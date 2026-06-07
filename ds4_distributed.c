@@ -445,7 +445,107 @@ struct ds4_dist_session {
      * prefix before applying new work. */
     bool spec_accept_pending;
     uint32_t spec_accept_len;
+    uint64_t mtp_calls;
+    uint64_t mtp_round1;
+    uint64_t mtp_verify;
+    uint64_t mtp_accept_tokens;
+    uint64_t mtp_draft_tokens;
+    uint64_t mtp_first_hit;
+    uint64_t mtp_disabled_cycles;
+    uint64_t mtp_disable_until_call;
+    uint64_t mtp_window_calls;
+    uint64_t mtp_window_accept_tokens;
+    uint64_t mtp_window_first_hit;
 };
+
+static uint32_t dist_env_u32_clamped(const char *name, uint32_t defv, uint32_t minv, uint32_t maxv);
+static bool dist_env_enabled(const char *name);
+
+static void dist_mtp_print_summary(ds4_dist_session *d, const char *tag) {
+    if (!d || d->mtp_calls == 0) return;
+    const double first_hit_pct = d->mtp_round1 ?
+        100.0 * (double)d->mtp_first_hit / (double)d->mtp_round1 : 0.0;
+    const double accept_per_call = d->mtp_calls ?
+        (double)d->mtp_accept_tokens / (double)d->mtp_calls : 0.0;
+    const uint64_t draft_accepts = d->mtp_accept_tokens > d->mtp_calls ?
+        d->mtp_accept_tokens - d->mtp_calls : 0;
+    const double draft_accept_pct = d->mtp_draft_tokens ?
+        100.0 * (double)draft_accepts / (double)d->mtp_draft_tokens : 0.0;
+    fprintf(stderr,
+            "ds4: dist-mtp %s: calls=%llu round1=%llu verify=%llu first_hit=%.2f%% "
+            "accepted=%llu drafts=%llu draft_accept=%.2f%% tok/call=%.2f disabled=%llu\n",
+            tag ? tag : "summary",
+            (unsigned long long)d->mtp_calls,
+            (unsigned long long)d->mtp_round1,
+            (unsigned long long)d->mtp_verify,
+            first_hit_pct,
+            (unsigned long long)d->mtp_accept_tokens,
+            (unsigned long long)d->mtp_draft_tokens,
+            draft_accept_pct,
+            accept_per_call,
+            (unsigned long long)d->mtp_disabled_cycles);
+}
+
+static void dist_mtp_maybe_log(ds4_dist_session *d, const char *tag) {
+    uint32_t interval = dist_env_u32_clamped("DS4_DIST_MTP_LOG_INTERVAL", 16, 0, 1000000);
+    if (interval != 0 && d && d->mtp_calls != 0 && (d->mtp_calls % interval) == 0) {
+        dist_mtp_print_summary(d, tag ? tag : "live");
+    }
+}
+
+static void dist_mtp_record_disabled(ds4_dist_session *d) {
+    if (!d) return;
+    d->mtp_disabled_cycles++;
+    d->mtp_accept_tokens++;
+    dist_mtp_maybe_log(d, "live");
+}
+
+static void dist_mtp_record_enabled(
+        ds4_dist_session *d,
+        uint32_t accepted_tokens,
+        uint32_t draft_tokens,
+        bool first_hit,
+        bool verified) {
+    if (!d) return;
+    d->mtp_round1++;
+    d->mtp_accept_tokens += accepted_tokens;
+    d->mtp_draft_tokens += draft_tokens;
+    if (first_hit) d->mtp_first_hit++;
+    if (verified) d->mtp_verify++;
+    d->mtp_window_calls++;
+    d->mtp_window_accept_tokens += accepted_tokens;
+    if (first_hit) d->mtp_window_first_hit++;
+
+    const bool force = dist_env_enabled("DS4_DIST_MTP_FORCE");
+    if (!force) {
+        const uint32_t after = dist_env_u32_clamped("DS4_DIST_MTP_ADAPT_AFTER", 8, 1, 1000000);
+        if (d->mtp_window_calls >= after) {
+            const uint64_t accept_per_1000 =
+                (1000ull * d->mtp_window_accept_tokens) / d->mtp_window_calls;
+            const uint64_t first_hit_per_1000 =
+                (1000ull * d->mtp_window_first_hit) / d->mtp_window_calls;
+            const uint32_t min_accept =
+                dist_env_u32_clamped("DS4_DIST_MTP_ADAPT_MIN_ACCEPT_PER_1000", 1200, 1000, 16000);
+            const uint32_t min_first_hit =
+                dist_env_u32_clamped("DS4_DIST_MTP_ADAPT_MIN_FIRST_HIT_PER_1000", 350, 0, 1000);
+            if (accept_per_1000 < min_accept || first_hit_per_1000 < min_first_hit) {
+                const uint32_t cooldown =
+                    dist_env_u32_clamped("DS4_DIST_MTP_ADAPT_COOLDOWN", 32, 1, 1000000);
+                d->mtp_disable_until_call = d->mtp_calls + cooldown;
+                fprintf(stderr,
+                        "ds4: dist-mtp adaptive-disable: window=%llu tok/call=%.2f first_hit=%.2f%%; disabling next %u calls (set DS4_DIST_MTP_FORCE=1 to force)\n",
+                        (unsigned long long)d->mtp_window_calls,
+                        (double)accept_per_1000 / 1000.0,
+                        (double)first_hit_per_1000 / 10.0,
+                        cooldown);
+            }
+            d->mtp_window_calls = 0;
+            d->mtp_window_accept_tokens = 0;
+            d->mtp_window_first_hit = 0;
+        }
+    }
+    dist_mtp_maybe_log(d, "live");
+}
 
 typedef struct {
     int id;
@@ -818,6 +918,23 @@ static bool dist_parse_positive_u32(
     }
     *out = (uint32_t)v;
     return true;
+}
+
+static uint32_t dist_env_u32_clamped(const char *name, uint32_t defv, uint32_t minv, uint32_t maxv) {
+    const char *s = getenv(name);
+    if (!s || !s[0]) return defv;
+    errno = 0;
+    char *end = NULL;
+    unsigned long v = strtoul(s, &end, 10);
+    if (errno != 0 || s[0] == '\0' || *end != '\0') return defv;
+    if (v < minv) v = minv;
+    if (v > maxv) v = maxv;
+    return (uint32_t)v;
+}
+
+static bool dist_env_enabled(const char *name) {
+    const char *v = getenv(name);
+    return v && v[0] && !(v[0] == '0' && v[1] == '\0');
 }
 
 /* =========================================================================
@@ -5619,6 +5736,7 @@ int ds4_dist_session_create(
 
 void ds4_dist_session_free(ds4_dist_session *d) {
     if (!d) return;
+    dist_mtp_print_summary(d, "summary");
     if (d->listen_fd >= 0) {
         shutdown(d->listen_fd, SHUT_RDWR);
         close(d->listen_fd);
@@ -5869,8 +5987,15 @@ int ds4_dist_session_eval_speculative(
         if (errlen) snprintf(err, errlen, "invalid distributed speculative request");
         return -1;
     }
+    d->mtp_calls++;
     /* No drafter configured or no remote worker: plain single-token decode. */
-    if (!d->state.mtp_draft || d->plan.count == 0) {
+    if (!d->state.mtp_draft || d->plan.count == 0 ||
+        (!dist_env_enabled("DS4_DIST_MTP_FORCE") && d->mtp_calls <= d->mtp_disable_until_call)) {
+        if (!d->state.mtp_draft || d->plan.count == 0) {
+            /* configured off */
+        } else {
+            dist_mtp_record_disabled(d);
+        }
         if (ds4_dist_session_eval(d, owner, checkpoint, first_token, logits, err, errlen) != 0) {
             return -1;
         }
@@ -5920,6 +6045,7 @@ int ds4_dist_session_eval_speculative(
         d->plan_ready = true;
         /* Rebuilt to [checkpoint + first_token]; no drafts available this cycle. */
         accepted[0] = first_token;
+        dist_mtp_record_enabled(d, 1, 0, false, false);
         ds4_tokens_free(&transcript);
         return 1;
     }
@@ -5927,12 +6053,14 @@ int ds4_dist_session_eval_speculative(
     int n_accept = 0;
     accepted[n_accept++] = first_token;            /* committed at pos p */
     if (first_token == eos_token || n_accept >= accepted_cap || r1.draft_n == 0) {
+        dist_mtp_record_enabled(d, (uint32_t)n_accept, r1.draft_n, false, false);
         ds4_tokens_free(&transcript);
         return n_accept;
     }
 
     /* drafts[0] is only worth verifying if the target already predicts it. */
     if ((int)r1.drafts[0] != dist_logits_argmax(logits, vocab)) {
+        dist_mtp_record_enabled(d, (uint32_t)n_accept, r1.draft_n, false, false);
         ds4_tokens_free(&transcript);
         return n_accept;
     }
@@ -5943,7 +6071,11 @@ int ds4_dist_session_eval_speculative(
     if (d->state.ctx_size != 0 && p + 1u + kc > d->state.ctx_size) {
         kc = (p + 1u < d->state.ctx_size) ? d->state.ctx_size - (p + 1u) : 0u;
     }
-    if (kc == 0) { ds4_tokens_free(&transcript); return n_accept; }
+    if (kc == 0) {
+        dist_mtp_record_enabled(d, (uint32_t)n_accept, r1.draft_n, true, false);
+        ds4_tokens_free(&transcript);
+        return n_accept;
+    }
 
     /* ---- Round 2: batch-verify the K candidates at positions p+1..p+kc. ---- */
     int verify_tokens[16];
@@ -5975,6 +6107,7 @@ int ds4_dist_session_eval_speculative(
             return -1;
         }
         d->plan_ready = true;
+        dist_mtp_record_enabled(d, (uint32_t)n_accept, r1.draft_n, true, false);
         ds4_tokens_free(&transcript);
         return n_accept;
     }
@@ -6002,6 +6135,7 @@ int ds4_dist_session_eval_speculative(
     d->spec_accept_pending = true;
     d->spec_accept_len = m;
 
+    dist_mtp_record_enabled(d, (uint32_t)n_accept, r1.draft_n, true, true);
     ds4_tokens_free(&transcript);
     return n_accept;
 }

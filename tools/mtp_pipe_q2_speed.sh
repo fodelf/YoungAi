@@ -20,7 +20,8 @@
 # 启动顺序 (reverse): 先起 M1 worker (listen 等待) → 再起本机 coordinator (主动拨 M1)。
 #
 # 安全闸 (任一触发"两边同杀, 只杀进程不删文件"): Ctrl+C / 本机 coordinator RSS 超 LOCAL_MAX_GB /
-#   M1 worker RSS 超 REMOTE_MAX_GB。会加载模型, 看门狗 + DS4_MEM_BUDGET_MB 预算闸都在。
+#   M1 worker RSS 超 REMOTE_MAX_GB。DS4_MEM_BUDGET_MB 和 L1 resident-budget gate 负责模型常驻硬预算；
+#   可设 MEM_WATCH_MODE=footprint 做慢速诊断，但 footprint 每秒扫描 VM 会明显拖慢测速。
 # !! 本机 M4 现扛大部分层 (~8G), 若 M4 被其他程序占满会 GPU OOM —— 先腾内存再跑。!!
 set -uo pipefail
 
@@ -31,17 +32,17 @@ LOCAL_DIR=${LOCAL_DIR:-/Users/fodelf/git/ds4-main}
 WORKER_IP=${WORKER_IP:-192.168.1.2}            # M1 雷电 IP: worker 在此 listen 控制端口, M4 coordinator 拨此
 PORT=${PORT:-5599}
 # 档位: 默认 q2-imatrix 完整模型；脚本只做双机层切分 + A3 按需专家加载 smoke。
-# 本机默认 0:32 共 33 层，M1 默认 33:output 共 10 层 + output + MTP。若 M1 8GB
-# 预算闸拒绝加载，先用 SPLIT_WORKER=36:output 或 NO_MTP=1 做隔离。
+# 分层等待诊断默认：本机 0:22，M1 23:output。这样故意把更多后段层放到 M1，
+# 用 --debug telemetry 观察是否 coordinator 在等 worker；若 M1 8GB 预算拒绝或变慢，再回 0:33/34:output。
 MODEL=${MODEL:-gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf}
 MTP_GGUF=${MTP_GGUF:-gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf} # 草稿模型, 仅 M1 worker 加载
 # 层切分 (block_count=43, layers 0..42)。本机 M4 扛大部分前段, M1 扛少部分末段 + output + MTP。
-SPLIT_COORD=${SPLIT_COORD:-0:33}               # 本机 M4 coordinator 层切片 (前段, 大部分)
-SPLIT_WORKER=${SPLIT_WORKER:-34:output}        # M1 worker 层切片 (末段, 少部分 + output, 持 MTP)
-CTX=${CTX:-4096}
+SPLIT_COORD=${SPLIT_COORD:-0:22}               # 本机 M4 coordinator 层切片 (诊断: 前 23 层)
+SPLIT_WORKER=${SPLIT_WORKER:-23:output}        # M1 worker 层切片 (诊断: 后 20 层 + output)
+CTX=${CTX:-200000}
 NPRED=${NPRED:-128}
-DRAFT=${DRAFT:-4}                              # --mtp-draft N: 投机批量 K (>=2 才有意义)
-NO_MTP=${NO_MTP:-0}                            # 隔离开关: NO_MTP=1 → 去掉两机 MTP 标志, 跑纯管线
+DRAFT=${DRAFT:-2}                              # --mtp-draft N: 分布式 MTP 默认 2；4 在当前 M1 worker 上实测负收益
+NO_MTP=${NO_MTP:-1}                            # 默认关 MTP：当前 M1 drafter 尽管接受率高但端到端负收益；设 NO_MTP=0 做实验
 if [ "$NO_MTP" = 1 ]; then
   COORD_MTP_ARGS=""
   WORKER_MTP_ARGS=""
@@ -61,26 +62,37 @@ REMOTE_BUDGET_MB=${REMOTE_BUDGET_MB:-8000}
 # 4096 的 scratch 几乎全浪费; 512 缩小 scratch 池, worker 不再 OOM (实测 coordinator prefill 21.5 t/s)。
 # 要更大上下文/吞吐再上调并实测。
 PREFILL_CHUNK=${PREFILL_CHUNK:-512}
-# 源页保活 LRU：不复制 expert 到大 MTLBuffer，而是对 GGUF mmap 源页做 madvise/可选 mlock，
-# 继续走 compact scratch kernel。目标是减少 page fault / 慢 IO，同时避免大副本池污染内存。
-LOCAL_EXPERT_SOURCE_CACHE_MB=${LOCAL_EXPERT_SOURCE_CACHE_MB:-2048}
-REMOTE_EXPERT_SOURCE_CACHE_MB=${REMOTE_EXPERT_SOURCE_CACHE_MB:-0}
+# 源专家 LRU（最终有效方案）：不再让 GPU 从大 expert pool 随机读。
+# LRU 只保活/复制专家源字节；每 token 仍走 compact A3 scratch，保持连续 GPU 读。
+# HARD_COPY=1 时 cache 真正占用匿名内存保存专家副本，命中后从热 DRAM 副本拷到 scratch，避免 mmap 冷页/页缓存抖动。
+LOCAL_EXPERT_SOURCE_CACHE_MB=${LOCAL_EXPERT_SOURCE_CACHE_MB:-3072}
+REMOTE_EXPERT_SOURCE_CACHE_MB=${REMOTE_EXPERT_SOURCE_CACHE_MB:-512}
 LOCAL_EXPERT_SOURCE_CACHE_LAYER_START=${LOCAL_EXPERT_SOURCE_CACHE_LAYER_START:-3}
-LOCAL_EXPERT_SOURCE_CACHE_LAYER_END=${LOCAL_EXPERT_SOURCE_CACHE_LAYER_END:-33}
-REMOTE_EXPERT_SOURCE_CACHE_LAYER_START=${REMOTE_EXPERT_SOURCE_CACHE_LAYER_START:-34}
+LOCAL_EXPERT_SOURCE_CACHE_LAYER_END=${LOCAL_EXPERT_SOURCE_CACHE_LAYER_END:-22}
+REMOTE_EXPERT_SOURCE_CACHE_LAYER_START=${REMOTE_EXPERT_SOURCE_CACHE_LAYER_START:-23}
 REMOTE_EXPERT_SOURCE_CACHE_LAYER_END=${REMOTE_EXPERT_SOURCE_CACHE_LAYER_END:-42}
 EXPERT_SOURCE_CACHE_ADMIT_AFTER=${EXPERT_SOURCE_CACHE_ADMIT_AFTER:-2}
 EXPERT_SOURCE_CACHE_MLOCK=${EXPERT_SOURCE_CACHE_MLOCK:-0}
-# 真实 expert pool：hit 时绕过 A3 scratch copy，直接让 MoE kernel 读 resident pool。
-# v1 不再全层 admission：早期层日志显示局部性差，会污染大池并拉低 copy 带宽；默认只缓存
-# coordinator 后段高命中层 24..33。M1 worker 默认不开，避免超过 8GiB。
-# 这是实际分配内存，不是模拟。若本机看门狗超限会两边同杀。
+EXPERT_SOURCE_CACHE_HARD_COPY=${EXPERT_SOURCE_CACHE_HARD_COPY:-0}
+# 旧 GPU expert pool 保留为实验开关，但默认关闭：日志已证明 Shared pool 随机读 + decode 同步填池比 compact scratch 慢。
 LOCAL_EXPERT_POOL_MB=${LOCAL_EXPERT_POOL_MB:-0}
 REMOTE_EXPERT_POOL_MB=${REMOTE_EXPERT_POOL_MB:-0}
-LOCAL_EXPERT_POOL_LAYER_START=${LOCAL_EXPERT_POOL_LAYER_START:-24}
-LOCAL_EXPERT_POOL_LAYER_END=${LOCAL_EXPERT_POOL_LAYER_END:-33}
-REMOTE_EXPERT_POOL_LAYER_START=${REMOTE_EXPERT_POOL_LAYER_START:-34}
+LOCAL_EXPERT_POOL_LAYER_START=${LOCAL_EXPERT_POOL_LAYER_START:-16}
+LOCAL_EXPERT_POOL_LAYER_END=${LOCAL_EXPERT_POOL_LAYER_END:-22}
+REMOTE_EXPERT_POOL_LAYER_START=${REMOTE_EXPERT_POOL_LAYER_START:-23}
 REMOTE_EXPERT_POOL_LAYER_END=${REMOTE_EXPERT_POOL_LAYER_END:-42}
+EXPERT_POOL_PREFETCH_LOOKAHEAD=${EXPERT_POOL_PREFETCH_LOOKAHEAD:-0}
+EXPERT_POOL_PREFETCH_TOP=${EXPERT_POOL_PREFETCH_TOP:-0}
+EXPERT_POOL_PREFETCH_SELF=${EXPERT_POOL_PREFETCH_SELF:-0}
+EXPERT_POOL_PREFETCH_ADJACENT=${EXPERT_POOL_PREFETCH_ADJACENT:-0}
+EXPERT_POOL_WAIT_INFLIGHT=${EXPERT_POOL_WAIT_INFLIGHT:-0}
+EXPERT_POOL_FOREGROUND_FILL=${EXPERT_POOL_FOREGROUND_FILL:-1}
+EXPERT_POOL_WARM_BATCH=${EXPERT_POOL_WARM_BATCH:-1}
+EXPERT_POOL_PREFETCH_EVICT=${EXPERT_POOL_PREFETCH_EVICT:-0}
+EXPERT_POOL_ADMIT_AFTER=${EXPERT_POOL_ADMIT_AFTER:-1}
+EXPERT_POOL_HOTLOCK_TOP=${EXPERT_POOL_HOTLOCK_TOP:-0}
+EXPERT_POOL_PREFETCH_QUEUE=${EXPERT_POOL_PREFETCH_QUEUE:-0}
+EXPERT_POOL_MIN_LAYER_SLOTS=${EXPERT_POOL_MIN_LAYER_SLOTS:-12}
 # Expert offload 命中率模拟日志：不改变推理，只在 A3 offload 每次 CPU-gather 后统计
 # 「如果有一个 LRU 专家池」的命中率/省下的拷贝量，并打印每层单专家 slot 内存。
 # coordinator 跑的层多，1GiB 连 34 层单 token 活跃集都放不下；默认给本机模拟池 4GiB。
@@ -105,10 +117,13 @@ if [ "$EXPERT_PROFILE" = 1 ]; then
   [ "$EXPERT_PROFILE_ALL" = 1 ] && LOCAL_PROFILE_ENV="$LOCAL_PROFILE_ENV DS4_METAL_EXPERT_PROFILE_ALL=1"
   [ "$EXPERT_PROFILE_ALL" = 1 ] && REMOTE_PROFILE_ENV="$REMOTE_PROFILE_ENV DS4_METAL_EXPERT_PROFILE_ALL=1"
 fi
-[ "$LOCAL_EXPERT_POOL_MB" != 0 ] && LOCAL_PROFILE_ENV="$LOCAL_PROFILE_ENV DS4_METAL_EXPERT_POOL_MB=$LOCAL_EXPERT_POOL_MB DS4_METAL_EXPERT_POOL_INTERVAL=$EXPERT_PROFILE_INTERVAL DS4_METAL_EXPERT_POOL_LAYER_START=$LOCAL_EXPERT_POOL_LAYER_START DS4_METAL_EXPERT_POOL_LAYER_END=$LOCAL_EXPERT_POOL_LAYER_END"
-[ "$REMOTE_EXPERT_POOL_MB" != 0 ] && REMOTE_PROFILE_ENV="$REMOTE_PROFILE_ENV DS4_METAL_EXPERT_POOL_MB=$REMOTE_EXPERT_POOL_MB DS4_METAL_EXPERT_POOL_INTERVAL=$EXPERT_PROFILE_INTERVAL DS4_METAL_EXPERT_POOL_LAYER_START=$REMOTE_EXPERT_POOL_LAYER_START DS4_METAL_EXPERT_POOL_LAYER_END=$REMOTE_EXPERT_POOL_LAYER_END"
-[ "$LOCAL_EXPERT_SOURCE_CACHE_MB" != 0 ] && LOCAL_PROFILE_ENV="$LOCAL_PROFILE_ENV DS4_METAL_EXPERT_SOURCE_CACHE_MB=$LOCAL_EXPERT_SOURCE_CACHE_MB DS4_METAL_EXPERT_SOURCE_CACHE_LAYER_START=$LOCAL_EXPERT_SOURCE_CACHE_LAYER_START DS4_METAL_EXPERT_SOURCE_CACHE_LAYER_END=$LOCAL_EXPERT_SOURCE_CACHE_LAYER_END DS4_METAL_EXPERT_SOURCE_CACHE_ADMIT_AFTER=$EXPERT_SOURCE_CACHE_ADMIT_AFTER DS4_METAL_EXPERT_SOURCE_CACHE_INTERVAL=$EXPERT_PROFILE_INTERVAL DS4_METAL_EXPERT_SOURCE_CACHE_MLOCK=$EXPERT_SOURCE_CACHE_MLOCK"
-[ "$REMOTE_EXPERT_SOURCE_CACHE_MB" != 0 ] && REMOTE_PROFILE_ENV="$REMOTE_PROFILE_ENV DS4_METAL_EXPERT_SOURCE_CACHE_MB=$REMOTE_EXPERT_SOURCE_CACHE_MB DS4_METAL_EXPERT_SOURCE_CACHE_LAYER_START=$REMOTE_EXPERT_SOURCE_CACHE_LAYER_START DS4_METAL_EXPERT_SOURCE_CACHE_LAYER_END=$REMOTE_EXPERT_SOURCE_CACHE_LAYER_END DS4_METAL_EXPERT_SOURCE_CACHE_ADMIT_AFTER=$EXPERT_SOURCE_CACHE_ADMIT_AFTER DS4_METAL_EXPERT_SOURCE_CACHE_INTERVAL=$EXPERT_PROFILE_INTERVAL DS4_METAL_EXPERT_SOURCE_CACHE_MLOCK=$EXPERT_SOURCE_CACHE_MLOCK"
+[ "$LOCAL_EXPERT_POOL_MB" != 0 ] && LOCAL_PROFILE_ENV="$LOCAL_PROFILE_ENV DS4_METAL_EXPERT_POOL_MB=$LOCAL_EXPERT_POOL_MB DS4_METAL_EXPERT_POOL_INTERVAL=$EXPERT_PROFILE_INTERVAL DS4_METAL_EXPERT_POOL_LAYER_START=$LOCAL_EXPERT_POOL_LAYER_START DS4_METAL_EXPERT_POOL_LAYER_END=$LOCAL_EXPERT_POOL_LAYER_END DS4_METAL_EXPERT_POOL_MIN_LAYER_SLOTS=$EXPERT_POOL_MIN_LAYER_SLOTS DS4_METAL_EXPERT_POOL_PREFETCH_LOOKAHEAD=$EXPERT_POOL_PREFETCH_LOOKAHEAD DS4_METAL_EXPERT_POOL_PREFETCH_TOP=$EXPERT_POOL_PREFETCH_TOP DS4_METAL_EXPERT_POOL_PREFETCH_SELF=$EXPERT_POOL_PREFETCH_SELF DS4_METAL_EXPERT_POOL_PREFETCH_ADJACENT=$EXPERT_POOL_PREFETCH_ADJACENT DS4_METAL_EXPERT_POOL_WAIT_INFLIGHT=$EXPERT_POOL_WAIT_INFLIGHT DS4_METAL_EXPERT_POOL_FOREGROUND_FILL=$EXPERT_POOL_FOREGROUND_FILL DS4_METAL_EXPERT_POOL_WARM_BATCH=$EXPERT_POOL_WARM_BATCH DS4_METAL_EXPERT_POOL_PREFETCH_EVICT=$EXPERT_POOL_PREFETCH_EVICT DS4_METAL_EXPERT_POOL_ADMIT_AFTER=$EXPERT_POOL_ADMIT_AFTER DS4_METAL_EXPERT_POOL_HOTLOCK_TOP=$EXPERT_POOL_HOTLOCK_TOP DS4_METAL_EXPERT_POOL_PREFETCH_QUEUE=$EXPERT_POOL_PREFETCH_QUEUE"
+[ "$REMOTE_EXPERT_POOL_MB" != 0 ] && REMOTE_PROFILE_ENV="$REMOTE_PROFILE_ENV DS4_METAL_EXPERT_POOL_MB=$REMOTE_EXPERT_POOL_MB DS4_METAL_EXPERT_POOL_INTERVAL=$EXPERT_PROFILE_INTERVAL DS4_METAL_EXPERT_POOL_LAYER_START=$REMOTE_EXPERT_POOL_LAYER_START DS4_METAL_EXPERT_POOL_LAYER_END=$REMOTE_EXPERT_POOL_LAYER_END DS4_METAL_EXPERT_POOL_MIN_LAYER_SLOTS=$EXPERT_POOL_MIN_LAYER_SLOTS DS4_METAL_EXPERT_POOL_PREFETCH_LOOKAHEAD=$EXPERT_POOL_PREFETCH_LOOKAHEAD DS4_METAL_EXPERT_POOL_PREFETCH_TOP=$EXPERT_POOL_PREFETCH_TOP DS4_METAL_EXPERT_POOL_PREFETCH_SELF=$EXPERT_POOL_PREFETCH_SELF DS4_METAL_EXPERT_POOL_PREFETCH_ADJACENT=$EXPERT_POOL_PREFETCH_ADJACENT DS4_METAL_EXPERT_POOL_WAIT_INFLIGHT=$EXPERT_POOL_WAIT_INFLIGHT DS4_METAL_EXPERT_POOL_FOREGROUND_FILL=$EXPERT_POOL_FOREGROUND_FILL DS4_METAL_EXPERT_POOL_WARM_BATCH=$EXPERT_POOL_WARM_BATCH DS4_METAL_EXPERT_POOL_PREFETCH_EVICT=$EXPERT_POOL_PREFETCH_EVICT DS4_METAL_EXPERT_POOL_ADMIT_AFTER=$EXPERT_POOL_ADMIT_AFTER DS4_METAL_EXPERT_POOL_HOTLOCK_TOP=$EXPERT_POOL_HOTLOCK_TOP DS4_METAL_EXPERT_POOL_PREFETCH_QUEUE=$EXPERT_POOL_PREFETCH_QUEUE"
+[ "$LOCAL_EXPERT_SOURCE_CACHE_MB" != 0 ] && LOCAL_PROFILE_ENV="$LOCAL_PROFILE_ENV DS4_METAL_EXPERT_SOURCE_CACHE_MB=$LOCAL_EXPERT_SOURCE_CACHE_MB DS4_METAL_EXPERT_SOURCE_CACHE_LAYER_START=$LOCAL_EXPERT_SOURCE_CACHE_LAYER_START DS4_METAL_EXPERT_SOURCE_CACHE_LAYER_END=$LOCAL_EXPERT_SOURCE_CACHE_LAYER_END DS4_METAL_EXPERT_SOURCE_CACHE_ADMIT_AFTER=$EXPERT_SOURCE_CACHE_ADMIT_AFTER DS4_METAL_EXPERT_SOURCE_CACHE_INTERVAL=$EXPERT_PROFILE_INTERVAL DS4_METAL_EXPERT_SOURCE_CACHE_MLOCK=$EXPERT_SOURCE_CACHE_MLOCK DS4_METAL_EXPERT_SOURCE_CACHE_HARD_COPY=$EXPERT_SOURCE_CACHE_HARD_COPY"
+[ "$REMOTE_EXPERT_SOURCE_CACHE_MB" != 0 ] && REMOTE_PROFILE_ENV="$REMOTE_PROFILE_ENV DS4_METAL_EXPERT_SOURCE_CACHE_MB=$REMOTE_EXPERT_SOURCE_CACHE_MB DS4_METAL_EXPERT_SOURCE_CACHE_LAYER_START=$REMOTE_EXPERT_SOURCE_CACHE_LAYER_START DS4_METAL_EXPERT_SOURCE_CACHE_LAYER_END=$REMOTE_EXPERT_SOURCE_CACHE_LAYER_END DS4_METAL_EXPERT_SOURCE_CACHE_ADMIT_AFTER=$EXPERT_SOURCE_CACHE_ADMIT_AFTER DS4_METAL_EXPERT_SOURCE_CACHE_INTERVAL=$EXPERT_PROFILE_INTERVAL DS4_METAL_EXPERT_SOURCE_CACHE_MLOCK=$EXPERT_SOURCE_CACHE_MLOCK DS4_METAL_EXPERT_SOURCE_CACHE_HARD_COPY=$EXPERT_SOURCE_CACHE_HARD_COPY"
+DIST_DEBUG=${DIST_DEBUG:-1}
+DEBUG_ARGS=""
+[ "$DIST_DEBUG" = 1 ] && DEBUG_ARGS="--debug"
 # reverse-connect 是本拓扑的核心 (见顶部注释)。两机都要带。
 # DS4_METAL_PREFILL_CHUNK 限制 prefill scratch, 防 M1 worker GPU 命令缓冲 OOM (见上)。
 # DS4_METAL_EXPERT_OFFLOAD 让 q2 routed experts 走 A3 按需 scratch; NO_MODEL_WARMUP 避免启动时扫冷 expert views。
@@ -137,12 +152,26 @@ cleanup(){
 }
 trap cleanup INT TERM EXIT
 
-# ---------------- RSS (GiB) ----------------
+# ---------------- 内存看门狗 (GiB) ----------------
+# 默认用 ps RSS，开销小、适合测速；DS4_MEM_BUDGET_MB/L1 gate 仍是模型常驻硬预算。
+# 诊断 mmap/Metal 真实 footprint 时设置 MEM_WATCH_MODE=footprint，但 footprint 很慢，会拖低 t/s。
+MEM_WATCH_MODE=${MEM_WATCH_MODE:-rss}
 rss_gb_local(){ local kb; kb=$(ps -o rss= -p "$1" 2>/dev/null | tr -d ' '); [ -n "$kb" ] && awk "BEGIN{printf \"%.2f\",$kb/1048576}" || echo 0; }
 rss_gb_remote(){
   local kb; kb=$(ssh "$REMOTE" "pid=\$(cat '$WORKER_PID_FILE' 2>/dev/null); [ -z \"\$pid\" ] && pid=\$(pgrep -f 'ds4 -m' | head -1); [ -n \"\$pid\" ] && ps -o rss= -p \$pid 2>/dev/null | tr -d ' '" 2>/dev/null)
   [ -n "$kb" ] && awk "BEGIN{printf \"%.2f\",$kb/1048576}" || echo 0
 }
+footprint_gb_local(){
+  local bytes; bytes=$(footprint -pid "$1" -f bytes --noCategories 2>/dev/null | awk '/phys_footprint:/ {print $2; exit}')
+  [ -n "$bytes" ] && awk "BEGIN{printf \"%.2f\",$bytes/1073741824}" || rss_gb_local "$1"
+}
+footprint_gb_remote(){
+  local bytes; bytes=$(ssh "$REMOTE" "pid=\$(cat '$WORKER_PID_FILE' 2>/dev/null); [ -z \"\$pid\" ] && pid=\$(pgrep -f 'ds4 -m' | head -1); [ -n \"\$pid\" ] && footprint -pid \$pid -f bytes --noCategories 2>/dev/null | awk '/phys_footprint:/ {print \$2; exit}'" 2>/dev/null)
+  [ -n "$bytes" ] && awk "BEGIN{printf \"%.2f\",$bytes/1073741824}" || rss_gb_remote
+}
+mem_gb_local(){ [ "$MEM_WATCH_MODE" = footprint ] && footprint_gb_local "$1" || rss_gb_local "$1"; }
+mem_gb_remote(){ [ "$MEM_WATCH_MODE" = footprint ] && footprint_gb_remote || rss_gb_remote; }
+mem_label(){ [ "$MEM_WATCH_MODE" = footprint ] && echo footprint || echo RSS; }
 over(){ awk "BEGIN{a=$1+0;b=$2+0;exit !(a>b)}"; }
 
 # ---------------- 0. 前置检查 ----------------
@@ -177,7 +206,7 @@ log "启动 M1 worker: --listen $WORKER_IP:$PORT --layers $SPLIT_WORKER ${WORKER
 ssh "$REMOTE" "cd '$REMOTE_DIR' && rm -f '$WORKER_LOG'; \
   $REMOTE_RUN_ENV DS4_MEM_BUDGET_MB=$REMOTE_BUDGET_MB \
   nohup ./ds4 -m '$MODEL' --role worker --listen '$WORKER_IP' '$PORT' \
-  --layers '$SPLIT_WORKER' $WORKER_MTP_ARGS \
+  --layers '$SPLIT_WORKER' $DEBUG_ARGS $WORKER_MTP_ARGS \
   -c '$CTX' --temp 0 --nothink > '$WORKER_LOG' 2>&1 & echo \$! > '$WORKER_PID_FILE'; echo launched" 2>/dev/null
 
 log "等 M1 worker backend 就绪并开始 control listen…"
@@ -187,7 +216,7 @@ for _ in $(seq 1 90); do
   if ssh "$REMOTE" "grep -qiE 'refusing to load|fatal|Address already|invalid|Insufficient Memory' '$WORKER_LOG'" 2>/dev/null; then
     log "M1 worker 启动失败, 日志尾:"; ssh "$REMOTE" "tail -10 '$WORKER_LOG'"; cleanup; exit 1
   fi
-  rg=$(rss_gb_remote); over "$rg" "$REMOTE_MAX_GB" && { log "M1 加载阶段 RSS ${rg}G 超 ${REMOTE_MAX_GB}G → 杀"; cleanup; exit 2; }
+  rg=$(mem_gb_remote); over "$rg" "$REMOTE_MAX_GB" && { log "M1 加载阶段 footprint ${rg}G 超 ${REMOTE_MAX_GB}G → 杀"; cleanup; exit 2; }
   sleep 1
 done
 [ "$wok" = 1 ] || { log "M1 worker 90s 未就绪 → 放弃"; ssh "$REMOTE" "tail -10 '$WORKER_LOG'"; cleanup; exit 1; }
@@ -196,14 +225,14 @@ sleep 1
 # ---------------- 5. 起本机 coordinator (主动拨 M1 worker, 跑一次性生成) ----------------
 log "启动本机 coordinator: --coordinator $WORKER_IP:$PORT --layers $SPLIT_COORD ${COORD_MTP_ARGS:-(无 MTP)} (reverse, 主动拨)"
 [ "$EXPERT_PROFILE" = 1 ] && log "专家命中率模拟 cache: coordinator=${LOCAL_EXPERT_PROFILE_CACHE_MB}MiB worker=${REMOTE_EXPERT_PROFILE_CACHE_MB}MiB (仅模拟)"
-log "真实 expert pool: coordinator=${LOCAL_EXPERT_POOL_MB}MiB layers=${LOCAL_EXPERT_POOL_LAYER_START}:${LOCAL_EXPERT_POOL_LAYER_END} worker=${REMOTE_EXPERT_POOL_MB}MiB layers=${REMOTE_EXPERT_POOL_LAYER_START}:${REMOTE_EXPERT_POOL_LAYER_END} (实际分配, 默认关闭)"
-log "源页保活 cache: coordinator=${LOCAL_EXPERT_SOURCE_CACHE_MB}MiB layers=${LOCAL_EXPERT_SOURCE_CACHE_LAYER_START}:${LOCAL_EXPERT_SOURCE_CACHE_LAYER_END} worker=${REMOTE_EXPERT_SOURCE_CACHE_MB}MiB layers=${REMOTE_EXPERT_SOURCE_CACHE_LAYER_START}:${REMOTE_EXPERT_SOURCE_CACHE_LAYER_END} admit_after=$EXPERT_SOURCE_CACHE_ADMIT_AFTER mlock=$EXPERT_SOURCE_CACHE_MLOCK"
+log "真实 expert pool: coordinator=${LOCAL_EXPERT_POOL_MB}MiB layers=${LOCAL_EXPERT_POOL_LAYER_START}:${LOCAL_EXPERT_POOL_LAYER_END} worker=${REMOTE_EXPERT_POOL_MB}MiB layers=${REMOTE_EXPERT_POOL_LAYER_START}:${REMOTE_EXPERT_POOL_LAYER_END} per-layer-LRU(min_slots=$EXPERT_POOL_MIN_LAYER_SLOTS,warm_batch=$EXPERT_POOL_WARM_BATCH) + 预测异步预取(lookahead=$EXPERT_POOL_PREFETCH_LOOKAHEAD top=$EXPERT_POOL_PREFETCH_TOP self=$EXPERT_POOL_PREFETCH_SELF adjacent=$EXPERT_POOL_PREFETCH_ADJACENT wait=$EXPERT_POOL_WAIT_INFLIGHT fg_fill=$EXPERT_POOL_FOREGROUND_FILL pf_evict=$EXPERT_POOL_PREFETCH_EVICT admit_after=$EXPERT_POOL_ADMIT_AFTER hotlock=$EXPERT_POOL_HOTLOCK_TOP)"
+log "源专家 LRU cache: coordinator=${LOCAL_EXPERT_SOURCE_CACHE_MB}MiB layers=${LOCAL_EXPERT_SOURCE_CACHE_LAYER_START}:${LOCAL_EXPERT_SOURCE_CACHE_LAYER_END} worker=${REMOTE_EXPERT_SOURCE_CACHE_MB}MiB layers=${REMOTE_EXPERT_SOURCE_CACHE_LAYER_START}:${REMOTE_EXPERT_SOURCE_CACHE_LAYER_END} admit_after=$EXPERT_SOURCE_CACHE_ADMIT_AFTER hard_copy=$EXPERT_SOURCE_CACHE_HARD_COPY mlock=$EXPERT_SOURCE_CACHE_MLOCK"
 log "  (首次可能弹 macOS 本地网络授权框 → 点允许)"
 cd "$LOCAL_DIR"
 rm -f "$COORD_LOG" "$COORD_OUT"
 env $LOCAL_RUN_ENV DS4_MEM_BUDGET_MB=$LOCAL_BUDGET_MB \
   ./ds4 -m "$MODEL" --role coordinator --coordinator "$WORKER_IP" "$PORT" \
-  --layers "$SPLIT_COORD" $COORD_MTP_ARGS \
+  --layers "$SPLIT_COORD" $DEBUG_ARGS $COORD_MTP_ARGS \
   -c "$CTX" -n "$NPRED" --temp 0 --seed "$SEED" --nothink \
   -p "$PROMPT" > "$COORD_OUT" 2> "$COORD_LOG" &
 COORD_PID=$!
@@ -213,10 +242,11 @@ log "运行中… coordinator(本机) 生成完即退出。(Ctrl+C 两边同杀;
 done_flag=0
 for _ in $(seq 1 1800); do
   if ! kill -0 "$COORD_PID" 2>/dev/null; then done_flag=1; break; fi
-  lg=$(rss_gb_local "$COORD_PID"); rg=$(rss_gb_remote)
-  printf "\r[mtp-pipe] RSS 本机coord=%sG/%dG  M1worker=%sG/%dG    " "$lg" "$LOCAL_MAX_GB" "$rg" "$REMOTE_MAX_GB"
-  over "$lg" "$LOCAL_MAX_GB" && { echo; log "本机 coordinator RSS ${lg}G 超限 → 两边同杀"; cleanup; exit 2; }
-  over "$rg" "$REMOTE_MAX_GB" && { echo; log "M1 worker RSS ${rg}G 超限 → 两边同杀"; cleanup; exit 2; }
+  lg=$(mem_gb_local "$COORD_PID"); rg=$(mem_gb_remote)
+  mlabel=$(mem_label)
+  printf "\r[mtp-pipe] %s 本机coord=%sG/%dG  M1worker=%sG/%dG    " "$mlabel" "$lg" "$LOCAL_MAX_GB" "$rg" "$REMOTE_MAX_GB"
+  over "$lg" "$LOCAL_MAX_GB" && { echo; log "本机 coordinator ${mlabel} ${lg}G 超限 → 两边同杀"; cleanup; exit 2; }
+  over "$rg" "$REMOTE_MAX_GB" && { echo; log "M1 worker ${mlabel} ${rg}G 超限 → 两边同杀"; cleanup; exit 2; }
   sleep 1
 done
 echo
@@ -237,12 +267,18 @@ if grep -qiE 'prefill:|generation:|t/s' "$COORD_LOG" 2>/dev/null; then
 else
   log "未拿到计时行, 本机 coordinator 日志尾:"; tail -12 "$COORD_LOG"
 fi
-if [ "$EXPERT_PROFILE" = 1 ]; then
+if grep -qiE 'dist-mtp|adaptive-disable' "$COORD_LOG" 2>/dev/null; then
   echo "----------------------------------------"
-  log "专家 offload 命中率摘要 (本机 coordinator):"
+  log "MTP 摘要 (本机 coordinator):"; grep -iE 'dist-mtp|adaptive-disable' "$COORD_LOG" | tail -20
+fi
+if grep -qiE 'expert-(profile|pool|source-cache)' "$COORD_LOG" 2>/dev/null; then
+  echo "----------------------------------------"
+  log "专家 LRU/pool/source 摘要 (本机 coordinator):"
   grep -iE 'expert-(profile|pool|source-cache) (summary|live|layer|  L|memory|enabled|enabled via)' "$COORD_LOG" | tail -100 || true
+fi
+if ssh "$REMOTE" "grep -qiE 'expert-(profile|pool|source-cache)' '$WORKER_LOG'" 2>/dev/null; then
   echo "----------------------------------------"
-  log "专家 offload 命中率摘要 (M1 worker):"
+  log "专家 LRU/pool/source 摘要 (M1 worker):"
   ssh "$REMOTE" "grep -iE 'expert-(profile|pool|source-cache) (summary|live|layer|  L|memory|enabled|enabled via)' '$WORKER_LOG' | tail -100" 2>/dev/null || true
 fi
 [ "$done_flag" = 1 ] || log "(注: coordinator 未正常结束, 上面是当前日志快照)"

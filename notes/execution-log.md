@@ -1321,3 +1321,157 @@ M4 coordinator --coordinator 192.168.1.2 5599 后拨; RUN_ENV=DS4_DIST_REVERSE_C
 - `make ds4` 通过（只编译，不加载模型）。
 - `bash -n tools/mtp_pipe_k4_speed.sh` 通过。
 - 未运行 `./ds4` / 未启动双机脚本 / 未 ssh 加载模型；脚本按用户要求留给用户自己跑。
+
+---
+
+## 2026-06-05 — Distributed MTP coordinator gating fix (code-only, no model run)
+
+**Context.** User reported `tools/mtp_pipe_k4_speed.sh` showed no speedup from MTP and only ~0.54 t/s while testing q2 with expert offload/pool ideas under strict 12GB/8GB budgets.
+
+**Finding.** The distributed coordinator did not load the MTP GGUF by design (the final-layer worker does), but `ds4_engine_mtp_draft_tokens()` returned a nonzero draft width only when `ds4_engine_has_mtp()` was true. The normal CLI decode loop uses this accessor to decide whether to call `ds4_session_eval_speculative_argmax()`. Therefore `--mtp-role worker --mtp-draft N` on the coordinator could silently stay on the plain distributed one-token decode path, even though the worker loaded the MTP model.
+
+**Patch.** `ds4.c`: make `ds4_engine_mtp_draft_tokens()` return the configured draft width for a distributed coordinator with `distributed.mtp_draft_on_worker=true`. Single-machine behavior is unchanged: non-distributed still requires a loaded MTP model. This enables the existing `ds4_dist_session_eval_speculative()` path for the script topology (coordinator orchestrates, worker drafts/verifies).
+
+**Validation.** `make ds4` passes. No model load / no dual-host run performed here; user will manually validate with `tools/mtp_pipe_k4_speed.sh`.
+
+**Expected impact.** This fixes a “MTP flag present but not entered” bug. It does not change the bigger physics: q2-full expert offload is still dominated by per-token expert CPU-gather/page-copy and backbone bandwidth; MTP only helps if the worker draft acceptance is high enough and the verification batch avoids extra copy/rollback overhead.
+
+### Follow-up run — `tools/mtp_pipe_k4_speed.sh` actually exercised MTP but got slower (2026-06-05)
+
+Ran on the two machines from this host (user requested local定位):
+
+1. `REMOTE=192.168.1.2 NPRED=16 CTX=4096 DRAFT=4 DS4_DECODE_DIAG=1 DS4_MTP_SPEC_LOG=1 DS4_MTP_TIMING=1 EXPERT_PROFILE_INTERVAL=16 tools/mtp_pipe_k4_speed.sh`
+   - Coordinator log now shows `mtp_draft=4`, so the ds4.c gating fix worked and the decode loop entered the speculative path.
+   - Worker loaded MTP: `MTP support model loaded ... (draft=4, distributed worker drafter)`.
+   - Generated text was sane prefix text, but speed was `prefill: 0.56 t/s, generation: 0.24 t/s`.
+   - Decode diagnostic sample indices jumped `0 -> 2 -> 6 -> 11 -> 14`, meaning speculative calls committed multiple tokens; the problem is not zero acceptance.
+   - Worker profile exposed extra MTP/offload work: after final-layer q2 expert profiles, MTP layer showed `one_expert=13.500 MiB`, and copy grew to ~16.6s by 112 MoE calls for this short run.
+
+2. Baseline `REMOTE=192.168.1.2 NPRED=8 CTX=4096 NO_MTP=1 DS4_DECODE_DIAG=1 EXPERT_PROFILE_INTERVAL=16 tools/mtp_pipe_k4_speed.sh`
+   - Speed: `prefill: 0.61 t/s, generation: 0.36 t/s`.
+
+**Diagnosis.** Distributed MTP is now active, but it is slower in the full-q2 expert-offload topology. The accepted draft count is not the blocker; the blocker is that every speculative round adds MTP model routed-MoE work on the M1 plus K-token target verification, and both paths still use A3 CPU-gather/scratch for routed experts. Tiny-batch verification expands the active expert union and copies many experts, so the “read weights once for K tokens” assumption does not hold under expert offload. MTP can help only after the target+MTP routed experts are resident/repacked enough that verify cost is close to one-token cost; with full q2 offload it amplifies the existing copy bottleneck.
+
+### Follow-up attempts per user request — MTP resident/direct, move output head, real expert pool (2026-06-05)
+
+User requested not just analysis: try the concrete knobs one by one, keep MTP resident on the other host, open the real expert pool, and move non-essential local memory to the other machine.
+
+**A. Keep MTP resident/direct instead of A3-copying its Q4 experts.**
+- Patch: `ds4_metal.m` now gates A3 expert offload to the full-q2 target layout only (`IQ2_XXS` gate/up + `Q2_K` down). Non-q2 routed tensors, including the MTP Q4_K support model that is already mapped resident on the worker, stay on the direct model-buffer path instead of being gathered again into A3 scratch.
+- Build: `make ds4` passed.
+- Test: `DRAFT=4`, profiling/source-cache/pools off for a cleaner speed check.
+- Result: still slower: `prefill 0.57 t/s, generation 0.21 t/s` vs no-MTP baseline around `0.32-0.33 t/s`. This removed the obvious MTP-Q4 scratch-copy mistake, but Scheme-A MTP still adds remote draft + K-token target verify work on the same M1 worker GPU and does not win under full-q2 offload.
+
+**B. Move coordinator output head off the local machine.**
+- Patch: `ds4.c` distributed layer-slice loading no longer forces `load_output=true` just because the role is coordinator. Only the role with `--layers ...:output` loads the output head. In the current script that is the M1 worker.
+- Build: `make ds4` passed.
+- Test: no-MTP smoke.
+- Result: correctness/smoke OK; coordinator startup changed from `layers 0:33+output` to `layers 0:33`, resident backbone dropped from ~6.78 GiB to ~6.26 GiB (about 0.52 GiB freed locally). Speed stayed about the same: `prefill 0.72 t/s, generation 0.32 t/s`.
+
+**C. Open real expert pool.**
+- Test env: `LOCAL_EXPERT_POOL_MB=2048`, `REMOTE_EXPERT_POOL_MB=512`, no MTP. This allocated real pools: coordinator 303 q2 expert slots (~2.0 GiB) for layers 24:33; worker 75 slots (~506 MiB) for layers 34:42.
+- With profiling on: coordinator pool reached ~43.5% hit by the short run end; worker ~31.6% hit. But speed collapsed to `generation 0.13 t/s`.
+- With profiling off (same pools): still `generation 0.13 t/s`.
+- Diagnosis: current real expert pool is CPU-filled `MTLStorageModeShared`. It removes some source mmap reads on hits, but misses still memcpy multi-GiB, and hits make MoE kernels read from a large Shared pool rather than compact hot scratch. For this short/full-q2 workload the pool is slower than the compact scratch path despite nonzero hits. Do not enable by default as-is.
+
+**D. Source-cache default.**
+- Script default changed to `LOCAL_EXPERT_SOURCE_CACHE_MB=0` because the source-page cache mostly adds bookkeeping/madvise overhead for this run and does not remove the A3 scratch copy. It remains opt-in via env.
+
+**Current status.**
+- Working code fixes kept: distributed MTP gating, coordinator does not load output head, MTP Q4 experts bypass A3 offload.
+- Real q2 expert pool tested and found negative for this topology; leave opt-in, not default.
+- Remaining high-upside route is not Scheme-A layer-pipeline MTP; it is a different architecture: remote pure asynchronous drafter queue (Scheme B) or physical expert repack/cut so target verify no longer uses full-q2 offload copies.
+
+---
+
+## 2026-06-06 — q2 expert LRU pool + predictor async prefetch (code-only)
+
+**Context.** User restated hard requirements: q2 GGUF only, two 16GB Macs over Thunderbolt, local <=12GB and remote <=8GB, 200k context target, Claude Code usable output, and must keep the LRU resident expert pool plus predictive asynchronous prefetch. Prior q2 speed stayed around 0.54 t/s; logs showed the bottleneck was routed-expert CPU gather/copy, not routing correctness.
+
+**Log finding.** Latest `/tmp/mtp_pipe_coord.log` and M1 worker log both showed A3 expert copy dominating wall time: coordinator copied ~169.7 GiB of q2 experts in ~226.8s for a short run; worker copied tens of GiB. With a small 1GiB simulated LRU the coordinator hit rate was 0% because one full layer-sweep active set already exceeds the cache; worker later reached ~55% simulated hits. Plain source-cache/pool v1 was not enough because hits still read a big Shared pool and misses stayed synchronous.
+
+**Patch.** `ds4_metal.m` now keeps the real q2 expert pool as a mandatory LRU pool when `DS4_METAL_EXPERT_POOL_MB` is set, and adds a background pthread prefetcher:
+- pool entries track `ready/loading/busy` so the GPU never reads a slot while the prefetcher overwrites it;
+- foreground MoE misses still synchronously fill LRU slots for correctness;
+- after each MoE call, predictor enqueue prefetches for future layers using (1) current active expert ids for adjacent layers, (2) each next layer's previous active ids (decode temporal locality), and (3) profiler hot experts when available;
+- asynchronous fills use the same resident pool and LRU victim path, protected from evicting active/loading slots;
+- logs now report real pool hit/miss, inflight waits, prefetch hit/miss/drop/copy, sync copy ms, and background copy ms.
+
+**Script defaults.** `tools/mtp_pipe_q2_speed.sh` now enables a bounded real pool by default under the stated budgets: local 2048MiB, remote 384MiB, `CTX=200000`, with `PREFETCH_LOOKAHEAD=1`, `PREFETCH_TOP=10`, `HOTLOCK_TOP=10`, queue 4096. Env overrides remain available. This intentionally preserves LRU residency and adds predictor async prefetch; source-cache remains opt-in.
+
+**Validation.** `make ds4` passes. `bash -n tools/mtp_pipe_q2_speed.sh` passes. No model run / no dual-host timing run performed here; user will validate manually with `tools/mtp_pipe_q2_speed.sh`.
+
+**Expected impact / caveat.** This removes the previous "pool is only synchronous" limitation and can convert repeated/hot expert misses into background copies. It cannot change the hard lower bound that cold q2 routed experts are ~6.75MiB each and must be read at least once; if predictor accuracy is low or pools are too small, generation remains copy-bound. Check `expert-pool live/summary` in both logs first: useful runs should show nonzero `hit`/`pf_copy` and low `wait`; high `pf_drop` or high `wait` means tune pool MB / prefetch top down/up.
+
+---
+
+## 2026-06-06 — q2 双机测速现状排查 + 默认脚本回退到稳定基线
+
+**用户目标/方案.** 在 M4 16GB Mac mini + M1 Pro 16GB MacBook（硬预算 mini≤12GB / worker≤8GB）上，优先 `gguf/` 下 q2 完整模型，探索“本机专家池内存保活 + LRU + 预测异步预取”提升专家命中率，并用 `tools/mtp_pipe_q2_speed.sh` 验证；此前版本约 0.58t/s。
+
+**本轮验证环境/命令.** 多轮 `tools/mtp_pipe_q2_speed.sh`，`CTX=200000 NPRED=32/64/128` 小样本，默认拓扑 `SPLIT_COORD=0:33`、`SPLIT_WORKER=34:output`，q2 完整模型 + A3 expert offload，MTP 草稿模型在 worker。所有运行都有脚本两边同杀 watchdog 与 `DS4_MEM_BUDGET_MB`，未出现 OOM/预算拒绝。
+
+**发现 1 — 真实 GPU expert pool 当前是负收益，不宜默认打开。**
+- 默认打开真实 pool（coord 2GiB, worker 384MiB, lookahead=1/top=10/hotlock=10）跑到 **generation 0.15t/s**；日志显示 coordinator pool hit≈51%，但 worker pool hit≈4%，async prefetch copy 达数十 GiB、明显抢统一内存带宽。
+- 关异步预取但扩大真实 pool（coord 2304MiB, worker 768MiB, lookahead=0）仍只有 **0.14t/s**。根因不是单纯 prefetch：真实 pool 首轮/低命中阶段要同步复制大量 expert 到 Shared MTLBuffer，并且 pool slot 作为 GPU 读源时存在跨层复用/同步成本；当前实现不适合做默认测速路径。
+- 结论：真实 expert pool 保留为显式实验开关；默认关闭，避免从 0.35t/s 退化到 0.14–0.15t/s。
+
+**发现 2 — distributed MTP 在当前 M1 worker 上端到端负收益。**
+- 修复/确认了 coordinator 进入分布式投机路径的 gating：`ds4_engine_mtp_draft_tokens()` 对 coordinator + `--mtp-role worker` 返回配置 draft 宽度；coordinator 不再加载 output head（只有 output worker 持 output）。
+- 加了 distributed MTP 摘要统计与自适应降级日志：`dist-mtp summary: calls/round1/verify/first_hit/accepted/drafts/tok_per_call/disabled`。
+- 实测 `DRAFT=2`：接受率很高（示例 `tok/call=2.46`, `first_hit=76.92%`, `draft_accept=73.08%`），但 M1 上加载/运行 MTP support model + VERIFY 批处理使端到端 **generation 0.28t/s**，低于纯 pipeline。
+- `DRAFT=4` 更差（此前 0.23t/s 或更低）。结论：MTP 不是当前硬件/实现下的默认加速路径；默认 `NO_MTP=1`，保留 `NO_MTP=0 DRAFT=2` 做实验。
+
+**发现 3 — profiler 和 footprint watchdog 会拖慢测速。**
+- `EXPERT_PROFILE=1` 会额外统计全层专家命中率，能诊断但会影响速度和日志量；默认改为 `EXPERT_PROFILE=0`。
+- `footprint` 每秒采样 phys_footprint 非常重，会明显拖慢测速；默认恢复轻量 `ps RSS` watchdog，保留 `MEM_WATCH_MODE=footprint` 作为慢速诊断开关。真正模型常驻硬预算仍由 `DS4_MEM_BUDGET_MB` + L1 resident-budget gate 控制。
+
+**当前稳定默认脚本参数（已改 `tools/mtp_pipe_q2_speed.sh`）。**
+- `NO_MTP=1`（默认纯 pipeline；MTP 显式实验）
+- `EXPERT_PROFILE=0`
+- `LOCAL_EXPERT_SOURCE_CACHE_MB=2048`, `REMOTE_EXPERT_SOURCE_CACHE_MB=1024`
+- `LOCAL_EXPERT_POOL_MB=0`, `REMOTE_EXPERT_POOL_MB=0`, prefetch/hotlock=0
+- `MEM_WATCH_MODE=rss`（可手动 `footprint` 诊断）
+
+**最新稳定结果.**
+- 默认等价配置（纯 pipeline + profile off + source-cache local 2GiB / worker 1GiB）: **prefill 0.63t/s, generation 0.36t/s**，输出文本正常，worker RSS 约 5.8GiB，未触发 8GiB 上限。
+- 无 source cache 对照: **prefill 0.71t/s, generation 0.33t/s**。source-cache 对 decode 有小幅正收益，但 prefill略慢；默认保留 source-cache 因目标更重 decode/Claude Code 交互。
+- 默认 MTP 实验 (`NO_MTP=0 DRAFT=2`)：**prefill 0.59t/s, generation 0.28t/s**，MTP 接受率高但端到端慢。
+
+**代码状态.**
+- `ds4_distributed.c`: 加 distributed MTP 统计、自适应降级、summary；不改变纯 pipeline 路径。
+- `ds4.c`: coordinator MTP gating + 不再让 coordinator 在层切分时加载 output head。
+- `ds4_metal.m`: 当前已有真实 expert pool/LRU/async prefetch 实验代码；经本轮验证默认不应开启。
+- `tools/mtp_pipe_q2_speed.sh`: 改为 q2 默认稳定基线并保留实验开关。
+- `make clean && make ds4` 通过。
+
+**结论.** 当前两机 q2 完整模型 200k 可跑但速度仍只有 **~0.36t/s decode**，离 20t/s 差两个数量级；本轮提出的“真实专家池 + LRU + 预测异步预取”在此实现中未提升，反而退化。下一步若继续优化，应先攻 A3 CPU-gather 本身（减少/并行化 expert memcpy、专用 per-layer hot expert 固定池且避免 GPU slot 复用 hazard）或回到物理裁剪/更小模型路径；不应把当前真实 GPU pool 当默认路径。
+
+## 2026-06-06 — q2 expert pool predictor retune (code-only; user validates)
+
+- Re-read latest logs: stable q2 pipeline still around 0.54 t/s with source-page LRU only; real pool/prefetch previous versions were slower because adjacent-layer prefetch copied tens of GiB on the foreground memory path and foreground waited on in-flight prefetches.
+- Kept the required real LRU resident expert pool + predictor async prefetch, but changed the default/policy to a conservative decode-local design:
+  - expert pool is enabled by default in `tools/mtp_pipe_q2_speed.sh` within budgets: local 768MiB, remote 256MiB;
+  - predictor prefetch defaults to same-layer temporal reuse (`PREFETCH_SELF=1`) and disables adjacent-layer flooding (`PREFETCH_ADJACENT=0`);
+  - misses do not wait for an in-flight background copy by default (`WAIT_INFLIGHT=0`): foreground falls back to A3 scratch for correctness, so the prefetcher can only help future tokens and cannot stall the current token;
+  - `ADMIT_AFTER=2` avoids filling the pool with first-seen cold experts; the first observation queues async prefetch for a potential next-token hit;
+  - summary logs now always print expert-pool/source-cache lines even with `EXPERT_PROFILE=0`, including `admit_skip`, `pf_copy`, `sync_copy`, and `wait`.
+- Metal implementation changes: added env knobs `DS4_METAL_EXPERT_POOL_PREFETCH_SELF`, `..._PREFETCH_ADJACENT`, `..._WAIT_INFLIGHT`, `..._ADMIT_AFTER`; predictor accounting now increments per-expert hot counts on foreground requests; in-flight prefetch hits are no longer synchronously waited unless explicitly enabled.
+- Validation performed here: `bash -n tools/mtp_pipe_q2_speed.sh`; `make ds4` passes. No dual-host/model run was performed here; user will validate manually with `tools/mtp_pipe_q2_speed.sh`.
+
+
+### Immediate fix after user reported 0.21 t/s (2026-06-06)
+
+- User validation showed the conservative pool still dropped decode to 0.21 t/s. Logs made the cause explicit: local pool `sync_copy=16.5s` + background `pf_copy_ms=52.9s`; worker `pf_copy=5668` for only 512 calls. Even without waits, the pool path still synchronously copied misses into Shared pool and the self-prefetcher over-copied.
+- Patch: added `DS4_METAL_EXPERT_POOL_FOREGROUND_FILL` (default off in q2 script). With it off, a pool miss never synchronously fills the resident pool; foreground immediately falls back to the proven A3 scratch path, while the async predictor may fill future-token entries. This keeps the required LRU resident pool and predictive async prefetch, but prevents the pool from making the current token slower than baseline.
+- Script now passes `DS4_METAL_EXPERT_POOL_FOREGROUND_FILL=0` by default and logs `fg_fill=0`. `WAIT_INFLIGHT=0` remains default. Validation: `bash -n tools/mtp_pipe_q2_speed.sh`; `make ds4` passes. No model run here.
+
+
+### Root cause correction: prefetch_evict=off was still evicting (2026-06-06)
+
+- User reported unchanged/slower 0.18 t/s. Latest logs proved `foreground_fill=off` but `pf_evict=off` still produced `pf_copy=3314` and `pf_drop=0`. That is impossible for a no-evict fill-only policy with only 113 slots, so the code still evicted despite the flag.
+- Root cause: `ds4_gpu_expert_pool_victim()` evicted an LRU slot before the caller checked `g_expert_pool_entries[slot].used`; by then the entry had already been cleared, so the no-evict guard never fired. Predictor therefore continued to churn the entire LRU pool and copy ~37s of experts.
+- Fix: prefetch worker now uses a true free-slot scan when `DS4_METAL_EXPERT_POOL_PREFETCH_EVICT=0`; it never calls the eviction helper in no-evict mode. If no free slot exists it increments `pf_drop` and does not copy.
+- Also lowered default q2 pool/predictor pressure: local 384MiB, remote 128MiB, `PREFETCH_TOP=2`. LRU pool + predictor async prefetch are still present, but prefetch copy is bounded by free slots and cannot churn resident experts.
+- Validation: `bash -n tools/mtp_pipe_q2_speed.sh`; `make ds4` passes. No model run here.
+

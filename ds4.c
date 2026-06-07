@@ -17826,7 +17826,18 @@ bool ds4_engine_has_mtp(ds4_engine *e) {
 }
 
 int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
-    return ds4_engine_has_mtp(e) ? e->mtp_draft_tokens : 0;
+    if (!e) return 0;
+    if (ds4_engine_has_mtp(e)) return e->mtp_draft_tokens;
+    /* Distributed layer-pipeline MTP is orchestrated by the coordinator but the
+     * support model is loaded only on the final-layer worker.  The CLI uses this
+     * accessor to decide whether to enter the speculative decode path; without
+     * this branch `--mtp-role worker --mtp-draft N` silently ran the plain
+     * one-token distributed decode loop and MTP could never show a speed change. */
+    if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR &&
+        e->distributed.mtp_draft_on_worker) {
+        return e->mtp_draft_tokens;
+    }
+    return 0;
 }
 
 /* mtp.md Phase 1: the configured draft width regardless of whether this engine
@@ -19191,8 +19202,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         load_layer_start = opt->distributed.layers.start;
         load_layer_end = opt->distributed.layers.has_output ?
                          UINT32_MAX : opt->distributed.layers.end;
-        load_output = opt->distributed.layers.has_output ||
-                      opt->distributed.role == DS4_DISTRIBUTED_COORDINATOR;
+        load_output = opt->distributed.layers.has_output;
     }
     /* mtp.md Phase 1 (Scheme A): the MTP drafter runs on the worker holding the
      * final layers + output head. That worker loads the MTP support model and,
