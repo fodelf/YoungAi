@@ -3582,6 +3582,20 @@ static void model_map_span_vec_finalize(ds4_model_map_span_vec *spans) {
     spans->len = out;
 }
 
+static void model_map_span_vec_sort_dedupe_exact(ds4_model_map_span_vec *spans) {
+    if (spans->len == 0) return;
+    qsort(spans->v, spans->len, sizeof(spans->v[0]), model_map_span_cmp);
+    uint32_t out = 0;
+    for (uint32_t i = 0; i < spans->len; i++) {
+        if (out == 0 ||
+            spans->v[i].off != spans->v[out - 1u].off ||
+            spans->v[i].end != spans->v[out - 1u].end) {
+            spans->v[out++] = spans->v[i];
+        }
+    }
+    spans->len = out;
+}
+
 /* Build the backbone (resident) and routed-expert (reclaimable) span lists for a
  * reduced-memory Metal load. Returns false if either list is empty or sizes look
  * wrong; the caller then falls back to the whole-tensor-data range loader. */
@@ -3600,7 +3614,7 @@ static bool weights_model_map_spans_split(
     model_map_span_vec_include_output(backbone, w);
 
     model_map_span_vec_finalize(backbone);
-    model_map_span_vec_finalize(experts);
+    model_map_span_vec_sort_dedupe_exact(experts);
 
     if (backbone->len == 0 || experts->len == 0) return false;
     if (backbone->max_tensor_bytes == 0) return false;
@@ -3631,7 +3645,7 @@ static bool weights_model_map_spans_split_slice(
     if (include_output) model_map_span_vec_include_output(backbone, w);
 
     model_map_span_vec_finalize(backbone);
-    model_map_span_vec_finalize(experts);
+    model_map_span_vec_sort_dedupe_exact(experts);
 
     if (backbone->len == 0 || experts->len == 0) return false;
     if (backbone->max_tensor_bytes == 0) return false;
@@ -9120,6 +9134,9 @@ typedef struct {
     ds4_gpu_tensor *layer_index_comp_cache[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_index_state_kv[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_index_state_score[DS4_MAX_LAYER];
+    uint32_t active_layer_start;
+    uint32_t active_layer_end;
+    bool active_layer_slice;
 
     /* Speculative decoding scratch.  MTP is allowed to mutate graph state only
      * if the target verifier can either commit it or restore the saved
@@ -9730,6 +9747,16 @@ static bool metal_graph_ensure_batch_ffn_out(ds4_gpu_graph *g) {
 
 /* Allocate the Metal graph state for a chosen raw-cache capacity.  The model
  * weights are not copied here; tensors reference the mapped GGUF. */
+static bool metal_graph_layer_is_active(const ds4_gpu_graph *g, uint32_t il) {
+    if (!g) return il < (uint32_t)DS4_N_LAYER;
+    /* The single-block MTP drafter reuses graph compressor/indexer state at
+     * synthetic layer index 1.  Keep that small state allocated on a layer-slice
+     * worker even when its target-model slice is the tail layers. */
+    if (g->mtp_enabled && il == 1u) return true;
+    if (!g->active_layer_slice) return il < (uint32_t)DS4_N_LAYER;
+    return il >= g->active_layer_start && il <= g->active_layer_end && il < (uint32_t)DS4_N_LAYER;
+}
+
 static bool metal_graph_alloc_raw_cap(
         ds4_gpu_graph *g,
         const ds4_weights     *weights,
@@ -9737,8 +9764,21 @@ static bool metal_graph_alloc_raw_cap(
         uint32_t                raw_cap,
         uint32_t                ctx_size,
         uint32_t                prefill_cap,
-        bool                    enable_mtp) {
+        bool                    enable_mtp,
+        uint32_t                active_layer_start,
+        uint32_t                active_layer_end,
+        bool                    active_layer_slice) {
     memset(g, 0, sizeof(*g));
+    g->active_layer_slice = active_layer_slice;
+    if (active_layer_start >= (uint32_t)DS4_N_LAYER) active_layer_start = 0;
+    if (active_layer_end >= (uint32_t)DS4_N_LAYER) active_layer_end = (uint32_t)DS4_N_LAYER - 1u;
+    if (active_layer_end < active_layer_start) {
+        active_layer_start = 0;
+        active_layer_end = (uint32_t)DS4_N_LAYER - 1u;
+        g->active_layer_slice = false;
+    }
+    g->active_layer_start = active_layer_start;
+    g->active_layer_end = active_layer_end;
     g->mtp_enabled = enable_mtp;
     if (raw_cap == 0) raw_cap = 1;
     if (ctx_size == 0) ctx_size = raw_cap;
@@ -9831,6 +9871,7 @@ static bool metal_graph_alloc_raw_cap(
     g->kv = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
     bool state_init_ok = true;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!metal_graph_layer_is_active(g, il)) continue;
         g->layer_raw_cache[il] = metal_graph_alloc_kv_cache_tensor(
                 managed_kv_cache,
                 (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
@@ -9986,6 +10027,7 @@ static bool metal_graph_alloc_raw_cap(
 
     bool layer_cache_ok = true;
     for (uint32_t il = 0; layer_cache_ok && il < DS4_N_LAYER; il++) {
+        if (!metal_graph_layer_is_active(g, il)) continue;
         layer_cache_ok = g->layer_raw_cache[il] != NULL;
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (layer_cache_ok && ratio != 0) {
@@ -10060,7 +10102,8 @@ static bool metal_graph_alloc(
         ds4_gpu_graph *g,
         const ds4_weights     *weights,
         const ds4_layer_weights *layer) {
-    return metal_graph_alloc_raw_cap(g, weights, layer, DS4_N_SWA, DS4_N_SWA, 1, false);
+    return metal_graph_alloc_raw_cap(g, weights, layer, DS4_N_SWA, DS4_N_SWA, 1, false,
+                                     0, (uint32_t)DS4_N_LAYER - 1u, false);
 }
 
 static uint32_t metal_graph_raw_span_for_batch(
@@ -12073,8 +12116,17 @@ static int metal_graph_first_token_full_test(
  * flow and their CPU reads stay outside these generation entry points.
  */
 
+static bool metal_graph_env_bool_enabled(const char *name) {
+    const char *v = getenv(name);
+    return v && v[0] && !(v[0] == '0' && v[1] == '\0');
+}
+
+static bool metal_graph_direct_expert_read_enabled(void) {
+    return metal_graph_env_bool_enabled("DS4_METAL_EXPERT_OFFLOAD_DIRECT");
+}
+
 static uint32_t metal_graph_token_split_after_layers(void) {
-    uint32_t split_after_layers = 4;
+    uint32_t split_after_layers = metal_graph_direct_expert_read_enabled() ? 1u : 4u;
     const char *split_env = getenv("DS4_METAL_GRAPH_TOKEN_SPLIT_LAYERS");
     if (split_env && split_env[0]) {
         char *end = NULL;
@@ -12133,8 +12185,13 @@ static bool metal_graph_encode_token_raw_swa(
         ds4_gpu_tensor *tmp = g->cur_hc;
         g->cur_hc = g->after_ffn_hc;
         g->after_ffn_hc = tmp;
-        if (ok && allow_split_flush && split_after_layers != 0 && il + 1u == split_after_layers) {
-            ok = ds4_gpu_flush_commands() != 0;
+        if (ok && allow_split_flush && split_after_layers != 0 &&
+            ((il + 1u) % split_after_layers) == 0 && il + 1u < (uint32_t)DS4_N_LAYER) {
+            if (metal_graph_direct_expert_read_enabled()) {
+                ok = ds4_gpu_end_commands() != 0 && ds4_gpu_begin_commands() != 0;
+            } else {
+                ok = ds4_gpu_flush_commands() != 0;
+            }
         }
     }
 
@@ -14535,6 +14592,7 @@ static bool metal_graph_reset_prefill_state(ds4_gpu_graph *g) {
     memset(g->layer_n_index_comp, 0, sizeof(g->layer_n_index_comp));
     g->mtp_n_raw = 0;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!metal_graph_layer_is_active(g, il)) continue;
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
         const uint32_t coff = ratio == 4 ? 2u : 1u;
@@ -14603,7 +14661,8 @@ static bool metal_graph_prefill_layer_major(
      */
     const bool throttle = graph_power_throttle_enabled(g);
     const bool callback_split = display_progress != NULL && n_tokens >= 32;
-    const bool split_commands = split_profile || throttle || callback_split ||
+    const bool direct_expert_split = metal_graph_direct_expert_read_enabled();
+    const bool split_commands = direct_expert_split || split_profile || throttle || callback_split ||
                                 n_tokens > 2048 || imatrix != NULL;
     const bool profile = getenv("DS4_METAL_GRAPH_PREFILL_PROFILE") != NULL || split_profile;
     const double t0 = profile ? now_sec() : 0.0;
@@ -15394,7 +15453,8 @@ static int metal_graph_prompt_logits_test(
 
     ds4_gpu_graph g;
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
-                                        raw_cap, (uint32_t)ctx_size, (uint32_t)n_test, false);
+                                        raw_cap, (uint32_t)ctx_size, (uint32_t)n_test, false,
+                                        0, (uint32_t)DS4_N_LAYER - 1u, false);
     if (!ok) {
         metal_graph_free(&g);
         fprintf(stderr, "ds4: failed to initialize Metal graph prompt test runtime\n");
@@ -16806,7 +16866,8 @@ static int generate_metal_graph_raw_swa(
     }
     ds4_gpu_graph g;
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
-                                        raw_cap, (uint32_t)ctx_size, prefill_cap, false);
+                                        raw_cap, (uint32_t)ctx_size, prefill_cap, false,
+                                        0, (uint32_t)DS4_N_LAYER - 1u, false);
     if (!ok) {
         fprintf(stderr, "ds4: failed to allocate GPU graph runtime\n");
         return 1;
@@ -18820,7 +18881,8 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
 
     ds4_gpu_graph g;
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
-                                        raw_cap, (uint32_t)ctx_size, prefill_cap, false);
+                                        raw_cap, (uint32_t)ctx_size, prefill_cap, false,
+                                        0, (uint32_t)DS4_N_LAYER - 1u, false);
     if (!ok) {
         fprintf(stderr, "ds4: failed to allocate imatrix Metal graph runtime\n");
         free(dataset);
@@ -19622,9 +19684,28 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->engine = e;
     s->ctx_size = ctx_size;
     s->prefill_cap = metal_graph_prefill_cap_for_prompt(ctx_size);
+    const char *dist_prefill_env = getenv("DS4_DIST_PREFILL_CAP");
+    if (dist_prefill_env && dist_prefill_env[0] &&
+        e->distributed.role != DS4_DISTRIBUTED_NONE && e->distributed.layers.set) {
+        char *endp = NULL;
+        unsigned long v = strtoul(dist_prefill_env, &endp, 10);
+        if (endp != dist_prefill_env && v > 0 && v <= (unsigned long)ctx_size) {
+            s->prefill_cap = (uint32_t)v;
+        }
+    }
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, s->prefill_cap);
+    bool active_slice = false;
+    uint32_t active_start = 0;
+    uint32_t active_end = (uint32_t)DS4_N_LAYER - 1u;
+    if (e->distributed.role != DS4_DISTRIBUTED_NONE && e->distributed.layers.set) {
+        active_slice = true;
+        active_start = e->distributed.layers.start;
+        active_end = e->distributed.layers.has_output ?
+                     ((uint32_t)DS4_N_LAYER - 1u) : e->distributed.layers.end;
+    }
     if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, &e->weights.layer[0],
-                                   raw_cap, (uint32_t)ctx_size, s->prefill_cap, e->mtp_ready))
+                                   raw_cap, (uint32_t)ctx_size, s->prefill_cap, e->mtp_ready,
+                                   active_start, active_end, active_slice))
     {
         free(s);
         return 1;
@@ -20044,10 +20125,14 @@ int ds4_session_eval_layer_slice(ds4_session *s,
             encoded_layers++;
             if (ok &&
                 split_after_layers != 0 &&
-                encoded_layers == split_after_layers &&
+                (encoded_layers % split_after_layers) == 0 &&
                 il < layer_end)
             {
-                ok = ds4_gpu_flush_commands() != 0;
+                if (metal_graph_direct_expert_read_enabled()) {
+                    ok = ds4_gpu_end_commands() != 0 && ds4_gpu_begin_commands() != 0;
+                } else {
+                    ok = ds4_gpu_flush_commands() != 0;
+                }
             }
         }
         if (ok && output_logits) {

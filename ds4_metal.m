@@ -14229,8 +14229,13 @@ int ds4_gpu_router_select_batch_tensor(
 }
 
 /* A3 expert offload: setting DS4_METAL_EXPERT_OFFLOAD=1 keeps routed expert
- * mmap views out of the resident working set and CPU-gathers only the routed
- * slots needed by this MoE call into small resident scratch buffers. */
+ * mmap views out of the resident working set.  The original safe path then
+ * CPU-gathers only the routed slots into small resident scratch buffers.  That
+ * path is memory-safe, but for q2-full it also forces a command-buffer drain +
+ * CPU readback/copy at every routed-MoE layer.  DS4_METAL_EXPERT_OFFLOAD_DIRECT=1
+ * keeps the non-resident expert views but lets the existing GPU id-matvec read
+ * selected expert rows directly from those mmap-backed views, avoiding the A3
+ * CPU gather barrier. */
 static int ds4_gpu_expert_offload_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -14238,8 +14243,25 @@ static int ds4_gpu_expert_offload_enabled(void) {
         cached = (v && v[0] && !(v[0] == '0' && v[1] == '\0')) ? 1 : 0;
         if (cached) {
             fprintf(stderr,
-                    "ds4: DS4_METAL_EXPERT_OFFLOAD=1: routed experts use A3 CPU-gather scratch; "
-                    "expert mmap views stay non-resident when the loader can split them.\n");
+                    "ds4: DS4_METAL_EXPERT_OFFLOAD=1: routed expert mmap views stay non-resident "
+                    "when the loader can split them.\n");
+        }
+    }
+    return cached;
+}
+
+static int ds4_gpu_expert_offload_direct_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = ds4_gpu_env_bool("DS4_METAL_EXPERT_OFFLOAD_DIRECT") > 0 ? 1 : 0;
+        if (cached) {
+            fprintf(stderr,
+                    "ds4: DS4_METAL_EXPERT_OFFLOAD_DIRECT=1: q2 routed experts bypass A3 CPU-gather; "
+                    "GPU reads selected rows directly from non-resident mmap views.\n");
+        } else if (ds4_gpu_expert_offload_enabled()) {
+            fprintf(stderr,
+                    "ds4: q2 routed experts use A3 CPU-gather scratch; set "
+                    "DS4_METAL_EXPERT_OFFLOAD_DIRECT=1 to avoid per-layer CPU gather barriers.\n");
         }
     }
     return cached;
@@ -16089,6 +16111,71 @@ static const ds4_metal_expert_source_entry *ds4_gpu_expert_source_hard_find(
     return e;
 }
 
+static uint32_t ds4_gpu_expert_gather_threads(void) {
+    static int initialized;
+    static uint32_t threads;
+    if (!initialized) {
+        uint64_t v = ds4_gpu_env_u64("DS4_METAL_EXPERT_GATHER_THREADS", 1u);
+        if (v < 1u) v = 1u;
+        if (v > 16u) v = 16u;
+        threads = (uint32_t)v;
+        initialized = 1;
+        if (threads > 1u && ds4_gpu_expert_offload_enabled() && !ds4_gpu_expert_offload_direct_enabled()) {
+            fprintf(stderr,
+                    "ds4: A3 expert CPU gather parallel copy enabled: %u threads\n",
+                    threads);
+        }
+    }
+    return threads;
+}
+
+typedef struct {
+    const uint8_t *map;
+    uint8_t *gate_dst;
+    uint8_t *up_dst;
+    uint8_t *down_dst;
+    const uint32_t *active_ids;
+    uint32_t n_active;
+    uint32_t n_expert_total;
+    uint64_t gate_offset;
+    uint64_t up_offset;
+    uint64_t down_offset;
+    uint64_t gate_expert_bytes;
+    uint64_t down_expert_bytes;
+    uint32_t next_slot;
+    int ok;
+    pthread_mutex_t mu;
+} ds4_metal_expert_gather_ctx;
+
+static void *ds4_gpu_expert_gather_worker(void *arg) {
+    ds4_metal_expert_gather_ctx *ctx = (ds4_metal_expert_gather_ctx *)arg;
+    for (;;) {
+        pthread_mutex_lock(&ctx->mu);
+        const uint32_t slot = ctx->next_slot++;
+        pthread_mutex_unlock(&ctx->mu);
+        if (slot >= ctx->n_active) break;
+        const uint32_t id = ctx->active_ids[slot];
+        if (id >= ctx->n_expert_total) {
+            ctx->ok = 0;
+            continue;
+        }
+        const uint64_t gate_src = (uint64_t)id * ctx->gate_expert_bytes;
+        const uint64_t down_src = (uint64_t)id * ctx->down_expert_bytes;
+        const uint64_t gate_dst_off = (uint64_t)slot * ctx->gate_expert_bytes;
+        const uint64_t down_dst_off = (uint64_t)slot * ctx->down_expert_bytes;
+        memcpy(ctx->gate_dst + gate_dst_off,
+               ctx->map + ctx->gate_offset + gate_src,
+               (size_t)ctx->gate_expert_bytes);
+        memcpy(ctx->up_dst + gate_dst_off,
+               ctx->map + ctx->up_offset + gate_src,
+               (size_t)ctx->gate_expert_bytes);
+        memcpy(ctx->down_dst + down_dst_off,
+               ctx->map + ctx->down_offset + down_src,
+               (size_t)ctx->down_expert_bytes);
+    }
+    return NULL;
+}
+
 static int ds4_gpu_load_layer_experts_to_scratch(
         const void *model_map,
         uint32_t    layer_index,
@@ -16125,6 +16212,42 @@ static int ds4_gpu_load_layer_experts_to_scratch(
     uint8_t *up_dst = (uint8_t *)g_moe_scratch_up.contents;
     uint8_t *down_dst = (uint8_t *)g_moe_scratch_down.contents;
     if (!gate_dst || !up_dst || !down_dst) return 0;
+
+    const uint32_t gather_threads = ds4_gpu_expert_gather_threads();
+    if (gather_threads > 1u && n_active >= 2u && !g_expert_source_hard_copy) {
+        ds4_metal_expert_gather_ctx ctx = {
+            .map = map,
+            .gate_dst = gate_dst,
+            .up_dst = up_dst,
+            .down_dst = down_dst,
+            .active_ids = active_ids,
+            .n_active = n_active,
+            .n_expert_total = n_expert_total,
+            .gate_offset = gate_offset,
+            .up_offset = up_offset,
+            .down_offset = down_offset,
+            .gate_expert_bytes = gate_expert_bytes,
+            .down_expert_bytes = down_expert_bytes,
+            .next_slot = 0,
+            .ok = 1,
+            .mu = PTHREAD_MUTEX_INITIALIZER,
+        };
+        pthread_t th[16];
+        uint32_t nth = gather_threads;
+        if (nth > n_active) nth = n_active;
+        int created = 0;
+        for (uint32_t i = 0; i < nth; i++) {
+            if (pthread_create(&th[i], NULL, ds4_gpu_expert_gather_worker, &ctx) == 0) {
+                created++;
+            }
+        }
+        for (int i = 0; i < created; i++) {
+            (void)pthread_join(th[i], NULL);
+        }
+        (void)pthread_mutex_destroy(&ctx.mu);
+        if (created == (int)nth) return ctx.ok;
+        /* Thread creation failed under pressure; fall back to the serial path for correctness. */
+    }
 
     for (uint32_t slot = 0; slot < n_active; slot++) {
         const uint32_t id = active_ids[slot];
@@ -16270,6 +16393,7 @@ int ds4_gpu_routed_moe_one_tensor(
          * direct resident-buffer path. */
         const bool a3_expert_offload =
             ds4_gpu_expert_offload_enabled() &&
+            !ds4_gpu_expert_offload_direct_enabled() &&
             gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
             down_type == DS4_METAL_TENSOR_Q2_K;
         if (a3_expert_offload) {
@@ -16681,6 +16805,7 @@ int ds4_gpu_routed_moe_batch_tensor(
          * direct resident-buffer path. */
         const bool a3_expert_offload =
             ds4_gpu_expert_offload_enabled() &&
+            !ds4_gpu_expert_offload_direct_enabled() &&
             gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
             down_type == DS4_METAL_TENSOR_Q2_K;
         if (a3_expert_offload) {

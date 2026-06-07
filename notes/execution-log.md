@@ -1475,3 +1475,18 @@ User requested not just analysis: try the concrete knobs one by one, keep MTP re
 - Also lowered default q2 pool/predictor pressure: local 384MiB, remote 128MiB, `PREFETCH_TOP=2`. LRU pool + predictor async prefetch are still present, but prefetch copy is bounded by free slots and cannot churn resident experts.
 - Validation: `bash -n tools/mtp_pipe_q2_speed.sh`; `make ds4` passes. No model run here.
 
+
+## 2026-06-07 — q2-full 0.66t/s bottleneck patch: per-tensor direct expert reads + layer-slice KV/scratch shrink
+
+**Context.** User reported latest `tools/mtp_pipe_q2_speed.sh` validation reached only ~0.66 t/s against the hard goal (two 16GB Macs, mini ≤12GB / MacBook ≤8GB, 200K ctx, must use `gguf/` q2 full model). Latest `/tmp/mtp_pipe_coord.log` still showed the dominant cost: A3 q2 routed-expert CPU gather copied ~126GiB in ~84s on the coordinator for a short 128-token run. The per-request distributed telemetry was ~0.3–0.7s/token; this is not Thunderbolt or output-head overhead, it is the CPU-gather barrier per MoE layer.
+
+**Patch.**
+- `ds4.c`: changed the expert-offload span builder so routed expert spans are **not coalesced**. The q2 GGUF stores each layer's gate/down/up expert tensor as an individual contiguous tensor (~528/672/528MiB), but the previous split loader merged all routed experts into one huge 38GiB expert span per slice. Direct binding of that merged view made Metal command validation see ~40GiB and OOM. Keeping exact per-tensor expert spans is the next fine-grained route requested by the user: command buffers now bind per-layer gate/up/down expert tensor views rather than one 30+GiB span.
+- `ds4_metal.m`: `DS4_METAL_EXPERT_OFFLOAD_DIRECT=1` remains the switch that bypasses A3 CPU gather for q2 routed tensors and lets existing Metal id-matvec kernels read selected rows directly from the non-resident mmap-backed expert tensor views.
+- `ds4.c`: direct mode changes decode command splitting from the old prefix split to per-layer split/drain (`DS4_METAL_GRAPH_TOKEN_SPLIT_LAYERS=1` default under direct). This keeps a direct-mode command buffer from accumulating expert views from many layers at once.
+- `ds4.c`: layer-slice graph sessions allocate KV/compressor/indexer persistent state only for the active distributed layer range (plus MTP support layer state when enabled). Added `DS4_DIST_PREFILL_CAP` to clamp distributed graph batch scratch independently of `-c 200000`.
+- `tools/mtp_pipe_q2_speed.sh`: defaults now set `DS4_METAL_EXPERT_OFFLOAD_DIRECT=1`, `DS4_METAL_GRAPH_TOKEN_SPLIT_LAYERS=1`, and `DS4_DIST_PREFILL_CAP=128`. A3 source-cache/profile defaults are kept as fallback/diagnostic knobs; they are inactive while direct mode bypasses A3.
+
+**Expected impact.** This directly attacks the measured 0.66t/s blocker without returning to a command buffer that sees a 30+GiB expert span. If Metal accepts the per-tensor direct views under the 12/8GiB budgets, decode should move from CPU-copy-bound toward GPU/mmap-read-bound. If a device still OOMs, set `DS4_METAL_EXPERT_OFFLOAD_DIRECT=0` to return to A3.
+
+**Validation performed here.** `make ds4` passes locally and `bash -n tools/mtp_pipe_q2_speed.sh` passes. No dual-host/model timing run performed here; user will manually validate with the script.

@@ -60,9 +60,15 @@ REMOTE_BUDGET_MB=${REMOTE_BUDGET_MB:-8000}
 # (模型常驻 ~6.88G + scratch 池) 越过 M1 Pro GPU 的 ~10.67G 工作集天花板 → kIOGPU OOM
 # (= 曾经"本机爆了"的真因; 实测 currentAllocated 11.23G > recommendedMax 10.67G)。prompt 短时
 # 4096 的 scratch 几乎全浪费; 512 缩小 scratch 池, worker 不再 OOM (实测 coordinator prefill 21.5 t/s)。
+# 分布式 layer-slice 现在只给本机/worker 各自层切片分配 KV/压缩前沿；200K 下可在预算内把
+# prefill scratch 降到真实 prompt 长度。
 # 要更大上下文/吞吐再上调并实测。
 PREFILL_CHUNK=${PREFILL_CHUNK:-512}
-# 源专家 LRU（最终有效方案）：不再让 GPU 从大 expert pool 随机读。
+DIST_PREFILL_CAP=${DIST_PREFILL_CAP:-128}
+GATHER_THREADS=${GATHER_THREADS:-4}
+# 源专家 LRU（A3 fallback 用）：direct per-tensor read 虽避免了 30+GiB view OOM，
+# 但实测每 token 15–16s（随机 mmap/页故障/每层 command drain），比 A3 慢一个数量级；默认回 A3。
+# 可手动设置 DS4_METAL_EXPERT_OFFLOAD_DIRECT=1 做 direct 实验。
 # LRU 只保活/复制专家源字节；每 token 仍走 compact A3 scratch，保持连续 GPU 读。
 # HARD_COPY=1 时 cache 真正占用匿名内存保存专家副本，命中后从热 DRAM 副本拷到 scratch，避免 mmap 冷页/页缓存抖动。
 LOCAL_EXPERT_SOURCE_CACHE_MB=${LOCAL_EXPERT_SOURCE_CACHE_MB:-3072}
@@ -125,9 +131,13 @@ DIST_DEBUG=${DIST_DEBUG:-1}
 DEBUG_ARGS=""
 [ "$DIST_DEBUG" = 1 ] && DEBUG_ARGS="--debug"
 # reverse-connect 是本拓扑的核心 (见顶部注释)。两机都要带。
-# DS4_METAL_PREFILL_CHUNK 限制 prefill scratch, 防 M1 worker GPU 命令缓冲 OOM (见上)。
-# DS4_METAL_EXPERT_OFFLOAD 让 q2 routed experts 走 A3 按需 scratch; NO_MODEL_WARMUP 避免启动时扫冷 expert views。
-BASE_RUN_ENV=${BASE_RUN_ENV:-"DS4_DIST_REVERSE_CONNECT=1 DS4_METAL_PREFILL_CHUNK=$PREFILL_CHUNK DS4_METAL_EXPERT_OFFLOAD=1 DS4_METAL_NO_MODEL_WARMUP=1"}
+# DS4_METAL_PREFILL_CHUNK 限制每次预填充 work 的 token 数；DS4_DIST_PREFILL_CAP 进一步把
+# graph 内部 batch scratch cap 钳到脚本真实 smoke prompt 量级（200K KV 仍由 -c 控制）。
+# DS4_METAL_EXPERT_OFFLOAD 让 q2 routed experts 走 A3 按需 scratch；EXPERT_GATHER_THREADS
+# 并行复制同层 active experts，降低 A3 memcpy 墙。per-tensor DIRECT 已验证不 OOM 但 15s/token，
+# 默认关闭；需要实验时覆盖 DS4_METAL_EXPERT_OFFLOAD_DIRECT=1。
+# NO_MODEL_WARMUP 避免启动时扫冷 expert views。
+BASE_RUN_ENV=${BASE_RUN_ENV:-"DS4_DIST_REVERSE_CONNECT=1 DS4_METAL_PREFILL_CHUNK=$PREFILL_CHUNK DS4_DIST_PREFILL_CAP=$DIST_PREFILL_CAP DS4_METAL_EXPERT_OFFLOAD=1 DS4_METAL_EXPERT_OFFLOAD_DIRECT=0 DS4_METAL_EXPERT_GATHER_THREADS=$GATHER_THREADS DS4_METAL_NO_MODEL_WARMUP=1"}
 # RUN_ENV 仍可一把覆盖两边；LOCAL_RUN_ENV/REMOTE_RUN_ENV 可分别覆盖。
 LOCAL_RUN_ENV=${LOCAL_RUN_ENV:-${RUN_ENV:-"$BASE_RUN_ENV $LOCAL_PROFILE_ENV"}}
 REMOTE_RUN_ENV=${REMOTE_RUN_ENV:-${RUN_ENV:-"$BASE_RUN_ENV $REMOTE_PROFILE_ENV"}}
