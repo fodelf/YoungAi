@@ -14645,6 +14645,7 @@ typedef struct {
     bool        ready;
     bool        loading;
     bool        busy;
+    bool        pinned;
     const void *model_map;
     uint32_t    layer;
     uint32_t    expert;
@@ -14715,11 +14716,35 @@ static int      g_expert_pool_wait_inflight;
 static int      g_expert_pool_foreground_fill;
 static int      g_expert_pool_warm_batch;
 static int      g_expert_pool_prefetch_evict;
+static int      g_expert_pool_hit_only;
 static uint32_t g_expert_pool_admit_after;
 static int      g_expert_pool_hotlock_enabled;
 static uint32_t g_expert_pool_hotlock_top;
 static uint64_t g_expert_pool_admission_skips;
 static uint64_t g_expert_pool_clock;
+static bool     g_expert_pool_pinned[DS4_METAL_EXPERT_PROFILE_MAX_LAYERS][DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS];
+static bool     g_expert_pool_static_pinned[DS4_METAL_EXPERT_PROFILE_MAX_LAYERS][DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS];
+static bool     g_expert_pool_dynamic_pinned[DS4_METAL_EXPERT_PROFILE_MAX_LAYERS][DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS];
+static uint32_t g_expert_pool_pinned_per_layer[DS4_METAL_EXPERT_PROFILE_MAX_LAYERS];
+static uint32_t g_expert_pool_static_pinned_per_layer[DS4_METAL_EXPERT_PROFILE_MAX_LAYERS];
+static uint32_t g_expert_pool_dynamic_pinned_per_layer[DS4_METAL_EXPERT_PROFILE_MAX_LAYERS];
+static uint32_t g_expert_pool_pinned_total;
+static uint32_t g_expert_pool_static_pinned_total;
+static uint32_t g_expert_pool_dynamic_pinned_total;
+static uint64_t g_expert_pool_pinned_requests;
+static uint64_t g_expert_pool_pinned_hits;
+static uint64_t g_expert_pool_pinned_misses;
+static uint64_t g_expert_pool_pinned_prefetches;
+static uint64_t g_expert_pool_auto_pin_updates;
+static bool     g_expert_pool_pinned_env_parsed;
+static bool     g_expert_pool_pinned_layer_queued[DS4_METAL_EXPERT_PROFILE_MAX_LAYERS];
+static uint32_t g_expert_pool_auto_pin_top;
+static uint32_t g_expert_pool_auto_pin_min_req;
+static uint32_t g_expert_pool_auto_pin_interval;
+static uint32_t g_expert_pool_pin_reserve;
+static uint32_t g_expert_pool_hotlist_top;
+static uint32_t g_expert_pool_hotlist_interval;
+static uint64_t g_expert_pool_auto_pin_last_req[DS4_METAL_EXPERT_PROFILE_MAX_LAYERS];
 #define DS4_METAL_EXPERT_POOL_LAST_ACTIVE_MAX 64u
 static uint32_t g_expert_pool_last_active_n[DS4_METAL_EXPERT_PROFILE_MAX_LAYERS];
 static uint32_t g_expert_pool_last_active[DS4_METAL_EXPERT_PROFILE_MAX_LAYERS][DS4_METAL_EXPERT_POOL_LAST_ACTIVE_MAX];
@@ -14789,6 +14814,206 @@ static int ds4_gpu_expert_pool_layer_allowed(uint32_t layer) {
     return layer >= g_expert_pool_layer_start && layer <= g_expert_pool_layer_end;
 }
 
+static int ds4_gpu_expert_pool_pin_sep(char c) {
+    return c == ';' || c == '|' || c == '/' || c == '\n';
+}
+
+static int ds4_gpu_expert_pool_add_pin(uint32_t layer, uint32_t expert, bool dynamic) {
+    if (layer >= DS4_METAL_EXPERT_PROFILE_MAX_LAYERS ||
+        expert >= DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS) {
+        return 0;
+    }
+    int added = 0;
+    if (!g_expert_pool_pinned[layer][expert]) {
+        g_expert_pool_pinned[layer][expert] = true;
+        g_expert_pool_pinned_per_layer[layer]++;
+        g_expert_pool_pinned_total++;
+        g_expert_pool_pinned_layer_queued[layer] = false;
+        added = 1;
+    }
+    if (g_expert_pool_entries) {
+        for (uint32_t slot = 0; slot < g_expert_pool_slots; slot++) {
+            ds4_metal_expert_pool_entry *entry = &g_expert_pool_entries[slot];
+            if (entry->used && entry->layer == layer && entry->expert == expert) {
+                entry->pinned = true;
+            }
+        }
+    }
+    if (dynamic) {
+        if (!g_expert_pool_static_pinned[layer][expert] &&
+            !g_expert_pool_dynamic_pinned[layer][expert]) {
+            g_expert_pool_dynamic_pinned[layer][expert] = true;
+            g_expert_pool_dynamic_pinned_per_layer[layer]++;
+            g_expert_pool_dynamic_pinned_total++;
+        }
+    } else if (!g_expert_pool_static_pinned[layer][expert]) {
+        if (g_expert_pool_dynamic_pinned[layer][expert]) {
+            g_expert_pool_dynamic_pinned[layer][expert] = false;
+            if (g_expert_pool_dynamic_pinned_per_layer[layer] > 0) {
+                g_expert_pool_dynamic_pinned_per_layer[layer]--;
+            }
+            if (g_expert_pool_dynamic_pinned_total > 0) g_expert_pool_dynamic_pinned_total--;
+        }
+        g_expert_pool_static_pinned[layer][expert] = true;
+        g_expert_pool_static_pinned_per_layer[layer]++;
+        g_expert_pool_static_pinned_total++;
+    }
+    return added;
+}
+
+static void ds4_gpu_expert_pool_parse_pinned_env(void) {
+    if (g_expert_pool_pinned_env_parsed) return;
+    g_expert_pool_pinned_env_parsed = true;
+    const char *spec = getenv("DS4_METAL_EXPERT_POOL_PINNED");
+    if (!spec || !spec[0]) return;
+
+    const char *p = spec;
+    while (*p) {
+        while (*p && (isspace((unsigned char)*p) || ds4_gpu_expert_pool_pin_sep(*p))) p++;
+        if (!*p) break;
+        if (*p == 'L' || *p == 'l') p++;
+        char *endp = NULL;
+        unsigned long layer_ul = strtoul(p, &endp, 10);
+        if (endp == p) {
+            while (*p && !ds4_gpu_expert_pool_pin_sep(*p)) p++;
+            continue;
+        }
+        p = endp;
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (*p != ':' && *p != '=') {
+            while (*p && !ds4_gpu_expert_pool_pin_sep(*p)) p++;
+            continue;
+        }
+        p++;
+
+        while (*p) {
+            while (*p && (isspace((unsigned char)*p) || *p == ',')) p++;
+            if (ds4_gpu_expert_pool_pin_sep(*p) || !*p) break;
+            if (*p == 'E' || *p == 'e') p++;
+            endp = NULL;
+            unsigned long expert_ul = strtoul(p, &endp, 10);
+            if (endp == p) {
+                while (*p && *p != ',' && !ds4_gpu_expert_pool_pin_sep(*p)) p++;
+                continue;
+            }
+            p = endp;
+            if (layer_ul < DS4_METAL_EXPERT_PROFILE_MAX_LAYERS &&
+                expert_ul < DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS) {
+                (void)ds4_gpu_expert_pool_add_pin((uint32_t)layer_ul,
+                                                  (uint32_t)expert_ul,
+                                                  false);
+            }
+            while (*p && isspace((unsigned char)*p)) p++;
+            if (*p == ',') {
+                p++;
+                continue;
+            }
+            if (ds4_gpu_expert_pool_pin_sep(*p) || !*p) break;
+            p++;
+        }
+    }
+
+    if (g_expert_pool_pinned_total != 0) {
+        fprintf(stderr,
+                "ds4: expert-pool pinned whitelist loaded: %u experts from DS4_METAL_EXPERT_POOL_PINNED\n",
+                g_expert_pool_pinned_total);
+    }
+}
+
+static int ds4_gpu_expert_pool_is_pinned(uint32_t layer, uint32_t expert) {
+    return layer < DS4_METAL_EXPERT_PROFILE_MAX_LAYERS &&
+           expert < DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS &&
+           g_expert_pool_pinned[layer][expert];
+}
+
+static int ds4_gpu_expert_pool_entry_ready(uint32_t layer, uint32_t expert, int *pinned_out) {
+    bool ready = false;
+    bool pinned = false;
+    if (g_expert_pool_entries) {
+        for (uint32_t slot = 0; slot < g_expert_pool_slots; slot++) {
+            ds4_metal_expert_pool_entry *entry = &g_expert_pool_entries[slot];
+            if (entry->used && entry->layer == layer && entry->expert == expert) {
+                if (entry->ready) ready = true;
+                if (entry->pinned) pinned = true;
+            }
+        }
+    }
+    if (pinned_out) *pinned_out = pinned ? 1 : 0;
+    return ready ? 1 : 0;
+}
+
+static void ds4_gpu_expert_pool_print_hotlist(const char *tag, uint32_t top, bool include_pinned_empty) {
+    if (top == 0) return;
+    if (top > DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS) top = DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS;
+
+    for (uint32_t layer = 0; layer < DS4_METAL_EXPERT_PROFILE_MAX_LAYERS; layer++) {
+        uint64_t layer_req = 0;
+        for (uint32_t expert = 0; expert < DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS; expert++) {
+            layer_req += g_expert_pool_hot_count[layer][expert];
+        }
+        if (layer_req == 0 && (!include_pinned_empty || g_expert_pool_pinned_per_layer[layer] == 0)) continue;
+
+        uint32_t layer_cap = 0;
+        const int served = ds4_gpu_expert_pool_layer_served(layer, &layer_cap);
+        fprintf(stderr,
+                "ds4: expert-pool layer %02u: tag=%s requests=%llu pinned=%u static=%u dynamic=%u served=%d cap=%u\n",
+                layer,
+                tag ? tag : "live",
+                (unsigned long long)layer_req,
+                g_expert_pool_pinned_per_layer[layer],
+                g_expert_pool_static_pinned_per_layer[layer],
+                g_expert_pool_dynamic_pinned_per_layer[layer],
+                served,
+                layer_cap);
+
+        bool printed[DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS] = { false };
+        uint32_t printed_count = 0;
+        while (printed_count < top) {
+            int best = -1;
+            uint64_t best_req = 0;
+            for (uint32_t expert = 0; expert < DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS; expert++) {
+                if (printed[expert]) continue;
+                const uint64_t req = g_expert_pool_hot_count[layer][expert];
+                if (req > best_req) {
+                    best_req = req;
+                    best = (int)expert;
+                }
+            }
+            if (best < 0 || best_req == 0) break;
+            printed[(uint32_t)best] = true;
+            printed_count++;
+            int entry_pinned = 0;
+            const int resident = ds4_gpu_expert_pool_entry_ready(layer, (uint32_t)best, &entry_pinned);
+            fprintf(stderr,
+                    "ds4: expert-pool   L%02u E%03u req=%llu pinned=%d static=%d dynamic=%d resident=%d entry_pin=%d\n",
+                    layer,
+                    (uint32_t)best,
+                    (unsigned long long)best_req,
+                    ds4_gpu_expert_pool_is_pinned(layer, (uint32_t)best),
+                    g_expert_pool_static_pinned[layer][best] ? 1 : 0,
+                    g_expert_pool_dynamic_pinned[layer][best] ? 1 : 0,
+                    resident,
+                    entry_pinned);
+        }
+
+        if (!include_pinned_empty) continue;
+        for (uint32_t expert = 0; expert < DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS && printed_count < top; expert++) {
+            if (!g_expert_pool_pinned[layer][expert] || printed[expert]) continue;
+            printed_count++;
+            int entry_pinned = 0;
+            const int resident = ds4_gpu_expert_pool_entry_ready(layer, expert, &entry_pinned);
+            fprintf(stderr,
+                    "ds4: expert-pool   L%02u E%03u req=0 pinned=1 static=%d dynamic=%d resident=%d entry_pin=%d\n",
+                    layer,
+                    expert,
+                    g_expert_pool_static_pinned[layer][expert] ? 1 : 0,
+                    g_expert_pool_dynamic_pinned[layer][expert] ? 1 : 0,
+                    resident,
+                    entry_pinned);
+        }
+    }
+}
+
 static int ds4_gpu_expert_pool_is_enabled(void) {
     if (g_expert_pool_enabled < 0) {
         const uint64_t mb = ds4_gpu_env_u64("DS4_METAL_EXPERT_POOL_MB", 0);
@@ -14817,6 +15042,8 @@ static int ds4_gpu_expert_pool_is_enabled(void) {
             g_expert_pool_foreground_fill = fg_fill_env < 0 ? 1 : (fg_fill_env > 0);
             g_expert_pool_warm_batch = ds4_gpu_env_bool("DS4_METAL_EXPERT_POOL_WARM_BATCH") > 0;
             g_expert_pool_prefetch_evict = ds4_gpu_env_bool("DS4_METAL_EXPERT_POOL_PREFETCH_EVICT") > 0;
+            int hit_only_env = ds4_gpu_env_bool("DS4_METAL_EXPERT_POOL_HIT_ONLY");
+            g_expert_pool_hit_only = hit_only_env < 0 ? 1 : (hit_only_env > 0);
             g_expert_pool_admit_after = (uint32_t)ds4_gpu_env_u64("DS4_METAL_EXPERT_POOL_ADMIT_AFTER", 1u);
             if (g_expert_pool_admit_after == 0) g_expert_pool_admit_after = 1u;
             g_expert_pool_hotlock_top = (uint32_t)ds4_gpu_env_u64("DS4_METAL_EXPERT_POOL_HOTLOCK_TOP", 0u);
@@ -14824,6 +15051,20 @@ static int ds4_gpu_expert_pool_is_enabled(void) {
                 g_expert_pool_hotlock_top = DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS;
             }
             g_expert_pool_hotlock_enabled = g_expert_pool_hotlock_top != 0 ? 1 : 0;
+            g_expert_pool_auto_pin_top = (uint32_t)ds4_gpu_env_u64("DS4_METAL_EXPERT_POOL_AUTO_PIN_TOP", 0u);
+            if (g_expert_pool_auto_pin_top > DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS) {
+                g_expert_pool_auto_pin_top = DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS;
+            }
+            g_expert_pool_auto_pin_min_req = (uint32_t)ds4_gpu_env_u64("DS4_METAL_EXPERT_POOL_AUTO_PIN_MIN_REQ", 3u);
+            if (g_expert_pool_auto_pin_min_req == 0) g_expert_pool_auto_pin_min_req = 1u;
+            g_expert_pool_auto_pin_interval = (uint32_t)ds4_gpu_env_u64("DS4_METAL_EXPERT_POOL_AUTO_PIN_INTERVAL", 32u);
+            g_expert_pool_pin_reserve = (uint32_t)ds4_gpu_env_u64("DS4_METAL_EXPERT_POOL_PIN_RESERVE", 8u);
+            g_expert_pool_hotlist_top = (uint32_t)ds4_gpu_env_u64("DS4_METAL_EXPERT_POOL_HOTLIST_TOP", 16u);
+            if (g_expert_pool_hotlist_top > DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS) {
+                g_expert_pool_hotlist_top = DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS;
+            }
+            g_expert_pool_hotlist_interval = (uint32_t)ds4_gpu_env_u64("DS4_METAL_EXPERT_POOL_HOTLIST_INTERVAL", g_expert_pool_interval);
+            ds4_gpu_expert_pool_parse_pinned_env();
         }
     }
     return g_expert_pool_enabled;
@@ -14835,10 +15076,14 @@ static void ds4_gpu_expert_pool_print(const char *tag) {
         g_expert_pool_admission_skips == 0) return;
     const double hit_pct = g_expert_pool_requests ?
         100.0 * (double)g_expert_pool_hits / (double)g_expert_pool_requests : 0.0;
+    const double pinned_hit_pct = g_expert_pool_pinned_requests ?
+        100.0 * (double)g_expert_pool_pinned_hits / (double)g_expert_pool_pinned_requests : 0.0;
     fprintf(stderr,
             "ds4: expert-pool %s: calls=%llu requests=%llu hit=%.2f%% hits=%llu "
             "misses=%llu inflight=%llu fallbacks=%llu admit_skip=%llu slots=%u slot=%.3f MiB budget=%.2f MiB "
-            "layers=%u:%u prefetch=%llu pf_hit=%llu pf_miss=%llu pf_drop=%llu pf_copy=%llu "
+            "layers=%u:%u pinned=%u static=%u dynamic=%u auto_pin=%u/%u/%u auto_updates=%llu "
+            "pinned_req=%llu pinned_hit=%.2f%% pinned_hits=%llu pinned_miss=%llu pinned_pf=%llu "
+            "prefetch=%llu pf_hit=%llu pf_miss=%llu pf_drop=%llu pf_copy=%llu "
             "miss_copy=%.2f GiB sync_copy=%.3f ms pf_copy_ms=%.3f wait=%llu/%.3f ms\n",
             tag ? tag : "live",
             (unsigned long long)g_expert_pool_calls,
@@ -14854,6 +15099,18 @@ static void ds4_gpu_expert_pool_print(const char *tag) {
             (double)g_expert_pool_budget_bytes / (1024.0 * 1024.0),
             g_expert_pool_layer_start,
             g_expert_pool_layer_end,
+            g_expert_pool_pinned_total,
+            g_expert_pool_static_pinned_total,
+            g_expert_pool_dynamic_pinned_total,
+            g_expert_pool_auto_pin_top,
+            g_expert_pool_auto_pin_min_req,
+            g_expert_pool_pin_reserve,
+            (unsigned long long)g_expert_pool_auto_pin_updates,
+            (unsigned long long)g_expert_pool_pinned_requests,
+            pinned_hit_pct,
+            (unsigned long long)g_expert_pool_pinned_hits,
+            (unsigned long long)g_expert_pool_pinned_misses,
+            (unsigned long long)g_expert_pool_pinned_prefetches,
             (unsigned long long)g_expert_pool_prefetches,
             (unsigned long long)g_expert_pool_prefetch_hits,
             (unsigned long long)g_expert_pool_prefetch_misses,
@@ -14868,6 +15125,8 @@ static void ds4_gpu_expert_pool_print(const char *tag) {
 
 static void ds4_gpu_expert_pool_summary(void) {
     ds4_gpu_expert_pool_print("summary");
+    uint32_t top = g_expert_pool_hotlist_top != 0 ? g_expert_pool_hotlist_top : 16u;
+    ds4_gpu_expert_pool_print_hotlist("summary", top, true);
 }
 
 static void ds4_gpu_expert_pool_lru_unlink(int32_t idx) {
@@ -14993,12 +15252,19 @@ static int ds4_gpu_expert_pool_enqueue_prefetch_unlocked(
         g_expert_pool_prefetch_drops++;
         return 0;
     }
-    ds4_metal_expert_prefetch_req *r = &g_expert_pool_prefetch_queue[g_expert_pool_prefetch_qtail];
+    ds4_metal_expert_prefetch_req *r = NULL;
+    if (ds4_gpu_expert_pool_is_pinned(layer, expert)) {
+        g_expert_pool_prefetch_qhead = (g_expert_pool_prefetch_qhead + g_expert_pool_prefetch_qcap - 1u) %
+                                      g_expert_pool_prefetch_qcap;
+        r = &g_expert_pool_prefetch_queue[g_expert_pool_prefetch_qhead];
+    } else {
+        r = &g_expert_pool_prefetch_queue[g_expert_pool_prefetch_qtail];
+        g_expert_pool_prefetch_qtail = (g_expert_pool_prefetch_qtail + 1u) % g_expert_pool_prefetch_qcap;
+    }
     r->used = true;
     r->model_map = model_map;
     r->layer = layer;
     r->expert = expert;
-    g_expert_pool_prefetch_qtail = (g_expert_pool_prefetch_qtail + 1u) % g_expert_pool_prefetch_qcap;
     g_expert_pool_prefetch_qcount++;
     pthread_cond_signal(&g_expert_pool_cv);
     return 1;
@@ -15090,6 +15356,7 @@ static bool ds4_gpu_expert_pool_protected(
     if (!e || !e->used) return false;
     if (e->busy || e->loading) return true;
     if (e->model_map != model_map) return false;
+    if (e->pinned) return true;
     if (e->layer != layer) {
         /* Effective LRU is per served layer: layer A must never evict layer B,
          * otherwise a small global pool cycles through layers and can hit 0% even
@@ -15131,6 +15398,93 @@ static int32_t ds4_gpu_expert_pool_victim(
         }
     }
     return -1;
+}
+
+static void ds4_gpu_expert_pool_queue_pinned_layer(
+        const void *model_map,
+        uint32_t layer) {
+    if (!model_map || g_expert_pool_pinned_total == 0) return;
+    if (layer >= DS4_METAL_EXPERT_PROFILE_MAX_LAYERS) return;
+    if (g_expert_pool_pinned_layer_queued[layer]) return;
+
+    pthread_mutex_lock(&g_expert_pool_mu);
+    if (!g_expert_pool_pinned_layer_queued[layer]) {
+        uint32_t queued = 0;
+        uint32_t wanted = 0;
+        for (uint32_t expert = 0; expert < DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS; expert++) {
+            if (!g_expert_pool_pinned[layer][expert]) continue;
+            wanted++;
+            if (ds4_gpu_expert_pool_enqueue_prefetch_unlocked(model_map, layer, expert)) {
+                queued++;
+            }
+        }
+        if (queued != 0) {
+            g_expert_pool_pinned_prefetches += queued;
+        }
+        if (wanted != 0 && queued == wanted) {
+            g_expert_pool_pinned_layer_queued[layer] = true;
+        }
+    }
+    pthread_mutex_unlock(&g_expert_pool_mu);
+}
+
+static void ds4_gpu_expert_pool_auto_pin_layer(
+        const void *model_map,
+        uint32_t layer,
+        uint32_t layer_cap) {
+    if (!model_map || g_expert_pool_auto_pin_top == 0) return;
+    if (layer >= DS4_METAL_EXPERT_PROFILE_MAX_LAYERS || layer_cap <= 6u) return;
+
+    uint64_t layer_req = 0;
+    for (uint32_t expert = 0; expert < DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS; expert++) {
+        layer_req += g_expert_pool_hot_count[layer][expert];
+    }
+    if (layer_req < g_expert_pool_auto_pin_min_req) return;
+    if (g_expert_pool_auto_pin_interval != 0 &&
+        layer_req < g_expert_pool_auto_pin_last_req[layer] + g_expert_pool_auto_pin_interval) {
+        return;
+    }
+    g_expert_pool_auto_pin_last_req[layer] = layer_req;
+
+    uint32_t max_pin = g_expert_pool_auto_pin_top;
+    uint32_t reserve = g_expert_pool_pin_reserve;
+    if (reserve < 6u) reserve = 6u;
+    if (layer_cap > reserve) {
+        const uint32_t cap_limit = layer_cap - reserve;
+        if (max_pin > cap_limit) max_pin = cap_limit;
+    } else {
+        max_pin = 0;
+    }
+    if (max_pin == 0 || g_expert_pool_pinned_per_layer[layer] >= max_pin) return;
+
+    bool chosen[DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS] = { false };
+    uint32_t added = 0;
+    while (g_expert_pool_pinned_per_layer[layer] < max_pin) {
+        int best = -1;
+        uint64_t best_req = 0;
+        for (uint32_t expert = 0; expert < DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS; expert++) {
+            if (chosen[expert] || g_expert_pool_pinned[layer][expert]) continue;
+            const uint64_t req = g_expert_pool_hot_count[layer][expert];
+            if (req >= (uint64_t)g_expert_pool_auto_pin_min_req && req > best_req) {
+                best_req = req;
+                best = (int)expert;
+            }
+        }
+        if (best < 0) break;
+        chosen[(uint32_t)best] = true;
+        if (ds4_gpu_expert_pool_add_pin(layer, (uint32_t)best, true)) {
+            added++;
+        }
+    }
+    if (added != 0) {
+        uint32_t queued = 0;
+        for (uint32_t expert = 0; expert < DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS; expert++) {
+            if (!g_expert_pool_pinned[layer][expert]) continue;
+            if (ds4_gpu_expert_pool_enqueue_prefetch_unlocked(model_map, layer, expert)) queued++;
+        }
+        if (queued != 0) g_expert_pool_pinned_prefetches += queued;
+        g_expert_pool_auto_pin_updates++;
+    }
 }
 
 static bool ds4_gpu_expert_pool_choose_hotlock(
@@ -15255,6 +15609,7 @@ static void *ds4_gpu_expert_pool_prefetch_main(void *arg) {
         e->model_map = req.model_map;
         e->layer = req.layer;
         e->expert = req.expert;
+        e->pinned = ds4_gpu_expert_pool_is_pinned(req.layer, req.expert);
         e->last_used = ++g_expert_pool_clock;
         ds4_gpu_expert_pool_lru_link_head(slot);
         g_expert_pool_prefetch_misses++;
@@ -15352,7 +15707,7 @@ static int ds4_gpu_expert_pool_init(uint64_t gate_expert_bytes, uint64_t down_ex
     g_expert_pool_down_expert_bytes = down_expert_bytes;
     g_expert_pool_slot_bytes = slot_bytes;
     g_expert_pool_slots = slots;
-    if (g_expert_pool_lookahead != 0 && !g_expert_pool_prefetch_queue) {
+    if ((g_expert_pool_lookahead != 0 || g_expert_pool_pinned_total != 0 || g_expert_pool_hit_only) && !g_expert_pool_prefetch_queue) {
         uint64_t qcap64 = ds4_gpu_env_u64("DS4_METAL_EXPERT_POOL_PREFETCH_QUEUE", (uint64_t)slots * 8ull);
         if (qcap64 < 64u) qcap64 = 64u;
         if (qcap64 > 65536u) qcap64 = 65536u;
@@ -15381,7 +15736,7 @@ static int ds4_gpu_expert_pool_init(uint64_t gate_expert_bytes, uint64_t down_ex
             "ds4: expert-pool enabled: %.2f MiB, %u slots, one expert %.3f MiB "
             "(gate=%.3f up=%.3f down=%.3f), configured layers %u:%u, serving tail %u/%u layers with >=%u slots/layer. "
             "LRU resident pool with async predictor prefetch lookahead=%u top=%u q=%u "
-            "self=%s adjacent=%s admit_after=%u wait_inflight=%s foreground_fill=%s warm_batch=%s pf_evict=%s%s; hits bypass A3 scratch copy.\n",
+            "self=%s adjacent=%s admit_after=%u pinned=%u static=%u dynamic=%u auto_pin_top=%u min_req=%u reserve=%u hotlist=%u/%u hit_only=%s wait_inflight=%s foreground_fill=%s warm_batch=%s pf_evict=%s%s; hits bypass A3 scratch copy.\n",
             (double)(2ull * gate_total + down_total) / (1024.0 * 1024.0),
             slots,
             (double)slot_bytes / (1024.0 * 1024.0),
@@ -15399,6 +15754,15 @@ static int ds4_gpu_expert_pool_init(uint64_t gate_expert_bytes, uint64_t down_ex
             g_expert_pool_prefetch_self ? "on" : "off",
             g_expert_pool_prefetch_adjacent ? "on" : "off",
             g_expert_pool_admit_after,
+            g_expert_pool_pinned_total,
+            g_expert_pool_static_pinned_total,
+            g_expert_pool_dynamic_pinned_total,
+            g_expert_pool_auto_pin_top,
+            g_expert_pool_auto_pin_min_req,
+            g_expert_pool_pin_reserve,
+            g_expert_pool_hotlist_top,
+            g_expert_pool_hotlist_interval,
+            g_expert_pool_hit_only ? "on" : "off",
             g_expert_pool_wait_inflight ? "on" : "off",
             g_expert_pool_foreground_fill ? "on" : "off",
             g_expert_pool_warm_batch ? "on" : "off",
@@ -15456,6 +15820,19 @@ static int ds4_gpu_try_load_layer_experts_to_pool(
         g_expert_pool_fallbacks++;
         return 0;
     }
+    if (layer_index < DS4_METAL_EXPERT_PROFILE_MAX_LAYERS &&
+        g_expert_pool_pinned_per_layer[layer_index] > layer_cap) {
+        static bool warned[DS4_METAL_EXPERT_PROFILE_MAX_LAYERS];
+        if (!warned[layer_index]) {
+            fprintf(stderr,
+                    "ds4: expert-pool pinned whitelist layer %u has %u experts but layer cap is %u; "
+                    "LRU misses may fall back until DS4_METAL_EXPERT_POOL_MB or min_layer_slots is increased.\n",
+                    layer_index,
+                    g_expert_pool_pinned_per_layer[layer_index],
+                    layer_cap);
+            warned[layer_index] = true;
+        }
+    }
     if (selectedbuf.storageMode != MTLStorageModeShared) return 0;
 
     int32_t pool_slots[1024];
@@ -15481,6 +15858,59 @@ static int ds4_gpu_try_load_layer_experts_to_pool(
                                             gate_expert_bytes,
                                             down_expert_bytes,
                                             n_expert_total);
+    ds4_gpu_expert_pool_queue_pinned_layer(model_map, layer_index);
+
+    if (g_expert_pool_hit_only) {
+        bool all_ready = true;
+        bool ready_flags[1024] = { false };
+        pthread_mutex_lock(&g_expert_pool_mu);
+        for (uint32_t i = 0; i < n_active; i++) {
+            const uint32_t expert = active_ids[i];
+            if (expert >= n_expert_total) {
+                all_ready = false;
+                continue;
+            }
+            const int32_t slot = ds4_gpu_expert_pool_find(model_map, layer_index, expert);
+            ds4_metal_expert_pool_entry *entry = slot >= 0 ? &g_expert_pool_entries[slot] : NULL;
+            ready_flags[i] = entry && entry->ready;
+            if (!ready_flags[i]) {
+                all_ready = false;
+                if (g_expert_pool_prefetch_queue) {
+                    (void)ds4_gpu_expert_pool_enqueue_prefetch_unlocked(model_map, layer_index, expert);
+                }
+            }
+        }
+        if (!all_ready) {
+            for (uint32_t i = 0; i < n_active; i++) {
+                const uint32_t expert = active_ids[i];
+                if (expert >= n_expert_total) continue;
+                const int request_pinned = ds4_gpu_expert_pool_is_pinned(layer_index, expert);
+                g_expert_pool_requests++;
+                if (request_pinned) g_expert_pool_pinned_requests++;
+                if (layer_index < DS4_METAL_EXPERT_PROFILE_MAX_LAYERS &&
+                    expert < DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS) {
+                    g_expert_pool_hot_count[layer_index][expert]++;
+                    ds4_gpu_expert_pool_auto_pin_layer(model_map, layer_index, layer_cap);
+                }
+                if (ready_flags[i]) {
+                    const int32_t slot = ds4_gpu_expert_pool_find(model_map, layer_index, expert);
+                    if (slot >= 0) {
+                        g_expert_pool_hits++;
+                        if (request_pinned) g_expert_pool_pinned_hits++;
+                        g_expert_pool_entries[slot].last_used = ++g_expert_pool_clock;
+                        ds4_gpu_expert_pool_lru_touch(slot);
+                    }
+                } else {
+                    g_expert_pool_misses++;
+                    if (request_pinned) g_expert_pool_pinned_misses++;
+                }
+            }
+            g_expert_pool_admission_skips++;
+            pthread_mutex_unlock(&g_expert_pool_mu);
+            return 0;
+        }
+        pthread_mutex_unlock(&g_expert_pool_mu);
+    }
 
     double copy_t0 = 0.0;
     bool copied_any = false;
@@ -15495,6 +15925,7 @@ static int ds4_gpu_try_load_layer_experts_to_pool(
         }
 
         bool counted_request = false;
+        bool request_pinned = false;
         for (;;) {
             int32_t slot = -1;
             bool need_sync_copy = false;
@@ -15503,9 +15934,15 @@ static int ds4_gpu_try_load_layer_experts_to_pool(
             pthread_mutex_lock(&g_expert_pool_mu);
             if (!counted_request) {
                 g_expert_pool_requests++;
+                const int was_pinned = ds4_gpu_expert_pool_is_pinned(layer_index, expert);
+                if (was_pinned) {
+                    g_expert_pool_pinned_requests++;
+                    request_pinned = true;
+                }
                 if (layer_index < DS4_METAL_EXPERT_PROFILE_MAX_LAYERS &&
                     expert < DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS) {
                     g_expert_pool_hot_count[layer_index][expert]++;
+                    ds4_gpu_expert_pool_auto_pin_layer(model_map, layer_index, layer_cap);
                 }
                 counted_request = true;
             }
@@ -15515,6 +15952,7 @@ static int ds4_gpu_try_load_layer_experts_to_pool(
                 ds4_metal_expert_pool_entry *e = &g_expert_pool_entries[slot];
                 if (e->ready) {
                     g_expert_pool_hits++;
+                    if (request_pinned) g_expert_pool_pinned_hits++;
                     e->busy = true;
                     e->last_used = ++g_expert_pool_clock;
                     ds4_gpu_expert_pool_lru_touch(slot);
@@ -15615,10 +16053,12 @@ static int ds4_gpu_try_load_layer_experts_to_pool(
                 e->model_map = model_map;
                 e->layer = layer_index;
                 e->expert = expert;
+                e->pinned = ds4_gpu_expert_pool_is_pinned(layer_index, expert);
                 e->last_used = ++g_expert_pool_clock;
                 ds4_gpu_expert_pool_lru_link_head(slot);
                 need_sync_copy = true;
                 g_expert_pool_misses++;
+                if (request_pinned) g_expert_pool_pinned_misses++;
                 pthread_mutex_unlock(&g_expert_pool_mu);
             } else {
                 pthread_mutex_unlock(&g_expert_pool_mu);
@@ -15686,6 +16126,11 @@ static int ds4_gpu_try_load_layer_experts_to_pool(
     if (g_expert_pool_interval != 0 && (g_expert_pool_calls % g_expert_pool_interval) == 0) {
         ds4_gpu_expert_pool_print("live");
     }
+    if (g_expert_pool_hotlist_interval != 0 &&
+        g_expert_pool_hotlist_top != 0 &&
+        (g_expert_pool_calls % g_expert_pool_hotlist_interval) == 0) {
+        ds4_gpu_expert_pool_print_hotlist("live", g_expert_pool_hotlist_top, false);
+    }
 
     /* Keep the LRU pool mandatory, but overlap future misses: current-layer active
      * IDs are a strong predictor for the next layer in this hash-routed q2 GGUF,
@@ -15743,6 +16188,7 @@ static ds4_metal_expert_source_entry *g_expert_source_entries;
 static uint32_t g_expert_source_cap;
 static int32_t g_expert_source_head = -1;
 static int32_t g_expert_source_tail = -1;
+static int32_t g_expert_source_index[DS4_METAL_EXPERT_PROFILE_MAX_LAYERS][DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS];
 static uint32_t g_expert_source_seen[DS4_METAL_EXPERT_PROFILE_MAX_LAYERS][DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS];
 static uint64_t g_expert_source_requests;
 static uint64_t g_expert_source_hits;
@@ -15753,6 +16199,33 @@ static uint64_t g_expert_source_soft_entries;
 static uint64_t g_expert_source_locked_entries;
 static uint64_t g_expert_source_lock_failures;
 static double   g_expert_source_admit_ms;
+static int      g_expert_source_async_prefetch;
+
+typedef struct {
+    const void *model_map;
+    uint64_t gate_offset;
+    uint64_t up_offset;
+    uint64_t down_offset;
+    uint64_t gate_expert_bytes;
+    uint64_t down_expert_bytes;
+    uint32_t layer;
+    uint32_t expert;
+} ds4_metal_expert_source_prefetch_req;
+
+static pthread_mutex_t g_expert_source_pf_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_expert_source_pf_cv = PTHREAD_COND_INITIALIZER;
+static pthread_t g_expert_source_pf_thread;
+static int g_expert_source_pf_thread_started;
+static int g_expert_source_pf_shutdown;
+static ds4_metal_expert_source_prefetch_req *g_expert_source_pf_q;
+static uint32_t g_expert_source_pf_qcap;
+static uint32_t g_expert_source_pf_qhead;
+static uint32_t g_expert_source_pf_qtail;
+static uint32_t g_expert_source_pf_qcount;
+static uint64_t g_expert_source_pf_enqueued;
+static uint64_t g_expert_source_pf_dropped;
+static uint64_t g_expert_source_pf_done;
+static double   g_expert_source_pf_ms;
 
 static int ds4_gpu_expert_source_is_enabled(void) {
     if (g_expert_source_enabled < 0) {
@@ -15770,6 +16243,7 @@ static int ds4_gpu_expert_source_is_enabled(void) {
             g_expert_source_interval = (uint32_t)ds4_gpu_env_u64("DS4_METAL_EXPERT_SOURCE_CACHE_INTERVAL", 64u);
             g_expert_source_use_mlock = ds4_gpu_env_bool("DS4_METAL_EXPERT_SOURCE_CACHE_MLOCK") > 0;
             g_expert_source_hard_copy = ds4_gpu_env_bool("DS4_METAL_EXPERT_SOURCE_CACHE_HARD_COPY") > 0;
+            g_expert_source_async_prefetch = ds4_gpu_env_bool("DS4_METAL_EXPERT_SOURCE_CACHE_ASYNC") > 0;
         }
     }
     return g_expert_source_enabled;
@@ -15785,7 +16259,7 @@ static void ds4_gpu_expert_source_print(const char *tag) {
     fprintf(stderr,
             "ds4: expert-source-cache %s: requests=%llu hit=%.2f%% hits=%llu misses=%llu "
             "admit=%llu evict=%llu used=%.2f/%.2f MiB peak=%.2f MiB "
-            "layers=%u:%u admit_after=%u mlock=%s hard_copy=%s locked=%llu soft=%llu lock_fail=%llu admit=%.3f ms\n",
+            "layers=%u:%u admit_after=%u mlock=%s hard_copy=%s async=%s locked=%llu soft=%llu lock_fail=%llu admit=%.3f ms pf=%llu/%llu drop=%llu pf_ms=%.3f\n",
             tag ? tag : "live",
             (unsigned long long)g_expert_source_requests,
             hit_pct,
@@ -15801,10 +16275,15 @@ static void ds4_gpu_expert_source_print(const char *tag) {
             g_expert_source_admit_after,
             (g_expert_source_use_mlock && !g_expert_source_mlock_disabled) ? "on" : "off",
             g_expert_source_hard_copy ? "on" : "off",
+            g_expert_source_async_prefetch ? "on" : "off",
             (unsigned long long)g_expert_source_locked_entries,
             (unsigned long long)g_expert_source_soft_entries,
             (unsigned long long)g_expert_source_lock_failures,
-            g_expert_source_admit_ms);
+            g_expert_source_admit_ms,
+            (unsigned long long)g_expert_source_pf_done,
+            (unsigned long long)g_expert_source_pf_enqueued,
+            (unsigned long long)g_expert_source_pf_dropped,
+            g_expert_source_pf_ms);
 }
 
 static void ds4_gpu_expert_source_summary(void) {
@@ -15876,6 +16355,11 @@ static void ds4_gpu_expert_source_evict_tail(void) {
     if (idx < 0) return;
     ds4_metal_expert_source_entry *e = &g_expert_source_entries[idx];
     ds4_gpu_expert_source_lru_unlink(idx);
+    if (e->layer < DS4_METAL_EXPERT_PROFILE_MAX_LAYERS &&
+        e->expert < DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS &&
+        g_expert_source_index[e->layer][e->expert] == idx) {
+        g_expert_source_index[e->layer][e->expert] = -1;
+    }
     ds4_gpu_expert_source_unlock_entry(e);
     if (g_expert_source_used_bytes >= e->charged_bytes) {
         g_expert_source_used_bytes -= e->charged_bytes;
@@ -15890,9 +16374,23 @@ static void ds4_gpu_expert_source_evict_tail(void) {
 
 static int32_t ds4_gpu_expert_source_find(const void *model_map, uint32_t layer, uint32_t expert) {
     if (!g_expert_source_entries) return -1;
+    if (layer < DS4_METAL_EXPERT_PROFILE_MAX_LAYERS &&
+        expert < DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS) {
+        const int32_t idx = g_expert_source_index[layer][expert];
+        if (idx >= 0 && (uint32_t)idx < g_expert_source_cap) {
+            ds4_metal_expert_source_entry *e = &g_expert_source_entries[idx];
+            if (e->used && e->model_map == model_map && e->layer == layer && e->expert == expert) {
+                return idx;
+            }
+        }
+    }
     for (uint32_t i = 0; i < g_expert_source_cap; i++) {
         ds4_metal_expert_source_entry *e = &g_expert_source_entries[i];
         if (e->used && e->model_map == model_map && e->layer == layer && e->expert == expert) {
+            if (layer < DS4_METAL_EXPERT_PROFILE_MAX_LAYERS &&
+                expert < DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS) {
+                g_expert_source_index[layer][expert] = (int32_t)i;
+            }
             return (int32_t)i;
         }
     }
@@ -15919,6 +16417,11 @@ static int ds4_gpu_expert_source_init(void) {
     g_expert_source_cap = DS4_METAL_EXPERT_SOURCE_MAX_ENTRIES;
     g_expert_source_entries = calloc(g_expert_source_cap, sizeof(g_expert_source_entries[0]));
     if (!g_expert_source_entries) return 0;
+    for (uint32_t l = 0; l < DS4_METAL_EXPERT_PROFILE_MAX_LAYERS; l++) {
+        for (uint32_t e = 0; e < DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS; e++) {
+            g_expert_source_index[l][e] = -1;
+        }
+    }
     for (uint32_t i = 0; i < g_expert_source_cap; i++) {
         g_expert_source_entries[i].prev = -1;
         g_expert_source_entries[i].next = -1;
@@ -15957,6 +16460,107 @@ static int ds4_gpu_expert_source_try_mlock(void *base, size_t len, bool *locked)
      * first failure so hot-loop admission does not repeatedly pay syscall costs. */
     g_expert_source_mlock_disabled = true;
     return 0;
+}
+
+static void *ds4_gpu_expert_source_prefetch_main(void *arg) {
+    (void)arg;
+    for (;;) {
+        ds4_metal_expert_source_prefetch_req req = { 0 };
+        pthread_mutex_lock(&g_expert_source_pf_mu);
+        while (!g_expert_source_pf_shutdown && g_expert_source_pf_qcount == 0) {
+            pthread_cond_wait(&g_expert_source_pf_cv, &g_expert_source_pf_mu);
+        }
+        if (g_expert_source_pf_shutdown && g_expert_source_pf_qcount == 0) {
+            pthread_mutex_unlock(&g_expert_source_pf_mu);
+            break;
+        }
+        req = g_expert_source_pf_q[g_expert_source_pf_qhead];
+        g_expert_source_pf_qhead = (g_expert_source_pf_qhead + 1u) % g_expert_source_pf_qcap;
+        g_expert_source_pf_qcount--;
+        pthread_mutex_unlock(&g_expert_source_pf_mu);
+
+        void *gate_base = NULL, *up_base = NULL, *down_base = NULL;
+        size_t gate_len = 0, up_len = 0, down_len = 0;
+        ds4_gpu_expert_source_align_range(req.model_map,
+                                          req.gate_offset + (uint64_t)req.expert * req.gate_expert_bytes,
+                                          req.gate_expert_bytes,
+                                          &gate_base,
+                                          &gate_len);
+        ds4_gpu_expert_source_align_range(req.model_map,
+                                          req.up_offset + (uint64_t)req.expert * req.gate_expert_bytes,
+                                          req.gate_expert_bytes,
+                                          &up_base,
+                                          &up_len);
+        ds4_gpu_expert_source_align_range(req.model_map,
+                                          req.down_offset + (uint64_t)req.expert * req.down_expert_bytes,
+                                          req.down_expert_bytes,
+                                          &down_base,
+                                          &down_len);
+        const double t0 = ds4_gpu_now_ms();
+        (void)madvise(gate_base, gate_len, MADV_WILLNEED);
+        (void)madvise(up_base, up_len, MADV_WILLNEED);
+        (void)madvise(down_base, down_len, MADV_WILLNEED);
+        const double dt = ds4_gpu_now_ms() - t0;
+        __sync_fetch_and_add(&g_expert_source_pf_done, 1ull);
+        g_expert_source_pf_ms += dt;
+    }
+    return NULL;
+}
+
+static void ds4_gpu_expert_source_prefetch_summary(void) {
+    pthread_mutex_lock(&g_expert_source_pf_mu);
+    g_expert_source_pf_shutdown = 1;
+    pthread_cond_broadcast(&g_expert_source_pf_cv);
+    pthread_mutex_unlock(&g_expert_source_pf_mu);
+}
+
+static int ds4_gpu_expert_source_prefetch_init(void) {
+    if (!g_expert_source_async_prefetch) return 0;
+    if (g_expert_source_pf_thread_started) return 1;
+    g_expert_source_pf_qcap = (uint32_t)ds4_gpu_env_u64("DS4_METAL_EXPERT_SOURCE_CACHE_ASYNC_QUEUE", 8192u);
+    if (g_expert_source_pf_qcap < 64u) g_expert_source_pf_qcap = 64u;
+    g_expert_source_pf_q = calloc(g_expert_source_pf_qcap, sizeof(g_expert_source_pf_q[0]));
+    if (!g_expert_source_pf_q) return 0;
+    if (pthread_create(&g_expert_source_pf_thread, NULL, ds4_gpu_expert_source_prefetch_main, NULL) != 0) {
+        free(g_expert_source_pf_q);
+        g_expert_source_pf_q = NULL;
+        return 0;
+    }
+    pthread_detach(g_expert_source_pf_thread);
+    g_expert_source_pf_thread_started = 1;
+    atexit(ds4_gpu_expert_source_prefetch_summary);
+    return 1;
+}
+
+static void ds4_gpu_expert_source_prefetch_enqueue(
+        const void *model_map,
+        uint32_t expert,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes) {
+    if (!model_map || !ds4_gpu_expert_source_prefetch_init()) return;
+    ds4_metal_expert_source_prefetch_req req = {
+        .model_map = model_map,
+        .gate_offset = gate_offset,
+        .up_offset = up_offset,
+        .down_offset = down_offset,
+        .gate_expert_bytes = gate_expert_bytes,
+        .down_expert_bytes = down_expert_bytes,
+        .expert = expert,
+    };
+    pthread_mutex_lock(&g_expert_source_pf_mu);
+    if (g_expert_source_pf_qcount == g_expert_source_pf_qcap) {
+        g_expert_source_pf_dropped++;
+    } else {
+        g_expert_source_pf_q[g_expert_source_pf_qtail] = req;
+        g_expert_source_pf_qtail = (g_expert_source_pf_qtail + 1u) % g_expert_source_pf_qcap;
+        g_expert_source_pf_qcount++;
+        g_expert_source_pf_enqueued++;
+        pthread_cond_signal(&g_expert_source_pf_cv);
+    }
+    pthread_mutex_unlock(&g_expert_source_pf_mu);
 }
 
 static void ds4_gpu_expert_source_admit(
@@ -16046,6 +16650,10 @@ static void ds4_gpu_expert_source_admit(
     e->up_locked = ul;
     e->down_locked = dl;
     ds4_gpu_expert_source_lru_link_head(idx);
+    if (layer < DS4_METAL_EXPERT_PROFILE_MAX_LAYERS &&
+        expert < DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS) {
+        g_expert_source_index[layer][expert] = idx;
+    }
     g_expert_source_used_bytes += charge;
     if (g_expert_source_used_bytes > g_expert_source_peak_bytes) g_expert_source_peak_bytes = g_expert_source_used_bytes;
     g_expert_source_admissions++;
@@ -16082,14 +16690,24 @@ static void ds4_gpu_expert_source_cache_note(
         g_expert_source_misses++;
         uint32_t seen = ++g_expert_source_seen[layer][expert];
         if (seen >= g_expert_source_admit_after) {
-            ds4_gpu_expert_source_admit(model_map,
-                                        layer,
-                                        expert,
-                                        gate_offset,
-                                        up_offset,
-                                        down_offset,
-                                        gate_expert_bytes,
-                                        down_expert_bytes);
+            if (g_expert_source_async_prefetch && !g_expert_source_hard_copy) {
+                ds4_gpu_expert_source_prefetch_enqueue(model_map,
+                                                       expert,
+                                                       gate_offset,
+                                                       up_offset,
+                                                       down_offset,
+                                                       gate_expert_bytes,
+                                                       down_expert_bytes);
+            } else {
+                ds4_gpu_expert_source_admit(model_map,
+                                            layer,
+                                            expert,
+                                            gate_offset,
+                                            up_offset,
+                                            down_offset,
+                                            gate_expert_bytes,
+                                            down_expert_bytes);
+            }
         }
     }
     if (g_expert_source_interval != 0 &&
@@ -16098,17 +16716,25 @@ static void ds4_gpu_expert_source_cache_note(
     }
 }
 
-static const ds4_metal_expert_source_entry *ds4_gpu_expert_source_hard_find(
+static const ds4_metal_expert_source_entry *ds4_gpu_expert_source_hard_find_ex(
         const void *model_map,
         uint32_t layer,
-        uint32_t expert) {
+        uint32_t expert,
+        bool touch_lru) {
     if (!g_expert_source_hard_copy || !g_expert_source_entries) return NULL;
     int32_t idx = ds4_gpu_expert_source_find(model_map, layer, expert);
     if (idx < 0) return NULL;
     ds4_metal_expert_source_entry *e = &g_expert_source_entries[idx];
     if (!e->hard_copy || !e->gate_copy || !e->up_copy || !e->down_copy) return NULL;
-    ds4_gpu_expert_source_lru_touch(idx);
+    if (touch_lru) ds4_gpu_expert_source_lru_touch(idx);
     return e;
+}
+
+static const ds4_metal_expert_source_entry *ds4_gpu_expert_source_hard_find(
+        const void *model_map,
+        uint32_t layer,
+        uint32_t expert) {
+    return ds4_gpu_expert_source_hard_find_ex(model_map, layer, expert, true);
 }
 
 static uint32_t ds4_gpu_expert_gather_threads(void) {
@@ -16130,6 +16756,7 @@ static uint32_t ds4_gpu_expert_gather_threads(void) {
 }
 
 typedef struct {
+    const void *model_map;
     const uint8_t *map;
     uint8_t *gate_dst;
     uint8_t *up_dst;
@@ -16137,6 +16764,7 @@ typedef struct {
     const uint32_t *active_ids;
     uint32_t n_active;
     uint32_t n_expert_total;
+    uint32_t layer_index;
     uint64_t gate_offset;
     uint64_t up_offset;
     uint64_t down_offset;
@@ -16144,36 +16772,124 @@ typedef struct {
     uint64_t down_expert_bytes;
     uint32_t next_slot;
     int ok;
-    pthread_mutex_t mu;
 } ds4_metal_expert_gather_ctx;
 
-static void *ds4_gpu_expert_gather_worker(void *arg) {
-    ds4_metal_expert_gather_ctx *ctx = (ds4_metal_expert_gather_ctx *)arg;
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    pthread_cond_t done_cv;
+    pthread_t threads[16];
+    uint32_t n_threads;
+    uint32_t target_workers;
+    uint32_t active_workers;
+    uint64_t generation;
+    uint64_t completed_generation;
+    int shutdown;
+    ds4_metal_expert_gather_ctx *ctx;
+} ds4_metal_expert_gather_pool;
+
+static ds4_metal_expert_gather_pool g_expert_gather_pool = {
+    .mu = PTHREAD_MUTEX_INITIALIZER,
+    .cv = PTHREAD_COND_INITIALIZER,
+    .done_cv = PTHREAD_COND_INITIALIZER,
+};
+
+static void ds4_gpu_expert_gather_copy_slot(ds4_metal_expert_gather_ctx *ctx, uint32_t slot) {
+    const uint32_t id = ctx->active_ids[slot];
+    if (id >= ctx->n_expert_total) {
+        ctx->ok = 0;
+        return;
+    }
+    const uint64_t gate_src = (uint64_t)id * ctx->gate_expert_bytes;
+    const uint64_t down_src = (uint64_t)id * ctx->down_expert_bytes;
+    const uint64_t gate_dst_off = (uint64_t)slot * ctx->gate_expert_bytes;
+    const uint64_t down_dst_off = (uint64_t)slot * ctx->down_expert_bytes;
+    const ds4_metal_expert_source_entry *src_entry =
+        ds4_gpu_expert_source_hard_find_ex(ctx->model_map, ctx->layer_index, id, false);
+    if (src_entry) {
+        memcpy(ctx->gate_dst + gate_dst_off, src_entry->gate_copy, (size_t)ctx->gate_expert_bytes);
+        memcpy(ctx->up_dst + gate_dst_off, src_entry->up_copy, (size_t)ctx->gate_expert_bytes);
+        memcpy(ctx->down_dst + down_dst_off, src_entry->down_copy, (size_t)ctx->down_expert_bytes);
+        return;
+    }
+    memcpy(ctx->gate_dst + gate_dst_off,
+           ctx->map + ctx->gate_offset + gate_src,
+           (size_t)ctx->gate_expert_bytes);
+    memcpy(ctx->up_dst + gate_dst_off,
+           ctx->map + ctx->up_offset + gate_src,
+           (size_t)ctx->gate_expert_bytes);
+    memcpy(ctx->down_dst + down_dst_off,
+           ctx->map + ctx->down_offset + down_src,
+           (size_t)ctx->down_expert_bytes);
+}
+
+typedef struct {
+    ds4_metal_expert_gather_pool *pool;
+    uint32_t index;
+} ds4_metal_expert_gather_worker_arg;
+
+static ds4_metal_expert_gather_worker_arg g_expert_gather_worker_args[16];
+
+static void *ds4_gpu_expert_gather_pool_worker(void *arg) {
+    ds4_metal_expert_gather_worker_arg *warg = (ds4_metal_expert_gather_worker_arg *)arg;
+    ds4_metal_expert_gather_pool *pool = warg->pool;
+    const uint32_t worker_index = warg->index;
+    uint64_t seen_generation = 0;
     for (;;) {
-        pthread_mutex_lock(&ctx->mu);
-        const uint32_t slot = ctx->next_slot++;
-        pthread_mutex_unlock(&ctx->mu);
-        if (slot >= ctx->n_active) break;
-        const uint32_t id = ctx->active_ids[slot];
-        if (id >= ctx->n_expert_total) {
-            ctx->ok = 0;
-            continue;
+        pthread_mutex_lock(&pool->mu);
+        while (!pool->shutdown && pool->generation == seen_generation) {
+            pthread_cond_wait(&pool->cv, &pool->mu);
         }
-        const uint64_t gate_src = (uint64_t)id * ctx->gate_expert_bytes;
-        const uint64_t down_src = (uint64_t)id * ctx->down_expert_bytes;
-        const uint64_t gate_dst_off = (uint64_t)slot * ctx->gate_expert_bytes;
-        const uint64_t down_dst_off = (uint64_t)slot * ctx->down_expert_bytes;
-        memcpy(ctx->gate_dst + gate_dst_off,
-               ctx->map + ctx->gate_offset + gate_src,
-               (size_t)ctx->gate_expert_bytes);
-        memcpy(ctx->up_dst + gate_dst_off,
-               ctx->map + ctx->up_offset + gate_src,
-               (size_t)ctx->gate_expert_bytes);
-        memcpy(ctx->down_dst + down_dst_off,
-               ctx->map + ctx->down_offset + down_src,
-               (size_t)ctx->down_expert_bytes);
+        if (pool->shutdown) {
+            pthread_mutex_unlock(&pool->mu);
+            break;
+        }
+        seen_generation = pool->generation;
+        const uint32_t participates = worker_index < pool->target_workers;
+        ds4_metal_expert_gather_ctx *ctx = participates ? pool->ctx : NULL;
+        pthread_mutex_unlock(&pool->mu);
+
+        if (!participates) continue;
+        for (;;) {
+            const uint32_t slot = __sync_fetch_and_add(&ctx->next_slot, 1u);
+            if (slot >= ctx->n_active) break;
+            ds4_gpu_expert_gather_copy_slot(ctx, slot);
+        }
+
+        pthread_mutex_lock(&pool->mu);
+        if (pool->active_workers > 0) pool->active_workers--;
+        if (pool->active_workers == 0) {
+            pool->completed_generation = seen_generation;
+            pthread_cond_signal(&pool->done_cv);
+        }
+        pthread_mutex_unlock(&pool->mu);
     }
     return NULL;
+}
+
+static void *ds4_gpu_expert_gather_temp_worker(void *arg) {
+    ds4_metal_expert_gather_ctx *ctx = (ds4_metal_expert_gather_ctx *)arg;
+    for (;;) {
+        const uint32_t slot = __sync_fetch_and_add(&ctx->next_slot, 1u);
+        if (slot >= ctx->n_active) break;
+        ds4_gpu_expert_gather_copy_slot(ctx, slot);
+    }
+    return NULL;
+}
+
+static int ds4_gpu_expert_gather_pool_run(ds4_metal_expert_gather_ctx *ctx, uint32_t nth) {
+    if (nth == 0 || nth > 16u) return 0;
+    pthread_t th[16];
+    int created = 0;
+    for (uint32_t i = 0; i < nth; i++) {
+        if (pthread_create(&th[i], NULL, ds4_gpu_expert_gather_temp_worker, ctx) == 0) {
+            created++;
+        }
+    }
+    for (int i = 0; i < created; i++) {
+        (void)pthread_join(th[i], NULL);
+    }
+    return created == (int)nth ? ctx->ok : 0;
 }
 
 static int ds4_gpu_load_layer_experts_to_scratch(
@@ -16214,8 +16930,9 @@ static int ds4_gpu_load_layer_experts_to_scratch(
     if (!gate_dst || !up_dst || !down_dst) return 0;
 
     const uint32_t gather_threads = ds4_gpu_expert_gather_threads();
-    if (gather_threads > 1u && n_active >= 2u && !g_expert_source_hard_copy) {
+    if (gather_threads > 1u && n_active >= 2u) {
         ds4_metal_expert_gather_ctx ctx = {
+            .model_map = model_map,
             .map = map,
             .gate_dst = gate_dst,
             .up_dst = up_dst,
@@ -16223,6 +16940,7 @@ static int ds4_gpu_load_layer_experts_to_scratch(
             .active_ids = active_ids,
             .n_active = n_active,
             .n_expert_total = n_expert_total,
+            .layer_index = layer_index,
             .gate_offset = gate_offset,
             .up_offset = up_offset,
             .down_offset = down_offset,
@@ -16230,43 +16948,35 @@ static int ds4_gpu_load_layer_experts_to_scratch(
             .down_expert_bytes = down_expert_bytes,
             .next_slot = 0,
             .ok = 1,
-            .mu = PTHREAD_MUTEX_INITIALIZER,
         };
-        pthread_t th[16];
         uint32_t nth = gather_threads;
         if (nth > n_active) nth = n_active;
-        int created = 0;
-        for (uint32_t i = 0; i < nth; i++) {
-            if (pthread_create(&th[i], NULL, ds4_gpu_expert_gather_worker, &ctx) == 0) {
-                created++;
-            }
-        }
-        for (int i = 0; i < created; i++) {
-            (void)pthread_join(th[i], NULL);
-        }
-        (void)pthread_mutex_destroy(&ctx.mu);
-        if (created == (int)nth) return ctx.ok;
-        /* Thread creation failed under pressure; fall back to the serial path for correctness. */
+        if (ds4_gpu_expert_gather_pool_run(&ctx, nth)) return ctx.ok;
+        /* Thread pool startup failed under pressure; fall back to the serial path for correctness. */
     }
 
     for (uint32_t slot = 0; slot < n_active; slot++) {
         const uint32_t id = active_ids[slot];
         if (id >= n_expert_total) return 0;
-        const uint64_t gate_src = (uint64_t)id * gate_expert_bytes;
-        const uint64_t down_src = (uint64_t)id * down_expert_bytes;
-        const uint64_t gate_dst_off = (uint64_t)slot * gate_expert_bytes;
-        const uint64_t down_dst_off = (uint64_t)slot * down_expert_bytes;
-        const ds4_metal_expert_source_entry *src_entry =
-            ds4_gpu_expert_source_hard_find(model_map, layer_index, id);
-        if (src_entry) {
-            memcpy(gate_dst + gate_dst_off, src_entry->gate_copy, (size_t)gate_expert_bytes);
-            memcpy(up_dst + gate_dst_off, src_entry->up_copy, (size_t)gate_expert_bytes);
-            memcpy(down_dst + down_dst_off, src_entry->down_copy, (size_t)down_expert_bytes);
-        } else {
-            memcpy(gate_dst + gate_dst_off, map + gate_offset + gate_src, (size_t)gate_expert_bytes);
-            memcpy(up_dst + gate_dst_off, map + up_offset + gate_src, (size_t)gate_expert_bytes);
-            memcpy(down_dst + down_dst_off, map + down_offset + down_src, (size_t)down_expert_bytes);
-        }
+        ds4_metal_expert_gather_ctx one = {
+            .model_map = model_map,
+            .map = map,
+            .gate_dst = gate_dst,
+            .up_dst = up_dst,
+            .down_dst = down_dst,
+            .active_ids = active_ids,
+            .n_active = n_active,
+            .n_expert_total = n_expert_total,
+            .layer_index = layer_index,
+            .gate_offset = gate_offset,
+            .up_offset = up_offset,
+            .down_offset = down_offset,
+            .gate_expert_bytes = gate_expert_bytes,
+            .down_expert_bytes = down_expert_bytes,
+            .ok = 1,
+        };
+        ds4_gpu_expert_gather_copy_slot(&one, slot);
+        if (!one.ok) return 0;
     }
     return 1;
 }
