@@ -1570,6 +1570,21 @@ extern "C" int ds4_gpu_set_model_map_spans_split(
                                        count, max_tensor_bytes);
 }
 
+/* Cross-layer router prediction prefetch is a Metal-side optimization (NVMe
+ * read-ahead for SSD-streamed experts); the CUDA backend accepts and ignores
+ * the registration so shared engine code links unchanged. */
+extern "C" int ds4_gpu_register_layer_router(const void *model_map, uint32_t layer,
+                                             uint64_t gate_inp_offset, uint64_t probs_bias_offset,
+                                             uint64_t gate_exps_offset, uint64_t up_exps_offset,
+                                             uint64_t down_exps_offset, uint64_t gate_expert_bytes,
+                                             uint64_t down_expert_bytes, uint32_t n_embd,
+                                             uint32_t n_expert) {
+    (void)model_map; (void)layer; (void)gate_inp_offset; (void)probs_bias_offset;
+    (void)gate_exps_offset; (void)up_exps_offset; (void)down_exps_offset;
+    (void)gate_expert_bytes; (void)down_expert_bytes; (void)n_embd; (void)n_expert;
+    return 1;
+}
+
 extern "C" int ds4_gpu_set_model_fd(int fd) {
     g_model_fd = fd;
     g_model_fd_host_base = g_model_host_base;

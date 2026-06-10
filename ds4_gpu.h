@@ -58,6 +58,14 @@ int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, cons
  * clean file-backed pages stay reclaimable under memory pressure. resident_flags
  * must be non-NULL with one entry per span. Used for DS4_METAL_EXPERT_OFFLOAD. */
 int ds4_gpu_set_model_map_spans_split(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, const bool *resident_flags, uint32_t count, uint64_t max_tensor_bytes);
+/* P2.1 cross-layer router prediction prefetch (project.md): register one routed
+ * MoE layer's router metadata so the backend can re-evaluate the next layer's
+ * router on the CPU during decode and issue async read-ahead for the predicted
+ * experts while the GPU is still computing the current layer.  gate_inp must be
+ * the F16 [n_embd][n_expert] router matrix; probs_bias_offset is UINT64_MAX
+ * when the model has no exp_probs_b bias.  Purely advisory: wrong predictions
+ * waste read bandwidth but can never change inference results. */
+int ds4_gpu_register_layer_router(const void *model_map, uint32_t layer, uint64_t gate_inp_offset, uint64_t probs_bias_offset, uint64_t gate_exps_offset, uint64_t up_exps_offset, uint64_t down_exps_offset, uint64_t gate_expert_bytes, uint64_t down_expert_bytes, uint32_t n_embd, uint32_t n_expert);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes);

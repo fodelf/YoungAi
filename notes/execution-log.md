@@ -1536,3 +1536,75 @@ SSD (3–7GB/s) 与雷电 (~4–5GB/s) 均未打满。本补丁按 project.md P0
 ① 三行 ds4-io 启动说明是否出现; ② decode `mode=gather` 行 pread_ms vs 旧 fault+memcpy;
 ③ prefill `mode=stream` 行 bw_gbps; ④ `pread_fallbacks` 必须为 0; ⑤ 两机 RSS 红线 12/8GiB。
 A/B 矩阵: EXPERT_PREAD=0/1 × EXPERT_STREAM=0/1 × EXPERT_SORT_IDS=0/1 (任一回退即逐项定位)。
+
+## 2026-06-10 — 第二波: P2.1 跨层路由预测预取 + gather 张量级工作单元 (1.56 t/s 之后)
+
+**Context.** 用户实测第一波 (pread+流式+排序) 后 generation 0.81 → **1.56 t/s** (prefill 2.95)。
+P0.1 的 ds4-io 账表 (coordinator): decode 每层 gather wall ~10–20ms (bw 2–4GB/s, fault/memcpy=0,
+pread_fallbacks=0 ⇒ pread 路径完全接管) + drain ~3.5–5ms; 20 层合计 ~365ms, 加 worker 23 层 ≈ 1.56 t/s
+自洽。剩余结构: **IO wall ~70% + drain 税 ~25%**, 且 IO 与 GPU 计算完全串行。本波按 project.md P2.1
+把 L+1 层专家 IO 藏进 L 层计算, 同时把 pread 并发度抬上去。
+
+**Patch.**
+- **gather 工作单元: 槽级 → 张量级** (`ds4_metal.m`): `copy_slot` 重构为 `copy_unit`
+  (unit = slot*3 + {gate,up,down}); decode 6 专家从 6 个并发单元变 **18 个并发 pread**,
+  线程池/串行回退/计时全部跟随。脚本 `GATHER_THREADS` 默认 4→8 (QD 实质翻倍, A/B 用 4 回退)。
+- **P2.1 跨层路由预测 + 异步预取** (`DS4_METAL_EXPERT_PREFETCH_AHEAD=1`):
+  - 新 API `ds4_gpu_register_layer_router` (ds4_gpu.h / ds4_metal.m / ds4_cuda.cu 桩):
+    `ds4.c` 在两个 expert-offload 装载分支注册**仅本机层片**的 router 元数据
+    (F16 gate_inp 偏移 + exp_probs_b 偏移 + gate/up/down 专家张量偏移; shrunken 模型跳过)。
+  - decode 站点 drain 之后立即把本层 router 输入 x (16KB) 快照入队 (队列 4 深, 满则丢弃计数);
+    后台线程复算 L+1 层 router: score = sqrt(softplus(gate_inp·x)) + bias (与
+    layer_topk_selected_experts 同序), 取 top-N (`DS4_METAL_EXPERT_PREFETCH_TOP` 默认 8),
+    对预测专家的 3 段字节发 **F_RDADVISE** (失败回退 pread 进丢弃缓冲) ⇒ 读提前进页缓存,
+    L+1 层真 gather 的 pread 变页缓存命中/与在途 IO 合并。
+  - 预测纯 advisory: 错了只多读 ~(N-6)/6 的字节, 不碰 selected/scratch/数值路径, 零正确性风险。
+    读 ahead 永远走常规 fd (非 F_NOCACHE fd)。
+  - **命中率计数**: 每层最新预测集 (gen 标记) 与真实活跃集比对, ds4-io 行尾新增 `pf=hits/total`
+    (累计)。P2.1 立项门槛 top-6∈top-8 命中 ≥85% 直接从日志可读。
+  - 覆盖率: 层片内 L+1 (coordinator 19/20, worker 22/23); 跨 token/跨机不预测。
+- **脚本**: 新增 `EXPERT_PREFETCH=1` / `EXPERT_PREFETCH_TOP=8` 入 BASE_RUN_ENV。
+
+**预期.** decode 每层从 串行(gather+GPU) 趋向 max(gather', GPU), 其中 gather' 因 QD↑ 与页缓存
+命中再降; 若 pf 命中率 ~90%, decode 方向 2.2–3 t/s (W2 双机串行墙 ~2.9)。若 pf 命中率低 (<60%),
+直接关 EXPERT_PREFETCH=0 不损失既有 1.56。
+
+**Validation performed here.** `make` 全量通过 (仅既有 4 条死代码警告; ds4.o 零警告);
+`./ds4_test --metal-kernels` OK (基线 + 新 env 全开各一次); `bash -n` 通过。未跑大模型。
+用户脚本验证关注: ① 启动行 `registered N local routed layers for cross-layer expert prefetch`
+(coordinator 应为 20, worker 23) 与 `cross-layer expert prefetch enabled`; ② decode ds4-io 行
+`pf=hits/total` 百分比 (≥85% 为预测可用); ③ wall_ms 是否较上轮下降 (QD↑ + 页缓存命中);
+④ `pread_fallbacks` 仍须为 0; ⑤ RSS 红线 12/8。
+A/B: EXPERT_PREFETCH=0/1, EXPERT_PREFETCH_TOP=8/12, GATHER_THREADS=4/8。
+
+## 2026-06-10 — 第三波: 预取改"礼让式" (1.49 t/s 回退修复)
+
+**Context.** 第二波实测 1.56 → **1.49 t/s** (prefill 2.95→2.86)。日志诊断:
+- `pf=3795/4896 ≈ 77.5%` —— 预测本身可用 (部分层 wall 2–3ms / bw 14–20GB/s = 预取完全命中);
+- 但多数层 wall 14→17ms 均值、尖刺 23–38ms, pread_ms 线程和大涨 ⇒ **readahead 与前台 gather 抢同一块
+  SSD**。decode 期间 SSD ~100% 忙, v1 预取的 54MiB/层 (top-8 + 23% 预测错) 是纯增量流量, 挤慢前台,
+  代价超过重叠收益。结构性教训: **预取只能花 SSD 空闲窗 (drain/GPU 计算窗), 不能加总流量**。
+
+**Patch (`ds4_metal.m` 预取 v2; `tools/mtp_pipe_q2_speed.sh` 加 EXPERT_PREFETCH_DELTA).**
+- **礼让调度**: 新增 `g_gather_active` 标志 (前台 gather/stream 进入置 1, 全部出口清 0);
+  预取改 1MiB 分块 advise, 每块前自旋等待前台让出 SSD (`usleep(200)` 轮询), 即 readahead 只流入
+  drain/GPU 计算的空闲窗。
+- **latest-wins + 过期中止**: 队列 4 深环 → 单槽 + seq; 新预测入队即覆盖旧任务, 在跑的任务每块
+  检查 seq 被超即放弃 (旧 token/旧层的 readahead 不再发)。
+- **mincore 跳过**: advise 前对 mmap 地址段查页驻留, ≥90% 已缓存即跳过 (重复专家不浪费空闲窗)。
+- **分数序发radvisory**: 预测分数高的专家先发, 空闲窗装不下时自然砍掉低概率尾巴 (top-8 余量
+  只在窗口富余时才花)。命中率统计在预测时全集打标 (pf= 仍量预测精度, 与读完成度解耦)。
+- **Δ 可调**: `DS4_METAL_EXPERT_PREFETCH_DELTA` (默认 1, ≤4) 预测 L+Δ 层 —— Δ=2 给 readahead
+  双倍空闲窗, 预测精度变化由 pf= 字段实测。
+- 预计算/标记/中止全部不碰数值路径, advisory-only 性质不变。
+
+**预期.** 预取从"抢带宽"变"捡空闲": 最坏情况退化为 ≈关闭预取 (1.56 基线), 好情况把空闲窗
+(~4–6ms/层 ≈ 12–18MiB) 的字节转成页缓存命中。Δ=2 + 77% 精度的理论上限 ~30–50% 的 IO 隐藏。
+
+**Validation performed here.** `make` 全量通过 (仅既有 4 条死代码警告); `./ds4_test --metal-kernels`
+基线+新 env (含 DELTA=2) 双跑 OK; `bash -n` 通过。未跑大模型。
+用户脚本 A/B 矩阵 (按优先级):
+① 默认 (PREFETCH=1 DELTA=1) vs `EXPERT_PREFETCH=0` —— 确认礼让版不再回退且有正收益;
+② `EXPERT_PREFETCH_DELTA=2` —— 看 pf= 精度降多少、wall_ms 降多少;
+③ `GATHER_THREADS=4` vs 8 —— 隔离 QD 项对 decode/prefill 的独立影响 (上轮无法归因);
+④ 关注 ds4-io 高 bw 层 (页缓存命中) 占比是否上升, pread_fallbacks 仍须 0, RSS 12/8 红线。

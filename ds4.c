@@ -19225,6 +19225,49 @@ int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
     return 0;
 }
 
+#ifndef DS4_NO_GPU
+/* project.md P2.1: register the locally-loaded routed layers' router metadata
+ * (F16 gate_inp + optional exp_probs_b + expert tensor offsets) so the GPU
+ * backend can re-evaluate the next layer's router on the CPU during decode and
+ * read predicted experts ahead.  Only the local slice is registered: issuing
+ * read-ahead for layers another machine executes would waste SSD bandwidth.
+ * Purely advisory metadata; never affects inference results. */
+static void engine_register_layer_routers(ds4_engine *e, uint32_t start, uint32_t end) {
+    if (e->model.expert_shrunken) return;   /* compact-slot models: ids differ */
+    if (end >= DS4_MAX_LAYER) end = DS4_MAX_LAYER - 1;
+    uint32_t registered = 0;
+    for (uint32_t il = start; il <= end && il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &e->weights.layer[il];
+        if (!l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps ||
+            !l->ffn_gate_inp || l->ffn_gate_inp->type != DS4_TENSOR_F16 ||
+            l->ffn_gate_tid2eid) {
+            continue;
+        }
+        const uint64_t n_exp = l->ffn_gate_exps->dim[2];
+        if (n_exp == 0 || n_exp != DS4_N_EXPERT) continue;
+        if (ds4_gpu_register_layer_router(e->model.map,
+                                          il,
+                                          l->ffn_gate_inp->abs_offset,
+                                          l->ffn_exp_probs_b ? l->ffn_exp_probs_b->abs_offset
+                                                             : UINT64_MAX,
+                                          l->ffn_gate_exps->abs_offset,
+                                          l->ffn_up_exps->abs_offset,
+                                          l->ffn_down_exps->abs_offset,
+                                          l->ffn_gate_exps->bytes / n_exp,
+                                          l->ffn_down_exps->bytes / n_exp,
+                                          (uint32_t)l->ffn_gate_inp->dim[0],
+                                          (uint32_t)n_exp)) {
+            registered++;
+        }
+    }
+    if (registered) {
+        fprintf(stderr,
+                "ds4: registered %u local routed layers for cross-layer expert prefetch\n",
+                registered);
+    }
+}
+#endif
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
     e->model.fd = -1;
@@ -19406,6 +19449,9 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                                                                  resident,
                                                                  total,
                                                                  split_max_tensor);
+                if (model_map_ok) {
+                    engine_register_layer_routers(e, load_layer_start, load_layer_end);
+                }
                 free(offsets);
                 free(sizes);
                 free(resident);
@@ -19518,6 +19564,9 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                                                                  resident,
                                                                  total,
                                                                  split_max_tensor);
+                if (model_map_ok) {
+                    engine_register_layer_routers(e, 0, DS4_MAX_LAYER - 1);
+                }
                 free(offsets);
                 free(sizes);
                 free(resident);

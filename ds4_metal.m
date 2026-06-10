@@ -16881,6 +16881,10 @@ static void ds4_gpu_expert_io_prof_reset(void) {
     g_io_prof_hit_bytes = 0;
 }
 
+/* P2.1 prediction-accuracy counters (defined here so the ds4-io line can carry
+ * them; maintained by the prefetch section below). */
+static uint64_t g_pf_pred_hits, g_pf_pred_total;
+
 static void ds4_gpu_expert_io_prof_report(const char *site,
                                           const char *mode,
                                           uint32_t layer,
@@ -16894,7 +16898,7 @@ static void ds4_gpu_expert_io_prof_report(const char *site,
     fprintf(stderr,
             "ds4-io: site=%s mode=%s layer=%u n_active=%u n_tokens=%u "
             "cold_mib=%.1f hit_mib=%.1f wall_ms=%.2f fault_ms=%.2f memcpy_ms=%.2f "
-            "pread_ms=%.2f drain_ms=%.2f bw_gbps=%.2f pread_fallbacks=%llu\n",
+            "pread_ms=%.2f drain_ms=%.2f bw_gbps=%.2f pread_fallbacks=%llu pf=%llu/%llu\n",
             site, mode, layer, n_active, n_tokens,
             (double)g_io_prof_cold_bytes / mib,
             (double)g_io_prof_hit_bytes / mib,
@@ -16904,7 +16908,9 @@ static void ds4_gpu_expert_io_prof_report(const char *site,
             (double)g_io_prof_pread_ns / 1e6,
             drain_ms,
             bw_gbps,
-            (unsigned long long)g_io_prof_pread_fallbacks);
+            (unsigned long long)g_io_prof_pread_fallbacks,
+            (unsigned long long)g_pf_pred_hits,
+            (unsigned long long)g_pf_pred_total);
 }
 
 /* Touch one byte per page so the mmap fault cost can be timed separately from
@@ -16915,6 +16921,329 @@ static uint64_t ds4_gpu_expert_touch_pages(const uint8_t *p, size_t len) {
     for (size_t i = 0; i < len; i += page) sink += p[i];
     if (len) sink += p[len - 1];
     return sink;
+}
+
+/* ---- project.md P2.1: cross-layer router prediction + async expert prefetch --
+ *
+ * Decode is a serial chain: gather(L) -> GPU(L) -> drain -> gather(L+1) ...
+ * The router of layer L+1 is a tiny F16 [n_expert][n_embd] matrix, and the
+ * residual stream changes slowly across one layer, so evaluating router(L+1)
+ * on layer L's MoE input already ranks the true top-6 with high overlap
+ * (Pre-Attention Expert Prediction, arXiv:2511.10676).  While the GPU computes
+ * layer L we re-evaluate router(L+1) on a background thread and issue
+ * F_RDADVISE read-ahead for the predicted experts' gate/up/down ranges, so by
+ * the time gather(L+1) preads them they are (partially) page-cache hits.
+ * Predictions are purely advisory: a miss only wastes read bandwidth, the
+ * gather path stays bit-exact.  DS4_METAL_EXPERT_PREFETCH_AHEAD=1 enables,
+ * DS4_METAL_EXPERT_PREFETCH_TOP (default 8) controls the prediction margin. */
+
+#define DS4_METAL_PF_MAX_EMBD 8192u
+#define DS4_METAL_PF_MAX_TOP 32u
+#define DS4_METAL_PF_QUEUE 4u
+
+typedef struct {
+    int valid;
+    const void *model_map;
+    uint64_t gate_inp_off;    /* F16 [n_expert][n_embd] rows */
+    uint64_t probs_bias_off;  /* F32 [n_expert], UINT64_MAX = absent */
+    uint64_t gate_exps_off;
+    uint64_t up_exps_off;
+    uint64_t down_exps_off;
+    uint64_t gate_expert_bytes;
+    uint64_t down_expert_bytes;
+    uint32_t n_embd;
+    uint32_t n_expert;
+} ds4_metal_layer_router;
+
+static ds4_metal_layer_router g_layer_router[DS4_METAL_EXPERT_PROFILE_MAX_LAYERS];
+
+int ds4_gpu_register_layer_router(
+        const void *model_map,
+        uint32_t layer,
+        uint64_t gate_inp_offset,
+        uint64_t probs_bias_offset,
+        uint64_t gate_exps_offset,
+        uint64_t up_exps_offset,
+        uint64_t down_exps_offset,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes,
+        uint32_t n_embd,
+        uint32_t n_expert) {
+    if (!model_map || layer >= DS4_METAL_EXPERT_PROFILE_MAX_LAYERS ||
+        n_embd == 0 || n_embd > DS4_METAL_PF_MAX_EMBD ||
+        n_expert == 0 || n_expert > DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS ||
+        gate_expert_bytes == 0 || down_expert_bytes == 0) {
+        return 0;
+    }
+    ds4_metal_layer_router *r = &g_layer_router[layer];
+    r->model_map = model_map;
+    r->gate_inp_off = gate_inp_offset;
+    r->probs_bias_off = probs_bias_offset;
+    r->gate_exps_off = gate_exps_offset;
+    r->up_exps_off = up_exps_offset;
+    r->down_exps_off = down_exps_offset;
+    r->gate_expert_bytes = gate_expert_bytes;
+    r->down_expert_bytes = down_expert_bytes;
+    r->n_embd = n_embd;
+    r->n_expert = n_expert;
+    r->valid = 1;
+    return 1;
+}
+
+static int ds4_gpu_expert_prefetch_top(void) {
+    static int cached;
+    if (cached == 0) {
+        uint64_t v = ds4_gpu_env_u64("DS4_METAL_EXPERT_PREFETCH_TOP", 8u);
+        if (v < 1u) v = 1u;
+        if (v > DS4_METAL_PF_MAX_TOP) v = DS4_METAL_PF_MAX_TOP;
+        cached = (int)v;
+    }
+    return cached;
+}
+
+/* Predict layer L+delta instead of L+1: deeper lookahead gives the paced
+ * read-ahead more idle windows to finish at the cost of some prediction
+ * accuracy (measure via the ds4-io pf= field before raising it). */
+static uint32_t ds4_gpu_expert_prefetch_delta(void) {
+    static uint32_t cached;
+    if (cached == 0) {
+        uint64_t v = ds4_gpu_env_u64("DS4_METAL_EXPERT_PREFETCH_DELTA", 1u);
+        if (v < 1u) v = 1u;
+        if (v > 4u) v = 4u;
+        cached = (uint32_t)v;
+    }
+    return cached;
+}
+
+typedef struct {
+    uint32_t layer;                      /* layer being predicted (= L+1) */
+    float x[DS4_METAL_PF_MAX_EMBD];      /* router-input snapshot from layer L */
+} ds4_metal_pf_job;
+
+/* Scheduling (v2, after the 1.56->1.49 regression): decode keeps the SSD
+ * ~100% busy, so read-ahead must never compete with the foreground gather --
+ * the first version did, and the extra traffic cost more than the overlap
+ * gained.  v2 is "polite": the prefetch thread only issues advisories in
+ * 1MiB chunks while no foreground gather is running (g_gather_active), skips
+ * ranges that are already page-cache resident (mincore), works in router
+ * score order so the scarce idle window is spent on the most likely experts,
+ * and a newer prediction supersedes an unfinished older one (latest-wins). */
+static pthread_mutex_t g_pf_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_pf_cv = PTHREAD_COND_INITIALIZER;
+static ds4_metal_pf_job g_pf_slot;             /* single slot, latest wins */
+static volatile uint32_t g_pf_seq;             /* bumped per enqueue */
+static uint32_t g_pf_picked_seq;               /* last seq picked by the worker */
+static int g_pf_shutdown;
+static uint64_t g_pf_enqueued, g_pf_superseded, g_pf_advise_fail, g_pf_skip_cached;
+static volatile int g_gather_active;           /* foreground gather/stream running */
+/* Prediction sets for accuracy accounting: mark[layer][expert] == gen[layer]
+ * means "expert was in the latest predicted set for that layer".  Written by
+ * the prefetch thread, read by the gather entry; stats-only, races benign. */
+static uint32_t g_pf_pred_gen[DS4_METAL_EXPERT_PROFILE_MAX_LAYERS];
+static uint32_t g_pf_pred_mark[DS4_METAL_EXPERT_PROFILE_MAX_LAYERS][DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS];
+
+static float ds4_gpu_pf_softplus(float v) {
+    if (v > 20.0f) return v;
+    if (v < -20.0f) return expf(v);
+    return log1pf(expf(v));
+}
+
+static void ds4_gpu_expert_prefetch_advise(int fd, uint64_t off, uint64_t len) {
+    struct radvisory ra;
+    ra.ra_offset = (off_t)off;
+    ra.ra_count = (int)len;
+    if (fcntl(fd, F_RDADVISE, &ra) != -1) return;
+    g_pf_advise_fail++;
+    /* Portable fallback: pull the range through the page cache with plain
+     * preads into a throwaway buffer (single prefetch thread => static ok). */
+    static uint8_t scratch[262144];
+    uint64_t done = 0;
+    while (done < len) {
+        size_t chunk = sizeof(scratch);
+        if ((uint64_t)chunk > len - done) chunk = (size_t)(len - done);
+        if (!ds4_gpu_pread_full(fd, scratch, off + done, chunk)) break;
+        done += chunk;
+    }
+}
+
+/* Issue read-ahead in small chunks, yielding whenever a foreground gather is
+ * running and aborting as soon as a newer prediction supersedes this one.
+ * Returns 0 on abort. */
+static int ds4_gpu_expert_prefetch_advise_paced(int fd, uint64_t off, uint64_t len, uint32_t my_seq) {
+    const uint64_t chunk = 1ull << 20;
+    uint64_t done = 0;
+    while (done < len) {
+        while (g_gather_active) {
+            if (g_pf_seq != my_seq || g_pf_shutdown) return 0;
+            usleep(200);
+        }
+        if (g_pf_seq != my_seq || g_pf_shutdown) return 0;
+        uint64_t n = chunk;
+        if (len - done < n) n = len - done;
+        ds4_gpu_expert_prefetch_advise(fd, off + done, n);
+        done += n;
+    }
+    return 1;
+}
+
+/* True when (almost) the whole file range is already page-cache resident, in
+ * which case read-ahead would only waste the idle window.  Ground truth via
+ * mincore on the model mapping (same UBC pages the preads hit). */
+static int ds4_gpu_expert_range_mostly_cached(const void *model_map, uint64_t off, uint64_t len) {
+    static char vec[8192];   /* single prefetch thread => static ok */
+    static size_t page;
+    if (page == 0) {
+        long p = sysconf(_SC_PAGESIZE);
+        page = p > 0 ? (size_t)p : 16384u;
+    }
+    const uintptr_t addr = (uintptr_t)model_map + (uintptr_t)off;
+    const uintptr_t start = addr & ~(uintptr_t)(page - 1u);
+    const size_t span = (size_t)(addr + len - start);
+    const size_t npages = (span + page - 1u) / page;
+    if (npages == 0 || npages > sizeof(vec)) return 0;
+    if (mincore((void *)start, span, vec) != 0) return 0;
+    size_t resident = 0;
+    for (size_t i = 0; i < npages; i++) resident += (size_t)(vec[i] & 1);
+    return resident * 10u >= npages * 9u;   /* >=90% resident: skip */
+}
+
+static void ds4_gpu_expert_prefetch_run_job(const ds4_metal_pf_job *job, uint32_t my_seq) {
+    if (job->layer >= DS4_METAL_EXPERT_PROFILE_MAX_LAYERS) return;
+    const ds4_metal_layer_router *r = &g_layer_router[job->layer];
+    if (!r->valid || g_model_fd < 0) return;
+    const uint8_t *map = (const uint8_t *)r->model_map;
+    const __fp16 *w = (const __fp16 *)(map + r->gate_inp_off);
+    const float *bias = r->probs_bias_off != UINT64_MAX ?
+        (const float *)(map + r->probs_bias_off) : NULL;
+    const uint32_t n_top = (uint32_t)ds4_gpu_expert_prefetch_top();
+
+    /* score = sqrt(softplus(gate_inp . x)) + bias, matching the selection rule
+     * in layer_topk_selected_experts (ranking only; weights don't matter). */
+    int top_idx[DS4_METAL_PF_MAX_TOP];
+    float top_score[DS4_METAL_PF_MAX_TOP];
+    for (uint32_t i = 0; i < n_top; i++) { top_idx[i] = -1; top_score[i] = -1e30f; }
+    for (uint32_t e = 0; e < r->n_expert; e++) {
+        const __fp16 *row = w + (size_t)e * r->n_embd;
+        float acc = 0.0f;
+        for (uint32_t d = 0; d < r->n_embd; d++) acc += (float)row[d] * job->x[d];
+        float s = sqrtf(ds4_gpu_pf_softplus(acc));
+        if (bias) s += bias[e];
+        if (s <= top_score[n_top - 1u]) continue;
+        uint32_t j = n_top - 1u;
+        while (j > 0u && s > top_score[j - 1u]) {
+            top_score[j] = top_score[j - 1u];
+            top_idx[j] = top_idx[j - 1u];
+            j--;
+        }
+        top_score[j] = s;
+        top_idx[j] = (int)e;
+    }
+
+    /* Mark the full predicted set first (prediction-accuracy accounting must
+     * not depend on how much read-ahead the idle window allowed), then advise
+     * in descending score order so the most likely experts go first; abort
+     * mid-way once a newer prediction lands. */
+    const uint32_t gen = ++g_pf_pred_gen[job->layer];
+    for (uint32_t i = 0; i < n_top; i++) {
+        if (top_idx[i] < 0) break;
+        g_pf_pred_mark[job->layer][(uint32_t)top_idx[i]] = gen;
+    }
+    const int fd = g_model_fd;   /* read-ahead must hit the page cache, never the F_NOCACHE fd */
+    for (uint32_t i = 0; i < n_top; i++) {
+        if (top_idx[i] < 0) break;
+        const uint64_t e = (uint64_t)top_idx[i];
+        const uint64_t seg_off[3] = {
+            r->gate_exps_off + e * r->gate_expert_bytes,
+            r->up_exps_off + e * r->gate_expert_bytes,
+            r->down_exps_off + e * r->down_expert_bytes,
+        };
+        const uint64_t seg_len[3] = {
+            r->gate_expert_bytes, r->gate_expert_bytes, r->down_expert_bytes,
+        };
+        for (uint32_t s = 0; s < 3u; s++) {
+            if (ds4_gpu_expert_range_mostly_cached(r->model_map, seg_off[s], seg_len[s])) {
+                g_pf_skip_cached++;
+                continue;
+            }
+            if (!ds4_gpu_expert_prefetch_advise_paced(fd, seg_off[s], seg_len[s], my_seq)) {
+                return;   /* superseded or shutting down */
+            }
+        }
+    }
+}
+
+static void *ds4_gpu_expert_prefetch_thread(void *arg) {
+    (void)arg;
+    static ds4_metal_pf_job local;
+    uint32_t my_seq = 0;
+    for (;;) {
+        pthread_mutex_lock(&g_pf_mu);
+        while (!g_pf_shutdown && g_pf_seq == my_seq) {
+            pthread_cond_wait(&g_pf_cv, &g_pf_mu);
+        }
+        if (g_pf_shutdown) {
+            pthread_mutex_unlock(&g_pf_mu);
+            break;
+        }
+        my_seq = g_pf_seq;
+        g_pf_picked_seq = my_seq;
+        memcpy(&local, &g_pf_slot, sizeof(local));
+        pthread_mutex_unlock(&g_pf_mu);
+        ds4_gpu_expert_prefetch_run_job(&local, my_seq);
+    }
+    return NULL;
+}
+
+/* Called from the serial graph thread only (no init race). */
+static int ds4_gpu_expert_prefetch_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = ds4_gpu_env_bool("DS4_METAL_EXPERT_PREFETCH_AHEAD") > 0 ? 1 : 0;
+        if (cached && g_model_fd < 0) {
+            fprintf(stderr,
+                    "ds4: DS4_METAL_EXPERT_PREFETCH_AHEAD=1 requested but no model fd; disabled\n");
+            cached = 0;
+        }
+        if (cached) {
+            pthread_t th;
+            if (pthread_create(&th, NULL, ds4_gpu_expert_prefetch_thread, NULL) == 0) {
+                fprintf(stderr,
+                        "ds4: cross-layer expert prefetch enabled (top %d predicted experts "
+                        "read ahead per next layer)\n",
+                        ds4_gpu_expert_prefetch_top());
+            } else {
+                cached = 0;
+            }
+        }
+    }
+    return cached;
+}
+
+static void ds4_gpu_expert_prefetch_enqueue(uint32_t next_layer, const float *x, uint32_t n_embd) {
+    if (next_layer >= DS4_METAL_EXPERT_PROFILE_MAX_LAYERS) return;
+    const ds4_metal_layer_router *r = &g_layer_router[next_layer];
+    if (!r->valid || r->n_embd != n_embd) return;
+    pthread_mutex_lock(&g_pf_mu);
+    if (g_pf_seq != g_pf_picked_seq) g_pf_superseded++;   /* old job replaced unstarted/aborted */
+    g_pf_slot.layer = next_layer;
+    memcpy(g_pf_slot.x, x, (size_t)n_embd * sizeof(float));
+    g_pf_seq++;
+    g_pf_enqueued++;
+    pthread_cond_signal(&g_pf_cv);
+    pthread_mutex_unlock(&g_pf_mu);
+}
+
+/* Accuracy accounting: compare this layer's actual active set against the
+ * latest prediction for it (stats only; harmless races). */
+static void ds4_gpu_expert_prefetch_note_actual(uint32_t layer, const uint32_t *ids, uint32_t n) {
+    if (layer >= DS4_METAL_EXPERT_PROFILE_MAX_LAYERS) return;
+    const uint32_t gen = g_pf_pred_gen[layer];
+    if (gen == 0) return;
+    for (uint32_t i = 0; i < n; i++) {
+        if (ids[i] >= DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS) continue;
+        g_pf_pred_total++;
+        if (g_pf_pred_mark[layer][ids[i]] == gen) g_pf_pred_hits++;
+    }
 }
 
 typedef struct {
@@ -16959,52 +17288,64 @@ static ds4_metal_expert_gather_pool g_expert_gather_pool = {
     .done_cv = PTHREAD_COND_INITIALIZER,
 };
 
-static void ds4_gpu_expert_gather_copy_slot(ds4_metal_expert_gather_ctx *ctx, uint32_t slot) {
+/* One gather work unit = one tensor (gate/up/down) of one active expert.
+ * Per-tensor units triple the available IO queue depth versus per-expert
+ * units: a 6-expert decode layer exposes 18 concurrent preads instead of 6,
+ * which matters because random NVMe bandwidth scales with QD. */
+static void ds4_gpu_expert_gather_copy_unit(ds4_metal_expert_gather_ctx *ctx, uint32_t unit) {
+    const uint32_t slot = unit / 3u;
+    const uint32_t part = unit % 3u;   /* 0=gate 1=up 2=down */
     const uint32_t id = ctx->active_ids[slot];
     if (id >= ctx->n_expert_total) {
         ctx->ok = 0;
         return;
     }
-    const uint64_t gate_src = (uint64_t)id * ctx->gate_expert_bytes;
-    const uint64_t down_src = (uint64_t)id * ctx->down_expert_bytes;
-    const uint64_t gate_dst_off = (uint64_t)slot * ctx->gate_expert_bytes;
-    const uint64_t down_dst_off = (uint64_t)slot * ctx->down_expert_bytes;
-    const uint64_t expert_bytes = 2u * ctx->gate_expert_bytes + ctx->down_expert_bytes;
     const ds4_metal_expert_source_entry *src_entry =
         ds4_gpu_expert_source_hard_find_ex(ctx->model_map, ctx->layer_index, id, false);
-    if (src_entry) {
+    uint64_t len;
+    uint64_t src_off;
+    uint8_t *dst;
+    const uint8_t *hard_src = NULL;
+    switch (part) {
+    case 0:
+        len = ctx->gate_expert_bytes;
+        src_off = ctx->gate_offset + (uint64_t)id * ctx->gate_expert_bytes;
+        dst = ctx->gate_dst + (uint64_t)slot * ctx->gate_expert_bytes;
+        if (src_entry) hard_src = (const uint8_t *)src_entry->gate_copy;
+        break;
+    case 1:
+        len = ctx->gate_expert_bytes;
+        src_off = ctx->up_offset + (uint64_t)id * ctx->gate_expert_bytes;
+        dst = ctx->up_dst + (uint64_t)slot * ctx->gate_expert_bytes;
+        if (src_entry) hard_src = (const uint8_t *)src_entry->up_copy;
+        break;
+    default:
+        len = ctx->down_expert_bytes;
+        src_off = ctx->down_offset + (uint64_t)id * ctx->down_expert_bytes;
+        dst = ctx->down_dst + (uint64_t)slot * ctx->down_expert_bytes;
+        if (src_entry) hard_src = (const uint8_t *)src_entry->down_copy;
+        break;
+    }
+    if (hard_src) {
         const double t0 = ctx->io_profile ? ds4_gpu_now_ms() : 0.0;
-        memcpy(ctx->gate_dst + gate_dst_off, src_entry->gate_copy, (size_t)ctx->gate_expert_bytes);
-        memcpy(ctx->up_dst + gate_dst_off, src_entry->up_copy, (size_t)ctx->gate_expert_bytes);
-        memcpy(ctx->down_dst + down_dst_off, src_entry->down_copy, (size_t)ctx->down_expert_bytes);
+        memcpy(dst, hard_src, (size_t)len);
         if (ctx->io_profile) {
             __sync_fetch_and_add(&g_io_prof_copy_ns,
                                  (uint64_t)((ds4_gpu_now_ms() - t0) * 1e6));
-            __sync_fetch_and_add(&g_io_prof_hit_bytes, expert_bytes);
+            __sync_fetch_and_add(&g_io_prof_hit_bytes, len);
         }
         return;
     }
-    /* P1.1 single-copy path: SSD -> Shared scratch in one pread per tensor,
-     * no page fault, no second memcpy.  Bytes are identical to the mmap copy
-     * (same file offsets), so logits are bit-exact by construction. */
+    /* P1.1 single-copy path: SSD -> Shared scratch in one pread, no page
+     * fault, no second memcpy.  Bytes are identical to the mmap copy (same
+     * file offsets), so logits are bit-exact by construction. */
     if (ctx->use_pread) {
         const double t0 = ctx->io_profile ? ds4_gpu_now_ms() : 0.0;
-        if (ds4_gpu_pread_full(ctx->pread_fd,
-                               ctx->gate_dst + gate_dst_off,
-                               ctx->gate_offset + gate_src,
-                               (size_t)ctx->gate_expert_bytes) &&
-            ds4_gpu_pread_full(ctx->pread_fd,
-                               ctx->up_dst + gate_dst_off,
-                               ctx->up_offset + gate_src,
-                               (size_t)ctx->gate_expert_bytes) &&
-            ds4_gpu_pread_full(ctx->pread_fd,
-                               ctx->down_dst + down_dst_off,
-                               ctx->down_offset + down_src,
-                               (size_t)ctx->down_expert_bytes)) {
+        if (ds4_gpu_pread_full(ctx->pread_fd, dst, src_off, (size_t)len)) {
             if (ctx->io_profile) {
                 __sync_fetch_and_add(&g_io_prof_pread_ns,
                                      (uint64_t)((ds4_gpu_now_ms() - t0) * 1e6));
-                __sync_fetch_and_add(&g_io_prof_cold_bytes, expert_bytes);
+                __sync_fetch_and_add(&g_io_prof_cold_bytes, len);
             }
             return;
         }
@@ -17013,39 +17354,16 @@ static void ds4_gpu_expert_gather_copy_slot(ds4_metal_expert_gather_ctx *ctx, ui
     }
     if (ctx->io_profile) {
         const double tf0 = ds4_gpu_now_ms();
-        uint64_t sink = 0;
-        sink += ds4_gpu_expert_touch_pages(ctx->map + ctx->gate_offset + gate_src,
-                                           (size_t)ctx->gate_expert_bytes);
-        sink += ds4_gpu_expert_touch_pages(ctx->map + ctx->up_offset + gate_src,
-                                           (size_t)ctx->gate_expert_bytes);
-        sink += ds4_gpu_expert_touch_pages(ctx->map + ctx->down_offset + down_src,
-                                           (size_t)ctx->down_expert_bytes);
-        g_io_prof_touch_sink += sink;
+        g_io_prof_touch_sink += ds4_gpu_expert_touch_pages(ctx->map + src_off, (size_t)len);
         const double tc0 = ds4_gpu_now_ms();
         __sync_fetch_and_add(&g_io_prof_fault_ns, (uint64_t)((tc0 - tf0) * 1e6));
-        memcpy(ctx->gate_dst + gate_dst_off,
-               ctx->map + ctx->gate_offset + gate_src,
-               (size_t)ctx->gate_expert_bytes);
-        memcpy(ctx->up_dst + gate_dst_off,
-               ctx->map + ctx->up_offset + gate_src,
-               (size_t)ctx->gate_expert_bytes);
-        memcpy(ctx->down_dst + down_dst_off,
-               ctx->map + ctx->down_offset + down_src,
-               (size_t)ctx->down_expert_bytes);
+        memcpy(dst, ctx->map + src_off, (size_t)len);
         __sync_fetch_and_add(&g_io_prof_copy_ns,
                              (uint64_t)((ds4_gpu_now_ms() - tc0) * 1e6));
-        __sync_fetch_and_add(&g_io_prof_cold_bytes, expert_bytes);
+        __sync_fetch_and_add(&g_io_prof_cold_bytes, len);
         return;
     }
-    memcpy(ctx->gate_dst + gate_dst_off,
-           ctx->map + ctx->gate_offset + gate_src,
-           (size_t)ctx->gate_expert_bytes);
-    memcpy(ctx->up_dst + gate_dst_off,
-           ctx->map + ctx->up_offset + gate_src,
-           (size_t)ctx->gate_expert_bytes);
-    memcpy(ctx->down_dst + down_dst_off,
-           ctx->map + ctx->down_offset + down_src,
-           (size_t)ctx->down_expert_bytes);
+    memcpy(dst, ctx->map + src_off, (size_t)len);
 }
 
 typedef struct {
@@ -17076,9 +17394,9 @@ static void *ds4_gpu_expert_gather_pool_worker(void *arg) {
 
         if (!participates) continue;
         for (;;) {
-            const uint32_t slot = __sync_fetch_and_add(&ctx->next_slot, 1u);
-            if (slot >= ctx->n_active) break;
-            ds4_gpu_expert_gather_copy_slot(ctx, slot);
+            const uint32_t unit = __sync_fetch_and_add(&ctx->next_slot, 1u);
+            if (unit >= ctx->n_active * 3u) break;
+            ds4_gpu_expert_gather_copy_unit(ctx, unit);
         }
 
         pthread_mutex_lock(&pool->mu);
@@ -17095,9 +17413,9 @@ static void *ds4_gpu_expert_gather_pool_worker(void *arg) {
 static void *ds4_gpu_expert_gather_temp_worker(void *arg) {
     ds4_metal_expert_gather_ctx *ctx = (ds4_metal_expert_gather_ctx *)arg;
     for (;;) {
-        const uint32_t slot = __sync_fetch_and_add(&ctx->next_slot, 1u);
-        if (slot >= ctx->n_active) break;
-        ds4_gpu_expert_gather_copy_slot(ctx, slot);
+        const uint32_t unit = __sync_fetch_and_add(&ctx->next_slot, 1u);
+        if (unit >= ctx->n_active * 3u) break;
+        ds4_gpu_expert_gather_copy_unit(ctx, unit);
     }
     return NULL;
 }
@@ -17162,7 +17480,9 @@ static int ds4_gpu_load_layer_experts_to_scratch(
     if (use_pread && pread_fd < 0) use_pread = 0;
 
     const uint32_t gather_threads = ds4_gpu_expert_gather_threads();
-    if (gather_threads > 1u && n_active >= 2u) {
+    const uint32_t total_units = n_active * 3u;
+    g_gather_active = 1;   /* prefetch read-ahead yields while we own the SSD */
+    if (gather_threads > 1u && total_units >= 2u) {
         ds4_metal_expert_gather_ctx ctx = {
             .model_map = model_map,
             .map = map,
@@ -17185,14 +17505,20 @@ static int ds4_gpu_load_layer_experts_to_scratch(
             .ok = 1,
         };
         uint32_t nth = gather_threads;
-        if (nth > n_active) nth = n_active;
-        if (ds4_gpu_expert_gather_pool_run(&ctx, nth)) return ctx.ok;
+        if (nth > total_units) nth = total_units;
+        if (ds4_gpu_expert_gather_pool_run(&ctx, nth)) {
+            g_gather_active = 0;
+            return ctx.ok;
+        }
         /* Thread pool startup failed under pressure; fall back to the serial path for correctness. */
     }
 
-    for (uint32_t slot = 0; slot < n_active; slot++) {
-        const uint32_t id = active_ids[slot];
-        if (id >= n_expert_total) return 0;
+    for (uint32_t unit = 0; unit < total_units; unit++) {
+        const uint32_t id = active_ids[unit / 3u];
+        if (id >= n_expert_total) {
+            g_gather_active = 0;
+            return 0;
+        }
         ds4_metal_expert_gather_ctx one = {
             .model_map = model_map,
             .map = map,
@@ -17213,9 +17539,13 @@ static int ds4_gpu_load_layer_experts_to_scratch(
             .io_profile = io_profile,
             .ok = 1,
         };
-        ds4_gpu_expert_gather_copy_slot(&one, slot);
-        if (!one.ok) return 0;
+        ds4_gpu_expert_gather_copy_unit(&one, unit);
+        if (!one.ok) {
+            g_gather_active = 0;
+            return 0;
+        }
     }
+    g_gather_active = 0;
     return 1;
 }
 
@@ -17394,6 +17724,7 @@ static int ds4_gpu_stream_layer_experts_to_scratch(
     if ((uint64_t)nth > ctx.total_chunks) nth = (uint32_t)ctx.total_chunks;
     pthread_t th[16];
     uint32_t created = 0;
+    g_gather_active = 1;   /* prefetch read-ahead yields while we own the SSD */
     if (nth > 1u) {
         for (uint32_t i = 0; i + 1u < nth && i < 16u; i++) {
             if (pthread_create(&th[created], NULL, ds4_gpu_expert_stream_worker, &ctx) == 0) {
@@ -17405,6 +17736,7 @@ static int ds4_gpu_stream_layer_experts_to_scratch(
      * every chunk is copied exactly once even if thread creation failed. */
     (void)ds4_gpu_expert_stream_worker(&ctx);
     for (uint32_t i = 0; i < created; i++) (void)pthread_join(th[i], NULL);
+    g_gather_active = 0;
     return ctx.ok;
 }
 
@@ -17612,6 +17944,17 @@ int ds4_gpu_routed_moe_one_tensor(
                 if (ds4_gpu_end_commands() == 0) return 0;
                 if (io_profile) drain_ms = ds4_gpu_now_ms() - drain_t0;
             }
+            /* P2.1: snapshot this layer's router input and kick next-layer
+             * router prediction + expert read-ahead on the background thread;
+             * it overlaps both this layer's gather and the GPU compute.  The
+             * batch was just drained, so x is CPU-visible and final. */
+            if (ds4_gpu_expert_prefetch_enabled() &&
+                xbuf.storageMode == MTLStorageModeShared) {
+                const float *x_cpu = (const float *)((const uint8_t *)xbuf.contents +
+                                                     (size_t)ds4_gpu_tensor_offset(x));
+                ds4_gpu_expert_prefetch_enqueue(layer_index + ds4_gpu_expert_prefetch_delta(),
+                                                x_cpu, expert_in_dim);
+            }
             uint32_t active_ids[1024];
             uint32_t n_active = 0;
             int compact_ok = ds4_gpu_compact_selected_experts(selectedbuf,
@@ -17621,6 +17964,11 @@ int ds4_gpu_routed_moe_one_tensor(
                                                               active_ids,
                                                               1024,
                                                               &n_active);
+            /* Compare this layer's actual active set against the latest
+             * prediction made for it (stats feed the ds4-io pf= field). */
+            if (compact_ok) {
+                ds4_gpu_expert_prefetch_note_actual(layer_index, active_ids, n_active);
+            }
             /* Real expert pool is currently limited to the full q2 routed layout.
              * MTP/q4 routed tensors can have different slot sizes and fall back to
              * the proven A3 scratch path. */
