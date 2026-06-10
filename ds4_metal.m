@@ -12,6 +12,8 @@
 #include <unistd.h>
 #include <sys/sysctl.h>
 #include <sys/mman.h>
+#include <sys/param.h>
+#include <fcntl.h>
 #include <errno.h>
 #include <pthread.h>
 
@@ -5145,8 +5147,22 @@ int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     return ds4_gpu_set_model_map_range(model_map, model_size, 0, model_size, 0);
 }
 
+/* Main-model GGUF file descriptor, registered by the engine right after the
+ * model is opened (the whole file is mmapped from offset 0, so file offset ==
+ * map offset).  The P1.1 single-copy expert gather (DS4_METAL_EXPERT_PREAD=1,
+ * project.md) preads cold expert bytes straight from this fd into the Shared
+ * scratch MTLBuffer, bypassing the mmap page-fault + memcpy double copy. */
+static int g_model_fd = -1;
+static int g_model_fd_conflict = 0;
+
 int ds4_gpu_set_model_fd(int fd) {
-    (void)fd;
+    if (fd < 0) return 1;
+    if (g_model_fd >= 0 && g_model_fd != fd) {
+        /* Two different model files registered in one process: the pread fast
+         * path can no longer tell which file backs a given map; disable it. */
+        g_model_fd_conflict = 1;
+    }
+    g_model_fd = fd;
     return 1;
 }
 
@@ -16755,6 +16771,152 @@ static uint32_t ds4_gpu_expert_gather_threads(void) {
     return threads;
 }
 
+/* ---- project.md P0.1/P1.1: expert IO instrumentation + single-copy pread ----
+ *
+ * Measured bottleneck (execution log 2026-06-10): the A3 gather moves cold
+ * expert bytes at ~1.5GB/s because every byte pays a 16KiB mmap page fault
+ * (SSD -> page cache) plus a memcpy (page cache -> Shared scratch), serialized
+ * behind a per-layer command drain.  DS4_METAL_EXPERT_PREAD=1 replaces the
+ * fault+memcpy double copy with one pread() per expert tensor straight into
+ * the scratch MTLBuffer.  DS4_METAL_EXPERT_PREAD_NOCACHE=1 additionally reads
+ * through a separate F_NOCACHE descriptor so the ~1.7GiB/token cold stream
+ * stops evicting hot page-cache pages (A/B knob, off by default).
+ * DS4_METAL_EXPERT_IO_PROFILE=1 prints one ds4-io line per routed-MoE layer
+ * call decomposing wall time into fault/memcpy/pread/drain so the account in
+ * project.md P0.1 can be settled from a normal speed run. */
+
+static int ds4_gpu_pread_full(int fd, void *dst, uint64_t src_off, size_t len) {
+    uint8_t *p = (uint8_t *)dst;
+    while (len > 0) {
+        ssize_t r = pread(fd, p, len, (off_t)src_off);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return 0;
+        }
+        if (r == 0) return 0;
+        p += (size_t)r;
+        src_off += (uint64_t)r;
+        len -= (size_t)r;
+    }
+    return 1;
+}
+
+/* Resolve once from the serial gather entry (before worker threads spawn) so
+ * the cached env lookups never race. */
+static int ds4_gpu_expert_pread_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = ds4_gpu_env_bool("DS4_METAL_EXPERT_PREAD") > 0 ? 1 : 0;
+        if (cached && (g_model_fd < 0 || g_model_fd_conflict)) {
+            fprintf(stderr,
+                    "ds4: DS4_METAL_EXPERT_PREAD=1 requested but no unambiguous model fd; "
+                    "falling back to mmap gather\n");
+            cached = 0;
+        }
+        if (cached) {
+            fprintf(stderr, "ds4: expert gather single-copy pread enabled (fd=%d)\n",
+                    g_model_fd);
+        }
+    }
+    return cached;
+}
+
+static int ds4_gpu_expert_pread_fd(void) {
+    static int cached_fd = -2;
+    if (cached_fd == -2) {
+        cached_fd = g_model_fd;
+        if (ds4_gpu_env_bool("DS4_METAL_EXPERT_PREAD_NOCACHE") > 0 && g_model_fd >= 0) {
+            char path[MAXPATHLEN];
+            memset(path, 0, sizeof(path));
+            if (fcntl(g_model_fd, F_GETPATH, path) == 0) {
+                int nfd = open(path, O_RDONLY);
+                if (nfd >= 0) {
+                    if (fcntl(nfd, F_NOCACHE, 1) != -1) {
+                        cached_fd = nfd;
+                        fprintf(stderr,
+                                "ds4: expert pread cold reads use a separate F_NOCACHE descriptor\n");
+                    } else {
+                        close(nfd);
+                    }
+                }
+            }
+            if (cached_fd == g_model_fd) {
+                fprintf(stderr,
+                        "ds4: DS4_METAL_EXPERT_PREAD_NOCACHE=1 requested but F_NOCACHE descriptor "
+                        "unavailable; using the shared model fd\n");
+            }
+        }
+    }
+    return cached_fd;
+}
+
+static int ds4_gpu_expert_io_profile_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = ds4_gpu_env_bool("DS4_METAL_EXPERT_IO_PROFILE") > 0 ? 1 : 0;
+        if (cached) {
+            fprintf(stderr,
+                    "ds4-io: expert IO profile on "
+                    "(fault/memcpy/pread are thread-summed CPU ms; wall/drain are wall-clock ms)\n");
+        }
+    }
+    return cached;
+}
+
+/* Thread-summed accumulators for the current gather call (reset per layer call,
+ * written by gather workers via atomic adds, read after the join). */
+static uint64_t g_io_prof_fault_ns;
+static uint64_t g_io_prof_copy_ns;
+static uint64_t g_io_prof_pread_ns;
+static uint64_t g_io_prof_cold_bytes;
+static uint64_t g_io_prof_hit_bytes;
+static uint64_t g_io_prof_pread_fallbacks;   /* cumulative, never reset */
+static volatile uint64_t g_io_prof_touch_sink;
+
+static void ds4_gpu_expert_io_prof_reset(void) {
+    g_io_prof_fault_ns = 0;
+    g_io_prof_copy_ns = 0;
+    g_io_prof_pread_ns = 0;
+    g_io_prof_cold_bytes = 0;
+    g_io_prof_hit_bytes = 0;
+}
+
+static void ds4_gpu_expert_io_prof_report(const char *site,
+                                          const char *mode,
+                                          uint32_t layer,
+                                          uint32_t n_active,
+                                          uint32_t n_tokens,
+                                          double wall_ms,
+                                          double drain_ms) {
+    const double mib = 1024.0 * 1024.0;
+    const uint64_t moved = g_io_prof_cold_bytes + g_io_prof_hit_bytes;
+    const double bw_gbps = wall_ms > 0.0 ? ((double)moved / (wall_ms * 1e-3)) / 1e9 : 0.0;
+    fprintf(stderr,
+            "ds4-io: site=%s mode=%s layer=%u n_active=%u n_tokens=%u "
+            "cold_mib=%.1f hit_mib=%.1f wall_ms=%.2f fault_ms=%.2f memcpy_ms=%.2f "
+            "pread_ms=%.2f drain_ms=%.2f bw_gbps=%.2f pread_fallbacks=%llu\n",
+            site, mode, layer, n_active, n_tokens,
+            (double)g_io_prof_cold_bytes / mib,
+            (double)g_io_prof_hit_bytes / mib,
+            wall_ms,
+            (double)g_io_prof_fault_ns / 1e6,
+            (double)g_io_prof_copy_ns / 1e6,
+            (double)g_io_prof_pread_ns / 1e6,
+            drain_ms,
+            bw_gbps,
+            (unsigned long long)g_io_prof_pread_fallbacks);
+}
+
+/* Touch one byte per page so the mmap fault cost can be timed separately from
+ * the memcpy when the IO profile is on (mmap path only). */
+static uint64_t ds4_gpu_expert_touch_pages(const uint8_t *p, size_t len) {
+    uint64_t sink = 0;
+    const size_t page = 16384;
+    for (size_t i = 0; i < len; i += page) sink += p[i];
+    if (len) sink += p[len - 1];
+    return sink;
+}
+
 typedef struct {
     const void *model_map;
     const uint8_t *map;
@@ -16771,6 +16933,9 @@ typedef struct {
     uint64_t gate_expert_bytes;
     uint64_t down_expert_bytes;
     uint32_t next_slot;
+    int use_pread;
+    int pread_fd;
+    int io_profile;
     int ok;
 } ds4_metal_expert_gather_ctx;
 
@@ -16804,12 +16969,72 @@ static void ds4_gpu_expert_gather_copy_slot(ds4_metal_expert_gather_ctx *ctx, ui
     const uint64_t down_src = (uint64_t)id * ctx->down_expert_bytes;
     const uint64_t gate_dst_off = (uint64_t)slot * ctx->gate_expert_bytes;
     const uint64_t down_dst_off = (uint64_t)slot * ctx->down_expert_bytes;
+    const uint64_t expert_bytes = 2u * ctx->gate_expert_bytes + ctx->down_expert_bytes;
     const ds4_metal_expert_source_entry *src_entry =
         ds4_gpu_expert_source_hard_find_ex(ctx->model_map, ctx->layer_index, id, false);
     if (src_entry) {
+        const double t0 = ctx->io_profile ? ds4_gpu_now_ms() : 0.0;
         memcpy(ctx->gate_dst + gate_dst_off, src_entry->gate_copy, (size_t)ctx->gate_expert_bytes);
         memcpy(ctx->up_dst + gate_dst_off, src_entry->up_copy, (size_t)ctx->gate_expert_bytes);
         memcpy(ctx->down_dst + down_dst_off, src_entry->down_copy, (size_t)ctx->down_expert_bytes);
+        if (ctx->io_profile) {
+            __sync_fetch_and_add(&g_io_prof_copy_ns,
+                                 (uint64_t)((ds4_gpu_now_ms() - t0) * 1e6));
+            __sync_fetch_and_add(&g_io_prof_hit_bytes, expert_bytes);
+        }
+        return;
+    }
+    /* P1.1 single-copy path: SSD -> Shared scratch in one pread per tensor,
+     * no page fault, no second memcpy.  Bytes are identical to the mmap copy
+     * (same file offsets), so logits are bit-exact by construction. */
+    if (ctx->use_pread) {
+        const double t0 = ctx->io_profile ? ds4_gpu_now_ms() : 0.0;
+        if (ds4_gpu_pread_full(ctx->pread_fd,
+                               ctx->gate_dst + gate_dst_off,
+                               ctx->gate_offset + gate_src,
+                               (size_t)ctx->gate_expert_bytes) &&
+            ds4_gpu_pread_full(ctx->pread_fd,
+                               ctx->up_dst + gate_dst_off,
+                               ctx->up_offset + gate_src,
+                               (size_t)ctx->gate_expert_bytes) &&
+            ds4_gpu_pread_full(ctx->pread_fd,
+                               ctx->down_dst + down_dst_off,
+                               ctx->down_offset + down_src,
+                               (size_t)ctx->down_expert_bytes)) {
+            if (ctx->io_profile) {
+                __sync_fetch_and_add(&g_io_prof_pread_ns,
+                                     (uint64_t)((ds4_gpu_now_ms() - t0) * 1e6));
+                __sync_fetch_and_add(&g_io_prof_cold_bytes, expert_bytes);
+            }
+            return;
+        }
+        /* pread failed (EIO/short read): fall back to the proven mmap copy. */
+        __sync_fetch_and_add(&g_io_prof_pread_fallbacks, 1u);
+    }
+    if (ctx->io_profile) {
+        const double tf0 = ds4_gpu_now_ms();
+        uint64_t sink = 0;
+        sink += ds4_gpu_expert_touch_pages(ctx->map + ctx->gate_offset + gate_src,
+                                           (size_t)ctx->gate_expert_bytes);
+        sink += ds4_gpu_expert_touch_pages(ctx->map + ctx->up_offset + gate_src,
+                                           (size_t)ctx->gate_expert_bytes);
+        sink += ds4_gpu_expert_touch_pages(ctx->map + ctx->down_offset + down_src,
+                                           (size_t)ctx->down_expert_bytes);
+        g_io_prof_touch_sink += sink;
+        const double tc0 = ds4_gpu_now_ms();
+        __sync_fetch_and_add(&g_io_prof_fault_ns, (uint64_t)((tc0 - tf0) * 1e6));
+        memcpy(ctx->gate_dst + gate_dst_off,
+               ctx->map + ctx->gate_offset + gate_src,
+               (size_t)ctx->gate_expert_bytes);
+        memcpy(ctx->up_dst + gate_dst_off,
+               ctx->map + ctx->up_offset + gate_src,
+               (size_t)ctx->gate_expert_bytes);
+        memcpy(ctx->down_dst + down_dst_off,
+               ctx->map + ctx->down_offset + down_src,
+               (size_t)ctx->down_expert_bytes);
+        __sync_fetch_and_add(&g_io_prof_copy_ns,
+                             (uint64_t)((ds4_gpu_now_ms() - tc0) * 1e6));
+        __sync_fetch_and_add(&g_io_prof_cold_bytes, expert_bytes);
         return;
     }
     memcpy(ctx->gate_dst + gate_dst_off,
@@ -16929,6 +17154,13 @@ static int ds4_gpu_load_layer_experts_to_scratch(
     uint8_t *down_dst = (uint8_t *)g_moe_scratch_down.contents;
     if (!gate_dst || !up_dst || !down_dst) return 0;
 
+    /* Resolve cached env switches here, on the serial entry path, so the
+     * lazily-initialized statics never race with gather worker threads. */
+    const int io_profile = ds4_gpu_expert_io_profile_enabled();
+    int use_pread = ds4_gpu_expert_pread_enabled();
+    const int pread_fd = use_pread ? ds4_gpu_expert_pread_fd() : -1;
+    if (use_pread && pread_fd < 0) use_pread = 0;
+
     const uint32_t gather_threads = ds4_gpu_expert_gather_threads();
     if (gather_threads > 1u && n_active >= 2u) {
         ds4_metal_expert_gather_ctx ctx = {
@@ -16947,6 +17179,9 @@ static int ds4_gpu_load_layer_experts_to_scratch(
             .gate_expert_bytes = gate_expert_bytes,
             .down_expert_bytes = down_expert_bytes,
             .next_slot = 0,
+            .use_pread = use_pread,
+            .pread_fd = pread_fd,
+            .io_profile = io_profile,
             .ok = 1,
         };
         uint32_t nth = gather_threads;
@@ -16973,6 +17208,9 @@ static int ds4_gpu_load_layer_experts_to_scratch(
             .down_offset = down_offset,
             .gate_expert_bytes = gate_expert_bytes,
             .down_expert_bytes = down_expert_bytes,
+            .use_pread = use_pread,
+            .pread_fd = pread_fd,
+            .io_profile = io_profile,
             .ok = 1,
         };
         ds4_gpu_expert_gather_copy_slot(&one, slot);
@@ -16981,7 +17219,200 @@ static int ds4_gpu_load_layer_experts_to_scratch(
     return 1;
 }
 
-static int ds4_gpu_compact_selected_experts(
+/* ---- project.md P1.2: prefill full-layer sequential streaming ----
+ *
+ * A prefill chunk of >=128 tokens activates nearly all 256 experts of every
+ * routed layer, so the per-expert gather degenerates into ~256 scattered
+ * multi-MiB reads.  When the active set covers at least
+ * DS4_METAL_EXPERT_STREAM_THRESHOLD_PCT (default 60) percent of the layer,
+ * DS4_METAL_EXPERT_FULL_LAYER_STREAM=1 streams the whole gate/up/down expert
+ * tensors into scratch as three long sequential reads (chunked across the
+ * gather threads) and keeps the original expert ids — no slot remap, the MoE
+ * kernels index scratch exactly like the resident direct path. */
+
+static int ds4_gpu_expert_stream_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = ds4_gpu_env_bool("DS4_METAL_EXPERT_FULL_LAYER_STREAM") > 0 ? 1 : 0;
+        if (cached) {
+            fprintf(stderr,
+                    "ds4: prefill full-layer expert streaming enabled "
+                    "(threshold %llu%%, chunk %lluMiB)\n",
+                    (unsigned long long)ds4_gpu_env_u64("DS4_METAL_EXPERT_STREAM_THRESHOLD_PCT", 60u),
+                    (unsigned long long)ds4_gpu_env_u64("DS4_METAL_EXPERT_STREAM_CHUNK_MB", 16u));
+        }
+    }
+    return cached;
+}
+
+static uint32_t ds4_gpu_expert_stream_threshold_pct(void) {
+    static uint32_t cached;
+    static int initialized;
+    if (!initialized) {
+        uint64_t v = ds4_gpu_env_u64("DS4_METAL_EXPERT_STREAM_THRESHOLD_PCT", 60u);
+        if (v < 1u) v = 1u;
+        if (v > 100u) v = 100u;
+        cached = (uint32_t)v;
+        initialized = 1;
+    }
+    return cached;
+}
+
+static uint64_t ds4_gpu_expert_stream_chunk_bytes(void) {
+    static uint64_t cached;
+    if (cached == 0) {
+        uint64_t mb = ds4_gpu_env_u64("DS4_METAL_EXPERT_STREAM_CHUNK_MB", 16u);
+        if (mb < 1u) mb = 1u;
+        if (mb > 256u) mb = 256u;
+        cached = mb << 20;
+    }
+    return cached;
+}
+
+typedef struct {
+    const uint8_t *map;
+    int use_pread;
+    int pread_fd;
+    int io_profile;
+    uint64_t seg_src[3];
+    uint8_t *seg_dst[3];
+    uint64_t seg_len[3];
+    uint64_t seg_chunks[3];
+    uint64_t chunk_bytes;
+    uint64_t total_chunks;
+    uint64_t next_chunk;   /* atomic cursor shared by the stream workers */
+    int ok;
+} ds4_metal_expert_stream_ctx;
+
+static void ds4_gpu_expert_stream_copy_chunk(ds4_metal_expert_stream_ctx *ctx, uint64_t chunk) {
+    uint32_t seg = 0;
+    uint64_t base = 0;
+    while (seg < 3u && chunk >= base + ctx->seg_chunks[seg]) {
+        base += ctx->seg_chunks[seg];
+        seg++;
+    }
+    if (seg >= 3u) {
+        ctx->ok = 0;
+        return;
+    }
+    const uint64_t off = (chunk - base) * ctx->chunk_bytes;
+    uint64_t len = ctx->seg_len[seg] - off;
+    if (len > ctx->chunk_bytes) len = ctx->chunk_bytes;
+    const double t0 = ctx->io_profile ? ds4_gpu_now_ms() : 0.0;
+    if (ctx->use_pread &&
+        ds4_gpu_pread_full(ctx->pread_fd,
+                           ctx->seg_dst[seg] + off,
+                           ctx->seg_src[seg] + off,
+                           (size_t)len)) {
+        if (ctx->io_profile) {
+            __sync_fetch_and_add(&g_io_prof_pread_ns,
+                                 (uint64_t)((ds4_gpu_now_ms() - t0) * 1e6));
+            __sync_fetch_and_add(&g_io_prof_cold_bytes, len);
+        }
+        return;
+    }
+    if (ctx->use_pread) __sync_fetch_and_add(&g_io_prof_pread_fallbacks, 1u);
+    memcpy(ctx->seg_dst[seg] + off, ctx->map + ctx->seg_src[seg] + off, (size_t)len);
+    if (ctx->io_profile) {
+        __sync_fetch_and_add(&g_io_prof_copy_ns,
+                             (uint64_t)((ds4_gpu_now_ms() - t0) * 1e6));
+        __sync_fetch_and_add(&g_io_prof_cold_bytes, len);
+    }
+}
+
+static void *ds4_gpu_expert_stream_worker(void *arg) {
+    ds4_metal_expert_stream_ctx *ctx = (ds4_metal_expert_stream_ctx *)arg;
+    for (;;) {
+        const uint64_t chunk = __sync_fetch_and_add(&ctx->next_chunk, 1ull);
+        if (chunk >= ctx->total_chunks) break;
+        ds4_gpu_expert_stream_copy_chunk(ctx, chunk);
+        if (!ctx->ok) break;
+    }
+    return NULL;
+}
+
+static int ds4_gpu_stream_layer_experts_to_scratch(
+        const void *model_map,
+        uint64_t    gate_offset,
+        uint64_t    up_offset,
+        uint64_t    down_offset,
+        uint64_t    gate_expert_bytes,
+        uint64_t    down_expert_bytes,
+        uint32_t    n_expert_total) {
+    if (!model_map || n_expert_total == 0) return 0;
+    const uint64_t gate_total = (uint64_t)n_expert_total * gate_expert_bytes;
+    const uint64_t down_total = (uint64_t)n_expert_total * down_expert_bytes;
+    if (gate_total == 0 || down_total == 0 ||
+        gate_total > NSUIntegerMax || down_total > NSUIntegerMax) {
+        return 0;
+    }
+    /* Same scratch pool as the per-expert gather: with ~all experts active the
+     * gather already sizes scratch to the full layer, so streaming does not
+     * raise the peak footprint. */
+    if (!ds4_gpu_ensure_scratch_buffer(&g_moe_scratch_gate,
+                                       &g_moe_scratch_gate_bytes,
+                                       (NSUInteger)gate_total,
+                                       "ds4_moe_scratch_gate") ||
+        !ds4_gpu_ensure_scratch_buffer(&g_moe_scratch_up,
+                                       &g_moe_scratch_up_bytes,
+                                       (NSUInteger)gate_total,
+                                       "ds4_moe_scratch_up") ||
+        !ds4_gpu_ensure_scratch_buffer(&g_moe_scratch_down,
+                                       &g_moe_scratch_down_bytes,
+                                       (NSUInteger)down_total,
+                                       "ds4_moe_scratch_down")) {
+        return 0;
+    }
+    uint8_t *gate_dst = (uint8_t *)g_moe_scratch_gate.contents;
+    uint8_t *up_dst = (uint8_t *)g_moe_scratch_up.contents;
+    uint8_t *down_dst = (uint8_t *)g_moe_scratch_down.contents;
+    if (!gate_dst || !up_dst || !down_dst) return 0;
+
+    const int io_profile = ds4_gpu_expert_io_profile_enabled();
+    int use_pread = ds4_gpu_expert_pread_enabled();
+    const int pread_fd = use_pread ? ds4_gpu_expert_pread_fd() : -1;
+    if (use_pread && pread_fd < 0) use_pread = 0;
+
+    ds4_metal_expert_stream_ctx ctx = {
+        .map = (const uint8_t *)model_map,
+        .use_pread = use_pread,
+        .pread_fd = pread_fd,
+        .io_profile = io_profile,
+        .seg_src = { gate_offset, up_offset, down_offset },
+        .seg_dst = { gate_dst, up_dst, down_dst },
+        .seg_len = { gate_total, gate_total, down_total },
+        .chunk_bytes = ds4_gpu_expert_stream_chunk_bytes(),
+        .next_chunk = 0,
+        .ok = 1,
+    };
+    for (uint32_t s = 0; s < 3u; s++) {
+        ctx.seg_chunks[s] = (ctx.seg_len[s] + ctx.chunk_bytes - 1u) / ctx.chunk_bytes;
+        ctx.total_chunks += ctx.seg_chunks[s];
+    }
+
+    uint32_t nth = ds4_gpu_expert_gather_threads();
+    if ((uint64_t)nth > ctx.total_chunks) nth = (uint32_t)ctx.total_chunks;
+    pthread_t th[16];
+    uint32_t created = 0;
+    if (nth > 1u) {
+        for (uint32_t i = 0; i + 1u < nth && i < 16u; i++) {
+            if (pthread_create(&th[created], NULL, ds4_gpu_expert_stream_worker, &ctx) == 0) {
+                created++;
+            }
+        }
+    }
+    /* The calling thread always participates; the shared cursor guarantees
+     * every chunk is copied exactly once even if thread creation failed. */
+    (void)ds4_gpu_expert_stream_worker(&ctx);
+    for (uint32_t i = 0; i < created; i++) (void)pthread_join(th[i], NULL);
+    return ctx.ok;
+}
+
+/* Pass 1 of the selected-expert compaction: collect the unique active expert
+ * ids of this layer call (first-appearance order) without touching the
+ * selected-id buffer, so the caller can pick gather vs full-layer streaming
+ * before committing to a slot remap. */
+static int ds4_gpu_collect_active_experts(
         id<MTLBuffer> selectedbuf,
         NSUInteger    selected_off,
         uint32_t      n_picks,
@@ -16996,26 +17427,92 @@ static int ds4_gpu_compact_selected_experts(
                 (unsigned long)selectedbuf.storageMode);
         return 0;
     }
-    if (n_expert_total == 0 || n_expert_total > active_cap) return 0;
-    int32_t *sel_cpu =
-        (int32_t *)((uint8_t *)selectedbuf.contents + (size_t)selected_off);
-    int16_t compact_lut[1024];
-    for (uint32_t i = 0; i < active_cap; i++) compact_lut[i] = -1;
+    if (n_expert_total == 0 || n_expert_total > active_cap || active_cap > 1024u) return 0;
+    const int32_t *sel_cpu =
+        (const int32_t *)((const uint8_t *)selectedbuf.contents + (size_t)selected_off);
+    int16_t seen_lut[1024];
+    for (uint32_t i = 0; i < active_cap; i++) seen_lut[i] = -1;
     uint32_t n_active = 0;
     for (uint32_t i = 0; i < n_picks; i++) {
         int32_t raw = sel_cpu[i];
         uint32_t id = (raw >= 0 && (uint32_t)raw < n_expert_total) ? (uint32_t)raw : 0u;
-        int16_t slot = compact_lut[id];
-        if (slot < 0) {
+        if (seen_lut[id] < 0) {
             if (n_active >= active_cap) return 0;
-            slot = (int16_t)n_active;
-            compact_lut[id] = slot;
+            seen_lut[id] = 0;
             active_ids[n_active++] = id;
         }
-        sel_cpu[i] = (int32_t)slot;
     }
     *n_active_out = n_active;
     return n_active != 0;
+}
+
+static int ds4_gpu_cmp_u32(const void *a, const void *b) {
+    const uint32_t x = *(const uint32_t *)a;
+    const uint32_t y = *(const uint32_t *)b;
+    return x < y ? -1 : (x > y ? 1 : 0);
+}
+
+static int ds4_gpu_expert_sort_ids_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = ds4_gpu_env_bool("DS4_METAL_EXPERT_SORT_IDS") > 0 ? 1 : 0;
+        if (cached) {
+            fprintf(stderr,
+                    "ds4: expert gather slots sorted by expert id (sequential cold reads)\n");
+        }
+    }
+    return cached;
+}
+
+/* Pass 2: optionally sort the active ids ascending (= ascending file offsets,
+ * so cold reads walk the GGUF forward instead of jumping around) and rewrite
+ * the selected-id buffer from original expert ids to compact scratch slots.
+ * Bit-exact either way: per-pick results and their summation order are
+ * unchanged, only the scratch slot numbering moves. */
+static int ds4_gpu_remap_selected_to_slots(
+        id<MTLBuffer> selectedbuf,
+        NSUInteger    selected_off,
+        uint32_t      n_picks,
+        uint32_t      n_expert_total,
+        uint32_t     *active_ids,
+        uint32_t      n_active) {
+    if (!selectedbuf || !active_ids || n_active == 0 || n_active > 1024u) return 0;
+    if (ds4_gpu_expert_sort_ids_enabled() && n_active > 1u) {
+        qsort(active_ids, n_active, sizeof(uint32_t), ds4_gpu_cmp_u32);
+    }
+    int16_t compact_lut[1024];
+    for (uint32_t i = 0; i < 1024u; i++) compact_lut[i] = -1;
+    for (uint32_t s = 0; s < n_active; s++) {
+        if (active_ids[s] >= 1024u) return 0;
+        compact_lut[active_ids[s]] = (int16_t)s;
+    }
+    int32_t *sel_cpu =
+        (int32_t *)((uint8_t *)selectedbuf.contents + (size_t)selected_off);
+    for (uint32_t i = 0; i < n_picks; i++) {
+        int32_t raw = sel_cpu[i];
+        uint32_t id = (raw >= 0 && (uint32_t)raw < n_expert_total) ? (uint32_t)raw : 0u;
+        if (id >= 1024u || compact_lut[id] < 0) return 0;
+        sel_cpu[i] = (int32_t)compact_lut[id];
+    }
+    return 1;
+}
+
+static int ds4_gpu_compact_selected_experts(
+        id<MTLBuffer> selectedbuf,
+        NSUInteger    selected_off,
+        uint32_t      n_picks,
+        uint32_t      n_expert_total,
+        uint32_t     *active_ids,
+        uint32_t      active_cap,
+        uint32_t     *n_active_out) {
+    if (!ds4_gpu_collect_active_experts(selectedbuf, selected_off, n_picks,
+                                        n_expert_total, active_ids, active_cap,
+                                        n_active_out)) {
+        return 0;
+    }
+    return ds4_gpu_remap_selected_to_slots(selectedbuf, selected_off, n_picks,
+                                           n_expert_total, active_ids,
+                                           *n_active_out);
 }
 
 int ds4_gpu_routed_moe_one_tensor(
@@ -17107,8 +17604,14 @@ int ds4_gpu_routed_moe_one_tensor(
             gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
             down_type == DS4_METAL_TENSOR_Q2_K;
         if (a3_expert_offload) {
+            const int io_profile = ds4_gpu_expert_io_profile_enabled();
             const int was_batched = (g_batch_cb != nil);
-            if (was_batched && ds4_gpu_end_commands() == 0) return 0;
+            double drain_ms = 0.0;
+            if (was_batched) {
+                const double drain_t0 = io_profile ? ds4_gpu_now_ms() : 0.0;
+                if (ds4_gpu_end_commands() == 0) return 0;
+                if (io_profile) drain_ms = ds4_gpu_now_ms() - drain_t0;
+            }
             uint32_t active_ids[1024];
             uint32_t n_active = 0;
             int compact_ok = ds4_gpu_compact_selected_experts(selectedbuf,
@@ -17154,6 +17657,8 @@ int ds4_gpu_routed_moe_one_tensor(
                                                  gate_expert_bytes,
                                                  down_expert_bytes);
             }
+            if (io_profile) ds4_gpu_expert_io_prof_reset();
+            const double gather_t0 = io_profile ? ds4_gpu_now_ms() : 0.0;
             const double copy_t0 = (!pool_used && ds4_gpu_expert_profile_is_enabled()) ? ds4_gpu_now_ms() : 0.0;
             int load_ok = compact_ok && (pool_used ||
                           ds4_gpu_load_layer_experts_to_scratch(model_map,
@@ -17166,6 +17671,15 @@ int ds4_gpu_routed_moe_one_tensor(
                                                                  gate_expert_bytes,
                                                                  down_expert_bytes,
                                                                  n_total_expert));
+            if (io_profile) {
+                ds4_gpu_expert_io_prof_report("decode",
+                                              pool_used ? "pool" : "gather",
+                                              layer_index,
+                                              n_active,
+                                              1u,
+                                              ds4_gpu_now_ms() - gather_t0,
+                                              drain_ms);
+            }
             if (!pool_used && compact_ok && ds4_gpu_expert_profile_is_enabled()) {
                 ds4_gpu_expert_profile_record(layer_index,
                                               active_ids,
@@ -17519,8 +18033,14 @@ int ds4_gpu_routed_moe_batch_tensor(
             gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
             down_type == DS4_METAL_TENSOR_Q2_K;
         if (a3_expert_offload) {
+            const int io_profile = ds4_gpu_expert_io_profile_enabled();
             const int was_batched = (g_batch_cb != nil);
-            if (was_batched && ds4_gpu_end_commands() == 0) return 0;
+            double drain_ms = 0.0;
+            if (was_batched) {
+                const double drain_t0 = io_profile ? ds4_gpu_now_ms() : 0.0;
+                if (ds4_gpu_end_commands() == 0) return 0;
+                if (io_profile) drain_ms = ds4_gpu_now_ms() - drain_t0;
+            }
             uint32_t active_ids[1024];
             uint32_t n_active = 0;
             const uint64_t total_picks_u64 = (uint64_t)n_tokens * n_expert;
@@ -17528,15 +18048,49 @@ int ds4_gpu_routed_moe_batch_tensor(
                 if (was_batched) (void)ds4_gpu_begin_commands();
                 return 0;
             }
-            int compact_ok = ds4_gpu_compact_selected_experts(selectedbuf,
-                                                              selected_off,
-                                                              (uint32_t)total_picks_u64,
-                                                              n_total_expert,
-                                                              active_ids,
-                                                              1024,
-                                                              &n_active);
+            /* Pass 1 only: count the active set first so we can choose between
+             * per-expert gather and P1.2 full-layer streaming before the slot
+             * remap rewrites the selected-id buffer. */
+            int compact_ok = ds4_gpu_collect_active_experts(selectedbuf,
+                                                            selected_off,
+                                                            (uint32_t)total_picks_u64,
+                                                            n_total_expert,
+                                                            active_ids,
+                                                            1024,
+                                                            &n_active);
+            if (io_profile) ds4_gpu_expert_io_prof_reset();
+            const double gather_t0 = io_profile ? ds4_gpu_now_ms() : 0.0;
+            /* P1.2: a big prefill chunk activates nearly every expert of the
+             * layer, so ~256 scattered reads degenerate to random IO.  Stream
+             * the whole gate/up/down tensors sequentially instead and keep the
+             * original expert ids (selected buffer untouched, kernels index
+             * the full-layer scratch exactly like the resident direct path). */
+            int stream_used = 0;
+            if (compact_ok && n_tokens > 1u && !g_expert_pool_warm_batch &&
+                gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
+                down_type == DS4_METAL_TENSOR_Q2_K &&
+                ds4_gpu_expert_stream_enabled() &&
+                (uint64_t)n_active * 100ull >=
+                    (uint64_t)n_total_expert * ds4_gpu_expert_stream_threshold_pct()) {
+                stream_used = ds4_gpu_stream_layer_experts_to_scratch(model_map,
+                                                                      gate_offset,
+                                                                      up_offset,
+                                                                      down_offset,
+                                                                      gate_expert_bytes,
+                                                                      down_expert_bytes,
+                                                                      n_total_expert);
+            }
+            if (compact_ok && !stream_used) {
+                compact_ok = ds4_gpu_remap_selected_to_slots(selectedbuf,
+                                                             selected_off,
+                                                             (uint32_t)total_picks_u64,
+                                                             n_total_expert,
+                                                             active_ids,
+                                                             n_active);
+            }
             int pool_used = 0;
-            if (compact_ok && g_expert_pool_warm_batch && gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
+            if (!stream_used && compact_ok && g_expert_pool_warm_batch &&
+                gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
                 down_type == DS4_METAL_TENSOR_Q2_K) {
                 pool_used = ds4_gpu_try_load_layer_experts_to_pool(model_map,
                                                                    layer_index,
@@ -17556,7 +18110,8 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                                    &down_buf,
                                                                    &source_n_total_expert);
             }
-            if (compact_ok && !pool_used && gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
+            if (!stream_used && compact_ok && !pool_used &&
+                gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
                 down_type == DS4_METAL_TENSOR_Q2_K) {
                 ds4_gpu_expert_source_cache_note(model_map,
                                                  layer_index,
@@ -17568,8 +18123,9 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                  gate_expert_bytes,
                                                  down_expert_bytes);
             }
-            const double copy_t0 = (!pool_used && ds4_gpu_expert_profile_is_enabled()) ? ds4_gpu_now_ms() : 0.0;
-            int load_ok = compact_ok && (pool_used ||
+            const double copy_t0 = (!pool_used && !stream_used && ds4_gpu_expert_profile_is_enabled()) ?
+                ds4_gpu_now_ms() : 0.0;
+            int load_ok = compact_ok && (stream_used || pool_used ||
                           ds4_gpu_load_layer_experts_to_scratch(model_map,
                                                                  layer_index,
                                                                  n_active,
@@ -17580,7 +18136,17 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                                  gate_expert_bytes,
                                                                  down_expert_bytes,
                                                                  n_total_expert));
-            if (!pool_used && compact_ok && ds4_gpu_expert_profile_is_enabled()) {
+            if (io_profile) {
+                ds4_gpu_expert_io_prof_report("batch",
+                                              stream_used ? "stream" :
+                                              (pool_used ? "pool" : "gather"),
+                                              layer_index,
+                                              n_active,
+                                              n_tokens,
+                                              ds4_gpu_now_ms() - gather_t0,
+                                              drain_ms);
+            }
+            if (!pool_used && !stream_used && compact_ok && ds4_gpu_expert_profile_is_enabled()) {
                 ds4_gpu_expert_profile_record(layer_index,
                                               active_ids,
                                               n_active,
@@ -17598,7 +18164,7 @@ int ds4_gpu_routed_moe_batch_tensor(
                 gate_buf = g_moe_scratch_gate;
                 up_buf = g_moe_scratch_up;
                 down_buf = g_moe_scratch_down;
-                source_n_total_expert = n_active;
+                source_n_total_expert = stream_used ? n_total_expert : n_active;
             }
             gate_inner = 0;
             up_inner = 0;

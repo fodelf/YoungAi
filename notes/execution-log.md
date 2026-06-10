@@ -1490,3 +1490,49 @@ User requested not just analysis: try the concrete knobs one by one, keep MTP re
 **Expected impact.** This directly attacks the measured 0.66t/s blocker without returning to a command buffer that sees a 30+GiB expert span. If Metal accepts the per-tensor direct views under the 12/8GiB budgets, decode should move from CPU-copy-bound toward GPU/mmap-read-bound. If a device still OOMs, set `DS4_METAL_EXPERT_OFFLOAD_DIRECT=0` to return to A3.
 
 **Validation performed here.** `make ds4` passes locally and `bash -n tools/mtp_pipe_q2_speed.sh` passes. No dual-host/model timing run performed here; user will manually validate with the script.
+
+## 2026-06-10 — project.md 第一波落地: P0.1 IO 分解计时 + P1.1 pread 单拷贝直读 + P1.2 prefill 整层流式 + 槽位排序
+
+**Context.** project.md 物理审计定位当前 0.81 t/s 的真瓶颈: A3 gather 有效带宽 ~1.5GB/s =
+mmap 16KiB 缺页 (SSD→页缓存) + memcpy (页缓存→Shared scratch) 双拷贝, 串行夹在每层 command drain 之间;
+SSD (3–7GB/s) 与雷电 (~4–5GB/s) 均未打满。本补丁按 project.md P0/P1 顺序落地第一波, 全部走 env 开关,
+引擎默认行为与旧基线 bit 级一致 (不设新 env = 原代码路径)。
+
+**Patch (`ds4_metal.m`, ~640 行新增/重排; `tools/mtp_pipe_q2_speed.sh` 新增开关).**
+- **P1.1 单拷贝直读** `DS4_METAL_EXPERT_PREAD=1`: `ds4_gpu_set_model_fd` 现真正登记主模型 fd
+  (mmap 自文件偏移 0 ⇒ 文件偏移==map 偏移); `ds4_gpu_expert_gather_copy_slot` 冷专家分支改为
+  每张量一次 `pread()` 直读进 scratch MTLBuffer——零缺页、零二次拷贝, 字节与 mmap 路径同源同偏移,
+  logits 构造性 bit-exact。pread 失败 (EIO/短读) 逐槽回退 mmap memcpy 并计数 `pread_fallbacks`。
+  双模型 fd 冲突时自动禁用 (g_model_fd_conflict)。`DS4_METAL_EXPERT_PREAD_NOCACHE=1` 经 F_GETPATH
+  开独立 F_NOCACHE fd 供冷读, 防止 1.7GiB/token 冷流冲掉热页缓存 (默认关, 单独 A/B)。
+  env 解析全部在 gather 串行入口完成后传 ctx, 避免与 gather 线程竞态。
+- **P1.2 prefill 整层顺序流式** `DS4_METAL_EXPERT_FULL_LAYER_STREAM=1`: batch 站点 (n_tokens>1)
+  先只数活跃集 (collect, 不重写 selected 缓冲); 活跃专家 ≥`DS4_METAL_EXPERT_STREAM_THRESHOLD_PCT`%
+  (默认 60) 时, 整层 gate/up/down 三段按 `DS4_METAL_EXPERT_STREAM_CHUNK_MB` (默认 16MiB) 分块、
+  gather 线程池并行顺序读满 scratch, **专家 id 不重映射** (selected 缓冲原样, kernel 以
+  n_total_expert 布局索引 scratch, 语义与 resident direct 路径一致)。流式失败自动回退 remap+gather。
+  内存无新增峰值: 大 chunk prefill 下 n_active≈243/256, 旧 gather scratch 本就 ~满层尺寸。
+  流式跳过 pool warm 与 source-cache note (decode 路径不受影响)。
+- **快赢: 槽位排序** `DS4_METAL_EXPERT_SORT_IDS=1`: compact 拆为 collect+remap 两段,
+  remap 前对活跃 id 升序排序 = 文件偏移升序 ⇒ 冷读顺序化。bit-exact: 仅 scratch 槽位编号变,
+  每 pick 的计算与求和顺序不变。
+- **P0.1 IO 分解计时** `DS4_METAL_EXPERT_IO_PROFILE=1`: 每个 routed-MoE 层调用打一行
+  `ds4-io: site=decode|batch mode=gather|stream|pool layer= n_active= n_tokens= cold_mib= hit_mib=
+  wall_ms= fault_ms= memcpy_ms= pread_ms= drain_ms= bw_gbps= pread_fallbacks=`;
+  mmap 模式下先 16KiB/页 touch 单独计 fault 时间再 memcpy (仅 profile 开启时); drain_ms 单独计
+  `ds4_gpu_end_commands` 等待 (屏障税专查, SwiftLM #84 教训)。fault/memcpy/pread 为线程求和 CPU ms,
+  wall/drain 为墙钟 ms (启动时打印说明行)。
+- **脚本**: 新增 EXPERT_PREAD(默认1)/EXPERT_PREAD_NOCACHE(0)/EXPERT_SORT_IDS(1)/EXPERT_STREAM(1)/
+  EXPERT_STREAM_THRESHOLD_PCT(60)/EXPERT_STREAM_CHUNK_MB(16)/EXPERT_IO_PROFILE(1), 拼进 BASE_RUN_ENV;
+  任意一项设 0 即回旧基线做 A/B。
+
+**预期.** decode: pread 砍掉缺页+双拷贝 (M1 门: ≥1.6 t/s 方向); prefill: 整层顺序流式把 ~256 次
+散乱 2–2.6MiB 读折成 3 段长顺序读 (M1 门: prefill ≥10 t/s 方向); ds4-io 行直接给出 P0.1 账表
+(fault/memcpy/pread/drain 占比 + 等效带宽), 决定下一步主攻 (P1.3 重排 vs P2.1 预取)。
+
+**Validation performed here.** `make` 全量通过 (新警告 0, 既有 4 条 unused 警告为本补丁前已存在的
+死代码); `./ds4_test --metal-kernels` OK (含新 env 全开重跑 OK); `bash -n tools/mtp_pipe_q2_speed.sh`
+通过。未在本机跑大模型 (纪律); 用户手动以 `tools/mtp_pipe_q2_speed.sh` 双机验证, 关注:
+① 三行 ds4-io 启动说明是否出现; ② decode `mode=gather` 行 pread_ms vs 旧 fault+memcpy;
+③ prefill `mode=stream` 行 bw_gbps; ④ `pread_fallbacks` 必须为 0; ⑤ 两机 RSS 红线 12/8GiB。
+A/B 矩阵: EXPERT_PREAD=0/1 × EXPERT_STREAM=0/1 × EXPERT_SORT_IDS=0/1 (任一回退即逐项定位)。
