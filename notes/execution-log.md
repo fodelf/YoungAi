@@ -1712,3 +1712,91 @@ coordinator `expert-fetch client: 3 connection(s)` + `remote fetch thread(s)`;
 ② coord ds4-io 行 `rfetch_mib` >0 且 wall_ms 下降 (期望 13.7→8-10); ③ worker 侧速度不应回退
 (服务在其空闲半程); ④ 输出文本 temp=0 seed=1 逐字一致; ⑤ A/B EXPERT_REMOTE_FETCH=0;
 ⑥ CONNS=2/4 扫一下; ⑦ RSS 红线 12/8 (服务端仅 8MiB/连接缓冲)。
+
+## 2026-06-10 — 第七波: 远程取数流水化 + 本地缓存命中分流 (1.81 t/s 之后)
+
+**Context.** 第六波远程专家字节服务实测 **1.81 t/s / prefill 4.80** (prefill +57%: 批量 gather
+单元多, 远程并行收益大)。coord 账表: rfetch 8.4MiB/层 (21%), wall 13.7→11.46; worker 几乎无感
+(4.84, 服务确实落在空闲半程)。但远程链路效率低: 每单元 ~6ms ≈ 0.26GB/s/连接 —— 纯乒乓协议,
+RTT + 服务端 pread 与网络传输全串行; 且远程工人会抢走本地页缓存里已有的单元 (本可 RAM 速完成),
+白花雷电带宽。
+
+**Patch.**
+- `ds4_distributed.c/h`: `ds4_dist_expert_fetch` 拆 `_send/_recv` 两段 (响应严格按请求序;
+  服务端无改动, 天然支持流水)。
+- `ds4_metal.m` 远程工人改**流水循环**: 每连接最多 2 个在途请求 —— 服务端 pread(N+1) 与
+  resp(N) 网络传输重叠, RTT 出关键路径; 各 pend 单元失败逐个本地兜底, 链路断仍永久降级本地。
+- 远程工人取到单元先查 **mincore**: 本地页缓存 ≥90% 命中的单元直接 RAM 拷贝
+  (`remote_local_finish`), 雷电带宽只花在真正的冷字节; 顺带修了 `range_mostly_cached` 的
+  static 缓冲并发 bug (预取线程 + 多个远程工人共用 → 改栈上)。
+- 脚本 CONNS 默认 3→4。
+
+**算账.** 流水化 + 4 连接: 远程供给 0.77 → ~1.5-2.5GB/s; coord 聚合 ≈ 2.5 + 2 ⇒
+wall 11.46 → ~8-9ms ⇒ coord 半程 ~240-260ms ⇒ token ~480-500ms ⇒ **方向 ~2.0-2.1 t/s**。
+
+**Validation performed here.** `make` 零新告警; **流水化环回自检** (1 连接 × 50 轮 × 2 在途,
+变长变偏移逐字节比对) 通过; `ds4_test --metal-kernels` 通过; `bash -n` 通过。未跑大模型。
+用户脚本验证: ① coord ds4-io `rfetch_mib` 应明显上升 (8.4 → 期望 15-25MiB/层), wall 下降;
+② rfetch_ms/rfetch_mib 比值下降 (流水化生效); ③ A/B CONNS=3/4/6; ④ worker 不回退;
+⑤ 输出 temp=0 逐字一致; ⑥ RSS 红线。
+
+## 2026-06-10 — 第八波: 远程取数「层尾禁抢」修复 (1.79 t/s 之后)
+
+**Context / 测量 (先测后改).**
+- 第七波流水化实测 1.81→1.79 (无效): rfetch 反降 8.4→6.1MiB/层, wall 11.46→12.33。
+- **裸链路测量**: 单 TCP 流 over 雷电桥 (4MB 显式缓冲) = **4.49GB/s** —— 链路无辜。
+- **生产协议隔离测量** (efetch 代码原样, worker 真实 gguf 随机 2.16MiB, 4 连接×2 在途, 无推理
+  负载): **4.69GB/s 聚合 / 1.17GB/s/连接** —— 协议与服务端也无辜。
+- ⇒ 生产环境 ~0.5GB/s 的真因是**层尾效应**: decode 每层仅 18 个单元/~12ms 窗口; 远程连接在
+  游标尾部抢到单元后, 本地 8 线程全部完工却要等 ~2ms/单元的远程在途请求 —— 每层 wall 被远程
+  长尾拖住, 中段收益被尾部反噬 (隔离测试无层边界故无此效应)。
+
+**Patch.**
+- `ds4_metal.m` 远程工人**尾部禁抢**: 最后 `DS4_METAL_EXPERT_REMOTE_TAIL_RESERVE`
+  (默认=GATHER_THREADS=8) 个单元只许本地 —— 本地 8 线程一轮并行收尾 (~1.5ms), 远程绝不站上
+  关键路径尾巴; 抢入尾区的竞态单元就地本地完成。
+- `remote_local_finish` 改走 pread 单拷贝 (原 mmap memcpy 对冷页付缺页税)。
+- `ds4_distributed.c`: efetch socket 显式 4MB SO_SNDBUF/RCVBUF (低延迟助手请求的 128MB 超
+  macOS kern.ipc.maxsockbuf 被静默拒绝, 落回自动调优默认)。
+- 脚本 CONNS 默认 4→6 (连接并行掩盖服务端 pread 串行; worker 盘 QD6 仍 5.5GB/s)。
+
+**算账.** 中段供给 ≈ 本地 2.5 + 远程 3-4.5GB/s, 尾部一轮本地收尾: coord wall 12.3 → ~6-8ms
+⇒ coord 半程 ~200-240ms ⇒ token ~430-470ms ⇒ **方向 ~2.1-2.3 t/s**。
+
+**Validation performed here.** `make` 零新告警; 流水化环回再跑 OK; `ds4_test --metal-kernels`
+OK; `bash -n` OK。隔离吞吐测量工具留 /tmp (efetch_pull/efetch_serve), 未入库。未跑大模型。
+用户脚本验证: ① coord ds4-io: rfetch_mib 期望 ≥15MiB/层 且 wall ≤9ms; ② A/B
+EXPERT_REMOTE_FETCH_CONNS=4/6/8 与 DS4_METAL_EXPERT_REMOTE_TAIL_RESERVE=4/8/12;
+③ worker 不回退; ④ 输出 temp=0 逐字一致; ⑤ RSS 红线。
+
+## 2026-06-10 — 第九波: 预测驱动远程暂存 (decode 放弃层内抢单) (1.81 t/s 平台期)
+
+**Context.** 第八波尾部禁抢后 wall 12.33→9.83 但 rfetch 反降至 5.6MiB/层 (部分层 0):
+decode 每层仅 18 个单元, 8 个本地线程在 t=0 秒抢 cutoff 之前的单元, 远程 (~2ms/往返) 拿不到活。
+结论: **"层内抢单"架构对小工作集 + 高延迟链路天然失配**, 1.81 t/s 平台期由此而来。
+(隔离测得链路/协议能跑 4.69GB/s —— 浪费在调度结构上。)
+
+**Patch (架构切换: racing → prediction-driven staging).**
+- `ds4_metal.m` 新增**暂存层** (`DS4_METAL_EXPERT_STAGE=1`, 需 FETCH_HOST):
+  - 双槽 (层奇偶交替) RAM 暂存区, 每槽 ≤16 专家 × stride(=gate×2+down ≈6.91MiB) ≈ 110MiB×2;
+  - 预测线程算完 L+1 top-N 后**arm 槽** (代替本地 advisories), 广播唤醒远程 fetch 线程;
+  - fetch 线程用 L 层 gather+GPU 的**整个 ~14ms 窗口**逐专家拉取 (mincore 命中走本地 pread,
+    链路断走本地, 每专家 3 段, ready 旗按专家粒度原子生效, 超越即弃);
+  - `copy_unit` 在 pread 前查暂存: 命中即 RAM memcpy (计入 hit_mib + stage 计数);
+  - **专家权重不可变 ⇒ 暂存内容永不过期**; 槽重 arm 时序在本层 gather 之后 (奇偶交替+d==0
+    限定), 结构上无读写竞争。
+- decode 的层内抢单关闭 (`total_units < 96` 且 staging 开启时不发布 racing ctx);
+  prefill 大批量 (≥96 单元) 仍走 racing (实测 prefill +60% 的来源, 保留)。
+- 结构调整: gather ctx 改具名 struct + 前置 typedef; g_rf 同步原语上移到暂存段。
+- 脚本: `EXPERT_STAGE=1` 默认开。
+
+**算账.** pf≈80% ⇒ 每层 ~4.8 专家 RAM memcpy + ~1.2 专家本地盘 (~8MiB): wall → ~4-5ms,
+coord 半程 20×(4.5+3.9)≈168ms ⇒ token ~400ms ⇒ **方向 ~2.3-2.5 t/s**。
+暂存内存 +~220MiB (coordinator 侧, 12G 预算内)。
+
+**Validation performed here.** `make` 零新告警; `ds4_test --metal-kernels` (基线 + STAGE 全开)
+通过; `bash -n` 通过。未跑大模型。
+用户脚本验证: ① 启动行 `predicted experts staged from peer SSD into RAM one layer ahead`;
+② coord ds4-io: **hit_mib 应首次显著非零 (期望 25-33MiB/层)**, cold_mib 降至 ~8-15, wall ≤6ms;
+③ A/B: EXPERT_STAGE=0 (回第八波) / EXPERT_PREFETCH_TOP=10 (staging 容量充足, 多预测提覆盖);
+④ worker 不回退; ⑤ 输出 temp=0 逐字一致; ⑥ coordinator RSS +220MiB 仍须 <12G。

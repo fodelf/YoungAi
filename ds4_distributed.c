@@ -9427,6 +9427,16 @@ typedef struct {
     uint32_t len;
 } ds4_efetch_req;
 
+/* dist_set_socket_low_latency asks for 128MB buffers, which exceeds macOS
+ * kern.ipc.maxsockbuf and silently leaves the (much smaller, autotuned)
+ * defaults.  Throughput over the Thunderbolt bridge wants a real, valid
+ * window: 4MiB succeeds and measured 4.5GB/s single-stream. */
+static void ds4_efetch_set_buffers(int fd) {
+    int b = 4 << 20;
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &b, sizeof(b));
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &b, sizeof(b));
+}
+
 typedef struct {
     int listen_fd;
     int model_fd;
@@ -9487,6 +9497,7 @@ static void *ds4_efetch_accept_thread(void *arg) {
             break;
         }
         dist_set_socket_low_latency(fd);
+        ds4_efetch_set_buffers(fd);
         void **pack = malloc(2 * sizeof(void *));
         if (!pack) { close(fd); continue; }
         pack[0] = (void *)(intptr_t)fd;
@@ -9560,6 +9571,7 @@ int ds4_dist_expert_fetch_client_init(const char *host, int port, int n_conns, u
             break;
         }
         dist_set_socket_low_latency(fd);
+        ds4_efetch_set_buffers(fd);
         uint64_t magic = DS4_EFETCH_MAGIC;
         uint64_t hello[2] = {0, 0};
         if (dist_write_full(fd, &magic, sizeof(magic)) != 0 ||
@@ -9584,13 +9596,34 @@ int ds4_dist_expert_fetch_client_init(const char *host, int port, int n_conns, u
 }
 
 int ds4_dist_expert_fetch(int slot, uint64_t off, void *dst, uint32_t len) {
-    if (slot < 0 || slot >= g_efetch_nconns || !dst || len == 0 || len > DS4_EFETCH_MAX_LEN) return 0;
+    if (!ds4_dist_expert_fetch_send(slot, off, len)) return 0;
+    return ds4_dist_expert_fetch_recv(slot, dst, len);
+}
+
+/* Split request/response phases so a fetcher thread can keep two requests in
+ * flight per connection: the server's pread of request N+1 then overlaps the
+ * network transfer of response N, and the request RTT disappears from the
+ * per-unit critical path.  Responses arrive strictly in request order (the
+ * server is sequential per connection), so recv calls must match send order. */
+int ds4_dist_expert_fetch_send(int slot, uint64_t off, uint32_t len) {
+    if (slot < 0 || slot >= g_efetch_nconns || len == 0 || len > DS4_EFETCH_MAX_LEN) return 0;
     const int fd = g_efetch_fds[slot];
     if (fd <= 0) return 0;
     ds4_efetch_req req = { off, len };
+    if (dist_write_full(fd, &req, sizeof(req)) != 0) {
+        close(fd);
+        g_efetch_fds[slot] = -1;
+        return 0;
+    }
+    return 1;
+}
+
+int ds4_dist_expert_fetch_recv(int slot, void *dst, uint32_t len) {
+    if (slot < 0 || slot >= g_efetch_nconns || !dst || len == 0 || len > DS4_EFETCH_MAX_LEN) return 0;
+    const int fd = g_efetch_fds[slot];
+    if (fd <= 0) return 0;
     uint32_t status = 1;
-    if (dist_write_full(fd, &req, sizeof(req)) != 0 ||
-        dist_read_full(fd, &status, sizeof(status)) != 1 ||
+    if (dist_read_full(fd, &status, sizeof(status)) != 1 ||
         status != 0 ||
         dist_read_full(fd, dst, len) != 1) {
         close(fd);

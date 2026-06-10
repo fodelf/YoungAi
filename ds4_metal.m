@@ -17164,7 +17164,7 @@ static int ds4_gpu_expert_prefetch_advise_paced(int fd, uint64_t off, uint64_t l
  * which case read-ahead would only waste the idle window.  Ground truth via
  * mincore on the model mapping (same UBC pages the preads hit). */
 static int ds4_gpu_expert_range_mostly_cached(const void *model_map, uint64_t off, uint64_t len) {
-    static char vec[8192];   /* single prefetch thread => static ok */
+    char vec[8192];          /* stack: called from prefetch + remote fetch threads */
     static size_t page;
     if (page == 0) {
         long p = sysconf(_SC_PAGESIZE);
@@ -17181,8 +17181,16 @@ static int ds4_gpu_expert_range_mostly_cached(const void *model_map, uint64_t of
     return resident * 10u >= npages * 9u;   /* >=90% resident: skip */
 }
 
-/* Predict + advise one layer; returns 0 when superseded/shutting down. */
-static int ds4_gpu_expert_prefetch_predict_one(uint32_t layer, const float *x, uint32_t my_seq) {
+/* Defined in the staging section below; predict_one dispatches to them. */
+static int ds4_gpu_expert_stage_enabled(void);
+static void ds4_gpu_expert_stage_arm(uint32_t layer, const int *top_idx, uint32_t n_top);
+
+/* Predict one layer, then either hand the predicted experts to the remote
+ * staging pipeline (stage_this: pulled from the peer's SSD into RAM during
+ * this layer's window) or issue local paced read-ahead advisories.  Returns 0
+ * when superseded/shutting down. */
+static int ds4_gpu_expert_prefetch_predict_one(uint32_t layer, const float *x, uint32_t my_seq,
+                                               int stage_this) {
     if (layer >= DS4_METAL_EXPERT_PROFILE_MAX_LAYERS) return 1;
     const ds4_metal_layer_router *r = &g_layer_router[layer];
     if (!r->valid || g_model_fd < 0) return 1;
@@ -17223,6 +17231,10 @@ static int ds4_gpu_expert_prefetch_predict_one(uint32_t layer, const float *x, u
         if (top_idx[i] < 0) break;
         g_pf_pred_mark[layer][(uint32_t)top_idx[i]] = gen;
     }
+    if (stage_this && ds4_gpu_expert_stage_enabled()) {
+        ds4_gpu_expert_stage_arm(layer, top_idx, n_top);
+        return 1;   /* fetch threads stage from the peer; no local advisories */
+    }
     const int fd = g_model_fd;   /* read-ahead must hit the page cache, never the F_NOCACHE fd */
     for (uint32_t i = 0; i < n_top; i++) {
         if (top_idx[i] < 0) break;
@@ -17249,12 +17261,13 @@ static int ds4_gpu_expert_prefetch_predict_one(uint32_t layer, const float *x, u
 }
 
 /* job->layer is the first predicted layer (L+1); predict L+1..L+depth from
- * the same hidden snapshot, closest deadline first. */
+ * the same hidden snapshot, closest deadline first.  Only d==0 is staged:
+ * its slot is never re-armed while its layer's gather can still read it. */
 static void ds4_gpu_expert_prefetch_run_job(const ds4_metal_pf_job *job, uint32_t my_seq) {
     const uint32_t depth = ds4_gpu_expert_prefetch_depth();
     for (uint32_t d = 0; d < depth; d++) {
         if (g_pf_seq != my_seq || g_pf_shutdown) return;
-        if (!ds4_gpu_expert_prefetch_predict_one(job->layer + d, job->x, my_seq)) return;
+        if (!ds4_gpu_expert_prefetch_predict_one(job->layer + d, job->x, my_seq, d == 0u)) return;
     }
 }
 
@@ -17319,6 +17332,174 @@ static void ds4_gpu_expert_prefetch_enqueue(uint32_t next_layer, const float *x,
     pthread_mutex_unlock(&g_pf_mu);
 }
 
+/* ---- project.md P2.1 x P2.2: prediction-driven remote expert staging ----
+ *
+ * Racing the per-layer gather cursor against the local pread threads cannot
+ * use the Thunderbolt link well: a decode layer exposes only 18 units for
+ * ~10ms and 8 local threads claim them instantly, while a remote unit costs a
+ * ~2ms round trip that then sits on the layer's critical path (measured:
+ * rfetch stuck at ~5MiB/layer).  Staging inverts it: the router prediction
+ * for layer L+1 (≈80% top-6 coverage) dispatches the predicted experts to the
+ * remote fetch threads which pull them into a RAM staging slot DURING layer
+ * L's entire gather+GPU window (~14ms x 4.5GB/s >> 54MiB, no tail
+ * constraint).  At layer L+1's gather, staged experts are RAM memcpys; only
+ * mispredicted experts touch the local SSD.  Two slots alternate by layer
+ * parity; only the first predicted layer (d==0) is staged, so a slot is never
+ * re-armed while the gather of its layer can still read it.  Stage bytes are
+ * advisory: a missing/partial entry just falls back to the normal local read. */
+
+#define DS4_METAL_STAGE_MAX_EXPERTS 16u
+
+/* Shared with the remote-fetch worker section below (defined here so the
+ * prediction thread can wake the fetch threads after arming a slot). */
+typedef struct ds4_metal_expert_gather_ctx ds4_metal_expert_gather_ctx;
+static ds4_metal_expert_gather_ctx * volatile g_rf_ctx;
+static pthread_mutex_t g_rf_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_rf_cv = PTHREAD_COND_INITIALIZER;
+static volatile int g_rf_link_down;
+
+typedef struct {
+    volatile uint32_t gen;                 /* bumped on (re)arm; 0 = never armed */
+    uint32_t layer;
+    uint32_t n;
+    volatile uint32_t next;                /* atomic claim index for fetch threads */
+    uint32_t ids[DS4_METAL_STAGE_MAX_EXPERTS];
+    volatile uint32_t ready_gen[DS4_METAL_STAGE_MAX_EXPERTS];
+    uint64_t gate_off, up_off, down_off;
+    uint64_t gate_eb, down_eb;
+    uint64_t stride;                       /* per-expert bytes in buf */
+    uint8_t *buf;
+    size_t buf_cap;
+} ds4_metal_stage_slot;
+
+static ds4_metal_stage_slot g_stage[2];
+static uint64_t g_stage_hit_bytes_total, g_stage_armed, g_stage_fetched;
+
+static int ds4_gpu_expert_stage_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = ds4_gpu_env_bool("DS4_METAL_EXPERT_STAGE") > 0 ? 1 : 0;
+        if (cached && !getenv("DS4_DIST_EXPERT_FETCH_HOST")) cached = 0;
+        if (cached) {
+            fprintf(stderr,
+                    "ds4: predicted experts staged from peer SSD into RAM one layer ahead\n");
+        }
+    }
+    return cached;
+}
+
+/* Arm a staging slot for a freshly predicted layer (prediction thread only). */
+static void ds4_gpu_expert_stage_arm(uint32_t layer,
+                                     const int *top_idx,
+                                     uint32_t n_top) {
+    if (layer >= DS4_METAL_EXPERT_PROFILE_MAX_LAYERS) return;
+    const ds4_metal_layer_router *r = &g_layer_router[layer];
+    if (!r->valid) return;
+    ds4_metal_stage_slot *s = &g_stage[layer & 1u];
+    const uint64_t stride = 2u * r->gate_expert_bytes + r->down_expert_bytes;
+    const size_t need = (size_t)stride * DS4_METAL_STAGE_MAX_EXPERTS;
+    if (!s->buf || s->buf_cap < need) {
+        free(s->buf);
+        s->buf = (uint8_t *)malloc(need);
+        s->buf_cap = s->buf ? need : 0;
+        if (!s->buf) return;
+    }
+    s->gen++;                       /* invalidates all ready flags */
+    __sync_synchronize();
+    s->layer = layer;
+    s->gate_off = r->gate_exps_off;
+    s->up_off = r->up_exps_off;
+    s->down_off = r->down_exps_off;
+    s->gate_eb = r->gate_expert_bytes;
+    s->down_eb = r->down_expert_bytes;
+    s->stride = stride;
+    uint32_t n = n_top;
+    if (n > DS4_METAL_STAGE_MAX_EXPERTS) n = DS4_METAL_STAGE_MAX_EXPERTS;
+    uint32_t m = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (top_idx[i] < 0) break;
+        s->ids[m++] = (uint32_t)top_idx[i];
+    }
+    s->n = m;
+    __sync_synchronize();
+    s->next = 0;
+    g_stage_armed++;
+    /* Wake the remote fetch threads parked on the shared condvar. */
+    pthread_mutex_lock(&g_rf_mu);
+    pthread_cond_broadcast(&g_rf_cv);
+    pthread_mutex_unlock(&g_rf_mu);
+}
+
+/* Fetch-thread side: claim and stage one expert of slot s.  Returns 0 when
+ * the slot has no more work. */
+static int ds4_gpu_expert_stage_fetch_one(ds4_metal_stage_slot *s, int conn_slot) {
+    const uint32_t gen = s->gen;
+    const uint32_t i = __sync_fetch_and_add(&s->next, 1u);
+    if (i >= s->n) return 0;
+    if (s->gen != gen) return 0;
+    const uint64_t e = (uint64_t)s->ids[i];
+    uint8_t *dst = s->buf + (size_t)i * s->stride;
+    const uint64_t seg_off[3] = {
+        s->gate_off + e * s->gate_eb,
+        s->up_off + e * s->gate_eb,
+        s->down_off + e * s->down_eb,
+    };
+    const uint64_t seg_len[3] = { s->gate_eb, s->gate_eb, s->down_eb };
+    uint64_t dst_off = 0;
+    int ok = 1;
+    for (uint32_t k = 0; k < 3u && ok; k++) {
+        if (s->gen != gen) return 1;   /* superseded mid-expert: drop silently */
+        /* Bytes already in the local page cache cost a RAM copy, not TB. */
+        if (g_model_map_ptr &&
+            ds4_gpu_expert_range_mostly_cached(g_model_map_ptr, seg_off[k], seg_len[k])) {
+            ok = ds4_gpu_pread_full(g_model_fd, dst + dst_off, seg_off[k], (size_t)seg_len[k]);
+        } else if (!g_rf_link_down &&
+                   ds4_dist_expert_fetch(conn_slot, seg_off[k], dst + dst_off,
+                                         (uint32_t)seg_len[k])) {
+            /* staged from the peer */
+        } else {
+            ok = ds4_gpu_pread_full(g_model_fd, dst + dst_off, seg_off[k], (size_t)seg_len[k]);
+        }
+        dst_off += seg_len[k];
+    }
+    if (ok && s->gen == gen) {
+        __sync_synchronize();
+        s->ready_gen[i] = gen;
+        g_stage_fetched++;
+    }
+    return 1;
+}
+
+static int ds4_gpu_expert_stage_has_work(void) {
+    for (int k = 0; k < 2; k++) {
+        if (g_stage[k].gen != 0 && g_stage[k].next < g_stage[k].n) return 1;
+    }
+    return 0;
+}
+
+/* Gather side: return the staged bytes for (layer, expert, part) or NULL.
+ * Safe by construction: the slot for layer L is only re-armed by the
+ * prediction made during layer L+1's gather, after L's gather finished. */
+static const uint8_t *ds4_gpu_expert_stage_find(uint32_t layer,
+                                                uint32_t id,
+                                                uint32_t part,
+                                                uint64_t *len_out) {
+    const ds4_metal_stage_slot *s = &g_stage[layer & 1u];
+    const uint32_t gen = s->gen;
+    if (gen == 0 || s->layer != layer) return NULL;
+    for (uint32_t i = 0; i < s->n; i++) {
+        if (s->ids[i] != id) continue;
+        if (s->ready_gen[i] != gen) return NULL;
+        const uint8_t *base = s->buf + (size_t)i * s->stride;
+        switch (part) {
+        case 0: *len_out = s->gate_eb; return base;
+        case 1: *len_out = s->gate_eb; return base + s->gate_eb;
+        default: *len_out = s->down_eb; return base + 2u * s->gate_eb;
+        }
+    }
+    return NULL;
+}
+
 /* Accuracy accounting: compare this layer's actual active set against the
  * latest prediction for it (stats only; harmless races). */
 static void ds4_gpu_expert_prefetch_note_actual(uint32_t layer, const uint32_t *ids, uint32_t n) {
@@ -17332,7 +17513,7 @@ static void ds4_gpu_expert_prefetch_note_actual(uint32_t layer, const uint32_t *
     }
 }
 
-typedef struct {
+struct ds4_metal_expert_gather_ctx {   /* typedef'd forward at the staging slots */
     const void *model_map;
     const uint8_t *map;
     uint8_t *gate_dst;
@@ -17353,7 +17534,7 @@ typedef struct {
     int pread_fd;
     int io_profile;
     int ok;
-} ds4_metal_expert_gather_ctx;
+};
 
 typedef struct {
     pthread_mutex_t mu;
@@ -17428,6 +17609,25 @@ static void ds4_gpu_expert_gather_copy_unit(ds4_metal_expert_gather_ctx *ctx, ui
         ctx->ok = 0;
         return;
     }
+    /* Staged one layer ahead from the peer's SSD?  RAM copy beats any disk. */
+    if (!hard_src) {
+        uint64_t slen = 0;
+        const uint8_t *staged = ds4_gpu_expert_stage_find(ctx->layer_index,
+                                                          ctx->active_ids[unit / 3u],
+                                                          unit % 3u,
+                                                          &slen);
+        if (staged && slen == len) {
+            const double t0 = ctx->io_profile ? ds4_gpu_now_ms() : 0.0;
+            memcpy(dst, staged, (size_t)len);
+            if (ctx->io_profile) {
+                __sync_fetch_and_add(&g_io_prof_copy_ns,
+                                     (uint64_t)((ds4_gpu_now_ms() - t0) * 1e6));
+                __sync_fetch_and_add(&g_io_prof_hit_bytes, len);
+            }
+            __sync_fetch_and_add(&g_stage_hit_bytes_total, len);
+            return;
+        }
+    }
     if (hard_src) {
         const double t0 = ctx->io_profile ? ds4_gpu_now_ms() : 0.0;
         memcpy(dst, hard_src, (size_t)len);
@@ -17478,46 +17678,152 @@ static void ds4_gpu_expert_gather_copy_unit(ds4_metal_expert_gather_ctx *ctx, ui
  * disk over Thunderbolt: aggregate supply = local SSD + TB link.  Failure of
  * the link permanently degrades to local-only (correctness never depends on
  * the peer).  Enabled by DS4_DIST_EXPERT_FETCH_HOST on the puller side and
- * DS4_DIST_EXPERT_FETCH_SERVE=1 on the serving side. */
-static ds4_metal_expert_gather_ctx * volatile g_rf_ctx;
-static pthread_mutex_t g_rf_mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t g_rf_cv = PTHREAD_COND_INITIALIZER;
-static volatile int g_rf_link_down;
+ * DS4_DIST_EXPERT_FETCH_SERVE=1 on the serving side.
+ * (g_rf_ctx/g_rf_mu/g_rf_cv/g_rf_link_down live next to the staging slots
+ * above so the prediction thread can wake the fetch threads.) */
+
+typedef struct {
+    uint64_t src_off;
+    uint8_t *dst;
+    uint64_t len;
+    double t0;
+} ds4_metal_rf_pending;
+
+/* Complete a claimed unit locally (used for page-cache hits, tail units and
+ * link-failure fallbacks so correctness never depends on the peer).  Prefers
+ * the single-copy pread path like the local gather workers; cached pages make
+ * pread a RAM copy anyway. */
+static void ds4_gpu_expert_remote_local_finish(ds4_metal_expert_gather_ctx *ctx,
+                                               uint64_t src_off,
+                                               uint8_t *dst,
+                                               uint64_t len) {
+    const double t0 = ctx->io_profile ? ds4_gpu_now_ms() : 0.0;
+    if (!(ctx->use_pread &&
+          ds4_gpu_pread_full(ctx->pread_fd, dst, src_off, (size_t)len))) {
+        memcpy(dst, ctx->map + src_off, (size_t)len);
+    }
+    if (ctx->io_profile) {
+        __sync_fetch_and_add(&g_io_prof_copy_ns,
+                             (uint64_t)((ds4_gpu_now_ms() - t0) * 1e6));
+        __sync_fetch_and_add(&g_io_prof_cold_bytes, len);
+    }
+}
+
+/* Last few gather units must stay local: a ~2ms remote round-trip claimed at
+ * the end of a layer stalls every finished local thread (measured: the tail
+ * ate the mid-layer remote gains).  Reserve about one unit per local gather
+ * thread; locals retire those in a single parallel round. */
+static uint32_t ds4_gpu_expert_remote_tail_reserve(void) {
+    static uint32_t cached;
+    static int initialized;
+    if (!initialized) {
+        uint64_t v = ds4_gpu_env_u64("DS4_METAL_EXPERT_REMOTE_TAIL_RESERVE",
+                                     ds4_gpu_expert_gather_threads());
+        if (v > 64u) v = 64u;
+        cached = (uint32_t)v;
+        initialized = 1;
+    }
+    return cached;
+}
 
 static void *ds4_gpu_expert_remote_fetch_worker(void *arg) {
     const int slot = (int)(intptr_t)arg;
     for (;;) {
         pthread_mutex_lock(&g_rf_mu);
-        while (!g_rf_ctx) pthread_cond_wait(&g_rf_cv, &g_rf_mu);
+        while (!g_rf_ctx && !ds4_gpu_expert_stage_has_work()) {
+            pthread_cond_wait(&g_rf_cv, &g_rf_mu);
+        }
         ds4_metal_expert_gather_ctx *ctx = (ds4_metal_expert_gather_ctx *)g_rf_ctx;
         pthread_mutex_unlock(&g_rf_mu);
 
-        for (;;) {
-            if (g_rf_link_down) break;
-            const uint32_t unit = __sync_fetch_and_add(&ctx->next_slot, 1u);
-            if (unit >= ctx->n_active * 3u) break;
-            uint64_t len = 0;
-            uint64_t src_off = 0;
-            uint8_t *dst = NULL;
-            const uint8_t *hard_src = NULL;
-            if (!ds4_gpu_expert_gather_unit_resolve(ctx, unit, &src_off, &dst, &len, &hard_src)) {
-                ctx->ok = 0;
-                __sync_fetch_and_add(&ctx->done, 1u);
-                continue;
+        if (!ctx) {
+            /* Staging work: pull the predicted next-layer experts from the
+             * peer into the RAM slots (runs during the current layer's local
+             * gather + GPU window; no layer-tail constraint). */
+            for (int k = 0; k < 2; k++) {
+                ds4_metal_stage_slot *s = &g_stage[k];
+                while (s->gen != 0 && ds4_gpu_expert_stage_fetch_one(s, slot)) {}
             }
-            const double t0 = ctx->io_profile ? ds4_gpu_now_ms() : 0.0;
-            if (hard_src) {
-                memcpy(dst, hard_src, (size_t)len);
-                if (ctx->io_profile) {
-                    __sync_fetch_and_add(&g_io_prof_copy_ns,
-                                         (uint64_t)((ds4_gpu_now_ms() - t0) * 1e6));
-                    __sync_fetch_and_add(&g_io_prof_hit_bytes, len);
+            continue;
+        }
+
+        /* Pipelined fetch: keep up to 2 requests in flight on this slot's
+         * connection so the server-side pread and the wire transfer overlap
+         * and the request RTT leaves the per-unit critical path.  Units whose
+         * bytes are already in the LOCAL page cache (prefetch read-ahead or
+         * natural reuse) are finished with a RAM copy instead of spending
+         * Thunderbolt bandwidth on them. */
+        ds4_metal_rf_pending pend[2];
+        uint32_t npend = 0;
+        int exhausted = 0;
+        const uint32_t total_units = ctx->n_active * 3u;
+        const uint32_t tail_reserve = ds4_gpu_expert_remote_tail_reserve();
+        const uint32_t remote_cutoff =
+            total_units > tail_reserve ? total_units - tail_reserve : 0u;
+        for (;;) {
+            while (!exhausted && npend < 2u) {
+                if (g_rf_link_down) { exhausted = 1; break; }
+                /* Tail guard: never claim into the reserved zone (peek, then
+                 * re-check after the claim in case of a race). */
+                if (ctx->next_slot >= remote_cutoff) { exhausted = 1; break; }
+                const uint32_t unit = __sync_fetch_and_add(&ctx->next_slot, 1u);
+                if (unit >= total_units) { exhausted = 1; break; }
+                uint64_t len = 0;
+                uint64_t src_off = 0;
+                uint8_t *dst = NULL;
+                const uint8_t *hard_src = NULL;
+                if (!ds4_gpu_expert_gather_unit_resolve(ctx, unit, &src_off, &dst, &len, &hard_src)) {
+                    ctx->ok = 0;
+                    __sync_fetch_and_add(&ctx->done, 1u);
+                    continue;
                 }
-            } else if (ds4_dist_expert_fetch(slot, src_off, dst, (uint32_t)len)) {
+                if (hard_src) {
+                    const double t0 = ctx->io_profile ? ds4_gpu_now_ms() : 0.0;
+                    memcpy(dst, hard_src, (size_t)len);
+                    if (ctx->io_profile) {
+                        __sync_fetch_and_add(&g_io_prof_copy_ns,
+                                             (uint64_t)((ds4_gpu_now_ms() - t0) * 1e6));
+                        __sync_fetch_and_add(&g_io_prof_hit_bytes, len);
+                    }
+                    __sync_fetch_and_add(&ctx->done, 1u);
+                    continue;
+                }
+                if (unit >= remote_cutoff) {
+                    /* Raced into the tail zone: keep it local. */
+                    ds4_gpu_expert_remote_local_finish(ctx, src_off, dst, len);
+                    __sync_fetch_and_add(&ctx->done, 1u);
+                    exhausted = 1;
+                    break;
+                }
+                if (ds4_gpu_expert_range_mostly_cached(ctx->map, src_off, len)) {
+                    ds4_gpu_expert_remote_local_finish(ctx, src_off, dst, len);
+                    __sync_fetch_and_add(&ctx->done, 1u);
+                    continue;
+                }
+                if (!ds4_dist_expert_fetch_send(slot, src_off, (uint32_t)len)) {
+                    if (!g_rf_link_down) {
+                        g_rf_link_down = 1;
+                        fprintf(stderr,
+                                "ds4: expert remote fetch link down; gather continues local-only\n");
+                    }
+                    ds4_gpu_expert_remote_local_finish(ctx, src_off, dst, len);
+                    __sync_fetch_and_add(&ctx->done, 1u);
+                    exhausted = 1;
+                    break;
+                }
+                pend[npend].src_off = src_off;
+                pend[npend].dst = dst;
+                pend[npend].len = len;
+                pend[npend].t0 = ctx->io_profile ? ds4_gpu_now_ms() : 0.0;
+                npend++;
+            }
+            if (npend == 0) break;
+            /* Drain the oldest in-flight response. */
+            if (ds4_dist_expert_fetch_recv(slot, pend[0].dst, (uint32_t)pend[0].len)) {
                 if (ctx->io_profile) {
                     __sync_fetch_and_add(&g_io_prof_remote_ns,
-                                         (uint64_t)((ds4_gpu_now_ms() - t0) * 1e6));
-                    __sync_fetch_and_add(&g_io_prof_remote_bytes, len);
+                                         (uint64_t)((ds4_gpu_now_ms() - pend[0].t0) * 1e6));
+                    __sync_fetch_and_add(&g_io_prof_remote_bytes, pend[0].len);
                 }
             } else {
                 if (!g_rf_link_down) {
@@ -17525,16 +17831,11 @@ static void *ds4_gpu_expert_remote_fetch_worker(void *arg) {
                     fprintf(stderr,
                             "ds4: expert remote fetch link down; gather continues local-only\n");
                 }
-                /* Finish the claimed unit locally so correctness never
-                 * depends on the peer. */
-                memcpy(dst, ctx->map + src_off, (size_t)len);
-                if (ctx->io_profile) {
-                    __sync_fetch_and_add(&g_io_prof_copy_ns,
-                                         (uint64_t)((ds4_gpu_now_ms() - t0) * 1e6));
-                    __sync_fetch_and_add(&g_io_prof_cold_bytes, len);
-                }
+                ds4_gpu_expert_remote_local_finish(ctx, pend[0].src_off, pend[0].dst, pend[0].len);
             }
             __sync_fetch_and_add(&ctx->done, 1u);
+            pend[0] = pend[1];
+            npend--;
         }
 
         /* Wait for the entry to retire this ctx so we don't spin on an
@@ -17691,11 +17992,15 @@ static int ds4_gpu_load_layer_experts_to_scratch(
     int use_pread = ds4_gpu_expert_pread_enabled();
     const int pread_fd = use_pread ? ds4_gpu_expert_pread_fd() : -1;
     if (use_pread && pread_fd < 0) use_pread = 0;
-    const int remote_on =
-        ds4_gpu_expert_remote_fetch_slots() > 0 && !g_rf_link_down;
-
     const uint32_t gather_threads = ds4_gpu_expert_gather_threads();
     const uint32_t total_units = n_active * 3u;
+    /* Cursor racing only pays on big prefill batches (hundreds of units).
+     * Decode layers (18 units, ~10ms) are served by the prediction-driven
+     * staging instead: 8 local threads claim the small cursor instantly and
+     * a ~2ms remote round trip would only sit on the layer tail. */
+    const int remote_on =
+        ds4_gpu_expert_remote_fetch_slots() > 0 && !g_rf_link_down &&
+        (total_units >= 96u || !ds4_gpu_expert_stage_enabled());
     g_gather_active = 1;   /* prefetch read-ahead yields while we own the SSD */
 
     ds4_metal_expert_gather_ctx ctx = {

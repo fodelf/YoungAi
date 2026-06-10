@@ -163,5 +163,9 @@ int ds4_dist_run(ds4_engine *engine, const ds4_dist_options *opt, const ds4_dist
 int ds4_dist_expert_fetch_maybe_serve(int model_fd, uint64_t model_size);
 int ds4_dist_expert_fetch_client_init(const char *host, int port, int n_conns, uint64_t model_size);
 int ds4_dist_expert_fetch(int slot, uint64_t off, void *dst, uint32_t len);
+/* Pipelined variants: per slot, recv order must match send order; up to a few
+ * requests may be in flight (bounded by the socket buffers). */
+int ds4_dist_expert_fetch_send(int slot, uint64_t off, uint32_t len);
+int ds4_dist_expert_fetch_recv(int slot, void *dst, uint32_t len);
 
 #endif
