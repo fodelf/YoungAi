@@ -17110,7 +17110,9 @@ static uint32_t ds4_gpu_expert_prefetch_depth(void) {
 
 typedef struct {
     uint32_t layer;                      /* layer being predicted (= L+1) */
-    float x[DS4_METAL_PF_MAX_EMBD];      /* router-input snapshot from layer L */
+    int kind;                            /* 0 = score prediction from x; 1 = token-hash note */
+    int token;
+    float x[DS4_METAL_PF_MAX_EMBD];      /* router-input snapshot from layer L (kind 0) */
 } ds4_metal_pf_job;
 
 /* Scheduling (v2, after the 1.56->1.49 regression): decode keeps the SSD
@@ -17208,6 +17210,7 @@ static int ds4_gpu_expert_range_mostly_cached(const void *model_map, uint64_t of
 static int ds4_gpu_expert_stage_enabled(void);
 static void ds4_gpu_expert_stage_arm(uint32_t layer, const int *top_idx, uint32_t n_top, int token);
 static void ds4_gpu_expert_stage_arm_if_new(uint32_t layer, const int *top_idx, uint32_t n_top, int token);
+static void ds4_gpu_expert_hash_note_run(int token);
 
 /* Predict one layer, then either hand the predicted experts to the remote
  * staging pipeline (stage_this: pulled from the peer's SSD into RAM during
@@ -17337,8 +17340,14 @@ static int ds4_gpu_expert_prefetch_predict_one(uint32_t layer, const float *x, u
 
 /* job->layer is the first predicted layer (L+1); predict L+1..L+depth from
  * the same hidden snapshot, closest deadline first.  Only d==0 is staged:
- * its slot is never re-armed while its layer's gather can still read it. */
+ * its slot is never re-armed while its layer's gather can still read it.
+ * kind==1 jobs carry only a token id and arm the exact hash-routed layers
+ * (moved off the graph thread: arming spins on the slot's busy gate). */
 static void ds4_gpu_expert_prefetch_run_job(const ds4_metal_pf_job *job, uint32_t my_seq) {
+    if (job->kind == 1) {
+        ds4_gpu_expert_hash_note_run(job->token);
+        return;
+    }
     const uint32_t depth = ds4_gpu_expert_prefetch_depth();
     for (uint32_t d = 0; d < depth; d++) {
         if (g_pf_seq != my_seq || g_pf_shutdown) return;
@@ -17400,7 +17409,23 @@ static void ds4_gpu_expert_prefetch_enqueue(uint32_t next_layer, const float *x,
     pthread_mutex_lock(&g_pf_mu);
     if (g_pf_seq != g_pf_picked_seq) g_pf_superseded++;   /* old job replaced unstarted/aborted */
     g_pf_slot.layer = next_layer;
+    g_pf_slot.kind = 0;
+    g_pf_slot.token = g_pf_token;
     memcpy(g_pf_slot.x, x, (size_t)n_embd * sizeof(float));
+    g_pf_seq++;
+    g_pf_enqueued++;
+    pthread_cond_signal(&g_pf_cv);
+    pthread_mutex_unlock(&g_pf_mu);
+}
+
+/* Non-blocking token note from the graph thread: the exact hash-layer arming
+ * spins on slot busy gates, so it runs on the prediction thread instead. */
+static void ds4_gpu_expert_prefetch_enqueue_hash(int token) {
+    pthread_mutex_lock(&g_pf_mu);
+    if (g_pf_seq != g_pf_picked_seq) g_pf_superseded++;
+    g_pf_slot.layer = 0;
+    g_pf_slot.kind = 1;
+    g_pf_slot.token = token;
     g_pf_seq++;
     g_pf_enqueued++;
     pthread_cond_signal(&g_pf_cv);
@@ -17550,23 +17575,10 @@ static void ds4_gpu_expert_stage_arm_if_new(uint32_t layer,
     ds4_gpu_expert_stage_arm(layer, top_idx, n_top, token);
 }
 
-/* Graph-thread hook from ds4_gpu_router_select_tensor: the first hash-mode
- * router select of each decode forward reveals the token id, which exactly
- * determines the hash-routed layers' experts.  Arm exact staging for the
+/* Prediction-thread side of the token note: arm exact staging for the
  * earliest hash layer of each slot parity; the prediction chain (also exact
  * for hash layers) covers the rest. */
-static void ds4_gpu_expert_router_note(int token, int hash_mode) {
-    if (!hash_mode) {
-        g_pf_saw_nonhash = 1;
-        return;
-    }
-    if (!g_pf_saw_nonhash) {
-        g_pf_token = token;
-        return;   /* later hash layer of the same forward */
-    }
-    g_pf_saw_nonhash = 0;
-    g_pf_token = token;
-    if (!ds4_gpu_expert_stage_enabled()) return;
+static void ds4_gpu_expert_hash_note_run(int token) {
     int armed_parity[2] = { 0, 0 };
     for (uint32_t l = 0; l < 8u && l < DS4_METAL_EXPERT_PROFILE_MAX_LAYERS; l++) {
         const ds4_metal_layer_router *r = &g_layer_router[l];
@@ -17582,9 +17594,33 @@ static void ds4_gpu_expert_router_note(int token, int hash_mode) {
         for (uint32_t i = 0; i < r->hash_k && i < 16u; i++) {
             if (row[i] >= 0 && (uint32_t)row[i] < r->n_expert) hidx[m++] = row[i];
         }
-        if (m) ds4_gpu_expert_stage_arm_if_new(l, hidx, m, token);
+        if (m) {
+            const uint32_t hgen = ++g_pf_pred_gen[l];
+            for (uint32_t i = 0; i < m; i++) g_pf_pred_mark[l][(uint32_t)hidx[i]] = hgen;
+            ds4_gpu_expert_stage_arm_if_new(l, hidx, m, token);
+        }
         if (armed_parity[0] && armed_parity[1]) break;
     }
+}
+
+/* Graph-thread hook from ds4_gpu_router_select_tensor: the first hash-mode
+ * router select of each decode forward reveals the token id, which exactly
+ * determines the hash-routed layers' experts.  MUST NOT BLOCK: arming spins
+ * on slot busy gates, so it is queued to the prediction thread (latest-wins
+ * is correct here -- at a forward boundary any pending older job is stale). */
+static void ds4_gpu_expert_router_note(int token, int hash_mode) {
+    if (!hash_mode) {
+        g_pf_saw_nonhash = 1;
+        return;
+    }
+    if (!g_pf_saw_nonhash) {
+        g_pf_token = token;
+        return;   /* later hash layer of the same forward */
+    }
+    g_pf_saw_nonhash = 0;
+    g_pf_token = token;
+    if (!ds4_gpu_expert_stage_enabled()) return;
+    ds4_gpu_expert_prefetch_enqueue_hash(token);
 }
 
 /* Fetch-thread side: claim and stage one expert of slot s.  Returns 0 when
@@ -17960,15 +17996,56 @@ static uint32_t ds4_gpu_expert_remote_tail_reserve(void) {
     return cached;
 }
 
+/* The Thunderbolt link idles for the whole worker pipeline half (~250ms per
+ * decoded token); TCP slow-start-after-idle then collapses the congestion
+ * window, so the first staged fetches of the next token (the hash layers 0/1,
+ * tightest deadlines!) crawl through the ramp-up.  While parked, each fetch
+ * thread keeps its connection warm with a small periodic read.  0 disables. */
+static uint32_t ds4_gpu_expert_link_keepalive_ms(void) {
+    static uint32_t cached = UINT32_MAX;
+    if (cached == UINT32_MAX) {
+        /* Default off: measured a net regression (2.03 -> 1.79 t/s) with 40ms
+         * keepalives; kept as an A/B knob only. */
+        uint64_t v = ds4_gpu_env_u64("DS4_METAL_EXPERT_LINK_KEEPALIVE_MS", 0u);
+        if (v > 1000u) v = 1000u;
+        cached = (uint32_t)v;
+    }
+    return cached;
+}
+
 static void *ds4_gpu_expert_remote_fetch_worker(void *arg) {
     const int slot = (int)(intptr_t)arg;
+    uint8_t *ka_buf = NULL;
+    const uint32_t ka_bytes = 262144u;
     for (;;) {
+        int do_keepalive = 0;
         pthread_mutex_lock(&g_rf_mu);
         while (!g_rf_ctx && !ds4_gpu_expert_stage_has_work()) {
-            pthread_cond_wait(&g_rf_cv, &g_rf_mu);
+            const uint32_t ka_ms = ds4_gpu_expert_link_keepalive_ms();
+            if (ka_ms == 0 || g_rf_link_down) {
+                pthread_cond_wait(&g_rf_cv, &g_rf_mu);
+                continue;
+            }
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_nsec += (long)ka_ms * 1000000L;
+            while (ts.tv_nsec >= 1000000000L) { ts.tv_nsec -= 1000000000L; ts.tv_sec++; }
+            if (pthread_cond_timedwait(&g_rf_cv, &g_rf_mu, &ts) == ETIMEDOUT &&
+                !g_rf_ctx && !ds4_gpu_expert_stage_has_work()) {
+                do_keepalive = 1;
+                break;
+            }
         }
         ds4_metal_expert_gather_ctx *ctx = (ds4_metal_expert_gather_ctx *)g_rf_ctx;
         pthread_mutex_unlock(&g_rf_mu);
+
+        if (do_keepalive) {
+            if (!ka_buf) ka_buf = (uint8_t *)malloc(ka_bytes);
+            if (ka_buf && !g_rf_link_down) {
+                (void)ds4_dist_expert_fetch(slot, 0, ka_buf, ka_bytes);
+            }
+            continue;
+        }
 
         if (!ctx) {
             /* Staging work: pull the predicted next-layer experts from the
@@ -18237,6 +18314,12 @@ static int ds4_gpu_load_layer_experts_to_scratch(
      * anyway, and the tail guard keeps remote off the layer's critical end.
      * Staged decode layers skip racing: 8 local threads claim the 18-unit
      * cursor instantly and a ~2ms remote round trip only adds tail. */
+    /* NOTE: do NOT gate this on staging readiness.  Letting a low-readiness
+     * layer fall back to cursor racing steals the fetch connections from the
+     * NEXT layer's staging, which then enters ITS gather low on readiness --
+     * the fallback cascades down all layers and converts the whole lookahead
+     * pipeline back into in-layer racing (measured: 2.03 -> 1.80 t/s).
+     * Armed == staged; the in-flight waits harvest what arrives late. */
     const int layer_is_staged =
         ds4_gpu_expert_stage_enabled() &&
         layer_index < DS4_METAL_EXPERT_PROFILE_MAX_LAYERS &&

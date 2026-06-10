@@ -1934,3 +1934,182 @@ coord 半程 ~200ms ⇒ **方向 ~2.1 t/s**; pf= 字段应明显上升 (哈希�
 未跑大模型。用户脚本验证: ① 启动行应为 **registered 20** (coord) 且无 not-registered 行;
 ② 层 0/1/2 的 ds4-io 行: hit_mib 应从 0 跳到 ~40 (精确暂存), wall 大降; ③ pf= 上升;
 ④ 输出 temp=0 逐字一致; ⑤ RSS 红线。
+
+## 2026-06-10 — 第十五波: 哈希 arm 移出图线程 (2.03 t/s 之后)
+
+**Context.** 第十四波实测 **2.03 t/s** (registered 20 ✓)。逐层账表非常诊断性:
+- **L2/L16 完美**: cold=0, hit=40.5, wall 1.3-2.3ms —— 精确/高命中暂存到位时的形态;
+- **L0 反而最差**: hit=0, wall=19.56ms —— 破案: token 钩子在**图线程**上直接调 stage_arm,
+  而 arm 内有 busy 自旋 + arm 互斥锁 → **图线程被堵在 router(0) encode 上**, 既没暂存成
+  还拖慢整层 (steal 了本该属于 drain/gather 的时间)。
+- 平均: cold 17.3 / hit 22.6 / wall 8.95 / pf 81.8%。
+
+**Patch.**
+- pf job 加 `kind/token` 字段: kind=1 为"token 哈希任务" (不带 x);
+  `ds4_gpu_expert_prefetch_enqueue_hash(token)` 非阻塞入队 (latest-wins 在 forward 边界
+  恰好正确: 旧任务本来就过期)。
+- 图线程钩子 `router_note` 只做: saw_nonhash 边界判定 + 记录 g_pf_token + 入队;
+  **绝不碰 arm 的锁/自旋**。
+- arm 循环移到预测线程 (`hash_note_run`), 顺带补上哈希层的 pf 标记 (命中统计覆盖钩子路径)。
+- score 预测 job 顺带携带 token (arm_if_new 去重一致性)。
+
+**算账.** L0 wall 19.6 → ~8-11 (钩子阻塞消除 + 异步 arm 部分命中 + racing 兜底);
+L1 命中提升 (arm 更早)。每 token 省 ~10-15ms ⇒ **方向 ~2.1 t/s**。
+L0 的取数窗口本质受限 (token 在采样后才知道, 距 L0 gather 仅 ~5-8ms) —— 已是该层的结构地板。
+
+**Validation performed here.** `make` 零新告警; `ds4_test --metal-kernels` 双跑 OK; `bash -n` OK。
+未跑大模型。用户脚本验证: ① L0 行 wall 应从 ~19 显著回落, hit_mib>0; ② L1/L2 保持 cold≈0;
+③ 平均 wall ≤7.5; ④ 输出 temp=0 逐字一致; ⑤ RSS 红线。
+
+## 2026-06-10 — 第十六波: 雷电链路 TCP 保温 (L0/L1 慢启动修复) (2.03 t/s 平台)
+
+**Context.** 第十五波 (哈希 arm 异步化) 实测 2.03 持平。逐层账表铁证:
+- L0 仍 hit=0、wall 15-23ms, **且 rfetch=0** —— hash arm 确实落地了 (staged=true 把 racing
+  兜底关掉), 但 stage fetch 没在窗口内完成 ⇒ 两头落空; 偶发一次 L0 hit=13.5 证明机制能通;
+- L1 部分命中 (22.9), L2+ 接近完美 (cold≈0, wall 1.3-4ms);
+- 梯度模式 = **越靠近 250ms 空闲期的取数越慢** ⇒ 诊断为 **TCP 空闲后慢启动**:
+  每 token 的 worker 半程 (~250ms) 链路空闲, cwnd 坍缩; L0/L1 的 stage fetch 撞上冷窗口
+  (初窗 ~6KB, 爬回线速要 ~8-9 个 RTT ≈ 4-9ms), L2 之后链路已热。macOS 无
+  per-socket 关闭 slow-start-after-idle 的开关。
+
+**Patch.**
+- fetch 线程的等待从 `cond_wait` 改 `cond_timedwait(DS4_METAL_EXPERT_LINK_KEEPALIVE_MS,
+  默认 40ms)`: 超时且无工作时, 每连接发一个 256KB 小读 (offset 0, 服务端页缓存热) **保温
+  cwnd**; 6 连接 × 256KB/40ms ≈ 38MB/s 后台流量, 对链路 (4.5GB/s) 无感, 只在线程空闲时发生
+  (prefill racing 期间线程忙, 自然不发)。0 可关闭。
+- 失败安全: 链路断时不发; keepalive 失败不置 link_down (留给真实取数路径判定)。
+
+**算账.** L0/L1 的 fetch 回到热链路速度 (~2.5ms/专家): L0 在 drain 窗 (~3.6ms) + 在途等待
+(2.5ms/专家) 内可命中 ~3-5/6, L1 全中: 两层合计省 ~20-25ms/token ⇒ **方向 ~2.1-2.15 t/s**。
+
+**Validation performed here.** `make` 零新告警; `ds4_test --metal-kernels` (基线+全开含
+KEEPALIVE) 双跑 OK; `bash -n` OK。未跑大模型。
+用户脚本验证: ① L0 行: hit_mib 应 >0 (期望 ≥20), wall ≤12; L1 应 cold≈0;
+② 平均 wall ≤6.5; ③ A/B: DS4_METAL_EXPERT_LINK_KEEPALIVE_MS=0 (关) / 40 / 20;
+④ 可同时试 DS4_METAL_EXPERT_STAGE_WAIT_US=4000 (给爬升留余地);
+⑤ 输出 temp=0 逐字一致; ⑥ RSS 红线。
+
+## 2026-06-10 — 第十七波: 保温默认关 (实测负) + 就绪度门控 racing 兜底 (1.79 回退修复)
+
+**Context.** 第十六波 keepalive=40ms 实测 **2.03→1.79 (-12%)**: coord 半程反而改善
+(232ms, L0 hit 0→6.8), worker 254ms —— 两半合计 486ms 但 token 实测 558ms,
+~70ms 系统性拖累在 MoE 账表之外 (具体路径未定位; A/B 结论已足够: **净负, 默认关**)。
+L0 本体问题依旧: 窗口 ~3.6ms vs 需求 41.5MiB, staging 完不成且 staged=true 把 racing
+兜底也关了 —— 两头落空是 L0 的结构性死角。
+
+**Patch.**
+- `DS4_METAL_EXPERT_LINK_KEEPALIVE_MS` 引擎默认 40→**0** (保留 A/B 旋钮)。
+- **就绪度门控 racing**: gather 入口对 staged 层数一遍 ready 旗, **就绪 <50% 时视为未暂存**
+  → racing (本地 8 线程 + 远程 6 连接, 含尾部禁抢) 接管缺口; copy_unit 仍优先吃陆续就绪的
+  暂存字节 (在途等待不变)。L0/L1 的早期紧窗口由此有了真兜底; 偶发双取 (racing 与 staging
+  撞同一专家) 带宽代价有限且只在低就绪层发生。
+
+**预期.** 回到 ≥2.03 基线, L0 wall 22.6 → ~10-12 (racing 聚合供给) ⇒ **方向 ~2.05-2.1**。
+
+**Validation performed here.** `make` 零新告警; `ds4_test --metal-kernels` 双跑 OK; `bash -n` OK。
+未跑大模型。用户脚本验证: ① 总速 ≥2.0 回归; ② L0 行应出现 rfetch>0 (racing 兜底生效),
+wall ≤12; ③ A/B: DS4_METAL_EXPERT_LINK_KEEPALIVE_MS=40 (复核拖累), STAGE_WAIT_US=4000;
+④ 输出 temp=0 逐字一致; ⑤ RSS 红线。
+
+## 2026-06-10 — 第十八波: 回滚就绪度门控 (级联诊断) — 恢复 2.03 基线代码
+
+**Context.** 第十七波实测 1.80 (未恢复): 就绪度门控的**级联效应** —— L0 就绪低 → racing 抢走
+全部 6 条 fetch 连接 → L1 stage fetch 饿死 → L1 就绪低 → 又 racing → 传染至 L19, 整个
+lookahead 流水线退化回层内抢单 (早已实测更慢)。第十五波 2.03 的正确形态 = decode 完全不
+racing, 连接专职 staging lookahead。两轮教训合并:
+- keepalive (第十六波): -12%, 已默认 0;
+- 就绪度门控 (第十七波): -11%, 本波回滚。
+
+**Patch.** `layer_is_staged` 回退为"armed 即 staged" (= 第十五波逻辑), 加注释钉死级联机理,
+防止重蹈。代码现等价于 2.03 基线 (keepalive 关 + 哈希异步 arm + 注册 20 层)。
+
+**结构性结论 (写给后续).** L0 是结构死角: token 在采样后才知道, 距其 gather 仅 ~4ms, 任何
+供给组合 (≤7GB/s) 都装不满 41.5MiB。可接受 (一层 ~15ms 占 token ~3%)。单 token 路线地板
+~2.1: 剩余 = 两机 drain (GPU 真实计算 ~175ms) + worker 本地读 (~120ms) + L0。
+**下一波正式转 PC.1 复制式投机** (多 token 有效吞吐, project.md §3.5)。
+
+**Validation performed here.** `make` 零新告警; `ds4_test --metal-kernels` 双跑 OK; `bash -n` OK。
+用户脚本验证: ① 总速应回 ~2.03; ② L0 行回到 hit=0/rfetch=0 (接受); ③ 输出 temp=0 逐字一致。
+
+## 2026-06-10 — 第十九波: PC.1 零成本复制式投机上线 (prompt-lookup drafting, 多 token 路线开张)
+
+**Context.** 第十八波回滚后实测 2.02 (prefill 4.79), 确认回归 2.03 基线 (±0.01 噪声)。
+单 token 地板 ~2.1 已到顶: 剩余 = 两机 drain GPU 真实计算 ~175ms/token + worker 本地读 + L0
+结构窗口, 全部不可再藏。M2 (≥3) 唯一通路 = 一次前向产出多个 token —— PC.1 复制式投机
+(project.md §3.5, CopySpec/SuffixDecoding/prompt-lookup 族)。
+
+**机制.** drafter 不是模型, 是 n-gram 匹配器: 在 transcript (checkpoint+first_token+next) 上
+找尾部 NGRAM-gram (默认 3) 的最近一次早先出现, 抄其后续 ≤K-1 个 token 当草稿; 连同目标自身
+argmax (drafts[0], 验证前置检查恒过) 组成 ≤K (默认 8) 的批, 经**既有 mtp.md Phase 1 协议原样
+复用**: Round 2 VERIFY 批一次过 43 层 → 逐行 argmax 接受前缀 → coordinator 本地
+layer_slice_rollback + worker 经下一帧 accept_len 延迟回滚。匹配失败 = 不发 Round 2, 零开销
+退化为普通 decode (正确性纯由目标 argmax 把关, greedy-only, 脚本本就 --temp 0)。
+为什么这次投机能赢 (vs MTP 历史负收益): ① 零草稿内存/算力 (MTP A/B 曾把 worker RSS 顶爆被
+watchdog 杀); ② 验证批 K token 的每层专家并集天然去重 (compact_selected_experts 已有),
+U(K)≪6K ⇒ 专家 IO 按 round 摊薄, 正是 W2 墙下投机的正确打开方式 (SP-MoE/SpecExec)。
+
+**Patch.**
+- `ds4_distributed.c`: `dist_copy_spec_enabled/_draft_k/_ngram` env 旋钮 +
+  `dist_copy_spec_match` (倒序扫描=最近出现优先, 末 token 廉价过滤 + memcmp);
+  `ds4_dist_session_eval_speculative` 增 copy 模式: 绕过 mtp_draft/自适应退避门,
+  Round 1 发普通帧 (无 DRAFT 标志, 仍带 accept_len 延迟回滚), 本地合成
+  drafts=[argmax, 抄来的延续...] (EOS 截断; transcript push/pop 保证 rebuild fallback
+  看到的仍是已提交前缀), draft_n==0 直接返回 (零开销 miss); Round 2/接受/回滚原码复用。
+  copy 模式下跳过 MTP 自适应禁用 (miss 免费, 退避只会刷屏)。
+- `ds4.c` (graph 创建): `DS4_DIST_COPY_SPEC=1` 且未开 MTP 时单独分配 `spec_logits`
+  (~8MiB) —— VERIFY 批在 worker 端只需要这一个 MTP 张量 (verify_batch_argmax 审计过,
+  其余全是无条件 batch 缓冲; 11342/15087 两处 spec_logits 门控路径仍被 mtp_ready 锁死,
+  不会被误启)。
+- `ds4_cli.c` ×2 / `ds4_server.c` ×1: 投机入口门改为
+  `(mtp_draft_tokens>1 || copy_spec_env)`, 其余条件 (temp≤0, SPEC_DISABLE) 不变。
+- `tools/mtp_pipe_q2_speed.sh`: `COPY_SPEC=1` (默认开, A/B 回退 =0) /
+  `COPY_SPEC_DRAFT=8` / `COPY_SPEC_NGRAM=3` → `$COPY_SPEC_ENV` 进 BASE_RUN_ENV (两侧进程
+  都拿到: coordinator 走匹配器, worker 分配 spec_logits 服务 VERIFY)。
+
+**协议审计 (零新帧).** worker 端 accept_len 回滚只看 session->spec_pending (与 DRAFT/VERIFY
+标志无关) ✅; is_verify 只看标志位, 与 mtp 权重无关 ✅; verify 后 spec_base_len=pos0 记录
+无条件 ✅; kc≤16≤prefill_cap ✅; spec_logits 16 行容量 ≥ kc ✅。
+
+**预期.** 现行短 prompt (回文函数+解释, 48 token) 重复结构有限 ⇒ 预计接受率温和,
+有效 decode ~2.1-2.5; 真正收益在编辑/工具回合 (PC.5 code-edit 档待建, 文献 2-3×)。
+接受率看 coordinator 日志 `dist-mtp` 行 (tok/call; LOG_INTERVAL 默认 16)。
+verify 批本身也是对 staging/racing 机器在小批量 (kc≤8, ~144 单元) 下的实战检验。
+
+**Validation performed here.** `make` 全目标零告警; matcher 9 例独立单测全过
+(/tmp/copyspec_test.c: 最近出现优先/周期重叠/cap 截断/边界 s=0/g=1); `ds4_test
+--metal-kernels` OK; `bash -n` OK。未跑大模型。用户脚本验证:
+① 总速 (期待 ≥2.02, 有重复结构时更高); ② coord 日志 grep dist-mtp 看 tok/call 与
+verify 次数; ③ 输出 temp=0 与上轮逐字一致 (投机不得改变输出流); ④ A/B: COPY_SPEC=0
+应回 2.02; ⑤ 两机 RSS 红线 (worker 仅 +8MiB spec_logits)。
+
+## 2026-06-10 — 第二十波: PC.1 v2 — 最长后缀锚 + 自适应抄长 (修第十九波的经济学)
+
+**Context.** 第十九波实测 1.82 (prefill 4.71), -10%。日志定责 (coord log):
+`dist-mtp summary: calls=47 verify=1 first_hit=2.13% draft_accept=12.50% tok/call=1.02`
+—— 47 次调用唯一一次 verify, 8-token 批的 7 个抄注**全部被拒** (12.5%=只剩白送的
+drafts[0])。该批 coordinator 侧 20 层 ds4-io 实测 n_active 19-45/层、wall 20-60ms/层,
+合计 ~740ms, 两机往返 ~1.5s+, 只换 1 个 token —— 这一单赔掉的 ~2.5s 正好 = 整段回退。
+其余 46 次 miss 确实近零开销 (~525 vs 495ms/token, 含批后流水线重热, 噪声内)。
+**结论: 机制端到端通了 (verify/回滚/输出全对), 输的是精度×赌注: 3-gram 锚太弱,
+固定抄 7 个太贪。** 账: c(kc=8)≈3.4×单步 ⇒ 全拒一单净亏 ~1.2s; kc=4 净亏 ~0.4s。
+
+**Patch (SuffixDecoding 式).**
+- 锚改**最长公共后缀**: 倒扫 transcript, 对每个末 token 命中位回向延伸公共后缀
+  (上限 32), 取最长锚 (平手取最近); `DS4_DIST_COPY_SPEC_NGRAM` 语义改为**最小锚长**,
+  默认 3→4 —— 锚越长, 抄来的延续越可信 (precision over recall)。
+- **自适应抄长** (`d->copy_spec_len`, HF assisted-decoding 同款): 初始
+  `DS4_DIST_COPY_SPEC_INIT=3`; 验证尾全接受 → 翻倍 (≤DRAFT-1=7); (近)全拒 (尾接受 ≤1)
+  → 回 INIT; 部分接受持平。单次坏批的最大赌注从 kc=8 (~1.5s) 降到 kc=4 (~0.9s)。
+- **最小抄长门** `DS4_DIST_COPY_SPEC_MIN=2`: 抄长 <2 不发批 (argmax 白送票永远赔不起
+  一次往返)。
+- 脚本: COPY_SPEC_NGRAM 默认 4, 新增 COPY_SPEC_INIT/MIN 旋钮进 COPY_SPEC_ENV。
+
+**预期 (诚实).** 本 smoke prompt 几乎无可抄结构 (上轮 fire 率 2%): 最小锚 4 后那次弱
+匹配大概率不再触发 ⇒ 预期**回 ~2.02 (非回退)**, verify 仅在真重复段开火。PC.1 的正收益
+要在 code-edit 档 prompt 上才可见 (PC.5, 下一波可建)。本波验收 = 不赔钱 + 自适应机制就位。
+
+**Validation performed here.** `make` 全目标零告警; v2 matcher 8 例独立单测全过
+(/tmp/copyspec2_test.c: 最长锚优先/平手取最近/最小锚门/边界 s<a/周期重叠/cap);
+`ds4_test --metal-kernels` OK; `bash -n` OK。未跑大模型。用户脚本验证:
+① 总速应回 ≥2.0; ② grep dist-mtp: verify 次数应 ≤1 (大概率 0), tok/call ≥1.0;
+③ 输出 temp=0 逐字一致; ④ 若仍 <2.0: COPY_SPEC=0 A/B 定位。

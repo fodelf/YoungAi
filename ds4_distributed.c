@@ -445,6 +445,11 @@ struct ds4_dist_session {
      * prefix before applying new work. */
     bool spec_accept_pending;
     uint32_t spec_accept_len;
+    /* PC.1 copy speculation: adaptive copied-draft length (SuffixDecoding /
+     * HF assisted-decoding style). Starts small so one wrong copy costs little
+     * (an 8-token verify batch is ~3x a single decode forward), doubles on a
+     * fully-accepted tail, resets on a (near-)total rejection. 0 = uninit. */
+    uint32_t copy_spec_len;
     uint64_t mtp_calls;
     uint64_t mtp_round1;
     uint64_t mtp_verify;
@@ -500,6 +505,74 @@ static void dist_mtp_record_disabled(ds4_dist_session *d) {
     dist_mtp_maybe_log(d, "live");
 }
 
+/* =========================================================================
+ * PC.1 copy speculation (project.md §3.5): prompt-lookup drafting.
+ * The drafter is not a model; it is an n-gram matcher over the session
+ * transcript ("copy what the context already said"). Zero draft memory, zero
+ * draft compute, no MTP weights needed; only the existing VERIFY batch +
+ * accept_len rollback protocol is reused. Greedy-only like the MTP path.
+ * ========================================================================= */
+static bool dist_copy_spec_enabled(void) {
+    return dist_env_enabled("DS4_DIST_COPY_SPEC");
+}
+
+static uint32_t dist_copy_spec_draft_k(void) {
+    /* Total verify batch size (drafts[0]=target argmax + copied tail). */
+    return dist_env_u32_clamped("DS4_DIST_COPY_SPEC_DRAFT", 8, 2, 16);
+}
+
+static uint32_t dist_copy_spec_ngram(void) {
+    /* MINIMUM anchor length: the longest common suffix shared with an earlier
+     * position must be at least this long before we trust its continuation.
+     * Wave-19 lesson: a fixed 3-gram anchor fired once on the smoke prompt and
+     * its whole copied tail was rejected (one ~1.5s verify batch bought one
+     * token, -10%% end to end). Precision over recall. */
+    return dist_env_u32_clamped("DS4_DIST_COPY_SPEC_NGRAM", 4, 1, 16);
+}
+
+static uint32_t dist_copy_spec_init_len(void) {
+    /* Initial / reset copied-draft length (adaptive: doubles on success). */
+    return dist_env_u32_clamped("DS4_DIST_COPY_SPEC_INIT", 3, 1, 15);
+}
+
+static uint32_t dist_copy_spec_min_copy(void) {
+    /* Don't issue a verify batch for fewer copied tokens than this: with the
+     * batch costing ~2-3x a single forward, a 1-token copy cannot break even
+     * (the argmax freebie alone never pays for the round). */
+    return dist_env_u32_clamped("DS4_DIST_COPY_SPEC_MIN", 2, 1, 15);
+}
+
+/* Longest-suffix prompt lookup (SuffixDecoding-style). Among earlier positions
+ * sharing a common suffix with the end of seq[0..len-1], pick the LONGEST
+ * anchor (most recent wins ties) and copy up to cap continuation tokens into
+ * out[]. Returns the anchor length (0 = no anchor >= min_g; caller then skips
+ * Round 2 entirely, so a miss costs nothing). Longer anchors are dramatically
+ * more precise on code/tool text than a fixed short n-gram. */
+static uint32_t dist_copy_spec_match(const int *seq, uint32_t len,
+                                     uint32_t min_g, uint32_t cap,
+                                     int *out, uint32_t *out_n) {
+    if (out_n) *out_n = 0;
+    if (!seq || !out || !out_n || min_g == 0 || cap == 0 || len < min_g + 1u) return 0;
+    const uint32_t max_g = 32;            /* anchor extension cap */
+    const int last = seq[len - 1u];
+    uint32_t best_a = 0, best_src = 0;
+    for (uint32_t s = len - 1u; s-- > 0; ) {
+        if (seq[s] != last) continue;     /* cheap last-token filter */
+        uint32_t a = 1;
+        while (a < max_g && a <= s && seq[s - a] == seq[len - 1u - a]) a++;
+        if (a > best_a) {                 /* strict > keeps the most recent */
+            best_a = a;
+            best_src = s + 1u;
+            if (a >= max_g) break;        /* maximal & most recent: done */
+        }
+    }
+    if (best_a < min_g) return 0;
+    uint32_t n = 0;
+    while (n < cap && best_src + n < len) { out[n] = seq[best_src + n]; n++; }
+    *out_n = n;
+    return n > 0 ? best_a : 0;
+}
+
 static void dist_mtp_record_enabled(
         ds4_dist_session *d,
         uint32_t accepted_tokens,
@@ -517,7 +590,9 @@ static void dist_mtp_record_enabled(
     if (first_hit) d->mtp_window_first_hit++;
 
     const bool force = dist_env_enabled("DS4_DIST_MTP_FORCE");
-    if (!force) {
+    /* PC.1 copy speculation never pays for a miss (no Round 2 on miss), so the
+     * MTP adaptive backoff would only print noise; skip it in copy mode. */
+    if (!force && !dist_copy_spec_enabled()) {
         const uint32_t after = dist_env_u32_clamped("DS4_DIST_MTP_ADAPT_AFTER", 8, 1, 1000000);
         if (d->mtp_window_calls >= after) {
             const uint64_t accept_per_1000 =
@@ -5988,12 +6063,17 @@ int ds4_dist_session_eval_speculative(
         return -1;
     }
     d->mtp_calls++;
+    /* PC.1 copy speculation: no MTP head required (the drafter is an n-gram
+     * matcher over the transcript); only a remote route for the VERIFY batch.
+     * The MTP adaptive backoff does not apply (a copy miss skips Round 2). */
+    const bool copy_spec = dist_copy_spec_enabled();
     /* No drafter configured or no remote worker: plain single-token decode. */
-    if (!d->state.mtp_draft || d->plan.count == 0 ||
-        (!dist_env_enabled("DS4_DIST_MTP_FORCE") && d->mtp_calls <= d->mtp_disable_until_call)) {
-        if (!d->state.mtp_draft || d->plan.count == 0) {
-            /* configured off */
-        } else {
+    const bool spec_ok = copy_spec
+        ? (d->plan.count != 0)
+        : (d->state.mtp_draft && d->plan.count != 0 &&
+           (dist_env_enabled("DS4_DIST_MTP_FORCE") || d->mtp_calls > d->mtp_disable_until_call));
+    if (!spec_ok) {
+        if (!copy_spec && d->state.mtp_draft && d->plan.count != 0) {
             dist_mtp_record_disabled(d);
         }
         if (ds4_dist_session_eval(d, owner, checkpoint, first_token, logits, err, errlen) != 0) {
@@ -6006,7 +6086,8 @@ int ds4_dist_session_eval_speculative(
 
     const int vocab = ds4_engine_vocab_size(d->state.engine);
     const uint32_t p = (uint32_t)checkpoint->len;
-    int K = ds4_engine_mtp_draft_tokens_configured(d->state.engine);
+    int K = copy_spec ? (int)dist_copy_spec_draft_k()
+                      : ds4_engine_mtp_draft_tokens_configured(d->state.engine);
     if (K < 2) {
         /* Drafting one token is no speedup; fall back to plain decode. */
         if (ds4_dist_session_eval(d, owner, checkpoint, first_token, logits, err, errlen) != 0) {
@@ -6021,11 +6102,14 @@ int ds4_dist_session_eval_speculative(
     ds4_tokens_copy(&transcript, checkpoint);
     ds4_tokens_push(&transcript, first_token);
 
-    /* ---- Round 1: eval first_token, request K drafts, carry pending rollback. */
+    /* ---- Round 1: eval first_token, request K drafts, carry pending rollback.
+     * Copy mode sends a plain frame (no DRAFT flag, drafts come from the local
+     * matcher below) but must still carry accept_len for the worker's deferred
+     * rollback of the previous VERIFY batch. */
     ds4_dist_spec_io r1;
     memset(&r1, 0, sizeof(r1));
-    r1.extra_flags = DS4_DIST_WORK_F_DRAFT;
-    r1.draft_cap = (uint32_t)K;
+    r1.extra_flags = copy_spec ? 0u : DS4_DIST_WORK_F_DRAFT;
+    r1.draft_cap = copy_spec ? 0u : (uint32_t)K;
     r1.accept_len = d->spec_accept_pending ? d->spec_accept_len : 0u;
 
     int rc = dist_coordinator_eval_span(&d->state, owner, &d->plan,
@@ -6048,6 +6132,48 @@ int ds4_dist_session_eval_speculative(
         dist_mtp_record_enabled(d, 1, 0, false, false);
         ds4_tokens_free(&transcript);
         return 1;
+    }
+
+    /* ---- PC.1 copy mode: synthesize the draft locally by prompt lookup.
+     * drafts[0] = the target's own argmax at p (so the verify precheck below
+     * passes by construction); drafts[1..] = the continuation that followed
+     * the most recent earlier occurrence of the trailing n-gram of
+     * (transcript + next). A miss costs nothing: draft_n stays 0, we return
+     * just first_token and never issue Round 2 (plain-decode behavior). */
+    if (copy_spec) {
+        r1.draft_n = 0;
+        if (d->copy_spec_len == 0) d->copy_spec_len = dist_copy_spec_init_len();
+        const int next = dist_logits_argmax(logits, vocab);
+        if (first_token != eos_token && next != eos_token) {
+            /* Adaptive copy length: one wrong verify batch costs real money
+             * (wave-19: ~1.5s for kc=8), so start small and let success grow
+             * it. The cap is K-1 (drafts[0] is the argmax freebie). */
+            uint32_t want = d->copy_spec_len;
+            if (want > (uint32_t)(K - 1)) want = (uint32_t)(K - 1);
+            ds4_tokens_push(&transcript, next);
+            int copied[15];
+            uint32_t n_copy = 0;
+            (void)dist_copy_spec_match(transcript.v,
+                                       (uint32_t)transcript.len,
+                                       dist_copy_spec_ngram(),
+                                       want,
+                                       copied,
+                                       &n_copy);
+            transcript.len--;  /* pop `next`: the rebuild fallback below must
+                                * see exactly the committed prefix. */
+            /* Never draft past EOS. */
+            for (uint32_t j = 0; j < n_copy; j++) {
+                if (copied[j] == eos_token) { n_copy = j + 1u; break; }
+            }
+            /* Too-short copies cannot pay for the batch round: skip Round 2. */
+            if (n_copy >= dist_copy_spec_min_copy()) {
+                r1.drafts[0] = (uint32_t)next;
+                for (uint32_t j = 0; j < n_copy; j++) {
+                    r1.drafts[1u + j] = (uint32_t)copied[j];
+                }
+                r1.draft_n = 1u + n_copy;
+            }
+        }
     }
 
     int n_accept = 0;
@@ -6127,6 +6253,21 @@ int ds4_dist_session_eval_speculative(
      * caller samples the next first_token from it. */
     memcpy(logits, vlogits + (size_t)(m - 1u) * (size_t)vocab, (size_t)vocab * sizeof(float));
     free(vlogits);
+
+    /* PC.1 adaptation: a fully-accepted copied tail doubles the next copy
+     * length (repetitive span: keep riding it), a (near-)total rejection
+     * resets it to the cheap initial length; partial acceptance keeps it. */
+    if (copy_spec && kc > 1u) {
+        const uint32_t tail_sent = kc - 1u;
+        const uint32_t tail_ok = m - 1u;
+        if (tail_ok == tail_sent) {
+            uint32_t grown = d->copy_spec_len * 2u;
+            if (grown > (uint32_t)(K - 1)) grown = (uint32_t)(K - 1);
+            d->copy_spec_len = grown;
+        } else if (tail_ok <= 1u) {
+            d->copy_spec_len = dist_copy_spec_init_len();
+        }
+    }
 
     /* Roll the coordinator's local layer-slice KV back to the accepted prefix
      * (p + first_token + m drafts) and defer the worker's rollback to the next

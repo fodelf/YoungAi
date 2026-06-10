@@ -41,6 +41,13 @@
 static volatile sig_atomic_t g_stop_requested = 0;
 static volatile sig_atomic_t g_listen_fd = -1;
 
+/* PC.1 copy speculation (project.md §3.5): enter the speculative decode path
+ * even without an MTP drafter when the n-gram copy drafter is enabled. */
+static bool server_copy_spec_enabled(void) {
+    const char *e = getenv("DS4_DIST_COPY_SPEC");
+    return e && *e && e[0] != '0';
+}
+
 #define DS4_SERVER_IO_TIMEOUT_SEC 10
 #define DS4_SERVER_SEND_STALL_TIMEOUT_MS 2000
 
@@ -10329,7 +10336,8 @@ decode_again:
         int toks[17];
         int ntok = 0;
         if (temperature <= 0.0f &&
-            ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
+            (ds4_engine_mtp_draft_tokens(s->engine) > 1 ||
+             server_copy_spec_enabled()) &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
             ntok = ds4_session_eval_speculative_argmax(s->session,

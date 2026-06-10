@@ -96,6 +96,13 @@ static void cli_dist_busy_set(const cli_config *cfg, bool busy) {
     if (!busy) cli_dist_notice_printed = 0;
 }
 
+/* PC.1 copy speculation (project.md §3.5): enter the speculative decode path
+ * even without an MTP drafter when the n-gram copy drafter is enabled. */
+static bool cli_copy_spec_enabled(void) {
+    const char *e = getenv("DS4_DIST_COPY_SPEC");
+    return e && *e && e[0] != '0';
+}
+
 static int cli_wait_distributed_route(const cli_config *cfg, ds4_session *session) {
     if (!cli_distributed_coordinator(cfg)) return 0;
 
@@ -604,7 +611,8 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
+        if (cfg->gen.temperature <= 0.0f &&
+            (ds4_engine_mtp_draft_tokens(engine) > 1 || cli_copy_spec_enabled()) &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
             cli_dist_busy_set(cfg, true);
             ntok = ds4_session_eval_speculative_argmax(session,
@@ -1275,7 +1283,8 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
+        if (cfg->gen.temperature <= 0.0f &&
+            (ds4_engine_mtp_draft_tokens(engine) > 1 || cli_copy_spec_enabled()) &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
             cli_dist_busy_set(cfg, true);
             ntok = ds4_session_eval_speculative_argmax(chat->session,

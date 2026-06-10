@@ -9985,6 +9985,16 @@ static bool metal_graph_alloc_raw_cap(
         g->spec_logits = ds4_gpu_tensor_alloc((uint64_t)16 * DS4_N_VOCAB * sizeof(float));
         g->mtp_n_raw = 0;
     }
+    /* PC.1 copy speculation (project.md §3.5): the cross-machine VERIFY batch
+     * reads its K logit rows out of spec_logits but needs none of the MTP
+     * drafter tensors. Allocate just that buffer (~8MiB) when the copy drafter
+     * is enabled without MTP, so the final-layer owner can serve VERIFY. */
+    if (!g->spec_logits) {
+        const char *cs = getenv("DS4_DIST_COPY_SPEC");
+        if (cs && *cs && cs[0] != '0') {
+            g->spec_logits = ds4_gpu_tensor_alloc((uint64_t)16 * DS4_N_VOCAB * sizeof(float));
+        }
+    }
 
     g->prefill_tokens = ds4_gpu_tensor_alloc(pc * sizeof(int32_t));
     g->batch_cur_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));

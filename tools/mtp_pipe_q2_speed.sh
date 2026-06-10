@@ -124,6 +124,26 @@ EXPERT_FETCH_PORT=${EXPERT_FETCH_PORT:-$((PORT+7))}
 # host wait (同 TP rendezvous 先例), CB 状态检查推迟一拍。43 层/token 的逐 CB 调度开销直接砍掉。
 # A/B 回退: EXPERT_EVENT_DRAIN=0。
 EXPERT_EVENT_DRAIN=${EXPERT_EVENT_DRAIN:-1}
+# ---- project.md §3.5 PC.1: 零成本复制式投机 (prompt-lookup drafting) ----
+# 单 token decode 已到 ~2.1 t/s 地板 (两机 drain GPU 计算 ~175ms/token 不可再藏), M2 ≥3 必须
+# 一次前向产出多个 token。drafter 不是模型: 在 transcript 上找尾部 NGRAM-gram 的最近一次
+# 早先出现, 直接"抄"其后续 ≤DRAFT-1 个 token 当草稿, 连同目标 argmax 一并经既有 VERIFY 批
+# (mtp.md Phase 1 协议原样复用) 一次验证; 接受前缀提交, 尾部跨机 KV 回滚。
+# 匹配失败 = 不发 Round 2, 零开销退化为普通 decode; 正确性纯由目标 argmax 把关 (greedy-only,
+# 脚本本就 --temp 0)。零草稿内存/算力, 不占 worker 一字节 (仅 worker 端 spec_logits ~8MiB)。
+# 验证批 K token 的专家并集天然去重 ⇒ IO 按 round 摊薄 (W2 墙下投机的正确打开方式)。
+# 第十九波教训 (1.82): 固定 3-gram 锚 + 固定抄 7 个 = 低精度高赌注 —— 唯一一次 verify
+# (~1.5s, n_active 19-45/层) 7 个抄注全敗只换 1 token。v2 改 SuffixDecoding 式:
+#   - 锚 = 最长公共后缀 (NGRAM 变最小锚长, 默认 4; 锚越长精度越高);
+#   - 自适应抄长: 初始 INIT=3, 全接受翻倍 (≤DRAFT-1), (近)全拒回 INIT; 抄长 <MIN=2 不发批。
+# A/B 回退: COPY_SPEC=0。接受率看 coordinator 日志 dist-mtp 行 (tok/call, verify 次数)。
+COPY_SPEC=${COPY_SPEC:-1}
+COPY_SPEC_DRAFT=${COPY_SPEC_DRAFT:-8}          # 验证批上限 (argmax + ≤7 个抄来的 token)
+COPY_SPEC_NGRAM=${COPY_SPEC_NGRAM:-4}          # 最小锚长 (最长后缀匹配须 ≥ 此值才信)
+COPY_SPEC_INIT=${COPY_SPEC_INIT:-3}            # 自适应抄长初始值/重置值
+COPY_SPEC_MIN=${COPY_SPEC_MIN:-2}              # 抄长低于此不发验证批 (赔不起往返)
+COPY_SPEC_ENV=""
+[ "$COPY_SPEC" = 1 ] && COPY_SPEC_ENV="DS4_DIST_COPY_SPEC=1 DS4_DIST_COPY_SPEC_DRAFT=$COPY_SPEC_DRAFT DS4_DIST_COPY_SPEC_NGRAM=$COPY_SPEC_NGRAM DS4_DIST_COPY_SPEC_INIT=$COPY_SPEC_INIT DS4_DIST_COPY_SPEC_MIN=$COPY_SPEC_MIN"
 IO_ENV="DS4_METAL_EXPERT_PREAD=$EXPERT_PREAD DS4_METAL_EXPERT_PREAD_NOCACHE=$EXPERT_PREAD_NOCACHE DS4_METAL_EXPERT_SORT_IDS=$EXPERT_SORT_IDS DS4_METAL_EXPERT_FULL_LAYER_STREAM=$EXPERT_STREAM DS4_METAL_EXPERT_STREAM_THRESHOLD_PCT=$EXPERT_STREAM_THRESHOLD_PCT DS4_METAL_EXPERT_STREAM_CHUNK_MB=$EXPERT_STREAM_CHUNK_MB DS4_METAL_EXPERT_IO_PROFILE=$EXPERT_IO_PROFILE DS4_METAL_EXPERT_PREFETCH_AHEAD=$EXPERT_PREFETCH DS4_METAL_EXPERT_PREFETCH_TOP=$EXPERT_PREFETCH_TOP DS4_METAL_EXPERT_PREFETCH_DEPTH=$EXPERT_PREFETCH_DEPTH DS4_METAL_EXPERT_EVENT_DRAIN=$EXPERT_EVENT_DRAIN DS4_METAL_EXPERT_STAGE=$EXPERT_STAGE"
 # 源专家 LRU（A3 fallback 用）：direct per-tensor read 虽避免了 30+GiB view OOM，
 # 但实测每 token 15–16s（随机 mmap/页故障/每层 command drain），比 A3 慢一个数量级；默认回 A3。
@@ -268,7 +288,7 @@ DEBUG_ARGS=""
 # 并行复制同层 active experts，降低 A3 memcpy 墙。per-tensor DIRECT 已验证不 OOM 但 15s/token，
 # 默认关闭；需要实验时覆盖 DS4_METAL_EXPERT_OFFLOAD_DIRECT=1。
 # NO_MODEL_WARMUP 避免启动时扫冷 expert views。
-BASE_RUN_ENV=${BASE_RUN_ENV:-"DS4_DIST_REVERSE_CONNECT=1 DS4_METAL_PREFILL_CHUNK=$PREFILL_CHUNK DS4_DIST_PREFILL_CAP=$DIST_PREFILL_CAP DS4_METAL_EXPERT_OFFLOAD=1 DS4_METAL_EXPERT_OFFLOAD_DIRECT=0 DS4_METAL_EXPERT_GATHER_THREADS=$GATHER_THREADS DS4_METAL_NO_MODEL_WARMUP=1 $IO_ENV"}
+BASE_RUN_ENV=${BASE_RUN_ENV:-"DS4_DIST_REVERSE_CONNECT=1 DS4_METAL_PREFILL_CHUNK=$PREFILL_CHUNK DS4_DIST_PREFILL_CAP=$DIST_PREFILL_CAP DS4_METAL_EXPERT_OFFLOAD=1 DS4_METAL_EXPERT_OFFLOAD_DIRECT=0 DS4_METAL_EXPERT_GATHER_THREADS=$GATHER_THREADS DS4_METAL_NO_MODEL_WARMUP=1 $IO_ENV $COPY_SPEC_ENV"}
 # 远程专家字节服务: coordinator (本机) 当客户端拉 worker 盘; worker 当服务端。
 LOCAL_FETCH_ENV=""
 REMOTE_FETCH_ENV=""
