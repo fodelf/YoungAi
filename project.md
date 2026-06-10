@@ -39,7 +39,8 @@
 | 里程碑 | decode | prefill | 依赖 |
 |---|---|---|---|
 | M0 起点 | 0.81 | 0.78 | — |
-| M0.5 实测（2026-06-10 第一波后） | **1.56** | 2.95 | P1.1 pread + 排序（短 prompt 未触发 P1.2 流式） |
+| M0.5 实测（2026-06-10 第一波后） | 1.56 | 2.95 | P1.1 pread + 排序（短 prompt 未触发 P1.2 流式） |
+| **M1 达成实测（第三波后）** | **1.70** | 3.07 | + P2.1 礼让式预取（pf 79.6%）；M1 门 decode ≥1.6 ✅ |
 | M1 单拷贝直读 + prefill 流式 | **≥1.6** | **≥10** | P1.1/P1.2 |
 | M2 预测预取流水 + 命中零拷贝 + repack | **≥3** | **≥25** | P1.3/P1.4/P2.1 |
 | M3 expert-parallel 双 SSD 并行 | **≥5** | ≥30 | P2.2 |
@@ -297,13 +298,20 @@ P0 测量基建（半天）→ P1 内存分区排布（主攻，~1-2 周）→ P
 - [x] 联网调研（arXiv 2026-06 检索 + 开源项目盘点）+ 方案落地本文件
 - [x] P0.1 gather 分解计时（`DS4_METAL_EXPERT_IO_PROFILE=1`，ds4-io 行：fault/memcpy/pread/drain/bw；
       含 drain_ms 屏障税专查）——**代码已落地 2026-06-10，待用户脚本实测取数**
-- [ ] P0.2 SRP·SCH 标定 / P0.3 SSD+RTT 底数
-- [ ] 快赢 1（DIST_PREFILL_CAP A/B）/ 2（屏障税 env A/B）/ 4（SRP/SCH 脚本）——零代码，待实测
+- [ ] P0.2 SRP·SCH 标定
+- [x] P0.3 SSD 底数（`tools/ssd_bench.c`，2026-06-10 实测）：**mini 全模式 ~2.4–2.6GB/s**（顺序≈随机），
+      **MacBook 5.5–6.7GB/s（快 2.3–2.6×）**——coordinator 慢盘是当前结构性瓶颈；RTT 待测
+- [ ] 快赢 1（DIST_PREFILL_CAP A/B）/ 4（SRP/SCH 脚本）——零代码，待实测
+- [x] 快赢 2 → 屏障税回收：A3 每层 drain 改 MTLSharedEvent 快路径 host wait
+      （`DS4_METAL_EXPERT_EVENT_DRAIN=1`，CB 状态检查推迟一拍；正确性保证等价）
+      ——**代码已落地 2026-06-10，drain_ms 新值待实测（目标 <2.5ms/层）**
 - [x] 快赢 3 → P1.1 pread 单拷贝直读（`DS4_METAL_EXPERT_PREAD=1` + `_NOCACHE` A/B 旋钮；
       MTLIOCommandQueue 留作下一步若 pread 未达 ≥3GB/s）——**代码已落地，M1 门 decode ≥1.6 待实测**
 - [x] P1.2 prefill 全层流式（`DS4_METAL_EXPERT_FULL_LAYER_STREAM=1`，阈值 60%、16MiB 分块、
       免 remap 直用原 id；含槽位排序快赢 `DS4_METAL_EXPERT_SORT_IDS=1`）——**代码已落地，M1 门 prefill ≥10 待实测**
-- [ ] P1.3 GGUF 专家捆绑重排 sidecar
+- [x] ~~P1.3 GGUF 专家捆绑重排 sidecar~~ **不立项（G 门否决，2026-06-10）**：P0.3 实测 mini 盘
+      随机 2MiB@QD8=2.40 vs 捆绑粒度 6.75MiB@QD8=2.61 vs 顺序=2.50 GB/s——增益 ≤8%，
+      不值 34GiB sidecar + repacker；worker 盘虽有 +18% 但不是瓶颈侧
 - [ ] P1.4 常驻池间接表（命中零拷贝）
 - [x] P2.1 跨层预测预取 v2（`DS4_METAL_EXPERT_PREFETCH_AHEAD=1` + `_TOP/_DELTA`；
       v1 实测回退 1.56→1.49：pf 精度 77.5% 可用，但 readahead 与前台 gather 抢 SSD——
@@ -311,7 +319,10 @@ P0 测量基建（半天）→ P1 内存分区排布（主攻，~1-2 周）→ P
       drain/GPU 空闲窗 + mincore 跳过已缓存 + 分数序 + latest-wins 过期中止）
       ——**v2 已落地 2026-06-10，待实测；M2 门 decode ≥3**；
       gather 工作单元同步细化到张量级（decode QD 6→18，脚本 GATHER_THREADS 默认 8，A/B 用 4）
-- [ ] P2.2 expert-parallel 拓扑（M3 门：decode ≥5）
+- [x] P2.2 低成本变体：远程专家字节服务（`DS4_DIST_EXPERT_FETCH_*`，worker 空闲快盘经雷电
+      给 coordinator 的 gather 供字节，与本地 pread 同游标抢单元；链路失败永久降级本地）
+      ——**代码已落地 2026-06-10（协议环回自检通过），待实测；coord 聚合供给 ≈2.5+TB GB/s**
+- [ ] P2.2 完整 expert-parallel 拓扑（M3 门：decode ≥5；先看低成本变体实测再定）
 - [ ] P2.3 MTP 重启评估 / P2.4 路由偏置（质量门）
 - [ ] PC.1 复制式投机（快赢 5 过门后；M4C 门：编辑型回合有效 decode ≥2×）
 - [ ] PC.2 编程域热专家画像 + 启动预热

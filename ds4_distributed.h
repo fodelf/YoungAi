@@ -150,4 +150,18 @@ int ds4_dist_session_load_payload(
  */
 int ds4_dist_run(ds4_engine *engine, const ds4_dist_options *opt, const ds4_dist_generation_options *gen);
 
+/* project.md P2.2 low-cost variant: remote expert pread service.  Both
+ * machines load the byte-identical GGUF; the worker's faster (and during the
+ * coordinator's pipeline half, idle) SSD serves raw file-range reads over
+ * Thunderbolt so the coordinator's expert gather draws from both disks at
+ * once.  Server side is enabled by DS4_DIST_EXPERT_FETCH_SERVE=1 (+ optional
+ * DS4_DIST_EXPERT_FETCH_PORT, default 5606) and is called by the engine right
+ * after the model is opened; it duplicates the model fd.  The client opens
+ * n_conns sockets (one per fetcher thread; ds4_dist_expert_fetch is
+ * slot-bound, lock-free) and validates that the remote file size matches.
+ * Purely a byte transport: wrong/unavailable service degrades to local reads. */
+int ds4_dist_expert_fetch_maybe_serve(int model_fd, uint64_t model_size);
+int ds4_dist_expert_fetch_client_init(const char *host, int port, int n_conns, uint64_t model_size);
+int ds4_dist_expert_fetch(int slot, uint64_t off, void *dst, uint32_t len);
+
 #endif

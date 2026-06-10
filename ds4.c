@@ -19373,6 +19373,10 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         }
         ds4_gpu_set_quality(e->quality);
         (void)ds4_gpu_set_model_fd(e->model.fd);
+        /* project.md P2.2 low-cost variant: when DS4_DIST_EXPERT_FETCH_SERVE=1
+         * (worker side), serve raw model-file range reads so the peer's expert
+         * gather can draw from this machine's faster idle SSD over Thunderbolt. */
+        (void)ds4_dist_expert_fetch_maybe_serve(e->model.fd, e->model.size);
         int model_map_ok = 0;
         uint64_t base_l1_resident_bytes = 0;
         const uint64_t mtp_l1_resident_bytes = e->mtp_ready ?

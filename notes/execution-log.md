@@ -1608,3 +1608,107 @@ A/B: EXPERT_PREFETCH=0/1, EXPERT_PREFETCH_TOP=8/12, GATHER_THREADS=4/8。
 ② `EXPERT_PREFETCH_DELTA=2` —— 看 pf= 精度降多少、wall_ms 降多少;
 ③ `GATHER_THREADS=4` vs 8 —— 隔离 QD 项对 decode/prefill 的独立影响 (上轮无法归因);
 ④ 关注 ds4-io 高 bw 层 (页缓存命中) 占比是否上升, pread_fallbacks 仍须 0, RSS 12/8 红线。
+
+## 2026-06-10 — 第四波: A3 每层 drain 改 MTLSharedEvent 快路径 (1.70 t/s 之后)
+
+**Context.** 第三波礼让式预取实测 **1.70 t/s** (prefill 3.07), 历史最高, M1 门 (decode ≥1.6) 过。
+最新账表 (coordinator): gather wall 均值 13.7ms (预取生效, pf=79.6%), **drain 均值 3.8ms/层**。
+drain × 43 层 ≈ 165ms/token (~28%) 是当前第二大项, 其中相当部分是逐 CB commit+waitUntilCompleted
+的调度/状态开销 (SwiftLM #84 同类教训; 仓库 TP rendezvous 注释先例: SharedEvent 快路径 ~150ms→<50µs)。
+
+**Patch (`ds4_metal.m`).**
+- 新增 `ds4_gpu_end_commands_event(label)` + 包装 `ds4_gpu_expert_drain_commands`:
+  `DS4_METAL_EXPERT_EVENT_DRAIN=1` 时, A3 两个调用点 (decode/batch) 的每层 drain 改为
+  **encodeSignalEvent → commit (不等) → MTLSharedEvent waitUntilSignaledValue 快路径 host wait**。
+  同队列 CB 按提交序完成 ⇒ 事件触发 = 之前全部 GPU 工作完成、Shared 写可见 —— 与
+  waitUntilCompleted 同等正确性保证, 去掉慢等待。
+- CB 状态/错误检查推迟一拍: drain 完把 CB 挂 `g_pending_cbs`, 下次 drain 在事件等待后清扫
+  (此时 CB 已完成, 清扫零成本); 事件 60s 超时回退 waitUntilCompleted + 完整诊断。
+- transient buffer 引用在事件等待后释放 (GPU 已用完, 语义同 classic 路径)。cleanup 释放事件。
+- 默认关闭 (engine); 脚本默认 `EXPERT_EVENT_DRAIN=1`, A/B 回退设 0。
+
+**预期.** 若 drain 3.8ms 中 1.5–2ms 是调度开销: 省 ~65–86ms/token ⇒ 1.70 → **~1.9–2.0 t/s** 方向。
+ds4-io 行 drain_ms 直接给出答案 (期望降到 ~1.5–2.5ms, 即纯 GPU 残余工作)。
+
+**Validation performed here.** `make` 全量 + `ds4_test --metal-kernels` (基线 + EVENT_DRAIN=1 全开
+env) 通过; `bash -n` 通过。未跑大模型。
+用户脚本验证: ① ds4-io drain_ms 新均值 (目标 <2.5ms); ② generation t/s; ③ 输出文本与上轮
+temp=0 seed=1 应逐字一致 (drain 语义等价的硬验证); ④ EXPERT_EVENT_DRAIN=0 A/B 回退;
+⑤ 顺手建议: 看 worker 侧账表 `ssh 192.168.1.2 "grep 'ds4-io: site=decode' /tmp/mtp_pipe_worker.log | tail"`
+对比两机每层 wall+drain, 若 coordinator 明显更忙, 可 A/B `SPLIT_COORD=0:17 SPLIT_WORKER=18:output`
+(零代码层重平衡)。
+
+## 2026-06-10 — 第五波: P0.3 双机 SSD 底数 + 预取 DEPTH 范围预测 (1.71 t/s 之后)
+
+**Context / 测量 (本轮先测后写).**
+- 事件 drain 实测无效: drain_ms 3.8→3.74 (1.70→1.71) ⇒ **drain 是真实 GPU 计算, 屏障税假设证伪**。
+- **P0.3 落地** (`tools/ssd_bench.c`, F_NOCACHE pread 基准, 两机对 81GiB gguf 实测):
+  - **M4 mini (coordinator): 全模式 ~2.4–2.6GB/s** (seq 16MiB=2.50, rand 2MiB qd8=2.40,
+    rand 6.75MiB qd8=2.61) ⇒ **P1.3 捆绑重排判死刑** (随机 vs 顺序仅差 8%, 34GiB sidecar 不值);
+    coordinator gather 有效 ~2.96GB/s 已超裸盘 (页缓存贡献), **mini 侧已逼近盘顶**。
+  - **M1 MacBook (worker): rand 2MiB qd4-8 ≈5.5-5.7, 6.75MiB/seq ≈6.5-6.7GB/s, 快 2.3-2.6×**。
+- 两机 decode 账表: coord 每层 wall 13.7 + drain 3.7 ≈ **17.5ms**; worker wall 4.52 (bw 13.35
+  = readahead 在快盘上真正完成, 页缓存大量命中, pf=83.7%) + drain 5.14 ≈ **9.7ms**。
+  Token ≈ 20×17.5 + 23×9.7 ≈ 585ms ✓ 1.71 t/s。
+  ⇒ 瓶颈 = coordinator 慢盘; 它的空闲窗 (~3.7ms ≈ 9MiB@2.5GB/s) 单层吃不满 40.5MiB 的预测读。
+
+**Patch.**
+- **预取 DEPTH 范围预测** (`ds4_metal.m`): job 从"预测单层"改"用同一 hidden 预测 L+1..L+D"
+  (`DS4_METAL_EXPERT_PREFETCH_DEPTH`, 默认 1, DELTA 作 legacy 别名; 脚本默认 **2**)。
+  最近 deadline 先发; mincore 让相邻 job 的重复预测近零成本; 超越/关停在层间与块间均可中止。
+  D=2 给每层预测 ~2 个空闲窗 (~18MiB ≈ 45% 覆盖), 预测精度代价由 pf= 实测。
+- `tools/ssd_bench.c` 入库 (含两机实测数注释), P0.3 可复现。
+- 脚本: EXPERT_PREFETCH_DELTA → EXPERT_PREFETCH_DEPTH=2。
+
+**决策记录.**
+- P1.3 (GGUF 捆绑重排): **不立项** (P0.3 数据否决, mini 盘无顺序优势)。
+- 层重平衡 (零代码, 数据支撑): 每挪 1 层 coord→worker 净省 ~7.8ms/token。
+  建议 A/B `SPLIT_COORD=0:17 SPLIT_WORKER=18:output` 起步 (worker +2 层 ≈ +0.4GiB,
+  注意 watchdog 8GiB 红线), 可再试 0:16/17:output。配合 coord 腾出的 wired 内存
+  → 更大页缓存 → coord 残余层 wall 进一步降。
+
+**Validation performed here.** `make` 0 error; `ds4_test --metal-kernels` 基线+新 env 双跑 OK;
+`bash -n` 通过; ssd_bench 双机实测完成 (仅文件读, 未跑模型)。
+用户脚本验证: ① 默认 (DEPTH=2): coord wall 期望 13.7→~10-11, 高 bw 层占比上升;
+② pf= 精度变化 (D=2 预测含 1 层陈旧 hidden); ③ `EXPERT_PREFETCH_DEPTH=1` A/B;
+④ 层重平衡 A/B (先小步 0:17/18:output, 看 worker RSS); ⑤ pread_fallbacks=0, RSS 红线。
+
+## 2026-06-10 — 第六波: DEPTH=2 证伪回退 + P2.2 低成本变体「远程专家字节服务」(1.66 t/s 之后)
+
+**Context.** DEPTH=2 实测 1.71→1.66: coord wall 13.96 (持平), worker wall 4.52→5.43 —— 远层预测的
+matvec 算力与 advisories 挤占了本就饱和的空闲窗, worker 的 readahead 本来就完成了, D=2 纯开销。
+**决策: 脚本 DEPTH 默认回 1** (引擎默认本来就是 1)。
+真正的结构机会来自 P0.3 + 两机账表: worker 盘 5.5-6.7GB/s 且在 coordinator 干活的 ~350ms/token
+里完全空闲; mini 盘 2.5GB/s 封顶且是瓶颈侧。两机加载字节相同的 gguf ⇒ **coordinator 可以同时从
+两块盘取专家字节** (本地 2.5 + 雷电链路 ~2-4GB/s)。
+
+**Patch (P2.2 低成本变体, project.md「空闲方 SSD 经雷电给忙方流专家字节」).**
+- `ds4_distributed.c/h`: 新增**远程 pread 服务** (~230 行):
+  - 协议: 每连接顺序 req{u64 off,u32 len(≤8MiB)} → resp{u32 status}+bytes; 握手校验 magic+文件大小。
+  - 服务端 `ds4_dist_expert_fetch_maybe_serve(fd,size)`: env `DS4_DIST_EXPERT_FETCH_SERVE=1` 时
+    监听 (`_PORT` 默认 5606), dup 模型 fd, accept 线程 + 每连接处理线程; ds4.c 在 engine open
+    (set_model_fd 同点) 调用, 未设 env 即 no-op。
+  - 客户端 `..._client_init(host,port,n,size)` + `ds4_dist_expert_fetch(slot,off,dst,len)`:
+    每拉取线程独占一条 TCP (slot 绑定, 无锁); 大小不匹配拒连。
+- `ds4_metal.m`:
+  - gather 重构: unit 解析抽出 `unit_resolve` (本地/远程共用); ctx 加原子 `done` 计数;
+    入口统一走共享游标 (串行回退也用 temp_worker 内联), 远程开启时发布 ctx → 远程线程与本地
+    pread 线程**从同一游标抢单元**, 入口等 done==total 后收尾。
+  - 远程工人: hard-copy 命中本地 memcpy; 远程失败**永久降级本地** (链路 down 标志 + 当前单元本地
+    完成), 正确性永不依赖对端。
+  - ds4-io 行新增 `rfetch_mib= rfetch_ms=` (远程字节/线程时间)。
+- 脚本: `EXPERT_REMOTE_FETCH=1` (默认开, A/B 设 0), `EXPERT_REMOTE_FETCH_CONNS=3`,
+  端口 PORT+7; coordinator 注 HOST/PORT/CONNS, worker 注 SERVE/PORT; DEPTH 默认回 1。
+
+**算账.** coord 侧聚合供给 ≈ 本地 2.5 + TB 实效 ~1.5-3GB/s ⇒ coord wall 13.7 → ~8-10ms,
+coord 半程 350 → ~240-280ms ⇒ token ~470-510ms ⇒ **方向 ~2.0-2.1 t/s**。worker 服务发生在它的
+空闲半程, 与其自身 gather 天然错峰。
+
+**Validation performed here.** `make` 零新告警; `ds4_test --metal-kernels` 多组 env 通过;
+**协议环回自检通过** (同机 serve+2 连接, 对齐/非对齐/尾部/6.75MiB 取数逐字节比对 OK, 越界请求
+正确拒绝); 连不上服务时优雅禁用路径检查; `bash -n` 通过。未跑大模型。
+用户脚本验证: ① 启动行两侧: worker `expert-fetch server listening on :5606`,
+coordinator `expert-fetch client: 3 connection(s)` + `remote fetch thread(s)`;
+② coord ds4-io 行 `rfetch_mib` >0 且 wall_ms 下降 (期望 13.7→8-10); ③ worker 侧速度不应回退
+(服务在其空闲半程); ④ 输出文本 temp=0 seed=1 逐字一致; ⑤ A/B EXPERT_REMOTE_FETCH=0;
+⑥ CONNS=2/4 扫一下; ⑦ RSS 红线 12/8 (服务端仅 8MiB/连接缓冲)。

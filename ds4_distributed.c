@@ -9398,3 +9398,204 @@ int ds4_dist_run(ds4_engine *engine, const ds4_dist_options *opt, const ds4_dist
     fprintf(stderr, "ds4: distributed runtime requested without a distributed role\n");
     return 1;
 }
+
+/* ============================================================================
+ * project.md P2.2 (low-cost variant): remote expert pread service.
+ *
+ * P0.3 measured the two SSDs: coordinator (M4 mini) tops out at ~2.4-2.6GB/s
+ * for every pattern while the worker (M1 MacBook) reads 5.5-6.7GB/s -- and
+ * the worker's disk sits idle during the coordinator's half of every decoded
+ * token (serial layer pipeline).  Both machines load the byte-identical GGUF,
+ * so the coordinator can stream cold expert bytes from the worker's faster,
+ * idle disk over Thunderbolt *in parallel with* its own SSD: aggregate supply
+ * ~2.5 + min(TB, worker SSD) GB/s.
+ *
+ * Protocol (one TCP connection per client thread, strictly sequential):
+ *   handshake: client sends {u64 magic}, server replies {u64 magic, u64 size}
+ *   request:   {u64 off, u32 len}            (len <= 8MiB, off+len <= size)
+ *   response:  {u32 status} + len bytes when status == 0
+ * Same-arch little-endian Macs on a direct link: fixed-width fields are sent
+ * raw, consistent with the existing payload framing in this file.
+ * ========================================================================== */
+
+#define DS4_EFETCH_MAGIC 0x4453344546563101ULL   /* "DS4EFV1" + 0x01 */
+#define DS4_EFETCH_MAX_LEN (8u << 20)
+#define DS4_EFETCH_MAX_CONNS 8
+
+typedef struct {
+    uint64_t off;
+    uint32_t len;
+} ds4_efetch_req;
+
+typedef struct {
+    int listen_fd;
+    int model_fd;
+    uint64_t model_size;
+} ds4_efetch_server;
+
+static void *ds4_efetch_conn_thread(void *arg) {
+    void **pack = (void **)arg;
+    int fd = (int)(intptr_t)pack[0];
+    ds4_efetch_server *srv = (ds4_efetch_server *)pack[1];
+    free(pack);
+
+    uint8_t *buf = malloc(DS4_EFETCH_MAX_LEN);
+    if (!buf) { close(fd); return NULL; }
+
+    uint64_t magic = 0;
+    if (dist_read_full(fd, &magic, sizeof(magic)) != 1 || magic != DS4_EFETCH_MAGIC) {
+        free(buf); close(fd); return NULL;
+    }
+    uint64_t hello[2] = { DS4_EFETCH_MAGIC, srv->model_size };
+    if (dist_write_full(fd, hello, sizeof(hello)) != 0) {
+        free(buf); close(fd); return NULL;
+    }
+
+    for (;;) {
+        ds4_efetch_req req;
+        int rc = dist_read_full(fd, &req, sizeof(req));
+        if (rc <= 0) break;
+        uint32_t status = 0;
+        if (req.len == 0 || req.len > DS4_EFETCH_MAX_LEN ||
+            req.off > srv->model_size || (uint64_t)req.len > srv->model_size - req.off) {
+            status = 1;
+        } else {
+            uint8_t *p = buf;
+            uint64_t off = req.off;
+            size_t left = req.len;
+            while (left > 0) {
+                ssize_t n = pread(srv->model_fd, p, left, (off_t)off);
+                if (n < 0) { if (errno == EINTR) continue; status = 2; break; }
+                if (n == 0) { status = 2; break; }
+                p += (size_t)n; off += (uint64_t)n; left -= (size_t)n;
+            }
+        }
+        if (dist_write_full(fd, &status, sizeof(status)) != 0) break;
+        if (status == 0 && dist_write_full(fd, buf, req.len) != 0) break;
+    }
+    free(buf);
+    close(fd);
+    return NULL;
+}
+
+static void *ds4_efetch_accept_thread(void *arg) {
+    ds4_efetch_server *srv = (ds4_efetch_server *)arg;
+    for (;;) {
+        int fd = accept(srv->listen_fd, NULL, NULL);
+        if (fd < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        dist_set_socket_low_latency(fd);
+        void **pack = malloc(2 * sizeof(void *));
+        if (!pack) { close(fd); continue; }
+        pack[0] = (void *)(intptr_t)fd;
+        pack[1] = srv;
+        pthread_t th;
+        if (pthread_create(&th, NULL, ds4_efetch_conn_thread, pack) == 0) {
+            pthread_detach(th);
+        } else {
+            free(pack);
+            close(fd);
+        }
+    }
+    return NULL;
+}
+
+int ds4_dist_expert_fetch_maybe_serve(int model_fd, uint64_t model_size) {
+    const char *serve = getenv("DS4_DIST_EXPERT_FETCH_SERVE");
+    if (!serve || serve[0] != '1' || model_fd < 0 || model_size == 0) return 0;
+
+    int port = 5606;
+    const char *penv = getenv("DS4_DIST_EXPERT_FETCH_PORT");
+    if (penv && penv[0]) {
+        char *end = NULL;
+        long v = strtol(penv, &end, 10);
+        if (end != penv && *end == '\0' && v > 0 && v <= 65535) port = (int)v;
+    }
+
+    static ds4_efetch_server srv;   /* one server per process */
+    if (srv.listen_fd > 0) return 1;
+
+    int dup_fd = dup(model_fd);
+    if (dup_fd < 0) return 0;
+    char err[256] = {0};
+    int lfd = dist_open_listener(NULL, port, err, sizeof(err));
+    if (lfd < 0) {
+        fprintf(stderr, "ds4: expert-fetch server failed to listen on :%d (%s)\n", port, err);
+        close(dup_fd);
+        return 0;
+    }
+    srv.listen_fd = lfd;
+    srv.model_fd = dup_fd;
+    srv.model_size = model_size;
+    pthread_t th;
+    if (pthread_create(&th, NULL, ds4_efetch_accept_thread, &srv) != 0) {
+        close(lfd);
+        close(dup_fd);
+        srv.listen_fd = 0;
+        return 0;
+    }
+    pthread_detach(th);
+    fprintf(stderr,
+            "ds4: expert-fetch server listening on :%d (serving %.2f GiB model file reads)\n",
+            port, (double)model_size / 1073741824.0);
+    return 1;
+}
+
+/* ---- client: one socket per fetcher thread, no shared locks ---- */
+
+static int g_efetch_fds[DS4_EFETCH_MAX_CONNS];
+static int g_efetch_nconns;
+
+int ds4_dist_expert_fetch_client_init(const char *host, int port, int n_conns, uint64_t model_size) {
+    if (!host || !host[0] || n_conns <= 0) return 0;
+    if (n_conns > DS4_EFETCH_MAX_CONNS) n_conns = DS4_EFETCH_MAX_CONNS;
+    int connected = 0;
+    for (int i = 0; i < n_conns; i++) {
+        char err[256] = {0};
+        int fd = dist_connect_endpoint_once(host, port, NULL, err, sizeof(err));
+        if (fd < 0) {
+            fprintf(stderr, "ds4: expert-fetch connect %s:%d failed (%s)\n", host, port, err);
+            break;
+        }
+        dist_set_socket_low_latency(fd);
+        uint64_t magic = DS4_EFETCH_MAGIC;
+        uint64_t hello[2] = {0, 0};
+        if (dist_write_full(fd, &magic, sizeof(magic)) != 0 ||
+            dist_read_full(fd, hello, sizeof(hello)) != 1 ||
+            hello[0] != DS4_EFETCH_MAGIC ||
+            (model_size != 0 && hello[1] != model_size)) {
+            fprintf(stderr,
+                    "ds4: expert-fetch handshake with %s:%d failed (remote size %llu vs local %llu)\n",
+                    host, port,
+                    (unsigned long long)hello[1], (unsigned long long)model_size);
+            close(fd);
+            break;
+        }
+        g_efetch_fds[connected++] = fd;
+    }
+    g_efetch_nconns = connected;
+    if (connected) {
+        fprintf(stderr, "ds4: expert-fetch client: %d connection(s) to %s:%d\n",
+                connected, host, port);
+    }
+    return connected;
+}
+
+int ds4_dist_expert_fetch(int slot, uint64_t off, void *dst, uint32_t len) {
+    if (slot < 0 || slot >= g_efetch_nconns || !dst || len == 0 || len > DS4_EFETCH_MAX_LEN) return 0;
+    const int fd = g_efetch_fds[slot];
+    if (fd <= 0) return 0;
+    ds4_efetch_req req = { off, len };
+    uint32_t status = 1;
+    if (dist_write_full(fd, &req, sizeof(req)) != 0 ||
+        dist_read_full(fd, &status, sizeof(status)) != 1 ||
+        status != 0 ||
+        dist_read_full(fd, dst, len) != 1) {
+        close(fd);
+        g_efetch_fds[slot] = -1;
+        return 0;
+    }
+    return 1;
+}
