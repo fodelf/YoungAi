@@ -14115,6 +14115,8 @@ int ds4_gpu_translate_expert_ids(
     return 1;
 }
 
+static void ds4_gpu_expert_router_note(int token, int hash_mode);
+
 int ds4_gpu_router_select_tensor(
         ds4_gpu_tensor       *selected,
         ds4_gpu_tensor       *weights,
@@ -14137,6 +14139,8 @@ int ds4_gpu_router_select_tensor(
     if (!selected || !weights || !probs || !logits || !model_map ||
         n_expert == 0 || n_expert_used == 0) return 0;
     if (hash_mode && token >= hash_rows) return 0;
+    /* Decode-token note for the exact hash-layer staging (project.md P2.1). */
+    ds4_gpu_expert_router_note((int)token, hash_mode ? 1 : 0);
     if (n_expert_groups > 1u || n_group_used > 0u) {
         fprintf(stderr, "ds4: Metal router group gating is not part of this DeepSeek V4 path\n");
         return 0;
@@ -17011,8 +17015,9 @@ static uint64_t ds4_gpu_expert_touch_pages(const uint8_t *p, size_t len) {
 
 typedef struct {
     int valid;
+    int gate_inp_is_f32;      /* early layers carry an F32 router matrix */
     const void *model_map;
-    uint64_t gate_inp_off;    /* F16 [n_expert][n_embd] rows */
+    uint64_t gate_inp_off;    /* F16/F32 [n_expert][n_embd] rows */
     uint64_t probs_bias_off;  /* F32 [n_expert], UINT64_MAX = absent */
     uint64_t gate_exps_off;
     uint64_t up_exps_off;
@@ -17021,6 +17026,9 @@ typedef struct {
     uint64_t down_expert_bytes;
     uint32_t n_embd;
     uint32_t n_expert;
+    uint64_t hash_off;        /* token-id hash routing LUT (I32 [k][n_vocab]); UINT64_MAX = score routing */
+    uint32_t hash_k;
+    uint32_t hash_rows;
 } ds4_metal_layer_router;
 
 static ds4_metal_layer_router g_layer_router[DS4_METAL_EXPERT_PROFILE_MAX_LAYERS];
@@ -17029,6 +17037,7 @@ int ds4_gpu_register_layer_router(
         const void *model_map,
         uint32_t layer,
         uint64_t gate_inp_offset,
+        int gate_inp_is_f32,
         uint64_t probs_bias_offset,
         uint64_t gate_exps_offset,
         uint64_t up_exps_offset,
@@ -17036,16 +17045,26 @@ int ds4_gpu_register_layer_router(
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes,
         uint32_t n_embd,
-        uint32_t n_expert) {
+        uint32_t n_expert,
+        uint64_t hash_table_offset,
+        uint32_t hash_k,
+        uint32_t hash_rows) {
     if (!model_map || layer >= DS4_METAL_EXPERT_PROFILE_MAX_LAYERS ||
         n_embd == 0 || n_embd > DS4_METAL_PF_MAX_EMBD ||
         n_expert == 0 || n_expert > DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS ||
         gate_expert_bytes == 0 || down_expert_bytes == 0) {
         return 0;
     }
+    if (hash_table_offset != UINT64_MAX && (hash_k == 0 || hash_k > 16u || hash_rows == 0)) {
+        return 0;
+    }
     ds4_metal_layer_router *r = &g_layer_router[layer];
     r->model_map = model_map;
     r->gate_inp_off = gate_inp_offset;
+    r->gate_inp_is_f32 = gate_inp_is_f32;
+    r->hash_off = hash_table_offset;
+    r->hash_k = hash_k;
+    r->hash_rows = hash_rows;
     r->probs_bias_off = probs_bias_offset;
     r->gate_exps_off = gate_exps_offset;
     r->up_exps_off = up_exps_offset;
@@ -17115,6 +17134,10 @@ static volatile int g_gather_active;           /* foreground gather/stream runni
  * the prefetch thread, read by the gather entry; stats-only, races benign. */
 static uint32_t g_pf_pred_gen[DS4_METAL_EXPERT_PROFILE_MAX_LAYERS];
 static uint32_t g_pf_pred_mark[DS4_METAL_EXPERT_PROFILE_MAX_LAYERS][DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS];
+/* Current decode token (router hook).  Hash-routed early layers' expert sets
+ * are an exact function of this id. */
+static volatile int g_pf_token = -1;
+static int g_pf_saw_nonhash = 1;
 
 static float ds4_gpu_pf_softplus(float v) {
     if (v > 20.0f) return v;
@@ -17183,7 +17206,8 @@ static int ds4_gpu_expert_range_mostly_cached(const void *model_map, uint64_t of
 
 /* Defined in the staging section below; predict_one dispatches to them. */
 static int ds4_gpu_expert_stage_enabled(void);
-static void ds4_gpu_expert_stage_arm(uint32_t layer, const int *top_idx, uint32_t n_top);
+static void ds4_gpu_expert_stage_arm(uint32_t layer, const int *top_idx, uint32_t n_top, int token);
+static void ds4_gpu_expert_stage_arm_if_new(uint32_t layer, const int *top_idx, uint32_t n_top, int token);
 
 /* Predict one layer, then either hand the predicted experts to the remote
  * staging pipeline (stage_this: pulled from the peer's SSD into RAM during
@@ -17194,25 +17218,77 @@ static int ds4_gpu_expert_prefetch_predict_one(uint32_t layer, const float *x, u
     if (layer >= DS4_METAL_EXPERT_PROFILE_MAX_LAYERS) return 1;
     const ds4_metal_layer_router *r = &g_layer_router[layer];
     if (!r->valid || g_model_fd < 0) return 1;
+    /* Token-id hash routing (early layers): the expert set is an exact
+     * function of the current token -- 100% "prediction" accuracy. */
+    if (r->hash_off != UINT64_MAX) {
+        const int tok = g_pf_token;
+        if (tok < 0 || (uint32_t)tok >= r->hash_rows) return 1;
+        const int32_t *row = (const int32_t *)((const uint8_t *)r->model_map + r->hash_off) +
+                             (size_t)tok * r->hash_k;
+        int hidx[16];
+        uint32_t m = 0;
+        for (uint32_t i = 0; i < r->hash_k && i < 16u; i++) {
+            if (row[i] >= 0 && (uint32_t)row[i] < r->n_expert) hidx[(int)m++] = row[i];
+        }
+        if (m == 0) return 1;
+        const uint32_t hgen = ++g_pf_pred_gen[layer];
+        for (uint32_t i = 0; i < m; i++) g_pf_pred_mark[layer][(uint32_t)hidx[i]] = hgen;
+        if (stage_this && ds4_gpu_expert_stage_enabled()) {
+            ds4_gpu_expert_stage_arm_if_new(layer, hidx, m, tok);
+            return 1;
+        }
+        const int hfd = g_model_fd;
+        for (uint32_t i = 0; i < m; i++) {
+            const uint64_t e = (uint64_t)hidx[i];
+            const uint64_t hsoff[3] = {
+                r->gate_exps_off + e * r->gate_expert_bytes,
+                r->up_exps_off + e * r->gate_expert_bytes,
+                r->down_exps_off + e * r->down_expert_bytes,
+            };
+            const uint64_t hslen[3] = { r->gate_expert_bytes, r->gate_expert_bytes,
+                                        r->down_expert_bytes };
+            for (uint32_t s = 0; s < 3u; s++) {
+                if (ds4_gpu_expert_range_mostly_cached(r->model_map, hsoff[s], hslen[s])) {
+                    g_pf_skip_cached++;
+                    continue;
+                }
+                if (!ds4_gpu_expert_prefetch_advise_paced(hfd, hsoff[s], hslen[s], my_seq)) {
+                    return 0;
+                }
+            }
+        }
+        return 1;
+    }
     const uint8_t *map = (const uint8_t *)r->model_map;
-    const __fp16 *w = (const __fp16 *)(map + r->gate_inp_off);
+    const __fp16 *w16 = (const __fp16 *)(map + r->gate_inp_off);
+    const float *w32 = (const float *)(map + r->gate_inp_off);
     const float *bias = r->probs_bias_off != UINT64_MAX ?
         (const float *)(map + r->probs_bias_off) : NULL;
     const uint32_t n_top = (uint32_t)ds4_gpu_expert_prefetch_top();
+    /* Opportunistic staging depth: the top-n_top experts saturate the link
+     * budget; a couple of extra candidates ride the idle tail of the window
+     * (fetched last, in score order) and convert some prediction misses. */
+    uint32_t n_top_total = n_top + (uint32_t)ds4_gpu_env_u64("DS4_METAL_EXPERT_STAGE_EXTRA", 2u);
+    if (n_top_total > DS4_METAL_PF_MAX_TOP) n_top_total = DS4_METAL_PF_MAX_TOP;
 
     /* score = sqrt(softplus(gate_inp . x)) + bias, matching the selection rule
      * in layer_topk_selected_experts (ranking only; weights don't matter). */
     int top_idx[DS4_METAL_PF_MAX_TOP];
     float top_score[DS4_METAL_PF_MAX_TOP];
-    for (uint32_t i = 0; i < n_top; i++) { top_idx[i] = -1; top_score[i] = -1e30f; }
+    for (uint32_t i = 0; i < n_top_total; i++) { top_idx[i] = -1; top_score[i] = -1e30f; }
     for (uint32_t e = 0; e < r->n_expert; e++) {
-        const __fp16 *row = w + (size_t)e * r->n_embd;
         float acc = 0.0f;
-        for (uint32_t d = 0; d < r->n_embd; d++) acc += (float)row[d] * x[d];
+        if (r->gate_inp_is_f32) {
+            const float *row = w32 + (size_t)e * r->n_embd;
+            for (uint32_t d = 0; d < r->n_embd; d++) acc += row[d] * x[d];
+        } else {
+            const __fp16 *row = w16 + (size_t)e * r->n_embd;
+            for (uint32_t d = 0; d < r->n_embd; d++) acc += (float)row[d] * x[d];
+        }
         float s = sqrtf(ds4_gpu_pf_softplus(acc));
         if (bias) s += bias[e];
-        if (s <= top_score[n_top - 1u]) continue;
-        uint32_t j = n_top - 1u;
+        if (s <= top_score[n_top_total - 1u]) continue;
+        uint32_t j = n_top_total - 1u;
         while (j > 0u && s > top_score[j - 1u]) {
             top_score[j] = top_score[j - 1u];
             top_idx[j] = top_idx[j - 1u];
@@ -17222,17 +17298,16 @@ static int ds4_gpu_expert_prefetch_predict_one(uint32_t layer, const float *x, u
         top_idx[j] = (int)e;
     }
 
-    /* Mark the full predicted set first (prediction-accuracy accounting must
-     * not depend on how much read-ahead the idle window allowed), then advise
-     * in descending score order so the most likely experts go first; abort
-     * mid-way once a newer prediction lands. */
+    /* Mark the headline predicted set first (prediction-accuracy accounting
+     * stays comparable across TOP settings), then stage/advise in descending
+     * score order; abort mid-way once a newer prediction lands. */
     const uint32_t gen = ++g_pf_pred_gen[layer];
     for (uint32_t i = 0; i < n_top; i++) {
         if (top_idx[i] < 0) break;
         g_pf_pred_mark[layer][(uint32_t)top_idx[i]] = gen;
     }
     if (stage_this && ds4_gpu_expert_stage_enabled()) {
-        ds4_gpu_expert_stage_arm(layer, top_idx, n_top);
+        ds4_gpu_expert_stage_arm(layer, top_idx, n_top_total, g_pf_token);
         return 1;   /* fetch threads stage from the peer; no local advisories */
     }
     const int fd = g_model_fd;   /* read-ahead must hit the page cache, never the F_NOCACHE fd */
@@ -17362,6 +17437,7 @@ typedef struct {
     volatile uint32_t gen;                 /* bumped on (re)arm; 0 = never armed */
     volatile uint32_t busy;                /* fetchers inside this slot (re-arm gate) */
     uint32_t layer;
+    int token;                             /* decode token this arm belongs to */
     uint32_t n;
     volatile uint32_t next;                /* atomic claim index for fetch threads */
     uint32_t ids[DS4_METAL_STAGE_MAX_EXPERTS];
@@ -17374,7 +17450,9 @@ typedef struct {
 } ds4_metal_stage_slot;
 
 static ds4_metal_stage_slot g_stage[2];
+static volatile int g_stage_recent;   /* parity of the most recently armed slot */
 static uint64_t g_stage_hit_bytes_total, g_stage_armed, g_stage_fetched, g_stage_dropped;
+static uint64_t g_stage_slots_total;  /* sum of armed expert counts (completion denominator) */
 
 static int ds4_gpu_expert_stage_enabled(void) {
     static int cached = -1;
@@ -17389,13 +17467,19 @@ static int ds4_gpu_expert_stage_enabled(void) {
     return cached;
 }
 
-/* Arm a staging slot for a freshly predicted layer (prediction thread only). */
+/* Arm a staging slot for a freshly predicted layer.  Callable from the
+ * prediction thread (score routing) and the graph thread (token-hash routing
+ * hook), so the whole re-arm is serialized by a mutex. */
+static pthread_mutex_t g_stage_arm_mu = PTHREAD_MUTEX_INITIALIZER;
+
 static void ds4_gpu_expert_stage_arm(uint32_t layer,
                                      const int *top_idx,
-                                     uint32_t n_top) {
+                                     uint32_t n_top,
+                                     int token) {
     if (layer >= DS4_METAL_EXPERT_PROFILE_MAX_LAYERS) return;
     const ds4_metal_layer_router *r = &g_layer_router[layer];
     if (!r->valid) return;
+    pthread_mutex_lock(&g_stage_arm_mu);
     ds4_metal_stage_slot *s = &g_stage[layer & 1u];
     const uint64_t stride = 2u * r->gate_expert_bytes + r->down_expert_bytes;
     const size_t need = (size_t)stride * DS4_METAL_STAGE_MAX_EXPERTS;
@@ -17403,16 +17487,20 @@ static void ds4_gpu_expert_stage_arm(uint32_t layer,
         free(s->buf);
         s->buf = (uint8_t *)malloc(need);
         s->buf_cap = s->buf ? need : 0;
-        if (!s->buf) return;
+        if (!s->buf) {
+            pthread_mutex_unlock(&g_stage_arm_mu);
+            return;
+        }
     }
     s->gen++;                       /* invalidates all ready flags */
     __sync_synchronize();
     /* Wait out fetchers still writing this slot's buffer under the old gen:
      * a new-gen fetcher must never interleave writes with an in-flight recv
-     * draining into the same region.  Runs on the prediction thread, off the
-     * critical path; in-flight units finish in ~2ms. */
+     * draining into the same region.  Off the gather critical path;
+     * in-flight units finish in ~2ms. */
     while (s->busy) usleep(50);
     s->layer = layer;
+    s->token = token;
     s->gate_off = r->gate_exps_off;
     s->up_off = r->up_exps_off;
     s->down_off = r->down_exps_off;
@@ -17429,7 +17517,9 @@ static void ds4_gpu_expert_stage_arm(uint32_t layer,
     s->n = m;
     __sync_synchronize();
     s->next = 0;
+    g_stage_recent = (int)(layer & 1u);
     g_stage_armed++;
+    g_stage_slots_total += m;
     /* Wake the remote fetch threads parked on the shared condvar. */
     pthread_mutex_lock(&g_rf_mu);
     pthread_cond_broadcast(&g_rf_cv);
@@ -17442,8 +17532,58 @@ static void ds4_gpu_expert_stage_arm(uint32_t layer,
                 (unsigned long long)g_stage_fetched,
                 (unsigned long long)g_stage_dropped,
                 (double)g_stage_hit_bytes_total / 1073741824.0,
-                g_stage_armed ? 100.0 * (double)g_stage_fetched /
-                    ((double)g_stage_armed * ds4_gpu_expert_prefetch_top()) : 0.0);
+                g_stage_slots_total ? 100.0 * (double)g_stage_fetched /
+                    (double)g_stage_slots_total : 0.0);
+    }
+    pthread_mutex_unlock(&g_stage_arm_mu);
+}
+
+/* Skip the re-arm when the slot already holds this (layer, token): the
+ * token-hash hook and the prediction chain may both try to arm hash layers. */
+static void ds4_gpu_expert_stage_arm_if_new(uint32_t layer,
+                                            const int *top_idx,
+                                            uint32_t n_top,
+                                            int token) {
+    if (layer >= DS4_METAL_EXPERT_PROFILE_MAX_LAYERS) return;
+    const ds4_metal_stage_slot *s = &g_stage[layer & 1u];
+    if (s->gen != 0 && s->layer == layer && s->token == token) return;
+    ds4_gpu_expert_stage_arm(layer, top_idx, n_top, token);
+}
+
+/* Graph-thread hook from ds4_gpu_router_select_tensor: the first hash-mode
+ * router select of each decode forward reveals the token id, which exactly
+ * determines the hash-routed layers' experts.  Arm exact staging for the
+ * earliest hash layer of each slot parity; the prediction chain (also exact
+ * for hash layers) covers the rest. */
+static void ds4_gpu_expert_router_note(int token, int hash_mode) {
+    if (!hash_mode) {
+        g_pf_saw_nonhash = 1;
+        return;
+    }
+    if (!g_pf_saw_nonhash) {
+        g_pf_token = token;
+        return;   /* later hash layer of the same forward */
+    }
+    g_pf_saw_nonhash = 0;
+    g_pf_token = token;
+    if (!ds4_gpu_expert_stage_enabled()) return;
+    int armed_parity[2] = { 0, 0 };
+    for (uint32_t l = 0; l < 8u && l < DS4_METAL_EXPERT_PROFILE_MAX_LAYERS; l++) {
+        const ds4_metal_layer_router *r = &g_layer_router[l];
+        if (!r->valid || r->hash_off == UINT64_MAX) continue;
+        const int p = (int)(l & 1u);
+        if (armed_parity[p]) continue;
+        armed_parity[p] = 1;
+        if (token < 0 || (uint32_t)token >= r->hash_rows) continue;
+        const int32_t *row = (const int32_t *)((const uint8_t *)r->model_map + r->hash_off) +
+                             (size_t)token * r->hash_k;
+        int hidx[16];
+        uint32_t m = 0;
+        for (uint32_t i = 0; i < r->hash_k && i < 16u; i++) {
+            if (row[i] >= 0 && (uint32_t)row[i] < r->n_expert) hidx[m++] = row[i];
+        }
+        if (m) ds4_gpu_expert_stage_arm_if_new(l, hidx, m, token);
+        if (armed_parity[0] && armed_parity[1]) break;
     }
 }
 
@@ -17833,9 +17973,12 @@ static void *ds4_gpu_expert_remote_fetch_worker(void *arg) {
         if (!ctx) {
             /* Staging work: pull the predicted next-layer experts from the
              * peer into the RAM slots (runs during the current layer's local
-             * gather + GPU window; no layer-tail constraint). */
-            for (int k = 0; k < 2; k++) {
-                ds4_metal_stage_slot *s = &g_stage[k];
+             * gather + GPU window; no layer-tail constraint).  Most recently
+             * armed slot first: its deadline is closest and link time spent
+             * on the stale parity is wasted. */
+            const int first = g_stage_recent & 1;
+            for (int pass = 0; pass < 2; pass++) {
+                ds4_metal_stage_slot *s = &g_stage[(first + pass) & 1];
                 while (s->gen != 0 && ds4_gpu_expert_stage_fetch_one(s, slot)) {}
             }
             continue;
@@ -18088,13 +18231,20 @@ static int ds4_gpu_load_layer_experts_to_scratch(
     if (use_pread && pread_fd < 0) use_pread = 0;
     const uint32_t gather_threads = ds4_gpu_expert_gather_threads();
     const uint32_t total_units = n_active * 3u;
-    /* Cursor racing only pays on big prefill batches (hundreds of units).
-     * Decode layers (18 units, ~10ms) are served by the prediction-driven
-     * staging instead: 8 local threads claim the small cursor instantly and
-     * a ~2ms remote round trip would only sit on the layer tail. */
+    /* Cursor racing pays on big prefill batches (hundreds of units) and on
+     * decode layers the staging could not cover (unregistered routers, layer
+     * 0 without a predecessor): their gather window leaves the link idle
+     * anyway, and the tail guard keeps remote off the layer's critical end.
+     * Staged decode layers skip racing: 8 local threads claim the 18-unit
+     * cursor instantly and a ~2ms remote round trip only adds tail. */
+    const int layer_is_staged =
+        ds4_gpu_expert_stage_enabled() &&
+        layer_index < DS4_METAL_EXPERT_PROFILE_MAX_LAYERS &&
+        g_stage[layer_index & 1u].gen != 0 &&
+        g_stage[layer_index & 1u].layer == layer_index;
     const int remote_on =
         ds4_gpu_expert_remote_fetch_slots() > 0 && !g_rf_link_down &&
-        (total_units >= 96u || !ds4_gpu_expert_stage_enabled());
+        (total_units >= 96u || !ds4_gpu_expert_stage_enabled() || !layer_is_staged);
     g_gather_active = 1;   /* prefetch read-ahead yields while we own the SSD */
 
     ds4_metal_expert_gather_ctx ctx = {

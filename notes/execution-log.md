@@ -1849,3 +1849,88 @@ cold ≤12, wall ≤6.5; ③ A/B EXPERT_PREFETCH_TOP=8/10/12; ④ 输出 temp=0 
 **Validation performed here.** `make` 零新告警; `ds4_test --metal-kernels` 双跑 OK; `bash -n` OK。
 未跑大模型。用户脚本验证: ① coord hit_mib ≥30 / cold ≤10 / wall ≤6.5; ② ds4-stage completion
 仍 ≥95; ③ A/B: STAGE_WAIT_US=0/2500/5000, TOP=8/9; ④ 输出 temp=0 逐字一致; ⑤ RSS 红线。
+
+## 2026-06-10 — 第十二波: F32 router 注册 + 槽优先级 + 机会性加深 (2.00 t/s 之后)
+
+**Context.** 第十一波实测 **2.00 t/s** (M0 的 2.5×)。账表: coord cold=15.9 hit=24.6 (61%)
+wall=8.13 drain=4.33 → 半程 249ms; worker wall=5.38 drain=5.42 → 半程 248ms ——
+**两半已完美平衡, 层重平衡失效**。coord 剩余 cold 的构成:
+- **~8MiB 来自"从不被预测的层"**: 注册行显示 17/20 (3 层 router 是 F32 被 F16-only 条件跳过)
+  + 层 0 无前驱;
+- ~8MiB 来自预测 miss (pf 79.6%)。
+worker 侧: 本地有效带宽 7.5GB/s (页缓存+快盘), 任何远程源都打不过 ⇒ **worker 对称 staging
+判负不做** (coord 盘 2.5GB/s 慢于 worker 本地路径)。
+
+**Patch.**
+- **F32 router 支持**: `ds4_gpu_register_layer_router` 加 `gate_inp_is_f32` 参数
+  (ds4_gpu.h/ds4.c/ds4_metal.m/ds4_cuda.cu 桩); 预测 matvec 按类型分支
+  ⇒ coord 应注册 20/20, 那 3 层进入 staging (−~8MiB cold)。
+- **fetcher 槽优先级**: `g_stage_recent` 记录最新 arm 的奇偶; fetch 线程先 drain 最新槽
+  (旧奇偶的迟到工作不再抢链路)。
+- **机会性加深** `DS4_METAL_EXPERT_STAGE_EXTRA` (默认 2): 预测取 top-(TOP+2), arm 全集但
+  分数序保证 top-8 先取; 额外 2 个只吃窗口空闲尾巴, 不占链路预算; pf 标记仍只记 TOP 集合
+  (口径可比)。
+**算账.** cold 15.9 → ~8-10MiB ⇒ wall ~5.5-6.5ms ⇒ coord 半程 ~200-215ms ⇒ token ~460ms
+⇒ **方向 ~2.15-2.2 t/s**。此后 coord/worker 的 drain (~4.3/5.4ms GPU 真实计算) 成为最大单项,
+单 token 路线接近物理地板; 下一波转向**多 token** (PC.1 复制投机离线回放, 快赢 5)。
+
+**Validation performed here.** `make` 零新告警; `ds4_test --metal-kernels` 双跑 OK; `bash -n` OK。
+未跑大模型。用户脚本验证: ① 启动行应为 `registered 20 local routed layers` (coord) /
+`23` (worker, 若其层也含 F32 router 则同步上升); ② coord cold ≤10 / wall ≤6.5;
+③ ds4-stage completion 仍 ≥95; ④ A/B: DS4_METAL_EXPERT_STAGE_EXTRA=0/2/4;
+⑤ 输出 temp=0 逐字一致; ⑥ RSS 红线。
+
+## 2026-06-10 — 第十三波: 注册诊断 + 未暂存层 racing 兜底 + 统计口径修复 (1.97 t/s)
+
+**Context.** 第十二波实测 1.97 (持平噪声内): **registered 仍是 17** —— 那 3 层不是 F32 问题,
+被其他条件挡住 (待诊断); completion 120% 是分母没算 STAGE_EXTRA 的口径 bug;
+cold/hit/wall 16.4/24.1/8.65 基本不变。
+
+**Patch.**
+- **注册诊断**: `engine_register_layer_routers` 对有 routed MoE 但被跳过的层打一行原因
+  (missing tensors / no gate_inp / gate_inp quantized / compact-slot / expert count,
+  含 type 与 n_exp 数值) —— 下轮日志直接给真因。
+- **未暂存层 racing 兜底**: gather 入口检查本层 staging 是否就位 (`g_stage[parity]` armed 且
+  layer 匹配); 未暂存的 decode 层 (未注册 router 的 3 层 + 层 0) 重新启用层内抢单 ——
+  这些层 gather 时链路本来空闲, 尾部禁抢仍然有效。staged 层保持关闭 (避免 18 单元被秒抢+尾巴)。
+- completion 分母改 g_stage_slots_total (armed 专家数累计)。
+
+**Validation performed here.** `make` 零新告警; `ds4_test --metal-kernels` 双跑 OK; `bash -n` OK。
+用户脚本验证: ① 看新的 `layer N router not registered (...)` 行 —— 把真因发回来;
+② 未暂存层的 ds4-io 行应重新出现 rfetch_mib>0, 它们的 wall 应从 ~13 降到 ~9;
+③ completion 显示应回 ≤100% 正常区间; ④ 输出 temp=0 逐字一致。
+
+**战略备忘.** 单 token 路线地板临近 (~2.2-2.3): coord/worker drain (GPU 真实计算) 合计
+~200ms/token 已是最大单项。**建议顺手做一轮零代码 A/B: `NO_MTP=0 DRAFT=2`** —— 历史 MTP
+负收益的两个根因 (A3 验证批放大专家拷贝 / drafter 抢 worker GPU) 中, 前者已被 staging+pread
+大幅缓解 (批验证的专家并集去重 + 字节供给 2.5×), 值得重测。下一波若速度平台化,
+转 PC.1 复制式投机 (多 token 路线, project.md §3.5)。
+
+## 2026-06-10 — 第十四波: 哈希路由层精确暂存 (registered 17 真因落地)
+
+**Context.** 第十三波诊断行揭晓: 层 0-2 未注册的真因是 **token-id 哈希路由**
+(`ffn_gate_tid2eid` I32 [6][n_vocab]): CPU 参考路径 `layer_hash_selected_experts` 证实
+这些层的 6 个专家 = `table[token*6..]` —— **专家选择是 token id 的纯函数, 100% 精确可知**,
+根本不需要预测。这 3 层 (~6MiB/层均摊 cold) 是 coord 剩余冷字节的最大孤儿。
+另: 用户的 MTP A/B (NO_MTP=0) 进程被看门狗杀 (MTP 模型加载推高 worker RSS), 暂不追 —— 多
+token 路线优先级仍是 PC.1。
+
+**Patch.**
+- 注册 API 加 `hash_table_offset/hash_k/hash_rows` (ds4_gpu.h / ds4.c / ds4_cuda.cu 桩);
+  ds4.c 对 tid2eid 为 I32 [6][vocab] 的层照常注册 (带哈希表), 非该布局才跳过。
+- `predict_one` 哈希分支: 查 LUT 得精确 6 专家 → 标记 (pf 将上升) → staging arm 或 advisories;
+  无需 matvec。
+- **token 钩子**: `ds4_gpu_router_select_tensor` (decode 单 token 路由, 已带 token/hash_mode
+  参数) 顶端调 `ds4_gpu_expert_router_note`: 每个 forward 的第一个 hash-mode select 记录
+  token 并对每个槽奇偶 arm 最早的哈希层 (层 0 奇偶 0 + 层 1 奇偶 1); 层 2 由预测链
+  (同样精确) 覆盖。重复 token 用 saw_nonhash 标志判 forward 边界, 不靠 token 值变化。
+- **arm 并发化**: arm 现在可从图线程 (哈希钩子) 与预测线程并发调用 → 整个重 arm 套
+  `g_stage_arm_mu`; 槽加 token 字段, `arm_if_new` 同 (layer,token) 跳过 (钩子与链双保险不打架)。
+
+**算账.** 层 0-2 staged 命中 → ~100% (精确): coord cold 16.4 → ~9-10MiB ⇒ wall ~6ms ⇒
+coord 半程 ~200ms ⇒ **方向 ~2.1 t/s**; pf= 字段应明显上升 (哈希层全中)。
+
+**Validation performed here.** `make` 零新告警; `ds4_test --metal-kernels` 双跑 OK; `bash -n` OK。
+未跑大模型。用户脚本验证: ① 启动行应为 **registered 20** (coord) 且无 not-registered 行;
+② 层 0/1/2 的 ds4-io 行: hit_mib 应从 0 跳到 ~40 (精确暂存), wall 大降; ③ pf= 上升;
+④ 输出 temp=0 逐字一致; ⑤ RSS 红线。

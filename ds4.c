@@ -19238,16 +19238,42 @@ static void engine_register_layer_routers(ds4_engine *e, uint32_t start, uint32_
     uint32_t registered = 0;
     for (uint32_t il = start; il <= end && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &e->weights.layer[il];
-        if (!l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps ||
-            !l->ffn_gate_inp || l->ffn_gate_inp->type != DS4_TENSOR_F16 ||
-            l->ffn_gate_tid2eid) {
-            continue;
+        if (!l->ffn_gate_exps) continue;   /* no routed MoE on this layer */
+        const char *why = NULL;
+        uint64_t hash_off = UINT64_MAX;
+        uint32_t hash_k = 0, hash_rows = 0;
+        if (!l->ffn_up_exps || !l->ffn_down_exps) why = "missing expert tensors";
+        else if (!l->ffn_gate_inp) why = "no gate_inp";
+        else if (l->ffn_gate_inp->type != DS4_TENSOR_F16 &&
+                 l->ffn_gate_inp->type != DS4_TENSOR_F32) why = "gate_inp quantized";
+        else if (l->ffn_gate_tid2eid) {
+            /* Early layers hash-route by token id (tid2eid I32 [k][n_vocab]):
+             * exact prediction, register the table. */
+            const ds4_tensor *t = l->ffn_gate_tid2eid;
+            if (t->type == DS4_TENSOR_I32 && t->ndim == 2 &&
+                t->dim[0] == DS4_N_EXPERT_USED && t->dim[1] > 0) {
+                hash_off = t->abs_offset;
+                hash_k = (uint32_t)t->dim[0];
+                hash_rows = (uint32_t)t->dim[1];
+            } else {
+                why = "unrecognized tid2eid layout";
+            }
         }
         const uint64_t n_exp = l->ffn_gate_exps->dim[2];
-        if (n_exp == 0 || n_exp != DS4_N_EXPERT) continue;
+        if (!why && (n_exp == 0 || n_exp != DS4_N_EXPERT)) why = "expert count";
+        if (why) {
+            fprintf(stderr,
+                    "ds4: layer %u router not registered for prefetch (%s; gate_inp type=%u, "
+                    "n_exp=%llu)\n",
+                    il, why,
+                    l->ffn_gate_inp ? l->ffn_gate_inp->type : 9999u,
+                    (unsigned long long)n_exp);
+            continue;
+        }
         if (ds4_gpu_register_layer_router(e->model.map,
                                           il,
                                           l->ffn_gate_inp->abs_offset,
+                                          l->ffn_gate_inp->type == DS4_TENSOR_F32,
                                           l->ffn_exp_probs_b ? l->ffn_exp_probs_b->abs_offset
                                                              : UINT64_MAX,
                                           l->ffn_gate_exps->abs_offset,
@@ -19256,7 +19282,10 @@ static void engine_register_layer_routers(ds4_engine *e, uint32_t start, uint32_
                                           l->ffn_gate_exps->bytes / n_exp,
                                           l->ffn_down_exps->bytes / n_exp,
                                           (uint32_t)l->ffn_gate_inp->dim[0],
-                                          (uint32_t)n_exp)) {
+                                          (uint32_t)n_exp,
+                                          hash_off,
+                                          hash_k,
+                                          hash_rows)) {
             registered++;
         }
     }

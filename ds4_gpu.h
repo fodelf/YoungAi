@@ -65,7 +65,11 @@ int ds4_gpu_set_model_map_spans_split(const void *model_map, uint64_t model_size
  * the F16 [n_embd][n_expert] router matrix; probs_bias_offset is UINT64_MAX
  * when the model has no exp_probs_b bias.  Purely advisory: wrong predictions
  * waste read bandwidth but can never change inference results. */
-int ds4_gpu_register_layer_router(const void *model_map, uint32_t layer, uint64_t gate_inp_offset, uint64_t probs_bias_offset, uint64_t gate_exps_offset, uint64_t up_exps_offset, uint64_t down_exps_offset, uint64_t gate_expert_bytes, uint64_t down_expert_bytes, uint32_t n_embd, uint32_t n_expert);
+/* hash_table_offset/k/rows describe the early layers' token-id hash routing
+ * (ffn_gate_tid2eid I32 [k][n_vocab]): their expert set is an exact function
+ * of the token id, so the backend can stage them with 100% accuracy as soon
+ * as the token is known.  hash_table_offset == UINT64_MAX for score routing. */
+int ds4_gpu_register_layer_router(const void *model_map, uint32_t layer, uint64_t gate_inp_offset, int gate_inp_is_f32, uint64_t probs_bias_offset, uint64_t gate_exps_offset, uint64_t up_exps_offset, uint64_t down_exps_offset, uint64_t gate_expert_bytes, uint64_t down_expert_bytes, uint32_t n_embd, uint32_t n_expert, uint64_t hash_table_offset, uint32_t hash_k, uint32_t hash_rows);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes);

@@ -1574,14 +1574,18 @@ extern "C" int ds4_gpu_set_model_map_spans_split(
  * read-ahead for SSD-streamed experts); the CUDA backend accepts and ignores
  * the registration so shared engine code links unchanged. */
 extern "C" int ds4_gpu_register_layer_router(const void *model_map, uint32_t layer,
-                                             uint64_t gate_inp_offset, uint64_t probs_bias_offset,
+                                             uint64_t gate_inp_offset, int gate_inp_is_f32,
+                                             uint64_t probs_bias_offset,
                                              uint64_t gate_exps_offset, uint64_t up_exps_offset,
                                              uint64_t down_exps_offset, uint64_t gate_expert_bytes,
                                              uint64_t down_expert_bytes, uint32_t n_embd,
-                                             uint32_t n_expert) {
-    (void)model_map; (void)layer; (void)gate_inp_offset; (void)probs_bias_offset;
+                                             uint32_t n_expert, uint64_t hash_table_offset,
+                                             uint32_t hash_k, uint32_t hash_rows) {
+    (void)model_map; (void)layer; (void)gate_inp_offset; (void)gate_inp_is_f32;
+    (void)probs_bias_offset;
     (void)gate_exps_offset; (void)up_exps_offset; (void)down_exps_offset;
     (void)gate_expert_bytes; (void)down_expert_bytes; (void)n_embd; (void)n_expert;
+    (void)hash_table_offset; (void)hash_k; (void)hash_rows;
     return 1;
 }
 
