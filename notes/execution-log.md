@@ -1800,3 +1800,52 @@ coord 半程 20×(4.5+3.9)≈168ms ⇒ token ~400ms ⇒ **方向 ~2.3-2.5 t/s**�
 ② coord ds4-io: **hit_mib 应首次显著非零 (期望 25-33MiB/层)**, cold_mib 降至 ~8-15, wall ≤6ms;
 ③ A/B: EXPERT_STAGE=0 (回第八波) / EXPERT_PREFETCH_TOP=10 (staging 容量充足, 多预测提覆盖);
 ④ worker 不回退; ⑤ 输出 temp=0 逐字一致; ⑥ coordinator RSS +220MiB 仍须 <12G。
+
+## 2026-06-10 — 第十波: 暂存取数段内流水 + 重 arm 竞态修复 (1.99 t/s 之后)
+
+**Context.** 第九波 staging 实测 **1.99 t/s** (历史新高): coord hit=21.8MiB/层 (54% 字节走 RAM),
+cold 18.7, wall 8.91; worker 4.82/4.65 不受影响。差距分析: **预测精度 79.6% vs 暂存命中 54%**
+—— 缺口在取数完成度: `stage_fetch_one` 三段串行 (~4-6ms/专家), 8 专家÷6 连接 ≈ 8-12ms,
+勉强塞进 ~13ms 窗口, 抖动即部分完成。另发现一个真实竞态: 槽重 arm 后新代 fetcher 可能与
+在途 recv 写同一缓冲区域。
+
+**Patch.**
+- `stage_fetch_one` **段内流水**: 三段 send 全发再按序 recv (~2.5ms/专家);
+  全段本地缓存命中或链路断时纯本地 pread。
+- **重 arm 竞态修复**: 槽加 `busy` 计数 (fetcher 进出原子增减); `stage_arm` 在 gen++ 后
+  自旋等 busy==0 才重初始化 —— 在途 recv 即使被超越也安全落盘 (响应流保持对齐),
+  新代 fetcher 绝不与旧 recv 交错写。arm 在预测线程上, 不在关键路径。
+- **可观测**: 每 64 次 arm 打 `ds4-stage: armed/fetched/dropped/hit_gib/completion%`。
+- 脚本 `EXPERT_PREFETCH_TOP` 8→10 (流水后窗口富余, 多预测 2 个对冲误差; worker advisories
+  流量 +25%, 其盘有余量; A/B 回 8)。
+
+**算账.** 取数完成度 → ~100%, 暂存命中 54% → ~pf (80%+, TOP=10 或可 ~85%):
+coord cold 18.7 → ~8-10MiB ⇒ wall ~5-6ms ⇒ coord 半程 ~190-200ms ⇒ token ~420ms ⇒
+**方向 ~2.3-2.4 t/s**。
+
+**Validation performed here.** `make` 零新告警; `ds4_test --metal-kernels` (基线+全开) 通过;
+`bash -n` 通过。未跑大模型。
+用户脚本验证: ① `ds4-stage:` 行 completion% (期望 ≥90); ② coord ds4-io hit_mib 期望 ≥28,
+cold ≤12, wall ≤6.5; ③ A/B EXPERT_PREFETCH_TOP=8/10/12; ④ 输出 temp=0 逐字一致;
+⑤ coordinator RSS (<12G, 暂存 ~220MiB 不变)。
+
+## 2026-06-10 — 第十一波: TOP 回 8 (链路预算) + 暂存在途等待 (1.94 t/s 回退修复)
+
+**Context.** 第十波实测 1.99→1.94: completion 97%、pf 升至 83.8% (TOP=10 有效), **但 hit 反降
+21.8→18.6、wall 反升 8.91→10.11** —— 指标分家的原因是**链路字节预算超额**: 层周期 ~14ms ×
+4.5GB/s ≈ 63MiB; TOP=10 需 69MiB > 预算 ⇒ 槽完成时间晚于 gather 开始, completion 里一截是
+"迟到的完成" (统计完成但没用上)。TOP=8 (55MiB) 在预算内。
+
+**Patch.**
+- 脚本 `EXPERT_PREFETCH_TOP` 默认回 **8** (预算内), 注释记录预算公式。
+- **在途等待** (`DS4_METAL_EXPERT_STAGE_WAIT_US`, 默认 2500, 0=关): `copy_unit` 碰到
+  "已预测 (在 armed 集合) 但未就绪"的专家时, 以 100µs 步进等 ≤2.5ms 再查暂存——流水化后
+  在途专家 ~2.5ms 内必到, 等 RAM 字节优于立刻吃 2.7ms+ 的本地冷读且不占慢盘带宽;
+  超时仍走原本地路径, 正确性不变。新增 `ds4_gpu_expert_stage_pending` (armed 集合查询)。
+
+**算账.** 迟到完成 → 短等待 + 命中: hit 46% → ~pf (80%+), cold → ~8MiB ⇒ wall ~5-6ms
+⇒ **方向 ~2.2-2.3 t/s**。
+
+**Validation performed here.** `make` 零新告警; `ds4_test --metal-kernels` 双跑 OK; `bash -n` OK。
+未跑大模型。用户脚本验证: ① coord hit_mib ≥30 / cold ≤10 / wall ≤6.5; ② ds4-stage completion
+仍 ≥95; ③ A/B: STAGE_WAIT_US=0/2500/5000, TOP=8/9; ④ 输出 temp=0 逐字一致; ⑤ RSS 红线。

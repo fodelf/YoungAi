@@ -94,6 +94,9 @@ EXPERT_IO_PROFILE=${EXPERT_IO_PROFILE:-1}
 # coordinator (慢盘 2.5GB/s) 的空闲窗 (~drain 3.7ms≈9MiB) 单层吃不满 40MiB, D=2 给每层预测
 # 双倍窗口。P0.3 实测: mini 盘随机/顺序都顶 ~2.4-2.6GB/s; MacBook 盘 5.5-6.5GB/s (见 ssd_bench)。
 EXPERT_PREFETCH=${EXPERT_PREFETCH:-1}
+# TOP=8: 链路字节预算 = 层周期 ~14ms × 4.5GB/s ≈ 63MiB; TOP=10 (69MiB) 实测超额 ⇒ 取数
+# 迟到、命中反降 (1.99→1.94)。TOP=8 (55MiB) 在预算内; 迟到的少数由 STAGE_WAIT_US 在途等待
+# (≤2.5ms) 转成命中。
 EXPERT_PREFETCH_TOP=${EXPERT_PREFETCH_TOP:-8}
 # DEPTH=2 实测回退 (1.71→1.66: 远层预测的算力/字节挤占了本就饱和的空闲窗) —— 默认回 1。
 EXPERT_PREFETCH_DEPTH=${EXPERT_PREFETCH_DEPTH:-1}
