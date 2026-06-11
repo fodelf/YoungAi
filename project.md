@@ -51,7 +51,8 @@
 | 第二十一—二十五波（code-edit 档攻坚） | **code-edit 1.95（二十五波新高）**；smoke 2.09（二十四波新高）/2.02 | — | mm_id GEMM 修 GPU 侧（批 drain 69→38ms）；NOCACHE 判决=prefill 冷读赢/verify 批输 → 收窄 ≥24 token；**backbone mlock 4.08GiB 根治 r1 驱逐爬升（548→2361ms 消失，稳 578-874）**；账面闭合：97tok≈Σr1(14.2s)+Σr2(35.7s)，r2=73% 是唯一大头 |
 | **第二十六波实测** | **code-edit 2.24（新高）/ smoke 2.09** | 7.33 | DRAFT 16 即刻生效（4 轮 16/16 全中）；反向 efetch 因 TB 桥启动期 ARP 瞬态未起（首连失败被永久缓存） |
 | 第二十七波（**未被真正测到**） | 报 2.23=wave26 复测 | — | 用户开跑时编辑只落了一半（脚本 DRAFT=32 未落 → K 被钳 16）；时间线复盘见 log 第二十八波 |
-| 第二十八波（待实测） | 目标 code-edit ≥2.5 | — | K=32 全链完整在树 + efetch 重试 8→150 次（2s×5min 延伸进 decode 静默期，prefill 风暴里 ARP 饿死是上波失败根因）|
+| **第二十八波实测** | **code-edit 2.30 / smoke 2.13（双新高）** | 7.60 | 但 K=32 仍未生效（漏改 eval 体内第二处 `K>16` 钳位，两波白测）；反向 efetch 31 连败——decode 期 staging 也把 TB 打满，ARP 全程饿死 |
+| 第二十九波（待实测） | 目标 code-edit ≥2.5 | — | 真凶钳位一行修复（K=32 链路终于闭合）+ worker accept 后静默窗主动拨号（唯一可靠安静的几秒）+ slots() trylock 并发安全 |
 | M1 单拷贝直读 + prefill 流式 | **≥1.6** | **≥10** | P1.1/P1.2 |
 | M2 预测预取流水 + 命中零拷贝 + repack | **≥3** | **≥25** | P1.3/P1.4/P2.1 |
 | M3 expert-parallel 双 SSD 并行 | **≥5** | ≥30 | P2.2 |

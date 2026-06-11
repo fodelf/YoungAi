@@ -18307,6 +18307,8 @@ static void *ds4_gpu_expert_remote_fetch_worker(void *arg) {
  * whole run; wave-27's 8x2s retries all landed inside the ~150s code-edit
  * prefill storm and still died.  Retry every 2s for up to 150 attempts
  * (~5min) so attempts reach the decode phase where the link is idle. */
+static pthread_mutex_t g_rf_init_mu = PTHREAD_MUTEX_INITIALIZER;
+
 static int ds4_gpu_expert_remote_fetch_slots(void) {
     static int cached;           /* live fetch worker threads */
     static int attempts;
@@ -18314,9 +18316,19 @@ static int ds4_gpu_expert_remote_fetch_slots(void) {
     if (cached > 0) return cached;
     const char *host = getenv("DS4_DIST_EXPERT_FETCH_HOST");
     if (!host || !host[0]) return 0;
-    if (attempts >= 150) return 0;
+    /* Wave 29: also dialed from the quiet-window kick thread; serialize with
+     * the gather path (a contended caller just reports "not yet"). */
+    if (pthread_mutex_trylock(&g_rf_init_mu) != 0) return 0;
+    if (cached > 0 || attempts >= 150) {
+        const int n = cached;
+        pthread_mutex_unlock(&g_rf_init_mu);
+        return n;
+    }
     const double now = ds4_gpu_now_ms();
-    if (attempts > 0 && now < retry_after_ms) return 0;
+    if (attempts > 0 && now < retry_after_ms) {
+        pthread_mutex_unlock(&g_rf_init_mu);
+        return 0;
+    }
     attempts++;
     retry_after_ms = now + 2000.0;
     const int port = (int)ds4_gpu_env_u64("DS4_DIST_EXPERT_FETCH_PORT", 5606u);
@@ -18336,15 +18348,41 @@ static int ds4_gpu_expert_remote_fetch_slots(void) {
                 "ds4: expert gather pulls from peer SSD via %d remote fetch thread(s)%s "
                 "(attempt %d)\n",
                 cached, attempts > 1 ? " after retry" : "", attempts);
+    } else if (attempts >= 150) {
+        fprintf(stderr,
+                "ds4: expert-fetch disabled after 150 failed connect attempts\n");
     } else if (attempts == 1 || attempts % 16 == 0) {
         fprintf(stderr,
                 "ds4: expert-fetch connect attempt %d/150 failed; retrying every 2s\n",
                 attempts);
-    } else if (attempts >= 150) {
-        fprintf(stderr,
-                "ds4: expert-fetch disabled after 150 failed connect attempts\n");
     }
-    return cached;
+    const int live = cached;
+    pthread_mutex_unlock(&g_rf_init_mu);
+    return live;
+}
+
+/* Wave 29: the in-run retries almost never see a quiet bridge -- coordinator
+ * staging keeps 6 efetch connections saturating the Thunderbolt link for the
+ * entire run (prefill AND decode), so the worker's reverse-efetch ARP probes
+ * starve from the first gather to the last (observed: 31 straight
+ * EHOSTUNREACH).  The only reliably quiet window is right after the worker
+ * accepts the coordinator's control connection, before the first prefill
+ * frame.  Dial from a short-lived background thread in that window. */
+static void *ds4_gpu_expert_remote_fetch_kick_main(void *arg) {
+    (void)arg;
+    for (int i = 0; i < 10 && ds4_gpu_expert_remote_fetch_slots() == 0; i++) {
+        usleep(700 * 1000);
+    }
+    return NULL;
+}
+
+void ds4_gpu_expert_remote_fetch_kick(void) {
+    const char *host = getenv("DS4_DIST_EXPERT_FETCH_HOST");
+    if (!host || !host[0]) return;
+    pthread_t th;
+    if (pthread_create(&th, NULL, ds4_gpu_expert_remote_fetch_kick_main, NULL) == 0) {
+        pthread_detach(th);
+    }
 }
 
 typedef struct {

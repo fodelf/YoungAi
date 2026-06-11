@@ -2392,3 +2392,35 @@ next_len 顶 15, verify 形态与第二十六波逐行一致 (2.23≈2.24 复测
    worker 日志 "remote fetch thread(s) ... after retry (attempt N)" (反向 efetch 生效);
    worker 批行 rfetch_mib>0 (racing 真把字节拉过来了);
 ② smoke 回归 ~2.0+; ③ A/B: COPY_SPEC_DRAFT=16 / EXPERT_REMOTE_FETCH_REVERSE=0。
+
+## 2026-06-10 — 第二十九波: K=32 真凶钳位 + 静默窗主动拨号 (反向 efetch 第三刀)
+
+**Context.** 第二十八波实测: code-edit **2.30 (新高)** / smoke **2.13 (新高)**。但取证:
+① **K=32 仍未生效** (sent 顶 16, next_len=15) —— 这次二进制/脚本都是新的, 地毯式重扫找到
+真凶: `ds4_distributed.c:6099` 还有一个 `if (K > 16) K = 16;` —— 第二十七波审计改了
+drafts[]/verify_tokens[]/spec_logits/钳位 helper/CLI 数组, 唯独漏了 eval 函数体内这行
+(两波白测)。② 反向 efetch 31 连败 EHOSTUNREACH 贯穿全程 (attempt 16 已在 decode 期) ——
+**decode 期链路也不安静**: coordinator staging 全程用 6 条 efetch 连接拉 ~600MB/s,
+worker 的 ARP 探测从第一次 gather 饿到最后。"等安静窗口" 的重试策略在这条永远饱和的
+链路上不成立。本轮 2.30/2.13 的提升来自上一波尾部修正的累积 (cached verify 读 + 杂项)。
+
+**Patch.**
+1. `ds4_distributed.c:6099`: `K>16→16` 改 `K>32→32` (本轮真正的主角, 一行)。
+2. 静默窗主动拨号: worker accept 控制连接后 (prefill 尚未开始, 链路唯一可靠安静的几秒),
+   后台线程 `ds4_gpu_expert_remote_fetch_kick()` 以 700ms 间隔试拨 ≤10 次;
+   `ds4_dist_expert_fetch_kick` 声明入 `ds4_distributed.h`, 实现在 ds4_metal.m。
+3. `ds4_gpu_expert_remote_fetch_slots()` 加 trylock 串行化 (kick 线程与 gather 串行路径
+   并发安全; 竞争方直接返回"未就绪"); "150 次后禁用"消息分支顺序修正 (原先不可达)。
+4. 复扫残余 16 钳位: 剩下的全在 MTP DRAFT 线协议 (copy-spec 不走 DRAFT 帧), NGRAM=16
+   是锚长上限, 均与 K=32 无关 —— 链路这次闭合。
+
+**期望.** K=32 生效后: next_len 走 3→6→12→24→31, 全中轮 33 token/(0.7+~7.5s)
+≈ 4 t/s round-rate ⇒ code-edit **≥2.5**; 反向 efetch 若在静默窗连上, worker 批半程
+~2.6s → ~1.9s 再加一截。smoke 不受影响 (~2.1)。
+
+**Validation performed here.** `make` 无新告警 (4 legacy); `ds4_test --metal-kernels` OK。
+未跑大模型。用户脚本验证 (两跑):
+① `PROMPT_PROFILE=code-edit tools/mtp_pipe_q2_speed.sh` — 决定性证据:
+   verify 行 **sent>16 / next_len=24 或 31**; worker 日志 "remote fetch thread(s)"
+   在 "coordinator connected" 后几秒内出现; worker 批行 rfetch_mib>0;
+② smoke 回归 ~2.1; ③ A/B: COPY_SPEC_DRAFT=16 / EXPERT_REMOTE_FETCH_REVERSE=0。

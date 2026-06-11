@@ -161,6 +161,10 @@ int ds4_dist_run(ds4_engine *engine, const ds4_dist_options *opt, const ds4_dist
  * slot-bound, lock-free) and validates that the remote file size matches.
  * Purely a byte transport: wrong/unavailable service degrades to local reads. */
 int ds4_dist_expert_fetch_maybe_serve(int model_fd, uint64_t model_size);
+/* Wave 29 (implemented in ds4_metal.m): eagerly dial the peer-SSD fetch
+ * connections from the post-accept quiet window on the worker. No-op unless
+ * DS4_DIST_EXPERT_FETCH_HOST is set. */
+void ds4_gpu_expert_remote_fetch_kick(void);
 int ds4_dist_expert_fetch_client_init(const char *host, int port, int n_conns, uint64_t model_size);
 int ds4_dist_expert_fetch(int slot, uint64_t off, void *dst, uint32_t len);
 /* Pipelined variants: per slot, recv order must match send order; up to a few

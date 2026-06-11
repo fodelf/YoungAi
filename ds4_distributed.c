@@ -6096,7 +6096,9 @@ int ds4_dist_session_eval_speculative(
         accepted[0] = first_token;
         return 1;
     }
-    if (K > 16) K = 16;
+    if (K > 32) K = 32;   /* wave 29: protocol cap (drafts[32]/spec_logits 32 rows);
+                           * wave-27 raised everything else but missed this clamp,
+                           * silently pinning copy-spec at K=16 for two waves. */
 
     ds4_tokens transcript = {0};
     ds4_tokens_copy(&transcript, checkpoint);
@@ -8759,6 +8761,11 @@ static int dist_run_worker(ds4_engine *engine, const ds4_dist_options *opt, int 
             char peer_host[NI_MAXHOST], peer_port[NI_MAXSERV];
             dist_peer_name(fd, peer_host, sizeof(peer_host), peer_port, sizeof(peer_port));
             fprintf(stderr, "ds4: distributed worker: coordinator connected from %s:%s\n", peer_host, peer_port);
+            /* Wave 29: dial the reverse-efetch connections NOW -- this is the
+             * only window where the Thunderbolt bridge is reliably quiet
+             * (coordinator staging saturates it once prefill starts and the
+             * worker's ARP probes starve for the entire run). */
+            ds4_gpu_expert_remote_fetch_kick();
             if (dist_send_hello(engine, opt, ctx_size, listen_port, fd) != 0) {
                 fprintf(stderr, "ds4: distributed worker: failed to send HELLO: %s\n", strerror(errno));
                 close(fd);
