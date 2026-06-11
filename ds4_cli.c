@@ -609,7 +609,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
         }
         if (token == ds4_token_eos(engine)) break;
 
-        int toks[17];
+        int toks[33];   /* K=32 verify batch + first_token */
         int ntok = 0;
         if (cfg->gen.temperature <= 0.0f &&
             (ds4_engine_mtp_draft_tokens(engine) > 1 || cli_copy_spec_enabled()) &&
@@ -1281,7 +1281,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
                                        &rng);
         if (token == ds4_token_eos(engine)) break;
 
-        int toks[17];
+        int toks[33];   /* K=32 verify batch + first_token */
         int ntok = 0;
         if (cfg->gen.temperature <= 0.0f &&
             (ds4_engine_mtp_draft_tokens(engine) > 1 || cli_copy_spec_enabled()) &&

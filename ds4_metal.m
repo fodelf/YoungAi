@@ -18299,31 +18299,50 @@ static void *ds4_gpu_expert_remote_fetch_worker(void *arg) {
 
 /* Lazy init on the serial gather path: by the first gather both engines are
  * up (the distributed session is already established), so the connect is
- * race-free with the peer's listener. */
+ * race-free with the peer's listener.
+ * Wave 27/28: the first connect can hit a transient EHOSTUNREACH (Thunderbolt
+ * bridge ARP starves under prefill rfetch saturation -- observed on the
+ * worker->coordinator reverse-efetch dial while ping/route were fine once the
+ * link went quiet).  A one-shot failure used to disable remote fetch for the
+ * whole run; wave-27's 8x2s retries all landed inside the ~150s code-edit
+ * prefill storm and still died.  Retry every 2s for up to 150 attempts
+ * (~5min) so attempts reach the decode phase where the link is idle. */
 static int ds4_gpu_expert_remote_fetch_slots(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        cached = 0;
-        const char *host = getenv("DS4_DIST_EXPERT_FETCH_HOST");
-        if (host && host[0]) {
-            const int port = (int)ds4_gpu_env_u64("DS4_DIST_EXPERT_FETCH_PORT", 5606u);
-            int conns = (int)ds4_gpu_env_u64("DS4_DIST_EXPERT_FETCH_CONNS", 3u);
-            if (conns > 8) conns = 8;
-            const int n = ds4_dist_expert_fetch_client_init(host, port, conns, g_model_map_size);
-            for (int i = 0; i < n; i++) {
-                pthread_t th;
-                if (pthread_create(&th, NULL, ds4_gpu_expert_remote_fetch_worker,
-                                   (void *)(intptr_t)i) == 0) {
-                    pthread_detach(th);
-                    cached++;
-                }
-            }
-            if (cached) {
-                fprintf(stderr,
-                        "ds4: expert gather pulls from peer SSD via %d remote fetch thread(s)\n",
-                        cached);
-            }
+    static int cached;           /* live fetch worker threads */
+    static int attempts;
+    static double retry_after_ms;
+    if (cached > 0) return cached;
+    const char *host = getenv("DS4_DIST_EXPERT_FETCH_HOST");
+    if (!host || !host[0]) return 0;
+    if (attempts >= 150) return 0;
+    const double now = ds4_gpu_now_ms();
+    if (attempts > 0 && now < retry_after_ms) return 0;
+    attempts++;
+    retry_after_ms = now + 2000.0;
+    const int port = (int)ds4_gpu_env_u64("DS4_DIST_EXPERT_FETCH_PORT", 5606u);
+    int conns = (int)ds4_gpu_env_u64("DS4_DIST_EXPERT_FETCH_CONNS", 3u);
+    if (conns > 8) conns = 8;
+    const int n = ds4_dist_expert_fetch_client_init(host, port, conns, g_model_map_size);
+    for (int i = 0; i < n; i++) {
+        pthread_t th;
+        if (pthread_create(&th, NULL, ds4_gpu_expert_remote_fetch_worker,
+                           (void *)(intptr_t)i) == 0) {
+            pthread_detach(th);
+            cached++;
         }
+    }
+    if (cached) {
+        fprintf(stderr,
+                "ds4: expert gather pulls from peer SSD via %d remote fetch thread(s)%s "
+                "(attempt %d)\n",
+                cached, attempts > 1 ? " after retry" : "", attempts);
+    } else if (attempts == 1 || attempts % 16 == 0) {
+        fprintf(stderr,
+                "ds4: expert-fetch connect attempt %d/150 failed; retrying every 2s\n",
+                attempts);
+    } else if (attempts >= 150) {
+        fprintf(stderr,
+                "ds4: expert-fetch disabled after 150 failed connect attempts\n");
     }
     return cached;
 }

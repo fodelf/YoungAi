@@ -49,7 +49,9 @@
 | **单 token 地板判定（2026-06-10）** | ~2.1 | — | 剩余=两机 drain GPU 计算 ~175ms + worker 本地读 + L0 结构窗口；**M2 ≥3 须走 PC.1 多 token 路线（§3.5）** |
 | **第二十波实测（PC.1 v2 上线）** | **2.05（smoke 档新高）** | 4.71 | 复制投机最长后缀锚+自适应抄长；smoke 档 fire 率 0%=纯不赔钱，收益待 code-edit 档（PC.5） |
 | 第二十一—二十五波（code-edit 档攻坚） | **code-edit 1.95（二十五波新高）**；smoke 2.09（二十四波新高）/2.02 | — | mm_id GEMM 修 GPU 侧（批 drain 69→38ms）；NOCACHE 判决=prefill 冷读赢/verify 批输 → 收窄 ≥24 token；**backbone mlock 4.08GiB 根治 r1 驱逐爬升（548→2361ms 消失，稳 578-874）**；账面闭合：97tok≈Σr1(14.2s)+Σr2(35.7s)，r2=73% 是唯一大头 |
-| 第二十六波（脚本波，待实测） | 目标 code-edit ≥2.2 | — | DRAFT 12→16（6/9 轮全中撑得起）；反向 efetch：worker 批 racing 拉 mini 闲盘（worker 半程 2.3→~1.7s）；worker STAGE=0 不变量压住 |
+| **第二十六波实测** | **code-edit 2.24（新高）/ smoke 2.09** | 7.33 | DRAFT 16 即刻生效（4 轮 16/16 全中）；反向 efetch 因 TB 桥启动期 ARP 瞬态未起（首连失败被永久缓存） |
+| 第二十七波（**未被真正测到**） | 报 2.23=wave26 复测 | — | 用户开跑时编辑只落了一半（脚本 DRAFT=32 未落 → K 被钳 16）；时间线复盘见 log 第二十八波 |
+| 第二十八波（待实测） | 目标 code-edit ≥2.5 | — | K=32 全链完整在树 + efetch 重试 8→150 次（2s×5min 延伸进 decode 静默期，prefill 风暴里 ARP 饿死是上波失败根因）|
 | M1 单拷贝直读 + prefill 流式 | **≥1.6** | **≥10** | P1.1/P1.2 |
 | M2 预测预取流水 + 命中零拷贝 + repack | **≥3** | **≥25** | P1.3/P1.4/P2.1 |
 | M3 expert-parallel 双 SSD 并行 | **≥5** | ≥30 | P2.2 |

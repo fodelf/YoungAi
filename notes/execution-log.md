@@ -2328,3 +2328,67 @@ prefill 期碰 mini 盘 —— prefill 若回落 >10% 用 `EXPERT_REMOTE_FETCH_R
 ① `PROMPT_PROFILE=code-edit tools/mtp_pipe_q2_speed.sh` — 期待 ≥2.2;
    看 verify 行 sent=16 的 r2_ms 与 worker 日志批行 rfetch_mib>0 (反向生效证据);
 ② smoke 回归 ~2.0+; ③ A/B: EXPERT_REMOTE_FETCH_REVERSE=0 / COPY_SPEC_DRAFT=12。
+
+## 2026-06-10 — 第二十七波: K 上限 16→32 + efetch 连接重试 (反向 efetch 落地补刀)
+
+**Context.** 第二十六波实测: code-edit **2.24 (新高)** / smoke 2.09。DRAFT=16 即刻生效:
+sent=16 轮 4 次全中 (r2 4.6-5.3s), 17 token/round。但取证发现**反向 efetch 没起来**:
+worker 批行 rfetch_mib≡0, worker 日志 `expert-fetch connect 192.168.1.3:5606 failed
+(No route to host)` —— 而 mini serve 正常监听、事后 ping 0.9ms/ARP/防火墙全通。
+判定: TB 桥 ARP 在 prefill 重载下的启动期瞬态; 而 `ds4_gpu_expert_remote_fetch_slots`
+是一次性懒初始化, **首连失败即永久缓存 0**。另: anchor=32 (锚长探测顶满) + 全中轮顶
+K-1=15 ⇒ 可抄段远长于 15, 协议 K=16 上限挡住了收益。
+
+**Patch.**
+1. `ds4_metal.m` efetch 客户端重试: 首连失败不再永久放弃 —— 2s 退避重试至多 8 次
+   (gather 热路径上零成本: 时间未到直接 return 0)。成功行加 "(after retry)" 标记。
+2. **K 上限 16→32** (改动面审计后全部落地):
+   - `ds4_distributed.c`: `ds4_dist_spec_io.drafts[16]→[32]` (本地结构, 线协议不变 ——
+     verify token 走普通 work 帧, 上限 prefill_cap=128); `verify_tokens[16]→[32]`;
+     `copied[15]→[31]`; `kc>16u→32u`; DRAFT 钳位 (2,16)→(2,32); INIT/MIN 钳位 15→31。
+   - `ds4.c`: spec_logits 两处分配 16→32 行 (~16.5MiB, MTP 路径与 copy-spec 路径都扩,
+     防 NO_MTP=0 组合下越界)。
+   - `ds4_cli.c`×2 / `ds4_server.c`: `toks[17]→[33]`。
+   - 验证读回 32×505KB≈16MiB/verify, 雷电 ~10ms, 可忽略。
+3. 脚本: `COPY_SPEC_DRAFT` 默认 16→**32**; 自适应抄长变 3→6→12→24→31
+   (三连全中才押到 24, 失败重置 3 —— 风险自钳)。
+
+**算账.** 全中 33 token 轮: r2(32) ≈ 6.5-7.5s (并集 ~50→65 专家/层 + 2× 行数 GPU)
+⇒ (0.7+7.5)/33 ≈ **4.0-4.4 t/s round-rate** (16 时代 2.97 顶); 反向 efetch 重试落地后
+worker 半程 -0.5s 再加成。混合 fire 率 42% 下期望端到端 **~2.5-2.8**。
+若 32 注的中途断接率显著升高 (accepted 远小于 sent), 自适应会自动缩回, 最坏回 16 形态。
+
+**Validation performed here.** `make` 无新告警 (4 legacy 同前); `ds4_test
+--metal-kernels` OK; `bash -n` OK; K=32 边界走查: kc≤32≤prefill_cap=128,
+accepted_cap=33≥1+kc... 全闭合。未跑大模型。用户脚本验证 (两跑):
+① `PROMPT_PROFILE=code-edit tools/mtp_pipe_q2_speed.sh` — 期待 ≥2.5;
+   验证点: verify 行出现 sent>16; worker 日志 "(after retry)" 或批行 rfetch_mib>0;
+② smoke 回归 ~2.0+; ③ A/B: COPY_SPEC_DRAFT=16 / EXPERT_REMOTE_FETCH_REVERSE=0。
+
+## 2026-06-10 — 第二十八波: efetch 重试拉长到 decode 静默期 (+第二十七波时间线复盘)
+
+**Context.** 用户报 "第二十七波" code-edit 2.23 / smoke 2.03 —— 但取证发现 **K=32 没被测到**:
+code-edit 留档 21:32:16, 而脚本对 smoke 跑的重编在 21:32:35 —— code-edit 跑用的是我改到
+一半的工作区 (脚本每跑 `make clean && make`, 编到什么算什么): metal 重试已在 (worker 有
+"attempt N/8" 行), 但脚本 `COPY_SPEC_DRAFT=32` 默认还没落 → env=16 → K 钳 16,
+next_len 顶 15, verify 形态与第二十六波逐行一致 (2.23≈2.24 复测)。**教训: 改码期间用户
+可能随时开跑 —— 一波的全部编辑必须一次性原子落完, 改一半绝不停手汇报。**
+另: 反向 efetch 的 8×2s=16s 重试窗口全落在 code-edit ~150s 的 prefill 风暴里
+(TB 被 coordinator rfetch 6 连打满, ARP 报文饿死), 7 次失败后放弃 —— 窗口本身选错了。
+
+**Patch.**
+- `ds4_metal.m`: efetch 客户端重试 8 次 → **150 次** (2s 间隔 ≈5min, 必然延伸进 decode
+  阶段 —— 单 token decode 期 TB 几乎空闲, ARP 必然可达); 失败日志只在第 1 次和每 16 次打。
+- `ds4_distributed.c`: client_init 的逐次 connect 失败行限流 (前 3 次 + 每 16 次),
+  150 次重试不再刷屏。
+
+**本波的真正待验主角 (已在树上, 这次完整):** K=32 全链 (第二十七波) + 反向 efetch。
+全中 33 token 轮预期 round-rate ~4 t/s, 端到端期待 ≥2.5。
+
+**Validation performed here.** `make` 无新告警 (4 legacy); `ds4_test --metal-kernels` OK。
+未跑大模型。用户脚本验证 (两跑):
+① `PROMPT_PROFILE=code-edit tools/mtp_pipe_q2_speed.sh` —
+   决定性证据三看: verify 行 sent>16 (K=32 生效) / next_len>15;
+   worker 日志 "remote fetch thread(s) ... after retry (attempt N)" (反向 efetch 生效);
+   worker 批行 rfetch_mib>0 (racing 真把字节拉过来了);
+② smoke 回归 ~2.0+; ③ A/B: COPY_SPEC_DRAFT=16 / EXPERT_REMOTE_FETCH_REVERSE=0。

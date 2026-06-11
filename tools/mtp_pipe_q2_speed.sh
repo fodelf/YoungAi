@@ -176,10 +176,12 @@ EXPERT_EVENT_DRAIN=${EXPERT_EVENT_DRAIN:-1}
 #   - 自适应抄长: 初始 INIT=3, 全接受翻倍 (≤DRAFT-1), (近)全拒回 INIT; 抄长 <MIN=2 不发批。
 # A/B 回退: COPY_SPEC=0。接受率看 coordinator 日志 dist-mtp 行 (tok/call, verify 次数)。
 COPY_SPEC=${COPY_SPEC:-1}
-# DRAFT=16 (协议上限): 第二十五波实测 6/9 轮 12/12 全中、next_len 顶在 11 —— 接受率
-# 撑得起更大赌注。批 IO 并集随 kc 次线性增长 (43→~50 专家/层), 全中轮边际 ≈5 t/s。
-# 自适应抄长 3→6→12→15 (全接受翻倍, 顶 DRAFT-1)。smoke 档永不触发, 不影响基线。
-COPY_SPEC_DRAFT=${COPY_SPEC_DRAFT:-16}         # 验证批上限 (argmax + ≤DRAFT-1 个抄来的 token)
+# DRAFT=32 (第二十七波新上限): 第二十六波 sent=16 仍 4 轮全中、anchor=32 顶满 ——
+# 可抄段远长于 15。引擎已扩 K≤32 (drafts[32]/spec_logits 32 行/CLI toks[33])。
+# 批 IO 并集随 kc 次线性, 全中 33 token/~7.5s ≈ 4.4 t/s round-rate。
+# 自适应抄长 3→6→12→24→31 (全接受翻倍, 顶 DRAFT-1; 三连全中才会押到 24)。
+# smoke 档永不触发, 不影响基线。A/B: COPY_SPEC_DRAFT=16 复旧。
+COPY_SPEC_DRAFT=${COPY_SPEC_DRAFT:-32}         # 验证批上限 (argmax + ≤DRAFT-1 个抄来的 token)
 COPY_SPEC_NGRAM=${COPY_SPEC_NGRAM:-4}          # 最小锚长 (最长后缀匹配须 ≥ 此值才信)
 COPY_SPEC_INIT=${COPY_SPEC_INIT:-3}            # 自适应抄长初始值/重置值
 COPY_SPEC_MIN=${COPY_SPEC_MIN:-2}              # 抄长低于此不发验证批 (赔不起往返)

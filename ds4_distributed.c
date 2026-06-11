@@ -518,7 +518,7 @@ static bool dist_copy_spec_enabled(void) {
 
 static uint32_t dist_copy_spec_draft_k(void) {
     /* Total verify batch size (drafts[0]=target argmax + copied tail). */
-    return dist_env_u32_clamped("DS4_DIST_COPY_SPEC_DRAFT", 8, 2, 16);
+    return dist_env_u32_clamped("DS4_DIST_COPY_SPEC_DRAFT", 8, 2, 32);
 }
 
 static uint32_t dist_copy_spec_ngram(void) {
@@ -532,14 +532,14 @@ static uint32_t dist_copy_spec_ngram(void) {
 
 static uint32_t dist_copy_spec_init_len(void) {
     /* Initial / reset copied-draft length (adaptive: doubles on success). */
-    return dist_env_u32_clamped("DS4_DIST_COPY_SPEC_INIT", 3, 1, 15);
+    return dist_env_u32_clamped("DS4_DIST_COPY_SPEC_INIT", 3, 1, 31);
 }
 
 static uint32_t dist_copy_spec_min_copy(void) {
     /* Don't issue a verify batch for fewer copied tokens than this: with the
      * batch costing ~2-3x a single forward, a 1-token copy cannot break even
      * (the argmax freebie alone never pays for the round). */
-    return dist_env_u32_clamped("DS4_DIST_COPY_SPEC_MIN", 2, 1, 15);
+    return dist_env_u32_clamped("DS4_DIST_COPY_SPEC_MIN", 2, 1, 31);
 }
 
 /* Longest-suffix prompt lookup (SuffixDecoding-style). Among earlier positions
@@ -2893,7 +2893,7 @@ typedef struct {
     uint32_t accept_len;
     uint32_t extra_flags;     /* DS4_DIST_WORK_F_DRAFT or _VERIFY */
     uint32_t draft_n;
-    uint32_t drafts[16];
+    uint32_t drafts[32];
     float   *verify_logits;   /* n_tokens * vocab floats when VERIFY */
 } ds4_dist_spec_io;
 
@@ -6154,7 +6154,7 @@ int ds4_dist_session_eval_speculative(
             uint32_t want = d->copy_spec_len;
             if (want > (uint32_t)(K - 1)) want = (uint32_t)(K - 1);
             ds4_tokens_push(&transcript, next);
-            int copied[15];
+            int copied[31];
             uint32_t n_copy = 0;
             copy_anchor = dist_copy_spec_match(transcript.v,
                                                (uint32_t)transcript.len,
@@ -6195,7 +6195,7 @@ int ds4_dist_session_eval_speculative(
     }
 
     uint32_t kc = r1.draft_n;
-    if (kc > 16u) kc = 16u;
+    if (kc > 32u) kc = 32u;
     if ((uint32_t)accepted_cap - (uint32_t)n_accept < kc) kc = (uint32_t)accepted_cap - (uint32_t)n_accept;
     if (d->state.ctx_size != 0 && p + 1u + kc > d->state.ctx_size) {
         kc = (p + 1u < d->state.ctx_size) ? d->state.ctx_size - (p + 1u) : 0u;
@@ -6207,7 +6207,7 @@ int ds4_dist_session_eval_speculative(
     }
 
     /* ---- Round 2: batch-verify the K candidates at positions p+1..p+kc. ---- */
-    int verify_tokens[16];
+    int verify_tokens[32];
     for (uint32_t i = 0; i < kc; i++) verify_tokens[i] = (int)r1.drafts[i];
     float *vlogits = malloc((size_t)kc * (size_t)vocab * sizeof(float));
     if (!vlogits) {
@@ -9721,7 +9721,15 @@ int ds4_dist_expert_fetch_client_init(const char *host, int port, int n_conns, u
         char err[256] = {0};
         int fd = dist_connect_endpoint_once(host, port, NULL, err, sizeof(err));
         if (fd < 0) {
-            fprintf(stderr, "ds4: expert-fetch connect %s:%d failed (%s)\n", host, port, err);
+            /* Wave 28: the metal layer retries this init every 2s for minutes
+             * (transient EHOSTUNREACH under prefill link saturation); rate-
+             * limit the per-attempt noise. */
+            static unsigned fail_logged;
+            if (fail_logged < 3 || (fail_logged & 15u) == 0) {
+                fprintf(stderr, "ds4: expert-fetch connect %s:%d failed (%s)\n",
+                        host, port, err);
+            }
+            fail_logged++;
             break;
         }
         dist_set_socket_low_latency(fd);

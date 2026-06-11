@@ -9982,7 +9982,7 @@ static bool metal_graph_alloc_raw_cap(
         g->mtp_raw_cache = metal_graph_alloc_kv_cache_tensor(
                 managed_kv_cache,
                 (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
-        g->spec_logits = ds4_gpu_tensor_alloc((uint64_t)16 * DS4_N_VOCAB * sizeof(float));
+        g->spec_logits = ds4_gpu_tensor_alloc((uint64_t)32 * DS4_N_VOCAB * sizeof(float));
         g->mtp_n_raw = 0;
     }
     /* PC.1 copy speculation (project.md §3.5): the cross-machine VERIFY batch
@@ -9992,7 +9992,7 @@ static bool metal_graph_alloc_raw_cap(
     if (!g->spec_logits) {
         const char *cs = getenv("DS4_DIST_COPY_SPEC");
         if (cs && *cs && cs[0] != '0') {
-            g->spec_logits = ds4_gpu_tensor_alloc((uint64_t)16 * DS4_N_VOCAB * sizeof(float));
+            g->spec_logits = ds4_gpu_tensor_alloc((uint64_t)32 * DS4_N_VOCAB * sizeof(float));
         }
     }
 
