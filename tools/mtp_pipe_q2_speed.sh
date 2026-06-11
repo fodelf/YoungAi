@@ -40,6 +40,44 @@ MTP_GGUF=${MTP_GGUF:-gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf} # 草稿模�
 SPLIT_COORD=${SPLIT_COORD:-0:19}               # 本机 M4 coordinator 层切片 (实测 >0.79 t/s 档)
 SPLIT_WORKER=${SPLIT_WORKER:-20:output}        # M1 worker 层切片 (后 23 层 + output)
 CTX=${CTX:-200000}
+# ---- project.md PC.5: PROMPT_PROFILE 档位 ----
+# smoke (默认): 现行短问句, 历史速度可比基线; PC.1 复制投机在它身上系统性无收益
+#   (无可抄结构, 第二十波实测 fire 率 0%) —— 它只测"不赔钱"。
+# code-edit:   编辑型负载 (给一段代码 + 改名指令, 输出 ≈ 大段回显输入) —— Claude Code
+#   真实回合的缩影, PC.1 的收益档。生成长 (NPRED 224) ⇒ 超时放宽。两档都该跑:
+#   PROMPT_PROFILE=code-edit tools/mtp_pipe_q2_speed.sh
+#   验收看 generation t/s (= 有效 t/s, 含投机接受) 与 dist-mtp 行 tok/call。
+PROMPT_PROFILE=${PROMPT_PROFILE:-smoke}
+if [ "$PROMPT_PROFILE" = "code-edit" ]; then
+  NPRED=${NPRED:-224}
+  RUN_TIMEOUT_SEC=${RUN_TIMEOUT_SEC:-600}
+  if [ -z "${PROMPT:-}" ]; then
+    PROMPT=$(cat <<'PEOF'
+下面是一段 Python 代码：
+```python
+def process_data(items):
+    result = []
+    for item in items:
+        if item is None:
+            continue
+        value = item.strip().lower()
+        if not value:
+            continue
+        if value in result:
+            continue
+        result.append(value)
+    return result
+
+def process_file(path):
+    with open(path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+    return process_data(lines)
+```
+请把函数名 process_data 改名为 clean_items（包括所有调用处），其他逻辑和格式保持完全不变，输出修改后的完整代码，不要任何解释。
+PEOF
+)
+  fi
+fi
 NPRED=${NPRED:-48}
 DRAFT=${DRAFT:-2}                              # --mtp-draft N: 分布式 MTP 默认 2；4 在当前 M1 worker 上实测负收益
 NO_MTP=${NO_MTP:-1}                            # 默认关 MTP：当前 M1 drafter 尽管接受率高但端到端负收益；设 NO_MTP=0 做实验
@@ -138,12 +176,15 @@ EXPERT_EVENT_DRAIN=${EXPERT_EVENT_DRAIN:-1}
 #   - 自适应抄长: 初始 INIT=3, 全接受翻倍 (≤DRAFT-1), (近)全拒回 INIT; 抄长 <MIN=2 不发批。
 # A/B 回退: COPY_SPEC=0。接受率看 coordinator 日志 dist-mtp 行 (tok/call, verify 次数)。
 COPY_SPEC=${COPY_SPEC:-1}
-COPY_SPEC_DRAFT=${COPY_SPEC_DRAFT:-8}          # 验证批上限 (argmax + ≤7 个抄来的 token)
+# DRAFT=12: 自适应抄长 3→6→11 (两连全接受后才会到顶), 回显长段一批最多 13 token/
+# ~2s ≈ 3× 有效; smoke 档永不触发, 不影响基线。协议上限 16。
+COPY_SPEC_DRAFT=${COPY_SPEC_DRAFT:-12}         # 验证批上限 (argmax + ≤DRAFT-1 个抄来的 token)
 COPY_SPEC_NGRAM=${COPY_SPEC_NGRAM:-4}          # 最小锚长 (最长后缀匹配须 ≥ 此值才信)
 COPY_SPEC_INIT=${COPY_SPEC_INIT:-3}            # 自适应抄长初始值/重置值
 COPY_SPEC_MIN=${COPY_SPEC_MIN:-2}              # 抄长低于此不发验证批 (赔不起往返)
+COPY_SPEC_LOG=${COPY_SPEC_LOG:-1}              # 每次 verify 打一行 anchor/sent/accepted
 COPY_SPEC_ENV=""
-[ "$COPY_SPEC" = 1 ] && COPY_SPEC_ENV="DS4_DIST_COPY_SPEC=1 DS4_DIST_COPY_SPEC_DRAFT=$COPY_SPEC_DRAFT DS4_DIST_COPY_SPEC_NGRAM=$COPY_SPEC_NGRAM DS4_DIST_COPY_SPEC_INIT=$COPY_SPEC_INIT DS4_DIST_COPY_SPEC_MIN=$COPY_SPEC_MIN"
+[ "$COPY_SPEC" = 1 ] && COPY_SPEC_ENV="DS4_DIST_COPY_SPEC=1 DS4_DIST_COPY_SPEC_DRAFT=$COPY_SPEC_DRAFT DS4_DIST_COPY_SPEC_NGRAM=$COPY_SPEC_NGRAM DS4_DIST_COPY_SPEC_INIT=$COPY_SPEC_INIT DS4_DIST_COPY_SPEC_MIN=$COPY_SPEC_MIN DS4_DIST_COPY_SPEC_LOG=$COPY_SPEC_LOG"
 IO_ENV="DS4_METAL_EXPERT_PREAD=$EXPERT_PREAD DS4_METAL_EXPERT_PREAD_NOCACHE=$EXPERT_PREAD_NOCACHE DS4_METAL_EXPERT_SORT_IDS=$EXPERT_SORT_IDS DS4_METAL_EXPERT_FULL_LAYER_STREAM=$EXPERT_STREAM DS4_METAL_EXPERT_STREAM_THRESHOLD_PCT=$EXPERT_STREAM_THRESHOLD_PCT DS4_METAL_EXPERT_STREAM_CHUNK_MB=$EXPERT_STREAM_CHUNK_MB DS4_METAL_EXPERT_IO_PROFILE=$EXPERT_IO_PROFILE DS4_METAL_EXPERT_PREFETCH_AHEAD=$EXPERT_PREFETCH DS4_METAL_EXPERT_PREFETCH_TOP=$EXPERT_PREFETCH_TOP DS4_METAL_EXPERT_PREFETCH_DEPTH=$EXPERT_PREFETCH_DEPTH DS4_METAL_EXPERT_EVENT_DRAIN=$EXPERT_EVENT_DRAIN DS4_METAL_EXPERT_STAGE=$EXPERT_STAGE"
 # 源专家 LRU（A3 fallback 用）：direct per-tensor read 虽避免了 30+GiB view OOM，
 # 但实测每 token 15–16s（随机 mmap/页故障/每层 command drain），比 A3 慢一个数量级；默认回 A3。
@@ -438,9 +479,9 @@ if grep -qiE 'prefill:|generation:|t/s' "$COORD_LOG" 2>/dev/null; then
 else
   log "未拿到计时行, 本机 coordinator 日志尾:"; tail -12 "$COORD_LOG"
 fi
-if grep -qiE 'dist-mtp|adaptive-disable' "$COORD_LOG" 2>/dev/null; then
+if grep -qiE 'dist-mtp|adaptive-disable|copy-spec' "$COORD_LOG" 2>/dev/null; then
   echo "----------------------------------------"
-  log "MTP 摘要 (本机 coordinator):"; grep -iE 'dist-mtp|adaptive-disable' "$COORD_LOG" | tail -20
+  log "投机摘要 (本机 coordinator):"; grep -iE 'dist-mtp|adaptive-disable|copy-spec' "$COORD_LOG" | tail -30
 fi
 if grep -qiE 'expert-(profile|pool|source-cache)' "$COORD_LOG" 2>/dev/null; then
   echo "----------------------------------------"

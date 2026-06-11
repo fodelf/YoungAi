@@ -47,6 +47,8 @@
 | **第十四波实测（哈希层精确暂存）** | **2.03** | 4.65 | 层 0–2 为 token 哈希路由（tid2eid 查表=100% 可知）；L2 完美形态 cold=0/wall=1.3ms |
 | 第十六/十七波（负结果已回滚） | 1.79/1.80 | — | keepalive 与就绪度门控均 -12%（门控引发 racing 级联、饿死 lookahead）；代码已恢复 2.03 基线 |
 | **单 token 地板判定（2026-06-10）** | ~2.1 | — | 剩余=两机 drain GPU 计算 ~175ms + worker 本地读 + L0 结构窗口；**M2 ≥3 须走 PC.1 多 token 路线（§3.5）** |
+| **第二十波实测（PC.1 v2 上线）** | **2.05（smoke 档新高）** | 4.71 | 复制投机最长后缀锚+自适应抄长；smoke 档 fire 率 0%=纯不赔钱，收益待 code-edit 档（PC.5） |
+| 第二十一—二十四波（code-edit 档攻坚中） | code-edit 1.74→1.80→1.68（smoke 2.02 稳） | — | 接受率 88% 但批前向贵：mm_id GEMM 已修 GPU 侧（批 drain 69→38ms）；第二十四波修 verify 冷读冲页缓存（批 pread F_NOCACHE，r1 548→2361ms 爬升的根因），r2≈4.3s 余下是 W2 墙内两机串行 IO（下一杆双机批流水） |
 | M1 单拷贝直读 + prefill 流式 | **≥1.6** | **≥10** | P1.1/P1.2 |
 | M2 预测预取流水 + 命中零拷贝 + repack | **≥3** | **≥25** | P1.3/P1.4/P2.1 |
 | M3 expert-parallel 双 SSD 并行 | **≥5** | ≥30 | P2.2 |
@@ -338,6 +340,7 @@ P0 测量基建（半天）→ P1 内存分区排布（主攻，~1-2 周）→ P
 - [ ] PC.2 编程域热专家画像 + 启动预热
 - [ ] PC.3 工具语法草稿（schema/replay 驱动）
 - [ ] PC.4 回合级增量 prefill（per-turn TTFT 指标上线）
-- [ ] PC.5 编程负载回放基准 + `PROMPT_PROFILE=code-edit` 档
+- [x] PC.5（部分）`PROMPT_PROFILE=code-edit` 档已入脚本（2026-06-10 第二十一波；
+      默认 smoke 档不变保历史可比）；完整回放基准（真实 transcript replay）仍待建
 - [ ] P3 200K 逐档 + Claude Code 前缀复用验证
 - [ ] G1–G3 决策记录

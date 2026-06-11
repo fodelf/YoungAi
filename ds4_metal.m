@@ -16887,6 +16887,57 @@ static int ds4_gpu_expert_pread_enabled(void) {
     return cached;
 }
 
+/* Wave 24: verify/prefill batch gathers read hundreds of MiB of cold expert
+ * bytes per layer with ~zero reuse (batch hit_mib==0 in every profile run),
+ * yet a kc=12 verify round streams ~5.8GiB through the coordinator page
+ * cache and evicts the mmap-resident backbone (Q8 attention/shared) pages.
+ * The next single-token frame then re-faults the backbone inside the GPU
+ * command execution: decode drain_ms ballooned 14.5 -> 46ms/layer (spikes to
+ * 855ms on the first layers after a verify), inflating round-1 from ~550ms to
+ * ~2.3s.  Route batch-site cold preads through a separate F_NOCACHE
+ * descriptor so one-shot batch bytes stop evicting hot pages.  Default on;
+ * DS4_METAL_EXPERT_BATCH_NOCACHE=0 restores the shared cached fd (A/B). */
+static int g_expert_gather_nocache_call;   /* set on the serial encode path per gather call */
+
+static int ds4_gpu_expert_batch_nocache_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("DS4_METAL_EXPERT_BATCH_NOCACHE");
+        cached = (v && *v && v[0] == '0') ? 0 : 1;
+    }
+    return cached;
+}
+
+static int ds4_gpu_expert_pread_fd_nocache(void) {
+    static int cached_fd = -2;
+    if (cached_fd == -2) {
+        cached_fd = -1;
+        if (g_model_fd >= 0) {
+            char path[MAXPATHLEN];
+            memset(path, 0, sizeof(path));
+            if (fcntl(g_model_fd, F_GETPATH, path) == 0) {
+                int nfd = open(path, O_RDONLY);
+                if (nfd >= 0) {
+                    if (fcntl(nfd, F_NOCACHE, 1) != -1) {
+                        cached_fd = nfd;
+                        fprintf(stderr,
+                                "ds4: batch expert gather cold reads use a separate "
+                                "F_NOCACHE descriptor (DS4_METAL_EXPERT_BATCH_NOCACHE=0 disables)\n");
+                    } else {
+                        close(nfd);
+                    }
+                }
+            }
+        }
+        if (cached_fd < 0) {
+            fprintf(stderr,
+                    "ds4: batch F_NOCACHE descriptor unavailable; "
+                    "batch gathers fall back to the shared cached fd\n");
+        }
+    }
+    return cached_fd;
+}
+
 static int ds4_gpu_expert_pread_fd(void) {
     static int cached_fd = -2;
     if (cached_fd == -2) {
@@ -18304,7 +18355,11 @@ static int ds4_gpu_load_layer_experts_to_scratch(
      * lazily-initialized statics never race with gather worker threads. */
     const int io_profile = ds4_gpu_expert_io_profile_enabled();
     int use_pread = ds4_gpu_expert_pread_enabled();
-    const int pread_fd = use_pread ? ds4_gpu_expert_pread_fd() : -1;
+    int pread_fd = -1;
+    if (use_pread) {
+        if (g_expert_gather_nocache_call) pread_fd = ds4_gpu_expert_pread_fd_nocache();
+        if (pread_fd < 0) pread_fd = ds4_gpu_expert_pread_fd();
+    }
     if (use_pread && pread_fd < 0) use_pread = 0;
     const uint32_t gather_threads = ds4_gpu_expert_gather_threads();
     const uint32_t total_units = n_active * 3u;
@@ -18774,6 +18829,7 @@ int ds4_gpu_routed_moe_one_tensor(
             down_type == DS4_METAL_TENSOR_Q2_K;
         if (a3_expert_offload) {
             const int io_profile = ds4_gpu_expert_io_profile_enabled();
+            g_expert_gather_nocache_call = 0;   /* decode reads stay page-cache friendly */
             const int was_batched = (g_batch_cb != nil);
             double drain_ms = 0.0;
             if (was_batched) {
@@ -19218,6 +19274,11 @@ int ds4_gpu_routed_moe_batch_tensor(
             down_type == DS4_METAL_TENSOR_Q2_K;
         if (a3_expert_offload) {
             const int io_profile = ds4_gpu_expert_io_profile_enabled();
+            /* Batch bytes (verify rounds, prefill gather fallback) are one-shot:
+             * keep them out of the page cache so they stop evicting the
+             * mmap-resident backbone between frames. */
+            g_expert_gather_nocache_call =
+                (n_tokens > 1u) && ds4_gpu_expert_batch_nocache_enabled();
             const int was_batched = (g_batch_cb != nil);
             double drain_ms = 0.0;
             if (was_batched) {
@@ -19387,20 +19448,57 @@ int ds4_gpu_routed_moe_batch_tensor(
             ds4_gpu_make_mul_mv_id_args(expert_mid_dim, out_dim, source_n_total_expert,
                                           down_row_bytes, down_expert_bytes,
                                           n_expert, n_expert, n_tokens, down_nr0);
-        const bool use_mm_id = n_tokens >= 32u && ds4_gpu_mul_mm_id_map0_name(n_expert) != NULL;
         /*
-         * MTP verification is neither normal decode nor large prefill: the
-         * target model must verify a tiny suffix (usually 2 tokens) in one
-         * layer-major pass.  For that shape the prefill expert-major GEMM path
-         * is too large, but the decode pair kernels are exactly the right
-         * primitive: they read the same activation once and compute routed
-         * gate/up together for every selected expert row.  Keep this limited to
-         * tiny batches so ordinary prefill keeps using the higher-throughput
-         * grouped matmul path.
+         * Grouped-GEMM threshold. The mm_id path maps token-rows per expert
+         * and reads each active expert's weights exactly ONCE (expert-major),
+         * while the mv/pair paths re-read the expert weights once per
+         * (expert,token) pair: a 12-token verify batch re-reads ~486MiB of
+         * scratch instead of the ~270MiB union, through matvec-shaped kernels
+         * with much lower effective bandwidth. The old >=32 threshold was
+         * tuned when the only small batches were MTP's 2-token suffixes; PC.1
+         * copy-speculation batches are 5..12 tokens and sit right in the slow
+         * gap. Default lowered to 8 (A/B: DS4_METAL_MOE_MM_ID_MIN=32 restores
+         * the old split, =0 forces never).
          */
+        static uint32_t mm_id_min_cached;
+        static int mm_id_min_init;
+        if (!mm_id_min_init) {
+            uint64_t v = ds4_gpu_env_u64("DS4_METAL_MOE_MM_ID_MIN", 8u);
+            if (v == 0) v = UINT32_MAX;     /* 0 = never use mm_id */
+            if (v < 2u) v = 2u;
+            mm_id_min_cached = (uint32_t)(v > UINT32_MAX ? UINT32_MAX : v);
+            mm_id_min_init = 1;
+        }
+        const bool use_mm_id = n_tokens >= mm_id_min_cached &&
+                               ds4_gpu_mul_mm_id_map0_name(n_expert) != NULL;
+        /*
+         * Speculative verification is neither normal decode nor large prefill:
+         * the target model must verify a small suffix in one layer-major pass.
+         * For that shape the prefill expert-major GEMM path is too large, but
+         * the decode pair kernels are exactly the right primitive: they read
+         * the same activation once and compute routed gate/up together for
+         * every selected expert row, and their dispatch grid is
+         * (n_expert x n_tokens) pairs - shape generic.
+         *
+         * PC.1 copy speculation widened the verify batches from MTP's 2 to
+         * 5..12 tokens, which used to fall through to the generic split-mv
+         * path: measured (2026-06-10 code-edit run) drain 100-256 ms/layer for
+         * a 12-token batch = ~5-10x worse per token than the >=32-token
+         * grouped GEMM (1.3 ms/token/layer). Route everything below the GEMM
+         * threshold through the pair kernels instead; cap adjustable for A/B
+         * (DS4_METAL_MOE_TINY_PAIR_MAX=4 restores the old behavior).
+         */
+        static uint32_t tiny_pair_max_cached;
+        static int tiny_pair_max_init;
+        if (!tiny_pair_max_init) {
+            uint64_t v = ds4_gpu_env_u64("DS4_METAL_MOE_TINY_PAIR_MAX", 16u);
+            if (v > 31u) v = 31u;
+            tiny_pair_max_cached = (uint32_t)v;
+            tiny_pair_max_init = 1;
+        }
         const bool use_tiny_pair_mv =
             !g_quality_mode &&
-            n_tokens <= 4u &&
+            n_tokens <= tiny_pair_max_cached &&
             !use_mm_id &&
             ((gate_type == DS4_METAL_TENSOR_IQ2_XXS && g_moe_mul_mv_id_iq2_xxs_pair_pipeline) ||
              (gate_type == DS4_METAL_TENSOR_Q4_K && g_moe_mul_mv_id_q4_k_pair_pipeline));

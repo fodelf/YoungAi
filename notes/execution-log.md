@@ -2113,3 +2113,140 @@ drafts[0])。该批 coordinator 侧 20 层 ds4-io 实测 n_active 19-45/层、wa
 `ds4_test --metal-kernels` OK; `bash -n` OK。未跑大模型。用户脚本验证:
 ① 总速应回 ≥2.0; ② grep dist-mtp: verify 次数应 ≤1 (大概率 0), tok/call ≥1.0;
 ③ 输出 temp=0 逐字一致; ④ 若仍 <2.0: COPY_SPEC=0 A/B 定位。
+
+## 2026-06-10 — 第二十一波: PC.5 code-edit 档 + 投机观测 (给 PC.1 一个能照出收益的负载)
+
+**Context.** 第二十波实测 **2.05 (历史新高)** / prefill 4.71。coord 日志:
+`dist-mtp summary: calls=48 verify=0 tok/call=1.00` —— 最小锚 4 如期滤掉了上轮的弱匹配,
+copy spec 全程零开销, 2.05 = 基线本身 (±噪声) ⇒ "不赔钱"验收通过。但 smoke 短问句
+**系统性测不出** PC.1 收益 (fire 率 0%, project.md PC.5 早有预判) —— 需要编辑型负载。
+
+**Patch.**
+- `tools/mtp_pipe_q2_speed.sh` 增 **`PROMPT_PROFILE=code-edit`** 档 (默认 smoke 不变,
+  历史可比性保留): 给一段 ~20 行 Python (两个函数) + "把 process_data 改名 clean_items,
+  其他不变, 输出完整代码" —— 期望输出 ≈ 大段逐字回显 prompt 中代码, 是 Claude Code
+  Edit/改写回合的缩影。NPRED 224 / RUN_TIMEOUT_SEC 600 (生成长); 显式 PROMPT/NPRED env
+  仍优先。heredoc 单引号定界, prompt 内 ``` 反引号安全 (已独立验证展开)。
+- `COPY_SPEC_DRAFT` 默认 8→12: 自适应抄长 3→6→11, 只有两连全接受后才到顶,
+  回显长段一批最多 13 token; smoke 档永不触发, 不影响基线。
+- 每次 verify 打一行 `ds4: copy-spec verify: anchor=%u sent=%u accepted=%u next_len=%u`
+  (`DS4_DIST_COPY_SPEC_LOG`, 脚本默认开) —— dist-mtp 聚合行看不出逐批接受模式,
+  这行直接显示锚长/赌注/回报/下一注。
+- 脚本末尾摘要 grep 扩为 dist-mtp|copy-spec。
+
+**预期.** code-edit 档: 输出大部分可从 prompt 逐字抄 ⇒ fire 率高、接受长;
+有效 generation 期待 **2.5-4+ t/s** (回显段 ~3×, 改名点/格式点会断)。
+smoke 档跑一次确认仍 ~2.05。两档都报 generation t/s + tok/call。
+
+**Validation performed here.** `make` 零告警; `ds4_test --metal-kernels` OK; `bash -n` OK;
+profile 块 heredoc 展开独立验证 (backtick 不被吞)。未跑大模型。用户脚本验证 (两跑):
+① `tools/mtp_pipe_q2_speed.sh` (smoke 回归 ~2.05);
+② `PROMPT_PROFILE=code-edit tools/mtp_pipe_q2_speed.sh` (PC.1 收益档, 看 generation t/s
+   + 末尾投机摘要 tok/call / copy-spec verify 行);
+③ code-edit 输出应是改名后的完整代码 (正确性目检); ④ RSS 红线不变。
+
+## 2026-06-10 — 第二十二波: 验证批 GPU 路径修复 (5-16 token 批从 mv 慢路转 pair 核)
+
+**Context.** 第二十一波两跑: smoke 2.02 (基线√); **code-edit 档 1.74 (回退)** —— 但复制投机
+功能上大胜: `tok/call=4.85, draft_accept=88.5%`, 9 次 verify 含 12/12 全中连击,
+输出正确 (改名后完整代码)。账: 20 调用/97 token/55.7s ⇒ 每个 12-token 验证批 ~5.1s,
+把投机赢的 token 全吃光。
+**归因 (coord ds4-io):** 批层 drain=100-256ms (单 token 才 ~4ms), gather wall ~65ms,
+两者串行各占一半。对照: prefill 128-token 批 (mm_id GEMM 路径) drain≈163ms = **1.3ms/token/层**;
+verify 12-token 批 ≈ **6-12ms/token/层 = 5-10× 低效**。真因 = kernel 路径分叉:
+`use_mm_id` 要 n_tokens≥32, `use_tiny_pair_mv` 只许 ≤4 (MTP 2-token 验证遗留)
+⇒ **5-31 token 正好掉进最慢的 split-mv 路径** (gate/up 两次独立 matvec dispatch,
+activation 不复用)。专家并集去重倒是成立 (12 token 每层 n_active≈31-68 ≪ 72,
+每 token IO 0.97 vs 1.74GiB); gather 聚合 bw 3.3-5.8GB/s 也健康。
+
+**Patch.** `ds4_metal.m` 批 MoE 路径: `use_tiny_pair_mv` 上限 4 → `DS4_METAL_MOE_TINY_PAIR_MAX`
+(默认 16, =4 即旧行为可 A/B)。pair 核 dispatch grid = (n_expert×n_tokens) pairs 本就形状
+通用, kc≤4 验证批已在用 (正确性已证); 下游 swiglu_weight/down 全按 pair_rows 走, 无批大小
+假设。只影响 5-16 token 批 = 仅 verify 负载; decode(1)/prefill(≥32) 路径零变化。
+
+**预期.** 批 drain 69ms 均值 → 期待 ~15-30ms ⇒ 12-token 批 ~5.1s → ~3.3-3.8s;
+全中连击轮 13 token/(0.5+3.5s) ≈ 3.2 t/s ⇒ code-edit 档期待 **2.3-2.8**。
+下一波若 gather (65ms/层, GPU 空转) 成为批主项: 批感知 staging lookahead
+(12 行 hidden 的 L+1 路由预测) 或哈希层 (0-2) 批前置预拉。
+
+**Validation performed here.** `make` (ds4_metal.m 4 个 warning 为早前波次遗留死代码,
+非本补丁); `ds4_test --metal-kernels` OK。未跑大模型。用户脚本验证 (两跑):
+① `PROMPT_PROFILE=code-edit tools/mtp_pipe_q2_speed.sh` — 主验收: generation 期待 ≥2.3,
+   copy-spec verify 行不变 (接受率与上轮持平), 批层 drain_ms 应显著缩水;
+② `tools/mtp_pipe_q2_speed.sh` — smoke 回归 ~2.0 (本补丁不该碰单 token 路径);
+③ code-edit 输出仍是正确的改名代码; ④ 若回退: DS4_METAL_MOE_TINY_PAIR_MAX=4 复旧。
+
+## 2026-06-10 — 第二十三波: 验证批转 mm_id 分组 GEMM (专家权重每层只读一次) + 逐批往返计时
+
+**Context.** 第二十二波实测: code-edit 1.74→**1.80** (+3.4%, 远低于预期), smoke 2.02 (√)。
+tiny_pair 几乎没用 ⇒ 第二十二波对 drain 的归因 (split-mv dispatch 低效) 不完整。
+重新算账: pair/mv 路径都是 **token-major**, 每个 (expert,token) pair 完整重读该专家权重
+—— 12-token 批 72 对 ≈ 486MiB/层 (vs 并集 270MiB), 且 matvec 形核有效带宽低;
+mm_id GEMM 路径的 map0 核按专家分桶, **每个活跃专家权重恰好读一次** (expert-major),
+这正是批该有的读取形态。旧阈值 ≥32 是 MTP 2-token 时代定的; PC.1 的 5-12 token 批
+正好卡在慢缝里。(注: code-edit 跑的日志已被 smoke 跑覆盖, 本波新 drain 值缺失 ——
+为此本波加了逐批计时, 以后每轮都有一手数据。)
+
+**Patch.**
+- `ds4_metal.m` 批 MoE: `use_mm_id` 阈值 32 → `DS4_METAL_MOE_MM_ID_MIN` (默认 **8**;
+  =32 复旧, =0 禁用)。map0_ne20_6 核已存在; mm_id 对 n_tokens 通用 (map 桶 + 按专家 GEMM,
+  tile padding 浪费算力但权重读次数=1, 而读才是瓶颈)。kc=5-7 仍走 pair (TINY_PAIR_MAX=16
+  保留), kc≥8 走 mm_id; decode(1)/prefill(≥32) 不变。
+- `ds4_distributed.c` 投机轮计时: copy-spec verify 行加 `r1_ms` (单 token 轮 = 基线单价)
+  与 `r2_ms` (kc-token 批轮) —— 一行看清每轮经济账 (r2/r1 vs accepted), 不再依赖
+  日志被覆盖前的 ds4-io 推算。
+
+**算账.** 若 mm_id 让批 MoE 读降到并集一次 (~270MiB@GEMM 带宽 ≈3-5ms/层), 批层 drain
+应从 ~69ms 落到 ~10-20ms; 12-token 批 ~5s → **~3-3.5s** ⇒ 全中连击轮 13 token/(0.5+3.2)
+≈ 3.5 t/s, code-edit 端到端期待 **≥2.3**。若 r2_ms 仍 ~5000: 大头不在 MoE kernel ——
+下一步用 r1/r2 + 两机 ds4-io 切分 coord/worker、gather/GPU, 再决定是否上双机批流水
+(micro-chunk 重叠两机) 或批感知 staging。
+
+**Validation performed here.** `make` 无新告警 (4 个 legacy 警告同前); `ds4_test
+--metal-kernels` OK。未跑大模型。用户脚本验证 (两跑):
+① `PROMPT_PROFILE=code-edit tools/mtp_pipe_q2_speed.sh` — 看 generation 与每行
+   copy-spec verify 的 r2_ms (期待 ≤3500); ② smoke 回归 ~2.0;
+③ code-edit 输出仍正确; ④ A/B: DS4_METAL_MOE_MM_ID_MIN=32 复旧。
+
+## 2026-06-10 — 第二十四波: 批冷读 F_NOCACHE — verify 不再冲掉 backbone 热页 (PC.1 性能修复 v4)
+
+**Context.** 第二十三波实测: code-edit **1.68** (又降, 1.80→1.68), 输出正确。r1/r2 计时立功:
+```
+anchor=4  sent=4  acc=2  r1= 548 r2=1745     (早期, verify 稀疏)
+anchor=17 sent=12 acc=12 r1=1420 r2=4887
+anchor=32 sent=12 acc=12 r1=2123 r2=4435     (后期, verify 连发)
+anchor=32 sent=12 acc=4  r1=2361 r2=4575
+```
+三个事实: ① r2≈4.5s 里 GPU 已不是大头 (mm_id 生效: 批 drain 均值 69→38ms), 现在是 IO ——
+每次 verify 全网冷读 ≈11.6GiB (每层每侧 cold 250-300MiB, hit≈0), 两侧串行 ≈4.3s = W2 墙;
+② **r1 (单 token 轮) 从 548ms 涨到 2361ms** —— 这才是本轮回归主因; ③ 切分定位:
+两机 gather wall 早晚不变 (coord 6.7→8.4ms, worker 6.0→6.9ms), worker drain 微涨
+(5.6→8.3ms), **coord 单 token drain 14.5→46.2ms/层** (p50 9.4 / p90 55 / max **855ms**,
+尖刺集中在每帧前几层) ⇒ ×20 层 ≈ 每 token 多付 ~630ms。
+
+**诊断.** drain = 等上一层 GPU 命令完成 = GPU 在执行中重新缺页读 **mmap 常驻的 backbone**
+(Q8 attn/shared, coord 侧 4.07GiB no-copy mmap 视图)。每次 verify 在 coord 侧 pread 冷读
+~5.8GiB 一次性专家字节 (批 hit_mib≡0, 零复用价值), 把页缓存里的 backbone 热页全部挤掉;
+紧随其后的 round-1 前几层 GPU 踩缺页 (mini 盘 2.4GB/s 随机) → 855ms 级 drain 尖刺。
+r1 不是"单调变慢", 是"离上一次 verify 越近越慢": 后期 next_len=11 让 verify 连发,
+每个 round-1 都落在污染窗口里。经济账: 9 次 verify × r2 4.3s + 20 次 round-1 × ~1.5s
+≈ 69s/117 tok = 1.7 t/s (对上实测); 若 r1 回到 550ms ⇒ ~50s ≈ **2.3 t/s**, 不动 r2 也能赢。
+
+**Patch.** `ds4_metal.m`: 批站点 (verify 轮 + prefill gather 回退, n_tokens>1) 的冷读 pread
+改走**独立 F_NOCACHE 描述符** (`ds4_gpu_expert_pread_fd_nocache`, 懒打开一次), 一次性字节
+绕开页缓存, 不再驱逐 backbone/staging 热页; decode 站点显式保持 cached fd (热命中受益),
+prefill 全层 stream 路径不动。默认开, `DS4_METAL_EXPERT_BATCH_NOCACHE=0` 复旧 (A/B)。
+per-call 标志在两个串行 encode 入口设置 (与既有 "serial entry resolves statics" 模式一致),
+NOCACHE fd 打不开时自动回退 cached fd。既有全局旋钮 `DS4_METAL_EXPERT_PREAD_NOCACHE` 语义不变。
+
+**代价权衡.** NOCACHE 让连续 verify 间重叠的专家字节失去页缓存复用 —— 但实测批 pread 本就
+~全冷 (hit_mib=0), 损失上限远小于每 token ~630ms 的 backbone 重缺页税。若本波后 coord 单
+token drain 仍 >20ms/层: 下一杆是 mlock/wire coordinator backbone 切片 (4.07GiB, 需重新核
+12GiB 红线下的 RSS 余量)。r2≈4.3s 的下一杆是双机批流水 (两机 IO 串行→重叠, 理论 ~2.3s)。
+
+**Validation performed here.** `make` 无新告警 (4 个 legacy 警告同前); `ds4_test
+--metal-kernels` OK。未跑大模型。用户脚本验证 (两跑):
+① `PROMPT_PROFILE=code-edit tools/mtp_pipe_q2_speed.sh` — 期待 generation ≥2.2,
+   copy-spec verify 行 r1_ms 回到 ~550-700 且不再随 verify 连发爬升;
+② smoke 回归 ~2.0 (verify 不发, NOCACHE 不触发, 应零影响);
+③ A/B: DS4_METAL_EXPERT_BATCH_NOCACHE=0 应复现 r1 爬升。

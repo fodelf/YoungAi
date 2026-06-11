@@ -6112,10 +6112,12 @@ int ds4_dist_session_eval_speculative(
     r1.draft_cap = copy_spec ? 0u : (uint32_t)K;
     r1.accept_len = d->spec_accept_pending ? d->spec_accept_len : 0u;
 
+    const double r1_t0 = dist_now_sec();
     int rc = dist_coordinator_eval_span(&d->state, owner, &d->plan,
                                         &first_token, 1, p,
                                         d->session_id, d->request_id++,
                                         false, logits, &r1, err, errlen);
+    const double r1_ms = (dist_now_sec() - r1_t0) * 1000.0;
     d->spec_accept_pending = false;
     d->spec_accept_len = 0;
     if (rc != 0) {
@@ -6140,6 +6142,7 @@ int ds4_dist_session_eval_speculative(
      * the most recent earlier occurrence of the trailing n-gram of
      * (transcript + next). A miss costs nothing: draft_n stays 0, we return
      * just first_token and never issue Round 2 (plain-decode behavior). */
+    uint32_t copy_anchor = 0;
     if (copy_spec) {
         r1.draft_n = 0;
         if (d->copy_spec_len == 0) d->copy_spec_len = dist_copy_spec_init_len();
@@ -6153,12 +6156,12 @@ int ds4_dist_session_eval_speculative(
             ds4_tokens_push(&transcript, next);
             int copied[15];
             uint32_t n_copy = 0;
-            (void)dist_copy_spec_match(transcript.v,
-                                       (uint32_t)transcript.len,
-                                       dist_copy_spec_ngram(),
-                                       want,
-                                       copied,
-                                       &n_copy);
+            copy_anchor = dist_copy_spec_match(transcript.v,
+                                               (uint32_t)transcript.len,
+                                               dist_copy_spec_ngram(),
+                                               want,
+                                               copied,
+                                               &n_copy);
             transcript.len--;  /* pop `next`: the rebuild fallback below must
                                 * see exactly the committed prefix. */
             /* Never draft past EOS. */
@@ -6217,10 +6220,12 @@ int ds4_dist_session_eval_speculative(
     r2.extra_flags = DS4_DIST_WORK_F_VERIFY;
     r2.verify_logits = vlogits;
 
+    const double r2_t0 = dist_now_sec();
     rc = dist_coordinator_eval_span(&d->state, owner, &d->plan,
                                     verify_tokens, kc, p + 1u,
                                     d->session_id, d->request_id++,
                                     false, logits, &r2, err, errlen);
+    const double r2_ms = (dist_now_sec() - r2_t0) * 1000.0;
     if (rc != 0) {
         /* Verify transport failed: resync both machines to [checkpoint+first_token]
          * via the rebuild fallback and emit just first_token. */
@@ -6266,6 +6271,14 @@ int ds4_dist_session_eval_speculative(
             d->copy_spec_len = grown;
         } else if (tail_ok <= 1u) {
             d->copy_spec_len = dist_copy_spec_init_len();
+        }
+        if (dist_env_enabled("DS4_DIST_COPY_SPEC_LOG")) {
+            /* r1 = the plain single-token round (baseline unit cost), r2 = the
+             * kc-token verify batch. r2_ms/r1_ms vs accepted is the whole
+             * economics of a round in one line. */
+            fprintf(stderr,
+                    "ds4: copy-spec verify: anchor=%u sent=%u accepted=%u next_len=%u r1_ms=%.0f r2_ms=%.0f\n",
+                    copy_anchor, kc, m, d->copy_spec_len, r1_ms, r2_ms);
         }
     }
 
