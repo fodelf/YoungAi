@@ -5228,13 +5228,77 @@ int ds4_gpu_set_model_fd(int fd) {
     return 1;
 }
 
+/* Wave 25: backbone wiring.  Verify rounds stream GiBs of one-shot expert
+ * bytes and evict the mmap-resident backbone (Q8 attention/shared) pages;
+ * the next frame's GPU work then re-faults the backbone inside command
+ * execution (measured: coord decode drain 14.5 -> 46ms/layer, spikes 855ms).
+ * Instead of bending the batch IO around the page cache, pin the backbone:
+ * every model range the encoder wraps for GPU use is by definition this
+ * machine's working set -- mlock it once (routed expert tensors are
+ * suppressed at their wrap sites; they are gathered, not mapped).
+ * DS4_METAL_BACKBONE_MLOCK=1 enables (script sets it per side);
+ * DS4_METAL_BACKBONE_MLOCK_BUDGET_MB caps the wired total (default 4608). */
+static int g_wrap_mlock_suppress;   /* set around routed-expert wrap calls */
+
+static void ds4_gpu_backbone_mlock_register(const void *model_map,
+                                            uint64_t offset,
+                                            uint64_t len) {
+    static int enabled = -1;
+    static uint64_t budget_bytes;
+    static uint64_t wired_bytes;
+    static uint64_t logged_half_gib;
+    static int budget_warned;
+    static uint32_t n_ranges;
+    static struct { uint64_t off, len; } ranges[4096];
+    if (enabled < 0) {
+        const char *v = getenv("DS4_METAL_BACKBONE_MLOCK");
+        enabled = (v && *v && v[0] != '0') ? 1 : 0;
+        if (enabled) {
+            const char *b = getenv("DS4_METAL_BACKBONE_MLOCK_BUDGET_MB");
+            uint64_t mb = b ? strtoull(b, NULL, 10) : 0;
+            if (mb == 0) mb = 4608;
+            budget_bytes = mb << 20;
+            fprintf(stderr, "ds4: backbone mlock enabled (budget %llu MiB)\n",
+                    (unsigned long long)mb);
+        }
+    }
+    if (!enabled || len == 0 || g_wrap_mlock_suppress) return;
+    for (uint32_t i = 0; i < n_ranges; i++) {
+        if (ranges[i].off == offset && ranges[i].len == len) return;
+    }
+    if (n_ranges >= 4096) return;
+    ranges[n_ranges].off = offset;
+    ranges[n_ranges].len = len;
+    n_ranges++;
+    const uint64_t page = (uint64_t)getpagesize();
+    const uint64_t start = offset & ~(page - 1u);
+    const uint64_t end = (offset + len + page - 1u) & ~(page - 1u);
+    if (wired_bytes + (end - start) > budget_bytes) {
+        if (!budget_warned) {
+            budget_warned = 1;
+            fprintf(stderr,
+                    "ds4: backbone mlock budget exhausted at %.2f GiB (%u ranges); "
+                    "remaining ranges stay evictable\n",
+                    ds4_gpu_gib(wired_bytes), n_ranges);
+        }
+        return;
+    }
+    if (mlock((const uint8_t *)model_map + start, (size_t)(end - start)) == 0) {
+        wired_bytes += end - start;
+        if ((wired_bytes >> 29) > logged_half_gib) {   /* log every 512MiB */
+            logged_half_gib = wired_bytes >> 29;
+            fprintf(stderr, "ds4: backbone mlock wired %.2f GiB (%u ranges)\n",
+                    ds4_gpu_gib(wired_bytes), n_ranges);
+        }
+    }
+}
+
 static id<MTLBuffer> ds4_gpu_wrap_model_range(
         const void *model_map,
         uint64_t    model_size,
         uint64_t    offset,
         uint64_t    len,
         uint64_t   *inner_offset) {
-    (void)model_map;
     if (model_size == 0 || offset > model_size || len > model_size - offset) {
         fprintf(stderr, "ds4: Metal model range is outside the mapped model\n");
         return nil;
@@ -5249,6 +5313,7 @@ static id<MTLBuffer> ds4_gpu_wrap_model_range(
         const uint64_t view_start = g_model_views[i].model_offset;
         const uint64_t view_end = view_start + g_model_views[i].bytes;
         if (offset >= view_start && end <= view_end) {
+            ds4_gpu_backbone_mlock_register(model_map, offset, len);
             *inner_offset = offset - view_start;
             return g_model_views[i].buffer;
         }
@@ -16908,6 +16973,26 @@ static int ds4_gpu_expert_batch_nocache_enabled(void) {
     return cached;
 }
 
+/* Wave 25 A/B verdict: NOCACHE won on first-touch prefill chunks (smoke
+ * 2.02 -> 2.09) but lost on kc<=16 verify rounds (code-edit 1.68 -> 1.48):
+ * verify unions overlap decode-hot experts and neighbouring rounds, so
+ * bypassing the cache re-reads warm bytes from the slow mini SSD.  Keep
+ * NOCACHE for big (prefill-sized) batches only; backbone protection against
+ * verify eviction moves to the mlock pin (see ds4_gpu_backbone_mlock_register). */
+static uint32_t ds4_gpu_expert_batch_nocache_min_tokens(void) {
+    static uint32_t cached;
+    static int init;
+    if (!init) {
+        const char *v = getenv("DS4_METAL_EXPERT_BATCH_NOCACHE_MIN");
+        uint64_t n = v ? strtoull(v, NULL, 10) : 0;
+        if (n == 0) n = 24;          /* verify kc<=16 stays cached */
+        if (n > UINT32_MAX) n = UINT32_MAX;
+        cached = (uint32_t)n;
+        init = 1;
+    }
+    return cached;
+}
+
 static int ds4_gpu_expert_pread_fd_nocache(void) {
     static int cached_fd = -2;
     if (cached_fd == -2) {
@@ -18809,9 +18894,11 @@ int ds4_gpu_routed_moe_one_tensor(
         uint64_t gate_inner = 0;
         uint64_t up_inner = 0;
         uint64_t down_inner = 0;
+        g_wrap_mlock_suppress = 1;   /* routed expert tensors: gathered, never wired */
         id<MTLBuffer> gate_buf = ds4_gpu_wrap_model_range(model_map, model_size, gate_offset, gate_tensor_bytes, &gate_inner);
         id<MTLBuffer> up_buf = ds4_gpu_wrap_model_range(model_map, model_size, up_offset, gate_tensor_bytes, &up_inner);
         id<MTLBuffer> down_buf = ds4_gpu_wrap_model_range(model_map, model_size, down_offset, down_tensor_bytes, &down_inner);
+        g_wrap_mlock_suppress = 0;
         if (!gate_buf || !up_buf || !down_buf) return 0;
         uint32_t source_n_total_expert = n_total_expert;
 
@@ -19254,9 +19341,11 @@ int ds4_gpu_routed_moe_batch_tensor(
         uint64_t gate_inner = 0;
         uint64_t up_inner = 0;
         uint64_t down_inner = 0;
+        g_wrap_mlock_suppress = 1;   /* routed expert tensors: gathered, never wired */
         id<MTLBuffer> gate_buf = ds4_gpu_wrap_model_range(model_map, model_size, gate_offset, gate_tensor_bytes, &gate_inner);
         id<MTLBuffer> up_buf = ds4_gpu_wrap_model_range(model_map, model_size, up_offset, gate_tensor_bytes, &up_inner);
         id<MTLBuffer> down_buf = ds4_gpu_wrap_model_range(model_map, model_size, down_offset, down_tensor_bytes, &down_inner);
+        g_wrap_mlock_suppress = 0;
         if (!gate_buf || !up_buf || !down_buf) return 0;
         uint32_t source_n_total_expert = n_total_expert;
 
@@ -19274,11 +19363,12 @@ int ds4_gpu_routed_moe_batch_tensor(
             down_type == DS4_METAL_TENSOR_Q2_K;
         if (a3_expert_offload) {
             const int io_profile = ds4_gpu_expert_io_profile_enabled();
-            /* Batch bytes (verify rounds, prefill gather fallback) are one-shot:
-             * keep them out of the page cache so they stop evicting the
-             * mmap-resident backbone between frames. */
+            /* Prefill-sized batch bytes are one-shot first-touch reads: keep
+             * them out of the page cache.  Verify rounds (kc<=16) stay cached
+             * -- their unions overlap decode-hot experts (wave 25 A/B). */
             g_expert_gather_nocache_call =
-                (n_tokens > 1u) && ds4_gpu_expert_batch_nocache_enabled();
+                (n_tokens >= ds4_gpu_expert_batch_nocache_min_tokens()) &&
+                ds4_gpu_expert_batch_nocache_enabled();
             const int was_batched = (g_batch_cb != nil);
             double drain_ms = 0.0;
             if (was_batched) {

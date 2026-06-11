@@ -176,9 +176,10 @@ EXPERT_EVENT_DRAIN=${EXPERT_EVENT_DRAIN:-1}
 #   - 自适应抄长: 初始 INIT=3, 全接受翻倍 (≤DRAFT-1), (近)全拒回 INIT; 抄长 <MIN=2 不发批。
 # A/B 回退: COPY_SPEC=0。接受率看 coordinator 日志 dist-mtp 行 (tok/call, verify 次数)。
 COPY_SPEC=${COPY_SPEC:-1}
-# DRAFT=12: 自适应抄长 3→6→11 (两连全接受后才会到顶), 回显长段一批最多 13 token/
-# ~2s ≈ 3× 有效; smoke 档永不触发, 不影响基线。协议上限 16。
-COPY_SPEC_DRAFT=${COPY_SPEC_DRAFT:-12}         # 验证批上限 (argmax + ≤DRAFT-1 个抄来的 token)
+# DRAFT=16 (协议上限): 第二十五波实测 6/9 轮 12/12 全中、next_len 顶在 11 —— 接受率
+# 撑得起更大赌注。批 IO 并集随 kc 次线性增长 (43→~50 专家/层), 全中轮边际 ≈5 t/s。
+# 自适应抄长 3→6→12→15 (全接受翻倍, 顶 DRAFT-1)。smoke 档永不触发, 不影响基线。
+COPY_SPEC_DRAFT=${COPY_SPEC_DRAFT:-16}         # 验证批上限 (argmax + ≤DRAFT-1 个抄来的 token)
 COPY_SPEC_NGRAM=${COPY_SPEC_NGRAM:-4}          # 最小锚长 (最长后缀匹配须 ≥ 此值才信)
 COPY_SPEC_INIT=${COPY_SPEC_INIT:-3}            # 自适应抄长初始值/重置值
 COPY_SPEC_MIN=${COPY_SPEC_MIN:-2}              # 抄长低于此不发验证批 (赔不起往返)
@@ -309,6 +310,14 @@ EXPERT_PROFILE_INTERVAL=${EXPERT_PROFILE_INTERVAL:-0}
 EXPERT_PROFILE_ALL=${EXPERT_PROFILE_ALL:-0}
 LOCAL_PROFILE_ENV=""
 REMOTE_PROFILE_ENV=""
+# 第二十五波: coordinator backbone mlock —— verify 批冷读不再驱逐 mmap 常驻 backbone 热页
+# (r1 548→2361ms 爬升的根治; NOCACHE 收窄到 prefill 量级批, verify 批回 cached fd)。
+# BACKBONE_MLOCK=0 关闭; BACKBONE_MLOCK_BUDGET_MB 调钉住预算 (coordinator 切片 ~4.07GiB)。
+BACKBONE_MLOCK=${BACKBONE_MLOCK:-1}
+BACKBONE_MLOCK_BUDGET_MB=${BACKBONE_MLOCK_BUDGET_MB:-4608}
+if [ "$BACKBONE_MLOCK" = 1 ]; then
+  LOCAL_PROFILE_ENV="$LOCAL_PROFILE_ENV DS4_METAL_BACKBONE_MLOCK=1 DS4_METAL_BACKBONE_MLOCK_BUDGET_MB=$BACKBONE_MLOCK_BUDGET_MB"
+fi
 if [ "$EXPERT_PROFILE" = 1 ]; then
   LOCAL_PROFILE_ENV="DS4_METAL_EXPERT_OFFLOAD_PROFILE=1 DS4_METAL_EXPERT_PROFILE_CACHE_MB=$LOCAL_EXPERT_PROFILE_CACHE_MB DS4_METAL_EXPERT_PROFILE_TOP=$EXPERT_PROFILE_TOP DS4_METAL_EXPERT_PROFILE_INTERVAL=$EXPERT_PROFILE_INTERVAL"
   REMOTE_PROFILE_ENV="DS4_METAL_EXPERT_OFFLOAD_PROFILE=1 DS4_METAL_EXPERT_PROFILE_CACHE_MB=$REMOTE_EXPERT_PROFILE_CACHE_MB DS4_METAL_EXPERT_PROFILE_TOP=$EXPERT_PROFILE_TOP DS4_METAL_EXPERT_PROFILE_INTERVAL=$EXPERT_PROFILE_INTERVAL"
@@ -331,11 +340,25 @@ DEBUG_ARGS=""
 # NO_MODEL_WARMUP 避免启动时扫冷 expert views。
 BASE_RUN_ENV=${BASE_RUN_ENV:-"DS4_DIST_REVERSE_CONNECT=1 DS4_METAL_PREFILL_CHUNK=$PREFILL_CHUNK DS4_DIST_PREFILL_CAP=$DIST_PREFILL_CAP DS4_METAL_EXPERT_OFFLOAD=1 DS4_METAL_EXPERT_OFFLOAD_DIRECT=0 DS4_METAL_EXPERT_GATHER_THREADS=$GATHER_THREADS DS4_METAL_NO_MODEL_WARMUP=1 $IO_ENV $COPY_SPEC_ENV"}
 # 远程专家字节服务: coordinator (本机) 当客户端拉 worker 盘; worker 当服务端。
+# 第二十六波反向 efetch (EXPERT_REMOTE_FETCH_REVERSE=1, 默认开):
+#   verify 批的 worker 半程 (~2.3s, 23 层×~270MiB 冷读) 期间 mini SSD 完全闲置 ——
+#   让 mini 也起 serve、worker 也当客户端, worker 的 ≥96 单元批 gather racing 把一部分
+#   单元经雷电拉 mini 盘 (聚合 ≈5.5+~2 GB/s)。两侧 serve/client 同端口号不冲突 (各连对方)。
+#   关键不变量: worker 端 DS4_METAL_EXPERT_STAGE=0 显式压住 (FETCH_HOST 会自动激活 staging,
+#   decode 期 worker staging 拉 mini 慢忙盘是负收益; racing 只动 ≥96 单元批, decode 18 单元不沾)。
 LOCAL_FETCH_ENV=""
 REMOTE_FETCH_ENV=""
+EXPERT_REMOTE_FETCH_REVERSE=${EXPERT_REMOTE_FETCH_REVERSE:-1}
+COORD_IP=${COORD_IP:-$(ipconfig getifaddr "$(route -n get "$WORKER_IP" 2>/dev/null | awk '/interface:/{print $2}')" 2>/dev/null)}
 if [ "$EXPERT_REMOTE_FETCH" = 1 ]; then
   LOCAL_FETCH_ENV="DS4_DIST_EXPERT_FETCH_HOST=$WORKER_IP DS4_DIST_EXPERT_FETCH_PORT=$EXPERT_FETCH_PORT DS4_DIST_EXPERT_FETCH_CONNS=$EXPERT_REMOTE_FETCH_CONNS"
   REMOTE_FETCH_ENV="DS4_DIST_EXPERT_FETCH_SERVE=1 DS4_DIST_EXPERT_FETCH_PORT=$EXPERT_FETCH_PORT"
+  if [ "$EXPERT_REMOTE_FETCH_REVERSE" = 1 ] && [ -n "$COORD_IP" ]; then
+    LOCAL_FETCH_ENV="$LOCAL_FETCH_ENV DS4_DIST_EXPERT_FETCH_SERVE=1"
+    REMOTE_FETCH_ENV="$REMOTE_FETCH_ENV DS4_DIST_EXPERT_FETCH_HOST=$COORD_IP DS4_DIST_EXPERT_FETCH_CONNS=$EXPERT_REMOTE_FETCH_CONNS DS4_METAL_EXPERT_STAGE=0"
+  elif [ "$EXPERT_REMOTE_FETCH_REVERSE" = 1 ]; then
+    echo "[mtp-pipe] 警告: 未能探测 COORD_IP, 反向 efetch 跳过 (可手动 COORD_IP=... 重跑)" >&2
+  fi
 fi
 # RUN_ENV 仍可一把覆盖两边；LOCAL_RUN_ENV/REMOTE_RUN_ENV 可分别覆盖。
 LOCAL_RUN_ENV=${LOCAL_RUN_ENV:-${RUN_ENV:-"$BASE_RUN_ENV $LOCAL_PROFILE_ENV $LOCAL_FETCH_ENV"}}
@@ -495,4 +518,9 @@ if ssh "$REMOTE" "grep -qiE 'expert-(profile|pool|source-cache)' '$WORKER_LOG'" 
 fi
 [ "$timeout_flag" = 1 ] && log "(注: 本次达到 ${RUN_TIMEOUT_SEC}s 超时后被脚本杀停，上面是超时日志快照)"
 [ "$timeout_flag" != 1 ] && [ "$done_flag" = 1 ] || [ "$timeout_flag" = 1 ] || log "(注: coordinator 未正常结束, 上面是当前日志快照)"
+# 第二十五波: 按 profile 留档 —— 第二跑不再覆盖第一跑的取证日志 (第二十三/二十四波两次吃亏)。
+cp -f "$COORD_LOG" "/tmp/mtp_pipe_coord.${PROMPT_PROFILE}.log" 2>/dev/null || true
+cp -f "$COORD_OUT" "/tmp/mtp_pipe_coord.${PROMPT_PROFILE}.out" 2>/dev/null || true
+scp -q "$REMOTE:$WORKER_LOG" "/tmp/mtp_pipe_worker.${PROMPT_PROFILE}.log" 2>/dev/null || true
+log "日志留档: /tmp/mtp_pipe_coord.${PROMPT_PROFILE}.log|.out, /tmp/mtp_pipe_worker.${PROMPT_PROFILE}.log"
 cleanup

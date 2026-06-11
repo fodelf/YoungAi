@@ -2250,3 +2250,81 @@ token drain 仍 >20ms/层: 下一杆是 mlock/wire coordinator backbone 切片 (
    copy-spec verify 行 r1_ms 回到 ~550-700 且不再随 verify 连发爬升;
 ② smoke 回归 ~2.0 (verify 不发, NOCACHE 不触发, 应零影响);
 ③ A/B: DS4_METAL_EXPERT_BATCH_NOCACHE=0 应复现 r1 爬升。
+
+## 2026-06-10 — 第二十五波: backbone mlock 钉住 + NOCACHE 收窄到 prefill 批 (PC.1 性能修复 v5)
+
+**Context.** 第二十四波实测: smoke **2.09 (历史新高)** / code-edit **1.48 (又降)**。
+A/B 判决清晰: NOCACHE 对**纯冷首读**(prefill gather 块, n_tokens=25+) 是赢的 —— smoke 的
+prefill 字节不再冲热页, decode 起步更暖 (+0.07); 但对 **verify 批 (kc≤16) 是输的** ——
+verify 并集与 decode 热专家/相邻轮次有页缓存重叠, NOCACHE 强制从慢盘 (mini 2.4GB/s)
+重读本来已暖的字节, 1.68→1.48。(code-edit 日志再次被第二跑覆盖 —— 本波起脚本按
+profile 留档, 不再瞎。)
+
+**结论修正.** r1 爬升 (548→2361ms, backbone 被 verify 冷读驱逐) 的正确解法不是绕开页缓存
+(NOCACHE, 砍掉复用), 而是**把 backbone 钉死** (mlock), 让 verify 随便读、页缓存随便换,
+backbone 永不掉页。
+
+**Patch.**
+- `ds4_metal.m` backbone mlock: `ds4_gpu_wrap_model_range` 命中视图返回前注册该
+  (offset,len) 并 mlock (页对齐, 去重表 4096 项, 预算门控)。encoder wrap 过的范围
+  =本机工作集的精确定义, 无需层拓扑知识; 两个 a3 站点的 routed expert 张量 wrap 用
+  `g_wrap_mlock_suppress` 抑制 (72.6GiB 绝不能进 mlock)。`DS4_METAL_BACKBONE_MLOCK=1`
+  开启 (默认关), `_BUDGET_MB` 默认 4608 (coordinator 切片 ~4.07GiB); 超预算/失败打一行
+  警告后优雅降级为可驱逐。每 512MiB 打进度行 `backbone mlock wired N GiB`。
+- `ds4_metal.m` NOCACHE 收窄: 批站点 NOCACHE 条件 n_tokens>1 → `n_tokens ≥
+  DS4_METAL_EXPERT_BATCH_NOCACHE_MIN` (默认 **24**): prefill 块 (25/128) 保持 NOCACHE
+  (smoke 新高保住), verify 批 (kc≤16) 回 cached fd (页缓存复用回来)。
+- `tools/mtp_pipe_q2_speed.sh`: ① `BACKBONE_MLOCK=1` 默认开, 只加在 LOCAL_PROFILE_ENV
+  (coordinator 侧; worker drain 仅 5.6→8.3ms 不值钉, 且 8GiB 红线更紧); ② 跑完按
+  profile 留档: cp coord log/out + scp worker log → `/tmp/mtp_pipe_{coord,worker}.<profile>.{log,out}`。
+
+**RSS 账.** mlock 钉的是 mmap 文件页 (本来 decode 稳态就常驻), 不新增分配; 它只是禁止
+verify 高峰时驱逐 → coordinator 峰值 RSS ≈ 钉住 4.07GiB + KV/scratch/staging 同前,
+预算 4608MiB 留了余量, 超出部分自动不钉。watchdog 12GiB 红线照常兜底。
+
+**期望.** code-edit: r1 回 ~550-700ms 且不随 verify 连发爬升 (mlock 防驱逐) + verify 批
+pread 部分页缓存复用回来 (r2 ≤4.3s) ⇒ 9×4.3 + 20×0.6 ≈ 51s/117tok ≈ **2.2-2.3**;
+smoke: mlock 无副作用 (本来常驻) + prefill NOCACHE 保留 ⇒ **~2.09 持平**。
+
+**Validation performed here.** `make` 无新告警; `ds4_test --metal-kernels` OK;
+`bash -n` 脚本语法 OK。未跑大模型。用户脚本验证 (两跑):
+① `PROMPT_PROFILE=code-edit tools/mtp_pipe_q2_speed.sh` — 期待 ≥2.2; 看 coord 日志
+   `backbone mlock wired` 总量 (~4.0GiB) 与 copy-spec verify 行 r1_ms (期待稳 ~550-700);
+② smoke 回归 ~2.09; ③ 留档生效后两份日志我都能看;
+④ A/B 旋钮: BACKBONE_MLOCK=0 / DS4_METAL_EXPERT_BATCH_NOCACHE_MIN=2 (复现 24 波) /
+   DS4_METAL_EXPERT_BATCH_NOCACHE=0 (全关)。
+
+## 2026-06-10 — 第二十六波: DRAFT 16 + 反向 efetch (worker 批 gather 拉 mini 闲盘) — 纯脚本波
+
+**Context.** 第二十五波实测: code-edit 1.48→**1.95 (历史新高)** / smoke 2.02。
+mlock 完全起效: `backbone mlock wired 4.08 GiB (547 ranges)`, **r1 稳在 578-874ms**
+(上波 548→2361 爬升消失)。账面全对上: tok/call=4.85×20 calls=97 token, 97/1.95≈49.7s
+≈ Σr1(14.2s)+Σr2(35.7s) —— **没有失踪时间, r2 就是剩下的全部大头 (73%)**。
+r2 现状: kc=12 要 4.6-5.6s, 其中两机 IO 串行 (coord 20 层 ~2.0s → worker 23 层 ~2.3s),
+每层 wall≈60ms gather + ~38ms drain。6/9 轮 12/12 全中, next_len 顶在 K-1=11。
+
+**两刀 (都是脚本, 引擎零改动).**
+1. `COPY_SPEC_DRAFT` 12→**16** (协议上限): 接受率 88%/全中 6 次撑得起更大赌注。
+   批专家并集随 kc 次线性 (~43→50/层, +16% IO), 全中轮 13→17 token/round,
+   边际 4 token/~0.8s ≈ 5 t/s。自适应抄长变 3→6→12→15。引擎已验: K 钳位 2-16,
+   verify_tokens[16]/spec_logits 16 行/CLI toks[17] 全部够位。
+2. **反向 efetch** (`EXPERT_REMOTE_FETCH_REVERSE=1` 默认开): verify 批的 worker 半程
+   ~2.3s 里 mini SSD 完全闲置。engine 的 serve/client 全 env 驱动且角色无关 —— 脚本让
+   mini 也 `FETCH_SERVE=1`、worker 也 `FETCH_HOST=$COORD_IP` (auto-detect: route+ipconfig,
+   本机=192.168.1.3); worker 的 ≥96 单元批 racing 把部分单元拉 mini 盘, worker 半程聚合
+   ≈5.5(本地)+~1.5-2(雷电→mini 盘) GB/s ⇒ ~2.3s→~1.7s, r2 -0.5s 左右。
+   **关键不变量**: REMOTE 侧显式 `DS4_METAL_EXPERT_STAGE=0` —— stage_enabled 的条件是
+   STAGE&&FETCH_HOST, 不压住的话 worker 会在 decode 期开 staging 拉 mini 慢忙盘 (负收益);
+   shell 前缀赋值后者覆盖 BASE_RUN_ENV 里的 STAGE=1, 已核实启动行形态。
+   racing 只动 ≥96 单元批 (verify/prefill gather 回退), decode 18 单元不沾 —— decode 路径零变化。
+
+**期望.** code-edit: 全中轮 (0.7+~5.5s)/17tok ≈ 2.8 t/s round-rate, 反向 racing 再 -0.5s
+⇒ 端到端 **~2.2-2.4**; smoke: DRAFT/efetch 都不触发 (verify 不发, decode 不 racing),
+期待 ~2.02-2.09 不动。风险点: prefill gather 回退块 (≥96 单元) 的 worker racing 会在
+prefill 期碰 mini 盘 —— prefill 若回落 >10% 用 `EXPERT_REMOTE_FETCH_REVERSE=0` A/B 切分。
+
+**Validation performed here.** `bash -n` OK; COORD_IP 探测在本机验证返回 192.168.1.3;
+引擎边界 (K/数组/协议) 走查如上, 无引擎改动无需重编。用户脚本验证 (两跑):
+① `PROMPT_PROFILE=code-edit tools/mtp_pipe_q2_speed.sh` — 期待 ≥2.2;
+   看 verify 行 sent=16 的 r2_ms 与 worker 日志批行 rfetch_mib>0 (反向生效证据);
+② smoke 回归 ~2.0+; ③ A/B: EXPERT_REMOTE_FETCH_REVERSE=0 / COPY_SPEC_DRAFT=12。
