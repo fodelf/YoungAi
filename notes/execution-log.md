@@ -2563,3 +2563,81 @@ A/B: `WORKER_BACKBONE_MLOCK=0` / `REMOTE_EXPERT_SOURCE_CACHE_MB=128` 单项回�
    worker decode 行 rfetch_mib 全 0、hit_mib 由 0 转正;
    worker verify 批行 drain_ms/层 比 74 明显下降;
 ② `tools/mtp_pipe_q2_speed.sh`（smoke）回归 ≥2.13; ③ 盯脚本状态行 M1worker 不逼近 12G。
+
+## 2026-06-10 — 第三十三波: worker staging（accept 模式连接喂给预测暂存）
+
+**Context.** 第三十二波实测: **code-edit 3.00（新高）/ smoke 2.14（新高）**。账目:
+- racing units 下限生效: worker decode rfetch **0/1104**（上波 426/1104）。
+- worker backbone mlock 生效（wired 4.14GiB/652 ranges, 预算 5120 内）; worker verify drain
+  74→~46-54ms/层（kc=25）。r2(33)=6493 闭合: IO walls 3885（60%）+ drain 2468（38%）。
+- **source cache 真相**: coordinator 自己的 summary 也是 requests=5894 **hits=0 admit=0**
+  ——async=on（默认）模式下这套 "LRU cache" 从不 admit, 只做 madvise(WILLNEED) 页缓存加热,
+  实测页又被冷流冲掉 = **两侧 2048MiB 配置纯属死字段**（性能收益全来自 mlock+budget+racing 修复）。
+- **coordinator decode hit_mib 的真正来源是 staging**（stage_find→RAM memcpy, 命中 50-100%,
+  全命中层 wall 1.1ms）; worker hit_mib=0.0 是因为 stage_enabled() 硬性要求 FETCH_HOST,
+  而 worker 在 accept 模式下没有这个 env —— 不对称是门的问题, 不是机器的问题。
+
+**Patch.**
+1. `ds4_metal.m` stage_enabled() 门（~17620）: `!getenv(FETCH_HOST) && !getenv(ACCEPT_PORT)`
+   才关。worker（accept 模式, 6 条活连接）现在和 coordinator 用同一套预测暂存:
+   预测线程（EXPERT_PREFETCH=1 两侧本就在跑, worker 此前只用于本地 madvise）arm 下一层,
+   rf 工作线程（同一函数已会服务 stage slot）从 mini SSD 拉预测专家进 RAM。
+   流水线交替 = worker 拉 mini 盘时 mini 正空闲, 盘上无冲突; TB 两方向全双工。
+   内存: stage buf 2×16×6.75MiB ≈ 216MiB, 12G 内无虞。
+   连带效应（有意保留）: worker stage_enabled=1 后, 未暂存 decode 层重新可 race
+   （= coordinator 已调优的策略, 对称化）。
+2. 脚本: `WORKER_EXPERT_STAGE=0` 单侧 A/B 开关（REMOTE_PROFILE_ENV 后置覆盖 BASE_RUN_ENV）。
+
+**期望.** worker decode 23 层从全冷（wall 2-6ms/层）转 staged RAM 命中
+（coordinator 同机制 54%+ 命中, 全命中层 1.1ms）⇒ smoke **≥2.2**;
+code-edit 的 r1/miss 轮同样是 decode 形态（~500-800ms/轮, 占总时 ~1/3）同步受益 ⇒ **≥3.1**。
+A/B: `WORKER_EXPERT_STAGE=0` 回本波前形态。
+
+**Validation performed here.** `make` 无新告警（4 legacy）; `ds4_test --metal-kernels` OK;
+`bash -n` 通过。未跑大模型。用户脚本验证（两跑）:
+① code-edit 档 — 决定性证据: worker 日志出现
+   "predicted experts staged from peer SSD into RAM one layer ahead" 与
+   "ds4-stage: armed=... (completion N%)" 行; worker decode 行 hit_mib 由 0 转正;
+② smoke 档回归 ≥2.14; ③ 盯 M1worker 内存（staging +~216MiB）。
+
+## 2026-06-12 — 第三十四波: worker staging 回滚 + PC.1 融合单轮（fire 轮砍掉整个 r1）
+
+**Context.** 第三十三波实测: code-edit **2.83（降）** / smoke **1.75（大降）**。worker staging
+负结果账目:
+- worker stage completion 64% vs coordinator 同机制 97%; dropped 33%; decode 命中仅 26%
+  （coordinator 70%）; worker decode wall 反升 2-6→4-9.6ms/层; stage_enabled=1 还把未暂存层
+  racing 复活（125/1104）; code-edit r1 全线 +20%（464-781→541-945ms）。
+- 根因 = **盘速不对称**（写入 project.md §1）: mini 盘顺序 ~1.9GB/s 且兼任 efetch server,
+  喂不饱 worker 的层窗口; MacBook 盘快得多。"coordinator←worker盘 staging 赚 /
+  worker←mini盘 staging 亏" 是物理结论, 不是参数问题。
+- 文档审计（用户要求, 两台 12G 新设定）: project.md §0 设备行、§1 盘速不对称注记、
+  §3 P3/§7 红线 12/8→12/12、§4 内存预算表按第三十二波实测重写
+  （mini 4.07 mlock + worker 4.14 wired; "source cache"死字段澄清; 两侧热专家余量 ~2.5-3.5G）。
+
+**Patch.**
+1. 脚本: `WORKER_EXPERT_STAGE` 默认 1→0（回滚; stage_enabled() 门的代码改动保留,
+   worker 侧用 env 覆盖关闭 ⇒ 行为精确回到第三十二波形态: 无 staging、无 decode racing）。
+2. `ds4_distributed.c` **PC.1 融合单轮**（fire 轮砍 r1, ~6110 起新分支）:
+   旧形态每个 fire 轮 = r1（整轮单 token, ~700-900ms, 唯一作用是拿 argmax(p) 当 drafts[0]
+   免费票）+ r2（kc 批）。但 n-gram matcher 根本不需要 argmax(p)——它匹配的是以 first_token
+   结尾的后缀, 而 first_token 进函数就有。融合: `[first_token, copied...]` 作为一个 VERIFY 批
+   从位置 p 起一次过; row j 验证 copied[j]（旧免费票变成 row0 的检查, 成本并入同一批）。
+   - 贪心输出**逐 token 等价**: 接受判据仍是逐行 argmax 精确匹配; copied[0] 被拒时
+     该 argmax token 顺延为下轮 first_token, 流不变。
+   - worker 回滚语义: 批 base=p（旧 p+1）, deferred accept_len = **1+m**（first_token 恒保留);
+     worker 端公式 keep=spec_base_len+accept_len 通用, 无需改 worker 代码。
+   - miss 轮 = 单 token 帧, 与旧 r1 字节级相同（带 accept_len）; OOM 退化为 miss 轮。
+   - 协议不动: 批行数 ≤1+32=33 ≤64 行 spec_logits; MTP 模式旧 r1+r2 路径原样保留。
+   - 账: 第三十二波 6 个 fire 轮 Σr1≈4.6s / 总 32.3s ⇒ 理论 3.00→~3.5。
+   - 日志行格式不变, fire 轮以 `r1_ms=0` 标记; sent/accepted 含义不变（批行数/保留行数）。
+
+**期望.** code-edit **≥3.3**（fire 轮每轮省 ~700-900ms）; smoke 回 ~2.14（纯回滚,
+融合不触发——smoke fire 率 0%, miss 轮与旧路径等价）。
+A/B: `WORKER_EXPERT_STAGE=1` 复现staging实验; 若 code-edit 输出内容变了 = 融合有错（理论上
+逐 token 等价, 内容必须与第三十二波完全一致）。
+
+**Validation performed here.** `make` 无新告警（4 legacy）; `ds4_test --metal-kernels` OK;
+`bash -n` 通过。未跑大模型。用户脚本验证（两跑）:
+① code-edit 档 — 决定性证据: verify 行出现 **r1_ms=0**; 轮数与 sent/accepted 序列
+   应与第三十二波同构（2/4/7/13/25/29 的接受序列, 输出文本逐字相同）;
+② smoke 档回归 ~2.14（worker 日志不再有 ds4-stage 行）。

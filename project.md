@@ -6,7 +6,9 @@
 
 ## 0. 硬约束与现状
 
-- 设备：M4 mini 16GB（≤12GB，coordinator）+ MacBook M1 系 16GB（≤8GB，worker），雷电直连 ≤40Gb/s。
+- 设备：M4 mini 16GB（≤12GB，coordinator）+ MacBook M1 系 16GB（**≤12GB**，worker），雷电直连 ≤40Gb/s。
+  （2026-06-10 设定更新：两台都放宽到 12G，合计 24G；worker 由 8G→12G，红利已投入
+  worker backbone mlock 5120MB + 硬预算 12000MB，见第三十二波。）
 - 模型：**必须用 `gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf`（81GiB q2 全量）**。
 - 目标：200K 上下文，Claude Code 可用；用户期望 80 t/s。
 - 验证：`tools/mtp_pipe_q2_speed.sh`；日志 `/tmp/mtp_pipe_coord.log|.out`、worker `192.168.1.2:/tmp/mtp_pipe_worker.log`、build 日志同前。
@@ -29,6 +31,11 @@
 | W1 容量墙 | 72.6GiB experts vs 两机合计可用 **24GiB**（2026-06-10 起两台都放宽到 12G；扣双侧 backbone mlock ~9.7G + ctx 3.6G + 运行时 ~2G，**可给专家缓存 ~8-9GiB**，此前仅 ~2.2G） | ~85% 专家访问仍落 SSD，但 decode 热集（路由偏斜）可观缓存 |
 | W2 SSD 墙 | 1.70GiB/token ÷ (双机 SSD 并行 ~6GB/s) ≈ **280ms/token** | 全冷、完美并行/零拷贝下 decode ≤ **~3.5 t/s**；叠 8-9GiB 缓存 40-60% 命中 ≤ **~6-7 t/s**。24G 重估的现实上限：smoke ~**3.0-3.4**（IO+drain 串行链），code-edit 纯复制区已实测 222ms/tok≈4.5，drain（占 r2 40-45%）砍半后区段 ~5-6、整体 **~4+** |
 | W3 backbone 带宽墙 | coord 4.07GiB/120GB/s=34ms + worker ~4.4GiB/68–200GB/s=22–65ms | 专家全部免费也只有 **10–18 t/s** |
+
+盘速不对称（第三十三波实证，影响所有"谁从谁的盘拉"决策）：mini 盘顺序 ~1.9GB/s 且兼任
+efetch server；MacBook 盘明显更快（decode 小读 8-21GB/s 突发）。因此 **coordinator←worker盘
+的 staging 赚（completion 97%）；worker←mini盘 的 staging 亏（completion 64%、净 -18%）**；
+racing 只在 ≥96 单元的大批形态下两盘并行才稳赚。
 
 **80 t/s 判定：不可达。** 需要每 token ~9.4GiB 权重在 12.5ms 内供给 ⇒ ~750GB/s 聚合带宽 + 81GiB 全驻留。
 两台 16GB Mac 差 ~40× 内存、~4–6× 带宽。该量级只存在于 M3/M4 Ultra 192GB（~800GB/s）单机或全驻留小模型。
@@ -55,7 +62,9 @@
 | **第二十九波实测** | **code-edit 2.90（新高）/ smoke 2.13（持平）** | — | K=32 终于生效（sent=4/4/7/13/25/32 接受 2/4/7/13/25/29、draft_accept 94%、tok/call 5.71）；反向 efetch 静默窗拨号仍瞬败（进程内 worker→mini 出连必败之谜未解） |
 | **第三十波实测** | code-edit 2.54（回落）/ smoke 2.08 | 8.39 | **accept 模式反向 efetch 终于连通**（worker 6 连、racing 生效、prefill gather 4.4→6.3-6.8GB/s）；回落=48 注赔钱（sent=49 只中 29，抄源分叉点=29，多付 3.4s）+新发现：流式层无 racing（mini L0-2 单盘 1.9GB/s×950ms/层） |
 | **第三十一波实测** | **code-edit 2.90（追平最高）/ smoke 2.08** | 10.41 | 两修都生效（next_len 顶 32、4 份日志 0 条 mode=stream）；smoke 没回 2.13 的元凶定位：**worker decode gather 在 racing**（426/1104 带 rfetch，`\|\| !stage_enabled` 臂在 accept 模式下永真，本地 2-6ms 的活去跨 TB 拉 6ms+ 纯加尾）——时间线与 wave30 accept 连通完全吻合；另：worker decode **hit_mib=0.0 全程零命中**（source cache 仅 128MiB） |
-| 第三十二波（待实测，**设备限制更新：两台都 12G/总 24G**） | 目标 code-edit ≥3.1 / smoke ≥2.15 | — | ① racing 加 units 下限（≥96 或 staging 在开且层未暂存才 race）修 smoke 回归；② worker 升 12G：杀线/硬预算 8→12G、source cache 128→2048（coordinator 同设计命中 50-100%、全命中层 wall 1.1 vs 冷 10.8ms）、**worker backbone mlock 5120**（worker drain 74ms/层疑与 wave25 修前同病=verify 冷流驱逐 backbone 后命令执行中 refault；coordinator mlock 后 42ms/层） |
+| **第三十二波实测（设备限制更新：两台都 12G/总 24G）** | **code-edit 3.00（新高）/ smoke 2.14（新高）** | 9.84 | racing units 下限生效（worker decode rfetch 0/1104）；worker mlock wired 4.14GiB、verify drain 74→~50ms/层；r2(33)=6493 闭合=IO walls 60%+drain 38%。**两个真相**：① source cache async 模式从不 admit（两侧 summary hits=0 admit=0，2048MiB 配置是死字段，只做 madvise 加热）；② coordinator decode hit_mib 全来自 **staging**，worker hit=0 只因 stage_enabled() 门硬要 FETCH_HOST |
+| 第三十三波实测（**负结果，已回滚**） | code-edit 2.83 / smoke 1.75（双降） | 10.00 | worker staging 净亏：completion 64%（coordinator 同机制 97%）、dropped 33%、decode 命中仅 26%，wall 反升 2-6→4-9.6ms/层，未暂存层 racing 复活 125/1104，r1 +20%。根因=盘速不对称：mini 盘慢（1.9GB/s）+兼任 efetch server，喂不饱 worker 暂存窗口。`WORKER_EXPERT_STAGE` 默认回 0 |
+| 第三十四波（待实测） | 目标 code-edit ≥3.3 / smoke 回 ~2.14 | — | **PC.1 融合单轮**：fire 轮把 r1（整轮单 token，~700-900ms，只为拿 argmax 当 drafts[0] 免费票）并进 verify 批——`[first_token+抄写串]` 从 p 起一批过，row0 顶替免费票检查；贪心输出逐 token 等价；worker accept_len 改 1+m（base=p）；6 个 fire 轮 ≈ 省 4.6s/32.3s；miss 轮与旧 r1 字节级相同；协议行数不变（≤33≤64） |
 | M1 单拷贝直读 + prefill 流式 | **≥1.6** | **≥10** | P1.1/P1.2 |
 | M2 预测预取流水 + 命中零拷贝 + repack | **≥3** | **≥25** | P1.3/P1.4/P2.1 |
 | M3 expert-parallel 双 SSD 并行 | **≥5** | ≥30 | P2.2 |
@@ -242,7 +251,7 @@ P0 测量基建（半天）→ P1 内存分区排布（主攻，~1-2 周）→ P
 - prefill 走 P1.2 流式 + `--kv-disk-dir` 前缀复用：Claude Code 会话重发长前缀，**增量 prefill** 才是日常路径；
   server 的 exact-DSML replay map 保证字节级前缀命中（已有）。
 - 逐档 32K→100K→200K 验证两机 KV/scratch 预算（coordinator 日志显示 200K 下 context buffers 1.83GiB，
-  在层切分 KV 收缩后可承受）；watchdog 红线不变 12/8GiB。
+  在层切分 KV 收缩后可承受）；watchdog 红线 12/12GiB（2026-06-10 起）。
 - 可用性诚实定义：M3 达成（decode ≥5 t/s）+ 前缀复用增量 prefill ≥30 t/s 时，Claude Code 短指令交互“勉强可用”；
   80 t/s 级流畅体验在本硬件+本模型组合下不存在。
 - 低优先备选（§2.1c）：raw 滑窗/indexer-selected KV 旋转量化（3bit K 族）再挤 ~0.5–1GiB/机给专家池；
@@ -258,16 +267,20 @@ P0 测量基建（半天）→ P1 内存分区排布（主攻，~1-2 周）→ P
   (a) 向用户摊牌换 `ds4flash-k16-v2.gguf`（13GiB，同 q2 量化族）双机全驻留路线（理论 10–18 t/s），
   (b) 或维持 q2 全量 + 接受 ~4–6 t/s 上限。
 
-## 4. 内存预算（目标排布，P0 实测校正）
+## 4. 内存预算（2026-06-10 两台 12G 新设定；第三十二波实测校正）
 
-| | M4 mini ≤12GiB | MacBook ≤8GiB |
+| | M4 mini ≤12GiB | MacBook ≤12GiB |
 |---|---|---|
-| backbone 层切片（含/不含 output） | 4.07 | ~4.4 |
-| KV/压缩前沿 @200K（层切片收缩后） | ~1.3 | ~1.0 |
-| A3/直读 scratch + IO 双缓冲 | ~0.8 | ~0.5 |
-| 热专家常驻池（间接表寻址） | **~3.5–4.0** | **~0.5–1.0** |
+| backbone 层切片 mlock（20 层 / 23 层） | 4.07（预算 4608MB） | 4.14 实测 wired（预算 5120MB） |
+| KV/压缩前沿 @200K（层切片收缩后） | ~1.8（ctx buffers 实测 1.83） | ~1.8 |
+| A3/直读 scratch + IO 双缓冲 + stage buf | ~1.0 | ~0.8 |
+| 热专家可用余量（页缓存/未来真缓存） | **~2.5–3.0** | **~3.0–3.5** |
 | 其余（进程/Metal 开销） | ~1.5 | ~1.0 |
-| 合计 | ~11.5 | ~7.7 |
+| 合计 | ~11 | ~10.5 |
+
+注：第三十二波审计证实"source cache"（async 模式）从不 admit、只做 madvise 加热，
+两侧 2048MB 配置不占匿名内存；表中"热专家余量"目前由页缓存隐式使用。
+若未来引入真 DRAM 专家缓存（hard_copy 或新池），从该行预算扣。
 
 护栏不变：`DS4_MEM_BUDGET_MB` + L1 resident gate 拒绝启动；脚本 RSS watchdog 两边同杀；
 诊断用 `MEM_WATCH_MODE=footprint`（慢）。
@@ -306,7 +319,7 @@ P0 测量基建（半天）→ P1 内存分区排布（主攻，~1-2 周）→ P
 - **P-Code 收益是负载相关的，不改物理墙**：复制式投机只在"输出回显上下文"的回合放大有效 t/s
   （编辑/工具回合 1.5–3×，纯新代码 ~1.1–1.3×），匹配失败自动退化为基线，无下行风险但也不保证均匀提速；
   编程域画像的上限由 P0.2 实测 SRP/SCH 决定，先测后建。M4C 的"≥2×"只承诺在 code-edit 档 prompt 上验收。
-- 一切以 `notes/execution-log.md` 实测为准；correctness before speed，watchdog 红线 12/8GiB 永不放松。
+- 一切以 `notes/execution-log.md` 实测为准；correctness before speed，watchdog 红线 12/12GiB（2026-06-10 起）永不放松。
 
 ## 8. 进度
 

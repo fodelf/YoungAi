@@ -17619,7 +17619,14 @@ static int ds4_gpu_expert_stage_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
         cached = ds4_gpu_env_bool("DS4_METAL_EXPERT_STAGE") > 0 ? 1 : 0;
-        if (cached && !getenv("DS4_DIST_EXPERT_FETCH_HOST")) cached = 0;
+        /* Wave 33: staging needs working fetch connections to the peer, not
+         * specifically the forward-dial client.  Accept mode (worker side:
+         * peer dials in, DS4_DIST_EXPERT_FETCH_ACCEPT_PORT) provides the same
+         * connections -- and the measured asymmetry was exactly this gate:
+         * coordinator decode layers hit 50-100% staged RAM (hit_mib 20-40 of
+         * 40.5) while worker decode ran 100% cold (hit_mib=0.0 all run). */
+        if (cached && !getenv("DS4_DIST_EXPERT_FETCH_HOST") &&
+            !getenv("DS4_DIST_EXPERT_FETCH_ACCEPT_PORT")) cached = 0;
         if (cached) {
             fprintf(stderr,
                     "ds4: predicted experts staged from peer SSD into RAM one layer ahead\n");

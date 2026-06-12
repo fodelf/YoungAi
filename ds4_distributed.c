@@ -6115,6 +6115,136 @@ int ds4_dist_session_eval_speculative(
     ds4_tokens_copy(&transcript, checkpoint);
     ds4_tokens_push(&transcript, first_token);
 
+    /* ---- Wave 34, PC.1 fused single round (copy mode only). --------------
+     * The old shape paid a full single-token round (r1, ~600-900ms: it exists
+     * only to learn argmax(p) so drafts[0] is a guaranteed-accept freebie)
+     * before every verify batch.  But the n-gram matcher does not need
+     * argmax(p): it matches the transcript suffix ending at first_token,
+     * which we already have.  So fuse: send [first_token, copied...] as ONE
+     * verify batch at pos p.  Row j validates copied[j] (the old freebie
+     * becomes row 0's check, costed into the same batch).  Greedy output is
+     * token-for-token identical: acceptance is still exact per-row argmax,
+     * and a rejected copied[0] just moves that argmax token to the next
+     * round's first_token.  Worker rollback: batch base is p (not p+1), so
+     * the deferred accept_len becomes 1+m (first_token is always kept).
+     * Economics: fire rounds lose the whole r1 (~700ms x ~6 rounds measured);
+     * miss rounds are byte-identical to the old r1 frame. */
+    if (copy_spec) {
+        if (d->copy_spec_len == 0) d->copy_spec_len = dist_copy_spec_init_len();
+        uint32_t want = d->copy_spec_len;
+        if (want > (uint32_t)(K - 1)) want = (uint32_t)(K - 1);
+        if (want > dist_copy_spec_max_len()) want = dist_copy_spec_max_len();
+        if ((uint32_t)accepted_cap - 1u < want) want = (uint32_t)accepted_cap - 1u;
+        int copied[63];
+        uint32_t n_copy = 0;
+        uint32_t anchor = 0;
+        if (first_token != eos_token && want > 0u) {
+            anchor = dist_copy_spec_match(transcript.v,
+                                          (uint32_t)transcript.len,
+                                          dist_copy_spec_ngram(),
+                                          want,
+                                          copied,
+                                          &n_copy);
+        }
+        /* Never draft past EOS. */
+        for (uint32_t j = 0; j < n_copy; j++) {
+            if (copied[j] == eos_token) { n_copy = j + 1u; break; }
+        }
+        if (d->state.ctx_size != 0 && p + 1u + n_copy > d->state.ctx_size) {
+            n_copy = (p + 1u < d->state.ctx_size) ? d->state.ctx_size - (p + 1u) : 0u;
+        }
+        /* Too-short copies cannot pay for a batch round: plain single round. */
+        if (n_copy < dist_copy_spec_min_copy()) n_copy = 0;
+
+        int toks[64];
+        toks[0] = first_token;
+        for (uint32_t j = 0; j < n_copy; j++) toks[1u + j] = copied[j];
+
+        float *vlogits = NULL;
+        if (n_copy > 0u) {
+            vlogits = malloc((size_t)(1u + n_copy) * (size_t)vocab * sizeof(float));
+            if (!vlogits) n_copy = 0;   /* OOM: degrade to the plain round */
+        }
+        const uint32_t kb = 1u + n_copy;
+
+        ds4_dist_spec_io io;
+        memset(&io, 0, sizeof(io));
+        io.accept_len = d->spec_accept_pending ? d->spec_accept_len : 0u;
+        if (vlogits) {
+            io.extra_flags = DS4_DIST_WORK_F_VERIFY;
+            io.verify_logits = vlogits;
+        }
+        const double t0 = dist_now_sec();
+        const int rc = dist_coordinator_eval_span(&d->state, owner, &d->plan,
+                                                  toks, kb, p,
+                                                  d->session_id, d->request_id++,
+                                                  false, logits, &io, err, errlen);
+        const double batch_ms = (dist_now_sec() - t0) * 1000.0;
+        d->spec_accept_pending = false;
+        d->spec_accept_len = 0;
+        if (rc != 0) {
+            free(vlogits);
+            if (dist_coordinator_rebuild_from_transcript(&d->state, owner, &d->plan,
+                    &transcript, d->session_id, &d->request_id, logits,
+                    &d->plan_generation, rc != DS4_DIST_RECV_REMOTE_ERROR, err, errlen) != 0) {
+                d->plan_ready = false; d->plan_generation = 0;
+                ds4_tokens_free(&transcript);
+                return -1;
+            }
+            d->plan_ready = true;
+            accepted[0] = first_token;
+            dist_mtp_record_enabled(d, 1, 0, false, false);
+            ds4_tokens_free(&transcript);
+            return 1;
+        }
+
+        accepted[0] = first_token;
+        int n_acc = 1;
+        if (vlogits) {
+            uint32_t m = 0;
+            for (uint32_t j = 0; j < n_copy && n_acc < accepted_cap; j++) {
+                const int pred = dist_logits_argmax(
+                        vlogits + (size_t)j * (size_t)vocab, vocab);
+                if (pred != copied[j]) break;
+                accepted[n_acc++] = copied[j];
+                m++;
+                if (copied[j] == eos_token) break;
+            }
+            /* Row m predicts the token after the accepted prefix. */
+            memcpy(logits, vlogits + (size_t)m * (size_t)vocab,
+                   (size_t)vocab * sizeof(float));
+            free(vlogits);
+            /* Same ladder as before: full copied tail doubles, dead tail
+             * resets (m counts accepted copies, the old tail_ok). */
+            if (m == n_copy) {
+                uint32_t grown = d->copy_spec_len * 2u;
+                if (grown > (uint32_t)(K - 1)) grown = (uint32_t)(K - 1);
+                if (grown > dist_copy_spec_max_len()) grown = dist_copy_spec_max_len();
+                d->copy_spec_len = grown;
+            } else if (m <= 1u) {
+                d->copy_spec_len = dist_copy_spec_init_len();
+            }
+            if (dist_env_enabled("DS4_DIST_COPY_SPEC_LOG")) {
+                /* sent/accepted keep the old meaning (batch rows / kept rows);
+                 * r1_ms=0 marks the fused round. */
+                fprintf(stderr,
+                        "ds4: copy-spec verify: anchor=%u sent=%u accepted=%u "
+                        "next_len=%u r1_ms=0 r2_ms=%.0f\n",
+                        anchor, kb, (uint32_t)n_acc, d->copy_spec_len, batch_ms);
+            }
+            /* Keep first_token + m copies; worker base is p, so its deferred
+             * accept_len is 1+m. */
+            (void)ds4_session_layer_slice_rollback(owner, p + 1u + m, err, errlen);
+            d->spec_accept_pending = true;
+            d->spec_accept_len = 1u + m;
+            dist_mtp_record_enabled(d, (uint32_t)n_acc, kb, true, true);
+        } else {
+            dist_mtp_record_enabled(d, 1, 0, false, false);
+        }
+        ds4_tokens_free(&transcript);
+        return n_acc;
+    }
+
     /* ---- Round 1: eval first_token, request K drafts, carry pending rollback.
      * Copy mode sends a plain frame (no DRAFT flag, drafts come from the local
      * matcher below) but must still carry accept_len for the worker's deferred
