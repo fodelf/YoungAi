@@ -2709,3 +2709,39 @@ A/B: `DS4_METAL_EXPERT_PREFETCH_AHEAD=0` 全关; 看批行 bw_gbps 升/pread_ms 
 ① code-edit 档 — 决定性证据: 两侧 site=batch 行 wall_ms 降、bw_gbps 明显升
    （暖页 pread 会拉高等效带宽）, r2(25)/r2(33) 下降; 输出文本仍逐字相同;
 ② smoke 档回归 ~2.15。
+
+## 2026-06-12 — 第三十七波: 注梯增长 ×2→×4（爬梯轮是白付的固定成本）
+
+**Context.** 第三十六波（批 union 预测预取）实测: **code-edit 3.54（新高）/ smoke 2.17（新高）**。
+（更正: 本条最初误标为"第三十六波"且把 3.54 归因 cached fd——实际 cached fd 是第三十五波
+= 3.39 近似打平, 3.54 来自第三十六波的批 union 预取。波次已更正, 分析数字均取自 3.54 跑。）
+- 3.54 跑账目: 六轮 r2 = 1354/1460/2286/3497/4821/5819, Σr2 19.2s。kc=33 轮:
+  walls 3058 (53%, worker 1512+coord 1546) + drain 2621 (45%, worker 1568+coord 1053)。
+  批 union 预取生效（与 35 波 cached fd 协同后 walls 显著降）。
+- 剩余结构 (97 tok / 27.4s): Σr2 19.2s (70%) + 13 miss tok 8.2s (30%)。
+- 大杠杆审计:
+  * **drain 不是快赢**: use_mm_id 在 n_tokens≥8 早已生效 (wave-23), 68ms/层 ≈ 真 GEMM
+    时间 (~1.3ms/token/层 ×33 + attention), 再砍要内核级调优。
+  * **walls 已贴盘速**: worker 7.9GiB/1.51s=5.2GB/s (双盘 racing 饱和), coord 3.3GB/s。
+  * **miss 轮已贴单轮地板** (630ms vs 地板 ~600); MTP-on-miss 算过 EV: 小批固定成本
+    ~1000ms ⇒ 需链式接受 ≥3 才回本, MTP 几何衰减撑不起, 不立项。
+  * **层内 gather/GPU 分半重叠** (后半 union IO ∥ 前半 GEMM, r2 理论 -25%): 可行但是
+    300+ 行 GPU/CPU 同步手术, 不适合单波原子落地 → 记 project.md 设计项 (P-OVL)。
+- 本波快赢: 注梯 3→6→12→24→32 中 6→12→24 三轮连续全中 —— ×2 增长是无帽时代校准的,
+  每多爬一轮就白付一轮固定成本 (~2s 可省); 32 帽 (wave 31) 已把超注损失锁死在材料尽头
+  一次性 ~2.3s (wave-30 的 48 注教训不复现)。
+
+**Patch.**
+1. `ds4_distributed.c`: `dist_copy_spec_growth()` = env `DS4_DIST_COPY_SPEC_GROWTH`
+   钳 (4,2,8); 融合分支全中增长 ×2 → ×growth。梯形变 3→12→32 直达帽。
+   部分接受保持/全拒回 INIT 语义不变; MTP 旧路径不动。
+2. 脚本: `COPY_SPEC_GROWTH=4` 默认 + COPY_SPEC_ENV 透传。
+
+**期望.** code-edit: 中型爬梯轮 (6/24 两档) 消失 ⇒ Σr2 ~19.2→~17s ⇒ **≥3.8**;
+smoke 不受影响 (~2.17)。A/B: `COPY_SPEC_GROWTH=2` 复旧梯。
+
+**Validation performed here.** `make` 无新告警 (4 legacy); `ds4_test --metal-kernels` OK;
+`bash -n` 通过。未跑大模型。用户脚本验证 (两跑):
+① code-edit 档 — 决定性证据: verify 行 next_len 序列变 3→12→32 (sent 4→13→33);
+   轮数 6→~4-5; 输出文本仍逐字相同;
+② smoke 档回归 ~2.17。

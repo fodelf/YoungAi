@@ -544,6 +544,16 @@ static uint32_t dist_copy_spec_init_len(void) {
     return dist_env_u32_clamped("DS4_DIST_COPY_SPEC_INIT", 3, 1, 63);
 }
 
+/* Wave 36: ladder growth factor on a fully-accepted copied tail. x2 was
+ * calibrated for an uncapped ladder; with the 32 cap (wave 31) the worst
+ * overbet is bounded (~2.3s once per copy-source end), while every ramp
+ * round the ladder spends below the cap is a measurably wasted round
+ * (wave-35 run: 6->12->24 full accepts = two mid-size rounds, ~2s, that a
+ * x4 ladder 3->12->32 skips). */
+static uint32_t dist_copy_spec_growth(void) {
+    return dist_env_u32_clamped("DS4_DIST_COPY_SPEC_GROWTH", 4, 2, 8);
+}
+
 static uint32_t dist_copy_spec_min_copy(void) {
     /* Don't issue a verify batch for fewer copied tokens than this: with the
      * batch costing ~2-3x a single forward, a 1-token copy cannot break even
@@ -6214,10 +6224,11 @@ int ds4_dist_session_eval_speculative(
             memcpy(logits, vlogits + (size_t)m * (size_t)vocab,
                    (size_t)vocab * sizeof(float));
             free(vlogits);
-            /* Same ladder as before: full copied tail doubles, dead tail
-             * resets (m counts accepted copies, the old tail_ok). */
+            /* Same ladder as before: full copied tail grows (wave 36: x4,
+             * see dist_copy_spec_growth), dead tail resets (m counts
+             * accepted copies, the old tail_ok). */
             if (m == n_copy) {
-                uint32_t grown = d->copy_spec_len * 2u;
+                uint32_t grown = d->copy_spec_len * dist_copy_spec_growth();
                 if (grown > (uint32_t)(K - 1)) grown = (uint32_t)(K - 1);
                 if (grown > dist_copy_spec_max_len()) grown = dist_copy_spec_max_len();
                 d->copy_spec_len = grown;

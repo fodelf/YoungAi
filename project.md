@@ -66,7 +66,8 @@ racing 只在 ≥96 单元的大批形态下两盘并行才稳赚。
 | 第三十三波实测（**负结果，已回滚**） | code-edit 2.83 / smoke 1.75（双降） | 10.00 | worker staging 净亏：completion 64%（coordinator 同机制 97%）、dropped 33%、decode 命中仅 26%，wall 反升 2-6→4-9.6ms/层，未暂存层 racing 复活 125/1104，r1 +20%。根因=盘速不对称：mini 盘慢（1.9GB/s）+兼任 efetch server，喂不饱 worker 暂存窗口。`WORKER_EXPERT_STAGE` 默认回 0 |
 | **第三十四波实测** | **code-edit 3.32（新高）/ smoke 2.16（新高）** | 9.91 | PC.1 融合单轮全生效（6 轮全 r1_ms=0）；意外之喜：+1 对齐偏移让末轮 33/33 全中（旧形态 29 分叉）；EOS 自然结束于 97；账：fire 轮 84 tok/Σr2 21.3s + miss 13 tok/7.8s |
 | **第三十五波实测** | **code-edit 3.39（新高）/ smoke 2.15** | 10.23 | NOCACHE 阈值修正近似打平（r2(25) -310 / r2(33) +190）：轮间复用被容量否决——每轮 union ~7GiB 装不进 ~3-4G 空闲页缓存；改动无害保留且是 36 波前置条件。排除项：MoE 分半 dispatch（路由依赖+位精确风险）、MTP-on-miss（小批 r2 成本曲线下只值 +5-10%）、批 token 分半流水（union 稀释吃掉重叠收益） |
-| 第三十六波（待实测） | 目标 code-edit ≥3.7 / smoke ~2.15 | — | **批 union 预测预取**：批路径此前完全没有 prefetch hook（decode 的 job 只装 1 行 hidden，33-token 批 50-74 专家 union 只预测出 ~8 个）⇒ verify gather 全冷；新增 ≤16 行采样快照 + 逐行精确 top-k 求并 + drain 盘空闲窗口（~60ms）发 advisories；cached-fd 批专用（35 波协同）；纯 CPU hint 零正确性风险；A/B `DS4_METAL_EXPERT_PREFETCH_AHEAD=0` |
+| **第三十六波实测** | **code-edit 3.54（新高）/ smoke 2.17（新高）** | — | 批 union 预测预取生效（与 35 波 cached fd 协同）：六轮 r2 全降至 1354/1460/2286/3497/4821/5819，Σr2 19.2s；kc=33 新账目 walls 53%（5.2GB/s 贴双盘饱和）+ drain 45%（真 GEMM）；结构：fire 70% + miss 30%（13 tok×630ms 贴单轮地板） |
+| 第三十七波（待实测） | 目标 code-edit ≥3.8 / smoke ~2.17 | — | 注梯增长 ×2→×4（`DS4_DIST_COPY_SPEC_GROWTH=4`，梯形 3→12→32 直达帽）：3.54 跑里 6→12→24 三轮连续全中=两轮白付固定成本（~2s）；32 帽锁死超注损失（材料尽头一次性 ~2.3s）；A/B `COPY_SPEC_GROWTH=2`。下一个大项仍是 P-OVL（层内 gather/GPU 分半重叠，r2 理论 -25%，需 metal-kernels 单测护航分波落地） |
 | M1 单拷贝直读 + prefill 流式 | **≥1.6** | **≥10** | P1.1/P1.2 |
 | M2 预测预取流水 + 命中零拷贝 + repack | **≥3** | **≥25** | P1.3/P1.4/P2.1 |
 | M3 expert-parallel 双 SSD 并行 | **≥5** | ≥30 | P2.2 |
