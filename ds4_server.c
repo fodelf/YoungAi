@@ -10333,7 +10333,7 @@ decode_again:
             break;
         }
 
-        int toks[33];   /* K=32 verify batch + first_token */
+        int toks[65];   /* K=64 verify batch + first_token */
         int ntok = 0;
         if (temperature <= 0.0f &&
             (ds4_engine_mtp_draft_tokens(s->engine) > 1 ||

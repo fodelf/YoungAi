@@ -166,6 +166,17 @@ int ds4_dist_expert_fetch_maybe_serve(int model_fd, uint64_t model_size);
  * DS4_DIST_EXPERT_FETCH_HOST is set. */
 void ds4_gpu_expert_remote_fetch_kick(void);
 int ds4_dist_expert_fetch_client_init(const char *host, int port, int n_conns, uint64_t model_size);
+/* Wave 30 reverse-established transport: the worker's in-process outbound
+ * dials to the coordinator fail (EHOSTUNREACH) while the coordinator's dials
+ * to the worker always succeed, so only the TCP establishment direction is
+ * reversed -- the wire protocol is unchanged.  accept_init: fetch CLIENT
+ * listens on `port` and waits (<=120s) for the pread server to dial in,
+ * then performs the normal client handshake on each accepted socket.
+ * serve_dial: pread SERVER side; gated on DS4_DIST_EXPERT_FETCH_SERVE_DIAL_HOST
+ * (+_PORT default 5607, +_CONNS), dials the peer in a background thread with
+ * a 2s backoff and runs the standard serving loop per connection. */
+int ds4_dist_expert_fetch_accept_init(int port, int n_conns, uint64_t model_size);
+int ds4_dist_expert_fetch_serve_dial(int model_fd, uint64_t model_size);
 int ds4_dist_expert_fetch(int slot, uint64_t off, void *dst, uint32_t len);
 /* Pipelined variants: per slot, recv order must match send order; up to a few
  * requests may be in flight (bounded by the socket buffers). */

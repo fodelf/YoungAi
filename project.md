@@ -26,8 +26,8 @@
 
 | 墙 | 闭式 | 含义 |
 |---|---|---|
-| W1 容量墙 | 72.6GiB experts vs 两机合计可用 ~20GiB（实际给专家 ≤6GiB） | ≥90% 专家访问必落 SSD |
-| W2 SSD 墙 | 1.70GiB/token ÷ (双机 SSD 并行 ~6GB/s) ≈ **280ms/token** | 全冷、完美并行/零拷贝下 decode ≤ **~3.5 t/s**；叠 50% 热缓存命中 ≤ **~7 t/s** |
+| W1 容量墙 | 72.6GiB experts vs 两机合计可用 **24GiB**（2026-06-10 起两台都放宽到 12G；扣双侧 backbone mlock ~9.7G + ctx 3.6G + 运行时 ~2G，**可给专家缓存 ~8-9GiB**，此前仅 ~2.2G） | ~85% 专家访问仍落 SSD，但 decode 热集（路由偏斜）可观缓存 |
+| W2 SSD 墙 | 1.70GiB/token ÷ (双机 SSD 并行 ~6GB/s) ≈ **280ms/token** | 全冷、完美并行/零拷贝下 decode ≤ **~3.5 t/s**；叠 8-9GiB 缓存 40-60% 命中 ≤ **~6-7 t/s**。24G 重估的现实上限：smoke ~**3.0-3.4**（IO+drain 串行链），code-edit 纯复制区已实测 222ms/tok≈4.5，drain（占 r2 40-45%）砍半后区段 ~5-6、整体 **~4+** |
 | W3 backbone 带宽墙 | coord 4.07GiB/120GB/s=34ms + worker ~4.4GiB/68–200GB/s=22–65ms | 专家全部免费也只有 **10–18 t/s** |
 
 **80 t/s 判定：不可达。** 需要每 token ~9.4GiB 权重在 12.5ms 内供给 ⇒ ~750GB/s 聚合带宽 + 81GiB 全驻留。
@@ -52,7 +52,10 @@
 | **第二十六波实测** | **code-edit 2.24（新高）/ smoke 2.09** | 7.33 | DRAFT 16 即刻生效（4 轮 16/16 全中）；反向 efetch 因 TB 桥启动期 ARP 瞬态未起（首连失败被永久缓存） |
 | 第二十七波（**未被真正测到**） | 报 2.23=wave26 复测 | — | 用户开跑时编辑只落了一半（脚本 DRAFT=32 未落 → K 被钳 16）；时间线复盘见 log 第二十八波 |
 | **第二十八波实测** | **code-edit 2.30 / smoke 2.13（双新高）** | 7.60 | 但 K=32 仍未生效（漏改 eval 体内第二处 `K>16` 钳位，两波白测）；反向 efetch 31 连败——decode 期 staging 也把 TB 打满，ARP 全程饿死 |
-| 第二十九波（待实测） | 目标 code-edit ≥2.5 | — | 真凶钳位一行修复（K=32 链路终于闭合）+ worker accept 后静默窗主动拨号（唯一可靠安静的几秒）+ slots() trylock 并发安全 |
+| **第二十九波实测** | **code-edit 2.90（新高）/ smoke 2.13（持平）** | — | K=32 终于生效（sent=4/4/7/13/25/32 接受 2/4/7/13/25/29、draft_accept 94%、tok/call 5.71）；反向 efetch 静默窗拨号仍瞬败（进程内 worker→mini 出连必败之谜未解） |
+| **第三十波实测** | code-edit 2.54（回落）/ smoke 2.08 | 8.39 | **accept 模式反向 efetch 终于连通**（worker 6 连、racing 生效、prefill gather 4.4→6.3-6.8GB/s）；回落=48 注赔钱（sent=49 只中 29，抄源分叉点=29，多付 3.4s）+新发现：流式层无 racing（mini L0-2 单盘 1.9GB/s×950ms/层） |
+| **第三十一波实测** | **code-edit 2.90（追平最高）/ smoke 2.08** | 10.41 | 两修都生效（next_len 顶 32、4 份日志 0 条 mode=stream）；smoke 没回 2.13 的元凶定位：**worker decode gather 在 racing**（426/1104 带 rfetch，`\|\| !stage_enabled` 臂在 accept 模式下永真，本地 2-6ms 的活去跨 TB 拉 6ms+ 纯加尾）——时间线与 wave30 accept 连通完全吻合；另：worker decode **hit_mib=0.0 全程零命中**（source cache 仅 128MiB） |
+| 第三十二波（待实测，**设备限制更新：两台都 12G/总 24G**） | 目标 code-edit ≥3.1 / smoke ≥2.15 | — | ① racing 加 units 下限（≥96 或 staging 在开且层未暂存才 race）修 smoke 回归；② worker 升 12G：杀线/硬预算 8→12G、source cache 128→2048（coordinator 同设计命中 50-100%、全命中层 wall 1.1 vs 冷 10.8ms）、**worker backbone mlock 5120**（worker drain 74ms/层疑与 wave25 修前同病=verify 冷流驱逐 backbone 后命令执行中 refault；coordinator mlock 后 42ms/层） |
 | M1 单拷贝直读 + prefill 流式 | **≥1.6** | **≥10** | P1.1/P1.2 |
 | M2 预测预取流水 + 命中零拷贝 + repack | **≥3** | **≥25** | P1.3/P1.4/P2.1 |
 | M3 expert-parallel 双 SSD 并行 | **≥5** | ≥30 | P2.2 |

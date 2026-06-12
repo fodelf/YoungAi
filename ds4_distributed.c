@@ -518,7 +518,7 @@ static bool dist_copy_spec_enabled(void) {
 
 static uint32_t dist_copy_spec_draft_k(void) {
     /* Total verify batch size (drafts[0]=target argmax + copied tail). */
-    return dist_env_u32_clamped("DS4_DIST_COPY_SPEC_DRAFT", 8, 2, 32);
+    return dist_env_u32_clamped("DS4_DIST_COPY_SPEC_DRAFT", 8, 2, 64);
 }
 
 static uint32_t dist_copy_spec_ngram(void) {
@@ -530,16 +530,25 @@ static uint32_t dist_copy_spec_ngram(void) {
     return dist_env_u32_clamped("DS4_DIST_COPY_SPEC_NGRAM", 4, 1, 16);
 }
 
+/* Wave 31: cap the adaptive bet. r2 per-token cost saturates by ~kc=25
+ * (228ms/tok at 25 vs 216 at 49 -- the expert union stops deduplicating), so
+ * doubling past ~32 buys almost no amortization while every token past the
+ * copy-source divergence point is pure loss (measured: the 48-bet paid
+ * r2(49)=10.6s for the same 29 tokens the 32-bet got for 7.2s). */
+static uint32_t dist_copy_spec_max_len(void) {
+    return dist_env_u32_clamped("DS4_DIST_COPY_SPEC_MAX", 32, 1, 63);
+}
+
 static uint32_t dist_copy_spec_init_len(void) {
     /* Initial / reset copied-draft length (adaptive: doubles on success). */
-    return dist_env_u32_clamped("DS4_DIST_COPY_SPEC_INIT", 3, 1, 31);
+    return dist_env_u32_clamped("DS4_DIST_COPY_SPEC_INIT", 3, 1, 63);
 }
 
 static uint32_t dist_copy_spec_min_copy(void) {
     /* Don't issue a verify batch for fewer copied tokens than this: with the
      * batch costing ~2-3x a single forward, a 1-token copy cannot break even
      * (the argmax freebie alone never pays for the round). */
-    return dist_env_u32_clamped("DS4_DIST_COPY_SPEC_MIN", 2, 1, 31);
+    return dist_env_u32_clamped("DS4_DIST_COPY_SPEC_MIN", 2, 1, 63);
 }
 
 /* Longest-suffix prompt lookup (SuffixDecoding-style). Among earlier positions
@@ -2893,7 +2902,7 @@ typedef struct {
     uint32_t accept_len;
     uint32_t extra_flags;     /* DS4_DIST_WORK_F_DRAFT or _VERIFY */
     uint32_t draft_n;
-    uint32_t drafts[32];
+    uint32_t drafts[64];
     float   *verify_logits;   /* n_tokens * vocab floats when VERIFY */
 } ds4_dist_spec_io;
 
@@ -6096,9 +6105,11 @@ int ds4_dist_session_eval_speculative(
         accepted[0] = first_token;
         return 1;
     }
-    if (K > 32) K = 32;   /* wave 29: protocol cap (drafts[32]/spec_logits 32 rows);
-                           * wave-27 raised everything else but missed this clamp,
-                           * silently pinning copy-spec at K=16 for two waves. */
+    if (K > 64) K = 64;   /* wave 30: protocol cap = drafts[64]/spec_logits 64 rows/
+                           * toks[65]. THE checklist for raising K: this clamp,
+                           * dist_copy_spec_draft_k, INIT/MIN clamps, copied[],
+                           * verify_tokens[], drafts[], both spec_logits allocs,
+                           * CLI+server toks[], script COPY_SPEC_DRAFT. */
 
     ds4_tokens transcript = {0};
     ds4_tokens_copy(&transcript, checkpoint);
@@ -6155,8 +6166,9 @@ int ds4_dist_session_eval_speculative(
              * it. The cap is K-1 (drafts[0] is the argmax freebie). */
             uint32_t want = d->copy_spec_len;
             if (want > (uint32_t)(K - 1)) want = (uint32_t)(K - 1);
+            if (want > dist_copy_spec_max_len()) want = dist_copy_spec_max_len();
             ds4_tokens_push(&transcript, next);
-            int copied[31];
+            int copied[63];
             uint32_t n_copy = 0;
             copy_anchor = dist_copy_spec_match(transcript.v,
                                                (uint32_t)transcript.len,
@@ -6197,7 +6209,7 @@ int ds4_dist_session_eval_speculative(
     }
 
     uint32_t kc = r1.draft_n;
-    if (kc > 32u) kc = 32u;
+    if (kc > 64u) kc = 64u;
     if ((uint32_t)accepted_cap - (uint32_t)n_accept < kc) kc = (uint32_t)accepted_cap - (uint32_t)n_accept;
     if (d->state.ctx_size != 0 && p + 1u + kc > d->state.ctx_size) {
         kc = (p + 1u < d->state.ctx_size) ? d->state.ctx_size - (p + 1u) : 0u;
@@ -6209,7 +6221,7 @@ int ds4_dist_session_eval_speculative(
     }
 
     /* ---- Round 2: batch-verify the K candidates at positions p+1..p+kc. ---- */
-    int verify_tokens[32];
+    int verify_tokens[64];
     for (uint32_t i = 0; i < kc; i++) verify_tokens[i] = (int)r1.drafts[i];
     float *vlogits = malloc((size_t)kc * (size_t)vocab * sizeof(float));
     if (!vlogits) {
@@ -6270,6 +6282,7 @@ int ds4_dist_session_eval_speculative(
         if (tail_ok == tail_sent) {
             uint32_t grown = d->copy_spec_len * 2u;
             if (grown > (uint32_t)(K - 1)) grown = (uint32_t)(K - 1);
+            if (grown > dist_copy_spec_max_len()) grown = dist_copy_spec_max_len();
             d->copy_spec_len = grown;
         } else if (tail_ok <= 1u) {
             d->copy_spec_len = dist_copy_spec_init_len();
@@ -9762,6 +9775,141 @@ int ds4_dist_expert_fetch_client_init(const char *host, int port, int n_conns, u
                 connected, host, port);
     }
     return connected;
+}
+
+/* ---- Wave 30: reverse-established transport ----
+ * The worker's outbound TCP dials to the coordinator fail with instant
+ * EHOSTUNREACH for the entire run (including the post-accept quiet window),
+ * while the coordinator's in-process dials to the worker succeed every run
+ * (control + 6 staging efetch conns).  Rather than keep debugging the
+ * asymmetric bridge, reverse only the ESTABLISHMENT direction and keep the
+ * wire identical: the worker (logical fetch client) LISTENS and after accept
+ * sends the client-side magic; the coordinator (logical pread server) DIALS
+ * the worker and then runs the standard conn-serving loop on the dialed
+ * socket.  ds4_efetch_conn_thread already starts by reading the magic, so the
+ * server side reuses it unmodified. */
+
+int ds4_dist_expert_fetch_accept_init(int port, int n_conns, uint64_t model_size) {
+    if (port <= 0 || n_conns <= 0) return 0;
+    if (n_conns > DS4_EFETCH_MAX_CONNS) n_conns = DS4_EFETCH_MAX_CONNS;
+    char err[256] = {0};
+    int lfd = dist_open_listener(NULL, port, err, sizeof(err));
+    if (lfd < 0) {
+        fprintf(stderr, "ds4: expert-fetch accept-listener :%d failed (%s)\n", port, err);
+        return 0;
+    }
+    fprintf(stderr,
+            "ds4: expert-fetch accept mode: waiting for %d peer-dialed conn(s) on :%d\n",
+            n_conns, port);
+    int connected = 0;
+    int waited_ms = 0;
+    while (connected < n_conns && waited_ms < 120000) {
+        struct pollfd p = { .fd = lfd, .events = POLLIN, .revents = 0 };
+        int pr = poll(&p, 1, 1000);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (pr == 0) { waited_ms += 1000; continue; }
+        int fd = accept(lfd, NULL, NULL);
+        if (fd < 0) continue;
+        dist_set_socket_low_latency(fd);
+        ds4_efetch_set_buffers(fd);
+        uint64_t magic = DS4_EFETCH_MAGIC;
+        uint64_t hello[2] = {0, 0};
+        if (dist_write_full(fd, &magic, sizeof(magic)) != 0 ||
+            dist_read_full(fd, hello, sizeof(hello)) != 1 ||
+            hello[0] != DS4_EFETCH_MAGIC ||
+            (model_size != 0 && hello[1] != model_size)) {
+            fprintf(stderr,
+                    "ds4: expert-fetch accept handshake failed (remote size %llu vs local %llu)\n",
+                    (unsigned long long)hello[1], (unsigned long long)model_size);
+            close(fd);
+            continue;
+        }
+        g_efetch_fds[connected++] = fd;
+    }
+    close(lfd);
+    g_efetch_nconns = connected;
+    if (connected) {
+        fprintf(stderr, "ds4: expert-fetch client (accept mode): %d connection(s) on :%d\n",
+                connected, port);
+    } else {
+        fprintf(stderr, "ds4: expert-fetch accept mode: no peer dial within 120s; disabled\n");
+    }
+    return connected;
+}
+
+static void *ds4_efetch_serve_dial_main(void *arg) {
+    ds4_efetch_server *srv = (ds4_efetch_server *)arg;
+    const char *host = getenv("DS4_DIST_EXPERT_FETCH_SERVE_DIAL_HOST");
+    if (!host || !host[0]) return NULL;
+    int port = 5607;
+    const char *penv = getenv("DS4_DIST_EXPERT_FETCH_SERVE_DIAL_PORT");
+    if (penv && penv[0]) {
+        char *end = NULL;
+        long v = strtol(penv, &end, 10);
+        if (end != penv && *end == '\0' && v > 0 && v <= 65535) port = (int)v;
+    }
+    int conns = (int)dist_env_u32_clamped("DS4_DIST_EXPERT_FETCH_SERVE_DIAL_CONNS", 4, 1,
+                                          DS4_EFETCH_MAX_CONNS);
+    /* The peer's accept-listener comes up a few seconds in (right after the
+     * worker accepts the control connection); dial with a 2s backoff. */
+    int dialed = 0;
+    for (int attempt = 0; dialed < conns && attempt < 150; attempt++) {
+        char err[256] = {0};
+        int fd = dist_connect_endpoint_once(host, port, NULL, err, sizeof(err));
+        if (fd < 0) {
+            if (attempt < 2 || (attempt & 15) == 0) {
+                fprintf(stderr, "ds4: expert-fetch serve-dial %s:%d failed (%s)\n",
+                        host, port, err);
+            }
+            struct timespec ts = { .tv_sec = 2, .tv_nsec = 0 };
+            nanosleep(&ts, NULL);
+            continue;
+        }
+        dist_set_socket_low_latency(fd);
+        ds4_efetch_set_buffers(fd);
+        void **pack = malloc(2 * sizeof(void *));
+        if (!pack) { close(fd); break; }
+        pack[0] = (void *)(intptr_t)fd;
+        pack[1] = srv;
+        pthread_t th;
+        if (pthread_create(&th, NULL, ds4_efetch_conn_thread, pack) == 0) {
+            pthread_detach(th);
+            dialed++;
+        } else {
+            free(pack);
+            close(fd);
+        }
+    }
+    if (dialed) {
+        fprintf(stderr, "ds4: expert-fetch serve-dial: %d connection(s) to %s:%d\n",
+                dialed, host, port);
+    } else {
+        fprintf(stderr, "ds4: expert-fetch serve-dial to %s:%d gave up\n", host, port);
+    }
+    return NULL;
+}
+
+int ds4_dist_expert_fetch_serve_dial(int model_fd, uint64_t model_size) {
+    const char *host = getenv("DS4_DIST_EXPERT_FETCH_SERVE_DIAL_HOST");
+    if (!host || !host[0] || model_fd < 0 || model_size == 0) return 0;
+    static ds4_efetch_server srv;   /* one serve-dial set per process */
+    if (srv.model_fd > 0) return 1;
+    int dup_fd = dup(model_fd);
+    if (dup_fd < 0) return 0;
+    srv.listen_fd = -1;
+    srv.model_fd = dup_fd;
+    srv.model_size = model_size;
+    pthread_t th;
+    if (pthread_create(&th, NULL, ds4_efetch_serve_dial_main, &srv) != 0) {
+        close(dup_fd);
+        srv.model_fd = 0;
+        return 0;
+    }
+    pthread_detach(th);
+    return 1;
 }
 
 int ds4_dist_expert_fetch(int slot, uint64_t off, void *dst, uint32_t len) {

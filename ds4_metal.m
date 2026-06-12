@@ -18308,19 +18308,22 @@ static void *ds4_gpu_expert_remote_fetch_worker(void *arg) {
  * prefill storm and still died.  Retry every 2s for up to 150 attempts
  * (~5min) so attempts reach the decode phase where the link is idle. */
 static pthread_mutex_t g_rf_init_mu = PTHREAD_MUTEX_INITIALIZER;
+static int g_rf_live;            /* live fetch worker threads */
 
 static int ds4_gpu_expert_remote_fetch_slots(void) {
-    static int cached;           /* live fetch worker threads */
     static int attempts;
     static double retry_after_ms;
-    if (cached > 0) return cached;
+    if (g_rf_live > 0) return g_rf_live;
+    /* Wave 30 accept mode (reverse-established transport): the kick thread
+     * owns the whole init -- the gather path must not dial anything. */
+    if (getenv("DS4_DIST_EXPERT_FETCH_ACCEPT_PORT")) return g_rf_live;
     const char *host = getenv("DS4_DIST_EXPERT_FETCH_HOST");
     if (!host || !host[0]) return 0;
     /* Wave 29: also dialed from the quiet-window kick thread; serialize with
      * the gather path (a contended caller just reports "not yet"). */
     if (pthread_mutex_trylock(&g_rf_init_mu) != 0) return 0;
-    if (cached > 0 || attempts >= 150) {
-        const int n = cached;
+    if (g_rf_live > 0 || attempts >= 150) {
+        const int n = g_rf_live;
         pthread_mutex_unlock(&g_rf_init_mu);
         return n;
     }
@@ -18340,14 +18343,14 @@ static int ds4_gpu_expert_remote_fetch_slots(void) {
         if (pthread_create(&th, NULL, ds4_gpu_expert_remote_fetch_worker,
                            (void *)(intptr_t)i) == 0) {
             pthread_detach(th);
-            cached++;
+            g_rf_live++;
         }
     }
-    if (cached) {
+    if (g_rf_live) {
         fprintf(stderr,
                 "ds4: expert gather pulls from peer SSD via %d remote fetch thread(s)%s "
                 "(attempt %d)\n",
-                cached, attempts > 1 ? " after retry" : "", attempts);
+                g_rf_live, attempts > 1 ? " after retry" : "", attempts);
     } else if (attempts >= 150) {
         fprintf(stderr,
                 "ds4: expert-fetch disabled after 150 failed connect attempts\n");
@@ -18356,7 +18359,7 @@ static int ds4_gpu_expert_remote_fetch_slots(void) {
                 "ds4: expert-fetch connect attempt %d/150 failed; retrying every 2s\n",
                 attempts);
     }
-    const int live = cached;
+    const int live = g_rf_live;
     pthread_mutex_unlock(&g_rf_init_mu);
     return live;
 }
@@ -18370,6 +18373,38 @@ static int ds4_gpu_expert_remote_fetch_slots(void) {
  * frame.  Dial from a short-lived background thread in that window. */
 static void *ds4_gpu_expert_remote_fetch_kick_main(void *arg) {
     (void)arg;
+    /* Wave 30 accept mode: the worker cannot dial out at all (in-process
+     * EHOSTUNREACH every attempt while shell tools succeed), so it LISTENS
+     * and the coordinator's serve-dial thread connects in.  This kick fires
+     * right after the worker accepts the control connection -- the same
+     * moment the coordinator's engine (already up, it just dialed us) starts
+     * its serve-dial backoff loop, so the rendezvous is race-free. */
+    const char *aport = getenv("DS4_DIST_EXPERT_FETCH_ACCEPT_PORT");
+    if (aport && aport[0]) {
+        pthread_mutex_lock(&g_rf_init_mu);
+        if (g_rf_live == 0) {
+            const int port = atoi(aport);
+            int conns = (int)ds4_gpu_env_u64("DS4_DIST_EXPERT_FETCH_CONNS", 3u);
+            if (conns > 8) conns = 8;
+            const int n = ds4_dist_expert_fetch_accept_init(port, conns, g_model_map_size);
+            for (int i = 0; i < n; i++) {
+                pthread_t th;
+                if (pthread_create(&th, NULL, ds4_gpu_expert_remote_fetch_worker,
+                                   (void *)(intptr_t)i) == 0) {
+                    pthread_detach(th);
+                    g_rf_live++;
+                }
+            }
+            if (g_rf_live) {
+                fprintf(stderr,
+                        "ds4: expert gather pulls from peer SSD via %d remote fetch "
+                        "thread(s) (accept mode)\n",
+                        g_rf_live);
+            }
+        }
+        pthread_mutex_unlock(&g_rf_init_mu);
+        return NULL;
+    }
     for (int i = 0; i < 10 && ds4_gpu_expert_remote_fetch_slots() == 0; i++) {
         usleep(700 * 1000);
     }
@@ -18378,7 +18413,8 @@ static void *ds4_gpu_expert_remote_fetch_kick_main(void *arg) {
 
 void ds4_gpu_expert_remote_fetch_kick(void) {
     const char *host = getenv("DS4_DIST_EXPERT_FETCH_HOST");
-    if (!host || !host[0]) return;
+    const char *aport = getenv("DS4_DIST_EXPERT_FETCH_ACCEPT_PORT");
+    if ((!host || !host[0]) && (!aport || !aport[0])) return;
     pthread_t th;
     if (pthread_create(&th, NULL, ds4_gpu_expert_remote_fetch_kick_main, NULL) == 0) {
         pthread_detach(th);
@@ -18522,9 +18558,19 @@ static int ds4_gpu_load_layer_experts_to_scratch(
         layer_index < DS4_METAL_EXPERT_PROFILE_MAX_LAYERS &&
         g_stage[layer_index & 1u].gen != 0 &&
         g_stage[layer_index & 1u].layer == layer_index;
+    /* Wave 32: units floor.  The old `|| !stage_enabled` arm made EVERY
+     * gather race on the worker once accept-mode rfetch went live (worker
+     * has no FETCH_HOST => staging off => arm always true).  Worker decode
+     * gathers (18 units) finish locally in 2-6ms; a TB round trip to the
+     * busy coordinator disk is 6ms+ of pure tail (measured: 426/1104 decode
+     * gathers raced, smoke 2.13 -> 2.08 the moment accept mode connected).
+     * Keep racing for batch-sized work (>= 96 units: prefill + verify) and
+     * for the coordinator's unstaged-decode-layer path; small unstaged
+     * gathers stay local. */
     const int remote_on =
         ds4_gpu_expert_remote_fetch_slots() > 0 && !g_rf_link_down &&
-        (total_units >= 96u || !ds4_gpu_expert_stage_enabled() || !layer_is_staged);
+        (total_units >= 96u ||
+         (ds4_gpu_expert_stage_enabled() && !layer_is_staged));
     g_gather_active = 1;   /* prefetch read-ahead yields while we own the SSD */
 
     ds4_metal_expert_gather_ctx ctx = {
@@ -18620,6 +18666,24 @@ static uint32_t ds4_gpu_expert_stream_threshold_pct(void) {
         initialized = 1;
     }
     return cached;
+}
+
+/* Wave 31: full-layer streaming reads the whole 1728MiB tensor set from the
+ * LOCAL disk only -- the stream path has no remote-fetch racing.  Measured on
+ * the 49-token verify batch: mini L0-2 streamed at 1.9GB/s = ~950ms/layer
+ * while the neighboring raced gathers did ~620MiB in ~130ms at 5-6.8GB/s
+ * aggregated over both SSDs.  Whenever racing is live, dense activation is
+ * exactly when racing pays the most (>=345 units), so skip streaming and let
+ * the raced gather take it.  DS4_METAL_EXPERT_STREAM_RFETCH_BYPASS=0 restores
+ * the old always-stream behavior. */
+static int ds4_gpu_expert_stream_rfetch_bypass(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_METAL_EXPERT_STREAM_RFETCH_BYPASS");
+        cached = (env && env[0] == '0' && env[1] == '\0') ? 0 : 1;
+    }
+    if (!cached) return 0;
+    return ds4_gpu_expert_remote_fetch_slots() > 0 && !g_rf_link_down;
 }
 
 static uint64_t ds4_gpu_expert_stream_chunk_bytes(void) {
@@ -19462,6 +19526,7 @@ int ds4_gpu_routed_moe_batch_tensor(
                 gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
                 down_type == DS4_METAL_TENSOR_Q2_K &&
                 ds4_gpu_expert_stream_enabled() &&
+                !ds4_gpu_expert_stream_rfetch_bypass() &&
                 (uint64_t)n_active * 100ull >=
                     (uint64_t)n_total_expert * ds4_gpu_expert_stream_threshold_pct()) {
                 stream_used = ds4_gpu_stream_layer_experts_to_scratch(model_map,

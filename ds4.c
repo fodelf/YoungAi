@@ -9982,7 +9982,7 @@ static bool metal_graph_alloc_raw_cap(
         g->mtp_raw_cache = metal_graph_alloc_kv_cache_tensor(
                 managed_kv_cache,
                 (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
-        g->spec_logits = ds4_gpu_tensor_alloc((uint64_t)32 * DS4_N_VOCAB * sizeof(float));
+        g->spec_logits = ds4_gpu_tensor_alloc((uint64_t)64 * DS4_N_VOCAB * sizeof(float));
         g->mtp_n_raw = 0;
     }
     /* PC.1 copy speculation (project.md §3.5): the cross-machine VERIFY batch
@@ -9992,7 +9992,7 @@ static bool metal_graph_alloc_raw_cap(
     if (!g->spec_logits) {
         const char *cs = getenv("DS4_DIST_COPY_SPEC");
         if (cs && *cs && cs[0] != '0') {
-            g->spec_logits = ds4_gpu_tensor_alloc((uint64_t)32 * DS4_N_VOCAB * sizeof(float));
+            g->spec_logits = ds4_gpu_tensor_alloc((uint64_t)64 * DS4_N_VOCAB * sizeof(float));
         }
     }
 
@@ -19416,6 +19416,10 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
          * (worker side), serve raw model-file range reads so the peer's expert
          * gather can draw from this machine's faster idle SSD over Thunderbolt. */
         (void)ds4_dist_expert_fetch_maybe_serve(e->model.fd, e->model.size);
+        /* Wave 30 reverse-established variant: when the worker cannot dial out
+         * (asymmetric bridge), the coordinator dials the worker's accept-mode
+         * listener instead and serves preads on the dialed sockets. */
+        (void)ds4_dist_expert_fetch_serve_dial(e->model.fd, e->model.size);
         int model_map_ok = 0;
         uint64_t base_l1_resident_bytes = 0;
         const uint64_t mtp_l1_resident_bytes = e->mtp_ready ?

@@ -2424,3 +2424,142 @@ worker 的 ARP 探测从第一次 gather 饿到最后。"等安静窗口" 的重
    verify 行 **sent>16 / next_len=24 或 31**; worker 日志 "remote fetch thread(s)"
    在 "coordinator connected" 后几秒内出现; worker 批行 rfetch_mib>0;
 ② smoke 回归 ~2.1; ③ A/B: COPY_SPEC_DRAFT=16 / EXPERT_REMOTE_FETCH_REVERSE=0。
+
+## 2026-06-10 — 第三十波: K=64 全链 + 反向 efetch 改 accept 模式 (建立方向反转)
+
+**Context.** 第二十九波实测: code-edit **2.90 (新高)** / smoke 2.13 (持平)。取证:
+① K=32 终于生效 —— verify 轮 sent=4/4/7/13/25/32, accepted=2/4/7/13/25/29,
+draft_accept **94.12%**, tok/call 5.71, r2(32)=7163ms (IO 并集随 kc 次线性,
+r2(13)≈r2(25)≈r2(32) 同量级) —— **抄长还想再翻倍**: 末两轮全中且 next_len 顶满 31。
+② 反向 efetch 第三刀 (静默窗拨号) 仍瞬败: worker 进程内 connect mini 一律立即
+EHOSTUNREACH (含控制连接 accept 后的真静默窗), 而同一时刻 worker shell 的
+nc/ping/未签名测试二进制全部连通, mini 进程内拨 worker (控制+6 条 staging efetch)
+每跑必成。根因不明 (三波取证无解), 不再纠缠 —— **解法 = 反转 TCP 建立方向**。
+
+**Patch (一次性原子落完, 含第二十八波教训).**
+1. **K=64 全链** (上轮已落, 本波脚本默认补齐):
+   `ds4_distributed.c` drafts[64]/verify_tokens[64]/copied[63]/`K>64` 钳/`kc>64u` 钳/
+   DRAFT env 钳 (8,2,64)/INIT (3,1,63)/MIN (2,1,63); `ds4.c` 两处 spec_logits 64 行
+   (~33MiB); `ds4_cli.c`×2 + `ds4_server.c` toks[65]; 脚本 `COPY_SPEC_DRAFT` 默认 32→**64**。
+   线协议无须动 (verify token 走普通 work 帧, cap=prefill_cap=128)。
+2. **反向 efetch accept 模式** (线上协议字节不变, 只反转谁拨谁):
+   - `ds4_distributed.c` 新增 `ds4_dist_expert_fetch_accept_init(port,conns,size)`:
+     逻辑客户端 (worker) 监听, poll-accept ≤120s, 对每条 accepted 套接字做标准
+     客户端握手 (先发 magic, 读 hello[2] 校验 magic+模型字节数), 填 g_efetch_fds;
+     `ds4_dist_expert_fetch_serve_dial(fd,size)`: 逻辑服务端 (mini), 由
+     `DS4_DIST_EXPERT_FETCH_SERVE_DIAL_HOST/_PORT(5607)/_CONNS` 门控, 后台线程
+     2s 退避 ≤150 次拨 worker, 每条连上的套接字直接跑原 `ds4_efetch_conn_thread`
+     (它本来就以"读 magic"开场, 服务端逻辑零改动)。
+   - `ds4.c` 引擎启动 maybe_serve 旁挂 `serve_dial`。
+   - `ds4_metal.m`: slots() 的函数静态 `cached` 提为文件级 `g_rf_live`;
+     accept 模式 (`DS4_DIST_EXPERT_FETCH_ACCEPT_PORT` 存在) 下 slots() 只读
+     g_rf_live 不拨号 (init 全权归 kick 线程); kick 门控扩为 FETCH_HOST||ACCEPT_PORT;
+     kick 线程 accept 模式下调 accept_init 再起 fetch worker 线程。
+   - 头文件: 两个新函数声明 + 注释。
+   - 脚本 REVERSE 块: LOCAL += `SERVE_DIAL_HOST=$WORKER_IP SERVE_DIAL_PORT=5607
+     SERVE_DIAL_CONNS=6`; REMOTE = `ACCEPT_PORT=5607 FETCH_CONNS=6` (撤 COORD_IP
+     探测/FETCH_HOST/显式 STAGE=0 —— **无 FETCH_HOST ⇒ worker staging 自然不激活**,
+     不变量以更简方式保持)。
+   - 会合时序: worker accept 控制连接 → kick 起监听; mini 引擎 (此刻早已 up,
+     控制连接正是它拨的) serve-dial 2s 退避循环正在跑 → 数秒内 6 连全通, 无竞态。
+3. 旧 FETCH_HOST 正向路径全保留 (`EXPERT_REMOTE_FETCH_REVERSE=0` 即回旧形态)。
+
+**期望.** K=64: 抄长 3→6→12→24→48→63, 全中 64-token 轮把 r2 摊得更薄 (r2 次线性,
+预估 r2(64)~9-10s, 全中轮 round-rate ~6.5 t/s) ⇒ code-edit **≥3.0**;
+accept 模式若连上: worker 的 ≥96 单元批 gather racing 拉 mini 盘, worker verify
+半程 ~2.6s→~1.9s 再加一截。smoke 不受影响 (~2.1)。
+
+**Validation performed here.** `make` 无新告警 (4 legacy); `ds4_test --metal-kernels` OK;
+`bash -n` 脚本通过。未跑大模型。用户脚本验证 (两跑):
+① `PROMPT_PROFILE=code-edit tools/mtp_pipe_q2_speed.sh` — 决定性证据三看:
+   verify 行 **sent>32 / next_len=48 或 63** (K=64 生效);
+   worker 日志 "expert-fetch client (accept mode): N connection(s)" +
+   coordinator "expert-fetch serve-dial: N connection(s)" (建立方向反转成功);
+   worker 批行 **rfetch_mib>0** (racing 真把字节拉过来了);
+② smoke 回归 ~2.1; ③ A/B: COPY_SPEC_DRAFT=32 / EXPERT_REMOTE_FETCH_REVERSE=0。
+
+## 2026-06-10 — 第三十一波: 押注上限 MAX=32 + 流式层 racing 旁路
+
+**Context.** 第三十波实测: code-edit **2.54 (回落)** / smoke 2.08。但两个里程碑式的好消息:
+① **accept 模式反向 efetch 三波之谜终于绕开**: worker 日志 "expert-fetch client (accept
+mode): 6 connection(s)"、coordinator "serve-dial: 6 connection(s)" (第一拨 Connection
+refused 后 2s 重拨即成), worker 批行 rfetch_mib 26-306, prefill gather 带宽 4.4→6.3-6.8
+GB/s。② K=64 生效 (sent=49)。回落的账目 (97 tok / 38.2s, 全对上):
+- **超额下注**: 第 6 轮 sent=49 只中 29 (r2=10583ms) —— 抄写源在第 29 个 token 处分叉
+  (与 wave29 的 29 完全一致 = 同一段可抄材料的尽头), 第 24→48 的翻倍多付 3.4s 换 0 个
+  新 token。r2 每 token 成本已饱和: kc=4:384 / 7:374 / 13:313 / 25:228 / 49:216 ms/tok ——
+  专家并集去重在 kc≈25 耗尽, 大注几乎无摊薄增益, 分叉点后全是纯损。
+- **流式层不 racing** (新发现, wave29 也在付): kc=49 轮 mini L0-2 n_active=157-161 ≥60%
+  阈值走 mode=stream 整层 1728MiB, **rfetch=0、单盘 1.9GB/s、~950ms/层** (3 层 2.9s);
+  相邻 raced gather 层 ~620MiB/130ms/5-6.8GB/s。worker L31/35 同病 (370-414ms vs 140)。
+  prefill 两侧的 stream 层 (mini 4 层/worker 2 层) 也一样在白付。
+- r2 账目: kc=13: mini wall+drain 1716 + worker 2285 = 4001≈4076 ✓;
+  kc=25: 2324+3283=5607≈5709 ✓; kc=49: 5999(含 2.9s stream)+4406=10405≈10583 ✓。
+  另注: drain (GPU 计算) 占 r2 ~40-45% (worker kc=25 drain 1703ms = 74ms/层) ——
+  下一波的候选目标。
+
+**Patch.**
+1. `ds4_distributed.c`: `dist_copy_spec_max_len()` = env `DS4_DIST_COPY_SPEC_MAX`
+   钳 (32,1,63); 合成时 want 与翻倍后 grown 都加 MAX 钳。注型回 3→6→12→24→32
+   (wave29 的赢钱注型), K=64 协议保留。
+2. `ds4_metal.m`: `ds4_gpu_expert_stream_rfetch_bypass()` (env
+   `DS4_METAL_EXPERT_STREAM_RFETCH_BYPASS` 默认 1): racing 在线
+   (slots>0 && !link_down) 时跳过 full-layer stream, 让 raced gather 接手 ——
+   稠密激活 (≥115/192) 恰是 racing 最赚的形态 (≥345 单元)。单机/无 racing 不受影响。
+3. 脚本: `COPY_SPEC_MAX=32` 默认 + env 透传; DRAFT 保持 64 (协议上限)。
+
+**期望.** code-edit: 去掉 48 注 (-3.4s) 回 wave29 形态, 再加大轮 stream 旁路
+(~2s/大轮) + prefill 提速 ⇒ **≥3.0**; smoke: 旁路只帮 prefill, 生成 ~2.1。
+A/B: `COPY_SPEC_MAX=63` 复第三十波注型; `DS4_METAL_EXPERT_STREAM_RFETCH_BYPASS=0`
+复旧流式。
+
+**Validation performed here.** `make` 无新告警 (4 legacy); `ds4_test --metal-kernels` OK;
+`bash -n` 通过。未跑大模型。用户脚本验证 (两跑):
+① `PROMPT_PROFILE=code-edit tools/mtp_pipe_q2_speed.sh` — 决定性证据:
+   verify 行 sent ≤33、next_len 顶在 32; coordinator/worker 批行不再出现
+   `mode=stream` (racing 在线时), 原 stream 层变 gather 且 rfetch_mib>0;
+② smoke 回归 ~2.1; ③ 若 code-edit <2.9, 先单独 A/B 两个开关定位。
+
+## 2026-06-10 — 第三十二波: racing units 下限 + worker 升 12G（设备限制更新）
+
+**Context.** 第三十一波实测: code-edit **2.90（追平最高）** / smoke 2.08。wave31 两修都生效:
+verify 行 sent≤33、next_len 顶在 32; 4 份日志 0 条 `mode=stream`（旁路在 racing 在线时全程接管）。
+smoke 没回 2.13 的元凶定位:
+- **worker decode gather 在 racing**: worker 1104 次 decode gather 中 **426 次 rfetch_mib>0**。
+  racing 条件 `units>=96 || !stage_enabled || !layer_is_staged` 里第二臂在 accept 模式下永真
+  （worker 无 FETCH_HOST ⇒ staging 关）。wave29 之前 worker 反向连接根本连不上（slots=0）所以
+  从未触发; wave30 accept 模式连通后副作用显形——decode 本地 wall 才 2-6ms, 跨 TB 到正忙的
+  mini 盘拉 4.7MiB 要 6.25ms, 纯加尾。2.13→2.08 恰从 wave30 起, 时间线吻合。
+- **worker decode 全程 hit_mib=0.0**: REMOTE source cache 只有 128MiB 摊 23 层（等于没有）;
+  coordinator 同设计 2048MiB 命中 50-100%, 全命中层 wall 1.1ms vs 冷层 10.8ms。
+
+**设备限制更新（用户 2026-06-10）**: 两台机器都放宽到 **12G**（总 24G; 此前 mini 12 + MacBook 8）。
+worker 多出 ~4G = 本波最大红利。24G 上限重估已写入 project.md §1
+（专家缓存可用 ~8-9GiB; smoke 现实上限 ~3.0-3.4, code-edit ~4+）。
+
+**Patch.**
+1. `ds4_metal.m` remote_on（~18561）: 去掉 `|| !stage_enabled` 永真臂, 改为
+   `units>=96 || (stage_enabled && !layer_is_staged)`。coordinator 行为零变化
+   （staging 开着, 未暂存 decode 层照旧 race）; worker 只剩 ≥96 单元的批
+   （prefill/verify, n_active≥32）才 race, decode（18 单元）回本地。
+2. 脚本: `REMOTE_MAX_GB` 8→12, `REMOTE_BUDGET_MB` 8000→12000（对齐 coordinator 比例）;
+   `REMOTE_EXPERT_SOURCE_CACHE_MB` 128→2048（layers 20:42）;
+   新增 `WORKER_BACKBONE_MLOCK=1`/`WORKER_BACKBONE_MLOCK_BUDGET_MB=5120`
+   （worker 切片 23 层 backbone ~4.7GiB; 动机: worker drain 74ms/层 ≈ wave25 修前
+   coordinator 同病——verify 冷流驱逐 backbone, GPU 命令执行中 refault; coordinator
+   mlock 后 42ms/层。drain 占 r2 ~40-45%, 这是上波点名的下一个大杠杆）。
+   worker 内存账: mlock 4.7 + ctx 1.8 + cache 2 + scratch/杂 ~1.5 ≈ 10-10.5G < 12G 杀线。
+
+**期望.** smoke: 去掉 decode racing 尾巴（~35ms/token）+ worker 层 cache 命中
++ worker drain 下降 ⇒ **≥2.15**（冲 2.2+）; code-edit: r2 的 worker 半程
+（wall+drain）两头都受益（verify 冷读部分命中 + drain refault 消失）⇒ **≥3.1**。
+A/B: `WORKER_BACKBONE_MLOCK=0` / `REMOTE_EXPERT_SOURCE_CACHE_MB=128` 单项回退;
+若 worker 被 12G 杀线杀掉, 先降 `WORKER_BACKBONE_MLOCK_BUDGET_MB=4096`。
+
+**Validation performed here.** `make` 无新告警（4 legacy）; `ds4_test --metal-kernels` OK;
+`bash -n` 通过。未跑大模型。用户脚本验证（两跑）:
+① `PROMPT_PROFILE=code-edit tools/mtp_pipe_q2_speed.sh` — 决定性证据:
+   worker 日志出现 "backbone mlock enabled (budget 5120 MiB)" 与 wired 增长行;
+   worker decode 行 rfetch_mib 全 0、hit_mib 由 0 转正;
+   worker verify 批行 drain_ms/层 比 74 明显下降;
+② `tools/mtp_pipe_q2_speed.sh`（smoke）回归 ≥2.13; ③ 盯脚本状态行 M1worker 不逼近 12G。
