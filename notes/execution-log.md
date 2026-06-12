@@ -2670,3 +2670,42 @@ A/B: `EXPERT_BATCH_NOCACHE_MIN=24` 回旧形态。
 ① code-edit 档 — 决定性证据: sent=25/33 轮的 r2_ms 比 5612/6175 明显下降
    (worker/coord 对应批行 pread_ms 降、bw 升); 输出文本仍与第三十四波逐字相同;
 ② smoke 档回归 ~2.16。
+
+## 2026-06-12 — 第三十六波: 批 union 预测预取（verify gather 不再全冷）
+
+**Context.** 第三十五波实测: **code-edit 3.39（新高）/ smoke 2.15（持平）**。
+- NOCACHE 阈值修正本身近似打平: r2(25) 5612→5302, r2(33) 6175→6365, Σr2 21.3→21.1s。
+  轮间页缓存复用没发生的原因是**容量**: 每轮 union ~7GiB（worker 侧 cold 7067MiB, hit=0）,
+  装不进 ~3-4G 空闲页缓存, 上一轮的页早被本轮自己冲掉。改动无害保留（且是本波的前置条件）。
+- 复盘排除的方向: ① MoE dispatch 按专家分半提前开跑——layer L+1 的路由依赖 L 的输出,
+  真重叠只能靠投机; 且 mm_id map 结构拆分有 float 加序/位精确风险。② MTP-on-miss——
+  r2(4)=1457ms 的小批成本曲线下只值 +5-10%, NO_MTP=1 的历史判决（接受率高但端到端负）依旧成立。
+  ③ 批 token 分半流水——union 稀释 +30-50% 正好吃掉重叠收益（算过, 6353→6329, 白动）。
+- **真空挡定位**: 批路径根本没有 prefetch hook（只有 decode 在挂, 且 job 只装一行 hidden,
+  33-token 批的 50-74 专家 union 只被预测出 ~8 个）⇒ verify gather 全程冷读;
+  而每层 drain（~50-60ms, GPU 在跑、盘空闲）是个白白浪费的预热窗口。
+
+**Patch.**（全 CPU 侧 hint, 预测错只浪费读, 零正确性风险）
+1. `ds4_metal.m` pf job 扩展: `n_rows` + `xrows[16×8192]`（批行快照, 步长采样 ≤16 行;
+   旧 enqueue 补 n_rows=1 防 slot 复用脏读）。
+2. `ds4_gpu_expert_prefetch_enqueue_batch(layer+1, x, n_embd, n_tokens)`: 批 hidden
+   [n_tokens×n_embd] 行主序, stride=floor(n/16) 采样。
+3. `ds4_gpu_expert_prefetch_predict_union`: 逐行精确 top-k（与 predict_one 同公式
+   sqrt(softplus)+bias）求并, 按 per-expert max score 降序发 advisories
+   （mostly_cached 跳过 + advise_paced 礼让 gather）; hash 层跳过; depth=1。
+   成本 ~16 次 router matvec ≈ 15-25ms, 在 pf 线程上与 gather 并行。
+4. 批路径 drain 后挂 hook: 仅 cached-fd 批（!nocache_call, 即 n_tokens<64 的 verify 批;
+   NOCACHE 的 prefill 帧预热无意义）且 n_tokens>1。
+   时序: gather(L) 期间 pf 线程算分 → drain(L+1) 盘空闲窗口发 advisories →
+   gather(L+1) 的 cached preads 吃暖页（第三十五波 cached fd 是前置条件, 协同）。
+
+**期望.** verify 每层 union ~300MiB 中预测覆盖 ~70-80%, drain 窗口能预热其中一半上下
+⇒ 批层 wall 82→~50-60ms ⇒ r2(33) 6365→~5000, Σr2 21→~16-17s ⇒ code-edit **≥3.7**;
+smoke 不变 ~2.15（decode 路径未动）。两侧机器同时受益（worker 23 层是大头）。
+A/B: `DS4_METAL_EXPERT_PREFETCH_AHEAD=0` 全关; 看批行 bw_gbps 升/pread_ms 降为证。
+
+**Validation performed here.** `make` 无新告警（4 legacy）; `ds4_test --metal-kernels` OK。
+未跑大模型。用户脚本验证（两跑）:
+① code-edit 档 — 决定性证据: 两侧 site=batch 行 wall_ms 降、bw_gbps 明显升
+   （暖页 pread 会拉高等效带宽）, r2(25)/r2(33) 下降; 输出文本仍逐字相同;
+② smoke 档回归 ~2.15。

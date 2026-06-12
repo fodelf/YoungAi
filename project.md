@@ -65,7 +65,8 @@ racing 只在 ≥96 单元的大批形态下两盘并行才稳赚。
 | **第三十二波实测（设备限制更新：两台都 12G/总 24G）** | **code-edit 3.00（新高）/ smoke 2.14（新高）** | 9.84 | racing units 下限生效（worker decode rfetch 0/1104）；worker mlock wired 4.14GiB、verify drain 74→~50ms/层；r2(33)=6493 闭合=IO walls 60%+drain 38%。**两个真相**：① source cache async 模式从不 admit（两侧 summary hits=0 admit=0，2048MiB 配置是死字段，只做 madvise 加热）；② coordinator decode hit_mib 全来自 **staging**，worker hit=0 只因 stage_enabled() 门硬要 FETCH_HOST |
 | 第三十三波实测（**负结果，已回滚**） | code-edit 2.83 / smoke 1.75（双降） | 10.00 | worker staging 净亏：completion 64%（coordinator 同机制 97%）、dropped 33%、decode 命中仅 26%，wall 反升 2-6→4-9.6ms/层，未暂存层 racing 复活 125/1104，r1 +20%。根因=盘速不对称：mini 盘慢（1.9GB/s）+兼任 efetch server，喂不饱 worker 暂存窗口。`WORKER_EXPERT_STAGE` 默认回 0 |
 | **第三十四波实测** | **code-edit 3.32（新高）/ smoke 2.16（新高）** | 9.91 | PC.1 融合单轮全生效（6 轮全 r1_ms=0）；意外之喜：+1 对齐偏移让末轮 33/33 全中（旧形态 29 分叉）；EOS 自然结束于 97；账：fire 轮 84 tok/Σr2 21.3s + miss 13 tok/7.8s |
-| 第三十五波（待实测） | 目标 code-edit ≥3.5 / smoke ~2.16 | — | verify 批回 cached fd：NOCACHE 阈值 24（K=16 时代校准，verify ≤17 行从不触发）→64；kc=25/33 两大轮（r2 11.8s=Σr2 的 55%）此前被误判 prefill 冷流，丢掉相邻轮 union 重叠+decode 热专家暖页（wave-25 判决：verify 走 NOCACHE 输）；backbone 已双侧 mlock 无驱逐风险；A/B `EXPERT_BATCH_NOCACHE_MIN=24` |
+| **第三十五波实测** | **code-edit 3.39（新高）/ smoke 2.15** | 10.23 | NOCACHE 阈值修正近似打平（r2(25) -310 / r2(33) +190）：轮间复用被容量否决——每轮 union ~7GiB 装不进 ~3-4G 空闲页缓存；改动无害保留且是 36 波前置条件。排除项：MoE 分半 dispatch（路由依赖+位精确风险）、MTP-on-miss（小批 r2 成本曲线下只值 +5-10%）、批 token 分半流水（union 稀释吃掉重叠收益） |
+| 第三十六波（待实测） | 目标 code-edit ≥3.7 / smoke ~2.15 | — | **批 union 预测预取**：批路径此前完全没有 prefetch hook（decode 的 job 只装 1 行 hidden，33-token 批 50-74 专家 union 只预测出 ~8 个）⇒ verify gather 全冷；新增 ≤16 行采样快照 + 逐行精确 top-k 求并 + drain 盘空闲窗口（~60ms）发 advisories；cached-fd 批专用（35 波协同）；纯 CPU hint 零正确性风险；A/B `DS4_METAL_EXPERT_PREFETCH_AHEAD=0` |
 | M1 单拷贝直读 + prefill 流式 | **≥1.6** | **≥10** | P1.1/P1.2 |
 | M2 预测预取流水 + 命中零拷贝 + repack | **≥3** | **≥25** | P1.3/P1.4/P2.1 |
 | M3 expert-parallel 双 SSD 并行 | **≥5** | ≥30 | P2.2 |
