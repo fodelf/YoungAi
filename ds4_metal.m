@@ -16985,7 +16985,16 @@ static uint32_t ds4_gpu_expert_batch_nocache_min_tokens(void) {
     if (!init) {
         const char *v = getenv("DS4_METAL_EXPERT_BATCH_NOCACHE_MIN");
         uint64_t n = v ? strtoull(v, NULL, 10) : 0;
-        if (n == 0) n = 24;          /* verify kc<=16 stays cached */
+        /* Wave 35: 24 was calibrated when K=16 capped verify at 17 rows --
+         * verify could never trip it.  The K=64 ladder now sends kc=25/33
+         * verify batches (the two big rounds, 11.8s of 21.3s r2 total) which
+         * 24 misclassifies as prefill-sized cold streams: their unions lose
+         * both the warm bytes of the neighbouring round (consecutive copy
+         * rounds share most experts) and the decode-hot overlap -- exactly
+         * the case the wave-25 verdict measured as a loss (1.68 vs 1.48).
+         * 64 keeps every verify batch (protocol max 64 rows) on the cached
+         * fd; prefill frames (128 tokens) stay NOCACHE. */
+        if (n == 0) n = 64;
         if (n > UINT32_MAX) n = UINT32_MAX;
         cached = (uint32_t)n;
         init = 1;

@@ -2641,3 +2641,32 @@ A/B: `WORKER_EXPERT_STAGE=1` 复现staging实验; 若 code-edit 输出内容变�
 ① code-edit 档 — 决定性证据: verify 行出现 **r1_ms=0**; 轮数与 sent/accepted 序列
    应与第三十二波同构（2/4/7/13/25/29 的接受序列, 输出文本逐字相同）;
 ② smoke 档回归 ~2.14（worker 日志不再有 ds4-stage 行）。
+
+## 2026-06-12 — 第三十五波: verify 批回 cached fd（NOCACHE 阈值 24→64）
+
+**Context.** 第三十四波实测: **code-edit 3.32（新高）/ smoke 2.16（新高）**。
+- 融合单轮全面生效: 6 轮全部 r1_ms=0; 且最后一轮 **sent=33 accepted=33 全中**
+  （旧形态在 29 分叉; 融合的 +1 对齐偏移让抄写源吃到尽头）。输出以 EOS 自然结束于 97
+  （NPRED=224 未触顶, 注帽 32 无钱可加）。
+- 账目: 6 fire 轮 84 tok, Σr2=21.3s; 13 miss tok ≈7.8s; 合计 29.1≈97/3.32 ✓。
+- 下一个误伤定位: `ds4_gpu_expert_batch_nocache_min_tokens` 默认 24 是 wave-25/K=16 时代
+  校准的——当时 verify ≤17 行永远不触发, 24 只拦 prefill。K=64 注梯后 kc=25/33 两个大轮
+  (r2 5612+6175 = 11.8s, 占 Σr2 的 55%) 被误判成 prefill 冷流走 F_NOCACHE:
+  读不暖缓存、也吃不到相邻轮 union 重叠（连续抄写轮专家高度共享）与 decode 热专家的暖页。
+  wave-25 判决原文: verify 走 NOCACHE 输 (1.68 vs 1.48)。backbone 驱逐风险已被双侧 mlock
+  消除 (wave 25/32), cached fd 对 backbone 无害。
+
+**Patch.**
+1. `ds4_metal.m` nocache_min 默认 24→64: 所有 verify 批 (协议上限 64 行) 走 cached fd;
+   prefill 帧 (128 token) 仍 NOCACHE。env `DS4_METAL_EXPERT_BATCH_NOCACHE_MIN` 可 A/B。
+2. 脚本: `EXPERT_BATCH_NOCACHE_MIN=64` 默认 + IO_ENV 透传（两侧生效）。
+
+**期望.** code-edit: kc=25/33 轮的 wall 吃到上一轮暖页 ⇒ r2 合计 -2~3s ⇒ **≥3.5**;
+smoke 不受影响 (~2.16, decode 单 token 本就 cached)。
+A/B: `EXPERT_BATCH_NOCACHE_MIN=24` 回旧形态。
+
+**Validation performed here.** `make` 无新告警（4 legacy）; `ds4_test --metal-kernels` OK;
+`bash -n` 通过。未跑大模型。用户脚本验证（两跑）:
+① code-edit 档 — 决定性证据: sent=25/33 轮的 r2_ms 比 5612/6175 明显下降
+   (worker/coord 对应批行 pread_ms 降、bw 升); 输出文本仍与第三十四波逐字相同;
+② smoke 档回归 ~2.16。
