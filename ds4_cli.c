@@ -609,7 +609,10 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
         }
         if (token == ds4_token_eos(engine)) break;
 
-        int toks[65];   /* K=64 verify batch + first_token */
+        int toks[129];  /* wave 69: 2 spec-pipe cycles (2*64 verify rows + first_token).
+                         * Was [65] (1 cycle), which silently blocked the spec-pipe 2nd
+                         * cycle on every full-accept batch (n_acc+spec_next_kb up to
+                         * 128 > 65) -- the real cause of its ~1/9 fire rate. */
         int ntok = 0;
         if (cfg->gen.temperature <= 0.0f &&
             (ds4_engine_mtp_draft_tokens(engine) > 1 || cli_copy_spec_enabled()) &&
@@ -1281,7 +1284,10 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
                                        &rng);
         if (token == ds4_token_eos(engine)) break;
 
-        int toks[65];   /* K=64 verify batch + first_token */
+        int toks[129];  /* wave 69: 2 spec-pipe cycles (2*64 verify rows + first_token).
+                         * Was [65] (1 cycle), which silently blocked the spec-pipe 2nd
+                         * cycle on every full-accept batch (n_acc+spec_next_kb up to
+                         * 128 > 65) -- the real cause of its ~1/9 fire rate. */
         int ntok = 0;
         if (cfg->gen.temperature <= 0.0f &&
             (ds4_engine_mtp_draft_tokens(engine) > 1 || cli_copy_spec_enabled()) &&
@@ -1348,12 +1354,33 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
             "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
             prefill_s > 0.0 ? (double)suffix / prefill_s : 0.0,
             decode_s > 0.0 ? (double)generated / decode_s : 0.0);
+    /* PC.4 per-turn TTFT metric: in a multi-turn session the prefix KV is
+     * reused (cached) and only the appended suffix is prefilled, so TTFT
+     * (wall-clock prefill of the suffix) is the real coding-UX denominator,
+     * not the cold full-context prefill.  Parsed by tools/mtp_replay_q2.sh. */
+    ds4_log(stderr,
+            DS4_LOG_TIMING,
+            "ds4: per-turn: cached=%d suffix=%d TTFT=%.0f ms decode=%d tok %.2f t/s\n",
+            cached,
+            suffix,
+            prefill_s * 1000.0,
+            generated,
+            decode_s > 0.0 ? (double)generated / decode_s : 0.0);
     return 0;
 }
 
 static int run_repl(ds4_engine *engine, cli_config *cfg) {
     repl_chat chat;
     if (repl_chat_init(engine, &chat, cfg) != 0) return 1;
+
+    /* The one-shot (-p) paths wait for the worker layer route before
+     * generating; the interactive/REPL path skipped it, so the first turn's
+     * prefill hit "distributed route incomplete: missing layer N" (PC.4
+     * multi-turn replay needs the route up across turns).  No-op for non-dist. */
+    if (cli_wait_distributed_route(cfg, chat.session) != 0) {
+        repl_chat_free(&chat);
+        return 1;
+    }
 
     struct sigaction old_int;
     struct sigaction sa;

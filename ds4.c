@@ -862,6 +862,26 @@ static void ds4_mem_watchdog_start(void) {
     atexit(ds4_profile_flush);
 }
 
+/* Exposed to the GPU backend (ds4_metal.m) so memory-hungry caches (e.g. the
+ * routed-expert source cache) can size themselves dynamically against the live
+ * Mach phys_footprint and the configured budget instead of a fixed MB cap
+ * (2026-06-15 policy: use the headroom up to the 12G total, not a fixed slice).
+ * Budget falls back to the env so it works even before the watchdog thread
+ * has populated g_mem_budget_bytes. */
+uint64_t ds4_runtime_phys_footprint_bytes(void) {
+    return ds4_phys_footprint_bytes();
+}
+
+uint64_t ds4_runtime_mem_budget_bytes(void) {
+    if (g_mem_budget_bytes != 0) return g_mem_budget_bytes;
+    const char *bud = getenv("DS4_MEM_BUDGET_MB");
+    if (bud && bud[0]) {
+        long mb = strtol(bud, NULL, 10);
+        if (mb > 0) return (uint64_t)mb * 1024ull * 1024ull;
+    }
+    return 0;
+}
+
 __attribute__((constructor)) static void ds4_stage0_autostart(void) {
     ds4_mem_watchdog_start();
 }
@@ -17899,13 +17919,14 @@ bool ds4_engine_has_mtp(ds4_engine *e) {
 int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
     if (!e) return 0;
     if (ds4_engine_has_mtp(e)) return e->mtp_draft_tokens;
-    /* Distributed layer-pipeline MTP is orchestrated by the coordinator but the
-     * support model is loaded only on the final-layer worker.  The CLI uses this
-     * accessor to decide whether to enter the speculative decode path; without
-     * this branch `--mtp-role worker --mtp-draft N` silently ran the plain
-     * one-token distributed decode loop and MTP could never show a speed change. */
+    /* Distributed layer-pipeline MTP is orchestrated by the coordinator. The
+     * support model lives either on the final-layer worker (--mtp-role worker) or
+     * on the coordinator itself (--mtp-role coordinator, 本机 MTP). The CLI uses
+     * this accessor to decide whether to enter the speculative decode path; both
+     * draft locations need it non-zero so the loop runs the candidate batch
+     * instead of the plain one-token distributed decode. */
     if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR &&
-        e->distributed.mtp_draft_on_worker) {
+        (e->distributed.mtp_draft_on_worker || e->distributed.mtp_draft_on_coordinator)) {
         return e->mtp_draft_tokens;
     }
     return 0;
@@ -19356,6 +19377,19 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         opt->distributed.role == DS4_DISTRIBUTED_WORKER &&
         opt->distributed.mtp_draft_on_worker &&
         load_output;
+    /* 本机 MTP topology: the coordinator runs the drafter. It owns the starting
+     * slice (so token_embd is already resident) but its layer slice ends before
+     * the output head; it must additionally resident the output head weights to
+     * turn the worker's returned final hidden state into logits (output head +
+     * its own MTP draft). The drafter also re-embeds its draft tokens, so keep
+     * token_embd resident as the worker-draft path does. */
+    const bool mtp_for_coord_draft =
+        opt->distributed.role == DS4_DISTRIBUTED_COORDINATOR &&
+        opt->distributed.mtp_draft_on_coordinator;
+    /* Whether this process must resident the output head weights: normally the
+     * owner of the final layer slice (load_output); also the coordinator drafter. */
+    const bool include_output_head = load_output || mtp_for_coord_draft;
+    const bool mtp_keep_token_embd = mtp_for_worker_draft || mtp_for_coord_draft;
 
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
     ds4_profile_load_begin();
@@ -19374,14 +19408,16 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         return 1;
     }
     if (opt->mtp_path && opt->mtp_path[0] &&
-        (opt->distributed.role == DS4_DISTRIBUTED_NONE || mtp_for_worker_draft)) {
+        (opt->distributed.role == DS4_DISTRIBUTED_NONE || mtp_for_worker_draft ||
+         mtp_for_coord_draft)) {
         model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
         mtp_weights_bind(&e->mtp_weights, &e->mtp_model);
         e->mtp_ready = true;
         fprintf(stderr, "ds4: MTP support model loaded: %s (draft=%d%s)\n",
                 opt->mtp_path,
                 e->mtp_draft_tokens,
-                mtp_for_worker_draft ? ", distributed worker drafter" : "");
+                mtp_for_worker_draft ? ", distributed worker drafter" :
+                mtp_for_coord_draft ? ", distributed coordinator drafter" : "");
     }
 
 #ifndef DS4_NO_GPU
@@ -19422,7 +19458,10 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         (void)ds4_dist_expert_fetch_serve_dial(e->model.fd, e->model.size);
         int model_map_ok = 0;
         uint64_t base_l1_resident_bytes = 0;
-        const uint64_t mtp_l1_resident_bytes = e->mtp_ready ?
+        /* Under DS4_MTP_NO_RESIDENCY the draft model is left evictable (not
+         * wired), so it must not count against the L1 resident budget gate. */
+        const uint64_t mtp_l1_resident_bytes =
+            (e->mtp_ready && getenv("DS4_MTP_NO_RESIDENCY") == NULL) ?
             e->mtp_model.size - e->mtp_model.tensor_data_pos : 0;
         const char *expert_offload_env = getenv("DS4_METAL_EXPERT_OFFLOAD");
         const bool expert_offload_requested = expert_offload_env && expert_offload_env[0] &&
@@ -19442,8 +19481,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 if (!weights_model_map_spans_split_slice(&e->weights,
                                                          load_layer_start,
                                                          load_layer_end,
-                                                         load_output,
-                                                         mtp_for_worker_draft,
+                                                         include_output_head,
+                                                         mtp_keep_token_embd,
                                                          &bb,
                                                          &exp))
                 {
@@ -19509,8 +19548,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 if (!weights_model_map_spans(&e->weights,
                                              load_layer_start,
                                              load_layer_end,
-                                             load_output,
-                                             mtp_for_worker_draft,
+                                             include_output_head,
+                                             mtp_keep_token_embd,
                                              &spans))
                 {
                     fprintf(stderr, "ds4: invalid model load layer slice %u:%s\n",
@@ -19638,6 +19677,10 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
+        /* DS4_MTP_NO_RESIDENCY: wrap the draft model's views evictable (not
+         * wired) so they do not pin the worker's GPU residency budget. */
+        const bool mtp_nonresident = e->mtp_ready && getenv("DS4_MTP_NO_RESIDENCY") != NULL;
+        if (mtp_nonresident) ds4_gpu_set_model_map_nonresident_hint(1);
         if (e->mtp_ready &&
             !ds4_gpu_set_model_map_range(e->mtp_model.map,
                                            e->mtp_model.size,
@@ -19645,6 +19688,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                                            e->mtp_model.size - e->mtp_model.tensor_data_pos,
                                            e->mtp_model.max_tensor_bytes))
         {
+            if (mtp_nonresident) ds4_gpu_set_model_map_nonresident_hint(0);
             fprintf(stderr,
                     "ds4: %s failed to map MTP model views; aborting startup. "
                     "This is commonly caused by insufficient memory or accelerator VM budget.\n",
@@ -19653,6 +19697,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
+        if (mtp_nonresident) ds4_gpu_set_model_map_nonresident_hint(0);
         if (!accelerator_cache_model_tensors(e->backend, &e->model)) {
             fprintf(stderr, "ds4: %s failed to prepare startup model cache\n",
                     ds4_backend_name(e->backend));
@@ -19664,13 +19709,29 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
          * Without this, MTP-block tensor reads at decode time hit the UVA-
          * mapped pointer (slow) instead of cudaMalloc'd HBM copies (fast).
          * The MoE expert filter in accelerator_cache_model_tensor_spans
-         * skips `mtp.0.ffn_*_exps.weight` automatically. */
-        if (e->mtp_ready && !accelerator_cache_model_tensors(e->backend, &e->mtp_model)) {
+         * skips `mtp.0.ffn_*_exps.weight` automatically.
+         *
+         * DS4_MTP_NO_RESIDENCY=1: skip wiring the MTP draft model into the GPU
+         * residency set.  On Metal the draft tensors stay no-copy mmap shared
+         * buffers (read directly, not slow -- same as the main model), just
+         * evictable.  This frees the ~3.8 GiB the draft would otherwise pin,
+         * letting the memory-tight worker (M1, ~10.67 GiB GPU budget) hold its
+         * layer-slice backbone + the draft on the default fast split instead of
+         * OOMing ("residency wired 51 views" / kIOGPUCommandBufferCallbackError
+         * OutOfMemory).  The draft forward pages the (hot, every-step) tensors
+         * back via the page cache. */
+        if (e->mtp_ready && getenv("DS4_MTP_NO_RESIDENCY") == NULL &&
+            !accelerator_cache_model_tensors(e->backend, &e->mtp_model)) {
             fprintf(stderr, "ds4: %s failed to prepare MTP startup model cache\n",
                     ds4_backend_name(e->backend));
             ds4_engine_close(e);
             *out = NULL;
             return 1;
+        }
+        if (e->mtp_ready && getenv("DS4_MTP_NO_RESIDENCY") != NULL) {
+            fprintf(stderr,
+                    "ds4: MTP draft model left non-resident (DS4_MTP_NO_RESIDENCY=1); "
+                    "draft tensors stay evictable mmap views to save GPU residency\n");
         }
         fprintf(stderr, "ds4: %s backend initialized for graph diagnostics\n",
                 ds4_backend_name(e->backend));

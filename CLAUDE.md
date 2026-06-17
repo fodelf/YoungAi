@@ -87,6 +87,22 @@ The codebase is flat C in the repo root. The pieces that need reading several fi
 
 Behavior has many `DS4_*` env switches (e.g. `DS4_METAL_PREFILL_CHUNK`, `DS4_METAL_NO_RESIDENCY`, `DS4_DIST_*`, `DS4_MTP_SPEC_DISABLE`). Treat them as diagnostic/tuning switches around the single release path, not permanent feature flags.
 
+## Active performance work: dual-host q2 full-model streaming (`project.md`)
+
+The current dominant effort is running the **81 GiB q2 full model** (`gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf`) across **two 16 GB Macs** (M4 mini coordinator + MacBook M1 worker, Thunderbolt direct, both budgeted **≤12 GiB**) via layer-sliced distributed inference + **A3 on-demand expert streaming from SSD**. `project.md` is the canonical plan (P0 measurement → P1 memory-layout → P2 algorithm → P-Code coding-workload specials); `notes/execution-log.md` is the running record. **Read both before touching this path.**
+
+- **The bottleneck is routed-expert SSD IO (~1.70 GiB/token), not KV or compute.** Three physical walls bound a single forward: W1 capacity (72.6 GiB experts vs ~24 GiB combined RAM), W2 SSD bandwidth (decode ceiling ~3–7 t/s), W3 backbone bandwidth (10–18 t/s). **80 t/s is physically impossible here** (needs ~750 GB/s aggregate + full residency); the honest target is **0.81 → ~3–6 t/s**. Best so far: **code-edit 3.54 / smoke 2.17 t/s** (wave 36). Coding-workload "effective t/s" can exceed the single-forward wall via copy-speculation and prefix reuse (§3.5 / P-Code).
+
+- **Execution discipline.** Every patch / measurement / scope decision / blocker gets appended to `notes/execution-log.md` (wave-numbered) — not just chat or memory.
+
+- **Test harness.** `tools/mtp_pipe_q2_speed.sh` drives the two-host run. Two prompt profiles: default **smoke** (short single question, general baseline) and **`PROMPT_PROFILE=code-edit`** (editing-type long-context prompt — the only profile where PC.1/PC.2 gains show); run both. Logs: `/tmp/mtp_pipe_coord.log|.out`, worker `192.168.1.2:/tmp/mtp_pipe_worker.log`. New knobs go through env and **default to the current stable baseline** so each is A/B-able.
+
+- **Live tuning levers** (env, around the single path — see `project.md` §progress for landed state): `DS4_METAL_EXPERT_IO_PROFILE` (gather fault/memcpy/pread/drain timing), `DS4_METAL_EXPERT_EVENT_DRAIN` (MTLSharedEvent fast-path host wait), `DS4_METAL_EXPERT_PREAD` (+`_NOCACHE`, single-copy direct read vs mmap+memcpy), `DS4_METAL_EXPERT_FULL_LAYER_STREAM` (+`_SORT_IDS`, prefill full-layer sequential stream), `DS4_METAL_EXPERT_PREFETCH_AHEAD` (+`_TOP`/`_DELTA`, cross-layer router-prediction prefetch), `DS4_METAL_EXPERT_STAGE` / `DS4_DIST_EXPERT_FETCH_*` (predictive remote expert staging / byte service), `DS4_DIST_COPY_SPEC` (+`_DRAFT`/`_NGRAM`/`_GROWTH`, PC.1 zero-cost copy-speculation: n-gram matcher as drafter, reusing the VERIFY/`accept_len`/KV-rollback protocol), `DS4_DIST_PREFILL_CAP`.
+
+- **Guardrails (hard).** Watchdog red line **12/12 GiB** (both hosts); `DS4_MEM_BUDGET_MB` + L1 resident gate must refuse startup over budget. **Any model-loading script must prove memory safety (RSS budget + watchdog) before it runs.** Never double-load the 81 GiB base on one host. After a local rebuild, consider whether the other host needs the synced binary too (shared `CORE_OBJS`). Never delete files on the other host without explicit confirmation — "cleanup" means killing the process, not removing files.
+
+- **Per-merge correctness gates** (on top of the speed track): `--dump-logprobs` parity vs the A3 baseline; `ds4_test --metal-kernels --server`; routing/quant/repack changes additionally run `ds4_test --logprob-vectors` + `ds4-eval q1..q4 --temp 0 --seed 1`.
+
 ## Project rules (from `AGENT.md` — follow these)
 
 - **No C++.** Pure C99, with Objective-C only where Metal requires it.

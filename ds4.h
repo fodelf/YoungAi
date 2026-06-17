@@ -99,6 +99,14 @@ typedef struct {
      * draft K future tokens without shipping the hidden back to the coordinator.
      * Set by `--mtp-role worker`; ignored unless an --mtp model is loaded. */
     bool mtp_draft_on_worker;
+    /* New topology (本机 MTP): run the MTP drafter on the COORDINATOR instead.
+     * The worker holds only the backbone layer slice and returns the final hidden
+     * state; the coordinator holds token_embd + output head + the MTP model, so it
+     * drafts locally and verifies the candidate batch back through the worker —
+     * the same local-draft / remote-verify skeleton PC.1 copy-spec already uses.
+     * Frees the worker of the ~2 GiB draft model. Set by `--mtp-role coordinator`;
+     * mutually exclusive with mtp_draft_on_worker. */
+    bool mtp_draft_on_coordinator;
 } ds4_distributed_options;
 
 typedef struct {
@@ -359,5 +367,11 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
                                    const int *tokens, uint32_t n_tokens,
                                    uint32_t layer_start, uint32_t layer_end,
                                    char *err, size_t errlen);
+
+/* Live Mach phys_footprint (bytes) and the configured DS4_MEM_BUDGET_MB budget
+ * (bytes, 0 if unset).  Exposed for backends that size caches dynamically
+ * against the headroom rather than a fixed cap. */
+uint64_t ds4_runtime_phys_footprint_bytes(void);
+uint64_t ds4_runtime_mem_budget_bytes(void);
 
 #endif

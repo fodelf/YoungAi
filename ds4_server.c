@@ -10333,7 +10333,8 @@ decode_again:
             break;
         }
 
-        int toks[65];   /* K=64 verify batch + first_token */
+        int toks[129];  /* wave 69: 2 spec-pipe cycles (2*64 verify rows + first_token);
+                         * was [65], which blocked the spec-pipe 2nd cycle on full accepts. */
         int ntok = 0;
         if (temperature <= 0.0f &&
             (ds4_engine_mtp_draft_tokens(s->engine) > 1 ||

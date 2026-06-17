@@ -50,6 +50,11 @@ int ds4_gpu_tp_host_wait(uint64_t value);
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
+/* When on!=0, the NEXT ds4_gpu_set_model_map_range wraps its views without
+ * adding them to the GPU residency set (evictable mmap, not wired).  Auto-state;
+ * set before the MTP draft map to keep it off the worker's wired budget. CPU
+ * builds ignore it. */
+void ds4_gpu_set_model_map_nonresident_hint(int on);
 int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, uint32_t count, uint64_t max_tensor_bytes);
 /* Reduced-memory model loader. Identical to ds4_gpu_set_model_map_spans but each
  * span carries a resident flag: resident spans (backbone) are wired into the GPU

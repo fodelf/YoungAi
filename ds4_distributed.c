@@ -65,10 +65,20 @@
  * worker runs the output head on every row and returns per-row argmax token ids
  * in the RESULT draft channel instead of a single logits row. */
 #define DS4_DIST_WORK_F_VERIFY 0x00000020u
+/* Wave 69: continuation chunk of a row-chunked (pipelined) VERIFY batch. The
+ * coordinator splits one verify batch into N chunks so its layer-0:k compute of
+ * chunk c+1 overlaps the worker's layer-k:out compute of chunk c (the ~50%
+ * serial coordinator-idle the layer-pipeline otherwise pays). A CONT chunk tells
+ * the worker: do NOT roll back (you are mid-batch, prior chunks' KV must stay)
+ * and do NOT reset spec_base_len (keep the batch-start position recorded by the
+ * first, non-CONT chunk, so the next batch's accept_len rolls back to the right
+ * place). KV is appended incrementally chunk-by-chunk on both hosts, so the
+ * result is byte-identical to the single-frame batch. */
+#define DS4_DIST_WORK_F_VERIFY_CONT 0x00000040u
 #define DS4_DIST_WORK_F_VALID_MASK \
     (DS4_DIST_WORK_F_INPUT_HC | DS4_DIST_WORK_F_OUTPUT_LOGITS | \
      DS4_DIST_WORK_F_RESET_SESSION | DS4_DIST_WORK_F_ACK_ONLY | \
-     DS4_DIST_WORK_F_DRAFT | DS4_DIST_WORK_F_VERIFY)
+     DS4_DIST_WORK_F_DRAFT | DS4_DIST_WORK_F_VERIFY | DS4_DIST_WORK_F_VERIFY_CONT)
 #define DS4_DIST_RESULT_ACK 0u
 #define DS4_DIST_RESULT_HIDDEN_STATE 1u
 #define DS4_DIST_RESULT_LOGITS 2u
@@ -266,6 +276,22 @@ typedef struct {
     /* mtp.md Phase 1: request MTP drafts + cross-machine batch verification from
      * the last-layer worker (set by --mtp-role worker on the coordinator). */
     bool mtp_draft;
+    /* 本机 MTP (--mtp-role coordinator): the drafter runs here, not on the worker.
+     * Round 1 sends a plain frame; the worker returns hidden state, the local
+     * output head turns it into logits, and ds4_session_mtp_draft rolls the K
+     * candidates from that same hidden — same VERIFY batch as worker drafting. */
+    bool mtp_draft_local;
+    /* Wave 68+ DS4_DIST_SPEC_PIPE state-carried hooks (default NULL/0 => standard
+     * synchronous path, NO signature change to eval_span and its 10 callers, so
+     * the off path is byte-identical).  spec_overlap_cb is invoked by
+     * dist_coordinator_eval_remote_on_fd BETWEEN the WORK send and the blocking
+     * result recv -- exactly while the worker computes -- so the coordinator can
+     * speculatively compute the NEXT cycle's local slice in that idle window.
+     * spec_precomputed_hidden, when set, makes dist_coordinator_eval_span reuse it
+     * and skip its own layer_slice (the precompute from the prev overlap window). */
+    int   (*spec_overlap_cb)(void *ctx);
+    void   *spec_overlap_ctx;
+    const float *spec_precomputed_hidden;
 } ds4_dist_coordinator_state;
 
 typedef struct {
@@ -461,6 +487,37 @@ struct ds4_dist_session {
     uint64_t mtp_window_calls;
     uint64_t mtp_window_accept_tokens;
     uint64_t mtp_window_first_hit;
+    /* Probe telemetry: total cross-machine forwards (eval_span calls) issued
+     * across all speculative calls. The whole point of carry-over drafting is to
+     * collapse the per-cycle forward count from 2 (Round-1 + verify) to 1
+     * (fused verify only), so forwards_per_call and accept_tokens/forward are the
+     * two numbers that decide whether MTP is net-positive on this hardware. */
+    uint64_t mtp_forwards;
+    /* 本机 MTP zero-extra-forward (DS4_DIST_MTP_CARRY_DRAFT): the MTP head drafts
+     * the NEXT cycle's candidates from the boundary row's hidden of THIS cycle's
+     * verify batch, so no dedicated Round-1 forward is needed to produce a draft
+     * hidden. carry_valid means carry_drafts[0..carry_draft_n-1] were drafted for
+     * positions starting at carry_pos; carry_drafts[0] is the MTP guess for the
+     * token the caller will resample as next first_token (validated by equality
+     * before the fused batch trusts the tail). Greedy-only, like every spec path. */
+    bool carry_valid;
+    uint32_t carry_pos;
+    uint32_t carry_draft_n;
+    int carry_drafts[64];
+    /* Wave 68+ DS4_DIST_SPEC_PIPE: speculative layer-pipeline overlap.  During the
+     * worker's compute of cycle N (the coordinator-idle t_remote_blocked measured
+     * at ~50% of r2), precompute cycle N+1's local-slice hidden, betting cycle N
+     * fully accepts (the dominant heavy-echo case, ~73%).  On full-accept the
+     * precompute is reused so the serial coord(t_local)+worker(t_remote) collapses
+     * toward max(); on partial accept the speculative KV advance is rolled back
+     * (ds4_session_layer_slice_rollback) and the hidden discarded.  Off => legacy
+     * synchronous eval_span (byte-identical, validated via --dump-logprobs). */
+    bool     spec_pipe_valid;       /* spec_pipe_hidden holds a usable precompute */
+    uint32_t spec_pipe_kb;          /* batch token count the precompute was built for */
+    uint32_t spec_pipe_base;        /* layer-slice KV len the precompute assumes */
+    int      spec_pipe_toks[64];    /* the predicted batch tokens precomputed */
+    float   *spec_pipe_hidden;      /* n_tokens*hc precomputed local hidden (owned) */
+    uint32_t spec_pipe_hidden_cap;  /* bytes allocated for spec_pipe_hidden */
 };
 
 static uint32_t dist_env_u32_clamped(const char *name, uint32_t defv, uint32_t minv, uint32_t maxv);
@@ -476,9 +533,14 @@ static void dist_mtp_print_summary(ds4_dist_session *d, const char *tag) {
         d->mtp_accept_tokens - d->mtp_calls : 0;
     const double draft_accept_pct = d->mtp_draft_tokens ?
         100.0 * (double)draft_accepts / (double)d->mtp_draft_tokens : 0.0;
+    const double forwards_per_call = d->mtp_calls ?
+        (double)d->mtp_forwards / (double)d->mtp_calls : 0.0;
+    const double tok_per_forward = d->mtp_forwards ?
+        (double)d->mtp_accept_tokens / (double)d->mtp_forwards : 0.0;
     fprintf(stderr,
             "ds4: dist-mtp %s: calls=%llu round1=%llu verify=%llu first_hit=%.2f%% "
-            "accepted=%llu drafts=%llu draft_accept=%.2f%% tok/call=%.2f disabled=%llu\n",
+            "accepted=%llu drafts=%llu draft_accept=%.2f%% tok/call=%.2f "
+            "forwards=%llu fwd/call=%.2f tok/fwd=%.2f disabled=%llu\n",
             tag ? tag : "summary",
             (unsigned long long)d->mtp_calls,
             (unsigned long long)d->mtp_round1,
@@ -488,6 +550,9 @@ static void dist_mtp_print_summary(ds4_dist_session *d, const char *tag) {
             (unsigned long long)d->mtp_draft_tokens,
             draft_accept_pct,
             accept_per_call,
+            (unsigned long long)d->mtp_forwards,
+            forwards_per_call,
+            tok_per_forward,
             (unsigned long long)d->mtp_disabled_cycles);
 }
 
@@ -561,6 +626,68 @@ static uint32_t dist_copy_spec_min_copy(void) {
     return dist_env_u32_clamped("DS4_DIST_COPY_SPEC_MIN", 2, 1, 63);
 }
 
+/* wave 68: on a PARTIAL copy accept (1 < m < n_copy) the copy source diverged at
+ * m.  The legacy ladder only grows (m==n_copy) or resets (m<=1), so a partial
+ * accept leaves copy_spec_len at its stale (possibly maxed) value -- the next
+ * short match then re-overbets at that length.  Measured on code-edit-heavy:
+ * repeated `sent=49 accepted=5` rounds that pay ~49 tokens of two-machine
+ * forward compute to keep 5 (the dominant 4.84->8.5 inefficiency, since each
+ * over-drafted row costs the full backbone+attention per-token wall).  When
+ * enabled, re-anchor the next draft length to the observed accepted run so the
+ * bet tracks the real divergence pattern.  BIT-EXACT: only the draft *length*
+ * changes; the verify batch still gates every token by exact argmax.  Default
+ * OFF so the legacy ladder (4.84 baseline) stays byte-reproducible. */
+static int dist_copy_spec_reanchor(void) {
+    return dist_env_enabled("DS4_DIST_COPY_SPEC_REANCHOR");
+}
+
+/* wave 69: the wave-68 unconditional re-anchor was net-negative because it fired
+ * on EVERY partial accept, including near-full rounds (measured code-edit-heavy:
+ * acc=39/48, acc=51/63 ~81% accepted) where the copy source is essentially still
+ * continuing -- shrinking those forces needless ramp-up rounds (each paying the
+ * fixed 2-machine serial hop) that ate the savings.  The real waste is
+ * concentrated in SEVERE divergences (acc=5,6 of 49 ~12%): re-anchor pays off
+ * only there.  Gate it: re-anchor iff m*ratio < n_copy (default ratio 3 => only
+ * when <1/3 of the bet was accepted).  ratio<=1 reproduces the wave-68
+ * unconditional behaviour for A/B. */
+static uint32_t dist_copy_spec_reanchor_ratio(void) {
+    return dist_env_u32_clamped("DS4_DIST_COPY_SPEC_REANCHOR_RATIO", 3, 1, 64);
+}
+
+/* Wave 68+ speculative layer-pipeline overlap gate (see ds4_dist_session struct
+ * spec_pipe_* fields).  Default OFF: legacy synchronous eval_span path. */
+static int dist_spec_pipe_enabled(void) {
+    return dist_env_enabled("DS4_DIST_SPEC_PIPE");
+}
+
+/* Wave 68+ spec-pipe overlap callback context.  The callback is invoked by
+ * dist_coordinator_eval_remote_on_fd between the WORK send and the blocking recv
+ * (i.e. while the worker computes cycle N), so this layer_slice of the PREDICTED
+ * cycle N+1 batch overlaps the worker's compute.  It advances the coord local-slice
+ * KV by `kb` at `pos0` (= p + cycle-N kb); the caller keeps that advance only if
+ * cycle N fully accepts AND the prediction holds, else rolls it back. */
+typedef struct {
+    ds4_session *session;
+    uint32_t     local_start, local_end;
+    int          toks[64];   /* predicted next-cycle batch (toks[0]=predicted next first) */
+    uint32_t     kb;         /* predicted batch token count (>=2 to be worth it) */
+    uint32_t     pos0;       /* position the predicted batch starts at */
+    float       *hidden;     /* out: precomputed local hidden (caller-owned, kb*hc floats) */
+    int          ok;         /* set 1 iff the speculative layer_slice succeeded */
+} dist_spec_pipe_ctx;
+
+static int dist_spec_pipe_overlap_cb(void *vctx) {
+    dist_spec_pipe_ctx *c = (dist_spec_pipe_ctx *)vctx;
+    c->ok = 0;
+    if (!c || c->kb < 2u || !c->hidden) return 0;
+    char e[160];
+    int rc = ds4_session_eval_layer_slice(c->session, c->toks, c->kb, c->pos0,
+                                          c->local_start, c->local_end,
+                                          NULL, c->hidden, false, NULL, e, sizeof(e));
+    c->ok = (rc == 0);
+    return rc;   /* swallowed by caller: a failed precompute just recomputes next cycle */
+}
+
 /* Longest-suffix prompt lookup (SuffixDecoding-style). Among earlier positions
  * sharing a common suffix with the end of seq[0..len-1], pick the LONGEST
  * anchor (most recent wins ties) and copy up to cap continuation tokens into
@@ -569,8 +696,9 @@ static uint32_t dist_copy_spec_min_copy(void) {
  * more precise on code/tool text than a fixed short n-gram. */
 static uint32_t dist_copy_spec_match(const int *seq, uint32_t len,
                                      uint32_t min_g, uint32_t cap,
-                                     int *out, uint32_t *out_n) {
+                                     int *out, uint32_t *out_n, uint32_t *out_src) {
     if (out_n) *out_n = 0;
+    if (out_src) *out_src = 0;
     if (!seq || !out || !out_n || min_g == 0 || cap == 0 || len < min_g + 1u) return 0;
     const uint32_t max_g = 32;            /* anchor extension cap */
     const int last = seq[len - 1u];
@@ -589,6 +717,11 @@ static uint32_t dist_copy_spec_match(const int *seq, uint32_t len,
     uint32_t n = 0;
     while (n < cap && best_src + n < len) { out[n] = seq[best_src + n]; n++; }
     *out_n = n;
+    /* out_src: where in seq[] the copied continuation came from (seq[best_src..]).
+     * The spec-pipeline predicts cycle N+1's batch as seq[best_src + n ..] (the
+     * copy source continuing past this batch) -- computable before the worker's
+     * verify result is back. */
+    if (out_src) *out_src = best_src;
     return n > 0 ? best_a : 0;
 }
 
@@ -2914,6 +3047,13 @@ typedef struct {
     uint32_t draft_n;
     uint32_t drafts[64];
     float   *verify_logits;   /* n_tokens * vocab floats when VERIFY */
+    /* 本机 MTP carry-over draft (DS4_DIST_MTP_CARRY_DRAFT): optional sink for the
+     * worker's returned per-row hidden states on a VERIFY batch. Only fillable
+     * when the worker holds no output head (returns RESULT_HIDDEN_STATE, the
+     * local-MTP topology); NULL otherwise. Sized n_tokens * hc_values floats.
+     * The coordinator re-runs its output head on the boundary row from here to
+     * seed cur_hc for the next cycle's MTP draft, eliding the Round-1 forward. */
+    float   *hidden_rows;
 } ds4_dist_spec_io;
 
 static int dist_coordinator_eval_remote_on_fd(
@@ -2955,6 +3095,15 @@ static int dist_coordinator_eval_remote_on_fd(
                                                      spec ? spec->extra_flags : 0,
                                                      err,
                                                      errlen);
+    /* Wave 68+ spec-pipe: the WORK is now in flight; run the speculative
+     * next-cycle local compute here, overlapping the worker's compute of THIS
+     * batch (the measured ~50% coordinator-idle t_remote_blocked window).
+     * Default NULL => no-op (byte-identical).  The cb's own errors are swallowed:
+     * a failed precompute just means the next cycle recomputes (no correctness
+     * impact -- the verify batch below still gates every token). */
+    if (rc == 0 && state->spec_overlap_cb) {
+        (void)state->spec_overlap_cb(state->spec_overlap_ctx);
+    }
     uint32_t kind = 0, payload_bytes = 0;
     uint64_t result_hash = 0;
     void *payload = NULL;
@@ -2981,15 +3130,44 @@ static int dist_coordinator_eval_remote_on_fd(
     const uint32_t logits_bytes = (uint32_t)((uint64_t)ds4_engine_vocab_size(state->engine) * sizeof(float));
     if (verify) {
         const uint32_t want = (uint32_t)((uint64_t)n_tokens * logits_bytes);
-        if (kind != DS4_DIST_RESULT_LOGITS || payload_bytes != want || !spec->verify_logits) {
+        if (!spec->verify_logits) {
             free(payload);
-            if (errlen) snprintf(err, errlen, "distributed verify returned %u bytes, want %u",
-                                 payload_bytes, want);
+            if (errlen) snprintf(err, errlen, "distributed verify has no logit sink");
             return 1;
         }
-        memcpy(spec->verify_logits, payload, want);
+        if (kind == DS4_DIST_RESULT_LOGITS && payload_bytes == want) {
+            memcpy(spec->verify_logits, payload, want);
+            free(payload);
+            return 0;
+        }
+        /* 本机 MTP: the worker holds no output head and returns one hidden-state
+         * row per verify position; run the local output head on each row to fill
+         * the N verify-logit rows the coordinator argmaxes for the accept prefix. */
+        const uint64_t hc_values = ds4_engine_hidden_f32_values(state->engine);
+        const uint32_t hidden_want =
+            (uint32_t)((uint64_t)n_tokens * hc_values * sizeof(float));
+        if (kind == DS4_DIST_RESULT_HIDDEN_STATE && payload_bytes == hidden_want) {
+            const float *rows = (const float *)payload;
+            const uint32_t vocab = (uint32_t)ds4_engine_vocab_size(state->engine);
+            for (uint32_t i = 0; i < n_tokens; i++) {
+                int hrc = ds4_session_eval_output_head_from_hc(
+                    session, rows + (uint64_t)i * hc_values, 1,
+                    spec->verify_logits + (uint64_t)i * vocab, err, errlen);
+                if (hrc != 0) { free(payload); return hrc; }
+            }
+            /* carry-over draft: keep the raw per-row hidden so the caller can
+             * re-seed cur_hc from the boundary row and draft the next cycle. */
+            if (spec->hidden_rows) {
+                memcpy(spec->hidden_rows, rows, hidden_want);
+            }
+            free(payload);
+            return 0;
+        }
         free(payload);
-        return 0;
+        if (errlen) snprintf(err, errlen,
+                             "distributed verify returned %u bytes, want %u logits or %u hidden",
+                             payload_bytes, want, hidden_want);
+        return 1;
     }
     if (kind == DS4_DIST_RESULT_LOGITS && payload_bytes == logits_bytes) {
         memcpy(logits, payload, logits_bytes);
@@ -3077,7 +3255,23 @@ static int dist_coordinator_eval_span(
         }
     }
 
-    int rc = ds4_session_eval_layer_slice(session,
+    /* DS4_DIST_PIPE_PROFILE: per-forward split of coord-local compute vs the
+     * time the coordinator is BLOCKED on the worker (send + worker compute +
+     * return). In layer-pipeline decode the two hosts never overlap for a single
+     * forward, so t_remote is exactly the coordinator-idle the user asked about
+     * ("双机分层是否存在等待"). One stderr line per cross-machine forward. */
+    const bool pipe_profile = dist_env_enabled("DS4_DIST_PIPE_PROFILE");
+    const double t0 = pipe_profile ? dist_now_sec() : 0.0;
+    int rc;
+    if (state->spec_precomputed_hidden && !local_logits && plan->count != 0) {
+        /* Wave 68+ spec-pipe: reuse the hidden computed during the PREVIOUS
+         * cycle's overlap window (its layer_slice already advanced this slice's
+         * KV by n_tokens), so skip the compute here -- this is the critical-path
+         * saving that collapses coord(t_local)+worker(t_remote) toward max(). */
+        memcpy(hidden, state->spec_precomputed_hidden, hidden_bytes);
+        rc = 0;
+    } else {
+        rc = ds4_session_eval_layer_slice(session,
                                           tokens,
                                           n_tokens,
                                           pos0,
@@ -3089,6 +3283,8 @@ static int dist_coordinator_eval_span(
                                           local_logits ? logits : NULL,
                                           err,
                                           errlen);
+    }
+    const double t_local = pipe_profile ? dist_now_sec() : 0.0;
     if (rc == 0 && plan->count != 0) {
         rc = dist_coordinator_eval_remote_on_fd(state,
                                                 session,
@@ -3108,6 +3304,171 @@ static int dist_coordinator_eval_span(
                                                 spec,
                                                 err,
                                                 errlen);
+    }
+    if (pipe_profile) {
+        const double t_remote = dist_now_sec();
+        const double local_ms = (t_local - t0) * 1000.0;
+        const double remote_ms = (t_remote - t_local) * 1000.0;
+        const double total_ms = local_ms + remote_ms;
+        const bool verify = spec && (spec->extra_flags & DS4_DIST_WORK_F_VERIFY) != 0;
+        const bool draft = spec && (spec->extra_flags & DS4_DIST_WORK_F_DRAFT) != 0;
+        fprintf(stderr,
+                "ds4: dist-pipe: pos=%u n_tokens=%u%s%s t_local=%.1fms "
+                "t_remote_blocked=%.1fms remote_frac=%.0f%% rc=%d\n",
+                pos0, n_tokens, verify ? " verify" : "", draft ? " draft" : "",
+                local_ms, remote_ms,
+                total_ms > 0.0 ? 100.0 * remote_ms / total_ms : 0.0, rc);
+    }
+    free(hidden);
+    return rc;
+}
+
+/* Wave 69: number of row-chunks to split a remote VERIFY batch into for two-host
+ * pipelining. 1 = off (single frame, byte-identical legacy path). >=2 overlaps
+ * the coordinator's layer-0:k compute of chunk c+1 with the worker's layer-k:out
+ * compute of chunk c, reclaiming the ~50% serial coordinator-idle measured on the
+ * layer-pipeline (wave 68: r2 = t_local 4s + t_remote_blocked 4s). */
+static uint32_t dist_pipe_chunk(void) {
+    return dist_env_u32_clamped("DS4_DIST_PIPE_CHUNK", 1, 1, 16);
+}
+
+/* Receive one pipelined VERIFY chunk's per-row logits into dst (n_rows*vocab). */
+static int dist_pipe_recv_chunk(int fd, ds4_dist_coordinator_state *state,
+                                uint64_t req, uint64_t expect_hash,
+                                float *dst, uint32_t n_rows, uint32_t vocab,
+                                char *err, size_t errlen) {
+    uint32_t kind = 0, pbytes = 0;
+    uint64_t rhash = 0;
+    void *payload = NULL;
+    int rc = dist_recv_result_alloc(fd, state, req, &kind, &rhash,
+                                    &payload, &pbytes, NULL, NULL, err, errlen);
+    if (rc != 0) return rc;
+    if (rhash != expect_hash) {
+        free(payload);
+        if (errlen) snprintf(err, errlen, "pipelined chunk result hash mismatch");
+        return 1;
+    }
+    const uint32_t want = (uint32_t)((uint64_t)n_rows * vocab * sizeof(float));
+    if (kind == DS4_DIST_RESULT_LOGITS && pbytes == want) {
+        memcpy(dst, payload, want);
+        free(payload);
+        return 0;
+    }
+    free(payload);
+    if (errlen) snprintf(err, errlen,
+                         "pipelined chunk returned %u bytes, want %u logits", pbytes, want);
+    return 1;
+}
+
+/* Wave 69: row-chunked, two-host-pipelined VERIFY batch (copy-spec/NO_MTP path:
+ * worker holds the output head and returns per-row LOGITS).
+ *
+ * Splits tokens[0..n_tokens) into n_chunks row ranges. For each chunk the
+ * coordinator runs its layer slice (appending KV at the chunk's pos), sends the
+ * chunk's hidden to the worker, and -- crucially -- computes the NEXT chunk's
+ * layer slice BEFORE blocking on this chunk's result, so coord(chunk c+1) overlaps
+ * worker(chunk c). recv-then-send ordering keeps a synchronous socket from
+ * serializing: the send happens right after a recv, when the worker is idle.
+ *
+ * Bit-exact: each chunk's eval_layer_slice / verify_batch_argmax appends KV at its
+ * own pos (== prefill chunking), prefix hashes chain, and the worker's deferred
+ * accept/rollback uses the first chunk's pos as the batch base (VERIFY_CONT). The
+ * reassembled verify_logits are identical to the single-frame batch. Caller reads
+ * the accepted prefix from spec->verify_logits exactly as before. */
+static int dist_coordinator_eval_span_pipelined(
+        ds4_dist_coordinator_state *state, ds4_session *session,
+        const ds4_dist_route_plan *plan, const int *tokens, uint32_t n_tokens,
+        uint32_t pos0, uint64_t session_id, uint64_t *request_id,
+        ds4_dist_spec_io *spec, uint32_t n_chunks, char *err, size_t errlen) {
+    if (plan->count == 0 || !spec || !spec->verify_logits) {
+        if (errlen) snprintf(err, errlen, "pipelined span requires a remote verify route");
+        return 1;
+    }
+    const int remote_fd = plan->entry[0].fd;
+    if (remote_fd < 0) {
+        if (errlen) snprintf(err, errlen, "pipelined span has no live first hop");
+        return 1;
+    }
+    const uint64_t hc_values = ds4_engine_hidden_f32_values(state->engine);
+    const uint32_t vocab = (uint32_t)ds4_engine_vocab_size(state->engine);
+    if (n_chunks < 2u) n_chunks = 2u;
+    if (n_chunks > n_tokens) n_chunks = n_tokens;
+
+    const uint32_t chunk_base = n_tokens / n_chunks;
+    const uint32_t chunk_rem  = n_tokens % n_chunks;
+    const uint32_t max_chunk  = chunk_base + (chunk_rem ? 1u : 0u);
+    float *hidden = malloc((size_t)max_chunk * hc_values * sizeof(float));
+    if (!hidden) {
+        if (errlen) snprintf(err, errlen, "out of memory in pipelined span");
+        return 1;
+    }
+
+    uint64_t prefix_hash = DS4_DIST_TOKEN_HASH_INIT;
+    if (dist_session_token_hash_prefix(session, pos0, &prefix_hash, err, errlen) != 0) {
+        free(hidden);
+        return 1;
+    }
+
+    const double t0 = dist_now_sec();
+    int rc = 0;
+    bool inflight = false;
+    uint64_t if_req = 0, if_rhash = 0;
+    uint32_t if_off = 0, if_n = 0;
+    uint32_t off = 0;
+
+    for (uint32_t k = 0; k < n_chunks; k++) {
+        const uint32_t n_k = chunk_base + (k < chunk_rem ? 1u : 0u);
+        /* (1) coordinator layer slice for this chunk -> hidden. This is the work
+         * that overlaps the worker's compute of the PREVIOUS chunk (still in flight). */
+        rc = ds4_session_eval_layer_slice(session, tokens + off, n_k, pos0 + off,
+                                          state->local_start, state->local_end,
+                                          NULL, hidden, false, NULL, err, errlen);
+        if (rc != 0) break;
+        /* (2) drain the previous chunk's result (it overlapped step 1). */
+        if (inflight) {
+            rc = dist_pipe_recv_chunk(remote_fd, state, if_req, if_rhash,
+                                      spec->verify_logits + (uint64_t)if_off * vocab,
+                                      if_n, vocab, err, errlen);
+            inflight = false;
+            if (rc != 0) break;
+        }
+        /* (3) send this chunk now -- the worker just went idle, so the synchronous
+         * send returns without blocking. */
+        const uint64_t result_hash = dist_token_hash_update_span(prefix_hash, tokens + off, n_k);
+        const uint32_t flags = DS4_DIST_WORK_F_VERIFY |
+                               (k ? DS4_DIST_WORK_F_VERIFY_CONT : 0u);
+        const uint32_t accept_len = (k == 0) ? spec->accept_len : 0u;
+        const uint64_t req = (*request_id)++;
+        rc = dist_coordinator_send_remote_work_on_fd(
+                state, plan, remote_fd, tokens + off, n_k, pos0 + off,
+                session_id, req, prefix_hash, result_hash,
+                /*reset=*/false, /*ack_only=*/false,
+                hidden, (uint32_t)((uint64_t)n_k * hc_values * sizeof(float)),
+                /*draft_cap=*/0, accept_len, flags, err, errlen);
+        if (rc != 0) break;
+        inflight = true;
+        if_req = req; if_rhash = result_hash; if_off = off; if_n = n_k;
+        prefix_hash = result_hash;
+        off += n_k;
+    }
+    if (rc == 0 && inflight) {
+        rc = dist_pipe_recv_chunk(remote_fd, state, if_req, if_rhash,
+                                  spec->verify_logits + (uint64_t)if_off * vocab,
+                                  if_n, vocab, err, errlen);
+        inflight = false;
+    } else if (rc != 0 && inflight) {
+        /* Best-effort drain so a half-finished pipeline does not desync the socket
+         * before the caller rebuilds the route. */
+        uint32_t k2 = 0, b2 = 0; uint64_t h2 = 0; void *p2 = NULL;
+        char tmp[64];
+        (void)dist_recv_result_alloc(remote_fd, state, if_req, &k2, &h2, &p2, &b2,
+                                     NULL, NULL, tmp, sizeof(tmp));
+        free(p2);
+    }
+    if (dist_env_enabled("DS4_DIST_PIPE_PROFILE")) {
+        fprintf(stderr,
+                "ds4: dist-pipe-chunked: pos=%u n_tokens=%u chunks=%u wall=%.1fms rc=%d\n",
+                pos0, n_tokens, n_chunks, (dist_now_sec() - t0) * 1000.0, rc);
     }
     free(hidden);
     return rc;
@@ -5773,6 +6134,7 @@ int ds4_dist_session_create(
     d->state.debug = opt->debug;
     d->state.use_control_for_work = true;
     d->state.mtp_draft = opt->mtp_draft_on_worker;
+    d->state.mtp_draft_local = opt->mtp_draft_on_coordinator;
     d->state.prefill_chunk = opt->prefill_chunk;
     d->state.prefill_window = opt->prefill_window;
     d->state.activation_bits = dist_activation_bits_or_default(opt->activation_bits);
@@ -5890,6 +6252,11 @@ int ds4_dist_session_sync(
         }
         const uint32_t pos0 = (uint32_t)checkpoint->len;
         const uint32_t suffix = (uint32_t)prompt->len - pos0;
+        /* Incremental prefill: pos0 reused from the live checkpoint, only the
+         * `suffix` tokens are (re)processed (confirmed correct by the wave-49
+         * replay -- turn N prefills only its appended suffix, not the full
+         * context).  The per-turn TTFT is then the suffix's cost at the current
+         * context depth, which stays W2/attention-bound per token. */
         if (dist_coordinator_can_pipeline_prefill(&d->state, &d->plan, owner, suffix, chunk_cap)) {
             int prefill_rc = dist_coordinator_prefill_prompt_pipelined(&d->state,
                                                                        owner,
@@ -5905,6 +6272,18 @@ int ds4_dist_session_sync(
                                                                        err,
                                                                        errlen);
             if (prefill_rc != 0) {
+                /* PC.4 diag: the pipelined incremental prefill of just the
+                 * suffix failed, so we fall back to re-prefilling the FULL
+                 * prompt (pos 0..len) -- this silently defeats incremental
+                 * prefill (observed: turn-3 replay re-ran the full 368-token
+                 * context).  Log the failure reason + the fallback cost so the
+                 * root cause is visible instead of hiding behind a slow turn.
+                 * err[] is reused by the rebuild below, so capture it here. */
+                fprintf(stderr,
+                        "ds4: [PC.4] dist incremental prefill FAILED (rc=%d pos0=%u suffix=%u): %s "
+                        "-- falling back to full %d-token rebuild\n",
+                        prefill_rc, pos0, suffix, err[0] ? err : "(no detail)",
+                        (int)prompt->len);
                 if (dist_coordinator_rebuild_from_transcript(&d->state,
                                                              owner,
                                                              &d->plan,
@@ -5967,6 +6346,23 @@ int ds4_dist_session_sync(
         return 0;
     }
 
+    /* PC.4 diag: we did NOT take the prefix-reuse branch above, so this is a
+     * full cold prefill of the whole prompt (no incremental skip).  In a
+     * multi-turn session that should be rare (only turn 1); if it fires on a
+     * later turn the dist checkpoint disagreed with the owner's prefix, which
+     * silently re-prefills the full context.  Log why the reuse check failed. */
+    /* Only the cold first turn legitimately has no checkpoint; if a checkpoint
+     * exists but was not a usable prefix we silently re-prefill the full
+     * context (defeats PC.4 incremental prefill), so warn with the reason. */
+    if (checkpoint != NULL) {
+        const int ck_prefix = (checkpoint->len >= 0 && checkpoint->len <= prompt->len)
+                                  ? (ds4_tokens_starts_with(prompt, checkpoint) ? 1 : 0)
+                                  : -1;
+        fprintf(stderr,
+                "ds4: [PC.4] dist FULL prefill, no prefix reuse despite checkpoint "
+                "(ck_len=%d prompt_len=%d starts_with=%d) -- re-prefilling all %d tokens\n",
+                (int)checkpoint->len, (int)prompt->len, ck_prefix, (int)prompt->len);
+    }
     int prefill_rc = dist_coordinator_prefill_prompt(&d->state,
                                                      owner,
                                                      &d->plan,
@@ -6052,6 +6448,43 @@ int ds4_dist_session_eval(
     return rc;
 }
 
+/* 本机 MTP zero-extra-forward drafting (DS4_DIST_MTP_CARRY_DRAFT). The legacy
+ * mtp_local path pays a dedicated Round-1 forward whose only product is the
+ * hidden the MTP head drafts from; carry-over reuses the previous verify batch's
+ * boundary-row hidden instead, so the steady state is one fused forward/cycle.
+ * Off by default — the 2-round path stays the A/B baseline. Greedy-only. */
+static bool dist_carry_draft_enabled(void) {
+    return dist_env_enabled("DS4_DIST_MTP_CARRY_DRAFT");
+}
+
+/* Draft the next cycle's MTP candidates from the session's CURRENT cur_hc (which
+ * the caller must have seeded with the boundary-row hidden of the token at
+ * `verified_token`@`pos`). On success carry_drafts[0] is the MTP guess for pos+1
+ * (the token the caller will resample as the next first_token), validated by
+ * equality before the next fused batch trusts the tail. Clears carry on failure. */
+static void dist_mtp_carry_redraft(ds4_dist_session *d, ds4_session *owner,
+                                   int verified_token, uint32_t pos, int K,
+                                   int eos_token) {
+    d->carry_valid = false;
+    d->carry_draft_n = 0;
+    if (verified_token == eos_token) return;
+    int want_k = K;
+    if (want_k > 64) want_k = 64;
+    if (want_k < 2) return;   /* a single draft leaves no tail to verify */
+    int mdrafts[64];
+    int mn = 0;
+    char e2[256];
+    if (ds4_session_mtp_draft(owner, verified_token, pos, want_k,
+                              mdrafts, &mn, e2, sizeof(e2)) == 0 && mn >= 2) {
+        uint32_t cap = (uint32_t)mn;
+        if (cap > 64u) cap = 64u;
+        for (uint32_t j = 0; j < cap; j++) d->carry_drafts[j] = mdrafts[j];
+        d->carry_draft_n = cap;
+        d->carry_pos = pos + 1u;   /* carry_drafts[0] is the guess for pos+1 */
+        d->carry_valid = true;
+    }
+}
+
 /* mtp.md Phase 1 (Scheme A) cross-machine speculative decode. Returns the number
  * of tokens committed this call (>=1) into accepted[], or -1 on hard failure.
  *
@@ -6086,10 +6519,15 @@ int ds4_dist_session_eval_speculative(
      * matcher over the transcript); only a remote route for the VERIFY batch.
      * The MTP adaptive backoff does not apply (a copy miss skips Round 2). */
     const bool copy_spec = dist_copy_spec_enabled();
+    /* 本机 MTP: the drafter runs on the coordinator (worker returns hidden). Like
+     * copy-spec it sends a plain Round-1 frame and synthesizes the K drafts
+     * locally — but from the MTP head over the worker's hidden, not the n-gram
+     * matcher. Shares the same VERIFY batch + accept/rollback as the worker path. */
+    const bool mtp_local = d->state.mtp_draft_local;
     /* No drafter configured or no remote worker: plain single-token decode. */
     const bool spec_ok = copy_spec
         ? (d->plan.count != 0)
-        : (d->state.mtp_draft && d->plan.count != 0 &&
+        : ((d->state.mtp_draft || mtp_local) && d->plan.count != 0 &&
            (dist_env_enabled("DS4_DIST_MTP_FORCE") || d->mtp_calls > d->mtp_disable_until_call));
     if (!spec_ok) {
         if (!copy_spec && d->state.mtp_draft && d->plan.count != 0) {
@@ -6125,6 +6563,172 @@ int ds4_dist_session_eval_speculative(
     ds4_tokens_copy(&transcript, checkpoint);
     ds4_tokens_push(&transcript, first_token);
 
+    /* ---- 本机 MTP zero-extra-forward carry-over (DS4_DIST_MTP_CARRY_DRAFT). ---
+     * Self-contained: always returns. Steady state = ONE fused verify forward per
+     * cycle, with the next cycle's drafts carried from this batch's boundary-row
+     * hidden (no dedicated Round-1). A carry miss / first call degrades to a single
+     * bootstrap forward (== plain decode cost, never the 2-round penalty). Greedy
+     * output is identical to the legacy path: acceptance stays exact per-row
+     * argmax; the carried draft only seeds candidates, the target argmax gates. */
+    /* copy-spec takes precedence: on code-edit it nails the repeated text with
+     * long zero-cost copies (the 4.14 champion), far beyond what the MTP head
+     * drafts. carry-MTP must not preempt it — it only owns the no-copy domain
+     * (smoke, COPY_SPEC=0). The legacy 2-round mtp_local path below already runs
+     * only after the copy_spec block returns, so this keeps the same invariant. */
+    if (mtp_local && dist_carry_draft_enabled() && !copy_spec) {
+        const uint64_t hc_values = ds4_engine_hidden_f32_values(d->state.engine);
+        const uint32_t accept_carried = d->spec_accept_pending ? d->spec_accept_len : 0u;
+
+        bool steady = d->carry_valid && d->carry_pos == p && d->carry_draft_n >= 2u &&
+                      d->carry_drafts[0] == first_token && first_token != eos_token &&
+                      accepted_cap >= 2;
+
+        uint32_t tail = 0;
+        int toks[64];
+        toks[0] = first_token;
+        if (steady) {
+            tail = d->carry_draft_n - 1u;                 /* carried tail = drafts[1..] */
+            if (tail > (uint32_t)(K - 1)) tail = (uint32_t)(K - 1);
+            if ((uint32_t)accepted_cap - 1u < tail) tail = (uint32_t)accepted_cap - 1u;
+            if (d->state.ctx_size != 0 && p + 1u + tail > d->state.ctx_size) {
+                tail = (p + 1u < d->state.ctx_size) ? d->state.ctx_size - (p + 1u) : 0u;
+            }
+            for (uint32_t j = 0; j < tail; j++) {
+                toks[1u + j] = d->carry_drafts[1u + j];
+                if (toks[1u + j] == eos_token) { tail = j + 1u; break; }
+            }
+            if (tail == 0u) steady = false;
+        }
+
+        if (steady) {
+            const uint32_t kb = 1u + tail;
+            float *vlogits = malloc((size_t)kb * (size_t)vocab * sizeof(float));
+            float *hbuf = malloc((size_t)kb * (size_t)hc_values * sizeof(float));
+            if (!vlogits || !hbuf) {
+                free(vlogits);
+                free(hbuf);
+            } else {
+                ds4_dist_spec_io io;
+                memset(&io, 0, sizeof(io));
+                io.extra_flags = DS4_DIST_WORK_F_VERIFY;
+                io.verify_logits = vlogits;
+                io.hidden_rows = hbuf;     /* carry sink: worker returns hidden rows */
+                io.accept_len = accept_carried;
+                const double t0 = dist_now_sec();
+                const int vrc = dist_coordinator_eval_span(&d->state, owner, &d->plan,
+                                                           toks, kb, p,
+                                                           d->session_id, d->request_id++,
+                                                           false, logits, &io, err, errlen);
+                const double batch_ms = (dist_now_sec() - t0) * 1000.0;
+                d->mtp_forwards++;        /* carry-over: 1 forward/cycle */
+                d->spec_accept_pending = false;
+                d->spec_accept_len = 0;
+                if (vrc != 0) {
+                    free(vlogits);
+                    free(hbuf);
+                    d->carry_valid = false;
+                    if (dist_coordinator_rebuild_from_transcript(&d->state, owner, &d->plan,
+                            &transcript, d->session_id, &d->request_id, logits,
+                            &d->plan_generation, vrc != DS4_DIST_RECV_REMOTE_ERROR,
+                            err, errlen) != 0) {
+                        d->plan_ready = false; d->plan_generation = 0;
+                        ds4_tokens_free(&transcript);
+                        return -1;
+                    }
+                    d->plan_ready = true;
+                    accepted[0] = first_token;
+                    dist_mtp_record_enabled(d, 1, 0, false, false);
+                    ds4_tokens_free(&transcript);
+                    return 1;
+                }
+                /* Accept by exact per-row argmax: row j predicts toks[j+1]. */
+                int n_acc = 0;
+                accepted[n_acc++] = first_token;
+                uint32_t m = 0;
+                for (uint32_t j = 0; j < tail && n_acc < accepted_cap; j++) {
+                    const int pred = dist_logits_argmax(
+                            vlogits + (size_t)j * (size_t)vocab, vocab);
+                    if (pred != toks[1u + j]) break;
+                    accepted[n_acc++] = toks[1u + j];
+                    m++;
+                    if (toks[1u + j] == eos_token) break;
+                }
+                /* Boundary row m predicts the next first_token. */
+                memcpy(logits, vlogits + (size_t)m * (size_t)vocab,
+                       (size_t)vocab * sizeof(float));
+                /* Re-seed cur_hc from boundary row m (re-runs the local output head
+                 * on the same bytes → identical logits) and draft the next cycle
+                 * with zero extra forward: verified_token = toks[m]@(p+m). */
+                if (ds4_session_eval_output_head_from_hc(
+                        owner, hbuf + (size_t)m * (size_t)hc_values, 1,
+                        logits, err, errlen) == 0) {
+                    dist_mtp_carry_redraft(d, owner, toks[m], p + m, K, eos_token);
+                } else {
+                    d->carry_valid = false;
+                }
+                free(vlogits);
+                free(hbuf);
+                if (dist_env_enabled("DS4_DIST_MTP_LOG")) {
+                    fprintf(stderr,
+                            "ds4: mtp-carry verify: kc=%u accepted=%u forwards=1 "
+                            "next_carry=%u r2_ms=%.0f\n",
+                            kb, (uint32_t)n_acc,
+                            d->carry_valid ? d->carry_draft_n : 0u, batch_ms);
+                }
+                (void)ds4_session_layer_slice_rollback(owner, p + 1u + m, err, errlen);
+                d->spec_accept_pending = true;
+                d->spec_accept_len = 1u + m;
+                dist_mtp_record_enabled(d, (uint32_t)n_acc, tail, true, true);
+                ds4_tokens_free(&transcript);
+                return n_acc;
+            }
+        }
+
+        /* Bootstrap / carry-miss: a single plain forward, then draft the next
+         * cycle from its hidden (cur_hc set by the local output head over the
+         * worker's returned hidden). One forward, one token — never worse than
+         * plain decode. */
+        ds4_dist_spec_io bio;
+        memset(&bio, 0, sizeof(bio));
+        bio.accept_len = accept_carried;
+        const double bt0 = dist_now_sec();
+        const int brc = dist_coordinator_eval_span(&d->state, owner, &d->plan,
+                                                   &first_token, 1, p,
+                                                   d->session_id, d->request_id++,
+                                                   false, logits, &bio, err, errlen);
+        const double bms = (dist_now_sec() - bt0) * 1000.0;
+        d->mtp_forwards++;
+        d->spec_accept_pending = false;
+        d->spec_accept_len = 0;
+        if (brc != 0) {
+            d->carry_valid = false;
+            if (dist_coordinator_rebuild_from_transcript(&d->state, owner, &d->plan,
+                    &transcript, d->session_id, &d->request_id, logits,
+                    &d->plan_generation, brc != DS4_DIST_RECV_REMOTE_ERROR,
+                    err, errlen) != 0) {
+                d->plan_ready = false; d->plan_generation = 0;
+                ds4_tokens_free(&transcript);
+                return -1;
+            }
+            d->plan_ready = true;
+            accepted[0] = first_token;
+            dist_mtp_record_enabled(d, 1, 0, false, false);
+            ds4_tokens_free(&transcript);
+            return 1;
+        }
+        accepted[0] = first_token;
+        /* cur_hc now holds first_token@p's hidden → draft candidates for p+1. */
+        dist_mtp_carry_redraft(d, owner, first_token, p, K, eos_token);
+        if (dist_env_enabled("DS4_DIST_MTP_LOG")) {
+            fprintf(stderr,
+                    "ds4: mtp-carry bootstrap: forwards=1 next_carry=%u r1_ms=%.0f\n",
+                    d->carry_valid ? d->carry_draft_n : 0u, bms);
+        }
+        dist_mtp_record_enabled(d, 1, 0, false, false);
+        ds4_tokens_free(&transcript);
+        return 1;
+    }
+
     /* ---- Wave 34, PC.1 fused single round (copy mode only). --------------
      * The old shape paid a full single-token round (r1, ~600-900ms: it exists
      * only to learn argmax(p) so drafts[0] is a guaranteed-accept freebie)
@@ -6140,6 +6744,13 @@ int ds4_dist_session_eval_speculative(
      * Economics: fire rounds lose the whole r1 (~700ms x ~6 rounds measured);
      * miss rounds are byte-identical to the old r1 frame. */
     if (copy_spec) {
+        const bool spec_pipe = dist_spec_pipe_enabled();
+        /* Wave 68+ spec-pipe within-call single-lookahead state (cb above): on a
+         * full accept the coord's NEXT-cycle local slice was already computed in
+         * this cycle's worker-wait window, so the second cycle runs here reusing it. */
+        dist_spec_pipe_ctx pctx;
+        float   *spec_hidden = NULL;   /* precomputed cycle N+1 local hidden (owned) */
+        uint32_t spec_next_kb = 0;     /* predicted N+1 batch size (0 = no precompute) */
         if (d->copy_spec_len == 0) d->copy_spec_len = dist_copy_spec_init_len();
         uint32_t want = d->copy_spec_len;
         if (want > (uint32_t)(K - 1)) want = (uint32_t)(K - 1);
@@ -6148,14 +6759,17 @@ int ds4_dist_session_eval_speculative(
         int copied[63];
         uint32_t n_copy = 0;
         uint32_t anchor = 0;
+        uint32_t copy_src = 0;   /* source pos of copied[] (spec-pipe next-batch prediction) */
         if (first_token != eos_token && want > 0u) {
             anchor = dist_copy_spec_match(transcript.v,
                                           (uint32_t)transcript.len,
                                           dist_copy_spec_ngram(),
                                           want,
                                           copied,
-                                          &n_copy);
+                                          &n_copy,
+                                          &copy_src);
         }
+        (void)copy_src;   /* consumed by the spec-pipe overlap (next step) */
         /* Never draft past EOS. */
         for (uint32_t j = 0; j < n_copy; j++) {
             if (copied[j] == eos_token) { n_copy = j + 1u; break; }
@@ -6184,16 +6798,68 @@ int ds4_dist_session_eval_speculative(
             io.extra_flags = DS4_DIST_WORK_F_VERIFY;
             io.verify_logits = vlogits;
         }
+        /* spec-pipe: predict cycle N+1's batch as the copy source continuing past
+         * copied[] (the full-accept bet) and arm the overlap cb so its local slice
+         * computes during THIS batch's worker wait.  Off / no-match => no-op. */
+        if (spec_pipe && n_copy > 0u && vlogits) {
+            uint32_t next_src = copy_src + n_copy;   /* source pos just past copied[] */
+            uint32_t nwant = d->copy_spec_len * dist_copy_spec_growth();
+            if (nwant > (uint32_t)(K - 1)) nwant = (uint32_t)(K - 1);
+            if (nwant > dist_copy_spec_max_len()) nwant = dist_copy_spec_max_len();
+            memset(&pctx, 0, sizeof(pctx));
+            uint32_t nkb = 0;
+            while (nkb < 1u + nwant && nkb < 64u &&
+                   next_src + nkb < (uint32_t)transcript.len) {
+                int t = transcript.v[next_src + nkb];
+                pctx.toks[nkb++] = t;
+                if (t == eos_token) break;
+            }
+            if (nkb >= 2u &&
+                (d->state.ctx_size == 0 || p + kb + nkb <= d->state.ctx_size)) {
+                const uint64_t hc = ds4_engine_hidden_f32_values(d->state.engine);
+                spec_hidden = malloc((size_t)nkb * hc * sizeof(float));
+                if (spec_hidden) {
+                    pctx.session = owner;
+                    pctx.local_start = d->state.local_start;
+                    pctx.local_end = d->state.local_end;
+                    pctx.kb = nkb;
+                    pctx.pos0 = p + kb;             /* spec batch starts after cycle N */
+                    pctx.hidden = spec_hidden;
+                    spec_next_kb = nkb;
+                    d->state.spec_overlap_cb = dist_spec_pipe_overlap_cb;
+                    d->state.spec_overlap_ctx = &pctx;
+                }
+            }
+        }
         const double t0 = dist_now_sec();
-        const int rc = dist_coordinator_eval_span(&d->state, owner, &d->plan,
-                                                  toks, kb, p,
-                                                  d->session_id, d->request_id++,
-                                                  false, logits, &io, err, errlen);
+        /* Wave 69: row-chunked two-host pipeline for the remote VERIFY batch
+         * (DS4_DIST_PIPE_CHUNK >= 2). Only when this is a real verify batch
+         * (vlogits/io.verify_logits set, kb >= 2) routed to a worker, and not while
+         * spec-pipe is arming this same call (mutually exclusive overlap schemes).
+         * Otherwise the legacy single-frame path -- byte-identical. */
+        int rc;
+        const uint32_t pipe_chunk = dist_pipe_chunk();
+        if (pipe_chunk >= 2u && vlogits && kb >= 2u && d->plan.count != 0 &&
+            !d->state.spec_overlap_cb && !d->state.spec_precomputed_hidden) {
+            rc = dist_coordinator_eval_span_pipelined(&d->state, owner, &d->plan,
+                                                      toks, kb, p, d->session_id,
+                                                      &d->request_id, &io, pipe_chunk,
+                                                      err, errlen);
+        } else {
+            rc = dist_coordinator_eval_span(&d->state, owner, &d->plan,
+                                            toks, kb, p,
+                                            d->session_id, d->request_id++,
+                                            false, logits, &io, err, errlen);
+        }
+        d->state.spec_overlap_cb = NULL;   /* one-shot: clear after this eval */
+        d->state.spec_overlap_ctx = NULL;
         const double batch_ms = (dist_now_sec() - t0) * 1000.0;
+        d->mtp_forwards++;   /* copy-spec fused = 1 forward/cycle */
         d->spec_accept_pending = false;
         d->spec_accept_len = 0;
         if (rc != 0) {
             free(vlogits);
+            free(spec_hidden);   /* spec-pipe: discard precompute; rebuild resets KV */
             if (dist_coordinator_rebuild_from_transcript(&d->state, owner, &d->plan,
                     &transcript, d->session_id, &d->request_id, logits,
                     &d->plan_generation, rc != DS4_DIST_RECV_REMOTE_ERROR, err, errlen) != 0) {
@@ -6234,6 +6900,13 @@ int ds4_dist_session_eval_speculative(
                 d->copy_spec_len = grown;
             } else if (m <= 1u) {
                 d->copy_spec_len = dist_copy_spec_init_len();
+            } else if (dist_copy_spec_reanchor() &&
+                       (uint64_t)m * dist_copy_spec_reanchor_ratio() < (uint64_t)n_copy) {
+                /* wave 68/69: partial accept with a SEVERE divergence (m < n_copy/ratio)
+                 * — re-anchor next bet to the observed run (m) instead of leaving the
+                 * stale high length to re-overbet.  Near-full partials are left alone
+                 * (wave 69: gating out near-fulls is what makes re-anchor net-positive). */
+                d->copy_spec_len = m;
             }
             if (dist_env_enabled("DS4_DIST_COPY_SPEC_LOG")) {
                 /* sent/accepted keep the old meaning (batch rows / kept rows);
@@ -6243,15 +6916,93 @@ int ds4_dist_session_eval_speculative(
                         "next_len=%u r1_ms=0 r2_ms=%.0f\n",
                         anchor, kb, (uint32_t)n_acc, d->copy_spec_len, batch_ms);
             }
-            /* Keep first_token + m copies; worker base is p, so its deferred
-             * accept_len is 1+m. */
-            (void)ds4_session_layer_slice_rollback(owner, p + 1u + m, err, errlen);
-            d->spec_accept_pending = true;
-            d->spec_accept_len = 1u + m;
-            dist_mtp_record_enabled(d, (uint32_t)n_acc, kb, true, true);
+            /* spec-pipe second cycle: cycle N fully accepted (m==n_copy) and the
+             * overlap precompute is valid (cb ran, prediction holds) -> run cycle
+             * N+1 here reusing the precomputed hidden (eval_span skips layer_slice;
+             * the cb already advanced the coord KV to p+kb+spec_next_kb).  The
+             * prediction holds iff the model's actual next token (argmax of logits,
+             * = vlogits[n_copy]) equals the predicted next first token. */
+            bool spec_ran = false;
+            /* wave 69 diagnostic: log which fire gate blocks spec-pipe (it fired
+             * only ~1/9 in earlier runs). Gated by COPY_SPEC_LOG. predmatch is only
+             * meaningful when armed (spec_hidden!=NULL, pctx valid). */
+            if (spec_pipe && dist_env_enabled("DS4_DIST_COPY_SPEC_LOG")) {
+                const int predmatch = (spec_hidden && spec_next_kb >= 2u &&
+                                       pctx.toks[0] == dist_logits_argmax(logits, vocab)) ? 1 : 0;
+                fprintf(stderr,
+                        "ds4: spec-pipe gate: armed=%d pctx_ok=%d full=%d(m=%u/n=%u) "
+                        "next_kb=%u predmatch=%d\n",
+                        spec_hidden ? 1 : 0, spec_hidden ? pctx.ok : -1,
+                        (m == n_copy) ? 1 : 0, m, n_copy, spec_next_kb, predmatch);
+            }
+            if (spec_pipe && spec_hidden && pctx.ok && m == n_copy &&
+                spec_next_kb >= 2u &&
+                pctx.toks[0] == dist_logits_argmax(logits, vocab) &&
+                (uint32_t)n_acc + spec_next_kb <= (uint32_t)accepted_cap) {
+                float *v2 = malloc((size_t)spec_next_kb * (size_t)vocab * sizeof(float));
+                if (v2) {
+                    ds4_dist_spec_io io2;
+                    memset(&io2, 0, sizeof(io2));
+                    io2.extra_flags = DS4_DIST_WORK_F_VERIFY;
+                    io2.verify_logits = v2;
+                    io2.accept_len = kb;   /* worker keeps all kb rows of cycle N */
+                    d->state.spec_precomputed_hidden = spec_hidden;
+                    const int rc2 = dist_coordinator_eval_span(&d->state, owner, &d->plan,
+                                                               pctx.toks, spec_next_kb, p + kb,
+                                                               d->session_id, d->request_id++,
+                                                               false, logits, &io2, err, errlen);
+                    d->state.spec_precomputed_hidden = NULL;
+                    d->mtp_forwards++;
+                    if (rc2 == 0) {
+                        accepted[n_acc++] = pctx.toks[0];   /* predicted next-first, validated */
+                        uint32_t m2 = 0;
+                        for (uint32_t j = 1; j < spec_next_kb && n_acc < accepted_cap; j++) {
+                            const int pred = dist_logits_argmax(
+                                    v2 + (size_t)(j - 1) * (size_t)vocab, vocab);
+                            if (pred != pctx.toks[j]) break;
+                            accepted[n_acc++] = pctx.toks[j];
+                            m2++;
+                            if (pctx.toks[j] == eos_token) break;
+                        }
+                        memcpy(logits, v2 + (size_t)m2 * (size_t)vocab,
+                               (size_t)vocab * sizeof(float));
+                        /* coord KV: keep cycle N (kb) + cycle N+1 (1 + m2). */
+                        (void)ds4_session_layer_slice_rollback(owner, p + kb + 1u + m2, err, errlen);
+                        d->spec_accept_pending = true;
+                        d->spec_accept_len = 1u + m2;   /* worker rolls N+1 next call */
+                        if (m2 == spec_next_kb - 1u) {
+                            uint32_t grown = d->copy_spec_len * dist_copy_spec_growth();
+                            if (grown > (uint32_t)(K - 1)) grown = (uint32_t)(K - 1);
+                            if (grown > dist_copy_spec_max_len()) grown = dist_copy_spec_max_len();
+                            d->copy_spec_len = grown;
+                        } else if (m2 <= 1u) {
+                            d->copy_spec_len = dist_copy_spec_init_len();
+                        }
+                        spec_ran = true;
+                        if (dist_env_enabled("DS4_DIST_COPY_SPEC_LOG")) {
+                            fprintf(stderr,
+                                    "ds4: spec-pipe 2nd: sent=%u accepted=%u next_len=%u\n",
+                                    spec_next_kb, 1u + m2, d->copy_spec_len);
+                        }
+                        dist_mtp_record_enabled(d, (uint32_t)n_acc, kb + spec_next_kb, true, true);
+                    }
+                    free(v2);
+                }
+            }
+            if (!spec_ran) {
+                /* Legacy single cycle: keep first_token + m copies.  This rollback to
+                 * p+1+m also undoes any speculative KV advance the cb made (it sat at
+                 * p+kb+spec_next_kb >= p+1+m), so a mispredict/partial costs only the
+                 * wasted speculative compute, never correctness. */
+                (void)ds4_session_layer_slice_rollback(owner, p + 1u + m, err, errlen);
+                d->spec_accept_pending = true;
+                d->spec_accept_len = 1u + m;
+                dist_mtp_record_enabled(d, (uint32_t)n_acc, kb, true, true);
+            }
         } else {
             dist_mtp_record_enabled(d, 1, 0, false, false);
         }
+        free(spec_hidden);   /* spec-pipe: precompute consumed or discarded */
         ds4_tokens_free(&transcript);
         return n_acc;
     }
@@ -6262,8 +7013,8 @@ int ds4_dist_session_eval_speculative(
      * rollback of the previous VERIFY batch. */
     ds4_dist_spec_io r1;
     memset(&r1, 0, sizeof(r1));
-    r1.extra_flags = copy_spec ? 0u : DS4_DIST_WORK_F_DRAFT;
-    r1.draft_cap = copy_spec ? 0u : (uint32_t)K;
+    r1.extra_flags = (copy_spec || mtp_local) ? 0u : DS4_DIST_WORK_F_DRAFT;
+    r1.draft_cap = (copy_spec || mtp_local) ? 0u : (uint32_t)K;
     r1.accept_len = d->spec_accept_pending ? d->spec_accept_len : 0u;
 
     const double r1_t0 = dist_now_sec();
@@ -6272,6 +7023,7 @@ int ds4_dist_session_eval_speculative(
                                         d->session_id, d->request_id++,
                                         false, logits, &r1, err, errlen);
     const double r1_ms = (dist_now_sec() - r1_t0) * 1000.0;
+    d->mtp_forwards++;   /* Round-1 draft-source forward (the cost carry-over elides) */
     d->spec_accept_pending = false;
     d->spec_accept_len = 0;
     if (rc != 0) {
@@ -6316,7 +7068,8 @@ int ds4_dist_session_eval_speculative(
                                                dist_copy_spec_ngram(),
                                                want,
                                                copied,
-                                               &n_copy);
+                                               &n_copy,
+                                               NULL);
             transcript.len--;  /* pop `next`: the rebuild fallback below must
                                 * see exactly the committed prefix. */
             /* Never draft past EOS. */
@@ -6331,6 +7084,32 @@ int ds4_dist_session_eval_speculative(
                 }
                 r1.draft_n = 1u + n_copy;
             }
+        }
+    }
+
+    /* ---- 本机 MTP: draft locally from the worker's returned hidden. Round 1's
+     * local output head wrote first_token's final hidden into g->cur_hc (and the
+     * argmax into `logits`); ds4_session_mtp_draft rolls the K candidates from
+     * that same hidden. drafts[0] is the MTP head's own prediction, gated against
+     * argmax(logits) by the precheck below exactly like the worker-draft path —
+     * so a wrong draft only costs the verify round, never correctness. */
+    double mtp_draft_ms = 0.0;
+    if (mtp_local) {
+        r1.draft_n = 0;
+        if (first_token != eos_token) {
+            int mdrafts[64];
+            int mn = 0;
+            int want_k = K;
+            if (want_k > 64) want_k = 64;
+            const double draft_t0 = dist_now_sec();
+            if (ds4_session_mtp_draft(owner, first_token, p, want_k,
+                                      mdrafts, &mn, err, errlen) == 0 && mn > 0) {
+                uint32_t cap = (uint32_t)mn;
+                if (cap > (uint32_t)K) cap = (uint32_t)K;
+                for (uint32_t j = 0; j < cap; j++) r1.drafts[j] = (uint32_t)mdrafts[j];
+                r1.draft_n = cap;
+            }
+            mtp_draft_ms = (dist_now_sec() - draft_t0) * 1000.0;
         }
     }
 
@@ -6381,6 +7160,7 @@ int ds4_dist_session_eval_speculative(
                                     d->session_id, d->request_id++,
                                     false, logits, &r2, err, errlen);
     const double r2_ms = (dist_now_sec() - r2_t0) * 1000.0;
+    d->mtp_forwards++;   /* Round-2 verify forward */
     if (rc != 0) {
         /* Verify transport failed: resync both machines to [checkpoint+first_token]
          * via the rebuild fallback and emit just first_token. */
@@ -6436,6 +7216,16 @@ int ds4_dist_session_eval_speculative(
                     "ds4: copy-spec verify: anchor=%u sent=%u accepted=%u next_len=%u r1_ms=%.0f r2_ms=%.0f\n",
                     copy_anchor, kc, m, d->copy_spec_len, r1_ms, r2_ms);
         }
+    }
+
+    /* mtp_local per-call economics: this 2-round path pays r1 (draft-source
+     * forward) + r2 (verify forward) = 2 forwards/cycle. DS4_DIST_MTP_CARRY_DRAFT
+     * collapses it to 1; this line is the A/B baseline for that comparison. */
+    if (mtp_local && dist_env_enabled("DS4_DIST_MTP_LOG")) {
+        fprintf(stderr,
+                "ds4: mtp-local verify: kc=%u accepted=%u forwards=2 "
+                "r1_ms=%.0f draft_ms=%.0f r2_ms=%.0f\n",
+                kc, m, r1_ms, mtp_draft_ms, r2_ms);
     }
 
     /* Roll the coordinator's local layer-slice KV back to the accepted prefix
@@ -8326,7 +9116,11 @@ static int dist_worker_process_work_payload(
      * the new frame. Output correctness never depends on this: a wrong rollback
      * only trips the prefix-hash check below and forces a transcript rebuild. */
     if (session->spec_pending &&
-        (work.flags & DS4_DIST_WORK_F_RESET_SESSION) == 0) {
+        (work.flags & DS4_DIST_WORK_F_RESET_SESSION) == 0 &&
+        (work.flags & DS4_DIST_WORK_F_VERIFY_CONT) == 0) {
+        /* wave 69: a VERIFY_CONT chunk is mid-batch -- rolling back here would undo
+         * the prior chunk's KV. Only the first (non-CONT) chunk of a batch rolls
+         * back the previous batch's rejected tail. */
         uint32_t keep = session->spec_base_len + work.accept_len;
         if (ds4_session_layer_slice_rollback(session->session, keep, err, sizeof(err)) == 0) {
             const ds4_tokens *tl = ds4_session_tokens(session->session);
@@ -8409,7 +9203,11 @@ static int dist_worker_process_work_payload(
         session->token_hash_valid = true;
         if (is_verify) {
             session->spec_pending = true;
-            session->spec_base_len = work.pos0;
+            /* wave 69: keep the batch-start base recorded by the first chunk; a
+             * CONT chunk's pos0 is mid-batch and must not overwrite it. */
+            if ((work.flags & DS4_DIST_WORK_F_VERIFY_CONT) == 0) {
+                session->spec_base_len = work.pos0;
+            }
         }
         if (want_draft) {
             uint32_t cap = work.draft_cap;
@@ -9131,10 +9929,12 @@ void ds4_dist_usage(FILE *fp) {
         "  --tp-layers N\n"
         "      Apply the TP down_proj split only to the first N layers (implies --tp).\n"
         "      0 (default with --tp) means all layers; small N brings the path up on 2-3 layers.\n"
-        "  --mtp-role worker\n"
-        "      Layer-pipeline only: run the MTP drafter on the worker that holds the\n"
-        "      final layers + output head, so it drafts from the model's final hidden\n"
-        "      state without shipping it back. Requires --mtp on that worker.\n"
+        "  --mtp-role worker|coordinator\n"
+        "      Layer-pipeline only. 'worker': run the MTP drafter on the worker that\n"
+        "      holds the final layers + output head (drafts from its own final hidden;\n"
+        "      requires --mtp on that worker). 'coordinator': run the drafter on the\n"
+        "      coordinator (holds output head + token_embd + MTP; worker runs only the\n"
+        "      backbone slice and returns hidden state). Requires --mtp on that side.\n"
         "  --debug\n"
         "      Print coordinator route/debug logs. Workers keep their normal logs without this.\n"
     );
@@ -9293,13 +10093,16 @@ ds4_dist_cli_parse_result ds4_dist_parse_cli_arg(
         }
         const char *value = dist_cli_need_arg(index, argc, argv, arg, err, errlen);
         if (!value) return DS4_DIST_CLI_ERROR;
-        /* mtp.md Phase 1: the drafter lives on the worker holding the final
-         * layers. "worker" is the only supported role today; "coordinator"
-         * (Scheme B's full-model verifier + remote drafter) is Phase 2. */
+        /* "worker": drafter lives on the final-layer worker (Scheme A).
+         * "coordinator": drafter lives on the coordinator, which holds output
+         * head + token_embd + MTP while the worker only runs the backbone slice
+         * and returns hidden state (本机 MTP topology). */
         if (!strcmp(value, "worker")) {
             opt->mtp_draft_on_worker = true;
+        } else if (!strcmp(value, "coordinator")) {
+            opt->mtp_draft_on_coordinator = true;
         } else {
-            if (errlen) snprintf(err, errlen, "--mtp-role must be 'worker'");
+            if (errlen) snprintf(err, errlen, "--mtp-role must be 'worker' or 'coordinator'");
             return DS4_DIST_CLI_ERROR;
         }
         return DS4_DIST_CLI_MATCHED;

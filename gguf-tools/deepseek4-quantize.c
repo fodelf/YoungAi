@@ -874,7 +874,8 @@ typedef enum { EXP_NONE, EXP_W1, EXP_W2, EXP_W3 } expert_part;
 
 typedef struct {
     bool is_expert;
-    int layer;
+    bool is_mtp;   /* tensor lives in an MTP draft module (HF prefix mtp.<layer>. not layers.<layer>.) */
+    int layer;     /* block index for blk.N / MTP module index for mtp.N */
     expert_part part;
 } expert_tensor;
 
@@ -883,14 +884,19 @@ static expert_tensor parse_expert_tensor(const char *name) {
     int layer = -1;
     char kind[16];
     int rest = 0;
-    if (sscanf(name, "blk.%d.ffn_%15[^_]_exps.weight%n", &layer, kind, &rest) == 2
-        && rest == (int)strlen(name))
-    {
-        if (strcmp(kind, "gate") == 0 || strcmp(kind, "down") == 0 || strcmp(kind, "up") == 0) {
-            e.is_expert = true;
-            e.layer = layer;
-            e.part = strcmp(kind, "gate") == 0 ? EXP_W1 : strcmp(kind, "down") == 0 ? EXP_W2 : EXP_W3;
-        }
+    bool is_mtp = false;
+    if (!(sscanf(name, "blk.%d.ffn_%15[^_]_exps.weight%n", &layer, kind, &rest) == 2
+          && rest == (int)strlen(name))) {
+        is_mtp = true;
+        if (!(sscanf(name, "mtp.%d.ffn_%15[^_]_exps.weight%n", &layer, kind, &rest) == 2
+              && rest == (int)strlen(name)))
+            return e;
+    }
+    if (strcmp(kind, "gate") == 0 || strcmp(kind, "down") == 0 || strcmp(kind, "up") == 0) {
+        e.is_expert = true;
+        e.is_mtp = is_mtp;
+        e.layer = layer;
+        e.part = strcmp(kind, "gate") == 0 ? EXP_W1 : strcmp(kind, "down") == 0 ? EXP_W2 : EXP_W3;
     }
     return e;
 }
@@ -954,12 +960,48 @@ static const name_map layer_map[] = {
     { "ffn_gate_tid2eid.weight",          "ffn.gate.tid2eid" },
 };
 
+/* MTP-only suffixes (after the mtp.<N>. prefix). The MTP module reuses most
+ * regular layer tensor names, so anything not listed here falls back to
+ * layer_map below; these are the ones that differ or have no layer analogue
+ * (the eagle e/h projection + norms, and the hc head correction tensors, which
+ * for a regular layer live under output_hc_* in top_map instead). */
+static const name_map mtp_map[] = {
+    { "hc_head_base.weight",   "hc_head_base" },
+    { "hc_head_fn.weight",     "hc_head_fn" },
+    { "hc_head_scale.weight",  "hc_head_scale" },
+    { "e_proj.weight",         "e_proj.weight" },
+    { "h_proj.weight",         "h_proj.weight" },
+    { "enorm.weight",          "enorm.weight" },
+    { "hnorm.weight",          "hnorm.weight" },
+    { "norm.weight",           "norm.weight" },
+};
+
 static char *hf_name_for_regular(const char *gguf_name) {
     for (size_t i = 0; i < sizeof(top_map) / sizeof(top_map[0]); i++) {
         if (strcmp(gguf_name, top_map[i].gguf) == 0) return xstrdup(top_map[i].hf);
     }
     int layer = -1;
     const char *p = gguf_name;
+    if (sscanf(p, "mtp.%d.", &layer) == 1) {
+        const char *rest = strchr(p + 4, '.');
+        if (!rest) die("bad mtp tensor name");
+        rest++;
+        char buf[512];
+        for (size_t i = 0; i < sizeof(mtp_map) / sizeof(mtp_map[0]); i++) {
+            if (strcmp(rest, mtp_map[i].gguf) == 0) {
+                snprintf(buf, sizeof(buf), "mtp.%d.%s", layer, mtp_map[i].hf);
+                return xstrdup(buf);
+            }
+        }
+        for (size_t i = 0; i < sizeof(layer_map) / sizeof(layer_map[0]); i++) {
+            if (strcmp(rest, layer_map[i].gguf) == 0) {
+                snprintf(buf, sizeof(buf), "mtp.%d.%s", layer, layer_map[i].hf);
+                return xstrdup(buf);
+            }
+        }
+        fprintf(stderr, "error: cannot map GGUF tensor to HF tensor: %s\n", gguf_name);
+        exit(1);
+    }
     if (sscanf(p, "blk.%d.", &layer) != 1) {
         fprintf(stderr, "error: cannot map GGUF tensor to HF tensor: %s\n", gguf_name);
         exit(1);
@@ -1008,6 +1050,26 @@ static bool is_output_tensor(const char *name) {
     return str_starts(name, "output.");
 }
 
+/* Tensors that ds4 loads through the plain-layout fast path and REQUIRES to be
+ * F16/F32 — one tensor_expect_plain_layout() call each in ds4.c:
+ *   - the "hc" head/attn/ffn projections (blk.N / mtp.N .hc_{head,attn,ffn}_fn,
+ *     their 1-D _base/_scale siblings, and the main-model output_hc_*);
+ *   - the MoE router gate ffn_gate_inp.weight (2-D F16/F32).
+ * Quantizing any of these makes the model fail to load with
+ * "tensor ... has type qN_k, expected F16 or F32". The 1-D base/scale are also
+ * kept by the n_dims<=1 rule; the 2-D fn projections and the router gate need
+ * this guard so an aggressive --dense/--attention policy can't reach them.
+ * ffn_gate_inp matched precisely (not ffn_gate_exps/_shexp, which DO quantize). */
+static bool is_plain_layout_weight(const char *name) {
+    return strstr(name, "hc_head_") != NULL ||
+           strstr(name, "hc_attn_") != NULL ||
+           strstr(name, "hc_ffn_")  != NULL ||
+           strstr(name, "_hc_fn")    != NULL ||
+           strstr(name, "_hc_base")  != NULL ||
+           strstr(name, "_hc_scale") != NULL ||
+           strstr(name, "ffn_gate_inp") != NULL;
+}
+
 typedef struct {
     char *name;
     int n_dims;
@@ -1042,6 +1104,7 @@ static ds4q_type policy_type(const quant_policy *p, const char *name, const tens
         return tmpl->type;
     }
     if (tensor_n_dims(tmpl) <= 1) return tmpl->type;
+    if (is_plain_layout_weight(name)) return tmpl->type;  /* plain-layout F16/F32, never quantize */
     if (strcmp(name, "token_embd.weight") == 0 && p->embedding != DS4Q_TYPE_COUNT) return p->embedding;
     if (is_output_tensor(name) && p->output != DS4Q_TYPE_COUNT) return p->output;
     if (is_shared_expert(name) && p->shared != DS4Q_TYPE_COUNT) return p->shared;
@@ -1223,7 +1286,10 @@ typedef struct {
 
 static void generate_one_expert(expert_job *j, int xid) {
     char prefix[256];
-    snprintf(prefix, sizeof(prefix), "layers.%d.ffn.experts.%d.%s", j->expert.layer, xid, j->wid);
+    if (j->expert.is_mtp)
+        snprintf(prefix, sizeof(prefix), "mtp.%d.ffn.experts.%d.%s", j->expert.layer, xid, j->wid);
+    else
+        snprintf(prefix, sizeof(prefix), "layers.%d.ffn.experts.%d.%s", j->expert.layer, xid, j->wid);
     char weight_name[320];
     char scale_name[320];
     snprintf(weight_name, sizeof(weight_name), "%s.weight", prefix);

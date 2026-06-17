@@ -328,6 +328,13 @@ struct ds4_metal_args_mul_mm_id_map0 {
     int32_t  ne21;
     int32_t  ne20;
     uint64_t nb21;
+    /* P-OVL (expert-half overlap): only experts (scratch slots) in
+     * [slot_lo, slot_hi) contribute to this map pass; out-of-range slots get
+     * tokens-per-expert = 0 so the grouped GEMM skips them.  Full range
+     * (slot_lo=0, slot_hi=ne02) is bit-identical to the un-split map (the
+     * range gate is then always true). */
+    int32_t  slot_lo;
+    int32_t  slot_hi;
 };
 
 struct ds4_metal_args_mul_mm_id {
@@ -1486,6 +1493,9 @@ kernel void kernel_mul_mm_id_map0(
         ushort tpitg[[thread_position_in_threadgroup]],
         ushort   ntg[[threads_per_threadgroup]]) {
     const short ide = tpitg;
+    /* P-OVL: loop-invariant range gate.  Kept inside the match (not an early
+     * return) so every thread still reaches the threadgroup barriers below. */
+    const bool in_range = (ide >= args.slot_lo && ide < args.slot_hi);
 
     uint32_t n_all = 0;
 
@@ -1515,7 +1525,7 @@ kernel void kernel_mul_mm_id_map0(
             short sel = 0;
             #pragma unroll(ne20)
             for (short i20 = 0; i20 < ne20; i20++) {
-                sel += (sids[i20] == ide)*(i20 + 1);
+                sel += (sids[i20] == ide && in_range)*(i20 + 1);
             }
 
             ids_i32[n_all] = (i21 + t)*ne20 + sel - 1;

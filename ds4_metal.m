@@ -150,6 +150,15 @@ static id<MTLBuffer> g_moe_scratch_up;
 static id<MTLBuffer> g_moe_scratch_down;
 static const void *g_model_map_ptr;
 static uint64_t g_model_map_size;
+/* Largest model file size ever mapped this process. The expert-fetch transport
+ * reads expert bytes from the BASE GGUF (~81 GiB) and handshakes the peer's
+ * served file size against it; but loading the small MTP draft model
+ * (~2.14 GiB, 本机 MTP topology) overwrites g_model_map_size with the draft's
+ * size, which made the efetch handshake reject every connection ("remote size
+ * <base> vs local <draft>") and silently starved the coordinator of the peer's
+ * fast SSD. Tracking the max (the base model is always the largest) keeps the
+ * efetch size stable regardless of MTP load order. */
+static uint64_t g_efetch_model_size;
 static uint64_t g_model_mapped_offset;
 static uint64_t g_model_mapped_size;
 static uint64_t g_model_mapped_max_tensor_bytes;
@@ -669,6 +678,18 @@ static int ds4_gpu_finish_model_views(
     return 1;
 }
 
+/* When set, the next contiguous-range model map (ds4_gpu_set_model_map_range)
+ * wraps its views WITHOUT adding them to the GPU residency set, so their clean
+ * mmap pages stay reclaimable instead of pinning the wired working set.  Used
+ * for the MTP draft model on the memory-tight worker (DS4_MTP_NO_RESIDENCY):
+ * the draft tensors are read via the no-copy mmap views (fine on Metal) and the
+ * hot, every-step ones stay warm in the page cache.  Auto-resets after use. */
+static int g_model_view_force_nonresident;
+
+void ds4_gpu_set_model_map_nonresident_hint(int on) {
+    g_model_view_force_nonresident = on ? 1 : 0;
+}
+
 static int ds4_gpu_map_model_views(
         const void *model_map,
         uint64_t    model_size,
@@ -677,12 +698,13 @@ static int ds4_gpu_map_model_views(
         uint64_t    max_tensor_bytes) {
     const double t0 = ds4_gpu_now_ms();
     uint64_t mapped_model_size = 0;
+    const bool resident = g_model_view_force_nonresident ? false : true;
     if (!ds4_gpu_add_model_view_range(model_map,
                                       model_size,
                                       map_offset,
                                       map_size,
                                       max_tensor_bytes,
-                                      true,
+                                      resident,
                                       &mapped_model_size)) {
         return 0;
     }
@@ -2512,6 +2534,8 @@ typedef struct {
     int32_t  ne21;
     int32_t  ne20;
     uint64_t nb21;
+    int32_t  slot_lo;   /* P-OVL: map only scratch slots [slot_lo, slot_hi) */
+    int32_t  slot_hi;   /* full range (0, ne02) == un-split map (bit-identical) */
 } ds4_gpu_mul_mm_id_map_args;
 
 typedef struct {
@@ -5090,6 +5114,7 @@ int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint
         }
         g_model_map_ptr = model_map;
         g_model_map_size = model_size;
+        if (model_size > g_efetch_model_size) g_efetch_model_size = model_size;
         g_model_mapped_offset = map_offset;
         g_model_mapped_size = map_size;
         g_model_mapped_max_tensor_bytes = max_tensor_bytes;
@@ -5165,6 +5190,7 @@ static int ds4_gpu_set_model_map_spans_impl(
         }
         g_model_map_ptr = model_map;
         g_model_map_size = model_size;
+        if (model_size > g_efetch_model_size) g_efetch_model_size = model_size;
         g_model_mapped_offset = first_offset == UINT64_MAX ? 0 : first_offset;
         g_model_mapped_size = mapped_total;
         g_model_mapped_max_tensor_bytes = max_tensor_bytes;
@@ -12931,6 +12957,8 @@ static ds4_gpu_mul_mm_id_map_args ds4_gpu_make_mul_mm_id_map_args(
         .ne21 = (int32_t)n_tokens,
         .ne20 = (int32_t)selected_experts,
         .nb21 = (uint64_t)selected_experts * sizeof(int32_t),
+        .slot_lo = 0,
+        .slot_hi = (int32_t)src0_experts,   /* full range: bit-identical to un-split */
     };
 }
 
@@ -16322,7 +16350,9 @@ static bool g_expert_source_init_attempted;
 static bool g_expert_source_summary_registered;
 static bool g_expert_source_mlock_disabled;
 static bool g_expert_source_mlock_reported;
-static uint64_t g_expert_source_budget_bytes;
+static uint64_t g_expert_source_budget_bytes;     /* configured MB cap (upper bound) */
+static int      g_expert_source_dynamic;          /* size against live headroom, not the fixed cap */
+static uint64_t g_expert_source_dyn_margin_bytes; /* keep this far below the 90% self-kill line */
 static uint64_t g_expert_source_used_bytes;
 static uint64_t g_expert_source_peak_bytes;
 static uint32_t g_expert_source_layer_start;
@@ -16391,9 +16421,46 @@ static int ds4_gpu_expert_source_is_enabled(void) {
             g_expert_source_use_mlock = ds4_gpu_env_bool("DS4_METAL_EXPERT_SOURCE_CACHE_MLOCK") > 0;
             g_expert_source_hard_copy = ds4_gpu_env_bool("DS4_METAL_EXPERT_SOURCE_CACHE_HARD_COPY") > 0;
             g_expert_source_async_prefetch = ds4_gpu_env_bool("DS4_METAL_EXPERT_SOURCE_CACHE_ASYNC") > 0;
+            /* Dynamic sizing: grow the cache into the live phys_footprint
+             * headroom (up to the configured MB as a ceiling) instead of always
+             * holding the fixed MB.  Keeps the cache useful when there is slack
+             * under the 12G budget and yields it back as the working set grows. */
+            g_expert_source_dynamic = ds4_gpu_env_bool("DS4_METAL_EXPERT_SOURCE_CACHE_DYNAMIC") > 0;
+            g_expert_source_dyn_margin_bytes =
+                ds4_gpu_env_u64("DS4_METAL_EXPERT_SOURCE_CACHE_DYN_MARGIN_MB", 768u) * 1024ull * 1024ull;
         }
     }
     return g_expert_source_enabled;
+}
+
+/* Effective byte budget for the source cache.  In dynamic mode it is the live
+ * headroom below the internal 90%-of-budget self-kill line (minus a margin),
+ * excluding the cache's own bytes, capped by the configured MB.  The live
+ * phys_footprint is sampled at most every 50ms so the per-expert admit path
+ * does not call task_info() hundreds of times per layer. */
+static uint64_t ds4_gpu_expert_source_effective_budget(void) {
+    if (!g_expert_source_dynamic) return g_expert_source_budget_bytes;
+    static uint64_t cached_footprint;
+    static double   cached_ms;
+    const double now = ds4_gpu_now_ms();
+    if (cached_footprint == 0 || now - cached_ms > 50.0) {
+        cached_footprint = ds4_runtime_phys_footprint_bytes();
+        cached_ms = now;
+    }
+    const uint64_t mem_budget = ds4_runtime_mem_budget_bytes();
+    if (mem_budget == 0 || cached_footprint == 0) {
+        return g_expert_source_budget_bytes;   /* no live info: fall back to fixed cap */
+    }
+    /* Internal watchdog self-kills at 90% of the budget; stay a margin below. */
+    uint64_t ceiling = mem_budget / 10ull * 9ull;
+    if (ceiling <= g_expert_source_dyn_margin_bytes) return 0;
+    ceiling -= g_expert_source_dyn_margin_bytes;
+    const uint64_t used = g_expert_source_used_bytes;
+    const uint64_t other = cached_footprint > used ? cached_footprint - used : 0;  /* footprint minus this cache */
+    if (other >= ceiling) return 0;            /* no headroom: evict everything */
+    uint64_t dyn = ceiling - other;
+    if (dyn > g_expert_source_budget_bytes) dyn = g_expert_source_budget_bytes;  /* MB is the hard ceiling */
+    return dyn;
 }
 
 static int ds4_gpu_expert_source_layer_allowed(uint32_t layer) {
@@ -16741,12 +16808,13 @@ static void ds4_gpu_expert_source_admit(
     const uint64_t charge = g_expert_source_hard_copy ?
         (gate_expert_bytes + gate_expert_bytes + down_expert_bytes) :
         ((uint64_t)gate_len + (uint64_t)up_len + (uint64_t)down_len);
-    if (charge == 0 || charge > g_expert_source_budget_bytes) return;
+    const uint64_t budget = ds4_gpu_expert_source_effective_budget();
+    if (charge == 0 || charge > budget) return;
 
-    while (g_expert_source_tail >= 0 && g_expert_source_used_bytes + charge > g_expert_source_budget_bytes) {
+    while (g_expert_source_tail >= 0 && g_expert_source_used_bytes + charge > budget) {
         ds4_gpu_expert_source_evict_tail();
     }
-    if (g_expert_source_used_bytes + charge > g_expert_source_budget_bytes) return;
+    if (g_expert_source_used_bytes + charge > budget) return;
 
     const int32_t idx = ds4_gpu_expert_source_free_entry();
     if (idx < 0) return;
@@ -16997,6 +17065,206 @@ static uint32_t ds4_gpu_expert_batch_nocache_min_tokens(void) {
         if (n == 0) n = 64;
         if (n > UINT32_MAX) n = UINT32_MAX;
         cached = (uint32_t)n;
+        init = 1;
+    }
+    return cached;
+}
+
+/* Minimum batch token count for the grouped-GEMM (mm_id) routed-MoE path.  Was
+ * an in-function static in ds4_gpu_routed_moe_batch_tensor; extracted so the
+ * P-OVL two-pass path can gate on the same threshold (overlap only applies to
+ * the mm_id encode shape). */
+static uint32_t ds4_gpu_moe_mm_id_min(void) {
+    static uint32_t cached;
+    static int init;
+    if (!init) {
+        uint64_t v = ds4_gpu_env_u64("DS4_METAL_MOE_MM_ID_MIN", 8u);
+        if (v == 0) v = UINT32_MAX;     /* 0 = never use mm_id */
+        if (v < 2u) v = 2u;
+        cached = (uint32_t)(v > UINT32_MAX ? UINT32_MAX : v);
+        init = 1;
+    }
+    return cached;
+}
+
+/* project.md §2.4/§3.5 降激活 (MoE activation thinning) -- the one lever that moves
+ * the dominant q2 wall (routed-expert SSD IO ~1.70GiB/token).  After routing has
+ * already chosen the per-token top-n_expert experts (selectedbuf ids + weightsbuf
+ * route weights), optionally drop the low-weight tail picks so the gather *union*
+ * shrinks and the per-token cold-expert bytes fall ~proportionally.  Cutting k 6->K
+ * lifts single-forward decode toward the W3 backbone ceiling (~10-18 t/s) and prefill
+ * toward the M2/M3 targets; combined with §3.5 copy-spec it is the only code path to
+ * the 30 t/s effective target (project.md §1.5 / wave 66).
+ *
+ * Mechanism (no kernel change, IO actually saved):
+ *   a dropped pick is rewritten to ALIAS the token's top-1 expert id with route
+ *   weight 0, so (1) the grouped GEMM computes top1_swiglu*0 = 0 -- the pick
+ *   contributes nothing -- and (2) ds4_gpu_collect/compact_selected_experts dedups
+ *   it away, so the dropped expert is never gathered.  Kept weights are rescaled to
+ *   the original sum of the n_expert routed weights (magnitude-neutral redistribution
+ *   of the dropped mass).
+ *
+ * This changes model outputs => a quality bet.  Two independent gates, BOTH default
+ * OFF => byte-identical baseline (kept off, the rewrite never runs):
+ *   DS4_METAL_MOE_THIN_ALPHA  (float)  drop picks with weight < alpha * top1_weight
+ *   DS4_METAL_MOE_THIN_TOPK   (uint)   keep at most this many highest-weight picks
+ * Validated by the user via ds4-eval q1..q4 --temp 0 --seed 1 + ds4_test
+ * --logprob-vectors before it can ever default on. */
+static float    g_moe_thin_alpha = -1.0f;   /* <0 = env unread */
+static uint32_t g_moe_thin_topk;
+/* Wave 68: only thin batches with >= this many tokens.  Routed-MoE batches come
+ * in two shapes: large prefill chunks (hundreds-thousands of tokens) and small
+ * copy-spec verify batches (<= COPY_SPEC_DRAFT, 64) / single-token decode (1).
+ * Thinning the verify/decode path changes the greedy argmax and collapses
+ * copy-spec verbatim acceptance (wave 67: code-edit tok/call 5.39->1.1, decode
+ * -27%).  Setting MIN_TOKENS above the verify cap (e.g. 128) makes thinning
+ * prefill-only: it keeps the +30% prefill IO win while leaving copy-spec decode
+ * byte-identical.  Default 1 = thin every batch (preserves the wave-66 knob). */
+static uint32_t g_moe_thin_min_tokens = 1u;
+/* Wave 69: upper gate, complement of min_tokens.  0 = no cap (legacy).  Set to 1
+ * to thin ONLY single-token decode (n_tokens==1).  In copy-spec mode that is
+ * exactly the no-match bare round: matched positions ride a verify batch
+ * (n_tokens = 1+n_copy >= 2) which stays full top-k / byte-identical, so
+ * copy-spec verbatim acceptance is preserved (the wave-67 collapse came from
+ * thinning the verify batch; this avoids it).  Run-A measured no-match decode is
+ * SSD-bound on cold expert gathers (pread 96-140ms/cold-layer); halving picks
+ * there cuts that IO where copy-spec cannot help.  Quality bet on the novel
+ * tokens only.  Default 0 => unchanged. */
+static uint32_t g_moe_thin_max_tokens = 0u;
+
+static void ds4_gpu_moe_thin_init(void) {
+    if (g_moe_thin_alpha >= 0.0f) return;
+    const char *a = getenv("DS4_METAL_MOE_THIN_ALPHA");
+    const char *k = getenv("DS4_METAL_MOE_THIN_TOPK");
+    const char *m = getenv("DS4_METAL_MOE_THIN_MIN_TOKENS");
+    const char *x = getenv("DS4_METAL_MOE_THIN_MAX_TOKENS");
+    float av = (a && *a) ? (float)atof(a) : 0.0f;
+    g_moe_thin_alpha = av > 0.0f ? av : 0.0f;
+    g_moe_thin_topk  = (k && *k) ? (uint32_t)strtoul(k, NULL, 10) : 0u;
+    g_moe_thin_min_tokens = (m && *m) ? (uint32_t)strtoul(m, NULL, 10) : 1u;
+    if (g_moe_thin_min_tokens < 1u) g_moe_thin_min_tokens = 1u;
+    g_moe_thin_max_tokens = (x && *x) ? (uint32_t)strtoul(x, NULL, 10) : 0u;
+    if (g_moe_thin_alpha > 0.0f || g_moe_thin_topk > 0u) {
+        fprintf(stderr,
+                "ds4: MoE activation thinning enabled (alpha=%.4f topk=%u min_tokens=%u max_tokens=%u) -- quality bet, "
+                "gate with q1..q4 + --logprob-vectors\n",
+                g_moe_thin_alpha, g_moe_thin_topk, g_moe_thin_min_tokens, g_moe_thin_max_tokens);
+    }
+}
+
+static inline int ds4_gpu_moe_thin_enabled(void) {
+    ds4_gpu_moe_thin_init();
+    return (g_moe_thin_alpha > 0.0f || g_moe_thin_topk > 0u) ? 1 : 0;
+}
+
+/* Rewrite selectedbuf/weightsbuf in place on the CPU.  Must be called after the
+ * routing kernels are drained (selectedbuf CPU-valid) and before the gather/union
+ * and before the swiglu/mm_id GEMM is encoded (they re-read both buffers).  No-op
+ * unless a thinning gate is set, or unless either buffer is not Shared. n_expert<=6. */
+static void ds4_gpu_moe_thin_picks(id<MTLBuffer> selectedbuf, NSUInteger selected_off,
+                                   id<MTLBuffer> weightsbuf, NSUInteger weights_off,
+                                   uint32_t n_tokens, uint32_t n_expert) {
+    if (!ds4_gpu_moe_thin_enabled()) return;
+    if (n_expert <= 1u || n_tokens == 0u) return;
+    if (n_tokens < g_moe_thin_min_tokens) return;   /* prefill-only gate (wave 68) */
+    if (g_moe_thin_max_tokens != 0u && n_tokens > g_moe_thin_max_tokens) return; /* no-match-decode-only gate (wave 69) */
+    if (!selectedbuf || !weightsbuf) return;
+    if (selectedbuf.storageMode != MTLStorageModeShared ||
+        weightsbuf.storageMode != MTLStorageModeShared) return;
+    int32_t *sel = (int32_t *)((uint8_t *)selectedbuf.contents + (size_t)selected_off);
+    float   *wt  = (float   *)((uint8_t *)weightsbuf.contents  + (size_t)weights_off);
+    const float    alpha = g_moe_thin_alpha;
+    const uint32_t topk  = g_moe_thin_topk;
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        int32_t *s = sel + (size_t)t * n_expert;
+        float   *w = wt  + (size_t)t * n_expert;
+        uint32_t top1 = 0;
+        float    top1w = w[0];
+        float    sum_all = w[0];
+        for (uint32_t i = 1; i < n_expert; i++) {
+            sum_all += w[i];
+            if (w[i] > top1w) { top1w = w[i]; top1 = i; }
+        }
+        if (!(top1w > 0.0f) || !(sum_all > 0.0f)) continue;  /* degenerate: leave token */
+        const int32_t top1_id = s[top1];
+        const float   thresh  = alpha * top1w;
+        float    sum_kept = 0.0f;
+        uint32_t kept     = 0;
+        for (uint32_t i = 0; i < n_expert; i++) {
+            int drop = 0;
+            if (i != top1) {
+                if (alpha > 0.0f && w[i] < thresh) drop = 1;
+                if (topk > 0u) {
+                    uint32_t greater = 0;   /* picks strictly ahead of i (ties -> lower index wins) */
+                    for (uint32_t j = 0; j < n_expert; j++)
+                        if (w[j] > w[i] || (w[j] == w[i] && j < i)) greater++;
+                    if (greater >= topk) drop = 1;
+                }
+            }
+            if (drop) {
+                s[i] = top1_id;   /* alias an expert the union already gathers */
+                w[i] = 0.0f;
+            } else {
+                sum_kept += w[i];
+                kept++;
+            }
+        }
+        if (kept < n_expert && sum_kept > 0.0f) {
+            const float scale = sum_all / sum_kept;   /* preserve original routed mass */
+            for (uint32_t i = 0; i < n_expert; i++)
+                if (w[i] != 0.0f) w[i] *= scale;
+        }
+    }
+}
+
+/* P-OVL (expert-half overlap, bit-exact): split a verify batch's active expert
+ * set into two disjoint scratch slot-ranges, commit pass 0 (GPU starts), then
+ * gather pass 1 on the CPU while the GPU runs pass 0 -- the routed-expert disk
+ * gather (the decode bottleneck) overlaps the GEMM.  Default OFF: it only
+ * restructures the mm_id verify path, leaving the 3.77 baseline byte-identical
+ * until DS4_METAL_MOE_OVERLAP=1. */
+static int ds4_gpu_moe_overlap_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = ds4_gpu_env_bool("DS4_METAL_MOE_OVERLAP") > 0 ? 1 : 0;
+        if (cached) {
+            fprintf(stderr,
+                    "ds4: routed-MoE expert-half overlap enabled "
+                    "(DS4_METAL_MOE_OVERLAP=1, bit-exact two-pass)\n");
+        }
+    }
+    return cached;
+}
+
+/* Below this active-expert count a split is not worth a second CB commit
+ * (the gather is tiny and the flush overhead dominates); fall back to the
+ * single-pass path.  A/B via DS4_METAL_MOE_OVERLAP_MIN_EXPERTS. */
+static uint32_t ds4_gpu_moe_overlap_min_experts(void) {
+    static uint32_t cached;
+    static int init;
+    if (!init) {
+        uint64_t v = ds4_gpu_env_u64("DS4_METAL_MOE_OVERLAP_MIN_EXPERTS", 8u);
+        if (v < 2u) v = 2u;
+        if (v > 1024u) v = 1024u;
+        cached = (uint32_t)v;
+        init = 1;
+    }
+    return cached;
+}
+
+/* Number of overlap passes (slot-range chunks).  Total decode forward time ~=
+ * T_gather + T_gpu/N: each extra pass hides another 1/N of the GEMM behind the
+ * disk gather (the physical floor), at the cost of one more CB commit + one
+ * more full-pair_rows swiglu + an N-times-larger empty-expert dispatch grid.
+ * Default 2 = the wave-41 validated behavior; A/B 3/4 to chase the knee. */
+static uint32_t ds4_gpu_moe_overlap_passes(void) {
+    static uint32_t cached;
+    static int init;
+    if (!init) {
+        uint64_t v = ds4_gpu_env_u64("DS4_METAL_MOE_OVERLAP_PASSES", 2u);
+        if (v < 1u) v = 1u;
+        if (v > 8u) v = 8u;
+        cached = (uint32_t)v;
         init = 1;
     }
     return cached;
@@ -17795,6 +18063,7 @@ static int ds4_gpu_expert_stage_enabled(void) {
     return cached;
 }
 
+
 /* Arm a staging slot for a freshly predicted layer.  Callable from the
  * prediction thread (score routing) and the graph thread (token-hash routing
  * hook), so the whole re-arm is serialized by a mutex. */
@@ -18504,7 +18773,10 @@ static int ds4_gpu_expert_remote_fetch_slots(void) {
     const int port = (int)ds4_gpu_env_u64("DS4_DIST_EXPERT_FETCH_PORT", 5606u);
     int conns = (int)ds4_gpu_env_u64("DS4_DIST_EXPERT_FETCH_CONNS", 3u);
     if (conns > 8) conns = 8;
-    const int n = ds4_dist_expert_fetch_client_init(host, port, conns, g_model_map_size);
+    /* Handshake against the BASE model size (efetch serves the ~81 GiB GGUF),
+     * not g_model_map_size which the MTP draft load overwrites with 2.14 GiB. */
+    const uint64_t efetch_size = g_efetch_model_size ? g_efetch_model_size : g_model_map_size;
+    const int n = ds4_dist_expert_fetch_client_init(host, port, conns, efetch_size);
     for (int i = 0; i < n; i++) {
         pthread_t th;
         if (pthread_create(&th, NULL, ds4_gpu_expert_remote_fetch_worker,
@@ -18553,7 +18825,8 @@ static void *ds4_gpu_expert_remote_fetch_kick_main(void *arg) {
             const int port = atoi(aport);
             int conns = (int)ds4_gpu_env_u64("DS4_DIST_EXPERT_FETCH_CONNS", 3u);
             if (conns > 8) conns = 8;
-            const int n = ds4_dist_expert_fetch_accept_init(port, conns, g_model_map_size);
+            const int n = ds4_dist_expert_fetch_accept_init(port, conns,
+                              g_efetch_model_size ? g_efetch_model_size : g_model_map_size);
             for (int i = 0; i < n; i++) {
                 pthread_t th;
                 if (pthread_create(&th, NULL, ds4_gpu_expert_remote_fetch_worker,
@@ -18659,11 +18932,43 @@ static int ds4_gpu_expert_gather_pool_run(ds4_metal_expert_gather_ctx *ctx, uint
     return created == (int)nth ? ctx->ok : 0;
 }
 
-static int ds4_gpu_load_layer_experts_to_scratch(
+/* Ensure the three routed-MoE expert scratch buffers are sized for n_active
+ * expert slots (grow-and-keep). */
+static int ds4_gpu_ensure_moe_scratch(uint32_t n_active,
+                                      uint64_t gate_expert_bytes,
+                                      uint64_t down_expert_bytes) {
+    const uint64_t gate_total = (uint64_t)n_active * gate_expert_bytes;
+    const uint64_t down_total = (uint64_t)n_active * down_expert_bytes;
+    if (n_active == 0 || gate_total > NSUIntegerMax || down_total > NSUIntegerMax) return 0;
+    return ds4_gpu_ensure_scratch_buffer(&g_moe_scratch_gate,
+                                         &g_moe_scratch_gate_bytes,
+                                         (NSUInteger)gate_total,
+                                         "ds4_moe_scratch_gate") &&
+           ds4_gpu_ensure_scratch_buffer(&g_moe_scratch_up,
+                                         &g_moe_scratch_up_bytes,
+                                         (NSUInteger)gate_total,
+                                         "ds4_moe_scratch_up") &&
+           ds4_gpu_ensure_scratch_buffer(&g_moe_scratch_down,
+                                         &g_moe_scratch_down_bytes,
+                                         (NSUInteger)down_total,
+                                         "ds4_moe_scratch_down");
+}
+
+/* Core expert gather: stream the n_active experts named by active_ids[] into
+ * the caller-provided gate/up/down destination buffers (expert at index i lands
+ * at slot i, i.e. dst + (uint64_t)i*expert_bytes).  The destination is a
+ * parameter so the P-OVL two-pass path can gather a disjoint slot sub-range of
+ * the shared scratch -- call with (active_ids + lo, dst + lo*expert_bytes,
+ * n_active = hi - lo) and the per-unit workers (slot = unit/3) land each expert
+ * at its global scratch slot without needing any range awareness themselves. */
+static int ds4_gpu_gather_experts_run(
         const void *model_map,
         uint32_t    layer_index,
         uint32_t    n_active,
         const uint32_t *active_ids,
+        uint8_t    *gate_dst,
+        uint8_t    *up_dst,
+        uint8_t    *down_dst,
         uint64_t    gate_offset,
         uint64_t    up_offset,
         uint64_t    down_offset,
@@ -18671,30 +18976,9 @@ static int ds4_gpu_load_layer_experts_to_scratch(
         uint64_t    down_expert_bytes,
         uint32_t    n_expert_total) {
     if (!model_map || n_expert_total == 0 || !active_ids || n_active == 0) return 0;
-    const uint64_t gate_total = (uint64_t)n_active * gate_expert_bytes;
-    const uint64_t down_total = (uint64_t)n_active * down_expert_bytes;
-    if (gate_total > NSUIntegerMax || down_total > NSUIntegerMax) return 0;
-
-    if (!ds4_gpu_ensure_scratch_buffer(&g_moe_scratch_gate,
-                                       &g_moe_scratch_gate_bytes,
-                                       (NSUInteger)gate_total,
-                                       "ds4_moe_scratch_gate") ||
-        !ds4_gpu_ensure_scratch_buffer(&g_moe_scratch_up,
-                                       &g_moe_scratch_up_bytes,
-                                       (NSUInteger)gate_total,
-                                       "ds4_moe_scratch_up") ||
-        !ds4_gpu_ensure_scratch_buffer(&g_moe_scratch_down,
-                                       &g_moe_scratch_down_bytes,
-                                       (NSUInteger)down_total,
-                                       "ds4_moe_scratch_down")) {
-        return 0;
-    }
+    if (!gate_dst || !up_dst || !down_dst) return 0;
 
     const uint8_t *map = (const uint8_t *)model_map;
-    uint8_t *gate_dst = (uint8_t *)g_moe_scratch_gate.contents;
-    uint8_t *up_dst = (uint8_t *)g_moe_scratch_up.contents;
-    uint8_t *down_dst = (uint8_t *)g_moe_scratch_down.contents;
-    if (!gate_dst || !up_dst || !down_dst) return 0;
 
     /* Resolve cached env switches here, on the serial entry path, so the
      * lazily-initialized statics never race with gather worker threads. */
@@ -18794,6 +19078,29 @@ static int ds4_gpu_load_layer_experts_to_scratch(
     }
     g_gather_active = 0;
     return ctx.ok;
+}
+
+/* Gather the full active set into the shared MoE scratch at slots [0, n_active).
+ * Thin wrapper preserving the original signature/behavior (ensure scratch, then
+ * gather into g_moe_scratch_*). */
+static int ds4_gpu_load_layer_experts_to_scratch(
+        const void *model_map,
+        uint32_t    layer_index,
+        uint32_t    n_active,
+        const uint32_t *active_ids,
+        uint64_t    gate_offset,
+        uint64_t    up_offset,
+        uint64_t    down_offset,
+        uint64_t    gate_expert_bytes,
+        uint64_t    down_expert_bytes,
+        uint32_t    n_expert_total) {
+    if (!ds4_gpu_ensure_moe_scratch(n_active, gate_expert_bytes, down_expert_bytes)) return 0;
+    return ds4_gpu_gather_experts_run(model_map, layer_index, n_active, active_ids,
+                                      (uint8_t *)g_moe_scratch_gate.contents,
+                                      (uint8_t *)g_moe_scratch_up.contents,
+                                      (uint8_t *)g_moe_scratch_down.contents,
+                                      gate_offset, up_offset, down_offset,
+                                      gate_expert_bytes, down_expert_bytes, n_expert_total);
 }
 
 /* ---- project.md P1.2: prefill full-layer sequential streaming ----
@@ -19222,6 +19529,10 @@ int ds4_gpu_routed_moe_one_tensor(
                                                      (size_t)ds4_gpu_tensor_offset(x));
                 ds4_gpu_expert_prefetch_enqueue(layer_index + 1u, x_cpu, expert_in_dim);
             }
+            /* §2.4/§3.5 降激活 (decode single token): thin picks before the union so
+             * the per-token expert IO drops toward the W3 ceiling.  Default OFF => no-op. */
+            ds4_gpu_moe_thin_picks(selectedbuf, selected_off, weightsbuf,
+                                   ds4_gpu_tensor_offset(weights), 1u, n_expert);
             uint32_t active_ids[1024];
             uint32_t n_active = 0;
             int compact_ok = ds4_gpu_compact_selected_experts(selectedbuf,
@@ -19636,6 +19947,11 @@ int ds4_gpu_routed_moe_batch_tensor(
         g_wrap_mlock_suppress = 0;
         if (!gate_buf || !up_buf || !down_buf) return 0;
         uint32_t source_n_total_expert = n_total_expert;
+        /* P-OVL state hoisted to function scope: the encode block must read the
+         * active expert set when the two-pass overlap defers the byte gather. */
+        uint32_t active_ids[1024];
+        uint32_t n_active = 0;
+        bool moe_overlap_active = false;
 
         /* DS4_METAL_EXPERT_OFFLOAD is meant for the full q2 target model, whose
          * routed experts are deliberately non-resident and must be gathered into
@@ -19679,8 +19995,12 @@ int ds4_gpu_routed_moe_batch_tensor(
                 ds4_gpu_expert_prefetch_enqueue_batch(layer_index + 1u, x_cpu,
                                                       expert_in_dim, n_tokens);
             }
-            uint32_t active_ids[1024];
-            uint32_t n_active = 0;
+            /* §2.4/§3.5 降激活: thin per-token picks before the union is built so the
+             * gather (and the dominant per-token expert IO) shrinks.  selectedbuf is
+             * CPU-valid here (drained above when batched; the non-batched path already
+             * reads it via collect below).  Default OFF => byte-identical no-op. */
+            ds4_gpu_moe_thin_picks(selectedbuf, selected_off, weightsbuf,
+                                   ds4_gpu_tensor_offset(weights), n_tokens, n_expert);
             const uint64_t total_picks_u64 = (uint64_t)n_tokens * n_expert;
             if (total_picks_u64 > UINT32_MAX) {
                 if (was_batched) (void)ds4_gpu_begin_commands();
@@ -19698,13 +20018,27 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                             &n_active);
             if (io_profile) ds4_gpu_expert_io_prof_reset();
             const double gather_t0 = io_profile ? ds4_gpu_now_ms() : 0.0;
+            /* P-OVL eligibility: the expert-half overlap only applies to the
+             * mm_id verify shape (batched, n_expert>1, n_tokens at/above the
+             * grouped-GEMM threshold) with enough active experts to split.  When
+             * it fires the byte gather is deferred to the per-pass encode below
+             * and the stream/pool/source-cache paths are skipped. */
+            moe_overlap_active =
+                compact_ok &&
+                ds4_gpu_moe_overlap_enabled() &&
+                was_batched &&
+                !g_quality_mode &&
+                n_expert > 1u &&
+                n_tokens >= ds4_gpu_moe_mm_id_min() &&
+                ds4_gpu_mul_mm_id_map0_name(n_expert) != NULL &&
+                n_active >= ds4_gpu_moe_overlap_min_experts();
             /* P1.2: a big prefill chunk activates nearly every expert of the
              * layer, so ~256 scattered reads degenerate to random IO.  Stream
              * the whole gate/up/down tensors sequentially instead and keep the
              * original expert ids (selected buffer untouched, kernels index
              * the full-layer scratch exactly like the resident direct path). */
             int stream_used = 0;
-            if (compact_ok && n_tokens > 1u && !g_expert_pool_warm_batch &&
+            if (compact_ok && !moe_overlap_active && n_tokens > 1u && !g_expert_pool_warm_batch &&
                 gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
                 down_type == DS4_METAL_TENSOR_Q2_K &&
                 ds4_gpu_expert_stream_enabled() &&
@@ -19728,7 +20062,7 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                              n_active);
             }
             int pool_used = 0;
-            if (!stream_used && compact_ok && g_expert_pool_warm_batch &&
+            if (!stream_used && !moe_overlap_active && compact_ok && g_expert_pool_warm_batch &&
                 gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
                 down_type == DS4_METAL_TENSOR_Q2_K) {
                 pool_used = ds4_gpu_try_load_layer_experts_to_pool(model_map,
@@ -19749,6 +20083,9 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                                    &down_buf,
                                                                    &source_n_total_expert);
             }
+            /* source-cache note is just bookkeeping + (hard_copy) admit, not a
+             * gather: run it for the overlap path too so the per-pass gather
+             * below hits the RAM hard copies via hard_find. */
             if (!stream_used && compact_ok && !pool_used &&
                 gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
                 down_type == DS4_METAL_TENSOR_Q2_K) {
@@ -19764,7 +20101,7 @@ int ds4_gpu_routed_moe_batch_tensor(
             }
             const double copy_t0 = (!pool_used && !stream_used && ds4_gpu_expert_profile_is_enabled()) ?
                 ds4_gpu_now_ms() : 0.0;
-            int load_ok = compact_ok && (stream_used || pool_used ||
+            int load_ok = compact_ok && (stream_used || pool_used || moe_overlap_active ||
                           ds4_gpu_load_layer_experts_to_scratch(model_map,
                                                                  layer_index,
                                                                  n_active,
@@ -19775,6 +20112,13 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                                  gate_expert_bytes,
                                                                  down_expert_bytes,
                                                                  n_total_expert));
+            /* P-OVL defers the byte gather to the per-pass encode: size the
+             * shared scratch now so the per-pass range gathers (slots [lo,hi))
+             * have valid destination addresses. */
+            if (load_ok && moe_overlap_active &&
+                !ds4_gpu_ensure_moe_scratch(n_active, gate_expert_bytes, down_expert_bytes)) {
+                load_ok = 0;
+            }
             if (io_profile) {
                 ds4_gpu_expert_io_prof_report("batch",
                                               stream_used ? "stream" :
@@ -19854,16 +20198,7 @@ int ds4_gpu_routed_moe_batch_tensor(
          * gap. Default lowered to 8 (A/B: DS4_METAL_MOE_MM_ID_MIN=32 restores
          * the old split, =0 forces never).
          */
-        static uint32_t mm_id_min_cached;
-        static int mm_id_min_init;
-        if (!mm_id_min_init) {
-            uint64_t v = ds4_gpu_env_u64("DS4_METAL_MOE_MM_ID_MIN", 8u);
-            if (v == 0) v = UINT32_MAX;     /* 0 = never use mm_id */
-            if (v < 2u) v = 2u;
-            mm_id_min_cached = (uint32_t)(v > UINT32_MAX ? UINT32_MAX : v);
-            mm_id_min_init = 1;
-        }
-        const bool use_mm_id = n_tokens >= mm_id_min_cached &&
+        const bool use_mm_id = n_tokens >= ds4_gpu_moe_mm_id_min() &&
                                ds4_gpu_mul_mm_id_map0_name(n_expert) != NULL;
         /*
          * Speculative verification is neither normal decode nor large prefill:
@@ -19996,6 +20331,90 @@ int ds4_gpu_routed_moe_batch_tensor(
             n_tokens <= 4u &&
             down_sum6_pipeline != nil;
         int ok = 0;
+        if (moe_overlap_active) {
+            /*
+             * P-OVL (bit-exact expert N-way overlap).  Partition the active
+             * expert set into N disjoint scratch slot-ranges.  Gather + encode
+             * pass p, COMMIT it so the GPU starts, then gather pass p+1 on the
+             * CPU while the GPU runs pass p -- the routed-expert disk gather
+             * (the decode bottleneck) overlaps the GEMM (total ~= T_gather +
+             * T_gpu/N).  The mm_id slot-range gate guarantees pass p's GEMM
+             * never reads outside [lo,hi), so the disjoint CPU writes during the
+             * next pass's gather do not alias the in-flight reads.  Each pass
+             * writes only its own picks' rows in the per-pair expert output
+             * buffer; the single sum_experts (fixed 6-pick order) makes the
+             * result bit-identical to the single-pass path.  swiglu runs over
+             * all pair_rows each pass: the other passes' rows are garbage but
+             * unread by this pass's slot-gated down GEMM, and are recomputed
+             * identically before being consumed.
+             */
+            const bool ov_mid_f16 = use_mm_id && !g_quality_mode && request_mid_f16;
+            if (mid_is_f16) *mid_is_f16 = ov_mid_f16;
+            id<MTLBuffer> ov_down_dst = expertsbuf;
+            const NSUInteger ov_down_dst_off = ds4_gpu_tensor_offset(experts);
+            uint32_t ov_passes = ds4_gpu_moe_overlap_passes();
+            if (ov_passes > n_active) ov_passes = n_active;   /* >= 1 expert per pass */
+            if (ov_passes < 1u) ov_passes = 1u;
+            ok = 1;
+            for (uint32_t pass = 0; pass < ov_passes && ok; pass++) {
+                const uint32_t lo = (uint32_t)((uint64_t)pass * n_active / ov_passes);
+                const uint32_t hi = (uint32_t)((uint64_t)(pass + 1u) * n_active / ov_passes);
+                if (lo >= hi) continue;
+                /* CPU/disk gather of this pass's experts into scratch slots
+                 * [lo,hi).  For passes after the first this runs while the GPU
+                 * executes the committed previous pass; the slot-range gate
+                 * keeps the regions disjoint so there is no read/write alias. */
+                if (!ds4_gpu_gather_experts_run(model_map, layer_index, hi - lo,
+                                                active_ids + lo,
+                                                (uint8_t *)g_moe_scratch_gate.contents + (uint64_t)lo * gate_expert_bytes,
+                                                (uint8_t *)g_moe_scratch_up.contents + (uint64_t)lo * gate_expert_bytes,
+                                                (uint8_t *)g_moe_scratch_down.contents + (uint64_t)lo * down_expert_bytes,
+                                                gate_offset, up_offset, down_offset,
+                                                gate_expert_bytes, down_expert_bytes,
+                                                n_total_expert)) {
+                    ok = 0;
+                    break;
+                }
+                gate_map_args.slot_lo = (int32_t)lo;
+                gate_map_args.slot_hi = (int32_t)hi;
+                ok = ds4_gpu_encode_mul_mm_id_map(cb, map_pipeline, &gate_map_args,
+                                                  &gate_mm_args, selectedbuf,
+                                                  ds4_gpu_tensor_offset(selected));
+                if (ok) ok = ds4_gpu_encode_mul_mm_id_mapped_tile(cb, gate_mm_pipeline,
+                                &gate_mm_args, gate_buf, (NSUInteger)gate_inner,
+                                xbuf, ds4_gpu_tensor_offset(x), gatebuf,
+                                ds4_gpu_tensor_offset(gate));
+                if (ok) ok = ds4_gpu_encode_mul_mm_id_mapped_tile(cb, up_mm_pipeline,
+                                &gate_mm_args, up_buf, (NSUInteger)up_inner,
+                                xbuf, ds4_gpu_tensor_offset(x), upbuf,
+                                ds4_gpu_tensor_offset(up));
+                if (ok) ok = ds4_gpu_encode_moe_swiglu_weight(cb, gatebuf,
+                                ds4_gpu_tensor_offset(gate), upbuf,
+                                ds4_gpu_tensor_offset(up), midbuf,
+                                ds4_gpu_tensor_offset(mid), weightsbuf,
+                                ds4_gpu_tensor_offset(weights), expert_mid_dim,
+                                pair_rows, clamp, ov_mid_f16);
+                if (ok) ok = ds4_gpu_encode_mul_mm_id_mapped_tile(cb, down_mm_pipeline,
+                                &down_mm_args, down_buf, (NSUInteger)down_inner,
+                                midbuf, ds4_gpu_tensor_offset(mid), ov_down_dst,
+                                ov_down_dst_off);
+                if (ok && pass + 1u < ov_passes) {
+                    /* Commit this pass (async; GPU starts) and reopen the batch
+                     * so the next pass's CPU gather overlaps the running GPU. */
+                    if (!ds4_gpu_flush_commands()) { ok = 0; break; }
+                    cb = ds4_gpu_command_buffer(&owned);
+                    if (!cb) { ok = 0; break; }
+                }
+            }
+            if (ok) {
+                ok = ds4_gpu_encode_moe_sum_experts(cb, ov_down_dst, ov_down_dst_off,
+                                                    outbuf, ds4_gpu_tensor_offset(out),
+                                                    out_dim, n_expert, n_tokens);
+            }
+            if (!ok) return 0;
+            if (!ds4_gpu_finish_command_buffer(cb, owned, "routed batch MoE")) return 0;
+            return 1;
+        }
         if (use_mm_id) {
             /*
              * The routed pair ids are the same for gate, up, and down. Build

@@ -1509,6 +1509,10 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     return 1;
 }
 
+/* Metal-only residency hint (see ds4_gpu.h); CUDA uses an HBM-cache model and
+ * ignores it. No-op so the shared core links against either backend. */
+extern "C" void ds4_gpu_set_model_map_nonresident_hint(int on) { (void)on; }
+
 extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes) {
     (void)max_tensor_bytes;
     if (!ds4_gpu_set_model_map(model_map, model_size)) return 0;

@@ -10,10 +10,11 @@
   （2026-06-10 设定更新：两台都放宽到 12G，合计 24G；worker 由 8G→12G，红利已投入
   worker backbone mlock 5120MB + 硬预算 12000MB，见第三十二波。）
 - 模型：**必须用 `gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf`（81GiB q2 全量）**。
-- 目标：200K 上下文，Claude Code 可用；用户期望 80 t/s。
+- 目标：200K 上下文，Claude Code 可用；**用户期望 30 t/s（编程域有效 t/s；2026-06-17 从 80 修正）**。
 - 验证：`tools/mtp_pipe_q2_speed.sh`；日志 `/tmp/mtp_pipe_coord.log|.out`、worker `192.168.1.2:/tmp/mtp_pipe_worker.log`、build 日志同前。
-- 现状（2026-06-10 最新一轮）：**prefill 0.78 t/s / generation 0.77–0.81 t/s**，
-  拓扑 `0:19 / 20:output`，A3 CPU-gather + 源专家 LRU（本轮命中 0%），`DS4_DIST_PREFILL_CAP=128`。
+- 现状（2026-06-17）：**code-edit gen 3.77 t/s / smoke gen ~2.05–2.17 t/s / prefill ~10–12 t/s**（逐波实测见 `log.md`），
+  拓扑 `0:19 / 20:output`，A3 流式 gather + overlap N=2 + copy-spec（code-edit fire 70%），`DS4_DIST_PREFILL_CAP=2048`。
+  （起点基线 2026-06-10：prefill 0.78 / gen 0.77–0.81。）
 
 ## 1. 物理上限审计（先认账，再谈方案）
 
@@ -41,40 +42,61 @@ racing 只在 ≥96 单元的大批形态下两盘并行才稳赚。
 两台 16GB Mac 差 ~40× 内存、~4–6× 带宽。该量级只存在于 M3/M4 Ultra 192GB（~800GB/s）单机或全驻留小模型。
 （旁注：`gguf/ds4flash-k16-v2.gguf` 13GiB 同为 q2 量化，双机全驻留理论 10–18 t/s——P4 决策门备选。）
 
-**本方案的诚实目标阶梯（q2 全量模型不变）：**
+**30 t/s 判定（2026-06-17，目标从 80 修正为 30）：单次前向 decode 不可达，但编程域"有效 t/s"可达（stretch）。**
+单前向天花板由 **W3 backbone 带宽墙** 决定（不是 SSD）：coord 4.07GiB÷120GB/s≈34ms + worker 4.4GiB÷(68–200GB/s)≈22–65ms，
+自回归单 token 是 coord→worker **串行** ≈ 56–99ms ⇒ **10–18 t/s**——这是**专家全部免费驻留（零 SSD IO）下**的上限，
+所以即便把 W1/W2 容量/SSD 墙彻底消掉，纯解码 30 仍在墙外。**唯一到 30 的物理路径 = §3.5 编程域有效 t/s**
+（copy-spec 多 token/前向 + 前缀复用少前向 + 降激活越过单前向墙），且只在 echo 重的编辑回合成立，非跨回合稳态。
+
+## 1.5 bit-exact 上限审计（2026-06-14，第三十八波，code-edit 3.77 跑实证）
+
+7 连波把 code-edit 0.81→3.77。第三十七波后做了一次彻底审计，**实测数字证明 q2 双机已触及"保正确性(bit-exact)上限"**，剩余只有违反对拍门的杠杆。逐条：
+
+1. **IO work-stealing 分配已达带宽最优**（不是估计，是闭式验证）。verify 批每层本地 pread + 远程
+   efetch 抢同一 cursor，自然按盘速分流。worker 批：总 30813MiB/wall 4508ms=6.67GB/s 聚合；
+   最优分配应满足 local/5.2 = remote/1.62 ⇒ local=23493/remote=7320，**实测 23512/7301**。
+   coord 批：local(mini本地)3.07 ≈ remote(worker经TB)3.12GB/s ⇒ 最优~50/50，**实测 14789/15056**。
+   两台都正落在带宽最优点 ⇒ 重新分流无收益。
+2. **walls 贴物理盘+TB 顶**：coord ~6.0GB/s（mini本地+worker经TB），worker ~6.7GB/s（worker本地+mini经TB）。
+   再快需要更快的盘或更宽的 TB（硬件）。
+3. **drain 是 GEMM / M1-GPU 墙**：verify drain ≈1.4ms/token/层（mm_id 自 wave-23 已调优）；
+   smoke 的 worker decode gather wall 4121ms@10.8GB/s(背景 madvise 已暖页) **< drain 6100ms(GPU)**
+   ⇒ worker decode 是 M1 GPU 算力受限，gather 已被隐藏，无可重叠。
+4. **重叠的可行性（2026-06-14 修正，原结论有误）**：
+   - **跨机 token 流水**：把 33-token 批拆 2 chunk 跨机流水，实算 dilution(walls×1.49)>overlap ⇒
+     4204ms > 单批 4065ms，**净亏**（用真实带宽数算的，不是旧估计）。排除。
+   - **层内专家分半重叠 = 唯一有效杠杆，且 BIT-EXACT**（修正：原以为破坏浮点结合律，错）：
+     MoE 的专家求和（`ds4_gpu_encode_moe_sum6`/`sum_experts`）是**按每 token 的 6 个 pick 固定顺序**
+     累加；`remap_selected_to_slots` 把每 pick 改写为紧凑 scratch 的 slot，mm_id 是 expert-major。
+     按 **slot 区间** 把 union 分两组（pass1 处理 slot[0,h)、pass2 处理 slot[h,n_active)），
+     每个 `(token,pick)` 的 down 值逐位不变、写入其固定行，最后**一次** sum_experts 顺序不变
+     ⇒ **逐位一致，过 `--dump-logprobs` 严格对拍门**。重叠点：pass2 的 gather(磁盘) 与 pass1 的
+     GEMM(GPU) 并行（两块独立 scratch，GPU 读 scratchA 时 CPU 填 scratchB，无别名）。
+     潜在收益：把 drain(~45% of r2) 藏到 walls 后 ⇒ r2 5679→~max(walls,drain) 区间 ⇒ **~15-17%**。
+   - **跨层重叠**（gather L+1 ∥ drain L）：bit-exact，但 L+1 路由数据依赖 ⇒ 需预测；coord 侧
+     staging(从 worker 快盘)已在做(73%命中)，worker 侧只能从 mini 慢盘预测 ⇒ 第三十三波已证净亏。
+5. **结论修正**：仍有一个 **bit-exact** 大杠杆——层内专家分半重叠（P-OVL）。**不需要放宽正确性契约**。
+   它是对最热函数 `ds4_gpu_routed_moe_batch_tensor` 的较大改造，**第四十～四十一波已落地**（默认 OFF）：
+   - **单 scratch 不相交 slot 区间**（非双 scratch）：pass0 填 `[0,half)`、pass1 填 `[half,n_active)`，
+     写不相交 ⇒ wave-40 的 slot 区间门保证 GPU 读 pass0 区间时 CPU 填 pass1 区间无别名，**内存中性**。
+   - `flush_commands` 异步提交 pass0（GPU 开跑）让 pass1 的 CPU gather 与之重叠；gather dst 参数化后
+     range-gather 不需改 worker（`active_ids+lo`/`dst+lo*bytes`/`n=hi-lo`）。
+   - 自包含 overlap 分支（提前 `return`，linear 路径字节不变）。`make`+`metal-kernels`+`server` 绿。
+   验收：`DS4_METAL_MOE_OVERLAP=1` 下 `--dump-logprobs` 对 A3 基线逐位一致 + A/B 速度（先 OFF 保 3.77，
+   验证后再默认 ON）。预期 +7~17%（受 `T_gpu/2` 约束：gather 是物理地板，重叠只藏 GPU 计算）。
+
+**本方案的诚实目标阶梯（q2 全量模型不变）：** 当前 code-edit 实测 **3.77 t/s**，用户目标 **30 t/s（编程域有效 t/s）**；逐波实测进展（M0.5 起逐波 + §第五十八波结论）已迁出至 [`log.md`](log.md)。
 
 | 里程碑 | decode | prefill | 依赖 |
 |---|---|---|---|
 | M0 起点 | 0.81 | 0.78 | — |
-| M0.5 实测（2026-06-10 第一波后） | 1.56 | 2.95 | P1.1 pread + 排序（短 prompt 未触发 P1.2 流式） |
-| M1 达成实测（第三波后） | 1.70 | 3.07 | + P2.1 礼让式预取（pf 79.6%）；M1 门 decode ≥1.6 ✅ |
-| 第六波实测（P2.2 低成本变体） | 1.81 | 4.80 | + 远程专家字节服务（rfetch 8.4MiB/层，coord wall 13.7→11.5） |
-| 第九波实测（预测驱动远程暂存） | 1.99 | 4.81 | staging hit 21.8MiB/层（54% 走 RAM），coord wall 8.91 |
-| 第十一波实测（在途等待+TOP 预算） | 2.00 | 4.99 | coord/worker 半程 249/248ms 完美平衡 |
-| **第十四波实测（哈希层精确暂存）** | **2.03** | 4.65 | 层 0–2 为 token 哈希路由（tid2eid 查表=100% 可知）；L2 完美形态 cold=0/wall=1.3ms |
-| 第十六/十七波（负结果已回滚） | 1.79/1.80 | — | keepalive 与就绪度门控均 -12%（门控引发 racing 级联、饿死 lookahead）；代码已恢复 2.03 基线 |
-| **单 token 地板判定（2026-06-10）** | ~2.1 | — | 剩余=两机 drain GPU 计算 ~175ms + worker 本地读 + L0 结构窗口；**M2 ≥3 须走 PC.1 多 token 路线（§3.5）** |
-| **第二十波实测（PC.1 v2 上线）** | **2.05（smoke 档新高）** | 4.71 | 复制投机最长后缀锚+自适应抄长；smoke 档 fire 率 0%=纯不赔钱，收益待 code-edit 档（PC.5） |
-| 第二十一—二十五波（code-edit 档攻坚） | **code-edit 1.95（二十五波新高）**；smoke 2.09（二十四波新高）/2.02 | — | mm_id GEMM 修 GPU 侧（批 drain 69→38ms）；NOCACHE 判决=prefill 冷读赢/verify 批输 → 收窄 ≥24 token；**backbone mlock 4.08GiB 根治 r1 驱逐爬升（548→2361ms 消失，稳 578-874）**；账面闭合：97tok≈Σr1(14.2s)+Σr2(35.7s)，r2=73% 是唯一大头 |
-| **第二十六波实测** | **code-edit 2.24（新高）/ smoke 2.09** | 7.33 | DRAFT 16 即刻生效（4 轮 16/16 全中）；反向 efetch 因 TB 桥启动期 ARP 瞬态未起（首连失败被永久缓存） |
-| 第二十七波（**未被真正测到**） | 报 2.23=wave26 复测 | — | 用户开跑时编辑只落了一半（脚本 DRAFT=32 未落 → K 被钳 16）；时间线复盘见 log 第二十八波 |
-| **第二十八波实测** | **code-edit 2.30 / smoke 2.13（双新高）** | 7.60 | 但 K=32 仍未生效（漏改 eval 体内第二处 `K>16` 钳位，两波白测）；反向 efetch 31 连败——decode 期 staging 也把 TB 打满，ARP 全程饿死 |
-| **第二十九波实测** | **code-edit 2.90（新高）/ smoke 2.13（持平）** | — | K=32 终于生效（sent=4/4/7/13/25/32 接受 2/4/7/13/25/29、draft_accept 94%、tok/call 5.71）；反向 efetch 静默窗拨号仍瞬败（进程内 worker→mini 出连必败之谜未解） |
-| **第三十波实测** | code-edit 2.54（回落）/ smoke 2.08 | 8.39 | **accept 模式反向 efetch 终于连通**（worker 6 连、racing 生效、prefill gather 4.4→6.3-6.8GB/s）；回落=48 注赔钱（sent=49 只中 29，抄源分叉点=29，多付 3.4s）+新发现：流式层无 racing（mini L0-2 单盘 1.9GB/s×950ms/层） |
-| **第三十一波实测** | **code-edit 2.90（追平最高）/ smoke 2.08** | 10.41 | 两修都生效（next_len 顶 32、4 份日志 0 条 mode=stream）；smoke 没回 2.13 的元凶定位：**worker decode gather 在 racing**（426/1104 带 rfetch，`\|\| !stage_enabled` 臂在 accept 模式下永真，本地 2-6ms 的活去跨 TB 拉 6ms+ 纯加尾）——时间线与 wave30 accept 连通完全吻合；另：worker decode **hit_mib=0.0 全程零命中**（source cache 仅 128MiB） |
-| **第三十二波实测（设备限制更新：两台都 12G/总 24G）** | **code-edit 3.00（新高）/ smoke 2.14（新高）** | 9.84 | racing units 下限生效（worker decode rfetch 0/1104）；worker mlock wired 4.14GiB、verify drain 74→~50ms/层；r2(33)=6493 闭合=IO walls 60%+drain 38%。**两个真相**：① source cache async 模式从不 admit（两侧 summary hits=0 admit=0，2048MiB 配置是死字段，只做 madvise 加热）；② coordinator decode hit_mib 全来自 **staging**，worker hit=0 只因 stage_enabled() 门硬要 FETCH_HOST |
-| 第三十三波实测（**负结果，已回滚**） | code-edit 2.83 / smoke 1.75（双降） | 10.00 | worker staging 净亏：completion 64%（coordinator 同机制 97%）、dropped 33%、decode 命中仅 26%，wall 反升 2-6→4-9.6ms/层，未暂存层 racing 复活 125/1104，r1 +20%。根因=盘速不对称：mini 盘慢（1.9GB/s）+兼任 efetch server，喂不饱 worker 暂存窗口。`WORKER_EXPERT_STAGE` 默认回 0 |
-| **第三十四波实测** | **code-edit 3.32（新高）/ smoke 2.16（新高）** | 9.91 | PC.1 融合单轮全生效（6 轮全 r1_ms=0）；意外之喜：+1 对齐偏移让末轮 33/33 全中（旧形态 29 分叉）；EOS 自然结束于 97；账：fire 轮 84 tok/Σr2 21.3s + miss 13 tok/7.8s |
-| **第三十五波实测** | **code-edit 3.39（新高）/ smoke 2.15** | 10.23 | NOCACHE 阈值修正近似打平（r2(25) -310 / r2(33) +190）：轮间复用被容量否决——每轮 union ~7GiB 装不进 ~3-4G 空闲页缓存；改动无害保留且是 36 波前置条件。排除项：MoE 分半 dispatch（路由依赖+位精确风险）、MTP-on-miss（小批 r2 成本曲线下只值 +5-10%）、批 token 分半流水（union 稀释吃掉重叠收益） |
-| **第三十六波实测** | **code-edit 3.54（新高）/ smoke 2.17（新高）** | — | 批 union 预测预取生效（与 35 波 cached fd 协同）：六轮 r2 全降至 1354/1460/2286/3497/4821/5819，Σr2 19.2s；kc=33 新账目 walls 53%（5.2GB/s 贴双盘饱和）+ drain 45%（真 GEMM）；结构：fire 70% + miss 30%（13 tok×630ms 贴单轮地板） |
-| 第三十七波（待实测） | 目标 code-edit ≥3.8 / smoke ~2.17 | — | 注梯增长 ×2→×4（`DS4_DIST_COPY_SPEC_GROWTH=4`，梯形 3→12→32 直达帽）：3.54 跑里 6→12→24 三轮连续全中=两轮白付固定成本（~2s）；32 帽锁死超注损失（材料尽头一次性 ~2.3s）；A/B `COPY_SPEC_GROWTH=2`。下一个大项仍是 P-OVL（层内 gather/GPU 分半重叠，r2 理论 -25%，需 metal-kernels 单测护航分波落地） |
 | M1 单拷贝直读 + prefill 流式 | **≥1.6** | **≥10** | P1.1/P1.2 |
 | M2 预测预取流水 + 命中零拷贝 + repack | **≥3** | **≥25** | P1.3/P1.4/P2.1 |
 | M3 expert-parallel 双 SSD 并行 | **≥5** | ≥30 | P2.2 |
 | M4 投机/路由偏置（质量门） | 6–8（stretch） | — | P2.3/P2.4 |
-| **M4C 编程场景专项** | 编辑/工具回合**有效 decode ≥2×M3**（复制投机摊薄） | 增量 4K prefill ≤25s | P-Code（§3.5） |
+| **M4C 编程场景专项（用户目标）** | echo 重编辑回合**有效 decode ≥30**（copy-spec+前缀复用+降激活；非跨回合稳态） | 增量 4K prefill ≤25s | P-Code（§3.5） |
 
-当前 0.81 t/s 离 W2 墙还有 **4–8×** 空间——“优化到极限”不成立，极限在 ~5–7 t/s，不在 0.8。
+当前 code-edit 3.77 t/s 已逼近单前向 W2/W3 墙（~5–7 t/s 区间）——单前向“优化到极限”≈5–7，**到 30 t/s 必须走 §3.5 有效 t/s**。
 **注意：W1–W3 三道墙限制的是“每次前向”的物理成本；编程场景的专项空间（§3.5）在于让
 一次前向产出多个 token（复制式投机）和少做前向（前缀/画像复用）——即“有效 t/s”可以越过单前向墙。**
 
@@ -255,8 +277,8 @@ P0 测量基建（半天）→ P1 内存分区排布（主攻，~1-2 周）→ P
   server 的 exact-DSML replay map 保证字节级前缀命中（已有）。
 - 逐档 32K→100K→200K 验证两机 KV/scratch 预算（coordinator 日志显示 200K 下 context buffers 1.83GiB，
   在层切分 KV 收缩后可承受）；watchdog 红线 12/12GiB（2026-06-10 起）。
-- 可用性诚实定义：M3 达成（decode ≥5 t/s）+ 前缀复用增量 prefill ≥30 t/s 时，Claude Code 短指令交互“勉强可用”；
-  80 t/s 级流畅体验在本硬件+本模型组合下不存在。
+- 可用性诚实定义：M3 达成（单前向 decode ≥5 t/s）+ 前缀复用增量 prefill ≥30 t/s 时，Claude Code 短指令交互“勉强可用”；
+  编程域有效 t/s 30（echo 重回合）是用户目标的可达上限；**单前向稳态 30 / 80 t/s 级流畅在本硬件+本模型组合下不存在**。
 - 低优先备选（§2.1c）：raw 滑窗/indexer-selected KV 旋转量化（3bit K 族）再挤 ~0.5–1GiB/机给专家池；
   仅当 P1.4 池容量被证明是命中率瓶颈时才做；dequant 不得落 decode 热路径；
   门槛 `--logprob-vectors` + `ds4_test --long-context`，过不了即弃（IO-bound 下可能负收益，SwiftLM 对照表已证）。
@@ -315,13 +337,14 @@ P0 测量基建（半天）→ P1 内存分区排布（主攻，~1-2 周）→ P
 
 ## 7. 风险与诚实结论
 
-- **80 t/s 在“q2 全量 81GiB + 两台 16GB Mac”前提下违反带宽/容量物理**（§1），本方案不承诺；
-  承诺的是把 0.81 t/s 推向 **3–6 t/s 的真实物理极限区间**，并给出每一步的实测关卡。
+- **80 t/s 违反带宽/容量物理；30 t/s 单前向也不可达（W3 backbone 墙 ≤10–18 t/s，§1）**，本方案不承诺单前向 30；
+  承诺两条诚实关卡：① **单前向 decode 推向 W2/W3 物理极限区间 3–7 t/s**（当前 code-edit 3.77 已在区间内）；
+  ② **编程域有效 t/s 冲 30（用户目标）**——靠 copy-spec/前缀复用/降激活越过单前向墙，仅 echo 重编辑回合可达、非跨回合稳态。
 - 主要工程风险：`MTLIOCommandQueue` 与现有 no-copy mmap 视图/ResidencySet 的共存语义（退路 pread）；
   expert-parallel 的 per-layer 同步抖动（E0 把关）；预测精度不足导致预取空转（fallback 不伤正确性，只亏带宽）。
 - **P-Code 收益是负载相关的，不改物理墙**：复制式投机只在"输出回显上下文"的回合放大有效 t/s
   （编辑/工具回合 1.5–3×，纯新代码 ~1.1–1.3×），匹配失败自动退化为基线，无下行风险但也不保证均匀提速；
-  编程域画像的上限由 P0.2 实测 SRP/SCH 决定，先测后建。M4C 的"≥2×"只承诺在 code-edit 档 prompt 上验收。
+  编程域画像的上限由 P0.2 实测 SRP/SCH 决定，先测后建。M4C 的"有效 30"只承诺在 code-edit 档（echo 重）prompt 上验收，匹配不上即回落单前向基线。
 - 一切以 `notes/execution-log.md` 实测为准；correctness before speed，watchdog 红线 12/12GiB（2026-06-10 起）永不放松。
 
 ## 8. 进度
@@ -332,7 +355,7 @@ P0 测量基建（半天）→ P1 内存分区排布（主攻，~1-2 周）→ P
 - [ ] P0.2 SRP·SCH 标定
 - [x] P0.3 SSD 底数（`tools/ssd_bench.c`，2026-06-10 实测）：**mini 全模式 ~2.4–2.6GB/s**（顺序≈随机），
       **MacBook 5.5–6.7GB/s（快 2.3–2.6×）**——coordinator 慢盘是当前结构性瓶颈；RTT 待测
-- [ ] 快赢 1（DIST_PREFILL_CAP A/B）/ 4（SRP/SCH 脚本）——零代码，待实测
+- [x] 快赢 1（DIST_PREFILL_CAP A/B，第四十七波）：实测 128→11.75 / **2048→12.89(+9.7% prefill)** / 4096→11.82(退化)；**2048 最优**(4096 巨块密集 gather+跨机延迟抵消)，脚本默认抬到 2048，bit-exact+峰值 6.68G 安全。受 W2 磁盘墙限故 +10% 非 3×；是 TTFT 白拿增益 / 4（SRP/SCH 脚本）——待实测
 - [x] 快赢 2 → 屏障税回收：A3 每层 drain 改 MTLSharedEvent 快路径 host wait
       （`DS4_METAL_EXPERT_EVENT_DRAIN=1`，CB 状态检查推迟一拍；正确性保证等价）
       ——**代码已落地 2026-06-10，drain_ms 新值待实测（目标 <2.5ms/层）**
@@ -343,7 +366,11 @@ P0 测量基建（半天）→ P1 内存分区排布（主攻，~1-2 周）→ P
 - [x] ~~P1.3 GGUF 专家捆绑重排 sidecar~~ **不立项（G 门否决，2026-06-10）**：P0.3 实测 mini 盘
       随机 2MiB@QD8=2.40 vs 捆绑粒度 6.75MiB@QD8=2.61 vs 顺序=2.50 GB/s——增益 ≤8%，
       不值 34GiB sidecar + repacker；worker 盘虽有 +18% 但不是瓶颈侧
-- [ ] P1.4 常驻池间接表（命中零拷贝）
+- [x] ~~P1.4 常驻池间接表（命中零拷贝）/ X9 驻留~~ **决定性否决（第五十一波, 数据充分）**：全层 top-16 pool
+      容量装得下（coord 2.16+worker 2.43 GiB, 用户对 24G 有余量）；HIT_ONLY=0 成功填满（命中 90→2760）排除
+      预热/容量问题；但 **decode 反而更慢**（pool 命中 2760 时 replay turn2 2.22 << 无 pool 4.00）⇒ **resident-pool
+      执行路径本身比 compact-scratch streaming 慢**（大缓冲散点索引/GPU 工作集/admit 开销）。所有缓存变体
+      (hard_copy/mlock/pool) 全使 decode 变慢。W1 流式+overlap+copy-spec 是本硬件最优。集中度真实但常驻它更慢
 - [x] P2.1 跨层预测预取 v2（`DS4_METAL_EXPERT_PREFETCH_AHEAD=1` + `_TOP/_DELTA`；
       v1 实测回退 1.56→1.49：pf 精度 77.5% 可用，但 readahead 与前台 gather 抢 SSD——
       decode 期间 SSD 无空闲带宽，预取不能加总流量；v2 改礼让式：1MiB 分块只流入
@@ -359,11 +386,14 @@ P0 测量基建（半天）→ P1 内存分区排布（主攻，~1-2 周）→ P
 - [ ] P2.3 MTP 重启评估 / P2.4 路由偏置（质量门）
 - [x] PC.1 复制式投机（`DS4_DIST_COPY_SPEC=1` + `_DRAFT/_NGRAM`；n-gram 匹配器当 drafter，
       VERIFY/accept_len/KV 回滚协议原样复用，miss 零开销；单 token 地板 ~2.1 后的 M2 主路线）
-      ——**代码已落地 2026-06-10（第十九波），待用户脚本实测；M4C 门：编辑型回合有效 decode ≥2×**
-- [ ] PC.2 编程域热专家画像 + 启动预热
+      ——**代码已落地 2026-06-10（第十九波），待用户脚本实测；M4C 门：echo 重编辑回合有效 decode ≥30**
+- [ ] PC.2 编程域热专家画像 + 启动预热（第四十四/四十六波定论: 驻留缓存打不过 page cache, 热集装不下, 暂搁置）
 - [ ] PC.3 工具语法草稿（schema/replay 驱动）
-- [ ] PC.4 回合级增量 prefill（per-turn TTFT 指标上线）
-- [x] PC.5（部分）`PROMPT_PROFILE=code-edit` 档已入脚本（2026-06-10 第二十一波；
-      默认 smoke 档不变保历史可比）；完整回放基准（真实 transcript replay）仍待建
+- [x] PC.4（部分，第四十八波）per-turn TTFT 指标上线（`run_chat_turn` 打印 cached/suffix/TTFT）+ **dist REPL
+      路由 bug 修复**（run_repl 漏等 worker 路由→"missing layer 20"，修复后 dist 多回合可跑）。实测增量 prefill
+      生效（cached 0→190→345 增长, suffix 只填新增 27/23）；**但小 suffix 走散点 gather 仍撞 W2 墙**(turn3 23tok/19.7s)。
+      遗留: 散点→稠密流式 / 热专家复用 / agent 工具返回即时 prefill(PC.4③)
+- [x] PC.5（部分）`PROMPT_PROFILE=code-edit`（第二十一波）+ **`PROMPT_PROFILE=replay` 多回合 bench（第四十八波，
+      REPL 模式量化 per-turn TTFT）**；完整真实 transcript replay 仍待建
 - [ ] P3 200K 逐档 + Claude Code 前缀复用验证
 - [ ] G1–G3 决策记录
