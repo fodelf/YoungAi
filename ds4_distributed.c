@@ -660,6 +660,17 @@ static int dist_spec_pipe_enabled(void) {
     return dist_env_enabled("DS4_DIST_SPEC_PIPE");
 }
 
+/* Wave 69: max chained spec-pipe lookahead cycles beyond the main verify batch.
+ * 1 = single lookahead (N->N+1, the wave-69 buffer-fix that hit 5.07). >1 chains
+ * N->N+1->N+2... through a long verbatim run: each extra cycle's coord layer
+ * slice is overlapped into the PRIOR cycle's worker-wait window, so a chain of C
+ * cycles costs ~ t_local + C*t_remote instead of C*(t_local+t_remote). Clamped to
+ * 7 so (1 + 7) verify batches (<=64 rows each) fit the caller's accepted[] buffer
+ * (toks[513]). bit-exact at any depth: every row is argmax-gated. */
+static uint32_t dist_spec_pipe_depth(void) {
+    return dist_env_u32_clamped("DS4_DIST_SPEC_PIPE_DEPTH", 4, 1, 7);
+}
+
 /* Wave 68+ spec-pipe overlap callback context.  The callback is invoked by
  * dist_coordinator_eval_remote_on_fd between the WORK send and the blocking recv
  * (i.e. while the worker computes cycle N), so this layer_slice of the PREDICTED
@@ -6939,38 +6950,101 @@ int ds4_dist_session_eval_speculative(
                 spec_next_kb >= 2u &&
                 pctx.toks[0] == dist_logits_argmax(logits, vocab) &&
                 (uint32_t)n_acc + spec_next_kb <= (uint32_t)accepted_cap) {
-                float *v2 = malloc((size_t)spec_next_kb * (size_t)vocab * sizeof(float));
-                if (v2) {
-                    ds4_dist_spec_io io2;
-                    memset(&io2, 0, sizeof(io2));
-                    io2.extra_flags = DS4_DIST_WORK_F_VERIFY;
-                    io2.verify_logits = v2;
-                    io2.accept_len = kb;   /* worker keeps all kb rows of cycle N */
-                    d->state.spec_precomputed_hidden = spec_hidden;
-                    const int rc2 = dist_coordinator_eval_span(&d->state, owner, &d->plan,
-                                                               pctx.toks, spec_next_kb, p + kb,
-                                                               d->session_id, d->request_id++,
-                                                               false, logits, &io2, err, errlen);
-                    d->state.spec_precomputed_hidden = NULL;
-                    d->mtp_forwards++;
-                    if (rc2 == 0) {
-                        accepted[n_acc++] = pctx.toks[0];   /* predicted next-first, validated */
-                        uint32_t m2 = 0;
-                        for (uint32_t j = 1; j < spec_next_kb && n_acc < accepted_cap; j++) {
-                            const int pred = dist_logits_argmax(
-                                    v2 + (size_t)(j - 1) * (size_t)vocab, vocab);
-                            if (pred != pctx.toks[j]) break;
-                            accepted[n_acc++] = pctx.toks[j];
-                            m2++;
-                            if (pctx.toks[j] == eos_token) break;
+                /* wave 69 chain: run cycle N+1 (coord slice precomputed by the main
+                 * cb), then keep chaining N+2,N+3... up to depth, each next cycle's
+                 * coord slice overlapped into the prior cycle's worker wait via the cb.
+                 * bit-exact: every row is argmax-gated; on any partial/miss the chain
+                 * stops and coord+worker KV roll back to the accepted boundary. The cb
+                 * only ever touches the COORD slice (no worker frame), so a discarded
+                 * speculative precompute never desyncs the worker. */
+                const uint64_t hc = ds4_engine_hidden_f32_values(d->state.engine);
+                const uint32_t max_depth = dist_spec_pipe_depth();
+                float *vc = malloc((size_t)64u * (size_t)vocab * sizeof(float)); /* reused per cycle */
+                if (vc) {
+                    dist_spec_pipe_ctx cur = pctx;       /* cycle N+1 batch (from main cb) */
+                    float   *cur_hidden = spec_hidden;   /* its precomputed coord hidden */
+                    spec_hidden = NULL;                  /* ownership moves into the chain */
+                    uint32_t cur_kb    = spec_next_kb;
+                    uint32_t cur_pos   = p + kb;
+                    uint32_t prev_kept = kb;             /* worker keeps all kb rows of cycle N */
+                    uint32_t cur_src   = copy_src + n_copy;
+                    uint32_t final_pos = cur_pos;        /* coord rollback target after the chain */
+                    uint32_t depth = 0;
+                    bool chain_err = false;
+                    while (depth < max_depth && cur_hidden && cur.ok && cur_kb >= 2u &&
+                           cur.toks[0] == dist_logits_argmax(logits, vocab) &&
+                           (uint32_t)n_acc + cur_kb <= (uint32_t)accepted_cap) {
+                        /* Predict + arm the NEXT cycle so its coord slice overlaps THIS
+                         * cycle's worker wait (skipped on the last allowed depth). */
+                        dist_spec_pipe_ctx nxt;
+                        memset(&nxt, 0, sizeof(nxt));
+                        float *nxt_hidden = NULL;
+                        const uint32_t nxt_pos = cur_pos + cur_kb;
+                        /* cur batch spans cur_kb source positions [cur_src, cur_src+cur_kb-1];
+                         * the next cycle's copy source continues at cur_src+cur_kb (wave-69
+                         * off-by-one fix: was cur_kb-1, which misaligned the prediction to the
+                         * last already-emitted token -> predmatch always failed -> chain never
+                         * went past chain[0]). */
+                        const uint32_t nxt_src = cur_src + cur_kb;
+                        if (depth + 1u < max_depth) {
+                            uint32_t nwant = d->copy_spec_len * dist_copy_spec_growth();
+                            if (nwant > (uint32_t)(K - 1)) nwant = (uint32_t)(K - 1);
+                            if (nwant > dist_copy_spec_max_len()) nwant = dist_copy_spec_max_len();
+                            uint32_t nkb = 0;
+                            while (nkb < 1u + nwant && nkb < 64u &&
+                                   nxt_src + nkb < (uint32_t)transcript.len) {
+                                int t = transcript.v[nxt_src + nkb];
+                                nxt.toks[nkb++] = t;
+                                if (t == eos_token) break;
+                            }
+                            if (nkb >= 2u &&
+                                (d->state.ctx_size == 0 || nxt_pos + nkb <= d->state.ctx_size) &&
+                                (uint32_t)n_acc + cur_kb + nkb <= (uint32_t)accepted_cap) {
+                                nxt_hidden = malloc((size_t)nkb * hc * sizeof(float));
+                                if (nxt_hidden) {
+                                    nxt.session = owner;
+                                    nxt.local_start = d->state.local_start;
+                                    nxt.local_end = d->state.local_end;
+                                    nxt.kb = nkb;
+                                    nxt.pos0 = nxt_pos;
+                                    nxt.hidden = nxt_hidden;
+                                    d->state.spec_overlap_cb = dist_spec_pipe_overlap_cb;
+                                    d->state.spec_overlap_ctx = &nxt;
+                                }
+                            }
                         }
-                        memcpy(logits, v2 + (size_t)m2 * (size_t)vocab,
-                               (size_t)vocab * sizeof(float));
-                        /* coord KV: keep cycle N (kb) + cycle N+1 (1 + m2). */
-                        (void)ds4_session_layer_slice_rollback(owner, p + kb + 1u + m2, err, errlen);
+                        ds4_dist_spec_io ioc;
+                        memset(&ioc, 0, sizeof(ioc));
+                        ioc.extra_flags = DS4_DIST_WORK_F_VERIFY;
+                        ioc.verify_logits = vc;
+                        ioc.accept_len = prev_kept;   /* worker keeps all rows of the prior cycle */
+                        d->state.spec_precomputed_hidden = cur_hidden;
+                        const int rcc = dist_coordinator_eval_span(&d->state, owner, &d->plan,
+                                                                   cur.toks, cur_kb, cur_pos,
+                                                                   d->session_id, d->request_id++,
+                                                                   false, logits, &ioc, err, errlen);
+                        d->state.spec_precomputed_hidden = NULL;
+                        d->state.spec_overlap_cb = NULL;
+                        d->state.spec_overlap_ctx = NULL;
+                        d->mtp_forwards++;
+                        free(cur_hidden); cur_hidden = NULL;
+                        if (rcc != 0) { free(nxt_hidden); chain_err = true; break; }
+                        accepted[n_acc++] = cur.toks[0];   /* validated == argmax(prior logits) */
+                        uint32_t m2 = 0;
+                        for (uint32_t j = 1; j < cur_kb && n_acc < accepted_cap; j++) {
+                            const int pred = dist_logits_argmax(vc + (size_t)(j - 1) * (size_t)vocab, vocab);
+                            if (pred != cur.toks[j]) break;
+                            accepted[n_acc++] = cur.toks[j];
+                            m2++;
+                            if (cur.toks[j] == eos_token) break;
+                        }
+                        memcpy(logits, vc + (size_t)m2 * (size_t)vocab, (size_t)vocab * sizeof(float));
+                        spec_ran = true;
+                        final_pos = cur_pos + 1u + m2;
                         d->spec_accept_pending = true;
-                        d->spec_accept_len = 1u + m2;   /* worker rolls N+1 next call */
-                        if (m2 == spec_next_kb - 1u) {
+                        d->spec_accept_len = 1u + m2;   /* worker rolls THIS (last) cycle next call */
+                        const bool full = (m2 == cur_kb - 1u);
+                        if (full) {
                             uint32_t grown = d->copy_spec_len * dist_copy_spec_growth();
                             if (grown > (uint32_t)(K - 1)) grown = (uint32_t)(K - 1);
                             if (grown > dist_copy_spec_max_len()) grown = dist_copy_spec_max_len();
@@ -6978,15 +7052,43 @@ int ds4_dist_session_eval_speculative(
                         } else if (m2 <= 1u) {
                             d->copy_spec_len = dist_copy_spec_init_len();
                         }
-                        spec_ran = true;
                         if (dist_env_enabled("DS4_DIST_COPY_SPEC_LOG")) {
-                            fprintf(stderr,
-                                    "ds4: spec-pipe 2nd: sent=%u accepted=%u next_len=%u\n",
-                                    spec_next_kb, 1u + m2, d->copy_spec_len);
+                            fprintf(stderr, "ds4: spec-pipe chain[%u]: sent=%u accepted=%u next_len=%u\n",
+                                    depth, cur_kb, 1u + m2, d->copy_spec_len);
                         }
+                        if (!full) { free(nxt_hidden); break; }
+                        /* full accept: advance to the armed next cycle (NULL hidden -> exit). */
+                        prev_kept = cur_kb;
+                        cur_pos = nxt_pos;
+                        cur_src = nxt_src;
+                        cur = nxt;
+                        cur_hidden = nxt_hidden;
+                        cur_kb = nxt.kb;
+                        depth++;
+                    }
+                    free(vc);
+                    if (cur_hidden) free(cur_hidden);   /* unused tail precompute */
+                    if (chain_err) {
+                        /* eval failed mid-chain: the accepted prefix is valid -> resync
+                         * the worker to it via a transcript rebuild, return what we have. */
+                        for (int ai = 1; ai < n_acc; ai++) ds4_tokens_push(&transcript, accepted[ai]);
+                        if (dist_coordinator_rebuild_from_transcript(&d->state, owner, &d->plan,
+                                &transcript, d->session_id, &d->request_id, logits,
+                                &d->plan_generation, true, err, errlen) != 0) {
+                            d->plan_ready = false; d->plan_generation = 0;
+                            ds4_tokens_free(&transcript);
+                            return -1;
+                        }
+                        d->plan_ready = true;
+                        d->spec_accept_pending = false; d->spec_accept_len = 0;
+                        dist_mtp_record_enabled(d, (uint32_t)n_acc, kb, true, true);
+                        ds4_tokens_free(&transcript);
+                        return n_acc;
+                    }
+                    if (spec_ran) {
+                        (void)ds4_session_layer_slice_rollback(owner, final_pos, err, errlen);
                         dist_mtp_record_enabled(d, (uint32_t)n_acc, kb + spec_next_kb, true, true);
                     }
-                    free(v2);
                 }
             }
             if (!spec_ran) {

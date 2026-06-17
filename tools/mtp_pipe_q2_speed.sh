@@ -339,6 +339,9 @@ COPY_SPEC_REANCHOR_RATIO=${COPY_SPEC_REANCHOR_RATIO:-3}
 # toks[65] 缓冲 bug 锁死 (全接受后无空间放第二轮 → 1/9 fire → 净亏)。缓冲修到 129 后实测 code-edit-heavy
 # decode 4.72→5.07 (+7.4%), bit-exact (accepted=303 不变, greedy 逐行 argmax gate)。A/B 回退: SPEC_PIPE=0。
 SPEC_PIPE=${SPEC_PIPE:-1}
+# 第六十九波 链式: spec-pipe 链深 (默认 4 = N→N+1→…→N+4; 1 = 单次前瞻=已验证 5.07 可回退)。长 verbatim 区
+# 每多链一轮只花 worker 时间 (coord 算被前一轮 worker-wait 藏住), 数据推导 ~1.6× → ~6 t/s。bit-exact。
+SPEC_PIPE_DEPTH=${SPEC_PIPE_DEPTH:-4}
 COPY_SPEC_INIT=${COPY_SPEC_INIT:-3}            # 自适应抄长初始值/重置值
 COPY_SPEC_MIN=${COPY_SPEC_MIN:-2}              # 抄长低于此不发验证批 (赔不起往返)
 # 第三十六波: 全中后增长 ×2→×4。×2 是无帽时代校准的; 32 帽锁死了超注损失 (材料尽头
@@ -603,7 +606,7 @@ DEBUG_ARGS=""
 # 并行复制同层 active experts，降低 A3 memcpy 墙。per-tensor DIRECT 已验证不 OOM 但 15s/token，
 # 默认关闭；需要实验时覆盖 DS4_METAL_EXPERT_OFFLOAD_DIRECT=1。
 # NO_MODEL_WARMUP 避免启动时扫冷 expert views。
-BASE_RUN_ENV=${BASE_RUN_ENV:-"DS4_DIST_REVERSE_CONNECT=1 DS4_METAL_PREFILL_CHUNK=$PREFILL_CHUNK DS4_DIST_PREFILL_CAP=$DIST_PREFILL_CAP DS4_METAL_EXPERT_OFFLOAD=1 DS4_METAL_EXPERT_OFFLOAD_DIRECT=0 DS4_METAL_EXPERT_GATHER_THREADS=$GATHER_THREADS DS4_METAL_NO_MODEL_WARMUP=1 DS4_DIST_SPEC_PIPE=$SPEC_PIPE $IO_ENV $COPY_SPEC_ENV"}
+BASE_RUN_ENV=${BASE_RUN_ENV:-"DS4_DIST_REVERSE_CONNECT=1 DS4_METAL_PREFILL_CHUNK=$PREFILL_CHUNK DS4_DIST_PREFILL_CAP=$DIST_PREFILL_CAP DS4_METAL_EXPERT_OFFLOAD=1 DS4_METAL_EXPERT_OFFLOAD_DIRECT=0 DS4_METAL_EXPERT_GATHER_THREADS=$GATHER_THREADS DS4_METAL_NO_MODEL_WARMUP=1 DS4_DIST_SPEC_PIPE=$SPEC_PIPE DS4_DIST_SPEC_PIPE_DEPTH=$SPEC_PIPE_DEPTH $IO_ENV $COPY_SPEC_ENV"}
 # 远程专家字节服务: coordinator (本机) 当客户端拉 worker 盘; worker 当服务端。
 # 第三十波反向 efetch 改 accept 模式 (EXPERT_REMOTE_FETCH_REVERSE=1, 默认开):
 #   目的不变 (二十六波): verify 批的 worker 半程 (~2.3s, 23 层×~270MiB 冷读) 期间

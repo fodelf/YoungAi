@@ -609,10 +609,10 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
         }
         if (token == ds4_token_eos(engine)) break;
 
-        int toks[129];  /* wave 69: 2 spec-pipe cycles (2*64 verify rows + first_token).
-                         * Was [65] (1 cycle), which silently blocked the spec-pipe 2nd
-                         * cycle on every full-accept batch (n_acc+spec_next_kb up to
-                         * 128 > 65) -- the real cause of its ~1/9 fire rate. */
+        int toks[513];  /* wave 69: chained spec-pipe, up to 1 + DEPTH(<=7) verify cycles
+                         * (8*64 rows + first_token). Was [65] (1 cycle) which blocked the
+                         * spec-pipe 2nd cycle on full accepts (n_acc+spec_next_kb>65 -> the
+                         * ~1/9 fire rate); 129 enabled 1 lookahead; 513 enables the chain. */
         int ntok = 0;
         if (cfg->gen.temperature <= 0.0f &&
             (ds4_engine_mtp_draft_tokens(engine) > 1 || cli_copy_spec_enabled()) &&
@@ -1284,10 +1284,10 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
                                        &rng);
         if (token == ds4_token_eos(engine)) break;
 
-        int toks[129];  /* wave 69: 2 spec-pipe cycles (2*64 verify rows + first_token).
-                         * Was [65] (1 cycle), which silently blocked the spec-pipe 2nd
-                         * cycle on every full-accept batch (n_acc+spec_next_kb up to
-                         * 128 > 65) -- the real cause of its ~1/9 fire rate. */
+        int toks[513];  /* wave 69: chained spec-pipe, up to 1 + DEPTH(<=7) verify cycles
+                         * (8*64 rows + first_token). Was [65] (1 cycle) which blocked the
+                         * spec-pipe 2nd cycle on full accepts (n_acc+spec_next_kb>65 -> the
+                         * ~1/9 fire rate); 129 enabled 1 lookahead; 513 enables the chain. */
         int ntok = 0;
         if (cfg->gen.temperature <= 0.0f &&
             (ds4_engine_mtp_draft_tokens(engine) > 1 || cli_copy_spec_enabled()) &&
