@@ -421,10 +421,197 @@ static void test_metal_q8_0_prefill_matmul(void) {
     free(weights_raw);
 }
 
+/* wave-78 gate: a non-%32 batch (e.g. copy-spec verify batch of 49) must be
+ * bit-exact through the NAX-padding path. The activation/output buffers are
+ * sized to the padded row count (64) so the matmul's capacity guard engages
+ * n_tok_nax=64; rows [0,49) must match the CPU reference, pad rows are ignored. */
+static void test_metal_q8_0_prefill_matmul_unaligned(void) {
+    const uint32_t in_dim = 128;
+    const uint32_t out_dim = 64;
+    const uint32_t n_tok = 49;          /* logical batch (not a multiple of 32) */
+    const uint32_t n_tok_alloc = 64;    /* padded capacity the matmul rounds up to */
+    const uint64_t row_bytes = (uint64_t)(in_dim / 32u) * 34u;
+    const uint64_t weight_bytes = (uint64_t)out_dim * row_bytes;
+    const uint64_t weight_alloc = test_round_up_u64(weight_bytes, (uint64_t)getpagesize());
+    const uint64_t x_bytes = (uint64_t)n_tok_alloc * in_dim * sizeof(float);
+    const uint64_t out_bytes = (uint64_t)n_tok_alloc * out_dim * sizeof(float);
+
+    void *weights_raw = NULL;
+    TEST_ASSERT(posix_memalign(&weights_raw, (size_t)getpagesize(), (size_t)weight_alloc) == 0);
+    if (!weights_raw) return;
+
+    uint8_t *weights = weights_raw;
+    memset(weights, 0, (size_t)weight_alloc);
+    test_fill_q8_0_weights(weights, in_dim, out_dim);
+
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(x_bytes);
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(out_bytes);
+    TEST_ASSERT(x != NULL);
+    TEST_ASSERT(out != NULL);
+    if (!x || !out) {
+        ds4_gpu_tensor_free(x);
+        ds4_gpu_tensor_free(out);
+        free(weights_raw);
+        return;
+    }
+
+    float *x_host = malloc((size_t)x_bytes);
+    float *out_host = malloc((size_t)out_bytes);
+    TEST_ASSERT(x_host != NULL);
+    TEST_ASSERT(out_host != NULL);
+    if (!x_host || !out_host) {
+        free(x_host);
+        free(out_host);
+        ds4_gpu_tensor_free(x);
+        ds4_gpu_tensor_free(out);
+        free(weights_raw);
+        return;
+    }
+
+    /* Fill all padded rows so the pad rows hold deterministic finite values. */
+    for (uint32_t t = 0; t < n_tok_alloc; t++) {
+        for (uint32_t i = 0; i < in_dim; i++) {
+            const int v = (int)((t * 19u + i * 7u + (t ^ i)) % 71u) - 35;
+            x_host[(uint64_t)t * in_dim + i] = (float)v / 80.0f;
+        }
+    }
+    for (uint32_t i = 0; i < n_tok_alloc * out_dim; i++) {
+        out_host[i] = 12345.0f;
+    }
+
+    TEST_ASSERT(ds4_gpu_tensor_write(x, 0, x_host, x_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_write(out, 0, out_host, out_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_set_model_map(weights_raw, weight_alloc) != 0);
+    ds4_gpu_set_quality(false);
+    /* call with the unaligned logical n_tok; the matmul pads to 64 internally */
+    TEST_ASSERT(ds4_gpu_matmul_q8_0_tensor(out, weights_raw, weight_alloc, 0,
+                                           in_dim, out_dim, x, n_tok) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_read(out, 0, out_host, out_bytes) != 0);
+
+    float max_abs = 0.0f;
+    float rms = 0.0f;
+    for (uint32_t t = 0; t < n_tok; t++) {   /* only the real rows must be correct */
+        for (uint32_t o = 0; o < out_dim; o++) {
+            const uint8_t *row = weights + (uint64_t)o * row_bytes;
+            float ref = 0.0f;
+            for (uint32_t b = 0; b < in_dim / 32u; b++) {
+                uint16_t scale_bits;
+                memcpy(&scale_bits, row + b * 34u, sizeof(scale_bits));
+                const float scale = test_f16_to_f32(scale_bits);
+                const int8_t *qs = (const int8_t *)(row + b * 34u + 2u);
+                for (uint32_t i = 0; i < 32; i++) {
+                    ref += scale * (float)qs[i] *
+                           x_host[(uint64_t)t * in_dim + b * 32u + i];
+                }
+            }
+            const float got = out_host[(uint64_t)t * out_dim + o];
+            TEST_ASSERT(isfinite(got));
+            const float err = fabsf(got - ref);
+            if (err > max_abs) max_abs = err;
+            rms += err * err;
+        }
+    }
+    rms = sqrtf(rms / (float)(n_tok * out_dim));
+    TEST_ASSERT(max_abs < 0.08f);
+    TEST_ASSERT(rms < 0.02f);
+
+    free(x_host);
+    free(out_host);
+    ds4_gpu_tensor_free(x);
+    ds4_gpu_tensor_free(out);
+    free(weights_raw);
+}
+
+/* TP Phase 1 correctness gate: the row-parallel Q8_0 matvec split must reconstruct
+ * the full matvec after the (host) all-reduce. Splits the in-dim into two halves,
+ * computes each peer's partial out via ds4_gpu_matmul_q8_0_rowslice_tensor (the new
+ * primitive: ne00=half blocks accumulated, nb01=full row stride for addressing),
+ * sums them, and checks against the CPU reference. The two-half sum differs from a
+ * single-machine reduction only in float associativity (~1e-6) — well inside the
+ * Q8_0 tolerance. Proves the shared-FFN TP down projection before any dual-host run. */
+static void test_metal_q8_0_rowslice_tp(void) {
+    const uint32_t in_dim = 128;          /* %64==0 so each half stays 32-block aligned */
+    const uint32_t out_dim = 64;
+    const uint32_t half = in_dim / 2u;    /* 64; 2 Q8_0 blocks per half-row */
+    const uint64_t row_bytes = (uint64_t)(in_dim / 32u) * 34u;
+    const uint64_t weight_bytes = (uint64_t)out_dim * row_bytes;
+    const uint64_t weight_alloc = test_round_up_u64(weight_bytes, (uint64_t)getpagesize());
+    const uint64_t half_bytes = (uint64_t)half * sizeof(float);
+    const uint64_t out_bytes = (uint64_t)out_dim * sizeof(float);
+
+    void *weights_raw = NULL;
+    TEST_ASSERT(posix_memalign(&weights_raw, (size_t)getpagesize(), (size_t)weight_alloc) == 0);
+    if (!weights_raw) return;
+    uint8_t *weights = weights_raw;
+    memset(weights, 0, (size_t)weight_alloc);
+    test_fill_q8_0_weights(weights, in_dim, out_dim);
+
+    ds4_gpu_tensor *x_lo = ds4_gpu_tensor_alloc(half_bytes);
+    ds4_gpu_tensor *x_hi = ds4_gpu_tensor_alloc(half_bytes);
+    ds4_gpu_tensor *out_lo = ds4_gpu_tensor_alloc(out_bytes);
+    ds4_gpu_tensor *out_hi = ds4_gpu_tensor_alloc(out_bytes);
+    TEST_ASSERT(x_lo != NULL); TEST_ASSERT(x_hi != NULL);
+    TEST_ASSERT(out_lo != NULL); TEST_ASSERT(out_hi != NULL);
+    if (!x_lo || !x_hi || !out_lo || !out_hi) {
+        ds4_gpu_tensor_free(x_lo); ds4_gpu_tensor_free(x_hi);
+        ds4_gpu_tensor_free(out_lo); ds4_gpu_tensor_free(out_hi);
+        free(weights_raw); return;
+    }
+
+    float x_host[128];
+    for (uint32_t i = 0; i < in_dim; i++) {
+        const int v = (int)((i * 7u + (i ^ 13u)) % 71u) - 35;
+        x_host[i] = (float)v / 80.0f;
+    }
+    float out_lo_host[64], out_hi_host[64];
+
+    TEST_ASSERT(ds4_gpu_tensor_write(x_lo, 0, x_host, half_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_write(x_hi, 0, x_host + half, half_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_set_model_map(weights_raw, weight_alloc) != 0);
+    ds4_gpu_set_quality(false);
+
+    /* peer-low: in-blocks [0, half/32); weight base unshifted; x = x_full[0:half). */
+    TEST_ASSERT(ds4_gpu_matmul_q8_0_rowslice_tensor(out_lo, weights_raw, weight_alloc,
+                                                    0, in_dim, half, out_dim, x_lo) != 0);
+    /* peer-high: in-blocks [half/32, in_dim/32); weight base + (half/32)*34; x = x_full[half:]. */
+    TEST_ASSERT(ds4_gpu_matmul_q8_0_rowslice_tensor(out_hi, weights_raw, weight_alloc,
+                                                    (uint64_t)(half / 32u) * 34u,
+                                                    in_dim, half, out_dim, x_hi) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_read(out_lo, 0, out_lo_host, out_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_read(out_hi, 0, out_hi_host, out_bytes) != 0);
+
+    float max_abs = 0.0f, rms = 0.0f;
+    for (uint32_t o = 0; o < out_dim; o++) {
+        const uint8_t *wr = weights + (uint64_t)o * row_bytes;
+        float ref = 0.0f;
+        for (uint32_t b = 0; b < in_dim / 32u; b++) {
+            uint16_t sb; memcpy(&sb, wr + b * 34u, sizeof(sb));
+            const float scale = test_f16_to_f32(sb);
+            const int8_t *qs = (const int8_t *)(wr + b * 34u + 2u);
+            for (uint32_t i = 0; i < 32; i++)
+                ref += scale * (float)qs[i] * x_host[b * 32u + i];
+        }
+        const float got = out_lo_host[o] + out_hi_host[o];   /* the host all-reduce sum */
+        TEST_ASSERT(isfinite(got));
+        const float err = fabsf(got - ref);
+        if (err > max_abs) max_abs = err;
+        rms += err * err;
+    }
+    rms = sqrtf(rms / (float)out_dim);
+    TEST_ASSERT(max_abs < 0.08f);
+    TEST_ASSERT(rms < 0.02f);
+
+    ds4_gpu_tensor_free(x_lo); ds4_gpu_tensor_free(x_hi);
+    ds4_gpu_tensor_free(out_lo); ds4_gpu_tensor_free(out_hi);
+    free(weights_raw);
+}
+
 static void test_metal_kernel_group(void) {
     test_metal_f16_matvec_fast_nr0_4();
     test_metal_f16_prefill_matmul();
     test_metal_q8_0_prefill_matmul();
+    test_metal_q8_0_prefill_matmul_unaligned();
+    test_metal_q8_0_rowslice_tp();
 }
 
 static void test_metal_short_prefill_ratio4(void) {

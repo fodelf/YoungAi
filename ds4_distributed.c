@@ -1470,6 +1470,15 @@ static int dist_write_full(int fd, const void *buf, size_t len) {
         ssize_t n = send(fd, p, len, 0);
         if (n < 0) {
             if (errno == EINTR) continue;
+            /* The TP control socket is non-blocking (shared with the full-duplex
+             * all-reduce pump); a not-yet-writable socket must poll-wait, not fail.
+             * Blocking sockets (layer-pipeline) never hit EAGAIN, so this is inert
+             * for them. wave-72: this was the TP decode send_step/recv_step bug. */
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                struct pollfd pfd = { .fd = fd, .events = POLLOUT, .revents = 0 };
+                if (poll(&pfd, 1, -1) < 0) return -1;   /* block until peer ready/closed (no timeout band-aid) */
+                continue;
+            }
             return -1;
         }
         if (n == 0) return -1;
@@ -1485,6 +1494,15 @@ static int dist_read_full(int fd, void *buf, size_t len) {
         ssize_t n = recv(fd, p, len, 0);
         if (n < 0) {
             if (errno == EINTR) continue;
+            /* Non-blocking TP control socket: poll-wait for data instead of
+             * failing on EAGAIN. Inert for blocking layer-pipeline sockets.
+             * wave-72: recv_step failed here (worker reached recv before the
+             * leader's step frame arrived after the ~18s prefill). */
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
+                if (poll(&pfd, 1, -1) < 0) return -1;   /* block until peer ready/closed (no timeout band-aid) */
+                continue;
+            }
             return -1;
         }
         if (n == 0) return 0;
@@ -10384,6 +10402,8 @@ static int dist_validate_layers_for_model(const ds4_dist_options *opt, uint32_t 
 
 #define DS4_DIST_MSG_TP_PROMPT 11u
 #define DS4_DIST_MSG_TP_STEP   12u
+#define DS4_DIST_MSG_TP_BATCH  13u  /* copy-spec: [n_tokens][tokens...] (n=0 stop, n=1 bare, n>1 verify) */
+#define DS4_DIST_MSG_TP_ACCEPT 14u  /* copy-spec: [accept_len] after a verify batch */
 
 static int dist_tp_send_prompt(ds4_dist_tp *tp, const ds4_tokens *toks) {
     int fd = tp->fd;
@@ -10428,30 +10448,65 @@ static uint32_t dist_tp_prefill_chunk(void) {
     return 4u;
 }
 
-static int dist_tp_send_step(ds4_dist_tp *tp, int32_t token) {
-    int fd = tp->fd;
-    if (dist_write_frame_header(fd, DS4_DIST_MSG_TP_STEP, (uint32_t)sizeof(uint32_t)) != 0) return -1;
-    uint32_t v = htonl((uint32_t)token);
-    return dist_write_full(fd, &v, sizeof(v));
-}
-
-static int dist_tp_recv_step(ds4_dist_tp *tp, int32_t *token) {
-    int fd = tp->fd;
-    uint32_t type = 0, bytes = 0;
-    char err[64];
-    if (dist_read_frame_header(fd, &type, &bytes, err, sizeof(err)) <= 0) return -1;
-    if (type != DS4_DIST_MSG_TP_STEP || bytes != sizeof(uint32_t)) return -1;
-    uint32_t v = 0;
-    if (dist_read_full(fd, &v, sizeof(v)) <= 0) return -1;
-    *token = (int32_t)ntohl(v);
-    return 0;
-}
-
 static int dist_tp_argmax(const float *logits, int n) {
     int best = 0;
     float bv = logits[0];
     for (int i = 1; i < n; i++) if (logits[i] > bv) { bv = logits[i]; best = i; }
     return best;
+}
+
+/* copy-spec TP protocol: the leader proposes a token run (n=1 bare round, n>1 a
+ * verify batch [first_token, copied...]); the follower mirrors the same eval so
+ * its KV stays in lockstep for the next bare round's Phase-3 all-reduce. n=0 is
+ * the stop sentinel. After a verify batch the leader sends the accepted length so
+ * both peers roll their layer-slice KV back to the same boundary. */
+static int dist_tp_send_batch(ds4_dist_tp *tp, const int *tokens, uint32_t n) {
+    int fd = tp->fd;
+    if (dist_write_frame_header(fd, DS4_DIST_MSG_TP_BATCH,
+                                (uint32_t)((1u + n) * sizeof(uint32_t))) != 0) return -1;
+    uint32_t hn = htonl(n);
+    if (dist_write_full(fd, &hn, sizeof(hn)) != 0) return -1;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t t = htonl((uint32_t)tokens[i]);
+        if (dist_write_full(fd, &t, sizeof(t)) != 0) return -1;
+    }
+    return 0;
+}
+
+static int dist_tp_recv_batch(ds4_dist_tp *tp, int *tokens, uint32_t cap, uint32_t *n_out) {
+    int fd = tp->fd;
+    uint32_t type = 0, bytes = 0; char err[64];
+    if (dist_read_frame_header(fd, &type, &bytes, err, sizeof(err)) <= 0) return -1;
+    if (type != DS4_DIST_MSG_TP_BATCH || bytes < sizeof(uint32_t)) return -1;
+    uint32_t hn = 0;
+    if (dist_read_full(fd, &hn, sizeof(hn)) <= 0) return -1;
+    uint32_t n = ntohl(hn);
+    if (bytes != (uint32_t)((1u + n) * sizeof(uint32_t)) || n > cap) return -1;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t t = 0;
+        if (dist_read_full(fd, &t, sizeof(t)) <= 0) return -1;
+        tokens[i] = (int)(int32_t)ntohl(t);
+    }
+    *n_out = n;
+    return 0;
+}
+
+static int dist_tp_send_accept(ds4_dist_tp *tp, uint32_t accept_len) {
+    int fd = tp->fd;
+    if (dist_write_frame_header(fd, DS4_DIST_MSG_TP_ACCEPT, (uint32_t)sizeof(uint32_t)) != 0) return -1;
+    uint32_t v = htonl(accept_len);
+    return dist_write_full(fd, &v, sizeof(v));
+}
+
+static int dist_tp_recv_accept(ds4_dist_tp *tp, uint32_t *accept_len) {
+    int fd = tp->fd;
+    uint32_t type = 0, bytes = 0; char err[64];
+    if (dist_read_frame_header(fd, &type, &bytes, err, sizeof(err)) <= 0) return -1;
+    if (type != DS4_DIST_MSG_TP_ACCEPT || bytes != sizeof(uint32_t)) return -1;
+    uint32_t v = 0;
+    if (dist_read_full(fd, &v, sizeof(v)) <= 0) return -1;
+    *accept_len = ntohl(v);
+    return 0;
 }
 
 static int dist_run_tp_leader(ds4_engine *engine, const ds4_dist_options *opt,
@@ -10508,25 +10563,89 @@ static int dist_run_tp_leader(ds4_engine *engine, const ds4_dist_options *opt,
     fprintf(stderr, "ds4: TP leader: prompt=%d tokens, generating up to %d (tp_layers=%u)\n",
             prompt.len, max_tokens, opt->tp_layers ? opt->tp_layers : last_layer + 1u);
     rc = 0;
-    double t_decode_sum = 0.0;   /* wall-clock spent inside eval_layer_slice during decode */
+    double t_decode_sum = 0.0;   /* wall-clock spent inside eval during decode */
     int decoded = 0;
-    for (int n = 0; n < max_tokens; n++) {
+    /* copy-spec (DS4_DIST_COPY_SPEC): draft a verbatim continuation from the
+     * transcript and verify it in one batch (warm, compute-bound) -> accept the
+     * argmax-matching prefix. Orthogonal to Phase 3 (the bare rounds still take the
+     * expert-split single-token path). spec_logits is allocated when this env is
+     * set (see metal graph alloc). Off => pure bare-round decode. */
+    const char *cse = getenv("DS4_DIST_COPY_SPEC");
+    const bool copy_spec = cse && cse[0] && cse[0] != '0';
+    ds4_tokens transcript = {0};
+    ds4_tokens_copy(&transcript, &prompt);
+    float *row_logits = copy_spec ? malloc((size_t)64 * (size_t)vocab * sizeof(float)) : NULL;
+    uint32_t copy_spec_len = dist_copy_spec_init_len();
+    for (int n = 0; n < max_tokens; ) {
         int token = dist_tp_argmax(logits, vocab);
         if (token == eos) break;
-        if (dist_tp_send_step(tp, (int32_t)token) != 0) { fprintf(stderr, "ds4: TP leader: send step failed\n"); rc = 1; break; }
-        size_t tl = 0; char *txt = ds4_token_text(engine, token, &tl);
-        if (txt) { fwrite(txt, 1, tl, stdout); fflush(stdout); free(txt); }
-        double t_dec0 = dist_now_sec();
-        if (ds4_session_eval_layer_slice(session, &token, 1, pos, 0, last_layer,
-                                         NULL, NULL, true, logits, err, sizeof(err)) != 0) {
-            fprintf(stderr, "\nds4: TP leader: decode failed: %s\n", err);
-            rc = 1; break;
+        uint32_t n_copy = 0;
+        int copied[63];
+        if (copy_spec && row_logits) {
+            uint32_t src = 0, want = copy_spec_len;
+            if (want > 63u) want = 63u;
+            ds4_tokens_push(&transcript, token);   /* match the suffix ending at token */
+            (void)dist_copy_spec_match(transcript.v, (uint32_t)transcript.len,
+                                       dist_copy_spec_ngram(), want, copied, &n_copy, &src);
+            transcript.len--;                       /* pop the trial token */
+            for (uint32_t j = 0; j < n_copy; j++) if (copied[j] == eos) { n_copy = j + 1u; break; }
+            if (gen->ctx_size > 0 && pos + 1u + n_copy > (uint32_t)gen->ctx_size)
+                n_copy = (pos + 1u < (uint32_t)gen->ctx_size) ? (uint32_t)gen->ctx_size - (pos + 1u) : 0u;
+            if (n_copy < dist_copy_spec_min_copy()) n_copy = 0;
         }
-        t_decode_sum += dist_now_sec() - t_dec0;
-        decoded++;
-        pos++;
+        double t_dec0 = dist_now_sec();
+        if (n_copy >= 2u) {
+            /* VERIFY BATCH: both peers eval [token, copied...] full (warm); leader
+             * accepts the argmax-matching prefix, both roll back to the boundary. */
+            int batch[64];
+            batch[0] = token;
+            for (uint32_t j = 0; j < n_copy; j++) batch[1u + j] = copied[j];
+            uint32_t kb = 1u + n_copy;
+            if (dist_tp_send_batch(tp, batch, kb) != 0) { fprintf(stderr, "ds4: TP leader: send batch failed\n"); rc = 1; break; }
+            if (ds4_session_verify_batch_argmax(session, batch, kb, pos, 0, last_layer,
+                                                NULL, row_logits, err, sizeof(err)) != 0) {
+                fprintf(stderr, "\nds4: TP leader: verify batch failed: %s\n", err); rc = 1; break;
+            }
+            int accepted[64]; accepted[0] = token; int n_acc = 1; bool hit_eos = false;
+            for (uint32_t j = 0; j < n_copy; j++) {
+                int pred = dist_tp_argmax(row_logits + (size_t)j * (size_t)vocab, vocab);
+                if (pred != copied[j]) break;
+                accepted[n_acc++] = copied[j];
+                if (copied[j] == eos) { hit_eos = true; break; }
+            }
+            uint32_t m = (uint32_t)n_acc - 1u;   /* matched copies; row m predicts the next token */
+            memcpy(logits, row_logits + (size_t)m * (size_t)vocab, (size_t)vocab * sizeof(float));
+            if (dist_tp_send_accept(tp, (uint32_t)n_acc) != 0) { fprintf(stderr, "ds4: TP leader: send accept failed\n"); rc = 1; break; }
+            (void)ds4_session_layer_slice_rollback(session, pos + (uint32_t)n_acc, err, sizeof(err));
+            t_decode_sum += dist_now_sec() - t_dec0;
+            for (int i = 0; i < n_acc; i++) {
+                size_t tl = 0; char *txt = ds4_token_text(engine, accepted[i], &tl);
+                if (txt) { fwrite(txt, 1, tl, stdout); fflush(stdout); free(txt); }
+                ds4_tokens_push(&transcript, accepted[i]);
+            }
+            copy_spec_len = (m == n_copy) ? (copy_spec_len < 16u ? copy_spec_len * 4u : 63u)
+                                          : (m <= 1u ? dist_copy_spec_init_len() : copy_spec_len);
+            if (copy_spec_len > 63u) copy_spec_len = 63u;
+            pos += (uint32_t)n_acc; decoded += n_acc; n += n_acc;
+            if (hit_eos) break;
+        } else {
+            /* BARE round: single token through the Phase-3 expert-split decode path
+             * (per-layer TP all-reduce in lockstep with the follower). */
+            if (dist_tp_send_batch(tp, &token, 1u) != 0) { fprintf(stderr, "ds4: TP leader: send step failed\n"); rc = 1; break; }
+            size_t tl = 0; char *txt = ds4_token_text(engine, token, &tl);
+            if (txt) { fwrite(txt, 1, tl, stdout); fflush(stdout); free(txt); }
+            if (ds4_session_eval_layer_slice(session, &token, 1, pos, 0, last_layer,
+                                             NULL, NULL, true, logits, err, sizeof(err)) != 0) {
+                fprintf(stderr, "\nds4: TP leader: decode failed: %s\n", err); rc = 1; break;
+            }
+            t_decode_sum += dist_now_sec() - t_dec0;
+            if (copy_spec) ds4_tokens_push(&transcript, token);
+            pos++; decoded++; n++;
+        }
     }
-    dist_tp_send_step(tp, -1); /* signal follower to stop */
+    ds4_tokens_free(&transcript);
+    free(row_logits);
+    dist_tp_send_batch(tp, NULL, 0u); /* n=0 signals follower to stop */
     fputc('\n', stdout);
     fprintf(stderr,
             "ds4: TP leader: prefill %d tok in %.3fs (%.1f tok/s) | decode %d tok in %.3fs (%.2f tok/s)\n",
@@ -10572,18 +10691,36 @@ static int dist_run_tp_follower(ds4_engine *engine, const ds4_dist_options *opt,
     }
     fprintf(stderr, "ds4: TP follower: prefilled %d prompt tokens, following leader\n", prompt.len);
     uint32_t pos = (uint32_t)prompt.len;
-    for (;;) {
-        int32_t token = 0;
-        if (dist_tp_recv_step(tp, &token) != 0) { fprintf(stderr, "ds4: TP follower: recv step failed\n"); break; }
-        if (token < 0) break; /* leader signaled stop */
-        int token_i = (int)token;
-        if (ds4_session_eval_layer_slice(session, &token_i, 1, pos, 0, last_layer,
-                                         NULL, NULL, false, NULL, err, sizeof(err)) != 0) {
-            fprintf(stderr, "ds4: TP follower: decode failed: %s\n", err);
-            break;
+    /* copy-spec: mirror the leader's batch protocol. n=1 -> bare round (Phase-3
+     * expert-split single-token, lockstep AR); n>1 -> verify batch (full, no AR)
+     * then recv accept_len and roll the slice KV back to the accepted boundary so
+     * both peers stay in sync; n=0 -> stop. row_logits is required by
+     * verify_batch_argmax even though the follower discards it. */
+    const int vocab = ds4_engine_vocab_size(engine);
+    float *row_logits = malloc((size_t)64 * (size_t)vocab * sizeof(float));
+    int batch[64];
+    while (row_logits) {
+        uint32_t n = 0;
+        if (dist_tp_recv_batch(tp, batch, 64u, &n) != 0) { fprintf(stderr, "ds4: TP follower: recv batch failed\n"); break; }
+        if (n == 0) break;   /* leader signaled stop */
+        if (n == 1) {
+            if (ds4_session_eval_layer_slice(session, batch, 1, pos, 0, last_layer,
+                                             NULL, NULL, false, NULL, err, sizeof(err)) != 0) {
+                fprintf(stderr, "ds4: TP follower: decode failed: %s\n", err); break;
+            }
+            pos++;
+        } else {
+            if (ds4_session_verify_batch_argmax(session, batch, n, pos, 0, last_layer,
+                                                NULL, row_logits, err, sizeof(err)) != 0) {
+                fprintf(stderr, "ds4: TP follower: verify batch failed: %s\n", err); break;
+            }
+            uint32_t accept_len = 0;
+            if (dist_tp_recv_accept(tp, &accept_len) != 0) { fprintf(stderr, "ds4: TP follower: recv accept failed\n"); break; }
+            (void)ds4_session_layer_slice_rollback(session, pos + accept_len, err, sizeof(err));
+            pos += accept_len;
         }
-        pos++;
     }
+    free(row_logits);
     ds4_tokens_free(&prompt);
     ds4_session_free(session);
     return 0;

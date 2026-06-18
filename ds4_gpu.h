@@ -184,6 +184,21 @@ int ds4_gpu_matmul_q8_0_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+/* TP row-parallel Q8_0 matvec (decode/n_tok=1). Computes a PARTIAL out[out_dim]
+ * over the input-dim block range [0, in_dim_slice) of each weight row, rows
+ * strided by in_dim_full. weight_offset is pre-shifted to the owned slice start;
+ * x is the compacted [in_dim_slice]. All-reduce the result across TP peers to get
+ * the full matvec (~1e-6 drift vs single-machine — inherent to row-parallel). */
+int ds4_gpu_matmul_q8_0_rowslice_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim_full,
+        uint64_t                in_dim_slice,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x);
+
 int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,
@@ -748,6 +763,8 @@ int ds4_gpu_routed_moe_batch_tensor(
         const ds4_gpu_tensor *x,
         uint32_t                layer_index,
         uint32_t                n_tokens,
+        uint32_t                slot_start,   /* TP Phase-3 batch split: owned slot range */
+        uint32_t                slot_count,   /* 0 or n_expert => no split (full) */
         bool                   *mid_is_f16);
 
 /* =========================================================================

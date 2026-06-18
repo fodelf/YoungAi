@@ -3675,3 +3675,198 @@ copy-spec 赖以整段接受的"逐字复现上下文"被打断 (tok/call 5.39�
 - 全 build 绿。smoke 域 spec-pipe 无效 (n_copy=0 不 arm), 通用问答仍 ~2.1 (与开关无关) —— +7.4% 是编辑/重复文本域的胜利, 与项目"编程域有效 t/s"定位一致。
 
 **待办**: 链式多轮 spec-pipe (现仅单次前瞻 N→N+1; 长 verbatim 区可链 N→N+1→N+2…, 每多轮只花 worker 时间, 数据推导 ~1.6× → ~6 t/s)。
+
+## 2026-06-17 — 第七十波: 链式多轮 spec-pipe (off-by-one bug→修复→深链 5.25, 分叉受限) (用户实跑, 经授权入日志)
+
+**承接 wave-69 待办 (单次前瞻 N→N+1 扩成链 N→N+1→N+2…)。全程 code-edit-heavy 档。**
+
+**① 链式 spec-pipe 实现 (ds4_distributed.c, ~line 6938):** 把 wave-69 的"一次性第二轮"块替换为 CHAIN LOOP——
+`while (depth < max_depth && cur_hidden && cur.ok && cur_kb≥2 && cur.toks[0]==argmax(logits) && n_acc+cur_kb≤accepted_cap)`:
+预测+arm 下一轮 cb (into `nxt`/`nxt_hidden`) → 用 `spec_precomputed_hidden=cur_hidden`+`accept_len=prev_kept` eval 当前轮 → 接受行 → full 则推进 (`cur=nxt; depth++`) 否则 break。循环后统一 `layer_slice_rollback(final_pos)`; chain_err 走 transcript 重建。`DS4_DIST_SPEC_PIPE_DEPTH` (默认 4, 钳 1-7)。缓冲随之 `toks[129]→toks[513]` (容 depth≤7)。
+
+**② off-by-one bug 发现+修复 (Run J→K):**
+- Run J (链初版): **decode 4.73 ≈ 基线**, 链从不超 depth 0 (假深)。
+- **根因 = `nxt_src = cur_src + (cur_kb - 1u)`**: 下一轮 copy 源起点错位到"上一轮最后一个已发 token"→ 下一轮预测与已发对不齐 → `predmatch` 永远 fail → 链停在 chain[0]。**非正确性 bug (仍 bit-exact), 只锁死深度。**
+- **修复 `nxt_src = cur_src + cur_kb`**。
+
+**③ Run K (修复后, SPEC_PIPE=1 DEPTH=4) — 用户实测:**
+
+| 跑 | 配置 | decode | vs 基线 4.72 |
+|---|---|---|---|
+| Run C | SPEC_PIPE=0 | 4.72 | — |
+| Run I (wave-69) | 单前瞻 (buf 129) | 5.07 | +7.4% |
+| Run J | 链 (off-by-one) | 4.73 | 假深 (bug) |
+| **Run K** | **链 (修复, buf 513)** | **5.25** | **+11.2%** |
+
+- **深链确认**: 观测到 `chain[0]→[1]→[2]` (一条 64+64 全接受 +51 partial = 3 连轮真深链); 另一条 13(full)+49(partial)=depth1。fwd/call 1.21→1.42。
+- **bit-exact ✓**: accepted=303 与基线全等, 无 desync。
+
+**④ 收敛结论 (实测): 链是分叉受限, 非深度受限。** code-edit-heavy 的 verbatim 区只 ~3 cycle 就分叉 (copy 源耗尽 / over-bet partial: 如 chain[1] sent=49 acc=39, chain[2] sent=64 acc=51), DEPTH=4 但实测只到 depth 2。**加大 DEPTH 无用**; chain 边际 (+3.6% vs 单前瞻) 比 wave-69 数据推导的 ~1.6× 小, 因 verbatim run 太短链不深。**spec-pipe 家族在 code-edit-heavy 工作负载 ~封顶 5.25。**
+
+**⑤ 本会话累计**: 4.72 → **5.25 (+11.2%)**, 全 bit-exact。剩余到 8.5 暖天花板 gap = partial-accept cycle (链停) + 未 fire cycle (主批非全接受), spec-pipe 够不到。
+
+**⑥ 已落地补丁 (本会话, 全 build 绿)**:
+- `ds4_distributed.c`: CHAIN LOOP (链式 spec-pipe) + `dist_spec_pipe_depth()` (`DS4_DIST_SPEC_PIPE_DEPTH` 默认 4) + off-by-one 修复 (`nxt_src = cur_src + cur_kb`)。
+- `ds4_cli.c`(×2)/`ds4_server.c`(×1): `toks[129]→toks[513]` (链深度缓冲)。
+- `tools/mtp_pipe_q2_speed.sh`: 默认 `SPEC_PIPE_DEPTH=4` (plumbed 进 BASE_RUN_ENV)。
+
+**待办 (下一步攻 partial-accept 链停, 本会话推进中)**: spec-pipe 在 partial-accept 后从分叉点 re-match 续链, 吃掉链停损失 (over-bet partial 是链深的硬上限)。
+
+## 2026-06-18 — 第七十一波: E0 RTT 实测 + TP width-split 裁决 (客观数据入日志, 裁决为用户指令)
+
+**承接 wave-70 (spec-pipe 封顶 5.25, 转 TP 结构杠杆)。E0 门 = p50 RTT ≤ 50µs。**
+
+**① 工具落地: `tools/tp_rtt_probe.c`** — 纯 C99 TCP ping-pong RTT 探针, 无 model/Metal/ds4 依赖 (内存安全, 不碰 81GiB base)。server 放 M1 (只 listen 零出站, 绕 [[tp_reverse_connect_workaround]] EHOSTUNREACH), client 放 M4 拨号。TCP_NODELAY + 1000 warmup。两机各编译绿。
+
+**② RTT 实测 (M4↔M1 雷电直连, 20000 iters/档, 客观数据):**
+
+| payload | min | p50 | p90 | p99 | max | E0门(50µs) |
+|---|---|---|---|---|---|---|
+| 8 B (延迟地板) | 46 | **84** | 97 | 112 | 192 | FAIL |
+| 16 KiB (n_embd F32) | 58 | **96** | 115 | 141 | 208 | FAIL |
+| 64 KiB (n_embd×n_hc F32, 真实单跳) | 97 | **140** | 174 | 197 | 270 | FAIL |
+
+**③ TP 收益账 (基于实测 RTT 推算, 待验证, 非最终结论):**
+- 满 TP all-reduce (attention 后 + MoE 后 ×2/层 × 43 层 = 86 syncs/token) × 140µs = **~12 ms/token sync**。
+- TP per-machine forward 减半 (decode 带宽 bound, 每机读半模型权重): 118ms→~59ms。
+- TP wall ≈ 59+12 = **71ms → ceiling ~14 t/s** (vs layer-pipeline 8.5)。门若过 (50µs) 也才 ~16 → **门 FAIL 非致命, sync 摩擦 ~17%**。
+- **真拦路虎**: landed skeleton 只 split MoE down_proj (ds4.h 注释), 而 wave-68 实测墙是 backbone+attention ~104ms (88%), MoE 仅 ~14ms。⇒ skeleton 即便验证通过近零收益; 兑现减半须 split MLA attention heads + dense backbone 宽度 (大改)。
+- 单次 forward 减半天花板: TP ~14-17。**注 (修正越界结论)**: 这是*单次 forward*上限, **不是编程域有效 t/s 的上限**——后者经 copy-spec + prefix 复用 + 专家贮存可叠加超越 (CLAUDE.md §3.5/P-Code)。30 t/s 仍是目标, 不判死 (memory [[feedback_no_ceiling_verdict_30ts]])。
+
+**④ 用户裁决 (指令)**: **投满 width-split TP** (split MLA attention heads + dense backbone, 目标 ~14 t/s)。下一步先 scope attention kernel 定 head-split 方案, 分阶段落地 + 逐步验证。
+
+## 2026-06-18 — 第七十二波: width-split TP 设计备忘 + Phase 1 落地 (用户认可入日志)
+
+**目标**: 抬"单次 forward 基速"乘数 (8.5→~14-17 单跳), 与编程域有效倍率 (copy-spec/prefix/专家贮存) 叠乘逼近 30 t/s 目标。**注: 单次 forward 上限 ≠ 有效 t/s 上限** (CLAUDE.md §3.5/P-Code; memory [[feedback_no_ceiling_verdict_30ts]])。
+
+**现状**: TP all-reduce transport (`ds4_dist_tp_allreduce_f32`, full-duplex exchange+sum, loopback self-test 绿) 实打实; 但 skeleton (ds4.c:9297 注释自述) 在 MoE down 处是"算全量→zero半边→allreduce"= #06 占位, **0 提速** (两机都做全活)。
+
+**正确性事实 (TP 固有, 非选项)**: column-parallel (切 output rows: gate/up) = bit-exact (不重新求和); row-parallel (切 input dim: down/o_proj) → all-reduce sum 改变浮点求和顺序 → **~1e-6 漂移**。⇒ 验证闸从 byte-identical 放宽到 `--dump-logprobs` tolerance + q1..q4 eval。
+
+**分阶段 (按 wave-68 带宽占比: backbone+attn 104ms/88% > MoE 14ms)**:
+- **Phase 1 — shared-expert dense FFN** (本波落地)
+- Phase 2 — MLA attention (q/kv/output_a column + output_b row)
+- Phase 3 — routed MoE 真实 expert-set split (替换 skeleton zero-half)
+- sync 融合: Megatron 式延迟归约, 每层 1-2 all-reduce; 43 层 = 43-86 syncs × 140µs (实测) = 6-12ms/token。
+
+**关键工程结论: Phase 1 零 .metal 改动 (纯 host 调参, 复用现 kernel)**:
+- Q8_0 权重 = [out_dim][in_dim] 行主序, 每行 in_dim/32 个 34B block; args struct 的 `ne00`(算几块) 与 `nb01`(行步长) 独立可设。
+- **gate/up column-split (bit-exact)**: `gate/up_offset += out_start*(n_embd/32)*34`, `out_dim=shared_dim/2`; kernel 输出行号从 0 起 → mid 自然压实写 [0, half)。
+- **down row-split (~1e-6)**: 新 host wrapper (复用 `kernel_mul_mv_q8_0_f32`): `ne00=shared_dim/2`(只遍历半块) + **`nb01` 覆写回全 `(shared_dim/32)*34`**(行步长不变) + weight base owned-high `+ (shared_dim/64)*34`, x=压实 mid[0,half) → partial out[n_embd] → all-reduce sum。
+- 接线: ds4.c shared-FFN 非融合分支 (TP 激活强走非融合绕开 fused down-hc); 每层 1 all-reduce [n_embd]=4096。
+- prefill (n_tok>1) 保持 replicated 全量 (bit-identical), 只 decode (n_tok=1) split——decode 才是目标。
+- 新 knob `DS4_TP_SHARED_SPLIT` 默认 OFF (= 现 skeleton 行为, A/B-able, 遵知识库 knob 默认 baseline 规则)。
+
+**验证计划 (待授权)**: 双机 `tp_layers=2` 起 → logprob-tolerance vs A3 baseline + 实测 sync vs 单块 compute 省。net-positive 才推 Phase 2。
+
+**Phase 1 落地验证 (客观)**: 新原语 `ds4_gpu_matmul_q8_0_rowslice_tensor` (ds4_metal.m, 复用 kernel_mul_mv_q8_0_f32, ne00=半块/nb01=全行步长) + 声明 (ds4_gpu.h) + 图接线 (ds4.c shared-FFN: gate/up column-split + down row-split + all-reduce, 新 knob DS4_TP_SHARED_SPLIT 默认 OFF) + 合成自检 `test_metal_q8_0_rowslice_tp` (tests/ds4_test.c, 挂 --metal-kernels)。全 build 绿。`./ds4_test --metal-kernels` 绿: split-then-sum vs CPU 参考过 max_abs<0.08/rms<0.02 ⇒ rowslice 数值正确, column-split 构造性 bit-exact。**双机端到端 (路线 B) 未验**。
+
+**Phase 1 双机首跑 (客观, 81GiB q2, tp_layers=2, CTX=256)**:
+- 内存安全: 两机 backbone 8.20 GiB resident, L1 gate 双双过 (8.20 < 11.72 GiB budget); 实测 RSS 远低 12G ⇒ **TP 在 81GiB 上内存可行 (全 backbone 进 16G 机)**。
+- **prefill TP 端到端跑通** (19 tok), 跨机 all-reduce 首次双机执行成功 (注: prefill 走 prefill_layer_major, 不经 encode_decode_layer 的 skeleton AR)。
+- **decode 失败** (生成 1 tok 后 "metal layer-slice full evaluation failed"): SHARED_SPLIT=1 与 **SHARED_SPLIT=0 (我的 Phase 1 全关) 同样失败** ⇒ **bug 是既有 TP decode 路径 (skeleton AR @ ds4.c:11187), 非 Phase 1**。根因: skeleton 的 decode AR 从没双机验证过 (prefill 不经此路径), decode 是首次真正执行即暴露。
+- 已加 `DS4_TP_AR_LOG` 逐步诊断 (6 步 AR), 待定位失败步。harness `tools/tp_q2_phase1.sh` 落地 (内存安全闸: L1 gate + 12/12 看门狗 + offload/no-warmup)。
+
+**Phase 1 decode bug 根因 + 修复 (DS4_TP_AR_LOG 诊断定位, 已落地待验)**:
+- 诊断: leader il=0 AR `signal/flush/host_wait/read ok=1, allreduce ok=0`; worker **无任何 tp-ar 日志** → "recv step failed" → worker 第一个 decode step 的 `dist_tp_recv_step` 就失败, 从没进 AR → leader allreduce 无对端 → ok=0。
+- **真根因**: TP socket 非阻塞 (为 full-duplex AR pump 设, dist_tp_alloc O_NONBLOCK), 而 `dist_read_full`/`dist_write_full` (1482/1467) 只处理 EINTR, **EAGAIN/EWOULDBLOCK 直接返回 -1**。worker prefill 耗 ~18s 后比 leader 先到 recv_step, 数据未达 → recv EAGAIN → 失败。recv_prompt 早期数据已就绪侥幸通过。
+- **修复**: `dist_read_full`/`dist_write_full` 加 EAGAIN/EWOULDBLOCK → `poll(POLLIN/POLLOUT, 60s)` 重试。阻塞 socket (layer-pipeline) 永不触发 EAGAIN ⇒ 对其为死代码, 安全。build 绿。
+- 这是既有 TP 路径 bug (非 Phase 1); 修它是任何 TP decode (含 Phase 2/3) 的前置。
+
+**Phase 1 双机 TP decode 验证通过 (客观, SHARED_SPLIT=1, EAGAIN 修复后)**:
+- `tp-ar il=0/1 step=signal/flush/host_wait/read/allreduce/write` 全 ok=1 (leader + worker 双方); decode 24 tok 完成无失败; 生成文本关于 hash table 连贯正确。⇒ **EAGAIN 修复生效 + Phase 1 shared-split decode AR 端到端工作 + 输出语义正确 + 内存安全**。TP decode 路径首次双机跑通。
+- **速度 0.45 t/s (tp_layers=2, 非性能档)**: 53.9s/24tok = 2.25s/token。41/43 层两机全冗余算 (无 compute 省) + 每 token 4 个 AR (2 层 × skeleton+shared) + AR_LOG I/O + 锁步等慢机。**~0.46s/AR**, 远超 RTT(140µs) → 主因 = **flush 把 batch drain + expert-offload 每次 flush 重 gather 专家** (tp_k4 脚本 line 41-43 已警告 offload×TP-flush 放大屏障税)。
+- **关键工程结论**: TP-at-scale 的瓶颈是 **AR 的 flush×offload re-gather 屏障税**, 不是 RTT。Phase 2 必须 (a) 每层融合成 1 个 AR (b) 解决 flush 触发的 expert re-gather (如 AR 不 drain 整 batch / 错开 offload)。
+
+**AR 成本拆解 (客观, 修正上一条 "屏障税" 误判)**:
+- DS4_TP_AR_LOG 计时 (48 ARs, tp_layers=2): **avg drain=1.9ms (signal+flush+host_wait GPU drain), avg net=7.4ms (read+allreduce+write)**; 典型 net 0.1ms, 偶发尖峰 13-24ms。AR total ≈ 18ms/token = decode (2.39s/token) 的 **<1%**。
+- **修正**: 上一条 "~0.46s/AR flush×offload 屏障税" **是误判** (错用 总overhead÷AR数 + 误设单机基线 0.48s)。**AR 不是墙**; decode 慢 = 冷专家流式 (A3 根本成本, no-warmup+短gen ~1.70GiB/token), 与 TP 无关。TCP_NODELAY 两端已设, net 尖峰 = lockstep skew (worker 略慢 leader 在 exchange 等)。
+- **战略重判 (数据推导)**: ① 全 TP 的 AR drain ~1.9ms/层 × 43 ≈ 82ms/token, vs backbone compute halving ~52ms → **Phase 2 (attention/backbone) 提速边际** (AR ≈ compute 省)。② 但 decode 主导成本 = **专家 IO (冷 ~2.4s/token)**; TP split 专家 → 每机只流半数 (1.70→0.85 GiB/token) → ~1.2s/token 省, 碾压 82ms AR。⇒ **Phase 3 (routed MoE 真实 expert split) 很可能 > Phase 2**, 是 81GiB-on-16GB 冷/流式场景的大杠杆。
+
+## 2026-06-18 — Phase 3 (routed MoE expert split) 落地 + 验证通过 (客观)
+
+**实现 (零 .metal 改动, host-side, 镜像 Phase 1)**: ds4.c routed_moe 调用处, `DS4_TP_EXPERT_SPLIT=1` 时传 router_selected/weights 的**半-slot view** (owns_low slots[0,k), owns_high [k,n_used); n_used=6→k=3) + n_expert=k → `compact_selected_experts` 只收 k 个专家 → gather 只拉 k 个。AR 块: expert-split 时跳过 zero-half (partial 已是 owned-slot 加权和), 直接 AR sum → 完整 routed_out。新 knob `DS4_TP_EXPERT_SPLIT` 默认 OFF。harness 加 EXPERT_SPLIT/EXPERT_IO_PROFILE knob。build 绿。
+**验证 (双机 81GiB, SHARED_SPLIT=0 EXPERT_SPLIT=1 tp_layers=2, EXPERT_IO_PROFILE=1)**:
+- **IO 减半实证**: split 层 il=0,1 `site=decode n_active=3 cold_mib=20.2` (vs 非split il≥2 `n_active=6 cold_mib=40.5`); leader(owns_low)拉 [0,3)、worker(owns_high)拉 [3,6) 各 3 个, 合覆盖全 6。
+- **输出正确**: "A hash table is a data structure that maps keys to values using a hash function, which computes an index into an array" — 连贯正确 ⇒ Phase 3 sum-等价成立。decode 24 tok 无失败。
+- 速度仍 0.43 t/s (仅 2/43 层 split, 整体 IO 省微小)。**真实提速需 tp_layers=43 (halve 全量 1.70 GiB/token 专家 IO)**, 待 A/B (EXPERT_SPLIT=0 vs 1 @ tp_layers=43)。
+
+**Phase 3 全层测速 (客观, 双机 81GiB, tp_layers=43, EXPERT_SPLIT=1, AR_LOG/IO_PROFILE 关)**:
+- **decode 0.43 → 1.28 t/s (~3×)**: 24 tok in 18.775s = 0.78s/token (基准 tp_layers=2 ≈ 单机冷 2.39s/token)。prefill 0.9 t/s。
+- 输出与 baseline 全一致正确 ("A hash table is a data structure that maps keys to values using a hash function, which computes an index into an array")。两机内存安全 (peak 远低 12G)。
+- 机制: 每机各用自己 SSD 并行拉半数专家 → 专家 IO 1.70→0.85 GiB/token/机。43 个 AR 的开销 (~balanced lockstep, net 回落) 没吃掉 IO 省 → 净 ~3×。**修正之前 "~净平" 的悲观预测 (单点负面推演不算判决, 实测为准)。**
+- 这是 minimal TP env (无 prefetch/copy-spec/MTP/Phase1/2)。Phase 3 与那些正交可叠加。**战略验证: IO-bound 冷场景 Phase 3 (IO split) 是数量级杠杆, > Phase 2 (backbone)。** 严格 A/B (EXPERT_SPLIT=0 @ tp_layers=43) 可后补, 但 n_active=3 profile + 3× 已证因果。
+
+**TP+Phase3 叠加 metal IO 优化 — 净负 (客观, tp_layers=43 EXPERT_SPLIT=1 IO_OPT=1)**:
+- decode **0.49 t/s < Phase3 单独 1.28 t/s** (慢 ~2.6×), 输出仍正确。
+- 根因: 那套 IO 优化 (PREFETCH_AHEAD/FULL_LAYER_STREAM/MOE_OVERLAP) 为非-split 路径调, 假设"读全部专家", 与 expert split (只读半数) **冲突**——FULL_LAYER_STREAM 整层流式抵消半-split, PREFETCH 预读全 6 专家多读+污染 cache。
+- 结论 (非判决, 单点特定组合): 朴素叠加打架; **Phase 3 单独 1.28 是当前冷场景最优**。要 split-aware prefetch/stream 才能叠 (未来), 或换正交杠杆 (copy-spec 进 TP / Phase 2)。
+
+## 2026-06-18 — 修正: Phase 3 "~3×" 是假数 (基线错误) + TP 真实收益 + copy-spec-in-TP/batch-split/timeout 实况
+
+**修正前述 "~3×" (用户要求重审, 客观)**:
+- **真单机冷 smoke decode = 1.02 t/s** (M4 单跑, offload+no-warmup+L1 gate, 同配置)。
+- TP+Phase3 (tp_layers=43) 冷 smoke = 1.28 t/s。**真实倍数 = 1.28/1.02 = ~1.25×, 不是 3×。**
+- 之前的 "3×" = 1.28/0.43, 但 0.43 是 tp_layers=2 (两机全冗余 + 2 AR/token + lockstep), 比真单机慢 ~2.4× → **烂基线, 3× 作废**。
+- 冷态 IO-bound: 两 SSD 各拉半专家理想 ~2× (490ms/token); 实测 781ms/token → **AR 开销 ~291ms/token (~7ms/层×43) 吃掉了一半 IO 收益** → 1.25×。⇒ **攻 AR 把 ~7ms/层压下去 = 把被偷的 IO 并行赚回, 冷态 1.28→~2.0 的空间**。
+
+**copy-spec-in-TP / batch-split / timeout 实况 (客观)**:
+- copy-spec-in-TP 功能正确 (verify 批 fire, n_tokens=13; 输出正确 rename), 但 **decode 暖态 code-edit 2.10/0.88 t/s << 单机 3.77** (暖态 compute-bound, TP 无 compute split 只加 AR → 必输)。token-20 还有协议 desync bug (未修)。
+- **batch-split (prefill) 净负**: 90 chunk×43 层 = ~3870 batch AR, drain 开销 > IO 省 (688s > 冗余 281s)。已 gate 成独立 env `DS4_TP_EXPERT_SPLIT_BATCH` 默认关。
+- 超时 band-aid 已去除 (dist_read/write_full 改阻塞 poll(-1) 等对端, recv==0 检测关闭)。mtp_pipe 加 `TP=1` 开关 + TP 模式关冲突 IO-opt (prefetch/full-layer-stream 与 split 打架)。
+- **战略**: TP 只在冷态 (smoke/long-context, IO-bound) 有 ~1.25× 且可经攻 AR 拉到 ~2×; 暖态 code-edit 单机赢。
+
+## 2026-06-18 — 攻 AR: 非对称专家切分消 lockstep skew (冷态 TP 1.25×→1.64×, 实测)
+
+**真因**: 冷态 TP AR 开销 (~291ms/tok @ 50/50) 主要是 lockstep skew —— coordinator(M4) 额外干 output head + 采样 + copy-spec match, per-token 比 worker(M1, 纯 backbone) 重, 每层 AR 时 M1 等 M4 (或反之失衡)。**不是 AR 机制本身, 是负载失衡**。
+**修复**: `DS4_TP_SPLIT_LOW` = coordinator(owns_low) 的专家数 (默认 n_used/2=3); 调低让 M4 少算补偿其 coordinator 负担。ds4.c 单-token Phase3 split 处可调 (view 切 owned slots)。
+**实测 (冷 smoke, NPRED=24, 同 mtp_pipe TP)**: 单机 1.02 | 50/50(M4=3) 1.28 | M4=4 1.12 | **M4=2/M1=4 1.67 (峰值)** | M4=1 1.45。⇒ **最优 SPLIT_LOW=2: 冷态 1.02→1.67 = 1.64× over 单机** (50/50 仅 1.25×); +30% over 50/50。输出正确。理想 IO-split 2× (490ms/tok) 已逼近 (1.67=600ms/tok)。
+**定位**: TP 冷/long-context (IO-bound) 域的有效配置 = EXPERT_SPLIT + SPLIT_LOW=2。暖态 code-edit 仍单机 (3.77) 域。mtp_pipe TP 块 TP_SPLIT_LOW 默认设 2。
+
+## 2026-06-18 — 第七十三波: MoE-thin bare-round 实测 (客观数据, 结论待批)
+**配置**: PROMPT_PROFILE=code-edit-heavy, MOE_THIN_TOPK=4 MIN_TOKENS=1 MAX_TOKENS=1 (只瘦 n=1 bare round, verify 批不动), 其余 baseline (NO_MTP=1 COPY_SPEC=1 SPEC_PIPE=1, auto-split coord 0:19 / worker 20:output)。
+**内存**: L1 闸 planned resident 4.07 GiB < 11.72 budget; 看门狗 coord ≤4.8G / worker ≤2.8G, 12/12 安全。
+**武装确认**: 引擎日志 "MoE activation thinning enabled (alpha=0.0000 topk=4 min_tokens=1 max_tokens=1)"; decode n_tokens=1 行 n_active=4 (降激活生效), batch n_tokens=49 行 n_active=160 (verify 批未瘦, bit-exact)。
+**实测**: prefill 21.99 t/s, **generation 5.40 t/s** (基线 5.26, +2.7%, 噪声内)。
+**客观分解** (coordinator dist-mtp + copy-spec 行):
+- copy-spec verify 批 r2_ms = 2687(sent4/acc4) / 7555(sent49/acc6) / 8223(sent49/acc5) / 8200(sent49/acc49)。
+- dist-mtp summary: calls=12 round1=12 verify=4 accepted=303 tok/call=25.25 forwards=17 fwd/call=1.42 tok/fwd=17.82。
+- bare round (decode n_tokens=1): cold_mib 6.8-20.2 (pool 已暖), wall 4-14ms/层 (非 wave-69 的 0.6s/tok)。
+
+## 2026-06-18 — 第七十四波: Phase 2 (跨机 attention compute-split) 代码级否定 (客观证据, 裁决待批)
+**调查路径** (无新增运行, 纯读码): dist_run_tp_leader/follower (ds4_distributed.c:10512/10661) + batch AR (ds4.c:14201-14215) + Metal drain (ds4_metal.m:4478/4574/4586)。
+**客观事实**:
+1. 当前 TP copy-spec 的 verify 批 (n>1) 是**两机各自 full 评估 (no split, no AR)** —— verify 批在 TP 下不省 compute (leader/follower 都 ds4_session_verify_batch_argmax 全量), 只靠 accept_len 同步 rollback。这是 TP 暖态输的根因。
+2. 唯一的 batch-AR 路径 DS4_TP_EXPERT_SPLIT_BATCH (ds4.c:14156) 实测 prefill 281→688s (wave-72), 代码注释 (14152-14155) 自记根因 = "drain overhead" (每 chunk×layer 一次 AR)。
+3. batch AR 的 host_wait (ds4_metal.m:4586) **已是快路径** waitUntilSignaledValue (<50µs, 非 waitUntilCompleted)。故 overhead 不是 wait 延迟。
+4. 真因 = **结构性 GPU 流水中断**: 正常 batch 评估把 43 层在单 CB 流流水跑 (零主机同步); per-layer 跨机 AR (signal→flush→host_wait→tensor_read→allreduce→tensor_write) 强制 GPU 每层 stall 等 host+网络往返 → 失去跨层 pipelining。decode (n=1) 不受影响因 A3 expert gather 本就每层 drain (AR <1% 搭车); batch 路径本无 drain, 加 AR = 净增 43×batch 次 stall。
+5. Thunderbolt Mac 无 GPU-direct AR, 主机往返绕不开; 层间有顺序依赖, AR 无法 defer 或与计算 overlap。
+**含义**: 双机 compute-split (Phase 2 attention head-split 同理) 撞硬件互联墙, 非可调参数。非 30-不可达裁决, 是此机制在此硬件的边界。
+
+## 2026-06-18 — 第七十五波: COPY_SPEC_GROWTH=2 A/B (实测, 客观)
+**配置**: PROMPT_PROFILE=code-edit-heavy COPY_SPEC_GROWTH=2, 其余 = wave-73 基线 (MoE-thin topk=4/max1 默认)。
+**实测**: prefill 22.58, **generation 5.07 t/s** (基线 5.40, -6%)。
+**关键客观事实**: verify 行 sent 仍 = 49 (acc=4/6/5/49, 与基线 sent 相同)。next_len 渐进 (6→48→48→63) 证明 GROWTH=2 只放慢 copy_spec_len 增长, 未改 sent。**sent = transcript 逐字匹配长度 (n_copy), 非增长 ladder 控**; 匹配 48 个逐字 token 即发 49, 但模型第 5 个分叉 → over-bet。
+**含义 (客观)**: bet-sizing 三杠杆 (GROWTH -6% / re-anchor wave-68 -7% / cap 理论中性) 均无效, 因 over-bet 根因 = 逐字匹配长度 ≠ 模型同意度 + 分叉不可预测。
+
+## 2026-06-18 — 第七十六波: replay 多轮编辑实测 (客观)
+**配置**: PROMPT_PROFILE=replay (3轮: 写代码→改名全量重输→加异常全量重输), 双机 layer-pipeline, NPRED=128, MoE-thin 默认。
+**per-turn 实测**: 轮1 cached=0/suffix=62/TTFT=8598ms/decode 2.16; 轮2 cached=190/suffix=27/TTFT=5405ms/decode 5.20; 轮3 cached=345/suffix=23/TTFT=17846ms/decode 3.44。
+**dist-mtp**: calls=147 round1=147 verify=9 first_hit=6.12% accepted=384 tok/call=2.61 tok/fwd=2.51 (138/147 = bare round)。
+**客观结论**: ① prefix KV 跨轮复用对 prefill compute 生效 (cached 0→345, suffix 缩), 但 TTFT 反升 (轮3 17.8s/23 suffix) = cold-expert SSD IO bound, 非 prefill compute。② copy-spec 在短代码 (~30行) 几乎不命中 (first_hit 6.12%, 大多 bare); copy-spec full-hit 需大文件长逐字段。③ code-edit-heavy 的 bare round cold_mib=6-20 (pool 已warm) → 那场景墙=compute; replay/smoke 冷场景 pool 救不动。"专家贮存"对 code-edit 无 IO 可省。
+
+## 2026-06-18 — 第七十七波: backbone compute profiling (Q8 matmul + flash-attn stage, 客观)
+**配置**: code-edit-heavy + DS4_METAL_Q8_PREFILL_PROFILE=1 + DS4_METAL_FLASH_ATTN_STAGE_PROFILE=1 (诊断跑, 读 prefill 大批 360-tok breakdown)。
+**稳态每层 backbone 拆解 (360-tok chunk)**:
+- Q up-proj 1024→32768: **9.7ms** (最大单项, naive MLA 把 latent 解压到 64×512 全 Q)
+- O-proj 8192→4096: **8.8ms**
+- flash attention: 4.9ms
+- Q-down 4096→1024: 1.4ms; KV-down 4096→512: 0.8ms
+- shared FFN gate/up 4096→2048: 3.1/2.4ms; down 2048→4096: 2.4ms
+**客观结论**: attention 块 (Q-up+O-proj+attn ≈ 24ms) 碾压 shared FFN (7.8ms)。decode/verify 批是 weight-bandwidth-bound (每批读 ~5GB backbone 权重, 摊到 bet 大小)。Q8 GEMM ~70-80% 理论效率。最大单项 Q-up 解压到 32768 = naive MLA 特征 → 疑似可用 matrix-absorption 消除 (待确认 decode 路径)。
+
+## 2026-06-18 — 第七十八波: NAX 非对齐垫行 (bit-exact, 实测中性) + 真墙重定位
+**改动**: ds4_metal.m matmul 把非 %32 n_tok 垫到 %32 走快 NAX MMA (容量 guard, 垫行忽略); tests/ds4_test.c 加 n_tok=49 非对齐用例。
+**门**: `./ds4_test --metal-kernels` = OK (含新 49-tok 用例); 双机 code-edit-heavy 输出与基线逐字节 IDENTICAL (1186B) = bit-exact 铁证。
+**实测**: prefill 22.16, generation **5.39 t/s** (基线 5.40, 噪声内, 无提速)。verify r2_ms 7586/8455/8193 ≈ 基线。
+**真墙重定位 (客观)**: verify 批 r2_ms=8s/49tok 里, backbone Q8 matmul (profile 的 Q-up/O-proj) 仅 ~1s ≈ 13%; per-layer gather drain_ms=38-82ms (EXPERT_EVENT_DRAIN=1 已快路径, 故 drain=真实 GPU 计算) ×43 = 1.6-3.5s; **routed-expert matmul (6 专家×49tok×43层, moe.metal 路径) = 未被 Q8_PREFILL_PROFILE 覆盖的 compute 大头**。⇒ kernel-opt 该打 routed-expert matmul 而非 backbone。NAX 改动 bit-exact 保留 (引擎偏好路径, 无害), 但此 workload 中性。

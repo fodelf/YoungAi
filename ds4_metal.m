@@ -5987,15 +5987,31 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
          * staging RHS into threadgroup memory and was the direct replacement for
          * the slower generic MPP prototype.
          */
+        /* wave-78: round n_tok up to a multiple of 32 so non-aligned batches
+         * (notably copy-spec verify batches sized 1+n_copy, e.g. 49) still hit
+         * the fast NAX direct-RHS MMA path instead of the slower bounds-checked
+         * generic mul_mm. The padded rows out[n_tok..n_tok_nax) compute garbage
+         * the caller never reads; rows [0,n_tok) are bit-identical. Only engaged
+         * when the (pc-sized) activation/output buffers actually hold the padded
+         * rows -- otherwise n_tok_nax stays n_tok and the %32 gate below is the
+         * original behaviour (no OOB possible). */
+        uint64_t n_tok_nax = n_tok;
+        if ((n_tok % 32u) != 0u) {
+            const uint64_t padded = ((n_tok + 31u) / 32u) * 32u;
+            if (ds4_gpu_tensor_bytes(x)   >= padded * in_dim  * sizeof(float) &&
+                ds4_gpu_tensor_bytes(out) >= padded * out_dim * sizeof(float)) {
+                n_tok_nax = padded;
+            }
+        }
         if (ds4_gpu_mpp_available() &&
-            n_tok >= 32u &&
+            n_tok_nax >= 32u &&
             (in_dim % 64u) == 0 &&
             (out_dim % 64u) == 0 &&
-            (n_tok % 32u) == 0) {
+            (n_tok_nax % 32u) == 0) {
             uint64_t nax_tile_n = 32u;
-            if ((n_tok % 128u) == 0) {
+            if ((n_tok_nax % 128u) == 0) {
                 nax_tile_n = 128u;
-            } else if ((n_tok % 64u) == 0) {
+            } else if ((n_tok_nax % 64u) == 0) {
                 nax_tile_n = 64u;
             }
             const char *nax_fn = nax_tile_n == 128u
@@ -6006,7 +6022,7 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
             id<MTLComputePipelineState> pipeline =
                 ds4_gpu_get_mul_mm_pipeline(nax_fn, false, false);
             if (pipeline) {
-                ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(in_dim, out_dim, n_tok, row_bytes);
+                ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(in_dim, out_dim, n_tok_nax, row_bytes);
 
                 id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
                 [enc setComputePipelineState:pipeline];
@@ -6015,7 +6031,7 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
                 [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
                 [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
                 [enc setThreadgroupMemoryLength:64u * 32u * sizeof(uint16_t) atIndex:0];
-                [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(n_tok / nax_tile_n),
+                [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(n_tok_nax / nax_tile_n),
                                                       (NSUInteger)out_dim / 64u,
                                                       1)
                      threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
@@ -6125,6 +6141,92 @@ int ds4_gpu_matmul_q8_0_tensor(
         }
     }
     return ok;
+}
+
+/* Tensor-parallel row-parallel Q8_0 matvec (decode/n_tok=1 only).
+ *
+ * Computes a PARTIAL out[out_dim] using only the input-dim block range
+ * [0, in_dim_slice) of each weight row, where rows are strided by the FULL
+ * in_dim_full row size. The caller pre-shifts `weight_offset` to the owned
+ * slice's first block (base + in_block_start*34) and passes the compacted
+ * x[in_dim_slice]. Each TP peer's result is a partial sum over its in-dim half;
+ * an all-reduce across peers reconstructs the full matvec (associativity differs
+ * from a single-machine reduction => ~1e-6 drift, not bit-identical — inherent to
+ * TP row-parallel). Reuses kernel_mul_mv_q8_0_f32 (no .metal change): the trick is
+ * ne00=slice (blocks to accumulate) while nb01=full row stride (row addressing). */
+int ds4_gpu_matmul_q8_0_rowslice_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim_full,
+        uint64_t                in_dim_slice,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if ((in_dim_full & 31u) != 0 || (in_dim_slice & 31u) != 0 ||
+        in_dim_slice == 0 || in_dim_slice > in_dim_full ||
+        in_dim_full > UINT32_MAX || out_dim > UINT32_MAX) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        const uint64_t x_bytes = in_dim_slice * sizeof(float);
+        const uint64_t out_bytes = out_dim * sizeof(float);
+        if (!xbuf || !outbuf ||
+            ds4_gpu_tensor_bytes(x) < x_bytes ||
+            ds4_gpu_tensor_bytes(out) < out_bytes) {
+            fprintf(stderr, "ds4: Metal Q8_0 rowslice matvec received undersized activation buffers\n");
+            return 0;
+        }
+
+        const uint64_t row_bytes_full  = (in_dim_full  / 32u) * 34u;
+        const uint64_t slice_row_bytes = (in_dim_slice / 32u) * 34u;
+        /* Span from the (pre-shifted) first owned block to the last row's owned end. */
+        const uint64_t weight_span = (out_dim - 1u) * row_bytes_full + slice_row_bytes;
+        if (weight_offset > model_size || weight_span > model_size - weight_offset) {
+            fprintf(stderr, "ds4: Metal Q8_0 rowslice matvec range is outside the mapped model\n");
+            return 0;
+        }
+
+        uint64_t inner_offset = 0;
+        id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(model_map, model_size, weight_offset,
+                                                      weight_span, &inner_offset);
+        if (!wbuf) return 0;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_q8_0_mv_args(in_dim_slice, out_dim);
+        mv_args.nb01 = row_bytes_full;   /* KEY: full row stride; ne00 stays the slice */
+        ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
+        if (out_dim > 65536u) mv_dispatch.nsg = 8;
+        mv_args.nr0 = mv_dispatch.nr0;
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_mul_mv_pipeline(mv_dispatch.function_name, mv_dispatch.nsg);
+        if (!pipeline) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&mv_args length:sizeof(mv_args) atIndex:0];
+        [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0,
+                                              1,
+                                              1)
+             threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "Q8_0 rowslice matvec")) {
+            return 0;
+        }
+        return 1;
+    }
 }
 
 int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
@@ -19894,6 +19996,8 @@ int ds4_gpu_routed_moe_batch_tensor(
         const ds4_gpu_tensor *x,
         uint32_t                layer_index,
         uint32_t                n_tokens,
+        uint32_t                slot_start,   /* TP Phase-3 batch split: owned slot range */
+        uint32_t                slot_count,   /* 0 or n_expert => no split (full) */
         bool                   *mid_is_f16) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out || !gate || !up || !mid || !x || !model_map || !selected || !weights ||
@@ -19979,6 +20083,23 @@ int ds4_gpu_routed_moe_batch_tensor(
                 const double drain_t0 = io_profile ? ds4_gpu_now_ms() : 0.0;
                 if (ds4_gpu_expert_drain_commands("routed MoE drain") == 0) return 0;
                 if (io_profile) drain_ms = ds4_gpu_now_ms() - drain_t0;
+            }
+            /* TP Phase-3 batch split: compact this peer's owned slot range to the
+             * front in place (selectedbuf/weightsbuf are CPU-visible after the drain),
+             * then run the rest with n_expert=slot_count so the gather/GEMM touch only
+             * half of each token's experts -> halves the cold batch (prefill) IO. The
+             * partial out is summed across peers by the caller's batch all-reduce.
+             * dst=t*cnt+j < src=t*n_expert+slot_start+j, so the forward copy is safe. */
+            if (slot_count > 0u && slot_count < n_expert) {
+                int32_t *sel = (int32_t *)((uint8_t *)selectedbuf.contents + selected_off);
+                float   *wt  = (float *)((uint8_t *)weightsbuf.contents + ds4_gpu_tensor_offset(weights));
+                for (uint32_t t = 0; t < n_tokens; t++) {
+                    for (uint32_t j = 0; j < slot_count; j++) {
+                        sel[(size_t)t * slot_count + j] = sel[(size_t)t * n_expert + slot_start + j];
+                        wt[(size_t)t * slot_count + j]  = wt[(size_t)t * n_expert + slot_start + j];
+                    }
+                }
+                n_expert = slot_count;
             }
             /* Wave 36: batch union prediction.  The batch path never enqueued
              * prefetch jobs at all (only decode did, and with one row): verify

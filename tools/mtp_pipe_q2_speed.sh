@@ -255,14 +255,16 @@ MOE_OVERLAP_PASSES=${MOE_OVERLAP_PASSES:-2}
 # 30 t/s 有效目标的核心). 改模型输出=质量赌注, **默认 0/0=OFF=bit-exact**. A/B: MOE_THIN_TOPK=2(留前2)
 # 或 MOE_THIN_ALPHA=0.5(弃 weight<0.5*top1). 经 IO_ENV 透传两机. 必过质量门 q1..q4 + --logprob-vectors.
 MOE_THIN_ALPHA=${MOE_THIN_ALPHA:-0}
-MOE_THIN_TOPK=${MOE_THIN_TOPK:-0}
+# 第七十三波: bare-round 降激活进基线 (code-edit-heavy 5.26→5.40, +2.7%, 实测保留)。TOPK=4 + MAX_TOKENS=1
+# = 只瘦 n=1 bare round, verify 批 bit-exact。A/B 回退: MOE_THIN_TOPK=0。质量门待过 (q1..q4 + --logprob-vectors)。
+MOE_THIN_TOPK=${MOE_THIN_TOPK:-4}
 # 第六十八波 prefill-only 门: 只砍 >=N token 的 prefill 批, 跳过 <=64 verify 批 + 单 token decode
 # → 保 copy-spec 逐字复现(decode 不退), 只吃 prefill IO 增益。1=砍所有(wave66 行为); 128=prefill-only。
 MOE_THIN_MIN_TOKENS=${MOE_THIN_MIN_TOKENS:-1}
 # 第六十九波 no-match-decode-only 门 (min_tokens 的对偶): 0=无上限(现行); 1=只砍 n_tokens==1 单 token
 # decode = copy-spec 模式下的 no-match bare round。verify 批(n_tokens>=2)+prefill 全保 full top-k 字节不变
 # → copy-spec 逐字接受不退, 只在 novel token 吃质量赌注削冷读 IO。依据: Run-A 实测 no-match decode SSD-bound。
-MOE_THIN_MAX_TOKENS=${MOE_THIN_MAX_TOKENS:-0}
+MOE_THIN_MAX_TOKENS=${MOE_THIN_MAX_TOKENS:-1}   # wave-73: 进基线 (只砍 bare round, verify 批字节不变)
 EXPERT_SORT_IDS=${EXPERT_SORT_IDS:-1}
 EXPERT_STREAM=${EXPERT_STREAM:-1}
 EXPERT_STREAM_THRESHOLD_PCT=${EXPERT_STREAM_THRESHOLD_PCT:-60}
@@ -681,11 +683,14 @@ rsync -a --exclude '.git' --exclude '*.o' --exclude '*.gguf' --exclude 'gguf/' \
   "$LOCAL_DIR"/ "$REMOTE:$REMOTE_DIR"/ || { log "rsync 失败"; exit 1; }
 
 # ---------------- 2. 两边 clean + build (共享 CORE_OBJS, 必须都重编) ----------------
-log "本机: make clean && make ds4"
-( cd "$LOCAL_DIR" && make clean >/dev/null 2>&1 && make ds4 >/tmp/mtp_pipe_build_local.log 2>&1 ) \
+# 默认增量编译 (只重编改动文件, ~10s); CLEAN=1 强制全量 (~2min/机)
+CLEAN=${CLEAN:-0}
+CLEAN_CMD=""; [ "$CLEAN" = 1 ] && CLEAN_CMD="make clean >/dev/null 2>&1 &&"
+log "本机: ${CLEAN:+clean+}make ds4"
+( cd "$LOCAL_DIR" && eval "$CLEAN_CMD make ds4 >/tmp/mtp_pipe_build_local.log 2>&1" ) \
   || { log "本机编译失败:"; tail -8 /tmp/mtp_pipe_build_local.log; exit 1; }
-log "M1:   make clean && make ds4"
-ssh "$REMOTE" "cd '$REMOTE_DIR' && make clean >/dev/null 2>&1 && make ds4 >/tmp/mtp_pipe_build_remote.log 2>&1" \
+log "M1:   ${CLEAN:+clean+}make ds4"
+ssh "$REMOTE" "cd '$REMOTE_DIR' && $CLEAN_CMD make ds4 >/tmp/mtp_pipe_build_remote.log 2>&1" \
   || { log "M1 编译失败:"; ssh "$REMOTE" "tail -8 /tmp/mtp_pipe_build_remote.log"; exit 1; }
 
 # ---------------- 3. 清旧进程 + 清端口 ----------------
@@ -694,18 +699,44 @@ pkill -f 'ds4 -m' 2>/dev/null || true
 ssh "$REMOTE" "pkill -f 'ds4 -m' 2>/dev/null; lsof -nP -iTCP:$PORT -t 2>/dev/null | xargs -r kill -9 2>/dev/null; true" 2>/dev/null || true
 sleep 1
 
+# ---------------- TP 开关 (默认 0 = 原 layer-pipeline; TP=1 = 张量并行) ----------------
+# TP=1: 两机各载全栈, --tp --tp-layers 替代 --layers; expert split (Phase 3) + 可选 shared split。
+# copy-spec 走 TP leader 的 verify 批 (复用 DS4_DIST_COPY_SPEC)。
+TP=${TP:-0}
+TP_LAYERS=${TP_LAYERS:-43}
+TP_EXPERT_SPLIT=${TP_EXPERT_SPLIT:-1}
+TP_SHARED_SPLIT=${TP_SHARED_SPLIT:-0}
+if [ "$TP" = 1 ]; then
+  WORKER_ROLE_ARGS="--tp --tp-layers $TP_LAYERS"
+  COORD_ROLE_ARGS="--tp --tp-layers $TP_LAYERS"
+  # TP expert-split 与"读全部专家"的 IO 优化冲突 (prefetch/full-layer-stream 会拉满 6 个专家,
+  # 抵消半-split)。TP 模式默认关掉它们 (覆盖 BASE_RUN_ENV); 要 A/B 用 TP_IO_OPT=1 保留。
+  TP_IO_OFF=""; [ "${TP_IO_OPT:-0}" = 1 ] || TP_IO_OFF="DS4_METAL_EXPERT_PREFETCH_AHEAD=0 DS4_METAL_EXPERT_FULL_LAYER_STREAM=0"
+  # 非对称专家切分: coordinator(M4) 拿 TP_SPLIT_LOW 个专家(默认 2), worker(M1) 拿剩下 4。
+  # 实测峰值 (M4 coordinator 负担重, 给它少算补偿): 冷 smoke M4=2 → 1.64× over 单机 (vs 50/50 的 1.25×)。
+  TP_SPLIT_LOW=${TP_SPLIT_LOW:-2}
+  TP_SPLIT_LOW_ENV="DS4_TP_SPLIT_LOW=$TP_SPLIT_LOW"
+  TP_ENV="DS4_TP_REVERSE_CONNECT=1 DS4_TP_EXPERT_SPLIT=$TP_EXPERT_SPLIT DS4_TP_SHARED_SPLIT=$TP_SHARED_SPLIT $TP_IO_OFF $TP_SPLIT_LOW_ENV"
+  WORKER_READY_PAT='backend initialized|waiting for coordinator|control listen'
+else
+  WORKER_ROLE_ARGS="--layers $SPLIT_WORKER"
+  COORD_ROLE_ARGS="--layers $SPLIT_COORD"
+  TP_ENV=""
+  WORKER_READY_PAT='waiting for coordinator|control listen'
+fi
+
 # ---------------- 4. 先起 M1 worker (control listen, 等 coordinator 来拨) ----------------
 log "启动 M1 worker: --listen $WORKER_IP:$PORT --layers $SPLIT_WORKER ${WORKER_MTP_ARGS:-(无 MTP)} (reverse, 只 accept)"
 ssh "$REMOTE" "cd '$REMOTE_DIR' && rm -f '$WORKER_LOG'; \
-  $REMOTE_RUN_ENV $WORKER_MTP_ENV DS4_MEM_BUDGET_MB=$REMOTE_BUDGET_MB \
+  $REMOTE_RUN_ENV $TP_ENV $WORKER_MTP_ENV DS4_MEM_BUDGET_MB=$REMOTE_BUDGET_MB \
   nohup ./ds4 -m '$MODEL' --role worker --listen '$WORKER_IP' '$PORT' \
-  --layers '$SPLIT_WORKER' $DEBUG_ARGS $WORKER_MTP_ARGS \
+  $WORKER_ROLE_ARGS $DEBUG_ARGS $WORKER_MTP_ARGS \
   -c '$CTX' --temp 0 --nothink > '$WORKER_LOG' 2>&1 & echo \$! > '$WORKER_PID_FILE'; echo launched" 2>/dev/null
 
 log "等 M1 worker backend 就绪并开始 control listen…"
 wok=0
 for _ in $(seq 1 90); do
-  if ssh "$REMOTE" "grep -q 'waiting for coordinator\|control listen' '$WORKER_LOG'" 2>/dev/null; then wok=1; break; fi
+  if ssh "$REMOTE" "grep -qE '$WORKER_READY_PAT' '$WORKER_LOG'" 2>/dev/null; then wok=1; break; fi
   if ssh "$REMOTE" "grep -qiE 'refusing to load|fatal|Address already|invalid|Insufficient Memory' '$WORKER_LOG'" 2>/dev/null; then
     log "M1 worker 启动失败, 日志尾:"; ssh "$REMOTE" "tail -10 '$WORKER_LOG'"; cleanup; exit 1
   fi
@@ -728,16 +759,16 @@ if [ "$REPLAY" = 1 ]; then
   # REPL 模式: 多回合单行 stdin (前缀 KV 跨回合复用). /quit 收尾让进程自然退出。
   log "REPLAY 多回合 (REPL, 无 -p): 3 回合 + /quit, 量化 per-turn 增量 prefill TTFT"
   printf '%s\n' "$REPLAY_TURN_1" "$REPLAY_TURN_2" "$REPLAY_TURN_3" "/quit" | \
-  env $LOCAL_RUN_ENV $COORD_MTP_ENV $COORD_PROBE_ENV DS4_MEM_BUDGET_MB=$LOCAL_BUDGET_MB \
+  env $LOCAL_RUN_ENV $TP_ENV $COORD_MTP_ENV $COORD_PROBE_ENV DS4_MEM_BUDGET_MB=$LOCAL_BUDGET_MB \
     ./ds4 -m "$MODEL" --role coordinator --coordinator "$WORKER_IP" "$PORT" \
-    --layers "$SPLIT_COORD" $DEBUG_ARGS $COORD_MTP_ARGS \
+    $COORD_ROLE_ARGS $DEBUG_ARGS $COORD_MTP_ARGS \
     -c "$CTX" -n "$NPRED" --temp 0 --seed "$SEED" --nothink \
     > "$COORD_OUT" 2> "$COORD_LOG" &
   COORD_PID=$!
 else
-env $LOCAL_RUN_ENV $COORD_MTP_ENV $COORD_PROBE_ENV DS4_MEM_BUDGET_MB=$LOCAL_BUDGET_MB \
+env $LOCAL_RUN_ENV $TP_ENV $COORD_MTP_ENV $COORD_PROBE_ENV DS4_MEM_BUDGET_MB=$LOCAL_BUDGET_MB \
   ./ds4 -m "$MODEL" --role coordinator --coordinator "$WORKER_IP" "$PORT" \
-  --layers "$SPLIT_COORD" $DEBUG_ARGS $COORD_MTP_ARGS \
+  $COORD_ROLE_ARGS $DEBUG_ARGS $COORD_MTP_ARGS \
   -c "$CTX" -n "$NPRED" --temp 0 --seed "$SEED" --nothink \
   -p "$PROMPT" > "$COORD_OUT" 2> "$COORD_LOG" &
 COORD_PID=$!

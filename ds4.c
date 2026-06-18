@@ -11138,6 +11138,38 @@ static bool metal_graph_encode_decode_layer(
         ok = ds4_gpu_translate_expert_ids(g->router_selected, il, DS4_N_EXPERT_USED, 1,
                                           model_expert_kept_count(model, il)) != 0;
     }
+    /* TP Phase 3 (DS4_TP_EXPERT_SPLIT): each peer gathers + computes only its half
+     * of the routed experts (owns_low: slots [0,k); owns_high: [k,n_used)), then the
+     * partial routed_out is all-reduce SUMMED below (no zero-half). The gather
+     * (compact_selected_experts reads n_expert slots from selected_off) thus fetches
+     * only k experts per peer => halves the per-token routed-expert SSD IO, the
+     * dominant cold-decode cost. Views pick the owned slots (contiguous for the
+     * single decode token). Default OFF => full gather + skeleton zero-half. */
+    const char *tp_es_env = getenv("DS4_TP_EXPERT_SPLIT");
+    bool tp_expert_split = false;
+    ds4_gpu_tensor *es_sel = NULL, *es_wt = NULL;
+    uint32_t es_n = DS4_N_EXPERT_USED;
+    if (g->tp && il < g->tp_layers && tp_es_env && tp_es_env[0] && tp_es_env[0] != '0' &&
+        DS4_N_EXPERT_USED >= 2u) {
+        const uint32_t n_used = DS4_N_EXPERT_USED;
+        /* Asymmetric split (DS4_TP_SPLIT_LOW): the coordinator (owns_low, faster M4)
+         * takes k experts, the worker (owns_high, slower M1) takes n_used-k. Tuning k
+         * up balances the per-layer time so the AR's lockstep wait (the dominant cold
+         * TP cost) shrinks. Default n_used/2 (50/50). */
+        uint32_t k = n_used / 2u;
+        const char *sl = getenv("DS4_TP_SPLIT_LOW");
+        if (sl && sl[0]) { unsigned long v = strtoul(sl, NULL, 10); if (v >= 1u && v < n_used) k = (uint32_t)v; }
+        const uint32_t slot_start = g->tp_owns_low ? 0u : k;
+        const uint32_t cnt = g->tp_owns_low ? k : (n_used - k);
+        es_sel = ds4_gpu_tensor_view(g->router_selected,
+                                     (uint64_t)slot_start * sizeof(int32_t),
+                                     (uint64_t)cnt * sizeof(int32_t));
+        es_wt = ds4_gpu_tensor_view(g->router_weights,
+                                    (uint64_t)slot_start * sizeof(float),
+                                    (uint64_t)cnt * sizeof(float));
+        if (es_sel && es_wt) { tp_expert_split = true; es_n = cnt; }
+        else { ds4_gpu_tensor_free(es_sel); ds4_gpu_tensor_free(es_wt); es_sel = es_wt = NULL; }
+    }
     if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
                                                  g->routed_gate,
                                                  g->routed_up,
@@ -11154,10 +11186,13 @@ static bool metal_graph_encode_decode_layer(
                                                  (uint32_t)expert_in_dim,
                                                  (uint32_t)down_in_dim,
                                                  (uint32_t)routed_out_dim,
-                                                 g->router_selected, g->router_weights,
+                                                 tp_expert_split ? es_sel : g->router_selected,
+                                                 tp_expert_split ? es_wt  : g->router_weights,
                                                  model_expert_kept_count(model, il),
-                                                 DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm,
+                                                 es_n, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm,
                                                  il) != 0;
+    ds4_gpu_tensor_free(es_sel);   /* NULL-safe; views are cheap wrappers */
+    ds4_gpu_tensor_free(es_wt);
     DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->routed_gate,
@@ -11185,28 +11220,79 @@ static bool metal_graph_encode_decode_layer(
      * memory before the (now reopened) batch's combine is committed, so no GPU
      * wait-back is needed. Guarded by g->tp ⇒ non-TP path never touches this. */
     if (ok && g->tp && il < g->tp_layers) {
+        /* wave-72 diag (DS4_TP_AR_LOG): the decode TP all-reduce had never run
+         * dual-host before Phase 1 (prefill uses prefill_layer_major, not this
+         * encode_decode_layer path). Per-step logging pins which of the 6 calls
+         * flips ok on first real use. */
+        const bool ar_log = getenv("DS4_TP_AR_LOG") != NULL;
+        const double ar_t0 = ar_log ? now_sec() : 0.0;
         const uint64_t ev = ds4_gpu_tp_signal_after_batch();
         ok = ev != 0;
         if (ok) ok = ds4_gpu_flush_commands() != 0;   /* commit (no full drain), reopen batch */
         if (ok) ok = ds4_gpu_tp_host_wait(ev) != 0;    /* fast wait until routed_moe done */
+        const double ar_t_drain = ar_log ? now_sec() : 0.0;   /* signal+flush+host_wait = GPU drain */
         if (ok) ok = ds4_gpu_tensor_read(g->routed_out, 0, g->tp_vec,
                                          (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
         if (ok) {
-            const uint32_t half = DS4_N_EMBD / 2;
-            if (g->tp_owns_low) {
-                for (uint32_t i = half; i < DS4_N_EMBD; i++) g->tp_vec[i] = 0.0f;
-            } else {
-                for (uint32_t i = 0; i < half; i++) g->tp_vec[i] = 0.0f;
+            /* Phase 3: with the expert split, routed_out is already this peer's
+             * partial (weighted sum over its owned slots) -> AR-sum reconstructs
+             * the full routed output. Without it (skeleton), each peer computed the
+             * FULL routed_out, so zero the non-owned n_embd half before the sum to
+             * avoid double-counting (the original element-range placeholder). */
+            if (!tp_expert_split) {
+                const uint32_t half = DS4_N_EMBD / 2;
+                if (g->tp_owns_low) {
+                    for (uint32_t i = half; i < DS4_N_EMBD; i++) g->tp_vec[i] = 0.0f;
+                } else {
+                    for (uint32_t i = 0; i < half; i++) g->tp_vec[i] = 0.0f;
+                }
             }
             ok = ds4_dist_tp_allreduce_f32(g->tp, g->tp_vec, DS4_N_EMBD) == 0;
         }
         if (ok) ok = ds4_gpu_tensor_write(g->routed_out, 0, g->tp_vec,
                                           (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
+        if (ar_log) {
+            const double ar_t1 = now_sec();
+            fprintf(stderr, "ds4: tp-ar il=%u pos=%u ok=%d drain=%.1fms net=%.1fms total=%.1fms\n",
+                    il, pos, ok, (ar_t_drain - ar_t0) * 1e3,
+                    (ar_t1 - ar_t_drain) * 1e3, (ar_t1 - ar_t0) * 1e3);
+        }
     }
+    /* TP Phase 1 (DS4_TP_SHARED_SPLIT): split the shared-expert dense FFN across
+     * the two peers. gate/up are column-parallel (each peer computes its half of
+     * the shared_dim rows, compacted into mid[0,half)); down is row-parallel
+     * (partial out[n_embd] over the owned input-dim half) then all-reduced. Decode
+     * only (this is the n_tok=1 layer encode; prefill stays replicated/full). Halves
+     * the shared-FFN weight bandwidth per peer. Off => byte-identical to the legacy
+     * path. tp_owns_low owns the low half, matching the routed-MoE skeleton above. */
+    const char *tp_split_env = getenv("DS4_TP_SHARED_SPLIT");
+    const bool tp_shared_split =
+        g->tp && il < g->tp_layers &&
+        tp_split_env && tp_split_env[0] && tp_split_env[0] != '0' &&
+        (shared_dim % 64u) == 0;   /* half must stay 32-block aligned */
+    const uint32_t tp_half = shared_dim / 2u;
+    const uint32_t tp_out_start = g->tp_owns_low ? 0u : tp_half;
     const bool fuse_shared_gate_up =
+        !tp_shared_split &&
         !g->quality &&
         getenv("DS4_METAL_DISABLE_SHARED_GATE_UP_SWIGLU_FUSION") == NULL;
-    if (ok && fuse_shared_gate_up) {
+    if (ok && tp_shared_split) {
+        /* column-parallel gate/up: owned half rows -> shared_mid[0, tp_half). The
+         * kernel's output row index starts at 0, so shifting the weight offset by
+         * the owned rows writes the owned slice compacted into [0, tp_half). */
+        const uint64_t gate_row_bytes = ((uint64_t)DS4_N_EMBD / 32u) * 34u;
+        ok = ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(g->shared_gate,
+                                                         g->shared_up,
+                                                         g->shared_mid,
+                                                         model->map,
+                                                         model->size,
+                                                         layer->ffn_gate_shexp->abs_offset + (uint64_t)tp_out_start * gate_row_bytes,
+                                                         layer->ffn_up_shexp->abs_offset   + (uint64_t)tp_out_start * gate_row_bytes,
+                                                         DS4_N_EMBD,
+                                                         tp_half,
+                                                         g->ffn_norm,
+                                                         DS4_SWIGLU_CLAMP_EXP) != 0;
+    } else if (ok && fuse_shared_gate_up) {
         ok = ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(g->shared_gate,
                                                          g->shared_up,
                                                          g->shared_mid,
@@ -11233,8 +11319,32 @@ static bool metal_graph_encode_decode_layer(
     DS4_METAL_PROFILE_DECODE_STAGE("shared_gate_up");
     const bool keep_ffn_out = metal_graph_needs_ffn_out(g, il, pos);
     const bool fuse_shared_down_hc =
+        !tp_shared_split &&
         !keep_ffn_out && !metal_graph_use_reference_shared_down_hc();
-    if (ok && fuse_shared_down_hc) {
+    if (ok && tp_shared_split) {
+        /* row-parallel down: partial out[n_embd] over the owned in-dim half (x is
+         * the compacted shared_mid[0, tp_half); the weight starts tp_out_start/32
+         * blocks * 34 bytes into each row), then all-reduce to the full down output.
+         * Same MTLSharedEvent fast-wait + host all-reduce as the routed-MoE skeleton:
+         * signal end of batch, flush (no full drain), fast-wait, read partial, sum
+         * across peers, write back. Combine into the residual via the unfused
+         * hc_expand_add_split path below (fuse_shared_down_hc forced false). */
+        ok = ds4_gpu_matmul_q8_0_rowslice_tensor(g->shared_out, model->map, model->size,
+                                                  layer->ffn_down_shexp->abs_offset + ((uint64_t)tp_out_start / 32u) * 34u,
+                                                  shared_dim, tp_half, DS4_N_EMBD,
+                                                  g->shared_mid) != 0;
+        if (ok) {
+            const uint64_t ev = ds4_gpu_tp_signal_after_batch();
+            ok = ev != 0;
+            if (ok) ok = ds4_gpu_flush_commands() != 0;
+            if (ok) ok = ds4_gpu_tp_host_wait(ev) != 0;
+            if (ok) ok = ds4_gpu_tensor_read(g->shared_out, 0, g->tp_vec,
+                                             (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
+            if (ok) ok = ds4_dist_tp_allreduce_f32(g->tp, g->tp_vec, DS4_N_EMBD) == 0;
+            if (ok) ok = ds4_gpu_tensor_write(g->shared_out, 0, g->tp_vec,
+                                              (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
+        }
+    } else if (ok && fuse_shared_down_hc) {
         ok = ds4_gpu_shared_down_hc_expand_q8_0_tensor(g->after_ffn_hc,
                                                          g->shared_out,
                                                          model->map,
@@ -14033,6 +14143,26 @@ static bool metal_graph_encode_layer_ffn_batch(
                                           n_tokens, model_expert_kept_count(model, il)) != 0;
     }
 
+    /* TP Phase-3 batch split (DS4_TP_EXPERT_SPLIT): each peer gathers/computes its
+     * half of every token's routed experts; the partial batch_routed_out is
+     * all-reduce SUMMED below. Ends the prefill redundancy (both peers had run the
+     * FULL gather) -> halves the cold batch (prefill) expert IO. Covers the batched
+     * paths (prefill chunks + verify batches); decode bare rounds use the single-
+     * token split. Default OFF => full gather. */
+    /* Separate gate from the single-token decode split: the batched path AR's once
+     * per (chunk, layer) -> prefill issues thousands of ARs whose drain overhead
+     * outweighs the IO halving (wave-72: 281s redundant < 688s split). Default OFF;
+     * opt-in for cold-batch experiments. Single-token decode keeps DS4_TP_EXPERT_SPLIT. */
+    const char *tp_es_env_b = getenv("DS4_TP_EXPERT_SPLIT_BATCH");
+    const bool tp_batch_split =
+        g->tp && il < g->tp_layers && tp_es_env_b && tp_es_env_b[0] && tp_es_env_b[0] != '0' &&
+        DS4_N_EXPERT_USED >= 2u;
+    uint32_t tpb_slot_start = 0u, tpb_slot_count = 0u;
+    if (tp_batch_split) {
+        const uint32_t k = DS4_N_EXPERT_USED / 2u;
+        tpb_slot_start = g->tp_owns_low ? 0u : k;
+        tpb_slot_count = g->tp_owns_low ? k : (DS4_N_EXPERT_USED - k);
+    }
     if (ok) {
         ok = ds4_gpu_routed_moe_batch_tensor(g->batch_routed_out,
                                                g->batch_routed_gate,
@@ -14061,7 +14191,27 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                g->batch_ffn_norm,
                                                il,
                                                n_tokens,
+                                               tpb_slot_start,
+                                               tpb_slot_count,
                                                &g->batch_routed_mid_is_f16) != 0;
+    }
+    /* batch all-reduce: sum each peer's partial routed_out [n_tokens x n_embd] into
+     * the full routed output (same MTLSharedEvent fast-wait path as the decode AR;
+     * routed_moe_batch leaves the batch CB open on the was_batched path). */
+    if (ok && tp_batch_split) {
+        const uint64_t ar_n = (uint64_t)n_tokens * (uint64_t)DS4_N_EMBD;
+        const uint64_t ev = ds4_gpu_tp_signal_after_batch();
+        ok = ev != 0;
+        if (ok) ok = ds4_gpu_flush_commands() != 0;
+        if (ok) ok = ds4_gpu_tp_host_wait(ev) != 0;
+        float *arbuf = ok ? malloc((size_t)ar_n * sizeof(float)) : NULL;
+        if (ok && !arbuf) ok = false;
+        if (ok) ok = ds4_gpu_tensor_read(g->batch_routed_out, 0, arbuf,
+                                         ar_n * sizeof(float)) != 0;
+        if (ok) ok = ds4_dist_tp_allreduce_f32(g->tp, arbuf, (uint32_t)ar_n) == 0;
+        if (ok) ok = ds4_gpu_tensor_write(g->batch_routed_out, 0, arbuf,
+                                          ar_n * sizeof(float)) != 0;
+        free(arbuf);
     }
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->batch_routed_gate,
