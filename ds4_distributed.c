@@ -3372,6 +3372,7 @@ static uint32_t dist_pipe_chunk(void) {
 
 /* Receive one pipelined VERIFY chunk's per-row logits into dst (n_rows*vocab). */
 static int dist_pipe_recv_chunk(int fd, ds4_dist_coordinator_state *state,
+                                ds4_session *session,
                                 uint64_t req, uint64_t expect_hash,
                                 float *dst, uint32_t n_rows, uint32_t vocab,
                                 char *err, size_t errlen) {
@@ -3392,9 +3393,23 @@ static int dist_pipe_recv_chunk(int fd, ds4_dist_coordinator_state *state,
         free(payload);
         return 0;
     }
+    /* 本机-MTP loopback: the last worker holds no output head and returns per-row
+     * hidden state; the coordinator runs its own output head here to produce the
+     * chunk's logits (matches the non-pipelined eval_span path, 3215). Without
+     * this the pipelined prefill rejects the HIDDEN_STATE result, fails the route,
+     * and forgets the worker -> "missing layer N". */
+    const uint32_t hidden_want = (uint32_t)((uint64_t)n_rows *
+        ds4_engine_hidden_f32_values(state->engine) * sizeof(float));
+    if (kind == DS4_DIST_RESULT_HIDDEN_STATE && pbytes == hidden_want) {
+        int head_rc = ds4_session_eval_output_head_from_hc(session, payload,
+                                                           n_rows, dst, err, errlen);
+        free(payload);
+        return head_rc;
+    }
     free(payload);
     if (errlen) snprintf(err, errlen,
-                         "pipelined chunk returned %u bytes, want %u logits", pbytes, want);
+                         "pipelined chunk returned %u bytes, want %u logits or %u hidden",
+                         pbytes, want, hidden_want);
     return 1;
 }
 
@@ -3464,7 +3479,7 @@ static int dist_coordinator_eval_span_pipelined(
         if (rc != 0) break;
         /* (2) drain the previous chunk's result (it overlapped step 1). */
         if (inflight) {
-            rc = dist_pipe_recv_chunk(remote_fd, state, if_req, if_rhash,
+            rc = dist_pipe_recv_chunk(remote_fd, state, session, if_req, if_rhash,
                                       spec->verify_logits + (uint64_t)if_off * vocab,
                                       if_n, vocab, err, errlen);
             inflight = false;
@@ -3490,7 +3505,7 @@ static int dist_coordinator_eval_span_pipelined(
         off += n_k;
     }
     if (rc == 0 && inflight) {
-        rc = dist_pipe_recv_chunk(remote_fd, state, if_req, if_rhash,
+        rc = dist_pipe_recv_chunk(remote_fd, state, session, if_req, if_rhash,
                                   spec->verify_logits + (uint64_t)if_off * vocab,
                                   if_n, vocab, err, errlen);
         inflight = false;
@@ -3691,6 +3706,7 @@ static int dist_coordinator_rebuild_from_transcript(
                      transcript->len,
                      forget_route ? "route failure" : "KV mismatch");
     if (forget_route) {
+        fprintf(stderr, "ds4: [diag] distributed root failure (err at forget): %s\n", err);
         dist_coordinator_forget_route_workers(state, plan);
         dist_route_plan_free(plan);
         uint64_t generation = 0;

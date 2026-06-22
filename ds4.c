@@ -3021,7 +3021,7 @@ static void weights_validate_layout(const ds4_model *m, const ds4_weights *w) {
     }
 }
 
-static void mtp_weights_validate_layout(const ds4_mtp_weights *w) {
+static void mtp_weights_validate_layout(const ds4_mtp_weights *w, uint32_t exp_dim) {
     const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
     const uint64_t hc_mix_dim = 2u * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
@@ -3056,9 +3056,12 @@ static void mtp_weights_validate_layout(const ds4_mtp_weights *w) {
     tensor_expect_layout(l->ffn_norm,       DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
     tensor_expect_plain_layout(l->ffn_gate_inp, 2, DS4_N_EMBD, DS4_N_EXPERT, 0);
     tensor_expect_layout(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, DS4_N_EXPERT, 0, 0);
-    tensor_expect_routed_expert(l->ffn_gate_exps, 3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
-    tensor_expect_routed_expert(l->ffn_up_exps,   3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
-    tensor_expect_routed_expert(l->ffn_down_exps, 3, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
+    /* exp_dim = kept routed-expert count (DS4_N_EXPERT for a full MTP, or the
+     * matched-MTP keep-map count). The router (ffn_gate_inp) + bias stay full
+     * DS4_N_EXPERT; route_translate maps the 256-way router pick into the kept slots. */
+    tensor_expect_routed_expert(l->ffn_gate_exps, 3, DS4_N_EMBD, DS4_N_FF_EXP, exp_dim);
+    tensor_expect_routed_expert(l->ffn_up_exps,   3, DS4_N_EMBD, DS4_N_FF_EXP, exp_dim);
+    tensor_expect_routed_expert(l->ffn_down_exps, 3, DS4_N_FF_EXP, DS4_N_EMBD, exp_dim);
     if (l->ffn_gate_exps->type != l->ffn_up_exps->type) {
         ds4_die("MTP routed gate/up experts use different quant types");
     }
@@ -3759,7 +3762,9 @@ static void mtp_weights_bind(ds4_mtp_weights *w, const ds4_model *m) {
     l->ffn_up_shexp    = required_tensor(m, "mtp.0.ffn_up_shexp.weight");
     l->ffn_down_shexp  = required_tensor(m, "mtp.0.ffn_down_shexp.weight");
 
-    mtp_weights_validate_layout(w);
+    /* exp_dim from the MTP model's keep-map (layer 0); DS4_N_EXPERT if unmasked.
+     * The reduced MTP routes 256-way then route_translate maps into kept slots. */
+    mtp_weights_validate_layout(w, model_expert_kept_count(m, 0));
 }
 
 static void weights_free(ds4_weights *w) {
@@ -9965,7 +9970,10 @@ static bool metal_graph_alloc_raw_cap(
     const uint64_t group_dim = (uint64_t)DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP);
     const uint64_t shared_dim = layer->ffn_gate_shexp->dim[1];
     const uint64_t routed_mid_dim = layer->ffn_gate_exps->dim[1];
-    const uint64_t vocab_dim = weights->output->dim[1];
+    /* Sharded worker slice (本机-MTP loopback) holds no output head: it returns
+     * hidden state and the coordinator runs the output head. weights->output is
+     * then NULL, so the per-row logits buffer is unneeded -- guard the deref. */
+    const uint64_t vocab_dim = weights->output ? weights->output->dim[1] : 0u;
     const uint64_t comp_width_max = 2ull * (DS4_N_HEAD_DIM > DS4_N_INDEXER_HEAD_DIM
         ? DS4_N_HEAD_DIM
         : DS4_N_INDEXER_HEAD_DIM);
@@ -10109,7 +10117,7 @@ static bool metal_graph_alloc_raw_cap(
     g->output_weights = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HC * sizeof(float));
     g->output_embd = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
     g->output_norm = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-    g->logits = ds4_gpu_tensor_alloc(vocab_dim * sizeof(float));
+    g->logits = ds4_gpu_tensor_alloc((vocab_dim ? vocab_dim : 1u) * sizeof(float));
     /*
      * MTP is deliberately outside the normal graph footprint.  A session that
      * does not opt in with --mtp must allocate and execute exactly the same
@@ -14565,6 +14573,14 @@ static bool metal_graph_eval_mtp_draft_from_hc(
         int                   *top_id) {
     if (!mtp || !mtp->block.attn_q_a || !g->mtp_raw_cache || !prev_hc || !out_hc) return false;
 
+    /* The expert keep-LUT is a single GPU resource shared by the base model and a
+     * matched (reduced) MTP drafter, but they carry different keep-maps. Swap to
+     * the MTP keep-map for the draft and restore the base's before returning so
+     * subsequent base-model forwards route their 256-way picks into the right slots.
+     * (No-op when the MTP is unmasked: expert_orig_to_compact is NULL.) */
+    if (mtp_model->expert_orig_to_compact)
+        ds4_gpu_set_expert_keep_lut(mtp_model->expert_orig_to_compact, mtp_model->expert_layer_count);
+
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint32_t raw_row = pos % g->raw_cap;
     uint32_t n_raw = g->mtp_n_raw + 1u;
@@ -14636,6 +14652,12 @@ static bool metal_graph_eval_mtp_draft_from_hc(
                                              token);
     }
     if (ok) g->cur_hc = out_hc;
+    /* MTP keep-map collection: tally the MTP block's routed-expert preference at
+     * synthetic layer index DS4_N_LAYER (==43, < MAXL 64) so make_expert_mask can
+     * build a reduced-MTP mask matched to what the MTP actually routes to. Called
+     * mid-batch (syncs the pending layer, reads g->router_logits, re-begins) like
+     * the prefill collector. Gated by DS4_ROUTER_FREQ_FILE (zero-cost when off). */
+    if (ok) router_freq_collect(g->router_logits, (uint32_t)DS4_N_LAYER, 1u);
     if (ok) ok = metal_graph_encode_output_head_mtp(g,
                                                     base_model,
                                                     base_weights,
@@ -14663,6 +14685,10 @@ static bool metal_graph_eval_mtp_draft_from_hc(
         g->cur_hc = saved_cur;
         g->after_ffn_hc = saved_after;
     }
+    /* Restore the base model's keep-LUT (overwritten above for the draft) so the
+     * next base-model forward routes correctly. */
+    if (base_model->expert_orig_to_compact)
+        ds4_gpu_set_expert_keep_lut(base_model->expert_orig_to_compact, base_model->expert_layer_count);
     return ok;
 }
 
@@ -19764,6 +19790,14 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
         mtp_weights_bind(&e->mtp_weights, &e->mtp_model);
         e->mtp_ready = true;
+#ifndef DS4_NO_GPU
+        /* model_open(MTP) set the single GPU keep-LUT to the MTP's keep-map,
+         * overwriting the base model's. Restore the base's so the first base
+         * forward (prefill) routes correctly; the MTP draft swaps to its own
+         * LUT per-draft and restores the base's afterward. */
+        if (e->model.expert_orig_to_compact)
+            ds4_gpu_set_expert_keep_lut(e->model.expert_orig_to_compact, e->model.expert_layer_count);
+#endif
         fprintf(stderr, "ds4: MTP support model loaded: %s (draft=%d%s)\n",
                 opt->mtp_path,
                 e->mtp_draft_tokens,

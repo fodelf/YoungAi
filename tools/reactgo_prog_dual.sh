@@ -49,6 +49,10 @@ COMMON_ENV="$COMMON_ENV $FREQ_ENV"
 # SPEC: 任意投机解码 env 透传两机(如 DS4_DIST_COPY_SPEC=1 DS4_DIST_COPY_SPEC_DRAFT=12 DS4_DIST_SPEC_PIPE=1)
 SPEC=${SPEC:-}
 COMMON_ENV="$COMMON_ENV $SPEC"
+# MTP_ARGS: 本机-MTP coordinator 的 --mtp 参数(--mtp FILE --mtp-role coordinator --mtp-draft N)。
+# output head 经 --mtp-role coordinator 自动归 M4; worker 分片须不含 output(--head none)。
+# 配 EXTRA_ENV=DS4_MTP_NO_RESIDENCY=0(wired 快/紧) 或 1(可驱逐 省内存/冷读慢)。
+MTP_ARGS=${MTP_ARGS:-}
 WORKER_LOG=/tmp/reactgo_prog_worker.log
 WORKER_PID_FILE=/tmp/reactgo_prog_worker.pid
 COORD_LOG=/tmp/reactgo_prog_coord.log
@@ -101,7 +105,7 @@ rm -f "$COORD_LOG" "$COORD_OUT"
 env DS4_DIST_REVERSE_CONNECT=1 DS4_METAL_EXPERT_OFFLOAD=0 DS4_METAL_NO_MODEL_WARMUP=1 $PC_ENV $EXTRA_ENV $FREQ_ENV $SPEC DS4_MEM_BUDGET_MB=$M4_BUDGET \
   ./ds4 -m "$M4_MODEL" --role coordinator --coordinator "$M1" "$PORT" \
   --layers "$COORD_LAYERS" -c "$CTX" -n "$NPRED" --temp "$TEMP" --seed "$SEED" --nothink \
-  $DUMP_ARG -p "$PROMPT" > "$COORD_OUT" 2> "$COORD_LOG" &
+  $MTP_ARGS $DUMP_ARG -p "$PROMPT" > "$COORD_OUT" 2> "$COORD_LOG" &
 COORD_PID=$!
 
 # ---- 看门狗: 等 coordinator 一次性生成结束; 双机 RSS 红线 + 超时 ----

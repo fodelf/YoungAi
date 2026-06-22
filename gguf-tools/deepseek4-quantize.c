@@ -1464,10 +1464,12 @@ static byte_buf generate_expert(st_db *db, const char *gguf_name, const tensor_m
     const int64_t ncols = tmpl->ne[0];
     const int64_t nrows = tmpl->ne[1];
     const size_t per_expert = (size_t)nrows * ds4q_row_size(target, ncols);
-    /* Hot mask only shrinks main-block experts; MTP draft experts pass whole. */
+    /* Hot mask shrinks routed experts. With a matched MTP mask it ALSO shrinks
+     * the MTP draft block (mtp.0) so the reduced drafter fits GPU-resident for the
+     * 本机-MTP loopback (acceptance comes from MTP+copy-spec hybrid; this is for fit). */
     int n_emit = n_experts;
     const int *emit_src = NULL;
-    if (hm && hm->active && !e.is_mtp) {
+    if (hm && hm->active) {
         if (e.layer < 0 || e.layer >= hm->n_layers) die("hot mask: expert layer out of range");
         n_emit = hm->kept_counts[e.layer];
         emit_src = hm->kept_ids[e.layer];
@@ -1829,10 +1831,11 @@ static output_context build_output_context(const gguf_file *tmpl, const quant_po
         if (type == DS4Q_TYPE_COUNT) type = src->type;
         if (type != DS4Q_TYPE_I32 && !is_quantizable_target(type)) die("unsupported planned tensor type");
         if (ds4q_can_quantize(type) && src->ne[0] % ds4q_block_size(type) != 0) die("ne[0] not divisible by block size");
-        /* Hot mask shrinks the routed-expert dim (last) of main-block exps tensors. */
+        /* Hot mask shrinks the routed-expert dim (last) of exps tensors, incl.
+         * the MTP draft block (mtp.0) when a matched MTP mask is supplied. */
         if (hm && hm->active) {
             expert_tensor e = parse_expert_tensor(src->name);
-            if (e.is_expert && !e.is_mtp) {
+            if (e.is_expert) {
                 if (e.layer < 0 || e.layer >= hm->n_layers) die("hot mask: expert layer out of range");
                 int last = src->n_dims - 1;
                 if (src->ne[last] != (int64_t)hm->n_expert)
