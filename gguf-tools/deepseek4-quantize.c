@@ -6,8 +6,10 @@
  * Pro GGUF recipes used by this repository:
  *
  * - safetensors index/header loading;
- * - FP8 E4M3 + E8M0 dequantization for dense tensors;
- * - packed FP4 + E8M0 dequantization for routed experts;
+ * - FP8 E4M3 + (F32 | E8M0) 128x128 block-scale dequantization, for dense
+ *   tensors AND for routed experts on the Base checkpoint (whose experts are
+ *   F8_E4M3 with an F32 block scale, not packed FP4);
+ * - packed FP4 + E8M0 dequantization for routed experts on the packed release;
  * - local Q8_0, Q4_K, Q2_K, and IQ2_XXS quantization;
  * - GGUF metadata/tensor-order reuse from an existing template GGUF.
  *
@@ -179,6 +181,14 @@ static int64_t load_i64_le(const uint8_t *p) {
     uint64_t v = 0;
     for (int i = 0; i < 8; i++) v |= (uint64_t)p[i] << (8 * i);
     return (int64_t)v;
+}
+
+static float load_f32_le(const uint8_t *p) {
+    uint32_t b = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                 ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+    float f;
+    memcpy(&f, &b, sizeof f);
+    return f;
 }
 
 /* =====
@@ -680,8 +690,15 @@ static float *tensor_to_f32(const st_value *t, int64_t *n_out) {
     return out;
 }
 
+/* F8_E4M3 weights with a 128x128 block scale.  The DeepSeek-V4-Flash *Base*
+ * checkpoint stores that scale as F32 on disk (config.json claims "ue8m0", but
+ * the safetensors dtype is F32); the packed quant release stores it as F8_E8M0.
+ * Accept both — geometry is identical, only the per-block scale read differs. */
 static float *dequant_fp8_weight(const st_value *w, const st_value *scale, int64_t *n_out) {
-    if (strcmp(w->dtype, "F8_E4M3") != 0 || strcmp(scale->dtype, "F8_E8M0") != 0) die("bad FP8 weight/scale dtype");
+    if (strcmp(w->dtype, "F8_E4M3") != 0) die("bad FP8 weight dtype (want F8_E4M3)");
+    const bool scale_f32 = (strcmp(scale->dtype, "F32") == 0);
+    if (!scale_f32 && strcmp(scale->dtype, "F8_E8M0") != 0)
+        die("FP8 block scale must be F32 (Base checkpoint) or F8_E8M0 (packed release)");
     if (w->n_dims != 2 || scale->n_dims != 2) die("FP8 tensor must be 2D");
     const int64_t out_dim = w->shape[0];
     const int64_t in_dim = w->shape[1];
@@ -691,10 +708,14 @@ static float *dequant_fp8_weight(const st_value *w, const st_value *scale, int64
     const int64_t scale_rows = out_dim / block_out;
     const int64_t scale_cols = in_dim / block_in;
     if (scale->shape[0] != scale_rows || scale->shape[1] != scale_cols) die("FP8 scale shape mismatch");
+    if (scale->nbytes < (size_t)scale_rows * (size_t)scale_cols * (scale_f32 ? 4u : 1u))
+        die("FP8 scale byte size too small");
     float *out = xmalloc((size_t)out_dim * (size_t)in_dim * sizeof(float));
     for (int64_t ob = 0; ob < scale_rows; ob++) {
         for (int64_t ib = 0; ib < scale_cols; ib++) {
-            const float s = e8m0_to_f32(scale->data[(size_t)ob * (size_t)scale_cols + (size_t)ib]);
+            const size_t sidx = (size_t)ob * (size_t)scale_cols + (size_t)ib;
+            const float s = scale_f32 ? load_f32_le(scale->data + sidx * 4)
+                                      : e8m0_to_f32(scale->data[sidx]);
             for (int64_t r = 0; r < block_out; r++) {
                 const int64_t row = ob * block_out + r;
                 const size_t base = (size_t)row * (size_t)in_dim + (size_t)ib * (size_t)block_in;
@@ -867,6 +888,85 @@ static void imatrix_free(imatrix_store *im) {
 }
 
 /* =====
+ * Optional routed-expert hot mask (precision-inversion / hot-resident build)
+ *
+ * A DSXM mask (gguf-tools/make_expert_mask.py) marks, per layer, which routed
+ * experts to KEEP.  With --experts-hot-mask the quantizer emits each main-block
+ * ffn_{gate,up,down}_exps tensor containing ONLY the kept (hot) experts,
+ * compacted to contiguous slots at the requested --experts type, and records
+ *   ds4.expert_keep_map.kept_counts   array<i32> length n_layers
+ *   ds4.expert_keep_map.original_ids  array<i32> length sum(kept_counts)
+ * so ds4.c:load_expert_keep_map() maps router expert id -> compact slot at run
+ * time.  Dropped (cold) experts are not written into this GGUF; in the hybrid
+ * layout they are streamed from the HF safetensors.  The byte format matches
+ * shrink_gguf.py exactly, so the runtime consumes either producer identically.
+ * MTP draft experts (mtp.N.*) are never shrunk here, matching shrink_gguf's
+ * blk-only regex.
+ */
+typedef struct {
+    bool active;
+    int n_layers;
+    int n_expert;        /* mask experts-per-layer; must equal routed expert count */
+    int *kept_counts;    /* [n_layers] */
+    int **kept_ids;      /* [n_layers][kept_counts[l]] kept expert ids, ascending */
+    int total_kept;
+} hot_mask;
+
+static void hot_mask_load(hot_mask *hm, const char *path) {
+    memset(hm, 0, sizeof(*hm));
+    FILE *fp = fopen(path, "rb");
+    if (!fp) die_errno("open hot mask", path);
+    unsigned char magic[4];
+    if (fread(magic, 1, 4, fp) != 4) die("hot mask: short header");
+    if (memcmp(magic, "DSXM", 4) != 0) die("hot mask: bad magic, expected DSXM");
+    int32_t version = read_i32_fp(fp, "hot-mask version");
+    if (version != 1) die("hot mask: unsupported version");
+    int32_t n_layers = read_i32_fp(fp, "hot-mask n_layers");
+    int32_t n_expert = read_i32_fp(fp, "hot-mask n_expert");
+    (void)read_i32_fp(fp, "hot-mask reserved");
+    if (n_layers < 1 || n_layers > 4096) die("hot mask: unreasonable n_layers");
+    if (n_expert < 1 || n_expert > 65536) die("hot mask: unreasonable n_expert");
+    size_t n_bits = (size_t)n_layers * (size_t)n_expert;
+    size_t n_bytes = (n_bits + 7) / 8;
+    uint8_t *bits = xmalloc(n_bytes);
+    if (fread(bits, 1, n_bytes, fp) != n_bytes) die("hot mask: short bit body");
+    fclose(fp);
+    hm->active = true;
+    hm->n_layers = n_layers;
+    hm->n_expert = n_expert;
+    hm->kept_counts = xcalloc((size_t)n_layers, sizeof(int));
+    hm->kept_ids = xcalloc((size_t)n_layers, sizeof(int *));
+    for (int l = 0; l < n_layers; l++) {
+        int cnt = 0;
+        for (int e = 0; e < n_expert; e++) {
+            size_t idx = (size_t)l * (size_t)n_expert + (size_t)e;
+            if (bits[idx >> 3] & (1u << (idx & 7))) cnt++;
+        }
+        hm->kept_counts[l] = cnt;
+        hm->kept_ids[l] = xmalloc((size_t)(cnt > 0 ? cnt : 1) * sizeof(int));
+        int s = 0;
+        for (int e = 0; e < n_expert; e++) {
+            size_t idx = (size_t)l * (size_t)n_expert + (size_t)e;
+            if (bits[idx >> 3] & (1u << (idx & 7))) hm->kept_ids[l][s++] = e;
+        }
+        hm->total_kept += cnt;
+    }
+    free(bits);
+    fprintf(stderr, "loaded hot mask %s: layers=%d n_expert=%d kept=%d/%d (%.1f%%)\n",
+            path, hm->n_layers, hm->n_expert, hm->total_kept,
+            hm->n_layers * hm->n_expert,
+            100.0 * (double)hm->total_kept / ((double)hm->n_layers * (double)hm->n_expert));
+}
+
+static void hot_mask_free(hot_mask *hm) {
+    if (!hm->active) return;
+    for (int l = 0; l < hm->n_layers; l++) free(hm->kept_ids[l]);
+    free(hm->kept_ids);
+    free(hm->kept_counts);
+    memset(hm, 0, sizeof(*hm));
+}
+
+/* =====
  * GGUF tensor mapping and quantization policy
  */
 
@@ -1027,6 +1127,8 @@ typedef struct {
 
 typedef struct {
     ds4q_type routed_w1, routed_w2, routed_w3;
+    ds4q_type hash_w1, hash_w2, hash_w3;  /* layers < n_hash_layers: hash-routed, non-specialty */
+    int n_hash_layers;
     ds4q_type attention_proj, attention, shared, embedding, output, dense;
     type_override *overrides;
     int n_overrides;
@@ -1094,6 +1196,14 @@ static ds4q_type policy_type(const quant_policy *p, const char *name, const tens
     }
     expert_tensor e = parse_expert_tensor(name);
     if (e.is_expert) {
+        /* Hash layers (0..n_hash_layers-1) are hash-routed and non-specialty; give
+         * them a separate (smaller) type so the size budget goes to the specialty
+         * routed experts. Falls through to routed_w* when --hash-w* is unset. */
+        if (!e.is_mtp && e.layer < p->n_hash_layers) {
+            if (e.part == EXP_W1 && p->hash_w1 != DS4Q_TYPE_COUNT) return p->hash_w1;
+            if (e.part == EXP_W2 && p->hash_w2 != DS4Q_TYPE_COUNT) return p->hash_w2;
+            if (e.part == EXP_W3 && p->hash_w3 != DS4Q_TYPE_COUNT) return p->hash_w3;
+        }
         if (e.part == EXP_W1 && p->routed_w1 != DS4Q_TYPE_COUNT) return p->routed_w1;
         if (e.part == EXP_W2 && p->routed_w2 != DS4Q_TYPE_COUNT) return p->routed_w2;
         if (e.part == EXP_W3 && p->routed_w3 != DS4Q_TYPE_COUNT) return p->routed_w3;
@@ -1271,7 +1381,9 @@ typedef struct {
     const char *gguf_name;
     const tensor_meta *tmpl;
     ds4q_type target;
-    int n_experts;
+    int n_experts;         /* full routed expert count == imatrix segment count */
+    int n_emit;            /* experts to emit (== n_experts, or hot kept count) */
+    const int *emit_src;   /* [n_emit] source expert id per output slot, NULL = identity */
     const imatrix_store *imatrix;
     expert_tensor expert;
     const char *wid;
@@ -1284,26 +1396,39 @@ typedef struct {
     pthread_mutex_t lock;
 } expert_job;
 
-static void generate_one_expert(expert_job *j, int xid) {
+/* slot = output position in the (possibly shrunken) tensor; src = the HF /
+ * imatrix expert id feeding it.  Without a hot mask they are identical. */
+static void generate_one_expert(expert_job *j, int slot) {
+    int src = j->emit_src ? j->emit_src[slot] : slot;
     char prefix[256];
     if (j->expert.is_mtp)
-        snprintf(prefix, sizeof(prefix), "mtp.%d.ffn.experts.%d.%s", j->expert.layer, xid, j->wid);
+        snprintf(prefix, sizeof(prefix), "mtp.%d.ffn.experts.%d.%s", j->expert.layer, src, j->wid);
     else
-        snprintf(prefix, sizeof(prefix), "layers.%d.ffn.experts.%d.%s", j->expert.layer, xid, j->wid);
+        snprintf(prefix, sizeof(prefix), "layers.%d.ffn.experts.%d.%s", j->expert.layer, src, j->wid);
     char weight_name[320];
     char scale_name[320];
     snprintf(weight_name, sizeof(weight_name), "%s.weight", prefix);
     snprintf(scale_name, sizeof(scale_name), "%s.scale", prefix);
     st_value w = db_read(j->db, weight_name);
     st_value s = db_read(j->db, scale_name);
-    if (w.n_dims != 2 || w.shape[0] != j->nrows || w.shape[1] * 2 != j->ncols) die("expert shape mismatch");
     int64_t n = 0;
-    float *f32 = dequant_fp4_weight(&w, &s, &n);
+    float *f32;
+    if (strcmp(w.dtype, "F8_E4M3") == 0) {
+        /* Base checkpoint: experts are F8_E4M3 (1 byte/elem) + 128x128 block scale. */
+        if (w.n_dims != 2 || w.shape[0] != j->nrows || w.shape[1] != j->ncols)
+            die("expert shape mismatch (FP8)");
+        f32 = dequant_fp8_weight(&w, &s, &n);
+    } else {
+        /* Packed quant release: experts are I8-packed FP4 (2 per byte) + E8M0 scale. */
+        if (w.n_dims != 2 || w.shape[0] != j->nrows || w.shape[1] * 2 != j->ncols)
+            die("expert shape mismatch (FP4)");
+        f32 = dequant_fp4_weight(&w, &s, &n);
+    }
     const char *names[3] = { j->gguf_name, weight_name, NULL };
-    const float *imat = imatrix_find(j->imatrix, names, 2, j->ncols, xid, j->n_experts);
+    const float *imat = imatrix_find(j->imatrix, names, 2, j->ncols, src, j->n_experts);
     byte_buf q = f32_to_type(f32, n, j->target, j->ncols, imat);
     if (q.size != j->per_expert) die("expert quantized size mismatch");
-    memcpy(j->out->data + (size_t)xid * j->per_expert, q.data, q.size);
+    memcpy(j->out->data + (size_t)slot * j->per_expert, q.data, q.size);
     free(q.data);
     free(f32);
     st_value_free(&w);
@@ -1314,15 +1439,15 @@ static void *expert_worker(void *arg) {
     expert_job *j = arg;
     for (;;) {
         pthread_mutex_lock(&j->lock);
-        int xid = j->next++;
+        int slot = j->next++;
         pthread_mutex_unlock(&j->lock);
-        if (xid >= j->n_experts) break;
-        generate_one_expert(j, xid);
+        if (slot >= j->n_emit) break;
+        generate_one_expert(j, slot);
         pthread_mutex_lock(&j->lock);
         int done = ++j->done;
-        if (done % 32 == 0 || done == j->n_experts) {
+        if (done % 32 == 0 || done == j->n_emit) {
             fprintf(stderr, "generate_expert_tensor: layer %d %s %d/%d experts\n",
-                    j->expert.layer, j->wid, done, j->n_experts);
+                    j->expert.layer, j->wid, done, j->n_emit);
         }
         pthread_mutex_unlock(&j->lock);
     }
@@ -1331,7 +1456,7 @@ static void *expert_worker(void *arg) {
 
 static byte_buf generate_expert(st_db *db, const char *gguf_name, const tensor_meta *tmpl,
                                 ds4q_type target, int n_experts, int n_threads,
-                                const imatrix_store *imatrix) {
+                                const imatrix_store *imatrix, const hot_mask *hm) {
     expert_tensor e = parse_expert_tensor(gguf_name);
     if (!e.is_expert) die("not an expert tensor");
     if (!is_quantizable_target(target)) die("unsupported expert target type");
@@ -1339,16 +1464,27 @@ static byte_buf generate_expert(st_db *db, const char *gguf_name, const tensor_m
     const int64_t ncols = tmpl->ne[0];
     const int64_t nrows = tmpl->ne[1];
     const size_t per_expert = (size_t)nrows * ds4q_row_size(target, ncols);
-    byte_buf out = { .size = per_expert * (size_t)n_experts, .data = xmalloc(per_expert * (size_t)n_experts) };
+    /* Hot mask only shrinks main-block experts; MTP draft experts pass whole. */
+    int n_emit = n_experts;
+    const int *emit_src = NULL;
+    if (hm && hm->active && !e.is_mtp) {
+        if (e.layer < 0 || e.layer >= hm->n_layers) die("hot mask: expert layer out of range");
+        n_emit = hm->kept_counts[e.layer];
+        emit_src = hm->kept_ids[e.layer];
+        if (n_emit < 1) die("hot mask: layer keeps zero experts");
+    }
+    byte_buf out = { .size = per_expert * (size_t)n_emit,
+                     .data = xmalloc(per_expert * (size_t)(n_emit > 0 ? n_emit : 1)) };
     ds4q_quantize_init(target);
     int worker_count = n_threads > 0 ? n_threads : 8;
     if (worker_count < 1) worker_count = 1;
-    if (worker_count > n_experts) worker_count = n_experts;
-    fprintf(stderr, "generate_expert_tensor: layer %d %s using %d worker%s\n",
-            e.layer, wid, worker_count, worker_count == 1 ? "" : "s");
+    if (worker_count > n_emit) worker_count = n_emit;
+    fprintf(stderr, "generate_expert_tensor: layer %d %s emitting %d/%d experts using %d worker%s\n",
+            e.layer, wid, n_emit, n_experts, worker_count, worker_count == 1 ? "" : "s");
     expert_job job = {
         .db = db, .gguf_name = gguf_name, .tmpl = tmpl, .target = target,
-        .n_experts = n_experts, .imatrix = imatrix, .expert = e, .wid = wid,
+        .n_experts = n_experts, .n_emit = n_emit, .emit_src = emit_src,
+        .imatrix = imatrix, .expert = e, .wid = wid,
         .ncols = ncols, .nrows = nrows, .per_expert = per_expert, .out = &out,
     };
     pthread_mutex_init(&job.lock, NULL);
@@ -1363,9 +1499,9 @@ static byte_buf generate_expert(st_db *db, const char *gguf_name, const tensor_m
 
 static byte_buf generate_tensor(st_db *db, const char *name, const tensor_meta *tmpl,
                                 ds4q_type target, int n_experts, int n_threads,
-                                const imatrix_store *imatrix) {
+                                const imatrix_store *imatrix, const hot_mask *hm) {
     if (parse_expert_tensor(name).is_expert) {
-        return generate_expert(db, name, tmpl, target, n_experts, n_threads, imatrix);
+        return generate_expert(db, name, tmpl, target, n_experts, n_threads, imatrix, hm);
     }
     return generate_regular(db, name, tmpl, target, imatrix);
 }
@@ -1521,6 +1657,41 @@ static void write_imatrix_kvs(FILE *fp, const imatrix_store *im) {
     }
 }
 
+/* GGUF array<i32> KV: key string, outer-type ARRAY, elem-type INT32, count, values. */
+static size_t kv_array_i32_size(const char *key, size_t n) {
+    return gguf_string_size(key) + 4 /*outer type*/ + 4 /*elem type*/ + 8 /*count*/ + n * 4;
+}
+
+static void write_kv_array_i32(FILE *fp, const char *key, const int *values, size_t n) {
+    write_gguf_string(fp, key);
+    write_u32(fp, GGUF_TYPE_ARRAY);
+    write_u32(fp, GGUF_TYPE_INT32);
+    write_u64(fp, (uint64_t)n);
+    for (size_t i = 0; i < n; i++) write_u32(fp, (uint32_t)values[i]);
+}
+
+static uint64_t extra_keepmap_kv_count(const hot_mask *hm) {
+    return (hm && hm->active) ? 2 : 0;
+}
+
+static size_t extra_keepmap_kv_size(const hot_mask *hm) {
+    if (!hm || !hm->active) return 0;
+    return kv_array_i32_size("ds4.expert_keep_map.kept_counts", (size_t)hm->n_layers)
+         + kv_array_i32_size("ds4.expert_keep_map.original_ids", (size_t)hm->total_kept);
+}
+
+static void write_keepmap_kvs(FILE *fp, const hot_mask *hm) {
+    if (!hm || !hm->active) return;
+    write_kv_array_i32(fp, "ds4.expert_keep_map.kept_counts", hm->kept_counts, (size_t)hm->n_layers);
+    /* original_ids: kept ids concatenated in layer order, ascending within a layer. */
+    int *flat = xmalloc((size_t)(hm->total_kept > 0 ? hm->total_kept : 1) * sizeof(int));
+    size_t k = 0;
+    for (int l = 0; l < hm->n_layers; l++)
+        for (int s = 0; s < hm->kept_counts[l]; s++) flat[k++] = hm->kept_ids[l][s];
+    write_kv_array_i32(fp, "ds4.expert_keep_map.original_ids", flat, k);
+    free(flat);
+}
+
 static gguf_file load_gguf_metadata(const char *path) {
     gguf_file g = {0};
     g.path = xstrdup(path);
@@ -1640,10 +1811,11 @@ static uint64_t fnv1a64_bytes(const uint8_t *data, size_t n) {
     return h;
 }
 
-static output_context build_output_context(const gguf_file *tmpl, const quant_policy *policy, const imatrix_store *im) {
+static output_context build_output_context(const gguf_file *tmpl, const quant_policy *policy,
+                                            const imatrix_store *im, const hot_mask *hm) {
     output_context out = {0};
     out.n_tensors = tmpl->n_tensors;
-    out.n_kv_extra = extra_imatrix_kv_count(im);
+    out.n_kv_extra = extra_imatrix_kv_count(im) + extra_keepmap_kv_count(hm);
     out.alignment = tmpl->alignment;
     out.tensors = xcalloc((size_t)out.n_tensors, sizeof(out.tensors[0]));
     size_t tensor_info = 0;
@@ -1657,14 +1829,26 @@ static output_context build_output_context(const gguf_file *tmpl, const quant_po
         if (type == DS4Q_TYPE_COUNT) type = src->type;
         if (type != DS4Q_TYPE_I32 && !is_quantizable_target(type)) die("unsupported planned tensor type");
         if (ds4q_can_quantize(type) && src->ne[0] % ds4q_block_size(type) != 0) die("ne[0] not divisible by block size");
+        /* Hot mask shrinks the routed-expert dim (last) of main-block exps tensors. */
+        if (hm && hm->active) {
+            expert_tensor e = parse_expert_tensor(src->name);
+            if (e.is_expert && !e.is_mtp) {
+                if (e.layer < 0 || e.layer >= hm->n_layers) die("hot mask: expert layer out of range");
+                int last = src->n_dims - 1;
+                if (src->ne[last] != (int64_t)hm->n_expert)
+                    die("hot mask: expert tensor last-dim != mask n_expert");
+                dst->ne[last] = (int64_t)hm->kept_counts[e.layer];
+            }
+        }
         dst->type = type;
-        dst->size = tensor_nbytes(type, src->ne, src->n_dims);
+        dst->size = tensor_nbytes(type, dst->ne, dst->n_dims);
         dst->new_offset = off;
         off += ds4q_pad(dst->size, tmpl->alignment);
         tensor_info += gguf_string_size(dst->name) + 4 + (size_t)dst->n_dims * 8 + 4 + 8;
     }
     out.tensor_bytes = off;
-    out.meta_size = 4 + 4 + 8 + 8 + tmpl->kv_raw_len + extra_imatrix_kv_size(im) + tensor_info;
+    out.meta_size = 4 + 4 + 8 + 8 + tmpl->kv_raw_len
+                  + extra_imatrix_kv_size(im) + extra_keepmap_kv_size(hm) + tensor_info;
     out.data_offset = ds4q_pad(out.meta_size, tmpl->alignment);
     return out;
 }
@@ -1680,7 +1864,7 @@ static void write_padding(FILE *fp, size_t n) {
 
 static void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_context *out_ctx,
                             const char *out_path, int n_experts, int n_threads,
-                            const imatrix_store *imatrix) {
+                            const imatrix_store *imatrix, const hot_mask *hm) {
     FILE *fp = fopen(out_path, "wb");
     if (!fp) die_errno("open output", out_path);
     if (fwrite("GGUF", 1, 4, fp) != 4) die("write GGUF magic failed");
@@ -1689,6 +1873,7 @@ static void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_conte
     write_u64(fp, tmpl->n_kv + out_ctx->n_kv_extra);
     if (fwrite(tmpl->kv_raw, 1, tmpl->kv_raw_len, fp) != tmpl->kv_raw_len) die("write GGUF KV failed");
     write_imatrix_kvs(fp, imatrix);
+    write_keepmap_kvs(fp, hm);
     for (uint64_t i = 0; i < out_ctx->n_tensors; i++) {
         const tensor_meta *t = &out_ctx->tensors[i];
         write_gguf_string(fp, t->name);
@@ -1706,7 +1891,7 @@ static void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_conte
         const tensor_meta *src = &tmpl->tensors[i];
         const tensor_meta *dst = &out_ctx->tensors[i];
         fprintf(stderr, "[%4" PRIu64 "/%4" PRIu64 "] %s -> %s\n", i + 1, out_ctx->n_tensors, dst->name, ds4q_type_name(dst->type));
-        byte_buf data = generate_tensor(db, dst->name, src, dst->type, n_experts, n_threads, imatrix);
+        byte_buf data = generate_tensor(db, dst->name, src, dst->type, n_experts, n_threads, imatrix, hm);
         size_t expected = dst->size;
         if (data.size != expected) {
             fprintf(stderr, "error: generated size mismatch for %s: got %zu expected %zu\n", dst->name, data.size, expected);
@@ -1751,6 +1936,7 @@ typedef struct {
     char *compare_gguf;
     char *compare_tensor;
     char *imatrix_file;
+    char *hot_mask_file;
     quant_policy policy;
     int n_experts;
     int n_threads;
@@ -1772,10 +1958,15 @@ static void usage(const char *argv0) {
     printf("  --dry-run              print output plan without reading HF tensor data\n");
     printf("  --imatrix FILE         legacy .dat imatrix from ds4 --imatrix-out\n");
     printf("  --imatrix-strict       fail if a quantized tensor has no matching imatrix vector\n");
+    printf("  --experts-hot-mask F   DSXM mask: emit ONLY kept (hot) experts per layer,\n");
+    printf("                         compacted, + ds4.expert_keep_map.* metadata (cold\n");
+    printf("                         experts dropped; streamed from HF in hybrid layout)\n");
     printf("  --experts TYPE         set routed w1/w2/w3 expert tensors to TYPE\n");
     printf("  --routed-w1 TYPE       routed gate expert tensor type\n");
     printf("  --routed-w2 TYPE       routed down expert tensor type\n");
     printf("  --routed-w3 TYPE       routed up expert tensor type\n");
+    printf("  --hash-layers N        first N layers are hash-routed; apply --hash-w* to their experts\n");
+    printf("  --hash-w1/w2/w3 TYPE   hash-layer expert type (non-specialty; default: same as routed)\n");
     printf("  --attention-proj TYPE  attn_q/kv/output projection type\n");
     printf("  --attention TYPE       other 2D attention/indexer/compressor type\n");
     printf("  --shared TYPE          shared expert tensor type\n");
@@ -1806,6 +1997,8 @@ static bool file_exists(const char *path) {
 static params parse_args(int argc, char **argv) {
     params p = {0};
     p.policy.routed_w1 = p.policy.routed_w2 = p.policy.routed_w3 = DS4Q_TYPE_COUNT;
+    p.policy.hash_w1 = p.policy.hash_w2 = p.policy.hash_w3 = DS4Q_TYPE_COUNT;
+    p.policy.n_hash_layers = 0;
     p.policy.attention_proj = p.policy.attention = p.policy.shared = DS4Q_TYPE_COUNT;
     p.policy.embedding = p.policy.output = p.policy.dense = DS4Q_TYPE_COUNT;
     p.n_experts = 0;
@@ -1834,6 +2027,8 @@ static params parse_args(int argc, char **argv) {
             p.imatrix_file = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--imatrix-strict") == 0) {
             p.imatrix_strict = true;
+        } else if (strcmp(arg, "--experts-hot-mask") == 0) {
+            p.hot_mask_file = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--experts") == 0 || strcmp(arg, "--routed") == 0) {
             ds4q_type t = parse_type(need_value(argc, argv, &i, arg));
             p.policy.routed_w1 = p.policy.routed_w2 = p.policy.routed_w3 = t;
@@ -1843,6 +2038,14 @@ static params parse_args(int argc, char **argv) {
             p.policy.routed_w2 = parse_type(need_value(argc, argv, &i, arg));
         } else if (strcmp(arg, "--routed-w3") == 0 || strcmp(arg, "--routed-up") == 0) {
             p.policy.routed_w3 = parse_type(need_value(argc, argv, &i, arg));
+        } else if (strcmp(arg, "--hash-layers") == 0) {
+            p.policy.n_hash_layers = atoi(need_value(argc, argv, &i, arg));
+        } else if (strcmp(arg, "--hash-w1") == 0) {
+            p.policy.hash_w1 = parse_type(need_value(argc, argv, &i, arg));
+        } else if (strcmp(arg, "--hash-w2") == 0) {
+            p.policy.hash_w2 = parse_type(need_value(argc, argv, &i, arg));
+        } else if (strcmp(arg, "--hash-w3") == 0) {
+            p.policy.hash_w3 = parse_type(need_value(argc, argv, &i, arg));
         } else if (strcmp(arg, "--attention-proj") == 0 || strcmp(arg, "--attn-proj") == 0) {
             p.policy.attention_proj = parse_type(need_value(argc, argv, &i, arg));
         } else if (strcmp(arg, "--attention") == 0) {
@@ -1889,7 +2092,7 @@ static void free_gguf_file(gguf_file *g) {
 }
 
 static void compare_one_tensor(st_db *db, const gguf_file *tmpl, const output_context *out_ctx,
-                               const params *p, const imatrix_store *imatrix) {
+                               const params *p, const imatrix_store *imatrix, const hot_mask *hm) {
     int idx = hmap_get(&tmpl->tensor_map, p->compare_tensor);
     if (idx < 0) {
         fprintf(stderr, "error: tensor not found in template: %s\n", p->compare_tensor);
@@ -1898,7 +2101,7 @@ static void compare_one_tensor(st_db *db, const gguf_file *tmpl, const output_co
     fprintf(stderr, "regenerating %s as %s\n",
             p->compare_tensor, ds4q_type_name(out_ctx->tensors[idx].type));
     byte_buf generated = generate_tensor(db, p->compare_tensor, &tmpl->tensors[idx],
-                                         out_ctx->tensors[idx].type, p->n_experts, p->n_threads, imatrix);
+                                         out_ctx->tensors[idx].type, p->n_experts, p->n_threads, imatrix, hm);
     gguf_file ref = load_gguf_metadata(p->compare_gguf);
     byte_buf reference = read_gguf_tensor_data(&ref, p->compare_gguf, p->compare_tensor);
     printf("tensor: %s\n", p->compare_tensor);
@@ -1947,24 +2150,35 @@ int main(int argc, char **argv) {
     } else {
         fprintf(stderr, "using %d routed experts from --n-experts\n", p.n_experts);
     }
-    output_context out_ctx = build_output_context(&tmpl, &p.policy, &imatrix);
+    hot_mask hm = {0};
+    if (p.hot_mask_file) {
+        hot_mask_load(&hm, p.hot_mask_file);
+        if (hm.n_expert != p.n_experts)
+            die("--experts-hot-mask n_expert does not match routed expert count");
+        fprintf(stderr, "hot-mask build: emitting %d hot experts total (%.1f%% of %d)\n",
+                hm.total_kept, 100.0 * (double)hm.total_kept / ((double)hm.n_layers * p.n_experts),
+                hm.n_layers * p.n_experts);
+    }
+    output_context out_ctx = build_output_context(&tmpl, &p.policy, &imatrix, &hm);
     print_plan(&tmpl, &out_ctx);
-    if (p.dry_run) return 0;
+    if (p.dry_run) { hot_mask_free(&hm); return 0; }
 
     st_db db;
     db_open(&db, p.hf_dir);
     if (p.compare_tensor) {
-        compare_one_tensor(&db, &tmpl, &out_ctx, &p, &imatrix);
+        compare_one_tensor(&db, &tmpl, &out_ctx, &p, &imatrix, &hm);
         db_close(&db);
+        hot_mask_free(&hm);
         imatrix_free(&imatrix);
         free_gguf_file(&tmpl);
         free(out_ctx.tensors);
         return 0;
     }
-    write_full_gguf(&db, &tmpl, &out_ctx, p.out_gguf, p.n_experts, p.n_threads, &imatrix);
+    write_full_gguf(&db, &tmpl, &out_ctx, p.out_gguf, p.n_experts, p.n_threads, &imatrix, &hm);
     fprintf(stderr, "wrote %s\n", p.out_gguf);
 
     db_close(&db);
+    hot_mask_free(&hm);
     imatrix_free(&imatrix);
     free_gguf_file(&tmpl);
     free(out_ctx.tensors);

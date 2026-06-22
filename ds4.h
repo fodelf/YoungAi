@@ -156,6 +156,12 @@ typedef struct {
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt);
 void ds4_engine_close(ds4_engine *e);
+
+/* Mode P/G dynamic-routing classifier: true => programming prompt (route to the
+ * resident programming model), false => everyday prompt (route to the full
+ * cached model). Model-free text heuristic; safe to call before opening any
+ * engine, which is exactly what the router needs to pick the model. */
+bool ds4_prompt_is_programming(const char *prompt);
 void ds4_engine_summary(ds4_engine *e);
 int ds4_engine_vocab_size(ds4_engine *e);
 int ds4_engine_power(ds4_engine *e);

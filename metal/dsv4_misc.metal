@@ -233,12 +233,21 @@ struct ds4_metal_args_dsv4_route_translate {
     uint32_t n_expert_used;    // entries per token in `selected` (== 6)
     uint32_t n_tokens;
     uint32_t n_total_expert;   // kept expert count for this layer (clamp upper bound)
+    uint32_t verify;           // B2b: 1 => atomic-tally every clamp into clamp_count
 };
 
+// B2b fail-loud clamp counter (react-go-execution-plan M-1.2). A dropped or
+// out-of-range expert id is silently clamped to slot 0 below; under Mode P (cold
+// experts masked out of routing entirely) that must never fire, so verify mode
+// tallies each clamp keyed by (layer, original id) into clamp_count[layer*256 +
+// orig] and the host dumps a fail-loud report at exit. A non-zero tally means the
+// router-side -inf mask (non-hash layers) or the hash-layer keep-all guard (B2a)
+// leaked a cold expert into the top-k. Zero runtime cost when verify == 0.
 kernel void kernel_dsv4_route_translate(
         constant ds4_metal_args_dsv4_route_translate & args,
         device const int16_t *lut,      // [n_layer * 256]
         device       int32_t *selected, // [n_tokens * n_expert_used], rewritten in place
+        device       atomic_uint *clamp_count, // [n_layer * 256], verify-mode tally
         uint gid [[thread_position_in_grid]]) {
     const uint total = args.n_tokens * args.n_expert_used;
     if (gid >= total) return;
@@ -247,6 +256,11 @@ kernel void kernel_dsv4_route_translate(
     const int32_t orig = selected[gid];
     int32_t slot = (orig >= 0 && orig < 256) ? (int32_t)row[orig] : -1;
     if (slot < 0 || slot >= (int32_t)args.n_total_expert) {
+        if (args.verify) {
+            const uint key = args.layer * 256u +
+                             (uint)((orig >= 0 && orig < 256) ? orig : 0);
+            atomic_fetch_add_explicit(&clamp_count[key], 1u, memory_order_relaxed);
+        }
         slot = 0;               // dropped/out-of-range expert -> safe slot 0
     }
     selected[gid] = slot;

@@ -63,6 +63,16 @@ int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, cons
  * clean file-backed pages stay reclaimable under memory pressure. resident_flags
  * must be non-NULL with one entry per span. Used for DS4_METAL_EXPERT_OFFLOAD. */
 int ds4_gpu_set_model_map_spans_split(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, const bool *resident_flags, uint32_t count, uint64_t max_tensor_bytes);
+/* Dynamic routed-expert residency route. The host decides at load time whether
+ * the fully-resident model fits the memory budget and pushes the verdict here so
+ * the hot-path gather agrees (1 = stream/offload, 0 = keep resident). An explicit
+ * DS4_METAL_EXPERT_OFFLOAD env always overrides this. CPU builds ignore it. */
+void ds4_gpu_set_expert_offload(int enabled);
+/* Device recommended max GPU working-set in bytes (0 if unknown / CPU build).
+ * Used as the AUTO offload budget when DS4_MEM_BUDGET_MB is unset. */
+uint64_t ds4_gpu_recommended_max_working_set_bytes(void);
+/* Live GPU working-set (model wired + scratch). 0 on CPU build. */
+uint64_t ds4_gpu_current_allocated_bytes(void);
 /* P2.1 cross-layer router prediction prefetch (project.md): register one routed
  * MoE layer's router metadata so the backend can re-evaluate the next layer's
  * router on the CPU during decode and issue async read-ahead for the predicted
@@ -685,7 +695,8 @@ int ds4_gpu_router_select_tensor(
         uint32_t                n_group_used,
         bool                    has_bias,
         bool                    hash_mode,
-        const ds4_gpu_tensor *logits);
+        const ds4_gpu_tensor *logits,
+        uint32_t                layer);
 
 int ds4_gpu_router_select_batch_tensor(
         ds4_gpu_tensor       *selected,
@@ -705,7 +716,8 @@ int ds4_gpu_router_select_batch_tensor(
         uint32_t                n_expert,
         uint32_t                n_expert_used,
         float                   expert_weight_scale,
-        uint32_t                n_tokens);
+        uint32_t                n_tokens,
+        uint32_t                layer);
 
 int ds4_gpu_routed_moe_one_tensor(
         ds4_gpu_tensor       *out,

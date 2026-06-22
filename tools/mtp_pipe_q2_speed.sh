@@ -604,11 +604,16 @@ DEBUG_ARGS=""
 # reverse-connect 是本拓扑的核心 (见顶部注释)。两机都要带。
 # DS4_METAL_PREFILL_CHUNK 限制每次预填充 work 的 token 数；DS4_DIST_PREFILL_CAP 进一步把
 # graph 内部 batch scratch cap 钳到脚本真实 smoke prompt 量级（200K KV 仍由 -c 控制）。
-# DS4_METAL_EXPERT_OFFLOAD 让 q2 routed experts 走 A3 按需 scratch；EXPERT_GATHER_THREADS
-# 并行复制同层 active experts，降低 A3 memcpy 墙。per-tensor DIRECT 已验证不 OOM 但 15s/token，
-# 默认关闭；需要实验时覆盖 DS4_METAL_EXPERT_OFFLOAD_DIRECT=1。
+# 专家常驻/offload 现在由引擎 *动态* 判定 (full-resident ≤85% 预算 → 常驻直读极速;
+# 超预算 → A3 offload 流式安全)。脚本不再硬钉 —— EXPERT_OFFLOAD 留空 = AUTO (让引擎决定);
+# 设 0/1 强制。q2 全模型每机切片远超 12G 预算 → AUTO 自然走 offload (与旧 =1 行为一致);
+# 任何进得了预算的小模型 → AUTO 自动走常驻快路径 (旧硬钉 =1 会把它拖慢 3.6×)。
+# per-tensor DIRECT 已验证不 OOM 但 15s/token，默认关；实验时设 EXPERT_OFFLOAD_DIRECT=1。
 # NO_MODEL_WARMUP 避免启动时扫冷 expert views。
-BASE_RUN_ENV=${BASE_RUN_ENV:-"DS4_DIST_REVERSE_CONNECT=1 DS4_METAL_PREFILL_CHUNK=$PREFILL_CHUNK DS4_DIST_PREFILL_CAP=$DIST_PREFILL_CAP DS4_METAL_EXPERT_OFFLOAD=1 DS4_METAL_EXPERT_OFFLOAD_DIRECT=0 DS4_METAL_EXPERT_GATHER_THREADS=$GATHER_THREADS DS4_METAL_NO_MODEL_WARMUP=1 DS4_DIST_SPEC_PIPE=$SPEC_PIPE DS4_DIST_SPEC_PIPE_DEPTH=$SPEC_PIPE_DEPTH $IO_ENV $COPY_SPEC_ENV"}
+EXPERT_OFFLOAD=${EXPERT_OFFLOAD:-}            # 空=AUTO(引擎动态判定); 0=强制常驻; 1=强制 offload
+EXPERT_OFFLOAD_ENV=""
+[ -n "$EXPERT_OFFLOAD" ] && EXPERT_OFFLOAD_ENV="DS4_METAL_EXPERT_OFFLOAD=$EXPERT_OFFLOAD DS4_METAL_EXPERT_OFFLOAD_DIRECT=${EXPERT_OFFLOAD_DIRECT:-0} "
+BASE_RUN_ENV=${BASE_RUN_ENV:-"DS4_DIST_REVERSE_CONNECT=1 DS4_METAL_PREFILL_CHUNK=$PREFILL_CHUNK DS4_DIST_PREFILL_CAP=$DIST_PREFILL_CAP ${EXPERT_OFFLOAD_ENV}DS4_METAL_EXPERT_GATHER_THREADS=$GATHER_THREADS DS4_METAL_NO_MODEL_WARMUP=1 DS4_DIST_SPEC_PIPE=$SPEC_PIPE DS4_DIST_SPEC_PIPE_DEPTH=$SPEC_PIPE_DEPTH DS4_METAL_MOE_MM_ID_MIN=${MM_ID_MIN:-8} DS4_METAL_EXPERT_OFFLOAD_PROFILE=${EXPERT_OFFLOAD_PROFILE:-0} DS4_METAL_EXPERT_PROFILE_CACHE_MB=${EXPERT_PROFILE_CACHE_MB:-1024} DS4_METAL_ROUTER_CACHE_BIAS=${ROUTER_CACHE_BIAS:-0} DS4_METAL_ROUTER_CACHE_DECAY=${ROUTER_CACHE_DECAY:-0.85} DS4_EXPERT_PIN_FILE=${EXPERT_PIN_FILE:-} DS4_EXPERT_PIN_MLOCK_MB=${EXPERT_PIN_MLOCK_MB:-0} DS4_REAP_COLLECT=${REAP_COLLECT:-0} DS4_EXPERT_KEEP_FILE=${EXPERT_KEEP_FILE:-} $IO_ENV $COPY_SPEC_ENV"}
 # 远程专家字节服务: coordinator (本机) 当客户端拉 worker 盘; worker 当服务端。
 # 第三十波反向 efetch 改 accept 模式 (EXPERT_REMOTE_FETCH_REVERSE=1, 默认开):
 #   目的不变 (二十六波): verify 批的 worker 半程 (~2.3s, 23 层×~270MiB 冷读) 期间
@@ -680,6 +685,7 @@ log "同步源码 → $REMOTE:$REMOTE_DIR"
 rsync -a --exclude '.git' --exclude '*.o' --exclude '*.gguf' --exclude 'gguf/' \
   --exclude '*.bin' --exclude 'ds4' --exclude 'ds4-server' --exclude 'ds4-bench' \
   --exclude 'ds4-eval' --exclude 'ds4-agent' --exclude 'e0-pingpong' --exclude 'ds4_test' \
+  --exclude 'hf/' --exclude 'benchmarks/' --exclude '*.safetensors' --exclude '*.aria2' \
   "$LOCAL_DIR"/ "$REMOTE:$REMOTE_DIR"/ || { log "rsync 失败"; exit 1; }
 
 # ---------------- 2. 两边 clean + build (共享 CORE_OBJS, 必须都重编) ----------------

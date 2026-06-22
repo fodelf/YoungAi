@@ -736,6 +736,15 @@ static uint32_t dist_copy_spec_match(const int *seq, uint32_t len,
     return n > 0 ? best_a : 0;
 }
 
+/* Single-machine entry point for the n-gram copy-spec drafter: ds4.c's local
+ * speculative path reuses the EXACT same matcher the distributed path uses, so
+ * both producers draft identically. Pure function (no dist state). */
+uint32_t ds4_copy_spec_match(const int *seq, uint32_t len, uint32_t min_g,
+                             uint32_t cap, int *out, uint32_t *out_n,
+                             uint32_t *out_src) {
+    return dist_copy_spec_match(seq, len, min_g, cap, out, out_n, out_src);
+}
+
 static void dist_mtp_record_enabled(
         ds4_dist_session *d,
         uint32_t accepted_tokens,

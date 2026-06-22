@@ -132,6 +132,14 @@ static id<MTLBuffer> g_router_weight_sum_buffer;
  * int16. nil for a full model (translation kernel never dispatched). */
 static id<MTLBuffer> g_expert_keep_lut_buffer;
 static uint32_t g_expert_keep_lut_layers;
+/* B2b verify-mode clamp tally (react-go-execution-plan M-1.2): [n_layer*256]
+ * uint32, atomic-incremented by kernel_dsv4_route_translate whenever a routed
+ * expert id is clamped to slot 0 (i.e. a cold/dropped expert leaked into the
+ * top-k). Persists across teardown like the REAP buffers so its atexit dump
+ * still sees the last forward's result. nil until DS4_VERIFY_ROUTE_CLAMP. */
+static int           g_route_clamp_verify = -1;   /* -1 uninit, 0 off, 1 on */
+static id<MTLBuffer> g_route_clamp_buf;
+static uint32_t      g_route_clamp_layers;        /* layer count the buffer is sized for */
 static id<MTLBuffer> g_indexer_head_scores_buffer;
 static id<MTLBuffer> g_indexer_topk_buffer;
 static id<MTLBuffer> g_indexed_topk_buffer;
@@ -13657,6 +13665,114 @@ static int ds4_gpu_encode_moe_swiglu_weight(
     return 1;
 }
 
+/* ---- REAP saliency collection (Router-weighted Expert Activation Pruning,
+ * arXiv:2510.13999) ----------------------------------------------------------
+ * One-shot, domain-calibrated expert importance:  S_j = mean over active tokens of
+ * g_j(x)*||f_j(x)||_2.  The sum6 input holds each selected expert's GATED output
+ * (route_weight folded in at swiglu_weight), so ||slot_k||_2 == g_k*||f_k||_2 exactly.
+ * kernel_dsv4_reap_accum atomic-adds that (fixed-point x256) into a persistent
+ * [layers*256] buffer keyed by the routed expert id (from the router `selected`
+ * tensor).  Routing/output are UNCHANGED -- pure measurement.  Enable DS4_REAP_COLLECT=1,
+ * run a Go+React calibration; per-(layer,expert) saliency dumps at exit -> the keep-set. */
+#define DS4_REAP_MAX_LAYERS 128u   /* covers DeepSeek V4's 43 layers; 128*256*4 = 128 KiB */
+typedef struct { uint32_t tokens, width, n_used, layer; uint64_t src_token_stride; } ds4_gpu_reap_args;
+static int           g_reap_enabled = -1;
+static id<MTLBuffer> g_reap_saliency_buf;   /* [DS4_REAP_MAX_LAYERS*256] uint32 fixed-point */
+static id<MTLBuffer> g_reap_counts_buf;     /* [DS4_REAP_MAX_LAYERS*256] uint32 */
+static id<MTLComputePipelineState> g_reap_accum_pipeline;
+/* stashed at router-select, consumed at the immediately-following sum6 (same layer,
+ * in-order cb execution makes the per-layer pairing exact even with a reused buffer) */
+static id<MTLBuffer> g_reap_sel_buf;
+static NSUInteger    g_reap_sel_off;
+static uint32_t      g_reap_layer;
+static uint32_t      g_reap_n_used;
+
+static void ds4_gpu_reap_dump(void) {
+    if (g_reap_enabled != 1 || !g_reap_saliency_buf || !g_reap_counts_buf) return;
+    const uint32_t *sal = (const uint32_t *)g_reap_saliency_buf.contents;
+    const uint32_t *cnt = (const uint32_t *)g_reap_counts_buf.contents;
+    /* Write to a BUFFERED file, not unbuffered stderr: a SIGTERM'd worker has only a
+     * brief window before the harness escalates to SIGKILL, and ~5k line-buffered
+     * stderr syscalls lose the race.  layer = per-machine first-seen slot (coord slot s
+     * == global layer s; worker slot s == global layer 20+s -- remap when merging). */
+    const char *path = getenv("DS4_REAP_DUMP_FILE");
+    FILE *f = fopen(path && *path ? path : "/tmp/reap_saliency.txt", "w");
+    if (!f) { fprintf(stderr, "ds4: REAP dump fopen failed\n"); return; }
+    for (uint32_t L = 0; L < DS4_REAP_MAX_LAYERS; L++) {
+        uint32_t used = 0;
+        for (uint32_t e = 0; e < 256u; e++) if (cnt[L * 256u + e]) used++;
+        if (!used) continue;
+        bool printed[256] = { false };
+        for (uint32_t r = 0; r < 256u; r++) {
+            int best = -1; double bestS = -1.0;
+            for (uint32_t e = 0; e < 256u; e++) {
+                if (printed[e] || !cnt[L * 256u + e]) continue;
+                const double S = (double)sal[L * 256u + e] / (256.0 * (double)cnt[L * 256u + e]);
+                if (S > bestS) { bestS = S; best = (int)e; }
+            }
+            if (best < 0) break;
+            printed[best] = true;
+            fprintf(f, "reap-saliency L%02u E%03d S=%.5f count=%u\n",
+                    L, best, bestS, cnt[L * 256u + (uint32_t)best]);
+        }
+    }
+    fclose(f);
+    fprintf(stderr, "ds4: REAP saliency written to %s\n", path && *path ? path : "/tmp/reap_saliency.txt");
+}
+
+/* A layer-sliced worker is shut down with SIGTERM (no atexit), so its 20-42 saliency
+ * would never dump.  When REAP is collecting, route SIGTERM through exit() so the
+ * atexit(reap_dump) fires -- by then its last forward's cb has completed and the
+ * Shared accumulator buffers are populated. */
+static void ds4_gpu_reap_sigterm(int sig) { (void)sig; exit(0); }
+
+static int ds4_gpu_reap_enabled(void) {
+    if (g_reap_enabled < 0) {
+        g_reap_enabled = ds4_gpu_env_bool("DS4_REAP_COLLECT") > 0 ? 1 : 0;
+        if (g_reap_enabled == 1) {
+            const size_t n = (size_t)DS4_REAP_MAX_LAYERS * 256u * sizeof(uint32_t);
+            g_reap_saliency_buf = [g_device newBufferWithLength:n options:MTLResourceStorageModeShared];
+            g_reap_counts_buf   = [g_device newBufferWithLength:n options:MTLResourceStorageModeShared];
+            g_reap_accum_pipeline = ds4_gpu_get_pipeline("kernel_dsv4_reap_accum");
+            if (!g_reap_saliency_buf || !g_reap_counts_buf || !g_reap_accum_pipeline) {
+                fprintf(stderr, "ds4: REAP collect init failed\n");
+                g_reap_enabled = 0;
+            } else {
+                memset(g_reap_saliency_buf.contents, 0, n);
+                memset(g_reap_counts_buf.contents, 0, n);
+                atexit(ds4_gpu_reap_dump);
+                signal(SIGTERM, ds4_gpu_reap_sigterm);
+                fprintf(stderr, "ds4: REAP saliency collection enabled (DS4_REAP_COLLECT=1)\n");
+            }
+        }
+    }
+    return g_reap_enabled;
+}
+
+/* Dispatch reap_accum over the sum6 input (the per-expert gated outputs). */
+static void ds4_gpu_reap_dispatch(id<MTLCommandBuffer> cb, id<MTLBuffer> experts,
+                                  NSUInteger experts_off, uint32_t width, uint32_t n_tokens) {
+    if (ds4_gpu_reap_enabled() != 1 || !cb || !experts || !g_reap_sel_buf ||
+        !g_reap_accum_pipeline || width == 0 || n_tokens == 0) return;
+    const uint32_t n_used = g_reap_n_used ? g_reap_n_used : 6u;
+    ds4_gpu_reap_args args = { .tokens = n_tokens, .width = width, .n_used = n_used,
+                               .layer = g_reap_layer,
+                               .src_token_stride = (uint64_t)n_used * width * sizeof(float) };
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:g_reap_accum_pipeline];
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:experts offset:experts_off atIndex:1];
+    [enc setBuffer:g_reap_sel_buf offset:g_reap_sel_off atIndex:2];
+    [enc setBuffer:g_reap_saliency_buf offset:0 atIndex:3];
+    [enc setBuffer:g_reap_counts_buf offset:0 atIndex:4];
+    const NSUInteger total = (NSUInteger)n_tokens * n_used;
+    NSUInteger tg = g_reap_accum_pipeline.maxTotalThreadsPerThreadgroup;
+    if (tg > 256u) tg = 256u; if (tg == 0u) tg = 1u;
+    const NSUInteger groups = (total + tg - 1u) / tg;
+    [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+}
+
 static int ds4_gpu_encode_moe_sum6(
         id<MTLCommandBuffer> cb,
         id<MTLBuffer>        experts,
@@ -13690,6 +13806,9 @@ static int ds4_gpu_encode_moe_sum6(
     [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
+    /* REAP: ||gated expert output||_2 per (token,slot) -> saliency, keyed by the
+     * router selection stashed at this layer's router-select (no-op unless enabled). */
+    ds4_gpu_reap_dispatch(cb, experts, experts_off, out_dim, n_tokens);
     return 1;
 }
 
@@ -14249,13 +14368,79 @@ int ds4_gpu_set_expert_keep_lut(const int16_t *lut, uint32_t n_layer) {
     return 1;
 }
 
+/* B2b fail-loud dump (react-go-execution-plan M-1.2), runs at process exit when
+ * verify is on. Mode P masks every cold expert out of routing, so a non-zero
+ * clamp tally is a correctness failure: a dropped expert was selected and the
+ * translate kernel silently re-routed it to slot 0. Lists every offending
+ * (layer, original-expert id) so a leak points straight at the masking gap. */
+static void ds4_gpu_route_clamp_dump(void) {
+    if (g_route_clamp_verify != 1 || !g_route_clamp_buf) return;
+    const uint32_t *cnt = (const uint32_t *)g_route_clamp_buf.contents;
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < g_route_clamp_layers * 256u; i++) total += cnt[i];
+    if (total == 0) {
+        fprintf(stderr,
+                "ds4: [B2b] route-translate clamp verify: 0 cold-expert clamps "
+                "across the run -- Mode P masking is tight (clamp count = 0)\n");
+        return;
+    }
+    fprintf(stderr,
+            "ds4: [B2b] *** ROUTE-TRANSLATE CLAMP LEAK *** %llu cold-expert "
+            "selection(s) clamped to slot 0 -- Mode P masking LEAKED:\n",
+            (unsigned long long)total);
+    for (uint32_t L = 0; L < g_route_clamp_layers; L++) {
+        for (uint32_t e = 0; e < 256u; e++) {
+            const uint32_t c = cnt[L * 256u + e];
+            if (c)
+                fprintf(stderr,
+                        "ds4: [B2b]   layer %02u expert %03u clamped %u time(s)\n",
+                        L, e, c);
+        }
+    }
+}
+
+/* B2b: read DS4_VERIFY_ROUTE_CLAMP once; on first enable register the atexit
+ * fail-loud dump. The tally buffer is allocated lazily by ensure_buf() below once
+ * the kept-layer count is known. Default (unset) => verify off => byte-identical
+ * routing (kernel skips the atomic). */
+static int ds4_gpu_route_clamp_verify_enabled(void) {
+    if (g_route_clamp_verify < 0) {
+        g_route_clamp_verify = ds4_gpu_env_bool("DS4_VERIFY_ROUTE_CLAMP") > 0 ? 1 : 0;
+        if (g_route_clamp_verify == 1) {
+            atexit(ds4_gpu_route_clamp_dump);
+            fprintf(stderr,
+                    "ds4: [B2b] route-translate clamp verify enabled "
+                    "(DS4_VERIFY_ROUTE_CLAMP=1) -- Mode P clamp count must be 0\n");
+        }
+    }
+    return g_route_clamp_verify;
+}
+
+/* B2b: lazily allocate the [n_layer*256] uint32 clamp tally, sized to the kept-
+ * layer count (DeepSeek V4 = 43 layers, ~43 KiB). Allocated for any keep-map
+ * model so the kernel always has a bound buffer at index 3; the atomic write is
+ * gated by args.verify, so non-verify runs leave it untouched. */
+static id<MTLBuffer> ds4_gpu_route_clamp_ensure_buf(void) {
+    if (!g_route_clamp_buf || g_route_clamp_layers != g_expert_keep_lut_layers) {
+        const size_t n = (size_t)g_expert_keep_lut_layers * 256u * sizeof(uint32_t);
+        g_route_clamp_buf = [g_device newBufferWithLength:n
+                                                  options:MTLResourceStorageModeShared];
+        if (g_route_clamp_buf) {
+            memset(g_route_clamp_buf.contents, 0, n);
+            g_route_clamp_layers = g_expert_keep_lut_layers;
+        }
+    }
+    return g_route_clamp_buf;
+}
+
 /* Rewrite a routed-expert selection tensor from original ids (0..255) to the
  * compact slots of a shrunken model's expert tensors, in place. Runs between
  * router selection and the routed-MoE matvec. No-op (returns 1) when no keep-map
  * LUT has been set, so a full model is unaffected. The kernel maps both top-k and
  * first-3-layer hash selections (both live in the same `selected` tensor) and
  * clamps dropped/out-of-range experts to slot 0 so the matvec never indexes out
- * of bounds. */
+ * of bounds. B2b: with DS4_VERIFY_ROUTE_CLAMP it tallies every such clamp into a
+ * resident buffer dumped at exit (Mode P must clamp 0). */
 int ds4_gpu_translate_expert_ids(
         ds4_gpu_tensor       *selected,
         uint32_t                layer,
@@ -14283,12 +14468,20 @@ int ds4_gpu_translate_expert_ids(
                                     "kernel_dsv4_route_translate");
         if (!pipeline) return 0;
 
+        const int verify = ds4_gpu_route_clamp_verify_enabled();
+        id<MTLBuffer> clampbuf = ds4_gpu_route_clamp_ensure_buf();
+        if (!clampbuf) {
+            fprintf(stderr, "ds4: route-translate clamp tally alloc failed\n");
+            return 0;   /* kernel requires a bound buffer at index 3 */
+        }
         struct {
             uint32_t layer;
             uint32_t n_expert_used;
             uint32_t n_tokens;
             uint32_t n_total_expert;
-        } args = { layer, n_expert_used, n_tokens, n_total_expert };
+            uint32_t verify;
+        } args = { layer, n_expert_used, n_tokens, n_total_expert,
+                   (uint32_t)(verify == 1) };
 
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
@@ -14298,6 +14491,7 @@ int ds4_gpu_translate_expert_ids(
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:g_expert_keep_lut_buffer offset:0 atIndex:1];
         [enc setBuffer:selbuf offset:ds4_gpu_tensor_offset(selected) atIndex:2];
+        [enc setBuffer:clampbuf offset:0 atIndex:3];
         const NSUInteger total = (NSUInteger)n_tokens * n_expert_used;
         NSUInteger tg = pipeline.maxTotalThreadsPerThreadgroup;
         if (tg > total) tg = total;
@@ -14311,6 +14505,105 @@ int ds4_gpu_translate_expert_ids(
 }
 
 static void ds4_gpu_expert_router_note(int token, int hash_mode);
+
+/* ---- Cache-aware routing bias (project.md P2.4) -----------------------------
+ * Nudge the biased top-k selection toward experts gathered in recent tokens
+ * (i.e. still page-cache-hot) so consecutive tokens reuse the same experts and
+ * fewer routed-expert fetches fall cold to SSD.  Keeps n_expert_used unchanged
+ * and leaves the route WEIGHTS on the model's unbiased probs -- only *which 6*
+ * shifts, exactly like the model's own load-balance bias (ffn_exp_probs_b).
+ * lambda=0 (default) => combined bias == model bias => bit-exact / no-op.
+ * QUALITY BET: it changes routing, so gate with ds4-eval q1..q4 +
+ * --logprob-vectors before raising lambda; the score-decay keeps it from
+ * collapsing routing onto a few experts. */
+#define DS4_ROUTER_CACHE_HOT_LAYERS 64u
+static float g_router_cache_hot[DS4_ROUTER_CACHE_HOT_LAYERS][256];
+static float g_router_cache_bias_lambda = -1.0f;   /* <0 = uninitialised */
+static float g_router_cache_bias_decay  = 0.85f;
+
+static float ds4_gpu_router_cache_bias(void) {
+    if (g_router_cache_bias_lambda < 0.0f) {
+        const char *l = getenv("DS4_METAL_ROUTER_CACHE_BIAS");
+        const char *d = getenv("DS4_METAL_ROUTER_CACHE_DECAY");
+        g_router_cache_bias_lambda = (l && *l) ? (float)strtod(l, NULL) : 0.0f;
+        if (!(g_router_cache_bias_lambda > 0.0f)) g_router_cache_bias_lambda = 0.0f;
+        if (d && *d) g_router_cache_bias_decay = (float)strtod(d, NULL);
+        if (g_router_cache_bias_lambda > 0.0f)
+            fprintf(stderr,
+                    "ds4: router cache-aware bias enabled (lambda=%.4f decay=%.3f) "
+                    "-- quality bet, gate with q1..q4 + --logprob-vectors\n",
+                    g_router_cache_bias_lambda, g_router_cache_bias_decay);
+    }
+    return g_router_cache_bias_lambda;
+}
+
+/* Decay this layer's recency scores and mark the just-gathered experts hot.
+ * Called from the gather (which owns layer_index + the active id set). */
+static void ds4_gpu_router_cache_note_gather(uint32_t layer, const uint32_t *active_ids, uint32_t n) {
+    if (ds4_gpu_router_cache_bias() <= 0.0f || layer >= DS4_ROUTER_CACHE_HOT_LAYERS || !active_ids) return;
+    float *hot = g_router_cache_hot[layer];
+    const float decay = g_router_cache_bias_decay;
+    for (uint32_t e = 0; e < 256u; e++) hot[e] *= decay;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint32_t e = active_ids[i];
+        if (e < 256u) hot[e] = 1.0f;
+    }
+}
+
+/* Map a layer's ffn_exp_probs_b model offset to a hot-table slot.  Slots are
+ * assigned in first-seen order, which is layer order (the graph evaluates layers
+ * 0..N sequentially), so this slot matches the gather's layer_index -- the router
+ * and the recency update share the same g_router_cache_hot row.  No cross-file
+ * plumbing.  Perf-only mapping: a stale association can never break correctness,
+ * only the cache-hit gain (and lambda=0 disables the whole path). */
+static uint32_t ds4_gpu_router_cache_layer_slot(uint64_t bias_offset) {
+    static uint64_t off_map[DS4_ROUTER_CACHE_HOT_LAYERS];
+    static uint32_t off_n = 0;
+    for (uint32_t i = 0; i < off_n; i++) if (off_map[i] == bias_offset) return i;
+    if (off_n < DS4_ROUTER_CACHE_HOT_LAYERS) { off_map[off_n] = bias_offset; return off_n++; }
+    return 0;
+}
+
+/* REAP expert keep-mask (Stage 4a quality test): restrict the router to the kept
+ * experts (top-K saliency) per layer by reusing the bias path -- pruned experts get
+ * bias -inf so they never enter the top-6, and the router renormalizes over the
+ * survivors.  No repack / no memory change here -- this checks whether the pruned
+ * model holds Go+React quality before committing to a repack.  Keep-set is
+ * slot-indexed (machine-local first-seen layer order, matching the saliency dump). */
+static bool g_reap_keep[DS4_ROUTER_CACHE_HOT_LAYERS][256];
+static int  g_keep_enabled = -1;
+static int ds4_gpu_expert_keep_enabled(void) {
+    if (g_keep_enabled < 0) {
+        g_keep_enabled = 0;
+        const char *path = getenv("DS4_EXPERT_KEEP_FILE");
+        if (path && *path) {
+            FILE *f = fopen(path, "r");
+            if (f) {
+                char line[8192];
+                while (fgets(line, sizeof(line), f)) {
+                    char *colon = strchr(line, ':');
+                    if (!colon) continue;
+                    *colon = '\0';
+                    const uint32_t slot = (uint32_t)strtoul(line, NULL, 10);
+                    if (slot >= DS4_ROUTER_CACHE_HOT_LAYERS) continue;
+                    char *p = colon + 1;
+                    while (*p && *p != '\n') {
+                        char *end = NULL;
+                        const uint32_t e = (uint32_t)strtoul(p, &end, 10);
+                        if (end == p) break;
+                        if (e < 256u) { g_reap_keep[slot][e] = true; g_keep_enabled = 1; }
+                        p = end;
+                        while (*p == ',' || *p == ' ') p++;
+                    }
+                }
+                fclose(f);
+            }
+        }
+        if (g_keep_enabled == 1)
+            fprintf(stderr, "ds4: REAP keep-mask enabled (file=%s) -- router restricted to kept experts + renorm\n", path);
+    }
+    return g_keep_enabled;
+}
 
 int ds4_gpu_router_select_tensor(
         ds4_gpu_tensor       *selected,
@@ -14329,7 +14622,8 @@ int ds4_gpu_router_select_tensor(
         uint32_t                n_group_used,
         bool                    has_bias,
         bool                    hash_mode,
-        const ds4_gpu_tensor *logits) {
+        const ds4_gpu_tensor *logits,
+        uint32_t                layer) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!selected || !weights || !probs || !logits || !model_map ||
         n_expert == 0 || n_expert_used == 0) return 0;
@@ -14363,9 +14657,43 @@ int ds4_gpu_router_select_tensor(
         NSUInteger hash_set_offset = 0;
         if (has_bias && !hash_mode) {
             const uint64_t bias_bytes = (uint64_t)n_expert * sizeof(float);
-            biasbuf = ds4_gpu_wrap_model_range(model_map, model_size, bias_offset, bias_bytes, &bias_inner);
-            if (!biasbuf) return 0;
-            bias_set_offset = (NSUInteger)bias_inner;
+            const float cache_lambda = ds4_gpu_router_cache_bias();
+            if ((cache_lambda > 0.0f || ds4_gpu_expert_keep_enabled() == 1 || g_expert_keep_lut_buffer) && model_map && n_expert <= 256u &&
+                bias_offset + bias_bytes <= model_size) {
+                /* Cache-aware bias: combined = model load-balance bias + lambda*hot.
+                 * Tiny per-call Shared buffer (<=1 KiB), freed with the pool. The
+                 * model bias is host-readable (mmap/Shared) at model_map+bias_offset. */
+                const uint32_t slot = ds4_gpu_router_cache_layer_slot(bias_offset);
+                const float *model_bias = (const float *)((const char *)model_map + bias_offset);
+                const float *hot = g_router_cache_hot[slot];
+                id<MTLBuffer> combined = [g_device newBufferWithLength:bias_bytes
+                                                               options:MTLResourceStorageModeShared];
+                if (!combined) return 0;
+                float *cbp = (float *)combined.contents;
+                const bool keep_on = ds4_gpu_expert_keep_enabled() == 1 && slot < DS4_ROUTER_CACHE_HOT_LAYERS;
+                /* Reduced-expert (shrunken) model: route_translate maps a dropped expert
+                 * (keep-lut == -1) to "safe slot 0", so any token routed to dropped experts
+                 * collapses its top-6 into duplicate slot-0 -> "number soup".  Mask the
+                 * dropped here (before top-k) so the router only ever selects kept experts. */
+                /* k16/shrunken fix: index the keep-LUT by the REAL layer (il), NOT the
+                 * cache-bias `slot` (first-seen bias_offset ordinal). The 3 hash layers
+                 * skip this branch, so slot = il - DS4_N_HASH_LAYER; masking with `slot`
+                 * dropped the WRONG layer's experts while route_translate used `il` ->
+                 * inconsistent mask vs gather -> "number soup". */
+                const int16_t *keeplut = (g_expert_keep_lut_buffer && layer < g_expert_keep_lut_layers)
+                    ? (const int16_t *)g_expert_keep_lut_buffer.contents + (uint64_t)layer * 256u : NULL;
+                for (uint32_t i = 0; i < n_expert; i++) {
+                    cbp[i] = model_bias[i] + (cache_lambda > 0.0f ? cache_lambda * hot[i] : 0.0f);
+                    if (keep_on && !g_reap_keep[slot][i]) cbp[i] = -1e30f;   /* REAP prune: excluded from top-6 */
+                    if (keeplut && keeplut[i] < 0) cbp[i] = -1e30f;          /* shrunken model: dropped -> never selected */
+                }
+                biasbuf = combined;
+                bias_set_offset = 0;
+            } else {
+                biasbuf = ds4_gpu_wrap_model_range(model_map, model_size, bias_offset, bias_bytes, &bias_inner);
+                if (!biasbuf) return 0;
+                bias_set_offset = (NSUInteger)bias_inner;
+            }
         }
         if (hash_mode) {
             const uint64_t hash_bytes = (uint64_t)hash_rows * n_expert_used * sizeof(int32_t);
@@ -14427,7 +14755,8 @@ int ds4_gpu_router_select_batch_tensor(
         uint32_t                n_expert,
         uint32_t                n_expert_used,
         float                   expert_weight_scale,
-        uint32_t                n_tokens) {
+        uint32_t                n_tokens,
+        uint32_t                layer) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!selected || !weights || !probs || !logits || !tokens || !model_map ||
         n_expert == 0 || n_expert_used == 0 || n_tokens == 0) return 0;
@@ -14460,15 +14789,59 @@ int ds4_gpu_router_select_batch_tensor(
         NSUInteger hash_set_offset = 0;
         if (has_bias && !hash_mode) {
             const uint64_t bias_bytes = (uint64_t)n_expert * sizeof(float);
-            biasbuf = ds4_gpu_wrap_model_range(model_map, model_size, bias_offset, bias_bytes, &bias_inner);
-            if (!biasbuf) return 0;
-            bias_set_offset = (NSUInteger)bias_inner;
+            const float cache_lambda = ds4_gpu_router_cache_bias();
+            if ((cache_lambda > 0.0f || ds4_gpu_expert_keep_enabled() == 1 || g_expert_keep_lut_buffer) && model_map && n_expert <= 256u &&
+                bias_offset + bias_bytes <= model_size) {
+                /* Cache-aware bias: combined = model load-balance bias + lambda*hot.
+                 * Tiny per-call Shared buffer (<=1 KiB), freed with the pool. The
+                 * model bias is host-readable (mmap/Shared) at model_map+bias_offset. */
+                const uint32_t slot = ds4_gpu_router_cache_layer_slot(bias_offset);
+                const float *model_bias = (const float *)((const char *)model_map + bias_offset);
+                const float *hot = g_router_cache_hot[slot];
+                id<MTLBuffer> combined = [g_device newBufferWithLength:bias_bytes
+                                                               options:MTLResourceStorageModeShared];
+                if (!combined) return 0;
+                float *cbp = (float *)combined.contents;
+                const bool keep_on = ds4_gpu_expert_keep_enabled() == 1 && slot < DS4_ROUTER_CACHE_HOT_LAYERS;
+                /* Reduced-expert (shrunken) model: route_translate maps a dropped expert
+                 * (keep-lut == -1) to "safe slot 0", so any token routed to dropped experts
+                 * collapses its top-6 into duplicate slot-0 -> "number soup".  Mask the
+                 * dropped here (before top-k) so the router only ever selects kept experts. */
+                /* k16/shrunken fix: index the keep-LUT by the REAL layer (il), NOT the
+                 * cache-bias `slot` (first-seen bias_offset ordinal). The 3 hash layers
+                 * skip this branch, so slot = il - DS4_N_HASH_LAYER; masking with `slot`
+                 * dropped the WRONG layer's experts while route_translate used `il` ->
+                 * inconsistent mask vs gather -> "number soup". */
+                const int16_t *keeplut = (g_expert_keep_lut_buffer && layer < g_expert_keep_lut_layers)
+                    ? (const int16_t *)g_expert_keep_lut_buffer.contents + (uint64_t)layer * 256u : NULL;
+                for (uint32_t i = 0; i < n_expert; i++) {
+                    cbp[i] = model_bias[i] + (cache_lambda > 0.0f ? cache_lambda * hot[i] : 0.0f);
+                    if (keep_on && !g_reap_keep[slot][i]) cbp[i] = -1e30f;   /* REAP prune: excluded from top-6 */
+                    if (keeplut && keeplut[i] < 0) cbp[i] = -1e30f;          /* shrunken model: dropped -> never selected */
+                }
+                biasbuf = combined;
+                bias_set_offset = 0;
+            } else {
+                biasbuf = ds4_gpu_wrap_model_range(model_map, model_size, bias_offset, bias_bytes, &bias_inner);
+                if (!biasbuf) return 0;
+                bias_set_offset = (NSUInteger)bias_inner;
+            }
         }
         if (hash_mode) {
             const uint64_t hash_bytes = (uint64_t)hash_rows * n_expert_used * sizeof(int32_t);
             hashbuf = ds4_gpu_wrap_model_range(model_map, model_size, hash_offset, hash_bytes, &hash_inner);
             if (!hashbuf) return 0;
             hash_set_offset = (NSUInteger)hash_inner;
+        }
+
+        /* REAP: stash this batch's router selection (per-token top-K expert ids) +
+         * the derived layer slot; the sum6 reap dispatch in this forward consumes them. */
+        if (ds4_gpu_reap_enabled() == 1) {
+            g_reap_sel_buf = selectedbuf;
+            g_reap_sel_off = (NSUInteger)ds4_gpu_tensor_offset(selected);
+            g_reap_layer   = (has_bias && !hash_mode && model_map && n_expert <= 256u)
+                             ? ds4_gpu_router_cache_layer_slot(bias_offset) : 0u;
+            g_reap_n_used  = n_expert_used;
         }
 
         const bool had_batch = g_batch_cb != nil;
@@ -14513,18 +14886,54 @@ int ds4_gpu_router_select_batch_tensor(
  * keeps the non-resident expert views but lets the existing GPU id-matvec read
  * selected expert rows directly from those mmap-backed views, avoiding the A3
  * CPU gather barrier. */
+/* Dynamic routed-expert residency route. The host computes a footprint-vs-budget
+ * verdict at load time and pushes it via ds4_gpu_set_expert_offload(); an explicit
+ * DS4_METAL_EXPERT_OFFLOAD env always overrides. This replaces the old "offload is
+ * a hardcoded env flag" behaviour: a model that fits RAM runs resident (direct GPU
+ * read, no per-layer CPU gather); only an over-budget model streams. */
+static int g_expert_offload_verdict = -1;   /* host AUTO verdict: -1 unset, else 0/1 */
+static int g_expert_offload_cached  = -1;   /* resolved decision (env override or verdict) */
+
+void ds4_gpu_set_expert_offload(int enabled) {
+    g_expert_offload_verdict = enabled ? 1 : 0;
+    g_expert_offload_cached = -1;   /* re-resolve on next query with the new verdict */
+}
+
+uint64_t ds4_gpu_recommended_max_working_set_bytes(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (g_device == nil) return 0;
+    return (uint64_t)[g_device recommendedMaxWorkingSetSize];
+}
+
+/* Live GPU working-set size (model wired + graph scratch). Compared against
+ * recommendedMaxWorkingSetSize this is the absolute evidence for whether a
+ * slice fits in VRAM without paging. */
+uint64_t ds4_gpu_current_allocated_bytes(void) {
+    if (g_device == nil) return 0;
+    return (uint64_t)[g_device currentAllocatedSize];
+}
+
 static int ds4_gpu_expert_offload_enabled(void) {
-    static int cached = -1;
-    if (cached < 0) {
+    if (g_expert_offload_cached < 0) {
         const char *v = getenv("DS4_METAL_EXPERT_OFFLOAD");
-        cached = (v && v[0] && !(v[0] == '0' && v[1] == '\0')) ? 1 : 0;
-        if (cached) {
+        int decision;
+        if (v && v[0]) {
+            decision = !(v[0] == '0' && v[1] == '\0') ? 1 : 0;   /* explicit override */
+        } else {
+            decision = (g_expert_offload_verdict >= 0) ? g_expert_offload_verdict : 0;
+        }
+        g_expert_offload_cached = decision;
+        if (decision) {
             fprintf(stderr,
-                    "ds4: DS4_METAL_EXPERT_OFFLOAD=1: routed expert mmap views stay non-resident "
-                    "when the loader can split them.\n");
+                    "ds4: routed-expert offload ON (mmap views non-resident, per-layer CPU "
+                    "gather; over-budget model or DS4_METAL_EXPERT_OFFLOAD=1).\n");
+        } else {
+            fprintf(stderr,
+                    "ds4: routed experts RESIDENT (wired, direct GPU read, no per-layer gather; "
+                    "model fits budget or DS4_METAL_EXPERT_OFFLOAD=0).\n");
         }
     }
-    return cached;
+    return g_expert_offload_cached;
 }
 
 static int ds4_gpu_expert_offload_direct_enabled(void) {
@@ -14642,10 +15051,7 @@ static void ds4_gpu_expert_profile_print_live(const char *tag) {
             g_expert_profile_copy_ms);
 }
 
-static void ds4_gpu_expert_profile_summary(void) {
-    if (!g_expert_profile_initialized || g_expert_profile_unique_requests == 0) return;
-    ds4_gpu_expert_profile_print_live("summary");
-
+static void ds4_gpu_expert_profile_dump_layers(void) {
     const uint32_t top = g_expert_profile_all ? DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS : g_expert_profile_top;
     for (uint32_t il = 0; il < DS4_METAL_EXPERT_PROFILE_MAX_LAYERS; il++) {
         ds4_metal_expert_profile_layer *ls = &g_expert_profile_layer[il];
@@ -14708,6 +15114,12 @@ static void ds4_gpu_expert_profile_summary(void) {
                     resident ? 1 : 0);
         }
     }
+}
+
+static void ds4_gpu_expert_profile_summary(void) {
+    if (!g_expert_profile_initialized || g_expert_profile_unique_requests == 0) return;
+    ds4_gpu_expert_profile_print_live("summary");
+    ds4_gpu_expert_profile_dump_layers();
 }
 
 static void ds4_gpu_expert_profile_init(void) {
@@ -14913,6 +15325,9 @@ static void ds4_gpu_expert_profile_record(
     if (g_expert_profile_interval != 0 &&
         (g_expert_profile_calls % g_expert_profile_interval) == 0) {
         ds4_gpu_expert_profile_print_live("live");
+        /* PROFILE_ALL: also emit per-expert hot set periodically so a SIGTERM'd
+         * worker (no atexit) still dumps its layers' hot experts to its log. */
+        if (g_expert_profile_all) ds4_gpu_expert_profile_dump_layers();
     }
 }
 
@@ -19063,6 +19478,93 @@ static int ds4_gpu_ensure_moe_scratch(uint32_t n_active,
  * the shared scratch -- call with (active_ids + lo, dst + lo*expert_bytes,
  * n_active = hi - lo) and the per-unit workers (slot = unit/3) land each expert
  * at its global scratch slot without needing any range awareness themselves. */
+/* ---- Frequency-pinned expert cache (quality-safe; project.md PC.2) ----------
+ * mlock the file-mmap regions of a per-layer coding-domain hot-expert set so they
+ * stay resident in the page cache and the routed gather's pread hits them WARM
+ * (RAM copy) instead of cold (SSD).  Routing is UNCHANGED -> bit-exact output;
+ * this only changes which expert bytes are already in RAM.  Distinct from the
+ * rejected paths: not the LRU source cache (evicts hot under churn -> 4.4% hit),
+ * not the resident pool (slow scattered GPU read, wave-51), not anon hard_copy
+ * (starves page cache).  Pin set is the frequency top-K profiled over diverse
+ * coding (top-K covers ~31%/55% of requests at K=32/64).  Budget-capped so the
+ * wired set stays under the watchdog. */
+static bool     g_expert_pin[DS4_METAL_EXPERT_PROFILE_MAX_LAYERS][256];
+static int      g_expert_pin_parsed = -1;     /* -1 uninit, 0 off, 1 on */
+static bool     g_expert_pin_mlocked[DS4_METAL_EXPERT_PROFILE_MAX_LAYERS];
+static uint64_t g_expert_pin_mlock_used;
+static uint64_t g_expert_pin_mlock_budget;
+
+static int ds4_gpu_expert_pin_enabled(void) {
+    if (g_expert_pin_parsed < 0) {
+        g_expert_pin_parsed = 0;
+        g_expert_pin_mlock_budget =
+            ds4_gpu_env_u64("DS4_EXPERT_PIN_MLOCK_MB", 0u) * 1024ull * 1024ull;
+        const char *path = getenv("DS4_EXPERT_PIN_FILE");
+        if (path && *path && g_expert_pin_mlock_budget > 0) {
+            FILE *f = fopen(path, "r");
+            if (f) {
+                char line[8192];
+                while (fgets(line, sizeof(line), f)) {
+                    char *colon = strchr(line, ':');
+                    if (!colon) continue;
+                    *colon = '\0';
+                    const uint32_t L = (uint32_t)strtoul(line, NULL, 10);
+                    if (L >= DS4_METAL_EXPERT_PROFILE_MAX_LAYERS) continue;
+                    char *p = colon + 1;
+                    while (*p && *p != '\n') {
+                        char *end = NULL;
+                        const uint32_t e = (uint32_t)strtoul(p, &end, 10);
+                        if (end == p) break;
+                        if (e < 256u) { g_expert_pin[L][e] = true; g_expert_pin_parsed = 1; }
+                        p = end;
+                        while (*p == ',' || *p == ' ') p++;
+                    }
+                }
+                fclose(f);
+            }
+        }
+        if (g_expert_pin_parsed == 1)
+            fprintf(stderr, "ds4: frequency-pinned expert cache enabled (file=%s budget=%llu MiB) "
+                    "-- quality-safe (routing unchanged, bit-exact)\n",
+                    path, (unsigned long long)(g_expert_pin_mlock_budget / (1024ull * 1024ull)));
+    }
+    return g_expert_pin_parsed;
+}
+
+/* mlock this layer's pinned experts (gate/up/down file regions) once, budget-capped.
+ * Faults the pins in on first touch (one-time warm cost) then keeps them wired so
+ * subsequent gathers read them from RAM. */
+static void ds4_gpu_expert_pin_mlock_layer(uint32_t layer_index, const void *model_map,
+                                           uint64_t gate_offset, uint64_t up_offset,
+                                           uint64_t down_offset, uint64_t gate_expert_bytes,
+                                           uint64_t down_expert_bytes) {
+    if (ds4_gpu_expert_pin_enabled() != 1 || !model_map) return;
+    if (layer_index >= DS4_METAL_EXPERT_PROFILE_MAX_LAYERS || g_expert_pin_mlocked[layer_index]) return;
+    g_expert_pin_mlocked[layer_index] = true;   /* attempt once per layer regardless */
+    const uint8_t *base = (const uint8_t *)model_map;
+    uint64_t pinned = 0;
+    for (uint32_t e = 0; e < 256u; e++) {
+        if (!g_expert_pin[layer_index][e]) continue;
+        if (g_expert_pin_mlock_used >= g_expert_pin_mlock_budget) break;
+        const uint64_t off[3] = { gate_offset + (uint64_t)e * gate_expert_bytes,
+                                  up_offset   + (uint64_t)e * gate_expert_bytes,
+                                  down_offset + (uint64_t)e * down_expert_bytes };
+        const uint64_t len[3] = { gate_expert_bytes, gate_expert_bytes, down_expert_bytes };
+        for (int r = 0; r < 3; r++) {
+            if (g_expert_pin_mlock_used + len[r] > g_expert_pin_mlock_budget) continue;
+            if (mlock(base + off[r], (size_t)len[r]) == 0) {
+                g_expert_pin_mlock_used += len[r];
+                pinned += len[r];
+            }
+        }
+    }
+    if (pinned)
+        fprintf(stderr, "ds4: layer %u pinned %.1f MiB hot experts (total wired %.2f/%.2f GiB)\n",
+                layer_index, (double)pinned / (1024.0 * 1024.0),
+                (double)g_expert_pin_mlock_used / (1024.0 * 1024.0 * 1024.0),
+                (double)g_expert_pin_mlock_budget / (1024.0 * 1024.0 * 1024.0));
+}
+
 static int ds4_gpu_gather_experts_run(
         const void *model_map,
         uint32_t    layer_index,
@@ -19149,6 +19651,11 @@ static int ds4_gpu_gather_experts_run(
         .ok = 1,
     };
 
+    /* Frequency-pinned cache: mlock this layer's hot experts resident (once) so the
+     * gather below reads them from RAM, not cold SSD.  Routing unchanged (bit-exact). */
+    ds4_gpu_expert_pin_mlock_layer(layer_index, model_map, gate_offset, up_offset,
+                                   down_offset, gate_expert_bytes, down_expert_bytes);
+
     /* Publish the shared cursor so the remote fetch workers can pull units
      * from the peer's SSD in parallel with the local pread threads. */
     if (remote_on) {
@@ -19178,6 +19685,10 @@ static int ds4_gpu_gather_experts_run(
         pthread_cond_broadcast(&g_rf_cv);
         pthread_mutex_unlock(&g_rf_mu);
     }
+    /* Record this layer's gathered (=now page-cache-hot) expert set so the NEXT
+     * forward's router can bias its top-k toward them (cache-aware routing). No-op
+     * when lambda=0. */
+    ds4_gpu_router_cache_note_gather(layer_index, active_ids, n_active);
     g_gather_active = 0;
     return ctx.ok;
 }

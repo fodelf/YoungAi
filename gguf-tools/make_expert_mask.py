@@ -63,6 +63,32 @@ def build_mask_from_keep_list(by_layer: list[dict], n_expert: int, keep_list: li
     return out
 
 
+def force_keep_hash_layers(keep_sets: list[set[int]], n_expert: int, n_hash: int) -> int:
+    """Force the first `n_hash` layers to keep ALL experts (correctness, not tuning).
+
+    DeepSeek-V4's first DS4_N_HASH_LAYER layers route by a frozen tid2eid hash
+    table keyed on token id, NOT by router logits.  The runtime's -inf keep-mask
+    only gates the learned-router path (`has_bias && !hash_mode`); the hash path
+    bypasses it and any selected-but-dropped expert is silently clamped to slot 0
+    in route_translate -> wrong expert, full route weight, no renorm, no error.
+    Activation-rank top-K cannot safely shrink these layers because the hash can
+    deterministically select any of its experts for some token.  So we keep them
+    whole.  (A tighter future option is to keep only the tid2eid-reachable union
+    read from the GGUF; keep-all is the conservative, always-correct invariant.)
+
+    Returns the number of experts newly added across the forced layers.
+    """
+    if n_hash <= 0:
+        return 0
+    n_hash = min(n_hash, len(keep_sets))
+    full = set(range(n_expert))
+    added = 0
+    for layer in range(n_hash):
+        added += n_expert - len(keep_sets[layer])
+        keep_sets[layer] = set(full)
+    return added
+
+
 def serialize_mask(keep_sets: list[set[int]], n_expert: int) -> bytes:
     n_layers = len(keep_sets)
     n_bits = n_layers * n_expert
@@ -87,6 +113,12 @@ def main():
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--keep-top-k", type=int, help="per-layer: keep this many top experts")
     g.add_argument("--keep-list", type=_csv_ints, help="per-layer K values, comma separated")
+    ap.add_argument("--hash-layers", type=int, default=3,
+                    help="force the first N layers (DeepSeek hash-routed layers, "
+                         "DS4_N_HASH_LAYER=3) to keep ALL experts. These route by a "
+                         "frozen token->expert hash and bypass the -inf keep-mask, so "
+                         "shrinking them silently misroutes. Use 0 to disable (e.g. for "
+                         "a non-hash model).")
     ap.add_argument("--out", required=True, help="output mask path")
     args = ap.parse_args()
 
@@ -111,6 +143,10 @@ def main():
         kept = build_mask_from_keep_list(by_layer, n_expert, args.keep_list)
         desc = f"per-layer K (median={sorted(args.keep_list)[len(args.keep_list)//2]})"
 
+    hash_added = force_keep_hash_layers(kept, n_expert, args.hash_layers)
+    if args.hash_layers > 0:
+        desc += f" +hash-keep-all[0:{min(args.hash_layers, len(kept))}]"
+
     blob = serialize_mask(kept, n_expert)
     with open(args.out, "wb") as f:
         f.write(blob)
@@ -124,6 +160,8 @@ def main():
         f"  kept slots   = {total_kept} / {total_slots} "
         f"({100.0 * total_kept / total_slots:.1f}%)\n"
         f"  disabled     = {total_slots - total_kept}\n"
+        f"  hash-layers  = {min(args.hash_layers, len(kept)) if args.hash_layers > 0 else 0} "
+        f"(forced full; +{hash_added} experts kept for routing correctness)\n"
         f"  mask bytes   = {len(blob)}",
         file=sys.stderr,
     )

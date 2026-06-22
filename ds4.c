@@ -22,6 +22,7 @@
 #include <limits.h>
 #include <math.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -828,9 +829,33 @@ static DS4_MAYBE_UNUSED void ds4_profile_add_decode(uint64_t tokens, double sec)
 
 static void *ds4_mem_watchdog_main(void *arg) {
     (void)arg;
+    const int fp_log = getenv("DS4_FOOTPRINT_LOG") != NULL;
+    uint64_t fp_min = ~0ull, fp_max = 0;
+    int fp_n = 0;
     while (g_mem_watch_run) {
         uint64_t fp = ds4_phys_footprint_bytes();
         if (fp > g_mem_peak_footprint) g_mem_peak_footprint = fp;
+        if (fp_log) {
+            if (fp < fp_min) fp_min = fp;
+            if (fp > fp_max) fp_max = fp;
+            if (++fp_n % 4 == 0) {
+#ifdef DS4_NO_GPU
+                fprintf(stderr, "[fp] phys=%.3f swing=%.0fMiB\n",
+                        (double)fp / DS4_GIB,
+                        (double)(fp_max - fp_min) / (1024.0 * 1024.0));
+#else
+                uint64_t ga = ds4_gpu_current_allocated_bytes();
+                uint64_t gm = ds4_gpu_recommended_max_working_set_bytes();
+                fprintf(stderr,
+                        "[fp] phys=%.3f swing=%.0fMiB | GPU alloc=%.3f / max=%.3f GiB %s\n",
+                        (double)fp / DS4_GIB,
+                        (double)(fp_max - fp_min) / (1024.0 * 1024.0),
+                        (double)ga / DS4_GIB, (double)gm / DS4_GIB,
+                        (gm && ga > gm) ? "<<OVER-MAX (paging)" : "ok");
+#endif
+                fflush(stderr);
+            }
+        }
         if (g_mem_budget_bytes != 0 && fp > (uint64_t)((double)g_mem_budget_bytes * 0.9)) {
             fprintf(stderr,
                     "\n[ds4-watchdog] phys_footprint %.2f GiB crossed 90%% of the "
@@ -839,7 +864,7 @@ static void *ds4_mem_watchdog_main(void *arg) {
             fflush(stderr);
             _exit(137);
         }
-        usleep(200000);
+        usleep(fp_log ? 50000 : 200000);
     }
     return NULL;
 }
@@ -2784,7 +2809,10 @@ static void tensor_expect_layout(
         uint64_t          d0,
         uint64_t          d1,
         uint64_t          d2) {
-    if (!t) ds4_die("internal error: missing tensor while validating layout");
+    if (!t) return;  /* sharded per-machine slice: tensors for the other machine's
+                      * layers (and the head half not held here) are absent -> skip.
+                      * Present layers are still validated; weights_bind's
+                      * required_tensorf guarantees a present layer is complete. */
     if (t->type != type) {
         fprintf(stderr,
                 "ds4: tensor %.*s has type %s, expected %s\n",
@@ -2834,7 +2862,10 @@ static void tensor_expect_plain_layout(
         uint64_t          d0,
         uint64_t          d1,
         uint64_t          d2) {
-    if (!t) ds4_die("internal error: missing tensor while validating layout");
+    if (!t) return;  /* sharded per-machine slice: tensors for the other machine's
+                      * layers (and the head half not held here) are absent -> skip.
+                      * Present layers are still validated; weights_bind's
+                      * required_tensorf guarantees a present layer is complete. */
     if (t->type != DS4_TENSOR_F16 && t->type != DS4_TENSOR_F32) {
         fprintf(stderr,
                 "ds4: tensor %.*s has type %s, expected F16 or F32\n",
@@ -2873,6 +2904,8 @@ static void tensor_expect_routed_expert(
         uint64_t          d0,
         uint64_t          d1,
         uint64_t          d2) {
+    if (!t) return;  /* sharded per-machine slice: routed experts of the other
+                      * machine's layers are absent -> skip (see tensor_expect_layout). */
     if (!tensor_is_routed_expert_type(t->type)) {
         fprintf(stderr,
                 "ds4: tensor %.*s has type %u (%s), expected a routed expert quant type\n",
@@ -2924,6 +2957,12 @@ static void weights_validate_layout(const ds4_model *m, const ds4_weights *w) {
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         const uint32_t ratio = ds4_layer_compress_ratio(il);
+
+        /* Sharded per-machine slice: a layer owned by the other machine is absent
+         * (weights_bind left it zeroed) -> skip its validation entirely. Some
+         * checks here dereference tensor dims directly, so the per-call NULL
+         * guards in tensor_expect_* are not enough on their own. */
+        if (!l->attn_norm) continue;
 
         tensor_expect_layout(l->hc_attn_fn,     DS4_TENSOR_F16,  2, hc_dim, hc_mix_dim, 0);
         tensor_expect_layout(l->hc_attn_scale,  DS4_TENSOR_F32,  1, 3, 0, 0);
@@ -3344,16 +3383,26 @@ static void config_validate_model(const ds4_model *m) {
  * where stringly GGUF metadata becomes direct model-specific pointers. */
 static void weights_bind(ds4_weights *w, const ds4_model *m) {
     memset(w, 0, sizeof(*w));
-    w->token_embd       = required_tensor(m, "token_embd.weight");
-    w->output_hc_base   = required_tensor(m, "output_hc_base.weight");
-    w->output_hc_fn     = required_tensor(m, "output_hc_fn.weight");
-    w->output_hc_scale  = required_tensor(m, "output_hc_scale.weight");
-    w->output_norm      = required_tensor(m, "output_norm.weight");
-    w->output           = required_tensor(m, "output.weight");
+    /* Head tensors are optional so a sharded per-machine slice can hold only the
+     * half it needs: the coordinator (first slice) carries token_embd, the last
+     * slice carries output*. A whole-model GGUF has them all -> model_find_tensor
+     * binds every one exactly as before. */
+    w->token_embd       = model_find_tensor(m, "token_embd.weight");
+    w->output_hc_base   = model_find_tensor(m, "output_hc_base.weight");
+    w->output_hc_fn     = model_find_tensor(m, "output_hc_fn.weight");
+    w->output_hc_scale  = model_find_tensor(m, "output_hc_scale.weight");
+    w->output_norm      = model_find_tensor(m, "output_norm.weight");
+    w->output           = model_find_tensor(m, "output.weight");
 
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         ds4_layer_weights *l = &w->layer[il];
         const uint32_t compress_ratio = ds4_layer_compress_ratio(il);
+
+        /* Sharded per-machine slice: a layer owned by the other machine has no
+         * tensors in this GGUF -> leave w->layer[il] zeroed and skip. The graph
+         * only evaluates this machine's --layers range, so the gap is never read.
+         * A whole-model GGUF has every layer present -> nothing is skipped. */
+        if (!tensor_by_namef(m, "blk.%u.attn_norm.weight", il)) continue;
 
         l->hc_attn_fn      = required_tensorf(m, "blk.%u.hc_attn_fn.weight", il);
         l->hc_attn_scale   = required_tensorf(m, "blk.%u.hc_attn_scale.weight", il);
@@ -9741,6 +9790,69 @@ static void metal_graph_debug_dump_i32_tensor(
     }
 }
 
+/* Router-frequency collector (DS4_ROUTER_FREQ_FILE). Tally, per layer, which
+ * experts the model's *intact* full-256 router would pick (raw top-k over the
+ * raw logits, BEFORE the keep-map mask). Lets us rebuild the keep-map mask from
+ * what THIS base model actually routes to for the calibration corpus, instead of
+ * a chat-derived specialty ranking. Env-gated -> zero cost when off; only active
+ * during an explicit collection run. Syncs/resumes like the debug dump. */
+#define DS4_ROUTER_FREQ_MAXL 64
+#define DS4_ROUTER_FREQ_MAXE 512
+static uint64_t g_router_freq[DS4_ROUTER_FREQ_MAXL][DS4_ROUTER_FREQ_MAXE];
+static int g_router_freq_on = -1;
+static const char *g_router_freq_file = NULL;
+
+static void router_freq_flush(void) {
+    if (g_router_freq_on != 1 || !g_router_freq_file) return;
+    FILE *fp = fopen(g_router_freq_file, "w");
+    if (!fp) { fprintf(stderr, "ds4: router-freq: cannot write %s\n", g_router_freq_file); return; }
+    const uint32_t ne = DS4_N_EXPERT;
+    fprintf(fp, "# layer expert count  (raw top-%u routing freq over %u experts)\n",
+            DS4_N_EXPERT_USED, ne);
+    for (uint32_t il = 0; il < DS4_ROUTER_FREQ_MAXL; il++)
+        for (uint32_t e = 0; e < ne && e < DS4_ROUTER_FREQ_MAXE; e++)
+            if (g_router_freq[il][e])
+                fprintf(fp, "%u %u %llu\n", il, e, (unsigned long long)g_router_freq[il][e]);
+    fclose(fp);
+    fprintf(stderr, "ds4: router-freq written to %s\n", g_router_freq_file);
+}
+
+/* The distributed worker is shut down with SIGTERM (default = terminate, no
+ * atexit). During a collection run install a handler so the worker flushes its
+ * freq file before dying. Gated by the freq env -> not installed on normal runs. */
+static void router_freq_sigterm(int sig) { (void)sig; exit(0); }
+
+static void router_freq_collect(ds4_gpu_tensor *logits_t, uint32_t il, uint32_t n_tokens) {
+    if (g_router_freq_on < 0) {
+        g_router_freq_file = getenv("DS4_ROUTER_FREQ_FILE");
+        g_router_freq_on = (g_router_freq_file && g_router_freq_file[0]) ? 1 : 0;
+        if (g_router_freq_on) { atexit(router_freq_flush); signal(SIGTERM, router_freq_sigterm); }
+    }
+    if (g_router_freq_on != 1 || !logits_t || il >= DS4_ROUTER_FREQ_MAXL) return;
+    const uint32_t ne = DS4_N_EXPERT, nu = DS4_N_EXPERT_USED;
+    if (ne > DS4_ROUTER_FREQ_MAXE || nu > 16 || n_tokens == 0) return;
+    float *buf = xmalloc((size_t)n_tokens * ne * sizeof(float));
+    if (ds4_gpu_synchronize() != 0 &&
+        ds4_gpu_tensor_read(logits_t, 0, buf, (uint64_t)n_tokens * ne * sizeof(float)) != 0) {
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            const float *lg = buf + (size_t)t * ne;
+            int used[16];
+            for (uint32_t k = 0; k < nu; k++) {
+                int best = -1; float bv = -3.0e38f;
+                for (uint32_t e = 0; e < ne; e++) {
+                    bool taken = false;
+                    for (uint32_t j = 0; j < k; j++) if (used[j] == (int)e) { taken = true; break; }
+                    if (!taken && lg[e] > bv) { bv = lg[e]; best = (int)e; }
+                }
+                used[k] = best;
+                if (best >= 0) g_router_freq[il][best]++;
+            }
+        }
+    }
+    free(buf);
+    ds4_gpu_begin_commands();
+}
+
 static bool metal_graph_needs_ffn_out(const ds4_gpu_graph *g, uint32_t il, uint32_t pos) {
     return metal_graph_directional_steering_ffn_enabled(g) ||
            g->materialize_ffn_out ||
@@ -9799,7 +9911,18 @@ static bool metal_graph_alloc_raw_cap(
     }
     g->active_layer_start = active_layer_start;
     g->active_layer_end = active_layer_end;
+    /* Sharded per-machine slice: callers pass &weights->layer[0] as the
+     * representative layer for per-layer dims (compression ratio, attn shape),
+     * but a worker slice may not hold layer 0. Fall back to the first layer this
+     * slice actually holds. Whole-model GGUFs hold layer 0 -> unchanged. */
+    if (weights && (!layer || !layer->attn_norm)) {
+        layer = &weights->layer[active_layer_start];
+    }
     g->mtp_enabled = enable_mtp;
+    /* Single-machine copy-spec reuses the spec frontier snapshot buffers
+     * (spec_attn/index_state_{kv,score}), so allocate those when copy-spec is on,
+     * not only for MTP. The MTP-only prefix1 buffers stay gated on enable_mtp. */
+    const bool enable_spec = enable_mtp || !active_layer_slice;
     if (raw_cap == 0) raw_cap = 1;
     if (ctx_size == 0) ctx_size = raw_cap;
     if (prefill_cap == 0) prefill_cap = 1;
@@ -9906,9 +10029,11 @@ static bool metal_graph_alloc_raw_cap(
                     (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float)));
             g->layer_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
             g->layer_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
-            if (enable_mtp) {
+            if (enable_spec) {
                 g->spec_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
                 g->spec_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
+            }
+            if (enable_mtp) {
                 g->spec_prefix1_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
                 g->spec_prefix1_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
             }
@@ -9929,9 +10054,11 @@ static bool metal_graph_alloc_raw_cap(
                         (uint64_t)g->layer_comp_cap[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
                 g->layer_index_state_kv[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
                 g->layer_index_state_score[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
-                if (enable_mtp) {
+                if (enable_spec) {
                     g->spec_index_state_kv[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
                     g->spec_index_state_score[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
+                }
+                if (enable_mtp) {
                     g->spec_prefix1_index_state_kv[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
                     g->spec_prefix1_index_state_score[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
                 }
@@ -10010,8 +10137,11 @@ static bool metal_graph_alloc_raw_cap(
      * drafter tensors. Allocate just that buffer (~8MiB) when the copy drafter
      * is enabled without MTP, so the final-layer owner can serve VERIFY. */
     if (!g->spec_logits) {
+        /* Single-machine copy-spec (enable_spec) and the distributed copy drafter
+         * (DS4_DIST_COPY_SPEC) both read K logit rows out of spec_logits without
+         * the MTP drafter tensors. ~8 MiB. */
         const char *cs = getenv("DS4_DIST_COPY_SPEC");
-        if (cs && *cs && cs[0] != '0') {
+        if (enable_spec || (cs && *cs && cs[0] != '0')) {
             g->spec_logits = ds4_gpu_tensor_alloc((uint64_t)64 * DS4_N_VOCAB * sizeof(float));
         }
     }
@@ -11123,7 +11253,7 @@ static bool metal_graph_encode_decode_layer(
                                                 0,
                                                 layer->ffn_exp_probs_b != NULL,
                                                 layer->ffn_gate_tid2eid != NULL,
-                                                g->router_logits) != 0;
+                                                g->router_logits, il) != 0;
     DS4_METAL_PROFILE_DECODE_STAGE("router");
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_logits", g->router_logits, DS4_N_EXPERT, il, pos);
@@ -14123,7 +14253,8 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                       DS4_N_EXPERT,
                                                       DS4_N_EXPERT_USED,
                                                       DS4_EXPERT_WEIGHT_SCALE,
-                                                      n_tokens) != 0;
+                                                      n_tokens, il) != 0;
+    if (ok) router_freq_collect(g->batch_router_logits, il, n_tokens);
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_logits", g->batch_router_logits,
                                       (uint64_t)n_tokens * DS4_N_EXPERT, il, pos0);
@@ -15311,11 +15442,16 @@ static bool metal_graph_verify_suffix_tops(
                                        g->spec_logits,
                                        DS4_N_VOCAB) != 0;
         } else if (top_rows) {
+            /* One argmax PER ROW: n_tokens = top_rows rows, top_k = 1. These two
+             * args were swapped (n_tokens=1, top_k=top_rows), which made this
+             * return the top-`top_rows` tokens of ROW 0 instead of each row's
+             * argmax -- harmless until copy-spec became the first caller to verify
+             * more than one draft row (MTP only ever uses top_rows==1 above). */
             ok = ds4_gpu_indexer_topk_tensor(g->comp_selected,
                                                g->spec_logits,
                                                DS4_N_VOCAB,
-                                               1,
-                                               top_rows) != 0;
+                                               top_rows,
+                                               1) != 0;
         }
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
@@ -17307,6 +17443,18 @@ struct ds4_session {
     int ctx_size;
     bool checkpoint_valid;
     bool mtp_draft_valid;
+    /* Adaptive copy-spec draft length (single-machine prompt-lookup speculation).
+     * Converges toward the length the target reliably accepts: grow on a full
+     * accept, shrink to the observed accept on a partial. 0 = not yet primed.
+     * This is what keeps copy-spec a net win on predictable text and a no-op on
+     * unpredictable text, with no tuning knob. */
+    int cs_draft_len;
+    /* Cooldown: after a low-payoff speculation (the per-call frontier snapshot
+     * cost only pays off when many tokens are accepted), skip speculating for a
+     * few steps so unpredictable text never pays the snapshot tax. One probe
+     * leaks through each cooldown so it re-arms the moment text becomes
+     * predictable again. */
+    int cs_cooldown;
 };
 
 /* =========================================================================
@@ -18055,9 +18203,62 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
 
 int ds4_engine_routed_quant_bits(ds4_engine *e) {
     if (!e) return 0;
-    const ds4_tensor *gate = e->weights.layer[0].ffn_gate_exps;
+    /* Sharded per-machine slice: layer 0 may belong to the other machine, so
+     * probe the first routed-expert layer this slice actually holds. The routed
+     * quant is uniform across layers, so any present layer reports the profile. */
+    const ds4_tensor *gate = NULL;
+    for (uint32_t il = 0; il < DS4_N_LAYER && !gate; il++) {
+        gate = e->weights.layer[il].ffn_gate_exps;
+    }
     if (!gate) return 0;
     return gate->type == DS4_TENSOR_Q4_K ? 4 : 2;
+}
+
+/* Mode P / Mode G dynamic routing brain: a cheap, model-free heuristic that
+ * classifies a user prompt as a programming task (-> resident programming model,
+ * Mode P) vs everyday chat (-> full cached model, Mode G). Pure text signals so
+ * the router decides BEFORE any model is loaded. Returns true for programming. */
+bool ds4_prompt_is_programming(const char *prompt) {
+    if (!prompt) return false;
+    const size_t len = strlen(prompt);
+    if (len == 0) return false;
+    int score = 0;
+    if (strstr(prompt, "```")) score += 6;                 /* fenced code block */
+    /* Strong code signals (a single one already routes to Mode P). */
+    static const char *const kw[] = {
+        "def ", "function ", "class ", "import ", "return ", "public ", "private ",
+        "void ", "const ", "let ", "var ", "func ", "struct ", "#include", "println",
+        "console.log", "printf", "std::", "() {", ");", "=>", "->", "elif ",
+        "async ", "await ", "lambda", "useState", "useEffect", "self.", "this.",
+        "</", "/>", "@app", "SELECT ", "npm ", "git ", NULL};
+    for (int i = 0; kw[i]; i++) if (strstr(prompt, kw[i])) score += 3;
+    static const char *const ext[] = {
+        ".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java", ".cpp",
+        ".sh", ".sql", ".html", ".css", ".json", ".yaml", NULL};
+    for (int i = 0; ext[i]; i++) if (strstr(prompt, ext[i])) score += 3;
+    /* Programming-intent words (EN + 中文 + frameworks). +2 each. */
+    static const char *const verb[] = {
+        "implement", "debug", "refactor", "compile", "stack trace", "exception",
+        "syntax", "runtime", "API", "React", "Vue", "Python", "JavaScript",
+        "TypeScript", "Golang", "Rust", "函数", "代码", "编译", "报错", "算法",
+        "重构", "变量", "数组", "循环", "接口", "调试", "返回值", "递归", "指针",
+        "编程", "脚本", "排序", "组件", "登录", "数据库", "框架", "前端", "后端",
+        "正则", "并发", "异步", "类型", "继承", "封装", "bug", "方法", "对象",
+        "装饰器", "闭包", "泛型", "多态", "线程", "进程", "队列", "哈希", "迭代器",
+        "生成器", "协程", "序列化", "指令", "编译器", "解释器", "字节码", NULL};
+    for (int i = 0; verb[i]; i++) if (strstr(prompt, verb[i])) score += 2;
+    /* Symbol density: code is punctuation-heavy relative to prose. */
+    size_t sym = 0;
+    for (size_t i = 0; i < len; i++) {
+        switch (prompt[i]) {
+            case '{': case '}': case ';': case '(': case ')': case ':':
+            case '[': case ']': case '<': case '>': case '=': sym++; break;
+            default: break;
+        }
+    }
+    if (sym * 100u / len >= 8u) score += 3;                 /* >= 8% symbols */
+    /* Everyday prompts carry zero of these signals, so a low bar is safe. */
+    return score >= 3;
 }
 
 bool ds4_engine_has_mtp(ds4_engine *e) {
@@ -19613,9 +19814,44 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         const uint64_t mtp_l1_resident_bytes =
             (e->mtp_ready && getenv("DS4_MTP_NO_RESIDENCY") == NULL) ?
             e->mtp_model.size - e->mtp_model.tensor_data_pos : 0;
+        /* Dynamic resident/offload route (replaces the old hardcoded env flag):
+         * keep routed experts resident -- direct GPU read, no per-layer CPU gather,
+         * full decode speed -- whenever the fully-resident model fits the memory
+         * budget; only stream when it would bust it. DS4_METAL_EXPERT_OFFLOAD still
+         * works as an explicit override (1 = force stream, 0 = force resident). */
         const char *expert_offload_env = getenv("DS4_METAL_EXPERT_OFFLOAD");
-        const bool expert_offload_requested = expert_offload_env && expert_offload_env[0] &&
-            !(expert_offload_env[0] == '0' && expert_offload_env[1] == '\0');
+        bool expert_offload_requested;
+        if (expert_offload_env && expert_offload_env[0]) {
+            expert_offload_requested =
+                !(expert_offload_env[0] == '0' && expert_offload_env[1] == '\0');
+        } else {
+            uint64_t full_resident_bytes = 0;
+            if (load_slice) {
+                ds4_model_map_span_vec bb_probe, exp_probe;
+                if (weights_model_map_spans_split_slice(&e->weights, load_layer_start,
+                        load_layer_end, include_output_head, mtp_keep_token_embd,
+                        &bb_probe, &exp_probe)) {
+                    for (uint32_t i = 0; i < bb_probe.len; i++)
+                        full_resident_bytes += bb_probe.v[i].end - bb_probe.v[i].off;
+                    for (uint32_t i = 0; i < exp_probe.len; i++)
+                        full_resident_bytes += exp_probe.v[i].end - exp_probe.v[i].off;
+                    free(bb_probe.v);
+                    free(exp_probe.v);
+                }
+            } else {
+                full_resident_bytes = e->model.size - e->model.tensor_data_pos;
+            }
+            uint64_t auto_budget = ds4_runtime_mem_budget_bytes();
+            if (auto_budget == 0) auto_budget = ds4_gpu_recommended_max_working_set_bytes();
+            const uint64_t planned = full_resident_bytes + mtp_l1_resident_bytes;
+            expert_offload_requested = (auto_budget > 0) && (full_resident_bytes > 0) &&
+                (planned > (uint64_t)((double)auto_budget * 0.85));
+            fprintf(stderr,
+                    "ds4: expert-offload AUTO: full-resident %.2f GiB vs %.2f GiB budget -> %s\n",
+                    (double)planned / DS4_GIB, (double)auto_budget / DS4_GIB,
+                    expert_offload_requested ? "stream (offload)" : "resident (fast)");
+        }
+        ds4_gpu_set_expert_offload(expert_offload_requested ? 1 : 0);
         if (load_slice) {
             char load_end[32];
             if (load_output && load_layer_end == UINT32_MAX) {
@@ -21222,6 +21458,174 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
     return rc;
 }
 
+/* Single-machine copy-speculation (prompt-lookup), DS4_COPY_SPEC=1.
+ *
+ * The cheapest speculative decode and the right lever for repetitive / code
+ * output. The drafter is the n-gram matcher (no draft model): it finds the
+ * longest suffix of the transcript that occurred earlier and drafts what
+ * followed. The TARGET model then verifies the whole drafted suffix in ONE
+ * layer-major batch -- reading the model weights once and amortizing the
+ * per-token decode-bandwidth wall over every accepted token (a K-token batch
+ * reads the multi-GiB backbone once, exactly like prefill, which is why prefill
+ * t/s >> single-token decode t/s). Only the greedy-correct prefix is committed;
+ * the rejected tail's KV is rolled back via the spec frontier snapshot. The
+ * target argmax is the gate, so the committed stream is byte-identical to plain
+ * argmax decode (lossless). Returns the committed token count (>=1) or -1. */
+static int ds4_session_eval_copyspec_argmax(ds4_session *s, int first_token,
+                                            int max_tokens, int eos_token,
+                                            int *accepted, int accepted_cap,
+                                            char *err, size_t errlen) {
+    /* Commit the normal target token first; s->logits then predicts the next. */
+    if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+    int n_accept = 0;
+    accepted[n_accept++] = first_token;
+    if (first_token == eos_token || max_tokens == 1 || n_accept >= accepted_cap)
+        return n_accept;
+#ifdef DS4_NO_GPU
+    (void)err; (void)errlen;
+    return n_accept;
+#else
+    ds4_engine *e = s->engine;
+
+    /* Cooldown: while speculation is not paying off, skip it entirely -- no
+     * frontier snapshot, no verify batch -- and just let this be a plain 1-token
+     * step. One probe leaks through (when the cooldown hits 0) to re-arm fast. */
+    if (s->cs_cooldown > 0) { s->cs_cooldown--; return n_accept; }
+
+    /* No tuning knobs: a 4-token anchor is precise on code/structured text, and
+     * the adaptive cs_draft_len (grown/shrunk by acceptance) picks the batch
+     * length. This call targets that running length. */
+    const uint32_t ngram = 4, min_copy = 2;
+    const bool cs_log = getenv("DS4_COPY_SPEC_LOG") != NULL;   /* diagnostic only */
+    const int target = s->cs_draft_len > 0 ? s->cs_draft_len : 6;
+    const uint32_t max_copy = (uint32_t)target;
+
+    /* Budget the draft length: drafts[16], output cap, accept cap, SWA room. */
+    int cap = (int)max_copy;
+    if (cap > 15) cap = 15;
+    if (cap > max_tokens - n_accept)  cap = max_tokens - n_accept;
+    if (cap > accepted_cap - n_accept) cap = accepted_cap - n_accept;
+    int room = s->ctx_size - s->checkpoint.len;
+    if (cap > room - 1) cap = room - 1;
+    if (cap < (int)min_copy || cap < 1) return n_accept;
+
+    /* Draft from the transcript (checkpoint already ends with first_token). */
+    int drafts[16];
+    uint32_t draft_n = 0, src = 0;
+    ds4_copy_spec_match(s->checkpoint.v, (uint32_t)s->checkpoint.len,
+                        ngram, (uint32_t)cap, drafts, &draft_n, &src);
+    /* The matcher copies exactly ONE period of the repeat (seq[best_src..end]).
+     * For a short period that is fewer tokens than the verify batch can amortize
+     * (period-1 single-token repeats give just 1 draft), so cyclically extend the
+     * draft to `cap` assuming the cycle continues. The target verifier still gates
+     * every token, so this stays byte-identical/lossless -- it only lengthens the
+     * speculation when the transcript is periodic, which is exactly when a long
+     * batch is free. Long verbatim runs (code echo) already fill `cap` and skip. */
+    if (draft_n >= 1 && draft_n < (uint32_t)cap) {
+        const uint32_t period = draft_n;
+        while (draft_n < (uint32_t)cap) {
+            drafts[draft_n] = drafts[draft_n - period];
+            draft_n++;
+        }
+    }
+    if (draft_n < min_copy) return n_accept;   /* no usable n-gram -> plain 1-token step */
+
+    /* drafts[0] is verified for free against the just-committed token's logits. */
+    if (sample_argmax(s->logits, DS4_N_VOCAB) != drafts[0]) {
+        if (cs_log) fprintf(stderr, "ds4: copy-spec miss first draft=%d\n", drafts[0]);
+        return n_accept;
+    }
+
+    /* Snapshot KV, then batch-verify the whole draft suffix in one pass. */
+    ds4_spec_frontier frontier;
+    memset(&frontier, 0, sizeof(frontier));
+    int *row_tops = xmalloc((size_t)draft_n * sizeof(row_tops[0]));
+    float *row_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row_logits[0]));
+    const int start = s->checkpoint.len;
+    bool have_frontier = spec_frontier_snapshot(&frontier, s);
+    bool ok = have_frontier;
+    if (ok) {
+        for (uint32_t i = 0; i < draft_n; i++) token_vec_push(&s->checkpoint, drafts[i]);
+        ok = metal_graph_verify_suffix_tops(&s->graph, &e->model, &e->weights,
+                                            &s->checkpoint, (uint32_t)start, draft_n,
+                                            false, row_tops, NULL);
+    }
+    /* Accept the longest greedy-correct prefix. row_tops[i-1] is the target's
+     * argmax after drafts[i-1] and must equal drafts[i]; drafts[0] is already
+     * proven, so commit_drafts starts at 1. */
+    int commit_drafts = 1;
+    if (ok) {
+        for (uint32_t i = 1; i < draft_n; i++) {
+            if (drafts[i - 1] == eos_token) break;
+            if (row_tops[i - 1] != drafts[i]) break;
+            commit_drafts++;
+        }
+    }
+
+    if (ok && commit_drafts == (int)draft_n) {
+        /* Full accept: the suffix KV stays committed; next logits = last row. */
+        ok = metal_graph_read_spec_logits_row(&s->graph, (uint32_t)(draft_n - 1), row_logits);
+        if (ok) {
+            memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+            for (uint32_t i = 0; i < draft_n && n_accept < accepted_cap; i++) {
+                accepted[n_accept++] = drafts[i];
+                if (drafts[i] == eos_token) break;
+            }
+            s->checkpoint_valid = true;
+            s->mtp_draft_valid = false;
+            /* Everything we drafted was accepted -> reach for a longer batch. */
+            s->cs_draft_len = (int)draft_n + 2 > 15 ? 15 : (int)draft_n + 2;
+            if (cs_log) fprintf(stderr, "ds4: copy-spec anchor=%u sent=%u accepted=%d full next_len=%d\n",
+                                ngram, draft_n, commit_drafts, s->cs_draft_len);
+            spec_frontier_free(&frontier); free(row_logits); free(row_tops);
+            return n_accept;
+        }
+    }
+
+    /* Partial accept (or verify miss): roll the speculative suffix back to
+     * `start`, then re-commit just the accepted prefix so its KV + next logits
+     * are exact. drafts[0] is always accepted, so commit_drafts >= 1. */
+    s->checkpoint.len = start;
+    ok = have_frontier && spec_frontier_restore(&frontier, s);
+    if (ok) {
+        for (int i = 0; i < commit_drafts; i++) token_vec_push(&s->checkpoint, drafts[i]);
+        ok = metal_graph_verify_suffix_tops(&s->graph, &e->model, &e->weights,
+                                            &s->checkpoint, (uint32_t)start,
+                                            (uint32_t)commit_drafts, false, row_tops, NULL);
+        if (ok) ok = metal_graph_read_spec_logits_row(&s->graph,
+                                                      (uint32_t)(commit_drafts - 1), row_logits);
+    }
+    if (ok) {
+        memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+        for (int i = 0; i < commit_drafts && n_accept < accepted_cap; i++) {
+            accepted[n_accept++] = drafts[i];
+            if (drafts[i] == eos_token) break;
+        }
+        s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
+        /* The target diverged from the copy after commit_drafts tokens -> aim the
+         * next batch at what it actually accepted (mostly-full accepts avoid the
+         * partial re-verify cost). This is the self-tuning backoff that keeps
+         * copy-spec from ever being a net loss on unpredictable text. */
+        s->cs_draft_len = commit_drafts < 2 ? 2 : commit_drafts;
+        /* If the batch barely paid for its snapshot, cool down before trying again. */
+        if (commit_drafts < 3) s->cs_cooldown = 8;
+        if (cs_log) fprintf(stderr, "ds4: copy-spec anchor=%u sent=%u accepted=%d partial next_len=%d cd=%d\n",
+                            ngram, draft_n, commit_drafts, s->cs_draft_len, s->cs_cooldown);
+        spec_frontier_free(&frontier); free(row_logits); free(row_tops);
+        return n_accept;
+    }
+
+    /* Hard failure: restore to the committed first_token and return it alone. */
+    s->checkpoint.len = start;
+    if (have_frontier) (void)spec_frontier_restore(&frontier, s);
+    s->checkpoint_valid = true;
+    s->mtp_draft_valid = false;
+    spec_frontier_free(&frontier); free(row_logits); free(row_tops);
+    return n_accept;
+#endif
+}
+
 /* Speculative decode state machine:
  * 1. commit the normal target token and use its logits to validate draft[0];
  * 2. let MTP recursively draft a tiny suffix from its own raw-cache frontier;
@@ -21266,6 +21670,17 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     return -1;
 #else
     ds4_engine *e = s->engine;
+
+    /* Natural default: with no MTP draft model loaded, single-machine greedy
+     * decode uses n-gram copy-speculation. It is self-tuning (adaptive draft
+     * length + cooldown), lossless, and a no-op when the text is unpredictable,
+     * so it needs no enable flag -- it just runs whenever it can help. With an
+     * MTP draft model present, the learned MTP drafter below takes over. */
+    if (!e->mtp_ready) {
+        return ds4_session_eval_copyspec_argmax(s, first_token, max_tokens,
+                                                eos_token, accepted, accepted_cap,
+                                                err, errlen);
+    }
 
     /*
      * MTP in DeepSeek V4 is a speculative drafter, not a replacement sampler.

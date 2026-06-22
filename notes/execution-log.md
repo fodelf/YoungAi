@@ -3870,3 +3870,107 @@ copy-spec 赖以整段接受的"逐字复现上下文"被打断 (tok/call 5.39�
 **门**: `./ds4_test --metal-kernels` = OK (含新 49-tok 用例); 双机 code-edit-heavy 输出与基线逐字节 IDENTICAL (1186B) = bit-exact 铁证。
 **实测**: prefill 22.16, generation **5.39 t/s** (基线 5.40, 噪声内, 无提速)。verify r2_ms 7586/8455/8193 ≈ 基线。
 **真墙重定位 (客观)**: verify 批 r2_ms=8s/49tok 里, backbone Q8 matmul (profile 的 Q-up/O-proj) 仅 ~1s ≈ 13%; per-layer gather drain_ms=38-82ms (EXPERT_EVENT_DRAIN=1 已快路径, 故 drain=真实 GPU 计算) ×43 = 1.6-3.5s; **routed-expert matmul (6 专家×49tok×43层, moe.metal 路径) = 未被 Q8_PREFILL_PROFILE 覆盖的 compute 大头**。⇒ kernel-opt 该打 routed-expert matmul 而非 backbone。NAX 改动 bit-exact 保留 (引擎偏好路径, 无害), 但此 workload 中性。
+
+## 2026-06-19 — 第七十九波: cycle-1 L1 (IQ2_XXS mat-mat-id 码本 threadgroup staging) — 实测 ≈0, 已还原 (用户授权入日志)
+
+**承接**: 联网研究 (108 agent, notes/ deep-research wf_3d28f69e) + 最新日志根因重定位, 落地 `task.md` (新前向计划). 研究框架印证: PowerInfer-2 (2406.06282) 实证 I/O-compute overlap 把 MoE 从 77%→14% I/O (compute-bound), DS4 暖态编程域已到此态 (verify 批 `cold_mib=0`); 文献 SSD-offloading 倍率 (KTransformers/Fiddler/HOBBIT 2-9.9×) 全 NVIDIA PCIe + 专家驻 DRAM, 不可迁移; 暖态下一道墙 = compute.
+
+**假说 (wave-78 指 routed-expert matmul 是大头, 但未拆 dequant vs MMA)**: `kernel_mul_mm_id` 对每专家无条件跑完整 `dequantize_iq2_xxs` (从 `constant` 码本数据相关查表), verify 批 49 token 散到 160 专家 (1.8 tok/专家) ⇒ 解量化零摊薄. mat-VEC 路径已 staged 码本到 threadgroup (ds4_gpu_routed_mv_smem 2176B), mat-MAT 没有 → 补上.
+
+**实现 (bit-exact, 编译期 gated)**: moe.metal 加 `dequantize_iq2_xxs_staged` + 偏特化 `mm_id_cb_dq` dispatch + `kernel_mul_mm_id` 加 `STAGE_CB` 模板参 (默认 false → 其它 quant 字节不变, CB_BYTES=0) + 码本 staging + shmem 偏移; 两个 iq2 实例化开 true. ds4_metal.m mat-mat tg-mem iq2_xxs 8192→10368 (+2176B), Q2_K/Q4_K 不变. `make` 绿; `./ds4_test --metal-kernels` 绿 (全库 MSL 编译通过 = STAGE_CB 实例化无语法错).
+
+**双机 code-edit-heavy A/B (客观)**: prefill 20.57, **generation 5.22 t/s** (基线 5.15–5.40, 噪声内/略负). 输出 md5 `5c0760367dc929d3af723d445fe92485` / 1186B **与基线逐字节相同**; dist-mtp summary calls=12 verify=4 accepted=303 tok/call=25.25 forwards=17 **指纹完全一致**; copy-spec r2_ms 3067/7976/8822/8265 (基线 2818/8274/8887/8562, 近似); peak RSS 4.72G/12. ⇒ **bit-exact 证实**.
+
+**决定性结论 (排除一条路)**: staged 码本无收益 (略负, 疑 +2176B threadgroup 掉 occupancy 4→3) ⇒ **verify 批 MoE GEMM 不是 dequant / `constant`-cache-bound**. 真瓶颈 = **MMA 欠填** (8 宽 simdgroup × 1.8 有效 token = ~4.4× 浪费) 或 **per-layer drain/gather**. 已 `git checkout -- ds4_metal.m metal/moe.metal` 还原 + 重编回基线 (避免 occupancy 污染后续 A/B).
+
+**下一步 (cycle-2)**: 稀疏 verify 批改走 mat-VEC (`kernel_mul_mv_id`, 已存在已暖码本) 而非欠填 mat-MAT — bit-exact 且决定性 (赢=欠填真因+即修复; 平/输=成本在 gather/drain). 备选: verify 批降激活 6→4 (过 q1..q4+logprob-vectors 质量门).
+
+## 2026-06-19 — 第八十波: IO 重定位 (cycle-2/2b/3a 否定 compute 假设) + TB 吞吐 probe + gather 根因 (用户授权入日志)
+
+**承接 wave-79 (cycle-1 dequant ≈0)。本波连做 4 实验, 把 warm code-edit 墙从"compute"彻底纠回"冷专家 gather IO", 并钉死可优化的 headroom。**
+
+**① cycle-2 (`MM_ID_MIN=64`) 无效 (客观)**: 默认 `MOE_OVERLAP=1` 的 P-OVL 路径 (ds4_metal.m:20455) 无条件走 mat-mat mapped_tile 并 early-return, **绕过 `use_mm_id`** (20322)。我的疏忽, 探测无效。
+
+**② cycle-2b (`MOE_OVERLAP=0 MM_ID_MIN=64`, mat-vec 真生效) (客观)**: overlap banner=0、verify r2 变化证明生效; gen **5.26** (≈基线 5.40), md5 bit-exact。**mat-vec ≈ mat-mat ⇒ 非 MMA 欠填主导。**
+
+**③ 读 ds4-io profile (一直开着, 我 cycle-0 该先读它) — 真因 (客观, 推翻 wave-78 "cold_mib=0")**: verify 批 (n_tokens=49) `n_active=143-160 cold_mib=357 hit_mib=0.0 rfetch_mib=607 wall_ms=267 pread_ms=2108 drain_ms=26 bw=3.78 pf=131/160`。**gather wall ~267ms/层 ≫ GPU drain 26ms → IO 占墙 ~90%, GPU compute (dequant/MMA) 仅 ~10%。专家冷读 (hit=0%, source cache admit=0; working set ~960MiB/层 ≫ per-layer cache ~120MiB)。⇒ cycle-1/2/2b 都在打那 10% GPU, 故全无效。回到 project.md W2 框架。**
+
+**④ cycle-3a 降激活 (`MOE_THIN_MAX_TOKENS=64`, top-4 扩到 verify 批) — 硬质量失败 (客观)**: n_active 160→109 (瘦生效), 但 **gen 2.11 (更差)**, copy-spec 崩溃 (first_hit 2%, tok/call 1.04, 742 bare calls), **输出垃圾** (`import Irrelevant...` + 无限 `<｜begin▁of▁sentence｜>` 退化)。**DeepSeek V4 Flash 主生成路径扛不住 top-4。降激活否决。** (顺带: 基线 `MOE_THIN_TOPK=4 MAX_TOKENS=1` bare-round 瘦是未过质量门的债, top-4 既退化, 值得单独验/回退。)
+
+**⑤ TB 吞吐 probe (`tools/tp_bw_probe.c` 落地, server M1 / client M4 reverse, 无模型内存安全) (客观)**: 单向 TCP sweep —
+| conns | AGG GB/s | per-conn |
+|---|---|---|
+| 1 | 3.56 | 3.61 |
+| 2 | **4.69** | 2.35 |
+| 4 | 4.71 | 1.18 |
+| 6 | 4.71 | 0.79 |
+**雷电 IP 吞吐 = 4.71 GB/s, 2 连接即饱和。** (回答研究/项目长期未测的 TB 真实吞吐。)
+
+**⑥ gather 根因 (probe + pread 数学双证, 客观)**: gather = cursor 抢单 (本地 8 线程 + 远程 6 连接抢同一原子游标, ds4_metal.m:18105/18460/18748)。**本地 pread_ms=2108 ÷ 8 = 263ms ≈ wall 267ms ⇒ 本机 mini 冷散点读 = 长杆, 357MiB @ 1.36 GB/s** (非顺序 2.4)。远程/TB (4.71) 拉 607MiB 仅 ~129ms 即空转。**cursor + tail_reserve 让慢 mini 分到 37% 份额 (超其带宽占比), 快 worker盘+TB 份额不足空转 → 失衡** (异于 wave-38 prefill "带宽最优", decode verify 批是不同 regime)。合并理论上限 = mini 2.4 + TB 4.71 ≈ 7.1 GB/s, 实测 3.78 ≈ 一半。
+
+**cycle-4 (待落地)**: 按真实带宽重平衡 gather — 慢 mini 少分 / 快 worker+TB 多分。理想 local 213@1.36=159ms ∥ remote 751@4.71=159ms → wall 267→~160ms → verify gather ~1.7× → **gen 5.40 → ~7-8 (估算)**。真调度代码 (带宽感知抢单 / tail_reserve), 非盲调参 (probe 证 CONNS=6 早够、2 连接饱和 TB)。
+
+## 2026-06-20 — 第八十一波: react/go 精度倒置量化工具链落地 (基于 react-go-opus46-design.md §3.5/3.6/3.8, 客观记录)
+
+**承接**: 用户「根据 react-go-opus46-design.md 新设计方案，重新开发量化脚本」。设计主线 = 精度倒置 (热=react/go 专家 IQ2 常驻 / 冷=HF FP8 流式) + 混合格式 (§3.8: 小 GGUF 只装热档, 冷档读 HF)。
+
+**格式约束确认 (客观)**: HF config `expert_dtype=fp8` (e4m3+ue8m0, block 128×128), `n_routed_experts=256`, `num_experts_per_tok=6`, `num_hidden_layers=43`, `num_hash_layers=3` — 冷档源是 FP8 非 FP16。GGUF 一层专家 = 单 3D 张量统一类型 (`generate_expert` 写 `out+xid*per_expert`), **同张量内逐专家混精度不可表示** ⇒ 精度倒置只能靠物理拆分 (热档 shrink + keep_map, 冷档不入 GGUF)。HF 下载未完成 (index.json 缺, 分片 16/19 仍 .aria2)。
+
+**落地 1 — `gguf-tools/router_norms_from_imatrix.py` (新, 离线内存安全)**: 设计 §3.5.3 缺的第一环。读 imatrix `.dat` (格式: i32 n_entries; per-entry i32 name_len/name/ncall/nval + f32[nval]; 路由张量 `blk.N.ffn_{gate,up,down}_exps.weight` nval=n_expert×ncols), 每专家 = 其 ncols 段求和 (÷ncall 为每张量常数, 不改排序), 默认 gate+up+down 求和, 每层降序 rank → `router_norms.json` (make_expert_mask 消费格式)。逐 entry 流式只留每专家标量 (峰值 ~2MB), 不载模型。`--self-test` 内置。
+
+**落地 2 — `gguf-tools/deepseek4-quantize.c` 加 `--experts-hot-mask FILE` (设计 §3.6.6)**: 给 DSXM mask, 每个 `blk.N` exps 张量**只量化热档专家** (compact 到 slot 0..k-1, `--experts` 类型), 写 `ds4.expert_keep_map.{kept_counts,original_ids}` (字节格式与 shrink_gguf.py 逐字节一致: key + u32 ARRAY(9) + u32 INT32(5) + u64 count + i32[]; ds4.c:load_expert_keep_map 已读)。冷档不写入 (§3.8 从 HF 流)。MTP (`mtp.N`) 不收缩 (与 shrink_gguf 的 blk-only 正则一致)。改动: hot_mask 结构+DSXM 加载器、expert_job 加 n_emit/emit_src (slot↔src 分离)、build_output_context 收缩 last-dim+keep_map KV 计账、generate_expert/tensor/write_full_gguf/compare/main 全程透传。
+
+**落地 3 — `gguf-tools/quantize_reactgo.sh` (新驱动 runbook)**: 串 imatrix→norms→mask→hot-only quantize。离线安全步 (2,3) 默认跑; 载模型步 (1,4) 门控 `RUN_MODEL_STEPS=1` (默认只打印命令, 遵守内存安全+逐次授权铁律)。
+
+**验证 (无 240GB 模型, 客观数字)**:
+- `make` (gguf-tools) 绿, 0 警告; `--help` 列出 `--experts-hot-mask`。
+- router_norms self-test OK; 合成 43×256 .dat → router_norms.json (43 层连续) → make_expert_mask → DSXM mask 与真实 `gguf/mask-k16.bin` 头部/体积同构 (magic/ver/43/256, body 1376B)。
+- 合成 metadata-only GGUF `--dry-run` A/B: 无 mask expert 字节 12,976,128 (per_expert IQ2_XXS=8448B 精确); top-32 mask → tensor_bytes_unpadded **1,724,416** = 6×8448×32 + token_embd 102,400 (未动)。256→32 收缩**精确到字节**, keep_map KV 计账未触发 "metadata larger than planned"。
+- 驱动门控 smoke: 模型步只打印、离线步无输入优雅跳过、有合成 imatrix 时步 2/3 产出真实 mask, exit 0。
+
+**未验 (需 HF 下载完成 + 授权)**: 步 1 react/go imatrix 真实跑; 步 4 真实 HF→hot-only GGUF 数据写; ds4 装载该 GGUF 的 keep_map 路由正确性 (接 wave 前修的 slot/il keep-map 修复, 单机 k16 验证仍待授权)。
+
+**wave-81 补 (用户质疑「哪些是编程专家」, 客观)**: 原 `router_norms_from_imatrix.py` 只产 react/go 绝对激活 top-K = 常驻/覆盖集 (含通用高频专家), **未分离「编程专属」**。补 `--baseline GENERAL.dat` + `--rank-by {energy,specialty}`: 每层内归一 share, `specialty_log2[e]=log2(p_code[e]/p_gen[e])` = react/go 相对通用偏好度 (>0=编程更依赖)。两口径分工: 热档 mask 仍按 **energy** (常驻必须保覆盖, 否则 cold miss); **specialty** 用于识别编程专属 / REAP 死档 / 训练靶向。驱动加 `GENERAL_IMATRIX` 开关 (energy 排 + 附 specialty_log2 字段, 单文件双用)。验证 (合成对比 .dat): 编程特异专家 specialty_log2=+3.80, 通用=−2.85; specialist 计数精确 (24/层×43=1032)。self-test 仍绿。
+
+**wave-81 再补 (用户决策, 客观)**: 抽离训练专册 `react-go-training-design.md` (16→17 节)。用户拍板「算法推理算编程方向」⇒ §7.1 specialty baseline 选定 **strict 档** (排代码+排数学/算法), 算法/数据结构推理专家获正 specialty 进编程专属面。连带固化: §7.1 构建管线 `--math drop`; §8 加算法覆盖约束 (角度1 算法类 bug + 角度2 算法导论蒸馏, 否则专属面空训); §10 eval 加算法/复杂度题; broad 档降为默认不跑的 T3 备选消融。
+
+## 2026-06-20 — 第八十二波: react/go 方案对抗审计 + B1/B2a 根因修复落地 (客观记录)
+
+**承接**: 用户 /effort ultracode + 「深度思考当前方案的可行性和设计缺失，完善方案」。起 workflow (6 维度 fan-out → 对抗验证 → 完整性批判, 42 agent / 2.55M tok / wf_cfbe5480-861), 每条 finding 落到真实代码。51 findings (12 blocker)。下列事实由我**直接读 header/源码/git diff 复核** (非仅信 agent):
+
+**① 实测纠错 (硬证据, 客观)**:
+- **专家真实格式**: 读 `hf/DeepSeek-V4-Flash-Base/model-00003-of-00046.safetensors` header — `layers.0.ffn.experts.0.w1.weight` = **F8_E4M3** [2048,4096], `.scale` = **F32** [16,32] (=128×128 block-scale)。分片直方图: 776 F8_E4M3 专家权重 + 783 F32 (含专家 scale)。**config.json `scale_fmt=ue8m0` 与磁盘真实 F32 scale 矛盾, 磁盘为准。** 专家命名是 **w1/w2/w3** 不是 gate/up/down。冷专家是 **F8 (1 byte)** 不是设计反复写的 FP16 → §3.8 省盘账 / RB / Mode G 速度数全部基于错前提 (×8 错, 应 ×1)。
+- **量化器专家路径 FP4 写死 (致命)**: `deepseek4-quantize.c` 旧 `generate_one_expert` 无条件 `dequant_fp4_weight` (要 I8 + F8_E8M0 + 2-per-byte 打包), dense 路径 (generate_regular) 才有 F8_E4M3 分支。喂真实 F8 专家**第一个就 die**。wave-81「dry-run 字节精确」只走元数据路径, 没碰真实张量 → 假绿。
+- **keep-map 屏蔽已部分落地 (memory「k16 未实现」部分过期)**: git diff 实测 working tree 有**未提交** router-side -inf 屏蔽 (ds4_metal.m +416 行, `keeplut[i]<0 → cbp[i]=-1e30f`) + g_reap_keep REAP 剪枝, 但门控 `has_bias && !hash_mode`。
+- **hash 层 (前 3 层, DS4_N_HASH_LAYER=3) 裸奔确认**: hash_mode 走 `kernel_dsv4_router_finalize_one` 直拷原始 id, **跳过 -inf 屏蔽**; 被删/被屏蔽专家在 `route_translate` (metal/dsv4_misc.metal:248) **静默钳到 slot 0** (满权重错路由, 无 renorm 无报错)。三个 python 工具 (make_expert_mask / shrink_gguf / router_norms) 均不特判 layer<3。
+- **HF 状态**: 24/46 分片, 2 个 .aria2 残留, **无 model.safetensors.index.json** (quantizer:525 硬依赖 → 直接 die)。
+
+**② B1 落地 — 量化器专家路径 FP4→FP8 (deepseek4-quantize.c)**: 加 `load_f32_le`; generalize `dequant_fp8_weight` 接受 **F32 | F8_E8M0** block-scale (几何不变, 仅 per-block scale 读法分流) + scale 字节数 sanity; `generate_one_expert` 按 `w.dtype` 分流 (F8_E4M3→fp8 路径 shape[1]==ncols / I8→fp4 路径 shape[1]*2==ncols, 保留向后兼容); 更新文件头注释。`make` (gguf-tools) 绿 0 警告; `--help` 仍列 experts-hot-mask/dry-run; FP4 路径保留。**未验**: 真实 F8 专家 dequant 数值 (需 HF index + 单张量读, gated)。
+
+**③ B2a 落地 — hash 层 mask 护栏 (make_expert_mask.py)**: 新 `force_keep_hash_layers()` + `--hash-layers N` (默认 3 = DS4_N_HASH_LAYER): 前 N 层强制 keep 全 256 专家 (根因修复, 让 route_translate clamp 物理不可能; hash 按 token-id 确定性路由, 无法靠激活幅度压缩)。驱动 `quantize_reactgo.sh` step-3 显式传 `--hash-layers ${HASH_LAYERS:-3}`。自测 (合成 5 层×8 专家): hash 层全 keep / 其余 top-K / 默认 3 生效, 全 OK。router_norms self-test 仍绿。
+
+**④ 连带客观发现 (未改, 记录)**: 20GB 预算 (§3.5.2) **未计入 hash 层需全 256 常驻** — 3 层×256×~6.75MiB ≈ 5GiB 未入账。eval 闭环现有 ds4-eval 是 MMLU/行号抽取 grader, 跑不了 react/go 执行型 eval (test-pass / Opus-judge / 工具幻觉率)。
+
+**未做 (待授权/待决策, 不在本波)**: B2b route_translate fail-loud 计数器 (动热 Metal 路径, 离线无法验数值, 宜与 k16 验证同跑); 单机 k16 logprob-vectors parity (memory 硬闸)。**主观结论 / M-1 前置里程碑排序 / Mode P-G 布局决策按铁律待用户批准后再写。**
+
+**wave-82 补 (用户下载 index.json + B1 真实数据验证通过, 客观)**: 用户从 HF 下 `model.safetensors.index.json` (5.1MB, 69189 张量/46 分片/total 294.6GB) 到 `hf/DeepSeek-V4-Flash-Base/` → 清掉 TF3 (量化器 :525 硬依赖)。现 25/46 分片, layers 0-5 专家齐。**模板 81GiB q2 GGUF 不在本机** (gguf/ 仅余 mask-k16/k48.bin, ds4flash.gguf 悬空); 用户确认 **q2 在 M1 worker, 本机磁盘放不下不恢复** → Path Y / `--template` 那些步要用 q2 时在 M1 跑, 不拷回。**B1 真实数据验证 (`/tmp/validate_b1_fp8.py`, 只读本机 HF ~24MB, 不碰 q2, 不载模型)**: 读 layers.0.ffn.experts.0.{w1,w2,w3} 真实张量, 跑与 C 逐位一致的 e4m3+F32 128×128 block-scale 解量化。结果 **3/3 OK**: 格式对上 (F8_E4M3 weight + F32 scale, scale shape=[out/128,in/128] 全断言过), 输出全有限/全非零/max|val|≈0.10 (合理权重量级), 抽样手算可核 (0xe7→-60×0.000244=-0.0146)。⇒ **B1 格式假设 + dequant 算术在真实 Base 数据上正确**, 量化器能读 F8 专家。**仍未验**: 量化器二进制端到端 (db_read→generate_one_expert→f32_to_type→IQ2), 需模板 GGUF (在 M1) + 全分片; 此为 C 路径集成验证, 与本数值验证正交。
+
+---
+
+## 2026-06-20 — wave-83: B2b route_translate fail-loud clamp 计数器落地 (M-1.2, 客观)
+
+**任务**: react-go-execution-plan §6 M-1.2 / §7 表 M-1.2 = B2b `route_translate` fail-loud 计数器 (verify 模式检测冷 clamp)。位置 M4-本机, 纯代码, 不载模型。
+
+**改动 (3 文件, 公共签名不变 ⇒ ds4.c 调用点 + CUDA 后端零改动)**:
+- `metal/dsv4_misc.metal` (`kernel_dsv4_route_translate`): struct 加 `uint32_t verify`; 内核加第 4 个 buffer 参数 `device atomic_uint *clamp_count` (隐式 index 3); clamp 分支 (`slot<0 || slot>=n_total_expert`) 内 `if (args.verify)` 时按 key=`layer*256 + (orig in [0,256)?orig:0)` 做 `atomic_fetch_add_explicit(...,1u,memory_order_relaxed)` (与 `moe.metal:271` REAP 内核逐字一致), 再 clamp 到 slot 0 (原行为不变)。
+- `ds4_metal.m`: 全局 `g_route_clamp_verify`(-1/0/1) + `g_route_clamp_buf` + `g_route_clamp_layers`; 三辅助 `ds4_gpu_route_clamp_dump()`(atexit, 读 Shared buffer, total=0 打印 "clamp count = 0" / total>0 打印 "*** ROUTE-TRANSLATE CLAMP LEAK ***" + 逐 (layer,expert) 计数)、`ds4_gpu_route_clamp_verify_enabled()`(读 env `DS4_VERIFY_ROUTE_CLAMP`, 首次 enable 注册 atexit, 镜像 `ds4_gpu_reap_enabled`)、`ds4_gpu_route_clamp_ensure_buf()`(惰性分配 `n_layer*256` uint32 Shared, ~43KiB, 按 `g_expert_keep_lut_layers` 定尺寸); `ds4_gpu_translate_expert_ids` dispatch 加 `verify` 字段 + `setBuffer:clampbuf atIndex:3`。buffer 不入 teardown nil-list (与 REAP buffer 一致, 保 atexit dump 看到末次 forward 结果)。
+
+**默认 off = byte-identical**: `DS4_VERIFY_ROUTE_CLAMP` 未设 ⇒ args.verify=0 ⇒ 内核跳过 atomic, `selected[]` 改写与改前逐字节一致; 仅多一个 index 3 上从不写入的 bound buffer。遵 knob 默认 baseline 规则。
+
+**M4 验证 (不载模型)**:
+- `make` 绿: ds4/ds4-server/ds4-bench/ds4-eval/ds4-agent 全链接; 仅 4 个既有 warning (expert gather pool 相关, 非本改动), 我加的函数全被引用无 warning。
+- Metal 语法确证: 因 shader 是运行时 `newLibraryWithSource` 编译 (`make` 不校验, `xcrun metal` CLI 本机未装), 用 python 复刻运行时拼接 (prelude `ds4_gpu_source` + 19 个 .metal 按 `required_sources` 顺序, 337KB → `/tmp/ds4_metal_combined.metal`), 写 `/tmp/metal_probe.m` 走 Metal.framework 运行时编译器 `newLibraryWithSource` + 创建 pipeline。结果 **OK: library 编译通过, kernel_dsv4_route_translate pipeline 创建成功 (maxThreads=1024)** ⇒ 新内核签名 (4 buffer + verify 字段 + atomic) MSL 合法、pipeline 可建。
+
+**未验 (gated, 不在本机做)**: 运行时 Mode P 下 clamp 计数=0 的实证 = M-1.3 单机 k16 logprob-vectors parity 跑 (在 M1, 载模型, 🔒 逐次授权; B2b 设计上与之同跑)。**M1 同步前置**: 本改动动 `ds4_metal.m`(CORE_OBJS) + `metal/dsv4_misc.metal`, M1 需 sync 两文件 + 重编后方能在 k16 跑中走到 B2b 路径。
+
+**wave-83 续: M-1.3 验证驱动脚本落地 `tools/reactgo_k16_verify.sh` (客观)**: 用户指出无类似 `mtp_pipe_q2_speed.sh` 的测试脚本。补单机 keep-map (shrunken Mode P) 验证驱动, 仿 mtp_pipe 安全结构。三门: **G1** B2b clamp (`DS4_VERIFY_ROUTE_CLAMP=1` 跑 → grep stderr → clamp=0 PASS / "CLAMP LEAK" FAIL / 无 dump 行=full 模型判 SKIP); **G2** smoke 连贯 (awk 唯一-token 占比启发式, 防数字汤; words≥8 且 ratio≥0.30 PASS); **G3** ds4-eval q1..q4 (opt-in)。安全闸: 默认 DRY-RUN, 须 `RUN=1` 才载模型 (逐次授权); `DS4_MEM_BUDGET_MB`(L1 gate) + 后台 RSS 看门狗 (超 `MAX_GB` 即杀) + `trap cleanup INT TERM EXIT` 只杀进程不删文件; keep-map 自检 (`strings | grep expert_keep_map`)。CLI flag 全核实 (ds4 `-p/-n/--temp/--seed`、ds4-eval `--plain/--questions/--tokens/--temp/--seed`)。**M4 验证 (不载模型)**: `bash -n` 绿; DRY-RUN 跑通 (正确报"模型不在本机→去 M1"并退 0, 不载模型); G2 awk 启发式合成测试 (连贯 ratio=0.83 PASS / 数字汤 ratio=0.05 FAIL)。文末附: 双机 mtp_pipe 跑里两端加 `DS4_VERIFY_ROUTE_CLAMP=1` 即得各机 clamp 统计 (B2b 是 ds4_metal.m 内置纯 env 开关, 与 run 模式无关)。**未跑**: 真实 k16 模型在 M1, gated, 待授权。

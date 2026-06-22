@@ -230,6 +230,48 @@ kernel void kernel_dsv4_moe_sum6_f32(
     }
 }
 
+/* REAP (Router-weighted Expert Activation Pruning, arXiv:2510.13999) saliency.
+ * The sum6 input holds each selected expert's GATED output (route_weight is folded
+ * in at swiglu_weight, before the down-projection), so ||slot_k||_2 == g_k*||f_k(x)||_2
+ * -- exactly REAP's per-token contribution g_j(x)*||f_j(x)||_2.  This kernel writes
+ * the per-(token,slot) L2 norm; the host then accumulates the REAP saliency
+ * S_j = (1/|X_j|) sum_{x in X_j} g_j(x)*||f_j(x)||_2, keyed by the routed expert id. */
+struct ds4_metal_dsv4_reap_args {
+    uint32_t tokens;
+    uint32_t width;            // output dim per expert (sum6 column count)
+    uint32_t n_used;           // selected experts per token (6)
+    uint32_t layer;            // layer index, for the [layer*256 + expert] accumulator slot
+    uint64_t src_token_stride; // bytes per token in src (== n_used*width*4)
+};
+
+/* Accumulate REAP saliency on-GPU: for each (token, slot) compute ||gated output||_2
+ * (== g_j*||f_j(x)||_2) and atomic-add it (fixed-point x256) into saliency[layer*256+e]
+ * keyed by the routed expert id, plus a token count.  One readback at exit yields
+ * S_j = saliency / (256 * count).  Fixed-point avoids atomic_float portability issues;
+ * the magnitudes here stay well within uint32 for a domain calibration set. */
+kernel void kernel_dsv4_reap_accum(
+        constant ds4_metal_dsv4_reap_args &args,
+        device const char  *src,        // sum6 input: per token, n_used gated expert outputs
+        device const int   *active_ids, // [tokens*n_used] slot -> expert id (0..255, -1 = none)
+        device atomic_uint *saliency,   // [n_layers*256] fixed-point accumulator
+        device atomic_uint *counts,     // [n_layers*256] active-token counts
+        uint gid[[thread_position_in_grid]]) {
+    const uint total = args.tokens * args.n_used;
+    if (gid >= total) return;
+    const uint token = gid / args.n_used;
+    const uint slot  = gid % args.n_used;
+    device const float *s = (device const float *)(src + (uint64_t)token * args.src_token_stride)
+                            + (uint64_t)slot * (uint64_t)args.width;
+    float sumsq = 0.0f;
+    for (uint c = 0; c < args.width; c++) { float v = s[c]; sumsq += v * v; }
+    const int e = active_ids[gid];
+    if (e >= 0 && e < 256) {
+        const uint base = args.layer * 256u + (uint)e;
+        atomic_fetch_add_explicit(&saliency[base], (uint)(sqrt(sumsq) * 256.0f), memory_order_relaxed);
+        atomic_fetch_add_explicit(&counts[base], 1u, memory_order_relaxed);
+    }
+}
+
 template <typename type4x4>
 void dequantize_q2_K(device const block_q2_K *xb, short il, thread type4x4 & reg) {
     const float d = xb->d;

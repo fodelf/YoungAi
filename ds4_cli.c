@@ -34,6 +34,10 @@ typedef struct {
     float min_p;
     uint64_t seed;
     bool dump_tokens;
+    bool classify_only;   /* --classify: print Mode P/G route for -p prompt, no model load */
+    bool route;           /* --route: classify prompt, then load prog/daily model */
+    const char *route_prog;   /* --route-prog: resident programming model (Mode P) */
+    const char *route_daily;  /* --route-daily: full cached model (Mode G) */
     const char *dump_logits_path;
     const char *dump_logprobs_path;
     int dump_logprobs_top_k;
@@ -99,8 +103,12 @@ static void cli_dist_busy_set(const cli_config *cfg, bool busy) {
 /* PC.1 copy speculation (project.md §3.5): enter the speculative decode path
  * even without an MTP drafter when the n-gram copy drafter is enabled. */
 static bool cli_copy_spec_enabled(void) {
-    const char *e = getenv("DS4_DIST_COPY_SPEC");
-    return e && *e && e[0] != '0';
+    /* Copy-speculation is the natural default drafter for greedy decode: it is
+     * self-tuning and lossless, a no-op on unpredictable text, so it is always
+     * armed (no enable flag). The session-level drafter itself decides per step
+     * whether to speculate; the distributed path keeps its own DS4_DIST_COPY_SPEC
+     * specifics. */
+    return true;
 }
 
 static int cli_wait_distributed_route(const cli_config *cfg, ds4_session *session) {
@@ -1056,7 +1064,11 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
         }
     } else if (cfg->engine.distributed.role == DS4_DISTRIBUTED_COORDINATOR ||
                cfg->gen.temperature > 0.0f ||
-               ds4_engine_mtp_draft_tokens(engine) > 1) {
+               ds4_engine_mtp_draft_tokens(engine) > 1 ||
+               cli_copy_spec_enabled()) {
+        /* copy-spec (single-machine, greedy temp=0) needs the sampled-generation
+         * loop that runs the speculative verifier; the plain argmax path below
+         * has no spec hook. */
         rc = run_sampled_generation(engine, cfg, &prompt);
     } else {
         token_printer printer = {
@@ -1658,6 +1670,14 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.backend = DS4_BACKEND_CUDA;
         } else if (!strcmp(arg, "--dump-tokens")) {
             c.gen.dump_tokens = true;
+        } else if (!strcmp(arg, "--classify")) {
+            c.gen.classify_only = true;
+        } else if (!strcmp(arg, "--route")) {
+            c.gen.route = true;
+        } else if (!strcmp(arg, "--route-prog")) {
+            c.gen.route_prog = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--route-daily")) {
+            c.gen.route_daily = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-logits")) {
             c.gen.dump_logits_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-logprobs")) {
@@ -1737,6 +1757,33 @@ static cli_config parse_options(int argc, char **argv) {
 
 int main(int argc, char **argv) {
     cli_config cfg = parse_options(argc, argv);
+    if (cfg.gen.classify_only) {
+        /* Mode P/G router decision, no model loaded: programming -> resident
+         * programming model; everyday -> full cached model. */
+        if (cfg.gen.prompt == NULL) {
+            fprintf(stderr, "ds4: --classify requires -p or --prompt-file\n");
+            free(cfg.prompt_owned);
+            return 2;
+        }
+        bool prog = ds4_prompt_is_programming(cfg.gen.prompt);
+        printf("%s\n", prog ? "programming" : "daily");
+        ds4_dist_options_free(cfg.dist);
+        free(cfg.prompt_owned);
+        return 0;
+    }
+    if (cfg.gen.route && cfg.gen.prompt) {
+        /* Mode P/G dynamic routing: classify the prompt, then point the engine at
+         * the resident programming model (Mode P) or the full cached model (Mode
+         * G) BEFORE it is opened. The rest of the run is unchanged. */
+        bool prog = ds4_prompt_is_programming(cfg.gen.prompt);
+        const char *picked = prog
+            ? (cfg.gen.route_prog  ? cfg.gen.route_prog  : "gguf/reactgo-prog.gguf")
+            : (cfg.gen.route_daily ? cfg.gen.route_daily : cfg.engine.model_path);
+        cfg.engine.model_path = picked;
+        fprintf(stderr, "ds4: route -> Mode %s [%s] -> %s\n",
+                prog ? "P (编程/常驻快)" : "G (日常/全模型缓存)",
+                prog ? "programming" : "daily", picked);
+    }
     if (cfg.gen.dump_tokens) {
         if (cfg.gen.prompt == NULL) {
             fprintf(stderr, "ds4: --dump-tokens requires -p or --prompt-file\n");
