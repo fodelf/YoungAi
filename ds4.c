@@ -21302,6 +21302,33 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
     return sample_top_p_min_p(logits, (uint32_t)n_vocab, temperature, top_k, top_p, min_p, rng);
 }
 
+/* Optional repeat penalty applied to the session logits before sampling. The base
+ * model greedy-decodes into short loops on long generation (ds4 has no built-in
+ * repeat penalty). Subtract DS4_REPEAT_FREQ per occurrence of each token in the
+ * last DS4_REPEAT_WINDOW (default 128) committed tokens: a looping token (high
+ * local count) is pushed down, diverse output (each token a few times) barely
+ * touched. Off by default. Universal: every sampler caller goes through here. */
+static void session_apply_repeat_penalty(ds4_session *s) {
+    static int on = -1;
+    static float freq_pen = 0.0f;
+    static uint32_t window = 128u;
+    if (on < 0) {
+        const char *f = getenv("DS4_REPEAT_FREQ");
+        const char *w = getenv("DS4_REPEAT_WINDOW");
+        freq_pen = (f && f[0]) ? (float)atof(f) : 0.0f;
+        if (w && w[0]) window = (uint32_t)strtoul(w, NULL, 10);
+        on = freq_pen > 0.0f ? 1 : 0;
+        if (on) fprintf(stderr, "ds4: repeat-penalty freq=%.2f window=%u\n", freq_pen, window);
+    }
+    if (on != 1 || !s || !s->logits || !s->checkpoint_valid || s->checkpoint.len <= 0) return;
+    uint32_t len = (uint32_t)s->checkpoint.len;
+    uint32_t start = len > window ? len - window : 0u;
+    for (uint32_t i = start; i < len; i++) {
+        int t = s->checkpoint.v[i];
+        if (t >= 0 && t < (int)DS4_N_VOCAB) s->logits[t] -= freq_pen;
+    }
+}
+
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
     if (getenv("DS4_DECODE_DIAG")) {
         /* [decode-diag] inspect the logits the sampler is about to draw from:
@@ -21319,6 +21346,7 @@ int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p
                 "ds4: [decode-diag] logits argmax=%d val=%.4f nonfinite=%u/%u\n",
                 argmax, amv, nonfinite, (unsigned)DS4_N_VOCAB);
     }
+    session_apply_repeat_penalty(s);
     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k, top_p, min_p, rng);
 }
 
