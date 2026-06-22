@@ -21312,6 +21312,7 @@ static void session_apply_repeat_penalty(ds4_session *s) {
     static int on = -1;
     static float freq_pen = 0.0f;
     static uint32_t window = 128u;
+    static int gen_start = -1;
     if (on < 0) {
         const char *f = getenv("DS4_REPEAT_FREQ");
         const char *w = getenv("DS4_REPEAT_WINDOW");
@@ -21321,8 +21322,17 @@ static void session_apply_repeat_penalty(ds4_session *s) {
         if (on) fprintf(stderr, "ds4: repeat-penalty freq=%.2f window=%u\n", freq_pen, window);
     }
     if (on != 1 || !s || !s->logits || !s->checkpoint_valid || s->checkpoint.len <= 0) return;
+    /* First sample of a generation = end of prompt. Penalize only GENERATED tokens,
+     * never the prompt: the edited file lives in the prompt, so penalizing it would
+     * suppress the legitimate verbatim reproduction and derail the model. With the
+     * prompt excluded, a LARGE window catches a long-period loop (model re-emitting
+     * the whole file) -- its tokens recur in the generated region (count>=2) -- while
+     * the first clean reproduction (count 1) is barely touched. */
+    if (gen_start < 0 || gen_start > s->checkpoint.len) gen_start = s->checkpoint.len;
     uint32_t len = (uint32_t)s->checkpoint.len;
+    uint32_t gstart = (uint32_t)gen_start;
     uint32_t start = len > window ? len - window : 0u;
+    if (start < gstart) start = gstart;
     for (uint32_t i = start; i < len; i++) {
         int t = s->checkpoint.v[i];
         if (t >= 0 && t < (int)DS4_N_VOCAB) s->logits[t] -= freq_pen;
