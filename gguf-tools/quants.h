@@ -45,10 +45,22 @@ typedef enum {
     DS4Q_TYPE_F64     = 28,
     DS4Q_TYPE_IQ1_M   = 29,
     DS4Q_TYPE_BF16    = 30,
+    /* ds4-private: Go-domain strict-binary (+/-1) 1-bit PER-ROW quantizer (go-onebit).
+     * Variable-length row record (one fp16 scale + packed sign words); research/
+     * calibration encoder only. CLI name "go1b_row". Fills an unused in-range slot;
+     * not a standard GGUF/GGML id, only ds4 tooling emits/consumes it. The runtime
+     * (Metal kernel) reads the BLOCK variant below, NOT this per-row record. */
+    DS4Q_TYPE_GO1B    = 31,
     DS4Q_TYPE_TQ1_0   = 34,
     DS4Q_TYPE_TQ2_0   = 35,
     DS4Q_TYPE_MXFP4   = 39,
-    DS4Q_TYPE_NVFP4   = 40,
+    /* ds4-private: Go-domain strict-binary (+/-1) 1-bit BLOCK quantizer — the format
+     * the ds4 runtime / Metal `block_go1b` kernel actually consumes. Fixed 256-element
+     * block = fp16 row scale (replicated per block) + 32 sign bytes = 34 bytes. CLI
+     * name "go1b"; emitted for routed experts. PINNED on-disk ggml type number = 40
+     * (repurposes the prior never-emitted NVFP4 placeholder that sat in this slot;
+     * NVFP4 had can_quantize=false and was referenced nowhere else). */
+    DS4Q_TYPE_GO1B_BLK = 40,
     DS4Q_TYPE_Q1_0    = 41,
     DS4Q_TYPE_COUNT   = 42,
 } ds4q_type;

@@ -1129,6 +1129,10 @@ typedef struct {
     ds4q_type routed_w1, routed_w2, routed_w3;
     ds4q_type hash_w1, hash_w2, hash_w3;  /* layers < n_hash_layers: hash-routed, non-specialty */
     int n_hash_layers;
+    /* --go1b-layers A:B — 逐层量化测试: 只有 layer∈[A:B] 的 routed 专家取 routed_w*(go1b),
+     * 范围外的专家取 go1b_outside(默认 q8_0 高精)。go1b_hi<0 = 禁用(全按 routed_w*)。 */
+    int go1b_lo, go1b_hi;
+    ds4q_type go1b_outside;
     ds4q_type attention_proj, attention, shared, embedding, output, dense;
     type_override *overrides;
     int n_overrides;
@@ -1204,6 +1208,9 @@ static ds4q_type policy_type(const quant_policy *p, const char *name, const tens
             if (e.part == EXP_W2 && p->hash_w2 != DS4Q_TYPE_COUNT) return p->hash_w2;
             if (e.part == EXP_W3 && p->hash_w3 != DS4Q_TYPE_COUNT) return p->hash_w3;
         }
+        /* 逐层量化测试: 范围外的专家用高精 go1b_outside(默认 q8_0) */
+        if (p->go1b_hi >= 0 && !e.is_mtp && (e.layer < p->go1b_lo || e.layer > p->go1b_hi))
+            return p->go1b_outside;
         if (e.part == EXP_W1 && p->routed_w1 != DS4Q_TYPE_COUNT) return p->routed_w1;
         if (e.part == EXP_W2 && p->routed_w2 != DS4Q_TYPE_COUNT) return p->routed_w2;
         if (e.part == EXP_W3 && p->routed_w3 != DS4Q_TYPE_COUNT) return p->routed_w3;
@@ -1813,6 +1820,124 @@ static uint64_t fnv1a64_bytes(const uint8_t *data, size_t n) {
     return h;
 }
 
+/* ===== --zchain: go-onebit 优化链(DQZ2)并入输出 GGUF 为原生张量 =====
+ * 用户产品形态: 量化(1bit 专家字节)与优化(每层最优 z/向后/GE; 四损失+感知已重解进
+ * 系数)合并输出【一个】GGUF。每层张量:
+ *   blk.L.opt_chain.weight  F32 [n_ops*16]   — 引擎打包 op 记录(16 float/op:
+ *       [0]=type 1GL|2dyn2|3dyn8|4TREF, [1]=g/t, [2..5]=w2p, [6..14]=w8,
+ *       [15]=层内 v8 块号(-1 无))
+ *   blk.L.opt_ge.weight     F32 [n_expert]   — 有效 GE(最后一条 type5)
+ *   blk.L.opt_v8.weight     F16 [nblk*8*d_model] — dyn8 投影(层内块序)
+ * + KV ds4.zchain.present=true(引擎自动装载开关)。 */
+typedef struct {
+    int       n_layer, n_expert, d_model;
+    float   **chain;  int *n_ops;      /* [L] 打包 op 记录 / op 数 */
+    float   **ge;                      /* [L] F32 增益或 NULL */
+    uint16_t **v8;    int *n_v8;       /* [L] fp16 dyn8 块 / 块数 */
+    uint16_t **zlm;   uint32_t *zlm_ne;/* [L] 冻结 z^L fp16 载荷{z[k],U[d·k],V[d·k]} / 元素数(type6, 2026-07-14) */
+    int       n_extra_tensors;
+} zchain_in;
+static zchain_in g_zc = {0};
+
+static int zchain_in_load(const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) die_errno("open zchain", path);
+    uint32_t magic = read_u32_le_fp(fp, "zchain magic");
+    uint32_t nl = read_u32_le_fp(fp, "zchain layers");
+    if (magic != 0x325A5144u) die("bad zchain magic (want DQZ2)");
+    if (nl == 0 || nl > 512) die("bad zchain layer count");
+    g_zc.n_layer = (int)nl;
+    g_zc.chain = xcalloc(nl, sizeof(g_zc.chain[0]));
+    g_zc.n_ops = xcalloc(nl, sizeof(g_zc.n_ops[0]));
+    g_zc.ge    = xcalloc(nl, sizeof(g_zc.ge[0]));
+    g_zc.v8    = xcalloc(nl, sizeof(g_zc.v8[0]));
+    g_zc.n_v8  = xcalloc(nl, sizeof(g_zc.n_v8[0]));
+    g_zc.zlm   = xcalloc(nl, sizeof(g_zc.zlm[0]));
+    g_zc.zlm_ne= xcalloc(nl, sizeof(g_zc.zlm_ne[0]));
+    for (uint32_t li = 0; li < nl; li++) {
+        uint32_t L = read_u32_le_fp(fp, "zchain L");
+        uint32_t nops = read_u32_le_fp(fp, "zchain nops");
+        if (L >= nl) die("zchain layer index out of range");
+        float *ch = nops ? xcalloc((size_t)nops * 16, sizeof(float)) : NULL;
+        int oi = 0;
+        for (uint32_t k = 0; k < nops; k++) {
+            uint32_t ty = read_u32_le_fp(fp, "zchain op type");
+            uint32_t psz = read_u32_le_fp(fp, "zchain op paysz");
+            uint8_t *pay = xmalloc(psz ? psz : 1);
+            if (psz && fread(pay, 1, psz, fp) != psz) die("zchain payload read");
+            if (ty == 6u && psz >= 16) {         /* 冻结 z^L(2026-07-14): 头{k,tr,din,dout}+fp16{z,U,V} */
+                uint32_t zk, din, dout; float tr;
+                memcpy(&zk, pay, 4); memcpy(&tr, pay + 4, 4);
+                memcpy(&din, pay + 8, 4); memcpy(&dout, pay + 12, 4);
+                size_t nh = (size_t)zk + (size_t)zk * din + (size_t)zk * dout;
+                if (zk > 0 && zk <= 64 && din == dout && psz >= 16 + nh * 2) {
+                    if (!g_zc.d_model) g_zc.d_model = (int)din;
+                    if ((int)din != g_zc.d_model) die("zchain zl d_model mismatch");
+                    float *f = ch + (size_t)oi * 16;
+                    f[0] = 6.0f; f[1] = tr; f[2] = (float)zk; f[15] = 0.0f;
+                    free(g_zc.zlm[L]);
+                    g_zc.zlm[L] = xmalloc(nh * 2);
+                    memcpy(g_zc.zlm[L], pay + 16, nh * 2);
+                    g_zc.zlm_ne[L] = (uint32_t)nh;
+                    oi++;
+                }
+            } else if (ty == 5u && psz >= 2) {   /* GE: 取最后一条(量化器回放口径) */
+                int ne = (int)(psz / 2);
+                if (!g_zc.n_expert) g_zc.n_expert = ne;
+                if (ne != g_zc.n_expert) die("zchain GE width mismatch");
+                if (!g_zc.ge[L]) g_zc.ge[L] = xmalloc((size_t)ne * sizeof(float));
+                for (int e = 0; e < ne; e++)
+                    g_zc.ge[L][e] = ds4q_f16_to_f32(load_u16_le(pay + (size_t)e * 2));
+            } else if (ty >= 1u && ty <= 4u) {
+                float *f = ch + (size_t)oi * 16;
+                f[0] = (float)ty; f[15] = -1.0f;
+                if (ty == 1u && psz >= 4) memcpy(&f[1], pay, 4);
+                else if (ty == 2u && psz >= 16) memcpy(&f[2], pay, 16);
+                else if (ty == 3u && psz > 36) {     /* 带 V8 才收; 无 V8 dyn8(psz==36)= 回放 no-op,
+                                                        落到末尾 else 丢弃。w8 必须在判收之后才写 —
+                                                        早写会把 w8 残留进本槽, 下一 op 复用槽位时
+                                                        f[6..14] 带脏字节(引擎按型不读但字节必须干净) */
+                    memcpy(&f[6], pay, 36);
+                    int dm = (int)((psz - 36) / (8 * 2));   /* 携带 V8: 层内块序 */
+                    if (!g_zc.d_model) g_zc.d_model = dm;
+                    if (dm != g_zc.d_model) die("zchain V8 d_model mismatch");
+                    int blk = g_zc.n_v8[L]++;
+                    g_zc.v8[L] = xrealloc(g_zc.v8[L],
+                        (size_t)g_zc.n_v8[L] * 8 * dm * sizeof(uint16_t));
+                    memcpy(g_zc.v8[L] + (size_t)blk * 8 * dm, pay + 36,
+                           (size_t)8 * dm * sizeof(uint16_t));
+                    f[15] = (float)blk;
+                }
+                else if (ty == 4u && psz >= 4) memcpy(&f[1], pay, 4);
+                else { free(pay); continue; }
+                oi++;
+            }
+            free(pay);
+        }
+        g_zc.n_ops[L] = oi;
+        if (oi) g_zc.chain[L] = ch; else free(ch);
+    }
+    fclose(fp);
+    int nt = 0, nops_tot = 0;
+    for (int L = 0; L < g_zc.n_layer; L++) {
+        if (g_zc.n_ops[L]) nt++;
+        if (g_zc.ge[L]) nt++;
+        if (g_zc.n_v8[L]) nt++;
+        if (g_zc.zlm_ne[L]) nt++;
+        nops_tot += g_zc.n_ops[L];
+    }
+    g_zc.n_extra_tensors = nt;
+    fprintf(stderr, "zchain: %s -> %d extra tensors (%d chain ops, n_expert=%d, d_model=%d)\n",
+            path, nt, nops_tot, g_zc.n_expert, g_zc.d_model);
+    return nt;
+}
+
+/* extra 张量的数据源(与 build_output_context 追加顺序一一对应) */
+typedef struct { const void *data; size_t size; } zc_payload;
+static zc_payload *g_zc_pay = NULL;
+static uint64_t g_zc_first_extra = 0;
+static const char *ZC_PRESENT_KEY = "ds4.zchain.present";
+
 static output_context build_output_context(const gguf_file *tmpl, const quant_policy *policy,
                                             const imatrix_store *im, const hot_mask *hm) {
     output_context out = {0};
@@ -1849,9 +1974,44 @@ static output_context build_output_context(const gguf_file *tmpl, const quant_po
         off += ds4q_pad(dst->size, tmpl->alignment);
         tensor_info += gguf_string_size(dst->name) + 4 + (size_t)dst->n_dims * 8 + 4 + 8;
     }
+    /* --zchain: 追加优化链张量(量化+优化合一 GGUF)。名字持有独立分配, 进程存续。 */
+    if (g_zc.n_extra_tensors) {
+        g_zc_first_extra = out.n_tensors;
+        out.tensors = xrealloc(out.tensors,
+            (size_t)(out.n_tensors + g_zc.n_extra_tensors) * sizeof(out.tensors[0]));
+        g_zc_pay = xcalloc((size_t)g_zc.n_extra_tensors, sizeof(g_zc_pay[0]));
+        int xi = 0;
+        for (int L = 0; L < g_zc.n_layer; L++) {
+            struct { const char *fmt; ds4q_type ty; int64_t ne0; const void *d; } add[4];
+            int na = 0;
+            if (g_zc.n_ops[L]) { add[na].fmt="blk.%d.opt_chain.weight"; add[na].ty=DS4Q_TYPE_F32;
+                add[na].ne0=(int64_t)g_zc.n_ops[L]*16; add[na].d=g_zc.chain[L]; na++; }
+            if (g_zc.ge[L])   { add[na].fmt="blk.%d.opt_ge.weight"; add[na].ty=DS4Q_TYPE_F32;
+                add[na].ne0=(int64_t)g_zc.n_expert; add[na].d=g_zc.ge[L]; na++; }
+            if (g_zc.n_v8[L]) { add[na].fmt="blk.%d.opt_v8.weight"; add[na].ty=DS4Q_TYPE_F16;
+                add[na].ne0=(int64_t)g_zc.n_v8[L]*8*g_zc.d_model; add[na].d=g_zc.v8[L]; na++; }
+            if (g_zc.zlm_ne[L]) { add[na].fmt="blk.%d.opt_zlm.weight"; add[na].ty=DS4Q_TYPE_F16;
+                add[na].ne0=(int64_t)g_zc.zlm_ne[L]; add[na].d=g_zc.zlm[L]; na++; }
+            for (int a = 0; a < na; a++) {
+                tensor_meta *dst = &out.tensors[out.n_tensors];
+                memset(dst, 0, sizeof(*dst));
+                char *nm = xmalloc(48); snprintf(nm, 48, add[a].fmt, L);
+                dst->name = nm; dst->n_dims = 1; dst->ne[0] = add[a].ne0;
+                dst->type = add[a].ty;
+                dst->size = tensor_nbytes(dst->type, dst->ne, dst->n_dims);
+                dst->new_offset = off;
+                off += ds4q_pad(dst->size, tmpl->alignment);
+                tensor_info += gguf_string_size(dst->name) + 4 + (size_t)dst->n_dims * 8 + 4 + 8;
+                g_zc_pay[xi++] = (zc_payload){ add[a].d, dst->size };
+                out.n_tensors++;
+            }
+        }
+        out.n_kv_extra += 1;   /* ds4.zchain.present */
+    }
     out.tensor_bytes = off;
     out.meta_size = 4 + 4 + 8 + 8 + tmpl->kv_raw_len
-                  + extra_imatrix_kv_size(im) + extra_keepmap_kv_size(hm) + tensor_info;
+                  + extra_imatrix_kv_size(im) + extra_keepmap_kv_size(hm) + tensor_info
+                  + (g_zc.n_extra_tensors ? gguf_string_size(ZC_PRESENT_KEY) + 4 + 1 : 0);
     out.data_offset = ds4q_pad(out.meta_size, tmpl->alignment);
     return out;
 }
@@ -1865,18 +2025,66 @@ static void write_padding(FILE *fp, size_t n) {
     }
 }
 
+/* Cluster split-quantize (no shared FS): --layers lo-hi selects which block
+ * layers THIS host generates; unselected tensors become fseek holes at their
+ * exact planned offsets, so two hosts produce structurally identical files
+ * whose written ranges are disjoint. --manifest records {name, abs_offset,
+ * bytes} per written tensor; quant_assemble.py splices a peer's ranges into
+ * the coordinator's file and the result is byte-identical to a single-host
+ * run (generation is deterministic). Layer classing: token_embd/embed-side
+ * globals ride with layer 0 (lo side); output.*/
+/* /mtp.* ride with the last layer (hi side). */
+static int tensor_layer_class(const char *name) {
+    int layer;
+    if (sscanf(name, "blk.%d.", &layer) == 1) return layer;
+    if (strncmp(name, "mtp.", 4) == 0) return 1 << 20;      /* hi side */
+    if (strncmp(name, "output", 6) == 0) return 1 << 20;    /* output.*, output_norm */
+    return -1;                                              /* embed-side globals: lo side */
+}
+
+/* --experts-hole: routed 专家 tensor(blk.*.ffn_*_exps)只留稀疏洞不计算不写 —
+ * 骨架实占≈骨干几GB(APFS 稀疏), 专家字节由 go-onebit 层文件 merge 时 pwrite 填入。
+ * mtp.* 专家与 shexp 不匹配此模式(正常量化写入)。 */
+static int g_experts_hole = 0;
+static int is_routed_exps_name(const char *name) {
+    int layer, rest = 0; char kind[16];
+    return sscanf(name, "blk.%d.ffn_%15[^_]_exps.weight%n", &layer, kind, &rest) == 2 && name[rest] == 0;
+}
+static int layer_selected(int cls, int lo, int hi, int n_layers) {
+    if (lo < 0) return 1;                    /* no --layers: everything */
+    if (cls < 0) return lo == 0;             /* embed-globals with the lo end */
+    if (cls >= (1 << 20)) return hi >= n_layers - 1;  /* output/mtp with the hi end */
+    return cls >= lo && cls <= hi;
+}
+
 static void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_context *out_ctx,
                             const char *out_path, int n_experts, int n_threads,
-                            const imatrix_store *imatrix, const hot_mask *hm) {
+                            const imatrix_store *imatrix, const hot_mask *hm,
+                            int layers_lo, int layers_hi, const char *manifest_path) {
     FILE *fp = fopen(out_path, "wb");
     if (!fp) die_errno("open output", out_path);
+    FILE *mf = NULL;
+    if (manifest_path) {
+        mf = fopen(manifest_path, "w");
+        if (!mf) die_errno("open manifest", manifest_path);
+    }
+    int n_layers = 0;   /* highest blk index + 1, for hi-side global assignment */
+    for (uint64_t i = 0; i < out_ctx->n_tensors; i++) {
+        int c = tensor_layer_class(out_ctx->tensors[i].name);
+        if (c >= 0 && c < (1 << 20) && c + 1 > n_layers) n_layers = c + 1;
+    }
     if (fwrite("GGUF", 1, 4, fp) != 4) die("write GGUF magic failed");
     write_u32(fp, tmpl->version);
-    write_u64(fp, tmpl->n_tensors);
+    write_u64(fp, out_ctx->n_tensors);   /* 含 --zchain 追加的 opt_* 张量 */
     write_u64(fp, tmpl->n_kv + out_ctx->n_kv_extra);
     if (fwrite(tmpl->kv_raw, 1, tmpl->kv_raw_len, fp) != tmpl->kv_raw_len) die("write GGUF KV failed");
     write_imatrix_kvs(fp, imatrix);
     write_keepmap_kvs(fp, hm);
+    if (g_zc.n_extra_tensors) {          /* ds4.zchain.present=true: 引擎自动装载 opt_* */
+        write_gguf_string(fp, ZC_PRESENT_KEY);
+        write_u32(fp, GGUF_TYPE_BOOL);
+        if (fputc(1, fp) == EOF) die("write zchain KV failed");
+    }
     for (uint64_t i = 0; i < out_ctx->n_tensors; i++) {
         const tensor_meta *t = &out_ctx->tensors[i];
         write_gguf_string(fp, t->name);
@@ -1891,8 +2099,29 @@ static void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_conte
     write_padding(fp, out_ctx->data_offset - (size_t)pos);
 
     for (uint64_t i = 0; i < out_ctx->n_tensors; i++) {
-        const tensor_meta *src = &tmpl->tensors[i];
         const tensor_meta *dst = &out_ctx->tensors[i];
+        const size_t padded = ds4q_pad(dst->size, out_ctx->alignment);
+        if (!layer_selected(tensor_layer_class(dst->name), layers_lo, layers_hi, n_layers)) {
+            /* peer's share: leave an exact-size hole (sparse seek, no write) */
+            if (fseeko(fp, (off_t)padded, SEEK_CUR) != 0) die_errno("seek hole", out_path);
+            continue;
+        }
+        if (g_zc.n_extra_tensors && i >= g_zc_first_extra) {
+            /* --zchain 追加张量: 数据即内存里的优化链载荷, 直接写(无模板源) */
+            const zc_payload *zp = &g_zc_pay[i - g_zc_first_extra];
+            if (zp->size != dst->size) die("zchain payload size mismatch");
+            if (mf) { fprintf(mf, "%s\t%llu\t%zu\n", dst->name,
+                        (unsigned long long)(out_ctx->data_offset + dst->new_offset), zp->size); fflush(mf); }
+            if (fwrite(zp->data, 1, zp->size, fp) != zp->size) die_errno("write zchain tensor", out_path);
+            write_padding(fp, padded - zp->size);
+            continue;
+        }
+        const tensor_meta *src = &tmpl->tensors[i];
+        if (g_experts_hole && is_routed_exps_name(dst->name)) {
+            /* 骨架模式: routed 专家留洞(不计算不写), merge 阶段由层文件填 */
+            if (fseeko(fp, (off_t)padded, SEEK_CUR) != 0) die_errno("seek hole", out_path);
+            continue;
+        }
         fprintf(stderr, "[%4" PRIu64 "/%4" PRIu64 "] %s -> %s\n", i + 1, out_ctx->n_tensors, dst->name, ds4q_type_name(dst->type));
         byte_buf data = generate_tensor(db, dst->name, src, dst->type, n_experts, n_threads, imatrix, hm);
         size_t expected = dst->size;
@@ -1900,12 +2129,26 @@ static void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_conte
             fprintf(stderr, "error: generated size mismatch for %s: got %zu expected %zu\n", dst->name, data.size, expected);
             exit(1);
         }
+        if (mf) {
+            fprintf(mf, "%s\t%llu\t%zu\n", dst->name,
+                    (unsigned long long)(out_ctx->data_offset + dst->new_offset), data.size);
+            fflush(mf);
+        }
         if (fwrite(data.data, 1, data.size, fp) != data.size) die_errno("write tensor", out_path);
-        size_t padded = ds4q_pad(data.size, out_ctx->alignment);
         write_padding(fp, padded - data.size);
         fprintf(stderr, "       generated %.2f MiB\n", (double)data.size / 1048576.0);
         free(data.data);
     }
+    /* materialize the file's full length even when the tail was a hole */
+    if (fseeko(fp, 0, SEEK_END) == 0) {
+        off_t end = ftello(fp);
+        off_t want = (off_t)(out_ctx->data_offset + out_ctx->tensor_bytes);
+        if (end < want) {
+            if (fseeko(fp, want - 1, SEEK_SET) != 0) die_errno("seek eof", out_path);
+            fputc(0, fp);
+        }
+    }
+    if (mf) fclose(mf);
     fclose(fp);
 }
 
@@ -1914,6 +2157,7 @@ static void print_plan(const gguf_file *tmpl, const output_context *out_ctx) {
     size_t changed = 0;
     for (uint64_t i = 0; i < out_ctx->n_tensors; i++) {
         tensor_bytes += out_ctx->tensors[i].size;
+        if (i >= tmpl->n_tensors) continue;   /* --zchain 追加张量: 无模板源 */
         const tensor_meta *src = &tmpl->tensors[i];
         const tensor_meta *dst = &out_ctx->tensors[i];
         if (src->type != dst->type) {
@@ -1946,6 +2190,9 @@ typedef struct {
     bool dry_run;
     bool overwrite;
     bool imatrix_strict;
+    int layers_lo;        /* --layers lo-hi cluster split; -1 = all */
+    int layers_hi;
+    char *manifest_file;  /* --manifest: written-tensor {name,offset,bytes} list */
 } params;
 
 static void usage(const char *argv0) {
@@ -1979,7 +2226,7 @@ static void usage(const char *argv0) {
     printf("  --tensor-type PFX=TYPE exact tensor-name or prefix override; may repeat\n");
     printf("  --n-experts N          routed expert count, default template metadata\n");
     printf("  --threads N            expert worker count, default 8\n");
-    printf("\nTYPE examples: f16, f32, bf16, q8_0, q4_k, q2_k, iq2_xxs\n");
+    printf("\nTYPE examples: f16, f32, bf16, q8_0, q4_k, q2_k, iq2_xxs, go1b (strict 1-bit routed experts)\n");
 }
 
 static char *need_value(int argc, char **argv, int *i, const char *arg) {
@@ -2002,10 +2249,15 @@ static params parse_args(int argc, char **argv) {
     p.policy.routed_w1 = p.policy.routed_w2 = p.policy.routed_w3 = DS4Q_TYPE_COUNT;
     p.policy.hash_w1 = p.policy.hash_w2 = p.policy.hash_w3 = DS4Q_TYPE_COUNT;
     p.policy.n_hash_layers = 0;
+    p.policy.go1b_lo = 0; p.policy.go1b_hi = -1;          /* 禁用 = 全按 routed_w* */
+    p.policy.go1b_outside = DS4Q_TYPE_Q8_0;               /* 范围外高精 */
     p.policy.attention_proj = p.policy.attention = p.policy.shared = DS4Q_TYPE_COUNT;
     p.policy.embedding = p.policy.output = p.policy.dense = DS4Q_TYPE_COUNT;
     p.n_experts = 0;
     p.n_threads = 8;
+    p.layers_lo = -1;
+    p.layers_hi = -1;
+    p.manifest_file = NULL;
 
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
@@ -2041,6 +2293,13 @@ static params parse_args(int argc, char **argv) {
             p.policy.routed_w2 = parse_type(need_value(argc, argv, &i, arg));
         } else if (strcmp(arg, "--routed-w3") == 0 || strcmp(arg, "--routed-up") == 0) {
             p.policy.routed_w3 = parse_type(need_value(argc, argv, &i, arg));
+        } else if (strcmp(arg, "--go1b-layers") == 0) {
+            const char *v = need_value(argc, argv, &i, arg);
+            int a = 0, b = 0;
+            if (sscanf(v, "%d:%d", &a, &b) != 2) die("--go1b-layers needs A:B");
+            p.policy.go1b_lo = a; p.policy.go1b_hi = b;
+        } else if (strcmp(arg, "--go1b-outside") == 0) {
+            p.policy.go1b_outside = parse_type(need_value(argc, argv, &i, arg));
         } else if (strcmp(arg, "--hash-layers") == 0) {
             p.policy.n_hash_layers = atoi(need_value(argc, argv, &i, arg));
         } else if (strcmp(arg, "--hash-w1") == 0) {
@@ -2072,6 +2331,18 @@ static params parse_args(int argc, char **argv) {
             p.n_experts = atoi(need_value(argc, argv, &i, arg));
         } else if (strcmp(arg, "--threads") == 0) {
             p.n_threads = atoi(need_value(argc, argv, &i, arg));
+        } else if (strcmp(arg, "--experts-hole") == 0) {
+            g_experts_hole = 1;
+        } else if (strcmp(arg, "--zchain") == 0) {
+            /* go-onebit 优化链(DQZ2)并入输出 GGUF 为 blk.L.opt_* 张量(量化+优化单文件) */
+            zchain_in_load(need_value(argc, argv, &i, arg));
+        } else if (strcmp(arg, "--layers") == 0) {
+            const char *v = need_value(argc, argv, &i, arg);
+            if (sscanf(v, "%d-%d", &p.layers_lo, &p.layers_hi) != 2 ||
+                p.layers_lo < 0 || p.layers_hi < p.layers_lo)
+                die("--layers expects LO-HI (e.g. 0-11)");
+        } else if (strcmp(arg, "--manifest") == 0) {
+            p.manifest_file = need_value(argc, argv, &i, arg);
         } else {
             fprintf(stderr, "error: unknown argument: %s\n", arg);
             exit(1);
@@ -2177,7 +2448,8 @@ int main(int argc, char **argv) {
         free(out_ctx.tensors);
         return 0;
     }
-    write_full_gguf(&db, &tmpl, &out_ctx, p.out_gguf, p.n_experts, p.n_threads, &imatrix, &hm);
+    write_full_gguf(&db, &tmpl, &out_ctx, p.out_gguf, p.n_experts, p.n_threads, &imatrix, &hm,
+                    p.layers_lo, p.layers_hi, p.manifest_file);
     fprintf(stderr, "wrote %s\n", p.out_gguf);
 
     db_close(&db);

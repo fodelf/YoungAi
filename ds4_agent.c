@@ -436,6 +436,7 @@ static bool agent_slash_command_known(const char *cmd) {
            !strcmp(cmd, "/exit") ||
            !strcmp(cmd, "/new") ||
            agent_slash_command_with_args(cmd, "/power") ||
+           agent_slash_command_with_args(cmd, "/corr") ||
            agent_slash_command_with_args(cmd, "/switch") ||
            agent_slash_command_with_args(cmd, "/del") ||
            agent_slash_command_with_args(cmd, "/strip") ||
@@ -540,6 +541,7 @@ static void usage(FILE *fp) {
         "  /strip SHA             Remove KV payload from a saved session.\n"
         "  /history [N]           Show N recent user turns from the current session.\n"
         "  /power N               Set GPU duty cycle percentage, 1..100.\n"
+        "  /corr [name|path|off]  List gguf/sidecars/ plugins or hot-swap the z domain.\n"
         "  /new                   Start a fresh session from the system prompt.\n"
         "  /quit, /exit           Exit.\n");
 }
@@ -605,6 +607,8 @@ static agent_config parse_options(int argc, char **argv) {
             c.gen.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--corr")) {
+            c.engine.corr_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {
@@ -7064,6 +7068,12 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
     ds4_session_set_progress(w->session, NULL, NULL);
     ds4_session_set_display_progress(w->session, NULL, NULL);
 
+    /* 摘要生成起点: 钉生成区边界 —— 摘要按定义要逐字复述上下文里的事实,
+     * anticycle 只扫摘要自身而不再禁"引用被总结的对话"; 贪心 argmax 路径
+     * 投机门=1。 */
+    ds4_session_mark_generation_start(w->session);
+    ds4_session_set_spec_greedy(w->session, 1);
+
     /* From here until the final rebuild, the live KV contains the internal
      * compaction prompt/summary, while w->transcript still contains the real
      * conversation.  If anything fails, invalidate live KV so the next turn
@@ -7328,6 +7338,11 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         }
         ds4_session_set_progress(w->session, NULL, NULL);
         ds4_session_set_display_progress(w->session, NULL, NULL);
+
+        /* 每个 tool_round 重钉生成区边界: 上轮生成+工具结果此刻都已是 prompt
+         * (逐字引用文件/工具输出必须合法); 投机贪心门按本请求实际温度。 */
+        ds4_session_mark_generation_start(w->session);
+        ds4_session_set_spec_greedy(w->session, cfg->gen.temperature <= 0.0f);
 
         int max_tokens = cfg->gen.n_predict;
         int room = ds4_session_ctx(w->session) - ds4_session_pos(w->session);
@@ -9518,6 +9533,42 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                         printf("compaction scheduled at next safe point\n");
                 } else if (!strcmp(cmd, "/list")) {
                     agent_worker_list_sessions(&worker);
+                } else if (!strncmp(cmd, "/corr", 5) &&
+                           (cmd[5] == '\0' || cmd[5] == ' ' || cmd[5] == '\t')) {
+                    /* R3-h multi-domain sidecar plugin: /corr lists the
+                     * gguf/sidecars/ registry; /corr <name|path|off> swaps
+                     * the z-domain between generations (~90MB, seconds). */
+                    char *arg = cmd + 5;
+                    while (*arg == ' ' || *arg == '\t') arg++;
+                    if (!arg[0]) {
+                        printf("sidecar registry (gguf/sidecars/):\n");
+                        DIR *dp = opendir("gguf/sidecars");
+                        if (dp) {
+                            struct dirent *de;
+                            while ((de = readdir(dp)) != NULL) {
+                                size_t n = strlen(de->d_name);
+                                if (n > 5 && !strcmp(de->d_name + n - 5, ".gguf"))
+                                    printf("  %.*s\n", (int)(n - 5), de->d_name);
+                            }
+                            closedir(dp);
+                        } else {
+                            printf("  (no gguf/sidecars/ directory)\n");
+                        }
+                        printf("usage: /corr <name|path|off>\n");
+                    } else {
+                        char path[512];
+                        if (!strcmp(arg, "off")) {
+                            path[0] = '\0';
+                        } else if (strchr(arg, '/')) {
+                            snprintf(path, sizeof(path), "%s", arg);
+                        } else {
+                            snprintf(path, sizeof(path), "gguf/sidecars/%s.gguf", arg);
+                        }
+                        if (ds4_engine_corr_switch(engine, path[0] ? path : NULL) == 0)
+                            printf("corr domain -> %s\n", path[0] ? path : "(off, pure 1-bit)");
+                        else
+                            printf("corr switch failed (kept current): %s\n", path);
+                    }
                 } else if (!strncmp(cmd, "/power", 6) &&
                            (cmd[6] == '\0' || cmd[6] == ' ' || cmd[6] == '\t')) {
                     char *arg = cmd + 6;

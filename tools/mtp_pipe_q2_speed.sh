@@ -27,6 +27,21 @@
 # !! 本机 M4 现扛大部分层 (~8G), 若 M4 被其他程序占满会 GPU OOM —— 先腾内存再跑。!!
 set -uo pipefail
 
+# ================= 用法示例 =================
+# (A) mono 质量基线 (★默认 —— 裸跑即此, 2026-07-07 验证配置):
+#       ./tools/mtp_pipe_q2_speed.sh
+#     默认 = ds4-mono-mixed + BOS 裸续写 twoSum prompt + NPRED=96。
+#     判据: 输出应为逐字正确的双重循环 twoSum + 自然续写 threeSum,
+#     gen ~1.7 t/s (全冷 SSD 流式)。数值安全(MATH_SAFE/KV_RAW_F32/
+#     ROPE_EXP2_LOG2/REPEAT_FREQ)由引擎按模型自动 armed, 无需 env。
+#     自定义 prompt: PROMPT='...' ./tools/mtp_pipe_q2_speed.sh
+#
+# (B) q2 长上下文测速 (编辑型 PROMPT 才让 copy-spec/spec-pipe 出效果):
+#       MODEL=gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf \
+#       CTX=200000 PROMPT='...' ./tools/mtp_pipe_q2_speed.sh
+#     (q2 是 chat 模型, PROMPT 用普通指令文本; 降激活 A/B 用 MOE_THIN_TOPK=4)
+# ============================================
+
 # ---------------- 配置 (均可 env 覆盖) ----------------
 REMOTE=${REMOTE:-192.168.1.2}                  # M1 (worker), ssh 目标
 REMOTE_DIR=${REMOTE_DIR:-/Users/fodelf/ds4-main}
@@ -36,175 +51,57 @@ PORT=${PORT:-5599}
 # 档位: 默认 q2-imatrix 完整模型；脚本只做双机层切分 + A3 按需专家加载 smoke。
 # 分层等待诊断默认：本机 0:22，M1 23:output。这样故意把更多后段层放到 M1，
 # 用 --debug telemetry 观察是否 coordinator 在等 worker；若 M1 8GB 预算拒绝或变慢，再回 0:33/34:output。
-MODEL=${MODEL:-gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf}
-# 草稿模型 (第五十八波起仅 coordinator/本机 M4 加载)。优先用 Q2K 小草稿 (~2.14G, mmap non-resident),
-# 由 tools/make_small_mtp.sh 生成; 不存在则回退已发布的 Q4K 3.8G。注意 M4 现额外扛 output head + 草稿,
-# 逼近 12G → 默认 DS4_MTP_NO_RESIDENCY=1 让草稿可驱逐 (不占 L1 resident budget)。
-if [ -z "${MTP_GGUF:-}" ]; then
-  if [ -f gguf/DeepSeek-V4-Flash-MTP-Q2K.gguf ]; then MTP_GGUF=gguf/DeepSeek-V4-Flash-MTP-Q2K.gguf
-  else MTP_GGUF=gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf; fi
-fi
+MODEL=${MODEL:-gguf/ds4-mono-mixed.gguf}   # 默认=go2b 全 EF mono 质量双机; 跑 q2 测速设 MODEL=gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf
+# ---- MTP 跨机投机 (可选, 由 MTP_GGUF 单一开关驱动, 无独立 enable 旋钮) ----
+# 不设 MTP_GGUF (默认) = 纯层切分: worker 持 output head 返 logits (4.14 基线拓扑)。
+# 设 MTP_GGUF=草稿模型路径 = 第五十八波"本机 MTP": drafter 跑 coordinator (--mtp-role
+# coordinator), output head + token_embd + 草稿都在 M4 —— 收 worker hidden → 本地 output head
+# 出 logits → 同一 hidden 喂 MTP head 本地 draft K 个 → 跨机 verify (复用 copy-spec 骨架)。
+# M1 worker 卸掉草稿 + output head (解决旧 Scheme A 死结: M1 装不下 backbone+草稿)。
+# 草稿用 tools/make_small_mtp.sh 生成的 Q2K (~2.14G) 或已发布 Q4K (3.8G); mmap non-resident
+# (默认 DS4_MTP_NO_RESIDENCY=1 可驱逐, 不占 L1 budget), 注意 M4 ≤12G 红线。
+MTP_GGUF=${MTP_GGUF:-}
 # 层切分 (block_count=43, layers 0..42)。本机 M4 扛大部分前段, M1 扛少部分末段 + output + MTP。
 # 第五十九波: AUTO_SPLIT=1 (默认) 启动期按两机冷盘读带宽 + mlock 预算自动标定最优 split
 # (见下方 auto-split 块)。用户显式设 SPLIT_COORD 或 SPLIT_WORKER 即跳过自动标定 (SPLIT_PINNED=1)。
 if [ -n "${SPLIT_COORD+x}" ] || [ -n "${SPLIT_WORKER+x}" ]; then SPLIT_PINNED=1; else SPLIT_PINNED=0; fi
-SPLIT_COORD=${SPLIT_COORD:-0:19}               # 本机 M4: 前 20 层 + token_embd + output head + MTP drafter
+SPLIT_COORD=${SPLIT_COORD:-0:19}               # 本机 M4: 前 20 层 + token_embd (+ output head + MTP drafter, 当设 MTP_GGUF)
 # 第五十八波 本机 MTP: worker 切片*不含* output head (结尾是数字 42=last layer, 不是 "output")。
 # worker 算到最后一层 backbone 即返回 hidden; coordinator 持 output head 把 hidden 变 logits。
 # (旧拓扑 20:output 让 worker 持 output head; 现 output head + MTP 都搬到 coordinator 卸 M1 内存。)
 SPLIT_WORKER=${SPLIT_WORKER:-20:42}            # M1 worker: 层 20..42 (last), 不含 output head → 返回 hidden
-CTX=${CTX:-200000}
-# ---- project.md PC.5: PROMPT_PROFILE 档位 ----
-# 第六十九波: 默认改 code-edit-heavy (编程域 = 项目"有效 t/s"主战场, copy-spec/spec-pipe 在此起作用)。
-# smoke:       现行短问句, 历史速度可比基线; copy-spec/spec-pipe 在它身上系统性无收益 (无可抄结构,
-#   n_copy=0 → spec-pipe 永不 arm) —— 它只测"不赔钱"。通用问答基线请显式 PROMPT_PROFILE=smoke。
-# code-edit:   编辑型负载 (给一段代码 + 改名指令, 输出 ≈ 大段回显输入) —— Claude Code 真实回合的缩影。
-# code-edit-heavy (默认): 大文件 + "加一个 docstring 输出完整文件", 制造 300+ token 连续逐字复现,
-#   copy-spec + spec-pipe 收益最大档。验收看 generation t/s (= 有效 t/s) 与 dist-mtp 行 tok/call。
-PROMPT_PROFILE=${PROMPT_PROFILE:-code-edit-heavy}
-if [ "$PROMPT_PROFILE" = "code-edit" ]; then
-  NPRED=${NPRED:-224}
-  RUN_TIMEOUT_SEC=${RUN_TIMEOUT_SEC:-600}
-  if [ -z "${PROMPT:-}" ]; then
-    PROMPT=$(cat <<'PEOF'
-下面是一段 Python 代码：
-```python
-def process_data(items):
-    result = []
-    for item in items:
-        if item is None:
-            continue
-        value = item.strip().lower()
-        if not value:
-            continue
-        if value in result:
-            continue
-        result.append(value)
-    return result
-
-def process_file(path):
-    with open(path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-    return process_data(lines)
-```
-请把函数名 process_data 改名为 clean_items（包括所有调用处），其他逻辑和格式保持完全不变，输出修改后的完整代码，不要任何解释。
-PEOF
-)
-  fi
-fi
-# 第六十八波 PC.5: 重 echo 档 (code-edit-heavy). 依据: wave-67 实测当前 code-edit 复制匹配仅 ~29-33 token
-# (wave-30 抄源第29分叉), verify 批长不起来 ⇒ 暖 drain (warm 主瓶颈) 摊薄不到位。重 echo = 大文件 +
-# 单处小改 + 输出完整文件 ⇒ 制造一段 100+ token 连续逐字复现 ⇒ 大 verify 批 ⇒ 暖 drain 0.3-0.7ms/tok
-# (文献: MoE 投机中大批量甜点 verify 近免费). 这是 30-有效目标的真实测量入口。NPRED 大 (整文件回显)。
-if [ "$PROMPT_PROFILE" = "code-edit-heavy" ]; then
-  NPRED=${NPRED:-768}
-  RUN_TIMEOUT_SEC=${RUN_TIMEOUT_SEC:-1500}
-  # 第六十八波依据: 重 echo 长匹配下 verify 批被 cap=32 钳死 (sent=33 全接受 r2~6.3s/批=190ms/tok)。
-  # 长匹配 regime 下 cap 是真约束 (零超额, 异于 wave-30 短匹配)。放大 cap → 大 verify 批摊薄暖 drain。
-  # 仍在引擎现有 clamp(<=63)/缓冲(64) 内, 零引擎风险。验证后再做 64->128 缓冲扩容。
-  COPY_SPEC_MAX=${COPY_SPEC_MAX:-63}
-  # 第六十八波 pipe-profile 依据: r2 ~88% 是 backbone+attention 前向计算 (两机串行 118ms/tok),
-  # 暖 decode 天花板 ~8.5 t/s。4.67→8.5 的差距主要是 ~55% 的 round1 单步前向 (first_hit 45%, n=1 0.6s/tok)。
-  # NGRAM 4→3: 锚更短 → 更多位置命中复制 → 更少 round1 → 更多 token 走廉价 verify 批。bit-exact (verify 拒错抄)。
-  COPY_SPEC_NGRAM=${COPY_SPEC_NGRAM:-3}
-  # 第六十八波: REANCHOR=1 实测净亏 (4.84→4.64): 重锚减超额, 却让下个长匹配欠注+重爬梯, 得不偿失。
-  # 默认回 0 (保 4.84 基线); knob 保留供 A/B。超额发生在不可预知的分叉轮, reanchor 修不到。
-  COPY_SPEC_REANCHOR=${COPY_SPEC_REANCHOR:-0}
-  if [ -z "${PROMPT:-}" ]; then
-    PROMPT=$(cat <<'HEOF'
-下面是一段 Python 代码：
-```python
-import os
-import json
-from typing import List, Dict, Optional
-
-
-class Config:
-    def __init__(self, path: str):
-        self.path = path
-        self.data: Dict[str, str] = {}
-
-    def load(self) -> None:
-        with open(self.path, "r", encoding="utf-8") as f:
-            self.data = json.load(f)
-
-    def get(self, key: str, default: Optional[str] = None) -> Optional[str]:
-        return self.data.get(key, default)
-
-    def set(self, key: str, value: str) -> None:
-        self.data[key] = value
-
-    def save(self) -> None:
-        with open(self.path, "w", encoding="utf-8") as f:
-            json.dump(self.data, f, indent=2, ensure_ascii=False)
-
-
-def merge_configs(base: Config, override: Config) -> Config:
-    result = Config(base.path)
-    result.data = dict(base.data)
-    for key, value in override.data.items():
-        result.data[key] = value
-    return result
-
-
-def load_all(paths: List[str]) -> List[Config]:
-    configs = []
-    for path in paths:
-        if not os.path.exists(path):
-            continue
-        cfg = Config(path)
-        cfg.load()
-        configs.append(cfg)
-    return configs
-```
-只给 Config 类的 load 方法加一行 docstring（在 def load 那行下面加 """从磁盘读取 JSON 配置文件。"""），其余每一行代码和格式完全保持不变，输出修改后的完整代码，不要任何解释。
-HEOF
-)
-  fi
-fi
-# 第四十八波 PC.5: 多回合 replay 档 (量化 PC.4 回合级增量 prefill). REPL 模式喂多回合 stdin,
-# 前缀 KV 跨回合复用 → 每回合只 prefill 新增 suffix → per-turn TTFT 是编码 UX 真分母。
-# REPL 逐行读 (linenoiseNoTTY), 故每回合必须单行 (代码块多行会被拆)。
-REPLAY=0
-if [ "$PROMPT_PROFILE" = "replay" ]; then
-  REPLAY=1
-  NPRED=${NPRED:-128}
-  RUN_TIMEOUT_SEC=${RUN_TIMEOUT_SEC:-900}
-  REPLAY_TURN_1=${REPLAY_TURN_1:-"用 Python 写一个清洗字符串列表的函数 clean_items：跳过 None、去首尾空白并转小写、去重且保持原顺序；再写一个 process_file 函数读取文件每行调用 clean_items。输出完整代码，不要解释。"}
-  REPLAY_TURN_2=${REPLAY_TURN_2:-"现在把 clean_items 改名为 sanitize_items，所有调用处一起改，输出修改后的完整代码。"}
-  REPLAY_TURN_3=${REPLAY_TURN_3:-"再给 process_file 加上当文件不存在时返回空列表的处理，输出完整代码。"}
-fi
-NPRED=${NPRED:-48}
+CTX=${CTX:-4096}   # 默认小 ctx 供 mono 质量双机 (KV 有界); q2 长上下文测速设 CTX=200000
+NPRED=${NPRED:-96} # 2026-07-07 验证值: 96 token 足够产出完整 twoSum + threeSum 开头做质量判据
 DRAFT=${DRAFT:-2}                              # --mtp-draft N: 分布式 MTP 默认 2；4 在当前 M1 worker 上实测负收益
-NO_MTP=${NO_MTP:-1}                            # 默认关 MTP。第五十八波起 MTP drafter 改跑 coordinator
-#   (--mtp-role coordinator): output head + token_embd + 2.14G 草稿都在 M4, M1 worker 只持 backbone
-#   返回 hidden。解决旧 Scheme A 的死结 (M1 装不下 backbone+草稿)。代价转移到 M4: M4 现额外扛
-#   output head + 草稿 (mmap non-resident, 不占 L1 budget), 注意 M4 ≤12G 红线。NO_MTP=0 开启。
-if [ "$NO_MTP" = 1 ]; then
-  COORD_MTP_ARGS=""
-  COORD_MTP_ENV=""
-  WORKER_MTP_ARGS=""
-  WORKER_MTP_ENV=""
-else
-  # 第五十八波 本机 MTP: drafter 跑在 coordinator (本机 M4), 不再在 M1 worker。
-  # coordinator 持 output head + token_embd + MTP 草稿: 收 worker 返回的 hidden → 本地 output
-  # head 出 logits → 同一 hidden 喂 MTP head 本地 draft K 个 → 跨机 verify (复用 copy-spec 骨架)。
-  # M1 worker 因此卸掉 ~2.14G 草稿 + output head, 内存松。
+COORD_MTP_ARGS=""
+COORD_MTP_ENV=""
+WORKER_MTP_ARGS=""
+WORKER_MTP_ENV=""
+if [ -n "$MTP_GGUF" ]; then
   COORD_MTP_ARGS="--mtp $MTP_GGUF --mtp-role coordinator --mtp-draft $DRAFT"
-  WORKER_MTP_ARGS=""
-  WORKER_MTP_ENV=""
   # 草稿不 wire 进 GPU residency (留 mmap 可驱逐, 不占 L1 budget)。A/B 回退: MTP_NO_RESIDENCY=0。
   COORD_MTP_ENV="DS4_MTP_NO_RESIDENCY=${MTP_NO_RESIDENCY:-1}"
 fi
-# 拓扑修正 (output head 归属): 默认 SPLIT_WORKER=20:42 (不含 output head) 只在 *本机 MTP* (NO_MTP=0,
-# output head 在 coordinator) 下成立。NO_MTP=1 时 coordinator 不持 output head, 若 worker 也用 20:42
-# 则**没人做 output head** → "distributed route incomplete / range 80.24 GiB not covered" 报错。
-# 4.14 基线拓扑 = worker 持 output head (20:output) 返 logits。故 NO_MTP=1 且用户未显式钉 split 时,
-# 强制 SPLIT_WORKER=20:output。(用户显式 SPLIT_WORKER 或 NO_MTP=0 不动。)
-if [ "$NO_MTP" = 1 ] && [ "$SPLIT_PINNED" = 0 ] && [ "$SPLIT_WORKER" = "20:42" ]; then
+# 拓扑修正 (output head 归属): 默认 SPLIT_WORKER=20:42 (不含 output head) 只在 *本机 MTP*
+# (设 MTP_GGUF, output head 在 coordinator) 下成立。纯层切分时 coordinator 不持 output head,
+# 若 worker 也用 20:42 则**没人做 output head** → "distributed route incomplete / range 80.24
+# GiB not covered" 报错。4.14 基线拓扑 = worker 持 output head (20:output) 返 logits。
+# 故未设 MTP_GGUF 且用户未显式钉 split 时, 强制 SPLIT_WORKER=20:output。
+# (用户显式 SPLIT_WORKER 或设 MTP_GGUF 不动。)
+if [ -z "$MTP_GGUF" ] && [ "$SPLIT_PINNED" = 0 ] && [ "$SPLIT_WORKER" = "20:42" ]; then
   SPLIT_WORKER="20:output"
 fi
-PROMPT=${PROMPT:-"写一个 Python 函数判断字符串是否回文，并解释它的原理。"}
+# 默认提示词 (2026-07-07 验证基线): BOS 裸续写 twoSum。mono (go1b/go2b) 是 BASE 风格模型,
+# 必须 BOS 前缀裸续写, 不走 chat 模板; 此 prompt 与 proven 参考 (mono_dual_run.sh / fable5
+# 2026-07-06 记录) 逐字同款, 正确输出 = 双重循环 twoSum + 自然续写 threeSum, 是现成的
+# 质量判据。跑 chat 模型(q2)或自定义场景用 PROMPT='...' 覆盖。
+if [ -z "${PROMPT+x}" ]; then
+  PROMPT=$(cat <<'PEOF'
+<｜begin▁of▁sentence｜>// twoSum returns the indices of the two numbers in nums that add up to target.
+func twoSum(nums []int, target int) []int {
+PEOF
+)
+fi
 SEED=${SEED:-1}
 # 第三十二波: 设备限制更新 —— 两台都是 12G (总 24G)。worker 杀线 8→12、硬预算 8000→12000;
 # 多出的 ~4G 给 worker 侧 source cache (128→2048) 和 worker backbone mlock (切片 23 层 ~4.7GiB)。
@@ -255,9 +152,11 @@ MOE_OVERLAP_PASSES=${MOE_OVERLAP_PASSES:-2}
 # 30 t/s 有效目标的核心). 改模型输出=质量赌注, **默认 0/0=OFF=bit-exact**. A/B: MOE_THIN_TOPK=2(留前2)
 # 或 MOE_THIN_ALPHA=0.5(弃 weight<0.5*top1). 经 IO_ENV 透传两机. 必过质量门 q1..q4 + --logprob-vectors.
 MOE_THIN_ALPHA=${MOE_THIN_ALPHA:-0}
-# 第七十三波: bare-round 降激活进基线 (code-edit-heavy 5.26→5.40, +2.7%, 实测保留)。TOPK=4 + MAX_TOKENS=1
-# = 只瘦 n=1 bare round, verify 批 bit-exact。A/B 回退: MOE_THIN_TOPK=0。质量门待过 (q1..q4 + --logprob-vectors)。
-MOE_THIN_TOPK=${MOE_THIN_TOPK:-4}
+# 第七十三波曾把 TOPK=4 设为默认 (code-edit-heavy 5.26→5.40, +2.7%; 质量门始终未过)。
+# 2026-07-06 实锤回滚: 单变量 A/B 证明 TOPK=4 对默认 mono (go1b/go2b 严格 1/2-bit 专家)
+# = 已判死路的"数量裁专家"→ 逐字正确 twoSum 变乱码。引擎侧现已对 go 类型硬拒 thinning,
+# 但脚本默认也回 0 (质量赌注永远显式 opt-in): q2 测速 A/B 用 MOE_THIN_TOPK=4。
+MOE_THIN_TOPK=${MOE_THIN_TOPK:-0}
 # 第六十八波 prefill-only 门: 只砍 >=N token 的 prefill 批, 跳过 <=64 verify 批 + 单 token decode
 # → 保 copy-spec 逐字复现(decode 不退), 只吃 prefill IO 增益。1=砍所有(wave66 行为); 128=prefill-only。
 MOE_THIN_MIN_TOKENS=${MOE_THIN_MIN_TOKENS:-1}
@@ -311,32 +210,14 @@ EXPERT_FETCH_PORT=${EXPERT_FETCH_PORT:-$((PORT+7))}
 # A/B 回退: EXPERT_EVENT_DRAIN=0。
 EXPERT_EVENT_DRAIN=${EXPERT_EVENT_DRAIN:-1}
 # ---- project.md §3.5 PC.1: 零成本复制式投机 (prompt-lookup drafting) ----
-# 单 token decode 已到 ~2.1 t/s 地板 (两机 drain GPU 计算 ~175ms/token 不可再藏), M2 ≥3 必须
-# 一次前向产出多个 token。drafter 不是模型: 在 transcript 上找尾部 NGRAM-gram 的最近一次
-# 早先出现, 直接"抄"其后续 ≤DRAFT-1 个 token 当草稿, 连同目标 argmax 一并经既有 VERIFY 批
-# (mtp.md Phase 1 协议原样复用) 一次验证; 接受前缀提交, 尾部跨机 KV 回滚。
-# 匹配失败 = 不发 Round 2, 零开销退化为普通 decode; 正确性纯由目标 argmax 把关 (greedy-only,
-# 脚本本就 --temp 0)。零草稿内存/算力, 不占 worker 一字节 (仅 worker 端 spec_logits ~8MiB)。
-# 验证批 K token 的专家并集天然去重 ⇒ IO 按 round 摊薄 (W2 墙下投机的正确打开方式)。
-# 第十九波教训 (1.82): 固定 3-gram 锚 + 固定抄 7 个 = 低精度高赌注 —— 唯一一次 verify
-# (~1.5s, n_active 19-45/层) 7 个抄注全敗只换 1 token。v2 改 SuffixDecoding 式:
-#   - 锚 = 最长公共后缀 (NGRAM 变最小锚长, 默认 4; 锚越长精度越高);
-#   - 自适应抄长: 初始 INIT=3, 全接受翻倍 (≤DRAFT-1), (近)全拒回 INIT; 抄长 <MIN=2 不发批。
-# A/B 回退: COPY_SPEC=0。接受率看 coordinator 日志 dist-mtp 行 (tok/call, verify 次数)。
-COPY_SPEC=${COPY_SPEC:-1}
-# DRAFT=64 (协议上限, 第三十波): 引擎已扩 K≤64 (drafts[64]/spec_logits 64 行/toks[65])。
-# MAX=32 (押注上限, 第三十一波): 第三十波实测 48 注赔钱 —— r2 每 token 成本在 kc≈25
-# 即饱和 (228→216ms/tok, 专家并集去重耗尽), 而抄写源分叉点之后的每个 token 都是纯损
-# (sent=49 只中 29, r2=10.6s; wave29 同样 29 个 token 只花 7.2s)。
-# 自适应抄长 3→6→12→24→32 (全接受翻倍, 顶 MAX)。
-# smoke 档永不触发, 不影响基线。A/B: COPY_SPEC_MAX=63 复第三十波。
-COPY_SPEC_DRAFT=${COPY_SPEC_DRAFT:-64}         # 验证批协议上限 (argmax + ≤DRAFT-1 个抄来的 token)
-COPY_SPEC_MAX=${COPY_SPEC_MAX:-32}             # 自适应押注上限 (经济最优注型, 见上)
-COPY_SPEC_NGRAM=${COPY_SPEC_NGRAM:-4}          # 最小锚长 (最长后缀匹配须 ≥ 此值才信)
-COPY_SPEC_REANCHOR=${COPY_SPEC_REANCHOR:-0}    # 第六十八波: 部分接受重锚草稿长度 (默认 0=旧 ladder, =1 减超额下注)
-# 第六十九波: 重锚阈值门。只在严重分叉 m < n_copy/RATIO 时缩注 (默认 3 = 接受 <1/3 才缩)。RATIO=1 复 wave68
-# 无条件重锚 (实测净亏)。依据: Run-D verify 分解 27% 浪费集中在 2 个 acc=5,6/49 杀手轮, near-full(81%)不该缩。
-COPY_SPEC_REANCHOR_RATIO=${COPY_SPEC_REANCHOR_RATIO:-3}
+# 引擎内建常开, 无 enable 开关 (ds4_distributed.c §PC.1): drafter 是 transcript 上的 n-gram
+# 匹配器 (零草稿内存/算力), 复用既有 VERIFY 批 + accept_len 回滚协议, 每个接受 token 由带
+# 惩罚 argmax 把关 (bit-exact, greedy-only)。锚长/押注梯/上限已按 wave 19/31/36 校准定型为
+# 引擎常量 DIST_CS_*: NGRAM=4, MIN=2, INIT=3, GROWTH=4, MAX=32, DRAFT_K=64。
+# 唯一保留的 env 是诊断开关 DS4_COPY_SPEC_LOG (每次 verify 打一行 anchor/sent/accepted;
+# 下方"投机摘要"段落 grep 依赖它)。
+COPY_SPEC_LOG=${COPY_SPEC_LOG:-1}
+COPY_SPEC_ENV="DS4_COPY_SPEC_LOG=$COPY_SPEC_LOG"
 # 第六十九波: 默认改 1。spec-pipe 跨轮重叠 (coord 在 worker 算 N 时预算 N+1 局部) 一直是对的, 之前被
 # toks[65] 缓冲 bug 锁死 (全接受后无空间放第二轮 → 1/9 fire → 净亏)。缓冲修到 129 后实测 code-edit-heavy
 # decode 4.72→5.07 (+7.4%), bit-exact (accepted=303 不变, greedy 逐行 argmax gate)。A/B 回退: SPEC_PIPE=0。
@@ -344,23 +225,14 @@ SPEC_PIPE=${SPEC_PIPE:-1}
 # 第六十九波 链式: spec-pipe 链深 (默认 4 = N→N+1→…→N+4; 1 = 单次前瞻=已验证 5.07 可回退)。长 verbatim 区
 # 每多链一轮只花 worker 时间 (coord 算被前一轮 worker-wait 藏住), 数据推导 ~1.6× → ~6 t/s。bit-exact。
 SPEC_PIPE_DEPTH=${SPEC_PIPE_DEPTH:-4}
-COPY_SPEC_INIT=${COPY_SPEC_INIT:-3}            # 自适应抄长初始值/重置值
-COPY_SPEC_MIN=${COPY_SPEC_MIN:-2}              # 抄长低于此不发验证批 (赔不起往返)
-# 第三十六波: 全中后增长 ×2→×4。×2 是无帽时代校准的; 32 帽锁死了超注损失 (材料尽头
-# 一次性 ~2.3s), 而爬梯每多一轮中型批就是白付一轮固定成本 (第三十五波 6→12→24 连续
-# 全中 = 两轮 ~2s 可省, ×4 即 3→12→32 直达)。部分接受仍保持、(近)全拒仍回 INIT。
-COPY_SPEC_GROWTH=${COPY_SPEC_GROWTH:-4}        # 全中后抄长乘数 (A/B: =2 复旧梯)
-COPY_SPEC_LOG=${COPY_SPEC_LOG:-1}              # 每次 verify 打一行 anchor/sent/accepted
-COPY_SPEC_ENV=""
-[ "$COPY_SPEC" = 1 ] && COPY_SPEC_ENV="DS4_DIST_COPY_SPEC=1 DS4_DIST_COPY_SPEC_DRAFT=$COPY_SPEC_DRAFT DS4_DIST_COPY_SPEC_MAX=$COPY_SPEC_MAX DS4_DIST_COPY_SPEC_NGRAM=$COPY_SPEC_NGRAM DS4_DIST_COPY_SPEC_INIT=$COPY_SPEC_INIT DS4_DIST_COPY_SPEC_MIN=$COPY_SPEC_MIN DS4_DIST_COPY_SPEC_GROWTH=$COPY_SPEC_GROWTH DS4_DIST_COPY_SPEC_REANCHOR=$COPY_SPEC_REANCHOR DS4_DIST_COPY_SPEC_REANCHOR_RATIO=$COPY_SPEC_REANCHOR_RATIO DS4_DIST_COPY_SPEC_LOG=$COPY_SPEC_LOG"
 # ---- project.md MTP 极限探测 (coordinator-only, 默认全 0 = 当前稳定基线) ----
 # MTP_CARRY_DRAFT=1: 本机 MTP 零额外前向 —— 草稿从上一轮 verify 批的边界 hidden 抽
-#   (1 前向/cycle), 去掉只为产 hidden 的专用 Round-1; 仅 mtp_local (NO_MTP=0 +
+#   (1 前向/cycle), 去掉只为产 hidden 的专用 Round-1; 仅本机 MTP (设 MTP_GGUF,
 #   --mtp-role coordinator) 生效, 默认 0 = 旧 2-round 路径 (A/B 基线)。greedy-only。
 # PIPE_PROFILE=1: 每次跨机前向打一行 coord 本地算 vs 干等 worker 的分段 (定位"分层等待")。
 # MTP_LOG=1: 每 call 打 r1/draft/r2 (2-round) 或 carry verify/bootstrap (carry) 的
 #   forwards/接受账。汇总行 dist-mtp 现额外打 forwards/call 与 tok/fwd (是否净正的判据)。
-MTP_CARRY_DRAFT=${MTP_CARRY_DRAFT:-0}   # 默认关: 只在 NO_MTP=0 探测 MTP 时显式 =1 开 (MTP 本硬件净亏, 不进基线)
+MTP_CARRY_DRAFT=${MTP_CARRY_DRAFT:-0}   # 默认关: 只在设 MTP_GGUF 探测 MTP 时显式 =1 开 (MTP 本硬件净亏, 不进基线)
 PIPE_PROFILE=${PIPE_PROFILE:-0}
 MTP_LOG=${MTP_LOG:-0}
 # 第六十九波: 把远程 VERIFY 批按行切 N 块做两机流水 (coord 算块c+1 与 worker 算块c 重叠), 收回
@@ -569,8 +441,8 @@ if [ "$AUTO_SPLIT" = 1 ] && [ "$SPLIT_PINNED" = 0 ]; then
   }')
   NC=${AUTO%% *}; NW=${AUTO##* }
   SPLIT_COORD="0:$((NC-1))"
-  # NO_MTP=1: worker 必须含 output head (返 logits); NO_MTP=0: output head 在 coord, worker 返 hidden。
-  if [ "$NO_MTP" = 1 ]; then SPLIT_WORKER="$NC:output"; else SPLIT_WORKER="$NC:42"; fi
+  # 未设 MTP_GGUF: worker 必须含 output head (返 logits); 设 MTP_GGUF: output head 在 coord, worker 返 hidden。
+  if [ -z "$MTP_GGUF" ]; then SPLIT_WORKER="$NC:output"; else SPLIT_WORKER="$NC:42"; fi
   # 源缓存层范围跟随 split (否则配在另一台机的层上, 白配)。本机仍跳过 0-2 哈希路由层。
   LOCAL_EXPERT_SOURCE_CACHE_LAYER_END=$((NC-1))
   REMOTE_EXPERT_SOURCE_CACHE_LAYER_START=$NC
@@ -613,7 +485,15 @@ DEBUG_ARGS=""
 EXPERT_OFFLOAD=${EXPERT_OFFLOAD:-}            # 空=AUTO(引擎动态判定); 0=强制常驻; 1=强制 offload
 EXPERT_OFFLOAD_ENV=""
 [ -n "$EXPERT_OFFLOAD" ] && EXPERT_OFFLOAD_ENV="DS4_METAL_EXPERT_OFFLOAD=$EXPERT_OFFLOAD DS4_METAL_EXPERT_OFFLOAD_DIRECT=${EXPERT_OFFLOAD_DIRECT:-0} "
-BASE_RUN_ENV=${BASE_RUN_ENV:-"DS4_DIST_REVERSE_CONNECT=1 DS4_METAL_PREFILL_CHUNK=$PREFILL_CHUNK DS4_DIST_PREFILL_CAP=$DIST_PREFILL_CAP ${EXPERT_OFFLOAD_ENV}DS4_METAL_EXPERT_GATHER_THREADS=$GATHER_THREADS DS4_METAL_NO_MODEL_WARMUP=1 DS4_DIST_SPEC_PIPE=$SPEC_PIPE DS4_DIST_SPEC_PIPE_DEPTH=$SPEC_PIPE_DEPTH DS4_METAL_MOE_MM_ID_MIN=${MM_ID_MIN:-8} DS4_METAL_EXPERT_OFFLOAD_PROFILE=${EXPERT_OFFLOAD_PROFILE:-0} DS4_METAL_EXPERT_PROFILE_CACHE_MB=${EXPERT_PROFILE_CACHE_MB:-1024} DS4_METAL_ROUTER_CACHE_BIAS=${ROUTER_CACHE_BIAS:-0} DS4_METAL_ROUTER_CACHE_DECAY=${ROUTER_CACHE_DECAY:-0.85} DS4_EXPERT_PIN_FILE=${EXPERT_PIN_FILE:-} DS4_EXPERT_PIN_MLOCK_MB=${EXPERT_PIN_MLOCK_MB:-0} DS4_REAP_COLLECT=${REAP_COLLECT:-0} DS4_EXPERT_KEEP_FILE=${EXPERT_KEEP_FILE:-} $IO_ENV $COPY_SPEC_ENV"}
+# 数值安全 env (MATH_SAFE/REPEAT_FREQ/KV_RAW_F32/ROPE_EXP2_LOG2): 只在用户显式设置时下发。
+# 不再硬编码 0 —— 引擎 2026-07-06 起按模型自适应 (model_open 检出 go1b/go2b 严格 1/2-bit
+# 专家即默认全开, 显式 env 仍可覆盖), 硬编码 0 会压掉该默认, 正是 mono 双机乱码根因之二。
+NUMERIC_ENV=""
+[ -n "${DS4_METAL_MATH_SAFE:-}" ]      && NUMERIC_ENV="$NUMERIC_ENV DS4_METAL_MATH_SAFE=$DS4_METAL_MATH_SAFE"
+[ -n "${DS4_REPEAT_FREQ:-}" ]          && NUMERIC_ENV="$NUMERIC_ENV DS4_REPEAT_FREQ=$DS4_REPEAT_FREQ"
+[ -n "${DS4_METAL_KV_RAW_F32:-}" ]     && NUMERIC_ENV="$NUMERIC_ENV DS4_METAL_KV_RAW_F32=$DS4_METAL_KV_RAW_F32"
+[ -n "${DS4_METAL_ROPE_EXP2_LOG2:-}" ] && NUMERIC_ENV="$NUMERIC_ENV DS4_METAL_ROPE_EXP2_LOG2=$DS4_METAL_ROPE_EXP2_LOG2"
+BASE_RUN_ENV=${BASE_RUN_ENV:-"DS4_DIST_REVERSE_CONNECT=1$NUMERIC_ENV DS4_METAL_PREFILL_CHUNK=$PREFILL_CHUNK DS4_DIST_PREFILL_CAP=$DIST_PREFILL_CAP ${EXPERT_OFFLOAD_ENV}DS4_METAL_EXPERT_GATHER_THREADS=$GATHER_THREADS DS4_METAL_NO_MODEL_WARMUP=1 DS4_DIST_SPEC_PIPE=$SPEC_PIPE DS4_DIST_SPEC_PIPE_DEPTH=$SPEC_PIPE_DEPTH DS4_METAL_MOE_MM_ID_MIN=${MM_ID_MIN:-8} DS4_METAL_EXPERT_OFFLOAD_PROFILE=${EXPERT_OFFLOAD_PROFILE:-0} DS4_METAL_EXPERT_PROFILE_CACHE_MB=${EXPERT_PROFILE_CACHE_MB:-1024} DS4_METAL_ROUTER_CACHE_BIAS=${ROUTER_CACHE_BIAS:-0} DS4_METAL_ROUTER_CACHE_DECAY=${ROUTER_CACHE_DECAY:-0.85} DS4_EXPERT_PIN_FILE=${EXPERT_PIN_FILE:-} DS4_EXPERT_PIN_MLOCK_MB=${EXPERT_PIN_MLOCK_MB:-0} DS4_REAP_COLLECT=${REAP_COLLECT:-0} DS4_EXPERT_KEEP_FILE=${EXPERT_KEEP_FILE:-} $IO_ENV $COPY_SPEC_ENV"}
 # 远程专家字节服务: coordinator (本机) 当客户端拉 worker 盘; worker 当服务端。
 # 第三十波反向 efetch 改 accept 模式 (EXPERT_REMOTE_FETCH_REVERSE=1, 默认开):
 #   目的不变 (二十六波): verify 批的 worker 半程 (~2.3s, 23 层×~270MiB 冷读) 期间
@@ -646,8 +526,9 @@ cleanup(){
   echo
   log "cleanup: 杀两边 ds4 进程 (只杀进程, 不删任何文件)"
   [ -n "$COORD_PID" ] && kill "$COORD_PID" 2>/dev/null || true
+  [ -n "${COORD_TAIL_PID:-}" ] && kill "$COORD_TAIL_PID" 2>/dev/null || true
   ssh "$REMOTE" "pid=\$(cat '$WORKER_PID_FILE' 2>/dev/null); [ -n \"\$pid\" ] && kill \"\$pid\" 2>/dev/null || true; pkill -f 'ds4 -m' 2>/dev/null || true" 2>/dev/null || true
-  pkill -f 'ds4 -m' 2>/dev/null || true
+  pkill -f 'ds4 -m' 2>/dev/null; pkill -f 'ds4 --role' 2>/dev/null || true
   log "done."
 }
 trap cleanup INT TERM EXIT
@@ -676,8 +557,9 @@ over(){ awk "BEGIN{a=$1+0;b=$2+0;exit !(a>b)}"; }
 
 # ---------------- 0. 前置检查 ----------------
 [ -f "$LOCAL_DIR/$MODEL" ] || { log "本机缺模型 $MODEL"; exit 1; }
-[ "$NO_MTP" = 1 ] || ssh "$REMOTE" "[ -f '$REMOTE_DIR/$MTP_GGUF' ]" 2>/dev/null \
-  || { log "M1 缺草稿模型 ${MTP_GGUF}。设 MTP_GGUF=... 覆盖, 或 NO_MTP=1 跳过"; exit 1; }
+# 草稿由 coordinator (本机 M4) 加载 (--mtp-role coordinator), 故查本机而非 M1。
+[ -z "$MTP_GGUF" ] || [ -f "$MTP_GGUF" ] || [ -f "$LOCAL_DIR/$MTP_GGUF" ] \
+  || { log "本机缺草稿模型 ${MTP_GGUF} (draft 由 coordinator/M4 加载)"; exit 1; }
 ssh "$REMOTE" "[ -f '$REMOTE_DIR/$MODEL' ]" 2>/dev/null || { log "M1 缺模型 $MODEL"; exit 1; }
 
 # ---------------- 1. 同步代码 → M1 ----------------
@@ -686,6 +568,8 @@ rsync -a --exclude '.git' --exclude '*.o' --exclude '*.gguf' --exclude 'gguf/' \
   --exclude '*.bin' --exclude 'ds4' --exclude 'ds4-server' --exclude 'ds4-bench' \
   --exclude 'ds4-eval' --exclude 'ds4-agent' --exclude 'e0-pingpong' --exclude 'ds4_test' \
   --exclude 'hf/' --exclude 'benchmarks/' --exclude '*.safetensors' --exclude '*.aria2' \
+  --exclude 'cap_*/' --exclude 'zdump*/' --exclude 'sel_spool*/' --exclude 'quant_spool/' \
+  --exclude '*.npy' --exclude 'go-onebit/corpus/raw/' \
   "$LOCAL_DIR"/ "$REMOTE:$REMOTE_DIR"/ || { log "rsync 失败"; exit 1; }
 
 # ---------------- 2. 两边 clean + build (共享 CORE_OBJS, 必须都重编) ----------------
@@ -701,13 +585,13 @@ ssh "$REMOTE" "cd '$REMOTE_DIR' && $CLEAN_CMD make ds4 >/tmp/mtp_pipe_build_remo
 
 # ---------------- 3. 清旧进程 + 清端口 ----------------
 log "清理两边旧 ds4 进程与 $PORT 端口占用"
-pkill -f 'ds4 -m' 2>/dev/null || true
-ssh "$REMOTE" "pkill -f 'ds4 -m' 2>/dev/null; lsof -nP -iTCP:$PORT -t 2>/dev/null | xargs -r kill -9 2>/dev/null; true" 2>/dev/null || true
+pkill -f 'ds4 -m' 2>/dev/null; pkill -f 'ds4 --role' 2>/dev/null || true
+ssh "$REMOTE" "pkill -f 'ds4 -m' 2>/dev/null; pkill -f 'ds4 --role' 2>/dev/null; lsof -nP -iTCP:$PORT -t 2>/dev/null | xargs -r kill -9 2>/dev/null; true" 2>/dev/null || true
 sleep 1
 
 # ---------------- TP 开关 (默认 0 = 原 layer-pipeline; TP=1 = 张量并行) ----------------
 # TP=1: 两机各载全栈, --tp --tp-layers 替代 --layers; expert split (Phase 3) + 可选 shared split。
-# copy-spec 走 TP leader 的 verify 批 (复用 DS4_DIST_COPY_SPEC)。
+# copy-spec 走 TP leader 的 verify 批 (引擎内建常开, 见上方 PC.1 段)。
 TP=${TP:-0}
 TP_LAYERS=${TP_LAYERS:-43}
 TP_EXPERT_SPLIT=${TP_EXPERT_SPLIT:-1}
@@ -733,9 +617,9 @@ fi
 
 # ---------------- 4. 先起 M1 worker (control listen, 等 coordinator 来拨) ----------------
 log "启动 M1 worker: --listen $WORKER_IP:$PORT --layers $SPLIT_WORKER ${WORKER_MTP_ARGS:-(无 MTP)} (reverse, 只 accept)"
-ssh "$REMOTE" "cd '$REMOTE_DIR' && rm -f '$WORKER_LOG'; \
+ssh "$REMOTE" "cd '$REMOTE_DIR' && pkill -f 'ds4 --role worker' 2>/dev/null; sleep 1; rm -f '$WORKER_LOG'; \
   $REMOTE_RUN_ENV $TP_ENV $WORKER_MTP_ENV DS4_MEM_BUDGET_MB=$REMOTE_BUDGET_MB \
-  nohup ./ds4 -m '$MODEL' --role worker --listen '$WORKER_IP' '$PORT' \
+  nohup ./ds4 -m '$MODEL' ${CORR:+--corr "$CORR"} ${ZCHAIN:+--zchain "$ZCHAIN"} --role worker --listen '$WORKER_IP' '$PORT' \
   $WORKER_ROLE_ARGS $DEBUG_ARGS $WORKER_MTP_ARGS \
   -c '$CTX' --temp 0 --nothink > '$WORKER_LOG' 2>&1 & echo \$! > '$WORKER_PID_FILE'; echo launched" 2>/dev/null
 
@@ -743,7 +627,7 @@ log "等 M1 worker backend 就绪并开始 control listen…"
 wok=0
 for _ in $(seq 1 90); do
   if ssh "$REMOTE" "grep -qE '$WORKER_READY_PAT' '$WORKER_LOG'" 2>/dev/null; then wok=1; break; fi
-  if ssh "$REMOTE" "grep -qiE 'refusing to load|fatal|Address already|invalid|Insufficient Memory' '$WORKER_LOG'" 2>/dev/null; then
+  if ssh "$REMOTE" "grep -qiE 'refusing to load|refusing to start|already running|fatal|Address already|invalid|Insufficient Memory' '$WORKER_LOG'" 2>/dev/null; then
     log "M1 worker 启动失败, 日志尾:"; ssh "$REMOTE" "tail -10 '$WORKER_LOG'"; cleanup; exit 1
   fi
   rg=$(mem_gb_remote); over "$rg" "$REMOTE_MAX_GB" && { log "M1 加载阶段 footprint ${rg}G 超 ${REMOTE_MAX_GB}G → 杀"; cleanup; exit 2; }
@@ -761,24 +645,16 @@ log "源专家 LRU cache: coordinator=${LOCAL_EXPERT_SOURCE_CACHE_MB}MiB layers=
 log "  (首次可能弹 macOS 本地网络授权框 → 点允许)"
 cd "$LOCAL_DIR"
 rm -f "$COORD_LOG" "$COORD_OUT"
-if [ "$REPLAY" = 1 ]; then
-  # REPL 模式: 多回合单行 stdin (前缀 KV 跨回合复用). /quit 收尾让进程自然退出。
-  log "REPLAY 多回合 (REPL, 无 -p): 3 回合 + /quit, 量化 per-turn 增量 prefill TTFT"
-  printf '%s\n' "$REPLAY_TURN_1" "$REPLAY_TURN_2" "$REPLAY_TURN_3" "/quit" | \
-  env $LOCAL_RUN_ENV $TP_ENV $COORD_MTP_ENV $COORD_PROBE_ENV DS4_MEM_BUDGET_MB=$LOCAL_BUDGET_MB \
-    ./ds4 -m "$MODEL" --role coordinator --coordinator "$WORKER_IP" "$PORT" \
-    $COORD_ROLE_ARGS $DEBUG_ARGS $COORD_MTP_ARGS \
-    -c "$CTX" -n "$NPRED" --temp 0 --seed "$SEED" --nothink \
-    > "$COORD_OUT" 2> "$COORD_LOG" &
-  COORD_PID=$!
-else
 env $LOCAL_RUN_ENV $TP_ENV $COORD_MTP_ENV $COORD_PROBE_ENV DS4_MEM_BUDGET_MB=$LOCAL_BUDGET_MB \
-  ./ds4 -m "$MODEL" --role coordinator --coordinator "$WORKER_IP" "$PORT" \
+  ./ds4 -m "$MODEL" ${CORR:+--corr "$CORR"} ${ZCHAIN:+--zchain "$ZCHAIN"} --role coordinator --coordinator "$WORKER_IP" "$PORT" \
   $COORD_ROLE_ARGS $DEBUG_ARGS $COORD_MTP_ARGS \
   -c "$CTX" -n "$NPRED" --temp 0 --seed "$SEED" --nothink \
   -p "$PROMPT" > "$COORD_OUT" 2> "$COORD_LOG" &
 COORD_PID=$!
-fi
+
+# 实时把 coordinator 生成文本(它进了 $COORD_OUT 文件)跟播到控制台 stdout。
+# 生成期间控制台 stdout 只有这一条 token 流; 看门狗进度行改走 stderr(见下)不打架。
+tail -n +1 -f "$COORD_OUT" 2>/dev/null & COORD_TAIL_PID=$!
 
 # ---------------- 6. 看门狗: 等本机 coordinator 一次性生成结束 ----------------
 log "运行中… coordinator(本机) 生成完即退出。(Ctrl+C 两边同杀; 超过${RUN_TIMEOUT_SEC}s、本机>${LOCAL_MAX_GB}G 或 M1>${REMOTE_MAX_GB}G 也同杀)"
@@ -788,7 +664,7 @@ for _ in $(seq 1 "$RUN_TIMEOUT_SEC"); do
   if ! kill -0 "$COORD_PID" 2>/dev/null; then done_flag=1; break; fi
   lg=$(mem_gb_local "$COORD_PID"); rg=$(mem_gb_remote)
   mlabel=$(mem_label)
-  printf "\r[mtp-pipe] %s 本机coord=%sG/%dG  M1worker=%sG/%dG  timeout=%ss    " "$mlabel" "$lg" "$LOCAL_MAX_GB" "$rg" "$REMOTE_MAX_GB" "$RUN_TIMEOUT_SEC"
+  printf "\r[mtp-pipe] %s 本机coord=%sG/%dG  M1worker=%sG/%dG  timeout=%ss    " "$mlabel" "$lg" "$LOCAL_MAX_GB" "$rg" "$REMOTE_MAX_GB" "$RUN_TIMEOUT_SEC" >&2
   over "$lg" "$LOCAL_MAX_GB" && { echo; log "本机 coordinator ${mlabel} ${lg}G 超限 → 两边同杀"; cleanup; exit 2; }
   over "$rg" "$REMOTE_MAX_GB" && { echo; log "M1 worker ${mlabel} ${rg}G 超限 → 两边同杀"; cleanup; exit 2; }
   sleep 1
@@ -799,9 +675,10 @@ if [ "$done_flag" != 1 ] && kill -0 "$COORD_PID" 2>/dev/null; then
   log "运行超过 ${RUN_TIMEOUT_SEC}s → 杀两边 ds4 进程并保留日志摘要"
   kill "$COORD_PID" 2>/dev/null || true
   ssh "$REMOTE" "pid=\$(cat '$WORKER_PID_FILE' 2>/dev/null); [ -n \"\$pid\" ] && kill \"\$pid\" 2>/dev/null || true; pkill -f 'ds4 -m' 2>/dev/null || true" 2>/dev/null || true
-  pkill -f 'ds4 -m' 2>/dev/null || true
+  pkill -f 'ds4 -m' 2>/dev/null; pkill -f 'ds4 --role' 2>/dev/null || true
   wait "$COORD_PID" 2>/dev/null || true
 fi
+[ -n "${COORD_TAIL_PID:-}" ] && kill "$COORD_TAIL_PID" 2>/dev/null || true   # 停实时跟播 tail
 echo
 
 # ---------------- 7. 结果 (在本机 coordinator 日志) ----------------
@@ -815,11 +692,7 @@ else
   log "(stdout 无非空文本行: 本次生成可能全是换行/空白 token；或 coordinator 未完成输出 flush)"
 fi
 echo "----------------------------------------"
-if [ "$REPLAY" = 1 ]; then
-  log "PC.4 逐回合 TTFT (cached=复用前缀, suffix=本回合增量 prefill, TTFT=suffix 墙钟):"
-  grep -iE 'ds4: per-turn:' "$COORD_LOG" | nl -ba -w2 -s'  回合 '
-  echo "  → turn1 冷 prefill (suffix 大); turn2+ 增量 (cached 大/suffix 小/TTFT 低) = 增量 prefill 生效证据"
-elif grep -qiE 'prefill:|generation:|t/s' "$COORD_LOG" 2>/dev/null; then
+if grep -qiE 'prefill:|generation:|t/s' "$COORD_LOG" 2>/dev/null; then
   log "速度 (本机 coordinator):"; grep -iE 'prefill:|generation:|t/s' "$COORD_LOG" | tail -2
 else
   log "未拿到计时行, 本机 coordinator 日志尾:"; tail -12 "$COORD_LOG"
@@ -840,9 +713,7 @@ if ssh "$REMOTE" "grep -qiE 'expert-(profile|pool|source-cache)' '$WORKER_LOG'" 
 fi
 [ "$timeout_flag" = 1 ] && log "(注: 本次达到 ${RUN_TIMEOUT_SEC}s 超时后被脚本杀停，上面是超时日志快照)"
 [ "$timeout_flag" != 1 ] && [ "$done_flag" = 1 ] || [ "$timeout_flag" = 1 ] || log "(注: coordinator 未正常结束, 上面是当前日志快照)"
-# 第二十五波: 按 profile 留档 —— 第二跑不再覆盖第一跑的取证日志 (第二十三/二十四波两次吃亏)。
-cp -f "$COORD_LOG" "/tmp/mtp_pipe_coord.${PROMPT_PROFILE}.log" 2>/dev/null || true
-cp -f "$COORD_OUT" "/tmp/mtp_pipe_coord.${PROMPT_PROFILE}.out" 2>/dev/null || true
-scp -q "$REMOTE:$WORKER_LOG" "/tmp/mtp_pipe_worker.${PROMPT_PROFILE}.log" 2>/dev/null || true
-log "日志留档: /tmp/mtp_pipe_coord.${PROMPT_PROFILE}.log|.out, /tmp/mtp_pipe_worker.${PROMPT_PROFILE}.log"
+# 把 M1 worker 日志拉回本机, 三份取证日志都落本机 /tmp。
+scp -q "$REMOTE:$WORKER_LOG" /tmp/mtp_pipe_worker.log 2>/dev/null || true
+log "日志: $COORD_LOG | $COORD_OUT | /tmp/mtp_pipe_worker.log (worker 已拉回)"
 cleanup

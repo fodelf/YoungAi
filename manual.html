@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DS4 · 部署与使用手册</title>
+<style>
+  :root{
+    --bg:#0b0f14; --panel:#0d1117; --line:#1f2630;
+    --fg:#c9d1d9; --dim:#8b949e; --acc:#4ade80; --warn:#f87171; --amber:#fbbf24;
+    --mono:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--fg);font:15px/1.7 -apple-system,"PingFang SC","Helvetica Neue",system-ui,sans-serif;
+       -webkit-font-smoothing:antialiased}
+  .wrap{max-width:880px;margin:0 auto;padding:0 24px 96px}
+  a{color:var(--acc);text-decoration:none}
+  a:hover{text-decoration:underline}
+  code,pre,kbd{font-family:var(--mono)}
+  code{font-size:13px;color:#a5d6ff;background:#151b23;border:1px solid var(--line);border-radius:4px;padding:1px 6px}
+  pre{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px 16px;
+      overflow-x:auto;font-size:13px;line-height:1.75;margin:14px 0}
+  pre code{background:none;border:none;padding:0;color:#c9d1d9}
+  pre .p{color:var(--acc);user-select:none}
+  pre .c{color:#586674}
+  pre .o{color:#8b949e}
+
+  header{padding:56px 0 28px;border-bottom:1px solid var(--line)}
+  .logo{font-family:var(--mono);font-size:26px;font-weight:700;letter-spacing:.5px}
+  .logo em{color:var(--acc);font-style:normal}
+  .tag{color:var(--dim);margin-top:6px}
+  .chips{margin-top:16px;display:flex;flex-wrap:wrap;gap:8px}
+  .chips span{font-family:var(--mono);font-size:11.5px;color:var(--dim);
+              border:1px solid var(--line);border-radius:99px;padding:2px 10px}
+
+  nav{position:sticky;top:0;background:rgba(11,15,20,.92);backdrop-filter:blur(6px);
+      border-bottom:1px solid var(--line);z-index:9}
+  nav .wrap{display:flex;flex-wrap:wrap;gap:2px 18px;padding:10px 24px}
+  nav a{font-family:var(--mono);font-size:12px;color:var(--dim)}
+  nav a:hover{color:var(--acc);text-decoration:none}
+
+  section{padding-top:44px}
+  h2{font-size:19px;margin-bottom:14px;display:flex;align-items:baseline;gap:12px}
+  h2 .n{font-family:var(--mono);font-size:12px;color:var(--acc)}
+  h3{font-size:15px;margin:22px 0 8px;color:#e6edf3}
+  p{margin:8px 0;color:var(--fg)}
+  .muted{color:var(--dim)}
+  ul{margin:8px 0 8px 20px}
+  li{margin:4px 0}
+
+  table{width:100%;border-collapse:collapse;margin:14px 0;font-size:13.5px}
+  th{font-family:var(--mono);font-size:11px;text-transform:uppercase;letter-spacing:.08em;
+     color:var(--dim);text-align:left;font-weight:600}
+  th,td{border-bottom:1px solid var(--line);padding:8px 12px 8px 0;vertical-align:top}
+  td code{white-space:nowrap}
+  .tbl{overflow-x:auto}
+
+  .rule{border-left:2px solid var(--warn);padding:2px 0 2px 16px;margin:10px 0}
+  .rule b{color:var(--warn)}
+  .note{border-left:2px solid var(--amber);padding:2px 0 2px 16px;margin:10px 0;color:var(--dim)}
+  .ok{color:var(--acc)}
+
+  footer{margin-top:72px;border-top:1px solid var(--line);padding-top:18px;
+         font-family:var(--mono);font-size:12px;color:var(--dim)}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <div class="logo">ds4 <em>·</em> DwarfStar</div>
+    <div class="tag">DeepSeek V4 Flash 专用本地推理引擎 —— 自含实现，不依赖 GGML。加载、tokenizer、DSML 渲染、KV cache、图调度、HTTP 服务、原生 coding agent 全部原生。</div>
+    <div class="chips">
+      <span>C99</span><span>Metal · macOS 主力</span><span>CUDA · Linux</span>
+      <span>mmap 零拷贝加载</span><span>压缩 KV 磁盘缓存</span><span>双机 layer-split</span>
+    </div>
+  </div>
+</header>
+
+<nav><div class="wrap">
+  <a href="#deploy">01 部署</a>
+  <a href="#run">02 运行</a>
+  <a href="#server">03 Server API</a>
+  <a href="#cc">04 接入 Claude Code</a>
+  <a href="#dist">05 双机分布式</a>
+  <a href="#env">06 调优旋钮</a>
+  <a href="#test">07 验证</a>
+  <a href="#debug">08 调试</a>
+  <a href="#redline">09 硬约束</a>
+</div></nav>
+
+<div class="wrap">
+
+<section id="deploy">
+  <h2><span class="n">01</span>部署</h2>
+  <p>单一手写 <code>Makefile</code>，无 CMake/configure。产物直接落在仓库根目录。</p>
+  <pre><code><span class="p">$</span> make                        <span class="c"># macOS: ds4 / ds4-server / ds4-bench / ds4-eval / ds4-agent (Metal)</span>
+<span class="p">$</span> make cuda-spark             <span class="c"># Linux: DGX Spark / GB10</span>
+<span class="p">$</span> make cuda-generic           <span class="c"># Linux: 本机 GPU (CUDA_ARCH=native)</span>
+<span class="p">$</span> make cuda CUDA_ARCH=sm_120  <span class="c"># Linux: 指定 nvcc arch</span>
+<span class="p">$</span> make cpu                    <span class="c"># CPU 参考/调试构建 (-DDS4_NO_GPU)</span></code></pre>
+  <p class="muted">Linux 上裸 <code>make</code> 只打印目标列表，必须显式选 <code>cuda-*</code> / <code>cpu</code>。CPU 路径仅作参考与诊断，不是生产路径。</p>
+
+  <h3>取模型</h3>
+  <pre><code><span class="p">$</span> ./download_model.sh q2-imatrix   <span class="c"># 下载至 ./gguf/，并把 ./ds4flash.gguf 软链过去</span></code></pre>
+  <p><code>./ds4flash.gguf</code> 是所有二进制的默认模型；用 <code>-m gguf/&lt;file&gt;</code> 覆盖。仅支持本项目发布的 DeepSeek V4 非对称量化 GGUF（routed expert IQ2_XXS/Q2_K，其余高精度）。</p>
+</section>
+
+<section id="run">
+  <h2><span class="n">02</span>运行</h2>
+  <div class="tbl"><table>
+    <tr><th>二进制</th><th>用途</th></tr>
+    <tr><td><code>ds4</code></td><td>CLI。<code>-p "..."</code> 一次性问答；不带 <code>-p</code> 进交互 REPL。<code>--metal / --cuda / --cpu</code> 强制后端；从别处启动加 <code>--chdir /path/to/ds4</code> 以解析 <code>metal/*.metal</code>。</td></tr>
+    <tr><td><code>ds4-server</code></td><td>OpenAI / Anthropic / Responses 三协议 HTTP 服务，单图 worker 串行推理。</td></tr>
+    <tr><td><code>ds4-agent</code></td><td>进程内原生 coding agent，会话即磁盘 KV（<code>~/.ds4/kvcache</code>）。会话命令：<code>/list /switch &lt;sha&gt; /save /del /strip</code>。</td></tr>
+    <tr><td><code>ds4-bench</code></td><td>上下文前沿处的瞬时 prefill/decode t/s（非全程均值）。</td></tr>
+    <tr><td><code>ds4-eval</code></td><td>内置 92 题能力面测评。</td></tr>
+  </table></div>
+  <pre><code><span class="p">$</span> ./ds4 -p "Explain Redis streams"
+<span class="p">$</span> ./ds4-server --port 8013 --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192</code></pre>
+</section>
+
+<section id="server">
+  <h2><span class="n">03</span>Server API</h2>
+  <p>端点：<code>/v1/chat/completions</code>（OpenAI）· <code>/v1/messages</code>（Anthropic）· <code>/v1/responses</code>（Responses）。流式均支持。</p>
+  <pre><code><span class="p">$</span> curl -s http://127.0.0.1:8013/v1/messages -H 'content-type: application/json' -d '{
+    "model":"deepseek-chat","max_tokens":256,"temperature":0,
+    "messages":[{"role":"user","content":"Write a Go function that reverses a slice."}]}'</code></pre>
+  <ul>
+    <li><b>磁盘 KV 缓存是续聊机制。</b>渲染前缀 sha1 → <code>&lt;sha&gt;.kv</code>，跨会话/重启复用 prefill；内存里只保留一个活体 checkpoint。</li>
+    <li><b>工具调用字节稳定。</b>server 维护 exact-DSML 重放表（tool id → 采样原字节），无状态客户端重发 JSON 也能与活体 KV 逐字节对齐；工具语法段强制 <code>temperature=0</code>。</li>
+    <li>请求级 <code>frequency_penalty / presence_penalty</code> 按 OpenAI 语义解析，只作用于生成区。</li>
+  </ul>
+</section>
+
+<section id="cc">
+  <h2><span class="n">04</span>接入 Claude Code</h2>
+  <p>把 server 当 Anthropic 端点用，零改客户端：</p>
+  <pre><code><span class="p">$</span> ANTHROPIC_BASE_URL=http://127.0.0.1:8013 \
+  ANTHROPIC_API_KEY=svc ANTHROPIC_MODEL=deepseek-chat \
+  NO_PROXY='*' API_TIMEOUT_MS=3600000 \
+  claude -p "修掉 pkg/util 里的竞态" --model deepseek-chat</code></pre>
+  <p class="muted">双机栈下等价快捷方式：<code>tools/svc.sh claude '任务'</code>。长会话受益于磁盘 KV：系统提示词早位变异会自动回卷到分叉点（live-lcp），不整段重灌。</p>
+</section>
+
+<section id="dist">
+  <h2><span class="n">05</span>双机分布式</h2>
+  <p>模型按 transformer 层切片跨机运行：coordinator 持 tokenizer/采样 + 前段层，worker 持后段层，自定 TCP 二进制协议流水。prefill 流水线加速；decode 每 token 一跳跨机。</p>
+  <pre><code><span class="c"># worker（先起，监听）</span>
+<span class="p">$</span> ./ds4 -m model.gguf --role worker --listen 192.168.1.2 5599 --layers 20:output -c 65536 --temp 0
+<span class="c"># coordinator</span>
+<span class="p">$</span> ./ds4-server -m model.gguf --role coordinator --coordinator 192.168.1.2 5599 \
+    --layers 0:19 -c 65536 --port 8013</code></pre>
+  <p>worker 出站受限时给两侧加 <code>DS4_DIST_REVERSE_CONNECT=1</code>（coordinator 反向连入）。</p>
+
+  <h3>tools/svc.sh —— 常驻栈服务管理</h3>
+  <pre><code><span class="p">$</span> CS_CAP=6 PIPE_CHUNK=2 MODEL=gguf/&lt;model&gt;.gguf tools/svc.sh up   <span class="c"># 拉起两侧 + 12G 看门狗</span>
+<span class="p">$</span> tools/svc.sh status              <span class="c"># 两侧 pid / RSS</span>
+<span class="p">$</span> tools/svc.sh probe '提示词' 64    <span class="c"># 单针探测</span>
+<span class="p">$</span> tools/svc.sh claude '任务'        <span class="c"># 直连 Claude Code</span>
+<span class="p">$</span> tools/svc.sh down                <span class="c"># 只杀进程，不动文件</span></code></pre>
+  <ul>
+    <li>幂等：已常驻则跳过；server 与看门狗均以独立进程组运行，宿主 shell 清理不连带。</li>
+    <li>看门狗 <code>tools/svc_watchdog.sh</code>：任一侧 RSS 超 12&nbsp;GiB，双侧同杀。</li>
+    <li><code>CS_CAP=6 PIPE_CHUNK=2</code> 为实测冠军配置（copy-speculation 批长封顶 + verify 批跨机分块流水；fresh +34%，edit +63%）。</li>
+  </ul>
+</section>
+
+<section id="env">
+  <h2><span class="n">06</span>调优旋钮</h2>
+  <p class="muted">全部 env 均围绕单一 release 路径的诊断/调优开关，默认值即当前稳定基线；不设不改即最优起点。</p>
+  <div class="tbl"><table>
+    <tr><th>变量</th><th>作用</th></tr>
+    <tr><td><code>DS4_MEM_BUDGET_MB</code></td><td>内存预算闸。启动时驻留规划超预算即拒绝，运行时配合看门狗。</td></tr>
+    <tr><td><code>DS4_DIST_CS_LEN_CAP</code></td><td>copy-speculation 单批草稿长度上限。稀疏 MoE 下 verify 行不去重专家，长批净亏；甜点 4–8。</td></tr>
+    <tr><td><code>DS4_DIST_PIPE_CHUNK</code></td><td>verify 批按行分块跨机流水，隐藏一跳延迟。</td></tr>
+    <tr><td><code>DS4_METAL_PREFILL_CHUNK</code></td><td>prefill 分块大小（默认 2048）。</td></tr>
+    <tr><td><code>DS4_METAL_EXPERT_PREAD</code></td><td>routed expert 走单拷贝直读（绕 mmap 缺页 + memcpy）。</td></tr>
+    <tr><td><code>DS4_LOOP_ESC / DS4_LOOP_HARD_K / DS4_LOOP_BREAK</code></td><td>生成区重复退化分级惩罚：第 k 轮重复罚 ESC·(k−1)，到 HARD_K 轮硬禁；<code>BREAK=0</code> 总关。合法有限重复可穿透，退化环被掐。</td></tr>
+    <tr><td><code>DS4_MTP_SPEC_DISABLE</code></td><td>关闭 MTP/投机路径（诊断用）。</td></tr>
+  </table></div>
+</section>
+
+<section id="test">
+  <h2><span class="n">07</span>验证</h2>
+  <pre><code><span class="p">$</span> make test                        <span class="c"># extractor 自检 + ds4_test 全套</span>
+<span class="p">$</span> ./ds4_test --server              <span class="c"># API 解析 / DSML 渲染 / 流式 / KV 记账（最快烟测）</span>
+<span class="p">$</span> ./ds4_test --logprob-vectors     <span class="c"># 对官方向量，抓 tokenizer/attention/logit 漂移</span>
+<span class="p">$</span> ./ds4_test --penalty-unit        <span class="c"># 采样惩罚语义（模型无关）</span>
+<span class="p">$</span> ./ds4_test --metal-kernels       <span class="c"># Metal kernel 数值单测</span>
+<span class="p">$</span> ./ds4-eval -m ds4flash.gguf --plain --questions 4 --tokens 2048 --temp 0 --seed 1
+                                   <span class="c"># 确定性 q1..q4 生成漂移闸（期望 token 数见 README）</span></code></pre>
+  <p class="muted">动推理代码前先读 <code>CONTRIBUTING.md</code>：正确性与速度两条回归轨道都要过。速度用 <code>ds4-bench</code> 测上下文前沿瞬时值，不看全程均值。</p>
+</section>
+
+<section id="debug">
+  <h2><span class="n">08</span>调试</h2>
+  <pre><code><span class="p">$</span> ./ds4 --dump-tokens -p "..."                          <span class="c"># 只分词（含 DS4 specials）</span>
+<span class="p">$</span> ./ds4 --dump-logprobs /tmp/out.json --temp 0 -p "..." <span class="c"># 贪心续写 + top-k 备选</span>
+<span class="p">$</span> ./ds4-server --trace /tmp/ds4-trace.txt ...           <span class="c"># 渲染提示词 / 缓存决策 / 工具事件</span></code></pre>
+</section>
+
+<section id="redline">
+  <h2><span class="n">09</span>硬约束</h2>
+  <div class="rule"><b>macOS 禁大跑 CPU 路径。</b>CPU 推理在 macOS 上可触发内核崩溃（OS VM bug）；CPU 仅限小规模参考/诊断。</div>
+  <div class="rule"><b>单实例锁是有意为之。</b>不并发跑多个巨模型进程；同一台 16G 机器绝不双载 80G 级底模。</div>
+  <div class="rule"><b>双机 12 GiB 红线。</b>两侧 RSS 上限 12&nbsp;GiB，看门狗越线双杀；任何加载模型的脚本必须先过内存账。</div>
+  <div class="note">加载保持 mmap-backed，永不整模型急拷贝；别再给 mmap 模型加显式 RAM 专家缓存/mlock 钉扎 —— OS page cache 已用 LRU 把内存吃满，抢它净变慢（两次实测判决）。</div>
+</section>
+
+<footer>
+  ds4 · DwarfStar &nbsp;—&nbsp; 详情见 README.md · MODEL_CARD.md · CONTRIBUTING.md &nbsp;·&nbsp; 双机现役配置见 project.md / fable5.md
+</footer>
+
+</div>
+</body>
+</html>

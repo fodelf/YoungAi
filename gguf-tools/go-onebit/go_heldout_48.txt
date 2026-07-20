@@ -1,0 +1,10 @@
+func ParseComplex(s string, bitSize int) (complex128, error) {
+	size := 64
+	if bitSize == 64 {
+		size = 32 // complex64 uses float32 parts
+	}
+
+	// Remove parentheses, if any.
+	if len(s) >= 2 && s[0] == '(' && s[len(s)-1] == ')' {
+		s = s[1 : len(s)-1]
+	}

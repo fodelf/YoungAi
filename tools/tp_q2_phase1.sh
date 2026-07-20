@@ -33,36 +33,8 @@ PORT=${PORT:-5599}
 MODEL=${MODEL:-ds4flash.gguf}                  # 81GiB q2 symlink (两机都要有)
 CTX=${CTX:-1024}
 NPRED=${NPRED:-200}
-# PROMPT_PROFILE=smoke (短问答, copy-spec 不触发) | code-edit (回显型, 触发 copy-spec verify 批)
-PROMPT_PROFILE=${PROMPT_PROFILE:-smoke}
-if [ "$PROMPT_PROFILE" = "code-edit" ]; then
-  PROMPT=$(cat <<'CEOF'
-下面是一个 Python 函数，请原样输出这段代码，只在 def clean_items 那一行下面加一行 docstring """清洗字符串列表。"""，其余每一行和格式完全不变，不要任何解释：
-
-def clean_items(items):
-    seen = set()
-    out = []
-    for it in items:
-        if it is None:
-            continue
-        s = it.strip().lower()
-        if not s:
-            continue
-        if s in seen:
-            continue
-        seen.add(s)
-        out.append(s)
-    return out
-
-def process_file(path):
-    with open(path) as f:
-        lines = f.readlines()
-    return clean_items(lines)
-CEOF
-)
-else
-  PROMPT=${PROMPT:-Explain what a hash table is in one paragraph.}
-fi
+# 短问答默认 (copy-spec 不触发); 回显/编辑型负载想触发 copy-spec verify 批, 自定义 PROMPT。
+PROMPT=${PROMPT:-Explain what a hash table is in one paragraph.}
 TP_LAYERS=${TP_LAYERS:-2}                       # Phase 1: 仅前 2 层做 split + all-reduce
 SHARED_SPLIT=${SHARED_SPLIT:-1}                 # 1=Phase 1 split; 0=skeleton 全量重组 baseline
 
@@ -82,13 +54,13 @@ AR_LOG=${AR_LOG:-1}                             # wave-72 debug: 逐步诊断/�
 EXPERT_SPLIT=${EXPERT_SPLIT:-0}                  # Phase 3: 每机只 gather 半数 routed 专家 (halve IO); 默认 OFF=skeleton
 EXPERT_IO_PROFILE=${EXPERT_IO_PROFILE:-0}        # 开 = 每 routed-MoE 调用打 ds4-io 分解 (看 gather 是否halve)
 # IO_OPT=1: 叠加 mtp_pipe 已验证的 metal 层 IO 优化 (与 TP 正交)。默认 0 保 A/B 干净。
-COPY_SPEC=${COPY_SPEC:-0}                        # copy-spec in TP decode (verify batch); 需 code-edit prompt 才触发
+# copy-spec 已是引擎天然默认 (TP leader verify 批; miss 零成本自动退化 bare round), 无开关。
 IO_OPT=${IO_OPT:-0}
 IO_OPT_ENV=""
 if [ "$IO_OPT" = 1 ]; then
   IO_OPT_ENV="DS4_METAL_MOE_OVERLAP=1 DS4_METAL_MOE_OVERLAP_PASSES=2 DS4_METAL_EXPERT_SORT_IDS=1 DS4_METAL_EXPERT_FULL_LAYER_STREAM=1 DS4_METAL_EXPERT_PREFETCH_AHEAD=1 DS4_METAL_EXPERT_PREFETCH_TOP=8 DS4_METAL_EXPERT_PREFETCH_DEPTH=1 DS4_METAL_EXPERT_EVENT_DRAIN=1"
 fi
-TP_RUN_ENV=${TP_RUN_ENV:-"DS4_TP_REVERSE_CONNECT=1 DS4_METAL_EXPERT_OFFLOAD=1 DS4_METAL_EXPERT_OFFLOAD_DIRECT=0 DS4_METAL_EXPERT_PREAD=1 DS4_METAL_EXPERT_GATHER_THREADS=$GATHER_THREADS DS4_METAL_NO_MODEL_WARMUP=1 DS4_TP_SHARED_SPLIT=$SHARED_SPLIT DS4_TP_EXPERT_SPLIT=$EXPERT_SPLIT DS4_METAL_EXPERT_IO_PROFILE=$EXPERT_IO_PROFILE DS4_TP_AR_LOG=$AR_LOG DS4_DIST_COPY_SPEC=$COPY_SPEC $IO_OPT_ENV"}
+TP_RUN_ENV=${TP_RUN_ENV:-"DS4_TP_REVERSE_CONNECT=1 DS4_METAL_EXPERT_OFFLOAD=1 DS4_METAL_EXPERT_OFFLOAD_DIRECT=0 DS4_METAL_EXPERT_PREAD=1 DS4_METAL_EXPERT_GATHER_THREADS=$GATHER_THREADS DS4_METAL_NO_MODEL_WARMUP=1 DS4_TP_SHARED_SPLIT=$SHARED_SPLIT DS4_TP_EXPERT_SPLIT=$EXPERT_SPLIT DS4_METAL_EXPERT_IO_PROFILE=$EXPERT_IO_PROFILE DS4_TP_AR_LOG=$AR_LOG $IO_OPT_ENV"}
 
 LEADER_LOG=/tmp/tp_q2_leader.log
 FOLLOWER_LOG=/tmp/tp_q2_follower.log

@@ -1,3 +1,31 @@
 deepseek4-quantize
+emit_z
 quality-testing/score_official
 quality-testing/data/
+go-onebit/corpus/raw/
+go-onebit/corpus/build/
+go-onebit/corpus/books/
+go-onebit/corpus/method/
+
+# 2026-07-16 四支柱采集数据(gh 抓取, 可再生, 勿入库)
+go-onebit/corpus/skills/
+go-onebit/corpus/dsml/
+go-onebit/corpus/code/
+go-onebit/corpus/raw/
+# 中间校准锚 + 热表(脚本从满档锚再生, 过程产物)
+go-onebit/corpus/calib_v2*.txt
+go-onebit/corpus/hot_*.txt
+# 编译产物(测试二进制/工具二进制)
+go-onebit/.build/
+/emit_residual
+/calib_run
+/calib_diag
+# 编译二进制(无扩展名 Mach-O) + 大数据(勿入库)
+go-onebit/corr_stats
+go-onebit/lut_cov
+go-onebit/merge_residual
+go-onebit/emit_residual
+go-onebit/*.dat
+go-onebit/gocorpus_big.txt
+/traj_analyze
+/validate_fwd

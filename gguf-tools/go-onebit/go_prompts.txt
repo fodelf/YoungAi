@@ -1,0 +1,5 @@
+用 Go 写函数 Add(a, b int) int 返回两数之和
+用 Go 写函数 Reverse(s string) string 返回字符串反转
+用 Go 写函数 Max(nums []int) int 返回切片中的最大值
+用 Go 写函数 IsEven(n int) bool 判断整数是否为偶数
+用 Go 写函数 Sum(nums []int) int 返回切片所有元素之和

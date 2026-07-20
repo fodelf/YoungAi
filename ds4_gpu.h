@@ -654,6 +654,75 @@ int ds4_gpu_add_tensor(
         const ds4_gpu_tensor *b,
         uint32_t                n);
 
+/* go1b "hidden variable z^L" four-loss correction (resident sidecar tensors).
+ *
+ * ds4_gpu_corr_router_bias adds the per-expert router-logit bias delta[e] to the
+ * raw router logits (pre softplus/sqrt) BEFORE top-k selection, broadcast across
+ * all n_tokens rows: logits[t][e] += delta[e]. Apply to score-routed layers only.
+ *
+ * ds4_gpu_corr_apply adds the per-selected-expert correction to the already-summed
+ * routed-MoE output, in place:  out[t][d] += sum over selected e of
+ *   ( U @ ( C[e] (.*) (V @ x[t]) ) )[d] + b[d] + beta[e].
+ * x is the per-token FFN input fed to the experts (post-RMSNorm activation).
+ * U is [d_model][d_l] row-major, V is [d_l][d_model] row-major, C is [n_expert][d_l]
+ * row-major, b is [d_model], beta is [n_expert]; selected is [n_tokens][n_expert_used]
+ * (original 0..n_expert-1 ids). One threadgroup per token; vx is recomputed per token. */
+int ds4_gpu_corr_router_bias(
+        ds4_gpu_tensor       *logits,
+        const ds4_gpu_tensor *delta,
+        uint32_t                n_expert,
+        uint32_t                n_tokens);
+
+int ds4_gpu_corr_apply(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *U,
+        const ds4_gpu_tensor *V,
+        const ds4_gpu_tensor *C,
+        const ds4_gpu_tensor *b,
+        const ds4_gpu_tensor *beta,
+        const ds4_gpu_tensor *selected,
+        uint32_t                d_model,
+        uint32_t                d_l,
+        uint32_t                n_expert,
+        uint32_t                n_expert_used,
+        uint32_t                n_tokens);
+
+/* Store variant of corr_apply: writes the raw correction term into delta_out
+ * (delta_out[t][d] = corr term) instead of accumulating into routed_out. The
+ * decode shared-down HC fusion then adds routed[d]+delta[d] — the same fadd
+ * the in-place kernel performed, so results are bit-identical, while the tiny
+ * corr dispatch stops write-hazarding the hot routed_out buffer (a measured
+ * ~23ms/layer full-pipeline bubble on Metal). Only used when
+ * ds4_gpu_corr_delta_supported() returns nonzero AND the fused shared-down
+ * consumer runs (single-host decode default); every other path keeps the
+ * in-place kernel. */
+int ds4_gpu_corr_apply_delta(
+        ds4_gpu_tensor       *delta_out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *U,
+        const ds4_gpu_tensor *V,
+        const ds4_gpu_tensor *C,
+        const ds4_gpu_tensor *b,
+        const ds4_gpu_tensor *beta,
+        const ds4_gpu_tensor *selected,
+        uint32_t                d_model,
+        uint32_t                d_l,
+        uint32_t                n_expert,
+        uint32_t                n_expert_used,
+        uint32_t                n_tokens);
+
+int ds4_gpu_corr_delta_supported(void);
+
+/* go1b corr needs the ORIGINAL top-k expert ids, but the offload MoE remaps the
+ * selected buffer to compact slots IN PLACE (ds4_gpu_remap_selected_to_slots)
+ * before the corr reads it.  ds4_gpu_routed_moe_batch_tensor snapshots the
+ * pre-remap ids into a persistent Shared buffer whenever it runs the go1b path;
+ * the corr indexes C[e]/beta[e] from this copy instead of the corrupted buffer.
+ * Returns NULL until the first go1b MoE call snapshots (callers fall back to the
+ * live selected tensor). Layout matches selected: [n_tokens][n_expert_used]. */
+ds4_gpu_tensor *ds4_gpu_corr_saved_selected(void);
+
 int ds4_gpu_directional_steering_project_tensor(
         ds4_gpu_tensor       *x,
         const ds4_gpu_tensor *directions,
@@ -719,12 +788,35 @@ int ds4_gpu_router_select_batch_tensor(
         uint32_t                n_tokens,
         uint32_t                layer);
 
+/* Optional 1-bit residual expert weights (go1b) for the routed MoE: a second 1-bit
+ * layer Q1(W-Q1(W)) summed into each expert matmul. NULL/gate=NULL => no residual.
+ * The buffers are RESIDENT GPU copies of the _res go1b tensors (a wrapped mmap view
+ * of an offload model reads as ZEROS on the GPU, so the residual MUST be resident,
+ * exactly like the corr sidecar). Strides/dims reuse the base expert args. */
+typedef struct {
+    /* CPU pointers to the go1b residual expert weights (sidecar mmap). The decode
+     * path CPU-gathers the active experts into a compacted scratch (like the base
+     * offload gather), then runs the go1b mm_id mapped-tile matmul over them. */
+    const void *gate_ptr;   /* blk.L.ffn_gate_exps_res weights (K experts if sparse) */
+    const void *up_ptr;     /* blk.L.ffn_up_exps_res weights */
+    const void *down_ptr;   /* blk.L.ffn_down_exps_res weights */
+    /* Sparse residual: lut[expert_id] = slot in [0,K) or -1 (no residual for that
+     * expert). NULL => dense (gate_ptr indexed directly by expert id, K=256). */
+    const float *lut;
+    /* Nonzero when the sidecar tensors are go2b (type 41: offline-merged
+     * base+residual, exact 4-level sum). The metal batch path then routes hot
+     * picks through a single go2b matmul pass and masks them out of the base
+     * pass, instead of the legacy base+residual add (3 extra matmuls/layer). */
+    int merged2b;
+} ds4_gpu_residual_set;
+
 int ds4_gpu_routed_moe_one_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,
         ds4_gpu_tensor       *mid,
         ds4_gpu_tensor       *experts,
+        const ds4_gpu_residual_set *residual,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                gate_offset,
@@ -753,6 +845,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         ds4_gpu_tensor       *up,
         ds4_gpu_tensor       *mid,
         ds4_gpu_tensor       *experts,
+        const ds4_gpu_residual_set *residual,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                gate_offset,
@@ -881,6 +974,9 @@ int ds4_gpu_hc_expand_add_split_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
+/* corr_delta (nullable): when non-NULL the kernel consumes routed[d]+delta[d]
+ * — the go1b corr store-variant output — with the exact fadd the in-place corr
+ * kernel used, keeping results bit-identical without a routed_out write hazard. */
 int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
         ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *shared_out,
@@ -893,6 +989,7 @@ int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
         const ds4_gpu_tensor *routed_out,
         const ds4_gpu_tensor *residual_hc,
         const ds4_gpu_tensor *split,
+        const ds4_gpu_tensor *corr_delta,
         uint32_t                n_embd,
         uint32_t                n_hc);
 
@@ -909,5 +1006,60 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc);
+
+/* go-onebit DQZ2 zchain (multiplicative correction chain; math contract in
+ * ds4_zchain.h). ds4_gpu_zchain_set() uploads the whole packed table once at
+ * load into small resident buffers:
+ *   ops       [n_ops_total][16] f32, layer-major. Slot layout per op:
+ *             [0]=type (1 GL | 2 dyn2 | 3 dyn8 | 4 TREF), [1]=g or t,
+ *             [2..5]=w2p, [6..14]=w8, [15]=dyn8 V8 block index (-1 = none).
+ *   layer_off [n_layer+1] op range per layer (ops[layer_off[l]..layer_off[l+1]))
+ *   v8        concatenated fp16 [n_v8_blocks][8][d_model] dyn8 projections
+ *   ge        [n_layer][n_expert] f32 router-weight gains (1.0-filled rows for
+ *             layers without GE)
+ *   ge_present[n_layer] flags so no-GE layers skip the dispatch entirely.
+ *
+ * ds4_gpu_zchain_ge_apply(): weights[t][k] *= ge[layer][selected[t][k]] --
+ * BEFORE the routed matvec and before any compact-slot remap (original ids).
+ * ds4_gpu_zchain_scale_routed(): routed[t][:] *= λ_layer(x[t]) with λ folded
+ * in-kernel over the layer's ops (feature reductions on x per token) -- AFTER
+ * the routed accumulate (and any TP all-reduce), BEFORE the additive corr.
+ * Both return 1 on success (including the layer-has-nothing fast path). */
+int ds4_gpu_zchain_set(
+        const float        *ops,
+        const uint32_t     *layer_off,
+        const uint16_t     *v8,
+        const float        *ge,
+        const uint8_t      *ge_present,
+        uint32_t             n_layer,
+        uint32_t             n_expert,
+        uint32_t             d_model,
+        uint32_t             n_ops_total,
+        uint32_t             n_v8_blocks);
+
+int ds4_gpu_zchain_ge_apply(
+        ds4_gpu_tensor       *weights,
+        const ds4_gpu_tensor *selected,
+        uint32_t                layer,
+        uint32_t                n_expert_used,
+        uint32_t                n_tokens);
+
+int ds4_gpu_zchain_scale_routed(
+        ds4_gpu_tensor       *routed,
+        const ds4_gpu_tensor *x,
+        uint32_t                layer,
+        uint32_t                n_tokens);
+
+/* frozen z^L (type 6, 2026-07-14): upload packed fp16 factors (concat of
+ * z[k]|U[d*k]|V[d*k] per zl layer) + per-layer {offset-in-halves, rank, trust
+ * factor}. The scale_routed dispatch applies it after the λ scale. k[l]==0 for
+ * every layer (or n_layer==0) = nothing to do, returns 1. */
+int ds4_gpu_zchain_zl_set(
+        const uint16_t *zlm,
+        const uint32_t *off,
+        const uint32_t *k,
+        const float    *tr,
+        uint32_t         n_layer,
+        uint64_t         total_halves);
 
 #endif

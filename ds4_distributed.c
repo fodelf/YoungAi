@@ -518,6 +518,12 @@ struct ds4_dist_session {
     int      spec_pipe_toks[64];    /* the predicted batch tokens precomputed */
     float   *spec_pipe_hidden;      /* n_tokens*hc precomputed local hidden (owned) */
     uint32_t spec_pipe_hidden_cap;  /* bytes allocated for spec_pipe_hidden */
+    /* Scratch logits row for the penalized speculative accept gates (vocab
+     * floats, lazily allocated; session is process-lifetime like the fields
+     * above). The gate must see the SAME penalized pick the plain sampler
+     * would make, but on a copy: the caller-visible row stays raw because the
+     * sampler re-applies its own penalty at the same window. */
+    float   *spec_pen;
 };
 
 static uint32_t dist_env_u32_clamped(const char *name, uint32_t defv, uint32_t minv, uint32_t maxv);
@@ -576,82 +582,74 @@ static void dist_mtp_record_disabled(ds4_dist_session *d) {
  * transcript ("copy what the context already said"). Zero draft memory, zero
  * draft compute, no MTP weights needed; only the existing VERIFY batch +
  * accept_len rollback protocol is reused. Greedy-only like the MTP path.
- * ========================================================================= */
-static bool dist_copy_spec_enabled(void) {
-    return dist_env_enabled("DS4_DIST_COPY_SPEC");
-}
-
-static uint32_t dist_copy_spec_draft_k(void) {
-    /* Total verify batch size (drafts[0]=target argmax + copied tail). */
-    return dist_env_u32_clamped("DS4_DIST_COPY_SPEC_DRAFT", 8, 2, 64);
-}
-
-static uint32_t dist_copy_spec_ngram(void) {
+ *
+ * Always armed -- no enable flag. It is the natural default drafter for
+ * greedy distributed decode: self-tuning (adaptive bet ladder), a no-op on
+ * text with no transcript repeat (a miss never issues a verify batch), and
+ * lossless (every accepted row is gated by the penalized argmax the plain
+ * sampler would produce, via ds4_session_anticycle_prep). An explicitly
+ * configured MTP drafter takes the drafting job instead -- copy-spec only
+ * owns the no-drafter domain. The lengths below are the calibrated values
+ * (waves 19/31/36); DS4_COPY_SPEC_LOG is the one remaining diagnostic. */
+enum {
     /* MINIMUM anchor length: the longest common suffix shared with an earlier
      * position must be at least this long before we trust its continuation.
      * Wave-19 lesson: a fixed 3-gram anchor fired once on the smoke prompt and
      * its whole copied tail was rejected (one ~1.5s verify batch bought one
-     * token, -10%% end to end). Precision over recall. */
-    return dist_env_u32_clamped("DS4_DIST_COPY_SPEC_NGRAM", 4, 1, 16);
-}
-
-/* Wave 31: cap the adaptive bet. r2 per-token cost saturates by ~kc=25
- * (228ms/tok at 25 vs 216 at 49 -- the expert union stops deduplicating), so
- * doubling past ~32 buys almost no amortization while every token past the
- * copy-source divergence point is pure loss (measured: the 48-bet paid
- * r2(49)=10.6s for the same 29 tokens the 32-bet got for 7.2s). */
-static uint32_t dist_copy_spec_max_len(void) {
-    return dist_env_u32_clamped("DS4_DIST_COPY_SPEC_MAX", 32, 1, 63);
-}
-
-static uint32_t dist_copy_spec_init_len(void) {
-    /* Initial / reset copied-draft length (adaptive: doubles on success). */
-    return dist_env_u32_clamped("DS4_DIST_COPY_SPEC_INIT", 3, 1, 63);
-}
-
-/* Wave 36: ladder growth factor on a fully-accepted copied tail. x2 was
- * calibrated for an uncapped ladder; with the 32 cap (wave 31) the worst
- * overbet is bounded (~2.3s once per copy-source end), while every ramp
- * round the ladder spends below the cap is a measurably wasted round
- * (wave-35 run: 6->12->24 full accepts = two mid-size rounds, ~2s, that a
- * x4 ladder 3->12->32 skips). */
-static uint32_t dist_copy_spec_growth(void) {
-    return dist_env_u32_clamped("DS4_DIST_COPY_SPEC_GROWTH", 4, 2, 8);
-}
-
-static uint32_t dist_copy_spec_min_copy(void) {
+     * token, -10% end to end). Precision over recall. */
+    DIST_CS_NGRAM = 4,
     /* Don't issue a verify batch for fewer copied tokens than this: with the
      * batch costing ~2-3x a single forward, a 1-token copy cannot break even
      * (the argmax freebie alone never pays for the round). */
-    return dist_env_u32_clamped("DS4_DIST_COPY_SPEC_MIN", 2, 1, 63);
+    DIST_CS_MIN_COPY = 2,
+    /* Initial / reset copied-draft length (adaptive: grows on full accepts). */
+    DIST_CS_INIT = 3,
+    /* Wave 36: ladder growth factor on a fully-accepted copied tail. With the
+     * 32 cap (below) the worst overbet is bounded, while every ramp round the
+     * ladder spends below the cap is a measurably wasted round (wave-35 run:
+     * x2's 6->12->24 full accepts = two mid-size rounds, ~2s, that x4's
+     * 3->12->32 skips). */
+    DIST_CS_GROWTH = 4,
+    /* Wave 31: cap the adaptive bet. r2 per-token cost saturates by ~kc=25
+     * (228ms/tok at 25 vs 216 at 49 -- the expert union stops deduplicating),
+     * so growing past ~32 buys almost no amortization while every token past
+     * the copy-source divergence point is pure loss (measured: the 48-bet paid
+     * r2(49)=10.6s for the same 29 tokens the 32-bet got for 7.2s). */
+    DIST_CS_MAX = 32,
+    /* Verify-batch protocol cap: drafts[64]/spec_logits 64 rows/toks[65]. */
+    DIST_CS_DRAFT_K = 64,
+    /* Minimum anchor for reference-corpus (knowledge-MTP) proposals. The
+     * fused protocol has no pre-batch free gate (row 0 of the verify batch is
+     * the first check), so a wrong idiom costs one small verify round --
+     * demand a longer anchor than the transcript matcher's 4 (precision over
+     * recall, the wave-19 lesson). */
+    DIST_CS_REF_NGRAM = 6,
+};
+
+/* Shared diagnostic switch with the single-machine copy-spec path (ds4.c). */
+static bool dist_copy_spec_log(void) {
+    return dist_env_enabled("DS4_COPY_SPEC_LOG");
 }
 
-/* wave 68: on a PARTIAL copy accept (1 < m < n_copy) the copy source diverged at
- * m.  The legacy ladder only grows (m==n_copy) or resets (m<=1), so a partial
- * accept leaves copy_spec_len at its stale (possibly maxed) value -- the next
- * short match then re-overbets at that length.  Measured on code-edit-heavy:
- * repeated `sent=49 accepted=5` rounds that pay ~49 tokens of two-machine
- * forward compute to keep 5 (the dominant 4.84->8.5 inefficiency, since each
- * over-drafted row costs the full backbone+attention per-token wall).  When
- * enabled, re-anchor the next draft length to the observed accepted run so the
- * bet tracks the real divergence pattern.  BIT-EXACT: only the draft *length*
- * changes; the verify batch still gates every token by exact argmax.  Default
- * OFF so the legacy ladder (4.84 baseline) stays byte-reproducible. */
-static int dist_copy_spec_reanchor(void) {
-    return dist_env_enabled("DS4_DIST_COPY_SPEC_REANCHOR");
-}
+static int dist_logits_argmax(const float *logits, int n_vocab);
 
-/* wave 69: the wave-68 unconditional re-anchor was net-negative because it fired
- * on EVERY partial accept, including near-full rounds (measured code-edit-heavy:
- * acc=39/48, acc=51/63 ~81% accepted) where the copy source is essentially still
- * continuing -- shrinking those forces needless ramp-up rounds (each paying the
- * fixed 2-machine serial hop) that ate the savings.  The real waste is
- * concentrated in SEVERE divergences (acc=5,6 of 49 ~12%): re-anchor pays off
- * only there.  Gate it: re-anchor iff m*ratio < n_copy (default ratio 3 => only
- * when <1/3 of the bet was accepted).  ratio<=1 reproduces the wave-68
- * unconditional behaviour for A/B. */
-static uint32_t dist_copy_spec_reanchor_ratio(void) {
-    return dist_env_u32_clamped("DS4_DIST_COPY_SPEC_REANCHOR_RATIO", 3, 1, 64);
+/* The penalized greedy pick the plain sampler would make at
+ * [checkpoint + extra[0..n_extra)]: replay the exact repeat/anticycle penalty
+ * (ds4_session_anticycle_prep) on the session scratch row and take its argmax.
+ * The input row is NOT modified -- a boundary row handed back to the caller
+ * must stay raw, since the sampler re-applies its own penalty at the same
+ * window (an in-place prep would double-apply the frequency penalty). This is
+ * what keeps every speculative accept byte-identical to plain penalized
+ * greedy decode (a banned continuation simply stops matching). On scratch OOM
+ * the raw argmax still yields a correct (unpenalized-gate) decode. */
+static int dist_spec_penalized_argmax(ds4_dist_session *d, ds4_session *owner,
+                                      const float *row, int vocab,
+                                      const int *extra, uint32_t n_extra) {
+    if (!d->spec_pen) d->spec_pen = malloc((size_t)vocab * sizeof(float));
+    if (!d->spec_pen) return dist_logits_argmax(row, vocab);
+    memcpy(d->spec_pen, row, (size_t)vocab * sizeof(float));
+    ds4_session_anticycle_prep(owner, d->spec_pen, extra, n_extra);
+    return dist_logits_argmax(d->spec_pen, vocab);
 }
 
 /* Wave 68+ speculative layer-pipeline overlap gate (see ds4_dist_session struct
@@ -763,8 +761,9 @@ static void dist_mtp_record_enabled(
 
     const bool force = dist_env_enabled("DS4_DIST_MTP_FORCE");
     /* PC.1 copy speculation never pays for a miss (no Round 2 on miss), so the
-     * MTP adaptive backoff would only print noise; skip it in copy mode. */
-    if (!force && !dist_copy_spec_enabled()) {
+     * MTP adaptive backoff would only print noise; it applies only when an MTP
+     * drafter is actually configured (i.e. not in copy mode). */
+    if (!force && (d->state.mtp_draft || d->state.mtp_draft_local)) {
         const uint32_t after = dist_env_u32_clamped("DS4_DIST_MTP_ADAPT_AFTER", 8, 1, 1000000);
         if (d->mtp_window_calls >= after) {
             const uint64_t accept_per_1000 =
@@ -4778,7 +4777,17 @@ static int dist_run_coordinator_generation(
     const int eos = ds4_token_eos(state->engine);
     ds4_tokens transcript = {0};
     ds4_tokens_copy(&transcript, &prompt);
+    /* 生成区边界: prefill 刚落完 prompt, 在本地会话上钉住 —— 会话侧惩罚窗从此
+     * 只数生成区(本循环的惩罚由下面的显式调用承担, 不走会话采样器)。 */
+    ds4_session_mark_generation_start(session);
     while (generated < max_tokens) {
+        /* transcript = prompt+已生成: 每步采样前对生成区 [prompt.len, len) 就地
+         * 施加与单机采样器相同的 repeat/anticycle 惩罚(logits 每步被 eval_span
+         * 重写, 就地改写安全)。此前这条明文 dist 路径直接采 RAW logits, 长生成
+         * 漂移/复读(双机 "1.1 1.2 1.3 ..." 退化)。 */
+        ds4_repeat_penalize_tokens(logits, transcript.v,
+                                   (uint32_t)transcript.len,
+                                   (uint32_t)prompt.len);
         int token = ds4_sample_logits(logits,
                                       ds4_engine_vocab_size(state->engine),
                                       gen->temperature,
@@ -4824,6 +4833,9 @@ static int dist_run_coordinator_generation(
                 dist_route_plan_free(&plan);
                 return 1;
             }
+            /* rebuild 重放了含已生成 token 的 transcript, 会话 checkpoint 尾已
+             * 越过生成起点 —— 显式恢复边界到 prompt 长度。 */
+            ds4_session_set_generation_start(session, prompt.len);
         }
     }
     fputc('\n', stdout);
@@ -6359,9 +6371,13 @@ int ds4_dist_session_sync(
         }
 
         uint32_t pos = pos0;
+        if (dist_env_enabled("DS4_DIST_SPAN_TIMING"))
+            fprintf(stderr, "ds4: [span-timing] sync suffix=%u pos0=%u chunk_cap=%u (non-pipelined batch path)\n",
+                    suffix, pos0, chunk_cap);
         while (pos < (uint32_t)prompt->len) {
             const uint32_t remaining = (uint32_t)prompt->len - pos;
             const uint32_t chunk = remaining < chunk_cap ? remaining : chunk_cap;
+            const double span_t0 = dist_env_enabled("DS4_DIST_SPAN_TIMING") ? dist_now_sec() : 0.0;
             int eval_rc = dist_coordinator_eval_span(&d->state,
                                                      owner,
                                                      &d->plan,
@@ -6375,6 +6391,10 @@ int ds4_dist_session_sync(
                                                      NULL,
                                                      err,
                                                      errlen);
+            if (dist_env_enabled("DS4_DIST_SPAN_TIMING"))
+                fprintf(stderr, "ds4: [span-timing] eval_span n=%u took %.2fs (%.2f t/s)\n",
+                        chunk, dist_now_sec() - span_t0,
+                        (dist_now_sec() - span_t0) > 0 ? chunk / (dist_now_sec() - span_t0) : 0.0);
             if (eval_rc != 0) {
                 if (dist_coordinator_rebuild_from_transcript(&d->state,
                                                              owner,
@@ -6569,19 +6589,39 @@ int ds4_dist_session_eval_speculative(
         return -1;
     }
     d->mtp_calls++;
-    /* PC.1 copy speculation: no MTP head required (the drafter is an n-gram
-     * matcher over the transcript); only a remote route for the VERIFY batch.
-     * The MTP adaptive backoff does not apply (a copy miss skips Round 2). */
-    const bool copy_spec = dist_copy_spec_enabled();
     /* 本机 MTP: the drafter runs on the coordinator (worker returns hidden). Like
      * copy-spec it sends a plain Round-1 frame and synthesizes the K drafts
      * locally — but from the MTP head over the worker's hidden, not the n-gram
      * matcher. Shares the same VERIFY batch + accept/rollback as the worker path. */
     const bool mtp_local = d->state.mtp_draft_local;
+    /* PC.1 copy speculation: the natural default drafter (no MTP head required;
+     * the drafter is an n-gram matcher over the transcript, and a miss costs
+     * nothing). An explicitly configured MTP drafter -- worker-side (--mtp on
+     * the worker) or local carry head -- takes the drafting job instead. The
+     * MTP adaptive backoff does not apply here (a copy miss skips Round 2). */
+    /* DS4_DIST_NO_COPY_SPEC=1: diagnostic — force plain single-token decode
+     * (isolates the copy-spec penalty path when A/B-ing dual-host drift). */
+    /* 温度门(ds4_session_spec_greedy_ok): 接受门是(惩罚重放的)argmax, 只有请求
+     * 实际 temperature==0 时才保采样分布 —— temp>0 下 n-gram 命中段会被贪心
+     * 静默接管。前端每请求设门; 缺省 true=旧行为, 门关时落到 plain 单 token。 */
+    const bool copy_spec = !d->state.mtp_draft && !mtp_local
+                           && ds4_session_spec_greedy_ok(owner)
+                           && !dist_env_enabled("DS4_DIST_NO_COPY_SPEC");
+    /* ★顺序修复(2026-07-14)★: spec_ok 判定用 d->plan.count, 但 plan 直到下方
+     * dist_session_ensure_route() 才建 —— 第一次 decode(及每次 generation 翻新后)
+     * plan.count==0 → spec_ok=false → 永远退回逐 token, 投机批从不触发(实测:
+     * code-edit 重抄输入代码但 decode 仍 1.16 t/s, DS4_COPY_SPEC_LOG 零输出)。
+     * ensure_route 幂等(plan_ready && generation 命中即返回), 提到判定前无副作用。 */
+    if (copy_spec || d->state.mtp_draft || mtp_local) {
+        if (dist_session_ensure_route(d, err, errlen) != 0) return -1;
+    }
     /* No drafter configured or no remote worker: plain single-token decode. */
     const bool spec_ok = copy_spec
         ? (d->plan.count != 0)
         : ((d->state.mtp_draft || mtp_local) && d->plan.count != 0 &&
+           /* MTP 同罪同门: 贪心 argmax 接受在 temp>0 下失真; 该门是正确性门,
+            * 不受 DS4_DIST_MTP_FORCE(性能退避豁免)覆盖。 */
+           ds4_session_spec_greedy_ok(owner) &&
            (dist_env_enabled("DS4_DIST_MTP_FORCE") || d->mtp_calls > d->mtp_disable_until_call));
     if (!spec_ok) {
         if (!copy_spec && d->state.mtp_draft && d->plan.count != 0) {
@@ -6597,7 +6637,7 @@ int ds4_dist_session_eval_speculative(
 
     const int vocab = ds4_engine_vocab_size(d->state.engine);
     const uint32_t p = (uint32_t)checkpoint->len;
-    int K = copy_spec ? (int)dist_copy_spec_draft_k()
+    int K = copy_spec ? DIST_CS_DRAFT_K
                       : ds4_engine_mtp_draft_tokens_configured(d->state.engine);
     if (K < 2) {
         /* Drafting one token is no speedup; fall back to plain decode. */
@@ -6609,9 +6649,9 @@ int ds4_dist_session_eval_speculative(
     }
     if (K > 64) K = 64;   /* wave 30: protocol cap = drafts[64]/spec_logits 64 rows/
                            * toks[65]. THE checklist for raising K: this clamp,
-                           * dist_copy_spec_draft_k, INIT/MIN clamps, copied[],
+                           * DIST_CS_DRAFT_K, INIT/MIN clamps, copied[],
                            * verify_tokens[], drafts[], both spec_logits allocs,
-                           * CLI+server toks[], script COPY_SPEC_DRAFT. */
+                           * CLI+server toks[]. */
 
     ds4_tokens transcript = {0};
     ds4_tokens_copy(&transcript, checkpoint);
@@ -6624,12 +6664,9 @@ int ds4_dist_session_eval_speculative(
      * bootstrap forward (== plain decode cost, never the 2-round penalty). Greedy
      * output is identical to the legacy path: acceptance stays exact per-row
      * argmax; the carried draft only seeds candidates, the target argmax gates. */
-    /* copy-spec takes precedence: on code-edit it nails the repeated text with
-     * long zero-cost copies (the 4.14 champion), far beyond what the MTP head
-     * drafts. carry-MTP must not preempt it — it only owns the no-copy domain
-     * (smoke, COPY_SPEC=0). The legacy 2-round mtp_local path below already runs
-     * only after the copy_spec block returns, so this keeps the same invariant. */
-    if (mtp_local && dist_carry_draft_enabled() && !copy_spec) {
+    /* mtp_local implies !copy_spec (an explicit MTP drafter owns the drafting
+     * job); the copy_spec block below is never in play here. */
+    if (mtp_local && dist_carry_draft_enabled()) {
         const uint64_t hc_values = ds4_engine_hidden_f32_values(d->state.engine);
         const uint32_t accept_carried = d->spec_accept_pending ? d->spec_accept_len : 0u;
 
@@ -6700,8 +6737,10 @@ int ds4_dist_session_eval_speculative(
                 accepted[n_acc++] = first_token;
                 uint32_t m = 0;
                 for (uint32_t j = 0; j < tail && n_acc < accepted_cap; j++) {
-                    const int pred = dist_logits_argmax(
-                            vlogits + (size_t)j * (size_t)vocab, vocab);
+                    /* unified anticycle semantics: banned continuation = no match */
+                    const int pred = dist_spec_penalized_argmax(d, owner,
+                            vlogits + (size_t)j * (size_t)vocab, vocab,
+                            toks, j + 1u);
                     if (pred != toks[1u + j]) break;
                     accepted[n_acc++] = toks[1u + j];
                     m++;
@@ -6805,10 +6844,24 @@ int ds4_dist_session_eval_speculative(
         dist_spec_pipe_ctx pctx;
         float   *spec_hidden = NULL;   /* precomputed cycle N+1 local hidden (owned) */
         uint32_t spec_next_kb = 0;     /* predicted N+1 batch size (0 = no precompute) */
-        if (d->copy_spec_len == 0) d->copy_spec_len = dist_copy_spec_init_len();
+        if (d->copy_spec_len == 0) d->copy_spec_len = DIST_CS_INIT;
         uint32_t want = d->copy_spec_len;
         if (want > (uint32_t)(K - 1)) want = (uint32_t)(K - 1);
-        if (want > dist_copy_spec_max_len()) want = dist_copy_spec_max_len();
+        if (want > DIST_CS_MAX) want = DIST_CS_MAX;
+        /* DS4_DIST_CS_LEN_CAP (default DIST_CS_MAX = today's behavior): A/B cap on
+         * the copied-draft length. Probe evidence (2026-07-17, v3p 1-bit offload):
+         * verify-batch cost is ROW-LINEAR (~0.9s/row ~= a full plain forward,
+         * 13-row batch ~= 12s) because at top-6-of-256 sparsity the batch's
+         * expert union barely dedups (13 rows re-read ~87% of a plain forward's
+         * bytes each) -- EcoSpec's MoE union-growth effect at its worst. With
+         * per-row accept p~0.87 the optimal draft is ~4-8 rows, not 32. */
+        {
+            const uint32_t cs_cap = dist_env_u32_clamped("DS4_DIST_CS_LEN_CAP",
+                                                         DIST_CS_MAX,
+                                                         DIST_CS_MIN_COPY,
+                                                         DIST_CS_MAX);
+            if (want > cs_cap) want = cs_cap;
+        }
         if ((uint32_t)accepted_cap - 1u < want) want = (uint32_t)accepted_cap - 1u;
         int copied[63];
         uint32_t n_copy = 0;
@@ -6817,7 +6870,7 @@ int ds4_dist_session_eval_speculative(
         if (first_token != eos_token && want > 0u) {
             anchor = dist_copy_spec_match(transcript.v,
                                           (uint32_t)transcript.len,
-                                          dist_copy_spec_ngram(),
+                                          DIST_CS_NGRAM,
                                           want,
                                           copied,
                                           &n_copy,
@@ -6832,7 +6885,29 @@ int ds4_dist_session_eval_speculative(
             n_copy = (p + 1u < d->state.ctx_size) ? d->state.ctx_size - (p + 1u) : 0u;
         }
         /* Too-short copies cannot pay for a batch round: plain single round. */
-        if (n_copy < dist_copy_spec_min_copy()) n_copy = 0;
+        if (n_copy < DIST_CS_MIN_COPY) n_copy = 0;
+
+        /* knowledge-MTP fallback (ds4_mtp.c reference corpus: built-in Go
+         * idioms + DS4_REF_CORPUS extension files): no transcript repeat ->
+         * suffix-match the context tail against the engine's idiom corpus,
+         * so the language's own boilerplate is drafted the FIRST time it
+         * appears (after that the transcript matcher owns the repeat). No
+         * match => n_copy stays 0 and this is a plain round: 不匹配就直接往下走. */
+        bool ref_src = false;
+        if (n_copy == 0 && first_token != eos_token && want > 0u) {
+            anchor = ds4_engine_ref_match(d->state.engine, transcript.v,
+                                          (uint32_t)transcript.len,
+                                          DIST_CS_REF_NGRAM, want,
+                                          copied, &n_copy);
+            for (uint32_t j = 0; j < n_copy; j++) {
+                if (copied[j] == eos_token) { n_copy = j + 1u; break; }
+            }
+            if (d->state.ctx_size != 0 && p + 1u + n_copy > d->state.ctx_size) {
+                n_copy = (p + 1u < d->state.ctx_size) ? d->state.ctx_size - (p + 1u) : 0u;
+            }
+            if (n_copy < DIST_CS_MIN_COPY) { n_copy = 0; anchor = 0; }
+            ref_src = n_copy > 0;
+        }
 
         int toks[64];
         toks[0] = first_token;
@@ -6854,12 +6929,14 @@ int ds4_dist_session_eval_speculative(
         }
         /* spec-pipe: predict cycle N+1's batch as the copy source continuing past
          * copied[] (the full-accept bet) and arm the overlap cb so its local slice
-         * computes during THIS batch's worker wait.  Off / no-match => no-op. */
-        if (spec_pipe && n_copy > 0u && vlogits) {
+         * computes during THIS batch's worker wait.  Off / no-match => no-op.
+         * Not armed for reference-corpus proposals: copy_src indexes the
+         * TRANSCRIPT there is no transcript source continuing past the idiom. */
+        if (spec_pipe && n_copy > 0u && vlogits && !ref_src) {
             uint32_t next_src = copy_src + n_copy;   /* source pos just past copied[] */
-            uint32_t nwant = d->copy_spec_len * dist_copy_spec_growth();
+            uint32_t nwant = d->copy_spec_len * DIST_CS_GROWTH;
             if (nwant > (uint32_t)(K - 1)) nwant = (uint32_t)(K - 1);
-            if (nwant > dist_copy_spec_max_len()) nwant = dist_copy_spec_max_len();
+            if (nwant > DIST_CS_MAX) nwant = DIST_CS_MAX;
             memset(&pctx, 0, sizeof(pctx));
             uint32_t nkb = 0;
             while (nkb < 1u + nwant && nkb < 64u &&
@@ -6933,8 +7010,14 @@ int ds4_dist_session_eval_speculative(
         if (vlogits) {
             uint32_t m = 0;
             for (uint32_t j = 0; j < n_copy && n_acc < accepted_cap; j++) {
-                const int pred = dist_logits_argmax(
-                        vlogits + (size_t)j * (size_t)vocab, vocab);
+                /* Unified anticycle semantics (same as the carry-MTP accept
+                 * loop): gate by the penalized pick the plain sampler would
+                 * make at [checkpoint + toks[0..j]], so a copied repetition
+                 * run the sampler would break is not accepted raw. This is
+                 * what makes always-armed copy-spec lossless. */
+                const int pred = dist_spec_penalized_argmax(d, owner,
+                        vlogits + (size_t)j * (size_t)vocab, vocab,
+                        toks, j + 1u);
                 if (pred != copied[j]) break;
                 accepted[n_acc++] = copied[j];
                 m++;
@@ -6945,30 +7028,25 @@ int ds4_dist_session_eval_speculative(
                    (size_t)vocab * sizeof(float));
             free(vlogits);
             /* Same ladder as before: full copied tail grows (wave 36: x4,
-             * see dist_copy_spec_growth), dead tail resets (m counts
+             * see DIST_CS_GROWTH), dead tail resets (m counts
              * accepted copies, the old tail_ok). */
             if (m == n_copy) {
-                uint32_t grown = d->copy_spec_len * dist_copy_spec_growth();
+                uint32_t grown = d->copy_spec_len * DIST_CS_GROWTH;
                 if (grown > (uint32_t)(K - 1)) grown = (uint32_t)(K - 1);
-                if (grown > dist_copy_spec_max_len()) grown = dist_copy_spec_max_len();
+                if (grown > DIST_CS_MAX) grown = DIST_CS_MAX;
                 d->copy_spec_len = grown;
             } else if (m <= 1u) {
-                d->copy_spec_len = dist_copy_spec_init_len();
-            } else if (dist_copy_spec_reanchor() &&
-                       (uint64_t)m * dist_copy_spec_reanchor_ratio() < (uint64_t)n_copy) {
-                /* wave 68/69: partial accept with a SEVERE divergence (m < n_copy/ratio)
-                 * — re-anchor next bet to the observed run (m) instead of leaving the
-                 * stale high length to re-overbet.  Near-full partials are left alone
-                 * (wave 69: gating out near-fulls is what makes re-anchor net-positive). */
-                d->copy_spec_len = m;
+                d->copy_spec_len = DIST_CS_INIT;
             }
-            if (dist_env_enabled("DS4_DIST_COPY_SPEC_LOG")) {
+            if (dist_copy_spec_log()) {
                 /* sent/accepted keep the old meaning (batch rows / kept rows);
-                 * r1_ms=0 marks the fused round. */
+                 * r1_ms=0 marks the fused round; src distinguishes transcript
+                 * copies from knowledge-MTP (reference corpus) proposals. */
                 fprintf(stderr,
                         "ds4: copy-spec verify: anchor=%u sent=%u accepted=%u "
-                        "next_len=%u r1_ms=0 r2_ms=%.0f\n",
-                        anchor, kb, (uint32_t)n_acc, d->copy_spec_len, batch_ms);
+                        "next_len=%u r1_ms=0 r2_ms=%.0f src=%s\n",
+                        anchor, kb, (uint32_t)n_acc, d->copy_spec_len, batch_ms,
+                        ref_src ? "ref" : "txt");
             }
             /* spec-pipe second cycle: cycle N fully accepted (m==n_copy) and the
              * overlap precompute is valid (cb ran, prediction holds) -> run cycle
@@ -6977,12 +7055,18 @@ int ds4_dist_session_eval_speculative(
              * prediction holds iff the model's actual next token (argmax of logits,
              * = vlogits[n_copy]) equals the predicted next first token. */
             bool spec_ran = false;
+            /* Chain gate: the boundary prediction must be the PENALIZED pick
+             * (what the sampler will actually choose), not the raw argmax. */
+            const int next_pick = (spec_pipe && spec_hidden)
+                ? dist_spec_penalized_argmax(d, owner, logits, vocab,
+                                             accepted, (uint32_t)n_acc)
+                : -1;
             /* wave 69 diagnostic: log which fire gate blocks spec-pipe (it fired
              * only ~1/9 in earlier runs). Gated by COPY_SPEC_LOG. predmatch is only
              * meaningful when armed (spec_hidden!=NULL, pctx valid). */
-            if (spec_pipe && dist_env_enabled("DS4_DIST_COPY_SPEC_LOG")) {
+            if (spec_pipe && dist_copy_spec_log()) {
                 const int predmatch = (spec_hidden && spec_next_kb >= 2u &&
-                                       pctx.toks[0] == dist_logits_argmax(logits, vocab)) ? 1 : 0;
+                                       pctx.toks[0] == next_pick) ? 1 : 0;
                 fprintf(stderr,
                         "ds4: spec-pipe gate: armed=%d pctx_ok=%d full=%d(m=%u/n=%u) "
                         "next_kb=%u predmatch=%d\n",
@@ -6991,7 +7075,7 @@ int ds4_dist_session_eval_speculative(
             }
             if (spec_pipe && spec_hidden && pctx.ok && m == n_copy &&
                 spec_next_kb >= 2u &&
-                pctx.toks[0] == dist_logits_argmax(logits, vocab) &&
+                pctx.toks[0] == next_pick &&
                 (uint32_t)n_acc + spec_next_kb <= (uint32_t)accepted_cap) {
                 /* wave 69 chain: run cycle N+1 (coord slice precomputed by the main
                  * cb), then keep chaining N+2,N+3... up to depth, each next cycle's
@@ -7015,7 +7099,8 @@ int ds4_dist_session_eval_speculative(
                     uint32_t depth = 0;
                     bool chain_err = false;
                     while (depth < max_depth && cur_hidden && cur.ok && cur_kb >= 2u &&
-                           cur.toks[0] == dist_logits_argmax(logits, vocab) &&
+                           cur.toks[0] == dist_spec_penalized_argmax(d, owner, logits, vocab,
+                                                                     accepted, (uint32_t)n_acc) &&
                            (uint32_t)n_acc + cur_kb <= (uint32_t)accepted_cap) {
                         /* Predict + arm the NEXT cycle so its coord slice overlaps THIS
                          * cycle's worker wait (skipped on the last allowed depth). */
@@ -7030,9 +7115,9 @@ int ds4_dist_session_eval_speculative(
                          * went past chain[0]). */
                         const uint32_t nxt_src = cur_src + cur_kb;
                         if (depth + 1u < max_depth) {
-                            uint32_t nwant = d->copy_spec_len * dist_copy_spec_growth();
+                            uint32_t nwant = d->copy_spec_len * DIST_CS_GROWTH;
                             if (nwant > (uint32_t)(K - 1)) nwant = (uint32_t)(K - 1);
-                            if (nwant > dist_copy_spec_max_len()) nwant = dist_copy_spec_max_len();
+                            if (nwant > DIST_CS_MAX) nwant = DIST_CS_MAX;
                             uint32_t nkb = 0;
                             while (nkb < 1u + nwant && nkb < 64u &&
                                    nxt_src + nkb < (uint32_t)transcript.len) {
@@ -7075,7 +7160,11 @@ int ds4_dist_session_eval_speculative(
                         accepted[n_acc++] = cur.toks[0];   /* validated == argmax(prior logits) */
                         uint32_t m2 = 0;
                         for (uint32_t j = 1; j < cur_kb && n_acc < accepted_cap; j++) {
-                            const int pred = dist_logits_argmax(vc + (size_t)(j - 1) * (size_t)vocab, vocab);
+                            /* same penalized gate as the main accept loop:
+                             * accepted[] holds everything committed so far. */
+                            const int pred = dist_spec_penalized_argmax(d, owner,
+                                    vc + (size_t)(j - 1) * (size_t)vocab, vocab,
+                                    accepted, (uint32_t)n_acc);
                             if (pred != cur.toks[j]) break;
                             accepted[n_acc++] = cur.toks[j];
                             m2++;
@@ -7088,14 +7177,14 @@ int ds4_dist_session_eval_speculative(
                         d->spec_accept_len = 1u + m2;   /* worker rolls THIS (last) cycle next call */
                         const bool full = (m2 == cur_kb - 1u);
                         if (full) {
-                            uint32_t grown = d->copy_spec_len * dist_copy_spec_growth();
+                            uint32_t grown = d->copy_spec_len * DIST_CS_GROWTH;
                             if (grown > (uint32_t)(K - 1)) grown = (uint32_t)(K - 1);
-                            if (grown > dist_copy_spec_max_len()) grown = dist_copy_spec_max_len();
+                            if (grown > DIST_CS_MAX) grown = DIST_CS_MAX;
                             d->copy_spec_len = grown;
                         } else if (m2 <= 1u) {
-                            d->copy_spec_len = dist_copy_spec_init_len();
+                            d->copy_spec_len = DIST_CS_INIT;
                         }
-                        if (dist_env_enabled("DS4_DIST_COPY_SPEC_LOG")) {
+                        if (dist_copy_spec_log()) {
                             fprintf(stderr, "ds4: spec-pipe chain[%u]: sent=%u accepted=%u next_len=%u\n",
                                     depth, cur_kb, 1u + m2, d->copy_spec_len);
                         }
@@ -7153,13 +7242,15 @@ int ds4_dist_session_eval_speculative(
     }
 
     /* ---- Round 1: eval first_token, request K drafts, carry pending rollback.
-     * Copy mode sends a plain frame (no DRAFT flag, drafts come from the local
-     * matcher below) but must still carry accept_len for the worker's deferred
-     * rollback of the previous VERIFY batch. */
+     * (Copy mode never reaches here: the fused single-round block above always
+     * returns. This 2-round path serves the worker-side and local MTP drafters.)
+     * mtp_local sends a plain frame (drafts synthesized locally below) but must
+     * still carry accept_len for the worker's deferred rollback of the previous
+     * VERIFY batch. */
     ds4_dist_spec_io r1;
     memset(&r1, 0, sizeof(r1));
-    r1.extra_flags = (copy_spec || mtp_local) ? 0u : DS4_DIST_WORK_F_DRAFT;
-    r1.draft_cap = (copy_spec || mtp_local) ? 0u : (uint32_t)K;
+    r1.extra_flags = mtp_local ? 0u : DS4_DIST_WORK_F_DRAFT;
+    r1.draft_cap = mtp_local ? 0u : (uint32_t)K;
     r1.accept_len = d->spec_accept_pending ? d->spec_accept_len : 0u;
 
     const double r1_t0 = dist_now_sec();
@@ -7185,51 +7276,6 @@ int ds4_dist_session_eval_speculative(
         dist_mtp_record_enabled(d, 1, 0, false, false);
         ds4_tokens_free(&transcript);
         return 1;
-    }
-
-    /* ---- PC.1 copy mode: synthesize the draft locally by prompt lookup.
-     * drafts[0] = the target's own argmax at p (so the verify precheck below
-     * passes by construction); drafts[1..] = the continuation that followed
-     * the most recent earlier occurrence of the trailing n-gram of
-     * (transcript + next). A miss costs nothing: draft_n stays 0, we return
-     * just first_token and never issue Round 2 (plain-decode behavior). */
-    uint32_t copy_anchor = 0;
-    if (copy_spec) {
-        r1.draft_n = 0;
-        if (d->copy_spec_len == 0) d->copy_spec_len = dist_copy_spec_init_len();
-        const int next = dist_logits_argmax(logits, vocab);
-        if (first_token != eos_token && next != eos_token) {
-            /* Adaptive copy length: one wrong verify batch costs real money
-             * (wave-19: ~1.5s for kc=8), so start small and let success grow
-             * it. The cap is K-1 (drafts[0] is the argmax freebie). */
-            uint32_t want = d->copy_spec_len;
-            if (want > (uint32_t)(K - 1)) want = (uint32_t)(K - 1);
-            if (want > dist_copy_spec_max_len()) want = dist_copy_spec_max_len();
-            ds4_tokens_push(&transcript, next);
-            int copied[63];
-            uint32_t n_copy = 0;
-            copy_anchor = dist_copy_spec_match(transcript.v,
-                                               (uint32_t)transcript.len,
-                                               dist_copy_spec_ngram(),
-                                               want,
-                                               copied,
-                                               &n_copy,
-                                               NULL);
-            transcript.len--;  /* pop `next`: the rebuild fallback below must
-                                * see exactly the committed prefix. */
-            /* Never draft past EOS. */
-            for (uint32_t j = 0; j < n_copy; j++) {
-                if (copied[j] == eos_token) { n_copy = j + 1u; break; }
-            }
-            /* Too-short copies cannot pay for the batch round: skip Round 2. */
-            if (n_copy >= dist_copy_spec_min_copy()) {
-                r1.drafts[0] = (uint32_t)next;
-                for (uint32_t j = 0; j < n_copy; j++) {
-                    r1.drafts[1u + j] = (uint32_t)copied[j];
-                }
-                r1.draft_n = 1u + n_copy;
-            }
-        }
     }
 
     /* ---- 本机 MTP: draft locally from the worker's returned hidden. Round 1's
@@ -7266,8 +7312,10 @@ int ds4_dist_session_eval_speculative(
         return n_accept;
     }
 
-    /* drafts[0] is only worth verifying if the target already predicts it. */
-    if ((int)r1.drafts[0] != dist_logits_argmax(logits, vocab)) {
+    /* drafts[0] is only worth verifying if the target already predicts it
+     * (penalized pick: what the sampler would actually choose at p+1). */
+    if ((int)r1.drafts[0] != dist_spec_penalized_argmax(d, owner, logits, vocab,
+                                                        &first_token, 1u)) {
         dist_mtp_record_enabled(d, (uint32_t)n_accept, r1.draft_n, false, false);
         ds4_tokens_free(&transcript);
         return n_accept;
@@ -7324,11 +7372,14 @@ int ds4_dist_session_eval_speculative(
     }
 
     /* drafts[0] was already target-verified above; extend while the target's
-     * per-row argmax keeps matching the next draft. */
+     * per-row penalized pick keeps matching the next draft (accepted[] holds
+     * everything committed so far, so the gate replays the sampler exactly). */
     uint32_t m = 1;
     accepted[n_accept++] = (int)r1.drafts[0];
     for (uint32_t i = 1; i < kc && n_accept < accepted_cap; i++) {
-        int pred = dist_logits_argmax(vlogits + (size_t)(i - 1u) * (size_t)vocab, vocab);
+        int pred = dist_spec_penalized_argmax(d, owner,
+                vlogits + (size_t)(i - 1u) * (size_t)vocab, vocab,
+                accepted, (uint32_t)n_accept);
         if (pred != (int)r1.drafts[i]) break;
         accepted[n_accept++] = (int)r1.drafts[i];
         m++;
@@ -7338,30 +7389,6 @@ int ds4_dist_session_eval_speculative(
      * caller samples the next first_token from it. */
     memcpy(logits, vlogits + (size_t)(m - 1u) * (size_t)vocab, (size_t)vocab * sizeof(float));
     free(vlogits);
-
-    /* PC.1 adaptation: a fully-accepted copied tail doubles the next copy
-     * length (repetitive span: keep riding it), a (near-)total rejection
-     * resets it to the cheap initial length; partial acceptance keeps it. */
-    if (copy_spec && kc > 1u) {
-        const uint32_t tail_sent = kc - 1u;
-        const uint32_t tail_ok = m - 1u;
-        if (tail_ok == tail_sent) {
-            uint32_t grown = d->copy_spec_len * 2u;
-            if (grown > (uint32_t)(K - 1)) grown = (uint32_t)(K - 1);
-            if (grown > dist_copy_spec_max_len()) grown = dist_copy_spec_max_len();
-            d->copy_spec_len = grown;
-        } else if (tail_ok <= 1u) {
-            d->copy_spec_len = dist_copy_spec_init_len();
-        }
-        if (dist_env_enabled("DS4_DIST_COPY_SPEC_LOG")) {
-            /* r1 = the plain single-token round (baseline unit cost), r2 = the
-             * kc-token verify batch. r2_ms/r1_ms vs accepted is the whole
-             * economics of a round in one line. */
-            fprintf(stderr,
-                    "ds4: copy-spec verify: anchor=%u sent=%u accepted=%u next_len=%u r1_ms=%.0f r2_ms=%.0f\n",
-                    copy_anchor, kc, m, d->copy_spec_len, r1_ms, r2_ms);
-        }
-    }
 
     /* mtp_local per-call economics: this 2-round path pays r1 (draft-source
      * forward) + r2 (verify forward) = 2 forwards/cycle. DS4_DIST_MTP_CARRY_DRAFT
@@ -10590,33 +10617,32 @@ static int dist_run_tp_leader(ds4_engine *engine, const ds4_dist_options *opt,
     rc = 0;
     double t_decode_sum = 0.0;   /* wall-clock spent inside eval during decode */
     int decoded = 0;
-    /* copy-spec (DS4_DIST_COPY_SPEC): draft a verbatim continuation from the
-     * transcript and verify it in one batch (warm, compute-bound) -> accept the
-     * argmax-matching prefix. Orthogonal to Phase 3 (the bare rounds still take the
-     * expert-split single-token path). spec_logits is allocated when this env is
-     * set (see metal graph alloc). Off => pure bare-round decode. */
-    const char *cse = getenv("DS4_DIST_COPY_SPEC");
-    const bool copy_spec = cse && cse[0] && cse[0] != '0';
+    /* copy-spec: draft a verbatim continuation from the transcript and verify
+     * it in one batch (warm, compute-bound) -> accept the argmax-matching
+     * prefix. Always armed (a miss costs nothing and falls through to the bare
+     * round); the gate is the same raw argmax this driver samples with, so the
+     * emitted stream is byte-identical to pure bare-round decode. Orthogonal to
+     * Phase 3 (the bare rounds still take the expert-split single-token path). */
     ds4_tokens transcript = {0};
     ds4_tokens_copy(&transcript, &prompt);
-    float *row_logits = copy_spec ? malloc((size_t)64 * (size_t)vocab * sizeof(float)) : NULL;
-    uint32_t copy_spec_len = dist_copy_spec_init_len();
+    float *row_logits = malloc((size_t)64 * (size_t)vocab * sizeof(float));
+    uint32_t copy_spec_len = DIST_CS_INIT;
     for (int n = 0; n < max_tokens; ) {
         int token = dist_tp_argmax(logits, vocab);
         if (token == eos) break;
         uint32_t n_copy = 0;
         int copied[63];
-        if (copy_spec && row_logits) {
+        if (row_logits) {
             uint32_t src = 0, want = copy_spec_len;
             if (want > 63u) want = 63u;
             ds4_tokens_push(&transcript, token);   /* match the suffix ending at token */
             (void)dist_copy_spec_match(transcript.v, (uint32_t)transcript.len,
-                                       dist_copy_spec_ngram(), want, copied, &n_copy, &src);
+                                       DIST_CS_NGRAM, want, copied, &n_copy, &src);
             transcript.len--;                       /* pop the trial token */
             for (uint32_t j = 0; j < n_copy; j++) if (copied[j] == eos) { n_copy = j + 1u; break; }
             if (gen->ctx_size > 0 && pos + 1u + n_copy > (uint32_t)gen->ctx_size)
                 n_copy = (pos + 1u < (uint32_t)gen->ctx_size) ? (uint32_t)gen->ctx_size - (pos + 1u) : 0u;
-            if (n_copy < dist_copy_spec_min_copy()) n_copy = 0;
+            if (n_copy < DIST_CS_MIN_COPY) n_copy = 0;
         }
         double t_dec0 = dist_now_sec();
         if (n_copy >= 2u) {
@@ -10649,7 +10675,7 @@ static int dist_run_tp_leader(ds4_engine *engine, const ds4_dist_options *opt,
                 ds4_tokens_push(&transcript, accepted[i]);
             }
             copy_spec_len = (m == n_copy) ? (copy_spec_len < 16u ? copy_spec_len * 4u : 63u)
-                                          : (m <= 1u ? dist_copy_spec_init_len() : copy_spec_len);
+                                          : (m <= 1u ? (uint32_t)DIST_CS_INIT : copy_spec_len);
             if (copy_spec_len > 63u) copy_spec_len = 63u;
             pos += (uint32_t)n_acc; decoded += n_acc; n += n_acc;
             if (hit_eos) break;
@@ -10664,7 +10690,7 @@ static int dist_run_tp_leader(ds4_engine *engine, const ds4_dist_options *opt,
                 fprintf(stderr, "\nds4: TP leader: decode failed: %s\n", err); rc = 1; break;
             }
             t_decode_sum += dist_now_sec() - t_dec0;
-            if (copy_spec) ds4_tokens_push(&transcript, token);
+            ds4_tokens_push(&transcript, token);
             pos++; decoded++; n++;
         }
     }

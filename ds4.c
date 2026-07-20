@@ -39,6 +39,11 @@
 
 #include "ds4.h"
 #include "ds4_distributed.h"
+#include "ds4_mtp.h"
+#include "ds4_multimodal.h"
+#include "ds4_zchain.h"
+#include "ds4_spatial.h"
+#include "ds4_css.h"
 
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
@@ -49,6 +54,12 @@
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
+#endif
+
+#ifdef DS4_NO_GPU
+/* ds4_distributed.o is compiled once (no DS4_NO_GPU variant) and calls this
+ * GPU-side helper unconditionally; the CPU build supplies the no-op here. */
+void ds4_gpu_expert_remote_fetch_kick(void) {}
 #endif
 
 #define DS4_NEG_INF (-1.0e30f)
@@ -86,72 +97,8 @@ static bool ds4_backend_uses_graph(ds4_backend backend) {
  * the active profile after GGUF validation.
  */
 
-enum {
-    DS4_MAX_LAYER            = 61,
-    DS4_MAX_EMBD             = 7168,
-    DS4_MAX_VOCAB            = 129280,
-    DS4_MAX_HEAD             = 128,
-    DS4_MAX_HEAD_KV          = 1,
-    DS4_MAX_HEAD_DIM         = 512,
-    DS4_MAX_VALUE_DIM        = 512,
-    DS4_MAX_ROT              = 64,
-    DS4_MAX_OUT_GROUP        = 16,
-    DS4_MAX_LORA_Q           = 1536,
-    DS4_MAX_LORA_O           = 1024,
-    DS4_MAX_EXPERT           = 384,
-    DS4_MAX_EXPERT_USED      = 6,
-    DS4_MAX_EXPERT_SHARED    = 1,
-    DS4_MAX_FF_EXP           = 3072,
-    DS4_MAX_HASH_LAYER       = 3,
-    DS4_MAX_SWA              = 128,
-    DS4_MAX_INDEXER_HEAD     = 64,
-    DS4_MAX_INDEXER_HEAD_DIM = 128,
-    DS4_MAX_INDEXER_TOP_K    = 1024,
-    DS4_MAX_HC               = 4,
-    DS4_MAX_HC_SINKHORN_ITER = 20,
-};
 
-typedef enum {
-    DS4_VARIANT_FLASH = 0,
-    DS4_VARIANT_PRO   = 1,
-} ds4_variant;
-
-typedef struct {
-    const char *name;
-    ds4_variant variant;
-    uint32_t n_layer;
-    uint32_t n_embd;
-    uint32_t n_vocab;
-    uint32_t n_head;
-    uint32_t n_head_kv;
-    uint32_t n_head_dim;
-    uint32_t n_value_dim;
-    uint32_t n_rot;
-    uint32_t n_out_group;
-    uint32_t n_lora_q;
-    uint32_t n_lora_o;
-    uint32_t n_expert;
-    uint32_t n_expert_used;
-    uint32_t n_expert_shared;
-    uint32_t n_ff_exp;
-    uint32_t n_hash_layer;
-    uint32_t n_swa;
-    uint32_t n_indexer_head;
-    uint32_t n_indexer_head_dim;
-    uint32_t n_indexer_top_k;
-    uint32_t n_hc;
-    uint32_t n_hc_sinkhorn_iter;
-    float rms_eps;
-    float hc_eps;
-    float expert_weight_scale;
-    float swiglu_clamp_exp;
-    float rope_freq_base;
-    float rope_scale_factor;
-    float rope_yarn_beta_fast;
-    float rope_yarn_beta_slow;
-    float compress_rope_freq_base;
-    uint64_t rope_orig_ctx;
-} ds4_shape;
+#include "ds4_internal.h"
 
 static const ds4_shape DS4_SHAPE_FLASH = {
     .name = "DeepSeek V4 Flash",
@@ -227,7 +174,7 @@ static const ds4_shape DS4_SHAPE_PRO = {
     .rope_orig_ctx = DS4_DEFAULT_ROPE_ORIG_CTX,
 };
 
-static ds4_shape g_ds4_shape = {
+ds4_shape g_ds4_shape = {
     .name = "DeepSeek V4 Flash",
     .variant = DS4_VARIANT_FLASH,
     .n_layer = 43,
@@ -266,40 +213,6 @@ static ds4_shape g_ds4_shape = {
 
 static uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER] = {0};
 
-#define DS4_MODEL_SHAPE_NAME          (g_ds4_shape.name)
-#define DS4_MODEL_VARIANT             (g_ds4_shape.variant)
-#define DS4_N_LAYER                   (g_ds4_shape.n_layer)
-#define DS4_N_EMBD                    (g_ds4_shape.n_embd)
-#define DS4_N_VOCAB                   (g_ds4_shape.n_vocab)
-#define DS4_N_HEAD                    (g_ds4_shape.n_head)
-#define DS4_N_HEAD_KV                 (g_ds4_shape.n_head_kv)
-#define DS4_N_HEAD_DIM                (g_ds4_shape.n_head_dim)
-#define DS4_N_VALUE_DIM               (g_ds4_shape.n_value_dim)
-#define DS4_N_ROT                     (g_ds4_shape.n_rot)
-#define DS4_N_OUT_GROUP               (g_ds4_shape.n_out_group)
-#define DS4_N_LORA_Q                  (g_ds4_shape.n_lora_q)
-#define DS4_N_LORA_O                  (g_ds4_shape.n_lora_o)
-#define DS4_N_EXPERT                  (g_ds4_shape.n_expert)
-#define DS4_N_EXPERT_USED             (g_ds4_shape.n_expert_used)
-#define DS4_N_EXPERT_SHARED           (g_ds4_shape.n_expert_shared)
-#define DS4_N_FF_EXP                  (g_ds4_shape.n_ff_exp)
-#define DS4_N_HASH_LAYER              (g_ds4_shape.n_hash_layer)
-#define DS4_N_SWA                     (g_ds4_shape.n_swa)
-#define DS4_N_INDEXER_HEAD            (g_ds4_shape.n_indexer_head)
-#define DS4_N_INDEXER_HEAD_DIM        (g_ds4_shape.n_indexer_head_dim)
-#define DS4_N_INDEXER_TOP_K           (g_ds4_shape.n_indexer_top_k)
-#define DS4_N_HC                      (g_ds4_shape.n_hc)
-#define DS4_N_HC_SINKHORN_ITER        (g_ds4_shape.n_hc_sinkhorn_iter)
-#define DS4_RMS_EPS                   (g_ds4_shape.rms_eps)
-#define DS4_HC_EPS                    (g_ds4_shape.hc_eps)
-#define DS4_EXPERT_WEIGHT_SCALE       (g_ds4_shape.expert_weight_scale)
-#define DS4_SWIGLU_CLAMP_EXP          (g_ds4_shape.swiglu_clamp_exp)
-#define DS4_ROPE_FREQ_BASE            (g_ds4_shape.rope_freq_base)
-#define DS4_ROPE_SCALE_FACTOR         (g_ds4_shape.rope_scale_factor)
-#define DS4_ROPE_YARN_BETA_FAST       (g_ds4_shape.rope_yarn_beta_fast)
-#define DS4_ROPE_YARN_BETA_SLOW       (g_ds4_shape.rope_yarn_beta_slow)
-#define DS4_COMPRESS_ROPE_FREQ_BASE   (g_ds4_shape.compress_rope_freq_base)
-#define DS4_ROPE_ORIG_CTX             (g_ds4_shape.rope_orig_ctx)
 
 static int g_ds4_lock_fd = -1;
 
@@ -347,11 +260,32 @@ typedef struct {
     uint16_t qs[QK_K / 8];
 } block_iq2_xxs;
 
+/* go1b: DS4 strict-1-bit routed expert weight.  One fp16 per-row scale d
+ * (replicated into every QK_K block of the row) + QK_K sign bits; element j in
+ * a block is +d when signs[j/8] bit (j%8) is set, else -d.  34 bytes / 256
+ * elements.  Mirrors the metal block_go1b in metal/moe.metal. */
+typedef struct {
+    uint16_t d;
+    uint8_t  signs[QK_K / 8];
+} block_go1b;
+
+/* go2b: offline-merged base+residual strict-binary pair (R5-C). Element value
+ * is the exact 4-level sum (±d1)+(±d2) of the two go1b layers it replaces.
+ * 68 bytes / 256 elements. Mirrors metal block_go2b. */
+typedef struct {
+    uint16_t d1;
+    uint16_t d2;
+    uint8_t  s1[QK_K / 8];
+    uint8_t  s2[QK_K / 8];
+} block_go2b;
+
 #define DS4_STATIC_ASSERT(name, cond) typedef char name[(cond) ? 1 : -1]
 DS4_STATIC_ASSERT(ds4_block_q2_k_size, sizeof(block_q2_K) == 84);
 DS4_STATIC_ASSERT(ds4_block_q4_k_size, sizeof(block_q4_K) == 144);
 DS4_STATIC_ASSERT(ds4_block_q8_k_size, sizeof(block_q8_K) == 292);
 DS4_STATIC_ASSERT(ds4_block_iq2_xxs_size, sizeof(block_iq2_xxs) == 66);
+DS4_STATIC_ASSERT(ds4_block_go1b_size, sizeof(block_go1b) == 34);
+DS4_STATIC_ASSERT(ds4_block_go2b_size, sizeof(block_go2b) == 68);
 
 typedef struct {
     uint32_t ctx_size;
@@ -578,14 +512,6 @@ static inline DS4_MAYBE_UNUSED int32_t dot_q2_16(const uint8_t *q2, const int8_t
  */
 
 #define DS4_GGUF_MAGIC 0x46554747u /* "GGUF", little endian. */
-#define DS4_MAX_DIMS   8
-
-typedef struct {
-    const char *ptr;
-    uint64_t len;
-} ds4_str;
-
-typedef ds4_tokens token_vec;
 
 typedef struct {
     const uint8_t *base;
@@ -594,7 +520,7 @@ typedef struct {
     char error[256];
 } ds4_cursor;
 
-static void ds4_die(const char *msg) {
+void ds4_die(const char *msg) {
     fprintf(stderr, "ds4: %s\n", msg);
     exit(1);
 }
@@ -670,14 +596,14 @@ static void ds4_alloc_guard_check(const char *op, size_t size) {
     exit(1);
 }
 
-static void *xcalloc(size_t n, size_t size) {
+void *xcalloc(size_t n, size_t size) {
     ds4_alloc_guard_check("calloc", n * size);
     void *p = calloc(n, size);
     if (!p) ds4_die("out of memory");
     return p;
 }
 
-static void *xmalloc(size_t size) {
+void *xmalloc(size_t size) {
     ds4_alloc_guard_check("malloc", size);
     void *p = malloc(size);
     if (!p) ds4_die("out of memory");
@@ -728,20 +654,37 @@ static double now_sec(void) {
  * tracks the peak, and _exit()s before crossing 90% of DS4_MEM_BUDGET_MB so the
  * machine never page-thrashes. A constructor self-starts it so the whole
  * process -- including the big model mmap + residency wiring during load -- is
- * covered, without touching any hot path. With neither DS4_MEM_BUDGET_MB nor
- * DS4_PROFILE set it returns after one getenv (no thread) = zero overhead.
+ * covered, without touching any hot path. A default-on system-pressure guard
+ * keeps a lightweight poll thread running for every process (one sysctl / 200ms)
+ * so the machine can never be driven into a kernel-watchdog panic; opt out with
+ * DS4_NO_MEM_PRESSURE_GUARD=1. DS4_MEM_BUDGET_MB adds the phys_footprint ceiling.
  * DS4_PROFILE accumulates load/prefill/decode wall time and, at exit, writes one
  * CSV-ish line to DS4_PROFILE_FILE (or stderr). */
 #if defined(__APPLE__)
 #include <mach/mach.h>
+#include <sys/sysctl.h>
 static uint64_t ds4_phys_footprint_bytes(void) {
     task_vm_info_data_t info;
     mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
     if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &count) != KERN_SUCCESS) return 0;
     return (uint64_t)info.phys_footprint;
 }
+/* System-wide memory-pressure level (kern.memorystatus_vm_pressure_level):
+ * 1=normal, 2=warn, 4=critical. Distinct from phys_footprint above, which is
+ * BLIND to clean file-backed page-cache pages -- the expert-offload path's
+ * MADV_WILLNEED prefetch fills those, and they don't count toward the process
+ * footprint yet DO drive system pressure. Sustained critical pressure starves
+ * watchdogd -> kernel watchdog panic + reboot (observed 2026-07-06: single-host
+ * offload generation on the full mono panicked M4 while footprint read a healthy
+ * 8.2 GiB). Returns 1 (normal) on any read failure so the guard fails safe. */
+static int ds4_system_mem_pressure_level(void) {
+    int level = 1; size_t len = sizeof(level);
+    if (sysctlbyname("kern.memorystatus_vm_pressure_level", &level, &len, NULL, 0) != 0) return 1;
+    return level;
+}
 #else
 static uint64_t ds4_phys_footprint_bytes(void) { return 0; }
+static int ds4_system_mem_pressure_level(void) { return 1; }
 #endif
 
 #define DS4_GIB (1024.0 * 1024.0 * 1024.0)
@@ -830,8 +773,11 @@ static DS4_MAYBE_UNUSED void ds4_profile_add_decode(uint64_t tokens, double sec)
 static void *ds4_mem_watchdog_main(void *arg) {
     (void)arg;
     const int fp_log = getenv("DS4_FOOTPRINT_LOG") != NULL;
+    const int pressure_guard = getenv("DS4_NO_MEM_PRESSURE_GUARD") == NULL;
+    const unsigned interval_ms = fp_log ? 50 : 200;
     uint64_t fp_min = ~0ull, fp_max = 0;
     int fp_n = 0;
+    unsigned crit_ms = 0;   /* consecutive system-CRITICAL accumulator for the pressure guard */
     while (g_mem_watch_run) {
         uint64_t fp = ds4_phys_footprint_bytes();
         if (fp > g_mem_peak_footprint) g_mem_peak_footprint = fp;
@@ -864,7 +810,25 @@ static void *ds4_mem_watchdog_main(void *arg) {
             fflush(stderr);
             _exit(137);
         }
-        usleep(fp_log ? 50000 : 200000);
+        /* Default-on system-pressure guard: abort after ~4s sustained CRITICAL,
+         * well ahead of the ~94s watchdogd-starvation kernel panic. Catches the
+         * offload page-cache blowup that phys_footprint (above) cannot see. Opt
+         * out with DS4_NO_MEM_PRESSURE_GUARD=1. */
+        if (pressure_guard && ds4_system_mem_pressure_level() >= 4 /* critical */) {
+            crit_ms += interval_ms;
+            if (crit_ms >= 4000) {
+                fprintf(stderr,
+                        "\n[ds4-watchdog] system memory pressure CRITICAL for %ums "
+                        "(phys_footprint %.2f GiB) -- aborting to keep the OS watchdog "
+                        "from panicking the machine. Split across hosts or lower --ctx.\n",
+                        crit_ms, (double)fp / DS4_GIB);
+                fflush(stderr);
+                _exit(137);
+            }
+        } else {
+            crit_ms = 0;
+        }
+        usleep(interval_ms * 1000);
     }
     return NULL;
 }
@@ -877,14 +841,20 @@ static void ds4_mem_watchdog_start(void) {
         long mb = strtol(bud, NULL, 10);
         if (mb > 0) g_mem_budget_bytes = (uint64_t)mb * 1024ull * 1024ull;
     }
-    if (!g_prof.enabled && g_mem_budget_bytes == 0) return;
+    const int pressure_guard = getenv("DS4_NO_MEM_PRESSURE_GUARD") == NULL;
+    /* Start the thread whenever anything needs it. The system-pressure guard is
+     * on by default, so the watchdog now runs for every process unless explicitly
+     * disabled -- this is the default-safe behavior that prevents a kernel panic. */
+    if (!g_prof.enabled && g_mem_budget_bytes == 0 && !pressure_guard) return;
     g_mem_watch_run = 1;
     if (pthread_create(&g_mem_watch_thread, NULL, ds4_mem_watchdog_main, NULL) != 0) {
         g_mem_watch_run = 0;
         return;
     }
     g_mem_watch_started = 1;
-    atexit(ds4_profile_flush);
+    /* Only the profiler emits an exit line; the pressure-guard-only case stays
+     * silent so normal runs see no new stderr output. */
+    if (g_prof.enabled || g_mem_budget_bytes != 0) atexit(ds4_profile_flush);
 }
 
 /* Exposed to the GPU backend (ds4_metal.m) so memory-hungry caches (e.g. the
@@ -1329,60 +1299,14 @@ static const gguf_type_info gguf_types[] = {
     [28] = {"f64",      1,   8},
     [29] = {"iq1_m",  256,  56},
     [30] = {"bf16",     1,   2},
+    /* DS4 strict-1-bit routed expert (block_go1b: fp16 row scale + 256 sign
+     * bits = 34 B / 256 elems).  GGUF ggml type number 40 (free: the standard
+     * ggml types stop at 30 here, and 40 collides with no DS4_TENSOR_*). */
+    [40] = {"go1b",   256,  34},
+    /* go2b: merged base+residual pair (two f16 scales + two sign planes). */
+    [41] = {"go2b",   256,  68},
 };
 
-enum {
-    DS4_TENSOR_F32      = 0,
-    DS4_TENSOR_F16      = 1,
-    DS4_TENSOR_Q8_0     = 8,
-    DS4_TENSOR_Q2_K     = 10,
-    DS4_TENSOR_Q4_K     = 12,
-    DS4_TENSOR_IQ2_XXS  = 16,
-    DS4_TENSOR_I32      = 26,
-};
-
-typedef struct {
-    ds4_str key;
-    uint32_t type;
-    uint64_t value_pos;
-} ds4_kv;
-
-typedef struct {
-    ds4_str name;
-    uint32_t ndim;
-    uint64_t dim[DS4_MAX_DIMS];
-    uint32_t type;
-    uint64_t rel_offset;
-    uint64_t abs_offset;
-    uint64_t elements;
-    uint64_t bytes;
-} ds4_tensor;
-
-typedef struct {
-    int fd;
-    const uint8_t *map;
-    uint64_t size;
-
-    uint32_t version;
-    uint64_t n_kv;
-    uint64_t n_tensors;
-    uint64_t alignment;
-    uint64_t tensor_data_pos;
-    uint64_t max_tensor_bytes;
-
-    ds4_kv *kv;
-    ds4_tensor *tensors;
-
-    /* Reduced-expert ("keep-map") models: a shrunken GGUF stores only the kept
-     * routed experts per layer (ffn_*_exps dim[2] = kept count, not DS4_N_EXPERT),
-     * while the router still emits 256-wide logits. These map original expert id
-     * -> compact slot in the shrunken tensor; -1 means the expert was dropped.
-     * Populated by load_expert_keep_map(); empty/NULL for a full model. */
-    bool      expert_shrunken;
-    uint32_t  expert_layer_count;          /* layers covered by the keep-map */
-    uint16_t *expert_kept_count;           /* [expert_layer_count]: kept experts per layer */
-    int16_t  *expert_orig_to_compact;      /* [expert_layer_count * DS4_N_EXPERT]: orig id -> slot, or -1 */
-} ds4_model;
 
 static uint64_t scalar_value_size(uint32_t type) {
     switch (type) {
@@ -1548,7 +1472,7 @@ static bool model_get_f32_compat(const ds4_model *m, const char *key, float *out
     return false;
 }
 
-static bool model_get_bool(const ds4_model *m, const char *key, bool *out) {
+bool model_get_bool(const ds4_model *m, const char *key, bool *out) {
     ds4_kv *kv = model_find_kv(m, key);
     if (!kv || kv->type != GGUF_VALUE_BOOL) return false;
     ds4_cursor c = cursor_at(m, kv->value_pos);
@@ -1659,8 +1583,13 @@ static void load_expert_keep_map(ds4_model *m) {
             m->expert_layer_count, min_kept, (uint32_t)DS4_N_EXPERT);
 }
 
-static void model_close(ds4_model *m) {
+static void residual_free(struct ds4_residual *r);   /* defined after corr_load() */
+
+void model_close(ds4_model *m) {
     if (!m) return;
+    if (m->corr) { corr_free(m->corr); m->corr = NULL; }
+    if (m->residual) { residual_free(m->residual); m->residual = NULL; }
+    if (m->zchain) { ds4_zchain_free(m->zchain); m->zchain = NULL; }
     free(m->kv);
     free(m->tensors);
     free(m->expert_kept_count);
@@ -1779,11 +1708,23 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
     }
 }
 
+/* Only the engine BASE model may arm process-wide env defaults from its
+ * tensor types (the go1b/go2b numeric-safety block inside model_open below).
+ * Support-model opens run in the base model's process -- the MTP draft
+ * sidecar (a go-family draft would arm DS4_REPEAT_FREQ etc. onto a non-go
+ * BASE sampler), the residual/corr sidecars, and tokenizer-only opens. This
+ * is the same cross-model pollution as the GPU keep-LUT, which is restored at
+ * the MTP call site; the env leak was missed there. model_open's signature is
+ * frozen (ds4_internal.h; external caller ds4_corr.c), so the base loader
+ * opts in through this file-scope flag instead of a new parameter -- default
+ * false keeps every sidecar/tokenizer open arming-free. */
+static bool g_model_open_arm_env_defaults = false;
+
 /* Open and map the GGUF once.  Metal needs a shared mapping for no-copy
  * MTLBuffers; CPU uses a private read-only mapping to avoid Darwin VM stress.
  * Tokenizer-only callers pass prefetch_cpu=false so inspecting tokens never
  * walks the huge tensor payload. */
-static void model_open(ds4_model *m, const char *path, bool metal_mapping,
+void model_open(ds4_model *m, const char *path, bool metal_mapping,
                        bool prefetch_cpu) {
     memset(m, 0, sizeof(*m));
     m->fd = -1;
@@ -1827,6 +1768,36 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
 
     parse_metadata(m, &c);
     parse_tensors(m, &c);
+    /* Strict 1/2-bit (go1b/go2b) experts sit at the numeric edge: fast-math /
+     * cross-GPU drift flips near-tie logits into word soup, and un-penalized
+     * greedy decode loops (measured 2026-07-06, dual-host mono; the proven
+     * recipe is mono_dual_run.sh's strict IEEE-754 + f32 raw KV + exp2/log2
+     * rope + freq repeat penalty). Arm those numeric-safety defaults from the
+     * MODEL, not the launch script, so the model works under any launcher.
+     * setenv(overwrite=0): an explicit env always wins. Must run before the
+     * first GPU call below -- these feed Metal library compile macros.
+     * Base-model opens only (g_model_open_arm_env_defaults): a go-family
+     * support model (--mtp draft, sidecars) must not arm the base process. */
+    if (g_model_open_arm_env_defaults)
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const uint32_t ty = m->tensors[i].type;
+        if (ty == DS4_TENSOR_GO1B || ty == DS4_TENSOR_GO2B) {
+            setenv("DS4_METAL_MATH_SAFE", "1", 0);
+            setenv("DS4_METAL_KV_RAW_F32", "1", 0);
+            setenv("DS4_METAL_ROPE_EXP2_LOG2", "1", 0);
+            /* REPEAT_FREQ=1 is the mono/go2b recipe (2026-07-06). For go1b the
+             * coherent probability mass is so narrow that freq=1 greedy decode
+             * collapses into symbol soup (measured 2026-07-13: penalty off =>
+             * coherent-then-loop, freq=1 => junk) -- do not arm it for 1-bit. */
+            if (ty == DS4_TENSOR_GO2B) setenv("DS4_REPEAT_FREQ", "1", 0);
+            fprintf(stderr,
+                    "ds4: strict 1/2-bit (go1b/go2b) experts detected -- numeric-safety "
+                    "defaults armed (MATH_SAFE, KV_RAW_F32, ROPE_EXP2_LOG2%s; "
+                    "explicit env overrides)\n",
+                    ty == DS4_TENSOR_GO2B ? ", REPEAT_FREQ=1" : "");
+            break;
+        }
+    }
     load_expert_keep_map(m);
 #ifndef DS4_NO_GPU
     /* Upload the reduced-expert routing LUT to the GPU so routed-MoE matvecs can
@@ -1934,7 +1905,7 @@ static void model_summary(const ds4_model *m) {
 
 }
 
-static ds4_tensor *model_find_tensor(const ds4_model *m, const char *name) {
+ds4_tensor *model_find_tensor(const ds4_model *m, const char *name) {
     const size_t len = strlen(name);
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         if (m->tensors[i].name.len == len &&
@@ -2094,9 +2065,249 @@ static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model
 #endif
 
 /* Return the in-place tensor payload inside the mapped GGUF. */
-static const void *tensor_data(const ds4_model *m, const ds4_tensor *t) {
+const void *tensor_data(const ds4_model *m, const ds4_tensor *t) {
     return m->map + t->abs_offset;
 }
+
+/* =========================================================================
+ * go1b "hidden variable z^L" four-loss correction sidecar.
+ * =========================================================================
+ *
+ * Loaded from a small separate GGUF (gguf/ds4-go1b-corr.gguf, ~94 MiB) that
+ * carries only the per-layer corr_* tensors + the ds4.corr.present KV. The base
+ * model GGUF is loaded unchanged. The correction is applied in the routed-MoE
+ * forward at every layer that carries it; absent => exactly today's pure 1-bit. */
+
+
+static void residual_free(struct ds4_residual *r) {
+    if (!r) return;
+#ifndef DS4_NO_GPU
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        ds4_gpu_tensor_free(r->layer[il].g_gate);
+        ds4_gpu_tensor_free(r->layer[il].g_up);
+        ds4_gpu_tensor_free(r->layer[il].g_down);
+    }
+#endif
+    model_close(&r->sidecar);
+    free(r);
+}
+
+/* Open the 1-bit residual sidecar GGUF and bind per-layer go1b residual expert
+ * tensors (blk.{L}.ffn_{gate,up,down}_exps_res.weight). Returns NULL (single
+ * 1-bit path) when the file lacks ds4.residual.present or carries no tensors. */
+static struct ds4_residual *residual_load(const char *path, bool metal_mapping) {
+    struct ds4_residual *r = xcalloc(1, sizeof(*r));
+    model_open(&r->sidecar, path, metal_mapping, false);
+    bool present = false;
+    if (!model_get_bool(&r->sidecar, "ds4.residual.present", &present) || !present) {
+        fprintf(stderr, "ds4: residual sidecar %s lacks ds4.residual.present=true; ignoring\n", path);
+        model_close(&r->sidecar); free(r); return NULL;
+    }
+    uint32_t loaded = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        char nm[128];
+        snprintf(nm, sizeof nm, "blk.%u.ffn_gate_exps_res.weight", il);
+        ds4_tensor *g = model_find_tensor(&r->sidecar, nm);
+        if (!g) continue;                       /* layer not residual-corrected */
+        ds4_residual_layer *rl = &r->layer[il];
+        rl->gate = g;
+        snprintf(nm, sizeof nm, "blk.%u.ffn_up_exps_res.weight", il);
+        rl->up = model_find_tensor(&r->sidecar, nm);
+        snprintf(nm, sizeof nm, "blk.%u.ffn_down_exps_res.weight", il);
+        rl->down = model_find_tensor(&r->sidecar, nm);
+        if (!rl->up || !rl->down) { fprintf(stderr, "ds4: residual layer %u missing up/down\n", il); exit(1); }
+        /* Sparse residual (Go-active experts only): the LUT maps a routed expert id to
+         * its residual slot (or -1). Absent => dense (indexed directly by expert id).
+         * The metal path CPU-gathers residual experts from the sidecar mmap, so no
+         * resident GPU upload is needed (unlike the corr sidecar). */
+        snprintf(nm, sizeof nm, "blk.%u.ffn_res_lut.weight", il);
+        rl->lut = model_find_tensor(&r->sidecar, nm);
+        rl->present = true;
+        loaded++;
+    }
+    if (loaded == 0) {
+        fprintf(stderr, "ds4: residual sidecar %s carried no per-layer tensors; ignoring\n", path);
+        model_close(&r->sidecar); free(r); return NULL;
+    }
+    r->present = true;
+    fprintf(stderr, "ds4: go1b 1-bit residual loaded from %s (%u layers)\n", path, loaded);
+    return r;
+}
+
+/* Build the zchain from in-model blk.L.opt_* tensors — the single merged GGUF
+ * product (deepseek4-quantize --zchain lands the optimization chains next to
+ * the 1bit expert bytes; KV ds4.zchain.present gates this). Op records mirror
+ * the ds4_gpu packed layout (16 floats, [15]=layer-local V8 block). v8 points
+ * into the model mmap (zero-copy); map stays NULL so ds4_zchain_free never
+ * munmaps model memory. External --zchain/DS4_ZCHAIN overrides this loader. */
+static struct ds4_zchain *zchain_from_model(const ds4_model *m) {
+    bool present = false;
+    if (!model_get_bool(m, "ds4.zchain.present", &present) || !present) return NULL;
+    ds4_zchain *z = xcalloc(1, sizeof(*z));
+    z->n_layer = DS4_N_LAYER; z->n_expert = DS4_N_EXPERT; z->d_model = DS4_N_EMBD;
+    z->layer = xcalloc(DS4_N_LAYER, sizeof(*z->layer));
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        char nm[64];
+        snprintf(nm, sizeof nm, "blk.%u.opt_chain.weight", il);
+        ds4_tensor *tc = model_find_tensor(m, nm);
+        snprintf(nm, sizeof nm, "blk.%u.opt_ge.weight", il);
+        ds4_tensor *tg = model_find_tensor(m, nm);
+        snprintf(nm, sizeof nm, "blk.%u.opt_v8.weight", il);
+        ds4_tensor *tv = model_find_tensor(m, nm);
+        const uint16_t *v8 = tv ? (const uint16_t *)tensor_data(m, tv) : NULL;
+        snprintf(nm, sizeof nm, "blk.%u.opt_zlm.weight", il);
+        ds4_tensor *tzl = model_find_tensor(m, nm);
+        const uint16_t *zlm = tzl ? (const uint16_t *)tensor_data(m, tzl) : NULL;
+        if (tg && tg->dim[0] == DS4_N_EXPERT) {
+            const float *ge = (const float *)tensor_data(m, tg);
+            if (ge) {
+                z->layer[il].ge = xmalloc((size_t)DS4_N_EXPERT * sizeof(float));
+                memcpy(z->layer[il].ge, ge, (size_t)DS4_N_EXPERT * sizeof(float));
+                z->n_ge_layers++;
+            }
+        }
+        if (tc && tc->dim[0] >= 16) {
+            const float *ch = (const float *)tensor_data(m, tc);
+            const uint32_t nops = (uint32_t)(tc->dim[0] / 16);
+            if (ch && nops) {
+                z->layer[il].ops = xcalloc(nops, sizeof(ds4_zchain_op));
+                uint32_t kept = 0;
+                for (uint32_t i = 0; i < nops; i++) {
+                    const float *f = ch + (size_t)i * 16;
+                    ds4_zchain_op *o = &z->layer[il].ops[kept];
+                    memset(o, 0, sizeof(*o));
+                    o->type = (uint32_t)f[0];
+                    o->g = f[1];
+                    memcpy(o->w2p, f + 2, 4 * sizeof(float));
+                    memcpy(o->w8, f + 6, 9 * sizeof(float));
+                    if (o->type == 3u) {
+                        const int blk = (int)f[15];
+                        if (blk < 0 || !v8 ||
+                            (uint64_t)(blk + 1) * 8u * DS4_N_EMBD > (tv ? tv->dim[0] : 0)) {
+                            continue;   /* V8-less dyn8 = quantizer-replay no-op: drop */
+                        }
+                        o->v8 = v8 + (size_t)blk * 8u * DS4_N_EMBD;
+                    }
+                    if (o->type == 6u) {   /* 冻结 z^L: 槽{f[1]=tr,f[2]=k} + opt_zlm 张量; 不进 λ 链 */
+                        const uint32_t zk = (uint32_t)f[2];
+                        const uint64_t nh = (uint64_t)zk + 2ull * zk * DS4_N_EMBD;
+                        if (zk > 0 && zk <= 16 && zlm && (tzl ? tzl->dim[0] : 0) >= nh) {
+                            z->layer[il].zl.zlk = zk;
+                            z->layer[il].zl.zltr = f[1];
+                            z->layer[il].zl.zlm = zlm;   /* aliases model mmap */
+                        }
+                        continue;
+                    }
+                    if (o->type >= 1u && o->type <= 4u) { kept++; z->n_ops_total++; }
+                }
+                z->layer[il].n_ops = kept;
+            }
+        }
+    }
+    uint32_t n_zl = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) if (z->layer[il].zl.zlk) n_zl++;
+    if (!z->n_ops_total && !z->n_ge_layers && !n_zl) { ds4_zchain_free(z); return NULL; }
+    fprintf(stderr, "ds4: zchain loaded from model tensors (merged GGUF): %u chain ops + %u GE layers + %u z^L layers\n",
+            z->n_ops_total, z->n_ge_layers, n_zl);
+    return z;
+}
+
+/* Build the GPU residual set for layer il (or NULL if absent). Static return: the
+ * routed-MoE forward is serialized through one graph worker, so a single static is safe.
+ * GPU builds only — the type itself lives behind the ds4_gpu.h GPU guard. */
+#ifndef DS4_NO_GPU
+static const ds4_gpu_residual_set *residual_set_for(const ds4_model *m, uint32_t il) {
+    static ds4_gpu_residual_set rs;
+    if (!m || !m->residual || !m->residual->present ||
+        il >= DS4_MAX_LAYER || !m->residual->layer[il].present) return NULL;
+    const ds4_residual_layer *rl = &m->residual->layer[il];
+    if (!rl->gate || !rl->up || !rl->down) return NULL;
+    rs.gate_ptr = tensor_data(&m->residual->sidecar, rl->gate);
+    rs.up_ptr   = tensor_data(&m->residual->sidecar, rl->up);
+    rs.down_ptr = tensor_data(&m->residual->sidecar, rl->down);
+    if (!rs.gate_ptr || !rs.up_ptr || !rs.down_ptr) return NULL;
+    rs.lut = rl->lut ? (const float *)tensor_data(&m->residual->sidecar, rl->lut) : NULL;
+    /* Type 41 = go2b (offline-merged base+residual, R5-C): the metal path runs the
+     * hot/cold two-source split instead of the legacy three-extra-matmul add. */
+    rs.merged2b = (rl->gate->type == 41u);
+    return &rs;
+}
+
+/* Pack the host-side zchain into the flat GPU tables (layout: ds4_gpu.h).
+ * Ops are layer-major; dyn8 V8 blocks concatenate in encounter order and each
+ * op's slot [15] carries its block index (-1 = none). GE rows default to 1.0
+ * so a single [n_layer][n_expert] table serves every GE layer. */
+static int zchain_gpu_upload(const struct ds4_zchain *z) {
+    const uint32_t nl = z->n_layer, ne = z->n_expert, dm = z->d_model;
+    uint32_t *loff = xmalloc((size_t)(nl + 1) * sizeof(uint32_t));
+    uint8_t *gep = xcalloc(nl, 1);
+    uint32_t nops = 0, nblk = 0, has_ge = 0;
+    for (uint32_t l = 0; l < nl; l++) {
+        loff[l] = nops;
+        nops += z->layer[l].n_ops;
+        if (z->layer[l].ge) { gep[l] = 1; has_ge = 1; }
+        for (uint32_t i = 0; i < z->layer[l].n_ops; i++)
+            if (z->layer[l].ops[i].type == 3u && z->layer[l].ops[i].v8) nblk++;
+    }
+    loff[nl] = nops;
+    float *ops = nops ? xmalloc((size_t)nops * 16u * sizeof(float)) : NULL;
+    uint16_t *v8 = nblk ? xmalloc((size_t)nblk * 8u * dm * sizeof(uint16_t)) : NULL;
+    uint32_t oi = 0, bi = 0;
+    for (uint32_t l = 0; l < nl; l++) {
+        for (uint32_t i = 0; i < z->layer[l].n_ops; i++, oi++) {
+            const ds4_zchain_op *o = &z->layer[l].ops[i];
+            float *f = ops + (size_t)oi * 16u;
+            f[0] = (float)o->type;
+            f[1] = o->g;
+            memcpy(f + 2, o->w2p, 4 * sizeof(float));
+            memcpy(f + 6, o->w8, 9 * sizeof(float));
+            f[15] = -1.0f;
+            if (o->type == 3u && o->v8) {
+                memcpy(v8 + (size_t)bi * 8u * dm, o->v8, (size_t)8u * dm * sizeof(uint16_t));
+                f[15] = (float)bi++;
+            }
+        }
+    }
+    float *ge = NULL;
+    if (has_ge) {
+        ge = xmalloc((size_t)nl * ne * sizeof(float));
+        for (size_t i = 0; i < (size_t)nl * ne; i++) ge[i] = 1.0f;
+        for (uint32_t l = 0; l < nl; l++)
+            if (z->layer[l].ge)
+                memcpy(ge + (size_t)l * ne, z->layer[l].ge, (size_t)ne * sizeof(float));
+    }
+    int r = ds4_gpu_zchain_set(ops, loff, v8, ge, has_ge ? gep : NULL,
+                               nl, ne, dm, nops, nblk);
+    /* frozen z^L (type 6): concat fp16 factor blocks + per-layer meta */
+    if (r) {
+        uint64_t total = 0; uint32_t nz = 0;
+        for (uint32_t l = 0; l < nl; l++) if (z->layer[l].zl.zlk)
+            { total += (uint64_t)z->layer[l].zl.zlk * (1u + 2u * dm); nz++; }
+        if (nz) {
+            uint16_t *zlm = xmalloc(total * sizeof(uint16_t));
+            uint32_t *zo = xcalloc(nl, sizeof(uint32_t));
+            uint32_t *zk = xcalloc(nl, sizeof(uint32_t));
+            float    *zt = xcalloc(nl, sizeof(float));
+            uint64_t cur = 0;
+            for (uint32_t l = 0; l < nl; l++) {
+                const ds4_zchain_zl *lz = &z->layer[l].zl;
+                if (!lz->zlk) continue;
+                const uint64_t nh = (uint64_t)lz->zlk * (1u + 2u * dm);
+                memcpy(zlm + cur, lz->zlm, nh * sizeof(uint16_t));
+                zo[l] = (uint32_t)cur; zk[l] = lz->zlk; zt[l] = lz->zltr;
+                cur += nh;
+            }
+            r = ds4_gpu_zchain_zl_set(zlm, zo, zk, zt, nl, total);
+            free(zlm); free(zo); free(zk); free(zt);
+        }
+    }
+    free(ops); free(v8); free(ge); free(loff); free(gep);
+    return r;
+}
+#endif
+
+/* Per-layer router-logit bias (delta), or NULL when this layer has no correction.
+ * Only score-routed layers consume it (hash layers select experts by token id). */
 
 /* Optional startup pass that touches tensor pages before timing generation. */
 static void model_warm_weights(const ds4_model *m) {
@@ -2880,7 +3091,9 @@ static void tensor_expect_plain_layout(
 static bool tensor_is_routed_expert_type(uint32_t type) {
     return type == DS4_TENSOR_IQ2_XXS ||
            type == DS4_TENSOR_Q2_K ||
-           type == DS4_TENSOR_Q4_K;
+           type == DS4_TENSOR_Q4_K ||
+           type == DS4_TENSOR_GO1B ||
+           type == DS4_TENSOR_GO2B;
 }
 
 static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
@@ -2888,6 +3101,8 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
     case DS4_TENSOR_IQ2_XXS: return sizeof(block_iq2_xxs);
     case DS4_TENSOR_Q2_K:    return sizeof(block_q2_K);
     case DS4_TENSOR_Q4_K:    return sizeof(block_q4_K);
+    case DS4_TENSOR_GO1B:    return sizeof(block_go1b);
+    case DS4_TENSOR_GO2B:    return sizeof(block_go2b);
     default:                 ds4_die("unsupported routed expert tensor type");
     }
     return 0;
@@ -6269,15 +6484,20 @@ static void layer_hash_selected_experts(
 }
 
 /* Router scores use sqrt(softplus(logit)); normalization happens only after
- * the six selected experts are known. */
+ * the six selected experts are known. logit_bias (go1b corr delta, or NULL) is
+ * added to the raw logits before softplus/sqrt, matching the GPU corr path. */
 static void layer_router_probs_one(
         float             probs[DS4_MAX_EXPERT],
         const ds4_model   * model,
         const ds4_layer_weights * layer,
-        const float       * x) {
+        const float       * x,
+        const float       * logit_bias) {
     float logits[DS4_MAX_EXPERT];
 
     matvec_f16(logits, model, layer->ffn_gate_inp, x);
+    if (logit_bias) {
+        for (uint32_t i = 0; i < DS4_N_EXPERT; i++) logits[i] += logit_bias[i];
+    }
     for (uint32_t i = 0; i < DS4_N_EXPERT; i++) {
         probs[i] = sqrtf(softplus_stable(logits[i]));
     }
@@ -6308,7 +6528,7 @@ static void layer_hash_router_weights_one(
         const int          selected[DS4_MAX_EXPERT_USED]) {
     float probs[DS4_MAX_EXPERT];
 
-    layer_router_probs_one(probs, model, layer, x);
+    layer_router_probs_one(probs, model, layer, x, NULL);
     layer_hash_router_weights_from_probs(weights_out, probs, selected);
 }
 
@@ -6340,10 +6560,11 @@ static void layer_topk_selected_experts(
         float                  expert_weight[DS4_MAX_EXPERT_USED],
         const ds4_model       *model,
         const ds4_layer_weights *layer,
-        const float           *x) {
+        const float           *x,
+        const float           *logit_bias) {
     float probs[DS4_MAX_EXPERT];
 
-    layer_router_probs_one(probs, model, layer, x);
+    layer_router_probs_one(probs, model, layer, x, logit_bias);
     layer_topk_selected_experts_from_probs(selected, expert_weight, model, layer, probs);
 }
 
@@ -6409,7 +6630,17 @@ static void layer_routed_moe_one(
         layer_hash_selected_experts(selected, model, layer, token);
         layer_hash_router_weights_one(expert_weight, model, layer, x, selected);
     } else {
-        layer_topk_selected_experts(selected, expert_weight, model, layer, x);
+        layer_topk_selected_experts(selected, expert_weight, model, layer, x, corr_layer_delta(model, il));
+    }
+    /* zchain GE: fold per-expert gains into the router weights before the expert
+     * matmuls (quantizer bytes_moe parity: the gain scales each selected expert's
+     * contribution linearly, exactly gate-weight scaling). */
+    {
+        const float *zge = ds4_zchain_layer_ge(model->zchain, il);
+        if (zge) for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+            const int ze = selected[i];
+            if (ze >= 0 && (uint32_t)ze < DS4_N_EXPERT) expert_weight[i] *= zge[ze];
+        }
     }
 
     if (!trace) {
@@ -6466,6 +6697,22 @@ static void layer_routed_moe_one(
         }
     }
 
+    /* zchain λ(x): per-token scale on the routed sum (the whole GL/dyn/TREF chain
+     * collapses to this scalar; the additive corr sidecar lands after, matching
+     * the quantizer's op order). */
+    if (ds4_zchain_layer_has_lambda(model->zchain, il)) {
+        const float zlam = ds4_zchain_lambda(model->zchain, il, x);
+        for (uint32_t j = 0; j < DS4_N_EMBD; j++) out[j] *= zlam;
+    }
+    /* frozen z^L (type 6): rank-k additive direction fix on the routed sum,
+     * after the λ scale (record-order parity with the quantizer's bytes_moe). */
+    { const ds4_zchain_zl *zzl = ds4_zchain_layer_zl(model->zchain, il);
+      if (zzl) ds4_zchain_zl_apply(zzl, DS4_N_EMBD, x, out); }
+
+    /* go1b correction: add the low-rank per-expert residual on top of the 1-bit
+     * expert sum (no-op when no corr sidecar is loaded). */
+    corr_apply_moe_host(out, model, il, x, selected, DS4_N_EXPERT_USED);
+
     free(midq);
     free(xq);
     free(down);
@@ -6503,7 +6750,16 @@ static void layer_routed_moe_one_prealloc(
         layer_hash_selected_experts(selected, model, layer, token);
         layer_hash_router_weights_one(expert_weight, model, layer, x, selected);
     } else {
-        layer_topk_selected_experts(selected, expert_weight, model, layer, x);
+        layer_topk_selected_experts(selected, expert_weight, model, layer, x, corr_layer_delta(model, il));
+    }
+    /* zchain GE: fold per-expert gains into the router weights (see the
+     * layer_routed_moe_one() copy of this hook for the contract). */
+    {
+        const float *zge = ds4_zchain_layer_ge(model->zchain, il);
+        if (zge) for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+            const int ze = selected[i];
+            if (ze >= 0 && (uint32_t)ze < DS4_N_EXPERT) expert_weight[i] *= zge[ze];
+        }
     }
 
     matvec_iq2_xxs_experts_mid_prequant(mid_all, model,
@@ -6522,7 +6778,18 @@ static void layer_routed_moe_one_prealloc(
     }
     matvec_q2_k_experts_accum_prequant(out, model, layer->ffn_down_exps, midq, selected, DS4_N_EXPERT_USED);
 
-    (void)il;
+    /* zchain λ(x): scale the routed sum before the additive corr (op-order parity). */
+    if (ds4_zchain_layer_has_lambda(model->zchain, il)) {
+        const float zlam = ds4_zchain_lambda(model->zchain, il, x);
+        for (uint32_t j = 0; j < DS4_N_EMBD; j++) out[j] *= zlam;
+    }
+    /* frozen z^L (type 6): rank-k additive direction fix on the routed sum,
+     * after the λ scale (record-order parity with the quantizer's bytes_moe). */
+    { const ds4_zchain_zl *zzl = ds4_zchain_layer_zl(model->zchain, il);
+      if (zzl) ds4_zchain_zl_apply(zzl, DS4_N_EMBD, x, out); }
+
+    /* go1b correction (no-op without a corr sidecar). */
+    corr_apply_moe_host(out, model, il, x, selected, DS4_N_EXPERT_USED);
 }
 
 /* Prefill MoE groups token/expert pairs by expert so each active expert's
@@ -6569,7 +6836,17 @@ static void layer_routed_moe_batch(
             layer_hash_selected_experts(sel, model, layer, token_ids[t]);
             layer_hash_router_weights_one(weights, model, layer, norm + (uint64_t)t * expert_in_dim, sel);
         } else {
-            layer_topk_selected_experts(sel, weights, model, layer, norm + (uint64_t)t * expert_in_dim);
+            layer_topk_selected_experts(sel, weights, model, layer, norm + (uint64_t)t * expert_in_dim,
+                                        corr_layer_delta(model, il));
+        }
+        /* zchain GE: fold per-expert gains into the pair weights (see
+         * layer_routed_moe_one() for the contract). */
+        {
+            const float *zge = ds4_zchain_layer_ge(model->zchain, il);
+            if (zge) for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
+                const int ze = sel[slot];
+                if (ze >= 0 && (uint32_t)ze < DS4_N_EXPERT) weights[slot] *= zge[ze];
+            }
         }
 
         for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
@@ -6663,14 +6940,39 @@ static void layer_routed_moe_batch(
 
     ds4_parallel_for(down_out_dim, matvec_q2_k_batch_accum_rows_worker, &down_ctx);
 
+    /* zchain λ(x) per token: scale the routed sums before the additive corr
+     * (op-order parity with the quantizer replay). */
+    if (ds4_zchain_layer_has_lambda(model->zchain, il)) {
+        for (uint32_t t = 0; t < n_tok; t++) {
+            const float zlam = ds4_zchain_lambda(model->zchain, il,
+                                                 norm + (uint64_t)t * expert_in_dim);
+            float *zmt = moe + (uint64_t)t * DS4_N_EMBD;
+            for (uint32_t j = 0; j < DS4_N_EMBD; j++) zmt[j] *= zlam;
+        }
+    }
+    /* frozen z^L (type 6) per token, after λ (record-order parity). */
+    { const ds4_zchain_zl *zzl = ds4_zchain_layer_zl(model->zchain, il);
+      if (zzl) for (uint32_t t = 0; t < n_tok; t++)
+          ds4_zchain_zl_apply(zzl, DS4_N_EMBD,
+                              norm + (uint64_t)t * expert_in_dim,
+                              moe + (uint64_t)t * DS4_N_EMBD); }
+
+    /* go1b correction per token (no-op without a corr sidecar). The pairs array is
+     * grouped-by-expert, but `selected` keeps the per-(token,slot) expert ids. */
+    if (model->corr && il < DS4_MAX_LAYER && model->corr->layer[il].present) {
+        for (uint32_t t = 0; t < n_tok; t++) {
+            corr_apply_moe_host(moe + (uint64_t)t * DS4_N_EMBD, model, il,
+                                norm + (uint64_t)t * expert_in_dim,
+                                &selected[(uint64_t)t * DS4_N_EXPERT_USED], DS4_N_EXPERT_USED);
+        }
+    }
+
     free(midq);
     free(pair_ids);
     free(xq);
     free(pairs);
     free(pair_weight);
     free(selected);
-
-    (void)il;
 }
 
 static void print_vec_stats(const char *name, const float *x, uint64_t n);
@@ -9270,6 +9572,10 @@ typedef struct {
     ds4_gpu_tensor *routed_mid;
     ds4_gpu_tensor *routed_down;
     ds4_gpu_tensor *routed_out;
+    /* go1b corr store-variant output [n_embd]: decode writes the correction
+     * here (never into routed_out) so the tiny corr dispatch carries no write
+     * hazard on the hot buffer; the fused shared-down consumer adds it. */
+    ds4_gpu_tensor *corr_delta;
     ds4_gpu_tensor *ffn_out;
     ds4_gpu_tensor *after_ffn_hc;
     ds4_gpu_tensor *output_pre;
@@ -9362,6 +9668,146 @@ typedef struct {
     bool tp_owns_low; /* true ⇒ this peer owns the low half of routed_out */
     float *tp_vec;    /* host staging buffer [DS4_N_EMBD], allocated when tp set */
 } ds4_gpu_graph;
+
+/* ---- engine-trajectory batch capture (DS4_CAP_DIR) ------------------------
+ * Appends, per routed layer and per prefill chunk, the tensors the offline
+ * error-feedback calibration needs, as raw little-endian shards:
+ *   raw_ffn_in_L{L}.f16        x̂ = post-RMSNorm expert input   [n×4096]
+ *   raw_route_L{L}.i16         selected expert ids (pre-remap) [n×6]
+ *   raw_route_logits_L{L}.f16  RAW router logits (pre-δ)       [n×256]
+ *   raw_route_w_L{L}.f16       applied gate weights            [n×6]
+ * Token count = file bytes / (width × elem size); cap_raw2npy.py converts to
+ * the cap npy schema. DS4_CAP_LAYERS="lo-hi" filters layers (default all). */
+static int cap_layer_enabled(uint32_t il) {
+    const char *r = getenv("DS4_CAP_LAYERS");
+    if (!r || !r[0]) return 1;
+    unsigned lo = 0, hi = DS4_MAX_LAYER;
+    if (sscanf(r, "%u-%u", &lo, &hi) != 2) return 1;
+    return il >= lo && il <= hi;
+}
+
+/* handle cache: the decode path appends per TOKEN per layer — reopening per
+ * append would be ~1M syscalls per full-corpus capture. One append handle per
+ * (layer, kind), opened lazily, flushed by exit / the libc atexit machinery
+ * (single ds4 instance; capture is a calibration-run-only mode). */
+static FILE *cap_handle(const char *dir, const char *name, uint32_t il, int kind) {
+    static FILE *cache[DS4_MAX_LAYER][5];
+    if (il >= DS4_MAX_LAYER || kind < 0 || kind > 4) return NULL;
+    if (!cache[il][kind]) {
+        char p[1024];
+        snprintf(p, sizeof p, "%s/%s_L%u", dir, name, il);
+        cache[il][kind] = fopen(p, "ab");
+    }
+    return cache[il][kind];
+}
+
+static void cap_append_k(const char *dir, const char *name, uint32_t il, int kind,
+                         const void *buf, size_t bytes) {
+    FILE *f = cap_handle(dir, name, il, kind);
+    if (!f) return;
+    fwrite(buf, 1, bytes, f);
+    /* flush per append: capture workers get SIGTERM-harvested (dist capture
+     * pipeline), and a signal death skips atexit — an unflushed stdio tail
+     * desyncs the five per-layer shards' row counts (12B/row route hurts most).
+     * Cost is noise next to the GPU readbacks that precede every append. */
+    fflush(f);
+}
+#define cap_append(dir, name, il, buf, bytes) cap_append_k(dir, name, il, \
+    (strcmp(name, "raw_ffn_in") == 0 ? 0 : strcmp(name, "raw_route_logits") == 0 ? 1 : \
+     strcmp(name, "raw_route_w") == 0 ? 2 : strcmp(name, "raw_ffn_out") == 0 ? 4 : 3), buf, bytes)
+
+static void cap_batch_layer(ds4_gpu_graph *g, uint32_t il, uint32_t n_tokens) {
+    const char *dir = getenv("DS4_CAP_DIR");
+    if (!dir || !dir[0] || n_tokens == 0 || !cap_layer_enabled(il)) return;
+
+    const uint32_t d = DS4_N_EMBD, ne = DS4_N_EXPERT, ku = DS4_N_EXPERT_USED;
+    size_t nf = (size_t)n_tokens * d;
+    float *fb = malloc(nf * sizeof(float));
+    uint16_t *hb = malloc(nf * sizeof(uint16_t));
+    if (!fb || !hb) { free(fb); free(hb); return; }
+
+    if (ds4_gpu_tensor_read(g->batch_ffn_norm, 0, fb, nf * sizeof(float))) {
+        for (size_t i = 0; i < nf; i++) hb[i] = f32_to_f16(fb[i]);
+        cap_append(dir, "raw_ffn_in", il, hb, nf * sizeof(uint16_t));
+    }
+    /* P2 侧车管线需要 O_BASE: routed-MoE 输出, 捕获点在 corr 应用之前(调用序
+     * 见 cap_batch_layer 调用处注释), 与 raw_ffn_in 同 token 对齐。f16 存储。 */
+    if (ds4_gpu_tensor_read(g->batch_routed_out, 0, fb, nf * sizeof(float))) {
+        for (size_t i = 0; i < nf; i++) hb[i] = f32_to_f16(fb[i]);
+        cap_append(dir, "raw_ffn_out", il, hb, nf * sizeof(uint16_t));
+    }
+    size_t nl = (size_t)n_tokens * ne;
+    if (ds4_gpu_tensor_read(g->batch_router_logits, 0, fb, nl * sizeof(float))) {
+        for (size_t i = 0; i < nl; i++) hb[i] = f32_to_f16(fb[i]);
+        cap_append(dir, "raw_route_logits", il, hb, nl * sizeof(uint16_t));
+    }
+    size_t nw = (size_t)n_tokens * ku;
+    if (ds4_gpu_tensor_read(g->batch_router_weights, 0, fb, nw * sizeof(float))) {
+        for (size_t i = 0; i < nw; i++) hb[i] = f32_to_f16(fb[i]);
+        cap_append(dir, "raw_route_w", il, hb, nw * sizeof(uint16_t));
+    }
+    /* pre-remap ids: same snapshot the corr dispatch consumes (go1b batch MoE
+     * rewrites the live tensor to compact slots in place) */
+    const ds4_gpu_tensor *sel = ds4_gpu_corr_saved_selected();
+    if (!sel) sel = g->batch_router_selected;
+    int32_t *ib = (int32_t *)fb;   /* reuse: n×6 i32 fits in the f32 buffer */
+    if (ds4_gpu_tensor_read(sel, 0, ib, nw * sizeof(int32_t))) {
+        int16_t *sb = (int16_t *)hb;
+        for (size_t i = 0; i < nw; i++) sb[i] = (int16_t)ib[i];
+        cap_append(dir, "raw_route", il, sb, nw * sizeof(int16_t));
+    }
+    free(fb); free(hb);
+    /* observability iron rule: unbuffered progress on stderr, rate-limited so
+     * the decode path (1 token per call) doesn't flood — never a black box. */
+    static uint64_t cap_tok_total;
+    cap_tok_total += n_tokens;
+    if (n_tokens > 1 || (cap_tok_total % 256) == 0)
+        fprintf(stderr, "ds4: [cap] L%u +%u (total %llu tok-layers)\n",
+                il, n_tokens, (unsigned long long)cap_tok_total);
+}
+
+/* decode-path capture: same shards, one token per call. The perplexity scorer
+ * (and any decode) runs token-by-token through here — this is where the bulk
+ * of a teacher-forced trajectory capture actually flows (the batch hook only
+ * sees the 32-token seed prefix). */
+static void cap_decode_layer(ds4_gpu_graph *g, uint32_t il) {
+    const char *dir = getenv("DS4_CAP_DIR");
+    if (!dir || !dir[0] || !cap_layer_enabled(il)) return;
+
+    const uint32_t d = DS4_N_EMBD, ne = DS4_N_EXPERT, ku = DS4_N_EXPERT_USED;
+    float fb[DS4_N_EXPERT > 4096 ? DS4_N_EXPERT : 4096];
+    uint16_t hb[DS4_N_EXPERT > 4096 ? DS4_N_EXPERT : 4096];
+
+    if (ds4_gpu_tensor_read(g->ffn_norm, 0, fb, (size_t)d * sizeof(float))) {
+        for (uint32_t i = 0; i < d; i++) hb[i] = f32_to_f16(fb[i]);
+        cap_append(dir, "raw_ffn_in", il, hb, (size_t)d * sizeof(uint16_t));
+    }
+    /* P2: O_BASE (decode 路径逐 token), 对齐 raw_ffn_in。 */
+    if (ds4_gpu_tensor_read(g->routed_out, 0, fb, (size_t)d * sizeof(float))) {
+        for (uint32_t i2 = 0; i2 < d; i2++) hb[i2] = f32_to_f16(fb[i2]);
+        cap_append(dir, "raw_ffn_out", il, hb, (size_t)d * sizeof(uint16_t));
+    }
+    if (ds4_gpu_tensor_read(g->router_logits, 0, fb, (size_t)ne * sizeof(float))) {
+        for (uint32_t i = 0; i < ne; i++) hb[i] = f32_to_f16(fb[i]);
+        cap_append(dir, "raw_route_logits", il, hb, (size_t)ne * sizeof(uint16_t));
+    }
+    if (ds4_gpu_tensor_read(g->router_weights, 0, fb, (size_t)ku * sizeof(float))) {
+        for (uint32_t i = 0; i < ku; i++) hb[i] = f32_to_f16(fb[i]);
+        cap_append(dir, "raw_route_w", il, hb, (size_t)ku * sizeof(uint16_t));
+    }
+    const ds4_gpu_tensor *sel = ds4_gpu_corr_saved_selected();
+    if (!sel) sel = g->router_selected;
+    int32_t ib[DS4_N_EXPERT_USED];
+    if (ds4_gpu_tensor_read(sel, 0, ib, (size_t)ku * sizeof(int32_t))) {
+        int16_t sb[DS4_N_EXPERT_USED];
+        for (uint32_t i = 0; i < ku; i++) sb[i] = (int16_t)ib[i];
+        cap_append(dir, "raw_route", il, sb, (size_t)ku * sizeof(int16_t));
+    }
+    static uint64_t cap_tok_total2;
+    if ((++cap_tok_total2 % (256 * 23)) == 0)
+        fprintf(stderr, "ds4: [cap] decode total %llu tok-layers\n",
+                (unsigned long long)cap_tok_total2);
+}
 
 static bool graph_power_throttle_enabled(const ds4_gpu_graph *g) {
     return g && g->power_percent > 0 && g->power_percent < 100;
@@ -9462,6 +9908,7 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->after_ffn_hc);
     ds4_gpu_tensor_free(g->ffn_out);
     ds4_gpu_tensor_free(g->routed_out);
+    ds4_gpu_tensor_free(g->corr_delta);
     ds4_gpu_tensor_free(g->routed_down);
     ds4_gpu_tensor_free(g->routed_mid);
     ds4_gpu_tensor_free(g->routed_up);
@@ -10112,6 +10559,7 @@ static bool metal_graph_alloc_raw_cap(
     g->routed_mid = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
     g->routed_down = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float));
     g->routed_out = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    g->corr_delta = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
     g->after_ffn_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
     g->output_pre = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HC * sizeof(float));
     g->output_weights = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HC * sizeof(float));
@@ -10140,18 +10588,13 @@ static bool metal_graph_alloc_raw_cap(
         g->spec_logits = ds4_gpu_tensor_alloc((uint64_t)64 * DS4_N_VOCAB * sizeof(float));
         g->mtp_n_raw = 0;
     }
-    /* PC.1 copy speculation (project.md §3.5): the cross-machine VERIFY batch
-     * reads its K logit rows out of spec_logits but needs none of the MTP
-     * drafter tensors. Allocate just that buffer (~8MiB) when the copy drafter
-     * is enabled without MTP, so the final-layer owner can serve VERIFY. */
+    /* PC.1 copy speculation (project.md §3.5): the VERIFY batch reads its K
+     * logit rows out of spec_logits but needs none of the MTP drafter tensors.
+     * The copy drafter is always armed (single-machine and distributed), so the
+     * final-layer owner must always be able to serve VERIFY: allocate the
+     * buffer unconditionally (~8 MiB). */
     if (!g->spec_logits) {
-        /* Single-machine copy-spec (enable_spec) and the distributed copy drafter
-         * (DS4_DIST_COPY_SPEC) both read K logit rows out of spec_logits without
-         * the MTP drafter tensors. ~8 MiB. */
-        const char *cs = getenv("DS4_DIST_COPY_SPEC");
-        if (enable_spec || (cs && *cs && cs[0] != '0')) {
-            g->spec_logits = ds4_gpu_tensor_alloc((uint64_t)64 * DS4_N_VOCAB * sizeof(float));
-        }
+        g->spec_logits = ds4_gpu_tensor_alloc((uint64_t)64 * DS4_N_VOCAB * sizeof(float));
     }
 
     g->prefill_tokens = ds4_gpu_tensor_alloc(pc * sizeof(int32_t));
@@ -10235,7 +10678,7 @@ static bool metal_graph_alloc_raw_cap(
                     g->shared_out &&
                     g->router_logits && g->router_probs && g->router_selected && g->router_weights &&
                     g->routed_gate && g->routed_up && g->routed_mid &&
-                    g->routed_down && g->routed_out &&
+                    g->routed_down && g->routed_out && g->corr_delta &&
                     g->after_ffn_hc &&
                     g->output_pre && g->output_weights && g->output_embd &&
                     g->output_norm && g->logits &&
@@ -11248,6 +11691,15 @@ static bool metal_graph_encode_decode_layer(
     const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
     if (ok) ok = metal_graph_matmul_plain_tensor(g->router_logits, model, layer->ffn_gate_inp,
                                                  DS4_N_EMBD, DS4_N_EXPERT, g->ffn_norm, 1);
+    /* go1b correction: bias the raw router logits by delta[e] before top-k. Only
+     * score-routed layers select by logits (hash layers select by token id).
+     * δ≡0 sidecars skip the dispatch entirely — it costs an owned-CB sync per
+     * layer on the offload decode path. */
+    if (ok && model->corr && il < DS4_MAX_LAYER && model->corr->layer[il].present &&
+        model->corr->layer[il].has_delta && layer->ffn_gate_tid2eid == NULL) {
+        ok = ds4_gpu_corr_router_bias(g->router_logits, model->corr->layer[il].gdelta,
+                                      DS4_N_EXPERT, 1) != 0;
+    }
     if (ok) ok = ds4_gpu_router_select_tensor(g->router_selected, g->router_weights, g->router_probs,
                                                 model->map, model->size,
                                                 layer->ffn_exp_probs_b ? layer->ffn_exp_probs_b->abs_offset : 0,
@@ -11268,6 +11720,12 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_tensor("ffn_moe_probs", g->router_probs, DS4_N_EXPERT, il, pos);
         metal_graph_debug_dump_i32_tensor("ffn_moe_topk", g->router_selected, DS4_N_EXPERT_USED, il, pos);
         metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->router_weights, DS4_N_EXPERT_USED, il, pos);
+    }
+    /* zchain GE: fold per-expert gains into the router weights. Must run on
+     * ORIGINAL expert ids, i.e. before the compact-slot translate below. */
+    if (ok && model->zchain && ds4_zchain_layer_ge(model->zchain, il)) {
+        ok = ds4_gpu_zchain_ge_apply(g->router_weights, g->router_selected,
+                                     il, DS4_N_EXPERT_USED, 1) != 0;
     }
     /* Translate full-256 router ids to compact slots for a shrunken model. No-op
      * for a full model (no LUT set). Runs after the router (weights were gathered
@@ -11308,11 +11766,43 @@ static bool metal_graph_encode_decode_layer(
         if (es_sel && es_wt) { tp_expert_split = true; es_n = cnt; }
         else { ds4_gpu_tensor_free(es_sel); ds4_gpu_tensor_free(es_wt); es_sel = es_wt = NULL; }
     }
-    if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
+    if (ok && (layer->ffn_gate_exps->type == DS4_TENSOR_GO1B ||
+               layer->ffn_gate_exps->type == DS4_TENSOR_GO2B)) {
+        /* go1b (strict 1-bit) and go2b (2-bit ±d1±d2, monolithic mixed base) routed
+         * experts have no hand-written mul_mv_id decode kernel; they run exclusively
+         * through the grouped mm_id matmul, which is a correct general GEMM even at
+         * n_tokens=1.  Route single-token decode through the batch-tensor path (it
+         * forces the mm_id kernel for mv-less quant types via force_mm=nil-mv-pipeline).
+         * go1b_mid_f16 is an unused output here (only the batch caller threads it). */
+        bool go1b_mid_f16 = false;
+        ok = ds4_gpu_routed_moe_batch_tensor(g->routed_out,
+                                             g->routed_gate,
+                                             g->routed_up,
+                                             g->routed_mid,
+                                             g->routed_down,
+                                             residual_set_for(model, il),
+                                             model->map, model->size,
+                                             layer->ffn_gate_exps->abs_offset,
+                                             layer->ffn_up_exps->abs_offset,
+                                             layer->ffn_down_exps->abs_offset,
+                                             layer->ffn_gate_exps->type,
+                                             layer->ffn_down_exps->type,
+                                             gate_expert_bytes, gate_row_bytes,
+                                             down_expert_bytes, down_row_bytes,
+                                             (uint32_t)expert_in_dim,
+                                             (uint32_t)down_in_dim,
+                                             (uint32_t)routed_out_dim,
+                                             tp_expert_split ? es_sel : g->router_selected,
+                                             tp_expert_split ? es_wt  : g->router_weights,
+                                             model_expert_kept_count(model, il),
+                                             es_n, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm,
+                                             il, 1u, 0u, 0u, &go1b_mid_f16) != 0;
+    } else if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
                                                  g->routed_gate,
                                                  g->routed_up,
                                                  g->routed_mid,
                                                  g->routed_down,
+                                                 residual_set_for(model, il),
                                                  model->map, model->size,
                                                  layer->ffn_gate_exps->abs_offset,
                                                  layer->ffn_up_exps->abs_offset,
@@ -11396,18 +11886,86 @@ static bool metal_graph_encode_decode_layer(
                     (ar_t1 - ar_t_drain) * 1e3, (ar_t1 - ar_t0) * 1e3);
         }
     }
+    /* zchain λ(x): scale the (now complete) routed output. After the TP
+     * all-reduce so every path sees the full routed sum; before the additive
+     * corr, matching the quantizer's op order (λ never scales corr terms). */
+    if (ok && (ds4_zchain_layer_has_lambda(model->zchain, il) ||
+               ds4_zchain_layer_zl(model->zchain, il))) {   /* λ 和/或 冻结 z^L 同一派发 */
+        ok = ds4_gpu_zchain_scale_routed(g->routed_out, g->ffn_norm, il, 1) != 0;
+    }
+    /* go1b correction: add the low-rank per-expert residual onto the (now full)
+     * routed MoE output. Placed after the TP all-reduce so routed_out is complete
+     * for every path (single-host, layer-sliced, and TP expert-split); g->ffn_norm
+     * (the expert input x) and g->router_selected (full 6 ids) are still intact. */
+    /* Engine-trajectory decode capture (DS4_CAP_DIR): the perplexity scorer
+     * (teacher-forced trajectory runs) flows token-by-token through HERE, not
+     * the batch path — same shards, one token per call. Reads happen before
+     * the corr mutates routed_out semantics for downstream x̂ definitions
+     * (x̂ = ffn_norm is already final at this point). */
+    if (ok) cap_decode_layer(g, il);
+    /* Consumer-path predicates, hoisted above the corr dispatch: the corr may
+     * only take the store-to-delta form when the fused shared-down consumer
+     * (the one kernel that performs the routed+delta add) is what will run
+     * below — every other consumer keeps the legacy in-place corr. */
+    const bool keep_ffn_out = metal_graph_needs_ffn_out(g, il, pos);
+    const char *tp_split_env = getenv("DS4_TP_SHARED_SPLIT");
+    const bool tp_shared_split =
+        g->tp && il < g->tp_layers &&
+        tp_split_env && tp_split_env[0] && tp_split_env[0] != '0' &&
+        (shared_dim % 64u) == 0;   /* half must stay 32-block aligned */
+    const bool fuse_shared_down_hc =
+        !tp_shared_split &&
+        !keep_ffn_out && !metal_graph_use_reference_shared_down_hc();
+    bool corr_delta_live = false;
+    /* DS4_CORR_SKIP=1: load the sidecar but skip the decode dispatch — perf
+     * splitter isolating "corr resident" from "corr kernel dispatched". */
+    if (ok && model->corr && il < DS4_MAX_LAYER && model->corr->layer[il].present &&
+        !getenv("DS4_CORR_SKIP")) {
+        const ds4_corr_layer *cl = &model->corr->layer[il];
+        /* For go1b the routed MoE (offload batch-tensor path) REMAPS g->router_selected
+         * to compact slots IN PLACE before this point, so the corr must index per-expert
+         * C[e]/beta[e] from the pre-remap snapshot the MoE saved, not the live (corrupted)
+         * selected tensor. Fall back to router_selected for any non-go1b/resident path
+         * that never remaps (snapshot NULL). */
+        const ds4_gpu_tensor *corr_sel = ds4_gpu_corr_saved_selected();
+        if (!corr_sel) corr_sel = g->router_selected;
+        /* φ selector: legacy x = ffn_norm; --feat yhat sidecars read routed_out
+         * itself (kernel phase1 consumes φ fully before phase2 writes out). */
+        const ds4_gpu_tensor *phi = model->corr->phi_yhat ? g->routed_out : g->ffn_norm;
+        if (getenv("DS4_CORR_MODE_TRACE")) {
+            static int traced;
+            if (traced++ < 4)
+                fprintf(stderr, "ds4: corr-mode il=%u fuse=%d delta_buf=%d supported=%d\n",
+                        il, (int)fuse_shared_down_hc, g->corr_delta != NULL,
+                        ds4_gpu_corr_delta_supported());
+        }
+        if (fuse_shared_down_hc && g->corr_delta && ds4_gpu_corr_delta_supported() &&
+            !getenv("DS4_CORR_INPLACE")) {
+            /* Store variant: the tiny corr dispatch writing the hot routed_out
+             * costs a full pipeline drain per layer (measured ~23ms; φ=ŷ makes
+             * it a R/W self-alias). Write the correction to corr_delta and let
+             * the fused shared-down consumer add it — bit-identical fadd. */
+            ok = ds4_gpu_corr_apply_delta(g->corr_delta, phi,
+                                          cl->gU, cl->gV, cl->gC, cl->gb, cl->gbeta,
+                                          corr_sel,
+                                          DS4_N_EMBD, cl->d_l, DS4_N_EXPERT, DS4_N_EXPERT_USED, 1) != 0;
+            corr_delta_live = ok;
+        } else {
+            ok = ds4_gpu_corr_apply(g->routed_out, phi,
+                                    cl->gU, cl->gV, cl->gC, cl->gb, cl->gbeta,
+                                    corr_sel,
+                                    DS4_N_EMBD, cl->d_l, DS4_N_EXPERT, DS4_N_EXPERT_USED, 1) != 0;
+        }
+    }
     /* TP Phase 1 (DS4_TP_SHARED_SPLIT): split the shared-expert dense FFN across
      * the two peers. gate/up are column-parallel (each peer computes its half of
      * the shared_dim rows, compacted into mid[0,half)); down is row-parallel
      * (partial out[n_embd] over the owned input-dim half) then all-reduced. Decode
      * only (this is the n_tok=1 layer encode; prefill stays replicated/full). Halves
      * the shared-FFN weight bandwidth per peer. Off => byte-identical to the legacy
-     * path. tp_owns_low owns the low half, matching the routed-MoE skeleton above. */
-    const char *tp_split_env = getenv("DS4_TP_SHARED_SPLIT");
-    const bool tp_shared_split =
-        g->tp && il < g->tp_layers &&
-        tp_split_env && tp_split_env[0] && tp_split_env[0] != '0' &&
-        (shared_dim % 64u) == 0;   /* half must stay 32-block aligned */
+     * path. tp_owns_low owns the low half, matching the routed-MoE skeleton above.
+     * (tp_shared_split itself is hoisted above the corr dispatch: the corr
+     * delta-vs-in-place choice must know which shared-down consumer runs.) */
     const uint32_t tp_half = shared_dim / 2u;
     const uint32_t tp_out_start = g->tp_owns_low ? 0u : tp_half;
     const bool fuse_shared_gate_up =
@@ -11455,10 +12013,7 @@ static bool metal_graph_encode_decode_layer(
                                            shared_dim, DS4_SWIGLU_CLAMP_EXP, 1.0f) != 0;
     }
     DS4_METAL_PROFILE_DECODE_STAGE("shared_gate_up");
-    const bool keep_ffn_out = metal_graph_needs_ffn_out(g, il, pos);
-    const bool fuse_shared_down_hc =
-        !tp_shared_split &&
-        !keep_ffn_out && !metal_graph_use_reference_shared_down_hc();
+    /* keep_ffn_out / fuse_shared_down_hc are declared above the corr dispatch */
     if (ok && tp_shared_split) {
         /* row-parallel down: partial out[n_embd] over the owned in-dim half (x is
          * the compacted shared_mid[0, tp_half); the weight starts tp_out_start/32
@@ -11494,6 +12049,7 @@ static bool metal_graph_encode_decode_layer(
                                                          g->routed_out,
                                                          g->after_attn_hc,
                                                          g->hc_split,
+                                                         corr_delta_live ? g->corr_delta : NULL,
                                                          DS4_N_EMBD,
                                                          DS4_N_HC) != 0;
     } else if (ok) {
@@ -11882,7 +12438,7 @@ static void metal_graph_trace_layer_stages(
         layer_hash_selected_experts(selected, model, layer, token);
         layer_hash_router_weights_one(expert_weight, model, layer, cpu_ffn_norm, selected);
     } else {
-        layer_topk_selected_experts(selected, expert_weight, model, layer, cpu_ffn_norm);
+        layer_topk_selected_experts(selected, expert_weight, model, layer, cpu_ffn_norm, corr_layer_delta(model, il));
     }
     for (uint32_t i = 0; i < DS4_N_EMBD; i++) cpu_ffn_out[i] = cpu_shared[i] + cpu_routed[i];
     hc_post_one(cpu_after_ffn_hc, cpu_ffn_out, cpu_after_attn_hc, ffn_post, ffn_comb, DS4_N_EMBD, DS4_N_HC);
@@ -12106,7 +12662,9 @@ static int metal_graph_decode_test(
         layer_hash_selected_experts(selected, model, layer, token);
         layer_hash_router_weights_one(expert_weight, model, layer, cpu_ffn_norm, selected);
     } else {
-        layer_topk_selected_experts(selected, expert_weight, model, layer, cpu_ffn_norm);
+        /* this diagnostic threads layer index 0 into the prealloc above; keep the
+         * router delta on the same layer so the selection stays consistent. */
+        layer_topk_selected_experts(selected, expert_weight, model, layer, cpu_ffn_norm, corr_layer_delta(model, 0));
     }
     for (uint32_t i = 0; i < DS4_N_EMBD; i++) cpu_ffn_out[i] = cpu_shared[i] + cpu_routed[i];
     hc_post_one(cpu_after_ffn_hc,
@@ -14244,6 +14802,14 @@ static bool metal_graph_encode_layer_ffn_batch(
                                              g->batch_ffn_norm,
                                              n_tokens) != 0;
 
+    /* go1b correction: bias raw router logits by delta[e] before top-k (broadcast
+     * over the n_tokens rows). Score-routed layers only; δ≡0 skips the dispatch. */
+    if (ok && model->corr && il < DS4_MAX_LAYER && model->corr->layer[il].present &&
+        model->corr->layer[il].has_delta && layer->ffn_gate_tid2eid == NULL) {
+        ok = ds4_gpu_corr_router_bias(g->batch_router_logits, model->corr->layer[il].gdelta,
+                                      DS4_N_EXPERT, n_tokens) != 0;
+    }
+
     if (ok) ok = ds4_gpu_router_select_batch_tensor(g->batch_router_selected,
                                                       g->batch_router_weights,
                                                       g->batch_router_probs,
@@ -14275,6 +14841,12 @@ static bool metal_graph_encode_layer_ffn_batch(
     }
     DS4_METAL_PROFILE_FFN_STAGE("router");
 
+    /* zchain GE: fold per-expert gains into the router weights (original ids;
+     * before the compact-slot translate and before the go1b MoE's in-place remap). */
+    if (ok && model->zchain && ds4_zchain_layer_ge(model->zchain, il)) {
+        ok = ds4_gpu_zchain_ge_apply(g->batch_router_weights, g->batch_router_selected,
+                                     il, DS4_N_EXPERT_USED, n_tokens) != 0;
+    }
     /* Translate full-256 router ids to compact slots for a shrunken model (no-op
      * for a full model). All n_tokens rows share the same per-layer LUT. */
     if (ok && model->expert_shrunken) {
@@ -14308,6 +14880,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                g->batch_routed_up,
                                                g->batch_routed_mid,
                                                g->batch_routed_down,
+                                               residual_set_for(model, il),
                                                model->map,
                                                model->size,
                                                layer->ffn_gate_exps->abs_offset,
@@ -14351,6 +14924,39 @@ static bool metal_graph_encode_layer_ffn_batch(
         if (ok) ok = ds4_gpu_tensor_write(g->batch_routed_out, 0, arbuf,
                                           ar_n * sizeof(float)) != 0;
         free(arbuf);
+    }
+    /* zchain λ(x): scale the (fully summed) routed output before the additive
+     * corr — quantizer op-order parity. */
+    if (ok && (ds4_zchain_layer_has_lambda(model->zchain, il) ||
+               ds4_zchain_layer_zl(model->zchain, il))) {   /* λ 和/或 冻结 z^L 同一派发 */
+        ok = ds4_gpu_zchain_scale_routed(g->batch_routed_out, g->batch_ffn_norm,
+                                         il, n_tokens) != 0;
+    }
+    /* Engine-trajectory batch capture (DS4_CAP_DIR [+DS4_CAP_LAYERS lo-hi]):
+     * append this chunk's x̂ / routing / raw router logits / gate weights as
+     * raw f16/i16 shards — THE ground-truth student trajectory for error-
+     * feedback calibration (the Python fp32-backbone simulation drifts from
+     * the engine in deep layers; R2 verdict). ffn_norm and router_logits are
+     * final at this point; selected uses the same pre-remap snapshot the corr
+     * dispatch uses. Off unless DS4_CAP_DIR is set. */
+    if (ok) cap_batch_layer(g, il, n_tokens);
+    /* go1b correction: per-token low-rank residual onto the full routed MoE output
+     * (after any TP all-reduce). x=g->batch_ffn_norm, selected=g->batch_router_selected. */
+    if (ok && model->corr && il < DS4_MAX_LAYER && model->corr->layer[il].present) {
+        const ds4_corr_layer *cl = &model->corr->layer[il];
+        /* Same remap hazard as decode: the go1b batch MoE rewrites batch_router_selected
+         * to compact slots in place, so read the pre-remap snapshot (per-token original
+         * ids, [n_tokens][n_expert_used]); fall back to the live tensor if not go1b. */
+        const ds4_gpu_tensor *corr_sel = ds4_gpu_corr_saved_selected();
+        if (!corr_sel) corr_sel = g->batch_router_selected;
+        ok = ds4_gpu_corr_apply(g->batch_routed_out,
+                                model->corr->phi_yhat ? g->batch_routed_out : g->batch_ffn_norm,
+                                cl->gU, cl->gV, cl->gC, cl->gb, cl->gbeta,
+                                corr_sel,
+                                DS4_N_EMBD, cl->d_l, DS4_N_EXPERT, DS4_N_EXPERT_USED, n_tokens) != 0;
+        if (getenv("DS4_RESIDUAL_DEBUG"))
+            fprintf(stderr, "ds4: [corr-batch] L%u ok=%d d_l=%u ntok=%u gU=%p gC=%p\n",
+                    il, ok, cl->d_l, n_tokens, (void*)cl->gU, (void*)cl->gC);
     }
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->batch_routed_gate,
@@ -16099,6 +16705,17 @@ struct ds4_engine {
     ds4_backend backend;
     int mtp_draft_tokens;
     float mtp_margin;
+    /* Go trie drafter for copy-spec (--go-trie / DS4_GO_TRIE); NULL = off. */
+    struct ds4_gotrie *go_trie;
+    /* knowledge-MTP reference corpus (ds4_mtp.c: built-in idioms +
+     * DS4_REF_CORPUS extension files). Always built at init; NULL only on
+     * OOM, and every module entry point accepts NULL as "no corpus". */
+    ds4_refcorpus *ref_corpus;
+    /* 多模态 registry (ds4_multimodal.c): modality -> text/tokens. The
+     * "image" family auto-binds the frontend-domain UI-sketch encoder at
+     * open (DS4_MM_IMAGE_CMD env > ./mm-ui). NULL only on OOM; consumers
+     * fail closed on NULL rather than fake support. */
+    ds4_mm *mm;
     char *directional_steering_file;
     float *directional_steering_dirs;
     float directional_steering_attn_scale;
@@ -16113,6 +16730,44 @@ struct ds4_engine {
     ds4_dist_tp *tp;
     bool tp_owns_low; /* coordinator owns low expert positions */
 };
+
+/* knowledge-MTP bridge (ds4_mtp.c): the module is tokenizer-agnostic, so the
+ * engine adapts its own tokenizer to the module callback shape. Token arrays
+ * are plain malloc'd (token_vec uses xrealloc), so ownership can move to the
+ * module and be freed there. */
+static void engine_mtp_tokenize_cb(void *ctx, const char *text, int **toks, int *n) {
+    ds4_engine *e = ctx;
+    ds4_tokens t = {0};
+    ds4_tokenize_text(e, text, &t);
+    *toks = t.v;
+    *n = t.len;
+}
+
+uint32_t ds4_engine_ref_match(ds4_engine *e, const int *tail, uint32_t len,
+                              uint32_t min_g, uint32_t cap,
+                              int *out, uint32_t *out_n) {
+    if (out_n) *out_n = 0;
+    if (!e) return 0;
+    return ds4_refcorpus_match(e->ref_corpus, tail, len, min_g, cap, out, out_n);
+}
+
+/* 前端域 enricher adapters (ds4_spatial.c / ds4_css.c): both are pure
+ * closed-form derivations over the UI-sketch text, registered on the image
+ * family at open. Non-sketch encoder output makes them return NULL, which
+ * the registry treats as "no section". */
+static char *engine_mm_spatial_enrich(void *ctx, const char *modality,
+                                      const char *text) {
+    (void)ctx;
+    (void)modality;
+    return ds4_spatial_annotate(text);
+}
+
+static char *engine_mm_css_enrich(void *ctx, const char *modality,
+                                  const char *text) {
+    (void)ctx;
+    (void)modality;
+    return ds4_css_annotate(text);
+}
 
 static bool cpu_directional_steering_enabled(
         const float *dirs,
@@ -17468,6 +18123,34 @@ struct ds4_session {
     uint32_t prefill_cap;
     int ctx_size;
     bool checkpoint_valid;
+    /* Anticycle/request-penalty generation boundary: first position of the
+     * CURRENT response's generated region. -1 = unmarked, and the penalty
+     * core then falls back to 0 = the WHOLE context is scanned (legacy
+     * behavior; also the deliberate dual-host-parity default, see
+     * repeat_penalize_buf). Frontends that mark it after prefill
+     * (ds4_session_mark_generation_start / _set_generation_start) scope the
+     * anticycle bans and request penalties to [gen_start, end) only, so
+     * verbatim prompt quoting stops being banned. Reset to -1 whenever the
+     * checkpoint is rebuilt. The env freq-penalty window intentionally
+     * IGNORES this boundary (2026-07-06 mono verdict; see
+     * repeat_penalize_core). */
+    int repeat_gen_start;
+    /* Sampling-lane policy (ds4.h DS4_LANE_*), frontend-declared request
+     * shape. Non-FREE lanes bypass ALL penalties (env freq, anticycle bans,
+     * request penalties): forced tool-call syntax and copy-constrained
+     * emission must see raw logits. Reset to FREE at creation/invalidate --
+     * sessions are reused across requests and a stale lane must not leak. */
+    int lane;
+    /* Per-request OpenAI-style penalties (frequency/presence), FREE lane
+     * only, counted over the generated region [repeat_gen_start, end). May be
+     * negative (OpenAI allows [-2,2] to encourage repetition). (0,0) = off;
+     * frontends re-declare on every request. */
+    float req_freq;
+    float req_presence;
+    /* Greedy speculative acceptance (copy-spec / MTP argmax gating) is only
+     * distribution-preserving at temperature 0; frontends clear this for
+     * sampled requests. Default 1 = legacy greedy-ok. */
+    int spec_greedy;
     bool mtp_draft_valid;
     /* Adaptive copy-spec draft length (single-machine prompt-lookup speculation).
      * Converges toward the length the target reliably accepts: grow on a full
@@ -17481,7 +18164,30 @@ struct ds4_session {
      * leaks through each cooldown so it re-arms the moment text becomes
      * predictable again. */
     int cs_cooldown;
+    /* Go-trie drafter cooldown, deliberately separate from cs_cooldown: a trie
+     * partial accept must not suppress the (independently profitable) n-gram
+     * drafter, and vice versa. Measured on go1b/A3: sharing the cooldown +
+     * letting trie partials shrink cs_draft_len cost -25% gen t/s by starving
+     * n-gram batches (fable5.md prompt2 table). */
+    int gt_cooldown;
+    /* Reference-corpus drafter cooldown -- its own for the same
+     * non-contamination reason as gt_cooldown. */
+    int rc_cooldown;
 };
+
+/* Per-request sampling-policy defaults. Called at session creation AND from
+ * ds4_session_invalidate: the server reuses one session across requests, so a
+ * stale lane / request penalty / spec-greedy flag from the previous request
+ * must never leak into the next (the ds4.h contract makes frontends
+ * re-declare all of them per request). repeat_gen_start goes back to -1 =
+ * unmarked, same as a checkpoint rebuild. */
+static void session_reset_request_policy(ds4_session *s) {
+    s->lane = DS4_LANE_FREE;
+    s->req_freq = 0.0f;
+    s->req_presence = 0.0f;
+    s->spec_greedy = 1;
+    s->repeat_gen_start = -1;
+}
 
 /* =========================================================================
  * Session Snapshot Payloads.
@@ -19770,7 +20476,11 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
 
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
     ds4_profile_load_begin();
+    /* BASE model: the only open allowed to arm go1b/go2b env defaults (the
+     * MTP draft open below and all sidecar opens leave the flag false). */
+    g_model_open_arm_env_defaults = true;
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
+    g_model_open_arm_env_defaults = false;
     if (opt->warm_weights) model_warm_weights(&e->model);
     if (!opt->inspect_only) vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);
@@ -19778,6 +20488,101 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     if (opt->inspect_only) {
         *out = e;
         return 0;
+    }
+
+    /* go1b "hidden variable z^L" four-loss correction sidecar. An explicit --corr
+     * PATH is always honoured; otherwise, when this model uses strict-1-bit (go1b)
+     * routed experts, auto-detect ds4-go1b-corr.gguf next to the -m model. Absent
+     * or unreadable => exactly the pure 1-bit path (fully backward compatible). */
+    {
+        const char *corr_path = opt->corr_path;
+        char corr_auto[1024];
+        if (!corr_path || !corr_path[0]) {
+            bool is_go1b = false;
+            for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+                if (e->weights.layer[il].ffn_gate_exps &&
+                    e->weights.layer[il].ffn_gate_exps->type == DS4_TENSOR_GO1B) {
+                    is_go1b = true;
+                    break;
+                }
+            }
+            if (is_go1b && opt->model_path) {
+                const char *slash = strrchr(opt->model_path, '/');
+                if (slash) {
+                    size_t dlen = (size_t)(slash - opt->model_path) + 1;   /* keep '/' */
+                    if (dlen < sizeof(corr_auto) - sizeof("ds4-go1b-corr.gguf")) {
+                        memcpy(corr_auto, opt->model_path, dlen);
+                        memcpy(corr_auto + dlen, "ds4-go1b-corr.gguf", sizeof("ds4-go1b-corr.gguf"));
+                        if (access(corr_auto, R_OK) == 0) corr_path = corr_auto;
+                    }
+                } else if (access("ds4-go1b-corr.gguf", R_OK) == 0) {
+                    snprintf(corr_auto, sizeof(corr_auto), "ds4-go1b-corr.gguf");
+                    corr_path = corr_auto;
+                }
+            }
+        }
+        if (corr_path && corr_path[0]) {
+            e->model.corr = corr_load(corr_path, graph_backend);
+        }
+        /* 1-bit residual sidecar (--residual): a second go1b layer per hot expert,
+         * summed into the base expert output. Absent => single 1-bit (today). */
+        {   /* --residual / DS4_RESIDUAL(2026-07-14): server 等无 CLI 旋钮的宿主经 env 挂热残差侧车 */
+            const char *res_path = (opt->residual_path && opt->residual_path[0])
+                                 ? opt->residual_path : getenv("DS4_RESIDUAL");
+            if (res_path && res_path[0])
+                e->model.residual = residual_load(res_path, graph_backend);
+        }
+        /* go-onebit 优化链: 外部 --zchain/DS4_ZCHAIN 文件优先(实验覆盖); 否则合一
+         * GGUF 内嵌 blk.L.opt_* 张量(ds4.zchain.present)自动装载。GE 增益乘进
+         * 路由权重 + 逐 token routed 缩放 λ(x)。都缺 => 素颜 1bit+signref 基座。 */
+        {
+            const char *zchain_path = opt->zchain_path && opt->zchain_path[0]
+                                    ? opt->zchain_path : getenv("DS4_ZCHAIN");
+            if (zchain_path && zchain_path[0]) {
+                e->model.zchain = ds4_zchain_load(zchain_path, DS4_N_LAYER,
+                                                  DS4_N_EXPERT, DS4_N_EMBD);
+            } else {
+                e->model.zchain = zchain_from_model(&e->model);
+            }
+#ifndef DS4_NO_GPU
+            if (e->model.zchain && graph_backend &&
+                !zchain_gpu_upload(e->model.zchain)) {
+                fprintf(stderr, "ds4: zchain GPU upload failed -- aborting (no silent quality downgrade)\n");
+                exit(1);
+            }
+#endif
+        }
+        /* Go trie drafter (--go-trie / DS4_GO_TRIE): corpus-statistics proposal
+         * source for single-machine copy-spec. Absent => exactly today's path. */
+        const char *trie_path = opt->go_trie_path && opt->go_trie_path[0]
+                              ? opt->go_trie_path : getenv("DS4_GO_TRIE");
+        if (trie_path && trie_path[0]) e->go_trie = ds4_gotrie_load(trie_path);
+        /* knowledge-MTP reference corpus (ds4_mtp.c): the language-idiom
+         * drafter is inherent -- tokenized from the built-in idiom set (+
+         * DS4_REF_CORPUS extension files) at init, no file, no flag.
+         * Proposals only ever ride the verify batch, so this costs nothing
+         * until an idiom actually matches. */
+        e->ref_corpus = ds4_refcorpus_build(engine_mtp_tokenize_cb, e);
+        /* 多模态 registry, same tokenizer bridge. The image family binds an
+         * external encoder command when one is present -- resolution:
+         * DS4_MM_IMAGE_CMD env, else ./mm-ui (the frontend-domain UI-sketch
+         * tool, `make mm-ui`; cwd-relative like the metal shader dir, so
+         * --chdir applies). Absent => image content is honestly rejected
+         * upstream (server 400s image blocks instead of dropping them). */
+        e->mm = ds4_mm_create(engine_mtp_tokenize_cb, e);
+        if (e->mm) {
+            const char *mm_cmd = getenv("DS4_MM_IMAGE_CMD");
+            if ((!mm_cmd || !mm_cmd[0]) && access("mm-ui", X_OK) == 0)
+                mm_cmd = "./mm-ui";
+            if (mm_cmd && mm_cmd[0] &&
+                ds4_mm_register_command(e->mm, "image", mm_cmd) == 0)
+                fprintf(stderr, "ds4: multimodal image encoder: %s\n", mm_cmd);
+            /* 前端域两插件, 顺序=节顺序: 物理方位先(关系), CSS 后(换算)。
+             * 与编码器解耦: 换编码器(DS4_MM_IMAGE_CMD)后输出若非草图格式,
+             * 两节自然缺席, 不伪造。 */
+            ds4_mm_register_enricher(e->mm, "image", engine_mm_spatial_enrich, NULL);
+            ds4_mm_register_enricher(e->mm, "image", engine_mm_css_enrich, NULL);
+        }
     }
     if (e->backend == DS4_BACKEND_CPU && !cpu_load_directional_steering(e)) {
         ds4_engine_close(e);
@@ -20183,6 +20988,20 @@ int ds4_engine_power(ds4_engine *e) {
     return e ? e->power_percent : 100;
 }
 
+/* R3-h multi-domain sidecar plugin: swap the corr between generations. Load
+ * the NEW sidecar first so a bad path keeps the current domain intact. */
+int ds4_engine_corr_switch(ds4_engine *e, const char *path) {
+    if (!e) return -1;
+    struct ds4_corr *next = NULL;
+    if (path && path[0]) {
+        next = corr_load(path, e->backend == DS4_BACKEND_METAL);
+        if (!next) return -1;
+    }
+    if (e->model.corr) corr_free(e->model.corr);
+    e->model.corr = next;
+    return 0;
+}
+
 int ds4_engine_set_power(ds4_engine *e, int power_percent) {
     if (!e || power_percent < 1 || power_percent > 100) return 1;
     e->power_percent = power_percent;
@@ -20217,6 +21036,23 @@ int ds4_engine_model_id(ds4_engine *e) {
 
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
+    if (e->go_trie) {
+        /* One summary line whenever the trie was armed: fires (batches sent),
+         * free-gate misses (zero-cost skips), accept ratio. This is the whole
+         * measurement story for the drafter, so it prints unconditionally. */
+        fprintf(stderr,
+                "ds4: go-trie summary: fires=%llu gate_miss=%llu sent=%llu "
+                "committed=%llu full=%llu avg_accept=%.2f\n",
+                (unsigned long long)e->go_trie->fires,
+                (unsigned long long)e->go_trie->gate_miss,
+                (unsigned long long)e->go_trie->sent,
+                (unsigned long long)e->go_trie->committed,
+                (unsigned long long)e->go_trie->full,
+                e->go_trie->fires ? (double)e->go_trie->committed / (double)e->go_trie->fires : 0.0);
+        ds4_gotrie_free(e->go_trie);
+    }
+    ds4_refcorpus_free(e->ref_corpus);
+    ds4_mm_free(e->mm);
     weights_free(&e->weights);
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
@@ -20235,6 +21071,9 @@ void ds4_engine_close(ds4_engine *e) {
 /* TP run loops (ds4_distributed.c) reach the engine's peer link through this. */
 ds4_dist_tp *ds4_engine_tp(ds4_engine *e) { return e ? e->tp : NULL; }
 
+/* Server /v1/messages image blocks reach the modality registry through this. */
+ds4_mm *ds4_engine_mm(ds4_engine *e) { return e ? e->mm : NULL; }
+
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
     if (e->backend == DS4_BACKEND_CPU) {
@@ -20244,6 +21083,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         }
         ds4_session *s = xcalloc(1, sizeof(*s));
         s->engine = e;
+        session_reset_request_policy(s);
         s->ctx_size = ctx_size;
         s->prefill_cap = ds4_default_prefill_cap_for_prompt(ctx_size);
         kv_cache_init(&s->cpu_cache, (uint32_t)ctx_size, 0);
@@ -20259,6 +21099,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 
     ds4_session *s = xcalloc(1, sizeof(*s));
     s->engine = e;
+    session_reset_request_policy(s);
     s->ctx_size = ctx_size;
     s->prefill_cap = metal_graph_prefill_cap_for_prompt(ctx_size);
     const char *dist_prefill_env = getenv("DS4_DIST_PREFILL_CAP");
@@ -21012,6 +21853,7 @@ static void ds4_session_note_prefill_progress(void *ud, const char *event, int c
     if (!p || !p->session || !p->prompt) return;
     if (!strcmp(event, "prefill_chunk") && current > 0 && current <= p->prompt->len) {
         p->session->checkpoint.len = 0;
+        p->session->repeat_gen_start = -1;
         for (int i = 0; i < current; i++) token_vec_push(&p->session->checkpoint, p->prompt->v[i]);
         p->session->checkpoint_valid = true;
         p->session->mtp_draft_valid = false;
@@ -21277,10 +22119,52 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
     return i;
 }
 
+static float session_repeat_freq_pen(uint32_t *window_out);
+static void repeat_penalize_buf(ds4_session *s, float *logits, uint32_t end);
+static int session_anticycle_active(void);
+static int session_penalties_active(const ds4_session *s);
+
+/* Anticycle-consistent prep for EXTERNAL verify loops (distributed accept):
+ * temporarily extend the checkpoint with the in-flight draft prefix, apply the
+ * exact penalties/bans the local sampler would use at that position onto the
+ * caller's row logits, then restore. Unified semantics: a banned continuation
+ * simply stops matching ("没有匹配就没有匹配"), the partial-accept machinery
+ * and the next full-logits decode step pick the alternative naturally. */
+void ds4_session_anticycle_prep(ds4_session *s, float *row_logits,
+                                const int *extra, uint32_t n_extra) {
+    if (!s || !row_logits) return;
+    /* Session-aware gate: also covers request penalties (a session with only
+     * req_freq/req_presence armed must still replay them onto the verify row)
+     * and the lane bypass (non-FREE lanes verify against raw logits). */
+    if (!session_penalties_active(s)) return;
+    int saved = s->checkpoint.len;
+    for (uint32_t i = 0; i < n_extra; i++) token_vec_push(&s->checkpoint, extra[i]);
+    repeat_penalize_buf(s, row_logits, (uint32_t)s->checkpoint.len);
+    s->checkpoint.len = saved;
+}
+
 int ds4_session_argmax(ds4_session *s) {
+    /* Non-FREE lanes see raw logits by contract (ds4.h): skip the scratch
+     * copy entirely -- tool-syntax/copy emission sit in the hot decode loop
+     * and repeat_penalize_buf would be a no-op for them anyway. */
+    if (s && s->lane != DS4_LANE_FREE)
+        return sample_argmax(s->logits, DS4_N_VOCAB);
+    if (session_penalties_active(s) && s && s->checkpoint_valid && s->checkpoint.len > 0) {
+        /* penalized greedy must match ds4_session_sample(temp 0); work on a
+         * scratch copy so diagnostic readers of s->logits stay unpolluted */
+        static float *scratch = NULL;
+        if (!scratch) scratch = xmalloc((size_t)DS4_MAX_VOCAB * sizeof(scratch[0]));
+        memcpy(scratch, s->logits, (size_t)DS4_N_VOCAB * sizeof(scratch[0]));
+        repeat_penalize_buf(s, scratch, (uint32_t)s->checkpoint.len);
+        return sample_argmax(scratch, DS4_N_VOCAB);
+    }
     return sample_argmax(s->logits, DS4_N_VOCAB);
 }
 
+/* Raw-logits argmax excluding one id -- deliberately penalty-free, unlike
+ * ds4_session_argmax: its only caller today is ds4-bench forced continuation
+ * (exclude EOS to keep generating), which wants the model's unmodified
+ * second choice for stable speed measurement, not a sampling path. */
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
     if (!s || !s->logits) return -1;
     int best = -1;
@@ -21302,41 +22186,337 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
     return sample_top_p_min_p(logits, (uint32_t)n_vocab, temperature, top_k, top_p, min_p, rng);
 }
 
+/* Env-armed penalty caches. File-scope (not function-local statics) only so
+ * the test-only reset below can drop them after a setenv; production code
+ * reads the env exactly once per process, through the accessors. */
+static int      g_repeat_env_scanned = 0;
+static float    g_repeat_freq_pen = 0.0f;
+static uint32_t g_repeat_freq_window = 128u;
+static int      g_loop_break = -1;
+static int      g_loop_esc_scanned = 0;
+static float    g_loop_esc = 3.0f;
+static int      g_loop_hard_k = 6;
+
+/* Test-only: forget the env caches so tests/ds4_test.c --penalty-unit can
+ * exercise several DS4_REPEAT_FREQ/DS4_REPEAT_WINDOW/DS4_LOOP_BREAK/
+ * DS4_LOOP_ESC/DS4_LOOP_HARD_K configs in one process (and restore the
+ * developer's env for later suites).
+ * extern-declared by the test; deliberately NOT in ds4.h. */
+void ds4_test_reset_penalty_env_cache(void) {
+    g_repeat_env_scanned = 0;
+    g_repeat_freq_pen = 0.0f;
+    g_repeat_freq_window = 128u;
+    g_loop_break = -1;
+    g_loop_esc_scanned = 0;
+    g_loop_esc = 3.0f;
+    g_loop_hard_k = 6;
+}
+
 /* Optional repeat penalty applied to the session logits before sampling. The base
  * model greedy-decodes into short loops on long generation (ds4 has no built-in
  * repeat penalty). Subtract DS4_REPEAT_FREQ per occurrence of each token in the
  * last DS4_REPEAT_WINDOW (default 128) committed tokens: a looping token (high
  * local count) is pushed down, diverse output (each token a few times) barely
  * touched. Off by default. Universal: every sampler caller goes through here. */
-static void session_apply_repeat_penalty(ds4_session *s) {
-    static int on = -1;
-    static float freq_pen = 0.0f;
-    static uint32_t window = 128u;
-    static int gen_start = -1;
-    if (on < 0) {
+static float session_repeat_freq_pen(uint32_t *window_out) {
+    if (!g_repeat_env_scanned) {
         const char *f = getenv("DS4_REPEAT_FREQ");
         const char *w = getenv("DS4_REPEAT_WINDOW");
-        freq_pen = (f && f[0]) ? (float)atof(f) : 0.0f;
-        if (w && w[0]) window = (uint32_t)strtoul(w, NULL, 10);
-        on = freq_pen > 0.0f ? 1 : 0;
-        if (on) fprintf(stderr, "ds4: repeat-penalty freq=%.2f window=%u\n", freq_pen, window);
+        g_repeat_freq_pen = (f && f[0]) ? (float)atof(f) : 0.0f;
+        if (w && w[0]) g_repeat_freq_window = (uint32_t)strtoul(w, NULL, 10);
+        g_repeat_env_scanned = 1;
+        if (g_repeat_freq_pen > 0.0f)
+            fprintf(stderr, "ds4: repeat-penalty freq=%.2f window=%u\n",
+                    g_repeat_freq_pen, g_repeat_freq_window);
     }
-    if (on != 1 || !s || !s->logits || !s->checkpoint_valid || s->checkpoint.len <= 0) return;
-    /* First sample of a generation = end of prompt. Penalize only GENERATED tokens,
-     * never the prompt: the edited file lives in the prompt, so penalizing it would
-     * suppress the legitimate verbatim reproduction and derail the model. With the
-     * prompt excluded, a LARGE window catches a long-period loop (model re-emitting
-     * the whole file) -- its tokens recur in the generated region (count>=2) -- while
-     * the first clean reproduction (count 1) is barely touched. */
-    if (gen_start < 0 || gen_start > s->checkpoint.len) gen_start = s->checkpoint.len;
-    uint32_t len = (uint32_t)s->checkpoint.len;
-    uint32_t gstart = (uint32_t)gen_start;
-    uint32_t start = len > window ? len - window : 0u;
-    if (start < gstart) start = gstart;
-    for (uint32_t i = start; i < len; i++) {
-        int t = s->checkpoint.v[i];
-        if (t >= 0 && t < (int)DS4_N_VOCAB) s->logits[t] -= freq_pen;
+    if (window_out) *window_out = g_repeat_freq_window;
+    return g_repeat_freq_pen > 0.0f ? g_repeat_freq_pen : 0.0f;
+}
+
+/* THE single DS4_LOOP_BREAK read (default ON). Every consumer -- the activity
+ * checks and the ban block in repeat_penalize_core -- goes through this one
+ * cache. The core previously re-did a raw getenv per call, so a mid-process
+ * setenv could make the cached activity decision and the per-call ban
+ * decision disagree (two reads, two cache disciplines). */
+static int session_loop_break_on(void) {
+    if (g_loop_break < 0) {
+        const char *lb = getenv("DS4_LOOP_BREAK");
+        g_loop_break = (lb && lb[0] == '0') ? 0 : 1;
     }
+    return g_loop_break;
+}
+
+/* THE single DS4_LOOP_ESC / DS4_LOOP_HARD_K read (defaults 3.0 / 6): the
+ * escalation slope and the hard-ban repeat count for BOTH anticycle detectors
+ * in repeat_penalize_core. The exact-period and 8-gram self-copy detectors
+ * share these two knobs deliberately -- one repetition-cost policy, no
+ * per-detector tuning surface. Same one-shot cache discipline as
+ * session_loop_break_on (reset via ds4_test_reset_penalty_env_cache). */
+static float session_loop_escalation(int *hard_k_out) {
+    if (!g_loop_esc_scanned) {
+        const char *e = getenv("DS4_LOOP_ESC");
+        const char *k = getenv("DS4_LOOP_HARD_K");
+        if (e && e[0]) g_loop_esc = (float)atof(e);
+        if (k && k[0]) g_loop_hard_k = (int)strtol(k, NULL, 10);
+        /* Negative/NaN slope would REWARD repetition; hard_k < 2 would ban
+         * inside the k>=2 detection floor -- 2 restores the legacy
+         * "third repetition is banned" behavior exactly. */
+        if (!(g_loop_esc >= 0.0f)) g_loop_esc = 0.0f;
+        if (g_loop_hard_k < 2) g_loop_hard_k = 2;
+        g_loop_esc_scanned = 1;
+        if (e || k)
+            fprintf(stderr, "ds4: loop-escalation esc=%.2f hard_k=%d\n",
+                    g_loop_esc, g_loop_hard_k);
+    }
+    if (hard_k_out) *hard_k_out = g_loop_hard_k;
+    return g_loop_esc;
+}
+
+/* Penalize an arbitrary logits row as if the committed stream ended at
+ * checkpoint[0..end): the speculative verify replays the SAME penalty the
+ * non-speculative sampler would have applied at that position, so greedy
+ * speculation stays bit-equivalent with the penalty active (it previously
+ * bypassed the penalty entirely — accepted whole repetition runs raw). */
+static int session_anticycle_active(void) {
+    return session_loop_break_on() == 1 || session_repeat_freq_pen(NULL) > 0.0f;
+}
+
+/* Session-aware penalty-activity gate: env-armed penalties (loop break /
+ * DS4_REPEAT_FREQ) plus this session's per-request penalties -- a session
+ * carrying only req_freq/req_presence must still take the penalized
+ * argmax/anticycle-prep paths. Non-FREE lanes report inactive: the lane
+ * contract (ds4.h) bypasses every penalty, so callers skip the scratch work
+ * outright. */
+static int session_penalties_active(const ds4_session *s) {
+    if (s && s->lane != DS4_LANE_FREE) return 0;
+    if (session_anticycle_active()) return 1;
+    return s && (s->req_freq != 0.0f || s->req_presence != 0.0f);
+}
+
+/* Core repeat/anticycle penalty on `logits` given committed tokens v[0..end)
+ * with the generation region starting at gstart. Extracted so both the
+ * single-machine session sampler and the distributed coordinator (which keeps
+ * its committed stream in a separate transcript, not s->checkpoint) share ONE
+ * implementation — keeping dual-host generation identical to single-host. */
+static void repeat_penalize_core(const int *v, uint32_t end, uint32_t gstart, float *logits) {
+    uint32_t window = 0;
+    const float freq_pen = session_repeat_freq_pen(&window);
+    if (!v || !logits || end == 0) return;
+    if (gstart > end) gstart = end;
+    if (freq_pen > 0.0f) {   /* optional manual tool; auto anti-cycle below is independent */
+        /* Window [end-window, end) is deliberately NOT clamped to gstart:
+         * early in generation the window must include the prompt tail or only
+         * a handful of generated tokens are counted and the penalty is far
+         * too weak for the fragile 2-bit models -- greedy drifts/loops
+         * (2026-07-06 mono verdict). The former clamp here (67ae6c7) was dead
+         * in practice anyway: gstart collapsed to 0 for unmarked sessions.
+         * Only the anticycle bans below and the per-request penalties in
+         * repeat_penalize_buf honor the generation boundary. */
+        uint32_t start = end > window ? end - window : 0u;
+        for (uint32_t i = start; i < end; i++) {
+            int t = v[i];
+            if (t >= 0 && t < (int)DS4_N_VOCAB) logits[t] -= freq_pen;
+        }
+    }
+    /* Anti-cycle loop breaker (default ON, DS4_LOOP_BREAK=0 disables): the
+     * frequency penalty is too blunt for multi-token cycles — a 12-token
+     * block repeats several times before per-token −freq accumulates past the
+     * attractor's logit margin. Two detectors below (exact period, 8-gram
+     * self-copy), both hitting ONLY the continuation token the repetition
+     * predicts next, both scanning the GENERATED region [gstart, end) alone:
+     * quoting a block that repeats in the prompt is legitimate output, not a
+     * loop — gstart is 0 (whole context) only for sessions whose frontend
+     * never marked the generation start. Applies to sampling, greedy and
+     * speculative verify uniformly (same boundary); teacher-forced NLL
+     * scoring never samples, so quality metrics are unaffected.
+     *
+     * GRADUATED escalation, not a third-strike ban: the former rule "twice is
+     * legit structure, the third repeat is a loop => -inf" mis-fired on legal
+     * bounded repetition — "write X five times" died at copy 3, markdown /
+     * ASCII separator rows (short token cycles) lost their third period, and
+     * the third `if err != nil { return err }` in one Go response had its
+     * continuation banned, producing wrong code. Instead, a repetition count
+     * of k costs the continuation ESC·(k−1), and only k >= K_HARD hard-bans
+     * (-1e30). Why the ramp separates loops from instructions: a degenerate
+     * greedy attractor cycles on a SMALL logit margin (the model drifted into
+     * it; nothing upstream demands it), so the growing penalty overtakes it
+     * within ~1-2 extra periods — bounded waste before the break. Genuinely
+     * instructed repetition rides a LARGE margin (prompt evidence keeps
+     * re-asserting the next copy) and survives the ramp through K_HARD−1
+     * legal repeats. The hard cap guarantees termination even for a
+     * pathological attractor whose margin outruns the ramp. Both detectors
+     * share the two knobs — DS4_LOOP_ESC (default 3.0) and DS4_LOOP_HARD_K
+     * (default 6) — read once in session_loop_escalation. */
+    if (!session_loop_break_on()) return;
+    {
+        int hard_k = 0;
+        const float esc = session_loop_escalation(&hard_k);
+        const uint32_t avail = end - gstart;
+        /* exact period: smallest P whose last two windows match, then count
+         * the CONSECUTIVE complete periods k ending at `end` by extending the
+         * v[i]==v[i+P] run backwards — the escalation needs the true k, not
+         * just "at least 2" — and escalate on the continuation v[end-P]. */
+        for (uint32_t P = 1; P <= 64u && 2u * P <= avail; P++) {
+            bool m = true;
+            for (uint32_t j = 0; j < P; j++)
+                if (v[end - P + j] != v[end - 2u * P + j]) { m = false; break; }
+            if (!m) continue;
+            /* ext = length of the maximal v[i]==v[i+P] run ending at end-P;
+             * the periodic span is ext+P tokens, so k = 1 + ext/P complete
+             * periods (integer division drops a partial leading period).
+             * k >= 2 here: the 2P match above already proves ext >= P. */
+            uint32_t ext = 0, i = end - P;
+            while (i > gstart && v[i - 1u] == v[i - 1u + P]) { i--; ext++; }
+            const uint32_t k = 1u + ext / P;
+            int cont = v[end - P];
+            if (cont >= 0 && cont < (int)DS4_N_VOCAB) {
+                if (k >= (uint32_t)hard_k) logits[cont] = -1.0e30f;
+                else                       logits[cont] -= esc * (float)(k - 1u);
+            }
+            break;
+        }
+        /* long-range self-copy: the current 8-suffix already appeared n >= 2
+         * times in the GENERATED region with the same continuation; choosing
+         * that continuation would emit instance n+1, so the prior-occurrence
+         * count n plays the role of k above — same ramp, same hard cap. */
+        const uint32_t NG = 8;
+        if (avail > NG) {
+            uint32_t seen[8] = {0};   /* count per distinct continuation, tiny */
+            int      ids[8]; uint32_t nid = 0;
+            for (uint32_t pos = gstart; pos + NG < end; pos++) {
+                bool m = true;
+                for (uint32_t j = 0; j < NG; j++)
+                    if (v[pos + j] != v[end - NG + j]) { m = false; break; }
+                if (!m) continue;
+                int cont = v[pos + NG];
+                uint32_t q = 0;
+                while (q < nid && ids[q] != cont) q++;
+                if (q == nid && nid < 8u) { ids[nid] = cont; seen[nid] = 0; nid++; }
+                if (q < 8u) seen[q < nid ? q : nid - 1u]++;
+            }
+            for (uint32_t q = 0; q < nid; q++) {
+                if (seen[q] < 2u || ids[q] < 0 || ids[q] >= (int)DS4_N_VOCAB) continue;
+                if (seen[q] >= (uint32_t)hard_k) logits[ids[q]] = -1.0e30f;
+                else                             logits[ids[q]] -= esc * (float)(seen[q] - 1u);
+            }
+        }
+    }
+}
+
+static void repeat_penalize_buf(ds4_session *s, float *logits, uint32_t end) {
+    if (!s || !logits || end == 0) return;
+    /* Lane gate (ds4.h contract): non-FREE lanes get raw logits, no penalty
+     * of any kind. A penalty-diverted token corrupts forced tool-call syntax,
+     * and the anticycle self-copy ban would forbid exactly the verbatim
+     * context reuse the copy-emission contract requires. */
+    if (s->lane != DS4_LANE_FREE) return;
+    /* Unmarked (-1) → 0 = whole context, NOT the prompt boundary (end).
+     * Pinning to `end` excluded the prompt from the repeat window, which left
+     * only the few generated tokens penalized early in generation → far too
+     * weak for the fragile 2-bit model, so greedy decode drifted/looped. The
+     * distributed coordinator's session starts invalidated
+     * (repeat_gen_start=-1) and hit this path → dual-host drifted where
+     * single-host (which stays at 0) wrote clean code (2026-07-06 root-cause:
+     * dual "bug" was this single-vs-dist gen_start mismatch, not cross-GPU
+     * fp). 0 keeps both paths identical for unmarked sessions. NEW (lane
+     * era): frontends now mark the real boundary via
+     * ds4_session_mark_generation_start / _set_generation_start, which scopes
+     * the anticycle bans + request penalties below to the generated region so
+     * quoting the prompt is never banned; the env freq window keeps ignoring
+     * the boundary either way (see repeat_penalize_core). */
+    if (s->repeat_gen_start < 0 || s->repeat_gen_start > (int)end)
+        s->repeat_gen_start = 0;
+    const uint32_t gstart = (uint32_t)s->repeat_gen_start;
+    repeat_penalize_core(s->checkpoint.v, end, gstart, logits);
+    /* Per-request OpenAI penalties, stacked on top of the env freq penalty:
+     * logits[t] -= req_freq*count(t) + (count(t)>0 ? req_presence : 0), with
+     * count over the generated region only. Negative values are legal and
+     * ADD probability (OpenAI [-2,2]). The `seen` scratch marks first
+     * occurrences and is wiped by re-walking the same range, so cost stays
+     * O(region), not O(vocab); single graph worker => static is safe (same
+     * discipline as the ds4_session_argmax scratch). */
+    if (s->req_freq != 0.0f || s->req_presence != 0.0f) {
+        static uint8_t *seen = NULL;
+        if (!seen) seen = xcalloc((size_t)DS4_MAX_VOCAB, sizeof(seen[0]));
+        for (uint32_t i = gstart; i < end; i++) {
+            const int t = s->checkpoint.v[i];
+            if (t < 0 || t >= (int)DS4_N_VOCAB) continue;
+            logits[t] -= s->req_freq;
+            if (!seen[t]) { seen[t] = 1; logits[t] -= s->req_presence; }
+        }
+        for (uint32_t i = gstart; i < end; i++) {
+            const int t = s->checkpoint.v[i];
+            if (t >= 0 && t < (int)DS4_N_VOCAB) seen[t] = 0;
+        }
+    }
+}
+
+/* Exposed for the distributed coordinator's plain-decode loop (ds4_distributed.c),
+ * which samples from a raw logits buffer using its own transcript (prompt +
+ * generated) rather than a ds4_session checkpoint. Applies the identical freq +
+ * anticycle penalty so dual-host generation matches single-host — the plain dist
+ * path previously sampled RAW logits and drifted/looped on long generation.
+ * LIMITATION: there is no ds4_session here, so per-request penalties
+ * (ds4_session_set_request_penalties) and the lane bypass do NOT apply -- the
+ * caller owns the transcript and must gate the call by its own lane state and
+ * apply request penalties itself if it ever carries them. */
+void ds4_repeat_penalize_tokens(float *logits, const int *toks, uint32_t n_committed,
+                                uint32_t gen_start) {
+    repeat_penalize_core(toks, n_committed, gen_start, logits);
+}
+
+/* ---- Sampling-lane / per-request policy (contract in ds4.h) ----
+ * Pure session-state setters/getters; the semantics live in
+ * repeat_penalize_buf / session_penalties_active above. All NULL-tolerant:
+ * frontends call them unconditionally on paths where the session may not
+ * exist yet. */
+void ds4_session_set_lane(ds4_session *s, int lane) {
+    if (!s) return;
+    /* Unknown lane ids fall back to FREE (penalties active): the safe default
+     * is current behavior, not an accidental penalty bypass. */
+    if (lane != DS4_LANE_TOOL_SYNTAX && lane != DS4_LANE_COPY_EMISSION)
+        lane = DS4_LANE_FREE;
+    s->lane = lane;
+}
+
+int ds4_session_lane(const ds4_session *s) {
+    return s ? s->lane : DS4_LANE_FREE;
+}
+
+/* Pin the generation boundary at the live checkpoint length: call after the
+ * prompt is fully prefilled, before the first sampled token of a response. */
+void ds4_session_mark_generation_start(ds4_session *s) {
+    if (!s) return;
+    s->repeat_gen_start = s->checkpoint.len;
+}
+
+/* Explicit boundary for rebuilds whose checkpoint already contains generated
+ * tokens (server re-sync of a transcript with a known assistant tail). */
+void ds4_session_set_generation_start(ds4_session *s, int pos) {
+    if (!s) return;
+    if (pos < 0) pos = 0;
+    if (pos > s->checkpoint.len) pos = s->checkpoint.len;
+    s->repeat_gen_start = pos;
+}
+
+void ds4_session_set_request_penalties(ds4_session *s, float freq, float presence) {
+    if (!s) return;
+    s->req_freq = freq;
+    s->req_presence = presence;
+}
+
+void ds4_session_set_spec_greedy(ds4_session *s, int greedy_ok) {
+    if (!s) return;
+    s->spec_greedy = greedy_ok ? 1 : 0;
+}
+
+int ds4_session_spec_greedy_ok(const ds4_session *s) {
+    return s ? s->spec_greedy : 1;
+}
+
+static void session_apply_repeat_penalty(ds4_session *s) {
+    if (!s || !s->logits || !s->checkpoint_valid || s->checkpoint.len <= 0) return;
+    repeat_penalize_buf(s, s->logits, (uint32_t)s->checkpoint.len);
 }
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
@@ -21530,7 +22710,56 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
     return rc;
 }
 
-/* Single-machine copy-speculation (prompt-lookup), DS4_COPY_SPEC=1.
+/* Append N KNOWN tokens to the live KV in ONE layer-major batch (2026-07-14).
+ *
+ * Motivation: the guided tool-call primer injects dozens of tokens whose values
+ * the SERVER already knows (the DSML structure) -- no sampling involved. Feeding
+ * them one at a time pays the full per-token decode-bandwidth wall each
+ * (measured dual-host: inject=28.9 s for 39 structure tokens vs a 352-token
+ * batched prefill at 9.9 t/s -- the same expert bytes, 7x the throughput,
+ * because a K-token batch reads the backbone ONCE; see the copy-spec note above
+ * for the same physics).
+ *
+ * This is the batch path WITHOUT the speculative accept/rollback machinery: the
+ * tokens are given, not drafted, so every one commits. Distributed sessions send
+ * a single multi-token WORK span; Metal/CPU sessions use the same batched entry
+ * the resume-prefill already uses. Falls back to a per-token loop on any error
+ * so the caller never needs a second code path. Returns 0 on success. */
+int ds4_session_eval_span(ds4_session *s, const int *tokens, int n,
+                          char *err, size_t errlen) {
+    if (!s || !tokens || n <= 0) {
+        if (errlen) snprintf(err, errlen, "invalid span eval request");
+        return 1;
+    }
+    if (ds4_session_pos(s) + n >= s->ctx_size) {
+        if (errlen) snprintf(err, errlen, "span exceeds context");
+        return 1;
+    }
+    if (n == 1) return ds4_session_eval(s, tokens[0], err, errlen);
+
+    /* Batched path: extend the checkpoint timeline with the known span. The
+     * session's own sync entry drives the backend-specific batch (dist: one
+     * WORK span; metal: resume-prefill), and it is exactly the prompt-prefill
+     * path, so KV rows finalize in the same order as a cold prompt. */
+    ds4_tokens want = {0};
+    if (s->checkpoint_valid)
+        for (int i = 0; i < s->checkpoint.len; i++) ds4_tokens_push(&want, s->checkpoint.v[i]);
+    for (int i = 0; i < n; i++) ds4_tokens_push(&want, tokens[i]);
+    const double t0 = now_sec();
+    int rc = ds4_session_sync_internal(s, &want, err, errlen);
+    ds4_tokens_free(&want);
+    if (rc == 0) {
+        if (g_prof.enabled) ds4_profile_add_decode((uint64_t)n, now_sec() - t0);
+        return 0;
+    }
+    /* Any batch failure: fall back to the exact per-token semantics. */
+    for (int i = 0; i < n; i++)
+        if (ds4_session_eval(s, tokens[i], err, errlen) != 0) return 1;
+    return 0;
+}
+
+/* Single-machine copy-speculation (prompt-lookup). Always armed: it self-gates
+ * per step (no transcript repeat -> plain 1-token decode, zero cost).
  *
  * The cheapest speculative decode and the right lever for repetitive / code
  * output. The drafter is the n-gram matcher (no draft model): it finds the
@@ -21600,13 +22829,70 @@ static int ds4_session_eval_copyspec_argmax(ds4_session *s, int first_token,
             draft_n++;
         }
     }
-    if (draft_n < min_copy) return n_accept;   /* no usable n-gram -> plain 1-token step */
-
-    /* drafts[0] is verified for free against the just-committed token's logits. */
-    if (sample_argmax(s->logits, DS4_N_VOCAB) != drafts[0]) {
-        if (cs_log) fprintf(stderr, "ds4: copy-spec miss first draft=%d\n", drafts[0]);
-        return n_accept;
+    /* drafts[0] is verified for free against the just-committed token's logits
+     * (the free gate): a proposal whose first token is not the target argmax is
+     * dropped before it costs a snapshot or a verify batch. */
+    struct ds4_gotrie *trie = e->go_trie;
+    bool from_trie = false;
+    int top1 = -1;
+    if (draft_n >= min_copy) {
+        session_apply_repeat_penalty(s);
+        top1 = sample_argmax(s->logits, DS4_N_VOCAB);
+        if (top1 != drafts[0]) {
+            if (cs_log) fprintf(stderr, "ds4: copy-spec miss first draft=%d\n", drafts[0]);
+            draft_n = 0;   /* transcript draft dead -> maybe the trie can rescue */
+        }
     }
+    if (draft_n < min_copy && trie) {
+        /* Go trie fallback (--go-trie / DS4_GO_TRIE): when the transcript has no
+         * usable repeat, propose global-corpus boilerplate instead. The chain is
+         * confidence-gated at build+walk time and its first token must equal the
+         * target argmax already in hand, so a wrong trie costs nothing here and
+         * at most one verify batch after this point -- same contract as the
+         * transcript matcher, byte-identical committed stream either way. Its
+         * cooldown is its own (gt_cooldown): trie misses sleep the trie only. */
+        if (s->gt_cooldown > 0) {
+            s->gt_cooldown--;
+        } else {
+            if (top1 < 0) {
+                session_apply_repeat_penalty(s);
+                top1 = sample_argmax(s->logits, DS4_N_VOCAB);
+            }
+            draft_n = ds4_gotrie_propose(trie, s->checkpoint.v, (uint32_t)s->checkpoint.len,
+                                         top1, drafts, cap);
+            from_trie = draft_n > 0;
+        }
+    }
+    /* Reference-corpus fallback (built-in language idioms + DS4_REF_CORPUS):
+     * last in the cascade -- transcript repeat first (session-specific), then
+     * trie statistics (real-corpus, confidence-gated), then the curated
+     * idioms. Free-gated exactly like the others: the idiom continuation's
+     * first token must equal the target argmax already in hand, so a wrong
+     * idiom costs nothing. Cooldown is its own (rc_cooldown). */
+    bool from_ref = false;
+    if (draft_n < min_copy && e->ref_corpus) {
+        if (s->rc_cooldown > 0) {
+            s->rc_cooldown--;
+        } else {
+            if (top1 < 0) {
+                session_apply_repeat_penalty(s);
+                top1 = sample_argmax(s->logits, DS4_N_VOCAB);
+            }
+            uint32_t rn = 0;
+            uint32_t ra = ds4_engine_ref_match(e, s->checkpoint.v,
+                                               (uint32_t)s->checkpoint.len,
+                                               ngram, (uint32_t)cap, drafts, &rn);
+            if (ra > 0 && rn >= min_copy && drafts[0] == top1) {
+                draft_n = rn;
+                from_ref = true;
+            } else {
+                draft_n = 0;   /* anchor absent or argmax disagrees: free skip */
+            }
+        }
+    }
+    if (draft_n < min_copy) return n_accept;   /* no usable draft -> plain 1-token step */
+    const bool gt_log = from_trie && trie->log;
+    if (from_trie) { trie->fires++; trie->sent += draft_n; }
 
     /* Snapshot KV, then batch-verify the whole draft suffix in one pass. */
     ds4_spec_frontier frontier;
@@ -21627,9 +22913,20 @@ static int ds4_session_eval_copyspec_argmax(ds4_session *s, int first_token,
      * proven, so commit_drafts starts at 1. */
     int commit_drafts = 1;
     if (ok) {
+        /* Session-aware: request penalties also demand replay (lossless
+         * accept), and a non-FREE lane skips replay entirely (raw contract). */
+        const int rp_on = session_penalties_active(s);
         for (uint32_t i = 1; i < draft_n; i++) {
             if (drafts[i - 1] == eos_token) break;
-            if (row_tops[i - 1] != drafts[i]) break;
+            int rp_top = row_tops[i - 1];
+            if (rp_on &&
+                metal_graph_read_spec_logits_row(&s->graph, i - 1, row_logits)) {
+                /* replay the exact penalty the non-spec sampler would apply at
+                 * this position (drafts already pushed: window = [0, start+i)) */
+                repeat_penalize_buf(s, row_logits, (uint32_t)start + i);
+                rp_top = sample_argmax(row_logits, DS4_N_VOCAB);
+            }
+            if (rp_top != drafts[i]) break;
             commit_drafts++;
         }
     }
@@ -21645,10 +22942,16 @@ static int ds4_session_eval_copyspec_argmax(ds4_session *s, int first_token,
             }
             s->checkpoint_valid = true;
             s->mtp_draft_valid = false;
-            /* Everything we drafted was accepted -> reach for a longer batch. */
-            s->cs_draft_len = (int)draft_n + 2 > 15 ? 15 : (int)draft_n + 2;
-            if (cs_log) fprintf(stderr, "ds4: copy-spec anchor=%u sent=%u accepted=%d full next_len=%d\n",
-                                ngram, draft_n, commit_drafts, s->cs_draft_len);
+            /* Everything we drafted was accepted -> reach for a longer batch.
+             * cs_draft_len is the n-gram drafter's dial only: trie chains are
+             * confidence-limited per fire, ref-corpus copies are idiom-length-
+             * limited, and neither must retune the n-gram. */
+            if (from_trie) { trie->committed += (uint64_t)commit_drafts; trie->full++; }
+            else if (!from_ref) s->cs_draft_len = (int)draft_n + 2 > 15 ? 15 : (int)draft_n + 2;
+            if (cs_log || gt_log)
+                fprintf(stderr, "ds4: %s anchor=%u sent=%u accepted=%d full next_len=%d\n",
+                        from_trie ? "go-trie" : from_ref ? "ref-corpus" : "copy-spec",
+                        ngram, draft_n, commit_drafts, s->cs_draft_len);
             spec_frontier_free(&frontier); free(row_logits); free(row_tops);
             return n_accept;
         }
@@ -21679,11 +22982,25 @@ static int ds4_session_eval_copyspec_argmax(ds4_session *s, int first_token,
          * next batch at what it actually accepted (mostly-full accepts avoid the
          * partial re-verify cost). This is the self-tuning backoff that keeps
          * copy-spec from ever being a net loss on unpredictable text. */
-        s->cs_draft_len = commit_drafts < 2 ? 2 : commit_drafts;
-        /* If the batch barely paid for its snapshot, cool down before trying again. */
-        if (commit_drafts < 3) s->cs_cooldown = 8;
-        if (cs_log) fprintf(stderr, "ds4: copy-spec anchor=%u sent=%u accepted=%d partial next_len=%d cd=%d\n",
-                            ngram, draft_n, commit_drafts, s->cs_draft_len, s->cs_cooldown);
+        /* Drafter-local backoff. A trie/ref partial sleeps ONLY its own drafter
+         * (gt_cooldown/rc_cooldown) and leaves the n-gram drafter's
+         * cs_draft_len/cs_cooldown untouched -- measured: cross-contaminating
+         * them starved profitable n-gram batches for -25% gen t/s. The n-gram
+         * partial keeps its original self-tuning. */
+        if (from_trie) {
+            trie->committed += (uint64_t)commit_drafts;
+            if (commit_drafts < 3) s->gt_cooldown = 8;
+        } else if (from_ref) {
+            if (commit_drafts < 3) s->rc_cooldown = 8;
+        } else {
+            s->cs_draft_len = commit_drafts < 2 ? 2 : commit_drafts;
+            /* If the batch barely paid for its snapshot, cool down before trying again. */
+            if (commit_drafts < 3) s->cs_cooldown = 8;
+        }
+        if (cs_log || gt_log)
+            fprintf(stderr, "ds4: %s anchor=%u sent=%u accepted=%d partial next_len=%d cd=%d\n",
+                    from_trie ? "go-trie" : from_ref ? "ref-corpus" : "copy-spec",
+                    ngram, draft_n, commit_drafts, s->cs_draft_len, s->cs_cooldown);
         spec_frontier_free(&frontier); free(row_logits); free(row_tops);
         return n_accept;
     }
@@ -21804,6 +23121,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
      * this point there is no suffix to verify, so the exact behavior is to emit
      * only first_token and skip all speculative work.
      */
+    session_apply_repeat_penalty(s);
     if (sample_argmax(s->logits, DS4_N_VOCAB) != drafts[0]) {
         if (getenv("DS4_MTP_SPEC_LOG")) {
             fprintf(stderr, "ds4: mtp spec miss first draft=%d\n", drafts[0]);
@@ -22039,10 +23357,22 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         const double micro_verify_done = mtp_timing ? now_sec() : 0.0;
         if (ok) {
             int commit_drafts = 1;
+            /* Session-aware (see copy-spec verify above): request penalties
+             * demand replay; non-FREE lanes verify against raw tops. */
+            const int rp_on = session_penalties_active(s);
+            float *rp_row = NULL;
+            if (rp_on) rp_row = xmalloc((size_t)DS4_N_VOCAB * sizeof(rp_row[0]));
             for (int i = 1; i < draft_n; i++) {
-                if (row_tops[i - 1] != drafts[i]) break;
+                int rp_top = row_tops[i - 1];
+                if (rp_row &&
+                    metal_graph_read_spec_logits_row(&s->graph, (uint32_t)(i - 1), rp_row)) {
+                    repeat_penalize_buf(s, rp_row, (uint32_t)start + (uint32_t)i);
+                    rp_top = sample_argmax(rp_row, DS4_N_VOCAB);
+                }
+                if (rp_top != drafts[i]) break;
                 commit_drafts++;
             }
+            free(rp_row);
             if (mtp_conf_log) {
                 fprintf(stderr,
                         "ds4: mtp conf drafted=%d committed=%d mtp_top=%d runner=%d margin=%.6f target_next=%d draft_next=%d\n",
@@ -22331,6 +23661,10 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
 void ds4_session_invalidate(ds4_session *s) {
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
+    /* Also drops lane/request-penalty/spec-greedy back to defaults (and
+     * repeat_gen_start to -1): an invalidated checkpoint means the next
+     * request re-renders and re-declares its policy from scratch. */
+    session_reset_request_policy(s);
     s->mtp_draft_valid = false;
 }
 
@@ -22352,3 +23686,4 @@ int ds4_session_ctx(ds4_session *s) {
 int ds4_session_prefill_cap(ds4_session *s) {
     return s ? (int)s->prefill_cap : 0;
 }
+

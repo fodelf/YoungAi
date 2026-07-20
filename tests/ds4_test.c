@@ -1,6 +1,8 @@
 #define DS4_SERVER_TEST
 #define DS4_SERVER_TEST_NO_MAIN
 #include "../ds4_server.c"
+#include "../ds4_spatial.h"
+#include "../ds4_css.h"
 #ifndef DS4_NO_GPU
 #include "../ds4_gpu.h"
 #include <math.h>
@@ -606,12 +608,498 @@ static void test_metal_q8_0_rowslice_tp(void) {
     free(weights_raw);
 }
 
+/* ---- go1b strict-1-bit routed-MoE numeric regression -----------------------
+ *
+ * The go1b model first ran but produced a clean repetition loop: in OFFLOAD mode
+ * (over-budget model, non-resident expert mmap views) the routed experts read as
+ * ZEROS because go1b skipped the A3 CPU-gather that q2 uses. This test builds a
+ * synthetic block_go1b routed-expert model (gate/up/down), forces the SAME offload
+ * CPU-gather-to-resident-scratch + mm_id dispatch the real 42 GiB model runs
+ * (DS4_METAL_EXPERT_OFFLOAD=1), and compares the routed-MoE output to a CPU
+ * reference (dequant +/-d per sign bit, gate/up matmul, SwiGLU, route weight, down
+ * matmul, sum over the 6 experts). It catches go1b dequant element-ordering, the
+ * row/expert byte strides ((ncols/256)*34), expert-id indexing, half-scale read,
+ * and -- crucially -- the gather dispatch: if the experts are not gathered into
+ * resident scratch the kernel reads garbage/zeros and the output misses the
+ * (non-trivial) reference by ~100%.
+ *
+ * NB: true page-reclamation non-residency only occurs with a real over-budget
+ * model; a small resident synthetic buffer reads correctly on the GPU regardless
+ * of residency-set membership. This isolates the go1b kernel + gather MATH through
+ * the offload code path; the end-to-end non-residency fix is verified by running
+ * the 42 GiB model (loop -> varied tokens). */
+#define TEST_GO1B_GGML_TYPE 40u   /* DS4_TENSOR_GO1B / DS4_METAL_TENSOR_GO1B */
+
+/* Per-row fp16 scale d, round-tripped through f16 so the reference reads exactly
+ * what dequantize_go1b reads (half d -> +d / -d). */
+static float test_go1b_scale(uint32_t tag, uint32_t e, uint32_t r) {
+    uint32_t h = tag * 0x9E3779B1u + e * 0x85EBCA77u + r * 0xC2B2AE3Du + 0x165667B1u;
+    h ^= h >> 15;
+    return test_f16_to_f32(test_float_to_f16(0.10f + (float)(h % 21u) * 0.005f));
+}
+static uint32_t test_go1b_sign(uint32_t tag, uint32_t e, uint32_t r, uint32_t c) {
+    uint32_t h = tag * 0x27D4EB2Fu + e * 0x9E3779B1u + r * 0x85EBCA77u + c * 0xC2B2AE3Du;
+    h ^= h >> 13; h *= 0x5BD1E995u; h ^= h >> 15;
+    return (h >> 7) & 1u;   /* 1 -> +d, 0 -> -d */
+}
+static float test_go1b_weight(uint32_t tag, uint32_t e, uint32_t r, uint32_t c) {
+    const float d = test_go1b_scale(tag, e, r);
+    return test_go1b_sign(tag, e, r, c) ? d : -d;
+}
+/* Write one go1b expert (rows x cols, cols % 256 == 0) at base. Each row repeats
+ * its fp16 scale into every 256-block and packs 256 sign bits per block. */
+static void test_fill_go1b_expert(uint8_t *base, uint32_t tag, uint32_t e,
+                                  uint32_t rows, uint32_t cols, uint64_t row_bytes) {
+    const uint32_t nblk = cols / 256u;
+    for (uint32_t r = 0; r < rows; r++) {
+        const uint16_t d16 = test_float_to_f16(test_go1b_scale(tag, e, r));
+        uint8_t *row = base + (uint64_t)r * row_bytes;
+        for (uint32_t b = 0; b < nblk; b++) {
+            uint8_t *blk = row + (uint64_t)b * 34u;
+            memcpy(blk, &d16, sizeof(d16));
+            uint8_t *signs = blk + 2u;
+            memset(signs, 0, 32u);
+            for (uint32_t i = 0; i < 256u; i++) {
+                const uint32_t c = b * 256u + i;
+                if (test_go1b_sign(tag, e, r, c)) signs[i >> 3] |= (uint8_t)(1u << (i & 7u));
+            }
+        }
+    }
+}
+
+static void test_metal_go1b_routed_moe(void) {
+    /* Exercise the over-budget OFFLOAD dispatch (CPU gather -> resident scratch ->
+     * mm_id). pread auto-falls back to memcpy with no model fd; force it off so the
+     * synthetic host-buffer model is gathered by memcpy. */
+    setenv("DS4_METAL_EXPERT_OFFLOAD", "1", 1);
+    setenv("DS4_METAL_EXPERT_PREAD", "0", 1);
+
+    /* Real-model shapes: multi-block rows (in_dim=2048 -> 8 go1b blocks/row,
+     * mid_dim=2048 -> 8 blocks) so the test exercises the per-block scale/sign
+     * advance the 42 GiB model uses, not just a single block. */
+    const uint32_t in_dim = 2048, mid_dim = 2048, out_dim = 2048;
+    const uint32_t n_total = 8, n_sel = 6;                      /* mm_id map0 supports 6 */
+    const uint64_t blk = 34u;                                   /* sizeof(block_go1b) */
+    const uint64_t gate_row_bytes = (uint64_t)(in_dim / 256u) * blk;
+    const uint64_t gate_expert_bytes = (uint64_t)mid_dim * gate_row_bytes;
+    const uint64_t down_row_bytes = (uint64_t)(mid_dim / 256u) * blk;
+    const uint64_t down_expert_bytes = (uint64_t)out_dim * down_row_bytes;
+    const uint64_t gate_tensor_bytes = (uint64_t)n_total * gate_expert_bytes;
+    const uint64_t down_tensor_bytes = (uint64_t)n_total * down_expert_bytes;
+    const uint64_t gate_off = 0;
+    const uint64_t up_off   = gate_tensor_bytes;
+    const uint64_t down_off = gate_tensor_bytes * 2u;
+    const uint64_t model_bytes = down_off + down_tensor_bytes;
+    const uint64_t model_alloc = test_round_up_u64(model_bytes, (uint64_t)getpagesize());
+
+    void *model_raw = NULL;
+    TEST_ASSERT(posix_memalign(&model_raw, (size_t)getpagesize(), (size_t)model_alloc) == 0);
+    if (!model_raw) return;
+    uint8_t *model = model_raw;
+    memset(model, 0, (size_t)model_alloc);
+    for (uint32_t e = 0; e < n_total; e++) {
+        test_fill_go1b_expert(model + gate_off + (uint64_t)e * gate_expert_bytes, 0, e, mid_dim, in_dim, gate_row_bytes);
+        test_fill_go1b_expert(model + up_off   + (uint64_t)e * gate_expert_bytes, 1, e, mid_dim, in_dim, gate_row_bytes);
+        test_fill_go1b_expert(model + down_off + (uint64_t)e * down_expert_bytes, 2, e, out_dim, mid_dim, down_row_bytes);
+    }
+
+    const uint32_t sel[6] = {0u, 2u, 4u, 6u, 1u, 3u};   /* 6 distinct of 8 */
+    int32_t sel_i[6];
+    float   rw[6];
+    for (uint32_t s = 0; s < n_sel; s++) { sel_i[s] = (int32_t)sel[s]; rw[s] = 0.4f + 0.1f * (float)s; }
+
+    float *x_host  = malloc((size_t)in_dim * sizeof(float));
+    float *out_host = malloc((size_t)out_dim * sizeof(float));
+    float *ref     = calloc(out_dim, sizeof(float));
+    float *mref    = malloc((size_t)mid_dim * sizeof(float));
+    ds4_gpu_tensor *x   = ds4_gpu_tensor_alloc((uint64_t)in_dim * sizeof(float));
+    ds4_gpu_tensor *gate = ds4_gpu_tensor_alloc((uint64_t)n_sel * mid_dim * sizeof(float));
+    ds4_gpu_tensor *up  = ds4_gpu_tensor_alloc((uint64_t)n_sel * mid_dim * sizeof(float));
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc((uint64_t)n_sel * mid_dim * sizeof(float));
+    ds4_gpu_tensor *experts = ds4_gpu_tensor_alloc((uint64_t)n_sel * out_dim * sizeof(float));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc((uint64_t)out_dim * sizeof(float));
+    ds4_gpu_tensor *sel_t = ds4_gpu_tensor_alloc((uint64_t)n_sel * sizeof(int32_t));
+    ds4_gpu_tensor *wt_t  = ds4_gpu_tensor_alloc((uint64_t)n_sel * sizeof(float));
+
+    if (x_host && out_host && ref && mref && x && gate && up && mid && experts && out && sel_t && wt_t) {
+        for (uint32_t c = 0; c < in_dim; c++)
+            x_host[c] = (float)((int)((c * 7u + 3u) % 29u) - 14) / 35.0f;   /* ~[-0.4, 0.4] */
+
+        TEST_ASSERT(ds4_gpu_tensor_write(x, 0, x_host, (uint64_t)in_dim * sizeof(float)) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(sel_t, 0, sel_i, sizeof(sel_i)) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(wt_t, 0, rw, sizeof(rw)) != 0);
+        TEST_ASSERT(ds4_gpu_set_model_map(model_raw, model_alloc) != 0);
+        ds4_gpu_set_quality(false);   /* the real inference path: fused SwiGLU, f16 mid */
+
+        bool mid_f16 = false;
+        const int ok = ds4_gpu_routed_moe_batch_tensor(
+            out, gate, up, mid, experts,
+            NULL /* residual sidecar: none in this kernel test */,
+            model_raw, model_alloc, gate_off, up_off, down_off,
+            TEST_GO1B_GGML_TYPE, TEST_GO1B_GGML_TYPE,
+            gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+            in_dim, mid_dim, out_dim, sel_t, wt_t, n_total, n_sel,
+            0.0f /* clamp off */, x, 0 /* layer */, 1 /* n_tokens */,
+            0, 0, &mid_f16);
+        TEST_ASSERT(ok != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(out, 0, out_host, (uint64_t)out_dim * sizeof(float)) != 0);
+
+        /* CPU reference: pair p uses expert sel[p] and route weight rw[p]. */
+        for (uint32_t s = 0; s < n_sel; s++) {
+            const uint32_t e = sel[s];
+            for (uint32_t r = 0; r < mid_dim; r++) {
+                float gv = 0.0f, uv = 0.0f;
+                for (uint32_t c = 0; c < in_dim; c++) {
+                    gv += test_go1b_weight(0, e, r, c) * x_host[c];
+                    uv += test_go1b_weight(1, e, r, c) * x_host[c];
+                }
+                const float silu = gv / (1.0f + expf(-gv));
+                mref[r] = silu * uv * rw[s];
+            }
+            for (uint32_t r = 0; r < out_dim; r++) {
+                float ov = 0.0f;
+                for (uint32_t c = 0; c < mid_dim; c++)
+                    ov += test_go1b_weight(2, e, r, c) * mref[c];
+                ref[r] += ov;
+            }
+        }
+
+        float max_abs = 0.0f, sq = 0.0f, ref_sq = 0.0f;
+        for (uint32_t r = 0; r < out_dim; r++) {
+            TEST_ASSERT(isfinite(out_host[r]));
+            const float err = fabsf(out_host[r] - ref[r]);
+            if (err > max_abs) max_abs = err;
+            sq += err * err;
+            ref_sq += ref[r] * ref[r];
+        }
+        const float rms = sqrtf(sq / (float)out_dim);
+        const float ref_rms = sqrtf(ref_sq / (float)out_dim);
+        fprintf(stderr, "ds4: go1b routed-MoE test ref_rms=%.4f rms_err=%.5f max_abs=%.5f (rel=%.4f)\n",
+                ref_rms, rms, max_abs, ref_rms > 0 ? rms / ref_rms : 0.0f);
+        /* A non-gathered (zeroed) expert read would leave out ~ 0 -> rel ~ 1.0. */
+        TEST_ASSERT(ref_rms > 0.5f);
+        TEST_ASSERT(rms < 0.06f * ref_rms);
+        TEST_ASSERT(max_abs < 0.25f * ref_rms);
+    } else {
+        TEST_ASSERT(0 && "go1b routed-MoE test allocation failed");
+    }
+
+    free(x_host); free(out_host); free(ref); free(mref);
+    ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(gate); ds4_gpu_tensor_free(up);
+    ds4_gpu_tensor_free(mid); ds4_gpu_tensor_free(experts); ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(sel_t); ds4_gpu_tensor_free(wt_t);
+    free(model_raw);
+}
+
+/* ---- go2b (2-bit ±d1±d2) routed-MoE cross-GPU numeric regression -----------
+ * Mirrors the go1b test but with the go2b 68-byte block {d1 f16, d2 f16, s1[32],
+ * s2[32]}, value = (s1?+d1:-d1)+(s2?+d2:-d2). Purpose: measure whether the go2b
+ * dequant+matmul is as cross-GPU consistent as go1b (rel 0.0006). If go2b rel
+ * error differs across M1/M4 while go1b matches, the monolithic mixed model's
+ * M1-vs-M4 generation divergence localizes to the go2b kernel. */
+#define TEST_GO2B_GGML_TYPE 41u
+static float test_go2b_d1(uint32_t tag, uint32_t e, uint32_t r) {
+    uint32_t h = tag * 0x9E3779B1u + e * 0x85EBCA77u + r * 0xC2B2AE3Du + 0x165667B1u;
+    h ^= h >> 15;
+    return test_f16_to_f32(test_float_to_f16(0.10f + (float)(h % 21u) * 0.005f));
+}
+static float test_go2b_d2(uint32_t tag, uint32_t e, uint32_t r) {
+    uint32_t h = tag * 0x27D4EB2Fu + e * 0xC2B2AE3Du + r * 0x9E3779B1u + 0x27220A95u;
+    h ^= h >> 14;
+    return test_f16_to_f32(test_float_to_f16(0.03f + (float)(h % 15u) * 0.004f));
+}
+static uint32_t test_go2b_s1(uint32_t tag, uint32_t e, uint32_t r, uint32_t c) {
+    uint32_t h = tag * 0x27D4EB2Fu + e * 0x9E3779B1u + r * 0x85EBCA77u + c * 0xC2B2AE3Du;
+    h ^= h >> 13; h *= 0x5BD1E995u; h ^= h >> 15;
+    return (h >> 7) & 1u;
+}
+static uint32_t test_go2b_s2(uint32_t tag, uint32_t e, uint32_t r, uint32_t c) {
+    uint32_t h = tag * 0x85EBCA77u + e * 0xC2B2AE3Du + r * 0x27D4EB2Fu + c * 0x9E3779B1u;
+    h ^= h >> 12; h *= 0x2545F491u; h ^= h >> 14;
+    return (h >> 9) & 1u;
+}
+static float test_go2b_weight(uint32_t tag, uint32_t e, uint32_t r, uint32_t c) {
+    const float d1 = test_go2b_d1(tag, e, r), d2 = test_go2b_d2(tag, e, r);
+    const float a = test_go2b_s1(tag, e, r, c) ? d1 : -d1;
+    const float b = test_go2b_s2(tag, e, r, c) ? d2 : -d2;
+    return a + b;
+}
+static void test_fill_go2b_expert(uint8_t *base, uint32_t tag, uint32_t e,
+                                  uint32_t rows, uint32_t cols, uint64_t row_bytes) {
+    const uint32_t nblk = cols / 256u;
+    for (uint32_t r = 0; r < rows; r++) {
+        const uint16_t d1_16 = test_float_to_f16(test_go2b_d1(tag, e, r));
+        const uint16_t d2_16 = test_float_to_f16(test_go2b_d2(tag, e, r));
+        uint8_t *row = base + (uint64_t)r * row_bytes;
+        for (uint32_t b = 0; b < nblk; b++) {
+            uint8_t *blk = row + (uint64_t)b * 68u;
+            memcpy(blk, &d1_16, 2u); memcpy(blk + 2u, &d2_16, 2u);
+            uint8_t *s1 = blk + 4u, *s2 = blk + 36u;
+            memset(s1, 0, 32u); memset(s2, 0, 32u);
+            for (uint32_t i = 0; i < 256u; i++) {
+                const uint32_t c = b * 256u + i;
+                if (test_go2b_s1(tag, e, r, c)) s1[i >> 3] |= (uint8_t)(1u << (i & 7u));
+                if (test_go2b_s2(tag, e, r, c)) s2[i >> 3] |= (uint8_t)(1u << (i & 7u));
+            }
+        }
+    }
+}
+static void test_metal_go2b_routed_moe(void) {
+    setenv("DS4_METAL_EXPERT_OFFLOAD", "1", 1);
+    setenv("DS4_METAL_EXPERT_PREAD", "0", 1);
+    const uint32_t in_dim = 2048, mid_dim = 2048, out_dim = 2048;
+    const uint32_t n_total = 8, n_sel = 6;
+    const uint64_t blk = 68u;   /* sizeof(block_go2b) */
+    const uint64_t gate_row_bytes = (uint64_t)(in_dim / 256u) * blk;
+    const uint64_t gate_expert_bytes = (uint64_t)mid_dim * gate_row_bytes;
+    const uint64_t down_row_bytes = (uint64_t)(mid_dim / 256u) * blk;
+    const uint64_t down_expert_bytes = (uint64_t)out_dim * down_row_bytes;
+    const uint64_t gate_tensor_bytes = (uint64_t)n_total * gate_expert_bytes;
+    const uint64_t down_tensor_bytes = (uint64_t)n_total * down_expert_bytes;
+    const uint64_t gate_off = 0, up_off = gate_tensor_bytes, down_off = gate_tensor_bytes * 2u;
+    const uint64_t model_bytes = down_off + down_tensor_bytes;
+    const uint64_t model_alloc = test_round_up_u64(model_bytes, (uint64_t)getpagesize());
+    void *model_raw = NULL;
+    TEST_ASSERT(posix_memalign(&model_raw, (size_t)getpagesize(), (size_t)model_alloc) == 0);
+    if (!model_raw) return;
+    uint8_t *model = model_raw; memset(model, 0, (size_t)model_alloc);
+    for (uint32_t e = 0; e < n_total; e++) {
+        test_fill_go2b_expert(model + gate_off + (uint64_t)e * gate_expert_bytes, 0, e, mid_dim, in_dim, gate_row_bytes);
+        test_fill_go2b_expert(model + up_off   + (uint64_t)e * gate_expert_bytes, 1, e, mid_dim, in_dim, gate_row_bytes);
+        test_fill_go2b_expert(model + down_off + (uint64_t)e * down_expert_bytes, 2, e, out_dim, mid_dim, down_row_bytes);
+    }
+    const uint32_t sel[6] = {0u, 2u, 4u, 6u, 1u, 3u};
+    int32_t sel_i[6]; float rw[6];
+    for (uint32_t s = 0; s < n_sel; s++) { sel_i[s] = (int32_t)sel[s]; rw[s] = 0.4f + 0.1f * (float)s; }
+    float *x_host = malloc((size_t)in_dim * sizeof(float)), *out_host = malloc((size_t)out_dim * sizeof(float));
+    float *ref = calloc(out_dim, sizeof(float)), *mref = malloc((size_t)mid_dim * sizeof(float));
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc((uint64_t)in_dim * sizeof(float));
+    ds4_gpu_tensor *gate = ds4_gpu_tensor_alloc((uint64_t)n_sel * mid_dim * sizeof(float));
+    ds4_gpu_tensor *up = ds4_gpu_tensor_alloc((uint64_t)n_sel * mid_dim * sizeof(float));
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc((uint64_t)n_sel * mid_dim * sizeof(float));
+    ds4_gpu_tensor *experts = ds4_gpu_tensor_alloc((uint64_t)n_sel * out_dim * sizeof(float));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc((uint64_t)out_dim * sizeof(float));
+    ds4_gpu_tensor *sel_t = ds4_gpu_tensor_alloc((uint64_t)n_sel * sizeof(int32_t));
+    ds4_gpu_tensor *wt_t = ds4_gpu_tensor_alloc((uint64_t)n_sel * sizeof(float));
+    if (x_host && out_host && ref && mref && x && gate && up && mid && experts && out && sel_t && wt_t) {
+        for (uint32_t c = 0; c < in_dim; c++)
+            x_host[c] = (float)((int)((c * 7u + 3u) % 29u) - 14) / 35.0f;
+        TEST_ASSERT(ds4_gpu_tensor_write(x, 0, x_host, (uint64_t)in_dim * sizeof(float)) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(sel_t, 0, sel_i, sizeof(sel_i)) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(wt_t, 0, rw, sizeof(rw)) != 0);
+        TEST_ASSERT(ds4_gpu_set_model_map(model_raw, model_alloc) != 0);
+        ds4_gpu_set_quality(false);
+        bool mid_f16 = false;
+        const int ok = ds4_gpu_routed_moe_batch_tensor(
+            out, gate, up, mid, experts, NULL, model_raw, model_alloc, gate_off, up_off, down_off,
+            TEST_GO2B_GGML_TYPE, TEST_GO2B_GGML_TYPE,
+            gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+            in_dim, mid_dim, out_dim, sel_t, wt_t, n_total, n_sel, 0.0f, x, 0, 1, 0, 0, &mid_f16);
+        TEST_ASSERT(ok != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(out, 0, out_host, (uint64_t)out_dim * sizeof(float)) != 0);
+        for (uint32_t s = 0; s < n_sel; s++) {
+            const uint32_t e = sel[s];
+            for (uint32_t r = 0; r < mid_dim; r++) {
+                float gv = 0.0f, uv = 0.0f;
+                for (uint32_t c = 0; c < in_dim; c++) {
+                    gv += test_go2b_weight(0, e, r, c) * x_host[c];
+                    uv += test_go2b_weight(1, e, r, c) * x_host[c];
+                }
+                const float silu = gv / (1.0f + expf(-gv));
+                mref[r] = silu * uv * rw[s];
+            }
+            for (uint32_t r = 0; r < out_dim; r++) {
+                float ov = 0.0f;
+                for (uint32_t c = 0; c < mid_dim; c++) ov += test_go2b_weight(2, e, r, c) * mref[c];
+                ref[r] += ov;
+            }
+        }
+        float max_abs = 0.0f, sq = 0.0f, ref_sq = 0.0f;
+        for (uint32_t r = 0; r < out_dim; r++) {
+            TEST_ASSERT(isfinite(out_host[r]));
+            const float err = fabsf(out_host[r] - ref[r]);
+            if (err > max_abs) max_abs = err; sq += err * err; ref_sq += ref[r] * ref[r];
+        }
+        const float rms = sqrtf(sq / (float)out_dim), ref_rms = sqrtf(ref_sq / (float)out_dim);
+        fprintf(stderr, "ds4: go2b routed-MoE test ref_rms=%.4f rms_err=%.5f max_abs=%.5f (rel=%.4f)\n",
+                ref_rms, rms, max_abs, ref_rms > 0 ? rms / ref_rms : 0.0f);
+        TEST_ASSERT(ref_rms > 0.3f);
+        TEST_ASSERT(rms < 0.06f * ref_rms);
+    } else { TEST_ASSERT(0 && "go2b routed-MoE test allocation failed"); }
+    free(x_host); free(out_host); free(ref); free(mref);
+    ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(gate); ds4_gpu_tensor_free(up);
+    ds4_gpu_tensor_free(mid); ds4_gpu_tensor_free(experts); ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(sel_t); ds4_gpu_tensor_free(wt_t);
+    free(model_raw);
+}
+
+/* go1b "hidden variable z^L" four-loss correction numeric regression.
+ *
+ * Builds synthetic U,V,C,b,beta,delta + a known x and a known 1-bit baseline o_hat,
+ * then checks that:
+ *   (1) kernel_dsv4_corr_apply reproduces an independent CPU reference of
+ *       out += sum over selected e of  U @ (C[e] .* (V @ x)) + b + beta[e];
+ *   (2) kernel_dsv4_corr_router_bias reproduces logits[t][e] += delta[e].
+ * Multi-token (n_tokens>1) exercises the per-token threadgroup dispatch. */
+static void test_metal_corr_apply(void) {
+    const uint32_t d_model = 320, d_l = 24, n_expert = 40, n_sel = 6, n_tok = 3;
+
+    float *U = malloc((size_t)d_model * d_l * sizeof(float));   /* [d_model][d_l] */
+    float *V = malloc((size_t)d_l * d_model * sizeof(float));   /* [d_l][d_model] */
+    float *C = malloc((size_t)n_expert * d_l * sizeof(float));  /* [n_expert][d_l] */
+    float *b = malloc((size_t)d_model * sizeof(float));
+    float *beta = malloc((size_t)n_expert * sizeof(float));
+    float *delta = malloc((size_t)n_expert * sizeof(float));
+    float *x = malloc((size_t)n_tok * d_model * sizeof(float));
+    int32_t *sel = malloc((size_t)n_tok * n_sel * sizeof(int32_t));
+    float *base = malloc((size_t)n_tok * d_model * sizeof(float));  /* o_hat baseline */
+    float *ref = malloc((size_t)n_tok * d_model * sizeof(float));
+    float *got = malloc((size_t)n_tok * d_model * sizeof(float));
+    TEST_ASSERT(U && V && C && b && beta && delta && x && sel && base && ref && got);
+
+    for (uint32_t k = 0; k < d_model * d_l; k++) U[k] = (float)((int)((k * 7u + 1u) % 17u) - 8) / 32.0f;
+    for (uint32_t k = 0; k < d_l * d_model; k++) V[k] = (float)((int)((k * 5u + 3u) % 19u) - 9) / 48.0f;
+    for (uint32_t k = 0; k < n_expert * d_l; k++) C[k] = (float)((int)((k * 11u + 2u) % 13u) - 6) / 24.0f;
+    for (uint32_t d = 0; d < d_model; d++) b[d] = (float)((int)((d * 3u) % 7u) - 3) / 40.0f;
+    for (uint32_t e = 0; e < n_expert; e++) beta[e] = (float)((int)((e * 9u + 1u) % 11u) - 5) / 50.0f;
+    for (uint32_t e = 0; e < n_expert; e++) delta[e] = (float)((int)((e * 13u + 4u) % 23u) - 11) / 16.0f;
+    for (uint32_t k = 0; k < n_tok * d_model; k++) x[k] = (float)((int)((k * 17u + 5u) % 29u) - 14) / 35.0f;
+    for (uint32_t k = 0; k < n_tok * d_model; k++) base[k] = (float)((int)((k * 23u + 7u) % 31u) - 15) / 20.0f;
+    for (uint32_t t = 0; t < n_tok; t++)
+        for (uint32_t s = 0; s < n_sel; s++)
+            sel[t * n_sel + s] = (int32_t)((t * 5u + s * 7u + 1u) % n_expert);   /* in-range ids */
+
+    /* Independent CPU reference, literal from the spec. */
+    float *vx = malloc((size_t)d_l * sizeof(float));
+    TEST_ASSERT(vx != NULL);
+    for (uint32_t t = 0; t < n_tok; t++) {
+        const float *xt = x + (size_t)t * d_model;
+        for (uint32_t i = 0; i < d_l; i++) {
+            float a = 0.0f;
+            for (uint32_t j = 0; j < d_model; j++) a += V[(size_t)i * d_model + j] * xt[j];
+            vx[i] = a;
+        }
+        float *rt = ref + (size_t)t * d_model;
+        for (uint32_t d = 0; d < d_model; d++) rt[d] = base[(size_t)t * d_model + d];
+        for (uint32_t s = 0; s < n_sel; s++) {
+            const uint32_t e = (uint32_t)sel[t * n_sel + s];
+            for (uint32_t d = 0; d < d_model; d++) {
+                float p = 0.0f;
+                for (uint32_t i = 0; i < d_l; i++) p += U[(size_t)d * d_l + i] * C[(size_t)e * d_l + i] * vx[i];
+                rt[d] += p + b[d] + beta[e];
+            }
+        }
+    }
+
+    ds4_gpu_tensor *gU = ds4_gpu_tensor_alloc((uint64_t)d_model * d_l * sizeof(float));
+    ds4_gpu_tensor *gV = ds4_gpu_tensor_alloc((uint64_t)d_l * d_model * sizeof(float));
+    ds4_gpu_tensor *gC = ds4_gpu_tensor_alloc((uint64_t)n_expert * d_l * sizeof(float));
+    ds4_gpu_tensor *gb = ds4_gpu_tensor_alloc((uint64_t)d_model * sizeof(float));
+    ds4_gpu_tensor *gbeta = ds4_gpu_tensor_alloc((uint64_t)n_expert * sizeof(float));
+    ds4_gpu_tensor *gdelta = ds4_gpu_tensor_alloc((uint64_t)n_expert * sizeof(float));
+    ds4_gpu_tensor *gx = ds4_gpu_tensor_alloc((uint64_t)n_tok * d_model * sizeof(float));
+    ds4_gpu_tensor *gsel = ds4_gpu_tensor_alloc((uint64_t)n_tok * n_sel * sizeof(int32_t));
+    ds4_gpu_tensor *gout = ds4_gpu_tensor_alloc((uint64_t)n_tok * d_model * sizeof(float));
+    TEST_ASSERT(gU && gV && gC && gb && gbeta && gdelta && gx && gsel && gout);
+
+    if (gU && gV && gC && gb && gbeta && gdelta && gx && gsel && gout) {
+        TEST_ASSERT(ds4_gpu_tensor_write(gU, 0, U, (uint64_t)d_model * d_l * sizeof(float)) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(gV, 0, V, (uint64_t)d_l * d_model * sizeof(float)) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(gC, 0, C, (uint64_t)n_expert * d_l * sizeof(float)) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(gb, 0, b, (uint64_t)d_model * sizeof(float)) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(gbeta, 0, beta, (uint64_t)n_expert * sizeof(float)) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(gx, 0, x, (uint64_t)n_tok * d_model * sizeof(float)) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(gsel, 0, sel, (uint64_t)n_tok * n_sel * sizeof(int32_t)) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(gout, 0, base, (uint64_t)n_tok * d_model * sizeof(float)) != 0);
+
+        TEST_ASSERT(ds4_gpu_corr_apply(gout, gx, gU, gV, gC, gb, gbeta, gsel,
+                                       d_model, d_l, n_expert, n_sel, n_tok) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(gout, 0, got, (uint64_t)n_tok * d_model * sizeof(float)) != 0);
+
+        float max_abs = 0.0f, sq = 0.0f, ref_sq = 0.0f;
+        for (uint32_t k = 0; k < n_tok * d_model; k++) {
+            TEST_ASSERT(isfinite(got[k]));
+            const float err = fabsf(got[k] - ref[k]);
+            if (err > max_abs) max_abs = err;
+            sq += err * err;
+            ref_sq += ref[k] * ref[k];
+        }
+        const float rel = ref_sq > 0.0f ? sqrtf(sq / ref_sq) : 0.0f;
+        fprintf(stderr, "ds4: corr_apply test ref_rms=%.4f max_abs=%.6f rel=%.7f\n",
+                sqrtf(ref_sq / (float)(n_tok * d_model)), max_abs, rel);
+        TEST_ASSERT(ref_sq > 0.0f);
+        TEST_ASSERT(rel < 1.0e-3f);
+
+        /* Router bias: logits[t][e] += delta[e]. */
+        float *logit = malloc((size_t)n_tok * n_expert * sizeof(float));
+        float *logit_ref = malloc((size_t)n_tok * n_expert * sizeof(float));
+        float *logit_got = malloc((size_t)n_tok * n_expert * sizeof(float));
+        TEST_ASSERT(logit && logit_ref && logit_got);
+        ds4_gpu_tensor *glogit = ds4_gpu_tensor_alloc((uint64_t)n_tok * n_expert * sizeof(float));
+        TEST_ASSERT(glogit != NULL);
+        if (logit && logit_ref && logit_got && glogit) {
+            for (uint32_t k = 0; k < n_tok * n_expert; k++) logit[k] = (float)((int)((k * 19u + 2u) % 37u) - 18) / 12.0f;
+            for (uint32_t t = 0; t < n_tok; t++)
+                for (uint32_t e = 0; e < n_expert; e++)
+                    logit_ref[t * n_expert + e] = logit[t * n_expert + e] + delta[e];
+            TEST_ASSERT(ds4_gpu_tensor_write(glogit, 0, logit, (uint64_t)n_tok * n_expert * sizeof(float)) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_write(gdelta, 0, delta, (uint64_t)n_expert * sizeof(float)) != 0);
+            TEST_ASSERT(ds4_gpu_corr_router_bias(glogit, gdelta, n_expert, n_tok) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_read(glogit, 0, logit_got, (uint64_t)n_tok * n_expert * sizeof(float)) != 0);
+            float bmax = 0.0f;
+            for (uint32_t k = 0; k < n_tok * n_expert; k++) {
+                const float err = fabsf(logit_got[k] - logit_ref[k]);
+                if (err > bmax) bmax = err;
+            }
+            fprintf(stderr, "ds4: corr_router_bias test max_abs=%.7f\n", bmax);
+            TEST_ASSERT(bmax < 1.0e-5f);
+        }
+        free(logit); free(logit_ref); free(logit_got);
+        ds4_gpu_tensor_free(glogit);
+
+        /* Store-variant parity: corr_delta writes the raw correction term;
+         * base[k] + delta[k] must reproduce the in-place result BITWISE (same
+         * fadd operands — this is the contract the fused shared-down consumer
+         * relies on). */
+        if (ds4_gpu_corr_delta_supported()) {
+            float *ddelta = malloc((size_t)n_tok * d_model * sizeof(float));
+            ds4_gpu_tensor *gdelta_out = ds4_gpu_tensor_alloc((uint64_t)n_tok * d_model * sizeof(float));
+            TEST_ASSERT(ddelta && gdelta_out);
+            if (ddelta && gdelta_out) {
+                TEST_ASSERT(ds4_gpu_corr_apply_delta(gdelta_out, gx, gU, gV, gC, gb, gbeta, gsel,
+                                                     d_model, d_l, n_expert, n_sel, n_tok) != 0);
+                TEST_ASSERT(ds4_gpu_tensor_read(gdelta_out, 0, ddelta,
+                                                (uint64_t)n_tok * d_model * sizeof(float)) != 0);
+                uint32_t mism = 0;
+                for (uint32_t k = 0; k < n_tok * d_model; k++) {
+                    const float recon = base[k] + ddelta[k];
+                    if (recon != got[k]) mism++;
+                }
+                fprintf(stderr, "ds4: corr_delta store-variant bitwise mismatches=%u\n", mism);
+                TEST_ASSERT(mism == 0);
+            }
+            free(ddelta);
+            ds4_gpu_tensor_free(gdelta_out);
+        }
+    }
+
+    free(vx);
+    ds4_gpu_tensor_free(gU); ds4_gpu_tensor_free(gV); ds4_gpu_tensor_free(gC);
+    ds4_gpu_tensor_free(gb); ds4_gpu_tensor_free(gbeta); ds4_gpu_tensor_free(gdelta);
+    ds4_gpu_tensor_free(gx); ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gout);
+    free(U); free(V); free(C); free(b); free(beta); free(delta);
+    free(x); free(sel); free(base); free(ref); free(got);
+}
+
 static void test_metal_kernel_group(void) {
     test_metal_f16_matvec_fast_nr0_4();
     test_metal_f16_prefill_matmul();
     test_metal_q8_0_prefill_matmul();
     test_metal_q8_0_prefill_matmul_unaligned();
     test_metal_q8_0_rowslice_tp();
+    test_metal_go1b_routed_moe();
+    test_metal_go2b_routed_moe();
+    test_metal_corr_apply();
 }
 
 static void test_metal_short_prefill_ratio4(void) {
@@ -1782,14 +2270,343 @@ static void test_tool_call_quality(void) {
 
 #endif
 
+/* ---- 前端域多模态插件 (物理方位 / CSS 理解 / enricher 链) ---- */
+
+/* mm-ui selftest 场景的手写草图副本: 数字取整, "Continue" 精确居中。
+ * 格式契约与 tools/mm_ui.swift 输出一致 -- 这里断言的每个空间/CSS 事实
+ * 都能手算复核。 */
+static const char *TEST_UI_SKETCH =
+    "[img 1280x800]\n"
+    "[palette #f5f6f8 84% #101828 8%]\n"
+    "[rect 0,65 1280x735 #f5f6f8]\n"
+    "[rect 0,0 1280x64 #101828]\n"
+    "[rect 480,280 320x240 #ffffff]\n"
+    "[rect 512,436 256x44 #3b82f6]\n"
+    "[text 40,22 146x22 #ffffff on #101828 \"Acme Console\"]\n"
+    "[text 512,318 74x28 #101828 on #ffffff \"Sign in\"]\n"
+    "[text 596,446 88x24 #ffffff on #3b82f6 \"Continue\"]\n";
+
+static void test_spatial_annotate_facts(void) {
+    char *sec = ds4_spatial_annotate(TEST_UI_SKETCH);
+    TEST_ASSERT(sec != NULL);
+    TEST_ASSERT(strstr(sec, "t2\"Sign in\"") != NULL);           /* 标签系统 */
+    TEST_ASSERT(strstr(sec, "r1 page") != NULL);                 /* 九宫格方位 */
+    TEST_ASSERT(strstr(sec, "r2 top") != NULL);
+    TEST_ASSERT(strstr(sec, "r3 center") != NULL);
+    TEST_ASSERT(strstr(sec, "[in r3(480,280): t2 r4]") != NULL); /* 包含树 */
+    TEST_ASSERT(strstr(sec, "[stack r3 column gap=90px: t2 r4]") != NULL);
+    TEST_ASSERT(strstr(sec, "[align left: t2 r4 (in r3)]") != NULL);
+    TEST_ASSERT(strstr(sec, "[align centered-x in r3: r4]") != NULL);
+    TEST_ASSERT(strstr(sec, "[align centered-x in r4: t3]") != NULL);
+    free(sec);
+    /* 非草图输入诚实缺席 */
+    TEST_ASSERT(ds4_spatial_annotate("hello, not a sketch") == NULL);
+}
+
+static void test_css_annotate_facts(void) {
+    char *sec = ds4_css_annotate(TEST_UI_SKETCH);
+    TEST_ASSERT(sec != NULL);
+    TEST_ASSERT(strstr(sec, "[css page: background:#f5f6f8]") != NULL);
+    TEST_ASSERT(strstr(sec, "[css r3: background:#ffffff; "
+                            "padding:38px 32px 40px 32px; display:flex; "
+                            "flex-direction:column; gap:90px; "
+                            "align-items:flex-start]") != NULL);
+    TEST_ASSERT(strstr(sec, "[css r4: background:#3b82f6; "
+                            "padding:10px 84px 10px 84px]") != NULL);
+    TEST_ASSERT(strstr(sec, "[css r2: background:#101828; "
+                            "padding:22px 1094px 20px 40px]") != NULL);
+    free(sec);
+    TEST_ASSERT(ds4_css_annotate("plain text") == NULL);
+}
+
+static void test_mm_stub_tokenize(void *ctx, const char *text, int **toks, int *n) {
+    (void)ctx;
+    const size_t len = strlen(text);
+    *toks = malloc(len ? len * sizeof(int) : sizeof(int));
+    *n = 0;
+    if (!*toks) return;
+    for (size_t i = 0; i < len; i++) (*toks)[i] = (int)(unsigned char)text[i];
+    *n = (int)len;
+}
+
+static char *test_mm_spatial_adapter(void *ctx, const char *modality,
+                                     const char *text) {
+    (void)ctx;
+    (void)modality;
+    return ds4_spatial_annotate(text);
+}
+
+static char *test_mm_css_adapter(void *ctx, const char *modality,
+                                 const char *text) {
+    (void)ctx;
+    (void)modality;
+    return ds4_css_annotate(text);
+}
+
+static void test_mm_enrichers_compose_both_forms(void) {
+    ds4_mm *mm = ds4_mm_create(test_mm_stub_tokenize, NULL);
+    TEST_ASSERT(mm != NULL);
+    TEST_ASSERT(ds4_mm_register_command(mm, "image", "/bin/cat") == 0);
+    TEST_ASSERT(ds4_mm_register_enricher(mm, "image", test_mm_spatial_adapter,
+                                         NULL) == 0);
+    TEST_ASSERT(ds4_mm_register_enricher(mm, "image", test_mm_css_adapter,
+                                         NULL) == 0);
+    char *text = NULL;
+    TEST_ASSERT(ds4_mm_encode_as_text(mm, "image/png",
+                                      (const uint8_t *)TEST_UI_SKETCH,
+                                      strlen(TEST_UI_SKETCH), &text) == 0);
+    TEST_ASSERT(text != NULL);
+    const char *sketch_tail = strstr(text, "\"Continue\"]");
+    const char *spatial = strstr(text, "[in r3");
+    const char *css = strstr(text, "[css r3");
+    TEST_ASSERT(sketch_tail && spatial && css);
+    TEST_ASSERT(sketch_tail < spatial && spatial < css);  /* 节序 = 注册序 */
+    const size_t text_len = strlen(text);
+    /* token 形必须携带同一份增强文本 (字节 stub tokenizer 逐字节出 token) */
+    int *toks = NULL;
+    int n_toks = 0;
+    TEST_ASSERT(ds4_mm_encode(mm, "image/png",
+                              (const uint8_t *)TEST_UI_SKETCH,
+                              strlen(TEST_UI_SKETCH), &toks, &n_toks) == 0);
+    TEST_ASSERT((size_t)n_toks == text_len);
+    free(toks);
+    free(text);
+    /* text 模态没挂 enricher: identity 原样 */
+    TEST_ASSERT(ds4_mm_encode_as_text(mm, "text", (const uint8_t *)"hi", 2,
+                                      &text) == 0);
+    TEST_ASSERT(text && !strcmp(text, "hi"));
+    free(text);
+    ds4_mm_free(mm);
+}
+
 static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
+    test_spatial_annotate_facts();
+    test_css_annotate_facts();
+    test_mm_enrichers_compose_both_forms();
 }
 
 /* TP Stage 2: in-process loopback check of the all-reduce transport (frame
  * format + sum correctness + no deadlock). No model, no network. */
 static void test_tp_allreduce(void) {
     TEST_ASSERT(ds4_dist_tp_selftest() == 0);
+}
+
+/* ---- Model-free unit tests for the repeat/anticycle penalty core ----
+ *
+ * Exercises ds4_repeat_penalize_tokens -- the raw-array entry that shares
+ * repeat_penalize_core with the session sampler -- on synthetic committed
+ * streams: no model, no engine, no GPU. The DS4_REPEAT_FREQ / DS4_LOOP_BREAK
+ * / DS4_LOOP_ESC / DS4_LOOP_HARD_K caches inside ds4.c are process-wide
+ * statics armed on first use, so the
+ * suite pins each config via the test-only reset hook (setenv BEFORE the
+ * first penalize call of that config) and restores the developer's env +
+ * re-resets afterwards, so greedy-sensitive model suites later in the same
+ * --all run re-arm from their own environment. */
+extern void ds4_test_reset_penalty_env_cache(void);
+
+/* Token ids in these tests stay far below this: the penalty core only ever
+ * writes logits at committed-token indices, so a small row suffices. */
+#define TEST_PEN_NLOGITS 256
+
+static char *test_penalty_env_save(const char *name) {
+    const char *value = getenv(name);
+    if (!value) return NULL;
+    size_t len = strlen(value);
+    char *copy = malloc(len + 1);
+    TEST_ASSERT(copy != NULL);
+    if (copy) memcpy(copy, value, len + 1);
+    return copy;
+}
+
+static void test_penalty_env_restore(const char *name, char *saved) {
+    if (saved) {
+        setenv(name, saved, 1);
+        free(saved);
+    } else {
+        unsetenv(name);
+    }
+}
+
+static void test_penalize_row(float *logits, const int *toks, uint32_t n,
+                              uint32_t gen_start) {
+    for (int i = 0; i < TEST_PEN_NLOGITS; i++) logits[i] = 0.0f;
+    ds4_repeat_penalize_tokens(logits, toks, n, gen_start);
+}
+
+static int test_pen_argmax(const float *logits) {
+    int best = 0;
+    for (int i = 1; i < TEST_PEN_NLOGITS; i++)
+        if (logits[i] > logits[best]) best = i;
+    return best;
+}
+
+/* n copies of {A(8 tokens 10..17), 42, distinct gap} + a final A: the current
+ * 8-suffix A occurred n times before in the stream, every time continued by
+ * 42, while the distinct gap tokens kill every exact period P<=64, isolating
+ * the 8-gram self-copy detector. Returns the stream length (10n+8). */
+static uint32_t test_pen_build_selfcopy(int *sc, int n) {
+    int m = 0;
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < 8; j++) sc[m++] = 10 + j;
+        sc[m++] = 42;
+        sc[m++] = 90 + i;
+    }
+    for (int j = 0; j < 8; j++) sc[m++] = 10 + j;
+    return (uint32_t)m;
+}
+
+static void test_penalty_unit(void) {
+    char *saved_freq = test_penalty_env_save("DS4_REPEAT_FREQ");
+    char *saved_window = test_penalty_env_save("DS4_REPEAT_WINDOW");
+    char *saved_loop = test_penalty_env_save("DS4_LOOP_BREAK");
+    char *saved_esc = test_penalty_env_save("DS4_LOOP_ESC");
+    char *saved_hardk = test_penalty_env_save("DS4_LOOP_HARD_K");
+    float logits[TEST_PEN_NLOGITS];
+    int cyc[24];                 /* 8 copies of the period-3 block {5,6,7} */
+    int sc[68];                  /* self-copy stream, up to n=6 blocks */
+    for (int i = 0; i < 24; i++) cyc[i] = 5 + (i % 3);
+
+    /* Config 1: anticycle escalation at the defaults (DS4_LOOP_BREAK ON,
+     * DS4_LOOP_ESC=3.0, DS4_LOOP_HARD_K=6; freq off). */
+    unsetenv("DS4_REPEAT_FREQ");
+    unsetenv("DS4_REPEAT_WINDOW");
+    unsetenv("DS4_LOOP_BREAK");
+    unsetenv("DS4_LOOP_ESC");
+    unsetenv("DS4_LOOP_HARD_K");
+    ds4_test_reset_penalty_env_cache();
+
+    /* (a) exact-period escalation ladder: k complete periods emitted => the
+     * continuation v[end-P] is pushed down by exactly ESC*(k-1), NOT
+     * hard-banned below K_HARD (the retired third-strike semantics -inf'd
+     * it at k=2). Ladder stops at k=4: from k=5 on a pure period-3 stream
+     * is long enough that the 8-gram detector legitimately stacks on top
+     * (that regime is covered by the argmax walk in (c)). */
+    for (uint32_t k = 2; k <= 4; k++) {
+        test_penalize_row(logits, cyc, 3u * k, 0);
+        TEST_ASSERT(logits[5] == -3.0f * (float)(k - 1u));
+        TEST_ASSERT(logits[6] == 0.0f);
+        TEST_ASSERT(logits[7] == 0.0f);
+    }
+    /* A partial leading period must not inflate k: 7|567|567 counts k=2. */
+    static const int part[7] = {7, 5, 6, 7, 5, 6, 7};
+    test_penalize_row(logits, part, 7, 0);
+    TEST_ASSERT(logits[5] == -3.0f);
+    TEST_ASSERT(logits[6] == 0.0f);
+    TEST_ASSERT(logits[7] == 0.0f);
+
+    /* (b) hard cap: k = K_HARD (6) and beyond hard-bans the continuation,
+     * so a pathological attractor still terminates. */
+    test_penalize_row(logits, cyc, 18, 0);   /* k=6 */
+    TEST_ASSERT(logits[5] < -1.0e29f);
+    test_penalize_row(logits, cyc, 21, 0);   /* k=7 */
+    TEST_ASSERT(logits[5] < -1.0e29f);
+
+    /* (c) strong margin walks a legal "repeat X five times" to completion:
+     * at every decode step of copies 3..5 the true continuation carries a
+     * 13.0 logit margin -- above the worst stacked penalty on the walk
+     * (period -9 at k=4 plus one 8-gram step -3) -- so argmax never flips
+     * and the instructed repetition finishes all five copies. */
+    for (uint32_t L = 6; L <= 14; L++) {
+        const int want = cyc[L];             /* the cycle's true continuation */
+        for (int i = 0; i < TEST_PEN_NLOGITS; i++) logits[i] = 0.0f;
+        logits[want] = 13.0f;
+        ds4_repeat_penalize_tokens(logits, cyc, L, 0);
+        TEST_ASSERT(test_pen_argmax(logits) == want);
+    }
+
+    /* (d) weak margin (< ESC): a degenerate drift attractor is argmax-broken
+     * at k=2 already -- escalation still kills loops within one period. */
+    for (int i = 0; i < TEST_PEN_NLOGITS; i++) logits[i] = 0.0f;
+    logits[5] = 2.5f;
+    ds4_repeat_penalize_tokens(logits, cyc, 6, 0);
+    TEST_ASSERT(logits[5] == -0.5f);         /* 2.5 - ESC*(2-1) */
+    TEST_ASSERT(test_pen_argmax(logits) != 5);
+
+    /* (e) the twice-repeated block entirely in the PROMPT region (gen_start
+     * == end: the state right after prefill + mark): quoting a block the
+     * prompt repeats must NOT be penalized. Legacy unmarked behavior
+     * (gen_start 0, case (a)) penalized it. */
+    test_penalize_row(logits, cyc, 6, 6);
+    TEST_ASSERT(logits[5] == 0.0f);
+    TEST_ASSERT(logits[6] == 0.0f);
+    TEST_ASSERT(logits[7] == 0.0f);
+
+    /* (f) 8-gram self-copy ladder: n prior occurrences of the current
+     * 8-suffix with the same continuation cost exactly ESC*(n-1) -- the
+     * third boilerplate instance (n=2, -inf under the retired semantics)
+     * now survives on any decent margin -- and only n = K_HARD hard-bans. */
+    test_penalize_row(logits, sc, test_pen_build_selfcopy(sc, 2), 0);
+    TEST_ASSERT(logits[42] == -3.0f);
+    TEST_ASSERT(logits[10] == 0.0f);   /* the copied block itself: untouched */
+    TEST_ASSERT(logits[43] == 0.0f);
+    test_penalize_row(logits, sc, test_pen_build_selfcopy(sc, 3), 0);
+    TEST_ASSERT(logits[42] == -6.0f);
+    test_penalize_row(logits, sc, test_pen_build_selfcopy(sc, 6), 0);
+    TEST_ASSERT(logits[42] < -1.0e29f);
+    /* ...and with both prior occurrences in the PROMPT (gen_start at the
+     * final A), the same continuation is exempt. */
+    test_penalize_row(logits, sc, test_pen_build_selfcopy(sc, 2), 20);
+    TEST_ASSERT(logits[42] == 0.0f);
+
+    /* Config 2: freq-window counting, bans disabled to isolate it. The
+     * window [end-4, end) must IGNORE the generation boundary: gen_start=5
+     * yet prompt-tail tokens at positions 2..4 are still counted (2026-07-06
+     * "window must include the prompt tail"; the removed gstart clamp would
+     * have zeroed them). All deltas are exact binary floats. */
+    setenv("DS4_REPEAT_FREQ", "0.5", 1);
+    setenv("DS4_REPEAT_WINDOW", "4", 1);
+    setenv("DS4_LOOP_BREAK", "0", 1);
+    ds4_test_reset_penalty_env_cache();
+
+    static const int fw[6] = {30, 31, 32, 33, 31, 34};
+    test_penalize_row(logits, fw, 6, 5);
+    TEST_ASSERT(logits[30] == 0.0f);    /* before the window: not counted */
+    TEST_ASSERT(logits[31] == -0.5f);   /* pos 4 in-window; pos 1 outside */
+    TEST_ASSERT(logits[32] == -0.5f);   /* prompt tail, pos < gen_start */
+    TEST_ASSERT(logits[33] == -0.5f);
+    TEST_ASSERT(logits[34] == -0.5f);
+
+    /* Per-occurrence accumulation (4 in-window hits of one token), and
+     * DS4_LOOP_BREAK=0 really disabled the escalation despite the blatant
+     * cycle (only the freq penalty shows). */
+    static const int rep[5] = {7, 7, 7, 7, 7};
+    test_penalize_row(logits, rep, 5, 0);
+    TEST_ASSERT(logits[7] == -2.0f);
+
+    /* Config 3: DS4_LOOP_BREAK=0 alone -- the master switch kills both
+     * detectors outright: a blatant six-period cycle draws zero penalty. */
+    unsetenv("DS4_REPEAT_FREQ");
+    unsetenv("DS4_REPEAT_WINDOW");
+    setenv("DS4_LOOP_BREAK", "0", 1);
+    ds4_test_reset_penalty_env_cache();
+    test_penalize_row(logits, cyc, 18, 0);
+    TEST_ASSERT(logits[5] == 0.0f);
+    TEST_ASSERT(logits[6] == 0.0f);
+    TEST_ASSERT(logits[7] == 0.0f);
+
+    /* Config 4: DS4_LOOP_ESC / DS4_LOOP_HARD_K overrides reach BOTH
+     * detectors (shared knobs): slope 0.5 per extra repeat, hard ban
+     * already at count 3. */
+    setenv("DS4_LOOP_BREAK", "1", 1);
+    setenv("DS4_LOOP_ESC", "0.5", 1);
+    setenv("DS4_LOOP_HARD_K", "3", 1);
+    ds4_test_reset_penalty_env_cache();
+    test_penalize_row(logits, cyc, 6, 0);    /* period k=2 -> -0.5*(2-1) */
+    TEST_ASSERT(logits[5] == -0.5f);
+    test_penalize_row(logits, cyc, 9, 0);    /* period k=3 >= hard_k -> ban */
+    TEST_ASSERT(logits[5] < -1.0e29f);
+    test_penalize_row(logits, sc, test_pen_build_selfcopy(sc, 2), 0);
+    TEST_ASSERT(logits[42] == -0.5f);        /* 8-gram n=2 -> -0.5*(2-1) */
+    test_penalize_row(logits, sc, test_pen_build_selfcopy(sc, 3), 0);
+    TEST_ASSERT(logits[42] < -1.0e29f);      /* 8-gram n=3 >= hard_k -> ban */
+
+    test_penalty_env_restore("DS4_REPEAT_FREQ", saved_freq);
+    test_penalty_env_restore("DS4_REPEAT_WINDOW", saved_window);
+    test_penalty_env_restore("DS4_LOOP_BREAK", saved_loop);
+    test_penalty_env_restore("DS4_LOOP_ESC", saved_esc);
+    test_penalty_env_restore("DS4_LOOP_HARD_K", saved_hardk);
+    ds4_test_reset_penalty_env_cache();
 }
 
 typedef void (*test_fn)(void);
@@ -1813,6 +2630,7 @@ static const ds4_test_entry test_entries[] = {
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
     {"--tp-allreduce", "tp-allreduce", "tensor-parallel all-reduce transport loopback", test_tp_allreduce},
+    {"--penalty-unit", "penalty-unit", "model-free repeat/anticycle penalty semantics (escalation ladder, gen-start boundary, freq window)", test_penalty_unit},
 };
 
 static void test_print_help(const char *prog) {

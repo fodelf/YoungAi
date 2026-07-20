@@ -112,6 +112,24 @@ typedef struct {
 typedef struct {
     const char *model_path;
     const char *mtp_path;
+    /* Optional sidecar GGUF holding the per-layer go1b "hidden variable z^L"
+     * four-loss correction tensors (blk.{L}.corr_*). When NULL, the engine
+     * auto-detects ds4-go1b-corr.gguf next to model_path. Absent => pure 1-bit. */
+    const char *corr_path;
+    /* Optional 1-bit residual sidecar GGUF (blk.{L}.ffn_*_exps_res, go1b). When set,
+     * the routed-MoE sums a second 1-bit layer into each expert. Absent => single 1-bit. */
+    const char *residual_path;
+    /* Optional go-onebit DQZ2 runtime sidecar (--zchain FILE, or DS4_ZCHAIN env):
+     * the quantizer's per-layer multiplicative correction chain -- GE per-expert
+     * gains folded into the router weights + a per-token scale λ(x) on the routed
+     * MoE contribution. Absent => raw 1-bit+signref base, exactly today's path. */
+    const char *zchain_path;
+    /* Optional Go-domain n-gram trie (--go-trie FILE, or DS4_GO_TRIE env): a
+     * corpus-statistics drafter that feeds the existing single-machine copy-spec
+     * verify pipeline with boilerplate continuations the transcript has not seen
+     * yet. Greedy-lossless (target argmax gates every token). NULL + no env =>
+     * exactly today's n-gram-only path. */
+    const char *go_trie_path;
     ds4_backend backend;
     int n_threads;
     int mtp_draft_tokens;
@@ -166,6 +184,77 @@ void ds4_engine_summary(ds4_engine *e);
 int ds4_engine_vocab_size(ds4_engine *e);
 int ds4_engine_power(ds4_engine *e);
 int ds4_engine_set_power(ds4_engine *e, int power_percent);
+/* Multi-domain z-sidecar plugin hot-swap: free the current corr sidecar and
+ * load `path` (~90MB, seconds). NULL/"" unloads (pure 1-bit). Call between
+ * generations only. Returns 0 on success, -1 on load failure (previous corr
+ * is kept in that case). */
+int ds4_engine_corr_switch(ds4_engine *e, const char *path);
+/* Multimodal registry (ds4_multimodal.c): "text" built in; the "image"
+ * family auto-binds the frontend-domain UI-sketch encoder at open when
+ * present (DS4_MM_IMAGE_CMD env > ./mm-ui, built by `make mm-ui`). Server
+ * /v1/messages image content blocks consume the registry's TEXT form so
+ * rendered prompts / disk-KV prefix keys / exact replay stay byte-stable.
+ * NULL before open or on OOM (consumers must fail closed, not fake). */
+struct ds4_mm;
+struct ds4_mm *ds4_engine_mm(ds4_engine *e);
+void ds4_session_anticycle_prep(ds4_session *s, float *row_logits,
+                                const int *extra, uint32_t n_extra);
+/* Repeat/anticycle penalty for callers that hold their own committed-token array
+ * (the distributed coordinator's plain-decode loop) instead of a ds4_session
+ * checkpoint. Penalizes toks[gen_start..n_committed) in `logits` in place. */
+void ds4_repeat_penalize_tokens(float *logits, const int *toks, uint32_t n_committed,
+                                uint32_t gen_start);
+
+/* ---- Sampling-lane policy (问答/编程链路的一等抽象) ----
+ * The frontend that knows the request shape (server/agent/cli/dist coordinator)
+ * declares which lane the session is generating for; the core sampler scopes
+ * repeat/anticycle penalties by lane:
+ *   FREE          - free content (chat answers, agent prose): freq penalty and
+ *                   anticycle bans apply.
+ *   TOOL_SYNTAX   - forced tool-call syntax emission: raw logits, no penalties
+ *                   (a penalty-diverted syntax token corrupts the protocol).
+ *   COPY_EMISSION - copy-constrained value emission (server primer values):
+ *                   raw logits; the copy contract REQUIRES verbatim context
+ *                   reuse, which the anticycle self-copy ban would forbid.
+ *                   Value-region repetition control belongs to the local
+ *                   DS4_PRIMER_VALUE_FREQ window, not the global penalty.
+ * Anticycle bans scan only [generation start, end). Mark the boundary with
+ * ds4_session_mark_generation_start (pins at the current checkpoint length;
+ * call after prefill, before the first sampled token of a response) or set it
+ * explicitly after a rebuild whose checkpoint already contains generated
+ * tokens. Unmarked sessions fall back to 0 = whole context (legacy). The env
+ * freq-penalty window intentionally IGNORES the boundary (2026-07-06 mono
+ * verdict: the early-generation window must include the prompt tail or the
+ * 2-bit penalty is too weak). */
+enum {
+    DS4_LANE_FREE = 0,
+    DS4_LANE_TOOL_SYNTAX = 1,
+    DS4_LANE_COPY_EMISSION = 2,
+};
+void ds4_session_set_lane(ds4_session *s, int lane);
+int  ds4_session_lane(const ds4_session *s);
+void ds4_session_mark_generation_start(ds4_session *s);
+void ds4_session_set_generation_start(ds4_session *s, int pos);
+/* Per-request penalties (OpenAI frequency_penalty / presence_penalty semantics,
+ * counted over the generated region only), applied on top of the env-armed
+ * freq penalty, FREE lane only. Sessions are reused across requests: call on
+ * EVERY request; (0,0) = none/clear. */
+void ds4_session_set_request_penalties(ds4_session *s, float freq, float presence);
+/* Whether greedy speculative acceptance (copy-spec / MTP argmax gating) is
+ * distribution-preserving for the current request: true only at temperature 0.
+ * Default true (legacy); frontends must set false for sampled requests so the
+ * dist accept gate falls back to plain decode instead of silently going
+ * greedy on n-gram hits. */
+void ds4_session_set_spec_greedy(ds4_session *s, int greedy_ok);
+int  ds4_session_spec_greedy_ok(const ds4_session *s);
+/* Built-in reference-corpus (language-idiom) drafter lookup: longest suffix of
+ * tail[0..len) (>= min_g tokens) occurring in the engine's idiom corpus; copies
+ * up to cap continuation tokens into out[]. Returns the anchor length, 0 = no
+ * match (a miss costs nothing -- callers just decode normally). Used by both
+ * the single-machine and distributed copy-spec drafters. */
+uint32_t ds4_engine_ref_match(ds4_engine *e, const int *tail, uint32_t len,
+                              uint32_t min_g, uint32_t cap,
+                              int *out, uint32_t *out_n);
 const char *ds4_engine_model_name(ds4_engine *e);
 int ds4_engine_layer_count(ds4_engine *e);
 uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer);
@@ -270,6 +359,11 @@ int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap);
 int ds4_session_set_logits(ds4_session *s, const float *logits, int n);
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
+
+/* Append N KNOWN tokens in ONE layer-major batch (guided-primer structure
+ * injection: the server knows the tokens, no sampling). See ds4.c. */
+int ds4_session_eval_span(ds4_session *s, const int *tokens, int n,
+                          char *err, size_t errlen);
 int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,

@@ -1,0 +1,318 @@
+<｜begin▁of▁sentence｜>package pkg0
+
+import (
+	"fmt"
+	"sort"
+	"strings"
+)
+
+// twoSum returns the indices of the two numbers in nums that add up to target.
+func twoSum(nums []int, target int) []int {
+	seen := make(map[int]int)
+	for i, n := range nums {
+		if j, ok := seen[target-n]; ok {
+			return []int{j, i}
+		}
+		seen[n] = i
+	}
+	return nil
+}
+
+// isPalindrome reports whether s reads the same forwards and backwards.
+func isPalindrome(s string) bool {
+	s = strings.ToLower(s)
+	for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1 {
+		if s[i] != s[j] {
+			return false
+		}
+	}
+	return true
+}
+
+// mergeSort sorts xs in ascending order using the merge sort algorithm.
+func mergeSort(xs []int) []int {
+	if len(xs) <= 1 {
+		return xs
+	}
+	mid := len(xs) / 2
+	left := mergeSort(xs[:mid])
+	right := mergeSort(xs[mid:])
+	out := make([]int, 0, len(xs))
+	i, j := 0, 0
+	for i < len(left) && j < len(right) {
+		if left[i] <= right[j] {
+			out = append(out, left[i])
+			i++
+		} else {
+			out = append(out, right[j])
+			j++
+		}
+	}
+	out = append(out, left[i:]...)
+	out = append(out, right[j:]...)
+	return out
+}
+
+type Stack struct {
+	items []int
+}
+
+func (s *Stack) Push(v int) { s.items = append(s.items, v) }
+
+func (s *Stack) Pop() (int, bool) {
+	if len(s.items) == 0 {
+		return 0, false
+	}
+	v := s.items[len(s.items)-1]
+	s.items = s.items[:len(s.items)-1]
+	return v, true
+}
+
+func main() {
+	fmt.Println(twoSum([]int{2, 7, 11, 15}, 9))
+	nums := []int{5, 2, 8, 1, 9}
+	sort.Ints(nums)
+	fmt.Println(nums)
+	fmt.Println(isPalindrome("Racecar"))
+	fmt.Println(mergeSort([]int{3, 1, 4, 1, 5, 9, 2, 6}))
+}
+
+
+package pkg1
+
+import (
+	"fmt"
+	"sort"
+	"strings"
+)
+
+// twoSum1 returns the indices of the two numbers in nums that add up to target.
+func twoSum1(nums []int, target int) []int {
+	seen := make(map[int]int)
+	for i, n := range nums {
+		if j, ok := seen[target-n]; ok {
+			return []int{j, i}
+		}
+		seen[n] = i
+	}
+	return nil
+}
+
+// isPalindrome reports whether s reads the same forwards and backwards.
+func isPalindrome(s string) bool {
+	s = strings.ToLower(s)
+	for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1 {
+		if s[i] != s[j] {
+			return false
+		}
+	}
+	return true
+}
+
+// mergeSort sorts xs in ascending order using the merge sort algorithm.
+func mergeSort(xs []int) []int {
+	if len(xs) <= 1 {
+		return xs
+	}
+	mid := len(xs) / 2
+	left := mergeSort(xs[:mid])
+	right := mergeSort(xs[mid:])
+	out := make([]int, 0, len(xs))
+	i, j := 0, 0
+	for i < len(left) && j < len(right) {
+		if left[i] <= right[j] {
+			out = append(out, left[i])
+			i++
+		} else {
+			out = append(out, right[j])
+			j++
+		}
+	}
+	out = append(out, left[i:]...)
+	out = append(out, right[j:]...)
+	return out
+}
+
+type Stack struct {
+	items []int
+}
+
+func (s *Stack) Push(v int) { s.items = append(s.items, v) }
+
+func (s *Stack) Pop() (int, bool) {
+	if len(s.items) == 0 {
+		return 0, false
+	}
+	v := s.items[len(s.items)-1]
+	s.items = s.items[:len(s.items)-1]
+	return v, true
+}
+
+func main() {
+	fmt.Println(twoSum1([]int{2, 7, 11, 15}, 9))
+	nums := []int{5, 2, 8, 1, 9}
+	sort.Ints(nums)
+	fmt.Println(nums)
+	fmt.Println(isPalindrome("Racecar"))
+	fmt.Println(mergeSort([]int{3, 1, 4, 1, 5, 9, 2, 6}))
+}
+
+
+package pkg2
+
+import (
+	"fmt"
+	"sort"
+	"strings"
+)
+
+// twoSum2 returns the indices of the two numbers in nums that add up to target.
+func twoSum2(nums []int, target int) []int {
+	seen := make(map[int]int)
+	for i, n := range nums {
+		if j, ok := seen[target-n]; ok {
+			return []int{j, i}
+		}
+		seen[n] = i
+	}
+	return nil
+}
+
+// isPalindrome reports whether s reads the same forwards and backwards.
+func isPalindrome(s string) bool {
+	s = strings.ToLower(s)
+	for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1 {
+		if s[i] != s[j] {
+			return false
+		}
+	}
+	return true
+}
+
+// mergeSort sorts xs in ascending order using the merge sort algorithm.
+func mergeSort(xs []int) []int {
+	if len(xs) <= 1 {
+		return xs
+	}
+	mid := len(xs) / 2
+	left := mergeSort(xs[:mid])
+	right := mergeSort(xs[mid:])
+	out := make([]int, 0, len(xs))
+	i, j := 0, 0
+	for i < len(left) && j < len(right) {
+		if left[i] <= right[j] {
+			out = append(out, left[i])
+			i++
+		} else {
+			out = append(out, right[j])
+			j++
+		}
+	}
+	out = append(out, left[i:]...)
+	out = append(out, right[j:]...)
+	return out
+}
+
+type Stack struct {
+	items []int
+}
+
+func (s *Stack) Push(v int) { s.items = append(s.items, v) }
+
+func (s *Stack) Pop() (int, bool) {
+	if len(s.items) == 0 {
+		return 0, false
+	}
+	v := s.items[len(s.items)-1]
+	s.items = s.items[:len(s.items)-1]
+	return v, true
+}
+
+func main() {
+	fmt.Println(twoSum2([]int{2, 7, 11, 15}, 9))
+	nums := []int{5, 2, 8, 1, 9}
+	sort.Ints(nums)
+	fmt.Println(nums)
+	fmt.Println(isPalindrome("Racecar"))
+	fmt.Println(mergeSort([]int{3, 1, 4, 1, 5, 9, 2, 6}))
+}
+
+
+package pkg3
+
+import (
+	"fmt"
+	"sort"
+	"strings"
+)
+
+// twoSum3 returns the indices of the two numbers in nums that add up to target.
+func twoSum3(nums []int, target int) []int {
+	seen := make(map[int]int)
+	for i, n := range nums {
+		if j, ok := seen[target-n]; ok {
+			return []int{j, i}
+		}
+		seen[n] = i
+	}
+	return nil
+}
+
+// isPalindrome reports whether s reads the same forwards and backwards.
+func isPalindrome(s string) bool {
+	s = strings.ToLower(s)
+	for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1 {
+		if s[i] != s[j] {
+			return false
+		}
+	}
+	return true
+}
+
+// mergeSort sorts xs in ascending order using the merge sort algorithm.
+func mergeSort(xs []int) []int {
+	if len(xs) <= 1 {
+		return xs
+	}
+	mid := len(xs) / 2
+	left := mergeSort(xs[:mid])
+	right := mergeSort(xs[mid:])
+	out := make([]int, 0, len(xs))
+	i, j := 0, 0
+	for i < len(left) && j < len(right) {
+		if left[i] <= right[j] {
+			out = append(out, left[i])
+			i++
+		} else {
+			out = append(out, right[j])
+			j++
+		}
+	}
+	out = append(out, left[i:]...)
+	out = append(out, right[j:]...)
+	return out
+}
+
+type Stack struct {
+	items []int
+}
+
+func (s *Stack) Push(v int) { s.items = append(s.items, v) }
+
+func (s *Stack) Pop() (int, bool) {
+	if len(s.items) == 0 {
+		return 0, false
+	}
+	v := s.items[len(s.items)-1]
+	s.items = s.items[:len(s.items)-1]
+	return v, true
+}
+
+func main() {
+	fmt.Println(twoSum3([]int{2, 7, 11, 15}, 9))
+	nums := []int{5, 2, 8, 1, 9}
+	sort.Ints(nums)
+	fmt.Println(nums)
+	fmt.Println(isPalindrome("Racecar"))
+	fmt.Println(mergeSort([]int{3, 1, 4, 1, 5, 9, 2, 6}))
+}

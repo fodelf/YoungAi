@@ -137,5 +137,5 @@ SZ=$(stat -f %z "$OUT" 2>/dev/null || stat -c %s "$OUT" 2>/dev/null)
 # 会被 bash 误解析, awk 拿到残缺程序转而读 stdin(tty) 永久阻塞。-v 传值 + </dev/null 双保险。
 GIB=$(awk -v b="$SZ" 'BEGIN{printf "%.2f", b/1073741824}' </dev/null)
 log "完成: $OUT  ($GIB GiB)"
-log "下一步: MTP_GGUF=$OUT NO_MTP=0 COPY_SPEC=0 PROMPT_PROFILE=smoke tools/mtp_pipe_q2_speed.sh"
+log "下一步: MTP_GGUF=$OUT tools/mtp_pipe_q2_speed.sh  (设 MTP_GGUF ⇒ MTP 接管草稿, copy-spec 自动让位)"
 log "(脚本 MTP_GGUF 默认已优先用此 Q2 版, 若存在)"

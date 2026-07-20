@@ -12,6 +12,7 @@
  */
 
 #include "quants.h"
+#include "go-onebit/quant/onebit_quant.h"
 
 #include <assert.h>
 #include <float.h>
@@ -69,8 +70,19 @@ static const ds4q_traits ds4q_type_traits[DS4Q_TYPE_COUNT] = {
     [DS4Q_TYPE_TQ1_0]   = { "tq1_0",   QK_K,  54, false, false },
     [DS4Q_TYPE_TQ2_0]   = { "tq2_0",   QK_K,  66, false, false },
     [DS4Q_TYPE_MXFP4]   = { "mxfp4",      32,  17, false, false },
-    [DS4Q_TYPE_NVFP4]   = { "nvfp4",      64,  36, false, false },
     [DS4Q_TYPE_Q1_0]    = { "q1_0",      128,  18, false, false },
+    /* GO1B (per-ROW) is a variable-length format (one fp16 scale + packed sign words
+     * per row); its byte size is special-cased in ds4q_row_size, NOT
+     * type_size*(ne/block_size). block_size=32 only enforces ncols%32==0; type_size
+     * here is nominal/unused. CLI name "go1b_row" so the emitted BLOCK form (slot 40)
+     * owns the canonical "go1b" name. Research/calibration encoder only. */
+    [DS4Q_TYPE_GO1B]    = { "go1b_row",   32,   4, true,  false },
+    /* GO1B_BLK is the runtime on-disk format (Metal `block_go1b`): a clean fixed
+     * 256-element block of 34 bytes = fp16 row scale (replicated into every block)
+     * + 32 sign bytes. Uniform type_size*(ne/block_size) sizing (34*(ne/256)), so it
+     * needs NO ds4q_row_size special case. PINNED ggml disk type 40 (was the unused
+     * NVFP4 placeholder). CLI name "go1b"; this is what `--experts go1b` emits. */
+    [DS4Q_TYPE_GO1B_BLK] = { "go1b",     256,  34, true,  false },
 };
 
 static float ds4q_f32_from_bits(uint32_t bits) {
@@ -1031,6 +1043,9 @@ int64_t ds4q_block_size(ds4q_type type) {
 
 size_t ds4q_row_size(ds4q_type type, int64_t ne) {
     if (type < 0 || type >= DS4Q_TYPE_COUNT) return 0;
+    /* GO1B stores one fp16 scale per row plus packed sign bits, which does not fit
+     * the uniform type_size*(ne/block_size) block model; compute it directly. */
+    if (type == DS4Q_TYPE_GO1B) return go1b_row_bytes(ne);
     const ds4q_traits *tr = &ds4q_type_traits[type];
     if (tr->block_size <= 0 || tr->type_size == 0 || ne % tr->block_size != 0) return 0;
     return tr->type_size * (size_t)(ne / tr->block_size);
@@ -1062,6 +1077,26 @@ size_t ds4q_quantize_chunk(ds4q_type type, const float *src, void *dst,
     }
     if (type == DS4Q_TYPE_IQ2_XXS) {
         return ds4q_quantize_iq2_xxs(src, dst, start, nrows, ncols, imatrix);
+    }
+    if (type == DS4Q_TYPE_GO1B) {
+        /* Per-row strict-binary encode. Mirror the chunk addressing used above:
+         * `start` is an element offset (= start_row*ncols); rows are independent. */
+        (void)imatrix;
+        const size_t rb = go1b_row_bytes(ncols);
+        const int64_t start_row = start / ncols;
+        uint8_t *out = (uint8_t *)dst + (size_t)start_row * rb;
+        return go1b_quantize(src + start, out, nrows, ncols);
+    }
+    if (type == DS4Q_TYPE_GO1B_BLK) {
+        /* Strict-binary 256-element BLOCK encode (runtime/Metal on-disk format, ggml
+         * type 40). Same chunk addressing as the other fixed-block encoders: `start`
+         * is an element offset (= start_row*ncols), rows independent. Scale =
+         * mean(|w|), or the Go-activation-weighted L_fix re-fit when an imatrix
+         * (per-expert E[x²] slice, ncols floats) is supplied via --imatrix. */
+        const size_t row_size = ds4q_row_size(DS4Q_TYPE_GO1B_BLK, ncols); /* 34*(ncols/256) */
+        const int64_t start_row = start / ncols;
+        uint8_t *out = (uint8_t *)dst + (size_t)start_row * row_size;
+        return go1b_blk_quantize_imat(src + start, out, nrows, ncols, imatrix);
     }
     (void)src;
     (void)dst;

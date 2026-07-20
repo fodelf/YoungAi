@@ -5,6 +5,56 @@ material scope decision / blocker gets a dated entry here (per standing rule).
 
 ---
 
+## go1b residual mm_id 集成落地 + 真根因 (2026-07-01)
+- 真根因(此前 metal decode failed): go1b 无 mv_id kernel(ds4_gpu_routed_mv_pipeline 对 type-40 返回 nil)→force_mm=true→decode 走 mm_id 路径; 残差之前错放 mv_id 路径(gate_mv_pipeline=nil)→崩. 诊断链: MTL_SHADER_VALIDATION 抓 setThreadgroupMemoryLength(1164)非16倍数(误导=base自身条件, 掩盖真故障)→finish_command_buffer 加 cb.error 打印→[res-mm] pipe_nil=1 定位.
+- 修法落地(客观): ds4_gpu_residual_set 改 CPU 指针(gate_ptr/up_ptr/down_ptr=sidecar mmap tensor_data); decode(n_tokens=1) 在 use_mm_id 分支内 CPU-gather 活跃残差专家进紧凑 scratch(g_moe_res_gate/up_scratch, 匹配 base offload 紧凑布局)+ 复用 base work map(gate_mm_args)跑 go1b mm_id mapped_tile → g_moe_go1b_res_scratch → add_f32_1d 加进 gate/up(swiglu 前). 文件: ds4_gpu.h(struct) / ds4.c(residual_set_for) / ds4_metal.m(batch Block0 + mm_id 残差块 + 删旧 mv_id 块 + ds4_gpu_ensure_res_scratch助手). one_tensor 路径残差禁用(非 decode 路径).
+- 实测(客观): [res-mm-apply] L0/L1/L2 ok=1 不崩; gather 权重非零(gathered512=62462 src512=65056 eb=1114112). 但现有 res gguf 只 3 层 gate/up→correction 太小, A(--residual)vs B(无) 贪心 token 完全 byte-identical("1 int 2 int"退化). 机制通, 覆盖不够(3/43层, 缺 down 残差).
+- 下一步: emit_residual 需编译(依赖 hf_read.h/onebit_quant.h); 生成更多层残差看模型级质量; down 残差未加.
+
+## 稀疏 Go-active 残差成功 → 质量大幅提升 (2026-07-01)
+- 铁律纠正: 用户提醒"别加体积"——满残差(26/43层)加 21-35G≈2-bit=违反。删掉。
+- 数据裁决(客观): DS4_DUMP_ACTIVE 加 raw-picks dump, 实测 Go 频率覆盖曲线(95-token 真 Go 程序 prefill): 覆盖 80% picks 需每层 top-37 专家(5.1G), 90%→56(7.6G), 95%→73(10G), 100%→111(15G). Go 用得宽(不是 top-16), 但稀疏可控.
+- 用户选 80% 覆盖(5G, 总47G<2-bit 81G). 建稀疏管线: (a) tools 频率→每层 top-K 列表 go_active.txt; (b) emit_residual 加 --active-experts(稀疏生成 K 专家 + 每层 F32[256] LUT: expert→slot/-1); (c) ds4 residual_load 读 LUT, residual_set 加 lut 指针; (d) metal gather 稀疏查表(slot>=0 gather sparse[slot] else memset 0=零go1b块dequant为0). NFS HF(/private/tmp/m1_ds4, 全46 shard)生成全43层.
+- 产物(客观): gguf/ds4-go1b-res.gguf 稀疏 43层 172 tensor 5.0G(sparse=1). ds4 集成: [res-mm-apply] ok=1 ×172 + [res-down] ×172 = 43层 gate/up/down 全应用.
+- ★质量实测(最简单 Go 问题 func Add, --residual+--corr)★: A(1-bit+稀疏Go残差+z+四损失)="  return int" (真 Go return 关键字) vs B(无残差)="1 int 2 int 3 int..."(退化垃圾). A≠B, 从退化→真实 Go 代码=**残差有效, 质量大幅提升**. gen 0.22 t/s(残差 gather 加 IO). "return int" 未到完美"return a+b"(80% 覆盖有 gap, 可升 90/95%).
+- 四条件全达成: (1)Go专属残差(稀疏Go-active)✓ (2)1-bit+Go残差+z+四损失集成ds4✓ (3)最简单Go问题✓ (4)质量日志(A vs B)✓.
+
+## 100% 覆盖 + 双机集群脚本 (2026-07-01)
+- 用户: 100%覆盖能放下 + 双机集群本机合并 + 脚本进项目. NFS `/private/tmp/m1_ds4` = M1 全46 shard; M1 SSH 通.
+- 100% 覆盖(每层全部 Go 用到专家 ~111/层, 43.3%)从 NFS HF 生成 gguf/ds4-go1b-res.gguf **14G**(总57G<2bit). 实测 func Add: 输出="  return int" **与 80% 完全相同**. 裁决(客观): 对 func Add, 80%↔100% 无差异——该输入只路由到两者都覆盖的专家, 额外覆盖对特定输入无效. 质量天花板"return int"(真Go `return` 但缺 `a+b`)= **1-bit 残差每专家 0.82 精度上限**(18%误差×43层累积), 非覆盖问题. 覆盖只对更广 Go 输入有用.
+- 双机集群脚本(项目内 gguf-tools/go-onebit/): emit_residual.c `--active-experts`(稀疏+LUT); merge_residual.c(合并各机 disjoint 层 GGUF, 含最小 GGUF reader); scripts/gen_residual_cluster.sh(M4本地0-11 ∥ M1本地12-42 → scp → merge, ~30min→~3min); scripts/pick_active_experts.py(picks.log→每层top-K, 参数化覆盖). 全编译/语法通过.
+- 待验: 集群脚本端到端(需 M1 同步+编译, 未跑); 更高质量需 2nd 残差层(Q1(R-Q1(R)) 加 bit/体积)——受"别加体积"约束.
+
+## ★z 隐变量零效应真根因 (2026-07-01, 用户要求验证 z 是否起作用)
+- 用户问: z+四损失确定起作用吗? 正向吗? 不是就调到最优.
+- 严格消融(客观铁证): P(纯1bit)=B(1bit+z)="1 int 2 int"退化; C(1bit+残差无z)=A(1bit+残差+z)="return int" **逐字节相同**. dump-logprobs A vs C 每步 **maxdiff=0.000000**(logits 完全一样). → **z 对输出零效应**(既非正向也非负向, 就是零). B==P → z 从来没起过作用(latent bug, 非残差冗余).
+- 逐层诊断链: corr 加载43/43·值非零(|C|max=247,|b|=0.06)·ds4_gpu_corr_apply 被调用ok=1·gU/gC上传非nil·kernel数学正确(outt[d]+=acc)·dispatch正常. kernel diag(+50/n_valid*10/b*1000 强写)全改变输出→**kernel完全工作、写回到达输出**. 但真实 acc≈0.
+- ★真根因★: [corr-sel] 读 corr 处 g->router_selected = **0,0,0,0,0,0 全零**(原始应0..255). go1b decode 走 offload 批tensor路径, MoE 内部 remap/gather **原地改坏了 g->router_selected**, corr 之后读到坏值→per-expert C[e]/beta[e] 索引退化→修正塌成0. **和残差之前一样的 offload 破坏共享输入 bug**. 注释留在 ds4.c L11765.
+- 裁决: z 在 ds4 从未起作用(offload bug); "z-neutral 0.55" 是 calib_run 离线测的, 非 ds4. ds4 里残差干全部活("return int"). 修法=给 corr 原始(remap前)top-6 selected(存副本)——但 z 和残差冗余(都修1bit误差, 残差更好). 待用户定是否修 plumbing.
+
+## ★z plumbing 已修通 → z 仍零效应, 真根因=corr 值本身退化 (2026-07-01, 续)
+- 用户否决"冗余可跳过": z 是 Go 专属叠加调优, 必须修通再判. 已修 offload remap bug: MoE 快照 remap 前原始 top-k selected(g_corr_saved_selected, ds4_metal.m 全局+ds4_gpu_corr_saved_selected()), decode/prefill 两处 corr 读快照. **验证快照生效**: [corr-sel] 现读到正确原始 id(L0 226/171/100/131/147/161, 每层每token不同), 非 0,0,0 也非 0..5 compact slot.
+- 但修通后仍 **P==B 逐字节相同**(base 与 base+z 一样, this-binary 实测, 非旧记忆). corr 值/id/x 全对却零效应 → 客观定位到 corr 值本身:
+  - corr_stats 实测(gguf/ds4-go1b-corr.gguf): corr_C max 33.9(L0)/196.7(L20) 大; 但 **corr_V max 仅 0.009 / mean 0.0007(近零)**, corr_U max 0.08, corr_b L2 0.76(L0)/3.4(L20).
+  - kernel +2.0 常量 diag → 输出变(dekameters), 证 routed_out→logits 通路 OK, 非 plumbing.
+  - [corr-x] 实测 ||ffn_norm(x)||≈15-20 max|x|1-4 = x 正常非损坏.
+  - corr_delta 实测 L0≈4.535 ≈ **6·||b||(=6×0.757)** → 修正塌到只剩常量 bias 项 n_valid·b, **激活相关核 U·diag(C)·(V·x) 因 V≈0 消失**. 常量 bias L2~4.5 相对残差流(L2 100+)太小→不翻 greedy token(尤其退化 loop 强吸引子).
+- ★结论(客观)★: ds4 集成侧全对(id/x/kernel/通路验证). z 零效应真根因在**四损失 solve 产出退化 V(≈0)**, 激活相关低秩修正塌成弱常量. 离线 solve 天花板也低: build_go1b.sh 记 corr_cos 仅 0.524→0.547@rank64(+0.023); log 上文 "方向子空间高秩 cumE@64=0.10, base_cos≈0.521=1bit sign方向极限". → 与 2026-06-29 [[go_onebit_activation_space_exhausted]] 一致: 严格1bit误差=高维噪声, 激活空间低秩修正数学上抓不住. 用户判据"没起作用=z和损失不对"→成立.
+
+## ★calib_run OOB bug 修复 + z 数据-scaling 实测 (2026-07-01, 用户: 规律存在是算法没找到)
+- 用户坚持: Go 有规律, z+四损失该抓到, 是算法没找到. → 深挖 solve 为何产出退化 V.
+- **发现 calib_run.c:287 硬 bug**: `hv_fidelity(..., NEXP, ...)` 传编译常量 NEXP=256, 但数组按 n_exp 分配(L209). n_exp<256 时越界读 → nx=32 读到垃圾(0.473<base 假数据)、nx>32 直接 segfault. **这是之前所有 solve 崩溃/假数据的真因**. 已修 (NEXP→n_exp). M4+M1 都重编.
+- 修后有效实测(L8, w_align=1, 现数字可信): n_exp=256 nx=32 → base_cos 0.521 / corr_cos 0.547; n_exp=64 nx=128(8192样本) → 0.532/0.546; n_exp=64 nx=512(32768样本) → 0.536/0.550. **4× 数据仅 +0.004 corr_cos**.
+- **eig 谱在 8192↔32768 样本形状不变**(顶模都占 tot 的 0.58%, cumE@64≈0.148 both) → 谱平坦是真的, 非小样本(Marchenko-Pastur)假象. 数据饿死假说被否: 加数据不救.
+- 唯一未测透杠杆=rank(rank64 只抓~15%能量). 已启 M1 后台 rank sweep(64/128/256/512, nx=512 n_exp=64, /tmp/rank_sweep.log). 待其判决线性 z 是否有救.
+- 对照锚点: 权重残差 base_cos 0.53→0.82(强一个量级). 若 rank sweep 平坦, 则线性激活 z 确有天花板, 规律实为权重残差所抓.
+
+## rank sweep 判决 + 转权重残差 + 覆盖诊断 (2026-07-01, 用户批准转残差)
+- M1 rank sweep 实测(L8 nx=512 n_exp=64): rank64→corr_cos 0.5455(cumE 0.42), rank128→0.5454(cumE 0.455). **rank 涨、抓能量涨、corr_cos 平** → rank 不是杠杆. 机理: Δo_e=ΔW_e·x 每专家一个矩阵, z 用共享 V+每专家标量 C_e 表示不了 → 天花板 ~0.545. 权重残差直接存 ΔW_e 所以 0.82. 用户批准转残差.
+- 残差覆盖诊断(ds4 base+residual DS4_DUMP_ACTIVE, 交叉 LUT): 测试 prompt 的 routed picks **仅 88.1% 被残差覆盖**(残差 avg 111/256 专家/层, 是标定 workload 的 Go-active 集; 测试 prompt 命中 12% 尾专家在集外→拿原始1bit). 24 层 <90% 覆盖.
+- ★磁盘事故★: union 覆盖残差(123/256, 17G)集群重生成撞 ENOSPC(M4 盘 95%满: q2 81G+base 42G+hf 主占; merge 峰值 33G). 已杀进程+清中间文件, **base/hf/q2/旧残差全在**, M4 剩 10G. 教训: merge_residual 不删中间文件→峰值高; emit_residual 单机边组装边 remove 临时→峰值~输出大小.
+- 转磁盘安全: test-prompt 覆盖残差(59/256 avg, ~8G)全程 M1 生成+测(M1 有 base+ds4+全shard, 14G空闲, 加磁盘看门狗). 决定性: 补齐覆盖后连贯=覆盖是杠杆; 仍退化=0.82保真墙.
+
 ## 2026-05-30 — Dual-host 200k / 20 t/s coding plan — investigation + physics (NEW plan, pre-params)
 
 **Context.** New goal, distinct from the single-machine 1M-ctx roadmap (Levers A/B/C).
@@ -3974,3 +4024,34 @@ copy-spec 赖以整段接受的"逐字复现上下文"被打断 (tok/call 5.39�
 **未验 (gated, 不在本机做)**: 运行时 Mode P 下 clamp 计数=0 的实证 = M-1.3 单机 k16 logprob-vectors parity 跑 (在 M1, 载模型, 🔒 逐次授权; B2b 设计上与之同跑)。**M1 同步前置**: 本改动动 `ds4_metal.m`(CORE_OBJS) + `metal/dsv4_misc.metal`, M1 需 sync 两文件 + 重编后方能在 k16 跑中走到 B2b 路径。
 
 **wave-83 续: M-1.3 验证驱动脚本落地 `tools/reactgo_k16_verify.sh` (客观)**: 用户指出无类似 `mtp_pipe_q2_speed.sh` 的测试脚本。补单机 keep-map (shrunken Mode P) 验证驱动, 仿 mtp_pipe 安全结构。三门: **G1** B2b clamp (`DS4_VERIFY_ROUTE_CLAMP=1` 跑 → grep stderr → clamp=0 PASS / "CLAMP LEAK" FAIL / 无 dump 行=full 模型判 SKIP); **G2** smoke 连贯 (awk 唯一-token 占比启发式, 防数字汤; words≥8 且 ratio≥0.30 PASS); **G3** ds4-eval q1..q4 (opt-in)。安全闸: 默认 DRY-RUN, 须 `RUN=1` 才载模型 (逐次授权); `DS4_MEM_BUDGET_MB`(L1 gate) + 后台 RSS 看门狗 (超 `MAX_GB` 即杀) + `trap cleanup INT TERM EXIT` 只杀进程不删文件; keep-map 自检 (`strings | grep expert_keep_map`)。CLI flag 全核实 (ds4 `-p/-n/--temp/--seed`、ds4-eval `--plain/--questions/--tokens/--temp/--seed`)。**M4 验证 (不载模型)**: `bash -n` 绿; DRY-RUN 跑通 (正确报"模型不在本机→去 M1"并退 0, 不载模型); G2 awk 启发式合成测试 (连贯 ratio=0.83 PASS / 数字汤 ratio=0.05 FAIL)。文末附: 双机 mtp_pipe 跑里两端加 `DS4_VERIFY_ROUTE_CLAMP=1` 即得各机 clamp 统计 (B2b 是 ds4_metal.m 内置纯 env 开关, 与 run 模式无关)。**未跑**: 真实 k16 模型在 M1, gated, 待授权。
+
+## go-onebit 质量迭代 (2026-06-30)
+- calib_run 加 CLI 四损失权重(--w-align/-smooth/-classify/-fixed)+子集专家(--n-experts)+--no-solve+--maxrank; iter.sh 秒级内环 base_cos 4s / corr_cos 78s.
+- 修 align 损失(loss4): 原只重加权 stage-5 per-expert C/β=无效(corr_cos 0.52442→0.52459); 改 w_align 门控 stage-2 残差单位归一化→方向感知共享基 U→corr_cos 0.52442→0.53012(rank16)→0.54707(rank64) 单调涨. 数据 L8 n_exp256 nx32.
+- base_cos≈0.521 全层稳定=1-bit sign 方向极限(主瓶颈). 张力: 方向子空间高秩(cumE@64=0.10)→全恢复需大rank vs 更小体积. 文档 gguf-tools/go-onebit/PROGRESS.md.
+
+## 2026-07-02 R1 — 四损失闭式 RRR 新方案启动（按新计划执行，不引用历史结论；计划文件 ~/.claude/plans/git-hf-nsf-ssh-golan-43-256-go-go-1b-gu-floofy-quokka.md）
+- E0 采集金标门 PASS：validate_fwd L5/8/20/35 STAGE1 variant(a) gate-weighted cos≥0.99996（relL2 .001-.014）
+- E0 1-bit 基线（objective）：聚合 cos(ŷ,y*) L5 .681 / L8 .684 / L20 .680 / L35 .591；密集 base_cos .545/.534/.545/.495；o_hat/o_ref trace 比≈0.16（输出范数~1/2.5）；Δo 谱 eig0 占 46% 能量（L8 nx=64）；per-expert x→Δo 线性 R²=0.0072
+- 新代码落地：solve_rrr.c/.h（RRR + 逐坐标 256×256 共火 LS(先验1/6) + k×k Procrustes + Q 度量 + 差分增广）、calib_run --solver rrr 聚合装配（教师 gate 权重重算=variant(a)，swiglu clamp 对齐 runtime）、layer_probe expert_forward_f32_lim、onebit_quant go1b_blk_quantize_imat（L_fix 加权 scale，GO1B_TEST 断言全绿）、quants.c GO1B_BLK 接 imatrix、pyfwd/gen_go_stats.py、dsv4_fwd.py capture 扩展（route_logits/route_w/routed/final_topk_idx|val，M1 侧 dsv4_fwd.py.bak_e1 已备份）
+- RRR_TEST 合成自测 PASS：TE cos 0.094→0.982
+- E2 L8 rank64 λ=1e-4 lam_c=0.01 nx=4096（chunk0-7 训练，heldout 尾部 chunks）：TR corr_cos .677→.789（rel .777→.377）；TE corr_cos .681→.425、rel .776→.795 —— held-out 反向，n_train≈d 插值区证据；后续扫 λ/lam_c/nx=10240/feat=yhat
+- E2 smoke L8 rank16 nx=512：TE cos .681→.578，rel .772→.448
+- E2 cfg2/cfg3（lam_c 0.2 / +no-procrustes）：TE corr_cos .423/.423 ≈ cfg1 .425 —— lam_c 与 Procrustes 均非 held-out 杠杆；决胜扫（λ∈{1e-2,1e-1}×feat∈{x,yhat}×nx=10240 + w_smooth 行）已发（scripts/e2_sweep.sh）
+- E4 A/B（L_fix 加权 scale，nx=64 密集）：L5 relL2 .8068→.7559 / L8 .8061→.7853；base_cos L5 .5453→.5437 / L8 .5338→.5324 —— rel 改善、cos 持平（sign 不变、方向不动，符合物理）；按门（cos≥+0.01）暂不排 E6，等 rrr+go-stats 叠加证据
+- E1 冒烟（M1 chunk0 全 43 层）：teacher top1 acc .920；w_sum≡1.5（±5e-4）；route_logits→top6 重放 L1/3/8/20 全等、L42 510/512（2 行 f16 平票 gap 4e-6/1.5e-5）；新旧 cap 对拍 FAIL＝token 流不同（hash 层 route 也不同→分块/BOS 约定差异，语料 mtime 早于老 cap 4 分钟未变）→ 决策：全量重采集为 cap_m1_v2（8 信号）作新金标，已后台发（~13GB，M1 剩 73G）
+- solve_rrr 增 --umode pca（U/V=特征(ŷ)PCA 基，免 d×d 图拟合，C 阶段承载全部增益）；RRR_TEST 复跑 PASS；calib 脚本 SOLVER/EXTRA_ARGS 参数化
+- E2 φ=ŷ 判决（L8 nx=10240 k64 lam_c.2）：feat=x λ1e-1 TE cos .738/rel .422（过门 +0.057）；**feat=ŷ λ1e-1 TE cos .766/rel .406（+0.085，TR/TE 差 .013）**=新最优；λ1e-2 ŷ .761；umode=pca 无效（TE .680/.624，RRR 拟合图的跨方向旋转必要）；sweep 行3/4 与 P2 双机复现一致（确定性交叉验证）
+- 深度检查（M1，feat=x λ1e-2）：L20 TE cos .666→.720/rel .448 ✓；**L35 病理：全局 rel .094 vs 逐token cos .188（塌）**——深层 token 范数弥散（标量增益 3.96 vs 浅层 ~2.2-2.4），能量加权 LS 被大范数 token 劫持 → 接入 L_align 逆范数重权（rrr 行加权 √a_t），L35 抢救行 walign∈{1.0,.5,0}×feat=ŷ 已发（M1），L8 哨兵行已发（M4）；RRR_TEST 复跑 PASS
+- 运行时 φ=ŷ 落地：ds4_corr.phi_yhat（KV ds4.corr.phi_yhat）+ corr_load 读取 + decode/batch dispatch 换绑 routed_out + host 镜像 feat 分支；kernel 零改动（phase1 读 φ 全量于 barrier 前，允许 out 别名）；emit_z --phi yhat 写 KV；ds4/emit_z 重编 0 警告
+- 双机并发调度落地：M4=层0-12权重活+求解/统计（磁盘 18G 剩，补 shard 不可行），M1=全 shard 重活+单机双进程 chunk 拆采集（48chunk 单进程 400s/层→24chunk 双进程 126s/层×2 路，~4×）；执行脚本入 repo：e2_lane.sh / e2_sweep.sh / cap_v2_dual.sh / merge_caps.py / check_capture.py / student_traj.py / gen_go_stats.py
+- E1 对拍升级判读：新旧 cap 为不同 token 流（老 cap 语料相同但切块/BOS 约定不明），不考古；cap_m1_v2（24 chunks 双进程）为新金标，L42 top6 重放 510/512（f16 平票 gap≤1.5e-5，非 bug）
+- R3-e wave: corr 批CB骑乘补丁回退（A22 22CB零开销反证队列拥挤论；B43 +15ms在fault_ms 另有机制）；真根因出土=`ds4_gpu_tensor_read` 裸memcpy不drain pending → corr async-submit后host立读=竞态（测试实锤 corr_apply rel=.605 / router_bias max_abs=.6875≈delta量级=校正未执行即被读）；修复=tensor_read入口 pending非空先wait（decode稳态pending空=零成本，NLL 2.186不受影响）；门：metal-kernels全绿（rel=1e-7/0.000）+ server OK；speed_demo4复测发出
+- R3-e wave2: 免费旋钮判决（bare 12tok 配对）base 0.45 / pread 0.97 / pread+prefetch 1.00（2.2×，token 逐字节一致）；侧车病灶=corr 微 dispatch 写 routed_out 的 hazard 管线气泡（SKIP 0.87/scratch 探针 0.92/真跑 0.40，φ=ŷ 自别名加倍）；结构修复=corr_delta store 变体+fused shared-down 消费者加法（同序 fadd 位精确，仅 decode fused 路径，DS4_CORR_INPLACE 回退）；metal-kernels+server 绿，新增 store-variant 位精确断言；make cpu 两处欠账修复复绿；NLL 位精确门在跑
+- R3-d stage0: harvest_repos.py 加匿名 REST 回退（无 gh 机器可跑）；go 关键字 4 仓库+96 issues 3.3MB（gin/frp/fzf/awesome-go，>80MB 6仓自动跳过）；corpus_build 出双链路流 simple 4056/complex 623 → go_mixed.txt 3.2MB
+- R3-e 终判决: NLL 位精确门 PASS(2.186004341 逐位+token 逐字节双侧车验证); delta 不救 φ=ŷ(打点证分支在跑)→根因改判=corr RAW-读 routed_out 在忙链插 barrier 转换(~10-12ms/次, 42G mmap 疑 residency 重验证); φ=x 读 ffn_norm 整体脱链→A22 0.97-0.99 免费 vs s1 φ=ŷ 0.40; 前沿: A22(2.209,0.97) vs s1(2.186,0.40) Δ0.023nats↔2.4×; EF2=feat=x+引擎目标+新语料合并两点; cap_ef2 已发射(L0-24, s1底座); M4 清过程数据 3→18G; M1 脚本同步; delta 基础设施保留作默认(φ=x 下写卫生,位精确,可回退)
+- EF2x 事故+修复: teacher_inject L≥3 断言把 hash 层(L0-2)拒之门外→泵 bad cap tensors(缺 routed 目标) PUMP-FAIL×3; 修=inject 加 hash 分支(hash 选择由 token id 决定输入无关+router 永不量化→同 token 同 x̂ 下采集的 route/route_w 就是教师选择, 直接驱动教师专家前向, δ 不适用 hash 本就跳过); 补注入 L0-2+重泵已挂自愈链(M4 消费者 until 轮询自动捡起); 主泵 L4+ 未受影响继续
+- EF2x 事故2+修复: 远端 nohup 继承 ssh 通道 stdin → ssh 永不返回(编排卡 stage1/2 两次, < /dev/null 放本地侧无效——必须写进远端命令 nohup 前); 泵/M1消费者实际已被 nohup 拉起未受影响, M4 消费者手动补发射; ef2x_solve.sh 已修成远端侧重定向+pgrep 防重守卫; 三泳道就位: M1泵(~5-7min/层)+M1本地消费(L13-24)+M4 scp消费(L0-12), sel L0/L1/L3-L5 已落
+- EF2x 2×2 终判: 交叉对称(b22 4.364/5.046 vs ef2x 4.920/4.374, bare 5.569@旧)→语料漂移主导, 管线无缺陷; z=域适应方向盘(10MB↔0.6-0.7nats); 产品配方=合并语料28k+双heldout; 教训=一轮一变量; go_merged_28k.txt 已备
+- R3-g P1a: corr 模块抽出（ds4_internal.h 类型网 238 行 + ds4_corr.c 165 行）；五重门全绿含快照参照二进制逐位等价（3.300111108）；MAX 枚举/shape 宏/模型张量类型网移入 internal.h，7 函数去 static 发布；Makefile 双变体 .o；M1 同步重编绿
+R5-B wave: emit_residual --base-gguf 补丁(逐字节dequant部署底座,修per-row scale错配0.02191≠0.020004) + gguf_range_stream.py(帧流splice) + r5_residual_dual.sh(全M1三波,峰值≤12.5G) → go-hot-res.gguf 4.28G (43层×top-32,点火质量66.8%) 产线全绿。悬崖判决: keep-sim K122 ΔNLL+0.678 / K160 +0.66(平坦)→专才不可裁,A/C路线灭,B=残差升位(底座42.5G不动+插件)

@@ -1,0 +1,17 @@
+The auditor noticed that quarterly revenue diverged sharply from the forecast, so she traced each anomaly back to a misconfigured currency-rounding rule buried in the reconciliation pipeline. Meanwhile, in a damp Lisbon warehouse, three engineers argued about whether the Kalman filter's process noise should be tuned before or after the sensors were recalibrated.
+
+def merge_intervals(intervals):
+    intervals.sort(key=lambda x: x[0])
+    merged = []
+    for start, end in intervals:
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return merged
+
+Consider a Markov chain whose stationary distribution pi satisfies pi = pi P; when the transition matrix P is irreducible and aperiodic, convergence is geometric with rate governed by the second-largest eigenvalue modulus. Historians still debate why the treaty collapsed within eighteen months, though most attribute it to the sudden devaluation and a poorly worded arbitration clause.
+
+fn fibonacci(n: u64) -> u64 { let (mut a, mut b) = (0u64, 1u64); for _ in 0..n { let t = a + b; a = b; b = t; } a }
+
+Rain hammered the tin roof as Mara decoded the intercepted telegram, its letters shifting under a Vigenere key she had guessed from the enemy's careless repetition of the word "harvest".

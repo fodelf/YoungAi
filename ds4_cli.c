@@ -100,17 +100,6 @@ static void cli_dist_busy_set(const cli_config *cfg, bool busy) {
     if (!busy) cli_dist_notice_printed = 0;
 }
 
-/* PC.1 copy speculation (project.md §3.5): enter the speculative decode path
- * even without an MTP drafter when the n-gram copy drafter is enabled. */
-static bool cli_copy_spec_enabled(void) {
-    /* Copy-speculation is the natural default drafter for greedy decode: it is
-     * self-tuning and lossless, a no-op on unpredictable text, so it is always
-     * armed (no enable flag). The session-level drafter itself decides per step
-     * whether to speculate; the distributed path keeps its own DS4_DIST_COPY_SPEC
-     * specifics. */
-    return true;
-}
-
 static int cli_wait_distributed_route(const cli_config *cfg, ds4_session *session) {
     if (!cli_distributed_coordinator(cfg)) return 0;
 
@@ -163,6 +152,8 @@ static void usage(FILE *fp) {
         "      Maximum autoregressive MTP draft tokens per speculative step. Default: 1\n"
         "  --mtp-margin F\n"
         "      Minimum recursive-draft confidence for the fast N=2 verifier. Default: 3\n"
+        "  --go-trie FILE\n"
+        "      Corpus n-gram trie (build_go_trie.py) as a greedy-lossless copy-spec drafter. Also: DS4_GO_TRIE.\n"
         "  -c, --ctx N\n"
         "      Context size allocated for the session. Default: 32768\n"
         "  --metal\n"
@@ -533,15 +524,6 @@ static void token_printer_write_text(token_printer *p, const char *text, size_t 
     }
 }
 
-static void print_generated_token(void *ud, int token) {
-    token_printer *p = ud;
-    size_t len = 0;
-    char *text = ds4_token_text(p->engine, token, &len);
-    token_printer_write_text(p, text, len);
-    fflush(p->fp);
-    free(text);
-}
-
 static void build_prompt(ds4_engine *engine, const cli_generation_options *gen, ds4_tokens *out) {
     if (is_rendered_chat_prompt(gen->prompt)) {
         ds4_tokenize_rendered_chat(engine, gen->prompt, out);
@@ -597,6 +579,11 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     ds4_session_set_display_progress(session, NULL, NULL);
     const double t_prefill1 = cli_now_sec();
 
+    /* 生成区边界 + 投机贪心门: anticycle 只扫 [prompt 末, end); argmax 接受
+     * (copy-spec/MTP)只在 temp==0 保分布, 带温采样时关断。 */
+    ds4_session_mark_generation_start(session);
+    ds4_session_set_spec_greedy(session, cfg->gen.temperature <= 0.0f);
+
     int max_tokens = cfg->gen.n_predict;
     int room = ds4_session_ctx(session) - ds4_session_pos(session);
     if (room <= 1) max_tokens = 0;
@@ -622,8 +609,10 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
                          * spec-pipe 2nd cycle on full accepts (n_acc+spec_next_kb>65 -> the
                          * ~1/9 fire rate); 129 enabled 1 lookahead; 513 enables the chain. */
         int ntok = 0;
+        /* Greedy decode always takes the speculative path: the n-gram copy
+         * drafter is the natural default (self-gating, lossless), with MTP
+         * drafting when a draft model is loaded. */
         if (cfg->gen.temperature <= 0.0f &&
-            (ds4_engine_mtp_draft_tokens(engine) > 1 || cli_copy_spec_enabled()) &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
             cli_dist_busy_set(cfg, true);
             ntok = ds4_session_eval_speculative_argmax(session,
@@ -871,6 +860,10 @@ static int run_logprob_dump(ds4_engine *engine, const cli_config *cfg, const ds4
     ds4_session_set_progress(session, NULL, NULL);
     ds4_session_set_display_progress(session, NULL, NULL);
 
+    /* 贪心 argmax 续写: 钉生成区边界(anticycle 不再扫 prompt), 贪心路径投机门=1。 */
+    ds4_session_mark_generation_start(session);
+    ds4_session_set_spec_greedy(session, 1);
+
     FILE *fp = fopen(cfg->gen.dump_logprobs_path, "wb");
     if (!fp) {
         fprintf(stderr, "ds4: failed to open --dump-logprobs file: %s\n", cfg->gen.dump_logprobs_path);
@@ -1062,35 +1055,11 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
             fprintf(stderr, "ds4: diagnostic run completed on the native %s path.\n",
                     ds4_backend_name(cfg->engine.backend));
         }
-    } else if (cfg->engine.distributed.role == DS4_DISTRIBUTED_COORDINATOR ||
-               cfg->gen.temperature > 0.0f ||
-               ds4_engine_mtp_draft_tokens(engine) > 1 ||
-               cli_copy_spec_enabled()) {
-        /* copy-spec (single-machine, greedy temp=0) needs the sampled-generation
-         * loop that runs the speculative verifier; the plain argmax path below
-         * has no spec hook. */
-        rc = run_sampled_generation(engine, cfg, &prompt);
     } else {
-        token_printer printer = {
-            .engine = engine,
-            .fp = stdout,
-            .format_thinking = ds4_think_mode_enabled(cli_effective_think_mode(&cfg->gen)),
-            .in_think = ds4_think_mode_enabled(cli_effective_think_mode(&cfg->gen)),
-            .use_color = isatty(fileno(stdout)) != 0,
-            .last_output_newline = true,
-        };
-        cli_prefill_progress progress = {
-            .base_tokens = 0,
-            .input_tokens = prompt.len,
-            .use_color = ds4_log_is_tty(stderr),
-        };
-        rc = ds4_engine_generate_argmax(engine, &prompt, cfg->gen.n_predict,
-                                        cfg->gen.ctx_size,
-                                        print_generated_token,
-                                        generation_done,
-                                        &printer,
-                                        cli_prefill_progress_cb,
-                                        &progress);
+        /* Generation always runs the sampled-generation loop: it hosts the
+         * speculative verifier for the always-armed copy-spec drafter (and MTP
+         * when loaded); greedy temp=0 is just a special case of it. */
+        rc = run_sampled_generation(engine, cfg, &prompt);
     }
 
     ds4_tokens_free(&prompt);
@@ -1269,6 +1238,11 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
     ds4_session_set_display_progress(chat->session, NULL, NULL);
     const double t_prefill1 = cli_now_sec();
 
+    /* 每轮重钉生成区边界(本轮 prompt=至此的全部 transcript, 含此前生成的轮次);
+     * 投机贪心门按本轮实际温度。 */
+    ds4_session_mark_generation_start(chat->session);
+    ds4_session_set_spec_greedy(chat->session, cfg->gen.temperature <= 0.0f);
+
     token_printer printer = {
         .engine = engine,
         .fp = stdout,
@@ -1301,8 +1275,8 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
                          * spec-pipe 2nd cycle on full accepts (n_acc+spec_next_kb>65 -> the
                          * ~1/9 fire rate); 129 enabled 1 lookahead; 513 enables the chain. */
         int ntok = 0;
+        /* Greedy decode always takes the speculative path (copy-spec / MTP). */
         if (cfg->gen.temperature <= 0.0f &&
-            (ds4_engine_mtp_draft_tokens(engine) > 1 || cli_copy_spec_enabled()) &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
             cli_dist_busy_set(cfg, true);
             ntok = ds4_session_eval_speculative_argmax(chat->session,
@@ -1569,7 +1543,9 @@ static cli_config parse_options(int argc, char **argv) {
         },
         .gen = {
             .prompt = NULL,
-            .system = "You are a helpful assistant",
+            .system = "",   /* default system prompt OFF: assistant-persona system text derails
+                             * base code continuation (model answers the persona instead of
+                             * continuing the code). Pass -sys "..." to set one explicitly. */
             .n_predict = 50000,
             .ctx_size = 32768,
             .temperature = DS4_DEFAULT_TEMPERATURE,
@@ -1624,6 +1600,14 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--corr")) {
+            c.engine.corr_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--residual")) {
+            c.engine.residual_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--zchain")) {
+            c.engine.zchain_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--go-trie")) {
+            c.engine.go_trie_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {

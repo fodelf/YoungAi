@@ -36,6 +36,8 @@ enum {
     DS4_METAL_TENSOR_Q2_K    = 10,
     DS4_METAL_TENSOR_Q4_K    = 12,
     DS4_METAL_TENSOR_IQ2_XXS = 16,
+    DS4_METAL_TENSOR_GO1B    = 40,   /* strict-1-bit routed expert (mirrors GGUF ggml type 40) */
+    DS4_METAL_TENSOR_GO2B    = 41,   /* merged base+residual binary pair (R5-C go2b) */
 };
 
 static id<MTLDevice> g_device;
@@ -156,6 +158,36 @@ static id<MTLBuffer> g_attn_out_group_ids_buffer;
 static id<MTLBuffer> g_moe_scratch_gate;
 static id<MTLBuffer> g_moe_scratch_up;
 static id<MTLBuffer> g_moe_scratch_down;
+static id<MTLBuffer> g_moe_go1b_res_scratch;   /* 1-bit residual mapped-tile matmul output */
+static id<MTLBuffer> g_moe_res_gate_scratch;   /* compacted residual gate experts (n_active) */
+static id<MTLBuffer> g_moe_res_up_scratch;     /* compacted residual up experts (n_active) */
+static id<MTLBuffer> g_moe_res_down_scratch;   /* compacted residual down experts (n_active) */
+/* R5-C go2b hot/cold split: hot picks run one go2b matmul pass; base pass masks them. */
+static id<MTLBuffer> g_moe_hot_gate_scratch;
+static id<MTLBuffer> g_moe_hot_up_scratch;
+static id<MTLBuffer> g_moe_hot_down_scratch;
+static id<MTLBuffer> g_moe_hot_sel;            /* per-pick compact hot slot (i32) or 0xFFFF */
+static int32_t *g_hot_pick_slot;               /* host: per-pick compact hot index or -1 */
+static uint32_t g_hot_pick_cap;
+
+/* go1b corr: snapshot of the ORIGINAL top-k expert ids taken inside the offload
+ * MoE before it remaps the selected buffer to compact slots in place.  The corr
+ * (ds4_gpu_corr_apply) indexes per-expert C[e]/beta[e] by true id, so it must
+ * read this pre-remap copy, not the corrupted live selected tensor. */
+static ds4_gpu_tensor *g_corr_saved_selected;
+
+ds4_gpu_tensor *ds4_gpu_corr_saved_selected(void) { return g_corr_saved_selected; }
+
+/* Ensure the compacted residual weight scratches (Shared: CPU-gathered, GPU-read). */
+static int ds4_gpu_ensure_res_scratch(uint32_t n_active, uint64_t expert_bytes) {
+    uint64_t need = (uint64_t)n_active * expert_bytes;
+    if (need == 0) return 0;
+    if (!g_moe_res_gate_scratch || (uint64_t)g_moe_res_gate_scratch.length < need)
+        g_moe_res_gate_scratch = [g_device newBufferWithLength:need options:MTLResourceStorageModeShared];
+    if (!g_moe_res_up_scratch || (uint64_t)g_moe_res_up_scratch.length < need)
+        g_moe_res_up_scratch = [g_device newBufferWithLength:need options:MTLResourceStorageModeShared];
+    return g_moe_res_gate_scratch != nil && g_moe_res_up_scratch != nil;
+}
 static const void *g_model_map_ptr;
 static uint64_t g_model_map_size;
 /* Largest model file size ever mapped this process. The expert-fetch transport
@@ -316,6 +348,14 @@ static void ds4_gpu_close_batch_encoder(void) {
 
 static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *label) {
     [cb waitUntilCompleted];
+    if (getenv("DS4_DRAIN_GPU_TIME")) {
+        /* GPU-busy vs host-wait splitter: kernelEnd-kernelStart = scheduling+
+         * encode validation; GPUEnd-GPUStart = shader execution. */
+        fprintf(stderr, "ds4: cb-time %s gpu=%.2fms sched=%.2fms\n",
+                label ? label : "?",
+                (cb.GPUEndTime - cb.GPUStartTime) * 1e3,
+                (cb.kernelEndTime - cb.kernelStartTime) * 1e3);
+    }
     if (cb.status == MTLCommandBufferStatusError) {
         fprintf(stderr, "ds4: Metal %s failed: %s\n",
                 label, [[cb.error localizedDescription] UTF8String]);
@@ -348,8 +388,24 @@ static int ds4_gpu_finish_command_buffer(id<MTLCommandBuffer> cb, int owned, con
     [cb commit];
     int ok = ds4_gpu_wait_pending_command_buffers(label);
     if (!ds4_gpu_wait_command_buffer(cb, label)) ok = 0;
+    if (!ok && cb.error && getenv("DS4_RESIDUAL_DEBUG"))
+        fprintf(stderr, "ds4: [cb-error] %s: %s\n", label ? label : "?",
+                cb.error.localizedDescription.UTF8String);
     [g_transient_buffers removeAllObjects];
     return ok;
+}
+
+/* Fire-and-forget submit for owned CBs whose results are only consumed by
+ * LATER GPU work or behind an existing pending-drain: commit in queue order
+ * (Metal executes same-queue CBs in commit order) and park on g_pending_cbs
+ * so every subsequent drain covers it. No host wait — this is what makes the
+ * per-layer corr dispatches ~free instead of a commit+waitUntilCompleted pair
+ * per routed layer. Only valid for encoders that touch NO transient buffers. */
+static int ds4_gpu_submit_command_buffer_async(id<MTLCommandBuffer> cb, int owned) {
+    if (!owned) return 1;
+    [cb commit];
+    [g_pending_cbs addObject:cb];
+    return 1;
 }
 
 static int ds4_gpu_device_name_contains(const char *needle);
@@ -2508,6 +2564,7 @@ typedef struct {
     uint64_t nb1;
     uint64_t nb2;
     int32_t has_add;
+    int32_t has_corr_delta;   /* shared-down fusion: add corr_delta[d] to routed */
 } ds4_gpu_hc_expand_args;
 
 typedef struct {
@@ -4402,6 +4459,12 @@ int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *dat
     if (!tensor || (!data && bytes != 0)) return 0;
     const DS4MetalTensor *obj = ds4_gpu_tensor_const_obj(tensor);
     if (offset > obj.bytes || bytes > obj.bytes - offset) return 0;
+    /* Host-read boundary: async-submitted CBs (corr sidecar) may still be
+     * writing this buffer. Reading GPU memory with in-flight writes is a
+     * race — drain pending before the memcpy (no-op when the list is empty,
+     * which is the steady decode state: end_commands already swept it). */
+    if ([g_pending_cbs count] != 0)
+        (void)ds4_gpu_wait_pending_command_buffers("tensor read");
     if (bytes != 0) {
         memcpy(data, (const uint8_t *)[obj.buffer contents] + obj.offset + offset, (size_t)bytes);
     }
@@ -12838,6 +12901,367 @@ int ds4_gpu_add_tensor(
     return 1;
 }
 
+/* go1b correction: add the per-expert router-logit bias delta[e] to the raw
+ * router logits before top-k selection, broadcast across all n_tokens rows. */
+int ds4_gpu_corr_router_bias(
+        ds4_gpu_tensor       *logits,
+        const ds4_gpu_tensor *delta,
+        uint32_t                n_expert,
+        uint32_t                n_tokens) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!logits || !delta || n_expert == 0 || n_tokens == 0) return 0;
+
+    @autoreleasepool {
+        id<MTLBuffer> lbuf = ds4_gpu_tensor_buffer(logits);
+        id<MTLBuffer> dbuf = ds4_gpu_tensor_buffer(delta);
+        const uint64_t total = (uint64_t)n_tokens * n_expert;
+        if (!lbuf || !dbuf ||
+            ds4_gpu_tensor_bytes(logits) < total * sizeof(float) ||
+            ds4_gpu_tensor_bytes(delta) < (uint64_t)n_expert * sizeof(float)) {
+            fprintf(stderr, "ds4: Metal corr router bias received undersized buffers\n");
+            return 0;
+        }
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_dsv4_corr_router_bias");
+        if (!pipeline) return 0;
+
+        struct { uint32_t n_expert; uint32_t n_tokens; } args = { n_expert, n_tokens };
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:lbuf offset:ds4_gpu_tensor_offset(logits) atIndex:1];
+        [enc setBuffer:dbuf offset:ds4_gpu_tensor_offset(delta) atIndex:2];
+        NSUInteger tg = pipeline.maxTotalThreadsPerThreadgroup;
+        if (tg > total) tg = (NSUInteger)total;
+        if (tg == 0) tg = 1;
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)total, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        /* consumed by the router select that follows on the same queue —
+         * async submit, no host wait (resident buffers only) */
+        if (!ds4_gpu_submit_command_buffer_async(cb, owned)) return 0;
+    }
+    return 1;
+}
+
+/* go1b correction: out[t][d] += sum over selected e of
+ *   ( U @ ( C[e] (.*) (V @ x[t]) ) )[d] + b[d] + beta[e].
+ * One threadgroup per token; vx (=V@x[t]) lives in threadgroup memory.
+ * kernel_name selects in-place accumulate ("kernel_dsv4_corr_apply") vs the
+ * store-to-delta variant ("kernel_dsv4_corr_delta") — same math, the delta
+ * form exists so decode can keep the hot routed_out free of a tiny-dispatch
+ * write hazard (measured ~23ms/layer pipeline bubble). */
+static int ds4_gpu_corr_apply_impl(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *U,
+        const ds4_gpu_tensor *V,
+        const ds4_gpu_tensor *C,
+        const ds4_gpu_tensor *b,
+        const ds4_gpu_tensor *beta,
+        const ds4_gpu_tensor *selected,
+        uint32_t                d_model,
+        uint32_t                d_l,
+        uint32_t                n_expert,
+        uint32_t                n_expert_used,
+        uint32_t                n_tokens,
+        const char             *kernel_name) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!out || !x || !U || !V || !C || !b || !beta || !selected ||
+        d_model == 0 || d_l == 0 || n_expert == 0 || n_expert_used == 0 || n_tokens == 0) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        id<MTLBuffer> xbuf   = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> ubuf   = ds4_gpu_tensor_buffer(U);
+        id<MTLBuffer> vbuf   = ds4_gpu_tensor_buffer(V);
+        id<MTLBuffer> cbuf   = ds4_gpu_tensor_buffer(C);
+        id<MTLBuffer> bbuf   = ds4_gpu_tensor_buffer(b);
+        id<MTLBuffer> betabuf = ds4_gpu_tensor_buffer(beta);
+        id<MTLBuffer> selbuf = ds4_gpu_tensor_buffer(selected);
+        const uint64_t vec_bytes = (uint64_t)n_tokens * d_model * sizeof(float);
+        if (!outbuf || !xbuf || !ubuf || !vbuf || !cbuf || !bbuf || !betabuf || !selbuf ||
+            ds4_gpu_tensor_bytes(out) < vec_bytes ||
+            ds4_gpu_tensor_bytes(x) < vec_bytes ||
+            ds4_gpu_tensor_bytes(U) < (uint64_t)d_model * d_l * sizeof(float) ||
+            ds4_gpu_tensor_bytes(V) < (uint64_t)d_l * d_model * sizeof(float) ||
+            ds4_gpu_tensor_bytes(C) < (uint64_t)n_expert * d_l * sizeof(float) ||
+            ds4_gpu_tensor_bytes(b) < (uint64_t)d_model * sizeof(float) ||
+            ds4_gpu_tensor_bytes(beta) < (uint64_t)n_expert * sizeof(float) ||
+            ds4_gpu_tensor_bytes(selected) < (uint64_t)n_tokens * n_expert_used * sizeof(int32_t)) {
+            fprintf(stderr, "ds4: Metal corr apply received undersized buffers\n");
+            return 0;
+        }
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline(kernel_name);
+        if (!pipeline) return 0;
+
+        struct {
+            uint32_t d_model;
+            uint32_t d_l;
+            uint32_t n_expert;
+            uint32_t n_expert_used;
+            uint32_t n_tokens;
+        } args = { d_model, d_l, n_expert, n_expert_used, n_tokens };
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        if (getenv("DS4_CORR_CB_TRACE")) {
+            static _Atomic uint64_t n_owned, n_ride;
+            uint64_t o = owned ? ++n_owned : n_owned, r = owned ? n_ride : ++n_ride;
+            if ((o + r) % 64 == 1)
+                fprintf(stderr, "ds4: corr-cb owned=%llu ride=%llu\n",
+                        (unsigned long long)o, (unsigned long long)r);
+        }
+        /* DS4_CORR_SCRATCH_PROBE=1: bind throwaway out/x so the dispatch keeps
+         * its full encode+exec cost but carries NO data hazard with the MoE
+         * producer / shared-add consumer. Output is garbage — perf probe only,
+         * splits "dependency bubble" from "dispatch mechanics". */
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:outbuf  offset:ds4_gpu_tensor_offset(out) atIndex:1];
+        [enc setBuffer:xbuf    offset:ds4_gpu_tensor_offset(x) atIndex:2];
+        [enc setBuffer:ubuf    offset:ds4_gpu_tensor_offset(U) atIndex:3];
+        [enc setBuffer:vbuf    offset:ds4_gpu_tensor_offset(V) atIndex:4];
+        [enc setBuffer:cbuf    offset:ds4_gpu_tensor_offset(C) atIndex:5];
+        [enc setBuffer:bbuf    offset:ds4_gpu_tensor_offset(b) atIndex:6];
+        [enc setBuffer:betabuf offset:ds4_gpu_tensor_offset(beta) atIndex:7];
+        [enc setBuffer:selbuf  offset:ds4_gpu_tensor_offset(selected) atIndex:8];
+        [enc setThreadgroupMemoryLength:(NSUInteger)d_l * sizeof(float) atIndex:0];
+        NSUInteger tg = pipeline.maxTotalThreadsPerThreadgroup;
+        if (tg > 256u) tg = 256u;
+        if (tg == 0) tg = 1;
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        /* routed_out is consumed by the shared-expert add / next-layer work on
+         * the same queue; CPU consumers sit behind pending-drain — async submit
+         * removes the per-layer commit+waitUntilCompleted pair (resident
+         * buffers only, no transients) */
+        if (!ds4_gpu_submit_command_buffer_async(cb, owned)) return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_corr_apply(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *U,
+        const ds4_gpu_tensor *V,
+        const ds4_gpu_tensor *C,
+        const ds4_gpu_tensor *b,
+        const ds4_gpu_tensor *beta,
+        const ds4_gpu_tensor *selected,
+        uint32_t d_model, uint32_t d_l, uint32_t n_expert,
+        uint32_t n_expert_used, uint32_t n_tokens) {
+    return ds4_gpu_corr_apply_impl(out, x, U, V, C, b, beta, selected,
+                                   d_model, d_l, n_expert, n_expert_used,
+                                   n_tokens, "kernel_dsv4_corr_apply");
+}
+
+int ds4_gpu_corr_apply_delta(
+        ds4_gpu_tensor       *delta_out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *U,
+        const ds4_gpu_tensor *V,
+        const ds4_gpu_tensor *C,
+        const ds4_gpu_tensor *b,
+        const ds4_gpu_tensor *beta,
+        const ds4_gpu_tensor *selected,
+        uint32_t d_model, uint32_t d_l, uint32_t n_expert,
+        uint32_t n_expert_used, uint32_t n_tokens) {
+    return ds4_gpu_corr_apply_impl(delta_out, x, U, V, C, b, beta, selected,
+                                   d_model, d_l, n_expert, n_expert_used,
+                                   n_tokens, "kernel_dsv4_corr_delta");
+}
+
+int ds4_gpu_corr_delta_supported(void) { return 1; }
+
+/* ===== go-onebit DQZ2 zchain (ds4_gpu.h contract) =====
+ * Small resident tables uploaded once at load; per-layer dispatch metadata
+ * (op ranges, GE presence) stays host-side in these statics. */
+static id<MTLBuffer> g_zchain_ops;        /* [n_ops_total][16] f32 */
+static id<MTLBuffer> g_zchain_v8;         /* [n_blk][8][d_model] fp16 (1-elem dummy when none) */
+static id<MTLBuffer> g_zchain_ge;         /* [n_layer][n_expert] f32 (1-elem dummy when none) */
+static uint32_t     *g_zchain_layer_off;  /* [n_layer+1] */
+static uint8_t      *g_zchain_ge_present; /* [n_layer] */
+static uint32_t      g_zchain_n_layer, g_zchain_n_expert, g_zchain_d_model;
+/* frozen z^L (type 6, 2026-07-14): packed fp16 factors + per-layer host meta */
+static id<MTLBuffer> g_zchain_zlm;        /* concat z[k]|U[d*k]|V[d*k] per zl layer (1-elem dummy when none) */
+static uint32_t     *g_zchain_zl_off;     /* [n_layer] offset in halves */
+static uint32_t     *g_zchain_zl_k;       /* [n_layer] rank (0 = absent) */
+static float        *g_zchain_zl_tr;      /* [n_layer] trust-region factor */
+
+int ds4_gpu_zchain_zl_set(const uint16_t *zlm, const uint32_t *off, const uint32_t *k,
+                          const float *tr, uint32_t n_layer, uint64_t total_halves) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    @autoreleasepool {
+        free(g_zchain_zl_off); g_zchain_zl_off = NULL;
+        free(g_zchain_zl_k);   g_zchain_zl_k = NULL;
+        free(g_zchain_zl_tr);  g_zchain_zl_tr = NULL;
+        g_zchain_zlm = nil;
+        if (!n_layer || !k || !off || !tr) return 1;   /* nothing to upload = ok */
+        g_zchain_zlm = (zlm && total_halves)
+            ? [g_device newBufferWithBytes:zlm
+                                    length:(NSUInteger)(total_halves * sizeof(uint16_t))
+                                   options:MTLResourceStorageModeShared]
+            : [g_device newBufferWithLength:sizeof(uint16_t)
+                                    options:MTLResourceStorageModeShared];
+        if (!g_zchain_zlm) return 0;
+        g_zchain_zl_off = malloc((size_t)n_layer * sizeof(uint32_t));
+        g_zchain_zl_k   = malloc((size_t)n_layer * sizeof(uint32_t));
+        g_zchain_zl_tr  = malloc((size_t)n_layer * sizeof(float));
+        if (!g_zchain_zl_off || !g_zchain_zl_k || !g_zchain_zl_tr) return 0;
+        memcpy(g_zchain_zl_off, off, (size_t)n_layer * sizeof(uint32_t));
+        memcpy(g_zchain_zl_k,   k,   (size_t)n_layer * sizeof(uint32_t));
+        memcpy(g_zchain_zl_tr,  tr,  (size_t)n_layer * sizeof(float));
+        uint32_t nz = 0;
+        for (uint32_t l = 0; l < n_layer; l++) if (k[l]) nz++;
+        if (nz) fprintf(stderr, "ds4: Metal zchain z^L resident: %u layers\n", nz);
+    }
+    return 1;
+}
+
+int ds4_gpu_zchain_set(
+        const float *ops, const uint32_t *layer_off, const uint16_t *v8,
+        const float *ge, const uint8_t *ge_present,
+        uint32_t n_layer, uint32_t n_expert, uint32_t d_model,
+        uint32_t n_ops_total, uint32_t n_v8_blocks) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!layer_off || n_layer == 0 || n_expert == 0 || d_model == 0) return 0;
+    @autoreleasepool {
+        g_zchain_ops = n_ops_total
+            ? [g_device newBufferWithBytes:ops
+                                    length:(NSUInteger)n_ops_total * 16u * sizeof(float)
+                                   options:MTLResourceStorageModeShared]
+            : [g_device newBufferWithLength:16u * sizeof(float)
+                                    options:MTLResourceStorageModeShared];
+        g_zchain_v8 = (v8 && n_v8_blocks)
+            ? [g_device newBufferWithBytes:v8
+                                    length:(NSUInteger)n_v8_blocks * 8u * d_model * sizeof(uint16_t)
+                                   options:MTLResourceStorageModeShared]
+            : [g_device newBufferWithLength:sizeof(uint16_t)
+                                    options:MTLResourceStorageModeShared];
+        g_zchain_ge = (ge && ge_present)
+            ? [g_device newBufferWithBytes:ge
+                                    length:(NSUInteger)n_layer * n_expert * sizeof(float)
+                                   options:MTLResourceStorageModeShared]
+            : [g_device newBufferWithLength:sizeof(float)
+                                    options:MTLResourceStorageModeShared];
+        if (!g_zchain_ops || !g_zchain_v8 || !g_zchain_ge) return 0;
+        free(g_zchain_layer_off); free(g_zchain_ge_present);
+        g_zchain_layer_off  = malloc((size_t)(n_layer + 1) * sizeof(uint32_t));
+        g_zchain_ge_present = calloc(n_layer, 1);
+        if (!g_zchain_layer_off || !g_zchain_ge_present) return 0;
+        memcpy(g_zchain_layer_off, layer_off, (size_t)(n_layer + 1) * sizeof(uint32_t));
+        if (ge_present) memcpy(g_zchain_ge_present, ge_present, n_layer);
+        g_zchain_n_layer = n_layer; g_zchain_n_expert = n_expert; g_zchain_d_model = d_model;
+        fprintf(stderr, "ds4: Metal zchain resident: %u ops, %u dyn8 blocks, GE %s\n",
+                n_ops_total, n_v8_blocks, (ge && ge_present) ? "yes" : "no");
+    }
+    return 1;
+}
+
+int ds4_gpu_zchain_ge_apply(
+        ds4_gpu_tensor *weights, const ds4_gpu_tensor *selected,
+        uint32_t layer, uint32_t n_expert_used, uint32_t n_tokens) {
+    if (!g_zchain_n_layer || layer >= g_zchain_n_layer) return 1;   /* not loaded => no-op */
+    if (!g_zchain_ge_present[layer]) return 1;
+    if (!weights || !selected || n_expert_used == 0 || n_tokens == 0) return 0;
+    @autoreleasepool {
+        id<MTLBuffer> wbuf = ds4_gpu_tensor_buffer(weights);
+        id<MTLBuffer> sbuf = ds4_gpu_tensor_buffer(selected);
+        const uint64_t total = (uint64_t)n_tokens * n_expert_used;
+        if (!wbuf || !sbuf ||
+            ds4_gpu_tensor_bytes(weights) < total * sizeof(float) ||
+            ds4_gpu_tensor_bytes(selected) < total * sizeof(int32_t)) {
+            fprintf(stderr, "ds4: Metal zchain ge received undersized buffers\n");
+            return 0;
+        }
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv4_zchain_ge");
+        if (!pipeline) return 0;
+        struct { uint32_t n_expert, n_expert_used, n_tokens, ge_base; } args = {
+            g_zchain_n_expert, n_expert_used, n_tokens, layer * g_zchain_n_expert
+        };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:wbuf offset:ds4_gpu_tensor_offset(weights) atIndex:1];
+        [enc setBuffer:sbuf offset:ds4_gpu_tensor_offset(selected) atIndex:2];
+        [enc setBuffer:g_zchain_ge offset:0 atIndex:3];
+        NSUInteger tg = pipeline.maxTotalThreadsPerThreadgroup;
+        if (tg > total) tg = (NSUInteger)total;
+        if (tg == 0) tg = 1;
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)total, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        /* consumed by the routed matvec that follows on the same queue */
+        if (!ds4_gpu_submit_command_buffer_async(cb, owned)) return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_zchain_scale_routed(
+        ds4_gpu_tensor *routed, const ds4_gpu_tensor *x,
+        uint32_t layer, uint32_t n_tokens) {
+    if (!g_zchain_n_layer || layer >= g_zchain_n_layer) return 1;   /* not loaded => no-op */
+    const uint32_t op_start = g_zchain_layer_off[layer];
+    const uint32_t op_count = g_zchain_layer_off[layer + 1] - op_start;
+    const uint32_t zl_k   = g_zchain_zl_k ? g_zchain_zl_k[layer] : 0;
+    const uint32_t zl_off = (zl_k && g_zchain_zl_off) ? g_zchain_zl_off[layer] : 0;
+    const float    zl_tr  = (zl_k && g_zchain_zl_tr) ? g_zchain_zl_tr[layer] : 0.0f;
+    if (op_count == 0 && zl_k == 0) return 1;
+    if (!routed || !x || n_tokens == 0) return 0;
+    @autoreleasepool {
+        id<MTLBuffer> rbuf = ds4_gpu_tensor_buffer(routed);
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        const uint64_t vec_bytes = (uint64_t)n_tokens * g_zchain_d_model * sizeof(float);
+        if (!rbuf || !xbuf ||
+            ds4_gpu_tensor_bytes(routed) < vec_bytes ||
+            ds4_gpu_tensor_bytes(x) < vec_bytes) {
+            fprintf(stderr, "ds4: Metal zchain scale received undersized buffers\n");
+            return 0;
+        }
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv4_zchain_scale");
+        if (!pipeline) return 0;
+        struct { uint32_t d_model, n_tokens, op_start, op_count, zl_k, zl_off; float zl_tr; } args = {
+            g_zchain_d_model, n_tokens, op_start, op_count, zl_k, zl_off, zl_tr
+        };
+        /* power-of-two threadgroup for the tree reduce */
+        NSUInteger tg = 256;
+        while (tg > pipeline.maxTotalThreadsPerThreadgroup) tg >>= 1;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:rbuf offset:ds4_gpu_tensor_offset(routed) atIndex:1];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+        [enc setBuffer:g_zchain_ops offset:0 atIndex:3];
+        [enc setBuffer:g_zchain_v8 offset:0 atIndex:4];
+        [enc setBuffer:(g_zchain_zlm ? g_zchain_zlm : g_zchain_v8) offset:0 atIndex:5];
+        [enc setThreadgroupMemoryLength:tg * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(n_tokens, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        /* consumed by the shared-down fusion / next layer on the same queue */
+        if (!ds4_gpu_submit_command_buffer_async(cb, owned)) return 0;
+    }
+    return 1;
+}
+
 typedef struct {
     uint32_t width;
     uint32_t rows;
@@ -13137,6 +13561,8 @@ static const char *ds4_gpu_metal_tensor_type_name(uint32_t type) {
     case DS4_METAL_TENSOR_IQ2_XXS: return "iq2_xxs";
     case DS4_METAL_TENSOR_Q2_K:    return "q2_k";
     case DS4_METAL_TENSOR_Q4_K:    return "q4_k";
+    case DS4_METAL_TENSOR_GO1B:    return "go1b";
+    case DS4_METAL_TENSOR_GO2B:    return "go2b";
     default:                       return "unknown";
     }
 }
@@ -13165,6 +13591,10 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mm_pipeline(uint32_t type) {
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f32", false);
     case DS4_METAL_TENSOR_Q4_K:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f32", false);
+    case DS4_METAL_TENSOR_GO1B:
+        return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_go1b_f32", false);
+    case DS4_METAL_TENSOR_GO2B:
+        return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_go2b_f32", false);
     default:
         return nil;
     }
@@ -13178,6 +13608,10 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mm_f16_rhs_pipeline(uint32_t t
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f16", false);
     case DS4_METAL_TENSOR_Q4_K:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f16", false);
+    case DS4_METAL_TENSOR_GO1B:
+        return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_go1b_f16", false);
+    case DS4_METAL_TENSOR_GO2B:
+        return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_go2b_f16", false);
     default:
         return nil;
     }
@@ -17522,7 +17956,13 @@ static int ds4_gpu_pread_full(int fd, void *dst, uint64_t src_off, size_t len) {
 static int ds4_gpu_expert_pread_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
-        cached = ds4_gpu_env_bool("DS4_METAL_EXPERT_PREAD") > 0 ? 1 : 0;
+        {
+            /* auto-adapt (no baked script envs): streaming/offload models get
+             * the single-copy pread win by default — token byte-exact, ~2.2x
+             * measured; resident models don't need it. Env still overrides. */
+            int e = ds4_gpu_env_bool("DS4_METAL_EXPERT_PREAD");
+            cached = (e < 0) ? (ds4_gpu_expert_offload_enabled() ? 1 : 0) : (e > 0 ? 1 : 0);
+        }
         if (cached && (g_model_fd < 0 || g_model_fd_conflict)) {
             fprintf(stderr,
                     "ds4: DS4_METAL_EXPERT_PREAD=1 requested but no unambiguous model fd; "
@@ -17680,8 +18120,24 @@ static inline int ds4_gpu_moe_thin_enabled(void) {
  * unless a thinning gate is set, or unless either buffer is not Shared. n_expert<=6. */
 static void ds4_gpu_moe_thin_picks(id<MTLBuffer> selectedbuf, NSUInteger selected_off,
                                    id<MTLBuffer> weightsbuf, NSUInteger weights_off,
-                                   uint32_t n_tokens, uint32_t n_expert) {
+                                   uint32_t n_tokens, uint32_t n_expert,
+                                   uint32_t gate_type) {
     if (!ds4_gpu_moe_thin_enabled()) return;
+    /* Thinning was calibrated on q2 (robust experts, +2.7% code-edit). On
+     * strict 1/2-bit experts (go1b/go2b) dropping routed picks is the
+     * adjudicated-dead "expert-count pruning": measured 2026-07-06, topk=4 on
+     * the mono model turns byte-correct greedy Go into word soup. Refuse it
+     * at the engine level so no launcher default can re-break quality. */
+    if (gate_type == DS4_METAL_TENSOR_GO1B || gate_type == DS4_METAL_TENSOR_GO2B) {
+        static int warned = 0;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr,
+                    "ds4: MoE thinning requested but routed experts are strict 1/2-bit "
+                    "(go1b/go2b) -- refusing (quality-catastrophic, measured); full top-k kept\n");
+        }
+        return;
+    }
     if (n_expert <= 1u || n_tokens == 0u) return;
     if (n_tokens < g_moe_thin_min_tokens) return;   /* prefill-only gate (wave 68) */
     if (g_moe_thin_max_tokens != 0u && n_tokens > g_moe_thin_max_tokens) return; /* no-match-decode-only gate (wave 69) */
@@ -17728,6 +18184,75 @@ static void ds4_gpu_moe_thin_picks(id<MTLBuffer> selectedbuf, NSUInteger selecte
         }
         if (kept < n_expert && sum_kept > 0.0f) {
             const float scale = sum_all / sum_kept;   /* preserve original routed mass */
+            for (uint32_t i = 0; i < n_expert; i++)
+                if (w[i] != 0.0f) w[i] *= scale;
+        }
+    }
+}
+
+/* Coverage-cliff simulation (DS4_EXPERT_KEEP_SIM=<file>): drop router picks
+ * whose expert is outside the per-layer kept set (43 text lines of kept ids),
+ * exactly mirroring the keep-map product semantics (alias to top1, zero
+ * weight, renormalize kept mass). Bit-width untouched — isolates the coverage
+ * variable for the 2bit-keepmap go/no-go verdict. Default off. */
+static uint8_t g_keep_sim[64][256];
+static int g_keep_sim_on = -1;
+static void ds4_gpu_moe_sim_keepmap(id<MTLBuffer> selectedbuf, NSUInteger selected_off,
+                                    id<MTLBuffer> weightsbuf, NSUInteger weights_off,
+                                    uint32_t n_tokens, uint32_t n_expert, uint32_t layer) {
+    if (g_keep_sim_on < 0) {
+        g_keep_sim_on = 0;
+        const char *p = getenv("DS4_EXPERT_KEEP_SIM");
+        if (p && p[0]) {
+            FILE *f = fopen(p, "r");
+            if (f) {
+                char line[4096];
+                uint32_t L = 0;
+                while (L < 64 && fgets(line, sizeof(line), f)) {
+                    char *tok = strtok(line, " \t\n");
+                    while (tok) {
+                        int e = atoi(tok);
+                        if (e >= 0 && e < 256) g_keep_sim[L][e] = 1;
+                        tok = strtok(NULL, " \t\n");
+                    }
+                    L++;
+                }
+                fclose(f);
+                g_keep_sim_on = 1;
+                fprintf(stderr, "ds4: expert keep-sim active (%u layers from %s)\n", L, p);
+            }
+        }
+    }
+    if (g_keep_sim_on != 1 || layer >= 64 || n_expert <= 1u || n_tokens == 0u) return;
+    if (!selectedbuf || !weightsbuf) return;
+    if (selectedbuf.storageMode != MTLStorageModeShared ||
+        weightsbuf.storageMode != MTLStorageModeShared) return;
+    int32_t *sel = (int32_t *)((uint8_t *)selectedbuf.contents + (size_t)selected_off);
+    float   *wt  = (float   *)((uint8_t *)weightsbuf.contents  + (size_t)weights_off);
+    const uint8_t *keep = g_keep_sim[layer];
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        int32_t *s = sel + (size_t)t * n_expert;
+        float   *w = wt  + (size_t)t * n_expert;
+        float sum_all = 0.0f, sum_kept = 0.0f;
+        int32_t anchor_id = -1;
+        float   anchor_w  = -1.0f;
+        for (uint32_t i = 0; i < n_expert; i++) {
+            sum_all += w[i];
+            if (s[i] >= 0 && s[i] < 256 && keep[s[i]] && w[i] > anchor_w) {
+                anchor_w = w[i]; anchor_id = s[i];
+            }
+        }
+        if (anchor_id < 0) continue;   /* every pick outside kept set: leave token (counted rare) */
+        for (uint32_t i = 0; i < n_expert; i++) {
+            if (s[i] >= 0 && s[i] < 256 && !keep[s[i]]) {
+                s[i] = anchor_id;      /* alias to a kept expert the union gathers */
+                w[i] = 0.0f;
+            } else {
+                sum_kept += w[i];
+            }
+        }
+        if (sum_kept > 0.0f && sum_kept < sum_all) {
+            const float scale = sum_all / sum_kept;
             for (uint32_t i = 0; i < n_expert; i++)
                 if (w[i] != 0.0f) w[i] *= scale;
         }
@@ -18426,7 +18951,10 @@ static void *ds4_gpu_expert_prefetch_thread(void *arg) {
 static int ds4_gpu_expert_prefetch_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
-        cached = ds4_gpu_env_bool("DS4_METAL_EXPERT_PREFETCH_AHEAD") > 0 ? 1 : 0;
+        {
+            int e = ds4_gpu_env_bool("DS4_METAL_EXPERT_PREFETCH_AHEAD");
+            cached = (e < 0) ? (ds4_gpu_expert_offload_enabled() ? 1 : 0) : (e > 0 ? 1 : 0);
+        }
         if (cached && g_model_fd < 0) {
             fprintf(stderr,
                     "ds4: DS4_METAL_EXPERT_PREFETCH_AHEAD=1 requested but no model fd; disabled\n");
@@ -18944,6 +19472,8 @@ static int ds4_gpu_expert_gather_unit_resolve(
     return 1;
 }
 
+static int ds4_gpu_expert_pin_hot(uint32_t layer_index, uint32_t expert_id);
+
 static void ds4_gpu_expert_gather_copy_unit(ds4_metal_expert_gather_ctx *ctx, uint32_t unit) {
     uint64_t len = 0;
     uint64_t src_off = 0;
@@ -18956,6 +19486,22 @@ static void ds4_gpu_expert_gather_copy_unit(ds4_metal_expert_gather_ctx *ctx, ui
     /* Staged one layer ahead from the peer's SSD?  RAM copy beats any disk. */
     if (!hard_src) {
         const uint32_t expert_id = ctx->active_ids[unit / 3u];
+        /* Frequency-pinned expert (DS4_EXPERT_PIN_FILE): serve from the mlocked
+         * mmap instead of pread — residency alone never pays on the pread path,
+         * which reads the SSD regardless (measured 2026-07-17: pins armed,
+         * hit_mib=0.0, decode still ~1.2GB/token cold on both hosts). Same file
+         * offsets as the pread, so bytes are bit-exact; a budget-skipped row
+         * simply faults through the mmap like the legacy gather. */
+        if (ds4_gpu_expert_pin_hot(ctx->layer_index, expert_id)) {
+            const double pt0 = ctx->io_profile ? ds4_gpu_now_ms() : 0.0;
+            memcpy(dst, ctx->map + src_off, (size_t)len);
+            if (ctx->io_profile) {
+                __sync_fetch_and_add(&g_io_prof_copy_ns,
+                                     (uint64_t)((ds4_gpu_now_ms() - pt0) * 1e6));
+                __sync_fetch_and_add(&g_io_prof_hit_bytes, len);
+            }
+            return;
+        }
         uint64_t slen = 0;
         const uint8_t *staged = ds4_gpu_expert_stage_find(ctx->layer_index,
                                                           expert_id,
@@ -19503,21 +20049,40 @@ static int ds4_gpu_expert_pin_enabled(void) {
         if (path && *path && g_expert_pin_mlock_budget > 0) {
             FILE *f = fopen(path, "r");
             if (f) {
+                /* Accepts both "20:1,2,..." per line and the gen_pinned.py emit
+                 * ("L20:...;L0:..." -- optional L prefix, ';' record separator,
+                 * possibly one single line). File order per layer is frequency
+                 * order, so the per-layer DS4_EXPERT_PIN_TOPK cut keeps the
+                 * hottest K (uniform per-layer budget instead of the old
+                 * whole-file first-come truncation). */
+                const uint32_t topk = (uint32_t)ds4_gpu_env_u64("DS4_EXPERT_PIN_TOPK", 256u);
+                uint32_t added[DS4_METAL_EXPERT_PROFILE_MAX_LAYERS] = {0};
                 char line[8192];
                 while (fgets(line, sizeof(line), f)) {
-                    char *colon = strchr(line, ':');
-                    if (!colon) continue;
-                    *colon = '\0';
-                    const uint32_t L = (uint32_t)strtoul(line, NULL, 10);
-                    if (L >= DS4_METAL_EXPERT_PROFILE_MAX_LAYERS) continue;
-                    char *p = colon + 1;
-                    while (*p && *p != '\n') {
-                        char *end = NULL;
-                        const uint32_t e = (uint32_t)strtoul(p, &end, 10);
-                        if (end == p) break;
-                        if (e < 256u) { g_expert_pin[L][e] = true; g_expert_pin_parsed = 1; }
-                        p = end;
-                        while (*p == ',' || *p == ' ') p++;
+                    char *save = NULL;
+                    for (char *grp = strtok_r(line, ";\n", &save); grp;
+                         grp = strtok_r(NULL, ";\n", &save)) {
+                        char *colon = strchr(grp, ':');
+                        if (!colon) continue;
+                        *colon = '\0';
+                        char *ls = grp;
+                        while (*ls == ' ') ls++;
+                        if (*ls == 'L' || *ls == 'l') ls++;
+                        const uint32_t L = (uint32_t)strtoul(ls, NULL, 10);
+                        if (L >= DS4_METAL_EXPERT_PROFILE_MAX_LAYERS) continue;
+                        char *p = colon + 1;
+                        while (*p) {
+                            char *end = NULL;
+                            const uint32_t e = (uint32_t)strtoul(p, &end, 10);
+                            if (end == p) break;
+                            if (e < 256u && added[L] < topk && !g_expert_pin[L][e]) {
+                                g_expert_pin[L][e] = true;
+                                added[L]++;
+                                g_expert_pin_parsed = 1;
+                            }
+                            p = end;
+                            while (*p == ',' || *p == ' ') p++;
+                        }
                     }
                 }
                 fclose(f);
@@ -19529,6 +20094,16 @@ static int ds4_gpu_expert_pin_enabled(void) {
                     path, (unsigned long long)(g_expert_pin_mlock_budget / (1024ull * 1024ull)));
     }
     return g_expert_pin_parsed;
+}
+
+/* Lock-free hot check for the gather workers: the pin table and the per-layer
+ * mlock marker are written on the serial model-load/encode path only, so by
+ * the time gather worker threads run they are read-only — no lock needed. */
+static int ds4_gpu_expert_pin_hot(uint32_t layer_index, uint32_t expert_id) {
+    return g_expert_pin_parsed == 1 &&
+           layer_index < DS4_METAL_EXPERT_PROFILE_MAX_LAYERS &&
+           g_expert_pin_mlocked[layer_index] &&
+           expert_id < 256u && g_expert_pin[layer_index][expert_id];
 }
 
 /* mlock this layer's pinned experts (gate/up/down file regions) once, budget-capped.
@@ -19563,6 +20138,53 @@ static void ds4_gpu_expert_pin_mlock_layer(uint32_t layer_index, const void *mod
                 layer_index, (double)pinned / (1024.0 * 1024.0),
                 (double)g_expert_pin_mlock_used / (1024.0 * 1024.0 * 1024.0),
                 (double)g_expert_pin_mlock_budget / (1024.0 * 1024.0 * 1024.0));
+}
+
+/* Residual-sidecar twin of the frequency pin above (DS4_RESID_PIN_MLOCK_MB, default
+ * 0 = off). The go1b residual gather is a single-thread memcpy straight off the
+ * sidecar mmap (metal.m:21874/22117) -- measured 18% of coordinator decode wall,
+ * mostly page-fault stalls, because the 9.2 GiB sidecar competes for page cache it
+ * never wins. Pin the residual slot ranges of the SAME pin-file experts (the
+ * sidecar's hot-64 superset) so those memcpys run at RAM speed. Residency-only:
+ * bytes and results are bit-exact. Shares DS4_EXPERT_PIN_FILE via g_expert_pin[][]
+ * (so DS4_EXPERT_PIN_TOPK sizes both pins); budget-capped separately. */
+static bool     g_resid_pin_mlocked[DS4_METAL_EXPERT_PROFILE_MAX_LAYERS];
+static uint64_t g_resid_pin_mlock_used;
+static void ds4_gpu_resid_pin_mlock_layer(uint32_t layer_index,
+                                          const void *res_gate_ptr,
+                                          const void *res_up_ptr,
+                                          const void *res_down_ptr,
+                                          const float *res_lut,
+                                          uint64_t gate_expert_bytes,
+                                          uint64_t down_expert_bytes) {
+    static int64_t budget = -1;
+    if (budget < 0) budget = (int64_t)(ds4_gpu_env_u64("DS4_RESID_PIN_MLOCK_MB", 0u) * 1024ull * 1024ull);
+    if (budget == 0 || ds4_gpu_expert_pin_enabled() != 1) return;
+    if (!res_gate_ptr || !res_up_ptr || !res_down_ptr) return;
+    if (layer_index >= DS4_METAL_EXPERT_PROFILE_MAX_LAYERS || g_resid_pin_mlocked[layer_index]) return;
+    g_resid_pin_mlocked[layer_index] = true;   /* attempt once per layer regardless */
+    uint64_t pinned = 0;
+    for (uint32_t e = 0; e < 256u; e++) {
+        if (!g_expert_pin[layer_index][e]) continue;
+        const int64_t slot = res_lut ? (int64_t)res_lut[e] : (int64_t)e;
+        if (slot < 0) continue;               /* sparse residual: not a hot expert */
+        if (g_resid_pin_mlock_used >= (uint64_t)budget) break;
+        const uint8_t *ptr[3] = { (const uint8_t *)res_gate_ptr + (uint64_t)slot * gate_expert_bytes,
+                                  (const uint8_t *)res_up_ptr   + (uint64_t)slot * gate_expert_bytes,
+                                  (const uint8_t *)res_down_ptr + (uint64_t)slot * down_expert_bytes };
+        const uint64_t len[3] = { gate_expert_bytes, gate_expert_bytes, down_expert_bytes };
+        for (int r = 0; r < 3; r++) {
+            if (g_resid_pin_mlock_used + len[r] > (uint64_t)budget) continue;
+            if (mlock(ptr[r], (size_t)len[r]) == 0) {
+                g_resid_pin_mlock_used += len[r];
+                pinned += len[r];
+            }
+        }
+    }
+    if (pinned)
+        fprintf(stderr, "ds4: layer %u pinned %.1f MiB residual hot experts (resid wired %.2f GiB)\n",
+                layer_index, (double)pinned / (1024.0 * 1024.0),
+                (double)g_resid_pin_mlock_used / (1024.0 * 1024.0 * 1024.0));
 }
 
 static int ds4_gpu_gather_experts_run(
@@ -19986,6 +20608,61 @@ static int ds4_gpu_expert_sort_ids_enabled(void) {
  * the selected-id buffer from original expert ids to compact scratch slots.
  * Bit-exact either way: per-pick results and their summation order are
  * unchanged, only the scratch slot numbering moves. */
+/* R5-C unified go2b gather: fill compact scratch with ALL active experts as go2b
+ * blocks — hot experts memcpy'd from the merged sidecar, cold experts fabricated
+ * on the fly from the base go1b bytes (d1=base scale, d2=0 => second plane inert;
+ * s2 bits left as-is). One weight type per layer => the MoE keeps bare's exact
+ * single map + three-tile dispatch shape. */
+static int ds4_gpu_hot_unified_gather(
+        const void *model_map,
+        uint32_t n_active, const uint32_t *active_ids, const float *lut,
+        const void *hot_gate, const void *hot_up, const void *hot_down,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim) {
+    const uint64_t g2_gate_row = (uint64_t)expert_in_dim / 256u * 68u;
+    const uint64_t g2_gate_exp = (uint64_t)expert_mid_dim * g2_gate_row;
+    const uint64_t g2_down_row = (uint64_t)expert_mid_dim / 256u * 68u;
+    const uint64_t g2_down_exp = (uint64_t)out_dim * g2_down_row;
+    const uint64_t need_g = (uint64_t)n_active * g2_gate_exp;
+    const uint64_t need_d = (uint64_t)n_active * g2_down_exp;
+    if (!g_moe_hot_gate_scratch || (uint64_t)g_moe_hot_gate_scratch.length < need_g) {
+        g_moe_hot_gate_scratch = [g_device newBufferWithLength:(NSUInteger)need_g options:MTLResourceStorageModeShared];
+        g_moe_hot_up_scratch   = [g_device newBufferWithLength:(NSUInteger)need_g options:MTLResourceStorageModeShared];
+    }
+    if (!g_moe_hot_down_scratch || (uint64_t)g_moe_hot_down_scratch.length < need_d)
+        g_moe_hot_down_scratch = [g_device newBufferWithLength:(NSUInteger)need_d options:MTLResourceStorageModeShared];
+    if (!g_moe_hot_gate_scratch || !g_moe_hot_up_scratch || !g_moe_hot_down_scratch) return 0;
+    for (uint32_t i = 0; i < n_active; i++) {
+        const uint32_t e = active_ids[i];
+        const int slot = lut ? (int)lut[e] : -1;
+        uint8_t *dg = (uint8_t *)g_moe_hot_gate_scratch.contents + (uint64_t)i * g2_gate_exp;
+        uint8_t *du = (uint8_t *)g_moe_hot_up_scratch.contents   + (uint64_t)i * g2_gate_exp;
+        uint8_t *dd = (uint8_t *)g_moe_hot_down_scratch.contents + (uint64_t)i * g2_down_exp;
+        if (slot >= 0) {
+            memcpy(dg, (const uint8_t *)hot_gate + (uint64_t)slot * g2_gate_exp, g2_gate_exp);
+            memcpy(du, (const uint8_t *)hot_up   + (uint64_t)slot * g2_gate_exp, g2_gate_exp);
+            memcpy(dd, (const uint8_t *)hot_down + (uint64_t)slot * g2_down_exp, g2_down_exp);
+        } else {
+            const uint8_t *sg = (const uint8_t *)model_map + gate_offset + (uint64_t)e * gate_expert_bytes;
+            const uint8_t *su = (const uint8_t *)model_map + up_offset   + (uint64_t)e * gate_expert_bytes;
+            const uint8_t *sd = (const uint8_t *)model_map + down_offset + (uint64_t)e * down_expert_bytes;
+            const uint64_t nbg = g2_gate_exp / 68u, nbd = g2_down_exp / 68u;
+            for (uint64_t b = 0; b < nbg; b++) {
+                uint8_t *o = dg + b * 68u; const uint8_t *p = sg + b * 34u;
+                o[0]=p[0]; o[1]=p[1]; o[2]=0; o[3]=0; memcpy(o+4, p+2, 32);
+                o = du + b * 68u; p = su + b * 34u;
+                o[0]=p[0]; o[1]=p[1]; o[2]=0; o[3]=0; memcpy(o+4, p+2, 32);
+            }
+            for (uint64_t b = 0; b < nbd; b++) {
+                uint8_t *o = dd + b * 68u; const uint8_t *p = sd + b * 34u;
+                o[0]=p[0]; o[1]=p[1]; o[2]=0; o[3]=0; memcpy(o+4, p+2, 32);
+            }
+        }
+    }
+    return 1;
+}
+
 static int ds4_gpu_remap_selected_to_slots(
         id<MTLBuffer> selectedbuf,
         NSUInteger    selected_off,
@@ -20038,6 +20715,7 @@ int ds4_gpu_routed_moe_one_tensor(
         ds4_gpu_tensor       *up,
         ds4_gpu_tensor       *mid,
         ds4_gpu_tensor       *experts,
+        const ds4_gpu_residual_set *residual,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                gate_offset,
@@ -20060,6 +20738,8 @@ int ds4_gpu_routed_moe_one_tensor(
         const ds4_gpu_tensor *x,
         uint32_t                layer_index) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
+    const ds4_gpu_residual_set *go1b_res =
+        (residual && residual->gate_ptr) ? residual : NULL;   /* go1b residual CPU pointers */
     if (!out || !gate || !up || !mid || !x || !model_map || !selected || !weights ||
         n_total_expert == 0 || n_expert == 0 || n_expert > 6) {
         return 0;
@@ -20145,7 +20825,8 @@ int ds4_gpu_routed_moe_one_tensor(
             /* §2.4/§3.5 降激活 (decode single token): thin picks before the union so
              * the per-token expert IO drops toward the W3 ceiling.  Default OFF => no-op. */
             ds4_gpu_moe_thin_picks(selectedbuf, selected_off, weightsbuf,
-                                   ds4_gpu_tensor_offset(weights), 1u, n_expert);
+                                   ds4_gpu_tensor_offset(weights), 1u, n_expert,
+                                   gate_type);
             uint32_t active_ids[1024];
             uint32_t n_active = 0;
             int compact_ok = ds4_gpu_compact_selected_experts(selectedbuf,
@@ -20278,6 +20959,11 @@ int ds4_gpu_routed_moe_one_tensor(
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
+
+        /* 1-bit residual is applied in the batch (mm_id) decode path; go1b decode does
+         * not use this one_tensor path, so no residual is applied here. */
+        int do_residual = 0;
+        (void)go1b_res;
 
         const NSUInteger gate_smem = ds4_gpu_routed_mv_smem(gate_type);
         const NSUInteger down_smem = ds4_gpu_routed_mv_smem(down_type);
@@ -20485,6 +21171,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         ds4_gpu_tensor       *up,
         ds4_gpu_tensor       *mid,
         ds4_gpu_tensor       *experts,
+        const ds4_gpu_residual_set *residual,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                gate_offset,
@@ -20511,6 +21198,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         uint32_t                slot_count,   /* 0 or n_expert => no split (full) */
         bool                   *mid_is_f16) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
+    const ds4_gpu_residual_set *go1b_res = (residual && residual->gate_ptr) ? residual : NULL;
     if (!out || !gate || !up || !mid || !x || !model_map || !selected || !weights ||
         n_tokens == 0 || n_total_expert == 0 || n_expert == 0 || n_expert > 6) {
         return 0;
@@ -20562,24 +21250,89 @@ int ds4_gpu_routed_moe_batch_tensor(
         g_wrap_mlock_suppress = 0;
         if (!gate_buf || !up_buf || !down_buf) return 0;
         uint32_t source_n_total_expert = n_total_expert;
+        /* 1-bit residual (go1b_res): decode-path (n_tokens=1) go1b mm_id matmul over a
+         * CPU-gathered compacted copy of the active residual experts, summed into
+         * gate/up. go1b has no mv_id kernel (force_mm), so decode runs the mm_id path;
+         * the residual reuses the base's work map by matching its compacted layout. */
+        const void *res_gate_ptr = NULL, *res_up_ptr = NULL, *res_down_ptr = NULL;
+        const float *res_lut = NULL;   /* sparse residual: expert id -> slot or -1 */
+        int do_residual = 0;
+        int do_hot = 0;                /* go2b merged sidecar: hot/cold split path */
+        if (go1b_res) {
+            /* residual mm_id output scratch: gate/up passes need n_tokens*n_expert*mid
+             * floats, the down pass n_tokens*n_expert*out — size for the larger and
+             * grow across prefill chunks (decode fits the old 128 KiB floor). The
+             * n_tokens==1 gate this replaces silently dropped the residual on every
+             * prefill/batch forward, so scored NLL and the KV built during prefill
+             * came from the bare base while decode ran corrected weights. */
+            const uint64_t rneed = (uint64_t)n_tokens * n_expert *
+                (uint64_t)(expert_mid_dim > out_dim ? expert_mid_dim : out_dim) * sizeof(float);
+            if (!g_moe_go1b_res_scratch || (uint64_t)g_moe_go1b_res_scratch.length < rneed)
+                g_moe_go1b_res_scratch = [g_device newBufferWithLength:(NSUInteger)rneed
+                                                               options:MTLResourceStorageModePrivate];
+            res_gate_ptr = go1b_res->gate_ptr;
+            res_up_ptr   = go1b_res->up_ptr;
+            res_down_ptr = go1b_res->down_ptr;
+            res_lut      = go1b_res->lut;
+            do_residual = (g_moe_go1b_res_scratch != nil && res_gate_ptr && res_up_ptr && res_down_ptr);
+            if (go1b_res->merged2b) {
+                /* go2b sidecar: never run the legacy add pass; the split below
+                 * needs the LUT (sparse hot set) to route picks. */
+                do_hot = (res_lut && res_gate_ptr && res_up_ptr && res_down_ptr);
+                do_residual = 0;
+            }
+            /* Residual hot-pin (DS4_RESID_PIN_MLOCK_MB, default off): one-time
+             * per layer, wires the pin-file experts' residual slots so the
+             * per-token gather memcpy below stops paging the sidecar off SSD.
+             * go1b residual only: its per-expert strides equal the base's
+             * (identical dims/type); the go2b merged sidecar (do_hot) uses
+             * g2_* strides and is not covered here. */
+            if (do_residual)
+                ds4_gpu_resid_pin_mlock_layer(layer_index, res_gate_ptr, res_up_ptr,
+                                              res_down_ptr, res_lut,
+                                              gate_expert_bytes, down_expert_bytes);
+            if (getenv("DS4_RESIDUAL_DEBUG"))
+                fprintf(stderr, "ds4: [residual-batch] L%u do=%d ntok=%u\n", layer_index, do_residual, n_tokens);
+        }
         /* P-OVL state hoisted to function scope: the encode block must read the
          * active expert set when the two-pass overlap defers the byte gather. */
         uint32_t active_ids[1024];
         uint32_t n_active = 0;
         bool moe_overlap_active = false;
+        /* R5-C go2b split state (hoisted: encode blocks run after the gather scope) */
+        uint32_t hot_slot_ids[64];
+        uint32_t n_hot_slots = 0;
+        uint64_t n_hot_picks = 0;
+        int hot_snapshotted = 0;
 
-        /* DS4_METAL_EXPERT_OFFLOAD is meant for the full q2 target model, whose
+        /* DS4_METAL_EXPERT_OFFLOAD is meant for over-budget target models whose
          * routed experts are deliberately non-resident and must be gathered into
-         * compact scratch/pool before the MoE kernels index them.  The MTP support
-         * model is mapped as a fully resident model range; forcing its Q4_K routed
-         * experts through the A3 scratch path just copies resident bytes again and
-         * made distributed MTP a net slowdown.  Leave non-q2 routed tensors on the
-         * direct resident-buffer path. */
+         * compact scratch/pool before the MoE kernels index them -- a non-resident
+         * wrapped mmap view reads as ZEROS on the GPU, so the selected experts must
+         * be CPU-copied into resident scratch first.  The MTP support model is mapped
+         * as a fully resident model range; forcing its Q4_K routed experts through the
+         * A3 scratch path just copies resident bytes again and made distributed MTP a
+         * net slowdown.  Leave non-offload (resident) routed tensors on the direct path.
+         *
+         * go1b (strict 1-bit, mv-less) ships as a 42 GiB over-budget offload model and
+         * must take this gather path too: the byte gather + slot-remap below are quant-
+         * type agnostic, and the q2-specific pool/stream/source-cache sub-paths stay
+         * gated to IQ2_XXS+Q2_K so go1b falls through to the basic resident-scratch
+         * gather and then the mm_id kernel reads its experts from that resident copy. */
+        const bool routed_pair_is_q2 =
+            gate_type == DS4_METAL_TENSOR_IQ2_XXS && down_type == DS4_METAL_TENSOR_Q2_K;
+        const bool routed_is_go1b = (gate_type == DS4_METAL_TENSOR_GO1B);
+        /* go2b (type 41) as a BASE routed-expert type (monolithic mixed model, not
+         * the overlay sidecar): the byte gather + slot-remap below are quant-type
+         * agnostic (routed_expert_block_bytes handles go2b=68B), and the go2b mm_id
+         * kernel is dispatched by gate_type downstream, so go2b falls through the
+         * same basic resident-scratch gather as go1b.  Without this it stays resident
+         * and OOMs a 16 GiB host on a 59 GiB monolithic model. */
+        const bool routed_is_go2b = (gate_type == DS4_METAL_TENSOR_GO2B);
         const bool a3_expert_offload =
             ds4_gpu_expert_offload_enabled() &&
             !ds4_gpu_expert_offload_direct_enabled() &&
-            gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
-            down_type == DS4_METAL_TENSOR_Q2_K;
+            (routed_pair_is_q2 || routed_is_go1b || routed_is_go2b);
         if (a3_expert_offload) {
             const int io_profile = ds4_gpu_expert_io_profile_enabled();
             /* Prefill-sized batch bytes are one-shot first-touch reads: keep
@@ -20632,7 +21385,10 @@ int ds4_gpu_routed_moe_batch_tensor(
              * CPU-valid here (drained above when batched; the non-batched path already
              * reads it via collect below).  Default OFF => byte-identical no-op. */
             ds4_gpu_moe_thin_picks(selectedbuf, selected_off, weightsbuf,
-                                   ds4_gpu_tensor_offset(weights), n_tokens, n_expert);
+                                   ds4_gpu_tensor_offset(weights), n_tokens, n_expert,
+                                   gate_type);
+            ds4_gpu_moe_sim_keepmap(selectedbuf, selected_off, weightsbuf,
+                                    ds4_gpu_tensor_offset(weights), n_tokens, n_expert, layer_index);
             const uint64_t total_picks_u64 = (uint64_t)n_tokens * n_expert;
             if (total_picks_u64 > UINT32_MAX) {
                 if (was_batched) (void)ds4_gpu_begin_commands();
@@ -20648,6 +21404,30 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                             active_ids,
                                                             1024,
                                                             &n_active);
+            if (getenv("DS4_DUMP_ACTIVE")) {   /* raw picks (with repetition = frequency) per layer */
+                const int32_t *sel = (const int32_t *)((uint8_t *)selectedbuf.contents + selected_off);
+                fprintf(stderr, "PICKS L%u", layer_index);
+                for (uint32_t i = 0; i < (uint32_t)total_picks_u64; i++) fprintf(stderr, " %d", sel[i]);
+                fprintf(stderr, "\n");
+            }
+            /* Snapshot the ORIGINAL expert ids (selectedbuf is CPU-valid here: drained
+             * above when batched, else already host-computed).  The remap below rewrites
+             * selectedbuf to compact slots IN PLACE, so the go1b corr must read C[e]/beta[e]
+             * by true id from this copy, not the corrupted live selected tensor. Covers
+             * decode (router_selected) and prefill (batch_router_selected); both flow
+             * through this one function, and each layer's corr consumes the snapshot
+             * before the next layer's MoE overwrites it. */
+            if (routed_is_go1b && total_picks_u64 > 0) {
+                const uint64_t sbytes = total_picks_u64 * sizeof(int32_t);
+                if (!g_corr_saved_selected || ds4_gpu_tensor_bytes(g_corr_saved_selected) < sbytes) {
+                    ds4_gpu_tensor_free(g_corr_saved_selected);
+                    g_corr_saved_selected = ds4_gpu_tensor_alloc(sbytes);
+                }
+                id<MTLBuffer> savedbuf = g_corr_saved_selected ? ds4_gpu_tensor_buffer(g_corr_saved_selected) : nil;
+                if (savedbuf)
+                    memcpy(savedbuf.contents,
+                           (const uint8_t *)selectedbuf.contents + selected_off, (size_t)sbytes);
+            }
             if (io_profile) ds4_gpu_expert_io_prof_reset();
             const double gather_t0 = io_profile ? ds4_gpu_now_ms() : 0.0;
             /* P-OVL eligibility: the expert-half overlap only applies to the
@@ -20657,6 +21437,7 @@ int ds4_gpu_routed_moe_batch_tensor(
              * and the stream/pool/source-cache paths are skipped. */
             moe_overlap_active =
                 compact_ok &&
+                !do_hot &&
                 ds4_gpu_moe_overlap_enabled() &&
                 was_batched &&
                 !g_quality_mode &&
@@ -20685,6 +21466,9 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                                       down_expert_bytes,
                                                                       n_total_expert);
             }
+            /* 1-bit residual (mm_id path) reuses the base's compacted work map, so it
+             * only applies on the compacted gather path, not the full-layer stream. */
+            if (do_residual && stream_used) do_residual = 0;
             if (compact_ok && !stream_used) {
                 compact_ok = ds4_gpu_remap_selected_to_slots(selectedbuf,
                                                              selected_off,
@@ -20692,6 +21476,7 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                              n_total_expert,
                                                              active_ids,
                                                              n_active);
+
             }
             int pool_used = 0;
             if (!stream_used && !moe_overlap_active && compact_ok && g_expert_pool_warm_batch &&
@@ -20733,7 +21518,19 @@ int ds4_gpu_routed_moe_batch_tensor(
             }
             const double copy_t0 = (!pool_used && !stream_used && ds4_gpu_expert_profile_is_enabled()) ?
                 ds4_gpu_now_ms() : 0.0;
-            int load_ok = compact_ok && (stream_used || pool_used || moe_overlap_active ||
+            int load_ok;
+            if (do_hot) {
+                /* R5-C unified go2b: every active expert lands in the go2b scratch
+                 * (hot from the merged sidecar, cold fabricated with d2=0), so the
+                 * MoE below keeps bare's single-map three-tile shape. */
+                load_ok = compact_ok && ds4_gpu_hot_unified_gather(model_map,
+                              n_active, active_ids, res_lut,
+                              res_gate_ptr, res_up_ptr, res_down_ptr,
+                              gate_offset, up_offset, down_offset,
+                              gate_expert_bytes, down_expert_bytes,
+                              expert_in_dim, expert_mid_dim, out_dim);
+            } else {
+                load_ok = compact_ok && (stream_used || pool_used || moe_overlap_active ||
                           ds4_gpu_load_layer_experts_to_scratch(model_map,
                                                                  layer_index,
                                                                  n_active,
@@ -20744,6 +21541,7 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                                  gate_expert_bytes,
                                                                  down_expert_bytes,
                                                                  n_total_expert));
+            }
             /* P-OVL defers the byte gather to the per-pass encode: size the
              * shared scratch now so the per-pass range gathers (slots [lo,hi))
              * have valid destination addresses. */
@@ -20775,7 +21573,12 @@ int ds4_gpu_routed_moe_batch_tensor(
                 if (was_batched) (void)ds4_gpu_begin_commands();
                 return 0;
             }
-            if (!pool_used) {
+            if (do_hot) {
+                gate_buf = g_moe_hot_gate_scratch;
+                up_buf = g_moe_hot_up_scratch;
+                down_buf = g_moe_hot_down_scratch;
+                source_n_total_expert = n_active;
+            } else if (!pool_used) {
                 gate_buf = g_moe_scratch_gate;
                 up_buf = g_moe_scratch_up;
                 down_buf = g_moe_scratch_down;
@@ -20804,7 +21607,19 @@ int ds4_gpu_routed_moe_batch_tensor(
         id<MTLComputePipelineState> gate_mm_pipeline = nil;
         id<MTLComputePipelineState> up_mm_pipeline = nil;
         id<MTLComputePipelineState> down_mm_pipeline = nil;
-        if (gate_nr0 == 0 || down_nr0 == 0 || !gate_mv_pipeline || !down_mv_pipeline) {
+        /* Strict-1-bit (go1b) routed experts ship only the grouped mm_id matmul kernel
+         * -- there is no hand-written mul_mv_id / pair / sum6 variant.  Detect "mm-only"
+         * quants by the absent mv pipeline and force the mm_id path for every batch size
+         * (the grouped GEMM is a correct general matmul at n_tokens=1, so decode -- routed
+         * here with n_tokens=1 -- works too). */
+        const bool force_mm = (gate_mv_pipeline == nil) || (down_mv_pipeline == nil);
+        if (force_mm) {
+            if (ds4_gpu_mul_mm_id_map0_name(n_expert) == NULL) {
+                fprintf(stderr, "ds4: mm-only routed MoE (gate=%u down=%u) has no mm_id map for n_expert=%u\n",
+                        gate_type, down_type, n_expert);
+                return 0;
+            }
+        } else if (gate_nr0 == 0 || down_nr0 == 0 || !gate_mv_pipeline || !down_mv_pipeline) {
             fprintf(stderr, "ds4: unsupported Metal routed batch MoE quant types gate=%u down=%u\n",
                     gate_type, down_type);
             return 0;
@@ -20830,7 +21645,7 @@ int ds4_gpu_routed_moe_batch_tensor(
          * gap. Default lowered to 8 (A/B: DS4_METAL_MOE_MM_ID_MIN=32 restores
          * the old split, =0 forces never).
          */
-        const bool use_mm_id = n_tokens >= ds4_gpu_moe_mm_id_min() &&
+        const bool use_mm_id = (force_mm || n_tokens >= ds4_gpu_moe_mm_id_min()) &&
                                ds4_gpu_mul_mm_id_map0_name(n_expert) != NULL;
         /*
          * Speculative verification is neither normal decode nor large prefill:
@@ -20877,22 +21692,30 @@ int ds4_gpu_routed_moe_batch_tensor(
         if (use_mm_id) {
             gate_map_args =
                 ds4_gpu_make_mul_mm_id_map_args(expert_in_dim, source_n_total_expert, 1, n_expert, n_tokens);
+            /* R5-C unified go2b: the scratch holds 68-byte blocks for every
+             * active expert, so strides and kernels switch to go2b wholesale. */
+            const uint64_t eff_gate_row = do_hot ? (uint64_t)expert_in_dim / 256u * 68u : gate_row_bytes;
+            const uint64_t eff_gate_exp = do_hot ? (uint64_t)expert_mid_dim * eff_gate_row : gate_expert_bytes;
+            const uint64_t eff_down_row = do_hot ? (uint64_t)expert_mid_dim / 256u * 68u : down_row_bytes;
+            const uint64_t eff_down_exp = do_hot ? (uint64_t)out_dim * eff_down_row : down_expert_bytes;
+            const uint32_t eff_gate_type = do_hot ? DS4_METAL_TENSOR_GO2B : gate_type;
+            const uint32_t eff_down_type = do_hot ? DS4_METAL_TENSOR_GO2B : down_type;
             gate_mm_args =
                 ds4_gpu_make_mul_mm_id_args(expert_in_dim, expert_mid_dim, source_n_total_expert,
-                                              gate_row_bytes, gate_expert_bytes,
+                                              eff_gate_row, eff_gate_exp,
                                               1, n_expert, n_tokens);
             down_mm_args =
                 ds4_gpu_make_mul_mm_id_args_src1_size(expert_mid_dim, out_dim, source_n_total_expert,
-                                                        down_row_bytes, down_expert_bytes,
+                                                        eff_down_row, eff_down_exp,
                                                         n_expert, n_expert, n_tokens,
                                                         request_mid_f16 ? sizeof(uint16_t) : sizeof(float));
 
             map_pipeline = ds4_gpu_get_pipeline(ds4_gpu_mul_mm_id_map0_name(n_expert));
-            gate_mm_pipeline = ds4_gpu_routed_mm_pipeline(gate_type);
-            up_mm_pipeline = ds4_gpu_routed_mm_pipeline(gate_type);
+            gate_mm_pipeline = ds4_gpu_routed_mm_pipeline(eff_gate_type);
+            up_mm_pipeline = ds4_gpu_routed_mm_pipeline(eff_gate_type);
             down_mm_pipeline = request_mid_f16 ?
-                ds4_gpu_routed_mm_f16_rhs_pipeline(down_type) :
-                ds4_gpu_routed_mm_pipeline(down_type);
+                ds4_gpu_routed_mm_f16_rhs_pipeline(eff_down_type) :
+                ds4_gpu_routed_mm_pipeline(eff_down_type);
             if (!map_pipeline || !gate_mm_pipeline || !up_mm_pipeline || !down_mm_pipeline) {
                 return 0;
             }
@@ -21084,6 +21907,102 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                    ds4_gpu_tensor_offset(up));
                 DS4_METAL_PROFILE_MOE_STAGE("up");
             }
+            if (ok && do_hot && n_hot_picks > 0) {
+                /* R5-C hot pass (gate/up): gather go2b hot experts, build the hot
+                 * work map over the SAME shared map buffer (base tiles already
+                 * encoded; same-CB dispatches execute in order), run one go2b
+                 * matmul per matrix writing the rows the base pass left unclaimed. */
+                const uint64_t g2_gate_row = (uint64_t)expert_in_dim / 256u * 68u;
+                const uint64_t g2_gate_exp = (uint64_t)expert_mid_dim * g2_gate_row;
+                const uint64_t g2_down_row = (uint64_t)expert_mid_dim / 256u * 68u;
+                const uint64_t g2_down_exp = (uint64_t)out_dim * g2_down_row;
+                const uint64_t need_g = (uint64_t)n_hot_slots * g2_gate_exp;
+                const uint64_t need_d = (uint64_t)n_hot_slots * g2_down_exp;
+                if (!g_moe_hot_gate_scratch || (uint64_t)g_moe_hot_gate_scratch.length < need_g) {
+                    g_moe_hot_gate_scratch = [g_device newBufferWithLength:(NSUInteger)need_g options:MTLResourceStorageModeShared];
+                    g_moe_hot_up_scratch   = [g_device newBufferWithLength:(NSUInteger)need_g options:MTLResourceStorageModeShared];
+                }
+                if (!g_moe_hot_down_scratch || (uint64_t)g_moe_hot_down_scratch.length < need_d)
+                    g_moe_hot_down_scratch = [g_device newBufferWithLength:(NSUInteger)need_d options:MTLResourceStorageModeShared];
+                const uint64_t hot_picks_total = (uint64_t)n_tokens * n_expert;
+                const uint64_t selbytes = hot_picks_total * sizeof(int32_t);
+                if (!g_moe_hot_sel || (uint64_t)g_moe_hot_sel.length < selbytes)
+                    g_moe_hot_sel = [g_device newBufferWithLength:(NSUInteger)selbytes options:MTLResourceStorageModeShared];
+                int hot_ok = (g_moe_hot_gate_scratch && g_moe_hot_up_scratch &&
+                              g_moe_hot_down_scratch && g_moe_hot_sel) ? 1 : 0;
+                if (hot_ok) {
+                    int32_t *hs = (int32_t *)g_moe_hot_sel.contents;
+                    for (uint32_t i = 0; i < (uint32_t)hot_picks_total; i++)
+                        hs[i] = (g_hot_pick_slot[i] >= 0) ? g_hot_pick_slot[i] : 0xFFFF;
+                    for (uint32_t j = 0; j < n_hot_slots; j++) {
+                        const uint64_t sslot = hot_slot_ids[j];
+                        memcpy((uint8_t *)g_moe_hot_gate_scratch.contents + (uint64_t)j * g2_gate_exp,
+                               (const uint8_t *)res_gate_ptr + sslot * g2_gate_exp, g2_gate_exp);
+                        memcpy((uint8_t *)g_moe_hot_up_scratch.contents + (uint64_t)j * g2_gate_exp,
+                               (const uint8_t *)res_up_ptr + sslot * g2_gate_exp, g2_gate_exp);
+                        memcpy((uint8_t *)g_moe_hot_down_scratch.contents + (uint64_t)j * g2_down_exp,
+                               (const uint8_t *)res_down_ptr + sslot * g2_down_exp, g2_down_exp);
+                    }
+                }
+                id<MTLComputePipelineState> hot_gate_pipe = ds4_gpu_routed_mm_pipeline(DS4_METAL_TENSOR_GO2B);
+                if (hot_ok && hot_gate_pipe) {
+                    ds4_gpu_mul_mm_id_map_args hot_map_args =
+                        ds4_gpu_make_mul_mm_id_map_args(expert_in_dim, n_hot_slots, 1, n_expert, n_tokens);
+                    ds4_gpu_mul_mm_id_args hot_gate_args =
+                        ds4_gpu_make_mul_mm_id_args(expert_in_dim, expert_mid_dim, n_hot_slots,
+                                                      g2_gate_row, g2_gate_exp,
+                                                      1, n_expert, n_tokens);
+                    ok = ds4_gpu_encode_mul_mm_id_map(cb, map_pipeline, &hot_map_args,
+                             &hot_gate_args, g_moe_hot_sel, 0)
+                      && ds4_gpu_encode_mul_mm_id_mapped_tile(cb, hot_gate_pipe, &hot_gate_args,
+                             g_moe_hot_gate_scratch, 0, xbuf, ds4_gpu_tensor_offset(x),
+                             gatebuf, ds4_gpu_tensor_offset(gate))
+                      && ds4_gpu_encode_mul_mm_id_mapped_tile(cb, hot_gate_pipe, &hot_gate_args,
+                             g_moe_hot_up_scratch, 0, xbuf, ds4_gpu_tensor_offset(x),
+                             upbuf, ds4_gpu_tensor_offset(up));
+                    DS4_METAL_PROFILE_MOE_STAGE("hot-gate-up");
+                } else if (do_hot) {
+                    ok = 0;   /* split active but resources missing: fail loud, no silent quality fork */
+                }
+            }
+            if (ok && do_residual && ds4_gpu_ensure_res_scratch(n_active, gate_expert_bytes)) {
+                /* CPU-gather the active residual experts into the compacted scratch
+                 * (matching the base offload layout), then run the go1b mm_id matmul
+                 * with the base's work map and sum into gate/up before swiglu. */
+                for (uint32_t i = 0; i < n_active; i++) {
+                    uint32_t e = active_ids[i];
+                    int slot = res_lut ? (int)res_lut[e] : (int)e;   /* sparse: -1 => no residual */
+                    uint8_t *gd = (uint8_t *)g_moe_res_gate_scratch.contents + (uint64_t)i * gate_expert_bytes;
+                    uint8_t *ud = (uint8_t *)g_moe_res_up_scratch.contents + (uint64_t)i * gate_expert_bytes;
+                    if (slot >= 0) {
+                        memcpy(gd, (const uint8_t *)res_gate_ptr + (uint64_t)slot * gate_expert_bytes, gate_expert_bytes);
+                        memcpy(ud, (const uint8_t *)res_up_ptr + (uint64_t)slot * gate_expert_bytes, gate_expert_bytes);
+                    } else {   /* zero go1b block (d=0) dequantizes to 0 => no correction */
+                        memset(gd, 0, gate_expert_bytes);
+                        memset(ud, 0, gate_expert_bytes);
+                    }
+                }
+                const uint32_t go_n = (uint32_t)n_tokens * n_expert * expert_mid_dim;
+                ok = ds4_gpu_encode_mul_mm_id_mapped_tile(cb, gate_mm_pipeline, &gate_mm_args,
+                         g_moe_res_gate_scratch, 0, xbuf, ds4_gpu_tensor_offset(x),
+                         g_moe_go1b_res_scratch, 0)
+                  && ds4_gpu_encode_add_f32_1d(cb, gatebuf, ds4_gpu_tensor_offset(gate),
+                         g_moe_go1b_res_scratch, 0, gatebuf, ds4_gpu_tensor_offset(gate), go_n)
+                  && ds4_gpu_encode_mul_mm_id_mapped_tile(cb, up_mm_pipeline, &gate_mm_args,
+                         g_moe_res_up_scratch, 0, xbuf, ds4_gpu_tensor_offset(x),
+                         g_moe_go1b_res_scratch, 0)
+                  && ds4_gpu_encode_add_f32_1d(cb, upbuf, ds4_gpu_tensor_offset(up),
+                         g_moe_go1b_res_scratch, 0, upbuf, ds4_gpu_tensor_offset(up), go_n);
+                if (getenv("DS4_RESIDUAL_DEBUG")) {
+                    const uint8_t *g0 = (const uint8_t*)g_moe_res_gate_scratch.contents;
+                    const uint8_t *rp = (const uint8_t*)res_gate_ptr;
+                    unsigned long gsum = 0, rsum = 0;
+                    for (int b = 0; b < 512; b++) { gsum += g0[b]; rsum += rp[b]; }
+                    fprintf(stderr, "ds4: [res-mm-apply] L%u n_active=%u go_n=%u ok=%d gathered512=%lu src512=%lu eb=%llu\n",
+                            layer_index, n_active, go_n, ok, gsum, rsum,
+                            (unsigned long long)gate_expert_bytes);
+                }
+            }
         } else if (use_tiny_pair_mv) {
             id<MTLComputePipelineState> pair_pipeline =
                 gate_type == DS4_METAL_TENSOR_IQ2_XXS ?
@@ -21137,6 +22056,8 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                   2,
                                                   false);
         }
+        /* 1-bit residual for decode is applied inside the use_mm_id branch above
+         * (go1b has no mv_id kernel, so decode always takes the mm_id path). */
         DS4_METAL_PROFILE_MOE_STAGE("gate_up");
         const bool use_fused_activation = !g_quality_mode;
         const bool use_mid_f16 =
@@ -21253,7 +22174,12 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                      down_smem,
                                                      2);
             } else if (use_mm_id) {
-                ok = ds4_gpu_encode_mul_mm_id_mapped_tile(cb,
+                /* R5-C: the hot gate/up pass rebuilt the shared work map from the
+                 * hot sel; restore the base map before the base down tile. */
+                if (do_hot && n_hot_picks > 0)
+                    ok = ok && ds4_gpu_encode_mul_mm_id_map(cb, map_pipeline, &gate_map_args,
+                                   &gate_mm_args, selectedbuf, ds4_gpu_tensor_offset(selected));
+                if (ok) ok = ds4_gpu_encode_mul_mm_id_mapped_tile(cb,
                                                        down_mm_pipeline,
                                                        &down_mm_args,
                                                        down_buf,
@@ -21278,6 +22204,57 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                      2,
                                                      false);
             }
+        }
+        if (ok && do_residual && use_mm_id && !direct_down_sum) {
+            /* residual down: gather active residual down experts into a compacted
+             * scratch, run the go1b mm_id down matmul with the base's down map, and
+             * sum into the per-expert down output (before sum_experts). */
+            uint64_t dneed = (uint64_t)n_active * down_expert_bytes;
+            if (!g_moe_res_down_scratch || (uint64_t)g_moe_res_down_scratch.length < dneed)
+                g_moe_res_down_scratch = [g_device newBufferWithLength:dneed options:MTLResourceStorageModeShared];
+            if (g_moe_res_down_scratch) {
+                for (uint32_t i = 0; i < n_active; i++) {
+                    uint32_t e = active_ids[i];
+                    int slot = res_lut ? (int)res_lut[e] : (int)e;
+                    uint8_t *dd = (uint8_t *)g_moe_res_down_scratch.contents + (uint64_t)i * down_expert_bytes;
+                    if (slot >= 0)
+                        memcpy(dd, (const uint8_t *)res_down_ptr + (uint64_t)slot * down_expert_bytes, down_expert_bytes);
+                    else
+                        memset(dd, 0, down_expert_bytes);
+                }
+                const uint32_t don = (uint32_t)n_tokens * n_expert * out_dim;
+                ok = ds4_gpu_encode_mul_mm_id_mapped_tile(cb, down_mm_pipeline, &down_mm_args,
+                         g_moe_res_down_scratch, 0, midbuf, ds4_gpu_tensor_offset(mid),
+                         g_moe_go1b_res_scratch, 0)
+                  && ds4_gpu_encode_add_f32_1d(cb, down_dst, down_dst_off,
+                         g_moe_go1b_res_scratch, 0, down_dst, down_dst_off, don);
+                if (getenv("DS4_RESIDUAL_DEBUG"))
+                    fprintf(stderr, "ds4: [res-down] L%u don=%u ok=%d\n", layer_index, don, ok);
+            }
+        }
+        if (ok && do_hot && n_hot_picks > 0 && use_mm_id) {
+            /* R5-C hot down: hot map + one go2b down matmul writing the hot rows
+             * of down_dst (disjoint from the base rows; sum_experts then folds
+             * every row exactly once). */
+            const uint64_t g2_down_row = (uint64_t)expert_mid_dim / 256u * 68u;
+            const uint64_t g2_down_exp = (uint64_t)out_dim * g2_down_row;
+            id<MTLComputePipelineState> hot_down_pipe = request_mid_f16 ?
+                ds4_gpu_routed_mm_f16_rhs_pipeline(DS4_METAL_TENSOR_GO2B) :
+                ds4_gpu_routed_mm_pipeline(DS4_METAL_TENSOR_GO2B);
+            ds4_gpu_mul_mm_id_map_args hot_map_args =
+                ds4_gpu_make_mul_mm_id_map_args(expert_mid_dim, n_hot_slots, 1, n_expert, n_tokens);
+            ds4_gpu_mul_mm_id_args hot_down_args =
+                ds4_gpu_make_mul_mm_id_args_src1_size(expert_mid_dim, out_dim, n_hot_slots,
+                                                        g2_down_row, g2_down_exp,
+                                                        n_expert, n_expert, n_tokens,
+                                                        request_mid_f16 ? sizeof(uint16_t) : sizeof(float));
+            ok = hot_down_pipe != nil
+              && ds4_gpu_encode_mul_mm_id_map(cb, map_pipeline, &hot_map_args,
+                     &hot_down_args, g_moe_hot_sel, 0)
+              && ds4_gpu_encode_mul_mm_id_mapped_tile(cb, hot_down_pipe, &hot_down_args,
+                     g_moe_hot_down_scratch, 0, midbuf, ds4_gpu_tensor_offset(mid),
+                     down_dst, down_dst_off);
+            DS4_METAL_PROFILE_MOE_STAGE("hot-down");
         }
         DS4_METAL_PROFILE_MOE_STAGE("down");
         if (ok && n_expert > 1 && !direct_down_sum) {
@@ -22223,6 +23200,7 @@ int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
         const ds4_gpu_tensor *routed_out,
         const ds4_gpu_tensor *residual_hc,
         const ds4_gpu_tensor *split,
+        const ds4_gpu_tensor *corr_delta,
         uint32_t                n_embd,
         uint32_t                n_hc) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
@@ -22263,6 +23241,14 @@ int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
             fprintf(stderr, "ds4: Metal shared-down HC fusion received undersized buffers\n");
             return 0;
         }
+        id<MTLBuffer> deltabuf = nil;
+        if (corr_delta) {
+            deltabuf = ds4_gpu_tensor_buffer(corr_delta);
+            if (!deltabuf || ds4_gpu_tensor_bytes(corr_delta) < embd_bytes) {
+                fprintf(stderr, "ds4: Metal shared-down HC fusion corr_delta undersized\n");
+                return 0;
+            }
+        }
 
         uint64_t inner_offset = 0;
         id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(model_map, model_size,
@@ -22294,6 +23280,7 @@ int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
             .nb1 = (uint64_t)n_embd * sizeof(float),
             .nb2 = (uint64_t)n_hc * n_embd * sizeof(float),
             .has_add = 1,
+            .has_corr_delta = corr_delta ? 1 : 0,
         };
 
         id<MTLComputePipelineState> pipeline =
@@ -22317,6 +23304,10 @@ int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
         [enc setBuffer:splitbuf offset:ds4_gpu_tensor_offset(split) + (NSUInteger)n_hc * sizeof(float) atIndex:7];
         [enc setBuffer:splitbuf offset:ds4_gpu_tensor_offset(split) + (NSUInteger)(2u * n_hc) * sizeof(float) atIndex:8];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out_hc) atIndex:9];
+        /* dummy-bind routed_out when absent: flag 0 means the kernel never reads it */
+        [enc setBuffer:(deltabuf ? deltabuf : routedbuf)
+                offset:(deltabuf ? ds4_gpu_tensor_offset(corr_delta) : ds4_gpu_tensor_offset(routed_out))
+               atIndex:10];
         [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) /
                                               (NSUInteger)mv_dispatch.nr0,

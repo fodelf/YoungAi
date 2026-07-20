@@ -1730,6 +1730,51 @@ __global__ static void embed_tokens_hc_kernel(
     out[gid] = __half2float(w[(uint64_t)tok * n_embd + d]);
 }
 
+/* go1b correction kernels (mirror metal/moe.metal kernel_dsv4_corr_*). */
+__global__ static void corr_router_bias_kernel(
+        float *logits, const float *delta, uint32_t n_expert, uint64_t total) {
+    uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= total) return;
+    logits[gid] += delta[(uint32_t)(gid % n_expert)];
+}
+
+__global__ static void corr_apply_kernel(
+        float *out, const float *x, const float *U, const float *V,
+        const float *C, const float *b, const float *beta, const int *selected,
+        uint32_t d_model, uint32_t d_l, uint32_t n_expert, uint32_t n_sel) {
+    extern __shared__ float vx[];   // [d_l] = V @ x[tok]
+    uint32_t tok = blockIdx.x;
+    const float *xt = x + (uint64_t)tok * d_model;
+    const int *sel = selected + (uint64_t)tok * n_sel;
+    for (uint32_t i = threadIdx.x; i < d_l; i += blockDim.x) {
+        const float *Vrow = V + (uint64_t)i * d_model;
+        float acc = 0.0f;
+        for (uint32_t j = 0; j < d_model; j++) acc += Vrow[j] * xt[j];
+        vx[i] = acc;
+    }
+    __syncthreads();
+    float beta_sum = 0.0f; uint32_t n_valid = 0;
+    for (uint32_t s = 0; s < n_sel; s++) {
+        int e = sel[s];
+        if (e >= 0 && (uint32_t)e < n_expert) { beta_sum += beta[e]; n_valid++; }
+    }
+    float *outt = out + (uint64_t)tok * d_model;
+    for (uint32_t d = threadIdx.x; d < d_model; d += blockDim.x) {
+        const float *Urow = U + (uint64_t)d * d_l;
+        float acc = 0.0f;
+        for (uint32_t s = 0; s < n_sel; s++) {
+            int e = sel[s];
+            if (e < 0 || (uint32_t)e >= n_expert) continue;
+            const float *Crow = C + (uint64_t)e * d_l;
+            float p = 0.0f;
+            for (uint32_t i = 0; i < d_l; i++) p += Urow[i] * Crow[i] * vx[i];
+            acc += p;
+        }
+        acc += (float)n_valid * b[d] + beta_sum;
+        outt[d] += acc;
+    }
+}
+
 __global__ static void matmul_f16_kernel(
         float *out,
         const __half *w,
@@ -7796,6 +7841,47 @@ extern "C" int ds4_gpu_add_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a, 
     add_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)a->ptr, (const float *)b->ptr, n);
     return cuda_ok(cudaGetLastError(), "add launch");
 }
+extern "C" int ds4_gpu_corr_router_bias(ds4_gpu_tensor *logits, const ds4_gpu_tensor *delta,
+        uint32_t n_expert, uint32_t n_tokens) {
+    if (!logits || !delta || n_expert == 0 || n_tokens == 0) return 0;
+    uint64_t total = (uint64_t)n_tokens * n_expert;
+    if (logits->bytes < total * sizeof(float) ||
+        delta->bytes < (uint64_t)n_expert * sizeof(float)) return 0;
+    corr_router_bias_kernel<<<(unsigned)((total + 255) / 256), 256>>>(
+        (float *)logits->ptr, (const float *)delta->ptr, n_expert, total);
+    return cuda_ok(cudaGetLastError(), "corr router bias launch");
+}
+extern "C" int ds4_gpu_corr_apply(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *U, const ds4_gpu_tensor *V, const ds4_gpu_tensor *C,
+        const ds4_gpu_tensor *b, const ds4_gpu_tensor *beta, const ds4_gpu_tensor *selected,
+        uint32_t d_model, uint32_t d_l, uint32_t n_expert, uint32_t n_expert_used, uint32_t n_tokens) {
+    if (!out || !x || !U || !V || !C || !b || !beta || !selected ||
+        d_model == 0 || d_l == 0 || n_expert == 0 || n_expert_used == 0 || n_tokens == 0) return 0;
+    uint64_t vec_bytes = (uint64_t)n_tokens * d_model * sizeof(float);
+    if (out->bytes < vec_bytes || x->bytes < vec_bytes ||
+        U->bytes < (uint64_t)d_model * d_l * sizeof(float) ||
+        V->bytes < (uint64_t)d_l * d_model * sizeof(float) ||
+        C->bytes < (uint64_t)n_expert * d_l * sizeof(float) ||
+        b->bytes < (uint64_t)d_model * sizeof(float) ||
+        beta->bytes < (uint64_t)n_expert * sizeof(float) ||
+        selected->bytes < (uint64_t)n_tokens * n_expert_used * sizeof(int32_t)) return 0;
+    corr_apply_kernel<<<n_tokens, 256, (size_t)d_l * sizeof(float)>>>(
+        (float *)out->ptr, (const float *)x->ptr, (const float *)U->ptr, (const float *)V->ptr,
+        (const float *)C->ptr, (const float *)b->ptr, (const float *)beta->ptr,
+        (const int *)selected->ptr, d_model, d_l, n_expert, n_expert_used, n_tokens);
+    return cuda_ok(cudaGetLastError(), "corr apply launch");
+}
+/* Metal-only decode optimization (routed_out write-hazard bubble); CUDA keeps
+ * the in-place corr kernel — callers must gate on this returning 0. */
+extern "C" int ds4_gpu_corr_delta_supported(void) { return 0; }
+extern "C" int ds4_gpu_corr_apply_delta(ds4_gpu_tensor *delta_out, const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *U, const ds4_gpu_tensor *V, const ds4_gpu_tensor *C,
+        const ds4_gpu_tensor *b, const ds4_gpu_tensor *beta, const ds4_gpu_tensor *selected,
+        uint32_t d_model, uint32_t d_l, uint32_t n_expert, uint32_t n_expert_used, uint32_t n_tokens) {
+    (void)delta_out; (void)x; (void)U; (void)V; (void)C; (void)b; (void)beta; (void)selected;
+    (void)d_model; (void)d_l; (void)n_expert; (void)n_expert_used; (void)n_tokens;
+    return 0;
+}
 extern "C" int ds4_gpu_directional_steering_project_tensor(
         ds4_gpu_tensor       *x,
         const ds4_gpu_tensor *directions,
@@ -10615,8 +10701,8 @@ static int routed_moe_launch(
     return ok;
 }
 
-extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index) {
-    (void)layer_index;
+extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const ds4_gpu_residual_set *residual, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index) {
+    (void)layer_index; (void)residual;  /* CUDA residual: TODO (metal-first); ignore for now */
     return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
                              gate_offset, up_offset, down_offset,
                              gate_type, down_type,
@@ -10625,8 +10711,8 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, n_total_expert, n_expert, clamp, x, 1);
 }
-extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16) {
-    (void)layer_index;
+extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const ds4_gpu_residual_set *residual, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16) {
+    (void)layer_index; (void)residual;  /* CUDA residual: TODO (metal-first) */
     if (mid_is_f16) *mid_is_f16 = false;
     return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
                              gate_offset, up_offset, down_offset,
@@ -10874,8 +10960,11 @@ extern "C" int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
         const ds4_gpu_tensor *routed_out,
         const ds4_gpu_tensor *residual_hc,
         const ds4_gpu_tensor *split,
+        const ds4_gpu_tensor *corr_delta,
         uint32_t                n_embd,
         uint32_t                n_hc) {
+    /* no CUDA corr-delta consumer: callers gate on corr_delta_supported()==0 */
+    if (corr_delta) return 0;
     if (getenv("DS4_CUDA_DISABLE_Q8_HC_EXPAND_FUSED") == NULL) {
         return cuda_matmul_q8_0_hc_expand_tensor_labeled(out_hc, shared_out,
                                                         model_map, model_size,
@@ -10924,4 +11013,42 @@ extern "C" int ds4_gpu_matmul_q8_0_hc_expand_tensor(
                                         weight_offset, in_dim, out_dim, x, 1) &&
            ds4_gpu_hc_expand_split_tensor(out_hc, block_out, residual_hc,
                                             split, n_embd, n_hc);
+}
+
+/* go-onebit DQZ2 zchain: not implemented on CUDA yet. ds4_gpu_zchain_set()
+ * returning 0 makes the engine ABORT at load when a zchain is requested on
+ * this backend (no silent quality downgrade). Mirror metal/moe.metal
+ * kernel_dsv4_zchain_* here to bring CUDA to parity. */
+extern "C" int ds4_gpu_zchain_set(
+        const float *ops, const uint32_t *layer_off, const uint16_t *v8,
+        const float *ge, const uint8_t *ge_present,
+        uint32_t n_layer, uint32_t n_expert, uint32_t d_model,
+        uint32_t n_ops_total, uint32_t n_v8_blocks) {
+    (void)ops; (void)layer_off; (void)v8; (void)ge; (void)ge_present;
+    (void)n_layer; (void)n_expert; (void)d_model; (void)n_ops_total; (void)n_v8_blocks;
+    fprintf(stderr, "ds4: zchain is not implemented on the CUDA backend yet\n");
+    return 0;
+}
+extern "C" int ds4_gpu_zchain_ge_apply(
+        ds4_gpu_tensor *weights, const ds4_gpu_tensor *selected,
+        uint32_t layer, uint32_t n_expert_used, uint32_t n_tokens) {
+    (void)weights; (void)selected; (void)layer; (void)n_expert_used; (void)n_tokens;
+    return 0;
+}
+extern "C" int ds4_gpu_zchain_scale_routed(
+        ds4_gpu_tensor *routed, const ds4_gpu_tensor *x,
+        uint32_t layer, uint32_t n_tokens) {
+    (void)routed; (void)x; (void)layer; (void)n_tokens;
+    return 0;
+}
+extern "C" int ds4_gpu_zchain_zl_set(
+        const uint16_t *zlm, const uint32_t *off, const uint32_t *k,
+        const float *tr, uint32_t n_layer, uint64_t total_halves) {
+    (void)zlm; (void)off; (void)tr; (void)total_halves;
+    for (uint32_t l = 0; k && l < n_layer; l++)
+        if (k[l]) {
+            fprintf(stderr, "ds4: frozen z^L is not implemented on the CUDA backend yet\n");
+            return 0;   /* engine aborts at load: no silent quality downgrade */
+        }
+    return 1;
 }

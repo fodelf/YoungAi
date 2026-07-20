@@ -46,7 +46,7 @@ EXTRA_ENV=${EXTRA_ENV:-}
 FREQ=${FREQ:-}
 FREQ_ENV=""; [ -n "$FREQ" ] && FREQ_ENV="DS4_ROUTER_FREQ_FILE=$FREQ"
 COMMON_ENV="$COMMON_ENV $FREQ_ENV"
-# SPEC: 任意投机解码 env 透传两机(如 DS4_DIST_COPY_SPEC=1 DS4_DIST_COPY_SPEC_DRAFT=12 DS4_DIST_SPEC_PIPE=1)
+# SPEC: 任意投机解码 env 透传两机(如 DS4_DIST_SPEC_PIPE=1; copy-spec 已是引擎天然默认无需 env)
 SPEC=${SPEC:-}
 COMMON_ENV="$COMMON_ENV $SPEC"
 # MTP_ARGS: 本机-MTP coordinator 的 --mtp 参数(--mtp FILE --mtp-role coordinator --mtp-draft N)。

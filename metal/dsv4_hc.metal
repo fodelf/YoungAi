@@ -75,6 +75,10 @@ struct ds4_metal_args_dsv4_hc_expand {
     uint64_t nb1;
     uint64_t nb2;
     int32_t  has_add;
+    /* go1b corr: shared-down fusion adds corr_delta[d] onto routed_out[d]
+     * (same fadd as the legacy in-place corr kernel — bit-identical), so the
+     * tiny corr dispatch never write-hazards the hot routed_out buffer. */
+    int32_t  has_corr_delta;
 };
 
 // Numerically stable sigmoid for the standalone split/sinkhorn path. The naive
@@ -639,6 +643,7 @@ kernel void kernel_dsv4_shared_down_hc_expand4_q8_0(
         device  const char * post,
         device  const char * comb,
         device        char * dst,
+        device  const char * corr_delta,
         threadgroup   char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
@@ -720,6 +725,10 @@ kernel void kernel_dsv4_shared_down_hc_expand4_q8_0(
             *((device float *)(shared_out + (uint64_t)d * sizeof(float))) = shared_v;
 
             float block_v = *((device const float *)(routed_out + (uint64_t)d * hc.nb_block0));
+            if (hc.has_corr_delta) {
+                /* same fadd the in-place corr kernel performed on routed_out */
+                block_v += *((device const float *)(corr_delta + (uint64_t)d * hc.nb_block0));
+            }
             block_v += shared_v;
 
             const float r0 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 0 * hc.nb_res1));
