@@ -1,0 +1,68 @@
+// ==== python ====
+    def route(self, rule: str, **options: t.Any) -> t.Callable[[T_route], T_route]:
+        """Decorate a view function to register it with the given URL
+        rule and options. Calls :meth:`add_url_rule`, which has more
+        details about the implementation.
+
+        .. code-block:: python
+
+            @app.route("/")
+            def index():
+// ==== javascript ====
+export default function dispatchRequest(config) {
+  throwIfCancellationRequested(config);
+
+  config.headers = AxiosHeaders.from(config.headers);
+
+  // Transform request data
+  config.data = transformData.call(config, config.transformRequest);
+
+// ==== rust ====
+    pub fn is_match<P: AsRef<Path>>(&self, path: P) -> bool {
+        self.is_match_candidate(&Candidate::new(path.as_ref()))
+    }
+
+    /// Tests whether the given path matches this pattern or not.
+    pub fn is_match_candidate(&self, path: &Candidate<'_>) -> bool {
+// ==== typescript ====
+export function reactive(target: object) {
+  // if trying to observe a readonly proxy, return the readonly version.
+  if (isReadonly(target)) {
+    return target
+  }
+  return createReactiveObject(
+    target,
+// ==== c ====
+static void assoc_expand(void) {
+    old_hashtable = primary_hashtable;
+
+    primary_hashtable = calloc(hashsize(hashpower + 1), sizeof(void *));
+    if (primary_hashtable) {
+        if (settings.verbose > 1)
+// ==== java ====
+  public <T> T fromJson(String json, Class<T> classOfT) throws JsonSyntaxException {
+    return fromJson(json, TypeToken.get(classOfT));
+  }
+
+  /**
+   * This method deserializes the specified JSON into an object of the specified type. This method
+// ==== go ====
+func TestDuplicatedLinks(t *testing.T) {
+	doc := goqueryFromReadme(t)
+	links := make(map[string]bool, 0)
+	doc.Find("body li > a:first-child").Each(func(_ int, s *goquery.Selection) {
+		t.Run(s.Text(), func(t *testing.T) {
+			href, ok := s.Attr("href")
+			if !ok {
+// ==== issuefix ====
+
+=== ISSUE #6093: IPv6 addresses parsed incorrectly because of `.partition(":")`? ===
+Hi, I checked the code and saw that two places use `.partition(":")` on addresses, and IPv6 ad
+// ==== method ====
+## Cache penetration (缓存穿透)
+
+Queries for keys that exist in neither cache nor database bypass the cache every time and
+hammer the database. Two standard fixes:
+// ==== soul ====
+An engineering answer is only worth its evidence. Four rules, always:
+

@@ -2158,7 +2158,11 @@ static struct ds4_zchain *zchain_from_model(const ds4_model *m) {
         snprintf(nm, sizeof nm, "blk.%u.opt_zlm.weight", il);
         ds4_tensor *tzl = model_find_tensor(m, nm);
         const uint16_t *zlm = tzl ? (const uint16_t *)tensor_data(m, tzl) : NULL;
-        if (tg && tg->dim[0] == DS4_N_EXPERT) {
+        /* DS4_ZCHAIN_NO_GE=1: 诊断开关 — 跳过 GE 表装载(所有折叠点按 ge==NULL 自然短路)。
+         * 依据(2026-07-21): GE=per-expert 增益把 base 修向 FP; 加性残差侧车的前提是
+         * base≈裸 Q1 → GE×残差=按专家双重修正嫌疑(Go-hot 命中面上集中爆), A/B 判决用。 */
+        const char *nge = getenv("DS4_ZCHAIN_NO_GE");   /* 值语义: 空串/"0"=不跳过(在案空串陷阱, quant_layer M4.6 同款) */
+        if (tg && tg->dim[0] == DS4_N_EXPERT && !(nge && *nge && *nge != '0')) {
             const float *ge = (const float *)tensor_data(m, tg);
             if (ge) {
                 z->layer[il].ge = xmalloc((size_t)DS4_N_EXPERT * sizeof(float));
@@ -9719,6 +9723,16 @@ static void cap_append_k(const char *dir, const char *name, uint32_t il, int kin
 static void cap_batch_layer(ds4_gpu_graph *g, uint32_t il, uint32_t n_tokens) {
     const char *dir = getenv("DS4_CAP_DIR");
     if (!dir || !dir[0] || n_tokens == 0 || !cap_layer_enabled(il)) return;
+
+    /* ★捕获前 GPU 定格(2026-07-22 根因修复)★: batch_routed_out 由仍在队列里的
+     * 本层 MoE 核写入 — 不 drain 就 tensor_read 会拿到上一层残值(首捕获层=全零,
+     * 之后逐层错位一格; off-by-one 实锤: 错位对齐后 cos(O_BASE,O_REF)=0.9995)。
+     * ffn_norm 恰因更早同步点已定格, 掩盖了此病 — dsml 时代 P2 侧车 NO-GO 同根因。
+     * 用 TP 块同款 signal→flush→host_wait 快路径(MTLSharedEvent), 只在捕获时付。 */
+    {
+        const uint64_t cap_ev = ds4_gpu_tp_signal_after_batch();
+        if (cap_ev) { (void)ds4_gpu_flush_commands(); (void)ds4_gpu_tp_host_wait(cap_ev); }
+    }
 
     const uint32_t d = DS4_N_EMBD, ne = DS4_N_EXPERT, ku = DS4_N_EXPERT_USED;
     size_t nf = (size_t)n_tokens * d;

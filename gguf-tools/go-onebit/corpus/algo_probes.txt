@@ -1,0 +1,66 @@
+# algo_probes.txt — 算法理论域快判集(2026-07-21, 四支柱后训练·支柱②)。
+# 对准 15 针面板判决的最大缺口: 算法续写四语言全未到正解。
+# 判据同族: 12-16 token 片段, 贪心续写出正确算法体=过, 注释逃逸/汤/复读=不过。
+# 针1 二分查找(Go, 中点+收缩)
+func binarySearch(a []int, target int) int {
+    lo, hi := 0, len(a)-1
+    for lo <= hi {
+---
+# 针2 twoSum map 解(Python, 补码查表)
+def two_sum(nums, target):
+    seen = {}
+    for i, x in enumerate(nums):
+        if target - x in seen:
+---
+# 针3 快排分区(Python)
+def partition(a, lo, hi):
+    pivot = a[hi]
+    i = lo - 1
+---
+# 针4 BFS 队列(Go)
+func bfs(root *Node) []int {
+    queue := []*Node{root}
+    var out []int
+    for len(queue) > 0 {
+---
+# 针5 斐波那契 DP(JavaScript)
+function fib(n) {
+  const dp = [0, 1];
+  for (let i = 2; i <= n; i++) {
+---
+# 针6 归并(Rust, 双指针)
+fn merge(a: &[i32], b: &[i32]) -> Vec<i32> {
+    let (mut i, mut j) = (0, 0);
+    let mut out = Vec::new();
+    while i < a.len() && j < b.len() {
+---
+# 针7 反转链表(C)
+struct node *reverse(struct node *head) {
+    struct node *prev = NULL;
+    while (head) {
+---
+# 针8 栈判括号(Java)
+public static boolean isValid(String s) {
+    Deque<Character> stack = new ArrayDeque<>();
+    for (char c : s.toCharArray()) {
+---
+# 针9 滑动窗口(Python)
+def longest_unique(s):
+    seen = {}
+    lo = best = 0
+    for hi, ch in enumerate(s):
+---
+# 针10 堆下滤(Go)
+func siftDown(h []int, i int) {
+    for {
+        l, r := 2*i+1, 2*i+2
+---
+# 针11 记忆化(JavaScript)
+const memo = new Map();
+function climb(n) {
+  if (n <= 2) return n;
+  if (memo.has(n)) {
+---
+# 针12 GCD 辗转相除(C)
+int gcd(int a, int b) {
+    while (b != 0) {

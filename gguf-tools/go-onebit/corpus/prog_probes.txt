@@ -1,0 +1,62 @@
+# prog_probes.txt — 编程全域分钟级快判集(2026-07-20 扩域第一刀)。
+# 目的: 判决「Go 锚校准的 v3p 栈」在非 Go 编程语言上的现状基线(裸续写口径, 与
+# pillar_probes.txt 同判据: 12-16 token 片段, 贪心续写对题=过, 汤/复读=不过)。
+# 针0 = Go 在案锚(twoSum, 07-15/07-17 两次逐字过), 同会话 sanity 参照。
+# 针0 Go 参照(在案已过)
+func twoSum(nums []int, target int) []int {
+---
+# 针1 Python 算法惯用
+def two_sum(nums, target):
+    seen = {}
+---
+# 针2 Python 文件惯用
+with open(path) as f:
+    for line in f:
+---
+# 针3 JavaScript 算法惯用
+const seen = new Map();
+for (const [i, x] of nums.entries()) {
+---
+# 针4 JavaScript 服务端惯用(express)
+app.get("/health", (req, res) => {
+---
+# 针5 TypeScript 类型惯用
+export interface User {
+  id: number;
+  name:
+---
+# 针6 Rust 算法惯用
+let mut seen = HashMap::new();
+for (i, &x) in nums.iter().enumerate() {
+---
+# 针7 Rust 错误处理惯用
+match File::open(&path) {
+    Ok(f) =>
+---
+# 针8 C 循环惯用
+for (int i = 0; i < n; i++) {
+    if (a[i] == key)
+---
+# 针9 C 错误处理惯用
+if (p == NULL) {
+    fprintf(stderr,
+---
+# 针10 Java 算法惯用
+public static int[] twoSum(int[] nums, int target) {
+    Map<Integer, Integer> seen
+---
+# 针11 SQL 联表惯用
+SELECT u.id, COUNT(o.id) AS orders
+FROM users u
+JOIN orders o ON
+---
+# 针12 Shell 脚本惯用
+set -euo pipefail
+for f in "$@"; do
+---
+# 针13 Python 报错诊断(traceback 续写)
+Traceback (most recent call last):
+  File "app.py", line 42, in <module>
+---
+# 针14 JS 报错诊断(TypeError 续写)
+TypeError: Cannot read properties of undefined (reading

@@ -52,7 +52,14 @@ trap 'echo "[中断] 杀本机量化进程" >&2; pkill -9 -f ds4quant_run 2>/dev
 if [ "$FAST" = 1 ]; then
     NLAY="${DS4_FAST_LAYERS:-43}"; NTOK="${DS4_FAST_NTOK:-16}"; BWD=1; GSW="${DS4_GSWEEP:-0}"   # fast=不向前修复: 逐层反修 C 侧按 DS4_FAST 硬跳, GSWEEP 回扫默认也关(DS4_GSWEEP=1 可开; 全缓存路径有 12G OOM bug 待修)
     echo "【全模型】脚本 算法=快速模式 进度=开始 体积=- 还原度=- 研判=全${NLAY}层快速档: S=${NTOK}·DS4_FAST(QC1+2轮封顶)·含末层终局反修(裁决2026-07-14)·GSWEEP=${GSW}·产物完整(dql/opt/zchain/合一GGUF)" >&2
-elif [ -z "$TMIN" ]; then NLAY=43; NTOK="${DS4_NTOK:-305}"; BWD="${DS4_BWD:-1}"; GSW="${DS4_GSWEEP:-3}"   # DS4_BWD=0 关终端反调; DS4_NTOK=满档校准S覆盖(数据scaling刀, 2026-07-15)
+elif [ -z "$TMIN" ]; then NLAY=43; NTOK="${DS4_NTOK:-305}"
+    # ★反修前提铁律(用户裁决2026-07-22)★: 反修族(终端反调BWD/终端反修TERM/回扫GSWEEP/复检)
+    # 必须先有"指标(rr)+真实场景(行为门)"双判决依据才许开——满档默认全关, 出基线模型先判,
+    # 有问题且反修对症再走 ./quant_layer.sh backfit(带 DS4_BF_JUSTIFIED=1)。
+    # 实证依据: v2 重型终端反修 rr 零贡献+行为面回退(假工具帧, fable5 2026-07-22 三腿合判)。
+    BWD="${DS4_BWD:-0}"; GSW="${DS4_GSWEEP:-0}"
+    export DS4_BF_TERM_MAXP="${DS4_BF_TERM_MAXP:-0}"
+    export DS4_BF_NO_RECHECK="${DS4_BF_NO_RECHECK:-1}"   # 判决前置(2026-07-21): 复检遍默认关
 else
     NLAY=43; GSW="${DS4_GSWEEP:-3}"
     TI=${TMIN%.*}; [ -n "$TI" ] || TI=0
@@ -135,6 +142,9 @@ if [ "$MODE" = merge ]; then
 else
 # ---------- M-1 清除上次遗留(只清产物; 锚/HF/q2 永不动; backfit=复用产物不清理) ----------
 if [ "$MODE" = backfit ]; then
+    # ★依据闸(2026-07-22)★: 不盲目反修 — 必须已有指标(rr VERDICT)+真实场景(行为门)双判决
+    # 且反修对症, 由操作者以 DS4_BF_JUSTIFIED=1 确认(确认即声明依据已在 fable5 入档)。
+    [ "${DS4_BF_JUSTIFIED:-0}" = 1 ] || { echo "[backfit] 依据闸: 需 DS4_BF_JUSTIFIED=1(指标+真实场景双判决在案且反修对症) — 拒跑" >&2; exit 3; }
     N_HAVE=$(ls "$LDIR"/dql_L*.bin 2>/dev/null | wc -l | tr -d ' ' || true)
     [ "$N_HAVE" = "$NLAY" ] || { echo "[backfit] 层文件 $N_HAVE/$NLAY 不齐 — 只跑反修需完整推进段产物, 拒跑(先满档或 fast)" >&2; exit 3; }
     echo "【全模型】脚本 算法=只跑反修 进度=开始 体积=- 还原度=- 研判=复用${NLAY}层dql(含已落地修正)按op链回放, SEARCH跳过 → 终局收敛sweep+反调+回扫+合并; OUT/LOG 追加" >&2
@@ -290,6 +300,32 @@ echo "【全模型】脚本 算法=完整性校验 进度=完成 体积=$(stat -
 # ---------- M4 出表: 每层 L<NN>.md + 总表 ALL.md ----------
 cp "$OUT" "$TBL/raw/all.out"
 python3 "$ROOT/gguf-tools/go-onebit/scripts/gen_tables.py" "$OUT" "$TBL"
+# ---------- M4.4 判决停点(2026-07-20 域放大): DS4_SKIP_MERGE=1 → 裁判后停在 dql 态 ----------
+# 依据: 跑机盘装不下合一 GGUF 时, merge(consume 消费 dql)是不可逆点(07-15 教训同族);
+# 停点=出表后先跑 rr 固定裁判(只读回放), dql/opt 全留存, 裁决赢了再手动 ./quant_layer.sh merge。
+if [ "${DS4_SKIP_MERGE:-0}" = 1 ]; then
+    if [ "${DS4_SKIP_RRVERDICT:-0}" != "1" ]; then
+        for RRIDS in /tmp/rr_hard.ids:64 /tmp/rr_code.ids:305; do
+            RRF="${RRIDS%%:*}"; RRN="${RRIDS##*:}"
+            [ -f "$RRF" ] && bash "$ROOT/gguf-tools/go-onebit/scripts/rr_verdict.sh" "$RRF" "$RRN" 2>&1 \
+                | grep -E 'VERDICT|watchdog' || echo "[skip-merge] rr_verdict $RRF 未出分(不阻塞停点)" >&2
+        done
+    fi
+    # ★dql 快照分叉(2026-07-22 用户三修正之一)★: DS4_DQL_SNAP=1 且盘余>载荷×1.5 时
+    # 硬链克隆 layers → layers_snap(同卷零拷贝); merge consume 后快照仍持字节 →
+    # 终端反修类实验可从快照分叉, 永不再全重跑。盘紧自动跳过(consume 空间账依赖 unlink)。
+    if [ "${DS4_DQL_SNAP:-0}" = 1 ]; then
+        SNKB=$(du -sk "$LDIR" | awk '{print $1}'); SFREE=$(df -k / | tail -1 | awk '{print $4}')
+        if [ "$SFREE" -gt $(( SNKB + SNKB/2 )) ]; then
+            rm -rf "$LDIR/../layers_snap"; cp -al "$LDIR" "$LDIR/../layers_snap" \
+                && echo "[M4.4] dql 快照 → layers_snap (硬链, 反修分叉用)" >&2
+        else
+            echo "[M4.4] 盘紧(余$((SFREE/1048576))G) → 跳过 dql 快照(consume 需 unlink 释放)" >&2
+        fi
+    fi
+    echo "【全模型】脚本 算法=判决停点 进度=完成(不合并) 体积=- 还原度=见上VERDICT 研判=DS4_SKIP_MERGE=1: dql/opt 全留存, 裁决后手动 merge(交接铁律: 新模型行为门过前不删前代)" >&2
+    exit 0
+fi
 # ---------- M4.5 合并整文件(可选; 盘不够自动跳过 — 真正的合并产物是 M4.6 的 GGUF) ----------
 FULL="$ROOT/gguf/go-onebit/dql_full.bin"
 NEED_KB=$(du -sk "$LDIR" | awk '{print $1}'); FREE_KB=$(df -k / | tail -1 | awk '{print $4}')

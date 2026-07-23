@@ -2283,6 +2283,76 @@ bad:
  * (panic → 定位行 → 最小 Edit)。灵魂由数据定义, 引擎只供本注入机制。 */
 static char *g_soul_text;
 
+/* ★knowledge-primer (2026-07-23, DS4_KNOWLEDGE_FILE / --knowledge)★
+ * 知识环修复: 1-bit base 无据知识问答退化成复读/幻觉(g1/g4 面板实证); 前提探针证实
+ * "参考塞进上下文→正确内容浮现"(g1 带参考逐字复现负缓存+布隆), 但 base 续写把
+ * Reference/Question 当续写→抄或漂。解: 检索最相关参考块, 作 # Reference: 注入 header,
+ * 让 base-native 的 # Assistant: 续写锚落到"用参考答问"分布。纯 prompt 层, 零模型/零体积。
+ * 文件格式: 参考块以 "---" 单行分隔; 检索=末条 user 消息的词重叠打分(浅 BM25 类)。 */
+static char **g_knowledge_blocks;
+static int g_knowledge_n;
+
+static void knowledge_load(const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) { fprintf(stderr, "ds4-server: --knowledge: 打不开 %s\n", path); return; }
+    fseek(fp, 0, SEEK_END); long sz = ftell(fp); fseek(fp, 0, SEEK_SET);
+    if (sz <= 0) { fclose(fp); return; }
+    char *all = xmalloc((size_t)sz + 1);
+    if (fread(all, 1, (size_t)sz, fp) != (size_t)sz) { free(all); fclose(fp); return; }
+    all[sz] = '\0'; fclose(fp);
+    /* split on lines that are exactly "---" */
+    char *p = all;
+    while (p && *p) {
+        char *sep = strstr(p, "\n---\n");
+        char *blk;
+        if (sep) { *sep = '\0'; blk = p; p = sep + 5; }
+        else { blk = p; p = NULL; }
+        while (*blk == '\n' || *blk == ' ') blk++;
+        if (*blk) {
+            g_knowledge_blocks = xrealloc(g_knowledge_blocks,
+                                          (size_t)(g_knowledge_n + 1) * sizeof(char *));
+            g_knowledge_blocks[g_knowledge_n++] = xstrdup(blk);
+        }
+    }
+    free(all);
+    fprintf(stderr, "ds4-server: knowledge-primer 载入 %d 参考块 (%s)\n", g_knowledge_n, path);
+}
+
+/* word-overlap 打分: query 的每个 ≥4 字符词在 block 里出现即 +1 (大小写不敏感的粗匹配)。
+ * 返回最佳块指针 (NULL=无库或零重叠, 不注入以免噪声)。 */
+static const char *knowledge_retrieve(const char *query) {
+    if (g_knowledge_n == 0 || !query || !query[0]) return NULL;
+    int best = -1, best_score = 0;
+    size_t qn = strlen(query);
+    for (int k = 0; k < g_knowledge_n; k++) {
+        const char *blk = g_knowledge_blocks[k];
+        int score = 0;
+        size_t i = 0;
+        while (i < qn) {
+            while (i < qn && !isalnum((unsigned char)query[i])) i++;
+            size_t j = i;
+            while (j < qn && isalnum((unsigned char)query[j])) j++;
+            if (j - i >= 3) {   /* ≥3: 让 "vet"/"sql" 等短判别词命中(2026-07-23 g4 miss 修复) */
+                char word[64];
+                size_t wl = j - i < 63 ? j - i : 63;
+                for (size_t w = 0; w < wl; w++) word[w] = (char)tolower((unsigned char)query[i + w]);
+                word[wl] = '\0';
+                /* 大小写不敏感子串搜 (block 通常短, 线性可接受) */
+                for (const char *s = blk; *s; s++) {
+                    if (tolower((unsigned char)*s) == word[0]) {
+                        size_t m = 0;
+                        while (word[m] && tolower((unsigned char)s[m]) == word[m]) m++;
+                        if (!word[m]) { score++; break; }
+                    }
+                }
+            }
+            i = j;
+        }
+        if (score > best_score) { best_score = score; best = k; }
+    }
+    return (best >= 0 && best_score >= 1) ? g_knowledge_blocks[best] : NULL;  /* score≥1: ≥3字符判别词一命中即注入(g4 "vet" 修复); 误注入参考害<代码框失败 */
+}
+
 static void append_tools_prompt_text(buf *b, const char *tool_schemas) {
     if (!tool_schemas || !tool_schemas[0]) return;
     buf_puts(b,
@@ -2589,7 +2659,24 @@ static char *render_chat_prompt_base_native(const chat_msgs *msgs, const char *t
         buf_puts(&out, m->content ? m->content : "");
         buf_puts(&out, "\n\n");
     }
-    if (conv_off) *conv_off = out.len;   /* header(tools+soul+system)止于此 */
+    /* knowledge-primer: 用末条 user 消息检索最相关参考块, 注入 header (system 后、
+     * 对话前 → KV 前缀友好且落在续写锚上游)。命中零重叠不注入(避免噪声)。 */
+    bool knowledge_hit = false;
+    /* 知识注入只在纯问答(无工具)时开: agent 任务有自身上下文不需百科参考, 且
+     * tools+soul+knowledge 三层叠大 prompt 会触内存压力安全中止(2026-07-23 g2 实证)。 */
+    if (g_knowledge_n > 0 && !(tool_schemas && tool_schemas[0])) {
+        const char *last_user = NULL;
+        for (int i = msgs->len - 1; i >= 0; i--)
+            if (!strcmp(msgs->v[i].role, "user")) { last_user = msgs->v[i].content; break; }
+        const char *ref = knowledge_retrieve(last_user);
+        if (ref) {
+            buf_puts(&out, "# Reference (use this to answer accurately):\n");
+            buf_puts(&out, ref);
+            buf_puts(&out, "\n\n");
+            knowledge_hit = true;
+        }
+    }
+    if (conv_off) *conv_off = out.len;   /* header(tools+soul+system+knowledge)止于此 */
     for (int i = 0; i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         if (role_is_system(m->role)) continue;
@@ -2615,7 +2702,15 @@ static char *render_chat_prompt_base_native(const chat_msgs *msgs, const char *t
          * 结构 token, 模型只填值) —— 1-bit 下 DSML 特殊 token 会被采成汉字, 结构必须
          * 由 server 强制。无 tools 时默认代码块锚(把 base 的"评论惯性"钉进干活分布)。 */
         const char *anchor = getenv("DS4_BASE_NATIVE_ANCHOR");
-        if (!anchor) anchor = (tool_schemas && tool_schemas[0]) ? "" : "```go\n";
+        /* knowledge 命中 → 散文答问锚(不是代码块): 否则 ```go 锚把知识问答顶进
+         * `func xxx(){ // 抄参考 }` 代码框(2026-07-23 g1 实证)。参考已在 header,
+         * 这里只给"用参考直接答"的散文起手, 让续写落到答案分布而非代码分布。 */
+        if (!anchor) {
+            /* knowledge 命中→答问脚手架(不是空锚: 空锚下 base 会回显问题,
+             * singleflight/read 实证; 引导词把续写钉进"陈述答案"分布)。 */
+            if (knowledge_hit) anchor = "Based on the reference: ";
+            else anchor = (tool_schemas && tool_schemas[0]) ? "" : "```go\n";
+        }
         buf_puts(&out, anchor);
     }
     return buf_take(&out);
@@ -8157,6 +8252,14 @@ struct server {
      * tool-call opener so a base/continuation model lands inside the format
      * and only has to continue it. */
     bool tool_primer;
+    /* 同调用禁重契约(2026-07-22): 上一次发出的工具调用 (工具名, 参数名, 值字节)。
+     * 多轮回路实证失败形态 = 消化 tool_result 后逐字节重发同一调用(复读吸引子);
+     * 值区闭合时与上一调用同名同参数同值 → 拒闭合走分歧(new≠old 契约同族)。
+     * 跟 session 生命周期走(跨请求保持), DS4_PRIMER_SAMECALL_OK=1 关闭契约。 */
+    char *prev_call_tool;
+    char *prev_call_param;
+    char *prev_call_val;
+    size_t prev_call_len;
     kv_disk_cache kv;
     tool_memory tool_mem;
     live_tool_state responses_live;
@@ -11345,16 +11448,35 @@ guided_primer:
                 const size_t val_start = text.len;
                 /* new!=old 契约只武装 new_string, 且仅当同一调用先产出了 old_string */
                 const bool arm_neq = !strcmp(pn, "new_string") && edit_old_val != NULL;
+                /* ★同调用禁重契约(2026-07-22)★: 上一调用同工具同参数的值字节在案时武装 —
+                 * 闭合时值逐字节等于上一调用 → 拒闭合走分歧(多轮回路实证失败形态:
+                 * 消化 tool_result 后原样重发同一命令)。neq 契约优先(同为闭合检查通道)。 */
+                const bool arm_same = !arm_neq && !getenv("DS4_PRIMER_SAMECALL_OK") &&
+                                      s->prev_call_tool && ts->name &&
+                                      !strcmp(s->prev_call_tool, ts->name) &&
+                                      s->prev_call_param && !strcmp(s->prev_call_param, pn) &&
+                                      s->prev_call_val && s->prev_call_len > 0;
                 PRIMER_GEN_COPY_C(&pc, multiline ? "" : "\n<", par_close_tok, hard,
                                   multiline ? 384 : 96,
-                                  arm_neq ? edit_old_val : NULL,
-                                  arm_neq ? edit_old_len : 0);
+                                  arm_neq ? edit_old_val : (arm_same ? s->prev_call_val : NULL),
+                                  arm_neq ? edit_old_len : (arm_same ? s->prev_call_len : 0));
                 if (gok && !strcmp(pn, "old_string") && text.len > val_start) {
                     free(edit_old_val);
                     edit_old_len = text.len - val_start;
                     edit_old_val = xmalloc(edit_old_len + 1);
                     memcpy(edit_old_val, text.ptr + val_start, edit_old_len);
                     edit_old_val[edit_old_len] = '\0';
+                }
+                /* 同调用禁重: 每个完成的参数值滚动暂存(跨请求, 跟 session 走);
+                 * 单参工具(Bash.command)即主值, 多参工具落到最后一个必填参数。 */
+                if (gok && text.len > val_start) {
+                    free(s->prev_call_tool); free(s->prev_call_param); free(s->prev_call_val);
+                    s->prev_call_tool = xstrdup(ts->name ? ts->name : "");
+                    s->prev_call_param = xstrdup(pn);
+                    s->prev_call_len = text.len - val_start;
+                    s->prev_call_val = xmalloc(s->prev_call_len + 1);
+                    memcpy(s->prev_call_val, text.ptr + val_start, s->prev_call_len);
+                    s->prev_call_val[s->prev_call_len] = '\0';
                 }
                 PRIMER_CK("</｜DSML｜parameter>\n", "\n");
             }
@@ -12734,6 +12856,8 @@ static server_config parse_options(int argc, char **argv) {
             }
             g_soul_text[sn] = '\0';
             fclose(sf);
+        } else if (!strcmp(arg, "--knowledge")) {
+            knowledge_load(need_arg(&i, argc, argv, arg));   /* 知识环检索库 (--- 分块) */
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
             c.engine.n_threads = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--chdir")) {
@@ -12830,6 +12954,9 @@ int main(int argc, char **argv) {
     sigaction(SIGTERM, &sa, NULL);
 
     server_config cfg = parse_options(argc, argv);
+    /* DS4_KNOWLEDGE_FILE: 与 --knowledge 等价的 env 口 (svc.sh 集成用; 二者可叠加) */
+    if (g_knowledge_n == 0 && getenv("DS4_KNOWLEDGE_FILE"))
+        knowledge_load(getenv("DS4_KNOWLEDGE_FILE"));
     if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: failed to chdir to %s: %s",
                    cfg.chdir_path, strerror(errno));

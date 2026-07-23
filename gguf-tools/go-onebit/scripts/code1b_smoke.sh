@@ -8,6 +8,9 @@ set -euo pipefail
 cd "$(dirname "$0")/../../.."   # → repo 根(ds4 与 metal/*.metal 在此)
 MODEL="${MODEL:-gguf/go-onebit/ds4-code1b.gguf}"
 NPRED="${NPRED:-48}"; TIMEOUT_S="${TIMEOUT_S:-300}"; MAXMB="${MAXMB:-11776}"
+# RESID 口(2026-07-21): 与 pillar_probe.sh 同语义 — 显式空=裸, 非空=挂残差侧车。
+# 此前本脚本静默无视 RESID → "带残差"针实际跑裸腿且输出逐字节同裸(已踩)。
+if [ -n "${RESID:-}" ]; then export DS4_RESIDUAL="$RESID"; fi
 if [ -z "${PROMPT+x}" ]; then
   PROMPT=$(cat <<'PEOF'
 <｜begin▁of▁sentence｜>// twoSum returns the indices of the two numbers in nums that add up to target.
@@ -38,7 +41,9 @@ while kill -0 "$P" 2>/dev/null; do
     fi
     sleep 2
 done
-wait "$P" 2>/dev/null; RC=$? || true
+# ds4 被杀/非零退出时 wait 返回非零, set -e 会在此静默杀死本脚本(2026-07-21 单机面板
+# 3/15 无声死实证) → 显式吞状态
+RC=0; wait "$P" 2>/dev/null || RC=$?
 echo "===== 原始输出(逐字, 不判读) ====="
 cat "$OUT" 2>/dev/null || true
 echo ""

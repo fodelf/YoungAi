@@ -6,19 +6,32 @@
 # one host; the forward/solve stages that consume the corpus use the dual-host
 # pipeline as usual.
 #
-#   env: KEYWORD, TOP_REPOS=10, ISSUES_PER_REPO=50, MAX_REPO_MB=80, OUT=corpus/raw
+#   env: KEYWORD, LANG=go, TOP_REPOS=10, ISSUES_PER_REPO=50, MAX_REPO_MB=80, OUT=corpus/raw
 #   requires: gh auth login done once; git.
+# 2026-07-20 域放大: LANG env 泛化搜索语言(缺省 go 保持旧行为); 每语言默认扩展名表。
 import json, os, subprocess, sys, pathlib, shutil
 
 KW = os.environ.get("KEYWORD", "go")
+LANG = os.environ.get("LANG_Q", os.environ.get("LANG_SEARCH", "go"))
 TOP = int(os.environ.get("TOP_REPOS", "10"))
 NISS = int(os.environ.get("ISSUES_PER_REPO", "50"))
 MAXMB = int(os.environ.get("MAX_REPO_MB", "80"))
 OUT = pathlib.Path(os.environ.get("OUT", "corpus/raw")) / KW
 OUT.mkdir(parents=True, exist_ok=True)
 
+LANG_EXTS = {  # 每语言默认源扩展名(md 一律带上: README/设计文档是散文支柱原料)
+    "go": {".go", ".md", ".mod", ".sum"},
+    "python": {".py", ".md", ".toml"},
+    "javascript": {".js", ".mjs", ".cjs", ".md", ".json"},
+    "typescript": {".ts", ".tsx", ".md", ".json"},
+    "rust": {".rs", ".md", ".toml"},
+    "c": {".c", ".h", ".md"},
+    "java": {".java", ".md", ".gradle"},
+    "shell": {".sh", ".bash", ".md"},
+}
 CODE_EXT = (set(os.environ["EXTS"].split(",")) if os.environ.get("EXTS")
-            else {".go", ".md", ".mod", ".sum"} if KW in ("go", "gin", "golang") else None)
+            else {".go", ".md", ".mod", ".sum"} if KW in ("go", "gin", "golang")
+            else LANG_EXTS.get(LANG))
 
 def sh(cmd):
     return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=600).stdout
@@ -30,7 +43,8 @@ HAVE_GH = shutil.which("gh") is not None
 
 # ---- top-N starred repos for the keyword -----------------------------------
 # REPOS=owner/name,owner/name 精确仓库列表覆盖搜索(支柱2 定点采集用)。
-q = f"language:go {KW}" if KW not in ("go", "golang") else "language:go stars:>10000"
+q = (f"language:{LANG} stars:>10000" if KW in ("go", "golang") or KW == LANG
+     else f"language:{LANG} {KW}")
 if os.environ.get("REPOS"):
     repos = [{"fullName": r, "stargazersCount": 0, "size": 0}
              for r in os.environ["REPOS"].split(",") if r]

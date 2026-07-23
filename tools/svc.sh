@@ -20,7 +20,7 @@ M1DIR=${M1DIR:-/Users/fodelf/ds4-main}
 DIR=${DIR:-/Users/fodelf/git/ds4-main}
 PORT=${PORT:-8013}
 DPORT=${DPORT:-5599}
-MODEL=${MODEL:-gguf/ds4-mono-mixed.gguf}
+MODEL=${MODEL:-gguf/go-onebit/ds4-code1b.gguf}   # 2026-07-22 主线=v3(编程全域基线)
 CTX=${CTX:-65536}
 CAP=${CAP:-512}
 # CORR=/abs/path/sidecar.gguf 挂 corr 侧车 (P2 后训练产物)。corr 校正的层跑在哪台,
@@ -28,7 +28,7 @@ CAP=${CAP:-512}
 # 侧车须先 scp 到 $M1DIR/$(basename)。
 CORR=${CORR:-}
 # SOUL=行为示例文件 (P3, 默认修复灵魂; 空串禁用)。只 server 侧 (prompt 渲染)。
-SOUL=${SOUL-gguf-tools/go-onebit/corpus/soul/repair_v1.txt}
+SOUL=${SOUL-gguf-tools/go-onebit/corpus/soul/soul_server_v3.txt}
 # EXPERT_PREAD + PREFETCH_AHEAD: 历史实测"赢家 2.2×"(fable5 L297, 位精确输出逐字节不变) —
 # 单拷贝 direct pread 替代 mmap+memcpy + 跨层 router 预测预取。EVENT_DRAIN: MTLSharedEvent
 # 快路径主机等待(Anukari 先例, 去 per-CB 调度开销)。这些是本日基线 1.18 缺失的 IO 杠杆。
@@ -36,12 +36,16 @@ ENVSTR="DS4_DIST_REVERSE_CONNECT=1 DS4_METAL_EXPERT_OFFLOAD=1 DS4_METAL_EXPERT_P
 # ↑ 批注入+小自由区(2026-07-16 CC 攻3 A/B 胜: 引导轮 15min→5min; 心跳 PRIMER_KA 已在 server 内建)
 # RESID=相对路径的热专家残差侧车(2026-07-14 方向A): 走 DS4_RESIDUAL, 两端都要(各自持有的层
 # 才用得上自己那部分)。侧车须已 scp 到 $M1DIR/同名相对路径。空=不挂。
-RESID=${RESID:-}
+RESID=${RESID-gguf/sidecars/code-hot-res-prog.gguf}   # 显式空=裸; 默认挂 prog 残差(2026-07-23 换代, 旧 v3p 版已删)
 [ -n "$RESID" ] && ENVSTR="$ENVSTR DS4_RESIDUAL=$RESID"
 # BASE_NATIVE=1(默认开): go-onebit 是 BASE 底模, chat 角色帧会出符号汤 → 母语骨架渲染
 # (# User:/# Assistant: 注释体) + 默认 stop; 工具帧仍由 --tool-primer 强制。只 server 侧生效。
 BASE_NATIVE=${BASE_NATIVE:-1}
 [ "$BASE_NATIVE" != 0 ] && ENVSTR="$ENVSTR DS4_BASE_NATIVE=$BASE_NATIVE"
+# KNOWLEDGE=知识环检索库(2026-07-23): server 端 knowledge-primer 参考注入, 治无据知识问答
+# 复读/幻觉(g1/g4/singleflight/read/commit 5针 A/B 全过)。纯 prompt 零模型零体积。默认挂。
+KNOWLEDGE=${KNOWLEDGE-gguf-tools/go-onebit/corpus/knowledge.txt}
+[ -n "$KNOWLEDGE" ] && ENVSTR="$ENVSTR DS4_KNOWLEDGE_FILE=$KNOWLEDGE"
 # 值区置信门控(2026-07-14): 自由 argmax 概率 ≥p 时放行自由构造, 否则 copy 约束防占位符。
 # 【negative result】实测模型的自由生成本身就是占位符($PARAMETER_VALUE), 对占位符反而"有把握"
 # → 门控放行的恰恰是垃圾。生产不设(纯 copy)。
@@ -84,8 +88,12 @@ if [ -n "$PINRAM" ]; then
   CPINRAM="DS4_EXPERT_PIN_FILE=$PIN_COORD $PINRAM_COMMON"
   WPINRAM="DS4_EXPERT_PIN_FILE=$PIN_WORKER $PINRAM_COMMON"
 fi
+# NOGE=1: 跳过 zchain GE 表(2026-07-21 四腿 A/B: GE 对 Go 针实测伤害; C 配置=残差+NO_GE
+# 为最优腿)。两端都要(各自持有层的 zchain 各自装载)。值语义已修(空串/0=不跳过)。
+[ -n "${NOGE:-}" ] && ENVSTR="$ENVSTR DS4_ZCHAIN_NO_GE=1"
 # CS_CAP=copy-spec 批长上限 (探针实测 verify 行成本≈整次 forward, 长批净亏; 4-8 是
 # 甜点)。PIPE_CHUNK=verify 批双机行分块流水 (已落地 wave69, 默认关)。都只 server 侧。
+CS_CAP=${CS_CAP-6}; PIPE_CHUNK=${PIPE_CHUNK-2}   # 冠军默认(07-18 归因表 +34%/+63%); 显式空=关
 [ -n "${CS_CAP:-}" ] && ENVSTR="$ENVSTR DS4_DIST_CS_LEN_CAP=$CS_CAP"
 [ -n "${PIPE_CHUNK:-}" ] && ENVSTR="$ENVSTR DS4_DIST_PIPE_CHUNK=$PIPE_CHUNK"
 # PROFILE=1: 每 forward 打 t_local/t_remote_blocked + 每 MoE 层 IO 拆解 (已落地观测)

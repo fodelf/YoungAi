@@ -6,7 +6,7 @@
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd); ROOT=$(cd "$HERE/../../.." && pwd)
 M1=192.168.1.2; M1DIR=/Users/fodelf/ds4-main; DPORT=5599
-MODEL=gguf/ds4-mono-mixed.gguf
+MODEL=${MODEL:-gguf/ds4-mono-mixed.gguf}   # 2026-07-21: env 可覆盖(v2 捕获用)
 ENVSTR="DS4_DIST_REVERSE_CONNECT=1 DS4_METAL_EXPERT_OFFLOAD=1 DS4_METAL_PREFILL_CHUNK=2048 DS4_DIST_PREFILL_CAP=2048 DS4_METAL_EXPERT_GATHER_THREADS=8 DS4_METAL_NO_MODEL_WARMUP=1 DS4_MEM_BUDGET_MB=12000 DS4_METAL_EXPERT_PREFETCH_AHEAD=0"
 # 校准 prompt: 默认 DSML seg0; PROMPT_FILE 可覆盖 (代码域校准用 gocode_calib.txt)
 PROMPT_FILE=${PROMPT_FILE:-$ROOT/cap_dsml/seg0.txt}

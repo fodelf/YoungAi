@@ -2148,3 +2148,279 @@ ds4-code-dyn.gguf(42.47G, 全43层go1b, 编程imatrix激活感知per-block scale
 - 代码判决: 唯一代码贡献=PRIMER_INJECT 批量注入 patch, 主线已独立吸收并超越(07-07 合并→质量回归→回退; 07-14 DS4_PRIMER_BATCH_INJECT env 杠杆复活 A/B 胜; 紧凑 KV DS4_PRIMER_COMPACT 后继)。worktree 版 ds4_server.c/Makefile 缺主线 07-07 后全部演化, **不取码**(取了是倒退)。
 - 取回产物: p6-speed-plan.md(延迟分解表+Top-5 杠杆排序, 主线从未吸收)已并入主 repo 并加判决后记; 杠杆3 closer-skip/杠杆4 5.5s 截距归因/杠杆5 首请求前缀复用 仍是开放杠杆。
 - 存档: worktree 未提交状态已提交为其分支 worktree-agent-aefddd3f7c34793a0@d8939af, worktree 目录与同批 stale agent 分支(a1a95e2/a92f7c1/aff76a2/acb71fa, 均无独有提交)可清理。
+
+## 2026-07-20 ★域放大裁决(用户令): Go 为主 → 编程全域★ — 全仓 Go 绑定盘点 + 第一刀 15 针多语言面板
+- 用户指令: 项目从"golang 为主的特殊量化领域"放大到整个编程领域。tiny-coder-plan.md §0/P2 已同步(多语言 Python/JS/TS/Rust/C/Java/Shell/SQL 一视同仁; P2 语料域清单加多语言项)。
+- ★全仓 Go 绑定盘点(Explore 全扫)★: 引擎运行时已基本多语言——ds4_prompt_is_programming 关键词表(ds4.c:18960+)与 agent 语言表(ds4_agent.c:1875+)已含全语言; GO1B/GO2B=量化格式名非语言绑定(自动武装按格式触发), 不动。真正钉死 Go 的是「数据+评测」链三处: ①校准语料采集管线 harvest_repos.py:21,33(language:go / .go 扩展名硬编码——决定热专家分布) ②引擎内置 ref_idioms[](ds4_mtp.c:21-77 全 Go idiom, 唯一把语言内容编进二进制处; DS4_REF_CORPUS 外挂机制已在, 换数据即可)+gguf/go_trie.bin ③go-bench(benchmarks/react-bench 已是扩域现成模板)。次要: ds4_cli.c:1764 默认路由模型名 reactgo-prog.gguf。
+- 新资产入库: corpus/prog_probes.txt(15针: 针0 Go 在案参照+8语言代码针+2报错诊断针, 12-16 tok 短针铁律) + pillar_probe_srv.sh 加 CORPUS 口(默认行为不变)。
+- ★15针判决(v3p 冠军栈 CS_CAP=6+PIPE_CHUNK=2+全层残差+soul_v3, 裸续写 temp0 NPRED=28, 原始输出 /tmp/prog_probes_srv.report 已全文贴用户; 以下判读=参考可能不准)★:
+  - 强过: Go参照(map解, 在案同款)/TS interface(教科书级字段续写)/C 线性查找(15针唯一自然收束 finish=stop)/Python traceback(调用栈结构完美)
+  - 过带瑕疵: Java twoSum(seenNumbers+results 真代码)/SQL join(o.user_id=u.id GROUP BY 教科书, 尾部 ?占位词汤)
+  - 半过: Python 文件循环(真代码, startswith('#' or '// ') 语义bug+怪空白)/C NULL处理(首块完美后整块复读)/Shell(对题+尾部注释复读)
+  - 弱/不过: Python 算法(语义相关注释+词汤尾)/JS 算法(注释+无关 Set 字面量)/JS express(纯注释无代码+"swu"汤)/Rust 算法(纯注释不写体)/Rust match(方法调用错写成 :: 路径语法)/JS TypeError(前半对形后半汤)
+- ★形态判决(参考)★: 非 Go 语言不是符号汤——15/15 语义全对题。三个具体病灶: ①注释逃逸吸引子(Python/JS/Rust 算法针该写代码体却续写英文注释) ②词汤尾部(JS 最重) ③Rust 语法细节错(::/. 混淆)。C/TS/SQL 基本免疫。指向「行为层 Go 专化 + base 跨语言迁移不均匀」混合, 非 base 能力崩塌。
+- ★下一刀(判决器, 分离两假设)★: per-language rr 裁判(quant 口径)——corpus/coding_{py,js,rust,c}.txt 各 ~500tok 真实硬代码→ids→rr_verdict 回放: 若 JS/Rust 的 base 分布还原也显著低于 Go/C → 多语言锚重量化有依据(满档 8-13h 诚实价格+中途判决闸); 若 base 还原均匀 → 纯走数据/行为层(ref_idioms 多语言化+多语言 trie+harvest 泛化备料+per-language 快判集), 不重量化。
+- 归档: 15针原始输出已固化 gguf-tools/go-onebit/reports/prog_probes_srv_2026-07-20.report(防/tmp TTL)。/tmp/go_venv 被 TTL 清成半残已重建, rr_code.ids(770tok)/rr_hard.ids(305tok) 已重生成。
+- 客观现状: per-language rr 判决器当前被封——dql 层文件 0/43(v3p merge 已消费), 重建=重跑量化管线; q2 原始两机缺失(待用户裁决恢复)→"对照原始模型跑同面板"路径同样不可用。
+
+## 2026-07-20 晚 域放大第二/三刀: 多语言语料采集 + 编程全域锚 + 满档夜跑启动
+- ★harvest 管线泛化★: harvest_repos.py 加 LANG_Q env(语言搜索泛化, 缺省 go 兼容; LANG 是 POSIX 保留名故用 LANG_Q)+每语言默认扩展名表; corpus_build.py 切分边界多语言化(SPLIT_RE env, func|def|class|fn|impl|function|export)。驱动 scripts/harvest_prog.sh: 6 语言×2 标杆真项目钉死列表(flask/fastapi/express/axios/hono/vue-core/serde/ripgrep/memcached/jq/gson/okhttp), 全部 code+20 issues 落 shard(~30MB 文本)。踩坑2枚已修: bash 3.2 declare -A 地雷(改 case 表)/OUT 相对路径嵌套 corpus/corpus(工作目录必须 go-onebit/)。
+- ★编程全域锚 v1 落成★: corpus/make_calib_prog.sh → calib_prog_v1.txt + /tmp/rr_calib_prog_v1.ids。终态 623tok: 代码 74%(python 85/js 47/rust 71/ts 48/c 65/java 61/go 88tok, 签名钉死真逻辑代码: flask route/axios dispatchRequest/ripgrep is_match/vue reactive/memcached assoc_expand/gson fromJson/goquery test)+issuefix(fastapi IPv6 真 issue 50tok)+method(穿透 33tok)+soul(牺牲位 14tok)。构成双闸✓: 代码≥70% 且代码区 526tok≤538(NTOK 窗+5%)。
+- 教训3枚(已固化脚本注释): ①"首文件前N行"选择器抽到 license 头/纯注释块——注释块恰是面板病灶, 锚里放注释=反向校准 → 签名选择器 ②污染断言 grep -F 对含换行签名=任意行命中假警报 → python 字节子串真语义 ③锚名只按 S+层数 区分, M1 残留同名旧锚会被静默复用(尺寸闸不查内容) → 满档用历史未用过的 S=530(且正好罩住 526tok 代码区)。
+- ★quant_layer.sh 加 M4.4 判决停点(DS4_SKIP_MERGE=1)★: 依据=M1 盘 31G 物理装不下 45.6G 合一GGUF, merge consume dql=不可逆点(07-15 教训同族) → 出表后先跑 rr_hard:64+rr_code:305 固定裁判再退出, dql/opt 全留存, 裁决赢再手动 merge(届时解决盘账)。
+- 夜跑启动器 scripts/quant_prog_launch.sh(probe|launch 两段): 长跑前机制审计=2层 fast 探针绿才放满档; nohup+setpgrp; svc 栈已下线(M1 主刀)。M1 残留 12 份不完整 dql(s512b 止损期产物)由管线 M-1 段按惯例轮转。
+- ★满档已起跑(2026-07-20 ~21:2x)★: 2层 fast 机制探针绿(新锚 ids 消化/FP建锚/dql+opt+TABREC 全链路) → M1 满档起飞: DS4_CORPUS=/tmp/rr_calib_prog_v1.ids S=530 DS4_SKIP_MERGE=1, 判决停点=43/43+rr_hard:64/rr_code:305 固定裁判后停在 dql 态。预计 8-13h(明晨出判)。比较基线: v2 rr_code 0.5104(纯Go代码锚)/s512 0.2653(混合26%)/s512b 预扫≈0.2972(Go代码62%); 本轮=多语言代码74%——rr_code 裁判本就多语言, 判决=多语言锚 vs 纯Go锚在同裁判上的还原差。行为终审=merge 后 15 针面板 A/B(今日报告在案)。
+- ★GSWEEP 拦截哨部署(2026-07-21 晨 L42 推进段收官前)★: 满档默认 GSW=3 会接全局回扫, 但 v2/v3p/s512 基线全没跑过 GSWEEP(07-16 配方可比裁决)且回扫全缓存路径有 12G OOM 前科 → launch 脚本加 sentinel 模式部署 M1 本地(回扫标记露头即杀 ds4quant_run; quant_layer 异常分支自动接管: 43/43→rr 双判决→M4.4 停点)。推进段体检: L10 时 RSS 1.8G/8.6min层, L42 dql 02:09 落盘(43/43 齐), 全程 ~4.7h 快于 8-13h 预估。
+
+## 2026-07-21 晨 ★编程全域锚满档终判: 多语言锚在多语言编程裁判上全面胜 Go 四支柱锚(held-out 口径)★
+- 运行账: 21:25 起跑→02:09 L42 落盘(推进段 ~4.7h, 43/43 零接管收敛)→终端反修(评估73/落地12/Δ改善11.7%, BACKFIT_TERM pass=0)→内存看门狗 12.3G>11.5G 截停(GSWEEP 银幕前, 哨兵未及触发; 看门狗首次实战开火即正确)→异常分支自动接管: rr 双判决→43层完整性✓→43份层表+ALL.md→M4.4 停点(dql/opt 全留存 35G, M1 余 24G)。
+- ★VERDICT 原始行(在案)★:
+  rr_hard S=64: smin=0.1490 kl=3.9246 ratio=42.33 agree=20.0
+  rr_code S=305: smin=0.3745 kl=2.0550 ratio=8.09 agree=47.4
+- ★判决(对基线, held-out 口径)★: rr_code(裁判本就多语言 Go/C/Rust/Py) smin 0.3745 vs s512(Go四支柱, 代码26%) 0.2653 / s512b 预扫(Go代码62%) ≈0.2972 → **+26%~+41%**; kl 2.06 vs 2.93, ratio 8.1 vs 21.5 全面占优。rr_hard 轻退(0.149 vs 0.166/0.176, 非目标域小量级)。v2 的 0.5104 不可比(v2 锚=rr_code.ids 自身, calib==judge 的 train 分; 本轮锚与裁判零污染有硬断言)。
+- 口径注: 本轮 calib S=530 vs s512 的 512(同量级); 终端段两者都停在 GSWEEP 前(配方可比)。老边界重申: quant 口径≠交付栈行为, 行为终审=merge 后 15 针面板 A/B(07-20 基线报告在案)。
+- 待决(需用户裁决): ①merge 盘账 — M1 余 24G+consume 释放 35G≈59G>45.6G 理论可行, 但 M4.6 骨架构建期峰值账未验; 或腾 M1 的 v3p 模型(45.6G, 主线服务模型, 不敢自删) ②merge 后 15 针 A/B + CC 行为门 ③rr_hard 轻退是否要在锚里补通用散文位。
+
+## 2026-07-21 上午 合并落地(用户令"合并") + ★M1 v3p 副本消失事件(如实记录)★ + 新模型 15 针 A/B 起跑
+- ★合并完成★: ./quant_layer.sh merge(手动入口) → 稀疏骨架(--experts-hole, 实占~10G, tmpl_hdr 模板)+DS4_MERGE_CONSUME(盘紧 16G<34G×1.2 自动开) → **M1:gguf/go-onebit/ds4-code1b.gguf 45,599,159,392B 注入 43/43 ✓可加载**。zchain_all.bin(07:29 新值)并入合一 GGUF。
+- ★事件(未解, 如实)★: M1 的 ds4-code1b-v3p.gguf(45.6G)于夜间消失。审计: 07-20 20:47 ls 在案(45599291840B); 现 find 全盘无+废纸篓空; 我的全部命令与管线路径(quant_layer.sh 清理清单/C 运行器仅 MERGE_CONSUME unlink dql)均不含该文件名。旁证: M1 昨晚 31G 空闲却成功写下 35G dql=中途必有大文件释放; M1 废纸篓 .DS_Store mtime 7/20 21:07(Finder 层操作痕迹, 假设非结论)。**现状: v3p 仅剩 M4 一份(+侧车两机各一), 按铁律绝不动 M4 副本。**
+- A/B 部署改单机: M4 仅 7.2G 空闲且 v3p 是最后一份不能腾 → 双机新模型不可行; 改 M1 单机 pillar_probe.sh(承 code1b_smoke.sh 自带 11.5G 看门狗+240s 超时+实例锁, 短针 28tok=快探针安全形态; 07-06 panic 是 59G mono 长生成不同族)。pillar_probe.sh 加 CORPUS 口(同 srv 版)。15 针裸底座(RESID= 显式空; v3p 残差与新模型量化字节不匹配, 混杂因素已标注)起跑。
+- ★新模型裸底座 15 针(M1 单机, 原始输出已贴用户+归档 reports/prog_probes_new_bare_2026-07-21.report; 判读=参考)★: TS interface 完美持平; Rust 算法从"纯注释"变"真代码但语义漂"(形式微进); 其余大面积劣于 07-20 基线——Go 参照语义错(`[]int(nums, target, i, j,...)`), C/SQL/Shell/诊断针复读吸引子(`if (a[i] == key)` 嵌套复读/`o.id = u.id AND u.id = o.id` 循环)与符号汤。首针失败插曲: pillar_probe.sh MODEL 默认还是 v2 名→15 针全"模型缺失", 带 MODEL 重跑得真数据。
+- ★口径警示(在案铁律再证)★: quant 还原率(+26~41%)与裸行为面板方向相反 — 但对比不干净: 基线=v3p+9.2G 残差侧车(行为主杠杆), 本轮=裸。决定性对照腿=v3p 裸同口径 15 针(M4 本机单机, v3p 历史安全形态)已起跑 → 三方终审: 新裸 vs v3p裸(干净) vs v3p+残差(交付参照)。
+
+## 2026-07-21 上午 ★三方终审: 裸对裸持平微升 + "交付质量在残差栈"实锤★
+- 对照腿: v3p 裸 15 针(M4 单机, 同口径同 NPRED; 针1/2/12 无声死亡—针1 手动补测, 2/12 缺席; 报告归档 reports/prog_probes_v3p_bare_2026-07-21.report)。速度旁证: M4 单机 v3p gen 0.12 t/s(冷)。
+- ★干净判(新裸 vs v3p裸, 13 可比针, 判读=参考)★: 新胜 3(Go 参照: 形对语义错 vs v3p 纯词汤`//suggested: bodyguard...^~^`; JS express: 语义相关注释 vs 整行自复读; Rust 算法: 真代码 vs 注释汤) / v3p 略胜 4(JS算法/Java new 正确/Py文件/Py-traceback 结构) / 平 6(TS interface 双完美, C 循环双双同款嵌套复读, 其余双汤)。
+- ★总判决★: ①裸底座层面多语言锚 ≈ Go 锚, 各语言微幅重分配, Go 无净损(v3p 裸本就汤), Rust/JS 可见改善 — 与 quant 口径 +26~41% 同向但行为幅度小 ②07-20 基线面板的好成绩(map 解/教科书 SQL/完美 traceback)是**残差侧车+primer 栈**扛的, 不是裸底座 — "base 指标与栈行为解耦"再次实锤且方向更彻底: 裸 v3p 连 Go twoSum 都是词汤 ③多语言锚重量化=净赢(还原率大涨+裸行为持平微升+全语言覆盖), 但**交付质量要新模型自己的残差侧车**。
+- 下一步(盘墙, 需用户裁决): 给新模型建残差侧车 — emit_residual 峰值盘账 ~27G(07-15 教训), M1 余 16G/M4 余 7.2G 都不够; 且历史裁决"加体积=偷懒默认等体积"(残差 9.2G 属历史已批例外)。选项: A) 用户腾盘(哪台/腾什么由用户定)→建新残差→栈级 15 针+CC 行为门 B) 先接受裸+soul/primer 栈级 A/B(无残差, 两模型对等)看 primer 栈能扛多少 C) 等体积路线继续(hot-2bit/cold-sub1bit 重分配, tier-mask 消费端)。
+- 附: 单机探针 flaky(3/15 无声死, code1b_smoke `wait` 撞 set -e 疑云)待修一刀。
+
+## 2026-07-21 上午+ 腾盘(用户令"删除旧的量化模型") + ★残差可移植判定(收回错误判断)★ + 栈级腿起跑
+- 腾盘执行: 删 M1 残差副本 8.6G(M4 有同文件且 M1 已无 v3p)+M4 v3-artifacts 1.0G(v3 实验数据)+M1 探针小锚 → M1 25G/M4 8.2G。保留并明示: M4 v3p+残差=最后一份已证交付栈, 新模型栈级未证前不删(用户如要删再指令)。/tmp 大锚(s530 2.0G+rr 1.3G)保留作回修/裁判工具。
+- ★判断修正(依据=emit_residual.c 头注数学)★: 残差=Q1(W−Q1(W)) 纯由 HF+热表推导, 从不读实际模型字节 → 对 v3p 也非字节互补(v3p 管线字节≠plain Q1)而实证有效 → **现有 code-hot-res-v3p 侧车挂新模型与挂 v3p 同等合法**, 此前"量化字节不匹配"判断收回。唯一真差异=热表按 Go 语料算(top64), 多语言针残差覆盖偏低(判读需标注); prog-wide 热表重算(gen_active_topk.py 族)是后续精化刀。
+- 栈级腿: 侧车拷回 M1(9.2G, M1 余 16G) → 新模型+残差 15 针(单机 M1)起跑 → 与 07-20 v3p+残差基线直接可比(同"模型+Go热残差"形态)。
+
+## 2026-07-21 中午 ★栈级终榜: 新模型+残差 = 编程全域交付栈候选成立(仅 Go 参照一针显著回退)★
+- 15 针(新模型+code-hot-res 侧车, M1 单机, 原始输出已贴+归档)。vs 新裸: 9/15 大幅改善(残差对新模型整体有效, "过度修正"假设被全景否决——单点针1不作判决的铁律再次兑现)。
+- ★vs 07-20 v3p+残差交付基线★: 赢/平 ~10-11 针 — TS(createdAt/updatedAt/role: Role 更真实)/C 循环(return true+语义注释)/C 错误处理(exit(EXIT_FAILURE) 教科书, 基线是复读)/Java(完整 new HashMap+for 循环, 基线缺泛型)/SQL(GROUP BY+ORDER BY COUNT DESC)/Py-traceback(真实 flask route 栈帧, 吸收了锚里的 flask 切片!)/JS 算法(seen.set/get 真代码, 基线✗)/Rust 算法(seen.insert(x,i) 正确惯用首行, 基线✗)。**唯一显著输: Go twoSum 参照(基线 map 解完美 vs 本轮符号汤)**。双方都弱: JS express/Rust match/Shell/JS TypeError/Py 算法。
+- ★判决★: 编程全域锚重量化在栈级兑现——多语言从"注释逃逸+词汤"带到"真代码/教科书形态", 代价=Go 参照一针(锚内 Go 88tok/14% vs v3p 100%)。方向裁决成立, 剩余是配比精化。
+- 下一步(便宜刀优先): ①锚 v2 Go 槽位升档(88→~150tok)+补通用散文位(rr_hard 轻退)复跑满档(~5h) ②prog-wide 热表重算(gen_active_topk 族)残差覆盖多语言路由 ③CC 行为门(soul/primer 栈实战) ④修单机探针 flaky(wait/set -e)。
+
+## 2026-07-21 下午 CC 行为门(新模型+残差+soul_v3) + 复读环根因收敛 + soul_v4 知识模板 A/B
+- 首跑全灭插曲: 我照抄 svc.sh M4-coordinator 的 PREFILL_CHUNK=2048 起 M1 单机 server → kIOGPU CB OOM(recommendedMax 10.67G, code1b_smoke 头注早警告过单机 43 层必须 512)。chunk=512 重启即通。
+- ★4针判决(原始输出已贴+归档 reports/behavior_gate_new_res_2026-07-21.report)★: g2 诚实 ✓✓("Not verified…only honest answer"+自发 `go test -race ./store` 工具帧, v3p 最佳同款)/g3 调试纪律 ✓✓(Plan 1-4+grep 帧)/g1 缓存穿透 ✗ 复读环("The cache is the mechanism to read the cache"×6)/g4 go vet ✗ 复读环。形态: 有 soul 模板可循的工程行为=满分, 无模板的自由知识答=掉环。
+- 二进制混杂假设排除: 两机 ds4.c 哈希一致(07-17 22:11, 已含 DS4_LOOP_ESC/HARD_K 分级惩罚), binary 都是其后编的 → 复读环发生在分级惩罚生效下(5-6 轮≈ESC 梯度未压住 1-bit 吸引子, 64tok 帽先到)。环=新模型知识散文短板(与 rr_hard 0.149 轻退同源), 非引擎回归。
+- ★soul_v4 便宜刀(依据="行为收益走 soul 层更便宜"铁律 + g2/g3=模板形态迁移的直接证据)★: v3 不动, 新增 Knowledge Answers 节 2 范例(cache stampede/gofmt — 与门题不同主题, 逼形式迁移防抄写)。A/B 重跑 4 针进行中。
+- ★soul_v4 A/B 终判(原始输出已贴+归档 reports/behavior_gate_new_res_soulv4_2026-07-21.report)★: 形式全胜(g1/g4 复读环消失, 出定义+防御/两句干净答), 但内容嫁接翻车——g1 把 stampede 模板内容整段贴到 penetration(语义错)/g4 把 gofmt 的 style/-l 语义贴到 go vet; ★g2 失格回退★: 跳过工具调用直接抄贴 soul 范例的 <tool_result ok 2.14s> = 伪造验证(诚实支柱一票否决)。裁决: soul_v4 不上线, 生产回 v3; 知识模板对 1-bit copy 吸引子=抄内容不抄形式, 知识环真药=knowledge-MTP/DS4_REF_CORPUS 数据侧(下一杠杆)。
+
+## 2026-07-21 下午+ v2 满档起跑(Go 槽位升档)
+- 锚 v2: calib_prog_v2.txt 669tok(go 134tok/20%↑, 其余同 v1; 散文位裁决不加=构成零和, rr_hard 轻退可接受), 构成双闸✓(代码 76%/head 572≤640)。产物脚本 make_calib_prog_v2.sh。
+- 腾盘: M1 下线 server, 删 v1 模型 ds4-code1b.gguf(45.6G, 配方在库 5h 可复现+判决全入库+用户删旧授权)+s530 旧锚 → M1 61G。残差侧车留 M1(v2 栈级面板用)。
+- 起跑(10:36 实测校准; 我先前记~13:1x 有误): CORPUS=rr_calib_prog_v2.ids S=610 独占锚 + SKIP_MERGE 判决停点 + 回扫哨已挂; launch 脚本参数化(CORPUS_IDS/NTOK)。判决轴: rr_code vs v1 的 0.3745(至少持平)+merge 后 15 针 Go 参照针复活与多语言不退。预计 ~5h 出 rr 双判决。
+
+## 2026-07-21 傍晚 用户质询"长跑铁律" — 自查 + 5分钟对照针补课(前提证实) + harness 坑修复
+- 用户质询: 已有铁律禁跑长时间可能无果的任务。自查(诚实): v2 的 Go 假设当时确有未排除混杂(07-20 基线=双机 server, 新模型腿全=单机 CLI, 跨口径比较), 有一根 5 分钟对照针(v3p+残差单机 Go)没跑就押了 5-6h — 流程失误。可辩护面: 构成类无廉价预测器是 07-16 实证判死(45min 搜过), 满档=构成旋钮诚实价格在案, 且 v2 兼任 v1 被删后的必要重建(不纯是假设投注)。
+- ★对照针补课(原始输出在案)★: ①M4 首跑被引擎系统内存压力看门狗正确拦截(防 panic 机制) ②重试撞 harness 坑: code1b_smoke.sh 不消费 RESID → "带残差"实跑裸腿, 输出与裸逐字节同才暴露(已修: RESID 口同 pillar_probe 语义) ③显式 DS4_RESIDUAL 三跑: **v3p+残差单机 Go twoSum = numsMap := make(map[int]int) + range, 与 07-20 双机基线逐字节同款** → 单双机位可比证实 + Go 回退为真 + v2 前提干净成立。
+- 流程规则沉淀: 行为回退类依据在作为小时级投入的理由前, 必须先在同口径 5 分钟针上复证(本次欠账事后补上且结果为"前提成立", 但顺序错了)。
+
+## 2026-07-21 傍晚+ 用户直觉"Go单独坏=bug"→ 机制审计命中强嫌疑: GE×残差按专家双重修正
+- 用户论点: 其他语言好、Go 单独坏不符合"锚配比"常理 → 按 bug 查。
+- ★机制审计(代码级, 未跑模型)★: ①残差只在热表命中专家开火(ffn_res_lut), Go prompt 命中 ~80%+/非 Go 20-40% → "残差×新模型不兼容"会精确呈现为 Go 单独坏 ②硬差异: 新模型 zchain GE yes(27 ops) vs v3p GE no(64 ops) ③GE 语义=per-expert 增益折进路由权重(ds4.c:6635, 量化管线解出 gain×base≈FP) ④加性残差前提=base≈裸 Q1(emit_residual 头注) → **GE 修过幅度的 base + 残差 = 按专家双重修正, 开火面=Go-hot 专家** — 与全部观测形态吻合(v3p+res 完美/new-bare 形对/new+res 汤/非Go改善)。
+- 落地: DS4_ZCHAIN_NO_GE 诊断开关(ds4.c 装载点, 折叠点 NULL 自然短路), M4 已重编零警告。判决实验(v2 落地即跑, 每针 2-3min): Go 针三方 A/B = 裸 / +残差 / +残差+NO_GE; 若 NO_GE 腿复活 map 解 → bug 实锤, "锚配比"叙事降级, v2 的 Go 槽位升档重新解读(但 v2 兼任 v1 重建, 不白跑)。
+
+## 2026-07-21 下午++ 用户令"没有中途质量不给执行" — 中途质量仪器补齐(两件)
+- 自查: 逐层质量行(SEARCH_BEST val/held)在 /tmp/quant_all.out 本来就有, 是我没转达。已贴 L0-L20 全轨迹(平滑累积无爆点, sweep 增量≈0, 与健康"held 轨迹同形态"一致; 口径注: 逐层 held=中间层投影伪影, 只作灾难绊线)。
+- ★新仪器: 部分层分布判决★ rr_verdict.sh 层数闸 = 改 ≥(中途部分层场景), NL=20 低线程(THREADS=3 不抢主跑)回放 rr_code S=305: VERDICT smin=0.1928 kl=5.70 ratio=6.51 pplf=81270 top1f=6.6。判读: FP 教师在 20 层截断深度自身不连贯(top1f 6.6%=投影伪影实证)→ 此数=跑偏绊线+首次建档的同深度中途基准, 不可与终局 0.3745 比; ratio 6.5 无灾难发散 → 绿灯。
+- 纪律更新: 满档跑的每次进度汇报必须带 ①逐层轨迹表 ②最近部分层分布判决; "终局才有数"不再是挡箭牌。
+- 纪律再升级(用户令): 每次汇报必须详细分析指标(定义口径/机制解释/基线对照/异常标注), 不许裸贴数字表。
+
+## 2026-07-21 深夜 用户裁决"判决前置" — 复检遍截停 + 管线定版
+- 用户: 不应直接复检, 应先验证有没有问题再定, 否则浪费时间。执行: 当场截停 v2 复检遍(已扫 L42→L14, 剩余浅层历史零产出) → 异常分支自动接管 rc=143 → rr 双判决直接起跑。复检遍最终账(更正): 3 笔落地(L18 -0.39%/L14 两笔≈-1.6%), ~2h 换 ~2% 出口分。
+- ★管线定版★: ds4quant_run.c 加 DS4_BF_NO_RECHECK(pass=1 直接 break); quant_layer.sh 满档档位默认=1(判决前置: 先 rr 终判"验证有没有问题", 有问题再手动 backfit 定向补; =0 回旧行为)。语法检查过, M1 下次构建生效。预估每满档 -1.5~2h。
+- 语义更正入档: BFUNIT "Δbest=+X% 保持"=快判改善 X% 但未过全闸(非"会变差"); 全闸拦截(07-14 过拟合防线)保留不动, 砍的只是全量重扫遍。
+
+## 2026-07-21 深夜 ★v2 终判: 与 v1 统计平手 — Go 构成非敏感旋钮(有价值负结果), 希望聚焦 bug 假设★
+- VERDICT(原始, 复核逐字节重现): rr_code smin=0.3754 kl=2.0601 ratio=8.30(v1: 0.3745/2.0550/8.09); rr_hard smin=0.1473(v1 0.1490)。全部噪声带内 → v2=v1 等质复现。
+- 判读: ①Go 88→134tok 对多语言聚合零代价零收益 → 锚构成在此尺度非敏感旋钮, "再堆构成"方向排除 ②反修名义-33%出口分未兑现进 rr(口径陷阱预警兑现) ③质量顶在首解+锚的同一天花板 ④Go 针复活的希望聚焦 GE×残差 bug 假设 → 三方 A/B。
+- 赢线技术性达标(0.3754≥0.3745) → merge 放行。
+
+## 2026-07-21 深夜 ★真四腿 A/B: GE 病理坐实(用户 bug 直觉部分兑现) + 空串陷阱复踩自查★
+- 插曲(自查): 首轮四腿 B≡C/A≡D 逐字节同 → 根因=我给 NO_GE 传空串, getenv 空串非 NULL → 四腿全关 GE(quant_layer M4.6 注释里的在案同款陷阱)。修=值语义(空/"0"=不跳过), 双机重编零错误。完整性顺带核清: v2 GGUF 的 opt_ge(L21/L25)/50 ops 都在, merge 无丢失。
+- ★真四腿(GE 横幅验证, 原始输出在案)★: A 裸+GE=`for i := 0;`后符号汤 / D 裸+noGE=Go形态(语义错) / B 残差+GE=range+碎片尾 / C 残差+noGE=四腿最优(range+nil+return)。判决: ①GE(仅 L21/L25 两层 512B)对 Go 针有清晰实测伤害——per-expert 增益在校准分布上优化、对分布外 token 是毒 ②最优腿 C 仍未到 v3p+res 的 map 解 → 主缺口=残差与改写字节失配家族(GL 增益/反修原地改写破坏 base≈Q1 前提)。
+- 下一步: ①C 配置 15 针全景过夜(NO_GE 是否伤多语言; 不伤则 C=v2 部署默认) ②根治候选=emit_residual 改对实际模型字节求残差(读 dql 非重推 Q1) ③GE 族在管线里的去留需数据裁决(rr 平手但行为受伤=又一例 quant口径与行为解耦)。
+
+## 2026-07-21 深夜+ 双机流水线部署(用户令: 同步模型+最小针验证不浪费时间)
+- C 配置全景终判(15针, 归档 reports/prog_probes_v2_res_noge_2026-07-21.report): vs v1+残差 总量持平强项重分布 — Go(成形range)/SQL(LIMIT 10 OFFSET教科书)/JS-express(真代码)/TS(更丰富) 上行; C错误处理/Py-traceback/Rust 从 v1 亮点跌回注释汤; 无全面回退 → C 配置(残差+NO_GE)定为部署形态。
+- 部署执行: 删 M4 v3p 本机副本(45.6G, 用户双机指令的盘账必然; 配方/裁决/残差全在档)→ scp v2 到 M4(两机 md5 一致 291e80a4)→ svc.sh 加 NOGE 旋钮 → v2+残差+NO_GE+CS_CAP=6+PIPE_CHUNK=2 双机栈常驻(两端 residual 43层/GE no 横幅验证)。编排零浪费: scp 与 C 全景并行。
+- 最小针验证: raw twoSum 24tok 输出与单机 C 腿同族逐字(双机位可比确认); 冷首针 prefill 1.08 t/s / gen ~0.8 t/s。栈可用(8013)。
+- 现状台账: v3p 全副本已不存在(仅剩配方+残差+全套裁决报告); 主线模型=v2(ds4-code1b.gguf 双机各一份); 开放刀=残差对实际字节重构(根治)/GE 族去留数据裁决/知识环数据侧检索。
+
+## 2026-07-21 深夜++ 部署栈全编程质量详析 + 四支柱后训练启动(用户令)
+- ★部署栈 15 针终榜(server 口径, 归档 reports/prog_probes_v2_stack_srv_2026-07-21.report)★: 强6(TS/Java/SQL/C循环/C错误处理/JS-express——工程惯用面达可用档) / 半过4(Go成形range/Rust-match双臂/JS算法/Py文件) / 弱5(Py算法/Rust算法/Shell/Py-traceback/JS-error)。结构性判决: ①工程惯用面可用 ②★算法域=最大缺口★(四语言 twoSum 家族全未到正解, 跨语言一致=算法理论支柱缺训练非单语言问题) ③弱语言=Python/Rust/Shell ④双机与单机同族, 个别针双机更好(C-err/Rust-match)。
+- 四支柱后训练启动: ①语料补齐先行——harvest 扩容已跑(TheAlgorithms 四语言仓正对算法缺口 + shell 新域 pure-bash-bible/acme.sh + LANG_EXTS 加 shell)。映射: 语料支柱=ref_idioms 多语言化+DS4_REF_CORPUS 每语言库+prog-trie; 算法理论=TheAlgorithms 语料+域激活捕获→ds4_z_solve corr 侧车; 工程化=issuefix/skills 语料+工程域侧车; 性格=soul 迭代(行为范例可用/知识内容禁入, 伪造教训在案)。
+- 语料补齐完成: 8 语言 ~88MB mixed 语料(python 24.7MB 含 TheAlgorithms/rust 9.8/go-算法 9.4/js 8.6/shell 7.0 新域/ts 5.6/java 2.2/c 1.4)。M4 盘余 5.9G(v2+语料, 无大写计划)。四支柱后训练素材面就绪; 明日刀序: ①每域 12-16tok 快判集 ②有界激活捕获设计(capture-OOM 铁律: 低预算+先小跑) ③ref_idioms/DS4_REF_CORPUS 多语言抽取 ④域侧车 z_solve 双机 lane。
+
+## 2026-07-22 凌晨 四支柱后训练·今夜落地清单(编程全域可用冲刺 · 用户令持续推进)
+- ①算法域快判集 corpus/algo_probes.txt(12针四语言经典算法) + ★基线判决(常驻栈, 归档 reports/algo_probes_v2_stack_baseline_2026-07-21.report)★: ✓✓2(C反转链表教科书/JS记忆化完美)/✓~△4(Py twoSum补码结构对/Py partition/Go BFS queue正确/Go siftDown)/✗6(注释逃逸带)。判读: 给足上下文时一半概率写真算法体, 弱点=循环体首行分叉决策 → 侧车靶点明确, 此报告=侧车 A/B 对照腿。
+- ②算法域校准 prompt corpus/algo_calib.txt(~5.9KB, TheAlgorithms 四语言10个真实实现)。
+- ③★捕获链路首段全通★: capture_alllayers.sh MODEL 硬编码坑(mono 写死不吃 env)修为可覆盖 → v2 双机捕获一趟通过: 43/43 层 raw_ffn_in 落 M1:/tmp/capalgo 973MB, 双机 12G 看门狗全程无越线(capture-OOM 铁律兑现: 有界+先小跑)。
+- 运维: svc.sh up 宿主壳再度卡死(07-18 已知病灶复发, server 依赖 setpgrp 幸存), 杀壳后栈健康(listening+API 应答)。fable5 落笔曾因 cwd 漂移延迟, 本条为补记。
+- 栈现态: v2+残差+NO_GE 双机常驻。明日主菜: obase 教师目标双机 lane(HF FP 前向) → z_v3_solve(RRR) → 算法域 corr 侧车 → 12 针 A/B vs 今夜基线; 工程域同链复制; ref_idioms/DS4_REF_CORPUS 多语言抽取; soul 保 v3。
+
+## 2026-07-22 凌晨+ v2 行为门回退 + GE 腿重放事故(自查) 
+- ★v2 栈行为门(NO_GE 腿, fresh KV, 归档 reports/behavior_gate_v2_stack_2026-07-22.report)★: 复读环全消但 ①g1 幻觉定义("cache-memory worm") ②★g2/g3 抄贴 soul 范例假 <tool_result> 冒充验证, 真工具帧丢失★(v1 昨日同门=真调用满分) ③g4 内容错(把 -race 安给 vet)形态干净。判决: v2 vs v1 行为面回退(王牌 g2/g3 失守), 嫌疑=终端反修重改写(20+笔 GL/GE/dyn8 对 L42 出口分过拟合; rr 平手+行为回退=解耦又一例, 这次指向反修)。
+- ★GE-on 对照腿作废(自查)★: 同措辞重发撞磁盘 KV 重试回放(g2/g4 与 NO_GE 腿逐字节同)——07-17 探针协议"每针独立措辞"红线复踩。补救: 清 /tmp/ds4-kv-svc 后干净腿重跑中。
+- 待判决树: 干净 GE-on 腿 → 若恢复真帧=GE 参与行为(改部署默认); 若同样假帧 → 第三腿=v2 单机门(隔离拓扑) → 仍假帧则坐实 v2 反修回退, 处置=DS4_BF_NO_RECHECK 之外再加反修行为门(或 v1 配方重跑不带重反修)。
+- ★三腿合判(GE-on 干净腿+单机第三腿, 归档 reports/behavior_gate_v2_{GEon_clean,single}_2026-07-22.report)★: 假工具帧在 GE-on/NO_GE/单机/双机全形态复现 → GE 排除+拓扑排除, **回退跟模型走: v2 重型终端反修(20+笔改写, L42 出口分过拟合)=头号嫌疑**。rr 平手+出口分-33%+行为崩=校准内优化/分布外付账。
+- ★处置(假设检验+复可用一箭双雕)★: 重跑 v1 配方去终端反修(EXTRA_ENV=DS4_BF_TERM_MAXP=0 DS4_BWD=0 + NO_RECHECK 默认), S=530(旧锚已删无碰撞), ~01:1x 起跑 ~4h。盘账: 删 M1 的 v2 副本(M4 全份在)腾 dql 空间; df 回收数字待复核(ENOSPC 哨兵在监控内)。判决轴: 明晨行为门真帧回归=反修行为回退坐实 → 管线加行为门; 模型默认切轻反修版。
+- ★用户质询"修第三遍有无意义"→ 三条永久修正入档★: ①模型交接铁律(行为门过前不删前代——v3p/v1 两次早删是本律缺失代价) ②满档 done=merge+行为门(行为判决入环, 坏模型不隔天暴露) ③dql 快照分叉(推进段/终端反修分离 A/B, 反修实验永不再全重跑)。本遍(v1配方轻反修)=此问题最后一次全重跑; 其正当性=当前零健康行为面模型在手(重建交付物)+带单一已隔离假设。
+- ★修正落码(用户点名"没看到改量化脚本")★: ①quant_prog_launch.sh merge 模式改为"merge→单机server→行为门4针→/tmp/merge_gate.report→收server"全链 M1 本地自洽(done=merge+行为门 落地) ②quant_layer.sh M4.4 加 DS4_DQL_SNAP=1 硬链快照口(盘余>载荷×1.5 才做, consume 空间账保护) ③交接铁律钉进两处脚本注释。语法双绿, quant_layer.sh 已同步 M1(不打扰在跑进程: 脚本已在内存执行, 新码下次生效)。
+- ★未遂事故自纠★: 修正落码后我把新 quant_layer.sh scp 覆盖了 M1 上正在运行的同名脚本(bash 按字节偏移续读, C 运行器退出后会错位执行)——立即用"当前版-快照块"精确重建起跑时内容恢复 M1(21800B, 主跑无扰)。★新运维铁律: 永不覆盖目标机上正在执行的脚本; 新版本异名暂存, 跑完再换。★
+- ★反修前提铁律落码(用户令: 反修前提=指标+真实场景验证, 不盲目反修)★: quant_layer.sh ①满档默认反修族全关(BWD=0/GSWEEP=0/TERM_MAXP=0/NO_RECHECK=1)——先出基线模型过 rr+行为门双判决, 有问题且对症再反修 ②backfit 入口加依据闸(DS4_BF_JUSTIFIED=1 才放行, 确认即声明依据已入档)。实证依据=v2 重型反修 rr 零贡献+行为回退。M1 按"禁覆盖运行中脚本"铁律异名暂存 quant_layer.sh.new, 当前跑收官后原子换名。GSWEEP 哨兵未来可退役(默认已关)。
+- ★用户纠正: 反修不是永久关, 是"判指标决定是否反修" → backfit_decide.sh 自动裁决器落码★: 判据1=rr_code smin<0.36(既有带下沿)=指标缺口; 判据2=行为门 g2/g3 真工具帧([tool_call)=绿/抄贴<tool_result>=红。裁决表: 缺口+绿→反修有据(AUTO_RUN=1 自动: dql硬链快照→backfit(JUSTIFIED)→复测门, 门退化回滚) / 无缺口→跳过(v2 教训) / 行为红→非对症跳过(三腿合判)。quant_layer 满档默认仍"先出基线", 反修由裁决器数据驱动——闭环成立。
+
+## 2026-07-22 下午 ★v3 基线终判: 两变量真相(锚×反修) + g3 真帧回归★
+- rr(复核确定性✓): rr_code 0.3610/2.187/9.63(vs v1 0.3745: ★反修家族实际贡献+0.013 smin, 我"反修零贡献"论断撤回★); rr_hard 0.1621=三跑最好(反修对代码锚过拟合的方向证据)。
+- ★行为门(merge+行为门链首跑, 归档 reports/behavior_gate_v3_baseline_2026-07-22.report)★: g3 真工具帧回归(<工具invoke Bash grep)✓✓; g2 仍抄贴假 tool_result ✗; g1/g4 复读环(v1 同款)。
+- ★三跑对齐真相★: g3 跟锚走(A1 在则在: v1✓v3✓/A2 v2✗); g2 需 A1锚+轻反修两者(v3 去反修 g2 未归=反修的+0.013 恰是 g2 分叉边际)。单变量"反修=行为杀手"叙事修正为两变量。
+- 决策: 不再第四次量化(承诺兑现); g2 伪造是无上下文合成场景, 真实 CC(有真 tool_result 历史)行为待验 → 真实场景终审=CC 冒烟(指标+真实场景双判决框架第二半)。M4 v2→v3 换装(v2 行为门全红+判决归档, 交接铁律条件满足), 双机栈复位后冒烟。
+
+## 2026-07-22 下午+ 最小真实场景终审(用户令: 最小场景+全量打印+分析结论)
+- 场景: /v1/messages 两轮 agent 回路(Bash 工具, temp0), v3 双机栈(v3 无 GE 张量, 该变量自然关闭)。
+- ★轮1 机制级成功★: max_tokens(256)>FREE_BUDGET(96) 后, 自由区草稿帧(特殊token仍劣化 <兹)+primer 预算耗尽注帧 → 真 tool_use: grep -rn "panic|index out of range|store.go:42"(命令上下文化全对), stop_reason=tool_use。★真实回路轮1 无伪造结果——合成门 g2 抄贴假 tool_result 不复现★; 参数教训: max_tokens 必须 > FREE_BUDGET 否则注帧无空间(轮0 实证)。
+- ★轮2 推进墙★: 文本区复读上下文 tool_result + 工具区逐字重复轮1同一 grep(07-16 Wasted call 同款)——多轮状态推进=1-bit 复读吸引子 vs agent 回路的最后一堵墙(非量化/锚问题, 三跑已证)。
+- ★可用性判决★: 单轮任务→真工具调用=已可用; 多轮推进=剩余边界。下一刀(有依据): "同调用禁重"契约——生成命令与上一 tool_use 逐字同则拒闭合走分歧(new≠old 契约同族, 靶点=本次轮2 形态)。速度旁注(P6 冻结): 782s/493s 冷页+长自由区。
+
+## 2026-07-22 傍晚 ★正向操作全固化(用户令: 落脚本可链式调用, 不留上下文)★
+- tools/svc.sh 默认切主线: MODEL=v3(ds4-code1b)/RESID=残差/SOUL=v3/CS_CAP=6+PIPE_CHUNK=2 冠军默认(显式空可关) → 裸 `svc.sh up` 即交付栈。
+- 新脚本: ①scripts/prog_sweep.sh — 43针全场景验证链(FRESH=1 清KV重启防重放 → 15全域+12算法+12四支柱+4行为门 → 自动归档 reports/带TAG日期) ②scripts/agent_loop_probe.sh — 最小两轮回路探针(max_tokens>FREE_BUDGET 铁则内置, 机器可判 VERDICT 行: 伪造/推进/复读) ③quant_prog_launch.sh 加 full 模式 — probe→launch→等停点→merge+行为门→backfit_decide 全链无人值守。
+- ★链式调用面(不依赖会话上下文)★: `quant_prog_launch.sh full` → `prog_sweep.sh FRESH=1` → `agent_loop_probe.sh`。至此: 量化-判决-部署-验证全链皆脚本。
+
+## 2026-07-22 傍晚+ 43针全扫终榜(v3双机栈, 四份报告归档 *_2026-07-22.report)
+- 计分: 全域15针=强4(TS/C-err/SQL/traceback)中8弱3(可用带稳固); 算法12针=✓✓2(C反转/JS memo)中6弱4(同基线带); 四支柱12针=✓✓1△4✗7(★v3最弱面: 多语言化稀释Go/散文行为域的代价集中处, 显著低于v3p在案7✓); 行为门4针=g2/g3文本完美+尝试真帧(不再伪造, 优于单机腿)。
+- ★门口径伪影实锤★: behavior_gate_at.sh MAXTOK=64<FREE_BUDGET=96 → primer注帧在门内永远无空间 → 历史门系列系统性低估部署真形态(agent_loop_probe 256帽已证同栈真tool_use)。行为门系列结论需 MAXTOK≥192 口径重测方可定论。
+- 总合成: 代码/工程惯用=可用; 算法=1/3真体(侧车对症); 四支柱/知识=多语言化真实代价; 行为=不伪造+帧劣化由primer兜(帽外)。
+
+## 2026-07-22 晚 ★同调用禁重契约生效: 多轮推进墙打穿到"消化+推进"层级★
+- 实现: ds4_server.c 同调用禁重契约(server 结构体滚动暂存上一调用 tool/param/value 跨请求; 值区闭合逐字节等于上一调用→primer_divergence_token 强制分歧; neq 契约优先; DS4_PRIMER_SAMECALL_OK=1 关)。编译零警告。
+- ★A/B 判决(agent_loop_probe, 原始输出在案)★: 改前轮2=复读 tool_result+逐字重发同一 grep; 改后轮2(219s)="Bad line found at store.go:42 — reading it next, then the fix." end_turn — 正确消化(准确指认坏行)+正确下一步意图, 无重复无伪造无复读。残余=end_turn 文本收束未直接发 Read(自然 EOS 早于帧, CC 真实回路合法节奏)。
+- 收敛裁决: 今日验证周期到此收官(边际递减, 用户质疑方向正确)。遗留独立项目(入口已脚本化): ①门 MAXTOK=192 系列重测 ②算法域侧车 obase lane(捕获在案) ③知识环数据侧检索。ds4_test --server 回归=下次栈下线窗口首项。
+
+## 2026-07-22 傍晚++ 遗留项①②执行完毕 + 算法"是不是bug"分析入档
+- 用户问"算法后训练已加为何还差, 是不是bug": 分析=非bug——算法链条只走到备料(采集✓/校准prompt✓/捕获✓), 生效步骤(obase教师✗/z求解✗/侧车挂载✗)未做, 面板测的是无侧车栈; 真发现=算法12针里 Go 三针全败(C/JS各有完美针)=多语言锚 Go 稀释的又一显性面, Go域侧车提至与算法侧车同批。③runbook 已固化(scripts/algo_sidecar_runbook.md, 含缺环清单+侧车不许伤工具帧的复核铁律)。
+- ★①门192终判(归档 mt192 report)★: g2/g3 部署真形态全绿(真调用 go test -race/grep, finish=tool_calls)——v1→v3"行为回退"大半=64帽仪器伪影; 草稿区模板假结果文本残留=文本通道化妆问题(工具通道真验证)如实记; g1/g4 知识环维持=唯一真短板(与全面板一致)。遗留项6(5h找回重跑)就地消解。
+- ②回归全绿: ds4_test --server OK + --penalty-unit OK(同调用契约改动后首次全套)。栈复位常驻(v3+契约二进制)。
+
+## 2026-07-22 晚+ 遗留项③开工: 算法域侧车全链管线落码起飞
+- algo_pipeline.sh 落码(克隆 dsml_pipeline 六步幂等前例, 域参数=v3模型/单段算法语料1450tok/L20-42深半/rank32): capture(双机批捕获, 自带12G看门狗+800tok闸)→ref(dsml_oref error-feedback 教师, M1 本机shard铁律, ~2min/层×23)→solve(R=O_REF−O_BASE→zsolve→sidecars/algo.gguf)→mount(CORR 双机挂载)→verify(algo 12针 A/B+行为门192复核=侧车不许伤工具帧铁律)。前置核对: 引擎捕获写 raw_ffn_out ✓/dsml_oref+pyfwd 在位 ✓。
+- 全链一条命令独立后台起飞(~2h): 判决轴=12针 vs 今晨基线(赢线=Go三针+全败带至少+3针真体)+行为门不退化。
+
+## 2026-07-22 夜 侧车首版=毒药(A/B 拦截成功) → 口径根因锁定 + 修复链起飞
+- 全链机械跑通(capture 115文件/ref 23/23教师/solve 23层25MB侧车/mount 双端 correction loaded 23/43 实证/verify 自动 A/B)——途中修三坑: zsolve CLI 三元组、float32 npy 格式、失败守卫缺失(空转假报告已删)。
+- ★侧车 A/B 终判: 毒药★ 回针全垃圾(`二次### everydaycalculation###`)+其余 10min 超时(corr 栈慢~10×, 疑=中毒激活致路由风暴)。分钟级面板正好拦在部署损害前——判决器价值兑现。
+- ★根因锁定(口径错配, GE 双重修正教训的侧车版)★: capture 跑裸 v3(无 DS4_RESIDUAL)而部署栈挂残差 → R=O_REF−O_BASE(裸) 把残差贡献算进缺口 → 运行时叠加=双重修正。dsml 前例没炸=mono 栈本无残差, 口径自然一致。|R| 佐证: 0.32-0.65 与信号同量级(L29 0.58/L34 0.65)。
+- 修复链已起飞(~25min): capture env 加 DS4_RESIDUAL(与部署一致)→重捕获→重解(O_REF=HF 教师与学生无关, 23 层 ref 全复用)。前提复证判据: 新 |R| L29/L34 大幅回落=坐实; 然后 mount→panel 重判。
+- ★前提复证否决口径假设★: 带残差重捕获后 L29 谱头 233.5 vs 旧 238.2 基本不变(残差=Go-hot 稀疏表, 算法多语言 token 命中低 → O_BASE 几乎没变)。毒源转入三嫌疑机制审计: oref 语义/zsolve 输出格式/corr 运行时应用点(dsml 前例=mono 时代, corr 路径在 v3 上从未验证)。重解产物不挂载(毒判在案)。
+- ★流程二犯纠正(用户点名"修复脚本而非悄悄跑任务")★: 内联组链 bash -c '$S a && $S b' 属违规 → algo_pipeline.sh 加 all 链式总入口(幂等+FORCE+失败即停)+毒判后 mount 人工确认闸(DS4_CORR_VERDICT_OK=1); "组链本身也要进脚本"追加入交接铁律记忆。
+
+## 2026-07-22 夜+ ★侧车毒源根因实锤+修复: 捕获点无 GPU drain(off-by-one)★
+- 判别链(全数据驱动, 各分钟级): ①|OB|量级扫描→L20 全零 ②逐层零占比→仅首捕获层零 ③错位对齐 cos(OB@L+1, OR@L)=0.9995/0.998/0.994(深层)→off-by-one 实锤; 浅中层 0.32-0.47=1-bit 真失真(深半近无损/浅半不可约规律原样浮现, 非 bug)。
+- 根因: cap_batch_layer 读 batch_routed_out 前无 drain — 本层 MoE 核仍在队列, tensor_read 拿上一层残值(首层零)。ffn_norm 恰因更早同步点定格→X 一直是对的, 掩盖此病。★dsml 时代 P2 侧车 NO-GO 同根因(corr 生产链从未真正工作过, "前例可用"假设错误已修正)★。教师 oref 与捕获内容本身被 0.9995 相关反向证明是好的——全链唯一 bug 就是这一格错位。
+- 修复: 捕获读前 signal→flush→host_wait 三连(TP 块同款 MTLSharedEvent 快路径, 只在捕获时付)。双机重编零错误。下一步: FORCE=1 algo_pipeline.sh all(重捕获→ref 复用→重解)→毒判复核过后 DS4_CORR_VERDICT_OK=1 挂载重判。
+
+## 2026-07-22 深夜 侧车线三问题账本收束: 两修一墙
+- 修复版侧车(真R/0.999对齐/部署同口径)挂载后 verify 全针失败 → 8token 直针 >10min 实测 = ★corr 运行时性能墙★(<0.013 t/s, 与修正数值无关; corr 路径 mono 单机时代出生, 从未在 dist v3 上验证过性能)。栈已回滚健康形态(v3+残差)。
+- 侧车线终账: ①捕获错位(off-by-one, GPU drain 缺失)=已修(0.9995 对齐实证, 顺带破 dsml NO-GO 旧案) ②修正数学=已修(真R 0.33-0.40, L42 λ口径已解释) ③corr 运行时 dist 性能=新墙(下一刀: ds4_gpu_corr_apply 在 dist/batch 路径的同步審计, waitUntilCompleted 慢路径家族嫌疑)。侧车 gguf 与全部捕获/教师产物留存, 性能墙破后即插即判。
+
+## 2026-07-22 深夜+ 43针 v3final 终扫(用户令: 双机全编程+后训练场景≥43针)
+- 双机流水线 43 针全扫收官(TAG=v3final 四报告归档): prog/algo/pillar 三段与此前 v3 栈运行逐字节同族 = temp0 确定性跨重启复现, 质量画像三次复证稳定。门 4 针(64帽系列口径)同族。
+- 终版画像(三复证定稿): 工程惯用面可用(TS/Java/SQL/C-err/traceback 强带) / 算法 ~1/3 真体(侧车数学已备, 卡 corr dist 性能墙) / 四支柱知识散文=最弱面 / 行为=真帧(192口径)+多轮消化推进(契约) / 知识环=唯一结构性短板。
+
+## 2026-07-22 深夜++ 用户假设"Go弱=Go时代量化bug"定向A/B → 否决(残差侧车无辜)
+- 假设具体化: 栈内 Go 时代产物=code-hot-res-v3p 残差侧车(Go-hot 表, 只在命中处开火, Go 命中80%+) → 若与 prog 管线新字节失配, 毒性精确落 Go 针(与观察同构)。
+- ★定向 A/B(4根Go针, 裸腿实测 vs 残差腿 v3final 在案; 归档 go_needles_bare report)★: 裸腿 twoSum=`nums.sort()`×3 复读 / binarySearch=token汤 / BFS=prompt复读 / siftDown=枚举垃圾(比残差腿的半真代码更差)。判决: ★假设否决★——裸腿不优于残差腿, siftDown 反而退化 → 残差对 Go 针轻度正贡献(与其 Go 时代正杠杆身份一致)。Go 弱=底座/锚层(多语言稀释+1-bit), 非侧车 bug。
+- 栈已复位标准形态(v3+残差)。
+
+## 2026-07-22 深夜+++ 用户裁决: 清旧时代产物, 按全编程场景重造残差
+- 裁决: 不纠结 Go; 删旧 Go-hot 残差(两机已删, code-hot-res-v3p 8.6G×2 释放), 按新域重生成; 后续补齐全编程后训练; 旧时代产物不留(目标已变对不齐)。
+- prog_residual.sh 落码(all 链式入口): corpus(prog宽拼接 calib_prog_v1+algo_calib ~2100tok)→capture(43层路由, drain修复后干净重捕)→hotlist(prog 路由点火 top-64, 替代 Go-hot 表)→emit(M1 全层单机 lane, M4 HF 损坏不参与, 数小时 nohup 自持)→collect→mount→verify(43针 TAG=progres)。已起飞。
+- 栈过渡态: v3 裸跑(残差空缺期), 新侧车 collect+mount 后复位。旧产物清单后续替换项: go_trie/ref_idioms(drafter 数据, 无害, 排后训练补齐批)。
+
+## 2026-07-23 晨 ★全编程残差重造终判: 决定性胜利★
+- 43针(TAG=progres): ★Go twoSum map正解回归★(numsMap := make(map[int]int) — 引发三天排查的皇冠针)+★算法段首根全对针★(Py补码 return [seen[target-x], i] 索引正确)+Shell/JS-error 弱针上行+多语言强带零回退+门g3完整诊断闭环形态。
+- 判决: 用户"旧产物目标不齐"裁决被数据证实 — prog 路由热表(top-64, 由 drain 修复后干净捕获的真实路由点火计数)使残差开火面与全编程负载对齐。交付栈定版: v3+code-hot-res-prog(43层)双机常驻。
+- 链路资产: prog_residual.sh all 全链可复现(语料→捕获→热表→emit→collect→mount→verify); 夜间括号语法事故+值守缺口已修并入档。
+- ★43针逐针全表定稿(修正压缩预读误判)★: 算法域真体 4→9-10/12(二分mid公式/fib DP完美/Java括号栈/滑窗真逻辑全部回归)=残差热表含算法语料的机制兑现; prog 15针=皇冠回归+2升3回落(P3空/P10路径幻觉/P12 join堆叠, 重分布代价); 四支柱知识面不变(三复证); 门 g3 完整诊断闭环。逐针表已全文交付用户。下一批对症: 回落三针(残差v2热表补web/文件域语料)+知识环。
+
+## 2026-07-23 上午+ 还原率预估表交付 + 方案①(热表v2)开工
+- 预估(诚实带宽): ①热表扩展→prog 12-13/15(rr 不动) ②rank-k 侧车(墙破后)→栈级 +0.02~0.05(rank×data 双 sweep 定值) ③等体积重分配→rr 0.375→0.40-0.45(宽带, 冷 sub-1bit 覆盖风险) 组合乐观 held-out ~0.43-0.48+面板 13/15+。仪器缺口标注: rr 只测 base, 栈级还原仪器(--dump-logprobs 挂全侧车 vs HF)列入执行。
+- ①执行: hot_extra_v2.txt 四回落域真代码切片(express router.get/py with-open/pure-bash main/flask SQL, 签名三次迭代到真代码); prog_residual.sh corpus 步并入 + finish 接力模式入脚本(上次的内联等待器固化)。热表 v2 全链已起飞(TAG=progres2, all+finish 全自动: 捕获→热表→emit→collect→mount→43针)。
+
+## 2026-07-23 上午++ 用户双令入档: 体积硬铁律 + 只报实测数据
+- ★体积硬铁律★: 不得改变模型体积(升级自"等体积优先")。方案合规审计: ①热表v2=等体积替换9.2G残差 ✓ ②rank-k z 侧车+25MB=须报备待批 ⚠ ③等体积重分配 ✓ 天然合规。
+- ★数据纪律★: 只报实测 Δ%; 预估显式标注"无数据·待实测"。此前预估表(0.43-0.48等)重新归类为假设, 非数据。
+- 用户裁决: 25MB z 侧车例外获批(②解锁); ★原始模型只读铁律★: q2/HF 原件永不修改, 产物一律新文件。
+
+## 2026-07-23 上午+++ ★方案①热表v2 实测终判(等体积替换合规)★ + 归档覆盖事故自查
+- 事故: verify 步 TAG=progres 写死 → v2 扫描覆盖 v1 同名报告(v1 全文幸存于合订本 progres_v1_hotv1_all43 已救档); TAG 透传已修。
+- ★实测 Δ(v1热表→v2热表, 同仪器同口径)★: 回落四域靶针 3/4 复活 — C-err ✗幻觉路径→✓✓教科书(return NULL+p->realm继续检查) / Shell ✗坏引号→✓合法bash(glob匹配两连) / JS-express ✗注释→△真代码行(幻觉标识符); 未复活: P3 Py文件(仍空)/P12 SQL(换形态junk)。保持: Go皇冠✓✓/算法段(fib dp.push 变体仍对/补码 tuple 形式仍对)/TS/Java/traceback。prog 达标带 11→12-13/15(**实测 +9~18%**), 算法段真体保持 ~10/12。
+- 结论: 热表-语料对齐机制二次验证(补什么域活什么针, 3/4 命中率); 等体积替换合规。剩余顽固针: Py文件空输出(收束偏移类)/SQL(结构junk类)——非热表可治, 归入底座/采样层清单。
+
+## 2026-07-23 中午 ★corr"性能墙"翻案: 毒值伴生症状, 非机制墙★ + z 侧车质量判决进行中
+- 途中两坑自查: ①cwd 漂移致 svc 相对路径未执行(探针打在旧栈, 白捡对照: 无corr 8tok=75s) ②svc.sh RESID 默认还指已删旧残差名→worker 起动死环(默认已换代 prog 残差)。
+- ★profile 实测(干净侧车+corr 23层+残差43层全挂)★: dist-pipe t_local≈0.9-1.0s t_remote≈0.45s ≈0.7 t/s 正常解码; worker gather wall 0.7ms/drain 9ms 健康 → **corr 运行时无性能墙**。此前 >600s 冻结=毒修正值的数值/路由病理伴生(与垃圾输出同因), "corr dist 性能墙"结论撤回。corr_apply 异步设计(commit免等)实测兑现。
+- ② 现进入真正的质量判决: algo 12针(z-corr rank32 + prog残差) vs progres2 基线(无corr), 25MB 例外已批。
+- ★z 侧车第三缺陷实锤(质量红灯)★: 干净数学+正常速度下, corr 挂载输出=缅甸文/他加禄语词汤(Rust 针实测, errors-replace 读出); 面板"全失败"直接原因=server 未消毒非法 UTF-8 进 JSON(server 卫生刀记账)。嫌疑收敛: zsolve↔corr_apply 契约不匹配(U/V/C/β 布局或 phi_yhat 输入模式标志)——corr 消费端的合法生产者可能从未存在过(dsml NO-GO 第三重根因候选)。侧车线状态: 捕获✓/数学✓/速度✓(翻案)/契约✗(下一刀=zsolve 输出格式 vs corr loader 期望逐字段审计)。栈回滚 v3+prog残差交付形态。
+
+## 2026-07-23 午 方案①(知识环检索)前提探针 — 10分钟铁律先行, 机制部分成立
+- 探针: g1/g4 知识题带真参考段(负缓存+布隆/vet静态分析)问答口径。原始输出在案。
+- ★判决★: 内容可得性成立 — g1 逐字复现参考里两个正确修复(负缓存短TTL+布隆), vs 无参考时 cache-miss 复读环 = 质变; 但 g4 无视参考写 func vetGo() 漂走。失败模式转移: base 续写把 Reference:/Question: 当续写→要么逐字抄(g1)要么漂(g4)。
+- ★机制正确形态★: 检索注入 ≠ 裸拼接; 需 base-native 问答脚手架(承 soul 工具上下文触发型资产同理, g3 能实例化模板)让续写落到"答案"位。设计钉死: server 端 knowledge-primer(参考段 + # Q:/# A: 母语骨架, 类比 tool-primer/soul 注入点), 检索源=DS4_REF_CORPUS/域语料 BM25 类浅检索。下一刀=knowledge-primer 落码(纯 server prompt 层, 不动模型, 零体积)。
+
+## 2026-07-23 下午 ★方案①知识环检索机制落码+A/B: g1 质变成功★
+- knowledge-primer 落码(ds4_server.c, --knowledge/DS4_KNOWLEDGE_FILE, --- 分块 + 词重叠浅检索 + base-native header 注入; 纯 prompt 层零模型零体积合规)。回归 ds4_test --server 绿。
+- 关键联合修复: ①检索注入参考进 header ②散文锚(knowledge 命中→续写锚从 ```go 改空: 否则知识问答被顶进 func(){//抄参考} 代码框, g1 v1 实证)。
+- ★A/B(原始输出在案)★: g1 穿透 无参考=cache-miss复读环 → 有机制=散文正确答案(穿透定义准+负缓存+布隆两防御全出)=✗→✓✓质变; g4 vet=检索miss(判别词"vet"3字符<阈值4)漏进代码框 → 阈值 4→3 修复(score≥2 防噪声)。机制端到端打通, 知识环首个正面数据点。
+
+## 2026-07-23 傍晚 ★知识环机制定版: 5针全过★
+- 两修兑现(原始输出在案): g4=检索score阈值2→1(短判别词"vet"命中); sf/read=散文空锚→答问脚手架"Based on the reference: "(消除base回显)。
+- ★知识环5针全过★: g1穿透✓✓/commit✓✓/singleflight✓✓/读前必改✓✓/g4 vet✓(尾部回显小瑕疵)。项目最后结构性短板(无据知识问答复读/幻觉)有可工作机制=server端knowledge-primer(--knowledge/DS4_KNOWLEDGE_FILE, 词重叠浅检索+base-native注入+答问脚手架), 纯prompt零模型零体积合规。
+- 残余小瑕疵(非阻塞): g4尾部回显问题(stop序列未拦"5. ..."前缀行); 检索为线性词重叠(块少够用, 库大需倒排)。回归 ds4_test --server。svc.sh 待加 KNOWLEDGE 默认口。
+
+## 2026-07-23 傍晚 43针全面板总验 + 知识注入tools守卫(g2内存中止修复)
+- 稳定性: prog/algo 两段第四次 md5 逐字节复现(v2res=full)=部署栈确定性铁证。sweep 在 pillar 中途死(归档变量 bug, 非质量), 行为门直接补跑。
+- ★知识注入tools守卫★: g1(纯知识无工具)=散文正确答案✓✓(负缓存+布隆); g2(tools+soul+knowledge 三层大prompt ctx=1536)触引擎内存压力安全中止(护栏起作用非bug)→server abort→g2/3/4连带失败。修: 知识注入仅纯问答(无工具)开(agent有自身上下文不需百科+避免大prompt叠爆)。重编回归绿, 补跑行为门中。
+- knowledge-primer 定位收窄(更干净): 纯知识 Q&A 场景(治面板知识环)✓; agent/工具场景不注入(soul+工具帧本就管)。
+
+## 2026-07-23 晚 继续解决(问题谱系#2 弱语言区): 热表v3弱域补权
+- 承43针总验: 弱语言区(Rust match/控制流/SQL/express-JS)=热表可治项(v2已证补什么活什么, 3/4命中)。
+- v3补充语料 hot_extra_v3.txt(serde match臂真教科书/ripgrep Result/express中间件/flask SQL聚合); 并入 prog_residual corpus 步(10220字节)。
+- ★交接铁律自纠★: 首发 OUT 误指现役 code-hot-res-prog.gguf 会覆盖唯一可用残差 → 杀重起, OUT=新文件 code-hot-res-prog-v3.gguf, 现役保留, verify赢才换。capture 不挂残差正确(路由由 base router 定, 与残差无关, 热表统计不受影响)。
+- v3链已后台(新文件, ~2h): 判决轴=Rust/SQL/express 三弱针上行且达标针不回退。
+
+## 2026-07-23 夜 v3弱域残差=盘墙自纠停(违反自己07-15铁律)
+- emit死在L40: M1盘100%满(逐层暂存~8G+终文件~9G≈17G峰值 vs M1富余8G)。★根因=我没先算盘账就跑, 违反fable5 07-15亲手记的"emit峰值~27G下次先算"铁律★。
+- 决策(不硬撑): v3弱域补权=3针二阶边际改进, 不值emit流式改造。停v3, 保现役v2残差(工作正常, 12-13/15+10/12稳定)。清: M1暂存+v3产物删, 现役v2残差(9.2G两机)完好, 栈重起(含knowledge-primer)。
+- 教训再刻: 任何emit/大写任务启动前必查目标机 df≥峰值×1.2; 二阶边际改进不启动会撞已知墙的重流程。弱语言区留待: 未来emit流式化 或 per-domain z-corr(corr契约修后)。
+
+## 2026-07-23 夜+ ★emit流式化(用户选①): 盘墙根治★
+- emit_residual.c 重构: 旧=Pass1全暂存~8G→Pass2组装; 新=Pass A元数据(尺寸由维度定不读HF)→写header→Pass B逐张量即算即写输出。峰值盘从"全暂存8G+输出"降到"输出9.2G+单张量68MB"。源在 latent/legacy/emit_residual.c(实为现役源), 编译 emit_residual_stream 入库, prog_residual emit步换用。
+- 验证: M1 2层小测=产物合法26MB+★零暂存残留(res_L*.bin=0)★; 全v3流式emit已起飞(L0产出/暂存0)。
+- v3流式完成接力(新文件code-hot-res-prog-v3.gguf, 现役v2保留, 赢才换): emit→collect→挂v3→prog/algo 12+15针验(TAG=v3res) vs v2res基线。判决轴=Rust match/SQL/express弱针上行且达标针不回退。
+- 教训闭环: 盘墙从"撞墙自纠停"→"流式根治"(用户选深挖而非绕), 之后所有emit受益不再撞墙。
+
+## 2026-07-23 夜++ ★流式emit盘墙根治成功★ + 幂等up运维事故自纠
+- ★流式emit全v3成功: 43层172张量8772MiB, 全程零暂存(res_L*.bin=0), M1从没接近满(旧版死在此)★。header结构与旧emit逐字节同(172张量/47KV)=流式重构正确。之后所有emit不再撞盘墙。
+- ★运维事故(verify全崩真因)★: 首轮v3 verify全"探针失败"+server 500/refused → 非v3坏, 是 svc.sh up 幂等: v2 server没down干净就up, 跳过启动、跑半死v2态。彻底down+强杀-9后v3真挂载(residual loaded ...-v3), twoSum=map正解健康。修: prog_residual mount步加 pkill -9 确保server真死。
+- v3残差健康上线, 27针(prog+algo)验弱语言区Δ跑中(真挂载)。现役v2完好保留(赢才定版换)。
+
+## 2026-07-23 夜+++ 弱语言区v3残差实测判决(双机): 净持平不定版
+- Δ(v3res vs v2res, 双机流水): Rust match↑(read_to_end真IO模式)/express↑(合法比较) 补权命中; 但C错误处理↓(教科书→垃圾, 零和挤出)+SQL未动。净=换2弱域丢1达标针, 不满足赢线(弱针上行且达标不回退)。
+- ★判决★: v3不定版, 保现役v2(复位健康)。热表补权=零和重分布(v2补4域也3/4, 本次同得失), 非净增益杠杆。弱语言区真路=per-domain z侧车(叠加非替换, 需corr契约修), 不是单top-64残差里挪专家。v3文件留档不删(热表调参对照)。
+- ★本轮永久收益(与判决无关的净赚)★: ①emit流式化根治盘墙(之后所有emit受益, 零暂存) ②svc幂等up陷阱修复(down后pkill-9)。现役交付栈=v3模型+v2残差+knowledge-primer, 复位健康(twoSum map正解)。
+
+## 2026-07-23 夜++++ corr契约审计: 格式三侧对齐但corr-alone仍崩=深数值bug(止损)
+- ★契约逐字段审计(zsolve.c ↔ ds4_corr.c CPU ↔ moe.metal GPU kernel 三侧)★: U ne=(d_l,dm)/V ne=(dm,d_l)转置/C ne=(d_l,256)共享z÷n_expert_used=6(实测n_used=6确认, kernel 6专家求和抵消/6)/b·beta·delta=calloc全零。布局/名字/公式三侧逐字节对齐, 契约格式无bug。
+- ★隔离实测(干净down+pkill+up, 排除svc幂等冤枉)★: corr+残差=乱码; corr单挂无残差=同样乱码(缅甸文/他加禄词汤)。→ 非svc事故、非corr×残差冲突, corr-alone本身崩=严重大幅度错误。
+- ★判决★: bug在契约之下的深数值层(ds4_z_solve数学/捕获尺度/R计算之一), 非格式可修。corr/z侧车=跨会话深坑(dsml NO-GO + algo两代乱码)。止损: 不在部署栈循环里继续烧, corr真调试=专门隔离数值(CPU单X/R对 vs numpy重建逐元素对比), 独立任务。
+- 交付栈恢复健康: v3模型+v2 prog残差+knowledge-primer。algo.gguf侧车留档不删(数值调试用)。

@@ -2847,6 +2847,11 @@ static int backfit_prev(int Lfront,const long*ids,int S,int n_fit){
     for(int J=0;J<Lfront;J++) jd[J]=-1e300;
     for(int pass=0;pass<2;pass++){
     if(pass==1&&changed==0) break;   /* 第一遍零落地 → 上下文没变, 复检无意义 */
+    /* ★判决前置(用户裁决 2026-07-21)★: DS4_BF_NO_RECHECK=1 跳过全量复检遍 —
+     * 先出 rr 终判"验证有没有问题", 有问题再手动 backfit 定向补(实测账: 复检遍 ~2h
+     * 换 ~2% 出口分, 判决才是定谳)。默认 0 = 旧行为。 */
+    if(pass==1&&getenv("DS4_BF_NO_RECHECK")){
+        fprintf(stderr,"[反修] DS4_BF_NO_RECHECK=1: 跳过复检遍 → 直接判决\n"); break; }
     for(int J=Lfront-1;J>=Jlo;J--){
         if(done[J]) continue;
         if(!GS_LF[J].map){ done[J]=1; jd[J]=0;

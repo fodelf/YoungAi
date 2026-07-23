@@ -1,0 +1,15 @@
+# go_needles.txt — Go 针×4(2026-07-22): 验"Go 时代残差侧车毒 Go 针"假设的定向 A/B 集。
+func twoSum(nums []int, target int) []int {
+---
+func binarySearch(a []int, target int) int {
+    lo, hi := 0, len(a)-1
+    for lo <= hi {
+---
+func bfs(root *Node) []int {
+    queue := []*Node{root}
+    var out []int
+    for len(queue) > 0 {
+---
+func siftDown(h []int, i int) {
+    for {
+        l, r := 2*i+1, 2*i+2

@@ -1,0 +1,341 @@
+// ==== python ====
+    def route(self, rule: str, **options: t.Any) -> t.Callable[[T_route], T_route]:
+        """Decorate a view function to register it with the given URL
+        rule and options. Calls :meth:`add_url_rule`, which has more
+        details about the implementation.
+
+        .. code-block:: python
+
+            @app.route("/")
+            def index():
+// ==== javascript ====
+export default function dispatchRequest(config) {
+  throwIfCancellationRequested(config);
+
+  config.headers = AxiosHeaders.from(config.headers);
+
+  // Transform request data
+  config.data = transformData.call(config, config.transformRequest);
+
+// ==== rust ====
+    pub fn is_match<P: AsRef<Path>>(&self, path: P) -> bool {
+        self.is_match_candidate(&Candidate::new(path.as_ref()))
+    }
+
+    /// Tests whether the given path matches this pattern or not.
+    pub fn is_match_candidate(&self, path: &Candidate<'_>) -> bool {
+// ==== typescript ====
+export function reactive(target: object) {
+  // if trying to observe a readonly proxy, return the readonly version.
+  if (isReadonly(target)) {
+    return target
+  }
+  return createReactiveObject(
+    target,
+// ==== c ====
+static void assoc_expand(void) {
+    old_hashtable = primary_hashtable;
+
+    primary_hashtable = calloc(hashsize(hashpower + 1), sizeof(void *));
+    if (primary_hashtable) {
+        if (settings.verbose > 1)
+// ==== java ====
+  public <T> T fromJson(String json, Class<T> classOfT) throws JsonSyntaxException {
+    return fromJson(json, TypeToken.get(classOfT));
+  }
+
+  /**
+   * This method deserializes the specified JSON into an object of the specified type. This method
+// ==== go ====
+func TestDuplicatedLinks(t *testing.T) {
+	doc := goqueryFromReadme(t)
+	links := make(map[string]bool, 0)
+	doc.Find("body li > a:first-child").Each(func(_ int, s *goquery.Selection) {
+		t.Run(s.Text(), func(t *testing.T) {
+			href, ok := s.Attr("href")
+			if !ok {
+// ==== issuefix ====
+
+=== ISSUE #6093: IPv6 addresses parsed incorrectly because of `.partition(":")`? ===
+Hi, I checked the code and saw that two places use `.partition(":")` on addresses, and IPv6 ad
+// ==== method ====
+## Cache penetration (缓存穿透)
+
+Queries for keys that exist in neither cache nor database bypass the cache every time and
+hammer the database. Two standard fixes:
+// ==== soul ====
+An engineering answer is only worth its evidence. Four rules, always:
+
+def binary_search(array: list, lower_bound: int, upper_bound: int, value: int) -> int:
+    """
+    This function carries out Binary search on a 1d array and
+    return -1 if it do not exist
+    array: A 1d sorted array
+    value : the value meant to be searched
+    >>> matrix = [1, 4, 7, 11, 15]
+    >>> binary_search(matrix, 0, len(matrix) - 1, 1)
+    0
+    >>> binary_search(matrix, 0, len(matrix) - 1, 23)
+    -1
+    """
+
+    r = int((lower_bound + upper_bound) // 2)
+    if array[r] == value:
+        return r
+    if lower_bound >= upper_bound:
+        return -1
+    if array[r] < value:
+        return binary_search(array, r + 1, upper_bound, value)
+    else:
+        return binary_search(array, lower_bound, r - 1, value)
+
+
+def mat_bin_search(value: int, matrix: list) -> list:
+    """
+    This function loops over a 2d matrix and calls binarySearch on
+    the selected 1d array and returns [-1, -1] is it do not exist
+    value : value meant to be searched
+    matrix = a sorted 2d matrix
+
+def quick_sort(collection: list) -> list:
+    """A pure Python implementation of quicksort algorithm.
+
+    :param collection: a mutable collection of comparable items
+    :return: the same collection ordered in ascending order
+
+    Examples:
+    >>> quick_sort([0, 5, 3, 2, 2])
+    [0, 2, 2, 3, 5]
+    >>> quick_sort([])
+    []
+    >>> quick_sort([-2, 5, 0, -45])
+    [-45, -2, 0, 5]
+    """
+    # Base case: if the collection has 0 or 1 elements, it is already sorted
+    if len(collection) < 2:
+        return collection
+
+    # Randomly select a pivot index and remove the pivot element from the collection
+    pivot_index = randrange(len(collection))
+    pivot = collection.pop(pivot_index)
+
+    # Partition the remaining elements into two groups: lesser or equal, and greater
+    lesser = [item for item in collection if item <= pivot]
+    greater = [item for item in collection if item > pivot]
+
+func Merge[T constraints.Ordered](items []T) []T {
+
+	if len(items) < 2 {
+		return items
+
+	}
+
+	var middle = len(items) / 2
+	var a = Merge(items[:middle])
+	var b = Merge(items[middle:])
+	return merge(a, b)
+
+}
+
+func MergeIter[T constraints.Ordered](items []T) []T {
+	for step := 1; step < len(items); step += step {
+		for i := 0; i+step < len(items); i += 2 * step {
+			tmp := merge(items[i:i+step], items[i+step:min.Int(i+2*step, len(items))])
+			copy(items[i:], tmp)
+		}
+	}
+	return items
+}
+
+// ParallelMerge Perform merge sort on a slice using goroutines
+
+function fibonacciCache
+ * @description - this is a cached variant of fib number
+ * @param {number} n  - Real number (n > -1)
+ * @param {Object} cache
+ * @returns {number}
+ */
+export const fibonacciCache = (n, cache = null) => {
+  if (cache) {
+    const value = cache.get(n)
+
+    if (value !== null) {
+      return value
+    }
+  }
+
+  if (n === 1 || n === 2) {
+    return 1
+  }
+
+  const result = fibonacciCache(n - 1, cache) + fibonacciCache(n - 2, cache)
+
+function bubbleSort(items) {
+  const length = items.length
+  let noSwaps
+
+  for (let i = length; i > 0; i--) {
+    // flag for optimization
+    noSwaps = true
+    // Number of passes
+    for (let j = 0; j < i - 1; j++) {
+      // Compare the adjacent positions
+      if (items[j] > items[j + 1]) {
+        // Swap the numbers
+        ;[items[j], items[j + 1]] = [items[j + 1], items[j]]
+        noSwaps = false
+      }
+    }
+    if (noSwaps) {
+      break
+    }
+  }
+
+pub fn binary_search<T: Ord>(item: &T, arr: &[T]) -> Option<usize> {
+    let is_asc = is_asc_arr(arr);
+
+    let mut left = 0;
+    let mut right = arr.len();
+
+    while left < right {
+        if match_compare(item, arr, &mut left, &mut right, is_asc) {
+            return Some(left);
+        }
+    }
+
+    None
+}
+
+/// Compares the item with the middle element of the current search range and
+/// updates the search bounds accordingly. This function handles both ascending
+/// and descending ordered arrays. It calculates the middle index of the
+/// current search range and compares the item with the element at
+/// this index. It then updates the search bounds (`left` and `right`) based on
+/// the result of this comparison. If the item is found, it updates `left` to
+/// the index of the found item and returns `true`.
+///
+/// # Parameters
+///
+func BreadthFirstSearch(start, end, nodes int, edges [][]int) (isConnected bool, distance int) {
+	queue := make([]int, 0)
+	discovered := make([]int, nodes)
+	discovered[start] = 1
+	queue = append(queue, start)
+	for len(queue) > 0 {
+		v := queue[0]
+		queue = queue[1:]
+		for i := 0; i < len(edges[v]); i++ {
+			if discovered[i] == 0 && edges[v][i] > 0 {
+				if i == end {
+					return true, discovered[v]
+				}
+				discovered[i] = discovered[v] + 1
+				queue = append(queue, i)
+			}
+		}
+	}
+	return false, 0
+}
+
+// ==== graph/breadthfirstsearch_test.go ====
+package graph
+
+import (
+
+func DepthFirstSearch(start, end int, nodes []int, edges [][]bool) ([]int, bool) {
+	return DepthFirstSearchHelper(start, end, nodes, edges, false)
+}
+
+// func main() {
+// 	nodes := []int{
+// 		1, 2, 3, 4, 5, 6,
+// 	}
+// 	/*
+// 		sample graph
+// 		①-②
+// 		|  |
+// 		③-④-⑤-⑥
+// 	*/
+// 	edges := [][]bool{
+// 		{false, true, true, false, false, false},
+// 		{true, false, false, true, false, false},
+// 		{true, false, false, true, false, false},
+// 		{false, true, true, false, true, false},
+// 		{false, false, false, true, false, true},
+// 		{false, false, false, false, true, false},
+// 	}
+
+pub fn bubble_sort<T: Ord>(arr: &mut [T]) {
+    if arr.is_empty() {
+        return;
+    }
+    let mut sorted = false;
+    let mut n = arr.len();
+    while !sorted {
+        sorted = true;
+        for i in 0..n - 1 {
+            if arr[i] > arr[i + 1] {
+                arr.swap(i, i + 1);
+                sorted = false;
+            }
+        }
+        n -= 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sorting::have_same_elements;
+// ==== web/express 路由域 ====
+    router.get('/foo', function (req, res, next) { next(new Error('should not run')) })
+// ==== python 文件IO域 ====
+with open(os.path.join(os.path.dirname(__file__), "data.sql"), "rb") as f:
+// ==== shell 真脚本域 ====
+main() {
+    trap 'rm readme_code test_file' EXIT
+
+    # Extract code blocks from the README.
+    while IFS=$'\n' read -r line; do
+        [[ "$code" && "$line" != \`\`\` ]] && printf '%s\n' "$line"
+        [[ "$line" =~ ^\`\`\`sh$ ]] && code=1
+        [[ "$line" =~ ^\`\`\`$ ]]   && code=
+    done < README.md > readme_code
+// ==== sql 查询域 ====
+        g.user = (
+            get_db().execute("SELECT * FROM user WHERE id = ?", (user_id,)).fetchone()
+            is not None
+        )
+
+
+@pytest.mark.parametrize(
+    ("username", "password", "message"),
+    (
+// ==== rust match/控制流域 ====
+        match *self {
+                Content::Bool(b) => serializer.serialize_bool(b),
+                Content::U8(u) => serializer.serialize_u8(u),
+                Content::U16(u) => serializer.serialize_u16(u),
+                Content::U32(u) => serializer.serialize_u32(u),
+                Content::U64(u) => serializer.serialize_u64(u),
+                Content::I8(i) => serializer.serialize_i8(i),
+                Content::I16(i) => serializer.serialize_i16(i),
+                Content::I32(i) => serializer.serialize_i32(i),
+                Content::I64(i) => serializer.serialize_i64(i),
+// ==== rust Result/? 域 ====
+    pub fn is_match<P: AsRef<Path>>(&self, path: P) -> bool {
+        self.re.is_match(&path.path)
+    }
+
+    /// Returns the `Glob` used to compile this matcher.
+    pub fn glob(&self) -> &Glob {
+        &self.pat
+// ==== express 中间件域 ====
+app.use(function(req, res, next){
+// ==== sql 聚合域 ====
+            get_db().execute("SELECT * FROM user WHERE id = ?", (user_id,)).fetchone()
+            is not None
+        )
+
+
+@pytest.mark.parametrize(

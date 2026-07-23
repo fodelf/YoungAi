@@ -241,72 +241,42 @@ int main(int argc, char **argv) {
     float *wh = xmalloc(maxrows * maxcols * sizeof(float));
     unsigned char *outbuf = xmalloc(maxrows * go1b_blk_row_bytes(maxcols));
 
-    /* Pass 1: residual bytes -> temp files. Sparse layers emit only active experts
-     * (in file order) + an F32[256] LUT tensor (expert id -> slot, -1 if absent). */
+    /* ★流式单遍(2026-07-23 盘墙修复)★: 张量尺寸全确定(rowbytes*K), 无需先暂存再组装。
+     * Pass A 只填元数据(不读 HF)→ 写 header → Pass B 逐张量即算即写输出。峰值盘 =
+     * 输出文件 + 单张量 RAM(~68MiB), 不再是全暂存~8G。旧 /tmp/res_L*.bin 暂存路径删除。 */
     int per_layer_t = sparse ? 4 : 3;
     int n_t = nL * per_layer_t;
     restensor *t = xmalloc((size_t)n_t * sizeof(*t));
-    int ti = 0;
     struct { const char *gguf; const char *hf; int rows, cols; } kinds[3] = {
         {"gate", "w1", DF, DM}, {"up", "w3", DF, DM}, {"down", "w2", DM, DF} };
+    /* Pass A: 元数据 (name/ne/size) — 尺寸由维度定, 不碰数据 */
+    int ti = 0;
     for (int li = 0; li < nL; li++) {
-        int L = layers[li];
-        int K = nact[li];
-        const int *elist = sparse ? active[li] : NULL;
+        int L = layers[li], K = nact[li];
         for (int k = 0; k < 3; k++) {
             restensor *rt = &t[ti++];
             rt->type = GGML_TYPE_GO1B;
             snprintf(rt->name, sizeof rt->name, "blk.%d.ffn_%s_exps_res.weight", L, kinds[k].gguf);
             rt->ne[0] = (uint64_t)kinds[k].cols; rt->ne[1] = (uint64_t)kinds[k].rows; rt->ne[2] = (uint64_t)K;
-            snprintf(rt->src, sizeof rt->src, "/tmp/res_L%d_%s.bin", L, kinds[k].gguf);
-            FILE *tf = fopen(rt->src, "wb"); if (!tf) die_errno("open temp");
-            size_t rowbytes = (size_t)kinds[k].rows * go1b_blk_row_bytes(kinds[k].cols);
-            for (int s = 0; s < K; s++) {
-                int e = sparse ? elist[s] : s;
-                char nm[96]; int64_t n;
-                snprintf(nm, sizeof nm, "layers.%d.ffn.experts.%d.%s.weight", L, e, kinds[k].hf);
-                float *W = hf_read_f32(db, nm, &n);
-                if (!W || n != (int64_t)kinds[k].rows * kinds[k].cols) { fprintf(stderr, "read %s n=%lld\n", nm, (long long)(W?n:-1)); die("hf_read"); }
-                if (bg) {
-                    bg_expert_dequant(bg, L, kinds[k].gguf, e, kinds[k].rows, kinds[k].cols, wh);
-                    residual_matrix_from_base(W, kinds[k].rows, kinds[k].cols, wh, outbuf);
-                } else {
-                    residual_matrix(W, kinds[k].rows, kinds[k].cols, scratch, wh, outbuf);
-                }
-                if (fwrite(outbuf, 1, rowbytes, tf) != rowbytes) die("write temp");
-                free(W);
-            }
-            fclose(tf);
-            rt->size = rowbytes * (size_t)K;
-            fprintf(stderr, "  %s ne=[%llu,%llu,%llu] %.1f MiB\n", rt->name,
-                    (unsigned long long)rt->ne[0],(unsigned long long)rt->ne[1],(unsigned long long)rt->ne[2], rt->size/1048576.0);
+            rt->size = (size_t)kinds[k].rows * go1b_blk_row_bytes(kinds[k].cols) * (size_t)K;
         }
         if (sparse) {
             restensor *rt = &t[ti++];
             rt->type = GGML_TYPE_F32;
             snprintf(rt->name, sizeof rt->name, "blk.%d.ffn_res_lut.weight", L);
             rt->ne[0] = NEXP; rt->ne[1] = 1; rt->ne[2] = 1;
-            snprintf(rt->src, sizeof rt->src, "/tmp/res_L%d_lut.bin", L);
-            FILE *tf = fopen(rt->src, "wb"); if (!tf) die_errno("open lut temp");
-            float lut[NEXP]; for (int e = 0; e < NEXP; e++) lut[e] = -1.0f;
-            for (int s = 0; s < K; s++) lut[elist[s]] = (float)s;
-            if (fwrite(lut, sizeof(float), NEXP, tf) != NEXP) die("write lut");
-            fclose(tf);
             rt->size = (size_t)NEXP * sizeof(float);
         }
     }
-    hf_close(db);
-    free(scratch); free(wh); free(outbuf);
-
     size_t align = DEFAULT_ALIGN, roff = 0;
     for (int i = 0; i < n_t; i++) { t[i].offset = roff; roff += pad_up(t[i].size, align); }
 
-    /* Pass 2: write the GGUF */
+    /* header */
     FILE *f = fopen(out_path, "wb"); if (!f) die_errno("open out");
     if (fwrite("GGUF", 1, 4, f) != 4) die("magic");
     w_u32(f, GGUF_VERSION);
     w_u64(f, (uint64_t)n_t);
-    w_u64(f, (uint64_t)(4 + nL));            /* arch + present + sparse + n_present + layer.{i} */
+    w_u64(f, (uint64_t)(4 + nL));
     w_kv_str(f, "general.architecture", "ds4-residual");
     w_kv_bool(f, "ds4.residual.present", true);
     w_kv_bool(f, "ds4.residual.sparse", sparse ? true : false);
@@ -320,14 +290,43 @@ int main(int argc, char **argv) {
     long pos = ftell(f); if (pos < 0) die("ftell");
     size_t data_off = pad_up((size_t)pos, align);
     write_padding(f, data_off - (size_t)pos);
-    for (int i = 0; i < n_t; i++) {
-        FILE *sf = fopen(t[i].src, "rb"); if (!sf) die_errno("open src");
-        unsigned char *cp = xmalloc(1<<20); size_t got, total = 0;
-        while ((got = fread(cp, 1, 1<<20, sf)) > 0) { if (fwrite(cp, 1, got, f) != got) die("copy"); total += got; }
-        free(cp); fclose(sf); remove(t[i].src);
-        if (total != t[i].size) die("size mismatch");
-        write_padding(f, pad_up(t[i].size, align) - t[i].size);
+
+    /* Pass B: 逐张量即算即写(顺序须与 Pass A 元数据一致) */
+    for (int li = 0; li < nL; li++) {
+        int L = layers[li], K = nact[li];
+        const int *elist = sparse ? active[li] : NULL;
+        for (int k = 0; k < 3; k++) {
+            size_t rowbytes = (size_t)kinds[k].rows * go1b_blk_row_bytes(kinds[k].cols);
+            size_t tsize = rowbytes * (size_t)K;
+            for (int s = 0; s < K; s++) {
+                int e = sparse ? elist[s] : s;
+                char nm[96]; int64_t n;
+                snprintf(nm, sizeof nm, "layers.%d.ffn.experts.%d.%s.weight", L, e, kinds[k].hf);
+                float *W = hf_read_f32(db, nm, &n);
+                if (!W || n != (int64_t)kinds[k].rows * kinds[k].cols) { fprintf(stderr, "read %s n=%lld\n", nm, (long long)(W?n:-1)); die("hf_read"); }
+                if (bg) {
+                    bg_expert_dequant(bg, L, kinds[k].gguf, e, kinds[k].rows, kinds[k].cols, wh);
+                    residual_matrix_from_base(W, kinds[k].rows, kinds[k].cols, wh, outbuf);
+                } else {
+                    residual_matrix(W, kinds[k].rows, kinds[k].cols, scratch, wh, outbuf);
+                }
+                if (fwrite(outbuf, 1, rowbytes, f) != rowbytes) die("write out");
+                free(W);
+            }
+            write_padding(f, pad_up(tsize, align) - tsize);
+            fprintf(stderr, "  blk.%d.ffn_%s_exps_res ne=[%d,%d,%d] %.1f MiB (streamed)\n",
+                    L, kinds[k].gguf, kinds[k].cols, kinds[k].rows, K, tsize/1048576.0);
+        }
+        if (sparse) {
+            float lut[NEXP]; for (int e = 0; e < NEXP; e++) lut[e] = -1.0f;
+            for (int s = 0; s < K; s++) lut[elist[s]] = (float)s;
+            size_t lsize = (size_t)NEXP * sizeof(float);
+            if (fwrite(lut, sizeof(float), NEXP, f) != NEXP) die("write lut");
+            write_padding(f, pad_up(lsize, align) - lsize);
+        }
     }
+    hf_close(db);
+    free(scratch); free(wh); free(outbuf);
     if (fclose(f) != 0) die_errno("close out");
     double mib = 0; for (int i = 0; i < n_t; i++) mib += t[i].size; mib /= 1048576.0;
     fprintf(stderr, "emit_residual: wrote %s  layers=%d  tensors=%d  sparse=%d  data=%.1f MiB\n",

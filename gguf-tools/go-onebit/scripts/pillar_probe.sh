@@ -12,7 +12,10 @@ RESID="${RESID-gguf/sidecars/code-hot-res-v2.gguf}"
 if [ -n "$RESID" ]; then export DS4_RESIDUAL="$RESID"; else unset DS4_RESIDUAL; fi
 NPRED="${NPRED:-28}"
 SEL="${PROBES:-first}"
-REPORT=/tmp/pillar_probe.report
+CORPUS="${CORPUS:-corpus/pillar_probes.txt}"   # 扩域口(2026-07-21): 换语料复用同判据
+[ -f "$CORPUS" ] || { echo "[probe] 语料 $CORPUS 缺失 — 拒跑" >&2; exit 2; }
+REPORT=/tmp/$(basename "$CORPUS" .txt).report
+[ "$CORPUS" = corpus/pillar_probes.txt ] && REPORT=/tmp/pillar_probe.report  # 旧默认路径不变
 : > "$REPORT"
 
 # 解析 pillar_probes.txt: --- 分块, 去 # 注释行; first 档取块 1,4,7,10(每支柱第1条)
@@ -21,7 +24,7 @@ mapfile_blocks() {
          { blk=""; nl = split($0, L, "\n");
            for (i = 1; i <= nl; i++) if (L[i] !~ /^#/) blk = blk (blk==""?"":"\n") L[i];
            gsub(/\n+$/, "", blk); sub(/^\n+/, "", blk);
-           if (blk != "") { n++; printf "%s\x1e", blk } }' corpus/pillar_probes.txt
+           if (blk != "") { n++; printf "%s\x1e", blk } }' "$CORPUS"
 }
 IFS=$'\x1e' read -r -a BLOCKS -d '' < <(mapfile_blocks; printf '\0') || true
 PICK=(0 3 6 9); [ "$SEL" = all ] && PICK=($(seq 0 $((${#BLOCKS[@]}-1))))

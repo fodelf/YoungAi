@@ -22,9 +22,14 @@ CHARS = int(os.environ.get("CHUNK_TOKENS", "512")) * 4      # ~4 chars/token
 simple, cplx = [], []
 
 # ---- code: function-level split, route by length ---------------------------
+# 2026-07-20 域放大: 切分边界覆盖多语言定义头(Go func / Py def·class / Rust fn·impl /
+# JS·TS function·export / Java·C 无通用头走文件界标); SPLIT_RE env 可覆盖。
+SPLIT_RE = os.environ.get(
+    "SPLIT_RE",
+    r"\n(?=func |def |class |fn |impl |function |export |// ==== )")
 for f in sorted(RAW.glob("*.code.txt")):
     txt = f.read_text(errors="ignore")
-    for block in re.split(r"\n(?=func |// ==== )", txt):
+    for block in re.split(SPLIT_RE, txt):
         if not block.strip(): continue
         (simple if block.count("\n") <= SIMPLE_MAX else cplx).append(block.strip())
 

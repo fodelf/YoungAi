@@ -15,7 +15,8 @@ NLAY="${DS4_NL:-43}"   # NL 覆盖口(2026-07-16): 小探针标定用 NL=6 局�
 [ -f "$IDS" ] || { echo "[rr_verdict] 语料 $IDS 缺失 — 拒跑" >&2; exit 2; }
 CTOK=$(grep -c . "$IDS"); [ "$NTOK" -gt "$CTOK" ] && NTOK=$CTOK
 N_HAVE=$(ls "$LDIR"/dql_L*.bin 2>/dev/null | wc -l | tr -d ' ' || true)
-[ "$N_HAVE" = "$NLAY" ] || { echo "[rr_verdict] dql 层文件 $N_HAVE/$NLAY 不齐(已被 merge consume?) — 拒跑" >&2; exit 3; }
+# ≥ 而非 =(2026-07-21): 中途部分层判决场景 — 满档跑到 L>NL 时前 NL 层文件已定型可回放
+[ "$N_HAVE" -ge "$NLAY" ] || { echo "[rr_verdict] dql 层文件 $N_HAVE/$NLAY 不够(已被 merge consume?) — 拒跑" >&2; exit 3; }
 cd "$QDIR"; [ -x ./ds4quant_run ] || ../scripts/quant_verify.sh build
 
 # ---- 内存看门狗(铁律: 吃内存的运行必须自带; 只杀本判决进程, 不动别的) ----

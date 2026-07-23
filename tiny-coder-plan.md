@@ -8,7 +8,8 @@
 
 ## 0. 一句话目标
 
-把 DeepSeek V4 Flash 量化到**极小体积**并用闭式后训练**还原到极好质量**（Go/计算机经典领域），
+把 DeepSeek V4 Flash 量化到**极小体积**并用闭式后训练**还原到极好质量**（**编程全域**/计算机经典领域
+——2026-07-20 用户裁决：域从"Go 为主"放大到整个编程领域，多语言 Python/JS/TS/Rust/C/Java/Shell/SQL 一视同仁），
 训练出**工程化灵魂**（诚实、长期专注、智能路由、容错、高效输出），多模态与后训练全部**插件化**，
 最终以 **ds4-server 接入 Claude Code** 完成日常开发。
 
@@ -51,7 +52,12 @@
 - **体积门**：≤24GB = 16G 单机可跑（消除双机依赖，速度和部署双赢）。
 
 ### P2：后训练域扩展（插件工厂）
-- 语料域：①Go 真项目（stdlib/gin/etcd 级别）②算法经典 ③重构 ④计算机底层。
+> 2026-07-20 域放大裁决：语料域从 Go 为主扩到**编程全域**。已有底子：rr_code 裁判语料
+> （coding_hard.txt）本就是多语言（Go/C/Rust/Python），纯 Go 代码锚在其上 smin 0.5104 =
+> 跨语言迁移在 base 层已存在；Go 专属的是行为面（探针面板/校准锚代码段/soul/knowledge-MTP 语料）。
+> 第一刀 = 多语言 15 针面板（corpus/prog_probes.txt + pillar_probe_srv.sh CORPUS 口）先测
+> v3p 现状基线，按针决定便宜路（语料/侧车扩产）vs 贵路（多语言锚重量化，需满档 8-13h 诚实价格）。
+- 语料域：①真项目（Go stdlib/gin/etcd 级别 + Python/TS/Rust/C 同级样本）②算法经典 ③重构 ④计算机底层 ⑤多语言惯用语（per-language 12-16 token 快判集）。
 - 每域产物 = 一个 z-corr 侧车 gguf（`X 激活捕获 → ds4_z_solve → 侧车`），运行时 `corr_switch` 热插拔。
 - knowledge-MTP 同步扩域：每域一个 `DS4_REF_CORPUS` 文本片段库（gin 样板等，加数据不加码）。
 - **门**：每域一套 12-16 token 快判集（快速质量验证铁律）+ 域内基准（如算法题 5 题）。
