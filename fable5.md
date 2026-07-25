@@ -2424,3 +2424,167 @@ ds4-code-dyn.gguf(42.47G, 全43层go1b, 编程imatrix激活感知per-block scale
 - ★隔离实测(干净down+pkill+up, 排除svc幂等冤枉)★: corr+残差=乱码; corr单挂无残差=同样乱码(缅甸文/他加禄词汤)。→ 非svc事故、非corr×残差冲突, corr-alone本身崩=严重大幅度错误。
 - ★判决★: bug在契约之下的深数值层(ds4_z_solve数学/捕获尺度/R计算之一), 非格式可修。corr/z侧车=跨会话深坑(dsml NO-GO + algo两代乱码)。止损: 不在部署栈循环里继续烧, corr真调试=专门隔离数值(CPU单X/R对 vs numpy重建逐元素对比), 独立任务。
 - 交付栈恢复健康: v3模型+v2 prog残差+knowledge-primer。algo.gguf侧车留档不删(数值调试用)。
+
+## 2026-07-23 夜(找到corr bug): ★复利爆炸——逐层激活空间修正联合应用发散★
+- ★numpy重建诊断(决定性)★: algo.gguf L20 的 U/V/C 提出+真实X重建: 幅度比corr/R=0.95, cos(corr,R)=0.9288 → corr侧车数学/闭式求解完全正确, R被高质量重建。
+- ★单层vs23层对比(根因锁定)★: corr单层(L20 only, 干净加载1/43)=`nums.sort()`可辨识代码不爆; corr 23层=缅甸文完全乱码爆炸。→ ★复利爆炸★: 每层corr独立拟合(假设别层不修正/学生态), 23层联合→上游修正使下游输入漂移→独立拟合失效→误差逐层复利指数爆。
+- ★为何残差不爆corr爆★: 残差=权重空间(Q1(W-Q1(W)), 改权重本身与激活无关, 联合一致); corr=激活空间(拟合特定X, 激活漂移即废)。本质区别, 回答用户"其他都好"直觉。
+- 契约审计副产品: zsolve↔CPU↔GPU三侧格式对齐/phi_yhat=false(x=ffn_norm对)/b·beta全零 —— 全部正确, 排除格式层。svc.sh worker用--corr basename(非gguf/sidecars前缀)=1层测试卡启动的基建坑。
+- 修复方向: ①阻尼α<1压复利(最便宜先试) ②顺序拟合(逐层重捕获漂移输入, 正确但贵) ③子集应用。
+
+## 2026-07-23 夜(corr bug结案): 复利爆炸=根因确证, DS4_CORR_SCALE阻尼已落码待稳定环境验
+- ★结论: corr的bug=逐层激活空间修正的联合复利爆炸★。三证据链闭合: ①numpy重建 corr侧车数学正确(cos0.93/幅度0.95) ②单层corr(1/43)=可辨识`nums.sort()`不爆 ③23层corr=缅甸文完全乱码。权重空间残差不爆(与激活无关)对照佐证。这是"其他都好单corr崩"的完整解释。
+- DS4_CORR_SCALE=α阻尼落码(ds4_corr.c, C上传前缩放副本, 零错误编译双机同步); α扫因dist基建抖动(worker --corr basename路径坑/慢针/反复崩)未跑成, 待稳定环境(单机不可载45.6G, 需专用dist稳定窗或numpy全前向模拟)。
+- ★真修复方向(结案判断)★: 阻尼=创可贴(压爆但欠拟合达不到teacher); 正解=顺序拟合(拟合L20→应用→重捕获L21漂移输入→逐层, 每层在已修正上游态上fit, 消除复利)。工程量=capture-solve链改逐层迭代。corr targets算法瑕疵+弱语言=二阶, 交付栈(v3+v2残差+knowledge)已可用, 顺序拟合排future。
+- 交付栈恢复健康。清理: M1DIR根的algo.gguf/corr_1layer.gguf临时件删, algo.gguf侧车留gguf/sidecars/(留档)。
+
+## 2026-07-23 夜(corr结案修正+runbook): ★"cos0.93"是单token误判, 均值0.18=激活空间受限★
+- ★诚实修正★: 固化 corr_reconstruct_check.py 跑 64-token 均值 → algo.gguf L20 mean cos=0.18/幅度0.18 FAIL(门0.85)。前"0.93"是 token0 离群大值误判(|R[0]|=1.89离群)。真相=rank-32只捕获R的18%, R大部高维噪声。
+- ★推深一层★: 与历史 go_onebit_activation_space_exhausted NO-GO 吻合(1-bit专家误差=高维噪声激活空间修正失败)。corr崩=弱拟合(0.18)×23层复利 双因素, 不只复利。
+- ★runbook落地★ corr_sequential_runbook.md: §0.5前置重建门(顺序拟合前必先验单层cos≥0.85, 否则激活空间墙顺序拟合白费→转rank/放弃)/§1顺序贪心拟合算法(逐层在已修正上游态重捕获)/§2复用资产/§3每层+整体判决门/§4铁律/§5三层小样10分钟先行/§6入口。诊断脚本 corr_reconstruct_check.py 固化。
+- 净判决: corr路线复活前置=重建门PASS; 现状algo.gguf 0.18=激活空间受限根本墙(非纯工程), 顺序拟合应先在新鲜单层拟合上验门, 不过则corr对1-bit残差是死路(与历史一致)。交付栈v3+v2残差+knowledge健康。
+
+## 2026-07-23 夜(收束/复读缺陷): DS4_LOOP_FUZZ模糊周期=对变长结构无效, 落opt-in杠杆
+- 8针问题集重跑现状(现役栈): 不变5针(P3空/SQL套娃/Rust-match递归/Println汤/Not-verified列举=收束复读吸引子)+意外上行1(Rust归并→真代码)+半过2。真顽固=收束/复读吸引子1类。
+- ★DS4_LOOP_FUZZ落码(ds4.c, 模糊周期容差, 每周期允许≤N token不匹配, continuation须精确, 默认0=现状精确, opt-in, 编译零错误penalty单测绿)★。
+- ★fuzz=1 A/B判决: 逐字节等fuzz=0=没开火★。根因(诚实): 结构攻击是变长(Not-verified `No bugs present.`4tok vs `No errors.`3tok长度不同/SQL每层更深/match结构生成), token级定长周期(即使容忍替换)抓不住变长自增殖。
+- ★结论★: 收束/复读缺陷需解析层/语义层(括号深度/AST节奏)=大工程非快改; token级anticycle到顶。DS4_LOOP_FUZZ留opt-in(定长模糊未来可能用)。这5针=1-bit采样吸引子的根本tail, 不在干净快改范围。交付栈恢复fuzz=0现役健康。
+
+## 2026-07-24 ★用户漂移诊断验证成功: 合并go2b输出级降28%误差★
+- 用户洞察: 现流程=量化(逐层贪心)→反修(base-alone上拟合z)→残差独立emit叠加→后训练; 从残差叠加起漂移(反修优化base单独输出, 部署跑base+残差, z不匹配)。提议: 除后训练外全合并先解漂移。
+- ★3层输出级验证(drift_output_check.py, 专家W@x vs 重建@x, FP教师真值)★: stacked(1+1bit各自拟合) L20-22 relL2=0.31/0.32/0.34 cos=0.957/0.951/0.945; joint go2b(合并2bit+DS4_GO2B_ACT_SCALE激活联合) relL2=0.22/0.24/0.26 cos=0.975/0.971/0.966 → ★joint降23-28%输出误差, 全层赢★。漂移定量=~28% gap。
+- ★关键洞察★: 权重级stacked赢(Q1逐行权重-L2最优)但输出级joint赢——证明现流程优化错目标(权重/中间层拟合, 没在部署真实输出上联合优化)。
+- ★基础设施已在★: GO2B类型(引擎+kernel)/encode_go2b+DS4_GO2B_ACT_SCALE(激活联合拟合, 本验证用它)/splice_go2b_inplace。一石二鸟=解漂移+等体积hot2冷1破rr天花板。历史go2b"恒等"负判不适用(那时无"反修在合并态"一致性)。
+- 下一步分阶段: ①3层已验✓ ②3层splice真模型验生成兑现 ③全量go2b热专家+反修在go2b前向 ④盘账emit流式复用。
+
+## 2026-07-24 ★全23层漂移验证: joint go2b均值降26.4%输出误差, 全层赢★
+- drift_output_check_all.py 全23深层(L20-42, cap_algo有数据): 每层joint go2b(合并2bit+act)胜stacked(1+1bit), 改善带+21.5%~+34.4%, 均值★+26.4%★。尾段L38-42达+28~34%(离logits近漂移代价最大, 合并收益最大)。
+- ★判决: 用户漂移诊断全层成立=全量go2b重建强GO信号★。合并联合拟合系统性降1/4专家输出误差。
+- 执行路径定版: 3层验证✓→全23层验证✓(本轮) → 下一步=go2b全模型重建(热专家2bit合并base+残差, 反修在go2b前向消backfit-z漂移, 冷专家保go1b=等体积hot2冷1); splice需GO2B槽位(v3纯GO1B), 走重建非原地; 盘账emit流式复用; 后训练corr插件不动。历史go2b恒等负判(无合并态反修)不适用。
+
+## 2026-07-24 ★go2b等体积执行(方案A) — 量化脚本改造 + 往返验证★
+- ★往返验证(实际编码字节decode, 非numpy返回值)★: L20/30/42 stacked 0.31/0.34/0.32 → go2b(None历史) 0.28/0.32/0.29(仅略好=恒等弱因) → go2b(激活) 0.22/0.25/0.23 = +26~29%。激活是唯一关键(DS4_GO2B_ACT_SCALE用cap raw_ffn_in)。
+- ★体积账等体积确认★: 现役=base go1b全256(1单位)+残差go1b热64(1)=320单位; 方案A=冷192 go1b(1)+热64 go2b(2)=320=真等体积(≈54.15G≈现役54.8G)。引擎go2b热/冷split基础设施已实现(g_moe_hot_*/g_hot_pick_slot/kernel_mul_mm_id_go2b/"hot go2b pass, base masks")。
+- ★量化脚本改造(build_go2b_hot.py, 派生自build_go2b_combined)★: ①只热K专家稀疏编码(ACT表, 非全256) ②encode_go2b喂激活Xh(raw_ffn_in)+ACT_SCALE ③lut稀疏(热→slot/冷→-1) ④tens ne[2]=Khot。语法绿。
+- 剩余大块=引擎稀疏冷base路由(base pass走冷192而非全256mask)使真等体积落地; 当前量化器侧foundational改造完成+验证。
+
+## 2026-07-24 go2b执行验证: 引擎路径通+激活encode验+盘墙 → 转引擎稀疏base
+- ★两正向验证★: ①激活最优go2b往返(实际bytes decode)+26~29%全23层(numerical+roundtrip) ②★引擎go2b(type41)热overlay端到端通★: build_go2b_hot 6层(L20-25,激活最优)挂v3, 引擎检测strict go2b+加载+应用无崩无乱码(输出可辨识退化码, 非corr缅甸文)=pipeline端到端soundness证。
+- ★盘墙★: 全43层go2b overlay=17.5GB中间物, M4/M1都~12G空闲装不下(base全256+go2b热=+9.2G冗余是overlay验证的固有代价)。等体积终态(冷稀疏base+go2b, 无独立残差)≈45.6G不产此大中间物。
+- ★判决: 两验证足以greenlight引擎稀疏base工程(真等体积deliverable直接产, 无17.5G中间物)★。6层生成质量非公平对比(37层裸), 全overlay验证盘阻塞且与真deliverable冗余。剩余=引擎base pass走稀疏冷192(非全256mask)+量化器emit稀疏cold base。交付栈恢复健康。
+
+## 2026-07-24 go2b重量化: 判据修正+runbook(不盲改精密量化器)
+- 用户点破: 1h生成验证是浪费, 要么分钟级要么重量化。理清: ★分钟级验证已完成(+26%专家输出, 往返实测全23层, 确定性)★; 任何生成端到端都须先build go2b(~50min stream+encode)非分钟级 → 不存在更便宜生成验证。
+- 决断: 走重量化, 但用管线自带 rr_verdict(teacher-forced smin vs FP锚, 分钟级确定性非生成)当每阶段判据 → 无"1h后才知道"。
+- 诚实: 全go2b重量化=深度C工程(ds4quant_run.c emit/replay + 引擎稀疏base), 盲改精密量化器一个bug=数h废模型=正是用户要避免的。不session内硬上手。
+- ★go2b_requant_runbook.md落地★: 集成点A(emit热go2b激活最优)/B(反修在go2b前向消漂移)/C(rr_verdict吃go2b分钟级判决)/D(引擎稀疏base等体积, 可延后); 分钟级门序(每层cos≥0.85→全层rr_verdict smin>0.3610→反修复测→43针); 铁律; 已否决捷径(None漏激活/corr死路/生成当判据)。
+- 净成果: 漂移诊断验证(26.4%)+激活关键锁定+引擎go2b路径可用+等体积账+build_go2b_hot/go2b_validate/drift_check脚本+runbook。重量化作为专门工程谨慎执行(3层小样门先行)。
+
+## 2026-07-24 ★go2b逐层输出质量门全过: 全43层均值+27.2%, 失败层=[]★
+- go2b_layer_quality.sh(全43层激活捕获cap_algo43双机→逐层go2b激活最优 vs stacked单层输出重建cos): 43层每层go2b优于stacked, 改善+20.8~34.1%, 均值+27.2%, ★失败层=[]★。首尾更高(L0 +30.5/L40-42 +31~34), 中段稳+25~28。补齐L0-19无死角。
+- ★重量化第1道分钟级门干净过★: 漂移方案全43层每层输出质量成立(非深层巧合)。
+- 总控脚本 go2b_requant.sh 落地(反修在链内脚本化, 集成点B: 反修在go2b前向消漂移): quality(过)→emit→backfit→verdict→merge→validate, 每阶段分钟级门。emit/backfit/merge硬闸=需ds4quant_run.c go2b C集成(runbook §2A/B/D), 未实现拒跑不静默错。
+- 下一步=go2b C集成(emit热go2b激活最优+replay dequant+引擎稀疏base), 3层小样门先行; 之后 go2b_requant.sh all 全链, rr_verdict分钟级判决(smin>0.3610赢线)。
+
+## 2026-07-24 ★go2b C集成落地: 编码器C移植parity完美 + 量化/反修/回放三路合并态贯通★
+- ★go2b_qc.h 落地(go2b_encode.py 逐行C移植)★: nf分位点+3轮Lloyd → GPTQ误差反馈(列组128 Hessian, double GJ逆) → 2轮act联合迭代(2×2闭式输出最优d1d2)。★parity探针(L20 e7, 真W+真激活256行): C relL2=0.2013/cos=0.9797 vs PY 0.2012/0.9797, 往返自检逐字节0误差 = 数值完美对齐★。工具 go2b_parity.c/.sh 固化。
+- ds4quant_run.c 三路集成: ①quant_apply/coadapt_worker 热专家(prog_active_top64)走 dq_quant_expert_go2b(合并态量化, D3轮热基座冻结用缓存输出scatter=精确等价) ②export 热专家 go2b 编码+逐层 GO2B_GATE(重建cos门0.85, w1/w2输出级) ③bytes_moe 回放热走 go2b dequant → 反修/rr_verdict 全在合并态前向(=用户方案核心: 残差+量化一体, 反修消漂移)。编译 -Wall -Wextra 零警告。
+- 3层机制探针(L0-2, S=16 fast): 热表加载Σ192/GO2B_GATE L0 cos=0.9497 PASS/L1 0.9429 PASS/侧车落盘/量化遍合并态跑通。用户裁决: 不做3层小样门, 直接全量+每层输出质量。
+- ★盘账墙+分储设计★: 全量层文件45G, M4余31G/M1余7G都装不下 → 冷go1b dql(热槽稀疏洞,26.3G)→M4规范layers; 热go2b改独立侧车 dql_go2b_L*.bin(17.5G)→M1规范layers(经NFS rw挂载); HF经NFS读M1; 计算在M4(快)。go2b从dql内嵌记录改侧车文件(磁盘可分储+格式不动dql)。lfile_load 侧车缺失+热表要求时硬拒(禁静默零回放)。
+- 清盘(过程产物): M1删 探针层文件/4旧锚/algo_solve/ref_dsml(dsml死路teacher捕获,可再生) → 22G; M4删 /tmp捕获副本 → 33G; rr_s305锚+语料已搬M4。两机盘门过(M1≥18/M4≥30)。
+- go2b_requant.sh 定版分储版: emit=quant_layer.sh满档本机(反修在链内, DS4_GO2B_HOT+DS4_GO2B_DIR), verdict=rr_verdict本机(侧车合并态回放), NFS/盘账硬闸。待NFS挂载(需sudo)即起飞。
+
+## 2026-07-24 傍晚 ★go2b 全量 emit 完成(43/43 全 PASS) + 反修 M4 死机事故与修正★
+- ★全量量化遍收官(M1, S=530 满档)★: 43 层 GO2B_GATE 全 PASS(cos 0.962-0.981, 门0.85); 全模型判决(反修前) ★Σmin=0.6474 / KL=0.9223★ vs 旧 base 同阶段 0.5105/1.7722 = 分布还原率+27%/KL 近半; 逐层累积 held vs 旧曲线 -12~-20%(深层更大, 旧峰值0.92/新0.80)。漂移方案全模型级兑现。
+- 分储链实跑修复三件: ①emit ssh 未分离(</dev/null)②rsync -S macOS 不保稀疏洞→sparsify_zeros.py(256K 粒度, 1MiB 对不齐专家槽打不净)③M4 盘满(删孤儿 v2 残差 8.6G——其 base 已被用户下令删除)。滚动搬运 43+43 文件到 M4 完成, M1 峰值仅~5G。
+- ★st_read 紧凑 JSON 陷阱★: 骨干子集(go2b_backbone_extract.py, 16G 非专家张量)首版用 json.dumps 默认带空格 → st_find "dtype":" 匹配静默失败 → embed NULL → 段错误 rc=139。修=紧凑 separators+原地改头(pad 补齐不动 16G 数据), st 冒烟 6 张量全 OK。
+- ★★M4 死机事故(最高约束违反, 已认账)★★: 反修(BF_ONLY)搬 M4 跑, footprint 0.2G/层爬升(L9 已 8.45G), 而 M4 盘只余 3-4G → swap 饿死 → 内核 watchdog panic 重启(与 07-06 mono 死机同签名)。9.5G 驱逐/11.5G 看门狗阈值是 M1(盘 60G+)口径, 不可移植到盘满机器。★修正=反修/判决固定回 M1(层文件传回 44G, M4 留双份备份), DS4_BF_MEMGB=8 收紧 + 外部看门狗 10.5G 强杀 + 盘≥12G 前置闸, 已编进 go2b_requant.sh★。层文件过重启完整性验证 86/86 无损。
+
+## 2026-07-24 晚 ★go2b 判决: rr_code smin=0.6917 vs 现役 0.3610 (+92%) — 漂移方案全链兑现★
+- ★正式判决(rr_code 305针 teacher-forced, M1 回放)★: smin=0.6917 kl=1.0468 ratio=2.35 top1=63.2%(fp82.9) — vs 现役 v3 全栈(base+残差+op链) floor 0.3610 = ★+92%★, runbook 赢线"显著>0.3610"大幅跨过。校准域 S=530: 0.6669/KL 0.884(vs 旧base 0.5105/1.772)。rr_hard 15tok 小样 0.2242 存疑(样本过小+无同代基线), 待大样复核。
+- ★终局sweep未跑之谜=07-22"反修前提铁律"闸★: quant_layer 满档分支 export DS4_BF_TERM_MAXP=0(v2 实证: 重型终端反修 rr 零贡献+行为回退) — backfit 模式也走此分支, DS4_BF_JUSTIFIED 无消费端, sweep 静默零轮(无 BACKFIT_TERM 行)。3层裸探针证 C 门正常(pass=0 落地=2)。首个"反修后+2pt"判读系回放路径口径差, 已诚实收回。
+- ★sweep A/B 开闸(合法性: rr基线在手+M4 dql全备份可回滚+新栈按'新方案忘旧判决'重测)★: 显式 MAXP=1 重跑 backfit 中, 判据=rr_code/S530 判决 vs 无sweep版, 净负即回滚 M4 备份。
+- M1 反修内存: BF_MEMGB=8 驱逐平台 8.1-8.3G 全程稳(死机修正后首个完整安全反修), 外部看门狗未触发。
+
+## 2026-07-24 夜 ★sweep 探针污染事故: 自查自纠(用户质疑对了)★
+- ★用户两连质疑全部成立★: ①"没有每一层反修"对 — sweep=每层评估(BFUNIT 行)+仅过不劣化全闸才落地(07-22 铁律语义), 首轮实况 9 评估/4 落地(L36/38/39/40), 37 文件未动; "全层都修"系我过度表述已收回。②"文件修改时间不对"对 — L00/L01 在 C 进程启动前(18:24-25)被无日志改写。
+- ★真凶=我的 3 层 sweep 门探针★: NL=3 探针把 DS4_LAYER_DIR 指向正式 layers 目录, BACKFIT_TERM 落地=2 = 用 16token rr_hard 探针语料重解 L00/L01 的 z.GL 写进正品(输出只在会话终端, 正式日志零痕迹)。时间线(探针 18:24-25 vs C 启动 18:26:41)/签名(z.GL payload+m1 原地改写)/笔数(落地=2) 三对齐。
+- 处置: 杀污染态 sweep(其 4 笔落地依据不净) → 6 个被改文件从 M4 备份逐一还原(md5 验证≡) → 干净 sweep 重启(go2b_backfit_clean.log)。
+- ★铁律新增: 探针永不指向正式产物目录 — 一律先拷 /tmp 副本再跑(带写路径的探针尤其)★。
+
+## 2026-07-24 深夜 ★干净sweep A/B收官: 净正但边际(+0.2pt), 定版sweep态★
+- 干净sweep(用户授权, 提前收割裁决): L42→L24 扫 19 层, 8 笔落地(L24/26/28/29/36/38/39/40, 全过不劣化全闸), 浅层候选塌缩至+0.0~0.3%全保持 → 用户批提前收割省2.5h。
+- ★A/B(rr_code 305, 同锚同口径)★: 无sweep smin=0.6917/kl=1.0468/ratio=2.3515 → sweep态 ★smin=0.6938/kl=1.0355/ratio=2.3079★ = 三指标齐正但边际(+0.3%/-1.1%/-1.9%)。07-22"终局反修边际"结论在新栈复证(但净正非零, 保留不回滚)。
+- ★定版: 层文件现役态=量化(合并态调优)+8笔深层sweep, rr_code smin=0.6938 vs 现役v3全栈 0.3610 = ★+92.2%★。M4 备份=post-emit纯净态(回滚锚点)。
+- 剩余高杠杆(按肉量): ①后训练插件(高维残差, 用户方案第三步) ②冷专家校准覆盖(每层60-90专家零校准行=胡言触发面根源) ③rr_hard大样复核(15tok小样0.2242未定论) ④merge等体积(需引擎稀疏base, runbook D)+行为门。
+
+## 2026-07-24 深夜 ①后训练corr插件: 新栈重建门双秩FAIL=结案死路(按序执行第1项)
+- 新增 DS4_BF_DUMPXR=L 捕获(BF_ONLY回放, X=学生态ffn_in, R=FP专家(同X同路由)−学生routed含op链, 纯专家量化残差口径) → L20 530tok。
+- ★重建门(runbook §0.5)★: rank-32 cos=0.157(旧栈0.18同量级) / rank-128 cos=0.385, z谱头0.33/0.33/0.30平坦≈满秩; 达0.85门需秩~10³=体积爆炸。★corr激活空间后训练对go2b新栈=死路结案(双栈双秩四点实测)★。顺序拟合投入被前置门省掉。
+- 后训练插件可行形态收敛: knowledge-primer(已在役)+server层; 能力肉转②冷专家校准覆盖。
+
+## 2026-07-25 凌晨 ②冷专家校准覆盖: 修复1942专家, rr_code 全指标齐升(按序执行第2项)
+- ★缺口量化(S=530锚ridx解析)★: 平均64.3/256专家/层零校准行(25%), 最差L15=94 — 胡言触发面定量底数。
+- 语料: build_calib_cold.sh(repo固化) = 现役calib前缀+10语言×2档节选+Go书3章混排, 21KB→5553tok; 判决语料(coding_hard/hard_eval)严格不混入。S=2000新锚: 零校准 64.3→★16.2★/层(最差94→30), 4倍收窄。
+- ★DS4_REPAIR_COLD 修复模式落地(ds4quant_run.c)★: 判据=旧锚0校准∧新锚≥1(热go2b/已校准不动, 其op链贡献≈0=风险最小); 新锚行重解signref(w2顺序补偿)原地pwrite。全43层修复=1942专家(L0-2=0, hash路由层本就全覆盖)。
+- ★判决(rr_code 305)★: smin 0.6938→0.6959, KL 1.0355→1.0159(-1.9%), top1一致 71.1→72.4 — 热域都受益, 零回退。长尾真判=rr_hard大样(③进行中)。
+
+## 2026-07-25 凌晨 ③rr_hard大样复核: 长尾真实=0.396(小样0.22是悲观偏差)(按序第3项)
+- hard_eval_v2(repo): 现役64tok前缀+Go书6章节选(与calib_cold用章严格隔离), 1507tok; rr_verdict S=400 held=99。
+- ★判决★: Σmin=0.3961 KL=2.20 PPL 5.78→51.3(×8.9) — 长尾弱但非崩塌, 新栈长尾≈现役栈编程域水平(0.361)。15tok小样0.2242系样本偏差, 退役。
+- 还原度定稿: 编程域0.696/长尾0.396/加权≈0.65-0.70; 1.29bit专家(整机~1.4bpw)零训练类别内per知识库无直接先例(限定词: 零训练+域内+非对称MoE)。
+
+## 2026-07-25 凌晨 corr门层无关性三点实证 + merge起跑(④)
+- 用户质疑"为什么只测L20"→补L05/L35: cos=0.169/0.153(L20=0.157), 浅中深三点齐FAIL且几乎等值 → ★墙层无关=三点实证结案★(1-bit残差高维噪声是全深度性质)。
+- 过程自纠: 我清/tmp误删首次L05/L35产物+merge kill_stale杀了捕获 → 暂停merge(可续并设计, 43dql完好)补捕获再续。教训同"探针不指正式目录"族: 共享/tmp清理前先查在跑任务依赖。
+- ④merge 续跑中(M1, 稀疏骨架+consume恒峰值); overlay转换器(侧车68B直拷→引擎残差格式)已备。
+
+## 2026-07-25 "46层 vs 43层"疑问核查: 无丢层, 46=shard文件数非层数
+- HF 原始 config.json: num_hidden_layers=43; safetensors index 实际张量 layers.0..42 = 43 层, 外加 1 个 mtp.0 模块(num_nextn_predict_layers=1, GGUF/ds4 主前向不用)+embed+head。
+- "46"来源 = checkpoint 按大小切的 46 个存储分片(model-00001-of-00046 ... 00046), 与层数无关。量化产物 43 层 = 完整无缺。
+
+## 2026-07-24 深夜 网页版 chat 页面落地: ds4-server GET / 直接提供浏览器聊天页
+- ★交付★: `web/chat.html`(零依赖单文件, 中文UI, 流式SSE+思考块+markdown/代码复制+t/s统计+多轮localStorage持久化+停止/重生成/导出) + ds4_server.c 新路由 GET `/`|`/chat`|`/index.html` → 同源回 web/chat.html(cwd契约同 metal/ 着色器, --chdir 同治; 无需 --cors; 每请求重读文件=改页刷新即生效, 免重启)。
+- 协议: 页面走 POST /v1/chat/completions(stream + stream_options.include_usage), 多轮整段重发 → 天然命中磁盘KV前缀复用; usage chunk 提供 prompt/cached/completion → 页面显示真实 t/s。
+- 验证: `./ds4_test --server` 全绿(新增 test_chat_page_route_serves_html/missing_404, socketpair 模型无关; AF_UNIX 8K 缓冲坑→SO_SNDBUF 512K); 编译零警告。M1 无需同步(只动 ds4_server.o, 非 CORE_OBJS, 分布式协议未触)。
+- 上线: 撞上 prog_sweep 43针在跑(pid 2898)→ 禁打断; 固化 `tools/svc_chatpage_smoke.sh`(等占用方退出→空闲闸→只杀 coordinator 同env `svc.sh up`→GET / + /v1/models + 8-token 流式三连冒烟)后台挂上, 结果待记。
+
+## 2026-07-25 凌晨 ★误读自纠: probe-srv 日志"块N"=探针片段非模型输出★
+- 用户抓破: 我把 sweep 日志 "[probe-srv N/15] 块N: ..."(=喂给模型的题目片段)当模型开块输出报质量, 并吹"三弱针开对"。考卷当答卷, 判读作废。
+- 有效证据只有归档报告 "── 续写(原始)" 段。真实15针: ≈11-12/15(Rust-match/SQL 弱针治愈✓, Express 仍✗, 新暴露=错误消息文本域两针崩=rr_hard长尾行为面映射)。
+- ★铁律: harness 过程日志行不作质量证据; 只认归档报告原始续写★(与"每一层反修"超前表述同族, 同日两犯)。
+- ★冒烟结果(23:41, sweep 结束后自动执行)★: GET / = HTTP 200/24243B/`<title>DwarfStar Chat</title>` ✓; /v1/models ✓; 8-token 流式三段(role→content→finish_reason=length→usage 15+8→[DONE])✓ 链路全通。③内容是 base 模型对超短裸问的复读("1+1=?…# User"), 链路无关。服务已带新路由常驻 :8013。
+
+## 2026-07-25 ★熵门控采样落地: 两崩针脱困+好针零扰动, A/B 赢线达成★
+- 病灶(用户促研): 15针面板 10/15 号(C错误串/JS栈帧)乱码 — v3/go2b 两代共有, 弱约束区平坦分布×temp0贪心×1.29bit噪声=吸引子链。联网文献三证: min-p(ICLR25, 重量化特效)/EDT 熵驱动动态温度/2512.04419"贪心+惩罚=病理"。
+- ★DS4_ENT_GATE 落码(ds4.c 采样器, ~70行)★: temp==0 且门开时 top-K 重归一熵 H≥τ(平坦) → min-p0.1+T0.9 固定种子采样; H<τ → 贪心不变。工具语法隔离=server in_tool_call 强制从 0.0 改传 -1.0 硬贪心哨兵(熵门只认 0.0)。svc.sh 加 EXTRA_ENV 透传。
+- ★A/B(τ=2.0, 面板同口径)★: C fprintf 乱码→真英文错误消息+合法二次fprintf(脱困); JS栈帧 碎片→合法 at X.run(native) 结构(结构性改善); C循环/SQL 对照逐字节不变(尖锐区零扰动实证); 门开火 16/56 token(~29%平坦区)。
+- 过程病自纠: 就绪探针 3s 超时<<20-40s 冷延迟 → 弃单排队自DoS 假卡死; 杀探针即愈(fast-probe 铁律补一条: 就绪探针超时须≥冷延迟)。
+
+## 2026-07-25 ★熵门参数空间四点收官: 定版 τ2.6+streak2+freq1.5, 编码逐字节安全已证★
+- 四点实测: τ2.0/s1(治愈错误文本/伤3代码针) | τ2.6/s2(代码逐字节安全/治愈打折) | τ2.6/s1(P1分叉熵≥2.6实证→τ单独分不开, streak才是分离器) | τ2.6/s2+freq1.5(freq对`_Integral`链无效=链片各异非token复读, 构造盲区)。
+- ★采样层天花板结论★: 代码结构三针逐字节回基线(硬保证); 错误文本从"乱码破坏结构"降级为"语法壳完整可编译+内容难看"(P4引号闭合/__func__()/分号全对); 内容质量受长尾0.40分布封顶, 采样层不可再买, 上行杠杆=bits/后训练。
+- 定版 EXTRA_ENV="DS4_ENT_GATE=2.6 DS4_ENT_STREAK=2 DS4_ENT_FREQ=1.5 DS4_ENT_TEMP=0.9 DS4_ENT_MINP=0.1"(freq 保留: 对通用复读族有效零害)。g3工具帧乱码疑门致(τ2.0时代), 终版43针复核。
+
+## 2026-07-25 ★铁律(用户令): 真实编码可用性优先——不能写真实代码就不跑任何任务★
+- 判据变更: 胜率(针/面板通过数)不是目标, ★真实编码场景可用性★才是。模型在真实任务(数百token完整代码)不可用时, 一切针扫/面板/评测=浪费时间, 禁跑。
+- 可用性判据=真任务产出: 可编译/完整/无乱码。验证工具=gen_coding_probe.sh(300-500tok 真任务)。
+
+## 2026-07-25 ★真实编码病链三层修复: 从零代码到真代码★(可用性铁律下的第一战)
+- ★病链实锤(trace 渲染层证据)★: 真实编码三任务零代码的真凶=服务层双 bug ①knowledge 检索 score≥1+≥3字符 → "and/each"停用词单命中即注入(Python 任务被塞 go-vet 参考) ②注入后"Based on the reference: "散文锚劫持 → BASE 模型合理续写=复述题目/答题。引擎写码能力(裸续写口径全天验证)从未被调用。
+- 修复三层: ①接口显式意图(用户方案): 请求体 "mode":"code"|"qa" → code=构造零注入+语言感知代码锚(python/rust/js...围栏), qa=检索+答问锚; 全4 API 解析环+渲染布线 ②auto 兜底: 问句形才检索(g1/g4 知识针保留) ③锚语言感知(硬编码```go→按提示词选围栏)。
+- ★启发式版实测(原文在案)★: Python 任务前8行完全正确(import/类头), Rust 真 imports — 从"零代码"到"真代码开头+长程衰减"。剩余病=300-500tok 长程衰减(注释区符号湍流/重复脚手架=弱约束区放大版), 针口径从未覆盖。mode:code 定判探针跑中。
+- 长程衰减下一步弹药(联网已备): 语法约束解码 MVP(括号/引号/收束状态机, 可编译性变保证) + MoE 翻转对比解码(平坦区委托 Q8 shared-only 干净前向, 零外部模型同词表)。
+
+## 2026-07-25 ★阶段收官(用户令): 72% 里程碑铭记, 转入量化方案 v2 设计研究★
+- ★里程碑定格★: 等体积 1.29bit 专家(整机~1.4bpw)零训练, 编程域 top1还原=72.4% / Σmin=0.696(现役0.361的1.9倍); 真实编码从零代码词汤修到 420token 无退化 LRU 实现(服务层三层修复+熵门); 瑕疵归因工具落地, 逐token实锤: 4瑕疵点2处=量化翻转(FP要写更干净代码), 根治杠杆=量化质量非提示/采样。
+- 收尾: 全部探针/面板/栈停; 成品=ds4-code2b.gguf(35G洞)+go2b-hot-overlay.gguf(17.5G)双机在位; mode:code 接口+熵门+知识门全落码。
+- ★新目标(用户令)★: 重开量化方案设计优化(联网+深挖), 提升还原率。方向预研: 旋转不相干化(QuaRot/Hadamard)/格码本(QuIP#-E8/QTIP-trellis/AQLM)/离群列钉扎(SpQR族)/MoE逐专家位分配, 叠加已证的合并态+顺序补偿纪律。
+- v2 设计文档落地: gguf-tools/go-onebit/quantv2-design.md (旋转RHT+QTIP trellis/E8码本+离群列钉扎+AlphaQ全局分配, 叠加v1合并态纪律; 门序G1=量化器侧分钟级A/B不动引擎)。
+
+## 2026-07-25 深研收割: 量化 v2.1 方案定稿
+- deep-research 工作流(5路检索→30源→110条带引文论断→56票对抗核实)按用户指令提前收割: 19条走完(4毙/15存活), 91条引文在案未核实。全文: gguf-tools/go-onebit/research/quantv2-deepresearch-2026-07-25.md (+appendix-raw)。
+- 击毙(防再踩): PTQ1.61/BTC-LLM 头条含训练组件(LoRA预处理/Adam学变换); HBLLM-vs-FrameQuant 体积对比是显存误读; BBT"零训练"基线实为 auto-round 梯度法。
+- 存活核心: ①块对角 sequency-Walsh 旋转比全局 Hadamard 在 2-bit ppl 减半(GSR, 20.29→11.59, 零字节零训练) ②HBLLM Haar 小波 1-bit @1.08bpw ppl6.71(NeurIPS25 spotlight, 全零训练) vs 我们 signref CIQ=2 ③结构化显著列 mask 0.0002bpw ④GPTAQ(ICML25)=我们合并态纪律的文献同构+残差项 ⑤WUSH: 自适应变换增益被 GPTQ 吃掉 4×(降温)。
+- 未核实高价值: MoE ILP 分配 +20.6分@2.05bpw; linear-block 粒度>整专家; 跨域校准 Code 崩 3.80%(印证 code 校准 load-bearing); QEP 阻尼警告(2-bit 全强度补偿有翻车例); 1-bit 禁朝漂移伪目标拟合。
+- v2.1 设计落地 quantv2-design.md: 块对角 sequency-Walsh + 冷小波分带结构化二值 + GPTAQ 内环 + linear-block ILP 分配 + 反修阻尼; 门序 G1a(量化器侧分钟级 A/B)先行。

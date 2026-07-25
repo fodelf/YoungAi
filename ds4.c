@@ -22210,6 +22210,7 @@ static int      g_loop_break = -1;
 static int      g_loop_esc_scanned = 0;
 static float    g_loop_esc = 3.0f;
 static int      g_loop_hard_k = 6;
+static int      g_loop_fuzz = 0;   /* DS4_LOOP_FUZZ: 模糊周期容差(每周期允许≤N个token不匹配), 0=现状精确 */
 
 /* Test-only: forget the env caches so tests/ds4_test.c --penalty-unit can
  * exercise several DS4_REPEAT_FREQ/DS4_REPEAT_WINDOW/DS4_LOOP_BREAK/
@@ -22270,8 +22271,10 @@ static float session_loop_escalation(int *hard_k_out) {
     if (!g_loop_esc_scanned) {
         const char *e = getenv("DS4_LOOP_ESC");
         const char *k = getenv("DS4_LOOP_HARD_K");
+        const char *fz = getenv("DS4_LOOP_FUZZ");
         if (e && e[0]) g_loop_esc = (float)atof(e);
         if (k && k[0]) g_loop_hard_k = (int)strtol(k, NULL, 10);
+        if (fz && fz[0]) { g_loop_fuzz = (int)strtol(fz, NULL, 10); if (g_loop_fuzz < 0) g_loop_fuzz = 0; if (g_loop_fuzz > 4) g_loop_fuzz = 4; }
         /* Negative/NaN slope would REWARD repetition; hard_k < 2 would ban
          * inside the k>=2 detection floor -- 2 restores the legacy
          * "third repetition is banned" behavior exactly. */
@@ -22371,9 +22374,18 @@ static void repeat_penalize_core(const int *v, uint32_t end, uint32_t gstart, fl
          * v[i]==v[i+P] run backwards — the escalation needs the true k, not
          * just "at least 2" — and escalate on the continuation v[end-P]. */
         for (uint32_t P = 1; P <= 64u && 2u * P <= avail; P++) {
+            /* 模糊周期(DS4_LOOP_FUZZ>0): 允许每周期≤fuzz个token不匹配 —— 抓"框架
+             * 重复+槽位变"的结构攻击(SQL套娃/No X列举/match递归, 逐字detector漏)。
+             * fuzz=0时退化为原精确匹配(m=true仅当零不匹配)。连续位(continuation)
+             * 必须匹配: 只有下一token确定被结构预测时才罚它。 */
+            uint32_t mis = 0;
             bool m = true;
             for (uint32_t j = 0; j < P; j++)
-                if (v[end - P + j] != v[end - 2u * P + j]) { m = false; break; }
+                if (v[end - P + j] != v[end - 2u * P + j]) {
+                    if (++mis > (uint32_t)g_loop_fuzz) { m = false; break; }
+                }
+            /* continuation v[end-P] 必须是精确匹配位, 否则罚错token */
+            if (m && g_loop_fuzz > 0 && v[end - P] != v[end - 2u * P]) m = false;
             if (!m) continue;
             /* ext = length of the maximal v[i]==v[i+P] run ending at end-P;
              * the periodic span is ext+P tokens, so k = 1 + ext/P complete
@@ -22533,6 +22545,70 @@ static void session_apply_repeat_penalty(ds4_session *s) {
     repeat_penalize_buf(s, s->logits, (uint32_t)s->checkpoint.len);
 }
 
+/* ===== 熵门控采样(DS4_ENT_GATE, 2026-07-25) =====
+ * 病灶: 弱约束区(字符串字面量/错误文本)FP 分布本就平坦, 1.29bit 量化噪声在平坦区翻 top-1,
+ * temp0 贪心把单次翻错复利成吸引子链(标识符链/复读环, v3/go2b 两代 15 针面板 10/15 号实证)。
+ * 方案(文献: min-p ICLR'25 对重量化模型特效 / EDT 熵驱动动态温度 / 2512.04419 贪心+惩罚=病理):
+ *   仅 temperature==0.0(全局贪心运行)且门开时: top-K 重归一熵 H ≥ τ(平坦) → min-p 截断
+ *   +低温采样(固定种子=跑间可复现); H<τ(尖锐=语法/结构区) → 贪心不变(好针零扰动)。
+ * 工具语法段隔离: server 的 in_tool_call 强制从 0.0 改传 -1.0(硬贪心哨兵), 门永不触碰工具帧。 */
+static float g_ent_gate_tau = -1.0f;   /* <0=未扫描; 0=关(默认) */
+static float g_ent_temp = 0.9f, g_ent_minp = 0.1f;
+static int   g_ent_topk = 40;
+static int   g_ent_streak_need = 2;    /* DS4_ENT_STREAK: 连续≥N 个平坦 token 才开火 —
+                                        * 代码分叉点=孤立熵尖峰(随后语法收紧)保持贪心(编码不伤);
+                                        * 错误文本=持续平坦带才采样(治吸引子链)。15针实测: τ2.0
+                                        * 无 streak 时 3 针代码分叉被误伤(fable5 2026-07-25)。 */
+static int   g_ent_streak = 0;
+static float g_ent_freq = 1.5f;        /* DS4_ENT_FREQ: 平坦区内频率惩罚(logit 单位, 近窗每次出现累减) —
+                                        * 文献分层第二层(2512.04419): 采样单用不斩链, τ2.6/s1 实测
+                                        * `_Integral` 链在采样下仍续(续链 token 分布内占优); 只在门内生效。 */
+static int   g_ent_freq_win = 48;      /* DS4_ENT_FREQ_WIN: 频率惩罚回看窗口(生成区内) */
+static uint64_t g_ent_rng = 0x5EEDC0DE2026ULL;   /* 会话内确定序列(DS4_ENT_SEED 覆盖) */
+static void ent_gate_scan(void) {
+    if (g_ent_gate_tau >= 0.0f) return;
+    const char *e = getenv("DS4_ENT_GATE");
+    g_ent_gate_tau = e ? (float)atof(e) : 0.0f;
+    if ((e = getenv("DS4_ENT_TEMP")) != NULL) g_ent_temp = (float)atof(e);
+    if ((e = getenv("DS4_ENT_MINP")) != NULL) g_ent_minp = (float)atof(e);
+    if ((e = getenv("DS4_ENT_TOPK")) != NULL) g_ent_topk = atoi(e);
+    if ((e = getenv("DS4_ENT_SEED")) != NULL) g_ent_rng = strtoull(e, NULL, 0);
+    if ((e = getenv("DS4_ENT_STREAK")) != NULL) g_ent_streak_need = atoi(e);
+    if (g_ent_streak_need < 1) g_ent_streak_need = 1;
+    if ((e = getenv("DS4_ENT_FREQ")) != NULL) g_ent_freq = (float)atof(e);
+    if ((e = getenv("DS4_ENT_FREQ_WIN")) != NULL) g_ent_freq_win = atoi(e);
+    if (g_ent_gate_tau > 0.0f)
+        fprintf(stderr, "ds4: entropy-gated sampling armed (tau=%.2f nats, streak>=%d, flat: temp=%.2f min_p=%.2f top_k=%d)\n",
+                g_ent_gate_tau, g_ent_streak_need, g_ent_temp, g_ent_minp, g_ent_topk);
+}
+/* top-K 重归一熵(nats): 单遍小插入选 K 个最大 logit → softmax → H。K=40 时 H∈[0, ln40≈3.69] */
+static float logits_topk_entropy(const float *logits, uint32_t n_vocab, int K) {
+    if (K > 64) K = 64;
+    float top[64];
+    int nt = 0;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        const float v = logits[i];
+        if (!isfinite(v)) continue;
+        if (nt < K) {
+            int j = nt++;
+            while (j > 0 && top[j - 1] < v) { top[j] = top[j - 1]; j--; }
+            top[j] = v;
+        } else if (v > top[K - 1]) {
+            int j = K - 1;
+            while (j > 0 && top[j - 1] < v) { top[j] = top[j - 1]; j--; }
+            top[j] = v;
+        }
+    }
+    if (nt == 0) return 0.0f;
+    double sum = 0.0;
+    for (int i = 0; i < nt; i++) sum += exp((double)(top[i] - top[0]));
+    double H = 0.0;
+    for (int i = 0; i < nt; i++) {
+        const double p = exp((double)(top[i] - top[0])) / sum;
+        if (p > 1e-12) H -= p * log(p);
+    }
+    return (float)H;
+}
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
     if (getenv("DS4_DECODE_DIAG")) {
         /* [decode-diag] inspect the logits the sampler is about to draw from:
@@ -22551,6 +22627,37 @@ int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p
                 argmax, amv, nonfinite, (unsigned)DS4_N_VOCAB);
     }
     session_apply_repeat_penalty(s);
+    ent_gate_scan();
+    if (temperature == 0.0f && g_ent_gate_tau > 0.0f) {
+        /* 平坦区逃逸: 只在全局贪心(temp==0)时评估; 工具语法段传 -1.0 永不进此支。
+         * streak 条件: 连续 N 个平坦 token 才开火 — 代码分叉点的孤立熵尖峰保持贪心。 */
+        const float H = logits_topk_entropy(s->logits, DS4_N_VOCAB, g_ent_topk);
+        if (H >= g_ent_gate_tau) {
+            g_ent_streak++;
+            if (g_ent_streak >= g_ent_streak_need) {
+                if (getenv("DS4_ENT_LOG"))
+                    fprintf(stderr, "ds4: [ent-gate] H=%.2f>=%.2f streak=%d flat-zone sample\n",
+                            H, g_ent_gate_tau, g_ent_streak);
+                if (g_ent_freq > 0.0f && s->checkpoint_valid && s->checkpoint.len > 0) {
+                    /* 平坦区频率惩罚: 近窗生成 token 每次出现累减 logit → 斩断续链偏好。
+                     * 只在门真开火时就地施加(logits 下一 token 重算, 无残留); 尖锐区/工具帧不受触。 */
+                    const uint32_t len = (uint32_t)s->checkpoint.len;
+                    uint32_t g0 = (s->repeat_gen_start > 0 && s->repeat_gen_start < (int)len)
+                                ? (uint32_t)s->repeat_gen_start : 0;
+                    uint32_t w0 = (len > (uint32_t)g_ent_freq_win && len - (uint32_t)g_ent_freq_win > g0)
+                                ? len - (uint32_t)g_ent_freq_win : g0;
+                    for (uint32_t t = w0; t < len; t++) {
+                        const int id = s->checkpoint.v[t];
+                        if (id >= 0 && id < (int)DS4_N_VOCAB) s->logits[id] -= g_ent_freq;
+                    }
+                }
+                return sample_top_p_min_p(s->logits, DS4_N_VOCAB, g_ent_temp, g_ent_topk,
+                                          1.0f, g_ent_minp, &g_ent_rng);
+            }
+        } else {
+            g_ent_streak = 0;
+        }
+    }
     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k, top_p, min_p, rng);
 }
 

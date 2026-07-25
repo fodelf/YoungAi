@@ -1,0 +1,35 @@
+# problem_probes.txt — 43针里仍有问题的针集合(2026-07-23)。raw续写口径复验现役栈。
+# P3 Python 文件(空输出)
+with open(path) as f:
+    for line in f:
+---
+# P12 SQL(套娃)
+SELECT u.id, COUNT(o.id) AS orders
+FROM users u
+JOIN orders o ON
+---
+# P8 Rust match(打转)
+match File::open(&path) {
+    Ok(f) =>
+---
+# algo P6 Rust归并(伪逻辑)
+fn merge(a: &[i32], b: &[i32]) -> Vec<i32> {
+    let (mut i, mut j) = (0, 0);
+    let mut out = Vec::new();
+    while i < a.len() && j < b.len() {
+---
+# algo P3 Py partition(do:串扰)
+def partition(a, lo, hi):
+    pivot = a[hi]
+    i = lo - 1
+---
+# 四支柱 P2 Println(符号汤)
+func main() {
+	fmt.Println(
+---
+# 四支柱 P11 Not verified(列举吸引子)
+Not verified. The edit compiled, but the test has not run
+---
+# P2 Python算法(注释先行)
+def two_sum(nums, target):
+    seen = {}

@@ -655,6 +655,7 @@ typedef struct {
     char *tool_force_name;   /* named tool to force, or NULL */
     bool tool_force_any;     /* force some tool call (name still model-chosen) */
     tool_replay_stats tool_replay;
+    int ds4_mode;            /* 接口显式意图(2026-07-25): 0=auto(问句启发式兜底) 1=code 2=qa */
 } request;
 
 static void tool_call_free(tool_call *tc) {
@@ -2320,8 +2321,29 @@ static void knowledge_load(const char *path) {
 
 /* word-overlap 打分: query 的每个 ≥4 字符词在 block 里出现即 +1 (大小写不敏感的粗匹配)。
  * 返回最佳块指针 (NULL=无库或零重叠, 不注入以免噪声)。 */
+/* 问句形判定(2026-07-25): knowledge-primer 只该救"无据知识问答", 祈使式编码任务
+ * ("Write a.../Implement...")注入参考=劫持成答题框架 → 三个真实编码任务零代码实证
+ * (trace: Python 任务被塞 go-vet 参考 + "Based on the reference:" 散文锚)。
+ * 根因叠加: score≥1 + ≥3字符 让 and/the/each 等停用词单命中即注入 = 滥命中。
+ * 修 = 问句形才允许检索(含 ? / 疑问词开头), 祈使式天然出局; g1/g4 知识针都是问句, 保住。 */
+static int g_req_mode = 0;   /* 当前请求的显式意图(request.ds4_mode 渲染前置位) */
+static bool query_is_question(const char *q) {
+    if (!q) return false;
+    if (strchr(q, '?') || strstr(q, "？")) return true;
+    while (*q && isspace((unsigned char)*q)) q++;
+    static const char *qw[] = { "what", "how", "why", "when", "which", "where", "who",
+                                "is ", "are ", "does ", "do ", "can ", "should ",
+                                "什么", "如何", "为什么", "怎么", "是否", "哪" };
+    for (size_t i = 0; i < sizeof(qw) / sizeof(qw[0]); i++) {
+        size_t n = strlen(qw[i]);
+        if (strncasecmp(q, qw[i], n) == 0) return true;
+    }
+    return false;
+}
 static const char *knowledge_retrieve(const char *query) {
     if (g_knowledge_n == 0 || !query || !query[0]) return NULL;
+    if (g_req_mode == 1) return NULL;             /* 接口声明 code → 零注入(硬保证) */
+    if (g_req_mode != 2 && !query_is_question(query)) return NULL;   /* auto 兜底: 祈使式零注入; qa 声明则放行 */
     int best = -1, best_score = 0;
     size_t qn = strlen(query);
     for (int k = 0; k < g_knowledge_n; k++) {
@@ -2709,7 +2731,34 @@ static char *render_chat_prompt_base_native(const chat_msgs *msgs, const char *t
             /* knowledge 命中→答问脚手架(不是空锚: 空锚下 base 会回显问题,
              * singleflight/read 实证; 引导词把续写钉进"陈述答案"分布)。 */
             if (knowledge_hit) anchor = "Based on the reference: ";
-            else anchor = (tool_schemas && tool_schemas[0]) ? "" : "```go\n";
+            else if (g_req_mode == 2) anchor = "Answer: ";   /* qa 声明无命中: 散文答问锚(禁代码框) */
+            else if (tool_schemas && tool_schemas[0]) anchor = "";
+            else {
+                /* 语言感知代码锚(2026-07-25): 硬编码 ```go 会把 Python/Rust 任务带偏
+                 * (真实编码探针实证链的收尾修)。按用户文本关键词选围栏, 未识别默认 go。 */
+                anchor = "```go\n";
+                const char *last_user = NULL;
+                for (int i = msgs->len - 1; i >= 0; i--)
+                    if (!strcmp(msgs->v[i].role, "user")) { last_user = msgs->v[i].content; break; }
+                if (last_user) {
+                    static const struct { const char *kw, *fence; } LK[] = {
+                        { "python", "```python\n" }, { "rust", "```rust\n" },
+                        { "typescript", "```typescript\n" }, { "javascript", "```javascript\n" },
+                        { " java", "```java\n" }, { "sql", "```sql\n" },
+                        { "shell", "```bash\n" }, { "bash", "```bash\n" },
+                        { " c++", "```cpp\n" }, { " c ", "```c\n" },
+                    };
+                    for (size_t li = 0; li < sizeof(LK) / sizeof(LK[0]); li++) {
+                        const char *p = last_user; bool hit = false;
+                        for (; *p; p++) {
+                            size_t n = strlen(LK[li].kw); size_t m = 0;
+                            while (LK[li].kw[m] && tolower((unsigned char)p[m]) == LK[li].kw[m]) m++;
+                            if (m == n) { hit = true; break; }
+                        }
+                        if (hit) { anchor = LK[li].fence; break; }
+                    }
+                }
+            }
         }
         buf_puts(&out, anchor);
     }
@@ -3146,6 +3195,16 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "mode")) {
+            /* 接口显式意图(2026-07-25 用户裁决: 写码/问答在调用处区分, 不靠服务端猜):
+             * "code"=零知识注入+语言感知代码锚; "qa"=允许检索+答问锚; 缺省=问句启发式兜底 */
+            char *mv = NULL;
+            if (!json_string(&p, &mv)) { free(key); goto bad; }
+            if (mv) {
+                if (!strcmp(mv, "code")) r->ds4_mode = 1;
+                else if (!strcmp(mv, "qa")) r->ds4_mode = 2;
+                free(mv);
+            }
         } else if (!strcmp(key, "temperature")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -3253,6 +3312,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
+    g_req_mode = r->ds4_mode;   /* 渲染前置位(单图worker串行, 静态安全同 argmax scratch 纪律) */
     r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
                                              &r->tool_orders, r->think_mode,
                                              &r->prompt_conv_off);
@@ -3396,6 +3456,16 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "mode")) {
+            /* 接口显式意图(2026-07-25 用户裁决: 写码/问答在调用处区分, 不靠服务端猜):
+             * "code"=零知识注入+语言感知代码锚; "qa"=允许检索+答问锚; 缺省=问句启发式兜底 */
+            char *mv = NULL;
+            if (!json_string(&p, &mv)) { free(key); goto bad; }
+            if (mv) {
+                if (!strcmp(mv, "code")) r->ds4_mode = 1;
+                else if (!strcmp(mv, "qa")) r->ds4_mode = 2;
+                free(mv);
+            }
         } else if (!strcmp(key, "temperature")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -3488,6 +3558,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
+    g_req_mode = r->ds4_mode;   /* 渲染前置位(单图worker串行, 静态安全同 argmax scratch 纪律) */
     r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
                                              &r->tool_orders, r->think_mode,
                                              &r->prompt_conv_off);
@@ -4301,6 +4372,16 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "mode")) {
+            /* 接口显式意图(2026-07-25 用户裁决: 写码/问答在调用处区分, 不靠服务端猜):
+             * "code"=零知识注入+语言感知代码锚; "qa"=允许检索+答问锚; 缺省=问句启发式兜底 */
+            char *mv = NULL;
+            if (!json_string(&p, &mv)) { free(key); goto bad; }
+            if (mv) {
+                if (!strcmp(mv, "code")) r->ds4_mode = 1;
+                else if (!strcmp(mv, "qa")) r->ds4_mode = 2;
+                free(mv);
+            }
         } else if (!strcmp(key, "temperature")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -4445,6 +4526,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     responses_prepare_live_continuation(r, &msgs);
+    g_req_mode = r->ds4_mode;   /* 渲染前置位(单图worker串行, 静态安全同 argmax scratch 纪律) */
     r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
                                              &r->tool_orders, r->think_mode,
                                              &r->prompt_conv_off);
@@ -4537,6 +4619,16 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
             if (!json_int(&p, &r->max_tokens)) {
                 free(key);
                 goto bad;
+            }
+        } else if (!strcmp(key, "mode")) {
+            /* 接口显式意图(2026-07-25 用户裁决: 写码/问答在调用处区分, 不靠服务端猜):
+             * "code"=零知识注入+语言感知代码锚; "qa"=允许检索+答问锚; 缺省=问句启发式兜底 */
+            char *mv = NULL;
+            if (!json_string(&p, &mv)) { free(key); goto bad; }
+            if (mv) {
+                if (!strcmp(mv, "code")) r->ds4_mode = 1;
+                else if (!strcmp(mv, "qa")) r->ds4_mode = 2;
+                free(mv);
             }
         } else if (!strcmp(key, "temperature")) {
             double v = 0.0;
@@ -5402,6 +5494,49 @@ static bool http_error_context_length_exceeded(int fd, bool enable_cors,
 /* Streaming is a translation state machine over the raw DS4 text.  The model
  * may produce <think> and DSML tool blocks; clients should receive those as
  * protocol-native reasoning/tool deltas, never as visible assistant text. */
+/* ---- Built-in browser chat page ----------------------------------------
+ * GET /, /chat and /index.html serve web/chat.html verbatim.  The path is
+ * resolved against the working directory — the same cwd contract as the
+ * Metal shader sources under metal/, so --chdir fixes both.  Same-origin
+ * serving keeps the
+ * page's fetch()es CORS-free; --cors stays only for pages hosted elsewhere.
+ * The file is re-read per request: it is tens of KB, and editing the page
+ * then refreshing the browser must not require a server restart. */
+#define DS4_CHAT_PAGE_FILE "web/chat.html"
+
+static char *read_text_file_dup(const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return NULL;
+    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return NULL; }
+    long n = ftell(fp);
+    if (n < 0) { fclose(fp); return NULL; }
+    rewind(fp);
+    char *text = malloc((size_t)n + 1);
+    if (!text) { fclose(fp); return NULL; }
+    size_t got = fread(text, 1, (size_t)n, fp);
+    fclose(fp);
+    text[got] = '\0';
+    return text;
+}
+
+static bool serve_chat_page(int fd, bool enable_cors, const char *path) {
+    char *html = read_text_file_dup(path);
+    if (!html) {
+        return http_error(fd, enable_cors, 404,
+                          "chat page file " DS4_CHAT_PAGE_FILE " not found; "
+                          "start ds4-server from the repo root or pass --chdir");
+    }
+    bool ok = http_response(fd, enable_cors, 200, "text/html; charset=utf-8", html);
+    free(html);
+    return ok;
+}
+
+/* Route match that tolerates a query string ("/?from=x" is still "/"). */
+static bool path_route_is(const char *path, const char *route) {
+    size_t n = strlen(route);
+    return strncmp(path, route, n) == 0 && (path[n] == '\0' || path[n] == '?');
+}
+
 static bool sse_headers(int fd, bool enable_cors) {
     buf h = {0};
     buf_puts(&h,
@@ -11532,7 +11667,8 @@ guided_primer:
             min_p = DS4_DEFAULT_MIN_P;
         }
         if (in_tool_call && !dsml_decode_state_uses_payload_sampling(dsml_state)) {
-            temperature = 0.0f;
+            temperature = -1.0f;   /* 硬贪心哨兵: 采样器按 temp<=0 仍走 argmax, 但熵门(DS4_ENT_GATE
+                                    * 只在 temp==0.0 开火)永不触碰工具语法帧 — 语法确定性铁律不破 */
         }
         int token = ds4_session_sample(s->session, temperature, top_k, top_p, min_p, &rng);
         if (token == ds4_token_eos(s->engine)) {
@@ -12422,6 +12558,14 @@ static void *client_main(void *arg) {
         goto done;
     }
 
+    if (!strcmp(hr.method, "GET") &&
+        (path_route_is(hr.path, "/") || path_route_is(hr.path, "/chat") ||
+         path_route_is(hr.path, "/index.html"))) {
+        serve_chat_page(fd, s->enable_cors, DS4_CHAT_PAGE_FILE);
+        http_request_free(&hr);
+        goto done;
+    }
+
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
         send_models(s, fd);
         http_request_free(&hr);
@@ -12752,6 +12896,7 @@ static void usage(FILE *fp) {
         "\n"
         "Notes:\n"
         "  Use /v1/chat/completions, /v1/responses, /v1/completions, or /v1/messages.\n"
+        "  GET / serves a browser chat page from web/chat.html (same origin, no --cors needed).\n"
         "  Larger --ctx values allocate more KV memory at startup; the startup log prints the estimate.\n"
         "  Disk KV caching is best for agents that resend long prompts with stable prefixes.\n"
         "\n"
@@ -13049,6 +13194,18 @@ int main(int argc, char **argv) {
     }
     g_listen_fd = lfd;
     server_log(DS4_LOG_DEFAULT, "ds4-server: listening on http://%s:%d", cfg.host, cfg.port);
+    {
+        struct stat page_st;
+        if (stat(DS4_CHAT_PAGE_FILE, &page_st) == 0) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: browser chat page on http://%s:%d/",
+                       cfg.host, cfg.port);
+        } else {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: %s not found from this working directory; "
+                       "GET / will 404 (--chdir to the repo root enables the chat page)",
+                       DS4_CHAT_PAGE_FILE);
+        }
+    }
 
     while (!g_stop_requested) {
         int fd = accept(lfd, NULL, NULL);
@@ -13518,6 +13675,50 @@ static void test_cors_sse_headers(void) {
     TEST_ASSERT(strstr(out, "Content-Type: text/event-stream") != NULL);
     TEST_ASSERT(strstr(out, "Access-Control-Allow-Origin: *") != NULL);
 
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_chat_page_route_serves_html(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+    /* The page is larger than the default AF_UNIX pipe buffer and the test
+     * reads only after the full synchronous write; widen both ends so
+     * serve_chat_page() cannot block against the unread response. */
+    int sockbuf = 512 * 1024;
+    TEST_ASSERT(setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &sockbuf, sizeof(sockbuf)) == 0);
+    TEST_ASSERT(setsockopt(sv[1], SOL_SOCKET, SO_RCVBUF, &sockbuf, sizeof(sockbuf)) == 0);
+
+    TEST_ASSERT(serve_chat_page(sv[0], false, DS4_CHAT_PAGE_FILE));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "HTTP/1.1 200 OK") != NULL);
+    TEST_ASSERT(strstr(out, "Content-Type: text/html; charset=utf-8") != NULL);
+    TEST_ASSERT(strstr(out, "/v1/chat/completions") != NULL);
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+
+    /* Route matcher: exact path or query-string suffix only. */
+    TEST_ASSERT(path_route_is("/", "/"));
+    TEST_ASSERT(path_route_is("/?from=bookmark", "/"));
+    TEST_ASSERT(path_route_is("/chat", "/chat"));
+    TEST_ASSERT(path_route_is("/chat?x=1", "/chat"));
+    TEST_ASSERT(!path_route_is("/chatter", "/chat"));
+    TEST_ASSERT(!path_route_is("/v1/models", "/"));
+}
+
+static void test_chat_page_missing_file_is_404(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+    serve_chat_page(sv[0], false, "web/__no_such_page__.html");
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "HTTP/1.1 404") != NULL);
+    TEST_ASSERT(strstr(out, DS4_CHAT_PAGE_FILE) != NULL);
     free(out);
     close(sv[0]);
     close(sv[1]);
@@ -17161,6 +17362,8 @@ static void ds4_server_unit_tests_run(void) {
     test_cors_headers_are_opt_in();
     test_cors_preflight_response_is_no_content();
     test_cors_sse_headers();
+    test_chat_page_route_serves_html();
+    test_chat_page_missing_file_is_404();
     test_anthropic_live_stream_sends_incremental_blocks();
     test_anthropic_usage_reports_cache_details();
     test_anthropic_tool_stream_sends_live_tool_use();

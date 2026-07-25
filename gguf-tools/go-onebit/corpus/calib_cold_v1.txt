@@ -1,0 +1,579 @@
+// ==== python ====
+    def route(self, rule: str, **options: t.Any) -> t.Callable[[T_route], T_route]:
+        """Decorate a view function to register it with the given URL
+        rule and options. Calls :meth:`add_url_rule`, which has more
+        details about the implementation.
+
+        .. code-block:: python
+
+            @app.route("/")
+            def index():
+// ==== javascript ====
+export default function dispatchRequest(config) {
+  throwIfCancellationRequested(config);
+
+  config.headers = AxiosHeaders.from(config.headers);
+
+  // Transform request data
+  config.data = transformData.call(config, config.transformRequest);
+
+// ==== rust ====
+    pub fn is_match<P: AsRef<Path>>(&self, path: P) -> bool {
+        self.is_match_candidate(&Candidate::new(path.as_ref()))
+    }
+
+    /// Tests whether the given path matches this pattern or not.
+    pub fn is_match_candidate(&self, path: &Candidate<'_>) -> bool {
+// ==== typescript ====
+export function reactive(target: object) {
+  // if trying to observe a readonly proxy, return the readonly version.
+  if (isReadonly(target)) {
+    return target
+  }
+  return createReactiveObject(
+    target,
+// ==== c ====
+static void assoc_expand(void) {
+    old_hashtable = primary_hashtable;
+
+    primary_hashtable = calloc(hashsize(hashpower + 1), sizeof(void *));
+    if (primary_hashtable) {
+        if (settings.verbose > 1)
+// ==== java ====
+  public <T> T fromJson(String json, Class<T> classOfT) throws JsonSyntaxException {
+    return fromJson(json, TypeToken.get(classOfT));
+  }
+
+  /**
+   * This method deserializes the specified JSON into an object of the specified type. This method
+// ==== go ====
+func TestDuplicatedLinks(t *testing.T) {
+	doc := goqueryFromReadme(t)
+	links := make(map[string]bool, 0)
+	doc.Find("body li > a:first-child").Each(func(_ int, s *goquery.Selection) {
+		t.Run(s.Text(), func(t *testing.T) {
+			href, ok := s.Attr("href")
+			if !ok {
+// ==== issuefix ====
+
+=== ISSUE #6093: IPv6 addresses parsed incorrectly because of `.partition(":")`? ===
+Hi, I checked the code and saw that two places use `.partition(":")` on addresses, and IPv6 ad
+// ==== method ====
+## Cache penetration (缓存穿透)
+
+Queries for keys that exist in neither cache nor database bypass the cache every time and
+hammer the database. Two standard fixes:
+// ==== soul ====
+An engineering answer is only worth its evidence. Four rules, always:
+
+
+// ==== python ====
+    def route(self, rule: str, **options: t.Any) -> t.Callable[[T_route], T_route]:
+        """Decorate a view function to register it with the given URL
+        rule and options. Calls :meth:`add_url_rule`, which has more
+        details about the implementation.
+
+        .. code-block:: python
+
+            @app.route("/")
+            def index():
+// ==== javascript ====
+export default function dispatchRequest(config) {
+  throwIfCancellationRequested(config);
+
+  config.headers = AxiosHeaders.from(config.headers);
+
+  // Transform request data
+  config.data = transformData.call(config, config.transformRequest);
+
+// ==== rust ====
+    pub fn is_match<P: AsRef<Path>>(&self, path: P) -> bool {
+        self.is_match_candidate(&Candidate::new(path.as_ref()))
+    }
+
+    /// Tests whether the given path matches this pattern or not.
+    pub fn is_match_candidate(&self, path: &Candidate<'_>) -> bool {
+// ==== typescript ====
+export function reactive(target: object) {
+  // if trying to observe a readonly proxy, return the readonly version.
+  if (isReadonly(target)) {
+    return target
+  }
+  return createReactiveObject(
+    target,
+// ==== c ====
+static void assoc_expand(void) {
+    old_hashtable = primary_hashtable;
+
+    primary_hashtable = calloc(hashsize(hashpower + 1), sizeof(void *));
+    if (primary_hashtable) {
+        if (settings.verbose > 1)
+// ==== java ====
+  public <T> T fromJson(String json, Class<T> classOfT) throws JsonSyntaxException {
+    return fromJson(json, TypeToken.get(classOfT));
+  }
+
+  /**
+   * This method deserializes the specified JSON into an object of the specified type. This method
+// ==== go ====
+func TestDuplicatedLinks(t *testing.T) {
+	doc := goqueryFromReadme(t)
+	links := make(map[string]bool, 0)
+	doc.Find("body li > a:first-child").Each(func(_ int, s *goquery.Selection) {
+		t.Run(s.Text(), func(t *testing.T) {
+			href, ok := s.Attr("href")
+			if !ok {
+				t.Error("expected to have href")
+			}
+			if links[href] {
+				t.Fatalf("duplicated link '%s'", href)
+			}
+			links[href] = true
+// ==== issuefix ====
+
+=== ISSUE #6093: IPv6 addresses parsed incorrectly because of `.partition(":")`? ===
+Hi, I checked the code and saw that two places use `.partition(":")` on addresses, and IPv6 ad
+// ==== method ====
+## Cache penetration (缓存穿透)
+
+Queries for keys that exist in neither cache nor database bypass the cache every time and
+hammer the database. Two standard fixes:
+// ==== soul ====
+An engineering answer is only worth its evidence. Four rules, always:
+
+
+// ==== .github/PULL_REQUEST_TEMPLATE/pull_request.md ====
+#### Description of Change
+<!--
+Thank you for your Pull Request. Please provide a description above and review
+the requirements below.
+
+Contributors guide: https://github.com/TheAlgorithms/Go/CONTRIBUTING.md
+-->
+
+#### Checklist
+<!-- Remove items that do not apply. For completed items, change [ ] to [x]. -->
+
+- [ ] Added description of change
+- [ ] Added file name matches [File name guidelines](https://github.com/TheAlgorithms/Go/blob/master/CONTRIBUTING.md#New-File-Name-guidelines)
+- [ ] Added tests and example, test must pass
+- [ ] Added documentation so that the program is self-explanatory and educational - [GoDoc guidelines](https
+// ==== CONTRIBUTING.md ====
+# CONTRIBUTION GUIDELINES
+
+## Before contributing
+
+Welcome to [TheAlgorithms/Go](https://github.com/TheAlgorithms/Go)! Before submitting pull requests, please make sure that you have **read the whole guidelines**. If you have any doubts about this contribution guide, please open [an issue](https://github.com/TheAlgorithms/Go/issues/new/choose) or ask in our [Discord server](https://the-algorithms.com/discord/) / [Gitter](https://gitter.im/TheAlgorithms), and clearly state your concerns.
+
+## Contributing
+
+### Maintainers
+---
+
+Please check the [`CODEOWNERS`](https://github.com/TheAlgorithms/Go/blob/master/.github/CODEOWNERS) file for a list of repository maintainer
+// ==== .cargo/config.toml ====
+# On Windows MSVC, statically link the C runtime so that the resulting EXE does
+# not depend on the vcruntime DLL.
+#
+# See: https://github.com/BurntSushi/ripgrep/pull/1613
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# Do the same for MUSL targets. At the time of writing (2023-10-23), this is
+# the default. But the plan is for the default to change to dynamic linking.
+# The whole point of MUSL with respect to ripgrep is to create a fully
+# statically linked executable.
+#
+# See: https://github.com/rust-lang/compiler-team/issues/422
+# See: https://
+// ==== CHANGELOG.md ====
+TBD
+===
+Unreleased changes. Release notes have not yet been written.
+
+
+15.2.0 (2026-07-15)
+===================
+This release fixes a number of bugs related to gitignore matching as well as
+some performance improvements in directory tree traversal.
+
+Platform support:
+
+* `aarch64-unknown-linux-musl` is now included in the release binaries for
+  ripgrep.
+
+Performance improvements:
+
+* [PERF #3293](https://github.com/BurntSushi/ripgrep/issues/3293):
+  Improves directory traversal time on very large corpora.
+
+Feature enhancements:
+
+* [FEATURE #3275](https://github.com/BurntSushi/ripgrep/issues/3275):
+  ripgrep now respects `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM`.
+
+Bug 
+// ==== .github/pull_request_template.md ====
+### Describe your change:
+
+
+
+* [ ] Add an algorithm?
+* [ ] Fix a bug or typo in an existing algorithm?
+* [ ] Add or change doctests? -- Note: Please avoid changing both code and tests in a single pull request.
+* [ ] Documentation change?
+
+### Checklist:
+* [ ] I have read [CONTRIBUTING.md](https://github.com/TheAlgorithms/Python/blob/master/CONTRIBUTING.md).
+* [ ] This pull request is all my own work -- I have not plagiarized.
+* [ ] I know that pull requests will not be merged if they fail the automated tests.
+* [ ] This PR only changes one algorithm file.  To ease review, please open separate PRs for separate algorithms.
+* [ ] All new Python file
+// ==== .devcontainer/README.md ====
+# Development Container
+
+This is **Devcontainer** configuration to provide a consistent development environment for all contributors.
+
+## Features
+
+- [x] Pre-configured **Python environment**
+- [x] Automatic installation of **pre-commit hooks**
+- [x] **Ruff** linter ready to check your code
+- [x] **Oh My Zsh** with plugins:
+- `zsh-autosuggestions`
+- `zsh-syntax-highlighting`
+
+## Usage
+
+1. Install [**Docker** ](https://www.docker.com/get-started/) and [**Visual Studio Code**](https://code.visualstudio.com/)
+2. Install the **Remote - Containers** extension in VS Code
+
+    - Do `CTRL+P`, paste this command and press `Enter`
+
+        ```shell
+        ext inst
+// ==== .github/pull_request_template.md ====
+[![Open in Gitpod](https://gitpod.io/button/open-in-gitpod.svg)](https://gitpod.io/from-referrer/)&nbsp;[know more](https://www.gitpod.io/docs/pull-requests/)
+
+### Describe your change:
+
+- [ ] Add an algorithm?
+- [ ] Fix a bug or typo in an existing algorithm?
+- [ ] Documentation change?
+
+### Checklist:
+
+- [ ] I have read [CONTRIBUTING.md](https://github.com/TheAlgorithms/Javascript/blob/master/CONTRIBUTING.md).
+- [ ] This pull request is all my own work -- I have not plagiarized.
+- [ ] I know that pull requests will not be merged if they fail the automated tests.
+- [ ] This PR only changes one algorithm file. To ease review, please open separate
+function pathsToMarkdown (filePaths) {
+  const output = []
+
+  let oldPath = ''
+  filePaths.sort(function (a, b) {
+    if (a.toLowerCase() < b.toLowerCase()) return -1
+    if (a.toLowerCase() > b.toLowerCase()) return 1
+    return 0
+  })
+
+  for (let filepath of filePaths) {
+    let filename = path.basename(filepath)
+    filepath = path.dirname(filepath)
+
+    if (filepath !== oldPath) {
+      oldPath = printPath(oldPath, filepath, output)
+    }
+
+    let indent = filepath.split(path.sep).length
+
+    // prepare the markdown-esque prefix to the file's line
+    const prefix = pathPrefix(indent)
+
+    // remove extension from filename
+    const name = path.basename(filename, ".js")
+    const url = p
+// ==== .github/pull_request_template.md ====
+### The author should do the following, if applicable
+
+- [ ] Add tests
+- [ ] Run tests
+- [ ] `bun run format:fix && bun run lint:fix` to format the code
+- [ ] Add [TSDoc](https://tsdoc.org/)/[JSDoc](https://jsdoc.app/about-getting-started) to document the code
+
+export default app
+```
+
+## Quick Start
+
+```bash
+npm create hono@latest
+```
+
+## Features
+
+- **Ultrafast** 🚀 - The router `RegExpRouter` is really fast. Not using linear loops. Fast.
+- **Lightweight** 🪶 - The `hono/tiny` preset is under 12kB. Hono has zero dependencies and uses only the Web Standard API.
+- **Multi-runtime** 🌍 - Works on Cloudflare Workers, Fastly Compute, Deno, Bun,
+export default app
+```
+
+## Quick Start
+
+```bash
+npm create hono@latest
+```
+
+## Features
+
+- **Ultrafast** 🚀 - The router `RegExpRouter` is really fast. Not using linear loops. Fast.
+- **Lightweight** 🪶 - The `hono/tiny` preset is under 12kB. Hono has zero dependencies and uses only the Web Standard API.
+- **Multi-runtime** 🌍 - Works on Cloudflare Workers, Fastly Compute, Deno, Bun, AWS Lambda, Lambda@Edge, or Node.js. The same code runs on all platforms.
+- **Batteries Included** 🔋 - Hono has built-in middleware, custom middleware, and third-party middleware. Batteries included.
+- **Delightful DX** 😃 - Super clean APIs. First-class TypeScript support. Now, we've got "Types".
+
+##
+// ==== .github/ISSUE_TEMPLATE/feature_request.md ====
+---
+name: Feature request
+about: Request a feature. ⚠️ Gson is in maintenance mode; large feature requests might be rejected.
+title: ''
+labels: enhancement
+assignees: ''
+
+---
+
+# Problem solved by the feature
+<!-- Describe which problem the requested feature solves -->
+
+
+# Feature description
+<!-- Describe the feature -->
+
+
+# Alternatives / workarounds
+<!-- Describe alternatives or workarounds in case you are aware of any -->
+
+// ==== .github/ISSUE_TEMPLATE/bug_report.md ====
+---
+name: Bug report
+about: Report a Gson bug. Please have a look at the troubleshooting guide (Troubleshooting.md) first.
+title: ''
+labels: bug
+assignees: ''
+
+-
+// ==== .github/ISSUE_TEMPLATE/bug_report.md ====
+---
+name: Bug report
+about: Report a Gson bug. Please have a look at the troubleshooting guide (Troubleshooting.md) first.
+title: ''
+labels: bug
+assignees: ''
+
+---
+
+# Gson version
+<!-- Gson version you are using, for example '2.8.8' -->
+
+
+# Java / Android version
+<!-- Version of the Java or Android platform on which the bug occurred -->
+
+
+# Used tools
+<!-- List relevant build tools and plugins with version number here which might affect Gson -->
+- [ ] Maven; version: 
+- [ ] Gradle; version: 
+- [ ] ProGuard (attach the configuration file please); version: 
+- [ ] ...
+
+# Description
+<!-- Describe the bug you experienced -->
+
+
+## Expected behavio
+// ==== .github/ISSUE_TEMPLATE/bug_report.md ====
+---
+name: Bug report
+about: Create a report to help us improve
+
+---
+
+<!--
+READ THIS FIRST!
+
+If you have a usage question, please ask us on [Stack Overflow](https://stackoverflow.com/questions/tagged/jq), in the [#jq channel](https://web.libera.chat/#jq) on [Libera.Chat](https://libera.chat/), or in our [Discord server](https://discord.gg/yg6yjNmgAC).
+
+-->
+
+**Describe the bug**
+A clear and concise description of what the bug is.
+
+**To Reproduce**
+Provide a minimal test case to reproduce the behavior.
+If the input is large, either attach it as a file, or [create a gist](https://gist.github.com) and link to it here.
+
+**Expected behavior**
+A clea
+// ==== NEWS.md ====
+# 1.8.2
+
+This is a patch release with security fixes and bug fixes since 1.8.1, along with new builds for Windows arm64 and Docker arm/v7.
+Full commit log can be found at <https://github.com/jqlang/jq/compare/jq-1.8.1...jq-1.8.2>.
+
+## Security fixes
+
+- CVE-2026-32316: Fix heap buffer overflow in `jvp_string_append` and `jvp_string_copy_replace_bad`.
+  @itchyny e47e56d226519635768e6aab2f38f0ab037c09e5
+- CVE-2026-33947: Limit path depth to prevent stack overflow in `jv_setpath`, `jv_getpath`, `jv_delpaths`.
+  @itchyny fb59f1491058d58bdc3e8dd28f1773d1ac690a1f
+- CVE-2026-33948: Fix NUL truncation in the JSON parser.
+  @itchyny 6374ae0bcdfe33a18eb0ae6db28493b1f34a0a5b
+- CVE-2
+// ==== .github/ISSUE_TEMPLATE.md ====
+<!--
+我很忙, 每天可能只有 几秒钟 时间看你的 issue, 如果不按照我的要求写 issue, 你可能不会得到任何回复, 石沉大海.
+
+请确保已经更新到最新的代码, 然后贴上来 `--debug 2` 的调试输出. 没有调试信息. 我做不了什么.
+如何调试 https://github.com/acmesh-official/acme.sh/wiki/How-to-debug-acme.sh
+
+If it is a bug report:
+- make sure you are able to repro it on the latest released version.
+You can install the latest version by: `acme.sh --upgrade`
+
+- Search the existing issues.
+- Refer to the [WIKI](https://wiki.acme.sh).
+- Debug info [Debug](https://github.com/acmesh-official/acme.sh/wiki/
+// ==== .github/copilot-instructions.md ====
+# GitHub Copilot Shell Scripting (sh) Review Instructions for acme.sh
+
+## Overall Goal
+
+Your role is to act as a rigorous yet helpful senior engineer, reviewing Shell script code (`.sh` files) for the [acme.sh](https://github.com/acmesh-official/acme.sh) project. Ensure the code exhibits the highest levels of robustness, security, and portability.
+The review must focus on risks unique to Shell scripting, such as proper quoting, robust error handling, and the secure execution of external commands.
+
+## Required Output Format
+
+Organize the feedback into a single, structured report, using the three-level marking system:
+
+1. **Critical Issues (Must Fix
+func setAdminPassword(pwd string) {
+	Init()
+	defer Release()
+	admin, err := op.GetAdmin()
+	if err != nil {
+		utils.Log.Errorf("failed get admin user: %+v", err)
+		return
+	}
+	admin.SetPassword(pwd)
+	if err := op.UpdateUser(admin); err != nil {
+		utils.Log.Errorf("failed update admin user: %+v", err)
+		return
+	}
+	utils.Log.Infof("admin user has been updated:")
+	utils.Log.Infof("username: %s", admin.Username)
+	utils.Log.Infof("password: %s", pwd)
+	DelAdminCacheOnline()
+}
+
+// ==== CODE_OF_CONDUCT.md ====
+# Contributor Covenant Code of Conduct
+
+## Our Pledge
+
+We as members, contributors, and leaders pledge to make participation in our
+community a harassment-free experience for everyone, regardles
+// ==== CODE_OF_CONDUCT.md ====
+# Contributor Covenant Code of Conduct
+
+## Our Pledge
+
+We as members, contributors, and leaders pledge to make participation in our
+community a harassment-free experience for everyone, regardless of age, body
+size, visible or invisible disability, ethnicity, sex characteristics, gender
+identity and expression, level of experience, education, socio-economic status,
+nationality, personal appearance, race, religion, or sexual identity
+and orientation.
+
+We pledge to act and interact in ways that contribute to an open, welcoming,
+diverse, inclusive, and healthy community.
+
+## Our Standards
+
+Examples of behavior that contributes to a positive environment for our
+com
+# 1.6 常见的并发模式
+
+Go 语言最吸引人的地方是它内建的并发支持。Go 语言并发体系的理论是 _C.A.R Hoare_ 在 1978 年提出的 CSP（Communicating Sequential Process，通讯顺序进程）。CSP 有着精确的数学模型，并实际应用在了 Hoare 参与设计的 T9000 通用计算机上。从 NewSqueak、Alef、Limbo 到现在的 Go 语言，对于对 CSP 有着 20 多年实战经验的 _Rob Pike_ 来说，他更关注的是将 CSP 应用在通用编程语言上产生的潜力。作为 Go 并发编程核心的 CSP 理论的核心概念只有一个：同步通信。关于同步通信的话题我们在前面一节已经讲过，本节我们将简单介绍下 Go 语言中常见的并发模式。
+
+首先要明确一个概念：并发不是并行。并发更关注的是程序的设计层面，并发的程序完全是可以顺序执行的，只有在真正的多核 CPU 上才可能真正地同时运行。并行更关注的是程序的运行层面，并行一般是简单的大量重复，例如 GPU 中对图像处理都会有大量的并行运算。为更好的编写并发程序，从设计之初 Go 语言就注重如何在编程语言层级上设计
+# 2.1 快速入门
+
+本节我们将通过一系列由浅入深的小例子来快速掌握 CGO 的基本用法。
+
+## 2.1.1 最简 CGO 程序
+
+真实的 CGO 程序一般都比较复杂。不过我们可以由浅入深，一个最简的 CGO 程序该是什么样的呢？要构造一个最简 CGO 程序，首先要忽视一些复杂的 CGO 特性，同时要展示 CGO 程序和纯 Go 程序的差别来。下面是我们构建的最简 CGO 程序：
+
+```go
+// hello.go
+package main
+
+import "C"
+
+func main() {
+	println("hello cgo")
+}
+```
+
+代码通过 `import "C"` 语句启用 CGO 特性，主函数只是通过 Go 内置的 println 函数输出字符串，其中并没有任何和 CGO 相关的代码。虽然没有调用 CGO 的相关函数，但是 `go build` 命令会在编译和链接阶段启动 gcc 编译器，这已经是一个完整的 CGO 程序了。
+
+## 2.1.2 基于 C 标准库函数输出字符串
+
+第一章那个 CGO 程序还不够简单，我们现在来看看更简单的版本：
+
+```go
+// hello.go
+package main
+
+//#include <stdio.h>
+import "C"
+
+func main() {
+	C.puts(C.CString("Hello, World\n"))
+}
+```
+
+我们不仅仅通过 `import "C"` 语句启用 CGO 特性，同时包含 
+# 2.2 CGO 基础
+
+要使用 CGO 特性，需要安装 C/C++ 构建工具链，在 macOS 和 Linux 下是要安装 GCC，在 windows 下是需要安装 MinGW 工具。同时需要保证环境变量 `CGO_ENABLED` 被设置为 1，这表示 CGO 是被启用的状态。在本地构建时 `CGO_ENABLED` 默认是启用的，当交叉构建时 CGO 默认是禁止的。比如要交叉构建 ARM 环境运行的 Go 程序，需要手工设置好 C/C++ 交叉构建的工具链，同时开启 `CGO_ENABLED` 环境变量。然后通过 `import "C"` 语句启用 CGO 特性。
+
+## 2.2.1 `import "C"` 语句
+
+如果在 Go 代码中出现了 `import "C"` 语句则表示使用了 CGO 特性，紧跟在这行语句前面的注释是一种特殊语法，里面包含的是正常的 C 语言代码。当确保 CGO 启用的情况下，还可以在当前目录中包含 C/C++ 对应的源文件。
+
+举个最简单的例子：
+
+```Go
+package main
+
+/*
+#include <stdio.h>
+
+void printint(int v) {
+	printf("printint: %d\n", v);
+}
+*/
+import "C"
+
+func main() {
+	v := 42
+	C.printint(C.int(v))
+}
+```
+
+这个例子展示了 cgo 的基本使用方法。开头的注释中写了要调用的 C 函数和相关的头文件，

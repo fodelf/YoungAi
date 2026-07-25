@@ -1,0 +1,579 @@
+<!doctype html>
+<!-- web/chat.html — DwarfStar (ds4-server) 自带的浏览器聊天页。
+     由 ds4-server 在 GET / 直接返回(同源, 无需 --cors);也可用 file:// 打开,
+     此时在设置里填服务器地址并给 ds4-server 加 --cors。
+     零依赖单文件: 无 CDN、无外部字体/脚本, 离线可用。
+     协议: POST /v1/chat/completions (stream:true, stream_options.include_usage),
+     模型列表 GET /v1/models。多轮 = 客户端保存完整 messages 重发, 与服务器的
+     磁盘 KV 前缀复用天然对齐。 -->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DwarfStar Chat</title>
+<style>
+  :root {
+    --bg: #0e1116; --panel: #161b22; --panel-2: #1c2330; --border: #2b3240;
+    --text: #e6edf3; --dim: #8b949e; --accent: #4ea1ff; --accent-dim: #1f3a5f;
+    --user-bg: #1d2d45; --err: #f85149; --err-bg: #2d1517; --ok: #3fb950;
+    --code-bg: #0d1117; --radius: 10px;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.6 system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    display: flex; flex-direction: column;
+  }
+  header {
+    display: flex; align-items: center; gap: 10px; padding: 10px 16px;
+    background: var(--panel); border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 10; flex-wrap: wrap;
+  }
+  .logo { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+  .logo .star { color: var(--accent); }
+  #status-dot {
+    width: 9px; height: 9px; border-radius: 50%; background: var(--dim);
+    display: inline-block; flex: none;
+  }
+  #status-dot.ok { background: var(--ok); }
+  #status-dot.bad { background: var(--err); }
+  #model-info { color: var(--dim); font-size: 12.5px; }
+  header .spacer { flex: 1; }
+  select, input[type=text], input[type=number], textarea {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 7px; padding: 6px 9px; font: inherit; font-size: 13.5px;
+  }
+  select:focus, input:focus, textarea:focus { outline: 1px solid var(--accent); }
+  button {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 7px; padding: 6px 12px; font: inherit; font-size: 13.5px; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #06121f; font-weight: 600; }
+  button.danger { color: var(--err); }
+  button:disabled { opacity: .45; cursor: default; }
+
+  #settings {
+    display: none; padding: 12px 16px; background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+  #settings.open { display: block; }
+  #settings .grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 10px 16px; max-width: 980px; margin: 0 auto;
+  }
+  #settings label { display: block; font-size: 12.5px; color: var(--dim); margin-bottom: 3px; }
+  #settings .wide { grid-column: 1 / -1; }
+  #settings input, #settings textarea { width: 100%; }
+  #settings textarea { resize: vertical; min-height: 40px; }
+  #settings .hint { font-size: 12px; color: var(--dim); margin-top: 6px; max-width: 980px; margin-left: auto; margin-right: auto; }
+
+  main { flex: 1; overflow-y: auto; scroll-behavior: smooth; }
+  #chat { max-width: 900px; margin: 0 auto; padding: 18px 16px 30px; }
+  .msg { margin: 14px 0; position: relative; }
+  .msg .who { font-size: 12px; color: var(--dim); margin-bottom: 4px; }
+  .msg .bubble {
+    background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 10px 14px; overflow-wrap: break-word;
+  }
+  .msg.user .bubble { background: var(--user-bg); border-color: var(--accent-dim); }
+  .msg.user .bubble .md { white-space: pre-wrap; }
+  .msg.error .bubble { background: var(--err-bg); border-color: var(--err); color: var(--err); white-space: pre-wrap; }
+  .msg .stats { font-size: 12px; color: var(--dim); margin-top: 5px; }
+  .msg .tools {
+    position: absolute; top: -2px; right: 0; display: none; gap: 6px;
+  }
+  .msg:hover .tools { display: flex; }
+  .msg .tools button { padding: 2px 8px; font-size: 12px; }
+  .stopped { color: var(--dim); font-style: italic; }
+
+  details.think {
+    border: 1px dashed var(--border); border-radius: 7px; margin: 4px 0 10px;
+    padding: 4px 10px; color: var(--dim); font-size: 13.5px;
+  }
+  details.think summary { cursor: pointer; user-select: none; }
+  details.think .md { white-space: pre-wrap; }
+
+  /* markdown-lite */
+  .md p { margin: .5em 0; }
+  .md h1, .md h2, .md h3, .md h4 { margin: .8em 0 .4em; line-height: 1.3; }
+  .md h1 { font-size: 1.35em; } .md h2 { font-size: 1.22em; } .md h3 { font-size: 1.1em; } .md h4 { font-size: 1em; }
+  .md ul, .md ol { margin: .4em 0; padding-left: 1.6em; }
+  .md blockquote { margin: .5em 0; padding: .1em .9em; border-left: 3px solid var(--border); color: var(--dim); }
+  .md hr { border: none; border-top: 1px solid var(--border); margin: .8em 0; }
+  .md a { color: var(--accent); }
+  .md code {
+    background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px;
+    padding: .08em .35em; font: 13px ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  .codeblock { position: relative; margin: .6em 0; }
+  .codeblock pre {
+    background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px 14px; overflow-x: auto; margin: 0;
+    font: 13px/1.5 ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  .codeblock pre code { background: none; border: none; padding: 0; font: inherit; }
+  .codeblock .lang {
+    position: absolute; top: 6px; right: 66px; font-size: 11px; color: var(--dim);
+  }
+  .codeblock .copy {
+    position: absolute; top: 5px; right: 8px; padding: 1px 8px; font-size: 11.5px;
+    opacity: 0; transition: opacity .15s;
+  }
+  .codeblock:hover .copy { opacity: 1; }
+
+  .cursor::after { content: "▍"; color: var(--accent); animation: blink 1s step-end infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  #composer {
+    background: var(--panel); border-top: 1px solid var(--border);
+    padding: 10px 16px calc(10px + env(safe-area-inset-bottom));
+  }
+  #composer .inner { max-width: 900px; margin: 0 auto; display: flex; gap: 10px; align-items: flex-end; }
+  #input {
+    flex: 1; resize: none; max-height: 200px; min-height: 40px;
+    line-height: 1.5; padding: 9px 12px;
+  }
+  #composer .keys { max-width: 900px; margin: 4px auto 0; font-size: 11.5px; color: var(--dim); }
+  #empty {
+    text-align: center; color: var(--dim); margin-top: 12vh; user-select: none;
+  }
+  #empty .big { font-size: 26px; margin-bottom: 8px; }
+  #empty code { font-size: 13px; }
+</style>
+</head>
+<body>
+
+<header>
+  <span class="logo"><span class="star">✦</span> DwarfStar Chat</span>
+  <span id="status-dot" title="服务状态"></span>
+  <span id="model-info">连接中…</span>
+  <span class="spacer"></span>
+  <select id="model" title="模型别名: deepseek-chat=非思考, deepseek-reasoner=思考(需服务端未加 --nothink)">
+    <option value="deepseek-chat">deepseek-chat(非思考)</option>
+    <option value="deepseek-reasoner">deepseek-reasoner(思考)</option>
+  </select>
+  <button id="btn-new" title="清空当前对话">新对话</button>
+  <button id="btn-export" title="导出为 Markdown 文件">导出</button>
+  <button id="btn-settings">设置</button>
+</header>
+
+<div id="settings">
+  <div class="grid">
+    <div>
+      <label for="set-base">服务器地址(同源留空)</label>
+      <input type="text" id="set-base" placeholder="例: http://127.0.0.1:8013">
+    </div>
+    <div>
+      <label for="set-temp">temperature</label>
+      <input type="number" id="set-temp" min="0" max="2" step="0.1" value="0">
+    </div>
+    <div>
+      <label for="set-max">max_tokens</label>
+      <input type="number" id="set-max" min="1" step="1" value="512">
+    </div>
+    <div class="wide">
+      <label for="set-system">system 提示词(留空不发送)</label>
+      <textarea id="set-system" rows="2"></textarea>
+    </div>
+  </div>
+  <div class="hint">
+    同源模式(由 ds4-server 的 GET / 提供本页)无需任何配置。用 file:// 或其他主机打开本页时,
+    填服务器地址并给 ds4-server 加 <code>--cors</code>。服务端 <code>--max-output-tokens</code> 会硬截更大的 max_tokens。
+  </div>
+</div>
+
+<main id="scroll">
+  <div id="chat">
+    <div id="empty">
+      <div class="big">✦</div>
+      <div>本页由 ds4-server 直接提供, 请求发往同源 <code>/v1/chat/completions</code>(流式)。</div>
+      <div>Enter 发送 · Shift+Enter 换行 · Esc 停止生成</div>
+    </div>
+  </div>
+</main>
+
+<div id="composer">
+  <div class="inner">
+    <textarea id="input" placeholder="输入消息…" rows="1"></textarea>
+    <button id="btn-send" class="primary">发送</button>
+  </div>
+  <div class="keys" id="footer-note"></div>
+</div>
+
+<script>
+"use strict";
+/* ---------- 状态 ---------- */
+const LS_SET = "ds4.chat.v1.settings", LS_CONV = "ds4.chat.v1.conv";
+/* conv: [{role:'user'|'assistant', content, reasoning?, stats?, stopped?, error?}] */
+let conv = [];
+let generating = false;
+let aborter = null;
+
+const $ = id => document.getElementById(id);
+const chatEl = $("chat"), scrollEl = $("scroll"), inputEl = $("input");
+const sendBtn = $("btn-send"), statusDot = $("status-dot"), modelInfo = $("model-info");
+
+/* file:// 打开时默认指到本机 8013;同源打开留空 = location.origin */
+function defaultBase() { return location.protocol === "file:" ? "http://127.0.0.1:8013" : ""; }
+function apiBase() {
+  const b = $("set-base").value.trim();
+  return (b || location.origin).replace(/\/+$/, "");
+}
+
+function loadSettings() {
+  let s = {};
+  try { s = JSON.parse(localStorage.getItem(LS_SET) || "{}"); } catch (e) {}
+  $("set-base").value = s.base ?? defaultBase();
+  $("set-temp").value = s.temp ?? 0;
+  $("set-max").value = s.max ?? 512;
+  $("set-system").value = s.system ?? "";
+  $("model").value = s.model ?? "deepseek-chat";
+  if ($("model").value !== s.model && s.model) { /* 自定义模型 id */
+    const o = document.createElement("option"); o.value = o.textContent = s.model;
+    $("model").appendChild(o); $("model").value = s.model;
+  }
+}
+function saveSettings() {
+  localStorage.setItem(LS_SET, JSON.stringify({
+    base: $("set-base").value.trim(), temp: +$("set-temp").value,
+    max: +$("set-max").value, system: $("set-system").value, model: $("model").value,
+  }));
+}
+function loadConv() {
+  try { conv = JSON.parse(localStorage.getItem(LS_CONV) || "[]"); } catch (e) { conv = []; }
+  renderAll();
+}
+function saveConv() {
+  try { localStorage.setItem(LS_CONV, JSON.stringify(conv)); } catch (e) {}
+}
+
+/* ---------- markdown-lite 渲染(无依赖, 先转义再变换) ---------- */
+function esc(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;");
+}
+function inlineMd(s) {
+  /* `code` 优先, 内部不再处理其他标记 */
+  const parts = s.split(/(`[^`\n]+`)/);
+  return parts.map(p => {
+    if (p.startsWith("`") && p.endsWith("`") && p.length > 2)
+      return "<code>" + p.slice(1, -1) + "</code>";
+    return p
+      .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>")
+      .replace(/\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g,
+               '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  }).join("");
+}
+function renderMd(src) {
+  /* 流式期间未闭合的 fence 自动补闭合 */
+  if ((src.match(/^```/gm) || []).length % 2 === 1) src += "\n```";
+  const lines = esc(src).split("\n");
+  const out = [];
+  let i = 0, para = [], list = null;
+  const flushPara = () => { if (para.length) { out.push("<p>" + para.map(inlineMd).join("<br>") + "</p>"); para = []; } };
+  const flushList = () => { if (list) { out.push("<" + list.tag + ">" + list.items.map(x => "<li>" + inlineMd(x) + "</li>").join("") + "</" + list.tag + ">"); list = null; } };
+  while (i < lines.length) {
+    const ln = lines[i];
+    const fence = ln.match(/^```(\S*)\s*$/);
+    if (fence) {
+      flushPara(); flushList();
+      const lang = fence[1]; const code = [];
+      i++;
+      while (i < lines.length && !/^```\s*$/.test(lines[i])) { code.push(lines[i]); i++; }
+      i++; /* 跳过闭合 fence */
+      out.push('<div class="codeblock">' +
+               (lang ? '<span class="lang">' + lang + "</span>" : "") +
+               '<button class="copy" data-copy>复制</button>' +
+               "<pre><code>" + code.join("\n") + "</code></pre></div>");
+      continue;
+    }
+    const h = ln.match(/^(#{1,4})\s+(.*)$/);
+    const li = ln.match(/^\s*([-*+]|\d+[.)])\s+(.*)$/);
+    if (h) { flushPara(); flushList(); out.push("<h" + h[1].length + ">" + inlineMd(h[2]) + "</h" + h[1].length + ">"); }
+    else if (/^\s*(---+|\*\*\*+)\s*$/.test(ln)) { flushPara(); flushList(); out.push("<hr>"); }
+    else if (ln.startsWith("&gt;")) { flushPara(); flushList(); out.push("<blockquote>" + inlineMd(ln.replace(/^&gt;\s?/, "")) + "</blockquote>"); }
+    else if (li) {
+      flushPara();
+      const tag = /[-*+]/.test(li[1]) ? "ul" : "ol";
+      if (!list || list.tag !== tag) { flushList(); list = { tag, items: [] }; }
+      list.items.push(li[2]);
+    }
+    else if (ln.trim() === "") { flushPara(); flushList(); }
+    else { flushList(); para.push(ln); }
+    i++;
+  }
+  flushPara(); flushList();
+  return out.join("");
+}
+
+/* ---------- 消息渲染 ---------- */
+function statsLine(st) {
+  if (!st) return "";
+  const bits = [];
+  if (st.prompt != null) {
+    let p = "输入 " + st.prompt;
+    if (st.cached) p += "(缓存命中 " + st.cached + ")";
+    bits.push(p);
+  }
+  if (st.completion != null) bits.push("输出 " + st.completion);
+  if (st.ttfb != null) bits.push("首字 " + st.ttfb.toFixed(2) + "s");
+  if (st.tps != null) bits.push(st.tps.toFixed(2) + " t/s");
+  return bits.join(" · ");
+}
+function msgHtml(m, idx, streaming) {
+  if (m.role === "user") {
+    return '<div class="who">你</div><div class="bubble"><div class="md">' + esc(m.content) + "</div></div>" +
+      '<div class="tools"><button data-act="copy" data-i="' + idx + '">复制</button></div>';
+  }
+  if (m.error) {
+    return '<div class="who">错误</div><div class="bubble">' + esc(m.content) + "</div>" +
+      '<div class="tools"><button data-act="retry" data-i="' + idx + '">重试</button></div>';
+  }
+  let inner = "";
+  if (m.reasoning)
+    inner += '<details class="think"><summary>思考过程</summary><div class="md">' + esc(m.reasoning) + "</div></details>";
+  inner += '<div class="md' + (streaming ? " cursor" : "") + '">' + renderMd(m.content || "") + "</div>";
+  if (m.stopped) inner += '<div class="stopped">(已停止)</div>';
+  let tools = '<div class="tools"><button data-act="copy" data-i="' + idx + '">复制</button>';
+  if (!streaming && idx === conv.length - 1) tools += '<button data-act="retry" data-i="' + idx + '">重新生成</button>';
+  tools += "</div>";
+  return '<div class="who">DwarfStar</div><div class="bubble">' + inner + "</div>" +
+    (m.stats ? '<div class="stats">' + statsLine(m.stats) + "</div>" : "") + tools;
+}
+function renderAll() {
+  $("empty")?.remove();
+  chatEl.innerHTML = conv.length
+    ? conv.map((m, i) => '<div class="msg ' + (m.error ? "error" : m.role) + '" data-idx="' + i + '">' + msgHtml(m, i, false) + "</div>").join("")
+    : '<div id="empty"><div class="big">✦</div><div>本页由 ds4-server 直接提供, 请求发往同源 <code>/v1/chat/completions</code>(流式)。</div><div>Enter 发送 · Shift+Enter 换行 · Esc 停止生成</div></div>';
+  scrollBottom(true);
+}
+let pinned = true;
+scrollEl.addEventListener("scroll", () => {
+  pinned = scrollEl.scrollTop + scrollEl.clientHeight >= scrollEl.scrollHeight - 60;
+});
+function scrollBottom(force) {
+  if (force || pinned) scrollEl.scrollTop = scrollEl.scrollHeight;
+}
+
+/* 事件代理: 复制/重试/代码复制 */
+document.addEventListener("click", async e => {
+  const t = e.target;
+  if (t.matches("[data-copy]")) {
+    const code = t.parentElement.querySelector("code")?.innerText || "";
+    await navigator.clipboard.writeText(code).catch(() => {});
+    t.textContent = "已复制"; setTimeout(() => t.textContent = "复制", 1200);
+    return;
+  }
+  if (t.matches("[data-act]")) {
+    const i = +t.dataset.i, act = t.dataset.act;
+    if (act === "copy") {
+      await navigator.clipboard.writeText(conv[i]?.content || "").catch(() => {});
+      t.textContent = "已复制"; setTimeout(() => t.textContent = "复制", 1200);
+    } else if (act === "retry" && !generating) {
+      conv.splice(i);            /* 删掉该条(错误/尾部assistant)及之后, 重新生成 */
+      renderAll(); saveConv(); generate();
+    }
+  }
+});
+
+/* ---------- SSE 流式请求 ---------- */
+function buildPayload() {
+  const msgs = [];
+  const sys = $("set-system").value.trim();
+  if (sys) msgs.push({ role: "system", content: sys });
+  for (const m of conv)
+    if (!m.error) msgs.push({ role: m.role, content: m.content });
+  const temp = +$("set-temp").value;
+  return {
+    model: $("model").value,
+    messages: msgs,
+    stream: true,
+    stream_options: { include_usage: true },
+    temperature: isFinite(temp) ? temp : 0,
+    max_tokens: Math.max(1, +$("set-max").value | 0),
+  };
+}
+
+async function generate() {
+  if (generating) return;
+  generating = true;
+  sendBtn.textContent = "停止"; sendBtn.classList.remove("primary"); sendBtn.classList.add("danger");
+  const asst = { role: "assistant", content: "", reasoning: "" };
+  conv.push(asst);
+  renderAll();
+  const idx = conv.length - 1;
+  const el = chatEl.querySelector('[data-idx="' + idx + '"]');
+  const t0 = performance.now();
+  let tFirst = null, usage = null, finish = null;
+  aborter = new AbortController();
+  let lastPaint = 0;
+  const paint = force => {
+    const now = performance.now();
+    if (!force && now - lastPaint < 100) return;
+    lastPaint = now;
+    el.innerHTML = msgHtml(asst, idx, true);
+    scrollBottom(false);
+  };
+  try {
+    const res = await fetch(apiBase() + "/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(buildPayload()),
+      signal: aborter.signal,
+    });
+    if (!res.ok || !res.body) {
+      let detail = await res.text().catch(() => "");
+      try { detail = JSON.parse(detail).error.message; } catch (e) {}
+      throw new Error("HTTP " + res.status + (detail ? ": " + detail : ""));
+    }
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let bufTxt = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bufTxt += dec.decode(value, { stream: true });
+      let sep;
+      while ((sep = bufTxt.indexOf("\n\n")) >= 0) {
+        const block = bufTxt.slice(0, sep); bufTxt = bufTxt.slice(sep + 2);
+        let event = "", data = "";
+        for (const ln of block.split("\n")) {
+          if (ln.startsWith("data: ")) data += (data ? "\n" : "") + ln.slice(6);
+          else if (ln.startsWith("event: ")) event = ln.slice(7).trim();
+        }
+        if (!data || data === "[DONE]") continue;
+        let obj; try { obj = JSON.parse(data); } catch (e) { continue; }
+        if (event === "error" || obj.error) {
+          throw new Error(obj.error?.message || "服务端错误");
+        }
+        const ch = obj.choices?.[0];
+        if (ch?.delta) {
+          if (ch.delta.reasoning_content) {
+            if (tFirst === null) tFirst = performance.now();
+            asst.reasoning += ch.delta.reasoning_content; paint(false);
+          }
+          if (ch.delta.content) {
+            if (tFirst === null) tFirst = performance.now();
+            asst.content += ch.delta.content; paint(false);
+          }
+          if (ch.finish_reason) finish = ch.finish_reason;
+        }
+        if (obj.usage) usage = obj.usage;
+      }
+    }
+  } catch (err) {
+    if (err.name === "AbortError") {
+      asst.stopped = true;
+      if (!asst.content && !asst.reasoning) conv.pop();
+    } else {
+      if (!asst.content && !asst.reasoning) conv.pop();
+      conv.push({ role: "assistant", error: true, content: String(err.message || err) });
+    }
+  }
+  const tEnd = performance.now();
+  if (!asst.reasoning) delete asst.reasoning;
+  if (usage || tFirst !== null) {
+    const genS = (tEnd - (tFirst ?? t0)) / 1000;
+    asst.stats = {
+      prompt: usage?.prompt_tokens, completion: usage?.completion_tokens,
+      cached: usage?.prompt_tokens_details?.cached_tokens,
+      ttfb: tFirst !== null ? (tFirst - t0) / 1000 : null,
+      tps: usage?.completion_tokens && genS > 0.05 ? usage.completion_tokens / genS : null,
+    };
+  }
+  generating = false; aborter = null;
+  sendBtn.textContent = "发送"; sendBtn.classList.add("primary"); sendBtn.classList.remove("danger");
+  saveConv();
+  renderAll();
+}
+
+function send() {
+  if (generating) { aborter?.abort(); return; }
+  const text = inputEl.value.trim();
+  if (!text) return;
+  inputEl.value = ""; autosize();
+  conv.push({ role: "user", content: text });
+  saveConv();
+  generate();
+}
+
+/* ---------- 服务状态 / 模型列表 ---------- */
+async function ping() {
+  try {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 4000);
+    const res = await fetch(apiBase() + "/v1/models", { signal: ctl.signal });
+    clearTimeout(timer);
+    if (!res.ok) throw 0;
+    const j = await res.json();
+    const m = j.data?.[0];
+    statusDot.className = "ok";
+    modelInfo.textContent = m ? (m.name || m.id) + " · ctx " + (m.context_length ?? "?") : "已连接";
+    /* 服务器报告的模型 id 并入下拉(去重) */
+    const sel = $("model"), have = new Set([...sel.options].map(o => o.value));
+    for (const md of j.data || []) {
+      if (!have.has(md.id)) {
+        const o = document.createElement("option");
+        o.value = md.id; o.textContent = md.id;
+        sel.appendChild(o); have.add(md.id);
+      }
+    }
+  } catch (e) {
+    statusDot.className = "bad";
+    modelInfo.textContent = "无法连接 " + apiBase();
+  }
+}
+
+/* ---------- 导出 ---------- */
+function exportMd() {
+  const lines = [];
+  const sys = $("set-system").value.trim();
+  if (sys) lines.push("> system: " + sys + "\n");
+  for (const m of conv) {
+    if (m.error) { lines.push("**[错误]** " + m.content + "\n"); continue; }
+    lines.push(m.role === "user" ? "## 你\n\n" + m.content + "\n" : "## DwarfStar\n\n" + m.content + "\n");
+  }
+  const blob = new Blob([lines.join("\n")], { type: "text/markdown" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "dwarfstar-chat-" + new Date().toISOString().slice(0, 19).replace(/[T:]/g, "-") + ".md";
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+/* ---------- 输入框 ---------- */
+function autosize() {
+  inputEl.style.height = "auto";
+  inputEl.style.height = Math.min(inputEl.scrollHeight, 200) + "px";
+}
+inputEl.addEventListener("input", autosize);
+inputEl.addEventListener("keydown", e => {
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
+});
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape" && generating) aborter?.abort();
+});
+sendBtn.addEventListener("click", send);
+$("btn-new").addEventListener("click", () => {
+  if (generating) aborter?.abort();
+  conv = []; saveConv(); renderAll(); inputEl.focus();
+});
+$("btn-export").addEventListener("click", exportMd);
+$("btn-settings").addEventListener("click", () => $("settings").classList.toggle("open"));
+for (const id of ["set-base", "set-temp", "set-max", "set-system"])
+  $(id).addEventListener("change", () => { saveSettings(); if (id === "set-base") ping(); });
+$("model").addEventListener("change", saveSettings);
+
+/* ---------- 启动 ---------- */
+loadSettings();
+loadConv();
+$("footer-note").textContent = "多轮对话整段重发, 命中服务器磁盘 KV 前缀缓存;温度/长度在「设置」里调。";
+ping();
+setInterval(ping, 20000);
+inputEl.focus();
+</script>
+</body>
+</html>

@@ -38,6 +38,7 @@ ENVSTR="DS4_DIST_REVERSE_CONNECT=1 DS4_METAL_EXPERT_OFFLOAD=1 DS4_METAL_EXPERT_P
 # 才用得上自己那部分)。侧车须已 scp 到 $M1DIR/同名相对路径。空=不挂。
 RESID=${RESID-gguf/sidecars/code-hot-res-prog.gguf}   # 显式空=裸; 默认挂 prog 残差(2026-07-23 换代, 旧 v3p 版已删)
 [ -n "$RESID" ] && ENVSTR="$ENVSTR DS4_RESIDUAL=$RESID"
+[ -n "${EXTRA_ENV:-}" ] && ENVSTR="$ENVSTR $EXTRA_ENV"   # 附加调优env透传(熵门等A/B用)
 # BASE_NATIVE=1(默认开): go-onebit 是 BASE 底模, chat 角色帧会出符号汤 → 母语骨架渲染
 # (# User:/# Assistant: 注释体) + 默认 stop; 工具帧仍由 --tool-primer 强制。只 server 侧生效。
 BASE_NATIVE=${BASE_NATIVE:-1}
