@@ -7,6 +7,11 @@
 # 前提: gguf/go-onebit/layers/dql_L*.bin 全齐 — 必须在 merge consume 之前运行!
 # 产物: /tmp/rr_verdict.out 全量原始输出; stdout 摘要(VERDICT/回放累积行)。
 set -euo pipefail
+# ★裁判自清扫(2026-07-28 事故修): 调用方(campaign backfit)泄漏的反修/sweep 族旗标会把
+# BF_ONLY 纯回放重新点成 SEARCH+落盘 = 在判决语料上拟合并改写 dql(L0-L9 实际发生)。
+# 本脚本语义=只读判决, 与外部反修 env 永不兼容 → 顶部无条件剥离, 防御一切调用方。
+unset DS4_ANCHOR_ROUTE DS4_BWD DS4_BWD_FINAL DS4_BF_JUSTIFIED DS4_GSWEEP \
+      DS4_BACKFIT_INCR DS4_BF_MEMGB DS4_SIGNREF_MU DS4_BF_SCREEN_K DS4_BF_SCREEN_DIV DS4_NFIT
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 QDIR="$ROOT/gguf-tools/go-onebit/quant"
 LDIR="$ROOT/gguf/go-onebit/layers"

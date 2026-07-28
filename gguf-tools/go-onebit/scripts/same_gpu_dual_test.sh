@@ -10,7 +10,7 @@ MODEL=$ROOT/gguf/ds4-mono-mixed.gguf
 PORT=5601; CTX=2048; N=${1:-40}
 PROMPT='<｜begin▁of▁sentence｜>// twoSum returns the indices of the two numbers in nums that add up to target.
 func twoSum(nums []int, target int) []int {'
-COMMON="DS4_METAL_EXPERT_OFFLOAD=1 DS4_METAL_PREFILL_CHUNK=512 DS4_REPEAT_FREQ=${DS4_REPEAT_FREQ:-1} DS4_LOOP_BREAK=${DS4_LOOP_BREAK:-1} DS4_DBG_PEN=${DS4_DBG_PEN:-} DS4_MTP_SPEC_DISABLE=${DS4_MTP_SPEC_DISABLE:-} DS4_DBG_RP=${DS4_DBG_RP:-}"  # 无 math_safe; 惩罚/调试/spec旗子 env 可覆盖
+COMMON="DS4_METAL_EXPERT_OFFLOAD=1 DS4_METAL_PREFILL_CHUNK=512 DS4_REPEAT_FREQ=${DS4_REPEAT_FREQ:-1} DS4_DBG_PEN=${DS4_DBG_PEN:-} DS4_MTP_SPEC_DISABLE=${DS4_MTP_SPEC_DISABLE:-} DS4_DBG_RP=${DS4_DBG_RP:-}"  # 无 math_safe; 惩罚/调试/spec旗子 env 可覆盖
 
 pkill -f 'ds4 --role' 2>/dev/null; pkill -f "ds4 -m " 2>/dev/null; sleep 1
 rm -f /tmp/sg_worker.log /tmp/sg_coord.out /tmp/sg_coord.log

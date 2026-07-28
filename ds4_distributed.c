@@ -6639,6 +6639,16 @@ int ds4_dist_session_eval_speculative(
     const uint32_t p = (uint32_t)checkpoint->len;
     int K = copy_spec ? DIST_CS_DRAFT_K
                       : ds4_engine_mtp_draft_tokens_configured(d->state.engine);
+    /* The fused verify batch (1 + drafts rows) replays through the layer-slice
+     * prefill path on every host, and that path hard-rejects
+     * n_tokens > prefill_cap (ds4.c layer-slice gate).  A grown copy-spec draft
+     * must therefore never exceed the session cap, or the route aborts
+     * mid-decode (seen on the dual-host VQ lane: chunk 13 vs
+     * DS4_METAL_PREFILL_CHUNK=8).  prefill_cap<=2 degrades to plain decode. */
+    {
+        const int pc = ds4_session_prefill_cap(owner);
+        if (pc > 0 && K > pc) K = pc;
+    }
     if (K < 2) {
         /* Drafting one token is no speedup; fall back to plain decode. */
         if (ds4_dist_session_eval(d, owner, checkpoint, first_token, logits, err, errlen) != 0) {

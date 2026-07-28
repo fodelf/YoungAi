@@ -808,6 +808,10 @@ typedef struct {
      * picks through a single go2b matmul pass and masks them out of the base
      * pass, instead of the legacy base+residual add (3 extra matmuls/layer). */
     int merged2b;
+    /* Nonzero when gate_ptr points at a v2.2 VQ layer blob (DQVL: 表+DQVQ 载荷).
+     * The metal path dequants every active expert to an f16 scratch at gather
+     * (cold w2 expanded from the base go1b bytes) and runs the F16W mm_id. */
+    int vq;
 } ds4_gpu_residual_set;
 
 int ds4_gpu_routed_moe_one_tensor(

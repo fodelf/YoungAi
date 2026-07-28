@@ -1857,7 +1857,16 @@ template [[host_name("kernel_mul_mm_id_iq2_xxs_f16")]]      kernel mul_mm_id_f16
 template [[host_name("kernel_mul_mm_id_go1b_f32")]]         kernel mul_mm_id         kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_go1b,    QK_NL, dequantize_go1b,    float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_go1b_f16")]]         kernel mul_mm_id_f16_rhs kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_go1b,    QK_NL, dequantize_go1b,    half, half4x4, half, half2x4>;
 template [[host_name("kernel_mul_mm_id_go2b_f32")]]         kernel mul_mm_id         kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_go2b,    QK_NL, dequantize_go2b,    float, float4x4, float, float2x4>;
+// F16W: v2.2 VQ gather 产出的 f16 权重 scratch 直读。block=32 半(64B), QK_NL=2
+// (镜像 q8_0 的 il-步进; QK_NL=1 触发 kernel il 逻辑边界 bug=BOS)。il∈{0,1} 读 16 半段。
+typedef struct { half4x4 q[16]; } block_f16w;   // 512B/256元素: 镜像 block_go2b(nl=QK_NL=16)
+template <typename type4x4>
+void dequantize_f16w(device const block_f16w * xb, short il, thread type4x4 & reg) {
+    reg = (type4x4)(xb->q[il]);   // il∈[0,16): 第 il 个 16-元素 sub-tile(与 go2b 同构)
+}
 template [[host_name("kernel_mul_mm_id_go2b_f16")]]         kernel mul_mm_id_f16_rhs kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_go2b,    QK_NL, dequantize_go2b,    half, half4x4, half, half2x4>;
+template [[host_name("kernel_mul_mm_id_f16w_f32")]]         kernel mul_mm_id         kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_f16w,    QK_NL, dequantize_f16w,    float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_id_f16w_f16")]]         kernel mul_mm_id_f16_rhs kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_f16w,    QK_NL, dequantize_f16w,    half, half4x4, half, half2x4>;
 
 #ifdef DS4_METAL_HAS_TENSOR
 // Attention-output low-rank projection retained for Metal4 prefill.  It uses

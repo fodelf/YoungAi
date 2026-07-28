@@ -1,0 +1,125 @@
+// ==== python ====
+    def route(self, rule: str, **options: t.Any) -> t.Callable[[T_route], T_route]:
+        """Decorate a view function to register it with the given URL
+        rule and options. Calls :meth:`add_url_rule`, which has more
+        details about the implementation.
+
+        .. code-block:: python
+
+            @app.route("/")
+            def index():
+// ==== javascript ====
+export default function dispatchRequest(config) {
+  throwIfCancellationRequested(config);
+
+  config.headers = AxiosHeaders.from(config.headers);
+
+  // Transform request data
+  config.data = transformData.call(config, config.transformRequest);
+
+// ==== rust ====
+    pub fn is_match<P: AsRef<Path>>(&self, path: P) -> bool {
+        self.is_match_candidate(&Candidate::new(path.as_ref()))
+    }
+
+    /// Tests whether the given path matches this pattern or not.
+    pub fn is_match_candidate(&self, path: &Candidate<'_>) -> bool {
+// ==== typescript ====
+export function reactive(target: object) {
+  // if trying to observe a readonly proxy, return the readonly version.
+  if (isReadonly(target)) {
+    return target
+  }
+  return createReactiveObject(
+    target,
+// ==== c ====
+static void assoc_expand(void) {
+    old_hashtable = primary_hashtable;
+
+    primary_hashtable = calloc(hashsize(hashpower + 1), sizeof(void *));
+    if (primary_hashtable) {
+        if (settings.verbose > 1)
+// ==== java ====
+  public <T> T fromJson(String json, Class<T> classOfT) throws JsonSyntaxException {
+    return fromJson(json, TypeToken.get(classOfT));
+  }
+
+  /**
+   * This method deserializes the specified JSON into an object of the specified type. This method
+// ==== go ====
+package cache
+
+import (
+	"container/list"
+	"math"
+)
+
+// LFU the Least Frequently Used (LFU) page-replacement algorithm
+type LFU struct {
+	len     int // length
+	cap     int // capacity
+	minFreq int // The element that operates least frequently in LFU
+
+	// key: key of element, value: value of element
+	itemMap map[string]*list.Element
+
+	// key: frequency of possible occurrences of all elements in the itemMap
+	// value: elements with the same frequency
+	freqMap map[int]*list.List
+}
+
+// NewLFU init the LFU cache with capacity
+func NewLFU(capacity int) LFU {
+	return LFU{
+		len:     0,
+		cap:     capacity,
+		minFreq: math.MaxInt,
+		itemMap: make(map[string]*list.Element),
+		freqMap: make(map[int]*list.List),
+	}
+}
+
+// initItem to init item for LFU
+func initItem(k string, v any, f int) item {
+	return item{
+		key:   k,
+		value: v,
+		freq:  f,
+	}
+}
+
+// Get the key in cache by LFU
+func (c *LFU) Get(key string) any {
+	// if existed, will return value
+	if e, ok := c.itemMap[key]; ok {
+		// the frequency of e +1 and change freqMap
+		c.increaseFreq(e)
+		obj := e.Value.(item)
+		return obj.value
+	}
+
+	// if not existed, return nil
+	return nil
+}
+
+func (engine *Engine) Handler() http.Handler {
+	if !engine.UseH2C {
+		return engine
+	}
+
+	h2s := &http2.Server{}
+	return h2c.NewHandler(engine, h2s)
+}
+
+// ==== issuefix ====
+
+=== ISSUE #6093: IPv6 addresses parsed incorrectly because of `.partition(":")`? ===
+Hi, I checked the code and saw that two places use `.partition(":")` on addresses, and IPv6 ad
+// ==== method ====
+## Cache penetration (缓存穿透)
+
+Queries for keys that exist in neither cache nor database bypass the cache every time and
+hammer the database. Two standard fixes:
+// ==== soul ====
+An engineering answer is only worth its evidence. Four rules, always:
+

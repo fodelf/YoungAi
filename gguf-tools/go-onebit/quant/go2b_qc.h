@@ -128,14 +128,16 @@ static void g2_assign(const float*W,int rows,int cols,const float*L4,
     free(H);free(Hinv);free(XbT);free(Wk);free(err);
 }
 static const int g2_s1of[4]={0,0,1,1}, g2_s2of[4]={0,1,0,1};   /* level idx → (s1,s2) 位 */
-/* _act_d1d2: 固定码 ±1, 每行 2×2 输出最优 (|d1|,|d2|); P/T 走 Accelerate sgemm */
+/* _act_d1d2: 固定码 ±1, 每行 2×2 输出最优 (|d1|,|d2|); P/T 走 Accelerate sgemm。
+ * Yadj(可NULL)[t*rows+r]: 目标平移(α·W·(x̃−x̂), GPTAQ 非对称目标, 2026-07-25 G1b)。 */
 static void g2_act_d1d2(const float*W,int rows,int cols,const int8_t*sidx,
-                        const float*X,int n,float*d1,float*d2){
+                        const float*X,int n,float*d1,float*d2,const float*Yadj){
     size_t N=(size_t)rows*cols;
     float *B1=malloc(N*sizeof(float)),*B2=malloc(N*sizeof(float));
     for(size_t i=0;i<N;i++){ int k=sidx[i]; B1[i]=g2_s1of[k]?1.0f:-1.0f; B2[i]=g2_s2of[k]?1.0f:-1.0f; }
     float *P1=malloc((size_t)n*rows*4),*P2=malloc((size_t)n*rows*4),*T=malloc((size_t)n*rows*4);
     dq_matmul(X,B1,P1,n,cols,rows); dq_matmul(X,B2,P2,n,cols,rows); dq_matmul(X,W,T,n,cols,rows);
+    if(Yadj) for(size_t i=0;i<(size_t)n*rows;i++) T[i]+=Yadj[i];
     for(int r=0;r<rows;r++){
         double a=0,b=0,c=0,r1=0,r2=0;
         for(int t=0;t<n;t++){ double p1=P1[(size_t)t*rows+r],p2=P2[(size_t)t*rows+r],tv=T[(size_t)t*rows+r];
@@ -147,8 +149,12 @@ static void g2_act_d1d2(const float*W,int rows,int cols,const int8_t*sidx,
 }
 /* 编码整矩阵: out(可NULL=只要浮点) 68B 块字节, wq_opt(可NULL) dequant 浮点(== decode(out))。
  * X[n_act×ncols]=真实激活; gate/up 喂层输入, w2 喂顺序补偿 hc。 */
+static void dq_go2b_encode_adj(const float*W,int nrows,int ncols,const float*X,int n_act,
+                           uint8_t*out,float*wq_opt,const float*Yadj);
 static void dq_go2b_encode(const float*W,int nrows,int ncols,const float*X,int n_act,
-                           uint8_t*out,float*wq_opt){
+                           uint8_t*out,float*wq_opt){ dq_go2b_encode_adj(W,nrows,ncols,X,n_act,out,wq_opt,NULL); }
+static void dq_go2b_encode_adj(const float*W,int nrows,int ncols,const float*X,int n_act,
+                           uint8_t*out,float*wq_opt,const float*Yadj){
     if(n_act>256) n_act=256;
     int nblk=ncols/GO2B_BLK_QK;
     float *d1=malloc((size_t)nrows*4),*d2=malloc((size_t)nrows*4),*L4=malloc((size_t)nrows*16);
@@ -168,7 +174,7 @@ static void dq_go2b_encode(const float*W,int nrows,int ncols,const float*X,int n
     int actrounds=2; { const char*ae=getenv("DS4_GO2B_ACT"); if(ae&&!atoi(ae)) actrounds=0; }
     if(!X||n_act<8) actrounds=0;
     for(int round=0;round<actrounds;round++){
-        g2_act_d1d2(W,nrows,ncols,sidx,X,n_act,d1,d2);
+        g2_act_d1d2(W,nrows,ncols,sidx,X,n_act,d1,d2,Yadj);
         for(int r=0;r<nrows;r++){
             float a=go1b_fp16_to_fp32(go1b_fp32_to_fp16(d1[r])), b=go1b_fp16_to_fp32(go1b_fp32_to_fp16(d2[r]));
             L4[(size_t)r*4+0]=-(a+b); L4[(size_t)r*4+1]=-(a-b); L4[(size_t)r*4+2]=(a-b); L4[(size_t)r*4+3]=(a+b);
@@ -197,10 +203,13 @@ static void dq_go2b_encode(const float*W,int nrows,int ncols,const float*X,int n
     free(d1);free(d2);free(L4);free(sidx); if(own_wq)free(Wq);
 }
 /* signref 同形 API: 量化-重构浮点(合并态前向/反修用) */
-static float *dq_quant_expert_go2b(const float*W,int nrows,int ncols,const float*X,int n_act){
+static float *dq_quant_expert_go2b_adj(const float*W,int nrows,int ncols,const float*X,int n_act,const float*Yadj){
     float *wq=malloc((size_t)nrows*ncols*sizeof(float));
-    dq_go2b_encode(W,nrows,ncols,X,n_act,NULL,wq);
+    dq_go2b_encode_adj(W,nrows,ncols,X,n_act,NULL,wq,Yadj);
     return wq;
+}
+static float *dq_quant_expert_go2b(const float*W,int nrows,int ncols,const float*X,int n_act){
+    return dq_quant_expert_go2b_adj(W,nrows,ncols,X,n_act,NULL);
 }
 
 /* ===== 热表(prog_active_top64): L<n>: id id ... — 热专家走 go2b, 冷保 go1b ===== */

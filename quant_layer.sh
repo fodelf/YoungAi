@@ -236,7 +236,7 @@ if [ "$TIMEDOUT" = 1 ] || [ "$WDOG" = 1 ] || [ "$RC" != 0 ]; then
         if [ "${DS4_SKIP_RRVERDICT:-0}" != "1" ]; then
             for RRIDS in /tmp/rr_hard.ids:64 /tmp/rr_code.ids:305; do
                 RRF="${RRIDS%%:*}"; RRN="${RRIDS##*:}"
-                [ -f "$RRF" ] && bash "$ROOT/gguf-tools/go-onebit/scripts/rr_verdict.sh" "$RRF" "$RRN" 2>&1 \
+                [ -f "$RRF" ] && env -u DS4_ANCHOR_ROUTE bash "$ROOT/gguf-tools/go-onebit/scripts/rr_verdict.sh" "$RRF" "$RRN" 2>&1 \
                     | grep -E 'VERDICT|watchdog' || echo "[自动merge] rr_verdict $RRF 未出分(不阻塞合并)" >&2
             done
         fi
@@ -307,7 +307,7 @@ if [ "${DS4_SKIP_MERGE:-0}" = 1 ]; then
     if [ "${DS4_SKIP_RRVERDICT:-0}" != "1" ]; then
         for RRIDS in /tmp/rr_hard.ids:64 /tmp/rr_code.ids:305; do
             RRF="${RRIDS%%:*}"; RRN="${RRIDS##*:}"
-            [ -f "$RRF" ] && bash "$ROOT/gguf-tools/go-onebit/scripts/rr_verdict.sh" "$RRF" "$RRN" 2>&1 \
+            [ -f "$RRF" ] && env -u DS4_ANCHOR_ROUTE bash "$ROOT/gguf-tools/go-onebit/scripts/rr_verdict.sh" "$RRF" "$RRN" 2>&1 \
                 | grep -E 'VERDICT|watchdog' || echo "[skip-merge] rr_verdict $RRF 未出分(不阻塞停点)" >&2
         done
     fi

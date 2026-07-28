@@ -1,0 +1,174 @@
+// ==== go ====
+package cache
+
+import (
+	"container/list"
+	"math"
+)
+
+// LFU the Least Frequently Used (LFU) page-replacement algorithm
+type LFU struct {
+	len     int // length
+	cap     int // capacity
+	minFreq int // The element that operates least frequently in LFU
+
+	// key: key of element, value: value of element
+	itemMap map[string]*list.Element
+
+	// key: frequency of possible occurrences of all elements in the itemMap
+	// value: elements with the same frequency
+	freqMap map[int]*list.List
+}
+
+// NewLFU init the LFU cache with capacity
+func NewLFU(capacity int) LFU {
+	return LFU{
+		len:     0,
+		cap:     capacity,
+		minFreq: math.MaxInt,
+		itemMap: make(map[string]*list.Element),
+		freqMap: make(map[int]*list.List),
+	}
+}
+
+// initItem to init item for LFU
+func initItem(k string, v any, f int) item {
+	return item{
+		key:   k,
+		value: v,
+		freq:  f,
+	}
+}
+
+// Get the key in cache by LFU
+func (c *LFU) Get(key string) any {
+	// if existed, will return value
+	if e, ok := c.itemMap[key]; ok {
+		// the frequency of e +1 and change freqMap
+		c.increaseFreq(e)
+		obj := e.Value.(item)
+		return obj.value
+	}
+
+	// if not existed, return nil
+	return nil
+}
+
+func (engine *Engine) Handler() http.Handler {
+	if !engine.UseH2C {
+		return engine
+	}
+
+	h2s := &http2.Server{}
+	return h2c.NewHandler(engine, h2s)
+}
+
+// ==== python ====
+    def route(self, rule: str, **options: t.Any) -> t.Callable[[T_route], T_route]:
+        """Decorate a view function to register it with the given URL
+        rule and options. Calls :meth:`add_url_rule`, which has more
+        details about the implementation.
+
+        .. code-block:: python
+
+            @app.route("/")
+            def index():
+// ==== javascript ====
+export default function dispatchRequest(config) {
+  throwIfCancellationRequested(config);
+
+  config.headers = AxiosHeaders.from(config.headers);
+
+  // Transform request data
+  config.data = transformData.call(config, config.transformRequest);
+
+// ==== rust ====
+    pub fn is_match<P: AsRef<Path>>(&self, path: P) -> bool {
+        self.is_match_candidate(&Candidate::new(path.as_ref()))
+    }
+
+    /// Tests whether the given path matches this pattern or not.
+    pub fn is_match_candidate(&self, path: &Candidate<'_>) -> bool {
+// ==== typescript ====
+export function reactive(target: object) {
+  // if trying to observe a readonly proxy, return the readonly version.
+  if (isReadonly(target)) {
+    return target
+  }
+  return createReactiveObject(
+    target,
+// ==== c ====
+static void assoc_expand(void) {
+    old_hashtable = primary_hashtable;
+
+    primary_hashtable = calloc(hashsize(hashpower + 1), sizeof(void *));
+    if (primary_hashtable) {
+        if (settings.verbose > 1)
+// ==== java ====
+  public <T> T fromJson(String json, Class<T> classOfT) throws JsonSyntaxException {
+    return fromJson(json, TypeToken.get(classOfT));
+  }
+
+  /**
+   * This method deserializes the specified JSON into an object of the specified type. This method
+// ==== held_go ====
+		}
+
+	})
+}
+
+// ==== checksum/crc8.go ====
+// crc8.go
+// description: Calculate CRC8
+// details:
+// A cyclic redundancy check (CRC) is an error-detecting code commonly used in digital networks
+// and storage devices to detect accidental changes to raw data.
+// time complexity: O(n)
+// space complexity: O(1)
+// ==== held_python ====
+                return "Hello, World!"
+
+        See :ref:`url-route-registrations`.
+
+        The endpoint name for the route defaults to the name of the view
+        function if the ``endpoint`` parameter isn't passed.
+// ==== held_javascript ====
+  if (['post', 'put', 'patch'].indexOf(config.method) !== -1) {
+    config.headers.setContentType('application/x-www-form-urlencoded', false);
+  }
+
+  const adapter = adapters.getAdapter(config.adapter || defaults.adapter, config);
+
+// ==== held_rust ====
+        self.re.is_match(&path.path)
+    }
+
+    /// Returns the `Glob` used to compile this matcher.
+    pub fn glob(&self) -> &Glob {
+// ==== held_typescript ====
+    false,
+    mutableHandlers,
+    mutableCollectionHandlers,
+    reactiveMap,
+  )
+// ==== held_c ====
+            fprintf(stderr, "Hash table expansion starting\n");
+        hashpower++;
+        expanding = true;
+        expand_bucket = 0;
+        STATS_LOCK();
+// ==== held_java ====
+   * is useful if the specified object is a generic type. For non-generic objects, use {@link
+   * #fromJson(String, Class)} instead. If you have the JSON in a {@link Reader} instead of a
+   * String, use {@link #fromJson(Reader, Type)} instead.
+   *
+   * <p>Since {@code Type} is not parameterized by T, this method is not type-safe and should be
+// ==== issuefix ====
+
+=== ISSUE #6093: IPv6 addresses parsed incorrectly because of `.partition(":")`? ===
+Hi, I checked the code and saw that two places use `.partition(":")` on addresses, and IPv6 ad
+// ==== method ====
+## Cache penetration (缓存穿透)
+
+Queries for keys that exist in neither cache nor database bypass the cache every time and
+hammer the database. Two standard fixes:

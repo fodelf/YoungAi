@@ -15,7 +15,7 @@ LDLIBS ?= -lm -pthread
 METAL_SRCS := $(wildcard metal/*.metal)
 
 ifeq ($(UNAME_S),Darwin)
-METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
+METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal -framework Accelerate
 MM_OBJS = ds4_multimodal.o ds4_spatial.o ds4_css.o
 CORE_OBJS = ds4.o ds4_corr.o ds4_zchain.o ds4_mtp.o $(MM_OBJS) ds4_distributed.o ds4_metal.o
 CPU_CORE_OBJS = ds4_cpu.o ds4_corr_cpu.o ds4_zchain.o ds4_mtp.o $(MM_OBJS) ds4_distributed.o

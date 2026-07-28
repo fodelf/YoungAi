@@ -2392,12 +2392,12 @@ static void test_tp_allreduce(void) {
     TEST_ASSERT(ds4_dist_tp_selftest() == 0);
 }
 
-/* ---- Model-free unit tests for the repeat/anticycle penalty core ----
+/* ---- Model-free unit tests for the repeat penalty core ----
  *
  * Exercises ds4_repeat_penalize_tokens -- the raw-array entry that shares
  * repeat_penalize_core with the session sampler -- on synthetic committed
- * streams: no model, no engine, no GPU. The DS4_REPEAT_FREQ / DS4_LOOP_BREAK
- * / DS4_LOOP_ESC / DS4_LOOP_HARD_K caches inside ds4.c are process-wide
+ * streams: no model, no engine, no GPU. The DS4_REPEAT_FREQ /
+ * DS4_REPEAT_WINDOW caches inside ds4.c are process-wide
  * statics armed on first use, so the
  * suite pins each config via the test-only reset hook (setenv BEFORE the
  * first penalize call of that config) and restores the developer's env +
@@ -2457,106 +2457,35 @@ static uint32_t test_pen_build_selfcopy(int *sc, int n) {
 }
 
 static void test_penalty_unit(void) {
+    /* 2026-07-28 用户裁决: anticycle 断环器整族删除 — 本套只剩显式 opt-in 的
+     * DS4_REPEAT_FREQ 语义: ①默认(全 unset)零改写=裸模型真值 ②freq 窗口计数
+     * 无视生成边界(2026-07-06 mono 判据) ③逐次累加。 */
     char *saved_freq = test_penalty_env_save("DS4_REPEAT_FREQ");
     char *saved_window = test_penalty_env_save("DS4_REPEAT_WINDOW");
-    char *saved_loop = test_penalty_env_save("DS4_LOOP_BREAK");
-    char *saved_esc = test_penalty_env_save("DS4_LOOP_ESC");
-    char *saved_hardk = test_penalty_env_save("DS4_LOOP_HARD_K");
     float logits[TEST_PEN_NLOGITS];
     int cyc[24];                 /* 8 copies of the period-3 block {5,6,7} */
     int sc[68];                  /* self-copy stream, up to n=6 blocks */
     for (int i = 0; i < 24; i++) cyc[i] = 5 + (i % 3);
 
-    /* Config 1: anticycle escalation at the defaults (DS4_LOOP_BREAK ON,
-     * DS4_LOOP_ESC=3.0, DS4_LOOP_HARD_K=6; freq off). */
+    /* Config 1: 默认(全 unset) — 任何重复形态都零惩罚: 裸模型真值路径。 */
     unsetenv("DS4_REPEAT_FREQ");
     unsetenv("DS4_REPEAT_WINDOW");
-    unsetenv("DS4_LOOP_BREAK");
-    unsetenv("DS4_LOOP_ESC");
-    unsetenv("DS4_LOOP_HARD_K");
     ds4_test_reset_penalty_env_cache();
-
-    /* (a) exact-period escalation ladder: k complete periods emitted => the
-     * continuation v[end-P] is pushed down by exactly ESC*(k-1), NOT
-     * hard-banned below K_HARD (the retired third-strike semantics -inf'd
-     * it at k=2). Ladder stops at k=4: from k=5 on a pure period-3 stream
-     * is long enough that the 8-gram detector legitimately stacks on top
-     * (that regime is covered by the argmax walk in (c)). */
-    for (uint32_t k = 2; k <= 4; k++) {
-        test_penalize_row(logits, cyc, 3u * k, 0);
-        TEST_ASSERT(logits[5] == -3.0f * (float)(k - 1u));
-        TEST_ASSERT(logits[6] == 0.0f);
-        TEST_ASSERT(logits[7] == 0.0f);
-    }
-    /* A partial leading period must not inflate k: 7|567|567 counts k=2. */
-    static const int part[7] = {7, 5, 6, 7, 5, 6, 7};
-    test_penalize_row(logits, part, 7, 0);
-    TEST_ASSERT(logits[5] == -3.0f);
-    TEST_ASSERT(logits[6] == 0.0f);
-    TEST_ASSERT(logits[7] == 0.0f);
-
-    /* (b) hard cap: k = K_HARD (6) and beyond hard-bans the continuation,
-     * so a pathological attractor still terminates. */
-    test_penalize_row(logits, cyc, 18, 0);   /* k=6 */
-    TEST_ASSERT(logits[5] < -1.0e29f);
-    test_penalize_row(logits, cyc, 21, 0);   /* k=7 */
-    TEST_ASSERT(logits[5] < -1.0e29f);
-
-    /* (c) strong margin walks a legal "repeat X five times" to completion:
-     * at every decode step of copies 3..5 the true continuation carries a
-     * 13.0 logit margin -- above the worst stacked penalty on the walk
-     * (period -9 at k=4 plus one 8-gram step -3) -- so argmax never flips
-     * and the instructed repetition finishes all five copies. */
-    for (uint32_t L = 6; L <= 14; L++) {
-        const int want = cyc[L];             /* the cycle's true continuation */
-        for (int i = 0; i < TEST_PEN_NLOGITS; i++) logits[i] = 0.0f;
-        logits[want] = 13.0f;
-        ds4_repeat_penalize_tokens(logits, cyc, L, 0);
-        TEST_ASSERT(test_pen_argmax(logits) == want);
-    }
-
-    /* (d) weak margin (< ESC): a degenerate drift attractor is argmax-broken
-     * at k=2 already -- escalation still kills loops within one period. */
-    for (int i = 0; i < TEST_PEN_NLOGITS; i++) logits[i] = 0.0f;
-    logits[5] = 2.5f;
-    ds4_repeat_penalize_tokens(logits, cyc, 6, 0);
-    TEST_ASSERT(logits[5] == -0.5f);         /* 2.5 - ESC*(2-1) */
-    TEST_ASSERT(test_pen_argmax(logits) != 5);
-
-    /* (e) the twice-repeated block entirely in the PROMPT region (gen_start
-     * == end: the state right after prefill + mark): quoting a block the
-     * prompt repeats must NOT be penalized. Legacy unmarked behavior
-     * (gen_start 0, case (a)) penalized it. */
-    test_penalize_row(logits, cyc, 6, 6);
+    test_penalize_row(logits, cyc, 18, 0);            /* 六周期明环 */
     TEST_ASSERT(logits[5] == 0.0f);
     TEST_ASSERT(logits[6] == 0.0f);
     TEST_ASSERT(logits[7] == 0.0f);
-
-    /* (f) 8-gram self-copy ladder: n prior occurrences of the current
-     * 8-suffix with the same continuation cost exactly ESC*(n-1) -- the
-     * third boilerplate instance (n=2, -inf under the retired semantics)
-     * now survives on any decent margin -- and only n = K_HARD hard-bans. */
-    test_penalize_row(logits, sc, test_pen_build_selfcopy(sc, 2), 0);
-    TEST_ASSERT(logits[42] == -3.0f);
-    TEST_ASSERT(logits[10] == 0.0f);   /* the copied block itself: untouched */
-    TEST_ASSERT(logits[43] == 0.0f);
-    test_penalize_row(logits, sc, test_pen_build_selfcopy(sc, 3), 0);
-    TEST_ASSERT(logits[42] == -6.0f);
     test_penalize_row(logits, sc, test_pen_build_selfcopy(sc, 6), 0);
-    TEST_ASSERT(logits[42] < -1.0e29f);
-    /* ...and with both prior occurrences in the PROMPT (gen_start at the
-     * final A), the same continuation is exempt. */
-    test_penalize_row(logits, sc, test_pen_build_selfcopy(sc, 2), 20);
-    TEST_ASSERT(logits[42] == 0.0f);
+    TEST_ASSERT(logits[42] == 0.0f);                  /* 8-gram 自拷贝也不动 */
+    TEST_ASSERT(logits[10] == 0.0f);
+    (void)test_pen_argmax;
 
-    /* Config 2: freq-window counting, bans disabled to isolate it. The
-     * window [end-4, end) must IGNORE the generation boundary: gen_start=5
-     * yet prompt-tail tokens at positions 2..4 are still counted (2026-07-06
-     * "window must include the prompt tail"; the removed gstart clamp would
-     * have zeroed them). All deltas are exact binary floats. */
+    /* Config 2: freq-window counting. The window [end-4, end) must IGNORE
+     * the generation boundary: gen_start=5 yet prompt-tail tokens at
+     * positions 2..4 are still counted (2026-07-06 "window must include the
+     * prompt tail"). All deltas are exact binary floats. */
     setenv("DS4_REPEAT_FREQ", "0.5", 1);
     setenv("DS4_REPEAT_WINDOW", "4", 1);
-    setenv("DS4_LOOP_BREAK", "0", 1);
     ds4_test_reset_penalty_env_cache();
 
     static const int fw[6] = {30, 31, 32, 33, 31, 34};
@@ -2567,45 +2496,13 @@ static void test_penalty_unit(void) {
     TEST_ASSERT(logits[33] == -0.5f);
     TEST_ASSERT(logits[34] == -0.5f);
 
-    /* Per-occurrence accumulation (4 in-window hits of one token), and
-     * DS4_LOOP_BREAK=0 really disabled the escalation despite the blatant
-     * cycle (only the freq penalty shows). */
+    /* Per-occurrence accumulation (4 in-window hits of one token). */
     static const int rep[5] = {7, 7, 7, 7, 7};
     test_penalize_row(logits, rep, 5, 0);
     TEST_ASSERT(logits[7] == -2.0f);
 
-    /* Config 3: DS4_LOOP_BREAK=0 alone -- the master switch kills both
-     * detectors outright: a blatant six-period cycle draws zero penalty. */
-    unsetenv("DS4_REPEAT_FREQ");
-    unsetenv("DS4_REPEAT_WINDOW");
-    setenv("DS4_LOOP_BREAK", "0", 1);
-    ds4_test_reset_penalty_env_cache();
-    test_penalize_row(logits, cyc, 18, 0);
-    TEST_ASSERT(logits[5] == 0.0f);
-    TEST_ASSERT(logits[6] == 0.0f);
-    TEST_ASSERT(logits[7] == 0.0f);
-
-    /* Config 4: DS4_LOOP_ESC / DS4_LOOP_HARD_K overrides reach BOTH
-     * detectors (shared knobs): slope 0.5 per extra repeat, hard ban
-     * already at count 3. */
-    setenv("DS4_LOOP_BREAK", "1", 1);
-    setenv("DS4_LOOP_ESC", "0.5", 1);
-    setenv("DS4_LOOP_HARD_K", "3", 1);
-    ds4_test_reset_penalty_env_cache();
-    test_penalize_row(logits, cyc, 6, 0);    /* period k=2 -> -0.5*(2-1) */
-    TEST_ASSERT(logits[5] == -0.5f);
-    test_penalize_row(logits, cyc, 9, 0);    /* period k=3 >= hard_k -> ban */
-    TEST_ASSERT(logits[5] < -1.0e29f);
-    test_penalize_row(logits, sc, test_pen_build_selfcopy(sc, 2), 0);
-    TEST_ASSERT(logits[42] == -0.5f);        /* 8-gram n=2 -> -0.5*(2-1) */
-    test_penalize_row(logits, sc, test_pen_build_selfcopy(sc, 3), 0);
-    TEST_ASSERT(logits[42] < -1.0e29f);      /* 8-gram n=3 >= hard_k -> ban */
-
     test_penalty_env_restore("DS4_REPEAT_FREQ", saved_freq);
     test_penalty_env_restore("DS4_REPEAT_WINDOW", saved_window);
-    test_penalty_env_restore("DS4_LOOP_BREAK", saved_loop);
-    test_penalty_env_restore("DS4_LOOP_ESC", saved_esc);
-    test_penalty_env_restore("DS4_LOOP_HARD_K", saved_hardk);
     ds4_test_reset_penalty_env_cache();
 }
 
@@ -2630,7 +2527,7 @@ static const ds4_test_entry test_entries[] = {
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
     {"--tp-allreduce", "tp-allreduce", "tensor-parallel all-reduce transport loopback", test_tp_allreduce},
-    {"--penalty-unit", "penalty-unit", "model-free repeat/anticycle penalty semantics (escalation ladder, gen-start boundary, freq window)", test_penalty_unit},
+    {"--penalty-unit", "penalty-unit", "model-free repeat penalty semantics (default=bare-model no-op, freq window, accumulation)", test_penalty_unit},
 };
 
 static void test_print_help(const char *prog) {

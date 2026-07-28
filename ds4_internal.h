@@ -239,6 +239,7 @@ typedef struct {
     bool present;
     ds4_tensor *gate, *up, *down;   /* blk.{L}.ffn_{gate,up,down}_exps_res.weight (sidecar) */
     ds4_tensor *lut;                /* blk.{L}.ffn_res_lut.weight (F32[256]); NULL if dense */
+    const void *vq_raw; size_t vq_sz;   /* v2.2 直读侧车模式: dql_vq_L%02d.bin mmap(免 overlay 复制) */
 #ifndef DS4_NO_GPU
     ds4_gpu_tensor *g_gate, *g_up, *g_down;   /* RESIDENT GPU copies (offload mmap reads 0) */
 #endif

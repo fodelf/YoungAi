@@ -8,6 +8,7 @@
 #include <ctype.h>
 #include <math.h>
 #include <float.h>
+#include <Accelerate/Accelerate.h>
 #include <time.h>
 #include <unistd.h>
 #include <sys/sysctl.h>
@@ -33,6 +34,7 @@
  */
 
 enum {
+    DS4_METAL_TENSOR_F16W    = 1,    /* v2.2 VQ gather 的 f16 权重 scratch(半精度直读) */
     DS4_METAL_TENSOR_Q2_K    = 10,
     DS4_METAL_TENSOR_Q4_K    = 12,
     DS4_METAL_TENSOR_IQ2_XXS = 16,
@@ -13563,6 +13565,7 @@ static const char *ds4_gpu_metal_tensor_type_name(uint32_t type) {
     case DS4_METAL_TENSOR_Q4_K:    return "q4_k";
     case DS4_METAL_TENSOR_GO1B:    return "go1b";
     case DS4_METAL_TENSOR_GO2B:    return "go2b";
+    case DS4_METAL_TENSOR_F16W:    return "f16w";
     default:                       return "unknown";
     }
 }
@@ -13595,6 +13598,8 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mm_pipeline(uint32_t type) {
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_go1b_f32", false);
     case DS4_METAL_TENSOR_GO2B:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_go2b_f32", false);
+    case DS4_METAL_TENSOR_F16W:
+        return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_f16w_f32", false);
     default:
         return nil;
     }
@@ -13612,6 +13617,8 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mm_f16_rhs_pipeline(uint32_t t
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_go1b_f16", false);
     case DS4_METAL_TENSOR_GO2B:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_go2b_f16", false);
+    case DS4_METAL_TENSOR_F16W:
+        return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_f16w_f16", false);
     default:
         return nil;
     }
@@ -20608,6 +20615,118 @@ static int ds4_gpu_expert_sort_ids_enabled(void) {
  * the selected-id buffer from original expert ids to compact scratch slots.
  * Bit-exact either way: per-pick results and their summation order are
  * unchanged, only the scratch slot numbering moves. */
+#include "vq_fmt.h"
+static id<MTLBuffer> g_moe_vq_gate_scratch, g_moe_vq_up_scratch, g_moe_vq_down_scratch;
+static float *g_vq_diag_ref; static uint32_t g_vq_diag_layer, g_vq_diag_ntok, g_vq_diag_out;
+/* VQ gather 并行化(2026-07-26): 每专家 dequant 独立写不相交 scratch → pthread 分片。
+ * 串行单线程 ~256ms/层是 decode 0.09t/s 的主因; 8 线程 dequant → ~数倍。 */
+typedef struct {
+    const void *model_map; const uint8_t *blob; const uint32_t *active_ids;
+    uint16_t *gbase, *ubase, *dbase;
+    uint64_t down_offset, down_expert_bytes;
+    uint32_t in, mid, out_dim, lo, hi;
+    volatile int *err;
+} ds4_vq_gather_task;
+static void *ds4_vq_gather_worker(void *arg) {
+    ds4_vq_gather_task *t = (ds4_vq_gather_task *)arg;
+    for (uint32_t i = t->lo; i < t->hi && !*t->err; i++) {
+        const uint32_t e = t->active_ids[i];
+        uint16_t *dg = t->gbase + (uint64_t)i * t->mid * t->in;
+        uint16_t *du = t->ubase + (uint64_t)i * t->mid * t->in;
+        uint16_t *dd = t->dbase + (uint64_t)i * t->out_dim * t->mid;
+        uint64_t o1 = ds4vq_slot(t->blob, (int)e, 0), o3 = ds4vq_slot(t->blob, (int)e, 1), o2 = ds4vq_slot(t->blob, (int)e, 2);
+        int rc1 = (!o1) ? -9 : ds4vq_dequant_f16(t->blob + o1, dg, (int)t->mid, (int)t->in);
+        int rc3 = (rc1 == 0 && o3) ? ds4vq_dequant_f16(t->blob + o3, du, (int)t->mid, (int)t->in) : (!o3 ? -9 : 0);
+        if (rc1 != 0 || rc3 != 0) {
+            fprintf(stderr, "ds4: [vq-gather-err] e=%u o1=%llu o3=%llu rc1=%d rc3=%d mid=%u in=%u\n",
+                    e, (unsigned long long)o1, (unsigned long long)o3, rc1, rc3, t->mid, t->in);
+            *t->err = 1; return NULL;
+        }
+        if (o2) {
+            int rc2 = ds4vq_dequant_f16(t->blob + o2, dd, (int)t->out_dim, (int)t->mid);
+            if (rc2 != 0) {
+                fprintf(stderr, "ds4: [vq-gather-err] e=%u o2=%llu rc2=%d out=%u mid=%u\n",
+                        e, (unsigned long long)o2, rc2, t->out_dim, t->mid);
+                *t->err = 1; return NULL;
+            }
+        } else {   /* 冷 w2: base go1b 34B/256el → ±d f16 */
+            const uint8_t *sd = (const uint8_t *)t->model_map + t->down_offset + (uint64_t)e * t->down_expert_bytes;
+            const uint64_t nblk_row = t->mid / 256u;
+            for (uint32_t r = 0; r < t->out_dim; r++) {
+                const uint8_t *rb = sd + (uint64_t)r * nblk_row * 34u;
+                uint16_t *orow = dd + (uint64_t)r * t->mid;
+                for (uint64_t b = 0; b < nblk_row; b++) {
+                    uint16_t dsc; memcpy(&dsc, rb + b * 34u, 2);
+                    const uint8_t *sg = rb + b * 34u + 2;
+                    uint16_t *o = orow + b * 256u;
+                    for (int k = 0; k < 256; k++)
+                        o[k] = (sg[k >> 3] >> (k & 7)) & 1 ? dsc : (uint16_t)(dsc ^ 0x8000u);
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
+/* v2.2 VQ unified gather: 全活跃专家 dequant→f16 scratch(热三矩阵/冷 w1w3 走层 blob;
+ * 冷 w2 从 base go1b 字节展开 ±d)。scratch 上限护栏 DS4_VQ_SCRATCH_GB(默认3)。 */
+static int ds4_gpu_vq_unified_gather(
+        const void *model_map, const uint8_t *blob,
+        uint32_t n_active, const uint32_t *active_ids,
+        uint64_t down_offset, uint64_t down_expert_bytes,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim) {
+    const uint64_t ge = (uint64_t)expert_mid_dim * expert_in_dim * 2u;   /* f16 gate/up 每专家 */
+    const uint64_t de = (uint64_t)out_dim * expert_mid_dim * 2u;
+    const uint64_t need_g = (uint64_t)n_active * ge, need_d = (uint64_t)n_active * de;
+    static uint64_t cap = 0;
+    if (!cap) { const char *e = getenv("DS4_VQ_SCRATCH_GB"); double g = e ? atof(e) : 3.0; cap = (uint64_t)(g * 1073741824.0); }
+    if (2 * need_g + need_d > cap) {
+        fprintf(stderr, "ds4: VQ gather scratch %.2fGB > cap(降 DS4_METAL_PREFILL_CHUNK 或调 DS4_VQ_SCRATCH_GB)\n",
+                (2.0 * need_g + need_d) / 1073741824.0);
+        return 0;
+    }
+    if (!g_moe_vq_gate_scratch || (uint64_t)g_moe_vq_gate_scratch.length < need_g) {
+        g_moe_vq_gate_scratch = [g_device newBufferWithLength:(NSUInteger)need_g options:MTLResourceStorageModeShared];
+        g_moe_vq_up_scratch   = [g_device newBufferWithLength:(NSUInteger)need_g options:MTLResourceStorageModeShared];
+    }
+    if (!g_moe_vq_down_scratch || (uint64_t)g_moe_vq_down_scratch.length < need_d)
+        g_moe_vq_down_scratch = [g_device newBufferWithLength:(NSUInteger)need_d options:MTLResourceStorageModeShared];
+    if (!g_moe_vq_gate_scratch || !g_moe_vq_up_scratch || !g_moe_vq_down_scratch) return 0;
+    /* memset 移除: 下面 dequant 填满全部 n_active 专家 gate/up/down, 清零冗余(省~300ms/token, ~730MB memset) */
+    double _vqgt = getenv("DS4_VQ_GT") ? ds4_gpu_now_ms() : 0.0;
+    /* 8 线程并行 dequant(各专家写不相交 scratch, 无锁); 串行是 decode 慢主因 */
+    int vqnth = 8; { const char *te = getenv("DS4_METAL_EXPERT_GATHER_THREADS"); if (te && atoi(te) > 0) vqnth = atoi(te); }
+    if ((uint32_t)vqnth > n_active) vqnth = (int)(n_active ? n_active : 1);
+    if (vqnth > 32) vqnth = 32;
+    volatile int vqerr = 0;
+    pthread_t vqth[32]; ds4_vq_gather_task vqtk[32];
+    uint16_t *gbase = (uint16_t *)g_moe_vq_gate_scratch.contents;
+    uint16_t *ubase = (uint16_t *)g_moe_vq_up_scratch.contents;
+    uint16_t *dbase = (uint16_t *)g_moe_vq_down_scratch.contents;
+    for (int ti = 0; ti < vqnth; ti++) {
+        vqtk[ti] = (ds4_vq_gather_task){ model_map, blob, active_ids, gbase, ubase, dbase,
+            down_offset, down_expert_bytes, expert_in_dim, expert_mid_dim, out_dim,
+            (uint32_t)((uint64_t)ti * n_active / vqnth), (uint32_t)((uint64_t)(ti + 1) * n_active / vqnth), &vqerr };
+        pthread_create(&vqth[ti], NULL, ds4_vq_gather_worker, &vqtk[ti]);
+    }
+    for (int ti = 0; ti < vqnth; ti++) pthread_join(vqth[ti], NULL);
+    if (vqerr) return 0;
+    if (_vqgt) fprintf(stderr, "[VQ_GT] n_active=%u nth=%d dequant=%.1fms\n", n_active, vqnth, ds4_gpu_now_ms() - _vqgt);
+    if (getenv("DS4_VQ_DEBUG") && n_active > 0) {
+        const uint16_t *g0 = (const uint16_t *)g_moe_vq_gate_scratch.contents;
+        const uint16_t *d0 = (const uint16_t *)g_moe_vq_down_scratch.contents;
+        int nz_g = 0, nz_d = 0;
+        for (uint64_t k = 0; k < ge / 2u; k++) if (g0[k]) nz_g++;
+        for (uint64_t k = 0; k < de / 2u; k++) if (d0[k]) nz_d++;
+        uint64_t o1 = ds4vq_slot(blob, (int)active_ids[0], 0);
+        uint64_t o2 = ds4vq_slot(blob, (int)active_ids[0], 2);
+        fprintf(stderr, "[VQ_DBG] n_active=%u e0=%u gate_nz=%d/%llu(w0=%.4f) down_nz=%d/%llu o1=%llu o2=%llu(w2hot=%d)\n",
+                n_active, active_ids[0], nz_g, (unsigned long long)(ge/2u), ds4vq_f16(g0[0]),
+                nz_d, (unsigned long long)(de/2u), (unsigned long long)o1, (unsigned long long)o2, o2!=0);
+    }
+    return 1;
+}
+
 /* R5-C unified go2b gather: fill compact scratch with ALL active experts as go2b
  * blocks — hot experts memcpy'd from the merged sidecar, cold experts fabricated
  * on the fly from the base go1b bytes (d1=base scale, d2=0 => second plane inert;
@@ -20782,12 +20901,22 @@ int ds4_gpu_routed_moe_one_tensor(
         uint64_t gate_inner = 0;
         uint64_t up_inner = 0;
         uint64_t down_inner = 0;
+        /* 合一 VQ GGUF: base gate/up 张量不在文件里(offset=0/bytes=0), do_vq 路
+         * 从 blob+down 取数, gate/up view 不建也不引用 — 建 0 区间 view 会硬失败。 */
+        const int vq_no_base_gate = (go1b_res && go1b_res->vq && gate_expert_bytes == 0);
         g_wrap_mlock_suppress = 1;   /* routed expert tensors: gathered, never wired */
-        id<MTLBuffer> gate_buf = ds4_gpu_wrap_model_range(model_map, model_size, gate_offset, gate_tensor_bytes, &gate_inner);
-        id<MTLBuffer> up_buf = ds4_gpu_wrap_model_range(model_map, model_size, up_offset, gate_tensor_bytes, &up_inner);
+        id<MTLBuffer> gate_buf = nil, up_buf = nil;
+        if (!vq_no_base_gate) {
+            gate_buf = ds4_gpu_wrap_model_range(model_map, model_size, gate_offset, gate_tensor_bytes, &gate_inner);
+            up_buf = ds4_gpu_wrap_model_range(model_map, model_size, up_offset, gate_tensor_bytes, &up_inner);
+        }
         id<MTLBuffer> down_buf = ds4_gpu_wrap_model_range(model_map, model_size, down_offset, down_tensor_bytes, &down_inner);
         g_wrap_mlock_suppress = 0;
-        if (!gate_buf || !up_buf || !down_buf) return 0;
+        if ((!vq_no_base_gate && (!gate_buf || !up_buf)) || !down_buf) {
+            fprintf(stderr, "ds4: [moe-buf-nil] L%u gate=%d up=%d down=%d vq_no_base_gate=%d\n",
+                    layer_index, gate_buf != nil, up_buf != nil, down_buf != nil, (int)vq_no_base_gate);
+            return 0;
+        }
         uint32_t source_n_total_expert = n_total_expert;
 
         /* DS4_METAL_EXPERT_OFFLOAD is meant for the full q2 target model, whose
@@ -21243,12 +21372,22 @@ int ds4_gpu_routed_moe_batch_tensor(
         uint64_t gate_inner = 0;
         uint64_t up_inner = 0;
         uint64_t down_inner = 0;
+        /* 合一 VQ GGUF: base gate/up 张量不在文件里(offset=0/bytes=0), do_vq 路
+         * 从 blob+down 取数, gate/up view 不建也不引用 — 建 0 区间 view 会硬失败。 */
+        const int vq_no_base_gate = (go1b_res && go1b_res->vq && gate_expert_bytes == 0);
         g_wrap_mlock_suppress = 1;   /* routed expert tensors: gathered, never wired */
-        id<MTLBuffer> gate_buf = ds4_gpu_wrap_model_range(model_map, model_size, gate_offset, gate_tensor_bytes, &gate_inner);
-        id<MTLBuffer> up_buf = ds4_gpu_wrap_model_range(model_map, model_size, up_offset, gate_tensor_bytes, &up_inner);
+        id<MTLBuffer> gate_buf = nil, up_buf = nil;
+        if (!vq_no_base_gate) {
+            gate_buf = ds4_gpu_wrap_model_range(model_map, model_size, gate_offset, gate_tensor_bytes, &gate_inner);
+            up_buf = ds4_gpu_wrap_model_range(model_map, model_size, up_offset, gate_tensor_bytes, &up_inner);
+        }
         id<MTLBuffer> down_buf = ds4_gpu_wrap_model_range(model_map, model_size, down_offset, down_tensor_bytes, &down_inner);
         g_wrap_mlock_suppress = 0;
-        if (!gate_buf || !up_buf || !down_buf) return 0;
+        if ((!vq_no_base_gate && (!gate_buf || !up_buf)) || !down_buf) {
+            fprintf(stderr, "ds4: [moe-buf-nil] L%u gate=%d up=%d down=%d vq_no_base_gate=%d\n",
+                    layer_index, gate_buf != nil, up_buf != nil, down_buf != nil, (int)vq_no_base_gate);
+            return 0;
+        }
         uint32_t source_n_total_expert = n_total_expert;
         /* 1-bit residual (go1b_res): decode-path (n_tokens=1) go1b mm_id matmul over a
          * CPU-gathered compacted copy of the active residual experts, summed into
@@ -21258,6 +21397,13 @@ int ds4_gpu_routed_moe_batch_tensor(
         const float *res_lut = NULL;   /* sparse residual: expert id -> slot or -1 */
         int do_residual = 0;
         int do_hot = 0;                /* go2b merged sidecar: hot/cold split path */
+        int do_vq = 0;                 /* v2.2 VQ blob: 全专家 dequant→f16 scratch 路 */
+        if (go1b_res && go1b_res->vq) { do_vq = 1; }
+        if (getenv("DS4_VQ_DEBUG") && do_vq) {
+            const float *xf = (const float*)((const uint8_t*)ds4_gpu_tensor_buffer(x).contents + ds4_gpu_tensor_offset(x));
+            double n2=0; int nnan=0; for(uint32_t k=0;k<expert_in_dim;k++){ float v=xf[k]; if(v!=v||v>1e30f||v<-1e30f)nnan++; n2+=(double)v*v; }
+            fprintf(stderr, "[VQ_XIN] L%u xnorm=%.3f nan/inf=%d/%u\n", layer_index, sqrt(n2), nnan, expert_in_dim);
+        }
         if (go1b_res) {
             /* residual mm_id output scratch: gate/up passes need n_tokens*n_expert*mid
              * floats, the down pass n_tokens*n_expert*out — size for the larger and
@@ -21294,6 +21440,11 @@ int ds4_gpu_routed_moe_batch_tensor(
             if (getenv("DS4_RESIDUAL_DEBUG"))
                 fprintf(stderr, "ds4: [residual-batch] L%u do=%d ntok=%u\n", layer_index, do_residual, n_tokens);
         }
+        /* VQ 层自包含: gather 已把全专家 dequant 成完整 f16 权重(gate/up VQ blob + w2 hot-blob
+         * 或冷 base 展开), MoE 走单 mm_id pass。residual_set_for 对 VQ 层把 gate_ptr/up_ptr/
+         * down_ptr 都设成 vq_raw(≠go1b residual 格式), 若让 do_residual/do_hot 生效会把 VQ blob
+         * 当成 go1b sign 字节误读并叠加 → logits 塌 BOS。故 VQ 路强制关闭这两条叠加 pass。 */
+        if (do_vq) { do_residual = 0; do_hot = 0; }
         /* P-OVL state hoisted to function scope: the encode block must read the
          * active expert set when the two-pass overlap defers the byte gather. */
         uint32_t active_ids[1024];
@@ -21437,7 +21588,7 @@ int ds4_gpu_routed_moe_batch_tensor(
              * and the stream/pool/source-cache paths are skipped. */
             moe_overlap_active =
                 compact_ok &&
-                !do_hot &&
+                !do_hot && !do_vq &&
                 ds4_gpu_moe_overlap_enabled() &&
                 was_batched &&
                 !g_quality_mode &&
@@ -21469,6 +21620,7 @@ int ds4_gpu_routed_moe_batch_tensor(
             /* 1-bit residual (mm_id path) reuses the base's compacted work map, so it
              * only applies on the compacted gather path, not the full-layer stream. */
             if (do_residual && stream_used) do_residual = 0;
+            int vq_remapped = 0;
             if (compact_ok && !stream_used) {
                 compact_ok = ds4_gpu_remap_selected_to_slots(selectedbuf,
                                                              selected_off,
@@ -21476,7 +21628,13 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                              n_total_expert,
                                                              active_ids,
                                                              n_active);
-
+                vq_remapped = 1;
+            }
+            if (getenv("DS4_VQ_DEBUG") && do_vq && layer_index < 1) {
+                const int32_t *sc = (const int32_t*)((const uint8_t*)selectedbuf.contents + selected_off);
+                fprintf(stderr, "[VQ_DBG3] L%u stream_used=%d remapped=%d compact_ok=%d n_active=%u sel[0..5]=%d,%d,%d,%d,%d,%d\n",
+                        layer_index, stream_used, vq_remapped, compact_ok, n_active,
+                        sc[0],sc[1],sc[2],sc[3],sc[4],sc[5]);
             }
             int pool_used = 0;
             if (!stream_used && !moe_overlap_active && compact_ok && g_expert_pool_warm_batch &&
@@ -21519,7 +21677,13 @@ int ds4_gpu_routed_moe_batch_tensor(
             const double copy_t0 = (!pool_used && !stream_used && ds4_gpu_expert_profile_is_enabled()) ?
                 ds4_gpu_now_ms() : 0.0;
             int load_ok;
-            if (do_hot) {
+            if (do_vq) {
+                load_ok = compact_ok && ds4_gpu_vq_unified_gather(model_map,
+                              (const uint8_t *)go1b_res->gate_ptr,
+                              n_active, active_ids,
+                              down_offset, down_expert_bytes,
+                              expert_in_dim, expert_mid_dim, out_dim);
+            } else if (do_hot) {
                 /* R5-C unified go2b: every active expert lands in the go2b scratch
                  * (hot from the merged sidecar, cold fabricated with d2=0), so the
                  * MoE below keeps bare's single-map three-tile shape. */
@@ -21573,7 +21737,60 @@ int ds4_gpu_routed_moe_batch_tensor(
                 if (was_batched) (void)ds4_gpu_begin_commands();
                 return 0;
             }
-            if (do_hot) {
+            if (do_vq) {
+                /* CPU MoE(匹配量化脚本 dq_expert_fp)。DS4_VQ_DIAG=1: 写 ref 并继续跑 GPU F16W 末尾对比。 */
+                int vqdiag = getenv("DS4_VQ_DIAG") != NULL;
+                int vqgpu  = vqdiag || getenv("DS4_VQ_GPU") != NULL;   /* GPU F16W 路; 默认走下方 CPU 生产路(已验证正确) */
+                if (!vqgpu || vqdiag) {   /* 纯GPU 跳过 CPU; 生产/DIAG 都要算 CPU(生产=输出, DIAG=参考) */
+                if (was_batched) (void)ds4_gpu_end_commands();
+                const float *xin = (const float*)((const uint8_t*)xbuf.contents + ds4_gpu_tensor_offset(x));
+                const int32_t *sel = (const int32_t*)((const uint8_t*)selectedbuf.contents + selected_off);
+                const float *rw = (const float*)((const uint8_t*)weightsbuf.contents + ds4_gpu_tensor_offset(weights));
+                float *outp = vqdiag ? (float*)malloc((size_t)n_tokens*out_dim*sizeof(float))
+                                     : (float*)((uint8_t*)outbuf.contents + ds4_gpu_tensor_offset(out));
+                /* f16 scratch(内存安全) → 每专家转 f32 temp + cblas_sgemv(向量化); temp reuse */
+                const uint16_t *gsc=(const uint16_t*)g_moe_vq_gate_scratch.contents;
+                const uint16_t *usc=(const uint16_t*)g_moe_vq_up_scratch.contents;
+                const uint16_t *dnc=(const uint16_t*)g_moe_vq_down_scratch.contents;
+                const int IN=(int)expert_in_dim, MID=(int)expert_mid_dim, OUT=(int)out_dim;
+                const float L=clamp;
+                /* per-slot f32 权重缓存(该层各专家转一次, reuse 跨 token): n_active×(2·MID·IN+OUT·MID) f32
+                 * 但内存受限 → 仅缓存"是否已转"标记 + 单专家 temp(32MB×3 reuse)。按专家外层循环批处理 token。 */
+                float *w1f=(float*)malloc((size_t)MID*IN*sizeof(float));
+                float *w3f=(float*)malloc((size_t)MID*IN*sizeof(float));
+                float *w2f=(float*)malloc((size_t)OUT*MID*sizeof(float));
+                float *gg=(float*)malloc((size_t)MID*sizeof(float));
+                float *hb=(float*)malloc((size_t)MID*sizeof(float));
+                for (uint32_t t=0;t<n_tokens;t++){ float *o=outp+(uint64_t)t*OUT; for(int d=0;d<OUT;d++)o[d]=0.0f; }
+                for (uint32_t sl=0; sl<n_active; sl++){
+                    /* 该 slot 是否被任何 token 选中 */
+                    int used=0; for(uint32_t t=0;t<n_tokens&&!used;t++) for(uint32_t pk=0;pk<n_expert;pk++) if(sel[(uint64_t)t*n_expert+pk]==(int)sl){used=1;break;}
+                    if(!used) continue;
+                    const uint16_t *g=gsc+(uint64_t)sl*MID*IN,*u=usc+(uint64_t)sl*MID*IN,*dn=dnc+(uint64_t)sl*OUT*MID;
+                    for(size_t j=0;j<(size_t)MID*IN;j++){ w1f[j]=ds4vq_f16(g[j]); w3f[j]=ds4vq_f16(u[j]); }
+                    for(size_t j=0;j<(size_t)OUT*MID;j++) w2f[j]=ds4vq_f16(dn[j]);
+                    for (uint32_t t=0;t<n_tokens;t++){
+                        float w=0; for(uint32_t pk=0;pk<n_expert;pk++) if(sel[(uint64_t)t*n_expert+pk]==(int)sl){ w=rw[(uint64_t)t*n_expert+pk]; break; }
+                        if(w==0.0f) continue;
+                        const float *xt=xin+(uint64_t)t*IN; float *o=outp+(uint64_t)t*OUT;
+                        cblas_sgemv(CblasRowMajor,CblasNoTrans,MID,IN,1.0f,w1f,IN,xt,1,0.0f,gg,1);
+                        cblas_sgemv(CblasRowMajor,CblasNoTrans,MID,IN,1.0f,w3f,IN,xt,1,0.0f,hb,1);
+                        for(int m=0;m<MID;m++){ float ga=gg[m],ua=hb[m];
+                            if(L>0){ if(ga>L)ga=L; if(ua>L)ua=L; if(ua<-L)ua=-L; }
+                            hb[m]=(ga/(1.0f+expf(-ga)))*ua; }
+                        cblas_sgemv(CblasRowMajor,CblasNoTrans,OUT,MID,w,w2f,MID,hb,1,1.0f,o,1);
+                    }
+                }
+                free(w1f);free(w3f);free(w2f);free(gg);free(hb);
+                if (was_batched) (void)ds4_gpu_begin_commands();
+                if (!vqgpu) return 1;   /* 生产: CPU 输出已写 outbuf */
+                /* DIAG: 存 CPU 参考, GPU 跑完在末尾对比 */
+                g_vq_diag_ref = outp; g_vq_diag_layer = layer_index; g_vq_diag_ntok = n_tokens; g_vq_diag_out = out_dim;
+                }   /* 结束 (!vqgpu || vqdiag) 的 CPU 块 */
+                /* GPU F16W: 设 VQ f16 scratch, fall through 到下方 plain mm_id passes(map→gate→up→swiglu→down→sum) */
+                gate_buf = g_moe_vq_gate_scratch; up_buf = g_moe_vq_up_scratch;
+                down_buf = g_moe_vq_down_scratch; source_n_total_expert = n_active;
+            } else if (do_hot) {
                 gate_buf = g_moe_hot_gate_scratch;
                 up_buf = g_moe_hot_up_scratch;
                 down_buf = g_moe_hot_down_scratch;
@@ -21694,12 +21911,20 @@ int ds4_gpu_routed_moe_batch_tensor(
                 ds4_gpu_make_mul_mm_id_map_args(expert_in_dim, source_n_total_expert, 1, n_expert, n_tokens);
             /* R5-C unified go2b: the scratch holds 68-byte blocks for every
              * active expert, so strides and kernels switch to go2b wholesale. */
-            const uint64_t eff_gate_row = do_hot ? (uint64_t)expert_in_dim / 256u * 68u : gate_row_bytes;
-            const uint64_t eff_gate_exp = do_hot ? (uint64_t)expert_mid_dim * eff_gate_row : gate_expert_bytes;
-            const uint64_t eff_down_row = do_hot ? (uint64_t)expert_mid_dim / 256u * 68u : down_row_bytes;
-            const uint64_t eff_down_exp = do_hot ? (uint64_t)out_dim * eff_down_row : down_expert_bytes;
-            const uint32_t eff_gate_type = do_hot ? DS4_METAL_TENSOR_GO2B : gate_type;
-            const uint32_t eff_down_type = do_hot ? DS4_METAL_TENSOR_GO2B : down_type;
+            uint64_t eff_gate_row = do_hot ? (uint64_t)expert_in_dim / 256u * 68u : gate_row_bytes;
+            uint64_t eff_gate_exp = do_hot ? (uint64_t)expert_mid_dim * eff_gate_row : gate_expert_bytes;
+            uint64_t eff_down_row = do_hot ? (uint64_t)expert_mid_dim / 256u * 68u : down_row_bytes;
+            uint64_t eff_down_exp = do_hot ? (uint64_t)out_dim * eff_down_row : down_expert_bytes;
+            uint32_t eff_gate_type = do_hot ? DS4_METAL_TENSOR_GO2B : gate_type;
+            uint32_t eff_down_type = do_hot ? DS4_METAL_TENSOR_GO2B : down_type;
+            if (do_vq) {   /* f16 scratch: 行=in*2B, 专家=mid*行 */
+                eff_gate_row = (uint64_t)expert_in_dim * 2u;
+                eff_gate_exp = (uint64_t)expert_mid_dim * eff_gate_row;
+                eff_down_row = (uint64_t)expert_mid_dim * 2u;
+                eff_down_exp = (uint64_t)out_dim * eff_down_row;
+                eff_gate_type = DS4_METAL_TENSOR_F16W;
+                eff_down_type = DS4_METAL_TENSOR_F16W;
+            }
             gate_mm_args =
                 ds4_gpu_make_mul_mm_id_args(expert_in_dim, expert_mid_dim, source_n_total_expert,
                                               eff_gate_row, eff_gate_exp,
@@ -21716,7 +21941,12 @@ int ds4_gpu_routed_moe_batch_tensor(
             down_mm_pipeline = request_mid_f16 ?
                 ds4_gpu_routed_mm_f16_rhs_pipeline(eff_down_type) :
                 ds4_gpu_routed_mm_pipeline(eff_down_type);
+            if (do_vq && getenv("DS4_VQ_DEBUG"))
+                fprintf(stderr, "[VQ_DBG4] map=%d gate=%d up=%d down=%d eff_gt=%u eff_dt=%u mid_f16=%d\n",
+                        map_pipeline!=nil, gate_mm_pipeline!=nil, up_mm_pipeline!=nil,
+                        down_mm_pipeline!=nil, eff_gate_type, eff_down_type, request_mid_f16);
             if (!map_pipeline || !gate_mm_pipeline || !up_mm_pipeline || !down_mm_pipeline) {
+                if (do_vq && getenv("DS4_VQ_DEBUG")) fprintf(stderr, "[VQ_DBG4] ★pipeline nil → return 0★\n");
                 return 0;
             }
         }
@@ -22271,6 +22501,16 @@ int ds4_gpu_routed_moe_batch_tensor(
         if (!ok) return 0;
 
         if (!ds4_gpu_finish_command_buffer(cb, owned, "routed batch MoE")) return 0;
+        if (g_vq_diag_ref) {
+            const float *gpu = (const float*)((const uint8_t*)outbuf.contents + ds4_gpu_tensor_offset(out));
+            uint32_t N = g_vq_diag_ntok * g_vq_diag_out; int nn=0, nbig=0; double mxd=0; int firstdiv=-1;
+            for (uint32_t k=0;k<N;k++){ float gv=gpu[k], cv=g_vq_diag_ref[k]; double d=fabs((double)gv-cv);
+                if(gv!=gv)nn++; else if(d>mxd)mxd=d; if(d>0.05){ nbig++; if(firstdiv<0)firstdiv=(int)k; } }
+            fprintf(stderr,"[VQ_DIFF] L%u N=%u gpu_nan=%d big_diff(>0.05)=%d maxd=%.4f first@%d(tok%d,d%d ref=%.3f)\n",
+                    g_vq_diag_layer, N, nn, nbig, mxd, firstdiv, firstdiv>=0?firstdiv/g_vq_diag_out:-1,
+                    firstdiv>=0?firstdiv%g_vq_diag_out:-1, firstdiv>=0?g_vq_diag_ref[firstdiv]:0.0);
+            free(g_vq_diag_ref); g_vq_diag_ref=NULL;
+        }
 #undef DS4_METAL_PROFILE_MOE_STAGE
     }
 

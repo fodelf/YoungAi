@@ -1305,6 +1305,8 @@ static const gguf_type_info gguf_types[] = {
     [40] = {"go1b",   256,  34},
     /* go2b: merged base+residual pair (two f16 scales + two sign planes). */
     [41] = {"go2b",   256,  68},
+    /* v2.2 VQ 层 blob(不透明字节: DQVL 表+DQVQ 载荷; shape=[nbytes]) */
+    [42] = {"vqblob",  1,   1},
 };
 
 
@@ -2092,6 +2094,60 @@ static void residual_free(struct ds4_residual *r) {
     free(r);
 }
 
+/* v2.2 直读 VQ 侧车目录(DS4_VQ_DIR): 逐层 mmap dql_vq_L%02d.bin(DQVL 校验), 零复制。
+ * 盘账动机: overlay GGUF 需复制 34.5G 侧车字节, 战役机放不下; 直读=同字节同语义。 */
+static struct ds4_residual *vq_dir_load(const char *dir) {
+    struct ds4_residual *r = xcalloc(1, sizeof(*r));
+    uint32_t loaded = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        char pth[512];
+        snprintf(pth, sizeof pth, "%s/dql_vq_L%02u.bin", dir, il);
+        int fd = open(pth, O_RDONLY);
+        if (fd < 0) continue;
+        struct stat st; fstat(fd, &st);
+        void *mp = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        close(fd);
+        if (mp == MAP_FAILED) continue;
+        uint32_t mg; memcpy(&mg, mp, 4);
+        if (mg != 0x4C565144u || (size_t)st.st_size < 16 + 256 * 3 * 8) { munmap(mp, (size_t)st.st_size); continue; }
+        r->layer[il].vq_raw = mp; r->layer[il].vq_sz = (size_t)st.st_size;
+        r->layer[il].present = true;
+        loaded++;
+    }
+    if (!loaded) { free(r); return NULL; }
+    r->present = true;
+    fprintf(stderr, "ds4: v2.2 VQ 侧车直读 %s (%u 层)\n", dir, loaded);
+    return r;
+}
+
+/* 合一 VQ GGUF(2026-07-27): blk.L.ffn_exps_vq.blob 张量(type 42 = DQVL 字节原样)在场即
+ * 自动装载, 指针直指模型 mmap — 与目录直读同字节同语义, 无需 DS4_VQ_DIR/DS4_RESIDUAL。 */
+static struct ds4_residual *vq_model_load(const ds4_model *m) {
+    struct ds4_residual *r = xcalloc(1, sizeof(*r));
+    uint32_t loaded = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        char nm[64];
+        snprintf(nm, sizeof nm, "blk.%u.ffn_exps_vq.blob", il);
+        ds4_tensor *t = model_find_tensor(m, nm);
+        if (!t || t->type != 42u) continue;
+        const void *p = tensor_data(m, t);
+        if (!p || t->bytes < 16 + 256 * 3 * 8) continue;
+        uint32_t mg; memcpy(&mg, p, 4);
+        if (mg != 0x4C565144u) {
+            fprintf(stderr, "ds4: 内嵌 VQ blob 层 %u 魔数错 -- aborting (no silent quality downgrade)\n", il);
+            exit(1);
+        }
+        r->layer[il].vq_raw = p;
+        r->layer[il].vq_sz = (size_t)t->bytes;
+        r->layer[il].present = true;
+        loaded++;
+    }
+    if (!loaded) { free(r); return NULL; }
+    r->present = true;
+    fprintf(stderr, "ds4: 合一 GGUF 内嵌 VQ blob 装载 (%u 层)\n", loaded);
+    return r;
+}
+
 /* Open the 1-bit residual sidecar GGUF and bind per-layer go1b residual expert
  * tensors (blk.{L}.ffn_{gate,up,down}_exps_res.weight). Returns NULL (single
  * 1-bit path) when the file lacks ds4.residual.present or carries no tensors. */
@@ -2106,6 +2162,13 @@ static struct ds4_residual *residual_load(const char *path, bool metal_mapping) 
     uint32_t loaded = 0;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         char nm[128];
+        snprintf(nm, sizeof nm, "blk.%u.ffn_exps_vq.blob", il);
+        ds4_tensor *vqb = model_find_tensor(&r->sidecar, nm);
+        if (vqb) {                              /* v2.2 VQ overlay: 单 blob 携带全专家 */
+            ds4_residual_layer *rl = &r->layer[il];
+            rl->gate = rl->up = rl->down = vqb; rl->lut = NULL; rl->present = true;
+            loaded++; continue;
+        }
         snprintf(nm, sizeof nm, "blk.%u.ffn_gate_exps_res.weight", il);
         ds4_tensor *g = model_find_tensor(&r->sidecar, nm);
         if (!g) continue;                       /* layer not residual-corrected */
@@ -2225,6 +2288,11 @@ static const ds4_gpu_residual_set *residual_set_for(const ds4_model *m, uint32_t
     if (!m || !m->residual || !m->residual->present ||
         il >= DS4_MAX_LAYER || !m->residual->layer[il].present) return NULL;
     const ds4_residual_layer *rl = &m->residual->layer[il];
+    if (rl->vq_raw) {   /* 直读侧车: blob 即三矩阵之源 */
+        rs.gate_ptr = rs.up_ptr = rs.down_ptr = rl->vq_raw;
+        rs.lut = NULL; rs.merged2b = 0; rs.vq = 1;
+        return &rs;
+    }
     if (!rl->gate || !rl->up || !rl->down) return NULL;
     rs.gate_ptr = tensor_data(&m->residual->sidecar, rl->gate);
     rs.up_ptr   = tensor_data(&m->residual->sidecar, rl->up);
@@ -2234,6 +2302,7 @@ static const ds4_gpu_residual_set *residual_set_for(const ds4_model *m, uint32_t
     /* Type 41 = go2b (offline-merged base+residual, R5-C): the metal path runs the
      * hot/cold two-source split instead of the legacy three-extra-matmul add. */
     rs.merged2b = (rl->gate->type == 41u);
+    rs.vq = (rl->gate->type == 42u);
     return &rs;
 }
 
@@ -3160,6 +3229,26 @@ static void tensor_expect_routed_expert(
 
 /* Verify every tensor type and dimension used by the specialized pipeline.
  * After this succeeds, inference code can rely on fixed DS4 constants. */
+/* 合一 VQ GGUF(2026-07-27): base 的 ffn_{gate,up}_exps(go1b, 被 VQ 覆盖的死重 22.85 GiB)
+ * 不再入文件, 专家维度/量化类型/偏移改由这些 helper 供给 — gate 在场走原值(所有旧文件
+ * 字节不变), 缺席(内嵌 VQ)时维度取自 down 张量(in=down.dim[1], mid=down.dim[0]),
+ * 类型按 GO1B 报(dispatch 走 batch mm_id 路 = VQ 消费端所在), 偏移 0(do_vq 不读)。 */
+static uint64_t routed_expert_in_dim(const ds4_layer_weights *l) {
+    return l->ffn_gate_exps ? l->ffn_gate_exps->dim[0] : l->ffn_down_exps->dim[1];
+}
+static uint64_t routed_expert_mid_dim(const ds4_layer_weights *l) {
+    return l->ffn_gate_exps ? l->ffn_gate_exps->dim[1] : l->ffn_down_exps->dim[0];
+}
+static uint32_t routed_expert_quant_type(const ds4_layer_weights *l) {
+    return l->ffn_gate_exps ? l->ffn_gate_exps->type : (uint32_t)DS4_TENSOR_GO1B;
+}
+static uint64_t routed_expert_gate_off(const ds4_layer_weights *l) {
+    return l->ffn_gate_exps ? l->ffn_gate_exps->abs_offset : 0;
+}
+static uint64_t routed_expert_up_off(const ds4_layer_weights *l) {
+    return l->ffn_up_exps ? l->ffn_up_exps->abs_offset : 0;
+}
+
 static void weights_validate_layout(const ds4_model *m, const ds4_weights *w) {
     const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
     const uint64_t hc_mix_dim = 2u * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
@@ -3224,10 +3313,14 @@ static void weights_validate_layout(const ds4_model *m, const ds4_weights *w) {
         /* A shrunken (keep-map) model carries only the kept routed experts; the
          * router + ffn_gate_inp + ffn_exp_probs_b stay 256-wide above. */
         const uint64_t exp_dim = model_expert_kept_count(m, il);
-        tensor_expect_routed_expert(l->ffn_gate_exps, 3, DS4_N_EMBD, DS4_N_FF_EXP, exp_dim);
-        tensor_expect_routed_expert(l->ffn_up_exps,   3, DS4_N_EMBD, DS4_N_FF_EXP, exp_dim);
+        /* 内嵌 VQ 合一文件: gate/up 死重不入文件(blob 张量替代), 仅 down(冷 w2 源)必在。 */
+        if (l->ffn_gate_exps)
+            tensor_expect_routed_expert(l->ffn_gate_exps, 3, DS4_N_EMBD, DS4_N_FF_EXP, exp_dim);
+        if (l->ffn_up_exps)
+            tensor_expect_routed_expert(l->ffn_up_exps,   3, DS4_N_EMBD, DS4_N_FF_EXP, exp_dim);
         tensor_expect_routed_expert(l->ffn_down_exps, 3, DS4_N_FF_EXP, DS4_N_EMBD, exp_dim);
-        if (l->ffn_gate_exps->type != l->ffn_up_exps->type) {
+        if (l->ffn_gate_exps && l->ffn_up_exps &&
+            l->ffn_gate_exps->type != l->ffn_up_exps->type) {
             fprintf(stderr, "ds4: routed gate/up experts use different quant types in layer %u\n", il);
             exit(1);
         }
@@ -3658,8 +3751,15 @@ static void weights_bind(ds4_weights *w, const ds4_model *m) {
         l->ffn_norm        = required_tensorf(m, "blk.%u.ffn_norm.weight", il);
         l->ffn_gate_inp    = required_tensorf(m, "blk.%u.ffn_gate_inp.weight", il);
         l->ffn_exp_probs_b = tensor_by_namef(m, "blk.%u.exp_probs_b.bias", il);
-        l->ffn_gate_exps   = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
-        l->ffn_up_exps     = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
+        /* 合一 VQ 文件携带 blk.L.ffn_exps_vq.blob 时 gate/up 死重不入文件 → 降为可选;
+         * down 是冷 w2 源永远必需。无 blob 的旧文件语义不变(仍必需)。 */
+        if (tensor_by_namef(m, "blk.%u.ffn_exps_vq.blob", il)) {
+            l->ffn_gate_exps = tensor_by_namef(m, "blk.%u.ffn_gate_exps.weight", il);
+            l->ffn_up_exps   = tensor_by_namef(m, "blk.%u.ffn_up_exps.weight", il);
+        } else {
+            l->ffn_gate_exps = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
+            l->ffn_up_exps   = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
+        }
         l->ffn_down_exps   = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
         l->ffn_gate_shexp  = required_tensorf(m, "blk.%u.ffn_gate_shexp.weight", il);
         l->ffn_up_shexp    = required_tensorf(m, "blk.%u.ffn_up_shexp.weight", il);
@@ -3708,6 +3808,7 @@ static void model_map_span_vec_append(ds4_model_map_span_vec *spans, uint64_t lo
 }
 
 static void model_map_span_vec_include_one(ds4_model_map_span_vec *spans, const ds4_tensor *t) {
+    if (!t) return;   /* 内嵌 VQ 合一文件: gate/up_exps 缺席即跳过(blob 走 CPU mmap 非 Metal span) */
     uint64_t lo = UINT64_MAX, hi = 0;
     model_map_span_include_tensor(t, &lo, &hi, &spans->max_tensor_bytes);
     model_map_span_vec_append(spans, lo, hi);
@@ -6620,7 +6721,7 @@ static void layer_routed_moe_one(
     float *mid = trace ? xmalloc((size_t)DS4_N_FF_EXP * sizeof(mid[0])) : NULL;
     float *mid_all = trace ? NULL : xmalloc((size_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(mid_all[0]));
     float *down = trace ? xmalloc((size_t)DS4_N_EMBD * sizeof(down[0])) : NULL;
-    const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
+    const uint64_t expert_in_dim = routed_expert_in_dim(layer);
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
     if (expert_in_dim % QK_K != 0) ds4_die("IQ2_XXS expert input is not QK_K aligned");
     if (down_in_dim != DS4_N_FF_EXP || down_in_dim % QK_K != 0) ds4_die("Q2_K expert input has an unexpected layout");
@@ -6741,7 +6842,7 @@ static void layer_routed_moe_one_prealloc(
         block_q8_K         * midq) {
     int selected[DS4_MAX_EXPERT_USED];
     float expert_weight[DS4_MAX_EXPERT_USED];
-    const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
+    const uint64_t expert_in_dim = routed_expert_in_dim(layer);
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
 
     if (expert_in_dim % QK_K != 0) ds4_die("IQ2_XXS expert input is not QK_K aligned");
@@ -6807,8 +6908,8 @@ static void layer_routed_moe_batch(
         uint32_t            n_tok,
         uint32_t            il,
         float               clamp) {
-    const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
-    const uint64_t expert_out_dim = layer->ffn_gate_exps->dim[1];
+    const uint64_t expert_in_dim = routed_expert_in_dim(layer);
+    const uint64_t expert_out_dim = routed_expert_mid_dim(layer);
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
     const uint64_t down_out_dim = layer->ffn_down_exps->dim[1];
     if (expert_in_dim % QK_K != 0) ds4_die("IQ2_XXS expert input is not QK_K aligned");
@@ -7286,7 +7387,7 @@ static void layer_routed_moe_tokens_parallel(
         .layer = layer,
         .norm = norm,
         .token_ids = token_ids,
-        .expert_in_dim = layer->ffn_gate_exps->dim[0],
+        .expert_in_dim = routed_expert_in_dim(layer),
         .down_in_dim = layer->ffn_down_exps->dim[0],
         .il = il,
     };
@@ -7318,7 +7419,7 @@ static void layer_ffn_shared_batch(
     float *shared = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(shared[0]));
     float *post = xmalloc((size_t)n_tok * n_hc * sizeof(post[0]));
     float *comb = xmalloc((size_t)n_tok * n_hc * n_hc * sizeof(comb[0]));
-    const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
+    const uint64_t expert_in_dim = routed_expert_in_dim(layer);
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
     const bool routed_token_parallel =
         getenv("DS4_ROUTED_TOKEN_PARALLEL") != NULL ||
@@ -10430,7 +10531,7 @@ static bool metal_graph_alloc_raw_cap(
     const uint64_t low_dim = (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O;
     const uint64_t group_dim = (uint64_t)DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP);
     const uint64_t shared_dim = layer->ffn_gate_shexp->dim[1];
-    const uint64_t routed_mid_dim = layer->ffn_gate_exps->dim[1];
+    const uint64_t routed_mid_dim = routed_expert_mid_dim(layer);
     /* Sharded worker slice (本机-MTP loopback) holds no output head: it returns
      * hidden state and the coordinator runs the output head. weights->output is
      * then NULL, so the per-row logits buffer is unneeded -- guard the deref. */
@@ -11073,8 +11174,8 @@ static bool metal_graph_encode_decode_layer(
     const uint32_t group_dim = DS4_N_HEAD_DIM * group_heads;
     const uint32_t rank = DS4_N_LORA_O;
     const uint32_t shared_dim = (uint32_t)layer->ffn_gate_shexp->dim[1];
-    const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
-    const uint64_t expert_mid_dim = layer->ffn_gate_exps->dim[1];
+    const uint64_t expert_in_dim = routed_expert_in_dim(layer);
+    const uint64_t expert_mid_dim = routed_expert_mid_dim(layer);
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
     const uint64_t routed_out_dim = layer->ffn_down_exps->dim[1];
     const bool compressed = ds4_layer_compress_ratio(il) != 0;
@@ -11699,7 +11800,7 @@ static bool metal_graph_encode_decode_layer(
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_norm", g->ffn_norm, DS4_N_EMBD, il, pos);
     }
-    const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
+    const uint64_t gate_row_bytes = (layer->ffn_gate_exps ? routed_expert_row_bytes(layer->ffn_gate_exps) : 0);
     const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
     const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
     const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
@@ -11780,8 +11881,8 @@ static bool metal_graph_encode_decode_layer(
         if (es_sel && es_wt) { tp_expert_split = true; es_n = cnt; }
         else { ds4_gpu_tensor_free(es_sel); ds4_gpu_tensor_free(es_wt); es_sel = es_wt = NULL; }
     }
-    if (ok && (layer->ffn_gate_exps->type == DS4_TENSOR_GO1B ||
-               layer->ffn_gate_exps->type == DS4_TENSOR_GO2B)) {
+    if (ok && (routed_expert_quant_type(layer) == DS4_TENSOR_GO1B ||
+               routed_expert_quant_type(layer) == DS4_TENSOR_GO2B)) {
         /* go1b (strict 1-bit) and go2b (2-bit ±d1±d2, monolithic mixed base) routed
          * experts have no hand-written mul_mv_id decode kernel; they run exclusively
          * through the grouped mm_id matmul, which is a correct general GEMM even at
@@ -11796,10 +11897,10 @@ static bool metal_graph_encode_decode_layer(
                                              g->routed_down,
                                              residual_set_for(model, il),
                                              model->map, model->size,
-                                             layer->ffn_gate_exps->abs_offset,
-                                             layer->ffn_up_exps->abs_offset,
+                                             routed_expert_gate_off(layer),
+                                             routed_expert_up_off(layer),
                                              layer->ffn_down_exps->abs_offset,
-                                             layer->ffn_gate_exps->type,
+                                             routed_expert_quant_type(layer),
                                              layer->ffn_down_exps->type,
                                              gate_expert_bytes, gate_row_bytes,
                                              down_expert_bytes, down_row_bytes,
@@ -11818,10 +11919,10 @@ static bool metal_graph_encode_decode_layer(
                                                  g->routed_down,
                                                  residual_set_for(model, il),
                                                  model->map, model->size,
-                                                 layer->ffn_gate_exps->abs_offset,
-                                                 layer->ffn_up_exps->abs_offset,
+                                                 routed_expert_gate_off(layer),
+                                                 routed_expert_up_off(layer),
                                                  layer->ffn_down_exps->abs_offset,
-                                                 layer->ffn_gate_exps->type,
+                                                 routed_expert_quant_type(layer),
                                                  layer->ffn_down_exps->type,
                                                  gate_expert_bytes, gate_row_bytes,
                                                  down_expert_bytes, down_row_bytes,
@@ -12373,7 +12474,7 @@ static void metal_graph_trace_layer_stages(
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint64_t shared_in_dim = layer->ffn_gate_shexp->dim[0];
     const uint64_t shared_dim = layer->ffn_gate_shexp->dim[1];
-    const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
+    const uint64_t expert_in_dim = routed_expert_in_dim(layer);
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
 
     float *cpu_attn_cur = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
@@ -12589,7 +12690,7 @@ static int metal_graph_decode_test(
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t q_rank = layer->attn_q_a->dim[1];
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
-    const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
+    const uint64_t expert_in_dim = routed_expert_in_dim(layer);
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
     const uint64_t vocab_dim = weights->output->dim[1];
 
@@ -14722,11 +14823,11 @@ static bool metal_graph_encode_layer_ffn_batch(
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t shared_dim = layer->ffn_gate_shexp->dim[1];
-    const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
-    const uint64_t expert_mid_dim = layer->ffn_gate_exps->dim[1];
+    const uint64_t expert_in_dim = routed_expert_in_dim(layer);
+    const uint64_t expert_mid_dim = routed_expert_mid_dim(layer);
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
     const uint64_t routed_out_dim = layer->ffn_down_exps->dim[1];
-    const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
+    const uint64_t gate_row_bytes = (layer->ffn_gate_exps ? routed_expert_row_bytes(layer->ffn_gate_exps) : 0);
     const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
     const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
     const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
@@ -14897,10 +14998,10 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                residual_set_for(model, il),
                                                model->map,
                                                model->size,
-                                               layer->ffn_gate_exps->abs_offset,
-                                               layer->ffn_up_exps->abs_offset,
+                                               routed_expert_gate_off(layer),
+                                               routed_expert_up_off(layer),
                                                layer->ffn_down_exps->abs_offset,
-                                               layer->ffn_gate_exps->type,
+                                               routed_expert_quant_type(layer),
                                                layer->ffn_down_exps->type,
                                                gate_expert_bytes,
                                                gate_row_bytes,
@@ -15507,6 +15608,7 @@ static bool imatrix_collector_save(
     imatrix_write_i32(fp, entries);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *layer = &weights->layer[il];
+        if (!layer->ffn_gate_exps || !layer->ffn_up_exps) continue;   /* 内嵌 VQ: 无 gate/up 名可写 */
         char name[256];
         snprintf(name, sizeof(name), "%.*s", (int)layer->ffn_gate_exps->name.len, layer->ffn_gate_exps->name.ptr);
         imatrix_write_entry(fp, name,
@@ -18956,7 +19058,8 @@ int ds4_engine_routed_quant_bits(ds4_engine *e) {
     for (uint32_t il = 0; il < DS4_N_LAYER && !gate; il++) {
         gate = e->weights.layer[il].ffn_gate_exps;
     }
-    if (!gate) return 0;
+    /* 合一 VQ GGUF: gate 死重不入文件, routed 源=内嵌 blob(等效 go1b 档) → 报 2。 */
+    if (!gate) return (e->model.residual && e->model.residual->present) ? 2 : 0;
     return gate->type == DS4_TENSOR_Q4_K ? 4 : 2;
 }
 
@@ -20387,6 +20490,7 @@ static void engine_register_layer_routers(ds4_engine *e, uint32_t start, uint32_
                 why = "unrecognized tid2eid layout";
             }
         }
+        if (!l->ffn_gate_exps || !l->ffn_up_exps) continue;   /* 内嵌 VQ: blob 为源, 不注册 base 专家预取 */
         const uint64_t n_exp = l->ffn_gate_exps->dim[2];
         if (!why && (n_exp == 0 || n_exp != DS4_N_EXPERT)) why = "expert count";
         if (why) {
@@ -20543,8 +20647,16 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         {   /* --residual / DS4_RESIDUAL(2026-07-14): server 等无 CLI 旋钮的宿主经 env 挂热残差侧车 */
             const char *res_path = (opt->residual_path && opt->residual_path[0])
                                  ? opt->residual_path : getenv("DS4_RESIDUAL");
+            const char *vq_dir = getenv("DS4_VQ_DIR");
+            if (vq_dir && !e->model.residual) {
+                e->model.residual = vq_dir_load(vq_dir);
+                if (e->model.residual) res_path = NULL;
+            }
             if (res_path && res_path[0])
                 e->model.residual = residual_load(res_path, graph_backend);
+            /* 合一 VQ GGUF: env 均未指定时, 文件自带 blob 张量即自动装载(文件即权威)。 */
+            if (!e->model.residual)
+                e->model.residual = vq_model_load(&e->model);
         }
         /* go-onebit 优化链: 外部 --zchain/DS4_ZCHAIN 文件优先(实验覆盖); 否则合一
          * GGUF 内嵌 blk.L.opt_* 张量(ds4.zchain.present)自动装载。GE 增益乘进
@@ -22206,25 +22318,15 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
 static int      g_repeat_env_scanned = 0;
 static float    g_repeat_freq_pen = 0.0f;
 static uint32_t g_repeat_freq_window = 128u;
-static int      g_loop_break = -1;
-static int      g_loop_esc_scanned = 0;
-static float    g_loop_esc = 3.0f;
-static int      g_loop_hard_k = 6;
-static int      g_loop_fuzz = 0;   /* DS4_LOOP_FUZZ: 模糊周期容差(每周期允许≤N个token不匹配), 0=现状精确 */
 
 /* Test-only: forget the env caches so tests/ds4_test.c --penalty-unit can
- * exercise several DS4_REPEAT_FREQ/DS4_REPEAT_WINDOW/DS4_LOOP_BREAK/
- * DS4_LOOP_ESC/DS4_LOOP_HARD_K configs in one process (and restore the
- * developer's env for later suites).
+ * exercise several DS4_REPEAT_FREQ/DS4_REPEAT_WINDOW configs in one process
+ * (and restore the developer's env for later suites).
  * extern-declared by the test; deliberately NOT in ds4.h. */
 void ds4_test_reset_penalty_env_cache(void) {
     g_repeat_env_scanned = 0;
     g_repeat_freq_pen = 0.0f;
     g_repeat_freq_window = 128u;
-    g_loop_break = -1;
-    g_loop_esc_scanned = 0;
-    g_loop_esc = 3.0f;
-    g_loop_hard_k = 6;
 }
 
 /* Optional repeat penalty applied to the session logits before sampling. The base
@@ -22248,54 +22350,16 @@ static float session_repeat_freq_pen(uint32_t *window_out) {
     return g_repeat_freq_pen > 0.0f ? g_repeat_freq_pen : 0.0f;
 }
 
-/* THE single DS4_LOOP_BREAK read (default ON). Every consumer -- the activity
- * checks and the ban block in repeat_penalize_core -- goes through this one
- * cache. The core previously re-did a raw getenv per call, so a mid-process
- * setenv could make the cached activity decision and the per-call ban
- * decision disagree (two reads, two cache disciplines). */
-static int session_loop_break_on(void) {
-    if (g_loop_break < 0) {
-        const char *lb = getenv("DS4_LOOP_BREAK");
-        g_loop_break = (lb && lb[0] == '0') ? 0 : 1;
-    }
-    return g_loop_break;
-}
-
-/* THE single DS4_LOOP_ESC / DS4_LOOP_HARD_K read (defaults 3.0 / 6): the
- * escalation slope and the hard-ban repeat count for BOTH anticycle detectors
- * in repeat_penalize_core. The exact-period and 8-gram self-copy detectors
- * share these two knobs deliberately -- one repetition-cost policy, no
- * per-detector tuning surface. Same one-shot cache discipline as
- * session_loop_break_on (reset via ds4_test_reset_penalty_env_cache). */
-static float session_loop_escalation(int *hard_k_out) {
-    if (!g_loop_esc_scanned) {
-        const char *e = getenv("DS4_LOOP_ESC");
-        const char *k = getenv("DS4_LOOP_HARD_K");
-        const char *fz = getenv("DS4_LOOP_FUZZ");
-        if (e && e[0]) g_loop_esc = (float)atof(e);
-        if (k && k[0]) g_loop_hard_k = (int)strtol(k, NULL, 10);
-        if (fz && fz[0]) { g_loop_fuzz = (int)strtol(fz, NULL, 10); if (g_loop_fuzz < 0) g_loop_fuzz = 0; if (g_loop_fuzz > 4) g_loop_fuzz = 4; }
-        /* Negative/NaN slope would REWARD repetition; hard_k < 2 would ban
-         * inside the k>=2 detection floor -- 2 restores the legacy
-         * "third repetition is banned" behavior exactly. */
-        if (!(g_loop_esc >= 0.0f)) g_loop_esc = 0.0f;
-        if (g_loop_hard_k < 2) g_loop_hard_k = 2;
-        g_loop_esc_scanned = 1;
-        if (e || k)
-            fprintf(stderr, "ds4: loop-escalation esc=%.2f hard_k=%d\n",
-                    g_loop_esc, g_loop_hard_k);
-    }
-    if (hard_k_out) *hard_k_out = g_loop_hard_k;
-    return g_loop_esc;
-}
-
 /* Penalize an arbitrary logits row as if the committed stream ended at
  * checkpoint[0..end): the speculative verify replays the SAME penalty the
  * non-speculative sampler would have applied at that position, so greedy
  * speculation stays bit-equivalent with the penalty active (it previously
- * bypassed the penalty entirely — accepted whole repetition runs raw). */
+ * bypassed the penalty entirely — accepted whole repetition runs raw).
+ * 2026-07-28 用户裁决: anticycle 断环器整族删除(LOOP_BREAK/ESC/HARD_K/FUZZ+双检测器)
+ * — 行为遮罩掩盖真实退化且模糊环照样穿透; 采样期惩罚只剩显式 opt-in 的
+ * DS4_REPEAT_FREQ 与 per-request OpenAI 惩罚, 默认路径=裸模型真值。 */
 static int session_anticycle_active(void) {
-    return session_loop_break_on() == 1 || session_repeat_freq_pen(NULL) > 0.0f;
+    return session_repeat_freq_pen(NULL) > 0.0f;
 }
 
 /* Session-aware penalty-activity gate: env-armed penalties (loop break /
@@ -22335,106 +22399,16 @@ static void repeat_penalize_core(const int *v, uint32_t end, uint32_t gstart, fl
             if (t >= 0 && t < (int)DS4_N_VOCAB) logits[t] -= freq_pen;
         }
     }
-    /* Anti-cycle loop breaker (default ON, DS4_LOOP_BREAK=0 disables): the
-     * frequency penalty is too blunt for multi-token cycles — a 12-token
-     * block repeats several times before per-token −freq accumulates past the
-     * attractor's logit margin. Two detectors below (exact period, 8-gram
-     * self-copy), both hitting ONLY the continuation token the repetition
-     * predicts next, both scanning the GENERATED region [gstart, end) alone:
-     * quoting a block that repeats in the prompt is legitimate output, not a
-     * loop — gstart is 0 (whole context) only for sessions whose frontend
-     * never marked the generation start. Applies to sampling, greedy and
-     * speculative verify uniformly (same boundary); teacher-forced NLL
-     * scoring never samples, so quality metrics are unaffected.
-     *
-     * GRADUATED escalation, not a third-strike ban: the former rule "twice is
-     * legit structure, the third repeat is a loop => -inf" mis-fired on legal
-     * bounded repetition — "write X five times" died at copy 3, markdown /
-     * ASCII separator rows (short token cycles) lost their third period, and
-     * the third `if err != nil { return err }` in one Go response had its
-     * continuation banned, producing wrong code. Instead, a repetition count
-     * of k costs the continuation ESC·(k−1), and only k >= K_HARD hard-bans
-     * (-1e30). Why the ramp separates loops from instructions: a degenerate
-     * greedy attractor cycles on a SMALL logit margin (the model drifted into
-     * it; nothing upstream demands it), so the growing penalty overtakes it
-     * within ~1-2 extra periods — bounded waste before the break. Genuinely
-     * instructed repetition rides a LARGE margin (prompt evidence keeps
-     * re-asserting the next copy) and survives the ramp through K_HARD−1
-     * legal repeats. The hard cap guarantees termination even for a
-     * pathological attractor whose margin outruns the ramp. Both detectors
-     * share the two knobs — DS4_LOOP_ESC (default 3.0) and DS4_LOOP_HARD_K
-     * (default 6) — read once in session_loop_escalation. */
-    if (!session_loop_break_on()) return;
-    {
-        int hard_k = 0;
-        const float esc = session_loop_escalation(&hard_k);
-        const uint32_t avail = end - gstart;
-        /* exact period: smallest P whose last two windows match, then count
-         * the CONSECUTIVE complete periods k ending at `end` by extending the
-         * v[i]==v[i+P] run backwards — the escalation needs the true k, not
-         * just "at least 2" — and escalate on the continuation v[end-P]. */
-        for (uint32_t P = 1; P <= 64u && 2u * P <= avail; P++) {
-            /* 模糊周期(DS4_LOOP_FUZZ>0): 允许每周期≤fuzz个token不匹配 —— 抓"框架
-             * 重复+槽位变"的结构攻击(SQL套娃/No X列举/match递归, 逐字detector漏)。
-             * fuzz=0时退化为原精确匹配(m=true仅当零不匹配)。连续位(continuation)
-             * 必须匹配: 只有下一token确定被结构预测时才罚它。 */
-            uint32_t mis = 0;
-            bool m = true;
-            for (uint32_t j = 0; j < P; j++)
-                if (v[end - P + j] != v[end - 2u * P + j]) {
-                    if (++mis > (uint32_t)g_loop_fuzz) { m = false; break; }
-                }
-            /* continuation v[end-P] 必须是精确匹配位, 否则罚错token */
-            if (m && g_loop_fuzz > 0 && v[end - P] != v[end - 2u * P]) m = false;
-            if (!m) continue;
-            /* ext = length of the maximal v[i]==v[i+P] run ending at end-P;
-             * the periodic span is ext+P tokens, so k = 1 + ext/P complete
-             * periods (integer division drops a partial leading period).
-             * k >= 2 here: the 2P match above already proves ext >= P. */
-            uint32_t ext = 0, i = end - P;
-            while (i > gstart && v[i - 1u] == v[i - 1u + P]) { i--; ext++; }
-            const uint32_t k = 1u + ext / P;
-            int cont = v[end - P];
-            if (cont >= 0 && cont < (int)DS4_N_VOCAB) {
-                if (k >= (uint32_t)hard_k) logits[cont] = -1.0e30f;
-                else                       logits[cont] -= esc * (float)(k - 1u);
-            }
-            break;
-        }
-        /* long-range self-copy: the current 8-suffix already appeared n >= 2
-         * times in the GENERATED region with the same continuation; choosing
-         * that continuation would emit instance n+1, so the prior-occurrence
-         * count n plays the role of k above — same ramp, same hard cap. */
-        const uint32_t NG = 8;
-        if (avail > NG) {
-            uint32_t seen[8] = {0};   /* count per distinct continuation, tiny */
-            int      ids[8]; uint32_t nid = 0;
-            for (uint32_t pos = gstart; pos + NG < end; pos++) {
-                bool m = true;
-                for (uint32_t j = 0; j < NG; j++)
-                    if (v[pos + j] != v[end - NG + j]) { m = false; break; }
-                if (!m) continue;
-                int cont = v[pos + NG];
-                uint32_t q = 0;
-                while (q < nid && ids[q] != cont) q++;
-                if (q == nid && nid < 8u) { ids[nid] = cont; seen[nid] = 0; nid++; }
-                if (q < 8u) seen[q < nid ? q : nid - 1u]++;
-            }
-            for (uint32_t q = 0; q < nid; q++) {
-                if (seen[q] < 2u || ids[q] < 0 || ids[q] >= (int)DS4_N_VOCAB) continue;
-                if (seen[q] >= (uint32_t)hard_k) logits[ids[q]] = -1.0e30f;
-                else                             logits[ids[q]] -= esc * (float)(seen[q] - 1u);
-            }
-        }
-    }
+    /* anticycle 断环器已整族删除(2026-07-28 用户裁决): 行为遮罩掩盖真实退化,
+     * 且模糊变体环照样穿透 — 默认路径必须暴露裸模型真值。 */
+    (void)gstart;
 }
 
 static void repeat_penalize_buf(ds4_session *s, float *logits, uint32_t end) {
     if (!s || !logits || end == 0) return;
     /* Lane gate (ds4.h contract): non-FREE lanes get raw logits, no penalty
-     * of any kind. A penalty-diverted token corrupts forced tool-call syntax,
-     * and the anticycle self-copy ban would forbid exactly the verbatim
-     * context reuse the copy-emission contract requires. */
+     * of any kind — a penalty-diverted token corrupts forced tool-call
+     * syntax. */
     if (s->lane != DS4_LANE_FREE) return;
     /* Unmarked (-1) → 0 = whole context, NOT the prompt boundary (end).
      * Pinning to `end` excluded the prompt from the repeat window, which left

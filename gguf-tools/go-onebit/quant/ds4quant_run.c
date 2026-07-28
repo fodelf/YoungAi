@@ -25,6 +25,7 @@
 #include "onebit_quant.c"
 #include "ds4quant_qhelp.h"   /* dq_go1b_bytes_dequant, dq_quant_expert (从 layer.c 抽出) */
 #include "go2b_qc.h"          /* GO2B 编码/解码+热表: 热专家合并2bit(残差+量化一体, 消漂移) */
+#include "vq_qc.h"            /* v2.2 VQ 码本(DS4_VQ=1): 热 vq4x512 全三矩阵 / 冷 w1w3 vq8x256 / 冷 w2 signref */
 #include "ds4_z.c"            /* 闭式秩-k RRR 隐变量 z (产物③) */
 #include "ds4_loss.c"        /* 四损失: align/classify/smooth/fixed */
 #include <pthread.h>
@@ -539,8 +540,12 @@ static void *expert_worker(void*arg){
             if(ANC_OK&&Xc){
                 const float *afin=ANC.fin+(size_t)L*S*DIM;
                 const int32_t *aidx=ANC.ridx+(size_t)L*S*NACT;
-                for(int s=0;s<n_fit;s++){ int hit=0;
-                    for(int a=0;a<NACT;a++) if(aidx[(size_t)s*NACT+a]==e){hit=1;break;}
+                /* DS4_CALIB_FULLSET(2026-07-27 g_r 饿死审计): 命中过滤在 n_fit~400 时每专家
+                 * 仅~9行 → GPTQ-H 是 rank-9 残料, g_r 被 lam=sp2/(n+1) 钉死在 1(实测全模型
+                 * g_r≈1.000)。全集喂入(ncal=n_fit)统计充分, lam 公式随 n 自愈。默认保持旧行为。 */
+                static int fullset=-1; if(fullset<0) fullset=getenv("DS4_CALIB_FULLSET")?1:0;
+                for(int s=0;s<n_fit;s++){ int hit=fullset;
+                    if(!hit) for(int a=0;a<NACT;a++) if(aidx[(size_t)s*NACT+a]==e){hit=1;break;}
                     if(hit){ memcpy(Xc+(size_t)ncal*DIM, afin+(size_t)s*DIM, (size_t)DIM*4); ncal++; } }
             }
             w->nhit++; w->calib_rows+=ncal; if(!ncal) w->calib_empty++;
@@ -672,8 +677,29 @@ static void *coadapt_worker(void*a){
                 if(w->idx[(size_t)s2*NACT+a2]==e){nhit++;break;}
             ce->nhit=nhit;
             int g2hot=g2_hot_slot(w->L,e)>=0;   /* 热专家: go2b 合并态量化(残差+量化一体) */
-            float *q1=g2hot?dq_quant_expert_go2b(e1,MOEI,DIM,Xc,ncal):dq_quant_expert_signref(e1,MOEI,DIM,Xc,ncal);
-            float *q3=g2hot?dq_quant_expert_go2b(e3,MOEI,DIM,Xc,ncal):dq_quant_expert_signref(e3,MOEI,DIM,Xc,ncal);
+            /* GPTAQ 非对称目标(2026-07-25 G1b): y_ref=W·x̂+α·W·(x̃−x̂); x̃=锚 FP 流(量化全程不被覆盖)。
+             * 回归仍在漂移输入 x̂ 上(合并态), 只有目标含 FP 流 ⇒ 纠正累积上游漂移而非仅条件于它。 */
+            float *yadj1=NULL,*yadj3=NULL; float tga=dq_tgt_alpha();
+            if(tga>0.0f&&ncal&&ANC_OK){
+                float *dx=malloc((size_t)ncal*DIM*4);
+                const float *afp=ANC.fin+(size_t)w->L*w->S*DIM;
+                for(int t=0;t<ncal;t++){ int s2=ce->calS[t];
+                    const float *xf=afp+(size_t)s2*DIM,*xh=afin+(size_t)s2*DIM;
+                    for(int d=0;d<DIM;d++) dx[(size_t)t*DIM+d]=xf[d]-xh[d]; }
+                yadj1=malloc((size_t)ncal*MOEI*4); yadj3=malloc((size_t)ncal*MOEI*4);
+                dq_matmul(dx,e1,yadj1,ncal,DIM,MOEI); dq_matmul(dx,e3,yadj3,ncal,DIM,MOEI);
+                for(size_t i2=0;i2<(size_t)ncal*MOEI;i2++){ yadj1[i2]*=tga; yadj3[i2]*=tga; }
+                free(dx);
+            }
+            float *q1,*q3;
+            if(dq_vq_on()){   /* v2.2: 码本量化(α 目标暂不进 VQ 内环, 行乘子已含激活拟合) */
+                q1=g2hot?dq_quant_expert_vq(e1,MOEI,DIM,Xc,ncal,4,512):dq_quant_expert_vq(e1,MOEI,DIM,Xc,ncal,8,256);
+                q3=g2hot?dq_quant_expert_vq(e3,MOEI,DIM,Xc,ncal,4,512):dq_quant_expert_vq(e3,MOEI,DIM,Xc,ncal,8,256);
+            } else {
+                q1=g2hot?dq_quant_expert_go2b_adj(e1,MOEI,DIM,Xc,ncal,yadj1):dq_quant_expert_signref_adj(e1,MOEI,DIM,Xc,ncal,yadj1,NULL);
+                q3=g2hot?dq_quant_expert_go2b_adj(e3,MOEI,DIM,Xc,ncal,yadj3):dq_quant_expert_signref_adj(e3,MOEI,DIM,Xc,ncal,yadj3,NULL);
+            }
+            if(yadj1){free(yadj1);yadj1=NULL;} if(yadj3){free(yadj3);yadj3=NULL;}
             if(ncal){ ce->hc_cal=malloc((size_t)ncal*MOEI*4); co_hc(Xc,ncal,q1,q3,ce->hc_cal); }
             if(nhit){
                 ce->hitS=malloc((size_t)nhit*sizeof(int)); ce->hitW=malloc((size_t)nhit*4);
@@ -690,7 +716,9 @@ static void *coadapt_worker(void*a){
                 ce->y2ref=malloc((size_t)ce->ncal*DIM*4);
                 dq_matmul(ce->hc_cal,e2,ce->y2ref,ce->ncal,MOEI,DIM);
             }
-            float *w2q=g2hot?dq_quant_expert_go2b(e2,DIM,MOEI,ce->hc_cal,ce->ncal)
+            float *w2q;
+            if(dq_vq_on()&&g2hot) w2q=dq_quant_expert_vq(e2,DIM,MOEI,ce->hc_cal,ce->ncal,4,512);
+            else w2q=g2hot?dq_quant_expert_go2b(e2,DIM,MOEI,ce->hc_cal,ce->ncal)
                             :dq_quant_expert_signref_adj(e2,DIM,MOEI,ce->hc_cal,ce->ncal,NULL,&w->nflip);
             co_w2_finish(ce,w2q,w->fout);
             free(w2q);free(e2);free(Xc);
@@ -902,6 +930,7 @@ typedef struct { int type; float g,t; float w2p[4]; float w8[9]; float *V8; floa
 typedef struct { uint8_t *map; size_t msz; const uint8_t *w1,*w3,*w2; size_t szG,szD;
                  uint8_t *g2map; size_t g2msz;                                    /* go2b 侧车 mmap(可异机盘/NFS) */
                  const uint8_t *g2w1,*g2w3,*g2w2; int g2k; int16_t g2slot[256];   /* 热专家 2bit 覆盖 */
+                 uint8_t *vqmap; size_t vqmsz;                                    /* v2.2 VQ 侧车 mmap(dql_vq_L%02d.bin) */
                  lop_t ops[32]; int nops; } lfile_t;
 /* go2b 侧车路径: DS4_GO2B_DIR(默认=层文件同目录)/dql_go2b_L<NN>.bin — 分储设计:
  * 冷 go1b dql 在本机(热专家稀疏洞), 热 go2b 侧车可放对机 NFS(两机 16G 盘都装不下合体) */
@@ -992,8 +1021,19 @@ static int lfile_load(const char*path,lfile_t*lf){
               } else { munmap(lf->g2map,lf->g2msz); lf->g2map=NULL; }
           }
       }
-      if(GO2B_HOT&&(int)Lh<64&&G2_K[Lh]>0&&lf->g2k<=0){
-          fprintf(stderr,"[go2b] ★L%u 侧车 %s 缺失/损坏 — 热槽位是稀疏洞, 拒加载★\n",Lh,gp);
+      /* v2.2 VQ 侧车(有则挂): 冷 w1/w3 + 热全三矩阵字节 */
+      { char vqp[512]; vq_sidecar_path(path,(int)Lh,vqp,sizeof(vqp));
+        int vfd=open(vqp,O_RDONLY);
+        if(vfd>=0){
+            struct stat vst; fstat(vfd,&vst); lf->vqmsz=(size_t)vst.st_size;
+            lf->vqmap=mmap(NULL,lf->vqmsz,PROT_READ,MAP_PRIVATE,vfd,0); close(vfd);
+            if(lf->vqmap==MAP_FAILED){ lf->vqmap=NULL; }
+            else { uint32_t mgv; memcpy(&mgv,lf->vqmap,4);
+                   if(mgv!=VQSC_MAGIC||lf->vqmsz<vq_hdr_bytes()){ munmap(lf->vqmap,lf->vqmsz); lf->vqmap=NULL; } }
+        }
+      }
+      if(GO2B_HOT&&(int)Lh<64&&G2_K[Lh]>0&&lf->g2k<=0&&!lf->vqmap){
+          fprintf(stderr,"[go2b] ★L%u 侧车 %s 缺失/损坏(无 VQ 侧车) — 热槽位是稀疏洞, 拒加载★\n",Lh,gp);
           munmap(lf->map,lf->msz); lf->map=NULL; return -1;
       }
     }
@@ -1006,6 +1046,7 @@ static void lfile_free(lfile_t*lf){
         if(lf->ops[i].type==5&&lf->ops[i].ge) free(lf->ops[i].ge);
         if(lf->ops[i].type==6){ free(lf->ops[i].zlU); free(lf->ops[i].zlV); free(lf->ops[i].zlz); }
     }
+    if(lf->vqmap) munmap(lf->vqmap,lf->vqmsz);
     if(lf->g2map) munmap(lf->g2map,lf->g2msz);
     if(lf->map) munmap(lf->map,lf->msz);
 }
@@ -1099,6 +1140,14 @@ static void *bytes_moe_worker(void*a){
             if(w->idx[(size_t)s2*NACT+a2]==e){ tok[nt]=s2; wwv[nt]=gee*w->rw[(size_t)s2*NACT+a2];
                 memcpy(xs+(size_t)nt*DIM,w->Fin+(size_t)s2*DIM,(size_t)DIM*4); nt++; break; }
         if(!nt) continue;
+        if(lf->vqmap){   /* v2.2 VQ 回放: 表内 w2 槽非零=热(全三矩阵 VQ), 否则冷(w1/w3 VQ + w2 go1b) */
+            const uint64_t *vtab=(const uint64_t*)(lf->vqmap+16);
+            uint64_t o1=vtab[(size_t)e*3],o3=vtab[(size_t)e*3+1],o2=vtab[(size_t)e*3+2];
+            vq_unpack_dequant(lf->vqmap+o1,lf->vqmsz-o1,q1,NULL,NULL);
+            vq_unpack_dequant(lf->vqmap+o3,lf->vqmsz-o3,q3,NULL,NULL);
+            if(o2) vq_unpack_dequant(lf->vqmap+o2,lf->vqmsz-o2,q2,NULL,NULL);
+            else   dq_go1b_bytes_dequant(lf->w2+(size_t)e*lf->szD,DIM,MOEI,q2);
+        } else {
         int sl=(lf->g2k>0&&g2_replay_en())?lf->g2slot[e]:-1;
         if(sl>=0){   /* 热专家: go2b 合并2bit 回放(反修/rr_verdict 在合并态前向上进行) */
             size_t szG2=(size_t)MOEI*go2b_row_bytes(DIM), szD2=(size_t)DIM*go2b_row_bytes(MOEI);
@@ -1109,7 +1158,7 @@ static void *bytes_moe_worker(void*a){
             dq_go1b_bytes_dequant(lf->w1+(size_t)e*lf->szG,MOEI,DIM,q1);
             dq_go1b_bytes_dequant(lf->w3+(size_t)e*lf->szG,MOEI,DIM,q3);
             dq_go1b_bytes_dequant(lf->w2+(size_t)e*lf->szD,DIM,MOEI,q2);
-        }
+        } }
         float *aq=calloc((size_t)nt*DIM,4);
         dq_expert_fp(xs,q1,q3,q2,wwv,aq,nt,DIM,MOEI,SWLIM);
         for(int i=0;i<nt;i++){ float*dst=w->partial+(size_t)tok[i]*DIM; const float*yi=aq+(size_t)i*DIM;
@@ -1121,6 +1170,14 @@ static void *bytes_moe_worker(void*a){
 static lfile_t *GS_LF=NULL;    /* 回扫: 全43层文件 mmap 只开一次(禁重复 mmap+解析) */
 /* ★真·反修前层★ 状态: 目标层 z 系数以【最终输出 KL】重解时用 */
 static int BF_ANCROUTE=0;   /* 反修前向强制锚路由(禁稀疏路由翻转); 备用, 默认关 */
+/* ★路由偏置侧车(2026-07-28 部署侧路由修正)★: 神谕探针实证反修字节全部亏损住在路由漂移
+ * (agree 77.6→82.9=top1f天花板)。FIT: 学生路由回放时按层累计 FP锚集合 vs 学生集合的选择分
+ * margin 缺口(漏选+=thr−v, 多选−=v−thr; thr=学生第6名选择分) → 均值+计数落盘。
+ * APPLY: Δb 只加进 dq_gate_route_topk 的选择分(gbias 侧), 权重分不动(与引擎语义同构)。
+ * 铁律: fit 只跑校准语料(判决锚不混入); 锚路由(神谕)下 fit 无意义, 自动跳过。 */
+static float *RB_ACC=NULL; static uint32_t *RB_CNT=NULL;  /* fit 累计 [NLAYERS][NEXP] */
+static float *RB_APPLY=NULL; static int RB_TRIED=0;       /* apply Δb_raw [NLAYERS][NEXP] */
+static float RB_ALPHA=1.0f; static int RB_MINCNT=8;
 static float *GS_GV=NULL; static int GS_GV_L=-1;   /* 目标层 per-token routed 增益向量(搜每 token 最优乘子) */
 static float *GS_FIN=NULL; static int GS_CAP_L=-1; /* 目标层 MoE 输入 Fin_L 捕获(重算 z 特征/当前系数) */
 static int *GS_IDXC=NULL; static float *GS_RWC=NULL; /* 目标层路由捕获(GE 投影: token→专家 命中+权重) */
@@ -1444,7 +1501,9 @@ static void coadapt_moe(int L,int S,int n_fit,const float*Fin,const int*idx,cons
         {"符号精修μ10×3轮",10,3},{"符号精修μ3×3轮(弱锚)",3,3},{"符号精修μ30×3轮(强锚)",30,3},
         {"符号精修μ10×6轮(深精修)",10,6},{"行scale闭式(0轮翻转)",0,0},
     };
-    const int nqc=FAST?1:(int)(sizeof(QC)/sizeof(QC[0]));   /* FAST: 只跑首个 signref 变体走流程 */
+    /* FAST: 只跑首个变体走流程; VQ 模式: μ 只剩冷 w2 一处消费, 5 配置全层重量化=4/5 空转
+     * (VQ 编码单价又是 signref 3-5×), 裁到单配置 μ10×3(生产惯用中档) */
+    const int nqc=(FAST||dq_vq_on())?1:(int)(sizeof(QC)/sizeof(QC[0]));
     const uint64_t QVOL=(uint64_t)NEXP*(2*(uint64_t)MOEI*go1b_blk_row_bytes(DIM)+(uint64_t)DIM*go1b_blk_row_bytes(MOEI));
     int qbest=-1; double qsc=1e300,qv=0,qh=0,qf=0; long nflip=0;
     double bfit,bval,bheld,scb;
@@ -1884,7 +1943,54 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
     /* moe 路由(实际激活: 量化遍即被污染激活 = 部署运行时口径) */
     int *idx=malloc((size_t)S*NACT*sizeof(int)); float *rw=malloc((size_t)S*NACT*4);
     if(W->t2ei) dq_gate_route_hash(Fin,W->gate,W->t2ei,ids,idx,rw,S,DIM,NEXP,NACT,ROUTE_SCALE);
-    else        dq_gate_route_topk(Fin,W->gate,W->gbias,idx,rw,S,DIM,NEXP,NACT,ROUTE_SCALE);
+    else{
+        if(!RB_TRIED&&getenv("DS4_ROUTE_BIAS")){   /* 懒加载路由偏置侧车(一次) */
+            RB_TRIED=1; FILE*rf=fopen(getenv("DS4_ROUTE_BIAS"),"rb");
+            if(rf){ uint32_t hd[4]={0,0,0,0};
+                if(fread(hd,4,4,rf)==4&&hd[0]==0x41494252u&&hd[1]==(uint32_t)NLAYERS&&hd[2]==(uint32_t)NEXP){
+                    RB_APPLY=malloc((size_t)NLAYERS*NEXP*4);
+                    uint32_t*c=malloc((size_t)NLAYERS*NEXP*4);
+                    if(fread(RB_APPLY,4,(size_t)NLAYERS*NEXP,rf)==(size_t)NLAYERS*NEXP&&
+                       fread(c,4,(size_t)NLAYERS*NEXP,rf)==(size_t)NLAYERS*NEXP){
+                        if(getenv("DS4_ROUTE_BIAS_ALPHA")) RB_ALPHA=atof(getenv("DS4_ROUTE_BIAS_ALPHA"));
+                        if(getenv("DS4_ROUTE_BIAS_MINCNT")) RB_MINCNT=atoi(getenv("DS4_ROUTE_BIAS_MINCNT"));
+                        long armed=0;
+                        for(size_t i=0;i<(size_t)NLAYERS*NEXP;i++){
+                            if((int)c[i]<RB_MINCNT) RB_APPLY[i]=0.0f; else if(RB_APPLY[i]!=0.0f) armed++; }
+                        printf("ROUTE_BIAS apply α=%.2f mincnt=%d 武装槽=%ld\n",RB_ALPHA,RB_MINCNT,armed);
+                    } else { free(RB_APPLY); RB_APPLY=NULL; }
+                    free(c);
+                }
+                fclose(rf);
+            }
+        }
+        const float *gb=W->gbias; float *gb2=NULL;
+        if(RB_APPLY){ gb2=malloc((size_t)NEXP*4);
+            for(int e=0;e<NEXP;e++) gb2[e]=(W->gbias?W->gbias[e]:0.0f)+RB_ALPHA*RB_APPLY[(size_t)L*NEXP+e];
+            gb=gb2; }
+        dq_gate_route_topk(Fin,W->gate,gb,idx,rw,S,DIM,NEXP,NACT,ROUTE_SCALE);
+        if(gb2) free(gb2);
+        if(getenv("DS4_ROUTE_BIAS_FIT")&&do_quant&&ANC_OK&&!getenv("DS4_ANCHOR_ROUTE")&&!BF_ANCROUTE){
+            if(!RB_ACC){ RB_ACC=calloc((size_t)NLAYERS*NEXP,4); RB_CNT=calloc((size_t)NLAYERS*NEXP,4); }
+            const int32_t *fpx=ANC.ridx+(size_t)L*S*NACT;
+            float *scv=malloc((size_t)NEXP*4);
+            for(int s=0;s<S;s++){
+                const float *xr=Fin+(size_t)s*DIM;
+                for(int e=0;e<NEXP;e++){ const float*gr=W->gate+(size_t)e*DIM;
+                    float raw=0.0f; for(int k=0;k<DIM;k++) raw+=xr[k]*gr[k];
+                    scv[e]=sqrtf(log1pf(expf(raw)))+(W->gbias?W->gbias[e]:0.0f); }
+                float thr=1e30f;
+                for(int a=0;a<NACT;a++){ float v=scv[idx[(size_t)s*NACT+a]]; if(v<thr)thr=v; }
+                for(int a=0;a<NACT;a++){ int e=fpx[(size_t)s*NACT+a]; int in=0;
+                    for(int b=0;b<NACT;b++) if(idx[(size_t)s*NACT+b]==e){in=1;break;}
+                    if(!in){ RB_ACC[(size_t)L*NEXP+e]+=thr-scv[e]; RB_CNT[(size_t)L*NEXP+e]++; } }
+                for(int a=0;a<NACT;a++){ int e=idx[(size_t)s*NACT+a]; int in=0;
+                    for(int b=0;b<NACT;b++) if(fpx[(size_t)s*NACT+b]==e){in=1;break;}
+                    if(!in){ RB_ACC[(size_t)L*NEXP+e]-=scv[e]-thr; RB_CNT[(size_t)L*NEXP+e]++; } }
+            }
+            free(scv);
+        }
+    }
     if(do_quant&&ANC_OK&&(getenv("DS4_ANCHOR_ROUTE")||BF_ANCROUTE)){   /* 神谕路由归因: 强制 FP 路由(专家选择+权重),
         隔离"路由漂移"对最终质量的贡献; 反修判据也用它禁翻转噪声 */
         const int32_t *aidx=ANC.ridx+(size_t)L*S*NACT;
@@ -2357,6 +2463,17 @@ static float *fwd_all(const long*ids,int S,int n_fit,int do_quant,const char*lcf
     if(BF_DYN2OP){ free(BF_DYN2OP); BF_DYN2OP=NULL; }
     if(BF_GEOP){ free(BF_GEOP); BF_GEOP=NULL; }
     if(GS_IDXC){ free(GS_IDXC); GS_IDXC=NULL; } if(GS_RWC){ free(GS_RWC); GS_RWC=NULL; }
+    if(RB_ACC&&getenv("DS4_ROUTE_BIAS_FIT")){   /* ★路由偏置侧车: 均值化+落盘★ */
+        const char*rp=getenv("DS4_ROUTE_BIAS_FIT");
+        float *rbo=malloc((size_t)NLAYERS*NEXP*4); long rbtot=0;
+        for(size_t i=0;i<(size_t)NLAYERS*NEXP;i++){ rbo[i]=RB_CNT[i]?RB_ACC[i]/(float)RB_CNT[i]:0.0f; rbtot+=RB_CNT[i]; }
+        FILE*rbf=fopen(rp,"wb");
+        if(rbf){ uint32_t hd[4]={0x41494252u,(uint32_t)NLAYERS,(uint32_t)NEXP,0};
+            fwrite(hd,4,4,rbf); fwrite(rbo,4,(size_t)NLAYERS*NEXP,rbf);
+            fwrite(RB_CNT,4,(size_t)NLAYERS*NEXP,rbf); fclose(rbf);
+            printf("ROUTE_BIAS fit → %s (margin事件=%ld)\n",rp,rbtot); }
+        free(rbo); free(RB_ACC); RB_ACC=NULL; free(RB_CNT); RB_CNT=NULL;
+    }
     free(H);free(hcfn);free(hcb);free(hcs);free(norm);free(hw);return logits;
 }
 
@@ -2394,6 +2511,7 @@ static goff_t *goff_find(int L,const char*kind){
 typedef struct { int L,S,n_fit; int *e_next; uint8_t *bg,*bu,*bd; size_t szG,szD;
                  int fd; size_t off0;
                  int g2fd; size_t g2off; int g2k; double g2sum[5];   /* go2b 侧车 fd/载荷偏移/热数/门统计{n,Σrel1,Σcos1,Σrel2,Σcos2} */
+                 int vqfd; double vqsum[4];   /* VQ 侧车 fd + 门统计{n_hot,Σcos_hot,n_cold,Σcos_cold} */
                } expw_t;   /* bg==NULL → 流式: 按偏移 pwrite 进 fd(855MB buffer→3.4MB/worker) */
 static void *export_worker(void*a){
     expw_t*w=a;
@@ -2412,21 +2530,47 @@ static void *export_worker(void*a){
         if(!e1||!e3||!e2){ fprintf(stderr,"\n[!] L%d e%d 读失败\n",w->L,e); if(e1)free(e1); if(e3)free(e3); if(e2)free(e2); continue; }
         int ncal=0;
         const float *afin=NULL; const int *aidx_i=NULL; const int32_t *aidx_a=NULL;
+        int csel[4096];
         if(EXP_FIN&&EXP_IDX&&EXP_L==w->L){ afin=EXP_FIN; aidx_i=EXP_IDX; }   /* ★调优同口径 */
         else if(ANC_OK){ afin=ANC.fin+(size_t)w->L*w->S*DIM; aidx_a=ANC.ridx+(size_t)w->L*w->S*NACT; }
         if(afin){
-            for(int s=0;s<w->n_fit;s++){ int hit=0;
-                for(int a2=0;a2<NACT;a2++){ int ee=aidx_i?aidx_i[(size_t)s*NACT+a2]:(int)aidx_a[(size_t)s*NACT+a2];
+            /* DS4_CALIB_FULLSET: 导出段(blob g_r/GPTQ-H 的真正产地)同款全集喂入 —
+             * hit 过滤在 n_fit~400 时每专家仅~9行, g_r 被钉死 1.000(全模型实测)。 */
+            static int fullset2=-1; if(fullset2<0) fullset2=getenv("DS4_CALIB_FULLSET")?1:0;
+            for(int s=0;s<w->n_fit;s++){ int hit=fullset2;
+                if(!hit) for(int a2=0;a2<NACT;a2++){ int ee=aidx_i?aidx_i[(size_t)s*NACT+a2]:(int)aidx_a[(size_t)s*NACT+a2];
                     if(ee==e){hit=1;break;} }
-                if(hit){ memcpy(Xc+(size_t)ncal*DIM,afin+(size_t)s*DIM,(size_t)DIM*4); ncal++; } }
+                if(hit){ memcpy(Xc+(size_t)ncal*DIM,afin+(size_t)s*DIM,(size_t)DIM*4);
+                         if(ncal<4096)csel[ncal]=s; ncal++; } }
         }
-        int sl2=(w->g2fd>0)?g2_hot_slot(w->L,e):-1;
+        /* GPTAQ 非对称目标(与 coadapt 同解, 导出=拟合一致性): dx=x̃−x̂ 仅当 afin=漂移流时非零 */
+        float *yadjE1=NULL,*yadjE3=NULL; { float tgaE=dq_tgt_alpha();
+        if(tgaE>0.0f&&ncal&&ncal<=4096&&ANC_OK&&aidx_i){
+            const float *afp2=ANC.fin+(size_t)w->L*w->S*DIM;
+            float *dx=malloc((size_t)ncal*DIM*4);
+            for(int t=0;t<ncal;t++){ const float *xf=afp2+(size_t)csel[t]*DIM,*xh=Xc+(size_t)t*DIM;
+                for(int d=0;d<DIM;d++) dx[(size_t)t*DIM+d]=xf[d]-xh[d]; }
+            yadjE1=malloc((size_t)ncal*MOEI*4); yadjE3=malloc((size_t)ncal*MOEI*4);
+            dq_matmul(dx,e1,yadjE1,ncal,DIM,MOEI); dq_matmul(dx,e3,yadjE3,ncal,DIM,MOEI);
+            for(size_t i2=0;i2<(size_t)ncal*MOEI;i2++){ yadjE1[i2]*=tgaE; yadjE3[i2]*=tgaE; }
+            free(dx);
+        } }
+        int sl2=(w->g2fd>0||dq_vq_on())?g2_hot_slot(w->L,e):-1;   /* VQ 模式热判定不依赖 g2fd(冒烟bug修) */
         float *q1=NULL,*q3=NULL,*hc=NULL;
         if(sl2<0){   /* 冷专家(或 go2b 关): signref go1b。热专家跳过 → dql 热槽位=稀疏洞(省盘+省算) */
         q1=malloc((size_t)MOEI*DIM*4); q3=malloc((size_t)MOEI*DIM*4);
         uint8_t *dG=w->bg?w->bg+(size_t)e*w->szG:tG, *dU=w->bu?w->bu+(size_t)e*w->szG:tU, *dDn=w->bd?w->bd+(size_t)e*w->szD:tD;
-        dq_signref_export(e1,MOEI,DIM,ncal?Xc:NULL,ncal,dG,q1);
-        dq_signref_export(e3,MOEI,DIM,ncal?Xc:NULL,ncal,dU,q3);
+        int vqcold=dq_vq_on();
+        if(vqcold){   /* v2.2: 冷 w1/w3 → vq8x256 侧车; dql G/U 段留稀疏洞 */
+            double c1v=0,c3v=0;
+            float *t1=vq_export_matrix(e1,MOEI,DIM,ncal?Xc:NULL,ncal,8,256,w->vqfd,vq_slot_off(w->L,e,0,MOEI,DIM),&c1v);
+            float *t3=vq_export_matrix(e3,MOEI,DIM,ncal?Xc:NULL,ncal,8,256,w->vqfd,vq_slot_off(w->L,e,1,MOEI,DIM),&c3v);
+            memcpy(q1,t1,(size_t)MOEI*DIM*4); memcpy(q3,t3,(size_t)MOEI*DIM*4); free(t1); free(t3);
+            w->vqsum[2]+=2; w->vqsum[3]+=c1v+c3v;
+        } else {
+        dq_signref_export_adj(e1,MOEI,DIM,ncal?Xc:NULL,ncal,dG,q1,yadjE1);
+        dq_signref_export_adj(e3,MOEI,DIM,ncal?Xc:NULL,ncal,dU,q3,yadjE3);
+        }
         int nhc=0;
         if(ncal){   /* w2 校准 = 量化 q1/q3 过校准行(顺序补偿, 与 harness 同口径) */
             hc=malloc((size_t)ncal*MOEI*4);
@@ -2438,9 +2582,11 @@ static void *export_worker(void*a){
             free(gg);free(uu); nhc=ncal;
         }
         dq_signref_export(e2,DIM,MOEI,hc,nhc,dDn,NULL);
-        if(!w->bg){   /* 流式: 三段各按偏移落盘(布局与整块拼接逐字节一致) */
+        if(!w->bg){   /* 流式: 三段各按偏移落盘(布局与整块拼接逐字节一致); VQ 模式 G/U=稀疏洞 */
+            if(!vqcold){
             if(pwrite(w->fd,dG,w->szG,(off_t)(w->off0+(size_t)e*w->szG))!=(ssize_t)w->szG) perror("exp-pw-g");
             if(pwrite(w->fd,dU,w->szG,(off_t)(w->off0+(size_t)NEXP*w->szG+(size_t)e*w->szG))!=(ssize_t)w->szG) perror("exp-pw-u");
+            }
             if(pwrite(w->fd,dDn,w->szD,(off_t)(w->off0+2*(size_t)NEXP*w->szG+(size_t)e*w->szD))!=(ssize_t)w->szD) perror("exp-pw-d");
         }
         } else {
@@ -2448,8 +2594,17 @@ static void *export_worker(void*a){
             size_t szG2=(size_t)MOEI*go2b_row_bytes(DIM), szD2=(size_t)DIM*go2b_row_bytes(MOEI);
             uint8_t *b1=malloc(szG2),*b3=malloc(szG2),*bD=malloc(szD2);
             float *g1=malloc((size_t)MOEI*DIM*4),*g3=malloc((size_t)MOEI*DIM*4);
-            dq_go2b_encode(e1,MOEI,DIM,ncal?Xc:NULL,ncal,b1,g1);
-            dq_go2b_encode(e3,MOEI,DIM,ncal?Xc:NULL,ncal,b3,g3);
+            int vqhot=dq_vq_on();
+            if(vqhot){   /* v2.2: 热全三矩阵 → vq4x512 侧车 */
+                double cv1=0,cv3=0;
+                float *t1=vq_export_matrix(e1,MOEI,DIM,ncal?Xc:NULL,ncal,4,512,w->vqfd,vq_slot_off(w->L,e,0,MOEI,DIM),&cv1);
+                float *t3=vq_export_matrix(e3,MOEI,DIM,ncal?Xc:NULL,ncal,4,512,w->vqfd,vq_slot_off(w->L,e,1,MOEI,DIM),&cv3);
+                memcpy(g1,t1,(size_t)MOEI*DIM*4); memcpy(g3,t3,(size_t)MOEI*DIM*4); free(t1); free(t3);
+                w->vqsum[0]+=2; w->vqsum[1]+=cv1+cv3;
+            } else {
+            dq_go2b_encode_adj(e1,MOEI,DIM,ncal?Xc:NULL,ncal,b1,g1,yadjE1);
+            dq_go2b_encode_adj(e3,MOEI,DIM,ncal?Xc:NULL,ncal,b3,g3,yadjE3);
+            }
             float *hc2=NULL; int nh2=0;
             if(ncal){
                 hc2=malloc((size_t)ncal*MOEI*4);
@@ -2461,10 +2616,17 @@ static void *export_worker(void*a){
                 free(gg);free(uu); nh2=ncal;
             }
             float *gD=malloc((size_t)DIM*MOEI*4);
+            if(vqhot){
+                double cv2=0;
+                float *t2=vq_export_matrix(e2,DIM,MOEI,hc2,nh2,4,512,w->vqfd,vq_slot_off(w->L,e,2,MOEI,DIM),&cv2);
+                memcpy(gD,t2,(size_t)DIM*MOEI*4); free(t2);
+                w->vqsum[0]+=1; w->vqsum[1]+=cv2;
+            } else {
             dq_go2b_encode(e2,DIM,MOEI,hc2,nh2,bD,gD);
             if(pwrite(w->g2fd,b1,szG2,(off_t)(w->g2off+(size_t)sl2*szG2))!=(ssize_t)szG2) perror("g2-pw-g");
             if(pwrite(w->g2fd,b3,szG2,(off_t)(w->g2off+(size_t)w->g2k*szG2+(size_t)sl2*szG2))!=(ssize_t)szG2) perror("g2-pw-u");
             if(pwrite(w->g2fd,bD,szD2,(off_t)(w->g2off+2*(size_t)w->g2k*szG2+(size_t)sl2*szD2))!=(ssize_t)szD2) perror("g2-pw-d");
+            }
             if(ncal){   /* 单层门统计: w1/w2 输出重建 vs FP(校准行) */
                 float *Ot=malloc((size_t)ncal*MOEI*4),*Oq=malloc((size_t)ncal*MOEI*4);
                 dq_matmul(Xc,e1,Ot,ncal,DIM,MOEI); dq_matmul(Xc,g1,Oq,ncal,DIM,MOEI);
@@ -2485,7 +2647,7 @@ static void *export_worker(void*a){
             free(b1);free(b3);free(bD);free(g1);free(g3);free(gD); if(hc2)free(hc2);
         }
         if(hc)free(hc);
-        if(q1)free(q1); if(q3)free(q3); free(e1);free(e3);free(e2);
+        if(q1)free(q1); if(q3)free(q3); if(yadjE1)free(yadjE1); if(yadjE3)free(yadjE3); free(e1);free(e3);free(e2);
     }
     if(tG)free(tG); if(tU)free(tU); if(tD)free(tD);
     free(Xc); return NULL;
@@ -2525,7 +2687,24 @@ static void export_layer_file(int L,int S,int n_fit,const char*lf){
                     int g2fd=-1; size_t g2off=0;
                     size_t szG2=(size_t)MOEI*go2b_row_bytes(DIM), szD2=(size_t)DIM*go2b_row_bytes(MOEI);
                     char g2path[512]={0};
-                    if(g2k>0){
+                    int vqfd=-1; char vqpath[512]={0};
+                    if(dq_vq_on()){
+                        vq_sidecar_path(lf,L,vqpath,sizeof(vqpath));
+                        vqfd=open(vqpath,O_RDWR|O_CREAT|O_TRUNC,0644);
+                        if(vqfd<0){ perror("vq-sidecar-open"); fclose(f); return; }
+                        size_t hb2=vq_hdr_bytes(); uint8_t *hb=calloc(1,hb2);
+                        uint32_t mgv=VQSC_MAGIC,verv=1,Lv=(uint32_t)L,nev=256;
+                        memcpy(hb,&mgv,4); memcpy(hb+4,&verv,4); memcpy(hb+8,&Lv,4); memcpy(hb+12,&nev,4);
+                        for(int e2=0;e2<256;e2++) for(int wh=0;wh<3;wh++){
+                            uint64_t o64=(uint64_t)vq_slot_off(L,e2,wh,MOEI,DIM);
+                            memcpy(hb+16+((size_t)e2*3+wh)*8,&o64,8); }
+                        if(pwrite(vqfd,hb,hb2,0)!=(ssize_t)hb2) perror("vq-hdr");
+                        free(hb);
+                        size_t vend=vq_total_bytes(L,MOEI,DIM); uint8_t z2=0;
+                        if(pwrite(vqfd,&z2,1,(off_t)(vend-1))!=1){ perror("vq-extend"); close(vqfd); fclose(f); return; }
+                        fprintf(stderr,"[层文件] L%02d VQ 侧车预留 %.1fMiB → %s\n",L,vend/1048576.0,vqpath);
+                    }
+                    if(g2k>0&&!dq_vq_on()){
                         g2_sidecar_path(lf,L,g2path,sizeof(g2path));
                         g2fd=open(g2path,O_RDWR|O_CREAT|O_TRUNC,0644);
                         if(g2fd<0){ perror("g2-sidecar-open"); fclose(f); return; }
@@ -2545,10 +2724,20 @@ static void export_layer_file(int L,int S,int n_fit,const char*lf){
                             g2k>0?"+go2b热侧车":"");
                     int e_next=0,nth=NTHREADS>NEXP?NEXP:NTHREADS,fd=fileno(f);
                     expw_t *ws=calloc((size_t)nth,sizeof(expw_t)); pthread_t *th=malloc((size_t)nth*sizeof(pthread_t));
-                    for(int t=0;t<nth;t++){ ws[t]=(expw_t){L,S,n_fit,&e_next,NULL,NULL,NULL,szG,szD,fd,off0,g2fd,g2off,g2k,{0}};
+                    for(int t=0;t<nth;t++){ ws[t]=(expw_t){L,S,n_fit,&e_next,NULL,NULL,NULL,szG,szD,fd,off0,g2fd,g2off,g2k,{0},vqfd,{0}};
                         pthread_create(&th[t],NULL,export_worker,&ws[t]); }
                     for(int t=0;t<nth;t++) pthread_join(th[t],NULL);
-                    if(g2k>0){   /* 单层重建门(runbook §3.1): 均值 cos≥0.85, 回填侧车头 mean_cos */
+                    if(dq_vq_on()){   /* ★VQ_GATE 每层日志(用户令: 每层量化必须有日志)★ */
+                        double nh=0,ch=0,ncd=0,cc=0;
+                        for(int t=0;t<nth;t++){ nh+=ws[t].vqsum[0]; ch+=ws[t].vqsum[1];
+                                                ncd+=ws[t].vqsum[2]; cc+=ws[t].vqsum[3]; }
+                        double mh=nh>0?ch/nh:0, mc2=ncd>0?cc/ncd:0;
+                        fprintf(stderr,"\nVQ_GATE L=%02d 热矩阵=%d 冷w1w3=%d 均值cos: hot=%.4f cold=%.4f %s → %s",
+                                L,(int)nh,(int)ncd,mh,mc2,
+                                (mh>=0.90&&mc2>=0.75)?"PASS":"★WARN(阈 hot0.90/cold0.75)★",vqpath);
+                        close(vqfd); vqfd=-1;
+                    }
+                    if(g2k>0&&!dq_vq_on()){   /* 单层重建门(runbook §3.1): 均值 cos≥0.85, 回填侧车头 mean_cos */
                         double n2=0,r1=0,c1=0,r2d=0,c2d=0;
                         for(int t=0;t<nth;t++){ n2+=ws[t].g2sum[0]; r1+=ws[t].g2sum[1]; c1+=ws[t].g2sum[2];
                             r2d+=ws[t].g2sum[3]; c2d+=ws[t].g2sum[4]; }
@@ -2606,7 +2795,7 @@ static void export_gguf(int S,int n_fit){
         fprintf(stderr,"L%02d 导出 ",L);
         int e_next=0; int nth=NTHREADS>NEXP?NEXP:NTHREADS;
         expw_t *ws=calloc((size_t)nth,sizeof(expw_t)); pthread_t *th=malloc((size_t)nth*sizeof(pthread_t));
-        for(int t=0;t<nth;t++){ ws[t]=(expw_t){L,S,n_fit,&e_next,bg,bu,bd,szG,szD,0,0,-1,0,0,{0}};
+        for(int t=0;t<nth;t++){ ws[t]=(expw_t){L,S,n_fit,&e_next,bg,bu,bd,szG,szD,0,0,-1,0,0,{0},-1,{0}};
             pthread_create(&th[t],NULL,export_worker,&ws[t]); }
         for(int t=0;t<nth;t++) pthread_join(th[t],NULL);
         free(ws);free(th);
