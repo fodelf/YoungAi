@@ -1,6 +1,6 @@
 #define DS4_SERVER_TEST
 #define DS4_SERVER_TEST_NO_MAIN
-#include "../ds4_server.c"
+#include "../src/server/server_main.c"
 #include "../ds4_spatial.h"
 #include "../ds4_css.h"
 #ifndef DS4_NO_GPU

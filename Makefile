@@ -186,8 +186,8 @@ ds4_cli.o: ds4_cli.c ds4.h ds4_distributed.h linenoise.h
 ds4_distributed.o: ds4_distributed.c ds4_distributed.h ds4.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_distributed.c
 
-ds4_server.o: ds4_server.c ds4.h ds4_distributed.h ds4_kvstore.h ds4_multimodal.h rax.h
-	$(CC) $(CFLAGS) -c -o $@ ds4_server.c
+ds4_server.o: src/server/server_main.c ds4.h ds4_distributed.h ds4_kvstore.h ds4_multimodal.h rax.h
+	$(CC) $(CFLAGS) -c -o $@ src/server/server_main.c
 
 ds4_bench.o: ds4_bench.c ds4.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_bench.c
@@ -204,7 +204,7 @@ ds4_web.o: ds4_web.c ds4_web.h
 ds4_kvstore.o: ds4_kvstore.c ds4_kvstore.h ds4.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_kvstore.c
 
-ds4_test.o: tests/ds4_test.c ds4_server.c ds4.h ds4_distributed.h ds4_kvstore.h ds4_multimodal.h ds4_spatial.h ds4_css.h rax.h
+ds4_test.o: tests/ds4_test.c src/server/server_main.c ds4.h ds4_distributed.h ds4_kvstore.h ds4_multimodal.h ds4_spatial.h ds4_css.h rax.h
 	$(CC) $(CFLAGS) -Wno-unused-function -c -o $@ tests/ds4_test.c
 
 tests/cuda_long_context_smoke.o: tests/cuda_long_context_smoke.c ds4_gpu.h
@@ -222,8 +222,8 @@ ds4_cpu.o: ds4.c ds4.h ds4_internal.h ds4_distributed.h ds4_gpu.h ds4_multimodal
 ds4_cli_cpu.o: ds4_cli.c ds4.h ds4_distributed.h linenoise.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_cli.c
 
-ds4_server_cpu.o: ds4_server.c ds4.h ds4_distributed.h ds4_kvstore.h ds4_multimodal.h rax.h
-	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_server.c
+ds4_server_cpu.o: src/server/server_main.c ds4.h ds4_distributed.h ds4_kvstore.h ds4_multimodal.h rax.h
+	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ src/server/server_main.c
 
 ds4_bench_cpu.o: ds4_bench.c ds4.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_bench.c
