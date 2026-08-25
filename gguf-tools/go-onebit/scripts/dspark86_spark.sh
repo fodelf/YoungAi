@@ -39,7 +39,7 @@ stage_solve(){
             DS4_ZL_ERF=0 DS4_ZL_SWLIM=60 DS4_ZL_GATE=99 \
             python3 -u "$ZL/zlayer.py" "$HF" "$OUT" "$ANCHOR" $L 1024 0 >"$OUT/zl_L$L.out" 2>&1 \
             || { LOG "★L$L zcache 失败(见 $OUT/zl_L$L.out)★"; exit 3; }
-        python3 -u "$ZL/amp_solve.py" "$ANCHOR" "$ZCF" "$REC" 1638 >"$OUT/amp_L$L.out" 2>&1 \
+        "$(dirname "$0")/../calib/amp_solve_zc" "$ANCHOR" "$ZCF" "$REC" 1638 >"$OUT/amp_L$L.out" 2>&1 \
             || { LOG "★L$L 解算失败(见 $OUT/amp_L$L.out)★"; exit 3; }
         rm -f "$ZCF"
         LOG "L$L ✓"

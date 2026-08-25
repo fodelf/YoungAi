@@ -47,7 +47,7 @@ PY
             rm -f "$AMPREC" "$AMPLOG"
             ( for _i in $(seq 1 600); do [ -f "$ZCF" ] && break; sleep 2; done
               [ -f "$ZCF" ] || { echo "★L$L amp 等 zcache 超时★"; exit 9; }
-              exec python3 -u "$ROOT/gguf-tools/go-onebit/zlever/amp_solve.py" \
+              exec "$(dirname "$0")/../calib/amp_solve_zc" \
                   "$ANCHOR" "$ZCF" "$AMPREC" "${ZS_AMPNFIT:-1638}" ) > "$AMPLOG" 2>&1 &
             AMPPID=$!
         fi

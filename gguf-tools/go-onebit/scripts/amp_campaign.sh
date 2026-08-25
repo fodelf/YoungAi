@@ -152,7 +152,7 @@ solve_one(){   # $1=层 $2=(保留位) $3=输出
         python3 -u "$ZL/zlayer.py" "$DS4_HF" "$AMP" "$ANCHOR" "$L" 1024 0 "$CAP" "${PREV:--}" 2>&1 \
         | grep -aE "XCAP|Error|Traceback|assert|★" \
         || DIE "L$L zcache 失败(完整输出见上)"
-    python3 -u "$ZL/amp_solve.py" "$ANCHOR" "$ZCF" "$3" || DIE "L$L 解算失败"   # 动态 z 已写死
+    "$(dirname "$0")/../calib/amp_solve_zc" "$ANCHOR" "$ZCF" "$3" || DIE "L$L 解算失败"   # 动态 z 已写死
 }
 
 # 【纯诊断, 不在 all 链里, 不是闸】只在想看"静态 z vs 动态 z 差多少"时手动跑。

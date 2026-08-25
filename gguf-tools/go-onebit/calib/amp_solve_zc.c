@@ -24,10 +24,14 @@
  *   旧战役脚本传的是 1638(只在 S=2048 时才等于 80%; S=8192 时是显式短拟合段, 照抄不纠)。
  *   额外 C 侧入口: `amp_solve_zc --selftest` 自检 RNG/特征分解/f16 舍入, 不读任何输入。
  *
- * 【编译】(BLAS 可选; 默认路无外部依赖)
- *     gcc -O3 -o amp_solve_zc amp_solve_zc.c -lm -lpthread
- *     gcc -O3 -march=native -ffp-contract=off -DDQ_BLAS -o amp_solve_zc amp_solve_zc.c \
- *         -framework Accelerate -lm -lpthread            (macOS, 快 3-5 倍)
+ * 【编译】默认路无外部依赖能跑, 但【产线请务必带 -DDQ_BLAS】:
+ *     gcc -O3 -o amp_solve_zc amp_solve_zc.c -lm -lpthread                      (能跑, 但慢)
+ *     gcc -O3 -march=native -ffp-contract=off -DDQ_BLAS -DACCELERATE_NEW_LAPACK \
+ *         -o amp_solve_zc amp_solve_zc.c -framework Accelerate -lm -lpthread     (macOS)
+ *     Linux 照 migrate/build_ctools.sh 里 zlayer 那条(scipy_openblas)写。
+ *   实测真尺寸 SVD 一段(13106×12288 取前 2048): 无 BLAS 430.7s vs Accelerate 28.0s ——
+ *   差 15 倍, 而两边精度一模一样(Ritz 残差都是 4.65e-8)。手写 GEMM 与二级前代循环撑不起
+ *   这个规模, 别让它落进 build_ctools.sh 的默认 `*)` 分支。
  *   ⚠ -ffp-contract=off 不是可选项而是正确性要求: 开着 FMA 合并会把 `a*b+c` 融成一条指令,
  *     少一次舍入 —— f32 精度阶梯上这会真的改数。文件里放了 #pragma STDC FP_CONTRACT OFF
  *     (clang 认), gcc 只认命令行开关; 不带 -march 的基线 x86-64 无 FMA 所以默认构建安全。
@@ -40,10 +44,11 @@
  *     dgemm)、np.linalg.solve(LAPACK dgesv)、SVD(gesdd)。C 侧自带 GEMM/LU/特征分解, 数学
  *     同式但求和顺序不同, f64 尾位差 ~1e-13 相对。U 落 f16(11 位尾数)后绝大多数条目相同,
  *     但边界值会翻末位 ⇒ 整文件 md5 不作判据。
- *  ③ SVD 是唯一的【算法替换】: numpy 的 gesdd → 本文件用 行 Gram(Y·Yᵀ) + 对称特征分解
- *     (Householder 三对角化 + 隐式 QL) + Vt_i = Yᵀw_i/σ_i。数学等价, 但奇异向量的符号与
- *     简并子空间内的旋转由算法决定 ⇒ 与 numpy 不同。对结果无影响(tanh 是奇函数, 基列翻号
- *     被 U 对应行翻号抵消, held 分数不变), 但若 PCA/pca2 当选, 载荷字节必然不同。
+ *  ③ SVD 是唯一的【算法替换】: numpy 的 gesdd → 本文件用【随机子空间迭代 + Rayleigh-Ritz】
+ *     (详见下面 "np.linalg.svd 位" 那一大段的成因与实测)。前导方向与 numpy 一致到 10 位
+ *     有效数字, 截断边缘那 ~1% 方向的 σ 低估 ~1%; 符号与简并子空间内的旋转由算法决定
+ *     ⇒ 与 numpy 不同。对结果无影响(tanh 是奇函数, 基列翻号被 U 对应行翻号抵消, held
+ *     分数不变), 但若 PCA/pca2 当选, 载荷字节必然不同。
  *  ④ 因此判据 = 【数值容差 + 终判在合并/回放侧】: 同一 zcache 下,
  *       - stdout 那一行的 held% 与 .py 差应 ≤0.05pp, 选出的 (V₀名, 门名, λ, k) 应完全相同;
  *       - 载荷长度必须逐位相同(k 相同即定长);
@@ -52,13 +57,18 @@
  *
  * 【已验证(2026-08-25, Mac 合成夹具, 与 .py 同机对跑)】
  *   - 出载荷路(S=1300 D=700 DIN=2100 NFIT=1024, 赢家 PCA×pca2): 赢家/λ=30.0/k=768/
- *     held 1.17%/文件长度 7526532B 全同; scale 逐位同; A、V 两块【每一列都只差一个全局符号】
- *     (A 377 同号 391 反号、V 411/357, 无一列"都不是") = SVD 换算法后子空间与向量本身都对上,
- *     只是符号约定不同; 独立回放复评 held: .py 1.167461% vs C 1.167444%(差 1.7e-5 pp)。
+ *     held 1.17%/文件长度 7526532B 全同; scale 逐位同; V 块【每一列都只差一个全局符号】
+ *     (371 同号 397 反号, 无一列"都不是"), A 块 765/768 同样只差符号、3 列不是 ——
+ *     那 3 列落在 pca2 门的截断边缘(Vt 第 1024..2048 行), 正是子空间法精度最低的地方;
+ *     独立回放复评 held: .py 1.167461% vs C 1.167442%(差 1.9e-5 pp)。
  *   - 层闸路(held 0.04% ≤0.5%): 116B 记录逐字节相同(md5 69d6ccff…)。该夹具同时走了
  *     无 xcap(读锚)+ 无 yqe(np.add.at 重建 yq)两条退路。
  *   - 随机基逐位: 生产尺寸 DIN=12288×KMAX=1024 的 seed 7 与 seed 11 两条基, 落 f16 后与
  *     numpy 12582912/12582912 元素【全部逐位相同】。
+ *   - SVD 真尺寸(13106×12288 取前 2048, `--selftest 13106 12288 2048 12288 1.0`):
+ *     28s(Accelerate) / 见文末成本, 正交性 4.7e-15, Ritz 残差 4.6e-8, 无重随机化;
+ *     同矩阵对 numpy: σ[0..7] 十位有效数字全同, 截断边缘 σ 低估约 1%。
+ *     秩 ≤ nv 的构造下投影残差 ‖Y−(YVᵀ)V‖/‖Y‖ = 4.3e-15(< 1e-10)。
  *
  * 【★macOS 上别拿本机 numpy 当 RNG 金标★】arm64 的 numpy 2.5.1 把 legacy_gauss 里
  *   `r2 = x1*x1 + x2*x2` 编译成了一条 FMA, r2 差 1 ULP。实测 200 万次抽样有 13.79% 的
@@ -69,9 +79,9 @@
  *
  * 【小端前提】.py 全用 struct '<' 与 numpy 小端 dtype; 本文件同样假定小端主机, 大端不支持。
  *
- * 【成本提醒】纯 CPU 路一层约 8-12 分钟(S=8192/NFIT=1638/KMAX=1024), 43 层 ≈ 7 小时;
- *   带 -DDQ_BLAS 约 3-4 分钟/层。.py 走 cupy GPU 路快得多 —— 按"spark 重计算必须 GPU 化"
- *   铁律, 若要上产线批量重解需补 CUDA 路(与 zlayer.c 一期同款欠账)。
+ * 【成本提醒】.py 走 cupy GPU 路(真数据 L20 整层 258s)。本文件是纯 CPU, 按"spark 重计算
+ *   必须 GPU 化"铁律, 若要上产线批量重解仍需补 CUDA 路(与 zlayer.c 一期同款欠账)。
+ *   带 -DDQ_BLAS 时 SVD 一段 28s, 网格才是大头(28 组 × 9 个 k, 见 py:113 的 k 表)。
  */
 
 #include <stdio.h>
@@ -529,7 +539,7 @@ static void lu_solve_T(double *A, int n, double *BT, int nrhs, int ldbt) {
  * 但 .py 的 215 条历史解算记录里 PCA/pca2 从未当选, 所以这条不确定性实际不落盘。
  * 随机起始块用【独立的 mt_t 实例 + 固定种子】, 不消耗也不扰动 .py 的三条流(seed 1/7/11),
  * 所以本工具仍然是确定性的: 同输入 → 同输出。 */
-#define SVD_OVERSAMPLE 64
+#define SVD_OVERSAMPLE 256
 #define SVD_NPOWER      2
 #define SVD_SEED  20250825u
 
@@ -551,6 +561,12 @@ static void guard_finite(const double *A, long long n, const char *what) {
     if (c.bad >= 0)
         die("%s 含非有限值(第 %lld 个 = %g) —— 上游 zcache/锚/dither 已带进 NaN/Inf, 停车",
             what, c.bad, A[c.bad]);
+}
+
+static void guard_finite_f32(const float *A, long long n, const char *what) {
+    for (long long i = 0; i < n; i++)
+        if (!isfinite(A[i]))
+            die("%s 第 %lld 个元素非有限(%g) —— 上游 zcache/锚已经带进 NaN/Inf, 停车", what, i, (double)A[i]);
 }
 
 /* 右看 Cholesky: G(n×n 对称正定, 行主序) → 原地出下三角 L(G = L·Lᵀ)。 */
@@ -596,6 +612,7 @@ static int chol_lower_rr(double *G, int n) {
 /* 行正交化: V 是 Lr×N(每行一个基向量), 出 V·Vᵀ = I。CholQR 走两遍(CholQR2) ——
  * 一遍在条件数 >1e8 时精度不够, 两遍是数值稳的标准做法, 且全是三级 BLAS 形状。
  * 前代 L⁻¹V 按【列】切给线程: 行方向的顺序依赖在每段列内完整保留, 与串行逐位同。 */
+#ifndef DQ_BLAS
 typedef struct { double *V; const double *L; int Lr; long long N; } cq_ctx;
 static void cq_worker(void *vc, int j0, int j1) {
     cq_ctx *c = (cq_ctx *)vc;
@@ -612,6 +629,7 @@ static void cq_worker(void *vc, int j0, int j1) {
         for (int j = j0; j < j1; j++) vr[j] *= di;
     }
 }
+#endif
 static void orth_rows(double *V, int Lr, long long N, double *G, const char *what, mt_t *rng) {
     for (int pass = 0; pass < 2; pass++) {
         for (int round = 0; ; round++) {
@@ -629,8 +647,15 @@ static void orth_rows(double *V, int Lr, long long N, double *G, const char *wha
             fprintf(stderr, "[amp_solve_zc]   %s: 数值秩 %d < L=%d, 尾部 %d 行重随机化(第 %d 轮)\n",
                     what, r, Lr, Lr - r, round + 1);
         }
+#ifdef DQ_BLAS
+        /* 前代 L⁻¹V 就是 dtrsm(Left/Lower/NoTrans/NonUnit) —— 交给 BLAS, 三级形状。
+         * 求和顺序与下面手写路不同, 属既有的"有/无 BLAS 两种构建不逐位"范畴。 */
+        cblas_dtrsm(CblasRowMajor, CblasLeft, CblasLower, CblasNoTrans, CblasNonUnit,
+                    Lr, (int)N, 1.0, G, Lr, V, (int)N);
+#else
         cq_ctx c = {V, G, Lr, N};
         parallel_for((int)N, cq_worker, &c);
+#endif
     }
 }
 
@@ -1069,7 +1094,7 @@ int main(int argc, char **argv) {
     npz_to_f32(&adH, dH, S * D);
 
     /* py:31-35  X0 = xcap(引擎真值) 优先, 否则退回 FP 锚 */
-    float *X0 = NULL; long long DX = 0;
+    float *X0 = NULL; long long DX = 0; const char *X0src = "xcap";
     if (!npz_find(zb, zsz, "xcap", &axcap)) {
         DX = axcap.d1;
         X0 = (float *)xmalloc((size_t)S * DX * 4);
@@ -1077,6 +1102,7 @@ int main(int argc, char **argv) {
     } else {
         const char *xap = getenv("DS4_ZL_XANCHOR");                  /* .py 既有 env, 非新增 */
         X0 = anchor_fin(xap && *xap ? xap : ap, L, S, &DX);
+        X0src = "锚 fin";
     }
     double t0 = now_s();                                             /* py:36 计时从这里起 */
 
@@ -1106,6 +1132,11 @@ int main(int argc, char **argv) {
         }
         free(prow); free(pw);
     }
+    /* NaN 入口守卫: 坏值往下走会伪装成"held=nan → 层闸"或特征分解"不收敛", 症状全是误导的 */
+    guard_finite_f32(dH, S * D, "zcache dH");
+    guard_finite_f32(yq, S * D, "yq(yqe 或 add.at 重建)");
+    guard_finite_f32(X0, S * DX, X0src);
+
     /* py:45  yfp = yq + dH (f32) */
     float *yfp = (float *)xmalloc((size_t)S * D * 4);
     for (long long i = 0; i < S * D; i++) yfp[i] = yq[i] + dH[i];

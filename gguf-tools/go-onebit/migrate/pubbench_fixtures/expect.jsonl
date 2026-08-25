@@ -1,0 +1,24 @@
+{"name": "full_rewrite_py", "out": "\u0000FULL\u0000def has_close(numbers, t):\n    return False\n"}
+{"name": "multi_fence_longest", "out": "\u0000FULL\u0000def has_close(numbers, t):\n    for a in numbers:\n        for b in numbers:\n            if abs(a-b) < t:\n                return True\n    return False\n"}
+{"name": "raw_completion_py", "out": "    \"\"\" inner doc \"\"\"\n    return False\n"}
+{"name": "echo_prompt_strip", "out": "\n    return False\n"}
+{"name": "sig_anchor_strip", "out": "\n    return 42\n"}
+{"name": "sig_strip_colon", "out": ":\n    return False\n"}
+{"name": "go_dup_entry_cut", "out": "\tfor i := range numbers {\n\t\t_ = i\n\t}\n\treturn false\n}\n"}
+{"name": "go_trailing_partial", "out": "\treturn false\n}\n\nfunc Helper(x int) int {\n\treturn x\n}\n"}
+{"name": "go_interface_brace", "out": "\treturn false\n}\n\nfunc Dump(v interface{}) string {\n\treturn \"\"\n}\n"}
+{"name": "py_stops", "out": "    return False\n"}
+{"name": "py_stops_main", "out": "    return False\n"}
+{"name": "unclosed_fence", "out": "\u0000FULL\u0000def has_close(numbers, t):\n    return False\n"}
+{"name": "four_backticks", "out": "\u0000FULL\u0000def has_close(numbers, t):\n    return False\n"}
+{"name": "fence_lang_plus", "out": "\u0000FULL\u0000def has_close(numbers, t):\n    return True\n"}
+{"name": "fence_no_newline", "out": "\u0000FULL\u0000def has_close(a, b):\n    return 1\n"}
+{"name": "no_decl_in_prompt", "out": "x = 1\n"}
+{"name": "fence_decl_no_body_marker", "out": "def has_close(numbers,\n t)\n    return False\n"}
+{"name": "go_full_rewrite", "out": "\u0000FULL\u0000package main\n\nimport \"math\"\n\nfunc HasClose(numbers []float64, t float64) bool {\n\treturn math.Abs(0) < t\n}\n"}
+{"name": "empty_text", "out": "\n"}
+{"name": "empty_fence_body", "out": "\n"}
+{"name": "go_no_close_brace", "out": "\treturn false\n"}
+{"name": "blank_prompt", "out": "  return 1\n"}
+{"name": "go_nested_braces", "out": "\tif t > 0 {\n\t\tfor i := 0; i < 3; i++ {\n\t\t\t_ = i\n\t\t}\n\t}\n\treturn false\n}\n\nfunc Aux() map[string]struct{} {\n\treturn nil\n}\n"}
+{"name": "multi_def_prompt_last", "out": "\u0000FULL\u0000def second(x):\n    return x + 1\n"}

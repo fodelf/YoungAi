@@ -97,3 +97,10 @@
     = committed official.vec(含 %.9g 浮点复刻); 抓到并修正一处转录笔误(long_code_audit ctx)
   边界: 记录 JSON 归档件为 jq 形态(结构同/字节可能异, 非判决件); API 抓取段(curl)结构对齐未实跑(需 key)
   结果: 过闸 ✓ → py 删除
+
+[2026-08-25] zlever/amp_solve.py → calib/amp_solve_zc.c (zcache 口径; ≠换代工具 calib/amp_solve.c)
+  一波折: 首版 SVD(三对角QL)在真尺寸 13106×12288 不收敛, agent 修为子空间迭代后过。
+  输入: 干净锚 + zl_gold_cpu zcache_L20 (spark)
+  判定(四判据): 赢家 rand/rnd2 λ=30.0 k=1024 全同; held 2.47%==2.47%; 载荷 58720388B 同长;
+    A/V 随机基块逐字节 cmp ✓; U 解算块仅 459 字节末位差(Cholesky vs LAPACK, 清单预算内)
+  结果: 过闸 ✓ → py 删除, 4 调用方接线, build_ctools 收编
