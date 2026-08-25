@@ -80,9 +80,8 @@ notice in our `LICENSE` file.
 
 ## Status
 
-The code and GGUF files are to be considered of **beta quality** because
-inference and model serving is a complicated matter and all this exists
-only for a few days. It will take months to reach a more stable form.
+The code and GGUF files are to be considered of **beta quality**: inference
+and model serving is a complicated matter and the project is still young.
 However, we try to keep the project in a usable state, and we are making
 progress. If you have issues, make sure to use `--trace` to log the
 sessions, and open issues including the full trace.
@@ -1273,13 +1272,17 @@ attention regressions show up before they become long generation failures. The
 C runner pins `DS4_METAL_PREFILL_CHUNK=2048` for this strict API-vector
 comparison.
 
-All project tests are driven by the C runner, with a small `ds4-eval`
-extractor self-test run first:
+All project tests are driven by the C runner. `make test` also runs the
+offline golden-fixture unit tests (`ds4_unit`), the ≤500-line source guard
+(`make linecount`), and the `ds4-eval` extractor self-test. Model-dependent
+suites SKIP cleanly when `ds4flash.gguf` is absent, so `make test` is
+meaningful on any machine. `./ds4_test --list` names all suites.
 
 ```sh
-make test                  # ./ds4-eval --self-test-extractors && ./ds4_test --all
-./ds4_test --logprob-vectors
-./ds4_test --server
+make test                  # ds4_unit + linecount + self-test-extractors + ds4_test --all
+./ds4_test --logprob-vectors   # bit-exact vs official API vectors (needs the model)
+./ds4_test --server            # 104 offline server unit tests
+./ds4_test --engine-units      # sampler / per-request penalty units (offline)
 ```
 
 ## Debugging Notes

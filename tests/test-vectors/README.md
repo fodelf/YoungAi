@@ -17,7 +17,7 @@ Files:
 Regenerate official vectors:
 
 ```sh
-DEEPSEEK_API_KEY=... ./tests/test-vectors/fetch_official_vectors.py
+DEEPSEEK_API_KEY=... ./tests/test-vectors/fetch_official_vectors.sh
 ```
 
 Running the fetcher without `--only` also regenerates `official.vec`.

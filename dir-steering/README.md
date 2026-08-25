@@ -38,7 +38,8 @@ more explanatory.
 Build the vector:
 
 ```sh
-python3 dir-steering/tools/build_direction.py \
+# (生成器 build_direction.py 已随全仓 Python 清退删除, 需要再生时从 git 历史找回)
+# python3 dir-steering/tools/build_direction.py \
   --ds4 ./ds4 \
   --model ds4flash.gguf \
   --good-file dir-steering/examples/succinct.txt \
@@ -84,7 +85,8 @@ The same vector can be used in either direction. The sign is the important part:
 Use the sweep helper to test several strengths on a fixed prompt set:
 
 ```sh
-python3 dir-steering/tools/run_sweep.py \
+# (run_sweep.py 已删, 同上; out/ 下的现成方向向量仍可直接被引擎加载)
+# python3 dir-steering/tools/run_sweep.py \
   --ds4 ./ds4 \
   --model ds4flash.gguf \
   --direction dir-steering/out/verbosity.f32 \
