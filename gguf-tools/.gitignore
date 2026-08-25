@@ -29,3 +29,20 @@ go-onebit/*.dat
 go-onebit/gocorpus_big.txt
 /traj_analyze
 /validate_fwd
+# 2026-08-25 重构清账: 以下编译二进制曾被误 track, 统一出库
+/merge_residual
+go-onebit/emit_residual_stream
+go-onebit/calib/amp_solve_zc
+go-onebit/calib/anchor_metrics
+go-onebit/calib/dql_to_zchain
+go-onebit/calib/kl_forensic
+go-onebit/calib/pubbench
+go-onebit/calib/rec_fidelity
+go-onebit/calib/route_alpha_set
+go-onebit/calib/route_bias_rebake
+go-onebit/calib/trace_ladder
+go-onebit/calib/zlayer
+go-onebit/calib/zrec_to_zchain
+go-onebit/migrate/pubbench_extract_test
+go-onebit/quant/ds4quant_run
+go-onebit/quant/vq_merge_v4

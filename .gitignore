@@ -33,3 +33,7 @@ gguf-tools/go-onebit/reports
 /hf-base
 # zlayer 二期对拍夹具(zlayer_fixture.py 现造现用, 约 16MB, 不入库)
 gguf-tools/go-onebit/migrate/zlayer_fixtures/
+# 编译二进制不入库(2026-08-25 重构清账: 曾有 37 个 Mach-O 被误 track)
+/zsolve
+tools/e0_pingpong
+tools/tp_rtt_probe
