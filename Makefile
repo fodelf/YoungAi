@@ -60,6 +60,11 @@ SERVER_CPU_OBJS := $(SERVER_SRCS:.c=_cpu.o)
 SERVER_HDRS := src/server/server_internal.h src/server/server_types.h src/server/server_types2.h
 SERVER_TESTS_SRCS := $(wildcard tests/server_tests_*.c)
 SERVER_TESTS_OBJS := $(SERVER_TESTS_SRCS:.c=.o)
+# ds4_test 拆分件(重构阶段8: 原单文件 tests/ds4_test.c 按 suite 拆为 tests/t_*.c,
+# 跨文件接口在 tests/test_internal.h)。通配模式 t_*.c 与 server_tests_*.c 不重叠,
+# 新增 suite 源文件放进 tests/ 叫 t_xxx.c 即自动入列。
+TESTS_SRCS := $(wildcard tests/t_*.c)
+TESTS_OBJS := $(patsubst %.c,%.o,$(TESTS_SRCS))
 
 # 引擎核心(重构阶段4: ds4.c 机械拆分为 src/core/*.c, 共享内部头 src/core/core_internal.h)
 CORE_ENGINE_SRCS := $(wildcard src/core/*.c)
@@ -302,8 +307,11 @@ src/web/%.o: src/web/%.c src/web/web_internal.h ds4_web.h
 src/kv/%.o: src/kv/%.c src/kv/kv_internal.h ds4_kvstore.h ds4.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-ds4_test.o: tests/ds4_test.c tests/server_tests_internal.h $(SERVER_DEP_HDRS) ds4_spatial.h ds4_css.h
-	$(CC) $(CFLAGS) -DDS4_SERVER_TEST -c -o $@ tests/ds4_test.c
+# t_units.c 额外吃 src/core/core_internal.h(采样/惩罚单测直插引擎内部), 头依赖
+# 对整组统一挂上 — 多算依赖只多触发重编, 不会漏。-Wno-unused-function: 共享助手
+# 去 static 后个别 TU 只用到子集, 不为此加 #if 网。
+tests/t_%.o: tests/t_%.c tests/test_internal.h tests/server_tests_internal.h $(SERVER_DEP_HDRS) ds4_spatial.h ds4_css.h src/core/core_internal.h ds4_internal.h
+	$(CC) $(CFLAGS) -DDS4_SERVER_TEST -Wno-unused-function -c -o $@ $<
 
 tests/cuda_long_context_smoke.o: tests/cuda_long_context_smoke.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -c -o $@ tests/cuda_long_context_smoke.c
@@ -341,11 +349,11 @@ ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_iq2_tables_cuda.inc
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-ds4_test: ds4_test.o $(SERVER_TEST_OBJS) $(SERVER_TESTS_OBJS) $(KV_OBJS) rax.o $(CORE_OBJS)
+ds4_test: $(TESTS_OBJS) $(SERVER_TEST_OBJS) $(SERVER_TESTS_OBJS) $(KV_OBJS) rax.o $(CORE_OBJS)
 ifeq ($(UNAME_S),Darwin)
-	$(CC) $(CFLAGS) -o $@ ds4_test.o $(SERVER_TEST_OBJS) $(SERVER_TESTS_OBJS) $(KV_OBJS) rax.o $(CORE_OBJS) $(METAL_LDLIBS)
+	$(CC) $(CFLAGS) -o $@ $(TESTS_OBJS) $(SERVER_TEST_OBJS) $(SERVER_TESTS_OBJS) $(KV_OBJS) rax.o $(CORE_OBJS) $(METAL_LDLIBS)
 else
-	$(NVCC) $(NVCCFLAGS) -o $@ ds4_test.o $(SERVER_TEST_OBJS) $(SERVER_TESTS_OBJS) $(KV_OBJS) rax.o $(CORE_OBJS) $(CUDA_LDLIBS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $(TESTS_OBJS) $(SERVER_TEST_OBJS) $(SERVER_TESTS_OBJS) $(KV_OBJS) rax.o $(CORE_OBJS) $(CUDA_LDLIBS)
 endif
 
 # src/common 共享格式库单测: 无模型/无 GPU, 纯主机 C。夹具路径相对仓库根。
@@ -360,7 +368,7 @@ test: ds4_test ds4-eval ds4_unit
 	./ds4_test
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_unit e0-pingpong mm-ui mm-ocr *.o src/cli/*.o src/bench/*.o src/kv/*.o src/web/*.o src/eval/*.o src/agent/*.o src/dist/*.o src/server/*.o src/core/*.o src/common/*.o src/metal/*.o tests/server_tests_*.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_unit e0-pingpong mm-ui mm-ocr *.o src/cli/*.o src/bench/*.o src/kv/*.o src/web/*.o src/eval/*.o src/agent/*.o src/dist/*.o src/server/*.o src/core/*.o src/common/*.o src/metal/*.o tests/server_tests_*.o tests/t_*.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
 
 # Task 04 / E0: standalone thunderbolt ping-pong latency gate (no core deps, no
 # model). Defined after the default targets so it never becomes the default goal.
