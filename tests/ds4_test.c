@@ -2400,20 +2400,21 @@ typedef struct {
     const char *name;
     const char *desc;
     void (*fn)(void);
+    int needs_model;   /* 1=要真模型: 缺时 SKIP 不 FAIL(无模型机器 make test 才有意义) */
 } ds4_test_entry;
 
 static const ds4_test_entry test_entries[] = {
 #ifndef DS4_NO_GPU
-    {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall},
-    {"--tool-call-quality", "tool-call-quality", "model emits valid DSML tool calls", test_tool_call_quality},
-    {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison on the standard Metal path", test_official_logprob_vectors},
-    {"--local-golden-vectors", "local-golden-vectors", "local top-k/logit drift regression for long Metal prefill", test_local_golden_vectors},
-    {"--metal-short-prefill", "metal-short-prefill", "Metal ratio-4 short prefill regression", test_metal_short_prefill_ratio4},
-    {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_kernel_group},
-    {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
+    {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall, 1},
+    {"--tool-call-quality", "tool-call-quality", "model emits valid DSML tool calls", test_tool_call_quality, 1},
+    {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison on the standard Metal path", test_official_logprob_vectors, 1},
+    {"--local-golden-vectors", "local-golden-vectors", "local top-k/logit drift regression for long Metal prefill", test_local_golden_vectors, 1},
+    {"--metal-short-prefill", "metal-short-prefill", "Metal ratio-4 short prefill regression", test_metal_short_prefill_ratio4, 1},
+    {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_kernel_group, 0},
+    {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence, 1},
 #endif
-    {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
-    {"--tp-allreduce", "tp-allreduce", "tensor-parallel all-reduce transport loopback", test_tp_allreduce},
+    {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group, 0},
+    {"--tp-allreduce", "tp-allreduce", "tensor-parallel all-reduce transport loopback", test_tp_allreduce, 0},
 };
 
 static void test_print_help(const char *prog) {
@@ -2453,6 +2454,15 @@ static const ds4_test_entry *test_find_entry(const char *arg) {
 }
 
 static void test_run_entry(const ds4_test_entry *entry) {
+    if (entry->needs_model) {
+        FILE *mf = fopen(test_model_path(), "rb");
+        if (!mf) {
+            fprintf(stderr, "%s: SKIP (model '%s' 不存在 — 该套件要真模型, 见 DS4_TEST_MODEL)\n",
+                    entry->name, test_model_path());
+            return;
+        }
+        fclose(mf);
+    }
     int before = test_failures;
     fprintf(stderr, "%s:\n", entry->name);
     entry->fn();
