@@ -1,7 +1,7 @@
 #!/bin/sh
 # safe_verify.sh — 单机安全跑全 mono 的 offload 前向(perplexity/gen)。固化既有 proven flags,
 # 治 2026-07-06 那次内核 panic(我漏了 NO_RESIDENCY + 乱设 MEM_BUDGET + 没 bound ctx → wired 暴涨饿死 watchdogd)。
-# proven 依据: go2b_product.sh do_verify / mono_dual_run.sh。外加外部内存看门狗兜底(内部预算闸已证挡不住)。
+# proven 依据: go2b_product.sh(已删, 见 git 历史) do_verify / mono_dual_run.sh。外加外部内存看门狗兜底(内部预算闸已证挡不住)。
 # 用法: safe_verify.sh [slice_file] [ctx]     slice 默认 go_heldout_48.txt(快); 定音用 go_heldout_300.txt
 set -u
 ROOT=/Users/fodelf/git/ds4-main
