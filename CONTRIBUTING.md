@@ -28,11 +28,18 @@ make test
 Useful narrower checks:
 
 ```sh
-./ds4_test --server
-./ds4_test --logprob-vectors
+./ds4_test --server              # 104 项服务端单测(离线)
+./ds4_test --engine-units        # 采样/per-request 惩罚单测(离线)
+./ds4_test --rax                 # 基数树单测(离线)
+./ds4_test --tp-allreduce        # TP 传输回环(离线)
+./ds4_test --metal-kernels       # 孤立 kernel 数值(要 Metal 设备, 不要模型)
+./ds4_test --logprob-vectors     # 官方向量逐位对拍(要真模型)
+./ds4_test --local-golden-vectors
 ./ds4_test --long-context
 ./ds4_test --tool-call-quality
-./ds4_test --metal-kernels
+./ds4_test --metal-short-prefill
+./ds4_test --metal-tensor-equivalence
+./ds4_unit                       # src/common 金标: dequant 七类型逐字节等
 ```
 
 What they cover:
@@ -91,17 +98,17 @@ make -C gguf-tools quality-score
 Then score old and new GGUFs against the same manifest and compare:
 
 ```sh
-gguf-tools/quality-testing/score_official OLD.gguf \
-  gguf-tools/quality-testing/data/manifest.tsv /tmp/old.tsv 4096
+gguf-tools/bench/quality-testing/score_official OLD.gguf \
+  gguf-tools/bench/quality-testing/data/manifest.tsv /tmp/old.tsv 4096
 
-gguf-tools/quality-testing/score_official NEW.gguf \
-  gguf-tools/quality-testing/data/manifest.tsv /tmp/new.tsv 4096
+gguf-tools/bench/quality-testing/score_official NEW.gguf \
+  gguf-tools/bench/quality-testing/data/manifest.tsv /tmp/new.tsv 4096
 
-gguf-tools/quality-testing/compare_scores /tmp/old.tsv /tmp/new.tsv
+gguf-tools/bench/quality-testing/compare_scores /tmp/old.tsv /tmp/new.tsv
 ```
 
 Lower `avg_nll` is better. See
-`gguf-tools/quality-testing/README.md` for collecting or refreshing official
+`gguf-tools/bench/quality-testing/README.md` for collecting or refreshing official
 continuations.
 
 ## Speed Regression Tests
