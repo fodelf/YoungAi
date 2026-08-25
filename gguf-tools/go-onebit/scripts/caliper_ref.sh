@@ -20,5 +20,5 @@ cd "$ROOT"
 # 五指标判决器=C 版(2026-08-25 Python→C 迁移 Wave A; 金标对拍 amp2 verdict 全五指标
 # 与 anchor_metrics.py 逐字符一致, C 版另多 Σmin 主尺; 金标记录 migrate/golden.txt)
 AM="$ROOT/gguf-tools/go-onebit/calib/anchor_metrics"
-[ -x "$AM" ] || gcc -O3 -march=native -o "$AM" "$ROOT/gguf-tools/go-onebit/calib/anchor_metrics.c" -lm -lpthread
+[ -x "$AM" ] || make -C "$ROOT/gguf-tools" anchor_metrics
 "$AM" --ref "$R30/anchor_wt2_s2653.bin" --ids "$G7/wt2.ids" --student "$OUT" --tail 3

@@ -20,7 +20,9 @@
  * 用法: DS4_HF=... ./ds4quant_run [ids_file=/tmp/rr_hard.ids] [ntok=64]
  *       (还原率铁律: 判决用硬多样文本 rr_hard.ids; Σmin/KL/PPL 为主, top1 仅参考)
  */
-#include <malloc.h>   /* mallopt: 分配器设置写进代码, 不走 env(2026-08-22 铁律) */
+#ifdef __linux__
+#include <malloc.h>   /* mallopt: 分配器设置写进代码, 不走 env(2026-08-22 铁律); glibc 专属, macOS 无此接口 */
+#endif
 #include "st_read.c"
 #include "ds4quant_fwd.c"
 #include "onebit_quant.c"
@@ -5538,9 +5540,11 @@ int main(int argc,char**argv){
      *    放开 top_pad 后 mmap 风暴消失: S=256 从 164s→65s, 磁盘 118 MB/s→1939 MB/s。
      *  · attention 在专家 pthread 循环之外, 是单线程段; BLAS 只给 1 线程会把它锁死在 1 核。
      *    专家循环内部已有 20 路 pthread, 那段靠 GPU/单线程 BLAS, 不受此影响。 */
+#ifdef __linux__
     mallopt(M_TOP_PAD,         256 * 1024 * 1024);
     mallopt(M_MMAP_THRESHOLD, 1024 * 1024 * 1024);
     mallopt(M_TRIM_THRESHOLD, 1024 * 1024 * 1024);
+#endif
 #ifdef DS4QUANT_OPENBLAS
     { void scipy_openblas_set_num_threads(int); long nc = sysconf(_SC_NPROCESSORS_ONLN);
       scipy_openblas_set_num_threads((int)(nc > 1 ? nc : 1)); }

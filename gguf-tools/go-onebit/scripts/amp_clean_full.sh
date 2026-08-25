@@ -54,15 +54,8 @@ done
 # 注入产物 rec_fidelity 复评一致)。XANCHOR/GGUF/ADDON 等二期模式 C 版硬拒(响亮失败, 无静默兜底)。
 # ⚠二期欠账: C 版纯 CPU ~570s/层(py-GPU 54s), 43层≈6.8h — 按"spark重计算必须GPU化"铁律须补 CUDA 路。
 ZLB="$HOME/ds4-main/gguf-tools/go-onebit/calib/zlayer"
-if [ ! -x "$ZLB" ]; then
-  if [ "$(uname)" = Darwin ]; then
-    gcc -O3 -march=native -DDQ_BLAS -o "$ZLB" "${ZLB}.c" -framework Accelerate -lm -lpthread
-  else
-    SO_DIR="$HOME/.local/lib/python3.12/site-packages/scipy_openblas32/lib"
-    gcc -O3 -march=native -DDQ_BLAS -Dcblas_sgemm=scipy_cblas_sgemm -Dcblas_dgemm=scipy_cblas_dgemm \
-      -I"$SO_DIR/../include" -o "$ZLB" "${ZLB}.c" "$SO_DIR/libscipy_openblas.so" -Wl,-rpath,"$SO_DIR" -lm -lpthread
-  fi
-fi
+# 构建收进 gguf-tools/Makefile(批1): 平台特判(Accelerate/scipy_openblas/CUDA)都在那边。
+[ -x "$ZLB" ] || make -C "$HOME/ds4-main/gguf-tools" zlayer
 for L in $(seq 0 42); do
   env DS4_ZL_NTOK=8192 DS4_ZL_NFIT=6144 ${XA:+DS4_ZL_XANCHOR=$XA} DS4_ZL_FIT_RANGES="$FR" DS4_ZL_EV_RANGE="$ER" \
   "$ZLB" "$DS4_HF" $D2/$WS/layers "$ANC" $L ${K:-1024} 1 ${XC:+$D2/$XC} \
