@@ -2392,69 +2392,15 @@ static void test_tp_allreduce(void) {
     TEST_ASSERT(ds4_dist_tp_selftest() == 0);
 }
 
-/* ---- Model-free unit tests for the repeat penalty core ----
- *
- * Exercises ds4_repeat_penalize_tokens -- the raw-array entry that shares
- * repeat_penalize_core with the session sampler -- on synthetic committed
- * streams: no model, no engine, no GPU. The DS4_REPEAT_FREQ /
- * DS4_REPEAT_WINDOW caches inside ds4.c are process-wide
- * statics armed on first use, so the
- * suite pins each config via the test-only reset hook (setenv BEFORE the
- * first penalize call of that config) and restores the developer's env +
- * re-resets afterwards, so greedy-sensitive model suites later in the same
- * --all run re-arm from their own environment. */
-extern void ds4_test_reset_penalty_env_cache(void);
-
-/* Token ids in these tests stay far below this: the penalty core only ever
- * writes logits at committed-token indices, so a small row suffices. */
-#define TEST_PEN_NLOGITS 256
-
-static char *test_penalty_env_save(const char *name) {
-    const char *value = getenv(name);
-    if (!value) return NULL;
-    size_t len = strlen(value);
-    char *copy = malloc(len + 1);
-    TEST_ASSERT(copy != NULL);
-    if (copy) memcpy(copy, value, len + 1);
-    return copy;
-}
-
-static void test_penalty_env_restore(const char *name, char *saved) {
-    if (saved) {
-        setenv(name, saved, 1);
-        free(saved);
-    } else {
-        unsetenv(name);
-    }
-}
-
-static void test_penalize_row(float *logits, const int *toks, uint32_t n,
-                              uint32_t gen_start) {
-    for (int i = 0; i < TEST_PEN_NLOGITS; i++) logits[i] = 0.0f;
-    ds4_repeat_penalize_tokens(logits, toks, n, gen_start);
-}
-
-static int test_pen_argmax(const float *logits) {
-    int best = 0;
-    for (int i = 1; i < TEST_PEN_NLOGITS; i++)
-        if (logits[i] > logits[best]) best = i;
-    return best;
-}
-
-/* n copies of {A(8 tokens 10..17), 42, distinct gap} + a final A: the current
- * 8-suffix A occurred n times before in the stream, every time continued by
- * 42, while the distinct gap tokens kill every exact period P<=64, isolating
- * the 8-gram self-copy detector. Returns the stream length (10n+8). */
-static uint32_t test_pen_build_selfcopy(int *sc, int n) {
-    int m = 0;
-    for (int i = 0; i < n; i++) {
-        for (int j = 0; j < 8; j++) sc[m++] = 10 + j;
-        sc[m++] = 42;
-        sc[m++] = 90 + i;
-    }
-    for (int j = 0; j < 8; j++) sc[m++] = 10 + j;
-    return (uint32_t)m;
-}
+/* 运行器登记表: flag=命令行开关, name=进度打印名, desc=--help 一行说明。
+ * (typedef 曾在 daa6237 随 --penalty-unit 套件误删, 运行器因此编不过;
+ * 采样惩罚单测的重建见重构阶段8, 对着现行采样器 API 写, 不复活旧 helpers。) */
+typedef struct {
+    const char *flag;
+    const char *name;
+    const char *desc;
+    void (*fn)(void);
+} ds4_test_entry;
 
 static const ds4_test_entry test_entries[] = {
 #ifndef DS4_NO_GPU
