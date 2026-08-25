@@ -1,0 +1,347 @@
+static void *bytes_moe_worker(void*a){
+    bmw_t*w=a; lfile_t*lf=w->lf; int S=w->S;
+    float *q1=malloc((size_t)MOEI*DIM*4),*q3=malloc((size_t)MOEI*DIM*4),*q2=malloc((size_t)DIM*MOEI*4);
+    int *tok=malloc((size_t)S*sizeof(int)); float *xs=malloc((size_t)S*DIM*4),*wwv=malloc((size_t)S*4);
+    float *w1p=NULL,*w3p=NULL,*w2p=NULL;   /* 本迭代实际权重指针(本地缓冲或批 dequant 切片) */
+    for(;;){ int e=__sync_fetch_and_add(w->e_next,1); if(e>=NEXP)break;
+        int nt=0; float gee=w->ge?w->ge[e]:1.0f;   /* bf.GE: per-expert 增益, 累加时乘 */
+        for(int s2=0;s2<S;s2++)for(int a2=0;a2<NACT_RT;a2++)
+            if(w->idx[(size_t)s2*NACT_RT+a2]==e){ tok[nt]=s2; wwv[nt]=gee*w->rw[(size_t)s2*NACT_RT+a2];
+                memcpy(xs+(size_t)nt*DIM,w->Fin+(size_t)s2*DIM,(size_t)DIM*4); nt++; break; }
+        if(!nt) continue;
+        int e_hot=0;   /* 冷热判定(合并态口径), 分桶累计用 */
+        if(lf->vqmap){   /* v2.2 VQ 回放: 表内 w2 槽非零=热(全三矩阵 VQ), 否则冷(w1/w3 VQ + w2 go1b) */
+            const uint64_t *vtab=(const uint64_t*)(lf->vqmap+16);
+            uint64_t o1=vtab[(size_t)e*3],o3=vtab[(size_t)e*3+1],o2=vtab[(size_t)e*3+2];
+            e_hot=o2!=0;
+            extern double g_bmw_t[2];
+            w1p=q1; w3p=q3; w2p=q2;   /* 默认走本地 dequant 缓冲 */
+#ifdef DS4QUANT_CUDA
+            extern float *g_bmw_buf; extern int g_bmw_batched;
+            if(g_bmw_batched){   /* 批 dequant 已就位: 指针别名切片, 不动 q1..q2 生命周期 */
+                w1p=g_bmw_buf+((size_t)e*3+0)*((size_t)DIM*MOEI);
+                w3p=g_bmw_buf+((size_t)e*3+1)*((size_t)DIM*MOEI);
+                w2p=g_bmw_buf+((size_t)e*3+2)*((size_t)DIM*MOEI);
+            } else {
+#endif
+            double bt0=vqt_now();
+            vq_unpack_dequant(lf->vqmap+o1,lf->vqmsz-o1,q1,NULL,NULL);
+            vq_unpack_dequant(lf->vqmap+o3,lf->vqmsz-o3,q3,NULL,NULL);
+            if(o2) vq_unpack_dequant(lf->vqmap+o2,lf->vqmsz-o2,q2,NULL,NULL);
+            else   dq_go1b_bytes_dequant(lf->w2+(size_t)e*lf->szD,DIM,MOEI,q2);
+            g_bmw_t[0]+=vqt_now()-bt0;
+#ifdef DS4QUANT_CUDA
+            }
+#endif
+        } else {
+        int sl=(lf->g2k>0&&g2_replay_en())?lf->g2slot[e]:-1;
+        e_hot=sl>=0;
+        if(sl>=0){   /* 热专家: go2b 合并2bit 回放(反修/rr_verdict 在合并态前向上进行) */
+            size_t szG2=(size_t)MOEI*go2b_row_bytes(DIM), szD2=(size_t)DIM*go2b_row_bytes(MOEI);
+            dq_go2b_bytes_dequant(lf->g2w1+(size_t)sl*szG2,MOEI,DIM,q1);
+            dq_go2b_bytes_dequant(lf->g2w3+(size_t)sl*szG2,MOEI,DIM,q3);
+            dq_go2b_bytes_dequant(lf->g2w2+(size_t)sl*szD2,DIM,MOEI,q2);
+        } else {
+            dq_go1b_bytes_dequant(lf->w1+(size_t)e*lf->szG,MOEI,DIM,q1);
+            dq_go1b_bytes_dequant(lf->w3+(size_t)e*lf->szG,MOEI,DIM,q3);
+            dq_go1b_bytes_dequant(lf->w2+(size_t)e*lf->szD,DIM,MOEI,q2);
+        } }
+        float *aq=calloc((size_t)nt*DIM,4);
+        { extern double g_bmw_t[2]; double bt1=vqt_now();
+          dq_expert_fp(xs,w1p?w1p:q1,w3p?w3p:q3,w2p?w2p:q2,wwv,aq,nt,DIM,MOEI,SWLIM);
+          g_bmw_t[1]+=vqt_now()-bt1; }
+        for(int i=0;i<nt;i++){ float*dst=(e_hot?w->partial:w->partial_c)+(size_t)tok[i]*DIM;
+            const float*yi=aq+(size_t)i*DIM;
+            for(int d2=0;d2<DIM;d2++) dst[d2]+=yi[d2]; }
+        free(aq);
+        /* ★zl.ERF 死层补丁回放(2026-08-12)★: c=w·(h@Vᵀ)@Uᵀ(U折S/V折α), token门 |c|²≥τ。
+         * h 与 dq_expert_fp 完全同式(clip+silu); 只在带 type8 记录且本专家在册的层花算力。
+         * DS4_TYPE8_OFF=1 消融开关(同态 A/B 归因用)。 */
+        if(getenv("DS4_TYPE8_OFF")) goto erf_skip;
+        for(int oi2=0;oi2<lf->nops;oi2++){
+            lop_t*op=&lf->ops[oi2];
+            if(op->type!=8) continue;
+            int ei=-1;
+            for(int i2=0;i2<op->erf_ne;i2++) if(op->erf_eid[i2]==(uint32_t)e){ei=i2;break;}
+            if(ei<0) break;
+            int r2=op->erf_r;
+            size_t blkf=(size_t)DIM*r2+(size_t)r2*MOEI;
+            const float*Ue=op->erf_UV+(size_t)ei*blkf;      /* [DIM,r] */
+            const float*Ve=Ue+(size_t)DIM*r2;               /* [r,MOEI] */
+            float tau=op->erf_tau[ei];
+            float *hh=malloc((size_t)nt*MOEI*4),*uu2=malloc((size_t)nt*MOEI*4);
+            dq_matmul(xs,w1p?w1p:q1,hh,nt,DIM,MOEI); dq_matmul(xs,w3p?w3p:q3,uu2,nt,DIM,MOEI);
+            for(size_t ii=0;ii<(size_t)nt*MOEI;ii++){ float gg=hh[ii],vv=uu2[ii];
+                if(SWLIM>0){ if(vv>SWLIM)vv=SWLIM; if(vv<-SWLIM)vv=-SWLIM; if(gg>SWLIM)gg=SWLIM; }
+                hh[ii]=dq_silu(gg)*vv; }
+            for(int i2=0;i2<nt;i2++)for(int j=0;j<MOEI;j++) hh[(size_t)i2*MOEI+j]*=wwv[i2];
+            float *gvb=malloc((size_t)nt*r2*4),*cb=malloc((size_t)nt*DIM*4);
+            dq_matmul(hh,Ve,gvb,nt,MOEI,r2);
+            dq_matmul(gvb,Ue,cb,nt,r2,DIM);
+            for(int i2=0;i2<nt;i2++){
+                const float*ci=cb+(size_t)i2*DIM;
+                float en2=0; for(int d2=0;d2<DIM;d2++) en2+=ci[d2]*ci[d2];
+                if(en2<tau) continue;
+                float*dst2=(e_hot?w->partial:w->partial_c)+(size_t)tok[i2]*DIM;
+                for(int d2=0;d2<DIM;d2++) dst2[d2]+=ci[d2];
+            }
+            free(hh);free(uu2);free(gvb);free(cb);
+            break;
+        }
+        erf_skip: ;
+    }
+    free(q1);free(q3);free(q2);free(tok);free(xs);free(wwv); return NULL;
+}
+static lfile_t *GS_LF=NULL;    /* 回扫: 全43层文件 mmap 只开一次(禁重复 mmap+解析) */
+/* ★真·反修前层★ 状态: 目标层 z 系数以【最终输出 KL】重解时用 */
+static int BF_ANCROUTE=0;   /* 反修前向强制锚路由(禁稀疏路由翻转); 备用, 默认关 */
+/* ★路由偏置侧车(2026-07-28 部署侧路由修正)★: 神谕探针实证反修字节全部亏损住在路由漂移
+ * (agree 77.6→82.9=top1f天花板)。FIT: 学生路由回放时按层累计 FP锚集合 vs 学生集合的选择分
+ * margin 缺口(漏选+=thr−v, 多选−=v−thr; thr=学生第6名选择分) → 均值+计数落盘。
+ * APPLY: Δb 只加进 dq_gate_route_topk 的选择分(gbias 侧), 权重分不动(与引擎语义同构)。
+ * 铁律: fit 只跑校准语料(判决锚不混入); 锚路由(神谕)下 fit 无意义, 自动跳过。 */
+static float *RB_ACC=NULL; static uint32_t *RB_CNT=NULL;  /* fit 累计 [NLAYERS][NEXP] */
+static float *RB_APPLY=NULL; static int RB_TRIED=0;       /* apply Δb_raw [NLAYERS][NEXP] */
+static float RB_ALPHA=1.0f; static int RB_MINCNT=8;
+/* ★序贯路由(2026-07-29 用户终令"添加路由和动态α扫"): 贪心内每层锁定后 FIT 本层 Δb →
+ * α 三点扫选层优(负收益自动关) → 定稿/链推进带路由修正, 下游继承; 收官 Δb+α 落盘。 */
+static int RB_SEQ=0;                 /* DS4_ROUTE_SEQ=1 */
+static float RB_ALPHA_L[64]={0};     /* per-layer 动态 α(0=该层关) */
+/* ★热启动记录(2026-07-30 用户"每层太慢"): 上层锁定档族/热数, 深带同带惯性 —
+ * 上层 'g' 族 ⇒ 本层跳 g10 裸基线+rank 二分(g10 曾被每层裸评两次), 直接从上层档-1 起试 */
+static char g_mv_pcfg=0; static int g_mv_phot=0;
+/* ★体积账(2026-07-30 用户"别本末倒置"): 累计 bpw vs 冠军口径(g10h16=1.1367/层),
+ * h32+ 频繁出现=门线/语料错位告警, 超支即刻可见 */
+static double g_mv_accv=0, g_mv_accc=0;
+#define MV_CHAMP_BPW ((240.0*1.0625+16.0*2.25)/256.0)
+static double mv_name_bpw(const char*nm){
+    if(nm&&nm[0]=='v'){   /* vq 名字族(2026-08-09 记账修): "v4x1024[ h0]" → 索引位/dim + gr + 码本 */
+        int dim=0,nc=0;
+        if(sscanf(nm,"v%dx%d",&dim,&nc)==2&&dim>0&&nc>1){
+            int b=0; while((1<<b)<nc) b++;
+            return (double)b/dim + 16.0/4096.0 + ((double)nc*dim*16.0)/(2048.0*4096.0);
+        }
+    }
+    if(!strncmp(nm,"g10h",4)){ int n=atoi(nm+4); if(n<=0)n=16; return ((256.0-n)*1.0625+n*2.25)/256.0; }
+    return 1.0625;   /* g10/未知 */
+}
+static void mv_vol_note(int L,const char*nm,double vol){
+    g_mv_accv+=vol; g_mv_accc+=MV_CHAMP_BPW;
+    fprintf(stderr,"L%02d [体积账] 锁 %s(%.4f bpw) 累计 %.2f vs 冠军口径 %.2f (%+.1f%%)\n",
+            L,nm,vol,g_mv_accv,g_mv_accc,(g_mv_accv/g_mv_accc-1.0)*100.0);
+}
+static void mv_prev_note(char cfg,const char*nm){
+    g_mv_pcfg=cfg;
+    const char*h=nm?strrchr(nm,'h'):NULL;
+    g_mv_phot = h? atoi(h+1) : 0;
+    if(cfg=='g'&&h&&g_mv_phot==0) g_mv_phot=16;   /* 旧名 "g10h"(基线) = 热16 */
+}
+static int g_rb_fit_L=-1;            /* 序贯: FIT 只统计该层(-1=全层旧行为) */
+static void rb_commit(int L){        /* 本层 FIT 累计折算进 RB_APPLY(内存直通, mincnt 门) */
+    if(!RB_ACC) return;
+    if(!RB_APPLY) RB_APPLY=calloc((size_t)NL*NEXP,4);
+    long armed=0;
+    for(int e=0;e<NEXP;e++){ size_t i=(size_t)L*NEXP+e;
+        RB_APPLY[i]=(RB_CNT[i]>=(uint32_t)RB_MINCNT)?RB_ACC[i]/(float)RB_CNT[i]:0.0f;
+        if(RB_APPLY[i]!=0.0f) armed++; }
+    fprintf(stderr,"L%02d [路由] Δb 就位(武装槽=%ld)\n",L,armed);
+}
+static void rb_save(void){           /* 收官/探针早退: Δb+cnt(0x41494252 同格式)+α 表落盘 */
+    /* ★固定规则模式补路由 FIT(2026-07-31 实锤: RB_SEQ 两处入口都带 !mv_base, R36 战役
+     * (mv_base 固定档)从未跑过路由 FIT ⇒ 裸路由 ⇒ 自回归活路由漂移无补偿 → 退化循环。
+     * DS4_ROUTE_BIAS_FIT 走非序贯统计(在既有量化前向里顺带累计, 零额外前向), 落盘同格式,
+     * α 由烘焙侧给(冠军同款 2.5)。teacher-forced 指标不受影响, 修的是自由生成稳定性。 */
+    { long nz=0; if(RB_CNT) for(size_t i=0;i<(size_t)NL*NEXP;i++) if(RB_CNT[i]) nz++;
+      fprintf(stderr,"[路由][diag] rb_save入口 ACC=%p APPLY=%p 非零CNT槽=%ld\n",(void*)RB_ACC,(void*)RB_APPLY,nz); }
+    if(RB_ACC&&!RB_APPLY){   /* ★评测遍FIT(2026-08-13): BF_ONLY 无逐层 rb_commit, 收官一次性折算 */
+        for(int l=0;l<NL;l++) rb_commit(l); }
+    if(!(RB_SEQ||getenv("DS4_ROUTE_BIAS_FIT"))||!RB_APPLY){
+        if(RB_SEQ||getenv("DS4_ROUTE_BIAS_FIT"))
+            fprintf(stderr,"[路由] Δb 无统计可落盘(哈希路由=选择零漂移, RB 不适用)\n");
+        return; }
+    const char*rp=getenv("DS4_ROUTE_BIAS_OUT"); if(!rp) return;
+    FILE*f=fopen(rp,"wb");
+    if(f){ uint32_t hd[4]={0x41494252u,(uint32_t)NL,(uint32_t)NEXP,0};
+        fwrite(hd,4,4,f); fwrite(RB_APPLY,4,(size_t)NL*NEXP,f);
+        if(RB_CNT) fwrite(RB_CNT,4,(size_t)NL*NEXP,f); fclose(f); }
+    char ap[512]; snprintf(ap,sizeof(ap),"%s.alpha.txt",rp);
+    FILE*g=fopen(ap,"w");
+    if(g){ for(int l=0;l<NL;l++) fprintf(g,"L=%d a=%.1f\n",l,RB_ALPHA_L[l]); fclose(g); }
+    fprintf(stderr,"[路由] Δb+α 落盘 → %s(+.alpha.txt)\n",rp);
+}
+static float *GS_GV=NULL; static int GS_GV_L=-1;   /* 目标层 per-token routed 增益向量(搜每 token 最优乘子) */
+static float *GS_FIN=NULL; static int GS_CAP_L=-1; /* 目标层 MoE 输入 Fin_L 捕获(重算 z 特征/当前系数) */
+static int *GS_IDXC=NULL; static float *GS_RWC=NULL; /* 目标层路由捕获(GE 投影: token→专家 命中+权重) */
+static float *HQE=NULL;    /* ★逐层反修★: 每层量化态入口隐藏 [NLAYERS+1][lstride](反修前层时从此重前向) */
+static size_t g_hqe_lstride=0;   /* HQE mmap 尺寸记账(munmap 用; 文件后备映射禁 free) */
+static int BACKFIT_INCR=1; /* DS4_BACKFIT_INCR: 逐层前进即反修(1=开, 默认); 0=只末尾全局回扫。
+                              裁决2026-07-12: 非fast=每前沿全量反修所有前层(取消"末层最后一次全量"特例, 原DS4_BF_SWEEP已删);
+                              fast=不向前修复(反修整个跳过, dql/opt 层文件照常落盘) */
+static int *BF_FINOP=NULL;  /* 逐层反修: 每层"最终缩放α op"(bf.GL) 在 ops[] 的下标(-1=未加) */
+static int *BF_DYN2OP=NULL; /* 逐层反修: 每层"per-token 动态 op"(bf.GLdyn2) 下标(-1=未加); 更新原地不重复追加 */
+static int *BF_GEOP=NULL;   /* 逐层反修: 每层"per-expert 增益 op"(bf.GE, type-5) 下标(-1=未加) */
+static int *BF_HCOP=NULL;   /* 冷热双通道: 每层"GLhc op"(bf.GLhc, type-7) 下标(-1=未加)(2026-08-06) */
+/* 追加一条落地记录(vd=1, 链末回放; bf.GL/bf.GLdyn2 等), 返回其载荷文件偏移(原地更新用) */
+static size_t append_rec(const char*path,const char*nm0,const char*al0,const void*pay,uint64_t paysz,float m1){
+    FILE*f=fopen(path,"r+b"); if(!f) return 0;
+    uint32_t nrec; fseek(f,8,SEEK_SET);
+    if(fread(&nrec,4,1,f)!=1){ fclose(f); return 0; }
+    fseek(f,0,SEEK_END); long eof=ftell(f); if(eof<0){ fclose(f); return 0; }
+    char nm[16]={0},al[64]={0}; snprintf(nm,16,"%s",nm0); snprintf(al,64,"%s",al0);
+    uint64_t vol=paysz; float m[4]={m1,0,0,m1}; int vd=1;
+    fwrite(nm,1,16,f); fwrite(al,1,64,f); fwrite(&vol,8,1,f); fwrite(&paysz,8,1,f);
+    fwrite(m,4,4,f); fwrite(&vd,4,1,f); fwrite(pay,1,(size_t)paysz,f);
+    fseek(f,8,SEEK_SET); nrec++; fwrite(&nrec,4,1,f);
+    fclose(f);
+    return (size_t)eof + 116;   /* 载荷偏移 = 记录起点 + (name16+algo64+vol8+psz8+mean16+vd4) */
+}
+double g_bmw_t[2]={0,0};
+#ifdef DS4QUANT_CUDA
+/* 第三刀(08-18): 整层 768 矩阵一次批 dequant(vq_gpu.cu), 消 99k 次 per-矩阵 sync。
+ * 26GB fp32 缓冲静态复用(裸判期内存空闲); worker 前向直接吃切片指针零拷贝。 */
+typedef struct { uint64_t pay_off, dst_off; int rows, cols, nc, nbit; } vqg_deq_job;
+extern int vqg_dequant_batch(const uint8_t*, float*, const vqg_deq_job*, int, int, int);
+extern int vqg_ready(void);
+float *g_bmw_buf=NULL;   /* [256][3][8.4M] 切片: e*3+w */
+int g_bmw_batched=0;     /* 本层批 dequant 成功旗标 */
+static size_t bmw_slot_off(int e,int w){ return ((size_t)e*3+w)*( (size_t)DIM*MOEI ); }
+static int bmw_batch_dequant(lfile_t*lf){
+    if(!lf->vqmap||!vqg_ready()) return 0;
+    const uint64_t *vtab=(const uint64_t*)(lf->vqmap+16);
+    if(!g_bmw_buf){   /* managed: GPU 写零页故障(malloc 26GB 首触=百万级 HMM fault, 实测比逐矩阵还慢) */
+        extern int vqg_alloc_managed(void**,size_t);
+        if(!vqg_alloc_managed((void**)&g_bmw_buf,(size_t)NEXP*3*DIM*MOEI*4)) return 0; }
+    static vqg_deq_job jobs[NEXP*3]; int nj=0, nc_max=0;
+    for(int e=0;e<NEXP;e++) for(int w=0;w<3;w++){
+        const uint64_t off=vtab[(size_t)e*3+w];
+        if(!off) return 0;                       /* 冷槽混合层: 退回逐矩阵路径 */
+        const uint8_t *pay=lf->vqmap+off;
+        uint16_t d16,n16; uint32_t rr,cc;
+        memcpy(&d16,pay+4,2); memcpy(&n16,pay+6,2); memcpy(&rr,pay+8,4); memcpy(&cc,pay+12,4);
+        if(d16!=4||n16>1024) return 0;
+        int nb=1; while((1<<nb)<n16) nb++;
+        jobs[nj].pay_off=off; jobs[nj].dst_off=bmw_slot_off(e,w);
+        jobs[nj].rows=(int)rr; jobs[nj].cols=(int)cc; jobs[nj].nc=(int)n16; jobs[nj].nbit=nb;
+        if((int)n16>nc_max) nc_max=n16;
+        nj++;
+    }
+    double bt0=vqt_now();
+    int ok=vqg_dequant_batch(lf->vqmap,g_bmw_buf,jobs,nj,4,nc_max);
+    g_bmw_t[0]+=vqt_now()-bt0;
+    return ok;
+}
+#endif
+static void bytes_moe(lfile_t*lf,int S,const float*Fin,const int*idx,const float*rw,float*Fout){
+#ifdef DS4QUANT_CUDA
+    g_bmw_batched=bmw_batch_dequant(lf);
+#endif
+    float *Fbase=malloc((size_t)S*DIM*4); memcpy(Fbase,Fout,(size_t)S*DIM*4);   /* shared 基 */
+    const float *ge=NULL;   /* bf.GE(type-5, 取最后一条): per-expert 增益, 专家累加时乘(链 op 之前) */
+    const int lay_skip=replay_layer_skipped();
+    if(!lay_skip) for(int i=lf->nops-1;i>=0;i--) if(lf->ops[i].type==5&&lf->ops[i].ge){ ge=lf->ops[i].ge; break; }
+    int nth=NTHREADS<1?1:(NTHREADS>NEXP?NEXP:NTHREADS); int e_next=0;
+    bmw_t *ws=calloc((size_t)nth,sizeof(bmw_t)); pthread_t *th=malloc((size_t)nth*sizeof(pthread_t));
+    for(int t=0;t<nth;t++){ ws[t]=(bmw_t){lf,S,Fin,idx,rw,&e_next,calloc((size_t)S*DIM,4),ge,
+                                          calloc((size_t)S*DIM,4)};
+        pthread_create(&th[t],NULL,bytes_moe_worker,&ws[t]); }
+    /* 冷热分桶缓存重建(hot=partial / cold=partial_c 归约) */
+    if(BM_S!=S){ free(BM_RH); free(BM_RC); BM_RH=malloc((size_t)S*DIM*4); BM_RC=malloc((size_t)S*DIM*4); BM_S=S; }
+    memset(BM_RH,0,(size_t)S*DIM*4); memset(BM_RC,0,(size_t)S*DIM*4);
+    for(int t=0;t<nth;t++){ pthread_join(th[t],NULL);
+        for(size_t i=0;i<(size_t)S*DIM;i++){ BM_RH[i]+=ws[t].partial[i]; BM_RC[i]+=ws[t].partial_c[i]; }
+        free(ws[t].partial); free(ws[t].partial_c); }
+    for(size_t i=0;i<(size_t)S*DIM;i++) Fout[i]+=BM_RH[i]+BM_RC[i];
+    free(ws);free(th);
+    /* ★Fcur=专家后·ops前的态(shared+base_routed)=coadapt 的 base态 Fcur★: TREF(type4)按 coadapt 口径
+     * 从 Fcur 插值(Fout=Fcur+t·(Fout−Fcur)), 而非从 shared 缩放(否则 t 把 routed 整体放大, 抵消临界点处 Fout 翻倍误差)。*/
+    /* (worker 内 bf.GE 已乘; Fcur 捕获在专家累加+GE 之后 = 调优的 base态口径) */
+    float *Fcur=malloc((size_t)S*DIM*4); memcpy(Fcur,Fout,(size_t)S*DIM*4);
+    /* 修正链回放(时间序): 缩放型(GL/dyn)以 Fbase=shared 为基; TREF 以 Fcur=base态 为基(与调优一致) */
+    float *xn=NULL,*pj=NULL; const float*pjV8=NULL;
+    /* ★op 族消融门(2026-08-04 诊断)★ DS4_REPLAY_SKIP_TYPES="4,6": 回放时跳过指定 type 的
+     * 修正 op — 定位"过程态1.853 vs 回放2.001"分叉的元凶族。生产不设=全应用(原行为)。 */
+    static int skip_t[8]={0}, skip_init=0;
+    if(!skip_init){ skip_init=1; const char*sv=getenv("DS4_REPLAY_SKIP_TYPES");
+        if(sv&&*sv){ char b2[64]; snprintf(b2,64,"%s",sv);
+            for(char*tk=strtok(b2,",");tk;tk=strtok(NULL,",")){ int t2=atoi(tk);
+                if(t2>=1&&t2<=7) skip_t[t2]=1; }
+            fprintf(stderr,"[replay] 消融: 跳过 op type {%s}\n",sv); } }
+    /* ★冷热基座先行(2026-08-06)★: type7 无论侧车序恒为链首 — 先应用基座分桶, 其余缩放
+     * op 在其结果上链式作用(尾置=毁链: 覆盖式会丢掉已调 op 效果, 10 连全负实锤)。 */
+    for(int oi=0;oi<lf->nops&&!lay_skip;oi++){ lop_t*o=&lf->ops[oi];
+        if(o->type!=7||skip_t[7]) continue;
+        for(int s2=0;s2<S;s2++){ float*fw=Fout+(size_t)s2*DIM; const float*fb=Fbase+(size_t)s2*DIM;
+            const float*rh=BM_RH+(size_t)s2*DIM,*rc=BM_RC+(size_t)s2*DIM;
+            for(int d2=0;d2<DIM;d2++) fw[d2]=fb[d2]+o->ghc[0]*rh[d2]+o->ghc[1]*rc[d2]; }
+        memcpy(Fcur,Fout,(size_t)S*DIM*4);   /* TREF 基准=基座后的 base态 */
+    }
+    for(int oi=0;oi<lf->nops&&!lay_skip;oi++){ lop_t*o=&lf->ops[oi];
+        if(o->type==7) continue;
+        if(o->type>=1&&o->type<=6&&skip_t[o->type]) continue;
+        if(o->type==1){ for(int s2=0;s2<S;s2++){ float*fw=Fout+(size_t)s2*DIM; const float*fb=Fbase+(size_t)s2*DIM;
+                for(int d2=0;d2<DIM;d2++) fw[d2]=fb[d2]+o->g*(fw[d2]-fb[d2]); } }
+        else if(o->type==2){
+            if(!xn){ xn=malloc((size_t)S*4);
+                for(int s2=0;s2<S;s2++){ const float*x=Fin+(size_t)s2*DIM; double v=0;
+                    for(int d2=0;d2<DIM;d2++) v+=(double)x[d2]*x[d2]; xn[s2]=(float)sqrt(v); } }
+            for(int s2=0;s2<S;s2++){ double c=o->w2p[0]+o->w2p[1]*((double)xn[s2]-o->w2p[2])/o->w2p[3];
+                if(c<0.25)c=0.25; if(c>4.0)c=4.0;
+                float*fw=Fout+(size_t)s2*DIM; const float*fb=Fbase+(size_t)s2*DIM;
+                for(int d2=0;d2<DIM;d2++) fw[d2]=fb[d2]+(float)c*(fw[d2]-fb[d2]); } }
+        else if(o->type==3&&o->V8){
+            /* ★pj 按本条 op 的 V8 投影(2026-08-04 错配实锤修)★: 旧版跨 op 复用首条投影 ⇒
+             * 反修追加的 bf.V8F(自带新方向)拿旧方向配自己的系数 → 部署回放 KL 2.00 vs 过程态 1.85。
+             * V8 指针变化即重算 — 单条 op 层零额外成本。 */
+            if(!pj||pjV8!=o->V8){ if(!pj) pj=malloc((size_t)S*8*4);
+                pjV8=o->V8;
+                for(int s2=0;s2<S;s2++){ const float*x=Fin+(size_t)s2*DIM; float*pr=pj+(size_t)s2*8;
+                    for(int c=0;c<8;c++){ double a2=0; const float*vc=o->V8+(size_t)c*DIM;
+                        for(int d2=0;d2<DIM;d2++) a2+=(double)x[d2]*vc[d2]; pr[c]=(float)a2; } } }
+            for(int s2=0;s2<S;s2++){ const float*pr=pj+(size_t)s2*8;
+                double c=o->w8[0]; for(int k=0;k<8;k++) c+=o->w8[1+k]*pr[k];
+                if(c<0.25)c=0.25; if(c>4.0)c=4.0;
+                float*fw=Fout+(size_t)s2*DIM; const float*fb=Fbase+(size_t)s2*DIM;
+                for(int d2=0;d2<DIM;d2++) fw[d2]=fb[d2]+(float)c*(fw[d2]-fb[d2]); } }
+        else if(o->type==4){ for(size_t i=0;i<(size_t)S*DIM;i++) Fout[i]=Fcur[i]+o->t*(Fout[i]-Fcur[i]); }   /* TREF: 从 base态 Fcur 插值(coadapt 口径) */
+        else if(o->type==6&&o->zlk>0){
+            /* ★冻结 z^L 回放(2026-07-14, 产物③)★: Fout += clip·U diag(z) Vᵀ Fin,
+             * clip=min(1, tr·‖Fout‖/‖zd‖) 逐 token(与活体/引擎同口径的信赖域) */
+            int zk=o->zlk;
+            int zdin=o->zdin>0?o->zdin:DIM;   /* ★md86: 3*DIM=ftA */
+            float *zd=malloc((size_t)DIM*4); double *pv=malloc((size_t)zk*8);
+            float *phi=(zdin==3*DIM)?malloc((size_t)zdin*4):NULL;
+            for(int s2=0;s2<S;s2++){
+                const float*x=Fin+(size_t)s2*DIM; float*fw=Fout+(size_t)s2*DIM;
+                const float*fb=Fbase+(size_t)s2*DIM;   /* 信赖域基准=routed(=Fout−shared基): 与引擎 λ 点同口径 */
+                const float*xin=x;
+                if(phi){   /* φ=[x, x⊙x/rms, relu(x)], rms=sqrt(mean(x²))+1e-6 — 与 zlayer zl_phi 逐式一致 */
+                    double ss=0; for(int d2=0;d2<DIM;d2++) ss+=(double)x[d2]*x[d2];
+                    float nrm=(float)sqrt(ss/DIM)+1e-6f;
+                    for(int d2=0;d2<DIM;d2++){ phi[d2]=x[d2]; phi[DIM+d2]=x[d2]*x[d2]/nrm; phi[2*DIM+d2]=x[d2]>0?x[d2]:0; }
+                    xin=phi; }
+                for(int c=0;c<zk;c++){ double a2=0; const float*vv=o->zlV;
+                    for(int d2=0;d2<zdin;d2++) a2+=(double)xin[d2]*vv[(size_t)d2*zk+c];
+                    pv[c]=a2*(double)o->zlz[c]; }
+                double nd=0,nf=0;
+                for(int d2=0;d2<DIM;d2++){ double a2=0; const float*uu=o->zlU+(size_t)d2*zk;
+                    for(int c=0;c<zk;c++) a2+=pv[c]*(double)uu[c];
+                    zd[d2]=(float)a2; nd+=a2*a2;
+                    double rt=(double)fw[d2]-fb[d2]; nf+=rt*rt; }
+                nd=sqrt(nd); nf=sqrt(nf);
+                double cap=(double)o->zltr*nf; float sc2=1.0f;
+                if(nd>cap&&nd>0) sc2=(float)(cap/nd);
+                for(int d2=0;d2<DIM;d2++) fw[d2]+=sc2*zd[d2];
+            }
+            free(zd); free(pv); if(phi)free(phi);
+        }
+    }
+    if(xn)free(xn); if(pj)free(pj);
+    free(Fbase); free(Fcur);
+    { static int bn=0; if((++bn%43)==0||getenv("DS4_BMW_TIMING"))
+        fprintf(stderr,"[bmwt] dequant=%.1fs 前向=%.1fs (bytes_moe 累计)\n",g_bmw_t[0],g_bmw_t[1]); }
+}
+/* 可复用调优轮(GL重拟合→GLdyn2→GLdyn8→TREF), 循环至整轮零接管; 返回是否有过接管 */
+typedef struct { int L,S,n_fit,vs; size_t rowsz; double bval,bheld;
+    const float *Fin,*Hf,*H2,*post2,*comb2,*shared,*Fcur;
+    float *Fstate,*Ftest,*routedC,*DF,*Hq;
+    double *sc_state,*v_cur,*h_cur; } costx_t;

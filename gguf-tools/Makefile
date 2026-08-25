@@ -61,6 +61,7 @@ TRAJ_INC := $(wildcard $(CAL)/traj_analyze_p*.inc.c)
 HFREAD_INC := $(wildcard $(CAL)/hf_read_p*.inc.c)
 VQMERGE_INC := $(wildcard $(QZ)/vq_merge_v4_p*.inc.c)
 ZLAYER_INC := $(wildcard $(AMP)/zlayer_p*.inc.c)
+DSQRUN_INC := $(wildcard $(AMP)/ds4quant_run_p*.inc.c)
 
 ifeq ($(UNAME_S),Darwin)
 NATIVE ?= -mcpu=native
@@ -170,7 +171,7 @@ $(QT)/compare_scores: $(QT)/compare_scores.c
 DSQR_FLAGS := $(BARE) $(NATIVE) -Wall -Wno-unused-parameter -Wno-unused-function -I..
 ifeq ($(UNAME_S),Darwin)
 ds4quant_run: $(AMP)/ds4quant_run
-$(AMP)/ds4quant_run: $(AMP)/ds4quant_run.c $(AMP)/ds4quant_fwd.c $(DSQFWD_INC) $(QZ)/onebit_quant.c \
+$(AMP)/ds4quant_run: $(AMP)/ds4quant_run.c $(DSQRUN_INC) $(AMP)/ds4quant_fwd.c $(DSQFWD_INC) $(QZ)/onebit_quant.c \
                      $(AMP)/ds4quant_qhelp.h $(QZ)/go2b_qc.h $(QZ)/vq_qc.h
 	$(CC) $(DSQR_FLAGS) -o $@ $(AMP)/ds4quant_run.c $(BLAS_LIBS) -lm -lpthread
 else
@@ -178,13 +179,13 @@ ifeq ($(CUDA),1)
 $(QZ)/vq_gpu.o: $(QZ)/vq_gpu.cu
 	$(NVCC) -O3 -arch=native -c $< -o $@
 ds4quant_run: $(AMP)/ds4quant_run
-$(AMP)/ds4quant_run: $(AMP)/ds4quant_run.c $(QZ)/vq_gpu.o
+$(AMP)/ds4quant_run: $(AMP)/ds4quant_run.c $(DSQRUN_INC) $(QZ)/vq_gpu.o
 	$(CC) $(DSQR_FLAGS) $(if $(filter 1,$(HAVE_BLAS)),-DDQ_BLAS -DDS4QUANT_OPENBLAS $(BLAS_CFLAGS)) \
 	    -DDS4QUANT_CUDA -I$(CUDA_HOME)/include -o $@ $(AMP)/ds4quant_run.c $(QZ)/vq_gpu.o \
 	    $(CUDA_LIBS) -lcublas $(BLAS_LIBS) -lm -lpthread
 else
 ds4quant_run: $(AMP)/ds4quant_run
-$(AMP)/ds4quant_run: $(AMP)/ds4quant_run.c
+$(AMP)/ds4quant_run: $(AMP)/ds4quant_run.c $(DSQRUN_INC)
 	$(CC) $(DSQR_FLAGS) $(if $(filter 1,$(HAVE_BLAS)),-DDQ_BLAS -DDS4QUANT_OPENBLAS $(BLAS_CFLAGS)) \
 	    -o $@ $(AMP)/ds4quant_run.c $(BLAS_LIBS) -lm -lpthread
 endif
