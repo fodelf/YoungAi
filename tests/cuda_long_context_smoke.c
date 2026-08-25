@@ -118,6 +118,7 @@ static int check_decode_attention_overflow_path(void) {
                                               n_raw,
                                               0,
                                               comp,
+                                              0, /* comp_kv_f16: 本测试的 comp 缓存是 f32 */
                                               n_comp,
                                               NULL,
                                               0,
