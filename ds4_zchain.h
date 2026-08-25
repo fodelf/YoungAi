@@ -51,8 +51,10 @@ typedef struct {
  * U/V row-major [dim][k]. k <= 16. */
 typedef struct {
     uint32_t        zlk;    /* active rank k (0 = absent) */
-    float           zltr;   /* trust-region cap factor */
-    const uint16_t *zlm;    /* fp16 z[k] | U[d_model*k] | V[d_model*k] */
+    uint32_t        zdin;   /* V input dim: d_model=linear | 3*d_model=ftA feature lift (md86) */
+    float           zltr;   /* trust-region cap factor; AMP(type7): tanh 定标 scale */
+    uint32_t        zmul;   /* 0=加性 z^L(type6) | 1=乘性放大器(type7): out⊙(1+U·tanh(Vᵀx/s)) */
+    const uint16_t *zlm;    /* fp16 z[k] | U[d_model*k] | V[zdin*k] */
 } ds4_zchain_zl;
 
 typedef struct {
@@ -60,6 +62,9 @@ typedef struct {
     uint32_t       n_ops;
     float         *ge;      /* [n_expert] effective per-expert gains (last type-5 record), or NULL */
     ds4_zchain_zl  zl;      /* frozen z^L (zlk==0 when absent) */
+    ds4_zchain_zl  rte;     /* 路由闭式侧车(type8 zl.RTE, 2026-08-19): 结构同构复用,
+                             * 语义 δlogits = U·tanh(Vᵀx/s) 加在 router raw logits 上
+                             * (select 前)。zdin=d_model, U 行数=n_expert(非 d_model)。 */
 } ds4_zchain_layer;
 
 typedef struct ds4_zchain {
@@ -90,6 +95,9 @@ static inline int ds4_zchain_layer_has_lambda(const ds4_zchain *z, uint32_t il) 
 }
 static inline const ds4_zchain_zl *ds4_zchain_layer_zl(const ds4_zchain *z, uint32_t il) {
     return (z && il < z->n_layer && z->layer[il].zl.zlk) ? &z->layer[il].zl : (const ds4_zchain_zl *)0;
+}
+static inline const ds4_zchain_zl *ds4_zchain_layer_rte(const ds4_zchain *z, uint32_t il) {
+    return (z && il < z->n_layer && z->layer[il].rte.zlk) ? &z->layer[il].rte : (const ds4_zchain_zl *)0;
 }
 
 /* Host-side frozen z^L apply: routed += clip * U diag(z) V^T x (contract above).

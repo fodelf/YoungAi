@@ -12,13 +12,15 @@ HERE=$(cd "$(dirname "$0")" && pwd); ROOT=$(cd "$HERE/../../.." && pwd)
 SUITE="${SUITE:-humaneval}"; TAG="${TAG:-vq22}"; N="${N:-20}"; PORT="${PORT:-8013}"
 # VQ lane 已验证 env(与 CLI dual_vq 同源): span/批 ≤8(VQ scratch 墙), GPU F16W 路,
 # 关 q2 IO 杠杆, 无残差侧车, PIPE_CHUNK 关(VQ lane 未验证)。
-export RESID= CTX=4096 PIPE_CHUNK=
+# ★域中立判定(2026-08-05 用户铁律: 域注入/定型配方全清, 裸模型裸判)★
+export RESID= CTX=4096 PIPE_CHUNK= SOUL= KNOWLEDGE=
 # 2026-07-28: DS4_VQ_DIR 摘除 — v4bf 起 blob 内嵌合一卷(引擎自动装载), 侧车目录已清
-export EXTRA_ENV="DS4_METAL_PREFILL_CHUNK=8 DS4_DIST_PREFILL_CAP=8 DS4_VQ_GPU=1 DS4_METAL_EXPERT_PREAD=0 DS4_METAL_EXPERT_PREFETCH_AHEAD=0 DS4_METAL_EXPERT_EVENT_DRAIN=0"
+export EXTRA_ENV="DS4_PRIMER_BATCH_INJECT=0 DS4_METAL_PREFILL_CHUNK=${PB_CHUNK:-8} DS4_DIST_PREFILL_CAP=${PB_CHUNK:-8} DS4_VQ_GPU=1 DS4_METAL_EXPERT_PREAD=0 DS4_METAL_EXPERT_PREFETCH_AHEAD=0 DS4_METAL_EXPERT_EVENT_DRAIN=0 ${PB_EXTRA:-}"
 OUT="$ROOT/gguf-tools/go-onebit/reports/pubbench"; mkdir -p "$OUT"
 FINAL="$OUT/pubbench_${SUITE}_${TAG}.jsonl"; : > "$FINAL"
 REQ_FAIL=0
-for k in $(seq 0 $((N-1))); do
+# OFFSETS="1 4 11" 指定题号复测(2026-07-28, 断环器删除后贪心真相针); 缺省=0..N-1 全量
+for k in ${OFFSETS:-$(seq 0 $((N-1)))}; do
   pkill -f "^\./ds4-server .*--port $PORT" 2>/dev/null; sleep 2
   "$ROOT/tools/svc.sh" up > /tmp/pubbench_serial_up.log 2>&1 || {
     echo "[serial] svc up 失败@题$k:" >&2; tail -3 /tmp/pubbench_serial_up.log >&2; exit 1; }

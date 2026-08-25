@@ -93,25 +93,10 @@ typedef struct {
      * existing role/listen/coordinator host:port fields select who listens. */
     bool tp_enabled;
     uint32_t tp_layers;
-    /* mtp.md Phase 1 (Scheme A): run the MTP drafter on the worker that holds
-     * the final transformer layers + output head. The MTP head consumes the
-     * model's final hidden state, which that worker already produces, so it can
-     * draft K future tokens without shipping the hidden back to the coordinator.
-     * Set by `--mtp-role worker`; ignored unless an --mtp model is loaded. */
-    bool mtp_draft_on_worker;
-    /* New topology (本机 MTP): run the MTP drafter on the COORDINATOR instead.
-     * The worker holds only the backbone layer slice and returns the final hidden
-     * state; the coordinator holds token_embd + output head + the MTP model, so it
-     * drafts locally and verifies the candidate batch back through the worker —
-     * the same local-draft / remote-verify skeleton PC.1 copy-spec already uses.
-     * Frees the worker of the ~2 GiB draft model. Set by `--mtp-role coordinator`;
-     * mutually exclusive with mtp_draft_on_worker. */
-    bool mtp_draft_on_coordinator;
 } ds4_distributed_options;
 
 typedef struct {
     const char *model_path;
-    const char *mtp_path;
     /* Optional sidecar GGUF holding the per-layer go1b "hidden variable z^L"
      * four-loss correction tensors (blk.{L}.corr_*). When NULL, the engine
      * auto-detects ds4-go1b-corr.gguf next to model_path. Absent => pure 1-bit. */
@@ -129,11 +114,8 @@ typedef struct {
      * verify pipeline with boilerplate continuations the transcript has not seen
      * yet. Greedy-lossless (target argmax gates every token). NULL + no env =>
      * exactly today's n-gram-only path. */
-    const char *go_trie_path;
     ds4_backend backend;
     int n_threads;
-    int mtp_draft_tokens;
-    float mtp_margin;
     const char *directional_steering_file;
     float directional_steering_attn;
     float directional_steering_ffn;
@@ -197,14 +179,6 @@ int ds4_engine_corr_switch(ds4_engine *e, const char *path);
  * NULL before open or on OOM (consumers must fail closed, not fake). */
 struct ds4_mm;
 struct ds4_mm *ds4_engine_mm(ds4_engine *e);
-void ds4_session_anticycle_prep(ds4_session *s, float *row_logits,
-                                const int *extra, uint32_t n_extra);
-/* Repeat/anticycle penalty for callers that hold their own committed-token array
- * (the distributed coordinator's plain-decode loop) instead of a ds4_session
- * checkpoint. Penalizes toks[gen_start..n_committed) in `logits` in place. */
-void ds4_repeat_penalize_tokens(float *logits, const int *toks, uint32_t n_committed,
-                                uint32_t gen_start);
-
 /* ---- Sampling-lane policy (问答/编程链路的一等抽象) ----
  * The frontend that knows the request shape (server/agent/cli/dist coordinator)
  * declares which lane the session is generating for; the core sampler scopes
@@ -360,6 +334,12 @@ int ds4_session_copy_logits(ds4_session *s, float *out, int cap);
 int ds4_session_set_logits(ds4_session *s, const float *logits, int n);
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
 
+/* 请求批处理: N 个会话各推进一个 token, 共享一次前向的行无关部分(骨干 FFN/MoE/输出头
+ * 权重只读一遍)。注意力半层各回自己的图算, KV 结构不变。实测每行成本 1 行 35.9ms /
+ * 4 行 18.9 / 8 行 14.9 ⇒ 8 路聚合约 1.96×。要求同引擎、GPU 后端、非分布式。 */
+int ds4_session_eval_multi(ds4_session **sessions, const int *tokens, uint32_t n,
+                           char *err, size_t errlen);
+
 /* Append N KNOWN tokens in ONE layer-major batch (guided-primer structure
  * injection: the server knows the tokens, no sampling). See ds4.c. */
 int ds4_session_eval_span(ds4_session *s, const int *tokens, int n,
@@ -374,11 +354,6 @@ int ds4_session_pos(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);
 int ds4_session_prefill_cap(ds4_session *s);
 int ds4_engine_routed_quant_bits(ds4_engine *e);
-bool ds4_engine_has_mtp(ds4_engine *e);
-int ds4_engine_mtp_draft_tokens(ds4_engine *e);
-/* Configured --mtp-draft width, ungated by MTP-model presence (the distributed
- * coordinator needs this to size the speculative batch without loading MTP). */
-int ds4_engine_mtp_draft_tokens_configured(ds4_engine *e);
 const ds4_tokens *ds4_session_tokens(ds4_session *s);
 
 /* Low-level graph slice entry points used by distributed inference.  The
@@ -402,19 +377,6 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
                                          float *logits,
                                          char *err,
                                          size_t errlen);
-/* mtp.md Phase 1: draft up to max_k greedy MTP tokens from the final hidden
- * state left in the graph by the last ds4_session_eval_layer_slice() call.
- * Writes the draft token ids into drafts[0..*out_n-1]. Returns 0 with *out_n=0
- * when MTP is unavailable (caller falls back to plain decode), 0 with *out_n>0
- * on success, nonzero only on a hard backend failure. */
-int ds4_session_mtp_draft(ds4_session *s,
-                          int verified_token,
-                          uint32_t pos,
-                          int max_k,
-                          int *drafts,
-                          int *out_n,
-                          char *err,
-                          size_t errlen);
 /* mtp.md Phase 1 cross-machine verifier: run a K-token candidate batch through
  * the final-layer worker slice and emit per-row greedy argmax into
  * row_tops[0..n_tokens-1]. Writes layer KV for pos0..pos0+n_tokens-1 without

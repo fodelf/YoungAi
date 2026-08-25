@@ -84,15 +84,51 @@ ds4_zchain *ds4_zchain_load(const char *path, uint32_t n_layer, uint32_t n_exper
                 for (uint32_t e = 0; e < n_expert; e++) zl->ge[e] = zc_fp16_to_fp32(h[e]);
                 continue;
             }
-            if (ty == 6u && psz >= 16) {
-                /* frozen z^L: u32 k | f32 tr | u32 din | u32 dout | fp16 z,U,V */
+            if (ty == 8u && psz >= 16) {
+                /* type8 路由闭式侧车(zl.RTE, 2026-08-19): δlogits=U·tanh(Vᵀx/s),
+                 * 载荷 u32 k | f32 scale | u32 din=d_model | u32 dout=n_expert
+                 * | fp16 z[k],U[n_expert*k],V[din*k] */
                 uint32_t zk, din, dout; float tr;
                 memcpy(&zk, pay, 4); memcpy(&tr, pay + 4, 4);
                 memcpy(&din, pay + 8, 4); memcpy(&dout, pay + 12, 4);
                 size_t nh = (size_t)zk + (size_t)zk * din + (size_t)zk * dout;
-                if (zk > 0 && zk <= 16 && din == d_model && dout == d_model
-                    && psz >= 16 + nh * 2) {
-                    zl->zl.zlk = zk; zl->zl.zltr = tr;
+                if (zk > 0 && zk <= 1024 && din == d_model && dout == n_expert &&
+                    psz >= 16 + nh * 2) {
+                    zl->rte.zlk = zk; zl->rte.zltr = tr; zl->rte.zdin = din;
+                    zl->rte.zmul = 2u;                       /* 标记: 路由偏置形态 */
+                    zl->rte.zlm = (const uint16_t *)(pay + 16);
+                }
+                continue;
+            }
+            if (ty == 9u && psz >= 16) {
+                /* type9 动态 z 乘性放大器(zl.AMPD, 2026-08-22 用户裁决方案B): 载荷
+                 *   u32 k | f32 s | u32 din | u32 dout | fp16 A[din*k], U[dout*k], V[din*k]
+                 * 语义 routed ⊙ (1 + U·[tanh(Aᵀx/s) ⊙ tanh(Vᵀx/s)])
+                 * 与 type7 的唯一区别: z 不再是常向量(旧解算器写死全 1 = 等于没解), 而是 x 的
+                 * 函数 —— 第二个 tanh 门。载荷因此把 z[k] 换成 A[din*k], 布局不同不可混用。 */
+                uint32_t zk, din, dout; float tr;
+                memcpy(&zk, pay, 4); memcpy(&tr, pay + 4, 4);
+                memcpy(&din, pay + 8, 4); memcpy(&dout, pay + 12, 4);
+                size_t nh = (size_t)zk * din * 2u + (size_t)zk * dout;
+                if (zk > 0 && zk <= 1024 && (din == d_model || din == 3u * d_model)
+                    && dout == d_model && psz >= 16 + nh * 2) {
+                    zl->zl.zlk = zk; zl->zl.zltr = tr; zl->zl.zdin = din;
+                    zl->zl.zmul = 3u;                            /* 动态 z 乘性 */
+                    zl->zl.zlm = (const uint16_t *)(pay + 16);
+                }
+                continue;
+            }
+            if ((ty == 6u || ty == 7u) && psz >= 16) {
+                /* type6 frozen z^L / type7 乘性放大器(AMP, 2026-08-19): 载荷同构
+                 * u32 k | f32 tr(AMP=tanh定标scale) | u32 din | u32 dout | fp16 z,U,V */
+                uint32_t zk, din, dout; float tr;
+                memcpy(&zk, pay, 4); memcpy(&tr, pay + 4, 4);
+                memcpy(&din, pay + 8, 4); memcpy(&dout, pay + 12, 4);
+                size_t nh = (size_t)zk + (size_t)zk * din + (size_t)zk * dout;
+                if (zk > 0 && zk <= 1024 && (din == d_model || din == 3u * d_model)
+                    && dout == d_model && psz >= 16 + nh * 2) {
+                    zl->zl.zlk = zk; zl->zl.zltr = tr; zl->zl.zdin = din;
+                    zl->zl.zmul = (ty == 7u) ? 1u : 0u;
                     zl->zl.zlm = (const uint16_t *)(pay + 16);   /* aliases the mmap */
                 }
                 continue;
@@ -112,14 +148,15 @@ ds4_zchain *ds4_zchain_load(const char *path, uint32_t n_layer, uint32_t n_exper
             z->n_ops_total++;
         }
     }
-    uint32_t n_zl = 0;
+    uint32_t n_zl = 0, n_rte = 0;
     for (uint32_t il = 0; il < n_layer; il++) {
         if (z->layer[il].ge) z->n_ge_layers++;
         if (z->layer[il].zl.zlk) n_zl++;
+        if (z->layer[il].rte.zlk) n_rte++;
     }
-    fprintf(stderr, "ds4: zchain loaded %s: %u chain ops + %u GE layers + %u z^L layers over %u layers\n",
-            path, z->n_ops_total, z->n_ge_layers, n_zl, n_layer);
-    if (z->n_ops_total == 0 && z->n_ge_layers == 0 && n_zl == 0) {
+    fprintf(stderr, "ds4: zchain loaded %s: %u chain ops + %u GE layers + %u z^L layers + %u route layers over %u layers\n",
+            path, z->n_ops_total, z->n_ge_layers, n_zl, n_rte, n_layer);
+    if (z->n_ops_total == 0 && z->n_ge_layers == 0 && n_zl == 0 && n_rte == 0) {
         fprintf(stderr, "ds4: zchain %s carries no ops; ignoring\n", path);
         ds4_zchain_free(z);
         return NULL;
@@ -180,15 +217,56 @@ float ds4_zchain_lambda(const ds4_zchain *z, uint32_t il, const float *x) {
 void ds4_zchain_zl_apply(const ds4_zchain_zl *zl, uint32_t d_model, const float *x, float *routed) {
     if (!zl || !zl->zlk || !zl->zlm) return;
     const uint32_t k = zl->zlk, d = d_model;
+    const uint32_t din = zl->zdin ? zl->zdin : d;   /* md86: 3d = ftA feature lift */
     const uint16_t *hz = zl->zlm;
-    const uint16_t *hU = hz + k;
+    /* type9(动态 z): 载荷是 A|U|V, 没有 z[k] 前缀 —— 偏移与 type6/7 不同 */
+    const uint16_t *hA = (zl->zmul == 3u) ? zl->zlm : NULL;
+    const uint16_t *hU = (zl->zmul == 3u) ? (zl->zlm + (size_t)(zl->zdin ? zl->zdin : d_model) * k)
+                                          : (hz + k);
     const uint16_t *hV = hU + (size_t)d * k;
-    double pv[16];
+    double pvs[16];   /* k<=16 走栈(旧路径零开销); 大 k 堆分配 */
+    double *pv = k <= 16 ? pvs : malloc((size_t)k * sizeof(double));
+    if (!pv) return;
+    float *phi = NULL;
+    const float *xin = x;
+    if (din == 3u * d) {   /* φ=[x, x⊙x/rms, relu(x)], rms=sqrt(mean(x²))+1e-6 — zlayer zl_phi 逐式一致 */
+        phi = malloc((size_t)din * sizeof(float));
+        if (!phi) { if (pv != pvs) free(pv); return; }
+        double ss = 0.0;
+        for (uint32_t j = 0; j < d; j++) ss += (double)x[j] * (double)x[j];
+        const float nrm = (float)sqrt(ss / d) + 1e-6f;
+        for (uint32_t j = 0; j < d; j++) {
+            phi[j] = x[j]; phi[d + j] = x[j] * x[j] / nrm; phi[2 * d + j] = x[j] > 0.0f ? x[j] : 0.0f;
+        }
+        xin = phi;
+    }
     for (uint32_t c = 0; c < k; c++) {
         double a = 0.0;
-        for (uint32_t j = 0; j < d; j++)
-            a += (double)x[j] * (double)zc_fp16_to_fp32(hV[(size_t)j * k + c]);
-        pv[c] = a * (double)zc_fp16_to_fp32(hz[c]);
+        for (uint32_t j = 0; j < din; j++)
+            a += (double)xin[j] * (double)zc_fp16_to_fp32(hV[(size_t)j * k + c]);
+        /* AMP(type7): pv=tanh(a/scale)·z(常量) — scale 在 zltr 槽; 加性(type6)保持原式。
+         * AMPD(type9): z 是 x 的函数 —— pv = tanh(Vᵀx/s) · tanh(Aᵀx/s), 两个 tanh 的乘积。 */
+        const double sc = (double)(zl->zltr > 0.0f ? zl->zltr : 1.0f);
+        if (zl->zmul == 3u) {
+            double g = 0.0;
+            for (uint32_t j = 0; j < din; j++)
+                g += (double)xin[j] * (double)zc_fp16_to_fp32(hA[(size_t)j * k + c]);
+            pv[c] = tanh(a / sc) * tanh(g / sc);
+        } else {
+            if (zl->zmul) a = tanh(a / sc);
+            pv[c] = a * (double)zc_fp16_to_fp32(hz[c]);
+        }
+    }
+    if (zl->zmul) {   /* 乘性出口: routed ⊙ (1+ua), 无信任域 */
+        for (uint32_t j = 0; j < d; j++) {
+            double a = 0.0;
+            const uint16_t *ur = hU + (size_t)j * k;
+            for (uint32_t c = 0; c < k; c++) a += pv[c] * (double)zc_fp16_to_fp32(ur[c]);
+            routed[j] *= (float)(1.0 + a);
+        }
+        if (pv != pvs) free(pv);
+        if (phi) free(phi);
+        return;
     }
     double nd = 0.0, nr = 0.0;
     for (uint32_t j = 0; j < d; j++) {
@@ -207,4 +285,6 @@ void ds4_zchain_zl_apply(const ds4_zchain_zl *zl, uint32_t d_model, const float 
         for (uint32_t c = 0; c < k; c++) a += pv[c] * (double)zc_fp16_to_fp32(ur[c]);
         routed[j] += s * (float)a;
     }
+    if (pv != pvs) free(pv);
+    if (phi) free(phi);
 }

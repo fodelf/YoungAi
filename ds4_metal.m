@@ -5304,6 +5304,26 @@ int ds4_gpu_set_model_map_spans_split(
                                             resident_flags, count, max_tensor_bytes);
 }
 
+/* GPU 跨度计时: Metal 侧不做事件对(CUDA 专用归因工具), 返回 -1 表示不可用。 */
+int ds4_gpu_register_aux_model_map(const void *map, uint64_t size) { (void)map; (void)size; return 1; }
+int ds4_gpu_sanitize_finite_tensor(ds4_gpu_tensor *t, uint64_t n) { (void)t; (void)n; return 1; }
+int ds4_gpu_sanitize_router_tensor(ds4_gpu_tensor *sel, ds4_gpu_tensor *w, uint32_t n, uint32_t ne) {
+    (void)sel; (void)w; (void)n; (void)ne; return 1;   /* Metal: 路由 kernel 不产 -1 */
+}
+int ds4_gpu_batch_graph_begin(int slot) { (void)slot; return 0; }   /* Metal: 无批图 */
+int ds4_gpu_batch_graph_end_launch(int encode_ok) { (void)encode_ok; return 0; }
+int ds4_gpu_matmul_q2_K_pair_batch_tensor(ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
+                                          const void *model_map, uint64_t model_size,
+                                          uint64_t off0, uint64_t off1,
+                                          uint64_t in_dim, uint64_t out0_dim, uint64_t out1_dim,
+                                          const ds4_gpu_tensor *x, uint64_t n_tok) {
+    (void)out0; (void)out1; (void)model_map; (void)model_size; (void)off0; (void)off1;
+    (void)in_dim; (void)out0_dim; (void)out1_dim; (void)x; (void)n_tok;
+    return 0;   /* Metal: 调用方回退两次单发 */
+}
+void ds4_gpu_span_begin(void) {}
+float ds4_gpu_span_end(void) { return -1.0f; }
+
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     return ds4_gpu_set_model_map_range(model_map, model_size, 0, model_size, 0);
 }
@@ -6227,6 +6247,131 @@ int ds4_gpu_matmul_q8_0_tensor(
  * from a single-machine reduction => ~1e-6 drift, not bit-identical — inherent to
  * TP row-parallel). Reuses kernel_mul_mv_q8_0_f32 (no .metal change): the trick is
  * ne00=slice (blocks to accumulate) while nb01=full row stride (row addressing). */
+/* dense Q4_K matmul: CUDA-first(backbone-q4k 配方)。Metal 未实现 — 返回 0,
+ * 引擎在校验/调用点会把失败向上抛, 不会静默算错。 */
+int ds4_gpu_token_graph_begin(void) { return 0; }   /* CUDA-only */
+void ds4_gpu_token_graph_set_pos(uint32_t pos) { (void)pos; }
+int ds4_gpu_kv_rope_fp8_store_raw_tensor(
+    ds4_gpu_tensor *kv, ds4_gpu_tensor *raw_cache,
+    uint32_t raw_cap, uint32_t raw_row, uint32_t head_dim, uint32_t n_rot,
+    uint32_t pos, uint32_t n_ctx_orig, float freq_base, float freq_scale,
+    float ext_factor, float attn_factor, float beta_fast, float beta_slow) {
+    /* Metal 无三合一核: 顺序回退(语义=rope→fp8→store 三发) */
+    if (!ds4_gpu_rope_tail_tensor(kv, 1, 1, head_dim, n_rot, pos, n_ctx_orig, false,
+                                  freq_base, freq_scale, ext_factor, attn_factor,
+                                  beta_fast, beta_slow)) return 0;
+    return ds4_gpu_kv_fp8_store_raw_tensor(kv, raw_cache, raw_cap, raw_row, head_dim, n_rot);
+}
+int ds4_gpu_head_rms_norm_rope_tail_tensor(
+    ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim,
+    uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse,
+    float freq_base, float freq_scale, float ext_factor, float attn_factor,
+    float beta_fast, float beta_slow, float eps) {
+    /* Metal 无融合核: 顺序回退(语义=两发) */
+    if (!ds4_gpu_head_rms_norm_tensor(x, n_tok, n_head, head_dim, eps)) return 0;
+    return ds4_gpu_rope_tail_tensor(x, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig,
+                                    inverse, freq_base, freq_scale, ext_factor, attn_factor,
+                                    beta_fast, beta_slow);
+}
+int ds4_gpu_token_graph_end_launch(void) { return 0; }
+int ds4_gpu_token_graph_try_pending(int token, uint32_t pos, int need_logits) { (void)token; (void)pos; (void)need_logits; return 0; }
+int ds4_gpu_token_graph_precapture_begin(void) { return 0; }
+int ds4_gpu_side_mark(void) { return 0; }    /* CUDA-only: Metal 顺序执行 */
+int ds4_gpu_side_begin(void) { return 0; }
+int ds4_gpu_side_main(void) { return 1; }
+int ds4_gpu_dspark_hc_mean_tensor(ds4_gpu_tensor *dst, const ds4_gpu_tensor *hc,
+                                  uint32_t n_embd, uint32_t n_hc, uint32_t slot, uint32_t n_tokens) {
+    (void)dst; (void)hc; (void)n_embd; (void)n_hc; (void)slot; (void)n_tokens;
+    return 0;   /* CUDA-only for now */
+}
+int ds4_gpu_dspark_attn_tensor(ds4_gpu_tensor *heads,
+                               const void *model_map, uint64_t model_size, uint64_t sinks_offset,
+                               const ds4_gpu_tensor *q, const ds4_gpu_tensor *win_kv,
+                               const ds4_gpu_tensor *blk_kv,
+                               uint32_t n_win, uint32_t blk, uint32_t n_head, uint32_t head_dim,
+                               uint32_t win_base, uint32_t win_cap) {
+    (void)heads; (void)model_map; (void)model_size; (void)sinks_offset; (void)q;
+    (void)win_kv; (void)blk_kv; (void)n_win; (void)blk; (void)n_head; (void)head_dim;
+    (void)win_base; (void)win_cap;
+    return 0;
+}
+int ds4_gpu_dspark_win_scatter_tensor(ds4_gpu_tensor *win, const ds4_gpu_tensor *rows,
+                                      uint32_t n, uint32_t pos0, uint32_t win_rows, uint32_t dim) {
+    (void)win; (void)rows; (void)n; (void)pos0; (void)win_rows; (void)dim;
+    return 0;
+}
+int ds4_gpu_dspark_argmax_only_tensor(ds4_gpu_tensor *out_id,
+                                      const ds4_gpu_tensor *logits_row, uint32_t vocab) {
+    (void)out_id; (void)logits_row; (void)vocab; return 0;
+}
+int ds4_gpu_dspark_markov_step_tensor(ds4_gpu_tensor *out_id, ds4_gpu_tensor *logits_row,
+                                      const void *model_map, uint64_t model_size,
+                                      uint64_t w1_offset, uint64_t w2_offset,
+                                      const ds4_gpu_tensor *prev_id, uint32_t vocab, uint32_t rank) {
+    (void)out_id; (void)logits_row; (void)model_map; (void)model_size;
+    (void)w1_offset; (void)w2_offset; (void)prev_id; (void)vocab; (void)rank;
+    return 0;
+}
+int ds4_gpu_side_join(void) { return 1; }
+int ds4_gpu_matmul_q4_K_pair_tensor(ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
+                                    const void *model_map, uint64_t model_size,
+                                    uint64_t off0, uint64_t off1,
+                                    uint64_t in_dim, uint64_t out0_dim, uint64_t out1_dim,
+                                    const ds4_gpu_tensor *x) {
+    (void)out0; (void)out1; (void)model_map; (void)model_size; (void)off0; (void)off1;
+    (void)in_dim; (void)out0_dim; (void)out1_dim; (void)x;
+    return 0;   /* CUDA-only; 调用方回退两次单矩阵 */
+}
+int ds4_gpu_matmul_q2_K_pair_tensor(ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
+                                    const void *model_map, uint64_t model_size,
+                                    uint64_t off0, uint64_t off1,
+                                    uint64_t in_dim, uint64_t out0_dim, uint64_t out1_dim,
+                                    const ds4_gpu_tensor *x) {
+    (void)out0; (void)out1; (void)model_map; (void)model_size; (void)off0; (void)off1;
+    (void)in_dim; (void)out0_dim; (void)out1_dim; (void)x;
+    return 0;   /* CUDA-only; 调用方回退两次单矩阵 */
+}
+int ds4_gpu_token_graph_precapture_end(uint32_t pos, int need_logits, int encode_ok) { (void)pos; (void)need_logits; (void)encode_ok; return 0; }
+
+int ds4_gpu_attention_output_q4k_batch_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *low, const void *model_map,
+        uint64_t model_size, uint64_t out_a_offset, uint64_t out_b_offset,
+        uint64_t group_dim, uint64_t rank, uint32_t n_groups, uint64_t out_dim,
+        const ds4_gpu_tensor *heads, uint32_t n_tokens) {
+    (void)out; (void)low; (void)model_map; (void)model_size; (void)out_a_offset;
+    (void)out_b_offset; (void)group_dim; (void)rank; (void)n_groups; (void)out_dim;
+    (void)heads; (void)n_tokens;
+    return 0;
+}
+
+int ds4_gpu_attention_output_low_q4k_tensor(
+        ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
+        uint64_t out_a_offset, uint64_t group_dim, uint64_t rank,
+        uint32_t n_groups, const ds4_gpu_tensor *heads) {
+    (void)low; (void)model_map; (void)model_size; (void)out_a_offset;
+    (void)group_dim; (void)rank; (void)n_groups; (void)heads;
+    return 0;   /* CUDA-first; Metal 未实现 */
+}
+
+int ds4_gpu_matmul_q4_K_hc_expand_tensor(
+        ds4_gpu_tensor *out_hc, ds4_gpu_tensor *block_out, const void *model_map,
+        uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
+    (void)out_hc; (void)block_out; (void)model_map; (void)model_size; (void)weight_offset;
+    (void)in_dim; (void)out_dim; (void)x; (void)residual_hc; (void)split; (void)n_embd; (void)n_hc;
+    return 0;
+}
+
+int ds4_gpu_matmul_q4_K_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint64_t n_tok) {
+    (void)out; (void)model_map; (void)model_size; (void)weight_offset;
+    (void)in_dim; (void)out_dim; (void)x; (void)n_tok;
+    return 0;
+}
+
 int ds4_gpu_matmul_q8_0_rowslice_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -13101,14 +13246,74 @@ static id<MTLBuffer> g_zchain_zlm;        /* concat z[k]|U[d*k]|V[d*k] per zl la
 static uint32_t     *g_zchain_zl_off;     /* [n_layer] offset in halves */
 static uint32_t     *g_zchain_zl_k;       /* [n_layer] rank (0 = absent) */
 static float        *g_zchain_zl_tr;      /* [n_layer] trust-region factor */
+static uint32_t     *g_zchain_zl_din;     /* [n_layer] V input dim (0/d=linear, 3d=ftA md86) */
+
+/* dense/attn_output Q2_K(2026-08-19 全q2 基座): Metal kernel 未实现 — 明确拒绝,
+ * 禁按 q8 语义静默跑错。全q2 模型当前只在 CUDA(spark) 服役。 */
+int ds4_gpu_register_q2k_f16_shadow(
+        const void *model_map, uint64_t model_size,
+        uint64_t offset, uint64_t rows, uint64_t cols) {
+    (void)model_map; (void)model_size; (void)offset; (void)rows; (void)cols;
+    fprintf(stderr, "ds4: 全q2 f16 影子 Metal 未实现(全q2 模型请用 CUDA)\n");
+    return 0;
+}
+int ds4_gpu_matmul_q2_K_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint64_t n_tok) {
+    (void)out; (void)model_map; (void)model_size; (void)weight_offset;
+    (void)in_dim; (void)out_dim; (void)x; (void)n_tok;
+    fprintf(stderr, "ds4: dense Q2_K matmul Metal 未实现(全q2 模型请用 CUDA)\n");
+    return 0;
+}
+int ds4_gpu_attention_output_q2k_batch_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *low,
+        const void *model_map, uint64_t model_size,
+        uint64_t out_a_offset, uint64_t out_b_offset,
+        uint64_t group_dim, uint64_t rank, uint32_t n_groups, uint64_t out_dim,
+        const ds4_gpu_tensor *heads, uint32_t n_tokens) {
+    (void)out; (void)low; (void)model_map; (void)model_size; (void)out_a_offset;
+    (void)out_b_offset; (void)group_dim; (void)rank; (void)n_groups; (void)out_dim;
+    (void)heads; (void)n_tokens;
+    fprintf(stderr, "ds4: attn_output Q2_K Metal 未实现(全q2 模型请用 CUDA)\n");
+    return 0;
+}
+
+int ds4_gpu_zchain_rte_set(const uint16_t *rm, const uint32_t *off, const uint32_t *k,
+                           const float *scale, uint32_t n_layer, uint32_t n_expert,
+                           uint64_t total_halves) {
+    (void)rm; (void)off; (void)scale; (void)n_expert; (void)total_halves;
+    /* 路由闭式侧车(type8) Metal kernel 未实现: 有侧车层 → 缴械并明示(禁静默跑错)。 */
+    if (k) for (uint32_t l = 0; l < n_layer; l++) if (k[l]) {
+        fprintf(stderr, "ds4: zchain route 侧车(type8) Metal 未实现 — 路由侧车缴械(路由=裸量化)\n");
+        return 1;
+    }
+    return 1;
+}
+
+int ds4_gpu_zchain_route_bias(ds4_gpu_tensor *logits, const ds4_gpu_tensor *x,
+                              uint32_t layer, uint32_t n_tokens) {
+    (void)logits; (void)x; (void)layer; (void)n_tokens;
+    return 1;   /* 未上传即无侧车, 零成本通过 */
+}
 
 int ds4_gpu_zchain_zl_set(const uint16_t *zlm, const uint32_t *off, const uint32_t *k,
-                          const float *tr, uint32_t n_layer, uint64_t total_halves) {
+                          const uint32_t *din, const float *tr, const uint32_t *mul,
+                          uint32_t n_layer, uint64_t total_halves) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
+    /* 乘性侧车(type7 AMP / type9 AMPD 动态 z) 的 Metal kernel 未实现:
+     * kernel_dsv4_zchain_scale 只有加性 z^L 那条路(参数结构里连 zl_mul 都没有)。
+     * 有 mul 层 → 整族缴械并明示(宁可不放大, 禁按加性语义静默跑错)。 */
+    if (mul) for (uint32_t l = 0; l < n_layer; l++) if (mul[l]) {
+        fprintf(stderr, "ds4: zchain 乘性侧车(type7 AMP / type9 AMPD) Metal 未实现 "
+                        "— z^L 侧车整族缴械(输出=裸量化)\n");
+        return 1;
+    }
     @autoreleasepool {
         free(g_zchain_zl_off); g_zchain_zl_off = NULL;
         free(g_zchain_zl_k);   g_zchain_zl_k = NULL;
         free(g_zchain_zl_tr);  g_zchain_zl_tr = NULL;
+        free(g_zchain_zl_din); g_zchain_zl_din = NULL;
         g_zchain_zlm = nil;
         if (!n_layer || !k || !off || !tr) return 1;   /* nothing to upload = ok */
         g_zchain_zlm = (zlm && total_halves)
@@ -13125,6 +13330,11 @@ int ds4_gpu_zchain_zl_set(const uint16_t *zlm, const uint32_t *off, const uint32
         memcpy(g_zchain_zl_off, off, (size_t)n_layer * sizeof(uint32_t));
         memcpy(g_zchain_zl_k,   k,   (size_t)n_layer * sizeof(uint32_t));
         memcpy(g_zchain_zl_tr,  tr,  (size_t)n_layer * sizeof(float));
+        if (din) {
+            g_zchain_zl_din = malloc((size_t)n_layer * sizeof(uint32_t));
+            if (!g_zchain_zl_din) return 0;
+            memcpy(g_zchain_zl_din, din, (size_t)n_layer * sizeof(uint32_t));
+        }
         uint32_t nz = 0;
         for (uint32_t l = 0; l < n_layer; l++) if (k[l]) nz++;
         if (nz) fprintf(stderr, "ds4: Metal zchain z^L resident: %u layers\n", nz);
@@ -13223,6 +13433,8 @@ int ds4_gpu_zchain_scale_routed(
     const uint32_t zl_k   = g_zchain_zl_k ? g_zchain_zl_k[layer] : 0;
     const uint32_t zl_off = (zl_k && g_zchain_zl_off) ? g_zchain_zl_off[layer] : 0;
     const float    zl_tr  = (zl_k && g_zchain_zl_tr) ? g_zchain_zl_tr[layer] : 0.0f;
+    const uint32_t zl_din = (zl_k && g_zchain_zl_din && g_zchain_zl_din[layer])
+                                ? g_zchain_zl_din[layer] : g_zchain_d_model;
     if (op_count == 0 && zl_k == 0) return 1;
     if (!routed || !x || n_tokens == 0) return 0;
     @autoreleasepool {
@@ -13237,8 +13449,8 @@ int ds4_gpu_zchain_scale_routed(
         }
         id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv4_zchain_scale");
         if (!pipeline) return 0;
-        struct { uint32_t d_model, n_tokens, op_start, op_count, zl_k, zl_off; float zl_tr; } args = {
-            g_zchain_d_model, n_tokens, op_start, op_count, zl_k, zl_off, zl_tr
+        struct { uint32_t d_model, n_tokens, op_start, op_count, zl_k, zl_off, zl_din; float zl_tr; } args = {
+            g_zchain_d_model, n_tokens, op_start, op_count, zl_k, zl_off, zl_din, zl_tr
         };
         /* power-of-two threadgroup for the tree reduce */
         NSUInteger tg = 256;
@@ -20650,6 +20862,14 @@ static void *ds4_vq_gather_worker(void *arg) {
                 *t->err = 1; return NULL;
             }
         } else {   /* 冷 w2: base go1b 34B/256el → ±d f16 */
+            /* R28: down 影子张量(base w2 不入文件)⇒ 这条回退路没有字节可读。
+             * 走到这里说明 blob 的 which=2 槽缺失但文件又没带 base down —— 产物与
+             * 引擎不同代, 硬失败而不是读 offset 0 的垃圾当权重。 */
+            if (t->down_expert_bytes == 0 || t->down_offset == 0) {
+                fprintf(stderr, "ds4: [vq-gather-err] e=%u 冷 w2 槽缺失且 base down 不在文件里"
+                                "(影子张量) -- aborting (no silent quality downgrade)\n", e);
+                *t->err = 1; return NULL;
+            }
             const uint8_t *sd = (const uint8_t *)t->model_map + t->down_offset + (uint64_t)e * t->down_expert_bytes;
             const uint64_t nblk_row = t->mid / 256u;
             for (uint32_t r = 0; r < t->out_dim; r++) {
@@ -20903,16 +21123,24 @@ int ds4_gpu_routed_moe_one_tensor(
         uint64_t down_inner = 0;
         /* 合一 VQ GGUF: base gate/up 张量不在文件里(offset=0/bytes=0), do_vq 路
          * 从 blob+down 取数, gate/up view 不建也不引用 — 建 0 区间 view 会硬失败。 */
-        const int vq_no_base_gate = (go1b_res && go1b_res->vq && gate_expert_bytes == 0);
+        const int vq_no_base_gate =
+            (go1b_res && go1b_res->vq && gate_expert_bytes == 0);
         g_wrap_mlock_suppress = 1;   /* routed expert tensors: gathered, never wired */
-        id<MTLBuffer> gate_buf = nil, up_buf = nil;
+        id<MTLBuffer> gate_buf = nil, up_buf = nil, down_buf = nil;
         if (!vq_no_base_gate) {
             gate_buf = ds4_gpu_wrap_model_range(model_map, model_size, gate_offset, gate_tensor_bytes, &gate_inner);
             up_buf = ds4_gpu_wrap_model_range(model_map, model_size, up_offset, gate_tensor_bytes, &up_inner);
         }
-        id<MTLBuffer> down_buf = ds4_gpu_wrap_model_range(model_map, model_size, down_offset, down_tensor_bytes, &down_inner);
+        /* ★冷 w2 也在 blob 时 down 是 bytes=0 影子张量(2026-08-01): --no-down 合并的文件里
+         * base ffn_down_exps 不存在(省 11.42 GiB), 引擎侧由 routed_down_shadow() 顶住维度,
+         * 真实字节从 blob 的 which=2 槽取 ⇒ 这里不该再要 down_buf, 也不该判它 nil 为失败。 */
+        /* 判据用 offset 而非 bytes: 影子张量的维度是真的(routed_down_shadow 填了 DS4 常量),
+         * 所以 down_tensor_bytes 按维度算出来非零; 真正的标志是 abs_offset==0(文件里没有它)。*/
+        const int vq_no_base_down = (down_offset == 0);
+        if (!vq_no_base_down)
+            down_buf = ds4_gpu_wrap_model_range(model_map, model_size, down_offset, down_tensor_bytes, &down_inner);
         g_wrap_mlock_suppress = 0;
-        if ((!vq_no_base_gate && (!gate_buf || !up_buf)) || !down_buf) {
+        if ((!vq_no_base_gate && (!gate_buf || !up_buf)) || (!vq_no_base_down && !down_buf)) {
             fprintf(stderr, "ds4: [moe-buf-nil] L%u gate=%d up=%d down=%d vq_no_base_gate=%d\n",
                     layer_index, gate_buf != nil, up_buf != nil, down_buf != nil, (int)vq_no_base_gate);
             return 0;
@@ -21374,16 +21602,24 @@ int ds4_gpu_routed_moe_batch_tensor(
         uint64_t down_inner = 0;
         /* 合一 VQ GGUF: base gate/up 张量不在文件里(offset=0/bytes=0), do_vq 路
          * 从 blob+down 取数, gate/up view 不建也不引用 — 建 0 区间 view 会硬失败。 */
-        const int vq_no_base_gate = (go1b_res && go1b_res->vq && gate_expert_bytes == 0);
+        const int vq_no_base_gate =
+            (go1b_res && go1b_res->vq && gate_expert_bytes == 0);
         g_wrap_mlock_suppress = 1;   /* routed expert tensors: gathered, never wired */
-        id<MTLBuffer> gate_buf = nil, up_buf = nil;
+        id<MTLBuffer> gate_buf = nil, up_buf = nil, down_buf = nil;
         if (!vq_no_base_gate) {
             gate_buf = ds4_gpu_wrap_model_range(model_map, model_size, gate_offset, gate_tensor_bytes, &gate_inner);
             up_buf = ds4_gpu_wrap_model_range(model_map, model_size, up_offset, gate_tensor_bytes, &up_inner);
         }
-        id<MTLBuffer> down_buf = ds4_gpu_wrap_model_range(model_map, model_size, down_offset, down_tensor_bytes, &down_inner);
+        /* ★冷 w2 也在 blob 时 down 是 bytes=0 影子张量(2026-08-01): --no-down 合并的文件里
+         * base ffn_down_exps 不存在(省 11.42 GiB), 引擎侧由 routed_down_shadow() 顶住维度,
+         * 真实字节从 blob 的 which=2 槽取 ⇒ 这里不该再要 down_buf, 也不该判它 nil 为失败。 */
+        /* 判据用 offset 而非 bytes: 影子张量的维度是真的(routed_down_shadow 填了 DS4 常量),
+         * 所以 down_tensor_bytes 按维度算出来非零; 真正的标志是 abs_offset==0(文件里没有它)。*/
+        const int vq_no_base_down = (down_offset == 0);
+        if (!vq_no_base_down)
+            down_buf = ds4_gpu_wrap_model_range(model_map, model_size, down_offset, down_tensor_bytes, &down_inner);
         g_wrap_mlock_suppress = 0;
-        if ((!vq_no_base_gate && (!gate_buf || !up_buf)) || !down_buf) {
+        if ((!vq_no_base_gate && (!gate_buf || !up_buf)) || (!vq_no_base_down && !down_buf)) {
             fprintf(stderr, "ds4: [moe-buf-nil] L%u gate=%d up=%d down=%d vq_no_base_gate=%d\n",
                     layer_index, gate_buf != nil, up_buf != nil, down_buf != nil, (int)vq_no_base_gate);
             return 0;
@@ -21740,7 +21976,8 @@ int ds4_gpu_routed_moe_batch_tensor(
             if (do_vq) {
                 /* CPU MoE(匹配量化脚本 dq_expert_fp)。DS4_VQ_DIAG=1: 写 ref 并继续跑 GPU F16W 末尾对比。 */
                 int vqdiag = getenv("DS4_VQ_DIAG") != NULL;
-                int vqgpu  = vqdiag || getenv("DS4_VQ_GPU") != NULL;   /* GPU F16W 路; 默认走下方 CPU 生产路(已验证正确) */
+                const char *vg = getenv("DS4_VQ_GPU");
+                int vqgpu  = vqdiag || !(vg && vg[0] == '0');   /* 默认 GPU F16W(2026-08-09 A/B: decode 3.2×/prefill 6.4×, 贪心输出与 CPU 参考路逐字一致); DS4_VQ_GPU=0 回 CPU 参考路 */
                 if (!vqgpu || vqdiag) {   /* 纯GPU 跳过 CPU; 生产/DIAG 都要算 CPU(生产=输出, DIAG=参考) */
                 if (was_batched) (void)ds4_gpu_end_commands();
                 const float *xin = (const float*)((const uint8_t*)xbuf.contents + ds4_gpu_tensor_offset(x));

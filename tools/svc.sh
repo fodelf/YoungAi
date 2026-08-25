@@ -32,7 +32,7 @@ SOUL=${SOUL-gguf-tools/go-onebit/corpus/soul/soul_server_v3.txt}
 # EXPERT_PREAD + PREFETCH_AHEAD: 历史实测"赢家 2.2×"(fable5 L297, 位精确输出逐字节不变) —
 # 单拷贝 direct pread 替代 mmap+memcpy + 跨层 router 预测预取。EVENT_DRAIN: MTLSharedEvent
 # 快路径主机等待(Anukari 先例, 去 per-CB 调度开销)。这些是本日基线 1.18 缺失的 IO 杠杆。
-ENVSTR="DS4_DIST_REVERSE_CONNECT=1 DS4_METAL_EXPERT_OFFLOAD=1 DS4_METAL_EXPERT_PREAD=1 DS4_METAL_EXPERT_PREFETCH_AHEAD=1 DS4_METAL_EXPERT_EVENT_DRAIN=1 DS4_METAL_PREFILL_CHUNK=2048 DS4_DIST_PREFILL_CAP=2048 DS4_METAL_EXPERT_GATHER_THREADS=8 DS4_METAL_NO_MODEL_WARMUP=1 DS4_MEM_BUDGET_MB=12000 DS4_PRIMER_BATCH_INJECT=1 DS4_PRIMER_FREE_BUDGET=96"
+ENVSTR="DS4_DIST_REVERSE_CONNECT=1 DS4_METAL_EXPERT_OFFLOAD=1 DS4_METAL_EXPERT_PREAD=1 DS4_METAL_EXPERT_PREFETCH_AHEAD=1 DS4_METAL_EXPERT_EVENT_DRAIN=1 DS4_METAL_PREFILL_CHUNK=2048 DS4_DIST_PREFILL_CAP=2048 DS4_METAL_EXPERT_GATHER_THREADS=8 DS4_METAL_NO_MODEL_WARMUP=1 DS4_MEM_BUDGET_MB=12000 DS4_PRIMER_BATCH_INJECT=1 DS4_PRIMER_FREE_BUDGET=96 ${EXTRA_ENV:-}"
 # ↑ 批注入+小自由区(2026-07-16 CC 攻3 A/B 胜: 引导轮 15min→5min; 心跳 PRIMER_KA 已在 server 内建)
 # RESID=相对路径的热专家残差侧车(2026-07-14 方向A): 走 DS4_RESIDUAL, 两端都要(各自持有的层
 # 才用得上自己那部分)。侧车须已 scp 到 $M1DIR/同名相对路径。空=不挂。
@@ -89,6 +89,10 @@ if [ -n "$PINRAM" ]; then
   CPINRAM="DS4_EXPERT_PIN_FILE=$PIN_COORD $PINRAM_COMMON"
   WPINRAM="DS4_EXPERT_PIN_FILE=$PIN_WORKER $PINRAM_COMMON"
 fi
+# ZCHAIN(2026-08-06 用户令"修通op"): 反修动态系数(GL/dyn2/dyn8/GE)的运行时通路。
+# 规则=文件驱动零开关: <MODEL>.zchain.bin 在则两端固定挂载(与模型同目录同名衍生, 随模型分发)。
+ZCH="$MODEL.zchain.bin"
+[ -f "$DIR/$ZCH" ] || ZCH=""
 # NOGE=1: 跳过 zchain GE 表(2026-07-21 四腿 A/B: GE 对 Go 针实测伤害; C 配置=残差+NO_GE
 # 为最优腿)。两端都要(各自持有层的 zchain 各自装载)。值语义已修(空串/0=不跳过)。
 [ -n "${NOGE:-}" ] && ENVSTR="$ENVSTR DS4_ZCHAIN_NO_GE=1"
@@ -134,7 +138,7 @@ up(){
     # 整个后台列表包 ( ) 重定向全 fd, 否则中间子壳持 sshd 管道 → ssh 挂到 worker 退出
     # PIN: worker 侧远程 cat 自己的白名单(\$( ) 转义 → 在 M1 shell 展开; 值无空格安全)
     WPIN=""; [ -n "$PIN" ] && WPIN="DS4_METAL_EXPERT_POOL_PINNED=\$(cat $PIN_WORKER)"
-    ssh "$M1" "rm -f /tmp/ds4_worker_svc.log; ( cd $M1DIR && $WPIN $WPINRAM $ENVSTR nohup ./ds4 -m $MODEL ${CORR:+--corr $(basename "$CORR")} --role worker --listen $M1 $DPORT --layers 20:output -c $CTX --temp 0 --nothink ) > /tmp/ds4_worker_svc.log 2>&1 < /dev/null & echo ok" 2>/dev/null
+    ssh "$M1" "rm -f /tmp/ds4_worker_svc.log; ( cd $M1DIR && $WPIN $WPINRAM $ENVSTR nohup ./ds4 -m $MODEL ${CORR:+--corr $(basename "$CORR")} ${ZCH:+--zchain $ZCH} --role worker --listen $M1 $DPORT --layers 20:output -c $CTX --temp 0 --nothink ) > /tmp/ds4_worker_svc.log 2>&1 < /dev/null & echo ok" 2>/dev/null
     until ssh "$M1" "grep -q 'waiting for coordinator' /tmp/ds4_worker_svc.log" 2>/dev/null; do sleep 3; done
   fi
   if [ -z "$(server_pid)" ]; then
@@ -143,7 +147,7 @@ up(){
     CPIN=""; [ -n "$PIN" ] && CPIN="DS4_METAL_EXPERT_POOL_PINNED=$(cat "$PIN_COORD")"
     # perl setpgid: server 自成进程组 —— 宿主 shell/任务被按组清理时不连带杀 server
     # (2026-07-17 实证两次: 后台任务清理连带 SERVER_GONE)。macOS 无 setsid(1), 用 perl。
-    ( cd "$DIR" && env $CPIN $CPINRAM $ENVSTR nohup perl -e 'setpgrp(0,0); exec @ARGV or die $!' ./ds4-server -m "$MODEL" ${CORR:+--corr "$CORR"} --role coordinator --coordinator "$M1" "$DPORT" --layers 0:19 -c "$CTX" --port "$PORT" --kv-disk-dir /tmp/ds4-kv-svc --kv-disk-space-mb 8192 --max-output-tokens "$CAP" --nothink --tool-primer ${SOUL:+--soul "$SOUL"} --trace /tmp/ds4-svc-trace.txt > /tmp/ds4-svc.log 2>&1 & )
+    ( cd "$DIR" && env $CPIN $CPINRAM $ENVSTR nohup perl -e 'setpgrp(0,0); exec @ARGV or die $!' ./ds4-server -m "$MODEL" ${CORR:+--corr "$CORR"} ${ZCH:+--zchain "$ZCH"} --role coordinator --coordinator "$M1" "$DPORT" --layers 0:19 -c "$CTX" --port "$PORT" --kv-disk-dir /tmp/ds4-kv-svc --kv-disk-space-mb 8192 --max-output-tokens "$CAP" --nothink --tool-primer ${SOUL:+--soul "$SOUL"} --trace /tmp/ds4-svc-trace.txt > /tmp/ds4-svc.log 2>&1 & )
     until grep -qE "listening|refusing" /tmp/ds4-svc.log 2>/dev/null; do sleep 3; done
     grep -q refusing /tmp/ds4-svc.log && { log "实例锁: 有别的 ds4 进程 (ds4_test?) 先退出它"; tail -2 /tmp/ds4-svc.log; return 1; }
   fi

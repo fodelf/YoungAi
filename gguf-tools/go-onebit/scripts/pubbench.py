@@ -5,8 +5,11 @@
 #         Go=拼包后 go test(拼装规则首火可能需拧一扣, 结果标 experimental 直到人工抽查确认)。
 # 注意: 会执行模型生成的代码(与官方 human-eval harness 同风险面), 只在本机跑。
 import argparse, gzip, io, json, os, re, subprocess, sys, tempfile, time, urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
-CACHE = "/tmp/pubbench_cache"
+# 默认仍是 /tmp(旧行为不变)。PUBBENCH_CACHE 指向 gguf-tools/go-onebit/pubbench_data/
+# 可跑在联不上外网的机器上(Spark 直连 GitHub/HF 超时) —— 那两份 164 题 jsonl 已入库。
+CACHE = os.environ.get("PUBBENCH_CACHE", "/tmp/pubbench_cache")
 
 HUMANEVAL_URLS = [
     "https://github.com/openai/human-eval/raw/master/data/HumanEval.jsonl.gz",
@@ -108,8 +111,23 @@ def call_server(url, prompt, max_tokens, timeout, mode="code", api="chat"):
 
 def extract_completion(text, prompt, stops, strip_prompt=True, close_brace=False):
     # 服务端 mode:code 常给围栏; 取第一个围栏体, 否则用原文
-    m = re.search(r"```[a-zA-Z0-9_+-]*\n(.*?)(```|\Z)", text, re.S)
-    body = m.group(1) if m else text
+    fences = re.findall(r"```[a-zA-Z0-9_+-]*\n(.*?)(?:```|\Z)", text, re.S)
+    body = fences[0] if fences else text
+    # chat 完整重写形态(2026-08-18): 围栏体自带入口函数完整定义(def entry(... / func Entry(...)
+    # + 函数体) —— 这是 instruct 模型的合法答案形态, 续写式剥重叠对它必然错位(sig 锚 \"\"\"
+    # 会把答案从 docstring 处劈开)。此形态直接原样返回, eval 侧当独立完整程序拼 test。
+    if strip_prompt and fences:
+        # 响应常有多个 fence(复述题面 + 解答): 取含入口函数定义的最长者(解答几乎恒长于复述);
+        # 复述 fence 的函数体常是空/pass, 当解答交卷=全场 AssertionError(08-18 实证)。
+        dm = re.findall(r"(?:def|func)\s+(\w+)\s*\(", prompt)
+        if dm:
+            ent = re.escape(dm[-1])
+            cands = [f for f in fences
+                     if re.search(r"(?:def|func)\s+" + ent + r"\s*\(", f)
+                     and re.search(r"(?:def|func)\s+" + ent + r"\s*\([^\n]*\)[^\n]*(?:\{|:)", f)]
+            if cands:
+                best = max(cands, key=len)
+                return "\x00FULL\x00" + best.rstrip() + "\n"
     # 若模型把题面(签名)复述了, 剥掉与 prompt 重叠的头部。
     # completions 裸续写(strip_prompt=False)禁用: response 本就是纯续写, 而"最后一行锚"
     # 对 HumanEval 恒为 \"\"\" — 会命中续写里任意 docstring 把正确答案整段扔掉(t4 实证)。
@@ -151,7 +169,10 @@ def extract_completion(text, prompt, stops, strip_prompt=True, close_brace=False
 
 
 def eval_python(row, completion, timeout_s):
-    prog = row["prompt"] + completion + "\n" + row["test"] + f"\ncheck({row['entry_point']})\n"
+    if completion.startswith("\x00FULL\x00"):
+        prog = completion[6:] + "\n" + row["test"] + f"\ncheck({row['entry_point']})\n"
+    else:
+        prog = row["prompt"] + completion + "\n" + row["test"] + f"\ncheck({row['entry_point']})\n"
     try:
         r = subprocess.run(
             [sys.executable, "-c", prog],
@@ -185,7 +206,10 @@ def eval_go(row, completion, timeout_s):
     # goimports -w 删未用 import(合并块是超集, 只删不加, 无需解析远程包)。
     d = tempfile.mkdtemp(prefix="pubbench_go_")
     setup = row.get("test_setup", "") or ""
-    sol = row["prompt"] + completion
+    if completion.startswith("\x00FULL\x00"):
+        sol = completion[6:]   # chat 完整重写: 自含入口函数, 不拼题面(strip_headers 剥其 package/import)
+    else:
+        sol = row["prompt"] + completion
     paths = []
     for s in (row.get("import", "") or "", sol, setup, row["test"]):
         for p in _go_import_paths(s):
@@ -221,25 +245,42 @@ def run_suite(a):
     os.makedirs(a.out_dir, exist_ok=True)
     out_path = os.path.join(a.out_dir, f"pubbench_{a.suite}_{a.tag}.jsonl")
     n_pass = 0
+    done_n = [0]
+    def one_task(k_row):
+        k, row = k_row
+        tid = row.get("task_id", f"{a.suite}/{a.offset + k}")
+        # ★Go 生成端 prompt 补全(2026-08-05 用户判"引擎有bug"实锤)★: 判定端(eval_go)
+        # 一直补 package+import 编译, 生成端却发裸函数 — BASE 模型的 Go 语料函数永远
+        # 在文件头之后, 裸函数=分布外 ⇒ TODO 弃权/风格漂移(两代同病, 冠军 Go 10/20 同压)。
+        # 组装完整文件头; 判定端 _go_strip_headers 对 sol 先剥后统一重组, 天然兼容。
+        gen_prompt = row["prompt"]
+        if lang == "go":
+            imp = (row.get("import", "") or "").strip()
+            gen_prompt = "package main\n\n" + (imp + "\n\n" if imp else "") + row["prompt"].lstrip("\n")
+        try:
+            text, raw, dt = call_server(a.url, gen_prompt, a.max_tokens, a.http_timeout, a.mode, a.api)
+            comp = extract_completion(text, gen_prompt, stops, strip_prompt=(a.api != "completions"), close_brace=(a.suite != "humaneval"))
+            ok, err = ev(row, comp, a.eval_timeout)
+        except Exception as e:  # noqa: BLE001
+            text, raw, dt, comp, ok, err = "", "", 0.0, "", False, f"request: {e}"
+        rec = {
+            "task_id": tid, "lang": lang, "tag": a.tag, "pass": ok, "err": err,
+            "gen_seconds": round(dt, 1), "prompt": row["prompt"],
+            "completion": comp, "response_text": text, "response_raw": raw,
+        }
+        done_n[0] += 1
+        log(f"[{done_n[0]}/{len(rows)}] {tid} gen={dt:.0f}s {'PASS' if ok else 'FAIL'}"
+            + (f" ({err.splitlines()[-1][:80]})" if err else ""))
+        return k, rec
+    # ★并发(2026-08-18 用户令"测试并发不要串行")★: server 推理单 worker 串行, 但并发请求
+    # 消掉 client 间隙+判题(go test 1-5s/题)与生成流水; 结果按题序落盘。
+    with ThreadPoolExecutor(max_workers=a.jobs) as ex:
+        results = dict(ex.map(one_task, enumerate(rows)))
     with open(out_path, "w", encoding="utf-8") as out:
-        for k, row in enumerate(rows):
-            tid = row.get("task_id", f"{a.suite}/{a.offset + k}")
-            try:
-                text, raw, dt = call_server(a.url, row["prompt"], a.max_tokens, a.http_timeout, a.mode, a.api)
-                comp = extract_completion(text, row["prompt"], stops, strip_prompt=(a.api != "completions"), close_brace=(a.suite != "humaneval"))
-                ok, err = ev(row, comp, a.eval_timeout)
-            except Exception as e:  # noqa: BLE001
-                text, raw, dt, comp, ok, err = "", "", 0.0, "", False, f"request: {e}"
-            n_pass += int(ok)
-            rec = {
-                "task_id": tid, "lang": lang, "tag": a.tag, "pass": ok, "err": err,
-                "gen_seconds": round(dt, 1), "prompt": row["prompt"],
-                "completion": comp, "response_text": text, "response_raw": raw,
-            }
+        for k in range(len(rows)):
+            rec = results[k]
+            n_pass += int(rec["pass"])
             out.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            out.flush()
-            log(f"[{k + 1}/{len(rows)}] {tid} gen={dt:.0f}s {'PASS' if ok else 'FAIL'}"
-                + (f" ({err.splitlines()[-1][:80]})" if err else ""))
     note = " (go judge=experimental, 人工抽查后作数)" if a.suite != "humaneval" else ""
     log(f"[done] {a.suite} tag={a.tag} pass@1 = {n_pass}/{len(rows)}{note}")
     log(f"[raw] {out_path}")
@@ -250,7 +291,7 @@ def rejudge(path, api="completions"):
     # 离线重判: 用已存 response_text 重新抽取+评测(修抽取器后免重生成), 原地重写 pass/completion。
     rows = [json.loads(l) for l in open(path, encoding="utf-8") if l.strip()]
     n_pass = 0
-    for r in rows:
+    def _rejudge_one(r):
         stops, ev = (PY_STOP, eval_python) if r["lang"] == "python" else (GO_STOP, eval_go)
         row = {"prompt": r["prompt"], "test": r.get("test", ""), "entry_point": r.get("entry_point", "")}
         # 数据集字段(test/entry_point)不在 jsonl 里 → 从数据集按 task_id 回填
@@ -267,7 +308,9 @@ def rejudge(path, api="completions"):
         changed = "" if ok == r["pass"] else f"  [改判 {r['pass']}→{ok}]"
         log(f"{r['task_id']}: {'PASS' if ok else 'FAIL'}{changed}" + (f" ({(err.splitlines() or [''])[-1][:70]})" if err else ""))
         r["pass"], r["err"], r["completion"] = ok, err, comp
-        n_pass += int(ok)
+        return int(ok)
+    with ThreadPoolExecutor(max_workers=8) as ex:   # 判题并发(用户令 08-18)
+        n_pass = sum(ex.map(_rejudge_one, rows))
     with open(path, "w", encoding="utf-8") as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
@@ -328,6 +371,37 @@ def compare(fa, fb):
     verdict(pa, pb, len(both), ka, kb)
 
 
+def selftest(suite, limit, offset, eval_timeout):
+    # harness 自检: 拿数据集自带的 canonical_solution 冒充模型输出, 走与真跑完全同一条
+    # 抽取+判定链路。**期望 164/164** —— 标准答案判不过 = harness 坏了(缺 go 工具链/
+    # 抽取器误剥/拼装规则跑偏), 与被测模型的质量无关。换机器/换 Go 版本后先跑这个,
+    # 免得把环境问题算到模型头上(2026-07-27 那次抽取器"最后一行锚"误剥就是这么漏掉的)。
+    if suite == "humaneval":
+        rows = load_jsonl(fetch(HUMANEVAL_URLS, "HumanEval.jsonl"))
+        ev, lang = eval_python, "python"
+    else:
+        rows = load_jsonl(fetch(HUMANEVALX_GO_URLS, "humaneval_x_go.jsonl"))
+        ev, lang = eval_go, "go"
+    rows = rows[offset : offset + limit]
+    n_pass, failed = 0, []
+    t0 = time.time()
+    for k, row in enumerate(rows):
+        tid = row.get("task_id", f"{suite}/{offset + k}")
+        # canonical_solution 就是"续写部分", 与 completions 裸续写口径同形, 直接当 completion
+        ok, err = ev(row, row["canonical_solution"], eval_timeout)
+        n_pass += int(ok)
+        if not ok:
+            failed.append(tid)
+            log(f"{tid}: FAIL  ({(err.splitlines() or [''])[-1][:100]})")
+        elif (k + 1) % 20 == 0:
+            log(f"[selftest] {k + 1}/{len(rows)} ... {n_pass} pass")
+    log(f"[selftest] {suite}: {n_pass}/{len(rows)} 标准答案通过 ({time.time() - t0:.0f}s)")
+    if failed:
+        log(f"[selftest] 未通过: {' '.join(failed)}")
+        log("[selftest] ★harness 有问题★ — 标准答案本应全过, 先修环境/判定器再跑模型")
+    return n_pass == len(rows)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--suite", choices=["humaneval", "humaneval-x-go"], default="humaneval")
@@ -340,12 +414,17 @@ def main():
     ap.add_argument("--api", choices=["chat", "completions"],
                     default=os.environ.get("PUBBENCH_API", "chat"))  # completions=BASE 裸续写口径
     ap.add_argument("--http-timeout", type=int, default=900)  # 慢机 2-5 t/s 留足
+    ap.add_argument("--jobs", type=int, default=int(os.environ.get("PUBBENCH_JOBS", "4")))  # 并发(生成+判题流水)
     ap.add_argument("--eval-timeout", type=int, default=15)
     ap.add_argument("--out-dir", default=os.environ.get("PUBBENCH_OUT",
                     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "reports", "pubbench")))
     ap.add_argument("--compare", nargs=2, metavar=("A.jsonl", "B.jsonl"))
     ap.add_argument("--rejudge", metavar="FILE.jsonl")
+    ap.add_argument("--selftest", action="store_true",
+                    help="用 canonical_solution 自检判定链路(期望满分), 不碰 server")
     a = ap.parse_args()
+    if a.selftest:
+        sys.exit(0 if selftest(a.suite, a.limit, a.offset, a.eval_timeout) else 1)
     if a.rejudge:
         rejudge(a.rejudge, a.api)
         return

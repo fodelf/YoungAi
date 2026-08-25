@@ -282,27 +282,50 @@ static void dq_signref_export_adj(const float *W,int nrows,int ncols,const float
         for(int j=0;j<ncols;j++) sg[j]= w[j]>=0.0f?1:-1;
         double s=s0;
         if(X&&n_act>=1){
+            /* ★热循环向量化(2026-08-03 用户令"暂停找到问题": 全 signref 配方把本函数推成
+             * 90% 热点, 18分/层 vs 冠军10分)★ 三处修复, 语义保持(同 double 累加域, 仅求和
+             * 顺序 ε 差):
+             *   ① y0[t]=w·x_t 与符号无关却每轮重算 → 提出轮外一次(cblas_dsdot: float 入
+             *      double 累加, 与原手写同精度域);
+             *   ② p_t=Σ_j sg_j·x_tj → 维护 sgf(±1 float) 向量, dsdot 批量;
+             *   ③ g1_j=Σ_t e_t·xj_t → e 的 float 镜像 ef 与 Xt 列 dsdot(e 本体仍 double
+             *      序贯更新, ef 同步; g1 误差 ~1e-7·|e| 远小于翻转判据量级)。 */
+            float *sgf=malloc((size_t)ncols*sizeof(float));
+            float *ef=malloc((size_t)n_act*sizeof(float));
+            float *g1v=malloc((size_t)ncols*sizeof(float));
+            double *y0=malloc((size_t)n_act*sizeof(double));
+            for(int j=0;j<ncols;j++) sgf[j]= sg[j]>0?1.0f:-1.0f;
+            for(int t=0;t<n_act;t++){
+                y0[t]=cblas_dsdot(ncols,w,1,X+(size_t)t*ncols,1);
+                if(Yadj) y0[t]+=(double)Yadj[(size_t)t*nrows+r];
+            }
             for(int round=0;round<=ROUNDS;round++){
                 double sp2=0,spy=0;
-                for(int t=0;t<n_act;t++){ const float *x=X+(size_t)t*ncols; double p=0,y=0;
-                    for(int j=0;j<ncols;j++){ double xj=x[j]; p += (sg[j]>0)?xj:-xj; y += (double)w[j]*xj; }
-                    if(Yadj) y+=(double)Yadj[(size_t)t*nrows+r];
-                    sp2+=p*p; spy+=p*y; e[t]=y; pp[t]=p;
+                for(int t=0;t<n_act;t++){
+                    double p=cblas_dsdot(ncols,sgf,1,X+(size_t)t*ncols,1);
+                    sp2+=p*p; spy+=p*y0[t]; e[t]=y0[t]; pp[t]=p;
                 }
                 double lam=sp2/((double)n_act+1.0), lam0=1e-3*sp2+1e-9; if(lam<lam0)lam=lam0;
                 s=(spy+lam*s0)/(sp2+lam);
                 if(s<0.0)s=s0; else if(s>4.0*s0+1e-12)s=4.0*s0;
-                for(int t=0;t<n_act;t++) e[t]-= s*pp[t];
+                for(int t=0;t<n_act;t++){ e[t]-= s*pp[t]; ef[t]=(float)e[t]; }
                 if(round==ROUNDS) break;
+                /* ★g1 批量化(第2版, 2026-08-03)★: 第1版逐 j 短 dsdot(128 长)被调用开销吃平
+                 * (840 万次/矩阵)。改一次 sgemv 算全部 g1[ncols] — Gauss-Seidel→Jacobi:
+                 * 判据用轮开头的 e(翻转的 e 更新保留, 影响 s 重估与下一轮), 大部分 dE 远离 0,
+                 * 边界位次轮自纠; L00 held 对拍 ±0.5% 是语义判决门。 */
+                cblas_sgemv(CblasRowMajor,CblasNoTrans,ncols,n_act,1.0f,Xt,n_act,ef,1,0.0f,g1v,1);
                 for(int j=0;j<ncols;j++){
                     const float *xj=Xt+(size_t)j*n_act;
-                    double g1=0; for(int t=0;t<n_act;t++) g1+=e[t]*(double)xj[t];
+                    double g1=(double)g1v[j];
                     double sj=(double)sg[j];
                     double dE = 4.0*s*sj*g1 + 4.0*s*s*cx[j] + mu*4.0*s*sj*(double)w[j];
-                    if(dE<0.0){ for(int t=0;t<n_act;t++) e[t]+= 2.0*s*sj*(double)xj[t];
-                                sg[j]=(signed char)(-sg[j]); }
+                    if(dE<0.0){ double d2=2.0*s*sj;
+                                for(int t=0;t<n_act;t++){ e[t]+= d2*(double)xj[t]; ef[t]=(float)e[t]; }
+                                sg[j]=(signed char)(-sg[j]); sgf[j]=-sgf[j]; }
                 }
             }
+            free(sgf); free(ef); free(g1v); free(y0);
         }
         uint16_t shrow=go1b_fp32_to_fp16((float)s);
         double sbx[16]; int blkon=dq_signref_blk_on();

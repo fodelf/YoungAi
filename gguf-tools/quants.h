@@ -79,6 +79,10 @@ size_t ds4q_quantize_chunk(ds4q_type type, const float *src, void *dst,
                            int64_t start, int64_t nrows, int64_t ncols,
                            const float *imatrix);
 
+/* IQ2_XXS 搜索表导出(GPU 编码器上传用; 调用即触发建表)。 */
+void ds4q_iq2_xxs_tables(const uint64_t **grid, const int **map, const uint16_t **neighbours,
+                         int *grid_size, int *map_size, int64_t *neighbours_len);
+
 float ds4q_f16_to_f32(uint16_t bits);
 float ds4q_bf16_to_f32(uint16_t bits);
 void ds4q_f32_to_f16_row(const float *src, uint16_t *dst, int64_t n);

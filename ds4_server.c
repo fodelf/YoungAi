@@ -5240,70 +5240,6 @@ static bool parse_generated_message_ex(const char *text, bool require_thinking_c
     }
 }
 
-/* Try to repair a truncated DSML block.
- *
- * DSML nesting order is: tool_calls > invoke > parameter.
- * Single-pass scan: count opens vs closes, then append missing closing tags.
- *
- * Returns true if repair was applied, false if the text had no recognizable DSML
- * or was already balanced.  This deliberately does not rewrite malformed but
- * balanced DSML into assistant text; semantic recovery belongs to the model. */
-static bool try_repair_dsml(const char *s, size_t len, buf *out) {
-    if (!s || !len) return false;
-
-    /* Only scan DSML tags after the last </think>.  DSML mentioned inside
-     * reasoning is not executable — it inflates tag counts and causes false
-     * positive repairs.  If no </think> is found, scan from the start
-     * (thinking mode is not active or thinking was never opened). */
-    const char *think_end = find_last_substr(s, "</think>");
-    const char *scan_start = think_end ? (think_end + 8) : s;
-    size_t scan_len = (size_t)((s + len) - scan_start);
-
-    /* Detect style from first <tool_calls> tag */
-    const char *ts, *te, *is, *ie, *ps, *pe;
-    if (strstr(scan_start, DS4_TOOL_CALLS_START)) {
-        ts = DS4_TOOL_CALLS_START;  te = DS4_TOOL_CALLS_END;
-        is = DS4_INVOKE_START;      ie = DS4_INVOKE_END;
-        ps = DS4_PARAM_START;       pe = DS4_PARAM_END;
-    } else if (strstr(scan_start, DS4_TOOL_CALLS_START_SHORT)) {
-        ts = DS4_TOOL_CALLS_START_SHORT;  te = DS4_TOOL_CALLS_END_SHORT;
-        is = DS4_INVOKE_START_SHORT;      ie = DS4_INVOKE_END_SHORT;
-        ps = DS4_PARAM_START_SHORT;       pe = DS4_PARAM_END_SHORT;
-    } else if (strstr(scan_start, "<tool_calls>")) {
-        ts = "<tool_calls>";   te = "</tool_calls>";
-        is = "<invoke";        ie = "</invoke>";
-        ps = "<parameter";     pe = "</parameter>";
-    } else {
-        return false; /* No recognizable DSML start tag */
-    }
-
-    /* Single-pass: count all 6 tag types in one scan */
-    size_t tos = 0, toe = 0, ios = 0, ioe = 0, pos = 0, poe = 0;
-    const char *e = scan_start + scan_len;
-    for (const char *p = scan_start; p < e; ) {
-        size_t d;
-        if ((d = strlen(ts)) && !strncmp(p, ts, d)) { tos++; p += d; }
-        else if ((d = strlen(te)) && !strncmp(p, te, d)) { toe++; p += d; }
-        else if ((d = strlen(is)) && !strncmp(p, is, d)) { ios++; p += d; }
-        else if ((d = strlen(ie)) && !strncmp(p, ie, d)) { ioe++; p += d; }
-        else if ((d = strlen(ps)) && !strncmp(p, ps, d)) { pos++; p += d; }
-        else if ((d = strlen(pe)) && !strncmp(p, pe, d)) { poe++; p += d; }
-        else p++;
-    }
-    if (tos == toe && ios == ioe && pos == poe) return false;
-    if (toe > tos || ioe > ios || poe > pos) {
-        /* Extra closing tags are not a truncation pattern.  Refuse repair so the
-         * unsigned differences below cannot wrap and append a huge suffix. */
-        return false;
-    }
-    /* Repair: copy original text and append missing closing tags in reverse order */
-    buf_puts(out, s);
-    for (size_t i = 0; i < pos - poe; i++) buf_puts(out, pe);
-    for (size_t i = 0; i < ios - ioe; i++) buf_puts(out, ie);
-    for (size_t i = 0; i < tos - toe; i++) buf_puts(out, te);
-    return true;
-}
-
 static const char *tool_parse_failure_recovery_finish(const char *finish) {
     /* Once DSML failed to parse there is no executable tool call to report.
      * Preserve a true length stop, because callers can distinguish truncation
@@ -8372,6 +8308,8 @@ static void id_list_push_unique(stop_list *ids, const char *id);
 struct server {
     ds4_engine *engine;
     ds4_session *session;
+    int ctx_size;              /* 批处理快路建临时会话用 */
+    int batch_max;             /* 并发批上限(0=关), 见 generate_jobs_batched */
     int default_tokens;
     /* Server-side hard cap on any request's output tokens (0 = uncapped).
      * Resource protection for small local models with weak EOS discipline:
@@ -10926,12 +10864,22 @@ static void generate_job(server *s, job *j) {
      * path, made visible by its PC.4 diagnostic. */
     if (cached == 0 && common > 0 && common < old_pos &&
         j->req.prompt.len > common) {
-        ds4_session_rewind(s->session, common);
-        cached = common;
-        cache_source = "live-lcp";
-        server_log(DS4_LOG_PREFILL,
-                   "ds4-server: live-lcp rewind live=%d -> common=%d (suffix=%d)",
-                   old_pos, common, j->req.prompt.len - common);
+        /* 短公共前缀不复用(2026-08-18): 部分回卷不回滚压缩器累积 state(ds4_session_rewind
+         * 注释的已知债), 旧对话内容留在 compressed KV 被新请求 attention 读到 —— 328 基准
+         * 实锤"题 N 答出题 N-1"跨请求污染。公共前缀只有模板头量级时, 冷重放成本≈零且语义
+         * 精确; 长前缀(CC 增量会话)保留原行为。 */
+        if (common < 512) {
+            ds4_session_rewind(s->session, 0);
+            server_log(DS4_LOG_PREFILL,
+                       "ds4-server: live-lcp too short (common=%d) -> cold replay", common);
+        } else {
+            ds4_session_rewind(s->session, common);
+            cached = common;
+            cache_source = "live-lcp";
+            server_log(DS4_LOG_PREFILL,
+                       "ds4-server: live-lcp rewind live=%d -> common=%d (suffix=%d)",
+                       old_pos, common, j->req.prompt.len - common);
+        }
     }
     const bool responses_reasoning_state_preserved =
         cached > 0 &&
@@ -11279,11 +11227,9 @@ decode_again:
      *     prompt, anticycle 只扫 [这里, end); decode_again 重入会重新钉一次。 */
     ds4_session_set_request_penalties(s->session, j->req.frequency_penalty,
                                       j->req.presence_penalty);
-    {
-        const float req_temp = ds4_think_mode_enabled(j->req.think_mode)
-            ? DS4_DEFAULT_TEMPERATURE : j->req.temperature;
-        ds4_session_set_spec_greedy(s->session, req_temp <= 0.0f);
-    }
+    /* 客户端参数原样生效: 此前 think 档会把 temperature 静默换成 DS4_DEFAULT_TEMPERATURE,
+     * 属引擎擅自改动模型行为(2026-08-21 铁律), 已删。 */
+    ds4_session_set_spec_greedy(s->session, j->req.temperature <= 0.0f);
     ds4_session_mark_generation_start(s->session);
     /* 自由区起点 (prompt 注入后的 session 位置)。echo 回落必须 KV 回滚到这里:
      * 复读到自然收束的 KV 态本身已废 —— 模型视回合为已结束, 注帧后自由采样是碎片汤
@@ -11666,10 +11612,6 @@ guided_primer:
             top_p = DS4_DEFAULT_TOP_P;
             min_p = DS4_DEFAULT_MIN_P;
         }
-        if (in_tool_call && !dsml_decode_state_uses_payload_sampling(dsml_state)) {
-            temperature = -1.0f;   /* 硬贪心哨兵: 采样器按 temp<=0 仍走 argmax, 但熵门(DS4_ENT_GATE
-                                    * 只在 temp==0.0 开火)永不触碰工具语法帧 — 语法确定性铁律不破 */
-        }
         int token = ds4_session_sample(s->session, temperature, top_k, top_p, min_p, &rng);
         if (token == ds4_token_eos(s->engine)) {
             finish = "stop";
@@ -11936,33 +11878,7 @@ guided_primer:
          * missing closing tags stays model-owned: for non-streaming requests,
          * append a tool error plus prompt reminder to the live session and let
          * the model issue a fresh call. */
-        bool completed_truncation = false;
-        buf repaired = {0};
-        if (try_repair_dsml(text.ptr, text.len, &repaired)) {
-            /* Parse repaired text to verify it produces valid tool calls */
-            tool_calls test_calls = {0};
-            char *test_content = NULL;
-            char *test_reasoning = NULL;
-            bool repair_ok = parse_generated_message_ex(repaired.ptr, false, &test_content, &test_reasoning, &test_calls);
-            free(test_content);
-            free(test_reasoning);
-            if (repair_ok && test_calls.len > 0) {
-                /* Repair succeeded - replace text with repaired version */
-                free(text.ptr);
-                text.ptr = buf_take(&repaired);
-                text.len = strlen(text.ptr);
-                saw_tool_end = true;
-                completed_truncation = true;
-                server_log(DS4_LOG_WARNING,
-                           "ds4-server: chat ctx=%s%s%s repaired unterminated tool call (%d calls recovered)",
-                           ctx_span,
-                           req_flags[0] ? " " : "",
-                           req_flags,
-                           test_calls.len);
-                trace_event(s, trace_id, "repaired unterminated tool call (%d calls recovered)", test_calls.len);
-            }
-            tool_calls_free(&test_calls);
-        }
+        const bool completed_truncation = false;
         if (!completed_truncation) {
             if (!j->req.stream && !dsml_recovery_attempted) {
                 int recovery_tokens = 0;
@@ -11990,7 +11906,6 @@ guided_primer:
                     trace_event(s, trace_id,
                                 "tool-error continuation appended %d tokens",
                                 recovery_tokens);
-                    buf_free(&repaired);
                     buf_free(&text);
                     goto decode_again;
                 }
@@ -12002,7 +11917,6 @@ guided_primer:
                 snprintf(err, sizeof(err), "unterminated tool call");
             }
         }
-        buf_free(&repaired);
     }
 
     if (completion > last_decode_log_completion) {
@@ -12358,16 +12272,176 @@ static job *dequeue(server *s) {
     return j;
 }
 
+/* ===== 并发批处理快路 (2026-08-21) ==================================
+ * 引擎侧 ds4_session_eval_multi 能把 N 路解码拼进同一次前向 —— 骨干 dense/FFN/MoE 与
+ * 输出头的权重只读一遍(实测 8 路聚合 1.43×)。但 server 一直是"单 worker 逐个 job",
+ * 8 路并发只是排队(实测 32.8 t/s = 单流速度)。
+ *
+ * 这条快路只接管"简单请求"(非流式 / 无工具 / chat / Anthropic|OpenAI): 每路建自己的
+ * 临时会话, 各自 prefill, 然后联合解码。复杂请求(流式、工具、responses 续接、跨请求
+ * 前缀缓存复用)一律走原来的 generate_job —— 那条路依赖单会话 KV 与工具活状态, 不动。
+ * 代价: 批内请求放弃跨请求前缀缓存复用(各自新会话), 所以默认关, DS4_SERVER_BATCH=N 开。 */
+static bool job_batchable(const job *j) {
+    return j && !j->req.stream && !j->req.has_tools &&
+           (j->req.kind == REQ_CHAT || j->req.kind == REQ_COMPLETION) &&
+           (j->req.api == API_ANTHROPIC || j->req.api == API_OPENAI) &&
+           j->req.prompt.len > 0;
+}
+
+/* 队列里再摘最多 max 个可合批的 job(不阻塞; 保持队列顺序) */
+static uint32_t dequeue_batchable(server *s, job **out, uint32_t max) {
+    uint32_t n = 0;
+    pthread_mutex_lock(&s->mu);
+    job **prev = &s->head;
+    for (job *cur = s->head; cur && n < max; ) {
+        job *next = cur->next;
+        if (job_batchable(cur)) {
+            *prev = next;
+            if (s->tail == cur) s->tail = (*prev) ? s->tail : NULL;
+            cur->next = NULL;
+            out[n++] = cur;
+        } else {
+            prev = &cur->next;
+        }
+        cur = next;
+    }
+    /* tail 重算(上面的摘除可能动到尾) */
+    s->tail = NULL;
+    for (job *cur = s->head; cur; cur = cur->next) s->tail = cur;
+    pthread_mutex_unlock(&s->mu);
+    return n;
+}
+
+static void job_finish(job *j) {
+    pthread_mutex_lock(&j->mu);
+    j->done = true;
+    pthread_cond_signal(&j->cv);
+    pthread_mutex_unlock(&j->mu);
+}
+
+static void generate_jobs_batched(server *s, job **jobs, uint32_t n) {
+    char err[160];
+    ds4_session *sess[8] = {0};
+    buf text[8];
+    int completion[8] = {0}, maxtok[8] = {0}, prompt_tokens[8] = {0};
+    bool done[8] = {false};
+    const char *finish[8];
+    uint64_t rng[8];
+    char id[8][96];
+    memset(text, 0, sizeof(text));
+    const double t0 = now_sec();
+
+    for (uint32_t i = 0; i < n; i++) {
+        finish[i] = "length";
+        snprintf(id[i], sizeof(id[i]), "chatcmpl-%llu", (unsigned long long)++s->seq);
+        rng[i] = jobs[i]->req.seed ? jobs[i]->req.seed
+                                   : (((uint64_t)time(NULL) << 32) ^ ((uint64_t)s->seq << 1) ^ (uint64_t)i);
+        err[0] = 0;
+        if (ds4_session_create(&sess[i], s->engine, s->ctx_size) != 0 || !sess[i] ||
+            ds4_session_sync(sess[i], &jobs[i]->req.prompt, err, sizeof err) != 0) {
+            server_log(DS4_LOG_WARNING, "ds4-server: 批处理会话 %u 建立失败: %s", i, err);
+            done[i] = true; finish[i] = "error";
+            continue;
+        }
+        prompt_tokens[i] = jobs[i]->req.prompt.len;
+        /* 请求级惩罚(frequency/presence): 原路 generate_job 有, 批路一开始漏了 ⇒ 客户端
+         * 传的 frequency_penalty 被静默丢弃(实测: 开 0.25 与不开 18/20 逐字相同)。
+         * 生成区边界 = 此刻的 checkpoint(prompt 到此为止), 与原路口径一致。 */
+        ds4_session_set_request_penalties(sess[i], jobs[i]->req.frequency_penalty,
+                                          jobs[i]->req.presence_penalty);
+        int mt = jobs[i]->req.max_tokens;
+        const int room = ds4_session_ctx(sess[i]) - ds4_session_pos(sess[i]);
+        if (mt <= 0) mt = s->default_tokens;
+        if (mt > room) mt = room;
+        if (s->max_output_tokens > 0 && mt > s->max_output_tokens) mt = s->max_output_tokens;
+        maxtok[i] = mt;
+    }
+
+    /* 联合解码: 每步各自采样, 活跃行拼成一次前向 */
+    for (;;) {
+        ds4_session *act[8]; int tok[8]; uint32_t idx[8], na = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            if (done[i]) continue;
+            if (completion[i] >= maxtok[i]) { done[i] = true; finish[i] = "length"; continue; }
+            const int t = ds4_session_sample(sess[i], jobs[i]->req.temperature,
+                                             jobs[i]->req.top_k, jobs[i]->req.top_p,
+                                             jobs[i]->req.min_p, &rng[i]);
+            if (t == ds4_token_eos(s->engine)) { done[i] = true; finish[i] = "stop"; continue; }
+            size_t plen = 0;
+            char *piece = ds4_token_text(s->engine, t, &plen);
+            if (piece && plen) buf_append(&text[i], piece, plen);
+            completion[i]++;
+            act[na] = sess[i]; tok[na] = t; idx[na] = i; na++;
+        }
+        if (!na) break;
+        err[0] = 0;
+        if (na == 1) {
+            if (ds4_session_eval(act[0], tok[0], err, sizeof err) != 0) {
+                done[idx[0]] = true; finish[idx[0]] = "error";
+            }
+        } else if (ds4_session_eval_multi(act, tok, na, err, sizeof err) != 0) {
+            server_log(DS4_LOG_WARNING, "ds4-server: 批解码失败: %s", err);
+            for (uint32_t k = 0; k < na; k++) { done[idx[k]] = true; finish[idx[k]] = "error"; }
+        }
+    }
+
+    int total = 0;
+    for (uint32_t i = 0; i < n; i++) total += completion[i];
+    server_log(DS4_LOG_GENERATION,
+               "ds4-server: 批处理 %u 路 gen=%d 用时 %.2fs ⇒ 聚合 %.2f t/s",
+               n, total, now_sec() - t0, total / (now_sec() - t0));
+
+    for (uint32_t i = 0; i < n; i++) {
+        char *content = NULL, *reasoning = NULL;
+        tool_calls calls = {0};
+        bool recovered = false;
+        const char *fin = finish[i];
+        char perr[160]; perr[0] = 0;
+        /* completions 是裸续写口径: 生成的就是答案本身, 不做 chat 消息解析 */
+        if (jobs[i]->req.kind == REQ_CHAT)
+            (void)parse_generated_message_for_response(text[i].ptr ? text[i].ptr : "",
+                                                       false, false,
+                                                       ds4_think_mode_enabled(jobs[i]->req.think_mode),
+                                                       &fin, perr, sizeof perr,
+                                                       &content, &reasoning, &calls, &recovered);
+        const char *body = content ? content : (text[i].ptr ? text[i].ptr : "");
+        if (jobs[i]->req.api == API_ANTHROPIC)
+            anthropic_final_response(jobs[i]->fd, s->enable_cors, &jobs[i]->req, id[i],
+                                     body, reasoning, &calls, fin,
+                                     prompt_tokens[i], completion[i]);
+        else
+            final_response(jobs[i]->fd, s->enable_cors, &jobs[i]->req, id[i],
+                           body, reasoning, &calls, fin,
+                           prompt_tokens[i], completion[i]);
+        free(content); free(reasoning); tool_calls_free(&calls);
+        buf_free(&text[i]);
+        if (sess[i]) ds4_session_free(sess[i]);
+        job_finish(jobs[i]);
+    }
+}
+
 static void *worker_main(void *arg) {
     server *s = arg;
     for (;;) {
         job *j = dequeue(s);
         if (!j) break;
+        if (s->batch_max >= 2 && job_batchable(j)) {
+            job *batch[8];
+            batch[0] = j;
+            /* 聚集窗口: 首个可合批的 job 到达后等一小会儿, 让同时发出的其余请求也排进来
+             * (实测不等的话 8 路里常有 1 路晚到, 只能合 7 路)。默认 60ms, 对单请求延迟
+             * 的影响远小于一次前向(29ms/token × N)。 */
+            static int wait_ms = -1;
+            if (wait_ms < 0) { const char *w = getenv("DS4_SERVER_BATCH_WAIT_MS"); wait_ms = w ? atoi(w) : 60; }
+            if (wait_ms > 0) {
+                struct timespec ts = { .tv_sec = wait_ms / 1000, .tv_nsec = (long)(wait_ms % 1000) * 1000000L };
+                nanosleep(&ts, NULL);
+            }
+            const uint32_t extra = dequeue_batchable(s, batch + 1, (uint32_t)s->batch_max - 1u);
+            if (extra > 0) { generate_jobs_batched(s, batch, extra + 1u); continue; }
+        }
         generate_job(s, j);
-        pthread_mutex_lock(&j->mu);
-        j->done = true;
-        pthread_cond_signal(&j->cv);
-        pthread_mutex_unlock(&j->mu);
+        job_finish(j);
     }
     return NULL;
 }
@@ -12807,12 +12881,6 @@ static void usage(FILE *fp) {
         "Model and runtime:\n"
         "  -m, --model FILE\n"
         "      GGUF model path. Default: ds4flash.gguf\n"
-        "  --mtp FILE\n"
-        "      Optional MTP support GGUF used for draft-token probes.\n"
-        "  --mtp-draft N\n"
-        "      Maximum autoregressive MTP draft tokens per speculative step. Default: 1\n"
-        "  --mtp-margin F\n"
-        "      Minimum recursive-draft confidence for the fast N=2 verifier. Default: 3\n"
         "  -c, --ctx N\n"
         "      Context size allocated at startup. Default: 32768\n"
         "  -n, --tokens N\n"
@@ -12930,8 +12998,6 @@ static server_config parse_options(int argc, char **argv) {
         .engine = {
             .model_path = "ds4flash.gguf",
             .backend = default_server_backend(),
-            .mtp_draft_tokens = 1,
-            .mtp_margin = 3.0f,
         },
         .host = "127.0.0.1",
         .port = 8000,
@@ -12972,12 +13038,8 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--corr")) {
             c.engine.corr_path = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--mtp")) {
-            c.engine.mtp_path = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--mtp-draft")) {
-            c.engine.mtp_draft_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--mtp-margin")) {
-            c.engine.mtp_margin = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 1000.0f);
+        } else if (!strcmp(arg, "--zchain")) {
+            c.engine.zchain_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
             c.ctx_size = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
@@ -13179,6 +13241,15 @@ int main(int argc, char **argv) {
     }
 
     pthread_t worker;
+    s.ctx_size = cfg.ctx_size;
+    { const char *bv = getenv("DS4_SERVER_BATCH");
+      s.batch_max = bv ? atoi(bv) : 0;
+      if (s.batch_max > 8) s.batch_max = 8;
+      if (s.batch_max < 0) s.batch_max = 0;
+      if (s.batch_max >= 2)
+          server_log(DS4_LOG_GENERATION,
+                     "ds4-server: 并发批处理已开 (最多 %d 路合批; 仅非流式/无工具的 chat 请求)",
+                     s.batch_max); }
     if (pthread_create(&worker, NULL, worker_main, &s) != 0) die("failed to start worker");
 
     int lfd = listen_on(cfg.host, cfg.port);
@@ -14755,213 +14826,6 @@ static void test_dsml_parser_recovers_loose_nested_parameters(void) {
     free(content);
     free(reasoning);
     tool_calls_free(&calls);
-}
-
-/* Verify that try_repair_dsml + parse_generated_message produces structurally
-   valid tool calls for all three DSML styles and multiple truncation scenarios.
-   Balanced but malformed DSML is not repaired: the model must retry it.
-   This tests repair ACCURACY, not just that it doesn't crash. */
-static void test_dsml_repair_produces_parseable_calls(void) {
-    char *content = NULL;
-    char *reasoning = NULL;
-    tool_calls calls = {0};
-    buf repaired = {0};
-
-    /* === TEST 1: Full DSML - missing </tool_calls> === */
-    {
-        const char *broken =
-            "thinking done\n\n"
-            DS4_TOOL_CALLS_START "\n"
-            DS4_INVOKE_START " name=\"bash\">\n"
-            DS4_PARAM_START " name=\"command\" string=\"true\">ls -la" DS4_PARAM_END "\n"
-            DS4_INVOKE_END "\n";
-        /* Missing: DS4_TOOL_CALLS_END */
-
-        buf_free(&repaired);
-        TEST_ASSERT(try_repair_dsml(broken, strlen(broken), &repaired));
-        TEST_ASSERT(parse_generated_message_ex(repaired.ptr, false, &content, &reasoning, &calls));
-        TEST_ASSERT(calls.len == 1);
-        TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "bash"));
-        TEST_ASSERT(strstr(calls.v[0].arguments, "\"command\": \"ls -la\"") != NULL);
-        free(content); free(reasoning); tool_calls_free(&calls);
-    }
-
-    /* === TEST 2: Full DSML - missing </invoke> and </tool_calls> === */
-    {
-        const char *broken =
-            "\n\n"
-            DS4_TOOL_CALLS_START "\n"
-            DS4_INVOKE_START " name=\"edit\">\n"
-            DS4_PARAM_START " name=\"path\" string=\"true\">/tmp/test.c" DS4_PARAM_END "\n";
-        /* Missing: DS4_INVOKE_END, DS4_TOOL_CALLS_END */
-
-        buf_free(&repaired);
-        TEST_ASSERT(try_repair_dsml(broken, strlen(broken), &repaired));
-        TEST_ASSERT(parse_generated_message_ex(repaired.ptr, false, &content, &reasoning, &calls));
-        TEST_ASSERT(calls.len == 1);
-        TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "edit"));
-        TEST_ASSERT(strstr(calls.v[0].arguments, "\"path\": \"/tmp/test.c\"") != NULL);
-        free(content); free(reasoning); tool_calls_free(&calls);
-    }
-
-    /* === TEST 3: Full DSML - missing </parameter> === */
-    {
-        const char *broken =
-            "\n\n"
-            DS4_TOOL_CALLS_START "\n"
-            DS4_INVOKE_START " name=\"bash\">\n"
-            DS4_PARAM_START " name=\"command\" string=\"true\">echo hello";
-        /* Missing: DS4_PARAM_END, DS4_INVOKE_END, DS4_TOOL_CALLS_END */
-
-        buf_free(&repaired);
-        TEST_ASSERT(try_repair_dsml(broken, strlen(broken), &repaired));
-        TEST_ASSERT(parse_generated_message_ex(repaired.ptr, false, &content, &reasoning, &calls));
-        TEST_ASSERT(calls.len == 1);
-        TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "bash"));
-        TEST_ASSERT(strstr(calls.v[0].arguments, "\"command\": \"echo hello\"") != NULL);
-        free(content); free(reasoning); tool_calls_free(&calls);
-    }
-
-    /* === TEST 4: Short DSML - missing closing tags === */
-    {
-        const char *broken =
-            "\n\n"
-            DS4_TOOL_CALLS_START_SHORT "\n"
-            DS4_INVOKE_START_SHORT " name=\"write_file\">\n"
-            DS4_PARAM_START_SHORT " name=\"path\" string=\"true\">/tmp/out.txt" DS4_PARAM_END_SHORT "\n"
-            DS4_PARAM_START_SHORT " name=\"content\" string=\"true\">hello world" DS4_PARAM_END_SHORT "\n"
-            DS4_INVOKE_END_SHORT "\n";
-        /* Missing: DS4_TOOL_CALLS_END_SHORT */
-
-        buf_free(&repaired);
-        TEST_ASSERT(try_repair_dsml(broken, strlen(broken), &repaired));
-        TEST_ASSERT(parse_generated_message_ex(repaired.ptr, false, &content, &reasoning, &calls));
-        TEST_ASSERT(calls.len == 1);
-        TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "write_file"));
-        TEST_ASSERT(strstr(calls.v[0].arguments, "\"path\": \"/tmp/out.txt\"") != NULL);
-        TEST_ASSERT(strstr(calls.v[0].arguments, "\"content\": \"hello world\"") != NULL);
-        free(content); free(reasoning); tool_calls_free(&calls);
-    }
-
-    /* === TEST 5: Plain XML - missing closing tags === */
-    {
-        const char *broken =
-            "\n\n"
-            "<tool_calls>\n"
-            "<invoke name=\"execute_command\">\n"
-            "<parameter name=\"command\" string=\"true\">pwd</parameter>\n"
-            "</invoke>\n";
-        /* Missing: </tool_calls> */
-
-        buf_free(&repaired);
-        TEST_ASSERT(try_repair_dsml(broken, strlen(broken), &repaired));
-        TEST_ASSERT(parse_generated_message_ex(repaired.ptr, false, &content, &reasoning, &calls));
-        TEST_ASSERT(calls.len == 1);
-        TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "execute_command"));
-        TEST_ASSERT(strstr(calls.v[0].arguments, "\"command\": \"pwd\"") != NULL);
-        free(content); free(reasoning); tool_calls_free(&calls);
-    }
-
-    /* === TEST 6: Balanced text should NOT be modified === */
-    {
-        const char *balanced =
-            "\n\n"
-            DS4_TOOL_CALLS_START "\n"
-            DS4_INVOKE_START " name=\"bash\">\n"
-            DS4_PARAM_START " name=\"command\" string=\"true\">ls" DS4_PARAM_END "\n"
-            DS4_INVOKE_END "\n"
-            DS4_TOOL_CALLS_END;
-
-        buf_free(&repaired);
-        TEST_ASSERT(!try_repair_dsml(balanced, strlen(balanced), &repaired));
-        /* No repair needed */
-    }
-
-    /* === TEST 7: No DSML tags should return false === */
-    {
-        const char *no_dsml = "just plain text, no tools";
-        buf_free(&repaired);
-        TEST_ASSERT(!try_repair_dsml(no_dsml, strlen(no_dsml), &repaired));
-    }
-
-    /* === TEST 8: Balanced DSML with no invoke is not repaired === */
-    {
-        const char *balanced_no_invoke =
-            "Let me analyze this.\n\n"
-            DS4_TOOL_CALLS_START
-            "The write tool truncates this too, at what looks like the same content location."
-            DS4_TOOL_CALLS_END;
-        buf_free(&repaired);
-        TEST_ASSERT(!try_repair_dsml(balanced_no_invoke, strlen(balanced_no_invoke), &repaired));
-    }
-
-    /* === TEST 9: Balanced short DSML with no invoke is not repaired === */
-    {
-        const char *balanced_short_no_invoke =
-            "thinking...\n\n"
-            DS4_TOOL_CALLS_START_SHORT
-            "some content here"
-            DS4_TOOL_CALLS_END_SHORT;
-        buf_free(&repaired);
-        TEST_ASSERT(!try_repair_dsml(balanced_short_no_invoke, strlen(balanced_short_no_invoke), &repaired));
-    }
-
-    /* === TEST 10: Balanced plain XML DSML with no invoke is not repaired === */
-    {
-        const char *balanced_xml_no_invoke =
-            "Let me think.\n\n"
-            "<tool_calls>"
-            "I need to use a tool but I don't know which one."
-            "</tool_calls>";
-        buf_free(&repaired);
-        TEST_ASSERT(!try_repair_dsml(balanced_xml_no_invoke, strlen(balanced_xml_no_invoke), &repaired));
-    }
-
-    /* === TEST 11: DSML mentioned inside thinking is not repaired === */
-    {
-        const char *thinking_quote =
-            "<think>The protocol uses "
-            DS4_TOOL_CALLS_START
-            "some explanatory text"
-            DS4_TOOL_CALLS_END
-            ", but this is only a quote.</think>\nFinal answer.";
-        buf_free(&repaired);
-        TEST_ASSERT(!try_repair_dsml(thinking_quote, strlen(thinking_quote), &repaired));
-    }
-
-    /* === TEST 12: Extra closing tags are unrecoverable, not truncation === */
-    {
-        const char *orphan_close =
-            "done\n\n"
-            DS4_TOOL_CALLS_START
-            DS4_TOOL_CALLS_END
-            DS4_TOOL_CALLS_END;
-        buf_free(&repaired);
-        TEST_ASSERT(!try_repair_dsml(orphan_close, strlen(orphan_close), &repaired));
-    }
-
-    /* === TEST 13: Real DSML after thinking still repairs normally === */
-    {
-        const char *broken_after_think =
-            "<think>"
-            DS4_TOOL_CALLS_START
-            "quoted DSML, not executable"
-            DS4_TOOL_CALLS_END
-            "</think>\n\n"
-            DS4_TOOL_CALLS_START "\n"
-            DS4_INVOKE_START " name=\"bash\">\n"
-            DS4_PARAM_START " name=\"command\" string=\"true\">date" DS4_PARAM_END "\n"
-            DS4_INVOKE_END "\n";
-        buf_free(&repaired);
-        TEST_ASSERT(try_repair_dsml(broken_after_think, strlen(broken_after_think), &repaired));
-        TEST_ASSERT(parse_generated_message_ex(repaired.ptr, true, &content, &reasoning, &calls));
-        TEST_ASSERT(calls.len == 1);
-        TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "bash"));
-        TEST_ASSERT(strstr(calls.v[0].arguments, "\"command\": \"date\"") != NULL);
-        free(content); free(reasoning); tool_calls_free(&calls);
-    }
-
-    buf_free(&repaired);
 }
 
 static void test_tool_parse_failure_returns_recoverable_finish(void) {
@@ -17380,7 +17244,6 @@ static void ds4_server_unit_tests_run(void) {
     test_streaming_holds_partial_utf8();
     test_parse_short_dsml_and_canonical_suffix();
     test_dsml_parser_recovers_loose_nested_parameters();
-    test_dsml_repair_produces_parseable_calls();
     test_tool_parse_failure_returns_recoverable_finish();
     test_invalid_dsml_tool_error_suffix_includes_system_prompt();
     test_thinking_dsml_is_not_executable_before_think_close();

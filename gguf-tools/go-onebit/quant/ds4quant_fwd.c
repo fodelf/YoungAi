@@ -22,6 +22,11 @@
 #define ACCELERATE_NEW_LAPACK   /* 新 CBLAS 头(避免 macOS13.3+ 弃用警告); 不开 ILP64, int 仍 32 位 */
 #endif
 #include <Accelerate/Accelerate.h>
+#elif defined(DS4QUANT_OPENBLAS)
+/* Linux/Spark(GB10 aarch64) 移植(2026-08-17): cblas 接口同名同义, 编译加
+ * -DDS4QUANT_OPENBLAS -lopenblas。标量路径仍是无 BLAS 时的参考。 */
+#define DQ_BLAS 1
+#include <cblas.h>
 #endif
 
 /* ---- 数值原语 (逐一对应 dsv4_fwd.py) ---- */
@@ -93,7 +98,101 @@ void dq_apply_rope(float *xp, const float *cosr, const float *sinr, int rd, int 
 }
 
 /* out[S,M] = X[S,K] @ W[M,K]^T  (W 行主序, 对应 numpy x@W.T). fp32 累加(近 numpy). */
+#ifdef DS4QUANT_CUDA
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
+#endif
+/* strided 版(08-18 attention GPU 化): C[S,M]=A[S,K](lda)·B[M,K](ldb)^T, 行主序任意行距 */
+void dq_matmul_strided(const float *A, int lda, const float *B, int ldb,
+                       float *Cst, int ldc, int S, int K, int M, float alpha) {
+#ifdef DS4QUANT_CUDA
+    if ((double)S * K * (double)M * 2.0 >= 2.0e8) {
+        static __thread cublasHandle_t h2 = NULL;
+        static __thread cudaStream_t s2 = NULL;
+        if (!h2) {
+            if (cublasCreate(&h2) != CUBLAS_STATUS_SUCCESS) h2 = NULL;
+            else { cudaStreamCreateWithFlags(&s2, cudaStreamNonBlocking); cublasSetStream(h2, s2); }
+        }
+        if (h2) {
+            const float zero = 0.0f;
+            if (cublasSgemm(h2, CUBLAS_OP_T, CUBLAS_OP_N, M, S, K,
+                            &alpha, B, ldb, A, lda, &zero, Cst, ldc) == CUBLAS_STATUS_SUCCESS &&
+                cudaStreamSynchronize(s2) == cudaSuccess)
+                return;
+        }
+    }
+#endif
+#ifdef DQ_BLAS
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, S, M, K,
+                alpha, A, lda, B, ldb, 0.0f, Cst, ldc);
+#else
+    for (int s = 0; s < S; s++)
+        for (int m = 0; m < M; m++) {
+            float acc = 0.0f;
+            for (int k = 0; k < K; k++) acc += A[(size_t)s * lda + k] * B[(size_t)m * ldb + k];
+            Cst[(size_t)s * ldc + m] = acc * alpha;
+        }
+#endif
+}
+/* NT 版: C[S,M]=A[S,K](lda)·B[K,M](B 行主序[N,HD]视为 K=N 行 M=HD 列→NoTrans) */
+void dq_matmul_nt_strided(const float *A, int lda, const float *B, int ldb,
+                          float *Cst, int ldc, int S, int K, int M) {
+#ifdef DS4QUANT_CUDA
+    if ((double)S * K * (double)M * 2.0 >= 2.0e8) {
+        static __thread cublasHandle_t h3 = NULL;
+        static __thread cudaStream_t s3 = NULL;
+        if (!h3) {
+            if (cublasCreate(&h3) != CUBLAS_STATUS_SUCCESS) h3 = NULL;
+            else { cudaStreamCreateWithFlags(&s3, cudaStreamNonBlocking); cublasSetStream(h3, s3); }
+        }
+        if (h3) {
+            const float one = 1.0f, zero = 0.0f;
+            /* RowMajor C=A·B ⇔ ColMajor C'=B'·A' */
+            if (cublasSgemm(h3, CUBLAS_OP_N, CUBLAS_OP_N, M, S, K,
+                            &one, B, ldb, A, lda, &zero, Cst, ldc) == CUBLAS_STATUS_SUCCESS &&
+                cudaStreamSynchronize(s3) == cudaSuccess)
+                return;
+        }
+    }
+#endif
+#ifdef DQ_BLAS
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, S, M, K,
+                1.0f, A, lda, B, ldb, 0.0f, Cst, ldc);
+#else
+    for (int s = 0; s < S; s++)
+        for (int m = 0; m < M; m++) {
+            float acc = 0.0f;
+            for (int k = 0; k < K; k++) acc += A[(size_t)s * lda + k] * B[(size_t)k * ldb + m];
+            Cst[(size_t)s * ldc + m] = acc;
+        }
+#endif
+}
 void dq_matmul(const float *X, const float *W, float *out, int S, int K, int M) {
+#ifdef DS4QUANT_CUDA
+    /* GB10 统一内存 cuBLAS 直传(2026-08-18 用户令"必须使用GPU"): malloc 指针 GPU 直访
+     * (探针 relerr 1.6e-7, 热点尺寸 2906x4096x2048=3.67ms=13.3 TFLOPS vs CPU 单线程 ~3.5s)。
+     * 小 GEMM 走 CPU(launch+sync ~100µs 不划算); per-thread handle+stream: 外层专家
+     * pthread 并发提交 GPU 多流; 任一 CUDA 失败静默落 CPU 路径(数值语义同, fp32 同精度)。 */
+    /* 阈=2e8(08-18 实测校准): 只让 g_r 级大 GEMM(24 GFLOP)上 GPU。5e6 低阈实测负收益
+     * (259s vs 181s/层): 20 线程高频小 GEMM 并发提交, launch+sync 队列争用吃掉全部收益。
+     * 高频小矩阵的正确姿势是批量结构改造(GPTQ 段 GPU 常驻), 不是逐调用换后端。 */
+    if ((double)S * K * (double)M * 2.0 >= 2.0e8) {
+        static __thread cublasHandle_t g_dqh = NULL;
+        static __thread cudaStream_t g_dqs = NULL;
+        if (!g_dqh) {
+            if (cublasCreate(&g_dqh) != CUBLAS_STATUS_SUCCESS) g_dqh = NULL;
+            else { cudaStreamCreateWithFlags(&g_dqs, cudaStreamNonBlocking); cublasSetStream(g_dqh, g_dqs); }
+        }
+        if (g_dqh) {
+            const float one = 1.0f, zero = 0.0f;
+            /* RowMajor C[S,M]=X·W^T ⇔ ColMajor C'[M,S]=W'^T·X' */
+            if (cublasSgemm(g_dqh, CUBLAS_OP_T, CUBLAS_OP_N, M, S, K,
+                            &one, W, K, X, K, &zero, out, M) == CUBLAS_STATUS_SUCCESS &&
+                cudaStreamSynchronize(g_dqs) == cudaSuccess)
+                return;
+        }
+    }
+#endif
 #ifdef DQ_BLAS
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, S, M, K,
                 1.0f, X, K, W, K, 0.0f, out, M);
@@ -374,8 +473,7 @@ void dq_attention(const float *x, const float *wqa, const float *qnorm, const fl
     /* per-head 两个 gemm: SC_h=Q_h·kva^T, O_h=P_h·kva. mask/softmax/sink 逻辑与标量路径逐字一致. */
     float *SC = (float*)malloc((size_t)S*N*sizeof(float));
     for (int h=0;h<NH;h++) {
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, S, N, HD,
-                    scale, q + (size_t)h*HD, NH*HD, kva, HD, 0.0f, SC, N);
+        dq_matmul_strided(q + (size_t)h*HD, NH*HD, kva, HD, SC, N, S, HD, N, scale);
         for (int s=0;s<S;s++) {
             float *scr = SC + (size_t)s*N;
             for (int n=0;n<N;n++) {
@@ -390,8 +488,7 @@ void dq_attention(const float *x, const float *wqa, const float *qnorm, const fl
             float inv=(float)(1.0/denom);
             for(int n=0;n<N;n++) scr[n]*=inv;
         }
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, S, HD, N,
-                    1.0f, SC, N, kva, HD, 0.0f, o + (size_t)h*HD, NH*HD);
+        dq_matmul_nt_strided(SC, N, kva, HD, o + (size_t)h*HD, NH*HD, S, N, HD);
     }
     free(SC);
     for (int s=0;s<S;s++) for (int h=0;h<NH;h++)

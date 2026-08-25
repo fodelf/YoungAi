@@ -235,7 +235,7 @@ static int go2b_hot_load(const char*path,int nlayers){
     }
     fclose(f); return 0;
 }
-static inline int g2_hot_slot(int L,int e){ return (GO2B_HOT&&L>=0&&L<64)?(int)G2_SLOT[L][e]:-1; }
+static inline int g2_hot_slot(int L,int e){ return (GO2B_HOT&&L>=0&&L<64&&G2_K[L]>0)?(int)G2_SLOT[L][e]:-1; }   /* G2_K[L]>0: 未 arm 层静态零初值防误判热(多层回放雷, 2026-07-29) */
 static inline int g2_replay_en(void){   /* DS4_GO2B_REPLAY=0 → 回放强制 go1b(A/B 用) */
     static int v=-1;
     if(v<0){ const char*s=getenv("DS4_GO2B_REPLAY"); v=(s&&!atoi(s))?0:1; }

@@ -2189,6 +2189,7 @@ struct ds4_metal_zchain_scale_args {
     uint32_t op_count;
     uint32_t zl_k;           // frozen z^L rank (0 = absent) — type 6, 2026-07-14
     uint32_t zl_off;         // this layer's offset (halves) into the packed zlm table
+    uint32_t zl_din;         // V input dim: d=linear | 3d=ftA feature lift (md86)
     float    zl_tr;          // trust-region cap factor
 };
 
@@ -2263,21 +2264,41 @@ kernel void kernel_dsv4_zchain_scale(
     // frozen z^L (type 6): routed += clip * U diag(z) V^T x, after the λ scale
     // (record-order parity with the quantizer's bytes_moe; clip base = routed norm).
     if (args.zl_k > 0u) {
-        const uint zk = args.zl_k;                    // <= 16 (enforced at load)
+        const uint zk = args.zl_k;                    // <= 1024 (enforced at load)
         device const half *hz = zlm + args.zl_off;
         device const half *hU = hz + zk;
         device const half *hV = hU + (uint64_t)d * zk;
-        float pv[16];
-        for (uint c = 0; c < zk; c++) {
-            float dk = 0.0f;
-            for (uint j = tid; j < d; j += ntg) dk += xt[j] * (float)hV[(uint64_t)j * zk + c];
-            pv[c] = zc_tg_reduce_add(dk, red, tid, ntg) * (float)hz[c];
+        // pv 挪 threadgroup(k>16 时寄存器放不下); c 归属制: 每线程认领 c 子集算完整
+        // 点积, 免去逐 c 树归约(k=1024 时归约 barrier 是主开销)。
+        threadgroup float pvS[1024];
+        const uint din = (args.zl_din > 0u) ? args.zl_din : d;
+        float nrm = 0.0f;
+        if (din == 3u * d) {   // md86 ftA: φ=[x, x⊙x/rms, relu(x)], rms=sqrt(mean(x²))+1e-6
+            float ss_p = 0.0f;
+            for (uint j = tid; j < d; j += ntg) ss_p += xt[j] * xt[j];
+            const float ss = zc_tg_reduce_add(ss_p, red, tid, ntg);
+            nrm = sqrt(ss / (float)d) + 1e-6f;
         }
+        for (uint c = tid; c < zk; c += ntg) {
+            float dk = 0.0f;
+            if (din == 3u * d) {
+                for (uint j = 0; j < d; j++) {
+                    const float xv = xt[j];
+                    dk += xv * (float)hV[(uint64_t)j * zk + c];
+                    dk += (xv * xv / nrm) * (float)hV[(uint64_t)(d + j) * zk + c];
+                    dk += (xv > 0.0f ? xv : 0.0f) * (float)hV[(uint64_t)(2u * d + j) * zk + c];
+                }
+            } else {
+                for (uint j = 0; j < d; j++) dk += xt[j] * (float)hV[(uint64_t)j * zk + c];
+            }
+            pvS[c] = dk * (float)hz[c];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         float nd_p = 0.0f, nr_p = 0.0f;
         for (uint j = tid; j < d; j += ntg) {
             float a = 0.0f;
             device const half *ur = hU + (uint64_t)j * zk;
-            for (uint c = 0; c < zk; c++) a += pv[c] * (float)ur[c];
+            for (uint c = 0; c < zk; c++) a += pvS[c] * (float)ur[c];
             nd_p += a * a;
             nr_p += rt[j] * rt[j];
         }
@@ -2288,7 +2309,7 @@ kernel void kernel_dsv4_zchain_scale(
         for (uint j = tid; j < d; j += ntg) {
             float a = 0.0f;
             device const half *ur = hU + (uint64_t)j * zk;
-            for (uint c = 0; c < zk; c++) a += pv[c] * (float)ur[c];
+            for (uint c = 0; c < zk; c++) a += pvS[c] * (float)ur[c];
             rt[j] += s * a;
         }
     }

@@ -37,6 +37,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <pthread.h>
 
 #if defined(_WIN32)
@@ -627,10 +628,19 @@ static st_value db_read(st_db *db, const char *name) {
     memcpy(v.shape, te->info.shape, sizeof(v.shape));
     v.nbytes = nbytes;
     v.data = xmalloc(nbytes);
-    pthread_mutex_lock(&s->lock);
-    if (fseeko(s->fp, (off_t)(s->data_base + te->info.begin), SEEK_SET) != 0) die_errno("seek", s->path);
-    if (nbytes && fread(v.data, 1, nbytes, s->fp) != nbytes) die_errno("read tensor", s->path);
-    pthread_mutex_unlock(&s->lock);
+    /* ★无锁并发读★: 原来是 fseeko+fread —— FILE* 的文件位置是共享状态, 必须靠
+     * per-shard 锁串行化。而同一层的 256 个专家几乎都落在同一个 shard, 于是 16 个
+     * worker 全部堵在这一把锁上排队读, 20 核机器实测只跑出 3 核(300% CPU), 每层 61s。
+     * pread 自带 offset、是原子的, 同一个 fd 可被多线程并发调用, 锁可以整个去掉。 */
+    const off_t base = (off_t)(s->data_base + te->info.begin);
+    size_t done = 0;
+    const int fd = fileno(s->fp);
+    while (done < nbytes) {
+        const ssize_t got = pread(fd, (char *)v.data + done, nbytes - done, base + (off_t)done);
+        if (got < 0) { if (errno == EINTR) continue; die_errno("read tensor", s->path); }
+        if (got == 0) die("short read on tensor");
+        done += (size_t)got;
+    }
     return v;
 }
 
@@ -1069,6 +1079,16 @@ static const name_map mtp_map[] = {
     { "hc_head_base.weight",   "hc_head_base" },
     { "hc_head_fn.weight",     "hc_head_fn" },
     { "hc_head_scale.weight",  "hc_head_scale" },
+    /* 0731 DSpark drafter 头(2026-08-18): target-hidden 融合投影 + 置信/markov 头 */
+    { "main_proj.weight",       "main_proj.weight" },
+    /* mtp 层是 bias-topk 路由(非 hash), 但层内模板 blk.0 是 hash 层没有 exp_probs_b
+     * 条目 ⇒ 必须走 specials 注入, 否则 drafter 路由丢 bias(2026-08-20 命中率 5% 根因) */
+    { "exp_probs_b.bias",       "ffn.gate.bias" },
+    { "main_norm.weight",       "main_norm.weight" },
+    { "confidence_proj.weight", "confidence_head.proj.weight" },
+    { "markov_w1.weight",       "markov_head.markov_w1.weight" },
+    { "markov_w2.weight",       "markov_head.markov_w2.weight" },
+    /* 旧 EAGLE 形态(pre-0731 checkpoint)保留兼容 */
     { "e_proj.weight",         "e_proj.weight" },
     { "h_proj.weight",         "h_proj.weight" },
     { "enorm.weight",          "enorm.weight" },
@@ -1332,12 +1352,17 @@ static size_t tensor_nbytes(ds4q_type type, const int64_t *ne, int n_dims) {
 
 static void check_reversed_shape(const char *gguf_name, const st_info *info, const tensor_meta *tmpl) {
     int nd = tensor_n_dims(tmpl);
-    if (info->n_dims != nd) {
+    /* HF 前导 1 维剔除(2026-08-18): DSpark confidence proj 形如 [1, 4352], GGUF 侧
+     * ne 规约后 rank=1 — 元素等价, 按剔除后的形状比对。 */
+    int ind = info->n_dims;
+    const int64_t *ish = info->shape;
+    while (ind > 1 && ish[0] == 1) { ish++; ind--; }
+    if (ind != nd) {
         fprintf(stderr, "error: rank mismatch for %s\n", gguf_name);
         exit(1);
     }
     for (int i = 0; i < nd; i++) {
-        if (tmpl->ne[i] != info->shape[nd - 1 - i]) {
+        if (tmpl->ne[i] != ish[nd - 1 - i]) {
             fprintf(stderr, "error: shape mismatch for %s\n", gguf_name);
             exit(1);
         }
@@ -1795,6 +1820,114 @@ static gguf_file load_gguf_metadata(const char *path) {
     return g;
 }
 
+/* --mtp-append(2026-08-18): 把 DSpark drafter(mtp.<N>.*) 张量条目注入输出目录。
+ * 官方 template 头不含 mtp 条目(这就是历来量化产物没带 drafter 的根因); mtp 层与主层
+ * 同构 ⇒ 层内张量 shape/type 兜底抄 blk.0 同名条目, 特殊头(main_proj/confidence/
+ * markov/norm/hc_head)从 HF dims 现读(GGUF ne = HF shape 反序)。HF 里不存在的
+ * 条目(indexer/compressor 等)自动跳过。档位仍走 policy_type(可用 --tensor-type
+ * mtp. 前缀整体覆盖)。 */
+static void append_mtp_tensors(gguf_file *g, const char *hf_dir, int n_mtp) {
+    st_db db;
+    db_open(&db, hf_dir);
+    const uint64_t base_n = g->n_tensors;
+    uint64_t cap = base_n + (uint64_t)n_mtp * 96u;
+    g->tensors = realloc(g->tensors, (size_t)cap * sizeof(g->tensors[0]));
+    if (!g->tensors) die("mtp-append: realloc failed");
+    uint64_t added = 0;
+    char gname[512], hfbuf[560];
+    for (int N = 0; N < n_mtp; N++) {
+        /* 层内条目: 以 blk.0.* 为形态模板 */
+        for (uint64_t i = 0; i < base_n; i++) {
+            const char *nm = g->tensors[i].name;
+            if (strncmp(nm, "blk.0.", 6) != 0) continue;
+            snprintf(gname, sizeof(gname), "mtp.%d.%s", N, nm + 6);
+            bool is_exps = strstr(nm, "_exps.weight") != NULL;
+            if (!is_exps) {
+                /* 存在性检查: 经映射得 HF 名; 映射不到或 HF 没有则跳过 */
+                const char *suffix = nm + 6;
+                const char *hf_suffix = NULL;
+                for (size_t mi = 0; mi < sizeof(mtp_map) / sizeof(mtp_map[0]); mi++)
+                    if (strcmp(suffix, mtp_map[mi].gguf) == 0) { hf_suffix = mtp_map[mi].hf; break; }
+                if (!hf_suffix) {
+                    for (size_t mi = 0; mi < sizeof(layer_map) / sizeof(layer_map[0]); mi++)
+                        if (strcmp(suffix, layer_map[mi].gguf) == 0) { hf_suffix = layer_map[mi].hf; break; }
+                }
+                if (!hf_suffix) continue;
+                snprintf(hfbuf, sizeof(hfbuf), "mtp.%d.%s", N, hf_suffix);
+                if (!db_has(&db, hfbuf)) continue;
+            }
+            tensor_meta t = g->tensors[i];
+            t.name = xstrdup(gname);
+            t.old_offset = 0;
+            g->tensors[base_n + added] = t;
+            added++;
+            if (base_n + added >= cap) die("mtp-append: cap overflow");
+        }
+        /* 特殊头(blk 层没有的形态): shape 从 HF 读 */
+        static const struct { const char *g; ds4q_type fallback; } specials[] = {
+            { "exp_probs_b.bias",       DS4Q_TYPE_F32 },
+            { "main_proj.weight",       DS4Q_TYPE_Q8_0 },
+            { "main_norm.weight",       DS4Q_TYPE_F32 },
+            { "confidence_proj.weight", DS4Q_TYPE_Q8_0 },
+            { "markov_w1.weight",       DS4Q_TYPE_Q8_0 },
+            { "markov_w2.weight",       DS4Q_TYPE_Q8_0 },
+            { "norm.weight",            DS4Q_TYPE_F32 },
+            { "hc_head_base.weight",    DS4Q_TYPE_F32 },
+            { "hc_head_fn.weight",      DS4Q_TYPE_F32 },
+            { "hc_head_scale.weight",   DS4Q_TYPE_F32 },
+        };
+        for (size_t si = 0; si < sizeof(specials) / sizeof(specials[0]); si++) {
+            snprintf(gname, sizeof(gname), "mtp.%d.%s", N, specials[si].g);
+            const char *hf_suffix = NULL;
+            for (size_t mi = 0; mi < sizeof(mtp_map) / sizeof(mtp_map[0]); mi++)
+                if (strcmp(specials[si].g, mtp_map[mi].gguf) == 0) { hf_suffix = mtp_map[mi].hf; break; }
+            if (!hf_suffix) continue;
+            snprintf(hfbuf, sizeof(hfbuf), "mtp.%d.%s", N, hf_suffix);
+            if (!db_has(&db, hfbuf)) continue;
+            tensor_entry *te = db_tensor(&db, hfbuf, NULL);
+            tensor_meta t = {0};
+            t.name = xstrdup(gname);
+            t.n_dims = te->info.n_dims;
+            for (int d = 0; d < t.n_dims; d++) t.ne[d] = te->info.shape[t.n_dims - 1 - d];
+            while (t.n_dims > 1 && t.ne[t.n_dims - 1] == 1) t.n_dims--;   /* HF 前导 1 维 */
+            /* 1D 或小张量保 F32; 矩阵默认 q8_0 兜底(policy/override 可重定) */
+            t.type = (t.n_dims <= 1) ? DS4Q_TYPE_F32 : specials[si].fallback;
+            t.old_offset = 0;
+            t.size = tensor_nbytes(t.type, t.ne, t.n_dims);
+            g->tensors[base_n + added] = t;
+            added++;
+            if (base_n + added >= cap) die("mtp-append: cap overflow");
+        }
+    }
+    g->n_tensors = base_n + added;
+    /* 重建名字索引(read_gguf_tensor_data 等按 map 查) */
+    free(g->tensor_map.slots);
+    char **keys = xmalloc((size_t)g->n_tensors * sizeof(keys[0]));
+    for (uint64_t i = 0; i < g->n_tensors; i++) keys[i] = g->tensors[i].name;
+    hmap_build(&g->tensor_map, keys, (int)g->n_tensors);
+    free(keys);
+    db_close(&db);
+    fprintf(stderr, "mtp-append: injected %llu drafter tensors (%d modules)\n",
+            (unsigned long long)added, n_mtp);
+}
+
+
+/* --mtp-only: append 之后把非 mtp.* 条目全部剔除, 输出成独立 drafter 文件
+ * (官方开源 DSpark 量化版形态: 单 mtp 模块 ≈7GB)。KV 头照抄 template。 */
+static void keep_mtp_only(gguf_file *g) {
+    uint64_t kept = 0;
+    for (uint64_t i = 0; i < g->n_tensors; i++)
+        if (strncmp(g->tensors[i].name, "mtp.", 4) == 0) g->tensors[kept++] = g->tensors[i];
+    if (!kept) die("mtp-only: no mtp.* tensors (use with --mtp-append N)");
+    g->n_tensors = kept;
+    free(g->tensor_map.slots);
+    char **keys = xmalloc((size_t)kept * sizeof(keys[0]));
+    for (uint64_t i = 0; i < kept; i++) keys[i] = g->tensors[i].name;
+    hmap_build(&g->tensor_map, keys, (int)kept);
+    free(keys);
+    fprintf(stderr, "mtp-only: kept %llu drafter tensors\n", (unsigned long long)kept);
+}
+
 static byte_buf read_gguf_tensor_data(const gguf_file *g, const char *path, const char *name) {
     int idx = hmap_get(&g->tensor_map, name);
     if (idx < 0) {
@@ -1954,8 +2087,19 @@ static output_context build_output_context(const gguf_file *tmpl, const quant_po
         dst->name = src->name;
         ds4q_type type = policy_type(policy, src->name, src);
         if (type == DS4Q_TYPE_COUNT) type = src->type;
+        /* 1D norm/bias/sinks 数学上非矩阵, 任何档位/override 下都保源精度 */
+        if (src->n_dims <= 1 && ds4q_can_quantize(type) && type != src->type) {
+            fprintf(stderr, "1d-guard: %s keeps source type\n", src->name);
+            type = src->type;
+        }
         if (type != DS4Q_TYPE_I32 && !is_quantizable_target(type)) die("unsupported planned tensor type");
-        if (ds4q_can_quantize(type) && src->ne[0] % ds4q_block_size(type) != 0) die("ne[0] not divisible by block size");
+        if (ds4q_can_quantize(type) && src->ne[0] % ds4q_block_size(type) != 0) {
+            fprintf(stderr, "block-size fallback: %s ne0=%lld type=%d -> keep source type %d\n",
+                    src->name, (long long)src->ne[0], (int)type, (int)src->type);
+            type = src->type;
+            if (ds4q_can_quantize(type) && src->ne[0] % ds4q_block_size(type) != 0)
+                die("ne[0] not divisible by block size (even at source type)");
+        }
         /* Hot mask shrinks the routed-expert dim (last) of exps tensors, incl.
          * the MTP draft block (mtp.0) when a matched MTP mask is supplied. */
         if (hm && hm->active) {
@@ -2193,6 +2337,8 @@ typedef struct {
     int layers_lo;        /* --layers lo-hi cluster split; -1 = all */
     int layers_hi;
     char *manifest_file;  /* --manifest: written-tensor {name,offset,bytes} list */
+    int mtp_append;       /* --mtp-append: 注入 DSpark drafter(mtp.0..N-1) 张量 */
+    int mtp_only;         /* --mtp-only: 输出仅保留 mtp.* 张量(独立 drafter 文件, 对齐官方开源形态) */
 } params;
 
 static void usage(const char *argv0) {
@@ -2201,6 +2347,8 @@ static void usage(const char *argv0) {
     printf("options:\n");
     printf("  --hf DIR               Hugging Face model directory with model.safetensors.index.json\n");
     printf("  --template FILE        existing DS4 GGUF used for metadata, tensor order, shapes\n");
+    printf("  --mtp-append N         inject DSpark drafter tensors (mtp.0..N-1) absent from template\n");
+    printf("  --mtp-only             emit ONLY mtp.* tensors (standalone drafter file)\n");
     printf("  --out FILE             output GGUF path\n");
     printf("  --compare-gguf FILE    reference GGUF for --compare-tensor, default template\n");
     printf("  --compare-tensor NAME  regenerate one tensor, byte-compare, and exit\n");
@@ -2266,6 +2414,10 @@ static params parse_args(int argc, char **argv) {
             exit(0);
         } else if (strcmp(arg, "--hf") == 0) {
             p.hf_dir = need_value(argc, argv, &i, arg);
+        } else if (strcmp(arg, "--mtp-append") == 0) {
+            p.mtp_append = atoi(need_value(argc, argv, &i, arg));
+        } else if (strcmp(arg, "--mtp-only") == 0) {
+            p.mtp_only = 1;
         } else if (strcmp(arg, "--template") == 0) {
             p.template_gguf = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--out") == 0) {
@@ -2413,6 +2565,8 @@ int main(int argc, char **argv) {
     if (p.imatrix_file) imatrix_load(&imatrix, p.imatrix_file, p.imatrix_strict);
 
     gguf_file tmpl = load_gguf_metadata(p.template_gguf);
+    if (p.mtp_append > 0) append_mtp_tensors(&tmpl, p.hf_dir, p.mtp_append);
+    if (p.mtp_only) keep_mtp_only(&tmpl);
     if (p.n_experts <= 0) {
         if (tmpl.n_experts > 0) {
             p.n_experts = tmpl.n_experts;

@@ -27,14 +27,6 @@ void ds4_dist_tp_free(ds4_dist_tp *tp);
 ds4_dist_tp *ds4_engine_tp(ds4_engine *e); /* implemented in ds4.c */
 int ds4_dist_tp_selftest(void); /* in-process loopback correctness check */
 
-/* n-gram copy-spec drafter (prompt-lookup): scan seq[0..len-1] for the longest
- * suffix that occurred earlier (anchor >= min_g), copy up to `cap` continuation
- * tokens into out[]. Returns the anchor length (0 = no usable match). Pure
- * function; the single-machine speculative path in ds4.c reuses it so the local
- * and distributed copy-spec producers draft identically. */
-uint32_t ds4_copy_spec_match(const int *seq, uint32_t len, uint32_t min_g,
-                             uint32_t cap, int *out, uint32_t *out_n,
-                             uint32_t *out_src);
 
 /* Options used by standalone `./ds4 --role coordinator -p ...` generation.
  * Interactive tools and the server go through the normal ds4_session API.

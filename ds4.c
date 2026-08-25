@@ -39,7 +39,6 @@
 
 #include "ds4.h"
 #include "ds4_distributed.h"
-#include "ds4_mtp.h"
 #include "ds4_multimodal.h"
 #include "ds4_zchain.h"
 #include "ds4_spatial.h"
@@ -1751,8 +1750,75 @@ void model_open(ds4_model *m, const char *path, bool metal_mapping,
      * avoids that VM accounting path while preserving normal file-backed reads.
      */
     const int mmap_flags = metal_mapping ? MAP_SHARED : MAP_PRIVATE;
-    void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, mmap_flags, fd, 0);
+    void *map = MAP_FAILED;
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+    /* 先丢掉本文件已有的 page cache 页, 再带 MADV_HUGEPAGE 映射 —— 否则内核会拿
+     * cache 里现成的 4KiB 页直接用, 大页永远只覆盖新读入的那部分(实测卡在 12-16%)。
+     * POSIX_FADV_DONTNEED 只作用于这一个 fd 对应的文件, 是进程级操作, 不需要特权。 */
+    if (getenv("DS4_NO_HUGEPAGE") == NULL)
+        (void)posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+#endif
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+    /* ★2MiB 对齐映射★: 文件页 THP 要求虚拟地址按大页对齐(文件偏移 0 本就满足),
+     * 否则整段退回 4KiB。内核给的地址通常不对齐, 实测大页覆盖率只有 8.5%。
+     * 做法: 先占一段带余量的匿名区探出对齐地址, 再 MAP_FIXED 把文件映上去 ——
+     * MAP_FIXED 直接覆盖占位区, 中间没有别的线程能插进来抢地址。 */
+    if (getenv("DS4_NO_HUGEPAGE") == NULL) {
+        const size_t HP = 2u * 1024u * 1024u;
+        const size_t want = (size_t)st.st_size;
+        void *probe = mmap(NULL, want + HP, PROT_NONE,
+                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (probe != MAP_FAILED) {
+            uintptr_t base = (uintptr_t)probe;
+            uintptr_t aligned = (base + HP - 1u) & ~(uintptr_t)(HP - 1u);
+            void *fixed = mmap((void *)aligned, want, PROT_READ,
+                               mmap_flags | MAP_FIXED, fd, 0);
+            if (fixed != MAP_FAILED) {
+                if (aligned > base) (void)munmap(probe, (size_t)(aligned - base));
+                const uintptr_t tail = aligned + want;
+                const uintptr_t probe_end = base + want + HP;
+                if (probe_end > tail) (void)munmap((void *)tail, (size_t)(probe_end - tail));
+                map = fixed;
+            } else {
+                (void)munmap(probe, want + HP);
+            }
+        }
+    }
+#endif
+    if (map == MAP_FAILED)
+        map = mmap(NULL, (size_t)st.st_size, PROT_READ, mmap_flags, fd, 0);
     if (map == MAP_FAILED) ds4_die_errno("cannot mmap model", path);
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+    /* ★大页★: GB10 这类统一内存机器上 GPU 直接走 host 页表访问权重
+     * (PageableMemoryAccess=1 且 UsesHostPageTables=1)。90 GiB 模型按 4KiB 页就是
+     * 2200 万个页表项, TLB 完全装不下 —— 每次专家读都在做地址翻译, 表现为 GPU 利用率
+     * 只有 6% 而 CPU/GPU/磁盘全都不忙。本机 THP 是 madvise 模式(不显式要就永远 4KiB),
+     * 故此处显式请求; 内核不支持文件页 THP 时该调用无害地失败。 */
+    if (getenv("DS4_NO_HUGEPAGE") == NULL) {
+        (void)madvise(map, (size_t)st.st_size, MADV_HUGEPAGE);
+        /* MADV_HUGEPAGE 只影响"之后新读入"的页; 已在 page cache 里的 4KiB 页不会自动
+         * 合并(khugepaged 每 10s 才扫 16MiB, 对 90GiB 等于没有)。MADV_COLLAPSE(6.1+)
+         * 主动就地合并, 是把覆盖率从个位数推上去的唯一手段。它是同步的, 分段做并允许
+         * 单段失败(碎片导致某段凑不出连续 2MiB 很正常, 跳过即可)。 */
+#ifndef MADV_COLLAPSE
+#define MADV_COLLAPSE 25
+#endif
+        if (getenv("DS4_NO_HUGEPAGE_COLLAPSE") == NULL) {
+            const size_t CH = 512u * 1024u * 1024u;   /* 每次 512MiB, 避免一次长阻塞 */
+            const double ct0 = now_sec();
+            size_t done = 0, ok_bytes = 0;
+            while (done < (size_t)st.st_size) {
+                size_t n = (size_t)st.st_size - done;
+                if (n > CH) n = CH;
+                if (madvise((char *)map + done, n, MADV_COLLAPSE) == 0) ok_bytes += n;
+                done += n;
+            }
+            if (getenv("DS4_HUGEPAGE_VERBOSE"))
+                fprintf(stderr, "ds4: MADV_COLLAPSE %.1f/%.1f GiB in %.2fs\n",
+                        ok_bytes / 1073741824.0, st.st_size / 1073741824.0, now_sec() - ct0);
+        }
+    }
+#endif
 
     m->fd = fd;
     m->map = map;
@@ -1770,36 +1836,12 @@ void model_open(ds4_model *m, const char *path, bool metal_mapping,
 
     parse_metadata(m, &c);
     parse_tensors(m, &c);
-    /* Strict 1/2-bit (go1b/go2b) experts sit at the numeric edge: fast-math /
-     * cross-GPU drift flips near-tie logits into word soup, and un-penalized
-     * greedy decode loops (measured 2026-07-06, dual-host mono; the proven
-     * recipe is mono_dual_run.sh's strict IEEE-754 + f32 raw KV + exp2/log2
-     * rope + freq repeat penalty). Arm those numeric-safety defaults from the
-     * MODEL, not the launch script, so the model works under any launcher.
-     * setenv(overwrite=0): an explicit env always wins. Must run before the
-     * first GPU call below -- these feed Metal library compile macros.
-     * Base-model opens only (g_model_open_arm_env_defaults): a go-family
-     * support model (--mtp draft, sidecars) must not arm the base process. */
-    if (g_model_open_arm_env_defaults)
-    for (uint64_t i = 0; i < m->n_tensors; i++) {
-        const uint32_t ty = m->tensors[i].type;
-        if (ty == DS4_TENSOR_GO1B || ty == DS4_TENSOR_GO2B) {
-            setenv("DS4_METAL_MATH_SAFE", "1", 0);
-            setenv("DS4_METAL_KV_RAW_F32", "1", 0);
-            setenv("DS4_METAL_ROPE_EXP2_LOG2", "1", 0);
-            /* REPEAT_FREQ=1 is the mono/go2b recipe (2026-07-06). For go1b the
-             * coherent probability mass is so narrow that freq=1 greedy decode
-             * collapses into symbol soup (measured 2026-07-13: penalty off =>
-             * coherent-then-loop, freq=1 => junk) -- do not arm it for 1-bit. */
-            if (ty == DS4_TENSOR_GO2B) setenv("DS4_REPEAT_FREQ", "1", 0);
-            fprintf(stderr,
-                    "ds4: strict 1/2-bit (go1b/go2b) experts detected -- numeric-safety "
-                    "defaults armed (MATH_SAFE, KV_RAW_F32, ROPE_EXP2_LOG2%s; "
-                    "explicit env overrides)\n",
-                    ty == DS4_TENSOR_GO2B ? ", REPEAT_FREQ=1" : "");
-            break;
-        }
-    }
+    /* ★模型嗅探自动武装已删除(2026-08-05 用户铁律)★: "带环境变量控制模型本身的代码
+     * 不应该存在, 定型硬编码优化在模型变化的时候肯定是 bug"。旧块按 go1b/go2b 张量类型
+     * setenv(MATH_SAFE/KV_RAW_F32/ROPE_EXP2_LOG2, GO2B 另加 REPEAT_FREQ=1) — 那是
+     * 2026-07 超低比特 mono 时代的定型配方, 对高保真新模型(r64 top1 71.4 vs FP 71.7)
+     * 是错配毒药(实测: REPEAT_FREQ=1 令生成空)。行为只由显式 env/配置决定; 需要数值
+     * 安全的 launcher 自己显式设, 引擎不替模型做主。 */
     load_expert_keep_map(m);
 #ifndef DS4_NO_GPU
     /* Upload the reduced-expert routing LUT to the GPU so routed-MoE matvecs can
@@ -1967,8 +2009,29 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
             return false;
         }
         /* Routed-expert weights are the only tensors with "_exps." in the
-         * name; memmem is safe on short names (returns NULL). */
-        if (memmem(t->name.ptr, t->name.len, "_exps.", 6) != NULL) {
+         * name; memmem is safe on short names (returns NULL).
+         * ★DS4_CACHE_EXPERTS=1 收编专家★: 上面"缓存冷专家浪费预算"的前提是显存
+         * 远小于模型(独显 24-80GB vs 89GB)。统一内存机器(GB10 121GiB)整模型装得下,
+         * 此时跳过反而让每次专家读都跨 C2C 去 host 内存 —— 实测 GPU 利用率被按在 6%,
+         * CPU 同时也闲着。开启需同时抬高 DS4_CUDA_WEIGHT_CACHE_LIMIT_GB(默认 24)。 */
+        static int cache_exps = -1;
+        if (cache_exps < 0) {
+            const char *ce = getenv("DS4_CACHE_EXPERTS");
+            if (ce && ce[0]) {
+                cache_exps = (ce[0] == '1') ? 1 : 0;
+            } else {
+#ifdef DS4_CUDA_SPARK_HBM_CACHE
+                /* GB10 默认收编专家(实测 decode 26.8→28.7): 内存账=模型+20GiB 余量
+                 * 装得下才开, 装不下回退老策略(只缓 backbone) */
+                const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
+                const uint64_t total = (uint64_t)sysconf(_SC_PHYS_PAGES) * page;
+                cache_exps = (m->size + 20ull * 1073741824ull <= total) ? 1 : 0;
+#else
+                cache_exps = 0;
+#endif
+            }
+        }
+        if (!cache_exps && memmem(t->name.ptr, t->name.len, "_exps.", 6) != NULL) {
             continue;
         }
         spans[nspan++] = (accelerator_tensor_span){
@@ -1982,16 +2045,28 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
     uint64_t cached = 0;
     uint64_t merged = 0;
     for (uint64_t i = 0; i < nspan;) {
-        uint64_t off = spans[i].off;
+        /* group: contiguous tensors with gaps <= 64 KiB */
+        const uint64_t g0 = i;
         uint64_t end = spans[i].end;
         i++;
-        while (i < nspan && spans[i].off <= end + 65536u && spans[i].end - off <= max_span) {
+        while (i < nspan && spans[i].off <= end + 65536u) {
             if (spans[i].end > end) end = spans[i].end;
             i++;
         }
-        while (off < end) {
-            uint64_t chunk_end = end;
-            if (chunk_end - off > max_span) chunk_end = off + max_span;
+        /* Pack the group's tensors into chunks WITHOUT splitting any single
+         * tensor: a device-side consumer (e.g. the VQ expert blob relocation)
+         * needs each tensor's bytes virtually contiguous in one cudaMalloc
+         * block.  A tensor larger than max_span becomes its own whole chunk
+         * (the arena allocator grows to fit). */
+        uint64_t j = g0;
+        while (j < i) {
+            const uint64_t off = spans[j].off;
+            uint64_t chunk_end = spans[j].end;
+            j++;
+            while (j < i && spans[j].end - off <= max_span) {
+                if (spans[j].end > chunk_end) chunk_end = spans[j].end;
+                j++;
+            }
             char label[96];
             snprintf(label, sizeof(label), "tensor-span:%" PRIu64, merged);
             if (ds4_gpu_cache_model_range(m->map, m->size, off, chunk_end - off, label) == 0) {
@@ -2004,7 +2079,6 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
             }
             cached += chunk_end - off;
             merged++;
-            off = chunk_end;
         }
     }
     free(spans);
@@ -2013,7 +2087,11 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
 }
 #endif
 
+/* CUDA 默认 prefill 分块(见 ds4_default_prefill_cap_for_prompt 的实测注释); 0=未定 */
+static int g_prefill_chunk_cuda = 0;
+
 static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m) {
+    if (backend == DS4_BACKEND_CUDA && g_prefill_chunk_cuda == 0) g_prefill_chunk_cuda = 256;
     if (backend != DS4_BACKEND_CUDA) return true;
     if (!m || !m->map || m->size == 0) return false;
     if (getenv("DS4_CUDA_DIRECT_MODEL") != NULL) {
@@ -2044,6 +2122,19 @@ static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model
         }
     }
 #ifdef DS4_CUDA_SPARK_HBM_CACHE
+    {   /* q8 repack 预建(decode gemv 快路): 必须先于 token graph capture */
+        uint64_t q8r_bytes = 0;
+        for (uint64_t i = 0; i < m->n_tensors; i++) {
+            const ds4_tensor *t = &m->tensors[i];
+            if (t->type != DS4_TENSOR_Q8_0 || t->ndim != 2 || t->bytes == 0) continue;
+            if (memmem(t->name.ptr, t->name.len, "_exps.", 6) != NULL) continue;
+            if (ds4_gpu_q8r_preload(m->map, m->size, t->abs_offset, t->dim[0], t->dim[1]))
+                q8r_bytes += t->bytes;
+        }
+        if (q8r_bytes)
+            fprintf(stderr, "ds4: CUDA q8 repack preloaded %.2f GiB\n",
+                    (double)q8r_bytes / 1073741824.0);
+    }
     if (cached != 0) {
         const double t1 = now_sec();
         if (ds4_log_is_tty(stderr)) fputc('\n', stderr);
@@ -2096,6 +2187,10 @@ static void residual_free(struct ds4_residual *r) {
 
 /* v2.2 直读 VQ 侧车目录(DS4_VQ_DIR): 逐层 mmap dql_vq_L%02d.bin(DQVL 校验), 零复制。
  * 盘账动机: overlay GGUF 需复制 34.5G 侧车字节, 战役机放不下; 直读=同字节同语义。 */
+/* ★VQ blob 在场(2026-08-01): 专家字节全在 blk.L.ffn_exps_vq.blob 里, 前向走 CPU gather →
+ * f16 scratch → GPU, blob 本身不进 Metal span; 且 --no-down 合并的文件里 gate/up 缺席、
+ * down 是 bytes=0 影子张量 ⇒ experts span 必然为空, 不是切分失败。 */
+static bool g_vq_experts_blob;
 static struct ds4_residual *vq_dir_load(const char *dir) {
     struct ds4_residual *r = xcalloc(1, sizeof(*r));
     uint32_t loaded = 0;
@@ -2116,6 +2211,7 @@ static struct ds4_residual *vq_dir_load(const char *dir) {
     }
     if (!loaded) { free(r); return NULL; }
     r->present = true;
+    g_vq_experts_blob = true;
     fprintf(stderr, "ds4: v2.2 VQ 侧车直读 %s (%u 层)\n", dir, loaded);
     return r;
 }
@@ -2144,6 +2240,7 @@ static struct ds4_residual *vq_model_load(const ds4_model *m) {
     }
     if (!loaded) { free(r); return NULL; }
     r->present = true;
+    g_vq_experts_blob = true;
     fprintf(stderr, "ds4: 合一 GGUF 内嵌 VQ blob 装载 (%u 层)\n", loaded);
     return r;
 }
@@ -2251,6 +2348,9 @@ static struct ds4_zchain *zchain_from_model(const ds4_model *m) {
                         const int blk = (int)f[15];
                         if (blk < 0 || !v8 ||
                             (uint64_t)(blk + 1) * 8u * DS4_N_EMBD > (tv ? tv->dim[0] : 0)) {
+                            fprintf(stderr, "ds4: zchain L%u dyn8 dropped: blk=%d v8=%d dim0=%llu need=%llu\n",
+                                    il, blk, v8 != NULL, (unsigned long long)(tv ? tv->dim[0] : 0),
+                                    (unsigned long long)((uint64_t)(blk + 1) * 8u * DS4_N_EMBD));
                             continue;   /* V8-less dyn8 = quantizer-replay no-op: drop */
                         }
                         o->v8 = v8 + (size_t)blk * 8u * DS4_N_EMBD;
@@ -2258,7 +2358,7 @@ static struct ds4_zchain *zchain_from_model(const ds4_model *m) {
                     if (o->type == 6u) {   /* 冻结 z^L: 槽{f[1]=tr,f[2]=k} + opt_zlm 张量; 不进 λ 链 */
                         const uint32_t zk = (uint32_t)f[2];
                         const uint64_t nh = (uint64_t)zk + 2ull * zk * DS4_N_EMBD;
-                        if (zk > 0 && zk <= 16 && zlm && (tzl ? tzl->dim[0] : 0) >= nh) {
+                        if (zk > 0 && zk <= 1024 && zlm && (tzl ? tzl->dim[0] : 0) >= nh) {
                             z->layer[il].zl.zlk = zk;
                             z->layer[il].zl.zltr = f[1];
                             z->layer[il].zl.zlm = zlm;   /* aliases model mmap */
@@ -2288,15 +2388,18 @@ static const ds4_gpu_residual_set *residual_set_for(const ds4_model *m, uint32_t
     if (!m || !m->residual || !m->residual->present ||
         il >= DS4_MAX_LAYER || !m->residual->layer[il].present) return NULL;
     const ds4_residual_layer *rl = &m->residual->layer[il];
+    /* rs 是跨层复用的静态, 每条分支都要写全判别位, 否则上一层的取值会漏进本层。 */
     if (rl->vq_raw) {   /* 直读侧车: blob 即三矩阵之源 */
         rs.gate_ptr = rs.up_ptr = rs.down_ptr = rl->vq_raw;
         rs.lut = NULL; rs.merged2b = 0; rs.vq = 1;
+        rs.vq_bytes = (uint64_t)rl->vq_sz;
         return &rs;
     }
     if (!rl->gate || !rl->up || !rl->down) return NULL;
     rs.gate_ptr = tensor_data(&m->residual->sidecar, rl->gate);
     rs.up_ptr   = tensor_data(&m->residual->sidecar, rl->up);
     rs.down_ptr = tensor_data(&m->residual->sidecar, rl->down);
+    rs.vq_bytes = 0;
     if (!rs.gate_ptr || !rs.up_ptr || !rs.down_ptr) return NULL;
     rs.lut = rl->lut ? (const float *)tensor_data(&m->residual->sidecar, rl->lut) : NULL;
     /* Type 41 = go2b (offline-merged base+residual, R5-C): the metal path runs the
@@ -2304,6 +2407,54 @@ static const ds4_gpu_residual_set *residual_set_for(const ds4_model *m, uint32_t
     rs.merged2b = (rl->gate->type == 41u);
     rs.vq = (rl->gate->type == 42u);
     return &rs;
+}
+
+/* dense matmul 的类型分发(backbone-q4k 配方): 同一批调用点此前硬编码 q8_0。
+ * Q4_K 走新的 ds4_gpu_matmul_q4_K_tensor(CUDA; Metal 返回 0 即向上抛失败)。 */
+static int dense_matmul_typed(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor *w,
+                              uint64_t in_dim, uint64_t out_dim,
+                              const ds4_gpu_tensor *x, uint64_t n_tok) {
+    if (w->type == DS4_TENSOR_Q4_K)
+        return ds4_gpu_matmul_q4_K_tensor(out, m->map, m->size, w->abs_offset,
+                                          in_dim, out_dim, x, n_tok);
+    if (w->type == DS4_TENSOR_Q2_K)   /* 全q2 基座(2026-08-19) */
+        return ds4_gpu_matmul_q2_K_tensor(out, m->map, m->size, w->abs_offset,
+                                          in_dim, out_dim, x, n_tok);
+    return ds4_gpu_matmul_q8_0_tensor(out, m->map, m->size, w->abs_offset,
+                                      in_dim, out_dim, x, n_tok);
+}
+
+/* decode 同输入矩阵对(q_a+kv / shared gate+up): 两权重都 q4_K 时一次量化+一次发射;
+ * 其他形态(q8/metal/批量)回退两次单矩阵。 */
+static int dense_matmul_pair_typed(ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
+                                   const ds4_model *m,
+                                   const ds4_tensor *w0, const ds4_tensor *w1,
+                                   uint64_t in_dim, uint64_t out0_dim, uint64_t out1_dim,
+                                   const ds4_gpu_tensor *x) {
+    if (w0->type == DS4_TENSOR_Q4_K && w1->type == DS4_TENSOR_Q4_K &&
+        ds4_gpu_matmul_q4_K_pair_tensor(out0, out1, m->map, m->size,
+                                        w0->abs_offset, w1->abs_offset,
+                                        in_dim, out0_dim, out1_dim, x))
+        return 1;
+    if (w0->type == DS4_TENSOR_Q2_K && w1->type == DS4_TENSOR_Q2_K &&
+        ds4_gpu_matmul_q2_K_pair_tensor(out0, out1, m->map, m->size,
+                                        w0->abs_offset, w1->abs_offset,
+                                        in_dim, out0_dim, out1_dim, x))
+        return 1;
+    return dense_matmul_typed(out0, m, w0, in_dim, out0_dim, x, 1) &&
+           dense_matmul_typed(out1, m, w1, in_dim, out1_dim, x, 1);
+}
+
+/* attn_output 批量入口按 a 张量类型分发(q4_K/q2_K 同参; 2026-08-19 全q2)。 */
+static int attn_output_kq_batch(const ds4_tensor *a, ds4_gpu_tensor *out, ds4_gpu_tensor *low,
+                                const void *map, uint64_t msize, uint64_t offb,
+                                uint64_t group_dim, uint64_t rank, uint32_t n_groups,
+                                uint64_t out_dim, const ds4_gpu_tensor *heads, uint32_t n_tokens) {
+    return a->type == DS4_TENSOR_Q2_K
+        ? ds4_gpu_attention_output_q2k_batch_tensor(out, low, map, msize, a->abs_offset, offb,
+                                                    group_dim, rank, n_groups, out_dim, heads, n_tokens)
+        : ds4_gpu_attention_output_q4k_batch_tensor(out, low, map, msize, a->abs_offset, offb,
+                                                    group_dim, rank, n_groups, out_dim, heads, n_tokens);
 }
 
 /* Pack the host-side zchain into the flat GPU tables (layout: ds4_gpu.h).
@@ -2354,24 +2505,52 @@ static int zchain_gpu_upload(const struct ds4_zchain *z) {
     /* frozen z^L (type 6): concat fp16 factor blocks + per-layer meta */
     if (r) {
         uint64_t total = 0; uint32_t nz = 0;
-        for (uint32_t l = 0; l < nl; l++) if (z->layer[l].zl.zlk)
-            { total += (uint64_t)z->layer[l].zl.zlk * (1u + 2u * dm); nz++; }
+        for (uint32_t l = 0; l < nl; l++) if (z->layer[l].zl.zlk) {
+            const uint32_t di = z->layer[l].zl.zdin ? z->layer[l].zl.zdin : dm;
+            total += (uint64_t)z->layer[l].zl.zlk * (1u + dm + di); nz++; }
         if (nz) {
             uint16_t *zlm = xmalloc(total * sizeof(uint16_t));
             uint32_t *zo = xcalloc(nl, sizeof(uint32_t));
             uint32_t *zk = xcalloc(nl, sizeof(uint32_t));
+            uint32_t *zd = xcalloc(nl, sizeof(uint32_t));
             float    *zt = xcalloc(nl, sizeof(float));
+            uint32_t *zm = xcalloc(nl, sizeof(uint32_t));
             uint64_t cur = 0;
             for (uint32_t l = 0; l < nl; l++) {
                 const ds4_zchain_zl *lz = &z->layer[l].zl;
                 if (!lz->zlk) continue;
-                const uint64_t nh = (uint64_t)lz->zlk * (1u + 2u * dm);
+                const uint32_t di = lz->zdin ? lz->zdin : dm;
+                const uint64_t nh = (uint64_t)lz->zlk * (1u + dm + di);
                 memcpy(zlm + cur, lz->zlm, nh * sizeof(uint16_t));
-                zo[l] = (uint32_t)cur; zk[l] = lz->zlk; zt[l] = lz->zltr;
+                zo[l] = (uint32_t)cur; zk[l] = lz->zlk; zd[l] = di; zt[l] = lz->zltr;
+                zm[l] = lz->zmul;
                 cur += nh;
             }
-            r = ds4_gpu_zchain_zl_set(zlm, zo, zk, zt, nl, total);
-            free(zlm); free(zo); free(zk); free(zt);
+            r = ds4_gpu_zchain_zl_set(zlm, zo, zk, zd, zt, zm, nl, total);
+            free(zlm); free(zo); free(zk); free(zd); free(zt); free(zm);
+        }
+    }
+    /* 路由闭式侧车(type8): z^L 同款 concat 上传, blob = z[k]|U[ne*k]|V[din*k] */
+    if (r) {
+        uint64_t total = 0; uint32_t nr = 0;
+        for (uint32_t l = 0; l < nl; l++) if (z->layer[l].rte.zlk) {
+            total += (uint64_t)z->layer[l].rte.zlk * (1u + ne + z->layer[l].rte.zdin); nr++; }
+        if (nr) {
+            uint16_t *rm = xmalloc(total * sizeof(uint16_t));
+            uint32_t *ro = xcalloc(nl, sizeof(uint32_t));
+            uint32_t *rk = xcalloc(nl, sizeof(uint32_t));
+            float    *rt = xcalloc(nl, sizeof(float));
+            uint64_t cur = 0;
+            for (uint32_t l = 0; l < nl; l++) {
+                const ds4_zchain_zl *lr = &z->layer[l].rte;
+                if (!lr->zlk) continue;
+                const uint64_t nh = (uint64_t)lr->zlk * (1u + ne + lr->zdin);
+                memcpy(rm + cur, lr->zlm, nh * sizeof(uint16_t));
+                ro[l] = (uint32_t)cur; rk[l] = lr->zlk; rt[l] = lr->zltr;
+                cur += nh;
+            }
+            r = ds4_gpu_zchain_rte_set(rm, ro, rk, rt, nl, ne, total);
+            free(rm); free(ro); free(rk); free(rt);
         }
     }
     free(ops); free(v8); free(ge); free(loff); free(gep);
@@ -3026,6 +3205,29 @@ typedef struct {
     ds4_layer_weights block;
 } ds4_mtp_weights;
 
+/* 0731 官方 DSpark drafter(块并行 5-token, 共享主模型 embd/lm_head):
+ * mtp.0..2 三个完整 V4 层 + main_proj(target-hidden 融合) + confidence/markov 头。
+ * 张量由量化器 --mtp-append 注入主 GGUF(v3+); 缺席 ⇒ ready=false, 纯解码不受扰。 */
+#define DS4_DSPARK_MAX_BLOCKS 3
+typedef struct {
+    ds4_tensor *main_proj;
+    ds4_tensor *main_norm;
+    ds4_tensor *confidence_proj;   /* 可缺(置信门) */
+    ds4_tensor *markov_w1;         /* 可缺(块内半自回归头) */
+    ds4_tensor *markov_w2;
+    ds4_tensor *norm;              /* 出口 norm */
+    ds4_tensor *hc_head_base;
+    ds4_tensor *hc_head_fn;
+    ds4_tensor *hc_head_scale;
+    ds4_layer_weights block[DS4_DSPARK_MAX_BLOCKS];
+    int n_blocks;
+    bool ready;
+    const ds4_model *src;      /* drafter 张量所属 model(主 model 或 DS4_DRAFT_GGUF 副文件) */
+    const ds4_model *head_src; /* 出口侧(norm/hc_head_*)张量所属 model: 官方语义 drafter 复用
+                                * 主模型 head(self.mtp[-1].head = self.head), checkpoint 的
+                                * mtp.* 命名空间不含这些 ⇒ 独立 drafter 文件时从主模型借 */
+} ds4_dspark_weights;
+
 /* =========================================================================
  * Fixed Weight Binding and Model Validation.
  * =========================================================================
@@ -3140,27 +3342,6 @@ static void tensor_expect_optional(
     if (t) tensor_expect_layout(t, type, ndim, d0, d1, d2);
 }
 
-static void tensor_expect_plain_layout(
-        const ds4_tensor *t,
-        uint32_t          ndim,
-        uint64_t          d0,
-        uint64_t          d1,
-        uint64_t          d2) {
-    if (!t) return;  /* sharded per-machine slice: tensors for the other machine's
-                      * layers (and the head half not held here) are absent -> skip.
-                      * Present layers are still validated; weights_bind's
-                      * required_tensorf guarantees a present layer is complete. */
-    if (t->type != DS4_TENSOR_F16 && t->type != DS4_TENSOR_F32) {
-        fprintf(stderr,
-                "ds4: tensor %.*s has type %s, expected F16 or F32\n",
-                (int)t->name.len,
-                t->name.ptr,
-                tensor_type_name(t->type));
-        exit(1);
-    }
-    tensor_expect_layout(t, t->type, ndim, d0, d1, d2);
-}
-
 static bool tensor_is_routed_expert_type(uint32_t type) {
     return type == DS4_TENSOR_IQ2_XXS ||
            type == DS4_TENSOR_Q2_K ||
@@ -3249,18 +3430,69 @@ static uint64_t routed_expert_up_off(const ds4_layer_weights *l) {
     return l->ffn_up_exps ? l->ffn_up_exps->abs_offset : 0;
 }
 
+/* R28 VQ(2026-07-31): 计划表 w2dim>0 时冷 w2 的 VQ 载荷也在层 blob 里(槽 which=2),
+ * 于是 base 的 ffn_down_exps(go1b 死重, 43 层 11.42 GiB)不再入合一文件 —— 这是 28 GiB
+ * 总量能成立的前提。缺席时合成一个"影子张量": 形状/类型按 DS4 常量填, bytes=0 且
+ * abs_offset=0。span 构建见 bytes==0 即跳过(model_map_span_include_tensor), 所以一个
+ * 字节都不会被 mmap、也不进 Metal residency; 而图/校验/分布式里三十余处 ->dim/->type
+ * 解引用语义完全不变, 不必逐点加 NULL 判(那种改法漏一处就是运行期空指针)。
+ * 唯一真去读 down 字节的是 VQ gather 的冷-w2-回退分支(blob 槽为 0 时从 base go1b 展开
+ * ±d), 那里按 down_expert_bytes==0 硬失败, 不静默降级成垃圾权重。 */
+static ds4_tensor *routed_down_shadow(uint32_t il) {
+    static ds4_tensor *shadow;      /* [DS4_N_LAYER]; DS4_N_LAYER 是运行期形状, 故堆分配 */
+    static char (*names)[40];
+    if (!shadow) {
+        shadow = xcalloc(DS4_N_LAYER, sizeof(*shadow));
+        names  = xcalloc(DS4_N_LAYER, sizeof(*names));
+    }
+    ds4_tensor *t = &shadow[il];
+    if (t->ndim == 0) {
+        int n = snprintf(names[il], sizeof(names[il]), "blk.%u.ffn_down_exps.weight", il);
+        t->name.ptr = names[il];
+        t->name.len = (uint64_t)(n < 0 ? 0 : n);
+        t->ndim = 3;
+        t->dim[0] = DS4_N_FF_EXP;   /* down_in_dim  = 专家中间维 */
+        t->dim[1] = DS4_N_EMBD;     /* routed_out_dim = 残差流维 */
+        t->dim[2] = DS4_N_EXPERT;
+        t->type = DS4_TENSOR_GO1B;  /* dispatch 与 gate/up 缺席时同口径 */
+        t->elements = t->dim[0] * t->dim[1] * t->dim[2];
+        t->rel_offset = t->abs_offset = t->bytes = 0;
+    }
+    return t;
+}
+
+/* 全q2(2026-08-19): f16 专线家族允许 Q2_K, 装载即注册 f16 影子(引擎适配, 文件全 q2)。 */
+static void tensor_expect_f16_q2(const ds4_model *m, ds4_tensor *t, uint64_t d0, uint64_t d1) {
+    if (t && t->type == DS4_TENSOR_Q2_K) {
+        tensor_expect_layout(t, DS4_TENSOR_Q2_K, 2, d0, d1, 0);
+#ifndef DS4_NO_GPU
+        if (!ds4_gpu_register_q2k_f16_shadow(m->map, m->size, t->abs_offset, d1, d0))
+            ds4_die("全q2: f16 影子注册失败(行长须为256倍数且显存足)");
+        /* 数据面已由影子替换成 f16(range_ptr 按 offset 命中优先于一切界检), 类型面必须
+         * 跟着翻——图编码把 t->type 一路传给 GPU 分发, 留着 q2_k 会被 f16 专线 kernel
+         * 拒收(L2 首个压缩层 attention_batch 静默失败即此)。t->bytes 保持文件真值,
+         * span/mmap 账仍按 q2 字节算。 */
+        t->type = DS4_TENSOR_F16;
+#else
+        ds4_die("全q2 模型的 f16 专线家族需 GPU 后端(CPU 参考未适配)");
+#endif
+    } else {
+        tensor_expect_layout(t, DS4_TENSOR_F16, 2, d0, d1, 0);
+    }
+}
+
 static void weights_validate_layout(const ds4_model *m, const ds4_weights *w) {
     const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
     const uint64_t hc_mix_dim = 2u * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint64_t out_low_dim = (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O;
 
-    tensor_expect_layout(w->token_embd,      DS4_TENSOR_F16,  2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+    tensor_expect_f16_q2(m, w->token_embd, DS4_N_EMBD, DS4_N_VOCAB);
     tensor_expect_layout(w->output_hc_base,  DS4_TENSOR_F32,  1, DS4_N_HC, 0, 0);
-    tensor_expect_layout(w->output_hc_fn,    DS4_TENSOR_F16,  2, hc_dim, DS4_N_HC, 0);
+    tensor_expect_f16_q2(m, w->output_hc_fn, hc_dim, DS4_N_HC);
     tensor_expect_layout(w->output_hc_scale, DS4_TENSOR_F32,  1, 1, 0, 0);
     tensor_expect_layout(w->output_norm,     DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-    tensor_expect_layout(w->output,          DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+    tensor_expect_layout(w->output,          w->output && (w->output->type == DS4_TENSOR_Q4_K || w->output->type == DS4_TENSOR_Q2_K) ? w->output->type : DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
 
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
@@ -3272,43 +3504,43 @@ static void weights_validate_layout(const ds4_model *m, const ds4_weights *w) {
          * guards in tensor_expect_* are not enough on their own. */
         if (!l->attn_norm) continue;
 
-        tensor_expect_layout(l->hc_attn_fn,     DS4_TENSOR_F16,  2, hc_dim, hc_mix_dim, 0);
+        tensor_expect_f16_q2(m, l->hc_attn_fn, hc_dim, hc_mix_dim);
         tensor_expect_layout(l->hc_attn_scale,  DS4_TENSOR_F32,  1, 3, 0, 0);
         tensor_expect_layout(l->hc_attn_base,   DS4_TENSOR_F32,  1, hc_mix_dim, 0, 0);
         tensor_expect_layout(l->attn_norm,      DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-        tensor_expect_layout(l->attn_q_a,       DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_LORA_Q, 0);
+        tensor_expect_layout(l->attn_q_a,       l->attn_q_a && (l->attn_q_a->type == DS4_TENSOR_Q4_K || l->attn_q_a->type == DS4_TENSOR_Q2_K) ? l->attn_q_a->type : DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_LORA_Q, 0);
         tensor_expect_layout(l->attn_q_a_norm,  DS4_TENSOR_F32,  1, DS4_N_LORA_Q, 0, 0);
-        tensor_expect_layout(l->attn_q_b,       DS4_TENSOR_Q8_0, 2, DS4_N_LORA_Q, q_dim, 0);
-        tensor_expect_layout(l->attn_kv,        DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_HEAD_DIM, 0);
+        tensor_expect_layout(l->attn_q_b,       l->attn_q_b && (l->attn_q_b->type == DS4_TENSOR_Q4_K || l->attn_q_b->type == DS4_TENSOR_Q2_K) ? l->attn_q_b->type : DS4_TENSOR_Q8_0, 2, DS4_N_LORA_Q, q_dim, 0);
+        tensor_expect_layout(l->attn_kv,        l->attn_kv && (l->attn_kv->type == DS4_TENSOR_Q4_K || l->attn_kv->type == DS4_TENSOR_Q2_K) ? l->attn_kv->type : DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_HEAD_DIM, 0);
         tensor_expect_layout(l->attn_kv_a_norm, DS4_TENSOR_F32,  1, DS4_N_HEAD_DIM, 0, 0);
         tensor_expect_layout(l->attn_sinks,     DS4_TENSOR_F32,  1, DS4_N_HEAD, 0, 0);
-        tensor_expect_layout(l->attn_output_a,  DS4_TENSOR_Q8_0, 2, DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP), out_low_dim, 0);
-        tensor_expect_layout(l->attn_output_b,  DS4_TENSOR_Q8_0, 2, out_low_dim, DS4_N_EMBD, 0);
+        tensor_expect_layout(l->attn_output_a,  l->attn_output_a && (l->attn_output_a->type == DS4_TENSOR_Q4_K || l->attn_output_a->type == DS4_TENSOR_Q2_K) ? l->attn_output_a->type : DS4_TENSOR_Q8_0, 2, DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP), out_low_dim, 0);
+        tensor_expect_layout(l->attn_output_b,  l->attn_output_b && (l->attn_output_b->type == DS4_TENSOR_Q4_K || l->attn_output_b->type == DS4_TENSOR_Q2_K) ? l->attn_output_b->type : DS4_TENSOR_Q8_0, 2, out_low_dim, DS4_N_EMBD, 0);
 
         if (ratio != 0) {
             const uint32_t coff = ratio == 4 ? 2u : 1u;
             const uint64_t comp_width = (uint64_t)coff * DS4_N_HEAD_DIM;
-            tensor_expect_layout(l->attn_compressor_ape,  DS4_TENSOR_F16, 2, comp_width, ratio, 0);
-            tensor_expect_layout(l->attn_compressor_kv,   DS4_TENSOR_F16, 2, DS4_N_EMBD, comp_width, 0);
-            tensor_expect_layout(l->attn_compressor_gate, DS4_TENSOR_F16, 2, DS4_N_EMBD, comp_width, 0);
+            tensor_expect_f16_q2(m, l->attn_compressor_ape, comp_width, ratio);
+            tensor_expect_f16_q2(m, l->attn_compressor_kv, DS4_N_EMBD, comp_width);
+            tensor_expect_f16_q2(m, l->attn_compressor_gate, DS4_N_EMBD, comp_width);
             tensor_expect_layout(l->attn_compressor_norm, DS4_TENSOR_F32, 1, DS4_N_HEAD_DIM, 0, 0);
         }
         if (ratio == 4) {
             const uint64_t index_q_dim = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
             const uint64_t index_width = 2u * DS4_N_INDEXER_HEAD_DIM;
-            tensor_expect_layout(l->indexer_attn_q_b,          DS4_TENSOR_F16, 2, DS4_N_LORA_Q, index_q_dim, 0);
-            tensor_expect_layout(l->indexer_proj,              DS4_TENSOR_F16, 2, DS4_N_EMBD, DS4_N_INDEXER_HEAD, 0);
-            tensor_expect_layout(l->indexer_compressor_ape,    DS4_TENSOR_F16, 2, index_width, ratio, 0);
-            tensor_expect_layout(l->indexer_compressor_kv,     DS4_TENSOR_F16, 2, DS4_N_EMBD, index_width, 0);
-            tensor_expect_layout(l->indexer_compressor_gate,   DS4_TENSOR_F16, 2, DS4_N_EMBD, index_width, 0);
+            tensor_expect_f16_q2(m, l->indexer_attn_q_b, DS4_N_LORA_Q, index_q_dim);
+            tensor_expect_f16_q2(m, l->indexer_proj, DS4_N_EMBD, DS4_N_INDEXER_HEAD);
+            tensor_expect_f16_q2(m, l->indexer_compressor_ape, index_width, ratio);
+            tensor_expect_f16_q2(m, l->indexer_compressor_kv, DS4_N_EMBD, index_width);
+            tensor_expect_f16_q2(m, l->indexer_compressor_gate, DS4_N_EMBD, index_width);
             tensor_expect_layout(l->indexer_compressor_norm,   DS4_TENSOR_F32, 1, DS4_N_INDEXER_HEAD_DIM, 0, 0);
         }
 
-        tensor_expect_layout(l->hc_ffn_fn,      DS4_TENSOR_F16,  2, hc_dim, hc_mix_dim, 0);
+        tensor_expect_f16_q2(m, l->hc_ffn_fn, hc_dim, hc_mix_dim);
         tensor_expect_layout(l->hc_ffn_scale,   DS4_TENSOR_F32,  1, 3, 0, 0);
         tensor_expect_layout(l->hc_ffn_base,    DS4_TENSOR_F32,  1, hc_mix_dim, 0, 0);
         tensor_expect_layout(l->ffn_norm,       DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-        tensor_expect_layout(l->ffn_gate_inp,   DS4_TENSOR_F16,  2, DS4_N_EMBD, DS4_N_EXPERT, 0);
+        tensor_expect_f16_q2(m, l->ffn_gate_inp, DS4_N_EMBD, DS4_N_EXPERT);
         tensor_expect_optional(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, DS4_N_EXPERT, 0, 0);
         /* A shrunken (keep-map) model carries only the kept routed experts; the
          * router + ffn_gate_inp + ffn_exp_probs_b stay 256-wide above. */
@@ -3324,62 +3556,13 @@ static void weights_validate_layout(const ds4_model *m, const ds4_weights *w) {
             fprintf(stderr, "ds4: routed gate/up experts use different quant types in layer %u\n", il);
             exit(1);
         }
-        tensor_expect_layout(l->ffn_gate_shexp, DS4_TENSOR_Q8_0,    2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
-        tensor_expect_layout(l->ffn_up_shexp,   DS4_TENSOR_Q8_0,    2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
-        tensor_expect_layout(l->ffn_down_shexp, DS4_TENSOR_Q8_0,    2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
+        tensor_expect_layout(l->ffn_gate_shexp, l->ffn_gate_shexp && (l->ffn_gate_shexp->type == DS4_TENSOR_Q4_K || l->ffn_gate_shexp->type == DS4_TENSOR_Q2_K) ? l->ffn_gate_shexp->type : DS4_TENSOR_Q8_0,    2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
+        tensor_expect_layout(l->ffn_up_shexp,   l->ffn_up_shexp && (l->ffn_up_shexp->type == DS4_TENSOR_Q4_K || l->ffn_up_shexp->type == DS4_TENSOR_Q2_K) ? l->ffn_up_shexp->type : DS4_TENSOR_Q8_0,    2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
+        tensor_expect_layout(l->ffn_down_shexp, l->ffn_down_shexp && (l->ffn_down_shexp->type == DS4_TENSOR_Q4_K || l->ffn_down_shexp->type == DS4_TENSOR_Q2_K) ? l->ffn_down_shexp->type : DS4_TENSOR_Q8_0,    2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
         if (il < DS4_N_HASH_LAYER) {
             tensor_expect_layout(l->ffn_gate_tid2eid, DS4_TENSOR_I32, 2, DS4_N_EXPERT_USED, DS4_N_VOCAB, 0);
         }
     }
-}
-
-static void mtp_weights_validate_layout(const ds4_mtp_weights *w, uint32_t exp_dim) {
-    const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
-    const uint64_t hc_mix_dim = 2u * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
-    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
-    const uint64_t out_low_dim = (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O;
-    const ds4_layer_weights *l = &w->block;
-
-    tensor_expect_layout(w->hc_head_base,  DS4_TENSOR_F32,  1, DS4_N_HC, 0, 0);
-    tensor_expect_plain_layout(w->hc_head_fn, 2, hc_dim, DS4_N_HC, 0);
-    tensor_expect_layout(w->hc_head_scale, DS4_TENSOR_F32,  1, 1, 0, 0);
-    tensor_expect_layout(w->e_proj,        DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_EMBD, 0);
-    tensor_expect_layout(w->h_proj,        DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_EMBD, 0);
-    tensor_expect_layout(w->enorm,         DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-    tensor_expect_layout(w->hnorm,         DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-    tensor_expect_layout(w->norm,          DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-
-    tensor_expect_plain_layout(l->hc_attn_fn, 2, hc_dim, hc_mix_dim, 0);
-    tensor_expect_layout(l->hc_attn_scale,  DS4_TENSOR_F32,  1, 3, 0, 0);
-    tensor_expect_layout(l->hc_attn_base,   DS4_TENSOR_F32,  1, hc_mix_dim, 0, 0);
-    tensor_expect_layout(l->attn_norm,      DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-    tensor_expect_layout(l->attn_q_a,       DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_LORA_Q, 0);
-    tensor_expect_layout(l->attn_q_a_norm,  DS4_TENSOR_F32,  1, DS4_N_LORA_Q, 0, 0);
-    tensor_expect_layout(l->attn_q_b,       DS4_TENSOR_Q8_0, 2, DS4_N_LORA_Q, q_dim, 0);
-    tensor_expect_layout(l->attn_kv,        DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_HEAD_DIM, 0);
-    tensor_expect_layout(l->attn_kv_a_norm, DS4_TENSOR_F32,  1, DS4_N_HEAD_DIM, 0, 0);
-    tensor_expect_layout(l->attn_sinks,     DS4_TENSOR_F32,  1, DS4_N_HEAD, 0, 0);
-    tensor_expect_layout(l->attn_output_a,  DS4_TENSOR_Q8_0, 2, DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP), out_low_dim, 0);
-    tensor_expect_layout(l->attn_output_b,  DS4_TENSOR_Q8_0, 2, out_low_dim, DS4_N_EMBD, 0);
-
-    tensor_expect_plain_layout(l->hc_ffn_fn, 2, hc_dim, hc_mix_dim, 0);
-    tensor_expect_layout(l->hc_ffn_scale,   DS4_TENSOR_F32,  1, 3, 0, 0);
-    tensor_expect_layout(l->hc_ffn_base,    DS4_TENSOR_F32,  1, hc_mix_dim, 0, 0);
-    tensor_expect_layout(l->ffn_norm,       DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-    tensor_expect_plain_layout(l->ffn_gate_inp, 2, DS4_N_EMBD, DS4_N_EXPERT, 0);
-    tensor_expect_layout(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, DS4_N_EXPERT, 0, 0);
-    /* exp_dim = kept routed-expert count (DS4_N_EXPERT for a full MTP, or the
-     * matched-MTP keep-map count). The router (ffn_gate_inp) + bias stay full
-     * DS4_N_EXPERT; route_translate maps the 256-way router pick into the kept slots. */
-    tensor_expect_routed_expert(l->ffn_gate_exps, 3, DS4_N_EMBD, DS4_N_FF_EXP, exp_dim);
-    tensor_expect_routed_expert(l->ffn_up_exps,   3, DS4_N_EMBD, DS4_N_FF_EXP, exp_dim);
-    tensor_expect_routed_expert(l->ffn_down_exps, 3, DS4_N_FF_EXP, DS4_N_EMBD, exp_dim);
-    if (l->ffn_gate_exps->type != l->ffn_up_exps->type) {
-        ds4_die("MTP routed gate/up experts use different quant types");
-    }
-    tensor_expect_layout(l->ffn_gate_shexp, DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
-    tensor_expect_layout(l->ffn_up_shexp,   DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
-    tensor_expect_layout(l->ffn_down_shexp, DS4_TENSOR_Q8_0, 2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
 }
 
 static bool ds4_shape_matches_metadata(
@@ -3696,6 +3879,110 @@ static void config_validate_model(const ds4_model *m) {
 
 /* Bind tensor names once into the fixed DS4 layer layout.  This is the point
  * where stringly GGUF metadata becomes direct model-specific pointers. */
+/* DSpark drafter 绑定(全 optional): 首块 attn_q_a 缺 ⇒ 模型没带 drafter, 静默关闭。
+ * 层内字段与主层同构(indexer/compressor 字段留 NULL — drafter 层没有这两族)。 */
+static ds4_tensor *dspark_tensorf(const ds4_model *m, const char *fmt, uint32_t blk) {
+    return tensor_by_namef(m, fmt, blk);
+}
+
+#define DS4_DSPARK_WIN   128u
+#define DS4_DSPARK_BLK   5u
+#define DS4_DSPARK_NOISE 128799
+static int g_dspark_ready_global = 0;   /* engine open 后置; graph alloc 统一消费 */
+static const ds4_dspark_weights *g_dspark_bound_for_prefill = NULL;   /* prefill 建窗弱引用 */
+
+static void dspark_weights_bind(ds4_dspark_weights *w, const ds4_model *m) {
+    memset(w, 0, sizeof(*w));
+    if (!model_find_tensor(m, "mtp.0.attn_q_a.weight")) return;   /* 没带 drafter */
+    for (uint32_t b = 0; b < DS4_DSPARK_MAX_BLOCKS; b++) {
+        if (!dspark_tensorf(m, "mtp.%u.attn_q_a.weight", b)) break;
+        ds4_layer_weights *l = &w->block[b];
+        l->hc_attn_fn      = dspark_tensorf(m, "mtp.%u.hc_attn_fn.weight", b);
+        l->hc_attn_scale   = dspark_tensorf(m, "mtp.%u.hc_attn_scale.weight", b);
+        l->hc_attn_base    = dspark_tensorf(m, "mtp.%u.hc_attn_base.weight", b);
+        l->attn_norm       = dspark_tensorf(m, "mtp.%u.attn_norm.weight", b);
+        l->attn_q_a        = dspark_tensorf(m, "mtp.%u.attn_q_a.weight", b);
+        l->attn_q_a_norm   = dspark_tensorf(m, "mtp.%u.attn_q_a_norm.weight", b);
+        l->attn_q_b        = dspark_tensorf(m, "mtp.%u.attn_q_b.weight", b);
+        l->attn_kv         = dspark_tensorf(m, "mtp.%u.attn_kv.weight", b);
+        l->attn_kv_a_norm  = dspark_tensorf(m, "mtp.%u.attn_kv_a_norm.weight", b);
+        l->attn_sinks      = dspark_tensorf(m, "mtp.%u.attn_sinks.weight", b);
+        l->attn_output_a   = dspark_tensorf(m, "mtp.%u.attn_output_a.weight", b);
+        l->attn_output_b   = dspark_tensorf(m, "mtp.%u.attn_output_b.weight", b);
+        l->hc_ffn_fn       = dspark_tensorf(m, "mtp.%u.hc_ffn_fn.weight", b);
+        l->hc_ffn_scale    = dspark_tensorf(m, "mtp.%u.hc_ffn_scale.weight", b);
+        l->hc_ffn_base     = dspark_tensorf(m, "mtp.%u.hc_ffn_base.weight", b);
+        l->ffn_norm        = dspark_tensorf(m, "mtp.%u.ffn_norm.weight", b);
+        l->ffn_gate_inp    = dspark_tensorf(m, "mtp.%u.ffn_gate_inp.weight", b);
+        l->ffn_exp_probs_b = dspark_tensorf(m, "mtp.%u.exp_probs_b.bias", b);
+        l->ffn_gate_exps   = dspark_tensorf(m, "mtp.%u.ffn_gate_exps.weight", b);
+        l->ffn_up_exps     = dspark_tensorf(m, "mtp.%u.ffn_up_exps.weight", b);
+        l->ffn_down_exps   = dspark_tensorf(m, "mtp.%u.ffn_down_exps.weight", b);
+        l->ffn_gate_shexp  = dspark_tensorf(m, "mtp.%u.ffn_gate_shexp.weight", b);
+        l->ffn_up_shexp    = dspark_tensorf(m, "mtp.%u.ffn_up_shexp.weight", b);
+        l->ffn_down_shexp  = dspark_tensorf(m, "mtp.%u.ffn_down_shexp.weight", b);
+        w->n_blocks = (int)b + 1;
+    }
+    /* 特殊头挂点分散(0731: main_proj 在 mtp.0, markov/confidence/norm/hc_head 在
+     * mtp.2) —— 逐模块探测取首个存在者 */
+    for (uint32_t b = 0; b < DS4_DSPARK_MAX_BLOCKS; b++) {
+        if (!w->main_proj)       w->main_proj       = dspark_tensorf(m, "mtp.%u.main_proj.weight", b);
+        if (!w->main_norm)       w->main_norm       = dspark_tensorf(m, "mtp.%u.main_norm.weight", b);
+        if (!w->confidence_proj) w->confidence_proj = dspark_tensorf(m, "mtp.%u.confidence_proj.weight", b);
+        if (!w->markov_w1)       w->markov_w1       = dspark_tensorf(m, "mtp.%u.markov_w1.weight", b);
+        if (!w->markov_w2)       w->markov_w2       = dspark_tensorf(m, "mtp.%u.markov_w2.weight", b);
+        if (!w->norm)            w->norm            = dspark_tensorf(m, "mtp.%u.norm.weight", b);
+        if (!w->hc_head_base)    w->hc_head_base    = dspark_tensorf(m, "mtp.%u.hc_head_base.weight", b);
+        if (!w->hc_head_fn)      w->hc_head_fn      = dspark_tensorf(m, "mtp.%u.hc_head_fn.weight", b);
+        if (!w->hc_head_scale)   w->hc_head_scale   = dspark_tensorf(m, "mtp.%u.hc_head_scale.weight", b);
+    }
+    /* 最小可用集: 至少一个块 + 融合投影 + 出口 norm */
+    w->ready = w->n_blocks > 0 && w->main_proj && w->norm;
+    if (w->ready) { g_dspark_ready_global = 1; g_dspark_bound_for_prefill = w; }
+    if (w->ready)
+        fprintf(stderr, "ds4: DSpark drafter armed: %d block(s)%s%s\n",
+                w->n_blocks,
+                w->confidence_proj ? " +confidence" : "",
+                w->markov_w1 ? " +markov" : "");
+}
+
+/* DS4_DRAFT_GGUF(2026-08-20): 独立 drafter gguf(官方开源 DSpark 量化版形态, 仅 mtp.*)
+ * 挂在主模型旁。主模型自带 mtp.* 时优先; 副 model 懒加载单例, 进程生命周期持有。
+ * CUDA (map,offset)→device 解析按 host_base 区分文件, 第二 mmap 天然可用。 */
+static ds4_model *g_draft_model = NULL;
+static void dspark_bind_with_draft(ds4_dspark_weights *w, const ds4_model *m, bool graph_backend) {
+    dspark_weights_bind(w, m);
+    if (w->ready) { w->src = m; w->head_src = m; return; }
+    const char *p = getenv("DS4_DRAFT_GGUF");
+    if (!p || !p[0]) return;
+    if (!g_draft_model) {
+        g_draft_model = xmalloc(sizeof(*g_draft_model));
+        model_open(g_draft_model, p, graph_backend, true);   /* prefetch: 副 map 页表预热(nsys: 冷页长尾 30x) */
+
+        fprintf(stderr, "ds4: draft gguf mapped: %s\n", p);
+    }
+    dspark_weights_bind(w, g_draft_model);
+    w->src = g_draft_model;
+    w->head_src = g_draft_model;
+    /* 出口侧借主模型(官方: drafter 复用主 head)。norm 是 ready 硬条件, hc_head 是
+     * step ④ 的硬解引用 —— 三者齐借, head_src 指向主模型供 step 选 map。 */
+    if (!w->ready && w->n_blocks > 0 && w->main_proj) {
+        if (!w->norm)          w->norm          = model_find_tensor(m, "output_norm.weight");
+        if (!w->hc_head_base)  w->hc_head_base  = model_find_tensor(m, "output_hc_base.weight");
+        if (!w->hc_head_fn)    w->hc_head_fn    = model_find_tensor(m, "output_hc_fn.weight");
+        if (!w->hc_head_scale) w->hc_head_scale = model_find_tensor(m, "output_hc_scale.weight");
+        if (w->norm && w->hc_head_base && w->hc_head_fn && w->hc_head_scale) {
+            w->head_src = m;
+            w->ready = true;
+            g_dspark_ready_global = 1;
+            g_dspark_bound_for_prefill = w;
+            fprintf(stderr, "ds4: DSpark drafter armed from draft gguf: %d block(s), head borrowed from base\n",
+                    w->n_blocks);
+        }
+    }
+    if (!w->ready) fprintf(stderr, "ds4: draft gguf has no usable mtp.* tensors: %s\n", p);
+}
+
 static void weights_bind(ds4_weights *w, const ds4_model *m) {
     memset(w, 0, sizeof(*w));
     /* Head tensors are optional so a sharded per-machine slice can hold only the
@@ -3751,16 +4038,20 @@ static void weights_bind(ds4_weights *w, const ds4_model *m) {
         l->ffn_norm        = required_tensorf(m, "blk.%u.ffn_norm.weight", il);
         l->ffn_gate_inp    = required_tensorf(m, "blk.%u.ffn_gate_inp.weight", il);
         l->ffn_exp_probs_b = tensor_by_namef(m, "blk.%u.exp_probs_b.bias", il);
-        /* 合一 VQ 文件携带 blk.L.ffn_exps_vq.blob 时 gate/up 死重不入文件 → 降为可选;
-         * down 是冷 w2 源永远必需。无 blob 的旧文件语义不变(仍必需)。 */
+        /* 合一 VQ 文件携带 blk.L.ffn_exps_vq.blob 时 gate/up 死重不入文件 → 降为可选。
+         * down 同样可选(R28: 冷 w2 也编在 blob 的 which=2 槽里), 缺席走影子张量;
+         * 冠军 vq4bf 那种"冷 w2 从 base go1b 读"的文件仍带着真 down, 语义不变。
+         * 无 blob 的旧文件语义不变(三者仍必需)。 */
         if (tensor_by_namef(m, "blk.%u.ffn_exps_vq.blob", il)) {
             l->ffn_gate_exps = tensor_by_namef(m, "blk.%u.ffn_gate_exps.weight", il);
             l->ffn_up_exps   = tensor_by_namef(m, "blk.%u.ffn_up_exps.weight", il);
+            l->ffn_down_exps = tensor_by_namef(m, "blk.%u.ffn_down_exps.weight", il);
+            if (!l->ffn_down_exps) l->ffn_down_exps = routed_down_shadow(il);
         } else {
             l->ffn_gate_exps = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
             l->ffn_up_exps   = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
+            l->ffn_down_exps = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
         }
-        l->ffn_down_exps   = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
         l->ffn_gate_shexp  = required_tensorf(m, "blk.%u.ffn_gate_shexp.weight", il);
         l->ffn_up_shexp    = required_tensorf(m, "blk.%u.ffn_up_shexp.weight", il);
         l->ffn_down_shexp  = required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il);
@@ -4008,7 +4299,10 @@ static bool weights_model_map_spans_split(
     model_map_span_vec_finalize(backbone);
     model_map_span_vec_sort_dedupe_exact(experts);
 
-    if (backbone->len == 0 || experts->len == 0) return false;
+    /* experts 为空在 VQ blob 下是正确结果(专家字节在 blob 里), 不是切分失败 —— 若当成
+     * 失败返回, 调用方会退回整条 tensor-data 全驻留包装(35 GiB), 正好是要避免的事。 */
+    if (backbone->len == 0) return false;
+    if (experts->len == 0 && !g_vq_experts_blob) return false;
     if (backbone->max_tensor_bytes == 0) return false;
     return true;
 }
@@ -4039,52 +4333,12 @@ static bool weights_model_map_spans_split_slice(
     model_map_span_vec_finalize(backbone);
     model_map_span_vec_sort_dedupe_exact(experts);
 
-    if (backbone->len == 0 || experts->len == 0) return false;
+    /* experts 为空在 VQ blob 下是正确结果(专家字节在 blob 里), 不是切分失败 —— 若当成
+     * 失败返回, 调用方会退回整条 tensor-data 全驻留包装(35 GiB), 正好是要避免的事。 */
+    if (backbone->len == 0) return false;
+    if (experts->len == 0 && !g_vq_experts_blob) return false;
     if (backbone->max_tensor_bytes == 0) return false;
     return true;
-}
-
-static void mtp_weights_bind(ds4_mtp_weights *w, const ds4_model *m) {
-    memset(w, 0, sizeof(*w));
-
-    w->hc_head_base  = required_tensor(m, "mtp.0.hc_head_base.weight");
-    w->hc_head_fn    = required_tensor(m, "mtp.0.hc_head_fn.weight");
-    w->hc_head_scale = required_tensor(m, "mtp.0.hc_head_scale.weight");
-    w->e_proj        = required_tensor(m, "mtp.0.e_proj.weight");
-    w->h_proj        = required_tensor(m, "mtp.0.h_proj.weight");
-    w->enorm         = required_tensor(m, "mtp.0.enorm.weight");
-    w->hnorm         = required_tensor(m, "mtp.0.hnorm.weight");
-    w->norm          = required_tensor(m, "mtp.0.norm.weight");
-
-    ds4_layer_weights *l = &w->block;
-    l->hc_attn_fn      = required_tensor(m, "mtp.0.hc_attn_fn.weight");
-    l->hc_attn_scale   = required_tensor(m, "mtp.0.hc_attn_scale.weight");
-    l->hc_attn_base    = required_tensor(m, "mtp.0.hc_attn_base.weight");
-    l->attn_norm       = required_tensor(m, "mtp.0.attn_norm.weight");
-    l->attn_q_a        = required_tensor(m, "mtp.0.attn_q_a.weight");
-    l->attn_q_a_norm   = required_tensor(m, "mtp.0.attn_q_a_norm.weight");
-    l->attn_q_b        = required_tensor(m, "mtp.0.attn_q_b.weight");
-    l->attn_kv         = required_tensor(m, "mtp.0.attn_kv.weight");
-    l->attn_kv_a_norm  = required_tensor(m, "mtp.0.attn_kv_a_norm.weight");
-    l->attn_sinks      = required_tensor(m, "mtp.0.attn_sinks.weight");
-    l->attn_output_a   = required_tensor(m, "mtp.0.attn_output_a.weight");
-    l->attn_output_b   = required_tensor(m, "mtp.0.attn_output_b.weight");
-    l->hc_ffn_fn       = required_tensor(m, "mtp.0.hc_ffn_fn.weight");
-    l->hc_ffn_scale    = required_tensor(m, "mtp.0.hc_ffn_scale.weight");
-    l->hc_ffn_base     = required_tensor(m, "mtp.0.hc_ffn_base.weight");
-    l->ffn_norm        = required_tensor(m, "mtp.0.ffn_norm.weight");
-    l->ffn_gate_inp    = required_tensor(m, "mtp.0.ffn_gate_inp.weight");
-    l->ffn_exp_probs_b = required_tensor(m, "mtp.0.exp_probs_b.bias");
-    l->ffn_gate_exps   = required_tensor(m, "mtp.0.ffn_gate_exps.weight");
-    l->ffn_up_exps     = required_tensor(m, "mtp.0.ffn_up_exps.weight");
-    l->ffn_down_exps   = required_tensor(m, "mtp.0.ffn_down_exps.weight");
-    l->ffn_gate_shexp  = required_tensor(m, "mtp.0.ffn_gate_shexp.weight");
-    l->ffn_up_shexp    = required_tensor(m, "mtp.0.ffn_up_shexp.weight");
-    l->ffn_down_shexp  = required_tensor(m, "mtp.0.ffn_down_shexp.weight");
-
-    /* exp_dim from the MTP model's keep-map (layer 0); DS4_N_EXPERT if unmasked.
-     * The reduced MTP routes 256-way then route_translate maps into kept slots. */
-    mtp_weights_validate_layout(w, model_expert_kept_count(m, 0));
 }
 
 static void weights_free(ds4_weights *w) {
@@ -4092,14 +4346,45 @@ static void weights_free(ds4_weights *w) {
 }
 
 /* Load one token embedding row and expand it to float activations. */
+/* 全q2 影子模型宿主行解码: 装载时 type 已翻成 F16 供图分发, 但 bytes 保持文件真值,
+ * mmap 里躺的仍是 q2_K 块 —— 宿主读行必须按真实编码解码(与 CUDA 侧
+ * host_deq_q2k_block 同式, 已对拍验证)。 */
+static void deq_q2K_row_f32(const uint8_t *row, uint64_t nblk, float *out) {
+    for (uint64_t b = 0; b < nblk; b++) {
+        const uint8_t *blk = row + b * 84u;
+        const uint8_t *sc = blk, *qs = blk + 16;
+        uint16_t hd, hm;
+        memcpy(&hd, blk + 80, 2);
+        memcpy(&hm, blk + 82, 2);
+        const float d = f16_to_f32(hd), dm = f16_to_f32(hm);
+        float *o = out + b * 256u;
+        for (int j = 0; j < 16; j++) {
+            const float dj = d * (float)(sc[j] & 0xF), mj = dm * (float)(sc[j] >> 4);
+            for (int ii = 0; ii < 16; ii++) {
+                const int idx = j * 16 + ii;
+                const int qpos = (idx / 128) * 32 + (idx % 32);
+                const int q = (qs[qpos] >> ((idx % 128) / 32 * 2)) & 3;
+                o[idx] = dj * (float)q - mj;
+            }
+        }
+    }
+}
+
 static void embed_token_f16(const ds4_model *m, const ds4_weights *w, int token, float *out) {
     ds4_tensor *te = w->token_embd;
     if (token < 0 || (uint64_t)token >= te->dim[1]) {
         ds4_die("token id is outside the embedding table");
     }
 
-    const uint16_t *base = tensor_data(m, te);
     const uint64_t stride = te->dim[0];
+    if (te->bytes * 256u == te->elements * 84u) {   /* 文件真身是 q2_K(全q2 影子) */
+        const uint8_t *qbase = (const uint8_t *)tensor_data(m, te);
+        const uint64_t nblk = stride / 256u;
+        deq_q2K_row_f32(qbase + (uint64_t)token * nblk * 84u, nblk, out);
+        return;
+    }
+
+    const uint16_t *base = tensor_data(m, te);
     const uint16_t *row = base + (uint64_t)token * stride;
 
     for (uint64_t i = 0; i < stride; i++) {
@@ -7609,6 +7894,11 @@ static uint32_t ds4_default_raw_cap(uint32_t ctx_size) {
     return raw_cap;
 }
 
+/* CUDA 侧默认分块(2026-08-21): 原 dense/grouped 批 kernel 每个 warp 为自己那一行把整批
+ * token 的激活重读一遍(340 token 的块 ≈ 12.9GB 流量, 权重才 11MB), 于是"一次灌完"是最慢
+ * 的配置(42 t/s), 小块反而快。加了 token 分片 GEMM(激活按 tile 进 shared, 块内共用)之后
+ * 大块重新变优: 实测 3800 token prompt chunk=128 119 / 256 **123** / 512 116 t/s。
+ * 分片 kernel 与原路逐位一致(NLL 与 max|Δlogit| 均为 0 差)。Metal 侧保持原行为。 */
 static uint32_t ds4_default_prefill_cap_for_prompt(int prompt_len) {
     if (prompt_len <= 0) return 1;
     uint32_t cap = (uint32_t)prompt_len;
@@ -7621,6 +7911,8 @@ static uint32_t ds4_default_prefill_cap_for_prompt(int prompt_len) {
             if (v <= 0) return cap;
             cap = (uint32_t)v;
         }
+    } else if (g_prefill_chunk_cuda > 0) {
+        cap = (uint32_t)g_prefill_chunk_cuda;
     } else if (prompt_len > 4096) {
         cap = 4096u;
     }
@@ -9636,6 +9928,13 @@ typedef struct {
     uint32_t layer_n_index_comp[DS4_MAX_LAYER];
     uint32_t spec_prefix1_n_comp[DS4_MAX_LAYER];
     uint32_t spec_prefix1_n_index_comp[DS4_MAX_LAYER];
+    /* spec replay 消除(2026-08-20): verify 批各层压缩器/indexer 输入行缓存(≤8 行),
+     * restore 后用缓存行快进 acc 位 —— 免第二次全模型前向(实测 replay 55-65ms/轮)。 */
+    ds4_gpu_tensor *spec_comp_rows_kv[DS4_MAX_LAYER];
+    ds4_gpu_tensor *spec_comp_rows_sc[DS4_MAX_LAYER];
+    ds4_gpu_tensor *spec_idx_rows_kv[DS4_MAX_LAYER];
+    ds4_gpu_tensor *spec_idx_rows_sc[DS4_MAX_LAYER];
+    int spec_comp_capture;
     bool spec_capture_prefix1;
     uint32_t raw_cap;
     /* Maximum compressed-row capacity across layers.  Shared work buffers use
@@ -9652,6 +9951,11 @@ typedef struct {
      * predictable: each pointer names an actual DS4 stage. */
     ds4_gpu_tensor *comp_kv_cur;
     ds4_gpu_tensor *comp_sc_cur;
+    /* Side-stream private cur pair for the attn compressor chain: the main
+     * stream's indexer compressor writes comp_kv_cur/comp_sc_cur concurrently,
+     * so the side chain must not share them (2026-08-19 determinism fix). */
+    ds4_gpu_tensor *comp_kv_side;
+    ds4_gpu_tensor *comp_sc_side;
     ds4_gpu_tensor *attn_comp_stage;
     ds4_gpu_tensor *indexer_q;
     ds4_gpu_tensor *indexer_weights;
@@ -9692,6 +9996,29 @@ typedef struct {
     /* Optional MTP model state.  It has its own raw cache because the drafter
      * runs on speculative future tokens; target KV state is updated only after
      * verification accepts draft tokens. */
+    /* DSpark drafter(2026-08-18): target 层(40/41/42) HC 均值拼接 buffer, decode 单
+     * token [3*4096]。capture 常开(node 开销 ~3μs), drafter ready 时被消费。 */
+    ds4_gpu_tensor *dspark_main_hidden;
+    ds4_gpu_tensor *dspark_main_x_raw;
+    ds4_gpu_tensor *dspark_main_x;
+    ds4_gpu_tensor *dspark_kv_tmp;
+    ds4_gpu_tensor *dspark_win_kv[3];  /* 每块层环形窗 [128][512] f32 */
+    ds4_gpu_tensor *dspark_ids;
+    ds4_gpu_tensor *dspark_hc_pre;
+    ds4_gpu_tensor *dspark_hc_w;
+    ds4_gpu_tensor *dspark_flat;
+    ds4_gpu_tensor *dspark_flat_norm;
+    ds4_gpu_tensor *dspark_logits;
+    ds4_gpu_tensor *spec_raw_save[DS4_MAX_LAYER]; /* verify 批写 SWA 环前的旧行存档 */
+    ds4_gpu_tensor *dspark_spec_kv[3]; /* verify 批的 drafter KV 暂存 [BLK+1, HEAD_DIM] */
+    ds4_gpu_tensor *dspark_conf;       /* [BLK] 逐位置置信(调度器输入) */
+    ds4_gpu_tensor *dspark_prev_ids;   /* [BLK] 逐位置输入 token(置信头用) */
+    ds4_gpu_tensor *dspark_prev_id;
+    ds4_gpu_tensor *dspark_out_id;
+    ds4_gpu_tensor *dspark_pf_hidden;   /* prefill 建窗: [chunk_cap, 3*4096] */
+    ds4_gpu_tensor *dspark_pf_x;        /* [chunk_cap, 4096] */
+    ds4_gpu_tensor *dspark_pf_kv;       /* [chunk_cap, 512] */
+    int dspark_capture;               /* engine open 时按 drafter ready 置位 */
     ds4_gpu_tensor *mtp_embed;
     ds4_gpu_tensor *mtp_enorm;
     ds4_gpu_tensor *mtp_eproj;
@@ -9881,6 +10208,56 @@ static void cap_batch_layer(ds4_gpu_graph *g, uint32_t il, uint32_t n_tokens) {
                 il, n_tokens, (unsigned long long)cap_tok_total);
 }
 
+/* ---- 反修百分百还原判决钩(DS4_AMP_ANCHOR, 2026-08-19) ----------------------
+ * 判决实验专用, 不进产线: 把反修解算时的输入条件在线还原 — zchain(放大器)的 x 用
+ * 解算锚(DQA2)的 FP fin; DS4_AMP_ANCHOR_ROUTE=1 时路由(selected/weights)也钉锚
+ * ridx/rw。用于把"解算产物/引擎应用有病"与"解算口径 vs 在线口径漂移"分开归因。
+ * 只挂 decode 路(score 链除首 token 外全走这里; 首 token 批路不钉, 偏差 1/S 在案)。 */
+static struct {
+    int state;                       /* 0 未初始化 / 1 开 / -1 关 */
+    int route_on;
+    const float   *fin;              /* [NL][S][DIM] */
+    const int32_t *ridx;             /* [NL][S][NACT] */
+    const float   *rw;
+    uint32_t S, nl, nact, dim;
+    ds4_gpu_tensor *xbuf[DS4_MAX_LAYER];  /* per-layer: 同 buf 跨层复用会被未执行的
+                                           * 前层 zchain kernel 读到后层数据 */
+} g_ampanc;
+
+static int ampanc_on(void) {
+    if (g_ampanc.state) return g_ampanc.state > 0;
+    g_ampanc.state = -1;
+    const char *p = getenv("DS4_AMP_ANCHOR");
+    if (!p || !p[0]) return 0;
+    int fd = open(p, O_RDONLY);
+    if (fd < 0) { fprintf(stderr, "ds4: AMP_ANCHOR %s: open failed\n", p); return 0; }
+    struct stat st;
+    if (fstat(fd, &st) != 0) { close(fd); return 0; }
+    void *m = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (m == MAP_FAILED) { fprintf(stderr, "ds4: AMP_ANCHOR mmap failed\n"); return 0; }
+    const uint32_t *hd = (const uint32_t *)m;
+    if (hd[0] != 0x32415144u) { fprintf(stderr, "ds4: AMP_ANCHOR bad magic\n"); return 0; }
+    g_ampanc.S = hd[1]; g_ampanc.dim = hd[3]; g_ampanc.nl = hd[4]; g_ampanc.nact = hd[6];
+    if (g_ampanc.dim != DS4_N_EMBD || g_ampanc.nact != DS4_N_EXPERT_USED ||
+        (uint64_t)st.st_size < 40u + (uint64_t)g_ampanc.nl * g_ampanc.S *
+            (4ull * g_ampanc.dim + 8ull * g_ampanc.nact)) {
+        fprintf(stderr, "ds4: AMP_ANCHOR 头/长度不合, 拒绝\n");
+        return 0;
+    }
+    const uint8_t *q = (const uint8_t *)m + 40;
+    g_ampanc.fin = (const float *)q;
+    q += (size_t)g_ampanc.nl * g_ampanc.S * g_ampanc.dim * 4u;
+    g_ampanc.ridx = (const int32_t *)q;
+    q += (size_t)g_ampanc.nl * g_ampanc.S * g_ampanc.nact * 4u;
+    g_ampanc.rw = (const float *)q;
+    g_ampanc.route_on = getenv("DS4_AMP_ANCHOR_ROUTE") != NULL;
+    g_ampanc.state = 1;
+    fprintf(stderr, "ds4: AMP_ANCHOR armed: S=%u NL=%u x=钉锚 route=%s (判决钩)\n",
+            g_ampanc.S, g_ampanc.nl, g_ampanc.route_on ? "钉锚" : "在线");
+    return 1;
+}
+
 /* decode-path capture: same shards, one token per call. The perplexity scorer
  * (and any decode) runs token-by-token through here — this is where the bulk
  * of a teacher-forced trajectory capture actually flows (the batch hook only
@@ -10014,6 +10391,26 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->mtp_eproj_hc);
     ds4_gpu_tensor_free(g->mtp_eproj);
     ds4_gpu_tensor_free(g->mtp_enorm);
+    ds4_gpu_tensor_free(g->dspark_main_hidden);
+    ds4_gpu_tensor_free(g->dspark_main_x_raw);
+    ds4_gpu_tensor_free(g->dspark_main_x);
+    ds4_gpu_tensor_free(g->dspark_kv_tmp);
+    for (int b = 0; b < 3; b++) ds4_gpu_tensor_free(g->dspark_win_kv[b]);
+    ds4_gpu_tensor_free(g->dspark_ids);
+    ds4_gpu_tensor_free(g->dspark_hc_pre);
+    ds4_gpu_tensor_free(g->dspark_hc_w);
+    ds4_gpu_tensor_free(g->dspark_flat);
+    ds4_gpu_tensor_free(g->dspark_flat_norm);
+    ds4_gpu_tensor_free(g->dspark_logits);
+    for (uint32_t il = 0; il < (uint32_t)DS4_N_LAYER; il++) ds4_gpu_tensor_free(g->spec_raw_save[il]);
+    for (uint32_t b = 0; b < 3u; b++) ds4_gpu_tensor_free(g->dspark_spec_kv[b]);
+    ds4_gpu_tensor_free(g->dspark_conf);
+    ds4_gpu_tensor_free(g->dspark_prev_ids);
+    ds4_gpu_tensor_free(g->dspark_prev_id);
+    ds4_gpu_tensor_free(g->dspark_out_id);
+    ds4_gpu_tensor_free(g->dspark_pf_hidden);
+    ds4_gpu_tensor_free(g->dspark_pf_x);
+    ds4_gpu_tensor_free(g->dspark_pf_kv);
     ds4_gpu_tensor_free(g->mtp_embed);
     ds4_gpu_tensor_free(g->spec_logits);
     ds4_gpu_tensor_free(g->output_norm);
@@ -10044,6 +10441,8 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->heads);
     ds4_gpu_tensor_free(g->comp_sc_cur);
     ds4_gpu_tensor_free(g->comp_kv_cur);
+    ds4_gpu_tensor_free(g->comp_sc_side);
+    ds4_gpu_tensor_free(g->comp_kv_side);
     ds4_gpu_tensor_free(g->attn_comp_stage);
     ds4_gpu_tensor_free(g->comp_mask);
     ds4_gpu_tensor_free(g->comp_selected);
@@ -10078,6 +10477,10 @@ static void metal_graph_free(ds4_gpu_graph *g) {
         ds4_gpu_tensor_free(g->spec_index_state_score[il]);
         ds4_gpu_tensor_free(g->spec_prefix1_attn_state_kv[il]);
         ds4_gpu_tensor_free(g->spec_prefix1_attn_state_score[il]);
+        ds4_gpu_tensor_free(g->spec_comp_rows_kv[il]);
+        ds4_gpu_tensor_free(g->spec_comp_rows_sc[il]);
+        ds4_gpu_tensor_free(g->spec_idx_rows_kv[il]);
+        ds4_gpu_tensor_free(g->spec_idx_rows_sc[il]);
         ds4_gpu_tensor_free(g->spec_prefix1_index_state_kv[il]);
         ds4_gpu_tensor_free(g->spec_prefix1_index_state_score[il]);
     }
@@ -10246,6 +10649,10 @@ static ds4_gpu_tensor *metal_graph_alloc_kv_cache_tensor(bool managed, uint64_t 
  * the command batch, so it is intentionally isolated here.
  */
 
+/* 投机 verify 的 SWA 环行存档/还原(定义在下方, 批编码里先用) */
+static bool metal_graph_spec_raw_snapshot(ds4_gpu_graph *g, uint32_t il, uint32_t pos0, uint32_t n);
+static bool metal_graph_spec_raw_restore(ds4_gpu_graph *g, uint32_t pos0, uint32_t from, uint32_t to);
+
 static bool metal_graph_debug_wants(const char *name, uint32_t il, uint32_t pos) {
     const char *prefix = getenv("DS4_METAL_GRAPH_DUMP_PREFIX");
     if (!prefix || !prefix[0]) return false;
@@ -10262,6 +10669,10 @@ static bool metal_graph_debug_wants(const char *name, uint32_t il, uint32_t pos)
 
     return true;
 }
+
+/* 同跑双路对账标签(2026-08-21): 投机 XCHECK 下同一位置会被批路和解码路各算一遍,
+ * 文件名带标签才不会互相覆盖。空标签 = 老行为。 */
+static const char *g_dump_tag = "";
 
 static void metal_graph_debug_dump_tensor(
         const char       *name,
@@ -10280,7 +10691,7 @@ static void metal_graph_debug_dump_tensor(
     float *buf = xmalloc((size_t)n_f32 * sizeof(buf[0]));
     if (ds4_gpu_tensor_read(t, 0, buf, n_f32 * sizeof(buf[0])) != 0) {
         char path[1024];
-        snprintf(path, sizeof(path), "%s_%s-%u_pos%u.bin", prefix, name, il, pos);
+        snprintf(path, sizeof(path), "%s%s_%s-%u_pos%u.bin", prefix, g_dump_tag, name, il, pos);
         if (write_f32_binary_file(path, buf, n_f32)) {
             fprintf(stderr, "ds4: dumped %s layer %u pos %u to %s\n", name, il, pos, path);
         }
@@ -10290,6 +10701,78 @@ static void metal_graph_debug_dump_tensor(
     if (ds4_gpu_begin_commands() == 0) {
         fprintf(stderr, "ds4: failed to resume Metal command batch after dumping %s layer %u pos %u\n", name, il, pos);
     }
+}
+
+/* DS4_TRACE_HNORM: 逐层打 ‖h‖ / ‖routed‖ / ‖shexp‖(decode 单 token)。
+ * 这是 "每层数学都对" 与 "模型输出" 之间那段的探针 —— 各层数值正确并不能保证整合
+ * 正确: routed 没被加进残差流, 每层的 ‖routed‖ 照样漂亮, 但 ‖h‖ 会一路不变。轨迹形态
+ * 直接给出病灶层: 突然爆炸 / 塌缩 / 不变(不变 = routed 没进 h)。
+ * 代价是每层一次 GPU 同步, 只在开了 env 时才走。 */
+static int trace_hnorm_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        /* 与模型无关: 这条追踪挂在 decode 层前向的唯一出口上, 对任何路由量化类型
+         * 一视同仁。启用时打一条横幅 —— 没看到横幅就说明跑的是旧二进制, 而不是
+         * "这条路没走到", 双机对照时这两种情况必须能一眼分开。 */
+        v = getenv("DS4_TRACE_HNORM") ? 1 : 0;
+        if (v) fprintf(stderr, "ds4: [HNORM] 逐层追踪已启用(与模型无关, decode 路每层一行)\n");
+    }
+    return v;
+}
+static double trace_l2_of(ds4_gpu_tensor *t, uint64_t n_f32) {
+    if (!t || !n_f32) return -1.0;
+    float *buf = xmalloc((size_t)n_f32 * sizeof(buf[0]));
+    double acc = -1.0;
+    if (ds4_gpu_tensor_read(t, 0, buf, n_f32 * sizeof(buf[0])) != 0) {
+        acc = 0.0;
+        for (uint64_t i = 0; i < n_f32; i++) acc += (double)buf[i] * (double)buf[i];
+        acc = sqrt(acc);
+    }
+    free(buf);
+    return acc;
+}
+static void trace_hnorm_layer(ds4_gpu_graph *g, uint32_t il, uint32_t pos, uint64_t hc_dim) {
+    if (!trace_hnorm_enabled()) return;
+    if (ds4_gpu_synchronize() == 0) return;
+    /* pos 必须打: 这条 trace 只在 decode 路触发, 而 decode 只处理"生成的" token —
+     * prompt 那几个位置即使在 ./ds4 -p 下也是走批路的。拿它和 HDUMP 的批文件比对时,
+     * 必须挑 HDUMP 里同一个 pos 的那一行, 否则比的是不同 token 的不同位置。
+     * ||attn|| 是本层 FFN 之前的 HC 态(embed+attn 之后), 用来把分歧夹在 attn / FFN 之间。 */
+    const double an = trace_l2_of(g->after_attn_hc, hc_dim);
+    const double hn = trace_l2_of(g->after_ffn_hc, hc_dim);
+    const double rn = trace_l2_of(g->routed_out, DS4_N_EMBD);
+    const double sn = trace_l2_of(g->shared_out, DS4_N_EMBD);
+    fprintf(stderr,
+            "[HNORM] L%02u pos=%u ||attn||=%.6g ||routed||=%.6g ||shexp||=%.6g ||h||=%.6g\n",
+            il, pos, an, rn, sn, hn);
+    (void)ds4_gpu_begin_commands();
+}
+/* head 之前的最终 ‖h‖ + top-5 logits: 看崩塌形态(单点尖峰 = 塌到某个 token;
+ * 全平 = 信息没传上来)。 */
+static void trace_hnorm_head(ds4_gpu_graph *g, uint32_t vocab_dim) {
+    if (!trace_hnorm_enabled()) return;
+    if (ds4_gpu_synchronize() == 0) return;
+    const double en = trace_l2_of(g->output_embd, DS4_N_EMBD);
+    const double nn = trace_l2_of(g->output_norm, DS4_N_EMBD);
+    float *lg = xmalloc((size_t)vocab_dim * sizeof(lg[0]));
+    if (ds4_gpu_tensor_read(g->logits, 0, lg, (uint64_t)vocab_dim * sizeof(lg[0])) != 0) {
+        int top[5] = {0, 0, 0, 0, 0};
+        for (int k = 0; k < 5; k++) {
+            int best = -1;
+            for (uint32_t i = 0; i < vocab_dim; i++) {
+                int dup = 0;
+                for (int j = 0; j < k; j++) if (top[j] == (int)i) { dup = 1; break; }
+                if (dup) continue;
+                if (best < 0 || lg[i] > lg[best]) best = (int)i;
+            }
+            top[k] = best < 0 ? 0 : best;
+        }
+        fprintf(stderr, "[HNORM] HEAD ||embd||=%.6g ||norm||=%.6g top5:", en, nn);
+        for (int k = 0; k < 5; k++) fprintf(stderr, " %d=%.4f", top[k], lg[top[k]]);
+        fprintf(stderr, "\n");
+    }
+    free(lg);
+    (void)ds4_gpu_begin_commands();
 }
 
 static void metal_graph_debug_dump_f16_tensor(
@@ -10341,7 +10824,7 @@ static void metal_graph_debug_dump_i32_tensor(
     int32_t *buf = xmalloc((size_t)n_i32 * sizeof(buf[0]));
     if (ds4_gpu_tensor_read(t, 0, buf, n_i32 * sizeof(buf[0])) != 0) {
         char path[1024];
-        snprintf(path, sizeof(path), "%s_%s-%u_pos%u.i32", prefix, name, il, pos);
+        snprintf(path, sizeof(path), "%s%s_%s-%u_pos%u.i32", prefix, g_dump_tag, name, il, pos);
         FILE *fp = fopen(path, "wb");
         if (fp) {
             if (fwrite(buf, sizeof(buf[0]), (size_t)n_i32, fp) == (size_t)n_i32) {
@@ -10468,6 +10951,7 @@ static bool metal_graph_alloc_raw_cap(
         uint32_t                active_layer_end,
         bool                    active_layer_slice) {
     memset(g, 0, sizeof(*g));
+    g->dspark_capture = g_dspark_ready_global;
     g->active_layer_slice = active_layer_slice;
     if (active_layer_start >= (uint32_t)DS4_N_LAYER) active_layer_start = 0;
     if (active_layer_end >= (uint32_t)DS4_N_LAYER) active_layer_end = (uint32_t)DS4_N_LAYER - 1u;
@@ -10645,6 +11129,8 @@ static bool metal_graph_alloc_raw_cap(
     }
     g->comp_kv_cur = ds4_gpu_tensor_alloc(comp_width_max * sizeof(float));
     g->comp_sc_cur = ds4_gpu_tensor_alloc(comp_width_max * sizeof(float));
+    g->comp_kv_side = ds4_gpu_tensor_alloc(comp_width_max * sizeof(float));
+    g->comp_sc_side = ds4_gpu_tensor_alloc(comp_width_max * sizeof(float));
     if (DS4_GPU_ATTN_COMP_CACHE_F16) {
         g->attn_comp_stage = ds4_gpu_tensor_alloc((uint64_t)g->attn_comp_stage_cap *
                                                   DS4_N_HEAD_DIM * sizeof(float));
@@ -10821,6 +11307,34 @@ static bool metal_graph_alloc_raw_cap(
                     g->batch_routed_mid && g->batch_routed_down &&
                     g->batch_routed_out;
     if (!ok) metal_graph_free(g);
+    if (g->dspark_capture && !g->dspark_main_hidden) {
+        /* DSpark drafter 工作 buffers(独立于 MTP 条件; ~2.6MB) */
+        const uint32_t B = 5u;
+        g->dspark_main_hidden = ds4_gpu_tensor_alloc(3ull * DS4_N_EMBD * sizeof(float));
+        g->dspark_main_x_raw = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+        g->dspark_main_x = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+        g->dspark_kv_tmp = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
+        for (int b = 0; b < 3; b++)
+            g->dspark_win_kv[b] = ds4_gpu_tensor_alloc(128ull * DS4_N_HEAD_DIM * sizeof(float));
+        g->dspark_ids = ds4_gpu_tensor_alloc(5u * sizeof(int32_t));
+        g->dspark_hc_pre = ds4_gpu_tensor_alloc((uint64_t)B * DS4_N_HC * sizeof(float));
+        g->dspark_hc_w = ds4_gpu_tensor_alloc((uint64_t)B * DS4_N_HC * sizeof(float));
+        g->dspark_flat = ds4_gpu_tensor_alloc((uint64_t)B * DS4_N_EMBD * sizeof(float));
+        g->dspark_flat_norm = ds4_gpu_tensor_alloc((uint64_t)B * DS4_N_EMBD * sizeof(float));
+        g->dspark_logits = ds4_gpu_tensor_alloc((uint64_t)B * DS4_N_VOCAB * sizeof(float));
+        for (uint32_t il = 0; il < (uint32_t)DS4_N_LAYER; il++)
+            g->spec_raw_save[il] = ds4_gpu_tensor_alloc((uint64_t)(DS4_DSPARK_BLK + 1u) * DS4_N_HEAD_DIM * sizeof(float));
+        for (uint32_t b = 0; b < 3u; b++)
+            g->dspark_spec_kv[b] = ds4_gpu_tensor_alloc((uint64_t)(DS4_DSPARK_BLK + 1u) * DS4_N_HEAD_DIM * sizeof(float));
+        g->dspark_conf = ds4_gpu_tensor_alloc((uint64_t)DS4_DSPARK_BLK * sizeof(float));
+        g->dspark_prev_ids = ds4_gpu_tensor_alloc((uint64_t)(DS4_DSPARK_BLK + 1u) * sizeof(int32_t));
+        g->dspark_prev_id = ds4_gpu_tensor_alloc(sizeof(int32_t));
+        g->dspark_out_id = ds4_gpu_tensor_alloc(sizeof(int32_t));
+        g->dspark_pf_hidden = ds4_gpu_tensor_alloc((uint64_t)g->prefill_cap * 3u * DS4_N_EMBD * sizeof(float));
+        g->dspark_pf_x = ds4_gpu_tensor_alloc((uint64_t)g->prefill_cap * DS4_N_EMBD * sizeof(float));
+        g->dspark_pf_kv = ds4_gpu_tensor_alloc((uint64_t)g->prefill_cap * DS4_N_HEAD_DIM * sizeof(float));
+    }
+
     return ok;
 }
 
@@ -11165,6 +11679,8 @@ static bool metal_graph_encode_decode_layer(
         uint32_t                raw_row,
         uint32_t                n_raw,
         int                     token) {
+    /* decode 路径 zchain 句柄(batch 路径经 _ex(no_zchain) 旁路, 此处恒主模型侧车) */
+    const struct ds4_zchain *zch = model->zchain;
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t q_rank = layer->attn_q_a->dim[1];
@@ -11246,18 +11762,22 @@ static bool metal_graph_encode_decode_layer(
     if (ok) {
         metal_graph_debug_dump_tensor("attn_norm", g->attn_norm, DS4_N_EMBD, il, pos);
     }
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->qr, model->map, model->size,
-                                              layer->attn_q_a->abs_offset,
-                                              DS4_N_EMBD, q_rank,
-                                              g->attn_norm, 1) != 0;
+    const bool qa_kv_pair = qkv_rms_fused &&
+        layer->attn_q_a->type == DS4_TENSOR_Q4_K && layer->attn_kv->type == DS4_TENSOR_Q4_K;
+    if (ok && qa_kv_pair) {
+        ok = dense_matmul_pair_typed(g->qr, g->kv_raw, model,
+                                     layer->attn_q_a, layer->attn_kv,
+                                     DS4_N_EMBD, q_rank, DS4_N_HEAD_DIM, g->attn_norm) != 0;
+    } else if (ok) {
+        ok = dense_matmul_typed(g->qr, model, layer->attn_q_a,
+                                DS4_N_EMBD, q_rank, g->attn_norm, 1) != 0;
+    }
     if (ok) {
         metal_graph_debug_dump_tensor("q_lora", g->qr, q_rank, il, pos);
     }
     if (qkv_rms_fused) {
-        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->kv_raw, model->map, model->size,
-                                                  layer->attn_kv->abs_offset,
-                                                  DS4_N_EMBD, DS4_N_HEAD_DIM,
-                                                  g->attn_norm, 1) != 0;
+        if (ok && !qa_kv_pair) ok = dense_matmul_typed(g->kv_raw, model, layer->attn_kv,
+                                          DS4_N_EMBD, DS4_N_HEAD_DIM, g->attn_norm, 1) != 0;
         if (ok) {
             metal_graph_debug_dump_tensor("KVraw", g->kv_raw, DS4_N_HEAD_DIM, il, pos);
         }
@@ -11285,31 +11805,38 @@ static bool metal_graph_encode_decode_layer(
     if (qkv_rms_fused && ok) {
         metal_graph_debug_dump_tensor("KVnorm", g->kv, DS4_N_HEAD_DIM, il, pos);
     }
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->q, model->map, model->size,
-                                              layer->attn_q_b->abs_offset,
-                                              q_rank, q_dim,
-                                              g->qr_norm, 1) != 0;
+    if (ok) ok = dense_matmul_typed(g->q, model, layer->attn_q_b,
+                                      q_rank, q_dim, g->qr_norm, 1) != 0;
     if (ok) {
         metal_graph_debug_dump_tensor("Qraw", g->q, q_dim, il, pos);
     }
-    if (ok) ok = ds4_gpu_head_rms_norm_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0;
-    if (ok) {
-        metal_graph_debug_dump_tensor("Qnorm", g->q, q_dim, il, pos);
-    }
-    if (ok) ok = ds4_gpu_rope_tail_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM,
+    {   /* G1a 融合(2026-08-20 megakernel 施工): q 的 head_rms+rope 一发(CUDA 融合核
+         * 早已在库但零接线; scale 折进旋转=容差级序差)。DS4_FUSE_QROPE=0 回两发。 */
+        static int fq = -1;
+        if (fq < 0) { const char *e = getenv("DS4_FUSE_QROPE"); fq = e ? atoi(e) : 1; }
+        if (fq) {
+            if (ok) ok = ds4_gpu_head_rms_norm_rope_tail_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM,
+                                            DS4_N_ROT, pos,
+                                            compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                                            false, freq_base, freq_scale, ext_factor, attn_factor,
+                                            DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW,
+                                            DS4_RMS_EPS) != 0;
+        } else {
+            if (ok) ok = ds4_gpu_head_rms_norm_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0;
+            if (ok) ok = ds4_gpu_rope_tail_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM,
                                             DS4_N_ROT, pos,
                                             compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
                                             false, freq_base, freq_scale, ext_factor, attn_factor,
                                             DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
+        }
+    }
     DS4_METAL_PROFILE_DECODE_STAGE("q_path");
     if (ok) {
         metal_graph_debug_dump_tensor("Qcur", g->q, q_dim, il, pos);
     }
     if (!qkv_rms_fused) {
-        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->kv_raw, model->map, model->size,
-                                                  layer->attn_kv->abs_offset,
-                                                  DS4_N_EMBD, DS4_N_HEAD_DIM,
-                                                  g->attn_norm, 1) != 0;
+        if (ok) ok = dense_matmul_typed(g->kv_raw, model, layer->attn_kv,
+                                          DS4_N_EMBD, DS4_N_HEAD_DIM, g->attn_norm, 1) != 0;
         if (ok) {
             metal_graph_debug_dump_tensor("KVraw", g->kv_raw, DS4_N_HEAD_DIM, il, pos);
         }
@@ -11321,24 +11848,36 @@ static bool metal_graph_encode_decode_layer(
             metal_graph_debug_dump_tensor("KVnorm", g->kv, DS4_N_HEAD_DIM, il, pos);
         }
     }
-    if (ok) ok = ds4_gpu_rope_tail_tensor(g->kv, 1, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
+    {   /* G1b 三合一(2026-08-20 megakernel 施工): rope(kv)+fp8+store 一发(CUDA 真核;
+         * rope 作用 rot 尾段/fp8 作用 nope 前段不相交, fp8 64线程树逐位照抄)。
+         * DS4_FUSE_KVTAIL=0 或 n_head_kv≠1 走原三发。 */
+        static int fkv = -1;
+        if (fkv < 0) { const char *e = getenv("DS4_FUSE_KVTAIL"); fkv = e ? atoi(e) : 1; }
+        if (fkv && DS4_N_HEAD_KV == 1 && !metal_graph_use_reference_kv_decode()) {
+            if (ok) ok = ds4_gpu_kv_rope_fp8_store_raw_tensor(g->kv, raw_cache, raw_cap, raw_row,
+                                            DS4_N_HEAD_DIM, DS4_N_ROT, pos,
+                                            compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                                            freq_base, freq_scale, ext_factor, attn_factor,
+                                            DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
+        } else {
+            if (ok) ok = ds4_gpu_rope_tail_tensor(g->kv, 1, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
                                             DS4_N_ROT, pos,
                                             compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
                                             false, freq_base, freq_scale, ext_factor, attn_factor,
                                             DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
-    if (ok) {
-        metal_graph_debug_dump_tensor("KVrope", g->kv, DS4_N_HEAD_DIM, il, pos);
+            if (ok) {
+                metal_graph_debug_dump_tensor("KVrope", g->kv, DS4_N_HEAD_DIM, il, pos);
+            }
+            if (ok) ok = metal_graph_decode_kv_store(g->kv, raw_cache, raw_cap, raw_row);
+        }
     }
-    /* RoPE stays as the exact standalone kernel above.  The decode fusion
-     * starts after that, where FP8 KV quantization and raw-cache storage can
-     * share one pass without changing the trigonometric path. */
-    if (ok) ok = metal_graph_decode_kv_store(g->kv, raw_cache, raw_cap, raw_row);
     DS4_METAL_PROFILE_DECODE_STAGE("kv_path");
     if (ok) {
         metal_graph_debug_dump_tensor("KVcur", g->kv, DS4_N_HEAD_DIM, il, pos);
     }
 
     uint32_t n_comp = 0;
+    int comp_side = 0;   /* 非 emit token: comp 链发侧流与 indexer/attention 并发 */
     ds4_gpu_tensor *comp_cache = NULL;
     ds4_gpu_tensor *comp_selected = NULL;
     uint32_t n_selected = 0;
@@ -11364,9 +11903,14 @@ static bool metal_graph_encode_decode_layer(
             fprintf(stderr, "ds4: Metal graph compressed KV cache capacity exceeded at layer %u\n", il);
             ok = false;
         }
+        /* comp 链回归主流串行(2026-08-19): 曾试双流并发(2026-08-17 第九夜), 实测
+         * decode 吞吐零收益, 且与主流 indexer 链存在未根除的数据竞争 —— 温 0 长生成
+         * (n=256)每 run 输出漂移, 关闭后逐字节可复现。侧流机制保留给 shared expert
+         * 段(已验证确定且无竞争)。 */
+        comp_side = 0; (void)emit;
         if (ok && !metal_graph_use_reference_compressor_pair_proj()) {
-            ok = ds4_gpu_matmul_f16_pair_tensor(g->comp_kv_cur,
-                                                  g->comp_sc_cur,
+            ok = ds4_gpu_matmul_f16_pair_tensor(g->comp_kv_side,
+                                                  g->comp_sc_side,
                                                   model->map,
                                                   model->size,
                                                   layer->attn_compressor_kv->abs_offset,
@@ -11376,18 +11920,18 @@ static bool metal_graph_encode_decode_layer(
                                                   g->attn_norm,
                                                   1) != 0;
         } else {
-            if (ok) ok = ds4_gpu_matmul_f16_tensor(g->comp_kv_cur, model->map, model->size,
+            if (ok) ok = ds4_gpu_matmul_f16_tensor(g->comp_kv_side, model->map, model->size,
                                                      layer->attn_compressor_kv->abs_offset,
                                                      DS4_N_EMBD, comp_width,
                                                      g->attn_norm, 1) != 0;
-            if (ok) ok = ds4_gpu_matmul_f16_tensor(g->comp_sc_cur, model->map, model->size,
+            if (ok) ok = ds4_gpu_matmul_f16_tensor(g->comp_sc_side, model->map, model->size,
                                                      layer->attn_compressor_gate->abs_offset,
                                                      DS4_N_EMBD, comp_width,
                                                      g->attn_norm, 1) != 0;
         }
         const uint32_t comp_row = g->layer_n_comp[il];
-        if (ok) ok = ds4_gpu_compressor_update_tensor(g->comp_kv_cur,
-                                                        g->comp_sc_cur,
+        if (ok) ok = ds4_gpu_compressor_update_tensor(g->comp_kv_side,
+                                                        g->comp_sc_side,
                                                         g->layer_attn_state_kv[il],
                                                         g->layer_attn_state_score[il],
                                                         metal_graph_attn_comp_update_target(g, il),
@@ -11410,6 +11954,7 @@ static bool metal_graph_encode_decode_layer(
                                                         DS4_ROPE_YARN_BETA_FAST,
                                                         DS4_ROPE_YARN_BETA_SLOW,
                                                         DS4_RMS_EPS) != 0;
+        if (comp_side) (void)ds4_gpu_side_main();   /* comp 链留侧流, 主流继续 indexer */
         if (ok && emit) {
             ds4_gpu_tensor *comp_row_view = metal_graph_attn_comp_row_view(g, il, comp_row);
             if (!comp_row_view) {
@@ -11679,6 +12224,7 @@ static bool metal_graph_encode_decode_layer(
                                                          DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
         }
     }
+    if (comp_side) { (void)ds4_gpu_side_join(); comp_side = 0; }
     DS4_METAL_PROFILE_DECODE_STAGE("attention");
     if (ok) {
         metal_graph_debug_dump_tensor("kqv_out", g->heads, q_dim, il, pos);
@@ -11699,42 +12245,76 @@ static bool metal_graph_encode_decode_layer(
     }
     const bool fuse_attn_out_hc =
         !metal_graph_directional_steering_attn_enabled(g) &&
-        !metal_graph_use_reference_attn_out_hc();
+        !metal_graph_use_reference_attn_out_hc() &&
+        layer->attn_output_a->type != DS4_TENSOR_Q2_K &&   /* 全q2: 融合家族无 q2 实现, 落批量路 */
+        layer->attn_output_b->type != DS4_TENSOR_Q2_K;
     if (ok && fuse_attn_out_hc) {
-        ok = ds4_gpu_attention_output_low_q8_tensor(g->attn_low,
-                                                      model->map,
-                                                      model->size,
-                                                      layer->attn_output_a->abs_offset,
-                                                      group_dim,
-                                                      rank,
-                                                      n_groups,
-                                                      g->heads) != 0;
+        const bool attn_out_q4k = layer->attn_output_a->type == DS4_TENSOR_Q4_K;
+        ok = (attn_out_q4k
+                  ? ds4_gpu_attention_output_low_q4k_tensor(g->attn_low,
+                                                            model->map,
+                                                            model->size,
+                                                            layer->attn_output_a->abs_offset,
+                                                            group_dim,
+                                                            rank,
+                                                            n_groups,
+                                                            g->heads)
+                  : ds4_gpu_attention_output_low_q8_tensor(g->attn_low,
+                                                           model->map,
+                                                           model->size,
+                                                           layer->attn_output_a->abs_offset,
+                                                           group_dim,
+                                                           rank,
+                                                           n_groups,
+                                                           g->heads)) != 0;
         if (ok) {
-            ok = ds4_gpu_matmul_q8_0_hc_expand_tensor(g->after_attn_hc,
-                                                        g->attn_out,
-                                                        model->map,
-                                                        model->size,
-                                                        layer->attn_output_b->abs_offset,
-                                                        (uint64_t)n_groups * rank,
-                                                        DS4_N_EMBD,
-                                                        g->attn_low,
-                                                        g->cur_hc,
-                                                        g->hc_split,
-                                                        DS4_N_EMBD,
-                                                        DS4_N_HC) != 0;
+            ok = (layer->attn_output_b->type == DS4_TENSOR_Q4_K
+                      ? ds4_gpu_matmul_q4_K_hc_expand_tensor(g->after_attn_hc,
+                                                             g->attn_out,
+                                                             model->map,
+                                                             model->size,
+                                                             layer->attn_output_b->abs_offset,
+                                                             (uint64_t)n_groups * rank,
+                                                             DS4_N_EMBD,
+                                                             g->attn_low,
+                                                             g->cur_hc,
+                                                             g->hc_split,
+                                                             DS4_N_EMBD,
+                                                             DS4_N_HC)
+                      : ds4_gpu_matmul_q8_0_hc_expand_tensor(g->after_attn_hc,
+                                                             g->attn_out,
+                                                             model->map,
+                                                             model->size,
+                                                             layer->attn_output_b->abs_offset,
+                                                             (uint64_t)n_groups * rank,
+                                                             DS4_N_EMBD,
+                                                             g->attn_low,
+                                                             g->cur_hc,
+                                                             g->hc_split,
+                                                             DS4_N_EMBD,
+                                                             DS4_N_HC)) != 0;
         }
     } else if (ok) {
-        ok = ds4_gpu_attention_output_q8_batch_tensor(g->attn_out,
-                                                        g->attn_low,
-                                                        g->batch_group_tmp,
-                                                        g->batch_low_tmp,
-                                                        model->map,
-                                                        model->size,
-                                                        layer->attn_output_a->abs_offset,
-                                                        layer->attn_output_b->abs_offset,
-                                                        group_dim, rank,
-                                                        n_groups, DS4_N_EMBD,
-                                                        g->heads, 1) != 0;
+        ok = ((layer->attn_output_a->type == DS4_TENSOR_Q4_K || layer->attn_output_a->type == DS4_TENSOR_Q2_K)
+                  ? attn_output_kq_batch(layer->attn_output_a, g->attn_out,
+                                                              g->attn_low,
+                                                              model->map,
+                                                              model->size,
+                                                              layer->attn_output_b->abs_offset,
+                                                              group_dim, rank,
+                                                              n_groups, DS4_N_EMBD,
+                                                              g->heads, 1)
+                  : ds4_gpu_attention_output_q8_batch_tensor(g->attn_out,
+                                                             g->attn_low,
+                                                             g->batch_group_tmp,
+                                                             g->batch_low_tmp,
+                                                             model->map,
+                                                             model->size,
+                                                             layer->attn_output_a->abs_offset,
+                                                             layer->attn_output_b->abs_offset,
+                                                             group_dim, rank,
+                                                             n_groups, DS4_N_EMBD,
+                                                             g->heads, 1)) != 0;
     }
     DS4_METAL_PROFILE_DECODE_STAGE("attn_output");
     if (ok) {
@@ -11815,6 +12395,9 @@ static bool metal_graph_encode_decode_layer(
         ok = ds4_gpu_corr_router_bias(g->router_logits, model->corr->layer[il].gdelta,
                                       DS4_N_EXPERT, 1) != 0;
     }
+    /* 路由闭式侧车(type8): δlogits 加在 raw logits 上, select 前(2026-08-19) */
+    if (ok && ds4_zchain_layer_rte(model->zchain, il))
+        ok = ds4_gpu_zchain_route_bias(g->router_logits, g->ffn_norm, il, 1) != 0;
     if (ok) ok = ds4_gpu_router_select_tensor(g->router_selected, g->router_weights, g->router_probs,
                                                 model->map, model->size,
                                                 layer->ffn_exp_probs_b ? layer->ffn_exp_probs_b->abs_offset : 0,
@@ -11836,9 +12419,34 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_i32_tensor("ffn_moe_topk", g->router_selected, DS4_N_EXPERT_USED, il, pos);
         metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->router_weights, DS4_N_EXPERT_USED, il, pos);
     }
+    /* 判决钩: 路由+专家输入钉锚(解算 yq 口径完整还原)。router kernel 仍在队列 →
+     * 必须先定格(signal→flush→host_wait, cap_batch_layer 同款)再覆写, 否则 host 写
+     * 会被之后才执行的 kernel 冲掉。专家前向的 x 同时钉锚: 解算的 yq=专家(锚X0),
+     * 只钉路由不钉专家输入, routed 本身仍与解算对不上。 */
+    ds4_gpu_tensor *anc_moe_x = g->ffn_norm;
+    if (ok && ampanc_on() && g_ampanc.route_on && pos < g_ampanc.S && il < g_ampanc.nl) {
+        const uint64_t anc_ev = ds4_gpu_tp_signal_after_batch();
+        if (anc_ev) { (void)ds4_gpu_flush_commands(); (void)ds4_gpu_tp_host_wait(anc_ev); }
+        const uint64_t anc_row = (uint64_t)il * g_ampanc.S + pos;
+        ok = ds4_gpu_tensor_write(g->router_selected, 0,
+                                  g_ampanc.ridx + anc_row * g_ampanc.nact,
+                                  DS4_N_EXPERT_USED * sizeof(int32_t)) != 0;
+        if (ok) ok = ds4_gpu_tensor_write(g->router_weights, 0,
+                                          g_ampanc.rw + anc_row * g_ampanc.nact,
+                                          DS4_N_EXPERT_USED * sizeof(float)) != 0;
+        if (ok && il < DS4_MAX_LAYER) {
+            if (!g_ampanc.xbuf[il])
+                g_ampanc.xbuf[il] = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+            if (g_ampanc.xbuf[il] &&
+                ds4_gpu_tensor_write(g_ampanc.xbuf[il], 0,
+                                     g_ampanc.fin + anc_row * g_ampanc.dim,
+                                     (uint64_t)DS4_N_EMBD * sizeof(float)) != 0)
+                anc_moe_x = g_ampanc.xbuf[il];
+        }
+    }
     /* zchain GE: fold per-expert gains into the router weights. Must run on
      * ORIGINAL expert ids, i.e. before the compact-slot translate below. */
-    if (ok && model->zchain && ds4_zchain_layer_ge(model->zchain, il)) {
+    if (ok && zch && ds4_zchain_layer_ge(zch, il)) {
         ok = ds4_gpu_zchain_ge_apply(g->router_weights, g->router_selected,
                                      il, DS4_N_EXPERT_USED, 1) != 0;
     }
@@ -11881,6 +12489,8 @@ static bool metal_graph_encode_decode_layer(
         if (es_sel && es_wt) { tp_expert_split = true; es_n = cnt; }
         else { ds4_gpu_tensor_free(es_sel); ds4_gpu_tensor_free(es_wt); es_sel = es_wt = NULL; }
     }
+    const int moe_side_mark = ok ? ds4_gpu_side_mark() : 0;
+    (void)moe_side_mark;
     if (ok && (routed_expert_quant_type(layer) == DS4_TENSOR_GO1B ||
                routed_expert_quant_type(layer) == DS4_TENSOR_GO2B)) {
         /* go1b (strict 1-bit) and go2b (2-bit ±d1±d2, monolithic mixed base) routed
@@ -11910,7 +12520,7 @@ static bool metal_graph_encode_decode_layer(
                                              tp_expert_split ? es_sel : g->router_selected,
                                              tp_expert_split ? es_wt  : g->router_weights,
                                              model_expert_kept_count(model, il),
-                                             es_n, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm,
+                                             es_n, DS4_SWIGLU_CLAMP_EXP, anc_moe_x,
                                              il, 1u, 0u, 0u, &go1b_mid_f16) != 0;
     } else if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
                                                  g->routed_gate,
@@ -11932,7 +12542,7 @@ static bool metal_graph_encode_decode_layer(
                                                  tp_expert_split ? es_sel : g->router_selected,
                                                  tp_expert_split ? es_wt  : g->router_weights,
                                                  model_expert_kept_count(model, il),
-                                                 es_n, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm,
+                                                 es_n, DS4_SWIGLU_CLAMP_EXP, anc_moe_x,
                                                  il) != 0;
     ds4_gpu_tensor_free(es_sel);   /* NULL-safe; views are cheap wrappers */
     ds4_gpu_tensor_free(es_wt);
@@ -12004,9 +12614,21 @@ static bool metal_graph_encode_decode_layer(
     /* zchain λ(x): scale the (now complete) routed output. After the TP
      * all-reduce so every path sees the full routed sum; before the additive
      * corr, matching the quantizer's op order (λ never scales corr terms). */
-    if (ok && (ds4_zchain_layer_has_lambda(model->zchain, il) ||
-               ds4_zchain_layer_zl(model->zchain, il))) {   /* λ 和/或 冻结 z^L 同一派发 */
-        ok = ds4_gpu_zchain_scale_routed(g->routed_out, g->ffn_norm, il, 1) != 0;
+    if (ok && (ds4_zchain_layer_has_lambda(zch, il) ||
+               ds4_zchain_layer_zl(zch, il))) {   /* λ 和/或 冻结 z^L 同一派发 */
+        /* 判决钩: 放大器的 x 钉锚(解算口径还原)。xbuf 无队列写者, host 写先于后续
+         * kernel 提交即序正确; per-layer buf 防跨层复用被未执行的前层 kernel 误读。 */
+        ds4_gpu_tensor *anc_zx = g->ffn_norm;
+        if (ampanc_on() && pos < g_ampanc.S && il < g_ampanc.nl && il < DS4_MAX_LAYER) {
+            if (!g_ampanc.xbuf[il])
+                g_ampanc.xbuf[il] = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+            if (g_ampanc.xbuf[il] &&
+                ds4_gpu_tensor_write(g_ampanc.xbuf[il], 0,
+                                     g_ampanc.fin + ((uint64_t)il * g_ampanc.S + pos) * g_ampanc.dim,
+                                     (uint64_t)DS4_N_EMBD * sizeof(float)) != 0)
+                anc_zx = g_ampanc.xbuf[il];
+        }
+        ok = ds4_gpu_zchain_scale_routed(g->routed_out, anc_zx, il, 1) != 0;
     }
     /* go1b correction: add the low-rank per-expert residual onto the (now full)
      * routed MoE output. Placed after the TP all-reduce so routed_out is complete
@@ -12030,6 +12652,8 @@ static bool metal_graph_encode_decode_layer(
         (shared_dim % 64u) == 0;   /* half must stay 32-block aligned */
     const bool fuse_shared_down_hc =
         !tp_shared_split &&
+        layer->ffn_down_shexp->type == DS4_TENSOR_Q8_0 &&   /* 融合 down+hc kernel 是 q8 专用;
+                                                             * q4_K 落到下方非融合 dense_matmul_typed */
         !keep_ffn_out && !metal_graph_use_reference_shared_down_hc();
     bool corr_delta_live = false;
     /* DS4_CORR_SKIP=1: load the sidecar but skip the decode dispatch — perf
@@ -12086,7 +12710,9 @@ static bool metal_graph_encode_decode_layer(
     const bool fuse_shared_gate_up =
         !tp_shared_split &&
         !g->quality &&
+        layer->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 &&   /* 融合 kernel 是 q8 专用 */
         getenv("DS4_METAL_DISABLE_SHARED_GATE_UP_SWIGLU_FUSION") == NULL;
+    int shared_side = 0;   /* 本层 shared 三件套是否发在侧流(与 MoE 并发) */
     if (ok && tp_shared_split) {
         /* column-parallel gate/up: owned half rows -> shared_mid[0, tp_half). The
          * kernel's output row index starts at 0, so shifting the weight offset by
@@ -12116,16 +12742,20 @@ static bool metal_graph_encode_decode_layer(
                                                          g->ffn_norm,
                                                          DS4_SWIGLU_CLAMP_EXP) != 0;
     } else {
-        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->shared_gate, model->map, model->size,
-                                                  layer->ffn_gate_shexp->abs_offset,
-                                                  DS4_N_EMBD, shared_dim,
-                                                  g->ffn_norm, 1) != 0;
-        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->shared_up, model->map, model->size,
-                                                  layer->ffn_up_shexp->abs_offset,
-                                                  DS4_N_EMBD, shared_dim,
-                                                  g->ffn_norm, 1) != 0;
+        /* 侧流并发: 与 routed MoE(主流)同读 ffn_norm, 输出到 hc_expand_add_split 前汇合 */
+        shared_side = (ok && moe_side_mark) ? ds4_gpu_side_begin() : 0;
+        if (ok) ok = dense_matmul_pair_typed(g->shared_gate, g->shared_up, model,
+                                             layer->ffn_gate_shexp, layer->ffn_up_shexp,
+                                             DS4_N_EMBD, shared_dim, shared_dim, g->ffn_norm) != 0;
         if (ok) ok = ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
                                            shared_dim, DS4_SWIGLU_CLAMP_EXP, 1.0f) != 0;
+        if (ok && shared_side) {
+            ok = dense_matmul_typed(g->shared_out, model, layer->ffn_down_shexp,
+                                      shared_dim, DS4_N_EMBD, g->shared_mid, 1) != 0;
+            if (ok) ok = ds4_gpu_side_join() != 0;
+        } else {
+            (void)ds4_gpu_side_join();
+        }
     }
     DS4_METAL_PROFILE_DECODE_STAGE("shared_gate_up");
     /* keep_ffn_out / fuse_shared_down_hc are declared above the corr dispatch */
@@ -12167,11 +12797,9 @@ static bool metal_graph_encode_decode_layer(
                                                          corr_delta_live ? g->corr_delta : NULL,
                                                          DS4_N_EMBD,
                                                          DS4_N_HC) != 0;
-    } else if (ok) {
-        ok = ds4_gpu_matmul_q8_0_tensor(g->shared_out, model->map, model->size,
-                                          layer->ffn_down_shexp->abs_offset,
-                                          shared_dim, DS4_N_EMBD,
-                                          g->shared_mid, 1) != 0;
+    } else if (ok && !shared_side) {
+        ok = dense_matmul_typed(g->shared_out, model, layer->ffn_down_shexp,
+                                  shared_dim, DS4_N_EMBD, g->shared_mid, 1) != 0;
     }
     DS4_METAL_PROFILE_DECODE_STAGE("shared_down");
     if (ok) {
@@ -12209,6 +12837,7 @@ static bool metal_graph_encode_decode_layer(
     if (ok) {
         metal_graph_debug_dump_tensor("hc_ffn_post", g->after_ffn_hc, hc_dim, il, pos);
     }
+    if (ok) trace_hnorm_layer(g, il, pos, hc_dim);
     return ok;
 }
 
@@ -12260,17 +12889,12 @@ static bool metal_graph_encode_output_head(
     if (ok) {
         metal_graph_debug_dump_tensor("result_norm", g->output_norm, DS4_N_EMBD, DS4_N_LAYER, 0);
     }
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->logits,
-                                              model->map,
-                                              model->size,
-                                              weights->output->abs_offset,
-                                              DS4_N_EMBD,
-                                              vocab_dim,
-                                              g->output_norm,
-                                              1) != 0;
+    if (ok) ok = dense_matmul_typed(g->logits, model, weights->output,
+                                      DS4_N_EMBD, vocab_dim, g->output_norm, 1) != 0;
     if (ok) {
         metal_graph_debug_dump_tensor("result_output", g->logits, vocab_dim, DS4_N_LAYER, 0);
     }
+    if (ok) trace_hnorm_head(g, vocab_dim);
     return ok;
 }
 
@@ -12349,11 +12973,8 @@ static bool metal_graph_encode_output_head_batch(
                                                        DS4_N_EMBD,
                                                        n_tokens,
                                                        DS4_RMS_EPS) != 0;
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(logits,
-                                              model->map,
-                                              model->size,
-                                              weights->output->abs_offset,
-                                              DS4_N_EMBD,
+    if (ok) ok = dense_matmul_typed(logits, model, weights->output,
+                                      DS4_N_EMBD,
                                               vocab_dim,
                                               output_norm,
                                               n_tokens) != 0;
@@ -12400,56 +13021,7 @@ static bool metal_graph_matmul_q8_0_named_tensor(
     (void)module;
     (void)il;
     (void)pos0;
-    const bool ok = ds4_gpu_matmul_q8_0_tensor(out,
-                                                 model->map,
-                                                 model->size,
-                                                 w->abs_offset,
-                                                 in_dim,
-                                                 out_dim,
-                                                 x,
-                                                 n_tok) != 0;
-    return ok;
-}
-
-static bool metal_graph_encode_output_head_mtp(
-        ds4_gpu_graph       *g,
-        const ds4_model       *base_model,
-        const ds4_weights     *base_weights,
-        const ds4_model       *mtp_model,
-        const ds4_mtp_weights *mtp,
-        uint64_t               vocab_dim) {
-    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
-    bool ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
-    if (ok) ok = metal_graph_matmul_plain_tensor(g->output_pre, mtp_model, mtp->hc_head_fn,
-                                                 hc_dim, DS4_N_HC, g->flat_hc, 1);
-    if (ok) ok = ds4_gpu_output_hc_weights_tensor(g->output_weights,
-                                                    g->output_pre,
-                                                    mtp_model->map,
-                                                    mtp_model->size,
-                                                    mtp->hc_head_scale->abs_offset,
-                                                    mtp->hc_head_base->abs_offset,
-                                                    DS4_N_HC,
-                                                    DS4_HC_EPS) != 0;
-    if (ok) ok = ds4_gpu_hc_weighted_sum_tensor(g->output_embd,
-                                                  g->cur_hc,
-                                                  g->output_weights,
-                                                  DS4_N_EMBD,
-                                                  DS4_N_HC) != 0;
-    if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->output_norm,
-                                                  g->output_embd,
-                                                  mtp_model->map,
-                                                  mtp_model->size,
-                                                  mtp->norm->abs_offset,
-                                                  DS4_N_EMBD,
-                                                  DS4_RMS_EPS) != 0;
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->logits,
-                                              base_model->map,
-                                              base_model->size,
-                                              base_weights->output->abs_offset,
-                                              DS4_N_EMBD,
-                                              vocab_dim,
-                                              g->output_norm,
-                                              1) != 0;
+    const bool ok = dense_matmul_typed(out, model, w, in_dim, out_dim, x, n_tok) != 0;
     return ok;
 }
 
@@ -13136,6 +13708,13 @@ static bool metal_graph_encode_token_raw_swa(
         ds4_gpu_tensor *tmp = g->cur_hc;
         g->cur_hc = g->after_ffn_hc;
         g->after_ffn_hc = tmp;
+        /* DSpark: target 层输出 HC 均值 → main_hidden[slot](官方 h.mean(dim=2) 语义;
+         * 0731 固定 dspark_target_layer_ids=[40,41,42]) */
+        if (ok && g->dspark_capture && g->dspark_main_hidden &&
+            il >= 40u && il <= 42u) {
+            ok = ds4_gpu_dspark_hc_mean_tensor(g->dspark_main_hidden, g->cur_hc,
+                                               DS4_N_EMBD, DS4_N_HC, il - 40u, 1) != 0;
+        }
         if (ok && allow_split_flush && split_after_layers != 0 &&
             ((il + 1u) % split_after_layers) == 0 && il + 1u < (uint32_t)DS4_N_LAYER) {
             if (metal_graph_direct_expert_read_enabled()) {
@@ -13297,7 +13876,10 @@ static bool metal_graph_upload_prompt_embeddings_hc(
         uint32_t            n_tokens) {
     if (pos0 > (uint32_t)prompt->len || n_tokens > (uint32_t)prompt->len - pos0) return false;
 
-    uint32_t gpu_min = 512;
+    /* 默认 1(2026-08-21): CPU 侧 embed_token_f16 与 decode 路的 GPU embed kernel 是两套
+     * 解量化实现, 同一 token 差 ~2e-4 —— 这是批 verify 与 decode 分叉的 L0 种子, 实测把
+     * 批/解码 argmax 一致率从 91.7% 抬到 97.9%。批走 GPU 路即与 decode 同源。 */
+    uint32_t gpu_min = 1;
     const char *gpu_min_env = getenv("DS4_METAL_GPU_BATCH_EMBED_MIN");
     if (gpu_min_env && gpu_min_env[0]) {
         char *end = NULL;
@@ -13433,13 +14015,27 @@ static bool metal_graph_q_stage_profile_boundary(
     return ds4_gpu_begin_commands() != 0;
 }
 
-static bool metal_graph_encode_layer_attention_batch(
+/* stages 位掩码(2026-08-21 请求批处理): 1=投影段(hc mix/norm/q/kv, 行无关)
+ * 2=KV 段(压缩器/索引器/注意力, 每行要自己的缓存) 4=出口段(inv_rope/o 投影/hc post,
+ * 行无关)。默认 7 = 整半层, 与改造前逐字节一致。多会话批解码用 1|4 在共享图上批算
+ * 行无关部分, 用 2 逐会话在各自图上算 KV 段。 */
+#define DS4_ATTN_STAGE_PRE   1u
+#define DS4_ATTN_STAGE_KV    2u
+#define DS4_ATTN_STAGE_POST  4u
+#define DS4_ATTN_STAGE_ALL   7u
+/* 8 = 投影段里跳过 q/kv 的 rope 与 kv 的 fp8 量化(它们依赖"这一行的真实位置")。
+ * 多会话批解码时 N 行来自不同会话、位置各不相同, 而 rope 入口只吃一个 pos0 —— 于是
+ * 投影段先不做 rope, 由驱动按行用真实位置逐行补(rope 是逐元素的, 逐行调同一个入口,
+ * 数值与整批调用逐位一致)。 */
+#define DS4_ATTN_STAGE_NOROPE 8u
+static bool metal_graph_encode_layer_attention_batch_stages(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
         const ds4_layer_weights *layer,
         uint32_t                il,
         uint32_t                pos0,
-        uint32_t                n_tokens) {
+        uint32_t                n_tokens,
+        uint32_t                stages) {
     if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
@@ -13487,6 +14083,11 @@ static bool metal_graph_encode_layer_attention_batch(
     ds4_gpu_tensor *after_attn_hc_view = ds4_gpu_tensor_view(
             g->batch_after_attn_hc, 0, (uint64_t)n_tokens * hc_dim * sizeof(float));
     bool ok = hc_mix_view && hc_split_view && attn_cur_view && after_attn_hc_view;
+    if (ok && (stages & DS4_ATTN_STAGE_PRE)) {
+    if (ok) {
+        metal_graph_debug_dump_tensor("hc_in", g->batch_cur_hc,
+                                      (uint64_t)n_tokens * hc_dim, il, pos0);
+    }
     if (ok) ok = ds4_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
                                                       g->batch_cur_hc,
                                                       (uint32_t)hc_dim,
@@ -13500,6 +14101,10 @@ static bool metal_graph_encode_layer_attention_batch(
                                              mix_hc,
                                              g->batch_flat_hc,
                                              n_tokens) != 0;
+    if (ok) {
+        metal_graph_debug_dump_tensor("hc_mix", hc_mix_view,
+                                      (uint64_t)n_tokens * mix_hc, il, pos0);
+    }
     if (metal_graph_use_reference_hc_decode()) {
         if (ok) ok = ds4_gpu_hc_split_sinkhorn_tensor(hc_split_view,
                                                         hc_mix_view,
@@ -13634,7 +14239,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                       (uint64_t)n_tokens * q_dim, il, pos0);
     }
     DS4_METAL_PROFILE_Q_STAGE("head_norm");
-    if (ok) ok = ds4_gpu_rope_tail_tensor(g->batch_q,
+    if (ok && !(stages & DS4_ATTN_STAGE_NOROPE)) ok = ds4_gpu_rope_tail_tensor(g->batch_q,
                                             n_tokens,
                                             DS4_N_HEAD,
                                             DS4_N_HEAD_DIM,
@@ -13682,7 +14287,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                           (uint64_t)n_tokens * DS4_N_HEAD_DIM, il, pos0);
         }
     }
-    if (ok) ok = ds4_gpu_rope_tail_tensor(g->batch_kv,
+    if (ok && !(stages & DS4_ATTN_STAGE_NOROPE)) ok = ds4_gpu_rope_tail_tensor(g->batch_kv,
                                             n_tokens,
                                             DS4_N_HEAD_KV,
                                             DS4_N_HEAD_DIM,
@@ -13700,15 +14305,18 @@ static bool metal_graph_encode_layer_attention_batch(
         metal_graph_debug_dump_tensor("KVrope", g->batch_kv,
                                       (uint64_t)n_tokens * DS4_N_HEAD_DIM, il, pos0);
     }
-    if (ok) ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(g->batch_kv,
-                                                       n_tokens,
-                                                       DS4_N_HEAD_DIM,
-                                                       DS4_N_ROT) != 0;
+    if (ok && !(stages & DS4_ATTN_STAGE_NOROPE))
+        ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(g->batch_kv,
+                                                 n_tokens,
+                                                 DS4_N_HEAD_DIM,
+                                                 DS4_N_ROT) != 0;
     if (ok) {
         metal_graph_debug_dump_tensor("KVcur", g->batch_kv,
                                       (uint64_t)n_tokens * DS4_N_HEAD_DIM, il, pos0);
     }
     DS4_METAL_PROFILE_ATTN_STAGE("kv_path");
+    }   /* stage PRE */
+    if (ok && (stages & DS4_ATTN_STAGE_KV)) {
     /*
      * Static graph order is q, kv, cpy_k(raw SWA), then attention. For a
      * zero-prefix batch it is safe to store the whole batch at once: attention
@@ -13752,7 +14360,9 @@ static bool metal_graph_encode_layer_attention_batch(
         const uint32_t raw_start = metal_graph_raw_start_for_span(g,
                                                                   pos0 + n_tokens - 1u,
                                                                   n_raw);
-        ok = ds4_gpu_store_raw_kv_batch_tensor(g->layer_raw_cache[il],
+        if (ok && g->spec_comp_capture)
+            ok = metal_graph_spec_raw_snapshot(g, il, pos0, n_tokens);
+        if (ok) ok = ds4_gpu_store_raw_kv_batch_tensor(g->layer_raw_cache[il],
                                                  g->batch_kv,
                                                  g->raw_cap,
                                                  pos0,
@@ -13901,6 +14511,17 @@ static bool metal_graph_encode_layer_attention_batch(
             }
             metal_graph_attn_comp_prefill_target_free(attn_comp_target);
         } else {
+            /* spec 捕获(update 前, 行未被就地处理): 本批压缩器输入行 */
+            if (ok && g->spec_comp_capture && n_tokens <= 8u) {
+                const uint64_t rb = (uint64_t)n_tokens * comp_width * sizeof(float);
+                if (!g->spec_comp_rows_kv[il])
+                    g->spec_comp_rows_kv[il] = ds4_gpu_tensor_alloc(8ull * comp_width * sizeof(float));
+                if (!g->spec_comp_rows_sc[il])
+                    g->spec_comp_rows_sc[il] = ds4_gpu_tensor_alloc(8ull * comp_width * sizeof(float));
+                ok = g->spec_comp_rows_kv[il] && g->spec_comp_rows_sc[il] &&
+                     ds4_gpu_tensor_copy(g->spec_comp_rows_kv[il], 0, g->batch_comp_kv, 0, rb) != 0 &&
+                     ds4_gpu_tensor_copy(g->spec_comp_rows_sc[il], 0, g->batch_comp_sc, 0, rb) != 0;
+            }
             const bool aligned_chunk = (pos0 % ratio) == 0u && (n_tokens % ratio) == 0u;
             if (aligned_chunk) {
                 const uint32_t comp_before = g->layer_n_comp[il];
@@ -14304,6 +14925,17 @@ static bool metal_graph_encode_layer_attention_batch(
                     }
                     ds4_gpu_tensor_free(index_view);
                 } else {
+                    /* spec 捕获(update 前): indexer 压缩器输入行 */
+                    if (ok && g->spec_comp_capture && n_tokens <= 8u) {
+                        const uint64_t rb = (uint64_t)n_tokens * index_width * sizeof(float);
+                        if (!g->spec_idx_rows_kv[il])
+                            g->spec_idx_rows_kv[il] = ds4_gpu_tensor_alloc(8ull * index_width * sizeof(float));
+                        if (!g->spec_idx_rows_sc[il])
+                            g->spec_idx_rows_sc[il] = ds4_gpu_tensor_alloc(8ull * index_width * sizeof(float));
+                        ok = g->spec_idx_rows_kv[il] && g->spec_idx_rows_sc[il] &&
+                             ds4_gpu_tensor_copy(g->spec_idx_rows_kv[il], 0, g->batch_comp_kv, 0, rb) != 0 &&
+                             ds4_gpu_tensor_copy(g->spec_idx_rows_sc[il], 0, g->batch_comp_sc, 0, rb) != 0;
+                    }
                     for (uint32_t t = 0; ok && t < n_tokens; t++) {
                         const uint32_t pos = pos0 + t;
                         const bool emit = ((pos + 1u) % ratio) == 0u;
@@ -14376,7 +15008,9 @@ static bool metal_graph_encode_layer_attention_batch(
             bool use_indexed_comp = false;
             double index_stage_t0 = 0.0;
 
-            ok = ds4_gpu_store_raw_kv_batch_tensor(g->layer_raw_cache[il],
+            if (ok && g->spec_comp_capture)
+                ok = metal_graph_spec_raw_snapshot(g, il, pos0, n_tokens);
+            if (ok) ok = ds4_gpu_store_raw_kv_batch_tensor(g->layer_raw_cache[il],
                                                      g->batch_kv,
                                                      g->raw_cap,
                                                      pos0,
@@ -14733,12 +15367,13 @@ static bool metal_graph_encode_layer_attention_batch(
         }
     }
     DS4_METAL_PROFILE_ATTN_STAGE("attention");
-
+    }   /* stage KV */
+    if (ok && (stages & DS4_ATTN_STAGE_POST)) {
     if (ok) {
         metal_graph_debug_dump_tensor("kqv_out", g->batch_heads,
                                       (uint64_t)n_tokens * q_dim, il, pos0);
     }
-    if (ok) ok = ds4_gpu_rope_tail_tensor(g->batch_heads,
+    if (ok && !(stages & DS4_ATTN_STAGE_NOROPE)) ok = ds4_gpu_rope_tail_tensor(g->batch_heads,
                                             n_tokens,
                                             DS4_N_HEAD,
                                             DS4_N_HEAD_DIM,
@@ -14758,20 +15393,32 @@ static bool metal_graph_encode_layer_attention_batch(
     }
     DS4_METAL_PROFILE_ATTN_STAGE("inv_rope");
     if (ok) {
-        ok = ds4_gpu_attention_output_q8_batch_tensor(g->batch_attn_out,
-                                                        g->batch_attn_low,
-                                                        g->batch_group_tmp,
-                                                        g->batch_low_tmp,
-                                                        model->map,
-                                                        model->size,
-                                                        layer->attn_output_a->abs_offset,
-                                                        layer->attn_output_b->abs_offset,
-                                                        group_dim,
-                                                        rank,
-                                                        n_groups,
-                                                        DS4_N_EMBD,
-                                                        g->batch_heads,
-                                                        n_tokens) != 0;
+        ok = ((layer->attn_output_a->type == DS4_TENSOR_Q4_K || layer->attn_output_a->type == DS4_TENSOR_Q2_K)
+                  ? attn_output_kq_batch(layer->attn_output_a, g->batch_attn_out,
+                                                              g->batch_attn_low,
+                                                              model->map,
+                                                              model->size,
+                                                              layer->attn_output_b->abs_offset,
+                                                              group_dim,
+                                                              rank,
+                                                              n_groups,
+                                                              DS4_N_EMBD,
+                                                              g->batch_heads,
+                                                              n_tokens)
+                  : ds4_gpu_attention_output_q8_batch_tensor(g->batch_attn_out,
+                                                             g->batch_attn_low,
+                                                             g->batch_group_tmp,
+                                                             g->batch_low_tmp,
+                                                             model->map,
+                                                             model->size,
+                                                             layer->attn_output_a->abs_offset,
+                                                             layer->attn_output_b->abs_offset,
+                                                             group_dim,
+                                                             rank,
+                                                             n_groups,
+                                                             DS4_N_EMBD,
+                                                             g->batch_heads,
+                                                             n_tokens)) != 0;
     }
     if (ok) {
         metal_graph_debug_dump_tensor("attn_low", g->batch_attn_low,
@@ -14798,6 +15445,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                       (uint64_t)n_tokens * hc_dim, il, pos0);
     }
     DS4_METAL_PROFILE_ATTN_STAGE("hc_post");
+    }   /* stage POST */
     ds4_gpu_tensor_free(after_attn_hc_view);
     ds4_gpu_tensor_free(attn_cur_view);
     ds4_gpu_tensor_free(hc_split_view);
@@ -14811,6 +15459,14 @@ static bool metal_graph_encode_layer_attention_batch(
 
 /* Encode the batched prefill FFN half: HC pre/norm, shared expert, routed
  * experts, sum, and HC post. */
+static bool metal_graph_encode_layer_ffn_batch_ex(
+        ds4_gpu_graph  *g,
+        const ds4_model        *model,
+        const ds4_layer_weights *layer,
+        uint32_t                il,
+        uint32_t                pos0,
+        uint32_t                n_tokens,
+        bool                    no_zchain);
 static bool metal_graph_encode_layer_ffn_batch(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -14818,6 +15474,19 @@ static bool metal_graph_encode_layer_ffn_batch(
         uint32_t                il,
         uint32_t                pos0,
         uint32_t                n_tokens) {
+    return metal_graph_encode_layer_ffn_batch_ex(g, model, layer, il, pos0, n_tokens, false);
+}
+static bool metal_graph_encode_layer_ffn_batch_ex(
+        ds4_gpu_graph  *g,
+        const ds4_model        *model,
+        const ds4_layer_weights *layer,
+        uint32_t                il,
+        uint32_t                pos0,
+        uint32_t                n_tokens,
+        bool                    no_zchain) {
+    /* no_zchain(2026-08-21): dspark drafter 复用 il=0 批段, 旧注释"L0 无 z 语义中性"
+     * 在 amp42 链(L0 有 AMP)下过时 → mtp 层误吃 L0 放大器。drafter 调用旁路侧车。 */
+    const struct ds4_zchain *zch = no_zchain ? NULL : model->zchain;
     if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
@@ -14925,6 +15594,9 @@ static bool metal_graph_encode_layer_ffn_batch(
                                       DS4_N_EXPERT, n_tokens) != 0;
     }
 
+    /* 路由闭式侧车(type8): 批路同挂, select 前(2026-08-19) */
+    if (ok && ds4_zchain_layer_rte(zch, il))
+        ok = ds4_gpu_zchain_route_bias(g->batch_router_logits, g->batch_ffn_norm, il, n_tokens) != 0;
     if (ok) ok = ds4_gpu_router_select_batch_tensor(g->batch_router_selected,
                                                       g->batch_router_weights,
                                                       g->batch_router_probs,
@@ -14943,6 +15615,11 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                       DS4_N_EXPERT_USED,
                                                       DS4_EXPERT_WEIGHT_SCALE,
                                                       n_tokens, il) != 0;
+    /* 路由空槽消毒(必须在 sorted-pairs 记账之前): -1 槽会造成 counts[-1] 越界原子写 +
+     * 该 pair 无 tile ⇒ mid 槽未初始化 ⇒ down 读垃圾(drafter 同输入两跑草稿全不同的真因)。 */
+    if (ok) ok = ds4_gpu_sanitize_router_tensor(g->batch_router_selected, g->batch_router_weights,
+                                                (uint32_t)n_tokens * DS4_N_EXPERT_USED,
+                                                model_expert_kept_count(model, il)) != 0;
     if (ok) router_freq_collect(g->batch_router_logits, il, n_tokens);
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_logits", g->batch_router_logits,
@@ -14989,7 +15666,42 @@ static bool metal_graph_encode_layer_ffn_batch(
         tpb_slot_start = g->tp_owns_low ? 0u : k;
         tpb_slot_count = g->tp_owns_low ? k : (DS4_N_EXPERT_USED - k);
     }
-    if (ok) {
+    /* 小批 MoE 快路(2026-08-21 投机战役): ≤8 tok 逐 token 走 decode 单 token 路
+     * (lut_gate/direct_down_sum6, 实测 0.2ms/层/token vs tile8 批路 2.35ms/层)。
+     * verify(6)/draft(5)/replay(1-3) 全吃到; prefill 大批不受影响。DS4_SPEC_MOE_BATCH=1 回退。 */
+    if (ok && n_tokens <= 8u && !tp_batch_split && !model->expert_shrunken &&
+        getenv("DS4_SPEC_MOE_PER_TOKEN") != NULL) {   /* 实验开关: 默认批路(逐token路 -21ms 但 acc -0.4 净亏) */
+        for (uint32_t t = 0; ok && t < n_tokens; t++) {
+            ds4_gpu_tensor *xv = metal_graph_tensor_row_view(g->batch_ffn_norm, t, DS4_N_EMBD);
+            ds4_gpu_tensor *ov = metal_graph_tensor_row_view(g->batch_routed_out, t, DS4_N_EMBD);
+            ds4_gpu_tensor *sv = metal_graph_tensor_row_view(g->batch_router_selected, t, DS4_N_EXPERT_USED);
+            ds4_gpu_tensor *wv = metal_graph_tensor_row_view(g->batch_router_weights, t, DS4_N_EXPERT_USED);
+            ok = xv && ov && sv && wv &&
+                 ds4_gpu_routed_moe_one_tensor(ov,
+                                               g->batch_routed_gate, g->batch_routed_up,
+                                               g->batch_routed_mid, g->batch_routed_down,
+                                               residual_set_for(model, il),
+                                               model->map, model->size,
+                                               routed_expert_gate_off(layer),
+                                               routed_expert_up_off(layer),
+                                               layer->ffn_down_exps->abs_offset,
+                                               routed_expert_quant_type(layer),
+                                               layer->ffn_down_exps->type,
+                                               gate_expert_bytes, gate_row_bytes,
+                                               down_expert_bytes, down_row_bytes,
+                                               (uint32_t)expert_in_dim,
+                                               (uint32_t)down_in_dim,
+                                               (uint32_t)routed_out_dim,
+                                               sv, wv,
+                                               model_expert_kept_count(model, il),
+                                               DS4_N_EXPERT_USED,
+                                               DS4_SWIGLU_CLAMP_EXP,
+                                               xv, il) != 0;
+            ds4_gpu_tensor_free(wv); ds4_gpu_tensor_free(sv);
+            ds4_gpu_tensor_free(ov); ds4_gpu_tensor_free(xv);
+        }
+        g->batch_routed_mid_is_f16 = false;   /* 单 token 路 mid 中间态与批口径无关 */
+    } else if (ok) {
         ok = ds4_gpu_routed_moe_batch_tensor(g->batch_routed_out,
                                                g->batch_routed_gate,
                                                g->batch_routed_up,
@@ -15098,7 +15810,21 @@ static bool metal_graph_encode_layer_ffn_batch(
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
     DS4_METAL_PROFILE_FFN_STAGE("routed_moe");
-    if (ok) ok = metal_graph_matmul_q8_0_named_tensor("shared_gate",
+    /* shexp gate+up 批 pair 融合(2026-08-21): 同输入两矩阵一发 —— 小矩阵单发在 6-token
+     * 批下只有 ~35GB/s(gx 小并行度不足), 合并后行数翻倍且权重只读一遍。不适用则回退。 */
+    bool shexp_pair_done = false;
+    if (ok && n_tokens > 1u &&
+        layer->ffn_gate_shexp->type == DS4_TENSOR_Q2_K &&
+        layer->ffn_up_shexp->type == DS4_TENSOR_Q2_K &&
+        getenv("DS4_NO_SHEXP_PAIR") == NULL) {
+        shexp_pair_done = ds4_gpu_matmul_q2_K_pair_batch_tensor(
+                g->batch_shared_gate, g->batch_shared_up,
+                model->map, model->size,
+                layer->ffn_gate_shexp->abs_offset, layer->ffn_up_shexp->abs_offset,
+                DS4_N_EMBD, shared_dim, shared_dim,
+                g->batch_ffn_norm, n_tokens) != 0;
+    }
+    if (ok && !shexp_pair_done) ok = metal_graph_matmul_q8_0_named_tensor("shared_gate",
                                                       il,
                                                       pos0,
                                                       g->batch_shared_gate,
@@ -15108,7 +15834,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                       shared_dim,
                                                       g->batch_ffn_norm,
                                                       n_tokens);
-    if (ok) ok = metal_graph_matmul_q8_0_named_tensor("shared_up",
+    if (ok && !shexp_pair_done) ok = metal_graph_matmul_q8_0_named_tensor("shared_up",
                                                       il,
                                                       pos0,
                                                       g->batch_shared_up,
@@ -15186,6 +15912,50 @@ static bool metal_graph_encode_layer_ffn_batch(
 }
 
 /* Encode one complete layer for prefill by chaining attention and FFN batches. */
+/* DS4_EVAL_HDUMP=<dir>: 每层出口 HC 隐状态整批追加写出 h_L%02d.bin
+ * (f32, [S][DS4_N_HC][DS4_N_EMBD], chunk 顺序即 token 顺序)。
+ * 挂在 HC 交换之后 —— 那时 batch_cur_hc 才是本层出口。GPU 定格用 cap_batch_layer
+ * 同款 signal→flush→host_wait: 本层的核还在队列里, 不 drain 就 read 会拿到上一层
+ * 残值(2026-07-22 那次 off-by-one 就是这么来的)。流式写盘, 不驻留。 */
+static void eval_hdump_batch_layer(ds4_gpu_graph *g, uint32_t il, uint32_t n_tokens) {
+    const char *dir = getenv("DS4_EVAL_HDUMP");
+    if (!dir || !dir[0] || n_tokens == 0) return;
+    {
+        const uint64_t ev = ds4_gpu_tp_signal_after_batch();
+        if (ev) { (void)ds4_gpu_flush_commands(); (void)ds4_gpu_tp_host_wait(ev); }
+    }
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const size_t nf = (size_t)n_tokens * hc_dim;
+    float *buf = malloc(nf * sizeof(float));
+    if (!buf) return;
+    if (ds4_gpu_tensor_read(g->batch_cur_hc, 0, buf, nf * sizeof(float))) {
+        char p[1024];
+        snprintf(p, sizeof p, "%s/h_L%02u.bin", dir, il);
+        FILE *f = fopen(p, "ab");
+        if (!f) {
+            fprintf(stderr, "ds4: [EVAL_HDUMP] 打不开 %s -- aborting\n", p);
+            exit(1);
+        }
+        if (fwrite(buf, sizeof(float), nf, f) != nf) {
+            fprintf(stderr, "ds4: [EVAL_HDUMP] 写 %s 短写 -- aborting\n", p);
+            exit(1);
+        }
+        fclose(f);
+    }
+    free(buf);
+}
+
+static bool metal_graph_encode_layer_attention_batch(
+        ds4_gpu_graph  *g,
+        const ds4_model        *model,
+        const ds4_layer_weights *layer,
+        uint32_t                il,
+        uint32_t                pos0,
+        uint32_t                n_tokens) {
+    return metal_graph_encode_layer_attention_batch_stages(g, model, layer, il, pos0,
+                                                           n_tokens, DS4_ATTN_STAGE_ALL);
+}
+
 static bool metal_graph_encode_layer_batch(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -15193,17 +15963,691 @@ static bool metal_graph_encode_layer_batch(
         uint32_t                il,
         uint32_t                pos0,
         uint32_t                n_tokens) {
-    bool ok = metal_graph_encode_layer_attention_batch(g, model, layer, il, pos0, n_tokens);
+    const bool attn_ok = metal_graph_encode_layer_attention_batch(g, model, layer, il, pos0, n_tokens);
+    bool ok = attn_ok;
     if (ok) ok = metal_graph_encode_layer_ffn_batch(g, model, layer, il, pos0, n_tokens);
+    if (!ok && getenv("DS4_GRAPH_FAIL_TRACE"))
+        fprintf(stderr, "ds4: [fail-trace] L%u %s_batch failed\n", il, attn_ok ? "ffn" : "attention");
     if (ok) {
         ds4_gpu_tensor *tmp = g->batch_cur_hc;
         g->batch_cur_hc = g->batch_next_hc;
         g->batch_next_hc = tmp;
     }
+    /* DSpark prefill 抓取(层出口 HC 均值)与建窗: prompt 每 token 的 main_kv 进环形窗,
+     * 与官方 prefill(start_pos==0 只建 KV)语义一致 */
+    if (getenv("DS4_DSPARK_DIAG") && il == 42u)
+        fprintf(stderr, "ds4: [dspark-diag] prefill L42 cap=%d pf=%p bound=%p n=%u\n",
+                g->dspark_capture, (void *)g->dspark_pf_hidden,
+                (const void *)g_dspark_bound_for_prefill, n_tokens);
+    if (ok && g->dspark_capture && g->dspark_pf_hidden && il >= 40u && il <= 42u) {
+        ok = ds4_gpu_dspark_hc_mean_tensor(g->dspark_pf_hidden, g->batch_cur_hc,
+                                           DS4_N_EMBD, DS4_N_HC, il - 40u, n_tokens) != 0;
+        if (ok && il == 42u && g_dspark_bound_for_prefill) {
+            const ds4_dspark_weights *dw = g_dspark_bound_for_prefill;
+            const ds4_model *dmodel = dw->src ? dw->src : model;
+            const float fb = DS4_ROPE_FREQ_BASE, fs = 1.0f;
+            ok = dense_matmul_typed(g->dspark_pf_x, dmodel, dw->main_proj,
+                                    3ull * DS4_N_EMBD, DS4_N_EMBD, g->dspark_pf_hidden, n_tokens) != 0;
+            if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->dspark_pf_x, g->dspark_pf_x,
+                                                             dmodel->map, dmodel->size,
+                                                             dw->main_norm->abs_offset,
+                                                             DS4_N_EMBD, n_tokens, DS4_RMS_EPS) != 0;
+            for (uint32_t b = 0; ok && b < (uint32_t)dw->n_blocks; b++) {
+                ok = dense_matmul_typed(g->dspark_pf_kv, dmodel, dw->block[b].attn_kv,
+                                        DS4_N_EMBD, DS4_N_HEAD_DIM, g->dspark_pf_x, n_tokens) != 0;
+                if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->dspark_pf_kv, g->dspark_pf_kv,
+                                                                 dmodel->map, dmodel->size,
+                                                                 dw->block[b].attn_kv_a_norm->abs_offset,
+                                                                 DS4_N_HEAD_DIM, n_tokens, DS4_RMS_EPS) != 0;
+                if (ok) ok = ds4_gpu_rope_tail_tensor(g->dspark_pf_kv, n_tokens, 1, DS4_N_HEAD_DIM,
+                                                      DS4_N_ROT, pos0, 0, false, fb, fs, 0.0f, 1.0f,
+                                                      DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
+                /* verify 批(spec_comp_capture=1)先暂存不落窗(2026-08-21 修): drafter 的 128 环形窗
+                 * 是"位置 p → 槽 p%128"。verify 会写 k 个候选, 其中被拒的那几个把 128 位之前
+                 * 仍在窗内的有效行盖掉, 且没有任何东西会把它们改回来 —— 窗口逐轮累积污染,
+                 * drafter 越跑越瞎(实测首位接受率 0.82 → 0.59)。改为按接受数提交。 */
+                if (ok && g->spec_comp_capture && b < 3u && g->dspark_spec_kv[b] &&
+                    n_tokens <= (uint32_t)DS4_DSPARK_BLK + 1u) {
+                    ok = ds4_gpu_tensor_copy(g->dspark_spec_kv[b], 0, g->dspark_pf_kv, 0,
+                                             (uint64_t)n_tokens * DS4_N_HEAD_DIM * sizeof(float)) != 0;
+                } else if (ok) {
+                    ok = ds4_gpu_dspark_win_scatter_tensor(g->dspark_win_kv[b], g->dspark_pf_kv,
+                                                           n_tokens, pos0, DS4_DSPARK_WIN,
+                                                           DS4_N_HEAD_DIM) != 0;
+                }
+            }
+        }
+    }
+    if (ok) eval_hdump_batch_layer(g, il, n_tokens);
     return ok;
 }
 
 /* Execute one Metal decode token and read back logits. */
+/* =========================================================================
+ * DSpark 块并行 drafter (2026-08-18, 语义=hf/inference/model.py)。
+ * 每 decode 步: ①main_x=main_norm(main_proj(main_hidden[3×4096]))
+ * ②每块层 main_kv=rope(kv_norm(wkv(main_x))) 写环形窗 pos%128
+ * ③draft: [anchor,noise×4] embed→HC→3 层(手写 attn: 窗+块内因果 / FFN 复用批段)
+ * ④hc_head→norm→lm_head→markov 链 5 步 → draft ids。
+ * drafter KV 全 f32(草稿路径, verify 兜底正确性)。 */
+
+/* spec replay 消除(2026-08-20): restore(轮前态)后, 用 verify 批捕获的压缩器/indexer
+ * 输入行快进 acc 位。与 replay 全前向等价 —— KV raw 行 verify 已写好且 restore 不动,
+ * 唯一需要推进的就是压缩器滚动态; 输入行两次前向逐位相同(同 token 同前缀)。 */
+static bool metal_graph_spec_comp_fastforward(ds4_gpu_graph *g, const ds4_model *model,
+                                              const ds4_weights *weights,
+                                              uint32_t pos0, uint32_t acc) {
+    bool ok = true;
+    for (uint32_t il = 0; ok && il < (uint32_t)DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        const ds4_layer_weights *layer = &weights->layer[il];
+        const uint32_t coff = ratio == 4 ? 2u : 1u;
+        const uint32_t comp_width = coff * DS4_N_HEAD_DIM;
+        const float freq_base = layer_rope_freq_base(il);
+        const float freq_scale = layer_rope_freq_scale(il);
+        const float ext_factor = DS4_ROPE_SCALE_FACTOR > 1.0f ? 1.0f : 0.0f;
+        float attn_factor = 1.0f;
+        if (ext_factor != 0.0f && freq_scale > 0.0f)
+            attn_factor /= 1.0f + 0.1f * logf(1.0f / freq_scale);
+        if (!g->spec_comp_rows_kv[il] || !g->spec_comp_rows_sc[il]) return false;
+        for (uint32_t t = 0; ok && t < acc; t++) {
+            const uint32_t pos = pos0 + t;
+            const bool emit = ((pos + 1u) % ratio) == 0u;
+            if (emit && g->layer_n_comp[il] >= g->layer_comp_cap[il]) { ok = false; break; }
+            ds4_gpu_tensor *kv_view = metal_graph_tensor_row_view(g->spec_comp_rows_kv[il], t, comp_width);
+            ds4_gpu_tensor *sc_view = metal_graph_tensor_row_view(g->spec_comp_rows_sc[il], t, comp_width);
+            const uint32_t comp_row = g->layer_n_comp[il];
+            ok = kv_view && sc_view &&
+                 ds4_gpu_compressor_update_tensor(kv_view, sc_view,
+                        g->layer_attn_state_kv[il], g->layer_attn_state_score[il],
+                        metal_graph_attn_comp_update_target(g, il),
+                        model->map, model->size,
+                        layer->attn_compressor_ape->abs_offset, layer->attn_compressor_ape->type,
+                        layer->attn_compressor_norm->abs_offset, layer->attn_compressor_norm->type,
+                        DS4_N_HEAD_DIM, ratio, pos,
+                        metal_graph_attn_comp_update_row(comp_row),
+                        DS4_N_ROT, (uint32_t)DS4_ROPE_ORIG_CTX,
+                        freq_base, freq_scale, ext_factor, attn_factor,
+                        DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW, DS4_RMS_EPS) != 0;
+            if (ok && emit) {
+                ds4_gpu_tensor *comp_row_view = metal_graph_attn_comp_row_view(g, il, comp_row);
+                ok = comp_row_view &&
+                     ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_row_view, 1, DS4_N_HEAD_DIM, DS4_N_ROT) != 0;
+                ds4_gpu_tensor_free(comp_row_view);
+                if (ok) ok = metal_graph_commit_attn_comp_stage(g, il, comp_row, 1);
+            }
+            if (ok && emit) g->layer_n_comp[il]++;
+            ds4_gpu_tensor_free(sc_view);
+            ds4_gpu_tensor_free(kv_view);
+        }
+        if (ok && ratio == 4) {
+            const uint32_t index_width = coff * DS4_N_INDEXER_HEAD_DIM;
+            if (!g->spec_idx_rows_kv[il] || !g->spec_idx_rows_sc[il]) return false;
+            for (uint32_t t = 0; ok && t < acc; t++) {
+                const uint32_t pos = pos0 + t;
+                const bool emit = ((pos + 1u) % ratio) == 0u;
+                if (emit && g->layer_n_index_comp[il] >= g->layer_comp_cap[il]) { ok = false; break; }
+                ds4_gpu_tensor *kv_view = metal_graph_tensor_row_view(g->spec_idx_rows_kv[il], t, index_width);
+                ds4_gpu_tensor *sc_view = metal_graph_tensor_row_view(g->spec_idx_rows_sc[il], t, index_width);
+                const uint32_t index_row = g->layer_n_index_comp[il];
+                ok = kv_view && sc_view &&
+                     ds4_gpu_compressor_update_tensor(kv_view, sc_view,
+                            g->layer_index_state_kv[il], g->layer_index_state_score[il],
+                            g->layer_index_comp_cache[il],
+                            model->map, model->size,
+                            layer->indexer_compressor_ape->abs_offset, layer->indexer_compressor_ape->type,
+                            layer->indexer_compressor_norm->abs_offset, layer->indexer_compressor_norm->type,
+                            DS4_N_INDEXER_HEAD_DIM, ratio, pos, index_row,
+                            DS4_N_ROT, (uint32_t)DS4_ROPE_ORIG_CTX,
+                            freq_base, freq_scale, ext_factor, attn_factor,
+                            DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW, DS4_RMS_EPS) != 0;
+                if (ok && emit) {
+                    ds4_gpu_tensor *iv = ds4_gpu_tensor_view(g->layer_index_comp_cache[il],
+                            (uint64_t)index_row * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                            (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+                    ok = iv && ds4_gpu_dsv4_indexer_qat_tensor(iv, 1, DS4_N_INDEXER_HEAD_DIM) != 0;
+                    ds4_gpu_tensor_free(iv);
+                }
+                if (ok && emit) g->layer_n_index_comp[il]++;
+                ds4_gpu_tensor_free(sc_view);
+                ds4_gpu_tensor_free(kv_view);
+            }
+        }
+    }
+    return ok;
+}
+
+/* verify 前后的压缩器状态快照/恢复(partial-accept 用 restore+重放, 官方
+ * checkpoint-restore 同口径)。快照 ~数十 MB 拷贝, 0.2ms 级。 */
+/* verify 批把 k 个候选的 raw KV 写进 SWA 环, 而环容量恰等于窗口(raw_cap==raw_window),
+ * 于是被拒候选的行会盖掉"仍在窗内"的旧位置, 且此后没有任何东西把它们改回来 ——
+ * 主模型后续 token 的注意力就会读到被拒草稿的 KV。写前存旧行, 定了 acc 再把被拒的还原。
+ * 行是 (pos0+t)%cap 连续段, 最多两段拷贝/层。 */
+static bool metal_graph_spec_raw_snapshot(ds4_gpu_graph *g, uint32_t il, uint32_t pos0, uint32_t n) {
+    if (il >= (uint32_t)DS4_N_LAYER || !g->spec_raw_save[il] || !g->layer_raw_cache[il] ||
+        n == 0 || n > (uint32_t)DS4_DSPARK_BLK + 1u || g->raw_cap == 0) return true;
+    const uint64_t rb = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+    const uint32_t start = pos0 % g->raw_cap;
+    const uint32_t first = (start + n <= g->raw_cap) ? n : (g->raw_cap - start);
+    if (!ds4_gpu_tensor_copy(g->spec_raw_save[il], 0, g->layer_raw_cache[il],
+                             (uint64_t)start * rb, (uint64_t)first * rb)) return false;
+    if (first < n &&
+        !ds4_gpu_tensor_copy(g->spec_raw_save[il], (uint64_t)first * rb,
+                             g->layer_raw_cache[il], 0, (uint64_t)(n - first) * rb)) return false;
+    return true;
+}
+
+static bool metal_graph_spec_raw_restore(ds4_gpu_graph *g, uint32_t pos0, uint32_t from, uint32_t to) {
+    if (from >= to || g->raw_cap == 0) return true;
+    /* 被拒的是 [from,to) 这一段连续位置 ⇒ 环上最多两段, 每层 1-2 次拷贝(逐行拷会发
+     * 215 次小拷贝, 实测吃掉 ~3ms/轮)。 */
+    const uint64_t rb = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+    const uint32_t n = to - from;
+    const uint32_t start = (pos0 + from) % g->raw_cap;
+    const uint32_t first = (start + n <= g->raw_cap) ? n : (g->raw_cap - start);
+    for (uint32_t il = 0; il < (uint32_t)DS4_N_LAYER; il++) {
+        if (!g->spec_raw_save[il] || !g->layer_raw_cache[il]) continue;
+        if (!ds4_gpu_tensor_copy(g->layer_raw_cache[il], (uint64_t)start * rb,
+                                 g->spec_raw_save[il], (uint64_t)from * rb,
+                                 (uint64_t)first * rb)) return false;
+        if (first < n &&
+            !ds4_gpu_tensor_copy(g->layer_raw_cache[il], 0,
+                                 g->spec_raw_save[il], (uint64_t)(from + first) * rb,
+                                 (uint64_t)(n - first) * rb)) return false;
+    }
+    return true;
+}
+
+/* 把 verify 批暂存的 drafter KV 按接受数提交进环形窗(只提交真正被接受的位置)。 */
+static bool metal_graph_dspark_win_commit(ds4_gpu_graph *g, uint32_t pos0, uint32_t n_acc) {
+    if (n_acc == 0) return true;
+    for (uint32_t b = 0; b < 3u; b++) {
+        if (!g->dspark_spec_kv[b] || !g->dspark_win_kv[b]) continue;
+        if (!ds4_gpu_dspark_win_scatter_tensor(g->dspark_win_kv[b], g->dspark_spec_kv[b],
+                                               n_acc, pos0, DS4_DSPARK_WIN,
+                                               DS4_N_HEAD_DIM)) return false;
+    }
+    return true;
+}
+
+static bool metal_graph_dspark_state_snapshot(ds4_gpu_graph *g) {
+    for (uint32_t il = 0; il < (uint32_t)DS4_N_LAYER; il++) {
+        if (!g->spec_prefix1_attn_state_kv[il] || !g->layer_attn_state_kv[il]) continue;
+        const uint64_t bytes = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
+        g->spec_prefix1_n_comp[il] = g->layer_n_comp[il];
+        if (!ds4_gpu_tensor_copy(g->spec_prefix1_attn_state_kv[il], 0,
+                                 g->layer_attn_state_kv[il], 0, bytes) ||
+            !ds4_gpu_tensor_copy(g->spec_prefix1_attn_state_score[il], 0,
+                                 g->layer_attn_state_score[il], 0, bytes)) return false;
+        if (g->spec_prefix1_index_state_kv[il] && g->layer_index_state_kv[il]) {
+            const uint64_t ib = ds4_gpu_tensor_bytes(g->layer_index_state_kv[il]);
+            g->spec_prefix1_n_index_comp[il] = g->layer_n_index_comp[il];
+            if (!ds4_gpu_tensor_copy(g->spec_prefix1_index_state_kv[il], 0,
+                                     g->layer_index_state_kv[il], 0, ib) ||
+                !ds4_gpu_tensor_copy(g->spec_prefix1_index_state_score[il], 0,
+                                     g->layer_index_state_score[il], 0, ib)) return false;
+        }
+    }
+    return true;
+}
+
+static bool metal_graph_dspark_state_restore(ds4_gpu_graph *g) {
+    for (uint32_t il = 0; il < (uint32_t)DS4_N_LAYER; il++) {
+        if (!g->spec_prefix1_attn_state_kv[il] || !g->layer_attn_state_kv[il]) continue;
+        const uint64_t bytes = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
+        g->layer_n_comp[il] = g->spec_prefix1_n_comp[il];
+        if (!ds4_gpu_tensor_copy(g->layer_attn_state_kv[il], 0,
+                                 g->spec_prefix1_attn_state_kv[il], 0, bytes) ||
+            !ds4_gpu_tensor_copy(g->layer_attn_state_score[il], 0,
+                                 g->spec_prefix1_attn_state_score[il], 0, bytes)) return false;
+        if (g->spec_prefix1_index_state_kv[il] && g->layer_index_state_kv[il]) {
+            const uint64_t ib = ds4_gpu_tensor_bytes(g->layer_index_state_kv[il]);
+            g->layer_n_index_comp[il] = g->spec_prefix1_n_index_comp[il];
+            if (!ds4_gpu_tensor_copy(g->layer_index_state_kv[il], 0,
+                                     g->spec_prefix1_index_state_kv[il], 0, ib) ||
+                !ds4_gpu_tensor_copy(g->layer_index_state_score[il], 0,
+                                     g->spec_prefix1_index_state_score[il], 0, ib)) return false;
+        }
+    }
+    return true;
+}
+
+/* out_conf(可空): 逐位置置信 c_k, 调度器用 ∏c 选验证长度(论文 Alg.1)。 */
+static bool metal_graph_dspark_step_n(
+        ds4_gpu_graph *g,
+        const ds4_model *model,
+        const ds4_weights *weights,
+        const ds4_dspark_weights *dw,
+        int anchor_token,
+        uint32_t pos,
+        int out_ids[DS4_DSPARK_BLK],
+        uint32_t n_need,
+        float *out_conf) {
+    /* drafter 权重可能在 DS4_DRAFT_GGUF 副文件; 主模型张量(token_embd/output)仍走 model */
+    const ds4_model *dmodel = dw->src ? dw->src : model;
+    const bool sprof = getenv("DS4_DSPARK_STEP_PROF") != NULL;
+    /* GPU 跨度(2026-08-21): 与墙钟对照分离"GPU 真忙" vs "CPU 编码/同步阻塞"。
+     * SP_MARK 自带同步会污染分段归因, 这条跨度不受影响。 */
+    const bool sspan = getenv("DS4_DSPARK_STEP_SPAN") != NULL;
+    const double span_t0 = sspan ? now_sec() : 0.0;
+    if (sspan) ds4_gpu_span_begin();
+    double sp_t0 = sprof ? now_sec() : 0.0;
+    static double sp_acc[6]; static uint32_t sp_n;
+    float sp_sink;
+#define SP_MARK(idx) do { if (sprof) { \
+        (void)ds4_gpu_tensor_read(g->dspark_main_x, 0, &sp_sink, 4); /* 流同步 */ \
+        sp_acc[idx] += now_sec() - sp_t0; sp_t0 = now_sec(); } } while (0)
+    const uint32_t B = DS4_DSPARK_BLK;
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t q_rank = dw->block[0].attn_q_a->dim[1];
+    const uint32_t n_groups = DS4_N_OUT_GROUP;
+    const uint32_t group_heads = DS4_N_HEAD / n_groups;
+    const uint32_t group_dim = DS4_N_HEAD_DIM * group_heads;
+    const uint32_t rank = DS4_N_LORA_O;
+    /* drafter compress_ratio==0: 非压缩 rope 口径(theta=10000, scale=1) —— L0 可能是
+     * 压缩层, 不能借 layer_rope_freq_base(0) */
+    const float freq_base = DS4_ROPE_FREQ_BASE;
+    const float freq_scale = 1.0f;
+    bool ok = true;
+
+    /* ---- ① main_x ---- */
+    if (ok) ok = dense_matmul_typed(g->dspark_main_x_raw, dmodel, dw->main_proj,
+                                    3ull * DS4_N_EMBD, DS4_N_EMBD,
+                                    g->dspark_main_hidden, 1) != 0;
+    if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->dspark_main_x, g->dspark_main_x_raw,
+                                                dmodel->map, dmodel->size,
+                                                dw->main_norm->abs_offset,
+                                                DS4_N_EMBD, DS4_RMS_EPS) != 0;
+
+    /* ---- ② 每块层 main_kv → 环形窗 ---- */
+    const uint32_t win_row = pos % DS4_DSPARK_WIN;
+    if (getenv("DS4_DSPARK_PROBE")) fprintf(stderr, "ds4: [dspark-step] stage A_mainproj ok=%d\n", (int)ok);
+    for (uint32_t b = 0; ok && b < (uint32_t)dw->n_blocks; b++) {
+        ds4_gpu_tensor *rowv = ds4_gpu_tensor_view(g->dspark_win_kv[b],
+                (uint64_t)win_row * DS4_N_HEAD_DIM * sizeof(float),
+                (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
+        ok = rowv != NULL;
+        if (ok) ok = dense_matmul_typed(g->dspark_kv_tmp, dmodel, dw->block[b].attn_kv,
+                                        DS4_N_EMBD, DS4_N_HEAD_DIM,
+                                        g->dspark_main_x, 1) != 0;
+        if (ok) ok = ds4_gpu_rms_norm_weight_tensor(rowv, g->dspark_kv_tmp,
+                                                    dmodel->map, dmodel->size,
+                                                    dw->block[b].attn_kv_a_norm->abs_offset,
+                                                    DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0;
+        if (ok) ok = ds4_gpu_rope_tail_tensor(rowv, 1, 1, DS4_N_HEAD_DIM, DS4_N_ROT,
+                                              pos, 0, false, freq_base, freq_scale,
+                                              0.0f, 1.0f,
+                                              DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
+        ds4_gpu_tensor_free(rowv);
+    }
+    uint32_t n_win = (pos + 1u < DS4_DSPARK_WIN) ? (pos + 1u) : DS4_DSPARK_WIN;
+    if (getenv("DS4_DSPARK_NOWIN")) n_win = 0;   /* 判别实验: 窗贡献归零对照 */
+    /* 对拍 dump(DS4_DSPARK_DUMP=/tmp/dir): main_hidden/main_x/窗行/后续 q/kv 落盘 */
+    const char *ddump = getenv("DS4_DSPARK_DUMP");
+    if (ddump) {
+        char p[512]; FILE *f;
+        float *tmpbuf = xmalloc(3ull * DS4_N_EMBD * sizeof(float));
+        snprintf(p, sizeof(p), "%s/mh_pos%u.bin", ddump, pos);
+        if (ds4_gpu_tensor_read(g->dspark_main_hidden, 0, tmpbuf, 3ull * DS4_N_EMBD * sizeof(float)) &&
+            (f = fopen(p, "wb"))) { fwrite(tmpbuf, 4, 3ull * DS4_N_EMBD, f); fclose(f); }
+        snprintf(p, sizeof(p), "%s/mx_pos%u.bin", ddump, pos);
+        if (ds4_gpu_tensor_read(g->dspark_main_x, 0, tmpbuf, (uint64_t)DS4_N_EMBD * sizeof(float)) &&
+            (f = fopen(p, "wb"))) { fwrite(tmpbuf, 4, DS4_N_EMBD, f); fclose(f); }
+        {
+            float *wf = xmalloc(128ull * DS4_N_HEAD_DIM * sizeof(float));
+            for (uint32_t wb = 0; wb < (uint32_t)dw->n_blocks; wb++) {
+                snprintf(p, sizeof(p), "%s/winfull_b%u_pos%u.bin", ddump, wb, pos);
+                if (ds4_gpu_tensor_read(g->dspark_win_kv[wb], 0, wf, 128ull * DS4_N_HEAD_DIM * sizeof(float)) &&
+                    (f = fopen(p, "wb"))) { fwrite(wf, 4, 128ull * DS4_N_HEAD_DIM, f); fclose(f); }
+            }
+            free(wf);
+        }
+        snprintf(p, sizeof(p), "%s/kvtmp_b2_pos%u.bin", ddump, pos);
+        if (ds4_gpu_tensor_read(g->dspark_kv_tmp, 0, tmpbuf, (uint64_t)DS4_N_HEAD_DIM * sizeof(float)) &&
+            (f = fopen(p, "wb"))) { fwrite(tmpbuf, 4, DS4_N_HEAD_DIM, f); fclose(f); }
+        for (uint32_t b = 0; b < (uint32_t)dw->n_blocks; b++) {
+            snprintf(p, sizeof(p), "%s/winrow_b%u_pos%u.bin", ddump, b, pos);
+            if (ds4_gpu_tensor_read(g->dspark_win_kv[b],
+                    (uint64_t)(pos % DS4_DSPARK_WIN) * DS4_N_HEAD_DIM * sizeof(float),
+                    tmpbuf, (uint64_t)DS4_N_HEAD_DIM * sizeof(float)) &&
+                (f = fopen(p, "wb"))) { fwrite(tmpbuf, 4, DS4_N_HEAD_DIM, f); fclose(f); }
+        }
+        free(tmpbuf);
+    }
+
+    /* ---- ③ 块 embed: [anchor, noise×4] ---- */
+    int32_t ids[DS4_DSPARK_BLK];
+    ids[0] = anchor_token;
+    for (uint32_t i = 1; i < B; i++) ids[i] = DS4_DSPARK_NOISE;
+    if (ok) ok = ds4_gpu_tensor_write(g->dspark_ids, 0, ids, sizeof(ids)) != 0;
+    if (getenv("DS4_DSPARK_PROBE")) fprintf(stderr, "ds4: [dspark-step] stage B_kvwin ok=%d\n", (int)ok);
+    if (ok) ok = ds4_gpu_embed_tokens_hc_tensor(g->batch_cur_hc, g->dspark_ids,
+                                                model->map, model->size,
+                                                weights->token_embd->abs_offset,
+                                                (uint32_t)weights->token_embd->dim[1],
+                                                B, DS4_N_EMBD, DS4_N_HC) != 0;
+
+    SP_MARK(0);   /* main_x + 窗 + embed */
+    /* ---- 3 层 drafter ---- */
+    if (getenv("DS4_DSPARK_PROBE")) fprintf(stderr, "ds4: [dspark-step] stage C_embed ok=%d\n", (int)ok);
+    for (uint32_t b = 0; ok && b < (uint32_t)dw->n_blocks; b++) {
+        const ds4_layer_weights *layer = &dw->block[b];
+        const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+        ds4_gpu_tensor *hc_mix_view = ds4_gpu_tensor_view(g->batch_hc_mix, 0, (uint64_t)B * mix_hc * sizeof(float));
+        ds4_gpu_tensor *hc_split_view = ds4_gpu_tensor_view(g->batch_hc_split, 0, (uint64_t)B * mix_hc * sizeof(float));
+        ds4_gpu_tensor *attn_cur_view = ds4_gpu_tensor_view(g->batch_attn_cur, 0, (uint64_t)B * DS4_N_EMBD * sizeof(float));
+        ds4_gpu_tensor *after_attn_hc_view = ds4_gpu_tensor_view(g->batch_after_attn_hc, 0, (uint64_t)B * hc_dim * sizeof(float));
+        ok = hc_mix_view && hc_split_view && attn_cur_view && after_attn_hc_view;
+        /* hc_pre(attn) */
+        if (ok) ok = ds4_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc, g->batch_cur_hc,
+                                                        (uint32_t)hc_dim, B, DS4_RMS_EPS) != 0;
+        if (ok) ok = ds4_gpu_matmul_f16_tensor(hc_mix_view, dmodel->map, dmodel->size,
+                                               layer->hc_attn_fn->abs_offset,
+                                               hc_dim, mix_hc, g->batch_flat_hc, B) != 0;
+        if (ok) ok = ds4_gpu_hc_split_weighted_sum_tensor(attn_cur_view, hc_split_view, hc_mix_view,
+                                                          g->batch_cur_hc, dmodel->map, dmodel->size,
+                                                          layer->hc_attn_scale->abs_offset,
+                                                          layer->hc_attn_base->abs_offset,
+                                                          DS4_N_EMBD, DS4_N_HC,
+                                                          DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS) != 0;
+        if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->batch_attn_norm, g->batch_attn_cur,
+                                                         dmodel->map, dmodel->size,
+                                                         layer->attn_norm->abs_offset,
+                                                         DS4_N_EMBD, B, DS4_RMS_EPS) != 0;
+        /* q 链 + 块内 kv */
+        if (ok) ok = metal_graph_matmul_q8_0_named_tensor("attn_q_a", 43 + (int)b, pos,
+                                                          g->batch_qr, dmodel, layer->attn_q_a,
+                                                          DS4_N_EMBD, q_rank, g->batch_attn_norm, B);
+        if (ok) ok = metal_graph_matmul_q8_0_named_tensor("attn_kv", 43 + (int)b, pos,
+                                                          g->batch_kv_raw, dmodel, layer->attn_kv,
+                                                          DS4_N_EMBD, DS4_N_HEAD_DIM, g->batch_attn_norm, B);
+        if (ok) ok = ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(g->batch_qr_norm, g->batch_qr,
+                                                           dmodel->map, dmodel->size,
+                                                           layer->attn_q_a_norm->abs_offset,
+                                                           (uint32_t)q_rank,
+                                                           g->batch_kv, g->batch_kv_raw,
+                                                           layer->attn_kv_a_norm->abs_offset,
+                                                           DS4_N_HEAD_DIM, B, DS4_RMS_EPS) != 0;
+        if (ok) ok = metal_graph_matmul_q8_0_named_tensor("attn_q_b", 43 + (int)b, pos,
+                                                          g->batch_q, dmodel, layer->attn_q_b,
+                                                          q_rank, q_dim, g->batch_qr_norm, B);
+        if (ok) ok = ds4_gpu_head_rms_norm_tensor(g->batch_q, B, DS4_N_HEAD, DS4_N_HEAD_DIM,
+                                                  DS4_RMS_EPS) != 0;
+        if (ok) ok = ds4_gpu_rope_tail_tensor(g->batch_q, B, DS4_N_HEAD, DS4_N_HEAD_DIM,
+                                              DS4_N_ROT, pos + 1u, 0, false,
+                                              freq_base, freq_scale, 0.0f, 1.0f,
+                                              DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
+        if (ok) ok = ds4_gpu_rope_tail_tensor(g->batch_kv, B, 1, DS4_N_HEAD_DIM,
+                                              DS4_N_ROT, pos + 1u, 0, false,
+                                              freq_base, freq_scale, 0.0f, 1.0f,
+                                              DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
+        if (ok && ddump && b == 0) {
+            char p[512]; FILE *f;
+            float *qb = xmalloc((uint64_t)B * DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(float));
+            snprintf(p, sizeof(p), "%s/q_b0_pos%u.bin", ddump, pos);
+            if (ds4_gpu_tensor_read(g->batch_q, 0, qb, (uint64_t)B * DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(float)) &&
+                (f = fopen(p, "wb"))) { fwrite(qb, 4, (uint64_t)B * DS4_N_HEAD * DS4_N_HEAD_DIM, f); fclose(f); }
+            snprintf(p, sizeof(p), "%s/blkkv_b0_pos%u.bin", ddump, pos);
+            if (ds4_gpu_tensor_read(g->batch_kv, 0, qb, (uint64_t)B * DS4_N_HEAD_DIM * sizeof(float)) &&
+                (f = fopen(p, "wb"))) { fwrite(qb, 4, (uint64_t)B * DS4_N_HEAD_DIM, f); fclose(f); }
+            free(qb);
+        }
+        /* drafter attention: 窗 + 块内 */
+        /* 窗首位置(2026-08-21 修被拒候选污染): 环行按位置映射, 只读 [pos+1-n_win, pos]。
+         * 原来读 ring[0..n_win-1], 上下文过 128 后会把 verify 批写入的被拒(未来)行读进来。 */
+        const uint32_t win_base = (uint32_t)(((uint64_t)pos + 1u + DS4_DSPARK_WIN - n_win) % DS4_DSPARK_WIN);
+        if (ok) ok = ds4_gpu_dspark_attn_tensor(g->batch_heads, dmodel->map, dmodel->size,
+                                                layer->attn_sinks->abs_offset,
+                                                g->batch_q, g->dspark_win_kv[b], g->batch_kv,
+                                                n_win, B, DS4_N_HEAD, DS4_N_HEAD_DIM,
+                                                win_base, DS4_DSPARK_WIN) != 0;
+        if (ok && ddump && b == 0) {
+            char p2[512]; FILE *f2;
+            float *hb = xmalloc((uint64_t)B * DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(float));
+            snprintf(p2, sizeof(p2), "%s/heads_b0_pos%u.bin", ddump, pos);
+            if (ds4_gpu_tensor_read(g->batch_heads, 0, hb, (uint64_t)B * DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(float)) &&
+                (f2 = fopen(p2, "wb"))) { fwrite(hb, 4, (uint64_t)B * DS4_N_HEAD * DS4_N_HEAD_DIM, f2); fclose(f2); }
+            free(hb);
+        }
+        if (ok) ok = ds4_gpu_rope_tail_tensor(g->batch_heads, B, DS4_N_HEAD, DS4_N_HEAD_DIM,
+                                              DS4_N_ROT, pos + 1u, 0, true,
+                                              freq_base, freq_scale, 0.0f, 1.0f,
+                                              DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
+        if (ok) ok = ((layer->attn_output_a->type == DS4_TENSOR_Q4_K || layer->attn_output_a->type == DS4_TENSOR_Q2_K)
+                  ? attn_output_kq_batch(layer->attn_output_a, g->batch_attn_out, g->batch_attn_low,
+                        dmodel->map, dmodel->size,
+                        layer->attn_output_b->abs_offset,
+                        group_dim, rank, n_groups, DS4_N_EMBD, g->batch_heads, B)
+                  : ds4_gpu_attention_output_q8_batch_tensor(g->batch_attn_out, g->batch_attn_low,
+                        g->batch_group_tmp, g->batch_low_tmp,
+                        dmodel->map, dmodel->size,
+                        layer->attn_output_a->abs_offset, layer->attn_output_b->abs_offset,
+                        group_dim, rank, n_groups, DS4_N_EMBD, g->batch_heads, B)) != 0;
+        if (ok && ddump && b == 0) {
+            char p2[512]; FILE *f2;
+            float *ab = xmalloc((uint64_t)B * DS4_N_EMBD * sizeof(float));
+            snprintf(p2, sizeof(p2), "%s/attnout_b0_pos%u.bin", ddump, pos);
+            if (ds4_gpu_tensor_read(g->batch_attn_out, 0, ab, (uint64_t)B * DS4_N_EMBD * sizeof(float)) &&
+                (f2 = fopen(p2, "wb"))) { fwrite(ab, 4, (uint64_t)B * DS4_N_EMBD, f2); fclose(f2); }
+            snprintf(p2, sizeof(p2), "%s/attncur_b0_pos%u.bin", ddump, pos);
+            if (ds4_gpu_tensor_read(g->batch_attn_cur, 0, ab, (uint64_t)B * DS4_N_EMBD * sizeof(float)) &&
+                (f2 = fopen(p2, "wb"))) { fwrite(ab, 4, (uint64_t)B * DS4_N_EMBD, f2); fclose(f2); }
+            free(ab);
+        }
+        if (ok) ok = ds4_gpu_hc_expand_split_tensor(after_attn_hc_view, g->batch_attn_out,
+                                                    g->batch_cur_hc, hc_split_view,
+                                                    DS4_N_EMBD, DS4_N_HC) != 0;
+        ds4_gpu_tensor_free(after_attn_hc_view);
+        ds4_gpu_tensor_free(attn_cur_view);
+        ds4_gpu_tensor_free(hc_split_view);
+        ds4_gpu_tensor_free(hc_mix_view);
+        if (ok && getenv("DS4_DSPARK_DIAG")) {
+            float ao[2] = {0}, hh[2] = {0}, qq[2] = {0}, kk[2] = {0}, wk[2] = {0};
+            (void)ds4_gpu_tensor_read(g->batch_q, 0, qq, sizeof(qq));
+            (void)ds4_gpu_tensor_read(g->batch_kv, 0, kk, sizeof(kk));
+            (void)ds4_gpu_tensor_read(g->dspark_win_kv[b], 0, wk, sizeof(wk));
+            const float *snk = (const float *)tensor_data(dmodel, layer->attn_sinks);
+            (void)ds4_gpu_tensor_read(g->dspark_win_kv[b],
+                    (uint64_t)((pos % 128u)) * DS4_N_HEAD_DIM * sizeof(float), wk, sizeof(wk));
+            fprintf(stderr, "ds4: [dspark-diag] blk%u q=%.3g %.3g kv=%.3g %.3g winrow=%.3g %.3g sink=%.3g %.3g\n",
+                    b, qq[0], qq[1], kk[0], kk[1], wk[0], wk[1], snk ? snk[0] : -999.0f, snk ? snk[1] : -999.0f);
+            (void)ds4_gpu_tensor_read(g->batch_attn_out, 0, ao, sizeof(ao));
+            (void)ds4_gpu_tensor_read(g->batch_heads, 0, hh, sizeof(hh));
+            fprintf(stderr, "ds4: [dspark-diag] blk%u heads=%.3g %.3g attn_out=%.3g %.3g\n",
+                    b, hh[0], hh[1], ao[0], ao[1]);
+        }
+        SP_MARK(4);   /* 本块 hc+attn 手写段 */
+        /* FFN 批段整段复用(corr/zchain/hash 对 drafter 自然旁路)。
+         * ★缓冲协议(2026-08-20 命中率根因修复): 主干管线 ffn_batch 读
+         * batch_after_attn_hc(hc_post(attn) 出口已在那), 此处此前多做了一次
+         * cur<->after swap ⇒ FFN 读到 embed 时代的原始 hc 流(attention 信号
+         * 全丢, Fin noise 行全同) ⇒ 草稿烂。不 swap 才是主干同款协议。 */
+        if (ok) {
+            if (ddump) {   /* 对拍: hc_post(attn) 出口 [B, hc_dim] */
+                char pd[512]; FILE *fd;
+                const uint64_t hbytes = (uint64_t)B * DS4_N_HC * DS4_N_EMBD * sizeof(float);
+                float *hb = xmalloc(hbytes);
+                snprintf(pd, sizeof(pd), "%s/hcpost_b%u_pos%u.bin", ddump, b, pos);
+                if (ds4_gpu_tensor_read(g->batch_after_attn_hc, 0, hb, hbytes) &&
+                    (fd = fopen(pd, "wb"))) { fwrite(hb, 1, hbytes, fd); fclose(fd); }
+                free(hb);
+            }
+            /* il 传 0: 43+b 会越界 per-layer 表(compress_ratio/collect); L0 无 hash
+             * (tid2eid 按 layer 指针判)无 corr 无 z, 对 drafter 语义中性 */
+            /* il=43+b: 合并 zchain 的 drafter 槽; 无 draft 侧车时 dmodel->zchain=NULL
+             * 自然旁路。per-layer 表访问对 43..45 全有界(kept_count/residual/ampanc)。 */
+            ok = metal_graph_encode_layer_ffn_batch_ex(g, dmodel, layer,
+                                                       getenv("DS4_DSPARK_FFN_IL_LOW") ? b : 43u + b, pos + 1u, B,
+                                                       dmodel->zchain == NULL);
+            ds4_gpu_tensor *tmp = g->batch_cur_hc;   /* ffn 出口在 batch_next_hc → 下一块读 cur */
+            g->batch_cur_hc = g->batch_next_hc;
+            g->batch_next_hc = tmp;
+        }
+        /* 放大器锚捕获(DS4_DSPARK_ANCHOR=path): drafter FFN 的 (Fin, route, o_ref) 落盘。
+         * 教师文件(exps 高精)跑一遍即锚; 学生侧由 zlayer 用 q2 gguf 对同 Fin 重放。
+         * batch_routed_out 是 zchain 缩放前的 routed 和(bypass 下天然教师口径);
+         * record: u32[5]{blk,pos,B,K,D} + fin[B*D] + sel[B*K]i32 + rw[B*K] + oref[B*D]。 */
+        if (ok && getenv("DS4_DSPARK_ANCHOR")) {
+            static FILE *anchf = NULL;
+            if (!anchf) anchf = fopen(getenv("DS4_DSPARK_ANCHOR"), "wb");
+            if (anchf) {
+                const uint32_t K = DS4_N_EXPERT_USED, D = DS4_N_EMBD;
+                float *fin = xmalloc((size_t)B * D * 4), *oref = xmalloc((size_t)B * D * 4);
+                float *rw = xmalloc((size_t)B * K * 4);
+                int32_t *sel = xmalloc((size_t)B * K * 4);
+                if (ds4_gpu_tensor_read(g->batch_ffn_norm, 0, fin, (uint64_t)B * D * 4) &&
+                    ds4_gpu_tensor_read(g->batch_routed_out, 0, oref, (uint64_t)B * D * 4) &&
+                    ds4_gpu_tensor_read(g->batch_router_selected, 0, sel, (uint64_t)B * K * 4) &&
+                    ds4_gpu_tensor_read(g->batch_router_weights, 0, rw, (uint64_t)B * K * 4)) {
+                    const uint32_t hdr[5] = { b, pos, B, K, D };
+                    fwrite(hdr, 4, 5, anchf);
+                    fwrite(fin, 4, (size_t)B * D, anchf);
+                    fwrite(sel, 4, (size_t)B * K, anchf);
+                    fwrite(rw, 4, (size_t)B * K, anchf);
+                    fwrite(oref, 4, (size_t)B * D, anchf);
+                    fflush(anchf);
+                }
+                free(fin); free(oref); free(rw); free(sel);
+            }
+        }
+        if (ok && getenv("DS4_DSPARK_DIAG")) {
+            float ff[2] = {0};
+            (void)ds4_gpu_tensor_read(g->batch_cur_hc, 0, ff, sizeof(ff));
+            fprintf(stderr, "ds4: [dspark-diag] blk%u ffn_out=%.3g %.3g\n", b, ff[0], ff[1]);
+        }
+        /* 数值护栏: drafter 约 1-4% 行会产 NaN(既有问题, 新旧 MoE kernel 同现), 一旦落到
+         * 锚位就整轮草稿作废。每块出口清洗一次, 代价可忽略。DS4_DSPARK_NO_SANITIZE=1 关。 */
+        if (ok && getenv("DS4_DSPARK_NO_SANITIZE") == NULL)
+            ok = ds4_gpu_sanitize_finite_tensor(g->batch_cur_hc,
+                                                (uint64_t)B * DS4_N_HC * DS4_N_EMBD) != 0;
+        SP_MARK(5);   /* 本块 ffn_batch 段 */
+    }
+    if (getenv("DS4_DSPARK_PROBE")) fprintf(stderr, "ds4: [dspark-step] stage D_blocks ok=%d\n", (int)ok);
+    SP_MARK(1);   /* 3 块层(hc+attn+ffn) */
+
+    /* ---- ④ hc_head → norm → lm_head → markov ---- */
+    const ds4_model *hmodel = dw->head_src ? dw->head_src : dmodel;   /* 出口侧张量归属 */
+    if (ok) ok = ds4_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc, g->batch_cur_hc,
+                                                    (uint32_t)hc_dim, B, DS4_RMS_EPS) != 0;
+    if (ok) ok = (dw->hc_head_fn->type == DS4_TENSOR_F32
+                  ? ds4_gpu_matmul_f32_tensor(g->dspark_hc_pre, hmodel->map, hmodel->size,
+                                              dw->hc_head_fn->abs_offset,
+                                              hc_dim, DS4_N_HC, g->batch_flat_hc, B)
+                  : ds4_gpu_matmul_f16_tensor(g->dspark_hc_pre, hmodel->map, hmodel->size,
+                                              dw->hc_head_fn->abs_offset,
+                                              hc_dim, DS4_N_HC, g->batch_flat_hc, B)) != 0;
+    if (ok) ok = ds4_gpu_output_hc_weights_tensor(g->dspark_hc_w, g->dspark_hc_pre,
+                                                  hmodel->map, hmodel->size,
+                                                  dw->hc_head_scale->abs_offset,
+                                                  dw->hc_head_base->abs_offset,
+                                                  DS4_N_HC, DS4_HC_EPS) != 0;
+    if (ok) ok = ds4_gpu_hc_weighted_sum_tensor(g->dspark_flat, g->batch_cur_hc,
+                                                g->dspark_hc_w, DS4_N_EMBD, DS4_N_HC) != 0;
+    if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->dspark_flat_norm, g->dspark_flat,
+                                                     hmodel->map, hmodel->size,
+                                                     dw->norm->abs_offset,
+                                                     DS4_N_EMBD, B, DS4_RMS_EPS) != 0;
+    if (ok) ok = dense_matmul_typed(g->dspark_logits, model, weights->output,
+                                    DS4_N_EMBD, DS4_N_VOCAB, g->dspark_flat_norm, B) != 0;
+    if (ddump) {
+        char p3[512]; FILE *f3;
+        float *lgb = xmalloc(5ull * DS4_N_VOCAB * sizeof(float));
+        snprintf(p3, sizeof(p3), "%s/logits_premarkov_pos%u.bin", ddump, pos);
+        if (ds4_gpu_tensor_read(g->dspark_logits, 0, lgb, 5ull * DS4_N_VOCAB * sizeof(float)) &&
+            (f3 = fopen(p3, "wb"))) { fwrite(lgb, 4, 5ull * DS4_N_VOCAB, f3); fclose(f3); }
+        free(lgb);
+    }
+    SP_MARK(2);   /* hc_head + norm + lm_head(logits) */
+    /* markov 链: 位置 i 的 prev=位置 i-1 的 argmax(串行 5 步) */
+    /* 逐步 host read 已去掉(2026-08-21): 每步 4B 设备→主机读 = 一次流同步, 5 步就是 5 次
+     * 管线气泡。链内只需要设备侧的 prev_id, 主机侧到末尾一次读回整条链即可。
+     * prev_ids[0]=输入 token, prev_ids[i+1]=第 i 位草稿 ⇒ 同一数组既喂链又喂置信头。 */
+    if (ok) ok = ds4_gpu_tensor_write(g->dspark_prev_id, 0, &ids[0], sizeof(int32_t)) != 0;
+    if (ok) ok = ds4_gpu_tensor_write(g->dspark_prev_ids, 0, &ids[0], sizeof(int32_t)) != 0;
+    /* 候选数 k<6 时后几位草稿用不上: markov 链是串行 5 步(每步一次设备往返), 按需截断。 */
+    const uint32_t n_chain = (n_need && n_need < B) ? n_need : B;
+    for (uint32_t i = 0; ok && i < n_chain; i++) {
+        ds4_gpu_tensor *lrow = ds4_gpu_tensor_view(g->dspark_logits,
+                (uint64_t)i * DS4_N_VOCAB * sizeof(float),
+                (uint64_t)DS4_N_VOCAB * sizeof(float));
+        ok = lrow != NULL;
+        if (getenv("DS4_DSPARK_NOMARKOV") || !dw->markov_w1 || !dw->markov_w2) {
+            /* markov 头可缺(checkpoint 的 mtp.* 不含时): 纯 argmax 草稿 */
+            if (ok) ok = ds4_gpu_dspark_argmax_only_tensor(g->dspark_out_id, lrow,
+                                                           (uint32_t)DS4_N_VOCAB) != 0;
+        } else if (ok) {
+            ok = ds4_gpu_dspark_markov_step_tensor(g->dspark_out_id, lrow,
+                                                   dmodel->map, dmodel->size,
+                                                   dw->markov_w1->abs_offset,
+                                                   dw->markov_w2->abs_offset,
+                                                   g->dspark_prev_id,
+                                                   (uint32_t)DS4_N_VOCAB, 256u) != 0;
+        }
+        /* out_id 变 prev_id: 设备内 4B 拷贝(下一步读) + 落到链数组第 i+1 位 */
+        if (ok) ok = ds4_gpu_tensor_copy(g->dspark_prev_id, 0, g->dspark_out_id, 0, sizeof(int32_t)) != 0;
+        if (ok) ok = ds4_gpu_tensor_copy(g->dspark_prev_ids, (uint64_t)(i + 1u) * sizeof(int32_t),
+                                         g->dspark_out_id, 0, sizeof(int32_t)) != 0;
+        ds4_gpu_tensor_free(lrow);
+    }
+    /* 置信头(论文 Alg.1 输入): 位置 i 的输入 token 是 ids[0](i=0) 或 out_ids[i-1]。
+     * markov 链跑完才知道这些 id, 所以一次性算完整块, 一次设备往返。 */
+    if (ok && out_conf && dw->confidence_proj && dw->markov_w1 && g->dspark_conf && g->dspark_prev_ids) {
+        /* prev_ids[0..n_chain-1] 就是每位置的输入 token, 链跑完已在设备上, 无需回写 */
+        ok = ds4_gpu_dspark_confidence_tensor(g->dspark_conf, g->dspark_flat,
+                                              dmodel->map, dmodel->size,
+                                              dw->confidence_proj->abs_offset,
+                                              dw->markov_w1->abs_offset,
+                                              g->dspark_prev_ids,
+                                              (uint32_t)DS4_N_EMBD, 256u,
+                                              (uint32_t)DS4_N_VOCAB, n_chain) != 0 != 0;
+    }
+    {   /* 一次读回整条链 */
+        int32_t chain[DS4_DSPARK_BLK + 1];
+        if (ok) ok = ds4_gpu_tensor_read(g->dspark_prev_ids, 0, chain,
+                                         (uint64_t)(n_chain + 1u) * sizeof(int32_t)) != 0;
+        if (ok) for (uint32_t i = 0; i < n_chain; i++) out_ids[i] = chain[i + 1];
+    }
+    if (ok && out_conf && dw->confidence_proj && dw->markov_w1 && g->dspark_conf)
+        ok = ds4_gpu_tensor_read(g->dspark_conf, 0, out_conf, (uint64_t)n_chain * sizeof(float)) != 0;
+    if (sspan) {
+        static double sp_wall = 0.0, sp_gpu = 0.0; static uint32_t sp_sn = 0;
+        const float gms = ds4_gpu_span_end();
+        sp_wall += (now_sec() - span_t0) * 1e3; if (gms > 0.0f) sp_gpu += gms; sp_sn++;
+        if ((sp_sn & 15u) == 0)
+            fprintf(stderr, "ds4: [dstep-span] n=%u avg_ms: wall=%.2f gpu=%.2f (空转=%.2f)\n",
+                    sp_sn, sp_wall / sp_sn, sp_gpu / sp_sn, (sp_wall - sp_gpu) / sp_sn);
+    }
+    if (sprof) {
+        sp_acc[3] += now_sec() - sp_t0; sp_n++;   /* markov 5 步(含逐步 host read) */
+        if ((sp_n & 15u) == 0)
+            fprintf(stderr, "ds4: [dstep-prof] n=%u avg_ms: pre=%.1f blocks=%.1f (attn=%.1f ffn=%.1f) head=%.1f markov=%.1f\n",
+                    sp_n, sp_acc[0] * 1e3 / sp_n, sp_acc[1] * 1e3 / sp_n,
+                    sp_acc[4] * 1e3 / sp_n, sp_acc[5] * 1e3 / sp_n,
+                    sp_acc[2] * 1e3 / sp_n, sp_acc[3] * 1e3 / sp_n);
+    }
+    if (ok && getenv("DS4_DSPARK_DUMP")) {   /* e2e 对拍: anchor+pos+draft ids 落盘 */
+        char p[512]; FILE *f;
+        snprintf(p, sizeof(p), "%s/draft_pos%u.txt", getenv("DS4_DSPARK_DUMP"), pos);
+        if ((f = fopen(p, "w"))) {
+            fprintf(f, "%d", anchor_token);
+            for (uint32_t i2 = 0; i2 < B; i2++) fprintf(f, " %d", out_ids[i2]);
+            fclose(f);
+        }
+    }
+    return ok;
+#undef SP_MARK
+}
+
+static bool metal_graph_dspark_step(
+        ds4_gpu_graph *g, const ds4_model *model, const ds4_weights *weights,
+        const ds4_dspark_weights *dw, int anchor_token, uint32_t pos,
+        int out_ids[DS4_DSPARK_BLK]) {
+    return metal_graph_dspark_step_n(g, model, weights, dw, anchor_token, pos, out_ids,
+                                    DS4_DSPARK_BLK, NULL);
+}
+
 static bool metal_graph_eval_token_raw_swa(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -15216,7 +16660,36 @@ static bool metal_graph_eval_token_raw_swa(
     const double t0 = (profile || throttle) ? now_sec() : 0.0;
 
     bool ok = ds4_gpu_begin_commands() != 0;
-    if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights, token, pos, logits != NULL, true);
+    /* decode 单 token CUDA graph: capture 包住 encode(纯 kernel 段), 失败则重编码直跑。
+     * 流水线(2026-08-17): 上一 token 的 GPU 窗口里已预编码本 pos 的图 ⇒ 直接发射,
+     * encode 移出临界路径; 发射后趁 GPU 忙再预编码 pos+1(token id 走参数槽间接)。 */
+    int launched = 0;
+    if (ok && ds4_gpu_token_graph_try_pending(token, pos, logits != NULL) > 0)
+        launched = 1;
+    ds4_gpu_token_graph_set_pos(pos);
+    const int tok_graph = (ok && !launched) ? ds4_gpu_token_graph_begin() : 0;
+    if (ok && !launched) ok = metal_graph_encode_token_raw_swa(g, model, weights, token, pos, logits != NULL, true);
+    if (ok && !launched && tok_graph) {
+        if (ds4_gpu_token_graph_end_launch() < 0)
+            ok = metal_graph_encode_token_raw_swa(g, model, weights, token, pos, logits != NULL, true);
+    } else if (!ok && tok_graph) {
+        /* encode 在 capture 里失败(如 comp cache 溢出): 必须收掉悬挂 capture,
+         * 否则后续所有 launch 报 "previous error during capture" 永久污染(2026-08-18
+         * 328 题基准 500 连锁的第二层根因)。 */
+        (void)ds4_gpu_token_graph_end_launch();
+    }
+    if (ok && (launched || tok_graph)) {
+        const bool tdbg = getenv("DS4_TOK_GRAPH_DEBUG") != NULL;
+        const double tp0 = tdbg ? now_sec() : 0.0;
+        if (ds4_gpu_token_graph_precapture_begin() > 0) {
+            const double tp1 = tdbg ? now_sec() : 0.0;
+            const bool pok = metal_graph_encode_token_raw_swa(g, model, weights, 0, pos + 1u, true, true);
+            const double tp2 = tdbg ? now_sec() : 0.0;
+            (void)ds4_gpu_token_graph_precapture_end(pos + 1u, 1, pok ? 1 : 0);
+            if (tdbg) fprintf(stderr, "[tokdbg] precap pos=%u begin=%.1f encode=%.1f end=%.1f (ms)\n",
+                              pos, (tp1 - tp0) * 1e3, (tp2 - tp1) * 1e3, (now_sec() - tp2) * 1e3);
+        }
+    }
     const double t_encoded = (profile || throttle) ? now_sec() : 0.0;
     if (ok) ok = ds4_gpu_end_commands() != 0;
     const double t_done = (profile || throttle) ? now_sec() : 0.0;
@@ -15242,198 +16715,6 @@ static bool metal_graph_eval_token_raw_swa(
         }
     }
     return ok;
-}
-
-/* Greedy verifier helper.  Speculative decoding only needs the target model's
- * top token after most accepted draft rows; the full vocabulary row is needed
- * once, for the final committed state that normal sampling will continue from.
- * Keeping intermediate rows device-resident avoids turning verification into a
- * sequence of large CPU readbacks. */
-static bool metal_graph_eval_token_raw_swa_top(
-        ds4_gpu_graph *g,
-        const ds4_model       *model,
-        const ds4_weights     *weights,
-        int                    token,
-        uint32_t               pos,
-        int                   *top_id,
-        float                 *logits) {
-    if (!top_id) return false;
-
-    bool ok = ds4_gpu_begin_commands() != 0;
-    if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights,
-                                                  token, pos, true, true);
-    if (ok) {
-        ok = ds4_gpu_argmax_tensor(g->comp_selected,
-                                   g->logits,
-                                   DS4_N_VOCAB) != 0;
-    }
-    if (ok) ok = ds4_gpu_end_commands() != 0;
-    if (ok) ok = ds4_gpu_tensor_read(g->comp_selected, 0, top_id, sizeof(*top_id)) != 0;
-    if (ok && logits) {
-        ok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
-    }
-    if (!ok) {
-        if (ds4_gpu_synchronize() == 0) {
-            fprintf(stderr, "ds4: Metal synchronize after top-only graph eval failure also failed\n");
-        }
-    }
-    return ok;
-}
-
-static bool metal_graph_eval_mtp_draft_from_hc(
-        ds4_gpu_graph       *g,
-        const ds4_model       *base_model,
-        const ds4_weights     *base_weights,
-        const ds4_model       *mtp_model,
-        const ds4_mtp_weights *mtp,
-        ds4_gpu_tensor      *prev_hc,
-        ds4_gpu_tensor      *out_hc,
-        int                    token,
-        uint32_t               pos,
-        float                 *logits,
-        int                   *top_id) {
-    if (!mtp || !mtp->block.attn_q_a || !g->mtp_raw_cache || !prev_hc || !out_hc) return false;
-
-    /* The expert keep-LUT is a single GPU resource shared by the base model and a
-     * matched (reduced) MTP drafter, but they carry different keep-maps. Swap to
-     * the MTP keep-map for the draft and restore the base's before returning so
-     * subsequent base-model forwards route their 256-way picks into the right slots.
-     * (No-op when the MTP is unmasked: expert_orig_to_compact is NULL.) */
-    if (mtp_model->expert_orig_to_compact)
-        ds4_gpu_set_expert_keep_lut(mtp_model->expert_orig_to_compact, mtp_model->expert_layer_count);
-
-    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
-    const uint32_t raw_row = pos % g->raw_cap;
-    uint32_t n_raw = g->mtp_n_raw + 1u;
-    if (n_raw > g->raw_window) n_raw = g->raw_window;
-    if (n_raw > g->raw_cap) n_raw = g->raw_cap;
-
-    ds4_gpu_tensor *saved_cur = g->cur_hc;
-    ds4_gpu_tensor *saved_after = g->after_ffn_hc;
-    bool ok = ds4_gpu_begin_commands() != 0;
-    if (ok) ok = ds4_gpu_embed_token_hc_tensor(g->mtp_embed,
-                                                  base_model->map,
-                                                  base_model->size,
-                                                  base_weights->token_embd->abs_offset,
-                                                  (uint32_t)base_weights->token_embd->dim[1],
-                                                  (uint32_t)token,
-                                                  DS4_N_EMBD,
-                                                  1) != 0;
-    if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->mtp_enorm,
-                                                  g->mtp_embed,
-                                                  mtp_model->map,
-                                                  mtp_model->size,
-                                                  mtp->enorm->abs_offset,
-                                                  DS4_N_EMBD,
-                                                  DS4_RMS_EPS) != 0;
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->mtp_eproj,
-                                              mtp_model->map,
-                                              mtp_model->size,
-                                              mtp->e_proj->abs_offset,
-                                              DS4_N_EMBD,
-                                              DS4_N_EMBD,
-                                              g->mtp_enorm,
-                                              1) != 0;
-    if (ok) ok = ds4_gpu_repeat_hc_tensor(g->mtp_eproj_hc,
-                                            g->mtp_eproj,
-                                            DS4_N_EMBD,
-                                            DS4_N_HC) != 0;
-    if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->mtp_hnorm_hc,
-                                                       prev_hc,
-                                                       mtp_model->map,
-                                                       mtp_model->size,
-                                                       mtp->hnorm->abs_offset,
-                                                       DS4_N_EMBD,
-                                                       DS4_N_HC,
-                                                       DS4_RMS_EPS) != 0;
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->mtp_hproj_hc,
-                                              mtp_model->map,
-                                              mtp_model->size,
-                                              mtp->h_proj->abs_offset,
-                                              DS4_N_EMBD,
-                                              DS4_N_EMBD,
-                                              g->mtp_hnorm_hc,
-                                              DS4_N_HC) != 0;
-    if (ok) ok = ds4_gpu_add_tensor(g->mtp_input_hc,
-                                      g->mtp_eproj_hc,
-                                      g->mtp_hproj_hc,
-                                      (uint32_t)hc_dim) != 0;
-    if (ok) {
-        g->cur_hc = g->mtp_input_hc;
-        g->after_ffn_hc = out_hc;
-        ok = metal_graph_encode_decode_layer(g,
-                                             mtp_model,
-                                             &mtp->block,
-                                             1,
-                                             pos,
-                                             g->mtp_raw_cache,
-                                             g->raw_cap,
-                                             raw_row,
-                                             n_raw,
-                                             token);
-    }
-    if (ok) g->cur_hc = out_hc;
-    /* MTP keep-map collection: tally the MTP block's routed-expert preference at
-     * synthetic layer index DS4_N_LAYER (==43, < MAXL 64) so make_expert_mask can
-     * build a reduced-MTP mask matched to what the MTP actually routes to. Called
-     * mid-batch (syncs the pending layer, reads g->router_logits, re-begins) like
-     * the prefill collector. Gated by DS4_ROUTER_FREQ_FILE (zero-cost when off). */
-    if (ok) router_freq_collect(g->router_logits, (uint32_t)DS4_N_LAYER, 1u);
-    if (ok) ok = metal_graph_encode_output_head_mtp(g,
-                                                    base_model,
-                                                    base_weights,
-                                                    mtp_model,
-                                                    mtp,
-                                                    base_weights->output->dim[1]);
-    if (ok && top_id) {
-        ok = ds4_gpu_argmax_tensor(g->comp_selected,
-                                   g->logits,
-                                   DS4_N_VOCAB) != 0;
-    }
-    if (ok) ok = ds4_gpu_end_commands() != 0;
-    g->cur_hc = saved_cur;
-    g->after_ffn_hc = saved_after;
-
-    if (ok && logits) {
-        ok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
-    }
-    if (ok && top_id) {
-        ok = ds4_gpu_tensor_read(g->comp_selected, 0, top_id, sizeof(*top_id)) != 0;
-    }
-    if (ok && g->mtp_n_raw < g->raw_window) g->mtp_n_raw++;
-    if (!ok) {
-        (void)ds4_gpu_synchronize();
-        g->cur_hc = saved_cur;
-        g->after_ffn_hc = saved_after;
-    }
-    /* Restore the base model's keep-LUT (overwritten above for the draft) so the
-     * next base-model forward routes correctly. */
-    if (base_model->expert_orig_to_compact)
-        ds4_gpu_set_expert_keep_lut(base_model->expert_orig_to_compact, base_model->expert_layer_count);
-    return ok;
-}
-
-static bool metal_graph_eval_mtp_draft(
-        ds4_gpu_graph       *g,
-        const ds4_model       *base_model,
-        const ds4_weights     *base_weights,
-        const ds4_model       *mtp_model,
-        const ds4_mtp_weights *mtp,
-        int                    token,
-        uint32_t               pos,
-        float                 *logits,
-        int                   *top_id) {
-    return metal_graph_eval_mtp_draft_from_hc(g,
-                                              base_model,
-                                              base_weights,
-                                              mtp_model,
-                                              mtp,
-                                              g->cur_hc,
-                                              g->mtp_state_hc,
-                                              token,
-                                              pos,
-                                              logits,
-                                              top_id);
 }
 
 /* =========================================================================
@@ -15860,6 +17141,9 @@ static bool metal_graph_prefill_layer_major(
                 g->batch_cur_hc = g->batch_next_hc;
                 g->batch_next_hc = tmp;
             }
+            /* split_profile 这条内联展开路自己做 HC 交换, 绕开了 metal_graph_encode_layer_batch
+             * —— 钩子必须在这里也挂一份, 否则开着剖析跑 HDUMP 会静默少写整层。 */
+            if (ok) eval_hdump_batch_layer(g, il, (uint32_t)n_tokens);
             const double t_ffn_encoded = now_sec();
             if (ok) ok = ds4_gpu_end_commands() != 0;
             const double t_ffn_done = now_sec();
@@ -16042,9 +17326,16 @@ static bool metal_graph_prefill_chunked_range(
         display_progress(display_progress_ud, "prefill_display", (int)start, prompt->len);
     }
 
+    /* 尾批仪器(DS4_METAL_PREFILL_TAIL_BATCH=k, 2026-08-21): 前缀逐 token 灌, 最后 k 个
+     * 一次成批 —— 这正是 verify 批的场景(前缀由单 token 路建, 然后一个 pos0>0 的 k 行批)。
+     * 与全程 chunk=1 对跑, 同一 pos0 的 dump 差异就纯是"批 vs 单", 不含前缀污染。 */
+    uint32_t tail_batch = 0;
+    { const char *tb = getenv("DS4_METAL_PREFILL_TAIL_BATCH");
+      if (tb && atoi(tb) > 0) tail_batch = (uint32_t)atoi(tb); }
     for (uint32_t pos0 = start; pos0 < end; ) {
         const uint32_t remaining = end - pos0;
         uint32_t local_cap = chunk_cap;
+        if (tail_batch) local_cap = (remaining > tail_batch) ? 1u : tail_batch;
         if (start != 0 && g->prefill_cap != 0) {
             const uint32_t mod = pos0 % g->prefill_cap;
             if (mod != 0) {
@@ -16121,248 +17412,6 @@ static bool metal_graph_prefill_chunked(
                                              display_progress,
                                              display_progress_ud,
                                              NULL);
-}
-
-/* Layer-major speculative target verifier for tiny MTP suffixes.
- *
- * This is the first production-shaped verifier attempt: unlike repeated decode
- * it runs the target model layer-by-layer for the whole speculative suffix, and
- * unlike the diagnostic path it does not read back full logits for every row.
- * The verifier returns the row top-1 ids needed for acceptance.  The caller
- * then reads exactly one logits row: the row that becomes the new continuation
- * state.  It still reuses the existing batch layer kernels, so it is not yet
- * the final hand-written N=2/N=4 decode microbatch, but it exercises the right
- * verifier contract and removes the obvious diagnostic overheads first. */
-static bool metal_graph_verify_suffix_tops(
-        ds4_gpu_graph *g,
-        const ds4_model       *model,
-        const ds4_weights     *weights,
-        const token_vec       *prompt,
-        uint32_t               start,
-        uint32_t               n_tokens,
-        bool                   capture_prefix1,
-        int                   *row_tops,
-        float                 *row_logits) {
-    if (n_tokens == 0 || n_tokens > g->prefill_cap || !g->spec_logits) return false;
-    if (start > (uint32_t)prompt->len || n_tokens > (uint32_t)prompt->len - start) return false;
-    const uint32_t top_rows = n_tokens > 1 ? n_tokens - 1 : 0;
-    if (top_rows && !row_tops) return false;
-
-    bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, prompt, start, n_tokens);
-    if (ok) ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
-                                                         g->prefill_tokens,
-                                                         model,
-                                                         weights,
-                                                         prompt,
-                                                         start,
-                                                         n_tokens);
-    if (!ok) return false;
-
-    const bool saved_capture = g->spec_capture_prefix1;
-    g->spec_capture_prefix1 = capture_prefix1 && n_tokens == 2;
-
-    ok = ds4_gpu_begin_commands() != 0;
-    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
-        ok = metal_graph_encode_layer_batch(g,
-                                            model,
-                                            &weights->layer[il],
-                                            il,
-                                            start,
-                                            n_tokens);
-    }
-    if (ok) ok = ds4_gpu_end_commands() != 0;
-    else (void)ds4_gpu_synchronize();
-    g->spec_capture_prefix1 = saved_capture;
-    if (!ok) return false;
-
-    ok = ds4_gpu_begin_commands() != 0;
-    if (ok) ok = metal_graph_encode_output_head_batch(g,
-                                                      model,
-                                                      weights,
-                                                      n_tokens,
-                                                      weights->output->dim[1]);
-    if (ok) {
-        if (top_rows == 1) {
-            /* Common K=2 verify case: top_k=1 over n_vocab → use the dedicated
-             * argmax kernel (single-block tree-reduce) instead of the legacy
-             * indexer_topk_kernel's single-thread O(n_vocab * top_k) fall-through. */
-            ok = ds4_gpu_argmax_tensor(g->comp_selected,
-                                       g->spec_logits,
-                                       DS4_N_VOCAB) != 0;
-        } else if (top_rows) {
-            /* One argmax PER ROW: n_tokens = top_rows rows, top_k = 1. These two
-             * args were swapped (n_tokens=1, top_k=top_rows), which made this
-             * return the top-`top_rows` tokens of ROW 0 instead of each row's
-             * argmax -- harmless until copy-spec became the first caller to verify
-             * more than one draft row (MTP only ever uses top_rows==1 above). */
-            ok = ds4_gpu_indexer_topk_tensor(g->comp_selected,
-                                               g->spec_logits,
-                                               DS4_N_VOCAB,
-                                               top_rows,
-                                               1) != 0;
-        }
-    }
-    if (ok) ok = ds4_gpu_end_commands() != 0;
-    else (void)ds4_gpu_synchronize();
-    if (ok && top_rows) {
-        ok = ds4_gpu_tensor_read(g->comp_selected,
-                                   0,
-                                   row_tops,
-                                   (uint64_t)top_rows * sizeof(row_tops[0])) != 0;
-    }
-    if (ok && row_logits) {
-        ok = ds4_gpu_tensor_read(g->spec_logits,
-                                   0,
-                                   row_logits,
-                                   (uint64_t)n_tokens * DS4_N_VOCAB * sizeof(row_logits[0])) != 0;
-    }
-    return ok;
-}
-
-static bool metal_graph_read_spec_logits_row(ds4_gpu_graph *g, uint32_t row, float *logits) {
-    if (!g || !g->spec_logits || !logits || row >= g->prefill_cap) return false;
-    const uint64_t row_bytes = (uint64_t)DS4_N_VOCAB * sizeof(float);
-    return ds4_gpu_tensor_read(g->spec_logits,
-                                 (uint64_t)row * row_bytes,
-                                 logits,
-                                 row_bytes) != 0;
-}
-
-/* Exact N=2 target verifier for MTP.
- *
- * The generic batch prefill path is fast, but it is not a safe substitute for
- * autoregressive decode: small row-wise differences in HC/MoE/output kernels
- * are enough to flip future greedy tokens.  This verifier keeps the exact
- * decode kernels and cache update order, but encodes the two proposed tokens
- * layer-by-layer in one command stream.  It returns the exact target top after
- * token0, and exact logits after token1. */
-static bool metal_graph_verify_decode2_exact(
-        ds4_gpu_graph *g,
-        const ds4_model       *model,
-        const ds4_weights     *weights,
-        int                    token0,
-        int                    token1,
-        uint32_t               start,
-        int                   *top0,
-        float                 *logits0,
-        float                 *logits1) {
-    if (!g || !top0 || !logits1 || g->raw_cap == 0) return false;
-
-    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
-    ds4_gpu_tensor *cur0 = metal_graph_tensor_row_view(g->batch_cur_hc, 0, hc_dim);
-    ds4_gpu_tensor *cur1 = metal_graph_tensor_row_view(g->batch_cur_hc, 1, hc_dim);
-    ds4_gpu_tensor *next0 = metal_graph_tensor_row_view(g->batch_next_hc, 0, hc_dim);
-    ds4_gpu_tensor *next1 = metal_graph_tensor_row_view(g->batch_next_hc, 1, hc_dim);
-    bool ok = cur0 && cur1 && next0 && next1;
-
-    if (ok) ok = ds4_gpu_embed_token_hc_tensor(cur0,
-                                                  model->map,
-                                                  model->size,
-                                                  weights->token_embd->abs_offset,
-                                                  (uint32_t)weights->token_embd->dim[1],
-                                                  (uint32_t)token0,
-                                                  DS4_N_EMBD,
-                                                  DS4_N_HC) != 0;
-    if (ok) ok = ds4_gpu_embed_token_hc_tensor(cur1,
-                                                  model->map,
-                                                  model->size,
-                                                  weights->token_embd->abs_offset,
-                                                  (uint32_t)weights->token_embd->dim[1],
-                                                  (uint32_t)token1,
-                                                  DS4_N_EMBD,
-                                                  DS4_N_HC) != 0;
-
-    ds4_gpu_tensor *saved_cur = g->cur_hc;
-    ds4_gpu_tensor *saved_after = g->after_ffn_hc;
-    const bool saved_capture = g->spec_capture_prefix1;
-    g->spec_capture_prefix1 = true;
-    if (ok) ok = ds4_gpu_begin_commands() != 0;
-    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
-        const uint32_t pos0 = start;
-        const uint32_t pos1 = start + 1u;
-
-        g->cur_hc = cur0;
-        g->after_ffn_hc = next0;
-        ok = metal_graph_encode_decode_layer(g,
-                                             model,
-                                             &weights->layer[il],
-                                             il,
-                                             pos0,
-                                             g->layer_raw_cache[il],
-                                             g->raw_cap,
-                                             pos0 % g->raw_cap,
-                                             metal_graph_raw_span_for_batch(g, pos0, 1),
-                                             token0);
-        if (!ok) break;
-        ok = metal_graph_capture_prefix1_attn_state(g, il) &&
-             metal_graph_capture_prefix1_index_state(g, il);
-        if (!ok) break;
-
-        g->cur_hc = cur1;
-        g->after_ffn_hc = next1;
-        ok = metal_graph_encode_decode_layer(g,
-                                             model,
-                                             &weights->layer[il],
-                                             il,
-                                             pos1,
-                                             g->layer_raw_cache[il],
-                                             g->raw_cap,
-                                             pos1 % g->raw_cap,
-                                             metal_graph_raw_span_for_batch(g, pos1, 1),
-                                             token1);
-        if (!ok) break;
-
-        ds4_gpu_tensor *tmp = cur0; cur0 = next0; next0 = tmp;
-        tmp = cur1; cur1 = next1; next1 = tmp;
-    }
-    if (ok) ok = ds4_gpu_end_commands() != 0;
-    else (void)ds4_gpu_synchronize();
-    g->spec_capture_prefix1 = saved_capture;
-    g->cur_hc = saved_cur;
-    g->after_ffn_hc = saved_after;
-
-    if (ok) {
-        g->cur_hc = cur0;
-        ok = ds4_gpu_begin_commands() != 0;
-        if (ok) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
-        if (ok) ok = ds4_gpu_argmax_tensor(g->comp_selected,
-                                           g->logits,
-                                           DS4_N_VOCAB) != 0;
-        if (ok) ok = ds4_gpu_end_commands() != 0;
-        else (void)ds4_gpu_synchronize();
-        g->cur_hc = saved_cur;
-        if (ok) ok = ds4_gpu_tensor_read(g->comp_selected, 0, top0, sizeof(*top0)) != 0;
-        if (ok && logits0) {
-            ok = ds4_gpu_tensor_read(g->logits,
-                                       0,
-                                       logits0,
-                                       (uint64_t)DS4_N_VOCAB * sizeof(logits0[0])) != 0;
-        }
-    }
-
-    if (ok) {
-        g->cur_hc = cur1;
-        ok = ds4_gpu_begin_commands() != 0;
-        if (ok) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
-        if (ok) ok = ds4_gpu_end_commands() != 0;
-        else (void)ds4_gpu_synchronize();
-        g->cur_hc = saved_cur;
-        if (ok) {
-            ok = ds4_gpu_tensor_read(g->logits,
-                                       0,
-                                       logits1,
-                                       (uint64_t)DS4_N_VOCAB * sizeof(logits1[0])) != 0;
-        }
-    }
-    g->cur_hc = saved_cur;
-    g->after_ffn_hc = saved_after;
-    g->spec_capture_prefix1 = saved_capture;
-
-    ds4_gpu_tensor_free(next1);
-    ds4_gpu_tensor_free(next0);
-    ds4_gpu_tensor_free(cur1);
-    ds4_gpu_tensor_free(cur0);
-    return ok;
 }
 
 /* Pick a raw SWA cache size for Metal.  During batched prefill it must cover
@@ -16818,15 +17867,14 @@ struct ds4_engine {
     ds4_vocab vocab;
     ds4_weights weights;
     ds4_mtp_weights mtp_weights;
+    ds4_dspark_weights dspark;    /* 0731 官方块并行 drafter(v3+ GGUF 内嵌) */
     ds4_backend backend;
     int mtp_draft_tokens;
     float mtp_margin;
     /* Go trie drafter for copy-spec (--go-trie / DS4_GO_TRIE); NULL = off. */
-    struct ds4_gotrie *go_trie;
     /* knowledge-MTP reference corpus (ds4_mtp.c: built-in idioms +
      * DS4_REF_CORPUS extension files). Always built at init; NULL only on
      * OOM, and every module entry point accepts NULL as "no corpus". */
-    ds4_refcorpus *ref_corpus;
     /* 多模态 registry (ds4_multimodal.c): modality -> text/tokens. The
      * "image" family auto-binds the frontend-domain UI-sketch encoder at
      * open (DS4_MM_IMAGE_CMD env > ./mm-ui). NULL only on OOM; consumers
@@ -16851,20 +17899,12 @@ struct ds4_engine {
  * engine adapts its own tokenizer to the module callback shape. Token arrays
  * are plain malloc'd (token_vec uses xrealloc), so ownership can move to the
  * module and be freed there. */
-static void engine_mtp_tokenize_cb(void *ctx, const char *text, int **toks, int *n) {
+static void engine_tokenize_cb(void *ctx, const char *text, int **toks, int *n) {
     ds4_engine *e = ctx;
     ds4_tokens t = {0};
     ds4_tokenize_text(e, text, &t);
     *toks = t.v;
     *n = t.len;
-}
-
-uint32_t ds4_engine_ref_match(ds4_engine *e, const int *tail, uint32_t len,
-                              uint32_t min_g, uint32_t cap,
-                              int *out, uint32_t *out_n) {
-    if (out_n) *out_n = 0;
-    if (!e) return 0;
-    return ds4_refcorpus_match(e->ref_corpus, tail, len, min_g, cap, out, out_n);
 }
 
 /* 前端域 enricher adapters (ds4_spatial.c / ds4_css.c): both are pure
@@ -18030,6 +19070,38 @@ static int generate_metal_graph_raw_swa(
         fprintf(stderr, "ds4: wrote GPU prefill logits to %s\n", dump_prefill_logits);
     }
 
+        /* DSpark 探针(DS4_DSPARK_PROBE=1): 每 decode token 后跑 drafter 块, 打印草稿与
+     * 后续真实 token 的命中; capture buffer 补分配(graph alloc 时 flag 未置)。 */
+    static ds4_dspark_weights g_dsw;
+    const bool dspark_probe = getenv("DS4_DSPARK_PROBE") != NULL;
+    if (getenv("DS4_DSPARK_PROBE"))
+        fprintf(stderr, "ds4: [dspark-probe] enter generate loop, probe=%d\n", (int)dspark_probe);
+    int dspark_pending[DS4_DSPARK_BLK]; int dspark_pending_n = 0; uint32_t dspark_hit = 0, dspark_tot = 0;
+    if (dspark_probe) {
+        dspark_bind_with_draft(&g_dsw, model, true);
+        if (g_dsw.ready) {
+            g.dspark_capture = 1;
+            if (!g.dspark_main_hidden) {
+                const uint32_t B = 5u;
+                g.dspark_main_hidden = ds4_gpu_tensor_alloc(3ull * DS4_N_EMBD * sizeof(float));
+                g.dspark_main_x_raw = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+                g.dspark_main_x = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+                g.dspark_kv_tmp = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
+                for (int b = 0; b < 3; b++)
+                    g.dspark_win_kv[b] = ds4_gpu_tensor_alloc(128ull * DS4_N_HEAD_DIM * sizeof(float));
+                g.dspark_ids = ds4_gpu_tensor_alloc(B * sizeof(int32_t));
+                g.dspark_hc_pre = ds4_gpu_tensor_alloc((uint64_t)B * DS4_N_HC * sizeof(float));
+                g.dspark_hc_w = ds4_gpu_tensor_alloc((uint64_t)B * DS4_N_HC * sizeof(float));
+                g.dspark_flat = ds4_gpu_tensor_alloc((uint64_t)B * DS4_N_EMBD * sizeof(float));
+                g.dspark_flat_norm = ds4_gpu_tensor_alloc((uint64_t)B * DS4_N_EMBD * sizeof(float));
+                g.dspark_logits = ds4_gpu_tensor_alloc((uint64_t)B * DS4_N_VOCAB * sizeof(float));
+                g.dspark_prev_id = ds4_gpu_tensor_alloc(sizeof(int32_t));
+                g.dspark_out_id = ds4_gpu_tensor_alloc(sizeof(int32_t));
+            }
+        } else {
+            fprintf(stderr, "ds4: [dspark-probe] drafter not armed, probe off\n");
+        }
+    }
     int pos = prompt->len;
     int n_generated = 0;
     int n_decode_eval = 0;
@@ -18043,6 +19115,11 @@ static int generate_metal_graph_raw_swa(
 
         int token = sample_argmax(logits, DS4_N_VOCAB);
         if (token == vocab->eos_id) break;
+        if (dspark_probe && dspark_pending_n > 0) {
+            dspark_tot++;
+            if (dspark_pending[0] == token) dspark_hit++;
+            dspark_pending_n = 0;
+        }
 
         if (emit) emit(emit_ud, token);
         n_generated++;
@@ -18066,7 +19143,22 @@ static int generate_metal_graph_raw_swa(
         }
         n_decode_eval++;
         pos++;
+        if (dspark_probe && g_dsw.ready) {
+            int ids[DS4_DSPARK_BLK] = {0};
+            if (metal_graph_dspark_step(&g, model, weights, &g_dsw, token, (uint32_t)(pos - 1), ids)) {
+                memcpy(dspark_pending, ids, sizeof(int) * DS4_DSPARK_BLK);
+                dspark_pending_n = DS4_DSPARK_BLK;
+                if (n_decode_eval <= 8)
+                    fprintf(stderr, "ds4: [dspark] pos=%d anchor=%d draft= %d %d %d %d %d\n",
+                            pos - 1, token, ids[0], ids[1], ids[2], ids[3], ids[4]);
+            } else if (n_decode_eval <= 3) {
+                fprintf(stderr, "ds4: [dspark] step failed at pos=%d\n", pos - 1);
+            }
+        }
     }
+    if (dspark_probe && dspark_tot)
+        fprintf(stderr, "ds4: [dspark] first-token hit %u/%u = %.1f%%\n",
+                dspark_hit, dspark_tot, 100.0 * dspark_hit / dspark_tot);
     const double t_decode1 = now_sec();
     if (done) done(emit_ud);
 
@@ -19110,36 +20202,6 @@ bool ds4_prompt_is_programming(const char *prompt) {
     return score >= 3;
 }
 
-bool ds4_engine_has_mtp(ds4_engine *e) {
-    return e && e->backend != DS4_BACKEND_CPU &&
-           e->distributed.role == DS4_DISTRIBUTED_NONE &&
-           e->mtp_ready;
-}
-
-int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
-    if (!e) return 0;
-    if (ds4_engine_has_mtp(e)) return e->mtp_draft_tokens;
-    /* Distributed layer-pipeline MTP is orchestrated by the coordinator. The
-     * support model lives either on the final-layer worker (--mtp-role worker) or
-     * on the coordinator itself (--mtp-role coordinator, 本机 MTP). The CLI uses
-     * this accessor to decide whether to enter the speculative decode path; both
-     * draft locations need it non-zero so the loop runs the candidate batch
-     * instead of the plain one-token distributed decode. */
-    if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR &&
-        (e->distributed.mtp_draft_on_worker || e->distributed.mtp_draft_on_coordinator)) {
-        return e->mtp_draft_tokens;
-    }
-    return 0;
-}
-
-/* mtp.md Phase 1: the configured draft width regardless of whether this engine
- * loaded the MTP model. The distributed coordinator orchestrates speculation but
- * does not load MTP itself (the drafter lives on the last-layer worker), so it
- * needs the raw --mtp-draft value to size the candidate batch. */
-int ds4_engine_mtp_draft_tokens_configured(ds4_engine *e) {
-    return e ? e->mtp_draft_tokens : 0;
-}
-
 const ds4_tokens *ds4_session_tokens(ds4_session *s) {
     return s ? &s->checkpoint : NULL;
 }
@@ -19151,105 +20213,6 @@ typedef struct {
     uint32_t mtp_n_raw;
 } ds4_spec_frontier;
 
-static void spec_frontier_free(ds4_spec_frontier *f) {
-    if (!f) return;
-    memset(f, 0, sizeof(*f));
-}
-
-static bool spec_frontier_snapshot(ds4_spec_frontier *f, ds4_session *s) {
-    memset(f, 0, sizeof(*f));
-    ds4_gpu_graph *g = &s->graph;
-    f->mtp_n_raw = g->mtp_n_raw;
-
-    bool ok = ds4_gpu_begin_commands() != 0;
-    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
-        f->n_comp[il] = g->layer_n_comp[il];
-        f->n_index_comp[il] = g->layer_n_index_comp[il];
-        const uint32_t ratio = ds4_layer_compress_ratio(il);
-        if (ratio == 0) continue;
-        const uint64_t ab = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
-        ok = ds4_gpu_tensor_copy(g->spec_attn_state_kv[il], 0,
-                                   g->layer_attn_state_kv[il], 0, ab) != 0 &&
-             ds4_gpu_tensor_copy(g->spec_attn_state_score[il], 0,
-                                   g->layer_attn_state_score[il], 0, ab) != 0;
-        if (ratio == 4) {
-            const uint64_t ib = ds4_gpu_tensor_bytes(g->layer_index_state_kv[il]);
-            ok = ok &&
-                 ds4_gpu_tensor_copy(g->spec_index_state_kv[il], 0,
-                                       g->layer_index_state_kv[il], 0, ib) != 0 &&
-                 ds4_gpu_tensor_copy(g->spec_index_state_score[il], 0,
-                                       g->layer_index_state_score[il], 0, ib) != 0;
-        }
-    }
-    if (ok) ok = ds4_gpu_end_commands() != 0;
-    else (void)ds4_gpu_synchronize();
-    if (ok) return true;
-
-    spec_frontier_free(f);
-    return false;
-}
-
-static bool spec_frontier_restore(ds4_spec_frontier *f, ds4_session *s) {
-    ds4_gpu_graph *g = &s->graph;
-    bool ok = ds4_gpu_begin_commands() != 0;
-    g->mtp_n_raw = f->mtp_n_raw;
-    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
-        g->layer_n_comp[il] = f->n_comp[il];
-        g->layer_n_index_comp[il] = f->n_index_comp[il];
-        const uint32_t ratio = ds4_layer_compress_ratio(il);
-        if (ratio == 0) continue;
-        const uint64_t ab = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
-        ok = ds4_gpu_tensor_copy(g->layer_attn_state_kv[il], 0,
-                                   g->spec_attn_state_kv[il], 0, ab) != 0 &&
-             ds4_gpu_tensor_copy(g->layer_attn_state_score[il], 0,
-                                   g->spec_attn_state_score[il], 0, ab) != 0;
-        if (ok && ratio == 4) {
-            const uint64_t ib = ds4_gpu_tensor_bytes(g->layer_index_state_kv[il]);
-            ok = ds4_gpu_tensor_copy(g->layer_index_state_kv[il], 0,
-                                       g->spec_index_state_kv[il], 0, ib) != 0 &&
-                 ds4_gpu_tensor_copy(g->layer_index_state_score[il], 0,
-                                       g->spec_index_state_score[il], 0, ib) != 0;
-        }
-    }
-    if (ok) ok = ds4_gpu_end_commands() != 0;
-    else (void)ds4_gpu_synchronize();
-    return ok;
-}
-
-/* Commit the prefix-1 state captured by the N=2 speculative verifier.
- *
- * The verifier has already advanced every layer through both draft tokens.  On
- * a one-token accept the append-only compressed caches can keep the second
- * speculative row as invisible garbage, but the compressor frontiers and row
- * counters must be rewound to the exact state after draft[0].  This is the
- * cheap partial-accept path: copy a few small per-layer frontiers instead of
- * restoring the whole prefix and replaying a one-token target decode. */
-static bool spec_frontier_commit_prefix1(ds4_session *s) {
-    ds4_gpu_graph *g = &s->graph;
-    bool ok = ds4_gpu_begin_commands() != 0;
-    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
-        const uint32_t ratio = ds4_layer_compress_ratio(il);
-        if (ratio == 0) continue;
-
-        g->layer_n_comp[il] = g->spec_prefix1_n_comp[il];
-        const uint64_t ab = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
-        ok = ds4_gpu_tensor_copy(g->layer_attn_state_kv[il], 0,
-                                   g->spec_prefix1_attn_state_kv[il], 0, ab) != 0 &&
-             ds4_gpu_tensor_copy(g->layer_attn_state_score[il], 0,
-                                   g->spec_prefix1_attn_state_score[il], 0, ab) != 0;
-        if (ok && ratio == 4) {
-            g->layer_n_index_comp[il] = g->spec_prefix1_n_index_comp[il];
-            const uint64_t ib = ds4_gpu_tensor_bytes(g->layer_index_state_kv[il]);
-            ok = ds4_gpu_tensor_copy(g->layer_index_state_kv[il], 0,
-                                       g->spec_prefix1_index_state_kv[il], 0, ib) != 0 &&
-                 ds4_gpu_tensor_copy(g->layer_index_state_score[il], 0,
-                                       g->spec_prefix1_index_state_score[il], 0, ib) != 0;
-        }
-    }
-    if (ok) ok = ds4_gpu_end_commands() != 0;
-    else (void)ds4_gpu_synchronize();
-    return ok;
-}
 #endif
 
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
@@ -20095,8 +21058,12 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
     return 1;
 #else
     if (!e || !dataset_path || !output_path) return 1;
-    if (e->backend != DS4_BACKEND_METAL || !e->metal_ready) {
-        fprintf(stderr, "ds4: imatrix collection currently requires --metal\n");
+    /* 收集器本身是后端无关的: 采集循环全在宿主侧, 回读只用 ds4_gpu_tensor_read
+     * (Metal/CUDA 都实现), 三个采样张量 batch_ffn_norm / batch_router_selected /
+     * batch_routed_mid 也都由共享宿主图物化。旧的 "requires --metal" 是 Mac 独占
+     * 时代的遗留闸, 拆掉 (2026-08-21: 全 q2 基座第一次要在 CUDA 上吃语料量化)。 */
+    if (!ds4_backend_uses_graph(e->backend) || !e->metal_ready) {
+        fprintf(stderr, "ds4: imatrix collection requires a GPU graph backend (--metal / --cuda)\n");
         return 1;
     }
     if (ctx_size <= 0) ctx_size = 32768;
@@ -20115,7 +21082,7 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
                                         raw_cap, (uint32_t)ctx_size, prefill_cap, false,
                                         0, (uint32_t)DS4_N_LAYER - 1u, false);
     if (!ok) {
-        fprintf(stderr, "ds4: failed to allocate imatrix Metal graph runtime\n");
+        fprintf(stderr, "ds4: failed to allocate imatrix graph runtime\n");
         free(dataset);
         return 1;
     }
@@ -20529,6 +21496,293 @@ static void engine_register_layer_routers(ds4_engine *e, uint32_t start, uint32_
 }
 #endif
 
+/* ---- DS4_EVAL_IDS 终审仪器 -------------------------------------------------
+ * 用途: 与量化器锚文件里同序列的 FP logits 直接对账(held 区 Σmin), 判"引擎口径
+ * 还原率 vs 量化器口径"。差距大时再用 HDUMP 的逐层 hidden 找第一分歧层。
+ *
+ *   DS4_EVAL_IDS=<ids文件>     原始 token id 流, 空白分隔的十进制整数(每行一个亦可)
+ *   DS4_EVAL_LOGITS=<out.bin>  每位置最终 logits, f32 [S][DS4_N_VOCAB], 顺序流式写盘
+ *   DS4_EVAL_HDUMP=<dir>       每层出口 hidden → h_L%02d.bin(见 eval_hdump_batch_layer)
+ *   DS4_EVAL_NO_BOS=1          不在流首插 BOS(默认插, 即"裸 BOS 起")
+ *
+ * 走的是分布式推理那条已验证的裸 token 通道(ds4_session_eval_layer_slice), 天然不过
+ * chat 模板/DSML, 与量化器 embed(ids) 直喂同口径。跑完 exit(0), 不采样。
+ * 内存: logits 每次只留一个位置(VOCAB f32 ≈ 0.5 MB), 写一行冲一行, 不驻留 S×VOCAB。 */
+static int *eval_ids_load(const char *path, uint32_t *out_n, uint32_t vocab) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "ds4: [EVAL_IDS] 打不开 %s -- aborting\n", path);
+        exit(1);
+    }
+    uint32_t cap = 4096, n = 0;
+    int *ids = xmalloc((size_t)cap * sizeof(int));
+    long v;
+    while (fscanf(f, "%ld", &v) == 1) {
+        if (v < 0 || (uint64_t)v >= (uint64_t)vocab) {
+            fprintf(stderr, "ds4: [EVAL_IDS] %s 第 %u 个 id=%ld 越界 [0,%u) -- aborting\n",
+                    path, n, v, vocab);
+            exit(1);
+        }
+        if (n == cap) {
+            cap *= 2;
+            int *nb = realloc(ids, (size_t)cap * sizeof(int));
+            if (!nb) { fprintf(stderr, "ds4: [EVAL_IDS] ids 扩容失败\n"); exit(1); }
+            ids = nb;
+        }
+        ids[n++] = (int)v;
+    }
+    fclose(f);
+    if (!n) {
+        fprintf(stderr, "ds4: [EVAL_IDS] %s 里没有解析出任何 id -- aborting\n", path);
+        exit(1);
+    }
+    *out_n = n;
+    return ids;
+}
+
+/* 并发批实测(DS4_MULTI_BENCH=N, 2026-08-21): 建 N 个会话各喂不同 prompt, 先各自
+ * 单独解码若干步做基准, 再用 ds4_session_eval_multi 批量推进同样的步数, 对比
+ *   ①聚合 token/s(红利有多大)  ②每个会话选出的 token 序列是否与单独解码逐字相同(无损)。
+ * 用 DS4_MULTI_BENCH_STEPS 调步数(默认 48)。 */
+static void ds4_multi_bench_run(ds4_engine *e) {
+    const char *env = getenv("DS4_MULTI_BENCH");
+    if (!env || !env[0]) return;
+    uint32_t n = (uint32_t)atoi(env);
+    if (n < 2u && !getenv("DS4_MULTI_FORCE")) n = 2u;
+    if (n < 1u) n = 1u;
+    if (n > 8u) n = 8u;
+    uint32_t steps = 48u;
+    { const char *sv = getenv("DS4_MULTI_BENCH_STEPS"); if (sv && atoi(sv) > 0) steps = (uint32_t)atoi(sv); }
+    if (steps > 500u) steps = 500u;
+    /* 只跑批模式(跳过单路基准): 演示 8 路并发时不必等基准 */
+    const int batch_only = getenv("DS4_MULTI_BENCH_BATCH_ONLY") != NULL;
+
+    /* 8 道真代码题(并发批处理演示用): 各自独立、长度相近, 便于横向比较 */
+    static const char *prompts[8] = {
+        "Write a Python function `merge_intervals(intervals)` that merges overlapping intervals. Return only the code.",
+        "Write a Go function `LRUCache` with Get and Put in O(1). Return only the code.",
+        "Write a C function that reverses a singly linked list in place. Return only the code.",
+        "Write a SQL query that returns each department's second-highest salary. Return only the query.",
+        "Write a Python function `binary_search(arr, target)` returning the index or -1. Return only the code.",
+        "Write a bash script that finds the 10 largest files under a directory. Return only the script.",
+        "Write a JavaScript function `debounce(fn, wait)` and explain nothing. Return only the code.",
+        "Write a Rust function that counts word frequencies in a string. Return only the code.",
+    };
+    char err[256];
+    ds4_session *ss[8] = {0};
+    ds4_tokens toks[8];
+    memset(toks, 0, sizeof(toks));
+    for (uint32_t i = 0; i < n; i++) {
+        if (ds4_session_create(&ss[i], e, 4096) != 0 || !ss[i]) {
+            fprintf(stderr, "ds4: [multi-bench] 会话 %u 创建失败\n", i); exit(1);
+        }
+        { uint32_t pi = i;
+          const char *sv = getenv("DS4_MULTI_BENCH_START");
+          if (sv) pi = ((uint32_t)atoi(sv) + i) & 7u;
+          const char *ptext = getenv("DS4_MULTI_BENCH_SAMEPROMPT") ? prompts[0] : prompts[pi];
+          /* 与 CLI 同一条渲染路: 走 chat 模板才是正经问答, 裸文本只会续写题面 */
+          if (getenv("DS4_MULTI_BENCH_RAW")) ds4_tokenize_text(e, ptext, &toks[i]);
+          else ds4_encode_chat_prompt(e, NULL, ptext, DS4_THINK_NONE, &toks[i]); }
+        if (ds4_session_sync(ss[i], &toks[i], err, sizeof err) != 0) {
+            fprintf(stderr, "ds4: [multi-bench] 会话 %u prefill 失败: %s\n", i, err); exit(1);
+        }
+    }
+    /* 基准: 各会话单独逐 token 解码 steps 步, 记下选出的 token */
+    int (*ref)[512] = xmalloc((size_t)n * sizeof(*ref));
+    float *ref_l1 = xmalloc((size_t)n * DS4_N_VOCAB * sizeof(float));   /* 第 1 步后的 logits */
+    int (*bat)[512] = xmalloc((size_t)n * sizeof(*bat));
+    double t0 = now_sec();
+    for (uint32_t i = 0; !batch_only && i < n; i++) {
+        for (uint32_t k = 0; k < steps; k++) {
+            int best = 0; float bv = -1e30f;
+            for (uint32_t v = 0; v < (uint32_t)DS4_N_VOCAB; v++)
+                if (ss[i]->logits[v] > bv) { bv = ss[i]->logits[v]; best = (int)v; }
+            ref[i][k] = best;
+            if (ds4_session_eval(ss[i], best, err, sizeof err) != 0) {
+                fprintf(stderr, "ds4: [multi-bench] 单路解码失败: %s\n", err); exit(1);
+            }
+            if (k == 0) memcpy(ref_l1 + (uint64_t)i * DS4_N_VOCAB, ss[i]->logits,
+                               (size_t)DS4_N_VOCAB * sizeof(float));
+        }
+    }
+    const double seq_s = now_sec() - t0;
+    if (!batch_only)
+        fprintf(stderr, "ds4: [multi-bench] 单路逐个跑: %u 会话 × %u token = %u, 用时 %.2fs ⇒ 聚合 %.2f t/s\n",
+                n, steps, n * steps, seq_s, (double)(n * steps) / seq_s);
+
+    /* 批: 重建会话到同一起点, 用 eval_multi 同步推进 */
+    for (uint32_t i = 0; i < n; i++) {
+        ds4_session_free(ss[i]);
+        ss[i] = NULL;
+        if (ds4_session_create(&ss[i], e, 4096) != 0 ||
+            ds4_session_sync(ss[i], &toks[i], err, sizeof err) != 0) {
+            fprintf(stderr, "ds4: [multi-bench] 会话重建失败\n"); exit(1);
+        }
+    }
+    uint32_t mismatch = 0, first_bad = 0;
+    int cur[8];
+    t0 = now_sec();
+    for (uint32_t k = 0; k < steps; k++) {
+        for (uint32_t i = 0; i < n; i++) {
+            int best = 0; float bv = -1e30f;
+            for (uint32_t v = 0; v < (uint32_t)DS4_N_VOCAB; v++)
+                if (ss[i]->logits[v] > bv) { bv = ss[i]->logits[v]; best = (int)v; }
+            cur[i] = best;
+            bat[i][k] = best;
+            if (best != ref[i][k]) { if (!mismatch) first_bad = k; mismatch++; }
+        }
+        if (ds4_session_eval_multi(ss, cur, n, err, sizeof err) != 0) {
+            fprintf(stderr, "ds4: [multi-bench] 批解码失败: %s\n", err); exit(1);
+        }
+        if (k == 0 && !batch_only) {   /* 第 1 步 logits 与单路对账 */
+            for (uint32_t i = 0; i < n; i++) {
+                const float *r = ref_l1 + (uint64_t)i * DS4_N_VOCAB;
+                double dmax = 0.0; int ar = 0, ab = 0; float br = -1e30f, bb = -1e30f;
+                for (uint32_t v = 0; v < (uint32_t)DS4_N_VOCAB; v++) {
+                    const double d = fabs((double)r[v] - (double)ss[i]->logits[v]);
+                    if (d > dmax) dmax = d;
+                    if (r[v] > br) { br = r[v]; ar = (int)v; }
+                    if (ss[i]->logits[v] > bb) { bb = ss[i]->logits[v]; ab = (int)v; }
+                }
+                fprintf(stderr, "ds4: [multi-bench] 会话%u(位置%d) 第1步: max|Δlogit|=%.4g 单路top1=%d 批top1=%d %s\n",
+                        i, ss[i]->checkpoint.len, dmax, ar, ab, ar == ab ? "(一致)" : "(不同)");
+            }
+        }
+    }
+    const double bat_s = now_sec() - t0;
+    fprintf(stderr, "ds4: [multi-bench] %u 路批处理: %u token, 用时 %.2fs ⇒ 聚合 %.2f t/s%s\n",
+            n, n * steps, bat_s, (double)(n * steps) / bat_s,
+            batch_only ? "" : "");
+    if (!batch_only)
+        fprintf(stderr, "ds4: [multi-bench] 相对单路加速 %.2fx\n", seq_s / bat_s);
+    /* 质量目视: 两种模式各自的文本(逐位不同是数值等价的正常结果, 关键看是否连贯) */
+    if (getenv("DS4_MULTI_BENCH_TEXT")) {
+        for (uint32_t i = 0; i < n; i++) {
+            static char buf[16384]; size_t off = 0;
+            for (uint32_t k = 0; k < steps && off < sizeof(buf) - 64; k++) {
+                size_t l = 0;
+                const char *p = ds4_token_text(e, ref[i][k], &l);
+                if (p && off + l < sizeof(buf) - 1) { memcpy(buf + off, p, l); off += l; }
+            }
+            buf[off] = 0;
+            if (!batch_only) fprintf(stderr, "ds4: [multi-bench] 会话%u 单路: %s\n", i, buf);
+            off = 0;
+            for (uint32_t k = 0; k < steps && off < sizeof(buf) - 64; k++) {
+                size_t l = 0;
+                const char *p = ds4_token_text(e, bat[i][k], &l);
+                if (p && off + l < sizeof(buf) - 1) { memcpy(buf + off, p, l); off += l; }
+            }
+            buf[off] = 0;
+            fprintf(stderr, "\n===== 会话 %u =====\n%s\n", i, buf);
+        }
+    }
+    if (!batch_only) fprintf(stderr, "ds4: [multi-bench] 与单路逐位对照: %s (不同 %u/%u%s)\n",
+            mismatch ? "有差异" : "完全一致", mismatch, n * steps,
+            mismatch ? "" : ", 无损");
+    if (mismatch && !batch_only) fprintf(stderr, "ds4: [multi-bench] 首个不同在第 %u 步\n", first_bad);
+    for (uint32_t i = 0; i < n; i++) ds4_session_free(ss[i]);
+    free(ref);
+    exit(0);
+}
+
+static void ds4_eval_ids_run(ds4_engine *e) {
+    const char *idp = getenv("DS4_EVAL_IDS");
+    if (!idp || !idp[0]) return;
+#ifdef DS4_NO_GPU
+    (void)e;
+    fprintf(stderr, "ds4: [EVAL_IDS] 需要 graph 后端 -- aborting\n");
+    exit(1);
+#else
+    const uint32_t vocab = (uint32_t)DS4_N_VOCAB;
+    uint32_t nfile = 0;
+    int *file_ids = eval_ids_load(idp, &nfile, vocab);
+
+    /* 默认在流首插 BOS(裸 BOS 起); DS4_EVAL_NO_BOS=1 则原样喂。 */
+    const int no_bos = getenv("DS4_EVAL_NO_BOS") != NULL;
+    const uint32_t n = no_bos ? nfile : nfile + 1u;
+    int *ids = xmalloc((size_t)n * sizeof(int));
+    if (no_bos) {
+        memcpy(ids, file_ids, (size_t)nfile * sizeof(int));
+    } else {
+        ids[0] = e->vocab.bos_id;
+        memcpy(ids + 1, file_ids, (size_t)nfile * sizeof(int));
+    }
+    free(file_ids);
+    /* 首 8 个生效 id 打出来: 与锚文件对齐与否一眼可验(错位一格 Σmin 就全废)。 */
+    fprintf(stderr, "ds4: [EVAL_IDS] S=%u (文件 %u%s) vocab=%u 首8: ",
+            n, nfile, no_bos ? ", 无 BOS" : ", 首插 BOS", vocab);
+    for (uint32_t i = 0; i < n && i < 8u; i++) fprintf(stderr, "%d ", ids[i]);
+    fprintf(stderr, "\n");
+
+    ds4_session *s = NULL;
+    if (ds4_session_create(&s, e, (int)n + 64) != 0 || !s) {
+        fprintf(stderr, "ds4: [EVAL_IDS] 会话创建失败 -- aborting\n");
+        exit(1);
+    }
+    const uint32_t pcap = (uint32_t)ds4_session_prefill_cap(s);
+    if (!pcap) { fprintf(stderr, "ds4: [EVAL_IDS] prefill_cap=0 -- aborting\n"); exit(1); }
+    /* 不设 DS4_METAL_PREFILL_CHUNK 时 prefill_cap 等于整个 ctx(一次灌完), 那会让 hc
+     * 暂存和单批显存都按 S 放大。仪器自己按 512 分块(DS4_EVAL_CHUNK 可调), 与 A3
+     * 的 PREFILL_CHUNK=512 口径一致; 分块只影响批大小, 不影响数值。 */
+    uint32_t cap = 512u;
+    { const char *cv = getenv("DS4_EVAL_CHUNK"); if (cv && atoi(cv) > 0) cap = (uint32_t)atoi(cv); }
+    if (cap > pcap) cap = pcap;
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    float *hc = xmalloc((size_t)cap * hc_dim * sizeof(float));
+
+    FILE *lf = NULL; float *lg = NULL;
+    const char *lp = getenv("DS4_EVAL_LOGITS");
+    if (lp && lp[0]) {
+        lf = fopen(lp, "wb");
+        if (!lf) {
+            fprintf(stderr, "ds4: [EVAL_IDS] 打不开 %s -- aborting\n", lp);
+            exit(1);
+        }
+        lg = xmalloc((size_t)vocab * sizeof(float));
+    }
+
+    char err[256];
+    for (uint32_t p0 = 0; p0 < n; p0 += cap) {
+        const uint32_t nt = (n - p0 < cap) ? (n - p0) : cap;
+        /* layer_start=0 ⇒ 由 token 直接 embed(input_hc=NULL); 走到最后一层拿整批出口 HC。
+         * 逐层 hidden 由 eval_hdump_batch_layer 在同一趟前向里顺带写出, 不重复前向。 */
+        if (ds4_session_eval_layer_slice(s, ids + p0, nt, p0, 0, (uint32_t)DS4_N_LAYER - 1u,
+                                         NULL, hc, false, NULL, err, sizeof err) != 0) {
+            fprintf(stderr, "ds4: [EVAL_IDS] prefill 失败 @pos %u: %s -- aborting\n", p0, err);
+            exit(1);
+        }
+        if (lf) {
+            /* 逐位置过输出头: eval_output_head_from_hc 只算传入批的最后一行, 所以按
+             * n_tokens=1 逐位置喂该位置的 HC 隐状态。 */
+            for (uint32_t t = 0; t < nt; t++) {
+                if (ds4_session_eval_output_head_from_hc(s, hc + (uint64_t)t * hc_dim, 1u,
+                                                         lg, err, sizeof err) != 0) {
+                    fprintf(stderr, "ds4: [EVAL_IDS] 输出头失败 @pos %u: %s -- aborting\n",
+                            p0 + t, err);
+                    exit(1);
+                }
+                if (fwrite(lg, sizeof(float), vocab, lf) != vocab) {
+                    fprintf(stderr, "ds4: [EVAL_IDS] logits 短写 @pos %u -- aborting\n", p0 + t);
+                    exit(1);
+                }
+            }
+            fflush(lf);
+        }
+        fprintf(stderr, "ds4: [EVAL_IDS] %u/%u\n", p0 + nt, n);
+    }
+    if (lf && fclose(lf) != 0) {
+        fprintf(stderr, "ds4: [EVAL_IDS] 关闭 %s 失败 -- aborting\n", lp);
+        exit(1);
+    }
+    fprintf(stderr, "ds4: [EVAL_IDS] 完成 S=%u vocab=%u%s%s\n", n, vocab,
+            lp && lp[0] ? " logits已写" : "",
+            getenv("DS4_EVAL_HDUMP") ? " hidden已写" : "");
+    ds4_session_free(s);
+    free(hc); free(lg); free(ids);
+    exit(0);
+#endif
+}
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
     e->model.fd = -1;
@@ -20538,9 +21792,6 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     e->distributed = opt->distributed;
     e->power_percent = opt->power_percent > 0 ? opt->power_percent : 100;
     if (e->power_percent > 100) e->power_percent = 100;
-    e->mtp_draft_tokens = opt->mtp_draft_tokens > 0 ? opt->mtp_draft_tokens : 1;
-    if (e->mtp_draft_tokens > 16) e->mtp_draft_tokens = 16;
-    e->mtp_margin = opt->mtp_margin >= 0.0f ? opt->mtp_margin : 3.0f;
     if ((opt->directional_steering_attn != 0.0f || opt->directional_steering_ffn != 0.0f) &&
         (!opt->directional_steering_file || !opt->directional_steering_file[0]))
     {
@@ -20570,28 +21821,9 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                          UINT32_MAX : opt->distributed.layers.end;
         load_output = opt->distributed.layers.has_output;
     }
-    /* mtp.md Phase 1 (Scheme A): the MTP drafter runs on the worker holding the
-     * final layers + output head. That worker loads the MTP support model and,
-     * unlike other layer-slice workers, must also keep token_embd resident (the
-     * MTP head re-embeds its own draft tokens from the base token_embd). */
-    const bool mtp_for_worker_draft =
-        opt->distributed.role == DS4_DISTRIBUTED_WORKER &&
-        opt->distributed.mtp_draft_on_worker &&
-        load_output;
-    /* 本机 MTP topology: the coordinator runs the drafter. It owns the starting
-     * slice (so token_embd is already resident) but its layer slice ends before
-     * the output head; it must additionally resident the output head weights to
-     * turn the worker's returned final hidden state into logits (output head +
-     * its own MTP draft). The drafter also re-embeds its draft tokens, so keep
-     * token_embd resident as the worker-draft path does. */
-    const bool mtp_for_coord_draft =
-        opt->distributed.role == DS4_DISTRIBUTED_COORDINATOR &&
-        opt->distributed.mtp_draft_on_coordinator;
-    /* Whether this process must resident the output head weights: normally the
-     * owner of the final layer slice (load_output); also the coordinator drafter. */
-    const bool include_output_head = load_output || mtp_for_coord_draft;
-    const bool mtp_keep_token_embd = mtp_for_worker_draft || mtp_for_coord_draft;
-
+    /* MTP drafter 拓扑整族已删除(2026-08-05)。 */
+    const bool include_output_head = load_output;
+    const bool mtp_keep_token_embd = false;
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
     ds4_profile_load_begin();
     /* BASE model: the only open allowed to arm go1b/go2b env defaults (the
@@ -20603,6 +21835,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     if (!opt->inspect_only) vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);
     weights_bind(&e->weights, &e->model);
+    dspark_bind_with_draft(&e->dspark, &e->model, graph_backend);
     if (opt->inspect_only) {
         *out = e;
         return 0;
@@ -20667,9 +21900,58 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             if (zchain_path && zchain_path[0]) {
                 e->model.zchain = ds4_zchain_load(zchain_path, DS4_N_LAYER,
                                                   DS4_N_EXPERT, DS4_N_EMBD);
+                /* 显式请求的侧车打不开/空链 => 硬失败。静默裸跑过一次假对照
+                 * (+z==裸, 2026-08-20), 判决容不得兜底。 */
+                if (!e->model.zchain) {
+                    fprintf(stderr, "ds4: zchain %s requested but unusable -- aborting (no silent bare-model fallback)\n",
+                            zchain_path);
+                    exit(1);
+                }
             } else {
                 e->model.zchain = zchain_from_model(&e->model);
             }
+        /* 第4文件(2026-08-20 用户四文件设计): drafter 反修放大器侧车 DS4_DRAFT_ZCHAIN。
+         * 3 层链(mtp.0/1/2)合并进主链尾部槽 43..45 ⇒ 单 GPU 表一次上传;
+         * 合并链同挂主/draft 两个 model, ffn_batch 的 zch=model->zchain 两侧都取到,
+         * drafter FFN 按 il=43+b 索引。显式请求打不开 => 硬失败(无静默兜底)。 */
+        {
+            const char *draft_zc = getenv("DS4_DRAFT_ZCHAIN");
+            if (draft_zc && draft_zc[0]) {
+                if (!g_draft_model || !e->dspark.ready) {
+                    fprintf(stderr, "ds4: DS4_DRAFT_ZCHAIN requires a mounted drafter (DS4_DRAFT_GGUF)\n");
+                    exit(1);
+                }
+                struct ds4_zchain *dz = ds4_zchain_load(draft_zc, 3, DS4_N_EXPERT, DS4_N_EMBD);
+                if (!dz) {
+                    fprintf(stderr, "ds4: draft zchain %s unusable -- aborting\n", draft_zc);
+                    exit(1);
+                }
+                struct ds4_zchain *base = e->model.zchain;
+                struct ds4_zchain *mg = xmalloc(sizeof(*mg));
+                memset(mg, 0, sizeof(*mg));
+                mg->n_layer = (uint32_t)DS4_N_LAYER + 3u;
+                mg->n_expert = DS4_N_EXPERT;
+                mg->d_model = DS4_N_EMBD;
+                mg->layer = xcalloc(mg->n_layer, sizeof(mg->layer[0]));
+                if (base) {
+                    memcpy(mg->layer, base->layer, (size_t)DS4_N_LAYER * sizeof(mg->layer[0]));
+                    mg->n_ops_total = base->n_ops_total;
+                    mg->n_ge_layers = base->n_ge_layers;
+                    mg->map = base->map; mg->map_size = base->map_size;
+                }
+                memcpy(mg->layer + DS4_N_LAYER, dz->layer, 3u * sizeof(mg->layer[0]));
+                mg->n_ops_total += dz->n_ops_total;
+                mg->n_ge_layers += dz->n_ge_layers;
+                /* base/dz 壳被 merged alias(单例, 进程生命周期), 不 free */
+                e->model.zchain = mg;
+                g_draft_model->zchain = mg;
+                fprintf(stderr, "ds4: draft zchain merged: %s (3 layers @ slots 43..45)\n", draft_zc);
+            } else if (g_draft_model && e->model.zchain) {
+                /* 无 draft 侧车但有主侧车: drafter FFN 的 zch 取 dmodel->zchain,
+                 * 保持 NULL 即旁路(主链槽 0..42 与 drafter il 43+b 互不相扰) */
+                g_draft_model->zchain = NULL;
+            }
+        }
 #ifndef DS4_NO_GPU
             if (e->model.zchain && graph_backend &&
                 !zchain_gpu_upload(e->model.zchain)) {
@@ -20678,24 +21960,14 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             }
 #endif
         }
-        /* Go trie drafter (--go-trie / DS4_GO_TRIE): corpus-statistics proposal
-         * source for single-machine copy-spec. Absent => exactly today's path. */
-        const char *trie_path = opt->go_trie_path && opt->go_trie_path[0]
-                              ? opt->go_trie_path : getenv("DS4_GO_TRIE");
-        if (trie_path && trie_path[0]) e->go_trie = ds4_gotrie_load(trie_path);
-        /* knowledge-MTP reference corpus (ds4_mtp.c): the language-idiom
-         * drafter is inherent -- tokenized from the built-in idiom set (+
-         * DS4_REF_CORPUS extension files) at init, no file, no flag.
-         * Proposals only ever ride the verify batch, so this costs nothing
-         * until an idiom actually matches. */
-        e->ref_corpus = ds4_refcorpus_build(engine_mtp_tokenize_cb, e);
+        /* go-trie/ref-corpus drafter 设施已随 copy-spec/MTP 整族删除(2026-08-05 用户裁决)。 */
         /* 多模态 registry, same tokenizer bridge. The image family binds an
          * external encoder command when one is present -- resolution:
          * DS4_MM_IMAGE_CMD env, else ./mm-ui (the frontend-domain UI-sketch
          * tool, `make mm-ui`; cwd-relative like the metal shader dir, so
          * --chdir applies). Absent => image content is honestly rejected
          * upstream (server 400s image blocks instead of dropping them). */
-        e->mm = ds4_mm_create(engine_mtp_tokenize_cb, e);
+        e->mm = ds4_mm_create(engine_tokenize_cb, e);
         if (e->mm) {
             const char *mm_cmd = getenv("DS4_MM_IMAGE_CMD");
             if ((!mm_cmd || !mm_cmd[0]) && access("mm-ui", X_OK) == 0)
@@ -20715,27 +21987,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         *out = NULL;
         return 1;
     }
-    if (opt->mtp_path && opt->mtp_path[0] &&
-        (opt->distributed.role == DS4_DISTRIBUTED_NONE || mtp_for_worker_draft ||
-         mtp_for_coord_draft)) {
-        model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
-        mtp_weights_bind(&e->mtp_weights, &e->mtp_model);
-        e->mtp_ready = true;
-#ifndef DS4_NO_GPU
-        /* model_open(MTP) set the single GPU keep-LUT to the MTP's keep-map,
-         * overwriting the base model's. Restore the base's so the first base
-         * forward (prefill) routes correctly; the MTP draft swaps to its own
-         * LUT per-draft and restores the base's afterward. */
-        if (e->model.expert_orig_to_compact)
-            ds4_gpu_set_expert_keep_lut(e->model.expert_orig_to_compact, e->model.expert_layer_count);
-#endif
-        fprintf(stderr, "ds4: MTP support model loaded: %s (draft=%d%s)\n",
-                opt->mtp_path,
-                e->mtp_draft_tokens,
-                mtp_for_worker_draft ? ", distributed worker drafter" :
-                mtp_for_coord_draft ? ", distributed coordinator drafter" : "");
-    }
-
+    /* MTP 支持模型加载已整族删除(2026-08-05 用户裁决: Go 定型优化)。 */
 #ifndef DS4_NO_GPU
     if (e->backend == DS4_BACKEND_CUDA) {
 #ifdef __APPLE__
@@ -20815,6 +22067,14 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                     "ds4: expert-offload AUTO: full-resident %.2f GiB vs %.2f GiB budget -> %s\n",
                     (double)planned / DS4_GIB, (double)auto_budget / DS4_GIB,
                     expert_offload_requested ? "stream (offload)" : "resident (fast)");
+        }
+        /* VQ blob 专家不进 Metal span(ds4.c:2074): 前向唯一路径=CPU gather→f16 scratch
+         * (ds4.c:2277 从 mmap vq_raw 读)。resident(offload=0)会让 MoE kernel 去 residency
+         * set 直读不存在的专家 span → 崩。双机切层后 planned<budget 时 AUTO 会误选 resident,
+         * 故 VQ blob 恒强制 offload。 */
+        if (g_vq_experts_blob && !expert_offload_requested) {
+            fprintf(stderr, "ds4: VQ blob 专家: 强制 offload(CPU gather 是唯一前向路径, 覆盖 AUTO resident)\n");
+            expert_offload_requested = true;
         }
         ds4_gpu_set_expert_offload(expert_offload_requested ? 1 : 0);
         if (load_slice) {
@@ -21049,6 +22309,22 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             return 1;
         }
         if (mtp_nonresident) ds4_gpu_set_model_map_nonresident_hint(0);
+        /* 副 drafter map 注册必须在主模型 map 之后: ds4_gpu_set_model_map 换 base 时
+         * release_all 会连带释放先注册的 range(2026-08-21 实测顺序坑)。 */
+        /* 副 map 注册失败 => drafter 读到的是不可用的裸指针(实测 logits NaN, 草稿全废、
+         * acc 塌到 1.00 而速度看似"正常")。明确停用 drafter, 不接受静默劣化。 */
+        /* ★默认关(2026-08-21 实测): 副 map 整体 cudaHostRegister + HostGetDevicePointer
+         * 在 5.59GB 文件映射上不可靠 —— drafter 同输入两跑 MoE 输出不同(Fin/路由/权重
+         * 逐字节相同), 关掉即完全确定; 注册前把页全部触实也无效。改走 cuda_model_range_ptr
+         * 的按 range 懒注册(页对齐分段, 已验证确定)。DS4_AUX_REG=1 可强开做对照。 */
+        if (g_draft_model && getenv("DS4_NO_AUX_REG") == NULL &&
+            !ds4_gpu_register_aux_model_map(g_draft_model->map, g_draft_model->size)) {
+            fprintf(stderr, "ds4: draft gguf aux map registration failed -- disabling drafter "
+                            "(speculation off; plain decode continues)\n");
+            e->dspark.ready = false;
+            g_dspark_ready_global = 0;
+            g_dspark_bound_for_prefill = NULL;
+        }
         if (!accelerator_cache_model_tensors(e->backend, &e->model)) {
             fprintf(stderr, "ds4: %s failed to prepare startup model cache\n",
                     ds4_backend_name(e->backend));
@@ -21098,6 +22374,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
 #endif
 
     ds4_profile_load_end();
+    ds4_multi_bench_run(e);   /* DS4_MULTI_BENCH=N: 并发批实测(跑完退出) */
+    ds4_eval_ids_run(e);   /* DS4_EVAL_IDS 在场则跑完仪器直接退出, 不返回 */
     *out = e;
     return 0;
 }
@@ -21162,22 +22440,6 @@ int ds4_engine_model_id(ds4_engine *e) {
 
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
-    if (e->go_trie) {
-        /* One summary line whenever the trie was armed: fires (batches sent),
-         * free-gate misses (zero-cost skips), accept ratio. This is the whole
-         * measurement story for the drafter, so it prints unconditionally. */
-        fprintf(stderr,
-                "ds4: go-trie summary: fires=%llu gate_miss=%llu sent=%llu "
-                "committed=%llu full=%llu avg_accept=%.2f\n",
-                (unsigned long long)e->go_trie->fires,
-                (unsigned long long)e->go_trie->gate_miss,
-                (unsigned long long)e->go_trie->sent,
-                (unsigned long long)e->go_trie->committed,
-                (unsigned long long)e->go_trie->full,
-                e->go_trie->fires ? (double)e->go_trie->committed / (double)e->go_trie->fires : 0.0);
-        ds4_gotrie_free(e->go_trie);
-    }
-    ds4_refcorpus_free(e->ref_corpus);
     ds4_mm_free(e->mm);
     weights_free(&e->weights);
     vocab_free(&e->vocab);
@@ -21247,6 +22509,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         active_end = e->distributed.layers.has_output ?
                      ((uint32_t)DS4_N_LAYER - 1u) : e->distributed.layers.end;
     }
+    s->graph.dspark_capture = e->dspark.ready ? 1 : 0;
     if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, &e->weights.layer[0],
                                    raw_cap, (uint32_t)ctx_size, s->prefill_cap, e->mtp_ready,
                                    active_start, active_end, active_slice))
@@ -21770,70 +23033,6 @@ int ds4_session_eval_layer_slice(ds4_session *s,
 #endif
 }
 
-/* mtp.md Phase 1 (Scheme A): produce up to `max_k` greedy MTP draft tokens on the
- * worker that just evaluated the final layer slice. The slice eval leaves the
- * model's final hidden state in g->cur_hc, which is exactly the input the MTP
- * head consumes, so no hidden-state round trip to the coordinator is needed.
- *
- * `verified_token` is the token the coordinator already committed at `pos`
- * (the slice's last token); the recursion drafts verified_token -> draft[0] ->
- * draft[1] -> ... Returns 0 with *out_n=0 (not an error) when MTP is unavailable
- * so callers can fall back to plain decode. Greedy-only, matching the
- * single-machine speculative path. The speculative rows written into the MTP
- * raw cache are rolled back later via the WORK accept_len (increment #4). */
-int ds4_session_mtp_draft(ds4_session *s,
-                          int verified_token,
-                          uint32_t pos,
-                          int max_k,
-                          int *drafts,
-                          int *out_n,
-                          char *err,
-                          size_t errlen) {
-    if (out_n) *out_n = 0;
-    if (!s || !s->engine || !drafts || max_k <= 0) return 0;
-    ds4_engine *e = s->engine;
-    if (!e->mtp_ready || !ds4_backend_uses_graph(e->backend)) return 0;
-#ifdef DS4_NO_GPU
-    (void)verified_token; (void)pos; (void)err; (void)errlen;
-    return 0;
-#else
-    ds4_gpu_graph *g = &s->graph;
-    if (!g->mtp_raw_cache) return 0;
-    if (max_k > e->mtp_draft_tokens) max_k = e->mtp_draft_tokens;
-    if (max_k > 16) max_k = 16;
-    if (max_k <= 0) return 0;
-
-    int n = 0;
-    int top = -1;
-    if (!metal_graph_eval_mtp_draft(g, &e->model, &e->weights,
-                                    &e->mtp_model, &e->mtp_weights,
-                                    verified_token, pos, NULL, &top)) {
-        if (errlen) snprintf(err, errlen, "MTP draft step 0 failed");
-        return 1;
-    }
-    drafts[n++] = top;
-    for (; n < max_k; n++) {
-        /* Ping-pong the two MTP hidden buffers exactly as the single-machine
-         * recursive drafter does: step 0 wrote g->mtp_state_hc, so an odd step
-         * reads it and writes g->mtp_next_hc, and an even step does the reverse. */
-        ds4_gpu_tensor *prev_hc = (n & 1) ? g->mtp_state_hc : g->mtp_next_hc;
-        ds4_gpu_tensor *out_hc  = (n & 1) ? g->mtp_next_hc  : g->mtp_state_hc;
-        top = -1;
-        if (!metal_graph_eval_mtp_draft_from_hc(g, &e->model, &e->weights,
-                                                &e->mtp_model, &e->mtp_weights,
-                                                prev_hc, out_hc,
-                                                drafts[n - 1],
-                                                pos + (uint32_t)n,
-                                                NULL, &top)) {
-            break; /* keep the drafts gathered so far */
-        }
-        drafts[n] = top;
-    }
-    if (out_n) *out_n = n;
-    return 0;
-#endif
-}
-
 /* mtp.md Phase 1 (Scheme A) cross-machine verifier: run a K-token candidate
  * batch through this worker's layer slice (layer_start..layer_end, which must be
  * the final transformer layer) and emit the per-row logits into
@@ -21903,12 +23102,48 @@ int ds4_session_verify_batch_argmax(ds4_session *s,
                                                      0,
                                                      n_tokens);
     }
+    const bool vprof = getenv("DS4_SPEC_PROF") != NULL;
+    const double vt0 = vprof ? now_sec() : 0.0;
+    if (vprof) ds4_gpu_span_begin();
     if (ok) ok = ds4_gpu_begin_commands() != 0;
+    /* 批 CUDA 图(2026-08-21): 43 层 ~3.5k kernel 的相邻间隙吃掉 31% GPU 时间。
+     * 捕获成图后单次发射, 间隙归零。编码会推进 host 侧压缩器计数 ⇒ 捕获失败必须先
+     * 还原再重编码, 否则 KV 记账错位。 */
+    uint32_t saved_n_comp[DS4_N_LAYER], saved_n_index[DS4_N_LAYER];
+    for (uint32_t il = 0; il < (uint32_t)DS4_N_LAYER; il++) {
+        saved_n_comp[il] = g->layer_n_comp[il];
+        saved_n_index[il] = g->layer_n_index_comp[il];
+    }
+    const int bgraph = (ok && layer_start == 0) ? ds4_gpu_batch_graph_begin((int)(pos0 & 3u)) : 0;
     for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
         ok = metal_graph_encode_layer_batch(g, &e->model, &e->weights.layer[il],
                                             il, pos0, n_tokens);
     }
+    if (bgraph) {
+        const int r = ds4_gpu_batch_graph_end_launch(ok ? 1 : 0);
+        if (r < 0) {   /* 捕获失败: 图内 kernel 未执行 ⇒ 还原计数后重编码直发 */
+            for (uint32_t il = 0; il < (uint32_t)DS4_N_LAYER; il++) {
+                g->layer_n_comp[il] = saved_n_comp[il];
+                g->layer_n_index_comp[il] = saved_n_index[il];
+            }
+            ok = true;
+            for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
+                ok = metal_graph_encode_layer_batch(g, &e->model, &e->weights.layer[il],
+                                                    il, pos0, n_tokens);
+            }
+        }
+    }
+    const double vt1 = vprof ? now_sec() : 0.0;
     if (ok) ok = ds4_gpu_end_commands() != 0;
+    if (vprof) {
+        static double enc_acc, wait_acc, gpu_acc; static uint32_t vn;
+        const float gpu_ms = ds4_gpu_span_end();
+        enc_acc += vt1 - vt0; wait_acc += now_sec() - vt1; vn++;
+        if (gpu_ms > 0.0f) gpu_acc += gpu_ms;
+        if ((vn & 15u) == 0)
+            fprintf(stderr, "ds4: [vfy-prof] n=%u avg_ms: encode_cpu=%.1f end_wait=%.1f gpu_span=%.1f\n",
+                    vn, enc_acc * 1e3 / vn, wait_acc * 1e3 / vn, gpu_acc / vn);
+    }
     else (void)ds4_gpu_synchronize();
     if (!ok) {
         if (errlen) snprintf(err, errlen, "%s verify batch layers failed",
@@ -22245,29 +23480,8 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
     return i;
 }
 
-static float session_repeat_freq_pen(uint32_t *window_out);
 static void repeat_penalize_buf(ds4_session *s, float *logits, uint32_t end);
-static int session_anticycle_active(void);
 static int session_penalties_active(const ds4_session *s);
-
-/* Anticycle-consistent prep for EXTERNAL verify loops (distributed accept):
- * temporarily extend the checkpoint with the in-flight draft prefix, apply the
- * exact penalties/bans the local sampler would use at that position onto the
- * caller's row logits, then restore. Unified semantics: a banned continuation
- * simply stops matching ("没有匹配就没有匹配"), the partial-accept machinery
- * and the next full-logits decode step pick the alternative naturally. */
-void ds4_session_anticycle_prep(ds4_session *s, float *row_logits,
-                                const int *extra, uint32_t n_extra) {
-    if (!s || !row_logits) return;
-    /* Session-aware gate: also covers request penalties (a session with only
-     * req_freq/req_presence armed must still replay them onto the verify row)
-     * and the lane bypass (non-FREE lanes verify against raw logits). */
-    if (!session_penalties_active(s)) return;
-    int saved = s->checkpoint.len;
-    for (uint32_t i = 0; i < n_extra; i++) token_vec_push(&s->checkpoint, extra[i]);
-    repeat_penalize_buf(s, row_logits, (uint32_t)s->checkpoint.len);
-    s->checkpoint.len = saved;
-}
 
 int ds4_session_argmax(ds4_session *s) {
     /* Non-FREE lanes see raw logits by contract (ds4.h): skip the scratch
@@ -22312,96 +23526,18 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
     return sample_top_p_min_p(logits, (uint32_t)n_vocab, temperature, top_k, top_p, min_p, rng);
 }
 
-/* Env-armed penalty caches. File-scope (not function-local statics) only so
- * the test-only reset below can drop them after a setenv; production code
- * reads the env exactly once per process, through the accessors. */
-static int      g_repeat_env_scanned = 0;
-static float    g_repeat_freq_pen = 0.0f;
-static uint32_t g_repeat_freq_window = 128u;
-
-/* Test-only: forget the env caches so tests/ds4_test.c --penalty-unit can
- * exercise several DS4_REPEAT_FREQ/DS4_REPEAT_WINDOW configs in one process
- * (and restore the developer's env for later suites).
- * extern-declared by the test; deliberately NOT in ds4.h. */
-void ds4_test_reset_penalty_env_cache(void) {
-    g_repeat_env_scanned = 0;
-    g_repeat_freq_pen = 0.0f;
-    g_repeat_freq_window = 128u;
-}
-
-/* Optional repeat penalty applied to the session logits before sampling. The base
- * model greedy-decodes into short loops on long generation (ds4 has no built-in
- * repeat penalty). Subtract DS4_REPEAT_FREQ per occurrence of each token in the
- * last DS4_REPEAT_WINDOW (default 128) committed tokens: a looping token (high
- * local count) is pushed down, diverse output (each token a few times) barely
- * touched. Off by default. Universal: every sampler caller goes through here. */
-static float session_repeat_freq_pen(uint32_t *window_out) {
-    if (!g_repeat_env_scanned) {
-        const char *f = getenv("DS4_REPEAT_FREQ");
-        const char *w = getenv("DS4_REPEAT_WINDOW");
-        g_repeat_freq_pen = (f && f[0]) ? (float)atof(f) : 0.0f;
-        if (w && w[0]) g_repeat_freq_window = (uint32_t)strtoul(w, NULL, 10);
-        g_repeat_env_scanned = 1;
-        if (g_repeat_freq_pen > 0.0f)
-            fprintf(stderr, "ds4: repeat-penalty freq=%.2f window=%u\n",
-                    g_repeat_freq_pen, g_repeat_freq_window);
-    }
-    if (window_out) *window_out = g_repeat_freq_window;
-    return g_repeat_freq_pen > 0.0f ? g_repeat_freq_pen : 0.0f;
-}
-
-/* Penalize an arbitrary logits row as if the committed stream ended at
- * checkpoint[0..end): the speculative verify replays the SAME penalty the
- * non-speculative sampler would have applied at that position, so greedy
- * speculation stays bit-equivalent with the penalty active (it previously
- * bypassed the penalty entirely — accepted whole repetition runs raw).
- * 2026-07-28 用户裁决: anticycle 断环器整族删除(LOOP_BREAK/ESC/HARD_K/FUZZ+双检测器)
- * — 行为遮罩掩盖真实退化且模糊环照样穿透; 采样期惩罚只剩显式 opt-in 的
- * DS4_REPEAT_FREQ 与 per-request OpenAI 惩罚, 默认路径=裸模型真值。 */
-static int session_anticycle_active(void) {
-    return session_repeat_freq_pen(NULL) > 0.0f;
-}
-
 /* Session-aware penalty-activity gate: env-armed penalties (loop break /
  * DS4_REPEAT_FREQ) plus this session's per-request penalties -- a session
  * carrying only req_freq/req_presence must still take the penalized
  * argmax/anticycle-prep paths. Non-FREE lanes report inactive: the lane
  * contract (ds4.h) bypasses every penalty, so callers skip the scratch work
  * outright. */
+/* 惩罚只剩客户端显式传的 per-request(OpenAI frequency/presence)。引擎自造的
+ * env 惩罚(DS4_REPEAT_FREQ)、断环器、熵门整族已删(2026-08-21 用户铁律:
+ * 引擎不得擅自修改模型输出, 默认路径=裸模型真值)。 */
 static int session_penalties_active(const ds4_session *s) {
     if (s && s->lane != DS4_LANE_FREE) return 0;
-    if (session_anticycle_active()) return 1;
     return s && (s->req_freq != 0.0f || s->req_presence != 0.0f);
-}
-
-/* Core repeat/anticycle penalty on `logits` given committed tokens v[0..end)
- * with the generation region starting at gstart. Extracted so both the
- * single-machine session sampler and the distributed coordinator (which keeps
- * its committed stream in a separate transcript, not s->checkpoint) share ONE
- * implementation — keeping dual-host generation identical to single-host. */
-static void repeat_penalize_core(const int *v, uint32_t end, uint32_t gstart, float *logits) {
-    uint32_t window = 0;
-    const float freq_pen = session_repeat_freq_pen(&window);
-    if (!v || !logits || end == 0) return;
-    if (gstart > end) gstart = end;
-    if (freq_pen > 0.0f) {   /* optional manual tool; auto anti-cycle below is independent */
-        /* Window [end-window, end) is deliberately NOT clamped to gstart:
-         * early in generation the window must include the prompt tail or only
-         * a handful of generated tokens are counted and the penalty is far
-         * too weak for the fragile 2-bit models -- greedy drifts/loops
-         * (2026-07-06 mono verdict). The former clamp here (67ae6c7) was dead
-         * in practice anyway: gstart collapsed to 0 for unmarked sessions.
-         * Only the anticycle bans below and the per-request penalties in
-         * repeat_penalize_buf honor the generation boundary. */
-        uint32_t start = end > window ? end - window : 0u;
-        for (uint32_t i = start; i < end; i++) {
-            int t = v[i];
-            if (t >= 0 && t < (int)DS4_N_VOCAB) logits[t] -= freq_pen;
-        }
-    }
-    /* anticycle 断环器已整族删除(2026-07-28 用户裁决): 行为遮罩掩盖真实退化,
-     * 且模糊变体环照样穿透 — 默认路径必须暴露裸模型真值。 */
-    (void)gstart;
 }
 
 static void repeat_penalize_buf(ds4_session *s, float *logits, uint32_t end) {
@@ -22427,7 +23563,6 @@ static void repeat_penalize_buf(ds4_session *s, float *logits, uint32_t end) {
     if (s->repeat_gen_start < 0 || s->repeat_gen_start > (int)end)
         s->repeat_gen_start = 0;
     const uint32_t gstart = (uint32_t)s->repeat_gen_start;
-    repeat_penalize_core(s->checkpoint.v, end, gstart, logits);
     /* Per-request OpenAI penalties, stacked on top of the env freq penalty:
      * logits[t] -= req_freq*count(t) + (count(t)>0 ? req_presence : 0), with
      * count over the generated region only. Negative values are legal and
@@ -22449,20 +23584,6 @@ static void repeat_penalize_buf(ds4_session *s, float *logits, uint32_t end) {
             if (t >= 0 && t < (int)DS4_N_VOCAB) seen[t] = 0;
         }
     }
-}
-
-/* Exposed for the distributed coordinator's plain-decode loop (ds4_distributed.c),
- * which samples from a raw logits buffer using its own transcript (prompt +
- * generated) rather than a ds4_session checkpoint. Applies the identical freq +
- * anticycle penalty so dual-host generation matches single-host — the plain dist
- * path previously sampled RAW logits and drifted/looped on long generation.
- * LIMITATION: there is no ds4_session here, so per-request penalties
- * (ds4_session_set_request_penalties) and the lane bypass do NOT apply -- the
- * caller owns the transcript and must gate the call by its own lane state and
- * apply request penalties itself if it ever carries them. */
-void ds4_repeat_penalize_tokens(float *logits, const int *toks, uint32_t n_committed,
-                                uint32_t gen_start) {
-    repeat_penalize_core(toks, n_committed, gen_start, logits);
 }
 
 /* ---- Sampling-lane / per-request policy (contract in ds4.h) ----
@@ -22519,70 +23640,6 @@ static void session_apply_repeat_penalty(ds4_session *s) {
     repeat_penalize_buf(s, s->logits, (uint32_t)s->checkpoint.len);
 }
 
-/* ===== 熵门控采样(DS4_ENT_GATE, 2026-07-25) =====
- * 病灶: 弱约束区(字符串字面量/错误文本)FP 分布本就平坦, 1.29bit 量化噪声在平坦区翻 top-1,
- * temp0 贪心把单次翻错复利成吸引子链(标识符链/复读环, v3/go2b 两代 15 针面板 10/15 号实证)。
- * 方案(文献: min-p ICLR'25 对重量化模型特效 / EDT 熵驱动动态温度 / 2512.04419 贪心+惩罚=病理):
- *   仅 temperature==0.0(全局贪心运行)且门开时: top-K 重归一熵 H ≥ τ(平坦) → min-p 截断
- *   +低温采样(固定种子=跑间可复现); H<τ(尖锐=语法/结构区) → 贪心不变(好针零扰动)。
- * 工具语法段隔离: server 的 in_tool_call 强制从 0.0 改传 -1.0(硬贪心哨兵), 门永不触碰工具帧。 */
-static float g_ent_gate_tau = -1.0f;   /* <0=未扫描; 0=关(默认) */
-static float g_ent_temp = 0.9f, g_ent_minp = 0.1f;
-static int   g_ent_topk = 40;
-static int   g_ent_streak_need = 2;    /* DS4_ENT_STREAK: 连续≥N 个平坦 token 才开火 —
-                                        * 代码分叉点=孤立熵尖峰(随后语法收紧)保持贪心(编码不伤);
-                                        * 错误文本=持续平坦带才采样(治吸引子链)。15针实测: τ2.0
-                                        * 无 streak 时 3 针代码分叉被误伤(fable5 2026-07-25)。 */
-static int   g_ent_streak = 0;
-static float g_ent_freq = 1.5f;        /* DS4_ENT_FREQ: 平坦区内频率惩罚(logit 单位, 近窗每次出现累减) —
-                                        * 文献分层第二层(2512.04419): 采样单用不斩链, τ2.6/s1 实测
-                                        * `_Integral` 链在采样下仍续(续链 token 分布内占优); 只在门内生效。 */
-static int   g_ent_freq_win = 48;      /* DS4_ENT_FREQ_WIN: 频率惩罚回看窗口(生成区内) */
-static uint64_t g_ent_rng = 0x5EEDC0DE2026ULL;   /* 会话内确定序列(DS4_ENT_SEED 覆盖) */
-static void ent_gate_scan(void) {
-    if (g_ent_gate_tau >= 0.0f) return;
-    const char *e = getenv("DS4_ENT_GATE");
-    g_ent_gate_tau = e ? (float)atof(e) : 0.0f;
-    if ((e = getenv("DS4_ENT_TEMP")) != NULL) g_ent_temp = (float)atof(e);
-    if ((e = getenv("DS4_ENT_MINP")) != NULL) g_ent_minp = (float)atof(e);
-    if ((e = getenv("DS4_ENT_TOPK")) != NULL) g_ent_topk = atoi(e);
-    if ((e = getenv("DS4_ENT_SEED")) != NULL) g_ent_rng = strtoull(e, NULL, 0);
-    if ((e = getenv("DS4_ENT_STREAK")) != NULL) g_ent_streak_need = atoi(e);
-    if (g_ent_streak_need < 1) g_ent_streak_need = 1;
-    if ((e = getenv("DS4_ENT_FREQ")) != NULL) g_ent_freq = (float)atof(e);
-    if ((e = getenv("DS4_ENT_FREQ_WIN")) != NULL) g_ent_freq_win = atoi(e);
-    if (g_ent_gate_tau > 0.0f)
-        fprintf(stderr, "ds4: entropy-gated sampling armed (tau=%.2f nats, streak>=%d, flat: temp=%.2f min_p=%.2f top_k=%d)\n",
-                g_ent_gate_tau, g_ent_streak_need, g_ent_temp, g_ent_minp, g_ent_topk);
-}
-/* top-K 重归一熵(nats): 单遍小插入选 K 个最大 logit → softmax → H。K=40 时 H∈[0, ln40≈3.69] */
-static float logits_topk_entropy(const float *logits, uint32_t n_vocab, int K) {
-    if (K > 64) K = 64;
-    float top[64];
-    int nt = 0;
-    for (uint32_t i = 0; i < n_vocab; i++) {
-        const float v = logits[i];
-        if (!isfinite(v)) continue;
-        if (nt < K) {
-            int j = nt++;
-            while (j > 0 && top[j - 1] < v) { top[j] = top[j - 1]; j--; }
-            top[j] = v;
-        } else if (v > top[K - 1]) {
-            int j = K - 1;
-            while (j > 0 && top[j - 1] < v) { top[j] = top[j - 1]; j--; }
-            top[j] = v;
-        }
-    }
-    if (nt == 0) return 0.0f;
-    double sum = 0.0;
-    for (int i = 0; i < nt; i++) sum += exp((double)(top[i] - top[0]));
-    double H = 0.0;
-    for (int i = 0; i < nt; i++) {
-        const double p = exp((double)(top[i] - top[0])) / sum;
-        if (p > 1e-12) H -= p * log(p);
-    }
-    return (float)H;
-}
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
     if (getenv("DS4_DECODE_DIAG")) {
         /* [decode-diag] inspect the logits the sampler is about to draw from:
@@ -22601,37 +23658,6 @@ int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p
                 argmax, amv, nonfinite, (unsigned)DS4_N_VOCAB);
     }
     session_apply_repeat_penalty(s);
-    ent_gate_scan();
-    if (temperature == 0.0f && g_ent_gate_tau > 0.0f) {
-        /* 平坦区逃逸: 只在全局贪心(temp==0)时评估; 工具语法段传 -1.0 永不进此支。
-         * streak 条件: 连续 N 个平坦 token 才开火 — 代码分叉点的孤立熵尖峰保持贪心。 */
-        const float H = logits_topk_entropy(s->logits, DS4_N_VOCAB, g_ent_topk);
-        if (H >= g_ent_gate_tau) {
-            g_ent_streak++;
-            if (g_ent_streak >= g_ent_streak_need) {
-                if (getenv("DS4_ENT_LOG"))
-                    fprintf(stderr, "ds4: [ent-gate] H=%.2f>=%.2f streak=%d flat-zone sample\n",
-                            H, g_ent_gate_tau, g_ent_streak);
-                if (g_ent_freq > 0.0f && s->checkpoint_valid && s->checkpoint.len > 0) {
-                    /* 平坦区频率惩罚: 近窗生成 token 每次出现累减 logit → 斩断续链偏好。
-                     * 只在门真开火时就地施加(logits 下一 token 重算, 无残留); 尖锐区/工具帧不受触。 */
-                    const uint32_t len = (uint32_t)s->checkpoint.len;
-                    uint32_t g0 = (s->repeat_gen_start > 0 && s->repeat_gen_start < (int)len)
-                                ? (uint32_t)s->repeat_gen_start : 0;
-                    uint32_t w0 = (len > (uint32_t)g_ent_freq_win && len - (uint32_t)g_ent_freq_win > g0)
-                                ? len - (uint32_t)g_ent_freq_win : g0;
-                    for (uint32_t t = w0; t < len; t++) {
-                        const int id = s->checkpoint.v[t];
-                        if (id >= 0 && id < (int)DS4_N_VOCAB) s->logits[id] -= g_ent_freq;
-                    }
-                }
-                return sample_top_p_min_p(s->logits, DS4_N_VOCAB, g_ent_temp, g_ent_topk,
-                                          1.0f, g_ent_minp, &g_ent_rng);
-            }
-        } else {
-            g_ent_streak = 0;
-        }
-    }
     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k, top_p, min_p, rng);
 }
 
@@ -22749,23 +23775,8 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     return 1;
 #else
     ds4_engine *e = s->engine;
-    const bool mtp_probe_log = getenv("DS4_MTP_PROBE") != NULL;
-    const bool mtp_should_draft =
-        probe_mtp && e->mtp_ready && s->mtp_logits &&
-        (e->mtp_draft_tokens > 1 || mtp_probe_log);
-    if (probe_mtp && s->mtp_draft_valid) {
-        if (mtp_probe_log) {
-            s->mtp_probe_total++;
-            if (s->mtp_draft_token == token) s->mtp_probe_hit++;
-            fprintf(stderr,
-                    "ds4: mtp probe token=%d draft=%d hit=%llu/%llu\n",
-                    token,
-                    s->mtp_draft_token,
-                    (unsigned long long)s->mtp_probe_hit,
-                    (unsigned long long)s->mtp_probe_total);
-        }
-        s->mtp_draft_valid = false;
-    }
+    /* MTP probe 已整族删除(2026-08-05)。 */
+    (void)probe_mtp;
     if (!metal_graph_eval_token_raw_swa(&s->graph, &e->model, &e->weights,
                                         (uint32_t)token,
                                         (uint32_t)s->checkpoint.len,
@@ -22776,22 +23787,245 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         return 1;
     }
     token_vec_push(&s->checkpoint, token);
-    if (mtp_should_draft) {
-        int mtp_top = -1;
-        if (metal_graph_eval_mtp_draft(&s->graph,
-                                       &e->model,
-                                       &e->weights,
-                                       &e->mtp_model,
-                                       &e->mtp_weights,
-                                       token,
-                                       (uint32_t)(s->checkpoint.len - 1),
-                                       getenv("DS4_MTP_FULL_LOGITS") ? s->mtp_logits : NULL,
-                                       &mtp_top)) {
-            s->mtp_draft_token = mtp_top >= 0 ? mtp_top : sample_argmax(s->mtp_logits, DS4_N_VOCAB);
-            s->mtp_draft_valid = true;
-        } else if (getenv("DS4_MTP_PROBE")) {
-            fprintf(stderr, "ds4: mtp probe draft failed\n");
+    /* MTP draft 已整族删除(2026-08-05)。 */
+    return 0;
+#endif
+}
+
+/* ===== 请求批处理: 多会话共享一次前向 (2026-08-21) =====================
+ * 为什么值得做: 本机是带宽墙 —— 每 token 要把 4.64GB 权重从 LPDDR5x 搬进计算单元
+ * (骨干 2.19GB + 该 token 路由到的 6 个专家/层 2.10GB + 输出头 0.35GB), 29ms/token
+ * 就是这么来的。多路请求各跑各的, 这 4.64GB 要各读一遍; 拼进同一次前向, 行无关的
+ * 部分只读一遍。实测批路径每行成本: 1 行 35.9ms / 2 行 26.4 / 4 行 18.9 / 8 行 14.9
+ * ⇒ 8 路聚合约 1.96×。
+ *
+ * 实现上不动 KV 结构(那是 6 个数组 180 处引用): 层内本来就分两半 ——
+ *   ①注意力半层(KV/压缩器/索引器) 各会话回自己的图算, n_tokens=1;
+ *   ②FFN/MoE 半层完全行无关, 借 ss[0] 的图当执行器一次算 N 行。
+ * 两半的接口是 batch_after_attn_hc(注意力写) → batch_next_hc(FFN 写), 中间按行拷贝
+ * (每层每行 64KB, N=4 时 22MB/步 ≈ 0.1ms, 可忽略)。
+ * 注意力半层用 n_tokens=1 与单 token 解码路已验证逐位一致(尾批对账 43 层全同)。 */
+int ds4_session_eval_multi(ds4_session **ss, const int *tokens, uint32_t n,
+                           char *err, size_t errlen) {
+#ifdef DS4_NO_GPU
+    (void)ss; (void)tokens; (void)n;
+    if (errlen) snprintf(err, errlen, "multi-session batch needs a GPU backend");
+    return 1;
+#else
+    if (!ss || !tokens || n == 0) {
+        if (errlen) snprintf(err, errlen, "invalid multi-session batch request");
+        return 1;
+    }
+    if (n == 1 && !getenv("DS4_MULTI_FORCE")) return ds4_session_eval(ss[0], tokens[0], err, errlen);
+    ds4_engine *e = ss[0]->engine;
+    ds4_gpu_graph *gb = &ss[0]->graph;          /* 共享执行器(它的 batch_* 缓冲够 N 行) */
+    if (n > gb->prefill_cap) {
+        if (errlen) snprintf(err, errlen, "multi-session batch %u exceeds prefill cap %u",
+                             n, gb->prefill_cap);
+        return 1;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        if (!ss[i] || ss[i]->engine != e || ss[i]->distributed || ds4_session_is_cpu(ss[i])) {
+            if (errlen) snprintf(err, errlen, "multi-session batch needs same-engine GPU sessions");
+            return 1;
         }
+        if (ss[i]->checkpoint.len + 1 >= ss[i]->ctx_size) {
+            if (errlen) snprintf(err, errlen, "multi-session batch: session %u out of context", i);
+            return 1;
+        }
+    }
+
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t hc_bytes = hc_dim * sizeof(float);
+    const uint64_t q_bytes  = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(float);
+    const uint64_t kv_bytes = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+    const uint64_t nm_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+
+    bool ok = ds4_gpu_begin_commands() != 0;
+    /* 前 3 层是哈希路由层: 专家由 token id 查表决定 ⇒ 共享图的 token 缓冲必须是本批的
+     * N 个 id, 否则读到上一次 prefill 的残留 id, 每行选错专家(实测: 同 prompt 的 4 路
+     * 输出互不相同, ffn_moe_probs 全同但 ffn_moe_topk 6/6 不同)。 */
+    {
+        ds4_tokens span = { .v = (int *)tokens, .len = (int)n, .cap = (int)n };
+        if (ok) ok = metal_graph_upload_prompt_tokens(gb->prefill_tokens, &span, 0, n);
+        for (uint32_t i = 0; ok && i < n; i++) {
+            ds4_tokens one = { .v = (int *)&tokens[i], .len = 1, .cap = 1 };
+            ok = metal_graph_upload_prompt_tokens(ss[i]->graph.prefill_tokens, &one, 0, 1u);
+        }
+    }
+    /* N 个 token 的嵌入一次落共享图的 N 行。必须用批版(token 从张量读): 单 token 版
+     * ds4_gpu_embed_token_hc_tensor 把 id 放在一个**全局单槽**里异步拷到设备, 连续调 N 次
+     * 时 GPU 真正执行前那个槽已被最后一个 token 覆盖 —— 实测 4 行全拿到同一个嵌入。 */
+    if (ok) ok = ds4_gpu_embed_tokens_hc_tensor(gb->batch_cur_hc,
+                                                gb->prefill_tokens,
+                                                e->model.map, e->model.size,
+                                                e->weights.token_embd->abs_offset,
+                                                (uint32_t)e->weights.token_embd->dim[1],
+                                                n, DS4_N_EMBD, DS4_N_HC) != 0;
+    /* 对照开关(DS4_MULTI_NO_SHARE=1): 每个会话整层都在自己的图上跑, 只共享输出头。
+     * 用来把"驱动接线"和"分段共享"分开定位 —— 这条路应当与单路解码同残差档。 */
+    static int no_share = -1;
+    if (no_share < 0) no_share = getenv("DS4_MULTI_NO_SHARE") ? 1 : 0;
+    if (ok && no_share) {
+        for (uint32_t i = 0; ok && i < n; i++) {
+            ds4_gpu_graph *gi = &ss[i]->graph;
+            /* 直接嵌入各自图: 不能从 gb 取行 —— 会话 0 跑完 43 层后 gb->batch_cur_hc
+             * 指针已被交换 43 次, 那里放的是它自己的层输出, 不是嵌入。 */
+            if (i != 0) ok = ds4_gpu_embed_tokens_hc_tensor(gi->batch_cur_hc, gi->prefill_tokens,
+                                                            e->model.map, e->model.size,
+                                                            e->weights.token_embd->abs_offset,
+                                                            (uint32_t)e->weights.token_embd->dim[1],
+                                                            1u, DS4_N_EMBD, DS4_N_HC) != 0;
+            for (uint32_t il = 0; ok && il < (uint32_t)DS4_N_LAYER; il++) {
+                ok = metal_graph_encode_layer_attention_batch(gi, &e->model, &e->weights.layer[il],
+                                                              il, (uint32_t)ss[i]->checkpoint.len, 1u) &&
+                     metal_graph_encode_layer_ffn_batch(gi, &e->model, &e->weights.layer[il],
+                                                        il, (uint32_t)ss[i]->checkpoint.len, 1u);
+                if (ok) { ds4_gpu_tensor *t = gi->batch_cur_hc; gi->batch_cur_hc = gi->batch_next_hc; gi->batch_next_hc = t; }
+            }
+            if (ok && i != 0) ok = ds4_gpu_tensor_copy(gb->batch_cur_hc, (uint64_t)i * hc_bytes,
+                                                       gi->batch_cur_hc, 0, hc_bytes) != 0;
+        }
+        goto multi_head;
+    }
+    for (uint32_t il = 0; ok && il < (uint32_t)DS4_N_LAYER; il++) {
+        const ds4_layer_weights *lw = &e->weights.layer[il];
+        const uint64_t qr_bytes = lw->attn_q_a->dim[1] * sizeof(float);
+        /* ① 投影段: 共享图一次算 N 行(q_a/q_b/kv 权重只读一遍)。跳过 rope —— N 行来自
+         *    不同会话, 位置各不相同, 下面按行用真实位置补。 */
+        ok = metal_graph_encode_layer_attention_batch_stages(gb, &e->model, lw, il, 0u, n,
+                                                             DS4_ATTN_STAGE_PRE | DS4_ATTN_STAGE_NOROPE);
+        /* ①b 逐行 rope + kv fp8 量化(各用自己的位置) */
+        {
+            const uint32_t ratio_l = ds4_layer_compress_ratio(il);
+            const bool comp_l = ratio_l != 0;
+            const float fb = layer_rope_freq_base(il), fs = layer_rope_freq_scale(il);
+            const float ef = (comp_l && DS4_ROPE_SCALE_FACTOR > 1.0f) ? 1.0f : 0.0f;
+            float af = 1.0f;
+            if (ef != 0.0f && fs > 0.0f) af /= 1.0f + 0.1f * logf(1.0f / fs);
+            for (uint32_t i = 0; ok && i < n; i++) {
+                const uint32_t p = (uint32_t)ss[i]->checkpoint.len;
+                ds4_gpu_tensor *qv = ds4_gpu_tensor_view(gb->batch_q, (uint64_t)i * q_bytes, q_bytes);
+                ds4_gpu_tensor *kvv = ds4_gpu_tensor_view(gb->batch_kv, (uint64_t)i * kv_bytes, kv_bytes);
+                ok = qv && kvv &&
+                     ds4_gpu_rope_tail_tensor(qv, 1u, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, p,
+                                              comp_l ? (uint32_t)DS4_ROPE_ORIG_CTX : 0, false,
+                                              fb, fs, ef, af,
+                                              DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0 &&
+                     ds4_gpu_rope_tail_tensor(kvv, 1u, 1u, DS4_N_HEAD_DIM, DS4_N_ROT, p,
+                                              comp_l ? (uint32_t)DS4_ROPE_ORIG_CTX : 0, false,
+                                              fb, fs, ef, af,
+                                              DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0 &&
+                     ds4_gpu_dsv4_fp8_kv_quantize_tensor(kvv, 1u, DS4_N_HEAD_DIM, DS4_N_ROT) != 0;
+                ds4_gpu_tensor_free(kvv);
+                ds4_gpu_tensor_free(qv);
+            }
+        }
+        /* ② KV 段: 每个会话回自己的图算(压缩器/索引器/注意力状态都在那儿) */
+        static int pre_per_sess = -1;
+        if (pre_per_sess < 0) pre_per_sess = getenv("DS4_MULTI_PRE_PER_SESSION") ? 1 : 0;
+        for (uint32_t i = 0; ok && i < n; i++) {
+            ds4_gpu_graph *gi = &ss[i]->graph;
+            if (pre_per_sess && i != 0) {
+                /* 二分用: 会话自己跑投影段(要先把自己的 hc 行搬回来), 不走拷贝集 */
+                ok = ds4_gpu_tensor_copy(gi->batch_cur_hc, 0, gb->batch_cur_hc,
+                                         (uint64_t)i * hc_bytes, hc_bytes) != 0 &&
+                     metal_graph_encode_layer_attention_batch_stages(gi, &e->model, lw, il,
+                                                                    (uint32_t)ss[i]->checkpoint.len,
+                                                                    1u, DS4_ATTN_STAGE_PRE);
+            } else if (i != 0) {
+                ok = ds4_gpu_tensor_copy(gi->batch_q, 0, gb->batch_q, (uint64_t)i * q_bytes, q_bytes) != 0 &&
+                     ds4_gpu_tensor_copy(gi->batch_kv, 0, gb->batch_kv, (uint64_t)i * kv_bytes, kv_bytes) != 0 &&
+                     ds4_gpu_tensor_copy(gi->batch_attn_norm, 0, gb->batch_attn_norm,
+                                         (uint64_t)i * nm_bytes, nm_bytes) != 0 &&
+                     ds4_gpu_tensor_copy(gi->batch_qr_norm, 0, gb->batch_qr_norm,
+                                         (uint64_t)i * qr_bytes, qr_bytes) != 0;
+            }
+            if (ok) ok = metal_graph_encode_layer_attention_batch_stages(
+                    gi, &e->model, lw, il, (uint32_t)ss[i]->checkpoint.len, 1u,
+                    DS4_ATTN_STAGE_KV);
+            if (ok && i != 0)
+                ok = ds4_gpu_tensor_copy(gb->batch_heads, (uint64_t)i * q_bytes,
+                                         gi->batch_heads, 0, q_bytes) != 0;
+        }
+        /* ③ 出口段 + FFN/MoE: 共享图一次算 N 行。出口段开头还有一次"逆 rope"(把注意力
+         *    输出转回), 同样依赖每行的真实位置 ⇒ 先逐行补, 再让出口段跳过。 */
+        {
+            const uint32_t ratio_l = ds4_layer_compress_ratio(il);
+            const bool comp_l = ratio_l != 0;
+            const float fb = layer_rope_freq_base(il), fs = layer_rope_freq_scale(il);
+            const float ef = (comp_l && DS4_ROPE_SCALE_FACTOR > 1.0f) ? 1.0f : 0.0f;
+            float af = 1.0f;
+            if (ef != 0.0f && fs > 0.0f) af /= 1.0f + 0.1f * logf(1.0f / fs);
+            for (uint32_t i = 0; ok && i < n; i++) {
+                ds4_gpu_tensor *hv = ds4_gpu_tensor_view(gb->batch_heads, (uint64_t)i * q_bytes, q_bytes);
+                ok = hv && ds4_gpu_rope_tail_tensor(hv, 1u, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT,
+                                                    (uint32_t)ss[i]->checkpoint.len,
+                                                    comp_l ? (uint32_t)DS4_ROPE_ORIG_CTX : 0, true,
+                                                    fb, fs, ef, af,
+                                                    DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
+                ds4_gpu_tensor_free(hv);
+            }
+        }
+        static int post_per_sess = -1;
+        if (post_per_sess < 0) post_per_sess = getenv("DS4_MULTI_POST_PER_SESSION") ? 1 : 0;
+        if (ok && post_per_sess) {
+            /* 二分用: 出口段也各自跑(需要把该行的 hc 与 hc_split 搬回去) */
+            const uint64_t mix_bytes = (2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC) * sizeof(float);
+            for (uint32_t i = 0; ok && i < n; i++) {
+                ds4_gpu_graph *gi = &ss[i]->graph;
+                if (i != 0) {
+                    ok = ds4_gpu_tensor_copy(gi->batch_cur_hc, 0, gb->batch_cur_hc,
+                                             (uint64_t)i * hc_bytes, hc_bytes) != 0 &&
+                         ds4_gpu_tensor_copy(gi->batch_hc_split, 0, gb->batch_hc_split,
+                                             (uint64_t)i * mix_bytes, mix_bytes) != 0;
+                }
+                if (ok) ok = metal_graph_encode_layer_attention_batch_stages(
+                        gi, &e->model, lw, il, (uint32_t)ss[i]->checkpoint.len, 1u,
+                        DS4_ATTN_STAGE_POST | DS4_ATTN_STAGE_NOROPE);
+                if (ok && i != 0)
+                    ok = ds4_gpu_tensor_copy(gb->batch_after_attn_hc, (uint64_t)i * hc_bytes,
+                                             gi->batch_after_attn_hc, 0, hc_bytes) != 0;
+            }
+        } else if (ok) {
+            ok = metal_graph_encode_layer_attention_batch_stages(gb, &e->model, lw, il, 0u, n,
+                                                                 DS4_ATTN_STAGE_POST | DS4_ATTN_STAGE_NOROPE);
+        }
+        if (ok) ok = metal_graph_encode_layer_ffn_batch(gb, &e->model, lw, il, 0u, n);
+        if (ok) {   /* 与 encode_layer_batch 同款 cur/next 交换 */
+            ds4_gpu_tensor *tmp = gb->batch_cur_hc;
+            gb->batch_cur_hc = gb->batch_next_hc;
+            gb->batch_next_hc = tmp;
+        }
+    }
+multi_head:
+    if (ok) ok = metal_graph_encode_output_head_batch(gb, &e->model, &e->weights,
+                                                      n, e->weights.output->dim[1]);
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    if (ok && !gb->spec_logits) {
+        if (errlen) snprintf(err, errlen, "multi-session batch needs the batch-logits buffer");
+        ok = false;
+    }
+    static float *mb_logits = NULL; static uint32_t mb_cap = 0;
+    if (ok && mb_cap < n) {
+        free(mb_logits);
+        mb_logits = xmalloc((size_t)n * DS4_N_VOCAB * sizeof(float));
+        mb_cap = n;
+    }
+    if (ok) ok = ds4_gpu_tensor_read(gb->spec_logits, 0, mb_logits,
+                                     (uint64_t)n * DS4_N_VOCAB * sizeof(float)) != 0;
+    if (!ok) {
+        if (errlen) snprintf(err, errlen, "%s multi-session batch failed",
+                             ds4_backend_name(e->backend));
+        for (uint32_t i = 0; i < n; i++) ss[i]->checkpoint_valid = false;
+        return 1;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        memcpy(ss[i]->logits, mb_logits + (uint64_t)i * DS4_N_VOCAB,
+               (size_t)DS4_N_VOCAB * sizeof(float));
+        token_vec_push(&ss[i]->checkpoint, tokens[i]);
+        ss[i]->checkpoint_valid = true;
     }
     return 0;
 #endif
@@ -22853,262 +24087,7 @@ int ds4_session_eval_span(ds4_session *s, const int *tokens, int n,
     return 0;
 }
 
-/* Single-machine copy-speculation (prompt-lookup). Always armed: it self-gates
- * per step (no transcript repeat -> plain 1-token decode, zero cost).
- *
- * The cheapest speculative decode and the right lever for repetitive / code
- * output. The drafter is the n-gram matcher (no draft model): it finds the
- * longest suffix of the transcript that occurred earlier and drafts what
- * followed. The TARGET model then verifies the whole drafted suffix in ONE
- * layer-major batch -- reading the model weights once and amortizing the
- * per-token decode-bandwidth wall over every accepted token (a K-token batch
- * reads the multi-GiB backbone once, exactly like prefill, which is why prefill
- * t/s >> single-token decode t/s). Only the greedy-correct prefix is committed;
- * the rejected tail's KV is rolled back via the spec frontier snapshot. The
- * target argmax is the gate, so the committed stream is byte-identical to plain
- * argmax decode (lossless). Returns the committed token count (>=1) or -1. */
-static int ds4_session_eval_copyspec_argmax(ds4_session *s, int first_token,
-                                            int max_tokens, int eos_token,
-                                            int *accepted, int accepted_cap,
-                                            char *err, size_t errlen) {
-    /* Commit the normal target token first; s->logits then predicts the next. */
-    if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
-    int n_accept = 0;
-    accepted[n_accept++] = first_token;
-    if (first_token == eos_token || max_tokens == 1 || n_accept >= accepted_cap)
-        return n_accept;
-#ifdef DS4_NO_GPU
-    (void)err; (void)errlen;
-    return n_accept;
-#else
-    ds4_engine *e = s->engine;
-
-    /* Cooldown: while speculation is not paying off, skip it entirely -- no
-     * frontier snapshot, no verify batch -- and just let this be a plain 1-token
-     * step. One probe leaks through (when the cooldown hits 0) to re-arm fast. */
-    if (s->cs_cooldown > 0) { s->cs_cooldown--; return n_accept; }
-
-    /* No tuning knobs: a 4-token anchor is precise on code/structured text, and
-     * the adaptive cs_draft_len (grown/shrunk by acceptance) picks the batch
-     * length. This call targets that running length. */
-    const uint32_t ngram = 4, min_copy = 2;
-    const bool cs_log = getenv("DS4_COPY_SPEC_LOG") != NULL;   /* diagnostic only */
-    const int target = s->cs_draft_len > 0 ? s->cs_draft_len : 6;
-    const uint32_t max_copy = (uint32_t)target;
-
-    /* Budget the draft length: drafts[16], output cap, accept cap, SWA room. */
-    int cap = (int)max_copy;
-    if (cap > 15) cap = 15;
-    if (cap > max_tokens - n_accept)  cap = max_tokens - n_accept;
-    if (cap > accepted_cap - n_accept) cap = accepted_cap - n_accept;
-    int room = s->ctx_size - s->checkpoint.len;
-    if (cap > room - 1) cap = room - 1;
-    if (cap < (int)min_copy || cap < 1) return n_accept;
-
-    /* Draft from the transcript (checkpoint already ends with first_token). */
-    int drafts[16];
-    uint32_t draft_n = 0, src = 0;
-    ds4_copy_spec_match(s->checkpoint.v, (uint32_t)s->checkpoint.len,
-                        ngram, (uint32_t)cap, drafts, &draft_n, &src);
-    /* The matcher copies exactly ONE period of the repeat (seq[best_src..end]).
-     * For a short period that is fewer tokens than the verify batch can amortize
-     * (period-1 single-token repeats give just 1 draft), so cyclically extend the
-     * draft to `cap` assuming the cycle continues. The target verifier still gates
-     * every token, so this stays byte-identical/lossless -- it only lengthens the
-     * speculation when the transcript is periodic, which is exactly when a long
-     * batch is free. Long verbatim runs (code echo) already fill `cap` and skip. */
-    if (draft_n >= 1 && draft_n < (uint32_t)cap) {
-        const uint32_t period = draft_n;
-        while (draft_n < (uint32_t)cap) {
-            drafts[draft_n] = drafts[draft_n - period];
-            draft_n++;
-        }
-    }
-    /* drafts[0] is verified for free against the just-committed token's logits
-     * (the free gate): a proposal whose first token is not the target argmax is
-     * dropped before it costs a snapshot or a verify batch. */
-    struct ds4_gotrie *trie = e->go_trie;
-    bool from_trie = false;
-    int top1 = -1;
-    if (draft_n >= min_copy) {
-        session_apply_repeat_penalty(s);
-        top1 = sample_argmax(s->logits, DS4_N_VOCAB);
-        if (top1 != drafts[0]) {
-            if (cs_log) fprintf(stderr, "ds4: copy-spec miss first draft=%d\n", drafts[0]);
-            draft_n = 0;   /* transcript draft dead -> maybe the trie can rescue */
-        }
-    }
-    if (draft_n < min_copy && trie) {
-        /* Go trie fallback (--go-trie / DS4_GO_TRIE): when the transcript has no
-         * usable repeat, propose global-corpus boilerplate instead. The chain is
-         * confidence-gated at build+walk time and its first token must equal the
-         * target argmax already in hand, so a wrong trie costs nothing here and
-         * at most one verify batch after this point -- same contract as the
-         * transcript matcher, byte-identical committed stream either way. Its
-         * cooldown is its own (gt_cooldown): trie misses sleep the trie only. */
-        if (s->gt_cooldown > 0) {
-            s->gt_cooldown--;
-        } else {
-            if (top1 < 0) {
-                session_apply_repeat_penalty(s);
-                top1 = sample_argmax(s->logits, DS4_N_VOCAB);
-            }
-            draft_n = ds4_gotrie_propose(trie, s->checkpoint.v, (uint32_t)s->checkpoint.len,
-                                         top1, drafts, cap);
-            from_trie = draft_n > 0;
-        }
-    }
-    /* Reference-corpus fallback (built-in language idioms + DS4_REF_CORPUS):
-     * last in the cascade -- transcript repeat first (session-specific), then
-     * trie statistics (real-corpus, confidence-gated), then the curated
-     * idioms. Free-gated exactly like the others: the idiom continuation's
-     * first token must equal the target argmax already in hand, so a wrong
-     * idiom costs nothing. Cooldown is its own (rc_cooldown). */
-    bool from_ref = false;
-    if (draft_n < min_copy && e->ref_corpus) {
-        if (s->rc_cooldown > 0) {
-            s->rc_cooldown--;
-        } else {
-            if (top1 < 0) {
-                session_apply_repeat_penalty(s);
-                top1 = sample_argmax(s->logits, DS4_N_VOCAB);
-            }
-            uint32_t rn = 0;
-            uint32_t ra = ds4_engine_ref_match(e, s->checkpoint.v,
-                                               (uint32_t)s->checkpoint.len,
-                                               ngram, (uint32_t)cap, drafts, &rn);
-            if (ra > 0 && rn >= min_copy && drafts[0] == top1) {
-                draft_n = rn;
-                from_ref = true;
-            } else {
-                draft_n = 0;   /* anchor absent or argmax disagrees: free skip */
-            }
-        }
-    }
-    if (draft_n < min_copy) return n_accept;   /* no usable draft -> plain 1-token step */
-    const bool gt_log = from_trie && trie->log;
-    if (from_trie) { trie->fires++; trie->sent += draft_n; }
-
-    /* Snapshot KV, then batch-verify the whole draft suffix in one pass. */
-    ds4_spec_frontier frontier;
-    memset(&frontier, 0, sizeof(frontier));
-    int *row_tops = xmalloc((size_t)draft_n * sizeof(row_tops[0]));
-    float *row_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row_logits[0]));
-    const int start = s->checkpoint.len;
-    bool have_frontier = spec_frontier_snapshot(&frontier, s);
-    bool ok = have_frontier;
-    if (ok) {
-        for (uint32_t i = 0; i < draft_n; i++) token_vec_push(&s->checkpoint, drafts[i]);
-        ok = metal_graph_verify_suffix_tops(&s->graph, &e->model, &e->weights,
-                                            &s->checkpoint, (uint32_t)start, draft_n,
-                                            false, row_tops, NULL);
-    }
-    /* Accept the longest greedy-correct prefix. row_tops[i-1] is the target's
-     * argmax after drafts[i-1] and must equal drafts[i]; drafts[0] is already
-     * proven, so commit_drafts starts at 1. */
-    int commit_drafts = 1;
-    if (ok) {
-        /* Session-aware: request penalties also demand replay (lossless
-         * accept), and a non-FREE lane skips replay entirely (raw contract). */
-        const int rp_on = session_penalties_active(s);
-        for (uint32_t i = 1; i < draft_n; i++) {
-            if (drafts[i - 1] == eos_token) break;
-            int rp_top = row_tops[i - 1];
-            if (rp_on &&
-                metal_graph_read_spec_logits_row(&s->graph, i - 1, row_logits)) {
-                /* replay the exact penalty the non-spec sampler would apply at
-                 * this position (drafts already pushed: window = [0, start+i)) */
-                repeat_penalize_buf(s, row_logits, (uint32_t)start + i);
-                rp_top = sample_argmax(row_logits, DS4_N_VOCAB);
-            }
-            if (rp_top != drafts[i]) break;
-            commit_drafts++;
-        }
-    }
-
-    if (ok && commit_drafts == (int)draft_n) {
-        /* Full accept: the suffix KV stays committed; next logits = last row. */
-        ok = metal_graph_read_spec_logits_row(&s->graph, (uint32_t)(draft_n - 1), row_logits);
-        if (ok) {
-            memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
-            for (uint32_t i = 0; i < draft_n && n_accept < accepted_cap; i++) {
-                accepted[n_accept++] = drafts[i];
-                if (drafts[i] == eos_token) break;
-            }
-            s->checkpoint_valid = true;
-            s->mtp_draft_valid = false;
-            /* Everything we drafted was accepted -> reach for a longer batch.
-             * cs_draft_len is the n-gram drafter's dial only: trie chains are
-             * confidence-limited per fire, ref-corpus copies are idiom-length-
-             * limited, and neither must retune the n-gram. */
-            if (from_trie) { trie->committed += (uint64_t)commit_drafts; trie->full++; }
-            else if (!from_ref) s->cs_draft_len = (int)draft_n + 2 > 15 ? 15 : (int)draft_n + 2;
-            if (cs_log || gt_log)
-                fprintf(stderr, "ds4: %s anchor=%u sent=%u accepted=%d full next_len=%d\n",
-                        from_trie ? "go-trie" : from_ref ? "ref-corpus" : "copy-spec",
-                        ngram, draft_n, commit_drafts, s->cs_draft_len);
-            spec_frontier_free(&frontier); free(row_logits); free(row_tops);
-            return n_accept;
-        }
-    }
-
-    /* Partial accept (or verify miss): roll the speculative suffix back to
-     * `start`, then re-commit just the accepted prefix so its KV + next logits
-     * are exact. drafts[0] is always accepted, so commit_drafts >= 1. */
-    s->checkpoint.len = start;
-    ok = have_frontier && spec_frontier_restore(&frontier, s);
-    if (ok) {
-        for (int i = 0; i < commit_drafts; i++) token_vec_push(&s->checkpoint, drafts[i]);
-        ok = metal_graph_verify_suffix_tops(&s->graph, &e->model, &e->weights,
-                                            &s->checkpoint, (uint32_t)start,
-                                            (uint32_t)commit_drafts, false, row_tops, NULL);
-        if (ok) ok = metal_graph_read_spec_logits_row(&s->graph,
-                                                      (uint32_t)(commit_drafts - 1), row_logits);
-    }
-    if (ok) {
-        memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
-        for (int i = 0; i < commit_drafts && n_accept < accepted_cap; i++) {
-            accepted[n_accept++] = drafts[i];
-            if (drafts[i] == eos_token) break;
-        }
-        s->checkpoint_valid = true;
-        s->mtp_draft_valid = false;
-        /* The target diverged from the copy after commit_drafts tokens -> aim the
-         * next batch at what it actually accepted (mostly-full accepts avoid the
-         * partial re-verify cost). This is the self-tuning backoff that keeps
-         * copy-spec from ever being a net loss on unpredictable text. */
-        /* Drafter-local backoff. A trie/ref partial sleeps ONLY its own drafter
-         * (gt_cooldown/rc_cooldown) and leaves the n-gram drafter's
-         * cs_draft_len/cs_cooldown untouched -- measured: cross-contaminating
-         * them starved profitable n-gram batches for -25% gen t/s. The n-gram
-         * partial keeps its original self-tuning. */
-        if (from_trie) {
-            trie->committed += (uint64_t)commit_drafts;
-            if (commit_drafts < 3) s->gt_cooldown = 8;
-        } else if (from_ref) {
-            if (commit_drafts < 3) s->rc_cooldown = 8;
-        } else {
-            s->cs_draft_len = commit_drafts < 2 ? 2 : commit_drafts;
-            /* If the batch barely paid for its snapshot, cool down before trying again. */
-            if (commit_drafts < 3) s->cs_cooldown = 8;
-        }
-        if (cs_log || gt_log)
-            fprintf(stderr, "ds4: %s anchor=%u sent=%u accepted=%d partial next_len=%d cd=%d\n",
-                    from_trie ? "go-trie" : from_ref ? "ref-corpus" : "copy-spec",
-                    ngram, draft_n, commit_drafts, s->cs_draft_len, s->cs_cooldown);
-        spec_frontier_free(&frontier); free(row_logits); free(row_tops);
-        return n_accept;
-    }
-
-    /* Hard failure: restore to the committed first_token and return it alone. */
-    s->checkpoint.len = start;
-    if (have_frontier) (void)spec_frontier_restore(&frontier, s);
-    s->checkpoint_valid = true;
-    s->mtp_draft_valid = false;
-    spec_frontier_free(&frontier); free(row_logits); free(row_tops);
-    return n_accept;
-#endif
-}
+/* copy-spec 单机整族已删除(2026-08-05 用户裁决)。 */
 
 /* Speculative decode state machine:
  * 1. commit the normal target token and use its logits to validate draft[0];
@@ -23155,601 +24134,427 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
 #else
     ds4_engine *e = s->engine;
 
-    /* Natural default: with no MTP draft model loaded, single-machine greedy
-     * decode uses n-gram copy-speculation. It is self-tuning (adaptive draft
-     * length + cooldown), lossless, and a no-op when the text is unpredictable,
-     * so it needs no enable flag -- it just runs whenever it can help. With an
-     * MTP draft model present, the learned MTP drafter below takes over. */
-    if (!e->mtp_ready) {
-        return ds4_session_eval_copyspec_argmax(s, first_token, max_tokens,
-                                                eos_token, accepted, accepted_cap,
-                                                err, errlen);
-    }
-
-    /*
-     * MTP in DeepSeek V4 is a speculative drafter, not a replacement sampler.
-     * The target model still defines the exact output stream.  A cycle starts
-     * by accepting one normal target token, then asks the MTP block to propose
-     * a short suffix.  The suffix is useful only if the target model can verify
-     * several proposed positions together; running ordinary decode once per
-     * draft token is correctness-safe but cannot be faster than baseline.
-     */
-    if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
-    int n_accept = 0;
-    accepted[n_accept++] = first_token;
-    if (first_token == eos_token || max_tokens == 1 || n_accept >= accepted_cap) return n_accept;
-
-    if (!e->mtp_ready || !s->mtp_draft_valid || e->mtp_draft_tokens <= 1) return n_accept;
-
-    int draft_cap = e->mtp_draft_tokens;
-    if (draft_cap > max_tokens - n_accept) draft_cap = max_tokens - n_accept;
-    if (draft_cap > accepted_cap - n_accept) draft_cap = accepted_cap - n_accept;
-    int room = s->ctx_size - s->checkpoint.len;
-    if (draft_cap > room - 1) draft_cap = room - 1;
-    if (draft_cap <= 0) return n_accept;
-
-    int drafts[16];
-    int draft_n = 1;
-    drafts[0] = s->mtp_draft_token;
-    s->mtp_draft_valid = false;
-    const bool strict_mtp = e->quality || getenv("DS4_MTP_STRICT") != NULL;
-    float mtp_margin_threshold = e->mtp_margin;
-    const char *mtp_margin_env = getenv("DS4_MTP_MIN_MARGIN");
-    if (mtp_margin_env && mtp_margin_env[0]) {
-        char *end = NULL;
-        float v = strtof(mtp_margin_env, &end);
-        if (end != mtp_margin_env && v >= 0.0f) mtp_margin_threshold = v;
-    }
-    const bool mtp_timing = getenv("DS4_MTP_TIMING") != NULL;
-    const bool mtp_conf_log = getenv("DS4_MTP_CONF_LOG") != NULL;
-    const bool mtp_need_logits = mtp_conf_log ||
-        getenv("DS4_MTP_FULL_LOGITS") != NULL ||
-        (!strict_mtp && mtp_margin_threshold > 0.0f);
-    const double mtp_t0 = mtp_timing ? now_sec() : 0.0;
-    double mtp_t_after_draft = mtp_t0;
-    float mtp_last_margin = 0.0f;
-    int mtp_last_top0 = -1, mtp_last_top1 = -1;
-
-    /*
-     * The first proposed token is verified for free: ds4_session_eval() just
-     * produced the base logits for the committed prefix.  If MTP disagrees at
-     * this point there is no suffix to verify, so the exact behavior is to emit
-     * only first_token and skip all speculative work.
-     */
-    session_apply_repeat_penalty(s);
-    if (sample_argmax(s->logits, DS4_N_VOCAB) != drafts[0]) {
-        if (getenv("DS4_MTP_SPEC_LOG")) {
-            fprintf(stderr, "ds4: mtp spec miss first draft=%d\n", drafts[0]);
-        }
-        return n_accept;
-    }
-    if (drafts[0] == eos_token) draft_cap = 1;
-    const uint32_t mtp_base_raw = s->graph.mtp_n_raw;
-    /*
-     * MTP has its own raw SWA cache. Recursive drafting writes speculative
-     * future rows into it; after verification, rows beyond the accepted prefix
-     * must become invisible.  We do not copy/rollback the cache body because the
-     * next draft attempt will overwrite future slots.  A counter is enough.
-     */
-#define DS4_MTP_KEEP_ACCEPTED(n_) do { \
-        uint32_t keep_ = mtp_base_raw + (uint32_t)(n_); \
-        if (keep_ > s->graph.raw_window) keep_ = s->graph.raw_window; \
-        s->graph.mtp_n_raw = keep_; \
-    } while (0)
-
-    for (; draft_n < draft_cap; draft_n++) {
-        ds4_gpu_tensor *prev_hc = (draft_n & 1) ? s->graph.mtp_state_hc : s->graph.mtp_next_hc;
-        ds4_gpu_tensor *out_hc = (draft_n & 1) ? s->graph.mtp_next_hc : s->graph.mtp_state_hc;
-        int mtp_top = -1;
-        if (!metal_graph_eval_mtp_draft_from_hc(&s->graph,
-                                                &e->model,
-                                                &e->weights,
-                                                &e->mtp_model,
-                                                &e->mtp_weights,
-                                                prev_hc,
-                                                out_hc,
-                                                drafts[draft_n - 1],
-                                                (uint32_t)(s->checkpoint.len + draft_n - 1),
-                                                mtp_need_logits ? s->mtp_logits : NULL,
-                                                &mtp_top))
-        {
-            return n_accept;
-        }
-        drafts[draft_n] = mtp_top >= 0 ? mtp_top : sample_argmax(s->mtp_logits, DS4_N_VOCAB);
-        if (drafts[draft_n] == eos_token) {
-            draft_n++;
-            break;
+    /* copy-spec 整族已删除(2026-08-05 用户裁决: 环境变量硬编码型行为机制, 与
+     * auto-arm 同判)。无显式 MTP draft 模型 => 纯单 token 平解码; 投机只剩
+     * 显式配置的 MTP drafter 一条路。 */
+    /* DSpark 投机主循环(DS4_DSPARK_SPEC=1, 2026-08-18): draft 块(5)+bonus 走 6 位
+     * verify 批; 接受链 argmax 对照; 部分接受= state 恢复+接受位重放(官方
+     * checkpoint-restore 口径)。verify 批复用 batch 层包装 ⇒ mh 抓取/drafter 建窗自动。 */
+    if (getenv("DS4_DSPARK_PROBE")) {
+        static int gate_diag = 0;
+        if (!gate_diag) { gate_diag = 1;
+            fprintf(stderr, "ds4: [dspark-gate] ready=%d capture=%d greedy=%d env=%d\n",
+                    (int)e->dspark.ready, s->graph.dspark_capture, s->spec_greedy,
+                    getenv("DS4_DSPARK_SPEC") != NULL);
         }
     }
-    if (mtp_conf_log && draft_n > 1) {
-        float v0 = 0.0f, v1 = 0.0f;
-        logits_top2(s->mtp_logits, DS4_N_VOCAB, &mtp_last_top0, &v0, &mtp_last_top1, &v1);
-        mtp_last_margin = v0 - v1;
-    }
-    if (mtp_timing) mtp_t_after_draft = now_sec();
-
-    if (!strict_mtp && draft_n == 2 && mtp_margin_threshold > 0.0f) {
-        if (!mtp_conf_log) {
-            float v0 = 0.0f, v1 = 0.0f;
-            logits_top2(s->mtp_logits, DS4_N_VOCAB, &mtp_last_top0, &v0, &mtp_last_top1, &v1);
-            mtp_last_margin = v0 - v1;
+    if (e->dspark.ready && s->graph.dspark_capture && s->spec_greedy &&
+        getenv("DS4_DSPARK_SPEC") != NULL) {
+        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        int n_acc = 0;
+        accepted[n_acc++] = first_token;
+        static float *row_logits = NULL;
+        if (!row_logits) row_logits = xmalloc(6ull * DS4_N_VOCAB * sizeof(float));
+        /* 候选数可调(2026-08-21 调度杠杆): verify 是字节受限, 而专家并集随候选数增长
+         * (实测 6 候选=22.1/36 唯一专家)。每字节产出 acc/bytes 在 k=3-4 处更优。 */
+        static uint32_t spec_k = 0u;
+        if (spec_k == 0u) {
+            const char *e = getenv("DS4_SPEC_CAND");
+            /* 默认 3(2026-08-21 扫参): 每 token 毫秒 k=6 48 / k=4 44 / k=3 38.7 / k=2 39.8。
+             * verify 是字节受限且专家并集随候选数增长(实测 6 候选=22.1 唯一专家), 多草稿
+             * 的边际接受收益跑不过边际字节成本。verify 语义与 k 无关 ⇒ 质量不受影响。 */
+            spec_k = e ? (uint32_t)atoi(e) : 3u;
+            if (spec_k < 2u) spec_k = 2u;
+            if (spec_k > 6u) spec_k = 6u;
         }
-        if (mtp_last_margin < mtp_margin_threshold) {
-            float *row_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row_logits[0]));
-            const int start = s->checkpoint.len;
-            const double verify_t0 = mtp_timing ? now_sec() : 0.0;
-            bool ok = metal_graph_eval_token_raw_swa(&s->graph,
-                                                     &e->model,
-                                                     &e->weights,
-                                                     drafts[0],
-                                                     (uint32_t)start,
-                                                     row_logits);
-            if (!ok) {
-                free(row_logits);
-                snprintf(err, errlen, "%s decode failed", ds4_backend_name(e->backend));
+        const bool spec_prof = getenv("DS4_SPEC_PROF") != NULL;
+        double pf_draft = 0, pf_snap = 0, pf_verify = 0, pf_replay = 0, pf_misc = 0, pf_round_wall = 0;
+        uint32_t pf_rounds = 0; double pf_t0 = 0;
+        while (n_acc < max_tokens && n_acc + (int)DS4_DSPARK_BLK + 1 <= accepted_cap) {
+            if (spec_prof) pf_t0 = now_sec();
+            int next = 0; float best = -1e30f;
+            for (uint32_t v = 0; v < (uint32_t)DS4_N_VOCAB; v++)
+                if (s->logits[v] > best) { best = s->logits[v]; next = (int)v; }
+            if (next == eos_token) break;
+            int cand[6];
+            cand[0] = next;
+            int ids[DS4_DSPARK_BLK] = {0};
+            const uint32_t pos_now = (uint32_t)s->checkpoint.len;
+            if (spec_prof) { pf_misc += now_sec() - pf_t0; pf_t0 = now_sec(); }
+            /* 置信调度(DS4_SPEC_SCHED=1, 论文 2607.05147 Alg.1 单请求版):
+             * 草稿一次出满块并拿到逐位置信 c_i; 前缀存活率 a_j = ∏_{i<=j} c_i 就是"验第 j 个
+             * 候选能多拿到的期望 token 数"。多验一个候选的边际成本是 m 毫秒(在线最小二乘
+             * 从 (k-1, verify_ms) 拟合), 当前吞吐 T = 已接受 token / 已用毫秒。只有
+             * a_j > T*m 时这个候选才划算 —— 这正是把"能不能白送"这个物理事实写进调度。 */
+            static int sched = -1;
+            if (sched < 0) sched = getenv("DS4_SPEC_SCHED") ? 1 : 0;
+            static double sch_tok = 0.0, sch_ms = 0.0;          /* 在线吞吐 */
+            static double rg_n = 0, rg_x = 0, rg_y = 0, rg_xx = 0, rg_xy = 0;  /* 边际回归 */
+            static double sch_m = 12.0;                          /* 每候选边际 ms */
+            /* 在线校准(论文的 STS 在线版): 原始置信头没针对"q2 drafter + 贪心验证"标定,
+             * 用自己的接受结果做逐位置乘性校正 g_j = 实测接受 / 预测和。低估就放大, 高估
+             * 就收缩 —— 调度阈值才对得上真实的边际收益。 */
+            static double cal_sum[DS4_DSPARK_BLK] = {0};
+            static double cal_hit[DS4_DSPARK_BLK] = {0};
+            static uint32_t cal_n[DS4_DSPARK_BLK] = {0};
+            /* 投机开关闸(2026-08-21): drafter 不是白送的 —— 一轮草稿 ~9ms, 每个候选边际
+             * ~12ms。文本难预测时(bash/概念解释)接受率掉到 1.8, 投机反而比纯解码慢 20%。
+             * 在线对比两种模式的实测 token/ms, 谁快用谁, 并按固定比例回探另一种以便文本
+             * 变好预测时能切回来。纯解码轮直接走单 token 解码路 = 无损且零草稿开销。 */
+            static double md_tok[2] = {0, 0}, md_ms[2] = {0, 0};   /* 0=纯解码 1=投机 */
+            static uint32_t md_n[2] = {0, 0}, md_round = 0;
+            int mode = 1;
+            if (sched) {
+                /* 起步先给投机 16 轮把 T/m/校准跑热, 之后按实测吞吐择优, 每 32 轮回探 1 轮。 */
+                const int explore = (md_round % 32u) == 31u;
+                if (md_round >= 16u && md_n[0] >= 3u && md_n[1] >= 8u) {
+                    const double t0 = md_tok[0] / md_ms[0], t1 = md_tok[1] / md_ms[1];
+                    mode = (t1 >= t0 * 0.98) ? 1 : 0;   /* 平手偏投机(它还带 acc 上升空间) */
+                } else if (md_round >= 16u && md_n[0] < 3u) {
+                    mode = 0;                            /* 先取几个纯解码样本 */
+                }
+                if (explore) mode = 1 - mode;
+                md_round++;
+            }
+            const double mode_t0 = now_sec();
+            if (sched && mode == 0) {
+                /* 纯解码轮: 提交 next, 不草稿不批验证 */
+                if (ds4_session_eval(s, next, err, errlen) != 0) { s->checkpoint_valid = false; return -1; }
+                accepted[n_acc++] = next;
+                const double dt = (now_sec() - mode_t0) * 1e3;
+                md_tok[0] += 1.0; md_ms[0] += dt; md_n[0]++;
+                /* 不喂 sch_tok/sch_ms: k 调度器的 T 是"投机模式下的吞吐", 掺进纯解码轮会
+                 * 抬高阈值 → k 变小 → 投机更差 → 更偏纯解码, 形成死亡螺旋。 */
+                if (getenv("DS4_SPEC_SCHED_LOG") && (md_round % 32u) == 0)
+                    fprintf(stderr, "ds4: [sched-mode] 纯解码 %.4f tok/ms(n=%u) vs 投机 %.4f(n=%u)\n",
+                            md_n[0] ? md_tok[0] / md_ms[0] : 0.0, md_n[0],
+                            md_n[1] ? md_tok[1] / md_ms[1] : 0.0, md_n[1]);
+                continue;
+            }
+
+            float conf[DS4_DSPARK_BLK] = {0};
+            uint32_t draft_n = sched ? (uint32_t)DS4_DSPARK_BLK : spec_k - 1u;
+            if (!metal_graph_dspark_step_n(&s->graph, &e->model, &e->weights, &e->dspark,
+                                           next, pos_now - 1u, ids, draft_n,
+                                           sched ? conf : NULL)) {
+                if (getenv("DS4_DSPARK_PROBE")) fprintf(stderr, "ds4: [dspark-gate] step FAILED\n");
+                break;
+            }
+            uint32_t round_k = spec_k;
+            if (sched) {
+                const double T = (sch_ms > 1.0) ? (sch_tok / sch_ms) : 0.030;   /* token/ms */
+                const double thr = T * sch_m;
+                double a = 1.0;
+                uint32_t adm = 0;
+                for (uint32_t j = 0; j < draft_n; j++) {
+                    double c = (double)conf[j];
+                    if (cal_n[j] >= 8u && cal_sum[j] > 1e-6) {
+                        double g = (cal_hit[j] + 1.0) / (cal_sum[j] + 1.0);
+                        c *= g;
+                        if (c > 0.999) c = 0.999;
+                        if (c < 0.001) c = 0.001;
+                    }
+                    a *= c;
+                    if (a <= thr) break;
+                    adm++;
+                }
+                round_k = adm + 1u;
+                if (round_k < 2u) round_k = 2u;
+                if (round_k > (uint32_t)DS4_DSPARK_BLK + 1u) round_k = (uint32_t)DS4_DSPARK_BLK + 1u;
+                if (getenv("DS4_SPEC_SCHED_LOG"))
+                    fprintf(stderr, "ds4: [sched] c=[%.2f %.2f %.2f %.2f %.2f] T=%.4f m=%.1f 阈=%.3f k=%u\n",
+                            conf[0], conf[1], conf[2], conf[3], conf[4], T, sch_m, thr, round_k);
+            }
+            for (uint32_t i = 0; i + 1u < round_k; i++) cand[1 + i] = ids[i];
+            if (spec_prof) { pf_draft += now_sec() - pf_t0; pf_t0 = now_sec(); }
+            if (!metal_graph_dspark_state_snapshot(&s->graph)) {
+                if (getenv("DS4_DSPARK_PROBE")) fprintf(stderr, "ds4: [dspark-gate] snapshot FAILED\n");
+                break;
+            }
+            if (spec_prof) { pf_snap += now_sec() - pf_t0; pf_t0 = now_sec(); }
+            /* 诊断路径(DS4_SPEC_SEQ_VERIFY=1): verify 不走批, 而是逐候选走单 token
+             * 解码路 —— 与纯解码逐字节同一条 kernel 链。没有批的加速, 只用来量
+             * drafter 对"真解码"的接受率上限, 以及判定批 verify 是否引入了偏差。
+             * 状态天然随接受推进, 不需要 snapshot/restore/快进。 */
+            const bool xcheck = getenv("DS4_SPEC_XCHECK") != NULL;
+            const bool seq_verify = xcheck || getenv("DS4_SPEC_SEQ_VERIFY") != NULL;
+            int seq_acc = 1;
+            static float *xc_batch = NULL;
+            if (xcheck) {
+                /* 同一位置先走批 verify(标签 b), 再走单 token 解码路(标签 d), 逐行比 logits。
+                 * 批的结果只用于对账, 提交仍走解码路 ⇒ 轨迹与纯解码相同。 */
+                if (!xc_batch) xc_batch = xmalloc(6ull * DS4_N_VOCAB * sizeof(float));
+                g_dump_tag = "b";
+                s->graph.spec_comp_capture = 1;
+                const int rc = ds4_session_verify_batch_argmax(s, cand, round_k, pos_now,
+                                                              0u, (uint32_t)DS4_N_LAYER - 1u,
+                                                              NULL, row_logits, err, errlen);
+                s->graph.spec_comp_capture = 0;
+                g_dump_tag = "";
+                if (rc != 0) { s->checkpoint_valid = false; return -1; }
+                memcpy(xc_batch, row_logits, (size_t)round_k * DS4_N_VOCAB * sizeof(float));
+                if (!metal_graph_dspark_state_restore(&s->graph)) break;
+                s->checkpoint.len = (int)pos_now;
+            }
+            if (seq_verify) {
+                if (xcheck) g_dump_tag = "d";
+                for (uint32_t i = 0; i < round_k; i++) {
+                    if (ds4_session_eval(s, cand[i], err, errlen) != 0) {
+                        s->checkpoint_valid = false;
+                        return -1;
+                    }
+                    memcpy(row_logits + (uint64_t)i * DS4_N_VOCAB, s->logits,
+                           (size_t)DS4_N_VOCAB * sizeof(float));
+                    if (i + 1u >= round_k) break;
+                    int am = 0; float bb = -1e30f;
+                    for (uint32_t v = 0; v < (uint32_t)DS4_N_VOCAB; v++)
+                        if (s->logits[v] > bb) { bb = s->logits[v]; am = (int)v; }
+                    if (am != cand[i + 1]) break;
+                    seq_acc++;
+                }
+                if (xcheck) {
+                    g_dump_tag = "";
+                    static uint32_t xc_n = 0, xc_same = 0; static double xc_dmax = 0.0;
+                    for (uint32_t i = 0; i < round_k; i++) {
+                        const float *rb = xc_batch + (uint64_t)i * DS4_N_VOCAB;
+                        const float *rd = row_logits + (uint64_t)i * DS4_N_VOCAB;
+                        int ab = 0, ad = 0; float bb = -1e30f, bd = -1e30f; double dmax = 0.0;
+                        for (uint32_t v = 0; v < (uint32_t)DS4_N_VOCAB; v++) {
+                            if (rb[v] > bb) { bb = rb[v]; ab = (int)v; }
+                            if (rd[v] > bd) { bd = rd[v]; ad = (int)v; }
+                            const double d = fabs((double)rb[v] - (double)rd[v]);
+                            if (d > dmax) dmax = d;
+                        }
+                        xc_n++; if (ab == ad) xc_same++;
+                        if (dmax > xc_dmax) xc_dmax = dmax;
+                        if (i == 0 && ab != ad)
+                            fprintf(stderr, "ds4: [xcheck] pos=%u row0 批argmax=%d 解码argmax=%d max|Δlogit|=%.4g\n",
+                                    pos_now, ab, ad, dmax);
+                    }
+                    if ((xc_n % 16u) == 0)
+                        fprintf(stderr, "ds4: [xcheck] 行数=%u argmax一致=%.1f%% 全程max|Δlogit|=%.4g\n",
+                                xc_n, 100.0 * xc_same / xc_n, xc_dmax);
+                }
+            } else {
+            s->graph.spec_comp_capture = 1;   /* verify 批捕获压缩器输入行(快进用) */
+            if (ds4_session_verify_batch_argmax(s, cand, round_k, pos_now,
+                                                0u, (uint32_t)DS4_N_LAYER - 1u,
+                                                NULL, row_logits, err, errlen) != 0) {
+                s->graph.spec_comp_capture = 0;
                 s->checkpoint_valid = false;
                 return -1;
             }
-            memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
-            free(row_logits);
-            token_vec_push(&s->checkpoint, drafts[0]);
-            accepted[n_accept++] = drafts[0];
-            s->checkpoint_valid = true;
-            s->mtp_draft_valid = false;
-            DS4_MTP_KEEP_ACCEPTED(1);
-            if (mtp_timing) {
-                const double done = now_sec();
-                fprintf(stderr,
-                        "ds4: mtp timing margin-skip drafted=2 committed=1 margin=%.3f threshold=%.3f draft=%.3f ms verify=%.3f ms total=%.3f ms\n",
-                        mtp_last_margin,
-                        mtp_margin_threshold,
-                        (mtp_t_after_draft - mtp_t0) * 1000.0,
-                        (done - verify_t0) * 1000.0,
-                        (done - mtp_t0) * 1000.0);
+            s->graph.spec_comp_capture = 0;
             }
-            return n_accept;
-        }
-    }
-
-    /*
-     * The useful N=2 verifier is the tiny batch path: it verifies two target
-     * positions in one layer-major pass and commits prefix-1 directly on a
-     * partial accept.  Like the rest of the non-quality Metal path, it may pick
-     * a different greedy token when batched reductions perturb nearly-tied
-     * logits.  --quality / DS4_MTP_STRICT selects the exact decode verifier,
-     * which preserves the one-token target stream but is not a speed win.
-     */
-    const bool use_decode2_exact =
-        draft_n == 2 && strict_mtp && getenv("DS4_MTP_BATCH_VERIFY") == NULL;
-    if (use_decode2_exact) {
-        ds4_spec_frontier frontier;
-        memset(&frontier, 0, sizeof(frontier));
-        float *row_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row_logits[0]));
-        float *row0_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row0_logits[0]));
-        const int start = s->checkpoint.len;
-        int row0_top = -1;
-        const double snapshot_t0 = mtp_timing ? now_sec() : 0.0;
-        bool have_frontier = spec_frontier_snapshot(&frontier, s);
-        const double snapshot_done = mtp_timing ? now_sec() : 0.0;
-        bool ok = have_frontier;
-        if (ok) {
-            ok = metal_graph_verify_decode2_exact(&s->graph,
-                                                  &e->model,
-                                                  &e->weights,
-                                                  drafts[0],
-                                                  drafts[1],
-                                                  (uint32_t)start,
-                                                  &row0_top,
-                                                  row0_logits,
-                                                  row_logits);
-        }
-        const double verify_done = mtp_timing ? now_sec() : 0.0;
-        if (ok && row0_top == drafts[1]) {
-            memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
-            token_vec_push(&s->checkpoint, drafts[0]);
-            token_vec_push(&s->checkpoint, drafts[1]);
-            accepted[n_accept++] = drafts[0];
-            if (n_accept < accepted_cap) accepted[n_accept++] = drafts[1];
-            s->checkpoint_valid = true;
-            s->mtp_draft_valid = false;
-            DS4_MTP_KEEP_ACCEPTED(2);
-            if (mtp_timing) {
-                fprintf(stderr,
-                        "ds4: mtp timing decode2 drafted=2 committed=2 draft=%.3f ms snapshot=%.3f ms verify=%.3f ms total=%.3f ms\n",
-                        (mtp_t_after_draft - mtp_t0) * 1000.0,
-                        (snapshot_done - snapshot_t0) * 1000.0,
-                        (verify_done - snapshot_done) * 1000.0,
-                        (now_sec() - mtp_t0) * 1000.0);
-            }
-            spec_frontier_free(&frontier);
-            free(row0_logits);
-            free(row_logits);
-            return n_accept;
-        }
-
-        if (ok) {
-            s->checkpoint.len = start;
-            ok = spec_frontier_commit_prefix1(s);
-        }
-        if (ok) memcpy(s->logits, row0_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
-        if (ok) {
-            token_vec_push(&s->checkpoint, drafts[0]);
-            accepted[n_accept++] = drafts[0];
-            s->checkpoint_valid = true;
-            s->mtp_draft_valid = false;
-            DS4_MTP_KEEP_ACCEPTED(1);
-            if (mtp_timing) {
-                const double replay_done = now_sec();
-                fprintf(stderr,
-                        "ds4: mtp timing decode2 drafted=2 committed=1 draft=%.3f ms snapshot=%.3f ms verify=%.3f ms prefix=%.3f ms total=%.3f ms\n",
-                        (mtp_t_after_draft - mtp_t0) * 1000.0,
-                        (snapshot_done - snapshot_t0) * 1000.0,
-                        (verify_done - snapshot_done) * 1000.0,
-                        (replay_done - verify_done) * 1000.0,
-                        (replay_done - mtp_t0) * 1000.0);
-            }
-            spec_frontier_free(&frontier);
-            free(row0_logits);
-            free(row_logits);
-            return n_accept;
-        }
-        if (have_frontier) {
-            s->checkpoint.len = start;
-            (void)spec_frontier_restore(&frontier, s);
-        }
-        spec_frontier_free(&frontier);
-        free(row0_logits);
-        free(row_logits);
-        if (getenv("DS4_MTP_SPEC_LOG")) {
-            fprintf(stderr, "ds4: mtp decode2 verifier failed, falling back to sequential\n");
-        }
-    }
-
-    if (!use_decode2_exact)
-    {
-        ds4_spec_frontier frontier;
-        memset(&frontier, 0, sizeof(frontier));
-        int *row_tops = xmalloc((size_t)draft_n * sizeof(row_tops[0]));
-        float *row_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row_logits[0]));
-        const int start = s->checkpoint.len;
-        /*
-         * The production MTP depth is two.  Prefix-1 capture makes partial
-         * accepts cheap, but it copies per-layer compressor frontiers even when
-         * both draft tokens are accepted.  Full accepts are the path that makes
-         * MTP worthwhile, so by default we snapshot before the verifier and
-         * replay one token on partial accept.  DS4_MTP_CAPTURE_PREFIX1 restores
-         * the older no-replay partial path for measurement.
-         */
-        const bool capture_prefix1 =
-            draft_n == 2 && (!strict_mtp || getenv("DS4_MTP_CAPTURE_PREFIX1") != NULL);
-        const bool exact_replay_debug = getenv("DS4_MTP_EXACT_REPLAY") != NULL;
-        const bool snapshot_required =
-            draft_n > 2 ||
-            (draft_n == 2 && (!capture_prefix1 || exact_replay_debug)) ||
-            getenv("DS4_MTP_FORCE_SNAPSHOT") != NULL;
-        bool have_frontier = false;
-        bool ok = true;
-        bool verifier_may_have_mutated = false;
-        const double snapshot_t0 = mtp_timing ? now_sec() : 0.0;
-        if (snapshot_required) {
-            have_frontier = spec_frontier_snapshot(&frontier, s);
-            ok = have_frontier;
-        }
-        const double snapshot_done = mtp_timing ? now_sec() : 0.0;
-        if (ok) {
-            for (int i = 0; i < draft_n; i++) token_vec_push(&s->checkpoint, drafts[i]);
-            verifier_may_have_mutated = true;
-            ok = metal_graph_verify_suffix_tops(&s->graph,
-                                                &e->model,
-                                                &e->weights,
-                                                &s->checkpoint,
-                                                (uint32_t)start,
-                                                (uint32_t)draft_n,
-                                                capture_prefix1,
-                                                row_tops,
-                                                NULL);
-        }
-        const double micro_verify_done = mtp_timing ? now_sec() : 0.0;
-        if (ok) {
-            int commit_drafts = 1;
-            /* Session-aware (see copy-spec verify above): request penalties
-             * demand replay; non-FREE lanes verify against raw tops. */
-            const int rp_on = session_penalties_active(s);
-            float *rp_row = NULL;
-            if (rp_on) rp_row = xmalloc((size_t)DS4_N_VOCAB * sizeof(rp_row[0]));
-            for (int i = 1; i < draft_n; i++) {
-                int rp_top = row_tops[i - 1];
-                if (rp_row &&
-                    metal_graph_read_spec_logits_row(&s->graph, (uint32_t)(i - 1), rp_row)) {
-                    repeat_penalize_buf(s, rp_row, (uint32_t)start + (uint32_t)i);
-                    rp_top = sample_argmax(rp_row, DS4_N_VOCAB);
-                }
-                if (rp_top != drafts[i]) break;
-                commit_drafts++;
-            }
-            free(rp_row);
-            if (mtp_conf_log) {
-                fprintf(stderr,
-                        "ds4: mtp conf drafted=%d committed=%d mtp_top=%d runner=%d margin=%.6f target_next=%d draft_next=%d\n",
-                        draft_n,
-                        commit_drafts,
-                        mtp_last_top0,
-                        mtp_last_top1,
-                        mtp_last_margin,
-                        draft_n > 1 ? row_tops[0] : -1,
-                        draft_n > 1 ? drafts[1] : -1);
-            }
-            if (exact_replay_debug && have_frontier) {
-                s->checkpoint.len = start;
-                ok = spec_frontier_restore(&frontier, s);
-                if (ok) {
-                    int replayed = 0;
-                    for (; replayed < commit_drafts && ok; replayed++) {
-                        ok = metal_graph_eval_token_raw_swa(&s->graph,
-                                                            &e->model,
-                                                            &e->weights,
-                                                            drafts[replayed],
-                                                            (uint32_t)(start + replayed),
-                                                            row_logits);
-                        if (ok) token_vec_push(&s->checkpoint, drafts[replayed]);
-                    }
-                    if (ok) {
-                        memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
-                        for (int i = 0; i < replayed && n_accept < accepted_cap; i++) {
-                            accepted[n_accept++] = drafts[i];
-                            if (drafts[i] == eos_token) break;
-                        }
-                        s->checkpoint_valid = true;
-                        s->mtp_draft_valid = false;
-                        DS4_MTP_KEEP_ACCEPTED(replayed);
-                        spec_frontier_free(&frontier);
-                        free(row_logits);
-                        free(row_tops);
-                        return n_accept;
-                    }
+            if (spec_prof) { pf_verify += now_sec() - pf_t0; pf_t0 = now_sec(); }
+            if (getenv("DS4_DSPARK_DIAG")) {
+                /* drafter 主干 top1(markov 前口径不可得, 打 markov 后 d0) vs 主模型 row0 top1 */
+                int am0 = 0; float b0 = -1e30f;
+                for (uint32_t v = 0; v < (uint32_t)DS4_N_VOCAB; v++)
+                    if (row_logits[v] > b0) { b0 = row_logits[v]; am0 = (int)v; }
+                static int dn = 0;
+                if (dn < 8) {
+                    float mh2[2] = {0}, mx2[2] = {0}, lg2[2] = {0};
+                    (void)ds4_gpu_tensor_read(s->graph.dspark_main_hidden, 0, mh2, sizeof(mh2));
+                    (void)ds4_gpu_tensor_read(s->graph.dspark_main_x, 0, mx2, sizeof(mx2));
+                    (void)ds4_gpu_tensor_read(s->graph.dspark_logits, 0, lg2, sizeof(lg2));
+                    fprintf(stderr, "ds4: [dspark-diag] verify_row0_top1=%d draft0=%d draft=[%d %d %d %d %d] mh=%.3g %.3g mx=%.3g %.3g lg=%.3g %.3g\n",
+                            am0, cand[1], cand[1], cand[2], cand[3], cand[4], cand[5],
+                            mh2[0], mh2[1], mx2[0], mx2[1], lg2[0], lg2[1]);
+                    dn++;
                 }
             }
-
-            if (commit_drafts == draft_n) {
-                ok = metal_graph_read_spec_logits_row(&s->graph,
-                                                      (uint32_t)(draft_n - 1),
-                                                      row_logits);
-                if (ok) {
-                    memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
-                    for (int i = 0; i < draft_n && n_accept < accepted_cap; i++) {
-                        accepted[n_accept++] = drafts[i];
-                        if (drafts[i] == eos_token) break;
+            int acc = 1;
+            for (int i = 0; !seq_verify && i + 1 < (int)round_k; i++) {
+                int am = 0; float bb = -1e30f;
+                const float *row = row_logits + (uint64_t)i * DS4_N_VOCAB;
+                for (uint32_t v = 0; v < (uint32_t)DS4_N_VOCAB; v++)
+                    if (row[v] > bb) { bb = row[v]; am = (int)v; }
+                if (am != cand[i + 1]) break;
+                acc++;
+            }
+            if (seq_verify) acc = seq_acc;
+            static int raw_restore_on = -1;
+            if (raw_restore_on < 0) raw_restore_on = getenv("DS4_SPEC_NO_RAW_RESTORE") ? 0 : 1;
+            if (raw_restore_on && !seq_verify && acc < (int)round_k &&
+                !metal_graph_spec_raw_restore(&s->graph, pos_now, (uint32_t)acc, round_k)) {
+                if (errlen) snprintf(err, errlen, "spec raw KV restore failed");
+                s->checkpoint_valid = false;
+                return -1;
+            }
+            if (!seq_verify && !metal_graph_dspark_win_commit(&s->graph, pos_now, (uint32_t)acc)) {
+                if (errlen) snprintf(err, errlen, "dspark window commit failed");
+                s->checkpoint_valid = false;
+                return -1;
+            }
+            /* timeline 已 commit 6 位 → 截到接受数 */
+            if (!seq_verify) s->checkpoint.len = (int)(pos_now + (uint32_t)acc);
+            if (!seq_verify && acc < (int)round_k) {
+                if (!metal_graph_dspark_state_restore(&s->graph)) break;
+                if (getenv("DS4_SPEC_REPLAY_OLD")) {
+                    /* A/B 对照: 旧 replay 全前向路径 */
+                    s->checkpoint.len = (int)pos_now;
+                    if (ds4_session_verify_batch_argmax(s, cand, (uint32_t)acc, pos_now,
+                                                        0u, (uint32_t)DS4_N_LAYER - 1u,
+                                                        NULL, row_logits, err, errlen) != 0) {
+                        s->checkpoint_valid = false;
+                        return -1;
                     }
-                    s->checkpoint_valid = true;
-                    s->mtp_draft_valid = false;
-                    DS4_MTP_KEEP_ACCEPTED(draft_n);
-                    if (mtp_timing) {
-                        fprintf(stderr,
-                                "ds4: mtp timing micro drafted=%d committed=%d draft=%.3f ms snapshot=%.3f ms verify=%.3f ms total=%.3f ms\n",
-                                draft_n,
-                                draft_n,
-                                (mtp_t_after_draft - mtp_t0) * 1000.0,
-                                (snapshot_done - snapshot_t0) * 1000.0,
-                                (micro_verify_done - snapshot_done) * 1000.0,
-                                (now_sec() - mtp_t0) * 1000.0);
-                    }
-                    spec_frontier_free(&frontier);
-                    free(row_logits);
-                    free(row_tops);
-                    return n_accept;
+                } else if (!metal_graph_spec_comp_fastforward(&s->graph, &e->model, &e->weights,
+                                                              pos_now, (uint32_t)acc)) {
+                    /* replay 消除(2026-08-20): KV raw 行 verify 已写好且 restore 不动;
+                     * 压缩器/indexer 态用 verify 捕获的输入行快进 acc 位。 */
+                    if (errlen) snprintf(err, errlen, "spec compressor fast-forward failed");
+                    s->checkpoint_valid = false;
+                    return -1;
+                }
+                s->checkpoint.len = (int)(pos_now + (uint32_t)acc);
+            }
+            memcpy(s->logits, row_logits + (uint64_t)(acc - 1) * DS4_N_VOCAB,
+                   (size_t)DS4_N_VOCAB * sizeof(float));
+            if (spec_prof) {
+                pf_replay += now_sec() - pf_t0; pf_t0 = now_sec();
+                pf_rounds++;
+                { static double last_top = 0.0; const double nowv = now_sec();
+                  if (last_top > 0.0) pf_round_wall += nowv - last_top;
+                  last_top = nowv; }
+                if ((pf_rounds & 7u) == 0) {
+                    fprintf(stderr, "ds4: [spec-prof] rounds=%u win8_ms: draft=%.1f snap=%.1f verify=%.1f replay=%.1f misc=%.1f | round_wall=%.1f\n",
+                            pf_rounds, pf_draft * 1e3 / 8.0, pf_snap * 1e3 / 8.0,
+                            pf_verify * 1e3 / 8.0, pf_replay * 1e3 / 8.0, pf_misc * 1e3 / 8.0,
+                            pf_round_wall * 1e3 / 8.0);
+                    pf_draft = pf_snap = pf_verify = pf_replay = pf_misc = pf_round_wall = 0;   /* 滑窗 */
                 }
             }
-
-            if (draft_n == 2 && commit_drafts == 1 && capture_prefix1) {
-                s->checkpoint.len = start;
-                const double prefix_t0 = mtp_timing ? now_sec() : 0.0;
-                ok = spec_frontier_commit_prefix1(s);
-                const double prefix_done = mtp_timing ? now_sec() : 0.0;
-                if (ok) ok = metal_graph_read_spec_logits_row(&s->graph, 0, row_logits);
-                if (ok) {
-                    memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
-                    accepted[n_accept++] = drafts[0];
-                    s->checkpoint_valid = true;
-                    s->mtp_draft_valid = false;
-                    DS4_MTP_KEEP_ACCEPTED(1);
-                    token_vec_push(&s->checkpoint, drafts[0]);
-                    if (mtp_timing) {
-                        fprintf(stderr,
-                                "ds4: mtp timing micro drafted=%d committed=%d draft=%.3f ms snapshot=%.3f ms verify=%.3f ms prefix=%.3f ms total=%.3f ms noreplay=1\n",
-                                draft_n,
-                                commit_drafts,
-                                (mtp_t_after_draft - mtp_t0) * 1000.0,
-                                (snapshot_done - snapshot_t0) * 1000.0,
-                                (micro_verify_done - snapshot_done) * 1000.0,
-                                (prefix_done - prefix_t0) * 1000.0,
-                                (now_sec() - mtp_t0) * 1000.0);
-                    }
-                    spec_frontier_free(&frontier);
-                    free(row_logits);
-                    free(row_tops);
-                    return n_accept;
+            if (sched) {
+                const double dt_mode = (now_sec() - mode_t0) * 1e3;
+                md_tok[1] += (double)acc; md_ms[1] += dt_mode; md_n[1]++;
+                /* 校准喂数: 草稿位 j 被真正验证过(前缀全接受)才计数; j = acc-1 是被拒的那位。 */
+                for (uint32_t j = 0; j + 1u < round_k && j < (uint32_t)acc; j++) {
+                    cal_n[j]++; cal_sum[j] += (double)conf[j];
+                    if ((int)j < acc - 1) cal_hit[j] += 1.0;
                 }
-            } else {
-                s->checkpoint.len = start;
-                ok = have_frontier && spec_frontier_restore(&frontier, s);
-            }
-            if (ok && draft_n == 2 && commit_drafts == 1) {
-                ok = metal_graph_eval_token_raw_swa(&s->graph,
-                                                    &e->model,
-                                                    &e->weights,
-                                                    drafts[0],
-                                                    (uint32_t)start,
-                                                    row_logits);
-                if (ok) {
-                    memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
-                    accepted[n_accept++] = drafts[0];
-                    s->checkpoint_valid = true;
-                    s->mtp_draft_valid = false;
-                    DS4_MTP_KEEP_ACCEPTED(1);
-                    token_vec_push(&s->checkpoint, drafts[0]);
-                    if (mtp_timing) {
-                        const double replay_done = now_sec();
-                        fprintf(stderr,
-                                "ds4: mtp timing micro drafted=%d committed=%d draft=%.3f ms snapshot=%.3f ms verify=%.3f ms exact_replay=%.3f ms total=%.3f ms\n",
-                                draft_n,
-                                commit_drafts,
-                                (mtp_t_after_draft - mtp_t0) * 1000.0,
-                                (snapshot_done - snapshot_t0) * 1000.0,
-                                (micro_verify_done - snapshot_done) * 1000.0,
-                                (replay_done - micro_verify_done) * 1000.0,
-                                (replay_done - mtp_t0) * 1000.0);
+                if (getenv("DS4_SPEC_SCHED_LOG")) {
+                    static uint32_t cl = 0;
+                    if (((++cl) % 32u) == 0) {
+                        fprintf(stderr, "ds4: [sched-cal]");
+                        for (uint32_t j = 0; j < (uint32_t)DS4_DSPARK_BLK; j++)
+                            fprintf(stderr, " p%u: 预测%.2f 实测%.2f(n=%u)", j + 1,
+                                    cal_n[j] ? cal_sum[j] / cal_n[j] : 0.0,
+                                    cal_n[j] ? cal_hit[j] / cal_n[j] : 0.0, cal_n[j]);
+                        fprintf(stderr, "\n");
                     }
-                    spec_frontier_free(&frontier);
-                    free(row_logits);
-                    free(row_tops);
-                    return n_accept;
                 }
-            }
-            if (ok) {
-                for (int i = 0; i < commit_drafts; i++) token_vec_push(&s->checkpoint, drafts[i]);
-                ok = metal_graph_verify_suffix_tops(&s->graph,
-                                                    &e->model,
-                                                    &e->weights,
-                                                    &s->checkpoint,
-                                                    (uint32_t)start,
-                                                    (uint32_t)commit_drafts,
-                                                    false,
-                                                    row_tops,
-                                                    NULL);
-                if (ok) ok = metal_graph_read_spec_logits_row(&s->graph,
-                                                              (uint32_t)(commit_drafts - 1),
-                                                              row_logits);
-                if (ok) {
-                    memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
-                    for (int i = 0; i < commit_drafts && n_accept < accepted_cap; i++) {
-                        accepted[n_accept++] = drafts[i];
-                        if (drafts[i] == eos_token) break;
+                /* 在线标定: 本轮墙钟与接受数喂吞吐; (k-1, verify_ms) 喂边际最小二乘。
+                 * x 有方差后才用拟合值, 否则保持上一次的 m(初值 12ms)。 */
+                static double last_top2 = 0.0;
+                const double nowv2 = now_sec();
+                if (last_top2 > 0.0) {
+                    const double dt_ms = (nowv2 - last_top2) * 1e3;
+                    sch_tok += (double)acc; sch_ms += dt_ms;
+                    const double x = (double)(round_k - 1u);
+                    rg_n += 1; rg_x += x; rg_y += dt_ms; rg_xx += x * x; rg_xy += x * dt_ms;
+                    const double den = rg_n * rg_xx - rg_x * rg_x;
+                    if (rg_n >= 8 && den > 1e-6) {
+                        const double slope = (rg_n * rg_xy - rg_x * rg_y) / den;
+                        if (slope > 1.0 && slope < 60.0) sch_m = slope;
                     }
-                    s->checkpoint_valid = true;
-                    s->mtp_draft_valid = false;
-                    DS4_MTP_KEEP_ACCEPTED(commit_drafts);
-                    if (mtp_timing) {
-                        const double replay_done = now_sec();
-                        fprintf(stderr,
-                                "ds4: mtp timing micro drafted=%d committed=%d draft=%.3f ms snapshot=%.3f ms verify=%.3f ms replay=%.3f ms total=%.3f ms\n",
-                                draft_n,
-                                commit_drafts,
-                                (mtp_t_after_draft - mtp_t0) * 1000.0,
-                                (snapshot_done - snapshot_t0) * 1000.0,
-                                (micro_verify_done - snapshot_done) * 1000.0,
-                                (replay_done - micro_verify_done) * 1000.0,
-                                (replay_done - mtp_t0) * 1000.0);
-                    }
-                    spec_frontier_free(&frontier);
-                    free(row_logits);
-                    free(row_tops);
-                    return n_accept;
                 }
+                last_top2 = nowv2;
+            }
+            if (getenv("DS4_DSPARK_STAT")) {
+                static uint32_t st_rounds = 0, st_acc = 0;
+                st_rounds++; st_acc += (uint32_t)acc;
+                if ((st_rounds & 7u) == 0)
+                    fprintf(stderr, "ds4: [dspark-stat] rounds=%u avg_acc=%.2f\n",
+                            st_rounds, (double)st_acc / st_rounds);
+            }
+            /* mh: verify/重放批的末接受位 → dspark_main_hidden(3 slot 连续拷贝)。
+             * seq 诊断路径下单 token 解码自己写 mh, 不需要也不能从批里拷。 */
+            for (uint32_t sl = 0; !seq_verify && sl < 3u; sl++)
+                (void)ds4_gpu_tensor_copy(s->graph.dspark_main_hidden,
+                                          (uint64_t)sl * DS4_N_EMBD * sizeof(float),
+                                          s->graph.dspark_pf_hidden,
+                                          ((uint64_t)(acc - 1) * 3u + sl) * DS4_N_EMBD * sizeof(float),
+                                          (uint64_t)DS4_N_EMBD * sizeof(float));
+            for (int i = 0; i < acc && n_acc < accepted_cap; i++) accepted[n_acc++] = cand[i];
+            if (acc >= 1 && cand[acc - 1] == eos_token) break;
+        }
+        return n_acc;
+    }
+    if (!e->mtp_ready) {
+        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        accepted[0] = first_token;
+        /* DSpark 探针(DS4_DSPARK_PROBE=1): eval 后 main_hidden 已被 graph 抓取,
+         * 跑一次 drafter 块打印草稿(活性/质量人工判读, 主循环接线前的最小验证)。 */
+        if (getenv("DS4_DSPARK_PROBE")) {
+            static int diag1 = 0;
+            if (!diag1) { diag1 = 1;
+                fprintf(stderr, "ds4: [dspark-diag] ready=%d g=%p capture=%d buf=%p\n",
+                        (int)e->dspark.ready, (void *)&s->graph, s->graph.dspark_capture, (void *)s->graph.dspark_main_hidden);
             }
         }
-        s->checkpoint.len = start;
-        if (have_frontier) {
-            (void)spec_frontier_restore(&frontier, s);
-        } else if (!verifier_may_have_mutated) {
-            /* Snapshot setup failed before the verifier touched Metal state.
-             * Fall through to the exact sequential verifier below. */
-        } else {
-            snprintf(err, errlen, "MTP verifier failed");
-            s->checkpoint_valid = false;
-            DS4_MTP_KEEP_ACCEPTED(0);
-            spec_frontier_free(&frontier);
-            free(row_logits);
-            free(row_tops);
-            return -1;
-        }
-        spec_frontier_free(&frontier);
-        free(row_logits);
-        free(row_tops);
-        if (getenv("DS4_MTP_SPEC_LOG")) {
-            fprintf(stderr, "ds4: mtp spec micro verifier failed, falling back to sequential\n");
-        }
-    }
-
-    /*
-     * Safety fallback: if the production microbatch verifier fails, verify
-     * drafts with the exact normal one-token decode path instead of returning
-     * wrong state.  This path is deliberately slow and should not be selected
-     * during normal --mtp operation.
-     */
-    int verified = 0;
-    int target_top = sample_argmax(s->logits, DS4_N_VOCAB);
-    bool logits_on_host = true;
-    const double seq_t0 = mtp_timing ? now_sec() : 0.0;
-    for (int i = 0; i < draft_n && n_accept < accepted_cap; i++) {
-        if (target_top != drafts[i]) {
-            if (getenv("DS4_MTP_SPEC_LOG")) {
-                fprintf(stderr,
-                        "ds4: mtp spec seq miss at=%d draft=%d base=%d drafted=%d accepted=%d\n",
-                        i,
-                        drafts[i],
-                        target_top,
-                        draft_n,
-                        n_accept);
+        if (e->dspark.ready && s->graph.dspark_capture && getenv("DS4_DSPARK_PROBE")) {
+            /* 零轨迹噪声命中统计(2026-08-21): PROBE 下草稿不被接受 ⇒ 生成序列与纯解码
+             * 完全一致, 三种 drafter 配置走同一条轨迹 ⇒ 命中率可直接比, 不含 acc 那种
+             * ±0.09 的轨迹漂移噪声。上一轮的草稿首位 vs 本轮真实 token。 */
+            /* 逐位命中(2026-08-21): 首位 91% 但 SPEC acc 仅 2.0/3 ⇒ 推出第二位接受率
+             * ~9%, 与 probe 原始输出"常连中 5 位"矛盾 ⇒ 需要逐位真值来定位是能力还是
+             * SPEC 路径的问题。ring 存最近一次草稿的 5 位, 与后续 5 个真实 token 比。 */
+            static int pend = -1;
+            static uint32_t hit = 0, tot = 0;
+            static int dr[DS4_DSPARK_BLK] = {-1,-1,-1,-1,-1};
+            static int dr_age = 99;
+            static uint32_t phit[DS4_DSPARK_BLK] = {0}, ptot[DS4_DSPARK_BLK] = {0};
+            static int probe_n = 0;
+            if (probe_n < 100000) {
+                int next = 0; float best = -1e30f;
+                for (uint32_t v = 0; v < (uint32_t)DS4_N_VOCAB; v++)
+                    if (s->logits[v] > best) { best = s->logits[v]; next = (int)v; }
+                /* 上一轮草稿首位预测的正是本轮的 next(不是本轮的输入 token) */
+                if (pend >= 0) { tot++; if (pend == next) hit++; }
+                if (dr_age < (int)DS4_DSPARK_BLK) {
+                    ptot[dr_age]++;
+                    if (dr[dr_age] == next) phit[dr_age]++;
+                    else dr_age = 99;   /* 链式: 一旦某位错, 后续位不再计(与 SPEC 接受语义一致) */
+                    if (dr_age != 99) dr_age++;
+                }
+                if (getenv("DS4_DSPARK_PROBE_STAT") && tot && (tot % 64u) == 0) {
+                    fprintf(stderr, "ds4: [probe-hit] %u/%u = %.1f%% | 逐位链式:", hit, tot, 100.0 * hit / tot);
+                    for (uint32_t q = 0; q < DS4_DSPARK_BLK; q++)
+                        fprintf(stderr, " p%u=%.0f%%(%u/%u)", q + 1,
+                                ptot[q] ? 100.0 * phit[q] / ptot[q] : 0.0, phit[q], ptot[q]);
+                    fprintf(stderr, "\n");
+                }
+                int ids[DS4_DSPARK_BLK] = {0};
+                if (metal_graph_dspark_step(&s->graph, &e->model, &e->weights, &e->dspark,
+                                            next, (uint32_t)(s->checkpoint.len - 1), ids)) {
+                    pend = ids[0];
+                    if (dr_age >= (int)DS4_DSPARK_BLK) {   /* 上一条草稿已用完/断链, 换新的 */
+                        for (uint32_t q = 0; q < DS4_DSPARK_BLK; q++) dr[q] = ids[q];
+                        dr_age = 0;
+                    }
+                    float mh[4] = {0}, lg[4] = {0}, mx[4] = {0};
+                    (void)ds4_gpu_tensor_read(s->graph.dspark_main_hidden, 0, mh, sizeof(mh));
+                    (void)ds4_gpu_tensor_read(s->graph.dspark_main_x, 0, mx, sizeof(mx));
+                    (void)ds4_gpu_tensor_read(s->graph.dspark_logits, 0, lg, sizeof(lg));
+                    if (probe_n < 8)
+                        fprintf(stderr, "ds4: [dspark] pos=%d next=%d draft= %d %d %d %d %d | mh=%.3g %.3g mx=%.3g %.3g lg=%.3g %.3g\n",
+                                s->checkpoint.len - 1, next, ids[0], ids[1], ids[2], ids[3], ids[4],
+                                mh[0], mh[1], mx[0], mx[1], lg[0], lg[1]);
+                } else if (probe_n < 8) {
+                    fprintf(stderr, "ds4: [dspark] step failed at pos=%d\n", s->checkpoint.len - 1);
+                }
+                probe_n++;
             }
-            break;
         }
-        if (!metal_graph_eval_token_raw_swa_top(&s->graph,
-                                                &e->model,
-                                                &e->weights,
-                                                drafts[i],
-                                                (uint32_t)s->checkpoint.len,
-                                                &target_top,
-                                                NULL))
-        {
-            snprintf(err, errlen, "%s decode failed", ds4_backend_name(e->backend));
-            s->checkpoint_valid = false;
-            return -1;
-        }
-        token_vec_push(&s->checkpoint, drafts[i]);
-        logits_on_host = false;
-        accepted[n_accept++] = drafts[i];
-        verified++;
-        if (drafts[i] == eos_token) break;
+        return 1;
     }
-    if (verified > 0 && !logits_on_host) {
-        if (ds4_gpu_tensor_read(s->graph.logits,
-                                  0,
-                                  s->logits,
-                                  (uint64_t)DS4_N_VOCAB * sizeof(s->logits[0])) == 0)
-        {
-            snprintf(err, errlen, "%s logits readback failed", ds4_backend_name(e->backend));
-            s->checkpoint_valid = false;
-            return -1;
-        }
-        logits_on_host = true;
-    }
-    (void)logits_on_host;
-    DS4_MTP_KEEP_ACCEPTED(verified);
-#undef DS4_MTP_KEEP_ACCEPTED
-    if (mtp_timing) {
-        fprintf(stderr,
-                "ds4: mtp timing seq drafted=%d verified=%d draft=%.3f ms verify=%.3f ms total=%.3f ms\n",
-                draft_n,
-                verified,
-                (mtp_t_after_draft - mtp_t0) * 1000.0,
-                (now_sec() - seq_t0) * 1000.0,
-                (now_sec() - mtp_t0) * 1000.0);
-    }
-    if (getenv("DS4_MTP_SPEC_LOG")) {
-        if (verified == draft_n) {
-            fprintf(stderr,
-                    "ds4: mtp spec seq accept drafted=%d accepted=%d\n",
-                    draft_n,
-                    n_accept);
-        } else {
-            fprintf(stderr,
-                    "ds4: mtp spec seq partial drafted=%d verified=%d accepted=%d\n",
-                    draft_n,
-                    verified,
-                    n_accept);
-        }
-    }
-    return n_accept;
+    /* MTP 投机整族已删除(2026-08-05 用户裁决: Go 定型优化)。mtp_ready 恒 false,
+     * 上面的 plain 路径即全部行为; 此处永不可达。 */
+    if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+    accepted[0] = first_token;
+    return 1;
 #endif
 }
 
@@ -23768,6 +24573,14 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     if (pos > s->checkpoint.len) pos = s->checkpoint.len;
     s->checkpoint.len = pos;
     s->mtp_draft_valid = false;
+    /* 冷回卷(pos==0)= 从头重放: 必须连 comp/indexer 计数与压缩器累积 state 一起清。
+     * 此前只截 token 时间线 ⇒ 连跑多题时 layer_n_comp 只涨不回, 2050 行容量在
+     * ~28 题后溢出("compressed KV cache capacity exceeded", 2026-08-18 328 题
+     * 基准 500 连锁的第一层根因)。部分回卷(pos>0)的 comp 精确回滚仍是已知债
+     * (state 含非边界脏贡献), CC 增量场景语义不变。 */
+#ifndef DS4_NO_GPU
+    if (pos == 0) (void)metal_graph_reset_prefill_state(&s->graph);
+#endif
 }
 
 int ds4_session_pos(ds4_session *s) {

@@ -17,8 +17,8 @@ METAL_SRCS := $(wildcard metal/*.metal)
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal -framework Accelerate
 MM_OBJS = ds4_multimodal.o ds4_spatial.o ds4_css.o
-CORE_OBJS = ds4.o ds4_corr.o ds4_zchain.o ds4_mtp.o $(MM_OBJS) ds4_distributed.o ds4_metal.o
-CPU_CORE_OBJS = ds4_cpu.o ds4_corr_cpu.o ds4_zchain.o ds4_mtp.o $(MM_OBJS) ds4_distributed.o
+CORE_OBJS = ds4.o ds4_corr.o ds4_zchain.o $(MM_OBJS) ds4_distributed.o ds4_metal.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_corr_cpu.o ds4_zchain.o $(MM_OBJS) ds4_distributed.o
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= /usr/local/cuda
@@ -30,8 +30,8 @@ endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 CUDA_SPARK_FLAGS := -DDS4_CUDA_SPARK_HBM_CACHE=1
 MM_OBJS = ds4_multimodal.o ds4_spatial.o ds4_css.o
-CORE_OBJS = ds4.o ds4_corr.o ds4_zchain.o ds4_mtp.o $(MM_OBJS) ds4_distributed.o ds4_cuda.o
-CPU_CORE_OBJS = ds4_cpu.o ds4_corr_cpu.o ds4_zchain.o ds4_mtp.o $(MM_OBJS) ds4_distributed.o
+CORE_OBJS = ds4.o ds4_corr.o ds4_zchain.o $(MM_OBJS) ds4_distributed.o ds4_cuda.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_corr_cpu.o ds4_zchain.o $(MM_OBJS) ds4_distributed.o
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 METAL_LDLIBS := $(LDLIBS)
 endif
@@ -94,7 +94,7 @@ help:
 	@echo "  make clean               Remove build outputs"
 
 cuda-spark:
-	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH= CFLAGS="$(CFLAGS) $(CUDA_SPARK_FLAGS)" NVCCFLAGS="$(NVCCFLAGS) $(CUDA_SPARK_FLAGS)"
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH= CFLAGS="$(CFLAGS) $(CUDA_SPARK_FLAGS)" NVCCFLAGS="$(NVCCFLAGS) $(CUDA_SPARK_FLAGS) -default-stream per-thread"
 
 cuda-generic:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=native
@@ -133,13 +133,9 @@ cuda-regression: tests/cuda_long_context_smoke
 	./tests/cuda_long_context_smoke
 endif
 
-ds4.o: ds4.c ds4.h ds4_internal.h ds4_distributed.h ds4_gpu.h ds4_mtp.h ds4_multimodal.h ds4_spatial.h ds4_css.h
+ds4.o: ds4.c ds4.h ds4_internal.h ds4_distributed.h ds4_gpu.h ds4_multimodal.h ds4_spatial.h ds4_css.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
-# knowledge-MTP module: backend-neutral (no GPU/engine includes), one object
-# shared by every build flavor.
-ds4_mtp.o: ds4_mtp.c ds4_mtp.h
-	$(CC) $(CFLAGS) -c -o $@ ds4_mtp.c
 
 # Standalone capability modules (self-contained, no engine coupling): z 隐变量
 # closed-form latent, 四损失 calibration losses, 后训练 closed-form quant
@@ -220,7 +216,7 @@ rax.o: rax.c rax.h rax_malloc.h
 linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
 
-ds4_cpu.o: ds4.c ds4.h ds4_internal.h ds4_distributed.h ds4_gpu.h ds4_mtp.h ds4_multimodal.h ds4_spatial.h ds4_css.h
+ds4_cpu.o: ds4.c ds4.h ds4_internal.h ds4_distributed.h ds4_gpu.h ds4_multimodal.h ds4_spatial.h ds4_css.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4.c
 
 ds4_cli_cpu.o: ds4_cli.c ds4.h ds4_distributed.h linenoise.h

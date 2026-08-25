@@ -2456,65 +2456,6 @@ static uint32_t test_pen_build_selfcopy(int *sc, int n) {
     return (uint32_t)m;
 }
 
-static void test_penalty_unit(void) {
-    /* 2026-07-28 用户裁决: anticycle 断环器整族删除 — 本套只剩显式 opt-in 的
-     * DS4_REPEAT_FREQ 语义: ①默认(全 unset)零改写=裸模型真值 ②freq 窗口计数
-     * 无视生成边界(2026-07-06 mono 判据) ③逐次累加。 */
-    char *saved_freq = test_penalty_env_save("DS4_REPEAT_FREQ");
-    char *saved_window = test_penalty_env_save("DS4_REPEAT_WINDOW");
-    float logits[TEST_PEN_NLOGITS];
-    int cyc[24];                 /* 8 copies of the period-3 block {5,6,7} */
-    int sc[68];                  /* self-copy stream, up to n=6 blocks */
-    for (int i = 0; i < 24; i++) cyc[i] = 5 + (i % 3);
-
-    /* Config 1: 默认(全 unset) — 任何重复形态都零惩罚: 裸模型真值路径。 */
-    unsetenv("DS4_REPEAT_FREQ");
-    unsetenv("DS4_REPEAT_WINDOW");
-    ds4_test_reset_penalty_env_cache();
-    test_penalize_row(logits, cyc, 18, 0);            /* 六周期明环 */
-    TEST_ASSERT(logits[5] == 0.0f);
-    TEST_ASSERT(logits[6] == 0.0f);
-    TEST_ASSERT(logits[7] == 0.0f);
-    test_penalize_row(logits, sc, test_pen_build_selfcopy(sc, 6), 0);
-    TEST_ASSERT(logits[42] == 0.0f);                  /* 8-gram 自拷贝也不动 */
-    TEST_ASSERT(logits[10] == 0.0f);
-    (void)test_pen_argmax;
-
-    /* Config 2: freq-window counting. The window [end-4, end) must IGNORE
-     * the generation boundary: gen_start=5 yet prompt-tail tokens at
-     * positions 2..4 are still counted (2026-07-06 "window must include the
-     * prompt tail"). All deltas are exact binary floats. */
-    setenv("DS4_REPEAT_FREQ", "0.5", 1);
-    setenv("DS4_REPEAT_WINDOW", "4", 1);
-    ds4_test_reset_penalty_env_cache();
-
-    static const int fw[6] = {30, 31, 32, 33, 31, 34};
-    test_penalize_row(logits, fw, 6, 5);
-    TEST_ASSERT(logits[30] == 0.0f);    /* before the window: not counted */
-    TEST_ASSERT(logits[31] == -0.5f);   /* pos 4 in-window; pos 1 outside */
-    TEST_ASSERT(logits[32] == -0.5f);   /* prompt tail, pos < gen_start */
-    TEST_ASSERT(logits[33] == -0.5f);
-    TEST_ASSERT(logits[34] == -0.5f);
-
-    /* Per-occurrence accumulation (4 in-window hits of one token). */
-    static const int rep[5] = {7, 7, 7, 7, 7};
-    test_penalize_row(logits, rep, 5, 0);
-    TEST_ASSERT(logits[7] == -2.0f);
-
-    test_penalty_env_restore("DS4_REPEAT_FREQ", saved_freq);
-    test_penalty_env_restore("DS4_REPEAT_WINDOW", saved_window);
-    ds4_test_reset_penalty_env_cache();
-}
-
-typedef void (*test_fn)(void);
-
-typedef struct {
-    const char *flag;
-    const char *name;
-    const char *desc;
-    test_fn fn;
-} ds4_test_entry;
-
 static const ds4_test_entry test_entries[] = {
 #ifndef DS4_NO_GPU
     {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall},
@@ -2527,7 +2468,6 @@ static const ds4_test_entry test_entries[] = {
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
     {"--tp-allreduce", "tp-allreduce", "tensor-parallel all-reduce transport loopback", test_tp_allreduce},
-    {"--penalty-unit", "penalty-unit", "model-free repeat penalty semantics (default=bare-model no-op, freq window, accumulation)", test_penalty_unit},
 };
 
 static void test_print_help(const char *prog) {

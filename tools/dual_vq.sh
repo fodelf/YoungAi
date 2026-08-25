@@ -76,7 +76,7 @@ mem_local(){ footprint -p "${CPID:-0}" 2>/dev/null | grep -Eo 'Footprint: *[0-9.
 # 1. 起 M1 worker (listen, 等 coordinator)
 log "起 M1 worker: --listen $WORKER_IP:$PORT --layers $SPLIT_WORKER (VQ_DIR=$REMOTE_VQ ${VQ_GPU_ENV:-CPU-MoE})"
 ssh "$REMOTE" "cd '$REMOTE_DIR' && pkill -9 -f 'ds4 .*--role worker' 2>/dev/null; sleep 1; rm -f '$WLOG'; \
-  $DIST_ENV $NUM_ENV $VQ_GPU_ENV DS4_VQ_DIR='$REMOTE_VQ' DS4_MEM_BUDGET_MB=$BUDGET_MB \
+  $DIST_ENV ${EXTRA_ENV:-} $NUM_ENV $VQ_GPU_ENV DS4_VQ_DIR='$REMOTE_VQ' DS4_MEM_BUDGET_MB=$BUDGET_MB \
   nohup ./ds4 -m '$MODEL' ${CORR:+--corr '$CORR'} --role worker --listen '$WORKER_IP' '$PORT' --layers '$SPLIT_WORKER' \
   -c '$CTX' --temp 0 --nothink > '$WLOG' 2>&1 & echo launched" 2>/dev/null
 
@@ -95,7 +95,7 @@ sleep 1
 # 2. 起 M4 coordinator (拨 M1, 一次性生成)
 log "起 M4 coordinator: --coordinator $WORKER_IP:$PORT --layers $SPLIT_COORD (VQ_DIR=$LOCAL_VQ)"
 cd "$LOCAL_DIR"; rm -f "$CLOG" "$COUT"
-env $DIST_ENV $NUM_ENV $VQ_GPU_ENV DS4_VQ_DIR="$LOCAL_VQ" DS4_MEM_BUDGET_MB=$BUDGET_MB \
+env $DIST_ENV ${EXTRA_ENV:-} $NUM_ENV $VQ_GPU_ENV DS4_VQ_DIR="$LOCAL_VQ" DS4_MEM_BUDGET_MB=$BUDGET_MB \
   ./ds4 -m "$COORD_MODEL" ${CORR:+--corr "$CORR"} --role coordinator --coordinator "$WORKER_IP" "$PORT" --layers "$SPLIT_COORD" \
   -c "$CTX" -n "$NPRED" --temp 0 --seed "$SEED" --nothink ${DUMP_LP:+--dump-logprobs "$DUMP_LP"} -p "$PROMPT" > "$COUT" 2> "$CLOG" &
 CPID=$!

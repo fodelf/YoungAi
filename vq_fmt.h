@@ -8,6 +8,7 @@
 #define DS4_VQ_FMT_H
 #include <stdint.h>
 #include <string.h>
+#include <stdlib.h>
 
 #define DS4VQ_BLOB_MAGIC 0x4C565144u
 #define DS4VQ_MAT_MAGIC  0x51565144u
@@ -41,8 +42,14 @@ static inline int ds4vq_dequant_f32(const uint8_t *pay, float *out, int exp_rows
     const uint8_t *cb = pay + 16;
     const uint8_t *gr = cb + (size_t)nc * dim * 2;
     const uint8_t *ix = gr + (size_t)rows * 2;
-    float cbf[512 * 8];
+    /* 堆分配 + 通用位宽(2026-08-08: f16 版早修过"硬编码 9bit 只认 nc512", f32 版漏修 —
+     * r86 冷 vq4×256(8bit 索引)在 CPU MoE 生产路被按 9bit 错位解 ⇒ 107 冷专家全垃圾。
+     * 与 f16 版/量化器 vq_nbits() 同口径。 */
+    float *cbf = (float *)malloc((size_t)nc * dim * sizeof(float));
+    if (!cbf) return -3;
     for (int i = 0; i < (int)nc * dim; i++) { uint16_t h; memcpy(&h, cb + 2 * (size_t)i, 2); cbf[i] = ds4vq_f16(h); }
+    int nbit = 0; while ((1 << nbit) < (int)nc) nbit++; if (nbit < 1) nbit = 1;
+    const uint32_t imsk = (nbit >= 32) ? 0xFFFFFFFFu : ((1u << nbit) - 1u);
     for (uint32_t r = 0; r < rows; r++) {
         uint16_t gh; memcpy(&gh, gr + 2 * (size_t)r, 2);
         float g = ds4vq_f16(gh);
@@ -50,13 +57,14 @@ static inline int ds4vq_dequant_f32(const uint8_t *pay, float *out, int exp_rows
         float *orow = out + (size_t)r * cols;
         for (size_t i = i0; i < i1; i++) {
             uint32_t v;
-            if (dim == 8) v = ix[i];
-            else { size_t bit = i * 9; uint32_t w = (uint32_t)ix[bit>>3] | ((uint32_t)ix[(bit>>3)+1]<<8) | ((uint32_t)ix[(bit>>3)+2]<<16); v = (w >> (bit & 7)) & 0x1FF; }
+            if (nbit == 8) v = ix[i];
+            else { size_t bit = i * (size_t)nbit; uint32_t w = (uint32_t)ix[bit >> 3] | ((uint32_t)ix[(bit >> 3) + 1] << 8) | ((uint32_t)ix[(bit >> 3) + 2] << 16); v = (w >> (bit & 7)) & imsk; }
             const float *c = cbf + (size_t)v * dim;
             float *o = orow + (i - i0) * dim;
             for (int d = 0; d < dim; d++) o[d] = c[d] * g;
         }
     }
+    free(cbf);
     return 0;
 }
 
@@ -71,9 +79,18 @@ static inline int ds4vq_dequant_f16(const uint8_t *pay, uint16_t *out,
     const uint8_t *cb = pay + 16;
     const uint8_t *gr = cb + (size_t)nc * dim * 2;
     const uint8_t *ix = gr + (size_t)rows * 2;
-    /* 码本先转 f32(小), 逐行乘 g_r 后转 f16 输出 */
-    float cbf[512 * 8];
+    /* 码本先转 f32, 逐行乘 g_r 后转 f16 输出。
+     * ★堆分配(2026-08-01 修 SIGBUS)★: 原 `float cbf[512*8]` 是 16 KiB 栈数组, 只够
+     * 冠军的 vq4×512 / vq8×256。R28 计划表用到 nc≤1024 × dim≤32 = 32768 float(128 KiB),
+     * 直接踩穿 gather 线程栈 → KERN_PROTECTION_FAILURE。码本相对整矩阵 dequant
+     * (rows×cols 元素)是小量, 每次 malloc 的开销可忽略。 */
+    float *cbf = (float *)malloc((size_t)nc * dim * sizeof(float));
+    if (!cbf) return -3;
     for (int i = 0; i < (int)nc * dim; i++) { uint16_t h; memcpy(&h, cb + 2 * (size_t)i, 2); cbf[i] = ds4vq_f16(h); }
+    /* 索引位宽由码本大小定, 与量化器 vq_nbits() 同口径 —— 原实现硬编码 9bit,
+     * 对 nc=256(8bit 字节流)/nc=1024(10bit)全部错位。 */
+    int nbit = 0; while ((1 << nbit) < (int)nc) nbit++; if (nbit < 1) nbit = 1;
+    const uint32_t imsk = (nbit >= 32) ? 0xFFFFFFFFu : ((1u << nbit) - 1u);
     size_t nidx = (size_t)rows * cols / dim;
     for (uint32_t r = 0; r < rows; r++) {
         uint16_t gh; memcpy(&gh, gr + 2 * (size_t)r, 2);
@@ -82,8 +99,8 @@ static inline int ds4vq_dequant_f16(const uint8_t *pay, uint16_t *out,
         uint16_t *orow = out + (size_t)r * cols;
         for (size_t i = i0; i < i1; i++) {
             uint32_t v;
-            if (dim == 8) v = ix[i];
-            else { size_t bit = i * 9; uint32_t w = (uint32_t)ix[bit >> 3] | ((uint32_t)ix[(bit >> 3) + 1] << 8) | ((uint32_t)ix[(bit >> 3) + 2] << 16); v = (w >> (bit & 7)) & 0x1FF; }
+            if (nbit == 8) v = ix[i];
+            else { size_t bit = i * (size_t)nbit; uint32_t w = (uint32_t)ix[bit >> 3] | ((uint32_t)ix[(bit >> 3) + 1] << 8) | ((uint32_t)ix[(bit >> 3) + 2] << 16); v = (w >> (bit & 7)) & imsk; }
             const float *c = cbf + (size_t)v * dim;
             uint16_t *o = orow + (i - i0) * dim;
             for (int d = 0; d < dim; d++) {
@@ -95,6 +112,7 @@ static inline int ds4vq_dequant_f16(const uint8_t *pay, uint16_t *out,
         }
         (void)nidx;
     }
+    free(cbf);
     return 0;
 }
 #endif

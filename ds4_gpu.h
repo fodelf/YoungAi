@@ -34,6 +34,51 @@ int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                    const ds4_gpu_tensor *src, uint64_t src_offset,
                                    uint64_t count);
 
+int ds4_gpu_token_graph_begin(void);
+void ds4_gpu_token_graph_set_pos(uint32_t pos);
+int ds4_gpu_token_graph_end_launch(void);
+/* decode 流水线: 命中预编码图直接发射 / GPU 忙时为 pos 预捕获下一图(CUDA-only) */
+int ds4_gpu_token_graph_try_pending(int token, uint32_t pos, int need_logits);
+/* decode 双流并发: mark(主流,MoE 前) → begin(shared 段切侧流) → join(汇合) */
+int ds4_gpu_side_mark(void);
+int ds4_gpu_side_begin(void);
+int ds4_gpu_side_main(void);
+int ds4_gpu_dspark_hc_mean_tensor(ds4_gpu_tensor *dst, const ds4_gpu_tensor *hc,
+                                  uint32_t n_embd, uint32_t n_hc, uint32_t slot, uint32_t n_tokens);
+int ds4_gpu_dspark_attn_tensor(ds4_gpu_tensor *heads,
+                               const void *model_map, uint64_t model_size, uint64_t sinks_offset,
+                               const ds4_gpu_tensor *q, const ds4_gpu_tensor *win_kv,
+                               const ds4_gpu_tensor *blk_kv,
+                               uint32_t n_win, uint32_t blk, uint32_t n_head, uint32_t head_dim,
+                               uint32_t win_base, uint32_t win_cap);
+int ds4_gpu_dspark_win_scatter_tensor(ds4_gpu_tensor *win, const ds4_gpu_tensor *rows,
+                                      uint32_t n, uint32_t pos0, uint32_t win_rows, uint32_t dim);
+int ds4_gpu_dspark_argmax_only_tensor(ds4_gpu_tensor *out_id,
+                                      const ds4_gpu_tensor *logits_row, uint32_t vocab);
+/* DSpark 置信头: c_k = sigmoid(w·[x_k ; W1[prev_k]]) —— 调度器按前缀存活率 ∏c 选验证长度 */
+int ds4_gpu_dspark_confidence_tensor(ds4_gpu_tensor *out_conf, const ds4_gpu_tensor *x,
+                                     const void *model_map, uint64_t model_size,
+                                     uint64_t conf_w_offset, uint64_t markov_w1_offset,
+                                     const ds4_gpu_tensor *prev_ids,
+                                     uint32_t dim, uint32_t rank, uint32_t vocab, uint32_t n_pos);
+
+int ds4_gpu_dspark_markov_step_tensor(ds4_gpu_tensor *out_id, ds4_gpu_tensor *logits_row,
+                                      const void *model_map, uint64_t model_size,
+                                      uint64_t w1_offset, uint64_t w2_offset,
+                                      const ds4_gpu_tensor *prev_id, uint32_t vocab, uint32_t rank);
+int ds4_gpu_side_join(void);
+int ds4_gpu_matmul_q4_K_pair_tensor(ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
+                                    const void *model_map, uint64_t model_size,
+                                    uint64_t off0, uint64_t off1,
+                                    uint64_t in_dim, uint64_t out0_dim, uint64_t out1_dim,
+                                    const ds4_gpu_tensor *x);
+int ds4_gpu_matmul_q2_K_pair_tensor(ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
+                                    const void *model_map, uint64_t model_size,
+                                    uint64_t off0, uint64_t off1,
+                                    uint64_t in_dim, uint64_t out0_dim, uint64_t out1_dim,
+                                    const ds4_gpu_tensor *x);
+int ds4_gpu_token_graph_precapture_begin(void);
+int ds4_gpu_token_graph_precapture_end(uint32_t pos, int need_logits, int encode_ok);
 int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_commands(void);
 int ds4_gpu_end_commands(void);
@@ -47,7 +92,28 @@ int ds4_gpu_synchronize(void);
 uint64_t ds4_gpu_tp_signal_after_batch(void);
 int ds4_gpu_tp_host_wait(uint64_t value);
 
+/* GPU 跨度计时(verify 归因): span_begin/end 之间的 GPU 侧毫秒 */
+void ds4_gpu_span_begin(void);
+float ds4_gpu_span_end(void);
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
+/* 副模型(drafter gguf)整体 map 注册: 不动主模型状态, 只加一条 range */
+int ds4_gpu_register_aux_model_map(const void *map, uint64_t size);
+/* verify 批 CUDA 图: begin(slot=pos0&3) 开始捕获; end_launch(encode_ok) 收尾并发射。
+ * 返回 1=已发射(图), 0=未启用(直发), -1=捕获失败(调用方需恢复状态后重编码直发)。 */
+/* 数值护栏: 把张量里的非有限值(NaN/Inf)就地置 0 */
+int ds4_gpu_sanitize_finite_tensor(ds4_gpu_tensor *t, uint64_t n_float);
+/* 路由空槽消毒: selected 里的 -1/越界项归零并清其权重(避免 counts[-1] 越界与未写 mid 槽) */
+int ds4_gpu_sanitize_router_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
+                                   uint32_t n_pairs, uint32_t n_total_expert);
+int ds4_gpu_batch_graph_begin(int slot);
+int ds4_gpu_batch_graph_end_launch(int encode_ok);
+/* 批版 pair 融合(同输入两矩阵一发): 激活量化一次 + 行数合并解并行度 + 权重驻留。
+ * 返回 0 = 不适用(调用方回退两次单发)。 */
+int ds4_gpu_matmul_q2_K_pair_batch_tensor(ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
+                                          const void *model_map, uint64_t model_size,
+                                          uint64_t off0, uint64_t off1,
+                                          uint64_t in_dim, uint64_t out0_dim, uint64_t out1_dim,
+                                          const ds4_gpu_tensor *x, uint64_t n_tok);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
 /* When on!=0, the NEXT ds4_gpu_set_model_map_range wraps its views without
@@ -87,6 +153,9 @@ uint64_t ds4_gpu_current_allocated_bytes(void);
 int ds4_gpu_register_layer_router(const void *model_map, uint32_t layer, uint64_t gate_inp_offset, int gate_inp_is_f32, uint64_t probs_bias_offset, uint64_t gate_exps_offset, uint64_t up_exps_offset, uint64_t down_exps_offset, uint64_t gate_expert_bytes, uint64_t down_expert_bytes, uint32_t n_embd, uint32_t n_expert, uint64_t hash_table_offset, uint32_t hash_k, uint32_t hash_rows);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
+/* CUDA decode: 启动期把 q8_0 权重 repack 成 scale/qs 分离平面(对齐 128bit 读)。
+ * token graph capture 时 host dispatch 只跑一次, repack 表必须先建好。 */
+int ds4_gpu_q8r_preload(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t in_dim, uint64_t out_dim);
 int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes);
 void ds4_gpu_set_quality(bool quality);
 void ds4_gpu_print_memory_report(const char *label);
@@ -199,6 +268,74 @@ int ds4_gpu_matmul_q8_0_tensor(
  * strided by in_dim_full. weight_offset is pre-shifted to the owned slice start;
  * x is the compacted [in_dim_slice]. All-reduce the result across TP peers to get
  * the full matvec (~1e-6 drift vs single-machine — inherent to row-parallel). */
+int ds4_gpu_attention_output_q4k_batch_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *low,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                out_b_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *heads,
+        uint32_t                n_tokens);
+
+int ds4_gpu_attention_output_low_q4k_tensor(
+        ds4_gpu_tensor       *low,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        const ds4_gpu_tensor *heads);
+
+int ds4_gpu_matmul_q4_K_hc_expand_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *block_out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc);
+
+int ds4_gpu_matmul_q4_K_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok);
+
+/* dense Q2_K matmul(2026-08-19 全q2 基座): 布局/语义与 q4_K 版逐参同。 */
+int ds4_gpu_matmul_q2_K_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint64_t n_tok);
+
+/* q2_K 版批量 attn_output(2026-08-19 全q2): 参数与 q4k 版逐参同。 */
+int ds4_gpu_attention_output_q2k_batch_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *low,
+        const void *model_map, uint64_t model_size,
+        uint64_t out_a_offset, uint64_t out_b_offset,
+        uint64_t group_dim, uint64_t rank, uint32_t n_groups, uint64_t out_dim,
+        const ds4_gpu_tensor *heads, uint32_t n_tokens);
+
+/* 全q2 f16 影子注册(2026-08-19): q2_K 权重一次性 dequant→f16 device buffer,
+ * 之后该 offset 的一切消费(range_ptr 命中)透明拿到 f16。rows/cols=行数/行长。 */
+int ds4_gpu_register_q2k_f16_shadow(
+        const void *model_map, uint64_t model_size,
+        uint64_t offset, uint64_t rows, uint64_t cols);
+
 int ds4_gpu_matmul_q8_0_rowslice_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -324,6 +461,16 @@ int ds4_gpu_dsv4_indexer_qat_tensor(
         uint32_t          n_rows,
         uint32_t          head_dim);
 
+int ds4_gpu_kv_rope_fp8_store_raw_tensor(
+    ds4_gpu_tensor *kv, ds4_gpu_tensor *raw_cache,
+    uint32_t raw_cap, uint32_t raw_row, uint32_t head_dim, uint32_t n_rot,
+    uint32_t pos, uint32_t n_ctx_orig, float freq_base, float freq_scale,
+    float ext_factor, float attn_factor, float beta_fast, float beta_slow);
+int ds4_gpu_head_rms_norm_rope_tail_tensor(
+    ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim,
+    uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse,
+    float freq_base, float freq_scale, float ext_factor, float attn_factor,
+    float beta_fast, float beta_slow, float eps);
 int ds4_gpu_rope_tail_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_tok,
@@ -812,6 +959,11 @@ typedef struct {
      * The metal path dequants every active expert to an f16 scratch at gather
      * (cold w2 expanded from the base go1b bytes) and runs the F16W mm_id. */
     int vq;
+    /* Total DQVL blob bytes when vq!=0. The CUDA path uses it to relocate the
+     * host-mmap blob pointer onto the HBM arena copy (the startup span cache
+     * already holds these bytes; reading the mmap original would re-fault pages
+     * that were madvise(DONTNEED)d after the copy). */
+    uint64_t vq_bytes;
 } ds4_gpu_residual_set;
 
 int ds4_gpu_routed_moe_one_tensor(
@@ -1062,8 +1214,29 @@ int ds4_gpu_zchain_zl_set(
         const uint16_t *zlm,
         const uint32_t *off,
         const uint32_t *k,
-        const float    *tr,
+        const uint32_t *din,    /* md86: per-layer V input dim (NULL = all d_model; 3d = ftA) */
+        const float    *tr,     /* type6: trust cap | type7 AMP: tanh 定标 scale */
+        const uint32_t *mul,    /* per-layer 1=乘性AMP(type7, 2026-08-19), NULL=全加性 */
         uint32_t         n_layer,
         uint64_t         total_halves);
+
+/* 路由闭式侧车(type8 zl.RTE, 2026-08-19): blob = z[k]|U[n_expert*k]|V[d_model*k]
+ * per rte layer; 应用 δlogits = U·diag(z)·tanh(Vᵀx/s) 加在 router raw logits 上
+ * (select 前)。k[l]==0 = 该层无侧车。 */
+int ds4_gpu_zchain_rte_set(
+        const uint16_t *rm,
+        const uint32_t *off,
+        const uint32_t *k,
+        const float    *scale,
+        uint32_t         n_layer,
+        uint32_t         n_expert,
+        uint64_t         total_halves);
+
+/* logits[n_tokens][n_expert] += route 侧车 δ(x); 无侧车层零成本返回 1。 */
+int ds4_gpu_zchain_route_bias(
+        ds4_gpu_tensor       *logits,
+        const ds4_gpu_tensor *x,
+        uint32_t               layer,
+        uint32_t               n_tokens);
 
 #endif

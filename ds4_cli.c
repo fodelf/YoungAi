@@ -39,6 +39,8 @@ typedef struct {
     const char *route_prog;   /* --route-prog: resident programming model (Mode P) */
     const char *route_daily;  /* --route-daily: full cached model (Mode G) */
     const char *dump_logits_path;
+    const char *score_ids_path;   /* --score-ids: teacher-forced 逐位打分(公开对拍) */
+    const char *score_out_path;
     const char *dump_logprobs_path;
     int dump_logprobs_top_k;
     const char *perplexity_file_path;
@@ -146,14 +148,6 @@ static void usage(FILE *fp) {
         "Model and runtime:\n"
         "  -m, --model FILE\n"
         "      GGUF model path. Default: ds4flash.gguf\n"
-        "  --mtp FILE\n"
-        "      Optional MTP support GGUF used for draft-token probes.\n"
-        "  --mtp-draft N\n"
-        "      Maximum autoregressive MTP draft tokens per speculative step. Default: 1\n"
-        "  --mtp-margin F\n"
-        "      Minimum recursive-draft confidence for the fast N=2 verifier. Default: 3\n"
-        "  --go-trie FILE\n"
-        "      Corpus n-gram trie (build_go_trie.py) as a greedy-lossless copy-spec drafter. Also: DS4_GO_TRIE.\n"
         "  -c, --ctx N\n"
         "      Context size allocated for the session. Default: 32768\n"
         "  --metal\n"
@@ -598,9 +592,8 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
                                        cfg->gen.top_p, cfg->gen.min_p, &rng);
         if (getenv("DS4_DECODE_DIAG")) {
             fprintf(stderr,
-                    "ds4: [decode-diag] sample#%d token=%d eos=%d max_tokens=%d mtp_draft=%d\n",
-                    generated, token, ds4_token_eos(engine), max_tokens,
-                    ds4_engine_mtp_draft_tokens(engine));
+                    "ds4: [decode-diag] sample#%d token=%d eos=%d max_tokens=%d\n",
+                    generated, token, ds4_token_eos(engine), max_tokens);
         }
         if (token == ds4_token_eos(engine)) break;
 
@@ -739,6 +732,58 @@ static void json_write_token(FILE *fp, ds4_engine *engine, int token) {
     fputc(']', fp);
     fputc('}', fp);
     free(text);
+}
+
+/* teacher-forced 逐位打分(2026-08-14 公开对拍): 读 ids 文件(空白分隔 token id),
+ * 首 token prefill 后逐位: 导出全词表 raw logits → 强制喂真值下一 token。
+ * 输出=量化器 DS4_DUMP_LOGITS 同构二进制(int32 S,V + fp32[S*V]) → anchor_metrics 直接对表。 */
+static int run_score_ids(ds4_engine *engine, const cli_config *cfg) {
+    FILE *fi = fopen(cfg->gen.score_ids_path, "r");
+    if (!fi) { fprintf(stderr, "ds4: --score-ids 打不开 %s\n", cfg->gen.score_ids_path); return 1; }
+    int cap = 8192, n = 0, t;
+    int *ids = malloc((size_t)cap * sizeof(int));
+    while (fscanf(fi, "%d", &t) == 1) {
+        if (n >= cap) { cap *= 2; ids = realloc(ids, (size_t)cap * sizeof(int)); }
+        ids[n++] = t;
+    }
+    fclose(fi);
+    if (n < 2) { fprintf(stderr, "ds4: score-ids 少于 2 token\n"); free(ids); return 1; }
+    ds4_session *session = NULL;
+    if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
+        fprintf(stderr, "ds4: --score-ids 需要图会话后端\n"); free(ids); return 1;
+    }
+    char err[160];
+    /* 首 token 走正常 S=1 sync 预填(与 --dump-logits 同路)。旧"CUDA 挂死绕道"(空会话
+     * eval 单步)已撤: ①当年的"sync 挂死"实为 timeout 进程组 SIGTTIN 停机误诊;
+     * ②空会话 pos=0 的 decode 反而是双后端都没验证过的边角, CUDA 上实测
+     * "cuda decode failed"(与模型无关, v2/allq2 同挂)。 */
+    ds4_tokens first = { .v = ids, .len = 1, .cap = 1 };
+    if (ds4_session_sync(session, &first, err, sizeof(err)) != 0) {
+        fprintf(stderr, "ds4: 首 token 预填失败: %s\n", err);
+        ds4_session_free(session); free(ids); return 1;
+    }
+    const int vocab = ds4_engine_vocab_size(engine);
+    float *logits = malloc((size_t)vocab * sizeof(float));
+    FILE *fo = fopen(cfg->gen.score_out_path ? cfg->gen.score_out_path : "/tmp/ds4_score.bin", "wb");
+    if (!fo || !logits) { fprintf(stderr, "ds4: score 输出打不开\n"); ds4_session_free(session); free(ids); return 1; }
+    int hd[2] = { n, vocab };
+    fwrite(hd, 4, 2, fo);
+    for (int i = 1; i <= n; i++) {
+        if (ds4_session_copy_logits(session, logits, vocab) != vocab) {
+            fprintf(stderr, "ds4: 位置 %d 取 logits 失败\n", i - 1); break;
+        }
+        fwrite(logits, 4, (size_t)vocab, fo);
+        if (i == n) break;
+        if (ds4_session_eval(session, ids[i], err, sizeof(err)) != 0) {
+            fprintf(stderr, "ds4: 位置 %d 强制喂入失败: %s\n", i, err); break;
+        }
+        if (i % 128 == 0) fprintf(stderr, "[score] %d/%d\n", i, n);
+    }
+    fclose(fo); free(logits); free(ids);
+    ds4_session_free(session);
+    fprintf(stderr, "[score] 完成 S=%d V=%d → %s\n", n, vocab,
+            cfg->gen.score_out_path ? cfg->gen.score_out_path : "/tmp/ds4_score.bin");
+    return 0;
 }
 
 static int run_logits_dump(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
@@ -1023,6 +1068,11 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
     }
     if (cfg->gen.metal_graph_prompt_test) {
         rc = ds4_engine_metal_graph_prompt_test(engine, &prompt, cfg->gen.ctx_size);
+        ds4_tokens_free(&prompt);
+        return rc;
+    }
+    if (cfg->gen.score_ids_path) {
+        rc = run_score_ids(engine, cfg);
         ds4_tokens_free(&prompt);
         return rc;
     }
@@ -1538,8 +1588,6 @@ static cli_config parse_options(int argc, char **argv) {
         .engine = {
             .model_path = "ds4flash.gguf",
             .backend = default_backend(),
-            .mtp_draft_tokens = 1,
-            .mtp_margin = 3.0f,
         },
         .gen = {
             .prompt = NULL,
@@ -1606,14 +1654,6 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.residual_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--zchain")) {
             c.engine.zchain_path = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--go-trie")) {
-            c.engine.go_trie_path = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--mtp")) {
-            c.engine.mtp_path = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--mtp-draft")) {
-            c.engine.mtp_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--mtp-margin")) {
-            c.engine.mtp_margin = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1000.0f);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
             c.gen.n_predict = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
@@ -1664,6 +1704,10 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.route_daily = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-logits")) {
             c.gen.dump_logits_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--score-ids")) {
+            c.gen.score_ids_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--score-out")) {
+            c.gen.score_out_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-logprobs")) {
             c.gen.dump_logprobs_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--logprobs-top-k")) {
@@ -1674,7 +1718,9 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.imatrix_dataset_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--imatrix-out")) {
             c.gen.imatrix_output_path = need_arg(&i, argc, argv, arg);
-            c.engine.backend = DS4_BACKEND_METAL;
+            /* 后端不在这里强改: default_backend() 已经是 Mac=Metal / Linux=CUDA,
+             * 旧代码硬写 METAL 是 Mac 独占时代的遗留, 在 CUDA 构建上会把用户显式
+             * 传的 --cuda 覆盖掉直接启动失败(2026-08-21 实锤)。 */
         } else if (!strcmp(arg, "--imatrix-max-prompts")) {
             c.gen.imatrix_max_prompts = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--imatrix-max-tokens")) {
@@ -1825,6 +1871,9 @@ int main(int argc, char **argv) {
                                         cfg.gen.imatrix_max_tokens);
     } else if (cfg.gen.perplexity_file_path) {
         rc = run_perplexity_file(engine, &cfg);
+    } else if (cfg.gen.score_ids_path) {
+        /* score-ids 不需要 prompt; 放 REPL 判断之前, 否则无 -p 时被吞进交互模式 */
+        rc = run_score_ids(engine, &cfg);
     } else if (cfg.gen.prompt == NULL) {
         rc = run_repl(engine, &cfg);
     } else {

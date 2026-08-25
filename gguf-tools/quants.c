@@ -19,6 +19,7 @@
 #include <math.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -676,6 +677,9 @@ typedef struct {
     uint64_t *grid;
     int *map;
     uint16_t *neighbours;
+    /* neighbours 是变长表(每个缺失码一个 count 头 + 若干邻居 id); 长度只有建表时
+     * 才知道, 记下来供 GPU 编码器整表上传。 */
+    int64_t neighbours_len;
 } ds4q_iq2_data;
 
 static ds4q_iq2_data ds4q_iq2_xxs_data;
@@ -801,8 +805,22 @@ static void ds4q_iq2_xxs_init(void) {
     free(dist2);
     ds4q_iq2_xxs_data.map = map;
     ds4q_iq2_xxs_data.neighbours = neighbours;
-    ds4q_iq2_xxs_data.grid = grid;
+    ds4q_iq2_xxs_data.neighbours_len = counter;
+    ds4q_iq2_xxs_data.grid = grid; /* grid 最后赋值: 它是"已初始化"哨兵 */
     pthread_mutex_unlock(&ds4q_init_mutex);
+}
+
+/* IQ2_XXS 搜索表导出(GPU 编码器一次性上传常驻显存用)。表本身仍由上面的 host
+ * 侧建表产生 —— 建表里的 qsort 不进 device。 */
+void ds4q_iq2_xxs_tables(const uint64_t **grid, const int **map, const uint16_t **neighbours,
+                         int *grid_size, int *map_size, int64_t *neighbours_len) {
+    ds4q_iq2_xxs_init();
+    if (grid) *grid = ds4q_iq2_xxs_data.grid;
+    if (map) *map = ds4q_iq2_xxs_data.map;
+    if (neighbours) *neighbours = ds4q_iq2_xxs_data.neighbours;
+    if (grid_size) *grid_size = 256;
+    if (map_size) *map_size = 43692;
+    if (neighbours_len) *neighbours_len = ds4q_iq2_xxs_data.neighbours_len;
 }
 
 static int ds4q_iq2_find_best_neighbour(const uint16_t *neighbours, const uint64_t *grid,
@@ -1006,6 +1024,36 @@ static void ds4q_write_iq2_xxs_block(const float *x, uint8_t *y, const float *qu
     memcpy(y + qs_off, q2, QK_K / 4);
 }
 
+/* 标量(CPU)编码: nrows 行 * ncols 列 -> out。GPU 路径的对拍参照也走这里。 */
+static void ds4q_iq2_xxs_encode_cpu(const float *src, uint8_t *out, int64_t nrows,
+                                    int64_t ncols, size_t row_size, const float *quant_weights) {
+    const int64_t blocks_per_row = ncols / QK_K;
+    for (int64_t row = 0; row < nrows; row++) {
+        const float *xrow = src + (size_t)row * (size_t)ncols;
+        for (int64_t b = 0; b < blocks_per_row; b++) {
+            uint8_t *block = out + (size_t)row * row_size + (size_t)b * ds4q_type_traits[DS4Q_TYPE_IQ2_XXS].type_size;
+            ds4q_write_iq2_xxs_block(xrow + (size_t)b * QK_K, block,
+                                     quant_weights + (size_t)b * QK_K);
+        }
+    }
+}
+
+#ifdef DS4Q_CUDA
+/* quantize_gpu.cu: 返回 1 = GPU 已写出全部字节, 0 = 不可用/失败(回落 CPU)。 */
+int ds4q_iq2xxs_encode_gpu(const float *src, void *dst, int64_t nrows, int64_t ncols,
+                           const float *imatrix_row_weights);
+
+/* DS4Q_GPU_VERIFY=1: GPU 出结果后再跑一遍 CPU 编码器逐字节对拍(慢, 只用于闸门)。 */
+static int ds4q_gpu_verify_on(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("DS4Q_GPU_VERIFY");
+        cached = (v && *v && *v != '0') ? 1 : 0;
+    }
+    return cached;
+}
+#endif
+
 static size_t ds4q_quantize_iq2_xxs(const float *src, void *dst, int64_t start,
                                     int64_t nrows, int64_t ncols, const float *quant_weights) {
     assert(quant_weights);
@@ -1013,16 +1061,30 @@ static size_t ds4q_quantize_iq2_xxs(const float *src, void *dst, int64_t start,
     const size_t row_size = ds4q_row_size(DS4Q_TYPE_IQ2_XXS, ncols);
     const int64_t start_row = start / ncols;
     uint8_t *out = (uint8_t *)dst + (size_t)start_row * row_size;
-    const int64_t blocks_per_row = ncols / QK_K;
 
-    for (int64_t row = 0; row < nrows; row++) {
-        const float *xrow = src + start + (size_t)row * (size_t)ncols;
-        for (int64_t b = 0; b < blocks_per_row; b++) {
-            uint8_t *block = out + (size_t)row * row_size + (size_t)b * ds4q_type_traits[DS4Q_TYPE_IQ2_XXS].type_size;
-            ds4q_write_iq2_xxs_block(xrow + (size_t)b * QK_K, block,
-                                     quant_weights + (size_t)b * QK_K);
+#ifdef DS4Q_CUDA
+    if (ds4q_iq2xxs_encode_gpu(src + start, out, nrows, ncols, quant_weights)) {
+        if (ds4q_gpu_verify_on()) {
+            uint8_t *ref = malloc((size_t)nrows * row_size);
+            if (ref) {
+                ds4q_iq2_xxs_encode_cpu(src + start, ref, nrows, ncols, row_size, quant_weights);
+                size_t bad = 0, first = 0;
+                for (size_t i = 0; i < (size_t)nrows * row_size; i++) {
+                    if (ref[i] != out[i]) {
+                        if (!bad) first = i;
+                        bad++;
+                    }
+                }
+                fprintf(stderr, "iq2_xxs verify: bytes=%zu mismatch=%zu%s first=%zu\n",
+                        (size_t)nrows * row_size, bad, bad ? " FAIL" : " OK", bad ? first : (size_t)0);
+                free(ref);
+            }
         }
+        return (size_t)nrows * row_size;
     }
+#endif
+
+    ds4q_iq2_xxs_encode_cpu(src + start, out, nrows, ncols, row_size, quant_weights);
     return (size_t)nrows * row_size;
 }
 

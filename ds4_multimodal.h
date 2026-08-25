@@ -40,8 +40,7 @@ typedef struct ds4_mm ds4_mm;
 typedef int (*ds4_mm_encode_fn)(void *ctx, const uint8_t *data, size_t len,
                                 int **toks, int *n_toks);
 
-/* Tokenizer callback for the built-in text modality (same shape as
- * ds4_mtp_tokenize_fn so the engine adapter is shared). */
+/* Tokenizer callback for the built-in text modality. */
 typedef void (*ds4_mm_tokenize_fn)(void *ctx, const char *text,
                                    int **toks, int *n);
 

@@ -10,6 +10,7 @@
 #include <stdint.h>
 
 static float ST_LUT[256];
+static int g_bbq4 = -1;   /* backbone q4 往返: -1=看 DS4_BB_Q4 env, 0/1=运行时切(BBQ4_AB 同进程 A/B) */
 static void st_lut_init(void) {
     for (int b = 0; b < 256; b++) {
         int s=(b>>7)&1, e=(b>>3)&0xF, m=b&0x7; float sign=s?-1.f:1.f;
@@ -80,7 +81,9 @@ float *st_read_weight(st_ctx *c, const char *name, long *R_out, long *C_out) {
         uint8_t *buf=malloc((size_t)Rr*Cc); fseek(f,ds+off[0],SEEK_SET);
         if(fread(buf,1,(size_t)Rr*Cc,f)!=(size_t)Rr*Cc){free(buf);free(w);free(hdr);fclose(f);return NULL;}
         for(size_t i=0;i<(size_t)Rr*Cc;i++) w[i]=ST_LUT[buf[i]]; free(buf);
-        /* 块scale name→.scale, F32 [R/128,C/128] */
+        /* 块scale name→.scale [R/128,C/128]。dtype 两世代: 老 Base 落盘 F32;
+         * 0731 起是真 F8_E8M0(1 字节纯指数, 值=2^(e-127); e=0 按 0x00400000 位型,
+         * 与 deepseek4-quantize.c e8m0_to_f32 逐位一致)。按头里的 dtype 分派, 硬拒其他。 */
         char sname[512]; snprintf(sname,sizeof(sname),"%s",name);
         char *ww=strstr(sname,".weight"); if(ww) strcpy(ww,".scale");
         char shard2[256]; st_shard(c,sname,shard2); long ds2; char *hdr2=st_shard_hdr(c,shard2,&ds2);
@@ -88,12 +91,59 @@ float *st_read_weight(st_ctx *c, const char *name, long *R_out, long *C_out) {
         if(hdr2 && st_find(hdr2,sname,dt2,ssh,soff)){
             long sbr=ssh[0],sbc=ssh[1]; char p2[1300]; snprintf(p2,sizeof(p2),"%s/%s",c->hf,shard2);
             FILE *f2=fopen(p2,"rb"); float *sc=malloc((size_t)sbr*sbc*sizeof(float));
-            fseek(f2,ds2+soff[0],SEEK_SET); fread(sc,4,(size_t)sbr*sbc,f2); fclose(f2);
+            fseek(f2,ds2+soff[0],SEEK_SET);
+            if(strcmp(dt2,"F8_E8M0")==0){
+                uint8_t *sb=malloc((size_t)sbr*sbc);
+                if(fread(sb,1,(size_t)sbr*sbc,f2)!=(size_t)sbr*sbc){fprintf(stderr,"st: scale 读不满 %s\n",sname);exit(1);}
+                for(size_t i=0;i<(size_t)sbr*sbc;i++){
+                    uint32_t u = sb[i]==0 ? 0x00400000u : ((uint32_t)sb[i]<<23);
+                    memcpy(&sc[i],&u,4);
+                }
+                free(sb);
+            } else if(strcmp(dt2,"F32")==0){
+                if(fread(sc,4,(size_t)sbr*sbc,f2)!=(size_t)sbr*sbc){fprintf(stderr,"st: scale 读不满 %s\n",sname);exit(1);}
+            } else {
+                fprintf(stderr,"st: 未知 scale dtype %s (%s) — 拒跑\n",dt2,sname); exit(1);
+            }
+            fclose(f2);
             for(long r=0;r<Rr;r++) for(long cc=0;cc<Cc;cc++)
                 w[(size_t)r*Cc+cc]*=sc[(size_t)(r/128)*sbc+(cc/128)];
             free(sc);
         }
         if(hdr2) free(hdr2);
+    } else if(strcmp(dt,"I8")==0){
+        /* ★0731 routed 专家 = MXFP4★: I8 容器 [R, C/2](每字节 2 个 E2M1 nibble, 低位先)
+         * + F8_E8M0 scale [R, C/32](1×32 微块)。返回口径与其余分支一致: 解包后 f32 [R, C真]。
+         * 几何/查表与 deepseek4-quantize.c dequant_fp4_weight 逐位一致(那边已验过 packed release)。 */
+        static const float FP4T[16]={0.f,.5f,1.f,1.5f,2.f,3.f,4.f,6.f,-0.f,-.5f,-1.f,-1.5f,-2.f,-3.f,-4.f,-6.f};
+        long Cin=Cc*2, nblk=Cin/32;
+        if(Cin%32){ fprintf(stderr,"st: FP4 %s C=%ld 不整除32\n",name,Cin); exit(1); }
+        char sname[512]; snprintf(sname,sizeof(sname),"%s",name);
+        char *ww=strstr(sname,".weight"); if(ww) strcpy(ww,".scale");
+        char shard2[256]; long ds2=0; char *hdr2=NULL; char dt2[16]; long ssh[2],soff[2];
+        if(!st_shard(c,sname,shard2) || !(hdr2=st_shard_hdr(c,shard2,&ds2)) ||
+           !st_find(hdr2,sname,dt2,ssh,soff) || strcmp(dt2,"F8_E8M0")!=0 ||
+           ssh[0]!=Rr || ssh[1]!=nblk){
+            fprintf(stderr,"st: FP4 %s 缺配套 E8M0 scale [R,C/32] — 拒跑\n",name);
+            if(hdr2) free(hdr2); exit(1);
+        }
+        w=realloc(w,(size_t)Rr*Cin*sizeof(float));   /* 真列数是 2×容器列 */
+        uint8_t *buf=malloc((size_t)Rr*Cc); fseek(f,ds+off[0],SEEK_SET);
+        if(fread(buf,1,(size_t)Rr*Cc,f)!=(size_t)Rr*Cc){fprintf(stderr,"st: FP4 读不满 %s\n",name);exit(1);}
+        char p2[1300]; snprintf(p2,sizeof(p2),"%s/%s",c->hf,shard2);
+        FILE *f2=fopen(p2,"rb"); uint8_t *sb=malloc((size_t)Rr*nblk);
+        fseek(f2,ds2+soff[0],SEEK_SET);
+        if(fread(sb,1,(size_t)Rr*nblk,f2)!=(size_t)Rr*nblk){fprintf(stderr,"st: FP4 scale 读不满 %s\n",sname);exit(1);}
+        fclose(f2); free(hdr2);
+        for(long r=0;r<Rr;r++) for(long b=0;b<nblk;b++){
+            uint8_t e=sb[(size_t)r*nblk+b]; uint32_t u = e==0 ? 0x00400000u : ((uint32_t)e<<23);
+            float s; memcpy(&s,&u,4);
+            const uint8_t *src=buf+((size_t)r*nblk+b)*16;
+            float *dst=w+(size_t)r*Cin+(size_t)b*32;
+            for(int j=0;j<16;j++){ dst[2*j]=FP4T[src[j]&0x0f]*s; dst[2*j+1]=FP4T[(src[j]>>4)&0x0f]*s; }
+        }
+        free(buf); free(sb);
+        Cc=Cin;   /* 下游按真实列数走 */
     } else if(strcmp(dt,"BF16")==0){
         uint16_t *buf=malloc((size_t)Rr*Cc*2); fseek(f,ds+off[0],SEEK_SET);
         fread(buf,2,(size_t)Rr*Cc,f);
@@ -105,6 +155,23 @@ float *st_read_weight(st_ctx *c, const char *name, long *R_out, long *C_out) {
     } else { /* F32 */
         fseek(f,ds+off[0],SEEK_SET); fread(w,4,(size_t)Rr*Cc,f);
     }
+    /* DS4_BB_Q4(2026-07-28 backbone 体积针): 非专家 2D 矩阵 q4 往返(32组非对称≈Q4_K 略保守)。
+     * 排除: routed 专家(量化主体另有管线)/norm/embed/head/scale/bias。shared_experts 属
+     * backbone 驻留=纳入。FP 锚必须走缓存(本钩子武装时不得重建锚, 否则参照系被污染)。 */
+    {int bb_on = (g_bbq4==-1) ? (getenv("DS4_BB_Q4")!=NULL) : g_bbq4;
+    if(bb_on && Rr>1 && Cc>=256 && !strstr(name,".ffn.experts.")
+       && !strstr(name,"norm") && !strstr(name,"embed") && !strstr(name,"head")
+       && !strstr(name,"bias")){
+        static int bn=0;
+        if(!bn){ fprintf(stderr,"[bbq4] backbone q4 往返已武装(32组非对称)\n"); bn=1; }
+        for(long r=0;r<Rr;r++){ float*row=w+(size_t)r*Cc;
+            for(long j0=0;j0<Cc;j0+=32){ long g=Cc-j0<32?Cc-j0:32;
+                float mn=row[j0],mx=row[j0];
+                for(long j=1;j<g;j++){ float v=row[j0+j]; if(v<mn)mn=v; if(v>mx)mx=v; }
+                float d=(mx-mn)/15.0f; if(d<=0.0f) continue;
+                for(long j=0;j<g;j++){ int q=(int)((row[j0+j]-mn)/d+0.5f);
+                    row[j0+j]=mn+(float)q*d; } } }
+    }}
     fclose(f); free(hdr); if(R_out)*R_out=Rr; if(C_out)*C_out=Cc; return w;
 }
 

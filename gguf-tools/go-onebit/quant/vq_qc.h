@@ -7,24 +7,55 @@
  * 编码链与 vq_shim.c/g1c_vq_sweep.vq_gptq 同口径(质量对齐已验: C 0.5120 vs py 0.5121)。 */
 #ifndef DS4QUANT_VQ_H
 #define DS4QUANT_VQ_H
+#include <unistd.h>   /* pwrite(Linux 上须在首个使用前有原型; 自含化 2026-08-17) */
+#ifdef __APPLE__
 #include <Accelerate/Accelerate.h>   /* vDSP argmin(vq_assign_q 热点, 2026-07-27) */
+#else
+/* Linux/Spark 移植(2026-08-17): vDSP 三件套的标量等价(热点在 sgemm, 这里量小) */
+typedef size_t vDSP_Length;
+static inline void vDSP_vsmul(const float *a, int sa, const float *s, float *o, int so, vDSP_Length n) {
+    (void)sa; (void)so;
+    for (vDSP_Length i = 0; i < n; i++) o[i] = a[i] * (*s);
+}
+static inline void vDSP_vadd(const float *a, int sa, const float *b, int sb, float *o, int so, vDSP_Length n) {
+    (void)sa; (void)sb; (void)so;
+    for (vDSP_Length i = 0; i < n; i++) o[i] = a[i] + b[i];
+}
+static inline void vDSP_minvi(const float *a, int sa, float *mv, vDSP_Length *mi, vDSP_Length n) {
+    (void)sa;
+    float m = a[0]; vDSP_Length k = 0;
+    for (vDSP_Length i = 1; i < n; i++) if (a[i] < m) { m = a[i]; k = i; }
+    *mv = m; *mi = k;
+}
+#endif
 
 #define VQ_MAGIC 0x51565144u   /* 'DQVQ' LE */
 
+static int vq_cold_dim(void); static int vq_cold_nc(void);
+static int vq_w2_dim(void); static int vq_w2_nc(void);
 static int dq_vq_on(void){ static int v=-1; if(v<0) v=getenv("DS4_VQ")?1:0; return v; }
 
 static size_t vq_idx_bytes(int rows,int cols,int dim,int nc){
     size_t nidx=(size_t)rows*cols/dim;
-    if(dim==8&&nc==256) return nidx;                 /* 1B/索引 */
-    if(dim==4&&nc==512) return (nidx*9+7)/8+1;       /* 9bit/索引, +1 防解包尾读越界 */
-    return (nidx*((size_t)ceil(log2((double)nc)))+7)/8;
+    int bits=1; while((1<<bits)<nc) bits++;
+    if(bits==8) return nidx;                         /* 1B/索引(任意dim, q2正品无尾字节) */
+    return (nidx*(size_t)bits+7)/8+1;                /* 位流 +1 防解包尾读越界(战役版语义) */
 }
 static size_t vq_payload_bytes(int rows,int cols,int dim,int nc){
     return 16 + (size_t)nc*dim*2 + (size_t)rows*2 + vq_idx_bytes(rows,cols,dim,nc);
 }
 
 /* ---- 最近邻(分块 sgemm 语义, 此处用 dq_matmul 批量) ---- */
+#ifdef DS4QUANT_CUDA
+/* vq_gpu.cu 的 GPU 常驻核(08-18 用户令): assign 批+GPTQ 组整段 */
+extern int vqg_ready(void);
+extern void vqg_assign(const float*,int,const float*,int,int,int*);
+extern void vqg_gptq_group(float*,const float*,const double*,int,int,int,int,int,int*);
+#endif
 static void vq_assign_q(const float *V,int nv,int dim,const float *C,int nc,int *idx){
+#ifdef DS4QUANT_CUDA
+    if(nv>=8192&&nc<=512&&dim<=8&&vqg_ready()){ vqg_assign(V,nv,C,nc,dim,idx); return; }
+#endif
     const int BS=8192;
     float *c2=malloc((size_t)nc*4),*G=malloc((size_t)BS*nc*4),*vtmp=malloc((size_t)nc*4);
     for(int c=0;c<nc;c++){ double s=0; for(int d=0;d<dim;d++) s+=(double)C[c*dim+d]*C[c*dim+d]; c2[c]=(float)s; }
@@ -44,10 +75,16 @@ static void vq_assign_q(const float *V,int nv,int dim,const float *C,int nc,int 
     free(c2);free(G);free(vtmp);
 }
 
+/* 段计时(DS4_VQ_TIMING=1): kmeans/GPTQ/g_r 三段全局累计秒, 收官打一行(GPU 化热点归因) */
+static double g_vqt[8]; static int g_vqt_on=-1;
+#include <time.h>
+static double vqt_now(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return ts.tv_sec+ts.tv_nsec*1e-9; }
 /* ---- 编码: kmeans(步长子采样,8轮) + GPTQ 列组反馈 + 行乘子; 输出码本/索引/g_r + dequant ---- */
 static void vq_encode_full(const float *W,int rows,int cols,int dim,int nc,
                            const float *X,int n_act,
                            float *Cb_out,int *idx_out,float *gr_out,float *Wq_opt){
+    if(g_vqt_on<0) g_vqt_on=getenv("DS4_VQ_TIMING")?1:0;
+    double vt0=g_vqt_on?vqt_now():0;
     size_t N=(size_t)rows*cols; int nv=(int)(N/dim);
     int nsub=nv<200000?nv:200000, stride=nv/nsub;
     float *sub=malloc((size_t)nsub*dim*4);
@@ -66,27 +103,94 @@ static void vq_encode_full(const float *W,int rows,int cols,int dim,int nc,
             for(int d=0;d<dim;d++) C[(size_t)c*dim+d]=(float)(acc[(size_t)c*dim+d]/cnt[c]);
     }
     free(sub);free(ai);free(acc);free(cnt);
+    if(g_vqt_on){ double t=vqt_now(); g_vqt[0]+=t-vt0; vt0=t; }   /* 多线程累计有竞争, 计时近似可容忍 */
     /* f16 往返码本(与存储一致再分配) */
     for(int i=0;i<nc*dim;i++) C[i]=go1b_fp16_to_fp32(go1b_fp32_to_fp16(C[i]));
     int grp=128;
     float *Wk=malloc((size_t)rows*grp*4),*seg=malloc((size_t)rows*dim*4);
     int *sidx=malloc((size_t)rows*sizeof(int));
     double *H=malloc((size_t)grp*grp*8),*Hi=malloc((size_t)grp*grp*8);
-    float *XbT=(X&&n_act>0)?malloc((size_t)grp*n_act*4):NULL;
+    /* ★快档旋钮(2026-08-09 用户令"开档验证")★: DS4_VQ_NOFB=1 关 GPTQ 列组误差反馈
+     * (编码退化为单遍最近邻, ~17×省时); g_r 行乘子不受影响(仍用 X 校准)。 */
+    static int nofb=-1; if(nofb<0) nofb=getenv("DS4_VQ_NOFB")?1:0;
+    float *XbT=(!nofb&&X&&n_act>0)?malloc((size_t)grp*n_act*4):NULL;
     float *Wq=Wq_opt?Wq_opt:malloc(N*4); int own=Wq_opt?0:1;
+#ifdef DS4QUANT_CUDA
+    /* v3 全矩阵批量(08-18): 组间独立 → 先算全部组 Hi(H cublas 逐组+CPU inv), 再一次
+     * kernel 吃整矩阵(grid.y=组), per-组 sync 32→1 次/矩阵(7.8ms×24.6k=193s/层 的本体)。 */
+    if(cols%grp==0&&grp%dim==0&&nc<=512&&dim<=8&&vqg_ready()){
+        const int ngrp=cols/grp;
+        double *Hi_all=NULL; int fb_all=0;
+        if(XbT){
+            Hi_all=malloc((size_t)ngrp*grp*grp*8); fb_all=1;
+            for(int gi=0;gi<ngrp&&fb_all;gi++){
+                const int j0=gi*grp;
+                double gt0=g_vqt_on?vqt_now():0;
+                for(int j=0;j<grp;j++) for(int t=0;t<n_act;t++) XbT[(size_t)j*n_act+t]=X[(size_t)t*cols+j0+j];
+                { float *Hf=malloc((size_t)grp*grp*4);
+                  dq_matmul(XbT,XbT,Hf,grp,n_act,grp);
+                  for(int i=0;i<grp*grp;i++) H[i]=Hf[i];
+                  free(Hf); }
+                double dm=0; for(int i=0;i<grp;i++) dm+=H[(size_t)i*grp+i]; dm/=grp;
+                for(int i=0;i<grp;i++) H[(size_t)i*grp+i]+=0.02*(dm+1e-9);
+                if(g_vqt_on){ double t=vqt_now(); g_vqt[3]+=t-gt0; gt0=t; }
+                if(g2_inv(H,grp,Hi_all+(size_t)gi*grp*grp)!=0) fb_all=0;
+                if(g_vqt_on){ g_vqt[4]+=vqt_now()-gt0; }
+            }
+        }
+        float *WkF=malloc((size_t)rows*cols*4);
+        memcpy(WkF,W,(size_t)rows*cols*4);
+        static __thread int *sidx_f=NULL; static __thread int sf_cap=0;
+        const int nsegs=cols/dim;
+        if(sf_cap<rows*nsegs){ free(sidx_f); sidx_f=malloc((size_t)rows*nsegs*sizeof(int)); sf_cap=rows*nsegs; }
+        double gk0=g_vqt_on?vqt_now():0;
+        vqg_gptq_full(WkF,C,Hi_all,rows,cols,grp,dim,nc,fb_all,sidx_f);
+        if(g_vqt_on){ g_vqt[5]+=vqt_now()-gk0; }
+        for(size_t i=0;i<(size_t)rows*nsegs;i++){
+            const int c=sidx_f[i];
+            idx_out[i]=c;
+            memcpy(Wq+i*dim,C+(size_t)c*dim,(size_t)dim*4);
+        }
+        free(WkF); if(Hi_all) free(Hi_all);
+        goto gptq_done;
+    }
+#endif
     for(int j0=0;j0<cols;j0+=grp){
         int g=cols-j0<grp?cols-j0:grp; int ok=0;
+        double gt0=g_vqt_on?vqt_now():0;
         if(XbT){
             for(int j=0;j<g;j++) for(int t=0;t<n_act;t++) XbT[(size_t)j*n_act+t]=X[(size_t)t*cols+j0+j];
-            for(int i=0;i<g;i++) for(int j=i;j<g;j++){ double s=0;
-                const float*xi=XbT+(size_t)i*n_act,*xj=XbT+(size_t)j*n_act;
-                for(int t=0;t<n_act;t++) s+=(double)xi[t]*xj[t];
-                H[(size_t)i*g+j]=H[(size_t)j*g+i]=s; }
+            /* H=XbT·XbTᵀ 改走 dq_matmul(GPU 化 2026-08-18): 原手写标量三重循环
+             * =128²/2×2906×768矩阵≈14.6T 标量op/层, 段计时实锤 GPTQ 段主导。
+             * f32 GEMM 累计 vs double: H 本身带 2% 对角阻尼的近似 Hessian, held 对拍验。 */
+            { float *Hf=malloc((size_t)g*g*4);
+              dq_matmul(XbT,XbT,Hf,g,n_act,g);
+              for(int i=0;i<g;i++) for(int j=0;j<g;j++) H[(size_t)i*g+j]=Hf[(size_t)i*g+j];
+              free(Hf); }
             double dm=0; for(int i=0;i<g;i++) dm+=H[(size_t)i*g+i]; dm/=g;
             for(int i=0;i<g;i++) H[(size_t)i*g+i]+=0.02*(dm+1e-9);
+            if(g_vqt_on){ double t=vqt_now(); g_vqt[3]+=t-gt0; gt0=t; }
             ok=g2_inv(H,g,Hi)==0;
+            if(g_vqt_on){ double t=vqt_now(); g_vqt[4]+=t-gt0; gt0=t; }
         }
         for(int r=0;r<rows;r++) memcpy(Wk+(size_t)r*g,W+(size_t)r*cols+j0,(size_t)g*4);
+#ifdef DS4QUANT_CUDA
+        /* GPU 常驻组核(08-18): 段循环+误差反馈整组进 kernel(行间独立=每线程一行,
+         * 行内与 CPU 逐项同序; Hi double→f32 唯一近似, held 对拍验)。 */
+        if(g%dim==0&&nc<=512&&dim<=8&&vqg_ready()){
+            const int nseg2=g/dim;
+            static __thread int *sidx_g=NULL; static __thread int sg_cap=0;
+            if(sg_cap<rows*nseg2){ free(sidx_g); sidx_g=malloc((size_t)rows*nseg2*sizeof(int)); sg_cap=rows*nseg2; }
+            if(g_vqt_on) gt0=vqt_now();
+            vqg_gptq_group(Wk,C,Hi,rows,g,dim,nc,ok,sidx_g);
+            if(g_vqt_on){ g_vqt[5]+=vqt_now()-gt0; }
+            for(int s2=0;s2<nseg2;s2++){ const int jj=s2*dim;
+                for(int r=0;r<rows;r++){ const int c=sidx_g[(size_t)r*nseg2+s2];
+                    idx_out[((size_t)r*cols+j0+jj)/dim]=c;
+                    memcpy(Wq+(size_t)r*cols+j0+jj,C+(size_t)c*dim,(size_t)dim*4); } }
+            continue;
+        }
+#endif
         for(int jj=0;jj+dim<=g;jj+=dim){
             for(int r=0;r<rows;r++) memcpy(seg+(size_t)r*dim,Wk+(size_t)r*g+jj,(size_t)dim*4);
             vq_assign_q(seg,rows,dim,C,nc,sidx);
@@ -104,7 +208,11 @@ static void vq_encode_full(const float *W,int rows,int cols,int dim,int nc,
                     } } }
         }
     }
+#ifdef DS4QUANT_CUDA
+gptq_done:
+#endif
     free(Wk);free(seg);free(sidx);free(H);free(Hi); if(XbT)free(XbT);
+    if(g_vqt_on){ double t=vqt_now(); g_vqt[1]+=t-vt0; vt0=t; }
     /* 行乘子 g_r(闭式 ridge) + f16 往返 */
     if(X&&n_act>=8){
         float *P=malloc((size_t)n_act*rows*4),*Y=malloc((size_t)n_act*rows*4);
@@ -121,6 +229,9 @@ static void vq_encode_full(const float *W,int rows,int cols,int dim,int nc,
         free(P);free(Y);
     } else for(int r=0;r<rows;r++) gr_out[r]=1.0f;
     if(own) free(Wq);
+    if(g_vqt_on){ g_vqt[2]+=vqt_now()-vt0;
+        static int vq_n=0;
+        if((++vq_n&255)==0) fprintf(stderr,"[vqt] kmeans=%.0fs gptq=%.0fs gr=%.0fs | 转置H=%.0fs inv=%.0fs 组核=%.0fs (n=%d)\n",g_vqt[0],g_vqt[1],g_vqt[2],g_vqt[3],g_vqt[4],g_vqt[5],vq_n); }
 }
 
 /* ---- 打包/解包 ---- */
@@ -133,33 +244,47 @@ static size_t vq_pack(const float *Cb,const int *idx,const float *gr,
     for(int i=0;i<nc*dim;i++){ uint16_t h=go1b_fp32_to_fp16(Cb[i]); memcpy(p,&h,2); p+=2; }
     for(int r=0;r<rows;r++){ uint16_t h=go1b_fp32_to_fp16(gr[r]); memcpy(p,&h,2); p+=2; }
     size_t nidx=(size_t)rows*cols/dim;
-    if(dim==8){ for(size_t i=0;i<nidx;i++) *p++=(uint8_t)idx[i]; }
-    else {      /* 9bit 打包: 位流 LE */
-        size_t nb=(nidx*9+7)/8+1; memset(p,0,nb);
-        for(size_t i=0;i<nidx;i++){ uint32_t v=(uint32_t)idx[i]&0x1FF; size_t bit=i*9;
-            p[bit>>3]   |=(uint8_t)(v<<(bit&7));
-            p[(bit>>3)+1]|=(uint8_t)(v>>(8-(bit&7)));
-            if((bit&7)>7-1&&(v>>(16-(bit&7)))) p[(bit>>3)+2]|=(uint8_t)(v>>(16-(bit&7)));
+    int bits=1; while((1<<bits)<nc) bits++;   /* ★通用位宽(2026-08-09 重建): 256→8/512→9/1024→10;
+                                                 旧 9bit 硬编码是 q2 时代遗留, nc=1024 高位截断=盘上乱码 */
+    if(bits==8){ for(size_t i=0;i<nidx;i++) *p++=(uint8_t)idx[i]; }
+    else {      /* 位流 LE, 与 9bit 老路径逐位兼容 */
+        size_t nb=(nidx*(size_t)bits+7)/8+1; memset(p,0,nb);
+        for(size_t i=0;i<nidx;i++){ size_t bit=i*(size_t)bits;
+            uint32_t m=((uint32_t)idx[i]&((1u<<bits)-1))<<(bit&7);
+            p[bit>>3]    |=(uint8_t)m;
+            p[(bit>>3)+1]|=(uint8_t)(m>>8);
+            if(m>>16) p[(bit>>3)+2]|=(uint8_t)(m>>16);
         }
         p+=nb;
     }
     return (size_t)(p-out);
 }
+#ifdef DS4QUANT_CUDA
+extern int vqg_unpack_dequant(const uint8_t*,float*,int,int,int,int,int);
+#endif
 static int vq_unpack_dequant(const uint8_t *buf,size_t sz,float *Wout,int *rows_o,int *cols_o){
     const uint8_t *p=buf;
     uint32_t mg; memcpy(&mg,p,4); p+=4; if(mg!=VQ_MAGIC) return -1;
     uint16_t dim,nc; memcpy(&dim,p,2);p+=2; memcpy(&nc,p,2);p+=2;
     uint32_t rows,cols; memcpy(&rows,p,4);p+=4; memcpy(&cols,p,4);p+=4;
     if(rows_o)*rows_o=(int)rows; if(cols_o)*cols_o=(int)cols;
+#ifdef DS4QUANT_CUDA
+    /* B 回放主体=768 矩阵标量位流解码(18s/层); 大矩阵 GPU 整解(逐位同语义) */
+    if((size_t)rows*cols>=1u<<20&&dim<=8&&nc<=1024){
+        int bits2=1; while((1<<bits2)<nc) bits2++;
+        if(vqg_unpack_dequant(buf,Wout,(int)rows,(int)cols,dim,nc,bits2)) return 0;
+    }
+#endif
     float *C=malloc((size_t)nc*dim*4);
     for(int i=0;i<nc*dim;i++){ uint16_t h; memcpy(&h,p,2); p+=2; C[i]=go1b_fp16_to_fp32(h); }
     float *gr=malloc((size_t)rows*4);
     for(uint32_t r=0;r<rows;r++){ uint16_t h; memcpy(&h,p,2); p+=2; gr[r]=go1b_fp16_to_fp32(h); }
     size_t nidx=(size_t)rows*cols/dim;
+    int bits=1; while((1<<bits)<nc) bits++;
     for(size_t i=0;i<nidx;i++){
         uint32_t v;
-        if(dim==8) v=p[i];
-        else { size_t bit=i*9; v=(uint32_t)p[bit>>3]|((uint32_t)p[(bit>>3)+1]<<8)|((uint32_t)p[(bit>>3)+2]<<16); v=(v>>(bit&7))&0x1FF; }
+        if(bits==8) v=p[i];
+        else { size_t bit=i*(size_t)bits; v=(uint32_t)p[bit>>3]|((uint32_t)p[(bit>>3)+1]<<8)|((uint32_t)p[(bit>>3)+2]<<16); v=(v>>(bit&7))&((1u<<bits)-1); }
         size_t r=(i*dim)/cols;
         float g=gr[r]; const float *cb=C+(size_t)v*dim;
         float *o=Wout+i*dim;
@@ -177,24 +302,30 @@ static void vq_sidecar_path(const char*lf,int L,char*out,size_t n){
 }
 static size_t vq_hdr_bytes(void){ return 16 + 256*3*8; }
 /* which: 0=w1 1=w3 2=w2; 返回 0=该矩阵无 VQ 载荷 */
+/* ★参数化槽位布局(2026-08-09 重建: 冷档从 rplan getter 取, 冷 w2>0 时带载荷 —
+ * 公式已对 q2(1,751,665,168B)/q4(2,023,770,896B) 两个已知产物逐字节验证)★ */
 static size_t vq_slot_off(int L,int e,int which,int moei,int dim_model){
     size_t off=vq_hdr_bytes();
     size_t hw13=vq_payload_bytes(moei,dim_model,4,512), hw2=vq_payload_bytes(dim_model,moei,4,512);
-    size_t cw13=vq_payload_bytes(moei,dim_model,8,256);
+    size_t cw13=vq_payload_bytes(moei,dim_model,vq_cold_dim(),vq_cold_nc());
+    int w2d=vq_w2_dim();
+    size_t cw2=w2d>0?vq_payload_bytes(dim_model,moei,w2d,vq_w2_nc()):0;
     for(int e2=0;e2<e;e2++){
-        if(g2_hot_slot(L,e2)>=0) off+=2*hw13+hw2; else off+=2*cw13;
+        if(g2_hot_slot(L,e2)>=0) off+=2*hw13+hw2; else off+=2*cw13+cw2;
     }
     int hot=g2_hot_slot(L,e)>=0;
-    if(!hot&&which==2) return 0;
+    if(!hot&&which==2&&cw2==0) return 0;
     if(which>=1) off+= hot?hw13:cw13;
-    if(which>=2) off+= hw13;
+    if(which>=2) off+= hot?hw13:cw13;
     return off;
 }
 static size_t vq_total_bytes(int L,int moei,int dim_model){
     size_t off=vq_hdr_bytes();
     size_t hw13=vq_payload_bytes(moei,dim_model,4,512), hw2=vq_payload_bytes(dim_model,moei,4,512);
-    size_t cw13=vq_payload_bytes(moei,dim_model,8,256);
-    for(int e2=0;e2<256;e2++) off+= (g2_hot_slot(L,e2)>=0)?(2*hw13+hw2):(2*cw13);
+    size_t cw13=vq_payload_bytes(moei,dim_model,vq_cold_dim(),vq_cold_nc());
+    int w2d=vq_w2_dim();
+    size_t cw2=w2d>0?vq_payload_bytes(dim_model,moei,w2d,vq_w2_nc()):0;
+    for(int e2=0;e2<256;e2++) off+= (g2_hot_slot(L,e2)>=0)?(2*hw13+hw2):(2*cw13+cw2);
     return off;
 }
 
@@ -228,5 +359,24 @@ static float *dq_quant_expert_vq(const float *W,int nrows,int ncols,const float 
     vq_encode_full(W,nrows,ncols,dim,nc,X,n_act,Cb,idx,gr,Wq);
     free(Cb);free(idx);free(gr);
     return Wq;
+}
+
+/* ── 战役期 API 重建(2026-08-09: git checkout 误覆盖未提交现版, 按主文件调用面重建;
+ *    验收闸 = r30_campaign.sh probe1 复现 cos=0.9699 / held=0.0668 / vq md5=4843132e…) ── */
+extern int g_vq_dim, g_vq_nc;   /* rplan 逐层档位全局(主文件 vq_rplan 写入) */
+static int vq_cold_dim(void){ if(g_vq_dim) return g_vq_dim;
+    const char*e=getenv("DS4_VQ_COLD_DIM"); return e?atoi(e):8; }
+static int vq_cold_nc(void){ if(g_vq_nc) return g_vq_nc;
+    const char*e=getenv("DS4_VQ_COLD_NC"); return e?atoi(e):256; }
+/* 顺序补偿变体: 调用侧已传量化态 hidden(hc), 每行输出匹配闭式缩放本就烘在
+ * vq_encode_full 的 g_r 段 → 与非 seq 同实现, flag 仅语义标注。 */
+static float *vq_export_matrix_seq(const float*W,int rows,int cols,const float*X,int n_act,
+                               int dim,int nc,int vqfd,size_t off,double*cos_out,int seq){
+    (void)seq;
+    return vq_export_matrix(W,rows,cols,X,n_act,dim,nc,vqfd,off,cos_out);
+}
+static float *dq_quant_expert_vq_seq(const float *W,int nrows,int ncols,const float *X,int n_act,int dim,int nc,int seq){
+    (void)seq;
+    return dq_quant_expert_vq(W,nrows,ncols,X,n_act,dim,nc);
 }
 #endif

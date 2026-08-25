@@ -29,12 +29,15 @@ set -e
 # ever ignores the Range (detected by an over-size result). Completed files on
 # either side are skipped by a byte-count check.
 
-REPO="deepseek-ai/DeepSeek-V4-Flash-Base"
+# Any HF safetensors repo with the same layout works (--repo / HF_REPO); the
+# default is the official BASE model. When the repo is overridden and no --dir
+# is given, the output dir follows the repo's basename (./hf/<repo-basename>).
+REPO=${HF_REPO:-deepseek-ai/DeepSeek-V4-Flash-Base}
 ENDPOINT=${HF_ENDPOINT:-https://huggingface.co}
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-OUT_DIR=${DS4_HF_DIR:-"$ROOT/hf/DeepSeek-V4-Flash-Base"}
-case "$OUT_DIR" in /*) ;; *) OUT_DIR="$ROOT/$OUT_DIR" ;; esac
+OUT_DIR=${DS4_HF_DIR:-}
+OUT_DIR_SET=0; [ -n "$OUT_DIR" ] && OUT_DIR_SET=1
 
 # Reached through a local proxy. Override with --proxy / HF_PROXY; disable with
 # --no-proxy / HF_PROXY=off. Applies to BOTH the API call and file transfers.
@@ -61,6 +64,12 @@ REMOTE_PROXY=${REMOTE_PROXY:-__INHERIT__}
 RELAY=${RELAY:-0}
 RELAY_RESERVE_GIB=${RELAY_RESERVE_GIB:-14}
 
+# The mirror image of --relay: once the REMOTE finishes its own share it helps
+# fetch the LOCAL host's outstanding shards, staging them on its own disk and
+# handing them over the bridge. Needed whenever the remote gets the smaller
+# slice (see --local-share), which is the normal case when its disk is smaller.
+REVERSE_RELAY=${REVERSE_RELAY:-0}
+
 # Free-space headroom to keep on each disk (GiB). The model is a tight fit, so
 # these are small by necessity; raise them and free space if you want margin.
 LOCAL_RESERVE_GIB=${LOCAL_RESERVE_GIB:-4}
@@ -69,6 +78,20 @@ REMOTE_RESERVE_GIB=${REMOTE_RESERVE_GIB:-4}
 CONFIG_ONLY=0
 PLAN_ONLY=0
 FORCE=0
+# aria2's multi-range parallelism (-x/-s) breaks against mirrors that redirect
+# to a pre-signed CDN URL whose policy pins a single ByteRange: every extra
+# segment comes back 403. --no-aria2 forces the single-connection curl path,
+# which those mirrors serve fine (and fast).
+USE_ARIA2=${USE_ARIA2:-1}
+# Concurrent files per host. The mirror throttles per connection, not per host:
+# measured 2026-08-02 on M4, one lane 0.89 MB/s vs three lanes 1.45 MB/s. More
+# lanes also eat more of the household uplink, so this stays tunable.
+LANES=${DL_LANES:-3}
+# Fraction of the model to aim at the LOCAL disk (0 = off => local-first fill).
+# With both hosts downloading at similar rates, a local-first split finishes one
+# host early and leaves the other alone with the tail; a share matched to the
+# measured rates has them finish together.
+LOCAL_SHARE=${LOCAL_SHARE:-0}
 
 TAB=$(printf '\t')
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=10"
@@ -101,12 +124,26 @@ Options:
   --remote-proxy URL      Proxy the remote uses for direct downloads
                           (default: same as local --proxy).
   --no-remote-proxy       Remote downloads without a proxy (direct to HF).
+  --reverse-relay         After the REMOTE finishes its own shards, it helps
+                          fetch the local host's remaining ones and hands them
+                          over the bridge. Use when the remote has the smaller
+                          slice so it does not sit idle.
   --relay                 After finishing local shards, also fetch the remote's
                           outstanding shards here and push them over the bridge
                           (both proxies drain the remote set). Keeps
                           --relay-reserve GiB free locally as staging scratch.
   --relay-reserve N       GiB to keep free locally for relay staging (default 14).
-  --dir DIR               Local output dir (default: ./hf/DeepSeek-V4-Flash-Base
+  --repo REPO             HF repo to download (default: $REPO).
+  --local-share F         Aim F (0..1) of the model at the local disk instead of
+                          filling local first. Set it to the local host's share
+                          of the two download rates so both finish together.
+  --lanes N               Files downloaded concurrently per host (default $LANES).
+                          The mirror throttles per connection, so >1 helps; it
+                          also uses more of the household bandwidth.
+  --no-aria2              Force the single-connection curl path. Needed for
+                          mirrors whose pre-signed CDN URLs pin one ByteRange
+                          (aria2's parallel segments come back 403).
+  --dir DIR               Local output dir (default: ./hf/<repo-basename>
                           or \$DS4_HF_DIR).
   --local-reserve N       GiB to keep free on the local disk  (default 4).
   --remote-reserve N      GiB to keep free on the remote disk (default 4).
@@ -119,7 +156,7 @@ Options:
   -h, --help              This help.
 
 Environment:
-  DS4_HF_DIR, HF_PROXY (off to disable), HF_ENDPOINT, HF_TOKEN,
+  HF_REPO, DS4_HF_DIR, HF_PROXY (off to disable), HF_ENDPOINT, HF_TOKEN,
   REMOTE_SSH, REMOTE_DIR, REMOTE_MODE (direct|stream), REMOTE_PROXY,
   LOCAL_RESERVE_GIB, REMOTE_RESERVE_GIB
 
@@ -138,7 +175,10 @@ while [ $# -gt 0 ]; do
             ;;
         --dir)
             shift; [ $# -gt 0 ] || { echo "Missing value after --dir" >&2; exit 1; }
-            OUT_DIR=$1; case "$OUT_DIR" in /*) ;; *) OUT_DIR="$ROOT/$OUT_DIR" ;; esac ;;
+            OUT_DIR=$1; OUT_DIR_SET=1 ;;
+        --repo)
+            shift; [ $# -gt 0 ] || { echo "Missing value after --repo" >&2; exit 1; }
+            REPO=$1 ;;
         --remote-mode)
             shift; [ $# -gt 0 ] || { echo "Missing value after --remote-mode" >&2; exit 1; }
             REMOTE_MODE=$1
@@ -146,9 +186,13 @@ while [ $# -gt 0 ]; do
         --remote-proxy) shift; [ $# -gt 0 ] || { echo "Missing value after --remote-proxy" >&2; exit 1; }; REMOTE_PROXY=$1 ;;
         --no-remote-proxy) REMOTE_PROXY="" ;;
         --relay) RELAY=1 ;;
+        --reverse-relay) REVERSE_RELAY=1 ;;
         --relay-reserve) shift; [ $# -gt 0 ] || { echo "Missing value after --relay-reserve" >&2; exit 1; }; RELAY_RESERVE_GIB=$1 ;;
         --local-reserve)  shift; LOCAL_RESERVE_GIB=$1 ;;
         --remote-reserve) shift; REMOTE_RESERVE_GIB=$1 ;;
+        --no-aria2) USE_ARIA2=0 ;;
+        --lanes) shift; [ $# -gt 0 ] || { echo "Missing value after --lanes" >&2; exit 1; }; LANES=$1 ;;
+        --local-share) shift; [ $# -gt 0 ] || { echo "Missing value after --local-share" >&2; exit 1; }; LOCAL_SHARE=$1 ;;
         --plan) PLAN_ONLY=1 ;;
         --config-only) CONFIG_ONLY=1 ;;
         --proxy) shift; [ $# -gt 0 ] || { echo "Missing value after --proxy" >&2; exit 1; }; PROXY=$1 ;;
@@ -161,9 +205,22 @@ while [ $# -gt 0 ]; do
     shift
 done
 
+# Default output dir follows the repo basename, so --repo alone lands in a
+# distinct ./hf/<name> instead of overwriting another model's dir.
+case "$LANES" in ''|*[!0-9]*|0) echo "--lanes must be a positive integer" >&2; exit 1 ;; esac
+
+[ "$OUT_DIR_SET" = 1 ] || OUT_DIR="$ROOT/hf/${REPO##*/}"
+case "$OUT_DIR" in /*) ;; *) OUT_DIR="$ROOT/$OUT_DIR" ;; esac
+
 case "$PROXY" in off|none|no) PROXY="" ;; esac
 [ "$REMOTE_PROXY" = "__INHERIT__" ] && REMOTE_PROXY=$PROXY
 case "$REMOTE_PROXY" in off|none|no) REMOTE_PROXY="" ;; esac
+# "No remote proxy" has to mean it: the remote's login env exports http_proxy /
+# https_proxy (clash), which curl and aria2 both honor silently. Without this,
+# --no-remote-proxy still tunnels every byte through the proxy.
+if [ -z "$REMOTE_PROXY" ]; then
+    REMOTE_PATH="$REMOTE_PATH unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY;"
+fi
 if [ -z "$TOKEN" ] && [ -s "$HOME/.cache/huggingface/token" ]; then
     TOKEN=$(cat "$HOME/.cache/huggingface/token")
 fi
@@ -228,16 +285,27 @@ remote_cap=$(awk -v f="$remote_free" -v r="$remote_reserve" 'BEGIN { printf "%.0
 # A shard already on a disk is part of the model and already accounted for in
 # that disk's `free`; only the REMAINING bytes (size - present) cost new space.
 
+# In-flight bytes live in "<name>.part" (curl) or "<name>.rr" (reverse relay),
+# not under the final name. Counting only the final name would charge a resumed
+# shard its FULL size against the disk budget on every re-plan, inventing a
+# shortfall that isn't there.
 LHAVE=$(mktemp); RMAP=$(mktemp)
 printf '%s\n' "$LIST" | while IFS="$TAB" read -r size name; do
     [ -n "$name" ] || continue
-    h=0; [ -f "$OUT_DIR/$name" ] && h=$(wc -c < "$OUT_DIR/$name" | tr -d ' ')
+    h=0
+    if   [ -f "$OUT_DIR/$name" ];      then h=$(wc -c < "$OUT_DIR/$name" | tr -d ' ')
+    elif [ -f "$OUT_DIR/$name.part" ]; then h=$(wc -c < "$OUT_DIR/$name.part" | tr -d ' ')
+    elif [ -f "$OUT_DIR/$name.rr" ];   then h=$(wc -c < "$OUT_DIR/$name.rr" | tr -d ' ')
+    fi
     printf '%s\t%s\n' "$name" "${h:-0}"
 done > "$LHAVE"
 : > "$RMAP"
 if [ -n "$REMOTE_SSH" ]; then
     $SSH "$REMOTE_SSH" "cd '$REMOTE_DIR' 2>/dev/null && find . -type f -exec stat -f '%z %N' {} + 2>/dev/null" \
-        | awk '{ sz=$1; nm=substr($0, index($0,$2)); sub(/^\.\//,"",nm); if (nm!="") print nm "\t" sz }' > "$RMAP" || true
+        | awk '{ sz=$1+0; nm=substr($0, index($0,$2)); sub(/^\.\//,"",nm)
+                 sub(/\.part$/,"",nm); sub(/\.rr$/,"",nm)
+                 if (nm!="" && sz > m[nm]) m[nm]=sz }
+               END { for (k in m) print k "\t" m[k] }' > "$RMAP" || true
 fi
 
 # --- placement: keep existing shards where they are; greedily fill remaining ---
@@ -245,10 +313,12 @@ fi
 
 PLAN=$(mktemp); STATS=$(mktemp)
 printf '%s\n' "$LIST" | awk -F"$TAB" -v lc="$local_cap" -v rc="$remote_cap" \
-    -v hasrem="$([ -n "$REMOTE_SSH" ] && echo 1 || echo 0)" -v lhf="$LHAVE" -v rmf="$RMAP" -v statsf="$STATS" '
+    -v hasrem="$([ -n "$REMOTE_SSH" ] && echo 1 || echo 0)" -v lhf="$LHAVE" -v rmf="$RMAP" -v statsf="$STATS" \
+    -v share="$LOCAL_SHARE" -v totalb="$total_bytes" '
 BEGIN {
     while ((getline ln < lhf) > 0) { p=index(ln,"\t"); if (p) lh[substr(ln,1,p-1)]=substr(ln,p+1) }
     while ((getline ln < rmf) > 0) { p=index(ln,"\t"); if (p) rh[substr(ln,1,p-1)]=substr(ln,p+1) }
+    target_l = (share > 0) ? share*totalb : -1
 }
 {
     size=$1; name=$2
@@ -260,7 +330,17 @@ BEGIN {
     rcost = size-rhave; if (rcost<0) rcost=0
     dest="X"
     if (!is_shard)                              { dest="L" }   # config/tokenizer -> local
+    else if (lhave>0)                           { dest="L" }   # continue a local partial
     else if (rhave>0 && hasrem && ru+rcost<=rc) { dest="R" }   # continue a remote partial
+    # Share mode: both hosts pull at their own rate, so filling one disk first
+    # leaves the other idle while the loaded one drags on alone. Cap local at
+    # its target share of the model and let the rest go remote; capacity still
+    # overrides (either side falls back to the other when it cannot fit).
+    else if (target_l >= 0 && hasrem) {
+        if      (ltot+size <= target_l && lu+lcost <= lc) { dest="L" }
+        else if (ru+rcost <= rc)                          { dest="R" }
+        else if (lu+lcost <= lc)                          { dest="L" }
+    }
     else if (lu+lcost <= lc)                    { dest="L" }   # keep local / fill local
     else if (hasrem && ru+rcost <= rc)          { dest="R" }   # overflow to remote
     if (dest=="L")      { lu+=lcost; ltot+=size; lnew+=lcost; nl++ }
@@ -312,7 +392,8 @@ file_size_remote() { # always emits an integer (0 if missing/unreachable)
     [ -n "$n" ] && echo "$n" || echo 0
 }
 
-have_aria2=0; command -v aria2c >/dev/null 2>&1 && have_aria2=1
+have_aria2=0
+[ "$USE_ARIA2" = 1 ] && command -v aria2c >/dev/null 2>&1 && have_aria2=1
 
 download_local() { # size name
     size=$1; name=$2; out="$OUT_DIR/$name"; url="$ENDPOINT/$REPO/resolve/main/$name"
@@ -328,12 +409,17 @@ download_local() { # size name
             --max-tries=0 --retry-wait=10 --timeout=60 --connect-timeout=30 \
             --max-file-not-found=5 \
             -d "$OUT_DIR" -o "$name"
-        [ -n "$PROXY" ] && set -- --all-proxy="$PROXY" "$@"
+        # No --proxy => actively disable it; a proxy in the environment would
+        # otherwise be picked up and silently used.
+        if [ -n "$PROXY" ]; then set -- --all-proxy="$PROXY" "$@"; else set -- --no-proxy='*' "$@"; fi
         [ -n "$TOKEN" ] && set -- --header="Authorization: Bearer $TOKEN" "$@"
         aria2c "$@" "$url" || true
     else
-        set -- -fL --progress-meter -C -
-        [ -n "$PROXY" ] && set -- -x "$PROXY" "$@"
+        # -s: this runs for hours into a log file; curl's progress meter would
+        # bury the get/ok lines under megabytes of redraw noise. Progress is
+        # observed from the file sizes instead (tools/dl_0731_progress.sh).
+        set -- -fsSL -C -
+        if [ -n "$PROXY" ]; then set -- -x "$PROXY" "$@"; else set -- --noproxy '*' "$@"; fi
         [ -n "$TOKEN" ] && set -- -H "Authorization: Bearer $TOKEN" "$@"
         curl "$@" -o "$out.part" "$url" && mv "$out.part" "$out" || true
     fi
@@ -347,7 +433,7 @@ download_remote() { # size name  (stream through this host, byte-level resumable
     if [ "$size" -ge 0 ] 2>/dev/null && [ "$have" -gt "$size" ] 2>/dev/null; then
         $SSH "$REMOTE_SSH" ": > '$rpath'"; have=0
     fi
-    set -- -fSL
+    set -- -fsSL
     [ -n "$PROXY" ] && set -- -x "$PROXY" "$@"
     [ -n "$TOKEN" ] && set -- -H "Authorization: Bearer $TOKEN" "$@"
     if [ "$have" -gt 0 ] 2>/dev/null; then
@@ -371,6 +457,7 @@ download_remote() { # size name  (stream through this host, byte-level resumable
 remote_has_aria2=0
 remote_check_aria2() {
     [ -n "$REMOTE_SSH" ] || return 0
+    [ "$USE_ARIA2" = 1 ] || return 0
     if $SSH "$REMOTE_SSH" "$REMOTE_PATH command -v aria2c >/dev/null 2>&1"; then remote_has_aria2=1; fi
 }
 
@@ -391,7 +478,7 @@ download_remote_direct() { # size name  (remote fetches it itself via its proxy)
         rcmd="$rcmd $(shq "$url")"
     else
         # curl resumes against the .part target (-C -); finalize with mv on success.
-        rcmd="curl -fSL -C - --retry 5 --retry-delay 5"
+        rcmd="curl -fsSL -C - --retry 5 --retry-delay 5"
         [ -n "$REMOTE_PROXY" ] && rcmd="$rcmd -x $(shq "$REMOTE_PROXY")"
         [ -n "$TOKEN" ] && rcmd="$rcmd -H $(shq "Authorization: Bearer $TOKEN")"
         rcmd="$rcmd -o $(shq "$rpath.part") $(shq "$url") && mv $(shq "$rpath.part") $(shq "$rpath")"
@@ -405,14 +492,70 @@ download_remote_direct() { # size name  (remote fetches it itself via its proxy)
 # line — the whole point of running both hosts in parallel.
 # Read the PLAN on FD 3, not stdin: the ssh calls below would otherwise consume
 # the plan file as their stdin and end the loop after one shard.
+# Lanes pull from a shared list instead of owning a fixed slice of it.
+#
+# The fixed-slice version (lane i takes every LANES-th file) collapses at the
+# tail: a lane that finishes its slice EXITS, and since the pass waits for all
+# lanes before starting the next round, concurrency decays to however many lanes
+# still hold an unfinished file. Measured mid-run: M1 down to 2 live connections
+# of 16, 0.81 MB/s instead of ~3.8.
+#
+# Claiming is an atomic mkdir. A claim is RELEASED only when the file did not
+# complete, so a finished file is never re-claimed inside the same round (which
+# would spin); the round's retry loop wipes all claims and starts over.
+claim_key() { printf '%s' "$1" | tr '/' '_'; }
+claim()   { mkdir "$CLAIMD/$(claim_key "$1")" 2>/dev/null; }
+unclaim() { rmdir "$CLAIMD/$(claim_key "$1")" 2>/dev/null || true; }
+
+remote_lane() {
+    while :; do
+        _got=0
+        while IFS="$TAB" read -r dest size name <&3; do
+            [ -n "$name" ] || continue
+            [ "$dest" = R ] || continue
+            claim "$name" || continue
+            if [ "$REMOTE_MODE" = direct ]; then download_remote_direct "$size" "$name"
+            else download_remote "$size" "$name"; fi
+            have=$(file_size_remote "$REMOTE_DIR/$name")
+            [ "$have" = "$size" ] || unclaim "$name"
+            _got=1
+            break
+        done 3< "$PLAN"
+        [ "$_got" = 0 ] && break
+    done
+}
+local_lane() {
+    while :; do
+        _got=0
+        while IFS="$TAB" read -r dest size name <&3; do
+            [ -n "$name" ] || continue
+            [ "$dest" = L ] || continue
+            # Handed to the remote's reverse relay — it owns this .part now.
+            [ -d "$TAKEOVER_D/$(claim_key "$name")" ] && continue
+            claim "$name" || continue
+            download_local "$size" "$name"
+            have=$(file_size_local "$OUT_DIR/$name")
+            [ "$have" = "$size" ] || unclaim "$name"
+            _got=1
+            break
+        done 3< "$PLAN"
+        [ "$_got" = 0 ] && break
+    done
+}
+
 run_remote_pass() {
     while :; do
+        CLAIMD=$(mktemp -d)
+        # Wait on THESE lanes by pid: a bare `wait` would also block on the
+        # other host's pass, which runs as a sibling background job.
+        _l=0; _pids=""
+        while [ "$_l" -lt "$LANES" ]; do remote_lane & _pids="$_pids $!"; _l=$((_l+1)); done
+        wait $_pids
+        rm -rf "$CLAIMD"
         pending=0
         while IFS="$TAB" read -r dest size name <&3; do
             [ -n "$name" ] || continue
             [ "$dest" = R ] || continue
-            if [ "$REMOTE_MODE" = direct ]; then download_remote_direct "$size" "$name"
-            else download_remote "$size" "$name"; fi
             have=$(file_size_remote "$REMOTE_DIR/$name")
             if [ "$size" -ge 0 ] 2>/dev/null && [ "$have" != "$size" ]; then pending=1; fi
         done 3< "$PLAN"
@@ -423,11 +566,15 @@ run_remote_pass() {
 }
 run_local_pass() {
     while :; do
+        CLAIMD=$(mktemp -d)
+        _l=0; _pids=""
+        while [ "$_l" -lt "$LANES" ]; do local_lane & _pids="$_pids $!"; _l=$((_l+1)); done
+        wait $_pids
+        rm -rf "$CLAIMD"
         pending=0
         while IFS="$TAB" read -r dest size name <&3; do
             [ -n "$name" ] || continue
             [ "$dest" = L ] || continue
-            download_local "$size" "$name"
             have=$(file_size_local "$OUT_DIR/$name")
             if [ "$size" -ge 0 ] 2>/dev/null && [ "$have" != "$size" ]; then pending=1; fi
         done 3< "$PLAN"
@@ -435,6 +582,142 @@ run_local_pass() {
         echo "local: shards still incomplete, retry round in 10s ..."
         sleep 10
     done
+}
+
+# --- reverse relay: idle REMOTE host helps fetch the local's shards ----------
+# Whichever host is given the smaller slice finishes first and would then sit
+# idle while the other drags the tail alone. This is the remote->local
+# direction: the finished remote downloads a shard the local host still owes,
+# into a scratch dir on its own disk, and we pull it over the bridge (measured
+# 1.0 GB/s, so the transfer is noise next to the ~3 MB/s internet leg).
+#
+# The two hosts walk the local list from opposite ends (local lanes ascending,
+# this descending) so they meet in the middle instead of racing for the same
+# file. Overlap is still possible; it costs duplicate bytes, never corruption
+# (each side writes its own staging file and the size check gates the rename).
+
+local_actively_downloading() { # name -> true if the local .part was touched recently
+    _f="$OUT_DIR/$1.part"
+    [ -f "$_f" ] || return 1
+    _n=$(date +%s); _m=$(stat -f %m "$_f" 2>/dev/null || echo 0)
+    [ $((_n - _m)) -lt 90 ]
+}
+
+# Streamed, not staged: the remote's curl writes to stdout and ssh carries the
+# bytes straight into the local .part. Nothing lands on the remote's disk (it
+# has ~7 GiB left once its own share is done, too little to stage 3 GiB
+# shards), and with no disk cost this runs LANES-wide like a normal pass.
+#
+# It appends to the SAME .part the local lane uses, so an in-flight shard keeps
+# the gigabytes already fetched instead of restarting. That makes handoff
+# mandatory: the local lane must release the file first, or both hosts write
+# the same descriptor and corrupt it. TAKEOVER_D is the shared interlock —
+# reverse relay marks a name there and kills the local curl; local_lane skips
+# any name marked in it for the rest of the run.
+local_curl_pid() { pgrep -f "curl .*$1\$" 2>/dev/null | head -1; }
+
+reverse_relay_fetch() { # size name
+    size=$1; name=$2; out="$OUT_DIR/$name"; part="$out.part"
+    url="$ENDPOINT/$REPO/resolve/main/$name"
+    mkdir -p "$TAKEOVER_D/$(claim_key "$name")" 2>/dev/null    # local_lane stands down
+    p=$(local_curl_pid "$name")
+    if [ -n "$p" ]; then kill "$p" 2>/dev/null || true; sleep 2; fi
+    have=$(file_size_local "$part")
+    echo "rrelay take $name ($(human "$size")) resume @ $(human "${have:-0}") via $REMOTE_SSH"
+    if [ "${have:-0}" -gt 0 ] 2>/dev/null; then
+        $SSH "$REMOTE_SSH" "$REMOTE_PATH curl -fsSL -r ${have}- '$url'" </dev/null >> "$part" || true
+    else
+        $SSH "$REMOTE_SSH" "$REMOTE_PATH curl -fsSL '$url'" </dev/null > "$part" || true
+    fi
+    got=$(file_size_local "$part")
+    if [ "$got" = "$size" ]; then
+        mv -f "$part" "$out"
+        echo "rrelay ok   $name delivered"
+    elif [ "$size" -ge 0 ] 2>/dev/null && [ "$got" -gt "$size" ] 2>/dev/null; then
+        # Range ignored by the CDN: the body was appended whole. Start clean.
+        echo "rrelay warn $name range not honored; resetting" >&2
+        rm -f "$part"
+        rmdir "$TAKEOVER_D/$(claim_key "$name")" 2>/dev/null || true
+    else
+        # Did not finish: hand the file back so the local lanes resume it.
+        rmdir "$TAKEOVER_D/$(claim_key "$name")" 2>/dev/null || true
+    fi
+}
+
+# How many shards the remote still owes on its OWN share. Reverse relay only
+# uses the lanes left over from that, so it ramps up as the remote drains its
+# list instead of competing with it from the start.
+remote_pending_count() {
+    $SSH "$REMOTE_SSH" "ls '$REMOTE_DIR'/*.part 2>/dev/null | wc -l" </dev/null 2>/dev/null | tr -d ' '
+}
+local_all_done() {
+    while IFS="$TAB" read -r size name <&3; do
+        [ -n "$name" ] || continue
+        [ "$(file_size_local "$OUT_DIR/$name")" = "$size" ] || return 1
+    done 3< "$llist"
+    return 0
+}
+local_pending_count() {
+    _n=0
+    while IFS="$TAB" read -r size name <&3; do
+        [ -n "$name" ] || continue
+        [ "$(file_size_local "$OUT_DIR/$name")" = "$size" ] || _n=$((_n + 1))
+    done 3< "$llist"
+    echo "$_n"
+}
+
+rrelay_lane() {
+    while :; do
+        _got=0
+        while IFS="$TAB" read -r size name <&3; do
+            [ -n "$name" ] || continue
+            have=$(file_size_local "$OUT_DIR/$name")
+            [ "$have" = "$size" ] && continue
+            claim "$name" || continue
+            reverse_relay_fetch "$size" "$name"
+            have=$(file_size_local "$OUT_DIR/$name")
+            [ "$have" = "$size" ] || unclaim "$name"
+            _got=1
+            break
+        done 3< "$llist"
+        [ "$_got" = 0 ] && break
+    done
+}
+
+reverse_relay_pass() {
+    [ -n "$REMOTE_SSH" ] || return 0
+    llist=$(mktemp)
+    # Descending: local lanes walk the list ascending, so the two sweeps meet in
+    # the middle rather than fighting over the same shard.
+    awk -F"$TAB" '$1=="L" && $3 ~ /\.safetensors$/ { print $2 "\t" $3 }' "$PLAN" | tail -r > "$llist"
+    echo "reverse-relay: armed; will use whatever lanes the remote isn't using"
+    while :; do
+        local_all_done && break
+        rleft=$(remote_pending_count)
+        rr=$(( LANES - ${rleft:-0} ))                     # lanes the remote has spare
+        # ...but never take more than half of what's left: one shard can only be
+        # fetched by one host, so grabbing them all idles the LOCAL machine
+        # (observed: M4 dropped to 0 connections while M1 ran 13). Split the
+        # remaining files between the two instead.
+        lleft=$(local_pending_count)
+        half=$(( (lleft + 1) / 2 ))
+        [ "$rr" -gt "$half" ] && rr=$half
+        if [ "$rr" -lt 1 ]; then sleep 30; continue; fi   # remote still busy with its own
+        CLAIMD=$(mktemp -d)
+        _l=0; _pids=""
+        while [ "$_l" -lt "$rr" ]; do rrelay_lane & _pids="$_pids $!"; _l=$((_l+1)); done
+        wait $_pids
+        rm -rf "$CLAIMD"
+        rpending=0
+        while IFS="$TAB" read -r size name <&3; do
+            [ -n "$name" ] || continue
+            have=$(file_size_local "$OUT_DIR/$name")
+            if [ "$have" != "$size" ]; then rpending=1; fi
+        done 3< "$llist"
+        [ "$rpending" = 0 ] && break
+        sleep 10
+    done
+    rm -f "$llist"
 }
 
 # --- relay-assist: idle local host helps fetch the remote's shards -----------
@@ -514,6 +797,11 @@ run_relay_pass() {
     rm -f "$rlist"; rmdir "$scratch" 2>/dev/null || true
 }
 
+# Shared interlock: names the remote's reverse relay has taken over, so the
+# local lanes stop writing those .part files. Defined for every mode so the
+# lanes' lookup never sees an empty path.
+TAKEOVER_D=$(mktemp -d)
+
 echo "Downloading (re-run to resume)..."
 [ -n "$REMOTE_SSH" ] && echo "Remote mode: $REMOTE_MODE${REMOTE_PROXY:+  remote-proxy $REMOTE_PROXY}"
 [ "$RELAY" = 1 ] && [ -n "$REMOTE_SSH" ] && echo "Relay: ON  (local host helps fetch remote shards; ${RELAY_RESERVE_GIB} GiB scratch reserved)"
@@ -523,9 +811,15 @@ if [ -n "$REMOTE_SSH" ] && [ "$REMOTE_MODE" = direct ] && [ "$n_remote" -gt 0 ] 
     remote_check_aria2
     run_remote_pass &
     REMOTE_PID=$!
+    # Runs alongside, not after: it sizes itself to the remote's spare lanes, so
+    # it stays out of the way early and ramps up as the remote drains its share.
+    RRELAY_PID=""
+    if [ "$REVERSE_RELAY" = 1 ]; then reverse_relay_pass & RRELAY_PID=$!; fi
     run_local_pass
     [ "$RELAY" = 1 ] && run_relay_pass   # idle local host now drains remote's set too
     wait "$REMOTE_PID" 2>/dev/null || true
+    [ -n "$RRELAY_PID" ] && { wait "$RRELAY_PID" 2>/dev/null || true; }
+    rm -rf "$TAKEOVER_D"
 else
     run_local_pass
     [ -n "$REMOTE_SSH" ] && run_remote_pass
@@ -535,17 +829,27 @@ fi
 
 echo
 incomplete=""
+# dest "X" = the placement pass found no disk with room for it. Only --force
+# gets this far; the shard was never attempted, so report it separately from a
+# genuinely failed transfer — otherwise a partial model reads as "complete".
+unplaced=""
 while IFS="$TAB" read -r dest size name <&3; do
     [ -n "$name" ] || continue
     [ "$size" -ge 0 ] 2>/dev/null || continue
     case "$dest" in
         L) got=$(file_size_local "$OUT_DIR/$name") ;;
         R) got=$(file_size_remote "$REMOTE_DIR/$name") ;;
-        *) continue ;;
+        *) unplaced="$unplaced $name"; continue ;;
     esac
     [ "$got" = "$size" ] || incomplete="$incomplete $dest:$name"
 done 3< "$PLAN"
 rm -f "$PLAN"
+
+if [ -n "$unplaced" ]; then
+    echo "NOT DOWNLOADED — no disk had room ($(human "$unfit_gross")); free space and re-run:" >&2
+    for f in $unplaced; do echo "  $f" >&2; done
+    echo >&2
+fi
 
 if [ -n "$incomplete" ]; then
     echo "Incomplete (re-run to resume):" >&2
@@ -553,7 +857,11 @@ if [ -n "$incomplete" ]; then
     exit 1
 fi
 
-echo "All files complete."
+if [ -n "$unplaced" ]; then
+    echo "Placed files complete, but the model is PARTIAL (see above)."
+else
+    echo "All files complete."
+fi
 echo "  local : $OUT_DIR"
 [ -n "$REMOTE_SSH" ] && echo "  remote: $REMOTE_SSH:$REMOTE_DIR"
 echo
@@ -562,3 +870,6 @@ echo "remote portion over the bridge (e.g. SMB) into $OUT_DIR before running"
 echo "  gguf-tools/deepseek4-quantize --hf \"$OUT_DIR\" --template ... --out ..."
 echo
 echo "Done."
+# Partial model => nonzero exit, so a caller/cron never mistakes it for a
+# finished download.
+if [ -n "$unplaced" ]; then exit 1; fi
