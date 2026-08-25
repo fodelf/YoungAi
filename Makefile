@@ -82,7 +82,9 @@ CUDA_ARCH ?=
 ifneq ($(strip $(CUDA_ARCH)),)
 NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
-NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
+# -I. 与 CFLAGS/OBJCFLAGS 同款: src/cuda/ 分片里的根目录头(vq_fmt.h/ds4_gpu.h/
+# ds4_iq2_tables_cuda.inc)按引用文件目录解析不到, 需要仓库根兜底。
+NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread -I.
 CUDA_SPARK_FLAGS := -DDS4_CUDA_SPARK_HBM_CACHE=1
 MM_OBJS = ds4_multimodal.o ds4_spatial.o ds4_css.o
 CORE_OBJS = $(CORE_ENGINE_OBJS) $(COMMON_FMT_OBJS) ds4_corr.o ds4_zchain.o $(MM_OBJS) $(DIST_OBJS) ds4_cuda.o
@@ -335,7 +337,10 @@ src/metal/metal_moe_vq.o: src/metal/metal_moe_vq.m $(METAL_INTERNAL_HDRS) vq_fmt
 src/metal/metal_routed_moe_batch.o: src/metal/metal_routed_moe_batch.m $(METAL_INTERNAL_HDRS) vq_fmt.h
 	$(CC) $(OBJCFLAGS) -c -o $@ $<
 
-ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_iq2_tables_cuda.inc
+# ds4_cuda.cu 是聚合根: 实现在 src/cuda/*.inc.cu 分片(单 TU 纹理包含),
+# 分片或共享前奏一变就得重编这个 .o。
+CUDA_INC_SRCS := $(wildcard src/cuda/*.inc.cu) src/cuda/cuda_internal.cuh
+ds4_cuda.o: ds4_cuda.cu $(CUDA_INC_SRCS) ds4_gpu.h ds4_iq2_tables_cuda.inc
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
 
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o
