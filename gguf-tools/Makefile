@@ -59,6 +59,7 @@ DSQFWD_INC := $(wildcard $(AMP)/ds4quant_fwd_p*.inc.c)
 AMPSOLVE_INC := $(wildcard $(AMP)/amp_solve_p*.inc.c)
 TRAJ_INC := $(wildcard $(CAL)/traj_analyze_p*.inc.c)
 HFREAD_INC := $(wildcard $(CAL)/hf_read_p*.inc.c)
+VQMERGE_INC := $(wildcard $(QZ)/vq_merge_v4_p*.inc.c)
 
 ifeq ($(UNAME_S),Darwin)
 NATIVE ?= -mcpu=native
@@ -375,7 +376,7 @@ $(BEN)/gates/pubbench_extract_test: $(BEN)/gates/pubbench_extract_test.c $(BEN)/
 	$(CC) $(BARE) -o $@ $(BEN)/gates/pubbench_extract_test.c $(CURL_FLAGS) -lz -lm -lpthread
 
 vq_merge_v4: $(QZ)/vq_merge_v4
-$(QZ)/vq_merge_v4: $(QZ)/vq_merge_v4.c
+$(QZ)/vq_merge_v4: $(QZ)/vq_merge_v4.c $(VQMERGE_INC)
 	$(CC) $(BARE) $(NATIVE) -o $@ $< -lm
 
 go2b_parity: $(QZ)/go2b_parity
