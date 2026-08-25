@@ -43,6 +43,26 @@ CPPFLAGS ?= -D_GNU_SOURCE
 BARE := -O3
 INC := -I$(QZ) -I$(AMP) -I$(CAL) -I$(SLV)
 
+# 聚合根分片依赖(2026-08-25 批6 拆分): 超 500 行源文件拆成 <名>_pK.inc.c, 由原路径
+# 聚合根按序 #include(单 TU, 符号零变化)。分片只进【依赖列表】触发重建, 绝不进编译
+# 命令行(它们不是独立 TU)。
+QUANTS_INC := $(wildcard $(QZ)/quants_p*.inc.c)
+DSQMAIN_INC := $(wildcard $(QZ)/deepseek4-quantize_p*.inc.c)
+PUBBENCH_INC := $(wildcard $(BEN)/pubbench_p*.inc.c)
+EMITZ_INC := $(wildcard $(AMP)/emit_z_p*.inc.c)
+CALIBDIAG_INC := $(wildcard $(CAL)/calib_diag_p*.inc.c)
+HVSOLVE_INC := $(wildcard $(AMP)/hiddenvar_solve_p*.inc.c)
+RRR_INC := $(wildcard $(AMP)/solve_rrr_p*.inc.c)
+CALIBRUN_INC := $(wildcard $(CAL)/calib_run_p*.inc.c)
+VFWD_INC := $(wildcard $(CAL)/validate_fwd_p*.inc.c)
+DSQFWD_INC := $(wildcard $(AMP)/ds4quant_fwd_p*.inc.c)
+AMPSOLVE_INC := $(wildcard $(AMP)/amp_solve_p*.inc.c)
+TRAJ_INC := $(wildcard $(CAL)/traj_analyze_p*.inc.c)
+HFREAD_INC := $(wildcard $(CAL)/hf_read_p*.inc.c)
+VQMERGE_INC := $(wildcard $(QZ)/vq_merge_v4_p*.inc.c)
+ZLAYER_INC := $(wildcard $(AMP)/zlayer_p*.inc.c)
+DSQRUN_INC := $(wildcard $(AMP)/ds4quant_run_p*.inc.c)
+
 ifeq ($(UNAME_S),Darwin)
 NATIVE ?= -mcpu=native
 HAVE_BLAS := 1
@@ -123,17 +143,17 @@ everything: all amp legacy calib bench
 # 否则 GPU 与 CPU 差最后一个 ulp, 逐字节对拍必挂(见原 build_dsq_gpu_spark.sh)。
 DSQ_SRC := $(QZ)/deepseek4-quantize.c $(QZ)/quants.c $(QZ)/onebit_quant.c
 ifeq ($(UNAME_S)-$(CUDA),Linux-1)
-deepseek4-quantize: $(DSQ_SRC) $(QZ)/quants.h $(QZ)/onebit_quant.h $(QZ)/quantize_gpu.cu
+deepseek4-quantize: $(DSQ_SRC) $(QUANTS_INC) $(DSQMAIN_INC) $(QZ)/quants.h $(QZ)/onebit_quant.h $(QZ)/quantize_gpu.cu
 	$(NVCC) -O3 -arch=native -fmad=false -c $(QZ)/quantize_gpu.cu -o $(QZ)/quantize_gpu.o
 	$(CC) $(CFLAGS) $(NATIVE) $(CPPFLAGS) $(INC) -DDS4Q_CUDA -o $@ $(DSQ_SRC) $(QZ)/quantize_gpu.o \
 	    $(CUDA_LIBS) -lm -pthread
 else
-deepseek4-quantize: $(DSQ_SRC) $(QZ)/quants.h $(QZ)/onebit_quant.h
+deepseek4-quantize: $(DSQ_SRC) $(QUANTS_INC) $(DSQMAIN_INC) $(QZ)/quants.h $(QZ)/onebit_quant.h
 	$(CC) $(CFLAGS) $(NATIVE) $(CPPFLAGS) $(INC) -o $@ $(DSQ_SRC) -lm -pthread
 endif
 
 # 纯 CPU 参照(对拍用, Linux; Mac 上本来就是 CPU 版)
-deepseek4-quantize-cpu: $(DSQ_SRC)
+deepseek4-quantize-cpu: $(DSQ_SRC) $(QUANTS_INC) $(DSQMAIN_INC)
 	$(CC) $(CFLAGS) $(NATIVE) $(CPPFLAGS) $(INC) -o $@ $(DSQ_SRC) -lm -pthread
 
 anchor_metrics: $(BEN)/anchor_metrics
@@ -151,7 +171,7 @@ $(QT)/compare_scores: $(QT)/compare_scores.c
 DSQR_FLAGS := $(BARE) $(NATIVE) -Wall -Wno-unused-parameter -Wno-unused-function -I..
 ifeq ($(UNAME_S),Darwin)
 ds4quant_run: $(AMP)/ds4quant_run
-$(AMP)/ds4quant_run: $(AMP)/ds4quant_run.c $(AMP)/ds4quant_fwd.c $(QZ)/onebit_quant.c \
+$(AMP)/ds4quant_run: $(AMP)/ds4quant_run.c $(DSQRUN_INC) $(AMP)/ds4quant_fwd.c $(DSQFWD_INC) $(QZ)/onebit_quant.c \
                      $(AMP)/ds4quant_qhelp.h $(QZ)/go2b_qc.h $(QZ)/vq_qc.h
 	$(CC) $(DSQR_FLAGS) -o $@ $(AMP)/ds4quant_run.c $(BLAS_LIBS) -lm -lpthread
 else
@@ -159,13 +179,13 @@ ifeq ($(CUDA),1)
 $(QZ)/vq_gpu.o: $(QZ)/vq_gpu.cu
 	$(NVCC) -O3 -arch=native -c $< -o $@
 ds4quant_run: $(AMP)/ds4quant_run
-$(AMP)/ds4quant_run: $(AMP)/ds4quant_run.c $(QZ)/vq_gpu.o
+$(AMP)/ds4quant_run: $(AMP)/ds4quant_run.c $(DSQRUN_INC) $(QZ)/vq_gpu.o
 	$(CC) $(DSQR_FLAGS) $(if $(filter 1,$(HAVE_BLAS)),-DDQ_BLAS -DDS4QUANT_OPENBLAS $(BLAS_CFLAGS)) \
 	    -DDS4QUANT_CUDA -I$(CUDA_HOME)/include -o $@ $(AMP)/ds4quant_run.c $(QZ)/vq_gpu.o \
 	    $(CUDA_LIBS) -lcublas $(BLAS_LIBS) -lm -lpthread
 else
 ds4quant_run: $(AMP)/ds4quant_run
-$(AMP)/ds4quant_run: $(AMP)/ds4quant_run.c
+$(AMP)/ds4quant_run: $(AMP)/ds4quant_run.c $(DSQRUN_INC)
 	$(CC) $(DSQR_FLAGS) $(if $(filter 1,$(HAVE_BLAS)),-DDQ_BLAS -DDS4QUANT_OPENBLAS $(BLAS_CFLAGS)) \
 	    -o $@ $(AMP)/ds4quant_run.c $(BLAS_LIBS) -lm -lpthread
 endif
@@ -176,7 +196,7 @@ endif
 # zlayer_gpu.o(cuBLAS 薄封装, GPU 缺时运行时自动回落 CPU 路)。
 zlayer: $(AMP)/zlayer
 ifeq ($(UNAME_S),Darwin)
-$(AMP)/zlayer: $(AMP)/zlayer.c ../src/common/ds4_quantfmt.c ../src/common/ds4_gguf.c
+$(AMP)/zlayer: $(AMP)/zlayer.c $(ZLAYER_INC) ../src/common/ds4_quantfmt.c ../src/common/ds4_gguf.c
 	$(CC) $(BARE) $(NATIVE) -DDQ_BLAS -o $@ $(AMP)/zlayer.c $(BLAS_LIBS) -lm -lpthread
 else
 ifeq ($(HAVE_BLAS),0)
@@ -186,11 +206,11 @@ else
 ifeq ($(CUDA),1)
 $(AMP)/zlayer_gpu.o: $(AMP)/zlayer_gpu.cu
 	$(NVCC) -O3 -arch=native -c $< -o $@
-$(AMP)/zlayer: $(AMP)/zlayer.c $(AMP)/zlayer_gpu.o ../src/common/ds4_quantfmt.c ../src/common/ds4_gguf.c
+$(AMP)/zlayer: $(AMP)/zlayer.c $(ZLAYER_INC) $(AMP)/zlayer_gpu.o ../src/common/ds4_quantfmt.c ../src/common/ds4_gguf.c
 	$(CC) $(BARE) $(NATIVE) -DDQ_BLAS $(BLAS_CFLAGS) -DZL_CUDA -o $@ $(AMP)/zlayer.c \
 	    $(AMP)/zlayer_gpu.o $(BLAS_LIBS) -L$(CUDA_HOME)/lib64 -lcublas -lcudart -lstdc++ -lm -lpthread
 else
-$(AMP)/zlayer: $(AMP)/zlayer.c ../src/common/ds4_quantfmt.c ../src/common/ds4_gguf.c
+$(AMP)/zlayer: $(AMP)/zlayer.c $(ZLAYER_INC) ../src/common/ds4_quantfmt.c ../src/common/ds4_gguf.c
 	$(CC) $(BARE) $(NATIVE) -DDQ_BLAS $(BLAS_CFLAGS) -o $@ $(AMP)/zlayer.c $(BLAS_LIBS) -lm -lpthread
 endif
 endif
@@ -200,7 +220,7 @@ endif
 # (vqpipe/vqge/amp_campaign 按 $GT/<name> 找)。
 amp_solve: amp_solve.bin
 .PHONY: amp_solve.bin
-amp_solve.bin: $(AMP)/amp_solve.c $(CAL)/npy.c
+amp_solve.bin: $(AMP)/amp_solve.c $(AMPSOLVE_INC) $(CAL)/npy.c
 	$(CC) $(BARE) $(NATIVE) -I$(CAL) -o amp_solve $(AMP)/amp_solve.c $(CAL)/npy.c -lm -lpthread
 
 zchain_merge: zchain_merge.bin
@@ -228,7 +248,7 @@ $(AMP)/route_bias_rebake: $(AMP)/route_bias_rebake.c
 
 emit_z: emit_z.bin
 .PHONY: emit_z.bin
-emit_z.bin: $(AMP)/emit_z.c
+emit_z.bin: $(AMP)/emit_z.c $(EMITZ_INC)
 	$(CC) -O3 -Wall -std=c99 -o emit_z $<
 
 teacher_routed: teacher_routed.bin
@@ -278,8 +298,10 @@ endif
 
 emit_residual: emit_residual.bin
 .PHONY: emit_residual.bin
-emit_residual.bin: $(SLV)/emit_residual.c $(CAL)/hf_read.c $(QZ)/onebit_quant.c $(CAL)/npy.c
-	$(CC) $(CFLAGS) $(NATIVE) $(CPPFLAGS) $(INC) -o emit_residual $^ -lm -pthread
+# 源列表显式化: 原配方用 $^ 当源, 加 *.inc.c 依赖后 $^ 会把分片当独立 TU 编译, 必须分开。
+EMITRES_SRC := $(SLV)/emit_residual.c $(CAL)/hf_read.c $(QZ)/onebit_quant.c $(CAL)/npy.c
+emit_residual.bin: $(EMITRES_SRC) $(HFREAD_INC)
+	$(CC) $(CFLAGS) $(NATIVE) $(CPPFLAGS) $(INC) -o emit_residual $(EMITRES_SRC) -lm -pthread
 
 corr_stats: $(SLV)/corr_stats
 $(SLV)/corr_stats: $(SLV)/corr_stats.c
@@ -300,25 +322,27 @@ calib_run: calib_run.bin
 CALIB_RUN_SRC := $(CAL)/calib_run.c $(CAL)/npy.c $(CAL)/hf_read.c $(QZ)/onebit_quant.c \
     $(CAL)/layer_probe.c $(AMP)/hiddenvar_solve.c $(SLV)/solve_perexpert.c $(SLV)/solve_denoise.c \
     $(SLV)/solve_genrf.c $(AMP)/solve_rrr.c $(AMP)/linalg_small.c
-calib_run.bin: $(CALIB_RUN_SRC)
+calib_run.bin: $(CALIB_RUN_SRC) $(CALIBRUN_INC) $(HVSOLVE_INC) $(RRR_INC) $(HFREAD_INC)
 	$(CC) $(CFLAGS) $(NATIVE) $(CPPFLAGS) $(INC) -o calib_run $(CALIB_RUN_SRC) -lm -pthread
 
 calib_diag: calib_diag.bin
 .PHONY: calib_diag.bin
 CALIB_DIAG_SRC := $(CAL)/calib_diag.c $(CAL)/npy.c $(CAL)/hf_read.c $(QZ)/onebit_quant.c \
     $(CAL)/layer_probe.c $(AMP)/hiddenvar_solve.c $(AMP)/linalg_small.c
-calib_diag.bin: $(CALIB_DIAG_SRC)
+calib_diag.bin: $(CALIB_DIAG_SRC) $(CALIBDIAG_INC) $(HVSOLVE_INC) $(HFREAD_INC)
 	$(CC) $(CFLAGS) $(NATIVE) $(CPPFLAGS) $(INC) -o calib_diag $(CALIB_DIAG_SRC) -lm -pthread
 
 validate_fwd: $(CAL)/validate_fwd
 VFWD_SRC := $(CAL)/validate_fwd.c $(CAL)/npy.c $(CAL)/hf_read.c $(CAL)/layer_probe.c \
     $(QZ)/onebit_quant.c $(SLV)/solve_denoise.c $(SLV)/solve_genrf.c $(AMP)/linalg_small.c
-$(CAL)/validate_fwd: $(VFWD_SRC)
+$(CAL)/validate_fwd: $(VFWD_SRC) $(VFWD_INC) $(HFREAD_INC)
 	$(CC) $(CFLAGS) $(NATIVE) $(CPPFLAGS) $(INC) -o $@ $(VFWD_SRC) -lm -pthread
 
 traj_analyze: $(CAL)/traj_analyze
-$(CAL)/traj_analyze: $(CAL)/traj_analyze.c $(CAL)/npy.c $(AMP)/linalg_small.c
-	$(CC) $(BARE) $(NATIVE) -I$(CAL) -I$(AMP) -o $@ $^ -lm -lpthread
+# 源列表显式化: 原配方用 $^ 当源, 加 *.inc.c 依赖后 $^ 会把分片当独立 TU 编译, 必须分开。
+TRAJ_SRC := $(CAL)/traj_analyze.c $(CAL)/npy.c $(AMP)/linalg_small.c
+$(CAL)/traj_analyze: $(TRAJ_SRC) $(TRAJ_INC)
+	$(CC) $(BARE) $(NATIVE) -I$(CAL) -I$(AMP) -o $@ $(TRAJ_SRC) -lm -lpthread
 
 cap_raw2npy: cap_raw2npy.bin
 .PHONY: cap_raw2npy.bin
@@ -346,15 +370,15 @@ $(BEN)/rec_fidelity: $(BEN)/rec_fidelity.c
 	$(CC) $(BARE) $(NATIVE) -o $@ $< -lm -lpthread
 
 pubbench: $(BEN)/pubbench
-$(BEN)/pubbench: $(BEN)/pubbench.c
+$(BEN)/pubbench: $(BEN)/pubbench.c $(PUBBENCH_INC)
 	$(CC) $(BARE) $(NATIVE) -o $@ $< $(CURL_FLAGS) -lz -lm -lpthread
 
 pubbench_extract_test: $(BEN)/gates/pubbench_extract_test
-$(BEN)/gates/pubbench_extract_test: $(BEN)/gates/pubbench_extract_test.c $(BEN)/pubbench.c
+$(BEN)/gates/pubbench_extract_test: $(BEN)/gates/pubbench_extract_test.c $(BEN)/pubbench.c $(PUBBENCH_INC)
 	$(CC) $(BARE) -o $@ $(BEN)/gates/pubbench_extract_test.c $(CURL_FLAGS) -lz -lm -lpthread
 
 vq_merge_v4: $(QZ)/vq_merge_v4
-$(QZ)/vq_merge_v4: $(QZ)/vq_merge_v4.c
+$(QZ)/vq_merge_v4: $(QZ)/vq_merge_v4.c $(VQMERGE_INC)
 	$(CC) $(BARE) $(NATIVE) -o $@ $< -lm
 
 go2b_parity: $(QZ)/go2b_parity
@@ -362,7 +386,7 @@ $(QZ)/go2b_parity: $(QZ)/go2b_parity.c $(QZ)/onebit_quant.h $(QZ)/go2b_qc.h
 	$(CC) $(BARE) $(NATIVE) -ffast-math -I$(QZ) -o $@ $(QZ)/go2b_parity.c $(BLAS_LIBS) -lm -lpthread
 
 vq2q2k_probe: $(QZ)/vq2q2k_probe
-$(QZ)/vq2q2k_probe: $(QZ)/vq2q2k_probe.c $(QZ)/quants.c $(QZ)/onebit_quant.c
+$(QZ)/vq2q2k_probe: $(QZ)/vq2q2k_probe.c $(QZ)/quants.c $(QUANTS_INC) $(QZ)/onebit_quant.c
 	$(CC) $(BARE) $(NATIVE) -o $@ $(QZ)/vq2q2k_probe.c $(QZ)/quants.c $(QZ)/onebit_quant.c -lm -lpthread
 
 # vq_em: GPU-EM 码本精修, Linux+CUDA 专属(st_bridge.c 桥接 st_read)。
