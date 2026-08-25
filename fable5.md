@@ -6655,3 +6655,32 @@ ds4_unit 全绿。linecount 守卫扩至全仓(含 gguf-tools), 豁免仅 vendor
 终态树(含批6)重编 cuda-spark 全链 0 error; cuda-regression 复跑 0.053s 过;
 真模型探针(allq2, --temp 0 -n 24)输出文本与批6 前逐字符相同
 ("1. The user asks..."), prefill 15.45 / gen 36.16 t/s。重构战役收官。
+
+## 2026-08-25 夜 r64c 战役: 重构树上重跑"半语料 VQ + 反修放大器"全链(用户令: 开源小语料切半/本机改码/同步 spark/合并/加载放大器/五指标)
+
+**语料与配方(零改动, 全沿用已裁决口径)**: calibration_datav5.txt(开源全场景 411k token)
+256-token 块交错切半零重叠; 量化半→平权 vq4x512 2.25bpw ×43(S=8192); 放大器半→干净
+FP 锚 anchor_a_clean_s8192 + zlayer 全家 + 行掩码 + NTOK8192 + K=64(已兑现最优配方)。
+
+**spark 正式切 restructure(重构待办①收官)**: 旧树 543 脏文件 git stash 保全
+(~/spark_pre_restructure_status.txt + stash), 7 个 untracked 碰撞文件移
+~/spark_pre_restructure_bak; checkout restructure + make clean 全量重编。判决尺
+ds4quant_run.old(08-22 冻结)从旧路径复制进 gguf-tools/amp/(判决链二进制钉死不变)。
+Mac↔spark 同步走 git push ssh(github 出站断; 推 restructure-in 中转分支再 ff 合并)。
+
+**重构树 spark 真编暴露 4 处 Mac 绿/Linux 断(全修, 3 commits)**:
+1. go2b_parity.c 无条件 include Accelerate 头 → zlayer 同款平台守卫 + 规则补 BLAS_CFLAGS;
+2. M_PI 在 -std=c11 严格模式无定义(Darwin 给 Linux 不给) → 兜底守卫铺满 5 个用点;
+3. 两处自测硬编码 Mac 会话 scratchpad 路径(重构交接账③: hiddenvar serializer/npy) → /tmp;
+4. (工程事故记录: git add -A 曾把 Mac 上 142M go-onebit 旧残留卷进提交, 已重写剔除)。
+修后 spark gguf-tools 全目标编译 0 error + tools-test 9 项全绿(含 CUDA vq_em)。
+
+**量化半产物复用依据(盘 67G 物理装不下第二份 82G 层件/90G 合并)**: vq86h_noz=干净层件
+基准(独立 inode 非硬链, mtime 08-23 08:07-08:18 = 合并 08:44 读取态, 0 zrec);
+vq86h/layers 合并后被注入污染(L00/01/03/04 zrec + dql_vq_L00/L20 漂移, mtime 18:58)
+——ds4-vq86h.gguf(87.0GB) 判定为干净量化态的合并产物, 复用成立。
+ids 两半各 8192 ✓, 干净锚 33,109,966,888 B 与期望字节精确一致 ✓。
+
+**发车(23:45)**: 裸判 caliper_ref.sh(noz, 对表 0.4706/78.36) ∥ amp_clean_full.sh
+amp_r64c "" 64(工作区全清重头跑, zlayer 43 层注入态 → caliper 五指标, 对表 0.43410)。
+五指标终判与引擎 --zchain 加载 smoke 结果待续。
