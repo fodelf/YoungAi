@@ -250,12 +250,19 @@ else
 	$(NVCC) $(NVCCFLAGS) -o $@ ds4_test.o ds4_kvstore.o rax.o $(CORE_OBJS) $(CUDA_LDLIBS)
 endif
 
-test: ds4_test ds4-eval
+# src/common 共享格式库单测: 无模型/无 GPU, 纯主机 C。夹具路径相对仓库根。
+ds4_unit: tests/unit/test_common.c src/common/ds4_quantfmt.c src/common/ds4_gguf.c \
+          src/common/ds4_quantfmt.h src/common/ds4_gguf.h src/common/ds4_float.h src/common/ds4_fp8.h
+	$(CC) $(CFLAGS) -Isrc/common -o $@ tests/unit/test_common.c \
+	    src/common/ds4_quantfmt.c src/common/ds4_gguf.c $(LDLIBS)
+
+test: ds4_test ds4-eval ds4_unit
+	./ds4_unit
 	./ds4-eval --self-test-extractors
 	./ds4_test
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test e0-pingpong mm-ui mm-ocr *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_unit e0-pingpong mm-ui mm-ocr *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
 
 # Task 04 / E0: standalone thunderbolt ping-pong latency gate (no core deps, no
 # model). Defined after the default targets so it never becomes the default goal.
