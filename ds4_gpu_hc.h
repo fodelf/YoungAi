@@ -6,6 +6,10 @@
 
 #include "ds4_gpu_core.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* =========================================================================
  * Hyper-Connection Kernels.
  * =========================================================================
@@ -216,5 +220,9 @@ int ds4_gpu_zchain_route_bias(
         const ds4_gpu_tensor *x,
         uint32_t               layer,
         uint32_t               n_tokens);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

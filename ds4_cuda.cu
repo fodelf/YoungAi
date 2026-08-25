@@ -36,6 +36,12 @@ static unsigned ds4_grid_cap(void) {
  * 共用同一份解码, 保证三端逐位同义。 */
 #include "vq_fmt.h"
 
+/* GPU 契约头(子头带 extern "C" 守卫)。API 定义因此直接继承 C 链接与签名检查:
+ * 实现与契约不一致会在编译期报 conflicting declaration, 而不是静默的 ABI 错位。
+ * ds4_gpu_tensor 在契约里是 opaque typedef, 下面补上 CUDA 侧的具体定义;
+ * ds4_gpu_residual_set 直接用契约里的那一份(历史上这里手抄过一份镜像)。 */
+#include "ds4_gpu.h"
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -58,21 +64,6 @@ struct ds4_gpu_tensor {
     uint64_t bytes;
     int owner;
 };
-
-/* 这个 .cu 刻意不 include ds4_gpu.h(那是 C 头, 且 GPU 句柄类型两边各自实现),
- * 所以跨 ABI 的结构体必须在这里镜像一份。**字段必须与 ds4_gpu.h 逐字一致**,
- * 那边改了这里就得跟, 否则是静默的 ABI 错位而不是编译错误。
- * go1b 1-bit 残差专家权重集; CUDA 侧尚未实现残差(见 routed_moe 包装里的
- * (void)residual), 这里只为让签名对得上。 */
-typedef struct {
-    const void *gate_ptr;
-    const void *up_ptr;
-    const void *down_ptr;
-    const float *lut;
-    int merged2b;
-    int vq;
-    uint64_t vq_bytes;   /* mirror of ds4_gpu.h: DQVL blob bytes for arena relocation */
-} ds4_gpu_residual_set;
 
 typedef struct {
     uint8_t scales[CUDA_QK_K / 16];
@@ -162,7 +153,7 @@ static int g_q2k_shadow_n = 0;
 
 static int cuda_ok(cudaError_t err, const char *what);
 
-extern "C" int ds4_gpu_register_q2k_f16_shadow(
+int ds4_gpu_register_q2k_f16_shadow(
         const void *model_map, uint64_t model_size,
         uint64_t offset, uint64_t rows, uint64_t cols) {
     /* 装载期先于 ds4_gpu_init 到达也安全: cudaMalloc 隐式建 device-0 primary context。 */
@@ -811,7 +802,7 @@ static const cuda_q8r_entry *cuda_q8r_get(const void *model_map, uint64_t offset
     return &g_q8r_entries.back();
 }
 
-extern "C" int ds4_gpu_q8r_preload(const void *model_map, uint64_t model_size,
+int ds4_gpu_q8r_preload(const void *model_map, uint64_t model_size,
                                    uint64_t offset, uint64_t in_dim, uint64_t out_dim) {
     if (!model_map || in_dim == 0 || out_dim == 0 || (in_dim & 31u)) return 0;
     const uint64_t blocks = (in_dim + 31u) / 32u;
@@ -1477,7 +1468,7 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
     return 0;
 }
 
-extern "C" int ds4_gpu_init(void) {
+int ds4_gpu_init(void) {
     int dev = 0;
     if (!cuda_ok(cudaSetDevice(dev), "set device")) return 0;
     cudaDeviceProp prop;
@@ -1497,7 +1488,7 @@ extern "C" int ds4_gpu_init(void) {
     return 1;
 }
 
-extern "C" void ds4_gpu_cleanup(void) {
+void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
     if (g_cublas_ready) {
         (void)cublasDestroy(g_cublas);
@@ -1564,7 +1555,7 @@ extern "C" void ds4_gpu_cleanup(void) {
 
 __global__ static void fill_f32_kernel(float *x, uint64_t n, float v);
 
-extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
+ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     if (bytes == 0) bytes = 1;
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;
@@ -1577,7 +1568,7 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     return t;
 }
 
-extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
+ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
     if (bytes == 0) bytes = 1;
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;
@@ -1599,7 +1590,7 @@ static uint64_t cuda_managed_kv_reserve_bytes(uint64_t total_bytes) {
     return reserve;
 }
 
-extern "C" int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes) {
+int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes) {
     if (kv_cache_bytes == 0) return 0;
 
     /* Very large KV caches are where device-only cudaMalloc() can make a
@@ -1626,7 +1617,7 @@ extern "C" int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint
     return free_bytes - context_bytes < reserve_bytes;
 }
 
-extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes) {
+ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes) {
     if (!base || offset > base->bytes || bytes > base->bytes - offset) return NULL;
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;
@@ -1636,40 +1627,40 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint6
     return t;
 }
 
-extern "C" void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
+void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
     if (!tensor) return;
     if (tensor->owner && tensor->ptr) (void)cudaFree(tensor->ptr);
     free(tensor);
 }
 
-extern "C" uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor) {
+uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor) {
     return tensor ? tensor->bytes : 0;
 }
 
-extern "C" void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
+void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
     if (!tensor) return NULL;
     (void)cudaDeviceSynchronize();
     return tensor->ptr;
 }
 
-extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count) {
+int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count) {
     if (!tensor || count > tensor->bytes / sizeof(float)) return 0;
     if (count == 0) return 1;
     fill_f32_kernel<<<(count + 255u) / 256u, 256>>>((float *)tensor->ptr, count, value);
     return cuda_ok(cudaGetLastError(), "tensor fill f32 launch");
 }
 
-extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
+int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     return cuda_ok(cudaMemcpy((char *)tensor->ptr + offset, data, (size_t)bytes, cudaMemcpyHostToDevice), "tensor write");
 }
 
-extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
+int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     return cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes, cudaMemcpyDeviceToHost), "tensor read");
 }
 
-extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
+int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                      const ds4_gpu_tensor *src, uint64_t src_offset,
                                      uint64_t bytes) {
     if (!dst || !src || dst_offset > dst->bytes || src_offset > src->bytes ||
@@ -1729,7 +1720,7 @@ static void side_stream_ensure(void) {
     }
 }
 
-extern "C" int ds4_gpu_side_mark(void) {
+int ds4_gpu_side_mark(void) {
     if (((const char *)0) /* DS4_NO_SIDE_STREAM: 路径开关已删(2026-08-22 隐形炸弹清理) */) return 0;   /* 二分诊断: 关闭双流并发 */
     if (!g_side_stream || !g_side_fork_ev) {
         cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
@@ -1744,7 +1735,7 @@ extern "C" int ds4_gpu_side_mark(void) {
     return 1;
 }
 
-extern "C" int ds4_gpu_side_begin(void) {
+int ds4_gpu_side_begin(void) {
     if (!g_side_stream || !g_side_fork_ev) return 0;
     if (cudaStreamWaitEvent(g_side_stream, g_side_fork_ev, 0) != cudaSuccess) {
         (void)cudaGetLastError(); return 0;
@@ -1755,12 +1746,12 @@ extern "C" int ds4_gpu_side_begin(void) {
 }
 
 /* 切回主流但保持 fork(侧流尾未 join): comp 链发完后主流继续 indexer/attention */
-extern "C" int ds4_gpu_side_main(void) {
+int ds4_gpu_side_main(void) {
     g_cur_stream = 0;
     return 1;
 }
 
-extern "C" int ds4_gpu_side_join(void) {
+int ds4_gpu_side_join(void) {
     g_cur_stream = 0;
     if (!g_side_active) return 1;
     g_side_active = 0;
@@ -1911,7 +1902,7 @@ __global__ static void dspark_confidence_kernel(
     if (threadIdx.x == 0) out_conf[p] = 1.0f / (1.0f + __expf(-part[0]));
 }
 
-extern "C" int ds4_gpu_dspark_confidence_tensor(
+int ds4_gpu_dspark_confidence_tensor(
         ds4_gpu_tensor *out_conf,
         const ds4_gpu_tensor *x,
         const void *model_map, uint64_t model_size,
@@ -1998,7 +1989,7 @@ __global__ static void dspark_argmax_kernel(int32_t *out_id, const float *logits
 }
 
 /* DSpark: 抓 target 层 HC 均值到 main_hidden[t][slot]; n_tokens 支持 batch prefill */
-extern "C" int ds4_gpu_dspark_hc_mean_tensor(
+int ds4_gpu_dspark_hc_mean_tensor(
         ds4_gpu_tensor *dst, const ds4_gpu_tensor *hc,
         uint32_t n_embd, uint32_t n_hc, uint32_t slot, uint32_t n_tokens) {
     if (!dst || !hc || n_embd == 0 || n_hc == 0 || slot >= 3u || n_tokens == 0) return 0;
@@ -2009,7 +2000,7 @@ extern "C" int ds4_gpu_dspark_hc_mean_tensor(
     return cuda_ok(cudaGetLastError(), "dspark hc mean launch");
 }
 
-extern "C" int ds4_gpu_dspark_attn_tensor(
+int ds4_gpu_dspark_attn_tensor(
         ds4_gpu_tensor *heads,
         const void *model_map, uint64_t model_size, uint64_t sinks_offset,
         const ds4_gpu_tensor *q, const ds4_gpu_tensor *win_kv, const ds4_gpu_tensor *blk_kv,
@@ -2028,7 +2019,7 @@ extern "C" int ds4_gpu_dspark_attn_tensor(
     return cuda_ok(cudaGetLastError(), "dspark attn launch");
 }
 
-extern "C" int ds4_gpu_dspark_win_scatter_tensor(
+int ds4_gpu_dspark_win_scatter_tensor(
         ds4_gpu_tensor *win, const ds4_gpu_tensor *rows,
         uint32_t n, uint32_t pos0, uint32_t win_rows, uint32_t dim) {
     if (!win || !rows || n == 0 || win_rows == 0 || dim == 0) return 0;
@@ -2041,7 +2032,7 @@ extern "C" int ds4_gpu_dspark_win_scatter_tensor(
 
 
 /* markov 一步: logits 行原地加 bias(w2@w1[prev]) 并 argmax → out_id(device int32) */
-extern "C" int ds4_gpu_dspark_markov_step_tensor(
+int ds4_gpu_dspark_markov_step_tensor(
         ds4_gpu_tensor *out_id, ds4_gpu_tensor *logits_row,
         const void *model_map, uint64_t model_size,
         uint64_t w1_offset, uint64_t w2_offset,
@@ -2062,7 +2053,7 @@ extern "C" int ds4_gpu_dspark_markov_step_tensor(
     return cuda_ok(cudaGetLastError(), "dspark markov launch");
 }
 
-extern "C" int ds4_gpu_dspark_argmax_only_tensor(ds4_gpu_tensor *out_id,
+int ds4_gpu_dspark_argmax_only_tensor(ds4_gpu_tensor *out_id,
                                                  const ds4_gpu_tensor *logits_row, uint32_t vocab) {
     if (!out_id || !logits_row || vocab == 0) return 0;
     dspark_argmax_kernel<<<1, 256, 0, g_cur_stream>>>(
@@ -2116,12 +2107,12 @@ static int tok_graph_finalize_slot(cudaGraph_t graph, int slot) {
 /* GPU 跨度计时(2026-08-21 verify 归因): 事件对夹住一段, end 返回 GPU 侧毫秒。
  * 与 host 计时对照即可分离"GPU 真忙" vs "CPU 编码/背压阻塞"。 */
 static cudaEvent_t g_span_a = NULL, g_span_b = NULL;
-extern "C" void ds4_gpu_span_begin(void) {
+void ds4_gpu_span_begin(void) {
     if (!g_span_a) { if (cudaEventCreate(&g_span_a) != cudaSuccess) { g_span_a = NULL; return; } }
     if (!g_span_b) { if (cudaEventCreate(&g_span_b) != cudaSuccess) { g_span_b = NULL; return; } }
     (void)cudaEventRecord(g_span_a, cudaStreamPerThread);
 }
-extern "C" float ds4_gpu_span_end(void) {
+float ds4_gpu_span_end(void) {
     if (!g_span_a || !g_span_b) return -1.0f;
     if (cudaEventRecord(g_span_b, cudaStreamPerThread) != cudaSuccess) return -1.0f;
     if (cudaEventSynchronize(g_span_b) != cudaSuccess) return -1.0f;
@@ -2138,7 +2129,7 @@ static cudaGraphExec_t g_bat_execs[4] = {NULL, NULL, NULL, NULL};
 static int g_bat_graph_on = -1;
 static int g_bat_slot = -1;
 
-extern "C" int ds4_gpu_batch_graph_begin(int slot) {
+int ds4_gpu_batch_graph_begin(int slot) {
     /* 默认关(2026-08-21 A/B): verify 64.9 vs 65.6 = 噪声内。批 kernel 比 decode 大 3x,
      * launch 开销占比小 => 图收益消失; 31% 空转是 kernel 间排空(ramp/drain)不是发射延迟。 */
     if (g_bat_graph_on < 0) g_bat_graph_on = ((const char *)0) /* DS4_CUDA_BATCH_GRAPH: 路径开关已删(2026-08-22 隐形炸弹清理) */ ? 1 : 0;
@@ -2155,7 +2146,7 @@ extern "C" int ds4_gpu_batch_graph_begin(int slot) {
     return 1;
 }
 
-extern "C" int ds4_gpu_batch_graph_end_launch(int encode_ok) {
+int ds4_gpu_batch_graph_end_launch(int encode_ok) {
     if (g_bat_slot < 0) return 0;
     const int slot = g_bat_slot;
     g_bat_slot = -1;
@@ -2207,7 +2198,7 @@ __global__ static void sanitize_router_kernel(int32_t *sel, float *w, uint32_t n
     if (e < 0 || (uint32_t)e >= n_expert) { sel[i] = 0; if (w) w[i] = 0.0f; }
 }
 
-extern "C" int ds4_gpu_sanitize_router_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
+int ds4_gpu_sanitize_router_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
                                               uint32_t n_pairs, uint32_t n_total_expert) {
     if (!selected || n_pairs == 0) return 0;
     sanitize_router_kernel<<<(n_pairs + 255u) / 256u, 256, 0, g_cur_stream>>>(
@@ -2226,15 +2217,15 @@ __global__ static void sanitize_finite_kernel(float *x, uint64_t n) {
  * blk0 干净输入也能出 10 个 NaN 维, 新旧两条 MoE kernel 同现 ⇒ 既有问题不是本轮改动)。
  * NaN 一旦落到锚位就整轮草稿作废(acc 塌到 1.00 的间歇故障)。这里在每块出口清洗,
  * 代价 = B×hc_dim 一次写。 */
-extern "C" int ds4_gpu_sanitize_finite_tensor(ds4_gpu_tensor *t, uint64_t n_float) {
+int ds4_gpu_sanitize_finite_tensor(ds4_gpu_tensor *t, uint64_t n_float) {
     if (!t || n_float == 0 || t->bytes < n_float * sizeof(float)) return 0;
     sanitize_finite_kernel<<<(unsigned)((n_float + 255u) / 256u), 256, 0, g_cur_stream>>>(
         (float *)t->ptr, n_float);
     return cuda_ok(cudaGetLastError(), "sanitize finite");
 }
 
-extern "C" void ds4_gpu_token_graph_set_pos(uint32_t pos) { g_tok_launch_pos = pos; }
-extern "C" int ds4_gpu_token_graph_begin(void) {
+void ds4_gpu_token_graph_set_pos(uint32_t pos) { g_tok_launch_pos = pos; }
+int ds4_gpu_token_graph_begin(void) {
     if (g_tok_graph_on < 0)
         /* ★decode token graph 整族关闭(2026-08-22 实测判定)★
          * 图在建图那次算对, 之后重放时逐 token 变化的注意力范围参数(KV 行数/raw 窗口起点/
@@ -2257,7 +2248,7 @@ extern "C" int ds4_gpu_token_graph_begin(void) {
     return 1;
 }
 
-extern "C" int ds4_gpu_token_graph_end_launch(void) {
+int ds4_gpu_token_graph_end_launch(void) {
     if (!g_tok_graph_on) return 0;
     cudaGraph_t graph = NULL;
     if (cudaStreamEndCapture(cudaStreamPerThread, &graph) != cudaSuccess || !graph) {
@@ -2286,7 +2277,7 @@ extern "C" int ds4_gpu_token_graph_end_launch(void) {
 }
 
 /* 命中预编码: 写参数槽后直接发射, encode 零成本。返回 1=已发射。 */
-extern "C" int ds4_gpu_token_graph_try_pending(int token, uint32_t pos, int need_logits) {
+int ds4_gpu_token_graph_try_pending(int token, uint32_t pos, int need_logits) {
     if (((const char *)0) /* DS4_TOK_GRAPH_DEBUG: 诊断开关已删(2026-08-22) */ && (g_tok_graph_on <= 0 || g_tok_pending < 0 ||
         g_tok_pending_pos != pos || g_tok_pending_logits != need_logits ||
         !g_tok_execs[g_tok_pending < 0 ? 0 : g_tok_pending]))
@@ -2308,7 +2299,7 @@ extern "C" int ds4_gpu_token_graph_try_pending(int token, uint32_t pos, int need
     return 1;
 }
 
-extern "C" int ds4_gpu_token_graph_precapture_begin(void) {
+int ds4_gpu_token_graph_precapture_begin(void) {
     if (g_tok_graph_on <= 0 || !g_tok_id_dev || !g_tok_id_host) {
         if (((const char *)0) /* DS4_TOK_GRAPH_DEBUG: 诊断开关已删(2026-08-22) */)
             fprintf(stderr, "[tokdbg] precap-skip: on=%d id_dev=%d id_host=%d\n",
@@ -2328,7 +2319,7 @@ static double tokdbg_now(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6;
 }
-extern "C" int ds4_gpu_token_graph_precapture_end(uint32_t pos, int need_logits, int encode_ok) {
+int ds4_gpu_token_graph_precapture_end(uint32_t pos, int need_logits, int encode_ok) {
     const int dbg = ((const char *)0) /* DS4_TOK_GRAPH_DEBUG: 诊断开关已删(2026-08-22) */ != NULL;
     const double td0 = dbg ? tokdbg_now() : 0.0;
     cudaGraph_t graph = NULL;
@@ -2365,8 +2356,8 @@ extern "C" int ds4_gpu_token_graph_precapture_end(uint32_t pos, int need_logits,
     return 1;
 }
 
-extern "C" int ds4_gpu_begin_commands(void) { return 1; }
-extern "C" int ds4_gpu_flush_commands(void) {
+int ds4_gpu_begin_commands(void) { return 1; }
+int ds4_gpu_flush_commands(void) {
     /* 在 token-graph capture 期间, flush(全设备同步)既非法也无意义 —— 图作为整体
      * 执行, 中途没有 host 可见状态。capture 态直接成功返回。 */
     cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
@@ -2377,25 +2368,25 @@ extern "C" int ds4_gpu_flush_commands(void) {
     (void)cudaGetLastError();
     return cuda_ok(cudaDeviceSynchronize(), "flush");
 }
-extern "C" int ds4_gpu_end_commands(void) {
+int ds4_gpu_end_commands(void) {
     /* capture 期间全设备同步既非法也无意义(图整体执行), 直接成功返回。 */
     cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
     if (cudaStreamIsCapturing(cudaStreamPerThread, &cs) == cudaSuccess &&
         cs == cudaStreamCaptureStatusActive) return 1;
     return cuda_ok(cudaDeviceSynchronize(), "end commands");
 }
-extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
+int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
 /* TP rendezvous: CUDA has no MTLSharedEvent fast path, but ds4_gpu_flush_commands
  * already does a full device sync, so by the time the host waits the results are
  * visible. signal returns a nonzero token; host_wait is a no-op success. */
-extern "C" uint64_t ds4_gpu_tp_signal_after_batch(void) { return 1; }
-extern "C" int ds4_gpu_tp_host_wait(uint64_t value) { (void)value; return 1; }
+uint64_t ds4_gpu_tp_signal_after_batch(void) { return 1; }
+int ds4_gpu_tp_host_wait(uint64_t value) { (void)value; return 1; }
 
 /* 副模型 map 注册(2026-08-21 draft 5x 慢根因): 主模型整文件 cudaHostRegister 后,
  * cuda_model_ptr 对"非主 base"退回裸 host 指针 —— 未注册路径在 GB10 上按缺页走,
  * drafter FFN 实测 12ms/层 vs verify 2.3ms/层。这里把副 map(DS4_DRAFT_GGUF)整体注册
  * 并挂进 g_model_ranges, 让 range 查找先命中 ⇒ 与主模型同速。 */
-extern "C" int ds4_gpu_register_aux_model_map(const void *map, uint64_t size) {
+int ds4_gpu_register_aux_model_map(const void *map, uint64_t size) {
     if (!map || size == 0) return 0;
     for (const cuda_model_range &r : g_model_ranges)
         if (r.host_base == map && r.offset == 0 && r.bytes >= size) return 1;
@@ -2434,7 +2425,7 @@ extern "C" int ds4_gpu_register_aux_model_map(const void *map, uint64_t size) {
     return 1;
 }
 
-extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
+int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return 0;
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
     cuda_model_range_release_all();
@@ -2517,14 +2508,14 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
 
 /* Metal-only residency hint (see ds4_gpu.h); CUDA uses an HBM-cache model and
  * ignores it. No-op so the shared core links against either backend. */
-extern "C" void ds4_gpu_set_model_map_nonresident_hint(int on) { (void)on; }
+void ds4_gpu_set_model_map_nonresident_hint(int on) { (void)on; }
 
 /* Dynamic resident/offload route (ds4_gpu.h) is a Metal unified-memory concept;
  * CUDA manages residency via its HBM weight cache. Accept the host verdict as a
  * no-op and report no working-set ceiling so the AUTO path falls back to the
  * explicit DS4_MEM_BUDGET_MB (or resident) without a spurious offload. */
-extern "C" void ds4_gpu_set_expert_offload(int enabled) { (void)enabled; }
-extern "C" uint64_t ds4_gpu_recommended_max_working_set_bytes(void) { return 0; }
+void ds4_gpu_set_expert_offload(int enabled) { (void)enabled; }
+uint64_t ds4_gpu_recommended_max_working_set_bytes(void) { return 0; }
 
 /* ---- 共享核心无条件调用、但只有 Metal 实现过的接口 ----
  * ds4.o / ds4_distributed.o 对两个后端只编译一份, 所以 CUDA 必须给出符号
@@ -2535,7 +2526,7 @@ extern "C" uint64_t ds4_gpu_recommended_max_working_set_bytes(void) { return 0; 
 /* 内存看门狗的 GPU 用量读数。CUDA 没有 Metal 那种 per-device allocated 计数,
  * 改用 driver 的 total-free: 它含其他进程和 context 开销, 对看门狗真正关心的
  * "这张卡现在还剩多少" 反而比纯自家分配量更准。 */
-extern "C" uint64_t ds4_gpu_current_allocated_bytes(void) {
+uint64_t ds4_gpu_current_allocated_bytes(void) {
     size_t free_b = 0, total_b = 0;
     if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
         (void)cudaGetLastError();
@@ -2549,12 +2540,12 @@ extern "C" uint64_t ds4_gpu_current_allocated_bytes(void) {
  * 残差(见 routed_moe 包装里的 (void)residual), 从不重映射, 所以没有快照可留 ——
  * 返回 NULL, 调用点(ds4.c 的 `if (!corr_sel) corr_sel = g->router_selected`)
  * 退回活的 selected, 而那正是 CUDA 路径下它此刻的正确值。 */
-extern "C" ds4_gpu_tensor *ds4_gpu_corr_saved_selected(void) { return NULL; }
+ds4_gpu_tensor *ds4_gpu_corr_saved_selected(void) { return NULL; }
 
 /* TP(tensor-parallel) 的 shared-FFN down 行切片: 为"两台 16G Mac 拆一个单机装不
  * 下的模型"设计, 算完半个 out_dim 再跨机 all-reduce。CUDA 侧走单机整模型, 没有
  * 对端可 all-reduce, 也不需要拆。返回 0 => 调用点 ok=false, 不进 TP 分支。 */
-extern "C" int ds4_gpu_matmul_q8_0_rowslice_tensor(
+int ds4_gpu_matmul_q8_0_rowslice_tensor(
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint64_t in_dim_full, uint64_t in_dim_slice,
         uint64_t out_dim, const ds4_gpu_tensor *x) {
@@ -2567,11 +2558,11 @@ extern "C" int ds4_gpu_matmul_q8_0_rowslice_tensor(
  * MoE kernel 没有 keep-map 支持。返回 0 让 model_open 在上传 LUT 时 ds4_die 退出:
  * 这是要的行为 —— 与其拿未翻译的 id 去索引裁剪后的专家张量、静默算出一堆数字汤,
  * 不如在加载期就拒绝。全量模型(无 keep-map)两个函数都不会被调到。 */
-extern "C" int ds4_gpu_set_expert_keep_lut(const int16_t *lut, uint32_t n_layer) {
+int ds4_gpu_set_expert_keep_lut(const int16_t *lut, uint32_t n_layer) {
     (void)lut; (void)n_layer;
     return 0;
 }
-extern "C" int ds4_gpu_translate_expert_ids(
+int ds4_gpu_translate_expert_ids(
         ds4_gpu_tensor *selected, uint32_t layer, uint32_t n_expert_used,
         uint32_t n_tokens, uint32_t n_total_expert) {
     (void)selected; (void)layer; (void)n_expert_used;
@@ -2583,7 +2574,7 @@ extern "C" int ds4_gpu_translate_expert_ids(
  * CUDA 没有远端专家字节源, no-op。 */
 extern "C" void ds4_gpu_expert_remote_fetch_kick(void) {}
 
-extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes) {
+int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes) {
     (void)max_tensor_bytes;
     if (!ds4_gpu_set_model_map(model_map, model_size)) return 0;
     if (0 &&
@@ -2593,7 +2584,7 @@ extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model
     return 1;
 }
 
-extern "C" int ds4_gpu_set_model_map_spans(
+int ds4_gpu_set_model_map_spans(
         const void *model_map,
         uint64_t model_size,
         const uint64_t *offsets,
@@ -2627,7 +2618,7 @@ extern "C" int ds4_gpu_set_model_map_spans(
     return 1;
 }
 
-extern "C" int ds4_gpu_set_model_map_spans_split(
+int ds4_gpu_set_model_map_spans_split(
         const void *model_map,
         uint64_t model_size,
         const uint64_t *offsets,
@@ -2647,7 +2638,7 @@ extern "C" int ds4_gpu_set_model_map_spans_split(
 /* Cross-layer router prediction prefetch is a Metal-side optimization (NVMe
  * read-ahead for SSD-streamed experts); the CUDA backend accepts and ignores
  * the registration so shared engine code links unchanged. */
-extern "C" int ds4_gpu_register_layer_router(const void *model_map, uint32_t layer,
+int ds4_gpu_register_layer_router(const void *model_map, uint32_t layer,
                                              uint64_t gate_inp_offset, int gate_inp_is_f32,
                                              uint64_t probs_bias_offset,
                                              uint64_t gate_exps_offset, uint64_t up_exps_offset,
@@ -2663,7 +2654,7 @@ extern "C" int ds4_gpu_register_layer_router(const void *model_map, uint32_t lay
     return 1;
 }
 
-extern "C" int ds4_gpu_set_model_fd(int fd) {
+int ds4_gpu_set_model_fd(int fd) {
     g_model_fd = fd;
     g_model_fd_host_base = g_model_host_base;
     g_model_file_size = 0;
@@ -2699,7 +2690,7 @@ extern "C" int ds4_gpu_set_model_fd(int fd) {
     return 1;
 }
 
-extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
+int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
 #ifndef DS4_CUDA_SPARK_HBM_CACHE
     (void)model_map;
     (void)model_size;
@@ -2743,7 +2734,7 @@ extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_s
 #endif
 }
 
-extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label) {
+int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label) {
     if (!model_map || bytes == 0) return 1;
     if (offset > model_size || bytes > model_size - offset) return 0;
     static int optional_q8_preload_disabled = 0;
@@ -2761,14 +2752,14 @@ extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_
     return 1;
 }
 
-extern "C" void ds4_gpu_print_memory_report(const char *label) {
+void ds4_gpu_print_memory_report(const char *label) {
     size_t free_b = 0, total_b = 0;
     (void)cudaMemGetInfo(&free_b, &total_b);
     fprintf(stderr, "ds4: CUDA memory report %s: free %.2f MiB total %.2f MiB\n",
             label ? label : "", (double)free_b / 1048576.0, (double)total_b / 1048576.0);
 }
 
-extern "C" void ds4_gpu_set_quality(bool quality) {
+void ds4_gpu_set_quality(bool quality) {
     g_quality_mode = quality ? 1 : 0;
     if (g_cublas_ready) {
         const cublasMath_t math_mode =
@@ -4315,7 +4306,7 @@ __global__ static void kv_rope_fp8_store_kernel(
         raw[(uint64_t)(raw_row % raw_cap) * head_dim + d] = __half2float(__float2half(kv[d]));
 }
 
-extern "C" int ds4_gpu_kv_rope_fp8_store_raw_tensor(
+int ds4_gpu_kv_rope_fp8_store_raw_tensor(
         ds4_gpu_tensor *kv, ds4_gpu_tensor *raw_cache,
         uint32_t raw_cap, uint32_t raw_row, uint32_t head_dim, uint32_t n_rot,
         uint32_t pos, uint32_t n_ctx_orig, float freq_base, float freq_scale,
@@ -7500,7 +7491,7 @@ __global__ static void topk_mask_kernel(float *mask, const uint32_t *topk, uint3
     mask[gid] = v;
 }
 
-extern "C" int ds4_gpu_embed_token_hc_tensor(ds4_gpu_tensor *out_hc, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n_vocab, uint32_t token, uint32_t n_embd, uint32_t n_hc) {
+int ds4_gpu_embed_token_hc_tensor(ds4_gpu_tensor *out_hc, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n_vocab, uint32_t token, uint32_t n_embd, uint32_t n_hc) {
     (void)n_vocab;
     if (!out_hc || !model_map || weight_offset >= model_size) return 0;
     uint64_t weight_bytes = (uint64_t)n_vocab * n_embd * sizeof(uint16_t);
@@ -7525,7 +7516,7 @@ extern "C" int ds4_gpu_embed_token_hc_tensor(ds4_gpu_tensor *out_hc, const void 
     return cuda_ok(cudaGetLastError(), "embed token launch");
 }
 
-extern "C" int ds4_gpu_embed_tokens_hc_tensor(
+int ds4_gpu_embed_tokens_hc_tensor(
         ds4_gpu_tensor       *out_hc,
         const ds4_gpu_tensor *tokens_t,
         const void             *model_map,
@@ -7637,7 +7628,7 @@ static int indexer_scores_launch(
     return cuda_ok(cudaGetLastError(), "indexer scores launch");
 }
 
-extern "C" int ds4_gpu_indexer_score_one_tensor(
+int ds4_gpu_indexer_score_one_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *weights,
@@ -7650,7 +7641,7 @@ extern "C" int ds4_gpu_indexer_score_one_tensor(
                                  n_head, head_dim, 1, scale, 0);
 }
 
-extern "C" int ds4_gpu_indexer_scores_prefill_tensor(
+int ds4_gpu_indexer_scores_prefill_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *weights,
@@ -7665,7 +7656,7 @@ extern "C" int ds4_gpu_indexer_scores_prefill_tensor(
                                  n_head, head_dim, ratio, scale, 1);
 }
 
-extern "C" int ds4_gpu_indexer_scores_decode_batch_tensor(
+int ds4_gpu_indexer_scores_decode_batch_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *weights,
@@ -7681,7 +7672,7 @@ extern "C" int ds4_gpu_indexer_scores_decode_batch_tensor(
                                  n_head, head_dim, ratio, scale, 1);
 }
 
-extern "C" int ds4_gpu_indexer_topk_tensor(
+int ds4_gpu_indexer_topk_tensor(
         ds4_gpu_tensor       *selected,
         const ds4_gpu_tensor *scores,
         uint32_t                n_comp,
@@ -7834,7 +7825,7 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
     return cuda_ok(cudaGetLastError(), "indexer topk launch");
 }
 
-extern "C" int ds4_gpu_argmax_tensor(
+int ds4_gpu_argmax_tensor(
         ds4_gpu_tensor       *out_idx,
         const ds4_gpu_tensor *logits,
         uint32_t                n_vocab) {
@@ -7849,7 +7840,7 @@ extern "C" int ds4_gpu_argmax_tensor(
     return cuda_ok(cudaGetLastError(), "argmax launch");
 }
 
-extern "C" int ds4_gpu_dsv4_topk_mask_tensor(
+int ds4_gpu_dsv4_topk_mask_tensor(
         ds4_gpu_tensor       *mask,
         const ds4_gpu_tensor *topk,
         uint32_t                n_comp,
@@ -7997,7 +7988,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
 }
 
 
-extern "C" int ds4_gpu_matmul_q8_0_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+int ds4_gpu_matmul_q8_0_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
     return cuda_matmul_q8_0_tensor_labeled(out, model_map, model_size, weight_offset,
                                            in_dim, out_dim, x, n_tok, "q8_0");
 }
@@ -8158,7 +8149,7 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
     return cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand launch");
 }
 
-extern "C" int ds4_gpu_matmul_q4_K_hc_expand_tensor(
+int ds4_gpu_matmul_q4_K_hc_expand_tensor(
         ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *block_out,
         const void             *model_map,
@@ -8290,7 +8281,7 @@ extern "C" int ds4_gpu_matmul_q4_K_hc_expand_tensor(
     return cuda_ok(cudaGetLastError(), "matmul_q4k_hc_expand launch");
 }
 
-extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
     if (!out || !x || !model_map) return 0;
     if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
     uint64_t weight_bytes = out_dim * in_dim * sizeof(uint16_t);
@@ -8404,7 +8395,7 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
     return cuda_ok(cudaGetLastError(), "matmul_f16 launch");
 }
 
-extern "C" int ds4_gpu_matmul_f16_pair_tensor(
+int ds4_gpu_matmul_f16_pair_tensor(
         ds4_gpu_tensor *out0,
         ds4_gpu_tensor *out1,
         const void *model_map,
@@ -8470,7 +8461,7 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
     return cuda_ok(cudaGetLastError(), "matmul_f16_pair_rowblock launch");
 }
 
-extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
     if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0) return 0;
     if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
     uint64_t weight_elems = out_dim * in_dim;
@@ -8506,7 +8497,7 @@ extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_
     return cuda_ok(cudaGetLastError(), "matmul_f32 launch");
 }
 
-extern "C" int ds4_gpu_repeat_hc_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *row, uint32_t n_embd, uint32_t n_hc) {
+int ds4_gpu_repeat_hc_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *row, uint32_t n_embd, uint32_t n_hc) {
     if (!out || !row || n_embd == 0 || n_hc == 0 ||
         row->bytes < (uint64_t)n_embd * sizeof(float) ||
         out->bytes < (uint64_t)n_embd * n_hc * sizeof(float)) {
@@ -8517,19 +8508,19 @@ extern "C" int ds4_gpu_repeat_hc_tensor(ds4_gpu_tensor *out, const ds4_gpu_tenso
     return cuda_ok(cudaGetLastError(), "repeat_hc launch");
 }
 
-extern "C" int ds4_gpu_rms_norm_plain_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, uint32_t n, float eps) {
+int ds4_gpu_rms_norm_plain_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, uint32_t n, float eps) {
     if (!out || !x || out->bytes < (uint64_t)n * sizeof(float) ||
         x->bytes < (uint64_t)n * sizeof(float)) return 0;
     rms_norm_fast_kernel<<<1, 1024>>>((float *)out->ptr, (const float *)x->ptr, NULL, n, 1, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_plain launch");
 }
-extern "C" int ds4_gpu_rms_norm_plain_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, uint32_t n, uint32_t rows, float eps) {
+int ds4_gpu_rms_norm_plain_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, uint32_t n, uint32_t rows, float eps) {
     if (!out || !x || out->bytes < (uint64_t)n * rows * sizeof(float) ||
         x->bytes < (uint64_t)n * rows * sizeof(float)) return 0;
     rms_norm_fast_kernel<<<rows, 1024>>>((float *)out->ptr, (const float *)x->ptr, NULL, n, rows, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_plain launch");
 }
-extern "C" int ds4_gpu_rms_norm_weight_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, float eps) {
+int ds4_gpu_rms_norm_weight_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, float eps) {
     if (!out || !x || !model_map || weight_offset > model_size ||
         model_size - weight_offset < (uint64_t)n * sizeof(float) ||
         out->bytes < (uint64_t)n * sizeof(float) ||
@@ -8540,7 +8531,7 @@ extern "C" int ds4_gpu_rms_norm_weight_tensor(ds4_gpu_tensor *out, const ds4_gpu
     rms_norm_fast_kernel<<<1, 1024>>>((float *)out->ptr, (const float *)x->ptr, w, n, 1, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
 }
-extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, uint32_t rows, float eps) {
+int ds4_gpu_rms_norm_weight_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, uint32_t rows, float eps) {
     if (!out || !x || !model_map || weight_offset > model_size ||
         model_size - weight_offset < (uint64_t)n * sizeof(float) ||
         out->bytes < (uint64_t)n * rows * sizeof(float) ||
@@ -8551,7 +8542,7 @@ extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(ds4_gpu_tensor *out, const ds
     rms_norm_fast_kernel<<<rows, 1024>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
 }
-extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
+int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
         ds4_gpu_tensor       *q_out,
         const ds4_gpu_tensor *q,
         const void             *model_map,
@@ -8600,23 +8591,23 @@ extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
            ds4_gpu_rms_norm_weight_rows_tensor(kv_out, kv, model_map, model_size,
                                                  kv_weight_offset, kv_n, rows, eps);
 }
-extern "C" int ds4_gpu_head_rms_norm_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, float eps) {
+int ds4_gpu_head_rms_norm_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, float eps) {
     if (!x || x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;
     head_rms_norm_kernel<<<n_tok * n_head, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, eps);
     return cuda_ok(cudaGetLastError(), "head_rms_norm launch");
 }
-extern "C" int ds4_gpu_head_rms_norm_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, float eps) {
+int ds4_gpu_head_rms_norm_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, float eps) {
     if (!x || n_rot > head_dim || (n_rot & 1u) ||
         x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;
     head_rms_norm_rope_tail_kernel<<<n_tok * n_head, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps);
     return cuda_ok(cudaGetLastError(), "head_rms_norm_rope_tail launch");
 }
-extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot) {
+int ds4_gpu_dsv4_fp8_kv_quantize_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot) {
     if (!x || n_rot > head_dim || x->bytes < (uint64_t)n_tok * head_dim * sizeof(float)) return 0;
     fp8_kv_quantize_kernel<<<n_tok, 64>>>((float *)x->ptr, n_tok, head_dim, n_rot);
     return cuda_ok(cudaGetLastError(), "fp8_kv_quantize launch");
 }
-extern "C" int ds4_gpu_dsv4_indexer_qat_tensor(ds4_gpu_tensor *x, uint32_t n_rows, uint32_t head_dim) {
+int ds4_gpu_dsv4_indexer_qat_tensor(ds4_gpu_tensor *x, uint32_t n_rows, uint32_t head_dim) {
     if (!x || n_rows == 0 || head_dim != 128u ||
         x->bytes < (uint64_t)n_rows * head_dim * sizeof(float)) {
         return 0;
@@ -8624,14 +8615,13 @@ extern "C" int ds4_gpu_dsv4_indexer_qat_tensor(ds4_gpu_tensor *x, uint32_t n_row
     indexer_hadamard_fp4_kernel<<<n_rows, 128>>>((float *)x->ptr, n_rows, head_dim);
     return cuda_ok(cudaGetLastError(), "indexer_hadamard_fp4 launch");
 }
-extern "C" int ds4_gpu_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow) {
+int ds4_gpu_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow) {
     if (!x || n_rot > head_dim || (n_rot & 1) || x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;
     uint32_t pairs = n_tok * n_head * (n_rot / 2);
     rope_tail_kernel<<<(pairs + 255) / 256, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, 1, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
     return cuda_ok(cudaGetLastError(), "rope_tail launch");
 }
-extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim);
-extern "C" int ds4_gpu_kv_fp8_store_raw_tensor(
+int ds4_gpu_kv_fp8_store_raw_tensor(
         ds4_gpu_tensor *kv,
         ds4_gpu_tensor *raw_cache,
         uint32_t          raw_cap,
@@ -8641,14 +8631,14 @@ extern "C" int ds4_gpu_kv_fp8_store_raw_tensor(
     return ds4_gpu_dsv4_fp8_kv_quantize_tensor(kv, 1, head_dim, n_rot) &&
            ds4_gpu_store_raw_kv_tensor(raw_cache, kv, raw_cap, raw_row, head_dim);
 }
-extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim) {
+int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim) {
     if (!raw_cache || !kv || raw_cap == 0 ||
         raw_cache->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
         kv->bytes < (uint64_t)head_dim * sizeof(float)) return 0;
     store_raw_kv_batch_kernel<<<(head_dim + 255) / 256, 256>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, row, 1, head_dim);
     return cuda_ok(cudaGetLastError(), "store_raw_kv launch");
 }
-extern "C" int ds4_gpu_store_raw_kv_batch_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim) {
+int ds4_gpu_store_raw_kv_batch_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim) {
     if (!raw_cache || !kv || raw_cap == 0 ||
         raw_cache->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
         kv->bytes < (uint64_t)n_tokens * head_dim * sizeof(float)) return 0;
@@ -8656,7 +8646,7 @@ extern "C" int ds4_gpu_store_raw_kv_batch_tensor(ds4_gpu_tensor *raw_cache, cons
     store_raw_kv_batch_kernel<<<(n + 255) / 256, 256>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, pos0, n_tokens, head_dim);
     return cuda_ok(cudaGetLastError(), "store_raw_kv_batch launch");
 }
-extern "C" int ds4_gpu_compressor_store_batch_tensor(
+int ds4_gpu_compressor_store_batch_tensor(
         const ds4_gpu_tensor *kv,
         const ds4_gpu_tensor *sc,
         ds4_gpu_tensor       *state_kv,
@@ -8704,7 +8694,7 @@ extern "C" int ds4_gpu_compressor_store_batch_tensor(
     return cuda_ok(cudaGetLastError(), "compressor store launch");
 }
 
-extern "C" int ds4_gpu_compressor_update_tensor(
+int ds4_gpu_compressor_update_tensor(
         const ds4_gpu_tensor *kv_cur,
         const ds4_gpu_tensor *sc_cur,
         ds4_gpu_tensor       *state_kv,
@@ -8786,7 +8776,7 @@ extern "C" int ds4_gpu_compressor_update_tensor(
     }
     return ok;
 }
-extern "C" int ds4_gpu_compressor_prefill_tensor(
+int ds4_gpu_compressor_prefill_tensor(
         ds4_gpu_tensor       *comp_cache,
         ds4_gpu_tensor       *state_kv,
         ds4_gpu_tensor       *state_score,
@@ -8902,7 +8892,7 @@ extern "C" int ds4_gpu_compressor_prefill_tensor(
     }
     return 1;
 }
-extern "C" int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
+int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
         ds4_gpu_tensor       *comp_cache,
         ds4_gpu_tensor       *state_kv,
         ds4_gpu_tensor       *state_score,
@@ -8989,7 +8979,7 @@ extern "C" int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
             prev_start, 0, ratio);
     return cuda_ok(cudaGetLastError(), "compressor replay state launch");
 }
-extern "C" int ds4_gpu_compressor_prefill_state_ratio4_tensor(
+int ds4_gpu_compressor_prefill_state_ratio4_tensor(
         ds4_gpu_tensor       *state_kv,
         ds4_gpu_tensor       *state_score,
         const ds4_gpu_tensor *kv_tail,
@@ -9031,7 +9021,7 @@ extern "C" int ds4_gpu_compressor_prefill_state_ratio4_tensor(
             0, 0, ratio);
     return cuda_ok(cudaGetLastError(), "compressor state set launch");
 }
-extern "C" int ds4_gpu_attention_decode_heads_tensor(
+int ds4_gpu_attention_decode_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
@@ -9099,7 +9089,7 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                                                  0, 0, n_head, head_dim);
     return cuda_ok(cudaGetLastError(), "attention decode launch");
 }
-extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim) {
+int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim) {
     if (!heads || !q || !raw_kv || !model_map || sinks_offset > model_size ||
         model_size - sinks_offset < (uint64_t)n_head * sizeof(float) ||
         heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
@@ -9293,7 +9283,7 @@ static int attention_decode_batch_launch(
     return cuda_ok(cudaGetLastError(), "attention decode batch launch");
 }
 
-extern "C" int ds4_gpu_attention_decode_raw_batch_heads_tensor(
+int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
@@ -9314,7 +9304,7 @@ extern "C" int ds4_gpu_attention_decode_raw_batch_heads_tensor(
                                       n_head, head_dim);
 }
 
-extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
+int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
@@ -9342,7 +9332,7 @@ extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
                                       n_comp, window, ratio, n_head, head_dim);
 }
 
-extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
@@ -9598,7 +9588,7 @@ static int attention_prefill_mixed_launch(
     return cuda_ok(cudaGetLastError(), "attention prefill mixed launch");
 }
 
-extern "C" int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
+int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
@@ -9619,7 +9609,7 @@ extern "C" int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
                                        n_comp, window, ratio, n_head, head_dim);
 }
 
-extern "C" int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
+int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
@@ -9640,12 +9630,7 @@ extern "C" int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
                                        q, raw_kv, comp_kv, comp_mask, 1, n_tokens,
                                        n_comp, window, ratio, n_head, head_dim);
 }
-extern "C" int ds4_gpu_matmul_q4_K_tensor(
-        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
-        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
-        const ds4_gpu_tensor *x, uint64_t n_tok);
-
-extern "C" int ds4_gpu_attention_output_q4k_batch_tensor(
+int ds4_gpu_attention_output_q4k_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *low,
         const void             *model_map,
@@ -9703,7 +9688,7 @@ extern "C" int ds4_gpu_attention_output_q4k_batch_tensor(
 }
 
 
-extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
+int ds4_gpu_attention_output_q8_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *low,
         ds4_gpu_tensor       *group_tmp,
@@ -9850,7 +9835,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                                            n_tokens,
                                            "attn_output_b");
 }
-extern "C" int ds4_gpu_attention_output_low_q8_tensor(
+int ds4_gpu_attention_output_low_q8_tensor(
         ds4_gpu_tensor       *low,
         const void             *model_map,
         uint64_t                model_size,
@@ -9912,7 +9897,7 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
                                                       use_dp4a);
     return cuda_ok(cudaGetLastError(), "attention_output_low_q8 launch");
 }
-extern "C" int ds4_gpu_attention_output_low_q4k_tensor(
+int ds4_gpu_attention_output_low_q4k_tensor(
         ds4_gpu_tensor       *low,
         const void             *model_map,
         uint64_t                model_size,
@@ -10018,7 +10003,7 @@ extern "C" int ds4_gpu_attention_output_low_q4k_tensor(
     }
     return cuda_ok(cudaGetLastError(), "attention_output_low_q4k launch");
 }
-extern "C" int ds4_gpu_swiglu_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up, uint32_t n, float clamp, float weight) {
+int ds4_gpu_swiglu_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up, uint32_t n, float clamp, float weight) {
     if (!out || !gate || !up ||
         out->bytes < (uint64_t)n * sizeof(float) ||
         gate->bytes < (uint64_t)n * sizeof(float) ||
@@ -10026,7 +10011,7 @@ extern "C" int ds4_gpu_swiglu_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *
     swiglu_kernel<<<(n + 255) / 256, 256, 0, g_cur_stream>>>((float *)out->ptr, (const float *)gate->ptr, (const float *)up->ptr, n, clamp, weight);
     return cuda_ok(cudaGetLastError(), "swiglu launch");
 }
-extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
+int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,
         ds4_gpu_tensor       *mid,
@@ -10052,7 +10037,7 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
                                         up_offset, in_dim, out_dim, x, 1) &&
            ds4_gpu_swiglu_tensor(mid, gate, up, (uint32_t)out_dim, clamp, 1.0f);
 }
-extern "C" int ds4_gpu_add_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a, const ds4_gpu_tensor *b, uint32_t n) {
+int ds4_gpu_add_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a, const ds4_gpu_tensor *b, uint32_t n) {
     if (!out || !a || !b ||
         out->bytes < (uint64_t)n * sizeof(float) ||
         a->bytes < (uint64_t)n * sizeof(float) ||
@@ -10060,7 +10045,7 @@ extern "C" int ds4_gpu_add_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a, 
     add_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)a->ptr, (const float *)b->ptr, n);
     return cuda_ok(cudaGetLastError(), "add launch");
 }
-extern "C" int ds4_gpu_corr_router_bias(ds4_gpu_tensor *logits, const ds4_gpu_tensor *delta,
+int ds4_gpu_corr_router_bias(ds4_gpu_tensor *logits, const ds4_gpu_tensor *delta,
         uint32_t n_expert, uint32_t n_tokens) {
     if (!logits || !delta || n_expert == 0 || n_tokens == 0) return 0;
     uint64_t total = (uint64_t)n_tokens * n_expert;
@@ -10070,7 +10055,7 @@ extern "C" int ds4_gpu_corr_router_bias(ds4_gpu_tensor *logits, const ds4_gpu_te
         (float *)logits->ptr, (const float *)delta->ptr, n_expert, total);
     return cuda_ok(cudaGetLastError(), "corr router bias launch");
 }
-extern "C" int ds4_gpu_corr_apply(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+int ds4_gpu_corr_apply(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
         const ds4_gpu_tensor *U, const ds4_gpu_tensor *V, const ds4_gpu_tensor *C,
         const ds4_gpu_tensor *b, const ds4_gpu_tensor *beta, const ds4_gpu_tensor *selected,
         uint32_t d_model, uint32_t d_l, uint32_t n_expert, uint32_t n_expert_used, uint32_t n_tokens) {
@@ -10093,8 +10078,8 @@ extern "C" int ds4_gpu_corr_apply(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
 }
 /* Metal-only decode optimization (routed_out write-hazard bubble); CUDA keeps
  * the in-place corr kernel — callers must gate on this returning 0. */
-extern "C" int ds4_gpu_corr_delta_supported(void) { return 0; }
-extern "C" int ds4_gpu_corr_apply_delta(ds4_gpu_tensor *delta_out, const ds4_gpu_tensor *x,
+int ds4_gpu_corr_delta_supported(void) { return 0; }
+int ds4_gpu_corr_apply_delta(ds4_gpu_tensor *delta_out, const ds4_gpu_tensor *x,
         const ds4_gpu_tensor *U, const ds4_gpu_tensor *V, const ds4_gpu_tensor *C,
         const ds4_gpu_tensor *b, const ds4_gpu_tensor *beta, const ds4_gpu_tensor *selected,
         uint32_t d_model, uint32_t d_l, uint32_t n_expert, uint32_t n_expert_used, uint32_t n_tokens) {
@@ -10102,7 +10087,7 @@ extern "C" int ds4_gpu_corr_apply_delta(ds4_gpu_tensor *delta_out, const ds4_gpu
     (void)d_model; (void)d_l; (void)n_expert; (void)n_expert_used; (void)n_tokens;
     return 0;
 }
-extern "C" int ds4_gpu_directional_steering_project_tensor(
+int ds4_gpu_directional_steering_project_tensor(
         ds4_gpu_tensor       *x,
         const ds4_gpu_tensor *directions,
         uint32_t                layer,
@@ -10125,7 +10110,7 @@ extern "C" int ds4_gpu_directional_steering_project_tensor(
             scale);
     return cuda_ok(cudaGetLastError(), "directional steering launch");
 }
-extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t token, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits, uint32_t layer) {
+int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t token, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits, uint32_t layer) {
     (void)layer;   /* CUDA has no shrunken/keep-map path yet; accept for ABI parity with Metal */
     if (!selected || !weights || !probs || !logits || !model_map || n_expert_groups > 1u || n_group_used > 0u) return 0;
     if (n_expert != 256u || n_expert_used != 6u || fabsf(expert_weight_scale - 1.5f) > 1.0e-6f) return 0;
@@ -10164,7 +10149,7 @@ extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_te
     }
     return ok;
 }
-extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits, const ds4_gpu_tensor *tokens, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_tokens, uint32_t layer) {
+int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits, const ds4_gpu_tensor *tokens, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_tokens, uint32_t layer) {
     (void)layer;   /* CUDA has no shrunken/keep-map path yet; accept for ABI parity with Metal */
     if (n_expert != 256u || n_expert_used != 6u || fabsf(expert_weight_scale - 1.5f) > 1.0e-6f) return 0;
     if (!selected || !weights || !probs || !logits || !tokens || !model_map || n_tokens == 0 ||
@@ -11550,7 +11535,7 @@ __global__ static void matmul_q4_K_warp_kernel(
     }
 }
 
-extern "C" int ds4_gpu_matmul_q4_K_tensor(
+int ds4_gpu_matmul_q4_K_tensor(
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
         const ds4_gpu_tensor *x, uint64_t n_tok) {
@@ -11770,12 +11755,7 @@ __global__ static void grouped_q2_K_rowlane_kernel(
     out[(uint64_t)tok * out_dim + row] = acc;
 }
 
-extern "C" int ds4_gpu_matmul_q2_K_tensor(
-        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
-        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
-        const ds4_gpu_tensor *x, uint64_t n_tok);
-
-extern "C" int ds4_gpu_attention_output_q2k_batch_tensor(
+int ds4_gpu_attention_output_q2k_batch_tensor(
         ds4_gpu_tensor *out, ds4_gpu_tensor *low,
         const void *model_map, uint64_t model_size,
         uint64_t out_a_offset, uint64_t out_b_offset,
@@ -12008,7 +11988,7 @@ __global__ static void __launch_bounds__(256, DS4_Q2K_BLOCKS_PER_SM) matmul_q2_K
     }
 }
 
-extern "C" int ds4_gpu_matmul_q2_K_pair_batch_tensor(
+int ds4_gpu_matmul_q2_K_pair_batch_tensor(
         ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
         const void *model_map, uint64_t model_size,
         uint64_t off0, uint64_t off1,
@@ -12230,7 +12210,7 @@ static inline void q2k_warp_launch(dim3 grid, size_t sh,
     }
 }
 
-extern "C" int ds4_gpu_matmul_q2_K_tensor(
+int ds4_gpu_matmul_q2_K_tensor(
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
         const ds4_gpu_tensor *x, uint64_t n_tok) {
@@ -12416,7 +12396,7 @@ static int q2k_matmul_from_xq(ds4_gpu_tensor *out, const void *model_map, uint64
     return cuda_ok(cudaGetLastError(), "dense q2_K pair matmul launch");
 }
 
-extern "C" int ds4_gpu_matmul_q2_K_pair_tensor(
+int ds4_gpu_matmul_q2_K_pair_tensor(
         ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
         const void *model_map, uint64_t model_size,
         uint64_t off0, uint64_t off1,
@@ -12448,7 +12428,7 @@ extern "C" int ds4_gpu_matmul_q2_K_pair_tensor(
 }
 
 /* decode 同输入矩阵对: 一次 q8_K 量化 + 一次发射覆盖两矩阵 */
-extern "C" int ds4_gpu_matmul_q4_K_pair_tensor(
+int ds4_gpu_matmul_q4_K_pair_tensor(
         ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
         const void *model_map, uint64_t model_size,
         uint64_t off0, uint64_t off1,
@@ -17184,7 +17164,7 @@ static int cuda_vq_moe_forward(
     return cuda_ok(cudaGetLastError(), "vq_moe_pair launch");
 }
 
-extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const ds4_gpu_residual_set *residual, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index) {
+int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const ds4_gpu_residual_set *residual, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index) {
     if (residual && residual->vq)
         return cuda_vq_moe_forward(out, mid, residual, model_map, down_offset, down_expert_bytes,
                                    expert_in_dim, expert_mid_dim, out_dim, selected, weights,
@@ -17202,7 +17182,7 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
  * 各自实现), 编译器无从校验。此处曾少了 slot_start/slot_count 两个参数: ds4.c 按
  * 头文件压 25 个实参, 这里按 23 个取, mid_is_f16 收到的其实是 slot_start 的值 ⇒
  * 解引用垃圾指针段错误。以前没暴露只是因为本文件根本编译不过(缺 residual_set 定义)。 */
-extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const ds4_gpu_residual_set *residual, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, uint32_t slot_start, uint32_t slot_count, bool *mid_is_f16) {
+int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const ds4_gpu_residual_set *residual, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, uint32_t slot_start, uint32_t slot_count, bool *mid_is_f16) {
     if (mid_is_f16) *mid_is_f16 = false;
     /* TP Phase-3 专家切分是双机拆模型用的; CUDA 走单机整模型, 没有对端可 all-reduce。
      * 非平凡切分直接拒绝, 不能只算半边专家却当成完整输出。 */
@@ -17225,7 +17205,7 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, n_total_expert, n_expert, clamp, x, n_tokens);
 }
-extern "C" int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *mix, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint32_t n_hc, uint32_t sinkhorn_iters, float eps) {
+int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *mix, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint32_t n_hc, uint32_t sinkhorn_iters, float eps) {
     if (!out || !mix || !model_map || n_hc != 4) return 0;
     const uint64_t mix_bytes = 24ull * sizeof(float);
     if (scale_offset > model_size || model_size - scale_offset < 3ull * sizeof(float) ||
@@ -17243,7 +17223,7 @@ extern "C" int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor *out, const ds4_g
         n_rows, sinkhorn_iters, eps);
     return cuda_ok(cudaGetLastError(), "hc_split_sinkhorn launch");
 }
-extern "C" int ds4_gpu_hc_weighted_sum_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *weights, uint32_t n_embd, uint32_t n_hc) {
+int ds4_gpu_hc_weighted_sum_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *weights, uint32_t n_embd, uint32_t n_hc) {
     if (!out || !residual_hc || !weights || n_embd == 0 || n_hc == 0) return 0;
     uint32_t n_tokens = (uint32_t)(out->bytes / ((uint64_t)n_embd * sizeof(float)));
     hc_weighted_sum_kernel<<<((uint64_t)n_embd * n_tokens + 255) / 256, 256>>>(
@@ -17251,7 +17231,7 @@ extern "C" int ds4_gpu_hc_weighted_sum_tensor(ds4_gpu_tensor *out, const ds4_gpu
         n_embd, n_hc, n_tokens, n_hc);
     return cuda_ok(cudaGetLastError(), "hc_weighted_sum launch");
 }
-extern "C" int ds4_gpu_hc_weighted_sum_split_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
+int ds4_gpu_hc_weighted_sum_split_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
     if (!out || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
     uint32_t n_tokens = (uint32_t)(out->bytes / ((uint64_t)n_embd * sizeof(float)));
     uint32_t stride = (uint32_t)(2u * n_hc + n_hc * n_hc);
@@ -17260,7 +17240,7 @@ extern "C" int ds4_gpu_hc_weighted_sum_split_tensor(ds4_gpu_tensor *out, const d
         n_embd, n_hc, n_tokens, stride);
     return cuda_ok(cudaGetLastError(), "hc_weighted_sum_split launch");
 }
-extern "C" int ds4_gpu_hc_split_weighted_sum_tensor(
+int ds4_gpu_hc_split_weighted_sum_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *split,
         const ds4_gpu_tensor *mix,
@@ -17305,7 +17285,7 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_tensor(
             n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps);
     return cuda_ok(cudaGetLastError(), "hc split weighted sum launch");
 }
-extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
+int ds4_gpu_hc_split_weighted_sum_norm_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *norm_out,
         ds4_gpu_tensor       *split,
@@ -17386,7 +17366,7 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
            ds4_gpu_rms_norm_weight_tensor(norm_out, out, model_map, model_size,
                                             norm_weight_offset, n_embd, norm_eps);
 }
-extern "C" int ds4_gpu_output_hc_weights_tensor(
+int ds4_gpu_output_hc_weights_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *pre,
         const void             *model_map,
@@ -17418,7 +17398,7 @@ extern "C" int ds4_gpu_output_hc_weights_tensor(
             eps);
     return cuda_ok(cudaGetLastError(), "output hc weights launch");
 }
-extern "C" int ds4_gpu_hc_expand_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *post, const ds4_gpu_tensor *comb, uint32_t n_embd, uint32_t n_hc) {
+int ds4_gpu_hc_expand_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *post, const ds4_gpu_tensor *comb, uint32_t n_embd, uint32_t n_hc) {
     if (!out_hc || !block_out || !residual_hc || !post || !comb || n_embd == 0 || n_hc == 0) return 0;
     uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * sizeof(float)));
     uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
@@ -17432,7 +17412,7 @@ extern "C" int ds4_gpu_hc_expand_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_te
                                                     n_hc, n_hc * n_hc, 0);
     return cuda_ok(cudaGetLastError(), "hc_expand launch");
 }
-extern "C" int ds4_gpu_hc_expand_split_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
+int ds4_gpu_hc_expand_split_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
     if (!out_hc || !block_out || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
     uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * sizeof(float)));
     uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
@@ -17448,7 +17428,7 @@ extern "C" int ds4_gpu_hc_expand_split_tensor(ds4_gpu_tensor *out_hc, const ds4_
                                                     mix_hc, mix_hc, 0);
     return cuda_ok(cudaGetLastError(), "hc_expand_split launch");
 }
-extern "C" int ds4_gpu_hc_expand_add_split_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *block_add, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
+int ds4_gpu_hc_expand_add_split_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *block_add, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
     if (!out_hc || !block_out || !block_add || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
     uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * sizeof(float)));
     uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
@@ -17464,7 +17444,7 @@ extern "C" int ds4_gpu_hc_expand_add_split_tensor(ds4_gpu_tensor *out_hc, const 
                                                     mix_hc, mix_hc, 1);
     return cuda_ok(cudaGetLastError(), "hc_expand_add_split launch");
 }
-extern "C" int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
+int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
         ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *shared_out,
         const void             *model_map,
@@ -17500,7 +17480,7 @@ extern "C" int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
                                                 residual_hc, split, n_embd, n_hc);
 }
 
-extern "C" int ds4_gpu_matmul_q8_0_hc_expand_tensor(
+int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *block_out,
         const void             *model_map,
@@ -17544,7 +17524,7 @@ static __half   *g_zc_zlm = NULL;        /* dev packed z[k]|U[d*k]|V[din*k] per 
 static uint32_t *g_zc_zl_off = NULL, *g_zc_zl_k = NULL, *g_zc_zl_din = NULL; /* host */
 static float    *g_zc_zl_tr = NULL;      /* host */
 
-extern "C" int ds4_gpu_zchain_set(
+int ds4_gpu_zchain_set(
         const float *ops, const uint32_t *layer_off, const uint16_t *v8,
         const float *ge, const uint8_t *ge_present,
         uint32_t n_layer, uint32_t n_expert, uint32_t d_model,
@@ -17583,7 +17563,7 @@ static __global__ void zchain_ge_kernel(
     weights[gid] *= ge[ge_base + (uint32_t)e];
 }
 
-extern "C" int ds4_gpu_zchain_ge_apply(
+int ds4_gpu_zchain_ge_apply(
         ds4_gpu_tensor *weights, const ds4_gpu_tensor *selected,
         uint32_t layer, uint32_t n_expert_used, uint32_t n_tokens) {
     if (!g_zc_ge || layer >= g_zc_n_layer || !g_zc_ge_present[layer]) return 1;
@@ -17942,7 +17922,7 @@ static __global__ void zc_zl_add_kernel(
     routed[(uint64_t)tok * d + j] += s * ua[(uint64_t)tok * d + j];
 }
 
-extern "C" int ds4_gpu_zchain_scale_routed(
+int ds4_gpu_zchain_scale_routed(
         ds4_gpu_tensor *routed, const ds4_gpu_tensor *x,
         uint32_t layer, uint32_t n_tokens) {
     if (layer >= g_zc_n_layer || !g_zc_layer_off) return 1;
@@ -18011,7 +17991,7 @@ extern "C" int ds4_gpu_zchain_scale_routed(
 }
 
 /* 参数表与 ds4_gpu.h 逐字一致(本文件不 include 它, 编译器不校验)。 */
-extern "C" int ds4_gpu_zchain_zl_set(
+int ds4_gpu_zchain_zl_set(
         const uint16_t *zlm, const uint32_t *off, const uint32_t *k,
         const uint32_t *din, const float *tr, const uint32_t *mul,
         uint32_t n_layer, uint64_t total_halves) {
@@ -18111,7 +18091,7 @@ static __global__ void zc_rte_add_kernel(
     logits[(uint64_t)tok * ne + e] += a;
 }
 
-extern "C" int ds4_gpu_zchain_rte_set(
+int ds4_gpu_zchain_rte_set(
         const uint16_t *rm, const uint32_t *off, const uint32_t *k,
         const float *scale, uint32_t n_layer, uint32_t n_expert, uint64_t total_halves) {
     if (!rm || !total_halves || !n_layer) return 1;
@@ -18151,7 +18131,7 @@ extern "C" int ds4_gpu_zchain_rte_set(
 
 static uint64_t g_zc_rt_pv_cap = 16u * 1024u;   /* floats; 预分配 16tok, prefill 按需扩 */
 
-extern "C" int ds4_gpu_zchain_route_bias(
+int ds4_gpu_zchain_route_bias(
         ds4_gpu_tensor *logits, const ds4_gpu_tensor *x, uint32_t layer, uint32_t n_tokens) {
     if (!g_zc_rt || layer >= g_zc_rt_nl || !g_zc_rt_k || !g_zc_rt_k[layer]) return 1;
     if (!logits || !x || n_tokens == 0) return 1;

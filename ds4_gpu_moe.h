@@ -6,6 +6,10 @@
 
 #include "ds4_gpu_core.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* =========================================================================
  * Router, Shared Expert, and Routed MoE.
  * =========================================================================
@@ -255,5 +259,9 @@ int ds4_gpu_routed_moe_batch_tensor(
         uint32_t                slot_count,   /* 0 or n_expert => no split (full) */
         bool                   *mid_is_f16);
 
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

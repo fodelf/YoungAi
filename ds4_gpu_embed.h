@@ -6,6 +6,10 @@
 
 #include "ds4_gpu_core.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* =========================================================================
  * Embeddings and Indexer Helpers.
  * =========================================================================
@@ -91,5 +95,9 @@ int ds4_gpu_dsv4_topk_mask_tensor(
         uint32_t                n_tokens,
         uint32_t                top_k);
 
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

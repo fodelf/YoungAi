@@ -6,6 +6,10 @@
 
 #include "ds4_gpu_core.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* =========================================================================
  * Dense Projections, Norms, RoPE, and KV Rounding.
  * =========================================================================
@@ -277,5 +281,9 @@ int ds4_gpu_store_raw_kv_batch_tensor(
         uint32_t                n_tokens,
         uint32_t                head_dim);
 
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
