@@ -28,7 +28,7 @@ DS4_VQ_GPU=1 DS4_MEM_BUDGET_MB=12000 DS4_ZCHAIN=$ROOT/gguf/go-onebit/r28v2/full/
 
 for A in $ALPHAS; do
     echo "########## α=$A ##########"
-    python3 "$S/route_alpha_set.py" "$M" "$RB" "$A" 2>&1 | tail -2
+    "$(dirname "$0")/../calib/route_alpha_set" "$M" "$RB" "$A" 2>&1 | tail -2
     env $E "$ROOT/ds4" -m "$M" --ctx 4096 -p "$PROMPT" -n "$NTOK" --temp 0 2>/dev/null
     echo
 done

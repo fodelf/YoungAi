@@ -74,3 +74,9 @@
   判定: 全数值逐字符一致; 残差仅 --stats 表头 CJK 对齐空白(同 kl_forensic 既判先例)。
   转录细节: python float repr(整值定点/最短往返)、str repr 引号规则(含'换双引号)均复刻。
   结果: 过闸 ✓ → py 删除(手工具, 无 .sh 调用方)
+
+[2026-08-25] scripts/route_bias_rebake.py + route_alpha_set.py → calib/同名.c
+  载具: 微型夹具 GGUF(3×exp_probs_b.bias)+双 RBIA(混合过门/不过门) — 真目标模型
+  (v4bf 冠军系, 老base分数路由)在 M1, 0731系无此张量, 夹具口径覆盖全部算术分支。
+  判定: rebake 产物 md5 同+stdout 同; alpha_set 幂等两遍产物/快照 md5 全同, stdout 仅文件名差。
+  结果: 双双过闸 ✓ → py 删除, 调用方接线, build_ctools 收编

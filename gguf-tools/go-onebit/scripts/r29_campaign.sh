@@ -165,8 +165,8 @@ stage_merge(){
     # 直接: 存裸态快照 → 写自己的 α。route_alpha_set.py 是幂等绝对写, 可反复扫 α 不累积。
     RB="$OUTF/route_bias_r29.bin"
     if [ -f "$RB" ]; then
-        python3 "$SC/route_alpha_set.py" "$MDL" "$RB" 0.0 --snapshot-only >&2 || true
-        python3 "$SC/route_alpha_set.py" "$MDL" "$RB" "${RB_ALPHA:-2.5}" >&2 || true
+        "$(dirname "$0")/../calib/route_alpha_set" "$MDL" "$RB" 0.0 --snapshot-only >&2 || true
+        "$(dirname "$0")/../calib/route_alpha_set" "$MDL" "$RB" "${RB_ALPHA:-2.5}" >&2 || true
         LOG "路由偏置 α=${RB_ALPHA:-2.5} 已烘焙(自产骨架, 无需减他人 Δb)"
     else
         LOG "★Δb 侧车 $RB 缺 — 路由未烘焙, 部署态路由不会向锚靠拢★"

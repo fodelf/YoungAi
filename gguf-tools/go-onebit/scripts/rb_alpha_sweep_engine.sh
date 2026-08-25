@@ -12,7 +12,7 @@ RB=/tmp/route_bias_r30.bin
 SC=gguf-tools/go-onebit/scripts
 for A in "$@"; do
     echo "== α: $CUR → $A (原位 rebake) =="
-    python3 $SC/route_bias_rebake.py "$MDL" $RB "$CUR" $RB "$A" | tail -1
+    "$(dirname "$0")/../calib/route_bias_rebake" "$MDL" $RB "$CUR" $RB "$A" | tail -1
     CUR=$A
     D=/tmp/rid32_a$A; rm -rf $D; mkdir -p $D
     DS4_EVAL_IDS=/tmp/ids32.txt DS4_EVAL_NO_BOS=1 DS4_EVAL_CHUNK=8 \

@@ -279,7 +279,7 @@ with open(sys.argv[1], 'wb') as f:
     f.write(struct.pack('<4I', 0x41494252, NL, NEXP, 0))
     f.write(b'\0' * (NL * NEXP * 4 * 2))
 PYEOF
-        python3 "$SC/route_bias_rebake.py" "$MDL" /tmp/rb_zero.bin 0 "$RBF" "${RB_ALPHA:-2.5}" \
+        "$(dirname "$0")/../calib/route_bias_rebake" "$MDL" /tmp/rb_zero.bin 0 "$RBF" "${RB_ALPHA:-2.5}" \
             || { LOG "★RB 烘焙失败 — 停(裸路由模型不交付)★"; exit 8; }
         LOG "RB 烘焙 ✓ (α=${RB_ALPHA:-2.5}, L3+ 分数路由漂移补偿)"
     else

@@ -43,16 +43,16 @@ run() {  # run <tag> <prompt> [额外env...]
 
 echo "==================== 阶段1: α 网格(贪心, 代码前缀) ===================="
 for A in $ALPHAS; do
-    python3 "$S/route_alpha_set.py" "$M" "$RB" "$A" >/dev/null 2>&1
+    "$(dirname "$0")/../calib/route_alpha_set" "$M" "$RB" "$A" >/dev/null 2>&1
     T=0 TOPP= run "α=$A | greedy | code-prefix" "$P_CODE"
 done
 
 echo "==================== 阶段2: BEST_A=$BEST_A 下扫采样器 ===================="
-python3 "$S/route_alpha_set.py" "$M" "$RB" "$BEST_A" >/dev/null 2>&1
+"$(dirname "$0")/../calib/route_alpha_set" "$M" "$RB" "$BEST_A" >/dev/null 2>&1
 T=0.7 TOPP=0.9 run "α=$BEST_A | t0.7/p0.9 | code-prefix" "$P_CODE"
 T=0.7 TOPP=0.9 run "α=$BEST_A | t0.7/p0.9 +rep1.1 | code-prefix" "$P_CODE" DS4_REPEAT_FREQ=1.1 DS4_REPEAT_WINDOW=128
 T=0.3 TOPP=0.9 run "α=$BEST_A | t0.3/p0.9 +rep1.1 | code-prefix" "$P_CODE" DS4_REPEAT_FREQ=1.1 DS4_REPEAT_WINDOW=128
 T=0.7 TOPP=0.9 run "α=$BEST_A | t0.7/p0.9 +rep1.1 | chat"        "$P_CHAT" DS4_REPEAT_FREQ=1.1 DS4_REPEAT_WINDOW=128
 
-python3 "$S/route_alpha_set.py" "$M" "$RB" "$BEST_A" 2>&1 | tail -1
+"$(dirname "$0")/../calib/route_alpha_set" "$M" "$RB" "$BEST_A" 2>&1 | tail -1
 echo "★扫完 — 模型 α 已固定回 ${BEST_A}★"

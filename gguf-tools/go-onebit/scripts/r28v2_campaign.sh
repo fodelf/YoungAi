@@ -132,9 +132,9 @@ stage_merge(){
     # 路由: 减冠军 2.5·Δb(骨架抄自 v4bf, 实测 k=+2.27 r=+0.94) → 快照裸态 → 写 α
     CHRB="$G7/route_bias_v4fix.bin"; RB="$OUTF/route_bias_r28.bin"
     if [ -f "$CHRB" ] && [ -f "$RB" ]; then
-        python3 "$ROOT/gguf-tools/go-onebit/scripts/route_bias_rebake.py" "$MDL" "$CHRB" 2.5 "$RB" 0.0 >&2 || LOG "减冠军偏置失败"
-        python3 "$ROOT/gguf-tools/go-onebit/scripts/route_alpha_set.py" "$MDL" "$RB" 0.0 --snapshot-only >&2 || true
-        python3 "$ROOT/gguf-tools/go-onebit/scripts/route_alpha_set.py" "$MDL" "$RB" "${RB_ALPHA:-2.5}" >&2 || true
+        "$(dirname "$0")/../calib/route_bias_rebake" "$MDL" "$CHRB" 2.5 "$RB" 0.0 >&2 || LOG "减冠军偏置失败"
+        "$(dirname "$0")/../calib/route_alpha_set" "$MDL" "$RB" 0.0 --snapshot-only >&2 || true
+        "$(dirname "$0")/../calib/route_alpha_set" "$MDL" "$RB" "${RB_ALPHA:-2.5}" >&2 || true
         LOG "路由偏置 α=${RB_ALPHA:-2.5} 已烘焙"
     fi
 }

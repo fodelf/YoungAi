@@ -64,14 +64,14 @@ CHRB="$ROOT/gguf/go-onebit/g7/route_bias_v4fix.bin"
 RB28="$OUTF/route_bias_r28.bin"
 rm -f "$MDL.bias0.bin"                         # 新模型 ⇒ 旧快照作废
 LOG "路由① 减冠军 2.5·Δb_v4fix(骨架抄自 v4bf, 实测 k=+2.27 r=+0.94)"
-python3 "$ROOT/gguf-tools/go-onebit/scripts/route_bias_rebake.py" \
+"$(dirname "$0")/../calib/route_bias_rebake" \
     "$MDL" "$CHRB" 2.5 "$RB28" 0.0 >&2 \
     || { LOG "★减冠军失败 — 路由仍是冠军的, 停★"; exit 8; }
 LOG "路由② 快照裸态"
-python3 "$ROOT/gguf-tools/go-onebit/scripts/route_alpha_set.py" \
+"$(dirname "$0")/../calib/route_alpha_set" \
     "$MDL" "$RB28" 0.0 --snapshot-only >&2 || exit 9
 LOG "路由③ 写 α=${RB_ALPHA:-2.5}(冠军定标起点; 最终值由合并后实扫定)"
-python3 "$ROOT/gguf-tools/go-onebit/scripts/route_alpha_set.py" \
+"$(dirname "$0")/../calib/route_alpha_set" \
     "$MDL" "$RB28" "${RB_ALPHA:-2.5}" >&2 || exit 9
 
 # ---- 阶段4: 生成冒烟(判决: 输出是否恢复正常) ----
@@ -89,7 +89,7 @@ echo >&2
 # 生成看得见。route_alpha_set 幂等, 每个 α 都从裸态重写, 秒级, 不碰层文件。
 if [ "${SWEEP_ALPHA:-0}" = 1 ]; then
     for A in 0 1 2.5 4; do
-        python3 "$ROOT/gguf-tools/go-onebit/scripts/route_alpha_set.py" "$MDL" "$RB28" "$A" >&2 || continue
+        "$(dirname "$0")/../calib/route_alpha_set" "$MDL" "$RB28" "$A" >&2 || continue
         env DS4_ZCHAIN="$OUTF/zchain.bin" DS4_METAL_EXPERT_OFFLOAD=1 DS4_METAL_PREFILL_CHUNK=512 \
             "$ROOT/ds4" -m "$MDL" --ctx 8192 \
             -p "写一个Go函数,计算两个整数之和" -n 64 --temp 0 \
