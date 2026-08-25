@@ -6568,3 +6568,21 @@ ds4_unit 单测逐字节回归(-ffast-math 下也逐位一致)。zlayer 已切�
 闸门: 每步 make/make cpu/make test 全绿(离线套件), server 104 项/kv 17 项/
 tp-allreduce/metal-kernels 全过。合并冲突处置模式: Makefile 变量块并置+
 cpu/clean 取并集+标记 grep 清零(一次漏检 clean 块被 grep 抓回, 已修)。
+
+## 2026-08-25 重构阶段4: ds4.c → src/core/ 六十文件落地(restructure 分支)
+
+24614 行引擎主文件按 60 文件地图机械拆分并合并主线。要点:
+- 符号对账: 基线 ds4.o 导出 126 个, 拆分后丢失=0, 新增 415 个(跨文件化的原
+  static, 预期增量)。热核同 TU 铁律落实(dot_i8_32+dot_q8_0_row 族+matvec
+  worker 全在 core_kern_q8.c; NEON f16 转换 static inline 上头一字未改)。
+- 最后单独一 commit 把 e4m3/e2m1/deq_q2K 换 src/common 唯一实现(逐位等价
+  预核对), ds4_unit 金标仍绿——复用性要求在引擎侧落地。
+- 3 个显式 EXCEPTION(>500 行单函数): core_gpu_prefill_attn 1434 /
+  core_gpu_decode_layer 1180 / core_engine_open 599。函数内拆分需真模型
+  逐位闸, 排到 spark 验证工序。
+- 合并撞出 xrealloc 三重定义(core/agent/server 各自提升了本模块 static):
+  按 xmalloc 先例, agent/server 两份转内部头 static inline, 全局留 core。
+- 内部头按 500 行规则拆成 4 个(core_internal/core_types/core_inline/
+  core_gpu_graph), .c 侧仍只 include core_internal.h。
+闸门: make/make cpu/make test 全绿。CUDA 段 Makefile 已同步改, spark 实测
+待阶段6。
