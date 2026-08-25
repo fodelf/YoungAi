@@ -1,4 +1,6 @@
-/* st_read.c — 最小 DeepSeek V4 HF 读器 (C): FP8 E4M3 + 128×128 块 F32 scale safetensors。
+/* ds4_st.c — 最小 DeepSeek V4 HF 读器 (C): FP8 E4M3 + 128×128 块 F32 scale safetensors。
+ * 全仓唯一 safetensors 实现(2026-08-25 重构阶段2 自 quant/st_read.c 升格;
+ * 旧路径留转发 stub 服务 7 个源 include 式消费方, 链接式转换见阶段7)。
  * 对应 ds4reader.py。忠实移植: e4m3 LUT + 块 scale dequant + safetensors JSON 头(最小解析)。
  * 验证: --selftest 读一个真实 HF 权重前几值, 与 numpy R.read_weight 对拍。
  * 编译: cc -O3 -DST_READ_SELFTEST -lm st_read.c -o st_selftest
@@ -22,15 +24,14 @@ static ssize_t st_pread(int fd, void *buf, size_t n, off_t off) {
     return r;
 }
 
+#include "ds4_fp8.h"
+
 static float ST_LUT[256];
 static int g_bbq4 = -1;   /* backbone q4 往返: -1=看 DS4_BB_Q4 env, 0/1=运行时切(BBQ4_AB 同进程 A/B) */
+/* LUT 改由 src/common/ds4_fp8.h 的唯一 E4M3 解码填充(重构阶段2 收敛 6 份副本)。
+ * 数值逐位等价原 powf 式: 全部是 2 的幂精确缩放, NaN/±0 槽位同。 */
 static void st_lut_init(void) {
-    for (int b = 0; b < 256; b++) {
-        int s=(b>>7)&1, e=(b>>3)&0xF, m=b&0x7; float sign=s?-1.f:1.f;
-        if (e==0) ST_LUT[b]=sign*(m/8.0f)*powf(2.0f,-6);
-        else if (e==0xF && m==0x7) ST_LUT[b]=NAN;
-        else ST_LUT[b]=sign*(1.0f+m/8.0f)*powf(2.0f,(float)(e-7));
-    }
+    for (int b = 0; b < 256; b++) ST_LUT[b] = ds4_e4m3fn_to_f32((uint8_t)b);
 }
 
 /* 在 JSON 文本里找 "name":{...} 段, 取 dtype/shape[2]/data_offsets[2]. 返回段起始或 NULL. */
@@ -194,7 +195,9 @@ float *st_read_weight(st_ctx *c, const char *name, long *R_out, long *C_out) {
         /* ★0731 routed 专家 = MXFP4★: I8 容器 [R, C/2](每字节 2 个 E2M1 nibble, 低位先)
          * + F8_E8M0 scale [R, C/32](1×32 微块)。返回口径与其余分支一致: 解包后 f32 [R, C真]。
          * 几何/查表与 deepseek4-quantize.c dequant_fp4_weight 逐位一致(那边已验过 packed release)。 */
-        static const float FP4T[16]={0.f,.5f,1.f,1.5f,2.f,3.f,4.f,6.f,-0.f,-.5f,-1.f,-1.5f,-2.f,-3.f,-4.f,-6.f};
+        /* FP4 值表来自 src/common/ds4_fp8.h 唯一实现(重构阶段2 收敛) */
+        static float FP4T[16]; static int fp4t_init=0;
+        if(!fp4t_init){ for(int i=0;i<16;i++) FP4T[i]=ds4_fp4_nibble_to_f32((uint8_t)i); fp4t_init=1; }
         long Cin=Cc*2, nblk=Cin/32;
         if(Cin%32){ fprintf(stderr,"st: FP4 %s C=%ld 不整除32\n",name,Cin); exit(1); }
         char sname[512]; snprintf(sname,sizeof(sname),"%s",name);
