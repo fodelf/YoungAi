@@ -1,6 +1,7 @@
 /* cuda_zchain_1.inc.cu — ds4_cuda.cu 机械拆分分片(聚合根按序 #include, 单 TU 语义不变)。
  * go-onebit DQZ2 zchain + 路由闭式 RTE 侧车。
  */
+#include <cuda_fp8.h>   /* 本分片 zc_fp8_ld 的 __nv_cvt_* 所需; 原在 ds4_cuda.cu 中段, 拆分时移到分片文首 */
 /* ===== go-onebit DQZ2 zchain (CUDA) =====
  * Metal kernel_dsv4_zchain_{ge,scale} 的逐语义平移(数学契约: ds4_zchain.h)。
  * 常驻小表一次上传; dispatch 纯 kernel launch, token-graph capture 兼容。 */
@@ -246,7 +247,6 @@ static __global__ void zc_zl_pv_kernel(
     }
 }
 
-#include <cuda_fp8.h>
 __device__ __forceinline__ static float zc_fp8_ld(const uint8_t *p) {
     __half_raw hr = __nv_cvt_fp8_to_halfraw(*p, __NV_E4M3);
     return __half2float(*(const __half *)&hr);
