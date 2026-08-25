@@ -648,23 +648,16 @@ static st_value db_read(st_db *db, const char *name) {
  * DeepSeek V4 data conversion
  */
 
-static float e8m0_to_f32(uint8_t e) {
-    const uint32_t bits = e == 0 ? 0x00400000u : ((uint32_t)e << 23);
-    float result;
-    memcpy(&result, &bits, sizeof(result));
-    return result;
-}
+/* e4m3/e8m0: 换 src/common/ds4_fp8.h 共享实现(批2 收敛)。
+ * ★E4M3 语义陷阱★共享库把 0x7f/0xff(NaN 槽)解成 NaN(IEEE 语义, ds4_fp8.h 头注有言);
+ * 本量化器旧实现解成 0.0f, 含 NaN 权重的量化输出字节依赖这个口径 —— 显式包一层保旧语义。 */
+#include "../src/common/ds4_fp8.h"
+
+static float e8m0_to_f32(uint8_t e) { return ds4_e8m0_to_f32(e); }
 
 static float e4m3fn_to_f32(uint8_t x) {
-    const uint8_t abs = x & 0x7f;
-    const bool sign = (x & 0x80) != 0;
-    if (abs == 0) return sign ? -0.0f : 0.0f;
-    if (abs == 0x7f) return 0.0f;
-    const int exp = (x >> 3) & 0x0f;
-    const int man = x & 0x07;
-    float value = exp == 0 ? ldexpf((float)man, -9)
-                           : ldexpf(1.0f + (float)man / 8.0f, exp - 7);
-    return sign ? -value : value;
+    float v = ds4_e4m3fn_to_f32(x);
+    return isnan(v) ? 0.0f : v;
 }
 
 static float bf16_to_f32_bits(uint16_t bits) {

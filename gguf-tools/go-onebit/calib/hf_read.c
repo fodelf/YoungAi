@@ -59,46 +59,23 @@ struct hf_db {
 /* =============================== numeric =============================== */
 
 static float f32_from_bits(uint32_t b) { float f; memcpy(&f, &b, 4); return f; }
-static uint32_t f32_to_bits(float f)   { uint32_t b; memcpy(&b, &f, 4); return b; }
 
-/* IEEE half -> f32 (matches ds4q_f16_to_f32). */
-static float f16_to_f32(uint16_t bits) {
-    const uint32_t w = (uint32_t)bits << 16;
-    const uint32_t sign = w & 0x80000000u;
-    const uint32_t two_w = w + w;
-    const uint32_t exp_offset = 0xE0u << 23;
-    const float exp_scale = 0x1.0p-112f;
-    const float normalized = f32_from_bits((two_w >> 4) + exp_offset) * exp_scale;
-    const uint32_t magic_mask = 126u << 23;
-    const float magic_bias = 0.5f;
-    const float denormalized = f32_from_bits((two_w >> 17) | magic_mask) - magic_bias;
-    const uint32_t cutoff = 1u << 27;
-    const uint32_t r = sign | (two_w < cutoff ? f32_to_bits(denormalized)
-                                              : f32_to_bits(normalized));
-    return f32_from_bits(r);
-}
+/* f16/bf16/e4m3/e8m0 标量: 换 src/common 共享实现(批2 收敛, 原地四份人肉副本清掉)。
+ * 本地名保留成薄包装, 调用点零改动。 */
+#include "../../../src/common/ds4_float.h"
+#include "../../../src/common/ds4_fp8.h"
 
-/* bf16 -> f32 (matches ds4q_bf16_to_f32). */
-static float bf16_to_f32(uint16_t bits) { return f32_from_bits((uint32_t)bits << 16); }
+static float f16_to_f32(uint16_t bits)  { return ds4_f16_to_f32(bits); }
+static float bf16_to_f32(uint16_t bits) { return ds4_bf16_to_f32(bits); }
 
-/* E4M3FN (FP8) -> f32 (matches e4m3fn_to_f32). */
+/* ★E4M3 语义陷阱★共享库把 0x7f/0xff(NaN 槽)解成 NaN(IEEE 语义, 见 ds4_fp8.h 头注);
+ * 本文件旧实现一直解成 0.0f —— 含 NaN 权重的读数是既定口径, 显式包一层保旧语义。 */
 static float e4m3fn_to_f32(uint8_t x) {
-    const uint8_t a = x & 0x7f;
-    const int sign = (x & 0x80) != 0;
-    if (a == 0)    return sign ? -0.0f : 0.0f;
-    if (a == 0x7f) return 0.0f;                 /* NaN slot -> 0, as upstream */
-    const int exp = (x >> 3) & 0x0f;
-    const int man = x & 0x07;
-    float v = exp == 0 ? ldexpf((float)man, -9)
-                       : ldexpf(1.0f + (float)man / 8.0f, exp - 7);
-    return sign ? -v : v;
+    float v = ds4_e4m3fn_to_f32(x);
+    return isnan(v) ? 0.0f : v;
 }
 
-/* E8M0 block scale -> f32 (matches e8m0_to_f32). */
-static float e8m0_to_f32(uint8_t e) {
-    const uint32_t bits = e == 0 ? 0x00400000u : ((uint32_t)e << 23);
-    return f32_from_bits(bits);
-}
+static float e8m0_to_f32(uint8_t e) { return ds4_e8m0_to_f32(e); }
 
 static uint16_t load_u16_le(const uint8_t *p) {
     return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
