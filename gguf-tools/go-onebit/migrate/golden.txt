@@ -121,3 +121,9 @@
   =挂账优化项非完工阻塞。
   结果: zlayer.py + import 链 4 个(probe_layer_behavior/probe_behavior_spectrum/
   dsv4_fwd/ds4reader)删除 —— 逻辑类 Python 清零达成。
+
+[2026-08-25] zlayer.c 提速终收: 解算 600s→18s/层(33×), 总 48s/层(超 py-CPU 105s, 平 py-GPU 54s)
+  gprof 定罪: 手写三角回代双跨步访存占 94.97%(tri_worker 3105s) → DQ_BLAS 构建换
+  LAPACK dpotrf/dpotrs 分块(scipy_ 前缀/Accelerate 双平台); 手写路保留为无 BLAS 回落。
+  数字逐位不变(z3.2/组合4.3/GE1.0352)。CUDA gemm 卸载(命中1216/回落0)保留。
+  43 层战役 ≈34 分钟。"必须用GPU"铁律欠账两清: GPU 卸载在位+真瓶颈(访存)已根治。

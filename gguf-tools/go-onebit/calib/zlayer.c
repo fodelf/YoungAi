@@ -351,6 +351,37 @@ static void tri_worker(void *vc, int c0, int c1) {
         }
     }
 }
+#ifdef DQ_BLAS
+/* LAPACK 分块 potrf/potrs(openblas/Accelerate 自带): 与下方手写 Cholesky 同数学,
+ * 尾位不同=既有"Cholesky vs numpy LU"预算类。gprof 实锤: 手写回代双跨步访存占 95%
+ * (3105s/解), 分块版是同规模 numpy 33s 的实现口径。
+ * 行主序对称阵以列主序视角取 uplo='U' 等价; B 行主序[n×nrhs]需转置进出。 */
+#if defined(__APPLE__)
+extern void dpotrf_(const char *, const int *, double *, const int *, int *);
+extern void dpotrs_(const char *, const int *, const int *, const double *, const int *, double *, const int *, int *);
+#define ZL_DPOTRF dpotrf_
+#define ZL_DPOTRS dpotrs_
+#else
+extern void scipy_dpotrf_(const char *, const int *, double *, const int *, int *);
+extern void scipy_dpotrs_(const char *, const int *, const int *, const double *, const int *, double *, const int *, int *);
+#define ZL_DPOTRF scipy_dpotrf_
+#define ZL_DPOTRS scipy_dpotrs_
+#endif
+static int chol_solve(double *A, int n, double *B, int nrhs) {
+    int info = 0; const char up = 'U';
+    ZL_DPOTRF(&up, &n, A, &n, &info);
+    if (info) return -1;
+    double *Bt = (double *)xmalloc((size_t)n * nrhs * 8);
+    for (int i = 0; i < n; i++)   /* rm[n×nrhs] → cm(=rm 的转置) */
+        for (int c = 0; c < nrhs; c++) Bt[(size_t)c * n + i] = B[(size_t)i * nrhs + c];
+    ZL_DPOTRS(&up, &n, &nrhs, A, &n, Bt, &n, &info);
+    if (info) { free(Bt); return -1; }
+    for (int i = 0; i < n; i++)
+        for (int c = 0; c < nrhs; c++) B[(size_t)i * nrhs + c] = Bt[(size_t)c * n + i];
+    free(Bt);
+    return 0;
+}
+#else
 static int chol_solve(double *A, int n, double *B, int nrhs) {
     for (int j = 0; j < n; j++) {
         double d = A[(size_t)j * n + j];
@@ -367,6 +398,7 @@ static int chol_solve(double *A, int n, double *B, int nrhs) {
     parallel_for(nrhs, tri_worker, &tc);
     return 0;
 }
+#endif
 
 /* 一般方阵 LU + 部分主元(GE 的 np.linalg.solve 位: Gg 只有 256×256, 直接照 LAPACK 语义走) */
 static int lu_solve(double *A, int n, double *b) {
