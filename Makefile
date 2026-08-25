@@ -106,7 +106,7 @@ AGENT_OBJS = $(AGENT_SRCS:.c=.o)
 AGENT_CPU_OBJS = $(AGENT_SRCS:.c=_cpu.o)
 AGENT_HDRS = src/agent/agent_internal.h src/agent/agent_types.h ds4.h ds4_distributed.h ds4_kvstore.h ds4_web.h linenoise.h
 
-.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression e0
+.PHONY: all help clean test linecount cpu cuda cuda-spark cuda-generic cuda-regression e0
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent modules
@@ -367,11 +367,23 @@ ds4_unit: tests/unit/test_common.c src/common/ds4_quantfmt.c src/common/ds4_gguf
 	$(CC) $(CFLAGS) -Isrc/common -o $@ tests/unit/test_common.c \
 	    src/common/ds4_quantfmt.c src/common/ds4_gguf.c $(LDLIBS)
 
-test: ds4_test ds4-eval ds4_unit
+test: ds4_test ds4-eval ds4_unit linecount
 	./ds4_unit
 	./ds4-eval --self-test-extractors
 	./ds4_test
 
+
+# 500 行守卫(重构阶段9): 源文件单文件 ≤500 行, 豁免清单见 .linecount-exempt
+# (vendored/单函数 EXCEPTION/冻结转录)。gguf-tools 大文件拆分(批6)落地前
+# 该目录暂不纳入; 批6 合并后把 find 范围加上 gguf-tools。
+linecount:
+	@ex=$$(grep -v '^#' .linecount-exempt | grep -v '^$$'); \
+	viol=$$(find src tests metal ds4*.c ds4*.h vq_fmt.h rax.c rax.h rax_malloc.h linenoise.c linenoise.h \
+	        \( -name '*.c' -o -name '*.h' -o -name '*.m' -o -name '*.cu' -o -name '*.cuh' -o -name '*.metal' -o -name '*.inc' \) \
+	        2>/dev/null | sort -u | grep -v -x -F "$$ex" \
+	        | xargs wc -l 2>/dev/null | awk '$$2 != "total" && $$1 > 500 {print $$1, $$2}'); \
+	if [ -n "$$viol" ]; then echo "linecount: 以下文件超 500 行(豁免走 .linecount-exempt, 要带理由):"; echo "$$viol"; exit 1; \
+	else echo "linecount: ok (≤500 行, 豁免清单外零超标)"; fi
 clean:
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_unit e0-pingpong mm-ui mm-ocr *.o src/cli/*.o src/bench/*.o src/kv/*.o src/web/*.o src/eval/*.o src/agent/*.o src/dist/*.o src/server/*.o src/core/*.o src/common/*.o src/metal/*.o tests/server_tests_*.o tests/t_*.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
 

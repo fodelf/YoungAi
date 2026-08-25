@@ -1,0 +1,27 @@
+# 500 行守卫豁免清单(make linecount 读取; 每行一个仓库相对路径, # 开头是注释)。
+# 收录标准: ①vendored 第三方(不改上游代码) ②单函数/单模板超 500 的显式 EXCEPTION
+# (函数内拆分需真模型逐位闸, 见 fable5.md 重构记录) ③冻结转录(禁改进纪律)。
+# 新增豁免必须带理由注释; "还没来得及拆"不是理由。
+
+# vendored (antirez)
+rax.c
+linenoise.c
+
+# EXCEPTION: 单函数 >500 行(机械拆分不切函数体; 函数内拆分=后续工序, 需真模型闸)
+src/core/core_gpu_prefill_attn.c
+src/core/core_gpu_decode_layer.c
+src/core/core_engine_open.c
+src/metal/metal_init.m
+src/metal/metal_routed_moe_batch.m
+metal/flash_attn_ext.metal
+src/cuda/cuda_moe_launch.inc.cu
+src/cuda/cuda_vq_fused2_3.inc.cu
+
+# 冻结转录(上一代放大器解算器, 文件头自述"复现旧战役用, 禁改进")
+gguf-tools/legacy/amp_solve_zc.c
+
+# GPU 单文件工具惯例(spark-only, 拆分收益低风险高)
+gguf-tools/quantize/vq_em.cu
+
+# 一次性设计探针(无演进面)
+gguf-tools/amp/hbase.c
