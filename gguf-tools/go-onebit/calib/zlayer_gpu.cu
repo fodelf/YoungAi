@@ -1,11 +1,11 @@
-/* zlayer_gpu.cu — zlayer.c 的 CUDA 热点卸载(cuBLAS 薄封装, 2026-08-25 二期)。
- * 依据: "spark 重计算必须 GPU 化"铁律; 一期纯 CPU ~570s/层, 热点全是 gemm 形
- * (教师/学生专家前向 255×3 gemm、Gram 4608²×4096、SVD 子空间迭代、k 曲线评估)。
- * 语义: 与 CPU 路"数值同语义(fp32/f64, 求和顺序重排容差)" —— 这正是 zlayer.py 自身
- * cupy/numpy 双路的既有契约(能力探测非行为开关), 金标口径=held 挽回打印精度一致。
- * 接口: C 可调 zg_* 族; zg_ready()==0 时调用方走 CPU 原路(能力探测, 无行为开关)。
+/* zlayer_gpu.cu — zlayer.c 的 CUDA 热点卸载(cuBLAS 通用行主序 gemm, 2026-08-25 二期)。
+ * 依据: "spark 重计算必须 GPU 化"铁律; CPU(openblas 20线程) ~585s/层, 热点全在
+ * mm64/mm32 两个中央 gemm 入口(教师/学生前向、Gram、SVD 子空间迭代、k 曲线评估)。
+ * 语义契约 = zlayer.py 自身 cupy/numpy 双路先例: 能力探测非行为开关, 数值同语义
+ * (求和顺序重排容差); CUDA 构建的金标口径 = held 挽回打印精度(0.1pp), 非逐字符。
+ * 行主序 gemm: C[M×N] = op(A)·op(B) 经列主序恒等式 C_cm = op(B)_cm·op(A)_cm 直传 cuBLAS。
  * 构建: nvcc -O3 -arch=native -c zlayer_gpu.cu -o zlayer_gpu.o
- *       gcc ... zlayer.c zlayer_gpu.o -DZL_CUDA -lcublas -lcudart -lstdc++ ... */
+ *       gcc ... -DZL_CUDA zlayer.c zlayer_gpu.o -lcublas -lcudart -lstdc++ */
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <cstdio>
@@ -13,6 +13,9 @@
 
 static cublasHandle_t g_h = nullptr;
 static int g_init = 0, g_ok = 0;
+/* 设备缓冲复用(层内多次大 gemm, 避免每次 cudaMalloc) */
+static void *g_dA = nullptr, *g_dB = nullptr, *g_dC = nullptr;
+static size_t g_sA = 0, g_sB = 0, g_sC = 0;
 
 extern "C" int zg_ready(void) {
     if (!g_init) {
@@ -23,64 +26,43 @@ extern "C" int zg_ready(void) {
     }
     return g_ok;
 }
+static int ensure(void **p, size_t *cur, size_t need) {
+    if (*cur >= need) return 1;
+    if (*p) cudaFree(*p);
+    *p = nullptr; *cur = 0;
+    if (cudaMalloc(p, need) != cudaSuccess) return 0;
+    *cur = need;
+    return 1;
+}
 
-/* 行主序 C = A(m×k) · B(k×n)ᵀ?  统一约定: 本封装做 行主序 C[m×n] = A[m×k]·B[n×k]ᵀ
- * (调用方矩阵都是行主序、右操作数按"行=输出列"存 —— zlayer 的 X@V / Xa@Xa.T / U 投影
- * 全是这个形。cuBLAS 列主序 ⇒ 等价调用 sgemm(N,T) 于转置视图。) */
-extern "C" int zg_sgemm_nt(int m, int n, int k, const float *A, const float *B, float *C) {
+/* 通用行主序 gemm(与 cblas_?gemm(RowMajor, ta, tb, M,N,K, 1, A,lda, B,ldb, 0, C,ldc) 同参型)。
+ * 返回 1=完成, 0=不可用/失败(调用方走 CPU 原路)。 */
+extern "C" int zg_dgemm(int ta, int tb, int M, int N, int K,
+                        const double *A, int lda, const double *B, int ldb, double *C, int ldc) {
     if (!zg_ready()) return 0;
-    float *dA, *dB, *dC;
-    size_t sa = (size_t)m * k * 4, sb = (size_t)n * k * 4, sc = (size_t)m * n * 4;
-    if (cudaMalloc(&dA, sa) != cudaSuccess) return 0;
-    if (cudaMalloc(&dB, sb) != cudaSuccess) { cudaFree(dA); return 0; }
-    if (cudaMalloc(&dC, sc) != cudaSuccess) { cudaFree(dA); cudaFree(dB); return 0; }
-    cudaMemcpy(dA, A, sa, cudaMemcpyHostToDevice);
-    cudaMemcpy(dB, B, sb, cudaMemcpyHostToDevice);
+    size_t ra = (size_t)(ta ? K : M) * lda * 8, rb = (size_t)(tb ? N : K) * ldb * 8, rc = (size_t)M * ldc * 8;
+    if (!ensure(&g_dA, &g_sA, ra) || !ensure(&g_dB, &g_sB, rb) || !ensure(&g_dC, &g_sC, rc)) return 0;
+    if (cudaMemcpy(g_dA, A, ra, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+    if (cudaMemcpy(g_dB, B, rb, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+    const double one = 1.0, zero = 0.0;
+    /* 行主序→列主序: C_cm[N×M] = op(B)_cm · op(A)_cm */
+    cublasStatus_t st = cublasDgemm(g_h,
+        tb ? CUBLAS_OP_T : CUBLAS_OP_N, ta ? CUBLAS_OP_T : CUBLAS_OP_N,
+        N, M, K, &one, (const double *)g_dB, ldb, (const double *)g_dA, lda, &zero, (double *)g_dC, ldc);
+    if (st != CUBLAS_STATUS_SUCCESS) return 0;
+    return cudaMemcpy(C, g_dC, rc, cudaMemcpyDeviceToHost) == cudaSuccess;
+}
+extern "C" int zg_sgemm(int ta, int tb, int M, int N, int K,
+                        const float *A, int lda, const float *B, int ldb, float *C, int ldc) {
+    if (!zg_ready()) return 0;
+    size_t ra = (size_t)(ta ? K : M) * lda * 4, rb = (size_t)(tb ? N : K) * ldb * 4, rc = (size_t)M * ldc * 4;
+    if (!ensure(&g_dA, &g_sA, ra) || !ensure(&g_dB, &g_sB, rb) || !ensure(&g_dC, &g_sC, rc)) return 0;
+    if (cudaMemcpy(g_dA, A, ra, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+    if (cudaMemcpy(g_dB, B, rb, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
     const float one = 1.0f, zero = 0.0f;
-    /* 列主序: C_cm[n×m] = B_cm[k×n]ᵀ · A_cm[k×m] ⇒ sgemm(T, N, n, m, k, B, k, A, k, C, n) */
-    cublasStatus_t st = cublasSgemm(g_h, CUBLAS_OP_T, CUBLAS_OP_N, n, m, k,
-                                    &one, dB, k, dA, k, &zero, dC, n);
-    int ok = (st == CUBLAS_STATUS_SUCCESS);
-    if (ok) cudaMemcpy(C, dC, sc, cudaMemcpyDeviceToHost);
-    cudaFree(dA); cudaFree(dB); cudaFree(dC);
-    return ok;
-}
-
-extern "C" int zg_dgemm_nt(int m, int n, int k, const double *A, const double *B, double *C) {
-    if (!zg_ready()) return 0;
-    double *dA, *dB, *dC;
-    size_t sa = (size_t)m * k * 8, sb = (size_t)n * k * 8, sc = (size_t)m * n * 8;
-    if (cudaMalloc(&dA, sa) != cudaSuccess) return 0;
-    if (cudaMalloc(&dB, sb) != cudaSuccess) { cudaFree(dA); return 0; }
-    if (cudaMalloc(&dC, sc) != cudaSuccess) { cudaFree(dA); cudaFree(dB); return 0; }
-    cudaMemcpy(dA, A, sa, cudaMemcpyHostToDevice);
-    cudaMemcpy(dB, B, sb, cudaMemcpyHostToDevice);
-    const double one = 1.0, zero = 0.0;
-    cublasStatus_t st = cublasDgemm(g_h, CUBLAS_OP_T, CUBLAS_OP_N, n, m, k,
-                                    &one, dB, k, dA, k, &zero, dC, n);
-    int ok = (st == CUBLAS_STATUS_SUCCESS);
-    if (ok) cudaMemcpy(C, dC, sc, cudaMemcpyDeviceToHost);
-    cudaFree(dA); cudaFree(dB); cudaFree(dC);
-    return ok;
-}
-
-/* 对称 Gram: C[m×m] = A[m×k]·Aᵀ (f64, ridge 由调用方加) — cublasDsyrk 半三角+镜像 */
-extern "C" int zg_dgram(int m, int k, const double *A, double *C) {
-    if (!zg_ready()) return 0;
-    double *dA, *dC;
-    size_t sa = (size_t)m * k * 8, sc = (size_t)m * m * 8;
-    if (cudaMalloc(&dA, sa) != cudaSuccess) return 0;
-    if (cudaMalloc(&dC, sc) != cudaSuccess) { cudaFree(dA); return 0; }
-    cudaMemcpy(dA, A, sa, cudaMemcpyHostToDevice);
-    const double one = 1.0, zero = 0.0;
-    cublasStatus_t st = cublasDsyrk(g_h, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_T,
-                                    m, k, &one, dA, k, &zero, dC, m);
-    int ok = (st == CUBLAS_STATUS_SUCCESS);
-    if (ok) {
-        cudaMemcpy(C, dC, sc, cudaMemcpyDeviceToHost);
-        for (int i = 0; i < m; i++)   /* 下三角(列主序)=上三角(行主序) → 镜像补全 */
-            for (int j = 0; j < i; j++) C[(size_t)i * m + j] = C[(size_t)j * m + i];
-    }
-    cudaFree(dA); cudaFree(dC);
-    return ok;
+    cublasStatus_t st = cublasSgemm(g_h,
+        tb ? CUBLAS_OP_T : CUBLAS_OP_N, ta ? CUBLAS_OP_T : CUBLAS_OP_N,
+        N, M, K, &one, (const float *)g_dB, ldb, (const float *)g_dA, lda, &zero, (float *)g_dC, ldc);
+    if (st != CUBLAS_STATUS_SUCCESS) return 0;
+    return cudaMemcpy(C, g_dC, rc, cudaMemcpyDeviceToHost) == cudaSuccess;
 }

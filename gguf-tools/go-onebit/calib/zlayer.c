@@ -265,10 +265,21 @@ static void mm64_worker(void *vc, int i0, int i1) {
         }
     }
 }
+#ifdef ZL_CUDA
+/* CUDA 卸载(zlayer_gpu.cu): 大 gemm 走 cuBLAS, 小的/GPU 不可用回落 CPU。
+ * 契约=py 自身 cupy/numpy 双路(能力探测, 数值同语义求和序容差); 阈值只挑真热点。 */
+extern int zg_dgemm(int, int, int, int, int, const double *, int, const double *, int, double *, int);
+extern int zg_sgemm(int, int, int, int, int, const float *, int, const float *, int, float *, int);
+#define ZG_MIN_FLOPS 5.0e8
+static long zg_hits=0, zg_miss=0;
+#endif
 static void mm64(int ta, int tb, int M, int N, int K, const double *A, int lda,
                  const double *B, int ldb, double *C, int ldc) {
     if (M <= 0 || N <= 0) return;
     if (K <= 0) { for (int i = 0; i < M; i++) for (int j = 0; j < N; j++) C[(size_t)i * ldc + j] = 0.0; return; }
+#ifdef ZL_CUDA
+    if ((double)M * N * K >= ZG_MIN_FLOPS) { if (zg_dgemm(ta, tb, M, N, K, A, lda, B, ldb, C, ldc)) { zg_hits++; return; } zg_miss++; }
+#endif
 #ifdef DQ_BLAS
     cblas_dgemm(CblasRowMajor, ta ? CblasTrans : CblasNoTrans, tb ? CblasTrans : CblasNoTrans,
                 M, N, K, 1.0, A, lda, B, ldb, 0.0, C, ldc);
@@ -306,6 +317,9 @@ static void mm32(int ta, int tb, int M, int N, int K, const float *A, int lda,
                  const float *B, int ldb, float *C, int ldc) {
     if (M <= 0 || N <= 0) return;
     if (K <= 0) { for (int i = 0; i < M; i++) for (int j = 0; j < N; j++) C[(size_t)i * ldc + j] = 0.0f; return; }
+#ifdef ZL_CUDA
+    if ((double)M * N * K >= ZG_MIN_FLOPS) { if (zg_sgemm(ta, tb, M, N, K, A, lda, B, ldb, C, ldc)) { zg_hits++; return; } zg_miss++; }
+#endif
 #ifdef DQ_BLAS
     cblas_sgemm(CblasRowMajor, ta ? CblasTrans : CblasNoTrans, tb ? CblasTrans : CblasNoTrans,
                 M, N, K, 1.0f, A, lda, B, ldb, 0.0f, C, ldc);
@@ -2682,5 +2696,8 @@ int main(int argc, char **argv) {
            "缓存 %.0fs 解算 %.0fs 总 %.0fs | %s\n",
            L, rz * 100, comb * 100, gemean, add_len / 1048576.0,
            t1 - t0, t2 - t1, t3 - t0, status);
+#ifdef ZL_CUDA
+    fprintf(stderr, "[zg] gemm卸载 命中=%ld 回落=%ld\n", zg_hits, zg_miss);
+#endif
     return 0;
 }

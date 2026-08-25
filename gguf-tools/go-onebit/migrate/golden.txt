@@ -113,3 +113,11 @@
     多重集) ⑤CLI 报错 6 例文本+退出码 ⑥数据集抓取+gz 产物逐字节。
   注: 判 Python 题执行模型生成代码用 python3 解释器=测试目标运行时, 非仓库逻辑代码。
   结果: 过闸 ✓ → py 删除, 7 调用方接线, build_ctools 已收编(agent 顺手完成)
+
+[2026-08-25] zlever/zlayer.py 二期收官 → calib/zlayer.c 全模式 + zlayer_gpu.cu
+  二期金标: 非XCAP L20(z3.2/组合4.3/GE1.0352/分域 逐字符) + ERF L40(专家125/挽回1.2%/
+  +11.7MB/产物同字节长) + GGUF 标量 dequant 七类型 64 块逐位对 gguf-py + QR/RNG 自检。
+  CUDA 构建口径=py cupy/numpy 双路契约(held 打印精度), 提速未兑现(642s, 计数针诊断中)
+  =挂账优化项非完工阻塞。
+  结果: zlayer.py + import 链 4 个(probe_layer_behavior/probe_behavior_spectrum/
+  dsv4_fwd/ds4reader)删除 —— 逻辑类 Python 清零达成。

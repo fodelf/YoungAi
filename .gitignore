@@ -31,3 +31,5 @@ ref_algo
 cap_algo
 gguf-tools/go-onebit/reports
 /hf-base
+# zlayer 二期对拍夹具(zlayer_fixture.py 现造现用, 约 16MB, 不入库)
+gguf-tools/go-onebit/migrate/zlayer_fixtures/

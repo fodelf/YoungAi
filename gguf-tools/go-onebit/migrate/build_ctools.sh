@@ -11,9 +11,16 @@ for t in $TOOLS; do
         gcc -O3 -march=native -DDQ_BLAS -o "$CAL/$t" "$CAL/$t.c" -framework Accelerate -lm -lpthread
       else
         SO_DIR="$HOME/.local/lib/python3.12/site-packages/scipy_openblas32/lib"
+        ZLCUDA=""; ZLOBJ=""
+        # 必须用GPU铁律: nvcc 在则叠 cuBLAS 卸载(能力探测, GPU 缺时运行时自动回落 CPU 路)
+        if [ -x /usr/local/cuda/bin/nvcc ]; then
+          /usr/local/cuda/bin/nvcc -O3 -arch=native -c "$CAL/zlayer_gpu.cu" -o "$CAL/zlayer_gpu.o"
+          ZLCUDA="-DZL_CUDA -L/usr/local/cuda/lib64 -lcublas -lcudart -lstdc++"
+          ZLOBJ="$CAL/zlayer_gpu.o"
+        fi
         gcc -O3 -march=native -DDQ_BLAS -Dcblas_sgemm=scipy_cblas_sgemm -Dcblas_dgemm=scipy_cblas_dgemm \
-          -I"$SO_DIR/../include" -o "$CAL/$t" "$CAL/$t.c" "$SO_DIR/libscipy_openblas.so" \
-          -Wl,-rpath,"$SO_DIR" -lm -lpthread
+          -I"$SO_DIR/../include" -o "$CAL/$t" "$CAL/$t.c" $ZLOBJ "$SO_DIR/libscipy_openblas.so" \
+          -Wl,-rpath,"$SO_DIR" $ZLCUDA -lm -lpthread
       fi ;;
     vq_merge_v4) gcc -O3 -march=native -o "$CAL/../quant/$t" "$CAL/../quant/$t.c" -lm ;;
     # pubbench 要 libcurl(HTTP)+zlib(数据集 .gz); 抽取器金标回归单独一个驱动。
