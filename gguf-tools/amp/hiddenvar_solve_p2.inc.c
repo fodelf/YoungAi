@@ -132,6 +132,11 @@ void z_spectrum_free(z_spectrum *s) {
 /* ================================================================== */
 #ifdef HVSOLVE_TEST
 
+/* Linux -std=c11 严格模式下 math.h 不给 M_PI(Darwin 给) — 自测段自带兜底。 */
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 /* deterministic Gaussian via splitmix64 + Box-Muller (test data only). */
 static double rnd_gauss(uint64_t *s) {
     double u1 = sm64_unit(s), u2 = sm64_unit(s);

@@ -383,7 +383,7 @@ $(QZ)/vq_merge_v4: $(QZ)/vq_merge_v4.c $(VQMERGE_INC)
 
 go2b_parity: $(QZ)/go2b_parity
 $(QZ)/go2b_parity: $(QZ)/go2b_parity.c $(QZ)/onebit_quant.h $(QZ)/go2b_qc.h
-	$(CC) $(BARE) $(NATIVE) -ffast-math -I$(QZ) -o $@ $(QZ)/go2b_parity.c $(BLAS_LIBS) -lm -lpthread
+	$(CC) $(BARE) $(NATIVE) -ffast-math -I$(QZ) $(BLAS_CFLAGS) -o $@ $(QZ)/go2b_parity.c $(BLAS_LIBS) -lm -lpthread
 
 vq2q2k_probe: $(QZ)/vq2q2k_probe
 $(QZ)/vq2q2k_probe: $(QZ)/vq2q2k_probe.c $(QZ)/quants.c $(QUANTS_INC) $(QZ)/onebit_quant.c

@@ -8,7 +8,13 @@
 #include <string.h>
 #include <math.h>
 #include <stdint.h>
+/* BLAS 平台分支与 zlayer 同款: Darwin=Accelerate, Linux=cblas(scipy_openblas 前缀
+ * 符号靠 Makefile 的 BLAS_RENAMES 改名接上; 少了 BLAS_CFLAGS 会在链接期爆未定义符号)。 */
+#if defined(__APPLE__)
 #include <Accelerate/Accelerate.h>
+#else
+#include <cblas.h>
+#endif
 #include "onebit_quant.h"   /* go1b_fp16 转换(与运行时/量化器同一实现) */
 void dq_matmul(const float *X,const float *W,float *out,int S,int K,int M){
     cblas_sgemm(CblasRowMajor,CblasNoTrans,CblasTrans,S,M,K,1.0f,X,K,W,K,0.0f,out,M);
