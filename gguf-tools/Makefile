@@ -56,6 +56,7 @@ RRR_INC := $(wildcard $(AMP)/solve_rrr_p*.inc.c)
 CALIBRUN_INC := $(wildcard $(CAL)/calib_run_p*.inc.c)
 VFWD_INC := $(wildcard $(CAL)/validate_fwd_p*.inc.c)
 DSQFWD_INC := $(wildcard $(AMP)/ds4quant_fwd_p*.inc.c)
+AMPSOLVE_INC := $(wildcard $(AMP)/amp_solve_p*.inc.c)
 
 ifeq ($(UNAME_S),Darwin)
 NATIVE ?= -mcpu=native
@@ -214,7 +215,7 @@ endif
 # (vqpipe/vqge/amp_campaign 按 $GT/<name> 找)。
 amp_solve: amp_solve.bin
 .PHONY: amp_solve.bin
-amp_solve.bin: $(AMP)/amp_solve.c $(CAL)/npy.c
+amp_solve.bin: $(AMP)/amp_solve.c $(AMPSOLVE_INC) $(CAL)/npy.c
 	$(CC) $(BARE) $(NATIVE) -I$(CAL) -o amp_solve $(AMP)/amp_solve.c $(CAL)/npy.c -lm -lpthread
 
 zchain_merge: zchain_merge.bin
