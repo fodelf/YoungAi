@@ -9,10 +9,16 @@ endif
 
 DEBUG_FLAGS ?= -g
 CFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c99 -I.
-OBJCFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -fobjc-arc -I.
+# -fno-common: 拆分后原 static 全局改为 metal_state.m 强定义+头文件 extern; Apple clang 的
+# ObjC 前端默认仍给未初始化全局 common 链接, 大数组会触发 ld 的 __common 对齐告警。
+OBJCFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -fobjc-arc -fno-common -I.
 
 LDLIBS ?= -lm -pthread
 METAL_SRCS := $(wildcard metal/*.metal)
+# ds4_metal.m 已机械拆分为 src/metal/*.m(行为零变化, 跨文件接口在 src/metal/metal_internal.h)。
+# 新增 metal 后端源文件放进 src/metal/ 即自动入列。
+METAL_OBJC_SRCS := $(wildcard src/metal/*.m)
+METAL_OBJS := $(METAL_OBJC_SRCS:.m=.o)
 
 # ds4_distributed.c 已机械拆分为 src/dist/*.c(行为零变化, 拆分见 src/dist/dist_internal.h)。
 # 对象放源旁; 两个平台段的 CORE_OBJS/CPU_CORE_OBJS 共用这一份列表。
@@ -66,7 +72,7 @@ COMMON_FMT_OBJS := src/common/ds4_quantfmt.o
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal -framework Accelerate
 MM_OBJS = ds4_multimodal.o ds4_spatial.o ds4_css.o
-CORE_OBJS = $(CORE_ENGINE_OBJS) $(COMMON_FMT_OBJS) ds4_corr.o ds4_zchain.o $(MM_OBJS) $(DIST_OBJS) ds4_metal.o
+CORE_OBJS = $(CORE_ENGINE_OBJS) $(COMMON_FMT_OBJS) ds4_corr.o ds4_zchain.o $(MM_OBJS) $(DIST_OBJS) $(METAL_OBJS)
 CPU_CORE_OBJS = $(CORE_ENGINE_CPU_OBJS) $(COMMON_FMT_OBJS) ds4_corr_cpu.o ds4_zchain.o $(MM_OBJS) $(DIST_OBJS)
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
@@ -313,8 +319,21 @@ linenoise.o: linenoise.c linenoise.h
 
 
 
-ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
-	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal.m
+# src/metal 全组 .m 只包含 metal_internal.h(其再包含 metal_args.h/metal_expert.h 与根公共头),
+# 头依赖对整组一致。metal_source.o 额外依赖 .metal kernel 文件(运行时拼接清单),
+# metal_moe_vq.o/metal_routed_moe_batch.o 额外包含 vq_fmt.h。
+METAL_INTERNAL_HDRS = src/metal/metal_internal.h src/metal/metal_args.h src/metal/metal_expert.h ds4_gpu.h ds4.h
+src/metal/%.o: src/metal/%.m $(METAL_INTERNAL_HDRS)
+	$(CC) $(OBJCFLAGS) -c -o $@ $<
+
+src/metal/metal_source.o: src/metal/metal_source.m $(METAL_INTERNAL_HDRS) $(METAL_SRCS)
+	$(CC) $(OBJCFLAGS) -c -o $@ $<
+
+src/metal/metal_moe_vq.o: src/metal/metal_moe_vq.m $(METAL_INTERNAL_HDRS) vq_fmt.h
+	$(CC) $(OBJCFLAGS) -c -o $@ $<
+
+src/metal/metal_routed_moe_batch.o: src/metal/metal_routed_moe_batch.m $(METAL_INTERNAL_HDRS) vq_fmt.h
+	$(CC) $(OBJCFLAGS) -c -o $@ $<
 
 ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_iq2_tables_cuda.inc
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
@@ -341,7 +360,7 @@ test: ds4_test ds4-eval ds4_unit
 	./ds4_test
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_unit e0-pingpong mm-ui mm-ocr *.o src/cli/*.o src/bench/*.o src/kv/*.o src/web/*.o src/eval/*.o src/agent/*.o src/dist/*.o src/server/*.o src/core/*.o src/common/*.o tests/server_tests_*.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_unit e0-pingpong mm-ui mm-ocr *.o src/cli/*.o src/bench/*.o src/kv/*.o src/web/*.o src/eval/*.o src/agent/*.o src/dist/*.o src/server/*.o src/core/*.o src/common/*.o src/metal/*.o tests/server_tests_*.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
 
 # Task 04 / E0: standalone thunderbolt ping-pong latency gate (no core deps, no
 # model). Defined after the default targets so it never becomes the default goal.
