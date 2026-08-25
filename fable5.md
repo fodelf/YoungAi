@@ -6552,3 +6552,19 @@ ds4_unit 单测逐字节回归(-ffast-math 下也逐位一致)。zlayer 已切�
 未完: 引擎/ds4_cuda/deepseek4-quantize 的副本删除归各自拆分阶段;
 注意 deepseek4-quantize 的 e4m3 把 0x7f 解成 0(非 NaN), 迁移时须显式保留。
 ⚠ spark 侧 zlayer 依赖本分支, 合并后需在 spark 重建(rebuild→check other machine)。
+
+## 2026-08-25 重构阶段3收官: 叶子程序全拆分(restructure 分支)
+
+八件全部落地, 除 vendored(rax/linenoise)与既定 EXCEPTION 外单文件 ≤500 行:
+- CLI→src/cli/ 6 文件(worktree 隔离 agent 首跑基底过期 e16ead1, 缺 8 月新增
+  187 行, 弃产出按其文件分工在正确基底重切——教训: worktree 起点必须核对 HEAD)
+- eval→src/eval/ 12 文件(用例表拆三数组+访问器; agent 做了拆分前后逐字节对照)
+- agent→src/agent/ 31 文件; dist→src/dist/ 28 文件+3头(逐行守恒核验);
+  server→src/server/ 32 文件+4 inc(generate_job 单函数 1515 行含 goto, 预处理
+  分片), 内嵌 4000 行测试块解耦为 tests/server_tests_*.c ×11 链接式
+  (ds4_test 不再 #include ds4_server.c)
+- bench→src/bench/ 2 文件; kvstore→src/kv/ 3 文件; web→src/web/ 5 文件
+- ds4_gpu.h→6 子头+伞头保名(消费方零改动)
+闸门: 每步 make/make cpu/make test 全绿(离线套件), server 104 项/kv 17 项/
+tp-allreduce/metal-kernels 全过。合并冲突处置模式: Makefile 变量块并置+
+cpu/clean 取并集+标记 grep 清零(一次漏检 clean 块被 grep 抓回, 已修)。
