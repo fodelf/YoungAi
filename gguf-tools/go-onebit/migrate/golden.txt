@@ -20,3 +20,9 @@
   输入: /tmp/traceH_noz.bin + /tmp/traceH_amp_clean_layers.bin + anchor_wt2 + trace_clean.log (spark)
   判定: 输出逐字节一致 (diff=0)
   结果: 过闸 ✓ → zlever/trace_ladder.py 删除
+
+[2026-08-25] zlever/rec_fidelity.py → calib/rec_fidelity.c
+  输入: amp_xcap/layers L0 与 L3 (zcache npz + dql 注入记录, spark)
+  判定: L0 全输出逐字符一致; L3 双金标 held=5.6%/fit=27.0% 一致。
+  C 侧新增: 最小 npz(stored/ZIP64) 解析器(np.savez 默认无压缩; ZIP64 extra id=1 真尺寸)
+  结果: 过闸 ✓ → zlever/rec_fidelity.py 删除

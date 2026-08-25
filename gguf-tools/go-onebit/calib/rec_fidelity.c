@@ -103,7 +103,7 @@ int main(int argc, char **argv) {
         memcpy(recs[nrec].nm, hdr, 16); recs[nrec].nm[16] = 0;
         memcpy(&recs[nrec].psz, hdr + 88, 8);
         recs[nrec].pay = off + 116;
-        printf("%s[%lluB] ", recs[nrec].nm, (unsigned long long)recs[nrec].psz);
+        printf("%s%s[%lluB]", nrec ? " " : "", recs[nrec].nm, (unsigned long long)recs[nrec].psz);
         off += 116 + (long long)recs[nrec].psz;
         nrec++;
     }
