@@ -1,8 +1,10 @@
 # Agent Notes
 
-`ds4.c` is a DeepSeek V4 Flash specific inference engine. It is not a generic
+DwarfStar is a DeepSeek V4 Flash specific inference engine. It is not a generic
 GGUF runner. The goal is a small, readable, high-performance C codebase with
 Objective-C only where Metal requires it and Metal kernels under `metal/`.
+Sources live under `src/` by module (2026-08-25 重构), one file ≤500 lines
+(`make linecount` enforces it; exemptions in `.linecount-exempt`).
 
 ## Goals
 
@@ -36,18 +38,28 @@ Objective-C only where Metal requires it and Metal kernels under `metal/`.
 
 ## Layout
 
-- `ds4.c`: model loading, tokenizer, CPU reference code, Metal graph scheduling,
-  sessions, disk-cache payload serialization.
-- `ds4_cli.c`: command line, linenoise REPL, interactive transcript handling.
-- `ds4_server.c`: OpenAI/Anthropic compatible HTTP API, worker queue, streaming,
-  tool-call mapping, disk KV cache policy.
-- `ds4_metal.m`: Objective-C Metal runtime and kernel wrappers.
-- `metal/*.metal`: compute kernels.
-- `tests/`: unit and live integration tests.
-- `misc/`: ignored notes, experiments, and old planning material.
+- `src/core/`: model loading, tokenizer, CPU reference code, GPU graph
+  scheduling, sessions, disk-cache payload serialization (was `ds4.c`).
+- `src/common/`: the single implementation of GGUF reading, quant-block
+  dequant, E4M3/E2M1 and f16 scalars, safetensors — shared with `gguf-tools`.
+- `src/metal/` + `metal/*.metal`: Metal runtime wrappers + compute kernels
+  (shaders are loaded at runtime by relative path; do not move `metal/`).
+- `src/cuda/`: CUDA backend (`ds4_cuda.cu` is the single-TU aggregate root).
+- `src/server/`, `src/cli/`, `src/agent/`, `src/eval/`, `src/bench/`: the five
+  binaries. `src/dist/`: distributed runtime. `src/kv/`: disk KV store.
+  `src/web/`: agent web fetch.
+- Root keeps: public headers (`ds4.h`, `ds4_gpu*.h`, ...), vendored `rax`/
+  `linenoise`, small host modules (`ds4_z`, `ds4_loss`, `ds4_corr`,
+  `ds4_zchain`, `ds4_multimodal`, `ds4_spatial`, `ds4_css`, `ds4_posttrain`).
+- `gguf-tools/`: offline quantizer + 反修 toolchain (own Makefile;
+  quantize/amp/calib/bench/scripts/data/legacy/docs/migrate).
+- `tests/`: suites (`t_*.c`), server tests, `unit/`, golden fixtures.
+- `docs/archive/`: retired campaign plans. `misc/`: old notes.
 
 ## Testing
 
-Use `make` for build validation. Use `make test` for unit/regression tests when a
-model and Metal are available. Use live server tests only when intentionally
-testing the API surface.
+Use `make` for build validation. `make test` runs offline suites (golden-fixture
+unit tests, 104 server tests, sampler units, rax, TP loopback, Metal kernel
+numerics, the ≤500-line guard) on any Mac — model-dependent suites SKIP cleanly
+when `ds4flash.gguf` is absent and run where a model exists. Use live server
+tests only when intentionally testing the API surface.
