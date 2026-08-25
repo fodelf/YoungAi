@@ -6586,3 +6586,16 @@ cpu/clean 取并集+标记 grep 清零(一次漏检 clean 块被 grep 抓回, �
   core_gpu_graph), .c 侧仍只 include core_internal.h。
 闸门: make/make cpu/make test 全绿。CUDA 段 Makefile 已同步改, spark 实测
 待阶段6。
+
+## 2026-08-25 重构: spark 真模型端到端验证 + 两处既有测试断点修复
+
+- 拆分树(ed48db6, core/metal/dist/server/agent/cli/eval/bench/kv/web 全拆后)在
+  spark `make cuda-spark` 全链 0 error; cuda-regression 首跑 5.2s 超 2s 阈值
+  =PTX JIT 首编(无 -arch 构建), 复跑 0.055s 过门。
+- 真模型探针(allq2 80GB, --cuda -c 4096 -n 24 --temp 0): exit=0, 输出连贯
+  ("1. The user asks "What is Redis used for?" - this is a simple..."),
+  prefill 16.55 / gen 34.55 t/s。拆分引擎整链(加载/tokenizer/CUDA graph/
+  采样)真机可用。
+- 顺手修掉的既有断点: tests/cuda_long_context_smoke.c 调用
+  ds4_gpu_attention_decode_heads_tensor 缺 comp_kv_f16 实参(KV F16 工作加参
+  后从未跟改, spark 上 cuda-regression 一直编不过)。
