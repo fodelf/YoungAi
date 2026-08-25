@@ -6642,3 +6642,10 @@ zlayer dequant 金标逐字节; 符号对账零丢失。
 按新路径挪(reports/corpus/quant 二进制, 清单见 gguf 重组 agent 报告);
 ②caliper_ref.sh 的 ds4quant_run.old lfile 回归钉(独立工单); ③两处自测
 写死旧 scratchpad 路径(改 mkdtemp); ④数据出库候选(gostats 21MB 等)待裁决。
+
+## 2026-08-25 重构批6落地: gguf-tools 大文件拆分收官
+
+16 文件(quants/量化器/pubbench/zlayer 7片/ds4quant_run 14片等)聚合根+分片
+拆分, 拼接 16/16 逐字节一致; zlayer 金标/pubbench 24/24/tools-test 9项/
+ds4_unit 全绿。linecount 守卫扩至全仓(含 gguf-tools), 豁免仅 vendored/
+单函数 EXCEPTION/冻结转录/GPU 单文件四类。至此单文件 ≤500 行全仓达成。
