@@ -19,6 +19,9 @@
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
+#ifndef M_PI
+#define M_PI 3.14159265358979323846  /* Linux -std=c11 严格模式 math.h 不给(Darwin 给) */
+#endif
 #include <time.h>
 #include <pthread.h>
 #include "npy.h"

@@ -339,6 +339,9 @@ void go1b_blk_dequantize_row(const void *row, float *dst, int64_t ncols) {
 #include <stdlib.h>
 #include <assert.h>
 #include <math.h>   /* test-only: sqrt/log/cos for Gaussian sampling + L2 metric */
+#ifndef M_PI
+#define M_PI 3.14159265358979323846  /* Linux -std=c11 严格模式 math.h 不给(Darwin 给) */
+#endif
 
 #define GO1B_PI 3.14159265358979323846 /* M_PI is not standard C99 */
 
