@@ -30,6 +30,10 @@ DIST_OBJS = src/dist/dist_util.o src/dist/dist_transport.o src/dist/dist_framing
 EVAL_SRCS := $(wildcard src/eval/*.c)
 EVAL_OBJS := $(EVAL_SRCS:.c=.o)
 EVAL_CPU_OBJS := $(EVAL_SRCS:.c=_cpu.o)
+# BENCH 模块(重构阶段3: ds4_bench.c 拆分为 src/bench/*.c)
+BENCH_SRCS := $(wildcard src/bench/*.c)
+BENCH_OBJS := $(BENCH_SRCS:.c=.o)
+BENCH_CPU_OBJS := $(BENCH_SRCS:.c=_cpu.o)
 # CLI 模块(重构阶段3: ds4_cli.c 拆分为 src/cli/*.c)
 CLI_SRCS := $(wildcard src/cli/*.c)
 CLI_OBJS := $(CLI_SRCS:.c=.o)
@@ -93,8 +97,8 @@ ds4: $(CLI_OBJS) linenoise.o $(CORE_OBJS)
 ds4-server: $(SERVER_OBJS) ds4_kvstore.o rax.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $(SERVER_OBJS) ds4_kvstore.o rax.o $(CORE_OBJS) $(METAL_LDLIBS)
 
-ds4-bench: ds4_bench.o $(CORE_OBJS)
-	$(CC) $(CFLAGS) -o $@ ds4_bench.o $(CORE_OBJS) $(METAL_LDLIBS)
+ds4-bench: $(BENCH_OBJS) $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(BENCH_OBJS) $(CORE_OBJS) $(METAL_LDLIBS)
 
 ds4-eval: $(EVAL_OBJS) $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $(EVAL_OBJS) $(CORE_OBJS) $(METAL_LDLIBS)
@@ -111,10 +115,10 @@ mm-ui: tools/mm_ui.swift
 mm-ocr: tools/mm_ocr.swift
 	swiftc -O tools/mm_ocr.swift -o $@
 
-cpu: $(CLI_CPU_OBJS) $(SERVER_CPU_OBJS) ds4_bench_cpu.o $(EVAL_CPU_OBJS) $(AGENT_CPU_OBJS) ds4_web.o ds4_kvstore.o linenoise.o rax.o $(CPU_CORE_OBJS)
+cpu: $(CLI_CPU_OBJS) $(SERVER_CPU_OBJS) $(BENCH_CPU_OBJS) $(EVAL_CPU_OBJS) $(AGENT_CPU_OBJS) ds4_web.o ds4_kvstore.o linenoise.o rax.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o ds4 $(CLI_CPU_OBJS) linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-server $(SERVER_CPU_OBJS) ds4_kvstore.o rax.o $(CPU_CORE_OBJS) $(LDLIBS)
-	$(CC) $(CFLAGS) -o ds4-bench ds4_bench_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o ds4-bench $(BENCH_CPU_OBJS) $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-eval $(EVAL_CPU_OBJS) $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-agent $(AGENT_CPU_OBJS) ds4_web.o ds4_kvstore.o linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
 
@@ -152,7 +156,7 @@ ds4: $(CLI_OBJS) linenoise.o $(CORE_OBJS)
 ds4-server: $(SERVER_OBJS) ds4_kvstore.o rax.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-ds4-bench: ds4_bench.o $(CORE_OBJS)
+ds4-bench: $(BENCH_OBJS) $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 ds4-eval: $(EVAL_OBJS) $(CORE_OBJS)
@@ -161,10 +165,10 @@ ds4-eval: $(EVAL_OBJS) $(CORE_OBJS)
 ds4-agent: $(AGENT_OBJS) ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-cpu: $(CLI_CPU_OBJS) $(SERVER_CPU_OBJS) ds4_bench_cpu.o $(EVAL_CPU_OBJS) $(AGENT_CPU_OBJS) ds4_web.o ds4_kvstore.o linenoise.o rax.o $(CPU_CORE_OBJS)
+cpu: $(CLI_CPU_OBJS) $(SERVER_CPU_OBJS) $(BENCH_CPU_OBJS) $(EVAL_CPU_OBJS) $(AGENT_CPU_OBJS) ds4_web.o ds4_kvstore.o linenoise.o rax.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o ds4 $(CLI_CPU_OBJS) linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-server $(SERVER_CPU_OBJS) ds4_kvstore.o rax.o $(CPU_CORE_OBJS) $(LDLIBS)
-	$(CC) $(CFLAGS) -o ds4-bench ds4_bench_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o ds4-bench $(BENCH_CPU_OBJS) $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-eval $(EVAL_CPU_OBJS) $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-agent $(AGENT_CPU_OBJS) ds4_web.o ds4_kvstore.o linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
 
@@ -248,8 +252,11 @@ src/server/server_generate.o src/server/server_generate_test.o src/server/server
 tests/server_tests_%.o: tests/server_tests_%.c tests/server_tests_internal.h $(SERVER_DEP_HDRS)
 	$(CC) $(CFLAGS) -DDS4_SERVER_TEST -DDS4_SERVER_TEST_NO_MAIN -c -o $@ $<
 
-ds4_bench.o: ds4_bench.c ds4.h
-	$(CC) $(CFLAGS) -c -o $@ ds4_bench.c
+src/bench/%.o: src/bench/%.c src/bench/bench_internal.h ds4.h ds4_distributed.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+src/bench/%_cpu.o: src/bench/%.c src/bench/bench_internal.h ds4.h ds4_distributed.h
+	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ $<
 
 src/eval/%.o: src/eval/%.c src/eval/eval_internal.h ds4.h ds4_distributed.h
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -286,8 +293,6 @@ ds4_cpu.o: ds4.c ds4.h ds4_internal.h ds4_distributed.h ds4_gpu.h ds4_multimodal
 
 
 
-ds4_bench_cpu.o: ds4_bench.c ds4.h
-	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_bench.c
 
 
 ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
@@ -318,7 +323,7 @@ test: ds4_test ds4-eval ds4_unit
 	./ds4_test
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_unit e0-pingpong mm-ui mm-ocr *.o src/cli/*.o src/eval/*.o src/agent/*.o src/dist/*.o src/server/*.o tests/server_tests_*.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_unit e0-pingpong mm-ui mm-ocr *.o src/cli/*.o src/bench/*.o src/eval/*.o src/agent/*.o src/dist/*.o src/server/*.o tests/server_tests_*.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
 
 # Task 04 / E0: standalone thunderbolt ping-pong latency gate (no core deps, no
 # model). Defined after the default targets so it never becomes the default goal.
