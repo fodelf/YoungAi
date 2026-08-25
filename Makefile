@@ -282,11 +282,7 @@ test: ds4_test ds4-eval ds4_unit
 	./ds4_test
 
 clean:
-<<<<<<< HEAD
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_unit e0-pingpong mm-ui mm-ocr *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o src/cli/*.o src/eval/*.o
-=======
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_unit e0-pingpong mm-ui mm-ocr *.o src/agent/*.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
->>>>>>> split/agent
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_unit e0-pingpong mm-ui mm-ocr *.o src/cli/*.o src/eval/*.o src/agent/*.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
 
 # Task 04 / E0: standalone thunderbolt ping-pong latency gate (no core deps, no
 # model). Defined after the default targets so it never becomes the default goal.
