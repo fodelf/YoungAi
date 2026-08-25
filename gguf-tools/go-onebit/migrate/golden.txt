@@ -85,3 +85,8 @@
   载具: 手写 TSV 夹具(重复id后覆盖/平局/乱序/交集不对称) — 真实评分 TSV 两机盘上无存量
   判定: stdout 逐字节一致(排序=py 元组序 delta→id 复刻)
   结果: 过闸 ✓ → py 删除, CLAUDE.md/CONTRIBUTING/README 引用同步更新
+
+[2026-08-25] tests/generate_long_context_story_prompt.py → 产物固化(免移植)
+  裁决: 固定种子(20260513)确定性生成器, 产物才是交付物(DS4_TEST_LONG_PROMPT 吃文件) →
+  用 py 终跑一次, 产物 tests/long_context_story_prompt.txt(140309B, md5 47c96195...)入库,
+  生成器删除。要改故事内容=改文本文件本身。
