@@ -48,6 +48,7 @@ INC := -I$(QZ) -I$(AMP) -I$(CAL) -I$(SLV)
 # 命令行(它们不是独立 TU)。
 QUANTS_INC := $(wildcard $(QZ)/quants_p*.inc.c)
 DSQMAIN_INC := $(wildcard $(QZ)/deepseek4-quantize_p*.inc.c)
+PUBBENCH_INC := $(wildcard $(BEN)/pubbench_p*.inc.c)
 
 ifeq ($(UNAME_S),Darwin)
 NATIVE ?= -mcpu=native
@@ -352,11 +353,11 @@ $(BEN)/rec_fidelity: $(BEN)/rec_fidelity.c
 	$(CC) $(BARE) $(NATIVE) -o $@ $< -lm -lpthread
 
 pubbench: $(BEN)/pubbench
-$(BEN)/pubbench: $(BEN)/pubbench.c
+$(BEN)/pubbench: $(BEN)/pubbench.c $(PUBBENCH_INC)
 	$(CC) $(BARE) $(NATIVE) -o $@ $< $(CURL_FLAGS) -lz -lm -lpthread
 
 pubbench_extract_test: $(BEN)/gates/pubbench_extract_test
-$(BEN)/gates/pubbench_extract_test: $(BEN)/gates/pubbench_extract_test.c $(BEN)/pubbench.c
+$(BEN)/gates/pubbench_extract_test: $(BEN)/gates/pubbench_extract_test.c $(BEN)/pubbench.c $(PUBBENCH_INC)
 	$(CC) $(BARE) -o $@ $(BEN)/gates/pubbench_extract_test.c $(CURL_FLAGS) -lz -lm -lpthread
 
 vq_merge_v4: $(QZ)/vq_merge_v4
