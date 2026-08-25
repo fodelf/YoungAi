@@ -73,7 +73,7 @@ continuation set.
 ## 4. Compare
 
 ```sh
-python3 gguf-tools/quality-testing/compare_scores.py /tmp/old.tsv /tmp/new.tsv
+gguf-tools/quality-testing/compare_scores /tmp/old.tsv /tmp/new.tsv
 ```
 
 Output fields:

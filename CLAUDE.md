@@ -65,7 +65,7 @@ Speed regressions use `ds4-bench` (instantaneous prefill/gen t/s at context fron
   --ctx-start 2048 --ctx-max 65536 --step-incr 2048 --gen-tokens 128 --csv /tmp/ds4-speed.csv
 ```
 
-Quantization/GGUF changes are scored with `gguf-tools/quality-testing` (`make -C gguf-tools quality-score`, then `score_official` + `compare_scores.py`; lower `avg_nll` is better).
+Quantization/GGUF changes are scored with `gguf-tools/quality-testing` (`make -C gguf-tools quality-score`, then `score_official` + `compare_scores`(C, 同目录 gcc 一行可建); lower `avg_nll` is better).
 
 ## Architecture (the cross-file picture)
 

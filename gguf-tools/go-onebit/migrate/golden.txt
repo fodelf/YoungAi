@@ -80,3 +80,8 @@
   (v4bf 冠军系, 老base分数路由)在 M1, 0731系无此张量, 夹具口径覆盖全部算术分支。
   判定: rebake 产物 md5 同+stdout 同; alpha_set 幂等两遍产物/快照 md5 全同, stdout 仅文件名差。
   结果: 双双过闸 ✓ → py 删除, 调用方接线, build_ctools 收编
+
+[2026-08-25] quality-testing/compare_scores.py → compare_scores.c
+  载具: 手写 TSV 夹具(重复id后覆盖/平局/乱序/交集不对称) — 真实评分 TSV 两机盘上无存量
+  判定: stdout 逐字节一致(排序=py 元组序 delta→id 复刻)
+  结果: 过闸 ✓ → py 删除, CLAUDE.md/CONTRIBUTING/README 引用同步更新

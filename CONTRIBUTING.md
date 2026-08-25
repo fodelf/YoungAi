@@ -97,7 +97,7 @@ gguf-tools/quality-testing/score_official OLD.gguf \
 gguf-tools/quality-testing/score_official NEW.gguf \
   gguf-tools/quality-testing/data/manifest.tsv /tmp/new.tsv 4096
 
-python3 gguf-tools/quality-testing/compare_scores.py /tmp/old.tsv /tmp/new.tsv
+gguf-tools/quality-testing/compare_scores /tmp/old.tsv /tmp/new.tsv
 ```
 
 Lower `avg_nll` is better. See
