@@ -6504,3 +6504,11 @@ cos 口径下 43 层全层闸。`zlayer.py`(2026-08-22 段)白纸黑字裁决过
   (四支柱缺失项, OOD/混沌位关z)。
 - 工程账: chain_sweep.bin只写到L0(sweep被杀+预分配尺寸陷阱二连); chain_bare.bin(33.1G,
   完整校验过)=裸回放链态锚可复用; trace脚手架已删; 判决尺=caliper_ref.sh(.old钉死)全程唯一。
+
+## 2026-08-25 zlayer C 版性能账终收（Py→C 迁移最后一针）
+
+- gprof 定罪：`tri_worker`（手写三角回代，B 列跨步 4096 + A 列跨步 9216 双 cache-miss）占 94.97%（3105s CPU），CUDA gemm 卸载命中 1216/回落 0 但无提速——热点根本不在 gemm。
+- 修法：`chol_solve` 在 DQ_BLAS 构建下换 LAPACK `dpotrf/dpotrs` 分块实现（spark=scipy_openblas 前缀符号，Mac=Accelerate 裸符号），手写路保留为无 BLAS 回落。行主序对称阵取 uplo='U' 列主序等价，B 转置进出。
+- 实测（spark L20 金标口径）：解算 **642s → 18s（36×）**，总 672s → **48s/层**；对照 py-CPU 105s、py-GPU 54s——**C 版反超 python 两条路**。数字逐位不变：z^L 3.2% 组合 4.3% GE均值 1.0352。
+- 43 层全战役估算 ≈ 34 分钟。commit cb70590，已同步 spark。
+- 至此 Py→C 迁移全部账目关闭：204→7 .py（3 金标校具 + 4 用户裁决非逻辑件），16 项金标全绿，性能不欠账。
