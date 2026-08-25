@@ -6684,3 +6684,32 @@ ids 两半各 8192 ✓, 干净锚 33,109,966,888 B 与期望字节精确一致 �
 **发车(23:45)**: 裸判 caliper_ref.sh(noz, 对表 0.4706/78.36) ∥ amp_clean_full.sh
 amp_r64c "" 64(工作区全清重头跑, zlayer 43 层注入态 → caliper 五指标, 对表 0.43410)。
 五指标终判与引擎 --zchain 加载 smoke 结果待续。
+
+## 2026-08-26 凌晨 r64c 战役收官: ★放大器新冠军 0.42510★ + spark 2.6TB 大清理
+
+**五指标终判(caliper_ref.sh, wt2 参考尺)**:
+| 指标 | 裸(vq86h_noz, 本轮复判) | +放大器(amp_r64c) | 对表 |
+|---|---|---|---|
+| Mean KLD | 0.47055(逐位复刻 08-24 账) | **0.42510** (−9.7%) | amp2 0.42792 / k64截断 0.43410 / 官方q2 0.4207 |
+| 中位 KLD | 0.11234 | 0.09136 (−18.7%) | amp2 中位 0.09384 |
+| Σmin 主尺 | 0.7799 (中位 0.8741) | **0.7903** (中位 0.8851) | |
+| Same top | 78.36% | 79.19% | amp2 79.53 |
+| PPL 比 | 1.361 (5.7650) | 1.358 (5.7522) | |
+
+★结论: **K=64 直接解算 > k1024 解算再截断(0.43410) > amp2 历史冠军(0.42792)**;
+距官方 q2 仅 0.0044。配方=干净锚+行掩码+NTOK8192+FP-x+K64 全家(z36层+GE41层),
+zlayer C 版 48s/层×43, L20 过程数字(3.2%/4.3%/GE1.0352)与迁移金标逐字一致。
+五项指标全面优于裸——重构树全链(判决尺/反修/注入/引擎)可复现性同场验证。
+
+**引擎加载放大器 smoke**: dql 注入态 → dql_to_zchain 提取 39.9MB(GE=41 z^L=36),
+ds4 --cuda --zchain 贪心 24 tok: 裸 "1.**Deconstruct the Prompt**: *Target: Distributed
+cache. *Question: What"(gen 13.68 t/s) / 武装 "1.**Deconstruct the User's Request**:
+*Topic: Distributed cache. *Specific"(gen 14.01 t/s) — 加载正常/输出连贯/与裸分叉
+(z 生效)/速度无损。ERF 引擎 type 仍未实现(判决路 dql 注入态可用, 部署技术债不变)。
+
+**spark 大清理(用户令: 删所有旧量化模型与过程文件, 盘 67G→2681G, 净清 ~2.6TB)**:
+16 个旧 gguf(含分布王 vq86h-em 95.8G——撞内存墙不可服役, noz+em_refine.sh+骨架可
+~2h 再生)/vqhalf 全部实验区/r30 六个旧战役家+9 旧锚/v5full 255G/v5half/q2z/tmp 大件。
+保留: hf、ds4-allq2(q2 铁律)、ds4-vq86h(现役)、vq86h_noz、amp_r64c(新冠军 73G)、
+干净锚、wt2 判决锚、r30_skeleton、amp2 冠军态、g7/ids/配方 txt。
+清单存 spark:~/r64c_cleanup_manifest.txt。旧树 543 脏文件在 git stash 有底。
