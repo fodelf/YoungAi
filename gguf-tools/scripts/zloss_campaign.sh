@@ -72,6 +72,26 @@ stage_npy(){
 stage_teacher(){
     [ -s "$NPY/routed_L42.npy" ] && { LOG "③教师已在, 跳过"; return 0; }
     [ -s "$ANC" ] || DIE "干净锚缺 $ANC"
+    # ★流对齐闸(2026-08-26 用户质疑后固化)★: 教师(锚行)与学生(捕获行)必须同一条
+    # token 流逐行对齐 —— 锚 fin L0 行 vs 捕获 ffn_in L0 行 cos 同行应 ~0.99+,
+    # 错位应 <0.5。错位=R 全是垃圾, 解算全废, 必须停车。
+    python3 - "$ANC" "$CAP/raw_ffn_in_L0" <<'PY' || DIE "教师/学生流不对齐(锚≠捕获同一 ids), 停车"
+import numpy as np, sys
+A, C = sys.argv[1], sys.argv[2]
+D, S = 4096, 8192
+cap = np.fromfile(C, dtype=np.float16)
+n = cap.size // D
+cap = cap[: n * D].reshape(n, D).astype(np.float32)
+af = open(A, "rb")
+bad = 0
+for i in [0, 100, 1000, 4000, n - 1]:
+    af.seek(40 + i * D * 4)
+    a = np.frombuffer(af.read(D * 4), dtype=np.float32)
+    cos = float(a @ cap[i] / (np.linalg.norm(a) * np.linalg.norm(cap[i]) + 1e-30))
+    print("  对齐闸 row %d cos=%.4f" % (i, cos))
+    if cos < 0.9: bad = 1
+sys.exit(bad)
+PY
     wd_start
     LOG "③教师 FP 锚口径(±10 截断产线对齐) 43 层"
     "$GT/teacher_routed" --hf "$HF" --cap "$NPY" --layers 0-42 \
