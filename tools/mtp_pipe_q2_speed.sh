@@ -569,7 +569,7 @@ rsync -a --exclude '.git' --exclude '*.o' --exclude '*.gguf' --exclude 'gguf/' \
   --exclude 'ds4-eval' --exclude 'ds4-agent' --exclude 'e0-pingpong' --exclude 'ds4_test' \
   --exclude 'hf/' --exclude 'benchmarks/' --exclude '*.safetensors' --exclude '*.aria2' \
   --exclude 'cap_*/' --exclude 'zdump*/' --exclude 'sel_spool*/' --exclude 'quant_spool/' \
-  --exclude '*.npy' --exclude 'go-onebit/corpus/raw/' \
+  --exclude '*.npy' --exclude 'data/corpus/raw/' \
   "$LOCAL_DIR"/ "$REMOTE:$REMOTE_DIR"/ || { log "rsync 失败"; exit 1; }
 
 # ---------------- 2. 两边 clean + build (共享 CORE_OBJS, 必须都重编) ----------------

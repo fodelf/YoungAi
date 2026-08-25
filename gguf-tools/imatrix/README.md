@@ -19,12 +19,10 @@ more heavily by the actual DS4 inference graph.
 
 ## 1. Build The Calibration Dataset
 
-The tracked dataset is in `gguf-tools/imatrix/dataset/`.  Regenerate it from
-the repository root with:
-
-```sh
-python3 gguf-tools/imatrix/dataset/build_ds4_imatrix_dataset.py
-```
+The tracked dataset is in `gguf-tools/imatrix/dataset/`.  The rendered prompt
+files are tracked as-is; the Python generator was removed with the repo-wide
+Python purge (2026-08-25) — see git history for
+`build_ds4_imatrix_dataset.py` if the dataset ever needs regenerating.
 
 The important output is:
 

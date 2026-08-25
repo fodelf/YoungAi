@@ -95,12 +95,12 @@ if [ ! -d "$HF" ]; then
           echo "[中断] 远端已清" >&2; exit 130' INT TERM
     RC=0; wait "$SSHPID" || RC=$?   # ||捕获: set -e 下裸 wait 收远端非零码会当场杀本地脚本, 明细表拉不回
     trap 'echo "[中断] 杀本机量化进程" >&2; pkill -9 -f ds4quant_run 2>/dev/null || true; exit 130' INT TERM
-    rsync -a "$REMOTE:$RPATH/gguf-tools/go-onebit/layer-tables/" "$ROOT/gguf-tools/go-onebit/layer-tables/" 2>/dev/null || true
+    rsync -a "$REMOTE:$RPATH/gguf-tools/data/layer-tables/" "$ROOT/gguf-tools/data/layer-tables/" 2>/dev/null || true
     [ "$RC" = 0 ] && echo "【全模型】脚本 算法=ssh转发 进度=完成 体积=- 还原度=- 研判=明细已拉回 layer-tables/; 侧车在 $REMOTE:$RPATH/gguf/go-onebit/zfile_all.bin"
     exit "$RC"
 fi
-QDIR="$ROOT/gguf-tools/go-onebit/quant"
-TBL="$ROOT/gguf-tools/go-onebit/layer-tables"
+QDIR="$ROOT/gguf-tools/amp"
+TBL="$ROOT/gguf-tools/data/layer-tables"
 LDIR="$ROOT/gguf/go-onebit/layers"
 # ★对齐目标 = 编程域★ (rr_code.ids 编程语料; 覆盖用 DS4_CORPUS)
 CORPUS="${DS4_CORPUS:-/tmp/rr_code.ids}"
@@ -236,7 +236,7 @@ if [ "$TIMEDOUT" = 1 ] || [ "$WDOG" = 1 ] || [ "$RC" != 0 ]; then
         if [ "${DS4_SKIP_RRVERDICT:-0}" != "1" ]; then
             for RRIDS in /tmp/rr_hard.ids:64 /tmp/rr_code.ids:305; do
                 RRF="${RRIDS%%:*}"; RRN="${RRIDS##*:}"
-                [ -f "$RRF" ] && env -u DS4_ANCHOR_ROUTE bash "$ROOT/gguf-tools/go-onebit/scripts/rr_verdict.sh" "$RRF" "$RRN" 2>&1 \
+                [ -f "$RRF" ] && env -u DS4_ANCHOR_ROUTE bash "$ROOT/gguf-tools/scripts/rr_verdict.sh" "$RRF" "$RRN" 2>&1 \
                     | grep -E 'VERDICT|watchdog' || echo "[自动merge] rr_verdict $RRF 未出分(不阻塞合并)" >&2
             done
         fi
@@ -307,7 +307,7 @@ if [ "${DS4_SKIP_MERGE:-0}" = 1 ]; then
     if [ "${DS4_SKIP_RRVERDICT:-0}" != "1" ]; then
         for RRIDS in /tmp/rr_hard.ids:64 /tmp/rr_code.ids:305; do
             RRF="${RRIDS%%:*}"; RRN="${RRIDS##*:}"
-            [ -f "$RRF" ] && env -u DS4_ANCHOR_ROUTE bash "$ROOT/gguf-tools/go-onebit/scripts/rr_verdict.sh" "$RRF" "$RRN" 2>&1 \
+            [ -f "$RRF" ] && env -u DS4_ANCHOR_ROUTE bash "$ROOT/gguf-tools/scripts/rr_verdict.sh" "$RRF" "$RRN" 2>&1 \
                 | grep -E 'VERDICT|watchdog' || echo "[skip-merge] rr_verdict $RRF 未出分(不阻塞停点)" >&2
         done
     fi

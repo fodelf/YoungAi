@@ -28,7 +28,7 @@ CAP=${CAP:-512}
 # 侧车须先 scp 到 $M1DIR/$(basename)。
 CORR=${CORR:-}
 # SOUL=行为示例文件 (P3, 默认修复灵魂; 空串禁用)。只 server 侧 (prompt 渲染)。
-SOUL=${SOUL-gguf-tools/go-onebit/corpus/soul/soul_server_v3.txt}
+SOUL=${SOUL-gguf-tools/data/corpus/soul/soul_server_v3.txt}
 # EXPERT_PREAD + PREFETCH_AHEAD: 历史实测"赢家 2.2×"(fable5 L297, 位精确输出逐字节不变) —
 # 单拷贝 direct pread 替代 mmap+memcpy + 跨层 router 预测预取。EVENT_DRAIN: MTLSharedEvent
 # 快路径主机等待(Anukari 先例, 去 per-CB 调度开销)。这些是本日基线 1.18 缺失的 IO 杠杆。
@@ -45,7 +45,7 @@ BASE_NATIVE=${BASE_NATIVE:-1}
 [ "$BASE_NATIVE" != 0 ] && ENVSTR="$ENVSTR DS4_BASE_NATIVE=$BASE_NATIVE"
 # KNOWLEDGE=知识环检索库(2026-07-23): server 端 knowledge-primer 参考注入, 治无据知识问答
 # 复读/幻觉(g1/g4/singleflight/read/commit 5针 A/B 全过)。纯 prompt 零模型零体积。默认挂。
-KNOWLEDGE=${KNOWLEDGE-gguf-tools/go-onebit/corpus/knowledge.txt}
+KNOWLEDGE=${KNOWLEDGE-gguf-tools/data/corpus/knowledge.txt}
 [ -n "$KNOWLEDGE" ] && ENVSTR="$ENVSTR DS4_KNOWLEDGE_FILE=$KNOWLEDGE"
 # 值区置信门控(2026-07-14): 自由 argmax 概率 ≥p 时放行自由构造, 否则 copy 约束防占位符。
 # 【negative result】实测模型的自由生成本身就是占位符($PARAMETER_VALUE), 对占位符反而"有把握"

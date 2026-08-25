@@ -28,9 +28,9 @@ HASH_W13="${HASH_W13:-iq2_xxs}"                          # hash层0-2 w1/w3 (=q2
 HASH_W2="${HASH_W2:-q2_K}"                               # hash层0-2 w2   (=q2档, 全256必须留)
 ROUTED_W13="${ROUTED_W13:-iq2_xxs}"                      # 路由层 w1/w3 (=q2精度, 覆盖优先; 想试高精度少专家改 q2_K)
 ROUTED_W2="${ROUTED_W2:-q2_K}"                           # 路由层 w2    (=q2精度; 想试高精度改 q4_K, 但 K 要降)
-NORMS="$ROOT/gguf-tools/reactgo/base_router_norms.json" # ★base 模型实测路由排名(非chat; 收集器扫编程语料得)
-MASK="$ROOT/gguf-tools/reactgo/mask-specialty-k${KEEP_TOP_K}.bin"
-IMAT="$ROOT/gguf-tools/reactgo/reactgo_router.dat"      # chat-q2 算的 imatrix
+NORMS="$ROOT/gguf-tools/data/expert-masks/base_router_norms.json" # ★base 模型实测路由排名(非chat; 收集器扫编程语料得)
+MASK="$ROOT/gguf-tools/data/expert-masks/mask-specialty-k${KEEP_TOP_K}.bin"
+IMAT="$ROOT/gguf-tools/data/expert-masks/reactgo_router.dat"      # chat-q2 算的 imatrix
 # USE_IMATRIX: 0=不带imatrix → 量化器从 base 权重自算重要性(对 base 正确; IQ2_XXS fallback sum(col^2))。
 #              1=用 chat-q2 的 reactgo_router.dat —— 实测错配 base 权重把 2-bit 量崩(数字汤/重复), 默认关。
 USE_IMATRIX="${USE_IMATRIX:-0}"
