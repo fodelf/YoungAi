@@ -60,6 +60,7 @@ AMPSOLVE_INC := $(wildcard $(AMP)/amp_solve_p*.inc.c)
 TRAJ_INC := $(wildcard $(CAL)/traj_analyze_p*.inc.c)
 HFREAD_INC := $(wildcard $(CAL)/hf_read_p*.inc.c)
 VQMERGE_INC := $(wildcard $(QZ)/vq_merge_v4_p*.inc.c)
+ZLAYER_INC := $(wildcard $(AMP)/zlayer_p*.inc.c)
 
 ifeq ($(UNAME_S),Darwin)
 NATIVE ?= -mcpu=native
@@ -194,7 +195,7 @@ endif
 # zlayer_gpu.o(cuBLAS 薄封装, GPU 缺时运行时自动回落 CPU 路)。
 zlayer: $(AMP)/zlayer
 ifeq ($(UNAME_S),Darwin)
-$(AMP)/zlayer: $(AMP)/zlayer.c ../src/common/ds4_quantfmt.c ../src/common/ds4_gguf.c
+$(AMP)/zlayer: $(AMP)/zlayer.c $(ZLAYER_INC) ../src/common/ds4_quantfmt.c ../src/common/ds4_gguf.c
 	$(CC) $(BARE) $(NATIVE) -DDQ_BLAS -o $@ $(AMP)/zlayer.c $(BLAS_LIBS) -lm -lpthread
 else
 ifeq ($(HAVE_BLAS),0)
@@ -204,11 +205,11 @@ else
 ifeq ($(CUDA),1)
 $(AMP)/zlayer_gpu.o: $(AMP)/zlayer_gpu.cu
 	$(NVCC) -O3 -arch=native -c $< -o $@
-$(AMP)/zlayer: $(AMP)/zlayer.c $(AMP)/zlayer_gpu.o ../src/common/ds4_quantfmt.c ../src/common/ds4_gguf.c
+$(AMP)/zlayer: $(AMP)/zlayer.c $(ZLAYER_INC) $(AMP)/zlayer_gpu.o ../src/common/ds4_quantfmt.c ../src/common/ds4_gguf.c
 	$(CC) $(BARE) $(NATIVE) -DDQ_BLAS $(BLAS_CFLAGS) -DZL_CUDA -o $@ $(AMP)/zlayer.c \
 	    $(AMP)/zlayer_gpu.o $(BLAS_LIBS) -L$(CUDA_HOME)/lib64 -lcublas -lcudart -lstdc++ -lm -lpthread
 else
-$(AMP)/zlayer: $(AMP)/zlayer.c ../src/common/ds4_quantfmt.c ../src/common/ds4_gguf.c
+$(AMP)/zlayer: $(AMP)/zlayer.c $(ZLAYER_INC) ../src/common/ds4_quantfmt.c ../src/common/ds4_gguf.c
 	$(CC) $(BARE) $(NATIVE) -DDQ_BLAS $(BLAS_CFLAGS) -o $@ $(AMP)/zlayer.c $(BLAS_LIBS) -lm -lpthread
 endif
 endif
