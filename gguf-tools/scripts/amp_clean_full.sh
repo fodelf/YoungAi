@@ -60,6 +60,8 @@ for L in $(seq 0 42); do
   env DS4_ZL_NTOK=8192 DS4_ZL_NFIT=6144 ${XA:+DS4_ZL_XANCHOR=$XA} DS4_ZL_FIT_RANGES="$FR" DS4_ZL_EV_RANGE="$ER" \
   "$ZLB" "$DS4_HF" $D2/$WS/layers "$ANC" $L ${K:-1024} 1 ${XC:+$D2/$XC} \
     2>&1 | grep -aE "XCAP|Error|assert|★" || { LOG "★L$L 失败★"; exit 1; }
+  # 进度可观测铁律: 每层收官打一行(tail -f 就能看到 43 层推进)
+  LOG "L$L ✓ $(ls "$D2/$WS/layers"/zrec_L*.bin 2>/dev/null | wc -l | tr -d ' ')/43 K=$K"
 done
 rm -f $D2/$WS/layers/zcache_L*.npz
 LOG "③反修收官"
