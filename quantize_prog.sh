@@ -126,10 +126,7 @@ echo "==== [6/7] 完成 + 每层尺寸(供切分) ===="
 ls -la "$OUT" | awk '{printf "  ✓ 编程模型: %.2f GiB  -> %s\n",$5/1073741824,$9}'
 "$PY" "$ROOT/gguf-tools/layer_sizes.py" "$OUT" 2>/dev/null | tail -4
 
-if [ "$AUTO_SPLIT" = 1 ]; then
-  echo "==== [7/7] 自动切分 + 上传 M1 worker 分片 (split_prog.sh) ===="
-  MODEL="$OUT" bash "$ROOT/split_prog.sh" || { echo "✗ 切分/上传失败(可手动重跑 bash split_prog.sh)"; exit 1; }
-else
-  echo "==== [7/7] 跳过自动切分(AUTO_SPLIT=0); 需要时手动: bash split_prog.sh ===="
-fi
+# split_prog.sh 已删(纯驱动已删的 split_gguf_layers.py/balanced_split.py, 见 git 历史);
+# 自动切分功能待 C 承接, 现在只提示。
+echo "==== [7/7] 自动切分已下线(split_prog.sh 已删, 生成器见 git 历史) ===="
 echo "  HF 已不需要可删腾盘; 卸载NFS: sudo umount $MNT"

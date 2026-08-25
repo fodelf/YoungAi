@@ -60,8 +60,9 @@ stage_rte(){
     env DS4_CAP_DIR="$RCAP" DS4_CUDA_NO_TOKEN_GRAPH=1 timeout --foreground 3000 \
         ./ds4 --cuda -m "$MDL" --score-ids "$IDS" --score-out "/tmp/${TAG}_rtecap.bin" \
         </dev/null 2>&1 | tail -1
-    RS_OUT="$RDIR" RS_CAP="$RCAP" RS_ANC="$FPA" bash "$SC/rsolve43.sh" 4 \
-        || { LOG "★rte 解算失败★"; exit 2; }
+    # rsolve43.sh 已删(纯驱动已删的 route_solve.py, 见 git 历史); rte 解算无 C 版承接,
+    # RTE 非空的战役在此响亮失败而不是静默跳过。
+    LOG "★rte 解算器已删(route_solve.py 无 C 版), RTE 战役不可跑★"; exit 2
     "$(dirname "$0")/../calib/zrec_to_zchain" "$RDIR" "$RTE" 43 || { LOG "★rte 链失败★"; exit 2; }
 }
 
