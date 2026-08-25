@@ -6738,3 +6738,29 @@ dither增广+收缩"错标成"四损失"并被我沿用——已纠正。
   (乘性静态z)生产链(amp_solve/amp_solve_zc)非现役、v5full 产物已清 → **引擎侧
   type7/9 apply 代码零消费者=真负债**; 同时意味"z 必须是 x 的函数"(方案B)未在
   冠军链兑现(现役 z=ftA 特征上的静态 z)。清除 type7/9 与补两支柱待用户令。
+
+## 2026-08-26 zloss 战役发车: 用户新设计重实现(单层贪心+四损失+模块复用+清仓)
+
+用户令: 按我的设计先解决单层贪心最优(不管链态), 四损失接进去, z/四损失都是有
+体积文件, 反修和引擎复用, amp 垃圾删掉重新实现。落地四件:
+1. **amp 清仓**: 38 个零消费者文件出库(amp_solve 族=type7/9 产线/zrec_to_zchain/
+   zchain_merge/ge_solve/emit_z/hsolve/hbase/dilution/route_alpha/route_bias/
+   probe 探针族/legacy 独立件/12 个死战役脚本), Makefile/gitignore 同步瘦身,
+   全目标重编+tools-test 绿。保留: 判决链/冠军产线(zlayer+dql_to_zchain)/
+   teacher_routed(文件头即写明"供四损失求解器当 y*")/calib 链接件。
+2. **新解算器 zloss_solve**(amp/, 302 行): 学生=引擎捕获真值(当层全部量化计算,
+   ffn_in/obase_v3), 教师=FP 锚口径(teacher_routed --anchor ±10); 解算=
+   ds4_z_solve(与引擎同一份模块), 四损失=ds4_loss 模块 held (λ,k) 网格择优,
+   k=0 裸基线参赛(输裸判空); 产物=z_L.ds4z(f32)+fourloss_L.txt+zl.RRR 注入
+   (冻结判决尺回放, manifest 幂等)。合成金标针: 种 rank-8 完整收回(align
+   0.866→0.0017), 5.7s/层。ds4_z.c 加 DQ_BLAS 守卫快路(dgemm+potrf/potrs,
+   引擎构建不定义, 标量路原样)。
+3. **引擎复用**: ds4_zchain type6(din=d) 载入转 f32 走 ds4_z_apply(同一份实现),
+   信任域夹持留引擎侧; ftA(din=3d) φ 形态留 fp16 旧路(冠军链兼容); type7/9
+   loader 拒收(响亮跳过)——CUDA kernel 内对应死分支挂账战役后清(快路中途不动)。
+   新单测 ut_zmod_parity: 模块路 vs fp16 旧路 rel 1e-8(常规)/1.5e-7(夹持) 过闸。
+   (工程事故记录: 手术 commit 首版 CORE_OBJS 少 ds4_z.o 带病提交, amend 已修——
+   grep 计数吞错误教训在案。)
+4. **战役脚本 zloss_campaign.sh**: capture(×2 复现闸含 ffn_out)→npy→teacher→
+   probe(L20 十分钟针)→solve(43 层)→judge(caliper 对表 裸 0.47055/r64c 0.42510)
+   →engine smoke。语料仍=放大器半(零重叠纪律), 行掩码沿用。已发车, 结果待续。
