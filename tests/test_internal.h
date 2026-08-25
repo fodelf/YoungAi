@@ -96,4 +96,8 @@ void test_tool_call_quality(void);
 void test_server_unit_group(void);
 void test_tp_allreduce(void);
 
+/* ---- t_units.c: 无模型离线单测(采样/惩罚 API + rax 基数树) ---- */
+void test_engine_units(void);
+void test_rax_units(void);
+
 #endif /* DS4_TEST_INTERNAL_H */

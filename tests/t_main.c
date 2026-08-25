@@ -26,6 +26,8 @@ static const ds4_test_entry test_entries[] = {
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group, 0},
     {"--tp-allreduce", "tp-allreduce", "tensor-parallel all-reduce transport loopback", test_tp_allreduce, 0},
+    {"--engine-units", "engine-units", "sampler/penalty API unit tests (no model)", test_engine_units, 0},
+    {"--rax", "rax", "rax radix tree unit tests (no model)", test_rax_units, 0},
 };
 
 static void test_print_help(const char *prog) {
