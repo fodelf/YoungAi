@@ -59,7 +59,14 @@ extern agent_worker *agent_completion_worker;
 void agent_sigint_handler(int sig);
 char *xstrdup(const char *s);
 char *xstrndup(const char *s, size_t n);
-void *xrealloc(void *ptr, size_t n);
+static inline void *xrealloc(void *ptr, size_t n) {   /* 同 xmalloc: 与 core 撞名, 保内部链接 */
+    void *p = realloc(ptr, n ? n : 1);
+    if (!p) {
+        perror("ds4-agent: realloc");
+        exit(1);
+    }
+    return p;
+}
 void write_all(int fd, const char *p, size_t n);
 void agent_input_buf_append(agent_input_buf *b, const char *s, size_t n);
 char *agent_input_buf_take(agent_input_buf *b);

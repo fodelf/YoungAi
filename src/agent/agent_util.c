@@ -28,15 +28,6 @@ char *xstrndup(const char *s, size_t n) {
     return p;
 }
 
-void *xrealloc(void *ptr, size_t n) {
-    void *p = realloc(ptr, n ? n : 1);
-    if (!p) {
-        perror("ds4-agent: realloc");
-        exit(1);
-    }
-    return p;
-}
-
 void write_all(int fd, const char *p, size_t n) {
     while (n) {
         ssize_t wr = write(fd, p, n);

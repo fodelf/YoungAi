@@ -7,7 +7,11 @@
 
 void stop_signal_handler(int sig);
 void die(const char *msg);
-void *xrealloc(void *p, size_t n);
+static inline void *xrealloc(void *p, size_t n) {   /* 同 xmalloc: 与 core 撞名, 保内部链接 */
+    p = realloc(p, n ? n : 1);
+    if (!p) die("out of memory");
+    return p;
+}
 char *xstrdup(const char *s);
 bool random_bytes(void *dst, size_t len);
 char *xstrndup(const char *s, size_t n);

@@ -27,12 +27,6 @@ void die(const char *msg) {
     exit(1);
 }
 
-void *xrealloc(void *p, size_t n) {
-    p = realloc(p, n ? n : 1);
-    if (!p) die("out of memory");
-    return p;
-}
-
 char *xstrdup(const char *s) {
     size_t n = strlen(s);
     char *p = xmalloc(n + 1);
