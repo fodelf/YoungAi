@@ -30,6 +30,9 @@ DIST_OBJS = src/dist/dist_util.o src/dist/dist_transport.o src/dist/dist_framing
 EVAL_SRCS := $(wildcard src/eval/*.c)
 EVAL_OBJS := $(EVAL_SRCS:.c=.o)
 EVAL_CPU_OBJS := $(EVAL_SRCS:.c=_cpu.o)
+# WEB 模块(重构阶段3: ds4_web.c 拆分为 src/web/*.c; 纯主机 C)
+WEB_SRCS := $(wildcard src/web/*.c)
+WEB_OBJS := $(WEB_SRCS:.c=.o)
 # KV 模块(重构阶段3: ds4_kvstore.c 拆分为 src/kv/*.c; 纯主机 C, 各构建共用)
 KV_SRCS := $(wildcard src/kv/*.c)
 KV_OBJS := $(KV_SRCS:.c=.o)
@@ -106,8 +109,8 @@ ds4-bench: $(BENCH_OBJS) $(CORE_OBJS)
 ds4-eval: $(EVAL_OBJS) $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $(EVAL_OBJS) $(CORE_OBJS) $(METAL_LDLIBS)
 
-ds4-agent: $(AGENT_OBJS) ds4_web.o $(KV_OBJS) linenoise.o $(CORE_OBJS)
-	$(CC) $(CFLAGS) -o $@ $(AGENT_OBJS) ds4_web.o $(KV_OBJS) linenoise.o $(CORE_OBJS) $(METAL_LDLIBS)
+ds4-agent: $(AGENT_OBJS) $(WEB_OBJS) $(KV_OBJS) linenoise.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(AGENT_OBJS) $(WEB_OBJS) $(KV_OBJS) linenoise.o $(CORE_OBJS) $(METAL_LDLIBS)
 
 # P4 多模态 image-family 编码器 (macOS Vision; opt-in, 不进默认 all 以免硬依赖
 # swiftc)。mm-ui = 前端开发域 UI 结构草图 (生产默认, 引擎自动绑定 ./mm-ui);
@@ -118,12 +121,12 @@ mm-ui: tools/mm_ui.swift
 mm-ocr: tools/mm_ocr.swift
 	swiftc -O tools/mm_ocr.swift -o $@
 
-cpu: $(CLI_CPU_OBJS) $(SERVER_CPU_OBJS) $(BENCH_CPU_OBJS) $(EVAL_CPU_OBJS) $(AGENT_CPU_OBJS) ds4_web.o $(KV_OBJS) linenoise.o rax.o $(CPU_CORE_OBJS)
+cpu: $(CLI_CPU_OBJS) $(SERVER_CPU_OBJS) $(BENCH_CPU_OBJS) $(EVAL_CPU_OBJS) $(AGENT_CPU_OBJS) $(WEB_OBJS) $(KV_OBJS) linenoise.o rax.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o ds4 $(CLI_CPU_OBJS) linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-server $(SERVER_CPU_OBJS) $(KV_OBJS) rax.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-bench $(BENCH_CPU_OBJS) $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-eval $(EVAL_CPU_OBJS) $(CPU_CORE_OBJS) $(LDLIBS)
-	$(CC) $(CFLAGS) -o ds4-agent $(AGENT_CPU_OBJS) ds4_web.o $(KV_OBJS) linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o ds4-agent $(AGENT_CPU_OBJS) $(WEB_OBJS) $(KV_OBJS) linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
 
 cuda-regression:
 	@echo "cuda-regression requires a CUDA build"
@@ -165,15 +168,15 @@ ds4-bench: $(BENCH_OBJS) $(CORE_OBJS)
 ds4-eval: $(EVAL_OBJS) $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-ds4-agent: $(AGENT_OBJS) ds4_web.o $(KV_OBJS) linenoise.o $(CORE_OBJS)
+ds4-agent: $(AGENT_OBJS) $(WEB_OBJS) $(KV_OBJS) linenoise.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-cpu: $(CLI_CPU_OBJS) $(SERVER_CPU_OBJS) $(BENCH_CPU_OBJS) $(EVAL_CPU_OBJS) $(AGENT_CPU_OBJS) ds4_web.o $(KV_OBJS) linenoise.o rax.o $(CPU_CORE_OBJS)
+cpu: $(CLI_CPU_OBJS) $(SERVER_CPU_OBJS) $(BENCH_CPU_OBJS) $(EVAL_CPU_OBJS) $(AGENT_CPU_OBJS) $(WEB_OBJS) $(KV_OBJS) linenoise.o rax.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o ds4 $(CLI_CPU_OBJS) linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-server $(SERVER_CPU_OBJS) $(KV_OBJS) rax.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-bench $(BENCH_CPU_OBJS) $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-eval $(EVAL_CPU_OBJS) $(CPU_CORE_OBJS) $(LDLIBS)
-	$(CC) $(CFLAGS) -o ds4-agent $(AGENT_CPU_OBJS) ds4_web.o $(KV_OBJS) linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o ds4-agent $(AGENT_CPU_OBJS) $(WEB_OBJS) $(KV_OBJS) linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
 
 cuda-regression: tests/cuda_long_context_smoke
 	./tests/cuda_long_context_smoke
@@ -273,8 +276,8 @@ src/agent/%_cpu.o: src/agent/%.c $(AGENT_HDRS)
 src/agent/%.o: src/agent/%.c $(AGENT_HDRS)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-ds4_web.o: ds4_web.c ds4_web.h
-	$(CC) $(CFLAGS) -c -o $@ ds4_web.c
+src/web/%.o: src/web/%.c src/web/web_internal.h ds4_web.h
+	$(CC) $(CFLAGS) -c -o $@ $<
 
 src/kv/%.o: src/kv/%.c src/kv/kv_internal.h ds4_kvstore.h ds4.h
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -326,7 +329,7 @@ test: ds4_test ds4-eval ds4_unit
 	./ds4_test
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_unit e0-pingpong mm-ui mm-ocr *.o src/cli/*.o src/bench/*.o src/kv/*.o src/eval/*.o src/agent/*.o src/dist/*.o src/server/*.o tests/server_tests_*.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_unit e0-pingpong mm-ui mm-ocr *.o src/cli/*.o src/bench/*.o src/kv/*.o src/web/*.o src/eval/*.o src/agent/*.o src/dist/*.o src/server/*.o tests/server_tests_*.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
 
 # Task 04 / E0: standalone thunderbolt ping-pong latency gate (no core deps, no
 # model). Defined after the default targets so it never becomes the default goal.
