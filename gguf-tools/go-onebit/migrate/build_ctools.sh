@@ -16,8 +16,16 @@ for t in $TOOLS; do
           -Wl,-rpath,"$SO_DIR" -lm -lpthread
       fi ;;
     vq_merge_v4) gcc -O3 -march=native -o "$CAL/../quant/$t" "$CAL/../quant/$t.c" -lm ;;
-    # pubbench 要 libcurl(HTTP)+zlib(数据集 .gz); 抽取器金标回归单独一个驱动
-    pubbench) gcc -O3 -march=native -o "$CAL/$t" "$CAL/$t.c" -lcurl -lz -lm -lpthread ;;
+    # pubbench 要 libcurl(HTTP)+zlib(数据集 .gz); 抽取器金标回归单独一个驱动。
+    # spark 无 root: 系统缺 curl 头时用 apt-get download+dpkg -x 的用户态头(~/.local/curl-dev),
+    # 链接直接指系统运行时 libcurl.so.4(ABI 稳定)。
+    pubbench)
+      CURL_FLAGS="-lcurl"
+      if [ "$(uname)" != Darwin ] && [ ! -e /usr/include/curl/curl.h ] && [ ! -e "/usr/include/$(uname -m)-linux-gnu/curl/curl.h" ]; then
+        CDEV="$HOME/.local/curl-dev/extract"
+        CURL_FLAGS="-I$CDEV/usr/include/$(uname -m)-linux-gnu -I$CDEV/usr/include /usr/lib/$(uname -m)-linux-gnu/libcurl.so.4"
+      fi
+      gcc -O3 -march=native -o "$CAL/$t" "$CAL/$t.c" $CURL_FLAGS -lz -lm -lpthread ;;
     pubbench_extract_test)
       gcc -O3 -o "$CAL/../migrate/$t" "$CAL/../migrate/$t.c" -lcurl -lz -lm -lpthread
       echo "build ✓ $CAL/../migrate/$t"; continue ;;
