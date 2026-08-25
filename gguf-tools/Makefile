@@ -50,6 +50,7 @@ QUANTS_INC := $(wildcard $(QZ)/quants_p*.inc.c)
 DSQMAIN_INC := $(wildcard $(QZ)/deepseek4-quantize_p*.inc.c)
 PUBBENCH_INC := $(wildcard $(BEN)/pubbench_p*.inc.c)
 EMITZ_INC := $(wildcard $(AMP)/emit_z_p*.inc.c)
+CALIBDIAG_INC := $(wildcard $(CAL)/calib_diag_p*.inc.c)
 
 ifeq ($(UNAME_S),Darwin)
 NATIVE ?= -mcpu=native
@@ -315,7 +316,7 @@ calib_diag: calib_diag.bin
 .PHONY: calib_diag.bin
 CALIB_DIAG_SRC := $(CAL)/calib_diag.c $(CAL)/npy.c $(CAL)/hf_read.c $(QZ)/onebit_quant.c \
     $(CAL)/layer_probe.c $(AMP)/hiddenvar_solve.c $(AMP)/linalg_small.c
-calib_diag.bin: $(CALIB_DIAG_SRC)
+calib_diag.bin: $(CALIB_DIAG_SRC) $(CALIBDIAG_INC)
 	$(CC) $(CFLAGS) $(NATIVE) $(CPPFLAGS) $(INC) -o calib_diag $(CALIB_DIAG_SRC) -lm -pthread
 
 validate_fwd: $(CAL)/validate_fwd
