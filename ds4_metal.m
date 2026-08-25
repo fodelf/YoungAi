@@ -6312,6 +6312,16 @@ int ds4_gpu_dspark_markov_step_tensor(ds4_gpu_tensor *out_id, ds4_gpu_tensor *lo
     (void)w1_offset; (void)w2_offset; (void)prev_id; (void)vocab; (void)rank;
     return 0;
 }
+int ds4_gpu_dspark_confidence_tensor(ds4_gpu_tensor *out_conf, const ds4_gpu_tensor *x,
+                                     const void *model_map, uint64_t model_size,
+                                     uint64_t conf_w_offset, uint64_t markov_w1_offset,
+                                     const ds4_gpu_tensor *prev_ids,
+                                     uint32_t dim, uint32_t rank, uint32_t vocab, uint32_t n_pos) {
+    (void)out_conf; (void)x; (void)model_map; (void)model_size;
+    (void)conf_w_offset; (void)markov_w1_offset; (void)prev_ids;
+    (void)dim; (void)rank; (void)vocab; (void)n_pos;
+    return 0;   /* CUDA-only(spark 置信头); Metal 无实现, 与本组其余 dspark stub 同约定 */
+}
 int ds4_gpu_side_join(void) { return 1; }
 int ds4_gpu_matmul_q4_K_pair_tensor(ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
                                     const void *model_map, uint64_t model_size,

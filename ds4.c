@@ -1960,6 +1960,11 @@ ds4_tensor *model_find_tensor(const ds4_model *m, const char *name) {
     return NULL;
 }
 
+/* CUDA 默认 prefill 分块(见 ds4_default_prefill_cap_for_prompt 的实测注释); 0=未定。
+ * 必须无条件声明: 使用点 ds4_default_prefill_cap_for_prompt 在所有构建里都编译,
+ * 原先声明被圈进 #ifndef __APPLE__ 导致 Mac 构建 undeclared(stale .o 曾掩盖)。 */
+static int g_prefill_chunk_cuda = 0;
+
 #ifndef DS4_NO_GPU
 #ifndef __APPLE__
 #ifdef DS4_CUDA_SPARK_HBM_CACHE
@@ -2086,9 +2091,6 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
     return true;
 }
 #endif
-
-/* CUDA 默认 prefill 分块(见 ds4_default_prefill_cap_for_prompt 的实测注释); 0=未定 */
-static int g_prefill_chunk_cuda = 0;
 
 static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m) {
     if (backend == DS4_BACKEND_CUDA && g_prefill_chunk_cuda == 0) g_prefill_chunk_cuda = 256;
@@ -19219,6 +19221,21 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size
  * the backend-appropriate mmap policy, and expose tokenized prompt operations
  * to the CLI and server.
  */
+
+/* 取料入口 setter 家族(ds4.h 同名注释): CLI 参数是对外入口, 进程内的唯一消费点
+ * 目前仍是 DS4_CAP_DIR/DS4_EVAL_* 的 getenv 读点(散在 capture/终审仪器几处),
+ * 所以 setter 落到 setenv——单一事实源不变, 旗标即时生效, 不造第二条配置路径。
+ * (2026-08-22 env→CLI 迁移只 land 了 CLI 半边, setter 无实现曾链接失败;
+ * 消费点集中化到进程内全局属 ds4.c 拆分工序, 见重构阶段4。) */
+void ds4_tool_set_cap_dir(const char *p)     { if (p) setenv("DS4_CAP_DIR", p, 1); }
+const char *ds4_tool_cap_dir(void)           { return getenv("DS4_CAP_DIR"); }
+void ds4_tool_set_eval_ids(const char *p)    { if (p) setenv("DS4_EVAL_IDS", p, 1); }
+const char *ds4_tool_eval_ids(void)          { return getenv("DS4_EVAL_IDS"); }
+void ds4_tool_set_eval_hdump(const char *p)  { if (p) setenv("DS4_EVAL_HDUMP", p, 1); }
+const char *ds4_tool_eval_hdump(void)        { return getenv("DS4_EVAL_HDUMP"); }
+void ds4_tool_set_eval_logits(const char *p) { if (p) setenv("DS4_EVAL_LOGITS", p, 1); }
+const char *ds4_tool_eval_logits(void)       { return getenv("DS4_EVAL_LOGITS"); }
+void ds4_tool_set_eval_no_bos(int v)         { if (v) setenv("DS4_EVAL_NO_BOS", "1", 1); else unsetenv("DS4_EVAL_NO_BOS"); }
 
 const char *ds4_backend_name(ds4_backend backend) {
     switch (backend) {
