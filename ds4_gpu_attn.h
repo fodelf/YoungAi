@@ -6,6 +6,10 @@
 
 #include "ds4_gpu_core.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* =========================================================================
  * KV Compression and Attention.
  * =========================================================================
@@ -269,5 +273,9 @@ int ds4_gpu_attention_output_low_q8_tensor(
         uint32_t                n_groups,
         const ds4_gpu_tensor *heads);
 
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

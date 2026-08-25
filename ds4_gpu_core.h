@@ -4,6 +4,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 
 /* =========================================================================
  * GPU Tensor and Command Lifetime.
@@ -161,5 +165,9 @@ int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t contex
 void ds4_gpu_set_quality(bool quality);
 void ds4_gpu_print_memory_report(const char *label);
 
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
