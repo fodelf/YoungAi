@@ -1,3235 +1,5 @@
-/* =========================================================================
- * ds4.c - DeepSeek V4 inference engine.
- * =========================================================================
- *
- * This file is deliberately vertical: it owns GGUF loading, the fixed
- * DeepSeek V4 tensor layouts, CPU reference kernels, the whole-model Metal
- * graph driver, and tokenizer wiring.  Model shape selection is intentionally
- * narrow: validation accepts the known Flash and Pro layouts and fails early
- * for anything else.
- *
- * Loading is mmap based.  The loader parses only the GGUF header, metadata
- * table, and tensor directory.  Tensor data stays in the kernel page cache
- * until inference touches it, or until Metal wraps slices of the mapping as
- * no-copy MTLBuffers.
- */
-
-#include <errno.h>
-#include <fcntl.h>
-#include <float.h>
-#include <inttypes.h>
-#include <ctype.h>
-#include <limits.h>
-#include <math.h>
-#include <pthread.h>
-#include <signal.h>
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <strings.h>
-#include <sys/file.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <stdarg.h>
-#include <time.h>
-#include <unistd.h>
-
-#include "ds4.h"
-#include "ds4_distributed.h"
-#include "ds4_multimodal.h"
-#include "ds4_zchain.h"
-#include "ds4_spatial.h"
-#include "ds4_css.h"
-
-#ifndef DS4_NO_GPU
-#include "ds4_gpu.h"
-#endif
-#if defined(__ARM_NEON)
-#include <arm_neon.h>
-#endif
-
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
-
-#ifdef DS4_NO_GPU
-/* ds4_distributed.o is compiled once (no DS4_NO_GPU variant) and calls this
- * GPU-side helper unconditionally; the CPU build supplies the no-op here. */
-void ds4_gpu_expert_remote_fetch_kick(void) {}
-#endif
-
-#define DS4_NEG_INF (-1.0e30f)
-#define DS4_POS_INF ( 1.0e30f)
-#define DS4_DEFAULT_RMS_EPS ( 1.0e-6f)
-#define DS4_DEFAULT_HC_EPS  ( 1.0e-6f)
-#define DS4_DEFAULT_SWIGLU_CLAMP_EXP    (10.0f)
-#define DS4_DEFAULT_ROPE_FREQ_BASE      (10000.0f)
-#define DS4_DEFAULT_ROPE_SCALE_FACTOR   (16.0f)
-#define DS4_DEFAULT_ROPE_YARN_BETA_FAST (32.0f)
-#define DS4_DEFAULT_ROPE_YARN_BETA_SLOW (1.0f)
-#define DS4_DEFAULT_COMPRESS_ROPE_FREQ_BASE (160000.0f)
-#define DS4_DEFAULT_ROPE_ORIG_CTX       UINT64_C(65536)
-
-static const char DS4_REASONING_EFFORT_MAX_PREFIX[] =
-    "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
-    "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n"
-    "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n";
-
-/* DeepSeek recommends Think Max only with at least a 384K-token context window.
- * Below that size we keep ordinary thinking to avoid injecting a prompt that
- * asks for a reasoning budget the allocated context is not meant to hold. */
-#define DS4_THINK_MAX_MIN_CONTEXT 393216u
-
-static bool ds4_backend_uses_graph(ds4_backend backend) {
-    return backend == DS4_BACKEND_METAL || backend == DS4_BACKEND_CUDA;
-}
-
-/* =========================================================================
- * DeepSeek V4 Shape Profiles.
- * =========================================================================
- *
- * The weight binder and metadata validator select one of the known model
- * profiles below.  Arrays reserve the maximum Pro dimensions; hot loops read
- * the active profile after GGUF validation.
- */
-
-
-#include "ds4_internal.h"
-
-static const ds4_shape DS4_SHAPE_FLASH = {
-    .name = "DeepSeek V4 Flash",
-    .variant = DS4_VARIANT_FLASH,
-    .n_layer = 43,
-    .n_embd = 4096,
-    .n_vocab = 129280,
-    .n_head = 64,
-    .n_head_kv = 1,
-    .n_head_dim = 512,
-    .n_value_dim = 512,
-    .n_rot = 64,
-    .n_out_group = 8,
-    .n_lora_q = 1024,
-    .n_lora_o = 1024,
-    .n_expert = 256,
-    .n_expert_used = 6,
-    .n_expert_shared = 1,
-    .n_ff_exp = 2048,
-    .n_hash_layer = 3,
-    .n_swa = 128,
-    .n_indexer_head = 64,
-    .n_indexer_head_dim = 128,
-    .n_indexer_top_k = 512,
-    .n_hc = 4,
-    .n_hc_sinkhorn_iter = 20,
-    .rms_eps = DS4_DEFAULT_RMS_EPS,
-    .hc_eps = DS4_DEFAULT_HC_EPS,
-    .expert_weight_scale = 1.5f,
-    .swiglu_clamp_exp = DS4_DEFAULT_SWIGLU_CLAMP_EXP,
-    .rope_freq_base = DS4_DEFAULT_ROPE_FREQ_BASE,
-    .rope_scale_factor = DS4_DEFAULT_ROPE_SCALE_FACTOR,
-    .rope_yarn_beta_fast = DS4_DEFAULT_ROPE_YARN_BETA_FAST,
-    .rope_yarn_beta_slow = DS4_DEFAULT_ROPE_YARN_BETA_SLOW,
-    .compress_rope_freq_base = DS4_DEFAULT_COMPRESS_ROPE_FREQ_BASE,
-    .rope_orig_ctx = DS4_DEFAULT_ROPE_ORIG_CTX,
-};
-
-static const ds4_shape DS4_SHAPE_PRO = {
-    .name = "DeepSeek V4 Pro",
-    .variant = DS4_VARIANT_PRO,
-    .n_layer = 61,
-    .n_embd = 7168,
-    .n_vocab = 129280,
-    .n_head = 128,
-    .n_head_kv = 1,
-    .n_head_dim = 512,
-    .n_value_dim = 512,
-    .n_rot = 64,
-    .n_out_group = 16,
-    .n_lora_q = 1536,
-    .n_lora_o = 1024,
-    .n_expert = 384,
-    .n_expert_used = 6,
-    .n_expert_shared = 1,
-    .n_ff_exp = 3072,
-    .n_hash_layer = 3,
-    .n_swa = 128,
-    .n_indexer_head = 64,
-    .n_indexer_head_dim = 128,
-    .n_indexer_top_k = 1024,
-    .n_hc = 4,
-    .n_hc_sinkhorn_iter = 20,
-    .rms_eps = DS4_DEFAULT_RMS_EPS,
-    .hc_eps = DS4_DEFAULT_HC_EPS,
-    .expert_weight_scale = 2.5f,
-    .swiglu_clamp_exp = DS4_DEFAULT_SWIGLU_CLAMP_EXP,
-    .rope_freq_base = DS4_DEFAULT_ROPE_FREQ_BASE,
-    .rope_scale_factor = DS4_DEFAULT_ROPE_SCALE_FACTOR,
-    .rope_yarn_beta_fast = DS4_DEFAULT_ROPE_YARN_BETA_FAST,
-    .rope_yarn_beta_slow = DS4_DEFAULT_ROPE_YARN_BETA_SLOW,
-    .compress_rope_freq_base = DS4_DEFAULT_COMPRESS_ROPE_FREQ_BASE,
-    .rope_orig_ctx = DS4_DEFAULT_ROPE_ORIG_CTX,
-};
-
-ds4_shape g_ds4_shape = {
-    .name = "DeepSeek V4 Flash",
-    .variant = DS4_VARIANT_FLASH,
-    .n_layer = 43,
-    .n_embd = 4096,
-    .n_vocab = 129280,
-    .n_head = 64,
-    .n_head_kv = 1,
-    .n_head_dim = 512,
-    .n_value_dim = 512,
-    .n_rot = 64,
-    .n_out_group = 8,
-    .n_lora_q = 1024,
-    .n_lora_o = 1024,
-    .n_expert = 256,
-    .n_expert_used = 6,
-    .n_expert_shared = 1,
-    .n_ff_exp = 2048,
-    .n_hash_layer = 3,
-    .n_swa = 128,
-    .n_indexer_head = 64,
-    .n_indexer_head_dim = 128,
-    .n_indexer_top_k = 512,
-    .n_hc = 4,
-    .n_hc_sinkhorn_iter = 20,
-    .rms_eps = DS4_DEFAULT_RMS_EPS,
-    .hc_eps = DS4_DEFAULT_HC_EPS,
-    .expert_weight_scale = 1.5f,
-    .swiglu_clamp_exp = DS4_DEFAULT_SWIGLU_CLAMP_EXP,
-    .rope_freq_base = DS4_DEFAULT_ROPE_FREQ_BASE,
-    .rope_scale_factor = DS4_DEFAULT_ROPE_SCALE_FACTOR,
-    .rope_yarn_beta_fast = DS4_DEFAULT_ROPE_YARN_BETA_FAST,
-    .rope_yarn_beta_slow = DS4_DEFAULT_ROPE_YARN_BETA_SLOW,
-    .compress_rope_freq_base = DS4_DEFAULT_COMPRESS_ROPE_FREQ_BASE,
-    .rope_orig_ctx = DS4_DEFAULT_ROPE_ORIG_CTX,
-};
-
-static uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER] = {0};
-
-
-static int g_ds4_lock_fd = -1;
-
-#if defined(__GNUC__) || defined(__clang__)
-#define DS4_MAYBE_UNUSED __attribute__((unused))
-#else
-#define DS4_MAYBE_UNUSED
-#endif
-
-/* =========================================================================
- * GGUF Quant Block Formats.
- * =========================================================================
- *
- * These layouts and IQ2 tables match the GGUF quantized tensor format,
- * reduced to only the formats ds4.c currently reads:
- *   - Q2_K routed down experts
- *   - Q4_K routed experts in the high-memory variant
- *   - IQ2_XXS routed gate/up experts
- *   - Q8_K temporary activation blocks for dot products
- */
-#define QK_K 256
-
-typedef struct {
-    uint8_t  scales[QK_K / 16];
-    uint8_t  qs[QK_K / 4];
-    uint16_t d;
-    uint16_t dmin;
-} block_q2_K;
-
-typedef struct {
-    uint16_t d;
-    uint16_t dmin;
-    uint8_t  scales[12];
-    uint8_t  qs[QK_K / 2];
-} block_q4_K;
-
-typedef struct {
-    float   d;
-    int8_t  qs[QK_K];
-    int16_t bsums[QK_K / 16];
-} block_q8_K;
-
-typedef struct {
-    uint16_t d;
-    uint16_t qs[QK_K / 8];
-} block_iq2_xxs;
-
-/* go1b: DS4 strict-1-bit routed expert weight.  One fp16 per-row scale d
- * (replicated into every QK_K block of the row) + QK_K sign bits; element j in
- * a block is +d when signs[j/8] bit (j%8) is set, else -d.  34 bytes / 256
- * elements.  Mirrors the metal block_go1b in metal/moe.metal. */
-typedef struct {
-    uint16_t d;
-    uint8_t  signs[QK_K / 8];
-} block_go1b;
-
-/* go2b: offline-merged base+residual strict-binary pair (R5-C). Element value
- * is the exact 4-level sum (±d1)+(±d2) of the two go1b layers it replaces.
- * 68 bytes / 256 elements. Mirrors metal block_go2b. */
-typedef struct {
-    uint16_t d1;
-    uint16_t d2;
-    uint8_t  s1[QK_K / 8];
-    uint8_t  s2[QK_K / 8];
-} block_go2b;
-
-#define DS4_STATIC_ASSERT(name, cond) typedef char name[(cond) ? 1 : -1]
-DS4_STATIC_ASSERT(ds4_block_q2_k_size, sizeof(block_q2_K) == 84);
-DS4_STATIC_ASSERT(ds4_block_q4_k_size, sizeof(block_q4_K) == 144);
-DS4_STATIC_ASSERT(ds4_block_q8_k_size, sizeof(block_q8_K) == 292);
-DS4_STATIC_ASSERT(ds4_block_iq2_xxs_size, sizeof(block_iq2_xxs) == 66);
-DS4_STATIC_ASSERT(ds4_block_go1b_size, sizeof(block_go1b) == 34);
-DS4_STATIC_ASSERT(ds4_block_go2b_size, sizeof(block_go2b) == 68);
-
-typedef struct {
-    uint32_t ctx_size;
-    uint32_t comp_cap;
-    uint32_t attn_score_cap;
-    uint32_t q8_cap;
-
-    float *plain;
-    float *cur;
-    float *next;
-
-    float *attn_cur;
-    float *attn_norm;
-    float *attn_residual;
-    float *q;
-    float *qr;
-    float *qr_norm;
-    float *kv_raw;
-    float *kv;
-    float *heads;
-    float *attn_low;
-    float *attn_out;
-    float *after_attn_hc;
-    float *attn_score;
-
-    float *comp;
-    float *index_comp;
-    float *comp_kv_cur;
-    float *comp_sc_cur;
-    float *comp_pooled;
-
-    bool *index_allowed;
-    float *index_q;
-    float *index_weights;
-    float *index_scores;
-
-    float *ffn_cur;
-    float *ffn_norm;
-    float *ffn_moe;
-    float *ffn_shared;
-    float *ffn_out;
-    float *shared_gate;
-    float *shared_up;
-    float *shared_mid;
-    float *routed_mid_all;
-    block_q8_K *routed_xq;
-    block_q8_K *routed_midq;
-
-    int8_t *q8_xq;
-    float *q8_xscale;
-
-    float *hc_flat;
-    float *output_flat;
-    float *output_pre;
-    float *output_weights;
-    float *output_embd;
-    float *output_norm;
-} ds4_cpu_decode_scratch;
-
-static const uint8_t kmask_iq2xs[8] = {
-    1, 2, 4, 8, 16, 32, 64, 128
-};
-
-static const uint8_t ksigns_iq2xs[128] = {
-      0, 129, 130,   3, 132,   5,   6, 135, 136,   9,  10, 139,  12, 141, 142,  15,
-    144,  17,  18, 147,  20, 149, 150,  23,  24, 153, 154,  27, 156,  29,  30, 159,
-    160,  33,  34, 163,  36, 165, 166,  39,  40, 169, 170,  43, 172,  45,  46, 175,
-     48, 177, 178,  51, 180,  53,  54, 183, 184,  57,  58, 187,  60, 189, 190,  63,
-    192,  65,  66, 195,  68, 197, 198,  71,  72, 201, 202,  75, 204,  77,  78, 207,
-     80, 209, 210,  83, 212,  85,  86, 215, 216,  89,  90, 219,  92, 221, 222,  95,
-     96, 225, 226,  99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,
-    240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
-};
-
-static const uint64_t iq2xxs_grid[256] = {
-    0x0808080808080808, 0x080808080808082b, 0x0808080808081919, 0x0808080808082b08,
-    0x0808080808082b2b, 0x0808080808190819, 0x0808080808191908, 0x08080808082b0808,
-    0x08080808082b082b, 0x08080808082b2b08, 0x08080808082b2b2b, 0x0808080819080819,
-    0x0808080819081908, 0x0808080819190808, 0x0808080819192b08, 0x08080808192b0819,
-    0x08080808192b1908, 0x080808082b080808, 0x080808082b08082b, 0x080808082b082b2b,
-    0x080808082b2b082b, 0x0808081908080819, 0x0808081908081908, 0x0808081908190808,
-    0x0808081908191919, 0x0808081919080808, 0x080808192b081908, 0x080808192b192b08,
-    0x0808082b08080808, 0x0808082b0808082b, 0x0808082b082b082b, 0x0808082b2b08082b,
-    0x0808190808080819, 0x0808190808081908, 0x0808190808190808, 0x08081908082b0819,
-    0x08081908082b1908, 0x0808190819080808, 0x080819081908082b, 0x0808190819082b08,
-    0x08081908192b0808, 0x080819082b080819, 0x080819082b081908, 0x080819082b190808,
-    0x080819082b2b1908, 0x0808191908080808, 0x080819190808082b, 0x0808191908082b08,
-    0x08081919082b0808, 0x080819191908192b, 0x08081919192b2b19, 0x080819192b080808,
-    0x080819192b190819, 0x0808192b08082b19, 0x0808192b08190808, 0x0808192b19080808,
-    0x0808192b2b081908, 0x0808192b2b2b1908, 0x08082b0808080808, 0x08082b0808081919,
-    0x08082b0808082b08, 0x08082b0808191908, 0x08082b08082b2b08, 0x08082b0819080819,
-    0x08082b0819081908, 0x08082b0819190808, 0x08082b081919082b, 0x08082b082b082b08,
-    0x08082b1908081908, 0x08082b1919080808, 0x08082b2b0808082b, 0x08082b2b08191908,
-    0x0819080808080819, 0x0819080808081908, 0x0819080808190808, 0x08190808082b0819,
-    0x0819080819080808, 0x08190808192b0808, 0x081908082b081908, 0x081908082b190808,
-    0x081908082b191919, 0x0819081908080808, 0x0819081908082b08, 0x08190819082b0808,
-    0x0819081919190808, 0x0819081919192b2b, 0x081908192b080808, 0x0819082b082b1908,
-    0x0819082b19081919, 0x0819190808080808, 0x0819190808082b08, 0x08191908082b0808,
-    0x08191908082b1919, 0x0819190819082b19, 0x081919082b080808, 0x0819191908192b08,
-    0x08191919192b082b, 0x0819192b08080808, 0x0819192b0819192b, 0x08192b0808080819,
-    0x08192b0808081908, 0x08192b0808190808, 0x08192b0819080808, 0x08192b082b080819,
-    0x08192b1908080808, 0x08192b1908081919, 0x08192b192b2b0808, 0x08192b2b19190819,
-    0x082b080808080808, 0x082b08080808082b, 0x082b080808082b2b, 0x082b080819081908,
-    0x082b0808192b0819, 0x082b08082b080808, 0x082b08082b08082b, 0x082b0819082b2b19,
-    0x082b081919082b08, 0x082b082b08080808, 0x082b082b0808082b, 0x082b190808080819,
-    0x082b190808081908, 0x082b190808190808, 0x082b190819080808, 0x082b19081919192b,
-    0x082b191908080808, 0x082b191919080819, 0x082b1919192b1908, 0x082b192b2b190808,
-    0x082b2b0808082b08, 0x082b2b08082b0808, 0x082b2b082b191908, 0x082b2b2b19081908,
-    0x1908080808080819, 0x1908080808081908, 0x1908080808190808, 0x1908080808192b08,
-    0x19080808082b0819, 0x19080808082b1908, 0x1908080819080808, 0x1908080819082b08,
-    0x190808081919192b, 0x19080808192b0808, 0x190808082b080819, 0x190808082b081908,
-    0x190808082b190808, 0x1908081908080808, 0x19080819082b0808, 0x19080819192b0819,
-    0x190808192b080808, 0x190808192b081919, 0x1908082b08080819, 0x1908082b08190808,
-    0x1908082b19082b08, 0x1908082b1919192b, 0x1908082b192b2b08, 0x1908190808080808,
-    0x1908190808082b08, 0x19081908082b0808, 0x190819082b080808, 0x190819082b192b19,
-    0x190819190819082b, 0x19081919082b1908, 0x1908192b08080808, 0x19082b0808080819,
-    0x19082b0808081908, 0x19082b0808190808, 0x19082b0819080808, 0x19082b0819081919,
-    0x19082b1908080808, 0x19082b1919192b08, 0x19082b19192b0819, 0x19082b192b08082b,
-    0x19082b2b19081919, 0x19082b2b2b190808, 0x1919080808080808, 0x1919080808082b08,
-    0x1919080808190819, 0x1919080808192b19, 0x19190808082b0808, 0x191908082b080808,
-    0x191908082b082b08, 0x1919081908081908, 0x191908191908082b, 0x191908192b2b1908,
-    0x1919082b2b190819, 0x191919082b190808, 0x191919082b19082b, 0x1919191908082b2b,
-    0x1919192b08080819, 0x1919192b19191908, 0x19192b0808080808, 0x19192b0808190819,
-    0x19192b0808192b19, 0x19192b08192b1908, 0x19192b1919080808, 0x19192b2b08082b08,
-    0x192b080808081908, 0x192b080808190808, 0x192b080819080808, 0x192b0808192b2b08,
-    0x192b081908080808, 0x192b081919191919, 0x192b082b08192b08, 0x192b082b192b0808,
-    0x192b190808080808, 0x192b190808081919, 0x192b191908190808, 0x192b19190819082b,
-    0x192b19192b081908, 0x192b2b081908082b, 0x2b08080808080808, 0x2b0808080808082b,
-    0x2b08080808082b2b, 0x2b08080819080819, 0x2b0808082b08082b, 0x2b08081908081908,
-    0x2b08081908192b08, 0x2b08081919080808, 0x2b08082b08190819, 0x2b08190808080819,
-    0x2b08190808081908, 0x2b08190808190808, 0x2b08190808191919, 0x2b08190819080808,
-    0x2b081908192b0808, 0x2b08191908080808, 0x2b0819191908192b, 0x2b0819192b191908,
-    0x2b08192b08082b19, 0x2b08192b19080808, 0x2b08192b192b0808, 0x2b082b080808082b,
-    0x2b082b1908081908, 0x2b082b2b08190819, 0x2b19080808081908, 0x2b19080808190808,
-    0x2b190808082b1908, 0x2b19080819080808, 0x2b1908082b2b0819, 0x2b1908190819192b,
-    0x2b1908192b080808, 0x2b19082b19081919, 0x2b19190808080808, 0x2b191908082b082b,
-    0x2b19190819081908, 0x2b19191919190819, 0x2b192b082b080819, 0x2b192b19082b0808,
-    0x2b2b08080808082b, 0x2b2b080819190808, 0x2b2b08082b081919, 0x2b2b081908082b19,
-    0x2b2b082b08080808, 0x2b2b190808192b08, 0x2b2b2b0819190808, 0x2b2b2b1908081908,
-};
-
-static int8_t iq2xxs_signed_grid[256][128][8];
-static int8_t iq2xxs_signs[128][8];
-static pthread_once_t iq2xxs_signed_grid_once = PTHREAD_ONCE_INIT;
-
-static void iq2xxs_signed_grid_init(void) {
-    for (uint32_t s = 0; s < 128; s++) {
-        const uint8_t signs = ksigns_iq2xs[s];
-        for (uint32_t j = 0; j < 8; j++) {
-            iq2xxs_signs[s][j] = (int8_t)((signs & kmask_iq2xs[j]) ? -1 : 1);
-        }
-    }
-
-    for (uint32_t g = 0; g < 256; g++) {
-        const uint8_t *grid = (const uint8_t *)(iq2xxs_grid + g);
-        for (uint32_t s = 0; s < 128; s++) {
-            const uint8_t signs = ksigns_iq2xs[s];
-            for (uint32_t j = 0; j < 8; j++) {
-                const int v = (int)grid[j];
-                iq2xxs_signed_grid[g][s][j] = (int8_t)((signs & kmask_iq2xs[j]) ? -v : v);
-            }
-        }
-    }
-}
-
-static inline DS4_MAYBE_UNUSED int32_t dot_iq2_pair_16(const int8_t *grid0, const int8_t *grid1, const int8_t *q8) {
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-    const int8x16_t gv = vcombine_s8(vld1_s8(grid0), vld1_s8(grid1));
-    const int32x4_t acc = vdotq_s32(vdupq_n_s32(0), gv, vld1q_s8(q8));
-    return vaddvq_s32(acc);
-#elif defined(__ARM_NEON)
-    const int8x16_t gv = vcombine_s8(vld1_s8(grid0), vld1_s8(grid1));
-    const int8x16_t qv = vld1q_s8(q8);
-    const int16x8_t p0 = vmull_s8(vget_low_s8(gv), vget_low_s8(qv));
-    const int16x8_t p1 = vmull_s8(vget_high_s8(gv), vget_high_s8(qv));
-    return vaddvq_s32(vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)));
-#else
-    int32_t sum = 0;
-    for (uint32_t i = 0; i < 8; i++) sum += (int32_t)grid0[i] * (int32_t)q8[i];
-    for (uint32_t i = 0; i < 8; i++) sum += (int32_t)grid1[i] * (int32_t)q8[8 + i];
-    return sum;
-#endif
-}
-
-static inline DS4_MAYBE_UNUSED int32_t dot_q2_16(const uint8_t *q2, const int8_t *q8, int shift) {
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-    const uint8x16_t packed = vld1q_u8(q2);
-    uint8x16_t shifted;
-    switch (shift) {
-    case 0: shifted = packed; break;
-    case 2: shifted = vshrq_n_u8(packed, 2); break;
-    case 4: shifted = vshrq_n_u8(packed, 4); break;
-    default: shifted = vshrq_n_u8(packed, 6); break;
-    }
-    const uint8x16_t vals_u = vandq_u8(shifted, vdupq_n_u8(3));
-    const int8x16_t vals = vreinterpretq_s8_u8(vals_u);
-    const int8x16_t q8v = vld1q_s8(q8);
-    const int32x4_t acc = vdotq_s32(vdupq_n_s32(0), q8v, vals);
-    return vaddvq_s32(acc);
-#elif defined(__ARM_NEON)
-    uint8_t vals_tmp[16];
-    for (uint32_t i = 0; i < 16; i++) vals_tmp[i] = (q2[i] >> shift) & 3;
-    const int8x16_t vals = vreinterpretq_s8_u8(vld1q_u8(vals_tmp));
-    const int8x16_t q8v = vld1q_s8(q8);
-    const int16x8_t p0 = vmull_s8(vget_low_s8(q8v), vget_low_s8(vals));
-    const int16x8_t p1 = vmull_s8(vget_high_s8(q8v), vget_high_s8(vals));
-    const int32x4_t s0 = vpaddlq_s16(p0);
-    const int32x4_t s1 = vpaddlq_s16(p1);
-    return vaddvq_s32(vaddq_s32(s0, s1));
-#else
-    int32_t sum = 0;
-    for (uint32_t i = 0; i < 16; i++) sum += (int32_t)q8[i] * (int32_t)((q2[i] >> shift) & 3);
-    return sum;
-#endif
-}
-
-/* =========================================================================
- * Shared Helpers, Allocation Guards, Threads, and Cursor Reads.
- * =========================================================================
- *
- * This section holds process-wide utilities used by all later stages:
- * fatal-error helpers, allocation wrappers, the persistent CPU worker pool,
- * and the small byte cursor used to parse GGUF metadata.
- */
-
-#define DS4_GGUF_MAGIC 0x46554747u /* "GGUF", little endian. */
-
-typedef struct {
-    const uint8_t *base;
-    uint64_t size;
-    uint64_t pos;
-    char error[256];
-} ds4_cursor;
-
-void ds4_die(const char *msg) {
-    fprintf(stderr, "ds4: %s\n", msg);
-    exit(1);
-}
-
-/* Attention compression is read from GGUF metadata after validating that it
- * matches the exact layout expected for the loaded model shape. */
-static uint32_t ds4_layer_compress_ratio(uint32_t il) {
-    if (il >= DS4_N_LAYER) ds4_die("DeepSeek4 layer index is outside the loaded model layout");
-    return g_ds4_compress_ratios[il];
-}
-
-static uint32_t ds4_expected_layer_compress_ratio(uint32_t il) {
-    if (il >= DS4_N_LAYER) ds4_die("DeepSeek4 layer index is outside the loaded model layout");
-
-    switch (DS4_MODEL_VARIANT) {
-    case DS4_VARIANT_FLASH:
-        if (il < 2) return 0;
-        return (il & 1u) == 0 ? 4u : 128u;
-    case DS4_VARIANT_PRO:
-        if (il < 2) return 128u;
-        return (il & 1u) == 0 ? 4u : 128u;
-    default:
-        ds4_die("unsupported DeepSeek4 model variant");
-    }
-    return 0;
-}
-
-static void ds4_die_errno(const char *what, const char *path) {
-    fprintf(stderr, "ds4: %s '%s': %s\n", what, path, strerror(errno));
-    exit(1);
-}
-
-static bool ds4_streq(ds4_str s, const char *z) {
-    size_t n = strlen(z);
-    return s.len == n && memcmp(s.ptr, z, n) == 0;
-}
-
-static bool ds4_str_eq(ds4_str a, ds4_str b) {
-    return a.len == b.len && memcmp(a.ptr, b.ptr, a.len) == 0;
-}
-
-static uint64_t hash_bytes(const void *ptr, uint64_t len) {
-    const uint8_t *p = ptr;
-    uint64_t h = 1469598103934665603ull;
-    for (uint64_t i = 0; i < len; i++) {
-        h ^= p[i];
-        h *= 1099511628211ull;
-    }
-    return h;
-}
-
-static bool g_alloc_guard_enabled;
-static const char *g_alloc_guard_phase;
-
-static void ds4_alloc_guard_begin(const char *phase) {
-    g_alloc_guard_phase = phase;
-    g_alloc_guard_enabled = true;
-}
-
-static void ds4_alloc_guard_end(void) {
-    g_alloc_guard_enabled = false;
-    g_alloc_guard_phase = NULL;
-}
-
-static void ds4_alloc_guard_check(const char *op, size_t size) {
-    if (!g_alloc_guard_enabled) return;
-    fprintf(stderr,
-            "ds4: internal allocation during %s: %s(%zu). "
-            "CPU decode is expected to reuse preallocated scratch buffers.\n",
-            g_alloc_guard_phase ? g_alloc_guard_phase : "guarded phase",
-            op,
-            size);
-    exit(1);
-}
-
-void *xcalloc(size_t n, size_t size) {
-    ds4_alloc_guard_check("calloc", n * size);
-    void *p = calloc(n, size);
-    if (!p) ds4_die("out of memory");
-    return p;
-}
-
-void *xmalloc(size_t size) {
-    ds4_alloc_guard_check("malloc", size);
-    void *p = malloc(size);
-    if (!p) ds4_die("out of memory");
-    return p;
-}
-
-static char *ds4_strdup(const char *s) {
-    size_t n = strlen(s);
-    char *p = xmalloc(n + 1);
-    memcpy(p, s, n + 1);
-    return p;
-}
-
-static void *xrealloc(void *ptr, size_t size) {
-    ds4_alloc_guard_check("realloc", size);
-    void *p = realloc(ptr, size);
-    if (!p) ds4_die("out of memory");
-    return p;
-}
-
-static void *xmalloc_zeroed(size_t n, size_t size) {
-    if (size != 0 && n > SIZE_MAX / size) ds4_die("allocation size overflow");
-    const size_t total = n * size;
-    void *p = xmalloc(total ? total : 1);
-    /*
-     * This is intentionally not calloc(). Large untouched calloc ranges may be
-     * represented by the VM through shared zero-page bookkeeping. The CPU decode
-     * KV cache grows one token at a time, so using calloc here can move thousands
-     * of first-touch faults into generation. On Darwin we have observed this end
-     * in a kernel cpt_mapcnt_inc overflow panic instead of a user-space error.
-     *
-     * Explicitly writing the zeroes while the cache is allocated keeps those VM
-     * faults out of the token loop and gives the cache private resident pages.
-     */
-    memset(p, 0, total);
-    return p;
-}
-
-static double now_sec(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
-}
-
-/* ---- Stage 0: phys_footprint watchdog + DS4_PROFILE timing (see task/02) ----
- * Watchdog samples the Mach phys_footprint every 200ms (NOT ps/rss, which is
- * blind to Metal no-copy mmap residency: 9.3GiB resident reads as ~38MiB),
- * tracks the peak, and _exit()s before crossing 90% of DS4_MEM_BUDGET_MB so the
- * machine never page-thrashes. A constructor self-starts it so the whole
- * process -- including the big model mmap + residency wiring during load -- is
- * covered, without touching any hot path. A default-on system-pressure guard
- * keeps a lightweight poll thread running for every process (one sysctl / 200ms)
- * so the machine can never be driven into a kernel-watchdog panic; opt out with
- * DS4_NO_MEM_PRESSURE_GUARD=1. DS4_MEM_BUDGET_MB adds the phys_footprint ceiling.
- * DS4_PROFILE accumulates load/prefill/decode wall time and, at exit, writes one
- * CSV-ish line to DS4_PROFILE_FILE (or stderr). */
-#if defined(__APPLE__)
-#include <mach/mach.h>
-#include <sys/sysctl.h>
-static uint64_t ds4_phys_footprint_bytes(void) {
-    task_vm_info_data_t info;
-    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
-    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &count) != KERN_SUCCESS) return 0;
-    return (uint64_t)info.phys_footprint;
-}
-/* System-wide memory-pressure level (kern.memorystatus_vm_pressure_level):
- * 1=normal, 2=warn, 4=critical. Distinct from phys_footprint above, which is
- * BLIND to clean file-backed page-cache pages -- the expert-offload path's
- * MADV_WILLNEED prefetch fills those, and they don't count toward the process
- * footprint yet DO drive system pressure. Sustained critical pressure starves
- * watchdogd -> kernel watchdog panic + reboot (observed 2026-07-06: single-host
- * offload generation on the full mono panicked M4 while footprint read a healthy
- * 8.2 GiB). Returns 1 (normal) on any read failure so the guard fails safe. */
-static int ds4_system_mem_pressure_level(void) {
-    int level = 1; size_t len = sizeof(level);
-    if (sysctlbyname("kern.memorystatus_vm_pressure_level", &level, &len, NULL, 0) != 0) return 1;
-    return level;
-}
-#else
-static uint64_t ds4_phys_footprint_bytes(void) { return 0; }
-static int ds4_system_mem_pressure_level(void) { return 1; }
-#endif
-
-#define DS4_GIB (1024.0 * 1024.0 * 1024.0)
-
-static pthread_t         g_mem_watch_thread;
-static volatile int      g_mem_watch_run = 0;
-static int               g_mem_watch_started = 0;
-static uint64_t          g_mem_budget_bytes = 0;
-static volatile uint64_t g_mem_peak_footprint = 0;
-
-typedef struct {
-    int      inited;
-    int      enabled;
-    const char *csv_path;
-    double   load_sec;
-    uint64_t load_footprint_delta;
-    uint64_t prefill_tokens;
-    uint32_t prefill_chunks;
-    double   prefill_sec;
-    uint64_t decode_tokens;
-    double   decode_sec;
-} ds4_profile_state;
-static ds4_profile_state g_prof;
-static DS4_MAYBE_UNUSED double   g_prof_load_begin_sec;
-static DS4_MAYBE_UNUSED uint64_t g_prof_load_footprint_begin;
-
-static void ds4_profile_init(void) {
-    if (g_prof.inited) return;
-    g_prof.inited = 1;
-    g_prof.enabled = getenv("DS4_PROFILE") != NULL;
-    g_prof.csv_path = getenv("DS4_PROFILE_FILE");
-}
-
-static void ds4_profile_flush(void) {
-    if (!g_prof.enabled && !g_mem_watch_started) return;
-    uint64_t peak = g_mem_peak_footprint;
-    uint64_t now = ds4_phys_footprint_bytes();
-    if (now > peak) peak = now;
-    double ptps = g_prof.prefill_sec > 0.0 ? (double)g_prof.prefill_tokens / g_prof.prefill_sec : 0.0;
-    double dtps = g_prof.decode_sec  > 0.0 ? (double)g_prof.decode_tokens  / g_prof.decode_sec  : 0.0;
-    FILE *f = stderr;
-    int close_f = 0;
-    if (g_prof.csv_path && g_prof.csv_path[0]) {
-        FILE *cf = fopen(g_prof.csv_path, "a");
-        if (cf) { f = cf; close_f = 1; }
-    }
-    fprintf(f,
-            "ds4_profile load_sec=%.3f load_footprint_gib=%.3f "
-            "prefill_tokens=%" PRIu64 " prefill_chunks=%u prefill_sec=%.3f prefill_tps=%.2f "
-            "decode_tokens=%" PRIu64 " decode_sec=%.3f decode_tps=%.2f "
-            "peak_footprint_gib=%.3f budget_gib=%.3f\n",
-            g_prof.load_sec, (double)g_prof.load_footprint_delta / DS4_GIB,
-            g_prof.prefill_tokens, g_prof.prefill_chunks, g_prof.prefill_sec, ptps,
-            g_prof.decode_tokens, g_prof.decode_sec, dtps,
-            (double)peak / DS4_GIB, (double)g_mem_budget_bytes / DS4_GIB);
-    if (close_f) fclose(f);
-}
-
-static DS4_MAYBE_UNUSED void ds4_profile_load_begin(void) {
-    ds4_profile_init();
-    if (!g_prof.enabled) return;
-    g_prof_load_begin_sec = now_sec();
-    g_prof_load_footprint_begin = ds4_phys_footprint_bytes();
-}
-
-static DS4_MAYBE_UNUSED void ds4_profile_load_end(void) {
-    if (!g_prof.enabled) return;
-    g_prof.load_sec += now_sec() - g_prof_load_begin_sec;
-    uint64_t fp = ds4_phys_footprint_bytes();
-    if (fp > g_prof_load_footprint_begin) g_prof.load_footprint_delta += fp - g_prof_load_footprint_begin;
-}
-
-static DS4_MAYBE_UNUSED void ds4_profile_add_prefill(uint64_t tokens, double sec) {
-    if (!g_prof.enabled) return;
-    g_prof.prefill_tokens += tokens;
-    g_prof.prefill_sec += sec;
-    g_prof.prefill_chunks++;
-}
-
-static DS4_MAYBE_UNUSED void ds4_profile_add_decode(uint64_t tokens, double sec) {
-    if (!g_prof.enabled) return;
-    g_prof.decode_tokens += tokens;
-    g_prof.decode_sec += sec;
-}
-
-static void *ds4_mem_watchdog_main(void *arg) {
-    (void)arg;
-    const int fp_log = getenv("DS4_FOOTPRINT_LOG") != NULL;
-    const int pressure_guard = getenv("DS4_NO_MEM_PRESSURE_GUARD") == NULL;
-    const unsigned interval_ms = fp_log ? 50 : 200;
-    uint64_t fp_min = ~0ull, fp_max = 0;
-    int fp_n = 0;
-    unsigned crit_ms = 0;   /* consecutive system-CRITICAL accumulator for the pressure guard */
-    while (g_mem_watch_run) {
-        uint64_t fp = ds4_phys_footprint_bytes();
-        if (fp > g_mem_peak_footprint) g_mem_peak_footprint = fp;
-        if (fp_log) {
-            if (fp < fp_min) fp_min = fp;
-            if (fp > fp_max) fp_max = fp;
-            if (++fp_n % 4 == 0) {
-#ifdef DS4_NO_GPU
-                fprintf(stderr, "[fp] phys=%.3f swing=%.0fMiB\n",
-                        (double)fp / DS4_GIB,
-                        (double)(fp_max - fp_min) / (1024.0 * 1024.0));
-#else
-                uint64_t ga = ds4_gpu_current_allocated_bytes();
-                uint64_t gm = ds4_gpu_recommended_max_working_set_bytes();
-                fprintf(stderr,
-                        "[fp] phys=%.3f swing=%.0fMiB | GPU alloc=%.3f / max=%.3f GiB %s\n",
-                        (double)fp / DS4_GIB,
-                        (double)(fp_max - fp_min) / (1024.0 * 1024.0),
-                        (double)ga / DS4_GIB, (double)gm / DS4_GIB,
-                        (gm && ga > gm) ? "<<OVER-MAX (paging)" : "ok");
-#endif
-                fflush(stderr);
-            }
-        }
-        if (g_mem_budget_bytes != 0 && fp > (uint64_t)((double)g_mem_budget_bytes * 0.9)) {
-            fprintf(stderr,
-                    "\n[ds4-watchdog] phys_footprint %.2f GiB crossed 90%% of the "
-                    "%.2f GiB budget -- aborting before page thrash.\n",
-                    (double)fp / DS4_GIB, (double)g_mem_budget_bytes / DS4_GIB);
-            fflush(stderr);
-            _exit(137);
-        }
-        /* Default-on system-pressure guard: abort after ~4s sustained CRITICAL,
-         * well ahead of the ~94s watchdogd-starvation kernel panic. Catches the
-         * offload page-cache blowup that phys_footprint (above) cannot see. Opt
-         * out with DS4_NO_MEM_PRESSURE_GUARD=1. */
-        if (pressure_guard && ds4_system_mem_pressure_level() >= 4 /* critical */) {
-            crit_ms += interval_ms;
-            if (crit_ms >= 4000) {
-                fprintf(stderr,
-                        "\n[ds4-watchdog] system memory pressure CRITICAL for %ums "
-                        "(phys_footprint %.2f GiB) -- aborting to keep the OS watchdog "
-                        "from panicking the machine. Split across hosts or lower --ctx.\n",
-                        crit_ms, (double)fp / DS4_GIB);
-                fflush(stderr);
-                _exit(137);
-            }
-        } else {
-            crit_ms = 0;
-        }
-        usleep(interval_ms * 1000);
-    }
-    return NULL;
-}
-
-static void ds4_mem_watchdog_start(void) {
-    if (g_mem_watch_started) return;
-    ds4_profile_init();
-    const char *bud = getenv("DS4_MEM_BUDGET_MB");
-    if (bud && bud[0]) {
-        long mb = strtol(bud, NULL, 10);
-        if (mb > 0) g_mem_budget_bytes = (uint64_t)mb * 1024ull * 1024ull;
-    }
-    const int pressure_guard = getenv("DS4_NO_MEM_PRESSURE_GUARD") == NULL;
-    /* Start the thread whenever anything needs it. The system-pressure guard is
-     * on by default, so the watchdog now runs for every process unless explicitly
-     * disabled -- this is the default-safe behavior that prevents a kernel panic. */
-    if (!g_prof.enabled && g_mem_budget_bytes == 0 && !pressure_guard) return;
-    g_mem_watch_run = 1;
-    if (pthread_create(&g_mem_watch_thread, NULL, ds4_mem_watchdog_main, NULL) != 0) {
-        g_mem_watch_run = 0;
-        return;
-    }
-    g_mem_watch_started = 1;
-    /* Only the profiler emits an exit line; the pressure-guard-only case stays
-     * silent so normal runs see no new stderr output. */
-    if (g_prof.enabled || g_mem_budget_bytes != 0) atexit(ds4_profile_flush);
-}
-
-/* Exposed to the GPU backend (ds4_metal.m) so memory-hungry caches (e.g. the
- * routed-expert source cache) can size themselves dynamically against the live
- * Mach phys_footprint and the configured budget instead of a fixed MB cap
- * (2026-06-15 policy: use the headroom up to the 12G total, not a fixed slice).
- * Budget falls back to the env so it works even before the watchdog thread
- * has populated g_mem_budget_bytes. */
-uint64_t ds4_runtime_phys_footprint_bytes(void) {
-    return ds4_phys_footprint_bytes();
-}
-
-uint64_t ds4_runtime_mem_budget_bytes(void) {
-    if (g_mem_budget_bytes != 0) return g_mem_budget_bytes;
-    const char *bud = getenv("DS4_MEM_BUDGET_MB");
-    if (bud && bud[0]) {
-        long mb = strtol(bud, NULL, 10);
-        if (mb > 0) return (uint64_t)mb * 1024ull * 1024ull;
-    }
-    return 0;
-}
-
-__attribute__((constructor)) static void ds4_stage0_autostart(void) {
-    ds4_mem_watchdog_start();
-}
-
-/* L1 pre-flight static budget gate. Called once the resident model byte total is
- * known (model map span sums), before any GPU buffer is bound. Aborts a planned
- * OOM at load time -- well ahead of the runtime watchdog -- when the closed-form
- * resident estimate crosses 85% of DS4_MEM_BUDGET_MB. kv_and_scratch_bytes is the
- * caller's estimate of KV + prefill scratch + fixed overhead (0 if unknown; the
- * runtime watchdog still backstops). No budget set => no-op (zero behavior change). */
-static DS4_MAYBE_UNUSED void ds4_l1_budget_gate(uint64_t resident_model_bytes,
-                                                uint64_t kv_and_scratch_bytes) {
-    ds4_profile_init();
-    if (g_mem_budget_bytes == 0) {
-        const char *bud = getenv("DS4_MEM_BUDGET_MB");
-        if (bud && bud[0]) {
-            long mb = strtol(bud, NULL, 10);
-            if (mb > 0) g_mem_budget_bytes = (uint64_t)mb * 1024ull * 1024ull;
-        }
-    }
-    if (g_mem_budget_bytes == 0) return;
-    const uint64_t planned = resident_model_bytes + kv_and_scratch_bytes;
-    const uint64_t limit = (uint64_t)((double)g_mem_budget_bytes * 0.85);
-    if (planned > limit) {
-        fprintf(stderr,
-                "\n[ds4-l1-gate] planned resident %.2f GiB (model %.2f + kv/scratch %.2f) "
-                "exceeds 85%% of the %.2f GiB budget -- refusing to load.\n",
-                (double)planned / DS4_GIB,
-                (double)resident_model_bytes / DS4_GIB,
-                (double)kv_and_scratch_bytes / DS4_GIB,
-                (double)g_mem_budget_bytes / DS4_GIB);
-        fflush(stderr);
-        _exit(137);
-    }
-    fprintf(stderr,
-            "ds4: L1 budget gate: planned resident %.2f GiB within %.2f GiB budget\n",
-            (double)planned / DS4_GIB, (double)g_mem_budget_bytes / DS4_GIB);
-}
-
-static void sleep_sec(double sec) {
-    if (sec <= 0.0 || !isfinite(sec)) return;
-    struct timespec req;
-    req.tv_sec = (time_t)sec;
-    req.tv_nsec = (long)((sec - (double)req.tv_sec) * 1000000000.0);
-    if (req.tv_nsec < 0) req.tv_nsec = 0;
-    if (req.tv_nsec >= 1000000000L) {
-        req.tv_sec++;
-        req.tv_nsec -= 1000000000L;
-    }
-    /* Do not resume after EINTR: Ctrl+C should cut through throttling sleeps. */
-    (void)nanosleep(&req, &req);
-}
-
-static const char *ds4_log_color_code(ds4_log_type type) {
-    switch (type) {
-    case DS4_LOG_PREFILL:
-    case DS4_LOG_TIMING:
-        return "\x1b[36m";
-    case DS4_LOG_GENERATION:
-    case DS4_LOG_OK:
-        return "\x1b[32m";
-    case DS4_LOG_KVCACHE:
-        return "\x1b[33m";
-    case DS4_LOG_TOOL:
-        return "\x1b[90m";
-    case DS4_LOG_WARNING:
-        return "\x1b[38;5;208m";
-    case DS4_LOG_ERROR:
-        return "\x1b[31m";
-    default:
-        return "";
-    }
-}
-
-bool ds4_log_is_tty(FILE *fp) {
-    int fd = fileno(fp);
-    return fd >= 0 && isatty(fd) != 0;
-}
-
-static void ds4_vlog(FILE *fp, ds4_log_type type, const char *fmt, va_list ap) {
-    const bool colorize = type != DS4_LOG_DEFAULT && ds4_log_is_tty(fp);
-    if (colorize) fputs(ds4_log_color_code(type), fp);
-    vfprintf(fp, fmt, ap);
-    if (colorize) fputs("\x1b[0m", fp);
-}
-
-void ds4_log(FILE *fp, ds4_log_type type, const char *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    ds4_vlog(fp, type, fmt, ap);
-    va_end(ap);
-}
-
-static bool write_f32_binary_file(const char *path, const float *data, uint64_t n) {
-    FILE *fp = fopen(path, "wb");
-    if (!fp) {
-        fprintf(stderr, "ds4: failed to open %s for writing: %s\n", path, strerror(errno));
-        return false;
-    }
-    const size_t nw = fwrite(data, sizeof(float), (size_t)n, fp);
-    const bool ok = nw == (size_t)n && fclose(fp) == 0;
-    if (!ok) {
-        fprintf(stderr, "ds4: failed to write %s\n", path);
-        return false;
-    }
-    return true;
-}
-
-static bool read_f32_binary_file(const char *path, float *data, uint64_t n) {
-    struct stat st;
-    if (stat(path, &st) != 0) {
-        fprintf(stderr, "ds4: failed to stat %s: %s\n", path, strerror(errno));
-        return false;
-    }
-    if (st.st_size < 0 || (uint64_t)st.st_size != n * sizeof(float)) {
-        fprintf(stderr,
-                "ds4: %s has size %llu bytes, expected %llu bytes\n",
-                path,
-                (unsigned long long)st.st_size,
-                (unsigned long long)(n * sizeof(float)));
-        return false;
-    }
-
-    FILE *fp = fopen(path, "rb");
-    if (!fp) {
-        fprintf(stderr, "ds4: failed to open %s for reading: %s\n", path, strerror(errno));
-        return false;
-    }
-    const size_t nr = fread(data, sizeof(float), (size_t)n, fp);
-    const bool ok = nr == (size_t)n && fclose(fp) == 0;
-    if (!ok) {
-        fprintf(stderr, "ds4: failed to read %s\n", path);
-        return false;
-    }
-    return true;
-}
-
-static bool cpu_directional_steering_enabled(
-        const float *dirs,
-        float        scale);
-
-static void cpu_directional_steering_project_rows(
-        float       *x,
-        const float *dirs,
-        uint32_t     il,
-        uint32_t     rows,
-        float        scale);
-
-typedef void (*ds4_parallel_fn)(void *ctx, uint64_t row0, uint64_t row1);
-
-#define DS4_MAX_THREADS 32
-
-typedef struct {
-    pthread_t threads[DS4_MAX_THREADS];
-    pthread_mutex_t mutex;
-    pthread_cond_t work_cond;
-    pthread_cond_t done_cond;
-    uint32_t n_threads;
-    uint32_t n_workers;
-    uint32_t generation;
-    uint32_t done;
-    bool initialized;
-    bool shutdown;
-    ds4_parallel_fn fn;
-    void *ctx;
-    uint64_t n_rows;
-} ds4_thread_pool;
-
-static ds4_thread_pool g_pool;
-static __thread int g_parallel_depth;
-static uint32_t g_requested_threads;
-
-static void *ds4_worker_main(void *arg) {
-    const uint32_t tid = (uint32_t)(uintptr_t)arg;
-    uint32_t seen_generation = 0;
-
-    for (;;) {
-        pthread_mutex_lock(&g_pool.mutex);
-        while (seen_generation == g_pool.generation && !g_pool.shutdown) {
-            pthread_cond_wait(&g_pool.work_cond, &g_pool.mutex);
-        }
-        if (g_pool.shutdown) {
-            pthread_mutex_unlock(&g_pool.mutex);
-            return NULL;
-        }
-
-        seen_generation = g_pool.generation;
-        ds4_parallel_fn fn = g_pool.fn;
-        void *ctx = g_pool.ctx;
-        const uint64_t n_rows = g_pool.n_rows;
-        const uint32_t n_threads = g_pool.n_threads;
-        pthread_mutex_unlock(&g_pool.mutex);
-
-        const uint64_t rows_per_thread = (n_rows + n_threads - 1) / n_threads;
-        const uint64_t row0 = (uint64_t)tid * rows_per_thread;
-        uint64_t row1 = row0 + rows_per_thread;
-        if (row1 > n_rows) row1 = n_rows;
-        if (row0 < row1) {
-            g_parallel_depth++;
-            fn(ctx, row0, row1);
-            g_parallel_depth--;
-        }
-
-        pthread_mutex_lock(&g_pool.mutex);
-        g_pool.done++;
-        if (g_pool.done == g_pool.n_workers) {
-            pthread_cond_signal(&g_pool.done_cond);
-        }
-        pthread_mutex_unlock(&g_pool.mutex);
-    }
-}
-
-/* Create the persistent CPU worker pool.  Decode reuses these threads instead
- * of creating pthreads in the token loop. */
-static void ds4_threads_init(void) {
-    if (g_pool.initialized) return;
-
-    pthread_once(&iq2xxs_signed_grid_once, iq2xxs_signed_grid_init);
-
-    uint32_t n_threads = 12;
-    const long online_cpus = sysconf(_SC_NPROCESSORS_ONLN);
-    if (online_cpus > 0) {
-        n_threads = online_cpus < 12 ? (uint32_t)online_cpus : 12;
-    }
-
-    const char *env = getenv("DS4_THREADS");
-    if (env && env[0]) {
-        long v = strtol(env, NULL, 10);
-        if (v > 0) n_threads = (uint32_t)v;
-    }
-    if (g_requested_threads > 0) n_threads = g_requested_threads;
-    if (n_threads > DS4_MAX_THREADS) n_threads = DS4_MAX_THREADS;
-    if (n_threads == 0) n_threads = 1;
-
-    pthread_mutex_init(&g_pool.mutex, NULL);
-    pthread_cond_init(&g_pool.work_cond, NULL);
-    pthread_cond_init(&g_pool.done_cond, NULL);
-    g_pool.n_threads = n_threads;
-    g_pool.n_workers = n_threads > 0 ? n_threads - 1 : 0;
-    g_pool.generation = 0;
-    g_pool.done = 0;
-    g_pool.shutdown = false;
-    g_pool.initialized = true;
-
-    for (uint32_t i = 1; i < n_threads; i++) {
-        if (pthread_create(&g_pool.threads[i], NULL, ds4_worker_main, (void *)(uintptr_t)i) != 0) {
-            ds4_die("failed to create worker thread");
-        }
-    }
-}
-
-static void ds4_threads_shutdown(void) {
-    if (!g_pool.initialized) return;
-
-    pthread_mutex_lock(&g_pool.mutex);
-    g_pool.shutdown = true;
-    g_pool.generation++;
-    pthread_cond_broadcast(&g_pool.work_cond);
-    pthread_mutex_unlock(&g_pool.mutex);
-
-    for (uint32_t i = 1; i < g_pool.n_threads; i++) {
-        pthread_join(g_pool.threads[i], NULL);
-    }
-
-    pthread_cond_destroy(&g_pool.done_cond);
-    pthread_cond_destroy(&g_pool.work_cond);
-    pthread_mutex_destroy(&g_pool.mutex);
-    memset(&g_pool, 0, sizeof(g_pool));
-}
-
-/* Run a row-parallel CPU kernel, falling back to serial execution for small
- * jobs or nested calls where spawning more work would only add latency. */
-static void ds4_parallel_for_min_rows(uint64_t n_rows, ds4_parallel_fn fn, void *ctx, uint64_t min_parallel_rows) {
-    ds4_threads_init();
-
-    if (g_parallel_depth > 0 || g_pool.n_threads <= 1 || n_rows < min_parallel_rows) {
-        fn(ctx, 0, n_rows);
-        return;
-    }
-
-    pthread_mutex_lock(&g_pool.mutex);
-    g_pool.fn = fn;
-    g_pool.ctx = ctx;
-    g_pool.n_rows = n_rows;
-    g_pool.done = 0;
-    g_pool.generation++;
-    pthread_cond_broadcast(&g_pool.work_cond);
-
-    const uint64_t rows_per_thread = (n_rows + g_pool.n_threads - 1) / g_pool.n_threads;
-    uint64_t main_row1 = rows_per_thread;
-    if (main_row1 > n_rows) main_row1 = n_rows;
-    pthread_mutex_unlock(&g_pool.mutex);
-
-    if (main_row1 > 0) {
-        g_parallel_depth++;
-        fn(ctx, 0, main_row1);
-        g_parallel_depth--;
-    }
-
-    pthread_mutex_lock(&g_pool.mutex);
-    while (g_pool.done < g_pool.n_workers) {
-        pthread_cond_wait(&g_pool.done_cond, &g_pool.mutex);
-    }
-    pthread_mutex_unlock(&g_pool.mutex);
-}
-
-static void ds4_parallel_for(uint64_t n_rows, ds4_parallel_fn fn, void *ctx) {
-    ds4_parallel_for_min_rows(n_rows, fn, ctx, 512);
-}
-
-static void cursor_error(ds4_cursor *c, const char *msg) {
-    if (c->error[0] == '\0') {
-        snprintf(c->error, sizeof(c->error), "%s at byte %" PRIu64, msg, c->pos);
-    }
-}
-
-static bool cursor_has(ds4_cursor *c, uint64_t n) {
-    if (n > c->size || c->pos > c->size - n) {
-        cursor_error(c, "truncated GGUF file");
-        return false;
-    }
-    return true;
-}
-
-static bool cursor_read(ds4_cursor *c, void *dst, uint64_t n) {
-    if (!cursor_has(c, n)) return false;
-    memcpy(dst, c->base + c->pos, (size_t)n);
-    c->pos += n;
-    return true;
-}
-
-static bool cursor_skip(ds4_cursor *c, uint64_t n) {
-    if (!cursor_has(c, n)) return false;
-    c->pos += n;
-    return true;
-}
-
-static bool cursor_u32(ds4_cursor *c, uint32_t *v) {
-    return cursor_read(c, v, sizeof(*v));
-}
-
-static bool cursor_u64(ds4_cursor *c, uint64_t *v) {
-    return cursor_read(c, v, sizeof(*v));
-}
-
-static bool cursor_string(ds4_cursor *c, ds4_str *s) {
-    uint64_t len;
-    if (!cursor_u64(c, &len)) return false;
-    if (!cursor_has(c, len)) return false;
-    s->ptr = (const char *)(c->base + c->pos);
-    s->len = len;
-    c->pos += len;
-    return true;
-}
-
-static uint64_t align_up(uint64_t value, uint64_t alignment) {
-    uint64_t rem = value % alignment;
-    return rem == 0 ? value : value + alignment - rem;
-}
-
-/* =========================================================================
- * GGUF Parsing and Model Mapping.
- * =========================================================================
- *
- * The loader maps the model once, records metadata/tensor descriptors, and
- * leaves tensor bytes in place.  Inference code accesses weights by adding
- * tensor offsets to the mapping instead of copying the GGUF into private
- * structures.
- */
-
-enum {
-    GGUF_VALUE_UINT8   = 0,
-    GGUF_VALUE_INT8    = 1,
-    GGUF_VALUE_UINT16  = 2,
-    GGUF_VALUE_INT16   = 3,
-    GGUF_VALUE_UINT32  = 4,
-    GGUF_VALUE_INT32   = 5,
-    GGUF_VALUE_FLOAT32 = 6,
-    GGUF_VALUE_BOOL    = 7,
-    GGUF_VALUE_STRING  = 8,
-    GGUF_VALUE_ARRAY   = 9,
-    GGUF_VALUE_UINT64  = 10,
-    GGUF_VALUE_INT64   = 11,
-    GGUF_VALUE_FLOAT64 = 12,
-};
-
-typedef struct {
-    const char *name;
-    uint32_t block_elems;
-    uint32_t block_bytes;
-} gguf_type_info;
-
-static const gguf_type_info gguf_types[] = {
-    [0]  = {"f32",      1,   4},
-    [1]  = {"f16",      1,   2},
-    [2]  = {"q4_0",    32,  18},
-    [3]  = {"q4_1",    32,  20},
-    [6]  = {"q5_0",    32,  22},
-    [7]  = {"q5_1",    32,  24},
-    [8]  = {"q8_0",    32,  34},
-    [9]  = {"q8_1",    32,  40},
-    [10] = {"q2_k",   256,  84},
-    [11] = {"q3_k",   256, 110},
-    [12] = {"q4_k",   256, 144},
-    [13] = {"q5_k",   256, 176},
-    [14] = {"q6_k",   256, 210},
-    [15] = {"q8_k",   256, 292},
-    [16] = {"iq2_xxs",256,  66},
-    [17] = {"iq2_xs", 256,  74},
-    [18] = {"iq3_xxs",256,  98},
-    [19] = {"iq1_s",  256, 110},
-    [20] = {"iq4_nl", 256,  50},
-    [21] = {"iq3_s",  256, 110},
-    [22] = {"iq2_s",  256,  82},
-    [23] = {"iq4_xs", 256, 136},
-    [24] = {"i8",       1,   1},
-    [25] = {"i16",      1,   2},
-    [26] = {"i32",      1,   4},
-    [27] = {"i64",      1,   8},
-    [28] = {"f64",      1,   8},
-    [29] = {"iq1_m",  256,  56},
-    [30] = {"bf16",     1,   2},
-    /* DS4 strict-1-bit routed expert (block_go1b: fp16 row scale + 256 sign
-     * bits = 34 B / 256 elems).  GGUF ggml type number 40 (free: the standard
-     * ggml types stop at 30 here, and 40 collides with no DS4_TENSOR_*). */
-    [40] = {"go1b",   256,  34},
-    /* go2b: merged base+residual pair (two f16 scales + two sign planes). */
-    [41] = {"go2b",   256,  68},
-    /* v2.2 VQ 层 blob(不透明字节: DQVL 表+DQVQ 载荷; shape=[nbytes]) */
-    [42] = {"vqblob",  1,   1},
-};
-
-
-static uint64_t scalar_value_size(uint32_t type) {
-    switch (type) {
-    case GGUF_VALUE_UINT8:
-    case GGUF_VALUE_INT8:
-    case GGUF_VALUE_BOOL:
-        return 1;
-    case GGUF_VALUE_UINT16:
-    case GGUF_VALUE_INT16:
-        return 2;
-    case GGUF_VALUE_UINT32:
-    case GGUF_VALUE_INT32:
-    case GGUF_VALUE_FLOAT32:
-        return 4;
-    case GGUF_VALUE_UINT64:
-    case GGUF_VALUE_INT64:
-    case GGUF_VALUE_FLOAT64:
-        return 8;
-    default:
-        return 0;
-    }
-}
-
-static bool skip_value(ds4_cursor *c, uint32_t type, int depth) {
-    if (depth > 8) {
-        cursor_error(c, "metadata array nesting is too deep");
-        return false;
-    }
-
-    uint64_t scalar = scalar_value_size(type);
-    if (scalar != 0) return cursor_skip(c, scalar);
-
-    if (type == GGUF_VALUE_STRING) {
-        ds4_str ignored;
-        return cursor_string(c, &ignored);
-    }
-
-    if (type == GGUF_VALUE_ARRAY) {
-        uint32_t item_type;
-        uint64_t len;
-
-        if (!cursor_u32(c, &item_type)) return false;
-        if (!cursor_u64(c, &len)) return false;
-
-        uint64_t item_size = scalar_value_size(item_type);
-        if (item_size != 0) {
-            if (len > UINT64_MAX / item_size) {
-                cursor_error(c, "metadata array is too large");
-                return false;
-            }
-            return cursor_skip(c, len * item_size);
-        }
-
-        for (uint64_t i = 0; i < len; i++) {
-            if (!skip_value(c, item_type, depth + 1)) return false;
-        }
-        return true;
-    }
-
-    cursor_error(c, "unknown GGUF metadata type");
-    return false;
-}
-
-static const gguf_type_info *tensor_type(uint32_t type) {
-    uint32_t n = sizeof(gguf_types) / sizeof(gguf_types[0]);
-    if (type >= n || gguf_types[type].name == NULL) return NULL;
-    return &gguf_types[type];
-}
-
-static const char *tensor_type_name(uint32_t type) {
-    const gguf_type_info *info = tensor_type(type);
-    return info ? info->name : "unknown";
-}
-
-static bool tensor_nbytes(uint32_t type, uint64_t elements, uint64_t *bytes) {
-    const gguf_type_info *info = tensor_type(type);
-    if (!info || info->block_elems == 0) return false;
-    uint64_t blocks = (elements + info->block_elems - 1) / info->block_elems;
-    if (blocks > UINT64_MAX / info->block_bytes) return false;
-    *bytes = blocks * info->block_bytes;
-    return true;
-}
-
-static ds4_cursor cursor_at(const ds4_model *m, uint64_t pos) {
-    ds4_cursor c = {
-        .base = m->map,
-        .size = m->size,
-        .pos = pos,
-        .error = {0},
-    };
-    return c;
-}
-
-static ds4_kv *model_find_kv(const ds4_model *m, const char *key) {
-    for (uint64_t i = 0; i < m->n_kv; i++) {
-        if (ds4_streq(m->kv[i].key, key)) return &m->kv[i];
-    }
-    return NULL;
-}
-
-static bool model_get_string(const ds4_model *m, const char *key, ds4_str *out) {
-    ds4_kv *kv = model_find_kv(m, key);
-    if (!kv || kv->type != GGUF_VALUE_STRING) return false;
-    ds4_cursor c = cursor_at(m, kv->value_pos);
-    return cursor_string(&c, out);
-}
-
-static bool model_get_u32(const ds4_model *m, const char *key, uint32_t *out) {
-    ds4_kv *kv = model_find_kv(m, key);
-    if (!kv || kv->type != GGUF_VALUE_UINT32) return false;
-    ds4_cursor c = cursor_at(m, kv->value_pos);
-    return cursor_u32(&c, out);
-}
-
-static bool model_get_u64(const ds4_model *m, const char *key, uint64_t *out) {
-    ds4_kv *kv = model_find_kv(m, key);
-    if (!kv || kv->type != GGUF_VALUE_UINT64) return false;
-    ds4_cursor c = cursor_at(m, kv->value_pos);
-    return cursor_u64(&c, out);
-}
-
-static bool model_get_u64_compat(const ds4_model *m, const char *key, uint64_t *out) {
-    ds4_kv *kv = model_find_kv(m, key);
-    if (!kv) return false;
-    ds4_cursor c = cursor_at(m, kv->value_pos);
-    if (kv->type == GGUF_VALUE_UINT64) {
-        return cursor_u64(&c, out);
-    }
-    if (kv->type == GGUF_VALUE_UINT32) {
-        uint32_t v = 0;
-        if (!cursor_u32(&c, &v)) return false;
-        *out = v;
-        return true;
-    }
-    return false;
-}
-
-static bool model_get_f32_compat(const ds4_model *m, const char *key, float *out) {
-    ds4_kv *kv = model_find_kv(m, key);
-    if (!kv) return false;
-    ds4_cursor c = cursor_at(m, kv->value_pos);
-    if (kv->type == GGUF_VALUE_FLOAT32) {
-        return cursor_read(&c, out, sizeof(*out));
-    }
-    if (kv->type == GGUF_VALUE_FLOAT64) {
-        double v = 0.0;
-        if (!cursor_read(&c, &v, sizeof(v))) return false;
-        *out = (float)v;
-        return true;
-    }
-    if (kv->type == GGUF_VALUE_UINT32) {
-        uint32_t v = 0;
-        if (!cursor_u32(&c, &v)) return false;
-        *out = (float)v;
-        return true;
-    }
-    if (kv->type == GGUF_VALUE_INT32) {
-        int32_t v = 0;
-        if (!cursor_read(&c, &v, sizeof(v))) return false;
-        *out = (float)v;
-        return true;
-    }
-    return false;
-}
-
-bool model_get_bool(const ds4_model *m, const char *key, bool *out) {
-    ds4_kv *kv = model_find_kv(m, key);
-    if (!kv || kv->type != GGUF_VALUE_BOOL) return false;
-    ds4_cursor c = cursor_at(m, kv->value_pos);
-    uint8_t v = 0;
-    if (!cursor_read(&c, &v, sizeof(v))) return false;
-    *out = v != 0;
-    return true;
-}
-
-typedef struct {
-    uint32_t type;
-    uint64_t len;
-    uint64_t data_pos;
-} ds4_array_ref;
-
-static bool model_get_array(const ds4_model *m, const char *key, ds4_array_ref *out) {
-    ds4_kv *kv = model_find_kv(m, key);
-    if (!kv || kv->type != GGUF_VALUE_ARRAY) return false;
-
-    ds4_cursor c = cursor_at(m, kv->value_pos);
-    if (!cursor_u32(&c, &out->type)) return false;
-    if (!cursor_u64(&c, &out->len)) return false;
-    out->data_pos = c.pos;
-    return true;
-}
-
-/* Kept routed-expert count for layer il. DS4_N_EXPERT for a full model, or the
- * shrunken count when a keep-map is present. Safe for il past the keep-map. */
-static uint32_t model_expert_kept_count(const ds4_model *m, uint32_t il) {
-    if (!m || !m->expert_kept_count || il >= m->expert_layer_count) {
-        return DS4_N_EXPERT;
-    }
-    return m->expert_kept_count[il];
-}
-
-/* Parse the optional ds4.expert_keep_map.* metadata written by gguf-tools/
- * shrink_gguf.py. When present, the routed-expert tensors only carry the kept
- * rows; this builds the original-id -> compact-slot table so routing still works
- * with the full 256-wide router logits. No-op for a full model. */
-static void load_expert_keep_map(ds4_model *m) {
-    ds4_array_ref counts_arr;
-    ds4_array_ref ids_arr;
-    const bool has_counts = model_get_array(m, "ds4.expert_keep_map.kept_counts", &counts_arr);
-    const bool has_ids    = model_get_array(m, "ds4.expert_keep_map.original_ids", &ids_arr);
-    if (!has_counts && !has_ids) return;
-    if (has_counts != has_ids) {
-        ds4_die("ds4.expert_keep_map: kept_counts and original_ids must appear together");
-    }
-    if (counts_arr.type != GGUF_VALUE_INT32 && counts_arr.type != GGUF_VALUE_UINT32) {
-        ds4_die("ds4.expert_keep_map.kept_counts must be an int32 array");
-    }
-    if (ids_arr.type != GGUF_VALUE_INT32 && ids_arr.type != GGUF_VALUE_UINT32) {
-        ds4_die("ds4.expert_keep_map.original_ids must be an int32 array");
-    }
-    if (counts_arr.len == 0 || counts_arr.len > 1024) {
-        ds4_die("ds4.expert_keep_map.kept_counts has an unreasonable length");
-    }
-
-    m->expert_layer_count = (uint32_t)counts_arr.len;
-    m->expert_kept_count = calloc(m->expert_layer_count, sizeof(m->expert_kept_count[0]));
-    m->expert_orig_to_compact = calloc((size_t)m->expert_layer_count * DS4_N_EXPERT,
-                                       sizeof(m->expert_orig_to_compact[0]));
-    if (!m->expert_kept_count || !m->expert_orig_to_compact) {
-        ds4_die("out of memory while allocating expert keep-map");
-    }
-    for (size_t i = 0; i < (size_t)m->expert_layer_count * DS4_N_EXPERT; i++) {
-        m->expert_orig_to_compact[i] = -1;          /* -1 == dropped */
-    }
-
-    uint64_t expected_ids_len = 0;
-    ds4_cursor cc = cursor_at(m, counts_arr.data_pos);
-    for (uint32_t il = 0; il < m->expert_layer_count; il++) {
-        int32_t v = 0;
-        if (!cursor_read(&cc, &v, sizeof(v))) ds4_die(cc.error);
-        if (v < 1 || v > (int32_t)DS4_N_EXPERT) {
-            ds4_die("ds4.expert_keep_map.kept_counts has an out-of-range value");
-        }
-        m->expert_kept_count[il] = (uint16_t)v;
-        expected_ids_len += (uint64_t)v;
-    }
-    if (ids_arr.len != expected_ids_len) {
-        ds4_die("ds4.expert_keep_map.original_ids length does not match sum(kept_counts)");
-    }
-
-    ds4_cursor ic = cursor_at(m, ids_arr.data_pos);
-    for (uint32_t il = 0; il < m->expert_layer_count; il++) {
-        const uint16_t k = m->expert_kept_count[il];
-        int16_t *row = m->expert_orig_to_compact + (size_t)il * DS4_N_EXPERT;
-        for (uint16_t slot = 0; slot < k; slot++) {
-            int32_t orig = 0;
-            if (!cursor_read(&ic, &orig, sizeof(orig))) ds4_die(ic.error);
-            if (orig < 0 || orig >= (int32_t)DS4_N_EXPERT) {
-                ds4_die("ds4.expert_keep_map.original_ids contains an out-of-range expert id");
-            }
-            if (row[orig] != -1) {
-                ds4_die("ds4.expert_keep_map.original_ids has a duplicate expert id in one layer");
-            }
-            row[orig] = (int16_t)slot;
-        }
-    }
-    m->expert_shrunken = true;
-    uint32_t min_kept = DS4_N_EXPERT;
-    for (uint32_t il = 0; il < m->expert_layer_count; il++) {
-        if (m->expert_kept_count[il] < min_kept) min_kept = m->expert_kept_count[il];
-    }
-    fprintf(stderr,
-            "ds4: reduced-expert model: keep-map over %u layers (min kept %u of %u)\n",
-            m->expert_layer_count, min_kept, (uint32_t)DS4_N_EXPERT);
-}
-
-static void residual_free(struct ds4_residual *r);   /* defined after corr_load() */
-
-void model_close(ds4_model *m) {
-    if (!m) return;
-    if (m->corr) { corr_free(m->corr); m->corr = NULL; }
-    if (m->residual) { residual_free(m->residual); m->residual = NULL; }
-    if (m->zchain) { ds4_zchain_free(m->zchain); m->zchain = NULL; }
-    free(m->kv);
-    free(m->tensors);
-    free(m->expert_kept_count);
-    free(m->expert_orig_to_compact);
-    if (m->map) munmap((void *)m->map, (size_t)m->size);
-    if (m->fd >= 0) close(m->fd);
-    memset(m, 0, sizeof(*m));
-    m->fd = -1;
-}
-
-static void model_prefetch_cpu_mapping(const ds4_model *m) {
-    if (!m || !m->map || m->size == 0) return;
-
-    /*
-     * CPU generation touches expert weights according to router decisions, so a
-     * long decode can fault in model pages that the prompt never touched. On
-     * current Darwin kernels we have seen those late file-backed faults trigger
-     * an OS-level VM panic in map-count accounting. This hint does not copy or
-     * pin the GGUF; it just asks the kernel to start bringing the read-only
-     * mapping into the page cache before token generation reaches it.
-     */
-#if defined(POSIX_MADV_WILLNEED)
-    const int rc = posix_madvise((void *)m->map, (size_t)m->size, POSIX_MADV_WILLNEED);
-    if (rc != 0) {
-        ds4_log(stderr,
-                DS4_LOG_WARNING,
-                "ds4: warning: POSIX_MADV_WILLNEED failed for CPU model mapping: %s\n",
-                strerror(rc));
-    }
-#else
-    (void)m;
-#endif
-}
-
-/* Read the GGUF metadata table.  Values stay in the mmap; we store offsets so
- * later validation can decode only the keys it needs. */
-static void parse_metadata(ds4_model *m, ds4_cursor *c) {
-    m->kv = calloc((size_t)m->n_kv, sizeof(m->kv[0]));
-    if (!m->kv) ds4_die("out of memory while allocating metadata table");
-
-    m->alignment = 32;
-
-    for (uint64_t i = 0; i < m->n_kv; i++) {
-        ds4_kv *kv = &m->kv[i];
-
-        if (!cursor_string(c, &kv->key)) ds4_die(c->error);
-        if (!cursor_u32(c, &kv->type)) ds4_die(c->error);
-
-        kv->value_pos = c->pos;
-
-        if (ds4_streq(kv->key, "general.alignment") &&
-            kv->type == GGUF_VALUE_UINT32)
-        {
-            ds4_cursor tmp = cursor_at(m, kv->value_pos);
-            uint32_t alignment;
-            if (cursor_u32(&tmp, &alignment) && alignment != 0) {
-                m->alignment = alignment;
-            }
-        }
-
-        if (!skip_value(c, kv->type, 0)) ds4_die(c->error);
-    }
-}
-
-/* Read the tensor directory and convert relative GGUF offsets to absolute
- * mmap offsets.  Tensor bytes are still never copied here. */
-static void parse_tensors(ds4_model *m, ds4_cursor *c) {
-    m->tensors = calloc((size_t)m->n_tensors, sizeof(m->tensors[0]));
-    if (!m->tensors) ds4_die("out of memory while allocating tensor table");
-
-    for (uint64_t i = 0; i < m->n_tensors; i++) {
-        ds4_tensor *t = &m->tensors[i];
-
-        if (!cursor_string(c, &t->name)) ds4_die(c->error);
-        if (!cursor_u32(c, &t->ndim)) ds4_die(c->error);
-        if (t->ndim == 0 || t->ndim > DS4_MAX_DIMS) {
-            ds4_die("tensor has an unsupported number of dimensions");
-        }
-
-        t->elements = 1;
-        for (uint32_t d = 0; d < t->ndim; d++) {
-            if (!cursor_u64(c, &t->dim[d])) ds4_die(c->error);
-            if (t->dim[d] != 0 && t->elements > UINT64_MAX / t->dim[d]) {
-                ds4_die("tensor element count overflow");
-            }
-            t->elements *= t->dim[d];
-        }
-
-        if (!cursor_u32(c, &t->type)) ds4_die(c->error);
-        if (!cursor_u64(c, &t->rel_offset)) ds4_die(c->error);
-
-        if (!tensor_nbytes(t->type, t->elements, &t->bytes)) {
-            ds4_log(stderr,
-                DS4_LOG_WARNING,
-                "ds4: warning: tensor %.*s has unsupported GGUF type %u\n",
-                (int)t->name.len, t->name.ptr, t->type);
-        }
-    }
-
-    m->tensor_data_pos = align_up(c->pos, m->alignment);
-
-    for (uint64_t i = 0; i < m->n_tensors; i++) {
-        ds4_tensor *t = &m->tensors[i];
-        if (t->rel_offset > UINT64_MAX - m->tensor_data_pos) {
-            ds4_die("tensor offset overflow");
-        }
-        t->abs_offset = m->tensor_data_pos + t->rel_offset;
-        if (t->bytes != 0 &&
-            (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset))
-        {
-            ds4_die("tensor points outside GGUF file");
-        }
-        if (t->bytes > m->max_tensor_bytes) {
-            m->max_tensor_bytes = t->bytes;
-        }
-    }
-}
-
-/* Only the engine BASE model may arm process-wide env defaults from its
- * tensor types (the go1b/go2b numeric-safety block inside model_open below).
- * Support-model opens run in the base model's process -- the MTP draft
- * sidecar (a go-family draft would arm DS4_REPEAT_FREQ etc. onto a non-go
- * BASE sampler), the residual/corr sidecars, and tokenizer-only opens. This
- * is the same cross-model pollution as the GPU keep-LUT, which is restored at
- * the MTP call site; the env leak was missed there. model_open's signature is
- * frozen (ds4_internal.h; external caller ds4_corr.c), so the base loader
- * opts in through this file-scope flag instead of a new parameter -- default
- * false keeps every sidecar/tokenizer open arming-free. */
-static bool g_model_open_arm_env_defaults = false;
-
-/* Open and map the GGUF once.  Metal needs a shared mapping for no-copy
- * MTLBuffers; CPU uses a private read-only mapping to avoid Darwin VM stress.
- * Tokenizer-only callers pass prefetch_cpu=false so inspecting tokens never
- * walks the huge tensor payload. */
-void model_open(ds4_model *m, const char *path, bool metal_mapping,
-                       bool prefetch_cpu) {
-    memset(m, 0, sizeof(*m));
-    m->fd = -1;
-
-    int fd = open(path, O_RDONLY);
-    if (fd == -1) ds4_die_errno("cannot open model", path);
-
-    struct stat st;
-    if (fstat(fd, &st) == -1) ds4_die_errno("cannot stat model", path);
-    if (st.st_size < 32) ds4_die("model file is too small to be GGUF");
-
-    /*
-     * Metal wraps slices of this mapping as no-copy MTLBuffers, so the Metal
-     * path keeps the file-backed shared mapping. The CPU path only reads the
-     * weights through normal pointers and should not inherit Metal's VM policy:
-     * use a private read-only mapping there.
-     *
-     * This is deliberately defensive against an OS-level Darwin VM bug observed
-     * while the CPU backend streams the very large GGUF through a shared mmap:
-     * the kernel can panic in VM map-count accounting instead of returning a
-     * normal user-space failure. Keeping CPU inference off the shared mapping
-     * avoids that VM accounting path while preserving normal file-backed reads.
-     */
-    const int mmap_flags = metal_mapping ? MAP_SHARED : MAP_PRIVATE;
-    void *map = MAP_FAILED;
-#if defined(__linux__) && defined(MADV_HUGEPAGE)
-    /* 先丢掉本文件已有的 page cache 页, 再带 MADV_HUGEPAGE 映射 —— 否则内核会拿
-     * cache 里现成的 4KiB 页直接用, 大页永远只覆盖新读入的那部分(实测卡在 12-16%)。
-     * POSIX_FADV_DONTNEED 只作用于这一个 fd 对应的文件, 是进程级操作, 不需要特权。 */
-    if (getenv("DS4_NO_HUGEPAGE") == NULL)
-        (void)posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
-#endif
-#if defined(__linux__) && defined(MADV_HUGEPAGE)
-    /* ★2MiB 对齐映射★: 文件页 THP 要求虚拟地址按大页对齐(文件偏移 0 本就满足),
-     * 否则整段退回 4KiB。内核给的地址通常不对齐, 实测大页覆盖率只有 8.5%。
-     * 做法: 先占一段带余量的匿名区探出对齐地址, 再 MAP_FIXED 把文件映上去 ——
-     * MAP_FIXED 直接覆盖占位区, 中间没有别的线程能插进来抢地址。 */
-    if (getenv("DS4_NO_HUGEPAGE") == NULL) {
-        const size_t HP = 2u * 1024u * 1024u;
-        const size_t want = (size_t)st.st_size;
-        void *probe = mmap(NULL, want + HP, PROT_NONE,
-                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-        if (probe != MAP_FAILED) {
-            uintptr_t base = (uintptr_t)probe;
-            uintptr_t aligned = (base + HP - 1u) & ~(uintptr_t)(HP - 1u);
-            void *fixed = mmap((void *)aligned, want, PROT_READ,
-                               mmap_flags | MAP_FIXED, fd, 0);
-            if (fixed != MAP_FAILED) {
-                if (aligned > base) (void)munmap(probe, (size_t)(aligned - base));
-                const uintptr_t tail = aligned + want;
-                const uintptr_t probe_end = base + want + HP;
-                if (probe_end > tail) (void)munmap((void *)tail, (size_t)(probe_end - tail));
-                map = fixed;
-            } else {
-                (void)munmap(probe, want + HP);
-            }
-        }
-    }
-#endif
-    if (map == MAP_FAILED)
-        map = mmap(NULL, (size_t)st.st_size, PROT_READ, mmap_flags, fd, 0);
-    if (map == MAP_FAILED) ds4_die_errno("cannot mmap model", path);
-#if defined(__linux__) && defined(MADV_HUGEPAGE)
-    /* ★大页★: GB10 这类统一内存机器上 GPU 直接走 host 页表访问权重
-     * (PageableMemoryAccess=1 且 UsesHostPageTables=1)。90 GiB 模型按 4KiB 页就是
-     * 2200 万个页表项, TLB 完全装不下 —— 每次专家读都在做地址翻译, 表现为 GPU 利用率
-     * 只有 6% 而 CPU/GPU/磁盘全都不忙。本机 THP 是 madvise 模式(不显式要就永远 4KiB),
-     * 故此处显式请求; 内核不支持文件页 THP 时该调用无害地失败。 */
-    if (getenv("DS4_NO_HUGEPAGE") == NULL) {
-        (void)madvise(map, (size_t)st.st_size, MADV_HUGEPAGE);
-        /* MADV_HUGEPAGE 只影响"之后新读入"的页; 已在 page cache 里的 4KiB 页不会自动
-         * 合并(khugepaged 每 10s 才扫 16MiB, 对 90GiB 等于没有)。MADV_COLLAPSE(6.1+)
-         * 主动就地合并, 是把覆盖率从个位数推上去的唯一手段。它是同步的, 分段做并允许
-         * 单段失败(碎片导致某段凑不出连续 2MiB 很正常, 跳过即可)。 */
-#ifndef MADV_COLLAPSE
-#define MADV_COLLAPSE 25
-#endif
-        if (getenv("DS4_NO_HUGEPAGE_COLLAPSE") == NULL) {
-            const size_t CH = 512u * 1024u * 1024u;   /* 每次 512MiB, 避免一次长阻塞 */
-            const double ct0 = now_sec();
-            size_t done = 0, ok_bytes = 0;
-            while (done < (size_t)st.st_size) {
-                size_t n = (size_t)st.st_size - done;
-                if (n > CH) n = CH;
-                if (madvise((char *)map + done, n, MADV_COLLAPSE) == 0) ok_bytes += n;
-                done += n;
-            }
-            if (getenv("DS4_HUGEPAGE_VERBOSE"))
-                fprintf(stderr, "ds4: MADV_COLLAPSE %.1f/%.1f GiB in %.2fs\n",
-                        ok_bytes / 1073741824.0, st.st_size / 1073741824.0, now_sec() - ct0);
-        }
-    }
-#endif
-
-    m->fd = fd;
-    m->map = map;
-    m->size = (uint64_t)st.st_size;
-
-    ds4_cursor c = cursor_at(m, 0);
-    uint32_t magic;
-    if (!cursor_u32(&c, &magic)) ds4_die(c.error);
-    if (magic != DS4_GGUF_MAGIC) ds4_die("model is not a GGUF file");
-    if (!cursor_u32(&c, &m->version)) ds4_die(c.error);
-    if (!cursor_u64(&c, &m->n_tensors)) ds4_die(c.error);
-    if (!cursor_u64(&c, &m->n_kv)) ds4_die(c.error);
-
-    if (m->version != 3) ds4_die("only GGUF v3 is supported");
-
-    parse_metadata(m, &c);
-    parse_tensors(m, &c);
-    /* ★模型嗅探自动武装已删除(2026-08-05 用户铁律)★: "带环境变量控制模型本身的代码
-     * 不应该存在, 定型硬编码优化在模型变化的时候肯定是 bug"。旧块按 go1b/go2b 张量类型
-     * setenv(MATH_SAFE/KV_RAW_F32/ROPE_EXP2_LOG2, GO2B 另加 REPEAT_FREQ=1) — 那是
-     * 2026-07 超低比特 mono 时代的定型配方, 对高保真新模型(r64 top1 71.4 vs FP 71.7)
-     * 是错配毒药(实测: REPEAT_FREQ=1 令生成空)。行为只由显式 env/配置决定; 需要数值
-     * 安全的 launcher 自己显式设, 引擎不替模型做主。 */
-    load_expert_keep_map(m);
-#ifndef DS4_NO_GPU
-    /* Upload the reduced-expert routing LUT to the GPU so routed-MoE matvecs can
-     * translate full-256 router ids to compact expert-tensor slots. No-op for a
-     * full model (keep-map absent). GPU-only: the keep-map table itself
-     * (expert_orig_to_compact, built in load_expert_keep_map) is the source of
-     * truth; the CPU reference path is not wired for shrunken models. */
-    if (m->expert_shrunken && m->expert_orig_to_compact) {
-        if (!ds4_gpu_set_expert_keep_lut(m->expert_orig_to_compact, m->expert_layer_count)) {
-            ds4_die("failed to upload reduced-expert routing LUT to the GPU");
-        }
-    }
-#endif
-
-    if (!metal_mapping && prefetch_cpu) model_prefetch_cpu_mapping(m);
-}
-
-static void print_size(uint64_t bytes) {
-    const double gib = 1024.0 * 1024.0 * 1024.0;
-    printf("%.2f GiB", (double)bytes / gib);
-}
-
-static void model_summary(const ds4_model *m) {
-    ds4_str name = {0};
-    ds4_str arch = {0};
-    uint32_t layers = 0;
-    uint64_t ctx_train = 0;
-    uint32_t n_head = 0;
-    uint32_t n_head_kv = 0;
-    uint32_t head_dim = 0;
-    uint32_t n_swa = 0;
-    uint32_t indexer_heads = 0;
-    uint32_t indexer_head_dim = 0;
-    uint32_t indexer_top_k = 0;
-    uint32_t n_expert = 0;
-    uint32_t n_expert_used = 0;
-    uint32_t n_expert_groups = 0;
-    uint32_t n_group_used = 0;
-    uint64_t tensor_bytes = 0;
-    uint64_t params = 0;
-
-    model_get_string(m, "general.name", &name);
-    model_get_string(m, "general.architecture", &arch);
-    model_get_u32(m, "deepseek4.block_count", &layers);
-    model_get_u64(m, "deepseek4.context_length", &ctx_train);
-    model_get_u32(m, "deepseek4.attention.head_count", &n_head);
-    model_get_u32(m, "deepseek4.attention.head_count_kv", &n_head_kv);
-    model_get_u32(m, "deepseek4.attention.key_length", &head_dim);
-    model_get_u32(m, "deepseek4.attention.sliding_window", &n_swa);
-    model_get_u32(m, "deepseek4.attention.indexer.head_count", &indexer_heads);
-    model_get_u32(m, "deepseek4.attention.indexer.key_length", &indexer_head_dim);
-    model_get_u32(m, "deepseek4.attention.indexer.top_k", &indexer_top_k);
-    model_get_u32(m, "deepseek4.expert_count", &n_expert);
-    model_get_u32(m, "deepseek4.expert_used_count", &n_expert_used);
-    model_get_u32(m, "deepseek4.expert_group_count", &n_expert_groups);
-    model_get_u32(m, "deepseek4.expert_group_used_count", &n_group_used);
-
-    for (uint64_t i = 0; i < m->n_tensors; i++) {
-        tensor_bytes += m->tensors[i].bytes;
-        params += m->tensors[i].elements;
-    }
-
-    printf("model: %.*s\n", (int)name.len, name.ptr);
-    printf("arch:  %.*s\n", (int)arch.len, arch.ptr);
-    printf("gguf:  v%u, %" PRIu64 " metadata keys, %" PRIu64 " tensors\n",
-        m->version, m->n_kv, m->n_tensors);
-    if (layers) printf("layers: %u\n", layers);
-    if (ctx_train) printf("train context: %" PRIu64 "\n", ctx_train);
-    if (n_head || n_head_kv || head_dim || n_swa) {
-        printf("attention: heads=%u kv_heads=%u head_dim=%u swa=%u\n",
-               n_head, n_head_kv, head_dim, n_swa);
-    }
-    if (indexer_heads || indexer_head_dim || indexer_top_k) {
-        printf("indexer: heads=%u head_dim=%u top_k=%u\n",
-               indexer_heads, indexer_head_dim, indexer_top_k);
-    }
-    if (n_expert || n_expert_used || n_expert_groups || n_group_used) {
-        printf("experts: count=%u used=%u groups=%u groups_used=%u\n",
-               n_expert, n_expert_used, n_expert_groups, n_group_used);
-    }
-    printf("file size: ");
-    print_size(m->size);
-    printf("\n");
-    printf("tensor bytes described by GGUF: ");
-    print_size(tensor_bytes);
-    printf("\n");
-    printf("logical parameters: %.2f B\n", (double)params / 1000000000.0);
-
-    printf("tensor types:\n");
-    for (uint32_t type = 0; type < sizeof(gguf_types)/sizeof(gguf_types[0]); type++) {
-        uint64_t count = 0;
-        uint64_t bytes = 0;
-        for (uint64_t i = 0; i < m->n_tensors; i++) {
-            if (m->tensors[i].type == type) {
-                count++;
-                bytes += m->tensors[i].bytes;
-            }
-        }
-        if (count != 0) {
-            printf("  %-8s %5" PRIu64 " tensors, ", tensor_type_name(type), count);
-            print_size(bytes);
-            printf("\n");
-        }
-    }
-
-}
-
-ds4_tensor *model_find_tensor(const ds4_model *m, const char *name) {
-    const size_t len = strlen(name);
-    for (uint64_t i = 0; i < m->n_tensors; i++) {
-        if (m->tensors[i].name.len == len &&
-            memcmp(m->tensors[i].name.ptr, name, len) == 0) {
-            return &m->tensors[i];
-        }
-    }
-    return NULL;
-}
-
-/* CUDA 默认 prefill 分块(见 ds4_default_prefill_cap_for_prompt 的实测注释); 0=未定。
- * 必须无条件声明: 使用点 ds4_default_prefill_cap_for_prompt 在所有构建里都编译,
- * 原先声明被圈进 #ifndef __APPLE__ 导致 Mac 构建 undeclared(stale .o 曾掩盖)。 */
-static int g_prefill_chunk_cuda = 0;
-
-#ifndef DS4_NO_GPU
-#ifndef __APPLE__
-#ifdef DS4_CUDA_SPARK_HBM_CACHE
-typedef struct {
-    uint64_t off;
-    uint64_t end;
-} accelerator_tensor_span;
-
-static int accelerator_tensor_span_cmp(const void *a, const void *b) {
-    const accelerator_tensor_span *sa = a;
-    const accelerator_tensor_span *sb = b;
-    if (sa->off < sb->off) return -1;
-    if (sa->off > sb->off) return 1;
-    if (sa->end < sb->end) return -1;
-    if (sa->end > sb->end) return 1;
-    return 0;
-}
-
-static uint64_t accelerator_cuda_preload_span_bytes(void) {
-    uint64_t mb = 1024;
-    const char *env = getenv("DS4_CUDA_WEIGHT_PRELOAD_SPAN_MB");
-    if (env && env[0]) {
-        char *end = NULL;
-        unsigned long long v = strtoull(env, &end, 10);
-        if (end != env && v > 0) mb = (uint64_t)v;
-    }
-    if (mb < 64) mb = 64;
-    if (mb > 4096) mb = 4096;
-    return mb * 1048576ull;
-}
-
-static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *cached_out) {
-    /* Routed MoE expert weights (`*_exps.weight`) are ~65 GiB of the model on
-     * V4-Flash but only top-K of N=256 experts fire per token — pre-caching
-     * them in HBM wastes most of the budget on cold weights and starves the
-     * hot non-MoE tensors that every token reads.  Skip them at the span-
-     * build stage so the cap fills with attn / shared FFN / embedding /
-     * output head.  Cold MoE expert reads fall back to the UVA-mapped
-     * pointer. */
-    accelerator_tensor_span *spans = xmalloc((size_t)m->n_tensors * sizeof(spans[0]));
-    uint64_t nspan = 0;
-    for (uint64_t i = 0; i < m->n_tensors; i++) {
-        const ds4_tensor *t = &m->tensors[i];
-        if (t->bytes == 0) continue;
-        if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) {
-            free(spans);
-            return false;
-        }
-        /* Routed-expert weights are the only tensors with "_exps." in the
-         * name; memmem is safe on short names (returns NULL).
-         * ★DS4_CACHE_EXPERTS=1 收编专家★: 上面"缓存冷专家浪费预算"的前提是显存
-         * 远小于模型(独显 24-80GB vs 89GB)。统一内存机器(GB10 121GiB)整模型装得下,
-         * 此时跳过反而让每次专家读都跨 C2C 去 host 内存 —— 实测 GPU 利用率被按在 6%,
-         * CPU 同时也闲着。开启需同时抬高 DS4_CUDA_WEIGHT_CACHE_LIMIT_GB(默认 24)。 */
-        static int cache_exps = -1;
-        if (cache_exps < 0) {
-            const char *ce = getenv("DS4_CACHE_EXPERTS");
-            if (ce && ce[0]) {
-                cache_exps = (ce[0] == '1') ? 1 : 0;
-            } else {
-#ifdef DS4_CUDA_SPARK_HBM_CACHE
-                /* GB10 默认收编专家(实测 decode 26.8→28.7): 内存账=模型+20GiB 余量
-                 * 装得下才开, 装不下回退老策略(只缓 backbone) */
-                const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
-                const uint64_t total = (uint64_t)sysconf(_SC_PHYS_PAGES) * page;
-                cache_exps = (m->size + 20ull * 1073741824ull <= total) ? 1 : 0;
-#else
-                cache_exps = 0;
-#endif
-            }
-        }
-        if (!cache_exps && memmem(t->name.ptr, t->name.len, "_exps.", 6) != NULL) {
-            continue;
-        }
-        spans[nspan++] = (accelerator_tensor_span){
-            .off = t->abs_offset,
-            .end = t->abs_offset + t->bytes,
-        };
-    }
-    qsort(spans, (size_t)nspan, sizeof(spans[0]), accelerator_tensor_span_cmp);
-
-    const uint64_t max_span = accelerator_cuda_preload_span_bytes();
-    uint64_t cached = 0;
-    uint64_t merged = 0;
-    for (uint64_t i = 0; i < nspan;) {
-        /* group: contiguous tensors with gaps <= 64 KiB */
-        const uint64_t g0 = i;
-        uint64_t end = spans[i].end;
-        i++;
-        while (i < nspan && spans[i].off <= end + 65536u) {
-            if (spans[i].end > end) end = spans[i].end;
-            i++;
-        }
-        /* Pack the group's tensors into chunks WITHOUT splitting any single
-         * tensor: a device-side consumer (e.g. the VQ expert blob relocation)
-         * needs each tensor's bytes virtually contiguous in one cudaMalloc
-         * block.  A tensor larger than max_span becomes its own whole chunk
-         * (the arena allocator grows to fit). */
-        uint64_t j = g0;
-        while (j < i) {
-            const uint64_t off = spans[j].off;
-            uint64_t chunk_end = spans[j].end;
-            j++;
-            while (j < i && spans[j].end - off <= max_span) {
-                if (spans[j].end > chunk_end) chunk_end = spans[j].end;
-                j++;
-            }
-            char label[96];
-            snprintf(label, sizeof(label), "tensor-span:%" PRIu64, merged);
-            if (ds4_gpu_cache_model_range(m->map, m->size, off, chunk_end - off, label) == 0) {
-                fprintf(stderr,
-                        "ds4: accelerator failed to cache model tensor span %" PRIu64
-                        " at offset %" PRIu64 "\n",
-                        merged, off);
-                free(spans);
-                return false;
-            }
-            cached += chunk_end - off;
-            merged++;
-        }
-    }
-    free(spans);
-    if (cached_out) *cached_out = cached;
-    return true;
-}
-#endif
-
-static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m) {
-    if (backend == DS4_BACKEND_CUDA && g_prefill_chunk_cuda == 0) g_prefill_chunk_cuda = 256;
-    if (backend != DS4_BACKEND_CUDA) return true;
-    if (!m || !m->map || m->size == 0) return false;
-    if (getenv("DS4_CUDA_DIRECT_MODEL") != NULL) {
-        return true;
-    }
-
-#ifdef DS4_CUDA_SPARK_HBM_CACHE
-    const double t0 = now_sec();
-    uint64_t cached = 0;
-    if (!accelerator_cache_model_tensor_spans(m, &cached)) return false;
-#else
-    uint64_t cached = 0;
-#endif
-    if (getenv("DS4_CUDA_Q8_F16_PRELOAD") != NULL ||
-        getenv("DS4_CUDA_Q8_F32_PRELOAD") != NULL) {
-        for (uint64_t i = 0; i < m->n_tensors; i++) {
-            const ds4_tensor *t = &m->tensors[i];
-            if (t->bytes == 0) continue;
-            if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) return false;
-            char label[128];
-            snprintf(label, sizeof(label), "tensor:%.*s", (int)t->name.len, t->name.ptr);
-            if (t->type == DS4_TENSOR_Q8_0 && t->ndim == 2 &&
-                ds4_gpu_cache_q8_f16_range(m->map, m->size, t->abs_offset, t->bytes, t->dim[0], t->dim[1], label) == 0) {
-                fprintf(stderr, "ds4: accelerator failed to cache dequantized Q8 tensor %.*s\n",
-                        (int)t->name.len, t->name.ptr);
-                return false;
-            }
-        }
-    }
-#ifdef DS4_CUDA_SPARK_HBM_CACHE
-    {   /* q8 repack 预建(decode gemv 快路): 必须先于 token graph capture */
-        uint64_t q8r_bytes = 0;
-        for (uint64_t i = 0; i < m->n_tensors; i++) {
-            const ds4_tensor *t = &m->tensors[i];
-            if (t->type != DS4_TENSOR_Q8_0 || t->ndim != 2 || t->bytes == 0) continue;
-            if (memmem(t->name.ptr, t->name.len, "_exps.", 6) != NULL) continue;
-            if (ds4_gpu_q8r_preload(m->map, m->size, t->abs_offset, t->dim[0], t->dim[1]))
-                q8r_bytes += t->bytes;
-        }
-        if (q8r_bytes)
-            fprintf(stderr, "ds4: CUDA q8 repack preloaded %.2f GiB\n",
-                    (double)q8r_bytes / 1073741824.0);
-    }
-    if (cached != 0) {
-        const double t1 = now_sec();
-        if (ds4_log_is_tty(stderr)) fputc('\n', stderr);
-        fprintf(stderr,
-                "ds4: CUDA startup model cache prepared %.2f GiB of tensor spans in %.3fs\n",
-                (double)cached / 1073741824.0,
-                t1 - t0);
-    }
-#else
-    (void)cached;
-#endif
-    return true;
-}
-#else
-static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m) {
-    (void)backend;
-    (void)m;
-    return true;
-}
-#endif
-#endif
-
-/* Return the in-place tensor payload inside the mapped GGUF. */
-const void *tensor_data(const ds4_model *m, const ds4_tensor *t) {
-    return m->map + t->abs_offset;
-}
-
-/* =========================================================================
- * go1b "hidden variable z^L" four-loss correction sidecar.
- * =========================================================================
- *
- * Loaded from a small separate GGUF (gguf/ds4-go1b-corr.gguf, ~94 MiB) that
- * carries only the per-layer corr_* tensors + the ds4.corr.present KV. The base
- * model GGUF is loaded unchanged. The correction is applied in the routed-MoE
- * forward at every layer that carries it; absent => exactly today's pure 1-bit. */
-
-
-static void residual_free(struct ds4_residual *r) {
-    if (!r) return;
-#ifndef DS4_NO_GPU
-    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
-        ds4_gpu_tensor_free(r->layer[il].g_gate);
-        ds4_gpu_tensor_free(r->layer[il].g_up);
-        ds4_gpu_tensor_free(r->layer[il].g_down);
-    }
-#endif
-    model_close(&r->sidecar);
-    free(r);
-}
-
-/* v2.2 直读 VQ 侧车目录(DS4_VQ_DIR): 逐层 mmap dql_vq_L%02d.bin(DQVL 校验), 零复制。
- * 盘账动机: overlay GGUF 需复制 34.5G 侧车字节, 战役机放不下; 直读=同字节同语义。 */
-/* ★VQ blob 在场(2026-08-01): 专家字节全在 blk.L.ffn_exps_vq.blob 里, 前向走 CPU gather →
- * f16 scratch → GPU, blob 本身不进 Metal span; 且 --no-down 合并的文件里 gate/up 缺席、
- * down 是 bytes=0 影子张量 ⇒ experts span 必然为空, 不是切分失败。 */
-static bool g_vq_experts_blob;
-static struct ds4_residual *vq_dir_load(const char *dir) {
-    struct ds4_residual *r = xcalloc(1, sizeof(*r));
-    uint32_t loaded = 0;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        char pth[512];
-        snprintf(pth, sizeof pth, "%s/dql_vq_L%02u.bin", dir, il);
-        int fd = open(pth, O_RDONLY);
-        if (fd < 0) continue;
-        struct stat st; fstat(fd, &st);
-        void *mp = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-        close(fd);
-        if (mp == MAP_FAILED) continue;
-        uint32_t mg; memcpy(&mg, mp, 4);
-        if (mg != 0x4C565144u || (size_t)st.st_size < 16 + 256 * 3 * 8) { munmap(mp, (size_t)st.st_size); continue; }
-        r->layer[il].vq_raw = mp; r->layer[il].vq_sz = (size_t)st.st_size;
-        r->layer[il].present = true;
-        loaded++;
-    }
-    if (!loaded) { free(r); return NULL; }
-    r->present = true;
-    g_vq_experts_blob = true;
-    fprintf(stderr, "ds4: v2.2 VQ 侧车直读 %s (%u 层)\n", dir, loaded);
-    return r;
-}
-
-/* 合一 VQ GGUF(2026-07-27): blk.L.ffn_exps_vq.blob 张量(type 42 = DQVL 字节原样)在场即
- * 自动装载, 指针直指模型 mmap — 与目录直读同字节同语义, 无需 DS4_VQ_DIR/DS4_RESIDUAL。 */
-static struct ds4_residual *vq_model_load(const ds4_model *m) {
-    struct ds4_residual *r = xcalloc(1, sizeof(*r));
-    uint32_t loaded = 0;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        char nm[64];
-        snprintf(nm, sizeof nm, "blk.%u.ffn_exps_vq.blob", il);
-        ds4_tensor *t = model_find_tensor(m, nm);
-        if (!t || t->type != 42u) continue;
-        const void *p = tensor_data(m, t);
-        if (!p || t->bytes < 16 + 256 * 3 * 8) continue;
-        uint32_t mg; memcpy(&mg, p, 4);
-        if (mg != 0x4C565144u) {
-            fprintf(stderr, "ds4: 内嵌 VQ blob 层 %u 魔数错 -- aborting (no silent quality downgrade)\n", il);
-            exit(1);
-        }
-        r->layer[il].vq_raw = p;
-        r->layer[il].vq_sz = (size_t)t->bytes;
-        r->layer[il].present = true;
-        loaded++;
-    }
-    if (!loaded) { free(r); return NULL; }
-    r->present = true;
-    g_vq_experts_blob = true;
-    fprintf(stderr, "ds4: 合一 GGUF 内嵌 VQ blob 装载 (%u 层)\n", loaded);
-    return r;
-}
-
-/* Open the 1-bit residual sidecar GGUF and bind per-layer go1b residual expert
- * tensors (blk.{L}.ffn_{gate,up,down}_exps_res.weight). Returns NULL (single
- * 1-bit path) when the file lacks ds4.residual.present or carries no tensors. */
-static struct ds4_residual *residual_load(const char *path, bool metal_mapping) {
-    struct ds4_residual *r = xcalloc(1, sizeof(*r));
-    model_open(&r->sidecar, path, metal_mapping, false);
-    bool present = false;
-    if (!model_get_bool(&r->sidecar, "ds4.residual.present", &present) || !present) {
-        fprintf(stderr, "ds4: residual sidecar %s lacks ds4.residual.present=true; ignoring\n", path);
-        model_close(&r->sidecar); free(r); return NULL;
-    }
-    uint32_t loaded = 0;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        char nm[128];
-        snprintf(nm, sizeof nm, "blk.%u.ffn_exps_vq.blob", il);
-        ds4_tensor *vqb = model_find_tensor(&r->sidecar, nm);
-        if (vqb) {                              /* v2.2 VQ overlay: 单 blob 携带全专家 */
-            ds4_residual_layer *rl = &r->layer[il];
-            rl->gate = rl->up = rl->down = vqb; rl->lut = NULL; rl->present = true;
-            loaded++; continue;
-        }
-        snprintf(nm, sizeof nm, "blk.%u.ffn_gate_exps_res.weight", il);
-        ds4_tensor *g = model_find_tensor(&r->sidecar, nm);
-        if (!g) continue;                       /* layer not residual-corrected */
-        ds4_residual_layer *rl = &r->layer[il];
-        rl->gate = g;
-        snprintf(nm, sizeof nm, "blk.%u.ffn_up_exps_res.weight", il);
-        rl->up = model_find_tensor(&r->sidecar, nm);
-        snprintf(nm, sizeof nm, "blk.%u.ffn_down_exps_res.weight", il);
-        rl->down = model_find_tensor(&r->sidecar, nm);
-        if (!rl->up || !rl->down) { fprintf(stderr, "ds4: residual layer %u missing up/down\n", il); exit(1); }
-        /* Sparse residual (Go-active experts only): the LUT maps a routed expert id to
-         * its residual slot (or -1). Absent => dense (indexed directly by expert id).
-         * The metal path CPU-gathers residual experts from the sidecar mmap, so no
-         * resident GPU upload is needed (unlike the corr sidecar). */
-        snprintf(nm, sizeof nm, "blk.%u.ffn_res_lut.weight", il);
-        rl->lut = model_find_tensor(&r->sidecar, nm);
-        rl->present = true;
-        loaded++;
-    }
-    if (loaded == 0) {
-        fprintf(stderr, "ds4: residual sidecar %s carried no per-layer tensors; ignoring\n", path);
-        model_close(&r->sidecar); free(r); return NULL;
-    }
-    r->present = true;
-    fprintf(stderr, "ds4: go1b 1-bit residual loaded from %s (%u layers)\n", path, loaded);
-    return r;
-}
-
-/* Build the zchain from in-model blk.L.opt_* tensors — the single merged GGUF
- * product (deepseek4-quantize --zchain lands the optimization chains next to
- * the 1bit expert bytes; KV ds4.zchain.present gates this). Op records mirror
- * the ds4_gpu packed layout (16 floats, [15]=layer-local V8 block). v8 points
- * into the model mmap (zero-copy); map stays NULL so ds4_zchain_free never
- * munmaps model memory. External --zchain/DS4_ZCHAIN overrides this loader. */
-static struct ds4_zchain *zchain_from_model(const ds4_model *m) {
-    bool present = false;
-    if (!model_get_bool(m, "ds4.zchain.present", &present) || !present) return NULL;
-    ds4_zchain *z = xcalloc(1, sizeof(*z));
-    z->n_layer = DS4_N_LAYER; z->n_expert = DS4_N_EXPERT; z->d_model = DS4_N_EMBD;
-    z->layer = xcalloc(DS4_N_LAYER, sizeof(*z->layer));
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        char nm[64];
-        snprintf(nm, sizeof nm, "blk.%u.opt_chain.weight", il);
-        ds4_tensor *tc = model_find_tensor(m, nm);
-        snprintf(nm, sizeof nm, "blk.%u.opt_ge.weight", il);
-        ds4_tensor *tg = model_find_tensor(m, nm);
-        snprintf(nm, sizeof nm, "blk.%u.opt_v8.weight", il);
-        ds4_tensor *tv = model_find_tensor(m, nm);
-        const uint16_t *v8 = tv ? (const uint16_t *)tensor_data(m, tv) : NULL;
-        snprintf(nm, sizeof nm, "blk.%u.opt_zlm.weight", il);
-        ds4_tensor *tzl = model_find_tensor(m, nm);
-        const uint16_t *zlm = tzl ? (const uint16_t *)tensor_data(m, tzl) : NULL;
-        /* DS4_ZCHAIN_NO_GE=1: 诊断开关 — 跳过 GE 表装载(所有折叠点按 ge==NULL 自然短路)。
-         * 依据(2026-07-21): GE=per-expert 增益把 base 修向 FP; 加性残差侧车的前提是
-         * base≈裸 Q1 → GE×残差=按专家双重修正嫌疑(Go-hot 命中面上集中爆), A/B 判决用。 */
-        const char *nge = getenv("DS4_ZCHAIN_NO_GE");   /* 值语义: 空串/"0"=不跳过(在案空串陷阱, quant_layer M4.6 同款) */
-        if (tg && tg->dim[0] == DS4_N_EXPERT && !(nge && *nge && *nge != '0')) {
-            const float *ge = (const float *)tensor_data(m, tg);
-            if (ge) {
-                z->layer[il].ge = xmalloc((size_t)DS4_N_EXPERT * sizeof(float));
-                memcpy(z->layer[il].ge, ge, (size_t)DS4_N_EXPERT * sizeof(float));
-                z->n_ge_layers++;
-            }
-        }
-        if (tc && tc->dim[0] >= 16) {
-            const float *ch = (const float *)tensor_data(m, tc);
-            const uint32_t nops = (uint32_t)(tc->dim[0] / 16);
-            if (ch && nops) {
-                z->layer[il].ops = xcalloc(nops, sizeof(ds4_zchain_op));
-                uint32_t kept = 0;
-                for (uint32_t i = 0; i < nops; i++) {
-                    const float *f = ch + (size_t)i * 16;
-                    ds4_zchain_op *o = &z->layer[il].ops[kept];
-                    memset(o, 0, sizeof(*o));
-                    o->type = (uint32_t)f[0];
-                    o->g = f[1];
-                    memcpy(o->w2p, f + 2, 4 * sizeof(float));
-                    memcpy(o->w8, f + 6, 9 * sizeof(float));
-                    if (o->type == 3u) {
-                        const int blk = (int)f[15];
-                        if (blk < 0 || !v8 ||
-                            (uint64_t)(blk + 1) * 8u * DS4_N_EMBD > (tv ? tv->dim[0] : 0)) {
-                            fprintf(stderr, "ds4: zchain L%u dyn8 dropped: blk=%d v8=%d dim0=%llu need=%llu\n",
-                                    il, blk, v8 != NULL, (unsigned long long)(tv ? tv->dim[0] : 0),
-                                    (unsigned long long)((uint64_t)(blk + 1) * 8u * DS4_N_EMBD));
-                            continue;   /* V8-less dyn8 = quantizer-replay no-op: drop */
-                        }
-                        o->v8 = v8 + (size_t)blk * 8u * DS4_N_EMBD;
-                    }
-                    if (o->type == 6u) {   /* 冻结 z^L: 槽{f[1]=tr,f[2]=k} + opt_zlm 张量; 不进 λ 链 */
-                        const uint32_t zk = (uint32_t)f[2];
-                        const uint64_t nh = (uint64_t)zk + 2ull * zk * DS4_N_EMBD;
-                        if (zk > 0 && zk <= 1024 && zlm && (tzl ? tzl->dim[0] : 0) >= nh) {
-                            z->layer[il].zl.zlk = zk;
-                            z->layer[il].zl.zltr = f[1];
-                            z->layer[il].zl.zlm = zlm;   /* aliases model mmap */
-                        }
-                        continue;
-                    }
-                    if (o->type >= 1u && o->type <= 4u) { kept++; z->n_ops_total++; }
-                }
-                z->layer[il].n_ops = kept;
-            }
-        }
-    }
-    uint32_t n_zl = 0;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) if (z->layer[il].zl.zlk) n_zl++;
-    if (!z->n_ops_total && !z->n_ge_layers && !n_zl) { ds4_zchain_free(z); return NULL; }
-    fprintf(stderr, "ds4: zchain loaded from model tensors (merged GGUF): %u chain ops + %u GE layers + %u z^L layers\n",
-            z->n_ops_total, z->n_ge_layers, n_zl);
-    return z;
-}
-
-/* Build the GPU residual set for layer il (or NULL if absent). Static return: the
- * routed-MoE forward is serialized through one graph worker, so a single static is safe.
- * GPU builds only — the type itself lives behind the ds4_gpu.h GPU guard. */
-#ifndef DS4_NO_GPU
-static const ds4_gpu_residual_set *residual_set_for(const ds4_model *m, uint32_t il) {
-    static ds4_gpu_residual_set rs;
-    if (!m || !m->residual || !m->residual->present ||
-        il >= DS4_MAX_LAYER || !m->residual->layer[il].present) return NULL;
-    const ds4_residual_layer *rl = &m->residual->layer[il];
-    /* rs 是跨层复用的静态, 每条分支都要写全判别位, 否则上一层的取值会漏进本层。 */
-    if (rl->vq_raw) {   /* 直读侧车: blob 即三矩阵之源 */
-        rs.gate_ptr = rs.up_ptr = rs.down_ptr = rl->vq_raw;
-        rs.lut = NULL; rs.merged2b = 0; rs.vq = 1;
-        rs.vq_bytes = (uint64_t)rl->vq_sz;
-        return &rs;
-    }
-    if (!rl->gate || !rl->up || !rl->down) return NULL;
-    rs.gate_ptr = tensor_data(&m->residual->sidecar, rl->gate);
-    rs.up_ptr   = tensor_data(&m->residual->sidecar, rl->up);
-    rs.down_ptr = tensor_data(&m->residual->sidecar, rl->down);
-    rs.vq_bytes = 0;
-    if (!rs.gate_ptr || !rs.up_ptr || !rs.down_ptr) return NULL;
-    rs.lut = rl->lut ? (const float *)tensor_data(&m->residual->sidecar, rl->lut) : NULL;
-    /* Type 41 = go2b (offline-merged base+residual, R5-C): the metal path runs the
-     * hot/cold two-source split instead of the legacy three-extra-matmul add. */
-    rs.merged2b = (rl->gate->type == 41u);
-    rs.vq = (rl->gate->type == 42u);
-    return &rs;
-}
-
-/* dense matmul 的类型分发(backbone-q4k 配方): 同一批调用点此前硬编码 q8_0。
- * Q4_K 走新的 ds4_gpu_matmul_q4_K_tensor(CUDA; Metal 返回 0 即向上抛失败)。 */
-static int dense_matmul_typed(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor *w,
-                              uint64_t in_dim, uint64_t out_dim,
-                              const ds4_gpu_tensor *x, uint64_t n_tok) {
-    if (w->type == DS4_TENSOR_Q4_K)
-        return ds4_gpu_matmul_q4_K_tensor(out, m->map, m->size, w->abs_offset,
-                                          in_dim, out_dim, x, n_tok);
-    if (w->type == DS4_TENSOR_Q2_K)   /* 全q2 基座(2026-08-19) */
-        return ds4_gpu_matmul_q2_K_tensor(out, m->map, m->size, w->abs_offset,
-                                          in_dim, out_dim, x, n_tok);
-    return ds4_gpu_matmul_q8_0_tensor(out, m->map, m->size, w->abs_offset,
-                                      in_dim, out_dim, x, n_tok);
-}
-
-/* decode 同输入矩阵对(q_a+kv / shared gate+up): 两权重都 q4_K 时一次量化+一次发射;
- * 其他形态(q8/metal/批量)回退两次单矩阵。 */
-static int dense_matmul_pair_typed(ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
-                                   const ds4_model *m,
-                                   const ds4_tensor *w0, const ds4_tensor *w1,
-                                   uint64_t in_dim, uint64_t out0_dim, uint64_t out1_dim,
-                                   const ds4_gpu_tensor *x) {
-    if (w0->type == DS4_TENSOR_Q4_K && w1->type == DS4_TENSOR_Q4_K &&
-        ds4_gpu_matmul_q4_K_pair_tensor(out0, out1, m->map, m->size,
-                                        w0->abs_offset, w1->abs_offset,
-                                        in_dim, out0_dim, out1_dim, x))
-        return 1;
-    if (w0->type == DS4_TENSOR_Q2_K && w1->type == DS4_TENSOR_Q2_K &&
-        ds4_gpu_matmul_q2_K_pair_tensor(out0, out1, m->map, m->size,
-                                        w0->abs_offset, w1->abs_offset,
-                                        in_dim, out0_dim, out1_dim, x))
-        return 1;
-    return dense_matmul_typed(out0, m, w0, in_dim, out0_dim, x, 1) &&
-           dense_matmul_typed(out1, m, w1, in_dim, out1_dim, x, 1);
-}
-
-/* attn_output 批量入口按 a 张量类型分发(q4_K/q2_K 同参; 2026-08-19 全q2)。 */
-static int attn_output_kq_batch(const ds4_tensor *a, ds4_gpu_tensor *out, ds4_gpu_tensor *low,
-                                const void *map, uint64_t msize, uint64_t offb,
-                                uint64_t group_dim, uint64_t rank, uint32_t n_groups,
-                                uint64_t out_dim, const ds4_gpu_tensor *heads, uint32_t n_tokens) {
-    return a->type == DS4_TENSOR_Q2_K
-        ? ds4_gpu_attention_output_q2k_batch_tensor(out, low, map, msize, a->abs_offset, offb,
-                                                    group_dim, rank, n_groups, out_dim, heads, n_tokens)
-        : ds4_gpu_attention_output_q4k_batch_tensor(out, low, map, msize, a->abs_offset, offb,
-                                                    group_dim, rank, n_groups, out_dim, heads, n_tokens);
-}
-
-/* Pack the host-side zchain into the flat GPU tables (layout: ds4_gpu.h).
- * Ops are layer-major; dyn8 V8 blocks concatenate in encounter order and each
- * op's slot [15] carries its block index (-1 = none). GE rows default to 1.0
- * so a single [n_layer][n_expert] table serves every GE layer. */
-static int zchain_gpu_upload(const struct ds4_zchain *z) {
-    const uint32_t nl = z->n_layer, ne = z->n_expert, dm = z->d_model;
-    uint32_t *loff = xmalloc((size_t)(nl + 1) * sizeof(uint32_t));
-    uint8_t *gep = xcalloc(nl, 1);
-    uint32_t nops = 0, nblk = 0, has_ge = 0;
-    for (uint32_t l = 0; l < nl; l++) {
-        loff[l] = nops;
-        nops += z->layer[l].n_ops;
-        if (z->layer[l].ge) { gep[l] = 1; has_ge = 1; }
-        for (uint32_t i = 0; i < z->layer[l].n_ops; i++)
-            if (z->layer[l].ops[i].type == 3u && z->layer[l].ops[i].v8) nblk++;
-    }
-    loff[nl] = nops;
-    float *ops = nops ? xmalloc((size_t)nops * 16u * sizeof(float)) : NULL;
-    uint16_t *v8 = nblk ? xmalloc((size_t)nblk * 8u * dm * sizeof(uint16_t)) : NULL;
-    uint32_t oi = 0, bi = 0;
-    for (uint32_t l = 0; l < nl; l++) {
-        for (uint32_t i = 0; i < z->layer[l].n_ops; i++, oi++) {
-            const ds4_zchain_op *o = &z->layer[l].ops[i];
-            float *f = ops + (size_t)oi * 16u;
-            f[0] = (float)o->type;
-            f[1] = o->g;
-            memcpy(f + 2, o->w2p, 4 * sizeof(float));
-            memcpy(f + 6, o->w8, 9 * sizeof(float));
-            f[15] = -1.0f;
-            if (o->type == 3u && o->v8) {
-                memcpy(v8 + (size_t)bi * 8u * dm, o->v8, (size_t)8u * dm * sizeof(uint16_t));
-                f[15] = (float)bi++;
-            }
-        }
-    }
-    float *ge = NULL;
-    if (has_ge) {
-        ge = xmalloc((size_t)nl * ne * sizeof(float));
-        for (size_t i = 0; i < (size_t)nl * ne; i++) ge[i] = 1.0f;
-        for (uint32_t l = 0; l < nl; l++)
-            if (z->layer[l].ge)
-                memcpy(ge + (size_t)l * ne, z->layer[l].ge, (size_t)ne * sizeof(float));
-    }
-    int r = ds4_gpu_zchain_set(ops, loff, v8, ge, has_ge ? gep : NULL,
-                               nl, ne, dm, nops, nblk);
-    /* frozen z^L (type 6): concat fp16 factor blocks + per-layer meta */
-    if (r) {
-        uint64_t total = 0; uint32_t nz = 0;
-        for (uint32_t l = 0; l < nl; l++) if (z->layer[l].zl.zlk) {
-            const uint32_t di = z->layer[l].zl.zdin ? z->layer[l].zl.zdin : dm;
-            total += (uint64_t)z->layer[l].zl.zlk * (1u + dm + di); nz++; }
-        if (nz) {
-            uint16_t *zlm = xmalloc(total * sizeof(uint16_t));
-            uint32_t *zo = xcalloc(nl, sizeof(uint32_t));
-            uint32_t *zk = xcalloc(nl, sizeof(uint32_t));
-            uint32_t *zd = xcalloc(nl, sizeof(uint32_t));
-            float    *zt = xcalloc(nl, sizeof(float));
-            uint32_t *zm = xcalloc(nl, sizeof(uint32_t));
-            uint64_t cur = 0;
-            for (uint32_t l = 0; l < nl; l++) {
-                const ds4_zchain_zl *lz = &z->layer[l].zl;
-                if (!lz->zlk) continue;
-                const uint32_t di = lz->zdin ? lz->zdin : dm;
-                const uint64_t nh = (uint64_t)lz->zlk * (1u + dm + di);
-                memcpy(zlm + cur, lz->zlm, nh * sizeof(uint16_t));
-                zo[l] = (uint32_t)cur; zk[l] = lz->zlk; zd[l] = di; zt[l] = lz->zltr;
-                zm[l] = lz->zmul;
-                cur += nh;
-            }
-            r = ds4_gpu_zchain_zl_set(zlm, zo, zk, zd, zt, zm, nl, total);
-            free(zlm); free(zo); free(zk); free(zd); free(zt); free(zm);
-        }
-    }
-    /* 路由闭式侧车(type8): z^L 同款 concat 上传, blob = z[k]|U[ne*k]|V[din*k] */
-    if (r) {
-        uint64_t total = 0; uint32_t nr = 0;
-        for (uint32_t l = 0; l < nl; l++) if (z->layer[l].rte.zlk) {
-            total += (uint64_t)z->layer[l].rte.zlk * (1u + ne + z->layer[l].rte.zdin); nr++; }
-        if (nr) {
-            uint16_t *rm = xmalloc(total * sizeof(uint16_t));
-            uint32_t *ro = xcalloc(nl, sizeof(uint32_t));
-            uint32_t *rk = xcalloc(nl, sizeof(uint32_t));
-            float    *rt = xcalloc(nl, sizeof(float));
-            uint64_t cur = 0;
-            for (uint32_t l = 0; l < nl; l++) {
-                const ds4_zchain_zl *lr = &z->layer[l].rte;
-                if (!lr->zlk) continue;
-                const uint64_t nh = (uint64_t)lr->zlk * (1u + ne + lr->zdin);
-                memcpy(rm + cur, lr->zlm, nh * sizeof(uint16_t));
-                ro[l] = (uint32_t)cur; rk[l] = lr->zlk; rt[l] = lr->zltr;
-                cur += nh;
-            }
-            r = ds4_gpu_zchain_rte_set(rm, ro, rk, rt, nl, ne, total);
-            free(rm); free(ro); free(rk); free(rt);
-        }
-    }
-    free(ops); free(v8); free(ge); free(loff); free(gep);
-    return r;
-}
-#endif
-
-/* Per-layer router-logit bias (delta), or NULL when this layer has no correction.
- * Only score-routed layers consume it (hash layers select experts by token id). */
-
-/* Optional startup pass that touches tensor pages before timing generation. */
-static void model_warm_weights(const ds4_model *m) {
-    const uint64_t start = m->tensor_data_pos;
-    const uint64_t end = m->size;
-    if (start >= end) return;
-
-    const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
-    const uint8_t *p = m->map;
-    volatile uint64_t checksum = 0;
-    const double t0 = now_sec();
-
-    fprintf(stderr, "ds4: warming mapped tensor pages: %.2f GiB\n",
-            (double)(end - start) / (1024.0 * 1024.0 * 1024.0));
-
-#if defined(POSIX_MADV_WILLNEED)
-    (void)posix_madvise((void *)(p + start), (size_t)(end - start), POSIX_MADV_WILLNEED);
-#endif
-
-    for (uint64_t off = start; off < end; off += page) {
-        checksum += p[off];
-    }
-    checksum += p[end - 1];
-
-    const double t1 = now_sec();
-    fprintf(stderr, "ds4: warmed tensor pages in %.3fs (checksum=%llu)\n",
-            t1 - t0, (unsigned long long)checksum);
-}
-
-/* =========================================================================
- * Scalar Conversion and Quantized Tensor Kernels.
- * =========================================================================
- *
- * These functions are the CPU reference math used by the C backend and by
- * Metal diagnostics.  They implement only the tensor formats present in the
- * DeepSeek V4 Flash GGUF: F16, F32, Q8_0, Q2_K, IQ2_XXS, and Q8_K activation
- * blocks used for expert dot products.
- */
-
-static inline float f16_to_f32(uint16_t h) {
-#if defined(__ARM_NEON)
-    const float16x4_t hv = vreinterpret_f16_u16(vdup_n_u16(h));
-    return vgetq_lane_f32(vcvt_f32_f16(hv), 0);
-#else
-    uint32_t sign = (uint32_t)(h & 0x8000) << 16;
-    uint32_t exp  = (h >> 10) & 0x1f;
-    uint32_t mant = h & 0x03ff;
-    uint32_t bits;
-
-    if (exp == 0) {
-        if (mant == 0) {
-            bits = sign;
-        } else {
-            exp = 1;
-            while ((mant & 0x0400) == 0) {
-                mant <<= 1;
-                exp--;
-            }
-            mant &= 0x03ff;
-            bits = sign | ((exp + 127 - 15) << 23) | (mant << 13);
-        }
-    } else if (exp == 31) {
-        bits = sign | 0x7f800000u | (mant << 13);
-    } else {
-        bits = sign | ((exp + 127 - 15) << 23) | (mant << 13);
-    }
-
-    float f;
-    memcpy(&f, &bits, sizeof(f));
-    return f;
-#endif
-}
-
-static inline uint16_t f32_to_f16(float f) {
-#if defined(__ARM_NEON)
-    const float32x4_t fv = vdupq_n_f32(f);
-    const float16x4_t hv = vcvt_f16_f32(fv);
-    return vget_lane_u16(vreinterpret_u16_f16(hv), 0);
-#else
-    uint32_t bits;
-    memcpy(&bits, &f, sizeof(bits));
-
-    const uint32_t sign = (bits >> 16) & 0x8000u;
-    int32_t exp = (int32_t)((bits >> 23) & 0xffu) - 127 + 15;
-    uint32_t mant = bits & 0x7fffffu;
-
-    if (exp <= 0) {
-        if (exp < -10) return (uint16_t)sign;
-        mant |= 0x800000u;
-        const uint32_t shift = (uint32_t)(14 - exp);
-        uint32_t half_mant = mant >> shift;
-        const uint32_t round_bit = (mant >> (shift - 1)) & 1u;
-        const uint32_t sticky = mant & ((1u << (shift - 1)) - 1u);
-        if (round_bit && (sticky || (half_mant & 1u))) half_mant++;
-        return (uint16_t)(sign | half_mant);
-    }
-
-    if (exp >= 31) {
-        if (((bits >> 23) & 0xffu) == 0xffu && mant != 0) {
-            return (uint16_t)(sign | 0x7e00u);
-        }
-        return (uint16_t)(sign | 0x7c00u);
-    }
-
-    uint32_t half = sign | ((uint32_t)exp << 10) | (mant >> 13);
-    const uint32_t round = mant & 0x1fffu;
-    if (round > 0x1000u || (round == 0x1000u && (half & 1u))) half++;
-    return (uint16_t)half;
-#endif
-}
-
-static void f16_round_inplace_cpu(float *x, uint32_t n) {
-    for (uint32_t i = 0; i < n; i++) x[i] = f16_to_f32(f32_to_f16(x[i]));
-}
-
-static float dsv4_e4m3fn_value_cpu(int i) {
-    static const float exp_scale[16] = {
-        0.0f, 0.015625f, 0.03125f, 0.0625f,
-        0.125f, 0.25f, 0.5f, 1.0f,
-        2.0f, 4.0f, 8.0f, 16.0f,
-        32.0f, 64.0f, 128.0f, 256.0f,
-    };
-
-    const int exp = (i >> 3) & 0x0f;
-    const int mant = i & 0x07;
-    return exp == 0
-        ? (float)mant * 0.001953125f
-        : (1.0f + (float)mant * 0.125f) * exp_scale[exp];
-}
-
-static float dsv4_e4m3fn_dequant_cpu(float x) {
-    const float sign = x < 0.0f ? -1.0f : 1.0f;
-    const float ax = fminf(fabsf(x), 448.0f);
-
-    int lo = 0;
-    int hi = 126;
-    while (lo < hi) {
-        const int mid = (lo + hi + 1) >> 1;
-        if (dsv4_e4m3fn_value_cpu(mid) <= ax) {
-            lo = mid;
-        } else {
-            hi = mid - 1;
-        }
-    }
-
-    int best = lo;
-    if (best < 126) {
-        const float best_diff = fabsf(ax - dsv4_e4m3fn_value_cpu(best));
-        const float next_diff = fabsf(ax - dsv4_e4m3fn_value_cpu(best + 1));
-        if (next_diff < best_diff || (next_diff == best_diff && ((best + 1) & 1) == 0 && (best & 1) != 0)) {
-            best++;
-        }
-    }
-
-    return sign * dsv4_e4m3fn_value_cpu(best);
-}
-
-/* DeepSeek V4 stores the non-RoPE part of compressed KV through an E4M3-style
- * round trip.  Keeping this in the CPU reference makes cache values comparable
- * to the Metal graph's compressed-cache behavior. */
-static void dsv4_fp8_kv_quantize_row_inplace_cpu(float *x, uint32_t head_dim, uint32_t n_rot) {
-    const uint32_t n_nope = head_dim - n_rot;
-    for (uint32_t off = 0; off < n_nope; off += 64) {
-        float amax = 0.0f;
-        for (uint32_t i = 0; i < 64; i++) {
-            const float av = fabsf(x[off + i]);
-            if (av > amax) amax = av;
-        }
-
-        if (amax < 1.0e-4f) amax = 1.0e-4f;
-        const float scale = ldexpf(1.0f, (int)ceilf(log2f(amax / 448.0f)));
-        for (uint32_t i = 0; i < 64; i++) {
-            float v = x[off + i] / scale;
-            if (v > 448.0f) v = 448.0f;
-            if (v < -448.0f) v = -448.0f;
-            x[off + i] = dsv4_e4m3fn_dequant_cpu(v) * scale;
-        }
-    }
-}
-
-static float dsv4_e2m1fn_value_cpu(int i) {
-    static const float values[8] = {
-        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-    };
-    return values[i & 7];
-}
-
-static float dsv4_e2m1fn_dequant_cpu(float x) {
-    const float sign = x < 0.0f ? -1.0f : 1.0f;
-    const float ax = fminf(fabsf(x), 6.0f);
-    int best = 0;
-    float best_diff = fabsf(ax - dsv4_e2m1fn_value_cpu(0));
-    for (int i = 1; i < 8; i++) {
-        const float diff = fabsf(ax - dsv4_e2m1fn_value_cpu(i));
-        if (diff < best_diff || (diff == best_diff && (i & 1) == 0 && (best & 1) != 0)) {
-            best = i;
-            best_diff = diff;
-        }
-    }
-    return sign * dsv4_e2m1fn_value_cpu(best);
-}
-
-static void dsv4_hadamard128_inplace_cpu(float *x) {
-    for (uint32_t stride = 1; stride < 128; stride <<= 1) {
-        for (uint32_t base = 0; base < 128; base += 2u * stride) {
-            for (uint32_t i = 0; i < stride; i++) {
-                const float a = x[base + i];
-                const float b = x[base + stride + i];
-                x[base + i] = a + b;
-                x[base + stride + i] = a - b;
-            }
-        }
-    }
-    const float scale = 0.08838834764831845f;
-    for (uint32_t i = 0; i < 128; i++) x[i] *= scale;
-}
-
-static void dsv4_fp4_act_quantize_row_inplace_cpu(float *x, uint32_t n) {
-    if ((n % 32u) != 0) ds4_die("DSV4 FP4 activation quantization requires 32-aligned rows");
-    for (uint32_t off = 0; off < n; off += 32) {
-        float amax = 0.0f;
-        for (uint32_t i = 0; i < 32; i++) {
-            const float av = fabsf(x[off + i]);
-            if (av > amax) amax = av;
-        }
-
-        if (amax < 7.052966104933725e-38f) amax = 7.052966104933725e-38f;
-        const float scale = ldexpf(1.0f, (int)ceilf(log2f(amax / 6.0f)));
-        for (uint32_t i = 0; i < 32; i++) {
-            float v = x[off + i] / scale;
-            if (v > 6.0f) v = 6.0f;
-            if (v < -6.0f) v = -6.0f;
-            x[off + i] = dsv4_e2m1fn_dequant_cpu(v) * scale;
-        }
-    }
-}
-
-/* The official DeepSeek V4 graph rotates indexer activations with a 128-wide
- * Hadamard transform and immediately runs the FP4 activation-simulation
- * round trip. This applies to both indexer Q and the indexer compressor KV;
- * without it, the top-k compressed-row selection is not the model's graph. */
-static void dsv4_indexer_qat_row_inplace_cpu(float *x, uint32_t head_dim) {
-    if (head_dim != 128) ds4_die("DSV4 indexer QAT expects 128-wide indexer rows");
-    dsv4_hadamard128_inplace_cpu(x);
-    dsv4_fp4_act_quantize_row_inplace_cpu(x, head_dim);
-}
-
-static void dsv4_indexer_qat_rows_inplace_cpu(float *x, uint32_t rows, uint32_t head_dim) {
-    for (uint32_t r = 0; r < rows; r++) {
-        dsv4_indexer_qat_row_inplace_cpu(x + (uint64_t)r * head_dim, head_dim);
-    }
-}
-
-/* Quantize a float activation into Q8_K blocks so GGUF Q2_K/IQ2_XXS expert
- * kernels can reuse the same activation for many expert rows. */
-static void ds4_quantize_row_q8_K(const float *x, block_q8_K *y, int64_t k) {
-    if (k % QK_K != 0) ds4_die("Q8_K quantization length is not QK_K aligned");
-    const int64_t nb = k / QK_K;
-
-    for (int64_t b = 0; b < nb; b++) {
-        float max = 0.0f;
-        float amax = 0.0f;
-        for (int j = 0; j < QK_K; j++) {
-            const float ax = fabsf(x[j]);
-            if (ax > amax) {
-                amax = ax;
-                max = x[j];
-            }
-        }
-
-        if (amax == 0.0f) {
-            y[b].d = 0.0f;
-            memset(y[b].qs, 0, sizeof(y[b].qs));
-            memset(y[b].bsums, 0, sizeof(y[b].bsums));
-            x += QK_K;
-            continue;
-        }
-
-        const float iscale = -127.0f / max;
-        for (int j = 0; j < QK_K; j++) {
-            int v = (int)lrintf(iscale * x[j]);
-            if (v > 127) v = 127;
-            if (v < -128) v = -128;
-            y[b].qs[j] = (int8_t)v;
-        }
-        for (int j = 0; j < QK_K / 16; j++) {
-            int sum = 0;
-            for (int i = 0; i < 16; i++) sum += y[b].qs[j * 16 + i];
-            y[b].bsums[j] = (int16_t)sum;
-        }
-        y[b].d = 1.0f / iscale;
-        x += QK_K;
-    }
-}
-
-static void ds4_vec_dot_q2_K_q8_K(int n, float *s, const block_q2_K *x, const block_q8_K *y) {
-    const int nb = n / QK_K;
-
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-    const uint8x16_t m3 = vdupq_n_u8(0x03);
-    const uint8x16_t m4 = vdupq_n_u8(0x0f);
-    const int32x4_t zero = vdupq_n_s32(0);
-    float sum = 0.0f;
-
-    for (int i = 0; i < nb; i++) {
-        const float d = y[i].d * f16_to_f32(x[i].d);
-        const float dmin = -y[i].d * f16_to_f32(x[i].dmin);
-
-        const uint8_t *q2 = x[i].qs;
-        const int8_t *q8 = y[i].qs;
-        const uint8_t *sc = x[i].scales;
-
-        const uint8x16_t mins_and_scales = vld1q_u8(sc);
-        const uint8x16_t scales = vandq_u8(mins_and_scales, m4);
-        uint8_t scale_lanes[16];
-        vst1q_u8(scale_lanes, scales);
-
-        const uint8x16_t mins = vshrq_n_u8(mins_and_scales, 4);
-        const int16x8x2_t q8sums = vld1q_s16_x2(y[i].bsums);
-        const int16x8x2_t mins16 = {{
-            vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(mins))),
-            vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(mins))),
-        }};
-        const int32x4_t s0 = vaddq_s32(
-            vmull_s16(vget_low_s16(mins16.val[0]), vget_low_s16(q8sums.val[0])),
-            vmull_s16(vget_high_s16(mins16.val[0]), vget_high_s16(q8sums.val[0])));
-        const int32x4_t s1 = vaddq_s32(
-            vmull_s16(vget_low_s16(mins16.val[1]), vget_low_s16(q8sums.val[1])),
-            vmull_s16(vget_high_s16(mins16.val[1]), vget_high_s16(q8sums.val[1])));
-        sum += dmin * (float)vaddvq_s32(vaddq_s32(s0, s1));
-
-        int isum = 0;
-        int is = 0;
-        for (int j = 0; j < QK_K / 128; j++) {
-            const uint8x16x2_t q2bits = vld1q_u8_x2(q2);
-            q2 += 32;
-
-#define DS4_Q2_DOT_NOSHIFT(scale_index) do {                                           \
-                const int8x16x2_t q8bytes = vld1q_s8_x2(q8);                           \
-                q8 += 32;                                                              \
-                const int8x16_t q2lo = vreinterpretq_s8_u8(vandq_u8(q2bits.val[0], m3));\
-                const int8x16_t q2hi = vreinterpretq_s8_u8(vandq_u8(q2bits.val[1], m3));\
-                isum += vaddvq_s32(vdotq_s32(zero, q2lo, q8bytes.val[0])) *            \
-                        scale_lanes[is + (scale_index)];                               \
-                isum += vaddvq_s32(vdotq_s32(zero, q2hi, q8bytes.val[1])) *            \
-                        scale_lanes[is + 1 + (scale_index)];                           \
-            } while (0)
-
-#define DS4_Q2_DOT_SHIFT(shift, scale_index) do {                                      \
-                const int8x16x2_t q8bytes = vld1q_s8_x2(q8);                           \
-                q8 += 32;                                                              \
-                const int8x16_t q2lo = vreinterpretq_s8_u8(                            \
-                    vandq_u8(vshrq_n_u8(q2bits.val[0], (shift)), m3));                 \
-                const int8x16_t q2hi = vreinterpretq_s8_u8(                            \
-                    vandq_u8(vshrq_n_u8(q2bits.val[1], (shift)), m3));                 \
-                isum += vaddvq_s32(vdotq_s32(zero, q2lo, q8bytes.val[0])) *            \
-                        scale_lanes[is + (scale_index)];                               \
-                isum += vaddvq_s32(vdotq_s32(zero, q2hi, q8bytes.val[1])) *            \
-                        scale_lanes[is + 1 + (scale_index)];                           \
-            } while (0)
-
-            DS4_Q2_DOT_NOSHIFT(0);
-            DS4_Q2_DOT_SHIFT(2, 2);
-            DS4_Q2_DOT_SHIFT(4, 4);
-            DS4_Q2_DOT_SHIFT(6, 6);
-            is += 8;
-
-#undef DS4_Q2_DOT_NOSHIFT
-#undef DS4_Q2_DOT_SHIFT
-        }
-
-        sum += d * (float)isum;
-    }
-
-    *s = sum;
-#else
-    float sumf = 0.0f;
-
-    for (int i = 0; i < nb; i++) {
-        const uint8_t *q2 = x[i].qs;
-        const int8_t *q8 = y[i].qs;
-        const uint8_t *sc = x[i].scales;
-
-        int summs = 0;
-        for (int j = 0; j < 16; j++) {
-            summs += y[i].bsums[j] * (sc[j] >> 4);
-        }
-
-        const float dall = y[i].d * f16_to_f32(x[i].d);
-        const float dmin = y[i].d * f16_to_f32(x[i].dmin);
-
-        int isum = 0;
-        int is = 0;
-        for (int k = 0; k < QK_K / 128; k++) {
-            int shift = 0;
-            for (int j = 0; j < 4; j++) {
-                int d = sc[is++] & 0x0f;
-                int isuml = dot_q2_16(q2, q8, shift);
-                isum += d * isuml;
-
-                d = sc[is++] & 0x0f;
-                isuml = dot_q2_16(q2 + 16, q8 + 16, shift);
-                isum += d * isuml;
-
-                shift += 2;
-                q8 += 32;
-            }
-            q2 += 32;
-        }
-        sumf += dall * (float)isum - dmin * (float)summs;
-    }
-    *s = sumf;
-#endif
-}
-
-static DS4_MAYBE_UNUSED void ds4_vec_dot_iq2_xxs_q8_K(int n, float *s, const block_iq2_xxs *x, const block_q8_K *y) {
-    const int nb = n / QK_K;
-
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-    float sumf = 0.0f;
-
-    for (int i = 0; i < nb; i++) {
-        const float d = f16_to_f32(x[i].d) * y[i].d;
-        const uint16_t *q2 = x[i].qs;
-        const int8_t *q8 = y[i].qs;
-        float sumf1 = 0.0f;
-        float sumf2 = 0.0f;
-
-        for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
-            int8x16x4_t q8b = vld1q_s8_x4(q8);
-            q8 += 64;
-
-            uint32_t aux32[4];
-            memcpy(aux32, q2, sizeof(aux32));
-            q2 += 8;
-            const uint8_t *aux8 = (const uint8_t *)aux32;
-
-            int8x16_t q2u0 = vcombine_s8(vld1_s8((const int8_t *)(iq2xxs_grid + aux8[0])),
-                                          vld1_s8((const int8_t *)(iq2xxs_grid + aux8[1])));
-            int8x16_t q2u1 = vcombine_s8(vld1_s8((const int8_t *)(iq2xxs_grid + aux8[2])),
-                                          vld1_s8((const int8_t *)(iq2xxs_grid + aux8[3])));
-            int8x16_t q2u2 = vcombine_s8(vld1_s8((const int8_t *)(iq2xxs_grid + aux8[8])),
-                                          vld1_s8((const int8_t *)(iq2xxs_grid + aux8[9])));
-            int8x16_t q2u3 = vcombine_s8(vld1_s8((const int8_t *)(iq2xxs_grid + aux8[10])),
-                                          vld1_s8((const int8_t *)(iq2xxs_grid + aux8[11])));
-
-            const int8x16_t q2s0 = vcombine_s8(vld1_s8(iq2xxs_signs[(aux32[1] >>  0) & 127]),
-                                               vld1_s8(iq2xxs_signs[(aux32[1] >>  7) & 127]));
-            const int8x16_t q2s1 = vcombine_s8(vld1_s8(iq2xxs_signs[(aux32[1] >> 14) & 127]),
-                                               vld1_s8(iq2xxs_signs[(aux32[1] >> 21) & 127]));
-            const int8x16_t q2s2 = vcombine_s8(vld1_s8(iq2xxs_signs[(aux32[3] >>  0) & 127]),
-                                               vld1_s8(iq2xxs_signs[(aux32[3] >>  7) & 127]));
-            const int8x16_t q2s3 = vcombine_s8(vld1_s8(iq2xxs_signs[(aux32[3] >> 14) & 127]),
-                                               vld1_s8(iq2xxs_signs[(aux32[3] >> 21) & 127]));
-
-            q2u0 = vmulq_s8(q2u0, q2s0);
-            q2u1 = vmulq_s8(q2u1, q2s1);
-            q2u2 = vmulq_s8(q2u2, q2s2);
-            q2u3 = vmulq_s8(q2u3, q2s3);
-
-            const int32x4_t p1 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), q2u0, q8b.val[0]), q2u1, q8b.val[1]);
-            const int32x4_t p2 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), q2u2, q8b.val[2]), q2u3, q8b.val[3]);
-
-            sumf1 += (float)vaddvq_s32(p1) * (0.5f + (float)(aux32[1] >> 28));
-            sumf2 += (float)vaddvq_s32(p2) * (0.5f + (float)(aux32[3] >> 28));
-        }
-
-        sumf += d * (sumf1 + sumf2);
-    }
-
-    *s = 0.25f * sumf;
-#else
-    uint32_t aux32[2];
-    const uint8_t *aux8 = (const uint8_t *)aux32;
-    float sumf = 0.0f;
-
-    for (int i = 0; i < nb; i++) {
-        const float d = f16_to_f32(x[i].d) * y[i].d;
-        const uint16_t *q2 = x[i].qs;
-        const int8_t *q8 = y[i].qs;
-        int32_t bsum = 0;
-
-        for (int ib32 = 0; ib32 < QK_K / 32; ib32++) {
-            memcpy(aux32, q2, 2 * sizeof(uint32_t));
-            q2 += 4;
-
-            const uint32_t ls = 2 * (aux32[1] >> 28) + 1;
-            int32_t sumi = 0;
-            for (int l = 0; l < 4; l += 2) {
-                const uint32_t sign_idx0 = (aux32[1] >> (7 * l)) & 127;
-                const uint32_t sign_idx1 = (aux32[1] >> (7 * (l + 1))) & 127;
-                sumi += dot_iq2_pair_16(iq2xxs_signed_grid[aux8[l]][sign_idx0],
-                                        iq2xxs_signed_grid[aux8[l + 1]][sign_idx1],
-                                        q8);
-                q8 += 16;
-            }
-            bsum += sumi * (int32_t)ls;
-        }
-        sumf += d * (float)bsum;
-    }
-    *s = 0.125f * sumf;
-#endif
-}
-
-static void ds4_vec_dot_iq2_xxs_pair_q8_K(
-        int n,
-        float *s0,
-        float *s1,
-        const block_iq2_xxs *x0,
-        const block_iq2_xxs *x1,
-        const block_q8_K *y) {
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-    const int nb = n / QK_K;
-    float total0 = 0.0f;
-    float total1 = 0.0f;
-
-    for (int i = 0; i < nb; i++) {
-        const float d0 = f16_to_f32(x0[i].d) * y[i].d;
-        const float d1 = f16_to_f32(x1[i].d) * y[i].d;
-        const uint16_t *q20 = x0[i].qs;
-        const uint16_t *q21 = x1[i].qs;
-        const int8_t *q8 = y[i].qs;
-        float sum01 = 0.0f;
-        float sum02 = 0.0f;
-        float sum11 = 0.0f;
-        float sum12 = 0.0f;
-
-        for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
-            const int8x16x4_t q8b = vld1q_s8_x4(q8);
-            q8 += 64;
-
-            uint32_t aux0[4];
-            uint32_t aux1[4];
-            memcpy(aux0, q20, sizeof(aux0));
-            memcpy(aux1, q21, sizeof(aux1));
-            q20 += 8;
-            q21 += 8;
-            const uint8_t *a0 = (const uint8_t *)aux0;
-            const uint8_t *a1 = (const uint8_t *)aux1;
-
-#define DS4_IQ2_PAIR_DOT(aux, aux8, accum_a, accum_b) do {                                              \
-                int8x16_t u0 = vcombine_s8(vld1_s8((const int8_t *)(iq2xxs_grid + (aux8)[0])),          \
-                                           vld1_s8((const int8_t *)(iq2xxs_grid + (aux8)[1])));          \
-                int8x16_t u1 = vcombine_s8(vld1_s8((const int8_t *)(iq2xxs_grid + (aux8)[2])),          \
-                                           vld1_s8((const int8_t *)(iq2xxs_grid + (aux8)[3])));          \
-                int8x16_t u2 = vcombine_s8(vld1_s8((const int8_t *)(iq2xxs_grid + (aux8)[8])),          \
-                                           vld1_s8((const int8_t *)(iq2xxs_grid + (aux8)[9])));          \
-                int8x16_t u3 = vcombine_s8(vld1_s8((const int8_t *)(iq2xxs_grid + (aux8)[10])),         \
-                                           vld1_s8((const int8_t *)(iq2xxs_grid + (aux8)[11])));         \
-                const int8x16_t sgn0 = vcombine_s8(vld1_s8(iq2xxs_signs[((aux)[1] >>  0) & 127]),       \
-                                                   vld1_s8(iq2xxs_signs[((aux)[1] >>  7) & 127]));      \
-                const int8x16_t sgn1 = vcombine_s8(vld1_s8(iq2xxs_signs[((aux)[1] >> 14) & 127]),       \
-                                                   vld1_s8(iq2xxs_signs[((aux)[1] >> 21) & 127]));      \
-                const int8x16_t sgn2 = vcombine_s8(vld1_s8(iq2xxs_signs[((aux)[3] >>  0) & 127]),       \
-                                                   vld1_s8(iq2xxs_signs[((aux)[3] >>  7) & 127]));      \
-                const int8x16_t sgn3 = vcombine_s8(vld1_s8(iq2xxs_signs[((aux)[3] >> 14) & 127]),       \
-                                                   vld1_s8(iq2xxs_signs[((aux)[3] >> 21) & 127]));      \
-                u0 = vmulq_s8(u0, sgn0);                                                               \
-                u1 = vmulq_s8(u1, sgn1);                                                               \
-                u2 = vmulq_s8(u2, sgn2);                                                               \
-                u3 = vmulq_s8(u3, sgn3);                                                               \
-                const int32x4_t p1 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), u0, q8b.val[0]), u1, q8b.val[1]); \
-                const int32x4_t p2 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), u2, q8b.val[2]), u3, q8b.val[3]); \
-                (accum_a) += (float)vaddvq_s32(p1) * (0.5f + (float)((aux)[1] >> 28));                  \
-                (accum_b) += (float)vaddvq_s32(p2) * (0.5f + (float)((aux)[3] >> 28));                  \
-            } while (0)
-
-            DS4_IQ2_PAIR_DOT(aux0, a0, sum01, sum02);
-            DS4_IQ2_PAIR_DOT(aux1, a1, sum11, sum12);
-
-#undef DS4_IQ2_PAIR_DOT
-        }
-
-        total0 += d0 * (sum01 + sum02);
-        total1 += d1 * (sum11 + sum12);
-    }
-
-    *s0 = 0.25f * total0;
-    *s1 = 0.25f * total1;
-#else
-    ds4_vec_dot_iq2_xxs_q8_K(n, s0, x0, y);
-    ds4_vec_dot_iq2_xxs_q8_K(n, s1, x1, y);
-#endif
-}
-
-typedef struct {
-    ds4_tensor *hc_attn_fn;
-    ds4_tensor *hc_attn_scale;
-    ds4_tensor *hc_attn_base;
-    ds4_tensor *attn_norm;
-    ds4_tensor *attn_q_a;
-    ds4_tensor *attn_q_a_norm;
-    ds4_tensor *attn_q_b;
-    ds4_tensor *attn_kv;
-    ds4_tensor *attn_kv_a_norm;
-    ds4_tensor *attn_sinks;
-    ds4_tensor *attn_output_a;
-    ds4_tensor *attn_output_b;
-    ds4_tensor *attn_compressor_ape;
-    ds4_tensor *attn_compressor_kv;
-    ds4_tensor *attn_compressor_gate;
-    ds4_tensor *attn_compressor_norm;
-    ds4_tensor *indexer_attn_q_b;
-    ds4_tensor *indexer_proj;
-    ds4_tensor *indexer_compressor_ape;
-    ds4_tensor *indexer_compressor_kv;
-    ds4_tensor *indexer_compressor_gate;
-    ds4_tensor *indexer_compressor_norm;
-    ds4_tensor *hc_ffn_fn;
-    ds4_tensor *hc_ffn_scale;
-    ds4_tensor *hc_ffn_base;
-    ds4_tensor *ffn_norm;
-    ds4_tensor *ffn_gate_tid2eid;
-    ds4_tensor *ffn_gate_inp;
-    ds4_tensor *ffn_exp_probs_b;
-    ds4_tensor *ffn_gate_exps;
-    ds4_tensor *ffn_up_exps;
-    ds4_tensor *ffn_down_exps;
-    ds4_tensor *ffn_gate_shexp;
-    ds4_tensor *ffn_up_shexp;
-    ds4_tensor *ffn_down_shexp;
-} ds4_layer_weights;
-
-typedef struct {
-    ds4_tensor *token_embd;
-    ds4_tensor *output_hc_base;
-    ds4_tensor *output_hc_fn;
-    ds4_tensor *output_hc_scale;
-    ds4_tensor *output_norm;
-    ds4_tensor *output;
-    ds4_layer_weights layer[DS4_MAX_LAYER];
-} ds4_weights;
-
-typedef struct {
-    ds4_tensor *e_proj;
-    ds4_tensor *h_proj;
-    ds4_tensor *enorm;
-    ds4_tensor *hnorm;
-    ds4_tensor *norm;
-    ds4_tensor *hc_head_base;
-    ds4_tensor *hc_head_fn;
-    ds4_tensor *hc_head_scale;
-    ds4_layer_weights block;
-} ds4_mtp_weights;
-
-/* 0731 官方 DSpark drafter(块并行 5-token, 共享主模型 embd/lm_head):
- * mtp.0..2 三个完整 V4 层 + main_proj(target-hidden 融合) + confidence/markov 头。
- * 张量由量化器 --mtp-append 注入主 GGUF(v3+); 缺席 ⇒ ready=false, 纯解码不受扰。 */
-#define DS4_DSPARK_MAX_BLOCKS 3
-typedef struct {
-    ds4_tensor *main_proj;
-    ds4_tensor *main_norm;
-    ds4_tensor *confidence_proj;   /* 可缺(置信门) */
-    ds4_tensor *markov_w1;         /* 可缺(块内半自回归头) */
-    ds4_tensor *markov_w2;
-    ds4_tensor *norm;              /* 出口 norm */
-    ds4_tensor *hc_head_base;
-    ds4_tensor *hc_head_fn;
-    ds4_tensor *hc_head_scale;
-    ds4_layer_weights block[DS4_DSPARK_MAX_BLOCKS];
-    int n_blocks;
-    bool ready;
-    const ds4_model *src;      /* drafter 张量所属 model(主 model 或 DS4_DRAFT_GGUF 副文件) */
-    const ds4_model *head_src; /* 出口侧(norm/hc_head_*)张量所属 model: 官方语义 drafter 复用
-                                * 主模型 head(self.mtp[-1].head = self.head), checkpoint 的
-                                * mtp.* 命名空间不含这些 ⇒ 独立 drafter 文件时从主模型借 */
-} ds4_dspark_weights;
-
+/* core_engine_open.c — 拆分中间态: 批次尚未切出的切片仍并在本文件(自 ds4.c). */
+#include "core_internal.h"
 /* =========================================================================
  * Fixed Weight Binding and Model Validation.
  * =========================================================================
@@ -3240,7 +10,7 @@ typedef struct {
  * lookup.  Shape validation is intentionally strict.
  */
 
-static uint32_t required_u32(const ds4_model *m, const char *key) {
+uint32_t required_u32(const ds4_model *m, const char *key) {
     uint32_t v = 0;
     if (!model_get_u32(m, key, &v)) {
         fprintf(stderr, "ds4: required metadata key is missing: %s\n", key);
@@ -3249,7 +19,7 @@ static uint32_t required_u32(const ds4_model *m, const char *key) {
     return v;
 }
 
-static float required_f32(const ds4_model *m, const char *key) {
+float required_f32(const ds4_model *m, const char *key) {
     float v = 0.0f;
     if (!model_get_f32_compat(m, key, &v)) {
         fprintf(stderr, "ds4: required metadata key is missing: %s\n", key);
@@ -3258,7 +28,7 @@ static float required_f32(const ds4_model *m, const char *key) {
     return v;
 }
 
-static bool required_bool(const ds4_model *m, const char *key) {
+bool required_bool(const ds4_model *m, const char *key) {
     bool v = false;
     if (!model_get_bool(m, key, &v)) {
         fprintf(stderr, "ds4: required metadata key is missing: %s\n", key);
@@ -3276,14 +46,14 @@ static ds4_tensor *required_tensor(const ds4_model *m, const char *name) {
     return t;
 }
 
-static ds4_tensor *tensor_by_namef(const ds4_model *m, const char *fmt, uint32_t layer) {
+ds4_tensor *tensor_by_namef(const ds4_model *m, const char *fmt, uint32_t layer) {
     char name[128];
     int n = snprintf(name, sizeof(name), fmt, layer);
     if (n < 0 || (size_t)n >= sizeof(name)) ds4_die("tensor name is too long");
     return model_find_tensor(m, name);
 }
 
-static ds4_tensor *required_tensorf(const ds4_model *m, const char *fmt, uint32_t layer) {
+ds4_tensor *required_tensorf(const ds4_model *m, const char *fmt, uint32_t layer) {
     char name[128];
     int n = snprintf(name, sizeof(name), fmt, layer);
     if (n < 0 || (size_t)n >= sizeof(name)) ds4_die("tensor name is too long");
@@ -3364,7 +134,7 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
     return 0;
 }
 
-static DS4_MAYBE_UNUSED uint64_t routed_expert_row_bytes(const ds4_tensor *t) {
+DS4_MAYBE_UNUSED uint64_t routed_expert_row_bytes(const ds4_tensor *t) {
     if ((t->dim[0] % QK_K) != 0) ds4_die("routed expert row is not QK_K aligned");
     return (t->dim[0] / QK_K) * routed_expert_block_bytes(t->type);
 }
@@ -3416,19 +186,19 @@ static void tensor_expect_routed_expert(
  * 不再入文件, 专家维度/量化类型/偏移改由这些 helper 供给 — gate 在场走原值(所有旧文件
  * 字节不变), 缺席(内嵌 VQ)时维度取自 down 张量(in=down.dim[1], mid=down.dim[0]),
  * 类型按 GO1B 报(dispatch 走 batch mm_id 路 = VQ 消费端所在), 偏移 0(do_vq 不读)。 */
-static uint64_t routed_expert_in_dim(const ds4_layer_weights *l) {
+uint64_t routed_expert_in_dim(const ds4_layer_weights *l) {
     return l->ffn_gate_exps ? l->ffn_gate_exps->dim[0] : l->ffn_down_exps->dim[1];
 }
-static uint64_t routed_expert_mid_dim(const ds4_layer_weights *l) {
+uint64_t routed_expert_mid_dim(const ds4_layer_weights *l) {
     return l->ffn_gate_exps ? l->ffn_gate_exps->dim[1] : l->ffn_down_exps->dim[0];
 }
-static uint32_t routed_expert_quant_type(const ds4_layer_weights *l) {
+uint32_t routed_expert_quant_type(const ds4_layer_weights *l) {
     return l->ffn_gate_exps ? l->ffn_gate_exps->type : (uint32_t)DS4_TENSOR_GO1B;
 }
-static uint64_t routed_expert_gate_off(const ds4_layer_weights *l) {
+uint64_t routed_expert_gate_off(const ds4_layer_weights *l) {
     return l->ffn_gate_exps ? l->ffn_gate_exps->abs_offset : 0;
 }
-static uint64_t routed_expert_up_off(const ds4_layer_weights *l) {
+uint64_t routed_expert_up_off(const ds4_layer_weights *l) {
     return l->ffn_up_exps ? l->ffn_up_exps->abs_offset : 0;
 }
 
@@ -3440,7 +210,7 @@ static uint64_t routed_expert_up_off(const ds4_layer_weights *l) {
  * 解引用语义完全不变, 不必逐点加 NULL 判(那种改法漏一处就是运行期空指针)。
  * 唯一真去读 down 字节的是 VQ gather 的冷-w2-回退分支(blob 槽为 0 时从 base go1b 展开
  * ±d), 那里按 down_expert_bytes==0 硬失败, 不静默降级成垃圾权重。 */
-static ds4_tensor *routed_down_shadow(uint32_t il) {
+ds4_tensor *routed_down_shadow(uint32_t il) {
     static ds4_tensor *shadow;      /* [DS4_N_LAYER]; DS4_N_LAYER 是运行期形状, 故堆分配 */
     static char (*names)[40];
     if (!shadow) {
@@ -3483,7 +253,7 @@ static void tensor_expect_f16_q2(const ds4_model *m, ds4_tensor *t, uint64_t d0,
     }
 }
 
-static void weights_validate_layout(const ds4_model *m, const ds4_weights *w) {
+void weights_validate_layout(const ds4_model *m, const ds4_weights *w) {
     const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
     const uint64_t hc_mix_dim = 2u * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
@@ -3566,6 +336,80 @@ static void weights_validate_layout(const ds4_model *m, const ds4_weights *w) {
         }
     }
 }
+
+static const ds4_shape DS4_SHAPE_FLASH = {
+    .name = "DeepSeek V4 Flash",
+    .variant = DS4_VARIANT_FLASH,
+    .n_layer = 43,
+    .n_embd = 4096,
+    .n_vocab = 129280,
+    .n_head = 64,
+    .n_head_kv = 1,
+    .n_head_dim = 512,
+    .n_value_dim = 512,
+    .n_rot = 64,
+    .n_out_group = 8,
+    .n_lora_q = 1024,
+    .n_lora_o = 1024,
+    .n_expert = 256,
+    .n_expert_used = 6,
+    .n_expert_shared = 1,
+    .n_ff_exp = 2048,
+    .n_hash_layer = 3,
+    .n_swa = 128,
+    .n_indexer_head = 64,
+    .n_indexer_head_dim = 128,
+    .n_indexer_top_k = 512,
+    .n_hc = 4,
+    .n_hc_sinkhorn_iter = 20,
+    .rms_eps = DS4_DEFAULT_RMS_EPS,
+    .hc_eps = DS4_DEFAULT_HC_EPS,
+    .expert_weight_scale = 1.5f,
+    .swiglu_clamp_exp = DS4_DEFAULT_SWIGLU_CLAMP_EXP,
+    .rope_freq_base = DS4_DEFAULT_ROPE_FREQ_BASE,
+    .rope_scale_factor = DS4_DEFAULT_ROPE_SCALE_FACTOR,
+    .rope_yarn_beta_fast = DS4_DEFAULT_ROPE_YARN_BETA_FAST,
+    .rope_yarn_beta_slow = DS4_DEFAULT_ROPE_YARN_BETA_SLOW,
+    .compress_rope_freq_base = DS4_DEFAULT_COMPRESS_ROPE_FREQ_BASE,
+    .rope_orig_ctx = DS4_DEFAULT_ROPE_ORIG_CTX,
+};
+
+static const ds4_shape DS4_SHAPE_PRO = {
+    .name = "DeepSeek V4 Pro",
+    .variant = DS4_VARIANT_PRO,
+    .n_layer = 61,
+    .n_embd = 7168,
+    .n_vocab = 129280,
+    .n_head = 128,
+    .n_head_kv = 1,
+    .n_head_dim = 512,
+    .n_value_dim = 512,
+    .n_rot = 64,
+    .n_out_group = 16,
+    .n_lora_q = 1536,
+    .n_lora_o = 1024,
+    .n_expert = 384,
+    .n_expert_used = 6,
+    .n_expert_shared = 1,
+    .n_ff_exp = 3072,
+    .n_hash_layer = 3,
+    .n_swa = 128,
+    .n_indexer_head = 64,
+    .n_indexer_head_dim = 128,
+    .n_indexer_top_k = 1024,
+    .n_hc = 4,
+    .n_hc_sinkhorn_iter = 20,
+    .rms_eps = DS4_DEFAULT_RMS_EPS,
+    .hc_eps = DS4_DEFAULT_HC_EPS,
+    .expert_weight_scale = 2.5f,
+    .swiglu_clamp_exp = DS4_DEFAULT_SWIGLU_CLAMP_EXP,
+    .rope_freq_base = DS4_DEFAULT_ROPE_FREQ_BASE,
+    .rope_scale_factor = DS4_DEFAULT_ROPE_SCALE_FACTOR,
+    .rope_yarn_beta_fast = DS4_DEFAULT_ROPE_YARN_BETA_FAST,
+    .rope_yarn_beta_slow = DS4_DEFAULT_ROPE_YARN_BETA_SLOW,
+    .compress_rope_freq_base = DS4_DEFAULT_COMPRESS_ROPE_FREQ_BASE,
+    .rope_orig_ctx = DS4_DEFAULT_ROPE_ORIG_CTX,
+};
 
 static bool ds4_shape_matches_metadata(
         const ds4_shape *s,
@@ -3767,7 +611,7 @@ static void config_validate_fixed_shape(uint32_t n_layer) {
 
 /* Validate metadata values that affect semantics: attention shape, HC count,
  * expert routing, RoPE scaling, compression ratios, and SwiGLU clamp. */
-static void config_validate_model(const ds4_model *m) {
+void config_validate_model(const ds4_model *m) {
     const uint32_t n_layer = required_u32(m, "deepseek4.block_count");
     const uint32_t n_embd = required_u32(m, "deepseek4.embedding_length");
     const uint32_t n_vocab = required_u32(m, "deepseek4.vocab_size");
@@ -3887,11 +731,8 @@ static ds4_tensor *dspark_tensorf(const ds4_model *m, const char *fmt, uint32_t 
     return tensor_by_namef(m, fmt, blk);
 }
 
-#define DS4_DSPARK_WIN   128u
-#define DS4_DSPARK_BLK   5u
-#define DS4_DSPARK_NOISE 128799
-static int g_dspark_ready_global = 0;   /* engine open 后置; graph alloc 统一消费 */
-static const ds4_dspark_weights *g_dspark_bound_for_prefill = NULL;   /* prefill 建窗弱引用 */
+int g_dspark_ready_global = 0;   /* engine open 后置; graph alloc 统一消费 */
+const ds4_dspark_weights *g_dspark_bound_for_prefill = NULL;   /* prefill 建窗弱引用 */
 
 static void dspark_weights_bind(ds4_dspark_weights *w, const ds4_model *m) {
     memset(w, 0, sizeof(*w));
@@ -3951,8 +792,8 @@ static void dspark_weights_bind(ds4_dspark_weights *w, const ds4_model *m) {
 /* DS4_DRAFT_GGUF(2026-08-20): 独立 drafter gguf(官方开源 DSpark 量化版形态, 仅 mtp.*)
  * 挂在主模型旁。主模型自带 mtp.* 时优先; 副 model 懒加载单例, 进程生命周期持有。
  * CUDA (map,offset)→device 解析按 host_base 区分文件, 第二 mmap 天然可用。 */
-static ds4_model *g_draft_model = NULL;
-static void dspark_bind_with_draft(ds4_dspark_weights *w, const ds4_model *m, bool graph_backend) {
+ds4_model *g_draft_model = NULL;
+void dspark_bind_with_draft(ds4_dspark_weights *w, const ds4_model *m, bool graph_backend) {
     dspark_weights_bind(w, m);
     if (w->ready) { w->src = m; w->head_src = m; return; }
     const char *p = getenv("DS4_DRAFT_GGUF");
@@ -3985,7 +826,7 @@ static void dspark_bind_with_draft(ds4_dspark_weights *w, const ds4_model *m, bo
     if (!w->ready) fprintf(stderr, "ds4: draft gguf has no usable mtp.* tensors: %s\n", p);
 }
 
-static void weights_bind(ds4_weights *w, const ds4_model *m) {
+void weights_bind(ds4_weights *w, const ds4_model *m) {
     memset(w, 0, sizeof(*w));
     /* Head tensors are optional so a sharded per-machine slice can hold only the
      * half it needs: the coordinator (first slice) carries token_embd, the last
@@ -4066,17 +907,6 @@ static void weights_bind(ds4_weights *w, const ds4_model *m) {
     weights_validate_layout(m, w);
 }
 
-typedef struct {
-    uint64_t off;
-    uint64_t end;
-} ds4_model_map_span;
-
-typedef struct {
-    ds4_model_map_span *v;
-    uint32_t len;
-    uint32_t cap;
-    uint64_t max_tensor_bytes;
-} ds4_model_map_span_vec;
 
 static void model_map_span_include_tensor(
         const ds4_tensor *t,
@@ -4165,7 +995,7 @@ static int model_map_span_cmp(const void *a, const void *b) {
     return 0;
 }
 
-static DS4_MAYBE_UNUSED bool weights_model_map_spans(
+DS4_MAYBE_UNUSED bool weights_model_map_spans(
         const ds4_weights *w,
         uint32_t layer_start,
         uint32_t layer_end,
@@ -4284,7 +1114,7 @@ static void model_map_span_vec_sort_dedupe_exact(ds4_model_map_span_vec *spans) 
 /* Build the backbone (resident) and routed-expert (reclaimable) span lists for a
  * reduced-memory Metal load. Returns false if either list is empty or sizes look
  * wrong; the caller then falls back to the whole-tensor-data range loader. */
-static bool weights_model_map_spans_split(
+bool weights_model_map_spans_split(
         const ds4_weights *w,
         ds4_model_map_span_vec *backbone,
         ds4_model_map_span_vec *experts) {
@@ -4309,7 +1139,7 @@ static bool weights_model_map_spans_split(
     return true;
 }
 
-static bool weights_model_map_spans_split_slice(
+bool weights_model_map_spans_split_slice(
         const ds4_weights *w,
         uint32_t layer_start,
         uint32_t layer_end,
@@ -4343,7 +1173,7 @@ static bool weights_model_map_spans_split_slice(
     return true;
 }
 
-static void weights_free(ds4_weights *w) {
+void weights_free(ds4_weights *w) {
     memset(w, 0, sizeof(*w));
 }
 
@@ -4372,7 +1202,7 @@ static void deq_q2K_row_f32(const uint8_t *row, uint64_t nblk, float *out) {
     }
 }
 
-static void embed_token_f16(const ds4_model *m, const ds4_weights *w, int token, float *out) {
+void embed_token_f16(const ds4_model *m, const ds4_weights *w, int token, float *out) {
     ds4_tensor *te = w->token_embd;
     if (token < 0 || (uint64_t)token >= te->dim[1]) {
         ds4_die("token id is outside the embedding table");
@@ -4395,7 +1225,7 @@ static void embed_token_f16(const ds4_model *m, const ds4_weights *w, int token,
 }
 
 /* RMSNorm without a learned scale, used by hyper-connection control vectors. */
-static void rms_norm_no_weight(float *out, const float *x, uint64_t n, float eps) {
+void rms_norm_no_weight(float *out, const float *x, uint64_t n, float eps) {
     double ss = 0.0;
     for (uint64_t i = 0; i < n; i++) ss += (double)x[i] * x[i];
 
@@ -4404,7 +1234,7 @@ static void rms_norm_no_weight(float *out, const float *x, uint64_t n, float eps
 }
 
 /* Standard DS4 RMSNorm with learned per-channel scale. */
-static void rms_norm_weight(float *out, const float *x, const float *weight, uint64_t n, float eps) {
+void rms_norm_weight(float *out, const float *x, const float *weight, uint64_t n, float eps) {
     double ss = 0.0;
     for (uint64_t i = 0; i < n; i++) ss += (double)x[i] * x[i];
 
@@ -4413,7 +1243,7 @@ static void rms_norm_weight(float *out, const float *x, const float *weight, uin
 }
 
 /* Normalize each attention head independently after Q projection. */
-static void head_rms_norm_inplace(float *x, uint32_t n_head, uint32_t head_dim, float eps) {
+void head_rms_norm_inplace(float *x, uint32_t n_head, uint32_t head_dim, float eps) {
     for (uint32_t h = 0; h < n_head; h++) {
         float *head = x + (uint64_t)h * head_dim;
         double ss = 0.0;
@@ -4423,13 +1253,6 @@ static void head_rms_norm_inplace(float *x, uint32_t n_head, uint32_t head_dim, 
         for (uint32_t i = 0; i < head_dim; i++) head[i] *= scale;
     }
 }
-
-typedef struct {
-    float *out;
-    const uint16_t *data;
-    const float *x;
-    uint64_t in_dim;
-} matvec_f16_ctx;
 
 static inline float dot_f16_row(const uint16_t *row, const float *x, uint64_t n) {
 #if defined(__ARM_NEON)
@@ -4464,7 +1287,7 @@ static void matvec_f16_worker(void *vctx, uint64_t row0, uint64_t row1) {
 }
 
 /* Dense F16 matvec for small control projections such as HC and router heads. */
-static void matvec_f16(float *out, const ds4_model *m, const ds4_tensor *w, const float *x) {
+void matvec_f16(float *out, const ds4_model *m, const ds4_tensor *w, const float *x) {
     if (w->type != 1 || w->ndim != 2) ds4_die("expected a 2D F16 tensor");
 
     const uint64_t in_dim = w->dim[0];
@@ -4481,7 +1304,7 @@ static void matvec_f16(float *out, const ds4_model *m, const ds4_tensor *w, cons
     ds4_parallel_for_min_rows(out_dim, matvec_f16_worker, &ctx, min_rows);
 }
 
-static void matvec_f16_serial(float *out, const ds4_model *m, const ds4_tensor *w, const float *x) {
+void matvec_f16_serial(float *out, const ds4_model *m, const ds4_tensor *w, const float *x) {
     if (w->type != 1 || w->ndim != 2) ds4_die("expected a 2D F16 tensor");
 
     const uint64_t in_dim = w->dim[0];
@@ -4492,80 +1315,6 @@ static void matvec_f16_serial(float *out, const ds4_model *m, const ds4_tensor *
     }
 }
 
-typedef struct {
-    float *out;
-    const uint8_t *data;
-    const int8_t *xq;
-    const float *xscale;
-    uint64_t in_dim;
-    uint64_t row0;
-    uint64_t blocks;
-} matvec_q8_0_ctx;
-
-typedef struct {
-    float *out0;
-    float *out1;
-    const uint8_t *data0;
-    const uint8_t *data1;
-    const int8_t *xq;
-    const float *xscale;
-    uint64_t in_dim;
-    uint64_t blocks;
-} matvec_q8_0_pair_ctx;
-
-typedef struct {
-    float *out;
-    const uint8_t *data;
-    const int8_t *xq;
-    const float *xscale;
-    uint64_t in_dim;
-    uint64_t blocks;
-    uint64_t rank;
-} matvec_q8_0_grouped_ctx;
-
-typedef struct {
-    float *out;
-    const uint8_t *data;
-    const int8_t *xq;
-    const float *xscale;
-    uint64_t n_tok;
-    uint64_t n_groups;
-    uint64_t group_dim;
-    uint64_t blocks;
-    uint64_t rank;
-} matmul_q8_0_grouped_batch_ctx;
-
-typedef struct {
-    float *out;
-    const uint8_t *data;
-    const int8_t *xq;
-    const float *xscale;
-    uint64_t n_tok;
-    uint64_t in_dim;
-    uint64_t out_dim;
-    uint64_t blocks;
-} matmul_q8_0_batch_ctx;
-
-typedef struct {
-    float *out0;
-    float *out1;
-    const uint8_t *data0;
-    const uint8_t *data1;
-    const int8_t *xq;
-    const float *xscale;
-    uint64_t n_tok;
-    uint64_t in_dim;
-    uint64_t out_dim;
-    uint64_t blocks;
-} matmul_q8_0_pair_batch_ctx;
-
-typedef struct {
-    const float *x;
-    int8_t *xq;
-    float *xscale;
-    uint64_t in_dim;
-    uint64_t blocks;
-} quantize_q8_0_batch_ctx;
 
 static inline int32_t dot_i8_32(const int8_t *a, const int8_t *b, uint64_t n) {
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
@@ -4818,7 +1567,7 @@ static inline DS4_MAYBE_UNUSED void dot_q8_0_row_pair(
     *out1 = acc1;
 }
 
-static void quantize_q8_0_activation(const float *x, int8_t *xq, float *scale, uint64_t n) {
+void quantize_q8_0_activation(const float *x, int8_t *xq, float *scale, uint64_t n) {
     const uint64_t blocks = (n + 31) / 32;
     for (uint64_t b = 0; b < blocks; b++) {
         const uint64_t i0 = b * 32;
@@ -4853,7 +1602,7 @@ static void quantize_q8_0_batch_worker(void *vctx, uint64_t t0, uint64_t t1) {
     }
 }
 
-static void quantize_q8_0_activation_batch(
+void quantize_q8_0_activation_batch(
         const float *x,
         int8_t      *xq,
         float       *xscale,
@@ -4869,7 +1618,7 @@ static void quantize_q8_0_activation_batch(
     ds4_parallel_for(n_tok, quantize_q8_0_batch_worker, &ctx);
 }
 
-static void matvec_q8_0_worker(void *vctx, uint64_t r0, uint64_t r1) {
+void matvec_q8_0_worker(void *vctx, uint64_t r0, uint64_t r1) {
     matvec_q8_0_ctx *ctx = vctx;
 
     for (uint64_t r = r0; r < r1; r++) {
@@ -4879,7 +1628,7 @@ static void matvec_q8_0_worker(void *vctx, uint64_t r0, uint64_t r1) {
     }
 }
 
-static void matvec_q8_0_pair_worker(void *vctx, uint64_t r0, uint64_t r1) {
+void matvec_q8_0_pair_worker(void *vctx, uint64_t r0, uint64_t r1) {
     matvec_q8_0_pair_ctx *ctx = vctx;
 
     for (uint64_t r = r0; r < r1; r++) {
@@ -4890,7 +1639,7 @@ static void matvec_q8_0_pair_worker(void *vctx, uint64_t r0, uint64_t r1) {
     }
 }
 
-static void matvec_q8_0_grouped_worker(void *vctx, uint64_t r0, uint64_t r1) {
+void matvec_q8_0_grouped_worker(void *vctx, uint64_t r0, uint64_t r1) {
     matvec_q8_0_grouped_ctx *ctx = vctx;
 
     for (uint64_t idx = r0; idx < r1; idx++) {
@@ -4904,7 +1653,7 @@ static void matvec_q8_0_grouped_worker(void *vctx, uint64_t r0, uint64_t r1) {
     }
 }
 
-static void matmul_q8_0_grouped_batch_worker(void *vctx, uint64_t r0, uint64_t r1) {
+void matmul_q8_0_grouped_batch_worker(void *vctx, uint64_t r0, uint64_t r1) {
     matmul_q8_0_grouped_batch_ctx *ctx = vctx;
 
     for (uint64_t idx = r0; idx < r1; idx++) {
@@ -4939,7 +1688,7 @@ static void matmul_q8_0_grouped_batch_worker(void *vctx, uint64_t r0, uint64_t r
     }
 }
 
-static void matmul_q8_0_batch_worker(void *vctx, uint64_t r0, uint64_t r1) {
+void matmul_q8_0_batch_worker(void *vctx, uint64_t r0, uint64_t r1) {
     matmul_q8_0_batch_ctx *ctx = vctx;
 
     for (uint64_t r = r0; r < r1; r++) {
@@ -4967,7 +1716,7 @@ static void matmul_q8_0_batch_worker(void *vctx, uint64_t r0, uint64_t r1) {
     }
 }
 
-static void matmul_q8_0_pair_batch_worker(void *vctx, uint64_t r0, uint64_t r1) {
+void matmul_q8_0_pair_batch_worker(void *vctx, uint64_t r0, uint64_t r1) {
     matmul_q8_0_pair_batch_ctx *ctx = vctx;
 
     for (uint64_t r = r0; r < r1; r++) {
@@ -5036,7 +1785,7 @@ static DS4_MAYBE_UNUSED void matvec_q8_0_prequant(
 
 /* Compute two Q8_0 projections from the same input, used by gate/up and
  * compressor kv/score pairs. */
-static void matvec_q8_0_pair_prequant(
+void matvec_q8_0_pair_prequant(
         float           * out0,
         float           * out1,
         const ds4_model * m,
@@ -5120,7 +1869,7 @@ static void matmul_q8_0_pair_batch_prequant(
 
 /* Batched Q8_0 matmul for prefill: quantize all token activations, then scan
  * weight rows once per output channel. */
-static void matmul_q8_0_batch(
+void matmul_q8_0_batch(
         float           * out,
         const ds4_model * m,
         const ds4_tensor * w,
@@ -5140,7 +1889,7 @@ static void matmul_q8_0_batch(
     free(xq);
 }
 
-static void matmul_q8_0_pair_batch(
+void matmul_q8_0_pair_batch(
         float           * out0,
         float           * out1,
         const ds4_model * m,
@@ -5189,11 +1938,10 @@ static void matvec_q8_0_rows(
 }
 
 /* Single-token Q8_0 matvec, used heavily in decode. */
-static void matvec_q8_0(float *out, const ds4_model *m, const ds4_tensor *w, const float *x) {
+void matvec_q8_0(float *out, const ds4_model *m, const ds4_tensor *w, const float *x) {
     matvec_q8_0_rows(out, m, w, x, 0, w->dim[1]);
 }
 
-static void matvec_any(float *out, const ds4_model *m, const ds4_tensor *w, const float *x);
 
 /* Decode scratch owns this temporary activation quantization so generation
  * can assert that the hot path performs no malloc. */
@@ -5205,7 +1953,7 @@ static void cpu_decode_quantize_q8_0(
     quantize_q8_0_activation(x, scratch->q8_xq, scratch->q8_xscale, in_dim);
 }
 
-static void matvec_q8_0_decode_scratch(
+void matvec_q8_0_decode_scratch(
         float                  * out,
         const ds4_model        * m,
         const ds4_tensor       * w,
@@ -5215,7 +1963,7 @@ static void matvec_q8_0_decode_scratch(
     matvec_q8_0_prequant(out, m, w, scratch->q8_xq, scratch->q8_xscale);
 }
 
-static void matvec_q8_0_pair_decode_scratch(
+void matvec_q8_0_pair_decode_scratch(
         float                  * out0,
         float                  * out1,
         const ds4_model        * m,
@@ -5227,7 +1975,7 @@ static void matvec_q8_0_pair_decode_scratch(
     matvec_q8_0_pair_prequant(out0, out1, m, w0, w1, scratch->q8_xq, scratch->q8_xscale);
 }
 
-static void matvec_any_decode_scratch(
+void matvec_any_decode_scratch(
         float                  * out,
         const ds4_model        * m,
         const ds4_tensor       * w,
@@ -5240,7 +1988,7 @@ static void matvec_any_decode_scratch(
     }
 }
 
-static void matvec_q8_0_grouped_rows(
+void matvec_q8_0_grouped_rows(
         float           * out,
         const ds4_model * m,
         const ds4_tensor * w,
@@ -5279,7 +2027,7 @@ static void matvec_q8_0_grouped_rows(
     free(xq);
 }
 
-static void matvec_q8_0_grouped_rows_decode_scratch(
+void matvec_q8_0_grouped_rows_decode_scratch(
         float                  * out,
         const ds4_model        * m,
         const ds4_tensor       * w,
@@ -5316,7 +2064,7 @@ static void matvec_q8_0_grouped_rows_decode_scratch(
     ds4_parallel_for((uint64_t)n_groups * rank, matvec_q8_0_grouped_worker, &ctx);
 }
 
-static void matmul_q8_0_grouped_batch(
+void matmul_q8_0_grouped_batch(
         float           * out,
         const ds4_model * m,
         const ds4_tensor * w,
@@ -5394,7 +2142,7 @@ static void matvec_f32(float *out, const ds4_model *m, const ds4_tensor *w, cons
 }
 
 /* Dispatch for dense F32/F16/Q8_0 tensors used by auxiliary projections. */
-static void matvec_any(float *out, const ds4_model *m, const ds4_tensor *w, const float *x) {
+void matvec_any(float *out, const ds4_model *m, const ds4_tensor *w, const float *x) {
     switch (w->type) {
     case 0: matvec_f32(out, m, w, x); break;
     case 1: matvec_f16(out, m, w, x); break;
@@ -5404,7 +2152,7 @@ static void matvec_any(float *out, const ds4_model *m, const ds4_tensor *w, cons
     }
 }
 
-static float tensor_1d_value(const ds4_model *m, const ds4_tensor *t, uint64_t i) {
+float tensor_1d_value(const ds4_model *m, const ds4_tensor *t, uint64_t i) {
     if (i >= t->elements) ds4_die("tensor scalar index is out of bounds");
     if (t->type == 0) {
         const float *p = tensor_data(m, t);
@@ -5418,7 +2166,7 @@ static float tensor_1d_value(const ds4_model *m, const ds4_tensor *t, uint64_t i
     return 0.0f;
 }
 
-static float tensor_2d_value(const ds4_model *m, const ds4_tensor *t, uint64_t x, uint64_t y) {
+float tensor_2d_value(const ds4_model *m, const ds4_tensor *t, uint64_t x, uint64_t y) {
     if (t->ndim != 2 || x >= t->dim[0] || y >= t->dim[1]) {
         ds4_die("tensor 2D index is out of bounds");
     }
@@ -5426,7 +2174,7 @@ static float tensor_2d_value(const ds4_model *m, const ds4_tensor *t, uint64_t x
 }
 
 /* Locate one expert's 2D matrix inside a 3D GGUF expert tensor. */
-static const uint8_t *tensor_expert_bytes(
+const uint8_t *tensor_expert_bytes(
         const ds4_model  *m,
         const ds4_tensor *w,
         uint32_t          expert,
@@ -5470,7 +2218,7 @@ static void matvec_iq2_xxs_pair_worker(void *vctx, uint64_t row0, uint64_t row1)
 
 /* Project one routed expert's gate and up matrices.  Both are IQ2_XXS and
  * share the same Q8_K activation. */
-static void matvec_iq2_xxs_expert_pair_prequant(
+void matvec_iq2_xxs_expert_pair_prequant(
         float            *out0,
         float            *out1,
         const ds4_model  *m,
@@ -5500,7 +2248,6 @@ static void matvec_iq2_xxs_expert_pair_prequant(
     ds4_parallel_for(out_dim0, matvec_iq2_xxs_pair_worker, &ctx);
 }
 
-static float silu(float x);
 
 typedef struct {
     float *mid;
@@ -5540,7 +2287,7 @@ static void matvec_iq2_xxs_mid_worker(void *vctx, uint64_t row0, uint64_t row1) 
 
 /* Build all selected expert hidden vectors: IQ2_XXS gate/up, clamp, SwiGLU,
  * and router weight.  The down projection runs later on the quantized mids. */
-static void matvec_iq2_xxs_experts_mid_prequant(
+void matvec_iq2_xxs_experts_mid_prequant(
         float            *mid,
         const ds4_model  *m,
         const ds4_tensor *gate_w,
@@ -5604,7 +2351,7 @@ static void matvec_q2_k_worker(void *vctx, uint64_t row0, uint64_t row1) {
 }
 
 /* Single expert Q2_K down projection, kept mostly for tracing and diagnostics. */
-static void matvec_q2_k_expert(
+void matvec_q2_k_expert(
         float            *out,
         const ds4_model  *m,
         const ds4_tensor *w,
@@ -5657,7 +2404,7 @@ static void matvec_q2_k_accum_worker(void *vctx, uint64_t row0, uint64_t row1) {
 
 /* Accumulate all selected experts' Q2_K down projections directly into the
  * 4096-wide MoE output. */
-static void matvec_q2_k_experts_accum_prequant(
+void matvec_q2_k_experts_accum_prequant(
         float            *out,
         const ds4_model  *m,
         const ds4_tensor *w,
@@ -5699,30 +2446,8 @@ static void matvec_q2_k_experts_accum_prequant(
     ds4_parallel_for(out_dim0, matvec_q2_k_accum_worker, &ctx);
 }
 
-typedef struct {
-    uint32_t token;
-    uint32_t slot;
-} ds4_expert_pair;
 
-typedef struct {
-    float *mid;
-    const uint8_t *gate_base[DS4_MAX_EXPERT];
-    const uint8_t *up_base[DS4_MAX_EXPERT];
-    const block_q8_K *xq;
-    const ds4_expert_pair *pairs;
-    const uint32_t *pair_ids;
-    const uint32_t *expert_offset;
-    const uint32_t *active_expert;
-    const float *pair_weight;
-    float clamp;
-    uint64_t in_dim;
-    uint64_t out_dim;
-    uint64_t gate_row_bytes[DS4_MAX_EXPERT];
-    uint64_t up_row_bytes[DS4_MAX_EXPERT];
-    uint64_t xq_blocks;
-} matvec_iq2_xxs_batch_mid_ctx;
-
-static void matvec_iq2_xxs_batch_mid_worker(void *vctx, uint64_t task0, uint64_t task1) {
+void matvec_iq2_xxs_batch_mid_worker(void *vctx, uint64_t task0, uint64_t task1) {
     matvec_iq2_xxs_batch_mid_ctx *ctx = vctx;
 
     for (uint64_t task = task0; task < task1; task++) {
@@ -5755,14 +2480,8 @@ static void matvec_iq2_xxs_batch_mid_worker(void *vctx, uint64_t task0, uint64_t
     }
 }
 
-typedef struct {
-    const float *mid;
-    block_q8_K *midq;
-    uint64_t down_in_dim;
-    uint64_t down_blocks;
-} quantize_mid_pairs_ctx;
 
-static void quantize_mid_pairs_worker(void *vctx, uint64_t p0, uint64_t p1) {
+void quantize_mid_pairs_worker(void *vctx, uint64_t p0, uint64_t p1) {
     quantize_mid_pairs_ctx *ctx = vctx;
     for (uint64_t p = p0; p < p1; p++) {
         ds4_quantize_row_q8_K(ctx->mid + p * ctx->down_in_dim,
@@ -5805,23 +2524,8 @@ static DS4_MAYBE_UNUSED void matvec_q2_k_batch_down_worker(void *vctx, uint64_t 
     }
 }
 
-typedef struct {
-    float *moe;
-    const uint8_t *base[DS4_MAX_EXPERT];
-    const block_q8_K *midq;
-    const ds4_expert_pair *pairs;
-    const uint32_t *pair_ids;
-    const uint32_t *expert_offset;
-    const uint32_t *active_expert;
-    uint32_t n_active;
-    uint32_t n_tok;
-    uint64_t in_dim;
-    uint64_t out_dim;
-    uint64_t row_bytes[DS4_MAX_EXPERT];
-    uint64_t midq_blocks;
-} matvec_q2_k_batch_accum_rows_ctx;
 
-static void matvec_q2_k_batch_accum_rows_worker(void *vctx, uint64_t row0, uint64_t row1) {
+void matvec_q2_k_batch_accum_rows_worker(void *vctx, uint64_t row0, uint64_t row1) {
     matvec_q2_k_batch_accum_rows_ctx *ctx = vctx;
 
     for (uint64_t row = row0; row < row1; row++) {
@@ -5962,7 +2666,7 @@ static void hc_split_sinkhorn_one(
 
 /* Reduce the four HC streams into the plain embedding vector consumed by a
  * normal attention or FFN sublayer. */
-static void hc_weighted_sum_one(
+void hc_weighted_sum_one(
         float       * out,
         const float * x,
         const float * weights,
@@ -5979,7 +2683,7 @@ static void hc_weighted_sum_one(
 
 /* HC pre step for one token.  It normalizes the HC state, projects the control
  * vector, runs the Sinkhorn split, and emits the sublayer input plus post data. */
-static void hc_pre_from_state_one_scratch(
+void hc_pre_from_state_one_scratch(
         const ds4_model   * model,
         const ds4_tensor  * fn,
         const ds4_tensor  * scale_tensor,
@@ -6012,7 +2716,7 @@ static void hc_pre_from_state_one_scratch(
     memcpy(comb, split + 2 * n_hc, n_hc * n_hc * sizeof(comb[0]));
 }
 
-static void hc_pre_from_state_one(
+void hc_pre_from_state_one(
         const ds4_model   * model,
         const ds4_tensor  * fn,
         const ds4_tensor  * scale_tensor,
@@ -6031,7 +2735,7 @@ static void hc_pre_from_state_one(
     free(flat);
 }
 
-static void layer_attn_pre_one(
+void layer_attn_pre_one(
         const ds4_model   * model,
         const ds4_layer_weights * layer,
         const float       * token_embd,
@@ -6053,7 +2757,7 @@ static void layer_attn_pre_one(
 }
 
 /* The input embedding starts all HC streams with the same token vector. */
-static void hc_from_plain_embedding(float *out_hc, const float *x, uint32_t n_embd, uint32_t n_hc) {
+void hc_from_plain_embedding(float *out_hc, const float *x, uint32_t n_embd, uint32_t n_hc) {
     for (uint32_t h = 0; h < n_hc; h++) {
         memcpy(out_hc + (uint64_t)h * n_embd, x, (size_t)n_embd * sizeof(x[0]));
     }
@@ -6061,7 +2765,7 @@ static void hc_from_plain_embedding(float *out_hc, const float *x, uint32_t n_em
 
 /* HC post step for one sublayer output.  It injects the new block output and
  * mixes the previous HC streams through the learned combine matrix. */
-static void hc_post_one(
+void hc_post_one(
         float       * out_hc,
         const float * block_out,
         const float * residual_hc,
@@ -6107,7 +2811,7 @@ static void hc_post_batch_worker(void *vctx, uint64_t t0, uint64_t t1) {
     }
 }
 
-static void hc_post_batch(
+void hc_post_batch(
         float       * out_hc,
         const float * block_out,
         const float * residual_hc,
@@ -6164,7 +2868,7 @@ static void hc_post_sum_batch_worker(void *vctx, uint64_t t0, uint64_t t1) {
     }
 }
 
-static void hc_post_sum_batch(
+void hc_post_sum_batch(
         float       * out_hc,
         const float * moe,
         const float * shared,
@@ -6239,7 +2943,7 @@ static void hc_pre_norm_batch_worker(void *vctx, uint64_t t0, uint64_t t1) {
 
 /* Batched HC pre plus RMSNorm.  Prefill uses this to keep the layer-major
  * token batch in contiguous arrays. */
-static void hc_pre_norm_batch(
+void hc_pre_norm_batch(
         const ds4_model  * model,
         const ds4_tensor * fn,
         const ds4_tensor * scale,
@@ -6270,7 +2974,7 @@ static void hc_pre_norm_batch(
     ds4_parallel_for_min_rows(n_tok, hc_pre_norm_batch_worker, &ctx, 1);
 }
 
-static void layer_attn_norm_one(
+void layer_attn_norm_one(
         float             * out,
         const ds4_model   * model,
         const ds4_layer_weights * layer,
@@ -6291,7 +2995,7 @@ static void layer_attn_norm_one(
 
 /* Q projection is low-rank: Q8_0 into the model-specific LoRA-Q rank,
  * RMSNorm, then Q8_0 back to all attention heads. */
-static void layer_q_projection_normed_one(
+void layer_q_projection_normed_one(
         const ds4_model   * model,
         const ds4_layer_weights * layer,
         const float       * norm,
@@ -6311,7 +3015,7 @@ static void layer_q_projection_normed_one(
     free(qr);
 }
 
-static void layer_q_projection_with_lora_one(
+void layer_q_projection_with_lora_one(
         const ds4_model   * model,
         const ds4_layer_weights * layer,
         const float       * norm,
@@ -6330,7 +3034,7 @@ static void layer_q_projection_with_lora_one(
 }
 
 /* KV projection has one KV head of width 512, followed by a learned RMSNorm. */
-static void layer_kv_projection_normed_one(
+void layer_kv_projection_normed_one(
         const ds4_model   * model,
         const ds4_layer_weights * layer,
         const float       * normed,
@@ -6345,7 +3049,7 @@ static void layer_kv_projection_normed_one(
     free(raw);
 }
 
-static void layer_q_projection_with_lora_one_decode_scratch(
+void layer_q_projection_with_lora_one_decode_scratch(
         const ds4_model         * model,
         const ds4_layer_weights * layer,
         const float             * norm,
@@ -6360,7 +3064,7 @@ static void layer_q_projection_with_lora_one_decode_scratch(
     head_rms_norm_inplace(q, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS);
 }
 
-static void layer_kv_projection_normed_one_decode_scratch(
+void layer_kv_projection_normed_one_decode_scratch(
         const ds4_model         * model,
         const ds4_layer_weights * layer,
         const float             * normed,
@@ -6442,20 +3146,20 @@ static void rope_tail_ext_inplace(
 }
 
 /* Dense layers and compressed layers use different RoPE bases. */
-static float layer_rope_freq_base(uint32_t il) {
+float layer_rope_freq_base(uint32_t il) {
     return ds4_layer_compress_ratio(il) != 0 && DS4_COMPRESS_ROPE_FREQ_BASE > 0.0f
         ? DS4_COMPRESS_ROPE_FREQ_BASE
         : DS4_ROPE_FREQ_BASE;
 }
 
-static float layer_rope_freq_scale(uint32_t il) {
+float layer_rope_freq_scale(uint32_t il) {
     if (ds4_layer_compress_ratio(il) == 0 || DS4_ROPE_SCALE_FACTOR <= 0.0f) {
         return 1.0f;
     }
     return 1.0f / DS4_ROPE_SCALE_FACTOR;
 }
 
-static void rope_tail_layer_inplace(
+void rope_tail_layer_inplace(
         float            * x,
         uint32_t           n_head,
         uint32_t           head_dim,
@@ -6512,7 +3216,7 @@ static void rope_tail_batch_worker(void *vctx, uint64_t t0, uint64_t t1) {
     }
 }
 
-static void rope_tail_layer_batch_inplace(
+void rope_tail_layer_batch_inplace(
         float            *x,
         uint64_t          stride,
         uint32_t          n_head,
@@ -6535,66 +3239,9 @@ static void rope_tail_layer_batch_inplace(
     ds4_parallel_for_min_rows(n_tok, rope_tail_batch_worker, &ctx, 1);
 }
 
-static inline float dot_f32(const float *a, const float *b, uint32_t n) {
-#if defined(__ARM_NEON)
-    uint32_t i = 0;
-    float32x4_t acc0 = vdupq_n_f32(0.0f);
-    float32x4_t acc1 = vdupq_n_f32(0.0f);
-    for (; i + 8 <= n; i += 8) {
-        acc0 = vfmaq_f32(acc0, vld1q_f32(a + i),     vld1q_f32(b + i));
-        acc1 = vfmaq_f32(acc1, vld1q_f32(a + i + 4), vld1q_f32(b + i + 4));
-    }
-    float acc = vaddvq_f32(vaddq_f32(acc0, acc1));
-    for (; i < n; i++) acc += a[i] * b[i];
-    return acc;
-#else
-    float acc = 0.0f;
-    for (uint32_t i = 0; i < n; i++) acc += a[i] * b[i];
-    return acc;
-#endif
-}
-
-static inline void axpy_f32(float *y, const float *x, float a, uint32_t n) {
-#if defined(__ARM_NEON)
-    uint32_t i = 0;
-    const float32x4_t av = vdupq_n_f32(a);
-    for (; i + 8 <= n; i += 8) {
-        vst1q_f32(y + i,     vfmaq_f32(vld1q_f32(y + i),     av, vld1q_f32(x + i)));
-        vst1q_f32(y + i + 4, vfmaq_f32(vld1q_f32(y + i + 4), av, vld1q_f32(x + i + 4)));
-    }
-    for (; i < n; i++) y[i] += a * x[i];
-#else
-    for (uint32_t i = 0; i < n; i++) y[i] += a * x[i];
-#endif
-}
-
-static inline void scale_f32(float *x, float a, uint32_t n) {
-#if defined(__ARM_NEON)
-    uint32_t i = 0;
-    const float32x4_t av = vdupq_n_f32(a);
-    for (; i + 8 <= n; i += 8) {
-        vst1q_f32(x + i,     vmulq_f32(vld1q_f32(x + i),     av));
-        vst1q_f32(x + i + 4, vmulq_f32(vld1q_f32(x + i + 4), av));
-    }
-    for (; i < n; i++) x[i] *= a;
-#else
-    for (uint32_t i = 0; i < n; i++) x[i] *= a;
-#endif
-}
-
-static float sigmoid_stable(float x) {
-    if (x >= 0.0f) {
-        const float e = expf(-x);
-        return 1.0f / (1.0f + e);
-    } else {
-        const float e = expf(x);
-        return e / (1.0f + e);
-    }
-}
-
 /* Sink-aware attention over a set of KV rows.  The learned sink logit is part
  * of the softmax denominator but contributes no value vector. */
-static void layer_attention_rows_one(
+void layer_attention_rows_one(
         float             * out_heads,
         const ds4_model   * model,
         const ds4_layer_weights * layer,
@@ -6634,7 +3281,7 @@ static void layer_attention_rows_one(
     if (score != score_stack) free(score);
 }
 
-static void layer_attention_one(
+void layer_attention_one(
         float             * out_heads,
         const ds4_model   * model,
         const ds4_layer_weights * layer,
@@ -6645,7 +3292,7 @@ static void layer_attention_one(
 
 /* Attention output projection is grouped: each group first maps its heads to
  * a 1024-rank low vector, then all groups are projected back to 4096. */
-static void layer_grouped_out_one(
+void layer_grouped_out_one(
         float             * out,
         const ds4_model   * model,
         const ds4_layer_weights * layer,
@@ -6663,7 +3310,7 @@ static void layer_grouped_out_one(
     free(low);
 }
 
-static void layer_grouped_out_one_decode_scratch(
+void layer_grouped_out_one_decode_scratch(
         float                  * out,
         const ds4_model        * model,
         const ds4_layer_weights * layer,
@@ -6680,7 +3327,7 @@ static void layer_grouped_out_one_decode_scratch(
     matvec_q8_0_decode_scratch(out, model, layer->attn_output_b, scratch->attn_low, scratch);
 }
 
-static void layer_grouped_out_batch(
+void layer_grouped_out_batch(
         float             * out,
         const ds4_model   * model,
         const ds4_layer_weights * layer,
@@ -6709,31 +3356,8 @@ static void layer_grouped_out_batch(
  * and the HC post step that returns the result to four-stream state.
  */
 
-static float silu(float x) {
-    return x * sigmoid_stable(x);
-}
-
-static float softplus_stable(float x) {
-    if (x > 20.0f) return x;
-    if (x < -20.0f) return expf(x);
-    return log1pf(expf(x));
-}
-
-static void swiglu(float *out, const float *gate, const float *up, uint64_t n, float clamp) {
-    for (uint64_t i = 0; i < n; i++) {
-        float g = gate[i];
-        float u = up[i];
-        if (clamp > 1.0e-6f) {
-            if (g > clamp) g = clamp;
-            if (u > clamp) u = clamp;
-            if (u < -clamp) u = -clamp;
-        }
-        out[i] = silu(g) * u;
-    }
-}
-
 /* The shared expert is a normal Q8_0 SwiGLU MLP that runs for every token. */
-static void layer_shared_ffn_one(
+void layer_shared_ffn_one(
         float             * out,
         const ds4_model   * model,
         const ds4_layer_weights * layer,
@@ -6767,7 +3391,7 @@ static void layer_shared_ffn_one(
     free(gate);
 }
 
-static void layer_shared_ffn_one_decode_scratch(
+void layer_shared_ffn_one_decode_scratch(
         float                  * out,
         const ds4_model        * model,
         const ds4_layer_weights * layer,
@@ -6811,7 +3435,7 @@ static void swiglu_batch_worker(void *vctx, uint64_t t0, uint64_t t1) {
     }
 }
 
-static void layer_shared_ffn_batch(
+void layer_shared_ffn_batch(
         float             * out,
         const ds4_model   * model,
         const ds4_layer_weights * layer,
@@ -6856,7 +3480,7 @@ static void layer_shared_ffn_batch(
 }
 
 /* Early DS4 layers use token-id hash routing instead of top-k routing. */
-static void layer_hash_selected_experts(
+void layer_hash_selected_experts(
         int                    selected[DS4_MAX_EXPERT_USED],
         const ds4_model       *model,
         const ds4_layer_weights *layer,
@@ -6912,7 +3536,7 @@ static void layer_hash_router_weights_from_probs(
     }
 }
 
-static void layer_hash_router_weights_one(
+void layer_hash_router_weights_one(
         float             weights_out[DS4_MAX_EXPERT_USED],
         const ds4_model   * model,
         const ds4_layer_weights * layer,
@@ -6947,7 +3571,7 @@ static void layer_topk_selected_experts_from_probs(
         const ds4_layer_weights *layer,
         const float           probs[DS4_MAX_EXPERT]);
 
-static void layer_topk_selected_experts(
+void layer_topk_selected_experts(
         int                    selected[DS4_MAX_EXPERT_USED],
         float                  expert_weight[DS4_MAX_EXPERT_USED],
         const ds4_model       *model,
@@ -6988,11 +3612,10 @@ static void layer_topk_selected_experts_from_probs(
     }
 }
 
-static void print_vec_stats(const char *name, const float *x, uint64_t n);
 
 /* Single-token routed MoE.  It selects six experts, runs IQ2_XXS gate/up,
  * applies SwiGLU and router weights, then accumulates Q2_K down projections. */
-static void layer_routed_moe_one(
+void layer_routed_moe_one(
         float             * out,
         const ds4_model   * model,
         const ds4_layer_weights * layer,
@@ -7116,7 +3739,7 @@ static void layer_routed_moe_one(
 
 /* Decode version of routed MoE: same math as layer_routed_moe_one(), but all
  * large temporaries come from the persistent scratch arena. */
-static void layer_routed_moe_one_prealloc(
+void layer_routed_moe_one_prealloc(
         float             * out,
         const ds4_model   * model,
         const ds4_layer_weights * layer,
@@ -7186,7 +3809,7 @@ static void layer_routed_moe_one_prealloc(
 
 /* Prefill MoE groups token/expert pairs by expert so each active expert's
  * rows are scanned once for the whole token batch. */
-static void layer_routed_moe_batch(
+void layer_routed_moe_batch(
         float             * moe,
         const ds4_model   * model,
         const ds4_layer_weights * layer,
@@ -7367,11 +3990,10 @@ static void layer_routed_moe_batch(
     free(selected);
 }
 
-static void print_vec_stats(const char *name, const float *x, uint64_t n);
 
 /* Full FFN sublayer for one token: HC pre, RMSNorm, routed MoE, shared expert,
  * sum, and HC post. */
-static void layer_ffn_one(
+void layer_ffn_one(
         float             * out_hc,
         const ds4_model   * model,
         const ds4_layer_weights * layer,
@@ -7476,7 +4098,7 @@ static void layer_ffn_one(
 }
 
 /* Allocation-free decode FFN using the persistent CPU scratch buffers. */
-static void layer_ffn_one_decode_scratch(
+void layer_ffn_one_decode_scratch(
         float                  * out_hc,
         const ds4_model        * model,
         const ds4_layer_weights * layer,
@@ -7550,7 +4172,7 @@ static void layer_ffn_one_decode_scratch(
     }
 }
 
-static void layer_ffn_batch(
+void layer_ffn_batch(
         float             * out_hc,
         const ds4_model   * model,
         const ds4_layer_weights * layer,
@@ -7683,7 +4305,7 @@ static void layer_routed_moe_tokens_parallel(
 
 /* Default prefill FFN path.  HC and shared expert are batched, while routed
  * experts can run either token-parallel or expert-grouped depending on size. */
-static void layer_ffn_shared_batch(
+void layer_ffn_shared_batch(
         float             * out_hc,
         const ds4_model   * model,
         const ds4_layer_weights * layer,
@@ -7826,7 +4448,7 @@ static void layer_ffn_tokens_worker(void *vctx, uint64_t t0, uint64_t t1) {
     }
 }
 
-static void layer_ffn_tokens_parallel(
+void layer_ffn_tokens_parallel(
         float             * out_hc,
         const ds4_model   * model,
         const ds4_layer_weights * layer,
@@ -7850,11 +4472,6 @@ static void layer_ffn_tokens_parallel(
     ds4_parallel_for(n_tok, layer_ffn_tokens_worker, &ctx);
 }
 
-static void output_logits_one(
-        float             * logits,
-        const ds4_model   * model,
-        const ds4_weights * weights,
-        const float       * inp_hc);
 
 /* =========================================================================
  * KV Cache, Compressors, and CPU Layer Execution.
@@ -7866,30 +4483,7 @@ static void output_logits_one(
  * hot loop.
  */
 
-typedef struct {
-    float *raw_kv;
-    uint32_t n_raw;
-    uint32_t cap_raw;
-
-    uint32_t compress_ratio;
-    uint32_t comp_cap;
-    uint32_t n_comp;
-    float *attn_comp_kv;
-    float *attn_state_kv;
-    float *attn_state_score;
-
-    uint32_t n_index_comp;
-    float *index_comp_kv;
-    float *index_state_kv;
-    float *index_state_score;
-} ds4_layer_cache;
-
-typedef struct {
-    ds4_layer_cache layer[DS4_MAX_LAYER];
-    uint32_t head_dim;
-} ds4_kv_cache;
-
-static uint32_t ds4_default_raw_cap(uint32_t ctx_size) {
+uint32_t ds4_default_raw_cap(uint32_t ctx_size) {
     uint32_t raw_cap = DS4_N_SWA;
     if (raw_cap > ctx_size) raw_cap = ctx_size;
     if (raw_cap == 0) raw_cap = 1;
@@ -7901,7 +4495,7 @@ static uint32_t ds4_default_raw_cap(uint32_t ctx_size) {
  * 的配置(42 t/s), 小块反而快。加了 token 分片 GEMM(激活按 tile 进 shared, 块内共用)之后
  * 大块重新变优: 实测 3800 token prompt chunk=128 119 / 256 **123** / 512 116 t/s。
  * 分片 kernel 与原路逐位一致(NLL 与 max|Δlogit| 均为 0 差)。Metal 侧保持原行为。 */
-static uint32_t ds4_default_prefill_cap_for_prompt(int prompt_len) {
+uint32_t ds4_default_prefill_cap_for_prompt(int prompt_len) {
     if (prompt_len <= 0) return 1;
     uint32_t cap = (uint32_t)prompt_len;
 
@@ -7926,7 +4520,7 @@ static uint32_t ds4_default_prefill_cap_for_prompt(int prompt_len) {
 
 /* Allocate all CPU decode temporaries once.  This keeps generation deterministic
  * from the VM's point of view and makes accidental hot-loop malloc visible. */
-static void cpu_decode_scratch_init(ds4_cpu_decode_scratch *scratch, uint32_t ctx_size) {
+void cpu_decode_scratch_init(ds4_cpu_decode_scratch *scratch, uint32_t ctx_size) {
     memset(scratch, 0, sizeof(*scratch));
     if (ctx_size == 0) ctx_size = 1;
     const uint32_t raw_cap = ds4_default_raw_cap(ctx_size);
@@ -8001,7 +4595,7 @@ static void cpu_decode_scratch_init(ds4_cpu_decode_scratch *scratch, uint32_t ct
     scratch->output_norm = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
 }
 
-static void cpu_decode_scratch_free(ds4_cpu_decode_scratch *scratch) {
+void cpu_decode_scratch_free(ds4_cpu_decode_scratch *scratch) {
     if (!scratch) return;
     free(scratch->output_norm);
     free(scratch->output_embd);
@@ -8052,7 +4646,7 @@ static void cpu_decode_scratch_free(ds4_cpu_decode_scratch *scratch) {
 
 /* Allocate per-layer KV state: a raw sliding window for all layers, plus
  * compressed attention/indexer caches for layers whose ratio is nonzero. */
-static void kv_cache_init(ds4_kv_cache *cache, uint32_t ctx_size, uint32_t raw_cap) {
+void kv_cache_init(ds4_kv_cache *cache, uint32_t ctx_size, uint32_t raw_cap) {
     memset(cache, 0, sizeof(*cache));
     if (raw_cap == 0) raw_cap = ds4_default_raw_cap(ctx_size);
     if (raw_cap > ctx_size) raw_cap = ctx_size;
@@ -8094,7 +4688,7 @@ static void kv_cache_init(ds4_kv_cache *cache, uint32_t ctx_size, uint32_t raw_c
     }
 }
 
-static void kv_cache_free(ds4_kv_cache *cache) {
+void kv_cache_free(ds4_kv_cache *cache) {
     if (!cache) return;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         free(cache->layer[il].raw_kv);
@@ -8109,7 +4703,7 @@ static void kv_cache_free(ds4_kv_cache *cache) {
 }
 
 /* Append to the raw SWA cache.  Once full, it slides by one row. */
-static void kv_cache_push_raw(ds4_layer_cache *cache, const float *kv) {
+void kv_cache_push_raw(ds4_layer_cache *cache, const float *kv) {
     if (cache->n_raw < cache->cap_raw) {
         float *dst = cache->raw_kv + (uint64_t)cache->n_raw * DS4_N_HEAD_DIM;
         for (uint32_t i = 0; i < DS4_N_HEAD_DIM; i++) dst[i] = f16_to_f32(f32_to_f16(kv[i]));
@@ -8124,7 +4718,7 @@ static void kv_cache_push_raw(ds4_layer_cache *cache, const float *kv) {
     for (uint32_t i = 0; i < DS4_N_HEAD_DIM; i++) dst[i] = f16_to_f32(f32_to_f16(kv[i]));
 }
 
-static void kv_cache_push_comp(float *rows, uint32_t *n_rows, uint32_t cap_rows, uint32_t row_dim, const float *kv) {
+void kv_cache_push_comp(float *rows, uint32_t *n_rows, uint32_t cap_rows, uint32_t row_dim, const float *kv) {
     if (*n_rows >= cap_rows) ds4_die("compressed KV cache capacity exceeded");
     float *dst = rows + (uint64_t)(*n_rows) * row_dim;
     for (uint32_t i = 0; i < row_dim; i++) dst[i] = f16_to_f32(f32_to_f16(kv[i]));
@@ -8155,7 +4749,7 @@ static void compressor_finish_prefill_state_cpu(
     }
 }
 
-static void kv_cache_finish_prefill_states(ds4_kv_cache *cache, uint32_t n_tokens) {
+void kv_cache_finish_prefill_states(ds4_kv_cache *cache, uint32_t n_tokens) {
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         ds4_layer_cache *layer = &cache->layer[il];
         const uint32_t ratio = layer->compress_ratio;
@@ -8178,7 +4772,7 @@ static void kv_cache_finish_prefill_states(ds4_kv_cache *cache, uint32_t n_token
 
 /* Pool the current compression window with a softmax over per-dimension scores.
  * Ratio-4 layers keep two lanes: attention compression and indexer compression. */
-static void compressor_pool_decode_state(
+void compressor_pool_decode_state(
         float    * out,
         float    * state_kv,
         float    * state_score,
@@ -8233,7 +4827,7 @@ static void compressor_pool_decode_state(
 
 /* Streaming compressor update for one token.  It projects kv/score rows,
  * updates the rolling state, and emits a compressed KV row on ratio boundaries. */
-static bool compressor_decode_one(
+bool compressor_decode_one(
         float                   * out_comp,
         const ds4_model         * model,
         const ds4_tensor        * wkv,
@@ -8330,7 +4924,7 @@ static bool compressor_decode_one(
     return true;
 }
 
-static bool compressor_decode_one_decode_scratch(
+bool compressor_decode_one_decode_scratch(
         float                  * out_comp,
         const ds4_model        * model,
         const ds4_tensor       * wkv,
@@ -8419,7 +5013,7 @@ static bool compressor_decode_one_decode_scratch(
 
 /* Attention over raw SWA rows plus optional compressed rows.  Ratio-4 layers
  * pass an indexer mask to hide compressed rows not selected for this token. */
-static void layer_attention_mixed_one(
+void layer_attention_mixed_one(
         float             * out_heads,
         const ds4_model   * model,
         const ds4_layer_weights * layer,
@@ -8481,7 +5075,7 @@ static void layer_attention_mixed_one(
     if (score != score_stack) free(score);
 }
 
-static void layer_attention_mixed_one_decode_scratch(
+void layer_attention_mixed_one_decode_scratch(
         float                  * out_heads,
         const ds4_model        * model,
         const ds4_layer_weights * layer,
@@ -8627,7 +5221,7 @@ static void layer_attention_prefix_batch_worker(void *vctx, uint64_t r0, uint64_
 
 /* Prefix prefill attention for a fresh prompt.  It computes each token's view
  * of the raw window and compressed rows without running the decode loop. */
-static void layer_attention_prefix_batch(
+void layer_attention_prefix_batch(
         float                   * out_heads,
         const ds4_model         * model,
         const ds4_layer_weights * layer,
@@ -8662,7 +5256,7 @@ static void layer_attention_prefix_batch(
 
 /* Ratio-4 layers use an auxiliary indexer to select which compressed rows are
  * visible to attention.  This is the CPU allocation-owning helper. */
-static bool *indexer_allowed_decode_one(
+bool *indexer_allowed_decode_one(
         const ds4_model         * model,
         const ds4_layer_weights * layer,
         const float             * cur,
@@ -8725,7 +5319,7 @@ static bool *indexer_allowed_decode_one(
 }
 
 /* Scratch-backed indexer selection for decode. */
-static bool *indexer_allowed_decode_one_decode_scratch(
+bool *indexer_allowed_decode_one_decode_scratch(
         const ds4_model         * model,
         const ds4_layer_weights * layer,
         const float             * cur,
@@ -8788,7 +5382,7 @@ static bool *indexer_allowed_decode_one_decode_scratch(
 }
 
 /* Single-token attention sublayer with raw SWA cache and DS4 compression. */
-static void layer_attention_raw_swa_one(
+void layer_attention_raw_swa_one(
         float                   * after_attn_hc,
         const ds4_model         * model,
         const ds4_layer_weights * layer,
@@ -8900,7 +5494,7 @@ static void layer_attention_raw_swa_one(
 
 /* Batched prefill attention.  It projects Q/KV for all tokens, streams them
  * through the same raw/compressed cache updates, then runs prefix attention. */
-static void layer_attention_raw_swa_batch(
+void layer_attention_raw_swa_batch(
         float                   * after_attn_hc,
         const ds4_model         * model,
         const ds4_layer_weights * layer,
@@ -9414,16 +6008,9 @@ static void layer_forward_raw_swa_one(
 
 }
 
-static void output_logits_one_decode_scratch(
-        float                  * logits,
-        const ds4_model        * model,
-        const ds4_weights      * weights,
-        const float            * inp_hc,
-        ds4_cpu_decode_scratch * scratch);
-
 /* CPU decode for one token through all 43 layers.  The caller owns scratch and
  * cache lifetimes so no per-token allocations are needed. */
-static void forward_token_raw_swa_cpu_decode_scratch(
+void forward_token_raw_swa_cpu_decode_scratch(
         float             * logits,
         const ds4_model   * model,
         const ds4_weights * weights,
@@ -9458,7 +6045,7 @@ static void forward_token_raw_swa_cpu_decode_scratch(
 }
 
 #ifndef DS4_NO_GPU
-static void forward_token_raw_swa_cpu(
+void forward_token_raw_swa_cpu(
         float             * logits,
         const ds4_model   * model,
         const ds4_weights * weights,
@@ -9483,7 +6070,7 @@ static void forward_token_raw_swa_cpu(
 
 /* CPU prefill in layer-major order.  All prompt tokens pass through layer 0,
  * then layer 1, etc., which exposes batch matmul opportunities. */
-static void prefill_layer_major_cpu(
+void prefill_layer_major_cpu(
         float             * logits,
         const ds4_model   * model,
         const ds4_weights * weights,
@@ -9645,7 +6232,7 @@ static void prefill_layer_major_cpu(
 
 /* Diagnostic first-token layer without cache history: the token attends only
  * to itself, useful for checking a minimal end-to-end slice. */
-static void layer_forward_self_one(
+void layer_forward_self_one(
         float                   * out_hc,
         const ds4_model         * model,
         const ds4_layer_weights * layer,
@@ -9700,7 +6287,7 @@ static void layer_forward_self_one(
     free(attn_cur);
 }
 
-static void forward_first_token_cpu(
+void forward_first_token_cpu(
         float             * out_hc,
         const ds4_model   * model,
         const ds4_weights * weights,
@@ -9756,7 +6343,7 @@ static void output_hc_head_one(
 }
 
 /* Final language-model head: HC collapse, RMSNorm, and Q8_0 vocab projection. */
-static void output_logits_one(
+void output_logits_one(
         float             * logits,
         const ds4_model   * model,
         const ds4_weights * weights,
@@ -9774,7 +6361,7 @@ static void output_logits_one(
 }
 
 /* Allocation-free logits head for CPU decode. */
-static void output_logits_one_decode_scratch(
+void output_logits_one_decode_scratch(
         float                  * logits,
         const ds4_model        * model,
         const ds4_weights      * weights,
@@ -9800,7 +6387,6 @@ static void output_logits_one_decode_scratch(
 }
 
 #ifndef DS4_NO_GPU
-static int sample_argmax(const float *logits, uint32_t n_vocab);
 
 /* =========================================================================
  * Metal Reference Comparison Helpers.
@@ -9810,7 +6396,7 @@ static int sample_argmax(const float *logits, uint32_t n_vocab);
  * reference path with the Metal executor.
  */
 
-static float max_abs_diff(const float *a, const float *b, uint64_t n) {
+float max_abs_diff(const float *a, const float *b, uint64_t n) {
     float max_diff = 0.0f;
     for (uint64_t i = 0; i < n; i++) {
         const float diff = fabsf(a[i] - b[i]);
@@ -9819,7 +6405,7 @@ static float max_abs_diff(const float *a, const float *b, uint64_t n) {
     return max_diff;
 }
 
-static float rms_abs_diff(const float *a, const float *b, uint64_t n) {
+float rms_abs_diff(const float *a, const float *b, uint64_t n) {
     double ss = 0.0;
     for (uint64_t i = 0; i < n; i++) {
         const double d = (double)a[i] - (double)b[i];
@@ -9828,7 +6414,7 @@ static float rms_abs_diff(const float *a, const float *b, uint64_t n) {
     return n ? (float)sqrt(ss / (double)n) : 0.0f;
 }
 
-static uint64_t argmax_f32(const float *x, uint64_t n) {
+uint64_t argmax_f32(const float *x, uint64_t n) {
     uint64_t best = 0;
     for (uint64_t i = 1; i < n; i++) {
         if (x[i] > x[best]) best = i;
@@ -9838,7 +6424,7 @@ static uint64_t argmax_f32(const float *x, uint64_t n) {
 
 #endif
 
-static void print_vec_stats(const char *name, const float *x, uint64_t n) {
+void print_vec_stats(const char *name, const float *x, uint64_t n) {
     float minv = DS4_POS_INF;
     float maxv = DS4_NEG_INF;
     double ss = 0.0;
@@ -9853,256 +6439,7 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
     printf("%s: min=%g max=%g rms=%g\n",
         name, minv, maxv, sqrt(ss / (double)n));
 }
-
 #ifndef DS4_NO_GPU
-/*
- * Apple Metal stores the persistent attention-compressed KV cache in F16.  The
- * compressor still pools, normalizes, RoPEs, and FP8-rounds rows in F32 staging
- * before writing the cache, while checkpoints and debug dumps expand back to
- * F32 for the stable external format.  This is a storage optimization rather
- * than a semantic approximation: all Metal attention consumers already run the
- * compressed K/V rows through F16 FlashAttention/indexed-attention paths.
- */
-#if defined(__APPLE__)
-#define DS4_GPU_ATTN_COMP_CACHE_F16 1
-#else
-#define DS4_GPU_ATTN_COMP_CACHE_F16 0
-#endif
-
-/* =========================================================================
- * Metal Release Graph State.
- * =========================================================================
- *
- * The release Metal executor owns one fixed set of tensors for single-token
- * decode and another for batched prefill.  The structure is DS4-specific:
- * tensor names follow the model stages rather than generic graph nodes.
- */
-
-typedef struct {
-    /* One-token decode tensors.  These stay allocated for the life of a
-     * session; a generated token enters as an embedding in cur_hc and leaves as
-     * logits after all 43 layers update their raw/compressed/indexer caches. */
-    ds4_gpu_tensor *cur_hc;
-    ds4_gpu_tensor *flat_hc;
-    ds4_gpu_tensor *hc_mix;
-    ds4_gpu_tensor *hc_split;
-    ds4_gpu_tensor *hc_pre;
-    ds4_gpu_tensor *hc_post;
-    ds4_gpu_tensor *hc_comb;
-    ds4_gpu_tensor *attn_cur;
-    ds4_gpu_tensor *attn_norm;
-    ds4_gpu_tensor *qr;
-    ds4_gpu_tensor *qr_norm;
-    ds4_gpu_tensor *q;
-    ds4_gpu_tensor *kv_raw;
-    ds4_gpu_tensor *kv;
-
-    /* Persistent KV state.  Raw KV is a sliding-window ring per layer.  Ratio-4
-     * layers also keep an indexer-compressed cache; ratio-128 layers keep only
-     * the attention-compressed cache.  The small state tensors are compressor
-     * frontiers for the next compressed row, so they must be snapshotted with
-     * the row counters whenever a checkpoint is saved or partially rewound. */
-    ds4_gpu_tensor *layer_raw_cache[DS4_MAX_LAYER];
-    ds4_gpu_tensor *layer_attn_comp_cache[DS4_MAX_LAYER];
-    ds4_gpu_tensor *layer_attn_state_kv[DS4_MAX_LAYER];
-    ds4_gpu_tensor *layer_attn_state_score[DS4_MAX_LAYER];
-    ds4_gpu_tensor *layer_index_comp_cache[DS4_MAX_LAYER];
-    ds4_gpu_tensor *layer_index_state_kv[DS4_MAX_LAYER];
-    ds4_gpu_tensor *layer_index_state_score[DS4_MAX_LAYER];
-    uint32_t active_layer_start;
-    uint32_t active_layer_end;
-    bool active_layer_slice;
-
-    /* Speculative decoding scratch.  MTP is allowed to mutate graph state only
-     * if the target verifier can either commit it or restore the saved
-     * frontiers.  The prefix1 buffers are the cheap partial-accept state for the
-     * common N=2 case. */
-    ds4_gpu_tensor *spec_attn_state_kv[DS4_MAX_LAYER];
-    ds4_gpu_tensor *spec_attn_state_score[DS4_MAX_LAYER];
-    ds4_gpu_tensor *spec_index_state_kv[DS4_MAX_LAYER];
-    ds4_gpu_tensor *spec_index_state_score[DS4_MAX_LAYER];
-    ds4_gpu_tensor *spec_prefix1_attn_state_kv[DS4_MAX_LAYER];
-    ds4_gpu_tensor *spec_prefix1_attn_state_score[DS4_MAX_LAYER];
-    ds4_gpu_tensor *spec_prefix1_index_state_kv[DS4_MAX_LAYER];
-    ds4_gpu_tensor *spec_prefix1_index_state_score[DS4_MAX_LAYER];
-    ds4_gpu_tensor *spec_logits;
-    uint32_t layer_n_comp[DS4_MAX_LAYER];
-    uint32_t layer_n_index_comp[DS4_MAX_LAYER];
-    uint32_t spec_prefix1_n_comp[DS4_MAX_LAYER];
-    uint32_t spec_prefix1_n_index_comp[DS4_MAX_LAYER];
-    /* spec replay 消除(2026-08-20): verify 批各层压缩器/indexer 输入行缓存(≤8 行),
-     * restore 后用缓存行快进 acc 位 —— 免第二次全模型前向(实测 replay 55-65ms/轮)。 */
-    ds4_gpu_tensor *spec_comp_rows_kv[DS4_MAX_LAYER];
-    ds4_gpu_tensor *spec_comp_rows_sc[DS4_MAX_LAYER];
-    ds4_gpu_tensor *spec_idx_rows_kv[DS4_MAX_LAYER];
-    ds4_gpu_tensor *spec_idx_rows_sc[DS4_MAX_LAYER];
-    int spec_comp_capture;
-    bool spec_capture_prefix1;
-    uint32_t raw_cap;
-    /* Maximum compressed-row capacity across layers.  Shared work buffers use
-     * this worst-case size because ratio-4 indexer layers can still reach it. */
-    uint32_t comp_cap;
-    /* Persistent compressed caches are per layer, so size them from the actual
-     * layer compression ratio instead of pessimistically using the ratio-4 cap
-     * for every ratio-128 layer. */
-    uint32_t layer_comp_cap[DS4_MAX_LAYER];
-    uint32_t attn_comp_stage_cap;
-
-    /* Per-layer work tensors.  They are reused in place by every layer instead
-     * of allocating a generic graph arena.  This is why the code is verbose but
-     * predictable: each pointer names an actual DS4 stage. */
-    ds4_gpu_tensor *comp_kv_cur;
-    ds4_gpu_tensor *comp_sc_cur;
-    /* Side-stream private cur pair for the attn compressor chain: the main
-     * stream's indexer compressor writes comp_kv_cur/comp_sc_cur concurrently,
-     * so the side chain must not share them (2026-08-19 determinism fix). */
-    ds4_gpu_tensor *comp_kv_side;
-    ds4_gpu_tensor *comp_sc_side;
-    ds4_gpu_tensor *attn_comp_stage;
-    ds4_gpu_tensor *indexer_q;
-    ds4_gpu_tensor *indexer_weights;
-    ds4_gpu_tensor *indexer_scores;
-    ds4_gpu_tensor *comp_mask;
-    ds4_gpu_tensor *comp_selected;
-    ds4_gpu_tensor *heads;
-    ds4_gpu_tensor *attn_low;
-    ds4_gpu_tensor *attn_out;
-    ds4_gpu_tensor *after_attn_hc;
-    ds4_gpu_tensor *ffn_cur;
-    ds4_gpu_tensor *ffn_norm;
-    ds4_gpu_tensor *shared_gate;
-    ds4_gpu_tensor *shared_up;
-    ds4_gpu_tensor *shared_mid;
-    ds4_gpu_tensor *shared_out;
-    ds4_gpu_tensor *router_logits;
-    ds4_gpu_tensor *router_probs;
-    ds4_gpu_tensor *router_selected;
-    ds4_gpu_tensor *router_weights;
-    ds4_gpu_tensor *routed_gate;
-    ds4_gpu_tensor *routed_up;
-    ds4_gpu_tensor *routed_mid;
-    ds4_gpu_tensor *routed_down;
-    ds4_gpu_tensor *routed_out;
-    /* go1b corr store-variant output [n_embd]: decode writes the correction
-     * here (never into routed_out) so the tiny corr dispatch carries no write
-     * hazard on the hot buffer; the fused shared-down consumer adds it. */
-    ds4_gpu_tensor *corr_delta;
-    ds4_gpu_tensor *ffn_out;
-    ds4_gpu_tensor *after_ffn_hc;
-    ds4_gpu_tensor *output_pre;
-    ds4_gpu_tensor *output_weights;
-    ds4_gpu_tensor *output_embd;
-    ds4_gpu_tensor *output_norm;
-    ds4_gpu_tensor *logits;
-
-    /* Optional MTP model state.  It has its own raw cache because the drafter
-     * runs on speculative future tokens; target KV state is updated only after
-     * verification accepts draft tokens. */
-    /* DSpark drafter(2026-08-18): target 层(40/41/42) HC 均值拼接 buffer, decode 单
-     * token [3*4096]。capture 常开(node 开销 ~3μs), drafter ready 时被消费。 */
-    ds4_gpu_tensor *dspark_main_hidden;
-    ds4_gpu_tensor *dspark_main_x_raw;
-    ds4_gpu_tensor *dspark_main_x;
-    ds4_gpu_tensor *dspark_kv_tmp;
-    ds4_gpu_tensor *dspark_win_kv[3];  /* 每块层环形窗 [128][512] f32 */
-    ds4_gpu_tensor *dspark_ids;
-    ds4_gpu_tensor *dspark_hc_pre;
-    ds4_gpu_tensor *dspark_hc_w;
-    ds4_gpu_tensor *dspark_flat;
-    ds4_gpu_tensor *dspark_flat_norm;
-    ds4_gpu_tensor *dspark_logits;
-    ds4_gpu_tensor *spec_raw_save[DS4_MAX_LAYER]; /* verify 批写 SWA 环前的旧行存档 */
-    ds4_gpu_tensor *dspark_spec_kv[3]; /* verify 批的 drafter KV 暂存 [BLK+1, HEAD_DIM] */
-    ds4_gpu_tensor *dspark_conf;       /* [BLK] 逐位置置信(调度器输入) */
-    ds4_gpu_tensor *dspark_prev_ids;   /* [BLK] 逐位置输入 token(置信头用) */
-    ds4_gpu_tensor *dspark_prev_id;
-    ds4_gpu_tensor *dspark_out_id;
-    ds4_gpu_tensor *dspark_pf_hidden;   /* prefill 建窗: [chunk_cap, 3*4096] */
-    ds4_gpu_tensor *dspark_pf_x;        /* [chunk_cap, 4096] */
-    ds4_gpu_tensor *dspark_pf_kv;       /* [chunk_cap, 512] */
-    int dspark_capture;               /* engine open 时按 drafter ready 置位 */
-    ds4_gpu_tensor *mtp_embed;
-    ds4_gpu_tensor *mtp_enorm;
-    ds4_gpu_tensor *mtp_eproj;
-    ds4_gpu_tensor *mtp_eproj_hc;
-    ds4_gpu_tensor *mtp_hnorm_hc;
-    ds4_gpu_tensor *mtp_hproj_hc;
-    ds4_gpu_tensor *mtp_input_hc;
-    ds4_gpu_tensor *mtp_state_hc;
-    ds4_gpu_tensor *mtp_next_hc;
-    ds4_gpu_tensor *mtp_raw_cache;
-    uint32_t mtp_n_raw;
-    uint32_t prefill_cap;
-    uint32_t raw_window;
-
-    /* Batched prefill tensors.  Prefill is layer-major: a chunk of prompt
-     * tokens moves through layer 0, then layer 1, and so on, updating the same
-     * persistent caches used by decode.  Keeping this separate from decode
-     * avoids a slow loop of one-token graph steps for long prompts. */
-    ds4_gpu_tensor *prefill_tokens;
-    ds4_gpu_tensor *batch_cur_hc;
-    ds4_gpu_tensor *batch_next_hc;
-    ds4_gpu_tensor *batch_flat_hc;
-    ds4_gpu_tensor *batch_hc_mix;
-    ds4_gpu_tensor *batch_hc_split;
-    ds4_gpu_tensor *batch_attn_cur;
-    ds4_gpu_tensor *batch_attn_norm;
-    ds4_gpu_tensor *batch_qr;
-    ds4_gpu_tensor *batch_qr_norm;
-    ds4_gpu_tensor *batch_q;
-    ds4_gpu_tensor *batch_kv_raw;
-    ds4_gpu_tensor *batch_kv;
-    ds4_gpu_tensor *batch_comp_kv;
-    ds4_gpu_tensor *batch_comp_sc;
-    ds4_gpu_tensor *batch_indexer_q;
-    ds4_gpu_tensor *batch_indexer_weights;
-    ds4_gpu_tensor *batch_heads;
-    ds4_gpu_tensor *batch_attn_low;
-    ds4_gpu_tensor *batch_attn_out;
-    ds4_gpu_tensor *batch_group_tmp;
-    ds4_gpu_tensor *batch_low_tmp;
-    ds4_gpu_tensor *batch_after_attn_hc;
-    ds4_gpu_tensor *batch_ffn_cur;
-    ds4_gpu_tensor *batch_ffn_norm;
-    ds4_gpu_tensor *batch_shared_gate;
-    ds4_gpu_tensor *batch_shared_up;
-    ds4_gpu_tensor *batch_shared_mid;
-    ds4_gpu_tensor *batch_shared_out;
-    ds4_gpu_tensor *batch_router_logits;
-    ds4_gpu_tensor *batch_router_probs;
-    ds4_gpu_tensor *batch_router_selected;
-    ds4_gpu_tensor *batch_router_weights;
-    ds4_gpu_tensor *batch_routed_gate;
-    ds4_gpu_tensor *batch_routed_up;
-    ds4_gpu_tensor *batch_routed_mid;
-    ds4_gpu_tensor *batch_routed_down;
-    ds4_gpu_tensor *batch_routed_out;
-    bool batch_routed_mid_is_f16;
-    ds4_gpu_tensor *batch_ffn_out;
-    bool materialize_ffn_out;
-    ds4_gpu_tensor *directional_steering_dirs;
-    float directional_steering_attn_scale;
-    float directional_steering_ffn_scale;
-    uint32_t power_percent;
-    double prefill_layer_avg_sec[DS4_MAX_LAYER];
-    double decode_token_avg_sec;
-    bool quality;
-    bool mtp_enabled;
-    /* Tensor parallelism (Stage 2 skeleton). When tp != NULL the routed-MoE
-     * output of decode layers [0, tp_layers) is recombined across two peers via
-     * an all-reduce: after the (replicated) routed_moe each peer zeros the half
-     * of routed_out it does not own and sum-all-reduces, reproducing the
-     * single-machine value bit-for-bit before the residual combine. This minimal
-     * element-range partition proves the split point + all-reduce frame + cross-
-     * machine sync with no Metal kernel change; #06 replaces it with a real
-     * compute split (masked experts / ff-row slice). tp == NULL ⇒ byte-identical
-     * to the non-TP path. tp_vec is the host staging buffer for the exchange. */
-    ds4_dist_tp *tp;
-    uint32_t tp_layers;
-    bool tp_owns_low; /* true ⇒ this peer owns the low half of routed_out */
-    float *tp_vec;    /* host staging buffer [DS4_N_EMBD], allocated when tp set */
-} ds4_gpu_graph;
-
 /* ---- engine-trajectory batch capture (DS4_CAP_DIR) ------------------------
  * Appends, per routed layer and per prefill chunk, the tensors the offline
  * error-feedback calibration needs, as raw little-endian shards:
@@ -10150,7 +6487,7 @@ static void cap_append_k(const char *dir, const char *name, uint32_t il, int kin
     (strcmp(name, "raw_ffn_in") == 0 ? 0 : strcmp(name, "raw_route_logits") == 0 ? 1 : \
      strcmp(name, "raw_route_w") == 0 ? 2 : strcmp(name, "raw_ffn_out") == 0 ? 4 : 3), buf, bytes)
 
-static void cap_batch_layer(ds4_gpu_graph *g, uint32_t il, uint32_t n_tokens) {
+void cap_batch_layer(ds4_gpu_graph *g, uint32_t il, uint32_t n_tokens) {
     const char *dir = getenv("DS4_CAP_DIR");
     if (!dir || !dir[0] || n_tokens == 0 || !cap_layer_enabled(il)) return;
 
@@ -10215,18 +6552,9 @@ static void cap_batch_layer(ds4_gpu_graph *g, uint32_t il, uint32_t n_tokens) {
  * 解算锚(DQA2)的 FP fin; DS4_AMP_ANCHOR_ROUTE=1 时路由(selected/weights)也钉锚
  * ridx/rw。用于把"解算产物/引擎应用有病"与"解算口径 vs 在线口径漂移"分开归因。
  * 只挂 decode 路(score 链除首 token 外全走这里; 首 token 批路不钉, 偏差 1/S 在案)。 */
-static struct {
-    int state;                       /* 0 未初始化 / 1 开 / -1 关 */
-    int route_on;
-    const float   *fin;              /* [NL][S][DIM] */
-    const int32_t *ridx;             /* [NL][S][NACT] */
-    const float   *rw;
-    uint32_t S, nl, nact, dim;
-    ds4_gpu_tensor *xbuf[DS4_MAX_LAYER];  /* per-layer: 同 buf 跨层复用会被未执行的
-                                           * 前层 zchain kernel 读到后层数据 */
-} g_ampanc;
+ds4_ampanc_state g_ampanc;
 
-static int ampanc_on(void) {
+int ampanc_on(void) {
     if (g_ampanc.state) return g_ampanc.state > 0;
     g_ampanc.state = -1;
     const char *p = getenv("DS4_AMP_ANCHOR");
@@ -10264,7 +6592,7 @@ static int ampanc_on(void) {
  * (and any decode) runs token-by-token through here — this is where the bulk
  * of a teacher-forced trajectory capture actually flows (the batch hook only
  * sees the 32-token seed prefix). */
-static void cap_decode_layer(ds4_gpu_graph *g, uint32_t il) {
+void cap_decode_layer(ds4_gpu_graph *g, uint32_t il) {
     const char *dir = getenv("DS4_CAP_DIR");
     if (!dir || !dir[0] || !cap_layer_enabled(il)) return;
 
@@ -10303,7 +6631,7 @@ static void cap_decode_layer(ds4_gpu_graph *g, uint32_t il) {
                 (unsigned long long)cap_tok_total2);
 }
 
-static bool graph_power_throttle_enabled(const ds4_gpu_graph *g) {
+bool graph_power_throttle_enabled(const ds4_gpu_graph *g) {
     return g && g->power_percent > 0 && g->power_percent < 100;
 }
 
@@ -10323,7 +6651,7 @@ static void graph_power_sleep(double work_sec, uint32_t power_percent) {
     sleep_sec(sleep);
 }
 
-static void graph_power_note_prefill_layer(ds4_gpu_graph *g,
+void graph_power_note_prefill_layer(ds4_gpu_graph *g,
                                            uint32_t il,
                                            double elapsed_sec) {
     if (!graph_power_throttle_enabled(g)) return;
@@ -10333,7 +6661,7 @@ static void graph_power_note_prefill_layer(ds4_gpu_graph *g,
     graph_power_sleep(g->prefill_layer_avg_sec[il], g->power_percent);
 }
 
-static void graph_power_note_decode_token(ds4_gpu_graph *g, double elapsed_sec) {
+void graph_power_note_decode_token(ds4_gpu_graph *g, double elapsed_sec) {
     if (!graph_power_throttle_enabled(g)) return;
     g->decode_token_avg_sec =
         graph_power_update_avg(g->decode_token_avg_sec, elapsed_sec);
@@ -10341,7 +6669,9 @@ static void graph_power_note_decode_token(ds4_gpu_graph *g, double elapsed_sec) 
 }
 
 /* Release every Metal tensor owned by the whole-model graph runtime. */
-static void metal_graph_free(ds4_gpu_graph *g) {
+#endif /* !DS4_NO_GPU */
+#ifndef DS4_NO_GPU
+void metal_graph_free(ds4_gpu_graph *g) {
     free(g->tp_vec); /* TP host staging buffer (the tp socket is owned by the engine) */
     ds4_gpu_tensor_free(g->directional_steering_dirs);
     ds4_gpu_tensor_free(g->batch_ffn_out);
@@ -10503,7 +6833,7 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     memset(g, 0, sizeof(*g));
 }
 
-static bool metal_tensor_fill_f32(ds4_gpu_tensor *t, float v, uint64_t n) {
+bool metal_tensor_fill_f32(ds4_gpu_tensor *t, float v, uint64_t n) {
     return ds4_gpu_tensor_fill_f32(t, v, n) != 0;
 }
 
@@ -10522,7 +6852,7 @@ static bool metal_tensor_fill_f32(ds4_gpu_tensor *t, float v, uint64_t n) {
  * the normal inference path.
  */
 
-static bool metal_graph_load_directional_steering(
+bool metal_graph_load_directional_steering(
         ds4_gpu_graph *g,
         const char      *path,
         float            attn_scale,
@@ -10555,11 +6885,11 @@ static bool metal_graph_load_directional_steering(
     return true;
 }
 
-static bool metal_graph_directional_steering_attn_enabled(const ds4_gpu_graph *g) {
+bool metal_graph_directional_steering_attn_enabled(const ds4_gpu_graph *g) {
     return g && g->directional_steering_dirs && g->directional_steering_attn_scale != 0.0f;
 }
 
-static bool metal_graph_directional_steering_ffn_enabled(const ds4_gpu_graph *g) {
+bool metal_graph_directional_steering_ffn_enabled(const ds4_gpu_graph *g) {
     return g && g->directional_steering_dirs && g->directional_steering_ffn_scale != 0.0f;
 }
 
@@ -10578,7 +6908,7 @@ static bool metal_graph_apply_directional_steering(
                                             scale) != 0;
 }
 
-static bool metal_graph_apply_directional_steering_attn(
+bool metal_graph_apply_directional_steering_attn(
         ds4_gpu_graph  *g,
         ds4_gpu_tensor *x,
         uint32_t          il,
@@ -10586,7 +6916,7 @@ static bool metal_graph_apply_directional_steering_attn(
     return metal_graph_apply_directional_steering(g, x, il, rows, g ? g->directional_steering_attn_scale : 0.0f);
 }
 
-static bool metal_graph_apply_directional_steering_ffn(
+bool metal_graph_apply_directional_steering_ffn(
         ds4_gpu_graph  *g,
         ds4_gpu_tensor *x,
         uint32_t          il,
@@ -10613,7 +6943,7 @@ static uint64_t metal_graph_kv_cache_bytes_for_context(uint32_t ctx_size, uint32
     return bytes;
 }
 
-static uint64_t metal_graph_context_bytes_for_kv_policy(
+uint64_t metal_graph_context_bytes_for_kv_policy(
         uint32_t  ctx_size,
         uint32_t  raw_cap,
         uint32_t  prefill_cap,
@@ -10638,9 +6968,11 @@ static uint64_t metal_graph_context_bytes_for_kv_policy(
     return bytes;
 }
 
-static ds4_gpu_tensor *metal_graph_alloc_kv_cache_tensor(bool managed, uint64_t bytes) {
+ds4_gpu_tensor *metal_graph_alloc_kv_cache_tensor(bool managed, uint64_t bytes) {
     return managed ? ds4_gpu_tensor_alloc_managed(bytes) : ds4_gpu_tensor_alloc(bytes);
 }
+#endif /* !DS4_NO_GPU */
+#ifndef DS4_NO_GPU
 
 /* =========================================================================
  * Metal Diagnostic Dump Hooks.
@@ -10651,9 +6983,6 @@ static ds4_gpu_tensor *metal_graph_alloc_kv_cache_tensor(bool managed, uint64_t 
  * the command batch, so it is intentionally isolated here.
  */
 
-/* 投机 verify 的 SWA 环行存档/还原(定义在下方, 批编码里先用) */
-static bool metal_graph_spec_raw_snapshot(ds4_gpu_graph *g, uint32_t il, uint32_t pos0, uint32_t n);
-static bool metal_graph_spec_raw_restore(ds4_gpu_graph *g, uint32_t pos0, uint32_t from, uint32_t to);
 
 static bool metal_graph_debug_wants(const char *name, uint32_t il, uint32_t pos) {
     const char *prefix = getenv("DS4_METAL_GRAPH_DUMP_PREFIX");
@@ -10674,9 +7003,9 @@ static bool metal_graph_debug_wants(const char *name, uint32_t il, uint32_t pos)
 
 /* 同跑双路对账标签(2026-08-21): 投机 XCHECK 下同一位置会被批路和解码路各算一遍,
  * 文件名带标签才不会互相覆盖。空标签 = 老行为。 */
-static const char *g_dump_tag = "";
+const char *g_dump_tag = "";
 
-static void metal_graph_debug_dump_tensor(
+void metal_graph_debug_dump_tensor(
         const char       *name,
         ds4_gpu_tensor *t,
         uint64_t          n_f32,
@@ -10733,7 +7062,7 @@ static double trace_l2_of(ds4_gpu_tensor *t, uint64_t n_f32) {
     free(buf);
     return acc;
 }
-static void trace_hnorm_layer(ds4_gpu_graph *g, uint32_t il, uint32_t pos, uint64_t hc_dim) {
+void trace_hnorm_layer(ds4_gpu_graph *g, uint32_t il, uint32_t pos, uint64_t hc_dim) {
     if (!trace_hnorm_enabled()) return;
     if (ds4_gpu_synchronize() == 0) return;
     /* pos 必须打: 这条 trace 只在 decode 路触发, 而 decode 只处理"生成的" token —
@@ -10751,7 +7080,7 @@ static void trace_hnorm_layer(ds4_gpu_graph *g, uint32_t il, uint32_t pos, uint6
 }
 /* head 之前的最终 ‖h‖ + top-5 logits: 看崩塌形态(单点尖峰 = 塌到某个 token;
  * 全平 = 信息没传上来)。 */
-static void trace_hnorm_head(ds4_gpu_graph *g, uint32_t vocab_dim) {
+void trace_hnorm_head(ds4_gpu_graph *g, uint32_t vocab_dim) {
     if (!trace_hnorm_enabled()) return;
     if (ds4_gpu_synchronize() == 0) return;
     const double en = trace_l2_of(g->output_embd, DS4_N_EMBD);
@@ -10777,7 +7106,7 @@ static void trace_hnorm_head(ds4_gpu_graph *g, uint32_t vocab_dim) {
     (void)ds4_gpu_begin_commands();
 }
 
-static void metal_graph_debug_dump_f16_tensor(
+void metal_graph_debug_dump_f16_tensor(
         const char       *name,
         ds4_gpu_tensor *t,
         uint64_t          n_f16,
@@ -10809,7 +7138,7 @@ static void metal_graph_debug_dump_f16_tensor(
     }
 }
 
-static void metal_graph_debug_dump_i32_tensor(
+void metal_graph_debug_dump_i32_tensor(
         const char       *name,
         ds4_gpu_tensor *t,
         uint64_t          n_i32,
@@ -10874,7 +7203,7 @@ static void router_freq_flush(void) {
  * freq file before dying. Gated by the freq env -> not installed on normal runs. */
 static void router_freq_sigterm(int sig) { (void)sig; exit(0); }
 
-static void router_freq_collect(ds4_gpu_tensor *logits_t, uint32_t il, uint32_t n_tokens) {
+void router_freq_collect(ds4_gpu_tensor *logits_t, uint32_t il, uint32_t n_tokens) {
     if (g_router_freq_on < 0) {
         g_router_freq_file = getenv("DS4_ROUTER_FREQ_FILE");
         g_router_freq_on = (g_router_freq_file && g_router_freq_file[0]) ? 1 : 0;
@@ -10905,25 +7234,27 @@ static void router_freq_collect(ds4_gpu_tensor *logits_t, uint32_t il, uint32_t 
     ds4_gpu_begin_commands();
 }
 
-static bool metal_graph_needs_ffn_out(const ds4_gpu_graph *g, uint32_t il, uint32_t pos) {
+bool metal_graph_needs_ffn_out(const ds4_gpu_graph *g, uint32_t il, uint32_t pos) {
     return metal_graph_directional_steering_ffn_enabled(g) ||
            g->materialize_ffn_out ||
            metal_graph_debug_wants("ffn_out", il, pos);
 }
 
-static bool metal_graph_ensure_ffn_out(ds4_gpu_graph *g) {
+bool metal_graph_ensure_ffn_out(ds4_gpu_graph *g) {
     if (!g->ffn_out) {
         g->ffn_out = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
     }
     return g->ffn_out != NULL;
 }
 
-static bool metal_graph_ensure_batch_ffn_out(ds4_gpu_graph *g) {
+bool metal_graph_ensure_batch_ffn_out(ds4_gpu_graph *g) {
     if (!g->batch_ffn_out) {
         g->batch_ffn_out = ds4_gpu_tensor_alloc((uint64_t)g->prefill_cap * DS4_N_EMBD * sizeof(float));
     }
     return g->batch_ffn_out != NULL;
 }
+#endif /* !DS4_NO_GPU */
+#ifndef DS4_NO_GPU
 
 /* =========================================================================
  * Metal Release Graph Allocation.
@@ -10931,7 +7262,7 @@ static bool metal_graph_ensure_batch_ffn_out(ds4_gpu_graph *g) {
 
 /* Allocate the Metal graph state for a chosen raw-cache capacity.  The model
  * weights are not copied here; tensors reference the mapped GGUF. */
-static bool metal_graph_layer_is_active(const ds4_gpu_graph *g, uint32_t il) {
+bool metal_graph_layer_is_active(const ds4_gpu_graph *g, uint32_t il) {
     if (!g) return il < (uint32_t)DS4_N_LAYER;
     /* The single-block MTP drafter reuses graph compressor/indexer state at
      * synthetic layer index 1.  Keep that small state allocated on a layer-slice
@@ -10941,7 +7272,7 @@ static bool metal_graph_layer_is_active(const ds4_gpu_graph *g, uint32_t il) {
     return il >= g->active_layer_start && il <= g->active_layer_end && il < (uint32_t)DS4_N_LAYER;
 }
 
-static bool metal_graph_alloc_raw_cap(
+bool metal_graph_alloc_raw_cap(
         ds4_gpu_graph *g,
         const ds4_weights     *weights,
         const ds4_layer_weights *layer,
@@ -11340,7 +7671,7 @@ static bool metal_graph_alloc_raw_cap(
     return ok;
 }
 
-static bool metal_graph_alloc(
+bool metal_graph_alloc(
         ds4_gpu_graph *g,
         const ds4_weights     *weights,
         const ds4_layer_weights *layer) {
@@ -11348,7 +7679,7 @@ static bool metal_graph_alloc(
                                      0, (uint32_t)DS4_N_LAYER - 1u, false);
 }
 
-static uint32_t metal_graph_raw_span_for_batch(
+uint32_t metal_graph_raw_span_for_batch(
         const ds4_gpu_graph *g,
         uint32_t               pos0,
         uint32_t               n_tokens) {
@@ -11366,7 +7697,7 @@ static uint32_t metal_graph_raw_span_for_batch(
     return (uint32_t)needed;
 }
 
-static uint32_t metal_graph_raw_start_for_span(
+uint32_t metal_graph_raw_start_for_span(
         const ds4_gpu_graph *g,
         uint32_t               last_pos,
         uint32_t               n_raw) {
@@ -11389,7 +7720,9 @@ static uint32_t metal_graph_raw_start_for_span(
  * not evict visible raw rows.  If the raw cache is ever reduced to a strict
  * 128-row ring, speculative raw rows must become shadow rows and be copied
  * into the ring only on commit. */
-static bool metal_graph_capture_prefix1_attn_state(ds4_gpu_graph *g, uint32_t il) {
+#endif /* !DS4_NO_GPU */
+#ifndef DS4_NO_GPU
+bool metal_graph_capture_prefix1_attn_state(ds4_gpu_graph *g, uint32_t il) {
     if (!g->spec_capture_prefix1 || !g->spec_prefix1_attn_state_kv[il]) return true;
     const uint64_t bytes = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
     g->spec_prefix1_n_comp[il] = g->layer_n_comp[il];
@@ -11399,7 +7732,7 @@ static bool metal_graph_capture_prefix1_attn_state(ds4_gpu_graph *g, uint32_t il
                                  g->layer_attn_state_score[il], 0, bytes) != 0;
 }
 
-static bool metal_graph_capture_prefix1_index_state(ds4_gpu_graph *g, uint32_t il) {
+bool metal_graph_capture_prefix1_index_state(ds4_gpu_graph *g, uint32_t il) {
     if (!g->spec_capture_prefix1 || !g->spec_prefix1_index_state_kv[il]) return true;
     const uint64_t bytes = ds4_gpu_tensor_bytes(g->layer_index_state_kv[il]);
     g->spec_prefix1_n_index_comp[il] = g->layer_n_index_comp[il];
@@ -11409,7 +7742,7 @@ static bool metal_graph_capture_prefix1_index_state(ds4_gpu_graph *g, uint32_t i
                                  g->layer_index_state_score[il], 0, bytes) != 0;
 }
 
-static uint32_t metal_graph_decode_indexer_sparse_threshold(const ds4_gpu_graph *g) {
+uint32_t metal_graph_decode_indexer_sparse_threshold(const ds4_gpu_graph *g) {
     (void)g;
     static int parsed = -1;
     static uint32_t cached = 0;
@@ -11461,42 +7794,42 @@ static bool metal_graph_env_flag(const char *name, int *cache) {
     return *cache != 0;
 }
 
-static bool metal_graph_use_reference_hc_decode(void) {
+bool metal_graph_use_reference_hc_decode(void) {
     static int cache = -1;
     return metal_graph_env_flag("DS4_METAL_DISABLE_HC_FUSION", &cache);
 }
 
-static bool metal_graph_use_reference_kv_decode(void) {
+bool metal_graph_use_reference_kv_decode(void) {
     static int cache = -1;
     return metal_graph_env_flag("DS4_METAL_DISABLE_KV_FUSION", &cache);
 }
 
-static bool metal_graph_use_reference_qkv_norm(void) {
+bool metal_graph_use_reference_qkv_norm(void) {
     static int cache = -1;
     return metal_graph_env_flag("DS4_METAL_DISABLE_QKV_NORM_FUSION", &cache);
 }
 
-static bool metal_graph_use_reference_compressor_pair_proj(void) {
+bool metal_graph_use_reference_compressor_pair_proj(void) {
     static int cache = -1;
     return metal_graph_env_flag("DS4_METAL_DISABLE_COMPRESSOR_PAIR_PROJ", &cache);
 }
 
-static bool metal_graph_use_reference_hc_norm_decode(void) {
+bool metal_graph_use_reference_hc_norm_decode(void) {
     static int cache = -1;
     return metal_graph_env_flag("DS4_METAL_DISABLE_HC_NORM_FUSION", &cache);
 }
 
-static bool metal_graph_use_reference_shared_down_hc(void) {
+bool metal_graph_use_reference_shared_down_hc(void) {
     static int cache = -1;
     return metal_graph_env_flag("DS4_METAL_DISABLE_SHARED_DOWN_HC_FUSION", &cache);
 }
 
-static bool metal_graph_use_reference_attn_out_hc(void) {
+bool metal_graph_use_reference_attn_out_hc(void) {
     static int cache = -1;
     return metal_graph_env_flag("DS4_METAL_DISABLE_ATTN_OUT_HC_FUSION", &cache);
 }
 
-static bool metal_graph_decode_hc_pre(
+bool metal_graph_decode_hc_pre(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *split,
         const ds4_gpu_tensor *mix,
@@ -11535,7 +7868,7 @@ static bool metal_graph_decode_hc_pre(
                                                   DS4_HC_EPS) != 0;
 }
 
-static bool metal_graph_decode_kv_store(
+bool metal_graph_decode_kv_store(
         ds4_gpu_tensor *kv,
         ds4_gpu_tensor *raw_cache,
         uint32_t          raw_cap,
@@ -11558,7 +7891,7 @@ static uint64_t metal_graph_attn_comp_cache_row_bytes(void) {
            (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
 }
 
-static uint32_t metal_graph_attn_comp_cache_is_f16(void) {
+uint32_t metal_graph_attn_comp_cache_is_f16(void) {
     return DS4_GPU_ATTN_COMP_CACHE_F16 ? 1u : 0u;
 }
 
@@ -11593,7 +7926,7 @@ static bool metal_graph_store_attn_comp_stage(
                                count * sizeof(float)) != 0;
 }
 
-static ds4_gpu_tensor *metal_graph_attn_comp_update_target(
+ds4_gpu_tensor *metal_graph_attn_comp_update_target(
         ds4_gpu_graph *g,
         uint32_t       il) {
     return DS4_GPU_ATTN_COMP_CACHE_F16
@@ -11601,11 +7934,11 @@ static ds4_gpu_tensor *metal_graph_attn_comp_update_target(
         : g->layer_attn_comp_cache[il];
 }
 
-static uint32_t metal_graph_attn_comp_update_row(uint32_t row) {
+uint32_t metal_graph_attn_comp_update_row(uint32_t row) {
     return DS4_GPU_ATTN_COMP_CACHE_F16 ? 0u : row;
 }
 
-static bool metal_graph_commit_attn_comp_stage(
+bool metal_graph_commit_attn_comp_stage(
         ds4_gpu_graph *g,
         uint32_t       il,
         uint32_t       first_row,
@@ -11614,7 +7947,7 @@ static bool metal_graph_commit_attn_comp_stage(
     return metal_graph_store_attn_comp_stage(g, il, first_row, rows);
 }
 
-static ds4_gpu_tensor *metal_graph_attn_comp_row_view(
+ds4_gpu_tensor *metal_graph_attn_comp_row_view(
         ds4_gpu_graph *g,
         uint32_t       il,
         uint32_t       row) {
@@ -11628,7 +7961,7 @@ static ds4_gpu_tensor *metal_graph_attn_comp_row_view(
                                (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
 }
 
-static ds4_gpu_tensor *metal_graph_attn_comp_prefill_target(
+ds4_gpu_tensor *metal_graph_attn_comp_prefill_target(
         ds4_gpu_graph *g,
         uint32_t       il,
         uint32_t       first_row,
@@ -11640,37 +7973,17 @@ static ds4_gpu_tensor *metal_graph_attn_comp_prefill_target(
                                (uint64_t)view_rows * DS4_N_HEAD_DIM * sizeof(float));
 }
 
-static void metal_graph_attn_comp_prefill_target_free(ds4_gpu_tensor *t) {
+void metal_graph_attn_comp_prefill_target_free(ds4_gpu_tensor *t) {
     if (!DS4_GPU_ATTN_COMP_CACHE_F16) ds4_gpu_tensor_free(t);
 }
 
 /* Encode one DS4 decode layer on Metal.  This is the release single-token
  * layer path; diagnostics reuse it so they compare exactly what generation
  * runs. */
-static bool metal_graph_indexer_stage_profile_boundary(
-        const char *stage,
-        uint32_t    il,
-        uint32_t    pos0,
-        uint32_t    n_tokens,
-        uint32_t    n_comp,
-        double     *stage_t0);
-static bool metal_graph_layer_stage_profile_boundary(
-        const char *part,
-        const char *stage,
-        uint32_t    il,
-        uint32_t    pos0,
-        uint32_t    n_tokens,
-        double     *stage_t0);
-static bool metal_graph_matmul_plain_tensor(
-        ds4_gpu_tensor       *out,
-        const ds4_model        *model,
-        const ds4_tensor       *w,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
-        uint64_t                n_tok);
 
-static bool metal_graph_encode_decode_layer(
+#endif /* !DS4_NO_GPU */
+#ifndef DS4_NO_GPU
+bool metal_graph_encode_decode_layer(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
         const ds4_layer_weights *layer,
@@ -12844,7 +9157,9 @@ static bool metal_graph_encode_decode_layer(
 }
 
 /* Encode the final HC collapse, output norm, and vocab projection on Metal. */
-static bool metal_graph_encode_output_head(
+#endif /* !DS4_NO_GPU */
+#ifndef DS4_NO_GPU
+bool metal_graph_encode_output_head(
         ds4_gpu_graph *g,
         const ds4_model       *model,
         const ds4_weights     *weights,
@@ -12908,7 +9223,7 @@ static bool metal_graph_encode_output_head(
  * tiny MTP suffixes we instead process all rows together and let the GPU reduce
  * each row to a top id; the CPU reads back just those ids plus the last row's
  * logits needed to continue the exact target stream. */
-static bool metal_graph_encode_output_head_batch(
+bool metal_graph_encode_output_head_batch(
         ds4_gpu_graph *g,
         const ds4_model       *model,
         const ds4_weights     *weights,
@@ -12989,7 +9304,7 @@ static bool metal_graph_encode_output_head_batch(
     return ok;
 }
 
-static bool metal_graph_matmul_plain_tensor(
+bool metal_graph_matmul_plain_tensor(
         ds4_gpu_tensor       *out,
         const ds4_model        *model,
         const ds4_tensor       *w,
@@ -13009,7 +9324,7 @@ static bool metal_graph_matmul_plain_tensor(
     return false;
 }
 
-static bool metal_graph_matmul_q8_0_named_tensor(
+bool metal_graph_matmul_q8_0_named_tensor(
         const char             *module,
         uint32_t                il,
         uint32_t                pos0,
@@ -13036,7 +9351,7 @@ static bool metal_graph_matmul_q8_0_named_tensor(
  * them to localize drift against the C reference pipeline.
  */
 
-static void metal_graph_trace_layer_stages(
+void metal_graph_trace_layer_stages(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
         const ds4_layer_weights *layer,
@@ -13250,7 +9565,9 @@ static void metal_graph_trace_layer_stages(
     free(cpu_attn_cur);
 }
 
-static int metal_graph_decode_test(
+#endif /* !DS4_NO_GPU */
+#ifndef DS4_NO_GPU
+int metal_graph_decode_test(
         const ds4_model   *model,
         const ds4_weights *weights,
         const token_vec   *prompt) {
@@ -13493,7 +9810,7 @@ static int metal_graph_decode_test(
     return ok ? 0 : 1;
 }
 
-static int metal_graph_first_token_full_test(
+int metal_graph_first_token_full_test(
         const ds4_model   *model,
         const ds4_weights *weights,
         const token_vec   *prompt) {
@@ -13632,6 +9949,8 @@ static int metal_graph_first_token_full_test(
     return ok ? 0 : 1;
 }
 
+#endif /* !DS4_NO_GPU */
+#ifndef DS4_NO_GPU
 /* =========================================================================
  * Metal Release Decode and Prefill.
  * =========================================================================
@@ -13646,11 +9965,11 @@ static bool metal_graph_env_bool_enabled(const char *name) {
     return v && v[0] && !(v[0] == '0' && v[1] == '\0');
 }
 
-static bool metal_graph_direct_expert_read_enabled(void) {
+bool metal_graph_direct_expert_read_enabled(void) {
     return metal_graph_env_bool_enabled("DS4_METAL_EXPERT_OFFLOAD_DIRECT");
 }
 
-static uint32_t metal_graph_token_split_after_layers(void) {
+uint32_t metal_graph_token_split_after_layers(void) {
     uint32_t split_after_layers = metal_graph_direct_expert_read_enabled() ? 1u : 4u;
     const char *split_env = getenv("DS4_METAL_GRAPH_TOKEN_SPLIT_LAYERS");
     if (split_env && split_env[0]) {
@@ -13663,7 +9982,7 @@ static uint32_t metal_graph_token_split_after_layers(void) {
 
 /* Encode a full single-token decode step on Metal.  This is the generation
  * hot path: update caches, run all layers, then produce logits. */
-static bool metal_graph_encode_token_raw_swa(
+bool metal_graph_encode_token_raw_swa(
         ds4_gpu_graph *g,
         const ds4_model       *model,
         const ds4_weights     *weights,
@@ -13733,7 +10052,7 @@ static bool metal_graph_encode_token_raw_swa(
     return ok;
 }
 
-static ds4_gpu_tensor *metal_graph_tensor_row_view(
+ds4_gpu_tensor *metal_graph_tensor_row_view(
         ds4_gpu_tensor *base,
         uint32_t          row,
         uint64_t          row_values) {
@@ -13743,7 +10062,7 @@ static ds4_gpu_tensor *metal_graph_tensor_row_view(
 }
 
 /* Upload prompt token ids for kernels that need token-aware hash routing. */
-static bool metal_graph_upload_prompt_tokens(
+bool metal_graph_upload_prompt_tokens(
         ds4_gpu_tensor *out_tokens,
         const token_vec  *prompt,
         uint32_t          pos0,
@@ -13765,7 +10084,7 @@ static bool metal_graph_upload_prompt_tokens(
 
 /* Rebuild ratio-4 compressor state after chunked prefill so a following decode
  * token sees the same rolling compression window. */
-static bool metal_graph_refresh_ratio4_compressor_state(
+bool metal_graph_refresh_ratio4_compressor_state(
         ds4_gpu_graph  *g,
         const ds4_model  *model,
         ds4_gpu_tensor *state_kv,
@@ -13868,7 +10187,7 @@ static bool metal_graph_upload_prompt_embeddings_hc_cpu(
 /* Seed the batched HC state from token ids: every HC stream starts as the same
  * 4096-wide embedding.  Long prefill chunks use the Metal get-rows/repeat
  * kernel so the CPU does not build and upload a large [token, HC, dim] tensor. */
-static bool metal_graph_upload_prompt_embeddings_hc(
+bool metal_graph_upload_prompt_embeddings_hc(
         ds4_gpu_tensor   *out_hc,
         ds4_gpu_tensor   *tokens,
         const ds4_model    *model,
@@ -13909,7 +10228,7 @@ static bool metal_graph_upload_prompt_embeddings_hc(
                                                        n_tokens);
 }
 
-static bool metal_graph_warmup_prefill_kernels(
+bool metal_graph_warmup_prefill_kernels(
         ds4_gpu_graph   *g,
         const ds4_model   *model,
         const ds4_weights *weights,
@@ -13950,7 +10269,7 @@ static bool metal_graph_warmup_prefill_kernels(
 
 /* Encode the batched prefill attention half for one layer.  It mirrors the CPU
  * layer-major path: HC pre/norm, Q/KV, cache/compression, prefix attention. */
-static bool metal_graph_indexer_stage_profile_boundary(
+bool metal_graph_indexer_stage_profile_boundary(
         const char *stage,
         uint32_t    il,
         uint32_t    pos0,
@@ -13977,7 +10296,7 @@ static bool metal_graph_indexer_stage_profile_boundary(
  * command buffer and waits, so the printed number includes encoding plus GPU
  * execution for the stage just emitted. This is disabled by default because it
  * adds synchronization points and changes scheduling. */
-static bool metal_graph_layer_stage_profile_boundary(
+bool metal_graph_layer_stage_profile_boundary(
         const char *part,
         const char *stage,
         uint32_t    il,
@@ -13998,7 +10317,7 @@ static bool metal_graph_layer_stage_profile_boundary(
     return ds4_gpu_begin_commands() != 0;
 }
 
-static bool metal_graph_q_stage_profile_boundary(
+bool metal_graph_q_stage_profile_boundary(
         const char *stage,
         uint32_t    il,
         uint32_t    pos0,
@@ -14017,20 +10336,9 @@ static bool metal_graph_q_stage_profile_boundary(
     return ds4_gpu_begin_commands() != 0;
 }
 
-/* stages 位掩码(2026-08-21 请求批处理): 1=投影段(hc mix/norm/q/kv, 行无关)
- * 2=KV 段(压缩器/索引器/注意力, 每行要自己的缓存) 4=出口段(inv_rope/o 投影/hc post,
- * 行无关)。默认 7 = 整半层, 与改造前逐字节一致。多会话批解码用 1|4 在共享图上批算
- * 行无关部分, 用 2 逐会话在各自图上算 KV 段。 */
-#define DS4_ATTN_STAGE_PRE   1u
-#define DS4_ATTN_STAGE_KV    2u
-#define DS4_ATTN_STAGE_POST  4u
-#define DS4_ATTN_STAGE_ALL   7u
-/* 8 = 投影段里跳过 q/kv 的 rope 与 kv 的 fp8 量化(它们依赖"这一行的真实位置")。
- * 多会话批解码时 N 行来自不同会话、位置各不相同, 而 rope 入口只吃一个 pos0 —— 于是
- * 投影段先不做 rope, 由驱动按行用真实位置逐行补(rope 是逐元素的, 逐行调同一个入口,
- * 数值与整批调用逐位一致)。 */
-#define DS4_ATTN_STAGE_NOROPE 8u
-static bool metal_graph_encode_layer_attention_batch_stages(
+#endif /* !DS4_NO_GPU */
+#ifndef DS4_NO_GPU
+bool metal_graph_encode_layer_attention_batch_stages(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
         const ds4_layer_weights *layer,
@@ -15458,18 +11766,12 @@ static bool metal_graph_encode_layer_attention_batch_stages(
 #undef DS4_METAL_PROFILE_Q_STAGE
     return ok;
 }
+#endif /* !DS4_NO_GPU */
+#ifndef DS4_NO_GPU
 
 /* Encode the batched prefill FFN half: HC pre/norm, shared expert, routed
  * experts, sum, and HC post. */
-static bool metal_graph_encode_layer_ffn_batch_ex(
-        ds4_gpu_graph  *g,
-        const ds4_model        *model,
-        const ds4_layer_weights *layer,
-        uint32_t                il,
-        uint32_t                pos0,
-        uint32_t                n_tokens,
-        bool                    no_zchain);
-static bool metal_graph_encode_layer_ffn_batch(
+bool metal_graph_encode_layer_ffn_batch(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
         const ds4_layer_weights *layer,
@@ -15478,7 +11780,7 @@ static bool metal_graph_encode_layer_ffn_batch(
         uint32_t                n_tokens) {
     return metal_graph_encode_layer_ffn_batch_ex(g, model, layer, il, pos0, n_tokens, false);
 }
-static bool metal_graph_encode_layer_ffn_batch_ex(
+bool metal_graph_encode_layer_ffn_batch_ex(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
         const ds4_layer_weights *layer,
@@ -15919,7 +12221,9 @@ static bool metal_graph_encode_layer_ffn_batch_ex(
  * 挂在 HC 交换之后 —— 那时 batch_cur_hc 才是本层出口。GPU 定格用 cap_batch_layer
  * 同款 signal→flush→host_wait: 本层的核还在队列里, 不 drain 就 read 会拿到上一层
  * 残值(2026-07-22 那次 off-by-one 就是这么来的)。流式写盘, 不驻留。 */
-static void eval_hdump_batch_layer(ds4_gpu_graph *g, uint32_t il, uint32_t n_tokens) {
+#endif /* !DS4_NO_GPU */
+#ifndef DS4_NO_GPU
+void eval_hdump_batch_layer(ds4_gpu_graph *g, uint32_t il, uint32_t n_tokens) {
     const char *dir = getenv("DS4_EVAL_HDUMP");
     if (!dir || !dir[0] || n_tokens == 0) return;
     {
@@ -15947,7 +12251,7 @@ static void eval_hdump_batch_layer(ds4_gpu_graph *g, uint32_t il, uint32_t n_tok
     free(buf);
 }
 
-static bool metal_graph_encode_layer_attention_batch(
+bool metal_graph_encode_layer_attention_batch(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
         const ds4_layer_weights *layer,
@@ -15958,7 +12262,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                            n_tokens, DS4_ATTN_STAGE_ALL);
 }
 
-static bool metal_graph_encode_layer_batch(
+bool metal_graph_encode_layer_batch(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
         const ds4_layer_weights *layer,
@@ -16036,7 +12340,7 @@ static bool metal_graph_encode_layer_batch(
 /* spec replay 消除(2026-08-20): restore(轮前态)后, 用 verify 批捕获的压缩器/indexer
  * 输入行快进 acc 位。与 replay 全前向等价 —— KV raw 行 verify 已写好且 restore 不动,
  * 唯一需要推进的就是压缩器滚动态; 输入行两次前向逐位相同(同 token 同前缀)。 */
-static bool metal_graph_spec_comp_fastforward(ds4_gpu_graph *g, const ds4_model *model,
+bool metal_graph_spec_comp_fastforward(ds4_gpu_graph *g, const ds4_model *model,
                                               const ds4_weights *weights,
                                               uint32_t pos0, uint32_t acc) {
     bool ok = true;
@@ -16126,7 +12430,7 @@ static bool metal_graph_spec_comp_fastforward(ds4_gpu_graph *g, const ds4_model 
  * 于是被拒候选的行会盖掉"仍在窗内"的旧位置, 且此后没有任何东西把它们改回来 ——
  * 主模型后续 token 的注意力就会读到被拒草稿的 KV。写前存旧行, 定了 acc 再把被拒的还原。
  * 行是 (pos0+t)%cap 连续段, 最多两段拷贝/层。 */
-static bool metal_graph_spec_raw_snapshot(ds4_gpu_graph *g, uint32_t il, uint32_t pos0, uint32_t n) {
+bool metal_graph_spec_raw_snapshot(ds4_gpu_graph *g, uint32_t il, uint32_t pos0, uint32_t n) {
     if (il >= (uint32_t)DS4_N_LAYER || !g->spec_raw_save[il] || !g->layer_raw_cache[il] ||
         n == 0 || n > (uint32_t)DS4_DSPARK_BLK + 1u || g->raw_cap == 0) return true;
     const uint64_t rb = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
@@ -16140,7 +12444,7 @@ static bool metal_graph_spec_raw_snapshot(ds4_gpu_graph *g, uint32_t il, uint32_
     return true;
 }
 
-static bool metal_graph_spec_raw_restore(ds4_gpu_graph *g, uint32_t pos0, uint32_t from, uint32_t to) {
+bool metal_graph_spec_raw_restore(ds4_gpu_graph *g, uint32_t pos0, uint32_t from, uint32_t to) {
     if (from >= to || g->raw_cap == 0) return true;
     /* 被拒的是 [from,to) 这一段连续位置 ⇒ 环上最多两段, 每层 1-2 次拷贝(逐行拷会发
      * 215 次小拷贝, 实测吃掉 ~3ms/轮)。 */
@@ -16162,7 +12466,7 @@ static bool metal_graph_spec_raw_restore(ds4_gpu_graph *g, uint32_t pos0, uint32
 }
 
 /* 把 verify 批暂存的 drafter KV 按接受数提交进环形窗(只提交真正被接受的位置)。 */
-static bool metal_graph_dspark_win_commit(ds4_gpu_graph *g, uint32_t pos0, uint32_t n_acc) {
+bool metal_graph_dspark_win_commit(ds4_gpu_graph *g, uint32_t pos0, uint32_t n_acc) {
     if (n_acc == 0) return true;
     for (uint32_t b = 0; b < 3u; b++) {
         if (!g->dspark_spec_kv[b] || !g->dspark_win_kv[b]) continue;
@@ -16173,7 +12477,7 @@ static bool metal_graph_dspark_win_commit(ds4_gpu_graph *g, uint32_t pos0, uint3
     return true;
 }
 
-static bool metal_graph_dspark_state_snapshot(ds4_gpu_graph *g) {
+bool metal_graph_dspark_state_snapshot(ds4_gpu_graph *g) {
     for (uint32_t il = 0; il < (uint32_t)DS4_N_LAYER; il++) {
         if (!g->spec_prefix1_attn_state_kv[il] || !g->layer_attn_state_kv[il]) continue;
         const uint64_t bytes = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
@@ -16194,7 +12498,7 @@ static bool metal_graph_dspark_state_snapshot(ds4_gpu_graph *g) {
     return true;
 }
 
-static bool metal_graph_dspark_state_restore(ds4_gpu_graph *g) {
+bool metal_graph_dspark_state_restore(ds4_gpu_graph *g) {
     for (uint32_t il = 0; il < (uint32_t)DS4_N_LAYER; il++) {
         if (!g->spec_prefix1_attn_state_kv[il] || !g->layer_attn_state_kv[il]) continue;
         const uint64_t bytes = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
@@ -16216,7 +12520,9 @@ static bool metal_graph_dspark_state_restore(ds4_gpu_graph *g) {
 }
 
 /* out_conf(可空): 逐位置置信 c_k, 调度器用 ∏c 选验证长度(论文 Alg.1)。 */
-static bool metal_graph_dspark_step_n(
+#endif /* !DS4_NO_GPU */
+#ifndef DS4_NO_GPU
+bool metal_graph_dspark_step_n(
         ds4_gpu_graph *g,
         const ds4_model *model,
         const ds4_weights *weights,
@@ -16642,7 +12948,7 @@ static bool metal_graph_dspark_step_n(
 #undef SP_MARK
 }
 
-static bool metal_graph_dspark_step(
+bool metal_graph_dspark_step(
         ds4_gpu_graph *g, const ds4_model *model, const ds4_weights *weights,
         const ds4_dspark_weights *dw, int anchor_token, uint32_t pos,
         int out_ids[DS4_DSPARK_BLK]) {
@@ -16650,7 +12956,9 @@ static bool metal_graph_dspark_step(
                                     DS4_DSPARK_BLK, NULL);
 }
 
-static bool metal_graph_eval_token_raw_swa(
+#endif /* !DS4_NO_GPU */
+#ifndef DS4_NO_GPU
+bool metal_graph_eval_token_raw_swa(
         ds4_gpu_graph *g,
         const ds4_model       *model,
         const ds4_weights     *weights,
@@ -16734,24 +13042,8 @@ static bool metal_graph_eval_token_raw_swa(
  * by expert: one tensor entry contains `n_expert * n_columns` floats and the
  * quantizer slices the vector for each expert.
  */
-typedef struct {
-    float *gate_up_sum2;   /* [active layer][active expert][hidden] */
-    float *down_sum2;      /* [active layer][active expert][expert FFN] */
-    uint32_t gate_up_count[DS4_MAX_LAYER][DS4_MAX_EXPERT];
-    uint32_t down_count[DS4_MAX_LAYER][DS4_MAX_EXPERT];
-    float *ffn_norm_buf;
-    float *routed_mid_buf;
-    uint16_t *routed_mid_f16_buf;
-    int   *selected_buf;
-    float *sq_tmp;
-    uint32_t cap_tokens;
-    uint64_t observed_tokens;
-    uint64_t observed_routes;
-    uint32_t chunks;
-    const char *dataset_path;
-} ds4_imatrix_collector;
 
-static bool imatrix_collector_init(ds4_imatrix_collector *c, uint32_t cap_tokens, const char *dataset_path) {
+bool imatrix_collector_init(ds4_imatrix_collector *c, uint32_t cap_tokens, const char *dataset_path) {
     memset(c, 0, sizeof(*c));
     c->cap_tokens = cap_tokens ? cap_tokens : 1u;
     c->dataset_path = dataset_path;
@@ -16768,7 +13060,7 @@ static bool imatrix_collector_init(ds4_imatrix_collector *c, uint32_t cap_tokens
            c->routed_mid_buf && c->routed_mid_f16_buf && c->selected_buf && c->sq_tmp;
 }
 
-static void imatrix_collector_free(ds4_imatrix_collector *c) {
+void imatrix_collector_free(ds4_imatrix_collector *c) {
     if (!c) return;
     free(c->gate_up_sum2);
     free(c->down_sum2);
@@ -16788,7 +13080,7 @@ static float *imatrix_down_ptr(ds4_imatrix_collector *c, uint32_t il, uint32_t e
     return c->down_sum2 + ((size_t)il * DS4_N_EXPERT + expert) * DS4_N_FF_EXP;
 }
 
-static bool imatrix_collect_layer_batch(
+bool imatrix_collect_layer_batch(
         ds4_imatrix_collector *c,
         ds4_gpu_graph         *g,
         uint32_t               il,
@@ -16877,7 +13169,7 @@ static void imatrix_write_entry(
     free(tmp);
 }
 
-static bool imatrix_collector_save(
+bool imatrix_collector_save(
         const ds4_imatrix_collector *c,
         const ds4_weights           *weights,
         const char                  *path) {
@@ -16929,7 +13221,9 @@ static bool imatrix_collector_save(
     return true;
 }
 
-static bool metal_graph_reset_prefill_state(ds4_gpu_graph *g) {
+#endif /* !DS4_NO_GPU */
+#ifndef DS4_NO_GPU
+bool metal_graph_reset_prefill_state(ds4_gpu_graph *g) {
     memset(g->layer_n_comp, 0, sizeof(g->layer_n_comp));
     memset(g->layer_n_index_comp, 0, sizeof(g->layer_n_index_comp));
     g->mtp_n_raw = 0;
@@ -16969,7 +13263,7 @@ static void metal_graph_report_prefill_display_progress(
                      (int)(start + (uint32_t)done), total);
 }
 
-static bool metal_graph_prefill_layer_major(
+bool metal_graph_prefill_layer_major(
         ds4_gpu_graph *g,
         const ds4_model       *model,
         const ds4_weights     *weights,
@@ -17262,7 +13556,7 @@ static bool metal_graph_prefill_layer_major(
     return ok;
 }
 
-static bool metal_graph_prefill_raw_swa(
+bool metal_graph_prefill_raw_swa(
         ds4_gpu_graph *g,
         const ds4_model       *model,
         const ds4_weights     *weights,
@@ -17295,7 +13589,9 @@ static bool metal_graph_prefill_raw_swa(
  * compression windows and row finalization follow the same schedule after the
  * cached prefix.
  */
-static bool metal_graph_prefill_chunked_range(
+#endif /* !DS4_NO_GPU */
+#ifndef DS4_NO_GPU
+bool metal_graph_prefill_chunked_range(
         ds4_gpu_graph *g,
         const ds4_model       *model,
         const ds4_weights     *weights,
@@ -17388,7 +13684,7 @@ static bool metal_graph_prefill_chunked_range(
 
 /* Long prompts are prefetched in fixed-size chunks.  Chunks bound transient
  * attention buffers while preserving the same final KV/cache state. */
-static bool metal_graph_prefill_chunked(
+bool metal_graph_prefill_chunked(
         ds4_gpu_graph *g,
         const ds4_model       *model,
         const ds4_weights     *weights,
@@ -17418,7 +13714,7 @@ static bool metal_graph_prefill_chunked(
 
 /* Pick a raw SWA cache size for Metal.  During batched prefill it must cover
  * the previous window plus the current ubatch. */
-static uint32_t metal_graph_raw_cap_for_context(int ctx_size, uint32_t prefill_cap) {
+uint32_t metal_graph_raw_cap_for_context(int ctx_size, uint32_t prefill_cap) {
     uint32_t raw_window = DS4_N_SWA;
     if (raw_window > (uint32_t)ctx_size) raw_window = (uint32_t)ctx_size;
     if (raw_window == 0) raw_window = 1;
@@ -17454,7 +13750,7 @@ static uint32_t metal_graph_raw_cap_for_context(int ctx_size, uint32_t prefill_c
 
 /* Choose the prefill ubatch size.  Whole-batch is fastest for normal prompts;
  * long prompts default to 4096-token chunks. */
-static uint32_t metal_graph_prefill_cap_for_prompt(int prompt_len) {
+uint32_t metal_graph_prefill_cap_for_prompt(int prompt_len) {
     return ds4_default_prefill_cap_for_prompt(prompt_len);
 }
 
@@ -17462,7 +13758,7 @@ static uint32_t metal_graph_prefill_cap_for_prompt(int prompt_len) {
  * the KV cache with batched prefill instead of single-token decode.  On an M3
  * Max, prefill is faster from 2-token suffixes upward; keep the default at 4
  * as a conservative crossover.  The env knob remains useful for retuning. */
-static uint32_t metal_graph_resume_prefill_min_tokens(void) {
+uint32_t metal_graph_resume_prefill_min_tokens(void) {
     const char *env = getenv("DS4_METAL_RESUME_PREFILL_MIN");
     if (env && env[0]) {
         char *endp = NULL;
@@ -17546,7 +13842,7 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size
     return m;
 }
 
-static int metal_graph_prompt_logits_test(
+int metal_graph_prompt_logits_test(
         const ds4_model   *model,
         const ds4_weights *weights,
         const token_vec   *prompt,
@@ -17725,11 +14021,8 @@ static int metal_graph_prompt_logits_test(
     return ok ? 0 : 1;
 }
 
-#endif
-
-typedef struct ds4_vocab ds4_vocab;
-
-static void embed_prompt(
+#endif /* !DS4_NO_GPU */
+void embed_prompt(
         const ds4_model   * model,
         const ds4_weights * weights,
         const token_vec   * tokens,
@@ -17751,36 +14044,24 @@ static void embed_prompt(
  * ID; user text goes through BPE.
  */
 
-typedef struct {
-    ds4_str key;
-    int value;
-    bool used;
-} str_i32_entry;
-
-typedef struct {
-    str_i32_entry *entry;
-    uint64_t cap;
-    uint64_t used;
-} str_i32_table;
-
 static uint64_t next_pow2(uint64_t n) {
     uint64_t p = 1;
     while (p < n) p <<= 1;
     return p;
 }
 
-static void table_init(str_i32_table *t, uint64_t expected) {
+void table_init(str_i32_table *t, uint64_t expected) {
     t->cap = next_pow2(expected * 2 + 16);
     t->used = 0;
     t->entry = xcalloc((size_t)t->cap, sizeof(t->entry[0]));
 }
 
-static void table_free(str_i32_table *t) {
+void table_free(str_i32_table *t) {
     free(t->entry);
     memset(t, 0, sizeof(*t));
 }
 
-static void table_put(str_i32_table *t, ds4_str key, int value) {
+void table_put(str_i32_table *t, ds4_str key, int value) {
     uint64_t mask = t->cap - 1;
     uint64_t i = hash_bytes(key.ptr, key.len) & mask;
 
@@ -17798,7 +14079,7 @@ static void table_put(str_i32_table *t, ds4_str key, int value) {
     t->used++;
 }
 
-static bool table_get(const str_i32_table *t, const char *ptr, uint64_t len, int *value) {
+bool table_get(const str_i32_table *t, const char *ptr, uint64_t len, int *value) {
     if (t->cap == 0) return false;
 
     uint64_t mask = t->cap - 1;
@@ -17815,7 +14096,7 @@ static bool table_get(const str_i32_table *t, const char *ptr, uint64_t len, int
     return false;
 }
 
-static void token_vec_push(token_vec *tv, int token) {
+void token_vec_push(token_vec *tv, int token) {
     if (tv->len == tv->cap) {
         tv->cap = tv->cap ? tv->cap * 2 : 64;
         tv->v = xrealloc(tv->v, (size_t)tv->cap * sizeof(tv->v[0]));
@@ -17823,7 +14104,7 @@ static void token_vec_push(token_vec *tv, int token) {
     tv->v[tv->len++] = token;
 }
 
-static void token_vec_free(token_vec *tv) {
+void token_vec_free(token_vec *tv) {
     free(tv->v);
     memset(tv, 0, sizeof(*tv));
 }
@@ -17849,59 +14130,12 @@ bool ds4_tokens_starts_with(const ds4_tokens *tokens, const ds4_tokens *prefix) 
     return true;
 }
 
-struct ds4_vocab {
-    ds4_str *token;
-    int n_vocab;
-    int bos_id;
-    int eos_id;
-    int user_id;
-    int assistant_id;
-    int think_start_id;
-    int think_end_id;
-    int dsml_id;
-    str_i32_table token_to_id;
-    str_i32_table merge_rank;
-};
-
-struct ds4_engine {
-    ds4_model model;
-    ds4_model mtp_model;
-    ds4_vocab vocab;
-    ds4_weights weights;
-    ds4_mtp_weights mtp_weights;
-    ds4_dspark_weights dspark;    /* 0731 官方块并行 drafter(v3+ GGUF 内嵌) */
-    ds4_backend backend;
-    int mtp_draft_tokens;
-    float mtp_margin;
-    /* Go trie drafter for copy-spec (--go-trie / DS4_GO_TRIE); NULL = off. */
-    /* knowledge-MTP reference corpus (ds4_mtp.c: built-in idioms +
-     * DS4_REF_CORPUS extension files). Always built at init; NULL only on
-     * OOM, and every module entry point accepts NULL as "no corpus". */
-    /* 多模态 registry (ds4_multimodal.c): modality -> text/tokens. The
-     * "image" family auto-binds the frontend-domain UI-sketch encoder at
-     * open (DS4_MM_IMAGE_CMD env > ./mm-ui). NULL only on OOM; consumers
-     * fail closed on NULL rather than fake support. */
-    ds4_mm *mm;
-    char *directional_steering_file;
-    float *directional_steering_dirs;
-    float directional_steering_attn_scale;
-    float directional_steering_ffn_scale;
-    int power_percent;
-    bool quality;
-    ds4_distributed_options distributed;
-    bool metal_ready;
-    bool mtp_ready;
-    /* TP peer connection (Stage 2). Established lazily on first session use when
-     * distributed.tp_enabled, shared read-only by the session graph. */
-    ds4_dist_tp *tp;
-    bool tp_owns_low; /* coordinator owns low expert positions */
-};
 
 /* knowledge-MTP bridge (ds4_mtp.c): the module is tokenizer-agnostic, so the
  * engine adapts its own tokenizer to the module callback shape. Token arrays
  * are plain malloc'd (token_vec uses xrealloc), so ownership can move to the
  * module and be freed there. */
-static void engine_tokenize_cb(void *ctx, const char *text, int **toks, int *n) {
+void engine_tokenize_cb(void *ctx, const char *text, int **toks, int *n) {
     ds4_engine *e = ctx;
     ds4_tokens t = {0};
     ds4_tokenize_text(e, text, &t);
@@ -17913,27 +14147,27 @@ static void engine_tokenize_cb(void *ctx, const char *text, int **toks, int *n) 
  * closed-form derivations over the UI-sketch text, registered on the image
  * family at open. Non-sketch encoder output makes them return NULL, which
  * the registry treats as "no section". */
-static char *engine_mm_spatial_enrich(void *ctx, const char *modality,
+char *engine_mm_spatial_enrich(void *ctx, const char *modality,
                                       const char *text) {
     (void)ctx;
     (void)modality;
     return ds4_spatial_annotate(text);
 }
 
-static char *engine_mm_css_enrich(void *ctx, const char *modality,
+char *engine_mm_css_enrich(void *ctx, const char *modality,
                                   const char *text) {
     (void)ctx;
     (void)modality;
     return ds4_css_annotate(text);
 }
 
-static bool cpu_directional_steering_enabled(
+bool cpu_directional_steering_enabled(
         const float *dirs,
         float        scale) {
     return dirs && scale != 0.0f;
 }
 
-static void cpu_directional_steering_project_rows(
+void cpu_directional_steering_project_rows(
         float       *x,
         const float *dirs,
         uint32_t     il,
@@ -17955,7 +14189,7 @@ static void cpu_directional_steering_project_rows(
     }
 }
 
-static bool cpu_load_directional_steering(ds4_engine *e) {
+bool cpu_load_directional_steering(ds4_engine *e) {
     if (!e ||
         (e->directional_steering_attn_scale == 0.0f &&
          e->directional_steering_ffn_scale == 0.0f)) {
@@ -18019,7 +14253,7 @@ static uint32_t gpt2_byte_to_codepoint(uint8_t b) {
 
 /* GPT-2 byte-level BPE first maps raw bytes to printable Unicode codepoints
  * so merges can operate on UTF-8 strings without losing byte identity. */
-static char *byte_encode(ds4_str in, uint64_t *out_len) {
+char *byte_encode(ds4_str in, uint64_t *out_len) {
     char *out = xmalloc((size_t)in.len * 4 + 1);
     char *p = out;
 
@@ -18031,7 +14265,7 @@ static char *byte_encode(ds4_str in, uint64_t *out_len) {
     return out;
 }
 
-static int utf8_len_from_first_byte(uint8_t c) {
+int utf8_len_from_first_byte(uint8_t c) {
     if (c < 0x80) return 1;
     if ((c & 0xe0) == 0xc0) return 2;
     if ((c & 0xf0) == 0xe0) return 3;
@@ -18325,7 +14559,7 @@ static int vocab_lookup(const ds4_vocab *vocab, const char *text) {
 }
 
 /* Load token strings, special token ids, and merge ranks from GGUF metadata. */
-static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
+void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
     memset(vocab, 0, sizeof(*vocab));
 
     ds4_array_ref tokens;
@@ -18367,7 +14601,7 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
     vocab->dsml_id = vocab_lookup(vocab, "｜DSML｜");
 }
 
-static void vocab_free(ds4_vocab *vocab) {
+void vocab_free(ds4_vocab *vocab) {
     free(vocab->token);
     table_free(&vocab->token_to_id);
     table_free(&vocab->merge_rank);
@@ -18438,7 +14672,7 @@ static void tokenize_span(const ds4_vocab *vocab, const char *p, size_t n, token
     free(tmp);
 }
 
-static void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *text,
+void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *text,
                                          token_vec *out) {
     if (!text) text = "";
 
@@ -18508,7 +14742,7 @@ void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_thi
                    e->vocab.think_start_id : e->vocab.think_end_id);
 }
 
-static void dump_tokens_fp(FILE *fp, const ds4_vocab *vocab, const token_vec *tokens) {
+void dump_tokens_fp(FILE *fp, const ds4_vocab *vocab, const token_vec *tokens) {
     fprintf(fp, "[");
     for (int i = 0; i < tokens->len; i++) {
         if (i) fprintf(fp, ", ");
@@ -18524,7 +14758,7 @@ static void dump_tokens_fp(FILE *fp, const ds4_vocab *vocab, const token_vec *to
     }
 }
 
-static void dump_tokens(const ds4_vocab *vocab, const token_vec *tokens) {
+void dump_tokens(const ds4_vocab *vocab, const token_vec *tokens) {
     dump_tokens_fp(stdout, vocab, tokens);
 }
 
@@ -18625,7 +14859,7 @@ int ds4_token_assistant(ds4_engine *e) {
     return e->vocab.assistant_id;
 }
 
-static int sample_argmax(const float *logits, uint32_t n_vocab) {
+int sample_argmax(const float *logits, uint32_t n_vocab) {
     int best = 0;
     float best_v = DS4_NEG_INF;
     for (uint32_t i = 0; i < n_vocab; i++) {
@@ -18774,7 +15008,7 @@ static int sample_full_vocab(
     return id;
 }
 
-static int sample_top_p_min_p(
+int sample_top_p_min_p(
         const float *logits,
         uint32_t     n_vocab,
         float        temperature,
@@ -18836,7 +15070,7 @@ static int sample_top_p_min_p(
     return ids[filtered - 1];
 }
 
-static void print_top_logits(
+void print_top_logits(
         FILE          * fp,
         const char    * label,
         const ds4_vocab * vocab,
@@ -18870,7 +15104,7 @@ static void print_top_logits(
 
 /* CPU generation entry point.  It runs layer-major prefill once, then decodes
  * one token at a time using the persistent KV cache and scratch arena. */
-static int generate_raw_swa_cpu(
+int generate_raw_swa_cpu(
         const ds4_model   * model,
         const ds4_vocab   * vocab,
         const ds4_weights * weights,
@@ -18987,7 +15221,7 @@ static int generate_raw_swa_cpu(
 #ifndef DS4_NO_GPU
 /* Metal generation entry point.  The model runs as one local whole-graph
  * pipeline: chunked/layer-major prefill followed by graph decode steps. */
-static int generate_metal_graph_raw_swa(
+int generate_metal_graph_raw_swa(
         const ds4_model   * model,
         const ds4_vocab   * vocab,
         const ds4_weights * weights,
@@ -19213,6 +15447,10 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size
 }
 #endif
 
+
+static int g_ds4_lock_fd = -1;
+
+
 /* =========================================================================
  * Engine API and Process Lock.
  * =========================================================================
@@ -19274,7 +15512,7 @@ ds4_think_mode ds4_think_mode_for_context(ds4_think_mode mode, int ctx_size) {
     return mode;
 }
 
-static void ds4_release_instance_lock(void) {
+void ds4_release_instance_lock(void) {
     if (g_ds4_lock_fd >= 0) {
         close(g_ds4_lock_fd);
         g_ds4_lock_fd = -1;
@@ -19283,7 +15521,7 @@ static void ds4_release_instance_lock(void) {
 
 /* Refuse to start a second ds4 process.  The model can map tens of GiB, so a
  * stale accidental second run is more dangerous than a normal CLI error. */
-static void ds4_acquire_instance_lock(void) {
+void ds4_acquire_instance_lock(void) {
     const char *path = getenv("DS4_LOCK_FILE");
     if (!path || !path[0]) path = "/tmp/ds4.lock";
 
@@ -19327,78 +15565,6 @@ static void ds4_acquire_instance_lock(void) {
     atexit(ds4_release_instance_lock);
 }
 
-struct ds4_session {
-    ds4_engine *engine;
-    ds4_dist_session *distributed;
-#ifndef DS4_NO_GPU
-    ds4_gpu_graph graph;
-#endif
-    ds4_kv_cache cpu_cache;
-    ds4_cpu_decode_scratch cpu_scratch;
-    token_vec checkpoint;
-    float *logits;
-    float *mtp_logits;
-    int mtp_draft_token;
-    uint64_t mtp_probe_total;
-    uint64_t mtp_probe_hit;
-    ds4_session_progress_fn progress;
-    void *progress_ud;
-    ds4_session_progress_fn display_progress;
-    void *display_progress_ud;
-    uint32_t prefill_cap;
-    int ctx_size;
-    bool checkpoint_valid;
-    /* Anticycle/request-penalty generation boundary: first position of the
-     * CURRENT response's generated region. -1 = unmarked, and the penalty
-     * core then falls back to 0 = the WHOLE context is scanned (legacy
-     * behavior; also the deliberate dual-host-parity default, see
-     * repeat_penalize_buf). Frontends that mark it after prefill
-     * (ds4_session_mark_generation_start / _set_generation_start) scope the
-     * anticycle bans and request penalties to [gen_start, end) only, so
-     * verbatim prompt quoting stops being banned. Reset to -1 whenever the
-     * checkpoint is rebuilt. The env freq-penalty window intentionally
-     * IGNORES this boundary (2026-07-06 mono verdict; see
-     * repeat_penalize_core). */
-    int repeat_gen_start;
-    /* Sampling-lane policy (ds4.h DS4_LANE_*), frontend-declared request
-     * shape. Non-FREE lanes bypass ALL penalties (env freq, anticycle bans,
-     * request penalties): forced tool-call syntax and copy-constrained
-     * emission must see raw logits. Reset to FREE at creation/invalidate --
-     * sessions are reused across requests and a stale lane must not leak. */
-    int lane;
-    /* Per-request OpenAI-style penalties (frequency/presence), FREE lane
-     * only, counted over the generated region [repeat_gen_start, end). May be
-     * negative (OpenAI allows [-2,2] to encourage repetition). (0,0) = off;
-     * frontends re-declare on every request. */
-    float req_freq;
-    float req_presence;
-    /* Greedy speculative acceptance (copy-spec / MTP argmax gating) is only
-     * distribution-preserving at temperature 0; frontends clear this for
-     * sampled requests. Default 1 = legacy greedy-ok. */
-    int spec_greedy;
-    bool mtp_draft_valid;
-    /* Adaptive copy-spec draft length (single-machine prompt-lookup speculation).
-     * Converges toward the length the target reliably accepts: grow on a full
-     * accept, shrink to the observed accept on a partial. 0 = not yet primed.
-     * This is what keeps copy-spec a net win on predictable text and a no-op on
-     * unpredictable text, with no tuning knob. */
-    int cs_draft_len;
-    /* Cooldown: after a low-payoff speculation (the per-call frontier snapshot
-     * cost only pays off when many tokens are accepted), skip speculating for a
-     * few steps so unpredictable text never pays the snapshot tax. One probe
-     * leaks through each cooldown so it re-arms the moment text becomes
-     * predictable again. */
-    int cs_cooldown;
-    /* Go-trie drafter cooldown, deliberately separate from cs_cooldown: a trie
-     * partial accept must not suppress the (independently profitable) n-gram
-     * drafter, and vice versa. Measured on go1b/A3: sharing the cooldown +
-     * letting trie partials shrink cs_draft_len cost -25% gen t/s by starving
-     * n-gram batches (fable5.md prompt2 table). */
-    int gt_cooldown;
-    /* Reference-corpus drafter cooldown -- its own for the same
-     * non-contamination reason as gt_cooldown. */
-    int rc_cooldown;
-};
 
 /* Per-request sampling-policy defaults. Called at session creation AND from
  * ds4_session_invalidate: the server reuses one session across requests, so a
@@ -19406,7 +15572,7 @@ struct ds4_session {
  * must never leak into the next (the ds4.h contract makes frontends
  * re-declare all of them per request). repeat_gen_start goes back to -1 =
  * unmarked, same as a checkpoint rebuild. */
-static void session_reset_request_policy(ds4_session *s) {
+void session_reset_request_policy(ds4_session *s) {
     s->lane = DS4_LANE_FREE;
     s->req_freq = 0.0f;
     s->req_presence = 0.0f;
@@ -19435,9 +15601,7 @@ static void session_reset_request_policy(ds4_session *s) {
  * for the next token to match a session that had just prefetched the prefix.
  */
 
-#define DS4_SESSION_IO_CHUNK (8u * 1024u * 1024u)
-
-static void payload_set_err(char *err, size_t errlen, const char *msg) {
+void payload_set_err(char *err, size_t errlen, const char *msg) {
     if (errlen != 0) snprintf(err, errlen, "%s", msg);
 }
 
@@ -19455,7 +15619,7 @@ static uint32_t payload_get_u32(const uint8_t in[4]) {
            ((uint32_t)in[3] << 24);
 }
 
-static int payload_write_bytes(FILE *fp, const void *ptr, uint64_t bytes, char *err, size_t errlen) {
+int payload_write_bytes(FILE *fp, const void *ptr, uint64_t bytes, char *err, size_t errlen) {
     const uint8_t *p = ptr;
     while (bytes != 0) {
         const size_t n = bytes > (uint64_t)SIZE_MAX ? SIZE_MAX : (size_t)bytes;
@@ -19469,7 +15633,7 @@ static int payload_write_bytes(FILE *fp, const void *ptr, uint64_t bytes, char *
     return 0;
 }
 
-static DS4_MAYBE_UNUSED int payload_read_bytes(FILE *fp, void *ptr, uint64_t bytes, uint64_t *remaining, char *err, size_t errlen) {
+DS4_MAYBE_UNUSED int payload_read_bytes(FILE *fp, void *ptr, uint64_t bytes, uint64_t *remaining, char *err, size_t errlen) {
     if (remaining && *remaining < bytes) {
         payload_set_err(err, errlen, "truncated session payload");
         return 1;
@@ -19489,13 +15653,13 @@ static DS4_MAYBE_UNUSED int payload_read_bytes(FILE *fp, void *ptr, uint64_t byt
     return 0;
 }
 
-static DS4_MAYBE_UNUSED int payload_write_u32(FILE *fp, uint32_t v, char *err, size_t errlen) {
+DS4_MAYBE_UNUSED int payload_write_u32(FILE *fp, uint32_t v, char *err, size_t errlen) {
     uint8_t b[4];
     payload_put_u32(b, v);
     return payload_write_bytes(fp, b, sizeof(b), err, errlen);
 }
 
-static DS4_MAYBE_UNUSED int payload_read_u32(FILE *fp, uint32_t *v, uint64_t *remaining, char *err, size_t errlen) {
+DS4_MAYBE_UNUSED int payload_read_u32(FILE *fp, uint32_t *v, uint64_t *remaining, char *err, size_t errlen) {
     uint8_t b[4];
     if (remaining && *remaining < sizeof(b)) {
         payload_set_err(err, errlen, "truncated session payload");
@@ -19510,7 +15674,7 @@ static DS4_MAYBE_UNUSED int payload_read_u32(FILE *fp, uint32_t *v, uint64_t *re
     return 0;
 }
 
-static int payload_copy_file_bytes(FILE *src, FILE *dst, uint64_t bytes, char *err, size_t errlen) {
+int payload_copy_file_bytes(FILE *src, FILE *dst, uint64_t bytes, char *err, size_t errlen) {
     uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
     int rc = 0;
     while (bytes != 0) {
@@ -19531,12 +15695,12 @@ static int payload_copy_file_bytes(FILE *src, FILE *dst, uint64_t bytes, char *e
     return rc;
 }
 
-static DS4_MAYBE_UNUSED uint64_t layer_attn_state_bytes(uint32_t ratio) {
+DS4_MAYBE_UNUSED uint64_t layer_attn_state_bytes(uint32_t ratio) {
     const uint32_t coff = ratio == 4 ? 2u : 1u;
     return (uint64_t)coff * DS4_N_HEAD_DIM * coff * ratio * sizeof(float);
 }
 
-static DS4_MAYBE_UNUSED uint64_t layer_index_state_bytes(uint32_t ratio) {
+DS4_MAYBE_UNUSED uint64_t layer_index_state_bytes(uint32_t ratio) {
     const uint32_t coff = ratio == 4 ? 2u : 1u;
     return (uint64_t)coff * DS4_N_INDEXER_HEAD_DIM * coff * ratio * sizeof(float);
 }
@@ -19547,7 +15711,7 @@ static DS4_MAYBE_UNUSED uint64_t layer_index_state_bytes(uint32_t ratio) {
  * the next suffix chunk will write its own raw rows before any attention read.
  * Compressed rows are different: sparse attention can select any row from the
  * prefix, so those are persisted up to their live row counts. */
-static uint32_t session_raw_live_rows(const ds4_gpu_graph *g, uint32_t checkpoint_len) {
+uint32_t session_raw_live_rows(const ds4_gpu_graph *g, uint32_t checkpoint_len) {
     uint32_t rows = g->raw_window ? g->raw_window : DS4_N_SWA;
     if (rows > g->raw_cap) rows = g->raw_cap;
     if (rows > checkpoint_len) rows = checkpoint_len;
@@ -19558,7 +15722,7 @@ static uint32_t session_raw_live_rows(const ds4_gpu_graph *g, uint32_t checkpoin
  * header and observability text.  This is deliberately based on live row counts
  * rather than capacities so the disk cache scales with saved tokens, not with
  * the maximum context size used to allocate the graph. */
-static uint64_t session_payload_live_tensor_bytes(const ds4_gpu_graph *g, uint32_t checkpoint_len) {
+uint64_t session_payload_live_tensor_bytes(const ds4_gpu_graph *g, uint32_t checkpoint_len) {
     uint64_t bytes = 0;
     const uint32_t raw_live = session_raw_live_rows(g, checkpoint_len);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
@@ -19580,7 +15744,7 @@ static uint64_t session_payload_live_tensor_bytes(const ds4_gpu_graph *g, uint32
 /* Accelerator tensors are copied through a fixed-size CPU buffer.  We do not mmap the
  * cache file and we do not allocate a second graph-sized blob just to serialize
  * it; both would be poor fits for this very large model. */
-static int payload_write_tensor_span(FILE *fp, const ds4_gpu_tensor *tensor,
+int payload_write_tensor_span(FILE *fp, const ds4_gpu_tensor *tensor,
                                      uint64_t offset, uint64_t bytes,
                                      uint8_t *buf, size_t cap, char *err, size_t errlen) {
     if (!tensor || offset > ds4_gpu_tensor_bytes(tensor) ||
@@ -19602,7 +15766,7 @@ static int payload_write_tensor_span(FILE *fp, const ds4_gpu_tensor *tensor,
     return 0;
 }
 
-static int payload_read_tensor_span(FILE *fp, ds4_gpu_tensor *tensor,
+int payload_read_tensor_span(FILE *fp, ds4_gpu_tensor *tensor,
                                     uint64_t offset, uint64_t bytes,
                                     uint8_t *buf, size_t cap, uint64_t *remaining,
                                     char *err, size_t errlen) {
@@ -19625,7 +15789,7 @@ static int payload_read_tensor_span(FILE *fp, ds4_gpu_tensor *tensor,
     return 0;
 }
 
-static DS4_MAYBE_UNUSED int payload_write_tensor_span_f16_as_f32(FILE *fp, const ds4_gpu_tensor *tensor,
+DS4_MAYBE_UNUSED int payload_write_tensor_span_f16_as_f32(FILE *fp, const ds4_gpu_tensor *tensor,
                                                                  uint64_t offset_f16, uint64_t count,
                                                                  uint8_t *buf, size_t cap, char *err, size_t errlen) {
     if (!tensor ||
@@ -19664,7 +15828,7 @@ static DS4_MAYBE_UNUSED int payload_write_tensor_span_f16_as_f32(FILE *fp, const
     return 0;
 }
 
-static DS4_MAYBE_UNUSED int payload_read_tensor_span_f32_as_f16(FILE *fp, ds4_gpu_tensor *tensor,
+DS4_MAYBE_UNUSED int payload_read_tensor_span_f32_as_f16(FILE *fp, ds4_gpu_tensor *tensor,
                                                                 uint64_t offset_f16, uint64_t count,
                                                                 uint8_t *buf, size_t cap, uint64_t *remaining,
                                                                 char *err, size_t errlen) {
@@ -19705,18 +15869,18 @@ static DS4_MAYBE_UNUSED int payload_read_tensor_span_f32_as_f16(FILE *fp, ds4_gp
 }
 #endif
 
-static bool ds4_session_is_cpu(const ds4_session *s) {
+bool ds4_session_is_cpu(const ds4_session *s) {
     return s && s->engine && s->engine->backend == DS4_BACKEND_CPU;
 }
 
-static uint32_t session_cpu_raw_live_rows(const ds4_session *s) {
+uint32_t session_cpu_raw_live_rows(const ds4_session *s) {
     if (!s || !s->checkpoint_valid) return 0;
     uint32_t rows = ds4_default_raw_cap((uint32_t)s->ctx_size);
     if (rows > (uint32_t)s->checkpoint.len) rows = (uint32_t)s->checkpoint.len;
     return rows;
 }
 
-static uint32_t session_cpu_comp_cap(const ds4_session *s) {
+uint32_t session_cpu_comp_cap(const ds4_session *s) {
     if (!s) return 0;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_layer_cache *layer = &s->cpu_cache.layer[il];
@@ -19729,7 +15893,7 @@ static uint32_t session_cpu_comp_cap(const ds4_session *s) {
     return (uint32_t)s->ctx_size;
 }
 
-static uint64_t session_cpu_payload_live_tensor_bytes(const ds4_session *s) {
+uint64_t session_cpu_payload_live_tensor_bytes(const ds4_session *s) {
     uint64_t bytes = 0;
     const uint32_t raw_live = session_cpu_raw_live_rows(s);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
@@ -19749,7 +15913,7 @@ static uint64_t session_cpu_payload_live_tensor_bytes(const ds4_session *s) {
     return bytes;
 }
 
-static void session_cpu_reset_cache(ds4_session *s) {
+void session_cpu_reset_cache(ds4_session *s) {
     kv_cache_free(&s->cpu_cache);
     kv_cache_init(&s->cpu_cache, (uint32_t)s->ctx_size, 0);
 }
@@ -21447,7 +17611,7 @@ int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
  * read predicted experts ahead.  Only the local slice is registered: issuing
  * read-ahead for layers another machine executes would waste SSD bandwidth.
  * Purely advisory metadata; never affects inference results. */
-static void engine_register_layer_routers(ds4_engine *e, uint32_t start, uint32_t end) {
+void engine_register_layer_routers(ds4_engine *e, uint32_t start, uint32_t end) {
     if (e->model.expert_shrunken) return;   /* compact-slot models: ids differ */
     if (end >= DS4_MAX_LAYER) end = DS4_MAX_LAYER - 1;
     uint32_t registered = 0;
@@ -21561,7 +17725,7 @@ static int *eval_ids_load(const char *path, uint32_t *out_n, uint32_t vocab) {
  * 单独解码若干步做基准, 再用 ds4_session_eval_multi 批量推进同样的步数, 对比
  *   ①聚合 token/s(红利有多大)  ②每个会话选出的 token 序列是否与单独解码逐字相同(无损)。
  * 用 DS4_MULTI_BENCH_STEPS 调步数(默认 48)。 */
-static void ds4_multi_bench_run(ds4_engine *e) {
+void ds4_multi_bench_run(ds4_engine *e) {
     const char *env = getenv("DS4_MULTI_BENCH");
     if (!env || !env[0]) return;
     uint32_t n = (uint32_t)atoi(env);
@@ -21702,7 +17866,7 @@ static void ds4_multi_bench_run(ds4_engine *e) {
     exit(0);
 }
 
-static void ds4_eval_ids_run(ds4_engine *e) {
+void ds4_eval_ids_run(ds4_engine *e) {
     const char *idp = getenv("DS4_EVAL_IDS");
     if (!idp || !idp[0]) return;
 #ifdef DS4_NO_GPU
@@ -22744,7 +18908,7 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
 #endif
 }
 
-static int ds4_session_slice_check_timeline(
+int ds4_session_slice_check_timeline(
         ds4_session *s,
         const int   *tokens,
         uint32_t     n_tokens,
@@ -22776,10 +18940,47 @@ static int ds4_session_slice_check_timeline(
     return 0;
 }
 
-static DS4_MAYBE_UNUSED void ds4_session_slice_commit_timeline(ds4_session *s, const int *tokens, uint32_t n_tokens) {
+DS4_MAYBE_UNUSED void ds4_session_slice_commit_timeline(ds4_session *s, const int *tokens, uint32_t n_tokens) {
     for (uint32_t i = 0; i < n_tokens; i++) token_vec_push(&s->checkpoint, tokens[i]);
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
+}
+
+void ds4_session_invalidate(ds4_session *s) {
+    s->checkpoint_valid = false;
+    s->checkpoint.len = 0;
+    /* Also drops lane/request-penalty/spec-greedy back to defaults (and
+     * repeat_gen_start to -1): an invalidated checkpoint means the next
+     * request re-renders and re-declares its policy from scratch. */
+    session_reset_request_policy(s);
+    s->mtp_draft_valid = false;
+}
+
+void ds4_session_rewind(ds4_session *s, int pos) {
+    if (pos < 0) pos = 0;
+    if (pos > s->checkpoint.len) pos = s->checkpoint.len;
+    s->checkpoint.len = pos;
+    s->mtp_draft_valid = false;
+    /* 冷回卷(pos==0)= 从头重放: 必须连 comp/indexer 计数与压缩器累积 state 一起清。
+     * 此前只截 token 时间线 ⇒ 连跑多题时 layer_n_comp 只涨不回, 2050 行容量在
+     * ~28 题后溢出("compressed KV cache capacity exceeded", 2026-08-18 328 题
+     * 基准 500 连锁的第一层根因)。部分回卷(pos>0)的 comp 精确回滚仍是已知债
+     * (state 含非边界脏贡献), CC 增量场景语义不变。 */
+#ifndef DS4_NO_GPU
+    if (pos == 0) (void)metal_graph_reset_prefill_state(&s->graph);
+#endif
+}
+
+int ds4_session_pos(ds4_session *s) {
+    return s->checkpoint.len;
+}
+
+int ds4_session_ctx(ds4_session *s) {
+    return s->ctx_size;
+}
+
+int ds4_session_prefill_cap(ds4_session *s) {
+    return s ? (int)s->prefill_cap : 0;
 }
 
 int ds4_session_eval_layer_slice(ds4_session *s,
@@ -23255,7 +19456,7 @@ static void ds4_session_note_prefill_progress(void *ud, const char *event, int c
  *
  * A non-matching prompt discards the checkpoint and prefills from token zero.
  */
-static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
+int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
     if (!s || !prompt || prompt->len <= 0 || prompt->len >= s->ctx_size) {
         snprintf(err, errlen, "prompt exceeds context");
         return 1;
@@ -23497,8 +19698,6 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
     return i;
 }
 
-static void repeat_penalize_buf(ds4_session *s, float *logits, uint32_t end);
-static int session_penalties_active(const ds4_session *s);
 
 int ds4_session_argmax(ds4_session *s) {
     /* Non-FREE lanes see raw logits by contract (ds4.h): skip the scratch
@@ -23552,12 +19751,12 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
 /* 惩罚只剩客户端显式传的 per-request(OpenAI frequency/presence)。引擎自造的
  * env 惩罚(DS4_REPEAT_FREQ)、断环器、熵门整族已删(2026-08-21 用户铁律:
  * 引擎不得擅自修改模型输出, 默认路径=裸模型真值)。 */
-static int session_penalties_active(const ds4_session *s) {
+int session_penalties_active(const ds4_session *s) {
     if (s && s->lane != DS4_LANE_FREE) return 0;
     return s && (s->req_freq != 0.0f || s->req_presence != 0.0f);
 }
 
-static void repeat_penalize_buf(ds4_session *s, float *logits, uint32_t end) {
+void repeat_penalize_buf(ds4_session *s, float *logits, uint32_t end) {
     if (!s || !logits || end == 0) return;
     /* Lane gate (ds4.h contract): non-FREE lanes get raw logits, no penalty
      * of any kind — a penalty-diverted token corrupts forced tool-call
@@ -23749,7 +19948,7 @@ int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
     return 0;
 }
 
-static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
+int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
     if (!s) return 1;
     if (s->distributed) {
@@ -24573,42 +20772,5 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     accepted[0] = first_token;
     return 1;
 #endif
-}
-
-void ds4_session_invalidate(ds4_session *s) {
-    s->checkpoint_valid = false;
-    s->checkpoint.len = 0;
-    /* Also drops lane/request-penalty/spec-greedy back to defaults (and
-     * repeat_gen_start to -1): an invalidated checkpoint means the next
-     * request re-renders and re-declares its policy from scratch. */
-    session_reset_request_policy(s);
-    s->mtp_draft_valid = false;
-}
-
-void ds4_session_rewind(ds4_session *s, int pos) {
-    if (pos < 0) pos = 0;
-    if (pos > s->checkpoint.len) pos = s->checkpoint.len;
-    s->checkpoint.len = pos;
-    s->mtp_draft_valid = false;
-    /* 冷回卷(pos==0)= 从头重放: 必须连 comp/indexer 计数与压缩器累积 state 一起清。
-     * 此前只截 token 时间线 ⇒ 连跑多题时 layer_n_comp 只涨不回, 2050 行容量在
-     * ~28 题后溢出("compressed KV cache capacity exceeded", 2026-08-18 328 题
-     * 基准 500 连锁的第一层根因)。部分回卷(pos>0)的 comp 精确回滚仍是已知债
-     * (state 含非边界脏贡献), CC 增量场景语义不变。 */
-#ifndef DS4_NO_GPU
-    if (pos == 0) (void)metal_graph_reset_prefill_state(&s->graph);
-#endif
-}
-
-int ds4_session_pos(ds4_session *s) {
-    return s->checkpoint.len;
-}
-
-int ds4_session_ctx(ds4_session *s) {
-    return s->ctx_size;
-}
-
-int ds4_session_prefill_cap(ds4_session *s) {
-    return s ? (int)s->prefill_cap : 0;
 }
 
