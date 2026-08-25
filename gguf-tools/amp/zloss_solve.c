@@ -248,6 +248,23 @@ int main(int argc, char **argv) {
         fclose(lf);
         { FILE *sf = fopen(lossp, "rb"); fseek(sf, 0, SEEK_END); vol_loss += ftell(sf); fclose(sf); }
 
+        /* 判空层重跑安全: 上一轮若注入过, 必须截回原长 —— 否则陈旧记录冒充本轮产物 */
+        if (!best && dql) {
+            char dp[1024], mp[1024];
+            snprintf(dp, sizeof dp, "%s/dql_L%02d.bin", dql, L);
+            snprintf(mp, sizeof mp, "%s/zloss_manifest.txt", dql);
+            FILE *mf = fopen(mp, "r");
+            long long orig = -1;
+            if (mf) { char ln[128]; int ml; long long mo;
+                while (fgets(ln, sizeof ln, mf))
+                    if (sscanf(ln, "L=%d orig=%lld", &ml, &mo) == 2 && ml == L) orig = mo;
+                fclose(mf); }
+            if (orig >= 0) {
+                FILE *df = fopen(dp, "r+b");
+                if (df) { if (ftruncate(fileno(df), (off_t)orig) != 0) die("L%d 判空截回失败", L);
+                          fclose(df); }
+            }
+        }
         /* 注入 zl.RRR 供冻结判决尺(格式=zlayer 同款: 116B 记录头 + u32 k|f32 tr|u32 din|u32 dout|fp16 z|U|V) */
         if (best && dql) {
             char dp[1024], mp[1024];
