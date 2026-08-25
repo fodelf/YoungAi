@@ -68,3 +68,9 @@
   输入: vq86h_noz/layers 43 层真数据 (spark)
   判定: stdout 与 stderr 双双逐字节一致
   结果: 过闸 ✓ → py 删除, 调用方接线, build_ctools 收编
+
+[2026-08-25] gguf-tools/dump_gguf_meta.py → dump_gguf_meta.c
+  输入: ds4-base86p.gguf + ds4-allq2.gguf × 三模式(默认/--stats/--vqhead) (spark)
+  判定: 全数值逐字符一致; 残差仅 --stats 表头 CJK 对齐空白(同 kl_forensic 既判先例)。
+  转录细节: python float repr(整值定点/最短往返)、str repr 引号规则(含'换双引号)均复刻。
+  结果: 过闸 ✓ → py 删除(手工具, 无 .sh 调用方)
