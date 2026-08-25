@@ -6599,3 +6599,17 @@ cpu/clean 取并集+标记 grep 清零(一次漏检 clean 块被 grep 抓回, �
 - 顺手修掉的既有断点: tests/cuda_long_context_smoke.c 调用
   ds4_gpu_attention_decode_heads_tensor 缺 comp_kv_f16 实参(KV F16 工作加参
   后从未跟改, spark 上 cuda-regression 一直编不过)。
+
+## 2026-08-25 重构阶段6: CUDA 拆分+契约统一落地(restructure 分支)
+
+- ds4_gpu.h 六子头加 extern "C" 守卫, ds4_cuda 直接 include 契约头——146 处
+  手抄 extern "C" 声明消解(141 剥前缀/3 删/2 CUDA 私有保留), 签名漂移 0;
+  从此契约漂移=编译期错误而非静默分歧。
+- 18159 行按方案A(聚合根+49 个 .inc.cu 分片)拆分, 拼接逐字节等于拆前;
+  2 个 EXCEPTION 单函数分片(moe_launch 888/vq_fused2_3 518)。
+- ★最强闸★spark 真模型(allq2) --score-ids 32 token: 拆分前后二进制输出
+  各 16,547,848 字节, cmp 逐字节一致(解码路 100% 决定论, 与捕获铁律同路)。
+- cuda-regression 阈值噪声正名: 首跑 5s=PTX JIT 冷缓存(无 -arch 构建),
+  复跑 0.05s; 顺修 smoke 的 comp_kv_f16 缺参(上游断裂)。
+- 发现未处理(既有): 契约声明 ds4_gpu_tensor_copy_f32_to_f16 在 CUDA 侧
+  无实现, 靠 if(0) 死代码消除躲链接。
