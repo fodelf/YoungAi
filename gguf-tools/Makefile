@@ -43,6 +43,11 @@ CPPFLAGS ?= -D_GNU_SOURCE
 BARE := -O3
 INC := -I$(QZ) -I$(AMP) -I$(CAL) -I$(SLV)
 
+# 聚合根分片依赖(2026-08-25 批6 拆分): 超 500 行源文件拆成 <名>_pK.inc.c, 由原路径
+# 聚合根按序 #include(单 TU, 符号零变化)。分片只进【依赖列表】触发重建, 绝不进编译
+# 命令行(它们不是独立 TU)。
+QUANTS_INC := $(wildcard $(QZ)/quants_p*.inc.c)
+
 ifeq ($(UNAME_S),Darwin)
 NATIVE ?= -mcpu=native
 HAVE_BLAS := 1
@@ -123,17 +128,17 @@ everything: all amp legacy calib bench
 # 否则 GPU 与 CPU 差最后一个 ulp, 逐字节对拍必挂(见原 build_dsq_gpu_spark.sh)。
 DSQ_SRC := $(QZ)/deepseek4-quantize.c $(QZ)/quants.c $(QZ)/onebit_quant.c
 ifeq ($(UNAME_S)-$(CUDA),Linux-1)
-deepseek4-quantize: $(DSQ_SRC) $(QZ)/quants.h $(QZ)/onebit_quant.h $(QZ)/quantize_gpu.cu
+deepseek4-quantize: $(DSQ_SRC) $(QUANTS_INC) $(QZ)/quants.h $(QZ)/onebit_quant.h $(QZ)/quantize_gpu.cu
 	$(NVCC) -O3 -arch=native -fmad=false -c $(QZ)/quantize_gpu.cu -o $(QZ)/quantize_gpu.o
 	$(CC) $(CFLAGS) $(NATIVE) $(CPPFLAGS) $(INC) -DDS4Q_CUDA -o $@ $(DSQ_SRC) $(QZ)/quantize_gpu.o \
 	    $(CUDA_LIBS) -lm -pthread
 else
-deepseek4-quantize: $(DSQ_SRC) $(QZ)/quants.h $(QZ)/onebit_quant.h
+deepseek4-quantize: $(DSQ_SRC) $(QUANTS_INC) $(QZ)/quants.h $(QZ)/onebit_quant.h
 	$(CC) $(CFLAGS) $(NATIVE) $(CPPFLAGS) $(INC) -o $@ $(DSQ_SRC) -lm -pthread
 endif
 
 # 纯 CPU 参照(对拍用, Linux; Mac 上本来就是 CPU 版)
-deepseek4-quantize-cpu: $(DSQ_SRC)
+deepseek4-quantize-cpu: $(DSQ_SRC) $(QUANTS_INC)
 	$(CC) $(CFLAGS) $(NATIVE) $(CPPFLAGS) $(INC) -o $@ $(DSQ_SRC) -lm -pthread
 
 anchor_metrics: $(BEN)/anchor_metrics
@@ -362,7 +367,7 @@ $(QZ)/go2b_parity: $(QZ)/go2b_parity.c $(QZ)/onebit_quant.h $(QZ)/go2b_qc.h
 	$(CC) $(BARE) $(NATIVE) -ffast-math -I$(QZ) -o $@ $(QZ)/go2b_parity.c $(BLAS_LIBS) -lm -lpthread
 
 vq2q2k_probe: $(QZ)/vq2q2k_probe
-$(QZ)/vq2q2k_probe: $(QZ)/vq2q2k_probe.c $(QZ)/quants.c $(QZ)/onebit_quant.c
+$(QZ)/vq2q2k_probe: $(QZ)/vq2q2k_probe.c $(QZ)/quants.c $(QUANTS_INC) $(QZ)/onebit_quant.c
 	$(CC) $(BARE) $(NATIVE) -o $@ $(QZ)/vq2q2k_probe.c $(QZ)/quants.c $(QZ)/onebit_quant.c -lm -lpthread
 
 # vq_em: GPU-EM 码本精修, Linux+CUDA 专属(st_bridge.c 桥接 st_read)。
