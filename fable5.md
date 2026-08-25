@@ -6512,3 +6512,25 @@ cos 口径下 43 层全层闸。`zlayer.py`(2026-08-22 段)白纸黑字裁决过
 - 实测（spark L20 金标口径）：解算 **642s → 18s（36×）**，总 672s → **48s/层**；对照 py-CPU 105s、py-GPU 54s——**C 版反超 python 两条路**。数字逐位不变：z^L 3.2% 组合 4.3% GE均值 1.0352。
 - 43 层全战役估算 ≈ 34 分钟。commit cb70590，已同步 spark。
 - 至此 Py→C 迁移全部账目关闭：204→7 .py（3 金标校具 + 4 用户裁决非逻辑件），16 项金标全绿，性能不欠账。
+
+## 2026-08-25 重构战役阶段1: 死物清理 + Mac 构建断点修复(restructure 分支)
+
+背景: 用户裁决全仓重构(模块化目录/单文件≤500行/补单测/反修与量化代码引擎复用)。
+工作在 restructure 分支, mac 分支不动。
+
+**重要发现: mac 分支 HEAD 在 Mac 上从未真编过。** `make clean` 全量重建暴露三处
+断点, 此前的"构建绿"全靠 8月9日 的陈旧 .o(make 因 .o 比源新而跳过重编):
+1. `g_prefill_chunk_cuda` 声明被圈进 `#ifndef __APPLE__`, 使用点无条件编译 → undeclared。
+2. `ds4_gpu_dspark_confidence_tensor` 只有 CUDA 实现, Metal 链接失败 → 按既有 dspark stub 约定补 0 返回。
+3. `ds4_tool_set_*` 取料 setter 家族(8-22 env→CLI 迁移)只 land 了 CLI 半边, 5 个 setter 无实现。
+另: tests/ds4_test.c 的 `ds4_test_entry` typedef 在 daa6237 随 --penalty-unit 误删,
+测试运行器本身自那时起编不过(--penalty-unit 是唯一的采样惩罚单测, 阶段8重建)。
+
+清账(commit 3c131fb..39df376): 根目录死文件 ds4_test.c(与 tests/ 逐字节同)、
+37 个被 track 的 Mach-O 二进制出库、竞赛文档去重、16 篇 5-6 月设计稿+task/ 归档
+docs/archive/、tools/ 一次性战役脚本 9 个删除、孤儿夹具/oneb venv(47MB)/35 孤儿
+pyc/5 空目录清除。
+
+闸门: make 全量重建 + ds4_test --server/--metal-kernels/--tp-allreduce +
+ds4-eval --self-test-extractors 全绿(真实重建后首次)。本机无模型(gguf/ 悬空链接),
+逐位对拍闸需 spark(模型在 spark:~/ds4-main/gguf/)。
