@@ -6534,3 +6534,21 @@ pyc/5 空目录清除。
 闸门: make 全量重建 + ds4_test --server/--metal-kernels/--tp-allreduce +
 ds4-eval --self-test-extractors 全绿(真实重建后首次)。本机无模型(gguf/ 悬空链接),
 逐位对拍闸需 spark(模型在 spark:~/ds4-main/gguf/)。
+
+## 2026-08-25 重构阶段2: src/common 共享格式库落地(restructure 分支)
+
+复用性要求的核心一步。四模块全部逐式转录自 8-25 过闸实现, 不改数值:
+- `src/common/ds4_float.h` f16/bf16 转换(收敛 4 份副本)
+- `src/common/ds4_fp8.h` E4M3FN/E8M0/E2M1, host/device 共享头(收敛 6 份 E4M3)
+- `src/common/ds4_quantfmt.{c,h}` 量化块 dequant + iq2xxs 编码/解码双表正名
+- `src/common/ds4_gguf.{c,h}` GGUF v3 只读解析(收敛 9 份, die→错误码)
+- `src/common/ds4_st.c` safetensors 读器升格(quant/st_read.c 移入, 旧路径留
+  转发 stub, 7 个源 include 消费方零改动)
+
+金标: tests/fixtures/quantfmt/ 7 类型固定输入 + 过闸版 zlayer 输出入库;
+ds4_unit 单测逐字节回归(-ffast-math 下也逐位一致)。zlayer 已切换共享库,
+--selftest-deq 7 类型 cmp 逐字节同金标。make test 新增 ds4_unit, 且模型
+缺失的套件改 SKIP 不 FAIL(本机无模型时闸门终于有意义)。
+未完: 引擎/ds4_cuda/deepseek4-quantize 的副本删除归各自拆分阶段;
+注意 deepseek4-quantize 的 e4m3 把 0x7f 解成 0(非 NaN), 迁移时须显式保留。
+⚠ spark 侧 zlayer 依赖本分支, 合并后需在 spark 重建(rebuild→check other machine)。
