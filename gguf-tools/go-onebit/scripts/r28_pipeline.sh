@@ -44,7 +44,7 @@ python3 "$ROOT/gguf-tools/go-onebit/scripts/vq_blob_truesize.py" "$OUTF/layers" 
 #   而冠军那份是针对冠军量化误差的、对 R28 是噪声。故合并阶段不碰 bias, 交给下面
 #   rebake: 先减冠军 2.5·Δb_v4fix, 再按实测最优 α 加 R28 自己的 Δb。
 LOG "起合并(VQ; 骨架=冠军抽取, --no-down, bias 留给 rebake)"
-python3 "$ROOT/gguf-tools/go-onebit/quant/vq_merge_v4.py" --merge --no-down \
+"$(dirname "$0")/../quant/vq_merge_v4" --merge --no-down \
     --skeleton "$ROOT/gguf/go-onebit/r28_skeleton.gguf" \
     --blob-sizes "$OUTF/blob_sizes.txt" \
     --dql-host 127.0.0.1 --dql-dir "$OUTF/layers" \

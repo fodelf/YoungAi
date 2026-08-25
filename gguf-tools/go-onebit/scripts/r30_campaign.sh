@@ -254,7 +254,7 @@ PYEOF
     #   vq4x512 三矩阵)进 GGUF + down(dql D 段冷 w2 signref, 热槽=洞由 blob o2 覆盖) + 自产骨架。
     #   --gud(code2b 全 signref 搬运)与 VQ 产物不兼容(G/U=稀疏洞), 已弃用。
     LOG "起合并(VQ 冠军形态: blob+down+骨架, 非消费式=源全保留)"
-    python3 "$ROOT/gguf-tools/go-onebit/quant/vq_merge_v4.py" --merge \
+    "$(dirname "$0")/../quant/vq_merge_v4" --merge \
         --skeleton "$SKEL" \
         --blob-sizes "$MAN" \
         --down-offsets "$OUTF/down_offsets.txt" \

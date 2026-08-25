@@ -54,7 +54,7 @@ stage_merge(){   # skeleton 重造 + --consume 合并(层文件边并边删, 盘
     [ -f $R30/r30_skeleton.gguf ] || { LOG "骨架重造(skel_from_hf ~30min)";
         SKEL_HF=$ROOT/hf/DeepSeek-V4-Flash-0731 SKEL_TMPL=$R30/template_head.gguf \
         bash $SC/skel_from_hf.sh $R30/r30_skeleton.gguf 4 || { LOG "★骨架失败★"; exit 5; } }
-    python3 $Q/vq_merge_v4.py --merge --skeleton $R30/r30_skeleton.gguf \
+    "$(dirname "$0")/../quant/vq_merge_v4" --merge --skeleton $R30/r30_skeleton.gguf \
         --blob-sizes $LAYERS/manifest.txt --no-down --consume \
         --dql-host 127.0.0.1 --dql-dir $LAYERS --out $MDL || { LOG "★合并失败★"; exit 6; }
     LOG "合并完: $(ls -l $MDL | awk '{printf "%.2f GB", $5/1e9}')"

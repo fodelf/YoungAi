@@ -89,7 +89,7 @@ stage_merge(){    # 合并 GGUF: skeleton + vq blob(--no-down: w2 在 blob which
     FREE=$(df -g /System/Volumes/Data | awk 'NR==2{print $4}')
     [ "$FREE" -ge 82 ] || { LOG "★free ${FREE}G <82G(非消费合并需全额) — 停★"; exit 7; }
     LOG "起合并(全VQ形态: skeleton+blob --no-down, 非消费式)"
-    python3 "$ROOT/gguf-tools/go-onebit/quant/vq_merge_v4.py" --merge \
+    "$(dirname "$0")/../quant/vq_merge_v4" --merge \
         --skeleton "$R30/r30_skeleton.gguf" \
         --blob-sizes "$MAN" --no-down \
         --dql-host 127.0.0.1 --dql-dir "$LAYERS" \

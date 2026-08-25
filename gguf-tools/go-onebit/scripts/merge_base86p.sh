@@ -28,7 +28,7 @@ fi
 FREE=$(df -BG --output=avail "$ROOT/gguf" | sed -n 2p | tr -dc 0-9)
 [ "${FREE:-0}" -ge 95 ] || { LOG "★盘不足★"; exit 4; }
 LOG "合并发车(全 VQ --no-down)"
-python3 gguf-tools/go-onebit/quant/vq_merge_v4.py --merge \
+"$(dirname "$0")/../quant/vq_merge_v4" --merge \
     --skeleton "$SKEL" \
     --blob-sizes "$LAYERS/manifest.txt" --no-down \
     --dql-host 127.0.0.1 --dql-dir "$LAYERS" \

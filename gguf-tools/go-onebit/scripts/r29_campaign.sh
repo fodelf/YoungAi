@@ -150,7 +150,7 @@ stage_merge(){
     fi
     # 干净度前置闸: 自产骨架对任何他人 Δb 的相关应 ≈0
     bash "$SC/preflight_skeleton.sh" "$SKEL" 0.30 >&2 || LOG "★骨架干净度自检未过 — 继续但需人工看★"
-    python3 "$ROOT/gguf-tools/go-onebit/quant/vq_merge_v4.py" --merge --no-down \
+    "$(dirname "$0")/../quant/vq_merge_v4" --merge --no-down \
         --skeleton "$SKEL" \
         --blob-sizes "$MAN" \
         --dql-host 127.0.0.1 --dql-dir "$OUTF/layers" \

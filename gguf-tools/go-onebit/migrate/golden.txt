@@ -53,3 +53,12 @@
   已知仍破: p2_truncprobe.sh/q4t_teacher_spark.sh/r60_kl_probe.sh 的 heredoc
   `from anchor_metrics import`(历史探针, Wave D 重写)。
   svc.sh 两针 JSON → jq(两机 /usr/bin/jq 均有; stderr 诊断格式 dict→JSON, 非判决数)。
+
+[2026-08-25] quant/vq_merge_v4.py → quant/vq_merge_v4.c
+  金标A(真数据, spark): --extract-skeleton @ ds4-base86p.gguf(86G) 输出逐字节 md5 同
+    (db9120d6093996758268150e88a36e05)
+  金标B(夹具, Mac, 转录agent执行): merge本地/route-bias烘焙(43层5420槽)/opt内嵌七类记录/
+    down非零skip/--gud/--consume/--extract-blobs 全部输出 md5 逐字节同, stdout 除文件名同
+  残余风险: 真数据 --merge 全量金标因 spark 磁盘(free 91G < 2×86G)未做, 由夹具B覆盖;
+    ssh 流式分支未对拍(popen 单引号包裹保 argv 一致, 见 vq_merge_v4_transcription_notes #15)
+  结果: 过闸 ✓ → py 删除, 11 个 .sh 调用方接线 quant/vq_merge_v4, build_ctools.sh 收编

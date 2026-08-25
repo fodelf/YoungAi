@@ -28,7 +28,7 @@ N1=$(ssh $M1 "wc -l < $M1DIR/gguf-tools/go-onebit/corpus/prog_active_top${HOT}.t
 [ "$N1" = "43" ] && say "热表 top${HOT} 43 行 ✓"
 
 # ③ 两机源一致 + 二进制新鲜(源 md5 同 & 二进制 mtime ≥ 源 mtime)
-for f in gguf-tools/go-onebit/quant/ds4quant_run.c gguf-tools/go-onebit/quant/vq_merge_v4.py gguf-tools/go-onebit/scripts/r30_campaign.sh; do
+for f in gguf-tools/go-onebit/quant/ds4quant_run.c gguf-tools/go-onebit/quant/vq_merge_v4.c gguf-tools/go-onebit/scripts/r30_campaign.sh; do
   A=$(md5 -q $ROOT/$f 2>/dev/null); B=$(ssh $M1 "md5 -q $M1DIR/$f" 2>/dev/null)
   [ "$A" = "$B" ] || bad "两机源不一致: $f — scp 同步后重试"
 done

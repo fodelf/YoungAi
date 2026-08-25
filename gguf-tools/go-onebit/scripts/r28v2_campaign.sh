@@ -119,7 +119,7 @@ stage_merge(){
     TOT=$(awk '{s+=$2} END{printf "%.3f",s/1073741824}' "$MAN")
     LOG "manifest ${TOT} GiB / $(wc -l < "$MAN") 层 → 预期模型 $(awk -v t="$TOT" 'BEGIN{printf "%.2f",t+8.202}') GiB"
     rm -f "$MDL" "$MDL.bias0.bin"
-    python3 "$ROOT/gguf-tools/go-onebit/quant/vq_merge_v4.py" --merge --no-down \
+    "$(dirname "$0")/../quant/vq_merge_v4" --merge --no-down \
         --skeleton "$ROOT/gguf/go-onebit/r28_skeleton.gguf" \
         --blob-sizes "$MAN" \
         --dql-host 127.0.0.1 --dql-dir "$OUTF/layers" \

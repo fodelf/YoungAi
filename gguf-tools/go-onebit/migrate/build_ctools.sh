@@ -3,7 +3,7 @@
 # 默认构建全部。产物=calib/<name>(与源同目录, .gitignore 不入库)。
 set -e
 CAL="$(cd "$(dirname "$0")/../calib" && pwd)"
-TOOLS="${*:-anchor_metrics kl_forensic trace_ladder rec_fidelity zrec_to_zchain dql_to_zchain zlayer}"
+TOOLS="${*:-anchor_metrics kl_forensic trace_ladder rec_fidelity zrec_to_zchain dql_to_zchain zlayer vq_merge_v4}"
 for t in $TOOLS; do
   case "$t" in
     zlayer)
@@ -15,6 +15,7 @@ for t in $TOOLS; do
           -I"$SO_DIR/../include" -o "$CAL/$t" "$CAL/$t.c" "$SO_DIR/libscipy_openblas.so" \
           -Wl,-rpath,"$SO_DIR" -lm -lpthread
       fi ;;
+    vq_merge_v4) gcc -O3 -march=native -o "$CAL/../quant/$t" "$CAL/../quant/$t.c" -lm ;;
     *) gcc -O3 -march=native -o "$CAL/$t" "$CAL/$t.c" -lm -lpthread ;;
   esac
   echo "build ✓ $CAL/$t"

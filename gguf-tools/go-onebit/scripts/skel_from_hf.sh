@@ -9,7 +9,7 @@
 # 做法(不必新写工具, 现成的就够):
 #   deepseek4-quantize --experts-hole  = 骨架模式: routed 专家"留洞"(不算不写),
 #                                        非专家张量全部从 HF 原始重新量化
-#   vq_merge_v4.py --extract-skeleton  = 把留洞文件压成紧凑骨架(丢掉洞和 down)
+#   vq_merge_v4.c --extract-skeleton  = 把留洞文件压成紧凑骨架(丢掉洞和 down)
 #
 # --template 只提供 GGUF 的 KV 元数据(tokenizer/超参)和张量顺序, **不提供任何权重**
 # —— 权重 100% 来自 --hf 指的原始 Base。这与"禁用 q2 当模版/backbone/源"的铁律不冲突:
@@ -65,7 +65,7 @@ LOG "留洞文件 表观 $(awk -v v=$APP 'BEGIN{printf "%.1f GiB",v/2^30}') / �
 awk -v a=$APP -v r=$REAL 'BEGIN{exit !(r > a*0.5)}' && LOG "★稀疏未生效(实占>表观一半) — 后续轮次应改为流式抽取★"
 
 LOG "阶段2: 压成紧凑骨架"
-python3 "$ROOT/gguf-tools/go-onebit/quant/vq_merge_v4.py" --extract-skeleton \
+"$(dirname "$0")/../quant/vq_merge_v4" --extract-skeleton \
     --base "$HOLE" --out "$OUT" || { LOG "★抽骨架失败★"; exit 4; }
 rm -f "$HOLE"
 LOG "自产骨架 $OUT $(ls -l "$OUT" | awk '{printf "%.2f GiB", $5/1073741824}')"

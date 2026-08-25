@@ -69,7 +69,7 @@ stage_merge(){   # 合并 GGUF(q2z_campaign stage_merge 的 spark 适配): skele
     FREE=$(df -BG --output=avail "$ROOT/gguf" | sed -n 2p | tr -dc 0-9)
     [ "${FREE:-0}" -ge 90 ] || { LOG "★盘不足 90G 停★"; exit 7; }
     LOG "起合并(全VQ形态, 非消费式)"
-    python3 "$ROOT/gguf-tools/go-onebit/quant/vq_merge_v4.py" --merge \
+    "$(dirname "$0")/../quant/vq_merge_v4" --merge \
         --skeleton "$R30/r30_skeleton.gguf" \
         --blob-sizes "$MAN" --no-down \
         --dql-host 127.0.0.1 --dql-dir "$LAYERS" \
