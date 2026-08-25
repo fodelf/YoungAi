@@ -20,8 +20,8 @@ XA=${4:-}
 ANCOV=${5:-}
 ANC=${ANCOV:-$D2/anchor_a_clean_s8192.bin}
 LOG(){ echo "[$WS $(date +%H:%M:%S)] $*"; }
-# ①等锚(FP遍写完的判据=文件尺寸到位)
-EXP=$(python3 -c "print(40+43*8192*4096*4+2*43*8192*6*4+43*8192*4*4096*4+8192*129280*4)")
+# ①等锚(FP遍写完的判据=文件尺寸到位)  [python3 内联清零(2026-08-25 迁移 Wave C): bash 算术同式]
+EXP=$(( 40 + 43*8192*4096*4 + 2*43*8192*6*4 + 43*8192*4*4096*4 + 8192*129280*4 ))
 while true; do
   sz=$(stat -c %s "$ANC" 2>/dev/null || echo 0)
   [ "$sz" -ge "$EXP" ] && break
@@ -43,8 +43,11 @@ cd ~/ds4-main
 LOG "②工作区就绪"
 # 行掩码(2026-08-24 拼接毒定罪: 256块互织语料每块前64行=异域上下文污染行, z被毒死;
 # 剔污染行后 z 复活 L3 7.2%/组合11.7%=连续锚同档) — 复用 08-09 拼接修正既有开关
-FR=$(python3 -c "print(','.join(f'{b*256+64}:{(b+1)*256}' for b in range(24)))")
-ER=$(python3 -c "print(','.join(f'{b*256+64}:{(b+1)*256}' for b in range(24,32)))")
+FR=""; ER=""
+for b in $(seq 0 31); do
+  seg="$((b*256+64)):$(( (b+1)*256 ))"
+  if [ "$b" -lt 24 ]; then FR="${FR:+$FR,}$seg"; else ER="${ER:+$ER,}$seg"; fi
+done
 # ③zlayer 全家 43 层(干净锚; XC 非空=第7参引擎捕获)
 for L in $(seq 0 42); do
   env DS4_ZL_NTOK=8192 DS4_ZL_NFIT=6144 ${XA:+DS4_ZL_XANCHOR=$XA} DS4_ZL_FIT_RANGES="$FR" DS4_ZL_EV_RANGE="$ER" \
