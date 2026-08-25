@@ -377,7 +377,7 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
                                          float *logits,
                                          char *err,
                                          size_t errlen);
-/* mtp.md Phase 1 cross-machine verifier: run a K-token candidate batch through
+/* docs/archive/mtp.md Phase 1 cross-machine verifier: run a K-token candidate batch through
  * the final-layer worker slice and emit per-row greedy argmax into
  * row_tops[0..n_tokens-1]. Writes layer KV for pos0..pos0+n_tokens-1 without
  * committing the timeline (caller commits accepted prefix + rolls back the rest). */

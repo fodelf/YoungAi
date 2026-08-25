@@ -4177,7 +4177,7 @@ static DS4_MAYBE_UNUSED bool weights_model_map_spans(
 
     memset(spans, 0, sizeof(*spans));
     /* Layer-0 workers always need token_embd to embed the prompt; a distributed
-     * MTP drafter on a nonzero-start worker needs it too (mtp.md Phase 1). */
+     * MTP drafter on a nonzero-start worker needs it too (docs/archive/mtp.md Phase 1). */
     if (layer_start == 0 || include_token_embd) {
         model_map_span_vec_include_one(spans, w->token_embd);
     }
@@ -23033,10 +23033,10 @@ int ds4_session_eval_layer_slice(ds4_session *s,
 #endif
 }
 
-/* mtp.md Phase 1 (Scheme A) cross-machine verifier: run a K-token candidate
+/* docs/archive/mtp.md Phase 1 (Scheme A) cross-machine verifier: run a K-token candidate
  * batch through this worker's layer slice (layer_start..layer_end, which must be
  * the final transformer layer) and emit the per-row logits into
- * row_logits[i*vocab .. ]. This is the batch verification pass (mtp.md §3.2.2,
+ * row_logits[i*vocab .. ]. This is the batch verification pass (docs/archive/mtp.md §3.2.2,
  * "末端出 K 组 logits"): row i predicts batch position i+1, so the coordinator
  * argmaxes each row to find the accepted speculative prefix and reuses the
  * boundary row to seed the next sampling step. The batch writes layer KV for
@@ -23176,7 +23176,7 @@ int ds4_session_verify_batch_argmax(ds4_session *s,
 #endif
 }
 
-/* mtp.md Phase 1: truncate the layer-slice timeline back to new_len positions
+/* docs/archive/mtp.md Phase 1: truncate the layer-slice timeline back to new_len positions
  * after a speculative batch so the rejected tail is dropped. The position-indexed
  * KV ring rows are not cleared; the next eval at new_len overwrites them, exactly
  * like the single-machine MTP rollback. */
@@ -24107,7 +24107,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             if (errlen) snprintf(err, errlen, "distributed decode requires a valid checkpoint");
             return -1;
         }
-        /* mtp.md Phase 1: cross-machine MTP speculation. The driver commits
+        /* docs/archive/mtp.md Phase 1: cross-machine MTP speculation. The driver commits
          * first_token + verified drafts into the session checkpoint and returns
          * the committed count; s->logits is left predicting the next token. */
         int cap = accepted_cap < max_tokens ? accepted_cap : max_tokens;

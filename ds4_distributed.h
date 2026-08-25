@@ -113,7 +113,7 @@ int ds4_dist_session_eval(
         char *err,
         size_t errlen);
 
-/* mtp.md Phase 1 (Scheme A): speculative decode across the layer-pipeline route.
+/* docs/archive/mtp.md Phase 1 (Scheme A): speculative decode across the layer-pipeline route.
  * Commits first_token plus any MTP draft tokens the target model verifies, into
  * accepted[0..ret-1]. Returns the committed count (>=1) or -1 on hard failure.
  * Falls back to a single-token eval when no drafter/worker is available. */

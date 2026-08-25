@@ -57,11 +57,11 @@
 #define DS4_DIST_WORK_F_OUTPUT_LOGITS 0x00000002u
 #define DS4_DIST_WORK_F_RESET_SESSION 0x00000004u
 #define DS4_DIST_WORK_F_ACK_ONLY 0x00000008u
-/* mtp.md Phase 1: after producing the final hidden state + logits, the worker
+/* docs/archive/mtp.md Phase 1: after producing the final hidden state + logits, the worker
  * holding the last layers should run the MTP drafter and append up to
  * work.draft_cap candidate token ids to its RESULT payload. */
 #define DS4_DIST_WORK_F_DRAFT 0x00000010u
-/* mtp.md Phase 1: the K-token candidate batch verification pass. The last-layer
+/* docs/archive/mtp.md Phase 1: the K-token candidate batch verification pass. The last-layer
  * worker runs the output head on every row and returns per-row argmax token ids
  * in the RESULT draft channel instead of a single logits row. */
 #define DS4_DIST_WORK_F_VERIFY 0x00000020u
@@ -129,7 +129,7 @@ typedef struct {
     uint32_t route_count;
     uint32_t route_index;
     uint32_t route_bytes;
-    /* mtp.md Phase 1 speculative fields (0 on every non-MTP frame, so the wire
+    /* docs/archive/mtp.md Phase 1 speculative fields (0 on every non-MTP frame, so the wire
      * layout is behavior-identical to the pre-MTP protocol once both ends are
      * rebuilt). draft_cap: how many MTP candidates the last-layer worker may
      * draft for this step. accept_len: number of tokens the coordinator
@@ -164,7 +164,7 @@ typedef struct {
     uint32_t telemetry_bytes;
     uint32_t payload_bytes;
     uint32_t payload_bits;
-    /* mtp.md Phase 1: count of MTP draft token ids (uint32 each) appended after
+    /* docs/archive/mtp.md Phase 1: count of MTP draft token ids (uint32 each) appended after
      * the logits/telemetry payload. 0 unless the WORK frame set DS4_DIST_WORK_F_DRAFT
      * and the worker successfully drafted. */
     uint32_t draft_count;
@@ -273,7 +273,7 @@ typedef struct {
     pthread_mutex_t mu;
     ds4_dist_worker_entry *workers;
     bool shutting_down;
-    /* mtp.md Phase 1: request MTP drafts + cross-machine batch verification from
+    /* docs/archive/mtp.md Phase 1: request MTP drafts + cross-machine batch verification from
      * the last-layer worker (set by --mtp-role worker on the coordinator). */
     bool mtp_draft;
     /* 本机 MTP (--mtp-role coordinator): the drafter runs here, not on the worker.
@@ -311,7 +311,7 @@ typedef struct ds4_dist_worker_session {
     uint64_t token_hash;
     bool token_hash_valid;
     ds4_session *session;
-    /* mtp.md Phase 1: when the previous frame was a speculative VERIFY batch,
+    /* docs/archive/mtp.md Phase 1: when the previous frame was a speculative VERIFY batch,
      * spec_pending is set and spec_base_len records the timeline length before
      * the batch was applied. The next frame carries accept_len; the worker rolls
      * its layer-slice KV back to spec_base_len + accept_len before proceeding. */
@@ -465,7 +465,7 @@ struct ds4_dist_session {
     uint64_t plan_generation;
     uint64_t session_id;
     uint64_t request_id;
-    /* mtp.md Phase 1: the previous speculative cycle ran a VERIFY batch and the
+    /* docs/archive/mtp.md Phase 1: the previous speculative cycle ran a VERIFY batch and the
      * remote worker still has all K candidate tokens in its layer KV. The next
      * frame must carry spec_accept_len so the worker rolls back to the accepted
      * prefix before applying new work. */
@@ -2665,7 +2665,7 @@ static int dist_recv_result_alloc(
     const uint64_t got_hash = dist_u64_from_halves(result.result_hash_hi,
                                                   result.result_hash_lo);
     const uint32_t body_bytes = bytes - (uint32_t)sizeof(result);
-    /* mtp.md Phase 1: draft token ids ride after telemetry + payload. */
+    /* docs/archive/mtp.md Phase 1: draft token ids ride after telemetry + payload. */
     if (result.draft_count > 16u) {
         dist_discard_bytes(fd, body_bytes);
         if (errlen) snprintf(err, errlen, "distributed result draft count out of range");
@@ -2777,7 +2777,7 @@ static int dist_recv_result_alloc(
         result.payload_bytes = decoded_bytes;
     }
 
-    /* mtp.md Phase 1: read the trailing MTP draft token ids (status==0 only;
+    /* docs/archive/mtp.md Phase 1: read the trailing MTP draft token ids (status==0 only;
      * the sender forces draft_count=0 on error frames). */
     for (uint32_t i = 0; i < result.draft_count; i++) {
         uint32_t t = 0;
@@ -2812,8 +2812,8 @@ static int dist_coordinator_send_remote_work_on_fd(
         bool ack_only,
         const float *hidden_hc,
         uint32_t hidden_hc_bytes,
-        uint32_t draft_cap,       /* mtp.md Phase 1: ask last-layer worker to draft */
-        uint32_t accept_len,      /* mtp.md Phase 1: roll back prev spec batch first */
+        uint32_t draft_cap,       /* docs/archive/mtp.md Phase 1: ask last-layer worker to draft */
+        uint32_t accept_len,      /* docs/archive/mtp.md Phase 1: roll back prev spec batch first */
         uint32_t extra_flags,     /* extra DS4_DIST_WORK_F_* bits (e.g. DRAFT/VERIFY) */
         char *err,
         size_t errlen) {
@@ -2863,7 +2863,7 @@ static int dist_coordinator_send_remote_work_on_fd(
     return 0;
 }
 
-/* mtp.md Phase 1 speculative I/O threaded through the coordinator eval path.
+/* docs/archive/mtp.md Phase 1 speculative I/O threaded through the coordinator eval path.
  * NULL on every non-speculative call (the normal decode/prefill path is byte
  * identical). When set on a DRAFT frame the worker appends MTP draft ids
  * (read into drafts[0..draft_n-1]); on a VERIFY frame the worker returns
@@ -6142,7 +6142,7 @@ int ds4_dist_session_eval(
     return rc;
 }
 
-/* mtp.md Phase 1 (Scheme A) cross-machine speculative decode. Returns the number
+/* docs/archive/mtp.md Phase 1 (Scheme A) cross-machine speculative decode. Returns the number
  * of tokens committed this call (>=1) into accepted[], or -1 on hard failure.
  *
  * Two cross-machine rounds:
@@ -6439,7 +6439,7 @@ static int dist_send_work_result(
     } else {
         payload_bits = 0;
     }
-    /* mtp.md Phase 1: draft tokens (uint32 each) ride after the logits payload,
+    /* docs/archive/mtp.md Phase 1: draft tokens (uint32 each) ride after the logits payload,
      * present only when the WORK frame requested a draft and status==0. */
     if (status != 0) draft_count = 0;
     const uint64_t draft_bytes64 = (uint64_t)draft_count * sizeof(uint32_t);
@@ -7986,7 +7986,7 @@ static int dist_worker_process_work_payload(
     const bool final_ack_only = ack_only && !has_next;
     const bool local_output_logits = output_logits && !has_next && !final_ack_only;
     const bool produce_hidden = !local_output_logits && !final_ack_only;
-    /* mtp.md Phase 1: a VERIFY frame runs the per-row output head over the whole
+    /* docs/archive/mtp.md Phase 1: a VERIFY frame runs the per-row output head over the whole
      * K-token candidate batch and returns K logit rows (one per position). */
     const bool is_verify = local_output_logits &&
                            (work.flags & DS4_DIST_WORK_F_VERIFY) != 0;
@@ -8044,7 +8044,7 @@ static int dist_worker_process_work_payload(
         free(tokens);
         return dist_worker_upstream_send_work_error(upstream, request_id, err);
     }
-    /* mtp.md Phase 1: if the previous frame was a speculative VERIFY batch, roll
+    /* docs/archive/mtp.md Phase 1: if the previous frame was a speculative VERIFY batch, roll
      * this worker's layer-slice KV back to base + accept_len before validating
      * the new frame. Output correctness never depends on this: a wrong rollback
      * only trips the prefix-hash check below and forces a transcript rebuild. */
@@ -8103,7 +8103,7 @@ static int dist_worker_process_work_payload(
     const double eval_t0 = dist_now_sec();
     int eval_rc;
     if (is_verify) {
-        /* mtp.md Phase 1: per-row batch verification. Runs this worker's final
+        /* docs/archive/mtp.md Phase 1: per-row batch verification. Runs this worker's final
          * layer slice + output head over all K candidates and fills K logit rows.
          * Records spec base so the next frame's accept_len can roll back. */
         eval_rc = ds4_session_verify_batch_argmax(session->session,
