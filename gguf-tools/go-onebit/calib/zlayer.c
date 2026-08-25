@@ -17,12 +17,28 @@
  *     自检: ./zlayer --selftest-rng 打印前 8 个值, 应等于 np.random.RandomState(1).randn(8)。
  *   - fp16 载荷由 f64 直接舍入(py: A[:,:K].astype(np.float16), A 是 f64), 不走 f32 中转。
  *
- * 【第一期范围】能编译能跑的最小完整闭环。明确【不做】(碰到就报错停车, 不静默换语义):
- *   - DS4_ZL_GGUF 标量模式(量化侧权重从 GGUF 切片) —— 未实现, 设了就拒跑。
- *   - DS4_ZL_XANCHOR / DS4_ZL_ADDON 链模式(链态锚 + 叠加式合并注入) —— 未实现, 拒跑。
- *   - ERF 死层部件 —— 未实现, 触发条件命中时打印一行"未实现, 跳过"继续走。
- *   - cupy/GPU 路径 —— 纯 CPU(+可选 BLAS)。
- *   - 非 XCAP 口径(x/y_q 走锚 fin + Python 重算量化专家) —— 第一期只做 XCAP。
+ * 【第二期补齐(2026-08-25)】一期只做 XCAP 口径, 二期把 .py 剩下的四个模式全转录进来。
+ *   ① 非 XCAP 口径: x=锚 fin, 学生=本进程重算量化专家(VQ blob 或 GGUF 切片),
+ *      dH = Σw·Y_fp − Σw_q·Y_q。amp86/dspark86 战役走的就是这一路(见 scripts/amp86_spark.sh)。
+ *   ② DS4_ZL_GGUF 标量模式: 学生权重从 GGUF 专家张量按字节均分切片再 dequant。
+ *   ③ DS4_ZL_XANCHOR / DS4_ZL_ADDON 链模式: 链态锚(x_q/路由_q 从第二个锚读) +
+ *      叠加式合并注入(既有 GE 乘入学生权重、既有 z 出力从 dH 扣除、新旧合并成单条记录)。
+ *      ★照抄 .py 的缩进事实★: ADDON 的读取整块嵌在 `if XAP:` 里 —— 也就是说
+ *      【只设 DS4_ZL_ADDON 而不设 DS4_ZL_XANCHOR 时, ADDON 完全不生效】。这不是笔误顺手
+ *      改掉的地方: .py 是权威, 改了就等于 C 与 py 同参数下产物不同。C 里额外加一行提示,
+ *      免得有人设了 ADDON 却以为生效了(提示不改行为)。
+ *   ④ ERF 死层部件: 组合增益 < DS4_ZL_ERF_BAR 时上的每专家 ΔW_w2 加权低秩补丁。
+ *   仍然【不做】: cupy/GPU 路径(纯 CPU + 可选 BLAS)。
+ *
+ * 【二期新增的不可逐位点】(判定看打印读数与结构, 不看载荷字节):
+ *   - ERF 的 randomized SVD 里有 QR 分解, ADDON 的合并里有两次 QR + 一次 SVD。
+ *     numpy 的 np.linalg.qr 是 LAPACK geqrf/orgqr(Householder), 这里手写 Householder,
+ *     两者的 Q/R 符号约定与舍入都不逐位。但 QR 只是中间基:
+ *       ADDON: 最终产物 = Pc·Qcᵀ 的截断 SVD, 与用哪组 QR 基无关(数学上唯一, 差在末位);
+ *       ERF:   最终产物 = 低秩补丁的乘积, 同理。
+ *     所以【金标口径 = 打印的挽回率/专家数/记录长度 + 记录头逐字节】, U/V 载荷不逐位。
+ *   - ERF 里 np.argsort(-_en) 是 numpy 默认 quicksort(不稳定); C 用稳定排序(键相同按
+ *     下标升序)。_en 是连续浮点能量, 实测不会撞值; 真撞了两边的 tau 也一样(同值)。
  *
  * 【金标口径】SVD 的数值路径与 numpy 不同(见 zl_svd_lowrank): numpy 走 LAPACK gesdd,
  *   这里走子空间迭代 + Rayleigh-Ritz。子空间迭代对 rank-k 截断是逼近而非精确, 所以
@@ -35,6 +51,8 @@
  * 环境变量(只认既有的这几个, 禁新增):
  *   DS4_ZL_NTOK=1716 DS4_ZL_NFIT=1287 DS4_ZL_FIT_RANGES DS4_ZL_EV_RANGE
  *   DS4_ZL_GE=1 DS4_ZL_GE_LAM=1e-3 DS4_ZL_FTA=1 DS4_ZL_ERF=1 DS4_ZL_GATE=0 DS4_ZL_SWLIM=10
+ *   DS4_ZL_ERF_BAR=0.01 DS4_ZL_ERF_R=8
+ *   DS4_ZL_GGUF=<模型路径> DS4_ZL_XANCHOR=<第二个锚> DS4_ZL_ADDON=1(要配 XANCHOR 才生效)
  *   DS4_ZL_CACHE_ONLY=0(纯控制流, 不参与数值)
  * 编译:
  *   gcc -O3 -march=native -o zlayer zlayer.c -lm -lpthread              (纯循环, 慢但能跑)
@@ -571,7 +589,13 @@ static void zw_finish(zwr_t *z) {
  *   槽表在 blob+16, 每专家 3 个 u64 偏移(w1,w3,w2 顺序);
  *   载荷 = magic|dim,nc(u16)|rows,cols(u32) | 码本 f16[nc*dim] | 行乘子 f16[rows] | 索引位流。
  *   out[r][c] = cb[idx[r*(cols/dim) + c/dim]][c%dim] * gr[r]
- * 位流是小端 bit order(numpy unpackbits bitorder='little'): 第 i 个索引取 bit 偏移 i*nbit。 */
+ * 位流是小端 bit order(numpy unpackbits bitorder='little'): 第 i 个索引取 bit 偏移 i*nbit。
+ *
+ * 与运行时那份的关系(2026-08-25 二期核对): quant/vq_qc.h:265 的 vq_unpack_dequant ——
+ * 就是 ds4quant_run.c 的 bytes_moe 用的那个 —— 与这里【数值同式】: 位宽推法、3 字节窗
+ * 取索引、码本×行乘子全一样, 只有行号的写法差异(`r=(i*dim)/cols` vs `r=i/(cols/dim)`,
+ * cols 整除 dim 时恒等)。本文件这份多了两处【只读 guard】: 索引 ≥nc 时钳到 nc-1、
+ * 位流读取按 blob 尾部截断补零 —— 侧车是外部产物, 越界会读飞。 */
 #define VQ_MAGIC 0x51565144u
 
 static uint64_t vq_slot(const uint8_t *blob, size_t bsz, int e, int w) {
@@ -618,6 +642,268 @@ static float *vq_dequant(const uint8_t *blob, size_t bsz, uint64_t off, long *R_
     free(cb); free(gr);
     *R_out = (long)rows; *C_out = (long)cols;
     return W;
+}
+
+/* ================= GGUF 标量模式(DS4_ZL_GGUF) =================
+ * py 侧: gguf.GGUFReader 取张量 + gguf.quants.dequantize 反量化, 专家沿【外维】连续,
+ *        所以"第 e 个专家"= 该张量原始字节按专家数均分后的第 e 段(py: per=db.size//nexp)。
+ * 这里对齐的是【数值结果】不是实现 —— py 走 gguf-py 的 numpy 向量化路, 这里走标量循环。
+ *
+ * 【来源, 不重写数值表】
+ *   - GGUF v3 头解析: 逐式抄 quant/vq_merge_v4.c 的 rdstr/skipv/parse_header
+ *     (同一份小端假设; 那边有"同参数下与 vq_merge_v4.py 逐字节 md5 相同"的金标)。
+ *   - q2_K: 抄 ds4.c:4352 的 deq_q2K_row_f32(注释里写明与 CUDA host_deq_q2k_block
+ *     同式且已对拍); 索引式 qpos/shift 一字未改。
+ *   - iq2_xxs 网格: 用 gguf-tools/quants.c:714 那张 kgrid[256](IQ2_XXS 编码器建表用的
+ *     同一张表), 由 2bit 四元组现场展开成 8×int8 = 2*l+1 —— 与 llama.cpp 的
+ *     iq2xxs_grid 逐字节同, 所以不另抄一份 2048 字节的常量。
+ *     符号表 ksigns_iq2xs 也不抄: 它就是 "popcount 为奇数则置 bit7", 现场算。
+ *   - q4_K/q8_0: llama.cpp 标准式(get_scale_min_k4 / y=d·q), 与 gguf-py 的
+ *     Q4_K.get_scale_min / Q8_0.dequantize_blocks 逐式同。
+ * 【范围】只实现这条产线真出现过的类型(全q2 底座 = 专家 w1/w3 IQ2_XXS + w2 Q2_K,
+ *   见 scripts/quant_allq2_spark.sh), 外加 f32/f16/bf16/q8_0/q4_K 这几个零成本的。
+ *   碰到别的类型直接停车 —— py 那边 gguf-py 也是抛异常, 不静默出垃圾。 */
+
+enum { GGT_F32 = 0, GGT_F16 = 1, GGT_Q8_0 = 8, GGT_Q2_K = 10, GGT_Q4_K = 12,
+       GGT_IQ2_XXS = 16, GGT_BF16 = 30 };
+
+typedef struct { char *name; uint32_t nd, type; uint64_t ne[4], off; } gg_tensor;
+typedef struct { const uint8_t *map; size_t msz; gg_tensor *t; int nt; uint64_t data0; } gg_ctx;
+
+static uint64_t gg_align_up(uint64_t x) { return (x + 31u) & ~31ull; }   /* GGUF 默认 alignment=32 */
+
+/* 光标式读取(全在 mmap 上, 越界即停车) */
+typedef struct { const uint8_t *p; const uint8_t *end; } gg_cur;
+static void gg_rd(gg_cur *c, void *dst, size_t n) {
+    if ((size_t)(c->end - c->p) < n) die("GGUF 头截断(还差 %zu B)", n);
+    memcpy(dst, c->p, n); c->p += n;
+}
+static uint32_t gg_u32(gg_cur *c) { uint32_t v; gg_rd(c, &v, 4); return v; }
+static uint64_t gg_u64(gg_cur *c) { uint64_t v; gg_rd(c, &v, 8); return v; }
+static void gg_skipstr(gg_cur *c) { uint64_t n = gg_u64(c); if ((uint64_t)(c->end - c->p) < n) die("GGUF 串截断"); c->p += n; }
+static void gg_skipval(gg_cur *c, uint32_t t) {          /* vq_merge_v4.c skipv 同表 */
+    static const int sz[13] = { 1, 1, 2, 2, 4, 4, 4, 1, 0, 0, 8, 8, 8 };
+    if (t == 8) { gg_skipstr(c); return; }
+    if (t == 9) { uint32_t et = gg_u32(c); uint64_t n = gg_u64(c);
+                  for (uint64_t i = 0; i < n; i++) gg_skipval(c, et); return; }
+    if (t > 12 || sz[t] == 0) die("GGUF KV 类型不认识: %u", t);
+    uint8_t tmp[8]; gg_rd(c, tmp, (size_t)sz[t]);
+}
+
+static void gg_open(gg_ctx *g, const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) die("DS4_ZL_GGUF 打不开: %s", path);
+    struct stat st;
+    if (fstat(fd, &st) || st.st_size <= 0) die("DS4_ZL_GGUF 空文件: %s", path);
+    g->msz = (size_t)st.st_size;
+    g->map = (const uint8_t *)mmap(NULL, g->msz, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (g->map == MAP_FAILED) die("DS4_ZL_GGUF mmap 失败: %s", path);
+    close(fd);
+    gg_cur c = { g->map, g->map + g->msz };
+    uint32_t magic = gg_u32(&c), ver = gg_u32(&c);
+    uint64_t n_t = gg_u64(&c), n_kv = gg_u64(&c);
+    if (!(magic == 0x46554747u && ver == 3)) die("assert 失败: 非 GGUF v3(magic=%08x ver=%u)", magic, ver);
+    for (uint64_t i = 0; i < n_kv; i++) { gg_skipstr(&c); gg_skipval(&c, gg_u32(&c)); }
+    g->nt = (int)n_t;
+    g->t = (gg_tensor *)xcalloc((size_t)(n_t ? n_t : 1), sizeof(gg_tensor));
+    for (uint64_t i = 0; i < n_t; i++) {
+        gg_tensor *t = &g->t[i];
+        uint64_t nl = gg_u64(&c);
+        if ((uint64_t)(c.end - c.p) < nl) die("GGUF 张量名截断");
+        t->name = (char *)xmalloc((size_t)nl + 1);
+        memcpy(t->name, c.p, (size_t)nl); t->name[nl] = 0; c.p += nl;
+        t->nd = gg_u32(&c);
+        if (t->nd < 1 || t->nd > 4) die("GGUF 张量 %s 维数 %u 超范围", t->name, t->nd);
+        t->ne[0] = t->ne[1] = t->ne[2] = t->ne[3] = 1;
+        for (uint32_t d2 = 0; d2 < t->nd; d2++) t->ne[d2] = gg_u64(&c);
+        t->type = gg_u32(&c);
+        t->off = gg_u64(&c);
+    }
+    g->data0 = gg_align_up((uint64_t)(c.p - g->map));
+}
+
+static void gg_type_geom(uint32_t ty, uint64_t *blk, uint64_t *tsz) {
+    switch (ty) {
+        case GGT_F32:     *blk = 1;   *tsz = 4;   return;
+        case GGT_F16:     *blk = 1;   *tsz = 2;   return;
+        case GGT_BF16:    *blk = 1;   *tsz = 2;   return;
+        case GGT_Q8_0:    *blk = 32;  *tsz = 34;  return;
+        case GGT_Q2_K:    *blk = 256; *tsz = 84;  return;
+        case GGT_Q4_K:    *blk = 256; *tsz = 144; return;
+        case GGT_IQ2_XXS: *blk = 256; *tsz = 66;  return;
+        default: die("GGUF 张量类型 %u 未实现 dequant — .py 侧 gguf-py 同样会抛, 拒跑", ty);
+    }
+}
+
+/* ---- 标量反量化: 输入 nb 个块的原始字节, 输出 nb*blk 个 f32 ---- */
+
+/* q2_K: 抄 ds4.c:4352 deq_q2K_row_f32(与 CUDA host_deq_q2k_block 同式, 已对拍) */
+static void gg_deq_q2_K(const uint8_t *src, uint64_t nblk, float *out) {
+    for (uint64_t b = 0; b < nblk; b++) {
+        const uint8_t *blk = src + b * 84u;
+        const uint8_t *sc = blk, *qs = blk + 16;
+        uint16_t hd, hm;
+        memcpy(&hd, blk + 80, 2); memcpy(&hm, blk + 82, 2);
+        const float d = f16_to_f32(hd), dm = f16_to_f32(hm);
+        float *o = out + b * 256u;
+        for (int j = 0; j < 16; j++) {
+            const float dj = d * (float)(sc[j] & 0xF), mj = dm * (float)(sc[j] >> 4);
+            for (int ii = 0; ii < 16; ii++) {
+                const int idx = j * 16 + ii;
+                const int qpos = (idx / 128) * 32 + (idx % 32);
+                const int q = (qs[qpos] >> ((idx % 128) / 32 * 2)) & 3;
+                o[idx] = dj * (float)q - mj;
+            }
+        }
+    }
+}
+
+/* q4_K: llama.cpp get_scale_min_k4 + dequantize_row_q4_K(= gguf-py Q4_K.get_scale_min) */
+static void gg_q4k_scale_min(int j, const uint8_t *q, uint8_t *d, uint8_t *m) {
+    if (j < 4) { *d = q[j] & 63; *m = q[j + 4] & 63; }
+    else { *d = (uint8_t)((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4));
+           *m = (uint8_t)((q[j + 4] >> 4)  | ((q[j - 0] >> 6) << 4)); }
+}
+static void gg_deq_q4_K(const uint8_t *src, uint64_t nblk, float *out) {
+    for (uint64_t b = 0; b < nblk; b++) {
+        const uint8_t *blk = src + b * 144u;
+        uint16_t hd, hm;
+        memcpy(&hd, blk, 2); memcpy(&hm, blk + 2, 2);
+        const float d = f16_to_f32(hd), dmin = f16_to_f32(hm);
+        const uint8_t *scales = blk + 4, *q = blk + 16;
+        float *y = out + b * 256u;
+        int is = 0;
+        for (int j = 0; j < 256; j += 64) {
+            uint8_t sc, m;
+            gg_q4k_scale_min(is + 0, scales, &sc, &m);
+            const float d1 = d * (float)sc, m1 = dmin * (float)m;
+            gg_q4k_scale_min(is + 1, scales, &sc, &m);
+            const float d2 = d * (float)sc, m2 = dmin * (float)m;
+            for (int l = 0; l < 32; l++) *y++ = d1 * (float)(q[l] & 0xF) - m1;
+            for (int l = 0; l < 32; l++) *y++ = d2 * (float)(q[l] >> 4)  - m2;
+            q += 32; is += 2;
+        }
+    }
+}
+
+static void gg_deq_q8_0(const uint8_t *src, uint64_t nblk, float *out) {
+    for (uint64_t b = 0; b < nblk; b++) {
+        const uint8_t *blk = src + b * 34u;
+        uint16_t hd; memcpy(&hd, blk, 2);
+        const float d = f16_to_f32(hd);
+        const int8_t *qs = (const int8_t *)(blk + 2);
+        float *o = out + b * 32u;
+        for (int j = 0; j < 32; j++) o[j] = d * (float)qs[j];
+    }
+}
+
+/* iq2_xxs 网格。两半分开说, 因为踩过一次坑:
+ *   ① 2bit 打包表 = gguf-tools/quants.c:714 的 kgrid[256], 与本文件这份逐字节相同
+ *      (已核对: 0,2,5,8,10,17,20,32,… 与 gguf-py 的 grid_hex 解出来的完全一致)。
+ *   ② 码 → 值的映射【不是】quants.c 里那个 2*l+1 ∈ {1,3,5,7}。那是 IQ2_XXS
+ *      【编码器的搜索空间】(llama.cpp quantize_iq2_xxs 里的 kgrid_q2xs), 与解码表不是
+ *      一套数。真正的解码值 = {0x08, 0x19, 0x2b}, 见 metal/moe.metal:23 的
+ *      ds4_metal_iq2xxs_grid(= llama.cpp iq2xxs_grid = gguf-py IQ2_XXS.grid_map)。
+ *      当初照 2*l+1 写, 与 gguf-py 对拍 max|Δ|=15 —— 数量级都对不上, 但代码不会报错。
+ *      码 3 在这张表里从不出现(全表只有三种字节值)。
+ * 符号: llama.cpp 的 ksigns_iq2xs[s] = s 的 popcount 为奇数时 s|0x80, 否则 s
+ *       (第 8 个符号 = 前 7 位的奇偶校验), 现场算不抄表。 */
+static const uint8_t gg_iq2xxs_val[4] = { 0x08, 0x19, 0x2b, 0x00 };
+static const uint16_t gg_iq2xxs_kgrid[256] = {
+        0,     2,     5,     8,    10,    17,    20,    32,    34,    40,    42,    65,    68,    80,    88,    97,
+      100,   128,   130,   138,   162,   257,   260,   272,   277,   320,   388,   408,   512,   514,   546,   642,
+     1025,  1028,  1040,  1057,  1060,  1088,  1090,  1096,  1120,  1153,  1156,  1168,  1188,  1280,  1282,  1288,
+     1312,  1350,  1385,  1408,  1425,  1545,  1552,  1600,  1668,  1700,  2048,  2053,  2056,  2068,  2088,  2113,
+     2116,  2128,  2130,  2184,  2308,  2368,  2562,  2580,  4097,  4100,  4112,  4129,  4160,  4192,  4228,  4240,
+     4245,  4352,  4360,  4384,  4432,  4442,  4480,  4644,  4677,  5120,  5128,  5152,  5157,  5193,  5248,  5400,
+     5474,  5632,  5654,  6145,  6148,  6160,  6208,  6273,  6400,  6405,  6560,  6737,  8192,  8194,  8202,  8260,
+     8289,  8320,  8322,  8489,  8520,  8704,  8706,  9217,  9220,  9232,  9280,  9302,  9472,  9537,  9572,  9872,
+    10248, 10272, 10388, 10820, 16385, 16388, 16400, 16408, 16417, 16420, 16448, 16456, 16470, 16480, 16513, 16516,
+    16528, 16640, 16672, 16737, 16768, 16773, 16897, 16912, 16968, 16982, 17000, 17408, 17416, 17440, 17536, 17561,
+    17682, 17700, 17920, 18433, 18436, 18448, 18496, 18501, 18688, 18776, 18785, 18818, 19013, 19088, 20480, 20488,
+    20497, 20505, 20512, 20608, 20616, 20740, 20802, 20900, 21137, 21648, 21650, 21770, 22017, 22100, 22528, 22545,
+    22553, 22628, 22848, 23048, 24580, 24592, 24640, 24680, 24832, 24917, 25112, 25184, 25600, 25605, 25872, 25874,
+    25988, 26690, 32768, 32770, 32778, 32833, 32898, 33028, 33048, 33088, 33297, 33793, 33796, 33808, 33813, 33856,
+    33888, 34048, 34118, 34196, 34313, 34368, 34400, 34818, 35076, 35345, 36868, 36880, 36900, 36928, 37025, 37142,
+    37248, 37445, 37888, 37922, 37956, 38225, 39041, 39200, 40962, 41040, 41093, 41225, 41472, 42008, 43088, 43268,
+};
+static void gg_deq_iq2_xxs(const uint8_t *src, uint64_t nblk, float *out) {
+    for (uint64_t b = 0; b < nblk; b++) {
+        const uint8_t *blk = src + b * 66u;
+        uint16_t hd; memcpy(&hd, blk, 2);
+        const float d = f16_to_f32(hd);
+        float *y = out + b * 256u;
+        for (int ib32 = 0; ib32 < 8; ib32++) {
+            uint16_t q2[4];
+            memcpy(q2, blk + 2 + ib32 * 8, 8);
+            const uint32_t a_g = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
+            const uint32_t a_s = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
+            const float db = d * (0.5f + (float)(a_s >> 28)) * 0.25f;
+            for (int l = 0; l < 4; l++) {
+                const uint32_t gi = (a_g >> (8 * l)) & 0xFFu;         /* aux8[l] */
+                const uint16_t kg = gg_iq2xxs_kgrid[gi];
+                uint32_t s7 = (a_s >> (7 * l)) & 127u;
+                int par = 0;
+                for (int t = 0; t < 7; t++) par ^= (int)((s7 >> t) & 1u);
+                const uint32_t signs = par ? (s7 | 0x80u) : s7;       /* = ksigns_iq2xs[s7] */
+                for (int j = 0; j < 8; j++) {
+                    const int code = (kg >> (2 * j)) & 3;
+                    if (code == 3) die("iq2_xxs 网格出现码 3 — 表读错了(assert)");
+                    const float gv = (float)gg_iq2xxs_val[code];
+                    *y++ = (signs & (1u << j)) ? -(db * gv) : (db * gv);
+                }
+            }
+        }
+    }
+}
+
+/* 一段字节 → f32[nelem]; 调用方保证 nelem 是块大小的整数倍(py 的 per 均分同样保证) */
+static void gg_dequant(uint32_t ty, const uint8_t *src, uint64_t nelem, float *out) {
+    uint64_t blk, tsz; gg_type_geom(ty, &blk, &tsz);
+    if (nelem % blk) die("GGUF dequant: 元素数 %llu 不是块 %llu 的整数倍", (unsigned long long)nelem, (unsigned long long)blk);
+    const uint64_t nb = nelem / blk;
+    switch (ty) {
+        case GGT_F32:  memcpy(out, src, (size_t)nelem * 4); return;
+        case GGT_F16:  for (uint64_t i = 0; i < nelem; i++) { uint16_t h; memcpy(&h, src + i * 2, 2); out[i] = f16_to_f32(h); } return;
+        case GGT_BF16: for (uint64_t i = 0; i < nelem; i++) { uint16_t h; memcpy(&h, src + i * 2, 2);
+                           uint32_t u = (uint32_t)h << 16; float v; memcpy(&v, &u, 4); out[i] = v; } return;
+        case GGT_Q8_0:    gg_deq_q8_0(src, nb, out);    return;
+        case GGT_Q2_K:    gg_deq_q2_K(src, nb, out);    return;
+        case GGT_Q4_K:    gg_deq_q4_K(src, nb, out);    return;
+        case GGT_IQ2_XXS: gg_deq_iq2_xxs(src, nb, out); return;
+        default: die("GGUF dequant: 类型 %u 未实现", ty);
+    }
+}
+
+/* py 的 _gg_expert(l,nm,e): 张量 blk.<L>.ffn_{gate,up,down}_exps.weight,
+ * shape=[内维 ne0, 行 ne1, 专家 ne2] → 每专家 [rows=ne[-2], cols=ne[0]],
+ * 字节按专家数均分(per = 总字节/nexp)。返回 malloc 的 f32 [rows*cols]。 */
+static float *gg_expert(const gg_ctx *g, int L, const char *nm, int e, long *R_out, long *C_out) {
+    static const char *TN[3] = { "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps" };
+    int wi = !strcmp(nm, "w1") ? 0 : (!strcmp(nm, "w3") ? 1 : 2);
+    char want[128];
+    snprintf(want, sizeof want, "blk.%d.%s.weight", L, TN[wi]);
+    const gg_tensor *t = NULL;
+    for (int i = 0; i < g->nt; i++) if (!strcmp(g->t[i].name, want)) { t = &g->t[i]; break; }
+    if (!t) die("KeyError: GGUF 里没有张量 %s", want);
+    if (t->nd < 3) die("%s 维数 %u < 3 — 没有专家外维, 口径不明拒跑", want, t->nd);
+    const uint64_t nexp = t->ne[t->nd - 1], rows = t->ne[t->nd - 2], cols = t->ne[0];
+    if ((uint64_t)e >= nexp) die("%s: 专家 %d ≥ %llu", want, e, (unsigned long long)nexp);
+    uint64_t nel = 1;
+    for (uint32_t d2 = 0; d2 < t->nd; d2++) nel *= t->ne[d2];
+    if (nel != rows * cols * nexp) die("%s: 维数 %u 有中间维, py 的 rows/cols 取法会错位, 拒跑", want, t->nd);
+    uint64_t blk, tsz; gg_type_geom(t->type, &blk, &tsz);
+    if (nel % blk) die("%s: 元素数 %llu 不是块 %llu 整数倍", want, (unsigned long long)nel, (unsigned long long)blk);
+    const uint64_t nbytes = nel / blk * tsz;
+    if (nbytes % nexp) die("%s: 字节 %llu 不能按 %llu 专家均分(py 的 per=db.size//nexp 会截断)",
+                           want, (unsigned long long)nbytes, (unsigned long long)nexp);
+    const uint64_t per = nbytes / nexp;
+    const uint64_t base = g->data0 + t->off + (uint64_t)e * per;
+    if (base + per > g->msz) die("%s 专家 %d 数据越界(off=%llu)", want, e, (unsigned long long)base);
+    float *w = (float *)xmalloc((size_t)rows * cols * sizeof(float));
+    gg_dequant(t->type, g->map + base, rows * cols, w);
+    *R_out = (long)rows; *C_out = (long)cols;
+    return w;
 }
 
 /* ---------------- 锚(DQA2)读取: probe_layer_behavior.anchor_layer 逐式 ---------------- */
@@ -787,6 +1073,82 @@ static void zl_svd_lowrank(const double *W, int din, int dout, int r,
     *A_out = A; *S_out = S; *Bt_out = Bt;
 }
 
+/* ---------------- Householder QR(reduced) ----------------
+ * 用在两处: ADDON 的新旧低秩合并(np.linalg.qr(Pc)/qr(Qc)) 与 ERF 的 randomized SVD。
+ * ★与 numpy 不逐位★: np.linalg.qr 走 LAPACK geqrf/orgqr —— 分块顺序、Householder 的符号
+ * 约定(LAPACK 让 R 对角可正可负)都与这里的教科书写法不同。两处调用都只把 QR 当【中间基】:
+ *   ADDON 最终产物 = Pc·Qcᵀ 的截断 SVD, 数学上与用哪组正交基无关;
+ *   ERF  最终产物 = 低秩补丁 U·Vᵀ 的乘积, 同理。
+ * 所以只要 Q 正交、QR=A 成立就够, 金标看打印读数不看载荷字节。
+ *
+ * 就地分解 A[m,n](行主序, m≥n): 返回时
+ *   R = 上三角(对角取 rdiag[k], 上方取 A[k*n+j], j>k);
+ *   第 k 个 Householder 向量 v_k 存在 A 的第 k 列 i≥k 处, tau[k]=2/‖v_k‖²(v_k=0 时 tau=0)。 */
+/* 尾列更新 A[k:m, k+1:n] -= tau·v·(vᵀ·A[k:m, k+1:n])。parallel_for 的分片是 0 基,
+ * 所以 worker 里把 jj 重映射成 j = k+1+jj。 */
+typedef struct { double *A; int m, n, k; double tau; } hhu_ctx;
+static void hhu_worker(void *vc, int i0, int i1) {
+    hhu_ctx *c = (hhu_ctx *)vc;
+    const int m = c->m, n = c->n, k = c->k;
+    for (int jj = i0; jj < i1; jj++) {
+        int j = k + 1 + jj;
+        double d = 0;
+        for (int i = k; i < m; i++) d += c->A[(size_t)i * n + k] * c->A[(size_t)i * n + j];
+        d *= c->tau;
+        if (d == 0.0) continue;
+        for (int i = k; i < m; i++) c->A[(size_t)i * n + j] -= c->A[(size_t)i * n + k] * d;
+    }
+}
+static void hh_qr(double *A, int m, int n, double *tau, double *rdiag) {
+    if (m < n) die("hh_qr: m=%d < n=%d(本实现只做 m≥n 的 reduced QR)", m, n);
+    for (int k = 0; k < n; k++) {
+        double nrm = 0;
+        for (int i = k; i < m; i++) { double x = A[(size_t)i * n + k]; nrm += x * x; }
+        nrm = sqrt(nrm);
+        if (nrm == 0.0) { tau[k] = 0.0; rdiag[k] = 0.0; continue; }
+        double x0 = A[(size_t)k * n + k];
+        double alpha = (x0 >= 0.0) ? -nrm : nrm;         /* 取反号避免相消 */
+        A[(size_t)k * n + k] = x0 - alpha;
+        double v2 = 0;
+        for (int i = k; i < m; i++) { double v = A[(size_t)i * n + k]; v2 += v * v; }
+        tau[k] = (v2 > 0.0) ? 2.0 / v2 : 0.0;
+        rdiag[k] = alpha;
+        if (k + 1 < n) { hhu_ctx hc = { A, m, n, k, tau[k] }; parallel_for(n - k - 1, hhu_worker, &hc); }
+    }
+}
+/* Y[m,ncy] ← Q·Y, Q = H_0·H_1·…·H_{n-1}(只用前 n 个反射子)。
+ * 不显式生成 Q: 调用点要的都是 Q 乘一个窄矩阵, 这样省掉 m×n 的中间物。 */
+typedef struct { const double *A; int m, n, k, ncy; double *Y; double tau; } hha_ctx;
+static void hha_worker(void *vc, int c0, int c1) {
+    hha_ctx *c = (hha_ctx *)vc;
+    const int m = c->m, n = c->n, k = c->k, ncy = c->ncy;
+    for (int col = c0; col < c1; col++) {
+        double d = 0;
+        for (int i = k; i < m; i++) d += c->A[(size_t)i * n + k] * c->Y[(size_t)i * ncy + col];
+        d *= c->tau;
+        if (d == 0.0) continue;
+        for (int i = k; i < m; i++) c->Y[(size_t)i * ncy + col] -= c->A[(size_t)i * n + k] * d;
+    }
+}
+static void hh_apply_q(const double *A, const double *tau, int m, int n, double *Y, int ncy) {
+    for (int k = n - 1; k >= 0; k--) {
+        if (tau[k] == 0.0) continue;
+        hha_ctx ac = { A, m, n, k, ncy, Y, tau[k] };
+        parallel_for(ncy, hha_worker, &ac);
+    }
+}
+
+/* 稳定降序 argsort(键相同按下标升序)。py 用 np.argsort(-_en) = 不稳定 quicksort;
+ * _en 是连续浮点能量, 实测不撞值 —— 真撞了两边的 tau 也一样(同值), 只是记录里的
+ * 专家内 token 门限来源不同, 不影响任何打印读数。 */
+typedef struct { double v; int i; } dsort_t;
+static int cmp_dsort_desc(const void *a, const void *b) {
+    const dsort_t *x = (const dsort_t *)a, *y = (const dsort_t *)b;
+    if (x->v > y->v) return -1;
+    if (x->v < y->v) return 1;
+    return x->i < y->i ? -1 : (x->i > y->i);
+}
+
 /* ---------------- 单专家前向(FP 或量化侧共用) ----------------
  * py: Y = swiglu(x@w1ᵀ, x@w3ᵀ) @ w2ᵀ, 路由权重【不在这里乘】(外面 dH[rows]+=w*Y)。
  * w1/w3 是 [MOEI, D], w2 是 [D, MOEI]; x[n,D] → Y[n,D]。全 f32(与 numpy 同)。 */
@@ -898,6 +1260,52 @@ int main(int argc, char **argv) {
         for (int i = 0; i < 8; i++) printf("%.17g\n", mt_gauss(&s));
         return 0;
     }
+    if (argc > 3 && !strcmp(argv[1], "--selftest-deq")) {
+        /* GGUF 标量 dequant 与 gguf-py 对拍用的管道: stdin 吃 nblk 个块的原始字节,
+         * stdout 吐 nblk*blk 个 f32。驱动见 migrate/zlayer_transcription_notes.md 的金标节。
+         *   ./zlayer --selftest-deq <ggml类型号> <块数> < blocks.bin > out.f32 */
+        uint32_t ty = (uint32_t)atoi(argv[2]);
+        long nb = atol(argv[3]);
+        uint64_t blk, tsz; gg_type_geom(ty, &blk, &tsz);
+        size_t insz = (size_t)nb * tsz, outn = (size_t)nb * blk;
+        uint8_t *in = (uint8_t *)xmalloc(insz);
+        if (fread(in, 1, insz, stdin) != insz) die("--selftest-deq: stdin 只给了不足 %zu B", insz);
+        float *out = (float *)xmalloc(outn * 4);
+        gg_dequant(ty, in, outn, out);
+        if (fwrite(out, 4, outn, stdout) != outn) die("--selftest-deq: stdout 写失败");
+        return 0;
+    }
+    if (argc > 3 && !strcmp(argv[1], "--selftest-qr")) {
+        /* Householder QR 自检: 随机 m×n, 报 ‖QR−A‖∞ 与 ‖QᵀQ−I‖∞(都应 ~1e-13)。
+         * 与 numpy 不逐位是设计内的(见 hh_qr 注释), 这里判的是"分解本身对不对"。 */
+        int m = atoi(argv[2]), n = atoi(argv[3]);
+        if (m < n || n < 1) die("--selftest-qr: 需要 m≥n≥1");
+        double *A0 = (double *)xmalloc((size_t)m * n * sizeof(double));
+        mt_t s; mt_seed(&s, 3);
+        for (size_t i = 0; i < (size_t)m * n; i++) A0[i] = mt_gauss(&s);
+        double *A = (double *)xmalloc((size_t)m * n * sizeof(double));
+        memcpy(A, A0, (size_t)m * n * sizeof(double));
+        double *tau = (double *)xmalloc((size_t)n * sizeof(double));
+        double *rd = (double *)xmalloc((size_t)n * sizeof(double));
+        hh_qr(A, m, n, tau, rd);
+        double *R = (double *)xcalloc((size_t)n * n, sizeof(double));
+        for (int i = 0; i < n; i++) { R[(size_t)i * n + i] = rd[i];
+            for (int j = i + 1; j < n; j++) R[(size_t)i * n + j] = A[(size_t)i * n + j]; }
+        double *Q = (double *)xcalloc((size_t)m * n, sizeof(double));
+        for (int c = 0; c < n; c++) Q[(size_t)c * n + c] = 1.0;
+        hh_apply_q(A, tau, m, n, Q, n);
+        double *QR = (double *)xmalloc((size_t)m * n * sizeof(double));
+        mm64(0, 0, m, n, n, Q, n, R, n, QR, n);
+        double e1 = 0;
+        for (size_t i = 0; i < (size_t)m * n; i++) { double d2 = fabs(QR[i] - A0[i]); if (d2 > e1) e1 = d2; }
+        double *QtQ = (double *)xmalloc((size_t)n * n * sizeof(double));
+        mm64(1, 0, n, n, m, Q, n, Q, n, QtQ, n);
+        double e2 = 0;
+        for (int i = 0; i < n; i++) for (int j = 0; j < n; j++) {
+            double d2 = fabs(QtQ[(size_t)i * n + j] - (i == j ? 1.0 : 0.0)); if (d2 > e2) e2 = d2; }
+        printf("QR自检 m=%d n=%d: ‖QR−A‖inf=%.3e ‖QᵀQ−I‖inf=%.3e\n", m, n, e1, e2);
+        return 0;
+    }
     if (argc < 5) {
         fprintf(stderr, "用法: zlayer <hf> <layers_dir> <anchor> <L> [K=1024] [inject=1] [XCAP目录] [PREV目录]\n"
                         "      zlayer --selftest-rng\n");
@@ -910,11 +1318,18 @@ int main(int argc, char **argv) {
     const char *XCAP = (argc > 7 && argv[7][0] && strcmp(argv[7], "-")) ? argv[7] : NULL;
     const char *PREV = (argc > 8 && argv[8][0] && strcmp(argv[8], "-")) ? argv[8] : NULL;
 
-    /* 第一期未实现的支路: 宁可停车也不静默换语义(这一周的教训就是 Python↔C 悄悄分歧) */
-    if (getenv("DS4_ZL_GGUF")) die("DS4_ZL_GGUF 标量模式第一期未实现 — 拒跑(用 .py 或等第二期)");
-    if (getenv("DS4_ZL_XANCHOR")) die("DS4_ZL_XANCHOR 链模式第一期未实现 — 拒跑");
-    if (getenv("DS4_ZL_ADDON")) die("DS4_ZL_ADDON 叠加模式第一期未实现 — 拒跑");
-    if (!XCAP) die("第一期只做 XCAP 口径: 第 7 个位置参数(引擎捕获目录)必填");
+    /* 二期支路开关。.py 是权威, 三条都照抄它的口径:
+     *   _GG   = DS4_ZL_GGUF 有值即开(空串视为关, 与 py 的 `if _GG:` 同);
+     *   XAP   = DS4_ZL_XANCHOR;
+     *   ADDON = DS4_ZL_ADDON, 但 py 把它的读取整块写在 `if XAP:` 里面 —— 没 XANCHOR 时
+     *           ADDON 是死的。这里不"修正", 只多打一行提示。 */
+    const char *GGP = getenv("DS4_ZL_GGUF"); if (GGP && !*GGP) GGP = NULL;
+    const char *XAP = getenv("DS4_ZL_XANCHOR"); if (XAP && !*XAP) XAP = NULL;
+    const char *ADDON = NULL;
+    if (XAP) { ADDON = getenv("DS4_ZL_ADDON"); if (ADDON && !*ADDON) ADDON = NULL; }
+    else if (getenv("DS4_ZL_ADDON") && *getenv("DS4_ZL_ADDON"))
+        printf("  L%d 提示: 设了 DS4_ZL_ADDON 但没设 DS4_ZL_XANCHOR — .py 里 ADDON 的读取整块"
+               "嵌在 if XAP: 内, 此时不生效, 本次照 .py 走非叠加路\n", L);
 
     const int NTOK = env_int("DS4_ZL_NTOK", 1716);
     const int CACHE_ONLY = (getenv("DS4_ZL_CACHE_ONLY") &&
@@ -939,11 +1354,77 @@ int main(int argc, char **argv) {
     const int NACT = am.NACT;
 
     /* ★XCAP★ x 与被乘量都换成引擎真值(raw_ffn_in / raw_ffn_out), FP 侧仍走锚(教师)。
-     * 教师路由 = FP 锚的 ridx/rw(2026-08-22 用户裁决: 换成量化路由等于换靶子)。 */
-    float *X0 = capload(XCAP, "raw_ffn_in", L, NTOK, D);
-    float *YQE = capload(XCAP, "raw_ffn_out", L, NTOK, D);
+     * 教师路由 = FP 锚的 ridx/rw(2026-08-22 用户裁决: 换成量化路由等于换靶子)。
+     * 没给 XCAP 目录 = 非 XCAP 口径: x 就是锚 fin(py: X0 保持 anchor_layer 的返回值),
+     * 学生输出 Y_q 由本进程重算(VQ blob 或 GGUF 切片), 没有 YQE。 */
+    float *X0 = XCAP ? capload(XCAP, "raw_ffn_in", L, NTOK, D) : X0fp;
+    float *YQE = XCAP ? capload(XCAP, "raw_ffn_out", L, NTOK, D) : NULL;
 
-    if (PREV) {
+    /* ★链态锚(DS4_ZL_XANCHOR)★ 部署侧的 x_q 与路由_q 从第二个锚读; 教师侧仍用主锚。 */
+    float *XQ0 = NULL, *rwq = NULL; int *ridxq = NULL;
+    if (XAP) {
+        ameta_t amq;
+        anchor_layer(XAP, L, NTOK, &XQ0, &ridxq, &rwq, &amq);
+        if (amq.NACT != am.NACT) die("链态锚 NACT=%d ≠ 主锚 %d — 槽宽不同, 口径不明拒跑", amq.NACT, am.NACT);
+    }
+
+    /* ★叠加式(DS4_ZL_ADDON)★ 读本层 dql 里【已有】的记录: bf.GE 的每专家门 ge_old,
+     * zl.RRR 的低秩 z_old。同名记录后出现的覆盖前面的(py 的循环就是这个语义)。 */
+    float *ge_old = NULL;                       /* [NEXP] f32, NULL = 没有既有 GE */
+    int zo_k0 = 0, zo_di = 0, zo_do = 0;        /* zo=(k0,di,do,z0,U0[do,k0],V0[di,k0]) */
+    float *zo_z = NULL, *zo_U = NULL, *zo_V = NULL;
+    if (ADDON) {
+        snprintf(path, sizeof path, "%s/dql_L%02d.bin", ld, L);
+        int dfd = open(path, O_RDONLY);
+        if (dfd < 0) die("ADDON: dql 打不开 %s", path);
+        struct stat dst2; fstat(dfd, &dst2);
+        size_t dsz2 = (size_t)dst2.st_size;
+        if (dsz2 < 12) die("ADDON: dql 太短 %s", path);
+        const uint8_t *draw = (const uint8_t *)mmap(NULL, dsz2, PROT_READ, MAP_PRIVATE, dfd, 0);
+        if (draw == MAP_FAILED) die("ADDON: dql mmap 失败");
+        close(dfd);
+        uint32_t nr2; memcpy(&nr2, draw + 8, 4);
+        size_t off2 = 12;
+        for (uint32_t i = 0; i < nr2; i++) {
+            if (off2 + 116 > dsz2) die("ADDON: dql 记录 %u 头越界", i);
+            char nm2[17]; memcpy(nm2, draw + off2, 16); nm2[16] = 0;
+            uint64_t psz2; memcpy(&psz2, draw + off2 + 88, 8);
+            int32_t vd; memcpy(&vd, draw + off2 + 112, 4);
+            if (off2 + 116 + psz2 > dsz2) die("ADDON: dql 记录 %u 载荷越界", i);
+            const uint8_t *pay2 = draw + off2 + 116;
+            off2 += 116 + (size_t)psz2;
+            if (vd != 1) continue;
+            if (strstr(nm2, "bf.GE") && psz2 >= 512) {
+                if (!ge_old) ge_old = (float *)xmalloc(NEXP * 4);
+                for (int e = 0; e < NEXP; e++) { uint16_t h; memcpy(&h, pay2 + e * 2, 2); ge_old[e] = f16_to_f32(h); }
+            } else if (strstr(nm2, "zl.RRR") && psz2 >= 16) {
+                uint32_t k0, di, do_; memcpy(&k0, pay2, 4); memcpy(&di, pay2 + 8, 4); memcpy(&do_, pay2 + 12, 4);
+                size_t nh = (size_t)k0 + (size_t)k0 * do_ + (size_t)k0 * di;
+                if (16 + nh * 2 > psz2) die("ADDON: zl.RRR 载荷不足(k=%u di=%u do=%u)", k0, di, do_);
+                free(zo_z); free(zo_U); free(zo_V);
+                zo_k0 = (int)k0; zo_di = (int)di; zo_do = (int)do_;
+                zo_z = (float *)xmalloc((size_t)k0 * 4);
+                zo_U = (float *)xmalloc((size_t)do_ * k0 * 4);
+                zo_V = (float *)xmalloc((size_t)di * k0 * 4);
+                const uint8_t *h = pay2 + 16;
+                for (size_t j = 0; j < (size_t)k0; j++) { uint16_t v; memcpy(&v, h + j * 2, 2); zo_z[j] = f16_to_f32(v); }
+                for (size_t j = 0; j < (size_t)do_ * k0; j++) { uint16_t v; memcpy(&v, h + (k0 + j) * 2, 2); zo_U[j] = f16_to_f32(v); }
+                for (size_t j = 0; j < (size_t)di * k0; j++) { uint16_t v; memcpy(&v, h + (k0 + (size_t)do_ * k0 + j) * 2, 2); zo_V[j] = f16_to_f32(v); }
+            }
+        }
+        munmap((void *)draw, dsz2);
+        char zdesc[64];
+        if (zo_z) snprintf(zdesc, sizeof zdesc, "k%d/din%d", zo_k0, zo_di); else snprintf(zdesc, sizeof zdesc, "无");
+        printf("  L%d ADDON: 既有记录 GE=%s z=%s\n", L, ge_old ? "有" : "无", zdesc);
+    }
+
+    /* GGUF 标量模式: 学生权重来源换成 GGUF 专家张量切片, 不再读 dql_vq blob */
+    gg_ctx gg; memset(&gg, 0, sizeof gg);
+    if (GGP) gg_open(&gg, GGP);
+
+    if (PREV && !XCAP)   /* py 里 PREV 整块嵌在 if XCAP: 内 —— 没 XCAP 时它是死的 */
+        printf("  L%d 提示: 给了 PREV 目录但没给 XCAP 目录 — .py 里 PREV 只在 XCAP 口径下生效, 本次忽略\n", L);
+    if (XCAP && PREV) {
         /* 第二轮反修: y_未修 = raw_ffn_out(带) / (1 + g_旧(新输入)) */
         snprintf(path, sizeof path, "%s/zrec_L%02d.bin", PREV, L);
         FILE *pf = fopen(path, "rb");
@@ -992,8 +1473,9 @@ int main(int argc, char **argv) {
     }
 
     /* ★对齐自检★ 判的是"两种对齐哪个对"的离散问题, 不是拿绝对余弦当质量闸:
-     * 绝对值随层数衰减(L0 0.89 → L42 0.56), 拿常数当门会把深层全误拦。 */
-    {
+     * 绝对值随层数衰减(L0 0.89 → L42 0.56), 拿常数当门会把深层全误拦。
+     * 非 XCAP 时 X0 就是 X0fp 自己, 自检恒等于 1 —— py 也只在 XCAP 分支里做, 这里同。 */
+    if (XCAP) {
         double c_ok = cosmed(X0fp, X0, NTOK, D);
         double c_bad = cosmed(X0fp + (size_t)D, X0, NTOK - 1, D);
         if (!(c_ok > c_bad * 1.15))
@@ -1037,18 +1519,29 @@ int main(int argc, char **argv) {
     } else {
         st_ctx *sc = (st_ctx *)xmalloc(sizeof(st_ctx));
         st_open(sc, hf);
-        snprintf(path, sizeof path, "%s/dql_vq_L%02d.bin", ld, L);
-        int bfd = open(path, O_RDONLY);
-        if (bfd < 0) die("VQ 侧车打不开: %s", path);
-        struct stat bst; fstat(bfd, &bst);
-        size_t bsz = (size_t)bst.st_size;
-        const uint8_t *blob = (const uint8_t *)mmap(NULL, bsz, PROT_READ, MAP_PRIVATE, bfd, 0);
-        if (blob == MAP_FAILED) die("VQ 侧车 mmap 失败: %s", path);
+        /* GGUF 标量模式下 py 是 `blob=None if _GG else open(...)` —— 根本不碰 dql_vq。
+         * 所以这里也只在非 GGUF 时才要求侧车存在(全q2 底座那条产线压根没有 dql_vq)。 */
+        const uint8_t *blob = NULL; size_t bsz = 0; int bfd = -1;
+        if (!GGP) {
+            snprintf(path, sizeof path, "%s/dql_vq_L%02d.bin", ld, L);
+            bfd = open(path, O_RDONLY);
+            if (bfd < 0) die("VQ 侧车打不开: %s", path);
+            struct stat bst; fstat(bfd, &bst);
+            bsz = (size_t)bst.st_size;
+            blob = (const uint8_t *)mmap(NULL, bsz, PROT_READ, MAP_PRIVATE, bfd, 0);
+            if (blob == MAP_FAILED) die("VQ 侧车 mmap 失败: %s", path);
+        }
 
+        /* need = 教师路由用到的专家 ∪ 部署路由用到的专家(py: XAP 时取并集) */
         int seen[NEXP]; memset(seen, 0, sizeof seen);
         for (long long i = 0; i < (long long)NTOK * NACT; i++) {
             int e = ridx[i];
             if (e < 0 || e >= NEXP) die("锚 ridx 越界: %d", e);
+            seen[e] = 1;
+        }
+        if (XAP) for (long long i = 0; i < (long long)NTOK * NACT; i++) {
+            int e = ridxq[i];
+            if (e < 0 || e >= NEXP) die("链态锚 ridx 越界: %d", e);
             seen[e] = 1;
         }
         int need[NEXP], nneed = 0;
@@ -1062,6 +1555,8 @@ int main(int argc, char **argv) {
 
         int *rows = (int *)xmalloc((size_t)NTOK * NACT * sizeof(int));
         int *slots = (int *)xmalloc((size_t)NTOK * NACT * sizeof(int));
+        int *rowsq = XAP ? (int *)xmalloc((size_t)NTOK * NACT * sizeof(int)) : NULL;
+        int *slotsq = XAP ? (int *)xmalloc((size_t)NTOK * NACT * sizeof(int)) : NULL;
         float *xs = (float *)xmalloc((size_t)NTOK * D * 4);
         float *Y = (float *)xmalloc((size_t)NTOK * D * 4);
         float *gb = NULL, *ub = NULL;
@@ -1073,7 +1568,16 @@ int main(int argc, char **argv) {
             for (int t = 0; t < NTOK; t++)                    /* np.where(ridx==e): 行升序, 行内槽升序 */
                 for (int s = 0; s < NACT; s++)
                     if (ridx[(size_t)t * NACT + s] == e) { rows[nr] = t; slots[nr] = s; nr++; }
-            if (!nr) continue;
+            int nrq = nr;
+            if (XAP) {
+                nrq = 0;
+                for (int t = 0; t < NTOK; t++)
+                    for (int s = 0; s < NACT; s++)
+                        if (ridxq[(size_t)t * NACT + s] == e) { rowsq[nrq] = t; slotsq[nrq] = s; nrq++; }
+            }
+            if (!nr && !nrq) continue;                        /* py: len(rows)==0 and len(rowsq)==0 */
+            const int *QR_ROW = XAP ? rowsq : rows, *QR_SLOT = XAP ? slotsq : slots;
+            const float *XQSRC = XAP ? XQ0 : X0, *RWQ = XAP ? rwq : rw;
             float *Wf[3], *Wq[3];
             static const char *NMS[3] = {"w1", "w3", "w2"};
             for (int wi = 0; wi < 3; wi++) {
@@ -1083,7 +1587,8 @@ int main(int argc, char **argv) {
                 float *wf = st_read_weight(sc, tn, &R, &C);
                 if (!wf) die("HF 权重读不到: %s", tn);
                 long rq = 0, cq = 0;
-                float *wq = vq_dequant(blob, bsz, vq_slot(blob, bsz, e, wi), &rq, &cq);
+                float *wq = GGP ? gg_expert(&gg, L, NMS[wi], e, &rq, &cq)
+                                : vq_dequant(blob, bsz, vq_slot(blob, bsz, e, wi), &rq, &cq);
                 if (wq && (R != rq || C != cq)) {             /* py: Wf.shape != Wq.shape → Wf = Wf.T */
                     float *tr = (float *)xmalloc((size_t)R * C * 4);
                     for (long r = 0; r < R; r++) for (long c = 0; c < C; c++) tr[(size_t)c * R + r] = wf[(size_t)r * C + c];
@@ -1099,31 +1604,66 @@ int main(int argc, char **argv) {
                 } else if (wi == 2 && (R != D || C != MOEI))
                     die("w2 形状 %ldx%ld ≠ %dx%d", R, C, D, MOEI);
             }
-            /* FP 目标侧: 引擎真值 x + FP 锚路由 + FP 权重 */
-            for (int j = 0; j < nr; j++) memcpy(xs + (size_t)j * D, X0 + (size_t)rows[j] * D, (size_t)D * 4);
-            zl_expert_fwd(xs, nr, Wf[0], Wf[1], Wf[2], MOEI, SWLIM, Y, gb, ub);
-            for (int j = 0; j < nr; j++) {
-                float w = rw[(size_t)rows[j] * NACT + slots[j]];
-                float *dst = dH + (size_t)rows[j] * D;
-                const float *y = Y + (size_t)j * D;
-                for (int d2 = 0; d2 < D; d2++) dst[d2] += w * y[d2];
+            /* FP 目标侧: (XCAP 时 x=引擎真值, 否则 x=锚 fin) + FP 锚路由 + FP 权重 */
+            if (nr > 0) {
+                for (int j = 0; j < nr; j++) memcpy(xs + (size_t)j * D, X0 + (size_t)rows[j] * D, (size_t)D * 4);
+                zl_expert_fwd(xs, nr, Wf[0], Wf[1], Wf[2], MOEI, SWLIM, Y, gb, ub);
+                for (int j = 0; j < nr; j++) {
+                    float w = rw[(size_t)rows[j] * NACT + slots[j]];
+                    float *dst = dH + (size_t)rows[j] * D;
+                    const float *y = Y + (size_t)j * D;
+                    for (int d2 = 0; d2 < D; d2++) dst[d2] += w * y[d2];
+                }
             }
-            /* 部署侧: XCAP 时 dH 不再减 Yq(直接用引擎 raw_ffn_out), 但 pYQ 仍要留给 GE */
-            zl_expert_fwd(xs, nr, Wq[0], Wq[1], Wq[2], MOEI, SWLIM, Y, gb, ub);
-            for (int j = 0; j < nr; j++) {
-                prow[npair] = rows[j];
-                pe[npair] = e;
-                pw[npair] = rw[(size_t)rows[j] * NACT + slots[j]];
-                memcpy(pYQ + (size_t)npair * D, Y + (size_t)j * D, (size_t)D * 4);
-                npair++;
+            /* 部署侧: 链模式=链态 x_q + 部署路由 + 量化权重; XCAP 时 dH 不减 Yq(直接用引擎
+             * raw_ffn_out), 但 pYQ/pw 仍要留给 GE。ADDON 时学生权重先乘既有 GE。 */
+            if (nrq > 0) {
+                for (int j = 0; j < nrq; j++) memcpy(xs + (size_t)j * D, XQSRC + (size_t)QR_ROW[j] * D, (size_t)D * 4);
+                zl_expert_fwd(xs, nrq, Wq[0], Wq[1], Wq[2], MOEI, SWLIM, Y, gb, ub);
+                for (int j = 0; j < nrq; j++) {
+                    float wq2 = RWQ[(size_t)QR_ROW[j] * NACT + QR_SLOT[j]];
+                    if (ge_old) wq2 *= ge_old[e];             /* py: wq = wq*ge_old[e] */
+                    if (!XCAP) {
+                        float *dst = dH + (size_t)QR_ROW[j] * D;
+                        const float *y = Y + (size_t)j * D;
+                        for (int d2 = 0; d2 < D; d2++) dst[d2] -= wq2 * y[d2];
+                    }
+                    prow[npair] = QR_ROW[j];
+                    pe[npair] = e;
+                    pw[npair] = wq2;
+                    memcpy(pYQ + (size_t)npair * D, Y + (size_t)j * D, (size_t)D * 4);
+                    npair++;
+                }
             }
             for (int wi = 0; wi < 3; wi++) { if (Wq[wi] != Wf[wi]) free(Wq[wi]); free(Wf[wi]); }
             if ((i + 1) % 64 == 0) printf("  L%d 缓存 …%d/%d\n", L, i + 1, nneed);
         }
-        for (size_t i = 0; i < (size_t)NTOK * D; i++) dH[i] -= YQE[i];   /* dH = Σw·Y_fp(锚教师) − 引擎真实量化 routed */
+        /* ADDON: 既有 z 的出力从 dH 扣掉 → dH = 贪心修完之后的残差(全 f32, 与 py 同) */
+        if (ADDON && zo_z) {
+            const float *Xq = XAP ? XQ0 : X0;
+            const float *Phi = Xq;
+            float *phi_buf = NULL;
+            if (zo_di == 3 * D) {
+                phi_buf = (float *)xmalloc((size_t)NTOK * 3 * D * 4);
+                phi32_ctx pc = {Xq, phi_buf, D};
+                parallel_for(NTOK, phi32_worker, &pc);
+                Phi = phi_buf;
+            } else if (zo_di != D) die("ADDON: 既有 z 的 din=%d 既非 D 也非 3D — py 的 _Phi 会形状不合, 拒跑", zo_di);
+            if (zo_do != D) die("ADDON: 既有 z 的 dout=%d ≠ D=%d", zo_do, D);
+            float *pv = (float *)xmalloc((size_t)NTOK * zo_k0 * 4);
+            mm32(0, 0, NTOK, zo_k0, zo_di, Phi, zo_di, zo_V, zo_k0, pv, zo_k0);
+            for (size_t t = 0; t < (size_t)NTOK; t++)
+                for (int c = 0; c < zo_k0; c++) pv[t * zo_k0 + c] *= zo_z[c];
+            float *zout = (float *)xmalloc((size_t)NTOK * D * 4);
+            mm32(0, 1, NTOK, D, zo_k0, pv, zo_k0, zo_U, zo_k0, zout, D);
+            for (size_t j = 0; j < (size_t)NTOK * D; j++) dH[j] -= zout[j];
+            free(pv); free(zout); free(phi_buf);
+        }
+        /* dH = Σw·Y_fp(锚教师) − 引擎真实量化 routed。非 XCAP 时这一减法已经逐专家做过了。 */
+        if (XCAP) for (size_t i = 0; i < (size_t)NTOK * D; i++) dH[i] -= YQE[i];
 
-        free(rows); free(slots); free(xs); free(Y); free(gb); free(ub);
-        munmap((void *)blob, bsz); close(bfd);
+        free(rows); free(slots); free(rowsq); free(slotsq); free(xs); free(Y); free(gb); free(ub);
+        if (blob) { munmap((void *)blob, bsz); close(bfd); }
 
         /* 原子换名: 并行 amp_solve 只见完整 zcache */
         char tmp[1300]; snprintf(tmp, sizeof tmp, "%s.tmp.npz", cache);
@@ -1138,8 +1678,10 @@ int main(int argc, char **argv) {
         zw_add(&zw, "pw", "<f4", npair, 1, 1, pw, 4);
         zw_add(&zw, "pYQ", "<f4", npair, D, 2, pYQ, 4);
         zw_add(&zw, "pDY", "<f4", npair, D, 2, NULL, 4);      /* py 存的就是全零 */
-        zw_add(&zw, "yqe", "<f4", NTOK, D, 2, YQE, 4);
-        zw_add(&zw, "xcap", "<f4", NTOK, D, 2, X0, 4);
+        if (XCAP) {                                           /* py: **({"yqe":YQE,"xcap":X0} if XCAP else {}) */
+            zw_add(&zw, "yqe", "<f4", NTOK, D, 2, YQE, 4);
+            zw_add(&zw, "xcap", "<f4", NTOK, D, 2, X0, 4);
+        }
         zw_finish(&zw);
         fclose(zw.f);
         free(prow64);
@@ -1150,8 +1692,11 @@ int main(int argc, char **argv) {
     if (CACHE_ONLY) { printf("★L%d zcache-only: 就绪(%.0fs), 解算交外部\n", L, t1 - t0); return 0; }
 
     /* ---------------- 解算 ---------------- */
+    /* py: X=(XQ0 if XAP else X0).astype(np.float64) —— 链模式下解算的自变量是【链态】x_q,
+     * 因为放大器部署时看到的就是它; 非链模式下 X0 已经是 XCAP 真值或锚 fin。 */
+    const float *XSOLVE = XAP ? XQ0 : X0;
     double *X = (double *)xmalloc((size_t)NTOK * D * sizeof(double));
-    for (size_t i = 0; i < (size_t)NTOK * D; i++) X[i] = X0[i];
+    for (size_t i = 0; i < (size_t)NTOK * D; i++) X[i] = XSOLVE[i];
 
     int ntr = 0, nev = 0, *tr = NULL, *ev = NULL;
     const char *fr = getenv("DS4_ZL_FIT_RANGES"), *er = getenv("DS4_ZL_EV_RANGE");
@@ -1351,6 +1896,19 @@ int main(int argc, char **argv) {
     } else printf("  L%d 纯z(ftA关) → k_L=%d\n", L, K);
 
     /* R = dH − 中标形态的 z 出力(f32, 与 py 的 .astype(np.float32) 同位置) */
+    /* ★.py 的一个潜伏坑, 这里改成停车而不是跟着崩★
+     * 关了 ftA 时 py 把 curvef 全填 0 ⇒ rz_fta=0.0。要是线性 k 曲线【全负】而 DS4_ZL_GATE
+     * 比它更低(比如 -100), 选形态那一步就走成 `elif rz_fta>rz_lin: FORM="ftA"` ——
+     * 而 Af/Sf/Bf 在 _FTA=0 时是 None, 下一行 Af[:,:K] 直接
+     *   TypeError: 'NoneType' object is not subscriptable
+     * C 这边照抄的话是空指针解引用(段错误), 症状比 py 还难查。判据与 py 完全一致, 只是
+     * 换成一句能 grep 的停车话。产线用的 GATE 是 0 或 99, 撞不到这个角落。 */
+    if (!strcmp(FORM, "ftA") && !(FTA && rfta > 0))
+        die("assert 失败: 关了 ftA(DS4_ZL_FTA=%d) 却把赢家判成 ftA —— 线性 k 曲线全负"
+            "(rz_lin=%.4f) 且 DS4_ZL_GATE=%.4f 比它还低。.py 在这里会抛 "
+            "TypeError: 'NoneType' object is not subscriptable。把闸调回 ≥0 即可绕开。",
+            FTA, rz_lin, GATE);
+
     float *R = dH;
     if (K > 0) {
         int din = !strcmp(FORM, "ftA") ? DIN3 : D;
@@ -1495,15 +2053,465 @@ int main(int argc, char **argv) {
     }
     double t2 = now_s();
 
+    /* ================= ERF 死层部件 =================
+     * 触发线(py): (not ADDON) and eff < DS4_ZL_ERF_BAR(0.01) and DS4_ZL_ERF。
+     * 做的事: 逐专家在【已中标 z 与 GE 之上】的真残差里, 用 ΔW_w2 = W_fp − W_q 的
+     * 加权低秩方向再修一刀 ——
+     *   ① 用该专家在 fit 行上的隐层能量 _sh 给 ΔW_w2 的列加权, 取 r 个主方向(randomized SVD);
+     *   ② 每个方向一个系数 α(小 r×r 岭回归), 得到每个 token 的修正量 _ct;
+     *   ③ token 能量门: 按 _ct 能量降序累积收益, 取收益最大的截断点 τ, 能量 < τ 的 token 不修;
+     *   ④ 中标了就把 _ct 从累积残差里扣掉 —— 后一个专家看到的是前面都修完的残差。
+     * 记录 zl.ERF 载荷 = <IHH>(ne, r, 0) + 逐专家 <If>(e, τ) + U16[D,r] + V16[r,F]。
+     * ★不逐位★ randomized SVD 里有 QR(见 hh_qr 注释)与一次小 SVD; U/V 载荷不与 .py 逐字节同。
+     * 逐位的是: 专家序、专家数 ne、记录头、记录总长度; τ 与挽回率对到打印精度。 */
+    uint8_t *ERF_ADD = NULL; size_t ERF_LEN = 0;
+    double ERF_GAIN = 0.0; int ERF_NE = 0;
+    if (!ADDON && eff < env_dbl("DS4_ZL_ERF_BAR", 0.01) && env_int("DS4_ZL_ERF", 1)) {
+        snprintf(path, sizeof path, "%s/dql_vq_L%02d.bin", ld, L);
+        int efd = open(path, O_RDONLY);
+        if (efd < 0) {
+            /* py 这里整块套在 try/except 里: GGUF 底座根本没有 dql_vq, 打不开就是这条路径。
+             * 照抄它的行为(打一行 异常 就继续), 不停车。 */
+            printf("  L%d ERF死层部件异常: 打不开 %s(%s)\n", L, path, strerror(errno));
+        } else {
+            struct stat ebst; fstat(efd, &ebst);
+            size_t ebsz = (size_t)ebst.st_size;
+            const uint8_t *eblob = (const uint8_t *)mmap(NULL, ebsz, PROT_READ, MAP_PRIVATE, efd, 0);
+            if (eblob == MAP_FAILED) die("ERF: VQ 侧车 mmap 失败: %s", path);
+            close(efd);
+            st_ctx *esc = (st_ctx *)xmalloc(sizeof(st_ctx));
+            st_open(esc, hf);
+            const int ERF_R = env_int("DS4_ZL_ERF_R", 8);
+            if (ERF_R < 1 || ERF_R > 256) die("DS4_ZL_ERF_R=%d 超范围", ERF_R);
+            const int RP8 = ERF_R + 8;                       /* py: _rsvd 的过采样 k+8 */
+
+            char *trm = (char *)xcalloc((size_t)NTOK, 1), *evm = (char *)xcalloc((size_t)NTOK, 1);
+            for (int i = 0; i < ntr; i++) trm[tr[i]] = 1;
+            for (int i = 0; i < nev; i++) evm[ev[i]] = 1;
+            int *evpos = (int *)xmalloc((size_t)NTOK * sizeof(int));
+            for (int t = 0; t < NTOK; t++) evpos[t] = -1;
+            for (int i = 0; i < nev; i++) evpos[ev[i]] = i;
+
+            /* 叠加基残差: _R = (K==0 ? dH : R) 再扣掉 GE 增益效应(USE_GE 时) */
+            double *ER = (double *)xmalloc((size_t)NTOK * D * sizeof(double));
+            { const float *src = (K == 0) ? dH : R;
+              for (size_t i = 0; i < (size_t)NTOK * D; i++) ER[i] = src[i]; }
+            if (USE_GE) {
+                for (int t = 0; t < NTOK; t++) {
+                    double *r0 = ER + (size_t)t * D;
+                    for (int a = pcnt[t]; a < pcnt[t + 1]; a++) {
+                        int p = pidx[a];
+                        double g1 = (double)gf[pe[p]] - 1.0;
+                        const float *y = pYQ + (size_t)p * D;
+                        float w = pw[p];
+                        for (int j = 0; j < D; j++) r0[j] -= g1 * (double)(w * y[j]);
+                    }
+                }
+            }
+            double *Rev0 = (double *)xmalloc((size_t)nev * D * sizeof(double));
+            for (int i = 0; i < nev; i++) memcpy(Rev0 + (size_t)i * D, ER + (size_t)ev[i] * D, (size_t)D * sizeof(double));
+            double *pred = (double *)xcalloc((size_t)nev * D, sizeof(double));
+
+            /* _order = 按该专家的配对数降序(py 的 sorted 是稳定的 → 同数按专家号升序), 取前 128 */
+            int ecnt[NEXP]; memset(ecnt, 0, sizeof ecnt);
+            for (long long p = 0; p < npair; p++) ecnt[pe[p]]++;
+            dsort_t eorder[NEXP]; int neo = 0;
+            for (int e = 0; e < NEXP; e++) if (ecnt[e] > 0) { eorder[neo].v = (double)ecnt[e]; eorder[neo].i = e; neo++; }
+            qsort(eorder, (size_t)neo, sizeof(dsort_t), cmp_dsort_desc);
+            if (neo > 128) neo = 128;
+
+            /* 逐专家的配对下标(p 升序 = np.where(pe==e)[0] 的顺序) */
+            int *ecsr = (int *)xcalloc((size_t)NEXP + 1, sizeof(int));
+            for (long long p = 0; p < npair; p++) ecsr[pe[p] + 1]++;
+            for (int e = 0; e < NEXP; e++) ecsr[e + 1] += ecsr[e];
+            int *eidx = (int *)xmalloc((size_t)(npair ? npair : 1) * sizeof(int));
+            { int *fill = (int *)xmalloc(((size_t)NEXP + 1) * sizeof(int));
+              memcpy(fill, ecsr, ((size_t)NEXP + 1) * sizeof(int));
+              for (long long p = 0; p < npair; p++) eidx[fill[pe[p]]++] = (int)p;
+              free(fill); }
+
+            uint8_t *epay = NULL; size_t epay_len = 0; int ne = 0;
+            int *ftr = (int *)xmalloc((size_t)(npair ? npair : 1) * sizeof(int));
+            int *fev = (int *)xmalloc((size_t)(npair ? npair : 1) * sizeof(int));
+
+            for (int oi = 0; oi < neo; oi++) {
+                int e = eorder[oi].i;
+                int nft = 0, nfe = 0;
+                for (int a = ecsr[e]; a < ecsr[e + 1]; a++) {
+                    int p = eidx[a];
+                    if (trm[prow[p]]) ftr[nft++] = p;
+                    if (evm[prow[p]]) fev[nfe++] = p;
+                }
+                if (nft < 24 || nfe < 2) continue;
+                uint64_t o1 = vq_slot(eblob, ebsz, e, 0), o3 = vq_slot(eblob, ebsz, e, 1), o2 = vq_slot(eblob, ebsz, e, 2);
+                if (!o1 || !o3 || !o2) continue;
+
+                char tn[256];
+                snprintf(tn, sizeof tn, "layers.%d.ffn.experts.%d.w2.weight", L, e);
+                long Rf = 0, Cf = 0;
+                float *wf2 = st_read_weight(esc, tn, &Rf, &Cf);
+                if (!wf2) die("ERF: HF 权重读不到 %s", tn);
+                long Rq = 0, Cq = 0;
+                float *wq2 = vq_dequant(eblob, ebsz, o2, &Rq, &Cq);
+                if (!wq2) die("ERF: w2 VQ 载荷读不到(e=%d)", e);
+                if (Rf != Rq || Cf != Cq) {                  /* py: _Wf.shape != _Wq.shape → _Wf=_Wf.T */
+                    float *trm2 = (float *)xmalloc((size_t)Rf * Cf * 4);
+                    for (long r2 = 0; r2 < Rf; r2++) for (long c2 = 0; c2 < Cf; c2++)
+                        trm2[(size_t)c2 * Rf + r2] = wf2[(size_t)r2 * Cf + c2];
+                    free(wf2); wf2 = trm2; long t2s = Rf; Rf = Cf; Cf = t2s;
+                }
+                if (Rf != D) die("ERF: w2 行数 %ld ≠ D=%d(e=%d)", Rf, D, e);
+                const int F = (int)Cf;                        /* = MOEI */
+                long R1 = 0, C1 = 0, R3 = 0, C3 = 0;
+                float *w1q = vq_dequant(eblob, ebsz, o1, &R1, &C1);
+                float *w3q = vq_dequant(eblob, ebsz, o3, &R3, &C3);
+                if (!w1q || !w3q) die("ERF: w1/w3 VQ 载荷读不到(e=%d)", e);
+                if (C1 != D) { float *t3 = (float *)xmalloc((size_t)R1 * C1 * 4);
+                    for (long r2 = 0; r2 < R1; r2++) for (long c2 = 0; c2 < C1; c2++) t3[(size_t)c2 * R1 + r2] = w1q[(size_t)r2 * C1 + c2];
+                    free(w1q); w1q = t3; long s = R1; R1 = C1; C1 = s; }
+                if (C3 != D) { float *t3 = (float *)xmalloc((size_t)R3 * C3 * 4);
+                    for (long r2 = 0; r2 < R3; r2++) for (long c2 = 0; c2 < C3; c2++) t3[(size_t)c2 * R3 + r2] = w3q[(size_t)r2 * C3 + c2];
+                    free(w3q); w3q = t3; long s = R3; R3 = C3; C3 = s; }
+                if (R1 != F || R3 != F || C1 != D || C3 != D)
+                    die("ERF: w1/w3 形状 %ldx%ld / %ldx%ld ≠ %dx%d(e=%d)", R1, C1, R3, C3, F, D, e);
+
+                /* _ht/_he = swiglu(x@W1qᵀ, x@W3qᵀ), 全 f64(py: _xt 是 f64, W 被 numpy 提升) */
+                double *W1d = (double *)xmalloc((size_t)F * D * sizeof(double));
+                double *W3d = (double *)xmalloc((size_t)F * D * sizeof(double));
+                for (size_t i2 = 0; i2 < (size_t)F * D; i2++) { W1d[i2] = w1q[i2]; W3d[i2] = w3q[i2]; }
+                free(w1q); free(w3q);
+                double *xt = (double *)xmalloc((size_t)nft * D * sizeof(double));
+                double *xe = (double *)xmalloc((size_t)nfe * D * sizeof(double));
+                for (int j = 0; j < nft; j++) { const float *s = XSOLVE + (size_t)prow[ftr[j]] * D;
+                    for (int c = 0; c < D; c++) xt[(size_t)j * D + c] = s[c]; }
+                for (int j = 0; j < nfe; j++) { const float *s = XSOLVE + (size_t)prow[fev[j]] * D;
+                    for (int c = 0; c < D; c++) xe[(size_t)j * D + c] = s[c]; }
+                double *ht = (double *)xmalloc((size_t)nft * F * sizeof(double));
+                double *he = (double *)xmalloc((size_t)nfe * F * sizeof(double));
+                double *ubuf = (double *)xmalloc((size_t)(nft > nfe ? nft : nfe) * F * sizeof(double));
+                mm64(0, 1, nft, F, D, xt, D, W1d, D, ht, F);
+                mm64(0, 1, nft, F, D, xt, D, W3d, D, ubuf, F);
+                for (size_t i2 = 0; i2 < (size_t)nft * F; i2++) {
+                    double g = ht[i2], u = ubuf[i2];
+                    if (SWLIM > 0) { if (g > SWLIM) g = SWLIM; else if (g < -SWLIM) g = -SWLIM;
+                                     if (u > SWLIM) u = SWLIM; else if (u < -SWLIM) u = -SWLIM; }
+                    double gc = g > 60.0 ? 60.0 : (g < -60.0 ? -60.0 : g);
+                    ht[i2] = (g / (1.0 + exp(-gc))) * u;
+                }
+                mm64(0, 1, nfe, F, D, xe, D, W1d, D, he, F);
+                mm64(0, 1, nfe, F, D, xe, D, W3d, D, ubuf, F);
+                for (size_t i2 = 0; i2 < (size_t)nfe * F; i2++) {
+                    double g = he[i2], u = ubuf[i2];
+                    if (SWLIM > 0) { if (g > SWLIM) g = SWLIM; else if (g < -SWLIM) g = -SWLIM;
+                                     if (u > SWLIM) u = SWLIM; else if (u < -SWLIM) u = -SWLIM; }
+                    double gc = g > 60.0 ? 60.0 : (g < -60.0 ? -60.0 : g);
+                    he[i2] = (g / (1.0 + exp(-gc))) * u;
+                }
+                free(xt); free(xe); free(W1d); free(W3d); free(ubuf);
+
+                double *sh = (double *)xmalloc((size_t)F * sizeof(double));
+                for (int c = 0; c < F; c++) {
+                    double ss = 0;
+                    for (int j = 0; j < nft; j++) { double v = ht[(size_t)j * F + c]; ss += v * v; }
+                    sh[c] = sqrt(ss / nft) + 1e-8;
+                }
+                /* Ms = (ΔW_w2 ⊙ sh).astype(f32); 差在 f64 里算(与 py 的 _Wf/_Wq 已升 f64 同) */
+                float *Ms = (float *)xmalloc((size_t)D * F * 4);
+                for (int r2 = 0; r2 < D; r2++) for (int c = 0; c < F; c++)
+                    Ms[(size_t)r2 * F + c] = (float)((((double)wf2[(size_t)r2 * F + c]) - (double)wq2[(size_t)r2 * F + c]) * sh[c]);
+                free(wf2); free(wq2);
+
+                /* ---- _rsvd(Ms, ERF_R): G=RandomState(11).randn(F, r+8) → QR(Ms@G) → svd(Qᵀ Ms) ---- */
+                float *Gr = (float *)xmalloc((size_t)F * RP8 * 4);
+                { mt_t rs; mt_seed(&rs, 11);
+                  for (size_t i2 = 0; i2 < (size_t)F * RP8; i2++) Gr[i2] = (float)mt_gauss(&rs); }
+                float *MG = (float *)xmalloc((size_t)D * RP8 * 4);
+                mm32(0, 0, D, RP8, F, Ms, F, Gr, RP8, MG, RP8);
+                free(Gr);
+                double *Qd = (double *)xmalloc((size_t)D * RP8 * sizeof(double));
+                for (size_t i2 = 0; i2 < (size_t)D * RP8; i2++) Qd[i2] = MG[i2];
+                free(MG);
+                double *qtau = (double *)xmalloc((size_t)RP8 * sizeof(double));
+                double *qrd = (double *)xmalloc((size_t)RP8 * sizeof(double));
+                hh_qr(Qd, D, RP8, qtau, qrd);
+                double *Qm = (double *)xcalloc((size_t)D * RP8, sizeof(double));
+                for (int c = 0; c < RP8; c++) Qm[(size_t)c * RP8 + c] = 1.0;   /* Q = Q_full·I[:, :RP8] */
+                hh_apply_q(Qd, qtau, D, RP8, Qm, RP8);
+                free(Qd); free(qtau); free(qrd);
+                float *Q32 = (float *)xmalloc((size_t)D * RP8 * 4);
+                for (size_t i2 = 0; i2 < (size_t)D * RP8; i2++) Q32[i2] = (float)Qm[i2];
+                float *B32 = (float *)xmalloc((size_t)RP8 * F * 4);
+                mm32(1, 0, RP8, F, D, Q32, RP8, Ms, F, B32, F);   /* B = Qᵀ·Ms */
+                free(Q32); free(Ms);
+                double *Bd = (double *)xmalloc((size_t)RP8 * F * sizeof(double));
+                for (size_t i2 = 0; i2 < (size_t)RP8 * F; i2++) Bd[i2] = B32[i2];
+                free(B32);
+                double *Ub = NULL, *Sb = NULL, *Vb = NULL;
+                zl_svd_lowrank(Bd, RP8, F, RP8, &Ub, &Sb, &Vb);   /* Ub[RP8,RP8] Sb[RP8] Vb[RP8,F] */
+                free(Bd);
+                double *Uw = (double *)xmalloc((size_t)D * ERF_R * sizeof(double));
+                mm64(0, 0, D, ERF_R, RP8, Qm, RP8, Ub, RP8, Uw, ERF_R);   /* U = (Q·Ub)[:, :r] */
+                free(Qm); free(Ub);
+                double *Sw = (double *)xmalloc((size_t)ERF_R * sizeof(double));
+                for (int c = 0; c < ERF_R; c++) Sw[c] = Sb[c];
+                free(Sb);
+                double *Vw = (double *)xmalloc((size_t)ERF_R * F * sizeof(double));
+                for (int c = 0; c < ERF_R; c++) for (int j = 0; j < F; j++)
+                    Vw[(size_t)c * F + j] = Vb[(size_t)c * F + j] / sh[j];  /* py: _V/_sh[None,:] */
+                free(Vb); free(sh);
+
+                /* _Gt/_Ge = (h@Vᵀ)·w ; 小 r×r 岭回归解 α */
+                double *Gt = (double *)xmalloc((size_t)nft * ERF_R * sizeof(double));
+                double *Ge = (double *)xmalloc((size_t)nfe * ERF_R * sizeof(double));
+                mm64(0, 1, nft, ERF_R, F, ht, F, Vw, F, Gt, ERF_R);
+                mm64(0, 1, nfe, ERF_R, F, he, F, Vw, F, Ge, ERF_R);
+                free(ht); free(he);
+                for (int j = 0; j < nft; j++) { double w = pw[ftr[j]];
+                    for (int c = 0; c < ERF_R; c++) Gt[(size_t)j * ERF_R + c] *= w; }
+                for (int j = 0; j < nfe; j++) { double w = pw[fev[j]];
+                    for (int c = 0; c < ERF_R; c++) Ge[(size_t)j * ERF_R + c] *= w; }
+
+                double *GtG = (double *)xmalloc((size_t)ERF_R * ERF_R * sizeof(double));
+                mm64(1, 0, ERF_R, ERF_R, nft, Gt, ERF_R, Gt, ERF_R, GtG, ERF_R);
+                double *UtU = (double *)xmalloc((size_t)ERF_R * ERF_R * sizeof(double));
+                mm64(1, 0, ERF_R, ERF_R, D, Uw, ERF_R, Uw, ERF_R, UtU, ERF_R);
+                double *Am2 = (double *)xmalloc((size_t)ERF_R * ERF_R * sizeof(double));
+                for (int a = 0; a < ERF_R; a++) for (int b = 0; b < ERF_R; b++)
+                    Am2[(size_t)a * ERF_R + b] = GtG[(size_t)a * ERF_R + b] * UtU[(size_t)a * ERF_R + b] * Sw[a] * Sw[b];
+                free(GtG); free(UtU);
+                /* _b = S ⊙ einsum("ni,nd,di->i", Gt, Rr, U) = S_i · Σ_n Gt[n,i]·(Rr[n,:]·U[:,i]) */
+                double *Pru = (double *)xmalloc((size_t)nft * ERF_R * sizeof(double));
+                { double *Rrow = (double *)xmalloc((size_t)nft * D * sizeof(double));
+                  for (int j = 0; j < nft; j++) memcpy(Rrow + (size_t)j * D, ER + (size_t)prow[ftr[j]] * D, (size_t)D * sizeof(double));
+                  mm64(0, 0, nft, ERF_R, D, Rrow, D, Uw, ERF_R, Pru, ERF_R);
+                  free(Rrow); }
+                double *bv = (double *)xmalloc((size_t)ERF_R * sizeof(double));
+                for (int c = 0; c < ERF_R; c++) {
+                    double s = 0;
+                    for (int j = 0; j < nft; j++) s += Gt[(size_t)j * ERF_R + c] * Pru[(size_t)j * ERF_R + c];
+                    bv[c] = Sw[c] * s;
+                }
+                free(Pru);
+                double atr = 0;
+                for (int c = 0; c < ERF_R; c++) atr += Am2[(size_t)c * ERF_R + c];
+                for (int c = 0; c < ERF_R; c++) Am2[(size_t)c * ERF_R + c] += atr / ERF_R + 1e-12;
+                if (lu_solve(Am2, ERF_R, bv)) { free(Am2); free(bv); free(Gt); free(Ge); free(Uw); free(Sw); free(Vw); continue; }
+                free(Am2);
+
+                /* _ct/_ce = (G ⊙ (α·S)) @ Uᵀ */
+                double *aS = (double *)xmalloc((size_t)ERF_R * sizeof(double));
+                for (int c = 0; c < ERF_R; c++) aS[c] = bv[c] * Sw[c];
+                double *GtS = (double *)xmalloc((size_t)nft * ERF_R * sizeof(double));
+                for (int j = 0; j < nft; j++) for (int c = 0; c < ERF_R; c++)
+                    GtS[(size_t)j * ERF_R + c] = Gt[(size_t)j * ERF_R + c] * aS[c];
+                double *GeS = (double *)xmalloc((size_t)nfe * ERF_R * sizeof(double));
+                for (int j = 0; j < nfe; j++) for (int c = 0; c < ERF_R; c++)
+                    GeS[(size_t)j * ERF_R + c] = Ge[(size_t)j * ERF_R + c] * aS[c];
+                free(aS); free(Gt); free(Ge);
+                double *ct = (double *)xmalloc((size_t)nft * D * sizeof(double));
+                double *ce = (double *)xmalloc((size_t)nfe * D * sizeof(double));
+                mm64(0, 1, nft, D, ERF_R, GtS, ERF_R, Uw, ERF_R, ct, D);
+                mm64(0, 1, nfe, D, ERF_R, GeS, ERF_R, Uw, ERF_R, ce, D);
+                free(GtS); free(GeS);
+
+                /* token 能量门: 按 _ct 能量降序累积收益, 取累积最大处的能量当 τ */
+                dsort_t *en = (dsort_t *)xmalloc((size_t)nft * sizeof(dsort_t));
+                double *ben = (double *)xmalloc((size_t)nft * sizeof(double));
+                for (int j = 0; j < nft; j++) {
+                    const double *c2 = ct + (size_t)j * D, *r2 = ER + (size_t)prow[ftr[j]] * D;
+                    double e2 = 0, dp = 0;
+                    for (int d3 = 0; d3 < D; d3++) { e2 += c2[d3] * c2[d3]; dp += r2[d3] * c2[d3]; }
+                    en[j].v = e2; en[j].i = j;
+                    ben[j] = 2.0 * dp - e2;
+                }
+                dsort_t *oi = (dsort_t *)xmalloc((size_t)nft * sizeof(dsort_t));
+                memcpy(oi, en, (size_t)nft * sizeof(dsort_t));
+                qsort(oi, (size_t)nft, sizeof(dsort_t), cmp_dsort_desc);
+                double cum = 0, best = -INFINITY; int m = 0;
+                for (int j = 0; j < nft; j++) { cum += ben[oi[j].i]; if (cum > best) { best = cum; m = j + 1; } }
+                free(ben);
+                if (best <= 0) { free(en); free(oi); free(ct); free(ce); free(Uw); free(Sw); free(Vw); free(bv); continue; }
+                double tau = oi[m - 1].v;
+                free(oi);
+                for (int j = 0; j < nft; j++) if (en[j].v < tau) memset(ct + (size_t)j * D, 0, (size_t)D * sizeof(double));
+                free(en);
+                for (int j = 0; j < nfe; j++) {
+                    double e2 = 0; const double *c2 = ce + (size_t)j * D;
+                    for (int d3 = 0; d3 < D; d3++) e2 += c2[d3] * c2[d3];
+                    if (e2 < tau) memset(ce + (size_t)j * D, 0, (size_t)D * sizeof(double));
+                }
+                double chk = 0;
+                for (int j = 0; j < nft; j++) {
+                    const double *c2 = ct + (size_t)j * D, *r2 = ER + (size_t)prow[ftr[j]] * D;
+                    for (int d3 = 0; d3 < D; d3++) chk += 2.0 * r2[d3] * c2[d3] - c2[d3] * c2[d3];
+                }
+                if (chk <= 0) { free(ct); free(ce); free(Uw); free(Sw); free(Vw); free(bv); continue; }
+
+                for (int j = 0; j < nft; j++) {
+                    double *r2 = ER + (size_t)prow[ftr[j]] * D;
+                    const double *c2 = ct + (size_t)j * D;
+                    for (int d3 = 0; d3 < D; d3++) r2[d3] -= c2[d3];
+                }
+                for (int j = 0; j < nfe; j++) {
+                    int po = evpos[prow[fev[j]]];
+                    if (po < 0) continue;
+                    double *p2 = pred + (size_t)po * D;
+                    const double *c2 = ce + (size_t)j * D;
+                    for (int d3 = 0; d3 < D; d3++) p2[d3] += c2[d3];
+                }
+                free(ct); free(ce);
+
+                /* 载荷: <If>(e,τ) + U16=(U⊙S)[D,r] + V16=(α·V)[r,F], 都是 f64 直接舍 f16 */
+                size_t one = 8 + (size_t)D * ERF_R * 2 + (size_t)ERF_R * F * 2;
+                epay = (uint8_t *)realloc(epay, epay_len + one);
+                if (!epay) die("realloc ERF 载荷");
+                uint8_t *dst = epay + epay_len; epay_len += one;
+                uint32_t e32 = (uint32_t)e; float tau32 = (float)tau;
+                memcpy(dst, &e32, 4); memcpy(dst + 4, &tau32, 4);
+                uint16_t *U16e = (uint16_t *)(dst + 8), *V16e = U16e + (size_t)D * ERF_R;
+                for (int r2 = 0; r2 < D; r2++) for (int c = 0; c < ERF_R; c++)
+                    U16e[(size_t)r2 * ERF_R + c] = f64_to_f16(Uw[(size_t)r2 * ERF_R + c] * Sw[c]);
+                for (int c = 0; c < ERF_R; c++) for (int j = 0; j < F; j++)
+                    V16e[(size_t)c * F + j] = f64_to_f16(bv[c] * Vw[(size_t)c * F + j]);
+                free(Uw); free(Sw); free(Vw); free(bv);
+                ne++;
+            }
+            free(ftr); free(fev); free(eidx); free(ecsr);
+
+            if (ne) {
+                double e0a = 0, e1a = 0;
+                for (size_t i2 = 0; i2 < (size_t)nev * D; i2++) {
+                    e0a += Rev0[i2] * Rev0[i2];
+                    double d3 = Rev0[i2] - pred[i2]; e1a += d3 * d3;
+                }
+                ERF_GAIN = 1.0 - e1a / (e0a > 1e-18 ? e0a : 1e-18);
+                if (ERF_GAIN > 0.002) {
+                    uint8_t *hdr8 = (uint8_t *)xmalloc(8 + epay_len);
+                    uint32_t u32ne = (uint32_t)ne; uint16_t u16r = (uint16_t)ERF_R, u16z = 0;
+                    memcpy(hdr8, &u32ne, 4); memcpy(hdr8 + 4, &u16r, 2); memcpy(hdr8 + 6, &u16z, 2);
+                    memcpy(hdr8 + 8, epay, epay_len);
+                    ERF_ADD = make_rec("zl.ERF", hdr8, 8 + epay_len, &ERF_LEN);
+                    free(hdr8);
+                    ERF_NE = ne;
+                }
+            }
+            double tot = eff + (ERF_GAIN > 0 ? ERF_GAIN : 0.0) * (1 - eff);
+            printf("  L%d ERF死层部件: 专家=%d 残差挽回=%.1f%% 组合总计=%.1f%% → %s\n",
+                   L, ne, ERF_GAIN * 100, tot * 100, ERF_ADD ? "注入" : "不过闸");
+            free(epay); free(pred); free(Rev0); free(ER); free(trm); free(evm); free(evpos);
+            munmap((void *)eblob, ebsz);
+            free(esc);
+        }
+    }
+
     /* ---------------- 注入载荷 ---------------- */
     uint8_t *add = NULL; size_t add_len = 0; int nrec_add = 0;
-    if (USE_GE) {
+    if (ADDON) {
+        /* ★叠加式合并注入★: 既有记录(GE, z_old)与本轮新解合并成【单条】, 引擎按"末条胜出"
+         * 读到的就是合并后的整体 —— 所以 GE 直接相乘, 两段低秩拼成一个矩阵再重新截断:
+         *   M = [V_old·z_old | V_new·S_new] · [U_old | U_new]ᵀ = Pc·Qcᵀ
+         * 对 Pc/Qc 各做一次 QR, 只对 n×n 的小核 Rp·Rqᵀ 求 SVD, 再把基乘回去 —— 等价于
+         * 对 M 直接做截断 SVD, 但不用把 DIW×D 的稠密 M 摆出来。 */
+        float ge_m[NEXP];
+        for (int e = 0; e < NEXP; e++) {
+            float gn = USE_GE ? gf[e] : 1.0f;
+            float gb2 = ge_old ? ge_old[e] : 1.0f;
+            ge_m[e] = gb2 * gn;
+        }
+        uint16_t ge_m16[NEXP];
+        for (int e = 0; e < NEXP; e++) ge_m16[e] = f64_to_f16((double)ge_m[e]);
+        const int ftaW = (K > 0 && !strcmp(FORM, "ftA"));
+        const int DIW = ((zo_z && zo_di == 3 * D) || ftaW) ? 3 * D : D;
+        const int kold = zo_z ? zo_k0 : 0, knew = (K > 0) ? K : 0;
+        const int ncol = kold + knew;
+        if (ncol == 0) {
+            add = make_rec("bf.GE", ge_m16, sizeof ge_m16, &add_len);
+            nrec_add = 1;
+        } else {
+            double *Pc = (double *)xcalloc((size_t)DIW * ncol, sizeof(double));
+            double *Qc = (double *)xcalloc((size_t)D * ncol, sizeof(double));
+            if (kold) {                                   /* P=lift(V_old·z_old), Q=U_old */
+                for (int i = 0; i < zo_di; i++) for (int c = 0; c < kold; c++)
+                    Pc[(size_t)i * ncol + c] = (double)zo_V[(size_t)i * zo_k0 + c] * (double)zo_z[c];
+                for (int j = 0; j < D; j++) for (int c = 0; c < kold; c++)
+                    Qc[(size_t)j * ncol + c] = zo_U[(size_t)j * zo_k0 + c];
+            }
+            if (knew) {                                   /* P=lift(A[:,:K]·S), Q=Bt[:K].T */
+                int dinn = ftaW ? DIN3 : D, rr = ftaW ? rfta : rlin;
+                const double *AA = ftaW ? Af : A, *SS = ftaW ? Sf : S, *BB = ftaW ? Bf : Bt;
+                for (int i = 0; i < dinn; i++) for (int c = 0; c < knew; c++)
+                    Pc[(size_t)i * ncol + kold + c] = AA[(size_t)i * rr + c] * SS[c];
+                for (int j = 0; j < D; j++) for (int c = 0; c < knew; c++)
+                    Qc[(size_t)j * ncol + kold + c] = BB[(size_t)c * D + j];
+            }
+            double *tauP = (double *)xmalloc((size_t)ncol * sizeof(double));
+            double *rdP = (double *)xmalloc((size_t)ncol * sizeof(double));
+            double *tauQ = (double *)xmalloc((size_t)ncol * sizeof(double));
+            double *rdQ = (double *)xmalloc((size_t)ncol * sizeof(double));
+            hh_qr(Pc, DIW, ncol, tauP, rdP);
+            hh_qr(Qc, D, ncol, tauQ, rdQ);
+            double *Rp = (double *)xcalloc((size_t)ncol * ncol, sizeof(double));
+            double *Rq = (double *)xcalloc((size_t)ncol * ncol, sizeof(double));
+            for (int i = 0; i < ncol; i++) {
+                Rp[(size_t)i * ncol + i] = rdP[i]; Rq[(size_t)i * ncol + i] = rdQ[i];
+                for (int j = i + 1; j < ncol; j++) {
+                    Rp[(size_t)i * ncol + j] = Pc[(size_t)i * ncol + j];
+                    Rq[(size_t)i * ncol + j] = Qc[(size_t)i * ncol + j];
+                }
+            }
+            free(rdP); free(rdQ);
+            double *Mm = (double *)xmalloc((size_t)ncol * ncol * sizeof(double));
+            mm64(0, 1, ncol, ncol, ncol, Rp, ncol, Rq, ncol, Mm, ncol);   /* Rp·Rqᵀ */
+            free(Rp); free(Rq);
+            /* py 用全 SVD 再数 Sm>1e-8 并封顶 1024。奇异值降序 ⇒ "全谱里 >1e-8 的个数封顶
+             * 1024" 恒等于 "前 min(n,1024) 个里 >1e-8 的个数", 所以只求前 rm 个就够。 */
+            int rm = ncol < 1088 ? ncol : 1088;
+            double *Am3 = NULL, *Sm3 = NULL, *Bm3 = NULL;
+            zl_svd_lowrank(Mm, ncol, ncol, rm, &Am3, &Sm3, &Bm3);
+            free(Mm);
+            int cap = ncol < 1024 ? ncol : 1024;
+            int km = 0;
+            for (int c = 0; c < cap && c < rm; c++) if (Sm3[c] > 1e-8) km++;
+            if (km == 0) km = 1;
+            double *Vm = (double *)xcalloc((size_t)DIW * km, sizeof(double));
+            for (int i = 0; i < ncol; i++) for (int c = 0; c < km; c++)
+                Vm[(size_t)i * km + c] = Am3[(size_t)i * rm + c];
+            hh_apply_q(Pc, tauP, DIW, ncol, Vm, km);                      /* Vm = Qp·Am[:, :km] */
+            double *Um = (double *)xcalloc((size_t)D * km, sizeof(double));
+            for (int i = 0; i < ncol; i++) for (int c = 0; c < km; c++)
+                Um[(size_t)i * km + c] = Bm3[(size_t)c * ncol + i];       /* Bm.T[:, :km] */
+            hh_apply_q(Qc, tauQ, D, ncol, Um, km);                        /* Um = Qq·Bm.T[:, :km] */
+            free(Pc); free(Qc); free(tauP); free(tauQ); free(Am3); free(Bm3);
+
+            size_t rl1; uint8_t *r1 = make_rec("bf.GE", ge_m16, sizeof ge_m16, &rl1);
+            size_t nh = (size_t)km + (size_t)D * km + (size_t)DIW * km;
+            size_t psz = 16 + nh * 2;
+            uint8_t *pay = (uint8_t *)xmalloc(psz);
+            uint32_t u32k = (uint32_t)km, u32di = (uint32_t)DIW, u32do = (uint32_t)D;
+            float tr05 = 0.5f;
+            memcpy(pay, &u32k, 4); memcpy(pay + 4, &tr05, 4);
+            memcpy(pay + 8, &u32di, 4); memcpy(pay + 12, &u32do, 4);
+            uint16_t *h = (uint16_t *)(pay + 16);
+            for (int c = 0; c < km; c++) h[c] = f64_to_f16(Sm3[c]);
+            uint16_t *U16 = h + km, *V16 = h + km + (size_t)D * km;
+            for (size_t i = 0; i < (size_t)D * km; i++) U16[i] = f64_to_f16(Um[i]);
+            for (size_t i = 0; i < (size_t)DIW * km; i++) V16[i] = f64_to_f16(Vm[i]);
+            free(Sm3); free(Um); free(Vm);
+            size_t rl2; uint8_t *r2 = make_rec("zl.RRR", pay, psz, &rl2);
+            free(pay);
+            add_len = rl1 + rl2;
+            add = (uint8_t *)xmalloc(add_len);
+            memcpy(add, r1, rl1); memcpy(add + rl1, r2, rl2);
+            free(r1); free(r2);
+            nrec_add = 2;
+        }
+    } else if (USE_GE) {
         size_t rl; uint8_t *r = make_rec("bf.GE", ge16, sizeof ge16, &rl);
         add = (uint8_t *)realloc(add, add_len + rl); if (!add) die("realloc");
         memcpy(add + add_len, r, rl); add_len += rl; free(r);
         nrec_add++;
     }
-    if (K > 0) {
+    if (!ADDON && K > 0) {
         int ftaW = !strcmp(FORM, "ftA");
         int din = ftaW ? DIN3 : D, r = ftaW ? rfta : rlin;
         const double *AA = ftaW ? Af : A, *SS = ftaW ? Sf : S, *BB = ftaW ? Bf : Bt;
@@ -1529,10 +2537,6 @@ int main(int argc, char **argv) {
         memcpy(add + add_len, rec, rl); add_len += rl; free(rec);
         nrec_add++;
     }
-
-    /* ERF 死层部件: 第一期未实现。只在 .py 会进这个分支时提示, 免得日志里凭空多一行。 */
-    if (eff < 0.01 && env_int("DS4_ZL_ERF", 1))
-        printf("  L%d ERF死层部件: 第一期未实现, 跳过(组合 %.1f%% < 1%%)\n", L, eff * 100);
 
     char status[512]; snprintf(status, sizeof status, "解算完");
     if (INJ == 2) {
@@ -1563,14 +2567,86 @@ int main(int argc, char **argv) {
                 if (atoi(q) == L) done = 1;
             }
             fclose(mf); }
-        if (done) {
+        char dql[1300]; snprintf(dql, sizeof dql, "%s/dql_L%02d.bin", ld, L);
+        if (ADDON) {
+            /* ★叠加式落地★ 注意 py 把这一支放在 `elif L in done` 【前面】—— 叠加式不看
+             * "已注入过", 它本来就是要覆盖上一轮贪心记录的。
+             * 闸拒 = 零动作(贪心原记录原样留着); 落地 = 先按账本截回裸底座(去掉旧记录)
+             * 再写合并记录, 账本不重复记。 */
+            if (eff <= GATE) {
+                snprintf(status, sizeof status, "Δ增益 %.1f%% ≤闸%.1f%% → 保留贪心原记录(叠加闸)", eff * 100, GATE * 100);
+            } else {
+                long long ent_sz = -1; uint32_t ent_n0 = 0; int have_ent = 0;
+                mf = fopen(man, "r");
+                if (mf) { char line[256];
+                    while (fgets(line, sizeof line, mf)) {
+                        const char *q = line;
+                        while (*q == ' ' || *q == '\t') q++;
+                        if (!(*q == '-' || (*q >= '0' && *q <= '9'))) continue;
+                        long a1 = 0, a2 = 0, a3 = 0;
+                        if (sscanf(q, "%ld %ld %ld", &a1, &a2, &a3) != 3) continue;
+                        if (a1 == L && a2 > 0) { ent_sz = a2; ent_n0 = (uint32_t)a3; have_ent = 1; }
+                    }
+                    fclose(mf); }
+                if (have_ent) {
+                    FILE *df = fopen(dql, "r+b");
+                    if (!df) die("dql 打不开(r+b): %s", dql);
+                    if (ftruncate(fileno(df), (off_t)ent_sz)) die("dql 截回原账长度失败");
+                    if (fseeko(df, 8, SEEK_SET) || fwrite(&ent_n0, 4, 1, df) != 1) die("dql nrec 回写失败");
+                    if (fseeko(df, 0, SEEK_END)) die("dql seek end 失败");
+                    if (add_len && fwrite(add, 1, add_len, df) != add_len) die("dql 追加失败");
+                    uint32_t n1 = ent_n0 + (uint32_t)nrec_add;
+                    if (fseeko(df, 8, SEEK_SET) || fwrite(&n1, 4, 1, df) != 1) die("dql nrec 回写失败");
+                    fclose(df);
+                    snprintf(status, sizeof status, "合并注入完(+%d记录, 基于原账 %lld)", nrec_add, ent_sz);
+                } else {
+                    struct stat ds;
+                    if (stat(dql, &ds)) die("dql 不存在: %s", dql);
+                    long long osz = (long long)ds.st_size;
+                    FILE *df = fopen(dql, "r+b");
+                    if (!df) die("dql 打不开(r+b): %s", dql);
+                    uint32_t n0;
+                    if (fseeko(df, 8, SEEK_SET) || fread(&n0, 4, 1, df) != 1) die("dql nrec 读不到");
+                    if (fseeko(df, 0, SEEK_END)) die("dql seek end 失败");
+                    if (add_len && fwrite(add, 1, add_len, df) != add_len) die("dql 追加失败");
+                    uint32_t n1 = n0 + (uint32_t)nrec_add;
+                    if (fseeko(df, 8, SEEK_SET) || fwrite(&n1, 4, 1, df) != 1) die("dql nrec 回写失败");
+                    fclose(df);
+                    mf = fopen(man, "a"); if (!mf) die("账本写不开");
+                    fprintf(mf, "%d %lld %u\n", L, osz, n0); fclose(mf);
+                    snprintf(status, sizeof status, "合并注入完(+%d记录, 新账 %lld)", nrec_add, osz);
+                }
+            }
+        } else if (done) {
             snprintf(status, sizeof status, "已注入过, 跳过(回滚请按账本截断)");
         } else if (eff <= GATE) {
-            mf = fopen(man, "a"); if (!mf) die("账本写不开");
-            fprintf(mf, "%d -1 -1\n", L); fclose(mf);
-            snprintf(status, sizeof status, "组合增益 %.1f%% ≤闸%.1f%% → 本层不注入(闸)", comb * 100, GATE * 100);
+            if (ERF_ADD) {          /* ★死层部件接管★: z 被闸拒但 ERF 过闸 → 同账本注入 */
+                struct stat ds;
+                if (stat(dql, &ds)) die("dql 不存在: %s", dql);
+                long long osz = (long long)ds.st_size;
+                FILE *df = fopen(dql, "r+b");
+                if (!df) die("dql 打不开(r+b): %s", dql);
+                uint32_t n0;
+                if (fseeko(df, 8, SEEK_SET) || fread(&n0, 4, 1, df) != 1) die("dql nrec 读不到");
+                if (fseeko(df, 0, SEEK_END)) die("dql seek end 失败");
+                if (fwrite(ERF_ADD, 1, ERF_LEN, df) != ERF_LEN) die("dql 追加失败");
+                uint32_t n1 = n0 + 1;
+                if (fseeko(df, 8, SEEK_SET) || fwrite(&n1, 4, 1, df) != 1) die("dql nrec 回写失败");
+                fclose(df);
+                mf = fopen(man, "a"); if (!mf) die("账本写不开");
+                fprintf(mf, "%d %lld %u\n", L, osz, n0); fclose(mf);
+                snprintf(status, sizeof status, "ERF死层注入(+1记录 %.1fMB, held+%.1f%%, 专家%d)",
+                         ERF_LEN / 1048576.0, ERF_GAIN * 100, ERF_NE);
+            } else {
+                mf = fopen(man, "a"); if (!mf) die("账本写不开");
+                fprintf(mf, "%d -1 -1\n", L); fclose(mf);
+                snprintf(status, sizeof status, "组合增益 %.1f%% ≤闸%.1f%% → 本层不注入(闸)", comb * 100, GATE * 100);
+            }
         } else {
-            char dql[1300]; snprintf(dql, sizeof dql, "%s/dql_L%02d.bin", ld, L);
+            if (ERF_ADD) {          /* ★叠加★: z/GE 之上再追加 ERF 残差补丁 */
+                add = (uint8_t *)realloc(add, add_len + ERF_LEN); if (!add) die("realloc");
+                memcpy(add + add_len, ERF_ADD, ERF_LEN); add_len += ERF_LEN; nrec_add++;
+            }
             struct stat ds;
             if (stat(dql, &ds)) die("dql 不存在: %s", dql);
             long long osz = (long long)ds.st_size;
@@ -1592,9 +2668,16 @@ int main(int argc, char **argv) {
     double t3 = now_s();
 
     double gemean;
-    { float acc = 0.0f;                       /* numpy 对 f16 数组的 mean 用 f32 累加器 */
+    { /* ★numpy 对 f16 数组的 mean: f32 累加/相除, 但【结果再舍回 f16】★
+       * (numpy _methods._mean 结尾的 `if is_float16_result: ret = arr.dtype.type(ret)`)
+       * 一期漏了最后这一步。夹具金标里撞出来: 只有 3 个专家被路由到时,
+       * py 打 GE均值 1.0010 而 C 打 1.0005 —— 差的正是 f16 在 1.0 附近的一格(2⁻¹⁰)。
+       * 一期是在 256 个专家全被路由到的 XCAP 层上对的拍, 那时两者恰好落同一格所以没露。
+       * 只影响这一行打印, 不碰任何载荷字节。
+       * (f32 累加这里是顺序累加, numpy 是 pairwise; 差在 f16 舍入前就被吸收掉了。) */
+      float acc = 0.0f;
       for (int e = 0; e < NEXP; e++) acc += f16_to_f32(ge16[e]);
-      gemean = (double)(acc / (float)NEXP); }
+      gemean = (double)f16_to_f32(f64_to_f16((double)(acc / (float)NEXP))); }
     printf("★L%d z侧车: held挽回 z^L %.1f%% 组合 %.1f%%  GE均值 %.4f  体积 %.1fMB | "
            "缓存 %.0fs 解算 %.0fs 总 %.0fs | %s\n",
            L, rz * 100, comb * 100, gemean, add_len / 1048576.0,
