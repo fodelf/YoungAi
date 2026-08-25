@@ -95,12 +95,12 @@ if [ ! -d "$HF" ]; then
           echo "[中断] 远端已清" >&2; exit 130' INT TERM
     RC=0; wait "$SSHPID" || RC=$?   # ||捕获: set -e 下裸 wait 收远端非零码会当场杀本地脚本, 明细表拉不回
     trap 'echo "[中断] 杀本机量化进程" >&2; pkill -9 -f ds4quant_run 2>/dev/null || true; exit 130' INT TERM
-    rsync -a "$REMOTE:$RPATH/gguf-tools/go-onebit/layer-tables/" "$ROOT/gguf-tools/go-onebit/layer-tables/" 2>/dev/null || true
+    rsync -a "$REMOTE:$RPATH/gguf-tools/data/layer-tables/" "$ROOT/gguf-tools/data/layer-tables/" 2>/dev/null || true
     [ "$RC" = 0 ] && echo "【全模型】脚本 算法=ssh转发 进度=完成 体积=- 还原度=- 研判=明细已拉回 layer-tables/; 侧车在 $REMOTE:$RPATH/gguf/go-onebit/zfile_all.bin"
     exit "$RC"
 fi
-QDIR="$ROOT/gguf-tools/go-onebit/quant"
-TBL="$ROOT/gguf-tools/go-onebit/layer-tables"
+QDIR="$ROOT/gguf-tools/amp"
+TBL="$ROOT/gguf-tools/data/layer-tables"
 LDIR="$ROOT/gguf/go-onebit/layers"
 # ★对齐目标 = 编程域★ (rr_code.ids 编程语料; 覆盖用 DS4_CORPUS)
 CORPUS="${DS4_CORPUS:-/tmp/rr_code.ids}"
@@ -121,9 +121,11 @@ if [ "$MODE" = merge ]; then
     [ -x ./ds4quant_run ] || ../scripts/quant_verify.sh build
     N_HAVE=$(ls "$LDIR"/dql_L*.bin 2>/dev/null | wc -l | tr -d ' ' || true)   # ||true: dql 已 consume 释放(零文件)时 pipefail 会杀脚本, 走不到下方"已完成"分支
     GOUT="$ROOT/gguf/go-onebit/ds4-code1b.gguf"
+    # gguf_offsets.py 已删(见 git 历史), opt_chain 在位检测功能待 C 承接 — 检测恒 false,
+    # 落到下方"拒并"分支响亮失败, 不静默装"已完成"。
     if [ "$N_HAVE" = 0 ] && [ -s "$GOUT" ] && \
-       python3 "$ROOT/gguf-tools/go-onebit/scripts/gguf_offsets.py" "$GOUT" 2>/dev/null | grep -q "opt_chain"; then
-        NOPT=$(python3 "$ROOT/gguf-tools/go-onebit/scripts/gguf_offsets.py" "$GOUT" 2>/dev/null | grep -c "opt_")
+       { echo "[merge] gguf_offsets.py 已删, opt_chain 检测待 C 承接(见 git 历史)" >&2; false; }; then
+        NOPT="?"
         echo "【全模型】脚本 算法=merge-only 进度=已完成 体积=$(stat -f%z "$GOUT")B 还原度=- 研判=✓ 合一GGUF已在且含 ${NOPT} 个优化张量; dql 层文件已按 consume 设计释放 — 无需也无法再合并(重出请跑 fast)" >&2
         exit 0
     fi
@@ -131,7 +133,7 @@ if [ "$MODE" = merge ]; then
         zchain_fix merge-only
         echo "【全模型】脚本 算法=merge-only 进度=开始 体积=- 还原度=- 研判=复用既有${NLAY}层文件+OUT 补表+GGUF(跳过量化)" >&2
     elif [ "$N_HAVE" -gt 0 ] && [ -s "$OUT" ] && [ -s "$GOUT" ] && \
-         python3 "$ROOT/gguf-tools/go-onebit/scripts/gguf_offsets.py" "$GOUT" 2>/dev/null | grep -q "opt_chain"; then
+         { echo "[merge] gguf_offsets.py 已删, 续并检测待 C 承接(见 git 历史)" >&2; false; }; then
         # ★续并★: 上次合并中途截停 — 已注入层的 dql 被 consume 删除(其唯一字节已在 GGUF) → 只补剩余层。
         # 不跑 zchain_fix: 用部分 dql 重建会把已消费层的 opt/zchain 清空(侧车已是终值, 续并只注专家字节)。
         RESUME=1
@@ -236,7 +238,7 @@ if [ "$TIMEDOUT" = 1 ] || [ "$WDOG" = 1 ] || [ "$RC" != 0 ]; then
         if [ "${DS4_SKIP_RRVERDICT:-0}" != "1" ]; then
             for RRIDS in /tmp/rr_hard.ids:64 /tmp/rr_code.ids:305; do
                 RRF="${RRIDS%%:*}"; RRN="${RRIDS##*:}"
-                [ -f "$RRF" ] && env -u DS4_ANCHOR_ROUTE bash "$ROOT/gguf-tools/go-onebit/scripts/rr_verdict.sh" "$RRF" "$RRN" 2>&1 \
+                [ -f "$RRF" ] && env -u DS4_ANCHOR_ROUTE bash "$ROOT/gguf-tools/scripts/rr_verdict.sh" "$RRF" "$RRN" 2>&1 \
                     | grep -E 'VERDICT|watchdog' || echo "[自动merge] rr_verdict $RRF 未出分(不阻塞合并)" >&2
             done
         fi
@@ -244,7 +246,7 @@ if [ "$TIMEDOUT" = 1 ] || [ "$WDOG" = 1 ] || [ "$RC" != 0 ]; then
         zchain_fix 自动merge
     elif [ "$TIMEDOUT" = 1 ]; then
         echo "【全模型】脚本 算法=到时终止 进度=完成层=$DONE/$NLAY 体积=- 还原度=- 研判=层文件在 $LDIR, 明细表按已完成层生成; 未齐不合并(半成品防护), 重跑将从头开始"
-        python3 "$ROOT/gguf-tools/go-onebit/scripts/gen_tables.py" "$OUT" "$TBL" || true
+        # gen_tables.py 已删(layer-tables 已冻结, 见 git 历史); 原始判决数据在 $OUT。
         exit 0
     elif [ "$WDOG" = 1 ]; then
         echo "[watchdog] 层文件 $DONE/$NLAY 未齐 → 不合并(半成品防护)" >&2
@@ -299,7 +301,7 @@ echo "【全模型】脚本 算法=完整性校验 进度=完成 体积=$(stat -
 
 # ---------- M4 出表: 每层 L<NN>.md + 总表 ALL.md ----------
 cp "$OUT" "$TBL/raw/all.out"
-python3 "$ROOT/gguf-tools/go-onebit/scripts/gen_tables.py" "$OUT" "$TBL"
+# gen_tables.py 已删(layer-tables 已冻结, 见 git 历史); 每层 L<NN>.md 不再再生, raw/all.out 照落。
 # ---------- M4.4 判决停点(2026-07-20 域放大): DS4_SKIP_MERGE=1 → 裁判后停在 dql 态 ----------
 # 依据: 跑机盘装不下合一 GGUF 时, merge(consume 消费 dql)是不可逆点(07-15 教训同族);
 # 停点=出表后先跑 rr 固定裁判(只读回放), dql/opt 全留存, 裁决赢了再手动 ./quant_layer.sh merge。
@@ -307,7 +309,7 @@ if [ "${DS4_SKIP_MERGE:-0}" = 1 ]; then
     if [ "${DS4_SKIP_RRVERDICT:-0}" != "1" ]; then
         for RRIDS in /tmp/rr_hard.ids:64 /tmp/rr_code.ids:305; do
             RRF="${RRIDS%%:*}"; RRN="${RRIDS##*:}"
-            [ -f "$RRF" ] && env -u DS4_ANCHOR_ROUTE bash "$ROOT/gguf-tools/go-onebit/scripts/rr_verdict.sh" "$RRF" "$RRN" 2>&1 \
+            [ -f "$RRF" ] && env -u DS4_ANCHOR_ROUTE bash "$ROOT/gguf-tools/scripts/rr_verdict.sh" "$RRF" "$RRN" 2>&1 \
                 | grep -E 'VERDICT|watchdog' || echo "[skip-merge] rr_verdict $RRF 未出分(不阻塞停点)" >&2
         done
     fi
@@ -362,9 +364,9 @@ ZCB="$ROOT/gguf/go-onebit/zchain_all.bin"
 ZARG=""; [ -s "$ZCB" ] && ZARG="--zchain $ZCB"
 if [ -s "$GGUF_OUT" ] && [ -s "$ZCB" ]; then
     # 优化链变了 → opt 张量尺寸/内容随之变 → 不能就地复用, 必须重建合一骨架
-    REB=0
-    python3 "$ROOT/gguf-tools/go-onebit/scripts/gguf_offsets.py" "$GGUF_OUT" > "$OFF" 2>/dev/null || REB=1
-    grep -q "opt_chain" "$OFF" 2>/dev/null || REB=1
+    # gguf_offsets.py 已删(见 git 历史): 无法验证 opt 链在位 → 一律按"未并入"走重建判定
+    # (续并态下面仍硬拒, 不丢唯一字节)。偏移读取功能待 C 承接。
+    REB=1
     [ "$GGUF_OUT" -ot "$ZCB" ] && REB=1
     if [ "$REB" = 1 ]; then
         # ★续并护栏★: 已消费层的 1bit 字节只存在于这个 GGUF 里, 删=永久丢(重出须整轮重量化) → 硬拒
@@ -392,7 +394,8 @@ elif [ ! -s "$SKEL" ]; then
 fi
 if [ ! -s "$GGUF_OUT" ] && [ -s "$SKEL" ]; then mv "$SKEL" "$GGUF_OUT"; fi   # 稀疏骨架直接就地回填(cp 会实体化洞+双倍盘); 骨架可随时重建(分钟级)
 if [ -s "$GGUF_OUT" ]; then
-    python3 "$ROOT/gguf-tools/go-onebit/scripts/gguf_offsets.py" "$GGUF_OUT" > "$OFF" 2>/dev/null
+    echo "[M4.6] ★gguf_offsets.py 已删(见 git 历史), 偏移表 $OFF 生成待 C 承接 — 合并段不可跑★" >&2
+    exit 4
     PAY_KB=$(du -sk "$LDIR" | awk '{print $1}'); FREE_KB=$(df -k / | tail -1 | awk '{print $4}')
     CONSUME=""; [ "$FREE_KB" -lt $(( PAY_KB + PAY_KB/5 )) ] && CONSUME=1 \
         && echo "[M4.6] 盘紧(余$((FREE_KB/1048576))G<载荷$((PAY_KB/1048576))G×1.2) → 边并边释放层文件(DS4_MERGE_CONSUME)" >&2

@@ -58,7 +58,7 @@ MODEL=${MODEL:-gguf/ds4-mono-mixed.gguf}   # 默认=go2b 全 EF mono 质量双�
 # coordinator), output head + token_embd + 草稿都在 M4 —— 收 worker hidden → 本地 output head
 # 出 logits → 同一 hidden 喂 MTP head 本地 draft K 个 → 跨机 verify (复用 copy-spec 骨架)。
 # M1 worker 卸掉草稿 + output head (解决旧 Scheme A 死结: M1 装不下 backbone+草稿)。
-# 草稿用 tools/make_small_mtp.sh 生成的 Q2K (~2.14G) 或已发布 Q4K (3.8G); mmap non-resident
+# 草稿用 Q2K (~2.14G, 生成器 make_small_mtp.sh 已删见 git 历史) 或已发布 Q4K (3.8G); mmap non-resident
 # (默认 DS4_MTP_NO_RESIDENCY=1 可驱逐, 不占 L1 budget), 注意 M4 ≤12G 红线。
 MTP_GGUF=${MTP_GGUF:-}
 # 层切分 (block_count=43, layers 0..42)。本机 M4 扛大部分前段, M1 扛少部分末段 + output + MTP。
@@ -569,7 +569,7 @@ rsync -a --exclude '.git' --exclude '*.o' --exclude '*.gguf' --exclude 'gguf/' \
   --exclude 'ds4-eval' --exclude 'ds4-agent' --exclude 'e0-pingpong' --exclude 'ds4_test' \
   --exclude 'hf/' --exclude 'benchmarks/' --exclude '*.safetensors' --exclude '*.aria2' \
   --exclude 'cap_*/' --exclude 'zdump*/' --exclude 'sel_spool*/' --exclude 'quant_spool/' \
-  --exclude '*.npy' --exclude 'go-onebit/corpus/raw/' \
+  --exclude '*.npy' --exclude 'data/corpus/raw/' \
   "$LOCAL_DIR"/ "$REMOTE:$REMOTE_DIR"/ || { log "rsync 失败"; exit 1; }
 
 # ---------------- 2. 两边 clean + build (共享 CORE_OBJS, 必须都重编) ----------------
