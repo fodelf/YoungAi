@@ -57,6 +57,7 @@ CALIBRUN_INC := $(wildcard $(CAL)/calib_run_p*.inc.c)
 VFWD_INC := $(wildcard $(CAL)/validate_fwd_p*.inc.c)
 DSQFWD_INC := $(wildcard $(AMP)/ds4quant_fwd_p*.inc.c)
 AMPSOLVE_INC := $(wildcard $(AMP)/amp_solve_p*.inc.c)
+TRAJ_INC := $(wildcard $(CAL)/traj_analyze_p*.inc.c)
 
 ifeq ($(UNAME_S),Darwin)
 NATIVE ?= -mcpu=native
@@ -332,8 +333,10 @@ $(CAL)/validate_fwd: $(VFWD_SRC) $(VFWD_INC)
 	$(CC) $(CFLAGS) $(NATIVE) $(CPPFLAGS) $(INC) -o $@ $(VFWD_SRC) -lm -pthread
 
 traj_analyze: $(CAL)/traj_analyze
-$(CAL)/traj_analyze: $(CAL)/traj_analyze.c $(CAL)/npy.c $(AMP)/linalg_small.c
-	$(CC) $(BARE) $(NATIVE) -I$(CAL) -I$(AMP) -o $@ $^ -lm -lpthread
+# 源列表显式化: 原配方用 $^ 当源, 加 *.inc.c 依赖后 $^ 会把分片当独立 TU 编译, 必须分开。
+TRAJ_SRC := $(CAL)/traj_analyze.c $(CAL)/npy.c $(AMP)/linalg_small.c
+$(CAL)/traj_analyze: $(TRAJ_SRC) $(TRAJ_INC)
+	$(CC) $(BARE) $(NATIVE) -I$(CAL) -I$(AMP) -o $@ $(TRAJ_SRC) -lm -lpthread
 
 cap_raw2npy: cap_raw2npy.bin
 .PHONY: cap_raw2npy.bin
