@@ -19,7 +19,7 @@ IDS="$D2/vqhalf_a.ids"          # 放大器半(与量化半零重叠, 语料纪�
 ANC="$D2/anchor_a_clean_s8192.bin"
 CAP="$D2/zloss_cap"; NPY="$D2/zloss_npy"; WS="$D2/zloss"
 NTOK=8192; NFIT=6144
-RANKS="16,64"; LAMBDAS="3e-3,3e-2"
+RANKS="16,64"; LAMBDAS="3e-3,3e-2,1e-1,3e-1"
 WA=1; WC=0.5; WSM=0.1; WF=1e-3   # 四损失权(ds4_loss_total; CLI 面板, 换轮改此处)
 LOG(){ echo "[zloss $(date +%H:%M:%S)] $*"; }
 DIE(){ LOG "★$*★"; exit 1; }
