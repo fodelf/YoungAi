@@ -55,6 +55,7 @@ HVSOLVE_INC := $(wildcard $(AMP)/hiddenvar_solve_p*.inc.c)
 RRR_INC := $(wildcard $(AMP)/solve_rrr_p*.inc.c)
 CALIBRUN_INC := $(wildcard $(CAL)/calib_run_p*.inc.c)
 VFWD_INC := $(wildcard $(CAL)/validate_fwd_p*.inc.c)
+DSQFWD_INC := $(wildcard $(AMP)/ds4quant_fwd_p*.inc.c)
 
 ifeq ($(UNAME_S),Darwin)
 NATIVE ?= -mcpu=native
@@ -164,7 +165,7 @@ $(QT)/compare_scores: $(QT)/compare_scores.c
 DSQR_FLAGS := $(BARE) $(NATIVE) -Wall -Wno-unused-parameter -Wno-unused-function -I..
 ifeq ($(UNAME_S),Darwin)
 ds4quant_run: $(AMP)/ds4quant_run
-$(AMP)/ds4quant_run: $(AMP)/ds4quant_run.c $(AMP)/ds4quant_fwd.c $(QZ)/onebit_quant.c \
+$(AMP)/ds4quant_run: $(AMP)/ds4quant_run.c $(AMP)/ds4quant_fwd.c $(DSQFWD_INC) $(QZ)/onebit_quant.c \
                      $(AMP)/ds4quant_qhelp.h $(QZ)/go2b_qc.h $(QZ)/vq_qc.h
 	$(CC) $(DSQR_FLAGS) -o $@ $(AMP)/ds4quant_run.c $(BLAS_LIBS) -lm -lpthread
 else
