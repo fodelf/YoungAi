@@ -54,6 +54,7 @@ CALIBDIAG_INC := $(wildcard $(CAL)/calib_diag_p*.inc.c)
 HVSOLVE_INC := $(wildcard $(AMP)/hiddenvar_solve_p*.inc.c)
 RRR_INC := $(wildcard $(AMP)/solve_rrr_p*.inc.c)
 CALIBRUN_INC := $(wildcard $(CAL)/calib_run_p*.inc.c)
+VFWD_INC := $(wildcard $(CAL)/validate_fwd_p*.inc.c)
 
 ifeq ($(UNAME_S),Darwin)
 NATIVE ?= -mcpu=native
@@ -325,7 +326,7 @@ calib_diag.bin: $(CALIB_DIAG_SRC) $(CALIBDIAG_INC) $(HVSOLVE_INC)
 validate_fwd: $(CAL)/validate_fwd
 VFWD_SRC := $(CAL)/validate_fwd.c $(CAL)/npy.c $(CAL)/hf_read.c $(CAL)/layer_probe.c \
     $(QZ)/onebit_quant.c $(SLV)/solve_denoise.c $(SLV)/solve_genrf.c $(AMP)/linalg_small.c
-$(CAL)/validate_fwd: $(VFWD_SRC)
+$(CAL)/validate_fwd: $(VFWD_SRC) $(VFWD_INC)
 	$(CC) $(CFLAGS) $(NATIVE) $(CPPFLAGS) $(INC) -o $@ $(VFWD_SRC) -lm -pthread
 
 traj_analyze: $(CAL)/traj_analyze
