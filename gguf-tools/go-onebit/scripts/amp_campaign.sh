@@ -210,6 +210,169 @@ judge_one(){   # $1=标签 $2=zchain(可空) $3=dump
     # 由用户给题, 单独跑, 不写死在判决里。
 }
 
+# 链态稀释判决: 同一放大器, 只 arm 一层 vs 全 43 层 arm, 看端到端增益是不是线性叠加。
+# 单层 held-out 挽回 28%(引擎实测), 全层端到端却 0.x% —— 若"只 arm L32"端到端也几乎为 0,
+# 则根因是【单层 routed_out 改进被下游稀释】; 若只 arm L32 明显 > 全 43 层的 1/43,
+# 则根因是【链态失配: 逐层独立拟合的 x 在全 arm 后全变了】。二者解法完全不同。
+stage_dilute(){
+    watchdog_start
+    judge_one 裸基座        ""                    /tmp/${NAME}_dil_bare.bin
+    judge_one 只armL32      /tmp/zc_phi32.bin     /tmp/${NAME}_dil_l32.bin
+    judge_one 全43层arm     "$D/zchain_v2.bin"    /tmp/${NAME}_dil_all.bin
+    watchdog_stop
+}
+
+# ★VQ86 战役(2026-08-23 用户裁决): 一半语料量化, 一半语料放大器。
+# 切法 = 按 1024-token 块【交错】分半, 不是前后对切 —— 前后切会让两半的领域组成不同
+# (语料是按主题拼接的), 交错切则两半的全场景组成/代码占比几乎逐块相同, 且零重叠。
+# 产出: vqhalf_q.ids(量化半) / vqhalf_a.ids(放大器半)。
+stage_idshalf(){
+    local D2="$ROOT/gguf/go-onebit/vqhalf"; mkdir -p "$D2"
+    local QI="$D2/vqhalf_q.ids" AI="$D2/vqhalf_a.ids"
+    [ -s "$QI" ] && [ -s "$AI" ] && { LOG "①ids 两半已在, 跳过"; return 0; }
+    LOG "①语料交错切半 → 两半各 S=8192(对称; 每专家 192 校准行, base86p 的 2906 只有 68)"
+    python3 - "$CORPUS" "$QI" "$AI" 8192 8192 64 "$DS4_HF" <<'PY' || DIE "切半失败"
+import re, sys
+from tokenizers import Tokenizer
+src, oq, oa, NQ, NA, CH, hf = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5]), int(sys.argv[6]), sys.argv[7]
+tok = Tokenizer.from_file(f"{hf}/tokenizer.json")
+text = open(src, encoding="utf-8").read()
+enc = tok.encode(text, add_special_tokens=False)
+allids, offs = enc.ids, enc.offsets
+
+# 代码区 = ``` 围栏之间(在【原文】上定界, 切半后不再重算 —— 交错切会把围栏拆散,
+# 在半文本上数 ``` 必然错配, 这正是先前算出"两半都 40% 代码"的原因)。
+fences = [m.start() for m in re.finditer("```", text)]
+spans = [(fences[i], fences[i+1]) for i in range(0, len(fences)-1, 2)]
+def in_code(pos):
+    for a, b in spans:
+        if a <= pos < b: return True
+        if pos < a: return False
+    return False
+mark = [in_code(o[0]) for o in offs]          # 每 token 是否落在代码围栏内
+print("  全语料 %d token, 代码 token 占比 %.1f%% (围栏 %d 段)" % (
+    len(allids), 100.0*sum(mark)/len(mark), len(spans)))
+
+B = 256   # 块越细, 交错后两半的主题组成越接近
+idx = list(range(len(allids)))
+blocks = [idx[i:i+B] for i in range(0, len(idx), B)]
+halfQ = [t for i, b in enumerate(blocks) if i % 2 == 0 for t in b]
+halfA = [t for i, b in enumerate(blocks) if i % 2 == 1 for t in b]
+def code_pct(sel): return 100.0*sum(mark[t] for t in sel)/max(len(sel), 1)
+pq, pa = code_pct(halfQ), code_pct(halfA)
+print("  交错切半(块=%d, 零重叠): 量化半 %d token 代码 %.1f%% | 放大器半 %d token 代码 %.1f%% (差 %.2fpp)" % (
+    B, len(halfQ), pq, len(halfA), pa, abs(pq-pa)))
+if abs(pq - pa) > 2.0: sys.exit("★两半池子组成失衡 —— 切法不合格★")
+
+def sample_win(pool, N, CH, path):
+    w = N // CH; step = (len(pool) - w - N % CH) // (CH - 1)
+    sel = []
+    for c in range(CH):
+        ww = w + (N % CH if c == CH - 1 else 0)
+        sel += pool[c*step : c*step+ww]
+    sel = sel[:N]
+    assert len(sel) == N, (len(sel), N)
+    open(path, "w").write("\n".join(str(allids[t]) for t in sel) + "\n")
+    print("  %-16s %6d token  代码 %.1f%%" % (path.split("/")[-1], N, code_pct(sel)))
+    return code_pct(sel)
+cq = sample_win(halfQ, NQ, CH, oq)
+ca = sample_win(halfA, NA, CH, oa)
+if abs(cq - ca) > 6.0:
+    print("  注: 两半抽样代码占比差 %.1fpp (64 窗仅覆盖池子 4%%, 抽样方差); 判据以池子为准。" % abs(cq-ca))
+PY
+}
+
+# ★VQ86 半语料量化(2026-08-23): 与 base86p 单变量对照 —— 配方(平权 vq4x512 = 2.25bpw × 43 层)
+# 完全不动, 只换两样: ① 语料 wt2train_cal9 → 开源全场景 v5 的【量化半】; ② 校准规模
+# S 2906 → 8192(每专家 192 校准行 vs 68, DS4_CALIB_CAP 帽是 512, 原来欠采样 7.5 倍)。
+# 放大器只许看【放大器半】, 与量化半零重叠 —— 这是本战役的核心实验纪律。
+stage_vqquant(){
+    local D2="$ROOT/gguf/go-onebit/vqhalf"
+    [ -s "$D2/vqhalf_q.ids" ] || DIE "量化半 ids 缺, 先跑 idshalf"
+    LOG "②VQ86 量化发车: 平权 vq4x512 2.25bpw × 43 层, 语料=量化半 S=8192"
+    Q86_IDS="$D2/vqhalf_q.ids" Q86_S=8192 Q86_NFIT=8192 \
+    Q86_ANCHOR="$D2/anchor_vqhalf_q_s8192.bin" Q86_OUT="$D2/vq86h" \
+    RPLAN86="$ROOT/gguf/go-onebit/r30/rplan_base86p.txt" \
+        bash "$SC/base86p_spark.sh" quant
+}
+
+# VQ86 合并 + 裸判: 复用参数化的 merge_base86p.sh(幂等), 判决=wt2 五指标, 对表 base86p 4.1222。
+stage_vqmerge(){
+    local D2="$ROOT/gguf/go-onebit/vqhalf"
+    local N=$(ls "$D2/vq86h/layers"/dql_vq_L*.bin 2>/dev/null | wc -l)
+    [ "$N" = 43 ] || DIE "vq86h 层不齐($N/43), 量化未收官"
+    M86_LAYERS="$D2/vq86h/layers" M86_MDL="$ROOT/gguf/ds4-vq86h.gguf" \
+    M86_SKEL="$ROOT/gguf/go-onebit/r30/r30_skeleton.gguf" M86_ZCH= \
+        bash "$SC/merge_base86p.sh" || DIE "合并失败"
+    watchdog_start
+    cd "$ROOT"; LOG "③vq86h 裸判 wt2 (对表 base86p 4.1222 / allq2 12.1494)"
+    timeout --foreground 3000 ./ds4 --cuda -m "$ROOT/gguf/ds4-vq86h.gguf" \
+        --score-ids "$G7/wt2.ids" --score-out /tmp/vq86h_wt2.bin </dev/null 2>&1 | tail -1
+    python3 "$SC/anchor_metrics.py" --ref "$R30/anchor_wt2_s2653.bin" --ids "$G7/wt2.ids" \
+        --student /tmp/vq86h_wt2.bin --tail 3 2>&1 | head -12
+    watchdog_stop
+}
+
+# VQ86 放大器取料: 学生=vq86h(合并后整模型), 语料=【放大器半】vqhalf_a.ids(8192, 与量化半零重叠)。
+# 取料走解码路(--score-ids+--cap-dir)=部署同路+确定(铁律); 批量路(--eval-ids)只出 hdump 杠杆诊断。
+# 捕获即验: 同命令两次, L0/L16/L32 三档逐位比对(浅=哈希层不算数, 必须含中深)。
+stage_vqcap(){
+    local D2="$ROOT/gguf/go-onebit/vqhalf" M="$ROOT/gguf/ds4-vq86h.gguf"
+    [ -s "$M" ] || DIE "vq86h.gguf 缺, 先跑 vqmerge"
+    [ -s "$D2/vqhalf_a.ids" ] || DIE "放大器半 ids 缺"
+    cd "$ROOT"; watchdog_start
+    if [ ! -s "$D2/cap_a/raw_ffn_in_L0" ]; then
+        LOG "④取料#1 解码路 on vq86h × 放大器半"
+        rm -rf "$D2/cap_a" "$D2/cap_a2"; mkdir -p "$D2/cap_a" "$D2/cap_a2"
+        timeout --foreground 7200 ./ds4 --cuda -m "$M" --score-ids "$D2/vqhalf_a.ids" \
+            --score-out /tmp/vq86h_capa.bin --cap-dir "$D2/cap_a" </dev/null 2>&1 | tail -1
+        LOG "④取料#2 复现检查遍"
+        timeout --foreground 7200 ./ds4 --cuda -m "$M" --score-ids "$D2/vqhalf_a.ids" \
+            --score-out /tmp/vq86h_capa2.bin --cap-dir "$D2/cap_a2" </dev/null 2>&1 | tail -1
+        for L in 0 16 32; do
+            cmp "$D2/cap_a/raw_ffn_in_L$L" "$D2/cap_a2/raw_ffn_in_L$L" || DIE "L$L 捕获不复现"
+            cmp "$D2/cap_a/raw_route_L$L"  "$D2/cap_a2/raw_route_L$L"  || DIE "L$L 路由不复现"
+        done
+        LOG "④复现 ✓ (L0/16/32 ffn_in+route 逐位一致), 清检查遍"
+        rm -rf "$D2/cap_a2"
+    else LOG "④取料 已在, 跳过"; fi
+    if [ ! -s "$D2/hdump_a/h_L00.bin" ]; then
+        LOG "④hdump 杠杆诊断遍(批量路)"
+        mkdir -p "$D2/hdump_a"
+        timeout --foreground 7200 ./ds4 --cuda -m "$M" --eval-ids "$D2/vqhalf_a.ids" \
+            --eval-hdump "$D2/hdump_a" </dev/null 2>&1 | tail -1
+    fi
+    LOG "④npy 转换 + 教师(C)"
+    mkdir -p "$D2/capnpy_a"
+    "$ROOT/gguf-tools/cap_raw2npy" --raw "$D2/cap_a" --out "$D2/capnpy_a" --ntok 8192 || DIE "npy 转换失败"
+    "$ROOT/gguf-tools/teacher_routed" --hf "$DS4_HF" --cap "$D2/capnpy_a" \
+        --layers 0-42 --ntok 8192 --threads 20 --swlim 60 || DIE "教师失败"
+    watchdog_stop
+    LOG "④收官: cap $(du -sh "$D2/cap_a" | cut -f1) capnpy $(du -sh "$D2/capnpy_a" | cut -f1)"
+}
+
+# VQ86 放大器解算(C, amp_solve.c) + 合链 + 端到端判决。
+# 解算=铁律 C 实现(乘性动态z, 随机基, 四损失行为空间目标); 合并器只做字节编排(许可的 Python)。
+stage_vqsolve(){
+    local D2="$ROOT/gguf/go-onebit/vqhalf"
+    [ -s "$D2/capnpy_a/routed_L42.npy" ] || DIE "教师 npy 缺, 先跑 vqcap"
+    mkdir -p "$D2/amp_c"
+    LOG "⑤C 解算 43 层(乘性动态z, ~1.2h)"
+    "$ROOT/gguf-tools/amp_solve" --cap "$D2/capnpy_a" --out "$D2/amp_c" \
+        --layers 0-42 --threads 20 || DIE "解算失败"
+    python3 "$ROOT/gguf-tools/go-onebit/zlever/zrec_to_zchain.py" \
+        "$D2/amp_c" "$D2/zchain_vq86h.bin" 43 || DIE "合链失败"
+    watchdog_start
+    cd "$ROOT"; LOG "⑥判决 wt2: vq86h裸 vs vq86h+放大器"
+    timeout --foreground 3000 ./ds4 --cuda -m "$ROOT/gguf/ds4-vq86h.gguf" \
+        --zchain "$D2/zchain_vq86h.bin" \
+        --score-ids "$G7/wt2.ids" --score-out /tmp/vq86h_amp_wt2.bin </dev/null 2>&1 | tail -1
+    echo "══ wt2 五指标 vq86h+放大器 (对表: 裸 vq86h / base86p 4.1222) ══"
+    python3 "$SC/anchor_metrics.py" --ref "$R30/anchor_wt2_s2653.bin" --ids "$G7/wt2.ids" \
+        --student /tmp/vq86h_amp_wt2.bin --tail 3 2>&1 | head -12
+    watchdog_stop
+}
+
 stage_judge(){
     watchdog_start
     judge_one 裸 "" /tmp/${NAME}_wt2_base.bin
@@ -221,9 +384,9 @@ ST="${1:-all}"
 case "$ST" in
   preflight) stage_preflight;; ids) stage_ids;; anchor) stage_anchor;;
   capture) stage_capture;; probe) stage_probe;; solve) stage_solve;; pass2) stage_pass2;;
-  chain) stage_chain;; judge) stage_judge;;
+  chain) stage_chain;; judge) stage_judge;; dilute) stage_dilute;; idshalf) stage_idshalf;; vqquant) stage_vqquant;; vqmerge) stage_vqmerge;; vqcap) stage_vqcap;; vqsolve) stage_vqsolve;;
   all) stage_preflight; stage_ids; stage_anchor; stage_capture
        stage_solve; stage_chain; stage_judge;;
-  *) echo "未知段: $ST"; echo "段: preflight ids anchor capture solve pass2 chain judge all (probe=可选诊断)"; exit 2;;
+  *) echo "未知段: $ST"; echo "段: preflight ids anchor capture solve pass2 chain judge dilute all (probe/dilute=诊断)"; exit 2;;
 esac
 LOG "段 $ST 完成"

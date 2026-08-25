@@ -23913,3 +23913,20 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
 
     return 1;
 }
+
+/* type10 zl.HXP 层出口放大器: Metal 侧未实现 —— 有载荷时响亮拒绝(禁静默降级)。 */
+int ds4_gpu_zchain_hxp_set(const uint16_t *m, const uint32_t *off, const uint32_t *k,
+                           const uint32_t *hd, uint32_t n_layer, uint64_t total_halves) {
+    (void)m; (void)off; (void)hd;
+    for (uint32_t l = 0; k && l < n_layer; l++)
+        if (k[l]) {
+            fprintf(stderr, "ds4: zchain HXP(type10) Metal 未实现 -- aborting (no silent quality downgrade)\n");
+            exit(1);
+        }
+    (void)total_halves;
+    return 1;
+}
+int ds4_gpu_zchain_hxp_apply(void *hc, const void *x, uint32_t layer, uint32_t n_tokens) {
+    (void)hc; (void)x; (void)layer; (void)n_tokens;
+    return 1;
+}

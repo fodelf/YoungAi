@@ -13,6 +13,8 @@
 #include <string.h>
 #include <math.h>
 #include <stdint.h>
+#include <pthread.h>
+#include <unistd.h>
 
 /* Apple Accelerate (AMX) sgemm: 大 matmul 走 BLAS, 标量路径留作参考/非苹果平台.
  * 累加同为 fp32, 与标量只差求和顺序(~1e-6 rel); anchor/quant 两遍同 kernel, 对比自洽. */
@@ -102,6 +104,16 @@ void dq_apply_rope(float *xp, const float *cosr, const float *sinr, int rd, int 
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #endif
+#ifdef DS4QUANT_CUDA
+typedef struct { float *p; size_t n; } dq_dbuf;
+static int dq_dbuf_need(dq_dbuf *b, size_t n) {
+    if (b->n >= n) return 1;
+    if (b->p) cudaFree(b->p);
+    b->p = NULL; b->n = 0;
+    if (cudaMalloc((void **)&b->p, n * sizeof(float)) != cudaSuccess) { b->p = NULL; return 0; }
+    b->n = n; return 1;
+}
+#endif
 /* strided 版(08-18 attention GPU 化): C[S,M]=A[S,K](lda)·B[M,K](ldb)^T, 行主序任意行距 */
 void dq_matmul_strided(const float *A, int lda, const float *B, int ldb,
                        float *Cst, int ldc, int S, int K, int M, float alpha) {
@@ -183,11 +195,22 @@ void dq_matmul(const float *X, const float *W, float *out, int S, int K, int M) 
             if (cublasCreate(&g_dqh) != CUBLAS_STATUS_SUCCESS) g_dqh = NULL;
             else { cudaStreamCreateWithFlags(&g_dqs, cudaStreamNonBlocking); cublasSetStream(g_dqh, g_dqs); }
         }
-        if (g_dqh) {
+        /* ★连续操作数走显存暂存(2026-08-22)★
+         * 专家 GEMM 每次换一块 33.5MB 的新反量化权重: 留在主机靠 ATS 直访 = 页粒度搬运,
+         * 实测等效 3.2 GB/s, 每层 25.7GB ⇒ ~8s。这里 X/W/out 全是连续的(无行距),
+         * 一次 cudaMemcpy 批量搬即可, 不会退化成跨步 DMA(那是 attention 那条路的坑,
+         * 它已改走 vqg_attention 整层驻留)。暂存 per-thread 复用, 按需增长。 */
+        static __thread dq_dbuf dX = {0, 0}, dW = {0, 0}, dO = {0, 0};
+        if (g_dqh && dq_dbuf_need(&dX, (size_t)S * K) && dq_dbuf_need(&dW, (size_t)M * K)
+                  && dq_dbuf_need(&dO, (size_t)S * M)) {
             const float one = 1.0f, zero = 0.0f;
+            const size_t f = sizeof(float);
             /* RowMajor C[S,M]=X·W^T ⇔ ColMajor C'[M,S]=W'^T·X' */
-            if (cublasSgemm(g_dqh, CUBLAS_OP_T, CUBLAS_OP_N, M, S, K,
-                            &one, W, K, X, K, &zero, out, M) == CUBLAS_STATUS_SUCCESS &&
+            if (cudaMemcpyAsync(dX.p, X, (size_t)S*K*f, cudaMemcpyHostToDevice, g_dqs) == cudaSuccess &&
+                cudaMemcpyAsync(dW.p, W, (size_t)M*K*f, cudaMemcpyHostToDevice, g_dqs) == cudaSuccess &&
+                cublasSgemm(g_dqh, CUBLAS_OP_T, CUBLAS_OP_N, M, S, K,
+                            &one, dW.p, K, dX.p, K, &zero, dO.p, M) == CUBLAS_STATUS_SUCCESS &&
+                cudaMemcpyAsync(out, dO.p, (size_t)S*M*f, cudaMemcpyDeviceToHost, g_dqs) == cudaSuccess &&
                 cudaStreamSynchronize(g_dqs) == cudaSuccess)
                 return;
         }
@@ -436,6 +459,46 @@ int dq_compressor(const float *x, const float *cwkv, const float *cwgate, const 
  * kv=rms(x@wkv.T,kvnorm) rope last RD; kv_all=[kv;kvc][N,HD];
  * scores[S,NH,N]=q·kv_all*HD^-0.5; mask(sliding win + comp); softmax w/ sink;
  * o[S,NH,HD]=w·kv_all; rope inv last RD; o reshape[S,OG,NH*HD/OG]; o=einsum wo_a; @wo_b.T. */
+/* mask+softmax 行并行: 各行独立, 逐位与串行版同式(每行内部顺序不变)。
+ * 线程数取 DS4_THREADS(与专家循环同一预算), 只读一次。 */
+double g_t_attn = 0;
+typedef struct { float *SC; float sinkh; int S, N, WIN, ratio, s0, s1; } dq_smw;
+static void *dq_sm_worker(void *arg) {
+    dq_smw *w = (dq_smw *)arg;
+    const int N = w->N, S = w->S, WIN = w->WIN, ratio = w->ratio;
+    for (int s = w->s0; s < w->s1; s++) {
+        float *scr = w->SC + (size_t)s * N;
+        for (int n = 0; n < N; n++) {
+            int ok;
+            if (n < S) ok = (n <= s) && (n > s - WIN);        /* sliding window causal */
+            else       ok = ((n - S) < (s + 1) / ratio);       /* comp_ok */
+            if (!ok) scr[n] = -INFINITY;
+        }
+        float m = -INFINITY; for (int n = 0; n < N; n++) if (scr[n] > m) m = scr[n];
+        double denom = exp((double)w->sinkh - m);
+        for (int n = 0; n < N; n++) { if (scr[n] == -INFINITY) { scr[n] = 0; continue; }
+                                      scr[n] = expf(scr[n] - m); denom += scr[n]; }
+        float inv = (float)(1.0 / denom);
+        for (int n = 0; n < N; n++) scr[n] *= inv;
+    }
+    return NULL;
+}
+static void dq_softmax_rows_par(float *SC, float sinkh, int S, int N, int WIN, int ratio) {
+    static int NT = 0;   /* 线程数 = 在线核数, 不读 env(2026-08-22 铁律) */
+    if (!NT) { long nc = sysconf(_SC_NPROCESSORS_ONLN); NT = (int)(nc < 1 ? 1 : (nc > 64 ? 64 : nc)); }
+    if (NT == 1 || S < 64) { dq_smw w = {SC, sinkh, S, N, WIN, ratio, 0, S}; dq_sm_worker(&w); return; }
+    pthread_t th[64]; dq_smw ws[64];
+    int per = (S + NT - 1) / NT, nt = 0;
+    for (int t = 0; t < NT; t++) {
+        int a = t * per, b = a + per > S ? S : a + per;
+        if (a >= b) break;
+        ws[nt] = (dq_smw){SC, sinkh, S, N, WIN, ratio, a, b};
+        if (pthread_create(&th[nt], NULL, dq_sm_worker, &ws[nt]) != 0) { dq_sm_worker(&ws[nt]); }
+        else nt++;
+    }
+    for (int t = 0; t < nt; t++) pthread_join(th[t], NULL);
+}
+
 void dq_attention(const float *x, const float *wqa, const float *qnorm, const float *wqb,
                   const float *wkv, const float *kvnorm, const float *sink,
                   const float *wo_a, const float *wo_b, const float *kvc,
@@ -471,26 +534,29 @@ void dq_attention(const float *x, const float *wqa, const float *qnorm, const fl
     float *o = (float*)malloc((size_t)S*NH*HD*sizeof(float));
 #ifdef DQ_BLAS
     /* per-head 两个 gemm: SC_h=Q_h·kva^T, O_h=P_h·kva. mask/softmax/sink 逻辑与标量路径逐字一致. */
+#ifdef DS4QUANT_CUDA
+    /* ★attention 整层驻留 GPU★ 成功则 o 已填好, 直接跳到 inverse rope。
+     * 失败(显存不够/cuBLAS 出错)静默回落下方逐头路径, 数值语义相同。 */
+    extern int vqg_attention(const float *q, const float *kva, const float *sink, float *o,
+                             int S, int N, int NH, int HD, int WIN, int ratio, float scale);
+    int _gpu_ok = vqg_attention(q, kva, sink, o, S, N, NH, HD, WIN, ratio, scale);
+    if (!_gpu_ok) {
+#endif
     float *SC = (float*)malloc((size_t)S*N*sizeof(float));
     for (int h=0;h<NH;h++) {
         dq_matmul_strided(q + (size_t)h*HD, NH*HD, kva, HD, SC, N, S, HD, N, scale);
-        for (int s=0;s<S;s++) {
-            float *scr = SC + (size_t)s*N;
-            for (int n=0;n<N;n++) {
-                int ok;
-                if (n<S) ok = (n<=s) && (n> s-WIN);              /* sliding window causal */
-                else     ok = ((n-S) < (s+1)/ratio);              /* comp_ok */
-                if (!ok) scr[n]=-INFINITY;
-            }
-            float m=-INFINITY; for(int n=0;n<N;n++) if(scr[n]>m) m=scr[n];
-            double denom=exp((double)sink[h]-m);
-            for(int n=0;n<N;n++){ if(scr[n]==-INFINITY){scr[n]=0;continue;} scr[n]=expf(scr[n]-m); denom+=scr[n]; }
-            float inv=(float)(1.0/denom);
-            for(int n=0;n<N;n++) scr[n]*=inv;
-        }
+        /* ★mask+softmax 按 s 切片并行(2026-08-22)★
+         * 原来这段是整个 dq_attention 里唯一的 O(S·N·NH) 标量循环, 且完全单线程:
+         * S=8192 时 = 8192×8192×64 ≈ 43 亿次迭代 + expf, 实测 ~60s/层, 而磁盘/GPU/其余
+         * 19 个核全在等它(1/20 核跑满是实锤)。S=256 时只有 420 万次, 所以小尺寸看不出来。
+         * 各 s 行之间完全独立(scr 是 SC 的行切片), 按行切给线程, 零额外内存、数值逐位不变。 */
+        dq_softmax_rows_par(SC, sink[h], S, N, WIN, ratio);
         dq_matmul_nt_strided(SC, N, kva, HD, o + (size_t)h*HD, NH*HD, S, N, HD);
     }
     free(SC);
+#ifdef DS4QUANT_CUDA
+    }
+#endif
     for (int s=0;s<S;s++) for (int h=0;h<NH;h++)
         dq_apply_rope(o+((size_t)s*NH+h)*HD+(HD-RD), cos_t+(size_t)s*(RD/2), sin_t+(size_t)s*(RD/2), RD, 1);  /* inverse */
 #else

@@ -1652,6 +1652,17 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.corr_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--residual")) {
             c.engine.residual_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--cap-dir")) {
+            /* 取料入口(2026-08-22 由 DS4_CAP_DIR 迁来): 逐层捕获 x̂/路由/routed 输出 */
+            ds4_tool_set_cap_dir(need_arg(&i, argc, argv, arg));
+        } else if (!strcmp(arg, "--eval-ids")) {
+            ds4_tool_set_eval_ids(need_arg(&i, argc, argv, arg));
+        } else if (!strcmp(arg, "--eval-hdump")) {
+            ds4_tool_set_eval_hdump(need_arg(&i, argc, argv, arg));
+        } else if (!strcmp(arg, "--eval-logits")) {
+            ds4_tool_set_eval_logits(need_arg(&i, argc, argv, arg));
+        } else if (!strcmp(arg, "--eval-no-bos")) {
+            ds4_tool_set_eval_no_bos(1);
         } else if (!strcmp(arg, "--zchain")) {
             c.engine.zchain_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {

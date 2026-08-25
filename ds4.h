@@ -436,4 +436,19 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
 uint64_t ds4_runtime_phys_footprint_bytes(void);
 uint64_t ds4_runtime_mem_budget_bytes(void);
 
+
+/* ---- 取料入口(2026-08-22: 从 env 迁到 CLI) --------------------------------
+ * 捕获/评估的入口过去是 DS4_CAP_DIR / DS4_EVAL_IDS / DS4_EVAL_HDUMP /
+ * DS4_EVAL_LOGITS 四个环境变量。env 让"这次跑到底做了什么"不可见, 且漏设即静默换行为
+ * (本项目已因此废掉一整轮反修)。改成命令行参数: 发车命令里一眼可见, 进程内全局存取。 */
+void        ds4_tool_set_cap_dir(const char *p);
+const char *ds4_tool_cap_dir(void);
+void        ds4_tool_set_eval_ids(const char *p);
+const char *ds4_tool_eval_ids(void);
+void        ds4_tool_set_eval_hdump(const char *p);
+const char *ds4_tool_eval_hdump(void);
+void        ds4_tool_set_eval_logits(const char *p);
+void        ds4_tool_set_eval_no_bos(int v);
+const char *ds4_tool_eval_logits(void);
+
 #endif

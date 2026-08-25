@@ -44,13 +44,22 @@ else:
     np.add.at(yq, prow, pw[:, None] * pYQ)
 yfp = yq + dH
 tr, ev = np.arange(0, NFIT), np.arange(NFIT, S)
+# ★φ 特征提升(2026-08-22 恢复)★ 引擎解析支持 din == 3*d_model 的 ftA 抬升,
+# 语义 φ(x)=[x, x⊙x/rms, relu(x)](与引擎 ds4_zchain_zl_apply 里的 din==3d 分支逐式一致)。
+# 早先被我从 amp86 抄来的 env 串(DS4_ZL_FTA=0)关掉了。实测 L32: 线性 x 挽回 23.59% →
+# φ 提升 28.18%(+19% 相对)。V/A 的输入维随之变 3D, 载荷 A|U|V 三块按 din=3D 存。
+def _phi(M):
+    n = np.sqrt((M * M).mean(1, keepdims=True)) + 1e-6
+    return np.concatenate([M, (M * M) / n, np.maximum(M, 0)], 1)
+X0 = _phi(X0.astype(np.float32))
 X = X0.astype(np.float64)
+DIN = X.shape[1]        # 输入维: φ 提升后 = 3*D; 输出维恒为 D
 eps = np.sqrt((yq[tr] ** 2).mean(0)) * 1e-2 + 1e-12
 R = (dH * yq / (yq ** 2 + eps[None, :] ** 2)).astype(np.float64)
 colw = np.sqrt(R[tr].var(0) + 1e-12) * np.sqrt((yq[tr] ** 2).mean(0) + 1e-12)
 rms = np.sqrt((X[tr] ** 2).mean(1, keepdims=True))
 r2 = np.random.RandomState(1)
-Xa = np.vstack([X[tr], X[tr] + r2.randn(len(tr), D) * 0.04 * rms])
+Xa = np.vstack([X[tr], X[tr] + r2.randn(len(tr), DIN) * 0.04 * rms])
 Ra = np.vstack([R[tr] * colw, R[tr] * colw])
 e0 = float(((yfp[ev] - yq[ev]).astype(np.float64) ** 2).sum())
 
@@ -71,7 +80,7 @@ _N = (lambda a: _cp.asnumpy(a)) if _GPU else (lambda a: np.asarray(a))
 Xa_ = _A(Xa); Ra_ = _A(Ra); Xev_ = _A(X[ev]); colw_ = _A(colw)
 yq_ev = _A(yq[ev]); yfp_ev = _A(yfp[ev])
 _, _, Vt = xp.linalg.svd(Xa_ - Xa_.mean(0), full_matrices=False)
-CANDS = {"PCA": Vt[:KMAX].T, "rand": _A(np.random.RandomState(7).randn(D, KMAX) / np.sqrt(D))}
+CANDS = {"PCA": Vt[:KMAX].T, "rand": _A(np.random.RandomState(7).randn(DIN, KMAX) / np.sqrt(DIN))}
 scale = float(xp.sqrt((Xa_ ** 2).mean()))
 
 # ★动态 z(方案B, 2026-08-22 用户裁决)★
@@ -83,7 +92,7 @@ scale = float(xp.sqrt((Xa_ ** 2).mean()))
 # 由 held 网格自选。体积: 每层多一块 D×k fp16(+50%), 用户已明示接受。
 # 动态 z 是定案(方案 B), 不留开关: 留开关等于还有一条未被裁决的路活着。
 GATES = {"pca2": Vt[KMAX:2 * KMAX].T,
-         "rnd2": _A(np.random.RandomState(11).randn(D, KMAX) / np.sqrt(D))}
+         "rnd2": _A(np.random.RandomState(11).randn(DIN, KMAX) / np.sqrt(DIN))}
 
 best = (0.0, None)   # (held, (V0名, 门名, λ, k, U))
 _diag = xp.arange(KMAX)
@@ -120,9 +129,9 @@ if best[0] <= 0.005 or best[1] is None:
 else:
     nm, gn, lam, k, U = best[1]
     Ueng = np.ascontiguousarray((U / colw[None, :]).T.astype(np.float16))       # D×k(引擎 hU[j*k+c])
-    Veng = np.ascontiguousarray(_N(CANDS[nm][:, :k]).astype(np.float16))        # D×k(引擎 hV[j*k+c])
+    Veng = np.ascontiguousarray(_N(CANDS[nm][:, :k]).astype(np.float16))   # DIN×k        # D×k(引擎 hV[j*k+c])
     Aeng = np.ascontiguousarray(_N(GATES[gn][:, :k]).astype(np.float16))        # D×k 动态 z 的门投影
-    pay = struct.pack('<IfII', k, scale, D, D) + Aeng.tobytes() + Ueng.tobytes() + Veng.tobytes()
+    pay = struct.pack('<IfII', k, scale, X0.shape[1], D) + Aeng.tobytes() + Ueng.tobytes() + Veng.tobytes()
     rec_nm = "zl.AMPD"                                                          # type9: 动态 z 乘性放大器
     open(outp, 'wb').write(hdr(rec_nm, len(pay)) + pay)
     print(f"★L{L} 放大器: held行为挽回 {best[0]*100:.2f}% @V₀={nm} 门={gn} λ={lam} k_L={k} "

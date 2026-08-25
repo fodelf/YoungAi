@@ -49,6 +49,3 @@ PY
 *) echo "用法: $0 [score_iq2|dtypes]"; exit 1 ;;
 esac
 LOG "p2 $ST 收官"
-# ===== 追加段(2026-08-20): perpos — 逐位置 KL 分布, 定位爆炸位置形态 =====
-# 用法: p2_bisect.sh perpos <student.bin> [student2.bin ...]
-# 判读: 头部集中=BOS/协议; 均匀=量化底噪; 尾段集中=长上下文/indexer; mod-128 周期=score 分块缝

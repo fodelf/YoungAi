@@ -142,21 +142,15 @@ if XCAP:
     _XFP=X0                    # 锚 fin, 留作对齐自检的参照
     X0=_capload("raw_ffn_in",D)
     YQE=_capload("raw_ffn_out",D)
-    # ★路由也必须取引擎的(2026-08-22 实锤修复)★
-    # 之前只把输入换成引擎真值, 路由仍用 FP 锚的 —— 于是教师调用的是 FP 选出的专家,
-    # 学生调用的是量化路由选出的专家。实测(L>2)只有 1~7% 的 token 选中同一组, 平均 6 个
-    # 里只重合 3.2 个。这样 dH 的主体是"选了另一半专家", 而不是"专家权重被量化了" ——
-    # 而选错专家是乘性增益在数学上够不着的东西(没法靠缩放一个专家的输出去顶替另一个)。
-    # 这正是层内挽回 14.4% 却端到端只有 0.7%、二次反修反而更差的根因。
-    # (L0-L2 走 token-id 哈希路由不受量化影响, 两边本来就 100% 一致, 可作本修的自检。)
-    _ri=np.fromfile(os.path.join(XCAP,f"raw_route_L{L}"),dtype=np.int16).reshape(-1,NACT)
-    _rw=np.fromfile(os.path.join(XCAP,f"raw_route_w_L{L}"),dtype=np.float16).reshape(-1,NACT)
-    _o=len(_ri)-NTOK
-    assert _o in (0,1), f"L{L} 路由捕获 {len(_ri)} 行, 与 NTOK={NTOK} 不匹配"
-    _same=float(np.mean([len(set(a)&set(b)) for a,b in zip(ridx[:2000],_ri[_o:_o+2000].astype(np.int32))]))
-    ridx=_ri[_o:_o+NTOK].astype(np.int32)
-    rw  =_rw[_o:_o+NTOK].astype(np.float32)
-    print(f"  L{L} 路由改用引擎真值 (与FP锚平均重合 {_same:.2f}/{NACT})",flush=True)
+    # ★教师用 FP 锚的路由(2026-08-22 用户裁决)★
+    # 一度改成"教师也用引擎的量化路由", 理由是"选错专家乘性增益够不着, 该从目标里剔除"。
+    # 那个推理是错的: 够不着 ≠ 该换靶子。教师必须是我们真正要还原的那个模型 ——
+    # FP 模型在这一层就是用它自己的路由 + FP 权重算的。对着真目标做最小二乘, 本来就会
+    # 自动做到它能做的那部分; 换成"专家选择照抄量化模型、只有权重是 FP"的虚构模型,
+    # 等于主动放弃一块本该争取的东西。
+    # (实测: 引擎 bug 修复前后, FP 锚与引擎路由的平均重合都是 ~3.17/6 —— 这是真实的
+    #  量化路由漂移, 观察没错; 错的是据此换靶子。)
+    # 所以 ridx/rw 保持 anchor_layer 读来的 FP 路由, x 与 y_q 仍取引擎真值。
     if PREV:
         import struct as _st
         _b=open(os.path.join(PREV,f"zrec_L{L:02d}.bin"),"rb").read()
@@ -182,8 +176,10 @@ if XCAP:
     def _cosmed(a,b):
         _n=min(len(a),len(b)); a,b=a[:_n],b[:_n]
         return float(np.median((a*b).sum(1)/(np.linalg.norm(a,axis=1)*np.linalg.norm(b,axis=1)+1e-9)))
-    _raw=np.fromfile(os.path.join(XCAP,f"raw_ffn_in_L{L}"),dtype=np.float16).reshape(-1,D).astype(np.float32)
-    _c_ok=_cosmed(_XFP,X0); _c_bad=_cosmed(_XFP,_raw[:NTOK])   # _raw[:NTOK] = 未掐 BOS 的错位版
+    # 错位假设 = 采用对齐再平移一行。这样两种捕获都能判:
+    #   批量捕获(NTOK+1 行, 含流首 BOS) 与 解码捕获(NTOK 行, 不插 BOS) 都适用。
+    #   早先拿 _raw[:NTOK] 当错位版, 在解码捕获上它与正确版是同一个数组, 比值恒为 1 → 误报。
+    _c_ok=_cosmed(_XFP,X0); _c_bad=_cosmed(_XFP[1:],X0[:-1])
     assert _c_ok > _c_bad*1.15, (f"L{L} XCAP 对齐自检失败: 采用对齐 {_c_ok:.4f} 未明显优于错位版 "
                                  f"{_c_bad:.4f} — 口径可疑, 停车")
     print(f"  L{L} XCAP: 对齐 {_c_ok:.4f} vs 错位 {_c_bad:.4f} ({_c_ok/max(_c_bad,1e-6):.1f}×) "
@@ -586,7 +582,7 @@ if ADDON:
         zm=Sm[:km].astype(np.float16)
         Um=(Qq@Bm.T[:,:km]).astype(np.float16)        # (D,km)
         add=rec('bf.GE',ge_m.tobytes())
-        add+=rec('zl.RRR',struct.pack('<IfII',km,1.0e6,DIW,D)+zm.tobytes()
+        add+=rec('zl.RRR',struct.pack('<IfII',km,0.5,DIW,D)+zm.tobytes()
                  +np.ascontiguousarray(Um).tobytes()+np.ascontiguousarray(Vm).tobytes())
         nrec_add=2
         K_report=km
@@ -597,10 +593,10 @@ else:
     if K>0:
         if FORM=="ftA":   # ★din=3D: 引擎/回放按 din 现场构建 φ(x), 载荷布局与线性完全同构
             V16=Af[:,:K].astype(np.float16); z16=Sf[:K].astype(np.float16); U16=np.ascontiguousarray(Bf[:K].T).astype(np.float16)
-            add+=rec('zl.RRR',struct.pack('<IfII',K,1.0e6,3*D,D)+z16.tobytes()+U16.tobytes()+V16.tobytes())
+            add+=rec('zl.RRR',struct.pack('<IfII',K,0.5,3*D,D)+z16.tobytes()+U16.tobytes()+V16.tobytes())
         else:
             V16=A[:,:K].astype(np.float16); z16=S[:K].astype(np.float16); U16=np.ascontiguousarray(Bt[:K].T).astype(np.float16)
-            add+=rec('zl.RRR',struct.pack('<IfII',K,1.0e6,D,D)+z16.tobytes()+U16.tobytes()+V16.tobytes())
+            add+=rec('zl.RRR',struct.pack('<IfII',K,0.5,D,D)+z16.tobytes()+U16.tobytes()+V16.tobytes())
     nrec_add=(1 if USE_GE else 0)+(1 if K>0 else 0)
 status="解算完"
 if INJ==2:   # 外挂模式(2026-08-09 q4): 记录落 zrec 文件(dql 被清道夫清, 部署走外挂 zchain)
