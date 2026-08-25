@@ -195,8 +195,8 @@ ds4_bench.o: ds4_bench.c ds4.h
 ds4_eval.o: ds4_eval.c ds4.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_eval.c
 
-ds4_agent.o: ds4_agent.c ds4.h ds4_distributed.h ds4_kvstore.h ds4_web.h linenoise.h
-	$(CC) $(CFLAGS) -c -o $@ ds4_agent.c
+ds4_agent.o: src/agent/agent_main.c ds4.h ds4_distributed.h ds4_kvstore.h ds4_web.h linenoise.h
+	$(CC) $(CFLAGS) -c -o $@ src/agent/agent_main.c
 
 ds4_web.o: ds4_web.c ds4_web.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_web.c
@@ -231,8 +231,8 @@ ds4_bench_cpu.o: ds4_bench.c ds4.h
 ds4_eval_cpu.o: ds4_eval.c ds4.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_eval.c
 
-ds4_agent_cpu.o: ds4_agent.c ds4.h ds4_distributed.h ds4_kvstore.h ds4_web.h linenoise.h
-	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_agent.c
+ds4_agent_cpu.o: src/agent/agent_main.c ds4.h ds4_distributed.h ds4_kvstore.h ds4_web.h linenoise.h
+	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ src/agent/agent_main.c
 
 ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal.m
