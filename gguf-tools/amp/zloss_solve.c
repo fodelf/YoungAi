@@ -174,7 +174,7 @@ int main(int argc, char **argv) {
     long long vol_z = 0, vol_loss = 0;
     for (int L = l0; L <= l1; L++) {
         float *X = load_rows(cap, "ffn_in", L, ntok);
-        float *Ys = load_rows(cap, "ffn_out", L, ntok);
+        float *Ys = load_rows(cap, "obase_v3", L, ntok);
         float *Yt = load_rows(cap, "routed", L, ntok);
         float *R = xmalloc((size_t)ntok * D * sizeof(float));
         for (size_t i = 0; i < (size_t)ntok * D; i++) R[i] = Yt[i] - Ys[i];
