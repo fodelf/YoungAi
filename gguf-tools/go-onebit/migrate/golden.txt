@@ -15,3 +15,8 @@
   判定: 全部数值逐字符一致(总量/中位/六桶/集中度/top10 罪犯); 唯一残差=表头一行
         CJK 对齐空白(printf 字节宽 vs Python 字符宽, 零数值内容)
   结果: 过闸 ✓ → zlever/kl_forensic.py 删除
+
+[2026-08-25] zlever/trace_ladder.py → calib/trace_ladder.c
+  输入: /tmp/traceH_noz.bin + /tmp/traceH_amp_clean_layers.bin + anchor_wt2 + trace_clean.log (spark)
+  判定: 输出逐字节一致 (diff=0)
+  结果: 过闸 ✓ → zlever/trace_ladder.py 删除
