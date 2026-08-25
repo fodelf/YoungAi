@@ -4,11 +4,6 @@
 /deepseek4-quantize-cpu
 /calib_run
 /calib_diag
-/emit_z
-/emit_residual
-/amp_solve
-/zchain_merge
-/ge_solve
 /teacher_routed
 /cap_raw2npy
 /dump_gguf_meta
@@ -24,16 +19,7 @@ quantize/st_bridge.o
 amp/ds4quant_run
 amp/zlayer
 amp/zlayer_gpu.o
-amp/zrec_to_zchain
 amp/dql_to_zchain
-amp/route_alpha_set
-amp/route_bias_rebake
-amp/hsolve
-amp/hbase
-amp/dilution
-amp/probe/z_tune
-amp/probe/z_explore
-amp/probe/z_explore2
 calib/validate_fwd
 calib/traj_analyze
 calib/vq_blob_truesize
@@ -46,11 +32,6 @@ bench/gates/pubbench_extract_test
 bench/quality-testing/score_official
 bench/quality-testing/compare_scores
 bench/quality-testing/data/
-legacy/amp_solve_zc
-legacy/min_go_check
-legacy/solvers/corr_stats
-legacy/solvers/lut_cov
-legacy/solvers/merge_residual
 
 # 运行时/再生数据(勿入库)
 /reports/

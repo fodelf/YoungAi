@@ -2,8 +2,8 @@
 #
 # 用法速查:
 #   make all          # deepseek4-quantize + anchor_metrics + compare_scores
-#   make amp          # 反修链全家(ds4quant_run/zlayer/amp_solve/合链/emit_z/探针...)
-#   make legacy       # 上一代 zcache 口径工具(amp_solve_zc/emit_residual/...)
+#   make amp          # 反修链(ds4quant_run/zlayer/dql_to_zchain/teacher_routed/zloss_solve)
+#   make legacy       # (2026-08-26 清仓后为空; solvers 源仅作 calib_run 链接件)
 #   make calib        # 校准/前向验证/npy 工具
 #   make bench        # 评测/取证工具(pubbench/kl_forensic/...)
 #   make tools-test   # 9 项纯 C 自测(原 go-onebit-test, 旧名保留一版别名)
@@ -23,7 +23,6 @@ UNAME_S := $(shell uname -s)
 
 QZ  := quantize
 AMP := amp
-PRB := amp/probe
 CAL := calib
 BEN := bench
 LEG := legacy
@@ -37,7 +36,6 @@ BUILD := .build
 #            deepseek4-quantize 的 CPU↔GPU 逐字节对拍就建立在这上(见 build_dsq_gpu_spark 注)。
 #   BARE     build_ctools.sh 移植目标: 无 -std(gnu 默认, fp-contract=fast), 金标(migrate/golden.txt)
 #            是这个口径跑出来的, 换旗标=换数字。
-#   amp_solve_zc 单独 -ffp-contract=off(文件头明令: FMA 合并少一次舍入会真改数)。
 CFLAGS ?= -O3 -Wall -Wextra -std=c11
 CPPFLAGS ?= -D_GNU_SOURCE
 BARE := -O3
@@ -49,14 +47,12 @@ INC := -I$(QZ) -I$(AMP) -I$(CAL) -I$(SLV)
 QUANTS_INC := $(wildcard $(QZ)/quants_p*.inc.c)
 DSQMAIN_INC := $(wildcard $(QZ)/deepseek4-quantize_p*.inc.c)
 PUBBENCH_INC := $(wildcard $(BEN)/pubbench_p*.inc.c)
-EMITZ_INC := $(wildcard $(AMP)/emit_z_p*.inc.c)
 CALIBDIAG_INC := $(wildcard $(CAL)/calib_diag_p*.inc.c)
 HVSOLVE_INC := $(wildcard $(AMP)/hiddenvar_solve_p*.inc.c)
 RRR_INC := $(wildcard $(AMP)/solve_rrr_p*.inc.c)
 CALIBRUN_INC := $(wildcard $(CAL)/calib_run_p*.inc.c)
 VFWD_INC := $(wildcard $(CAL)/validate_fwd_p*.inc.c)
 DSQFWD_INC := $(wildcard $(AMP)/ds4quant_fwd_p*.inc.c)
-AMPSOLVE_INC := $(wildcard $(AMP)/amp_solve_p*.inc.c)
 TRAJ_INC := $(wildcard $(CAL)/traj_analyze_p*.inc.c)
 HFREAD_INC := $(wildcard $(CAL)/hf_read_p*.inc.c)
 VQMERGE_INC := $(wildcard $(QZ)/vq_merge_v4_p*.inc.c)
@@ -120,18 +116,17 @@ endif
 
 # ---------------------------------------------------------------- 目标分组
 .PHONY: all amp legacy calib bench tools-test go-onebit-test quality-score clean everything
-.PHONY: deepseek4-quantize-alias anchor_metrics compare_scores ds4quant_run zlayer amp_solve \
-        zrec_to_zchain dql_to_zchain zchain_merge route_alpha_set route_bias_rebake emit_z \
-        teacher_routed ge_solve hsolve hbase dilution z_tune z_explore z_explore2 \
-        amp_solve_zc emit_residual corr_stats lut_cov merge_residual min_go_check \
+.PHONY: deepseek4-quantize-alias anchor_metrics compare_scores ds4quant_run zlayer \
+        dql_to_zchain teacher_routed \
         calib_run calib_diag validate_fwd traj_analyze cap_raw2npy vq_blob_truesize dump_gguf_meta \
         kl_forensic trace_ladder rec_fidelity pubbench pubbench_extract_test vq_merge_v4 \
         go2b_parity vq2q2k_probe vq_em deepseek4-quantize-cpu
 
 all: deepseek4-quantize anchor_metrics compare_scores
-amp: ds4quant_run zlayer amp_solve zrec_to_zchain dql_to_zchain zchain_merge route_alpha_set \
-     route_bias_rebake emit_z teacher_routed ge_solve hsolve hbase dilution z_tune z_explore z_explore2
-legacy: amp_solve_zc emit_residual corr_stats lut_cov merge_residual min_go_check
+amp: ds4quant_run zlayer dql_to_zchain teacher_routed
+# legacy 二进制已随 2026-08-26 清仓删除(用户令); solvers 源仅作 calib_run 链接件存续。
+legacy:
+	@echo "legacy 目标已清空(2026-08-26 清仓)"
 calib: calib_run calib_diag validate_fwd traj_analyze cap_raw2npy vq_blob_truesize dump_gguf_meta
 bench: kl_forensic trace_ladder rec_fidelity pubbench pubbench_extract_test vq_merge_v4 \
        go2b_parity vq2q2k_probe vq_em
@@ -216,105 +211,14 @@ endif
 endif
 endif
 
-# amp_solve(换代解算器, capnpy 口径)与 zchain_merge/ge_solve: 产物落 gguf-tools 根
-# (vqpipe/vqge/amp_campaign 按 $GT/<name> 找)。
-amp_solve: amp_solve.bin
-.PHONY: amp_solve.bin
-amp_solve.bin: $(AMP)/amp_solve.c $(AMPSOLVE_INC) $(CAL)/npy.c
-	$(CC) $(BARE) $(NATIVE) -I$(CAL) -o amp_solve $(AMP)/amp_solve.c $(CAL)/npy.c -lm -lpthread
-
-zchain_merge: zchain_merge.bin
-.PHONY: zchain_merge.bin
-zchain_merge.bin: $(AMP)/zchain_merge.c
-	$(CC) $(BARE) $(NATIVE) -o zchain_merge $< -lm -lpthread
-
-ge_solve: ge_solve.bin
-.PHONY: ge_solve.bin
-ge_solve.bin: $(AMP)/ge_solve.c $(CAL)/npy.c
-	$(CC) $(BARE) $(NATIVE) -I$(CAL) -I.. -o ge_solve $(AMP)/ge_solve.c $(CAL)/npy.c -lm -lpthread
-
-zrec_to_zchain: $(AMP)/zrec_to_zchain
-$(AMP)/zrec_to_zchain: $(AMP)/zrec_to_zchain.c
-	$(CC) $(BARE) $(NATIVE) -o $@ $< -lm -lpthread
 dql_to_zchain: $(AMP)/dql_to_zchain
 $(AMP)/dql_to_zchain: $(AMP)/dql_to_zchain.c
 	$(CC) $(BARE) $(NATIVE) -o $@ $< -lm -lpthread
-route_alpha_set: $(AMP)/route_alpha_set
-$(AMP)/route_alpha_set: $(AMP)/route_alpha_set.c
-	$(CC) $(BARE) $(NATIVE) -o $@ $< -lm -lpthread
-route_bias_rebake: $(AMP)/route_bias_rebake
-$(AMP)/route_bias_rebake: $(AMP)/route_bias_rebake.c
-	$(CC) $(BARE) $(NATIVE) -o $@ $< -lm -lpthread
-
-emit_z: emit_z.bin
-.PHONY: emit_z.bin
-emit_z.bin: $(AMP)/emit_z.c $(EMITZ_INC)
-	$(CC) -O3 -Wall -std=c99 -o emit_z $<
-
 teacher_routed: teacher_routed.bin
 .PHONY: teacher_routed.bin
 teacher_routed.bin: $(AMP)/teacher_routed.c $(CAL)/npy.c $(CAL)/layer_probe.c
 	$(CC) $(BARE) $(NATIVE) -I$(CAL) -I$(QZ) -o teacher_routed $(AMP)/teacher_routed.c \
 	    $(CAL)/npy.c $(CAL)/layer_probe.c -lm -lpthread
-
-hsolve: $(AMP)/hsolve
-$(AMP)/hsolve: $(AMP)/hsolve.c $(CAL)/npy.c
-	$(CC) $(BARE) $(NATIVE) -I$(CAL) -o $@ $(AMP)/hsolve.c $(CAL)/npy.c -lm -lpthread
-hbase: $(AMP)/hbase
-$(AMP)/hbase: $(AMP)/hbase.c $(CAL)/npy.c
-	$(CC) $(BARE) $(NATIVE) -I$(CAL) -o $@ $(AMP)/hbase.c $(CAL)/npy.c -lm -lpthread
-dilution: $(AMP)/dilution
-$(AMP)/dilution: $(AMP)/dilution.c $(CAL)/npy.c
-	$(CC) $(BARE) $(NATIVE) -I$(CAL) -o $@ $(AMP)/dilution.c $(CAL)/npy.c -lm -lpthread
-
-# z 探针(z_tune/z_explore*): #include 仓库根 ds4_z.c/ds4_loss.c + quant 目录 st_read/fwd。
-z_tune: $(PRB)/z_tune
-$(PRB)/z_tune: $(PRB)/z_tune.c
-	$(CC) $(BARE) $(NATIVE) -I.. -o $@ $< $(BLAS_LIBS) -lm -lpthread
-z_explore: $(PRB)/z_explore
-$(PRB)/z_explore: $(PRB)/z_explore.c
-	$(CC) $(BARE) $(NATIVE) -I.. -o $@ $< $(BLAS_LIBS) -lm -lpthread
-z_explore2: $(PRB)/z_explore2
-$(PRB)/z_explore2: $(PRB)/z_explore2.c
-	$(CC) $(BARE) $(NATIVE) -I.. -o $@ $< $(BLAS_LIBS) -lm -lpthread
-
-# ---------------------------------------------------------------- legacy(上一代口径)
-# amp_solve_zc: -ffp-contract=off 是正确性要求, 不是可选项(FMA 合并少一次舍入会真改数,
-# 见文件头)。产线务必带 BLAS(无 BLAS 慢 15 倍但数值相同)。
-amp_solve_zc: $(LEG)/amp_solve_zc
-ifeq ($(UNAME_S),Darwin)
-$(LEG)/amp_solve_zc: $(LEG)/amp_solve_zc.c
-	$(CC) $(BARE) $(NATIVE) -ffp-contract=off -DDQ_BLAS -DACCELERATE_NEW_LAPACK \
-	    -o $@ $< $(BLAS_LIBS) -lm -lpthread
-else
-ifeq ($(HAVE_BLAS),1)
-$(LEG)/amp_solve_zc: $(LEG)/amp_solve_zc.c
-	$(CC) $(BARE) $(NATIVE) -ffp-contract=off -DDQ_BLAS $(BLAS_CFLAGS) -o $@ $< $(BLAS_LIBS) -lm -lpthread
-else
-$(LEG)/amp_solve_zc: $(LEG)/amp_solve_zc.c
-	$(CC) $(BARE) $(NATIVE) -ffp-contract=off -o $@ $< -lm -lpthread
-endif
-endif
-
-emit_residual: emit_residual.bin
-.PHONY: emit_residual.bin
-# 源列表显式化: 原配方用 $^ 当源, 加 *.inc.c 依赖后 $^ 会把分片当独立 TU 编译, 必须分开。
-EMITRES_SRC := $(SLV)/emit_residual.c $(CAL)/hf_read.c $(QZ)/onebit_quant.c $(CAL)/npy.c
-emit_residual.bin: $(EMITRES_SRC) $(HFREAD_INC)
-	$(CC) $(CFLAGS) $(NATIVE) $(CPPFLAGS) $(INC) -o emit_residual $(EMITRES_SRC) -lm -pthread
-
-corr_stats: $(SLV)/corr_stats
-$(SLV)/corr_stats: $(SLV)/corr_stats.c
-	$(CC) $(BARE) $(NATIVE) $(INC) -o $@ $< -lm -lpthread
-lut_cov: $(SLV)/lut_cov
-$(SLV)/lut_cov: $(SLV)/lut_cov.c
-	$(CC) $(BARE) $(NATIVE) $(INC) -o $@ $< -lm -lpthread
-merge_residual: $(SLV)/merge_residual
-$(SLV)/merge_residual: $(SLV)/merge_residual.c
-	$(CC) $(BARE) $(NATIVE) $(INC) -o $@ $< -lm -lpthread
-min_go_check: $(LEG)/min_go_check
-$(LEG)/min_go_check: $(LEG)/min_go_check.c
-	$(CC) $(BARE) $(NATIVE) $(INC) -o $@ $< -lm -lpthread
 
 # ---------------------------------------------------------------- calib(校准/验证)
 calib_run: calib_run.bin
@@ -428,17 +332,15 @@ quality-score:
 	    $$( $(QUALITY_OBJS_CMD) ) $(QUALITY_LDLIBS)
 
 clean:
-	rm -f deepseek4-quantize deepseek4-quantize-cpu calib_run calib_diag emit_z \
-	    emit_residual amp_solve zchain_merge ge_solve teacher_routed cap_raw2npy dump_gguf_meta vq_em \
+	rm -f deepseek4-quantize deepseek4-quantize-cpu calib_run calib_diag \
+	    teacher_routed cap_raw2npy dump_gguf_meta vq_em \
 	    $(QT)/score_official $(QT)/compare_scores \
 	    $(QZ)/quantize_gpu.o $(QZ)/vq_gpu.o $(QZ)/vq_merge_v4 $(QZ)/go2b_parity $(QZ)/vq2q2k_probe \
 	    $(QZ)/vq_em.o $(QZ)/st_bridge.o \
-	    $(AMP)/ds4quant_run $(AMP)/zlayer $(AMP)/zlayer_gpu.o $(AMP)/zrec_to_zchain \
-	    $(AMP)/dql_to_zchain $(AMP)/route_alpha_set $(AMP)/route_bias_rebake $(AMP)/hsolve \
-	    $(AMP)/hbase $(AMP)/dilution $(PRB)/z_tune $(PRB)/z_explore $(PRB)/z_explore2 \
+	    $(AMP)/ds4quant_run $(AMP)/zlayer $(AMP)/zlayer_gpu.o \
+	    $(AMP)/dql_to_zchain \
 	    $(CAL)/validate_fwd $(CAL)/traj_analyze $(CAL)/vq_blob_truesize \
 	    $(BEN)/anchor_metrics $(BEN)/kl_forensic $(BEN)/trace_ladder $(BEN)/rec_fidelity \
 	    $(BEN)/pubbench $(BEN)/gates/pubbench_extract_test \
-	    $(LEG)/amp_solve_zc $(LEG)/min_go_check \
-	    $(SLV)/corr_stats $(SLV)/lut_cov $(SLV)/merge_residual
+	    ds4quant_fwd_test
 	rm -rf $(BUILD)
