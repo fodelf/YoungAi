@@ -35,6 +35,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "ds4_z.h"   /* z 隐变量模块: 反修解算与引擎 apply 同一份实现(2026-08-26) */
 
 typedef struct {
     uint32_t        type;   /* 1 GL | 2 GLdyn2 | 3 GLdyn8 | 4 TREF (GE is pre-resolved, not chained) */
@@ -52,9 +53,11 @@ typedef struct {
 typedef struct {
     uint32_t        zlk;    /* active rank k (0 = absent) */
     uint32_t        zdin;   /* V input dim: d_model=linear | 3*d_model=ftA feature lift (md86) */
-    float           zltr;   /* trust-region cap factor; AMP(type7): tanh 定标 scale */
-    uint32_t        zmul;   /* 0=加性 z^L(type6) | 1=乘性放大器(type7): out⊙(1+U·tanh(Vᵀx/s)) */
+    float           zltr;   /* trust-region cap factor */
+    uint32_t        zmul;   /* 0=加性 z^L(type6) | 2=rte 路由形态标记; type7/9 已删(2026-08-26 清仓) */
     const uint16_t *zlm;    /* fp16 z[k] | U[d_model*k] | V[zdin*k] */
+    ds4_z          *zmod;   /* din==d_model 的线性 z: 载入时转 f32, apply 走 ds4_z 模块
+                             * (与反修解算器同一份实现); din=3d ftA 走下方 fp16 旧路 */
 } ds4_zchain_zl;
 
 typedef struct {

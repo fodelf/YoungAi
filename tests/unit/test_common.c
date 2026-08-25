@@ -170,6 +170,7 @@ int main(void) {
     test_deq_error_paths();
     test_fp8();
     test_gguf_roundtrip();
+    { extern int unit_zmod(void); g_fail += unit_zmod(); }   /* 引擎 z 双路对拍(2026-08-26) */
     if (g_fail) { fprintf(stderr, "ds4_unit: %d failure(s)\n", g_fail); return 1; }
     puts("ds4_unit: ok");
     return 0;
