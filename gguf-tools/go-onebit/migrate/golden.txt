@@ -104,3 +104,12 @@
   判定(四判据): 赢家 rand/rnd2 λ=30.0 k=1024 全同; held 2.47%==2.47%; 载荷 58720388B 同长;
     A/V 随机基块逐字节 cmp ✓; U 解算块仅 459 字节末位差(Cholesky vs LAPACK, 清单预算内)
   结果: 过闸 ✓ → py 删除, 4 调用方接线, build_ctools 收编
+
+[2026-08-25] scripts/pubbench.py → calib/pubbench.c (判分逻辑, 迁移最后一个复杂件)
+  金标电池(agent Mac 全跑+主会话独立复验):
+  ①--selftest 双 suite 164/164 逐字符 ②抽取器夹具 24/24 逐字节(migrate/pubbench_fixtures,
+    驱动 pubbench_extract_test.c 入库为回归资产) ③--compare/--rejudge/判决闸 真实报告+
+    构造样本全分支逐字符 ④mock server 端到端 4 组(HTTP 请求体字节/落盘 JSONL/stdout/stderr
+    多重集) ⑤CLI 报错 6 例文本+退出码 ⑥数据集抓取+gz 产物逐字节。
+  注: 判 Python 题执行模型生成代码用 python3 解释器=测试目标运行时, 非仓库逻辑代码。
+  结果: 过闸 ✓ → py 删除, 7 调用方接线, build_ctools 已收编(agent 顺手完成)

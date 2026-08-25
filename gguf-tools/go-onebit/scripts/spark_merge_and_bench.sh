@@ -85,7 +85,7 @@ do_bench(){
 
     LOG "跑 $suite 全 164 题"
     cd "$ROOT/gguf-tools/go-onebit" || exit 1
-    PUBBENCH_CACHE="$PWD/pubbench_data" python3 scripts/pubbench.py \
+    PUBBENCH_CACHE="$PWD/pubbench_data" "$(dirname "$0")/../calib/pubbench" \
         --suite "$suite" --limit 164 --tag "${TAG:-en86}" --api completions
 }
 

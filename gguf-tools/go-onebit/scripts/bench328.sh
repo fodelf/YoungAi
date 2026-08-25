@@ -16,10 +16,10 @@ SRV=$!
 sleep 75
 cd "$SC"
 LOG "smoke 2题"
-python3 pubbench.py --suite humaneval --url http://127.0.0.1:8000 --tag ${TAG}_smoke --limit 2 2>&1 | tail -2
+"$(dirname "$0")/../calib/pubbench" --suite humaneval --url http://127.0.0.1:8000 --tag ${TAG}_smoke --limit 2 2>&1 | tail -2
 LOG "Py 164 (4并发)"
-python3 pubbench.py --suite humaneval --url http://127.0.0.1:8000 --tag $TAG --limit 164 --jobs 4 2>&1 | tail -3
+"$(dirname "$0")/../calib/pubbench" --suite humaneval --url http://127.0.0.1:8000 --tag $TAG --limit 164 --jobs 4 2>&1 | tail -3
 LOG "Go 164 (4并发)"
-python3 pubbench.py --suite humaneval-x-go --url http://127.0.0.1:8000 --tag $TAG --limit 164 --jobs 4 2>&1 | tail -3
+"$(dirname "$0")/../calib/pubbench" --suite humaneval-x-go --url http://127.0.0.1:8000 --tag $TAG --limit 164 --jobs 4 2>&1 | tail -3
 kill $SRV 2>/dev/null || true
 LOG "b328 收官"

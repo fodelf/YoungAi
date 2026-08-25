@@ -12,7 +12,7 @@ set -u
 cd "$(dirname "$0")"
 
 if [ "${1:-}" = "compare" ]; then
-  exec python3 pubbench.py --compare "$2" "$3"
+  exec "$(dirname "$0")/../calib/pubbench" --compare "$2" "$3"
 fi
 
 SUITE="${SUITE:-humaneval}"
@@ -25,7 +25,7 @@ echo "[pubbench] suite=$SUITE tag=$TAG url=$URL limit=$LIMIT" >&2
 
 if [ "$SMOKE" = "1" ]; then
   echo "[pubbench] smoke: 2 题先行, 判据=请求通+抽取出代码体+judge 正常给出 PASS/FAIL" >&2
-  python3 pubbench.py --suite "$SUITE" --url "$URL" --tag "${TAG}_smoke" --limit 2 || {
+  "$(dirname "$0")/../calib/pubbench" --suite "$SUITE" --url "$URL" --tag "${TAG}_smoke" --limit 2 || {
     echo "[pubbench] smoke FAILED — 不放全量, 先查 server 字段/抽取/judge" >&2
     exit 1
   }
@@ -39,4 +39,4 @@ if [ "$SMOKE" = "1" ]; then
   echo "[pubbench] smoke 通过, 放全量 $LIMIT 题" >&2
 fi
 
-exec python3 pubbench.py --suite "$SUITE" --url "$URL" --tag "$TAG" --limit "$LIMIT"
+exec "$(dirname "$0")/../calib/pubbench" --suite "$SUITE" --url "$URL" --tag "$TAG" --limit "$LIMIT"

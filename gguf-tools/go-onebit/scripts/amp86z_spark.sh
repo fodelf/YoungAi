@@ -143,11 +143,11 @@ stage_bench(){
     cd "$SC"
     export PUBBENCH_CACHE="$ROOT/gguf-tools/go-onebit/pubbench_data"
     LOG "smoke 2题"
-    python3 pubbench.py --suite humaneval --url http://127.0.0.1:8000 --tag "${TAG}_smoke" --limit 2 2>&1 | tail -3
+    "$(dirname "$0")/../calib/pubbench" --suite humaneval --url http://127.0.0.1:8000 --tag "${TAG}_smoke" --limit 2 2>&1 | tail -3
     LOG "Py 164 (4并发)"
-    python3 pubbench.py --suite humaneval --url http://127.0.0.1:8000 --tag "$TAG" --limit 164 --jobs 4 2>&1 | tail -4
+    "$(dirname "$0")/../calib/pubbench" --suite humaneval --url http://127.0.0.1:8000 --tag "$TAG" --limit 164 --jobs 4 2>&1 | tail -4
     LOG "Go 164 (4并发)"
-    python3 pubbench.py --suite humaneval-x-go --url http://127.0.0.1:8000 --tag "$TAG" --limit 164 --jobs 4 2>&1 | tail -4
+    "$(dirname "$0")/../calib/pubbench" --suite humaneval-x-go --url http://127.0.0.1:8000 --tag "$TAG" --limit 164 --jobs 4 2>&1 | tail -4
     kill $SRV 2>/dev/null || true
 }
 

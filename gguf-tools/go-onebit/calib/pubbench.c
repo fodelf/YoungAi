@@ -466,18 +466,31 @@ static jv *jintv(long long i) { jv *v = jnew(JINT); v->i = i; return v; }
 
 /* ============================ HTTP(libcurl) ============================ */
 
-typedef struct { char *p; size_t n, cap; } buf_t;
+static double now_s(void);
+
+/* urllib 的 timeout 是 **socket 空闲超时**(connect 与每次 recv 各算一次), 不是总时长。
+ * curl 的 LOW_SPEED_TIME 在"还没收到第一个字节"的等待期不触发(实测: 服务端 sleep 8s、
+ * timeout=2 时 .py 判 timed out 而 curl 一直等) —— 所以这里用进度回调自己算空闲计时:
+ * 每收到一段数据就刷新 last, 空闲超过 timeout 即中止(CURLE_ABORTED_BY_CALLBACK)。 */
+typedef struct { char *p; size_t n, cap; double last, idle_max; } buf_t;
 static size_t curl_sink(void *ptr, size_t sz, size_t nm, void *ud) {
     buf_t *b = ud; size_t add = sz * nm;
     if (b->n + add + 1 > b->cap) { size_t c = b->cap ? b->cap : 4096; while (c < b->n + add + 1) c *= 2; b->p = xrealloc(b->p, c); b->cap = c; }
     memcpy(b->p + b->n, ptr, add); b->n += add; b->p[b->n] = 0;
+    b->last = now_s();
     return add;
 }
+static int curl_idle_abort(void *ud, curl_off_t dt, curl_off_t dn, curl_off_t ut, curl_off_t un) {
+    buf_t *b = ud;
+    (void)dt; (void)dn; (void)ut; (void)un;
+    return (now_s() - b->last > b->idle_max) ? 1 : 0;
+}
 /* 状态行的 reason phrase(HTTPError 的消息里带) */
-typedef struct { char reason[128]; } hdr_ctx;
+typedef struct { char reason[128]; buf_t *b; } hdr_ctx;
 static size_t curl_hdr(void *ptr, size_t sz, size_t nm, void *ud) {
     hdr_ctx *h = ud; size_t n = sz * nm;
     const char *s = ptr;
+    if (h->b) h->b->last = now_s();   /* 收到响应头也算"有数据": http.client 读完头才读体 */
     if (n > 9 && !strncmp(s, "HTTP/", 5)) {
         const char *sp1 = memchr(s, ' ', n);
         if (sp1) {
@@ -503,7 +516,8 @@ static int http_post_json(const char *url, const char *body, long timeout_s,
     CURL *h = curl_easy_init();
     if (!h) { snprintf(errmsg, errcap, "<urlopen error curl init failed>"); return -1; }
     buf_t b = {0};
-    hdr_ctx hc; hc.reason[0] = 0;
+    b.last = now_s(); b.idle_max = (double)timeout_s;
+    hdr_ctx hc; hc.reason[0] = 0; hc.b = &b;
     struct curl_slist *hdr = NULL;
     hdr = curl_slist_append(hdr, "Content-Type: application/json");
     hdr = curl_slist_append(hdr, "Connection: close");
@@ -521,8 +535,9 @@ static int http_post_json(const char *url, const char *body, long timeout_s,
     curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(h, CURLOPT_FORBID_REUSE, 1L);
     curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT, timeout_s);
-    curl_easy_setopt(h, CURLOPT_LOW_SPEED_LIMIT, 1L);
-    curl_easy_setopt(h, CURLOPT_LOW_SPEED_TIME, timeout_s);
+    curl_easy_setopt(h, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(h, CURLOPT_XFERINFOFUNCTION, curl_idle_abort);
+    curl_easy_setopt(h, CURLOPT_XFERINFODATA, &b);
     CURLcode rc = curl_easy_perform(h);
     long code = 0;
     curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &code);
@@ -530,7 +545,7 @@ static int http_post_json(const char *url, const char *body, long timeout_s,
     if (rc != CURLE_OK) {
         long oserr = 0;
         curl_easy_getinfo(h, CURLINFO_OS_ERRNO, &oserr);
-        if (rc == CURLE_OPERATION_TIMEDOUT) snprintf(errmsg, errcap, "timed out");
+        if (rc == CURLE_OPERATION_TIMEDOUT || rc == CURLE_ABORTED_BY_CALLBACK) snprintf(errmsg, errcap, "timed out");
         else if (oserr) snprintf(errmsg, errcap, "<urlopen error [Errno %ld] %s>", oserr, strerror((int)oserr));
         else snprintf(errmsg, errcap, "<urlopen error %s>", curl_easy_strerror(rc));
         ret = -1;
@@ -550,7 +565,8 @@ static int http_get(const char *url, char **out, size_t *out_n, char *errmsg, si
     CURL *h = curl_easy_init();
     if (!h) { snprintf(errmsg, errcap, "curl init failed"); return -1; }
     buf_t b = {0};
-    hdr_ctx hc; hc.reason[0] = 0;
+    b.last = now_s(); b.idle_max = 120.0;
+    hdr_ctx hc; hc.reason[0] = 0; hc.b = &b;
     struct curl_slist *hdr = curl_slist_append(NULL, "User-Agent: pubbench/1.0");
     curl_easy_setopt(h, CURLOPT_URL, url);
     curl_easy_setopt(h, CURLOPT_HTTPHEADER, hdr);
@@ -561,8 +577,9 @@ static int http_get(const char *url, char **out, size_t *out_n, char *errmsg, si
     curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT, 120L);
-    curl_easy_setopt(h, CURLOPT_LOW_SPEED_LIMIT, 1L);
-    curl_easy_setopt(h, CURLOPT_LOW_SPEED_TIME, 120L);
+    curl_easy_setopt(h, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(h, CURLOPT_XFERINFOFUNCTION, curl_idle_abort);
+    curl_easy_setopt(h, CURLOPT_XFERINFODATA, &b);
     CURLcode rc = curl_easy_perform(h);
     long code = 0;
     curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &code);

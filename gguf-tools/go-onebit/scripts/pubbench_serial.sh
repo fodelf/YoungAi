@@ -25,7 +25,7 @@ for k in ${OFFSETS:-$(seq 0 $((N-1)))}; do
   "$ROOT/tools/svc.sh" up > /tmp/pubbench_serial_up.log 2>&1 || {
     echo "[serial] svc up 失败@题$k:" >&2; tail -3 /tmp/pubbench_serial_up.log >&2; exit 1; }
   echo "[serial] 题 $((k+1))/$N (offset=$k) 生成中…" >&2
-  python3 "$HERE/pubbench.py" --suite "$SUITE" --url "http://127.0.0.1:$PORT" \
+  "$(dirname "$0")/../calib/pubbench" --suite "$SUITE" --url "http://127.0.0.1:$PORT" \
     --tag "${TAG}_t$k" --offset "$k" --limit 1 --api completions 2>&1 | grep -vE "^\[fetch\]" >&2
   TJ="$OUT/pubbench_${SUITE}_${TAG}_t$k.jsonl"
   [ -f "$TJ" ] && cat "$TJ" >> "$FINAL"

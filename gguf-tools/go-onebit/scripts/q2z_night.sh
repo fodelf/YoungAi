@@ -63,8 +63,8 @@ cat "$RPT/speed_c4.txt"
 LOG "② 328 题基准"
 cd "$ROOT/gguf-tools/go-onebit"
 export PATH="$HOME/opt/go/bin:$PATH"
-DS4_URL=http://127.0.0.1:8000 PUBBENCH_CACHE="$PWD/pubbench_data" python3 scripts/pubbench.py --suite humaneval --limit 164 --tag f86v2 --api completions 2>&1 | tail -6 | tee "$RPT/bench_py.txt"
-DS4_URL=http://127.0.0.1:8000 PUBBENCH_CACHE="$PWD/pubbench_data" python3 scripts/pubbench.py --suite humaneval-x-go --limit 164 --tag f86v2 --api completions 2>&1 | tail -6 | tee "$RPT/bench_go.txt"
+DS4_URL=http://127.0.0.1:8000 PUBBENCH_CACHE="$PWD/pubbench_data" "$(dirname "$0")/../calib/pubbench" --suite humaneval --limit 164 --tag f86v2 --api completions 2>&1 | tail -6 | tee "$RPT/bench_py.txt"
+DS4_URL=http://127.0.0.1:8000 PUBBENCH_CACHE="$PWD/pubbench_data" "$(dirname "$0")/../calib/pubbench" --suite humaneval-x-go --limit 164 --tag f86v2 --api completions 2>&1 | tail -6 | tee "$RPT/bench_go.txt"
 LOG "② 基准完, 杀 server"
 pkill -x ds4-server 2>/dev/null; sleep 3; rm -f /tmp/ds4.lock
 
