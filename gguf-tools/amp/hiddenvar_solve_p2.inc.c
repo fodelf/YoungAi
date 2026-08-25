@@ -275,8 +275,9 @@ int main(void) {
     printf(" rel-L2 = %.6e    cosine_mean = %.8f\n", fid.rel_l2, fid.cosine_mean);
 
     /* ---- serializer round-trip (flat file) ---- */
-    const char *zpath = "/private/tmp/claude-501/-Users-fodelf-git-ds4-main/"
-                        "24503593-c406-4203-a34b-b2d8ea433b47/scratchpad/z_layer.bin";
+    /* 自测临时文件: 固定 /tmp 路径(重构交接账: 原硬编码 Mac 会话 scratchpad,
+     * spark 上不存在 → save rc!=0 假 FAIL)。 */
+    const char *zpath = "/tmp/ds4_hvsolve_selftest_z_layer.bin";
     int sv = z_layer_save(&z, zpath);
     z_layer z2; memset(&z2, 0, sizeof z2);
     int ld = z_layer_load(&z2, zpath);

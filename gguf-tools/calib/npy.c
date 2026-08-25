@@ -265,8 +265,8 @@ float *npy_read_f32(const char *path, npy_meta *out) {
 #ifdef NPY_TEST
 #include <math.h>
 
-#define SCRATCH "/private/tmp/claude-501/-Users-fodelf-git-ds4-main/" \
-                "24503593-c406-4203-a34b-b2d8ea433b47/scratchpad"
+/* 自测临时目录: 固定 /tmp(重构交接账: 原硬编码 Mac 会话 scratchpad, 跨机即假 FAIL)。 */
+#define SCRATCH "/tmp"
 
 static int g_fail = 0;
 #define CHECK(cond, msg) do {                                   \
