@@ -1,0 +1,11 @@
+# Python→C 迁移金标账本（2026-08-25 起）
+# 格式: [日期] 工具 | 输入 | 判定 | 结果
+# 铁律: 金标先于删除; C 未过闸不得 git rm 对应 .py; 不一致=停车审计。
+
+[2026-08-25] anchor_metrics.py → calib/anchor_metrics.c
+  输入: --ref gguf/go-onebit/r30/anchor_wt2_s2653.bin --ids gguf/go-onebit/g7/wt2.ids
+        --student /tmp/qc_amp2_wt2.bin --tail 3  (spark 实跑)
+  判定: 全五指标+尾部报表逐字符一致 (PPL 5.7274 / KLD 0.42792 中位0.09384 p95 2.17163 /
+        RMS 5.3958% / top 79.53% / Δp 0.1579 p95 0.6399 / 尾部3行同)
+  C 超集: 额外输出 分布还原率 Σmin=0.7901(中位0.8867 p5 0.2469)
+  结果: 过闸 ✓ → caliper_ref.sh 接线 C 版, scripts/anchor_metrics.py 删除

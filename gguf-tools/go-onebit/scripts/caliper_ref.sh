@@ -17,5 +17,8 @@ env DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-0731" OPENBLAS_NUM_THREADS=1 DS4_BF_MEMGB
     DS4_LAYER_DIR="$LAYERS" DS4_LCFG="$LCx" DS4_VQ=1 DS4_TGT_ALPHA=1.0 \
     DS4_DUMP_LOGITS="$OUT" ./ds4quant_run.old "$G7/wt2.ids" 8000 2>&1 | tail -2
 cd "$ROOT"
-python3 gguf-tools/go-onebit/scripts/anchor_metrics.py --ref "$R30/anchor_wt2_s2653.bin" \
-    --ids "$G7/wt2.ids" --student "$OUT" --tail 3
+# 五指标判决器=C 版(2026-08-25 Python→C 迁移 Wave A; 金标对拍 amp2 verdict 全五指标
+# 与 anchor_metrics.py 逐字符一致, C 版另多 Σmin 主尺; 金标记录 migrate/golden.txt)
+AM="$ROOT/gguf-tools/go-onebit/calib/anchor_metrics"
+[ -x "$AM" ] || gcc -O3 -march=native -o "$AM" "$ROOT/gguf-tools/go-onebit/calib/anchor_metrics.c" -lm -lpthread
+"$AM" --ref "$R30/anchor_wt2_s2653.bin" --ids "$G7/wt2.ids" --student "$OUT" --tail 3
