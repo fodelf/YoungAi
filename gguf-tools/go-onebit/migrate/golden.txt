@@ -90,3 +90,10 @@
   裁决: 固定种子(20260513)确定性生成器, 产物才是交付物(DS4_TEST_LONG_PROMPT 吃文件) →
   用 py 终跑一次, 产物 tests/long_context_story_prompt.txt(140309B, md5 47c96195...)入库,
   生成器删除。要改故事内容=改文本文件本身。
+
+[2026-08-25] tests/test-vectors/fetch_official_vectors.py → fetch_official_vectors.sh (bash+curl+jq+awk)
+  金标A: 五个 prompt 生成逐字节 = 库内 committed prompts/*.txt
+  金标B: official.vec 从库内 official/*.json 离线重建, 除 case 行路径列(root 入参差)外逐字节
+    = committed official.vec(含 %.9g 浮点复刻); 抓到并修正一处转录笔误(long_code_audit ctx)
+  边界: 记录 JSON 归档件为 jq 形态(结构同/字节可能异, 非判决件); API 抓取段(curl)结构对齐未实跑(需 key)
+  结果: 过闸 ✓ → py 删除

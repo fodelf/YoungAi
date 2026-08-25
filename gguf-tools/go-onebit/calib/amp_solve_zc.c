@@ -502,23 +502,146 @@ static void lu_solve_T(double *A, int n, double *BT, int nrhs, int ldbt) {
     free(piv);
 }
 
-/* ---------------- np.linalg.svd 位: 行 Gram + 对称特征分解 ----------------
- * 要的东西只有 Vt 的前 2*KMAX 行(右奇异向量)。Y 是 na×DIN 且 na ≪ DIN, 所以走行 Gram:
- *     C = Y·Yᵀ (na×na 对称半正定) → C = W Λ Wᵀ → σ_i = √λ_i, Vt_i = (Yᵀw_i)/σ_i
- * 数学等价于 gesdd, 但① 符号/简并子空间内的旋转是算法自定的, 与 numpy 不同;
- * ② λ = σ² 把条件数平方, 尾部小奇异值的相对精度掉一半(实测数据里 σ_2048/σ_0 ~1e-2..1e-3,
- * 平方后 1e-4..1e-6, 远在 f64 余量内)。整支只在 V₀=PCA / 门=pca2 当选时进载荷 ——
- * 而 .py 的 215 条历史记录里 PCA 从未当选, 所以这条不确定性实际上不落盘。
+/* ---------------- np.linalg.svd 位: 随机子空间迭代 + Rayleigh-Ritz ----------------
+ * 只需要 Vt 的前 2*KMAX=2048 行(右奇异向量)。真实规模是 Y = 13106×12288 ——
+ * 拿"整块 Gram + 全特征分解"去取前 16% 的方向是错的工具, 有两个硬伤(2026-08-25 实测):
+ *   ① 慢到不可用: 全特征分解是 O(n³) 且 QL 的特征向量累加天然串行。实测 n=2000 → 3.6s、
+ *      n=4000 → 28s(≈n^3.2), 外推 n=13106 ≈ 16 分钟 —— 而这一段是【历史上从不当选】的候选。
+ *   ② 会崩: 首版走【行】Gram(na×na), 而真数据 na=13106 > DIN=12288 —— 取到了大的那一边,
+ *      且 Gram 秩亏 818。spark 真数据报 `tqli: 第 0 个特征值 60 轮不收敛`。
+ *      归因: QL 的收缩判据 `|e[m]| + dd == dd` 是【纯相对】判据。特征值动态范围一旦超过
+ *      1/ε(≈1e16, 秩亏 + 激活谱重尾时必然), 小特征值那端的 e[m] 里全是来自大特征值的
+ *      ~ε·λ_max 舍入噪声, 相对判据【永远不可能满足】⇒ 迭代上限耗尽。调高上限治不了。
+ *      (排除项: 秩亏本身不致命 —— 1400×1200 秩亏通过; dither 成对近重复结构也不致命 ——
+ *       1800×1500 带 dither 通过。是规模 + 动态范围一起才炸。)
  *
- * 特征向量按【行】存(ZT[i] = 第 i 个特征向量): QL 旋转每次动相邻两行, 全连续访问;
- * 按列存的话是跨 n×8 字节的 stride, 3276 维下每次访问一个 cache line, 慢十倍以上。 */
+ * 现在的算法 = 随机子空间迭代 + Rayleigh-Ritz(与 calib/zlayer.c 的 SVD 段同族做法):
+ *     V ← 正交化(randn(L, DIN)),  L = nv + 64(过采样)
+ *     重复 NPOWER 次:  W = Y·Vᵀ ;  V ← 正交化(W·Y)          [= 对 C=YᵀY 做幂迭代]
+ *     W = Y·Vᵀ ;  H = W·Wᵀ = Vᵀ·C·V  (L×L 对称正定)
+ *     H = Z Λ Zᵀ  →  σ_i = √λ_i ,  Vt_i = (Z·V)_i
+ * 好处: ①【整块 Gram 不再出现】(省 1.2-1.37 GB 与 4e12 flop) ②大矩阵只走矩阵乘(可并行、
+ * 可上 BLAS) ③稠密特征分解只在 L=2112 阶做一次(约 4s, 稳在 tridiag/QL 的舒适区)
+ * ④迭代次数固定 ⇒ 【没有"不收敛"这个失败模式】。
+ *
+ * ★语义声明不变★: 这段只喂 V₀=PCA / 门=pca2 两个候选。Ritz 向量是主子空间的近似基,
+ * 与 gesdd 的精确奇异向量在【符号、简并子空间内的旋转、以及靠近截断处方向的混合】上不同 ——
+ * 但 .py 的 215 条历史解算记录里 PCA/pca2 从未当选, 所以这条不确定性实际不落盘。
+ * 随机起始块用【独立的 mt_t 实例 + 固定种子】, 不消耗也不扰动 .py 的三条流(seed 1/7/11),
+ * 所以本工具仍然是确定性的: 同输入 → 同输出。 */
+#define SVD_OVERSAMPLE 64
+#define SVD_NPOWER      2
+#define SVD_SEED  20250825u
 
-/* Householder 三对角化: A(n×n 对称, 行主序, 全存两半, 原地毁) → d/e + 反射向量 hv。
- * 第 i 步(i 从 n-1 递减)把第 i 行/列的 0..i-2 部分消成 0, 反射子只作用在 0..i-1 上。 */
+typedef struct { const double *A; long long n; const char *what; long long bad; } fin_ctx;
+static void fin_worker(void *vc, int i0, int i1) {
+    fin_ctx *c = (fin_ctx *)vc;
+    long long per = (c->n + 63) / 64;
+    for (int b = i0; b < i1; b++) {
+        long long s = (long long)b * per, e = s + per > c->n ? c->n : s + per;
+        for (long long i = s; i < e; i++)
+            if (!isfinite(c->A[i])) { if (c->bad < 0) c->bad = i; break; }
+    }
+}
+/* 入口守卫: 上游(zcache / 锚 / dither)一旦带进 NaN/Inf, 整条解算就是垃圾, 且会在特征分解里
+ * 表现成"不收敛"这种误导性症状。这里一次性查掉, 报清楚是哪个量。 */
+static void guard_finite(const double *A, long long n, const char *what) {
+    fin_ctx c = {A, n, what, -1};
+    parallel_for(64, fin_worker, &c);
+    if (c.bad >= 0)
+        die("%s 含非有限值(第 %lld 个 = %g) —— 上游 zcache/锚/dither 已带进 NaN/Inf, 停车",
+            what, c.bad, A[c.bad]);
+}
+
+/* 右看 Cholesky: G(n×n 对称正定, 行主序) → 原地出下三角 L(G = L·Lᵀ)。 */
+typedef struct { double *G; const double *col; int n, k; } ch_ctx;
+static void ch_worker(void *vc, int i0, int i1) {
+    ch_ctx *c = (ch_ctx *)vc;
+    const int n = c->n, k = c->k;
+    for (int t = i0; t < i1; t++) {
+        int i = k + 1 + t;
+        double *gi = c->G + (size_t)i * n;
+        double f = gi[k];
+        if (f == 0.0) continue;
+        /* 减的是 L[i][k]·L[j][k] —— 必须取【已缩放的第 k 列】。取第 k 行是错的:
+         * 上三角还留着未缩放的原始对称值, 拿它更新会把因子算坏(首版就栽在这, 表现成
+         * "起始块主元 ≤ 0" 这种看起来像数值退化的假象)。列先收拢成连续缓冲再用。 */
+        for (int j = k + 1; j <= i; j++) gi[j] -= f * c->col[j];
+    }
+}
+/* 返回 n(全部主元合格), 或第一个"数值上已落在前面行张成空间里"的行号。
+ * 容差 = n·ε·max(初始对角), 与 LAPACK 判秩同款量级。 */
+static int chol_lower_rr(double *G, int n) {
+    double dmax = 0.0;
+    for (int i = 0; i < n; i++) if (G[(size_t)i * n + i] > dmax) dmax = G[(size_t)i * n + i];
+    const double tol = (double)n * 2.220446049250313e-16 * dmax;
+    double *col = (double *)xmalloc((size_t)n * sizeof(double));
+    int rank = n;
+    for (int k = 0; k < n; k++) {
+        double d = G[(size_t)k * n + k];
+        if (!(d > tol)) { rank = k; break; }
+        d = sqrt(d);
+        G[(size_t)k * n + k] = d;
+        for (int i = k + 1; i < n; i++) { double v = G[(size_t)i * n + k] / d; G[(size_t)i * n + k] = v; col[i] = v; }
+        ch_ctx c = {G, col, n, k};
+        if (n - k - 1 > 0) {
+            if (n - k - 1 > 256) parallel_for(n - k - 1, ch_worker, &c);
+            else ch_worker(&c, 0, n - k - 1);
+        }
+    }
+    free(col);
+    return rank;
+}
+
+/* 行正交化: V 是 Lr×N(每行一个基向量), 出 V·Vᵀ = I。CholQR 走两遍(CholQR2) ——
+ * 一遍在条件数 >1e8 时精度不够, 两遍是数值稳的标准做法, 且全是三级 BLAS 形状。
+ * 前代 L⁻¹V 按【列】切给线程: 行方向的顺序依赖在每段列内完整保留, 与串行逐位同。 */
+typedef struct { double *V; const double *L; int Lr; long long N; } cq_ctx;
+static void cq_worker(void *vc, int j0, int j1) {
+    cq_ctx *c = (cq_ctx *)vc;
+    for (int r = 0; r < c->Lr; r++) {
+        double *vr = c->V + (size_t)r * c->N;
+        const double *lr = c->L + (size_t)r * c->Lr;
+        for (int t = 0; t < r; t++) {
+            double f = lr[t];
+            if (f == 0.0) continue;
+            const double *vt = c->V + (size_t)t * c->N;
+            for (int j = j0; j < j1; j++) vr[j] -= f * vt[j];
+        }
+        double di = 1.0 / lr[r];
+        for (int j = j0; j < j1; j++) vr[j] *= di;
+    }
+}
+static void orth_rows(double *V, int Lr, long long N, double *G, const char *what, mt_t *rng) {
+    for (int pass = 0; pass < 2; pass++) {
+        for (int round = 0; ; round++) {
+            mm_nt(Lr, Lr, (int)N, V, (int)N, V, (int)N, G, Lr);
+            int r = chol_lower_rr(G, Lr);
+            if (r == Lr) break;
+            /* 第 r 行起在数值上已落进前 r 行张成的空间 —— 只会发生在 Y 的数值秩 < L 时。
+             * 这些方向对应 σ=0, numpy 的 gesdd 同样只是返回零空间里的【任意】正交补,
+             * 所以正确做法是换一批新随机向量再正交化, 不是报错。用的是同一条确定性流,
+             * 工具仍然同输入→同输出。 */
+            if (round >= 3)
+                die("CholQR(%s): 重随机化 4 轮后数值秩仍只有 %d < %d —— Y 的秩远低于所求方向数, "
+                    "解算无意义, 停车。", what, r, Lr);
+            for (long long i = (long long)r * N; i < (long long)Lr * N; i++) V[i] = mt_gauss(rng);
+            fprintf(stderr, "[amp_solve_zc]   %s: 数值秩 %d < L=%d, 尾部 %d 行重随机化(第 %d 轮)\n",
+                    what, r, Lr, Lr - r, round + 1);
+        }
+        cq_ctx c = {V, G, Lr, N};
+        parallel_for((int)N, cq_worker, &c);
+    }
+}
+
+/* ---- 小规模稠密对称特征分解(只在 L=nv+64 阶用, 约 2112) ----
+ * Householder 三对角化 → 逐行累加特征向量 → 隐式位移 QL。特征向量按【行】存
+ * (ZT[i] = 第 i 个特征向量): QL 旋转每次动相邻两行, 全连续访问; 按列存是 n×8 字节的
+ * stride, 每次访问一个 cache line, 慢十倍以上。 */
 typedef struct { double *A; const double *v, *w; int n, l; } h2_ctx;
 static void h2_mv(void *vc, int j0, int j1) {          /* p[j] = Σ_k A[j][k]v[k], j ≤ l */
     h2_ctx *c = (h2_ctx *)vc;
-    double *p = (double *)c->w;                        /* 这一路 w 复用为输出 p */
+    double *p = (double *)c->w;
     for (int j = j0; j < j1; j++) {
         const double *aj = c->A + (size_t)j * c->n;
         double s = 0.0;
@@ -526,7 +649,7 @@ static void h2_mv(void *vc, int j0, int j1) {          /* p[j] = Σ_k A[j][k]v[k
         p[j] = s;
     }
 }
-static void h2_upd(void *vc, int j0, int j1) {         /* A -= v wᵀ + w vᵀ (两半都更新) */
+static void h2_upd(void *vc, int j0, int j1) {         /* A -= v wᵀ + w vᵀ(两半都更新) */
     h2_ctx *c = (h2_ctx *)vc;
     for (int j = j0; j < j1; j++) {
         double *aj = c->A + (size_t)j * c->n;
@@ -534,13 +657,16 @@ static void h2_upd(void *vc, int j0, int j1) {         /* A -= v wᵀ + w vᵀ (
         for (int k = 0; k <= c->l; k++) aj[k] -= vj * c->w[k] + wj * c->v[k];
     }
 }
+static void pf_small(int n, pf_fn fn, void *ctx) {     /* 活太小就别开线程 */
+    if (n < 512) fn(ctx, 0, n); else parallel_for(n, fn, ctx);
+}
 static void tridiag(double *A, int n, double *d, double *e, double *hv, double *hh) {
     double *p = (double *)xmalloc((size_t)n * sizeof(double));
     double *w = (double *)xmalloc((size_t)n * sizeof(double));
     for (int i = n - 1; i >= 1; i--) {
         int l = i - 1;
         double *v = hv + (size_t)i * n;
-        d[i] = A[(size_t)i * n + i];                   /* 本步只动 0..l, A[i][i] 已定 */
+        d[i] = A[(size_t)i * n + i];
         memset(v, 0, (size_t)n * sizeof(double));
         hh[i] = 0.0;
         if (l == 0) { e[i] = A[(size_t)i * n + 0]; continue; }
@@ -556,23 +682,21 @@ static void tridiag(double *A, int n, double *d, double *e, double *hv, double *
         v[l] = f - g;
         hh[i] = h;
         h2_ctx c = {A, v, p, n, l};
-        parallel_for(l + 1, h2_mv, &c);
+        pf_small(l + 1, h2_mv, &c);
         double K = 0.0;
         for (int j = 0; j <= l; j++) { p[j] /= h; K += v[j] * p[j]; }
         K /= (2.0 * h);
         for (int j = 0; j <= l; j++) w[j] = p[j] - K * v[j];
         c.w = w;
-        parallel_for(l + 1, h2_upd, &c);
-        /* 第 i 行/列在三对角化后只剩 e[i] 这一项(0..l-1 已消): 显式写回, 保对称。 */
+        pf_small(l + 1, h2_upd, &c);
         for (int k = 0; k <= l; k++) { A[(size_t)i * n + k] = 0.0; A[(size_t)k * n + i] = 0.0; }
         A[(size_t)i * n + l] = e[i]; A[(size_t)l * n + i] = e[i];
     }
     d[0] = A[0]; e[0] = 0.0;
     free(p); free(w);
 }
-
-/* QT = H_1·H_2·⋯·H_{n-1} 逐行构造(QT[r] = Q 的第 r 列 = 第 r 个 Ritz 基向量)。
- * H_i 只动 0..i-1 列, 而应用到第 i 步时 r ≥ i 的行还是单位行 ⇒ 只需遍历 r < i。 */
+/* QT = H_1·H_2·⋯·H_{n-1} 逐行构造。H_i 只动 0..i-1 列, 而应用到第 i 步时 r ≥ i 的行
+ * 还是单位行 ⇒ 只需遍历 r < i。 */
 typedef struct { double *QT; const double *v; int n, l; double h; } qb_ctx;
 static void qb_worker(void *vc, int r0, int r1) {
     qb_ctx *c = (qb_ctx *)vc;
@@ -590,18 +714,30 @@ static void build_QT(double *QT, int n, const double *hv, const double *hh) {
     for (int i = 1; i < n; i++) {
         if (hh[i] == 0.0) continue;
         qb_ctx c = {QT, hv + (size_t)i * n, n, i - 1, hh[i]};
-        parallel_for(i, qb_worker, &c);
+        pf_small(i, qb_worker, &c);
     }
 }
-
 static double pythag(double a, double b) {
     double aa = fabs(a), ab = fabs(b);
     if (aa > ab) { double r = ab / aa; return aa * sqrt(1.0 + r * r); }
     if (ab == 0.0) return 0.0;
     { double r = aa / ab; return ab * sqrt(1.0 + r * r); }
 }
-/* 隐式位移 QL(EISPACK tql2 同式), 特征向量按行累加在 ZT 上。 */
+/* 隐式位移 QL(EISPACK tql2 同式), 特征向量按行累加在 ZT 上。
+ * ★收缩判据带绝对下限★: 纯相对判据 `|e[m]|+dd == dd` 在特征值动态范围超过 1/ε 时,
+ * 小特征值那端永远收缩不了(e[m] 里是大特征值留下的 ~ε·‖T‖ 噪声) —— 这正是首版在真数据上
+ * "第 0 个特征值 60 轮不收敛"的成因。LAPACK dsteqr 同样带这个绝对下限。 */
 static void tqli_rows(double *d, double *e, int n, double *ZT) {
+    const double EPS = 2.220446049250313e-16;
+    for (int i = 0; i < n; i++)
+        if (!isfinite(d[i]) || !isfinite(e[i]))
+            die("tqli: 三对角阵含非有限值(i=%d d=%g e=%g) —— 上游已经坏了, 不是收敛问题", i, d[i], e[i]);
+    double anorm = 0.0;
+    for (int i = 0; i < n; i++) {
+        double r = fabs(d[i]) + fabs(e[i]) + (i ? fabs(e[i - 1]) : 0.0);
+        if (r > anorm) anorm = r;
+    }
+    const double afloor = EPS * anorm;          /* 绝对下限, 见上 */
     for (int i = 1; i < n; i++) e[i - 1] = e[i];
     e[n - 1] = 0.0;
     for (int l = 0; l < n; l++) {
@@ -609,10 +745,12 @@ static void tqli_rows(double *d, double *e, int n, double *ZT) {
         do {
             for (m = l; m < n - 1; m++) {
                 double dd = fabs(d[m]) + fabs(d[m + 1]);
-                if (fabs(e[m]) + dd == dd) break;
+                if (fabs(e[m]) <= EPS * dd + afloor) break;
             }
             if (m == l) break;
-            if (iter++ == 60) die("tqli: 第 %d 个特征值 60 轮不收敛", l);
+            if (iter++ == 100)
+                die("tqli: 第 %d 个特征值 100 轮不收敛(m=%d e[m]=%.6g d[l]=%.6g ‖T‖≈%.6g)",
+                    l, m, e[m], d[l], anorm);
             double g = (d[l + 1] - d[l]) / (2.0 * e[l]);
             double r = pythag(g, 1.0);
             g = d[m] - d[l] + e[l] / (g + (g >= 0.0 ? fabs(r) : -fabs(r)));
@@ -641,7 +779,6 @@ static void tqli_rows(double *d, double *e, int n, double *ZT) {
         } while (m != l);
     }
 }
-
 typedef struct { double lam; int idx; } eig_t;
 static int eig_cmp(const void *a, const void *b) {     /* 降序; 平局按下标稳定 */
     const eig_t *x = (const eig_t *)a, *y = (const eig_t *)b;
@@ -649,38 +786,60 @@ static int eig_cmp(const void *a, const void *b) {     /* 降序; 平局按下�
     if (x->lam < y->lam) return 1;
     return x->idx < y->idx ? -1 : (x->idx > y->idx);
 }
-
-/* Y(na×DIN) 的前 nv 个右奇异向量 → Vt(nv×DIN, 行主序)。要求 nv ≤ na ≤ DIN。 */
-static void top_right_singular(const double *Y, int na, long long DIN, int nv, double *Vt) {
-    double *C = (double *)xmalloc((size_t)na * na * sizeof(double));
-    mm_nt(na, na, (int)DIN, Y, (int)DIN, Y, (int)DIN, C, na);
-    double *d = (double *)xmalloc((size_t)na * sizeof(double));
-    double *e = (double *)xmalloc((size_t)na * sizeof(double));
-    double *hv = (double *)xmalloc((size_t)na * na * sizeof(double));
-    double *hh = (double *)xmalloc((size_t)na * sizeof(double));
-    tridiag(C, na, d, e, hv, hh);
-    double *ZT = C;                                    /* Gram 已用完, 就地当特征向量缓冲 */
-    build_QT(ZT, na, hv, hh);
+/* 对称阵 H(n×n) 的全部特征对: 出 d(未排序)与 ZT(行=特征向量), H 被毁。 */
+static void sym_eig_rows(double *H, int n, double *d, double *ZT) {
+    double *e = (double *)xmalloc((size_t)n * 8);
+    double *hv = (double *)xmalloc((size_t)n * n * 8);
+    double *hh = (double *)xmalloc((size_t)n * 8);
+    tridiag(H, n, d, e, hv, hh);
+    build_QT(ZT, n, hv, hh);
     free(hv); free(hh);
-    tqli_rows(d, e, na, ZT);
+    tqli_rows(d, e, n, ZT);
     free(e);
-    eig_t *ord = (eig_t *)xmalloc((size_t)na * sizeof(eig_t));
-    for (int i = 0; i < na; i++) { ord[i].lam = d[i]; ord[i].idx = i; }
-    qsort(ord, (size_t)na, sizeof(eig_t), eig_cmp);
-    /* W_sel[i] = w_{ord[i]} / σ_i , 然后 Vt = W_sel · Y */
-    double *Wsel = (double *)xmalloc((size_t)nv * na * sizeof(double));
-    for (int i = 0; i < nv; i++) {
-        double lam = ord[i].lam;
-        double sig = lam > 0.0 ? sqrt(lam) : 0.0;
-        const double *src = ZT + (size_t)ord[i].idx * na;
-        double *dst = Wsel + (size_t)i * na;
-        if (sig == 0.0) { memset(dst, 0, (size_t)na * sizeof(double)); continue; }
-        double inv = 1.0 / sig;
-        for (int r = 0; r < na; r++) dst[r] = src[r] * inv;
+}
+
+/* Y(na×DIN) 的前 nv 个右奇异向量 → Vt(nv×DIN, 行主序, 行正交)。
+ * 同时可选出 sig[nv](降序奇异值), 传 NULL 表示不要。 */
+static void top_right_singular(const double *Y, int na, long long DIN, int nv, double *Vt, double *sig) {
+    guard_finite(Y, (long long)na * DIN, "SVD 输入 Xa−mean");
+    int rmax = na < (int)DIN ? na : (int)DIN;
+    if (nv > rmax) die("要 %d 个右奇异向量但 rank 上限只有 %d", nv, rmax);
+    int L = nv + SVD_OVERSAMPLE; if (L > rmax) L = rmax;
+    double *V = (double *)xmalloc((size_t)L * DIN * 8);
+    double *W = (double *)xmalloc((size_t)L * na * 8);
+    double *G = (double *)xmalloc((size_t)L * L * 8);
+    mt_t rng; mt_seed(&rng, SVD_SEED);
+    for (long long i = 0; i < (long long)L * DIN; i++) V[i] = mt_gauss(&rng);
+    orth_rows(V, L, DIN, G, "起始块", &rng);
+    /* ★每半步都正交化★, 不是每整步。整步才正交时, 一步的条件数是 (σ₁/σ_L)² ——
+     * 衰减谱下这个数轻易破 1e8, 子空间会数值塌掉(实测 13106×12288 / 1/(1+i) 谱, 每整步
+     * 正交时数值秩从 2112 塌到 1148, 尾部近千个方向被迫重随机化 = 那些方向直接算错了)。
+     * 每半步正交后条件数降到 σ₁/σ_L, CholQR2 稳稳吃得下。代价约 +15% 矩阵乘。 */
+    for (int it = 0; it < SVD_NPOWER; it++) {
+        mm_nt(L, na, (int)DIN, V, (int)DIN, Y, (int)DIN, W, na);    /* W = V·Yᵀ  (L×na)  */
+        orth_rows(W, L, na, G, "幂迭代(左)", &rng);
+        mm_nn(L, (int)DIN, na, W, na, Y, (int)DIN, V, (int)DIN);    /* V = W·Y   (L×DIN) */
+        orth_rows(V, L, DIN, G, "幂迭代(右)", &rng);
+        fprintf(stderr, "[amp_solve_zc]   子空间迭代 %d/%d\n", it + 1, SVD_NPOWER);
     }
-    free(d); free(ord); free(C);
-    mm_nn(nv, (int)DIN, na, Wsel, na, Y, (int)DIN, Vt, (int)DIN);
-    free(Wsel);
+    mm_nt(L, na, (int)DIN, V, (int)DIN, Y, (int)DIN, W, na);
+    double *H = (double *)xmalloc((size_t)L * L * 8);
+    mm_nt(L, L, na, W, na, W, na, H, L);                            /* H = W·Wᵀ = VᵀCV   */
+    free(W);
+    double *d = (double *)xmalloc((size_t)L * 8);
+    double *ZT = G;                                                 /* G 已用完, 复用 L×L */
+    sym_eig_rows(H, L, d, ZT);
+    free(H);
+    eig_t *ord = (eig_t *)xmalloc((size_t)L * sizeof(eig_t));
+    for (int i = 0; i < L; i++) { ord[i].lam = d[i]; ord[i].idx = i; }
+    qsort(ord, (size_t)L, sizeof(eig_t), eig_cmp);
+    double *Zs = (double *)xmalloc((size_t)nv * L * 8);
+    for (int i = 0; i < nv; i++) {
+        memcpy(Zs + (size_t)i * L, ZT + (size_t)ord[i].idx * L, (size_t)L * 8);
+        if (sig) sig[i] = ord[i].lam > 0.0 ? sqrt(ord[i].lam) : 0.0;
+    }
+    mm_nn(nv, (int)DIN, L, Zs, L, V, (int)DIN, Vt, (int)DIN);       /* Vt = Zsel·V */
+    free(Zs); free(ord); free(d); free(G); free(V);
 }
 
 /* ---------------- 锚读取(scripts/probe_layer_behavior.py: anchor_layer 的 fin 分支) ----
@@ -747,52 +906,131 @@ static void put_hdr(uint8_t *h, const char *nm, uint64_t psz) {
     memcpy(h + 112, &one, 4);
 }
 
-static void selftest(void) {
+/* 生成谱可控的测试矩阵: Y = A·diag(s)·Bᵀ, s_c = 1/(1+c)^decay(decay=0 即平谱), 秩 = rank。 */
+static void st_gen(double *Y, int na, long long DIN, int rank, double decay, uint32_t seed) {
+    mt_t g; mt_seed(&g, seed);
+    int rmax = na < (int)DIN ? na : (int)DIN;
+    if (rank >= rmax) {          /* 满秩: 列缩放的 iid 高斯, O(na·DIN) 生成, 谱由 s_j 定 */
+        for (int i = 0; i < na; i++) {
+            double *r = Y + (size_t)i * DIN;
+            for (long long j = 0; j < DIN; j++)
+                r[j] = mt_gauss(&g) * (decay == 0.0 ? 1.0 : pow(1.0 / (1.0 + (double)j), decay));
+        }
+        return;
+    }
+    double *A = (double *)xmalloc((size_t)na * rank * 8);
+    double *B = (double *)xmalloc((size_t)DIN * rank * 8);
+    for (long long i = 0; i < (long long)na * rank; i++) A[i] = mt_gauss(&g);
+    for (long long i = 0; i < DIN * rank; i++) B[i] = mt_gauss(&g);
+    for (int c = 0; c < rank; c++) {
+        double s = decay == 0.0 ? 1.0 : pow(1.0 / (1.0 + (double)c), decay);
+        for (int i = 0; i < na; i++) A[(size_t)i * rank + c] *= s;
+    }
+    mm_nt(na, (int)DIN, rank, A, rank, B, rank, Y, (int)DIN);
+    free(A); free(B);
+}
+/* 投影残差 ‖Y − (Y·Vᵀ)·V‖_F / ‖Y‖_F, 按行分块算, 不开 na×DIN 的大缓冲。
+ * (不能用 ‖Y‖²−‖P‖² 那个恒等式: 残差接近 0 时是灾难性相消, 开方后只能验到 ~1e-8。) */
+static double st_residual(const double *Y, int na, long long DIN, const double *V, int nv) {
+    const int BLK = 256;
+    if (na > 4096) na = 4096;   /* 抽样前 4096 行: 比值有代表性, 全量和 SVD 本身一样贵 */
+    double *P = (double *)xmalloc((size_t)BLK * nv * 8);
+    double *R = (double *)xmalloc((size_t)BLK * DIN * 8);
+    double sy = 0.0, sr = 0.0;
+    for (int b = 0; b < na; b += BLK) {
+        int nb = b + BLK > na ? na - b : BLK;
+        const double *Yb = Y + (size_t)b * DIN;
+        mm_nt(nb, nv, (int)DIN, Yb, (int)DIN, V, (int)DIN, P, nv);
+        mm_nn(nb, (int)DIN, nv, P, nv, V, (int)DIN, R, (int)DIN);
+        for (long long i = 0; i < (long long)nb * DIN; i++) {
+            double y = Yb[i], r = y - R[i];
+            sy += y * y; sr += r * r;
+        }
+    }
+    free(P); free(R);
+    return sy > 0.0 ? sqrt(sr / sy) : 0.0;
+}
+static void selftest(int argc, char **argv) {
     printf("== RNG: np.random.RandomState(1).randn(8) ==\n");
     mt_t s; mt_seed(&s, 1);
     for (int i = 0; i < 8; i++) printf("%.17g\n", mt_gauss(&s));
     printf("== f16 舍入抽查(值 → 位) ==\n");
     const double tv[] = {1.0, -2.5, 6.103515625e-05, 1e-8, 65519.0, 65520.0, 1.0009765625, 1.00048828125};
     for (int i = 0; i < 8; i++) printf("%.17g -> 0x%04x\n", tv[i], f64_to_f16(tv[i]));
-    printf("== 特征分解: Y(40×100) 随机, 前 8 个奇异值 + 正交性 ==\n");
-    int na = 40; long long DIN = 100; int nv = 8;
+
+    /* 用法: --selftest [na DIN nv rank decay]。缺省是小号(rank ≤ nv, 投影残差判据可验)。 */
+    int na   = argc > 2 ? (int)py_int(argv[2], "na")   : 800;
+    long long DIN = argc > 3 ? py_int(argv[3], "DIN")  : 700;
+    int nv   = argc > 4 ? (int)py_int(argv[4], "nv")   : 200;
+    int rank = argc > 5 ? (int)py_int(argv[5], "rank") : 150;
+    double decay = argc > 6 ? atof(argv[6]) : 1.0;
+    int rmax = na < (int)DIN ? na : (int)DIN;
+    if (rank > rmax) rank = rmax;
+    printf("== SVD: Y %d×%lld  取前 %d 个右奇异向量  秩=%d  谱=%s  (L=%d, 幂迭代 %d 轮) ==\n",
+           na, DIN, nv, rank, decay == 0.0 ? "平" : "1/(1+i)^decay", nv + SVD_OVERSAMPLE, SVD_NPOWER);
+    fflush(stdout);
     double *Y = (double *)xmalloc((size_t)na * DIN * 8);
-    mt_t r; mt_seed(&r, 3);
-    for (long long i = 0; i < na * DIN; i++) Y[i] = mt_gauss(&r);
+    st_gen(Y, na, DIN, rank, decay, 5);
     double *Vt = (double *)xmalloc((size_t)nv * DIN * 8);
-    top_right_singular(Y, na, DIN, nv, Vt);
-    double *C = (double *)xmalloc((size_t)na * na * 8);
-    mm_nt(na, na, (int)DIN, Y, (int)DIN, Y, (int)DIN, C, na);
-    (void)C;
-    for (int i = 0; i < nv; i++) {
-        /* σ_i = ‖Y·v_i‖ */
-        double s2 = 0.0;
-        for (int r2 = 0; r2 < na; r2++) {
-            double d = 0.0;
-            for (long long j = 0; j < DIN; j++) d += Y[(size_t)r2 * DIN + j] * Vt[(size_t)i * DIN + j];
-            s2 += d * d;
+    double *sig = (double *)xmalloc((size_t)nv * 8);
+    double t = now_s();
+    top_right_singular(Y, na, DIN, nv, Vt, sig);
+    double dt = now_s() - t;
+    /* 正交性 */
+    double onmax = 0.0, dgmax = 0.0;
+    int nchk = nv < 64 ? nv : 64;
+    for (int i = 0; i < nchk; i++) {
+        double q = pw_sq_f64(Vt + (size_t)i * DIN, DIN);
+        if (fabs(q - 1.0) > dgmax) dgmax = fabs(q - 1.0);
+        for (int j = i + 1; j < nchk; j++) {
+            double dp = 0.0;
+            for (long long k = 0; k < DIN; k++) dp += Vt[(size_t)i * DIN + k] * Vt[(size_t)j * DIN + k];
+            if (fabs(dp) > onmax) onmax = fabs(dp);
         }
-        double nrm = pw_sq_f64(Vt + (size_t)i * DIN, DIN);
-        printf("σ%d=%.12g  ‖v‖²−1=%.3e\n", i, sqrt(s2), nrm - 1.0);
     }
-    double omx = 0.0;
-    for (int i = 0; i < nv; i++)
-        for (int j = i + 1; j < nv; j++) {
-            double d = 0.0;
-            for (long long k = 0; k < DIN; k++) d += Vt[(size_t)i * DIN + k] * Vt[(size_t)j * DIN + k];
-            if (fabs(d) > omx) omx = fabs(d);
-        }
-    printf("正交性 max|vᵢ·vⱼ| = %.3e\n", omx);
-    free(Y); free(Vt); free(C);
+    /* Ritz 残差 ‖Yᵀ(Y v) − σ²v‖ / σ²(抽前几个 + 截断处附近) */
+    int probe[6] = {0, 1, nv / 4, nv / 2, 3 * nv / 4, nv - 1};
+    double rrmax = 0.0, lam0 = sig[0] * sig[0];
+    double *u = (double *)xmalloc((size_t)na * 8), *z = (double *)xmalloc((size_t)DIN * 8);
+    for (int pi = 0; pi < 6; pi++) {
+        int i = probe[pi];
+        const double *v = Vt + (size_t)i * DIN;
+        mm_nt(1, na, (int)DIN, v, (int)DIN, Y, (int)DIN, u, na);
+        mm_nn(1, (int)DIN, na, u, na, Y, (int)DIN, z, (int)DIN);
+        double lam = sig[i] * sig[i], num = 0.0;
+        for (long long k = 0; k < DIN; k++) { double r = z[k] - lam * v[k]; num += r * r; }
+        /* 按 λ_0 归一, 不按 λ_i: 零空间方向的 λ_i≈0 会把比值刷爆, 那不是精度问题 */
+        double rr = lam0 > 0.0 ? sqrt(num) / lam0 : 0.0;
+        if (rr > rrmax) rrmax = rr;
+    }
+    free(u); free(z);
+    double res = st_residual(Y, na, DIN, Vt, nv);
+    printf("耗时 %.1fs  前%d: |‖v‖²−1| max %.3e  正交 max %.3e   Ritz 残差 max %.3e\n",
+           dt, nchk, dgmax, onmax, rrmax);
+    printf("投影残差 ‖Y−(YVᵀ)V‖/‖Y‖ = %.6e%s   %s\n", res, na > 4096 ? "(前4096行)" : "",
+           rank <= nv ? (res < 1e-10 ? "★秩≤nv, <1e-10 ✓" : "★秩≤nv 但 ≥1e-10 ✗")
+                      : "(秩>nv: 该值 = 被截掉的尾部能量, 数学上不可能小, 见下)");
+    if (rank > nv) {
+        printf("  └ 满秩/高秩下这个判据不适用: 只取前 %d 个方向, 残差 = √(Σ_{i>%d}σ²/Σσ²)。\n"
+               "    对本例的期望量级: 平谱≈√(1−nv/rank)=%.3f, 1/(1+i) 谱≈%.3f。\n"
+               "    该场景要看的是上一行的【Ritz 残差】与【正交性】, 以及下面的 σ 与 numpy 对表。\n",
+               nv, nv, sqrt(1.0 - (double)nv / rank), 0.0);
+    }
+    printf("σ[0..7] =");
+    for (int i = 0; i < 8 && i < nv; i++) printf(" %.10g", sig[i]);
+    printf("\nσ[nv-4..nv-1] =");
+    for (int i = nv - 4; i < nv; i++) if (i >= 0) printf(" %.10g", sig[i]);
+    printf("\n");
+    free(Y); free(Vt); free(sig);
 }
 
 /* ================================ 主流程 ================================
  * 下面每一段都标了对应的 amp_solve.py 行号, 改的时候两边一起看。 */
 int main(int argc, char **argv) {
-    if (argc == 2 && !strcmp(argv[1], "--selftest")) { selftest(); return 0; }
+    if (argc >= 2 && !strcmp(argv[1], "--selftest")) { selftest(argc, argv); return 0; }
     if (argc < 4) {
         fprintf(stderr, "用法: amp_solve_zc <anchor> <zcache_LXX.npz> <out_amprec.bin> [NFIT]\n");
-        fprintf(stderr, "      amp_solve_zc --selftest\n");
+        fprintf(stderr, "      amp_solve_zc --selftest [na DIN nv rank decay]\n");
         return 1;
     }
     const char *ap = argv[1], *zcp = argv[2], *outp = argv[3];       /* py:14 */
@@ -969,7 +1207,7 @@ int main(int argc, char **argv) {
         for (long long i = 0; i < na; i++) { const double *r = Xa + (size_t)i * DIN; double *d = Y + (size_t)i * DIN; for (long long j = 0; j < DIN; j++) d[j] = r[j] - mean[j]; }
         free(mean);
         double *Vt = (double *)xmalloc((size_t)(2 * KMAX) * DIN * 8);
-        top_right_singular(Y, (int)na, DIN, 2 * KMAX, Vt);
+        top_right_singular(Y, (int)na, DIN, 2 * KMAX, Vt, NULL);
         free(Y);
         /* 基一律按【行=基向量】存(= Vt 的自然布局), 投影走 NT gemm。 */
         V0[0] = (double *)xmalloc((size_t)KMAX * DIN * 8);
