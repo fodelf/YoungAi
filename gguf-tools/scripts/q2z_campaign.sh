@@ -8,7 +8,8 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 SC="$ROOT/gguf-tools/scripts"
-ZL="$ROOT/gguf-tools/go-onebit/zlever"
+ZLB="$ROOT/gguf-tools/amp/zlayer"   # C 反修解算器(zlayer.py 已删)
+[ -x "$ZLB" ] || make -C "$ROOT/gguf-tools" zlayer
 R30="$ROOT/gguf/go-onebit/r30"
 OUTF="$R30/full"
 LAYERS="$OUTF/layers"
@@ -51,14 +52,14 @@ stage_quant(){    # 43 层批量顺序(单进程, 误差前向吸收=部署口�
 stage_zsideL(){   # 单层计时: zsideL <L>(反修=闭式 z^L+GE+注入)
     local L=$1
     cd "$ROOT"
-    python3 -u "$ZL/zlayer.py" "$DS4_HF" "$LAYERS" "$ANCHOR" "$L" 1024 1
+    "$ZLB" "$DS4_HF" "$LAYERS" "$ANCHOR" "$L" 1024 1
 }
 
 stage_zside(){    # 逐层反修: 第一层到最后一层
     cd "$ROOT"
     for L in $(seq 0 $((NL-1))); do
         [ -f "$LAYERS/$(printf 'dql_vq_L%02d.bin' $L)" ] || { LOG "★L$L 未量化, 停★"; exit 2; }
-        python3 -u "$ZL/zlayer.py" "$DS4_HF" "$LAYERS" "$ANCHOR" "$L" 1024 1 \
+        "$ZLB" "$DS4_HF" "$LAYERS" "$ANCHOR" "$L" 1024 1 \
             2>&1 | tee -a /tmp/q2z_zside.log | grep '★' || { LOG "★L$L z侧车失败, 停★"; exit 3; }
     done
     LOG "反修段收官: 账本 $(wc -l < "$LAYERS/zinject_manifest.txt" | tr -d ' ')/43 层"

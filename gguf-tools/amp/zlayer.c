@@ -1,6 +1,6 @@
 /* zlayer.c — 每层 z 侧车一体化(建缓存→四损失闭式解→注入 dql, 反修段主力)。
  *
- * 【转录来源】gguf-tools/go-onebit/zlever/zlayer.py (672 行) 逐式转录, 2026-08-25。
+ * 【转录来源】zlever/zlayer.py(672 行, 全仓 Python 清零已删, 见 git 历史)逐式转录, 2026-08-25。
  *   连带转录它 import 的两个函数: scripts/probe_layer_behavior.py 的 anchor_layer/swiglu,
  *   scripts/probe_behavior_spectrum.py 的 st_index/st_mxfp4/vq_slot/vq_dequant/st_raw/FP4T。
  *   MXFP4(HF I8 容器 + E8M0 scale) 的读取直接复用 quant/st_read.c 的 st_read_weight,

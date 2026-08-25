@@ -51,26 +51,9 @@ PY
   [ "$ntok" -gt 800 ] || { log "捕获异常(tokens=$ntok), 停"; exit 1; }
   ;;
 ref)
-  # O_REF: 复用 dsml_oref.py(error-feedback 语义: 引擎 x̂+路由 + HF fp8 权重重算 FFN)。
-  # HF 46 shard 全在 M1 → ref 整段 M1 跑(各跑本机 shard 铁律)。~2min/层 × 23 层。
-  M1HF=${M1HF:-$M1DIR/hf/DeepSeek-V4-Flash-Base}
-  PYFWD=$ROOT/gguf-tools/go-onebit/calib/pyfwd
-  mkdir -p "$REFDIR"
-  ssh "$M1" "mkdir -p /tmp/oref /tmp/oref/pyfwd"
-  scp -q "$HERE/dsml_oref.py" "$M1:/tmp/oref/"
-  scp -q "$PYFWD/dsv4_fwd.py" "$PYFWD/ds4reader.py" "$M1:/tmp/oref/pyfwd/"
-  for L in $(seq "${LAYERS%-*}" "${LAYERS#*-}"); do
-    [ -f "$REFDIR/ffn_out_L$L" ] && { log "L$L 已有, 跳过"; continue; }
-    for k in raw_ffn_in raw_route raw_route_w; do
-      [ -f "$CAPDIR/seg0/${k}_L$L" ] || { log "L$L 捕获不全($k)"; exit 1; }
-      scp -q "$CAPDIR/seg0/${k}_L$L" "$M1:/tmp/oref/${k}_L$L"
-    done
-    ssh "$M1" "cd /tmp/oref && DS4_HF=$M1HF python3 dsml_oref.py --cap /tmp/oref --layer $L --out /tmp/oref/o_ref_L$L" || { log "L$L oref 失败"; exit 1; }
-    scp -q "$M1:/tmp/oref/o_ref_L$L" "$REFDIR/ffn_out_L$L"
-    ssh "$M1" "rm -f /tmp/oref/raw_*_L$L /tmp/oref/o_ref_L$L"
-    log "L$L O_REF 就绪 ($(du -sh "$REFDIR/ffn_out_L$L" | cut -f1))"
-  done
-  log "ref 完成: $REFDIR"
+  # O_REF 段原依赖已删 Python 前向(dsml_oref.py + calib/pyfwd 的 dsv4_fwd/ds4reader,
+  # 全仓 Python 清零删除, 见 git 历史), 无 C 承接 — 响亮失败不静默。
+  log "★ref 段依赖已删 Python 前向(见 git 历史), 待 C 承接★"; exit 1
   ;;
 solve)
   [ -x "$ROOT/zsolve" ] || make -C "$ROOT" zsolve

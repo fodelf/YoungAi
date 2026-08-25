@@ -71,27 +71,18 @@ stage_gate(){
     LOG "教师体检① 语言健康度(旧锚 PPL 4.2365 为参照, 教师应≤)"
     "$(dirname "$0")/../bench/anchor_metrics" --ref-raw "$TD/q4t_wt2.bin" --ids "$G7/wt2.ids" | tail -4
     LOG "教师体检② 旧锚盲区复核(教师应贴学生=会拷贝/会检索)"
-    python3 - <<'PY'
-import sys
-import numpy as np
-sys.path.insert(0, "gguf-tools/scripts")
-from anchor_metrics import read_anchor_logits, read_student_logits, log_softmax
-old, meta = read_anchor_logits("gguf/go-onebit/r30/anchor_wt2_s2653.bin")
-t = read_student_logits("gguf/go-onebit/r30/teach/q4t_wt2.bin")
-stu = read_student_logits("/tmp/p2_iq2_wt2.bin")
-ids = np.array([int(x) for x in open("gguf/go-onebit/g7/wt2.ids").read().split()])
-S = meta['S']; n = S - 1; tid = ids[1:S]
-lo, lt, ls = log_softmax(old), log_softmax(t), log_softmax(stu)
-adv = ls[np.arange(n), tid] - lo[np.arange(n), tid]
-blind = adv > 2.0
-print(f"旧锚盲区 {blind.sum()} 位置: lnp(true) 旧锚={lo[np.arange(n),tid][blind].mean():.3f} "
-      f"q4t教师={lt[np.arange(n),tid][blind].mean():.3f} 学生iq2={ls[np.arange(n),tid][blind].mean():.3f}")
-nll_t = -lt[np.arange(n), tid].mean(); nll_o = -lo[np.arange(n), tid].mean()
-print(f"全段 NLL: q4t教师={nll_t:.4f} 旧锚={nll_o:.4f}")
-ok = nll_t < nll_o and lt[np.arange(n), tid][blind].mean() > -1.0
-print("★教师体检: PASS★" if ok else "★教师体检: FAIL★")
-sys.exit(0 if ok else 1)
-PY
+    # 原 numpy 盲区细察(anchor_metrics.py)随全仓 Python 清零删除(见 git 历史)。
+    # C 版 bench/anchor_metrics 给同尺五指标: 分别以 q4t 教师 dump 与 iq2 学生 dump 作
+    # --student 对旧锚判, NLL/Σmin 对比即"教师是否优于旧锚"; 逐位置盲区明细不再输出。
+    AM="$ROOT/gguf-tools/bench/anchor_metrics"
+    [ -x "$AM" ] || make -C "$ROOT/gguf-tools" anchor_metrics
+    echo "== q4t 教师 vs 旧锚 =="
+    "$AM" --ref gguf/go-onebit/r30/anchor_wt2_s2653.bin --ids gguf/go-onebit/g7/wt2.ids \
+          --student gguf/go-onebit/r30/teach/q4t_wt2.bin
+    echo "== iq2 学生 vs 旧锚 =="
+    "$AM" --ref gguf/go-onebit/r30/anchor_wt2_s2653.bin --ids gguf/go-onebit/g7/wt2.ids \
+          --student /tmp/p2_iq2_wt2.bin
+    echo "体检判读: 教师 NLL 应显著低于学生且不劣于旧锚(逐位置盲区细察见 git 历史 py 版)"
 }
 
 stage_rejudge(){

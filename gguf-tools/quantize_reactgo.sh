@@ -15,7 +15,7 @@
 #   [model] 4. deepseek4-quantize         HF + hot mask -> small hot-only GGUF
 #
 # SAFETY (CLAUDE.md / memory 铁律):
-#   * Steps 2 and 3 are pure offline python, 64 MB-streaming, never load the
+#   * Steps 2/3 的 python 生成器已删(见 git 历史), 现在直接消费 data/expert-masks/ 现成件;
 #     model — they run by default.
 #   * Steps 1 and 4 read the model (a model run / a 240 GB HF sweep).  They are
 #     GATED: they only execute when RUN_MODEL_STEPS=1 is set in the environment,
@@ -96,9 +96,9 @@ if [[ -f "$IMATRIX" ]]; then
   else
     echo "specialty scoring OFF (set GENERAL_IMATRIX=<general .dat> to identify programming-specific experts)."
   fi
-  "$PY" "$HERE/router_norms_from_imatrix.py" "$IMATRIX" \
-      --n-expert "$N_EXPERT" --part "$RANK_PART" --rank-by energy \
-      "${BASELINE_ARGS[@]}" --out "$NORMS"
+  # router_norms_from_imatrix.py 已删(见 git 历史) — 步骤2 跳过, 直接用现成排名/掩码
+  # (data/expert-masks/ 下 base_router_norms.json 与 mask-specialty-k*.bin)。
+  echo "step 2 生成器已删(见 git 历史); 用现成 $NORMS 或 data/expert-masks/ 掩码"
 else
   echo "imatrix not present yet ($IMATRIX); skipping step 2 (needs step 1)."
 fi
@@ -110,9 +110,10 @@ if [[ -f "$NORMS" ]]; then
   # token->expert hash that bypasses the -inf keep-mask; shrinking them silently
   # misroutes (route_translate clamps dropped picks to slot 0).  Force-keep them
   # whole for routing correctness (costs ~3 layers of full experts).
-  "$PY" "$HERE/make_expert_mask.py" "$NORMS" --keep-top-k "$KEEP_TOP_K" \
-      --hash-layers "${HASH_LAYERS:-3}" --out "$MASK"
-  echo "hot mask: $MASK  (keep-top-$KEEP_TOP_K/layer + hash layers 0..2 full; use --keep-list for per-layer K)"
+  # make_expert_mask.py 已删(见 git 历史) — 步骤3 跳过, 直接用 data/expert-masks/ 现成 mask。
+  [ -f "$MASK" ] || MASK="$HERE/data/expert-masks/mask-specialty-k${KEEP_TOP_K}.bin"
+  [ -f "$MASK" ] && echo "hot mask(现成): $MASK" \
+      || echo "★现成 mask 缺(k${KEEP_TOP_K}); 可用: $(ls "$HERE"/data/expert-masks/mask-*.bin 2>/dev/null | xargs -n1 basename | tr '\n' ' ')★"
 else
   echo "router_norms not present yet ($NORMS); skipping step 3 (needs step 2)."
 fi

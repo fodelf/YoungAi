@@ -19,6 +19,7 @@ set -uo pipefail
 export LC_ALL=en_US.UTF-8   # nohup/C locale 下 bash 会把 "$L失败" 解析成多字节变量名, set -u 误杀 lane(08-14 事故)
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 SC="$ROOT/gguf-tools/scripts"
+[ -x "$ROOT/gguf-tools/amp/zlayer" ] || make -C "$ROOT/gguf-tools" zlayer   # C 反修解算器(zlayer.py 已删)
 . "$SC/_portable.sh"   # 盘闸/看门狗/stat 的跨平台形态(Linux 上 BSD 形态会静默失效)
 G7="$ROOT/gguf/go-onebit/g7"
 R30="$ROOT/gguf/go-onebit/r30"
@@ -304,7 +305,7 @@ stage_metrics(){
 }
 
 # ==== md86 两段式反修(2026-08-10 归并; 用户设计: ①每层贪心最优 ②收尾链态一遍) ====
-# 消费 zlayer.py 全套新旋钮(组件门/ftA/链模式); 锚与层目录经 env 注入:
+# 消费 zlayer(C 版)全套旋钮(组件门/ftA/链模式); 锚与层目录经 env 注入:
 #   MD_ANCHOR=FP锚  MD_CHAIN=链态锚  MD_LAYERS=层目录  MD_IDS=ids  MD_S=总token  MD_FR=fit区间  MD_EV=ev区间
 stage_zside2(){   # ①统一反修43层(2026-08-13 定版): 每层 z+GE → 组合<ERF_BAR 时叠加 ERF(权重空间
     #   ΔW_w2 SVD r 方向+α残差重加权+token能量门, 记录 zl.ERF, C 回放 type8)。双路并行;
@@ -319,7 +320,7 @@ stage_zside2(){   # ①统一反修43层(2026-08-13 定版): 每层 z+GE → 组
         rm -f "$MD_LAYERS/zcache_L$(printf %02d $L).npz"   # 层前必删: 陈旧缓存(异尺锚)复用=IndexError 崩 lane(08-14 事故)
         env VECLIB_MAXIMUM_THREADS=4 DS4_ZL_NTOK=$MD_S DS4_ZL_FIT_RANGES=$MD_FR DS4_ZL_EV_RANGE=$MD_EV \
             DS4_ZL_ERF_R="${ERF_R:-16}" DS4_ZL_ERF_BAR="${ERF_BAR:-0.01}" DS4_ZL_SWLIM="${ZL_SWLIM:-10}" DS4_ZL_GE_LAM="${GE_LAM:-1e-3}" \
-            python3 -u gguf-tools/go-onebit/zlever/zlayer.py "$DS4_HF" "$MD_LAYERS" "$MD_ANCHOR" $L 1024 1 \
+            gguf-tools/amp/zlayer "$DS4_HF" "$MD_LAYERS" "$MD_ANCHOR" $L 1024 1 \
             || LOG "★贪心L${L}失败★"
         rm -f "$MD_LAYERS/zcache_L$(printf %02d $L).npz"
     done; }
@@ -345,11 +346,12 @@ stage_sweep(){    # ②收尾链态一遍: 回放建链锚(带全部贪心记录
         cp -c "$MD_LAYERS/dql_L$LL.bin" "$MD_LAYERS/dql_L$LL.bak" 2>/dev/null \
             || cp "$MD_LAYERS/dql_L$LL.bin" "$MD_LAYERS/dql_L$LL.bak"   # APFS clone 零成本快照(破坏前先保全)
         local MANBAK=$(grep "^$L " "$MD_LAYERS/zinject_manifest.txt" 2>/dev/null || true)
-        python3 gguf-tools/go-onebit/zlever/pop_layer.py $L "$MD_LAYERS"
+        # pop_layer.py 已删(见 git 历史), 弹层重解无 C 承接 — stage_sweep 响亮失败不静默。
+        LOG "★pop_layer 生成器已删(见 git 历史), 收尾链态整替段不可跑★"; exit 2
         rm -f "$MD_LAYERS/zcache_L$LL.npz"
         env VECLIB_MAXIMUM_THREADS=4 DS4_ZL_XANCHOR=$MD_CHAIN DS4_ZL_NTOK=$MD_S \
             DS4_ZL_FIT_RANGES=$MD_FR DS4_ZL_EV_RANGE=$MD_EV \
-            python3 -u gguf-tools/go-onebit/zlever/zlayer.py "$DS4_HF" "$MD_LAYERS" "$MD_ANCHOR" $L 1024 1 \
+            gguf-tools/amp/zlayer "$DS4_HF" "$MD_LAYERS" "$MD_ANCHOR" $L 1024 1 \
             || LOG "★收尾L$L失败★"
         rm -f "$MD_LAYERS/zcache_L$LL.npz"
         if ! grep -q "^$L " "$MD_LAYERS/zinject_manifest.txt" 2>/dev/null; then
@@ -379,7 +381,7 @@ stage_addon(){   # ②叠加式链修正遍(2026-08-10 用户设计): 链回放(
         rm -f "$MD_LAYERS/zcache_L$(printf %02d $L).npz"
         env VECLIB_MAXIMUM_THREADS=4 DS4_ZL_ADDON=1 DS4_ZL_XANCHOR=$MD_CHAIN DS4_ZL_NTOK=$MD_S \
             DS4_ZL_FIT_RANGES=$MD_FR DS4_ZL_EV_RANGE=$MD_EV \
-            python3 -u gguf-tools/go-onebit/zlever/zlayer.py "$DS4_HF" "$MD_LAYERS" "$MD_ANCHOR" $L 1024 1 \
+            gguf-tools/amp/zlayer "$DS4_HF" "$MD_LAYERS" "$MD_ANCHOR" $L 1024 1 \
             || LOG "★叠加L${L}失败★"
         rm -f "$MD_LAYERS/zcache_L$(printf %02d $L).npz"
     done; }
@@ -434,7 +436,7 @@ stage_dynvol(){   # 动态体积单层探针(2026-08-11 用户令): PL=层 PT=�
     cd "$ROOT"
     rm -f "$R30/nl86/layers/zcache_L$LL.npz"
     env VECLIB_MAXIMUM_THREADS=4 DS4_ZL_NTOK=4683 DS4_ZL_FIT_RANGES=0:1287,1716:3003,3383:4683 DS4_ZL_EV_RANGE=1287:1716 \
-        python3 -u gguf-tools/go-onebit/zlever/zlayer.py "$DS4_HF" "$R30/nl86/layers" "$R30/anchor_md86v2_s4683.bin" $PL 1024 1 2>&1 | tail -6
+        gguf-tools/amp/zlayer "$DS4_HF" "$R30/nl86/layers" "$R30/anchor_md86v2_s4683.bin" $PL 1024 1 2>&1 | tail -6
     rm -f "$R30/nl86/layers/zcache_L$LL.npz"
     LOG "dynvol L$LL@$PT 完"
 }

@@ -6,7 +6,8 @@
 set -uo pipefail
 ROOT=/Users/fodelf/ds4-main
 Q=$ROOT/gguf-tools/amp
-ZL=$ROOT/gguf-tools/go-onebit/zlever
+ZLB="$ROOT/gguf-tools/amp/zlayer"   # C 反修解算器(zlayer.py 已删)
+[ -x "$ZLB" ] || make -C "$ROOT/gguf-tools" zlayer
 SC=$ROOT/gguf-tools/scripts
 R30=$ROOT/gguf/go-onebit/r30
 LAYERS=$R30/q4/layers
@@ -30,7 +31,7 @@ stage_quant(){   # 批量顺序(误差前向吸收), 已有层自动跳过; dql=
 stage_zside(){   # 反修=逐层质量优先 z^L+GE, 注入 dql; zcache 滚动删(盘紧)
     cd "$ROOT"
     for L in $(seq 0 42); do
-        python3 -u $ZL/zlayer.py $ROOT/hf/DeepSeek-V4-Flash-0731 $LAYERS $ANCHOR $L 2048 1 \
+        "$ZLB" $ROOT/hf/DeepSeek-V4-Flash-0731 $LAYERS $ANCHOR $L 2048 1 \
             2>&1 | grep '★' || { LOG "★L$L zside失败★"; exit 3; }
         rm -f $LAYERS/zcache_L$(printf %02d $L).npz
     done

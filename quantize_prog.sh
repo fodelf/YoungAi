@@ -44,12 +44,11 @@ SKIP_NFS="${SKIP_NFS:-0}"                                                # 1=跳
 DRY_ONLY="${DRY_ONLY:-0}"                                                # 1=只跑到干跑投影尺寸就退出(验证流水线)
 mkdir -p "$ROOT/gguf"
 
-echo "==== [0/7] 重建量化器(确保 --hash-w* 可用)+ 建 k${KEEP_TOP_K} 特化 mask ===="
+echo "==== [0/7] 重建量化器(确保 --hash-w* 可用)+ 取现成 k${KEEP_TOP_K} 特化 mask ===="
 make -C "$ROOT/gguf-tools" deepseek4-quantize 2>&1 | grep -iE "error" && { echo '✗ 量化器编译失败'; exit 1; }
-[ -f "$NORMS" ] || { echo "✗ 缺特化排名 $NORMS"; exit 1; }
-"$PY" "$ROOT/gguf-tools/make_expert_mask.py" "$NORMS" \
-  --keep-top-k "$KEEP_TOP_K" --hash-layers 3 --out "$MASK" || { echo '✗ mask 失败'; exit 1; }
-echo "  ✓ mask: $MASK (hash层0-2全留256, 路由层3-42留top-${KEEP_TOP_K})"
+# mask 生成器 make_expert_mask.py 已删(见 git 历史) — 直接消费 data/expert-masks/ 现成 mask。
+[ -f "$MASK" ] || { echo "✗ 现成 mask 缺: $MASK (生成器已删; 可用: $(ls "$ROOT/gguf-tools/data/expert-masks/"mask-specialty-k*.bin 2>/dev/null | xargs -n1 basename | tr '\n' ' '))"; exit 1; }
+echo "  ✓ mask(现成): $MASK (hash层0-2全留256, 路由层3-42留top-${KEEP_TOP_K})"
 
 mkdir -p "$MNT"
 NFS_READY=0; { [ "$SKIP_NFS" = 1 ] || [ -f "$MNT/gguf/$Q2" ]; } && NFS_READY=1
@@ -124,7 +123,7 @@ RC=$?; kill "$WD" 2>/dev/null
 
 echo "==== [6/7] 完成 + 每层尺寸(供切分) ===="
 ls -la "$OUT" | awk '{printf "  ✓ 编程模型: %.2f GiB  -> %s\n",$5/1073741824,$9}'
-"$PY" "$ROOT/gguf-tools/layer_sizes.py" "$OUT" 2>/dev/null | tail -4
+# layer_sizes.py 已删(切分功能已下线, 见 git 历史)
 
 # split_prog.sh 已删(纯驱动已删的 split_gguf_layers.py/balanced_split.py, 见 git 历史);
 # 自动切分功能待 C 承接, 现在只提示。

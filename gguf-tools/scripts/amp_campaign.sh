@@ -28,7 +28,8 @@
 set -uo pipefail
 ROOT="$HOME/ds4-main"
 SC="$ROOT/gguf-tools/scripts"
-ZL="$ROOT/gguf-tools/go-onebit/zlever"
+ZLB="$ROOT/gguf-tools/amp/zlayer"   # C 反修解算器(zlayer.py 已删, 接线照 amp_clean_full.sh 已验证参数位)
+[ -x "$ZLB" ] || make -C "$ROOT/gguf-tools" zlayer
 QD="$ROOT/gguf-tools/amp"
 R30="$ROOT/gguf/go-onebit/r30"
 G7="$ROOT/gguf/go-onebit/g7"
@@ -63,7 +64,7 @@ watchdog_start(){
         A=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo)
         if [ "${A:-99}" -lt "$MEM_FLOOR_GB" ]; then
             echo "[watchdog] MemAvailable=${A}GB < ${MEM_FLOOR_GB}GB ★杀本段★" >&2
-            pkill -9 -f 'ds4 --cuda'; pkill -9 -f ds4quant_run; pkill -9 -f zlayer.py
+            pkill -9 -f 'ds4 --cuda'; pkill -9 -f ds4quant_run; pkill -9 -f 'amp/zlayer'
             break
         fi; sleep 5
       done ) & WD=$!
@@ -146,11 +147,11 @@ stage_capture(){   # 学生: 引擎跑普通全 q2 基座的真值(一切都是�
 solve_one(){   # $1=层 $2=(保留位) $3=输出
     local L=$1 ZCF="$AMP/zcache_L$(printf %02d $1).npz"
     # 第 7 位置参数 = 引擎捕获目录(x 与被乘量取真值), 命令行里可见, 不用 env。
-    # 其余 DS4_ZL_* 是 zlayer.py 上游既有开关, 非本轮新增。
+    # 其余 DS4_ZL_* 是 zlayer(C 版)既有开关, 非本轮新增。
     [ -f "$ZCF" ] || env DS4_ZL_GGUF="$MDL" DS4_ZL_NTOK="$S" \
         DS4_ZL_GE=0 DS4_ZL_FTA=0 DS4_ZL_ERF=0 DS4_ZL_SWLIM=60 DS4_ZL_GATE=99 \
-        python3 -u "$ZL/zlayer.py" "$DS4_HF" "$AMP" "$ANCHOR" "$L" 1024 0 "$CAP" "${PREV:--}" 2>&1 \
-        | grep -aE "XCAP|Error|Traceback|assert|★" \
+        "$ZLB" "$DS4_HF" "$AMP" "$ANCHOR" "$L" 1024 0 "$CAP" "${PREV:--}" 2>&1 \
+        | grep -aE "XCAP|Error|assert|★" \
         || DIE "L$L zcache 失败(完整输出见上)"
     "$(dirname "$0")/../legacy/amp_solve_zc" "$ANCHOR" "$ZCF" "$3" || DIE "L$L 解算失败"   # 动态 z 已写死
 }

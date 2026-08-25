@@ -9,7 +9,7 @@
 #
 # 为什么单独一个脚本而不是直接用 r30_campaign.sh: 那个是**战役**驱动(锚/plan/量化/反修/
 # 学生/合并/指标 全链), 这里只要它的 merge 一段, 且 Spark 上没有锚也不需要重量化。
-# 合并本身仍然调它同一套工具(vq_merge_v4.c / dql_down_offset.py / skel_from_hf.sh),
+# 合并本身仍然调它同一套工具(vq_merge_v4.c / skel_from_hf.sh; down 偏移表生成器已删只消费现成),
 # 没有另起炉灶。
 set -uo pipefail
 
@@ -50,9 +50,9 @@ do_merge(){
     LOG "输出盘可用 ${free} GiB (合并产物 ~89.8 GiB / 96.4 GB)"
     [ "${free:-0}" -ge 100 ] || { LOG "★盘不足 100G 停★"; exit 7; }
 
-    LOG "生成 down 偏移表"
-    python3 "$SC/dql_down_offset.py" "$LAYERS" "$NL" > "$OUTF/down_offsets.txt" \
-        || { LOG "★down 偏移表失败★"; exit 5; }
+    # down 偏移表生成器 dql_down_offset.py 已删(见 git 历史) — 只消费盘上现成产物。
+    [ -s "$OUTF/down_offsets.txt" ] || { LOG "★down_offsets.txt 缺且生成器已删(见 git 历史)★"; exit 5; }
+    LOG "复用现成 down 偏移表 $OUTF/down_offsets.txt"
 
     LOG "起合并(VQ 冠军形态: blob+down+骨架, 非消费式=源全保留)"
     rm -f "$MDL"

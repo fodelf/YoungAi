@@ -18,20 +18,13 @@ for N in 1528 217; do
         -m "$ROOT/gguf/ds4-iq2.gguf" --score-ids "/tmp/p2_trunc$N.ids" \
         --score-out "/tmp/p2_trunc$N.bin" </dev/null 2>&1 | grep -aE "完成" | tail -1
 done
-python3 - <<'PY'
-import numpy as np, sys
-sys.path.insert(0, "gguf-tools/scripts")
-from anchor_metrics import read_student_logits, log_softmax
-ids = [int(t) for t in open("gguf/go-onebit/g7/wt2.ids").read().split()]
-full = read_student_logits("/tmp/p2_iq2_wt2.bin")
-lfull = log_softmax(full)
-for N, poss in [(1528, [1526, 1527, 216]), (217, [216])]:
-    t = read_student_logits(f"/tmp/p2_trunc{N}.bin")
-    lt = log_softmax(t)
-    for p in poss:
-        true = ids[p+1]
-        infut = "未来在输入" if p+1 < N else "★未来不在输入★"
-        print(f"截断{N} pos={p} true={true} [{infut}]  "
-              f"截断跑 lnp(true)={lt[p,true]:+.3f} top1={int(np.argmax(lt[p]))}  |  "
-              f"全长跑 lnp(true)={lfull[p,true]:+.3f}")
-PY
+# 原逐位置 lnp 细察(anchor_metrics.py)随全仓 Python 清零删除(见 git 历史)。
+# C 版 bench/anchor_metrics 以全长跑 dump 作参考、截断跑 dump 作学生, 五指标聚合判
+# "截断是否改了截断点之前的分布"(逐位置打印见 git 历史 py 版)。
+AM="$(dirname "$0")/../bench/anchor_metrics"
+[ -x "$AM" ] || make -C "$(dirname "$0")/.." anchor_metrics
+for N in 1528 217; do
+  echo "== 截断$N vs 全长 =="
+  "$AM" --ref-raw /tmp/p2_iq2_wt2.bin --ids gguf/go-onebit/g7/wt2.ids \
+        --stu-raw "/tmp/p2_trunc$N.bin"
+done

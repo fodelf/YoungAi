@@ -5652,7 +5652,7 @@ int main(int argc,char**argv){
     if(getenv("DS4_GO2B_HOT")&&atoi(getenv("DS4_GO2B_HOT"))){
         /* 热专家 go2b 合并态量化(残差+量化一体, 消漂移): 热表加载失败=硬拒(禁静默退 go1b) */
         const char*hp=getenv("DS4_GO2B_HOT_TABLE");
-        const char*cands[3]={hp,"../corpus/prog_active_top64.txt","gguf-tools/go-onebit/corpus/prog_active_top64.txt"};
+        const char*cands[3]={hp,"../data/corpus/prog_active_top64.txt","gguf-tools/data/corpus/prog_active_top64.txt"};
         int okh=-1;
         for(int i=0;i<3;i++){ if(!cands[i])continue; if(go2b_hot_load(cands[i],NLAYERS)==0){ okh=i; break; } }
         if(okh<0){ fprintf(stderr,"[go2b] ★热表读失败(DS4_GO2B_HOT_TABLE/默认两处) — 硬拒★\n"); exit(8); }

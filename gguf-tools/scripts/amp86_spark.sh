@@ -9,7 +9,8 @@
 set -uo pipefail
 ROOT="$HOME/ds4-main"
 SC="$ROOT/gguf-tools/scripts"
-ZL="$ROOT/gguf-tools/go-onebit/zlever"
+ZLB="$ROOT/gguf-tools/amp/zlayer"   # C 反修解算器(zlayer.py 已删)
+[ -x "$ZLB" ] || make -C "$ROOT/gguf-tools" zlayer
 R30="$ROOT/gguf/go-onebit/r30"
 G7="$ROOT/gguf/go-onebit/g7"
 MDL="$ROOT/gguf/ds4-allq2.gguf"
@@ -44,7 +45,7 @@ stage_solve(){
         ZCF="$AMP/zcache_L$(printf %02d $L).npz"
         [ -f "$ZCF" ] || env DS4_ZL_GGUF="$MDL" DS4_ZL_NTOK=2048 DS4_ZL_GE=0 DS4_ZL_FTA=0 \
             DS4_ZL_ERF=0 DS4_ZL_SWLIM=60 DS4_ZL_GATE=99 \
-            python3 -u "$ZL/zlayer.py" "$DS4_HF" "$AMP" "$ANCHOR" $L 1024 0 >/dev/null 2>&1 \
+            "$ZLB" "$DS4_HF" "$AMP" "$ANCHOR" $L 1024 0 >/dev/null 2>&1 \
             || { LOG "★L$L zcache 失败★"; exit 3; }
         "$(dirname "$0")/../legacy/amp_solve_zc" "$ANCHOR" "$ZCF" "$REC" 1638 || { LOG "★L$L 解算失败★"; exit 3; }
         rm -f "$ZCF"

@@ -9,6 +9,7 @@
 set -e
 export LC_ALL=en_US.UTF-8
 ROOT=/Users/fodelf/ds4-main
+[ -x "$ROOT/gguf-tools/amp/zlayer" ] || make -C "$ROOT/gguf-tools" zlayer   # C 反修解算器(zlayer.py 已删)
 R30=$ROOT/gguf/go-onebit/r30
 LD=$R30/en86/layers
 DS4_HF=$ROOT/hf/DeepSeek-V4-Flash-0731
@@ -53,7 +54,7 @@ run_arm() { # $1=layer $2=臂名 $3=fit范围
   Lz=$(printf "%02d" "$1"); lg=/tmp/domz_${2}_L$Lz$TAG.log
   env VECLIB_MAXIMUM_THREADS=4 DS4_ZL_NTOK=$NTOK DS4_ZL_FIT_RANGES="$3" \
     DS4_ZL_EV_RANGE="$EVR" DS4_ZL_SWLIM=60 \
-    python3 -u gguf-tools/go-onebit/zlever/zlayer.py \
+    gguf-tools/amp/zlayer \
     "$DS4_HF" "$LD" "$ANCHOR" "$1" 1024 2 >"$lg" 2>&1
   grep -E "分域组合|held挽回" "$lg" | sed "s/^/[$2 L$Lz] /" >> $SUM
   mv "$LD/zrec_L$Lz.bin" "$BK/zrec_L$Lz.$2$TAG.bin" 2>/dev/null || true

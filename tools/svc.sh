@@ -62,7 +62,8 @@ KNOWLEDGE=${KNOWLEDGE-gguf-tools/data/corpus/knowledge.txt}
 [ -n "${COMPACT:-}" ] && ENVSTR="$ENVSTR DS4_PRIMER_COMPACT=$COMPACT"
 # PIN=1(2026-07-14 用户洞察: 活跃专家进RAM): 静态白名单钉 code 域 top-k 活跃专家进
 # GPU 常驻池(绕过自动热锁 warmup, 确定性)。表 /tmp/code_pin.{coord,worker}.pinned 由
-# gen_pinned.py 从 s305 锚生成, 按层切(coord 0-19 / worker 20-42)。池 5G(装下 ~4-4.5G
+# gen_pinned.py(已删, 见 git 历史)当年从 s305 锚生成, 按层切(coord 0-19 / worker 20-42);
+# 现只消费 /tmp 既有表, 重新生成需 checkout 历史。池 5G(装下 ~4-4.5G
 # top64 + 余量); 内存: backbone 4G + 池 5G = 9G < 12G 红线, 看门狗兜底。
 PIN=${PIN:-}
 POOL_MB=${POOL_MB:-}

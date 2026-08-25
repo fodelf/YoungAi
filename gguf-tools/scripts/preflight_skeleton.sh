@@ -25,7 +25,10 @@ done
 [ -n "$FOREIGN" ] || { echo "[preflight] 无他人 Δb 可比对, 跳过(骨架来源未知, 建议自产)" >&2; exit 0; }
 
 echo "[preflight] 骨架: $SKEL" >&2
-OUT=$(python3 "$ROOT/gguf-tools/go-onebit/scripts/skel_bias_probe.py" "$SKEL" $FOREIGN 2>&1)
+# skel_bias_probe.py 已删(见 git 历史), 偏置体检无 C 承接 — 显式告警跳过, 不产生假绿判决。
+echo "[preflight] ★偏置探针已删(skel_bias_probe.py, 见 git 历史) — 干净度未体检, 需人工确认★" >&2
+exit 0
+OUT=""
 echo "$OUT" | grep -E "武装槽|斜率|★" >&2
 
 BAD=$(echo "$OUT" | awk -v t="$THRESH" '

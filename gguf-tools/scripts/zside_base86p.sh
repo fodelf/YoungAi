@@ -9,6 +9,7 @@
 # 用法: bash zside_base86p.sh [lane数=4]
 set -uo pipefail
 ROOT="$HOME/ds4-main"
+[ -x "$ROOT/gguf-tools/amp/zlayer" ] || make -C "$ROOT/gguf-tools" zlayer   # C 反修解算器(zlayer.py 已删)
 LAYERS="${ZS_LAYERS:-$ROOT/gguf/go-onebit/r30/base86p/layers}"
 ANCHOR="${ZS_ANCHOR:-$ROOT/gguf/go-onebit/r30/anchor_cal9_s2906.bin}"
 ZS_NTOK="${ZS_NTOK:-2906}"
@@ -56,7 +57,7 @@ PY
             DS4_ZL_EV_RANGE="$ZS_EV" \
             DS4_ZL_GE="${DS4_ZL_GE:-0}" DS4_ZL_FTA="${DS4_ZL_FTA:-0}" DS4_ZL_ERF="${DS4_ZL_ERF:-0}" \
             DS4_ZL_ERF_R=16 DS4_ZL_ERF_BAR=0.01 DS4_ZL_SWLIM=60 DS4_ZL_GE_LAM=1e-3 \
-            python3 -u "$ROOT/gguf-tools/go-onebit/zlever/zlayer.py" \
+            "$ROOT/gguf-tools/amp/zlayer" \
             "$DS4_HF" "$LAYERS" "$ANCHOR" $L 1024 "$ZS_INJ" 2>&1 | grep -E "★|失败" \
             | tee "$LAYERS/zl_L$NN.out" \
             || { LOG "★L$L 失败★"; echo "$L" >> "$FAILF"; }

@@ -10,7 +10,6 @@
 set -uo pipefail
 ROOT="$HOME/ds4-main"
 SC="$ROOT/gguf-tools/scripts"
-ZL="$ROOT/gguf-tools/go-onebit/zlever"
 R30="$ROOT/gguf/go-onebit/r30"
 G7="$ROOT/gguf/go-onebit/g7"
 OUT="${F86_OUT:-$R30/full86}"
@@ -78,7 +77,8 @@ stage_cap(){
     env DS4_CAP_DIR="$CAP" DS4_CUDA_NO_TOKEN_GRAPH=1 timeout --foreground 3000 \
         ./ds4 --cuda -m "$MDL" "${ZARG[@]+"${ZARG[@]}"}" \
         --score-ids "$IDS" --score-out "/tmp/${TAG}_capscore.bin" </dev/null 2>&1 | tail -1
-    python3 "$SC/cap_to_anchor.py" "$CAP" "$IDS" "$CHA" 43 || { LOG "★锚转换失败★"; exit 2; }
+    # cap_to_anchor.py 生成器已删(见 git 历史), 链态锚转换无 C 承接 — 响亮失败不静默。
+    LOG "★cap_to_anchor 生成器已删(见 git 历史), 链态锚战役(F86_CAP=1)不可跑★"; exit 2
 }
 
 stage_solve(){

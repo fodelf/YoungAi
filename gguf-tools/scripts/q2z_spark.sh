@@ -4,6 +4,7 @@
 # ②阶段可从 anchor 起。用法: bash q2z_spark.sh [anchor|quant|zside|all]
 set -uo pipefail
 ROOT="$HOME/ds4-main"
+[ -x "$ROOT/gguf-tools/amp/zlayer" ] || make -C "$ROOT/gguf-tools" zlayer   # C 反修解算器(zlayer.py 已删)
 SC="$ROOT/gguf-tools/scripts"
 R30="$ROOT/gguf/go-onebit/r30"
 OUTF="$R30/full"
@@ -54,7 +55,7 @@ stage_zside(){
     for L in $(seq 0 $((NL-1))); do
         F="$LAYERS/$(printf 'dql_vq_L%02d.bin' $L)"
         [ -f "$F" ] || { LOG "★L$L 未量化, 停★"; exit 2; }
-        python3 -u "$ROOT/gguf-tools/go-onebit/zlever/zlayer.py" "$DS4_HF" "$LAYERS" "$ANCHOR" "$L" 1024 1 \
+        "$ROOT/gguf-tools/amp/zlayer" "$DS4_HF" "$LAYERS" "$ANCHOR" "$L" 1024 1 \
             2>&1 | tee -a /tmp/q2z_zside.log | grep '★' || true
     done
     LOG "z 侧车段收官"
