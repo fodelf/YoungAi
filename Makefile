@@ -14,6 +14,11 @@ OBJCFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -fo
 LDLIBS ?= -lm -pthread
 METAL_SRCS := $(wildcard metal/*.metal)
 
+# CLI 模块(重构阶段3: ds4_cli.c 拆分为 src/cli/*.c)
+CLI_SRCS := $(wildcard src/cli/*.c)
+CLI_OBJS := $(CLI_SRCS:.c=.o)
+CLI_CPU_OBJS := $(CLI_SRCS:.c=_cpu.o)
+
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal -framework Accelerate
 MM_OBJS = ds4_multimodal.o ds4_spatial.o ds4_css.o
@@ -48,8 +53,8 @@ help:
 	@echo "  make test         Build and run tests"
 	@echo "  make clean        Remove build outputs"
 
-ds4: ds4_cli.o linenoise.o $(CORE_OBJS)
-	$(CC) $(CFLAGS) -o $@ ds4_cli.o linenoise.o $(CORE_OBJS) $(METAL_LDLIBS)
+ds4: $(CLI_OBJS) linenoise.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(CLI_OBJS) linenoise.o $(CORE_OBJS) $(METAL_LDLIBS)
 
 ds4-server: ds4_server.o ds4_kvstore.o rax.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ ds4_server.o ds4_kvstore.o rax.o $(CORE_OBJS) $(METAL_LDLIBS)
@@ -72,8 +77,8 @@ mm-ui: tools/mm_ui.swift
 mm-ocr: tools/mm_ocr.swift
 	swiftc -O tools/mm_ocr.swift -o $@
 
-cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu.o ds4_web.o ds4_kvstore.o linenoise.o rax.o $(CPU_CORE_OBJS)
-	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
+cpu: $(CLI_CPU_OBJS) ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu.o ds4_web.o ds4_kvstore.o linenoise.o rax.o $(CPU_CORE_OBJS)
+	$(CC) $(CFLAGS) -o ds4 $(CLI_CPU_OBJS) linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-server ds4_server_cpu.o ds4_kvstore.o rax.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-bench ds4_bench_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-eval ds4_eval_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
@@ -107,7 +112,7 @@ cuda:
 	fi
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH="$(CUDA_ARCH)"
 
-ds4: ds4_cli.o linenoise.o $(CORE_OBJS)
+ds4: $(CLI_OBJS) linenoise.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 ds4-server: ds4_server.o ds4_kvstore.o rax.o $(CORE_OBJS)
@@ -122,8 +127,8 @@ ds4-eval: ds4_eval.o $(CORE_OBJS)
 ds4-agent: ds4_agent.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu.o ds4_web.o ds4_kvstore.o linenoise.o rax.o $(CPU_CORE_OBJS)
-	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
+cpu: $(CLI_CPU_OBJS) ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu.o ds4_web.o ds4_kvstore.o linenoise.o rax.o $(CPU_CORE_OBJS)
+	$(CC) $(CFLAGS) -o ds4 $(CLI_CPU_OBJS) linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-server ds4_server_cpu.o ds4_kvstore.o rax.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-bench ds4_bench_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-eval ds4_eval_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
@@ -180,8 +185,11 @@ ds4_corr_cpu.o: ds4_corr.c ds4_internal.h ds4.h
 ds4_zchain.o: ds4_zchain.c ds4_zchain.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_zchain.c
 
-ds4_cli.o: ds4_cli.c ds4.h ds4_distributed.h linenoise.h
-	$(CC) $(CFLAGS) -c -o $@ ds4_cli.c
+src/cli/%.o: src/cli/%.c src/cli/cli_internal.h ds4.h ds4_distributed.h linenoise.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+src/cli/%_cpu.o: src/cli/%.c src/cli/cli_internal.h ds4.h ds4_distributed.h linenoise.h
+	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ $<
 
 ds4_distributed.o: ds4_distributed.c ds4_distributed.h ds4.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_distributed.c
@@ -219,8 +227,7 @@ linenoise.o: linenoise.c linenoise.h
 ds4_cpu.o: ds4.c ds4.h ds4_internal.h ds4_distributed.h ds4_gpu.h ds4_multimodal.h ds4_spatial.h ds4_css.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4.c
 
-ds4_cli_cpu.o: ds4_cli.c ds4.h ds4_distributed.h linenoise.h
-	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_cli.c
+
 
 ds4_server_cpu.o: ds4_server.c ds4.h ds4_distributed.h ds4_kvstore.h ds4_multimodal.h rax.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_server.c
@@ -262,7 +269,7 @@ test: ds4_test ds4-eval ds4_unit
 	./ds4_test
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_unit e0-pingpong mm-ui mm-ocr *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_unit e0-pingpong mm-ui mm-ocr *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o src/cli/*.o
 
 # Task 04 / E0: standalone thunderbolt ping-pong latency gate (no core deps, no
 # model). Defined after the default targets so it never becomes the default goal.

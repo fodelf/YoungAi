@@ -1,0 +1,132 @@
+/* cli_internal.h — ds4 CLI 模块内部头(重构阶段3, 自 ds4_cli.c 机械拆分)。
+ * 只声明跨文件符号; 命名与拆分前完全一致。文件分工:
+ *   cli_main.c  信号/分布式等待 + main
+ *   cli_opts.c  参数解析原语 + read_prompt_file + parse_options
+ *   cli_print.c usage/内存日志/think 提示/时钟/预填进度/token printer/JSON 输出
+ *   cli_gen.c   构建 prompt + 采样生成主循环 + run_generation 分派
+ *   cli_diag.c  诊断模式族(score-ids/logits/logprobs/perplexity)
+ *   cli_repl.c  交互 REPL 与多轮会话 */
+#ifndef DS4_CLI_INTERNAL_H
+#define DS4_CLI_INTERNAL_H
+
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+
+#include "ds4.h"
+#include "ds4_distributed.h"
+
+typedef struct {
+    const char *prompt;
+    const char *system;
+    int n_predict;
+    int ctx_size;
+    float temperature;
+    float top_p;
+    float min_p;
+    uint64_t seed;
+    bool dump_tokens;
+    bool classify_only;   /* --classify: print Mode P/G route for -p prompt, no model load */
+    bool route;           /* --route: classify prompt, then load prog/daily model */
+    const char *route_prog;   /* --route-prog: resident programming model (Mode P) */
+    const char *route_daily;  /* --route-daily: full cached model (Mode G) */
+    const char *dump_logits_path;
+    const char *score_ids_path;   /* --score-ids: teacher-forced 逐位打分(公开对拍) */
+    const char *score_out_path;
+    const char *dump_logprobs_path;
+    int dump_logprobs_top_k;
+    const char *perplexity_file_path;
+    const char *imatrix_dataset_path;
+    const char *imatrix_output_path;
+    int imatrix_max_prompts;
+    int imatrix_max_tokens;
+    ds4_think_mode think_mode;
+    bool head_test;
+    bool first_token_test;
+    bool metal_graph_test;
+    bool metal_graph_full_test;
+    bool metal_graph_prompt_test;
+} cli_generation_options;
+
+typedef struct {
+    ds4_engine_options engine;
+    ds4_dist_options *dist;
+    cli_generation_options gen;
+    char *prompt_owned;
+    bool inspect;
+} cli_config;
+
+typedef struct {
+    int base_tokens;
+    int input_tokens;
+    bool use_color;
+    bool finished;
+} cli_prefill_progress;
+
+typedef struct {
+    ds4_engine *engine;
+    FILE *fp;
+    bool format_thinking;
+    bool in_think;
+    bool color_open;
+    bool use_color;
+    bool last_output_newline;
+    char pending[16];
+    size_t pending_len;
+} token_printer;
+
+typedef struct {
+    ds4_session *session;
+    ds4_tokens transcript;
+    int ctx_size;
+    int max_prefix_tokens;
+} repl_chat;
+
+/* cli_main.c */
+void cli_sigint_handler(int sig);
+bool cli_interrupt_requested(void);
+void cli_interrupt_clear(void);
+bool cli_distributed_coordinator(const cli_config *cfg);
+void cli_dist_busy_set(const cli_config *cfg, bool busy);
+int  cli_wait_distributed_route(const cli_config *cfg, ds4_session *session);
+
+/* cli_opts.c */
+int parse_int(const char *s, const char *opt);
+uint64_t parse_u64(const char *s, const char *opt);
+float parse_float_range(const char *s, const char *opt, float min, float max);
+ds4_backend parse_backend(const char *s);
+ds4_backend default_backend(void);
+cli_config parse_options(int argc, char **argv);
+char *read_prompt_file(const char *path, bool fatal);
+
+/* cli_print.c */
+void usage(FILE *fp);
+void log_context_memory(ds4_backend backend, int ctx_size);
+ds4_think_mode cli_effective_think_mode(const cli_generation_options *gen);
+bool cli_think_max_downgraded(const cli_generation_options *gen);
+void cli_warn_think_max_downgraded(const cli_generation_options *gen, const char *name);
+double cli_now_sec(void);
+void cli_prefill_progress_cb(void *ud, const char *event, int current, int total);
+void token_printer_process(token_printer *p, const char *text, size_t len, bool finish);
+void token_printer_finish(token_printer *p);
+void token_printer_write_text(token_printer *p, const char *text, size_t len);
+void generation_done(void *ud);
+void json_write_string(FILE *fp, const char *s, size_t n);
+void json_write_token(FILE *fp, ds4_engine *engine, int token);
+
+/* cli_gen.c */
+bool is_rendered_chat_prompt(const char *prompt);
+void build_prompt(ds4_engine *engine, const cli_generation_options *gen, ds4_tokens *out);
+int  run_sampled_generation(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt);
+int  run_generation(ds4_engine *engine, const cli_config *cfg);
+
+/* cli_diag.c */
+int run_score_ids(ds4_engine *engine, const cli_config *cfg);
+int run_logits_dump(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt);
+int run_logprob_dump(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt);
+int run_perplexity_file(ds4_engine *engine, const cli_config *cfg);
+
+/* cli_repl.c */
+int run_repl(ds4_engine *engine, cli_config *cfg);
+
+#endif /* DS4_CLI_INTERNAL_H */
