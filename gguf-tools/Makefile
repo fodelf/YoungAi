@@ -52,6 +52,7 @@ PUBBENCH_INC := $(wildcard $(BEN)/pubbench_p*.inc.c)
 EMITZ_INC := $(wildcard $(AMP)/emit_z_p*.inc.c)
 CALIBDIAG_INC := $(wildcard $(CAL)/calib_diag_p*.inc.c)
 HVSOLVE_INC := $(wildcard $(AMP)/hiddenvar_solve_p*.inc.c)
+RRR_INC := $(wildcard $(AMP)/solve_rrr_p*.inc.c)
 
 ifeq ($(UNAME_S),Darwin)
 NATIVE ?= -mcpu=native
@@ -310,7 +311,7 @@ calib_run: calib_run.bin
 CALIB_RUN_SRC := $(CAL)/calib_run.c $(CAL)/npy.c $(CAL)/hf_read.c $(QZ)/onebit_quant.c \
     $(CAL)/layer_probe.c $(AMP)/hiddenvar_solve.c $(SLV)/solve_perexpert.c $(SLV)/solve_denoise.c \
     $(SLV)/solve_genrf.c $(AMP)/solve_rrr.c $(AMP)/linalg_small.c
-calib_run.bin: $(CALIB_RUN_SRC) $(HVSOLVE_INC)
+calib_run.bin: $(CALIB_RUN_SRC) $(HVSOLVE_INC) $(RRR_INC)
 	$(CC) $(CFLAGS) $(NATIVE) $(CPPFLAGS) $(INC) -o calib_run $(CALIB_RUN_SRC) -lm -pthread
 
 calib_diag: calib_diag.bin
