@@ -62,7 +62,7 @@ stage_rte(){
         </dev/null 2>&1 | tail -1
     RS_OUT="$RDIR" RS_CAP="$RCAP" RS_ANC="$FPA" bash "$SC/rsolve43.sh" 4 \
         || { LOG "★rte 解算失败★"; exit 2; }
-    python3 "$ZL/zrec_to_zchain.py" "$RDIR" "$RTE" 43 || { LOG "★rte 链失败★"; exit 2; }
+    "$(dirname "$0")/../calib/zrec_to_zchain" "$RDIR" "$RTE" 43 || { LOG "★rte 链失败★"; exit 2; }
 }
 
 stage_cap(){
@@ -102,7 +102,7 @@ stage_solve(){
 stage_chain(){
     LOG "合并 zchain${RTE:+(+route)}"
     [ -n "$RTE" ] && cp -f "$(dirname "$RTE")"/zrec_route_L*.bin "$LDIR"/ 2>/dev/null
-    python3 "$ZL/zrec_to_zchain.py" "$LDIR" "$ZC" 43 || { LOG "★合并失败★"; exit 4; }
+    "$(dirname "$0")/../calib/zrec_to_zchain" "$LDIR" "$ZC" 43 || { LOG "★合并失败★"; exit 4; }
 }
 
 judge_one(){ # $1=标签 $2=ids $3=ref锚 $4=zchain(可空) $5=out
@@ -113,7 +113,7 @@ judge_one(){ # $1=标签 $2=ids $3=ref锚 $4=zchain(可空) $5=out
         "${Z[@]+"${Z[@]}"}" --score-ids "$2" --score-out "$5" </dev/null 2>&1 \
         | grep -aE "zchain loaded|完成" | head -2
     echo "══ 五指标 $1 ══"
-    python3 "$SC/anchor_metrics.py" --ref "$3" --ids "$2" --student "$5" --tail 0 2>&1 | tail -7
+    "$(dirname "$0")/../calib/anchor_metrics" --ref "$3" --ids "$2" --student "$5" --tail 0 2>&1 | tail -7
 }
 
 stage_judge(){

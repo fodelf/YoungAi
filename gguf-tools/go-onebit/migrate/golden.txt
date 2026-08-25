@@ -37,3 +37,19 @@
     ③RNG: numpy RandomState(1).randn 逐位复刻(--selftest-rng)
   结果: 一期过闸 ✓ → amp_clean_full.sh 接线 C; zlayer.py 暂留(二期待补: GGUF/XANCHOR/
     ADDON/ERF/非XCAP/CUDA 提速, C 版对未实现模式硬拒不静默)
+
+[2026-08-25] zlever/zrec_to_zchain.py → calib/zrec_to_zchain.c
+  输入: amp_chain/layers 的 zrec 集 (spark)
+  判定: 输出 zchain 逐字节 md5 相同(70b0bcfc...), stdout 仅文件名参数差
+  结果: 过闸 ✓ → py 删除, 全仓 .sh 调用批量接线 "$(dirname $0)/../calib/zrec_to_zchain"
+
+[2026-08-25] zlever/dql_to_zchain.py → calib/dql_to_zchain.c
+  输入: amp_k64/layers (spark)
+  判定: 输出逐字节 md5 相同(8ed2b42d...), 计数 GE=41 z^L=36 同
+  结果: 过闸 ✓ → py 删除, 调用方批量接线
+
+[2026-08-25] 批量接线勘误: anchor_metrics.py 删除时(bf80cb1)漏接 17 个 .sh 调用方 —
+  本批 perl 全仓统一接线(残留 0), 附 migrate/build_ctools.sh 集中构建器。
+  已知仍破: p2_truncprobe.sh/q4t_teacher_spark.sh/r60_kl_probe.sh 的 heredoc
+  `from anchor_metrics import`(历史探针, Wave D 重写)。
+  svc.sh 两针 JSON → jq(两机 /usr/bin/jq 均有; stderr 诊断格式 dict→JSON, 非判决数)。

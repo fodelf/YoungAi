@@ -16,7 +16,7 @@ L="${P1_L:-00}"
 LN=$((10#$L))
 export P1_L="$L" P1_LN=$LN
 cp "$R30/c86/layers/zrec_L$L.bin" /tmp/p1_zc/
-python3 gguf-tools/go-onebit/zlever/zrec_to_zchain.py /tmp/p1_zc /tmp/p1_L0.zchain 43
+"$(dirname "$0")/../calib/zrec_to_zchain" /tmp/p1_zc /tmp/p1_L0.zchain 43
 LOG "裸跑(捕 x̂/O_pre)"
 env DS4_CAP_DIR=/tmp/p1_cap_bare DS4_CAP_LAYERS=$LN-$LN DS4_CUDA_NO_TOKEN_GRAPH=1 \
     timeout --foreground 1200 ./ds4 --cuda -m gguf/ds4-cal12.gguf \

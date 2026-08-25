@@ -55,7 +55,7 @@ judge_one(){   # $1=α (0=不挂 RB)
         DS4_DUMP_LOGITS="$ST" "$QBIN" "$G7/wt2.ids" 8000 2>&1 | tail -2
     cd "$ROOT"
     echo "══ wt2 五指标 α=$A ══"
-    python3 "$SC/anchor_metrics.py" --ref "$R30/anchor_wt2_s2653.bin" --ids "$G7/wt2.ids" --student "$ST" --tail 5
+    "$(dirname "$0")/../calib/anchor_metrics" --ref "$R30/anchor_wt2_s2653.bin" --ids "$G7/wt2.ids" --student "$ST" --tail 5
 }
 
 stage_judge(){ for A in ${RB_ALPHAS:-0 2.5}; do judge_one "$A"; done; }

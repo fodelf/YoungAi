@@ -35,7 +35,7 @@ if [ ! -f "$ANCHOR" ]; then
   ( cd $ROOT/gguf-tools/go-onebit/quant && \
     env DS4_HF=$DS4_HF DS4_FP_ONLY=1 DS4_ANCHOR="$ANCHOR" DS4_THREADS=8 \
       ./ds4quant_run.dchunk "$IDS" "$NTOK" >/tmp/domz_anchor$TAG.log 2>&1 )
-  python3 gguf-tools/go-onebit/scripts/anchor_metrics.py --ref "$ANCHOR" --ids "$IDS" >/dev/null 2>&1 \
+  "$(dirname "$0")/../calib/anchor_metrics" --ref "$ANCHOR" --ids "$IDS" >/dev/null 2>&1 \
     || { echo "★锚完整性闸失败★" >> $SUM; exit 3; }
   echo "锚 ✓ $(ls -l "$ANCHOR" | awk '{printf "%.2f GiB",$5/1073741824}') $(date +%T)" >> $SUM
 fi

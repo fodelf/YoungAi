@@ -17,7 +17,7 @@ export Q86_ANCHOR="${Q86_ANCHOR:-$CAL9_ANCHOR}" Q86_OUT="${Q86_OUT:-$R30/base86p
 export RPLAN86="${RPLAN86:-$R30/rplan_base86p.txt}" VOLB86="${VOLB86:-95}" DS4_THREADS=6   # GPU 常驻版: 6 流大 kernel(20 流小 kernel 队列争用在案)
 JUDGE_DUMP="${JUDGE_DUMP:-/tmp/base86p_wt2.bin}"
 
-if ! { [ -f "$Q86_ANCHOR" ] && python3 "$SC/anchor_metrics.py" --ref "$Q86_ANCHOR" --ids "$Q86_IDS" >/dev/null 2>&1; }; then
+if ! { [ -f "$Q86_ANCHOR" ] && "$(dirname "$0")/../calib/anchor_metrics" --ref "$Q86_ANCHOR" --ids "$Q86_IDS" >/dev/null 2>&1; }; then
     LOG "锚缺, FP 前向现造 S=$Q86_S → $Q86_ANCHOR"
     cd "$ROOT/gguf-tools/go-onebit/quant"
     DS4_HF="${DS4_HF:-$ROOT/hf/DeepSeek-V4-Flash-0731}" \
@@ -50,6 +50,6 @@ env DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-0731" OPENBLAS_NUM_THREADS=1 DS4_BF_MEMGB
     DS4_DUMP_LOGITS="$JUDGE_DUMP" ./ds4quant_run "$G7/wt2.ids" 8000 2>&1 | tail -2
 cd "$ROOT"
 echo "══ $(basename "$Q86_OUT") 裸判 wt2 五指标(对表: M10裸底 0.4956 | 官方q2 0.4207) ══"
-python3 "$SC/anchor_metrics.py" --ref "$R30/anchor_wt2_s2653.bin" --ids "$G7/wt2.ids" \
+"$(dirname "$0")/../calib/anchor_metrics" --ref "$R30/anchor_wt2_s2653.bin" --ids "$G7/wt2.ids" \
     --student "$JUDGE_DUMP" --tail 5
 LOG "战役收官"

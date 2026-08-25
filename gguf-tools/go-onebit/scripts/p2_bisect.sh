@@ -23,7 +23,7 @@ score_iq2)
         --score-out /tmp/p2_iq2_wt2.bin </dev/null 2>&1 | grep -aE "score|完成|error|fail" | tail -3
     [ -s /tmp/p2_iq2_wt2.bin ] || { LOG "★score 没落盘★"; exit 2; }
     LOG "五指标 vs FP 锚"
-    python3 "$SC/anchor_metrics.py" --ref "$R30/anchor_wt2_s2653.bin" \
+    "$(dirname "$0")/../calib/anchor_metrics" --ref "$R30/anchor_wt2_s2653.bin" \
         --ids "$G7/wt2.ids" --student /tmp/p2_iq2_wt2.bin --tail 0 2>&1 | tail -7
     ;;
 dtypes)

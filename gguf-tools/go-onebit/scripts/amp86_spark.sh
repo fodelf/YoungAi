@@ -54,7 +54,7 @@ stage_solve(){
 
 stage_chain(){
     LOG "③合并 zchain"
-    python3 "$ZL/zrec_to_zchain.py" "$AMP" "$ZC" 43 || { LOG "★合并失败★"; exit 4; }
+    "$(dirname "$0")/../calib/zrec_to_zchain" "$AMP" "$ZC" 43 || { LOG "★合并失败★"; exit 4; }
 }
 
 stage_build(){
@@ -73,7 +73,7 @@ judge_one(){ # $1=标签 $2=zchain(可空) $3=out
     timeout --foreground 3000 ./ds4 --cuda -m "$MDL" "${Z[@]+"${Z[@]}"}" \
         --score-ids "$G7/wt2.ids" --score-out "$3" </dev/null 2>&1 | tail -1
     echo "══ wt2 五指标 $1 ══"
-    python3 "$SC/anchor_metrics.py" --ref "$R30/anchor_wt2_s2653.bin" --ids "$G7/wt2.ids" \
+    "$(dirname "$0")/../calib/anchor_metrics" --ref "$R30/anchor_wt2_s2653.bin" --ids "$G7/wt2.ids" \
         --student "$3" --tail 3 2>&1 | head -12
 }
 

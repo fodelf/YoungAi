@@ -44,11 +44,11 @@ stage_metrics(){ # 评分=全43层回放(量化+注入z) vs FP锚, held=位置12
         DS4_THREADS=8 DS4_LAYER_DIR=$LAYERS DS4_LCFG=$(printf 'g%.0s' $(seq 1 43)) \
         DS4_VQ=1 DS4_TGT_ALPHA=1.0 DS4_DUMP_LOGITS=/tmp/q4z_student.bin \
         ./ds4quant_run.zk1024 "$IDS" 1716 2>&1 | grep -E 'VERDICT' | tail -2
-    cd "$ROOT" && python3 $SC/anchor_metrics.py --ref $ANCHOR --ids $IDS \
+    cd "$ROOT" && "$(dirname "$0")/../calib/anchor_metrics" --ref $ANCHOR --ids $IDS \
         --student /tmp/q4z_student.bin --fit 1287
 }
 stage_zchain(){  # 部署外挂 zchain 抽取(dql 混装记录 → DQZ2)
-    python3 $ZL/dql_to_zchain.py $LAYERS $ROOT/gguf/go-onebit/ds4-q4z.gguf.zchain.bin 43
+    "$(dirname "$0")/../calib/dql_to_zchain" $LAYERS $ROOT/gguf/go-onebit/ds4-q4z.gguf.zchain.bin 43
 }
 stage_merge(){   # skeleton 重造 + --consume 合并(层文件边并边删, 盘峰值≈骨架+输出增量)
     [ -f $R30/r30_skeleton.gguf ] || { LOG "骨架重造(skel_from_hf ~30min)";

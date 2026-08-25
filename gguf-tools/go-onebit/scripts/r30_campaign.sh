@@ -59,7 +59,7 @@ stage_anchor(){
     [ -f "$ANCHOR" ] || { LOG "★锚没落盘★"; exit 3; }
     LOG "锚 ✓ $(ls -l "$ANCHOR" | awk '{printf "%.2f GiB",$5/1073741824}')"
     # 冒烟判决同款自检: FP 参考 PPL 必须在正常范围(权重读错这里当场炸)
-    python3 "$SC/anchor_metrics.py" --ref "$ANCHOR" --ids "$IDS" --fit 933 >&2 \
+    "$(dirname "$0")/../calib/anchor_metrics" --ref "$ANCHOR" --ids "$IDS" --fit 933 >&2 \
         || { LOG "★锚 PPL 自检 FAIL — 权重/前向有错, 停★"; exit 4; }
 }
 
@@ -295,7 +295,7 @@ stage_metrics(){
     [ -f "$ANCHOR" ] || { [ -f "$R30/ref_logits.bin" ] && REF_ARGS=(--ref-raw "$R30/ref_logits.bin") \
         || { LOG "参考分布缺(锚和 ref_logits 都不在)"; exit 2; }; }
     LOG "===== 五项标准指标(量化域, v5mini held=783) ====="
-    python3 "$SC/anchor_metrics.py" "${REF_ARGS[@]}" --ids "$IDS" \
+    "$(dirname "$0")/../calib/anchor_metrics" "${REF_ARGS[@]}" --ids "$IDS" \
         --student "$OUTF/student_logits.bin" --fit 933 | tee "$R30/metrics_v5mini.txt" >&2
     if [ -f "$MDL" ] && [ -f "$R30/r30_skeleton.gguf" ]; then
         LOG "===== Bit-exact weights(合并 GGUF vs 骨架) ====="
@@ -398,7 +398,7 @@ stage_score2(){   # 五指标双尺: A=老编程锚(历史对表) B=当前战役
         DS4_DUMP_LOGITS=/tmp/score_prog_student.bin \
         "$QBIN" "$IDS" 1716 2>&1 | tail -3
     cd "$ROOT"
-    python3 gguf-tools/go-onebit/scripts/anchor_metrics.py --ref $R30/anchor_r30_s1716.bin \
+    "$(dirname "$0")/../calib/anchor_metrics" --ref $R30/anchor_r30_s1716.bin \
         --ids "$IDS" --student /tmp/score_prog_student.bin --fit 1287
     if [ -n "${MD_ANCHOR:-}" ] && [ -n "${MD_IDS:-}" ]; then
         cd "$ROOT/gguf-tools/go-onebit/quant"
@@ -408,7 +408,7 @@ stage_score2(){   # 五指标双尺: A=老编程锚(历史对表) B=当前战役
             DS4_DUMP_LOGITS=/tmp/score_md_student.bin \
             "$QBIN" "$MD_IDS" "$MD_S" 2>&1 | tail -3
         cd "$ROOT"
-        python3 gguf-tools/go-onebit/scripts/anchor_metrics.py --ref $MD_ANCHOR \
+        "$(dirname "$0")/../calib/anchor_metrics" --ref $MD_ANCHOR \
             --ids "$MD_IDS" --student /tmp/score_md_student.bin --fit ${MD_NFIT:-3874}
     fi
 }
@@ -479,7 +479,7 @@ stage_quant86(){   # 86G 底座量化(冠军 08-13 配方原样 env 化; en86 �
 
 _anchor_ok(){   # 锚完整性实读验证(08-14 事故: wdog 杀在写出峰, 部分锚骗过 -f 弱闸 → 双实例互杀链)
     [ -f "$1" ] || return 1
-    ( cd "$ROOT" && python3 "$SC/anchor_metrics.py" --ref "$1" --ids "$2" >/dev/null 2>&1 )
+    ( cd "$ROOT" && "$(dirname "$0")/../calib/anchor_metrics" --ref "$1" --ids "$2" >/dev/null 2>&1 )
 }
 stage_en86_anchors(){   # en86 双锚捕获(缺/废哪捕哪): 底座校准锚 + 反修解算锚
     cd "$ROOT/gguf-tools/go-onebit/quant"
@@ -509,7 +509,7 @@ stage_en86_judge(){   # 双盲判(零泄漏协议=08-13 盲判同款: NFIT=1 无
             DS4_DUMP_LOGITS="$ST" "$QBIN" "$ID" 8000 2>&1 | tail -3
         cd "$ROOT"
         echo "== 盲判[$TAG] =="
-        python3 "$SC/anchor_metrics.py" --ref "$AN" --ids "$ID" --student "$ST" --tail 5
+        "$(dirname "$0")/../calib/anchor_metrics" --ref "$AN" --ids "$ID" --student "$ST" --tail 5
     done
 }
 
@@ -522,7 +522,7 @@ stage_progz_judge(){   # 真域held盲判(2026-08-16 用户设计): prog语料�
         DS4_DUMP_LOGITS="${PROG_ST:-/tmp/progz_student.bin}" "$QBIN" "$G7/rr_calib_prog_v5mini.ids" 8000 2>&1 | tail -3
     cd "$ROOT"
     echo "== 真域盲判[prog held=1287:1716] =="
-    python3 "$SC/anchor_metrics.py" --ref "$R30/anchor_prog_s1716.bin" --ids "$G7/rr_calib_prog_v5mini.ids" \
+    "$(dirname "$0")/../calib/anchor_metrics" --ref "$R30/anchor_prog_s1716.bin" --ids "$G7/rr_calib_prog_v5mini.ids" \
         --student "${PROG_ST:-/tmp/progz_student.bin}" --fit 1287 --tail 5
 }
 

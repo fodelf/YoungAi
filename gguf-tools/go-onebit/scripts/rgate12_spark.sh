@@ -46,6 +46,6 @@ env DS4_ANCHOR_ROUTE=1 DS4_GSWEEP=0 DS4_BF_TERMINAL=0 DS4_BF_ONLY=1 DS4_COADAPT=
     DS4_DUMP_LOGITS=/tmp/rgate12_wt2.bin ./ds4quant_run "$G7/wt2.ids" 8000 2>&1 | tail -2
 cd "$ROOT"
 echo "══ rgate12 终判五指标(对表: 部署态0.4747 | 神谕0.3771 | 官方q2 0.4207) ══"
-python3 "$SC/anchor_metrics.py" --ref "$R30/anchor_wt2_s2653.bin" --ids "$G7/wt2.ids" \
+"$(dirname "$0")/../calib/anchor_metrics" --ref "$R30/anchor_wt2_s2653.bin" --ids "$G7/wt2.ids" \
     --student /tmp/rgate12_wt2.bin --tail 5
 LOG "战役收官"

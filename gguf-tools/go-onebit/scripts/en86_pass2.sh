@@ -20,10 +20,10 @@ python3 -c "exit(0 if float('$WKL')<0.60 else 1)" \
 echo "PASS2_GATE_OK wt2KL=$WKL $(date +%T)"
 
 cd $R/gguf-tools/go-onebit/quant
-if ! ( cd $R && python3 gguf-tools/go-onebit/scripts/anchor_metrics.py --ref $ENA --ids $ENIDS >/dev/null 2>&1 ); then
+if ! ( cd $R && "$(dirname "$0")/../calib/anchor_metrics" --ref $ENA --ids $ENIDS >/dev/null 2>&1 ); then
   rm -f $ENA; echo "捕干净EN FP锚 S=$ENS $(date +%T)"
   env DS4_HF=$R/hf/DeepSeek-V4-Flash-0731 DS4_FP_ONLY=1 DS4_ANCHOR=$ENA DS4_THREADS=8 "$Q" $ENIDS 9999 2>&1 | tail -2
-  ( cd $R && python3 gguf-tools/go-onebit/scripts/anchor_metrics.py --ref $ENA --ids $ENIDS >/dev/null 2>&1 ) \
+  ( cd $R && "$(dirname "$0")/../calib/anchor_metrics" --ref $ENA --ids $ENIDS >/dev/null 2>&1 ) \
     || { echo "PASS2_EN_ANCHOR_BAD"; exit 2; }
 fi
 echo "EN锚 ✓ $(date +%T)"

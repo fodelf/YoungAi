@@ -64,7 +64,7 @@ stage_merge(){   # 合并 GGUF(q2z_campaign stage_merge 的 spark 适配): skele
     MDL="$ROOT/gguf/go-onebit/ds4-q2z.gguf"
     MAN="$LAYERS/manifest.txt"
     [ -f "$MAN" ] || { LOG "★manifest 缺★"; exit 4; }
-    python3 "$ROOT/gguf-tools/go-onebit/zlever/dql_to_zchain.py" "$LAYERS" "$OUTF/zchain_q2z.bin" 43 \
+    "$(dirname "$0")/../calib/dql_to_zchain" "$LAYERS" "$OUTF/zchain_q2z.bin" 43 \
         || { LOG "★zchain 抽取失败★"; exit 5; }
     FREE=$(df -BG --output=avail "$ROOT/gguf" | sed -n 2p | tr -dc 0-9)
     [ "${FREE:-0}" -ge 90 ] || { LOG "★盘不足 90G 停★"; exit 7; }
@@ -88,7 +88,7 @@ stage_metrics(){  # 五指标回放(量化+z侧车 vs FP 锚, held=位置1287..1
         DS4_VQ=1 DS4_TGT_ALPHA=1.0 DS4_DUMP_LOGITS=/tmp/q2z_student.bin \
         ./ds4quant_run "$IDS" 1716 2>&1 | grep -E 'ops=|VERDICT' | tail -5
     cd "$ROOT"
-    python3 "$SC/anchor_metrics.py" --ref "$ANCHOR" --ids "$IDS" \
+    "$(dirname "$0")/../calib/anchor_metrics" --ref "$ANCHOR" --ids "$IDS" \
         --student /tmp/q2z_student.bin --fit 1287 || true
 }
 

@@ -75,7 +75,7 @@ stage_metrics(){  # 五指标: 全43层回放(量化+z侧车) vs FP 锚, held=�
         "$RBIN" "$IDS" 1716 2>&1 | grep -E 'ops=|VERDICT' | tail -5
     LOG "回放遍用时 $(( $(date +%s)-T0 ))s"
     cd "$ROOT"
-    python3 "$SC/anchor_metrics.py" --ref "$ANCHOR" --ids "$IDS" \
+    "$(dirname "$0")/../calib/anchor_metrics" --ref "$ANCHOR" --ids "$IDS" \
         --student /tmp/q2z_student.bin --fit 1287
 }
 
@@ -85,7 +85,7 @@ stage_merge(){    # 合并 GGUF: skeleton + vq blob(--no-down: w2 在 blob which
     MDL="$ROOT/gguf/go-onebit/ds4-q2z.gguf"
     MAN="$LAYERS/manifest.txt"
     [ "$(wc -l < "$MAN" | tr -d ' ')" = 43 ] || { LOG "manifest 不齐"; exit 4; }
-    python3 "$ZL/dql_to_zchain.py" "$LAYERS" "$OUTF/zchain_q2z.bin" 43 || { LOG "★zchain 抽取失败★"; exit 5; }
+    "$(dirname "$0")/../calib/dql_to_zchain" "$LAYERS" "$OUTF/zchain_q2z.bin" 43 || { LOG "★zchain 抽取失败★"; exit 5; }
     FREE=$(df -g /System/Volumes/Data | awk 'NR==2{print $4}')
     [ "$FREE" -ge 82 ] || { LOG "★free ${FREE}G <82G(非消费合并需全额) — 停★"; exit 7; }
     LOG "起合并(全VQ形态: skeleton+blob --no-down, 非消费式)"

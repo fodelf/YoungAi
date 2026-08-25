@@ -29,7 +29,7 @@ run_one(){ # $1=标签 $2=out.bin $3...=附加 env/参数(K=V 形式在前, -- �
         timeout --foreground 3000 ./ds4 --cuda -m "$MDL" "${ARGS[@]+"${ARGS[@]}"}" \
         --score-ids "$IDS" --score-out "$OUT" </dev/null 2>&1 | grep -aE "armed|zchain|完成" | head -4
     echo "══ 五指标 $TAG ══"
-    python3 "$SC/anchor_metrics.py" --ref "$ANC" --ids "$IDS" --student "$OUT" --tail 0 2>&1 | tail -8
+    "$(dirname "$0")/../calib/anchor_metrics" --ref "$ANC" --ids "$IDS" --student "$OUT" --tail 0 2>&1 | tail -8
 }
 
 run_one "a裸"        /tmp/ampj_a.bin

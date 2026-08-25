@@ -22,7 +22,7 @@ for L in $(seq 0 42); do
 done > "$LAYERS/manifest.txt"
 if [ -n "$ZCH" ]; then
     LOG "zchain 抽取 → $ZCH"
-    python3 gguf-tools/go-onebit/zlever/dql_to_zchain.py "$LAYERS" "$ZCH" 43 \
+    "$(dirname "$0")/../calib/dql_to_zchain" "$LAYERS" "$ZCH" 43 \
         || { LOG "★zchain 失败★"; exit 3; }
 fi
 FREE=$(df -BG --output=avail "$ROOT/gguf" | sed -n 2p | tr -dc 0-9)

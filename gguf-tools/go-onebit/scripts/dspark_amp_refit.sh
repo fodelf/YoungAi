@@ -15,5 +15,5 @@ for B in 0 1 2; do
     timeout 3600 python3 -u gguf-tools/go-onebit/zlever/dspark_amp_fit.py \
         "$HF" "$STUDENT" "$D/anchor_big.bin" "$D/big" "$B" 2>&1 | grep -aE "锚行|数据|★"
 done
-python3 gguf-tools/go-onebit/zlever/zrec_to_zchain.py "$D/big" "$D/zchain_drafter_amp_big.bin" 3 2>&1 | tail -1
+"$(dirname "$0")/../calib/zrec_to_zchain" "$D/big" "$D/zchain_drafter_amp_big.bin" 3 2>&1 | tail -1
 ls -l "$D/zchain_drafter_amp_big.bin"

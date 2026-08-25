@@ -66,5 +66,5 @@ for B in 0 1 2; do
 done
 
 echo "[4/4] 成链"
-python3 gguf-tools/go-onebit/zlever/zrec_to_zchain.py "$D/cz" "$D/zchain_drafter_cal12z.bin" 3 2>&1 | tail -1
+"$(dirname "$0")/../calib/zrec_to_zchain" "$D/cz" "$D/zchain_drafter_cal12z.bin" 3 2>&1 | tail -1
 ls -l "$D/zchain_drafter_cal12z.bin"

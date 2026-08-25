@@ -158,9 +158,11 @@ up(){
 
 probe(){
   local p=${1:?prompt}; local n=${2:-64}
+  # python3 内联清零(2026-08-25 迁移 Wave C): jq 等价替换(两机均有 /usr/bin/jq);
+  # stderr 诊断行的 usage 展示格式从 python dict 变 jq JSON, 非判决数字, 语义同。
   curl -s --noproxy '*' "http://127.0.0.1:$PORT/v1/messages" -H 'content-type: application/json' \
-    -d "$(python3 -c "import json,sys;print(json.dumps({'model':'deepseek-chat','max_tokens':int('$n'),'temperature':0,'messages':[{'role':'user','content':sys.argv[1]}]}))" "$p")" \
-    | python3 -c "import json,sys;d=json.load(sys.stdin);print(d['content'][0]['text']);print('--',d.get('stop_reason'),d['usage'],file=sys.stderr)"
+    -d "$(jq -n --arg p "$p" --argjson n "$n" '{model:"deepseek-chat",max_tokens:$n,temperature:0,messages:[{role:"user",content:$p}]}')" \
+    | jq -r '.content[0].text, ("-- \(.stop_reason) \(.usage|tojson)\n" | stderr | empty)'
 }
 
 cc(){

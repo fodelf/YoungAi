@@ -24,7 +24,7 @@ echo "Q2DL_DONE $(stat -f %z "$G")B"
 cd "$REPO"
 ./ds4 -m "$G" --metal --score-ids "$IDS" --score-out /tmp/openq2_rrhard.bin 2>&1 | tail -3
 echo Q2SCORE_DONE
-python3 gguf-tools/go-onebit/scripts/anchor_metrics.py \
+"$(dirname "$0")/../calib/anchor_metrics" \
   --ref "$R30/anchor_rr_hard_s1716.bin" --ids "$IDS" \
   --student /tmp/openq2_rrhard.bin --tail 10
 echo SHOWDOWN_DONE

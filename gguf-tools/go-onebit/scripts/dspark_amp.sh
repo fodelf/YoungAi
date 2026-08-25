@@ -49,7 +49,7 @@ stage_solve(){
 
 stage_chain(){
     LOG "chain: 3 层 drafter 链"
-    python3 "$ROOT/gguf-tools/go-onebit/zlever/zrec_to_zchain.py" "$OUT" "$ZC" 3 || exit 4
+    "$(dirname "$0")/../calib/zrec_to_zchain" "$OUT" "$ZC" 3 || exit 4
     ls -l "$ZC"
 }
 

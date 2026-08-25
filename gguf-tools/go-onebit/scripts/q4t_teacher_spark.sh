@@ -69,7 +69,7 @@ stage_score(){
 stage_gate(){
     cd "$ROOT"
     LOG "教师体检① 语言健康度(旧锚 PPL 4.2365 为参照, 教师应≤)"
-    python3 "$SC/anchor_metrics.py" --ref-raw "$TD/q4t_wt2.bin" --ids "$G7/wt2.ids" | tail -4
+    "$(dirname "$0")/../calib/anchor_metrics" --ref-raw "$TD/q4t_wt2.bin" --ids "$G7/wt2.ids" | tail -4
     LOG "教师体检② 旧锚盲区复核(教师应贴学生=会拷贝/会检索)"
     python3 - <<'PY'
 import sys
@@ -106,7 +106,7 @@ stage_rejudge(){
         NM="${J%%:*}"; BIN="$(echo "$J" | cut -d: -f2)"; RU="${J##*:}"
         [ -s "$BIN" ] || { LOG "$NM: 学生bin缺($BIN), 跳过"; continue; }
         echo "══ q4t尺 $NM ══"
-        python3 "$SC/anchor_metrics.py" --ref-raw "$TD/q4t_$RU.bin" \
+        "$(dirname "$0")/../calib/anchor_metrics" --ref-raw "$TD/q4t_$RU.bin" \
             --ids "$G7/$RU.ids" --student "$BIN" --tail 0 2>&1 | tail -6
     done
 }

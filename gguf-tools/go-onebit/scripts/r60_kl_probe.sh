@@ -30,7 +30,7 @@ LOG "空链版 ✓"
 LOG "===== 三 KL 终审(量化器 VERDICT 参照 KL=0.387)====="
 for v in chain bare; do
   echo "--- 引擎口径 [$v] ---"
-  python3 gguf-tools/go-onebit/scripts/anchor_metrics.py --ref-raw /tmp/ref_logits.bin \
+  "$(dirname "$0")/../calib/anchor_metrics" --ref-raw /tmp/ref_logits.bin \
       --ids $IDS --student /tmp/eval_$v.bin --fit 933 2>&1 | /usr/bin/grep -E "PPL|KLD|top"
 done
 LOG "★三 KL 落定★"

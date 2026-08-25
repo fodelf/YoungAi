@@ -48,7 +48,7 @@ stage_solve(){
 
 stage_chain(){
     LOG "chain: zrec → DQZ2"
-    python3 "$ZL/zrec_to_zchain.py" "$OUT" "$ZC" 43 || { LOG "★成链失败★"; exit 4; }
+    "$(dirname "$0")/../calib/zrec_to_zchain" "$OUT" "$ZC" 43 || { LOG "★成链失败★"; exit 4; }
 }
 
 stage_size(){

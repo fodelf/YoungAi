@@ -30,6 +30,6 @@ env -u DS4_TUNE -u DS4_MINVOL -u DS4_VQ_RPLAN -u DS4_ZCHAIN \
     DS4_VQ=1 DS4_TGT_ALPHA=1.0 DS4_DUMP_LOGITS=/tmp/q2z_wt2_student.bin \
     "$QBIN" "$IDS" 2653 2>&1 | grep -E 'ops=|VERDICT' | tail -3
 cd "$ROOT"
-python3 "$SC/anchor_metrics.py" --ref "$ANCHOR" --ids "$IDS" \
+"$(dirname "$0")/../calib/anchor_metrics" --ref "$ANCHOR" --ids "$IDS" \
     --student /tmp/q2z_wt2_student.bin --fit 2653 || true
 LOG "wt2 尺收官"

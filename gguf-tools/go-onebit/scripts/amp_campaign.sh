@@ -192,7 +192,7 @@ stage_solve(){
 
 stage_chain(){
     LOG "⑥合并 zchain"
-    python3 "$ZL/zrec_to_zchain.py" "$AMP" "$ZC" 43 || DIE "合并失败"
+    "$(dirname "$0")/../calib/zrec_to_zchain" "$AMP" "$ZC" 43 || DIE "合并失败"
     ls -l "$ZC"
 }
 
@@ -203,7 +203,7 @@ judge_one(){   # $1=标签 $2=zchain(可空) $3=dump
     timeout --foreground 3000 ./ds4 --cuda -m "$MDL" "${Z[@]+"${Z[@]}"}" \
         --score-ids "$G7/wt2.ids" --score-out "$3" </dev/null 2>&1 | tail -1
     echo "══ wt2 五指标 $1 ══"
-    python3 "$SC/anchor_metrics.py" --ref "$R30/anchor_wt2_s2653.bin" --ids "$G7/wt2.ids" \
+    "$(dirname "$0")/../calib/anchor_metrics" --ref "$R30/anchor_wt2_s2653.bin" --ids "$G7/wt2.ids" \
         --student "$3" --tail 3 2>&1 | head -12
     # 【已移除】这里原来有一段"贴原始输出"的生成, 用的是我自己编的 prompt(还是道代码题),
     # 既是自造内容、又要靠 env 传 —— 两条铁律都踩。判决就是 wt2 五指标; 要看文本样本时
@@ -308,7 +308,7 @@ stage_vqmerge(){
     cd "$ROOT"; LOG "③vq86h 裸判 wt2 (对表 base86p 4.1222 / allq2 12.1494)"
     timeout --foreground 3000 ./ds4 --cuda -m "$ROOT/gguf/ds4-vq86h.gguf" \
         --score-ids "$G7/wt2.ids" --score-out /tmp/vq86h_wt2.bin </dev/null 2>&1 | tail -1
-    python3 "$SC/anchor_metrics.py" --ref "$R30/anchor_wt2_s2653.bin" --ids "$G7/wt2.ids" \
+    "$(dirname "$0")/../calib/anchor_metrics" --ref "$R30/anchor_wt2_s2653.bin" --ids "$G7/wt2.ids" \
         --student /tmp/vq86h_wt2.bin --tail 3 2>&1 | head -12
     watchdog_stop
 }
@@ -360,7 +360,7 @@ stage_vqsolve(){
     LOG "⑤C 解算 43 层(乘性动态z, ~1.2h)"
     "$ROOT/gguf-tools/amp_solve" --cap "$D2/capnpy_a" --out "$D2/amp_c" \
         --layers 0-42 --threads 20 || DIE "解算失败"
-    python3 "$ROOT/gguf-tools/go-onebit/zlever/zrec_to_zchain.py" \
+    "$(dirname "$0")/../calib/zrec_to_zchain" \
         "$D2/amp_c" "$D2/zchain_vq86h.bin" 43 || DIE "合链失败"
     watchdog_start
     cd "$ROOT"; LOG "⑥判决 wt2: vq86h裸 vs vq86h+放大器"
@@ -368,7 +368,7 @@ stage_vqsolve(){
         --zchain "$D2/zchain_vq86h.bin" \
         --score-ids "$G7/wt2.ids" --score-out /tmp/vq86h_amp_wt2.bin </dev/null 2>&1 | tail -1
     echo "══ wt2 五指标 vq86h+放大器 (对表: 裸 vq86h / base86p 4.1222) ══"
-    python3 "$SC/anchor_metrics.py" --ref "$R30/anchor_wt2_s2653.bin" --ids "$G7/wt2.ids" \
+    "$(dirname "$0")/../calib/anchor_metrics" --ref "$R30/anchor_wt2_s2653.bin" --ids "$G7/wt2.ids" \
         --student /tmp/vq86h_amp_wt2.bin --tail 3 2>&1 | head -12
     watchdog_stop
 }
