@@ -49,6 +49,7 @@ INC := -I$(QZ) -I$(AMP) -I$(CAL) -I$(SLV)
 QUANTS_INC := $(wildcard $(QZ)/quants_p*.inc.c)
 DSQMAIN_INC := $(wildcard $(QZ)/deepseek4-quantize_p*.inc.c)
 PUBBENCH_INC := $(wildcard $(BEN)/pubbench_p*.inc.c)
+EMITZ_INC := $(wildcard $(AMP)/emit_z_p*.inc.c)
 
 ifeq ($(UNAME_S),Darwin)
 NATIVE ?= -mcpu=native
@@ -235,7 +236,7 @@ $(AMP)/route_bias_rebake: $(AMP)/route_bias_rebake.c
 
 emit_z: emit_z.bin
 .PHONY: emit_z.bin
-emit_z.bin: $(AMP)/emit_z.c
+emit_z.bin: $(AMP)/emit_z.c $(EMITZ_INC)
 	$(CC) -O3 -Wall -std=c99 -o emit_z $<
 
 teacher_routed: teacher_routed.bin
