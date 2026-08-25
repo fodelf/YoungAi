@@ -6649,3 +6649,9 @@ zlayer dequant 金标逐字节; 符号对账零丢失。
 拆分, 拼接 16/16 逐字节一致; zlayer 金标/pubbench 24/24/tools-test 9项/
 ds4_unit 全绿。linecount 守卫扩至全仓(含 gguf-tools), 豁免仅 vendored/
 单函数 EXCEPTION/冻结转录/GPU 单文件四类。至此单文件 ≤500 行全仓达成。
+
+## 2026-08-25 重构终态验证(spark)
+
+终态树(含批6)重编 cuda-spark 全链 0 error; cuda-regression 复跑 0.053s 过;
+真模型探针(allq2, --temp 0 -n 24)输出文本与批6 前逐字符相同
+("1. The user asks..."), prefill 15.45 / gen 36.16 t/s。重构战役收官。
