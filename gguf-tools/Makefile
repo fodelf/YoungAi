@@ -58,6 +58,7 @@ VFWD_INC := $(wildcard $(CAL)/validate_fwd_p*.inc.c)
 DSQFWD_INC := $(wildcard $(AMP)/ds4quant_fwd_p*.inc.c)
 AMPSOLVE_INC := $(wildcard $(AMP)/amp_solve_p*.inc.c)
 TRAJ_INC := $(wildcard $(CAL)/traj_analyze_p*.inc.c)
+HFREAD_INC := $(wildcard $(CAL)/hf_read_p*.inc.c)
 
 ifeq ($(UNAME_S),Darwin)
 NATIVE ?= -mcpu=native
@@ -294,8 +295,10 @@ endif
 
 emit_residual: emit_residual.bin
 .PHONY: emit_residual.bin
-emit_residual.bin: $(SLV)/emit_residual.c $(CAL)/hf_read.c $(QZ)/onebit_quant.c $(CAL)/npy.c
-	$(CC) $(CFLAGS) $(NATIVE) $(CPPFLAGS) $(INC) -o emit_residual $^ -lm -pthread
+# 源列表显式化: 原配方用 $^ 当源, 加 *.inc.c 依赖后 $^ 会把分片当独立 TU 编译, 必须分开。
+EMITRES_SRC := $(SLV)/emit_residual.c $(CAL)/hf_read.c $(QZ)/onebit_quant.c $(CAL)/npy.c
+emit_residual.bin: $(EMITRES_SRC) $(HFREAD_INC)
+	$(CC) $(CFLAGS) $(NATIVE) $(CPPFLAGS) $(INC) -o emit_residual $(EMITRES_SRC) -lm -pthread
 
 corr_stats: $(SLV)/corr_stats
 $(SLV)/corr_stats: $(SLV)/corr_stats.c
@@ -316,20 +319,20 @@ calib_run: calib_run.bin
 CALIB_RUN_SRC := $(CAL)/calib_run.c $(CAL)/npy.c $(CAL)/hf_read.c $(QZ)/onebit_quant.c \
     $(CAL)/layer_probe.c $(AMP)/hiddenvar_solve.c $(SLV)/solve_perexpert.c $(SLV)/solve_denoise.c \
     $(SLV)/solve_genrf.c $(AMP)/solve_rrr.c $(AMP)/linalg_small.c
-calib_run.bin: $(CALIB_RUN_SRC) $(CALIBRUN_INC) $(HVSOLVE_INC) $(RRR_INC)
+calib_run.bin: $(CALIB_RUN_SRC) $(CALIBRUN_INC) $(HVSOLVE_INC) $(RRR_INC) $(HFREAD_INC)
 	$(CC) $(CFLAGS) $(NATIVE) $(CPPFLAGS) $(INC) -o calib_run $(CALIB_RUN_SRC) -lm -pthread
 
 calib_diag: calib_diag.bin
 .PHONY: calib_diag.bin
 CALIB_DIAG_SRC := $(CAL)/calib_diag.c $(CAL)/npy.c $(CAL)/hf_read.c $(QZ)/onebit_quant.c \
     $(CAL)/layer_probe.c $(AMP)/hiddenvar_solve.c $(AMP)/linalg_small.c
-calib_diag.bin: $(CALIB_DIAG_SRC) $(CALIBDIAG_INC) $(HVSOLVE_INC)
+calib_diag.bin: $(CALIB_DIAG_SRC) $(CALIBDIAG_INC) $(HVSOLVE_INC) $(HFREAD_INC)
 	$(CC) $(CFLAGS) $(NATIVE) $(CPPFLAGS) $(INC) -o calib_diag $(CALIB_DIAG_SRC) -lm -pthread
 
 validate_fwd: $(CAL)/validate_fwd
 VFWD_SRC := $(CAL)/validate_fwd.c $(CAL)/npy.c $(CAL)/hf_read.c $(CAL)/layer_probe.c \
     $(QZ)/onebit_quant.c $(SLV)/solve_denoise.c $(SLV)/solve_genrf.c $(AMP)/linalg_small.c
-$(CAL)/validate_fwd: $(VFWD_SRC) $(VFWD_INC)
+$(CAL)/validate_fwd: $(VFWD_SRC) $(VFWD_INC) $(HFREAD_INC)
 	$(CC) $(CFLAGS) $(NATIVE) $(CPPFLAGS) $(INC) -o $@ $(VFWD_SRC) -lm -pthread
 
 traj_analyze: $(CAL)/traj_analyze
