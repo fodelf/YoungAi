@@ -37,3 +37,4 @@ gguf-tools/go-onebit/migrate/zlayer_fixtures/
 /zsolve
 tools/e0_pingpong
 tools/tp_rtt_probe
+/ds4_unit
