@@ -49,10 +49,24 @@ for b in $(seq 0 31); do
   if [ "$b" -lt 24 ]; then FR="${FR:+$FR,}$seg"; else ER="${ER:+$ER,}$seg"; fi
 done
 # ③zlayer 全家 43 层(干净锚; XC 非空=第7参引擎捕获)
+# zlayer=C 版(2026-08-25 迁移 Wave B 一期, 金标 migrate/golden.txt: z支线与py精确一致/
+# GE=py-CPU路真解口径(py-GPU路 XCAP 下 GE 恒死是 py 自身分裂, 见 zlayer_transcription_notes #1)/
+# 注入产物 rec_fidelity 复评一致)。XANCHOR/GGUF/ADDON 等二期模式 C 版硬拒(响亮失败, 无静默兜底)。
+# ⚠二期欠账: C 版纯 CPU ~570s/层(py-GPU 54s), 43层≈6.8h — 按"spark重计算必须GPU化"铁律须补 CUDA 路。
+ZLB="$HOME/ds4-main/gguf-tools/go-onebit/calib/zlayer"
+if [ ! -x "$ZLB" ]; then
+  if [ "$(uname)" = Darwin ]; then
+    gcc -O3 -march=native -DDQ_BLAS -o "$ZLB" "${ZLB}.c" -framework Accelerate -lm -lpthread
+  else
+    SO_DIR="$HOME/.local/lib/python3.12/site-packages/scipy_openblas32/lib"
+    gcc -O3 -march=native -DDQ_BLAS -Dcblas_sgemm=scipy_cblas_sgemm -Dcblas_dgemm=scipy_cblas_dgemm \
+      -I"$SO_DIR/../include" -o "$ZLB" "${ZLB}.c" "$SO_DIR/libscipy_openblas.so" -Wl,-rpath,"$SO_DIR" -lm -lpthread
+  fi
+fi
 for L in $(seq 0 42); do
   env DS4_ZL_NTOK=8192 DS4_ZL_NFIT=6144 ${XA:+DS4_ZL_XANCHOR=$XA} DS4_ZL_FIT_RANGES="$FR" DS4_ZL_EV_RANGE="$ER" \
-  python3 -u gguf-tools/go-onebit/zlever/zlayer.py "$DS4_HF" $D2/$WS/layers "$ANC" $L ${K:-1024} 1 ${XC:+$D2/$XC} \
-    2>&1 | grep -aE "XCAP|★" || { LOG "★L$L 失败★"; exit 1; }
+  "$ZLB" "$DS4_HF" $D2/$WS/layers "$ANC" $L ${K:-1024} 1 ${XC:+$D2/$XC} \
+    2>&1 | grep -aE "XCAP|Error|assert|★" || { LOG "★L$L 失败★"; exit 1; }
 done
 rm -f $D2/$WS/layers/zcache_L*.npz
 LOG "③反修收官"
