@@ -374,11 +374,10 @@ test: ds4_test ds4-eval ds4_unit linecount
 
 
 # 500 行守卫(重构阶段9): 源文件单文件 ≤500 行, 豁免清单见 .linecount-exempt
-# (vendored/单函数 EXCEPTION/冻结转录)。gguf-tools 大文件拆分(批6)落地前
-# 该目录暂不纳入; 批6 合并后把 find 范围加上 gguf-tools。
+# (vendored/单函数 EXCEPTION/冻结转录)。范围含 gguf-tools(批6 已落地)。
 linecount:
 	@ex=$$(grep -v '^#' .linecount-exempt | grep -v '^$$'); \
-	viol=$$(find src tests metal ds4*.c ds4*.h vq_fmt.h rax.c rax.h rax_malloc.h linenoise.c linenoise.h \
+	viol=$$(find src tests metal gguf-tools ds4*.c ds4*.h vq_fmt.h rax.c rax.h rax_malloc.h linenoise.c linenoise.h \
 	        \( -name '*.c' -o -name '*.h' -o -name '*.m' -o -name '*.cu' -o -name '*.cuh' -o -name '*.metal' -o -name '*.inc' \) \
 	        2>/dev/null | sort -u | grep -v -x -F "$$ex" \
 	        | xargs wc -l 2>/dev/null | awk '$$2 != "total" && $$1 > 500 {print $$1, $$2}'); \

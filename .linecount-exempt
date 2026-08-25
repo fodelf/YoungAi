@@ -25,3 +25,6 @@ gguf-tools/quantize/vq_em.cu
 
 # 一次性设计探针(无演进面)
 gguf-tools/amp/hbase.c
+
+# GPU 单文件工具惯例(续): IQ2_XXS 编码器 CUDA 化, 逐位契约绑 CPU 版
+gguf-tools/quantize/quantize_gpu.cu
