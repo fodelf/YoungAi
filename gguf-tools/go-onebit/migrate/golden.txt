@@ -9,3 +9,9 @@
         RMS 5.3958% / top 79.53% / Δp 0.1579 p95 0.6399 / 尾部3行同)
   C 超集: 额外输出 分布还原率 Σmin=0.7901(中位0.8867 p5 0.2469)
   结果: 过闸 ✓ → caliper_ref.sh 接线 C 版, scripts/anchor_metrics.py 删除
+
+[2026-08-25] zlever/kl_forensic.py → calib/kl_forensic.c
+  输入: anchor_wt2_s2653.bin + wt2.ids + /tmp/qc_noz_wt2.bin vs /tmp/qc_ampclean_wt2.bin (spark)
+  判定: 全部数值逐字符一致(总量/中位/六桶/集中度/top10 罪犯); 唯一残差=表头一行
+        CJK 对齐空白(printf 字节宽 vs Python 字符宽, 零数值内容)
+  结果: 过闸 ✓ → zlever/kl_forensic.py 删除
