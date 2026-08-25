@@ -1,26 +1,8 @@
 /* core_kern_f16.c — deq_q2K/embed/rms_norm/matvec_f16(热核同TU) (机械拆分自 ds4.c, 重构阶段4)。 */
 #include "core_internal.h"
-static void deq_q2K_row_f32(const uint8_t *row, uint64_t nblk, float *out) {
-    for (uint64_t b = 0; b < nblk; b++) {
-        const uint8_t *blk = row + b * 84u;
-        const uint8_t *sc = blk, *qs = blk + 16;
-        uint16_t hd, hm;
-        memcpy(&hd, blk + 80, 2);
-        memcpy(&hm, blk + 82, 2);
-        const float d = f16_to_f32(hd), dm = f16_to_f32(hm);
-        float *o = out + b * 256u;
-        for (int j = 0; j < 16; j++) {
-            const float dj = d * (float)(sc[j] & 0xF), mj = dm * (float)(sc[j] >> 4);
-            for (int ii = 0; ii < 16; ii++) {
-                const int idx = j * 16 + ii;
-                const int qpos = (idx / 128) * 32 + (idx % 32);
-                const int q = (qs[qpos] >> ((idx % 128) / 32 * 2)) & 3;
-                o[idx] = dj * (float)q - mj;
-            }
-        }
-    }
-}
-
+/* q2_K 标量 dequant 收敛到全仓唯一实现(tests/unit 金标闸): 原 deq_q2K_row_f32
+ * 与 ds4_deq_q2_K 逐行同式(f16 换 ds4_f16_to_f32, 同为半精度位型解码)。 */
+#include "src/common/ds4_quantfmt.h"
 void embed_token_f16(const ds4_model *m, const ds4_weights *w, int token, float *out) {
     ds4_tensor *te = w->token_embd;
     if (token < 0 || (uint64_t)token >= te->dim[1]) {
@@ -31,7 +13,7 @@ void embed_token_f16(const ds4_model *m, const ds4_weights *w, int token, float 
     if (te->bytes * 256u == te->elements * 84u) {   /* 文件真身是 q2_K(全q2 影子) */
         const uint8_t *qbase = (const uint8_t *)tensor_data(m, te);
         const uint64_t nblk = stride / 256u;
-        deq_q2K_row_f32(qbase + (uint64_t)token * nblk * 84u, nblk, out);
+        ds4_deq_q2_K(qbase + (uint64_t)token * nblk * 84u, nblk, out);
         return;
     }
 
