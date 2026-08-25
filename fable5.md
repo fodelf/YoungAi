@@ -6613,3 +6613,32 @@ cpu/clean 取并集+标记 grep 清零(一次漏检 clean 块被 grep 抓回, �
   复跑 0.05s; 顺修 smoke 的 comp_kv_f16 缺参(上游断裂)。
 - 发现未处理(既有): 契约声明 ds4_gpu_tensor_copy_f32_to_f16 在 CUDA 侧
   无实现, 靠 if(0) 死代码消除躲链接。
+
+## 2026-08-25 重构战役总结(restructure 分支, 待用户验收合并 mac)
+
+用户四点要求全部落地:
+1. **模块化目录**: 12.6 万行根目录平铺 C → src/{common,core,metal,cuda,dist,
+   server,agent,cli,eval,bench,kv,web} 模块树; gguf-tools 按 quantize/amp/
+   calib/bench/scripts/data/legacy/docs/migrate 重组, "go-onebit"命名消亡;
+   docs/archive 收 6 月已收官设计稿; 119 个死脚本清退(git 史保全)。
+2. **单文件 ≤500 行**: 全仓源文件达标, make linecount 守卫挂进 make test;
+   豁免清单 .linecount-exempt 只收三类(vendored/单函数 EXCEPTION/冻结转录),
+   每条带理由。EXCEPTION 单函数(core 3 个/metal 2+1 个/cuda 2 个)的函数内
+   拆分需真模型逐位闸, 挂账后续工序。
+3. **测试补齐**: make test 在无模型机器离线全绿(ds4_unit 金标/104 项 server/
+   新增 --engine-units 采样惩罚/--rax/tp-allreduce/metal-kernels/linecount),
+   模型套件缺模型改 SKIP 不 FAIL; dequant 七类型金标夹具入库; 修复三处
+   年久失修断点(mac 分支 Mac 编译断/ds4_test 运行器 typedef 丢失/cuda smoke
+   契约缺参)——全是"旧 .o 掩盖的从未真编过"。
+4. **复用性**: src/common 唯一实现收敛 FP8×6 份/GGUF 解析×9 份/safetensors
+   ×3 份/iq2xxs 双表正名; 引擎(core/cuda)与工具(zlayer/hf_read/量化器)全部
+   改吃同一份; ds4_gpu.h 六子头 extern "C" 后 CUDA 直接吃契约头, 146 处手抄
+   声明消解, 契约漂移从静默分歧变编译错误。
+验证主干: 每步 make/make cpu/make test 三平台绿(Metal 实测/CUDA spark 实测/
+CPU 编译); spark 真模型端到端(allq2 80GB)生成连贯 34.5 t/s; CUDA 拆分前后
+--score-ids 输出 16,547,848 字节逐字节一致; Metal shader 拼接逐字节一致;
+zlayer dequant 金标逐字节; 符号对账零丢失。
+待办交接: ①spark/M1 生产机同步重编(共享对象面全变)+盘上未跟踪战役产物
+按新路径挪(reports/corpus/quant 二进制, 清单见 gguf 重组 agent 报告);
+②caliper_ref.sh 的 ds4quant_run.old lfile 回归钉(独立工单); ③两处自测
+写死旧 scratchpad 路径(改 mkdtemp); ④数据出库候选(gostats 21MB 等)待裁决。
