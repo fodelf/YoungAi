@@ -6713,3 +6713,14 @@ cache. *Question: What"(gen 13.68 t/s) / 武装 "1.**Deconstruct the User's Requ
 保留: hf、ds4-allq2(q2 铁律)、ds4-vq86h(现役)、vq86h_noz、amp_r64c(新冠军 73G)、
 干净锚、wt2 判决锚、r30_skeleton、amp2 冠军态、g7/ids/配方 txt。
 清单存 spark:~/r64c_cleanup_manifest.txt。旧树 543 脏文件在 git stash 有底。
+
+## 2026-08-26 ★正名: "四损失"错标签纠正(用户纠正)★
+
+用户设计的四损失 = ds4_loss.{c,h}(ALGORITHM.md §4): ①L_align 对齐(1−cos)
+②L_classify 分类(per-dim 方差加权 MSE) ③L_smooth 光滑(固定种子 dither 扰动)
+④L_fixed 固定(权重衰减)。amp_campaign.sh 注释把 zlayer 的"ridge拟合+方差列权+
+dither增广+收缩"错标成"四损失"并被我沿用——已纠正。
+实况: **量化侧落地**(ds4quant_run DS4_TUNE=1: held_score=L_align+0.5·L_classify
+择优 + loss.align/cls/fix/smooth 四旋钮调优入档, vq86h 即此链产物);
+**反修侧未落地**(zlayer 不链接 ds4_loss, L_align 不在解算目标里)= 08-22 审计
+"四损失没接"欠账未还。r64c 冠军 0.42510 = 量化底座吃四损失 + 放大器解算没吃。

@@ -6,7 +6,10 @@
 #          —— 取引擎跑普通全 q2 基座时的真值, 不是 Python 理想化重算
 #   教师 = FP 全层前向(锚)
 #   解变量 = U, V, **z**;  ★z 必须是 x 的函数(动态 z, 方案 B)★
-#   目标 = 四损失(行为 fit + 感知列权 + dither 稳定 + 收缩), λ/k_L 走 held 网格
+#   目标 = ridge 拟合(方差列权 + dither 增广 + 收缩), λ/k_L 走 held 网格
+#   ★正名(2026-08-26 用户纠正): 这不是"四损失"。四损失=ds4_loss.{c,h}(ALGORITHM.md §4:
+#   L_align/L_classify/L_smooth/L_fixed), 落地在量化器 ds4quant_run 调优链;
+#   本反修解算(zlayer)未接 ds4_loss —— 移植欠账在案, 别再把这里叫四损失。
 #   判据 = 当层最优
 #   产物 = 放大器侧车 → 之后配合引擎阶段使用
 #
