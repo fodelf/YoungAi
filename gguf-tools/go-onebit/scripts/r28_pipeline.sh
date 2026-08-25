@@ -34,7 +34,7 @@ LOG "反修 rc=$BFRC(非0=看门狗/异常, 层文件仍完好, 继续合并)"
 pgrep -f "ds4quant_run" >/dev/null && { LOG "仍有量化进程, 停"; exit 3; }
 rm -f "$ROOT/gguf/go-onebit/ds4-r28.gguf"
 LOG "预扫 blob 真尺寸"
-python3 "$ROOT/gguf-tools/go-onebit/scripts/vq_blob_truesize.py" "$OUTF/layers" \
+"$(dirname "$0")/../calib/vq_blob_truesize" "$OUTF/layers" \
     > "$OUTF/blob_sizes.txt" 2>/tmp/r28_truesize.log || { LOG "预扫失败"; exit 4; }
 # ★--no-down(2026-07-31): R28 计划表 43/43 层 w2dim=16 ⇒ 冷 w2 的 VQ 载荷在 blob 的
 #   which=2 槽里, base ffn_down_exps(43×0.2656=11.42 GiB)是纯死重。带上它 = 38.74 GiB,

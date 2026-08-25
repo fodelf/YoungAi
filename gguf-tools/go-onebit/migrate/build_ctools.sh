@@ -3,7 +3,7 @@
 # 默认构建全部。产物=calib/<name>(与源同目录, .gitignore 不入库)。
 set -e
 CAL="$(cd "$(dirname "$0")/../calib" && pwd)"
-TOOLS="${*:-anchor_metrics kl_forensic trace_ladder rec_fidelity zrec_to_zchain dql_to_zchain zlayer vq_merge_v4}"
+TOOLS="${*:-anchor_metrics kl_forensic trace_ladder rec_fidelity zrec_to_zchain dql_to_zchain zlayer vq_merge_v4 vq_blob_truesize}"
 for t in $TOOLS; do
   case "$t" in
     zlayer)

@@ -62,3 +62,9 @@
   残余风险: 真数据 --merge 全量金标因 spark 磁盘(free 91G < 2×86G)未做, 由夹具B覆盖;
     ssh 流式分支未对拍(popen 单引号包裹保 argv 一致, 见 vq_merge_v4_transcription_notes #15)
   结果: 过闸 ✓ → py 删除, 11 个 .sh 调用方接线 quant/vq_merge_v4, build_ctools.sh 收编
+
+[2026-08-25] scripts/vq_blob_truesize.py → calib/vq_blob_truesize.c
+  勘误: 大清仓 keep 清单路径笔误(quant/≠scripts/)致误删, 已从 git 恢复后转录。
+  输入: vq86h_noz/layers 43 层真数据 (spark)
+  判定: stdout 与 stderr 双双逐字节一致
+  结果: 过闸 ✓ → py 删除, 调用方接线, build_ctools 收编
