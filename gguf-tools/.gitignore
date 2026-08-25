@@ -18,6 +18,7 @@ quantize/vq_em.o
 quantize/st_bridge.o
 amp/ds4quant_run
 amp/zlayer
+amp/zloss_solve
 amp/zlayer_gpu.o
 amp/dql_to_zchain
 calib/validate_fwd

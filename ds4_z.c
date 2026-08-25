@@ -7,6 +7,28 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* DQ_BLAS 快路(2026-08-26): 正规方程/Cholesky 换 BLAS/LAPACK 分块。数学不变,
+ * 只有累加顺序的尾位差(zlayer chol_solve 36× 先例同款)。引擎构建不定义 DQ_BLAS,
+ * 模块对引擎保持 stdlib-only; 反修解算器(zloss_solve)开 DQ_BLAS —— 4096² 正规
+ * 方程纯标量 ~5min/层, 43 层等一夜, 不开就是浪费设备。 */
+#ifdef DQ_BLAS
+#if defined(__APPLE__)
+#ifndef ACCELERATE_NEW_LAPACK
+#define ACCELERATE_NEW_LAPACK
+#endif
+#include <Accelerate/Accelerate.h>
+#define DZ_DPOTRF dpotrf_
+#define DZ_DPOTRS dpotrs_
+#else
+#include <cblas.h>
+extern void scipy_dpotrf_(const char *, const int *, double *, const int *, int *);
+extern void scipy_dpotrs_(const char *, const int *, const int *, const double *,
+                          const int *, double *, const int *, int *);
+#define DZ_DPOTRF scipy_dpotrf_
+#define DZ_DPOTRS scipy_dpotrs_
+#endif
+#endif
+
 /* Deterministic LCG (Numerical Recipes constants): subspace-iteration init
  * must be reproducible, so no rand()/time seeding anywhere in this module. */
 static inline uint32_t lcg_next(uint64_t *s) {
@@ -114,6 +136,20 @@ ds4_z *ds4_z_solve(const float *X, const float *R, uint32_t n,
     double *B = calloc((size_t)d_in * d_out, sizeof(double));
     float  *W = malloc((size_t)d_in * d_out * sizeof(float));
     if (!A || !B || !W) { free(A); free(B); free(W); return NULL; }
+#ifdef DQ_BLAS
+    {   /* A = XᵀX, B = XᵀR — dgemm 双精(输入升 f64 后与标量路同一乘加集合) */
+        double *Xd = malloc((size_t)n * d_in * sizeof(double));
+        double *Rd = malloc((size_t)n * d_out * sizeof(double));
+        if (!Xd || !Rd) { free(Xd); free(Rd); free(A); free(B); free(W); return NULL; }
+        for (size_t i = 0; i < (size_t)n * d_in; i++) Xd[i] = X[i];
+        for (size_t i = 0; i < (size_t)n * d_out; i++) Rd[i] = R[i];
+        cblas_dgemm(CblasRowMajor, CblasTrans, CblasNoTrans, (int)d_in, (int)d_in, (int)n,
+                    1.0, Xd, (int)d_in, Xd, (int)d_in, 0.0, A, (int)d_in);
+        cblas_dgemm(CblasRowMajor, CblasTrans, CblasNoTrans, (int)d_in, (int)d_out, (int)n,
+                    1.0, Xd, (int)d_in, Rd, (int)d_out, 0.0, B, (int)d_out);
+        free(Xd); free(Rd);
+    }
+#else
     for (uint32_t t = 0; t < n; t++) {
         const float *x = X + (size_t)t * d_in;
         const float *r = R + (size_t)t * d_out;
@@ -126,6 +162,7 @@ ds4_z *ds4_z_solve(const float *X, const float *R, uint32_t n,
             for (uint32_t j = 0; j < d_out; j++) Bi[j] += xi * r[j];
         }
     }
+#endif
     /* mirror the upper triangle + dimensionless ridge */
     double tr = 0.0;
     for (uint32_t i = 0; i < d_in; i++) tr += A[(size_t)i * d_in + i];
@@ -135,6 +172,27 @@ ds4_z *ds4_z_solve(const float *X, const float *R, uint32_t n,
         for (uint32_t j = i + 1; j < d_in; j++)
             A[(size_t)j * d_in + i] = A[(size_t)i * d_in + j];
     }
+#ifdef DQ_BLAS
+    {   /* 分块 potrf/potrs: 行主序对称阵取 uplo='U' 列主序等价; B 转置进出(zlayer 同式) */
+        int info = 0, N = (int)d_in, nrhs = (int)d_out;
+        const char up = 'U';
+        DZ_DPOTRF(&up, &N, A, &N, &info);
+        if (info) { free(A); free(B); free(W); return NULL; }
+        double *Bt = malloc((size_t)d_in * d_out * sizeof(double));
+        if (!Bt) { free(A); free(B); free(W); return NULL; }
+        for (uint32_t i = 0; i < d_in; i++)
+            for (uint32_t j = 0; j < d_out; j++)
+                Bt[(size_t)j * d_in + i] = B[(size_t)i * d_out + j];
+        DZ_DPOTRS(&up, &N, &nrhs, A, &N, Bt, &N, &info);
+        if (info) { free(Bt); free(A); free(B); free(W); return NULL; }
+        for (uint32_t i = 0; i < d_in; i++)
+            for (uint32_t j = 0; j < d_out; j++)
+                W[(size_t)i * d_out + j] = (float)Bt[(size_t)j * d_in + i];
+        free(Bt);
+        free(A);
+        free(B);
+    }
+#else
     if (cholesky(A, d_in) != 0) { free(A); free(B); free(W); return NULL; }
     double *col = malloc((size_t)d_in * sizeof(double));
     if (!col) { free(A); free(B); free(W); return NULL; }
@@ -146,6 +204,7 @@ ds4_z *ds4_z_solve(const float *X, const float *R, uint32_t n,
     free(col);
     free(A);
     free(B);
+#endif
 
     /* Rank-k truncation by subspace iteration on W W^T: V converges to the
      * top-k left singular subspace of W, then M = V^T W = diag(z) U^T. */

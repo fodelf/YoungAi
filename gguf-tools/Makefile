@@ -117,13 +117,13 @@ endif
 # ---------------------------------------------------------------- 目标分组
 .PHONY: all amp legacy calib bench tools-test go-onebit-test quality-score clean everything
 .PHONY: deepseek4-quantize-alias anchor_metrics compare_scores ds4quant_run zlayer \
-        dql_to_zchain teacher_routed \
+        dql_to_zchain teacher_routed zloss_solve \
         calib_run calib_diag validate_fwd traj_analyze cap_raw2npy vq_blob_truesize dump_gguf_meta \
         kl_forensic trace_ladder rec_fidelity pubbench pubbench_extract_test vq_merge_v4 \
         go2b_parity vq2q2k_probe vq_em deepseek4-quantize-cpu
 
 all: deepseek4-quantize anchor_metrics compare_scores
-amp: ds4quant_run zlayer dql_to_zchain teacher_routed
+amp: ds4quant_run zlayer dql_to_zchain teacher_routed zloss_solve
 # legacy 二进制已随 2026-08-26 清仓删除(用户令); solvers 源仅作 calib_run 链接件存续。
 legacy:
 	@echo "legacy 目标已清空(2026-08-26 清仓)"
@@ -214,6 +214,17 @@ endif
 dql_to_zchain: $(AMP)/dql_to_zchain
 $(AMP)/dql_to_zchain: $(AMP)/dql_to_zchain.c
 	$(CC) $(BARE) $(NATIVE) -o $@ $< -lm -lpthread
+# zloss_solve: 单层贪心四损失解算器(2026-08-26 用户设计)。-I.. 吃仓库根 ds4_z.c/
+# ds4_loss.c(与引擎同一份实现); BLAS 在则开 DQ_BLAS 快路(ds4_z.c 内守卫)。
+zloss_solve: $(AMP)/zloss_solve
+ifeq ($(HAVE_BLAS),1)
+$(AMP)/zloss_solve: $(AMP)/zloss_solve.c $(CAL)/npy.c ../ds4_z.c ../ds4_z.h ../ds4_loss.c ../ds4_loss.h
+	$(CC) $(BARE) $(NATIVE) -I.. -I$(CAL) -DDQ_BLAS $(BLAS_CFLAGS) -o $@ $(AMP)/zloss_solve.c $(CAL)/npy.c $(BLAS_LIBS) -lm -lpthread
+else
+$(AMP)/zloss_solve: $(AMP)/zloss_solve.c $(CAL)/npy.c ../ds4_z.c ../ds4_z.h ../ds4_loss.c ../ds4_loss.h
+	$(CC) $(BARE) $(NATIVE) -I.. -I$(CAL) -o $@ $(AMP)/zloss_solve.c $(CAL)/npy.c -lm -lpthread
+endif
+
 teacher_routed: teacher_routed.bin
 .PHONY: teacher_routed.bin
 teacher_routed.bin: $(AMP)/teacher_routed.c $(CAL)/npy.c $(CAL)/layer_probe.c
@@ -338,7 +349,7 @@ clean:
 	    $(QZ)/quantize_gpu.o $(QZ)/vq_gpu.o $(QZ)/vq_merge_v4 $(QZ)/go2b_parity $(QZ)/vq2q2k_probe \
 	    $(QZ)/vq_em.o $(QZ)/st_bridge.o \
 	    $(AMP)/ds4quant_run $(AMP)/zlayer $(AMP)/zlayer_gpu.o \
-	    $(AMP)/dql_to_zchain \
+	    $(AMP)/dql_to_zchain $(AMP)/zloss_solve \
 	    $(CAL)/validate_fwd $(CAL)/traj_analyze $(CAL)/vq_blob_truesize \
 	    $(BEN)/anchor_metrics $(BEN)/kl_forensic $(BEN)/trace_ladder $(BEN)/rec_fidelity \
 	    $(BEN)/pubbench $(BEN)/gates/pubbench_extract_test \
