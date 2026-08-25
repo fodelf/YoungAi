@@ -19,11 +19,16 @@ CLI_SRCS := $(wildcard src/cli/*.c)
 CLI_OBJS := $(CLI_SRCS:.c=.o)
 CLI_CPU_OBJS := $(CLI_SRCS:.c=_cpu.o)
 
+# 引擎核心(重构阶段4: ds4.c 机械拆分为 src/core/*.c, 共享内部头 src/core/core_internal.h)
+CORE_ENGINE_SRCS := $(wildcard src/core/*.c)
+CORE_ENGINE_OBJS := $(CORE_ENGINE_SRCS:.c=.o)
+CORE_ENGINE_CPU_OBJS := $(CORE_ENGINE_SRCS:.c=_cpu.o)
+
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal -framework Accelerate
 MM_OBJS = ds4_multimodal.o ds4_spatial.o ds4_css.o
-CORE_OBJS = ds4.o ds4_corr.o ds4_zchain.o $(MM_OBJS) ds4_distributed.o ds4_metal.o
-CPU_CORE_OBJS = ds4_cpu.o ds4_corr_cpu.o ds4_zchain.o $(MM_OBJS) ds4_distributed.o
+CORE_OBJS = $(CORE_ENGINE_OBJS) ds4_corr.o ds4_zchain.o $(MM_OBJS) ds4_distributed.o ds4_metal.o
+CPU_CORE_OBJS = $(CORE_ENGINE_CPU_OBJS) ds4_corr_cpu.o ds4_zchain.o $(MM_OBJS) ds4_distributed.o
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= /usr/local/cuda
@@ -35,8 +40,8 @@ endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 CUDA_SPARK_FLAGS := -DDS4_CUDA_SPARK_HBM_CACHE=1
 MM_OBJS = ds4_multimodal.o ds4_spatial.o ds4_css.o
-CORE_OBJS = ds4.o ds4_corr.o ds4_zchain.o $(MM_OBJS) ds4_distributed.o ds4_cuda.o
-CPU_CORE_OBJS = ds4_cpu.o ds4_corr_cpu.o ds4_zchain.o $(MM_OBJS) ds4_distributed.o
+CORE_OBJS = $(CORE_ENGINE_OBJS) ds4_corr.o ds4_zchain.o $(MM_OBJS) ds4_distributed.o ds4_cuda.o
+CPU_CORE_OBJS = $(CORE_ENGINE_CPU_OBJS) ds4_corr_cpu.o ds4_zchain.o $(MM_OBJS) ds4_distributed.o
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 METAL_LDLIBS := $(LDLIBS)
 endif
@@ -138,8 +143,11 @@ cuda-regression: tests/cuda_long_context_smoke
 	./tests/cuda_long_context_smoke
 endif
 
-ds4.o: ds4.c ds4.h ds4_internal.h ds4_distributed.h ds4_gpu.h ds4_multimodal.h ds4_spatial.h ds4_css.h
-	$(CC) $(CFLAGS) -c -o $@ ds4.c
+src/core/%.o: src/core/%.c $(wildcard src/core/*.h) ds4.h ds4_internal.h ds4_distributed.h ds4_gpu.h ds4_multimodal.h ds4_spatial.h ds4_css.h ds4_zchain.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+src/core/%_cpu.o: src/core/%.c $(wildcard src/core/*.h) ds4.h ds4_internal.h ds4_distributed.h ds4_multimodal.h ds4_spatial.h ds4_css.h ds4_zchain.h
+	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ $<
 
 
 # Standalone capability modules (self-contained, no engine coupling): z 隐变量
@@ -224,8 +232,6 @@ rax.o: rax.c rax.h rax_malloc.h
 linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
 
-ds4_cpu.o: ds4.c ds4.h ds4_internal.h ds4_distributed.h ds4_gpu.h ds4_multimodal.h ds4_spatial.h ds4_css.h
-	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4.c
 
 
 
@@ -269,7 +275,7 @@ test: ds4_test ds4-eval ds4_unit
 	./ds4_test
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_unit e0-pingpong mm-ui mm-ocr *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o src/cli/*.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_unit e0-pingpong mm-ui mm-ocr *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o src/cli/*.o src/core/*.o
 
 # Task 04 / E0: standalone thunderbolt ping-pong latency gate (no core deps, no
 # model). Defined after the default targets so it never becomes the default goal.
