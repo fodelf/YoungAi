@@ -14,11 +14,24 @@ OBJCFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -fo
 LDLIBS ?= -lm -pthread
 METAL_SRCS := $(wildcard metal/*.metal)
 
+# ds4_distributed.c 已机械拆分为 src/dist/*.c(行为零变化, 拆分见 src/dist/dist_internal.h)。
+# 对象放源旁; 两个平台段的 CORE_OBJS/CPU_CORE_OBJS 共用这一份列表。
+DIST_OBJS = src/dist/dist_util.o src/dist/dist_transport.o src/dist/dist_framing.o \
+    src/dist/dist_tp.o src/dist/dist_wire.o src/dist/dist_reg.o \
+    src/dist/dist_coord_route.o src/dist/dist_coord_dispatch.o src/dist/dist_coord_eval.o \
+    src/dist/dist_coord_gen.o src/dist/dist_prefill_pipe.o src/dist/dist_prefill.o \
+    src/dist/dist_coord_recover.o src/dist/dist_coord_ctl.o src/dist/dist_kv_snapshot.o \
+    src/dist/dist_payload.o src/dist/dist_coord_kv.o src/dist/dist_coord_session.o \
+    src/dist/dist_coord_main.o src/dist/dist_worker_loop.o src/dist/dist_worker_route.o \
+    src/dist/dist_worker_fwd.o src/dist/dist_worker_kv.o src/dist/dist_worker_exec.o \
+    src/dist/dist_worker_prefetch.o src/dist/dist_worker_main.o src/dist/dist_cli.o \
+    src/dist/dist_rfetch.o
+
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal -framework Accelerate
 MM_OBJS = ds4_multimodal.o ds4_spatial.o ds4_css.o
-CORE_OBJS = ds4.o ds4_corr.o ds4_zchain.o $(MM_OBJS) ds4_distributed.o ds4_metal.o
-CPU_CORE_OBJS = ds4_cpu.o ds4_corr_cpu.o ds4_zchain.o $(MM_OBJS) ds4_distributed.o
+CORE_OBJS = ds4.o ds4_corr.o ds4_zchain.o $(MM_OBJS) $(DIST_OBJS) ds4_metal.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_corr_cpu.o ds4_zchain.o $(MM_OBJS) $(DIST_OBJS)
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= /usr/local/cuda
@@ -30,8 +43,8 @@ endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 CUDA_SPARK_FLAGS := -DDS4_CUDA_SPARK_HBM_CACHE=1
 MM_OBJS = ds4_multimodal.o ds4_spatial.o ds4_css.o
-CORE_OBJS = ds4.o ds4_corr.o ds4_zchain.o $(MM_OBJS) ds4_distributed.o ds4_cuda.o
-CPU_CORE_OBJS = ds4_cpu.o ds4_corr_cpu.o ds4_zchain.o $(MM_OBJS) ds4_distributed.o
+CORE_OBJS = ds4.o ds4_corr.o ds4_zchain.o $(MM_OBJS) $(DIST_OBJS) ds4_cuda.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_corr_cpu.o ds4_zchain.o $(MM_OBJS) $(DIST_OBJS)
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 METAL_LDLIBS := $(LDLIBS)
 endif
@@ -183,8 +196,10 @@ ds4_zchain.o: ds4_zchain.c ds4_zchain.h
 ds4_cli.o: ds4_cli.c ds4.h ds4_distributed.h linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_cli.c
 
-ds4_distributed.o: ds4_distributed.c ds4_distributed.h ds4.h
-	$(CC) $(CFLAGS) -c -o $@ ds4_distributed.c
+# src/dist 全组 .c 只包含 dist_internal.h(其再包含 dist_proto.h/dist_state.h 与根公共头),
+# 头依赖对整组一致, 用静态模式规则替代逐文件规则。
+$(DIST_OBJS): %.o: %.c src/dist/dist_internal.h src/dist/dist_proto.h src/dist/dist_state.h ds4_distributed.h ds4.h
+	$(CC) $(CFLAGS) -c -o $@ $<
 
 ds4_server.o: ds4_server.c ds4.h ds4_distributed.h ds4_kvstore.h ds4_multimodal.h rax.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_server.c
@@ -262,7 +277,7 @@ test: ds4_test ds4-eval ds4_unit
 	./ds4_test
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_unit e0-pingpong mm-ui mm-ocr *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_unit e0-pingpong mm-ui mm-ocr *.o src/dist/*.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
 
 # Task 04 / E0: standalone thunderbolt ping-pong latency gate (no core deps, no
 # model). Defined after the default targets so it never becomes the default goal.
