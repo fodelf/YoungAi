@@ -710,215 +710,34 @@ static float *vq_dequant(const uint8_t *blob, size_t bsz, uint64_t off, long *R_
  *   见 scripts/quant_allq2_spark.sh), 外加 f32/f16/bf16/q8_0/q4_K 这几个零成本的。
  *   碰到别的类型直接停车 —— py 那边 gguf-py 也是抛异常, 不静默出垃圾。 */
 
-enum { GGT_F32 = 0, GGT_F16 = 1, GGT_Q8_0 = 8, GGT_Q2_K = 10, GGT_Q4_K = 12,
-       GGT_IQ2_XXS = 16, GGT_BF16 = 30 };
+/* ★重构阶段2(2026-08-25)★ 上面注释描述的实现已升格为全仓唯一
+ * src/common/{ds4_gguf,ds4_quantfmt}(逐式搬移, tests/fixtures/quantfmt/ 金标
+ * 逐字节回归)。此处只剩 die 口径 shim: 库返回错误码, 停车与否由本工具定。 */
+#include "../../../src/common/ds4_quantfmt.c"
+#include "../../../src/common/ds4_gguf.c"
 
-typedef struct { char *name; uint32_t nd, type; uint64_t ne[4], off; } gg_tensor;
-typedef struct { const uint8_t *map; size_t msz; gg_tensor *t; int nt; uint64_t data0; } gg_ctx;
+enum { GGT_F32 = DS4_GGT_F32, GGT_F16 = DS4_GGT_F16, GGT_Q8_0 = DS4_GGT_Q8_0,
+       GGT_Q2_K = DS4_GGT_Q2_K, GGT_Q4_K = DS4_GGT_Q4_K,
+       GGT_IQ2_XXS = DS4_GGT_IQ2_XXS, GGT_BF16 = DS4_GGT_BF16 };
+typedef ds4_gguf gg_ctx;
+typedef ds4_gguf_tensor gg_tensor;
 
-static uint64_t gg_align_up(uint64_t x) { return (x + 31u) & ~31ull; }   /* GGUF 默认 alignment=32 */
-
-/* 光标式读取(全在 mmap 上, 越界即停车) */
-typedef struct { const uint8_t *p; const uint8_t *end; } gg_cur;
-static void gg_rd(gg_cur *c, void *dst, size_t n) {
-    if ((size_t)(c->end - c->p) < n) die("GGUF 头截断(还差 %zu B)", n);
-    memcpy(dst, c->p, n); c->p += n;
+static void gg_type_geom(uint32_t ty, uint64_t *blk, uint64_t *tsz) {
+    if (!ds4_ggt_geom(ty, blk, tsz))
+        die("GGUF 张量类型 %u 未实现 dequant — .py 侧 gguf-py 同样会抛, 拒跑", ty);
 }
-static uint32_t gg_u32(gg_cur *c) { uint32_t v; gg_rd(c, &v, 4); return v; }
-static uint64_t gg_u64(gg_cur *c) { uint64_t v; gg_rd(c, &v, 8); return v; }
-static void gg_skipstr(gg_cur *c) { uint64_t n = gg_u64(c); if ((uint64_t)(c->end - c->p) < n) die("GGUF 串截断"); c->p += n; }
-static void gg_skipval(gg_cur *c, uint32_t t) {          /* vq_merge_v4.c skipv 同表 */
-    static const int sz[13] = { 1, 1, 2, 2, 4, 4, 4, 1, 0, 0, 8, 8, 8 };
-    if (t == 8) { gg_skipstr(c); return; }
-    if (t == 9) { uint32_t et = gg_u32(c); uint64_t n = gg_u64(c);
-                  for (uint64_t i = 0; i < n; i++) gg_skipval(c, et); return; }
-    if (t > 12 || sz[t] == 0) die("GGUF KV 类型不认识: %u", t);
-    uint8_t tmp[8]; gg_rd(c, tmp, (size_t)sz[t]);
+
+static void gg_dequant(uint32_t ty, const uint8_t *src, uint64_t nelem, float *out) {
+    uint64_t blk, tsz;
+    if (!ds4_ggt_geom(ty, &blk, &tsz)) die("GGUF dequant: 类型 %u 未实现", ty);
+    if (nelem % blk) die("GGUF dequant: 元素数 %llu 不是块 %llu 的整数倍",
+                         (unsigned long long)nelem, (unsigned long long)blk);
+    if (ds4_deq_bytes(ty, src, nelem, out)) die("GGUF dequant: 类型 %u 失败", ty);
 }
 
 static void gg_open(gg_ctx *g, const char *path) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) die("DS4_ZL_GGUF 打不开: %s", path);
-    struct stat st;
-    if (fstat(fd, &st) || st.st_size <= 0) die("DS4_ZL_GGUF 空文件: %s", path);
-    g->msz = (size_t)st.st_size;
-    g->map = (const uint8_t *)mmap(NULL, g->msz, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (g->map == MAP_FAILED) die("DS4_ZL_GGUF mmap 失败: %s", path);
-    close(fd);
-    gg_cur c = { g->map, g->map + g->msz };
-    uint32_t magic = gg_u32(&c), ver = gg_u32(&c);
-    uint64_t n_t = gg_u64(&c), n_kv = gg_u64(&c);
-    if (!(magic == 0x46554747u && ver == 3)) die("assert 失败: 非 GGUF v3(magic=%08x ver=%u)", magic, ver);
-    for (uint64_t i = 0; i < n_kv; i++) { gg_skipstr(&c); gg_skipval(&c, gg_u32(&c)); }
-    g->nt = (int)n_t;
-    g->t = (gg_tensor *)xcalloc((size_t)(n_t ? n_t : 1), sizeof(gg_tensor));
-    for (uint64_t i = 0; i < n_t; i++) {
-        gg_tensor *t = &g->t[i];
-        uint64_t nl = gg_u64(&c);
-        if ((uint64_t)(c.end - c.p) < nl) die("GGUF 张量名截断");
-        t->name = (char *)xmalloc((size_t)nl + 1);
-        memcpy(t->name, c.p, (size_t)nl); t->name[nl] = 0; c.p += nl;
-        t->nd = gg_u32(&c);
-        if (t->nd < 1 || t->nd > 4) die("GGUF 张量 %s 维数 %u 超范围", t->name, t->nd);
-        t->ne[0] = t->ne[1] = t->ne[2] = t->ne[3] = 1;
-        for (uint32_t d2 = 0; d2 < t->nd; d2++) t->ne[d2] = gg_u64(&c);
-        t->type = gg_u32(&c);
-        t->off = gg_u64(&c);
-    }
-    g->data0 = gg_align_up((uint64_t)(c.p - g->map));
-}
-
-static void gg_type_geom(uint32_t ty, uint64_t *blk, uint64_t *tsz) {
-    switch (ty) {
-        case GGT_F32:     *blk = 1;   *tsz = 4;   return;
-        case GGT_F16:     *blk = 1;   *tsz = 2;   return;
-        case GGT_BF16:    *blk = 1;   *tsz = 2;   return;
-        case GGT_Q8_0:    *blk = 32;  *tsz = 34;  return;
-        case GGT_Q2_K:    *blk = 256; *tsz = 84;  return;
-        case GGT_Q4_K:    *blk = 256; *tsz = 144; return;
-        case GGT_IQ2_XXS: *blk = 256; *tsz = 66;  return;
-        default: die("GGUF 张量类型 %u 未实现 dequant — .py 侧 gguf-py 同样会抛, 拒跑", ty);
-    }
-}
-
-/* ---- 标量反量化: 输入 nb 个块的原始字节, 输出 nb*blk 个 f32 ---- */
-
-/* q2_K: 抄 ds4.c:4352 deq_q2K_row_f32(与 CUDA host_deq_q2k_block 同式, 已对拍) */
-static void gg_deq_q2_K(const uint8_t *src, uint64_t nblk, float *out) {
-    for (uint64_t b = 0; b < nblk; b++) {
-        const uint8_t *blk = src + b * 84u;
-        const uint8_t *sc = blk, *qs = blk + 16;
-        uint16_t hd, hm;
-        memcpy(&hd, blk + 80, 2); memcpy(&hm, blk + 82, 2);
-        const float d = f16_to_f32(hd), dm = f16_to_f32(hm);
-        float *o = out + b * 256u;
-        for (int j = 0; j < 16; j++) {
-            const float dj = d * (float)(sc[j] & 0xF), mj = dm * (float)(sc[j] >> 4);
-            for (int ii = 0; ii < 16; ii++) {
-                const int idx = j * 16 + ii;
-                const int qpos = (idx / 128) * 32 + (idx % 32);
-                const int q = (qs[qpos] >> ((idx % 128) / 32 * 2)) & 3;
-                o[idx] = dj * (float)q - mj;
-            }
-        }
-    }
-}
-
-/* q4_K: llama.cpp get_scale_min_k4 + dequantize_row_q4_K(= gguf-py Q4_K.get_scale_min) */
-static void gg_q4k_scale_min(int j, const uint8_t *q, uint8_t *d, uint8_t *m) {
-    if (j < 4) { *d = q[j] & 63; *m = q[j + 4] & 63; }
-    else { *d = (uint8_t)((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4));
-           *m = (uint8_t)((q[j + 4] >> 4)  | ((q[j - 0] >> 6) << 4)); }
-}
-static void gg_deq_q4_K(const uint8_t *src, uint64_t nblk, float *out) {
-    for (uint64_t b = 0; b < nblk; b++) {
-        const uint8_t *blk = src + b * 144u;
-        uint16_t hd, hm;
-        memcpy(&hd, blk, 2); memcpy(&hm, blk + 2, 2);
-        const float d = f16_to_f32(hd), dmin = f16_to_f32(hm);
-        const uint8_t *scales = blk + 4, *q = blk + 16;
-        float *y = out + b * 256u;
-        int is = 0;
-        for (int j = 0; j < 256; j += 64) {
-            uint8_t sc, m;
-            gg_q4k_scale_min(is + 0, scales, &sc, &m);
-            const float d1 = d * (float)sc, m1 = dmin * (float)m;
-            gg_q4k_scale_min(is + 1, scales, &sc, &m);
-            const float d2 = d * (float)sc, m2 = dmin * (float)m;
-            for (int l = 0; l < 32; l++) *y++ = d1 * (float)(q[l] & 0xF) - m1;
-            for (int l = 0; l < 32; l++) *y++ = d2 * (float)(q[l] >> 4)  - m2;
-            q += 32; is += 2;
-        }
-    }
-}
-
-static void gg_deq_q8_0(const uint8_t *src, uint64_t nblk, float *out) {
-    for (uint64_t b = 0; b < nblk; b++) {
-        const uint8_t *blk = src + b * 34u;
-        uint16_t hd; memcpy(&hd, blk, 2);
-        const float d = f16_to_f32(hd);
-        const int8_t *qs = (const int8_t *)(blk + 2);
-        float *o = out + b * 32u;
-        for (int j = 0; j < 32; j++) o[j] = d * (float)qs[j];
-    }
-}
-
-/* iq2_xxs 网格。两半分开说, 因为踩过一次坑:
- *   ① 2bit 打包表 = gguf-tools/quants.c:714 的 kgrid[256], 与本文件这份逐字节相同
- *      (已核对: 0,2,5,8,10,17,20,32,… 与 gguf-py 的 grid_hex 解出来的完全一致)。
- *   ② 码 → 值的映射【不是】quants.c 里那个 2*l+1 ∈ {1,3,5,7}。那是 IQ2_XXS
- *      【编码器的搜索空间】(llama.cpp quantize_iq2_xxs 里的 kgrid_q2xs), 与解码表不是
- *      一套数。真正的解码值 = {0x08, 0x19, 0x2b}, 见 metal/moe.metal:23 的
- *      ds4_metal_iq2xxs_grid(= llama.cpp iq2xxs_grid = gguf-py IQ2_XXS.grid_map)。
- *      当初照 2*l+1 写, 与 gguf-py 对拍 max|Δ|=15 —— 数量级都对不上, 但代码不会报错。
- *      码 3 在这张表里从不出现(全表只有三种字节值)。
- * 符号: llama.cpp 的 ksigns_iq2xs[s] = s 的 popcount 为奇数时 s|0x80, 否则 s
- *       (第 8 个符号 = 前 7 位的奇偶校验), 现场算不抄表。 */
-static const uint8_t gg_iq2xxs_val[4] = { 0x08, 0x19, 0x2b, 0x00 };
-static const uint16_t gg_iq2xxs_kgrid[256] = {
-        0,     2,     5,     8,    10,    17,    20,    32,    34,    40,    42,    65,    68,    80,    88,    97,
-      100,   128,   130,   138,   162,   257,   260,   272,   277,   320,   388,   408,   512,   514,   546,   642,
-     1025,  1028,  1040,  1057,  1060,  1088,  1090,  1096,  1120,  1153,  1156,  1168,  1188,  1280,  1282,  1288,
-     1312,  1350,  1385,  1408,  1425,  1545,  1552,  1600,  1668,  1700,  2048,  2053,  2056,  2068,  2088,  2113,
-     2116,  2128,  2130,  2184,  2308,  2368,  2562,  2580,  4097,  4100,  4112,  4129,  4160,  4192,  4228,  4240,
-     4245,  4352,  4360,  4384,  4432,  4442,  4480,  4644,  4677,  5120,  5128,  5152,  5157,  5193,  5248,  5400,
-     5474,  5632,  5654,  6145,  6148,  6160,  6208,  6273,  6400,  6405,  6560,  6737,  8192,  8194,  8202,  8260,
-     8289,  8320,  8322,  8489,  8520,  8704,  8706,  9217,  9220,  9232,  9280,  9302,  9472,  9537,  9572,  9872,
-    10248, 10272, 10388, 10820, 16385, 16388, 16400, 16408, 16417, 16420, 16448, 16456, 16470, 16480, 16513, 16516,
-    16528, 16640, 16672, 16737, 16768, 16773, 16897, 16912, 16968, 16982, 17000, 17408, 17416, 17440, 17536, 17561,
-    17682, 17700, 17920, 18433, 18436, 18448, 18496, 18501, 18688, 18776, 18785, 18818, 19013, 19088, 20480, 20488,
-    20497, 20505, 20512, 20608, 20616, 20740, 20802, 20900, 21137, 21648, 21650, 21770, 22017, 22100, 22528, 22545,
-    22553, 22628, 22848, 23048, 24580, 24592, 24640, 24680, 24832, 24917, 25112, 25184, 25600, 25605, 25872, 25874,
-    25988, 26690, 32768, 32770, 32778, 32833, 32898, 33028, 33048, 33088, 33297, 33793, 33796, 33808, 33813, 33856,
-    33888, 34048, 34118, 34196, 34313, 34368, 34400, 34818, 35076, 35345, 36868, 36880, 36900, 36928, 37025, 37142,
-    37248, 37445, 37888, 37922, 37956, 38225, 39041, 39200, 40962, 41040, 41093, 41225, 41472, 42008, 43088, 43268,
-};
-static void gg_deq_iq2_xxs(const uint8_t *src, uint64_t nblk, float *out) {
-    for (uint64_t b = 0; b < nblk; b++) {
-        const uint8_t *blk = src + b * 66u;
-        uint16_t hd; memcpy(&hd, blk, 2);
-        const float d = f16_to_f32(hd);
-        float *y = out + b * 256u;
-        for (int ib32 = 0; ib32 < 8; ib32++) {
-            uint16_t q2[4];
-            memcpy(q2, blk + 2 + ib32 * 8, 8);
-            const uint32_t a_g = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
-            const uint32_t a_s = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
-            const float db = d * (0.5f + (float)(a_s >> 28)) * 0.25f;
-            for (int l = 0; l < 4; l++) {
-                const uint32_t gi = (a_g >> (8 * l)) & 0xFFu;         /* aux8[l] */
-                const uint16_t kg = gg_iq2xxs_kgrid[gi];
-                uint32_t s7 = (a_s >> (7 * l)) & 127u;
-                int par = 0;
-                for (int t = 0; t < 7; t++) par ^= (int)((s7 >> t) & 1u);
-                const uint32_t signs = par ? (s7 | 0x80u) : s7;       /* = ksigns_iq2xs[s7] */
-                for (int j = 0; j < 8; j++) {
-                    const int code = (kg >> (2 * j)) & 3;
-                    if (code == 3) die("iq2_xxs 网格出现码 3 — 表读错了(assert)");
-                    const float gv = (float)gg_iq2xxs_val[code];
-                    *y++ = (signs & (1u << j)) ? -(db * gv) : (db * gv);
-                }
-            }
-        }
-    }
-}
-
-/* 一段字节 → f32[nelem]; 调用方保证 nelem 是块大小的整数倍(py 的 per 均分同样保证) */
-static void gg_dequant(uint32_t ty, const uint8_t *src, uint64_t nelem, float *out) {
-    uint64_t blk, tsz; gg_type_geom(ty, &blk, &tsz);
-    if (nelem % blk) die("GGUF dequant: 元素数 %llu 不是块 %llu 的整数倍", (unsigned long long)nelem, (unsigned long long)blk);
-    const uint64_t nb = nelem / blk;
-    switch (ty) {
-        case GGT_F32:  memcpy(out, src, (size_t)nelem * 4); return;
-        case GGT_F16:  for (uint64_t i = 0; i < nelem; i++) { uint16_t h; memcpy(&h, src + i * 2, 2); out[i] = f16_to_f32(h); } return;
-        case GGT_BF16: for (uint64_t i = 0; i < nelem; i++) { uint16_t h; memcpy(&h, src + i * 2, 2);
-                           uint32_t u = (uint32_t)h << 16; float v; memcpy(&v, &u, 4); out[i] = v; } return;
-        case GGT_Q8_0:    gg_deq_q8_0(src, nb, out);    return;
-        case GGT_Q2_K:    gg_deq_q2_K(src, nb, out);    return;
-        case GGT_Q4_K:    gg_deq_q4_K(src, nb, out);    return;
-        case GGT_IQ2_XXS: gg_deq_iq2_xxs(src, nb, out); return;
-        default: die("GGUF dequant: 类型 %u 未实现", ty);
-    }
+    char err[256];
+    if (ds4_gguf_open(g, path, err, sizeof err)) die("DS4_ZL_GGUF %s", err);
 }
 
 /* py 的 _gg_expert(l,nm,e): 张量 blk.<L>.ffn_{gate,up,down}_exps.weight,
