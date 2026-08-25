@@ -4,11 +4,15 @@
  * =========================================================================
  *
  * The latent-variable product of the go-onebit scheme (ALGORITHM.md §6.2,
- * "三段式产物" ③): a per-layer low-rank map that predicts the residual the
- * quantized base gets wrong, solved CLOSED-FORM from calibration activations
- * (zero training), with the rank k_L adjustable per layer AFTER solving --
- * the singular directions are ordered, so truncating z is the quality/size
- * dial.
+ * "三段式产物" ③): a per-layer low-rank map solved CLOSED-FORM from
+ * calibration activations (zero training), with the rank k_L adjustable per
+ * layer AFTER solving -- the singular directions are ordered, so truncating
+ * z is the quality/size dial.
+ *
+ * ★靶口径(2026-08-22 用户裁决, 2026-08-26 正名): z 不是"底座残差"——R 的语义
+ * 是【教师(FP) − 当层全部量化计算(attn/shared/router/norm/专家)的真值】,
+ * 学生侧取引擎捕获, 不是 Python 理想化重算。本模块不定义靶(X/R 由调用方喂),
+ * 旧文档把 R 写成 y_ref−y_base 底座残差是 7 月口径, 勿再沿用。
  *
  *   y_corrected = y_base + U * diag(z[0..rank)) * V^T * x
  *
