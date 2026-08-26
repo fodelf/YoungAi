@@ -456,7 +456,7 @@ int main(int argc, char **argv) {
             /* ★4L 臂(用户设计: 四损失进解算目标, ds4_z 机器原样)★ */
             run_4l_arm(X, R, Ys, Yt, Yt_ev, wv, fit, nf, ev, mode0, nev, ntok,
                        ranks, nrank, lambdas, nlam, maxk, &lw, dscale, (float)trclamp,
-                       seed, nth, L, lf, &best, Yhat, Cb, Cp, zcat);
+                       seed, nth, L, lf, &best, Yhat, Cb, Cp, zcat, gecorr, Rge);
         }
         tfta = tnow();
         fprintf(stderr, "  [t]L%d 数据%.1f GE%.1f x臂%.1f φ%.1f ftA%.1f 层计%.1fs\n",

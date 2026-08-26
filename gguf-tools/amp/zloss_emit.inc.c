@@ -182,12 +182,11 @@ static void emit_z_finish(const char *ldir, int L, best_t *best, const float *ge
         free(Ytf);
     }
     const char *action;
-    /* ★GE 与 z 解耦(2026-08-26 用户令"打日志找"定位的真 bug)★
-     * 原实现把冠军臂当单选: 纯 z 臂(ftA/4L)在校准 held 上险胜 GE+z 时, 整层 GE 被丢掉。
-     * 实测代价: z4l 只剩 GE=25 层(GE-only 战役是 39 层), 端到端 0.43750 反输 GE-only
-     * 0.43164。GE 是每专家标量门(512B/层, 跨语料最稳、端到端兑现最好), z 是低秩隐变量
-     * ——两者修的是不同部分, 本就该并存。此后: GE 赢裸即落, z 另外叠加。 */
-    const int ge_solo = (ge_dz && !best->zkeep_hasge && ge_wins);
+    /* ★GE 与 z 的正确关系(2026-08-27 修正)★ 2026-08-26 曾用 ge_solo 硬凑: 纯 z 臂
+     * 夺冠时也补落 GE —— 但纯 z 臂的 z 解的是【完整残差 R】, 再叠 GE 就是同一部分修两遍,
+     * 重尾被踩(PPL 比 1.385 反超裸 1.361)。正解=给每个 z 臂都提供 GE 基版本(GE+ftA/
+     * ftAw/GE+4L), 让四损失在同口径下择优; 冠军带 GE 基才落 GE, 不再硬凑。 */
+    const int ge_solo = 0; (void)ge_wins;
     if (!best->arm || best->tot >= tot0) action = "输裸不注入";
     else if (best->zkeep) {
         uint8_t *recs = NULL; size_t len = 0; int nrec = 0;

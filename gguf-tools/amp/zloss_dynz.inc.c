@@ -345,7 +345,8 @@ static void run_4l_arm(const float *X, const float *R, const float *Ys, const fl
                        const int *ranks, int nrank, const double *lambdas, int nlam,
                        int maxk, const ds4_loss_weights *lw, double dscale, float tr,
                        uint64_t seed, int nth, int L, FILE *lf, best_t *best,
-                       float *Yhat, float *Cb, float *Cp, float *zcat) {
+                       float *Yhat, float *Cb, float *Cp, float *zcat,
+                       const float *gecorr, const float *Rge) {
     float *sw2 = mk_sw2_fit(R, Ys, fit, nf);
     float *swts = xmalloc(D * sizeof(float));
     for (int j = 0; j < D; j++) swts[j] = sqrtf(sw2[j]);
@@ -362,6 +363,13 @@ static void run_4l_arm(const float *X, const float *R, const float *Ys, const fl
     run_map_arm("4L", X, D, NULL, tr, R, R, X, Ys, Yt_ev, wv, swts, ralign,
                 fit, nf, ev, mode0, nev, ranks, nrank, lambdas, nlam, maxk,
                 lw, dscale, seed, nth, L, lf, best, Yhat, Cb, Cp, zcat);
+    /* ★GE 基版本(2026-08-27): 无此臂时择优只能在"纯 z"与"GE"间二选一, 硬凑叠加
+     * = z 修全 R 而 GE 又修一遍同一部分 → 重复修正踩重尾(PPL 比 1.385 反超裸)。
+     * 补齐后 GE 与 z 的落地口径自洽: z 解的就是 GE 之后的残差。 */
+    if (gecorr && Rge)
+        run_map_arm("GE+4L", X, D, gecorr, tr, Rge, R, X, Ys, Yt_ev, wv, swts, ralign,
+                    fit, nf, ev, mode0, nev, ranks, nrank, lambdas, nlam, maxk,
+                    lw, dscale, seed, nth, L, lf, best, Yhat, Cb, Cp, zcat);
     free(sw2); free(swts); free(ralign);
 }
 
