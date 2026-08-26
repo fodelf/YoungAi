@@ -378,5 +378,25 @@ static void zl_healthcheck(const float *X, const float *R, const float *Ys, int 
     }
     printf("  [体检]L%d 非有限 x=%ld R=%ld Ys=%ld | rms x=%.4g R=%.4g Ys=%.4g | max|x|=%.4g max|R|=%.4g\n",
            L, nx, nr, ny, sqrt(sx / nn), sqrt(sr / nn), sqrt(sy / nn), mx, mr);
+    {   /* 巨值集中度: 逐通道能量占比 top-8(L41 max/rms=1000 → 最小二乘容量被少数通道吃光) */
+        double *ce = calloc(D, sizeof(double));
+        if (ce) {
+            for (int t = 0; t < ntok; t++)
+                for (int j = 0; j < D; j++) { double v = R[(size_t)t * D + j]; ce[j] += v * v; }
+            double tot = 0; for (int j = 0; j < D; j++) tot += ce[j];
+            double top8 = 0; int idx8[8] = {0};
+            for (int r2 = 0; r2 < 8; r2++) {
+                int bi = 0; double bv = -1;
+                for (int j = 0; j < D; j++) {
+                    int used = 0; for (int q = 0; q < r2; q++) if (idx8[q] == j) used = 1;
+                    if (!used && ce[j] > bv) { bv = ce[j]; bi = j; }
+                }
+                idx8[r2] = bi; top8 += bv;
+            }
+            printf("  [体检]L%d R 能量: top8 通道占 %.1f%% (ch %d,%d,%d…) — 巨值集中度\n",
+                   L, 100.0 * top8 / (tot + 1e-30), idx8[0], idx8[1], idx8[2]);
+            free(ce);
+        }
+    }
     if (nx + nr + ny) printf("  ★L%d 数据面含非有限值 — 解算必炸, 这是 bug 不是层的属性★\n", L);
 }
