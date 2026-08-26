@@ -25,6 +25,8 @@
  *   [--lambdas 3e-3,3e-2,3e-1] [--wa 1] [--wc 0.5] [--ws 0.1] [--wf 1e-3]
  *   [--dither 0.04] [--seed 1] [--threads 16]
  *   [--fit-ranges a:b,..] [--ev-ranges a:b,..]   (行掩码: 拼接语料剔污染行)
+ *   [--emit-ge DIR]  GE-only 端到端路(zloss_emit.inc.c): 只解 GE, held 过闸后把
+ *                    bf.GE 注入 DIR/dql_L%02d.bin(冻结判决尺原生认), 斜率标定用。
  * 全 CLI 参数, 无环境变量(铁律)。
  */
 #define _FILE_OFFSET_BITS 64
@@ -139,6 +141,7 @@ static int mode_assign(const float *x, const float *C, int M) {
     return bm;
 }
 #include "zloss_gate.inc.c"             /* 门族分片: EM 模式门 + 语境门 GEc */
+#include "zloss_emit.inc.c"             /* GE-only 端到端注入(bf.GE, 斜率标定) */
 
 /* ---- held 行评估(pthread): Yhat=Ys+M(x), Cb=M(x), Cp=M(x+δ); ER 部分和 ---- */
 typedef struct {
@@ -228,7 +231,7 @@ static double eval_apply(ds4_z *const *zl, const float *C, int M, int gate_route
 }
 
 int main(int argc, char **argv) {
-    const char *anc = NULL, *zdir = NULL, *out = NULL, *frs = NULL, *ers = NULL;
+    const char *anc = NULL, *zdir = NULL, *out = NULL, *frs = NULL, *ers = NULL, *emitge = NULL;
     int l0 = -1, l1 = -1, ntok = 8192, nfit = 6144, nth = 16, selftest = 0;
     int modes[MAXG] = {1, 8, 16}; int nmode = 3;
     int ranks[MAXG] = {16, 64, 128, 256}; int nrank = 4;
@@ -257,6 +260,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--seed") && i + 1 < argc) seed = (uint64_t)strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--fit-ranges") && i + 1 < argc) frs = argv[++i];
         else if (!strcmp(argv[i], "--ev-ranges") && i + 1 < argc) ers = argv[++i];
+        else if (!strcmp(argv[i], "--emit-ge") && i + 1 < argc) emitge = argv[++i];
         else if (!strcmp(argv[i], "--selftest")) selftest = 1;
         else die("未知参数 %s", argv[i]);
     }
@@ -327,6 +331,15 @@ int main(int argc, char **argv) {
         memset(mode0, 0, (size_t)nev * sizeof(int));
         float *gecorr = NULL, *Rge = NULL, *XP = NULL;
         uint8_t *isfit = NULL;
+        if (emitge && !selftest) {       /* GE-only 端到端注入路: 解算→闸→bf.GE, 跳过全网格 */
+            run_emit_ge(emitge, L, &zp, X, R, Ys, Yt_ev, wv, fit, nf, ev, mode0, nev,
+                        ntok, &lw, dscale, seed, nth, lf, la0, lc0, tot0, Yhat, Cb, Cp);
+            fclose(lf);
+            free(X); free(R); free(Ys); free(Yt); free(Yt_ev); free(Ys_ev); free(wv);
+            free(Yhat); free(Cb); free(Cp); free(zcat); free(top1); free(mode0);
+            free(zp.prow); free(zp.pe); free(zp.pw); free(zp.pyq);
+            continue;
+        }
         if (!selftest) {  /* 基修正臂组 + 语境门 GEc(段漂移对策: δ_e(c)) */
             run_base_arms(&zp, X, R, Ys, Yt_ev, wv, fit, nf, ev, mode0, nev, ntok,
                           &lw, dscale, seed, nth, L, lf, &best, Yhat, Cb, Cp,

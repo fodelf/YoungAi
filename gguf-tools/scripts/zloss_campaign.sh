@@ -77,7 +77,51 @@ stage_needle(){
     exit "$NEEDLE_RC"
 }
 
-stage_solve(){  DIE "全量档位待针裁决(modes/ranks/λ 按 $WS/needle/ 三表定), 现在拒跑"; }
+# GE-only 43 层端到端斜率标定(2026-08-26 用户令"跑"): 针终判饱和 ~1%/层, 但
+# held层内≠端到端(冠军 43 层小赢复利 KL−9.7%)——本段把唯一稳定赢家 GE 全层
+# 注入(bf.GE 冻结判决尺原生认, 零判决尺升级债)跑 caliper, 标定 held↔端到端斜率。
+# 对表: 裸 0.47055 / r64c 冠军 0.42510 / 官方 q2 0.4207。
+stage_solve(){
+    [ -s "$ANC" ] || DIE "锚缺 $ANC"
+    [ -x "$GT/amp/zlayer" ] || DIE "zlayer 缺"
+    [ -x "$GT/amp/zloss_solve" ] || DIE "zloss_solve 缺(带 --emit-ge 的版本)"
+    GE="$D2/zge"
+    # ①注入工作区从 vq86h_noz 干净态重建(amp_clean_full.sh ②同式)。zloss/layers
+    # 的 dql_L 有 7 层 v1 作废 zl.RRR 残留(L02-06/08/09 尺寸对不上 noz 实锤),
+    # 只当 zcache 数据面用, 不做注入床。
+    rm -rf "$GE"; mkdir -p "$GE/layers"
+    ( cd "$D2/vq86h_noz/layers" || exit 1
+      for f in dql_vq_L*.bin; do
+          ln -f "$f" "$GE/layers/$f" 2>/dev/null || cp "$f" "$GE/layers/"; done
+      cp dql_ops_L*.bin opt_L*.bin manifest.txt "$GE/layers/" 2>/dev/null
+      cp dql_L*.bin "$GE/layers/" ) || DIE "工作区重建失败"
+    N=$(ls "$GE/layers"/dql_vq_L*.bin 2>/dev/null | wc -l)
+    [ "$N" -eq 43 ] || DIE "工作区层件不齐 $N/43"
+    mkdir -p "$WS/ge"
+    LOG "①注入工作区就绪 $GE/layers(43 层件, dql_L 全新拷贝)"
+    wd_start
+    # ②逐层: zcache 缺则建(zlayer 模式①只写缓存不动 dql) → GE 解算+四损失闸+注入
+    for L in $(seq 0 42); do
+        Lz=$(printf '%02d' "$L")
+        if [ ! -s "$WS/layers/zcache_L$Lz.npz" ]; then
+            env DS4_ZL_NTOK=$NTOK DS4_ZL_NFIT=$NFIT DS4_ZL_FIT_RANGES="$FR" DS4_ZL_EV_RANGE="$ER" \
+                DS4_ZL_CACHE_ONLY=1 "$GT/amp/zlayer" "$HF" "$WS/layers" "$ANC" "$L" 1024 0 \
+                2>&1 | grep -aE "zcache|就绪|Error|assert|★" || DIE "L$L zcache 失败"
+        fi
+        "$GT/amp/zloss_solve" --anchor "$ANC" --zcache "$WS/layers" --out "$WS/ge" \
+            --layers "$L-$L" --ntok $NTOK --threads 18 \
+            --fit-ranges "$FR" --ev-ranges "$ER" --emit-ge "$GE/layers" \
+            || DIE "L$L GE 解算/注入异常"
+        NI=$(wc -l < "$GE/layers/zinject_manifest.txt" 2>/dev/null || echo 0)
+        LOG "L$L ✓ 已注入 $NI 层"
+    done
+    wd_stop
+    LOG "②43 层收官(注入账 $GE/layers/zinject_manifest.txt) → caliper 五指标"
+    bash "$GT/scripts/caliper_ref.sh" "$GE/layers" /tmp/qc_zge_wt2.bin \
+        > /tmp/caliper_zge.log 2>&1 || DIE "caliper 失败, 看 /tmp/caliper_zge.log"
+    grep -aE "PPL|KLD|RMS|Same|Δp|min" /tmp/caliper_zge.log | tail -10
+    LOG "③端到端斜率标定完成: 对表 裸 0.47055 / r64c 0.42510, 全表 /tmp/caliper_zge.log"
+}
 stage_judge(){  DIE "动态 z 注入格式 + 判决尺升级闸(新尺须逐字节复刻裸 0.47055/r64c 0.42510)未定, 针后设计"; }
 stage_engine(){ DIE "引擎多模式 z 加载路未实现(ds4_z 模块扩容器), 针后设计"; }
 
