@@ -489,9 +489,17 @@ static void run_base_arms(const zpairs *zp, const float *X, const float *R,
         nn = na = nb = 0;
         for (int j = 0; j < D; j++) { nn += (double)u1[j] * u2[j]; na += (double)u1[j] * u1[j]; nb += (double)u2[j] * u2[j]; }
         double cmu = nn / (sqrt(na * nb) + 1e-30);
-        printf("  L%d 折半稳定性: GEδ cos=%.3f  乘门ua cos=%.3f (低=数据饿, 高而输held=家族错)\n",
-               L, cge, cmu);
-        free(h1); free(h2); free(u1); free(u2);
+        /* fit↔held δ 余弦: 折半稳定但此值塌 = 参数随语料段漂移(语境条件化结构) */
+        uint8_t *hv = xmalloc((size_t)ntok);
+        memset(hv, 0, (size_t)ntok);
+        for (int i = 0; i < nev; i++) hv[ev[i]] = 1;
+        double dv[256];
+        solve_ge(zp, R, hv, ntok, 1e-3, L, dv);
+        nn = na = nb = 0;
+        for (int e = 0; e < 256; e++) { nn += delta[e] * dv[e]; na += delta[e] * delta[e]; nb += dv[e] * dv[e]; }
+        printf("  L%d 折半稳定性: GEδ cos=%.3f  乘门ua cos=%.3f  fit↔held δ cos=%.3f "
+               "(折半高+此值塌=段漂移)\n", L, cge, cmu, nn / (sqrt(na * nb) + 1e-30));
+        free(h1); free(h2); free(u1); free(u2); free(hv);
     }
     free(ua); free(ua2); free(mc2); free(base2); free(isfit);
     *gecorr_out = gecorr; *Rge_out = Rge;
