@@ -7,11 +7,11 @@
  *   全塞进靶里, 深度单调致 36 层判空(裸 align L0 0.04→L27 0.60 即指纹), 已删除,
  *   与 XCAP 全量 0.47364 比裸差同罪(链态口径两次翻车)。
  *
- * ★动态 z(方案 B 兑现)★ 低维动态 z 映射高维行为: 锚 x 方向余弦 k-means 分 M 个
- *   模式(定死种子, LCG 首心 + farthest-point 续种, 全确定性), 每模式独立
- *   ds4_z_solve 闭式 rank-k, 应用时按最近质心选模式 —— 修正图随 token 的行为
- *   模式切换(路由哈希看似随机, 规律是条件性的; 一张全局静态图把模式平均掉,
- *   v1 深层全军判空的第二根因)。M=1 = 静态下界参赛。
+ * ★动态 z(方案 B 兑现)★ 低维动态 z 映射高维行为: 模式=混合线性回归硬 EM
+ *   (zloss_gate.inc.c, 按"哪张图预测得更好"发现行标签, 定死种子+双重启),
+ *   门=EM 标签的 x 方向质心(apply 只有 x), 每模式独立 ds4_z_solve 闭式 rank-k
+ *   —— 修正图随 token 的行为模式切换(路由哈希看似随机, 规律是条件性的; 一张
+ *   全局静态图把模式平均掉, v1 深层全军判空的第二根因)。M=1 = 静态下界参赛。
  *
  * ★判空废除(铁律)★ 全网格输给裸 = 打印停车审计并以 exit 3 收尾(跑完所有层留全
  *   诊断表), 不写零混过去 —— "没找到规律"是解算器的 bug, 不是层的属性。
@@ -127,6 +127,8 @@ static void zcache_load(const char *dir, int L, int ntok, float **R_out, float *
     *R_out = R; *Ys_out = Ys;
 }
 
+#include "zloss_selftest.inc.c"         /* 合成金标(物理分片, 同 TU) */
+
 /* ---- 方向余弦 k-means(全确定性): LCG 首心 + farthest-point 续种 + 20 轮 Lloyd ---- */
 static int mode_assign(const float *x, const float *C, int M) {
     if (M <= 1) return 0;
@@ -138,62 +140,7 @@ static int mode_assign(const float *x, const float *C, int M) {
     }
     return bm;
 }
-static void kmeans_modes(const float *X, const int *fit, int nf, int M, uint64_t seed, float *C) {
-    float *Xn = xmalloc((size_t)nf * D * sizeof(float));
-    for (int i = 0; i < nf; i++) {
-        const float *x = X + (size_t)fit[i] * D; float *o = Xn + (size_t)i * D;
-        double ss = 0; for (int j = 0; j < D; j++) ss += (double)x[j] * x[j];
-        double inv = ss > 0 ? 1.0 / sqrt(ss) : 0.0;
-        for (int j = 0; j < D; j++) o[j] = (float)(x[j] * inv);
-    }
-    uint64_t s = seed * 6364136223846793005ULL + 1442695040888963407ULL;
-    memcpy(C, Xn + (size_t)((s >> 33) % (uint64_t)nf) * D, D * sizeof(float));
-    float *dmin = xmalloc((size_t)nf * sizeof(float));
-    for (int i = 0; i < nf; i++) dmin[i] = 1e30f;
-    for (int m = 1; m < M; m++) {
-        int far = 0; float fd = -1e30f;
-        for (int i = 0; i < nf; i++) {
-            const float *c = C + (size_t)(m - 1) * D, *x = Xn + (size_t)i * D;
-            double dt = 0; for (int j = 0; j < D; j++) dt += (double)x[j] * c[j];
-            float d = 1.0f - (float)dt;
-            if (d < dmin[i]) dmin[i] = d;
-            if (dmin[i] > fd) { fd = dmin[i]; far = i; }
-        }
-        memcpy(C + (size_t)m * D, Xn + (size_t)far * D, D * sizeof(float));
-        dmin[far] = -1e30f;
-    }
-    int *asg = xmalloc((size_t)nf * sizeof(int));
-    double *acc = xmalloc((size_t)M * D * sizeof(double));
-    int *cnt = xmalloc((size_t)M * sizeof(int));
-    for (int it = 0; it < 20; it++) {
-        for (int i = 0; i < nf; i++) asg[i] = mode_assign(Xn + (size_t)i * D, C, M);
-        memset(acc, 0, (size_t)M * D * sizeof(double));
-        memset(cnt, 0, (size_t)M * sizeof(int));
-        for (int i = 0; i < nf; i++) {
-            double *a = acc + (size_t)asg[i] * D; const float *x = Xn + (size_t)i * D;
-            for (int j = 0; j < D; j++) a[j] += x[j];
-            cnt[asg[i]]++;
-        }
-        for (int m = 0; m < M; m++) {
-            if (!cnt[m]) {                       /* 空簇: 重播到当前最不合群的行 */
-                int worst = 0; double wd = 1e30;
-                for (int i = 0; i < nf; i++) {
-                    const float *x = Xn + (size_t)i * D, *c = C + (size_t)asg[i] * D;
-                    double dt = 0; for (int j = 0; j < D; j++) dt += (double)x[j] * c[j];
-                    if (dt < wd) { wd = dt; worst = i; }
-                }
-                memcpy(C + (size_t)m * D, Xn + (size_t)worst * D, D * sizeof(float));
-                continue;
-            }
-            double ss = 0; const double *a = acc + (size_t)m * D;
-            for (int j = 0; j < D; j++) ss += a[j] * a[j];
-            double inv = ss > 0 ? 1.0 / sqrt(ss) : 0.0;
-            float *c = C + (size_t)m * D;
-            for (int j = 0; j < D; j++) c[j] = (float)(a[j] * inv);
-        }
-    }
-    free(Xn); free(dmin); free(asg); free(acc); free(cnt);
-}
+#include "zloss_gate.inc.c"             /* EM 模式发现 + x 侧门(物理分片, 同 TU) */
 
 /* ---- held 行评估(pthread): Yhat=Ys+M(x), Cb=M(x), Cp=M(x+δ); ER 部分和 ---- */
 typedef struct {
@@ -247,7 +194,7 @@ static double eval_apply(ds4_z *const *zl, const float *C, int M, const float *X
 
 int main(int argc, char **argv) {
     const char *anc = NULL, *zdir = NULL, *out = NULL, *frs = NULL, *ers = NULL;
-    int l0 = -1, l1 = -1, ntok = 8192, nfit = 6144, nth = 16;
+    int l0 = -1, l1 = -1, ntok = 8192, nfit = 6144, nth = 16, selftest = 0;
     int modes[MAXG] = {1, 8, 16}; int nmode = 3;
     int ranks[MAXG] = {16, 64, 128, 256}; int nrank = 4;
     double lambdas[MAXG] = {3e-3, 3e-2, 3e-1}; int nlam = 3;
@@ -274,9 +221,15 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--seed") && i + 1 < argc) seed = (uint64_t)strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--fit-ranges") && i + 1 < argc) frs = argv[++i];
         else if (!strcmp(argv[i], "--ev-ranges") && i + 1 < argc) ers = argv[++i];
+        else if (!strcmp(argv[i], "--selftest")) selftest = 1;
         else die("未知参数 %s", argv[i]);
     }
-    if (!anc || !zdir || !out || l0 < 0)
+    if (selftest) {                      /* 合成金标: 覆盖网格与行集, 表写 /tmp */
+        l0 = l1 = 0; ntok = 2048; nfit = 1536; frs = ers = NULL; out = "/tmp";
+        nmode = 2; modes[0] = 1; modes[1] = 2;
+        nrank = 1; ranks[0] = 16;
+        nlam = 1; lambdas[0] = 3e-3;
+    } else if (!anc || !zdir || !out || l0 < 0)
         die("用法: zloss_solve --anchor FILE --zcache DIR --out DIR --layers a-b ...(见文件头)");
 
     int nf, nev, *fit, *ev;
@@ -301,9 +254,9 @@ int main(int argc, char **argv) {
 
     int any_lost = 0;
     for (int L = l0; L <= l1; L++) {
-        float *X = anchor_fin(anc, L, ntok);
-        float *R = NULL, *Ys = NULL;
-        zcache_load(zdir, L, ntok, &R, &Ys);
+        float *X, *R = NULL, *Ys = NULL;
+        if (selftest) st_synth(ntok, &X, &R, &Ys);
+        else { X = anchor_fin(anc, L, ntok); zcache_load(zdir, L, ntok, &R, &Ys); }
         float *Yt = xmalloc((size_t)ntok * D * sizeof(float));
         for (size_t i = 0; i < (size_t)ntok * D; i++) Yt[i] = Ys[i] + R[i];
 
@@ -331,16 +284,19 @@ int main(int argc, char **argv) {
         float *zcat = xmalloc((size_t)maxM * maxk * sizeof(float));
         double best_tot = tot0, best_lam = 0, best_er = 0; int best_M = 0, best_k = 0;
         float bla = la0, blc = lc0;
+        float mbest_align[MAXG]; for (int i = 0; i < MAXG; i++) mbest_align[i] = 1e9f;
 
         for (int mi = 0; mi < nmode; mi++) {
             const int M = modes[mi];
-            float *C = xmalloc((size_t)M * D * sizeof(float));
-            if (M > 1) kmeans_modes(X, fit, nf, M, seed, C);
-            else { memset(C, 0, (size_t)D * sizeof(float)); }
+            float *C = xmalloc((size_t)M * D * sizeof(float));   /* x 侧门质心 */
+            memset(C, 0, (size_t)M * D * sizeof(float));
             int *mode_fit = xmalloc((size_t)nf * sizeof(int));
             int *mode_ev = xmalloc((size_t)nev * sizeof(int));
+            memset(mode_fit, 0, (size_t)nf * sizeof(int));
+            if (M > 1)
+                derive_modes(X, R, fit, nf, M, maxk, lambdas[0], seed, L, C, mode_fit);
             int cnt[MAXM]; memset(cnt, 0, sizeof cnt);
-            for (int i = 0; i < nf; i++) { mode_fit[i] = mode_assign(X + (size_t)fit[i] * D, C, M); cnt[mode_fit[i]]++; }
+            for (int i = 0; i < nf; i++) cnt[mode_fit[i]]++;
             for (int i = 0; i < nev; i++) mode_ev[i] = mode_assign(X + (size_t)ev[i] * D, C, M);
             printf("  L%d M=%d fit行分布:", L, M);
             for (int m = 0; m < M; m++) printf(" %d", cnt[m]);
@@ -384,6 +340,7 @@ int main(int argc, char **argv) {
                     printf("  L%d M=%-2d λ=%-5.3g k=%-3d | align %.4f cls %.4f sm %.5f fx %.5f "
                            "tot %.4f | ER %.1f%% | vol %.1fMB\n",
                            L, M, lambdas[li], ranks[ki], la, lc, ls, lfx, tot, er * 100, vol / 1e6);
+                    if (la < mbest_align[mi]) mbest_align[mi] = la;
                     if (tot < best_tot) {
                         best_tot = tot; best_lam = lambdas[li]; best_k = ranks[ki];
                         best_M = M; best_er = er; bla = la; blc = lc;
@@ -404,6 +361,13 @@ int main(int argc, char **argv) {
                L, won ? "选中" : "★全网格输裸=解算器有病, 停车审计★", best_M, best_lam,
                best_k, la0, bla, lc0, blc, tot0, best_tot, best_er * 100);
         if (!won) any_lost = 1;
+        if (selftest) {
+            printf("★selftest: M=1 best align=%.4f  M=2 best align=%.4f\n",
+                   mbest_align[0], mbest_align[1]);
+            if (!(mbest_align[1] < 0.20f && mbest_align[1] < 0.6f * mbest_align[0]))
+                die("selftest 失败: 种进去的两模式结构没被动态 z 收回(布线有病)");
+            printf("★SELFTEST PASS(模式布线金标收回)\n");
+        }
         fflush(stdout);
         free(X); free(R); free(Ys); free(Yt); free(Yt_ev); free(Ys_ev); free(wv);
         free(Yhat); free(Cb); free(Cp); free(zcat);
