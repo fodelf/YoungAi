@@ -304,6 +304,7 @@ static void bytes_moe(lfile_t*lf,int S,const float*Fin,const int*idx,const float
                 for(int d2=0;d2<DIM;d2++) fw[d2]=fb[d2]+(float)c*(fw[d2]-fb[d2]); } }
         else if(o->type==4){ for(size_t i=0;i<(size_t)S*DIM;i++) Fout[i]=Fcur[i]+o->t*(Fout[i]-Fcur[i]); }   /* TREF: 从 base态 Fcur 插值(coadapt 口径) */
         else if(o->type==6&&o->zlk>0){
+            double zdiag_nd=0,zdiag_nf=0,zdiag_sc=0; long long zdiag_n=0,zdiag_clip=0;
             /* ★冻结 z^L 回放(2026-07-14, 产物③)★: Fout += clip·U diag(z) Vᵀ Fin,
              * clip=min(1, tr·‖Fout‖/‖zd‖) 逐 token(与活体/引擎同口径的信赖域) */
             int zk=o->zlk;
@@ -331,7 +332,13 @@ static void bytes_moe(lfile_t*lf,int S,const float*Fin,const int*idx,const float
                 double cap=(double)o->zltr*nf; float sc2=1.0f;
                 if(nd>cap&&nd>0) sc2=(float)(cap/nd);
                 for(int d2=0;d2<DIM;d2++) fw[d2]+=sc2*zd[d2];
+                zdiag_nd+=nd; zdiag_nf+=nf; zdiag_sc+=sc2; if(sc2<1.0f) zdiag_clip++; zdiag_n++;
             }
+            /* ★z 回放插桩(2026-08-26 用户令"打日志找"): 修正/基 幅度比 + 夹持触发率
+             * —— 解算侧同口径打印(zloss_solve eval_apply), 两边对不上即回放路 bug。 */
+            if(zdiag_n) fprintf(stderr,"[zdiag]L%02d k=%d tr=%.2f 行=%lld |z|/|routed|=%.4f "
+                "夹持率=%.1f%% 平均缩放=%.3f\n", g_replay_cur_L, zk, (double)o->zltr, zdiag_n,
+                zdiag_nf>0?zdiag_nd/zdiag_nf:0.0, 100.0*zdiag_clip/zdiag_n, zdiag_sc/zdiag_n);
             free(zd); free(pv); if(phi)free(phi);
         }
     }
