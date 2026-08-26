@@ -25,14 +25,15 @@ void dq_gate_route_hash(const float *x, const float *gate, const int *tid2eid, c
 void dq_gate_route_topk(const float *x, const float *gate, const float *gbias,
                         int *idx_out, float *w_out, int Nt, int DIM, int NEXP, int NACT,
                         float route_scale) {
+    /* raw 分数=一个 [Nt,NEXP] GEMM, 走 dq_matmul(大尺寸上 GPU 显存暂存路)。32k 锚相位
+     * 计时定罪: 原逐 token 点积单线程 18s/层(2026-08-26 用户令提速)。变换/top-k 原样。 */
+    float *raw = malloc((size_t)Nt * NEXP * sizeof(float));
+    dq_matmul(x, gate, raw, Nt, DIM, NEXP);
     float *sc = malloc((size_t)NEXP * sizeof(float));
     for (int t = 0; t < Nt; t++) {
-        const float *xr = x + (size_t)t * DIM;
-        for (int e = 0; e < NEXP; e++) {
-            const float *gr = gate + (size_t)e * DIM;
-            float raw = 0.0f; for (int k = 0; k < DIM; k++) raw += xr[k]*gr[k];
-            sc[e] = sqrtf(log1pf(expf(raw)));      /* orig(无 bias) */
-        }
+        const float *rr = raw + (size_t)t * NEXP;
+        for (int e = 0; e < NEXP; e++)
+            sc[e] = sqrtf(log1pf(expf(rr[e])));    /* orig(无 bias) */
         int chosen[64]; double wsum = 0.0; float ws[64];
         for (int a = 0; a < NACT; a++) {           /* 选第 a 大的 (sc+gbias) */
             int best = -1; float bestv = -1e30f;
@@ -48,7 +49,7 @@ void dq_gate_route_topk(const float *x, const float *gate, const float *gbias,
         float inv = (float)(route_scale / wsum);
         for (int a = 0; a < NACT; a++) w_out[(size_t)t*NACT+a] = ws[a] * inv;
     }
-    free(sc);
+    free(sc); free(raw);
 }
 
 /* overlap_transform: t[sp,ratio,2d] → new[sp,2*ratio,d]. new[:,r:,:]=t[:,:,d:];
