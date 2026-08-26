@@ -159,6 +159,7 @@ typedef struct {
 static void run_map_arm(const char *arm, const float *XF, int din, const float *bc,
                         float tr, const float *Reff, const float *R, const float *X,
                         const float *Ys, const float *Yt_ev, const float *wv,
+                        const float *swts, /* 感知加权解算: 靶按 √cls权 白化, NULL=关 */
                         const int *fit, int nf, const int *ev, const int *mode0, int nev,
                         const int *ranks, int nrank, const double *lambdas, int nlam,
                         int maxk, const ds4_loss_weights *lw, double dscale,
@@ -168,7 +169,10 @@ static void run_map_arm(const char *arm, const float *XF, int din, const float *
     float *Rm = xmalloc((size_t)nf * D * sizeof(float));
     for (int i = 0; i < nf; i++) {
         memcpy(Xm + (size_t)i * din, XF + (size_t)fit[i] * din, (size_t)din * sizeof(float));
-        memcpy(Rm + (size_t)i * D, Reff + (size_t)fit[i] * D, D * sizeof(float));
+        const float *rs = Reff + (size_t)fit[i] * D;
+        float *rd = Rm + (size_t)i * D;
+        if (swts) for (int j = 0; j < D; j++) rd[j] = rs[j] * swts[j];
+        else memcpy(rd, rs, D * sizeof(float));
     }
     ds4_z *zs[MAXG] = {0};
     float lamf[MAXG];
@@ -176,6 +180,13 @@ static void run_map_arm(const char *arm, const float *XF, int din, const float *
     if (ds4_z_solve_multi(Xm, Rm, (uint32_t)nf, (uint32_t)din, D, (uint32_t)maxk,
                           lamf, (uint32_t)nlam, zs))
         die("L%d %s 解算失败", L, arm);
+    if (swts)   /* 解在白化空间, U 行回真空间(秩截断已按 cls 权分配容量) */
+        for (int li = 0; li < nlam; li++)
+            for (uint32_t j = 0; j < (uint32_t)D; j++) {
+                float inv = swts[j] > 1e-20f ? 1.0f / swts[j] : 0.0f;
+                for (uint32_t c = 0; c < zs[li]->rank; c++)
+                    zs[li]->U[(size_t)j * zs[li]->rank + c] *= inv;
+            }
     for (int li = 0; li < nlam; li++) {
         ds4_z *zl[1] = { zs[li] };
         for (int ki = 0; ki < nrank; ki++) {
@@ -207,31 +218,64 @@ static void run_map_arm(const char *arm, const float *XF, int din, const float *
 }
 
 /* GE 单臂评估: 图=空, bc=GE 修正 */
-static void run_ge_arm(const double *delta, const float *gecorr, const float *X,
+/* 纯基修正臂(无图): GE / 乘性出口 / 其叠加 —— bc 即全部修正 */
+static void run_bc_arm(const char *arm, const float *params, int nparam,
+                       const float *bc, const float *X,
                        const float *Ys, const float *Yt_ev, const float *wv,
                        const float *R, const int *ev, const int *mode0, int nev,
                        const ds4_loss_weights *lw, double dscale, uint64_t seed,
                        int nth, int L, FILE *lf, best_t *best,
                        float *Yhat, float *Cb, float *Cp) {
     ds4_z *zl[1] = {0};
-    double er = eval_apply(zl, NULL, 1, 1 /*路由门语义: 扰动不改 GE*/, gecorr, 0,
+    double er = eval_apply(zl, NULL, 1, 1 /*路由门语义: 扰动不改基修正*/, bc, 0,
                            X, Ys, R, ev, mode0, nev, Yhat, Cb, Cp, dscale, seed, nth);
-    float dz[256];
-    for (int e = 0; e < 256; e++) dz[e] = (float)delta[e];
     float la = ds4_loss_align(Yhat, Yt_ev, (uint32_t)nev, D);
     float lc = ds4_loss_classify(Yhat, Yt_ev, wv, (uint32_t)nev, D);
     float ls = ds4_loss_smooth(Cb, Cp, (uint32_t)nev, D);
-    float lfx = ds4_loss_fixed(dz, 256);
+    float lfx = ds4_loss_fixed(params, (size_t)nparam);
     float tot = ds4_loss_total(lw, la, lc, ls, lfx);
-    int nact = 0; for (int e = 0; e < 256; e++) if (fabs(delta[e]) > 1e-4) nact++;
-    fprintf(lf, "GE 1 0 0 %.6f %.6f %.6f %.6f %.6f %.2f 0.00\n", la, lc, ls, lfx, tot, er * 100);
-    printf("  L%d GE     活门=%d      | align %.4f cls %.4f sm %.5f fx %.5f "
-           "tot %.4f | ER %.1f%% | vol 0.0MB\n", L, nact, la, lc, ls, lfx, tot, er * 100);
+    int nact = 0;
+    for (int e = 0; e < nparam; e++) if (fabsf(params[e]) > 1e-4f) nact++;
+    fprintf(lf, "%s 1 0 0 %.6f %.6f %.6f %.6f %.6f %.2f %.2f\n",
+            arm, la, lc, ls, lfx, tot, er * 100, nparam * 2 / 1e6);
+    printf("  L%d %-6s 活参=%-4d    | align %.4f cls %.4f sm %.5f fx %.5f "
+           "tot %.4f | ER %.1f%% | vol %.2fMB\n", L, arm, nact, la, lc, ls, lfx, tot,
+           er * 100, nparam * 2 / 1e6);
     if (tot < best->tot) {
         best->tot = tot; best->lam = 0; best->k = 0; best->M = 1;
-        best->er = er; best->la = la; best->lc = lc; best->arm = "GE";
+        best->er = er; best->la = la; best->lc = lc; best->arm = arm;
     }
     fflush(stdout);
+}
+
+/* 乘性出口臂: 每通道增益 ua_j(引擎 zc_zl_add_kernel mul 分支 ⊙(1+ua) 同式),
+ * 直击巨值通道的通道级系统偏差(L41 定向: 裸 cls=L20 的 3×=通道指纹)。
+ * 闭式=每通道标量 ridge: ua_j = Σ_fit R_j·base_j / (Σ_fit base_j² + λ·量纲)。 */
+static float *solve_mul(const float *R, const float *base, const uint8_t *isfit,
+                        int ntok, double lam) {
+    double *num = xmalloc(D * sizeof(double)), *den = xmalloc(D * sizeof(double));
+    memset(num, 0, D * sizeof(double)); memset(den, 0, D * sizeof(double));
+    for (int t = 0; t < ntok; t++) {
+        if (!isfit[t]) continue;
+        const float *r = R + (size_t)t * D, *b = base + (size_t)t * D;
+        for (int j = 0; j < D; j++) { num[j] += (double)r[j] * b[j]; den[j] += (double)b[j] * b[j]; }
+    }
+    double md = 0; for (int j = 0; j < D; j++) md += den[j];
+    md = md / D + 1e-30;
+    float *ua = xmalloc(D * sizeof(float));
+    for (int j = 0; j < D; j++) ua[j] = (float)(num[j] / (den[j] + lam * md));
+    free(num); free(den);
+    return ua;
+}
+static float *mul_corr_build(const float *ua, const float *base, const float *bc0, int ntok) {
+    float *corr = xmalloc((size_t)ntok * D * sizeof(float));
+    for (int t = 0; t < ntok; t++) {
+        const float *b = base + (size_t)t * D;
+        const float *c0 = bc0 ? bc0 + (size_t)t * D : NULL;
+        float *c = corr + (size_t)t * D;
+        for (int j = 0; j < D; j++) c[j] = ua[j] * b[j] + (c0 ? c0[j] : 0.0f);
+    }
+    return corr;
 }
 
 /* zloss_gate.inc.c — 动态 z 的模式发现与 x 侧门(物理分片, 只被 zloss_solve.c include)。
@@ -394,4 +438,40 @@ static void zcache_load(const char *dir, int L, int ntok, float **R_out, float *
     }
     free(prow.v); free(pe.v); free(pw.v); free(buf);
     *R_out = R; *Ys_out = Ys;
+}
+
+/* 基修正臂组: GE → 乘性出口 → GE+乘性; 产出 gecorr 与 Rge(=R−GE, ftA 叠加臂复用) */
+static void run_base_arms(const zpairs *zp, const float *X, const float *R,
+                          const float *Ys, const float *Yt_ev, const float *wv,
+                          const int *fit, int nf, const int *ev, const int *mode0,
+                          int nev, int ntok, const ds4_loss_weights *lw, double dscale,
+                          uint64_t seed, int nth, int L, FILE *lf, best_t *best,
+                          float *Yhat, float *Cb, float *Cp,
+                          float **gecorr_out, float **Rge_out) {
+    uint8_t *isfit = xmalloc((size_t)ntok);
+    memset(isfit, 0, (size_t)ntok);
+    for (int i = 0; i < nf; i++) isfit[fit[i]] = 1;
+    double delta[256]; float dzf[256];
+    solve_ge(zp, R, isfit, ntok, 1e-3, L, delta);      /* λ=zlayer GE_LAM 同款 */
+    float *gecorr = ge_corr_build(zp, delta, ntok);
+    for (int e = 0; e < 256; e++) dzf[e] = (float)delta[e];
+    run_bc_arm("GE", dzf, 256, gecorr, X, Ys, Yt_ev, wv, R, ev, mode0, nev,
+               lw, dscale, seed, nth, L, lf, best, Yhat, Cb, Cp);
+    float *ua = solve_mul(R, Ys, isfit, ntok, 1e-3);
+    float *mc = mul_corr_build(ua, Ys, NULL, ntok);
+    run_bc_arm("mul", ua, D, mc, X, Ys, Yt_ev, wv, R, ev, mode0, nev,
+               lw, dscale, seed, nth, L, lf, best, Yhat, Cb, Cp);
+    free(mc);
+    float *Rge = xmalloc((size_t)ntok * D * sizeof(float));
+    float *base2 = xmalloc((size_t)ntok * D * sizeof(float));
+    for (size_t i = 0; i < (size_t)ntok * D; i++) {
+        Rge[i] = R[i] - gecorr[i];
+        base2[i] = Ys[i] + gecorr[i];      /* 引擎里 GE 折进权重 → 乘门作用在 GE 后 */
+    }
+    float *ua2 = solve_mul(Rge, base2, isfit, ntok, 1e-3);
+    float *mc2 = mul_corr_build(ua2, base2, gecorr, ntok);
+    run_bc_arm("GE+mul", ua2, D, mc2, X, Ys, Yt_ev, wv, R, ev, mode0, nev,
+               lw, dscale, seed, nth, L, lf, best, Yhat, Cb, Cp);
+    free(ua); free(ua2); free(mc2); free(base2); free(isfit);
+    *gecorr_out = gecorr; *Rge_out = Rge;
 }

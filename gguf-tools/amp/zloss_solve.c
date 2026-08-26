@@ -324,18 +324,10 @@ int main(int argc, char **argv) {
         int *mode0 = xmalloc((size_t)nev * sizeof(int));
         memset(mode0, 0, (size_t)nev * sizeof(int));
         float *gecorr = NULL, *Rge = NULL, *XP = NULL;
-        if (!selftest) {
-            /* ---- GE 臂: 每专家增益, 门=路由本身(冠军 bf.GE 同族, 四损失口径重解) ---- */
-            uint8_t *isfit = xmalloc((size_t)ntok);
-            memset(isfit, 0, (size_t)ntok);
-            for (int i = 0; i < nf; i++) isfit[fit[i]] = 1;
-            double delta[256];
-            solve_ge(&zp, R, isfit, ntok, 1e-3, L, delta);   /* λ=zlayer GE_LAM 同款 */
-            gecorr = ge_corr_build(&zp, delta, ntok);
-            run_ge_arm(delta, gecorr, X, Ys, Yt_ev, wv, R, ev, mode0, nev,
-                       &lw, dscale, seed, nth, L, lf, &best, Yhat, Cb, Cp);
-            free(isfit);
-        }
+        if (!selftest)   /* 基修正臂组: GE / 乘性出口 / GE+乘性(路由与通道两条门) */
+            run_base_arms(&zp, X, R, Ys, Yt_ev, wv, fit, nf, ev, mode0, nev, ntok,
+                          &lw, dscale, seed, nth, L, lf, &best, Yhat, Cb, Cp,
+                          &gecorr, &Rge);
         tge = tnow();
 
         for (int mi = 0; mi < nmode; mi++) {
@@ -417,17 +409,32 @@ int main(int argc, char **argv) {
         }
         tx = tnow();
         if (!selftest) {
-            /* ---- ftA 臂(冠军特征) 与 GE+ftA 臂(冠军配方全还原) ---- */
+            /* ---- ftA 臂(冠军特征) / GE+ftA(冠军配方全还原) / ftAw(感知加权解算,
+             * cls 方差权进解算目标——四损失进解不只做裁判, L41 定向) ---- */
             XP = build_phi(X, ntok);
             tphi = tnow();
             run_map_arm("ftA", XP, 3 * D, NULL, (float)trclamp, R, R, X, Ys, Yt_ev, wv,
-                        fit, nf, ev, mode0, nev, ranks, nrank, lambdas, nlam, maxk, &lw,
-                        dscale, seed, nth, L, lf, &best, Yhat, Cb, Cp, zcat);
-            Rge = xmalloc((size_t)ntok * D * sizeof(float));
-            for (size_t i = 0; i < (size_t)ntok * D; i++) Rge[i] = R[i] - gecorr[i];
-            run_map_arm("GE+ftA", XP, 3 * D, gecorr, (float)trclamp, Rge, R, X, Ys, Yt_ev,
-                        wv, fit, nf, ev, mode0, nev, ranks, nrank, lambdas, nlam, maxk,
+                        NULL, fit, nf, ev, mode0, nev, ranks, nrank, lambdas, nlam, maxk,
                         &lw, dscale, seed, nth, L, lf, &best, Yhat, Cb, Cp, zcat);
+            run_map_arm("GE+ftA", XP, 3 * D, gecorr, (float)trclamp, Rge, R, X, Ys, Yt_ev,
+                        wv, NULL, fit, nf, ev, mode0, nev, ranks, nrank, lambdas, nlam,
+                        maxk, &lw, dscale, seed, nth, L, lf, &best, Yhat, Cb, Cp, zcat);
+            float *wvf = xmalloc(D * sizeof(float));     /* 权取 fit 侧教师方差, 防 held 泄漏 */
+            float *swts = xmalloc(D * sizeof(float));
+            {
+                float *Ytf = xmalloc((size_t)nf * D * sizeof(float));
+                for (int i = 0; i < nf; i++)
+                    memcpy(Ytf + (size_t)i * D, Yt + (size_t)fit[i] * D, D * sizeof(float));
+                ds4_loss_dim_variance(Ytf, (uint32_t)nf, D, wvf);
+                free(Ytf);
+                double mw = 0; for (int j = 0; j < D; j++) mw += wvf[j];
+                mw = mw / D + 1e-30;
+                for (int j = 0; j < D; j++) swts[j] = sqrtf((wvf[j] + (float)(1e-6 * mw)) / (float)mw);
+            }
+            run_map_arm("ftAw", XP, 3 * D, gecorr, (float)trclamp, Rge, R, X, Ys, Yt_ev,
+                        wv, swts, fit, nf, ev, mode0, nev, ranks, nrank, lambdas, nlam,
+                        maxk, &lw, dscale, seed, nth, L, lf, &best, Yhat, Cb, Cp, zcat);
+            free(wvf); free(swts);
         }
         tfta = tnow();
         fprintf(stderr, "  [t]L%d 数据%.1f GE%.1f x臂%.1f φ%.1f ftA%.1f 层计%.1fs\n",
