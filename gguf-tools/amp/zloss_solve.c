@@ -76,20 +76,40 @@ static int *parse_ranges(const char *s, int *n_out) {   /* "a:b,c:d" 左闭右�
     *n_out = n; return v;
 }
 
-/* ---- 锚 fin 读取(DQA2, 与 zlayer anchor_layer 同格式; 只取 fin, 路由不用) ---- */
-static float *anchor_fin(const char *ap, int L, int ntok) {
+/* ---- 锚读取(DQA2, 与 zlayer anchor_layer 同格式): fin + top-1 专家(路由门用,
+ * rw 最大槽位; 部署时路由先于专家计算, 是免费可得的信号) ---- */
+static float *anchor_load(const char *ap, int L, int ntok, int **top1_out) {
     FILE *f = fopen(ap, "rb"); if (!f) die("锚打不开: %s", ap);
     uint32_t hd[8];
     if (fread(hd, 4, 8, f) != 8) die("锚头截断: %s", ap);
     if (hd[0] != 0x32415144u) die("%s 不是 DQA2 锚(magic 0x%08x)", ap, hd[0]);
-    int S = (int)hd[1], DIM = (int)hd[3], NL = (int)hd[4];
+    int S = (int)hd[1], DIM = (int)hd[3], NL = (int)hd[4], NACT = (int)hd[6];
     if (DIM != D) die("锚 DIM=%d ≠ %d", DIM, D);
     if (ntok > S) die("--ntok %d > 锚 S=%d", ntok, S);
     if (L < 0 || L >= NL) die("L%d 越界(锚 NL=%d)", L, NL);
+    if (NACT < 1 || NACT > 16) die("锚 NACT=%d 口径可疑", NACT);
     float *fin = xmalloc((size_t)ntok * D * sizeof(float));
     if (fseeko(f, (off_t)(40LL + (long long)L * S * DIM * 4), SEEK_SET) ||
         fread(fin, 4, (size_t)ntok * D, f) != (size_t)ntok * D) die("锚 fin 读不满 L=%d", L);
-    fclose(f); return fin;
+    long long ridx_off = 40LL + (long long)NL * S * DIM * 4;
+    long long rw_off = ridx_off + (long long)NL * S * NACT * 4;
+    int *ridx = xmalloc((size_t)ntok * NACT * sizeof(int));
+    float *rw = xmalloc((size_t)ntok * NACT * sizeof(float));
+    if (fseeko(f, (off_t)(ridx_off + (long long)L * S * NACT * 4), SEEK_SET) ||
+        fread(ridx, 4, (size_t)ntok * NACT, f) != (size_t)ntok * NACT) die("锚 ridx 读不满 L=%d", L);
+    if (fseeko(f, (off_t)(rw_off + (long long)L * S * NACT * 4), SEEK_SET) ||
+        fread(rw, 4, (size_t)ntok * NACT, f) != (size_t)ntok * NACT) die("锚 rw 读不满 L=%d", L);
+    fclose(f);
+    int *top1 = xmalloc((size_t)ntok * sizeof(int));
+    for (int t = 0; t < ntok; t++) {
+        int bs = 0;
+        for (int s = 1; s < NACT; s++) if (rw[(size_t)t * NACT + s] > rw[(size_t)t * NACT + bs]) bs = s;
+        int e = ridx[(size_t)t * NACT + bs];
+        if (e < 0 || e > 255) die("锚 ridx 越界: %d", e);
+        top1[t] = e;
+    }
+    free(ridx); free(rw);
+    *top1_out = top1; return fin;
 }
 
 /* ---- zcache 读取: R=dH, Ys=Σ pw·pYQ(自洽重建, 不掺 teacher_routed 的约定差) ---- */
@@ -144,7 +164,7 @@ static int mode_assign(const float *x, const float *C, int M) {
 
 /* ---- held 行评估(pthread): Yhat=Ys+M(x), Cb=M(x), Cp=M(x+δ); ER 部分和 ---- */
 typedef struct {
-    ds4_z *const *zl; const float *C; int M;
+    ds4_z *const *zl; const float *C; int M, gate_route;
     const float *X, *Ys, *R; const int *ev, *mode_ev; int nev;
     float *Yhat, *Cb, *Cp; double dscale; uint64_t seed;
     double er_num, er_den;
@@ -166,7 +186,8 @@ static void *ev_worker(void *arg) {
         const float rms = (float)sqrt(ss / D);
         ds4_loss_dither(c->seed, (uint32_t)c->ev[i], (float)(c->dscale * rms), delta, D);
         for (int j = 0; j < D; j++) xp[j] = x[j] + delta[j];
-        int mp = mode_assign(xp, c->C, c->M);    /* 扰动可换模式: 门稳定性一并入 smooth */
+        /* 扰动可换模式(x门): 门稳定性一并入 smooth; 路由门下扰动不改路由 → 同模式 */
+        int mp = c->gate_route ? m : mode_assign(xp, c->C, c->M);
         if (c->zl[mp]) ds4_z_apply(c->zl[mp], xp, cp);
         const float *r = c->R + (size_t)c->ev[i] * D;
         for (int j = 0; j < D; j++) {
@@ -176,15 +197,16 @@ static void *ev_worker(void *arg) {
     }
     free(delta); free(xp); return NULL;
 }
-static double eval_apply(ds4_z *const *zl, const float *C, int M, const float *X,
+static double eval_apply(ds4_z *const *zl, const float *C, int M, int gate_route,
+                         const float *X,
                          const float *Ys, const float *R, const int *ev, const int *mode_ev,
                          int nev, float *Yhat, float *Cb, float *Cp,
                          double dscale, uint64_t seed, int nth) {
     pthread_t th[32]; ev_ctx cx[32];
     if (nth > 32) nth = 32;
     for (int t = 0; t < nth; t++) {
-        cx[t] = (ev_ctx){zl, C, M, X, Ys, R, ev, mode_ev, nev, Yhat, Cb, Cp, dscale, seed,
-                         0, 0, nev * t / nth, nev * (t + 1) / nth};
+        cx[t] = (ev_ctx){zl, C, M, gate_route, X, Ys, R, ev, mode_ev, nev, Yhat, Cb, Cp,
+                         dscale, seed, 0, 0, nev * t / nth, nev * (t + 1) / nth};
         pthread_create(&th[t], NULL, ev_worker, &cx[t]);
     }
     double num = 0, den = 0;
@@ -254,9 +276,9 @@ int main(int argc, char **argv) {
 
     int any_lost = 0;
     for (int L = l0; L <= l1; L++) {
-        float *X, *R = NULL, *Ys = NULL;
+        float *X, *R = NULL, *Ys = NULL; int *top1 = NULL;
         if (selftest) st_synth(ntok, &X, &R, &Ys);
-        else { X = anchor_fin(anc, L, ntok); zcache_load(zdir, L, ntok, &R, &Ys); }
+        else { X = anchor_load(anc, L, ntok, &top1); zcache_load(zdir, L, ntok, &R, &Ys); }
         float *Yt = xmalloc((size_t)ntok * D * sizeof(float));
         for (size_t i = 0; i < (size_t)ntok * D; i++) Yt[i] = Ys[i] + R[i];
 
@@ -293,11 +315,15 @@ int main(int argc, char **argv) {
             int *mode_fit = xmalloc((size_t)nf * sizeof(int));
             int *mode_ev = xmalloc((size_t)nev * sizeof(int));
             memset(mode_fit, 0, (size_t)nf * sizeof(int));
+            int table[256]; int gate_route = 0;
             if (M > 1)
-                derive_modes(X, R, fit, nf, M, maxk, lambdas[0], seed, L, C, mode_fit);
+                derive_modes(X, R, fit, nf, M, maxk, lambdas[0], seed, L, top1,
+                             C, mode_fit, table, &gate_route);
             int cnt[MAXM]; memset(cnt, 0, sizeof cnt);
             for (int i = 0; i < nf; i++) cnt[mode_fit[i]]++;
-            for (int i = 0; i < nev; i++) mode_ev[i] = mode_assign(X + (size_t)ev[i] * D, C, M);
+            for (int i = 0; i < nev; i++)
+                mode_ev[i] = (M > 1 && gate_route) ? table[top1[ev[i]]]
+                             : mode_assign(X + (size_t)ev[i] * D, C, M);
             printf("  L%d M=%d fit行分布:", L, M);
             for (int m = 0; m < M; m++) printf(" %d", cnt[m]);
             printf("\n");
@@ -328,7 +354,8 @@ int main(int argc, char **argv) {
                         vol += (long long)zl[m]->k * (1 + 2 * D) * 2;   /* fp16 z|U|V */
                         for (uint32_t c = 0; c < zl[m]->k; c++) zcat[nz++] = zl[m]->z[c];
                     }
-                    double er = eval_apply(zl, C, M, X, Ys, R, ev, mode_ev, nev,
+                    if (gate_route) vol += 256;      /* 路由查表门: 每专家 1 字节 */
+                    double er = eval_apply(zl, C, M, gate_route, X, Ys, R, ev, mode_ev, nev,
                                            Yhat, Cb, Cp, dscale, seed, nth);
                     float la = ds4_loss_align(Yhat, Yt_ev, (uint32_t)nev, D);
                     float lc = ds4_loss_classify(Yhat, Yt_ev, wv, (uint32_t)nev, D);
@@ -370,7 +397,7 @@ int main(int argc, char **argv) {
         }
         fflush(stdout);
         free(X); free(R); free(Ys); free(Yt); free(Yt_ev); free(Ys_ev); free(wv);
-        free(Yhat); free(Cb); free(Cp); free(zcat);
+        free(Yhat); free(Cb); free(Cp); free(zcat); free(top1);
     }
     free(fit); free(ev);
     if (any_lost) { fprintf(stderr, "zloss_solve: 有层全网格输裸 — 停车审计(exit 3)\n"); return 3; }

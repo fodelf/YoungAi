@@ -9,7 +9,8 @@
  * selftest 金标(种 sign(p·h) 双图)下两者门一致率都 ≈50% 掷硬币。 */
 static void derive_modes(const float *X, const float *R, const int *fit, int nf,
                          int M, int maxk, double lam0, uint64_t seed, int L,
-                         float *C, int *mode_fit) {
+                         const int *top1, float *C, int *mode_fit,
+                         int *table, int *gate_route) {
     float *Xf = xmalloc((size_t)nf * D * sizeof(float));
     float *Rf = xmalloc((size_t)nf * D * sizeof(float));
     for (int i = 0; i < nf; i++) {
@@ -68,6 +69,7 @@ static void derive_modes(const float *X, const float *R, const int *fit, int nf,
         printf("  L%d M=%d EM 重启%d fit误差 %.4g\n", L, M, rs, toterr);
         if (toterr < errbest) { errbest = toterr; memcpy(labbest, lab, (size_t)nf * sizeof(int)); }
     }
+    /* 门候选①: x 方向质心(EM 标签的 x 侧线性读出) */
     double *xacc = xmalloc((size_t)M * D * sizeof(double));
     memset(xacc, 0, (size_t)M * D * sizeof(double));
     for (int i = 0; i < nf; i++) {
@@ -84,11 +86,33 @@ static void derive_modes(const float *X, const float *R, const int *fit, int nf,
         float *c = C + (size_t)m * D;
         for (int j = 0; j < D; j++) c[j] = (float)(a[j] * inv);
     }
-    int agree = 0;
-    for (int i = 0; i < nf; i++) {
-        mode_fit[i] = mode_assign(Xf + (size_t)i * D, C, M);
-        if (mode_fit[i] == labbest[i]) agree++;
+    int agree_x = 0;
+    for (int i = 0; i < nf; i++)
+        if (mode_assign(Xf + (size_t)i * D, C, M) == labbest[i]) agree_x++;
+    /* 门候选②: 路由 top-1 专家查表(R=Σ所选专家误差图 ⇒ 模式天然路由承载;
+     * 部署时路由先于专家计算, 免费信号)。空表专家回落全局多数标签。 */
+    int agree_r = -1;
+    if (top1 && table) {
+        int *vt = xmalloc((size_t)256 * M * sizeof(int));
+        memset(vt, 0, (size_t)256 * M * sizeof(int));
+        int gcnt[MAXM]; memset(gcnt, 0, sizeof gcnt);
+        for (int i = 0; i < nf; i++) { vt[(size_t)top1[fit[i]] * M + labbest[i]]++; gcnt[labbest[i]]++; }
+        int gmaj = 0;
+        for (int m = 1; m < M; m++) if (gcnt[m] > gcnt[gmaj]) gmaj = m;
+        for (int e = 0; e < 256; e++) {
+            int bm = -1, bc = 0;
+            for (int m = 0; m < M; m++) if (vt[(size_t)e * M + m] > bc) { bc = vt[(size_t)e * M + m]; bm = m; }
+            table[e] = bm < 0 ? gmaj : bm;
+        }
+        agree_r = 0;
+        for (int i = 0; i < nf; i++) if (table[top1[fit[i]]] == labbest[i]) agree_r++;
+        free(vt);
     }
-    printf("  L%d M=%d 门一致率(x门 vs EM标签) %.1f%%\n", L, M, 100.0 * agree / nf);
+    *gate_route = (agree_r > agree_x);
+    for (int i = 0; i < nf; i++)
+        mode_fit[i] = *gate_route ? table[top1[fit[i]]] : mode_assign(Xf + (size_t)i * D, C, M);
+    printf("  L%d M=%d 门一致率 x=%.1f%% 路由=%.1f%% → 选%s门\n", L, M,
+           100.0 * agree_x / nf, agree_r < 0 ? -1.0 : 100.0 * agree_r / nf,
+           *gate_route ? "路由" : "x");
     free(Xf); free(Rf); free(lab); free(labbest); free(tmp); free(xacc);
 }
