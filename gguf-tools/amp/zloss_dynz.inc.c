@@ -14,7 +14,7 @@
 
 /* Φ[t,c] = tanh((x_t·V_c)/s_c)·tanh((x_t·A_c)/σ_c), 投影用 BLAS 批量 */
 static float *dynz_phi(const float *X, int ntok, const float *V, const float *A,
-                       const float *sv, const float *sa, int k) {
+                       const float *sv, const float *sa, int k, int gate2) {
     float *p1 = xmalloc((size_t)ntok * k * sizeof(float));
     float *p2 = xmalloc((size_t)ntok * k * sizeof(float));
 #ifdef DQ_BLAS
@@ -34,7 +34,8 @@ static float *dynz_phi(const float *X, int ntok, const float *V, const float *A,
 #endif
     for (size_t i = 0; i < (size_t)ntok * k; i++) {
         int c = (int)(i % k);
-        p1[i] = tanhf(p1[i] / sv[c]) * tanhf(p2[i] / sa[c]);
+        p1[i] = gate2 ? tanhf(p1[i] / sv[c]) * tanhf(p2[i] / sa[c])
+                      : tanhf(p1[i] / sv[c]);      /* 单门变体: 实现自检对照 */
     }
     free(p2);
     return p1;                                     /* p1 即 Φ */
@@ -116,7 +117,8 @@ static void run_dynz_arm(const float *X, const float *R, const float *Ys,
             memcpy(Vk + (size_t)j * k, s1->V + (size_t)j * s1->rank, (size_t)k * sizeof(float));
             memcpy(Ak + (size_t)j * k, s2->V + (size_t)j * s2->rank, (size_t)k * sizeof(float));
         }
-        float *Phi = dynz_phi(X, ntok, Vk, Ak, sv, sa, k);      /* 全行(fit 解, held 判) */
+        for (int gate2 = 0; gate2 <= 1; gate2++) {
+        float *Phi = dynz_phi(X, ntok, Vk, Ak, sv, sa, k, gate2);   /* 全行(fit 解, held 判) */
         double *G = xmalloc((size_t)k * k * sizeof(double));    /* Gram=ΦfᵀΦf */
         double *B = xmalloc((size_t)k * D * sizeof(double));    /* ΦfᵀR */
         memset(G, 0, (size_t)k * k * sizeof(double));
@@ -154,15 +156,24 @@ static void run_dynz_arm(const float *X, const float *R, const float *Ys,
                 corr[(size_t)t * D + j] = (float)a;
             }
 #endif
-            char nm[24]; snprintf(nm, sizeof nm, "dynz");
-            float pk[2] = { (float)k, (float)lambdas[li] };
-            run_bc_arm(nm, pk, 2, corr, X, Ys, Yt_ev, wv, R, ev, mode0, nev,
-                       lw, dscale, seed, nth, L, lf, best, Yhat, Cb, Cp);
-            printf("    ↑dynz k=%d λ=%.3g vol=%.1fMB(f16 A|U|V)\n",
-                   k, lambdas[li], (double)k * 3 * D * 2 / 1e6);
-            free(corr); free(Gs); free(Us);
+            float *Uf2 = xmalloc((size_t)k * D * sizeof(float));
+            for (size_t i = 0; i < (size_t)k * D; i++) Uf2[i] = (float)Us[i];
+            double fn2 = 0, fd2 = 0;      /* fit 侧挽回(实现自检: fit 也没肉=解算病) */
+            for (int i = 0; i < nf; i += 7) {
+                const float *r = R + (size_t)fit[i] * D, *c2 = corr + (size_t)fit[i] * D;
+                for (int j = 0; j < D; j++) { double e = (double)r[j] - c2[j];
+                    fn2 += e * e; fd2 += (double)r[j] * r[j]; }
+            }
+            run_bc_arm(gate2 ? "dynz" : "dyn1", Uf2, k * D, corr, X, Ys, Yt_ev, wv,
+                       R, ev, mode0, nev, lw, dscale, seed, nth, L, lf, best, Yhat, Cb, Cp);
+            printf("    ↑%s k=%d λ=%.3g fitER=%.1f%% vol=%.1fMB\n", gate2 ? "dynz" : "dyn1",
+                   k, lambdas[li], 100.0 * (1.0 - fn2 / (fd2 + 1e-30)),
+                   (double)k * (gate2 ? 3 : 2) * D * 2 / 1e6);
+            free(Uf2); free(corr); free(Gs); free(Us);
         }
-        free(Phi); free(Vk); free(Ak); free(G); free(B);
+        free(Phi); free(G); free(B);
+        }
+        free(Vk); free(Ak);
     }
     ds4_z_free(s1); ds4_z_free(s2); free(sv); free(sa);
 }
