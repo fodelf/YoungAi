@@ -185,16 +185,34 @@ static int mode_assign(const float *x, const float *C, int M) {
 typedef struct {
     ds4_z *const *zl; const float *C; int M, gate_route;
     const float *bc;                    /* 基修正(ntok×D, GE 臂), NULL=无 */
+    float tr;                           /* 信任域(引擎 zc_zl_add_kernel 同式), ≤0=不夹 */
     const float *X, *Ys, *R; const int *ev, *mode_ev; int nev;
     float *Yhat, *Cb, *Cp; double dscale; uint64_t seed;
     double er_num, er_den;
     int t0, t1;
 } ev_ctx;
+
+/* 图输出按引擎信任域夹持后叠加: cap=tr·‖基‖, ‖Δ‖>cap 整体缩到 cap。
+ * 与部署 apply 同式 —— 评估不建模夹持=评一个不存在的部署行为。 */
+static void add_clamped(const float *mb, float nb, float tr, float *yh, float *cb) {
+    double nd2 = 0;
+    for (int j = 0; j < D; j++) nd2 += (double)mb[j] * mb[j];
+    float s = 1.0f;
+    if (tr > 0 && nb > 0) {
+        float nd = (float)sqrt(nd2), cap = tr * nb;
+        if (nd > cap && nd > 0) s = cap / nd;
+    }
+    for (int j = 0; j < D; j++) {
+        if (yh) yh[j] += s * mb[j];
+        if (cb) cb[j] += s * mb[j];
+    }
+}
 static void *ev_worker(void *arg) {
     ev_ctx *c = (ev_ctx *)arg;
     float *delta = xmalloc(D * sizeof(float));
     float *xp = xmalloc(D * sizeof(float));
     float *phib = xmalloc((size_t)3 * D * sizeof(float));
+    float *mbuf = xmalloc(D * sizeof(float));
     c->er_num = c->er_den = 0;
     for (int i = c->t0; i < c->t1; i++) {
         const float *x = c->X + (size_t)c->ev[i] * D;
@@ -206,31 +224,42 @@ static void *ev_worker(void *arg) {
             memcpy(cb, b, D * sizeof(float)); memcpy(cp, b, D * sizeof(float));
         } else { memset(cb, 0, D * sizeof(float)); memset(cp, 0, D * sizeof(float)); }
         int m = c->mode_ev[i];
-        if (c->zl[m]) { apply_any(c->zl[m], x, phib, yh); apply_any(c->zl[m], x, phib, cb); }
+        double nb2 = 0;                  /* ‖基‖=Ys(+GE) 行范数, 引擎 nr 同义 */
+        for (int j = 0; j < D; j++) nb2 += (double)yh[j] * yh[j];
+        const float nb = (float)sqrt(nb2);
+        if (c->zl[m]) {
+            memset(mbuf, 0, D * sizeof(float));
+            apply_any(c->zl[m], x, phib, mbuf);
+            add_clamped(mbuf, nb, c->tr, yh, cb);
+        }
         double ss = 0; for (int j = 0; j < D; j++) ss += (double)x[j] * x[j];
         const float rms = (float)sqrt(ss / D);
         ds4_loss_dither(c->seed, (uint32_t)c->ev[i], (float)(c->dscale * rms), delta, D);
         for (int j = 0; j < D; j++) xp[j] = x[j] + delta[j];
         /* 扰动可换模式(x门): 门稳定性一并入 smooth; 路由门下扰动不改路由 → 同模式 */
         int mp = c->gate_route ? m : mode_assign(xp, c->C, c->M);
-        if (c->zl[mp]) apply_any(c->zl[mp], xp, phib, cp);
+        if (c->zl[mp]) {
+            memset(mbuf, 0, D * sizeof(float));
+            apply_any(c->zl[mp], xp, phib, mbuf);
+            add_clamped(mbuf, nb, c->tr, cp, NULL);
+        }
         const float *r = c->R + (size_t)c->ev[i] * D;
         for (int j = 0; j < D; j++) {
             double e = (double)r[j] - cb[j];
             c->er_num += e * e; c->er_den += (double)r[j] * r[j];
         }
     }
-    free(delta); free(xp); free(phib); return NULL;
+    free(delta); free(xp); free(phib); free(mbuf); return NULL;
 }
 static double eval_apply(ds4_z *const *zl, const float *C, int M, int gate_route,
-                         const float *bc, const float *X,
+                         const float *bc, float tr, const float *X,
                          const float *Ys, const float *R, const int *ev, const int *mode_ev,
                          int nev, float *Yhat, float *Cb, float *Cp,
                          double dscale, uint64_t seed, int nth) {
     pthread_t th[32]; ev_ctx cx[32];
     if (nth > 32) nth = 32;
     for (int t = 0; t < nth; t++) {
-        cx[t] = (ev_ctx){zl, C, M, gate_route, bc, X, Ys, R, ev, mode_ev, nev, Yhat, Cb, Cp,
+        cx[t] = (ev_ctx){zl, C, M, gate_route, bc, tr, X, Ys, R, ev, mode_ev, nev, Yhat, Cb, Cp,
                          dscale, seed, 0, 0, nev * t / nth, nev * (t + 1) / nth};
         pthread_create(&th[t], NULL, ev_worker, &cx[t]);
     }
@@ -246,7 +275,7 @@ int main(int argc, char **argv) {
     int ranks[MAXG] = {16, 64, 128, 256}; int nrank = 4;
     double lambdas[MAXG] = {3e-3, 3e-2, 3e-1}; int nlam = 3;
     ds4_loss_weights lw = {1.0f, 0.5f, 0.1f, 1e-3f};
-    double dscale = 0.04; uint64_t seed = 1;
+    double dscale = 0.04, trclamp = 0.5; uint64_t seed = 1;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--anchor") && i + 1 < argc) anc = argv[++i];
         else if (!strcmp(argv[i], "--zcache") && i + 1 < argc) zdir = argv[++i];
@@ -265,6 +294,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--ws") && i + 1 < argc) lw.w_smooth = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--wf") && i + 1 < argc) lw.w_fixed = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--dither") && i + 1 < argc) dscale = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--tr") && i + 1 < argc) trclamp = atof(argv[++i]);
         else if (!strcmp(argv[i], "--seed") && i + 1 < argc) seed = (uint64_t)strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--fit-ranges") && i + 1 < argc) frs = argv[++i];
         else if (!strcmp(argv[i], "--ev-ranges") && i + 1 < argc) ers = argv[++i];
@@ -395,8 +425,8 @@ int main(int argc, char **argv) {
                         for (uint32_t c = 0; c < zl[m]->k; c++) zcat[nz++] = zl[m]->z[c];
                     }
                     if (gate_route) vol += 256;      /* 路由查表门: 每专家 1 字节 */
-                    double er = eval_apply(zl, C, M, gate_route, NULL, X, Ys, R, ev, mode_ev,
-                                           nev, Yhat, Cb, Cp, dscale, seed, nth);
+                    double er = eval_apply(zl, C, M, gate_route, NULL, trclamp, X, Ys, R, ev,
+                                           mode_ev, nev, Yhat, Cb, Cp, dscale, seed, nth);
                     float la = ds4_loss_align(Yhat, Yt_ev, (uint32_t)nev, D);
                     float lc = ds4_loss_classify(Yhat, Yt_ev, wv, (uint32_t)nev, D);
                     float ls = ds4_loss_smooth(Cb, Cp, (uint32_t)nev, D);
@@ -421,14 +451,14 @@ int main(int argc, char **argv) {
         if (!selftest) {
             /* ---- ftA 臂(冠军特征) 与 GE+ftA 臂(冠军配方全还原) ---- */
             XP = build_phi(X, ntok);
-            run_map_arm("ftA", XP, 3 * D, NULL, R, R, X, Ys, Yt_ev, wv, fit, nf,
-                        ev, mode0, nev, ranks, nrank, lambdas, nlam, maxk, &lw,
+            run_map_arm("ftA", XP, 3 * D, NULL, (float)trclamp, R, R, X, Ys, Yt_ev, wv,
+                        fit, nf, ev, mode0, nev, ranks, nrank, lambdas, nlam, maxk, &lw,
                         dscale, seed, nth, L, lf, &best, Yhat, Cb, Cp, zcat);
             Rge = xmalloc((size_t)ntok * D * sizeof(float));
             for (size_t i = 0; i < (size_t)ntok * D; i++) Rge[i] = R[i] - gecorr[i];
-            run_map_arm("GE+ftA", XP, 3 * D, gecorr, Rge, R, X, Ys, Yt_ev, wv, fit, nf,
-                        ev, mode0, nev, ranks, nrank, lambdas, nlam, maxk, &lw,
-                        dscale, seed, nth, L, lf, &best, Yhat, Cb, Cp, zcat);
+            run_map_arm("GE+ftA", XP, 3 * D, gecorr, (float)trclamp, Rge, R, X, Ys, Yt_ev,
+                        wv, fit, nf, ev, mode0, nev, ranks, nrank, lambdas, nlam, maxk,
+                        &lw, dscale, seed, nth, L, lf, &best, Yhat, Cb, Cp, zcat);
         }
         int won = best.arm != NULL;
         fprintf(lf, "# 选中: %s arm=%s M=%d λ=%.3g k=%d total=%.6f (裸 %.6f Δ=%.2f%%) ER=%.1f%%\n",

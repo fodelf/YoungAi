@@ -8,7 +8,7 @@
 
 /* eval_apply 在主文件后段定义(worker 按 zl->d_in 自动 φ 提升), 此处前置声明 */
 static double eval_apply(ds4_z *const *zl, const float *C, int M, int gate_route,
-                         const float *bc, const float *X, const float *Ys,
+                         const float *bc, float tr, const float *X, const float *Ys,
                          const float *R, const int *ev, const int *mode_ev, int nev,
                          float *Yhat, float *Cb, float *Cp, double dscale,
                          uint64_t seed, int nth);
@@ -104,7 +104,7 @@ typedef struct {
 /* 线性/ftA 图臂: 特征 XF(din 宽), 靶 Reff(bc 臂=R−GE修正), M=1 静态。
  * 评估仍走 eval_apply(worker 按 zl->d_in 自动 φ 提升), ER 恒对原始 R。 */
 static void run_map_arm(const char *arm, const float *XF, int din, const float *bc,
-                        const float *Reff, const float *R, const float *X,
+                        float tr, const float *Reff, const float *R, const float *X,
                         const float *Ys, const float *Yt_ev, const float *wv,
                         const int *fit, int nf, const int *ev, const int *mode0, int nev,
                         const int *ranks, int nrank, const double *lambdas, int nlam,
@@ -127,7 +127,7 @@ static void run_map_arm(const char *arm, const float *XF, int din, const float *
             long long vol = (long long)zl[0]->k * (1 + din + D) * 2 + (bc ? 512 : 0);
             int nz = 0;
             for (uint32_t c = 0; c < zl[0]->k; c++) zcat[nz++] = zl[0]->z[c];
-            double er = eval_apply(zl, NULL, 1, 0, bc, X, Ys, R, ev, mode0, nev,
+            double er = eval_apply(zl, NULL, 1, 0, bc, tr, X, Ys, R, ev, mode0, nev,
                                    Yhat, Cb, Cp, dscale, seed, nth);
             float la = ds4_loss_align(Yhat, Yt_ev, (uint32_t)nev, D);
             float lc = ds4_loss_classify(Yhat, Yt_ev, wv, (uint32_t)nev, D);
@@ -158,7 +158,7 @@ static void run_ge_arm(const double *delta, const float *gecorr, const float *X,
                        int nth, int L, FILE *lf, best_t *best,
                        float *Yhat, float *Cb, float *Cp) {
     ds4_z *zl[1] = {0};
-    double er = eval_apply(zl, NULL, 1, 1 /*路由门语义: 扰动不改 GE*/, gecorr,
+    double er = eval_apply(zl, NULL, 1, 1 /*路由门语义: 扰动不改 GE*/, gecorr, 0,
                            X, Ys, R, ev, mode0, nev, Yhat, Cb, Cp, dscale, seed, nth);
     float dz[256];
     for (int e = 0; e < 256; e++) dz[e] = (float)delta[e];
