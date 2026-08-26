@@ -135,7 +135,10 @@ stage_anchor32(){
         || DIE "扩样 ids 生成失败"
     [ -s "$IDS32" ] || DIE "ids 没落盘 $IDS32"
     n=$(wc -l < "$IDS32"); [ "$n" -eq 32768 ] || DIE "ids 行数 $n ≠ 32768"
-    [ -s "$ANC32" ] && { LOG "锚已在 $(du -h "$ANC32" | cut -f1), 跳过"; return 0; }
+    # 完成判据=头魔数(anchor_save 最后写头=提交标记; 半成品被 ftruncate 成全尺寸, 只看
+    # 存在/大小会把无头垃圾当成品 —— 2026-08-26 实锤)。头坏不删文件: 建锚 mmap 原地重写。
+    if [ -s "$ANC32" ] && [ "$(head -c 4 "$ANC32" 2>/dev/null)" = "DQA2" ]; then
+        LOG "锚已在(DQA2 头有效, $(du -h "$ANC32" | cut -f1)), 跳过"; return 0; fi
     avail_gb=$(df -BG --output=avail "$D2" | tail -1 | tr -dc 0-9)
     [ "$avail_gb" -ge 200 ] || DIE "盘余 ${avail_gb}GB <200GB, 锚 ~132GB 不发车"
     LOG "②FP 锚定遍发车 S=32768 → $ANC32 (~132GB, 逐层写)"
@@ -156,6 +159,7 @@ stage_needle32(){
     EXP32=$(( 40 + 43*32768*4096*4 + 2*43*32768*6*4 + 43*32768*4*4096*4 + 32768*129280*4 ))
     sz=$(stat -c %s "$ANC32" 2>/dev/null || echo 0)
     [ "$sz" -ge "$EXP32" ] || DIE "32k 锚未就绪($sz/$EXP32), 先跑 anchor32"
+    [ "$(head -c 4 "$ANC32" 2>/dev/null)" = "DQA2" ] || DIE "32k 锚无 DQA2 头(半成品), 先跑完 anchor32"
     W32="$WS/layers32"
     if [ ! -d "$W32" ]; then
         mkdir -p "$W32"
