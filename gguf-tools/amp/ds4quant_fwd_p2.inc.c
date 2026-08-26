@@ -160,6 +160,48 @@ static void dq_softmax_rows_par(float *SC, float sinkh, int S, int N, int WIN, i
     for (int t = 0; t < nt; t++) pthread_join(th[t], NULL);
 }
 
+/* ---- s-切片并行(2026-08-26 用户令 GPU/并行化): 注意力里三段逐 token 标量循环
+ * (q 逐头 rms+rope / kv rms+rope / 出口逆 rope)在 S=32768 时是单线程长尾;
+ * 各 s 行完全独立, 按行切线程 = 数值逐位不变(与 dq_softmax_rows_par 同纪律)。 ---- */
+typedef struct {
+    float *q, *kva, *o; const float *qnorm2, *cos_t, *sin_t;
+    int S, NH, HD, RD; float EPS;
+} dq_arw;
+static void dq_ar_qrms(dq_arw *w, int a, int b) {
+    for (int s = a; s < b; s++) for (int h = 0; h < w->NH; h++) {
+        float *qh = w->q + ((size_t)s * w->NH + h) * w->HD;
+        double v = 0; for (int d = 0; d < w->HD; d++) v += (double)qh[d] * qh[d];
+        float r = (float)(1.0 / sqrt(v / (double)w->HD + (double)w->EPS));
+        for (int d = 0; d < w->HD; d++) qh[d] *= r;
+        dq_apply_rope(qh + (w->HD - w->RD), w->cos_t + (size_t)s * (w->RD / 2),
+                      w->sin_t + (size_t)s * (w->RD / 2), w->RD, 0);
+    }
+}
+static void dq_ar_irope(dq_arw *w, int a, int b) {
+    for (int s = a; s < b; s++) for (int h = 0; h < w->NH; h++)
+        dq_apply_rope(w->o + ((size_t)s * w->NH + h) * w->HD + (w->HD - w->RD),
+                      w->cos_t + (size_t)s * (w->RD / 2),
+                      w->sin_t + (size_t)s * (w->RD / 2), w->RD, 1);
+}
+typedef struct { dq_arw *w; void (*fn)(dq_arw *, int, int); int a, b; } dq_arj;
+static void *dq_ar_worker(void *arg) { dq_arj *j = (dq_arj *)arg; j->fn(j->w, j->a, j->b); return NULL; }
+static void dq_ar_par(void (*fn)(dq_arw *, int, int), dq_arw *w, int S) {
+    static int NT2 = 0;   /* 线程数 = 在线核数(dq_softmax_rows_par 同式, 不读 env) */
+    if (!NT2) { long nc = sysconf(_SC_NPROCESSORS_ONLN); NT2 = (int)(nc < 1 ? 1 : (nc > 64 ? 64 : nc)); }
+    int nt = NT2;
+    if (nt <= 1 || S < 256) { fn(w, 0, S); return; }
+    pthread_t th[64]; dq_arj js[64];
+    int per = (S + nt - 1) / nt, n = 0;
+    for (int t = 0; t < nt; t++) {
+        int a = t * per, b = a + per > S ? S : a + per;
+        if (a >= b) break;
+        js[n] = (dq_arj){w, fn, a, b};
+        if (pthread_create(&th[n], NULL, dq_ar_worker, &js[n]) != 0) fn(w, a, b);
+        else n++;
+    }
+    for (int t = 0; t < n; t++) pthread_join(th[t], NULL);
+}
+
 void dq_attention(const float *x, const float *wqa, const float *qnorm, const float *wqb,
                   const float *wkv, const float *kvnorm, const float *sink,
                   const float *wo_a, const float *wo_b, const float *kvc,
@@ -173,14 +215,9 @@ void dq_attention(const float *x, const float *wqa, const float *qnorm, const fl
     for (int s=0;s<S;s++) dq_rms(qra+(size_t)s*QLR, qnorm, qr+(size_t)s*QLR, QLR, EPS);
     float *q = (float*)malloc((size_t)S*NH*HD*sizeof(float));
     dq_matmul(qr, wqb, q, S, QLR, NH*HD);
-    /* per-head rms (mean over HD) + rope */
-    for (int s=0;s<S;s++) for (int h=0;h<NH;h++) {
-        float *qh = q + ((size_t)s*NH+h)*HD;
-        double v=0; for(int d=0;d<HD;d++) v+=(double)qh[d]*qh[d];
-        float r=(float)(1.0/sqrt(v/(double)HD+(double)EPS));
-        for(int d=0;d<HD;d++) qh[d]*=r;
-        dq_apply_rope(qh+(HD-RD), cos_t+(size_t)s*(RD/2), sin_t+(size_t)s*(RD/2), RD, 0);
-    }
+    /* per-head rms (mean over HD) + rope — s 切片并行(逐位同) */
+    dq_arw arw = { q, NULL, NULL, NULL, cos_t, sin_t, S, NH, HD, RD, EPS };
+    dq_ar_par(dq_ar_qrms, &arw, S);
     float *kv = (float*)malloc((size_t)S*HD*sizeof(float));
     { float *kvr=(float*)malloc((size_t)S*HD*sizeof(float));
       dq_matmul(x, wkv, kvr, S, DIM, HD);
@@ -218,8 +255,8 @@ void dq_attention(const float *x, const float *wqa, const float *qnorm, const fl
 #ifdef DS4QUANT_CUDA
     }
 #endif
-    for (int s=0;s<S;s++) for (int h=0;h<NH;h++)
-        dq_apply_rope(o+((size_t)s*NH+h)*HD+(HD-RD), cos_t+(size_t)s*(RD/2), sin_t+(size_t)s*(RD/2), RD, 1);  /* inverse */
+    arw.o = o;
+    dq_ar_par(dq_ar_irope, &arw, S);       /* inverse rope — s 切片并行(逐位同) */
 #else
     float *scr = (float*)malloc((size_t)N*sizeof(float));
     for (int s=0;s<S;s++) for (int h=0;h<NH;h++) {

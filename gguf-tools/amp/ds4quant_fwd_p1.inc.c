@@ -249,21 +249,16 @@ void dq_expert_fp(const float *x, const float *w1, const float *w3, const float 
         g[i] = dq_silu(gg) * uu;   /* h */
     }
     if (weight) for (int s = 0; s < S; s++) for (int j = 0; j < MOEI; j++) g[(size_t)s*MOEI+j] *= weight[s];
-    /* out += h @ w2.T  (w2[DIM,MOEI]) */
-#ifdef DQ_BLAS
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, S, DIM, MOEI,
-                1.0f, g, MOEI, w2, MOEI, 1.0f, acc_out, DIM);
-#else
-    for (int s = 0; s < S; s++) {
-        const float *hr = g + (size_t)s * MOEI;
-        for (int d = 0; d < DIM; d++) {
-            const float *wr = w2 + (size_t)d * MOEI;
-            float a = 0.0f;
-            for (int j = 0; j < MOEI; j++) a += hr[j] * wr[j];
-            acc_out[(size_t)s * DIM + d] += a;
-        }
+    /* out += h @ w2.T  (w2[DIM,MOEI]) — 走 dq_matmul(大 GEMM 上 GPU 显存暂存路)再累加。
+     * 2026-08-26 用户令 GPU 化: 原来这里直落 cblas β=1, 共享专家 550 GFLOP/层与 256 个
+     * routed 第三矩阵全部单线程 CPU 磨(锚定遍 46% 墙钟的主凶)。β=0 乘积+显式加法与
+     * β=1 sgemm 的乘积段同序 ⇒ CPU 路数值逐位不变; GPU 路精度与前两 GEMM 同级。 */
+    {
+        float *t2 = (float *)malloc((size_t)S * DIM * sizeof(float));
+        dq_matmul(g, w2, t2, S, MOEI, DIM);
+        for (size_t i = 0; i < (size_t)S * DIM; i++) acc_out[i] += t2[i];
+        free(t2);
     }
-#endif
     free(g); free(u);
 }
 
