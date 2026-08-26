@@ -20,6 +20,10 @@ HF="$ROOT/hf/DeepSeek-V4-Flash-0731"
 ANC="$D2/anchor_a_clean_s8192.bin"
 WS="$D2/zloss"
 NTOK=8192; NFIT=6144
+# 夹持轮参数(2026-08-26 用户纠正跑法浪费后收窄): EM 模式网格已出结论(x/路由门
+# 都读不出标签, 三层同款)不再重跑; 只跑有判决价值的臂 = 裸/GE/x静态/ftA/GE+ftA。
+# 全网格版本的读数在 needle.log.v4unclamped 与 fable5.md。
+MODES="1"; RANKS="16,64,128,256"; LAMBDAS="3e-3,3e-2,3e-1"
 LOG(){ echo "[zloss $(date +%H:%M:%S)] $*"; }
 DIE(){ LOG "★$*★"; exit 1; }
 
@@ -59,10 +63,10 @@ stage_needle(){
         else
             LOG "①L$L zcache 已在, 复用"
         fi
-        LOG "②L$L 网格解算(M∈{1,8,16} × λ∈{3e-3,3e-2,3e-1} × k∈{16,64,128,256} + ER)"
+        LOG "②L$L 臂解算(M=$MODES × λ=$LAMBDAS × k=$RANKS + GE/ftA/GE+ftA + ER, 信任域0.5)"
         "$GT/amp/zloss_solve" --anchor "$ANC" --zcache "$WS/layers" --out "$WS/needle" \
             --layers "$L-$L" --ntok $NTOK --threads 18 \
-            --modes 1,8,16 --ranks 16,64,128,256 --lambdas 3e-3,3e-2,3e-1 \
+            --modes "$MODES" --ranks "$RANKS" --lambdas "$LAMBDAS" \
             --fit-ranges "$FR" --ev-ranges "$ER"
         rc=$?
         if [ "$rc" -eq 3 ]; then LOG "★L$L 全网格输裸 — 停车审计信号★"; NEEDLE_RC=3
