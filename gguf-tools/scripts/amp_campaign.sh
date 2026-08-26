@@ -286,6 +286,39 @@ if abs(cq - ca) > 6.0:
 PY
 }
 
+# ★放大器半扩样(2026-08-26 zloss90 战役, 用户令: 体积≤2GB 换 Σmin→0.90)★
+# 依据: 大秩 held 单调恶化(过拟合)+段漂移 δcos 塌+GEc 段覆盖墙 三指纹同指
+# "锚 8192tok/32段 数据饿"; 2GB 预算对应 rank ~1400-2800/层, fit 4608 行喂不动。
+# 池=放大器半(奇数 256 块, idshalf 同式), 同一冻结语料内多采=不违语料冻结铁律;
+# 量化半 ids 一字不动(零重叠纪律)。窗宽 128 与原 vqhalf_a.ids 同(行掩码几何不变)。
+# 用法: amp_campaign.sh idshalf_ext [N=32768] [CH=256] [出名=vqhalf_a32k.ids]
+stage_idshalf_ext(){
+    local D2="$ROOT/gguf/go-onebit/vqhalf"
+    local N="${1:-32768}" CH="${2:-256}" OUT="$D2/${3:-vqhalf_a32k.ids}"
+    [ -s "$OUT" ] && { LOG "①扩样 ids 已在 $OUT, 跳过"; return 0; }
+    LOG "①放大器半扩样 → $OUT (N=$N CH=$CH; 量化半不动)"
+    python3 - "$CORPUS" "$OUT" "$N" "$CH" "$DS4_HF" <<'PY' || DIE "扩样失败"
+import sys
+from tokenizers import Tokenizer
+src, oa, N, CH, hf = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
+tok = Tokenizer.from_file(f"{hf}/tokenizer.json")
+allids = tok.encode(open(src, encoding="utf-8").read(), add_special_tokens=False).ids
+B = 256
+nblk = (len(allids) + B - 1) // B
+pool = [t for i in range(nblk) if i % 2 == 1 for t in range(i*B, min((i+1)*B, len(allids)))]
+w = N // CH; step = (len(pool) - w - N % CH) // (CH - 1)
+assert step > w, ("窗重叠", step, w)                   # 步距>窗宽 = 窗间零重叠
+sel = []
+for c in range(CH):
+    ww = w + (N % CH if c == CH - 1 else 0)
+    sel += pool[c*step : c*step+ww]
+sel = sel[:N]
+assert len(sel) == N, (len(sel), N)
+open(oa, "w").write("\n".join(str(allids[t]) for t in sel) + "\n")
+print("  %s: %d token / 池 %d / 窗 %d×%d / 步距 %d" % (oa.split("/")[-1], N, len(pool), CH, w, step))
+PY
+}
+
 # ★VQ86 半语料量化(2026-08-23): 与 base86p 单变量对照 —— 配方(平权 vq4x512 = 2.25bpw × 43 层)
 # 完全不动, 只换两样: ① 语料 wt2train_cal9 → 开源全场景 v5 的【量化半】; ② 校准规模
 # S 2906 → 8192(每专家 192 校准行 vs 68, DS4_CALIB_CAP 帽是 512, 原来欠采样 7.5 倍)。
@@ -388,7 +421,7 @@ ST="${1:-all}"
 case "$ST" in
   preflight) stage_preflight;; ids) stage_ids;; anchor) stage_anchor;;
   capture) stage_capture;; probe) stage_probe;; solve) stage_solve;; pass2) stage_pass2;;
-  chain) stage_chain;; judge) stage_judge;; dilute) stage_dilute;; idshalf) stage_idshalf;; vqquant) stage_vqquant;; vqmerge) stage_vqmerge;; vqcap) stage_vqcap;; vqsolve) stage_vqsolve;;
+  chain) stage_chain;; judge) stage_judge;; dilute) stage_dilute;; idshalf) stage_idshalf;; idshalf_ext) shift; stage_idshalf_ext "$@";; vqquant) stage_vqquant;; vqmerge) stage_vqmerge;; vqcap) stage_vqcap;; vqsolve) stage_vqsolve;;
   all) stage_preflight; stage_ids; stage_anchor; stage_capture
        stage_solve; stage_chain; stage_judge;;
   *) echo "未知段: $ST"; echo "段: preflight ids anchor capture solve pass2 chain judge dilute all (probe/dilute=诊断)"; exit 2;;

@@ -39,7 +39,7 @@ WD=""
 wd_start(){ ( while true; do
     A=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo)
     [ "${A:-99}" -lt 4 ] && { echo "[watchdog] MemAvailable=${A}GB <4GB ★杀★" >&2
-        pkill -9 -f 'amp/zlayer'; pkill -9 -f zloss_solve; break; }
+        pkill -9 -f 'amp/zlayer'; pkill -9 -f zloss_solve; pkill -9 -f ds4quant_run; break; }
     sleep 5; done ) & WD=$!; }
 wd_stop(){ [ -n "$WD" ] && kill "$WD" 2>/dev/null; WD=""; }
 trap 'wd_stop' EXIT
@@ -122,13 +122,39 @@ stage_solve(){
     grep -aE "PPL|KLD|RMS|Same|Δp|min" /tmp/caliper_zge.log | tail -10
     LOG "③端到端斜率标定完成: 对表 裸 0.47055 / r64c 0.42510, 全表 /tmp/caliper_zge.log"
 }
+# ★zloss90 数据面(2026-08-26 用户令: 体积花到 2GB 换 Σmin→0.90)★
+# 锚 8192tok/32段 → 32768tok/128段(放大器半池多采, 同冻结语料, 量化半零重叠不动)。
+# 依据三指纹: 大秩 held 单调恶化(数据饿)+fit↔held δcos 塌(段漂移)+GEc 段覆盖墙。
+# FP 锚定遍=base86p_spark.sh 同式(em 针 08-26 同路刚验证), 逐层顺序写=浅层段先可用,
+# 落盘 ~132GB。判决门(锚就绪后的针): held 家族须从 1-2%/层 解锁到 ≥5%/层, 否则
+# 数据面不是墙、停车换形态。
+ANC32="$D2/anchor_a_clean_s32768.bin"
+stage_anchor32(){
+    IDS32="$D2/vqhalf_a32k.ids"
+    [ -s "$IDS32" ] || bash "$GT/scripts/amp_campaign.sh" idshalf_ext 32768 256 vqhalf_a32k.ids \
+        || DIE "扩样 ids 生成失败"
+    [ -s "$IDS32" ] || DIE "ids 没落盘 $IDS32"
+    n=$(wc -l < "$IDS32"); [ "$n" -eq 32768 ] || DIE "ids 行数 $n ≠ 32768"
+    [ -s "$ANC32" ] && { LOG "锚已在 $(du -h "$ANC32" | cut -f1), 跳过"; return 0; }
+    avail_gb=$(df -BG --output=avail "$D2" | tail -1 | tr -dc 0-9)
+    [ "$avail_gb" -ge 200 ] || DIE "盘余 ${avail_gb}GB <200GB, 锚 ~132GB 不发车"
+    LOG "②FP 锚定遍发车 S=32768 → $ANC32 (~132GB, 逐层写)"
+    wd_start
+    ( cd "$GT/amp" && env DS4_HF="$HF" DS4_FP_ONLY=1 DS4_ANCHOR="$ANC32" \
+        DS4_THREADS=20 OPENBLAS_NUM_THREADS=1 ./ds4quant_run "$IDS32" 32768 ) \
+        || { wd_stop; DIE "FP 锚定遍失败"; }
+    wd_stop
+    LOG "③锚落盘 $(du -h "$ANC32" | cut -f1)"
+}
+
 stage_judge(){  DIE "动态 z 注入格式 + 判决尺升级闸(新尺须逐字节复刻裸 0.47055/r64c 0.42510)未定, 针后设计"; }
 stage_engine(){ DIE "引擎多模式 z 加载路未实现(ds4_z 模块扩容器), 针后设计"; }
 
 case "${1:-needle}" in
     needle)  stage_needle;;
     solve)   stage_solve;;
+    anchor32) stage_anchor32;;
     judge)   stage_judge;;
     engine)  stage_engine;;
-    *) DIE "用法: bash zloss_campaign.sh [needle|solve|judge|engine]";;
+    *) DIE "用法: bash zloss_campaign.sh [needle|solve|anchor32|judge|engine]";;
 esac
