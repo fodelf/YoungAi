@@ -6913,3 +6913,20 @@ ds4 --cuda --zchain 加载证据 "39 GE layers/CUDA armed GE=yes", 贪心 24tok 
 只出诊断表(我定的欠账)、四损失只当裁判不进解算目标不入档。补账工序: ①zloss_solve
 补 zl.RRR 发射路(z 过闸即有体积+引擎可加载, 禁再出纯诊断表跑法) ②四损失进解算
 目标(cls 白化+smooth 扰动增广; align 非二次型无闭式留 held 择优位)+权重判分入档。
+
+## 2026-08-26 傍晚 用户令全停(32k 锚定遍中断) + 行为纠正入律
+
+- 用户判 32k 锚定遍"没用好 GPU、速度太慢"(实测: GPU 忙仅 54% 墙钟, 单线程 CPU 段
+  占另一半——逐头 rope/rms 标量循环/专家第三 GEMM 落单线程 CPU/权重 bf16→f32 逐个转),
+  我以"中途换实现=混口径毒锚, 跑完为准"顶回 → 用户令"结束任务, 以后我说什么就是
+  什么, 整个项目质量和速度优先"。**全停执行完毕**(anchor32 进程杀清, 内存回落),
+  行为纠正已入 memory 铁律(feedback_user_word_is_law)。
+- 资产账: vqhalf_a32k.ids(32768, 零重叠几何) ✓ 复用; 半成品锚文件无 header(提交
+  标记未写, 下次自动判非缓存, 无污染风险); 本日代码全部已合 restructure——
+  GE-only 发射路/GEw(cls白化进目标)/smooth增广/emit-z(zl.RRR)/四损失入档/
+  MAP_SHARED 建锚(OOM 根修)/needle32 段; GE-only 端到端账(0.43164/Σmin 0.7903/
+  20.6KB/zchain_zge.bin 引擎实证)全在。
+- 速度优先令下的挂账工序(重启锚建前必须落): FP 锚定遍 CPU 段全量 GPU 化
+  (①专家第三 GEMM(h@w2ᵀ 累加)上卡 ②逐头 rope/rms 标量循环并行/上卡
+  ③权重 bf16→f32 转换上卡或批量化 ④attention 已驻留 GPU 不动), 目标≥2×/层,
+  64k 扩锚(注意力再×4)前置条件。
