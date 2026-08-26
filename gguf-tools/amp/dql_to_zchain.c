@@ -16,7 +16,7 @@ int main(int argc, char **argv) {
     FILE *out = fopen(outp, "wb");
     if (!out) { fprintf(stderr, "%s 打不开\n", outp); return 2; }
     put32(out, 0x325A5144u); put32(out, (uint32_t)NL);
-    long long tot5 = 0, tot6 = 0, outsz = 8;
+    long long tot5 = 0, tot6 = 0, outsz = 8; long long tot10 = 0;
     for (int L = 0; L < NL; L++) {
         char p[1024]; snprintf(p, sizeof p, "%s/dql_L%02d.bin", ld, L);
         FILE *f = fopen(p, "rb");
@@ -41,6 +41,7 @@ int main(int argc, char **argv) {
             uint32_t ty = 0;
             if (strstr(nm, "bf.GE") && psz >= 512) { ty = 5; tot5++; }
             else if (strstr(nm, "zl.RRR") && psz >= 16) { ty = 6; tot6++; }
+            else if (strstr(nm, "zl.4L") && psz >= 32) { ty = 10; tot10++; }   /* 四损失参数文件 */
             if (!ty || nops >= 64) continue;
             ops[nops].ty = ty; ops[nops].psz = psz;
             ops[nops].pay = malloc(psz);
@@ -58,6 +59,6 @@ int main(int argc, char **argv) {
         }
     }
     fclose(out);
-    printf("→ %s (%.1f MB) GE=%lld z^L=%lld\n", outp, outsz / 1e6, tot5, tot6);
+    printf("→ %s (%.1f MB) GE=%lld z^L=%lld 4L=%lld\n", outp, outsz / 1e6, tot5, tot6, tot10);
     return 0;
 }

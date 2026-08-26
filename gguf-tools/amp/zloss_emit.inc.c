@@ -89,6 +89,26 @@ static uint8_t *rec_rrr(uint8_t *buf, size_t *len, const ds4_z *zl) {
     return buf;
 }
 
+
+/* zl.4L 载荷(四损失参数文件, 用户架构: 放大器产/引擎耗, 前向调制+在线调 z 双用):
+ * f32 w_align,w_classify,w_smooth,w_fixed | u64 dither_seed | f32 dither_scale |
+ * u32 D | f16 wcls[D](fit 侧教师 per-dim 方差=classify 重要性) — 共 8224B。 */
+static uint8_t *rec_4l(uint8_t *buf, size_t *len, const ds4_loss_weights *lw,
+                       uint64_t seed, float dscale, const float *wclsf, uint32_t d) {
+    size_t psz = 16 + 8 + 4 + 4 + (size_t)d * 2;
+    uint8_t *pay = xmalloc(psz);
+    memcpy(pay, &lw->w_align, 4); memcpy(pay + 4, &lw->w_classify, 4);
+    memcpy(pay + 8, &lw->w_smooth, 4); memcpy(pay + 12, &lw->w_fixed, 4);
+    memcpy(pay + 16, &seed, 8);
+    memcpy(pay + 24, &dscale, 4);
+    memcpy(pay + 28, &d, 4);
+    uint16_t *h = (uint16_t *)(pay + 32);
+    for (uint32_t j = 0; j < d; j++) h[j] = ds4_f64_to_f16((double)wclsf[j]);
+    buf = rec_append(buf, len, "zl.4L", pay, psz);
+    free(pay);
+    return buf;
+}
+
 /* 四损失入档: 每层一行(臂/λ/k/裸→冠军四项/ER/损失权重) */
 static void fourloss_archive(const char *ldir, int L, const best_t *b, float la0,
                              float lc0, float tot0, const ds4_loss_weights *lw,
@@ -150,13 +170,24 @@ static void run_emit_ge(const char *ldir, int L, const zpairs *zp, const float *
 
 /* 全网格路终局: 四损失冠军整体落地。ge_dz=基 GE δ(组合臂的 bf.GE 基)。 */
 static void emit_z_finish(const char *ldir, int L, best_t *best, const float *ge_dz,
-                          float la0, float lc0, float tot0, const ds4_loss_weights *lw) {
+                          float la0, float lc0, float tot0, const ds4_loss_weights *lw,
+                          const float *Yt, const int *fit, int nf,
+                          uint64_t seed, float dscale) {
+    float *wclsf = xmalloc(D * sizeof(float));   /* fit 侧教师 per-dim 方差(引擎 classify 权) */
+    {
+        float *Ytf = xmalloc((size_t)nf * D * sizeof(float));
+        for (int i = 0; i < nf; i++)
+            memcpy(Ytf + (size_t)i * D, Yt + (size_t)fit[i] * D, D * sizeof(float));
+        ds4_loss_dim_variance(Ytf, (uint32_t)nf, D, wclsf);
+        free(Ytf);
+    }
     const char *action;
     if (!best->arm || best->tot >= tot0) action = "输裸不注入";
     else if (best->zkeep) {
         uint8_t *recs = NULL; size_t len = 0; int nrec = 0;
         if (best->zkeep_hasge && ge_dz) { recs = rec_ge(recs, &len, ge_dz); nrec++; }
         recs = rec_rrr(recs, &len, best->zkeep); nrec++;
+        recs = rec_4l(recs, &len, lw, seed, dscale, wclsf, D); nrec++;   /* 四损失参数随 z 落地 */
         inject_recs(ldir, L, recs, len, nrec);
         free(recs);
         action = best->zkeep_hasge ? "注入bf.GE+zl.RRR" : "注入zl.RRR";
@@ -165,7 +196,8 @@ static void emit_z_finish(const char *ldir, int L, best_t *best, const float *ge
     } else if (best->bckind == 1) {
         uint8_t *recs = NULL; size_t len = 0;
         recs = rec_ge(recs, &len, best->bcdz);
-        inject_recs(ldir, L, recs, len, 1);
+        recs = rec_4l(recs, &len, lw, seed, dscale, wclsf, D);
+        inject_recs(ldir, L, recs, len, 2);
         free(recs);
         action = "注入bf.GE";
         printf("★L%d emit-z: 冠军 %s → bf.GE 注入\n", L, best->arm);
@@ -175,5 +207,6 @@ static void emit_z_finish(const char *ldir, int L, best_t *best, const float *ge
                L, best->arm, best->M);
     }
     fourloss_archive(ldir, L, best, la0, lc0, tot0, lw, action);
+    free(wclsf);
     if (best->zkeep) { ds4_z_free(best->zkeep); best->zkeep = NULL; }
 }

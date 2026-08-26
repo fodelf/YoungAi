@@ -6,6 +6,7 @@
  *   payload: 1=GL f32 g | 2=GLdyn2 f32 w2p[4] | 3=GLdyn8 f32 w8[9] (+ fp16
  *   V8[8][d_model] when carried) | 4=TREF f32 t | 5=GE fp16[n_expert]. */
 #include "ds4_zchain.h"
+#include "ds4_loss.h"   /* posttrain 钩子: 四损失(dither/权)同一份实现 */
 
 #include <fcntl.h>
 #include <math.h>
@@ -100,6 +101,30 @@ ds4_zchain *ds4_zchain_load(const char *path, uint32_t n_layer, uint32_t n_exper
                 }
                 continue;
             }
+            if (ty == 10u && psz >= 32) {
+                /* type10 zl.4L 四损失参数(2026-08-26 用户架构): f32 w[4] | u64 seed |
+                 * f32 dscale | u32 d | fp16 wcls[d]。wnorm=均值归一 f32(前向加权范数用)。 */
+                ds4_zchain_4l *q = &zl->l4;
+                memcpy(q->w, pay, 16);
+                memcpy(&q->seed, pay + 16, 8);
+                memcpy(&q->dscale, pay + 24, 4);
+                memcpy(&q->d, pay + 28, 4);
+                if (q->d == d_model && psz >= 32u + (uint64_t)q->d * 2u) {
+                    q->wcls = (const uint16_t *)(pay + 32);
+                    float *wn = malloc((size_t)q->d * sizeof(float));
+                    if (wn) {
+                        double m = 0.0;
+                        for (uint32_t j2 = 0; j2 < q->d; j2++) {
+                            wn[j2] = zc_fp16_to_fp32(q->wcls[j2]);
+                            m += wn[j2];
+                        }
+                        m = m / q->d + 1e-30;
+                        for (uint32_t j2 = 0; j2 < q->d; j2++) wn[j2] = (float)(wn[j2] / m);
+                        q->wnorm = wn;
+                    }
+                } else { memset(q, 0, sizeof(*q)); }
+                continue;
+            }
             /* type7(乘性AMP)/type9(动态z AMPD) 已删(2026-08-26 清仓): 生产链非现役、
              * 现役产物零消费者。载荷遇到即拒(响亮跳过), 不再静默进 apply。 */
             if ((ty == 7u || ty == 9u) && psz >= 16) {
@@ -156,6 +181,7 @@ ds4_zchain *ds4_zchain_load(const char *path, uint32_t n_layer, uint32_t n_exper
     }
     uint32_t n_zl = 0, n_rte = 0;
     for (uint32_t il = 0; il < n_layer; il++) {
+        z->layer[il].zl.w4norm = z->layer[il].l4.wnorm;   /* 4L→z 信任域加权链接 */
         if (z->layer[il].ge) z->n_ge_layers++;
         if (z->layer[il].zl.zlk) n_zl++;
         if (z->layer[il].rte.zlk) n_rte++;
@@ -176,6 +202,7 @@ void ds4_zchain_free(ds4_zchain *z) {
         for (uint32_t il = 0; il < z->n_layer; il++) {
             free(z->layer[il].ops);
             free(z->layer[il].ge);
+            free(z->layer[il].l4.wnorm);
         }
         free(z->layer);
     }
@@ -233,9 +260,11 @@ void ds4_zchain_zl_apply(const ds4_zchain_zl *zl, uint32_t d_model, const float 
         if (!delta) return;
         ds4_z_apply(zl->zmod, x, delta);
         double nd = 0.0, nr = 0.0;
+        const float *w4 = zl->w4norm;    /* zl.4L classify 权: 重要维度说了算的夹持 */
         for (uint32_t j = 0; j < d; j++) {
-            nd += (double)delta[j] * delta[j];
-            nr += (double)routed[j] * routed[j];
+            const double wj = w4 ? (double)w4[j] : 1.0;
+            nd += wj * (double)delta[j] * delta[j];
+            nr += wj * (double)routed[j] * routed[j];
         }
         nd = sqrt(nd); nr = sqrt(nr);
         const double cap = (double)zl->zltr * nr;
@@ -276,8 +305,9 @@ void ds4_zchain_zl_apply(const ds4_zchain_zl *zl, uint32_t d_model, const float 
         double a = 0.0;
         const uint16_t *ur = hU + (size_t)j * k;
         for (uint32_t c = 0; c < k; c++) a += pv[c] * (double)zc_fp16_to_fp32(ur[c]);
-        nd += a * a;
-        nr += (double)routed[j] * (double)routed[j];
+        const double wj = zl->w4norm ? (double)zl->w4norm[j] : 1.0;
+        nd += wj * a * a;
+        nr += wj * (double)routed[j] * (double)routed[j];
     }
     nd = sqrt(nd); nr = sqrt(nr);
     double cap = (double)zl->zltr * nr;
@@ -290,4 +320,105 @@ void ds4_zchain_zl_apply(const ds4_zchain_zl *zl, uint32_t d_model, const float 
     }
     if (pv != pvs) free(pv);
     if (phi) free(phi);
+}
+
+
+/* ★引擎内调 z(用户架构②)★: U/V 冻结, 按 zl.4L 四权闭式重解 z 对角。
+ * 目标 min_z Σ_t a_t ‖diag(√w)(R_t − U diag(z) Vᵀ x_t)‖² + λ‖z‖², 其中
+ * a_t=1/‖Yt_t‖²(align 行权=方向平权), w=classify 权(缺则平权), smooth=固定种子
+ * dither 增广行, λ=w_fixed·Gram 迹(fixed)。k×k 正规方程, 高斯消元(k≤1024)。 */
+int ds4_zchain_posttrain_z(struct ds4_zchain *z, uint32_t layer,
+                           const float *X, const float *R, const float *Yt, uint32_t n) {
+    if (!z || layer >= z->n_layer || !X || !R || !n) return -1;
+    ds4_zchain_layer *zl = &z->layer[layer];
+    ds4_z *zm = zl->zl.zmod;
+    if (!zm || !zl->l4.wnorm) return -1;              /* 只支持线性 z + 有 4L 参数的层 */
+    const uint32_t k = zm->k, d = zm->d_out, din = zm->d_in;
+    if (din != d) return -1;
+    const float *w4 = zl->l4.wnorm;
+    const float wa = zl->l4.w[0], wc = zl->l4.w[1], ws = zl->l4.w[2], wf = zl->l4.w[3];
+    double *G = calloc((size_t)k * k, sizeof(double));
+    double *b = calloc(k, sizeof(double));
+    float *pv = malloc((size_t)k * sizeof(float));
+    float *ub = malloc((size_t)k * sizeof(float));
+    float *xp = malloc((size_t)d * sizeof(float));
+    float *dl = malloc((size_t)d * sizeof(float));
+    if (!G || !b || !pv || !ub || !xp || !dl) {
+        free(G); free(b); free(pv); free(ub); free(xp); free(dl); return -1;
+    }
+    const int naug = (ws > 0.0f && zl->l4.dscale > 0.0f) ? 2 : 1;   /* smooth: 扰动增广遍 */
+    for (uint32_t t = 0; t < n; t++) {
+        const float *yt = Yt ? Yt + (size_t)t * d : NULL;
+        double an = 0.0;
+        if (yt) { for (uint32_t j = 0; j < d; j++) an += (double)yt[j] * yt[j]; }
+        const double at = (wa > 0.0f && an > 0.0) ? 1.0 / an : 1.0;    /* align 行权 */
+        for (int aug = 0; aug < naug; aug++) {
+            const float *xr = X + (size_t)t * d;
+            if (aug) {
+                double ss = 0.0;
+                for (uint32_t j = 0; j < d; j++) ss += (double)xr[j] * xr[j];
+                ds4_loss_dither(zl->l4.seed, t, (float)(zl->l4.dscale * sqrt(ss / d)), dl, d);
+                for (uint32_t j = 0; j < d; j++) xp[j] = xr[j] + dl[j];
+                xr = xp;
+            }
+            const double roww = at * (aug ? (double)ws : 1.0);
+            for (uint32_t c = 0; c < k; c++) {         /* p = Vᵀx */
+                double a = 0.0;
+                for (uint32_t j = 0; j < din; j++) a += (double)xr[j] * zm->V[(size_t)j * k + c];
+                pv[c] = (float)a;
+            }
+            const float *rt = R + (size_t)t * d;
+            for (uint32_t c = 0; c < k; c++) {         /* 列 c 的加权基向量 = U[:,c]·p_c */
+                double bc = 0.0;
+                for (uint32_t j = 0; j < d; j++) {
+                    const double wj = 1.0 + (double)wc * ((double)w4[j] - 1.0);   /* classify 混权 */
+                    bc += wj * (double)zm->U[(size_t)j * k + c] * pv[c] * (aug ? 0.0 : (double)rt[j]);
+                }
+                b[c] += roww * bc;
+                for (uint32_t c2 = c; c2 < k; c2++) {
+                    double g2 = 0.0;
+                    for (uint32_t j = 0; j < d; j++) {
+                        const double wj = 1.0 + (double)wc * ((double)w4[j] - 1.0);
+                        g2 += wj * (double)zm->U[(size_t)j * k + c] * (double)zm->U[(size_t)j * k + c2];
+                    }
+                    g2 *= (double)pv[c] * pv[c2] * roww;
+                    G[(size_t)c * k + c2] += g2;
+                    if (c2 != c) G[(size_t)c2 * k + c] += g2;
+                }
+            }
+        }
+    }
+    double tr = 0.0;
+    for (uint32_t c = 0; c < k; c++) tr += G[(size_t)c * k + c];
+    tr = tr / k + 1e-30;
+    for (uint32_t c = 0; c < k; c++) G[(size_t)c * k + c] += (double)(wf > 0.0f ? wf : 1e-3f) * tr;
+    for (uint32_t c = 0; c < k; c++) {                 /* 高斯消元(部分主元) */
+        uint32_t piv = c;
+        for (uint32_t r2 = c + 1; r2 < k; r2++)
+            if (fabs(G[(size_t)r2 * k + c]) > fabs(G[(size_t)piv * k + c])) piv = r2;
+        if (piv != c) {
+            for (uint32_t j = 0; j < k; j++) {
+                double tmp = G[(size_t)c * k + j];
+                G[(size_t)c * k + j] = G[(size_t)piv * k + j];
+                G[(size_t)piv * k + j] = tmp;
+            }
+            double tb = b[c]; b[c] = b[piv]; b[piv] = tb;
+        }
+        const double dg = G[(size_t)c * k + c];
+        if (fabs(dg) < 1e-300) { free(G); free(b); free(pv); free(ub); free(xp); free(dl); return -1; }
+        for (uint32_t r2 = c + 1; r2 < k; r2++) {
+            const double f2 = G[(size_t)r2 * k + c] / dg;
+            if (f2 == 0.0) continue;
+            for (uint32_t j = c; j < k; j++) G[(size_t)r2 * k + j] -= f2 * G[(size_t)c * k + j];
+            b[r2] -= f2 * b[c];
+        }
+    }
+    for (int c = (int)k - 1; c >= 0; c--) {
+        double a = b[c];
+        for (uint32_t j = (uint32_t)c + 1; j < k; j++) a -= G[(size_t)c * k + j] * (double)ub[j];
+        ub[c] = (float)(a / G[(size_t)c * k + c]);
+    }
+    for (uint32_t c = 0; c < k; c++) zm->z[c] = ub[c];   /* z 就地更新(天然 LoRA 位) */
+    free(G); free(b); free(pv); free(ub); free(xp); free(dl);
+    return 0;
 }

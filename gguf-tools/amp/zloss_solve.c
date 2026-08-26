@@ -473,9 +473,9 @@ int main(int argc, char **argv) {
                L, won ? "选中" : "★全网格输裸=解算器有病, 停车审计★", won ? best.arm : "-",
                best.M, best.lam, best.k, la0, best.la, lc0, best.lc, tot0, best.tot,
                best.er * 100);
-        if (emitz && !selftest)          /* 冠军整体落地(zl.RRR/bf.GE, 四损失入档) */
-            emit_z_finish(emitz, L, &best, best.zkeep_hasge ? ge_dz : NULL,
-                          la0, lc0, tot0, &lw);
+        if (emitz && !selftest)          /* 冠军落地(zl.RRR/bf.GE + zl.4L 四损失参数) */
+            emit_z_finish(emitz, L, &best, best.zkeep_hasge ? ge_dz : NULL, la0, lc0,
+                          tot0, &lw, Yt, fit, nf, seed, (float)dscale);
         if (!won && !emitz) any_lost = 1;   /* 落地跑: 输裸层=记档不注入, 不停车 */
         if (selftest) {
             printf("★selftest: M=1 best align=%.4f  M=2 best align=%.4f\n",

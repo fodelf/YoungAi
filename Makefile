@@ -77,8 +77,8 @@ COMMON_FMT_OBJS := src/common/ds4_quantfmt.o
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal -framework Accelerate
 MM_OBJS = ds4_multimodal.o ds4_spatial.o ds4_css.o
-CORE_OBJS = $(CORE_ENGINE_OBJS) $(COMMON_FMT_OBJS) ds4_corr.o ds4_zchain.o ds4_z.o $(MM_OBJS) $(DIST_OBJS) $(METAL_OBJS)
-CPU_CORE_OBJS = $(CORE_ENGINE_CPU_OBJS) $(COMMON_FMT_OBJS) ds4_corr_cpu.o ds4_zchain.o ds4_z.o $(MM_OBJS) $(DIST_OBJS)
+CORE_OBJS = $(CORE_ENGINE_OBJS) $(COMMON_FMT_OBJS) ds4_corr.o ds4_zchain.o ds4_z.o ds4_loss.o $(MM_OBJS) $(DIST_OBJS) $(METAL_OBJS)
+CPU_CORE_OBJS = $(CORE_ENGINE_CPU_OBJS) $(COMMON_FMT_OBJS) ds4_corr_cpu.o ds4_zchain.o ds4_z.o ds4_loss.o $(MM_OBJS) $(DIST_OBJS)
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= /usr/local/cuda
@@ -92,8 +92,8 @@ endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread -I.
 CUDA_SPARK_FLAGS := -DDS4_CUDA_SPARK_HBM_CACHE=1
 MM_OBJS = ds4_multimodal.o ds4_spatial.o ds4_css.o
-CORE_OBJS = $(CORE_ENGINE_OBJS) $(COMMON_FMT_OBJS) ds4_corr.o ds4_zchain.o ds4_z.o $(MM_OBJS) $(DIST_OBJS) ds4_cuda.o
-CPU_CORE_OBJS = $(CORE_ENGINE_CPU_OBJS) $(COMMON_FMT_OBJS) ds4_corr_cpu.o ds4_zchain.o ds4_z.o $(MM_OBJS) $(DIST_OBJS)
+CORE_OBJS = $(CORE_ENGINE_OBJS) $(COMMON_FMT_OBJS) ds4_corr.o ds4_zchain.o ds4_z.o ds4_loss.o $(MM_OBJS) $(DIST_OBJS) ds4_cuda.o
+CPU_CORE_OBJS = $(CORE_ENGINE_CPU_OBJS) $(COMMON_FMT_OBJS) ds4_corr_cpu.o ds4_zchain.o ds4_z.o ds4_loss.o $(MM_OBJS) $(DIST_OBJS)
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 METAL_LDLIBS := $(LDLIBS)
 endif
@@ -364,9 +364,9 @@ endif
 # src/common 共享格式库单测: 无模型/无 GPU, 纯主机 C。夹具路径相对仓库根。
 ds4_unit: tests/unit/test_common.c tests/unit/test_zmod.c src/common/ds4_quantfmt.c src/common/ds4_gguf.c \
           src/common/ds4_quantfmt.h src/common/ds4_gguf.h src/common/ds4_float.h src/common/ds4_fp8.h \
-          ds4_z.c ds4_z.h ds4_zchain.c ds4_zchain.h
+          ds4_z.c ds4_z.h ds4_zchain.c ds4_zchain.h ds4_loss.c ds4_loss.h
 	$(CC) $(CFLAGS) -Isrc/common -I. -o $@ tests/unit/test_common.c tests/unit/test_zmod.c \
-	    src/common/ds4_quantfmt.c src/common/ds4_gguf.c ds4_z.c ds4_zchain.c $(LDLIBS)
+	    src/common/ds4_quantfmt.c src/common/ds4_gguf.c ds4_z.c ds4_zchain.c ds4_loss.c $(LDLIBS)
 
 test: ds4_test ds4-eval ds4_unit linecount
 	./ds4_unit

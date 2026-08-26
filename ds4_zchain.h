@@ -58,7 +58,20 @@ typedef struct {
     const uint16_t *zlm;    /* fp16 z[k] | U[d_model*k] | V[zdin*k] */
     ds4_z          *zmod;   /* din==d_model 的线性 z: 载入时转 f32, apply 走 ds4_z 模块
                              * (与反修解算器同一份实现); din=3d ftA 走下方 fp16 旧路 */
+    const float    *w4norm; /* 同层 zl.4L 的归一 classify 权(载入后链接); NULL=平权范数 */
 } ds4_zchain_zl;
+
+/* type10 zl.4L(2026-08-26 用户架构定案): 四损失参数文件 — 放大器产/引擎耗, 双用:
+ * ①前向调制: classify 权向量进 z 信任域范数(重要维度说了算的夹持, w4norm 挂到 zl);
+ * ②引擎内调 z 的尺: ds4_zchain_posttrain_z 按四权重解 z 对角(z=天然 LoRA 位)。 */
+typedef struct {
+    float           w[4];    /* w_align, w_classify, w_smooth, w_fixed */
+    uint64_t        seed;    /* dither 种子(L_smooth) */
+    float           dscale;  /* dither 尺度 */
+    uint32_t        d;       /* wcls 维数(=d_model) */
+    const uint16_t *wcls;    /* fp16 per-dim classify 权(教师 fit 侧方差), mmap 别名 */
+    float          *wnorm;   /* 载入归一 f32(均值=1); NULL=层无 4L */
+} ds4_zchain_4l;
 
 typedef struct {
     ds4_zchain_op *ops;     /* chain in record order (types 1..4 only) */
@@ -68,6 +81,7 @@ typedef struct {
     ds4_zchain_zl  rte;     /* 路由闭式侧车(type8 zl.RTE, 2026-08-19): 结构同构复用,
                              * 语义 δlogits = U·tanh(Vᵀx/s) 加在 router raw logits 上
                              * (select 前)。zdin=d_model, U 行数=n_expert(非 d_model)。 */
+    ds4_zchain_4l  l4;      /* type10 zl.4L 四损失参数(wnorm==NULL 时缺席) */
 } ds4_zchain_layer;
 
 typedef struct ds4_zchain {
@@ -106,5 +120,13 @@ static inline const ds4_zchain_zl *ds4_zchain_layer_rte(const ds4_zchain *z, uin
 /* Host-side frozen z^L apply: routed += clip * U diag(z) V^T x (contract above).
  * routed = the token's post-λ routed sum, modified in place. */
 void ds4_zchain_zl_apply(const ds4_zchain_zl *zl, uint32_t d_model, const float *x, float *routed);
+
+
+/* ★引擎内调 z(用户架构②, 2026-08-26)★: 按该层 zl.4L 的四权, 用参考批 (X, R, Yt)
+ * 闭式重解 z 对角(U/V 冻结, z=天然 LoRA 位)。R=教师−底座 routed, Yt=教师输出
+ * (供 align 行权 1/‖Yt‖²)。行=align 加权, 维=align+classify 混权, smooth=固定种子
+ * dither 增广行, fixed=λ 岭。只支持线性 z(zmod 在); 成功返回 0, 无 z/无 4L 返 -1。 */
+int ds4_zchain_posttrain_z(struct ds4_zchain *z, uint32_t layer,
+                           const float *X, const float *R, const float *Yt, uint32_t n);
 
 #endif /* DS4_ZCHAIN_H */
