@@ -433,10 +433,10 @@ int main(int argc, char **argv) {
             XP = build_phi(X, ntok);
             tphi = tnow();
             run_map_arm("ftA", XP, 3 * D, NULL, (float)trclamp, R, R, X, Ys, Yt_ev, wv,
-                        NULL, fit, nf, ev, mode0, nev, ranks, nrank, lambdas, nlam, maxk,
+                        NULL, NULL, fit, nf, ev, mode0, nev, ranks, nrank, lambdas, nlam, maxk,
                         &lw, dscale, seed, nth, L, lf, &best, Yhat, Cb, Cp, zcat);
             run_map_arm("GE+ftA", XP, 3 * D, gecorr, (float)trclamp, Rge, R, X, Ys, Yt_ev,
-                        wv, NULL, fit, nf, ev, mode0, nev, ranks, nrank, lambdas, nlam,
+                        wv, NULL, NULL, fit, nf, ev, mode0, nev, ranks, nrank, lambdas, nlam,
                         maxk, &lw, dscale, seed, nth, L, lf, &best, Yhat, Cb, Cp, zcat);
             float *wvf = xmalloc(D * sizeof(float));     /* 权取 fit 侧教师方差, 防 held 泄漏 */
             float *swts = xmalloc(D * sizeof(float));
@@ -451,9 +451,13 @@ int main(int argc, char **argv) {
                 for (int j = 0; j < D; j++) swts[j] = sqrtf((wvf[j] + (float)(1e-6 * mw)) / (float)mw);
             }
             run_map_arm("ftAw", XP, 3 * D, gecorr, (float)trclamp, Rge, R, X, Ys, Yt_ev,
-                        wv, swts, fit, nf, ev, mode0, nev, ranks, nrank, lambdas, nlam,
+                        wv, swts, NULL, fit, nf, ev, mode0, nev, ranks, nrank, lambdas, nlam,
                         maxk, &lw, dscale, seed, nth, L, lf, &best, Yhat, Cb, Cp, zcat);
             free(wvf); free(swts);
+            /* ★4L 臂(用户设计: 四损失进解算目标, ds4_z 机器原样)★ */
+            run_4l_arm(X, R, Ys, Yt, Yt_ev, wv, fit, nf, ev, mode0, nev, ntok,
+                       ranks, nrank, lambdas, nlam, maxk, &lw, dscale, (float)trclamp,
+                       seed, nth, L, lf, &best, Yhat, Cb, Cp, zcat);
         }
         tfta = tnow();
         fprintf(stderr, "  [t]L%d 数据%.1f GE%.1f x臂%.1f φ%.1f ftA%.1f 层计%.1fs\n",

@@ -208,6 +208,7 @@ static void run_map_arm(const char *arm, const float *XF, int din, const float *
                         float tr, const float *Reff, const float *R, const float *X,
                         const float *Ys, const float *Yt_ev, const float *wv,
                         const float *swts, /* 感知加权解算: 靶按 √cls权 白化, NULL=关 */
+                        const float *roww, /* 行权(align: 1/‖Yt‖ 方向平权), NULL=关 */
                         const int *fit, int nf, const int *ev, const int *mode0, int nev,
                         const int *ranks, int nrank, const double *lambdas, int nlam,
                         int maxk, const ds4_loss_weights *lw, double dscale,
@@ -216,11 +217,13 @@ static void run_map_arm(const char *arm, const float *XF, int din, const float *
     float *Xm = xmalloc((size_t)nf * din * sizeof(float));
     float *Rm = xmalloc((size_t)nf * D * sizeof(float));
     for (int i = 0; i < nf; i++) {
-        memcpy(Xm + (size_t)i * din, XF + (size_t)fit[i] * din, (size_t)din * sizeof(float));
+        float w2r = roww ? roww[fit[i]] : 1.0f;   /* 线性图: 行权=同乘特征与靶 */
+        float *xd = Xm + (size_t)i * din;
+        memcpy(xd, XF + (size_t)fit[i] * din, (size_t)din * sizeof(float));
+        if (roww) for (int j = 0; j < din; j++) xd[j] *= w2r;
         const float *rs = Reff + (size_t)fit[i] * D;
         float *rd = Rm + (size_t)i * D;
-        if (swts) for (int j = 0; j < D; j++) rd[j] = rs[j] * swts[j];
-        else memcpy(rd, rs, D * sizeof(float));
+        for (int j = 0; j < D; j++) rd[j] = rs[j] * w2r * (swts ? swts[j] : 1.0f);
     }
     int nfa = nf;
     if (g_smooth_aug) {   /* L_smooth 进解算目标: 同靶扰动增广行(逼 M(x+δ)≈M(x)),
@@ -237,6 +240,8 @@ static void run_map_arm(const char *arm, const float *XF, int din, const float *
             float *o = Xm + (size_t)(nf + i) * din;
             if (din == 3 * D) mk_phi(xp, o);
             else memcpy(o, xp, D * sizeof(float));
+            if (roww) { float w2r = roww[fit[i]];
+                for (int j = 0; j < din; j++) o[j] *= w2r; }
             memcpy(Rm + (size_t)(nf + i) * D, Rm + (size_t)i * D, D * sizeof(float));
         }
         free(dl); free(xp);
@@ -400,24 +405,7 @@ static void zcache_load(const char *dir, int L, int ntok, float **R_out, float *
     *R_out = R; *Ys_out = Ys;
 }
 
-/* cls 方差权²(fit 侧教师方差归一, ftAw/量化侧 DS4_TUNE 同精神; held 不参与=防泄漏) */
-static float *mk_sw2_fit(const float *R, const float *Ys, const int *fit, int nf) {
-    float *Ytf = xmalloc((size_t)nf * D * sizeof(float));
-    for (int i = 0; i < nf; i++) {
-        const float *ys = Ys + (size_t)fit[i] * D, *r = R + (size_t)fit[i] * D;
-        float *o = Ytf + (size_t)i * D;
-        for (int j = 0; j < D; j++) o[j] = ys[j] + r[j];
-    }
-    float *wvf = xmalloc(D * sizeof(float));
-    ds4_loss_dim_variance(Ytf, (uint32_t)nf, D, wvf);
-    free(Ytf);
-    double mw = 0; for (int j = 0; j < D; j++) mw += wvf[j];
-    mw = mw / D + 1e-30;
-    float *sw2 = xmalloc(D * sizeof(float));
-    for (int j = 0; j < D; j++) sw2[j] = (float)((wvf[j] + 1e-6 * mw) / mw);
-    free(wvf);
-    return sw2;
-}
+static float *mk_sw2_fit(const float *R, const float *Ys, const int *fit, int nf);
 
 /* 基修正臂组: GE → 乘性出口 → GE+乘性; 产出 gecorr 与 Rge(=R−GE, ftA 叠加臂复用) */
 static void run_base_arms(const zpairs *zp, const float *X, const float *R,

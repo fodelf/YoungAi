@@ -312,3 +312,55 @@ static void run_pez_arm(const zpairs *zp, const float *X, const float *R, const 
     ds4_z_free(sv1); free(isfit); free(rs); free(ord);
     fprintf(stderr, "  [pez]L%d 每专家低秩 z 收官 %.0fs\n", L, tnow() - t0);
 }
+
+/* cls 方差权²(fit 侧教师方差归一, ftAw/量化侧 DS4_TUNE 同精神; held 不参与=防泄漏) */
+static float *mk_sw2_fit(const float *R, const float *Ys, const int *fit, int nf) {
+    float *Ytf = xmalloc((size_t)nf * D * sizeof(float));
+    for (int i = 0; i < nf; i++) {
+        const float *ys = Ys + (size_t)fit[i] * D, *r = R + (size_t)fit[i] * D;
+        float *o = Ytf + (size_t)i * D;
+        for (int j = 0; j < D; j++) o[j] = ys[j] + r[j];
+    }
+    float *wvf = xmalloc(D * sizeof(float));
+    ds4_loss_dim_variance(Ytf, (uint32_t)nf, D, wvf);
+    free(Ytf);
+    double mw = 0; for (int j = 0; j < D; j++) mw += wvf[j];
+    mw = mw / D + 1e-30;
+    float *sw2 = xmalloc(D * sizeof(float));
+    for (int j = 0; j < D; j++) sw2[j] = (float)((wvf[j] + 1e-6 * mw) / mw);
+    free(wvf);
+    return sw2;
+}
+
+
+/* ★4L 臂(用户设计: 四损失全部进解算目标, 机器=ds4_z 原样)★
+ * align   → 行权 1/‖Yt_t‖(方向对齐, token 平权 — 能量口径的"修残差"按范数分配容量,
+ *           大范数行霸占解, 这正是用户判"修残差挖不到"的病灶);
+ * classify→ 列 √方差白化(解在白化空间, run_map_arm 内 U 行回真空间);
+ * smooth  → --smooth-aug 扰动增广行(调用方开);
+ * fixed   → λ 网格(量纲化 ridge)。 */
+static void run_4l_arm(const float *X, const float *R, const float *Ys, const float *Yt,
+                       const float *Yt_ev, const float *wv, const int *fit, int nf,
+                       const int *ev, const int *mode0, int nev, int ntok,
+                       const int *ranks, int nrank, const double *lambdas, int nlam,
+                       int maxk, const ds4_loss_weights *lw, double dscale, float tr,
+                       uint64_t seed, int nth, int L, FILE *lf, best_t *best,
+                       float *Yhat, float *Cb, float *Cp, float *zcat) {
+    float *sw2 = mk_sw2_fit(R, Ys, fit, nf);
+    float *swts = xmalloc(D * sizeof(float));
+    for (int j = 0; j < D; j++) swts[j] = sqrtf(sw2[j]);
+    float *ralign = xmalloc((size_t)ntok * sizeof(float));
+    double mrw = 0;
+    for (int t = 0; t < ntok; t++) {
+        const float *yt = Yt + (size_t)t * D;
+        double nn = 0; for (int j = 0; j < D; j++) nn += (double)yt[j] * yt[j];
+        ralign[t] = (float)(1.0 / (sqrt(nn) + 1e-9));
+        mrw += ralign[t];
+    }
+    mrw /= ntok;   /* 行权均值归一: λ 量纲与非加权臂可比 */
+    for (int t = 0; t < ntok; t++) ralign[t] /= (float)mrw;
+    run_map_arm("4L", X, D, NULL, tr, R, R, X, Ys, Yt_ev, wv, swts, ralign,
+                fit, nf, ev, mode0, nev, ranks, nrank, lambdas, nlam, maxk,
+                lw, dscale, seed, nth, L, lf, best, Yhat, Cb, Cp, zcat);
+    free(sw2); free(swts); free(ralign);
+}
