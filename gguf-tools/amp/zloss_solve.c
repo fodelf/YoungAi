@@ -315,7 +315,7 @@ int main(int argc, char **argv) {
         memset(mode0, 0, (size_t)nev * sizeof(int));
         float *gecorr = NULL, *Rge = NULL, *XP = NULL;
         uint8_t *isfit = NULL;
-        float ge_dz[256] = {0};          /* 基 GE δ(emit-z 组合臂的 bf.GE 基) */
+        float ge_dz[256] = {0}; int ge_wins = 0;   /* GE δ 与"GE 独立赢裸"标记(解耦落地判据) */
         if (emitge && !selftest) {       /* GE-only 端到端注入路: 解算→闸→bf.GE, 跳过全网格 */
             run_emit_ge(emitge, L, &zp, X, R, Ys, Yt_ev, wv, fit, nf, ev, mode0, nev,
                         ntok, &lw, dscale, seed, nth, lf, la0, lc0, tot0, Yhat, Cb, Cp);
@@ -328,7 +328,7 @@ int main(int argc, char **argv) {
         if (!selftest) {  /* 基修正臂组 + 语境门 GEc(段漂移对策: δ_e(c)) */
             run_base_arms(&zp, X, R, Ys, Yt_ev, wv, fit, nf, ev, mode0, nev, ntok,
                           &lw, dscale, seed, nth, L, lf, &best, Yhat, Cb, Cp,
-                          &gecorr, &Rge, &isfit, ge_dz);
+                          &gecorr, &Rge, &isfit, ge_dz, &ge_wins);
             const int cm = 4;
             float *ctx = ctx_build(X, ntok, cm, isfit, L);
             double *thd = xmalloc((size_t)256 * (1 + cm) * sizeof(double));
@@ -478,8 +478,8 @@ int main(int argc, char **argv) {
             z_fp16_recheck(&best, best.zkeep_hasge ? gecorr : NULL, X, Ys, R, Yt_ev,
                            wv, ev, mode0, nev, dscale, seed, nth, L, lf);
         if (emitz && !selftest)          /* 冠军落地(zl.RRR/bf.GE + zl.4L 四损失参数) */
-            emit_z_finish(emitz, L, &best, best.zkeep_hasge ? ge_dz : NULL, la0, lc0,
-                          tot0, &lw, Yt, fit, nf, seed, (float)dscale);
+            emit_z_finish(emitz, L, &best, ge_dz, la0, lc0,
+                          tot0, &lw, Yt, fit, nf, seed, (float)dscale, ge_wins);
         if (!won && !emitz) any_lost = 1;   /* 落地跑: 输裸层=记档不注入, 不停车 */
         if (selftest) {
             printf("★selftest: M=1 best align=%.4f  M=2 best align=%.4f\n",

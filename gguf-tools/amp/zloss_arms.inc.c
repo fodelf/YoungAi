@@ -417,7 +417,7 @@ static void run_base_arms(const zpairs *zp, const float *X, const float *R,
                           uint64_t seed, int nth, int L, FILE *lf, best_t *best,
                           float *Yhat, float *Cb, float *Cp,
                           float **gecorr_out, float **Rge_out, uint8_t **isfit_out,
-                          float *dz_out) {
+                          float *dz_out, int *ge_wins_out) {
     uint8_t *isfit = xmalloc((size_t)ntok);
     memset(isfit, 0, (size_t)ntok);
     for (int i = 0; i < nf; i++) isfit[fit[i]] = 1;
@@ -426,8 +426,10 @@ static void run_base_arms(const zpairs *zp, const float *X, const float *R,
     float *gecorr = ge_corr_build(zp, delta, ntok);
     for (int e = 0; e < 256; e++) dzf[e] = (float)delta[e];
     if (dz_out) memcpy(dz_out, dzf, 256 * sizeof(float));
+    double tot_before_ge = best->tot;
     run_bc_arm("GE", dzf, 256, gecorr, X, Ys, Yt_ev, wv, R, ev, mode0, nev,
                lw, dscale, seed, nth, L, lf, best, Yhat, Cb, Cp);
+    if (ge_wins_out) *ge_wins_out = (best->tot < tot_before_ge);   /* GE 独立赢裸 */
     {   /* GEw 臂: cls 方差权(fit 侧教师, 防 held 泄漏)白化进 GE 解算目标 —— 四损失
          * L_classify 从裁判升级为目标组件(用户令); 评估仍在真空间, 四损失总分裁决。 */
         float *sw2 = mk_sw2_fit(R, Ys, fit, nf);

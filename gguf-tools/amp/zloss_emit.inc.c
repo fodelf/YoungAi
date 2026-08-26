@@ -172,7 +172,7 @@ static void run_emit_ge(const char *ldir, int L, const zpairs *zp, const float *
 static void emit_z_finish(const char *ldir, int L, best_t *best, const float *ge_dz,
                           float la0, float lc0, float tot0, const ds4_loss_weights *lw,
                           const float *Yt, const int *fit, int nf,
-                          uint64_t seed, float dscale) {
+                          uint64_t seed, float dscale, int ge_wins) {
     float *wclsf = xmalloc(D * sizeof(float));   /* fit 侧教师 per-dim 方差(引擎 classify 权) */
     {
         float *Ytf = xmalloc((size_t)nf * D * sizeof(float));
@@ -182,15 +182,23 @@ static void emit_z_finish(const char *ldir, int L, best_t *best, const float *ge
         free(Ytf);
     }
     const char *action;
+    /* ★GE 与 z 解耦(2026-08-26 用户令"打日志找"定位的真 bug)★
+     * 原实现把冠军臂当单选: 纯 z 臂(ftA/4L)在校准 held 上险胜 GE+z 时, 整层 GE 被丢掉。
+     * 实测代价: z4l 只剩 GE=25 层(GE-only 战役是 39 层), 端到端 0.43750 反输 GE-only
+     * 0.43164。GE 是每专家标量门(512B/层, 跨语料最稳、端到端兑现最好), z 是低秩隐变量
+     * ——两者修的是不同部分, 本就该并存。此后: GE 赢裸即落, z 另外叠加。 */
+    const int ge_solo = (ge_dz && !best->zkeep_hasge && ge_wins);
     if (!best->arm || best->tot >= tot0) action = "输裸不注入";
     else if (best->zkeep) {
         uint8_t *recs = NULL; size_t len = 0; int nrec = 0;
-        if (best->zkeep_hasge && ge_dz) { recs = rec_ge(recs, &len, ge_dz); nrec++; }
+        const int with_ge = (best->zkeep_hasge || ge_solo) && ge_dz;
+        if (with_ge) { recs = rec_ge(recs, &len, ge_dz); nrec++; }
         recs = rec_rrr(recs, &len, best->zkeep); nrec++;
         recs = rec_4l(recs, &len, lw, seed, dscale, wclsf, D); nrec++;   /* 四损失参数随 z 落地 */
         inject_recs(ldir, L, recs, len, nrec);
         free(recs);
-        action = best->zkeep_hasge ? "注入bf.GE+zl.RRR" : "注入zl.RRR";
+        action = with_ge ? (best->zkeep_hasge ? "注入bf.GE+zl.RRR" : "注入bf.GE(解耦)+zl.RRR")
+                         : "注入zl.RRR";
         printf("★L%d emit-z: %s k=%u din=%u → %s (%.2fMB)\n", L, best->arm,
                best->zkeep->k, best->zkeep->d_in, action, len / 1048576.0);
     } else if (best->bckind == 1) {
