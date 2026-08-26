@@ -34,8 +34,10 @@ static float *dynz_phi(const float *X, int ntok, const float *V, const float *A,
 #endif
     for (size_t i = 0; i < (size_t)ntok * k; i++) {
         int c = (int)(i % k);
-        p1[i] = gate2 ? tanhf(p1[i] / sv[c]) * tanhf(p2[i] / sa[c])
-                      : tanhf(p1[i] / sv[c]);      /* 单门变体: 实现自检对照 */
+        float a = p1[i] / sv[c], b = p2[i] / sa[c];
+        /* 0=单门 tanh(a)  1=双门 tanh(a)·tanh(b)  2=线性×门 a·tanh(b):
+         * 门饱和→±线性 ⇒ 下界=静态线性臂(L10 自检: tanh 压扁大幅值投影=丢巨值矿) */
+        p1[i] = gate2 == 1 ? tanhf(a) * tanhf(b) : gate2 == 2 ? a * tanhf(b) : tanhf(a);
     }
     free(p2);
     return p1;                                     /* p1 即 Φ */
@@ -117,7 +119,7 @@ static void run_dynz_arm(const float *X, const float *R, const float *Ys,
             memcpy(Vk + (size_t)j * k, s1->V + (size_t)j * s1->rank, (size_t)k * sizeof(float));
             memcpy(Ak + (size_t)j * k, s2->V + (size_t)j * s2->rank, (size_t)k * sizeof(float));
         }
-        for (int gate2 = 0; gate2 <= 1; gate2++) {
+        for (int gate2 = 0; gate2 <= 2; gate2++) {
         float *Phi = dynz_phi(X, ntok, Vk, Ak, sv, sa, k, gate2);   /* 全行(fit 解, held 判) */
         double *G = xmalloc((size_t)k * k * sizeof(double));    /* Gram=ΦfᵀΦf */
         double *B = xmalloc((size_t)k * D * sizeof(double));    /* ΦfᵀR */
@@ -164,9 +166,10 @@ static void run_dynz_arm(const float *X, const float *R, const float *Ys,
                 for (int j = 0; j < D; j++) { double e = (double)r[j] - c2[j];
                     fn2 += e * e; fd2 += (double)r[j] * r[j]; }
             }
-            run_bc_arm(gate2 ? "dynz" : "dyn1", Uf2, k * D, corr, X, Ys, Yt_ev, wv,
+            const char *anm = gate2 == 1 ? "dynz" : gate2 == 2 ? "dynL" : "dyn1";
+            run_bc_arm(anm, Uf2, k * D, corr, X, Ys, Yt_ev, wv,
                        R, ev, mode0, nev, lw, dscale, seed, nth, L, lf, best, Yhat, Cb, Cp);
-            printf("    ↑%s k=%d λ=%.3g fitER=%.1f%% vol=%.1fMB\n", gate2 ? "dynz" : "dyn1",
+            printf("    ↑%s k=%d λ=%.3g fitER=%.1f%% vol=%.1fMB\n", anm,
                    k, lambdas[li], 100.0 * (1.0 - fn2 / (fd2 + 1e-30)),
                    (double)k * (gate2 ? 3 : 2) * D * 2 / 1e6);
             free(Uf2); free(corr); free(Gs); free(Us);
