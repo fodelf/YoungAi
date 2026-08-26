@@ -143,6 +143,7 @@ static void *expert_worker(void*arg){
         free(e1);free(e3);free(e2);
     }
     free(toks);free(wwv);free(xs); if(Xc)free(Xc);
+    dq_gpu_thread_release();   /* 每层新建线程: __thread CUDA 资源不释放=逐层泄漏(32k 实锤) */
     return NULL;
 }
 

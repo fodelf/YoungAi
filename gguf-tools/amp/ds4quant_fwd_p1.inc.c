@@ -116,7 +116,22 @@ static int dq_dbuf_need(dq_dbuf *b, size_t n) {
     if (cudaMalloc((void **)&b->p, n * sizeof(float)) != cudaSuccess) { b->p = NULL; return 0; }
     b->n = n; return 1;
 }
+static __thread cublasHandle_t g_dqh = NULL;
+static __thread cudaStream_t g_dqs = NULL;
+static __thread dq_dbuf dX = {0, 0}, dW = {0, 0}, dO = {0, 0};
 #endif
+/* ★退出前必须调用(每层新建的专家 worker 线程)★: __thread CUDA 资源(句柄/流/显存暂存)
+ * 随线程退出不自动释放 — 32k 锚实锤 ~2-3GB/层泄漏, L11 处 available 118→10G,
+ * 杀进程后全量回收。非 CUDA 构建为空操作。 */
+static void dq_gpu_thread_release(void) {
+#ifdef DS4QUANT_CUDA
+    if (dX.p) { cudaFree(dX.p); dX.p = NULL; dX.n = 0; }
+    if (dW.p) { cudaFree(dW.p); dW.p = NULL; dW.n = 0; }
+    if (dO.p) { cudaFree(dO.p); dO.p = NULL; dO.n = 0; }
+    if (g_dqh) { cublasDestroy(g_dqh); g_dqh = NULL; }
+    if (g_dqs) { cudaStreamDestroy(g_dqs); g_dqs = NULL; }
+#endif
+}
 /* strided 版(08-18 attention GPU 化): C[S,M]=A[S,K](lda)·B[M,K](ldb)^T, 行主序任意行距 */
 void dq_matmul_strided(const float *A, int lda, const float *B, int ldb,
                        float *Cst, int ldc, int S, int K, int M, float alpha) {
@@ -192,8 +207,6 @@ void dq_matmul(const float *X, const float *W, float *out, int S, int K, int M) 
      * (259s vs 181s/层): 20 线程高频小 GEMM 并发提交, launch+sync 队列争用吃掉全部收益。
      * 高频小矩阵的正确姿势是批量结构改造(GPTQ 段 GPU 常驻), 不是逐调用换后端。 */
     if ((double)S * K * (double)M * 2.0 >= 2.0e8) {
-        static __thread cublasHandle_t g_dqh = NULL;
-        static __thread cudaStream_t g_dqs = NULL;
         if (!g_dqh) {
             if (cublasCreate(&g_dqh) != CUBLAS_STATUS_SUCCESS) g_dqh = NULL;
             else { cudaStreamCreateWithFlags(&g_dqs, cudaStreamNonBlocking); cublasSetStream(g_dqh, g_dqs); }
@@ -202,8 +215,8 @@ void dq_matmul(const float *X, const float *W, float *out, int S, int K, int M) 
          * 专家 GEMM 每次换一块 33.5MB 的新反量化权重: 留在主机靠 ATS 直访 = 页粒度搬运,
          * 实测等效 3.2 GB/s, 每层 25.7GB ⇒ ~8s。这里 X/W/out 全是连续的(无行距),
          * 一次 cudaMemcpy 批量搬即可, 不会退化成跨步 DMA(那是 attention 那条路的坑,
-         * 它已改走 vqg_attention 整层驻留)。暂存 per-thread 复用, 按需增长。 */
-        static __thread dq_dbuf dX = {0, 0}, dW = {0, 0}, dO = {0, 0};
+         * 它已改走 vqg_attention 整层驻留)。暂存 per-thread 复用, 按需增长;
+         * ★退出线程必须 dq_gpu_thread_release(2026-08-26 泄漏实锤见下)★ */
         if (g_dqh && dq_dbuf_need(&dX, (size_t)S * K) && dq_dbuf_need(&dW, (size_t)M * K)
                   && dq_dbuf_need(&dO, (size_t)S * M)) {
             const float one = 1.0f, zero = 0.0f;
