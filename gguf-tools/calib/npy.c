@@ -269,7 +269,9 @@ static uint16_t npz_rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8
 static uint32_t npz_rd32(const uint8_t *p) {
     return p[0] | (p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
-int npz_get(const uint8_t *buf, int64_t sz, const char *name, npz_arr *out) {
+/* 内部: 定位条目, 返回数据指针与 dtype/形状(零拷贝); f64/f32 出口共用 */
+static int npz_locate(const uint8_t *buf, int64_t sz, const char *name,
+                      const uint8_t **data_out, char dt[8], int64_t *d0_out, int64_t *d1_out) {
     char want[128]; snprintf(want, sizeof want, "%s.npy", name);
     int64_t off = 0;
     while (off + 30 <= sz) {
@@ -294,8 +296,7 @@ int npz_get(const uint8_t *buf, int64_t sz, const char *name, npz_arr *out) {
             int maj = p[6];
             uint32_t hl = maj >= 2 ? npz_rd32(p + 8) : npz_rd16(p + 8);
             const char *hdr = (const char *)p + (maj >= 2 ? 12 : 10);
-            const uint8_t *data = p + (maj >= 2 ? 12 : 10) + hl;
-            char dt[8] = {0};
+            memset(dt, 0, 8);
             { const char *q = strstr(hdr, "'descr':"); if (!q) return -1;
               q = strchr(q + 8, '\'');                        /* 跳过键, 值起始引号 */
               const char *e = strchr(q + 1, '\'');
@@ -310,21 +311,45 @@ int npz_get(const uint8_t *buf, int64_t sz, const char *name, npz_arr *out) {
                   if (nd == 0) d0 = v; else if (nd == 1) d1 = v;
                   nd++;
               } }
-            int64_t n = d0 * d1;
-            double *v = malloc((size_t)n * 8);
-            if (!v) return -1;
-            if (!strcmp(dt, "<f4")) { const float *s = (const float *)data; for (int64_t i = 0; i < n; i++) v[i] = s[i]; }
-            else if (!strcmp(dt, "<f8")) memcpy(v, data, (size_t)n * 8);
-            else if (!strcmp(dt, "<f2")) { const uint16_t *s = (const uint16_t *)data; for (int64_t i = 0; i < n; i++) v[i] = (double)npy_half_to_float(s[i]); }
-            else if (!strcmp(dt, "<i4")) { const int32_t *s = (const int32_t *)data; for (int64_t i = 0; i < n; i++) v[i] = s[i]; }
-            else if (!strcmp(dt, "<i8")) { const int64_t *s = (const int64_t *)data; for (int64_t i = 0; i < n; i++) v[i] = (double)s[i]; }
-            else { fprintf(stderr, "npz %s: dtype %s 不支持\n", name, dt); free(v); return -1; }
-            out->v = v; out->n = n; out->d0 = d0; out->d1 = nd > 1 ? d1 : 1;
+            *data_out = p + (maj >= 2 ? 12 : 10) + hl;
+            *d0_out = d0; *d1_out = nd > 1 ? d1 : 1;
             return 0;
         }
         off = pay + csz;
     }
     return -1;
+}
+int npz_get(const uint8_t *buf, int64_t sz, const char *name, npz_arr *out) {
+    const uint8_t *data; char dt[8]; int64_t d0, d1;
+    if (npz_locate(buf, sz, name, &data, dt, &d0, &d1)) return -1;
+    int64_t n = d0 * d1;
+    double *v = malloc((size_t)n * 8);
+    if (!v) return -1;
+    if (!strcmp(dt, "<f4")) { const float *s = (const float *)data; for (int64_t i = 0; i < n; i++) v[i] = s[i]; }
+    else if (!strcmp(dt, "<f8")) memcpy(v, data, (size_t)n * 8);
+    else if (!strcmp(dt, "<f2")) { const uint16_t *s = (const uint16_t *)data; for (int64_t i = 0; i < n; i++) v[i] = (double)npy_half_to_float(s[i]); }
+    else if (!strcmp(dt, "<i4")) { const int32_t *s = (const int32_t *)data; for (int64_t i = 0; i < n; i++) v[i] = s[i]; }
+    else if (!strcmp(dt, "<i8")) { const int64_t *s = (const int64_t *)data; for (int64_t i = 0; i < n; i++) v[i] = (double)s[i]; }
+    else { fprintf(stderr, "npz %s: dtype %s 不支持\n", name, dt); free(v); return -1; }
+    out->v = v; out->n = n; out->d0 = d0; out->d1 = d1;
+    return 0;
+}
+/* f32 直读(2026-08-26 提速: 大条目绕开 f64 中转的 2× 内存搬运) */
+int npz_get_f32(const uint8_t *buf, int64_t sz, const char *name,
+                float **v_out, int64_t *d0_out, int64_t *d1_out) {
+    const uint8_t *data; char dt[8]; int64_t d0, d1;
+    if (npz_locate(buf, sz, name, &data, dt, &d0, &d1)) return -1;
+    int64_t n = d0 * d1;
+    float *v = malloc((size_t)n * 4);
+    if (!v) return -1;
+    if (!strcmp(dt, "<f4")) memcpy(v, data, (size_t)n * 4);
+    else if (!strcmp(dt, "<f8")) { const double *s = (const double *)data; for (int64_t i = 0; i < n; i++) v[i] = (float)s[i]; }
+    else if (!strcmp(dt, "<f2")) { const uint16_t *s = (const uint16_t *)data; for (int64_t i = 0; i < n; i++) v[i] = npy_half_to_float(s[i]); }
+    else if (!strcmp(dt, "<i4")) { const int32_t *s = (const int32_t *)data; for (int64_t i = 0; i < n; i++) v[i] = (float)s[i]; }
+    else if (!strcmp(dt, "<i8")) { const int64_t *s = (const int64_t *)data; for (int64_t i = 0; i < n; i++) v[i] = (float)s[i]; }
+    else { fprintf(stderr, "npz %s: dtype %s 不支持\n", name, dt); free(v); return -1; }
+    *v_out = v; *d0_out = d0; *d1_out = d1;
+    return 0;
 }
 
 #ifdef NPY_TEST

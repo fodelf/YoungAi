@@ -28,6 +28,7 @@
  * 全 CLI 参数, 无环境变量(铁律)。
  */
 #define _FILE_OFFSET_BITS 64
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -44,6 +45,10 @@
 #define MAXG 8                          /* λ/k/M 网格上限 */
 #define MAXM 32                         /* 单档模式数上限 */
 
+static double tnow(void) {              /* 相位计时(提速轮的肥肉探测器) */
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+}
 static void die(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     fprintf(stderr, "zloss_solve Error: "); vfprintf(stderr, fmt, ap);
@@ -77,7 +82,7 @@ static int *parse_ranges(const char *s, int *n_out) {   /* "a:b,c:d" 左闭右�
     *n_out = n; return v;
 }
 
-#include "zloss_solve_p1.inc.c"         /* 唯一物理分片(金标+GE/ftA 臂+模式发现) */
+#include "zloss_solve_p1.inc.c"         /* 唯一物理分片(金标+臂+模式发现+zcache读取) */
 
 /* ---- 锚读取(DQA2, 与 zlayer anchor_layer 同格式): fin + top-1 专家(路由门用,
  * rw 最大槽位; 部署时路由先于专家计算, 是免费可得的信号) ---- */
@@ -115,50 +120,6 @@ static float *anchor_load(const char *ap, int L, int ntok, int **top1_out) {
     *top1_out = top1; return fin;
 }
 
-/* ---- zcache 读取: R=dH, Ys=Σ pw·pYQ(自洽重建, 不掺 teacher_routed 的约定差) ---- */
-static void zcache_load(const char *dir, int L, int ntok, float **R_out, float **Ys_out,
-                        zpairs *zp) {
-    char p[1024]; snprintf(p, sizeof p, "%s/zcache_L%02d.npz", dir, L);
-    FILE *f = fopen(p, "rb");
-    if (!f) die("%s 打不开(先 DS4_ZL_CACHE_ONLY=1 跑 zlayer 建缓存)", p);
-    fseeko(f, 0, SEEK_END); long long sz = (long long)ftello(f); fseeko(f, 0, SEEK_SET);
-    uint8_t *buf = xmalloc((size_t)sz);
-    if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) die("%s 读不满", p);
-    fclose(f);
-    npz_arr dH, prow, pe, pw, pYQ;
-    if (npz_get(buf, sz, "dH", &dH) || npz_get(buf, sz, "prow", &prow) ||
-        npz_get(buf, sz, "pe", &pe) || npz_get(buf, sz, "pw", &pw) ||
-        npz_get(buf, sz, "pYQ", &pYQ)) die("%s 字段缺(要 dH/prow/pe/pw/pYQ)", p);
-    if (dH.d0 < ntok || dH.d1 != D)
-        die("zcache dH 形状 %lldx%lld, 需 ≥%dx%d", (long long)dH.d0, (long long)dH.d1, ntok, D);
-    if (pYQ.d1 != D || pYQ.d0 != prow.n || pw.n != prow.n || pe.n != prow.n)
-        die("zcache 配对形状不一致: prow=%lld pYQ=%lldx%lld", (long long)prow.n,
-            (long long)pYQ.d0, (long long)pYQ.d1);
-    float *R = xmalloc((size_t)ntok * D * sizeof(float));
-    for (size_t i = 0; i < (size_t)ntok * D; i++) R[i] = (float)dH.v[i];
-    float *Ys = xmalloc((size_t)ntok * D * sizeof(float));
-    memset(Ys, 0, (size_t)ntok * D * sizeof(float));
-    for (long long i = 0; i < prow.n; i++) {
-        int t = (int)prow.v[i];
-        if (t < 0 || (int)pe.v[i] < 0) die("zcache 配对越界: prow=%d pe=%d", t, (int)pe.v[i]);
-        if (t >= ntok) continue;
-        float w = (float)pw.v[i];
-        float *ys = Ys + (size_t)t * D;
-        const double *yq = pYQ.v + (size_t)i * D;
-        for (int d = 0; d < D; d++) ys[d] += w * (float)yq[d];
-    }
-    zp->npair = prow.n;                  /* 配对留给 GE 臂(路由精确条件化数据面) */
-    zp->prow = xmalloc((size_t)prow.n * sizeof(int));
-    zp->pe = xmalloc((size_t)prow.n * sizeof(int));
-    zp->pw = xmalloc((size_t)prow.n * sizeof(float));
-    zp->pyq = xmalloc((size_t)prow.n * D * sizeof(float));
-    for (long long i = 0; i < prow.n; i++) {
-        zp->prow[i] = (int)prow.v[i]; zp->pe[i] = (int)pe.v[i]; zp->pw[i] = (float)pw.v[i];
-    }
-    for (size_t i = 0; i < (size_t)prow.n * D; i++) zp->pyq[i] = (float)pYQ.v[i];
-    free(dH.v); free(prow.v); free(pe.v); free(pw.v); free(pYQ.v); free(buf);
-    *R_out = R; *Ys_out = Ys;
-}
 
 /* 图应用: d_in=3D 的 ftA 图先做 φ 提升(与引擎 type6 ftA 路同式) */
 static void apply_any(const ds4_z *zl, const float *x, float *phib, float *y) {
@@ -327,10 +288,12 @@ int main(int argc, char **argv) {
 
     int any_lost = 0;
     for (int L = l0; L <= l1; L++) {
+        double tl0 = tnow();
         float *X, *R = NULL, *Ys = NULL; int *top1 = NULL;
         zpairs zp = {0};
         if (selftest) st_synth(ntok, &X, &R, &Ys);
         else { X = anchor_load(anc, L, ntok, &top1); zcache_load(zdir, L, ntok, &R, &Ys, &zp); }
+        double td = tnow(), tge = td, tx = td, tphi = td, tfta = td;
         float *Yt = xmalloc((size_t)ntok * D * sizeof(float));
         for (size_t i = 0; i < (size_t)ntok * D; i++) Yt[i] = Ys[i] + R[i];
 
@@ -373,6 +336,7 @@ int main(int argc, char **argv) {
                        &lw, dscale, seed, nth, L, lf, &best, Yhat, Cb, Cp);
             free(isfit);
         }
+        tge = tnow();
 
         for (int mi = 0; mi < nmode; mi++) {
             const int M = modes[mi];
@@ -451,9 +415,11 @@ int main(int argc, char **argv) {
             free(zsm);
             free(C); free(mode_fit); free(mode_ev);
         }
+        tx = tnow();
         if (!selftest) {
             /* ---- ftA 臂(冠军特征) 与 GE+ftA 臂(冠军配方全还原) ---- */
             XP = build_phi(X, ntok);
+            tphi = tnow();
             run_map_arm("ftA", XP, 3 * D, NULL, (float)trclamp, R, R, X, Ys, Yt_ev, wv,
                         fit, nf, ev, mode0, nev, ranks, nrank, lambdas, nlam, maxk, &lw,
                         dscale, seed, nth, L, lf, &best, Yhat, Cb, Cp, zcat);
@@ -463,6 +429,9 @@ int main(int argc, char **argv) {
                         wv, fit, nf, ev, mode0, nev, ranks, nrank, lambdas, nlam, maxk,
                         &lw, dscale, seed, nth, L, lf, &best, Yhat, Cb, Cp, zcat);
         }
+        tfta = tnow();
+        fprintf(stderr, "  [t]L%d 数据%.1f GE%.1f x臂%.1f φ%.1f ftA%.1f 层计%.1fs\n",
+                L, td - tl0, tge - td, tx - tge, tphi - tx, tfta - tphi, tnow() - tl0);
         int won = best.arm != NULL;
         fprintf(lf, "# 选中: %s arm=%s M=%d λ=%.3g k=%d total=%.6f (裸 %.6f Δ=%.2f%%) ER=%.1f%%\n",
                 won ? "有解" : "全网格输裸(停车审计)", won ? best.arm : "-", best.M,

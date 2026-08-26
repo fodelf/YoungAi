@@ -37,5 +37,8 @@ float *npy_read_f32(const char *path, npy_meta *out);
  * 模块禁止另建同功能文件)。 */
 typedef struct { double *v; int64_t n, d0, d1; } npz_arr;   /* shape (d0[,d1]) */
 int npz_get(const uint8_t *buf, int64_t sz, const char *name, npz_arr *out);
+/* f32 直读(大条目绕开 f64 中转; dtype 支持同上) */
+int npz_get_f32(const uint8_t *buf, int64_t sz, const char *name,
+                float **v_out, int64_t *d0_out, int64_t *d1_out);
 
 #endif /* GO_ONEBIT_NPY_H */

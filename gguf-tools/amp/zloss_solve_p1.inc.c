@@ -354,3 +354,44 @@ static void derive_modes(const float *X, const float *R, const int *fit, int nf,
            *gate_route ? "路由" : "x");
     free(Xf); free(Rf); free(lab); free(labbest); free(tmp); free(xacc);
 }
+/* ---- zcache 读取: R=dH, Ys=Σ pw·pYQ(自洽重建, 不掺 teacher_routed 的约定差) ---- */
+static void zcache_load(const char *dir, int L, int ntok, float **R_out, float **Ys_out,
+                        zpairs *zp) {
+    char p[1024]; snprintf(p, sizeof p, "%s/zcache_L%02d.npz", dir, L);
+    FILE *f = fopen(p, "rb");
+    if (!f) die("%s 打不开(先 DS4_ZL_CACHE_ONLY=1 跑 zlayer 建缓存)", p);
+    fseeko(f, 0, SEEK_END); long long sz = (long long)ftello(f); fseeko(f, 0, SEEK_SET);
+    uint8_t *buf = xmalloc((size_t)sz);
+    if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) die("%s 读不满", p);
+    fclose(f);
+    /* 大条目(dH/pYQ) f32 直读, 绕开 f64 中转的 2× 内存搬运(提速轮) */
+    float *R = NULL, *pyq = NULL; int64_t rd0, rd1, q0, q1;
+    npz_arr prow, pe, pw;
+    if (npz_get_f32(buf, sz, "dH", &R, &rd0, &rd1) || npz_get(buf, sz, "prow", &prow) ||
+        npz_get(buf, sz, "pe", &pe) || npz_get(buf, sz, "pw", &pw) ||
+        npz_get_f32(buf, sz, "pYQ", &pyq, &q0, &q1)) die("%s 字段缺(要 dH/prow/pe/pw/pYQ)", p);
+    if (rd0 < ntok || rd1 != D)
+        die("zcache dH 形状 %lldx%lld, 需 ≥%dx%d", (long long)rd0, (long long)rd1, ntok, D);
+    if (q1 != D || q0 != prow.n || pw.n != prow.n || pe.n != prow.n)
+        die("zcache 配对形状不一致: prow=%lld pYQ=%lldx%lld", (long long)prow.n,
+            (long long)q0, (long long)q1);
+    float *Ys = xmalloc((size_t)ntok * D * sizeof(float));
+    memset(Ys, 0, (size_t)ntok * D * sizeof(float));
+    zp->npair = prow.n;                  /* 配对留给 GE 臂(路由精确条件化数据面) */
+    zp->prow = xmalloc((size_t)prow.n * sizeof(int));
+    zp->pe = xmalloc((size_t)prow.n * sizeof(int));
+    zp->pw = xmalloc((size_t)prow.n * sizeof(float));
+    zp->pyq = pyq;
+    for (long long i = 0; i < prow.n; i++) {
+        int t = (int)prow.v[i], e = (int)pe.v[i];
+        if (t < 0 || e < 0) die("zcache 配对越界: prow=%d pe=%d", t, e);
+        zp->prow[i] = t; zp->pe[i] = e; zp->pw[i] = (float)pw.v[i];
+        if (t >= ntok) continue;
+        float w = zp->pw[i];
+        float *ys = Ys + (size_t)t * D;
+        const float *yq = pyq + (size_t)i * D;
+        for (int d = 0; d < D; d++) ys[d] += w * yq[d];
+    }
+    free(prow.v); free(pe.v); free(pw.v); free(buf);
+    *R_out = R; *Ys_out = Ys;
+}
