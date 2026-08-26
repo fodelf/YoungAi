@@ -123,7 +123,9 @@ stage_solve(){
     LOG "③端到端斜率标定完成: 对表 裸 0.47055 / r64c 0.42510, 全表 /tmp/caliper_zge.log"
 }
 # ★4L 全量(2026-08-26 用户令"跑"): 8192 放大器半锚(与量化半同口径, 零重叠), 43 层。
-# 每层: zcache(缺则建) → 全臂网格(4L/x/GE 族同表四损失择优, λ 扩到 1/3/10/30 —— 原
+# 每层: zcache(缺则建) → 全臂网格(4L/x/GE 族同表四损失择优; k 定档 512 —— 2026-08-26
+# k 扫描定论: k 512→4096 有效秩 439→1500 真涨但 ER 只 +0.4pt(全是 held 无用方向),
+# 降 λ 放容量更是负收益(λ=1 全线输 λ=10)=瓶颈是泛化不是容量; λ 仍扫 1/3/10/30 —— 原
 # 网格顶 0.3 是边界单调 bug, L41/L20 修后双双赢裸) → 冠军 emit-z(zl.RRR±bf.GE+zl.4L)
 # → caliper 五指标。体积: k≤512 时 z 最大 8.4MB/层 ×43 ≈ 360MB(2GB 预算内)。
 # 对表: 裸 0.47055 / r64c 冠军 0.42510 / 官方 q2 0.4207。
@@ -151,7 +153,7 @@ stage_full4l(){
         fi
         "$GT/amp/zloss_solve" --anchor "$ANC" --zcache "$WS/layers" --out "$WS/n4l" \
             --layers "$L-$L" --ntok $NTOK --threads 18 --modes 1 \
-            --ranks "16,64,128,512" --lambdas "1,3,10,30" \
+            --ranks "512" --lambdas "1,3,10,30" \
             --fit-ranges "$FR" --ev-ranges "$ER" --smooth-aug --emit-z "$G4/layers" \
             || DIE "L$L 解算/注入异常"
         NI=$(wc -l < "$G4/layers/zinject_manifest.txt" 2>/dev/null || echo 0)
