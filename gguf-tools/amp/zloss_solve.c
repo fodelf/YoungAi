@@ -8,7 +8,7 @@
  *   与 XCAP 全量 0.47364 比裸差同罪(链态口径两次翻车)。
  *
  * ★动态 z(方案 B 兑现)★ 低维动态 z 映射高维行为: 模式=混合线性回归硬 EM
- *   (zloss_solve_p1.inc.c, 按"哪张图预测得更好"发现行标签, 定死种子+双重启),
+ *   (zloss_arms.inc.c, 按"哪张图预测得更好"发现行标签, 定死种子+双重启),
  *   门=EM 标签的 x 方向质心(apply 只有 x), 每模式独立 ds4_z_solve 闭式 rank-k
  *   —— 修正图随 token 的行为模式切换(路由哈希看似随机, 规律是条件性的; 一张
  *   全局静态图把模式平均掉, v1 深层全军判空的第二根因)。M=1 = 静态下界参赛。
@@ -82,7 +82,7 @@ static int *parse_ranges(const char *s, int *n_out) {   /* "a:b,c:d" 左闭右�
     *n_out = n; return v;
 }
 
-#include "zloss_solve_p1.inc.c"         /* 唯一物理分片(金标+臂+模式发现+zcache读取) */
+#include "zloss_arms.inc.c"             /* 解算臂分片(金标+GE/ftA臂+模式发现+zcache) */
 
 /* ---- 锚读取(DQA2, 与 zlayer anchor_layer 同格式): fin + top-1 专家(路由门用,
  * rw 最大槽位; 部署时路由先于专家计算, 是免费可得的信号) ---- */

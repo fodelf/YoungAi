@@ -35,7 +35,7 @@ extern int zg_dgemm(int, int, int, int, int, const double *, int, const double *
                     double *, int);
 extern int zg_sgemm(int, int, int, int, int, const float *, int, const float *, int,
                     float *, int);
-extern int zg_dpotrf_potrs(int n, int nrhs, const double *A, double *B);
+extern int zg_spotrf_potrs_f64io(int n, int nrhs, const double *A, double *B);
 extern int zg_sqr_orth(int d, int k, float *V);
 #endif
 static void dz_dgemm(int ta, int M, int N, int K, const double *A, int lda,
@@ -344,7 +344,9 @@ int ds4_z_solve_multi(const float *X, const float *R, uint32_t n,
             int done = 0;
             memcpy(Btc, Bt0, (size_t)d_in * d_out * sizeof(double));
 #ifdef DQ_CUDA
-            done = zg_dpotrf_potrs((int)d_in, (int)d_out, Ac, Btc);
+            /* GB10 FP64=1:64 阉割, f64 因子化在卡上跟 CPU 一样慢(计时定罪
+             * 47s/53s); f32 因子化+无量纲 ridge(条件数≤1/λ)精度富余, 载荷 fp16 */
+            done = zg_spotrf_potrs_f64io((int)d_in, (int)d_out, Ac, Btc);
 #endif
             if (!done) {
                 int info = 0, N = (int)d_in, nrhs = (int)d_out;

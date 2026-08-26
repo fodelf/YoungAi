@@ -88,26 +88,6 @@ static int zg_info_ok(void) {
     int info = -1;
     return cudaMemcpy(&info, g_dinfo, 4, cudaMemcpyDeviceToHost) == cudaSuccess && info == 0;
 }
-/* A: 行主序 n×n 全对称(两三角都填) — 列主序视图即自身, uplo 任取(取 LOWER)。
- * B: 与 CPU 路 Bt 同布局(列主序 n×nrhs), 出参=解。 */
-extern "C" int zg_dpotrf_potrs(int n, int nrhs, const double *A, double *B) {
-    if (!zg_solver_ready()) return 0;
-    size_t sa = (size_t)n * n * 8, sb = (size_t)n * nrhs * 8;
-    if (!ensure(&g_dA, &g_sA, sa) || !ensure(&g_dB, &g_sB, sb)) return 0;
-    if (cudaMemcpy(g_dA, A, sa, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
-    if (cudaMemcpy(g_dB, B, sb, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
-    int lwork = 0;
-    if (cusolverDnDpotrf_bufferSize(g_sh, CUBLAS_FILL_MODE_LOWER, n, (double *)g_dA, n,
-                                    &lwork) != CUSOLVER_STATUS_SUCCESS) return 0;
-    if (!ensure(&g_dW2, &g_sW2, (size_t)lwork * 8)) return 0;
-    if (cusolverDnDpotrf(g_sh, CUBLAS_FILL_MODE_LOWER, n, (double *)g_dA, n,
-                         (double *)g_dW2, lwork, g_dinfo) != CUSOLVER_STATUS_SUCCESS) return 0;
-    if (!zg_info_ok()) return 0;
-    if (cusolverDnDpotrs(g_sh, CUBLAS_FILL_MODE_LOWER, n, nrhs, (double *)g_dA, n,
-                         (double *)g_dB, n, g_dinfo) != CUSOLVER_STATUS_SUCCESS) return 0;
-    if (!zg_info_ok()) return 0;
-    return cudaMemcpy(B, g_dB, sb, cudaMemcpyDeviceToHost) == cudaSuccess;
-}
 /* V: 行主序 d×k 就地正交化(薄 QR 的 Q)。geam 转置进出列主序。
  * 与 mgs 产的基不同但张成同一子空间 —— 截断积 U·diag(z)·Vᵀ 对基不变,
  * 金标口径 = selftest 收回率与针表打印精度, 非逐位。 */
@@ -143,4 +123,40 @@ extern "C" int zg_sqr_orth(int d, int k, float *V) {
                     &zero, (const float *)g_dA, k, (float *)g_dA, k) != CUBLAS_STATUS_SUCCESS)
         return 0;
     return cudaMemcpy(V, g_dA, sv, cudaMemcpyDeviceToHost) == cudaSuccess;
+}
+
+/* f32 因子化+解(2026-08-26 计时定罪: GB10 FP64=1:64 阉割, f64 potrf/potrs 在卡上
+ * 跟 CPU 一样慢, ftA 12288 维 6 次因子化吃掉 47s/53s。f32 + 无量纲 ridge(条件数
+ * ≤1/λ≈333)精度富余, 产物载荷本就是 fp16 —— zlayer ftA f32 Gram 冠军先例同族)。
+ * A: 行主序 n×n 全对称 f64(入参不动, 卡上转 f32); B: 列主序 n×nrhs f64 进出。 */
+static __global__ void zg_d2s(const double *s, float *d, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) d[i] = (float)s[i];
+}
+static __global__ void zg_s2d(const float *s, double *d, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) d[i] = (double)s[i];
+}
+extern "C" int zg_spotrf_potrs_f64io(int n, int nrhs, const double *A, double *B) {
+    if (!zg_solver_ready()) return 0;
+    size_t sa8 = (size_t)n * n * 8, sb8 = (size_t)n * nrhs * 8;
+    size_t sa4 = sa8 / 2, sb4 = sb8 / 2;
+    if (!ensure(&g_dA, &g_sA, sa8) || !ensure(&g_dB, &g_sB, sb8) ||
+        !ensure(&g_dC, &g_sC, sa4 > sb4 ? sa4 + sb4 : sb4 + sa4)) return 0;
+    float *fA = (float *)g_dC, *fB = fA + (size_t)n * n;
+    if (cudaMemcpy(g_dA, A, sa8, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+    if (cudaMemcpy(g_dB, B, sb8, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+    size_t na = (size_t)n * n, nb = (size_t)n * nrhs;
+    zg_d2s<<<(unsigned)((na + 255) / 256), 256>>>((const double *)g_dA, fA, na);
+    zg_d2s<<<(unsigned)((nb + 255) / 256), 256>>>((const double *)g_dB, fB, nb);
+    int lwork = 0;
+    if (cusolverDnSpotrf_bufferSize(g_sh, CUBLAS_FILL_MODE_LOWER, n, fA, n, &lwork)
+        != CUSOLVER_STATUS_SUCCESS) return 0;
+    if (!ensure(&g_dW2, &g_sW2, (size_t)lwork * 4)) return 0;
+    if (cusolverDnSpotrf(g_sh, CUBLAS_FILL_MODE_LOWER, n, fA, n, (float *)g_dW2, lwork,
+                         g_dinfo) != CUSOLVER_STATUS_SUCCESS || !zg_info_ok()) return 0;
+    if (cusolverDnSpotrs(g_sh, CUBLAS_FILL_MODE_LOWER, n, nrhs, fA, n, fB, n, g_dinfo)
+        != CUSOLVER_STATUS_SUCCESS || !zg_info_ok()) return 0;
+    zg_s2d<<<(unsigned)((nb + 255) / 256), 256>>>(fB, (double *)g_dB, nb);
+    return cudaMemcpy(B, g_dB, sb8, cudaMemcpyDeviceToHost) == cudaSuccess;
 }
