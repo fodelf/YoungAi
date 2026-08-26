@@ -474,6 +474,9 @@ int main(int argc, char **argv) {
                L, won ? "选中" : "★全网格输裸=解算器有病, 停车审计★", won ? best.arm : "-",
                best.M, best.lam, best.k, la0, best.la, lc0, best.lc, tot0, best.tot,
                best.er * 100);
+        if (emitz && !selftest)          /* 落地前用部署位宽(fp16)复评 —— 位宽账 */
+            z_fp16_recheck(&best, best.zkeep_hasge ? gecorr : NULL, X, Ys, R, Yt_ev,
+                           wv, ev, mode0, nev, dscale, seed, nth, L, lf);
         if (emitz && !selftest)          /* 冠军落地(zl.RRR/bf.GE + zl.4L 四损失参数) */
             emit_z_finish(emitz, L, &best, best.zkeep_hasge ? ge_dz : NULL, la0, lc0,
                           tot0, &lw, Yt, fit, nf, seed, (float)dscale);

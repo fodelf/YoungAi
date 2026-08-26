@@ -400,3 +400,41 @@ static void zl_healthcheck(const float *X, const float *R, const float *Ys, int 
     }
     if (nx + nr + ny) printf("  ★L%d 数据面含非有限值 — 解算必炸, 这是 bug 不是层的属性★\n", L);
 }
+
+/* ★fp16 往返自检(2026-08-26 用户判"引擎磨平收益"的代码级检验)★
+ * 层内评估在 f32 上做, 落地 zl.RRR 是 fp16(判决尺/引擎都按 fp16 读) —— k 大时高阶
+ * 奇异方向元素小, fp16 舍入可能把它们抹平甚至变噪声。本函数把 z/U/V 做一次 fp16
+ * 往返(与 rec_rrr 落地位宽逐位同), 供调用方用【部署真值】重评。 */
+static void z_fp16_roundtrip(ds4_z *zl) {
+    for (uint32_t c = 0; c < zl->k; c++)
+        zl->z[c] = ds4_f16_to_f32(ds4_f64_to_f16((double)zl->z[c]));
+    for (size_t i = 0; i < (size_t)zl->d_out * zl->rank; i++)
+        zl->U[i] = ds4_f16_to_f32(ds4_f64_to_f16((double)zl->U[i]));
+    for (size_t i = 0; i < (size_t)zl->d_in * zl->rank; i++)
+        zl->V[i] = ds4_f16_to_f32(ds4_f64_to_f16((double)zl->V[i]));
+}
+
+/* fp16 往返复评: 用【落地位宽】的 z 重算 held 四损失 —— f32 账与 fp16 账的差,
+ * 就是"层内赢、端到端不兑现"里被位宽磨掉的那部分(用户 2026-08-26 判点)。 */
+static void z_fp16_recheck(const best_t *best, const float *bc, const float *X,
+                           const float *Ys, const float *R, const float *Yt_ev,
+                           const float *wv, const int *ev, const int *mode0, int nev,
+                           double dscale, uint64_t seed, int nth, int L, FILE *lf) {
+    if (!best->zkeep) return;
+    ds4_z *cp = z_clone_k(best->zkeep);
+    z_fp16_roundtrip(cp);
+    float *Yh = xmalloc((size_t)nev * D * sizeof(float));
+    float *Cb = xmalloc((size_t)nev * D * sizeof(float));
+    float *Cp = xmalloc((size_t)nev * D * sizeof(float));
+    ds4_z *zl1[1] = { cp };
+    double er = eval_apply(zl1, NULL, 1, 0, bc, 0.5f, X, Ys, R, ev, mode0, nev,
+                           Yh, Cb, Cp, dscale, seed, nth);
+    float la = ds4_loss_align(Yh, Yt_ev, (uint32_t)nev, D);
+    float lc = ds4_loss_classify(Yh, Yt_ev, wv, (uint32_t)nev, D);
+    printf("★L%d fp16复评(部署位宽): align %.4f→%.4f cls %.4f→%.4f ER %.2f%%→%.2f%% k=%u\n",
+           L, best->la, la, best->lc, lc, best->er * 100, er * 100, cp->k);
+    if (lf) fprintf(lf, "# fp16复评 align=%.6f cls=%.6f ER=%.2f%% (f32 账 align=%.6f ER=%.2f%%)\n",
+                    la, lc, er * 100, best->la, best->er * 100);
+    free(Yh); free(Cb); free(Cp);
+    ds4_z_free(cp);
+}
