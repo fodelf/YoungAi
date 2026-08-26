@@ -364,3 +364,19 @@ static void run_4l_arm(const float *X, const float *R, const float *Ys, const fl
                 lw, dscale, seed, nth, L, lf, best, Yhat, Cb, Cp, zcat);
     free(sw2); free(swts); free(ralign);
 }
+
+/* 数据面体检(2026-08-26 L41 爆炸定位): NaN/Inf 计数 + rms + 极值通道。
+ * ds4_loss 契约"NaN-free 是调用方责任" — 深层量化前向确实会产 NaN, 这里是那道闸。 */
+static void zl_healthcheck(const float *X, const float *R, const float *Ys, int ntok, int L) {
+    long nx = 0, nr = 0, ny = 0; double sx = 0, sr = 0, sy = 0, mx = 0, mr = 0;
+    size_t nn = (size_t)ntok * D;
+    for (size_t i = 0; i < nn; i++) {
+        float a = X[i], b = R[i], c = Ys[i];
+        if (!isfinite(a)) nx++; else { sx += (double)a * a; if (fabsf(a) > mx) mx = fabsf(a); }
+        if (!isfinite(b)) nr++; else { sr += (double)b * b; if (fabsf(b) > mr) mr = fabsf(b); }
+        if (!isfinite(c)) ny++; else sy += (double)c * c;
+    }
+    printf("  [体检]L%d 非有限 x=%ld R=%ld Ys=%ld | rms x=%.4g R=%.4g Ys=%.4g | max|x|=%.4g max|R|=%.4g\n",
+           L, nx, nr, ny, sqrt(sx / nn), sqrt(sr / nn), sqrt(sy / nn), mx, mr);
+    if (nx + nr + ny) printf("  ★L%d 数据面含非有限值 — 解算必炸, 这是 bug 不是层的属性★\n", L);
+}

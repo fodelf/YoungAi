@@ -285,6 +285,7 @@ int main(int argc, char **argv) {
         double td = tnow(), tge = td, tx = td, tphi = td, tfta = td;
         float *Yt = xmalloc((size_t)ntok * D * sizeof(float));
         for (size_t i = 0; i < (size_t)ntok * D; i++) Yt[i] = Ys[i] + R[i];
+        zl_healthcheck(X, R, Ys, ntok, L);
 
         float *Yt_ev = xmalloc((size_t)nev * D * sizeof(float));
         float *Ys_ev = xmalloc((size_t)nev * D * sizeof(float));

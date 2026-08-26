@@ -127,6 +127,8 @@ static float *build_phi(const float *X, int n) {
 /* zcache 配对(路由精确条件化的数据面): prow/pe/pw/pyq */
 typedef struct { int *prow, *pe; float *pw, *pyq; long long npair; } zpairs;
 
+static void zl_healthcheck(const float *X, const float *R, const float *Ys, int ntok, int L);
+
 /* GE 闭式解: min Σ_t∈fit ||diag(sw)(R_t − Σ_{e∈S_t} δ_e·w·pYQ)||² + λ·量纲化ridge。
  * sw2=每通道权²(cls 方差权白化=四损失 L_classify 进解算目标, 用户令), NULL=平权。
  * A 256×256 正规方程, chol_solve_spd(linalg_small, 全仓唯一小 Cholesky)。 */
