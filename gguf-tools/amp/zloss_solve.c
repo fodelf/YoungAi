@@ -138,6 +138,8 @@ static int mode_assign(const float *x, const float *C, int M) {
     }
     return bm;
 }
+#include "zloss_gate.inc.c"             /* 门族分片: EM 模式门 + 语境门 GEc */
+
 /* ---- held 行评估(pthread): Yhat=Ys+M(x), Cb=M(x), Cp=M(x+δ); ER 部分和 ---- */
 typedef struct {
     ds4_z *const *zl; const float *C; int M, gate_route;
@@ -324,10 +326,22 @@ int main(int argc, char **argv) {
         int *mode0 = xmalloc((size_t)nev * sizeof(int));
         memset(mode0, 0, (size_t)nev * sizeof(int));
         float *gecorr = NULL, *Rge = NULL, *XP = NULL;
-        if (!selftest)   /* 基修正臂组: GE / 乘性出口 / GE+乘性(路由与通道两条门) */
+        uint8_t *isfit = NULL;
+        if (!selftest) {  /* 基修正臂组 + 语境门 GEc(段漂移对策: δ_e(c)) */
             run_base_arms(&zp, X, R, Ys, Yt_ev, wv, fit, nf, ev, mode0, nev, ntok,
                           &lw, dscale, seed, nth, L, lf, &best, Yhat, Cb, Cp,
-                          &gecorr, &Rge);
+                          &gecorr, &Rge, &isfit);
+            const int cm = 4;
+            float *ctx = ctx_build(X, ntok, cm, isfit, L);
+            double *thd = xmalloc((size_t)256 * (1 + cm) * sizeof(double));
+            solve_gec(&zp, R, ctx, cm, isfit, ntok, 1e-3, L, thd);
+            float thf[256 * 16];
+            for (int i = 0; i < 256 * (1 + cm); i++) thf[i] = (float)thd[i];
+            float *gc = gec_corr_build(&zp, thd, ctx, cm, ntok);
+            run_bc_arm("GEc", thf, 256 * (1 + cm), gc, X, Ys, Yt_ev, wv, R, ev, mode0,
+                       nev, &lw, dscale, seed, nth, L, lf, &best, Yhat, Cb, Cp);
+            free(ctx); free(thd); free(gc);
+        }
         tge = tnow();
 
         for (int mi = 0; mi < nmode; mi++) {
@@ -461,7 +475,7 @@ int main(int argc, char **argv) {
         fflush(stdout);
         free(X); free(R); free(Ys); free(Yt); free(Yt_ev); free(Ys_ev); free(wv);
         free(Yhat); free(Cb); free(Cp); free(zcat); free(top1);
-        free(mode0); free(gecorr); free(Rge); free(XP);
+        free(mode0); free(gecorr); free(Rge); free(XP); free(isfit);
         free(zp.prow); free(zp.pe); free(zp.pw); free(zp.pyq);
     }
     free(fit); free(ev);
