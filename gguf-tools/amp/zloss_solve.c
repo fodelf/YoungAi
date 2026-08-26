@@ -58,31 +58,8 @@ static void die(const char *fmt, ...) {
 }
 static void *xmalloc(size_t n) { void *p = malloc(n); if (!p) die("OOM %zu", n); return p; }
 
-static int parse_ints(const char *s, int *out, int cap) {
-    int n = 0; const char *p = s;
-    while (*p && n < cap) { out[n++] = (int)strtol(p, (char **)&p, 10); if (*p == ',') p++; }
-    return n;
-}
-static int parse_dbls(const char *s, double *out, int cap) {
-    int n = 0; const char *p = s;
-    while (*p && n < cap) { out[n++] = strtod(p, (char **)&p); if (*p == ',') p++; }
-    return n;
-}
-static int *parse_ranges(const char *s, int *n_out) {   /* "a:b,c:d" 左闭右开 */
-    int cap = 1024, n = 0; int *v = xmalloc((size_t)cap * sizeof(int));
-    const char *p = s;
-    while (*p) {
-        char *e; long a = strtol(p, &e, 10);
-        if (*e != ':') die("区间语法(a:b): %s", s);
-        long b = strtol(e + 1, &e, 10);
-        for (long i = a; i < b; i++) {
-            if (n == cap) { cap *= 2; v = realloc(v, (size_t)cap * sizeof(int)); if (!v) die("OOM"); }
-            v[n++] = (int)i;
-        }
-        p = (*e == ',') ? e + 1 : e;
-    }
-    *n_out = n; return v;
-}
+static int g_smooth_aug = 0;            /* --smooth-aug: L_smooth 进解算目标(扰动增广) */
+static int g_track_z = 0;               /* --emit-z: 网格中跟踪冠军 z 克隆(序列化用) */
 
 #include "zloss_arms.inc.c"             /* 解算臂分片(金标+GE/ftA臂+模式发现+zcache) */
 
@@ -231,7 +208,8 @@ static double eval_apply(ds4_z *const *zl, const float *C, int M, int gate_route
 }
 
 int main(int argc, char **argv) {
-    const char *anc = NULL, *zdir = NULL, *out = NULL, *frs = NULL, *ers = NULL, *emitge = NULL;
+    const char *anc = NULL, *zdir = NULL, *out = NULL, *frs = NULL, *ers = NULL,
+               *emitge = NULL, *emitz = NULL;
     int l0 = -1, l1 = -1, ntok = 8192, nfit = 6144, nth = 16, selftest = 0;
     int modes[MAXG] = {1, 8, 16}; int nmode = 3;
     int ranks[MAXG] = {16, 64, 128, 256}; int nrank = 4;
@@ -261,6 +239,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--fit-ranges") && i + 1 < argc) frs = argv[++i];
         else if (!strcmp(argv[i], "--ev-ranges") && i + 1 < argc) ers = argv[++i];
         else if (!strcmp(argv[i], "--emit-ge") && i + 1 < argc) emitge = argv[++i];
+        else if (!strcmp(argv[i], "--emit-z") && i + 1 < argc) { emitz = argv[++i]; g_track_z = 1; }
+        else if (!strcmp(argv[i], "--smooth-aug")) g_smooth_aug = 1;
         else if (!strcmp(argv[i], "--selftest")) selftest = 1;
         else die("未知参数 %s", argv[i]);
     }
@@ -331,6 +311,7 @@ int main(int argc, char **argv) {
         memset(mode0, 0, (size_t)nev * sizeof(int));
         float *gecorr = NULL, *Rge = NULL, *XP = NULL;
         uint8_t *isfit = NULL;
+        float ge_dz[256] = {0};          /* 基 GE δ(emit-z 组合臂的 bf.GE 基) */
         if (emitge && !selftest) {       /* GE-only 端到端注入路: 解算→闸→bf.GE, 跳过全网格 */
             run_emit_ge(emitge, L, &zp, X, R, Ys, Yt_ev, wv, fit, nf, ev, mode0, nev,
                         ntok, &lw, dscale, seed, nth, lf, la0, lc0, tot0, Yhat, Cb, Cp);
@@ -343,7 +324,7 @@ int main(int argc, char **argv) {
         if (!selftest) {  /* 基修正臂组 + 语境门 GEc(段漂移对策: δ_e(c)) */
             run_base_arms(&zp, X, R, Ys, Yt_ev, wv, fit, nf, ev, mode0, nev, ntok,
                           &lw, dscale, seed, nth, L, lf, &best, Yhat, Cb, Cp,
-                          &gecorr, &Rge, &isfit);
+                          &gecorr, &Rge, &isfit, ge_dz);
             const int cm = 4;
             float *ctx = ctx_build(X, ntok, cm, isfit, L);
             double *thd = xmalloc((size_t)256 * (1 + cm) * sizeof(double));
@@ -477,7 +458,10 @@ int main(int argc, char **argv) {
                L, won ? "选中" : "★全网格输裸=解算器有病, 停车审计★", won ? best.arm : "-",
                best.M, best.lam, best.k, la0, best.la, lc0, best.lc, tot0, best.tot,
                best.er * 100);
-        if (!won) any_lost = 1;
+        if (emitz && !selftest)          /* 冠军整体落地(zl.RRR/bf.GE, 四损失入档) */
+            emit_z_finish(emitz, L, &best, best.zkeep_hasge ? ge_dz : NULL,
+                          la0, lc0, tot0, &lw);
+        if (!won && !emitz) any_lost = 1;   /* 落地跑: 输裸层=记档不注入, 不停车 */
         if (selftest) {
             printf("★selftest: M=1 best align=%.4f  M=2 best align=%.4f\n",
                    mbest_align[0], mbest_align[1]);

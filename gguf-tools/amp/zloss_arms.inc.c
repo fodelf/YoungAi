@@ -59,6 +59,48 @@ static void st_synth(int ntok, float **Xo, float **Ro, float **Yso) {
  * GE 与 zlayer bf.GE 同族(四损失口径重解, 求解走 linalg_small chol_solve_spd),
  * φ 与引擎 type6 ftA 加载路同式(公式必须逐字对齐, 否则解算目标≠部署行为)。 */
 
+/* ---- CLI 解析工具(主文件 500 行腾挪迁入, 逐字不动) ---- */
+static int parse_ints(const char *s, int *out, int cap) {
+    int n = 0; const char *p = s;
+    while (*p && n < cap) { out[n++] = (int)strtol(p, (char **)&p, 10); if (*p == ',') p++; }
+    return n;
+}
+static int parse_dbls(const char *s, double *out, int cap) {
+    int n = 0; const char *p = s;
+    while (*p && n < cap) { out[n++] = strtod(p, (char **)&p); if (*p == ',') p++; }
+    return n;
+}
+static int *parse_ranges(const char *s, int *n_out) {   /* "a:b,c:d" 左闭右开 */
+    int cap = 1024, n = 0; int *v = xmalloc((size_t)cap * sizeof(int));
+    const char *p = s;
+    while (*p) {
+        char *e; long a = strtol(p, &e, 10);
+        if (*e != ':') die("区间语法(a:b): %s", s);
+        long b = strtol(e + 1, &e, 10);
+        for (long i = a; i < b; i++) {
+            if (n == cap) { cap *= 2; v = realloc(v, (size_t)cap * sizeof(int)); if (!v) die("OOM"); }
+            v[n++] = (int)i;
+        }
+        p = (*e == ',') ? e + 1 : e;
+    }
+    *n_out = n; return v;
+}
+
+/* 冠军 z 截秩克隆(--emit-z 序列化用): 只留活跃 k 列, U/V 步长 rank→k */
+static ds4_z *z_clone_k(const ds4_z *s) {
+    ds4_z *c = xmalloc(sizeof(ds4_z));
+    c->d_in = s->d_in; c->d_out = s->d_out; c->rank = s->k; c->k = s->k;
+    c->z = xmalloc((size_t)s->k * sizeof(float));
+    c->U = xmalloc((size_t)s->d_out * s->k * sizeof(float));
+    c->V = xmalloc((size_t)s->d_in * s->k * sizeof(float));
+    memcpy(c->z, s->z, (size_t)s->k * sizeof(float));
+    for (uint32_t j = 0; j < s->d_out; j++)
+        memcpy(c->U + (size_t)j * s->k, s->U + (size_t)j * s->rank, (size_t)s->k * sizeof(float));
+    for (uint32_t i = 0; i < s->d_in; i++)
+        memcpy(c->V + (size_t)i * s->k, s->V + (size_t)i * s->rank, (size_t)s->k * sizeof(float));
+    return c;
+}
+
 /* eval_apply 在主文件后段定义(worker 按 zl->d_in 自动 φ 提升), 此处前置声明 */
 static double eval_apply(ds4_z *const *zl, const float *C, int M, int gate_route,
                          const float *bc, float tr, const float *X, const float *Ys,
@@ -85,10 +127,11 @@ static float *build_phi(const float *X, int n) {
 /* zcache 配对(路由精确条件化的数据面): prow/pe/pw/pyq */
 typedef struct { int *prow, *pe; float *pw, *pyq; long long npair; } zpairs;
 
-/* GE 闭式解: min Σ_t∈fit ||R_t − Σ_{e∈S_t} δ_e·w·pYQ||² + λ·量纲化ridge。
+/* GE 闭式解: min Σ_t∈fit ||diag(sw)(R_t − Σ_{e∈S_t} δ_e·w·pYQ)||² + λ·量纲化ridge。
+ * sw2=每通道权²(cls 方差权白化=四损失 L_classify 进解算目标, 用户令), NULL=平权。
  * A 256×256 正规方程, chol_solve_spd(linalg_small, 全仓唯一小 Cholesky)。 */
 static void solve_ge(const zpairs *zp, const float *R, const uint8_t *isfit,
-                     int ntok, double lam, int L, double *delta) {
+                     int ntok, double lam, int L, double *delta, const float *sw2) {
     long long *rs = xmalloc((size_t)(ntok + 1) * sizeof(long long));
     memset(rs, 0, (size_t)(ntok + 1) * sizeof(long long));
     for (long long i = 0; i < zp->npair; i++) if (zp->prow[i] < ntok) rs[zp->prow[i] + 1]++;
@@ -110,13 +153,15 @@ static void solve_ge(const zpairs *zp, const float *R, const uint8_t *isfit,
             const float *yi = zp->pyq + (size_t)i * D;
             double wi = zp->pw[i]; int e = zp->pe[i];
             double bi = 0;
-            for (int j = 0; j < D; j++) bi += (double)yi[j] * r[j];
+            if (sw2) for (int j = 0; j < D; j++) bi += (double)yi[j] * r[j] * sw2[j];
+            else for (int j = 0; j < D; j++) bi += (double)yi[j] * r[j];
             delta[e] += wi * bi;
             for (long long b2 = a; b2 < rs[t + 1]; b2++) {
                 long long k = ord[b2];
                 const float *yk = zp->pyq + (size_t)k * D;
                 double d = 0;
-                for (int j = 0; j < D; j++) d += (double)yi[j] * yk[j];
+                if (sw2) for (int j = 0; j < D; j++) d += (double)yi[j] * yk[j] * sw2[j];
+                else for (int j = 0; j < D; j++) d += (double)yi[j] * yk[j];
                 d *= wi * zp->pw[k];
                 int f = zp->pe[k];
                 A[(size_t)e * 256 + f] += d;
@@ -149,9 +194,12 @@ static float *ge_corr_build(const zpairs *zp, const double *delta, int ntok) {
     return corr;
 }
 
-/* 择优追踪(全臂共享) */
+/* 择优追踪(全臂共享)。zkeep=冠军 z 克隆(--emit-z 时跟踪); zkeep_hasge=z 是 GE 基上
+ * 的叠加(序列化须连 bf.GE); bcdz/bckind=冠军基修正臂参数(1=256专家门可序列化, 2=无路)。 */
 typedef struct {
     double tot, lam, er; int M, k; float la, lc; const char *arm;
+    ds4_z *zkeep; int zkeep_hasge;
+    float bcdz[256]; int bckind;
 } best_t;
 
 /* 线性/ftA 图臂: 特征 XF(din 宽), 靶 Reff(bc 臂=R−GE修正), M=1 静态。
@@ -174,10 +222,30 @@ static void run_map_arm(const char *arm, const float *XF, int din, const float *
         if (swts) for (int j = 0; j < D; j++) rd[j] = rs[j] * swts[j];
         else memcpy(rd, rs, D * sizeof(float));
     }
+    int nfa = nf;
+    if (g_smooth_aug) {   /* L_smooth 进解算目标: 同靶扰动增广行(逼 M(x+δ)≈M(x)),
+                           * δ=ds4_loss_dither 定死种子(行号=fit 行, 与 held 评估行不交) */
+        Xm = realloc(Xm, (size_t)2 * nf * din * sizeof(float));
+        Rm = realloc(Rm, (size_t)2 * nf * D * sizeof(float));
+        if (!Xm || !Rm) die("L%d %s 增广 OOM", L, arm);
+        float *dl = xmalloc(D * sizeof(float)), *xp = xmalloc(D * sizeof(float));
+        for (int i = 0; i < nf; i++) {
+            const float *x = X + (size_t)fit[i] * D;
+            double ss = 0; for (int j = 0; j < D; j++) ss += (double)x[j] * x[j];
+            ds4_loss_dither(seed, (uint32_t)fit[i], (float)(dscale * sqrt(ss / D)), dl, D);
+            for (int j = 0; j < D; j++) xp[j] = x[j] + dl[j];
+            float *o = Xm + (size_t)(nf + i) * din;
+            if (din == 3 * D) mk_phi(xp, o);
+            else memcpy(o, xp, D * sizeof(float));
+            memcpy(Rm + (size_t)(nf + i) * D, Rm + (size_t)i * D, D * sizeof(float));
+        }
+        free(dl); free(xp);
+        nfa = 2 * nf;
+    }
     ds4_z *zs[MAXG] = {0};
     float lamf[MAXG];
     for (int li = 0; li < nlam; li++) lamf[li] = (float)lambdas[li];
-    if (ds4_z_solve_multi(Xm, Rm, (uint32_t)nf, (uint32_t)din, D, (uint32_t)maxk,
+    if (ds4_z_solve_multi(Xm, Rm, (uint32_t)nfa, (uint32_t)din, D, (uint32_t)maxk,
                           lamf, (uint32_t)nlam, zs))
         die("L%d %s 解算失败", L, arm);
     if (swts)   /* 解在白化空间, U 行回真空间(秩截断已按 cls 权分配容量) */
@@ -209,6 +277,12 @@ static void run_map_arm(const char *arm, const float *XF, int din, const float *
             if (tot < best->tot) {
                 best->tot = tot; best->lam = lambdas[li]; best->k = ranks[ki];
                 best->M = 1; best->er = er; best->la = la; best->lc = lc; best->arm = arm;
+                if (g_track_z) {         /* 图臂夺冠: 截秩克隆(swts 已回真空间) */
+                    if (best->zkeep) ds4_z_free(best->zkeep);
+                    best->zkeep = z_clone_k(zl[0]);
+                    best->zkeep_hasge = (bc != NULL);
+                    best->bckind = 0;
+                }
             }
             fflush(stdout);
         }
@@ -244,6 +318,12 @@ static void run_bc_arm(const char *arm, const float *params, int nparam,
     if (tot < best->tot) {
         best->tot = tot; best->lam = 0; best->k = 0; best->M = 1;
         best->er = er; best->la = la; best->lc = lc; best->arm = arm;
+        if (g_track_z) {                 /* 基修正臂夺冠: z 克隆作废, 记门参数 */
+            if (best->zkeep) { ds4_z_free(best->zkeep); best->zkeep = NULL; }
+            best->zkeep_hasge = 0;
+            if (nparam == 256) { memcpy(best->bcdz, params, 256 * sizeof(float)); best->bckind = 1; }
+            else best->bckind = 2;       /* mul/GEc 等: 无引擎序列化路, 落地时响亮报 */
+        }
     }
     fflush(stdout);
 }
@@ -320,6 +400,25 @@ static void zcache_load(const char *dir, int L, int ntok, float **R_out, float *
     *R_out = R; *Ys_out = Ys;
 }
 
+/* cls 方差权²(fit 侧教师方差归一, ftAw/量化侧 DS4_TUNE 同精神; held 不参与=防泄漏) */
+static float *mk_sw2_fit(const float *R, const float *Ys, const int *fit, int nf) {
+    float *Ytf = xmalloc((size_t)nf * D * sizeof(float));
+    for (int i = 0; i < nf; i++) {
+        const float *ys = Ys + (size_t)fit[i] * D, *r = R + (size_t)fit[i] * D;
+        float *o = Ytf + (size_t)i * D;
+        for (int j = 0; j < D; j++) o[j] = ys[j] + r[j];
+    }
+    float *wvf = xmalloc(D * sizeof(float));
+    ds4_loss_dim_variance(Ytf, (uint32_t)nf, D, wvf);
+    free(Ytf);
+    double mw = 0; for (int j = 0; j < D; j++) mw += wvf[j];
+    mw = mw / D + 1e-30;
+    float *sw2 = xmalloc(D * sizeof(float));
+    for (int j = 0; j < D; j++) sw2[j] = (float)((wvf[j] + 1e-6 * mw) / mw);
+    free(wvf);
+    return sw2;
+}
+
 /* 基修正臂组: GE → 乘性出口 → GE+乘性; 产出 gecorr 与 Rge(=R−GE, ftA 叠加臂复用) */
 static void run_base_arms(const zpairs *zp, const float *X, const float *R,
                           const float *Ys, const float *Yt_ev, const float *wv,
@@ -327,16 +426,29 @@ static void run_base_arms(const zpairs *zp, const float *X, const float *R,
                           int nev, int ntok, const ds4_loss_weights *lw, double dscale,
                           uint64_t seed, int nth, int L, FILE *lf, best_t *best,
                           float *Yhat, float *Cb, float *Cp,
-                          float **gecorr_out, float **Rge_out, uint8_t **isfit_out) {
+                          float **gecorr_out, float **Rge_out, uint8_t **isfit_out,
+                          float *dz_out) {
     uint8_t *isfit = xmalloc((size_t)ntok);
     memset(isfit, 0, (size_t)ntok);
     for (int i = 0; i < nf; i++) isfit[fit[i]] = 1;
     double delta[256]; float dzf[256];
-    solve_ge(zp, R, isfit, ntok, 1e-3, L, delta);      /* λ=zlayer GE_LAM 同款 */
+    solve_ge(zp, R, isfit, ntok, 1e-3, L, delta, NULL);  /* λ=zlayer GE_LAM 同款 */
     float *gecorr = ge_corr_build(zp, delta, ntok);
     for (int e = 0; e < 256; e++) dzf[e] = (float)delta[e];
+    if (dz_out) memcpy(dz_out, dzf, 256 * sizeof(float));
     run_bc_arm("GE", dzf, 256, gecorr, X, Ys, Yt_ev, wv, R, ev, mode0, nev,
                lw, dscale, seed, nth, L, lf, best, Yhat, Cb, Cp);
+    {   /* GEw 臂: cls 方差权(fit 侧教师, 防 held 泄漏)白化进 GE 解算目标 —— 四损失
+         * L_classify 从裁判升级为目标组件(用户令); 评估仍在真空间, 四损失总分裁决。 */
+        float *sw2 = mk_sw2_fit(R, Ys, fit, nf);
+        double dw[256]; float dwf[256];
+        solve_ge(zp, R, isfit, ntok, 1e-3, L, dw, sw2);
+        float *gwcorr = ge_corr_build(zp, dw, ntok);
+        for (int e = 0; e < 256; e++) dwf[e] = (float)dw[e];
+        run_bc_arm("GEw", dwf, 256, gwcorr, X, Ys, Yt_ev, wv, R, ev, mode0, nev,
+                   lw, dscale, seed, nth, L, lf, best, Yhat, Cb, Cp);
+        free(gwcorr); free(sw2);
+    }
     float *ua = solve_mul(R, Ys, isfit, ntok, 1e-3);
     float *mc = mul_corr_build(ua, Ys, NULL, ntok);
     run_bc_arm("mul", ua, D, mc, X, Ys, Yt_ev, wv, R, ev, mode0, nev,
@@ -360,8 +472,8 @@ static void run_base_arms(const zpairs *zp, const float *X, const float *R,
         memset(h1, 0, (size_t)ntok); memset(h2, 0, (size_t)ntok);
         for (int i = 0; i < nf; i++) { if (i & 1) h2[fit[i]] = 1; else h1[fit[i]] = 1; }
         double da[256], db[256];
-        solve_ge(zp, R, h1, ntok, 1e-3, L, da);
-        solve_ge(zp, R, h2, ntok, 1e-3, L, db);
+        solve_ge(zp, R, h1, ntok, 1e-3, L, da, NULL);
+        solve_ge(zp, R, h2, ntok, 1e-3, L, db, NULL);
         double nn = 0, na = 0, nb = 0;
         for (int e = 0; e < 256; e++) { nn += da[e] * db[e]; na += da[e] * da[e]; nb += db[e] * db[e]; }
         double cge = nn / (sqrt(na * nb) + 1e-30);
@@ -374,7 +486,7 @@ static void run_base_arms(const zpairs *zp, const float *X, const float *R,
         memset(hv, 0, (size_t)ntok);
         for (int i = 0; i < nev; i++) hv[ev[i]] = 1;
         double dv[256];
-        solve_ge(zp, R, hv, ntok, 1e-3, L, dv);
+        solve_ge(zp, R, hv, ntok, 1e-3, L, dv, NULL);
         nn = na = nb = 0;
         for (int e = 0; e < 256; e++) { nn += delta[e] * dv[e]; na += delta[e] * delta[e]; nb += dv[e] * dv[e]; }
         printf("  L%d 折半稳定性: GEδ cos=%.3f  乘门ua cos=%.3f  fit↔held δ cos=%.3f "

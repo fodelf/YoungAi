@@ -1,26 +1,29 @@
-/* zloss_emit.inc.c — GE-only 端到端注入(斜率标定, 只被 zloss_solve.c include)。
+/* zloss_emit.inc.c — 冠军序列化与注入(只被 zloss_solve.c include)。
  *
- * 依据(2026-08-26 针终判+用户令"跑"): per-layer held 修正家族饱和 ~1%/层, 但
- * held层内≠端到端(冠军 43 层小赢复利出 KL−9.7%)——唯一裁判=caliper。本分片把
- * zloss 家族唯一稳定赢家 GE(每专家门)落成冻结判决尺原生认的 bf.GE 记录, 43 层
- * 注入后跑 caliper_ref.sh, 标定 held↔端到端换算斜率。
+ * 体积铁律(用户 2026-08-26 拷问后定): z 与四损失口径的解必须落成有体积文件——
+ * 反修产线注入 dql(冻结判决尺原生认) → dql_to_zchain → 引擎 --zchain 加载,
+ * 三段同一条链; "只出诊断表"的跑法非法。
  *
- * 记录=zlayer make_rec 同构(116B 头: 名@0/psz u64@88/vd=1@112, 载荷 256×f16 增益);
- * 判决尺语义: 专家累加时乘 g_e(ds4quant_run_p4), 学生基线 Ys=Σw·y ⇒ g_e=1+δ_e
- * (solve_ge 解的是 R≈Σδ_e·w·y 的 δ)。账本 zinject_manifest.txt 同 zlayer
- * (每行"L osz n0", 回滚=按账截断+回写 nrec)。
- * 闸=GE held 四损失 total 严格赢裸才注入(zlayer GATE 同语义); 输裸层零动作,
- * 不算停车审计(斜率标定要的就是"哪些层赢、赢多少、合起来值多少"这张表)。
+ * 两条发射路:
+ *   --emit-ge DIR  GE-only 快路(斜率标定/GE 战役): 只解 GE+GEw, 四损失 held 择优,
+ *                  赢裸即注入 bf.GE(g=1+δ)。
+ *   --emit-z  DIR  全网格路: 四损失选出的冠军臂整体落地——图臂→zl.RRR(±bf.GE 基),
+ *                  门臂→bf.GE; 无引擎类型的臂(mul/GEc/多模式)响亮报不落地。
+ * 记录=zlayer make_rec 同构(116B 头: 名@0/psz u64@88/vd=1@112); 判决尺语义:
+ * 专家累加乘 g_e(ds4quant_run_p4), 学生基线 Ys=Σw·y ⇒ g_e=1+δ_e。
+ * 账本 zinject_manifest.txt 同 zlayer(L osz n0, 回滚=按账截断);
+ * 四损失入档 fourloss_manifest.txt(每层: 臂/λ/k/四损失前后/ER/权重)。
  */
 
 #include <sys/stat.h>
 #include "src/common/ds4_float.h"
 
-static void emitge_inject(const char *ldir, int L, const float *g256) {
+/* 多记录注入: recs=连续记录字节, nrec=条数; 幂等闸=账本已有本层即停车 */
+static void inject_recs(const char *ldir, int L, const uint8_t *recs, size_t len, int nrec) {
     char dql[1200], man[1200];
     snprintf(dql, sizeof dql, "%s/dql_L%02d.bin", ldir, L);
     snprintf(man, sizeof man, "%s/zinject_manifest.txt", ldir);
-    FILE *mf = fopen(man, "r");     /* 全量重跑铁律: 干净工作区不该有本层账 */
+    FILE *mf = fopen(man, "r");
     if (mf) {
         char line[256];
         while (fgets(line, sizeof line, mf))
@@ -28,13 +31,6 @@ static void emitge_inject(const char *ldir, int L, const float *g256) {
                 die("L%d 已在注入账本 %s — 工作区不是干净态, 停车", L, man);
         fclose(mf);
     }
-    uint8_t rec[116 + 512];
-    memset(rec, 0, sizeof rec);
-    memcpy(rec, "bf.GE", 5);
-    uint64_t psz = 512; memcpy(rec + 88, &psz, 8);
-    int32_t vd = 1; memcpy(rec + 112, &vd, 4);
-    uint16_t *g16 = (uint16_t *)(rec + 116);
-    for (int e = 0; e < 256; e++) g16[e] = ds4_f64_to_f16((double)g256[e]);
     struct stat ds;
     if (stat(dql, &ds)) die("dql 不存在: %s", dql);
     long long osz = (long long)ds.st_size;
@@ -42,9 +38,8 @@ static void emitge_inject(const char *ldir, int L, const float *g256) {
     if (!df) die("dql 打不开(r+b): %s", dql);
     uint32_t n0;
     if (fseeko(df, 8, SEEK_SET) || fread(&n0, 4, 1, df) != 1) die("dql nrec 读不到");
-    if (fseeko(df, 0, SEEK_END) || fwrite(rec, 1, sizeof rec, df) != sizeof rec)
-        die("dql 追加失败");
-    uint32_t n1 = n0 + 1;
+    if (fseeko(df, 0, SEEK_END) || fwrite(recs, 1, len, df) != len) die("dql 追加失败");
+    uint32_t n1 = n0 + (uint32_t)nrec;
     if (fseeko(df, 8, SEEK_SET) || fwrite(&n1, 4, 1, df) != 1) die("dql nrec 回写失败");
     fclose(df);
     mf = fopen(man, "a");
@@ -53,8 +48,62 @@ static void emitge_inject(const char *ldir, int L, const float *g256) {
     fclose(mf);
 }
 
-/* GE-only 一层: 解算(λ=1e-3 zlayer GE_LAM 同款)→held 四损失判→过闸注入。
- * 打印行与针的 GE 臂同源(run_bc_arm), 数字口径与三层针逐位可比。 */
+/* 116B 记录头+载荷(zlayer make_rec 同构), 追加进动态缓冲 */
+static uint8_t *rec_append(uint8_t *buf, size_t *len, const char *nm,
+                           const void *pay, size_t psz) {
+    buf = realloc(buf, *len + 116 + psz);
+    if (!buf) die("rec OOM");
+    uint8_t *r = buf + *len;
+    memset(r, 0, 116);
+    memcpy(r, nm, strlen(nm));
+    uint64_t p64 = psz; memcpy(r + 88, &p64, 8);
+    int32_t vd = 1; memcpy(r + 112, &vd, 4);
+    memcpy(r + 116, pay, psz);
+    *len += 116 + psz;
+    return buf;
+}
+
+static uint8_t *rec_ge(uint8_t *buf, size_t *len, const float *dz256) {
+    uint16_t g16[256];
+    for (int e = 0; e < 256; e++) g16[e] = ds4_f64_to_f16(1.0 + (double)dz256[e]);
+    return rec_append(buf, len, "bf.GE", g16, sizeof g16);
+}
+
+/* zl.RRR 载荷: k(u32) tr=0.5(f32) din(u32) dout(u32) + f16 z[k]|U[dout×k]|V[din×k]
+ * (zlayer_p7 非 ADDON 路同构; tr 槽写 0.5=引擎信任域契约) */
+static uint8_t *rec_rrr(uint8_t *buf, size_t *len, const ds4_z *zl) {
+    uint32_t K = zl->k, din = zl->d_in, dout = zl->d_out;
+    size_t nh = (size_t)K + (size_t)dout * K + (size_t)din * K;
+    size_t psz = 16 + nh * 2;
+    uint8_t *pay = xmalloc(psz);
+    float tr05 = 0.5f;
+    memcpy(pay, &K, 4); memcpy(pay + 4, &tr05, 4);
+    memcpy(pay + 8, &din, 4); memcpy(pay + 12, &dout, 4);
+    uint16_t *h = (uint16_t *)(pay + 16);
+    for (uint32_t c = 0; c < K; c++) h[c] = ds4_f64_to_f16((double)zl->z[c]);
+    uint16_t *U16 = h + K, *V16 = h + K + (size_t)dout * K;
+    for (size_t i = 0; i < (size_t)dout * K; i++) U16[i] = ds4_f64_to_f16((double)zl->U[i]);
+    for (size_t i = 0; i < (size_t)din * K; i++) V16[i] = ds4_f64_to_f16((double)zl->V[i]);
+    buf = rec_append(buf, len, "zl.RRR", pay, psz);
+    free(pay);
+    return buf;
+}
+
+/* 四损失入档: 每层一行(臂/λ/k/裸→冠军四项/ER/损失权重) */
+static void fourloss_archive(const char *ldir, int L, const best_t *b, float la0,
+                             float lc0, float tot0, const ds4_loss_weights *lw,
+                             const char *action) {
+    char p[1200]; snprintf(p, sizeof p, "%s/fourloss_manifest.txt", ldir);
+    FILE *f = fopen(p, "a"); if (!f) die("四损失档写不开: %s", p);
+    fprintf(f, "L%02d arm=%s lam=%.3g k=%d align %.6f->%.6f cls %.6f->%.6f "
+            "total %.6f->%.6f ER=%.2f%% w=[%g %g %g %g] %s\n",
+            L, b->arm ? b->arm : "-", b->lam, b->k, la0, b->la, lc0, b->lc,
+            tot0, b->tot, b->er * 100, lw->w_align, lw->w_classify, lw->w_smooth,
+            lw->w_fixed, action);
+    fclose(f);
+}
+
+/* GE-only 快路一层: GE 与 GEw(cls 白化目标) 双解, 四损失 held 择优, 赢裸注入。 */
 static void run_emit_ge(const char *ldir, int L, const zpairs *zp, const float *X,
                         const float *R, const float *Ys, const float *Yt_ev,
                         const float *wv, const int *fit, int nf, const int *ev,
@@ -65,24 +114,66 @@ static void run_emit_ge(const char *ldir, int L, const zpairs *zp, const float *
     uint8_t *isfit = xmalloc((size_t)ntok);
     memset(isfit, 0, (size_t)ntok);
     for (int i = 0; i < nf; i++) isfit[fit[i]] = 1;
-    double delta[256];
-    float dzf[256];
-    solve_ge(zp, R, isfit, ntok, 1e-3, L, delta);
+    best_t best = { tot0, 0, 0, 0, 0, la0, lc0, NULL };
+    int tz = g_track_z; g_track_z = 1;   /* 门参数跟踪走 best.bcdz 统一路 */
+    double delta[256]; float dzf[256];
+    solve_ge(zp, R, isfit, ntok, 1e-3, L, delta, NULL);
     float *gecorr = ge_corr_build(zp, delta, ntok);
     for (int e = 0; e < 256; e++) dzf[e] = (float)delta[e];
-    best_t best = { tot0, 0, 0, 0, 0, la0, lc0, NULL };
     run_bc_arm("GE", dzf, 256, gecorr, X, Ys, Yt_ev, wv, R, ev, mode0, nev,
                lw, dscale, seed, nth, L, lf, &best, Yhat, Cb, Cp);
-    int inject = best.arm && best.tot < tot0;
-    if (inject) {
-        float g[256];
-        for (int e = 0; e < 256; e++) g[e] = 1.0f + dzf[e];
-        emitge_inject(ldir, L, g);
+    {
+        float *sw2 = mk_sw2_fit(R, Ys, fit, nf);
+        double dw[256]; float dwf[256];
+        solve_ge(zp, R, isfit, ntok, 1e-3, L, dw, sw2);
+        float *gwcorr = ge_corr_build(zp, dw, ntok);
+        for (int e = 0; e < 256; e++) dwf[e] = (float)dw[e];
+        run_bc_arm("GEw", dwf, 256, gwcorr, X, Ys, Yt_ev, wv, R, ev, mode0, nev,
+                   lw, dscale, seed, nth, L, lf, &best, Yhat, Cb, Cp);
+        free(gwcorr); free(sw2);
     }
-    fprintf(lf, "# emit-ge: %s total=%.6f 裸=%.6f ER=%.2f%%\n",
-            inject ? "注入" : "输裸不注入", best.tot, tot0, best.er * 100);
-    printf("★L%d GE-only: total %.4f vs 裸 %.4f | ER %+.2f%% → %s\n",
-           L, best.tot, tot0, best.er * 100, inject ? "注入 bf.GE" : "输裸, 不注入");
+    g_track_z = tz;
+    int inject = best.arm && best.bckind == 1 && best.tot < tot0;
+    if (inject) {
+        uint8_t *recs = NULL; size_t len = 0;
+        recs = rec_ge(recs, &len, best.bcdz);
+        inject_recs(ldir, L, recs, len, 1);
+        free(recs);
+    }
+    fourloss_archive(ldir, L, &best, la0, lc0, tot0, lw, inject ? "注入bf.GE" : "输裸不注入");
+    printf("★L%d GE-only: 冠军 %s total %.4f vs 裸 %.4f | ER %+.2f%% → %s\n",
+           L, best.arm ? best.arm : "-", best.tot, tot0, best.er * 100,
+           inject ? "注入 bf.GE" : "输裸, 不注入");
     free(isfit);
     free(gecorr);
+}
+
+/* 全网格路终局: 四损失冠军整体落地。ge_dz=基 GE δ(组合臂的 bf.GE 基)。 */
+static void emit_z_finish(const char *ldir, int L, best_t *best, const float *ge_dz,
+                          float la0, float lc0, float tot0, const ds4_loss_weights *lw) {
+    const char *action;
+    if (!best->arm || best->tot >= tot0) action = "输裸不注入";
+    else if (best->zkeep) {
+        uint8_t *recs = NULL; size_t len = 0; int nrec = 0;
+        if (best->zkeep_hasge && ge_dz) { recs = rec_ge(recs, &len, ge_dz); nrec++; }
+        recs = rec_rrr(recs, &len, best->zkeep); nrec++;
+        inject_recs(ldir, L, recs, len, nrec);
+        free(recs);
+        action = best->zkeep_hasge ? "注入bf.GE+zl.RRR" : "注入zl.RRR";
+        printf("★L%d emit-z: %s k=%u din=%u → %s (%.2fMB)\n", L, best->arm,
+               best->zkeep->k, best->zkeep->d_in, action, len / 1048576.0);
+    } else if (best->bckind == 1) {
+        uint8_t *recs = NULL; size_t len = 0;
+        recs = rec_ge(recs, &len, best->bcdz);
+        inject_recs(ldir, L, recs, len, 1);
+        free(recs);
+        action = "注入bf.GE";
+        printf("★L%d emit-z: 冠军 %s → bf.GE 注入\n", L, best->arm);
+    } else {
+        action = "★冠军臂无引擎序列化路, 未落地★";
+        printf("★L%d emit-z: 冠军 %s (M=%d) 无引擎类型 — 响亮不落地, 挂账\n",
+               L, best->arm, best->M);
+    }
+    fourloss_archive(ldir, L, best, la0, lc0, tot0, lw, action);
+    if (best->zkeep) { ds4_z_free(best->zkeep); best->zkeep = NULL; }
 }

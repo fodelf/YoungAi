@@ -147,6 +147,50 @@ stage_anchor32(){
     LOG "③锚落盘 $(du -h "$ANC32" | cut -f1)"
 }
 
+# ★zloss90 针(32k 锚, 判决门)★: 三层(L20/30/41) 大秩+GEw(cls白化目标)+smooth增广。
+# 判决门: held 家族须从 8192 锚的 1-2%/层 解锁到 ≥5%/层(浅层对照 L3 档), 否则
+# "数据面=墙"假设被否, 停车换形态。ranks 上探 2048=2GB 预算对应容量(ftA 1024≈1.4GB/43层)。
+stage_needle32(){
+    [ -x "$GT/amp/zlayer" ] || DIE "zlayer 缺"
+    [ -x "$GT/amp/zloss_solve" ] || DIE "zloss_solve 缺(emit/GEw/smooth 版)"
+    EXP32=$(( 40 + 43*32768*4096*4 + 2*43*32768*6*4 + 43*32768*4*4096*4 + 32768*129280*4 ))
+    sz=$(stat -c %s "$ANC32" 2>/dev/null || echo 0)
+    [ "$sz" -ge "$EXP32" ] || DIE "32k 锚未就绪($sz/$EXP32), 先跑 anchor32"
+    W32="$WS/layers32"
+    if [ ! -d "$W32" ]; then
+        mkdir -p "$W32"
+        ( cd "$D2/vq86h_noz/layers" || exit 1
+          for f in dql_vq_L*.bin; do ln -f "$f" "$W32/$f" 2>/dev/null || cp "$f" "$W32/"; done
+          cp opt_L*.bin manifest.txt "$W32/" 2>/dev/null ) || DIE "layers32 工作区建失败"
+    fi
+    # 行掩码 128 块×256(几何与 8192 锚同: 每块剔前 64 污染行), 前 96 块 fit / 后 32 held
+    FR32=""; ER32=""
+    for b in $(seq 0 127); do
+        seg="$((b*256+64)):$(( (b+1)*256 ))"
+        if [ "$b" -lt 96 ]; then FR32="${FR32:+$FR32,}$seg"; else ER32="${ER32:+$ER32,}$seg"; fi
+    done
+    mkdir -p "$WS/needle32"
+    wd_start
+    for L in 20 30 41; do
+        Lz=$(printf '%02d' "$L")
+        if [ ! -s "$W32/zcache_L$Lz.npz" ]; then
+            LOG "①L$L zcache32 重建(32768 tok)"
+            env DS4_ZL_NTOK=32768 DS4_ZL_NFIT=24576 DS4_ZL_FIT_RANGES="$FR32" DS4_ZL_EV_RANGE="$ER32" \
+                DS4_ZL_CACHE_ONLY=1 "$GT/amp/zlayer" "$HF" "$W32" "$ANC32" "$L" 1024 0 \
+                2>&1 | grep -aE "zcache|就绪|Error|assert|★" || DIE "L$L zcache32 失败"
+        fi
+        LOG "②L$L 大秩针(k≤2048, GEw+smooth增广, 四损失择优)"
+        "$GT/amp/zloss_solve" --anchor "$ANC32" --zcache "$W32" --out "$WS/needle32" \
+            --layers "$L-$L" --ntok 32768 --threads 18 --modes 1 \
+            --ranks "64,256,512,1024,2048" --lambdas "3e-3,3e-2,3e-1" \
+            --fit-ranges "$FR32" --ev-ranges "$ER32" --smooth-aug
+        rc=$?
+        [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ] || DIE "L$L 针异常 rc=$rc"
+    done
+    wd_stop
+    LOG "③32k 针收官: 表在 $WS/needle32/, 判决门=held ≥5%/层(对照 8192 锚 L20 1.4/L30 0.3/L41 0)"
+}
+
 stage_judge(){  DIE "动态 z 注入格式 + 判决尺升级闸(新尺须逐字节复刻裸 0.47055/r64c 0.42510)未定, 针后设计"; }
 stage_engine(){ DIE "引擎多模式 z 加载路未实现(ds4_z 模块扩容器), 针后设计"; }
 
@@ -154,7 +198,8 @@ case "${1:-needle}" in
     needle)  stage_needle;;
     solve)   stage_solve;;
     anchor32) stage_anchor32;;
+    needle32) stage_needle32;;
     judge)   stage_judge;;
     engine)  stage_engine;;
-    *) DIE "用法: bash zloss_campaign.sh [needle|solve|anchor32|judge|engine]";;
+    *) DIE "用法: bash zloss_campaign.sh [needle|solve|anchor32|needle32|judge|engine]";;
 esac
