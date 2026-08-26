@@ -281,8 +281,8 @@ trace_ladder: $(BEN)/trace_ladder
 $(BEN)/trace_ladder: $(BEN)/trace_ladder.c
 	$(CC) $(BARE) $(NATIVE) -o $@ $< -lm -lpthread
 rec_fidelity: $(BEN)/rec_fidelity
-$(BEN)/rec_fidelity: $(BEN)/rec_fidelity.c
-	$(CC) $(BARE) $(NATIVE) -o $@ $< -lm -lpthread
+$(BEN)/rec_fidelity: $(BEN)/rec_fidelity.c $(CAL)/npy.c
+	$(CC) $(BARE) $(NATIVE) -I$(CAL) -o $@ $(BEN)/rec_fidelity.c $(CAL)/npy.c -lm -lpthread
 
 pubbench: $(BEN)/pubbench
 $(BEN)/pubbench: $(BEN)/pubbench.c $(PUBBENCH_INC)

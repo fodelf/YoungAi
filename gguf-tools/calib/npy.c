@@ -262,6 +262,71 @@ float *npy_read_f32(const char *path, npy_meta *out) {
 }
 
 /* ======================================================================== */
+/* ---- 最小 npz(ZIP_STORED) 条目读取(声明见 npy.h) ----
+ * 2026-08-26 自 bench/rec_fidelity.c 逐行搬入(f16 解码换用本文件已有的
+ * npy_half_to_float, f16→f32→f64 无损, 数值不变)。 */
+static uint16_t npz_rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
+static uint32_t npz_rd32(const uint8_t *p) {
+    return p[0] | (p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+int npz_get(const uint8_t *buf, int64_t sz, const char *name, npz_arr *out) {
+    char want[128]; snprintf(want, sizeof want, "%s.npy", name);
+    int64_t off = 0;
+    while (off + 30 <= sz) {
+        if (npz_rd32(buf + off) != 0x04034b50u) break;   /* 局部文件头 PK\3\4 */
+        uint16_t meth = npz_rd16(buf + off + 8), nlen = npz_rd16(buf + off + 26),
+                 xlen = npz_rd16(buf + off + 28);
+        int64_t csz = npz_rd32(buf + off + 18);
+        const char *nm = (const char *)buf + off + 30;
+        int64_t pay = off + 30 + nlen + xlen;
+        if (csz == 0xFFFFFFFFLL) {   /* ZIP64(numpy npz 常见): 真 u64 尺寸在 extra id=0x0001 */
+            const uint8_t *x = buf + off + 30 + nlen, *xe = x + xlen;
+            while (x + 4 <= xe) {
+                uint16_t id = npz_rd16(x), l = npz_rd16(x + 2);
+                if (id == 1 && l >= 16) { memcpy(&csz, x + 12, 8); break; }
+                x += 4 + l;
+            }
+        }
+        if ((int64_t)strlen(want) == nlen && !memcmp(nm, want, nlen)) {
+            if (meth != 0) { fprintf(stderr, "npz %s: 压缩条目不支持\n", name); return -1; }
+            const uint8_t *p = buf + pay;
+            if (memcmp(p, "\x93NUMPY", 6)) { fprintf(stderr, "npz %s: 非 npy\n", name); return -1; }
+            int maj = p[6];
+            uint32_t hl = maj >= 2 ? npz_rd32(p + 8) : npz_rd16(p + 8);
+            const char *hdr = (const char *)p + (maj >= 2 ? 12 : 10);
+            const uint8_t *data = p + (maj >= 2 ? 12 : 10) + hl;
+            char dt[8] = {0};
+            { const char *q = strstr(hdr, "'descr':"); if (!q) return -1;
+              q = strchr(q + 8, '\'');                        /* 跳过键, 值起始引号 */
+              const char *e = strchr(q + 1, '\'');
+              size_t l = (size_t)(e - q - 1); if (l > 7) l = 7; memcpy(dt, q + 1, l); }
+            int64_t d0 = 1, d1 = 1, nd = 0;
+            { const char *q = strstr(hdr, "'shape':"); if (!q) return -1;
+              q = strchr(q, '(') + 1;
+              while (*q && *q != ')') {
+                  while (*q == ' ' || *q == ',') q++;
+                  if (*q == ')') break;
+                  int64_t v = strtoll(q, (char **)&q, 10);
+                  if (nd == 0) d0 = v; else if (nd == 1) d1 = v;
+                  nd++;
+              } }
+            int64_t n = d0 * d1;
+            double *v = malloc((size_t)n * 8);
+            if (!v) return -1;
+            if (!strcmp(dt, "<f4")) { const float *s = (const float *)data; for (int64_t i = 0; i < n; i++) v[i] = s[i]; }
+            else if (!strcmp(dt, "<f8")) memcpy(v, data, (size_t)n * 8);
+            else if (!strcmp(dt, "<f2")) { const uint16_t *s = (const uint16_t *)data; for (int64_t i = 0; i < n; i++) v[i] = (double)npy_half_to_float(s[i]); }
+            else if (!strcmp(dt, "<i4")) { const int32_t *s = (const int32_t *)data; for (int64_t i = 0; i < n; i++) v[i] = s[i]; }
+            else if (!strcmp(dt, "<i8")) { const int64_t *s = (const int64_t *)data; for (int64_t i = 0; i < n; i++) v[i] = (double)s[i]; }
+            else { fprintf(stderr, "npz %s: dtype %s 不支持\n", name, dt); free(v); return -1; }
+            out->v = v; out->n = n; out->d0 = d0; out->d1 = nd > 1 ? d1 : 1;
+            return 0;
+        }
+        off = pay + csz;
+    }
+    return -1;
+}
+
 #ifdef NPY_TEST
 #include <math.h>
 

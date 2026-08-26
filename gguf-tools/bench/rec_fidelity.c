@@ -1,7 +1,8 @@
 /* rec_fidelity.c — 注入载荷忠实度对拍器(C, 2026-08-25 Python→C 迁移 Wave A)。
  * 取代 zlever/rec_fidelity.py。把 dql 注入记录按回放公式(type5 GE / type6 zl.RRR 含
  * ftA φ 提升)重放在解算 zcache 的同一批 x 行上, 重评 held/fit 挽回率 —— S1↔S2 对拍仪。
- * zcache=.npz(np.savez 默认 ZIP_STORED 无压缩): 内嵌最小解析器(局部文件头+npy 头)。
+ * zcache=.npz(np.savez 默认 ZIP_STORED 无压缩): 读取走 calib/npy.c 的 npz_get
+ * (2026-08-26 并入, 全仓唯一 npz 实现; 原内嵌解析器逐行搬过去, 数值不变)。
  * 行集与发车 env 同式: FR=块0-23 剔前64, ER=块24-31 剔前64。
  * 用法: rec_fidelity <layers_dir> <L> [orig_len=855638144] */
 #include <stdio.h>
@@ -9,13 +10,11 @@
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
+#include "npy.h"
 
 #define D 4096
 
-/* ---- 最小 npz(stored) 读取: 返回 malloc 的 f64 数组(所有 dtype 升为 f64) ---- */
-typedef struct { double *v; long long n, d0, d1; } arr_t;   /* shape (d0[,d1]) */
-static uint16_t rd16(const uint8_t *p) { return p[0] | (p[1] << 8); }
-static uint32_t rd32(const uint8_t *p) { return p[0] | (p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
+/* f16→f64: dql fp16 载荷(GE 门/z/U/V)解码用, 精确 IEEE 展开 */
 static double f16_to_f64(uint16_t h) {
     int s = (h >> 15) & 1, e = (h >> 10) & 31, m = h & 1023;
     double v;
@@ -23,62 +22,6 @@ static double f16_to_f64(uint16_t h) {
     else if (e == 31) v = m ? NAN : INFINITY;
     else v = ldexp(m + 1024, e - 25);
     return s ? -v : v;
-}
-static int npz_get(const uint8_t *buf, long long sz, const char *name, arr_t *out) {
-    char want[128]; snprintf(want, sizeof want, "%s.npy", name);
-    long long off = 0;
-    while (off + 30 <= sz) {
-        if (rd32(buf + off) != 0x04034b50u) break;   /* 局部文件头 PK\3\4 */
-        uint16_t meth = rd16(buf + off + 8), nlen = rd16(buf + off + 26), xlen = rd16(buf + off + 28);
-        long long csz = rd32(buf + off + 18);
-        const char *nm = (const char *)buf + off + 30;
-        long long pay = off + 30 + nlen + xlen;
-        if (csz == 0xFFFFFFFFLL) {   /* ZIP64(numpy npz 常见): 真 u64 尺寸在 extra id=0x0001 */
-            const uint8_t *x = buf + off + 30 + nlen, *xe = x + xlen;
-            while (x + 4 <= xe) {
-                uint16_t id = rd16(x), l = rd16(x + 2);
-                if (id == 1 && l >= 16) { memcpy(&csz, x + 12, 8); break; }   /* [未压尺寸u64][压后尺寸u64] */
-                x += 4 + l;
-            }
-        }
-        if ((long long)strlen(want) == nlen && !memcmp(nm, want, nlen)) {
-            if (meth != 0) { fprintf(stderr, "npz %s: 压缩条目不支持\n", name); return -1; }
-            const uint8_t *p = buf + pay;
-            if (memcmp(p, "\x93NUMPY", 6)) { fprintf(stderr, "npz %s: 非 npy\n", name); return -1; }
-            int maj = p[6];
-            uint32_t hl = maj >= 2 ? rd32(p + 8) : rd16(p + 8);
-            const char *hdr = (const char *)p + (maj >= 2 ? 12 : 10);
-            const uint8_t *data = p + (maj >= 2 ? 12 : 10) + hl;
-            char dt[8] = {0};
-            { const char *q = strstr(hdr, "'descr':"); if (!q) return -1;
-              q = strchr(q + 8, '\'');                        /* 跳过键, 值起始引号 */
-              const char *e = strchr(q + 1, '\'');
-              size_t l = e - q - 1; if (l > 7) l = 7; memcpy(dt, q + 1, l); }
-            long long d0 = 1, d1 = 1, nd = 0;
-            { const char *q = strstr(hdr, "'shape':"); if (!q) return -1;
-              q = strchr(q, '(') + 1;
-              while (*q && *q != ')') {
-                  while (*q == ' ' || *q == ',') q++;
-                  if (*q == ')') break;
-                  long long v = strtoll(q, (char **)&q, 10);
-                  if (nd == 0) d0 = v; else if (nd == 1) d1 = v;
-                  nd++;
-              } }
-            long long n = d0 * d1;
-            double *v = malloc((size_t)n * 8);
-            if (!strcmp(dt, "<f4")) { const float *s = (const float *)data; for (long long i = 0; i < n; i++) v[i] = s[i]; }
-            else if (!strcmp(dt, "<f8")) memcpy(v, data, (size_t)n * 8);
-            else if (!strcmp(dt, "<f2")) { const uint16_t *s = (const uint16_t *)data; for (long long i = 0; i < n; i++) v[i] = f16_to_f64(s[i]); }
-            else if (!strcmp(dt, "<i4")) { const int32_t *s = (const int32_t *)data; for (long long i = 0; i < n; i++) v[i] = s[i]; }
-            else if (!strcmp(dt, "<i8")) { const int64_t *s = (const int64_t *)data; for (long long i = 0; i < n; i++) v[i] = (double)s[i]; }
-            else { fprintf(stderr, "npz %s: dtype %s 不支持\n", name, dt); free(v); return -1; }
-            (void)csz;
-            out->v = v; out->n = n; out->d0 = d0; out->d1 = nd > 1 ? d1 : 1;
-            return 0;
-        }
-        off = pay + csz;
-    }
-    return -1;
 }
 
 int main(int argc, char **argv) {
@@ -117,7 +60,7 @@ int main(int argc, char **argv) {
     uint8_t *zbuf = malloc(zsz);
     if (fread(zbuf, 1, zsz, zf) != (size_t)zsz) return 2;
     fclose(zf);
-    arr_t dH, prow, pe, pw, pYQ, X;
+    npz_arr dH, prow, pe, pw, pYQ, X;
     if (npz_get(zbuf, zsz, "dH", &dH) || npz_get(zbuf, zsz, "prow", &prow) ||
         npz_get(zbuf, zsz, "pe", &pe) || npz_get(zbuf, zsz, "pw", &pw) ||
         npz_get(zbuf, zsz, "pYQ", &pYQ)) { fprintf(stderr, "zcache 字段缺\n"); return 2; }

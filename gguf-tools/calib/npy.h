@@ -31,4 +31,11 @@ int npy_stat(const char *path, npy_meta *out);
  * If out != NULL it is filled with the array metadata. */
 float *npy_read_f32(const char *path, npy_meta *out);
 
+/* ---- npz (np.savez, ZIP_STORED 无压缩) 条目读取: zcache 契约 ----
+ * 返回 malloc 的 f64 数组(所有 dtype 升 f64), 支持 <f2/<f4/<f8/<i4/<i8 与 ZIP64。
+ * 2026-08-26 从 bench/rec_fidelity.c 并入: 全仓唯一 npz 实现(铁律: 已有功能
+ * 模块禁止另建同功能文件)。 */
+typedef struct { double *v; int64_t n, d0, d1; } npz_arr;   /* shape (d0[,d1]) */
+int npz_get(const uint8_t *buf, int64_t sz, const char *name, npz_arr *out);
+
 #endif /* GO_ONEBIT_NPY_H */
