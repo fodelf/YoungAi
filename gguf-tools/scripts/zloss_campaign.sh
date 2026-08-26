@@ -9,7 +9,7 @@
 #     → [针过闸后] solve 43 层(档位按针定, 未定档拒跑)
 #     → judge/engine(动态 z 注入格式 + 判决尺升级闸, 针后设计)
 # 目标: Σmin ≥ 0.90(裸 0.7799/冠军 r64c 0.7903), 体积 ≤ 2GB(用户 08-26 拍板)。
-# 用法: bash zloss_campaign.sh [needle|solve|judge|engine]
+# 用法: bash zloss_campaign.sh [needle|solve|full4l|judge|engine]
 # ★无环境变量铁律: 本脚本参数全部写死; DS4_ZL_* 是 zlayer(冻结转录件)的既有
 # 面板, 只用不新增。zlayer 只当 zcache 数据生产器(CACHE_ONLY), 解算线唯一
 # = zloss_solve(反修只留一份解算器, 用户 08-26 铁律)。★
@@ -122,77 +122,48 @@ stage_solve(){
     grep -aE "PPL|KLD|RMS|Same|Δp|min" /tmp/caliper_zge.log | tail -10
     LOG "③端到端斜率标定完成: 对表 裸 0.47055 / r64c 0.42510, 全表 /tmp/caliper_zge.log"
 }
-# ★zloss90 数据面(2026-08-26 用户令: 体积花到 2GB 换 Σmin→0.90)★
-# 锚 8192tok/32段 → 32768tok/128段(放大器半池多采, 同冻结语料, 量化半零重叠不动)。
-# 依据三指纹: 大秩 held 单调恶化(数据饿)+fit↔held δcos 塌(段漂移)+GEc 段覆盖墙。
-# FP 锚定遍=base86p_spark.sh 同式(em 针 08-26 同路刚验证), 逐层顺序写=浅层段先可用,
-# 落盘 ~132GB。判决门(锚就绪后的针): held 家族须从 1-2%/层 解锁到 ≥5%/层, 否则
-# 数据面不是墙、停车换形态。
-ANC32="$D2/anchor_a_clean_s32768.bin"
-stage_anchor32(){
-    IDS32="$D2/vqhalf_a32k.ids"
-    [ -s "$IDS32" ] || bash "$GT/scripts/amp_campaign.sh" idshalf_ext 32768 256 vqhalf_a32k.ids \
-        || DIE "扩样 ids 生成失败"
-    [ -s "$IDS32" ] || DIE "ids 没落盘 $IDS32"
-    n=$(wc -l < "$IDS32"); [ "$n" -eq 32768 ] || DIE "ids 行数 $n ≠ 32768"
-    # 完成判据=头魔数(anchor_save 最后写头=提交标记; 半成品被 ftruncate 成全尺寸, 只看
-    # 存在/大小会把无头垃圾当成品 —— 2026-08-26 实锤)。头坏不删文件: 建锚 mmap 原地重写。
-    if [ -s "$ANC32" ] && [ "$(head -c 4 "$ANC32" 2>/dev/null)" = "DQA2" ]; then
-        LOG "锚已在(DQA2 头有效, $(du -h "$ANC32" | cut -f1)), 跳过"; return 0; fi
-    avail_gb=$(df -BG --output=avail "$D2" | tail -1 | tr -dc 0-9)
-    [ "$avail_gb" -ge 200 ] || DIE "盘余 ${avail_gb}GB <200GB, 锚 ~132GB 不发车"
-    LOG "②FP 锚定遍发车 S=32768 → $ANC32 (~132GB, 逐层写)"
+# ★4L 全量(2026-08-26 用户令"跑"): 8192 放大器半锚(与量化半同口径, 零重叠), 43 层。
+# 每层: zcache(缺则建) → 全臂网格(4L/x/GE 族同表四损失择优, λ 扩到 1/3/10/30 —— 原
+# 网格顶 0.3 是边界单调 bug, L41/L20 修后双双赢裸) → 冠军 emit-z(zl.RRR±bf.GE+zl.4L)
+# → caliper 五指标。体积: k≤512 时 z 最大 8.4MB/层 ×43 ≈ 360MB(2GB 预算内)。
+# 对表: 裸 0.47055 / r64c 冠军 0.42510 / 官方 q2 0.4207。
+stage_full4l(){
+    [ -s "$ANC" ] || DIE "8192 干净锚缺 $ANC"
+    [ -x "$GT/amp/zloss_solve" ] || DIE "zloss_solve 缺"
+    G4="$D2/z4l"
+    rm -rf "$G4"; mkdir -p "$G4/layers"
+    ( cd "$D2/vq86h_noz/layers" || exit 1
+      for f in dql_vq_L*.bin; do ln -f "$f" "$G4/layers/$f" 2>/dev/null || cp "$f" "$G4/layers/"; done
+      cp dql_ops_L*.bin opt_L*.bin manifest.txt "$G4/layers/" 2>/dev/null
+      cp dql_L*.bin "$G4/layers/" ) || DIE "注入工作区建失败"
+    N=$(ls "$G4/layers"/dql_vq_L*.bin 2>/dev/null | wc -l)
+    [ "$N" -eq 43 ] || DIE "层件不齐 $N/43"
+    mkdir -p "$WS/n4l"
+    LOG "①注入工作区就绪(43 层件, 从 vq86h_noz 干净态)"
     wd_start
-    ( cd "$GT/amp" && env DS4_HF="$HF" DS4_FP_ONLY=1 DS4_ANCHOR="$ANC32" \
-        DS4_THREADS=20 OPENBLAS_NUM_THREADS=1 ./ds4quant_run "$IDS32" 32768 ) \
-        || { wd_stop; DIE "FP 锚定遍失败"; }
-    wd_stop
-    LOG "③锚落盘 $(du -h "$ANC32" | cut -f1)"
-}
-
-# ★zloss90 针(32k 锚, 判决门)★: 三层(L20/30/41) 大秩+GEw(cls白化目标)+smooth增广。
-# 判决门: held 家族须从 8192 锚的 1-2%/层 解锁到 ≥5%/层(浅层对照 L3 档), 否则
-# "数据面=墙"假设被否, 停车换形态。ranks 上探 2048=2GB 预算对应容量(ftA 1024≈1.4GB/43层)。
-stage_needle32(){
-    [ -x "$GT/amp/zlayer" ] || DIE "zlayer 缺"
-    [ -x "$GT/amp/zloss_solve" ] || DIE "zloss_solve 缺(emit/GEw/smooth 版)"
-    EXP32=$(( 40 + 43*32768*4096*4 + 2*43*32768*6*4 + 43*32768*4*4096*4 + 32768*129280*4 ))
-    sz=$(stat -c %s "$ANC32" 2>/dev/null || echo 0)
-    [ "$sz" -ge "$EXP32" ] || DIE "32k 锚未就绪($sz/$EXP32), 先跑 anchor32"
-    [ "$(head -c 4 "$ANC32" 2>/dev/null)" = "DQA2" ] || DIE "32k 锚无 DQA2 头(半成品), 先跑完 anchor32"
-    W32="$WS/layers32"
-    if [ ! -d "$W32" ]; then
-        mkdir -p "$W32"
-        ( cd "$D2/vq86h_noz/layers" || exit 1
-          for f in dql_vq_L*.bin; do ln -f "$f" "$W32/$f" 2>/dev/null || cp "$f" "$W32/"; done
-          cp opt_L*.bin manifest.txt "$W32/" 2>/dev/null ) || DIE "layers32 工作区建失败"
-    fi
-    # 行掩码 128 块×256(几何与 8192 锚同: 每块剔前 64 污染行), 前 96 块 fit / 后 32 held
-    FR32=""; ER32=""
-    for b in $(seq 0 127); do
-        seg="$((b*256+64)):$(( (b+1)*256 ))"
-        if [ "$b" -lt 96 ]; then FR32="${FR32:+$FR32,}$seg"; else ER32="${ER32:+$ER32,}$seg"; fi
-    done
-    mkdir -p "$WS/needle32"
-    wd_start
-    for L in 20 30 41; do
+    for L in $(seq 0 42); do
         Lz=$(printf '%02d' "$L")
-        if [ ! -s "$W32/zcache_L$Lz.npz" ]; then
-            LOG "①L$L zcache32 重建(32768 tok)"
-            env DS4_ZL_NTOK=32768 DS4_ZL_NFIT=24576 DS4_ZL_FIT_RANGES="$FR32" DS4_ZL_EV_RANGE="$ER32" \
-                DS4_ZL_CACHE_ONLY=1 "$GT/amp/zlayer" "$HF" "$W32" "$ANC32" "$L" 1024 0 \
-                2>&1 | grep -aE "zcache|就绪|Error|assert|★" || DIE "L$L zcache32 失败"
+        if [ ! -s "$WS/layers/zcache_L$Lz.npz" ]; then
+            LOG "L$L zcache 重建"
+            env DS4_ZL_NTOK=$NTOK DS4_ZL_NFIT=$NFIT DS4_ZL_FIT_RANGES="$FR" DS4_ZL_EV_RANGE="$ER" \
+                DS4_ZL_CACHE_ONLY=1 "$GT/amp/zlayer" "$HF" "$WS/layers" "$ANC" "$L" 1024 0 \
+                2>&1 | grep -aE "zcache|就绪|Error|assert|★" || DIE "L$L zcache 失败"
         fi
-        LOG "②L$L 大秩针(k≤2048, GEw+smooth增广, 四损失择优)"
-        "$GT/amp/zloss_solve" --anchor "$ANC32" --zcache "$W32" --out "$WS/needle32" \
-            --layers "$L-$L" --ntok 32768 --threads 18 --modes 1 \
-            --ranks "64,256,512,1024,2048" --lambdas "3e-3,3e-2,3e-1" \
-            --fit-ranges "$FR32" --ev-ranges "$ER32" --smooth-aug
-        rc=$?
-        [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ] || DIE "L$L 针异常 rc=$rc"
+        "$GT/amp/zloss_solve" --anchor "$ANC" --zcache "$WS/layers" --out "$WS/n4l" \
+            --layers "$L-$L" --ntok $NTOK --threads 18 --modes 1 \
+            --ranks "16,64,128,512" --lambdas "1,3,10,30" \
+            --fit-ranges "$FR" --ev-ranges "$ER" --smooth-aug --emit-z "$G4/layers" \
+            || DIE "L$L 解算/注入异常"
+        NI=$(wc -l < "$G4/layers/zinject_manifest.txt" 2>/dev/null || echo 0)
+        LOG "L$L ✓ 注入账 $NI/43"
     done
     wd_stop
-    LOG "③32k 针收官: 表在 $WS/needle32/, 判决门=held ≥5%/层(对照 8192 锚 L20 1.4/L30 0.3/L41 0)"
+    VOL=$(du -sm "$G4/layers" 2>/dev/null | cut -f1)
+    LOG "②43 层收官(注入 $NI 层, 工作区 ${VOL}MB) → caliper 五指标"
+    bash "$GT/scripts/caliper_ref.sh" "$G4/layers" /tmp/qc_z4l_wt2.bin > /tmp/caliper_z4l.log 2>&1 \
+        || DIE "caliper 失败, 看 /tmp/caliper_z4l.log"
+    grep -aE "PPL|KLD|RMS|Same|min" /tmp/caliper_z4l.log | tail -8
+    LOG "③4L 全量终判完成: 对表 裸 0.47055 / r64c 0.42510"
 }
 
 stage_judge(){  DIE "动态 z 注入格式 + 判决尺升级闸(新尺须逐字节复刻裸 0.47055/r64c 0.42510)未定, 针后设计"; }
@@ -201,9 +172,8 @@ stage_engine(){ DIE "引擎多模式 z 加载路未实现(ds4_z 模块扩容器)
 case "${1:-needle}" in
     needle)  stage_needle;;
     solve)   stage_solve;;
-    anchor32) stage_anchor32;;
-    needle32) stage_needle32;;
+    full4l)  stage_full4l;;
     judge)   stage_judge;;
     engine)  stage_engine;;
-    *) DIE "用法: bash zloss_campaign.sh [needle|solve|anchor32|needle32|judge|engine]";;
+    *) DIE "用法: bash zloss_campaign.sh [needle|solve|full4l|judge|engine]";;
 esac
