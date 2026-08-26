@@ -291,47 +291,89 @@ void dq_hc_sinkhorn(const float *mixes, const float *scale, const float *base,
 
 /* hc_pre: h[S,HCM,DIM] → y[S,DIM], post[S,HCM], comb[S,HCM,HCM].
  * x=h.reshape(S,HCM*DIM); mixes=(x@fn.T)*rsqrt(mean(x²)); sinkhorn; y=Σ_j pre[j]*h[j]. */
+/* ---- hc 混合族 s 切片并行(2026-08-26 用户令提速: 32k 锚定遍相位计时定罪
+ * hc7-8s+mix8s/层全在单线程) —— 各 s 行完全独立, 按行切线程 = 数值逐位不变
+ * (dq_softmax_rows_par 同纪律)。mode: 0=hc_pre mixes  1=hc_pre y 混合  2=hc_post。 ---- */
+typedef struct {
+    int mode, HCM, DIM, HD, mixdim;
+    const float *h, *fn, *pre, *a, *resid, *post, *comb;
+    float *mixes, *y, *out; float EPS;
+} dq_hcw;
+static void dq_hc_range(dq_hcw *w, int a0, int b0) {
+    if (w->mode == 0) {
+        for (int s = a0; s < b0; s++) {
+            const float *x = w->h + (size_t)s * w->HD;
+            double v = 0.0; for (int i = 0; i < w->HD; i++) v += (double)x[i]*(double)x[i];
+            float rsq = (float)(1.0/sqrt(v/(double)w->HD + (double)w->EPS));
+            float *mx = w->mixes + (size_t)s * w->mixdim;
+            for (int m = 0; m < w->mixdim; m++) {
+                const float *fr = w->fn + (size_t)m * w->HD;
+                float acc = 0.0f; for (int k = 0; k < w->HD; k++) acc += x[k]*fr[k];
+                mx[m] = acc * rsq;
+            }
+        }
+    } else if (w->mode == 1) {
+        for (int s = a0; s < b0; s++)
+            for (int d = 0; d < w->DIM; d++) {
+                float acc = 0.0f;
+                for (int j = 0; j < w->HCM; j++)
+                    acc += w->pre[(size_t)s*w->HCM+j] * w->h[((size_t)s*w->HCM+j)*w->DIM+d];
+                w->y[(size_t)s*w->DIM+d] = acc;
+            }
+    } else {
+        for (int s = a0; s < b0; s++)
+            for (int j = 0; j < w->HCM; j++) {
+                float pj = w->post[(size_t)s*w->HCM+j];
+                const float *cj = w->comb + ((size_t)s*w->HCM+j)*w->HCM;
+                float *o = w->out + ((size_t)s*w->HCM+j)*w->DIM;
+                const float *ar = w->a + (size_t)s*w->DIM;
+                for (int d = 0; d < w->DIM; d++) {
+                    float acc = pj * ar[d];
+                    for (int k = 0; k < w->HCM; k++) acc += cj[k] * w->resid[((size_t)s*w->HCM+k)*w->DIM+d];
+                    o[d] = acc;
+                }
+            }
+    }
+}
+typedef struct { dq_hcw *w; int a, b; } dq_hcj;
+static void *dq_hc_thr(void *arg) { dq_hcj *j = (dq_hcj *)arg; dq_hc_range(j->w, j->a, j->b); return NULL; }
+static void dq_hc_par(dq_hcw *w, int S) {
+    static int NTH = 0;   /* 线程数=在线核数(dq_softmax_rows_par 同式, 不读 env) */
+    if (!NTH) { long nc = sysconf(_SC_NPROCESSORS_ONLN); NTH = (int)(nc < 1 ? 1 : (nc > 64 ? 64 : nc)); }
+    if (NTH <= 1 || S < 256) { dq_hc_range(w, 0, S); return; }
+    pthread_t th[64]; dq_hcj js[64];
+    int per = (S + NTH - 1) / NTH, n = 0;
+    for (int t = 0; t < NTH; t++) {
+        int a = t * per, b = a + per > S ? S : a + per;
+        if (a >= b) break;
+        js[n] = (dq_hcj){w, a, b};
+        if (pthread_create(&th[n], NULL, dq_hc_thr, &js[n]) != 0) dq_hc_range(w, a, b);
+        else n++;
+    }
+    for (int t = 0; t < n; t++) pthread_join(th[t], NULL);
+}
+
 void dq_hc_pre(const float *h, const float *fn, const float *scale, const float *base,
                float *y, float *post, float *comb, int S, int HCM, int DIM,
                int mixdim, int HCIT, float EPS, float HCEPS) {
     int HD = HCM * DIM;
     float *mixes = (float *)malloc((size_t)S * mixdim * sizeof(float));
     float *pre = (float *)malloc((size_t)S * HCM * sizeof(float));
-    for (int s = 0; s < S; s++) {
-        const float *x = h + (size_t)s * HD;
-        double v = 0.0; for (int i = 0; i < HD; i++) v += (double)x[i]*(double)x[i];
-        float rsq = (float)(1.0/sqrt(v/(double)HD + (double)EPS));
-        float *mx = mixes + (size_t)s * mixdim;
-        for (int m = 0; m < mixdim; m++) {
-            const float *fr = fn + (size_t)m * HD;
-            float a = 0.0f; for (int k = 0; k < HD; k++) a += x[k]*fr[k];
-            mx[m] = a * rsq;
-        }
-    }
+    dq_hcw w0 = { 0, HCM, DIM, HD, mixdim, h, fn, NULL, NULL, NULL, NULL, NULL,
+                  mixes, NULL, NULL, EPS };
+    dq_hc_par(&w0, S);
     dq_hc_sinkhorn(mixes, scale, base, pre, post, comb, S, HCM, HCIT, HCEPS);
-    for (int s = 0; s < S; s++)
-        for (int d = 0; d < DIM; d++) {
-            float a = 0.0f;
-            for (int j = 0; j < HCM; j++) a += pre[(size_t)s*HCM+j] * h[((size_t)s*HCM+j)*DIM+d];
-            y[(size_t)s*DIM+d] = a;
-        }
+    dq_hcw w1 = { 1, HCM, DIM, HD, mixdim, h, NULL, pre, NULL, NULL, NULL, NULL,
+                  NULL, y, NULL, EPS };
+    dq_hc_par(&w1, S);
     free(mixes); free(pre);
 }
 
 /* hc_post: out[S,HCM,DIM] = post[:,:,None]*a[:,None,:] + einsum('sjk,skd->sjd', comb, resid). */
 void dq_hc_post(const float *a, const float *resid, const float *post, const float *comb,
                 float *out, int S, int HCM, int DIM) {
-    for (int s = 0; s < S; s++)
-        for (int j = 0; j < HCM; j++) {
-            float pj = post[(size_t)s*HCM+j];
-            const float *cj = comb + ((size_t)s*HCM+j)*HCM;
-            float *o = out + ((size_t)s*HCM+j)*DIM;
-            const float *ar = a + (size_t)s*DIM;
-            for (int d = 0; d < DIM; d++) {
-                float acc = pj * ar[d];
-                for (int k = 0; k < HCM; k++) acc += cj[k] * resid[((size_t)s*HCM+k)*DIM+d];
-                o[d] = acc;
-            }
-        }
+    dq_hcw w2 = { 2, HCM, DIM, HCM * DIM, 0, NULL, NULL, NULL, a, resid, post, comb,
+                  NULL, NULL, out, 0.0f };
+    dq_hc_par(&w2, S);
 }
 
