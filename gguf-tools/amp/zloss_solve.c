@@ -21,12 +21,10 @@
  * 产物序列化(多模式容器/注入格式/判决尺升级闸)待针裁决后定, 本针只出诊断表。
  *
  * 用法: zloss_solve --anchor FILE --zcache DIR --out DIR --layers a-b
- *   [--ntok 8192] [--modes 1,8,16] [--ranks 16,64,128,256]
- *   [--lambdas 3e-3,3e-2,3e-1] [--wa 1] [--wc 0.5] [--ws 0.1] [--wf 1e-3]
- *   [--dither 0.04] [--seed 1] [--threads 16]
+ *   [--ntok 8192] [--modes 1,8,16] [--ranks 16,64,128,256] [--lambdas 3e-3,3e-2,3e-1]
+ *   [--wa 1] [--wc 0.5] [--ws 0.1] [--wf 1e-3] [--dither 0.04] [--seed 1] [--threads 16]
  *   [--fit-ranges a:b,..] [--ev-ranges a:b,..]   (行掩码: 拼接语料剔污染行)
- *   [--emit-ge DIR]  GE-only 端到端路(zloss_emit.inc.c): 只解 GE, held 过闸后把
- *                    bf.GE 注入 DIR/dql_L%02d.bin(冻结判决尺原生认), 斜率标定用。
+ *   [--emit-ge DIR] GE-only 端到端路 | [--emit-z DIR] 冠军整体落地(z+GE+四损失参数)
  * 全 CLI 参数, 无环境变量(铁律)。
  */
 #define _FILE_OFFSET_BITS 64
@@ -285,7 +283,7 @@ int main(int argc, char **argv) {
         double td = tnow(), tge = td, tx = td, tphi = td, tfta = td;
         float *Yt = xmalloc((size_t)ntok * D * sizeof(float));
         for (size_t i = 0; i < (size_t)ntok * D; i++) Yt[i] = Ys[i] + R[i];
-        zl_healthcheck(X, R, Ys, ntok, L);
+        zl_healthcheck(X, R, Ys, ntok, L);   /* 数据面体检(NaN/rms/巨值集中度) */
 
         float *Yt_ev = xmalloc((size_t)nev * D * sizeof(float));
         float *Ys_ev = xmalloc((size_t)nev * D * sizeof(float));
@@ -475,13 +473,13 @@ int main(int argc, char **argv) {
                best.er * 100);
         /* ★fclose 必须在 recheck 之后: 原顺序把已 fclose 的 lf 传进 recheck 再
          * fprintf = use-after-free 踩坏 heap(随机层 free(): invalid pointer)★ */
-        if (emitz && !selftest)          /* 落地前用部署位宽(fp16)复评 —— 位宽账 */
+        if (emitz && !selftest) {        /* 部署位宽复评 → 冠军落地(z+GE+四损失参数) */
             z_fp16_recheck(&best, best.zkeep_hasge ? gecorr : NULL, X, Ys, R, Yt_ev,
                            wv, ev, mode0, nev, dscale, seed, nth, L, lf);
-        fclose(lf);
-        if (emitz && !selftest)          /* 冠军落地(zl.RRR/bf.GE + zl.4L 四损失参数) */
+            fclose(lf);
             emit_z_finish(emitz, L, &best, ge_dz, la0, lc0,
                           tot0, &lw, Yt, fit, nf, seed, (float)dscale, ge_wins);
+        } else fclose(lf);
         if (!won && !emitz) any_lost = 1;   /* 落地跑: 输裸层=记档不注入, 不停车 */
         if (selftest) {
             printf("★selftest: M=1 best align=%.4f  M=2 best align=%.4f\n",
