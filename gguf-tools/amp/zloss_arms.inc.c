@@ -472,6 +472,27 @@ static void run_base_arms(const zpairs *zp, const float *X, const float *R,
     float *mc2 = mul_corr_build(ua2, base2, gecorr, ntok);
     run_bc_arm("GE+mul", ua2, D, mc2, X, Ys, Yt_ev, wv, R, ev, mode0, nev,
                lw, dscale, seed, nth, L, lf, best, Yhat, Cb, Cp);
+    /* 折半稳定性诊断("没找到≠没有"的定量化): fit 交替对半双解, 两组参数余弦。
+     * 高相关+输 held = 模型家族错(结构在, 形态不对); 低相关 = 数据饿
+     * (每专家/每通道有效样本不足, 解在拟合噪声)。 */
+    {
+        uint8_t *h1 = xmalloc((size_t)ntok), *h2 = xmalloc((size_t)ntok);
+        memset(h1, 0, (size_t)ntok); memset(h2, 0, (size_t)ntok);
+        for (int i = 0; i < nf; i++) { if (i & 1) h2[fit[i]] = 1; else h1[fit[i]] = 1; }
+        double da[256], db[256];
+        solve_ge(zp, R, h1, ntok, 1e-3, L, da);
+        solve_ge(zp, R, h2, ntok, 1e-3, L, db);
+        double nn = 0, na = 0, nb = 0;
+        for (int e = 0; e < 256; e++) { nn += da[e] * db[e]; na += da[e] * da[e]; nb += db[e] * db[e]; }
+        double cge = nn / (sqrt(na * nb) + 1e-30);
+        float *u1 = solve_mul(R, Ys, h1, ntok, 1e-3), *u2 = solve_mul(R, Ys, h2, ntok, 1e-3);
+        nn = na = nb = 0;
+        for (int j = 0; j < D; j++) { nn += (double)u1[j] * u2[j]; na += (double)u1[j] * u1[j]; nb += (double)u2[j] * u2[j]; }
+        double cmu = nn / (sqrt(na * nb) + 1e-30);
+        printf("  L%d 折半稳定性: GEδ cos=%.3f  乘门ua cos=%.3f (低=数据饿, 高而输held=家族错)\n",
+               L, cge, cmu);
+        free(h1); free(h2); free(u1); free(u2);
+    }
     free(ua); free(ua2); free(mc2); free(base2); free(isfit);
     *gecorr_out = gecorr; *Rge_out = Rge;
 }
