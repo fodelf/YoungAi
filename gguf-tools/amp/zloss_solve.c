@@ -468,15 +468,17 @@ int main(int argc, char **argv) {
                 won ? "有解" : "全网格输裸(停车审计)", won ? best.arm : "-", best.M,
                 best.lam, best.k, best.tot, tot0,
                 tot0 > 0 ? 100.0 * (tot0 - best.tot) / tot0 : 0.0, best.er * 100);
-        fclose(lf);
         printf("★L%d 终判: %s arm=%s M=%d λ=%.3g k=%d | align %.4f→%.4f cls %.4f→%.4f "
                "total %.4f→%.4f | ER %.1f%%\n",
                L, won ? "选中" : "★全网格输裸=解算器有病, 停车审计★", won ? best.arm : "-",
                best.M, best.lam, best.k, la0, best.la, lc0, best.lc, tot0, best.tot,
                best.er * 100);
+        /* ★fclose 必须在 recheck 之后: 原顺序把已 fclose 的 lf 传进 recheck 再
+         * fprintf = use-after-free 踩坏 heap(随机层 free(): invalid pointer)★ */
         if (emitz && !selftest)          /* 落地前用部署位宽(fp16)复评 —— 位宽账 */
             z_fp16_recheck(&best, best.zkeep_hasge ? gecorr : NULL, X, Ys, R, Yt_ev,
                            wv, ev, mode0, nev, dscale, seed, nth, L, lf);
+        fclose(lf);
         if (emitz && !selftest)          /* 冠军落地(zl.RRR/bf.GE + zl.4L 四损失参数) */
             emit_z_finish(emitz, L, &best, ge_dz, la0, lc0,
                           tot0, &lw, Yt, fit, nf, seed, (float)dscale, ge_wins);
