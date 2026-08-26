@@ -3,16 +3,52 @@
 }
 
 /* head: H[S,HCM,DIM] → logits[S,VOCAB] (vocab 投影批量 sgemm) */
+/* ★yv 方向诊断(2026-08-27 用户判"引擎里有计算磨平收益"): logits 只吃 rms(yv) 的方向,
+ * yv 的模长被 RMS 抹掉。反修解的是 L2(模长+方向), 若改善集中在模长 → relL2 大降而
+ * KLD 不动(实测 L40 −41.6%/L42 −23.4% 对 KLD −0.27%)。本诊断直接量方向: 与 FP 的
+ * yv 逐行 cos。ANC_OK 时启用, 只读不改数值。 */
+static void yv_dir_diag(const float *yvq, const float *yvf, int S) {
+    double sc = 0, sn = 0; int n = 0;
+    for (int s = 0; s < S; s++) {
+        const float *a = yvq + (size_t)s * DIM, *b = yvf + (size_t)s * DIM;
+        double d = 0, na = 0, nb = 0, e2 = 0;
+        for (int j = 0; j < DIM; j++) {
+            d += (double)a[j] * b[j]; na += (double)a[j] * a[j]; nb += (double)b[j] * b[j];
+            double df = (double)a[j] - b[j]; e2 += df * df;
+        }
+        if (na > 0 && nb > 0) { sc += d / (sqrt(na) * sqrt(nb)); sn += sqrt(e2 / nb); n++; }
+    }
+    if (n) fprintf(stderr, "[yvdiag] 最终 yv: 方向 cos=%.6f | relL2=%.6f (行=%d)\n",
+                   sc / n, sn / n, n);
+}
+
 static void head_fwd(float*H,int S,float*hcfn,float*hcb,float*hcs,float*norm,float*hw,float*logits){
     int HD_=HCM*DIM;
     float *yn=malloc((size_t)S*DIM*4);
+    float *yvall=malloc((size_t)S*DIM*4);
     for(int s=0;s<S;s++){ const float*x=H+(size_t)s*HD_; double v=0;for(int i=0;i<HD_;i++)v+=(double)x[i]*x[i];float rsq=(float)(1.0/sqrt(v/HD_+EPSF));
         float mix[8],pre[8]; for(int j=0;j<HCM;j++){const float*fr=hcfn+(size_t)j*HD_;float aa=0;for(int k=0;k<HD_;k++)aa+=x[k]*fr[k];mix[j]=aa*rsq;pre[j]=dq_sigmoid(mix[j]*hcs[0]+hcb[j])+EPSF;}
         float yv[DIM]; for(int d=0;d<DIM;d++){float aa=0;for(int j=0;j<HCM;j++)aa+=pre[j]*H[((size_t)s*HCM+j)*DIM+d];yv[d]=aa;}
+        memcpy(yvall+(size_t)s*DIM,yv,(size_t)DIM*4);
         dq_rms(yv,norm,yn+(size_t)s*DIM,DIM,EPSF);
     }
+    if(ANC_OK&&ANC.H){   /* FP 侧同式合成 yv, 比方向(RMS 前) */
+        float *yvf=malloc((size_t)S*DIM*4);
+        const float *Hf=ANC.H+(size_t)(NLAYERS-1)*(size_t)S*HCM*DIM;
+        for(int s=0;s<S;s++){ const float*x=Hf+(size_t)s*HD_; double v=0;
+            for(int i=0;i<HD_;i++)v+=(double)x[i]*x[i];
+            float rsq=(float)(1.0/sqrt(v/HD_+EPSF));
+            float mix[8],pre[8];
+            for(int j=0;j<HCM;j++){const float*fr=hcfn+(size_t)j*HD_;float aa=0;
+                for(int k=0;k<HD_;k++)aa+=x[k]*fr[k];mix[j]=aa*rsq;
+                pre[j]=dq_sigmoid(mix[j]*hcs[0]+hcb[j])+EPSF;}
+            for(int d=0;d<DIM;d++){float aa=0;for(int j=0;j<HCM;j++)aa+=pre[j]*Hf[((size_t)s*HCM+j)*DIM+d];
+                yvf[(size_t)s*DIM+d]=aa;}
+        }
+        yv_dir_diag(yvall,yvf,S); free(yvf);
+    }
     dq_matmul(yn,hw,logits,S,DIM,VOCAB);
-    free(yn);
+    free(yn); free(yvall);
 }
 
 /* head_fwd 低内存版(2026-07-28 里程碑尖刺修): head.weight [VOCAB,DIM] 按行块流式
