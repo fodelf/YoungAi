@@ -394,23 +394,29 @@ int main(int argc, char **argv) {
             for (int m = 0; m < M; m++) printf(" %d", cnt[m]);
             printf("\n");
 
+            ds4_z *(*zsm)[MAXG] = xmalloc(sizeof(ds4_z *[MAXM][MAXG]));
+            memset(zsm, 0, sizeof(ds4_z *[MAXM][MAXG]));
+            float lamf[MAXG];
+            for (int li = 0; li < nlam; li++) lamf[li] = (float)lambdas[li];
+            for (int m = 0; m < M; m++) {        /* 每模式一次多 λ 解(Gram 共享) */
+                if (!cnt[m]) { printf("  L%d M=%d 模式%d 无fit行, 该模式不修\n", L, M, m); continue; }
+                float *Xm = xmalloc((size_t)cnt[m] * D * sizeof(float));
+                float *Rm = xmalloc((size_t)cnt[m] * D * sizeof(float));
+                int w = 0;
+                for (int i = 0; i < nf; i++) if (mode_fit[i] == m) {
+                    memcpy(Xm + (size_t)w * D, X + (size_t)fit[i] * D, D * sizeof(float));
+                    memcpy(Rm + (size_t)w * D, R + (size_t)fit[i] * D, D * sizeof(float));
+                    w++;
+                }
+                int rk = maxk < cnt[m] ? maxk : cnt[m];
+                if (ds4_z_solve_multi(Xm, Rm, (uint32_t)cnt[m], D, D, (uint32_t)rk,
+                                      lamf, (uint32_t)nlam, zsm[m]))
+                    die("L%d M=%d 模式%d 解算失败", L, M, m);
+                free(Xm); free(Rm);
+            }
             for (int li = 0; li < nlam; li++) {
                 ds4_z *zl[MAXM] = {0};
-                for (int m = 0; m < M; m++) {
-                    if (!cnt[m]) { printf("  L%d M=%d λ=%g 模式%d 无fit行, 该模式不修\n", L, M, lambdas[li], m); continue; }
-                    float *Xm = xmalloc((size_t)cnt[m] * D * sizeof(float));
-                    float *Rm = xmalloc((size_t)cnt[m] * D * sizeof(float));
-                    int w = 0;
-                    for (int i = 0; i < nf; i++) if (mode_fit[i] == m) {
-                        memcpy(Xm + (size_t)w * D, X + (size_t)fit[i] * D, D * sizeof(float));
-                        memcpy(Rm + (size_t)w * D, R + (size_t)fit[i] * D, D * sizeof(float));
-                        w++;
-                    }
-                    int rk = maxk < cnt[m] ? maxk : cnt[m];
-                    zl[m] = ds4_z_solve(Xm, Rm, (uint32_t)cnt[m], D, D, (uint32_t)rk, (float)lambdas[li]);
-                    if (!zl[m]) die("L%d M=%d λ=%g 模式%d 解算失败", L, M, lambdas[li], m);
-                    free(Xm); free(Rm);
-                }
+                for (int m = 0; m < M; m++) zl[m] = zsm[m][li];
                 for (int ki = 0; ki < nrank; ki++) {
                     long long vol = (long long)M * D * 4;    /* 质心 f32 也计体积 */
                     int nz = 0;
@@ -442,6 +448,7 @@ int main(int argc, char **argv) {
                 }
                 for (int m = 0; m < M; m++) if (zl[m]) ds4_z_free(zl[m]);
             }
+            free(zsm);
             free(C); free(mode_fit); free(mode_ev);
         }
         if (!selftest) {

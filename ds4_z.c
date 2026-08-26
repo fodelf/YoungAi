@@ -122,92 +122,11 @@ static void mgs(float *Q, uint32_t d, uint32_t k, uint64_t *seed) {
     }
 }
 
-ds4_z *ds4_z_solve(const float *X, const float *R, uint32_t n,
-                   uint32_t d_in, uint32_t d_out, uint32_t rank,
-                   float lambda) {
-    if (!X || !R || n == 0 || d_in == 0 || d_out == 0 || rank == 0) return NULL;
-    if (rank > d_in) rank = d_in;
-    if (rank > d_out) rank = d_out;
-
-    /* Normal equations in double: A = X^T X + lambda*mean(diag)*I (d_in x
-     * d_in), B = X^T R (d_in x d_out). Accumulation order is fixed, so the
-     * solve is reproducible. */
-    double *A = calloc((size_t)d_in * d_in, sizeof(double));
-    double *B = calloc((size_t)d_in * d_out, sizeof(double));
-    float  *W = malloc((size_t)d_in * d_out * sizeof(float));
-    if (!A || !B || !W) { free(A); free(B); free(W); return NULL; }
-#ifdef DQ_BLAS
-    {   /* A = XᵀX, B = XᵀR — dgemm 双精(输入升 f64 后与标量路同一乘加集合) */
-        double *Xd = malloc((size_t)n * d_in * sizeof(double));
-        double *Rd = malloc((size_t)n * d_out * sizeof(double));
-        if (!Xd || !Rd) { free(Xd); free(Rd); free(A); free(B); free(W); return NULL; }
-        for (size_t i = 0; i < (size_t)n * d_in; i++) Xd[i] = X[i];
-        for (size_t i = 0; i < (size_t)n * d_out; i++) Rd[i] = R[i];
-        cblas_dgemm(CblasRowMajor, CblasTrans, CblasNoTrans, (int)d_in, (int)d_in, (int)n,
-                    1.0, Xd, (int)d_in, Xd, (int)d_in, 0.0, A, (int)d_in);
-        cblas_dgemm(CblasRowMajor, CblasTrans, CblasNoTrans, (int)d_in, (int)d_out, (int)n,
-                    1.0, Xd, (int)d_in, Rd, (int)d_out, 0.0, B, (int)d_out);
-        free(Xd); free(Rd);
-    }
-#else
-    for (uint32_t t = 0; t < n; t++) {
-        const float *x = X + (size_t)t * d_in;
-        const float *r = R + (size_t)t * d_out;
-        for (uint32_t i = 0; i < d_in; i++) {
-            const double xi = x[i];
-            if (xi == 0.0) continue;
-            double *Ai = A + (size_t)i * d_in;
-            for (uint32_t j = i; j < d_in; j++) Ai[j] += xi * x[j];
-            double *Bi = B + (size_t)i * d_out;
-            for (uint32_t j = 0; j < d_out; j++) Bi[j] += xi * r[j];
-        }
-    }
-#endif
-    /* mirror the upper triangle + dimensionless ridge */
-    double tr = 0.0;
-    for (uint32_t i = 0; i < d_in; i++) tr += A[(size_t)i * d_in + i];
-    const double ridge = (double)lambda * (tr / (double)d_in) + 1e-10;
-    for (uint32_t i = 0; i < d_in; i++) {
-        A[(size_t)i * d_in + i] += ridge;
-        for (uint32_t j = i + 1; j < d_in; j++)
-            A[(size_t)j * d_in + i] = A[(size_t)i * d_in + j];
-    }
-#ifdef DQ_BLAS
-    {   /* 分块 potrf/potrs: 行主序对称阵取 uplo='U' 列主序等价; B 转置进出(zlayer 同式) */
-        int info = 0, N = (int)d_in, nrhs = (int)d_out;
-        const char up = 'U';
-        DZ_DPOTRF(&up, &N, A, &N, &info);
-        if (info) { free(A); free(B); free(W); return NULL; }
-        double *Bt = malloc((size_t)d_in * d_out * sizeof(double));
-        if (!Bt) { free(A); free(B); free(W); return NULL; }
-        for (uint32_t i = 0; i < d_in; i++)
-            for (uint32_t j = 0; j < d_out; j++)
-                Bt[(size_t)j * d_in + i] = B[(size_t)i * d_out + j];
-        DZ_DPOTRS(&up, &N, &nrhs, A, &N, Bt, &N, &info);
-        if (info) { free(Bt); free(A); free(B); free(W); return NULL; }
-        for (uint32_t i = 0; i < d_in; i++)
-            for (uint32_t j = 0; j < d_out; j++)
-                W[(size_t)i * d_out + j] = (float)Bt[(size_t)j * d_in + i];
-        free(Bt);
-        free(A);
-        free(B);
-    }
-#else
-    if (cholesky(A, d_in) != 0) { free(A); free(B); free(W); return NULL; }
-    double *col = malloc((size_t)d_in * sizeof(double));
-    if (!col) { free(A); free(B); free(W); return NULL; }
-    for (uint32_t j = 0; j < d_out; j++) {      /* solve per output column */
-        for (uint32_t i = 0; i < d_in; i++) col[i] = B[(size_t)i * d_out + j];
-        cholesky_solve(A, d_in, col);
-        for (uint32_t i = 0; i < d_in; i++) W[(size_t)i * d_out + j] = (float)col[i];
-    }
-    free(col);
-    free(A);
-    free(B);
-#endif
-
-    /* Rank-k truncation by subspace iteration on W W^T: V converges to the
-     * top-k left singular subspace of W, then M = V^T W = diag(z) U^T. */
+/* ---- 秩截断: W(d_in×d_out) 的子空间迭代取 top-rank; W 被本函数消费(释放)。
+ * V converges to the top-k left singular subspace of W, then
+ * M = V^T W = diag(z) U^T. DQ_BLAS 下三个大矩阵乘走 sgemm(2026-08-26: 标量
+ * 截断段单线程 100-300 GFLOP/次是针跑法的第二浪费源; mgs 仍标量, 占比小)。 */
+static ds4_z *zl_truncate(float *W, uint32_t d_in, uint32_t d_out, uint32_t rank) {
     ds4_z *zl = calloc(1, sizeof(*zl));
     float *V = malloc((size_t)d_in * rank * sizeof(float));
     float *T = malloc((size_t)d_out * rank * sizeof(float));   /* W^T V */
@@ -222,6 +141,13 @@ ds4_z *ds4_z_solve(const float *X, const float *R, uint32_t n,
     for (size_t i = 0; i < (size_t)d_in * rank; i++) V[i] = lcg_unit(&seed);
     mgs(V, d_in, rank, &seed);
     for (int it = 0; it < 12; it++) {           /* 12 iters: ample for k<<d */
+#ifdef DQ_BLAS
+        /* T = WᵀV (d_out×k); V = W·T (d_in×k) — sgemm, 数学同标量路(尾位差) */
+        cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, (int)d_out, (int)rank,
+                    (int)d_in, 1.0f, W, (int)d_out, V, (int)rank, 0.0f, T, (int)rank);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, (int)d_in, (int)rank,
+                    (int)d_out, 1.0f, W, (int)d_out, T, (int)rank, 0.0f, V, (int)rank);
+#else
         /* T = W^T V  (d_out x k) */
         memset(T, 0, (size_t)d_out * rank * sizeof(float));
         for (uint32_t i = 0; i < d_in; i++) {
@@ -246,10 +172,15 @@ ds4_z *ds4_z_solve(const float *X, const float *R, uint32_t n,
                 for (uint32_t c = 0; c < rank; c++) Vi[c] += wij * Tj[c];
             }
         }
+#endif
         mgs(V, d_in, rank, &seed);
     }
     /* M = V^T W (k x d_out); z = row norms of M (descending by construction
      * up to iteration accuracy); U rows = normalized M rows. */
+#ifdef DQ_BLAS
+    cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, (int)rank, (int)d_out,
+                (int)d_in, 1.0f, V, (int)rank, W, (int)d_out, 0.0f, M, (int)d_out);
+#else
     memset(M, 0, (size_t)rank * d_out * sizeof(float));
     for (uint32_t i = 0; i < d_in; i++) {
         const float *Wi = W + (size_t)i * d_out;
@@ -261,6 +192,7 @@ ds4_z *ds4_z_solve(const float *X, const float *R, uint32_t n,
             for (uint32_t j = 0; j < d_out; j++) Mc[j] += v * Wi[j];
         }
     }
+#endif
     for (uint32_t c = 0; c < rank; c++) {
         double nrm = 0.0;
         const float *Mc = M + (size_t)c * d_out;
@@ -302,6 +234,115 @@ ds4_z *ds4_z_solve(const float *X, const float *R, uint32_t n,
     zl->rank = rank;
     zl->k = rank;
     return zl;
+}
+
+int ds4_z_solve_multi(const float *X, const float *R, uint32_t n,
+                      uint32_t d_in, uint32_t d_out, uint32_t rank,
+                      const float *lambdas, uint32_t nl, ds4_z **out) {
+    if (!X || !R || !lambdas || !out || nl == 0 ||
+        n == 0 || d_in == 0 || d_out == 0 || rank == 0) return -1;
+    if (rank > d_in) rank = d_in;
+    if (rank > d_out) rank = d_out;
+    for (uint32_t i = 0; i < nl; i++) out[i] = NULL;
+
+    /* Normal equations in double: G = X^T X (d_in x d_in), B = X^T R
+     * (d_in x d_out) — 与 λ 无关, 只算一次。Accumulation order is fixed. */
+    double *G = calloc((size_t)d_in * d_in, sizeof(double));
+    double *B = calloc((size_t)d_in * d_out, sizeof(double));
+    if (!G || !B) { free(G); free(B); return -1; }
+#ifdef DQ_BLAS
+    {   /* G = XᵀX, B = XᵀR — dgemm 双精(输入升 f64 后与标量路同一乘加集合) */
+        double *Xd = malloc((size_t)n * d_in * sizeof(double));
+        double *Rd = malloc((size_t)n * d_out * sizeof(double));
+        if (!Xd || !Rd) { free(Xd); free(Rd); free(G); free(B); return -1; }
+        for (size_t i = 0; i < (size_t)n * d_in; i++) Xd[i] = X[i];
+        for (size_t i = 0; i < (size_t)n * d_out; i++) Rd[i] = R[i];
+        cblas_dgemm(CblasRowMajor, CblasTrans, CblasNoTrans, (int)d_in, (int)d_in, (int)n,
+                    1.0, Xd, (int)d_in, Xd, (int)d_in, 0.0, G, (int)d_in);
+        cblas_dgemm(CblasRowMajor, CblasTrans, CblasNoTrans, (int)d_in, (int)d_out, (int)n,
+                    1.0, Xd, (int)d_in, Rd, (int)d_out, 0.0, B, (int)d_out);
+        free(Xd); free(Rd);
+    }
+#else
+    for (uint32_t t = 0; t < n; t++) {
+        const float *x = X + (size_t)t * d_in;
+        const float *r = R + (size_t)t * d_out;
+        for (uint32_t i = 0; i < d_in; i++) {
+            const double xi = x[i];
+            if (xi == 0.0) continue;
+            double *Gi = G + (size_t)i * d_in;
+            for (uint32_t j = i; j < d_in; j++) Gi[j] += xi * x[j];
+            double *Bi = B + (size_t)i * d_out;
+            for (uint32_t j = 0; j < d_out; j++) Bi[j] += xi * r[j];
+        }
+    }
+#endif
+    double tr = 0.0;                             /* ridge 量纲基 + 镜像下三角 */
+    for (uint32_t i = 0; i < d_in; i++) tr += G[(size_t)i * d_in + i];
+    for (uint32_t i = 0; i < d_in; i++)
+        for (uint32_t j = i + 1; j < d_in; j++)
+            G[(size_t)j * d_in + i] = G[(size_t)i * d_in + j];
+
+    double *Ac = malloc((size_t)d_in * d_in * sizeof(double));
+#ifdef DQ_BLAS
+    double *Bt0 = malloc((size_t)d_in * d_out * sizeof(double));
+    double *Btc = malloc((size_t)d_in * d_out * sizeof(double));
+    if (Bt0)
+        for (uint32_t i = 0; i < d_in; i++)
+            for (uint32_t j = 0; j < d_out; j++)
+                Bt0[(size_t)j * d_in + i] = B[(size_t)i * d_out + j];
+    int ok = Ac && Bt0 && Btc;
+#else
+    double *col = malloc((size_t)d_in * sizeof(double));
+    int ok = Ac && col;
+#endif
+    int rc = ok ? 0 : -1;
+    for (uint32_t li = 0; rc == 0 && li < nl; li++) {
+        memcpy(Ac, G, (size_t)d_in * d_in * sizeof(double));
+        const double ridge = (double)lambdas[li] * (tr / (double)d_in) + 1e-10;
+        for (uint32_t i = 0; i < d_in; i++) Ac[(size_t)i * d_in + i] += ridge;
+        float *W = malloc((size_t)d_in * d_out * sizeof(float));
+        if (!W) { rc = -1; break; }
+#ifdef DQ_BLAS
+        {   /* 分块 potrf/potrs: 行主序对称阵取 uplo='U' 列主序等价; B 转置进出 */
+            int info = 0, N = (int)d_in, nrhs = (int)d_out;
+            const char up = 'U';
+            DZ_DPOTRF(&up, &N, Ac, &N, &info);
+            if (info) { free(W); rc = -1; break; }
+            memcpy(Btc, Bt0, (size_t)d_in * d_out * sizeof(double));
+            DZ_DPOTRS(&up, &N, &nrhs, Ac, &N, Btc, &N, &info);
+            if (info) { free(W); rc = -1; break; }
+            for (uint32_t i = 0; i < d_in; i++)
+                for (uint32_t j = 0; j < d_out; j++)
+                    W[(size_t)i * d_out + j] = (float)Btc[(size_t)j * d_in + i];
+        }
+#else
+        if (cholesky(Ac, d_in) != 0) { free(W); rc = -1; break; }
+        for (uint32_t j = 0; j < d_out; j++) {   /* solve per output column */
+            for (uint32_t i = 0; i < d_in; i++) col[i] = B[(size_t)i * d_out + j];
+            cholesky_solve(Ac, d_in, col);
+            for (uint32_t i = 0; i < d_in; i++) W[(size_t)i * d_out + j] = (float)col[i];
+        }
+#endif
+        out[li] = zl_truncate(W, d_in, d_out, rank);   /* W 被消费 */
+        if (!out[li]) rc = -1;
+    }
+#ifdef DQ_BLAS
+    free(Bt0); free(Btc);
+#else
+    free(col);
+#endif
+    free(Ac); free(G); free(B);
+    if (rc)
+        for (uint32_t i = 0; i < nl; i++) { ds4_z_free(out[i]); out[i] = NULL; }
+    return rc;
+}
+
+ds4_z *ds4_z_solve(const float *X, const float *R, uint32_t n,
+                   uint32_t d_in, uint32_t d_out, uint32_t rank,
+                   float lambda) {
+    ds4_z *o = NULL;
+    return ds4_z_solve_multi(X, R, n, d_in, d_out, rank, &lambda, 1, &o) == 0 ? o : NULL;
 }
 
 void ds4_z_apply(const ds4_z *zl, const float *x, float *y) {

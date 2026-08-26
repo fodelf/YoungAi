@@ -46,6 +46,13 @@ ds4_z *ds4_z_solve(const float *X, const float *R, uint32_t n,
                    uint32_t d_in, uint32_t d_out, uint32_t rank,
                    float lambda);
 
+/* λ 网格版: 正规方程 G=XᵀX 与 B=XᵀR 只算一次(它们不依赖 λ — 逐 λ 重算是
+ * 2026-08-26 针跑法定罪的头号浪费), 每个 λ 只做 ridge+Cholesky+截断。
+ * out[i] 收第 i 个 λ 的解(全部成功返回 0; 失败返回 -1, 已产出的解被释放)。 */
+int ds4_z_solve_multi(const float *X, const float *R, uint32_t n,
+                      uint32_t d_in, uint32_t d_out, uint32_t rank,
+                      const float *lambdas, uint32_t nl, ds4_z **out);
+
 /* y += U diag(z[0..k)) V^T x -- the runtime-side apply. O(k*(d_in+d_out)). */
 void ds4_z_apply(const ds4_z *zl, const float *x, float *y);
 

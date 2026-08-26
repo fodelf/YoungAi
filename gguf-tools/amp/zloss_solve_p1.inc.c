@@ -170,11 +170,14 @@ static void run_map_arm(const char *arm, const float *XF, int din, const float *
         memcpy(Xm + (size_t)i * din, XF + (size_t)fit[i] * din, (size_t)din * sizeof(float));
         memcpy(Rm + (size_t)i * D, Reff + (size_t)fit[i] * D, D * sizeof(float));
     }
+    ds4_z *zs[MAXG] = {0};
+    float lamf[MAXG];
+    for (int li = 0; li < nlam; li++) lamf[li] = (float)lambdas[li];
+    if (ds4_z_solve_multi(Xm, Rm, (uint32_t)nf, (uint32_t)din, D, (uint32_t)maxk,
+                          lamf, (uint32_t)nlam, zs))
+        die("L%d %s 解算失败", L, arm);
     for (int li = 0; li < nlam; li++) {
-        ds4_z *zl[1];
-        zl[0] = ds4_z_solve(Xm, Rm, (uint32_t)nf, (uint32_t)din, D, (uint32_t)maxk,
-                            (float)lambdas[li]);
-        if (!zl[0]) die("L%d %s λ=%g 解算失败", L, arm, lambdas[li]);
+        ds4_z *zl[1] = { zs[li] };
         for (int ki = 0; ki < nrank; ki++) {
             ds4_z_set_rank(zl[0], (uint32_t)ranks[ki]);
             long long vol = (long long)zl[0]->k * (1 + din + D) * 2 + (bc ? 512 : 0);
@@ -250,7 +253,9 @@ static void derive_modes(const float *X, const float *R, const int *fit, int nf,
         memcpy(Xf + (size_t)i * D, X + (size_t)fit[i] * D, D * sizeof(float));
         memcpy(Rf + (size_t)i * D, R + (size_t)fit[i] * D, D * sizeof(float));
     }
-    const int EMK = maxk < 32 ? maxk : 32, T = 6, RS = 2;
+    /* 单重启+4 迭代(2026-08-26 提速定案: L20/L30 双重启 6 次实测全部收敛同解,
+     * 第二重启纯烧机; 迭代 4 轮后标签已稳) */
+    const int EMK = maxk < 32 ? maxk : 32, T = 4, RS = 1;
     int *lab = xmalloc((size_t)nf * sizeof(int));
     int *labbest = xmalloc((size_t)nf * sizeof(int));
     float *tmp = xmalloc(D * sizeof(float));
