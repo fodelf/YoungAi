@@ -269,6 +269,13 @@ static void run_map_arm(const char *arm, const float *XF, int din, const float *
             long long vol = (long long)zl[0]->k * (1 + din + D) * 2 + (bc ? 512 : 0);
             int nz = 0;
             for (uint32_t c = 0; c < zl[0]->k; c++) zcat[nz++] = zl[0]->z[c];
+            int r95 = 0;   /* 有效秩: z² 能量累到 95% 所需列数(用户 2026-08-26 追问:
+                            * k 变 r 变没变 —— ridge 下有效秩由 λ 定, k 只是上限) */
+            { double tot2 = 0, acc = 0;
+              for (uint32_t c = 0; c < zl[0]->k; c++) tot2 += (double)zl[0]->z[c] * zl[0]->z[c];
+              for (uint32_t c = 0; c < zl[0]->k; c++) {
+                  acc += (double)zl[0]->z[c] * zl[0]->z[c]; r95++;
+                  if (acc >= 0.95 * tot2) break; } }
             double er = eval_apply(zl, NULL, 1, 0, bc, tr, X, Ys, R, ev, mode0, nev,
                                    Yhat, Cb, Cp, dscale, seed, nth);
             float la = ds4_loss_align(Yhat, Yt_ev, (uint32_t)nev, D);
@@ -278,9 +285,9 @@ static void run_map_arm(const char *arm, const float *XF, int din, const float *
             float tot = ds4_loss_total(lw, la, lc, ls, lfx);
             fprintf(lf, "%s 1 %.3g %d %.6f %.6f %.6f %.6f %.6f %.2f %.2f\n",
                     arm, lambdas[li], ranks[ki], la, lc, ls, lfx, tot, er * 100, vol / 1e6);
-            printf("  L%d %-6s λ=%-5.3g k=%-3d | align %.4f cls %.4f sm %.5f fx %.5f "
-                   "tot %.4f | ER %.1f%% | vol %.1fMB\n",
-                   L, arm, lambdas[li], ranks[ki], la, lc, ls, lfx, tot, er * 100, vol / 1e6);
+            printf("  L%d %-6s λ=%-5.3g k=%-4d | align %.4f cls %.4f sm %.5f fx %.5f "
+                   "tot %.4f | ER %.1f%% | 有效秩r95=%d | vol %.1fMB\n",
+                   L, arm, lambdas[li], ranks[ki], la, lc, ls, lfx, tot, er * 100, r95, vol / 1e6);
             if (tot < best->tot) {
                 best->tot = tot; best->lam = lambdas[li]; best->k = ranks[ki];
                 best->M = 1; best->er = er; best->la = la; best->lc = lc; best->arm = arm;
