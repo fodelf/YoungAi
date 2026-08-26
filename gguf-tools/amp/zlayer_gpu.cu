@@ -66,3 +66,81 @@ extern "C" int zg_sgemm(int ta, int tb, int M, int N, int K,
     if (st != CUBLAS_STATUS_SUCCESS) return 0;
     return cudaMemcpy(C, g_dC, rc, cudaMemcpyDeviceToHost) == cudaSuccess;
 }
+
+/* ---- cusolver 扩展(2026-08-26 zloss 提速令: potrf/potrs 与 QR 正交化上卡;
+ * 12288 维 Cholesky(~10s) 与标量 mgs(~15s) 是 gemm 上卡后的 CPU 剩余热点)。
+ * 同一能力探测契约: 任何失败返 0, 调用方走 CPU 原路。 */
+#include <cusolverDn.h>
+static cusolverDnHandle_t g_sh = nullptr;
+static int g_sinit = 0, g_sok = 0;
+static void *g_dW2 = nullptr; static size_t g_sW2 = 0;
+static int *g_dinfo = nullptr;
+extern "C" int zg_solver_ready(void) {
+    if (!g_sinit) {
+        g_sinit = 1;
+        if (zg_ready() && cusolverDnCreate(&g_sh) == CUSOLVER_STATUS_SUCCESS &&
+            cudaMalloc((void **)&g_dinfo, 4) == cudaSuccess)
+            g_sok = 1;
+    }
+    return g_sok;
+}
+static int zg_info_ok(void) {
+    int info = -1;
+    return cudaMemcpy(&info, g_dinfo, 4, cudaMemcpyDeviceToHost) == cudaSuccess && info == 0;
+}
+/* A: 行主序 n×n 全对称(两三角都填) — 列主序视图即自身, uplo 任取(取 LOWER)。
+ * B: 与 CPU 路 Bt 同布局(列主序 n×nrhs), 出参=解。 */
+extern "C" int zg_dpotrf_potrs(int n, int nrhs, const double *A, double *B) {
+    if (!zg_solver_ready()) return 0;
+    size_t sa = (size_t)n * n * 8, sb = (size_t)n * nrhs * 8;
+    if (!ensure(&g_dA, &g_sA, sa) || !ensure(&g_dB, &g_sB, sb)) return 0;
+    if (cudaMemcpy(g_dA, A, sa, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+    if (cudaMemcpy(g_dB, B, sb, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+    int lwork = 0;
+    if (cusolverDnDpotrf_bufferSize(g_sh, CUBLAS_FILL_MODE_LOWER, n, (double *)g_dA, n,
+                                    &lwork) != CUSOLVER_STATUS_SUCCESS) return 0;
+    if (!ensure(&g_dW2, &g_sW2, (size_t)lwork * 8)) return 0;
+    if (cusolverDnDpotrf(g_sh, CUBLAS_FILL_MODE_LOWER, n, (double *)g_dA, n,
+                         (double *)g_dW2, lwork, g_dinfo) != CUSOLVER_STATUS_SUCCESS) return 0;
+    if (!zg_info_ok()) return 0;
+    if (cusolverDnDpotrs(g_sh, CUBLAS_FILL_MODE_LOWER, n, nrhs, (double *)g_dA, n,
+                         (double *)g_dB, n, g_dinfo) != CUSOLVER_STATUS_SUCCESS) return 0;
+    if (!zg_info_ok()) return 0;
+    return cudaMemcpy(B, g_dB, sb, cudaMemcpyDeviceToHost) == cudaSuccess;
+}
+/* V: 行主序 d×k 就地正交化(薄 QR 的 Q)。geam 转置进出列主序。
+ * 与 mgs 产的基不同但张成同一子空间 —— 截断积 U·diag(z)·Vᵀ 对基不变,
+ * 金标口径 = selftest 收回率与针表打印精度, 非逐位。 */
+extern "C" int zg_sqr_orth(int d, int k, float *V) {
+    if (!zg_solver_ready()) return 0;
+    size_t sv = (size_t)d * k * 4;
+    if (!ensure(&g_dA, &g_sA, sv) || !ensure(&g_dB, &g_sB, sv)) return 0;
+    if (cudaMemcpy(g_dA, V, sv, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+    const float one = 1.0f, zero = 0.0f;
+    /* g_dA(行主序 d×k = 列主序 k×d) → g_dB(列主序 d×k) */
+    if (cublasSgeam(g_h, CUBLAS_OP_T, CUBLAS_OP_N, d, k, &one, (const float *)g_dA, k,
+                    &zero, (const float *)g_dB, d, (float *)g_dB, d) != CUBLAS_STATUS_SUCCESS)
+        return 0;
+    int lw1 = 0, lw2 = 0;
+    if (cusolverDnSgeqrf_bufferSize(g_sh, d, k, (float *)g_dB, d, &lw1) != CUSOLVER_STATUS_SUCCESS)
+        return 0;
+    size_t need = ((size_t)(lw1 > k ? lw1 : k) + (size_t)k) * 4;
+    if (!ensure(&g_dW2, &g_sW2, need)) return 0;
+    float *dtau = (float *)g_dW2, *dwork = dtau + k;
+    int lw = (int)((g_sW2 / 4) - k);
+    if (cusolverDnSorgqr_bufferSize(g_sh, d, k, k, (float *)g_dB, d, dtau, &lw2)
+        != CUSOLVER_STATUS_SUCCESS) return 0;
+    if (lw2 > lw) {
+        if (!ensure(&g_dW2, &g_sW2, ((size_t)lw2 + k) * 4)) return 0;
+        dtau = (float *)g_dW2; dwork = dtau + k; lw = lw2;
+    }
+    if (cusolverDnSgeqrf(g_sh, d, k, (float *)g_dB, d, dtau, dwork, lw, g_dinfo)
+        != CUSOLVER_STATUS_SUCCESS || !zg_info_ok()) return 0;
+    if (cusolverDnSorgqr(g_sh, d, k, k, (float *)g_dB, d, dtau, dwork, lw, g_dinfo)
+        != CUSOLVER_STATUS_SUCCESS || !zg_info_ok()) return 0;
+    /* g_dB(列主序 d×k) → g_dA(行主序 d×k) */
+    if (cublasSgeam(g_h, CUBLAS_OP_T, CUBLAS_OP_N, k, d, &one, (const float *)g_dB, d,
+                    &zero, (const float *)g_dA, k, (float *)g_dA, k) != CUBLAS_STATUS_SUCCESS)
+        return 0;
+    return cudaMemcpy(V, g_dA, sv, cudaMemcpyDeviceToHost) == cudaSuccess;
+}

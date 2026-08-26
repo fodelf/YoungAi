@@ -203,7 +203,7 @@ $(AMP)/zlayer_gpu.o: $(AMP)/zlayer_gpu.cu
 	$(NVCC) -O3 -arch=native -c $< -o $@
 $(AMP)/zlayer: $(AMP)/zlayer.c $(ZLAYER_INC) $(AMP)/zlayer_gpu.o ../src/common/ds4_quantfmt.c ../src/common/ds4_gguf.c
 	$(CC) $(BARE) $(NATIVE) -DDQ_BLAS $(BLAS_CFLAGS) -DZL_CUDA -o $@ $(AMP)/zlayer.c \
-	    $(AMP)/zlayer_gpu.o $(BLAS_LIBS) -L$(CUDA_HOME)/lib64 -lcublas -lcudart -lstdc++ -lm -lpthread
+	    $(AMP)/zlayer_gpu.o $(BLAS_LIBS) -lcublas -lcusolver $(CUDA_LIBS) -lm -lpthread
 else
 $(AMP)/zlayer: $(AMP)/zlayer.c $(ZLAYER_INC) ../src/common/ds4_quantfmt.c ../src/common/ds4_gguf.c
 	$(CC) $(BARE) $(NATIVE) -DDQ_BLAS $(BLAS_CFLAGS) -o $@ $(AMP)/zlayer.c $(BLAS_LIBS) -lm -lpthread
@@ -217,7 +217,12 @@ $(AMP)/dql_to_zchain: $(AMP)/dql_to_zchain.c
 # zloss_solve: 单层贪心四损失解算器(2026-08-26 用户设计)。-I.. 吃仓库根 ds4_z.c/
 # ds4_loss.c(与引擎同一份实现); BLAS 在则开 DQ_BLAS 快路(ds4_z.c 内守卫)。
 zloss_solve: $(AMP)/zloss_solve
-ifeq ($(HAVE_BLAS),1)
+ZLOSS_DEPS := $(AMP)/zloss_solve.c $(AMP)/zloss_solve_p1.inc.c $(AMP)/linalg_small.c $(CAL)/npy.c ../ds4_z.c ../ds4_z.h ../ds4_loss.c ../ds4_loss.h
+ifeq ($(HAVE_BLAS)-$(CUDA),1-1)
+# GPU 路(2026-08-26 提速令"必须用GPU"): gemm/potrf/potrs/QR 走 zlayer_gpu.o(cuBLAS+cuSOLVER)
+$(AMP)/zloss_solve: $(ZLOSS_DEPS) $(AMP)/zlayer_gpu.o
+	$(CC) $(BARE) $(NATIVE) -I.. -I$(CAL) -DDQ_BLAS -DDQ_CUDA $(BLAS_CFLAGS) -o $@ $(AMP)/zloss_solve.c $(AMP)/linalg_small.c $(CAL)/npy.c $(AMP)/zlayer_gpu.o $(BLAS_LIBS) -lcublas -lcusolver $(CUDA_LIBS) -lm -lpthread
+else ifeq ($(HAVE_BLAS),1)
 $(AMP)/zloss_solve: $(AMP)/zloss_solve.c $(AMP)/zloss_solve_p1.inc.c $(AMP)/linalg_small.c $(CAL)/npy.c ../ds4_z.c ../ds4_z.h ../ds4_loss.c ../ds4_loss.h
 	$(CC) $(BARE) $(NATIVE) -I.. -I$(CAL) -DDQ_BLAS $(BLAS_CFLAGS) -o $@ $(AMP)/zloss_solve.c $(AMP)/linalg_small.c $(CAL)/npy.c $(BLAS_LIBS) -lm -lpthread
 else

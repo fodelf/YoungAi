@@ -27,6 +27,33 @@ extern void scipy_dpotrs_(const char *, const int *, const int *, const double *
 #define DZ_DPOTRF scipy_dpotrf_
 #define DZ_DPOTRS scipy_dpotrs_
 #endif
+#ifdef DQ_CUDA
+/* zlayer_gpu.cu 的行主序 GPU 入口(2026-08-26 提速令"必须用GPU"): 能力探测契约,
+ * 返 0 自动回 cblas/LAPACK。QR 正交化与 mgs 产的基不同但张成同一子空间 ——
+ * U·diag(z)·Vᵀ 对基不变, 金标口径=selftest 收回率+针表打印精度。 */
+extern int zg_dgemm(int, int, int, int, int, const double *, int, const double *, int,
+                    double *, int);
+extern int zg_sgemm(int, int, int, int, int, const float *, int, const float *, int,
+                    float *, int);
+extern int zg_dpotrf_potrs(int n, int nrhs, const double *A, double *B);
+extern int zg_sqr_orth(int d, int k, float *V);
+#endif
+static void dz_dgemm(int ta, int M, int N, int K, const double *A, int lda,
+                     const double *B, int ldb, double *C, int ldc) {
+#ifdef DQ_CUDA
+    if (zg_dgemm(ta, 0, M, N, K, A, lda, B, ldb, C, ldc)) return;
+#endif
+    cblas_dgemm(CblasRowMajor, ta ? CblasTrans : CblasNoTrans, CblasNoTrans,
+                M, N, K, 1.0, A, lda, B, ldb, 0.0, C, ldc);
+}
+static void dz_sgemm(int ta, int M, int N, int K, const float *A, int lda,
+                     const float *B, int ldb, float *C, int ldc) {
+#ifdef DQ_CUDA
+    if (zg_sgemm(ta, 0, M, N, K, A, lda, B, ldb, C, ldc)) return;
+#endif
+    cblas_sgemm(CblasRowMajor, ta ? CblasTrans : CblasNoTrans, CblasNoTrans,
+                M, N, K, 1.0f, A, lda, B, ldb, 0.0f, C, ldc);
+}
 #endif
 
 /* Deterministic LCG (Numerical Recipes constants): subspace-iteration init
@@ -122,6 +149,14 @@ static void mgs(float *Q, uint32_t d, uint32_t k, uint64_t *seed) {
     }
 }
 
+/* 正交化入口: DQ_CUDA 有卡走 GPU QR(失败自动回落), 否则 mgs 标量参考路 */
+static void dz_orth(float *V, uint32_t d, uint32_t k, uint64_t *seed) {
+#if defined(DQ_BLAS) && defined(DQ_CUDA)
+    if (zg_sqr_orth((int)d, (int)k, V)) return;
+#endif
+    mgs(V, d, k, seed);
+}
+
 /* ---- 秩截断: W(d_in×d_out) 的子空间迭代取 top-rank; W 被本函数消费(释放)。
  * V converges to the top-k left singular subspace of W, then
  * M = V^T W = diag(z) U^T. DQ_BLAS 下三个大矩阵乘走 sgemm(2026-08-26: 标量
@@ -139,14 +174,14 @@ static ds4_z *zl_truncate(float *W, uint32_t d_in, uint32_t d_out, uint32_t rank
     }
     uint64_t seed = 0x5A5A1EEDULL;
     for (size_t i = 0; i < (size_t)d_in * rank; i++) V[i] = lcg_unit(&seed);
-    mgs(V, d_in, rank, &seed);
+    dz_orth(V, d_in, rank, &seed);
     for (int it = 0; it < 12; it++) {           /* 12 iters: ample for k<<d */
 #ifdef DQ_BLAS
-        /* T = WᵀV (d_out×k); V = W·T (d_in×k) — sgemm, 数学同标量路(尾位差) */
-        cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, (int)d_out, (int)rank,
-                    (int)d_in, 1.0f, W, (int)d_out, V, (int)rank, 0.0f, T, (int)rank);
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, (int)d_in, (int)rank,
-                    (int)d_out, 1.0f, W, (int)d_out, T, (int)rank, 0.0f, V, (int)rank);
+        /* T = WᵀV (d_out×k); V = W·T (d_in×k) — gemm, 数学同标量路(尾位差) */
+        dz_sgemm(1, (int)d_out, (int)rank, (int)d_in, W, (int)d_out, V, (int)rank,
+                 T, (int)rank);
+        dz_sgemm(0, (int)d_in, (int)rank, (int)d_out, W, (int)d_out, T, (int)rank,
+                 V, (int)rank);
 #else
         /* T = W^T V  (d_out x k) */
         memset(T, 0, (size_t)d_out * rank * sizeof(float));
@@ -173,13 +208,13 @@ static ds4_z *zl_truncate(float *W, uint32_t d_in, uint32_t d_out, uint32_t rank
             }
         }
 #endif
-        mgs(V, d_in, rank, &seed);
+        dz_orth(V, d_in, rank, &seed);
     }
     /* M = V^T W (k x d_out); z = row norms of M (descending by construction
      * up to iteration accuracy); U rows = normalized M rows. */
 #ifdef DQ_BLAS
-    cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, (int)rank, (int)d_out,
-                (int)d_in, 1.0f, V, (int)rank, W, (int)d_out, 0.0f, M, (int)d_out);
+    dz_sgemm(1, (int)rank, (int)d_out, (int)d_in, V, (int)rank, W, (int)d_out,
+             M, (int)d_out);
 #else
     memset(M, 0, (size_t)rank * d_out * sizeof(float));
     for (uint32_t i = 0; i < d_in; i++) {
@@ -257,10 +292,10 @@ int ds4_z_solve_multi(const float *X, const float *R, uint32_t n,
         if (!Xd || !Rd) { free(Xd); free(Rd); free(G); free(B); return -1; }
         for (size_t i = 0; i < (size_t)n * d_in; i++) Xd[i] = X[i];
         for (size_t i = 0; i < (size_t)n * d_out; i++) Rd[i] = R[i];
-        cblas_dgemm(CblasRowMajor, CblasTrans, CblasNoTrans, (int)d_in, (int)d_in, (int)n,
-                    1.0, Xd, (int)d_in, Xd, (int)d_in, 0.0, G, (int)d_in);
-        cblas_dgemm(CblasRowMajor, CblasTrans, CblasNoTrans, (int)d_in, (int)d_out, (int)n,
-                    1.0, Xd, (int)d_in, Rd, (int)d_out, 0.0, B, (int)d_out);
+        dz_dgemm(1, (int)d_in, (int)d_in, (int)n, Xd, (int)d_in, Xd, (int)d_in,
+                 G, (int)d_in);
+        dz_dgemm(1, (int)d_in, (int)d_out, (int)n, Xd, (int)d_in, Rd, (int)d_out,
+                 B, (int)d_out);
         free(Xd); free(Rd);
     }
 #else
@@ -304,14 +339,21 @@ int ds4_z_solve_multi(const float *X, const float *R, uint32_t n,
         float *W = malloc((size_t)d_in * d_out * sizeof(float));
         if (!W) { rc = -1; break; }
 #ifdef DQ_BLAS
-        {   /* 分块 potrf/potrs: 行主序对称阵取 uplo='U' 列主序等价; B 转置进出 */
-            int info = 0, N = (int)d_in, nrhs = (int)d_out;
-            const char up = 'U';
-            DZ_DPOTRF(&up, &N, Ac, &N, &info);
-            if (info) { free(W); rc = -1; break; }
+        {   /* 分块 potrf/potrs: 行主序对称阵取 uplo='U' 列主序等价; B 转置进出。
+             * DQ_CUDA 先试 cusolver(Ac 主机侧不被破坏), 失败回 LAPACK。 */
+            int done = 0;
             memcpy(Btc, Bt0, (size_t)d_in * d_out * sizeof(double));
-            DZ_DPOTRS(&up, &N, &nrhs, Ac, &N, Btc, &N, &info);
-            if (info) { free(W); rc = -1; break; }
+#ifdef DQ_CUDA
+            done = zg_dpotrf_potrs((int)d_in, (int)d_out, Ac, Btc);
+#endif
+            if (!done) {
+                int info = 0, N = (int)d_in, nrhs = (int)d_out;
+                const char up = 'U';
+                DZ_DPOTRF(&up, &N, Ac, &N, &info);
+                if (info) { free(W); rc = -1; break; }
+                DZ_DPOTRS(&up, &N, &nrhs, Ac, &N, Btc, &N, &info);
+                if (info) { free(W); rc = -1; break; }
+            }
             for (uint32_t i = 0; i < d_in; i++)
                 for (uint32_t j = 0; j < d_out; j++)
                     W[(size_t)i * d_out + j] = (float)Btc[(size_t)j * d_in + i];
