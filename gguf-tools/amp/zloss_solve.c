@@ -38,6 +38,7 @@
 #include "npy.h"
 #include "ds4_z.c"                      /* -I.. 仓库根: 与引擎同一份实现(复用铁律) */
 #include "ds4_loss.c"
+#include "linalg_small.h"               /* GE 256×256 正规方程用 chol_solve_spd */
 
 #define D 4096
 #define MAXG 8                          /* λ/k/M 网格上限 */
@@ -76,6 +77,8 @@ static int *parse_ranges(const char *s, int *n_out) {   /* "a:b,c:d" 左闭右�
     *n_out = n; return v;
 }
 
+#include "zloss_arms.inc.c"             /* GE 臂 + ftA 臂(物理分片, 同 TU) */
+
 /* ---- 锚读取(DQA2, 与 zlayer anchor_layer 同格式): fin + top-1 专家(路由门用,
  * rw 最大槽位; 部署时路由先于专家计算, 是免费可得的信号) ---- */
 static float *anchor_load(const char *ap, int L, int ntok, int **top1_out) {
@@ -113,7 +116,8 @@ static float *anchor_load(const char *ap, int L, int ntok, int **top1_out) {
 }
 
 /* ---- zcache 读取: R=dH, Ys=Σ pw·pYQ(自洽重建, 不掺 teacher_routed 的约定差) ---- */
-static void zcache_load(const char *dir, int L, int ntok, float **R_out, float **Ys_out) {
+static void zcache_load(const char *dir, int L, int ntok, float **R_out, float **Ys_out,
+                        zpairs *zp) {
     char p[1024]; snprintf(p, sizeof p, "%s/zcache_L%02d.npz", dir, L);
     FILE *f = fopen(p, "rb");
     if (!f) die("%s 打不开(先 DS4_ZL_CACHE_ONLY=1 跑 zlayer 建缓存)", p);
@@ -143,8 +147,23 @@ static void zcache_load(const char *dir, int L, int ntok, float **R_out, float *
         const double *yq = pYQ.v + (size_t)i * D;
         for (int d = 0; d < D; d++) ys[d] += w * (float)yq[d];
     }
+    zp->npair = prow.n;                  /* 配对留给 GE 臂(路由精确条件化数据面) */
+    zp->prow = xmalloc((size_t)prow.n * sizeof(int));
+    zp->pe = xmalloc((size_t)prow.n * sizeof(int));
+    zp->pw = xmalloc((size_t)prow.n * sizeof(float));
+    zp->pyq = xmalloc((size_t)prow.n * D * sizeof(float));
+    for (long long i = 0; i < prow.n; i++) {
+        zp->prow[i] = (int)prow.v[i]; zp->pe[i] = (int)pe.v[i]; zp->pw[i] = (float)pw.v[i];
+    }
+    for (size_t i = 0; i < (size_t)prow.n * D; i++) zp->pyq[i] = (float)pYQ.v[i];
     free(dH.v); free(prow.v); free(pe.v); free(pw.v); free(pYQ.v); free(buf);
     *R_out = R; *Ys_out = Ys;
+}
+
+/* 图应用: d_in=3D 的 ftA 图先做 φ 提升(与引擎 type6 ftA 路同式) */
+static void apply_any(const ds4_z *zl, const float *x, float *phib, float *y) {
+    if (zl->d_in == 3 * D) { mk_phi(x, phib); ds4_z_apply(zl, phib, y); }
+    else ds4_z_apply(zl, x, y);
 }
 
 #include "zloss_selftest.inc.c"         /* 合成金标(物理分片, 同 TU) */
@@ -165,6 +184,7 @@ static int mode_assign(const float *x, const float *C, int M) {
 /* ---- held 行评估(pthread): Yhat=Ys+M(x), Cb=M(x), Cp=M(x+δ); ER 部分和 ---- */
 typedef struct {
     ds4_z *const *zl; const float *C; int M, gate_route;
+    const float *bc;                    /* 基修正(ntok×D, GE 臂), NULL=无 */
     const float *X, *Ys, *R; const int *ev, *mode_ev; int nev;
     float *Yhat, *Cb, *Cp; double dscale; uint64_t seed;
     double er_num, er_den;
@@ -174,38 +194,43 @@ static void *ev_worker(void *arg) {
     ev_ctx *c = (ev_ctx *)arg;
     float *delta = xmalloc(D * sizeof(float));
     float *xp = xmalloc(D * sizeof(float));
+    float *phib = xmalloc((size_t)3 * D * sizeof(float));
     c->er_num = c->er_den = 0;
     for (int i = c->t0; i < c->t1; i++) {
         const float *x = c->X + (size_t)c->ev[i] * D;
         float *yh = c->Yhat + (size_t)i * D, *cb = c->Cb + (size_t)i * D, *cp = c->Cp + (size_t)i * D;
         memcpy(yh, c->Ys + (size_t)c->ev[i] * D, D * sizeof(float));
-        memset(cb, 0, D * sizeof(float)); memset(cp, 0, D * sizeof(float));
+        if (c->bc) {                     /* 基修正(GE): 图叠在它之上 */
+            const float *b = c->bc + (size_t)c->ev[i] * D;
+            for (int j = 0; j < D; j++) yh[j] += b[j];
+            memcpy(cb, b, D * sizeof(float)); memcpy(cp, b, D * sizeof(float));
+        } else { memset(cb, 0, D * sizeof(float)); memset(cp, 0, D * sizeof(float)); }
         int m = c->mode_ev[i];
-        if (c->zl[m]) { ds4_z_apply(c->zl[m], x, yh); ds4_z_apply(c->zl[m], x, cb); }
+        if (c->zl[m]) { apply_any(c->zl[m], x, phib, yh); apply_any(c->zl[m], x, phib, cb); }
         double ss = 0; for (int j = 0; j < D; j++) ss += (double)x[j] * x[j];
         const float rms = (float)sqrt(ss / D);
         ds4_loss_dither(c->seed, (uint32_t)c->ev[i], (float)(c->dscale * rms), delta, D);
         for (int j = 0; j < D; j++) xp[j] = x[j] + delta[j];
         /* 扰动可换模式(x门): 门稳定性一并入 smooth; 路由门下扰动不改路由 → 同模式 */
         int mp = c->gate_route ? m : mode_assign(xp, c->C, c->M);
-        if (c->zl[mp]) ds4_z_apply(c->zl[mp], xp, cp);
+        if (c->zl[mp]) apply_any(c->zl[mp], xp, phib, cp);
         const float *r = c->R + (size_t)c->ev[i] * D;
         for (int j = 0; j < D; j++) {
             double e = (double)r[j] - cb[j];
             c->er_num += e * e; c->er_den += (double)r[j] * r[j];
         }
     }
-    free(delta); free(xp); return NULL;
+    free(delta); free(xp); free(phib); return NULL;
 }
 static double eval_apply(ds4_z *const *zl, const float *C, int M, int gate_route,
-                         const float *X,
+                         const float *bc, const float *X,
                          const float *Ys, const float *R, const int *ev, const int *mode_ev,
                          int nev, float *Yhat, float *Cb, float *Cp,
                          double dscale, uint64_t seed, int nth) {
     pthread_t th[32]; ev_ctx cx[32];
     if (nth > 32) nth = 32;
     for (int t = 0; t < nth; t++) {
-        cx[t] = (ev_ctx){zl, C, M, gate_route, X, Ys, R, ev, mode_ev, nev, Yhat, Cb, Cp,
+        cx[t] = (ev_ctx){zl, C, M, gate_route, bc, X, Ys, R, ev, mode_ev, nev, Yhat, Cb, Cp,
                          dscale, seed, 0, 0, nev * t / nth, nev * (t + 1) / nth};
         pthread_create(&th[t], NULL, ev_worker, &cx[t]);
     }
@@ -277,8 +302,9 @@ int main(int argc, char **argv) {
     int any_lost = 0;
     for (int L = l0; L <= l1; L++) {
         float *X, *R = NULL, *Ys = NULL; int *top1 = NULL;
+        zpairs zp = {0};
         if (selftest) st_synth(ntok, &X, &R, &Ys);
-        else { X = anchor_load(anc, L, ntok, &top1); zcache_load(zdir, L, ntok, &R, &Ys); }
+        else { X = anchor_load(anc, L, ntok, &top1); zcache_load(zdir, L, ntok, &R, &Ys, &zp); }
         float *Yt = xmalloc((size_t)ntok * D * sizeof(float));
         for (size_t i = 0; i < (size_t)ntok * D; i++) Yt[i] = Ys[i] + R[i];
 
@@ -296,17 +322,31 @@ int main(int argc, char **argv) {
 
         char lossp[1024]; snprintf(lossp, sizeof lossp, "%s/fourloss_L%02d.txt", out, L);
         FILE *lf = fopen(lossp, "w"); if (!lf) die("%s 写不开", lossp);
-        fprintf(lf, "# zloss v2 L%02d 裸基线: align=%.6f cls=%.6f total=%.6f\n", L, la0, lc0, tot0);
-        fprintf(lf, "# M lambda k align classify smooth fixed total ER%% volMB\n");
+        fprintf(lf, "# zloss v4 L%02d 裸基线: align=%.6f cls=%.6f total=%.6f\n", L, la0, lc0, tot0);
+        fprintf(lf, "# arm M lambda k align classify smooth fixed total ER%% volMB\n");
         printf("★L%d 裸: align %.4f cls %.4f total %.4f\n", L, la0, lc0, tot0);
 
         float *Yhat = xmalloc((size_t)nev * D * sizeof(float));
         float *Cb = xmalloc((size_t)nev * D * sizeof(float));
         float *Cp = xmalloc((size_t)nev * D * sizeof(float));
         float *zcat = xmalloc((size_t)maxM * maxk * sizeof(float));
-        double best_tot = tot0, best_lam = 0, best_er = 0; int best_M = 0, best_k = 0;
-        float bla = la0, blc = lc0;
+        best_t best = { tot0, 0, 0, 0, 0, la0, lc0, NULL };
         float mbest_align[MAXG]; for (int i = 0; i < MAXG; i++) mbest_align[i] = 1e9f;
+        int *mode0 = xmalloc((size_t)nev * sizeof(int));
+        memset(mode0, 0, (size_t)nev * sizeof(int));
+        float *gecorr = NULL, *Rge = NULL, *XP = NULL;
+        if (!selftest) {
+            /* ---- GE 臂: 每专家增益, 门=路由本身(冠军 bf.GE 同族, 四损失口径重解) ---- */
+            uint8_t *isfit = xmalloc((size_t)ntok);
+            memset(isfit, 0, (size_t)ntok);
+            for (int i = 0; i < nf; i++) isfit[fit[i]] = 1;
+            double delta[256];
+            solve_ge(&zp, R, isfit, ntok, 1e-3, L, delta);   /* λ=zlayer GE_LAM 同款 */
+            gecorr = ge_corr_build(&zp, delta, ntok);
+            run_ge_arm(delta, gecorr, X, Ys, Yt_ev, wv, R, ev, mode0, nev,
+                       &lw, dscale, seed, nth, L, lf, &best, Yhat, Cb, Cp);
+            free(isfit);
+        }
 
         for (int mi = 0; mi < nmode; mi++) {
             const int M = modes[mi];
@@ -355,22 +395,22 @@ int main(int argc, char **argv) {
                         for (uint32_t c = 0; c < zl[m]->k; c++) zcat[nz++] = zl[m]->z[c];
                     }
                     if (gate_route) vol += 256;      /* 路由查表门: 每专家 1 字节 */
-                    double er = eval_apply(zl, C, M, gate_route, X, Ys, R, ev, mode_ev, nev,
-                                           Yhat, Cb, Cp, dscale, seed, nth);
+                    double er = eval_apply(zl, C, M, gate_route, NULL, X, Ys, R, ev, mode_ev,
+                                           nev, Yhat, Cb, Cp, dscale, seed, nth);
                     float la = ds4_loss_align(Yhat, Yt_ev, (uint32_t)nev, D);
                     float lc = ds4_loss_classify(Yhat, Yt_ev, wv, (uint32_t)nev, D);
                     float ls = ds4_loss_smooth(Cb, Cp, (uint32_t)nev, D);
                     float lfx = ds4_loss_fixed(zcat, (size_t)nz);
                     float tot = ds4_loss_total(&lw, la, lc, ls, lfx);
-                    fprintf(lf, "%d %.3g %d %.6f %.6f %.6f %.6f %.6f %.2f %.2f\n",
+                    fprintf(lf, "x %d %.3g %d %.6f %.6f %.6f %.6f %.6f %.2f %.2f\n",
                             M, lambdas[li], ranks[ki], la, lc, ls, lfx, tot, er * 100, vol / 1e6);
                     printf("  L%d M=%-2d λ=%-5.3g k=%-3d | align %.4f cls %.4f sm %.5f fx %.5f "
                            "tot %.4f | ER %.1f%% | vol %.1fMB\n",
                            L, M, lambdas[li], ranks[ki], la, lc, ls, lfx, tot, er * 100, vol / 1e6);
                     if (la < mbest_align[mi]) mbest_align[mi] = la;
-                    if (tot < best_tot) {
-                        best_tot = tot; best_lam = lambdas[li]; best_k = ranks[ki];
-                        best_M = M; best_er = er; bla = la; blc = lc;
+                    if (tot < best.tot) {
+                        best.tot = tot; best.lam = lambdas[li]; best.k = ranks[ki];
+                        best.M = M; best.er = er; best.la = la; best.lc = lc; best.arm = "x";
                     }
                     fflush(stdout);
                 }
@@ -378,15 +418,29 @@ int main(int argc, char **argv) {
             }
             free(C); free(mode_fit); free(mode_ev);
         }
-        int won = best_M > 0;
-        fprintf(lf, "# 选中: %s M=%d λ=%.3g k=%d total=%.6f (裸 %.6f Δ=%.2f%%) ER=%.1f%%\n",
-                won ? "有解" : "全网格输裸(停车审计)", best_M, best_lam, best_k,
-                best_tot, tot0, tot0 > 0 ? 100.0 * (tot0 - best_tot) / tot0 : 0.0, best_er * 100);
+        if (!selftest) {
+            /* ---- ftA 臂(冠军特征) 与 GE+ftA 臂(冠军配方全还原) ---- */
+            XP = build_phi(X, ntok);
+            run_map_arm("ftA", XP, 3 * D, NULL, R, R, X, Ys, Yt_ev, wv, fit, nf,
+                        ev, mode0, nev, ranks, nrank, lambdas, nlam, maxk, &lw,
+                        dscale, seed, nth, L, lf, &best, Yhat, Cb, Cp, zcat);
+            Rge = xmalloc((size_t)ntok * D * sizeof(float));
+            for (size_t i = 0; i < (size_t)ntok * D; i++) Rge[i] = R[i] - gecorr[i];
+            run_map_arm("GE+ftA", XP, 3 * D, gecorr, Rge, R, X, Ys, Yt_ev, wv, fit, nf,
+                        ev, mode0, nev, ranks, nrank, lambdas, nlam, maxk, &lw,
+                        dscale, seed, nth, L, lf, &best, Yhat, Cb, Cp, zcat);
+        }
+        int won = best.arm != NULL;
+        fprintf(lf, "# 选中: %s arm=%s M=%d λ=%.3g k=%d total=%.6f (裸 %.6f Δ=%.2f%%) ER=%.1f%%\n",
+                won ? "有解" : "全网格输裸(停车审计)", won ? best.arm : "-", best.M,
+                best.lam, best.k, best.tot, tot0,
+                tot0 > 0 ? 100.0 * (tot0 - best.tot) / tot0 : 0.0, best.er * 100);
         fclose(lf);
-        printf("★L%d 终判: %s M=%d λ=%.3g k=%d | align %.4f→%.4f cls %.4f→%.4f "
+        printf("★L%d 终判: %s arm=%s M=%d λ=%.3g k=%d | align %.4f→%.4f cls %.4f→%.4f "
                "total %.4f→%.4f | ER %.1f%%\n",
-               L, won ? "选中" : "★全网格输裸=解算器有病, 停车审计★", best_M, best_lam,
-               best_k, la0, bla, lc0, blc, tot0, best_tot, best_er * 100);
+               L, won ? "选中" : "★全网格输裸=解算器有病, 停车审计★", won ? best.arm : "-",
+               best.M, best.lam, best.k, la0, best.la, lc0, best.lc, tot0, best.tot,
+               best.er * 100);
         if (!won) any_lost = 1;
         if (selftest) {
             printf("★selftest: M=1 best align=%.4f  M=2 best align=%.4f\n",
@@ -398,6 +452,8 @@ int main(int argc, char **argv) {
         fflush(stdout);
         free(X); free(R); free(Ys); free(Yt); free(Yt_ev); free(Ys_ev); free(wv);
         free(Yhat); free(Cb); free(Cp); free(zcat); free(top1);
+        free(mode0); free(gecorr); free(Rge); free(XP);
+        free(zp.prow); free(zp.pe); free(zp.pw); free(zp.pyq);
     }
     free(fit); free(ev);
     if (any_lost) { fprintf(stderr, "zloss_solve: 有层全网格输裸 — 停车审计(exit 3)\n"); return 3; }
