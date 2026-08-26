@@ -66,7 +66,7 @@ int main(int argc, char **argv) {
         npz_get(zbuf, zsz, "pYQ", &pYQ)) { fprintf(stderr, "zcache 字段缺\n"); return 2; }
     int hasX = npz_get(zbuf, zsz, "xcap", &X) == 0;
     int NTOK = (int)dH.d0;
-    printf("zcache: dH(%d, %d) X=%s 对数=%lld\n", NTOK, (int)dH.d1, hasX ? "有" : "无(锚fin口径)", prow.n);
+    printf("zcache: dH(%d, %d) X=%s 对数=%lld\n", NTOK, (int)dH.d1, hasX ? "有" : "无(锚fin口径)", (long long)prow.n);
     if (!hasX) { fprintf(stderr, "无 xcap 的 zcache(锚fin口径)本工具不重建 x — 与 .py 行为一致需锚, 拒跑\n"); return 3; }
     /* 残差 = dH 副本 */
     double *resid = malloc((size_t)NTOK * D * 8);
