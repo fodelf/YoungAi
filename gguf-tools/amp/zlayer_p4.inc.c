@@ -257,7 +257,9 @@
         zw_add(&zw, "pe", "<i4", npair, 1, 1, pe, 4);
         zw_add(&zw, "pw", "<f4", npair, 1, 1, pw, 4);
         zw_add(&zw, "pYQ", "<f4", npair, D, 2, pYQ, 4);
-        zw_add(&zw, "pDY", "<f4", npair, D, 2, NULL, 4);      /* py 存的就是全零 */
+        if ((long long)npair * D * 4 < 0xF0000000LL)          /* py 存的就是全零; 大缓存不再
+            写这块死重(32k=4.8GB 零, 零消费者) — 8192 缓存字节不变 */
+            zw_add(&zw, "pDY", "<f4", npair, D, 2, NULL, 4);
         if (XCAP) {                                           /* py: **({"yqe":YQE,"xcap":X0} if XCAP else {}) */
             zw_add(&zw, "yqe", "<f4", NTOK, D, 2, YQE, 4);
             zw_add(&zw, "xcap", "<f4", NTOK, D, 2, X0, 4);

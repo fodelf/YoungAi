@@ -156,27 +156,41 @@ static void zw_add(zwr_t *z, const char *name, const char *dt, long long d0, lon
     npy_header(hdr, sizeof hdr, dt, d0, d1, nd, &hlen);
     size_t nel = (size_t)d0 * (size_t)(nd > 1 ? d1 : 1);
     size_t dsz = nel * esz, total = hlen + dsz;
-    if (z->pos + (long long)total + 4096 > 0xF0000000LL)
-        die("zcache 超过 4GB —— 本实现只写 ZIP32, 拒绝写出会被 numpy 读坏的文件");
+    /* ★ZIP64(2026-08-26 32k zcache 撞 4GB 墙)★: 条目/偏移超 u32 → 局部头尺寸槽打
+     * 0xFFFFFFFF, 真 u64 尺寸进 extra id=0x0001(uncompressed,compressed 各 8B)。
+     * 仓内两只读器(zlayer npz_find / calib npz_locate)本就认这个布局(顺序局部头扫描,
+     * 不吃中央目录); numpy zipfile 不在 >4GB 缓存的消费清单。≤4GB 文件字节不变。 */
+    int z64 = (total >= 0xFFFFFFFFULL) || (z->pos >= 0xFFFFFFFFLL);
     uint32_t crc = 0;
     crc = crc_upd(crc, hdr, hlen);
     if (data) crc = crc_upd(crc, data, dsz);
     else { static const uint8_t zbuf[65536] = {0}; size_t left = dsz;
            while (left) { size_t c = left > sizeof zbuf ? sizeof zbuf : left; crc = crc_upd(crc, zbuf, c); left -= c; } }
     char fn[64]; snprintf(fn, sizeof fn, "%s.npy", name);
-    uint8_t lh[30] = {0};
-    wr32(lh, 0x04034b50u); wr16(lh + 4, 20); wr16(lh + 6, 0); wr16(lh + 8, 0);
+    uint8_t lh[30] = {0}, xtra[20]; uint16_t xl = 0;
+    wr32(lh, 0x04034b50u); wr16(lh + 4, z64 ? 45 : 20); wr16(lh + 6, 0); wr16(lh + 8, 0);
     wr16(lh + 10, 0); wr16(lh + 12, 0x21);          /* 固定时间戳: 产物字节可复现 */
-    wr32(lh + 14, crc); wr32(lh + 18, (uint32_t)total); wr32(lh + 22, (uint32_t)total);
-    wr16(lh + 26, (uint32_t)strlen(fn)); wr16(lh + 28, 0);
+    wr32(lh + 14, crc);
+    if (z64) {
+        wr32(lh + 18, 0xFFFFFFFFu); wr32(lh + 22, 0xFFFFFFFFu);
+        uint64_t t64 = total;
+        wr16(xtra, 1); wr16(xtra + 2, 16);
+        memcpy(xtra + 4, &t64, 8); memcpy(xtra + 12, &t64, 8);
+        xl = 20;
+    } else { wr32(lh + 18, (uint32_t)total); wr32(lh + 22, (uint32_t)total); }
+    wr16(lh + 26, (uint32_t)strlen(fn)); wr16(lh + 28, xl);
     zent_t *e = &z->e[z->n++];
     snprintf(e->name, sizeof e->name, "%s", fn);
-    e->crc = crc; e->size = (uint32_t)total; e->off = (uint32_t)z->pos;
-    fwrite(lh, 1, 30, z->f); fwrite(fn, 1, strlen(fn), z->f); fwrite(hdr, 1, hlen, z->f);
+    e->crc = crc;
+    e->size = total < 0xFFFFFFFFULL ? (uint32_t)total : 0xFFFFFFFFu;
+    e->off = z->pos < 0xFFFFFFFFLL ? (uint32_t)z->pos : 0xFFFFFFFFu;
+    fwrite(lh, 1, 30, z->f); fwrite(fn, 1, strlen(fn), z->f);
+    if (xl) fwrite(xtra, 1, xl, z->f);
+    fwrite(hdr, 1, hlen, z->f);
     if (data) fwrite(data, 1, dsz, z->f);
     else { static const uint8_t zbuf[65536] = {0}; size_t left = dsz;
            while (left) { size_t c = left > sizeof zbuf ? sizeof zbuf : left; fwrite(zbuf, 1, c, z->f); left -= c; } }
-    z->pos += 30 + (long long)strlen(fn) + (long long)total;
+    z->pos += 30 + (long long)strlen(fn) + xl + (long long)total;
 }
 static void zw_finish(zwr_t *z) {
     long long cd = z->pos;
