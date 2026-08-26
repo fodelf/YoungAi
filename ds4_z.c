@@ -285,8 +285,22 @@ int ds4_z_solve_multi(const float *X, const float *R, uint32_t n,
     double *G = calloc((size_t)d_in * d_in, sizeof(double));
     double *B = calloc((size_t)d_in * d_out, sizeof(double));
     if (!G || !B) { free(G); free(B); return -1; }
+    int gram_done = 0; (void)gram_done;  /* 标量路不消费 */
+#if defined(DQ_BLAS) && defined(DQ_CUDA)
+    {   /* f32 Gram 上卡(GB10 f64=1:64; zlayer ftA f32 Gram 冠军先例), 升 f64 进解 */
+        float *Gf = malloc((size_t)d_in * d_in * 4), *Bf = malloc((size_t)d_in * d_out * 4);
+        if (Gf && Bf &&
+            zg_sgemm(1, 0, (int)d_in, (int)d_in, (int)n, X, (int)d_in, X, (int)d_in, Gf, (int)d_in) &&
+            zg_sgemm(1, 0, (int)d_in, (int)d_out, (int)n, X, (int)d_in, R, (int)d_out, Bf, (int)d_out)) {
+            for (size_t i = 0; i < (size_t)d_in * d_in; i++) G[i] = Gf[i];
+            for (size_t i = 0; i < (size_t)d_in * d_out; i++) B[i] = Bf[i];
+            gram_done = 1;
+        }
+        free(Gf); free(Bf);
+    }
+#endif
 #ifdef DQ_BLAS
-    {   /* G = XᵀX, B = XᵀR — dgemm 双精(输入升 f64 后与标量路同一乘加集合) */
+    if (!gram_done) {   /* G = XᵀX, B = XᵀR — dgemm 双精(输入升 f64 后与标量路同一乘加集合) */
         double *Xd = malloc((size_t)n * d_in * sizeof(double));
         double *Rd = malloc((size_t)n * d_out * sizeof(double));
         if (!Xd || !Rd) { free(Xd); free(Rd); free(G); free(B); return -1; }
