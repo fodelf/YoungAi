@@ -1,3 +1,56 @@
+/* zloss_solve_p1.inc.c — zloss_solve 唯一物理分片(≤500 行守卫所迫, 纯编号切片
+ * 惯例, 2026-08-26 用户令: 同一功能一个文件一直迭代, 禁按功能另起文件名——
+ * 原 zloss_selftest/zloss_gate/zloss_arms 三个自造名分片并入本片, 内容逐字节保留)。 */
+static int mode_assign(const float *x, const float *C, int M);   /* 主文件后段定义 */
+
+/* zloss_selftest.inc.c — zloss_solve 的合成金标(物理分片, 只被 zloss_solve.c
+ * include)。种两模式各一张 rank-8 线性图, M=2 必须近零收回, M=1 必须收不动
+ * —— 验的是 残差聚类→x 门→模式打包→eval 的全布线, 不是理论。
+ *
+ * 金标形态(两次翻案的教训都固化在此):
+ * ①x = B·h 住 H=64 维流形 —— 真激活是低维各向异性的, 金标必须同构; 满维各向
+ *   同性随机 x 下 1.5k 行撑不起 4096² 图的泛化, 谁来解都收不回(数据墙非布线针)。
+ * ②模式种在"靶怎么依赖 x"里(sign(p·h) 选 U_c·G_c), x 的密度分布对两模式完全
+ *   对称 —— x 侧无监督聚类原理上看不见这刀怎么切(任意对径切分密度等价),
+ *   逼着解算器走 残差方向聚类+x 侧门 的路(gate(x) 支柱)。 */
+static uint64_t st_s = 0x9E3779B97F4A7C15ULL;
+static float st_u(void) {
+    st_s = st_s * 6364136223846793005ULL + 1442695040888963407ULL;
+    return (float)((int64_t)(st_s >> 33) % 2000001 - 1000000) / 1e6f;
+}
+static void st_synth(int ntok, float **Xo, float **Ro, float **Yso) {
+    const int RK = 8, H = 64;
+    float *X = xmalloc((size_t)ntok * D * 4), *R = xmalloc((size_t)ntok * D * 4);
+    float *Ys = xmalloc((size_t)ntok * D * 4);
+    float *B = xmalloc((size_t)D * H * 4), *ph = xmalloc(H * 4), *h = xmalloc(H * 4);
+    float *U = xmalloc((size_t)2 * RK * D * 4), *G = xmalloc((size_t)2 * RK * H * 4);
+    for (size_t i = 0; i < (size_t)D * H; i++) B[i] = st_u();
+    for (int t = 0; t < H; t++) ph[t] = st_u();
+    for (size_t i = 0; i < (size_t)2 * RK * D; i++) U[i] = st_u();
+    for (size_t i = 0; i < (size_t)2 * RK * H; i++) G[i] = st_u();
+    memset(Ys, 0, (size_t)ntok * D * 4);
+    for (int i = 0; i < ntok; i++) {
+        float *x = X + (size_t)i * D, *r = R + (size_t)i * D;
+        double dp = 0;
+        for (int t = 0; t < H; t++) { h[t] = st_u(); dp += (double)h[t] * ph[t]; }
+        int c = dp > 0;
+        for (int j = 0; j < D; j++) {
+            double a = 0; const float *b = B + (size_t)j * H;
+            for (int t = 0; t < H; t++) a += (double)b[t] * h[t];
+            x[j] = (float)a;
+        }
+        memset(r, 0, D * 4);
+        for (int rr = 0; rr < RK; rr++) {
+            const float *g = G + ((size_t)c * RK + rr) * H, *u = U + ((size_t)c * RK + rr) * D;
+            double a = 0; for (int t = 0; t < H; t++) a += (double)g[t] * h[t];
+            a /= H;
+            for (int j = 0; j < D; j++) r[j] += (float)(a * u[j]);
+        }
+    }
+    free(B); free(ph); free(h); free(U); free(G);
+    *Xo = X; *Ro = R; *Yso = Ys;
+}
+
 /* zloss_arms.inc.c — GE 臂与 ftA 臂(物理分片, 只被 zloss_solve.c include)。
  *
  * 依据(L20 针终判): 裸 x 全家(静态+EM模式)在 FP 自洽口径下输裸, 而 r64c 冠军
@@ -176,4 +229,123 @@ static void run_ge_arm(const double *delta, const float *gecorr, const float *X,
         best->er = er; best->la = la; best->lc = lc; best->arm = "GE";
     }
     fflush(stdout);
+}
+
+/* zloss_gate.inc.c — 动态 z 的模式发现与 x 侧门(物理分片, 只被 zloss_solve.c include)。
+ *
+ * 模式 = 混合线性回归的硬 EM: 行标签按"哪张图预测得更好"迭代(T=6), 定死种子
+ * + 双重启取 fit 总误差更小者, 全确定性。门 = EM 标签的 x 方向质心
+ * (apply 时只有 x); 训练行按门重分配, 与部署 apply 完全同式(门错训练时就吃进去)。
+ *
+ * 为什么不是无监督聚类(v2 两次翻案固化): 模式藏在 x↔R 的联合关系里 ——
+ * x 密度聚类与残差方向聚类都只看边缘分布, 对称分布下任意对径切分密度等价,
+ * selftest 金标(种 sign(p·h) 双图)下两者门一致率都 ≈50% 掷硬币。 */
+static void derive_modes(const float *X, const float *R, const int *fit, int nf,
+                         int M, int maxk, double lam0, uint64_t seed, int L,
+                         const int *top1, float *C, int *mode_fit,
+                         int *table, int *gate_route) {
+    float *Xf = xmalloc((size_t)nf * D * sizeof(float));
+    float *Rf = xmalloc((size_t)nf * D * sizeof(float));
+    for (int i = 0; i < nf; i++) {
+        memcpy(Xf + (size_t)i * D, X + (size_t)fit[i] * D, D * sizeof(float));
+        memcpy(Rf + (size_t)i * D, R + (size_t)fit[i] * D, D * sizeof(float));
+    }
+    const int EMK = maxk < 32 ? maxk : 32, T = 6, RS = 2;
+    int *lab = xmalloc((size_t)nf * sizeof(int));
+    int *labbest = xmalloc((size_t)nf * sizeof(int));
+    float *tmp = xmalloc(D * sizeof(float));
+    double errbest = 1e300;
+    for (int rs = 0; rs < RS; rs++) {
+        uint64_t s = (seed + 1 + (uint64_t)rs) * 6364136223846793005ULL + 1442695040888963407ULL;
+        for (int i = 0; i < nf; i++) {
+            s = s * 6364136223846793005ULL + 1442695040888963407ULL;
+            lab[i] = (int)((s >> 33) % (uint64_t)M);
+        }
+        double toterr = 1e300;
+        for (int it = 0; it < T; it++) {
+            ds4_z *wm[MAXM] = {0};
+            for (int m = 0; m < M; m++) {
+                int c = 0;
+                for (int i = 0; i < nf; i++) if (lab[i] == m) c++;
+                if (!c) continue;                     /* 空模式=零图参赛, 行可迁回 */
+                float *Xm = xmalloc((size_t)c * D * sizeof(float));
+                float *Rm = xmalloc((size_t)c * D * sizeof(float));
+                int w = 0;
+                for (int i = 0; i < nf; i++) if (lab[i] == m) {
+                    memcpy(Xm + (size_t)w * D, Xf + (size_t)i * D, D * sizeof(float));
+                    memcpy(Rm + (size_t)w * D, Rf + (size_t)i * D, D * sizeof(float));
+                    w++;
+                }
+                wm[m] = ds4_z_solve(Xm, Rm, (uint32_t)c, D, D,
+                                    (uint32_t)(EMK < c ? EMK : c), (float)lam0);
+                free(Xm); free(Rm);
+                if (!wm[m]) die("L%d M=%d EM 模式%d 解算失败", L, M, m);
+            }
+            toterr = 0;
+            for (int i = 0; i < nf; i++) {
+                const float *x = Xf + (size_t)i * D, *r = Rf + (size_t)i * D;
+                double best = 1e300; int bm = lab[i];
+                for (int m = 0; m < M; m++) {
+                    double e = 0;
+                    if (!wm[m]) { for (int j = 0; j < D; j++) e += (double)r[j] * r[j]; }
+                    else {
+                        memset(tmp, 0, D * sizeof(float));
+                        ds4_z_apply(wm[m], x, tmp);
+                        for (int j = 0; j < D; j++) { double d = (double)r[j] - tmp[j]; e += d * d; }
+                    }
+                    if (e < best) { best = e; bm = m; }
+                }
+                lab[i] = bm; toterr += best;
+            }
+            for (int m = 0; m < M; m++) if (wm[m]) ds4_z_free(wm[m]);
+        }
+        printf("  L%d M=%d EM 重启%d fit误差 %.4g\n", L, M, rs, toterr);
+        if (toterr < errbest) { errbest = toterr; memcpy(labbest, lab, (size_t)nf * sizeof(int)); }
+    }
+    /* 门候选①: x 方向质心(EM 标签的 x 侧线性读出) */
+    double *xacc = xmalloc((size_t)M * D * sizeof(double));
+    memset(xacc, 0, (size_t)M * D * sizeof(double));
+    for (int i = 0; i < nf; i++) {
+        const float *x = Xf + (size_t)i * D;
+        double ss = 0; for (int j = 0; j < D; j++) ss += (double)x[j] * x[j];
+        double inv = ss > 0 ? 1.0 / sqrt(ss) : 0.0;
+        double *a = xacc + (size_t)labbest[i] * D;
+        for (int j = 0; j < D; j++) a[j] += x[j] * inv;
+    }
+    for (int m = 0; m < M; m++) {
+        double ss = 0; const double *a = xacc + (size_t)m * D;
+        for (int j = 0; j < D; j++) ss += a[j] * a[j];
+        double inv = ss > 0 ? 1.0 / sqrt(ss) : 0.0;
+        float *c = C + (size_t)m * D;
+        for (int j = 0; j < D; j++) c[j] = (float)(a[j] * inv);
+    }
+    int agree_x = 0;
+    for (int i = 0; i < nf; i++)
+        if (mode_assign(Xf + (size_t)i * D, C, M) == labbest[i]) agree_x++;
+    /* 门候选②: 路由 top-1 专家查表(R=Σ所选专家误差图 ⇒ 模式天然路由承载;
+     * 部署时路由先于专家计算, 免费信号)。空表专家回落全局多数标签。 */
+    int agree_r = -1;
+    if (top1 && table) {
+        int *vt = xmalloc((size_t)256 * M * sizeof(int));
+        memset(vt, 0, (size_t)256 * M * sizeof(int));
+        int gcnt[MAXM]; memset(gcnt, 0, sizeof gcnt);
+        for (int i = 0; i < nf; i++) { vt[(size_t)top1[fit[i]] * M + labbest[i]]++; gcnt[labbest[i]]++; }
+        int gmaj = 0;
+        for (int m = 1; m < M; m++) if (gcnt[m] > gcnt[gmaj]) gmaj = m;
+        for (int e = 0; e < 256; e++) {
+            int bm = -1, bc = 0;
+            for (int m = 0; m < M; m++) if (vt[(size_t)e * M + m] > bc) { bc = vt[(size_t)e * M + m]; bm = m; }
+            table[e] = bm < 0 ? gmaj : bm;
+        }
+        agree_r = 0;
+        for (int i = 0; i < nf; i++) if (table[top1[fit[i]]] == labbest[i]) agree_r++;
+        free(vt);
+    }
+    *gate_route = (agree_r > agree_x);
+    for (int i = 0; i < nf; i++)
+        mode_fit[i] = *gate_route ? table[top1[fit[i]]] : mode_assign(Xf + (size_t)i * D, C, M);
+    printf("  L%d M=%d 门一致率 x=%.1f%% 路由=%.1f%% → 选%s门\n", L, M,
+           100.0 * agree_x / nf, agree_r < 0 ? -1.0 : 100.0 * agree_r / nf,
+           *gate_route ? "路由" : "x");
+    free(Xf); free(Rf); free(lab); free(labbest); free(tmp); free(xacc);
 }

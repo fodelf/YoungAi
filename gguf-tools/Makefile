@@ -218,10 +218,10 @@ $(AMP)/dql_to_zchain: $(AMP)/dql_to_zchain.c
 # ds4_loss.c(与引擎同一份实现); BLAS 在则开 DQ_BLAS 快路(ds4_z.c 内守卫)。
 zloss_solve: $(AMP)/zloss_solve
 ifeq ($(HAVE_BLAS),1)
-$(AMP)/zloss_solve: $(AMP)/zloss_solve.c $(AMP)/zloss_selftest.inc.c $(AMP)/zloss_gate.inc.c $(AMP)/zloss_arms.inc.c $(AMP)/linalg_small.c $(CAL)/npy.c ../ds4_z.c ../ds4_z.h ../ds4_loss.c ../ds4_loss.h
+$(AMP)/zloss_solve: $(AMP)/zloss_solve.c $(AMP)/zloss_solve_p1.inc.c $(AMP)/linalg_small.c $(CAL)/npy.c ../ds4_z.c ../ds4_z.h ../ds4_loss.c ../ds4_loss.h
 	$(CC) $(BARE) $(NATIVE) -I.. -I$(CAL) -DDQ_BLAS $(BLAS_CFLAGS) -o $@ $(AMP)/zloss_solve.c $(AMP)/linalg_small.c $(CAL)/npy.c $(BLAS_LIBS) -lm -lpthread
 else
-$(AMP)/zloss_solve: $(AMP)/zloss_solve.c $(AMP)/zloss_selftest.inc.c $(AMP)/zloss_gate.inc.c $(AMP)/zloss_arms.inc.c $(AMP)/linalg_small.c $(CAL)/npy.c ../ds4_z.c ../ds4_z.h ../ds4_loss.c ../ds4_loss.h
+$(AMP)/zloss_solve: $(AMP)/zloss_solve.c $(AMP)/zloss_solve_p1.inc.c $(AMP)/linalg_small.c $(CAL)/npy.c ../ds4_z.c ../ds4_z.h ../ds4_loss.c ../ds4_loss.h
 	$(CC) $(BARE) $(NATIVE) -I.. -I$(CAL) -o $@ $(AMP)/zloss_solve.c $(AMP)/linalg_small.c $(CAL)/npy.c -lm -lpthread
 endif
 

@@ -8,7 +8,7 @@
  *   与 XCAP 全量 0.47364 比裸差同罪(链态口径两次翻车)。
  *
  * ★动态 z(方案 B 兑现)★ 低维动态 z 映射高维行为: 模式=混合线性回归硬 EM
- *   (zloss_gate.inc.c, 按"哪张图预测得更好"发现行标签, 定死种子+双重启),
+ *   (zloss_solve_p1.inc.c, 按"哪张图预测得更好"发现行标签, 定死种子+双重启),
  *   门=EM 标签的 x 方向质心(apply 只有 x), 每模式独立 ds4_z_solve 闭式 rank-k
  *   —— 修正图随 token 的行为模式切换(路由哈希看似随机, 规律是条件性的; 一张
  *   全局静态图把模式平均掉, v1 深层全军判空的第二根因)。M=1 = 静态下界参赛。
@@ -77,7 +77,7 @@ static int *parse_ranges(const char *s, int *n_out) {   /* "a:b,c:d" 左闭右�
     *n_out = n; return v;
 }
 
-#include "zloss_arms.inc.c"             /* GE 臂 + ftA 臂(物理分片, 同 TU) */
+#include "zloss_solve_p1.inc.c"         /* 唯一物理分片(金标+GE/ftA 臂+模式发现) */
 
 /* ---- 锚读取(DQA2, 与 zlayer anchor_layer 同格式): fin + top-1 专家(路由门用,
  * rw 最大槽位; 部署时路由先于专家计算, 是免费可得的信号) ---- */
@@ -166,8 +166,6 @@ static void apply_any(const ds4_z *zl, const float *x, float *phib, float *y) {
     else ds4_z_apply(zl, x, y);
 }
 
-#include "zloss_selftest.inc.c"         /* 合成金标(物理分片, 同 TU) */
-
 /* ---- 方向余弦 k-means(全确定性): LCG 首心 + farthest-point 续种 + 20 轮 Lloyd ---- */
 static int mode_assign(const float *x, const float *C, int M) {
     if (M <= 1) return 0;
@@ -179,8 +177,6 @@ static int mode_assign(const float *x, const float *C, int M) {
     }
     return bm;
 }
-#include "zloss_gate.inc.c"             /* EM 模式发现 + x 侧门(物理分片, 同 TU) */
-
 /* ---- held 行评估(pthread): Yhat=Ys+M(x), Cb=M(x), Cp=M(x+δ); ER 部分和 ---- */
 typedef struct {
     ds4_z *const *zl; const float *C; int M, gate_route;
