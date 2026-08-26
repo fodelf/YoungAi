@@ -338,10 +338,14 @@ int main(int argc, char **argv) {
             run_bc_arm("GEc", thf, 256 * (1 + cm), gc, X, Ys, Yt_ev, wv, R, ev, mode0,
                        nev, &lw, dscale, seed, nth, L, lf, &best, Yhat, Cb, Cp);
             free(ctx); free(thd); free(gc);
-            if (g_dynz)          /* ★方案B 动态 z 臂(z=f(x), 四损失判决同表)★ */
+            if (g_dynz) {        /* ★方案B 动态 z 臂(z=f(x), 四损失判决同表)★ */
                 run_dynz_arm(X, R, Ys, Yt_ev, wv, fit, nf, ev, mode0, nev, ntok,
                              ranks, nrank, lambdas, nlam, maxk, &lw, dscale, seed,
                              nth, L, lf, &best, Yhat, Cb, Cp);
+                run_pez_arm(&zp, X, R, Ys, Yt_ev, wv, fit, nf, ev, mode0, nev, ntok,
+                            lambdas, nlam, maxk, &lw, dscale, seed, nth, L, lf,
+                            &best, Yhat, Cb, Cp);
+            }
         }
         tge = tnow();
 

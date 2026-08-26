@@ -180,3 +180,135 @@ static void run_dynz_arm(const float *X, const float *R, const float *Ys,
     }
     ds4_z_free(s1); ds4_z_free(s2); free(sv); free(sa);
 }
+
+/* ★pez 臂: 每专家低秩 z(路由承载的动态 z)★ — GE 标量门的向量化:
+ *   corr_t = Σ_{e∈S_t} w_te · U_e · (Vᵀ x_t),  V 共享(线性解方向), U_e 每专家独立。
+ * 门=路由本身(部署免费, 不用学) ⇒ z 经由路由成为 x 的函数。特征 φ_{(e,c)}(t)=
+ * w_te·p_c(t)(e 未点火=0), U 联合 ridge(256k 维块正规方程, 闭式)。
+ * 体积: U[256,k,D]+V[D,k] f16 ≈ k=16 时 33.6MB/层。 */
+static void run_pez_arm(const zpairs *zp, const float *X, const float *R, const float *Ys,
+                        const float *Yt_ev, const float *wv, const int *fit, int nf,
+                        const int *ev, const int *mode0, int nev, int ntok,
+                        const double *lambdas, int nlam, int maxk,
+                        const ds4_loss_weights *lw, double dscale, uint64_t seed,
+                        int nth, int L, FILE *lf, best_t *best,
+                        float *Yhat, float *Cb, float *Cp) {
+    double t0 = tnow();
+    float *Xf = xmalloc((size_t)nf * D * sizeof(float));
+    float *Rf = xmalloc((size_t)nf * D * sizeof(float));
+    for (int i = 0; i < nf; i++) {
+        memcpy(Xf + (size_t)i * D, X + (size_t)fit[i] * D, D * sizeof(float));
+        memcpy(Rf + (size_t)i * D, R + (size_t)fit[i] * D, D * sizeof(float));
+    }
+    ds4_z *sv1 = ds4_z_solve(Xf, Rf, (uint32_t)nf, D, D, (uint32_t)maxk, 3e-2f);
+    if (!sv1) die("L%d pez 共享 V 解失败", L);
+    free(Xf); free(Rf);
+    uint8_t *isfit = xmalloc((size_t)ntok); memset(isfit, 0, (size_t)ntok);
+    for (int i = 0; i < nf; i++) isfit[fit[i]] = 1;
+    /* 行→配对索引(zcache 的 prow 有序? 不假定, 建行首索引) */
+    long long *rs = xmalloc((size_t)(ntok + 1) * sizeof(long long));
+    memset(rs, 0, (size_t)(ntok + 1) * sizeof(long long));
+    for (long long i = 0; i < zp->npair; i++) if (zp->prow[i] < ntok) rs[zp->prow[i] + 1]++;
+    for (int t = 0; t < ntok; t++) rs[t + 1] += rs[t];
+    long long *ord = xmalloc((size_t)zp->npair * sizeof(long long));
+    { long long *cur = xmalloc((size_t)ntok * sizeof(long long));
+      memcpy(cur, rs, (size_t)ntok * sizeof(long long));
+      for (long long i = 0; i < zp->npair; i++)
+          if (zp->prow[i] < ntok) ord[cur[zp->prow[i]]++] = i;
+      free(cur); }
+    int kk[3] = {8, 16, 32};
+    for (int ki = 0; ki < 3; ki++) {
+        int k = kk[ki]; if (k > maxk) continue;
+        int F = 256 * k;
+        /* p[t,c] = x_t·V_c / s_c(sv1 前 k 列; 尺度并进特征保 Gram 条件) */
+        float *pm = xmalloc((size_t)ntok * k * sizeof(float));
+        {
+            float *Vk = xmalloc((size_t)D * k * sizeof(float));
+            for (int j = 0; j < D; j++)
+                memcpy(Vk + (size_t)j * k, sv1->V + (size_t)j * sv1->rank, (size_t)k * sizeof(float));
+#ifdef DQ_BLAS
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, ntok, k, D,
+                        1.0f, X, D, Vk, k, 0.0f, pm, k);
+#else
+            for (int t = 0; t < ntok; t++) for (int c = 0; c < k; c++) {
+                double a = 0; for (int j = 0; j < D; j++) a += (double)X[(size_t)t*D+j]*Vk[(size_t)j*k+c];
+                pm[(size_t)t * k + c] = (float)a;
+            }
+#endif
+            free(Vk);
+            for (int c = 0; c < k; c++) {
+                double ss = 0; int n2 = 0;
+                for (int i = 0; i < nf; i++) { double v = pm[(size_t)fit[i]*k+c]; ss += v*v; n2++; }
+                float sc2 = (float)sqrt(ss / (n2 ? n2 : 1)) + 1e-6f;
+                for (int t = 0; t < ntok; t++) pm[(size_t)t * k + c] /= sc2;
+            }
+        }
+        /* Gram[F,F] 与 B[F,D](fit 行): 每行活跃特征 ≤ NACT_MAX·k */
+        double *G = xmalloc((size_t)F * F * sizeof(double));
+        double *B = xmalloc((size_t)F * D * sizeof(double));
+        memset(G, 0, (size_t)F * F * sizeof(double));
+        memset(B, 0, (size_t)F * D * sizeof(double));
+        int *fidx = xmalloc(64 * k * sizeof(int));
+        float *fval = xmalloc(64 * k * sizeof(float));
+        for (int t = 0; t < ntok; t++) {
+            if (!isfit[t]) continue;
+            int na = 0;
+            for (long long a = rs[t]; a < rs[t + 1] && na < 64 * k; a++) {
+                long long i = ord[a]; int e = zp->pe[i]; float w = zp->pw[i];
+                for (int c = 0; c < k; c++) { fidx[na] = e * k + c; fval[na] = w * pm[(size_t)t*k+c]; na++; }
+            }
+            const float *r = R + (size_t)t * D;
+            for (int a = 0; a < na; a++) {
+                double va = fval[a]; int fa = fidx[a];
+                for (int b = a; b < na; b++) {
+                    double d = va * fval[b];
+                    G[(size_t)fa * F + fidx[b]] += d;
+                    if (fidx[b] != fa) G[(size_t)fidx[b] * F + fa] += d;
+                }
+                double *Br = B + (size_t)fa * D;
+                for (int j = 0; j < D; j++) Br[j] += va * r[j];
+            }
+        }
+        double tr = 0; for (int f2 = 0; f2 < F; f2++) tr += G[(size_t)f2 * F + f2];
+        tr = tr / F + 1e-30;
+        for (int li = 0; li < nlam; li++) {
+            double *Gs = xmalloc((size_t)F * F * sizeof(double));
+            double *Us = xmalloc((size_t)F * D * sizeof(double));
+            memcpy(Gs, G, (size_t)F * F * sizeof(double));
+            memcpy(Us, B, (size_t)F * D * sizeof(double));
+            for (int f2 = 0; f2 < F; f2++) Gs[(size_t)f2 * F + f2] += lambdas[li] * tr;
+            if (chol_solve_spd(Gs, F, Us, D) != 0) { free(Gs); free(Us); continue; }
+            float *corr = xmalloc((size_t)ntok * D * sizeof(float));
+            memset(corr, 0, (size_t)ntok * D * sizeof(float));
+            double fn2 = 0, fd2 = 0;
+            for (int t = 0; t < ntok; t++) {
+                float *ct = corr + (size_t)t * D;
+                for (long long a = rs[t]; a < rs[t + 1]; a++) {
+                    long long i = ord[a]; int e = zp->pe[i]; double w = zp->pw[i];
+                    for (int c = 0; c < k; c++) {
+                        double f3 = w * pm[(size_t)t * k + c];
+                        if (fabs(f3) < 1e-12) continue;
+                        const double *ur = Us + (size_t)(e * k + c) * D;
+                        for (int j = 0; j < D; j++) ct[j] += (float)(f3 * ur[j]);
+                    }
+                }
+                if (isfit[t] && (t % 7) == 0) {
+                    const float *r = R + (size_t)t * D;
+                    for (int j = 0; j < D; j++) { double e2 = (double)r[j] - ct[j];
+                        fn2 += e2 * e2; fd2 += (double)r[j] * r[j]; }
+                }
+            }
+            float *Uf2 = xmalloc((size_t)F * D * sizeof(float));
+            for (size_t i = 0; i < (size_t)F * D; i++) Uf2[i] = (float)Us[i];
+            run_bc_arm("pez", Uf2, F * D, corr, X, Ys, Yt_ev, wv, R, ev, mode0, nev,
+                       lw, dscale, seed, nth, L, lf, best, Yhat, Cb, Cp);
+            printf("    ↑pez k=%d λ=%.3g fitER=%.1f%% vol=%.1fMB(U[256,%d,D]+V f16)\n",
+                   k, lambdas[li], 100.0 * (1.0 - fn2 / (fd2 + 1e-30)),
+                   ((double)256 * k * D + (double)D * k) * 2 / 1e6, k);
+            free(Uf2); free(corr); free(Gs); free(Us);
+        }
+        free(pm); free(G); free(B); free(fidx); free(fval);
+    }
+    ds4_z_free(sv1); free(isfit); free(rs); free(ord);
+    fprintf(stderr, "  [pez]L%d 每专家低秩 z 收官 %.0fs\n", L, tnow() - t0);
+}
