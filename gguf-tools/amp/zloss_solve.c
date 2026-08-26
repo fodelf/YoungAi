@@ -60,6 +60,7 @@ static void *xmalloc(size_t n) { void *p = malloc(n); if (!p) die("OOM %zu", n);
 
 static int g_smooth_aug = 0;            /* --smooth-aug: L_smooth 进解算目标(扰动增广) */
 static int g_track_z = 0;               /* --emit-z: 网格中跟踪冠军 z 克隆(序列化用) */
+static int g_dynz = 0;                  /* --dynz: 方案B 动态 z 臂(用户核心设计) */
 
 #include "zloss_arms.inc.c"             /* 解算臂分片(金标+GE/ftA臂+模式发现+zcache) */
 
@@ -119,6 +120,7 @@ static int mode_assign(const float *x, const float *C, int M) {
 }
 #include "zloss_gate.inc.c"             /* 门族分片: EM 模式门 + 语境门 GEc */
 #include "zloss_emit.inc.c"             /* GE-only 端到端注入(bf.GE, 斜率标定) */
+#include "zloss_dynz.inc.c"             /* ★方案B 动态 z: pv(x)=tanh(Vx/s)·tanh(Ax/σ) */
 
 /* ---- held 行评估(pthread): Yhat=Ys+M(x), Cb=M(x), Cp=M(x+δ); ER 部分和 ---- */
 typedef struct {
@@ -241,6 +243,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--emit-ge") && i + 1 < argc) emitge = argv[++i];
         else if (!strcmp(argv[i], "--emit-z") && i + 1 < argc) { emitz = argv[++i]; g_track_z = 1; }
         else if (!strcmp(argv[i], "--smooth-aug")) g_smooth_aug = 1;
+        else if (!strcmp(argv[i], "--dynz")) g_dynz = 1;
         else if (!strcmp(argv[i], "--selftest")) selftest = 1;
         else die("未知参数 %s", argv[i]);
     }
@@ -335,6 +338,10 @@ int main(int argc, char **argv) {
             run_bc_arm("GEc", thf, 256 * (1 + cm), gc, X, Ys, Yt_ev, wv, R, ev, mode0,
                        nev, &lw, dscale, seed, nth, L, lf, &best, Yhat, Cb, Cp);
             free(ctx); free(thd); free(gc);
+            if (g_dynz)          /* ★方案B 动态 z 臂(z=f(x), 四损失判决同表)★ */
+                run_dynz_arm(X, R, Ys, Yt_ev, wv, fit, nf, ev, mode0, nev, ntok,
+                             ranks, nrank, lambdas, nlam, maxk, &lw, dscale, seed,
+                             nth, L, lf, &best, Yhat, Cb, Cp);
         }
         tge = tnow();
 
