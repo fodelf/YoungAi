@@ -476,12 +476,16 @@ stage_dynquant(){
     export MALLOC_MMAP_THRESHOLD_=1073741824 MALLOC_TRIM_THRESHOLD_=1073741824
     export OPENBLAS_NUM_THREADS=1 DS4_THREADS=20 DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-0731"
     LOG "②dyn86 量化发车: 43 层动态配置(冷 vq4x256 / 热 vq4x1024 逐层 60-195), 混合 2.2591 bpw"
+    # 断点续跑是自动的: plan_lookup(L) 命中且 ckpt 装得上就复用该层, 重跑同命令即续。
+    # 看门狗必挂(2026-08-27 教训): 首跑 L36 被系统 OOM killer 干掉(rc=137), 用户态先杀才可控。
+    watchdog_start
     if ! env QBIN_OVERRIDE="$ROOT/gguf-tools/amp/ds4quant_run" Q86_IDS="$D2/vqhalf_q.ids" \
         Q86_S=8192 Q86_NFIT=8192 Q86_ANCHOR="$D2/anchor_vqhalf_q_s8192.bin" \
         Q86_OUT="$P/model" RPLAN86="$P/rplan_dyn86.txt" VOLB86=76 \
         bash "$SC/r30_campaign.sh" quant86 > "$P/quant.log" 2>&1; then
-        tail -8 "$P/quant.log"; DIE "dyn86 量化失败, 见 $P/quant.log"
+        watchdog_stop; tail -8 "$P/quant.log"; DIE "dyn86 量化失败, 见 $P/quant.log"
     fi
+    watchdog_stop
     LOG "dyn86 量化收官 43/43"
     grep -E "★贪心选|档位|冷档" "$P/quant.log" | tail -5
 }

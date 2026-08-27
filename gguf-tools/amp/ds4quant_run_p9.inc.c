@@ -130,9 +130,16 @@ static void *export_worker(void*a){
         } else {
             /* 热专家 go2b(合并2bit, 激活最优) → 独立侧车文件; hc2 走 go2b q1/q3 顺序补偿(合并态口径) */
             size_t szG2=(size_t)MOEI*go2b_row_bytes(DIM), szD2=(size_t)DIM*go2b_row_bytes(MOEI);
-            uint8_t *b1=malloc(szG2),*b3=malloc(szG2),*bD=malloc(szD2);
-            float *g1=malloc((size_t)MOEI*DIM*4),*g3=malloc((size_t)MOEI*DIM*4);
             int vqhot=dq_vq_on();
+            /* ★b1/b3/bD 只有 go2b 路要★(2026-08-27 OOM 定位): VQ 热路径下这三块从头到尾没被
+             * 碰过, 却每个热专家白分配 ~6.3MB 再释放。配上 MALLOC_TRIM_THRESHOLD_=1GiB
+             * (base86p 配方为压 mmap 锁争用而设, glibc 因此不把大块还给系统), 150 热专家/层
+             * ≈ 1GiB/层的空转churn 全留在 20 个线程 arena 里, 堆到 L28 起挤掉 page cache,
+             * HF 读盘越来越慢, L35 单层 113s(L00-L27 只要 5-15s), L36 被 OOM killer 干掉。
+             * 平权跑从没暴露: hot=0 时这条热分支根本不执行。 */
+            uint8_t *b1=NULL,*b3=NULL,*bD=NULL;
+            if(!vqhot){ b1=malloc(szG2); b3=malloc(szG2); bD=malloc(szD2); }
+            float *g1=malloc((size_t)MOEI*DIM*4),*g3=malloc((size_t)MOEI*DIM*4);
             if(vqhot){   /* v2.2: 热全三矩阵 → vq4x512 侧车 */
                 double cv1=0,cv3=0;
                 float *t1=vq_export_matrix(e1,MOEI,DIM,ncal?Xc:NULL,ncal,vq_hot_dim(),vq_hot_nc(),w->vqfd,vq_slot_off(w->L,e,0,MOEI,DIM),&cv1);
