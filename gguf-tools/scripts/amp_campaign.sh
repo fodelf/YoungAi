@@ -482,7 +482,7 @@ stage_dynquant(){
     if ! env QBIN_OVERRIDE="$ROOT/gguf-tools/amp/ds4quant_run" Q86_IDS="$D2/vqhalf_q.ids" \
         Q86_S=8192 Q86_NFIT=8192 Q86_ANCHOR="$D2/anchor_vqhalf_q_s8192.bin" \
         Q86_OUT="$P/model" RPLAN86="$P/rplan_dyn86.txt" VOLB86=76 \
-        bash "$SC/r30_campaign.sh" quant86 > "$P/quant.log" 2>&1; then
+        bash "$SC/r30_campaign.sh" quant86 >> "$P/quant.log" 2>&1; then
         watchdog_stop; tail -8 "$P/quant.log"; DIE "dyn86 量化失败, 见 $P/quant.log"
     fi
     watchdog_stop
@@ -490,11 +490,29 @@ stage_dynquant(){
     grep -E "★贪心选|档位|冷档" "$P/quant.log" | tail -5
 }
 
+# ═══ dyn86 ③合并 + 判决 ═══
+# 判决尺只认参考前向(caliper_ref.sh, 铁律 08-24: 引擎 CUDA score/eval 路 4× 分歧未修前不当判官)。
+# 对表 = 同语料同锚同工序的平权 vq86h_noz, 唯一变量 = 位宽分配方式。
+stage_dynjudge(){
+    local P="$ROOT/gguf/go-onebit/vqhalf/dyn86"
+    local N; N=$(ls "$P/model/layers"/dql_vq_L*.bin 2>/dev/null | wc -l)
+    [ "$N" = 43 ] || DIE "dyn86 层不齐($N/43)"
+    # caliper 直接吃层件目录, 判决不需要先合 GGUF(合并留给引擎部署/真代码基准那一步)。
+    # ★口径风险在案★ 判决尺是冻结的 ds4quant_run.old(08-22), 早于本次热档可配改动, 不认
+    # hotdim/hotnc。理论上无碍: VQ blob 自描述(每载荷头带 dim/nc, 偏移走 blob 内 256×3 表),
+    # 老二进制照样解得开。但这是理论 —— 读数落在 0.40-0.50 合理带才可信, 若崩成天文数字
+    # 就是老尺读不了新格式, 那时必须先解决尺子问题再谈质量, 不许拿坏尺的数当结论。
+    LOG "③dyn86 裸判(参考前向尺); 对表平权 vq86h_noz: KLD 0.47055 / Σmin 0.7799 / top1 78.36%"
+    watchdog_start
+    bash "$SC/caliper_ref.sh" "$P/model/layers" /tmp/qc_dyn86_wt2.bin 2>&1 | tail -14
+    watchdog_stop
+}
+
 ST="${1:-all}"
 case "$ST" in
   preflight) stage_preflight;; ids) stage_ids;; anchor) stage_anchor;;
   capture) stage_capture;; probe) stage_probe;; solve) stage_solve;; pass2) stage_pass2;;
-  chain) stage_chain;; judge) stage_judge;; dilute) stage_dilute;; idshalf) stage_idshalf;; idshalf_ext) shift; stage_idshalf_ext "$@";; vqquant) stage_vqquant;; vqmerge) stage_vqmerge;; vqcap) stage_vqcap;; vqsolve) stage_vqsolve;; dynladder) stage_dynladder;; dynquant) stage_dynquant;;
+  chain) stage_chain;; judge) stage_judge;; dilute) stage_dilute;; idshalf) stage_idshalf;; idshalf_ext) shift; stage_idshalf_ext "$@";; vqquant) stage_vqquant;; vqmerge) stage_vqmerge;; vqcap) stage_vqcap;; vqsolve) stage_vqsolve;; dynladder) stage_dynladder;; dynquant) stage_dynquant;; dynjudge) stage_dynjudge;;
   all) stage_preflight; stage_ids; stage_anchor; stage_capture
        stage_solve; stage_chain; stage_judge;;
   *) echo "未知段: $ST"; echo "段: preflight ids anchor capture solve pass2 chain judge dilute all (probe/dilute=诊断)"; exit 2;;
