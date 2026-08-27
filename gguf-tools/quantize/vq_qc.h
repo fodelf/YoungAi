@@ -35,15 +35,7 @@ static int vq_cold_dim(void); static int vq_cold_nc(void);
 static int vq_w2_dim(void); static int vq_w2_nc(void);
 static int dq_vq_on(void){ static int v=-1; if(v<0) v=getenv("DS4_VQ")?1:0; return v; }
 
-static size_t vq_idx_bytes(int rows,int cols,int dim,int nc){
-    size_t nidx=(size_t)rows*cols/dim;
-    int bits=1; while((1<<bits)<nc) bits++;
-    if(bits==8) return nidx;                         /* 1B/索引(任意dim, q2正品无尾字节) */
-    return (nidx*(size_t)bits+7)/8+1;                /* 位流 +1 防解包尾读越界(战役版语义) */
-}
-static size_t vq_payload_bytes(int rows,int cols,int dim,int nc){
-    return 16 + (size_t)nc*dim*2 + (size_t)rows*2 + vq_idx_bytes(rows,cols,dim,nc);
-}
+#include "vq_qc_bytes.h"   /* vq_idx_bytes / vq_payload_bytes: 与体积分配器共用同一份字节账 */
 
 /* ---- 最近邻(分块 sgemm 语义, 此处用 dq_matmul 批量) ---- */
 #ifdef DS4QUANT_CUDA

@@ -417,19 +417,18 @@ stage_judge(){
     watchdog_stop
 }
 
-# ═══ dyn86 边际审计(2026-08-27, 用户令"按86G生成动态配置json")═══
-# 【为什么要先跑这个】平权 vq4x512 把同样的 bit 平均撒给 43 层, 但 vq86h_noz/plan.txt 实测
-#   逐层 held 误差 relh 从 L0=0.1055 到 L28=0.5315 差 5.0 倍。动态配置的赌注是"把 bit 从
-#   易层挪给难层总分更高"。但 relh 高只说明该层"现在错得多", 不等于"加 bit 就能少错"——
-#   也可能本来就难、加了白加。真正决定成败的是【边际响应】: 每 ±0.25bpw 换回多少 relh。
-#   不先测这条曲线就生成配置 = 拿 3 小时量化赌一个没验证的假设。
-# 【怎么测】L0-5 六层(全在"易"端 relh 0.106-0.160, 正是要降档让出体积的那一半)分别跑
-#   vq4x256(2.00bpw) 与 vq4x1024(2.50bpw), 对表已在盘的 vq4x512(2.25bpw) relh。
-#   dim 固定 4, 只动 nc ⇒ 位宽 = ceil(log2 nc)/4 bpw, 单变量。
-# 【判决门】降档代价 = relh@256 − relh@512。若六层平均 <0.01(相对 <10%), 降档近乎免费,
-#   等体积上挪成立 → 生成全 43 层配置; 若 ≥0.02, 易层也吃 bit, 动态无肉 → 停车。
-# 【体积算术】等体积: 升 N 层 +0.25bpw 必须配降 N 层 −0.25bpw, 总字节不变(符合"加体积=偷懒")。
-stage_dynprobe(){
+# ═══ dyn86 ①档梯标定(2026-08-27, 用户令"按 86G 生成动态配置 json")═══
+# 【全流程】① 档梯标定(本段) → ② rplan_solve 按预算出配置 json+计划表 → ③ 量化(量化半语料)
+#           → ④ 反修(放大器半语料) → ⑤ caliper 五指标终判
+# 【本段干什么】量出"每个位宽档的重建余弦 cos"。分配器完全靠这张表决定"多给这层
+#   0.25bpw 值不值"——表是估计值, 优化的就是假问题。所以标定必须先做, 不能跳。
+# 【为什么档梯要向上延伸】原分配器 rplan_solve_v4.py 的档梯只有 vq4x512 往【下】的档,
+#   于是 86G 预算下它的最优解必然是"每层拉满 vq4x512"= 平权。这是当年平权在 86G 赢的
+#   机制原因: 动态无处可去, 不是动态更差。本版加 vq4x1024(2.51bpw) 这一级往上的档。
+# 【做法】L0-5 六层 × 三档 vq4x{256,512,1024}, 读量化器导出路打的 VQ_GATE 冷 cos 均值。
+#   dim 固定 4 只动 nc ⇒ 位宽 = ceil(log2 nc)/4 bpw, 单变量。nc=512 也重跑一遍(不复用
+#   vq86h 旧日志)是为了三档同批同语料同口径, 跨批比 cos 会把批次差当成档位差。
+stage_dynladder(){
     local D2="$ROOT/gguf/go-onebit/vqhalf" P="$ROOT/gguf/go-onebit/vqhalf/dyn86"
     [ -s "$D2/vqhalf_q.ids" ] || DIE "量化半 ids 缺"
     [ -s "$D2/anchor_vqhalf_q_s8192.bin" ] || DIE "量化半锚缺"
@@ -437,35 +436,40 @@ stage_dynprobe(){
     # base86p_spark.sh 同款运行时设置: 缺了会从 24s/层 劣化到 9min/层(mmap 写锁争用实锤)
     export DS4_BF_MEMGB=80 DS4_VQ_TIMING=1 DS4_CALIB_CAP=512 DS4_CALIB_EXPORT_CAP=512
     export MALLOC_MMAP_THRESHOLD_=1073741824 MALLOC_TRIM_THRESHOLD_=1073741824
-    export OPENBLAS_NUM_THREADS=1 DS4_THREADS=20
-    export DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-0731"
-    local NC
-    for NC in 256 1024; do
-        local RP="$P/rplan_nc$NC.txt" L
-        : > "$RP"; for L in $(seq 0 42); do echo "L=$L dim=4 nc=$NC hot=0 w2dim=4 w2nc=512" >> "$RP"; done
-        if [ -s "$P/nc$NC/plan.txt" ] && [ "$(wc -l < "$P/nc$NC/plan.txt")" -ge 6 ]; then
-            LOG "  档 vq4x$NC 已有 6 层, 跳过"; continue
+    export OPENBLAS_NUM_THREADS=1 DS4_THREADS=20 DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-0731"
+    local NC L
+    for NC in 256 512 1024; do
+        local RP="$P/rplan_nc$NC.txt"
+        : > "$RP"; for L in $(seq 0 42); do echo "L=$L dim=4 nc=$NC hot=0 w2dim=4 w2nc=$NC" >> "$RP"; done
+        if grep -q "VQ_GATE" "$P/nc$NC.log" 2>/dev/null; then LOG "  档 vq4x$NC 已标定, 跳过"; continue; fi
+        LOG "  档 vq4x$NC 标定发车(L0-5)"
+        # QBIN_OVERRIDE: r30_campaign 默认找 ds4quant_run.r30(重构后不存在), 指到现役量化器。
+        # ★别用管道包 grep★: 管道退出码是 grep 的, 量化器崩了也报"完成"(08-27 首跑即中招)。
+        if ! env DS4_MINVOL_MAXL=6 QBIN_OVERRIDE="$ROOT/gguf-tools/amp/ds4quant_run" Q86_IDS="$D2/vqhalf_q.ids" Q86_S=8192 Q86_NFIT=8192 Q86_ANCHOR="$D2/anchor_vqhalf_q_s8192.bin" Q86_OUT="$P/nc$NC" RPLAN86="$RP" bash "$SC/r30_campaign.sh" quant86 > "$P/nc$NC.log" 2>&1; then
+            tail -6 "$P/nc$NC.log"; DIE "档 vq4x$NC 标定失败, 见 $P/nc$NC.log"
         fi
-        LOG "  档 vq4x$NC 发车(L0-5)"
-        DS4_MINVOL_MAXL=6 Q86_IDS="$D2/vqhalf_q.ids" Q86_S=8192 Q86_NFIT=8192         Q86_ANCHOR="$D2/anchor_vqhalf_q_s8192.bin" Q86_OUT="$P/nc$NC" RPLAN86="$RP"             bash "$SC/r30_campaign.sh" quant86 2>&1 | tee "$P/nc$NC.log" | grep -E "档位|relL2|探针" | tail -8
+        grep -o "VQ_GATE L=[0-9]* .*cold=[0-9.]*" "$P/nc$NC.log" | tail -6
     done
-    echo "══ dyn86 边际审计: relh 逐层三档对表(低=好) ══"
-    awk 'function lv(){split($1,a,"=");return a[2]} function rv(){split($4,c,"=");return c[2]}
-         FNR==NR{b[lv()]=rv();next}
-         FILENAME~/nc256/{lo[lv()]=rv();next}
-         {hi[lv()]=rv()}
-         END{printf "%-4s %9s %9s %9s | %10s %10s\n","层","2.00bpw","2.25bpw","2.50bpw","降档代价","升档收益";
-             for(i=0;i<6;i++){ if(!(i in b)||!(i in lo)) continue;
-               printf "L%-3d %9.4f %9.4f %9s | %+10.4f %+10.4f\n", i, lo[i], b[i], (i in hi?sprintf("%.4f",hi[i]):"-"),
-                      lo[i]-b[i], (i in hi? hi[i]-b[i] : 0) }}' \
-        "$D2/vq86h_noz/plan.txt" "$P/nc256/plan.txt" "$P/nc1024/plan.txt" 2>/dev/null
+    echo "══ dyn86 档梯标定结果(cos 越高越准) ══"
+    : > "$P/ladder_measured.txt"
+    echo "# ladder_measured.txt — dyn86 档梯标定(L0-5 均值, 量化半语料 S=8192, 同批同口径)" >> "$P/ladder_measured.txt"
+    echo "# 格式: dim nc cos   # 出处" >> "$P/ladder_measured.txt"
+    for NC in 256 512 1024; do
+        local C
+        C=$(grep -o "cold=[0-9.]*" "$P/nc$NC.log" 2>/dev/null | sed 's/cold=//' \
+            | awk '{s+=$1;n++} END{if(n)printf "%.4f",s/n; else printf "0"}')
+        local N; N=$(grep -c "VQ_GATE" "$P/nc$NC.log" 2>/dev/null || echo 0)
+        printf "  vq4 x%-5s cos=%s  (%s 条 VQ_GATE)\n" "$NC" "$C" "$N"
+        echo "4 $NC $C   # dyn86 标定 $(date +%m-%d), L0-5 均值, $N 条 VQ_GATE" >> "$P/ladder_measured.txt"
+    done
+    echo "档梯 → $P/ladder_measured.txt  (下一步: rplan_solve --ladder 它 --budget-gib 72.857)"
 }
 
 ST="${1:-all}"
 case "$ST" in
   preflight) stage_preflight;; ids) stage_ids;; anchor) stage_anchor;;
   capture) stage_capture;; probe) stage_probe;; solve) stage_solve;; pass2) stage_pass2;;
-  chain) stage_chain;; judge) stage_judge;; dilute) stage_dilute;; idshalf) stage_idshalf;; idshalf_ext) shift; stage_idshalf_ext "$@";; vqquant) stage_vqquant;; vqmerge) stage_vqmerge;; vqcap) stage_vqcap;; vqsolve) stage_vqsolve;; dynprobe) stage_dynprobe;;
+  chain) stage_chain;; judge) stage_judge;; dilute) stage_dilute;; idshalf) stage_idshalf;; idshalf_ext) shift; stage_idshalf_ext "$@";; vqquant) stage_vqquant;; vqmerge) stage_vqmerge;; vqcap) stage_vqcap;; vqsolve) stage_vqsolve;; dynladder) stage_dynladder;;
   all) stage_preflight; stage_ids; stage_anchor; stage_capture
        stage_solve; stage_chain; stage_judge;;
   *) echo "未知段: $ST"; echo "段: preflight ids anchor capture solve pass2 chain judge dilute all (probe/dilute=诊断)"; exit 2;;

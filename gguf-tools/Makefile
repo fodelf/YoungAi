@@ -122,7 +122,7 @@ endif
         kl_forensic trace_ladder rec_fidelity pubbench pubbench_extract_test vq_merge_v4 \
         go2b_parity vq2q2k_probe vq_em deepseek4-quantize-cpu
 
-all: deepseek4-quantize anchor_metrics compare_scores
+all: deepseek4-quantize anchor_metrics compare_scores rplan_solve
 amp: ds4quant_run zlayer dql_to_zchain teacher_routed zloss_solve
 # legacy 二进制已随 2026-08-26 清仓删除(用户令); solvers 源仅作 calib_run 链接件存续。
 legacy:
@@ -224,6 +224,12 @@ amp_solve: amp_solve.bin
 .PHONY: amp_solve.bin
 amp_solve.bin: $(AMP)/amp_solve.c $(AMPSOLVE_INC) $(CAL)/npy.c
 	$(CC) $(BARE) $(NATIVE) -I$(CAL) -o amp_solve $(AMP)/amp_solve.c $(CAL)/npy.c -lm -lpthread
+
+# 体积预算 → 逐层档位配置(动态层)。字节账与量化器共用 vq_qc_bytes.h, 不许各抄一份。
+rplan_solve: rplan_solve.bin
+.PHONY: rplan_solve.bin
+rplan_solve.bin: $(QZ)/rplan_solve.c $(QZ)/vq_qc_bytes.h
+	$(CC) $(BARE) $(NATIVE) -I$(QZ) -o rplan_solve $(QZ)/rplan_solve.c -lm
 
 zrec_to_zchain: zrec_to_zchain.bin
 .PHONY: zrec_to_zchain.bin
