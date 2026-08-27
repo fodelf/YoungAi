@@ -54,7 +54,9 @@ typedef struct {
     uint32_t        zlk;    /* active rank k (0 = absent) */
     uint32_t        zdin;   /* V input dim: d_model=linear | 3*d_model=ftA feature lift (md86) */
     float           zltr;   /* trust-region cap factor */
-    uint32_t        zmul;   /* 0=加性 z^L(type6) | 2=rte 路由形态标记; type7/9 已删(2026-08-26 清仓) */
+    uint32_t        zmul;   /* 0=加性 z^L(type6) | 1=乘性 AMP(type7) | 2=rte 路由形态标记
+                             * | ★3=动态 z 乘性 AMPD(type9, 用户方案B): pv=tanh(Vᵀx/s)·tanh(Aᵀx/s)
+                             * 载荷 A|U|V 无 z[k] 前缀; 2026-08-26 误删, 08-27 按用户令还原★ */
     const uint16_t *zlm;    /* fp16 z[k] | U[d_model*k] | V[zdin*k] */
     ds4_z          *zmod;   /* din==d_model 的线性 z: 载入时转 f32, apply 走 ds4_z 模块
                              * (与反修解算器同一份实现); din=3d ftA 走下方 fp16 旧路 */

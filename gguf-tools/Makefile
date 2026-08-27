@@ -217,6 +217,19 @@ $(AMP)/dql_to_zchain: $(AMP)/dql_to_zchain.c
 # zloss_solve: 单层贪心四损失解算器(2026-08-26 用户设计)。-I.. 吃仓库根 ds4_z.c/
 # ds4_loss.c(与引擎同一份实现); BLAS 在则开 DQ_BLAS 快路(ds4_z.c 内守卫)。
 zloss_solve: $(AMP)/zloss_solve
+# ★amp_solve(用户方案B 动态 z 乘性放大器, 四损失口径; 2026-08-26 误删 08-27 还原)★
+#   语义 routed ⊙ (1 + U·[tanh(Aᵀφ(x)/s) ⊙ tanh(Vᵀφ(x)/s)]) → zrec "zl.AMPD"(引擎 type9)
+AMPSOLVE_INC := $(wildcard $(AMP)/amp_solve_p*.inc.c)
+amp_solve: amp_solve.bin
+.PHONY: amp_solve.bin
+amp_solve.bin: $(AMP)/amp_solve.c $(AMPSOLVE_INC) $(CAL)/npy.c
+	$(CC) $(BARE) $(NATIVE) -I$(CAL) -o amp_solve $(AMP)/amp_solve.c $(CAL)/npy.c -lm -lpthread
+
+zrec_to_zchain: zrec_to_zchain.bin
+.PHONY: zrec_to_zchain.bin
+zrec_to_zchain.bin: $(AMP)/zrec_to_zchain.c
+	$(CC) $(BARE) $(NATIVE) -o zrec_to_zchain $< -lm -lpthread
+
 ZLOSS_DEPS := $(AMP)/zloss_solve.c $(AMP)/zloss_arms.inc.c $(AMP)/zloss_gate.inc.c $(AMP)/zloss_emit.inc.c $(AMP)/zloss_dynz.inc.c $(AMP)/linalg_small.c $(CAL)/npy.c ../ds4_z.c ../ds4_z.h ../ds4_loss.c ../ds4_loss.h
 ifeq ($(HAVE_BLAS)-$(CUDA),1-1)
 # GPU 路(2026-08-26 提速令"必须用GPU"): gemm/potrf/potrs/QR 走 zlayer_gpu.o(cuBLAS+cuSOLVER)
