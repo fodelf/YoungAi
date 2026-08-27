@@ -113,8 +113,14 @@ stage_quant(){
 
 stage_backfit(){
     N=$(ls "$OUTF"/layers/dql_L*.bin 2>/dev/null | wc -l | tr -d ' ')
-    EXPN=43; [ -n "${PROBE1:-}" ] && EXPN=1
-    [ "$N" = "$EXPN" ] || { LOG "层文件 $N/$EXPN 不齐, 拒反修"; exit 2; }
+    # PROBE1 的语义是"只反修 L00"(下面 DS4_NL=1), 不是"只有一层层件"。原闸写成 EXPN=1 是
+    # 早期只量化一层的战役留下的, 拿一个 43 层齐备的模型跑探针会被自己的闸拒掉
+    # (2026-08-27 实撞)。改为: 探针要 ≥1 层, 全量仍要满 43。
+    if [ -n "${PROBE1:-}" ]; then
+        [ "$N" -ge 1 ] || { LOG "层文件 0 个, 拒反修"; exit 2; }
+    else
+        [ "$N" = 43 ] || { LOG "层文件 $N/43 不齐, 拒反修"; exit 2; }
+    fi
     cd "$ROOT/gguf-tools/amp"
     export DS4_ANCHOR="$ANCHOR" DS4_NFIT="${BF_NFIT:-933}" DS4_THREADS="${DS4_THREADS:-6}"
     export DS4_CALIB_FULLSET=1
