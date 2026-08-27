@@ -347,7 +347,9 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
         if(nval<8){ vs=n_fit; nval=0; }
         /* 行帽已撤(2026-08-23): 2048 行全梯拒(过拟合), 行数是拟合质量的硬需求;
          * 时长改从 z_solve_dual 并行化拿(600GFLOP 单线程→20 线程)。 */
+        double _z0=vqt_now();
         ds4_z *zl=z_solve_dual(Fin,DF,(uint32_t)vs,DIM,DIM,(uint32_t)LZRANK,LZLAMBDA);
+        g_lt[1]+=vqt_now()-_z0;   /* 借用槽1(路由实测仅 0.1s), 打印改名 zsolve */
         if(zl){
             int kL = nval>0 ? z_pick_rank(zl,Fin+(size_t)vs*DIM,DF+(size_t)vs*DIM,nval,DIM,NULL,NULL,NULL,NULL)
                             : (int)zl->rank;

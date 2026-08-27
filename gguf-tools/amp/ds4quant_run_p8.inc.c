@@ -232,7 +232,7 @@ static float *fwd_all(const long*ids,int S,int n_fit,int do_quant,const char*lcf
              * 三段和小于总时长的部分 = 本函数之外(层文件读写/HQE 快照/驱逐重载)。 */
             { extern double g_lt[8];   /* 恒打: 一层一行, 零成本, 不新增 env(铁律 08-22) */
                 double tt=0; for(int i=0;i<8;i++) tt+=g_lt[i];
-                fprintf(stderr,"[LT] L%02d attn=%.1f 路由=%.1f 共享=%.1f bmoe1=%.1f lfload=%.1f fp教师=%.1f 其余=%.1f zlgate=%.1f | 合计=%.1fs\n",
+                fprintf(stderr,"[LT] L%02d attn=%.1f zsolve+路由=%.1f 共享=%.1f bmoe1=%.1f lfload=%.1f fp教师=%.1f 其余=%.1f zlgate=%.1f | 合计=%.1fs\n",
                         L,g_lt[0],g_lt[1],g_lt[2],g_lt[3],g_lt[6],g_lt[7],g_lt[4],g_lt[5],tt); }
             gs_lw_evict(L-6>0?L-6:0);
             free_layer(&W);
