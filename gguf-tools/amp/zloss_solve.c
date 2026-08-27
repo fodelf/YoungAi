@@ -7,11 +7,9 @@
  *   全塞进靶里, 深度单调致 36 层判空(裸 align L0 0.04→L27 0.60 即指纹), 已删除,
  *   与 XCAP 全量 0.47364 比裸差同罪(链态口径两次翻车)。
  *
- * ★动态 z(方案 B 兑现)★ 低维动态 z 映射高维行为: 模式=混合线性回归硬 EM
- *   (zloss_arms.inc.c, 按"哪张图预测得更好"发现行标签, 定死种子+双重启),
- *   门=EM 标签的 x 方向质心(apply 只有 x), 每模式独立 ds4_z_solve 闭式 rank-k
- *   —— 修正图随 token 的行为模式切换(路由哈希看似随机, 规律是条件性的; 一张
- *   全局静态图把模式平均掉, v1 深层全军判空的第二根因)。M=1 = 静态下界参赛。
+ * ★条件化(用户理论)★ 修正按离散路由结构切换: cond 臂=top1 专家分组 g_e+b_e
+ *   (2026-07-05 真尺 +9.0pp; 同期全局线性 z rank16 = −5915% 判"函数形态错")。
+ *   EM 模式门/x 门为历史对照臂(门读不出标签, 三层同款结论)。
  *
  * ★判空废除(铁律)★ 全网格输给裸 = 打印停车审计并以 exit 3 收尾(跑完所有层留全
  *   诊断表), 不写零混过去 —— "没找到规律"是解算器的 bug, 不是层的属性。
@@ -23,8 +21,7 @@
  * 用法: zloss_solve --anchor FILE --zcache DIR --out DIR --layers a-b
  *   [--ntok 8192] [--modes 1,8,16] [--ranks 16,64,128,256] [--lambdas 3e-3,3e-2,3e-1]
  *   [--wa 1] [--wc 0.5] [--ws 0.1] [--wf 1e-3] [--dither 0.04] [--seed 1] [--threads 16]
- *   [--fit-ranges a:b,..] [--ev-ranges a:b,..]   (行掩码: 拼接语料剔污染行)
- *   [--emit-ge DIR] GE-only 端到端路 | [--emit-z DIR] 冠军整体落地(z+GE+四损失参数)
+ *   [--fit-ranges a:b,..] [--ev-ranges a:b,..] 行掩码 | [--emit-ge/-z DIR] 落地路
  * 全 CLI 参数, 无环境变量(铁律)。
  */
 #define _FILE_OFFSET_BITS 64
@@ -118,7 +115,8 @@ static int mode_assign(const float *x, const float *C, int M) {
 }
 #include "zloss_gate.inc.c"             /* 门族分片: EM 模式门 + 语境门 GEc */
 #include "zloss_emit.inc.c"             /* GE-only 端到端注入(bf.GE, 斜率标定) */
-#include "zloss_dynz.inc.c"             /* ★方案B 动态 z: pv(x)=tanh(Vx/s)·tanh(Ax/σ) */
+#include "zloss_dynz.inc.c"   /* 动态 z 族(方案B/正交靶/4L) */
+#include "zloss_cond.inc.c"   /* 条件化 z: top1 专家分组 g_e+b_e(+9.0pp 配方) */
 
 /* ---- held 行评估(pthread): Yhat=Ys+M(x), Cb=M(x), Cp=M(x+δ); ER 部分和 ---- */
 typedef struct {
@@ -453,7 +451,9 @@ int main(int argc, char **argv) {
                         wv, swts, NULL, fit, nf, ev, mode0, nev, ranks, nrank, lambdas, nlam,
                         maxk, &lw, dscale, seed, nth, L, lf, &best, Yhat, Cb, Cp, zcat);
             free(wvf); free(swts);
-            /* ★4L 臂(用户设计: 四损失进解算目标, ds4_z 机器原样)★ */
+            for (int ci = 0; ci < nlam; ci++) run_cond_arm(X, R, Ys, Yt_ev, wv, top1,   /* 条件化 z */
+                fit, nf, ev, mode0, nev, ntok, &lw, dscale, seed, nth, L, lf, &best,
+                Yhat, Cb, Cp, lambdas[ci]);
             run_4l_arm(X, R, Ys, Yt, Yt_ev, wv, fit, nf, ev, mode0, nev, ntok,
                        ranks, nrank, lambdas, nlam, maxk, &lw, dscale, (float)trclamp,
                        seed, nth, L, lf, &best, Yhat, Cb, Cp, zcat, gecorr, Rge);
