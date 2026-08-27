@@ -122,7 +122,7 @@ endif
         kl_forensic trace_ladder rec_fidelity pubbench pubbench_extract_test vq_merge_v4 \
         go2b_parity vq2q2k_probe vq_em deepseek4-quantize-cpu
 
-all: deepseek4-quantize anchor_metrics compare_scores rplan_solve
+all: deepseek4-quantize anchor_metrics compare_scores rplan_solve route_alpha_set
 amp: ds4quant_run zlayer dql_to_zchain teacher_routed zloss_solve
 # legacy 二进制已随 2026-08-26 清仓删除(用户令); solvers 源仅作 calib_run 链接件存续。
 legacy:
@@ -233,6 +233,12 @@ rplan_solve: rplan_solve.bin
 .PHONY: rplan_solve.bin
 rplan_solve.bin: $(QZ)/rplan_solve.c $(QZ)/vq_qc_bytes.h
 	$(CC) $(BARE) $(NATIVE) -I$(QZ) -o rplan_solve $(QZ)/rplan_solve.c -lm
+
+# 路由偏置烘焙: 幂等把 exp_probs_b 设成 [裸态 + α·Δb](首次存 .bias0.bin 快照)。
+route_alpha_set: route_alpha_set.bin
+.PHONY: route_alpha_set.bin
+route_alpha_set.bin: $(AMP)/route_alpha_set.c
+	$(CC) $(BARE) $(NATIVE) -o route_alpha_set $< -lm
 
 zrec_to_zchain: zrec_to_zchain.bin
 .PHONY: zrec_to_zchain.bin
