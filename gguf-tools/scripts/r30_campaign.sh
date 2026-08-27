@@ -476,7 +476,9 @@ stage_quant86(){   # 86G 底座量化(冠军 08-13 配方原样 env 化; en86 �
         "$QBIN" "$Q_IDS" "$Q_S"
     LOG "quant86 rc=$?"
     N=$(ls "$Q_OUT"/layers/dql_L*.bin 2>/dev/null | wc -l | tr -d ' ')
-    [ "$N" = 43 ] || { LOG "★quant86 层不齐 $N/43★"; exit 3; }
+    # 探针模式(DS4_MINVOL_MAXL=N)按 N 层收工是设计内提前退出, 完整性闸随之改口径, 否则探针必 exit 3。
+    local WANT="${DS4_MINVOL_MAXL:-43}"
+    [ "$N" -ge "$WANT" ] || { LOG "★quant86 层不齐 $N/$WANT★"; exit 3; }
 }
 
 _anchor_ok(){   # 锚完整性实读验证(08-14 事故: wdog 杀在写出峰, 部分锚骗过 -f 弱闸 → 双实例互杀链)

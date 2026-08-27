@@ -38,3 +38,7 @@ gguf-tools/go-onebit/migrate/zlayer_fixtures/
 tools/e0_pingpong
 tools/tp_rtt_probe
 /ds4_unit
+
+# gguf-tools 顶层编译产物(Makefile 输出; 2026-08-27 git add -A 误提交过一次)
+gguf-tools/amp_solve
+gguf-tools/zrec_to_zchain
