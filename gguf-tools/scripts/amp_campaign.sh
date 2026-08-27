@@ -545,7 +545,11 @@ stage_champbf(){
     esac
     [ "$(ls "$OUT/layers"/dql_L*.bin 2>/dev/null | wc -l)" = 43 ] || DIE "层件不齐 $OUT/layers"
     [ -s "$D2/anchor_a_clean_s8192.bin" ] || DIE "校准锚缺"
-    export DS4_BF_MEMGB=80 MALLOC_MMAP_THRESHOLD_=1073741824 MALLOC_TRIM_THRESHOLD_=1073741824
+    # ★三个内存闸要拉开距离★(2026-08-27 实撞): 原设 BF_MEMGB=80(驱逐线) + RSS 杀线 93G,
+    # 只留 13G 缓冲 —— 驱逐刚在 L14 起步(footprint 89.73G), 进程就撞 93.5G 被杀。
+    # 驱逐是渐进的, 触发点必须【远低于】杀线才来得及。上一跑 footprint 稳在 59-62G,
+    # 说明 60 左右是本负载的自然工作点, 取 55 让驱逐早介入, 给杀线留 38G 缓冲。
+    export DS4_BF_MEMGB=55 MALLOC_MMAP_THRESHOLD_=1073741824 MALLOC_TRIM_THRESHOLD_=1073741824
     export OPENBLAS_NUM_THREADS=1 DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-0731"
     # 这四个必须不在场, 否则 backfit 走错分支(段内自带硬闸会停)
     unset DS4_TUNE DS4_MINVOL DS4_MV_BASELINE DS4_VQ_RPLAN
