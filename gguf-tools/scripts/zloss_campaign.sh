@@ -35,10 +35,12 @@ for b in $(seq 0 31); do
     if [ "$b" -lt 24 ]; then FR="${FR:+$FR,}$seg"; else ER="${ER:+$ER,}$seg"; fi
 done
 
+# 看门狗红线=总内存 1/8(下限 8G), 不写死小数字(见 amp_campaign.sh 同处注释)。
+MEM_FLOOR_GB=$(awk '/MemTotal/{g=int($2/1048576/8); print (g<8?8:g)}' /proc/meminfo 2>/dev/null || echo 8)
 WD=""
 wd_start(){ ( while true; do
     A=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo)
-    [ "${A:-99}" -lt 4 ] && { echo "[watchdog] MemAvailable=${A}GB <4GB ★杀★" >&2
+    [ "${A:-99}" -lt "$MEM_FLOOR_GB" ] && { echo "[watchdog] MemAvailable=${A}GB <${MEM_FLOOR_GB}GB ★杀★" >&2
         pkill -9 -f 'amp/zlayer'; pkill -9 -f zloss_solve; pkill -9 -f ds4quant_run; break; }
     sleep 5; done ) & WD=$!; }
 wd_stop(){ [ -n "$WD" ] && kill "$WD" 2>/dev/null; WD=""; }

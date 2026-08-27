@@ -43,7 +43,11 @@ S=8192                       # 锚 token 数(整份语料等距窗抽样)
 IDS_WIN=64                   # 等距窗数, 跨度铺满全文
 MDL="$ROOT/gguf/ds4-allq2.gguf"   # 普通 RTN 全 q2, 零语料, 本战役不重量化
 PROBE_L=2                    # 仅 probe 诊断段用
-MEM_FLOOR_GB=4               # 看门狗红线
+# 看门狗红线 = 总内存 1/8(下限 8G)。★不要写死小数字★(2026-08-27 用户纠正): 原值 4 是
+# 小机器时代的遗留, 在 121G 的 spark 上等于"跌到只剩 3% 才停车" —— 而实测恶化(逐层耗时
+# 5s→38s)从 MemAvailable 还很充裕时就开始了, 等 4G 才响已经白磨了五六层。
+# 按比例取阈值 ⇒ 换机器不用改脚本, 也不会再留下一个过时的魔法数。
+MEM_FLOOR_GB=$(awk '/MemTotal/{g=int($2/1048576/8); print (g<8?8:g)}' /proc/meminfo 2>/dev/null || echo 8)
 DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-0731"
 export DS4_HF   # 上游既有 env, 非本轮新增
 
