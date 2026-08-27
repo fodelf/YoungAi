@@ -484,6 +484,18 @@
         if(minvol) plan_append_rr(L,sel_nm,brel,mprev); else plan_append(L,sel_nm,brel);
         ckpt_save(L,H,lstride,idh);
         free_layer(&W);
+        /* ★层边界把空闲堆还给系统★(2026-08-27 两次 OOM 定位)
+         * 症状: 逐层配置(每层不同 dim/nc)跑到第 26-30 层耗时开始翻倍(5s→38s), 最终被
+         * 内存看门狗停车; 平权配置(43 层同档)跑 43 层从不复现。
+         * 机制: mallopt(M_MMAP_THRESHOLD, 1GiB)(p14, 为压 mmap 写锁争用而设 —— 默认小阈会
+         * 让每层重读 HF、线程全 D 态等 IO、9 分/层实测)副作用是 glibc 不把大块还给系统。
+         * 层间档位一变, 工作缓冲尺寸就变(nc=256 与 nc=1024 差 4 倍), 旧尺寸的空闲块无法复用,
+         * 在 20 个线程 arena 里越堆越多, 攒够六七层就挤爆 page cache → HF 读盘退化 → 停车。
+         * 修法: 层内保持大阈值(性能要它), 只在层边界(此处已 free_layer, 无在飞分配)显式归还。
+         * 零数值影响: malloc_trim 只动分配器簿记, 不碰任何权重/中间量。 */
+#ifdef __linux__
+        malloc_trim(0);
+#endif
         /* 护栏碑已删除(2026-08-18 用户令"删除里程碑评估"; 08-04 已裁"没有意义"):
          * 质量判决由收官 VERDICT/五指标全权。 */
         /* 单层探针(2026-07-28 用户: "先跑一层看看, 不要蒙头就跑"): 锁满 MAXL 层即收工。
