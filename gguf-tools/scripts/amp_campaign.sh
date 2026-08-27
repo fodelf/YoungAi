@@ -468,26 +468,30 @@ stage_dynladder(){
 # ═══ dyn86 ②量化(动态配置)═══
 # 配置来源 = rplan_solve 按 86G 预算解出的 dyn86/rplan_dyn86.txt(等体积对打平权 vq86h)。
 # 与 vq86h 的唯一变量 = 位宽分配方式; 语料/锚/S/工序全部相同, 所以判决可直接对表。
+# $1 = 计划表变体: dyn86(动态专家+动态层) | lyr86(纯动态层, 全 256 专家层内同档)
 stage_dynquant(){
     local D2="$ROOT/gguf/go-onebit/vqhalf" P="$ROOT/gguf/go-onebit/vqhalf/dyn86"
-    [ -s "$P/rplan_dyn86.txt" ] || DIE "计划表缺, 先跑 rplan_solve"
+    local V="${1:-dyn86}" RP MODEL
+    RP="$P/rplan_$V.txt"; MODEL="$P/model_$V"
+    [ "$V" = dyn86 ] && { [ -s "$P/rplan_dyn86.txt" ] && RP="$P/rplan_dyn86.txt"; MODEL="$P/model"; }
+    [ -s "$RP" ] || DIE "计划表缺 $RP"
     [ -s "$D2/anchor_vqhalf_q_s8192.bin" ] || DIE "量化半锚缺"
     export DS4_BF_MEMGB=80 DS4_VQ_TIMING=1 DS4_CALIB_CAP=512 DS4_CALIB_EXPORT_CAP=512
     export MALLOC_MMAP_THRESHOLD_=1073741824 MALLOC_TRIM_THRESHOLD_=1073741824
     export OPENBLAS_NUM_THREADS=1 DS4_THREADS=20 DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-0731"
-    LOG "②dyn86 量化发车: 43 层动态配置(冷 vq4x256 / 热 vq4x1024 逐层 60-195), 混合 2.2591 bpw"
+    LOG "②量化发车 变体=$V 计划表=$RP → $MODEL"
     # 断点续跑是自动的: plan_lookup(L) 命中且 ckpt 装得上就复用该层, 重跑同命令即续。
     # 看门狗必挂(2026-08-27 教训): 首跑 L36 被系统 OOM killer 干掉(rc=137), 用户态先杀才可控。
     watchdog_start
     if ! env QBIN_OVERRIDE="$ROOT/gguf-tools/amp/ds4quant_run" Q86_IDS="$D2/vqhalf_q.ids" \
         Q86_S=8192 Q86_NFIT=8192 Q86_ANCHOR="$D2/anchor_vqhalf_q_s8192.bin" \
-        Q86_OUT="$P/model" RPLAN86="$P/rplan_dyn86.txt" VOLB86=76 \
-        bash "$SC/r30_campaign.sh" quant86 >> "$P/quant.log" 2>&1; then
-        watchdog_stop; tail -8 "$P/quant.log"; DIE "dyn86 量化失败, 见 $P/quant.log"
+        Q86_OUT="$MODEL" RPLAN86="$RP" VOLB86=76 \
+        bash "$SC/r30_campaign.sh" quant86 >> "$P/quant_$V.log" 2>&1; then
+        watchdog_stop; tail -8 "$P/quant_$V.log"; DIE "$V 量化失败, 见 $P/quant.log"
     fi
     watchdog_stop
-    LOG "dyn86 量化收官 43/43"
-    grep -E "★贪心选|档位|冷档" "$P/quant.log" | tail -5
+    LOG "$V 量化收官 43/43"
+    grep -E "★贪心选|档位|冷档" "$P/quant_$V.log" | tail -5
 }
 
 # ═══ dyn86 ③合并 + 判决 ═══
@@ -512,7 +516,7 @@ ST="${1:-all}"
 case "$ST" in
   preflight) stage_preflight;; ids) stage_ids;; anchor) stage_anchor;;
   capture) stage_capture;; probe) stage_probe;; solve) stage_solve;; pass2) stage_pass2;;
-  chain) stage_chain;; judge) stage_judge;; dilute) stage_dilute;; idshalf) stage_idshalf;; idshalf_ext) shift; stage_idshalf_ext "$@";; vqquant) stage_vqquant;; vqmerge) stage_vqmerge;; vqcap) stage_vqcap;; vqsolve) stage_vqsolve;; dynladder) stage_dynladder;; dynquant) stage_dynquant;; dynjudge) stage_dynjudge;;
+  chain) stage_chain;; judge) stage_judge;; dilute) stage_dilute;; idshalf) stage_idshalf;; idshalf_ext) shift; stage_idshalf_ext "$@";; vqquant) stage_vqquant;; vqmerge) stage_vqmerge;; vqcap) stage_vqcap;; vqsolve) stage_vqsolve;; dynladder) stage_dynladder;; dynquant) shift; stage_dynquant "$@";; dynjudge) stage_dynjudge;;
   all) stage_preflight; stage_ids; stage_anchor; stage_capture
        stage_solve; stage_chain; stage_judge;;
   *) echo "未知段: $ST"; echo "段: preflight ids anchor capture solve pass2 chain judge dilute all (probe/dilute=诊断)"; exit 2;;
