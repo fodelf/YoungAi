@@ -1,12 +1,25 @@
-static int backfit_prev(int Lfront,const long*ids,int S,int n_fit){
-    if(!GS_LW||!GS_LF||!HQE||Lfront<1) return 0;
+/* ★分块 ONEPASS(2026-08-27 重新实现)★
+ * 冠军 r64 用的是 DS4_BF_CHUNK=7, 但那份 C 实现【从未进过 git】(只活在当时的
+ * ds4quant_run.dchunk 二进制里, 已佚), fable5 4985 留着完整设计, 照它重写。
+ *
+ * 【为什么必须有】纯 ONEPASS 是"冻结基线 Jacobi": 每层都在"别层不变"的假设下单独评估,
+ * 各自都是正收益, composed 起来却互相打架。2026-08-27 实撞: L41(bf.GL α=1.2 −2.38%)
+ * + L40(bf.GL α=0.8 −2.00%) + L39(bf.GLdyn8 −5.09%) 三个都是真收益, 到 L38 基线
+ * 0.4302→34.8462 炸 80 倍, 链闸硬停。fable5 6497 记过同款(每层×2 正反馈 L4 0.48→L10 13.2)。
+ *
+ * 【怎么修】按 CH 层一块: 块内保持原 ONEPASS 语义(冻结基线选型), 块末做终验
+ * ——★终验走真前沿全程出口, 不是块边界★, 判据不变; 过则提交并刷新 HQE(下块在新上下文
+ * 里评估 = Gauss-Seidel), 败则只回滚本块。这样坏组合最多污染一块, 且后面的块看到真实状态。
+ * CH 写死不走 env(铁律 08-22 禁新增 env; 冠军值 7)。 */
+static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S,int n_fit){
+    if(!GS_LW||!GS_LF||!HQE||Lfront<1||Jhi<=Jlo_in) return 0;
     size_t lstride=(size_t)S*HCM*DIM, rowsz=(size_t)HCM*DIM;
     const float*Htgt=ANC.H+(size_t)Lfront*lstride;
     int vs=(n_fit*3)/4, changed=0, evald=0; double simpr=0;
     double bf_bestdl=-1e300; int bf_bestJ=-1;   /* 可视化: 全部候选里最接近正向的Δ(没提交也看得见搜索) */
     char uc[300]; int ucl=0; uc[0]=0;           /* 未正向层清单(层号+最优候选Δ), 铁律: 不许隐身 */
     /* ★用户裁决2026-07-12★: 每前沿全量反修所有前层("末层最后一次全量"特例取消; fast 不进本函数) */
-    int Jlo=0;
+    int Jlo=Jlo_in;
     time_t bt0=time(NULL);
     if(!GS_FIN) GS_FIN=malloc((size_t)S*DIM*4);
     const int NA=FAST?2:4;
@@ -73,9 +86,9 @@ static int backfit_prev(int Lfront,const long*ids,int S,int n_fit){
         fprintf(stderr,"[反修] DS4_BF_NO_RECHECK=1: 跳过复检遍 → 直接判决\n"); break; }
     /* 访问驱动器: linear=Lfront-1..0 递减(默认, 原行为); bisect(仅首遍)=段栈中点序 */
     int bis=(bis_on&&pass==0);
-    int blo=Jlo,bhi=Lfront-1;
-    if(bis){ bsp=0; bseg[0][0]=Jlo; bseg[0][1]=Lfront-1; bsp=1; }
-    int J=Lfront;
+    int blo=Jlo,bhi=Jhi-1;   /* ★只扫本块; Lfront 别处仍指真前沿(终验/近视野都要它) */
+    if(bis){ bsp=0; bseg[0][0]=Jlo; bseg[0][1]=Jhi-1; bsp=1; }
+    int J=Jhi;
     for(;;){
         if(bis){
             if(bsp<=0) break;
@@ -433,5 +446,18 @@ static int backfit_prev(int Lfront,const long*ids,int S,int n_fit){
     printf("BACKFIT_PREV Lfront=%d 评估=%d 提交=%d Δ改善=%.4g 最优候选Δ=%.3g%%@L%d 用时=%lds 粗筛=K%d÷%d(行%d)%s 全闸拒=%d 未正向:%s(判据=L%d出口回放; 形态=own-z/α/TREF/dyn2/GE+复检)\n",
            Lfront,evald,changed,simpr,100.0*bf_bestdl,bf_bestJ,(long)(time(NULL)-bt0),BK,SDIV,Ss,bis_on?" 序=bisect":"",vrej,ucl?uc:" 无",Lfront);
     fflush(stdout);
+    return changed;
+}
+
+/* 分块驱动: 从高层往低层, 每 CH 层一块(见 backfit_prev_chunk 头注)。 */
+static int backfit_prev(int Lfront,const long*ids,int S,int n_fit){
+    const int CH=7;   /* 冠军 r64 用值; 写死不走 env */
+    int changed=0;
+    for(int hi=Lfront; hi>0; ){
+        int lo=hi-CH; if(lo<0) lo=0;
+        fprintf(stderr,"[分块ONEPASS] 块 [L%02d,L%02d) / 真前沿 L%d\n",lo,hi,Lfront);
+        changed |= backfit_prev_chunk(lo,hi,Lfront,ids,S,n_fit);
+        hi=lo;
+    }
     return changed;
 }
