@@ -465,11 +465,32 @@ stage_dynladder(){
     echo "档梯 → $P/ladder_measured.txt  (下一步: rplan_solve --ladder 它 --budget-gib 72.857)"
 }
 
+# ═══ dyn86 ②量化(动态配置)═══
+# 配置来源 = rplan_solve 按 86G 预算解出的 dyn86/rplan_dyn86.txt(等体积对打平权 vq86h)。
+# 与 vq86h 的唯一变量 = 位宽分配方式; 语料/锚/S/工序全部相同, 所以判决可直接对表。
+stage_dynquant(){
+    local D2="$ROOT/gguf/go-onebit/vqhalf" P="$ROOT/gguf/go-onebit/vqhalf/dyn86"
+    [ -s "$P/rplan_dyn86.txt" ] || DIE "计划表缺, 先跑 rplan_solve"
+    [ -s "$D2/anchor_vqhalf_q_s8192.bin" ] || DIE "量化半锚缺"
+    export DS4_BF_MEMGB=80 DS4_VQ_TIMING=1 DS4_CALIB_CAP=512 DS4_CALIB_EXPORT_CAP=512
+    export MALLOC_MMAP_THRESHOLD_=1073741824 MALLOC_TRIM_THRESHOLD_=1073741824
+    export OPENBLAS_NUM_THREADS=1 DS4_THREADS=20 DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-0731"
+    LOG "②dyn86 量化发车: 43 层动态配置(冷 vq4x256 / 热 vq4x1024 逐层 60-195), 混合 2.2591 bpw"
+    if ! env QBIN_OVERRIDE="$ROOT/gguf-tools/amp/ds4quant_run" Q86_IDS="$D2/vqhalf_q.ids" \
+        Q86_S=8192 Q86_NFIT=8192 Q86_ANCHOR="$D2/anchor_vqhalf_q_s8192.bin" \
+        Q86_OUT="$P/model" RPLAN86="$P/rplan_dyn86.txt" VOLB86=76 \
+        bash "$SC/r30_campaign.sh" quant86 > "$P/quant.log" 2>&1; then
+        tail -8 "$P/quant.log"; DIE "dyn86 量化失败, 见 $P/quant.log"
+    fi
+    LOG "dyn86 量化收官 43/43"
+    grep -E "★贪心选|档位|冷档" "$P/quant.log" | tail -5
+}
+
 ST="${1:-all}"
 case "$ST" in
   preflight) stage_preflight;; ids) stage_ids;; anchor) stage_anchor;;
   capture) stage_capture;; probe) stage_probe;; solve) stage_solve;; pass2) stage_pass2;;
-  chain) stage_chain;; judge) stage_judge;; dilute) stage_dilute;; idshalf) stage_idshalf;; idshalf_ext) shift; stage_idshalf_ext "$@";; vqquant) stage_vqquant;; vqmerge) stage_vqmerge;; vqcap) stage_vqcap;; vqsolve) stage_vqsolve;; dynladder) stage_dynladder;;
+  chain) stage_chain;; judge) stage_judge;; dilute) stage_dilute;; idshalf) stage_idshalf;; idshalf_ext) shift; stage_idshalf_ext "$@";; vqquant) stage_vqquant;; vqmerge) stage_vqmerge;; vqcap) stage_vqcap;; vqsolve) stage_vqsolve;; dynladder) stage_dynladder;; dynquant) stage_dynquant;;
   all) stage_preflight; stage_ids; stage_anchor; stage_capture
        stage_solve; stage_chain; stage_judge;;
   *) echo "未知段: $ST"; echo "段: preflight ids anchor capture solve pass2 chain judge dilute all (probe/dilute=诊断)"; exit 2;;

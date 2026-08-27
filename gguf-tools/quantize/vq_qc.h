@@ -33,6 +33,10 @@ static inline void vDSP_minvi(const float *a, int sa, float *mv, vDSP_Length *mi
 
 static int vq_cold_dim(void); static int vq_cold_nc(void);
 static int vq_w2_dim(void); static int vq_w2_nc(void);
+/* 热档(2026-08-27 可配化): 原先三个文件八处写死 vq4x512, 于是"热数拉满"就等于全员 2.25bpw
+ * = 平权, 86G 预算下分配器无处可花钱, 专家分档实验根本跑不起来。现由计划表 hotdim/hotnc
+ * 决定, 缺省仍是 4/512 ⇒ 所有历史 rplan 文件行为逐字节不变。 */
+static int vq_hot_dim(void); static int vq_hot_nc(void);
 static int dq_vq_on(void){ static int v=-1; if(v<0) v=getenv("DS4_VQ")?1:0; return v; }
 
 #include "vq_qc_bytes.h"   /* vq_idx_bytes / vq_payload_bytes: 与体积分配器共用同一份字节账 */
@@ -299,7 +303,7 @@ static size_t vq_hdr_bytes(void){ return 16 + 256*3*8; }
  * 公式已对 q2(1,751,665,168B)/q4(2,023,770,896B) 两个已知产物逐字节验证)★ */
 static size_t vq_slot_off(int L,int e,int which,int moei,int dim_model){
     size_t off=vq_hdr_bytes();
-    size_t hw13=vq_payload_bytes(moei,dim_model,4,512), hw2=vq_payload_bytes(dim_model,moei,4,512);
+    size_t hw13=vq_payload_bytes(moei,dim_model,vq_hot_dim(),vq_hot_nc()), hw2=vq_payload_bytes(dim_model,moei,vq_hot_dim(),vq_hot_nc());
     size_t cw13=vq_payload_bytes(moei,dim_model,vq_cold_dim(),vq_cold_nc());
     int w2d=vq_w2_dim();
     size_t cw2=w2d>0?vq_payload_bytes(dim_model,moei,w2d,vq_w2_nc()):0;
@@ -314,7 +318,7 @@ static size_t vq_slot_off(int L,int e,int which,int moei,int dim_model){
 }
 static size_t vq_total_bytes(int L,int moei,int dim_model){
     size_t off=vq_hdr_bytes();
-    size_t hw13=vq_payload_bytes(moei,dim_model,4,512), hw2=vq_payload_bytes(dim_model,moei,4,512);
+    size_t hw13=vq_payload_bytes(moei,dim_model,vq_hot_dim(),vq_hot_nc()), hw2=vq_payload_bytes(dim_model,moei,vq_hot_dim(),vq_hot_nc());
     size_t cw13=vq_payload_bytes(moei,dim_model,vq_cold_dim(),vq_cold_nc());
     int w2d=vq_w2_dim();
     size_t cw2=w2d>0?vq_payload_bytes(dim_model,moei,w2d,vq_w2_nc()):0;

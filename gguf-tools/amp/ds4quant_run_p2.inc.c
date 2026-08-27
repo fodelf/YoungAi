@@ -13,6 +13,11 @@ static int vq_w2_dim(void){ const char*e=getenv("DS4_VQ_W2_DIM"); int v=e?atoi(e
 /* ★R28 每层计划(DS4_VQ_RPLAN, 2026-07-31): "L=%d dim=%d nc=%d hot=%d w2dim=%d w2nc=%d"
  * 动态层大小(每层不同码本档) + 动态冷热(每层不同热专家数)。层序处理, 单全局安全。 */
 static int g_vq_L=-1; int g_vq_dim=0, g_vq_nc=0; static int g_vq_hot=0;
+/* 热档档位(2026-08-27): 用全局不用 env —— 本项目禁新增 env 配置(铁律 08-22)。
+ * 缺省 4/512 = 历史行为; 计划表带 hotdim/hotnc 才改。 */
+static int g_vq_hot_dim=4, g_vq_hot_nc=512;
+static int vq_hot_dim(void){ return g_vq_hot_dim; }
+static int vq_hot_nc(void){ return g_vq_hot_nc; }
 static int vq_rplan(int L){
     const char*pp=getenv("DS4_VQ_RPLAN"); if(!pp) return 0;
     FILE*f=fopen(pp,"r"); if(!f){ fprintf(stderr,"[R28] 计划表打不开 %s\n",pp); exit(2); }
@@ -20,12 +25,17 @@ static int vq_rplan(int L){
     while(fgets(ln,sizeof(ln),f))
         if(sscanf(ln,"L=%d dim=%d nc=%d hot=%d w2dim=%d w2nc=%d",&l,&d,&n,&h,&wd,&wn)==6 && l==L){
             g_vq_L=L; g_vq_dim=d; g_vq_nc=n; g_vq_hot=h; ok=1;
+            /* 可选热档字段(缺省 4/512 = 历史逐字节不变)。放在行尾追加而不是改列序,
+             * 老计划表照读; 新表想让热专家更密就写 hotdim=4 hotnc=1024。 */
+            { const char*hp=strstr(ln,"hotdim="); int hd,hn;
+              if(hp && sscanf(hp,"hotdim=%d hotnc=%d",&hd,&hn)==2){ g_vq_hot_dim=hd; g_vq_hot_nc=hn; }
+              else { g_vq_hot_dim=4; g_vq_hot_nc=512; } }
             char b[16]; snprintf(b,16,"%d",wd); setenv("DS4_VQ_W2_DIM",b,1);
             snprintf(b,16,"%d",wn); setenv("DS4_VQ_W2_NC",b,1);
             break; }
     fclose(f);
     if(!ok){ fprintf(stderr,"[R28] 计划表缺 L%d\n",L); exit(2); }
-    fprintf(stderr,"[R28] L%02d 档位 vq%dx%d 热%d w2 vq%dx%d\n",L,d,n,h,wd,wn);
+    fprintf(stderr,"[R28] L%02d 冷档 vq%dx%d 热%d(vq%dx%d) w2 vq%dx%d\n",L,d,n,h,g_vq_hot_dim,g_vq_hot_nc,wd,wn);
     return 1;
 }
 static int vq_w2_nc(void){ const char*e=getenv("DS4_VQ_W2_NC"); int v=e?atoi(e):256; if(v<16||v>4096) v=256; return v; }   /* 同上: 禁 static 缓存, 计划表逐层改档 */
@@ -291,8 +301,8 @@ static void *coadapt_worker(void*a){
                 vq_unpack_dequant(BFB_VQMAP+bfvt0[(size_t)e*3],BFB_VQMSZ-bfvt0[(size_t)e*3],q1,NULL,NULL);
                 vq_unpack_dequant(BFB_VQMAP+bfvt0[(size_t)e*3+1],BFB_VQMSZ-bfvt0[(size_t)e*3+1],q3,NULL,NULL);
             } else if(dq_vq_on()){   /* v2.2: 码本量化(α 目标暂不进 VQ 内环, 行乘子已含激活拟合) */
-                q1=g2hot?dq_quant_expert_vq(e1,MOEI,DIM,Xc,ncal,4,512):dq_quant_expert_vq(e1,MOEI,DIM,Xc,ncal,vq_cold_dim(),vq_cold_nc());
-                q3=g2hot?dq_quant_expert_vq(e3,MOEI,DIM,Xc,ncal,4,512):dq_quant_expert_vq(e3,MOEI,DIM,Xc,ncal,vq_cold_dim(),vq_cold_nc());
+                q1=g2hot?dq_quant_expert_vq(e1,MOEI,DIM,Xc,ncal,vq_hot_dim(),vq_hot_nc()):dq_quant_expert_vq(e1,MOEI,DIM,Xc,ncal,vq_cold_dim(),vq_cold_nc());
+                q3=g2hot?dq_quant_expert_vq(e3,MOEI,DIM,Xc,ncal,vq_hot_dim(),vq_hot_nc()):dq_quant_expert_vq(e3,MOEI,DIM,Xc,ncal,vq_cold_dim(),vq_cold_nc());
             } else {
                 q1=g2hot?dq_quant_expert_go2b_adj(e1,MOEI,DIM,Xc,ncal,yadj1):dq_quant_expert_signref_adj(e1,MOEI,DIM,Xc,ncal,yadj1,NULL);
                 q3=g2hot?dq_quant_expert_go2b_adj(e3,MOEI,DIM,Xc,ncal,yadj3):dq_quant_expert_signref_adj(e3,MOEI,DIM,Xc,ncal,yadj3,NULL);
@@ -319,7 +329,7 @@ static void *coadapt_worker(void*a){
                 w2q=malloc((size_t)DIM*MOEI*4);
                 dq_go1b_bytes_dequant(BFB_W2+(size_t)e*BFB_SZD,DIM,MOEI,w2q);
             }
-            else if(dq_vq_on()&&g2hot) w2q=dq_quant_expert_vq(e2,DIM,MOEI,ce->hc_cal,ce->ncal,4,512);
+            else if(dq_vq_on()&&g2hot) w2q=dq_quant_expert_vq(e2,DIM,MOEI,ce->hc_cal,ce->ncal,vq_hot_dim(),vq_hot_nc());
             /* ★冷 w2 评估路径带顺序补偿(2026-08-03): 与导出路径(vq_export_matrix_seq)同解,
              * 搜索/调优/z 全链看到的就是部署态 — 失配事故修 */
             else if(dq_vq_on()&&vq_w2_dim()>0)   /* R28: 冷 w2 码本(省 6.2G 给 w13; 冠军此处是 signref) */

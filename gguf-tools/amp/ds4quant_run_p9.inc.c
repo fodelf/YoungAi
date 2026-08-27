@@ -135,8 +135,8 @@ static void *export_worker(void*a){
             int vqhot=dq_vq_on();
             if(vqhot){   /* v2.2: 热全三矩阵 → vq4x512 侧车 */
                 double cv1=0,cv3=0;
-                float *t1=vq_export_matrix(e1,MOEI,DIM,ncal?Xc:NULL,ncal,4,512,w->vqfd,vq_slot_off(w->L,e,0,MOEI,DIM),&cv1);
-                float *t3=vq_export_matrix(e3,MOEI,DIM,ncal?Xc:NULL,ncal,4,512,w->vqfd,vq_slot_off(w->L,e,1,MOEI,DIM),&cv3);
+                float *t1=vq_export_matrix(e1,MOEI,DIM,ncal?Xc:NULL,ncal,vq_hot_dim(),vq_hot_nc(),w->vqfd,vq_slot_off(w->L,e,0,MOEI,DIM),&cv1);
+                float *t3=vq_export_matrix(e3,MOEI,DIM,ncal?Xc:NULL,ncal,vq_hot_dim(),vq_hot_nc(),w->vqfd,vq_slot_off(w->L,e,1,MOEI,DIM),&cv3);
                 memcpy(g1,t1,(size_t)MOEI*DIM*4); memcpy(g3,t3,(size_t)MOEI*DIM*4); free(t1); free(t3);
                 w->vqsum[0]+=2; w->vqsum[1]+=cv1+cv3;
             } else {
@@ -156,7 +156,7 @@ static void *export_worker(void*a){
             float *gD=malloc((size_t)DIM*MOEI*4);
             if(vqhot){   /* 热 w2=vq4x512(实测序: go2b>vq4x512>signref; signref 版 2026-08-03 已否决) */
                 double cv2=0;
-                float *t2=vq_export_matrix(e2,DIM,MOEI,hc2,nh2,4,512,w->vqfd,vq_slot_off(w->L,e,2,MOEI,DIM),&cv2);
+                float *t2=vq_export_matrix(e2,DIM,MOEI,hc2,nh2,vq_hot_dim(),vq_hot_nc(),w->vqfd,vq_slot_off(w->L,e,2,MOEI,DIM),&cv2);
                 memcpy(gD,t2,(size_t)DIM*MOEI*4); free(t2);
                 w->vqsum[0]+=1; w->vqsum[1]+=cv2;
             } else {

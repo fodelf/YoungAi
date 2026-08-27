@@ -86,9 +86,15 @@
                     hot_from_anchor(L,S,g_vq_hot);
                     snprintf(win_nm,sizeof(win_nm),"v%dx%d h%d",g_vq_dim,g_vq_nc,g_vq_hot);
                     win_cfg='g'; win_r=0; win_hot=g_vq_hot;
-                    win_vol=(double)(16+g_vq_nc*g_vq_dim*2+MOEI*2
-                             +((size_t)MOEI*DIM/g_vq_dim*(g_vq_nc<=256?8:(g_vq_nc<=512?9:(g_vq_nc<=1024?10:12)))+7)/8+1)
-                            *8.0/((double)MOEI*DIM);
+                    /* ★体积账必须混合热冷★(2026-08-27 修): 原式只算冷档 bpw, 热专家当不存在。
+                     * 对照非计划表分支 (16*2.25+240*1.0625)/256 —— win_vol 的语义本就是
+                     * 全 256 专家混合后的每权重 bpw。热档比冷档贵时低报, DS4_VOL_BUDGET_GIB
+                     * 闸就失灵; r64 战役当年正是栽在同类口径错位(01:18 体积闸自绊 rc=9,
+                     * 已量化 32 层作废重来)。用共享字节账函数算, 不再手抄公式。 */
+                    { size_t hb=vq_payload_bytes(MOEI,DIM,vq_hot_dim(),vq_hot_nc());
+                      size_t cb=vq_payload_bytes(MOEI,DIM,g_vq_dim,g_vq_nc);
+                      win_vol=((double)g_vq_hot*hb+(double)(256-g_vq_hot)*cb)*8.0
+                              /(256.0*(double)MOEI*DIM); }
                 } else {
                 snprintf(win_nm,sizeof(win_nm),"g10h"); win_hot=MV_HOTK;
                 win_vol=(16*2.25+240*1.0625)/256.0;
