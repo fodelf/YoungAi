@@ -1,5 +1,12 @@
+/* ★逐阶段计时(2026-08-27)★ 反修单层 48-51 秒墙钟, 而 bytes_moe 前向摊到墙钟只有 ~2 秒
+ * (那个 [bmwt] 数是 20 线程累计, 除以 20 才是墙钟 —— 我误读过一次)。perf 被内核
+ * perf_event_paranoid 挡、gdb 无符号, 只能自己埋点。四段: attn(含 hc_pre/post) /
+ * 路由 / 专家前向 / ZLGATE 候选评估。恒开(一层一行, 不新增 env)。 */
+double g_lt[4];   /* 0=attn 1=route 2=expert 3=zlgate; 单位秒, 每层清零 */
 static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
                       int do_quant, char cfg, lstat_t*st){
+    double lt_t0=vqt_now(), lt_mark=lt_t0;
+    for(int i=0;i<4;i++) g_lt[i]=0;
     int mixd=2*HCM+HCM*HCM;
     float *cosr=malloc((size_t)S*(RD/2)*4),*sinr=malloc((size_t)S*(RD/2)*4);
     if(CR[L]>0) dq_freqs_cis(RD,S,65536.0,160000.0,16.0,32.0,1.0,cosr,sinr);
@@ -16,6 +23,7 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
     dq_hc_pre(H2,W->ffn,W->fsc,W->fbase,y2,post2,comb2,S,HCM,DIM,mixd,HCIT,EPSF,EPSF);
     float *Fin=malloc((size_t)S*DIM*4); for(int s=0;s<S;s++)dq_rms(y2+(size_t)s*DIM,W->fn,Fin+(size_t)s*DIM,DIM,EPSF);
     if(GS_CAP_L==L&&GS_FIN) memcpy(GS_FIN,Fin,(size_t)S*DIM*4);  if(g_xcap_out) xcap_dump_fin(L,Fin,S);   /* 反修取料 + 量化链 x 捕获 */
+    g_lt[0]=vqt_now()-lt_mark; lt_mark=vqt_now();   /* ①attn+hc 段完 */
     /* moe 路由(实际激活: 量化遍即被污染激活 = 部署运行时口径) */
     int *idx=malloc((size_t)S*NACT_RT*sizeof(int)); float *rw=malloc((size_t)S*NACT_RT*4);
     if(W->t2ei){ static int hbn=0;
@@ -357,6 +365,7 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
                 for(int s=vs;s<n_fit;s++){ const float*hq=Hq2+(size_t)s*HCM*DIM,*hf=Hf2+(size_t)s*HCM*DIM;
                     for(size_t i=0;i<(size_t)HCM*DIM;i++){ double d=(double)hq[i]-hf[i]; e2+=d*d; a2+=(double)hf[i]*hf[i]; } }
                 e0=sqrt(e2/(a2+1e-30)); }
+              g_lt[2]=vqt_now()-lt_mark; lt_mark=vqt_now();   /* ②路由+③专家前向 段完(基线 e0 已出) */
               { static double bf_e0_prev=-1.0;   /* ★链闸(2026-08-25)★: 逐层基线日志+失控守卫 */
                 fprintf(stderr,"[链闸] L%02d 基线val出口=%.4f 前层=%.4f 靶=%s\n",
                         L,e0,bf_e0_prev,(BF_LT&&BF_LT_L==L)?"层局部":"漂移");
@@ -416,6 +425,7 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
                           for(size_t i3=0;i3<(size_t)DIM*kk;i3++) h3[o3++]=go1b_fp32_to_fp16(ZLP_U[i3]);
                           for(size_t i3=0;i3<(size_t)DIM*kk;i3++) h3[o3++]=go1b_fp32_to_fp16(ZLP_V[i3]);
                           fwrite(h3,2,o3,zf3); free(h3); fclose(zf3);
+                g_lt[3]=vqt_now()-lt_mark;   /* ④ZLGATE 候选评估段完 */
                           printf("ZREC L=%d k=%d → zrec_L%02d.bin\n",L,kk,L); fflush(stdout);
                         } } }
                 }

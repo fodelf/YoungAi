@@ -228,6 +228,11 @@ static float *fwd_all(const long*ids,int S,int n_fit,int do_quant,const char*lcf
               fprintf(stderr," | 回放累积relL2 fit=%.4f held=%.4f | ops=%d\n",
                       sqrt(e2/(a2+1e-30)),sqrt(e2h/(a2h+1e-30)),GS_LF[L].nops); }
             fprintf(stderr,"[mem] L%02d footprint=%.2fGB 只跑反修回放\n",L,mem_gb());
+            /* ★逐阶段墙钟(DS4_LT=1)★ 定位"单层 48-51 秒花在哪": p7 埋点, 这里汇总打印。
+             * 三段和小于总时长的部分 = 本函数之外(层文件读写/HQE 快照/驱逐重载)。 */
+            { extern double g_lt[4];   /* 恒打: 一层一行, 零成本, 且不新增 env(铁律 08-22) */
+                fprintf(stderr,"[LT] L%02d attn=%.1fs 路由+专家=%.1fs zlgate=%.1fs | 三段合计=%.1fs\n",
+                        L,g_lt[0],g_lt[2],g_lt[3],g_lt[0]+g_lt[2]+g_lt[3]); }
             gs_lw_evict(L-6>0?L-6:0);
             free_layer(&W);
             continue;
