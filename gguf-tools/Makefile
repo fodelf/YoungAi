@@ -174,7 +174,10 @@ ifeq ($(CUDA),1)
 $(QZ)/vq_gpu.o: $(QZ)/vq_gpu.cu
 	$(NVCC) -O3 -arch=native -c $< -o $@
 ds4quant_run: $(AMP)/ds4quant_run
-$(AMP)/ds4quant_run: $(AMP)/ds4quant_run.c $(DSQRUN_INC) $(QZ)/vq_gpu.o
+# 头文件依赖必须列全: 2026-08-27 改 vq_qc.h 后 Linux 侧静默不重编(Darwin 分支列了, 这里漏了),
+# 表现是"改完照跑, 行为没变", 极难察觉。改这条规则时同步 Darwin 分支。
+$(AMP)/ds4quant_run: $(AMP)/ds4quant_run.c $(DSQRUN_INC) $(QZ)/vq_gpu.o $(AMP)/ds4quant_fwd.c \
+                     $(DSQFWD_INC) $(QZ)/onebit_quant.c $(AMP)/ds4quant_qhelp.h $(QZ)/go2b_qc.h $(QZ)/vq_qc.h
 	$(CC) $(DSQR_FLAGS) $(if $(filter 1,$(HAVE_BLAS)),-DDQ_BLAS -DDS4QUANT_OPENBLAS $(BLAS_CFLAGS)) \
 	    -DDS4QUANT_CUDA -I$(CUDA_HOME)/include -o $@ $(AMP)/ds4quant_run.c $(QZ)/vq_gpu.o \
 	    $(CUDA_LIBS) -lcublas $(BLAS_LIBS) -lm -lpthread
