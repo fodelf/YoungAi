@@ -372,7 +372,17 @@ int main(int argc, char **argv) {
      * 没给 XCAP 目录 = 非 XCAP 口径: x 就是锚 fin(py: X0 保持 anchor_layer 的返回值),
      * 学生输出 Y_q 由本进程重算(VQ blob 或 GGUF 切片), 没有 YQE。 */
     float *X0 = XCAP ? capload(XCAP, "raw_ffn_in", L, NTOK, D) : X0fp;
-    float *YQE = XCAP ? capload(XCAP, "raw_ffn_out", L, NTOK, D) : NULL;
+    /* ★只换 x 模式(2026-08-27)★: XCAP 目录只给 raw_ffn_in 时 YQE=NULL —— 学生与教师
+     * 都由本进程在【同一个量化链 x】上重算, 靶=纯量化误差(不掺引擎实现差)。用户口径:
+     * "用量化链给反修用去对齐原始模型"。给了 raw_ffn_out 才走旧的引擎输出口径。 */
+    float *YQE = NULL;
+    if (XCAP) {
+        char probe[1024];
+        snprintf(probe, sizeof probe, "%s/raw_ffn_out_L%d", XCAP, L);
+        FILE *pf = fopen(probe, "rb");
+        if (pf) { fclose(pf); YQE = capload(XCAP, "raw_ffn_out", L, NTOK, D); }
+        else printf("  L%d XCAP 只换 x 模式(无 raw_ffn_out): 学生/教师同 x 重算\n", L);
+    }
 
     /* ★链态锚(DS4_ZL_XANCHOR)★ 部署侧的 x_q 与路由_q 从第二个锚读; 教师侧仍用主锚。 */
     float *XQ0 = NULL, *rwq = NULL; int *ridxq = NULL;

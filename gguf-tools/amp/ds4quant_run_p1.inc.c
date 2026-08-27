@@ -36,6 +36,8 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+
+
 #include <sys/stat.h>
 #ifdef __APPLE__
 #include <mach/mach.h>   /* 内存自报: task_info phys_footprint(看门狗同口径) */
@@ -466,4 +468,3 @@ static ds4_z *z_solve_fourloss(const float *X,const float *R,int n,int d_in,int 
         for(uint32_t c=0;c<zl->rank;c++) zl->U[(size_t)j*zl->rank+c]*=iw; } }
     return zl;
 }
-

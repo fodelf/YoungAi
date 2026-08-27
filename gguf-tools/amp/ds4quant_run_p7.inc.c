@@ -15,7 +15,7 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
     float *y2=malloc((size_t)S*DIM*4),*post2=malloc((size_t)S*HCM*4),*comb2=malloc((size_t)S*HCM*HCM*4);
     dq_hc_pre(H2,W->ffn,W->fsc,W->fbase,y2,post2,comb2,S,HCM,DIM,mixd,HCIT,EPSF,EPSF);
     float *Fin=malloc((size_t)S*DIM*4); for(int s=0;s<S;s++)dq_rms(y2+(size_t)s*DIM,W->fn,Fin+(size_t)s*DIM,DIM,EPSF);
-    if(GS_CAP_L==L&&GS_FIN) memcpy(GS_FIN,Fin,(size_t)S*DIM*4);   /* ★反修: 捕获目标层 MoE 输入(算 z 特征用)★ */
+    if(GS_CAP_L==L&&GS_FIN) memcpy(GS_FIN,Fin,(size_t)S*DIM*4);  if(g_xcap_out) xcap_dump_fin(L,Fin,S);   /* 反修取料 + 量化链 x 捕获 */
     /* moe 路由(实际激活: 量化遍即被污染激活 = 部署运行时口径) */
     int *idx=malloc((size_t)S*NACT_RT*sizeof(int)); float *rw=malloc((size_t)S*NACT_RT*4);
     if(W->t2ei){ static int hbn=0;

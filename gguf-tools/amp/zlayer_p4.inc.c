@@ -63,7 +63,8 @@
                 L, c_ok, c_bad);
         printf("  L%d XCAP: 对齐 %.4f vs 错位 %.4f (%.1f×) |x|=%.1f |y_q|=%.1f\n",
                L, c_ok, c_bad, c_ok / (c_bad > 1e-6 ? c_bad : 1e-6),
-               fro_norm(X0, (size_t)NTOK * D), fro_norm(YQE, (size_t)NTOK * D));
+               fro_norm(X0, (size_t)NTOK * D),
+               YQE ? fro_norm(YQE, (size_t)NTOK * D) : 0.0);   /* 只换 x 模式无 YQE */
     }
 
     /* ---------------- 缓存: dH 与配对记录 ---------------- */
@@ -203,7 +204,7 @@
                 for (int j = 0; j < nrq; j++) {
                     float wq2 = RWQ[(size_t)QR_ROW[j] * NACT + QR_SLOT[j]];
                     if (ge_old) wq2 *= ge_old[e];             /* py: wq = wq*ge_old[e] */
-                    if (!XCAP) {
+                    if (!XCAP || !YQE) {   /* 只换 x 模式: 学生由本进程重算, 逐专家减 */
                         float *dst = dH + (size_t)QR_ROW[j] * D;
                         const float *y = Y + (size_t)j * D;
                         for (int d2 = 0; d2 < D; d2++) dst[d2] -= wq2 * y[d2];
@@ -240,7 +241,7 @@
             free(pv); free(zout); free(phi_buf);
         }
         /* dH = Σw·Y_fp(锚教师) − 引擎真实量化 routed。非 XCAP 时这一减法已经逐专家做过了。 */
-        if (XCAP) for (size_t i = 0; i < (size_t)NTOK * D; i++) dH[i] -= YQE[i];
+        if (XCAP && YQE) for (size_t i = 0; i < (size_t)NTOK * D; i++) dH[i] -= YQE[i];
 
         free(rows); free(slots); free(rowsq); free(slotsq); free(xs); free(Y); free(gb); free(ub);
         if (blob) { munmap((void *)blob, bsz); close(bfd); }

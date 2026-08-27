@@ -189,6 +189,7 @@ int main(int argc,char**argv){
     nact_rt_init(getenv("DS4_LAYER_DIR"));   /* 动态路由反修 Phase-B: 层目录 rroute.txt 门控 */
     const char*hf=getenv("DS4_HF");if(!hf)hf="/Users/fodelf/ds4-main/hf/DeepSeek-V4-Flash-Base"; st_open(&C,hf);
     const char*idf=argc>1?argv[1]:"/tmp/rr_hard.ids"; int ntok=argc>2?atoi(argv[2]):64;
+    for(int i=1;i<argc-1;i++) if(!strcmp(argv[i],"--xcap-out")) g_xcap_out=argv[i+1];  /* 量化链 x 捕获(见 xcap 分片) */
     if(getenv("DS4_Z_RANK")) ZRANK=atoi(getenv("DS4_Z_RANK"));
     if(getenv("DS4_Z_LAMBDA")) ZLAMBDA=atof(getenv("DS4_Z_LAMBDA"));
     if(getenv("DS4_NL")){ NLAYERS=atoi(getenv("DS4_NL")); if(NLAYERS<1)NLAYERS=1; if(NLAYERS>NL)NLAYERS=NL; }
