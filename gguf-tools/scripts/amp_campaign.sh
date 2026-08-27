@@ -47,7 +47,13 @@ PROBE_L=2                    # 仅 probe 诊断段用
 # 小机器时代的遗留, 在 121G 的 spark 上等于"跌到只剩 3% 才停车" —— 而实测恶化(逐层耗时
 # 5s→38s)从 MemAvailable 还很充裕时就开始了, 等 4G 才响已经白磨了五六层。
 # 按比例取阈值 ⇒ 换机器不用改脚本, 也不会再留下一个过时的魔法数。
-MEM_FLOOR_GB=$(awk '/MemTotal/{g=int($2/1048576/8); print (g<8?8:g)}' /proc/meminfo 2>/dev/null || echo 8)
+MEM_FLOOR_GB=8   # 系统 MemAvailable 地板(绝对值, 不按总内存缩放)
+# ★两个阈值语义不同, 别混★(2026-08-27 实撞: 我按总内存 1/8 取 15G, 把一个正在出正收益的
+#  反修跑误杀 —— 那活儿合法吃到 105G+(60G RSS + 33G mmap 锚 + page cache), MemAvailable
+#  落到 14G 是正常工况不是失控)。
+#   · 进程 RSS 上限 → 该按机器缩放(r30_campaign 内部 wdog = 总内存 3/4)
+#   · 系统 MemAvailable 地板 → 绝对值: 它量的是「离内核 OOM 还有多远」, 与总内存无关。
+#     设太高=误杀正常大内存作业; 设太低=抢不到内核 OOM killer 前面。8G 取二者之间。
 DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-0731"
 export DS4_HF   # 上游既有 env, 非本轮新增
 

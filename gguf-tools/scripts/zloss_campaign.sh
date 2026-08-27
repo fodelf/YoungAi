@@ -36,7 +36,13 @@ for b in $(seq 0 31); do
 done
 
 # 看门狗红线=总内存 1/8(下限 8G), 不写死小数字(见 amp_campaign.sh 同处注释)。
-MEM_FLOOR_GB=$(awk '/MemTotal/{g=int($2/1048576/8); print (g<8?8:g)}' /proc/meminfo 2>/dev/null || echo 8)
+MEM_FLOOR_GB=8   # 系统 MemAvailable 地板(绝对值, 不按总内存缩放)
+# ★两个阈值语义不同, 别混★(2026-08-27 实撞: 我按总内存 1/8 取 15G, 把一个正在出正收益的
+#  反修跑误杀 —— 那活儿合法吃到 105G+(60G RSS + 33G mmap 锚 + page cache), MemAvailable
+#  落到 14G 是正常工况不是失控)。
+#   · 进程 RSS 上限 → 该按机器缩放(r30_campaign 内部 wdog = 总内存 3/4)
+#   · 系统 MemAvailable 地板 → 绝对值: 它量的是「离内核 OOM 还有多远」, 与总内存无关。
+#     设太高=误杀正常大内存作业; 设太低=抢不到内核 OOM killer 前面。8G 取二者之间。
 WD=""
 wd_start(){ ( while true; do
     A=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo)
