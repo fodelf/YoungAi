@@ -288,10 +288,21 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
         { double cand=scE; if(scF<cand)cand=scF; if(scA<cand)cand=scA; if(scB<cand)cand=scB; if(scC<cand)cand=scC; if(scD<cand)cand=scD;
           double dl=(base-cand)/(base>1e-12?base:1); jdl=100.0*dl;
           if(dl>bf_bestdl){ bf_bestdl=dl; bf_bestJ=J; } }
-        if(form&&scr&&!onep){
+        if(form&&scr){
             /* ★全闸复核★: 粗筛只定排序; 胜者内存试装 → 真前沿×全token 重打, 必须净降才放行
              * (落地判据与旧全量逐字节同口径; 未过=还原+保持, 复检 pass 仍可再试)
-             * ONEPASS: 跳过 — 逐单元全程复核被收尾统一终验+全回滚取代 */
+             *
+             * ★2026-08-27: ONEPASS 不再跳过这道闸(原 !onep 条件已删)★
+             * 原理由"逐单元全程复核被收尾统一终验+全回滚取代"经实测证伪:
+             *   粗筛口径 = 抽 1/12 行(DS4_BF_SCREEN_DIV) × 近视野出口(eF=min(J+BK,Lfront))。
+             *   标量候选(bf.GL 乘常数)对这个近似免疫; ★dyn8 不免疫★ —— 它的 9 dof 在抽样行上
+             *   岭回归拟合、增益 c=w8[0]+Σw8[1+k]·pr[k] 是输入投影的线性函数, 换到全量分布
+             *   立刻失配并系统性撞 clamp 上限 4.0。
+             *   实撞(lyr86, 两跑逐位复现): L41 bf.GL −2.38% + L40 bf.GL −2.00% + L39
+             *   ★bf.GLdyn8★ −5.09% 三个粗筛口径下都是真收益 → 评 L38 时基线
+             *   0.4302→34.8462(80×) 链闸硬停, 收尾统一终验根本没机会执行。
+             * 本块只读不写 HQE(胜者试装后完整还原), 打开它不破坏 ONEPASS 冻结基线语义,
+             * 代价=每个有胜者的单元多一次真前沿全量前向。 */
             g_anc_rowmap = NULL;   /* 复核走全量行 ⇒ 锚回恒等映射 */
             float*Hf0=gs_forward_exit(J,Lfront,Hin,ids,S,n_fit,NULL);
             double basef=co_score(Hf0,Htgt,vs,n_fit,rowsz); free(Hf0);
