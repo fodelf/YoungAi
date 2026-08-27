@@ -244,7 +244,7 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
         }
         if(LZRANK>0&&do_quant){   /* ★层局部靶物料(两分支汇合点, shb 仍活): R=FP专家@Fin−回放routed */
             if(!BF_LT) BF_LT=malloc((size_t)S*DIM*4);
-            bf_fp_routed(L,Fin,idx,rw,S,BF_LT);
+            { double _f0=vqt_now(); bf_fp_routed(L,Fin,idx,rw,S,BF_LT); g_lt[7]+=vqt_now()-_f0; }
             for(size_t i=0;i<(size_t)S*DIM;i++) BF_LT[i]-=(Fout[i]-shb[i]);
             BF_LT_L=L;
         }
