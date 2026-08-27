@@ -45,7 +45,13 @@ LOG(){ echo "[r30 $(date +%H:%M:%S)] $*" >&2; }
 WDOG(){ while true; do
     P=$(pgrep -nf "${WDOG_PAT:-[d]s4quant_run.* $IDS}" || true); [ -n "$P" ] || { sleep 5; continue; }
     MB=$(proc_mem_mb "$P" || true)
-    [ -n "${MB:-}" ] && [ "$MB" -gt "${WDOG_MB:-11900}" ] && { echo "[r30][wdog] ${MB}MB >${WDOG_MB:-11900}MB 杀" >&2; kill -9 "$P" 2>/dev/null || true; }
+    # ★别写死内存红线★(2026-08-27 用户纠正"之前 4g/12g 的设备已经不存在了, spark 是 128g")
+    # 原默认 11900MB 是 16GB Mac Mini 时代的 12GiB 红线, 在 121G 的 spark 上把正常反修进程
+    # 当失控杀掉(实撞: [wdog] 12080MB>11900MB, 反修 21 秒即死)。历史上同一个数还误杀过
+    # "判决回放合法峰 12.3G"(fable5 在案), 当时的修法是逐个战役手写 WDOG_MB=22528 —— 治标。
+    # 现按机器实际内存取 3/4 为默认(spark≈90G), 显式 WDOG_MB 仍可覆盖。
+    _WD_DEF=$(awk '/MemTotal/{printf "%d", $2/1024*3/4}' /proc/meminfo 2>/dev/null || echo 11900)
+    [ -n "${MB:-}" ] && [ "$MB" -gt "${WDOG_MB:-$_WD_DEF}" ] && { echo "[r30][wdog] ${MB}MB >${WDOG_MB:-$_WD_DEF}MB 杀" >&2; kill -9 "$P" 2>/dev/null || true; }
     sleep 5; done }
 
 stage_anchor(){
