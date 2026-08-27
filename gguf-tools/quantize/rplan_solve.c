@@ -58,7 +58,7 @@ static int parse_kv(const char *ln, const char *key, double *out) {
 }
 
 int main(int argc, char **argv) {
-    const char *held_p = NULL, *lad_p = NULL, *oj = NULL, *ot = NULL;
+    const char *held_p = NULL, *lad_p = NULL, *oj = NULL, *ot = NULL, *wts_p = NULL;
     double budget_gib = 0.0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--held") && i + 1 < argc) held_p = argv[++i];
@@ -66,10 +66,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--budget-gib") && i + 1 < argc) budget_gib = atof(argv[++i]);
         else if (!strcmp(argv[i], "--out-json") && i + 1 < argc) oj = argv[++i];
         else if (!strcmp(argv[i], "--out-rplan") && i + 1 < argc) ot = argv[++i];
+        else if (!strcmp(argv[i], "--weights") && i + 1 < argc) wts_p = argv[++i];
         else { fprintf(stderr, "未知参数 %s\n", argv[i]); return 2; }
     }
-    if (!held_p || !lad_p || budget_gib <= 0) {
-        fprintf(stderr, "用法: rplan_solve --held <plan.txt> --ladder <ladder.txt> --budget-gib N\n"
+    if ((!held_p && !wts_p) || !lad_p || budget_gib <= 0) {
+        fprintf(stderr, "用法: rplan_solve (--weights <w.txt> | --held <plan.txt>) --ladder <l.txt> --budget-gib N\n"
                         "                 [--out-json f.json] [--out-rplan f.txt]\n");
         return 2;
     }
@@ -105,6 +106,7 @@ int main(int argc, char **argv) {
     /* ---- 逐层难度 ---- */
     double relh[MAXL]; int NL = 0;
     memset(relh, 0, sizeof relh);
+    if (held_p) {
     f = fopen(held_p, "r");
     if (!f) { fprintf(stderr, "held 表打不开 %s\n", held_p); return 2; }
     while (fgets(ln, sizeof ln, f)) {
@@ -116,12 +118,47 @@ int main(int argc, char **argv) {
     }
     fclose(f);
     if (NL < 2) { fprintf(stderr, "★held 表只解析到 %d 层★\n", NL); return 2; }
+    }
 
+    /* ★难度信号的来源决定成败, 所以做成可注入的输入而不是写死的推导★
+     *
+     * --weights: 外部实测的逐层难度(首选)。每行 "L w  # 出处"。
+     * --held:    从量化器 plan.txt 的累积 relh 推导 —— ★已知有缺陷, 只作兜底★。
+     *   缺陷: relh 是【累积】相对误差, 深层饱和(vq86h 实测 L27 起恒在 0.52 附近), 于是
+     *   能量增量 relh²[L]−relh²[L−1] 趋近 0, 全模型错得最狠的 L28 反被判成"最不需要 bit"。
+     *   实跑 43 层有 17 层撞地板(2026-08-27 实测), 撞地板的层之间只能靠循环次序随机排位。
+     *   v4 原版同样撞这堵墙(其注释: 累积曲线 L18 0.886 见顶 → L42 0.837), 它没修信号,
+     *   是加"逐层不退步底线"绕过去的。本版选择修信号: 用端到端实测贡献注入。 */
     double w[MAXL];
     const double FLOOR = 0.004;   /* 自愈层(能量负增量)仍要参与竞价, 不能给 0 权重 */
-    for (int L = 0; L < NL; L++) {
-        double h2 = relh[L] * relh[L], p2 = L ? relh[L-1] * relh[L-1] : 0.0;
-        w[L] = h2 - p2; if (w[L] < FLOOR) w[L] = FLOOR;
+    if (wts_p) {
+        for (int L = 0; L < MAXL; L++) w[L] = -1.0;
+        FILE *wf = fopen(wts_p, "r");
+        if (!wf) { fprintf(stderr, "难度表打不开 %s\n", wts_p); return 2; }
+        int nw = 0;
+        while (fgets(ln, sizeof ln, wf)) {
+            if (ln[0] == '#' || ln[0] == '\n') continue;
+            int L; double v;
+            if (sscanf(ln, "%d %lf", &L, &v) != 2) continue;
+            if (L < 0 || L >= MAXL) continue;
+            w[L] = v; nw++; if (L + 1 > NL) NL = L + 1;
+        }
+        fclose(wf);
+        if (nw < 2) { fprintf(stderr, "★难度表只解析到 %d 行★\n", nw); return 2; }
+        for (int L = 0; L < NL; L++)
+            if (w[L] < 0) { fprintf(stderr, "★难度表缺 L%d — 缺层会被静默当 0 资源, 硬拒★\n", L); return 2; }
+        printf("[难度] 外部实测注入 %s (%d 层)\n", wts_p, nw);
+    } else {
+        for (int L = 0; L < NL; L++) {
+            double h2 = relh[L] * relh[L], p2 = L ? relh[L-1] * relh[L-1] : 0.0;
+            w[L] = h2 - p2; if (w[L] < FLOOR) w[L] = FLOOR;
+        }
+        int nfloor = 0;
+        for (int L = 0; L < NL; L++) if (w[L] <= FLOOR) nfloor++;
+        printf("[难度] 由累积 relh 推导(兜底路) — %d/%d 层撞地板 %.3f\n", nfloor, NL, FLOOR);
+        if (nfloor * 3 > NL)
+            fprintf(stderr, "★警告: 过半以上层撞地板, 该信号已饱和失效, 分配基本是随机排位。"
+                            "请改用 --weights 注入端到端实测难度★\n");
     }
 
     /* ---- 贪心分配 ---- */

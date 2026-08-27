@@ -27,6 +27,22 @@ static cudaStream_t vqg_stream(void) {
     return g_vqg_stream;
 }
 
+/* ★别用魔法数卡 nc★(2026-08-27 实测事故): vq_qc.h 三处调用点原先写死 nc<=512, 于是
+ * nc=1024 静默掉回 CPU 标量 —— 实测 kmeans 慢 53×/gptq 慢 36×(每单位 15.5 vs 0.072),
+ * 一层从 2.5 分钟变 23 分钟, 直接撞"必须用 GPU"铁律。而 kernel 对 nc 本就是通用循环
+ * (c 从 threadIdx.x 步进 blockDim.x, 无 512 假设), 真正的限制只有两条:
+ *   ① dim ≤ VQG_MAX_DIM —— 栈数组 float v[VQG_MAX_DIM] 的硬约束, 越界即错值
+ *   ② 动态共享内存 nc*(dim+1)*4 字节装得下 —— 装不下 launch 直接失败
+ * 所以按真限制放行, 不再拍数字。(nc=1024: dim=4 需 20KB, dim=8 需 36KB, 均在 48KB 内。)
+ * 改这里前先想: 放行范围变了 = 更多情形从 CPU 路切到 GPU 路, 两路必须同判
+ * (assign 的 "严格 <" 保首现语义就是为此); 验证法见 dynladder 标定的 cos 对表。 */
+extern "C" int vqg_shm_ok(int nc, int dim) {
+    if (dim > VQG_MAX_DIM || nc < 1) return 0;
+    static int lim = -1;
+    if (lim < 0) { if (cudaDeviceGetAttribute(&lim, cudaDevAttrMaxSharedMemoryPerBlock, 0) != cudaSuccess) lim = 48 * 1024; }
+    return (size_t)(nc * dim + nc) * sizeof(float) <= (size_t)lim;
+}
+
 /* ---- assign: 每线程一向量 ---- */
 __global__ static void vqg_assign_kernel(
         const float *__restrict__ V, int nv,

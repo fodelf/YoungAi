@@ -42,11 +42,12 @@ static int dq_vq_on(void){ static int v=-1; if(v<0) v=getenv("DS4_VQ")?1:0; retu
 /* vq_gpu.cu 的 GPU 常驻核(08-18 用户令): assign 批+GPTQ 组整段 */
 extern int vqg_ready(void);
 extern void vqg_assign(const float*,int,const float*,int,int,int*);
+extern int vqg_shm_ok(int nc,int dim);   /* GPU 可跑判定=共享内存真限额, 不是魔法数(见 vq_gpu.cu) */
 extern void vqg_gptq_group(float*,const float*,const double*,int,int,int,int,int,int*);
 #endif
 static void vq_assign_q(const float *V,int nv,int dim,const float *C,int nc,int *idx){
 #ifdef DS4QUANT_CUDA
-    if(nv>=8192&&nc<=512&&dim<=8&&vqg_ready()){ vqg_assign(V,nv,C,nc,dim,idx); return; }
+    if(nv>=8192&&vqg_shm_ok(nc,dim)&&vqg_ready()){ vqg_assign(V,nv,C,nc,dim,idx); return; }
 #endif
     const int BS=8192;
     float *c2=malloc((size_t)nc*4),*G=malloc((size_t)BS*nc*4),*vtmp=malloc((size_t)nc*4);
@@ -110,7 +111,7 @@ static void vq_encode_full(const float *W,int rows,int cols,int dim,int nc,
 #ifdef DS4QUANT_CUDA
     /* v3 全矩阵批量(08-18): 组间独立 → 先算全部组 Hi(H cublas 逐组+CPU inv), 再一次
      * kernel 吃整矩阵(grid.y=组), per-组 sync 32→1 次/矩阵(7.8ms×24.6k=193s/层 的本体)。 */
-    if(cols%grp==0&&grp%dim==0&&nc<=512&&dim<=8&&vqg_ready()){
+    if(cols%grp==0&&grp%dim==0&&vqg_shm_ok(nc,dim)&&vqg_ready()){
         const int ngrp=cols/grp;
         double *Hi_all=NULL; int fb_all=0;
         if(XbT){
@@ -169,7 +170,7 @@ static void vq_encode_full(const float *W,int rows,int cols,int dim,int nc,
 #ifdef DS4QUANT_CUDA
         /* GPU 常驻组核(08-18): 段循环+误差反馈整组进 kernel(行间独立=每线程一行,
          * 行内与 CPU 逐项同序; Hi double→f32 唯一近似, held 对拍验)。 */
-        if(g%dim==0&&nc<=512&&dim<=8&&vqg_ready()){
+        if(g%dim==0&&vqg_shm_ok(nc,dim)&&vqg_ready()){
             const int nseg2=g/dim;
             static __thread int *sidx_g=NULL; static __thread int sg_cap=0;
             if(sg_cap<rows*nseg2){ free(sidx_g); sidx_g=malloc((size_t)rows*nseg2*sizeof(int)); sg_cap=rows*nseg2; }
