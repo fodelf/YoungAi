@@ -116,6 +116,20 @@ static int dq_dbuf_need(dq_dbuf *b, size_t n) {
     if (cudaMalloc((void **)&b->p, n * sizeof(float)) != cudaSuccess) { b->p = NULL; return 0; }
     b->n = n; return 1;
 }
+/* ★指针已在统一/显存里就别再拷★(2026-08-27, 128GiB GB10 适配)
+ * bytes_moe 的批 dequant 把整层 256 专家×3 矩阵(26GiB)放在 cudaMallocManaged 里 —— GPU 本就
+ * 直访。但下面的 GEMM 一直无条件 cudaMemcpy 到自己的暂存: 每调 33.5MB × 768 调/层 × 43 层
+ * ≈ 1.1TB 纯浪费的 H2D。判一下指针类型, managed/device 直接喂 cuBLAS。
+ * 失败或非托管指针 → 保持原拷贝路(小机器/非批模式行为逐字节不变)。
+ * cudaPointerGetAttributes 对普通 malloc 指针在新版 CUDA 返回 success+Unregistered,
+ * 老版返回 error 并污染 last_error —— 两种都要吞掉, 否则后续 cuda 调用误判失败。 */
+static int dq_dev_ptr(const void *p) {
+    if (!p) return 0;
+    cudaPointerAttributes at;
+    cudaError_t e = cudaPointerGetAttributes(&at, p);
+    if (e != cudaSuccess) { cudaGetLastError(); return 0; }
+    return at.type == cudaMemoryTypeManaged || at.type == cudaMemoryTypeDevice;
+}
 static __thread cublasHandle_t g_dqh = NULL;
 static __thread cudaStream_t g_dqs = NULL;
 static __thread dq_dbuf dX = {0, 0}, dW = {0, 0}, dO = {0, 0};
@@ -217,18 +231,25 @@ void dq_matmul(const float *X, const float *W, float *out, int S, int K, int M) 
          * 一次 cudaMemcpy 批量搬即可, 不会退化成跨步 DMA(那是 attention 那条路的坑,
          * 它已改走 vqg_attention 整层驻留)。暂存 per-thread 复用, 按需增长;
          * ★退出线程必须 dq_gpu_thread_release(2026-08-26 泄漏实锤见下)★ */
-        if (g_dqh && dq_dbuf_need(&dX, (size_t)S * K) && dq_dbuf_need(&dW, (size_t)M * K)
-                  && dq_dbuf_need(&dO, (size_t)S * M)) {
+        /* 已在统一/显存的操作数免拷(见 dq_dev_ptr 头注)。W 是热点: 批 dequant 模式下它就是
+         * managed 的 g_bmw_buf 切片。X/out 通常是普通 malloc, 仍走暂存。 */
+        const int wdev = dq_dev_ptr(W), xdev = dq_dev_ptr(X), odev = dq_dev_ptr(out);
+        if (g_dqh && (xdev || dq_dbuf_need(&dX, (size_t)S * K))
+                  && (wdev || dq_dbuf_need(&dW, (size_t)M * K))
+                  && (odev || dq_dbuf_need(&dO, (size_t)S * M))) {
             const float one = 1.0f, zero = 0.0f;
             const size_t f = sizeof(float);
+            const float *Xd = xdev ? X : dX.p, *Wd = wdev ? W : dW.p;
+            float *Od = odev ? out : dO.p;
+            int ok = 1;
+            if (!xdev && cudaMemcpyAsync(dX.p, X, (size_t)S*K*f, cudaMemcpyHostToDevice, g_dqs) != cudaSuccess) ok = 0;
+            if (ok && !wdev && cudaMemcpyAsync(dW.p, W, (size_t)M*K*f, cudaMemcpyHostToDevice, g_dqs) != cudaSuccess) ok = 0;
             /* RowMajor C[S,M]=X·W^T ⇔ ColMajor C'[M,S]=W'^T·X' */
-            if (cudaMemcpyAsync(dX.p, X, (size_t)S*K*f, cudaMemcpyHostToDevice, g_dqs) == cudaSuccess &&
-                cudaMemcpyAsync(dW.p, W, (size_t)M*K*f, cudaMemcpyHostToDevice, g_dqs) == cudaSuccess &&
-                cublasSgemm(g_dqh, CUBLAS_OP_T, CUBLAS_OP_N, M, S, K,
-                            &one, dW.p, K, dX.p, K, &zero, dO.p, M) == CUBLAS_STATUS_SUCCESS &&
-                cudaMemcpyAsync(out, dO.p, (size_t)S*M*f, cudaMemcpyDeviceToHost, g_dqs) == cudaSuccess &&
-                cudaStreamSynchronize(g_dqs) == cudaSuccess)
-                return;
+            if (ok && cublasSgemm(g_dqh, CUBLAS_OP_T, CUBLAS_OP_N, M, S, K,
+                            &one, Wd, K, Xd, K, &zero, Od, M) != CUBLAS_STATUS_SUCCESS) ok = 0;
+            if (ok && !odev && cudaMemcpyAsync(out, dO.p, (size_t)S*M*f, cudaMemcpyDeviceToHost, g_dqs) != cudaSuccess) ok = 0;
+            if (ok && cudaStreamSynchronize(g_dqs) == cudaSuccess) return;
+            cudaGetLastError();   /* 失败则落 CPU 路, 先清错免污染后续调用 */
         }
     }
 #endif
