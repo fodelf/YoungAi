@@ -326,9 +326,19 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
          * z^L: Fin→ΔFout 的 dual-form ridge RRR + 四损失(align/classify/smooth感知/fixed)选秩 k_L;
          * 只用 fit 行拟合, 应用于全部行(held=泛化), 下层看到校正后激活(序贯, 同顺序量化哲学)。
          * 体积: Σk_L×2·DIM×fp16 → k=8 全层 ≈5.4MB(产物③可调秩侧车)。 */
+        /* ★锚索引必须用建锚时的原始 S, 不是本次调用的 S★(2026-08-27 实锤 bug)
+         * 粗筛前向(backfit sweep)调 layer_fwd 时传的是抽格后的 S(=Ss≈S/12), 但 ANC.H 是按
+         * H_b=NLAYERS*S_full*HCM*DIM 分配的。用局部 S 算层偏移 ⇒ L*Ss 只有 L*S_full 的 1/12,
+         * ★指到别的层的锚区去★。实撞: lyr86 sweep 评 L38(该层无 zrec 故进本块)基线
+         * val出口 0.5637(推进段) → 34.8461, 链闸误判"链失稳"硬停, 三跑逐位复现。
+         * 只在【没有 zrec 的层】暴露 —— 有 zrec 的层整块被 !zrec_done 跳过, 所以只炸一层, 极隐蔽。
+         * p6 早就备好了这对全局(g_anc_rowstride=锚原始行 stride, g_anc_rowmap=抽格行→原始行),
+         * p13:112 也设好了, 本块从来没用。行索引同理必须过映射。 */
+        const int ancS = g_anc_rowmap ? g_anc_rowstride : S;
+        #define ANCROW(sx) (g_anc_rowmap ? g_anc_rowmap[(sx)] : (sx))
         float *Hq=malloc((size_t)S*HCM*DIM*4);
         dq_hc_post(Fout,H2,post2,comb2,Hq,S,HCM,DIM);
-        const float *Hf=ANC.H+(size_t)L*S*HCM*DIM;
+        const float *Hf=ANC.H+(size_t)L*ancS*HCM*DIM;
         float *DF=malloc((size_t)S*DIM*4);
         if(BF_LT&&BF_LT_L==L){   /* ★B路序贯: 层局部靶(见 bf_fp_routed 注释); 非B路走原漂移靶 */
             memcpy(DF,BF_LT,(size_t)S*DIM*4);
@@ -337,7 +347,7 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
             const float *ps=post2+(size_t)s*HCM; double pd=1e-12;
             for(int j=0;j<HCM;j++) pd+=(double)ps[j]*ps[j];
             for(int d=0;d<DIM;d++){ double a2=0;
-                for(int j=0;j<HCM;j++) a2+=(double)ps[j]*((double)Hf[((size_t)s*HCM+j)*DIM+d]-(double)Hq[((size_t)s*HCM+j)*DIM+d]);
+                for(int j=0;j<HCM;j++) a2+=(double)ps[j]*((double)Hf[((size_t)ANCROW(s)*HCM+j)*DIM+d]-(double)Hq[((size_t)s*HCM+j)*DIM+d]);
                 DF[(size_t)s*DIM+d]=(float)(a2/pd); }
         }
         }
@@ -365,11 +375,11 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
             { int cand0[7]={LZRANK,LZRANK/2,16,kL>0?kL:8,8,4,1}, tried[7]={0,0,0,0,0,0,0};
               size_t lst2=(size_t)S*HCM*DIM;
               float *Hq2=malloc(lst2*4), *Ftry=malloc((size_t)S*DIM*4), *zd=malloc((size_t)DIM*4);
-              const float *Hf2=ANC.H+(size_t)L*lst2;
+              const float *Hf2=ANC.H+(size_t)L*ancS*HCM*DIM;   /* 同上: 锚步长用 ancS 不是 lst2(=S*HCM*DIM) */
               /* 基线 val 出口 relL2 */
               double e0; { dq_hc_post(Fout,H2,post2,comb2,Hq2,S,HCM,DIM);
                 double e2=0,a2=0;
-                for(int s=vs;s<n_fit;s++){ const float*hq=Hq2+(size_t)s*HCM*DIM,*hf=Hf2+(size_t)s*HCM*DIM;
+                for(int s=vs;s<n_fit;s++){ const float*hq=Hq2+(size_t)s*HCM*DIM,*hf=Hf2+(size_t)ANCROW(s)*HCM*DIM;
                     for(size_t i=0;i<(size_t)HCM*DIM;i++){ double d=(double)hq[i]-hf[i]; e2+=d*d; a2+=(double)hf[i]*hf[i]; } }
                 e0=sqrt(e2/(a2+1e-30)); }
               g_lt[4]=vqt_now()-lt_mark-g_lt[3]-g_lt[6]-g_lt[7]; lt_mark=vqt_now();   /* ④其余(扣三项) */
@@ -399,7 +409,7 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
                 }
                 double e1; { dq_hc_post(Ftry,H2,post2,comb2,Hq2,S,HCM,DIM);
                   double e2=0,a2=0;
-                  for(int s=vs;s<n_fit;s++){ const float*hq=Hq2+(size_t)s*HCM*DIM,*hf=Hf2+(size_t)s*HCM*DIM;
+                  for(int s=vs;s<n_fit;s++){ const float*hq=Hq2+(size_t)s*HCM*DIM,*hf=Hf2+(size_t)ANCROW(s)*HCM*DIM;
                       for(size_t i=0;i<(size_t)HCM*DIM;i++){ double d=(double)hq[i]-hf[i]; e2+=d*d; a2+=(double)hf[i]*hf[i]; } }
                   e1=sqrt(e2/(a2+1e-30)); }
                 printf("ZLGATE L=%d k=%d val出口relL2 %.6f→%.6f %s\n",L,kk,e0,e1,e1<e0-1e-9?"✓落地":"✗拒");
@@ -475,16 +485,16 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
                         float*fw=Ftry2+(size_t)s2*DIM;
                         for(int d2=0;d2<DIM;d2++) fw[d2]*=gh;
                     }
-                    const float *Hf3=ANC.H+(size_t)L*S*HCM*DIM;
+                    const float *Hf3=ANC.H+(size_t)L*ancS*HCM*DIM;
                     double e0g,e1g;
                     { dq_hc_post(Fout,H2,post2,comb2,Hq3,S,HCM,DIM);
                       double e2s=0,a2s=0;
-                      for(int s2=vs2;s2<n_fit;s2++){ const float*hq=Hq3+(size_t)s2*HCM*DIM,*hf=Hf3+(size_t)s2*HCM*DIM;
+                      for(int s2=vs2;s2<n_fit;s2++){ const float*hq=Hq3+(size_t)s2*HCM*DIM,*hf=Hf3+(size_t)ANCROW(s2)*HCM*DIM;
                           for(size_t i2=0;i2<(size_t)HCM*DIM;i2++){ double d3=(double)hq[i2]-hf[i2]; e2s+=d3*d3; a2s+=(double)hf[i2]*hf[i2]; } }
                       e0g=sqrt(e2s/(a2s+1e-30)); }
                     { dq_hc_post(Ftry2,H2,post2,comb2,Hq3,S,HCM,DIM);
                       double e2s=0,a2s=0;
-                      for(int s2=vs2;s2<n_fit;s2++){ const float*hq=Hq3+(size_t)s2*HCM*DIM,*hf=Hf3+(size_t)s2*HCM*DIM;
+                      for(int s2=vs2;s2<n_fit;s2++){ const float*hq=Hq3+(size_t)s2*HCM*DIM,*hf=Hf3+(size_t)ANCROW(s2)*HCM*DIM;
                           for(size_t i2=0;i2<(size_t)HCM*DIM;i2++){ double d3=(double)hq[i2]-hf[i2]; e2s+=d3*d3; a2s+=(double)hf[i2]*hf[i2]; } }
                       e1g=sqrt(e2s/(a2s+1e-30)); }
                     printf("ZLGATE L=%d GE(路由投影) val出口relL2 %.6f→%.6f %s (活门=%d)\n",
