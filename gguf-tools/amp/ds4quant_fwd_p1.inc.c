@@ -125,7 +125,7 @@ static int dq_dbuf_need(dq_dbuf *b, size_t n) {
  * 老版返回 error 并污染 last_error —— 两种都要吞掉, 否则后续 cuda 调用误判失败。 */
 static int dq_dev_ptr(const void *p) {
     if (!p) return 0;
-    cudaPointerAttributes at;
+    struct cudaPointerAttributes at;   /* C 里必须带 struct: CUDA 头的 typedef 是 C++ 专属 */
     cudaError_t e = cudaPointerGetAttributes(&at, p);
     if (e != cudaSuccess) { cudaGetLastError(); return 0; }
     return at.type == cudaMemoryTypeManaged || at.type == cudaMemoryTypeDevice;
