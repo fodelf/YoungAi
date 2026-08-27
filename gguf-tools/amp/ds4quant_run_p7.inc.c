@@ -2,11 +2,11 @@
  * (那个 [bmwt] 数是 20 线程累计, 除以 20 才是墙钟 —— 我误读过一次)。perf 被内核
  * perf_event_paranoid 挡、gdb 无符号, 只能自己埋点。四段: attn(含 hc_pre/post) /
  * 路由 / 专家前向 / ZLGATE 候选评估。恒开(一层一行, 不新增 env)。 */
-double g_lt[6];   /* 0=attn 1=路由 2=共享专家 3=bytes_moe 4=段内其余 5=zlgate */
+double g_lt[8];   /* 0=attn 1=路由 2=共享专家 3=bytes_moe#1 4=段内其余 5=zlgate 6=lfile_load 7=bytes_moe#2 */
 static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
                       int do_quant, char cfg, lstat_t*st){
     double lt_t0=vqt_now(), lt_mark=lt_t0;
-    for(int i=0;i<6;i++) g_lt[i]=0;
+    for(int i=0;i<8;i++) g_lt[i]=0;
     int mixd=2*HCM+HCM*HCM;
     float *cosr=malloc((size_t)S*(RD/2)*4),*sinr=malloc((size_t)S*(RD/2)*4);
     if(CR[L]>0) dq_freqs_cis(RD,S,65536.0,160000.0,16.0,32.0,1.0,cosr,sinr);
@@ -228,14 +228,17 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
         } else {
             lfile_t lf; char lp[512];
             snprintf(lp,sizeof(lp),"%s/dql_L%02d.bin",getenv("DS4_LAYER_DIR")?getenv("DS4_LAYER_DIR"):".",L);
-            if(lfile_load(lp,&lf)==0){
+            double _lf0=vqt_now();
+            int _lfrc=lfile_load(lp,&lf);
+            g_lt[6]+=vqt_now()-_lf0;
+            if(_lfrc==0){
                 /* ★反修遍硬闸(2026-08-23 审计)★: VQ 侧车挂载失败会静默 vqmap=NULL →
                  * bytes_moe 拿 1bit 基座当学生, z 全解错且无报错。禁静默假学生。 */
                 if(LZRANK>0&&!lf.vqmap){
                     fprintf(stderr,"★反修遍 L%d: dql_vq 侧车缺/损(vqmap=NULL), 学生≠部署字节 — 拒跑★\n",L);
                     exit(1);
                 }
-                g_replay_cur_L=L; bytes_moe(&lf,S,Fin,idx,rw,Fout); lfile_free(&lf);
+                g_replay_cur_L=L; { double _b2=vqt_now(); bytes_moe(&lf,S,Fin,idx,rw,Fout); g_lt[7]+=vqt_now()-_b2; } lfile_free(&lf);
                 if(L<NL&&GBL_G[L]!=1.0f) for(size_t i=0;i<(size_t)S*DIM;i++) Fout[i]=shb[i]+GBL_G[L]*(Fout[i]-shb[i]);
             } else fprintf(stderr,"[B] 层文件 %s 读失败 — Fout 只含 shared\n",lp);
         }
@@ -367,7 +370,7 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
                 for(int s=vs;s<n_fit;s++){ const float*hq=Hq2+(size_t)s*HCM*DIM,*hf=Hf2+(size_t)s*HCM*DIM;
                     for(size_t i=0;i<(size_t)HCM*DIM;i++){ double d=(double)hq[i]-hf[i]; e2+=d*d; a2+=(double)hf[i]*hf[i]; } }
                 e0=sqrt(e2/(a2+1e-30)); }
-              g_lt[4]=vqt_now()-lt_mark-g_lt[3]; lt_mark=vqt_now();   /* ④段内其余(扣掉 bytes_moe) */
+              g_lt[4]=vqt_now()-lt_mark-g_lt[3]-g_lt[6]-g_lt[7]; lt_mark=vqt_now();   /* ④其余(扣三项) */
               { static double bf_e0_prev=-1.0;   /* ★链闸(2026-08-25)★: 逐层基线日志+失控守卫 */
                 fprintf(stderr,"[链闸] L%02d 基线val出口=%.4f 前层=%.4f 靶=%s\n",
                         L,e0,bf_e0_prev,(BF_LT&&BF_LT_L==L)?"层局部":"漂移");
