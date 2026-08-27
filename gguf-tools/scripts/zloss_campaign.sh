@@ -135,23 +135,47 @@ stage_solve(){
 # 实测: FP 锚 fin vs 判决尺回放 Fin 方向 cos 0.9425/相对差 32.5% ⇒ z 是 x 的线性函数,
 # 在 A 输入解最优、部署喂 B 输入 = GE(不吃x)端到端兑现 8.3% 而 z(吃x)只剩 0.2% 的根因。
 # XC 非空 = zcache 走量化链 x(zlayer 只换 x 模式: 学生/教师同 x 重算, 靶=纯量化误差)。
-XC="$D2/xcap_a"; WSX="$WS/layers_xc"
+# 底座变体(位置参数 $2, 非 env: 本脚本自带无 env 铁律)。默认平权 vq86h_noz。
+# ★反修的 x 必须来自本底座自己的量化链★ 拿别的底座的 x 解出的放大器部署即失配
+# (xcap 分片头注实测: FP 锚 fin vs 回放 Fin 方向 cos 仅 0.9425/相对差 32.5%,
+#  正是"层内 ER 20%/端到端归零"的唯一实测偏差)。所以换底座必须重captured。
+BASE="${2:-vq86h_noz}"
+case "$BASE" in
+  vq86h_noz) BASE_LAYERS="$D2/vq86h_noz/layers"; TAG="" ;;
+  dyn86)     BASE_LAYERS="$D2/dyn86/model/layers"; TAG="_dyn86" ;;
+  *) echo "未知底座 $BASE (可选 vq86h_noz|dyn86)" >&2; exit 2 ;;
+esac
+XC="$D2/xcap_a$TAG"; WSX="$WS/layers_xc$TAG"
 stage_full4l(){
     [ -s "$ANC" ] || DIE "8192 干净锚缺 $ANC"
     [ -x "$GT/amp/zloss_solve" ] || DIE "zloss_solve 缺"
-    G4="$D2/z4l"
+    G4="$D2/z4l$TAG"
     rm -rf "$G4"; mkdir -p "$G4/layers"
-    ( cd "$D2/vq86h_noz/layers" || exit 1
+    ( cd "$BASE_LAYERS" || exit 1
       for f in dql_vq_L*.bin; do ln -f "$f" "$G4/layers/$f" 2>/dev/null || cp "$f" "$G4/layers/"; done
       cp dql_ops_L*.bin opt_L*.bin manifest.txt "$G4/layers/" 2>/dev/null
       cp dql_L*.bin "$G4/layers/" ) || DIE "注入工作区建失败"
     N=$(ls "$G4/layers"/dql_vq_L*.bin 2>/dev/null | wc -l)
     [ "$N" -eq 43 ] || DIE "层件不齐 $N/43"
     mkdir -p "$WS/n4l" "$WSX"
-    ( cd "$D2/vq86h_noz/layers" || exit 1
+    ( cd "$BASE_LAYERS" || exit 1
       for f in dql_vq_L*.bin; do ln -f "$f" "$WSX/$f" 2>/dev/null || cp "$f" "$WSX/"; done ) || DIE "layers_xc 建失败"
     n=$(ls "$XC"/raw_ffn_in_L* 2>/dev/null | wc -l)
-    [ "$n" -eq 43 ] || DIE "量化链 x 捕获不齐 $n/43(先跑 --xcap-out)"
+    if [ "$n" -ne 43 ]; then
+        # 量化链 x 捕获: 原先手敲没入脚本, 换底座就断链。口径=校准语料(判决语料会泄漏)
+        # + 本底座层件 + 校准锚, 与 caliper 同一条回放链。
+        LOG "量化链 x 捕获($BASE, 现有 $n/43) → $XC"
+        mkdir -p "$XC"
+        LCx=$(printf 'g%.0s' $(seq 1 43))
+        ( cd "$GT/amp" && env DS4_HF="$HF" OPENBLAS_NUM_THREADS=1 DS4_BF_MEMGB=8 \
+            DS4_GSWEEP=0 DS4_BF_TERMINAL=0 DS4_BF_ONLY=1 DS4_COADAPT=1 DS4_CALIB_FULLSET=1 \
+            DS4_EXPORT_BYTES=0 DS4_ANCHOR="$ANC" DS4_NFIT=1 DS4_THREADS=20 \
+            DS4_LAYER_DIR="$BASE_LAYERS" DS4_LCFG="$LCx" DS4_VQ=1 DS4_TGT_ALPHA=1.0 \
+            ./ds4quant_run "$D2/vqhalf_a.ids" 8192 --xcap-out "$XC" 2>&1 | tail -2 ) \
+            || DIE "x 捕获失败"
+        n=$(ls "$XC"/raw_ffn_in_L* 2>/dev/null | wc -l)
+        [ "$n" -eq 43 ] || DIE "x 捕获仍不齐 $n/43"
+    fi
     LOG "①注入工作区就绪(43 层件) + 量化链 x 捕获 43/43"
     wd_start
     for L in $(seq 0 42); do
@@ -173,10 +197,14 @@ stage_full4l(){
     wd_stop
     VOL=$(du -sm "$G4/layers" 2>/dev/null | cut -f1)
     LOG "②43 层收官(注入 $NI 层, 工作区 ${VOL}MB) → caliper 五指标"
-    bash "$GT/scripts/caliper_ref.sh" "$G4/layers" /tmp/qc_z4l_wt2.bin > /tmp/caliper_z4l.log 2>&1 \
-        || DIE "caliper 失败, 看 /tmp/caliper_z4l.log"
-    grep -aE "PPL|KLD|RMS|Same|min" /tmp/caliper_z4l.log | tail -8
-    LOG "③4L 全量终判完成: 对表 裸 0.47055 / r64c 0.42510"
+    bash "$GT/scripts/caliper_ref.sh" "$G4/layers" "/tmp/qc_z4l${TAG}_wt2.bin" > "/tmp/caliper_z4l${TAG}.log" 2>&1 \
+        || DIE "caliper 失败, 看 /tmp/caliper_z4l${TAG}.log"
+    grep -aE "PPL|KLD|RMS|Same|min" "/tmp/caliper_z4l${TAG}.log" | tail -8
+    # 对表随底座: 同底座的裸判才是这次反修的分母; 跨底座比挽回率无意义(底座越粗挽回越多)。
+    case "$BASE" in
+      vq86h_noz) LOG "③4L 终判: 对表 平权裸 0.47055 / r64c 0.42510" ;;
+      dyn86)     LOG "③4L 终判: 对表 dyn86 裸 0.54312 / 平权终态 0.42510(★真正要超的是这个★)" ;;
+    esac
 }
 
 stage_judge(){  DIE "动态 z 注入格式 + 判决尺升级闸(新尺须逐字节复刻裸 0.47055/r64c 0.42510)未定, 针后设计"; }
