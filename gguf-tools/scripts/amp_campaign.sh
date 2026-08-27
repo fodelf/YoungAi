@@ -516,11 +516,47 @@ stage_dynjudge(){
     watchdog_stop
 }
 
+# ═══ 冠军配方反修(2026-08-27 用户令"按 67g 冠军版设计重新反修和路由反修")═══
+# 【这不是新写的东西】直接调 r30_campaign.sh backfit —— 那就是超冠当时跑的那一段, 原封不动。
+# 它一段里同时做完【反修 + 路由反修】, 不是两件事:
+#   DS4_BF_ONLY=1     跳过 ALT 逐层(层内判据, 保险门实锤端到端负贡献)
+#   DS4_BF_ONEPASS=1  冻结基线一遍选型 + 统一终验 + 劣化全回滚(用户 08-04 裁决"一遍就够")
+#   DS4_GSWEEP=0      回扫不跑(侧车架构下需要时删侧车补跑即可)
+#   DS4_EXPORT_BYTES=0 平行架构: dql 只读不可变, 只重建 op 侧车(用户"反修不许动量化模型")
+#   DS4_ROUTE_BIAS_FIT=1 + ALPHA=2.5  ★路由偏置寄生在反修自身前向, 零额外前向★
+#   DS4_ANCHOR_ROUTE=1 锚路由反修(超冠原样)
+# 段内自带"架构组件在场自检": z变量[E/C/F] 四损失[KGRID la/lf/ls+lc] 感知[pc行权]
+# 向后[TREF-B] 路由[GE-D投影] —— 四损失本来就在这一段, 不在后来另起的 zloss_solve 里。
+#
+# $1 = 层件目录名(model_lyr86 | model | vq86h_noz); $2 = probe 则只跑 L00 验机制
+stage_champbf(){
+    local D2="$ROOT/gguf/go-onebit/vqhalf" V="${1:?层件目录}" MODE="${2:-full}"
+    local OUT
+    case "$V" in
+      vq86h_noz) OUT="$D2/vq86h_noz";;
+      *)         OUT="$D2/dyn86/$V";;
+    esac
+    [ "$(ls "$OUT/layers"/dql_L*.bin 2>/dev/null | wc -l)" = 43 ] || DIE "层件不齐 $OUT/layers"
+    [ -s "$D2/anchor_a_clean_s8192.bin" ] || DIE "校准锚缺"
+    export DS4_BF_MEMGB=80 MALLOC_MMAP_THRESHOLD_=1073741824 MALLOC_TRIM_THRESHOLD_=1073741824
+    export OPENBLAS_NUM_THREADS=1 DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-0731"
+    # 这四个必须不在场, 否则 backfit 走错分支(段内自带硬闸会停)
+    unset DS4_TUNE DS4_MINVOL DS4_MV_BASELINE DS4_VQ_RPLAN
+    local PB=""; [ "$MODE" = probe ] && PB=1
+    LOG "冠军配方反修发车: $OUT ${PB:+(单层探针 L00)}"
+    watchdog_start
+    ( cd "$ROOT" && env ${PB:+PROBE1=1} OUTF_OVERRIDE="$OUT" ANCHOR_OVERRIDE="$D2/anchor_a_clean_s8192.bin" \
+        IDS_OVERRIDE="$D2/vqhalf_a.ids" BF_S=8192 BF_NFIT=6144 DS4_THREADS=20 \
+        QBIN_OVERRIDE="$ROOT/gguf-tools/amp/ds4quant_run" DS4_GSWEEP=0 \
+        bash "$SC/r30_campaign.sh" backfit ) 2>&1 | tail -40
+    watchdog_stop
+}
+
 ST="${1:-all}"
 case "$ST" in
   preflight) stage_preflight;; ids) stage_ids;; anchor) stage_anchor;;
   capture) stage_capture;; probe) stage_probe;; solve) stage_solve;; pass2) stage_pass2;;
-  chain) stage_chain;; judge) stage_judge;; dilute) stage_dilute;; idshalf) stage_idshalf;; idshalf_ext) shift; stage_idshalf_ext "$@";; vqquant) stage_vqquant;; vqmerge) stage_vqmerge;; vqcap) stage_vqcap;; vqsolve) stage_vqsolve;; dynladder) stage_dynladder;; dynquant) shift; stage_dynquant "$@";; dynjudge) stage_dynjudge;;
+  chain) stage_chain;; judge) stage_judge;; dilute) stage_dilute;; idshalf) stage_idshalf;; idshalf_ext) shift; stage_idshalf_ext "$@";; vqquant) stage_vqquant;; vqmerge) stage_vqmerge;; vqcap) stage_vqcap;; vqsolve) stage_vqsolve;; dynladder) stage_dynladder;; dynquant) shift; stage_dynquant "$@";; dynjudge) stage_dynjudge;; champbf) shift; stage_champbf "$@";;
   all) stage_preflight; stage_ids; stage_anchor; stage_capture
        stage_solve; stage_chain; stage_judge;;
   *) echo "未知段: $ST"; echo "段: preflight ids anchor capture solve pass2 chain judge dilute all (probe/dilute=诊断)"; exit 2;;
