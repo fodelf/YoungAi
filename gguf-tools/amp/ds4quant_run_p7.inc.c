@@ -2,11 +2,11 @@
  * (那个 [bmwt] 数是 20 线程累计, 除以 20 才是墙钟 —— 我误读过一次)。perf 被内核
  * perf_event_paranoid 挡、gdb 无符号, 只能自己埋点。四段: attn(含 hc_pre/post) /
  * 路由 / 专家前向 / ZLGATE 候选评估。恒开(一层一行, 不新增 env)。 */
-double g_lt[4];   /* 0=attn 1=route 2=expert 3=zlgate; 单位秒, 每层清零 */
+double g_lt[6];   /* 0=attn 1=路由 2=共享专家 3=bytes_moe 4=段内其余 5=zlgate */
 static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
                       int do_quant, char cfg, lstat_t*st){
     double lt_t0=vqt_now(), lt_mark=lt_t0;
-    for(int i=0;i<4;i++) g_lt[i]=0;
+    for(int i=0;i<6;i++) g_lt[i]=0;
     int mixd=2*HCM+HCM*HCM;
     float *cosr=malloc((size_t)S*(RD/2)*4),*sinr=malloc((size_t)S*(RD/2)*4);
     if(CR[L]>0) dq_freqs_cis(RD,S,65536.0,160000.0,16.0,32.0,1.0,cosr,sinr);
@@ -179,12 +179,14 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
         st->agree=100.0*(double)match/((double)S*NACT);
     }
     /* shared 专家 FP 为公共基 */
+    g_lt[1]=vqt_now()-lt_mark; lt_mark=vqt_now();   /* ①路由段完 */
     float *Fout=calloc((size_t)S*DIM,4); dq_expert_fp(Fin,W->s1,W->s3,W->s2,NULL,Fout,S,DIM,MOEI,SWLIM);
+    g_lt[2]=vqt_now()-lt_mark; lt_mark=vqt_now();   /* ②共享专家(全 S 稠密前向)完 */
     if(do_quant&&cfg=='B'){
         /* 字节重前向: 从层文件(权重字节+落地修正链)执行, 不重量化 — 全局回扫的引擎 */
         float *shb=malloc((size_t)S*DIM*4); memcpy(shb,Fout,(size_t)S*DIM*4);   /* shared 基 */
         if(GS_LF&&L<NL&&GS_LF[L].map){   /* ★存档缓存: 不重 mmap/不重解析★ */
-            g_replay_cur_L=L; bytes_moe(&GS_LF[L],S,Fin,idx,rw,Fout);
+            g_replay_cur_L=L; { double _b=vqt_now(); bytes_moe(&GS_LF[L],S,Fin,idx,rw,Fout); g_lt[3]+=vqt_now()-_b; }
             if(GS_GV&&GS_GV_L==L){        /* ★反修: 目标层 per-token routed 增益(搜每 token 最优乘子)★ */
                 for(int s=0;s<S;s++){ float g=GS_GV[s]; float*fw=Fout+(size_t)s*DIM,*sb=shb+(size_t)s*DIM;
                     for(int d=0;d<DIM;d++) fw[d]=sb[d]+g*(fw[d]-sb[d]); } }
@@ -365,7 +367,7 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
                 for(int s=vs;s<n_fit;s++){ const float*hq=Hq2+(size_t)s*HCM*DIM,*hf=Hf2+(size_t)s*HCM*DIM;
                     for(size_t i=0;i<(size_t)HCM*DIM;i++){ double d=(double)hq[i]-hf[i]; e2+=d*d; a2+=(double)hf[i]*hf[i]; } }
                 e0=sqrt(e2/(a2+1e-30)); }
-              g_lt[2]=vqt_now()-lt_mark; lt_mark=vqt_now();   /* ②路由+③专家前向 段完(基线 e0 已出) */
+              g_lt[4]=vqt_now()-lt_mark-g_lt[3]; lt_mark=vqt_now();   /* ④段内其余(扣掉 bytes_moe) */
               { static double bf_e0_prev=-1.0;   /* ★链闸(2026-08-25)★: 逐层基线日志+失控守卫 */
                 fprintf(stderr,"[链闸] L%02d 基线val出口=%.4f 前层=%.4f 靶=%s\n",
                         L,e0,bf_e0_prev,(BF_LT&&BF_LT_L==L)?"层局部":"漂移");
@@ -425,7 +427,7 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
                           for(size_t i3=0;i3<(size_t)DIM*kk;i3++) h3[o3++]=go1b_fp32_to_fp16(ZLP_U[i3]);
                           for(size_t i3=0;i3<(size_t)DIM*kk;i3++) h3[o3++]=go1b_fp32_to_fp16(ZLP_V[i3]);
                           fwrite(h3,2,o3,zf3); free(h3); fclose(zf3);
-                g_lt[3]=vqt_now()-lt_mark;   /* ④ZLGATE 候选评估段完 */
+                g_lt[5]=vqt_now()-lt_mark;   /* ⑤ZLGATE 候选评估段完 */
                           printf("ZREC L=%d k=%d → zrec_L%02d.bin\n",L,kk,L); fflush(stdout);
                         } } }
                 }
