@@ -12,10 +12,14 @@ RB_ENV=(); [ -n "$RB" ] && RB_ENV=(DS4_ROUTE_BIAS="$RB" DS4_ROUTE_BIAS_ALPHA="$R
 R30="$ROOT/gguf/go-onebit/r30"; G7="$ROOT/gguf/go-onebit/g7"
 N=$(ls "$LAYERS"/dql_vq_L*.bin 2>/dev/null | wc -l)
 [ "$N" = 43 ] || { echo "层件不齐 $N/43" >&2; exit 2; }
+# ★不再写死 DS4_BF_MEMGB=8★(2026-08-27): 那是 16GiB Mac 时代的预算, 在 121GiB 机器上
+# 逼着判决尺反复驱逐 fp16 层缓存再从 HF 盘重载(~0.6s/访)。改由代码按物理内存自适应
+# (默认=一半)。★纯速度开关, 不动数值★ —— 驱逐后重载回来的权重逐位相同, 已用同一层件
+# 前后两跑 logits md5 对拍验证。
 export MALLOC_MMAP_THRESHOLD_=1073741824 MALLOC_TRIM_THRESHOLD_=1073741824
 LCx=$(printf "g%.0s" $(seq 1 43))
 cd "$ROOT/gguf-tools/amp"
-env DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-0731" OPENBLAS_NUM_THREADS=1 DS4_BF_MEMGB=8 \
+env DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-0731" OPENBLAS_NUM_THREADS=1 \
     DS4_GSWEEP=0 DS4_BF_TERMINAL=0 DS4_BF_ONLY=1 DS4_COADAPT=1 DS4_CALIB_FULLSET=1 \
     DS4_EXPORT_BYTES=0 DS4_ANCHOR="$R30/anchor_wt2_s2653.bin" DS4_NFIT=1 DS4_THREADS="$THR" \
     DS4_LAYER_DIR="$LAYERS" DS4_LCFG="$LCx" DS4_VQ=1 DS4_TGT_ALPHA=1.0 \

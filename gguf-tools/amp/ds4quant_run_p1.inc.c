@@ -292,10 +292,30 @@ static double mem_gb(void){   /* Linux: VmRSS(看门狗近似口径) */
     }
     fclose(f); return gb; }
 #endif
-static double BF_MEMGB=9.5;
+/* 机器物理内存(GiB); 读不到回退 16(旧默认机型)。分配预算类的默认值一律由它导出,
+ * 不再写死 —— 死数在换机器时会静默变成性能杀手(2026-08-27 用户: "之前代码根本不适配
+ * 当前的设备了, 当前是 128 的 GPU 场景")。 */
+static double dq_host_ram_gb(void) {
+    static double g = -1.0;
+    if (g < 0) {
+        g = 16.0;
+        FILE *f = fopen("/proc/meminfo", "r");
+        if (f) { char ln[256]; unsigned long kb;
+            while (fgets(ln, sizeof ln, f))
+                if (sscanf(ln, "MemTotal: %lu kB", &kb) == 1) { g = (double)kb / 1048576.0; break; }
+            fclose(f); }
+    }
+    return g;
+}
+/* ★别写死 9.5★(2026-08-27): 这是 16GiB Mac 时代的预算。超预算就驱逐 fp16 层缓存, 该层
+ * 下次被访问时从 HF 盘重载(~0.6s/访) —— 在 121GiB 机器上等于"内存明明够, 却坚持走盘"。
+ * 改为物理内存的一半(spark≈60GiB, 旧 16G 机上≈8GiB 与原值同量级), DS4_BF_MEMGB 仍可覆盖。 */
+static double BF_MEMGB_init(void){ return dq_host_ram_gb() * 0.5; }
+static double BF_MEMGB=0;   /* 0=未初始化, 首次 mem_evict 时由 BF_MEMGB_init 填(见 p14 env 覆盖) */
 static void lwh_free(LWH*H);
 static void gs_lw_evict(int upto){   /* 驱逐 [0,upto) 里已缓存的最低层, 直到回预算 */
     if(!GS_LW) return;
+    if(BF_MEMGB<=0) BF_MEMGB=BF_MEMGB_init();
     while(mem_gb()>BF_MEMGB){
         int v=-1; for(int i=0;i<upto;i++) if(GS_LW[i].loaded){ v=i; break; }
         if(v<0) break;

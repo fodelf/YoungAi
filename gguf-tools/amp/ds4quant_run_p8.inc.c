@@ -162,16 +162,28 @@ static float *fwd_all(const long*ids,int S,int n_fit,int do_quant,const char*lcf
             /* ★反修内存架构: HQE 快照(S=1716 时 ~2.5G)由 malloc(脏页)改为 /tmp 匿名文件后备
              * mmap(MAP_SHARED) — 有磁盘后备可换出, 内存压力下自回收, 与锚 mmap 合计砍反修
              * 基线脏内存 ~7G ⇒ 终局 sweep 进 12G 红线(2026-07-31 用户令核心价值必须反修)。 */
-            char hqp[]="/tmp/ds4_hqe_XXXXXX"; int hfd=mkstemp(hqp);
-            if(hfd<0){ perror("hqe-tmp"); exit(1); }
-            unlink(hqp);
             size_t hb=(size_t)(NLAYERS+1)*lstride*4;
-            if(ftruncate(hfd,(off_t)hb)!=0){ perror("hqe-trunc"); exit(1); }
-            HQE=mmap(NULL,hb,PROT_READ|PROT_WRITE,MAP_SHARED,hfd,0);
-            close(hfd);
-            if(HQE==MAP_FAILED){ perror("hqe-mmap"); exit(1); }
+            /* ★内存够就别落盘★(2026-08-27): 文件后备是 16GiB Mac 时代为"可换出"设的续命手段,
+             * 在 121GiB 机器上白换来 page fault + 盘 IO。物理内存 ≥ 快照的 4 倍时走匿名 mmap
+             * (纯内存); 否则保留原文件后备路(小机器行为逐字节不变)。 */
+            double need_gb=hb/1073741824.0;
+            if(dq_host_ram_gb() >= need_gb*4.0){
+                HQE=mmap(NULL,hb,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+                if(HQE==MAP_FAILED){ perror("hqe-anon"); exit(1); }
+                fprintf(stderr,"[反修] HQE 快照 %.2f GiB → 匿名 mmap(纯内存; 机器 %.0f GiB)\n",
+                        need_gb,dq_host_ram_gb());
+            } else {
+                char hqp[]="/tmp/ds4_hqe_XXXXXX"; int hfd=mkstemp(hqp);
+                if(hfd<0){ perror("hqe-tmp"); exit(1); }
+                unlink(hqp);
+                if(ftruncate(hfd,(off_t)hb)!=0){ perror("hqe-trunc"); exit(1); }
+                HQE=mmap(NULL,hb,PROT_READ|PROT_WRITE,MAP_SHARED,hfd,0);
+                close(hfd);
+                if(HQE==MAP_FAILED){ perror("hqe-mmap"); exit(1); }
+                fprintf(stderr,"[反修] HQE 快照 %.2f GiB → 文件后备 mmap(可换出; 机器仅 %.0f GiB)\n",
+                        need_gb,dq_host_ram_gb());
+            }
             g_hqe_lstride=lstride;
-            fprintf(stderr,"[反修] HQE 快照 %.2f GiB → 文件后备 mmap(可换出)\n",hb/1073741824.0);
         }
         if(!BF_FINOP){ BF_FINOP=malloc((size_t)NLAYERS*sizeof(int)); for(int i=0;i<NLAYERS;i++) BF_FINOP[i]=-1; }
         if(!BF_DYN2OP){ BF_DYN2OP=malloc((size_t)NLAYERS*sizeof(int)); for(int i=0;i<NLAYERS;i++) BF_DYN2OP[i]=-1; }
