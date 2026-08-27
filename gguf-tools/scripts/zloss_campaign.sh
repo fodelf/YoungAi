@@ -36,13 +36,14 @@ for b in $(seq 0 31); do
 done
 
 # 看门狗红线=总内存 1/8(下限 8G), 不写死小数字(见 amp_campaign.sh 同处注释)。
-MEM_FLOOR_GB=8   # 系统 MemAvailable 地板(绝对值, 不按总内存缩放)
-# ★两个阈值语义不同, 别混★(2026-08-27 实撞: 我按总内存 1/8 取 15G, 把一个正在出正收益的
-#  反修跑误杀 —— 那活儿合法吃到 105G+(60G RSS + 33G mmap 锚 + page cache), MemAvailable
-#  落到 14G 是正常工况不是失控)。
-#   · 进程 RSS 上限 → 该按机器缩放(r30_campaign 内部 wdog = 总内存 3/4)
-#   · 系统 MemAvailable 地板 → 绝对值: 它量的是「离内核 OOM 还有多远」, 与总内存无关。
-#     设太高=误杀正常大内存作业; 设太低=抢不到内核 OOM killer 前面。8G 取二者之间。
+MEM_FLOOR_GB=4   # 系统 MemAvailable 地板 —— ★4 是实测值, 不是小机器遗留, 别再往上调★
+# 2026-08-27 我在这个数上连错三次: 原值 4 全天正常; 改 15(总内存 1/8) 误杀正在出正收益的
+# 反修; 改 8(绝对值) 误杀量化于 L39。实测: 本工作负载【正常工况】就把 MemAvailable 压到
+# 5-7GB —— 121GB 机器 + 33GB mmap 锚 + page cache, 吃满是设计意图不是失控。
+# ★两个阈值语义不同★
+#   · 真限制 = 进程 RSS(r30_campaign 内部 wdog, 按机器内存 3/4) —— 那个该随机器缩放
+#   · 这里 = 系统 MemAvailable 最后一道网, 只为抢在内核 OOM killer 前面留个可控停车点。
+#     它必须【低于】负载的正常低点, 否则每次都误杀。调高 = 把正常工况判成失控。
 WD=""
 wd_start(){ ( while true; do
     A=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo)
