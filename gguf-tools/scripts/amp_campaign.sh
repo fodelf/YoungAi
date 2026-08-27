@@ -543,11 +543,13 @@ stage_champbf(){
     # 这四个必须不在场, 否则 backfit 走错分支(段内自带硬闸会停)
     unset DS4_TUNE DS4_MINVOL DS4_MV_BASELINE DS4_VQ_RPLAN
     local PB=""; [ "$MODE" = probe ] && PB=1
+    # 纯 VQ 底座无 go2b 热专家 ⇒ 关 GO2B_HOT(冠军底座是 go2b 热, 这是底座差异不是配方改动)
+    local G2H=0
     LOG "冠军配方反修发车: $OUT ${PB:+(单层探针 L00)}"
     watchdog_start
     ( cd "$ROOT" && env ${PB:+PROBE1=1} OUTF_OVERRIDE="$OUT" ANCHOR_OVERRIDE="$D2/anchor_a_clean_s8192.bin" \
         IDS_OVERRIDE="$D2/vqhalf_a.ids" BF_S=8192 BF_NFIT=6144 DS4_THREADS=20 \
-        QBIN_OVERRIDE="$ROOT/gguf-tools/amp/ds4quant_run" DS4_GSWEEP=0 \
+        QBIN_OVERRIDE="$ROOT/gguf-tools/amp/ds4quant_run" DS4_GSWEEP=0 DS4_GO2B_HOT=$G2H \
         bash "$SC/r30_campaign.sh" backfit ) 2>&1 | tail -40
     watchdog_stop
 }
