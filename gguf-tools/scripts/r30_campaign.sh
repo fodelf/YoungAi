@@ -126,7 +126,12 @@ stage_backfit(){
     export DS4_CALIB_FULLSET=1
     export DS4_LAYER_DIR="$OUTF/layers" DS4_LCFG=$(printf 'g%.0s' $(seq 1 43)) DS4_COADAPT=1
     export DS4_VQ=1 DS4_TGT_ALPHA=1.0
-    export DS4_GO2B_HOT=1 DS4_GO2B_HOT_TABLE="${HOT_TABLE:-$ROOT/gguf-tools/data/corpus/prog_active_top49.txt}"
+    # go2b 热专家: 冠军底座是"热 go2b 合并态 + 冷 go1b", 默认 1=原样。但纯 VQ 底座没有
+    # go2b 热专家(如 lyr86 全 256 专家层内同档 hot=0), armed 一张不属于它的热表 = 反修按
+    # "这些专家是合并 2bit"建模 = 错模型。故认既有开关 DS4_GO2B_HOT(非新增 env), 缺省保持
+    # 冠军行为。★热表读失败是硬拒 rc=8★ —— 要关就明确传 0, 它不会静默退化。
+    export DS4_GO2B_HOT="${DS4_GO2B_HOT:-1}"
+    export DS4_GO2B_HOT_TABLE="${HOT_TABLE:-$ROOT/gguf-tools/data/corpus/prog_active_top49.txt}"
     export DS4_ZFILE="$OUTF/zfile.bin" DS4_ZCHAIN="$OUTF/zchain.bin"
     # ★一次从头到尾的反修(2026-08-04 用户终裁)★: 不要 ALT逐层+sweep+回扫三段叠罗汉 —
     #   ①BF_ONLY: 跳过 ALT 逐层反修(层内判据, 保险门实锤端到端负贡献 1.9045>1.6474)
