@@ -363,6 +363,41 @@ static void run_4l_arm(const float *X, const float *R, const float *Ys, const fl
     run_map_arm("4L", X, D, NULL, tr, R, R, X, Ys, Yt_ev, wv, swts, ralign,
                 fit, nf, ev, mode0, nev, ranks, nrank, lambdas, nlam, maxk,
                 lw, dscale, seed, nth, L, lf, best, Yhat, Cb, Cp, zcat);
+    /* ★正交靶臂 4Lp(2026-08-27 用户判"引擎磨平收益"的根因修)★
+     * layer_fwd 每层入口 dq_rms + head_fwd 末端 dq_rms ⇒ 修正里【平行于教师方向】
+     * 的分量只改模长, 下一层归一化即抹平, 对 logits 零贡献。而 L2 最小二乘优先修
+     * 能量最大的误差(往往就是模长) ⇒ 实测 L40 relL2 −41.6% 而 KLD 只 −0.27%。
+     * 修法: 靶投影到与 Yt 正交的子空间, z 只学能改方向的修正(与 L_align=1−cos 同源)。 */
+    {
+        float *Rp = xmalloc((size_t)ntok * D * sizeof(float));
+        for (int t = 0; t < ntok; t++) {
+            const float *yt = Yt + (size_t)t * D, *r = R + (size_t)t * D;
+            float *o = Rp + (size_t)t * D;
+            double nn = 0, dp = 0;
+            for (int j = 0; j < D; j++) { nn += (double)yt[j] * yt[j]; dp += (double)r[j] * yt[j]; }
+            const double c = nn > 0 ? dp / nn : 0.0;      /* R 在 Yt 方向的投影系数 */
+            for (int j = 0; j < D; j++) o[j] = (float)(r[j] - c * yt[j]);
+        }
+        run_map_arm("4Lp", X, D, NULL, tr, Rp, R, X, Ys, Yt_ev, wv, swts, ralign,
+                    fit, nf, ev, mode0, nev, ranks, nrank, lambdas, nlam, maxk,
+                    lw, dscale, seed, nth, L, lf, best, Yhat, Cb, Cp, zcat);
+        if (gecorr) {   /* GE 基版本: 靶=(R−GE) 的正交分量 */
+            float *Rgp = xmalloc((size_t)ntok * D * sizeof(float));
+            for (int t = 0; t < ntok; t++) {
+                const float *yt = Yt + (size_t)t * D, *r = Rge + (size_t)t * D;
+                float *o = Rgp + (size_t)t * D;
+                double nn = 0, dp = 0;
+                for (int j = 0; j < D; j++) { nn += (double)yt[j] * yt[j]; dp += (double)r[j] * yt[j]; }
+                const double c = nn > 0 ? dp / nn : 0.0;
+                for (int j = 0; j < D; j++) o[j] = (float)(r[j] - c * yt[j]);
+            }
+            run_map_arm("GE+4Lp", X, D, gecorr, tr, Rgp, R, X, Ys, Yt_ev, wv, swts, ralign,
+                        fit, nf, ev, mode0, nev, ranks, nrank, lambdas, nlam, maxk,
+                        lw, dscale, seed, nth, L, lf, best, Yhat, Cb, Cp, zcat);
+            free(Rgp);
+        }
+        free(Rp);
+    }
     /* ★GE 基版本(2026-08-27): 无此臂时择优只能在"纯 z"与"GE"间二选一, 硬凑叠加
      * = z 修全 R 而 GE 又修一遍同一部分 → 重复修正踩重尾(PPL 比 1.385 反超裸)。
      * 补齐后 GE 与 z 的落地口径自洽: z 解的就是 GE 之后的残差。 */
