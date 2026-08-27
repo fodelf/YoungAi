@@ -550,7 +550,10 @@ stage_champbf(){
     ( cd "$ROOT" && env ${PB:+PROBE1=1} OUTF_OVERRIDE="$OUT" ANCHOR_OVERRIDE="$D2/anchor_a_clean_s8192.bin" \
         IDS_OVERRIDE="$D2/vqhalf_a.ids" BF_S=8192 BF_NFIT=6144 DS4_THREADS=20 \
         QBIN_OVERRIDE="$ROOT/gguf-tools/amp/ds4quant_run" DS4_GSWEEP=0 DS4_GO2B_HOT=$G2H \
-        bash "$SC/r30_campaign.sh" backfit ) 2>&1 | tail -40
+        bash "$SC/r30_campaign.sh" backfit ) > "$OUT/backfit.log" 2>&1
+    # ★别用管道包 tail★(2026-08-27 实撞): 管道把 stderr 全缓冲, 跑一小时看不到任何逐层进度,
+    # 违反"长任务必须逐单元可观测"铁律。改为直接落盘 —— 跑中随时 tail -f 看真进度。
+    tail -40 "$OUT/backfit.log"
     watchdog_stop
 }
 
