@@ -129,6 +129,11 @@ stage_solve(){
 # 网格顶 0.3 是边界单调 bug, L41/L20 修后双双赢裸) → 冠军 emit-z(zl.RRR±bf.GE+zl.4L)
 # → caliper 五指标。体积: k≤512 时 z 最大 8.4MB/层 ×43 ≈ 360MB(2GB 预算内)。
 # 对表: 裸 0.47055 / r64c 冠军 0.42510 / 官方 q2 0.4207。
+# ★量化链 x 口径(2026-08-27, 用户令"用量化链给反修用去对齐原始模型")★
+# 实测: FP 锚 fin vs 判决尺回放 Fin 方向 cos 0.9425/相对差 32.5% ⇒ z 是 x 的线性函数,
+# 在 A 输入解最优、部署喂 B 输入 = GE(不吃x)端到端兑现 8.3% 而 z(吃x)只剩 0.2% 的根因。
+# XC 非空 = zcache 走量化链 x(zlayer 只换 x 模式: 学生/教师同 x 重算, 靶=纯量化误差)。
+XC="$D2/xcap_a"; WSX="$WS/layers_xc"
 stage_full4l(){
     [ -s "$ANC" ] || DIE "8192 干净锚缺 $ANC"
     [ -x "$GT/amp/zloss_solve" ] || DIE "zloss_solve 缺"
@@ -140,18 +145,22 @@ stage_full4l(){
       cp dql_L*.bin "$G4/layers/" ) || DIE "注入工作区建失败"
     N=$(ls "$G4/layers"/dql_vq_L*.bin 2>/dev/null | wc -l)
     [ "$N" -eq 43 ] || DIE "层件不齐 $N/43"
-    mkdir -p "$WS/n4l"
-    LOG "①注入工作区就绪(43 层件, 从 vq86h_noz 干净态)"
+    mkdir -p "$WS/n4l" "$WSX"
+    ( cd "$D2/vq86h_noz/layers" || exit 1
+      for f in dql_vq_L*.bin; do ln -f "$f" "$WSX/$f" 2>/dev/null || cp "$f" "$WSX/"; done ) || DIE "layers_xc 建失败"
+    n=$(ls "$XC"/raw_ffn_in_L* 2>/dev/null | wc -l)
+    [ "$n" -eq 43 ] || DIE "量化链 x 捕获不齐 $n/43(先跑 --xcap-out)"
+    LOG "①注入工作区就绪(43 层件) + 量化链 x 捕获 43/43"
     wd_start
     for L in $(seq 0 42); do
         Lz=$(printf '%02d' "$L")
-        if [ ! -s "$WS/layers/zcache_L$Lz.npz" ]; then
-            LOG "L$L zcache 重建"
+        if [ ! -s "$WSX/zcache_L$Lz.npz" ]; then
+            LOG "L$L zcache 重建(量化链 x)"
             env DS4_ZL_NTOK=$NTOK DS4_ZL_NFIT=$NFIT DS4_ZL_FIT_RANGES="$FR" DS4_ZL_EV_RANGE="$ER" \
-                DS4_ZL_CACHE_ONLY=1 "$GT/amp/zlayer" "$HF" "$WS/layers" "$ANC" "$L" 1024 0 \
-                2>&1 | grep -aE "zcache|就绪|Error|assert|★" || DIE "L$L zcache 失败"
+                DS4_ZL_CACHE_ONLY=1 "$GT/amp/zlayer" "$HF" "$WSX" "$ANC" "$L" 1024 0 "$XC" \
+                2>&1 | grep -aE "zcache|就绪|XCAP|只换|Error|assert|★" || DIE "L$L zcache 失败"
         fi
-        "$GT/amp/zloss_solve" --anchor "$ANC" --zcache "$WS/layers" --out "$WS/n4l" \
+        "$GT/amp/zloss_solve" --anchor "$ANC" --zcache "$WSX" --out "$WS/n4l" \
             --layers "$L-$L" --ntok $NTOK --threads 18 --modes 1 \
             --ranks "512" --lambdas "1,3,10,30" \
             --fit-ranges "$FR" --ev-ranges "$ER" --smooth-aug --emit-z "$G4/layers" \
