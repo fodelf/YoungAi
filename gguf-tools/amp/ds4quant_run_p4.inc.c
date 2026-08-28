@@ -269,9 +269,11 @@ static void bytes_moe(lfile_t*lf,int S,const float*Fin,const int*idx,const float
     /* ★逐层口径(2026-08-28 改)★ 原为全程累计, 我曾把它当墙钟误读一次(1731s 实为 20 线程
      * 累计 ÷20 = 87s)。改为每次进本函数清零 + 每层打印, 并显式标注"20线程累计/墙钟"两栏。 */
     { extern double g_bmw_t[2]; g_bmw_t[0]=0; g_bmw_t[1]=0; }
+    double bm_ent=vqt_now();
 #ifdef DS4QUANT_CUDA
     g_bmw_batched=bmw_batch_dequant(lf);
 #endif
+    double bm_deq=vqt_now()-bm_ent;
     float *Fbase=malloc((size_t)S*DIM*4); memcpy(Fbase,Fout,(size_t)S*DIM*4);   /* shared 基 */
     const float *ge=NULL;   /* bf.GE(type-5, 取最后一条): per-expert 增益, 专家累加时乘(链 op 之前) */
     const int lay_skip=replay_layer_skipped();
@@ -297,8 +299,7 @@ static void bytes_moe(lfile_t*lf,int S,const float*Fin,const int*idx,const float
           pthread_create(&th[t],NULL,bmw_reduce_worker,&rs[t]); }
       for(int t=0;t<nth;t++) pthread_join(th[t],NULL);
       free(rs); }
-    fprintf(stderr,"[bm2] 池=%.2f 专家墙钟=%.2f(内 dequant=%.2f 前向墙钟=%.2f) 归约=%.2f\n",
-            bmt_pool,bmt_wk,g_bmw_t[0],g_bmw_t[1]/(double)nth,vqt_now()-bmt1);
+    double bm_red=vqt_now()-bmt1;
     free(ws);free(th);
     /* ★Fcur=专家后·ops前的态(shared+base_routed)=coadapt 的 base态 Fcur★: TREF(type4)按 coadapt 口径
      * 从 Fcur 插值(Fout=Fcur+t·(Fout−Fcur)), 而非从 shared 缩放(否则 t 把 routed 整体放大, 抵消临界点处 Fout 翻倍误差)。*/
@@ -392,6 +393,9 @@ static void bytes_moe(lfile_t*lf,int S,const float*Fin,const int*idx,const float
     }
     if(xn)free(xn); if(pj)free(pj);
     free(Fbase); free(Fcur);
+    fprintf(stderr,"[bm2] 总=%.2f | dequant=%.2f 前段(Fbase+ge扫)=%.2f 池=%.2f 专家墙钟=%.2f 归约=%.2f 尾段(Fcur+回放链)=%.2f | nops=%d\n",
+            vqt_now()-bm_ent, bm_deq, bmt0-bm_ent-bm_deq, bmt_pool, bmt_wk, bm_red,
+            vqt_now()-bmt1-bm_red, lf->nops);
     { int nth2=NTHREADS>0?NTHREADS:1;
       /* ★口径必须显式标注★: dequant 计数器同时接收两条路 —— 批量路(单线程调一次, 值即墙钟)
        * 与逐矩阵回退路(20 线程累计, 要 ÷线程数)。不标 batched 旗标就无法判读, 我曾误读过一次。 */
