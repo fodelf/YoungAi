@@ -115,7 +115,7 @@ endif
 endif
 
 # ---------------------------------------------------------------- 目标分组
-.PHONY: all amp legacy calib bench tools-test go-onebit-test quality-score clean everything
+.PHONY: all amp legacy calib bench tools-test go-onebit-test quality-score clean everything dsq_units_gpu
 .PHONY: deepseek4-quantize-alias anchor_metrics compare_scores ds4quant_run zlayer \
         dql_to_zchain teacher_routed zloss_solve \
         calib_run calib_diag validate_fwd traj_analyze cap_raw2npy vq_blob_truesize dump_gguf_meta \
@@ -351,11 +351,21 @@ vq_em:
 endif
 
 # ---------------------------------------------------------------- 自测(9 项, 纯 C 无模型)
+# ★真层单元针: 编译参数与 ds4quant_run 逐项相同★(铁律 2026-08-28 "单测和生产一套代码")
+# 手拼参数是错误之源(实撞: 漏 -DDQ_BLAS 走标量路 / 漏 BLAS_CFLAGS 报 CblasRowMajor 未定义 /
+# 漏 -lstdc++ 报 __cxa_guard_acquire)。这条规则直接复用 ds4quant_run 的那套。
+dsq_units_gpu: $(QZ)/vq_gpu.o
+	@mkdir -p $(BUILD)
+	$(CC) $(DSQR_FLAGS) $(if $(filter 1,$(HAVE_BLAS)),-DDQ_BLAS -DDS4QUANT_OPENBLAS $(BLAS_CFLAGS)) \
+	    -DDSQ_UNITS_TEST -DDS4QUANT_CUDA -I$(CUDA_HOME)/include \
+	    -o $(BUILD)/dsq_units_gpu $(AMP)/dsq_units.c $(QZ)/vq_gpu.o \
+	    $(CUDA_LIBS) -lcublas -lstdc++ $(BLAS_LIBS) -lm -lpthread
+
 tools-test:
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(NATIVE) $(INC) -DGO1B_TEST    $(QZ)/onebit_quant.c -o $(BUILD)/onebit_test -lm && $(BUILD)/onebit_test
 	$(CC) $(CFLAGS) $(NATIVE) $(INC) -DLINALG_TEST  $(AMP)/linalg_small.c -o $(BUILD)/linalg_test -lm && $(BUILD)/linalg_test
-	$(CC) $(CFLAGS) $(NATIVE) $(INC) -DDSQ_UNITS_TEST $(AMP)/dsq_units.c -o $(BUILD)/dsq_units_test $(BLAS_LIBS) -lpthread -lm && $(BUILD)/dsq_units_test
+	$(CC) $(CFLAGS) $(NATIVE) $(INC) $(if $(filter 1,$(HAVE_BLAS)),-DDQ_BLAS -DDS4QUANT_OPENBLAS $(BLAS_CFLAGS)) -DDSQ_UNITS_TEST $(AMP)/dsq_units.c -o $(BUILD)/dsq_units_test $(BLAS_LIBS) -lpthread -lm && $(BUILD)/dsq_units_test
 	$(CC) $(CFLAGS) $(NATIVE) $(INC) -DPROBE_TEST   $(CAL)/layer_probe.c  -o $(BUILD)/probe_test  -lpthread -lm && $(BUILD)/probe_test
 	$(CC) $(CFLAGS) $(NATIVE) $(INC) -DHVSOLVE_TEST $(AMP)/hiddenvar_solve.c $(AMP)/linalg_small.c -o $(BUILD)/hv_test -lm && $(BUILD)/hv_test
 	$(CC) $(CFLAGS) $(NATIVE) $(INC) -DNPY_TEST     $(CAL)/npy.c -o $(BUILD)/npy_test -lm && $(BUILD)/npy_test
