@@ -837,7 +837,10 @@ stage_probe3(){
     rm -rf "$PW"; mkdir -p "$PW"
     T0=$(date +%s)
     watchdog_start
-    ( cd "$ROOT" && env PROBE1=1 QBIN_OVERRIDE="$ROOT/gguf-tools/amp/ds4quant_run" \
+    # ★闸要发 DS4_MINVOL_MAXL 不是 PROBE1★: quant86 本来就带 DS4_MINVOL=1, C 侧早退闸
+    # (p12) 认的是 DS4_MINVOL_MAXL; PROBE1 是【旧量化段】的开关, 对 quant86 不起作用 ——
+    # 实撞: 发 PROBE1 跑到第 2 层还没停。两个都是既有变量, 不算新增 env。
+    ( cd "$ROOT" && env DS4_MINVOL_MAXL=1 QBIN_OVERRIDE="$ROOT/gguf-tools/amp/ds4quant_run" \
         Q86_IDS="$ID" Q86_S=8192 Q86_NFIT=6144 Q86_ANCHOR="$AN" Q86_OUT="$PW" \
         RPLAN86="$ROOT/gguf/go-onebit/r30/rplan_base86p.txt" VOLB86=76 \
         DS4_BF_MEMGB=55 DS4_THREADS=20 OPENBLAS_NUM_THREADS=1 \
