@@ -279,7 +279,6 @@ static int bmw_batch_dequant(lfile_t*lf,int e0,int e1){
         nj++;
     }
     double bt0=vqt_now();
-    fprintf(stderr,"[bmjob] madvise=%.2f 表构建=%.2f\n",jt_adv,bt0-jt0-jt_adv);
     int ok=vqg_dequant_batch(lf->vqmap,g_bmw_buf,jobs,nj,4,nc_max);
     g_bmw_t[0]+=vqt_now()-bt0;
     return ok;
