@@ -152,6 +152,21 @@ int dsq_quant_matrix(const float *W, int rows, int cols, int dim, int nc,
     free(Cb); free(idx); free(gr); free(Wq);
     return 0;
 }
+
+/* 同上, 但把反量化后的权重写出来(反修要拿量化态权重再前向一遍) */
+int dsq_quant_matrix_wq(const float *W,int rows,int cols,int dim,int nc,float *Wq_out,double *relh)
+{
+    if(!W||!Wq_out||cols%dim) return -1;
+    const int nvec=rows*(cols/dim);
+    float *Cb=malloc((size_t)nc*dim*4); int *idx=malloc((size_t)nvec*4);
+    float *gr=malloc((size_t)rows*4);
+    if(!Cb||!idx||!gr){ free(Cb);free(idx);free(gr); return -1; }
+    vq_encode_full(W,rows,cols,dim,nc,NULL,0,Cb,idx,gr,Wq_out);
+    if(relh){ double e=0,w=0;
+        for(size_t i=0;i<(size_t)rows*cols;i++){ const double d=(double)W[i]-Wq_out[i]; e+=d*d; w+=(double)W[i]*W[i]; }
+        *relh=sqrt(e/(w+1e-30)); }
+    free(Cb);free(idx);free(gr); return 0;
+}
 #endif
 
 /* ══════════════════════════ 自测 ══════════════════════════════════════════ */
@@ -265,9 +280,153 @@ static int t_sweep(void)
     return ok;
 }
 
-int main(void)
+/* ══ 真模型一层模式 ══════════════════════════════════════════════════════════
+ * 用法: dsq_units_test --hf <HF目录> --anchor <锚文件> --layer L [--experts N] [--rows S]
+ * 三段全吃真数据, 各报墙钟 + 质量:
+ *   ①量化 : 从 HF 读第 L 层前 N 个专家的 w1/w3/w2, 逐个走 dsq_quant_matrix
+ *   ②反修 : x 取锚里的 fin[L](★这就是该层 MoE 的真输入★), 路由取 ridx/rw;
+ *           y_fp = FP 专家前向, y_q = 量化权重前向, dH = 差 ⇒ elm_solve
+ *   ③sweep: 用②的真实候选分跑落地决策
+ * 锚布局(ds4quant_anchor.inc.c 逐字):
+ *   [0]u32 hd[8]={'DQA2',S,HCM,DIM,NLAYERS,VOCAB,NACT,_} [32]u64 idh
+ *   [40] fin[NL][S][DIM] | ridx[NL][S][NACT] | rw[NL][S][NACT] | H[NL][S][HCM][DIM] | logits
+ * ★速度口径必须标注★: 本单元的量化走 vq_encode_full 的 CPU 参考路, 生产走 vq_gpu.cu 的
+ * GPU kmeans(实测快一个数量级) —— 这里的秒数不能直接当生产速度用。 */
+#ifdef __APPLE__
+/* macOS 没有 posix_fadvise(ds4_st.c 用它提示内核丢页)。真跑在 spark 上, Mac 只需编过 ⇒ 空操作。 */
+#define POSIX_FADV_DONTNEED 0
+static int posix_fadvise(int fd,long off,long len,int adv){ (void)fd;(void)off;(void)len;(void)adv; return 0; }
+#endif
+#include "../../src/common/ds4_st.c"
+
+static void expert_fwd(const float *x,const float *w1,const float *w3,const float *w2,
+                       const float *ww,float *acc,int n,int D,int M)
+{   /* SwiGLU 专家前向, 与 dq_expert_fp 同式(silu(x@w1)*(x@w3) @ w2ᵀ, 行权在 w2 前乘) */
+    float *g=malloc((size_t)n*M*4),*u=malloc((size_t)n*M*4);
+    dq_matmul(x,w1,g,n,D,M); dq_matmul(x,w3,u,n,D,M);
+    for(size_t i=0;i<(size_t)n*M;i++){ const float t=g[i]; g[i]=(t/(1.0f+expf(-t)))*u[i]; }
+    if(ww) for(int s2=0;s2<n;s2++) for(int j=0;j<M;j++) g[(size_t)s2*M+j]*=ww[s2];
+    float *t2=malloc((size_t)n*D*4);
+    dq_matmul(g,w2,t2,n,M,D);
+    for(size_t i=0;i<(size_t)n*D;i++) acc[i]+=t2[i];
+    free(g);free(u);free(t2);
+}
+
+static int real_layer(const char *hf,const char *anc,int L,int NE,int SROW)
 {
-    printf("== dsq_units 自测(量化/反修/sweep 三单元) ==\n");
+    /* ── 读锚头 ── */
+    FILE *f=fopen(anc,"rb"); if(!f){ printf("锚打不开: %s\n",anc); return 1; }
+    uint32_t hd[8]; uint64_t idh;
+    if(fread(hd,4,8,f)!=8||fread(&idh,8,1,f)!=1){ printf("锚头读失败\n"); fclose(f); return 1; }
+    if(hd[0]!=0x32415144u){ printf("锚 magic 不对 0x%08X\n",hd[0]); fclose(f); return 1; }
+    const int S=(int)hd[1], HCM=(int)hd[2], D=(int)hd[3], NL=(int)hd[4], NACT=(int)hd[6];
+    const int M=2048;                              /* MOEI, 与 p1 一致 */
+    if(L<0||L>=NL){ printf("层号越界 %d/%d\n",L,NL); fclose(f); return 1; }
+    if(SROW<=0||SROW>S) SROW=S;
+    printf("锚: S=%d HCM=%d DIM=%d NLAYERS=%d NACT=%d → 取 L%d 前 %d 行, %d 个专家\n",
+           S,HCM,D,NL,NACT,L,SROW,NE);
+    const size_t fin_b=(size_t)NL*S*D*4, ridx_b=(size_t)NL*S*NACT*4;
+    float *X=malloc((size_t)SROW*D*4);
+    int32_t *RI=malloc((size_t)SROW*NACT*4); float *RW=malloc((size_t)SROW*NACT*4);
+    int rc = fseek(f,40+(long)((size_t)L*S*D*4),SEEK_SET)==0 &&
+             fread(X,4,(size_t)SROW*D,f)==(size_t)SROW*D;
+    rc &= fseek(f,40+(long)fin_b+(long)((size_t)L*S*NACT*4),SEEK_SET)==0 &&
+          fread(RI,4,(size_t)SROW*NACT,f)==(size_t)SROW*NACT;
+    rc &= fseek(f,40+(long)fin_b+(long)ridx_b+(long)((size_t)L*S*NACT*4),SEEK_SET)==0 &&
+          fread(RW,4,(size_t)SROW*NACT,f)==(size_t)SROW*NACT;
+    fclose(f);
+    if(!rc){ printf("锚读失败(文件短?)\n"); return 1; }
+
+    st_ctx C; memset(&C,0,sizeof C); st_open(&C,hf);
+    float *YQ=calloc((size_t)SROW*D,4), *YF=calloc((size_t)SROW*D,4);
+    double relh_sum=0; size_t bytes=0; int nq=0;
+    int *tok=malloc((size_t)SROW*4); float *ww=malloc((size_t)SROW*4);
+    float *xs=malloc((size_t)SROW*D*4), *Wq=malloc((size_t)M*D*4);
+
+    /* ── ①量化 ── */
+    const double t0=vqt_now();
+    for(int e=0;e<NE;e++){
+        char n1[192],n3[192],n2[192]; long r,c;
+        snprintf(n1,sizeof n1,"layers.%d.ffn.experts.%d.w1.weight",L,e);
+        snprintf(n3,sizeof n3,"layers.%d.ffn.experts.%d.w3.weight",L,e);
+        snprintf(n2,sizeof n2,"layers.%d.ffn.experts.%d.w2.weight",L,e);
+        float *e1=st_read_weight(&C,n1,&r,&c), *e3=st_read_weight(&C,n3,&r,&c),
+              *e2=st_read_weight(&C,n2,&r,&c);
+        if(!e1||!e3||!e2){ printf("专家 %d 权重缺\n",e); free(e1);free(e3);free(e2); break; }
+        double rh; size_t bt;
+        for(int w=0;w<3;w++){
+            const float *W = w==0?e1:(w==1?e3:e2);
+            const int rows = w==2?D:M, cols = w==2?M:D;
+            if(dsq_quant_matrix(W,rows,cols,4,512,NULL,0,&rh,&bt)==0){
+                relh_sum+=rh; bytes+=bt; nq++; }
+        }
+        /* 本专家的 token 集合(路由命中), FP 与量化各前向一遍 */
+        int nt=0;
+        for(int s2=0;s2<SROW;s2++) for(int a2=0;a2<NACT;a2++)
+            if(RI[(size_t)s2*NACT+a2]==e){ tok[nt]=s2; ww[nt]=RW[(size_t)s2*NACT+a2];
+                memcpy(xs+(size_t)nt*D,X+(size_t)s2*D,(size_t)D*4); nt++; break; }
+        if(nt){
+            float *aF=calloc((size_t)nt*D,4), *aQ=calloc((size_t)nt*D,4);
+            expert_fwd(xs,e1,e3,e2,ww,aF,nt,D,M);
+            /* 量化态 w2(最肥的那个)重建后前向, w1/w3 用 FP —— 隔离出 w2 的量化误差 */
+            double rh2; dsq_quant_matrix_wq(e2,D,M,4,512,Wq,&rh2);
+            expert_fwd(xs,e1,e3,Wq,ww,aQ,nt,D,M);
+            for(int i=0;i<nt;i++) for(int d=0;d<D;d++){
+                YF[(size_t)tok[i]*D+d]+=aF[(size_t)i*D+d];
+                YQ[(size_t)tok[i]*D+d]+=aQ[(size_t)i*D+d]; }
+            free(aF);free(aQ);
+        }
+        free(e1);free(e3);free(e2);
+    }
+    const double t1=vqt_now();
+    if(!nq){ printf("★量化 0 个矩阵 —— HF 路径或层号不对★\n"); return 1; }
+    printf("①量化   %6.1fs  %d 个矩阵  平均relh=%.4f  载荷=%.1f MiB  (★CPU 参考路, 生产走 GPU★)\n",
+           t1-t0, nq, relh_sum/nq, bytes/1048576.0);
+
+    /* ── ②反修 ── */
+    float *DH=malloc((size_t)SROW*D*4);
+    for(size_t i=0;i<(size_t)SROW*D;i++) DH[i]=YF[i]-YQ[i];
+    double eq=0,ef=0; for(size_t i=0;i<(size_t)SROW*D;i++){ eq+=(double)DH[i]*DH[i]; ef+=(double)YF[i]*YF[i]; }
+    const int vs=(SROW*3)/4;
+    elm_res er; const double t2=vqt_now();
+    const int erc = elm_solve(X,YQ,DH,SROW,D,vs,&er);
+    const double t3=vqt_now();
+    if(erc==0){
+        printf("②反修   %6.1fs  held行为挽回=%.2f%%  @V₀=%s λ=%g k=%d | 乘性线性对照=%.2f%%\n",
+               t3-t2, er.held*100.0, er.from_pca?"PCA":"rand", (double)er.lam, er.k, er.held_lin*100.0);
+        printf("         量化误差基线: ‖dH‖/‖y_fp‖=%.4f (fit=%d行 held=%d行)\n",
+               sqrt(eq/(ef+1e-30)), vs, SROW-vs);
+    } else printf("②反修   %6.1fs  解算失败(rc=%d)\n", t3-t2, erc);
+
+    /* ── ③sweep ── */
+    const double t4=vqt_now();
+    double base=1.0, cand[3]={ 1.0-er.held, 1.0-er.held_lin, 1.0 };
+    int win=-1; double ws=0;
+    const int land=dsq_sweep_pick(base,cand,3,0.05,&win,&ws);
+    const int commit=dsq_sweep_commit(base,ws);
+    const double t5=vqt_now();
+    printf("③sweep  %6.3fs  候选{ELM %.4f, 线性 %.4f, 基线 %.4f} → %s(win=%d ws=%.4f) 终验=%s\n",
+           t5-t4, cand[0],cand[1],cand[2], land?"落地":"不落地", win, ws, commit?"提交":"回滚");
+    if(erc==0) elm_free(&er);
+    free(X);free(RI);free(RW);free(YQ);free(YF);free(DH);free(tok);free(ww);free(xs);free(Wq);
+    return 0;
+}
+
+int main(int argc, char **argv)
+{
+    const char *hf=NULL,*anc=NULL; int L=0,NE=8,SROW=0;
+    for(int i=1;i<argc-1;i++){
+        if(!strcmp(argv[i],"--hf")) hf=argv[i+1];
+        else if(!strcmp(argv[i],"--anchor")) anc=argv[i+1];
+        else if(!strcmp(argv[i],"--layer")) L=atoi(argv[i+1]);
+        else if(!strcmp(argv[i],"--experts")) NE=atoi(argv[i+1]);
+        else if(!strcmp(argv[i],"--rows")) SROW=atoi(argv[i+1]);
+    }
+    if(hf&&anc){
+        printf("== dsq_units 真模型一层(L%d) ==\n",L);
+        return real_layer(hf,anc,L,NE,SROW);
+    }
+    printf("== dsq_units 自测(量化/反修/sweep 三单元, 合成数据) ==\n");
     int ok = 1;
     ok &= t_quant();
     ok &= t_backfit();
