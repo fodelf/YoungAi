@@ -124,6 +124,7 @@ stage_quant(){
     LOG "量化 rc=$?"
 }
 
+# 额外 CLI 参数(如 --elm-probe 2,20,40)原样透传给 QBIN。走位置参数不走 env —— 铁律 08-22。
 stage_backfit(){
     N=$(ls "$OUTF"/layers/dql_L*.bin 2>/dev/null | wc -l | tr -d ' ')
     # PROBE1 的语义是"只反修 L00"(下面 DS4_NL=1), 不是"只有一层层件"。原闸写成 EXPN=1 是
@@ -182,7 +183,7 @@ stage_backfit(){
     [ -n "${DS4_ANCHOR_ROUTE:-}" ] || { LOG "★DS4_ANCHOR_ROUTE 不在场 — 停★"; exit 8; }
     [ -n "${PROBE1:-}" ] && { export DS4_NL=1; LOG "★探针模式: 只反修 L00(DS4_NL=1)★"; }
     LOG "反修起跑"
-    "$QBIN" "$IDS" "${BF_S:-1716}"
+    "$QBIN" "$IDS" "${BF_S:-1716}" "$@"
     LOG "反修 rc=$?"
 }
 
@@ -613,7 +614,7 @@ case "${1:-all}" in
     sweep)   stage_sweep ;;
     quant)   WDOG & trap 'kill %1 2>/dev/null||true' EXIT; stage_quant ;;
     qbackup) stage_qbackup ;;
-    backfit) WDOG & trap 'kill %1 2>/dev/null||true' EXIT; stage_backfit ;;
+    backfit) shift; WDOG & trap 'kill %1 2>/dev/null||true' EXIT; stage_backfit "$@" ;;
     probe1bf) # ★反修段单层复跑(SIGSEGV 归因探针): 只跑 stage_backfit(PROBE1), 产物需已在场★
              WDOG & trap 'kill %1 2>/dev/null||true' EXIT
              export PROBE1=1

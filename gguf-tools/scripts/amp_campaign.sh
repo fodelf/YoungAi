@@ -644,6 +644,7 @@ stage_champbf(){
     export OPENBLAS_NUM_THREADS=1 DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-0731"
     # 这四个必须不在场, 否则 backfit 走错分支(段内自带硬闸会停)
     unset DS4_TUNE DS4_MINVOL DS4_MV_BASELINE DS4_VQ_RPLAN
+    shift 2 2>/dev/null || true       # 余下参数原样透传给 QBIN(如 --elm-probe 2,20,40)
     local PB=""; [ "$MODE" = probe ] && PB=1
     # 纯 VQ 底座无 go2b 热专家 ⇒ 关 GO2B_HOT(冠军底座是 go2b 热, 这是底座差异不是配方改动)
     local G2H=0
@@ -652,7 +653,7 @@ stage_champbf(){
     ( cd "$ROOT" && env ${PB:+PROBE1=1} OUTF_OVERRIDE="$OUT" ANCHOR_OVERRIDE="$D2/anchor_a_clean_s8192.bin" \
         IDS_OVERRIDE="$D2/vqhalf_a.ids" BF_S=8192 BF_NFIT=6144 DS4_THREADS=20 \
         QBIN_OVERRIDE="$ROOT/gguf-tools/amp/ds4quant_run" DS4_GSWEEP=0 DS4_GO2B_HOT=$G2H \
-        bash "$SC/r30_campaign.sh" backfit ) > "$OUT/backfit.log" 2>&1
+        bash "$SC/r30_campaign.sh" backfit "$@" ) > "$OUT/backfit.log" 2>&1
     # ★别用管道包 tail★(2026-08-27 实撞): 管道把 stderr 全缓冲, 跑一小时看不到任何逐层进度,
     # 违反"长任务必须逐单元可观测"铁律。改为直接落盘 —— 跑中随时 tail -f 看真进度。
     tail -40 "$OUT/backfit.log"
@@ -810,6 +811,30 @@ stage_judge3(){
         grep -aE "PPL\(student\)|分布还原率|Mean KLD|Same top" "/tmp/j3_$B.log"
     done
     echo "★注: 这是同域尺, 不取代 wt2 官方判决 —— 两个数一起看★"
+}
+
+# ═══ ELM 针(2026-08-28 用户令"1、2 打一针再决策")═══
+# 要回答两件事, 都靠同一次跑的读数, 不靠推理:
+#   ①ELM 闭式乘性非线性 z 在【本底座本语料】上 held 行为挽回能不能上 10%
+#     (历史 L35=+12.02% / L40 全场景=+14.1%, 但那是单层探针, 本底座没验过)
+#   ②同口径【乘性线性】对照打多少(判例 +0.6%) —— 若两者接近, 说明 tanh 在这个底座上没肉,
+#     ELM 整条路要重估; 若拉开数量级, 八要件里的"非线性"就坐实了。
+# 针只读不写: 不落侧车、不改层件、不动模型。层选 L2/L20/L40(与历史三层针同位置, 可直接对表)。
+# 前置: ①反修锚必须与 vqhalf_a.ids 配套(anchors3) ②层件必须是纯净量化态(champreset)。
+stage_elmprobe(){
+    local D2="$ROOT/gguf/go-onebit/vqhalf"
+    local W="$D2/champ86"
+    local AN="$D2/anchor_a_clean_s8192.bin"
+    local ID="$D2/vqhalf_a.ids"
+    [ -s "$AN" ] && [ "$AN" -nt "$ID" ] || DIE "反修锚缺或比 ids 旧, 先跑 anchors3"
+    [ "$(ls "$W/layers"/dql_vq_L*.bin 2>/dev/null | wc -l)" = 43 ] || DIE "层件不齐, 先量化"
+    LOG "层件复位到纯净量化态(针不能吃带反修 op 的层件)"
+    stage_champ_reset
+    LOG "ELM 针发车: L2/L20/L40, 历史对表 编程 7.5/5.1/12.0 · 全场景 6.8/4.7/12.3"
+    stage_champbf champ86 full --elm-probe 2,20,40
+    echo "══ ELM 针结果 ══"
+    grep -aE "^★ELM " "$W/backfit.log" || echo "(没有 ELM 行 —— 钩子没触发, 查 --elm-probe 是否透传到 QBIN)"
+    echo "★读法: held ≥10% ⇒ 八要件成立可上全量; 若与'乘性线性对照'接近 ⇒ tanh 无肉, 整条路重估★"
 }
 
 # ═══ champ3: 三份语料全链一条龙(2026-08-28 用户令"三份 8192 每个域都有")═══
@@ -995,7 +1020,7 @@ ST="${1:-all}"
 case "$ST" in
   preflight) stage_preflight;; ids) stage_ids;; anchor) stage_anchor;;
   capture) stage_capture;; probe) stage_probe;; solve) stage_solve;; pass2) stage_pass2;;
-  chain) stage_chain;; judge) stage_judge;; dilute) stage_dilute;; idshalf) stage_idshalf;; idshalf_ext) shift; stage_idshalf_ext "$@";; vqquant) stage_vqquant;; vqmerge) stage_vqmerge;; vqcap) stage_vqcap;; vqsolve) stage_vqsolve;; dynladder) stage_dynladder;; dynquant) shift; stage_dynquant "$@";; dynjudge) stage_dynjudge;; champbf) shift; stage_champbf "$@";; champ86) stage_champ86;; champreset) stage_champ_reset;; champ3rd) stage_champ3rd;; corpdiff) stage_corpdiff;; anchors3) stage_anchors3;; champ3) stage_champ3;; judge3) shift; stage_judge3 "$@";; champrb) stage_champ_rbsweep;; full) shift; stage_full "$@";;
+  chain) stage_chain;; judge) stage_judge;; dilute) stage_dilute;; idshalf) stage_idshalf;; idshalf_ext) shift; stage_idshalf_ext "$@";; vqquant) stage_vqquant;; vqmerge) stage_vqmerge;; vqcap) stage_vqcap;; vqsolve) stage_vqsolve;; dynladder) stage_dynladder;; dynquant) shift; stage_dynquant "$@";; dynjudge) stage_dynjudge;; champbf) shift; stage_champbf "$@";; champ86) stage_champ86;; champreset) stage_champ_reset;; champ3rd) stage_champ3rd;; corpdiff) stage_corpdiff;; anchors3) stage_anchors3;; champ3) stage_champ3;; elmprobe) stage_elmprobe;; judge3) shift; stage_judge3 "$@";; champrb) stage_champ_rbsweep;; full) shift; stage_full "$@";;
   all) stage_preflight; stage_ids; stage_anchor; stage_capture
        stage_solve; stage_chain; stage_judge;;
   *) echo "未知段: $ST"; echo "段: preflight ids anchor capture solve pass2 chain judge dilute all (probe/dilute=诊断)"; exit 2;;
