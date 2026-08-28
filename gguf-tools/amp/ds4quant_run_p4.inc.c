@@ -348,8 +348,15 @@ static void bytes_moe(lfile_t*lf,int S,const float*Fin,const int*idx,const float
     if(xn)free(xn); if(pj)free(pj);
     free(Fbase); free(Fcur);
     { int nth2=NTHREADS>0?NTHREADS:1;
-      fprintf(stderr,"[bmwt] 本层 dequant=%.2fs 前向=%.2fs (20线程累计) | 墙钟约 %.2f/%.2fs\n",
-              g_bmw_t[0],g_bmw_t[1],g_bmw_t[0]/nth2,g_bmw_t[1]/nth2); }
+      /* ★口径必须显式标注★: dequant 计数器同时接收两条路 —— 批量路(单线程调一次, 值即墙钟)
+       * 与逐矩阵回退路(20 线程累计, 要 ÷线程数)。不标 batched 旗标就无法判读, 我曾误读过一次。 */
+      fprintf(stderr,"[bmwt] 本层 batched=%d dequant=%.2fs 前向=%.2fs(20线程累计,墙钟约%.2f)\n",
+#ifdef DS4QUANT_CUDA
+              g_bmw_batched,
+#else
+              0,
+#endif
+              g_bmw_t[0],g_bmw_t[1],g_bmw_t[1]/nth2); }
 }
 /* 可复用调优轮(GL重拟合→GLdyn2→GLdyn8→TREF), 循环至整轮零接管; 返回是否有过接管 */
 typedef struct { int L,S,n_fit,vs; size_t rowsz; double bval,bheld;
