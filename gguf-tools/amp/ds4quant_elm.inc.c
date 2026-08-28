@@ -239,7 +239,9 @@ static int elm_solve(const float *X, const float *YQ, const float *DH,
     double *ZtR = malloc((size_t)K*D*sizeof(double));
     double *G   = malloc((size_t)K*K*sizeof(double));
     double *Ub  = malloc((size_t)K*D*sizeof(double));
-    double *gac = malloc((size_t)nev*D*sizeof(double));   /* 前缀 k 的累加增益 */
+    float  *gacf = malloc((size_t)nev*D*4);              /* 网格点增益(GEMM 输出) */
+    float  *UbT  = malloc((size_t)D*K*4);                /* Ub[K][D] 的转置视图, GEMM 右操作数 */
+    float  *ZeK  = malloc((size_t)nev*K*4);              /* Ze 的前 k 列紧凑副本(行距要连续) */
     out->held = -1e300;
 
     for(int variant=0; variant<2; variant++){
@@ -279,18 +281,23 @@ static int elm_solve(const float *X, const float *YQ, const float *DH,
                     free(B);
                 }
                 /* k 是前缀: 按列秩-1 累加, 在网格点上评 held(免得每个 k 重算整个矩阵乘) */
-                memset(gac, 0, (size_t)nev*D*sizeof(double));
-                int gi = 0;
-                for(int c=0;c<K && gi<7; c++){
-                    { elma_ctx ac={Ze,Ub+(size_t)c*D,gac,K,D,c}; zpar_for(nev,20,elma_worker,&ac); }
-                    if(c+1 != ELM_KGRID[gi]) continue;
-                    const int kk = ELM_KGRID[gi++];
+                /* ★k 网格改按点 GEMM(铁律: 只有 GPU 版本)★ 原来是"按列秩-1 累加, 到网格点取快照",
+                 * 省 flops 但全是 CPU 标量(K×nev×D×5λ×3支 ≈ 1.6e10, 实测占反修剩余时间一半)。
+                 * 改成每个网格点直接 g_k = Ze[:, :k]·U[:k,:] 一次 GEMM: flops 多 2.7 倍, 但走
+                 * 生产 dq_matmul(cuBLAS/BLAS)后净快得多。★数值等价★: 同样是前 k 列的和。 */
+                for(int gi=0; gi<7; gi++){
+                    const int kk = ELM_KGRID[gi];
+                    if(kk > K) break;
+                    /* dq_matmul(A[S,K],B[M,K]) = A·Bᵀ ⇒ 要 UbT[D][kk](Ub 是 [K][D]) */
+                    for(int d=0;d<D;d++) for(int c=0;c<kk;c++) UbT[(size_t)d*kk+c]=(float)Ub[(size_t)c*D+d];
+                    for(int i=0;i<nev;i++) memcpy(ZeK+(size_t)i*kk, Ze+(size_t)i*K, (size_t)kk*4);
+                    dq_matmul(ZeK, UbT, gacf, nev, kk, D);  /* g[nev,D] = ZeK[nev,kk]·UbT[D,kk]ᵀ */
                     double err = 0.0;
                     for(int i=0;i<nev;i++){
                         const float *yq = YQ + (size_t)(ev0+i)*D, *dh = DH + (size_t)(ev0+i)*D;
-                        const double *ga = gac + (size_t)i*D;
+                        const float *ga = gacf + (size_t)i*D;
                         for(int d=0;d<D;d++){
-                            const double g2 = ga[d]/colw[d];
+                            const double g2 = (double)ga[d]/colw[d];
                             const double e2 = (double)dh[d] - (double)yq[d]*g2;  /* y_fp−ŷ */
                             err += e2*e2;
                         }
@@ -313,7 +320,7 @@ static int elm_solve(const float *X, const float *YQ, const float *DH,
         }
     }
     free(R);free(eps);free(colw);free(Xa);free(Ra);free(Vp);free(Vr);
-    free(Za);free(Ze);free(ZtZ);free(ZtR);free(G);free(Ub);free(gac);
+    free(Za);free(Ze);free(ZtZ);free(ZtR);free(G);free(Ub);free(gacf);free(UbT);free(ZeK);
     free(V0T);free(ZaT);free(RaT);
     return out->V0 ? 0 : -1;
 }
