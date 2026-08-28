@@ -15,9 +15,13 @@
  *
  * 自测: make -C gguf-tools tools-test 会带上 -DDSQ_UNITS_TEST 编译本文件并跑。
  */
-/* Linux 上 -std=c11 是严格 ISO 模式, POSIX 的 clock_gettime/pwrite 不会暴露
- * (vq_qc.h 两处都要)。必须在任何 include 之前开。 */
-#define _POSIX_C_SOURCE 200809L
+/* Linux 上 -std=c11 是严格 ISO 模式, clock_gettime/pwrite/_SC_NPROCESSORS_ONLN 都不暴露
+ * (vq_qc.h 与 ds4quant_fwd 都要)。★用 _GNU_SOURCE 不用 _POSIX_C_SOURCE★:
+ * 后者只开 POSIX, _SC_NPROCESSORS_ONLN 是 GNU/BSD 扩展, 仍然被挡(实撞)。
+ * macOS 默认全暴露, 不需要任何宏。 */
+#if defined(__linux__)
+#define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -82,44 +86,22 @@ int dsq_sweep_commit(double before, double after)
 
 /* ── 量化单元实现 ─────────────────────────────────────────────────────────── */
 #ifndef DSQ_UNITS_NO_VQ
-/* vq_qc.h 依赖三样外部原语。生产里它们来自 ds4quant_fwd(GPU/BLAS 路)、onebit_quant、
- * go2b_qc; 本单元只要【数值正确】不要快, 所以给参考实现, 免得把半个引擎拖进来。
- *   dq_matmul: out[S,M] = x[S,K] · w[M,K]ᵀ (与 ds4quant_fwd_p1 的标量参考路逐式同)
- *   fp16 往返: 码本存 fp16, 量化误差里包含这一步, 不能省
- *   g2_inv   : 小矩阵求逆(Gauss-Jordan), 只在 vq 的 Hessian 加权支用到 */
-#include "../quantize/onebit_quant.h"
-/* g2_hot_slot: vq_qc.h 的【侧车字节偏移】辅助要它(冷热专家分档), 本单元只用
- * encode/pack/unpack 三条, 走不到那里。给个"全冷"桩, 语义明确不静默。 */
-static int g2_hot_slot(int L,int e){ (void)L; (void)e; return -1; }
-/* 同理: 热档位查询也只在侧车偏移那条路上用到, 本单元的档位由调用方直接传 dim/nc。 */
-static int vq_hot_dim(void){ return 4; }
-static int vq_hot_nc(void){ return 512; }
-static int vq_w2_dim(void){ return 4; }
-static int vq_w2_nc(void){ return 512; }
-/* vq_cold_dim/nc 由 vq_qc.h 自己定义, 不重复 */
-static void dq_matmul(const float *x,const float *w,float *o,int S,int K,int M){
-    for(int s=0;s<S;s++) for(int m=0;m<M;m++){ float a2=0;
-        for(int k=0;k<K;k++) a2 += x[(size_t)s*K+k]*w[(size_t)m*K+k];
-        o[(size_t)s*M+m]=a2; }
-}
-static int g2_inv(const double *A,int n,double *Ai){
-    double *M2=malloc((size_t)n*2*n*sizeof(double)); if(!M2) return -1;
-    for(int i=0;i<n;i++){ for(int j=0;j<n;j++) M2[(size_t)i*2*n+j]=A[(size_t)i*n+j];
-        for(int j=0;j<n;j++) M2[(size_t)i*2*n+n+j]=(i==j)?1.0:0.0; }
-    for(int c=0;c<n;c++){
-        int p=c; for(int r=c+1;r<n;r++) if(fabs(M2[(size_t)r*2*n+c])>fabs(M2[(size_t)p*2*n+c])) p=r;
-        if(fabs(M2[(size_t)p*2*n+c])<1e-300){ free(M2); return -1; }
-        if(p!=c) for(int j=0;j<2*n;j++){ double t=M2[(size_t)c*2*n+j];
-            M2[(size_t)c*2*n+j]=M2[(size_t)p*2*n+j]; M2[(size_t)p*2*n+j]=t; }
-        const double d=M2[(size_t)c*2*n+c];
-        for(int j=0;j<2*n;j++) M2[(size_t)c*2*n+j]/=d;
-        for(int r=0;r<n;r++){ if(r==c) continue; const double f=M2[(size_t)r*2*n+c];
-            if(f==0.0) continue;
-            for(int j=0;j<2*n;j++) M2[(size_t)r*2*n+j]-=f*M2[(size_t)c*2*n+j]; }
-    }
-    for(int i=0;i<n;i++) for(int j=0;j<n;j++) Ai[(size_t)i*n+j]=M2[(size_t)i*2*n+n+j];
-    free(M2); return 0;
-}
+/* ★单元测试与生产必须是同一套代码★(铁律 2026-08-28 用户令"一套代码一套速度和质量")
+ * 原来这里为了"能编过"写了 dq_matmul / g2_inv / g2_hot_slot / vq_hot_* 一堆参考实现桩,
+ * 结果就是【两套实现】: 生产走 ds4quant_fwd 的 cuBLAS dq_matmul 与 go2b_qc 的真 g2_inv,
+ * 单测走我的标量版 —— 速度差一个数量级、数值也不保证一致, 测了等于没测。
+ * 现在全部换成生产同一份源码:
+ *   DIM/MOEI      与 ds4quant_run_p1 同值(它们是编译期常量, ds4quant_fwd 要)
+ *   dq_matmul     ← ds4quant_fwd.c(带 -DDS4QUANT_CUDA 时是 cuBLAS 路)
+ *   g2_inv/g2_hot_slot/vq_hot_* ← go2b_qc.h(生产同一份)
+ * ★include 顺序照抄 ds4quant_run_p1(27→28→30→167)★: fwd 在前, DIM/MOEI 的
+ * #define 必须排在它们【之后】—— dq_expert_fp 的形参名就叫 DIM/MOEI, 先 define 会把
+ * 函数签名撞碎(实撞: "expected ')'" + swlim undeclared)。go2b_qc.h 用 dq_matmul, 也得在后。 */
+#include "ds4quant_fwd.c"
+#include "../quantize/onebit_quant.c"
+#include "../quantize/go2b_qc.h"
+#define DIM  4096
+#define MOEI 2048
 #include "../quantize/vq_qc.h"
 
 int dsq_quant_matrix(const float *W, int rows, int cols, int dim, int nc,
