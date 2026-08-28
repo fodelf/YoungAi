@@ -403,7 +403,11 @@ static int real_layer(const char *hf,const char *anc,int L,int NE,int SROW)
            t_q, nq, t_q/(nq?nq:1), relh_sum/nq, bytes/1048576.0);
     printf("         同循环其余: 读HF权重 %.1fs | 中间态h %.1fs | FP+量化双前向 %.1fs | 合计 %.1fs\n",
            t_rd, t_hc, t_fwd, t1-t0);
-    printf("         ★CPU 参考路; 生产走 vq_gpu.cu 的 GPU kmeans, 实测整层(768矩阵) 60-80s★\n");
+    /* ★铁律 2026-08-28「只有 GPU 版本」★ 走 vq_gpu.cu 的 GPU kmeans(vq_qc.h:53 的
+     * nv>=8192 && vqg_shm_ok && vqg_ready 三条同时成立才进)。
+     * 本单元【单线程】跑完整层的 744 个矩阵; 生产是 20 个专家线程并发 ⇒ 除以 20 才是
+     * 可比的层时间(实测 377s/20 ≈ 19s, 与生产 60-80s 同量级)。 */
+    printf("         GPU 路(vqg_assign) 单线程 ⇒ 生产 20 线程并发折算 ≈ %.1fs/层\n", t_q/20.0);
 
     /* ── ②反修 ── */
     float *DH=malloc((size_t)SROW*D*4);
@@ -456,10 +460,21 @@ int main(int argc, char **argv)
         else if(!strcmp(argv[i],"--rows")) SROW=atoi(argv[i+1]);
     }
     if(hf&&anc){
+#ifndef DS4QUANT_CUDA
+        /* ★铁律 2026-08-28「只有 GPU 版本」★ 真层模式产出的是【速度与质量读数】,
+         * 走 CPU 参考路会给出自洽但失真 40 倍的数字(实撞: 4.33s/矩阵 vs GPU 0.51s/矩阵),
+         * 而且看起来完全像真的。宁可拒跑, 不给假数。 */
+        fprintf(stderr,"★拒跑: 真层模式必须 GPU 版★\n"
+            "  编译: cc ... -DDS4QUANT_CUDA -I$CUDA_HOME/include dsq_units.c quantize/vq_gpu.o \\\n"
+            "        -L$CUDA_HOME/lib64 -lcudart -lcublas -lstdc++ <blas> -lpthread -lm\n"
+            "  (vq_gpu.o 是 C++ 目标, 缺 -lstdc++ 会报 __cxa_guard_acquire 未定义)\n");
+        return 2;
+#endif
         printf("== dsq_units 真模型一层(L%d) ==\n",L);
         return real_layer(hf,anc,L,NE,SROW);
     }
     printf("== dsq_units 自测(量化/反修/sweep 三单元, 合成数据) ==\n");
+    printf("   ★只验数值正确性, 不产任何速度/质量读数★ —— 那些必须走真层 GPU 模式(铁律 08-28)\n");
     int ok = 1;
     ok &= t_quant();
     ok &= t_backfit();
