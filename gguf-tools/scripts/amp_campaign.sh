@@ -541,6 +541,7 @@ stage_champbf(){
     local OUT
     case "$V" in
       vq86h_noz) OUT="$D2/vq86h_noz";;
+      champ86)   OUT="$D2/champ86";;    # 平权底座工作副本(原始 vq86h_noz 只读保全)
       *)         OUT="$D2/dyn86/$V";;
     esac
     [ "$(ls "$OUT/layers"/dql_L*.bin 2>/dev/null | wc -l)" = 43 ] || DIE "层件不齐 $OUT/layers"
