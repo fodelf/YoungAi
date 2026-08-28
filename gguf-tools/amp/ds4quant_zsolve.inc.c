@@ -31,12 +31,37 @@ static void zg_worker(void *vc,int a0,int a1){ zg_ctx*c=(zg_ctx*)vc;
 typedef struct { const double*G; const float*R; double*al; uint32_t n,d_out; } zs_ctx;
 static void cholesky_solve(const double *L, uint32_t d, double *b);   /* ds4_z.c 同-TU 原语(本就 const) */
 #define cholesky_solve_nc cholesky_solve
+/* ★多右端项回代(2026-08-28)★ 原来是每一列 j 单独调一次 cholesky_solve, 而每次调用都要把
+ * 整个下三角 L(n×n double = 4608²×8 ≈ 170MB)从头扫到尾。d_out=4096 列 ⇒ 20 线程合计
+ * 把这 170MB 读了 4096 遍 ≈ 700GB, 时间全在搬 L 而不是算。
+ * 一次解 NR=16 列: L 的每个元素读进来立刻服务 16 个右端项, 流量降 16 倍。
+ * ★逐位不变★: 单看任意一列, 前代/回代对 k 的累加次序与 cholesky_solve 一字不差,
+ * 只是把"列"这一维提到了内层。 */
+#define ZS_NR 16
+static void chol_solve_multi(const double*L, uint32_t d, double*B, int nr){
+    double v[ZS_NR];
+    for(uint32_t i=0;i<d;i++){                      /* forward: L y = b */
+        for(int r=0;r<nr;r++) v[r]=B[(size_t)i*nr+r];
+        for(uint32_t k=0;k<i;k++){ const double lik=L[(size_t)i*d+k]; const double*Bk=B+(size_t)k*nr;
+            for(int r=0;r<nr;r++) v[r]-=lik*Bk[r]; }
+        const double dg=L[(size_t)i*d+i];
+        for(int r=0;r<nr;r++) B[(size_t)i*nr+r]=v[r]/dg; }
+    for(uint32_t ii=d;ii-->0;){                     /* backward: L^T w = y */
+        for(int r=0;r<nr;r++) v[r]=B[(size_t)ii*nr+r];
+        for(uint32_t k=ii+1;k<d;k++){ const double lki=L[(size_t)k*d+ii]; const double*Bk=B+(size_t)k*nr;
+            for(int r=0;r<nr;r++) v[r]-=lki*Bk[r]; }
+        const double dg=L[(size_t)ii*d+ii];
+        for(int r=0;r<nr;r++) B[(size_t)ii*nr+r]=v[r]/dg; } }
 static void zs_worker(void *vc,int j0,int j1){ zs_ctx*c=(zs_ctx*)vc;
-    double *cc=malloc((size_t)c->n*sizeof(double));
-    for(int j=j0;j<j1;j++){ for(uint32_t a=0;a<c->n;a++) cc[a]=c->R[(size_t)a*c->d_out+j];
-        cholesky_solve_nc(c->G,c->n,cc);
-        for(uint32_t a=0;a<c->n;a++) c->al[(size_t)a*c->d_out+j]=cc[a]; }
-    free(cc); }
+    double *B=malloc((size_t)c->n*ZS_NR*sizeof(double));
+    for(int jb=j0;jb<j1;jb+=ZS_NR){
+        const int nr=(jb+ZS_NR<j1)?ZS_NR:(j1-jb);
+        for(uint32_t a=0;a<c->n;a++){ const float*Ra=c->R+(size_t)a*c->d_out+jb;
+            for(int r=0;r<nr;r++) B[(size_t)a*nr+r]=Ra[r]; }
+        chol_solve_multi(c->G,c->n,B,nr);
+        for(uint32_t a=0;a<c->n;a++){ double*ala=c->al+(size_t)a*c->d_out+jb;
+            for(int r=0;r<nr;r++) ala[r]=B[(size_t)a*nr+r]; } }
+    free(B); }
 typedef struct { const float*X; const double*al; float*W; uint32_t n,d_in,d_out; } zw_ctx;
 /* ★W=Xᵀα 的访存重排(2026-08-28)★
  * 原来是 for(i){ for(a){ 整行 α[a][0..d_out) } }: α 是 n×d_out 的 double = 4608×4096×8
