@@ -48,6 +48,16 @@ static int elm_probe_hit(int L){
 }
 static void elm_free(elm_res *r){ if(!r) return; free(r->V0); free(r->U); r->V0=NULL; r->U=NULL; }
 
+/* ── 并行核: 投影后的逐元素定标+激活 z = tanh(a/s)(投影本身交给生产 dq_matmul) ── */
+typedef struct { float *Z; int K; float inv_s; int do_tanh; } elmt_ctx;
+static void elmt_worker(void *vc, int r0, int r1){
+    elmt_ctx *c=(elmt_ctx*)vc;
+    for(int r=r0;r<r1;r++){
+        float *z = c->Z + (size_t)r*c->K;
+        if(c->do_tanh) for(int j=0;j<c->K;j++) z[j] = tanhf(z[j]*c->inv_s);
+        else           for(int j=0;j<c->K;j++) z[j] = z[j]*c->inv_s;
+    }
+}
 /* ── 并行核: Za = tanh(Xa·V0/s) ─────────────────────────────────────────── */
 typedef struct { const float *Xa, *V0; float *Za; int D, K; float inv_s; int do_tanh; } elmz_ctx;
 static void elmz_worker(void *vc, int r0, int r1){
@@ -220,6 +230,11 @@ static int elm_solve(const float *X, const float *YQ, const float *DH,
 
     /* ⑤⑥⑧ 对两套 V₀ 各扫 λ×k, held 择优 */
     float *Za = malloc((size_t)na*K*4), *Ze = malloc((size_t)nev*K*4);
+    /* GEMM 要的转置视图: dq_matmul(A[S,K],B[M,K]) 算 A·Bᵀ, 所以右操作数得是 [M][K] 布局 */
+    float *V0T = malloc((size_t)K*D*4);      /* V₀[D][K] → [K][D] */
+    float *ZaT = malloc((size_t)K*na*4);     /* Za[na][K] → [K][na] */
+    float *RaT = malloc((size_t)D*na*4);     /* Ra[na][D] → [D][na], 且 double→float */
+    for(int i=0;i<na;i++) for(int d=0;d<D;d++) RaT[(size_t)d*na+i] = (float)Ra[(size_t)i*D+d];
     double *ZtZ = malloc((size_t)K*K*sizeof(double));
     double *ZtR = malloc((size_t)K*D*sizeof(double));
     double *G   = malloc((size_t)K*K*sizeof(double));
@@ -231,11 +246,21 @@ static int elm_solve(const float *X, const float *YQ, const float *DH,
         const float *V0 = variant ? Vr : Vp;
         for(int lin=0; lin<(variant?1:2); lin++){        /* lin=1 只在 PCA 支跑一次(线性对照) */
             const int do_tanh = !lin;
-            { elmz_ctx zc={Xa,V0,Za,D,K,1.0f/scale,do_tanh}; zpar_for(na, 20, elmz_worker, &zc); }
-            { elmz_ctx zc={X+(size_t)ev0*D,V0,Ze,D,K,1.0f/scale,do_tanh}; zpar_for(nev,20,elmz_worker,&zc); }
-            { elmg_ctx gc={Za,ZtZ,na,K}; zpar_for(K, 20, elmg_worker, &gc); }
-            for(int a=0;a<K;a++) for(int b=0;b<a;b++) ZtZ[(size_t)a*K+b] = ZtZ[(size_t)b*K+a];
-            { elmb_ctx bc={Za,Ra,ZtR,na,K,D}; zpar_for(K, 20, elmb_worker, &bc); }
+            /* ★投影走生产 GEMM★(铁律): Za=Xa·V₀ 是 na×D×K≈2.6e10, 自写循环是 CPU 大头。
+             * dq_matmul 要 B 为 [M][K] 布局 ⇒ V₀T[K][D]; 之后 tanh 逐元素(便宜, 留 CPU)。 */
+            for(int d=0;d<D;d++) for(int c=0;c<K;c++) V0T[(size_t)c*D+d]=V0[(size_t)d*K+c];
+            dq_matmul(Xa, V0T, Za, na, D, K);
+            dq_matmul(X+(size_t)ev0*D, V0T, Ze, nev, D, K);
+            { elmt_ctx tc={Za,K,1.0f/scale,do_tanh}; zpar_for(na, 20, elmt_worker, &tc); }
+            { elmt_ctx tc={Ze,K,1.0f/scale,do_tanh}; zpar_for(nev,20, elmt_worker, &tc); }
+            /* ZtZ = ZaᵀZa, ZtR = ZaᵀRa —— 同样走 GEMM(要 Zaᵀ[K][na] 与 Raᵀ[D][na]) */
+            for(int i=0;i<na;i++) for(int c=0;c<K;c++) ZaT[(size_t)c*na+i]=Za[(size_t)i*K+c];
+            { float *tz=malloc((size_t)K*K*4);
+              dq_matmul(ZaT, ZaT, tz, K, na, K);
+              for(size_t i=0;i<(size_t)K*K;i++) ZtZ[i]=tz[i]; free(tz); }
+            { float *tr=malloc((size_t)K*D*4);
+              dq_matmul(ZaT, RaT, tr, K, na, D);
+              for(size_t i=0;i<(size_t)K*D;i++) ZtR[i]=tr[i]; free(tr); }
             double trz = 0.0; for(int a=0;a<K;a++) trz += ZtZ[(size_t)a*K+a];
 
             for(int li=0; li<5; li++){
@@ -289,5 +314,6 @@ static int elm_solve(const float *X, const float *YQ, const float *DH,
     }
     free(R);free(eps);free(colw);free(Xa);free(Ra);free(Vp);free(Vr);
     free(Za);free(Ze);free(ZtZ);free(ZtR);free(G);free(Ub);free(gac);
+    free(V0T);free(ZaT);free(RaT);
     return out->V0 ? 0 : -1;
 }
