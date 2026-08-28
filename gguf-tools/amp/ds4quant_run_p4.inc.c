@@ -235,7 +235,7 @@ double g_bmw_t[2]={0,0};
 /* 第三刀(08-18): 整层 768 矩阵一次批 dequant(vq_gpu.cu), 消 99k 次 per-矩阵 sync。
  * 26GB fp32 缓冲静态复用(裸判期内存空闲); worker 前向直接吃切片指针零拷贝。 */
 typedef struct { uint64_t pay_off, dst_off; int rows, cols, nc, nbit; } vqg_deq_job;
-extern int vqg_dequant_batch(const uint8_t*, size_t, float*, const vqg_deq_job*, int, int, int);
+extern int vqg_dequant_batch(const uint8_t*, float*, const vqg_deq_job*, int, int, int);
 extern int vqg_ready(void);
 float *g_bmw_buf=NULL;   /* [256][3][8.4M] 切片: e*3+w */
 int g_bmw_batched=0;     /* 本层批 dequant 成功旗标 */
@@ -268,7 +268,8 @@ static int bmw_batch_dequant(lfile_t*lf){
         nj++;
     }
     double bt0=vqt_now();
-    int ok=vqg_dequant_batch(lf->vqmap,lf->vqmsz,g_bmw_buf,jobs,nj,4,nc_max);
+    fprintf(stderr,"[bmjob] madvise=%.2f 表构建=%.2f\n",jt_adv,bt0-jt0-jt_adv);
+    int ok=vqg_dequant_batch(lf->vqmap,g_bmw_buf,jobs,nj,4,nc_max);
     g_bmw_t[0]+=vqt_now()-bt0;
     return ok;
 }
