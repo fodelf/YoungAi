@@ -621,11 +621,35 @@ stage_champ86(){
     bash "$SC/caliper_ref.sh" "$W/layers" /tmp/qc_champ86.bin 2>&1 | tail -10
 }
 
+# ═══ champ86 ④: 路由偏置 α 在【本底座本语料】上实扫(2026-08-28 用户纠)═══
+# ★不许直接用冠军的 2.5★ 那是 r64 在【它自己的底座(热108 go2b+冷1bit)+它自己的语料
+# (rr code S=305)】上扫出来的峰(曲线: ≤1.0 阈下无效 / 1.5→80.3 / 2.0→81.6 / ★2.5→84.2★
+# / 3.0 过冲回落)。我们换了底座(平权 VQ 2.25bpw)和语料(calibration_datav5 半), 峰位没理由
+# 还在原处 —— fable5 3300 行有前车之鉴: 迁移版 Δb 直接搬 = 净负("别人的漂移药方")。
+# α 有翻转阈值(小 α 完全不动 argmax), 所以必须扫到 2 以上才看得出东西, 别用 α=1 下结论。
+# 判决尺应用 DS4_ROUTE_BIAS/ALPHA 与合并时烘进 exp_probs_b.bias 语义同构, 故层件上扫即可
+# 预测合并后行为, 不必每个 α 合一次 87GB 模型。
+stage_champ_rbsweep(){
+    local W="$ROOT/gguf/go-onebit/vqhalf/champ86" RB="$ROOT/gguf/go-onebit/vqhalf/champ86/route_bias_r30.bin"
+    [ -s "$RB" ] || DIE "Δb 不在($RB) — 反修未跑到 rb_save 或哈希路由无对象"
+    local AS=(1.5 2.0 2.5 3.0)
+    echo "══ α 扫描(本底座本语料); α=0 基线见 ③ 的五指标 ══"
+    for A in "${AS[@]}"; do
+        LOG "α=$A 判决中"
+        bash "$SC/caliper_ref.sh" "$W/layers" "/tmp/qc_champ86_a$A.bin" 20 "$RB" "$A" \
+            > "/tmp/cal_champ86_a$A.log" 2>&1 || { LOG "α=$A 判决失败"; continue; }
+        printf "── α=%s ──\n" "$A"
+        grep -aE "PPL\(student\)|分布还原率|Mean KLD|Same top" "/tmp/cal_champ86_a$A.log" | head -4
+    done
+    echo "★选峰依据: 主尺 Σmin 优先; Same-top 是路由偏置的直接靶(冠军按它选), 两者背离时报给用户定★"
+    echo "选定后写 $W/rb_alpha.txt, 合并段自动读取"
+}
+
 ST="${1:-all}"
 case "$ST" in
   preflight) stage_preflight;; ids) stage_ids;; anchor) stage_anchor;;
   capture) stage_capture;; probe) stage_probe;; solve) stage_solve;; pass2) stage_pass2;;
-  chain) stage_chain;; judge) stage_judge;; dilute) stage_dilute;; idshalf) stage_idshalf;; idshalf_ext) shift; stage_idshalf_ext "$@";; vqquant) stage_vqquant;; vqmerge) stage_vqmerge;; vqcap) stage_vqcap;; vqsolve) stage_vqsolve;; dynladder) stage_dynladder;; dynquant) shift; stage_dynquant "$@";; dynjudge) stage_dynjudge;; champbf) shift; stage_champbf "$@";; champ86) stage_champ86;; full) shift; stage_full "$@";;
+  chain) stage_chain;; judge) stage_judge;; dilute) stage_dilute;; idshalf) stage_idshalf;; idshalf_ext) shift; stage_idshalf_ext "$@";; vqquant) stage_vqquant;; vqmerge) stage_vqmerge;; vqcap) stage_vqcap;; vqsolve) stage_vqsolve;; dynladder) stage_dynladder;; dynquant) shift; stage_dynquant "$@";; dynjudge) stage_dynjudge;; champbf) shift; stage_champbf "$@";; champ86) stage_champ86;; champrb) stage_champ_rbsweep;; full) shift; stage_full "$@";;
   all) stage_preflight; stage_ids; stage_anchor; stage_capture
        stage_solve; stage_chain; stage_judge;;
   *) echo "未知段: $ST"; echo "段: preflight ids anchor capture solve pass2 chain judge dilute all (probe/dilute=诊断)"; exit 2;;

@@ -42,7 +42,15 @@ LOG "合并完: $(ls -la "$MDL" | awk '{printf "%.2f GB", $5/1e9}')"
 # route_alpha_set 幂等: 首跑存裸态快照 <model>.bias0.bin, 之后每次从快照绝对重写, α 可来回扫。
 RB="${M86_RB:-$(dirname "$LAYERS")/route_bias_r30.bin}"
 if [ -s "$RB" ]; then
-    RBA="${M86_RB_ALPHA:-2.5}"
+    # ★α 必须来自本底座实扫, 不能照搬冠军的 2.5★(2026-08-28 用户纠: 底座与语料都换了,
+    # 峰位没理由不动; fable5 3300 前车之鉴=迁移版 Δb 直接搬净负)。rb_alpha.txt 由
+    # amp_campaign.sh champrb 段扫出后写入; 缺文件时退回 2.5 并【显式告警】。
+    RBA="${M86_RB_ALPHA:-}"
+    if [ -z "$RBA" ]; then
+        AF="$(dirname "$LAYERS")/rb_alpha.txt"
+        if [ -s "$AF" ]; then RBA=$(tr -d " \n" < "$AF"); LOG "α=$RBA (本底座实扫, 来自 $AF)"
+        else RBA=2.5; LOG "★警告: 未见 $AF, 退回冠军值 α=2.5 —— 该值是 r64 在别的底座/语料上扫的, 未必适配本底座★"; fi
+    fi
     "$ROOT/gguf-tools/route_alpha_set" "$MDL" "$RB" "$RBA" \
         && LOG "路由偏置已烘: α=$RBA Δb=$(ls -l "$RB" | awk '{printf "%.1fKB", $5/1024}')" \
         || { LOG "★路由偏置烘焙失败★"; exit 6; }
