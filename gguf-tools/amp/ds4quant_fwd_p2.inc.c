@@ -319,6 +319,12 @@ void dq_attention(const float *x, const float *wqa, const float *qnorm, const fl
      * 试过换 dq_matmul_strided 走 cuBLAS —— 更慢(1.36s): 每个 g 都以 lda=NH*HD 跨步读遍
      * 整块 1GB 的 o, 8 次调用就是 8GB 的 HMM 读, GPU 这边一点也不划算。
      * 改为 8 条线程各跑一个原样的 cblas_sgemm: 各 g 只写 oo 的不相交列段 ⇒ 逐位不变。 */
+    int _wo_gpu = 0;
+#ifdef DS4QUANT_CUDA
+    { extern int vqg_wo_a(const float*,const float*,float*,int,int,int,int,int);
+      _wo_gpu = vqg_wo_a(o, wo_a, oo, S, NH*HD, OG, GD, OLR); }
+#endif
+    if(!_wo_gpu)
     { typedef struct { const float*o,*wa; float*oo; int S,GD,OLR,NHHD,ldc; } wog_t;
       wog_t wg[OG]; pthread_t wt[OG];
       for(int g=0;g<OG;g++) wg[g]=(wog_t){o+(size_t)g*GD, wo_a+(size_t)g*OLR*GD,
