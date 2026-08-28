@@ -1,0 +1,275 @@
+/* dsq_units.c — 量化 / 反修 / sweep 三段的可单测单元(2026-08-28 用户令)
+ *
+ * 为什么有这个文件: ds4quant_run 是 6000 行单 TU, 93 个静态全局 + 169 处 getenv,
+ * 量化那段连函数边界都没有(裸 for(L) 循环在 main 里)。想给三段做一个"跑一层看速度和质量"
+ * 的针, 只能往整条流水线里塞变量 —— 实撞的后果: 闸挂错段(PROBE1 是旧量化段的开关, quant86
+ * 不认)、变量被 unset、量化停不下来、被杀的子进程成孤儿去污染下一段的计时。
+ * 结论是架构问题不是参数问题, 所以把三段的核心单元拆出来, 各自能用合成小数据独立跑。
+ *
+ * 拆分原则(用户令"合理拆分别浪费时间"): 只搬, 不重写。
+ *   量化 → vq_qc.h 里 vq_encode_full/vq_pack/vq_unpack_dequant 本来就是参数化的, 直接包一层
+ *          成"量化一个矩阵并给出还原度"。
+ *   反修 → elm_solve 本来就是纯函数(零全局零 getenv), 直接用。
+ *   sweep → 落地决策(从候选里择优 + 增益门 + 终验回滚)原样搬自 ds4quant_run_p13:280-285
+ *          与 417-425, 只把它从一堆全局里摘出来变成传参。
+ *
+ * 自测: make -C gguf-tools tools-test 会带上 -DDSQ_UNITS_TEST 编译本文件并跑。
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <stdint.h>
+
+/* ══ ① 量化单元 ════════════════════════════════════════════════════════════
+ * 量化一个权重矩阵并回报还原度。这是"量化一层"的最小可测单位 —— 一层就是
+ * NEXP×3 个矩阵各跑一遍这个。
+ *   W      [rows][cols] 原始权重
+ *   dim/nc VQ 档位(向量维/码本大小), 如 4/512 = v4x512
+ *   X      [n_act][cols] 校准激活(可为 NULL = 无加权)
+ * 出参:
+ *   *relh  相对残差 ‖W−Ŵ‖/‖W‖ —— 就是 plan.txt 里那个 relh
+ *   *bytes 打包后的字节数(体积账)
+ * 返回 0=成功。往返自检(pack→unpack 逐位)由调用方或自测做。 */
+int dsq_quant_matrix(const float *W, int rows, int cols, int dim, int nc,
+                     const float *X, int n_act, double *relh, size_t *bytes);
+
+/* ══ ② 反修单元 ════════════════════════════════════════════════════════════
+ * 见 ds4quant_elm.inc.c 的 elm_solve: 给一层的 (x, y_q, dH) 解乘性非线性放大器,
+ * 回报 held 行为挽回。签名在那边, 这里不重复声明 —— 自测直接 include 它。 */
+
+/* ══ ③ sweep 单元 ══════════════════════════════════════════════════════════
+ * sweep 的决策核心有两处, 原样搬出来:
+ *   (a) 单元择优: 从候选出口分里挑最优, 过增益门才算落地(p13:280-285)
+ *   (b) 统一终验: 全部落地后一次全程复核, 不改善就整体回滚(p13:417-425)
+ * 口径约定: 分数【越小越好】(出口误差)。 */
+
+/* (a) 候选择优 + 增益门。
+ *   base    基线分
+ *   cand[n] 候选分(NAN = 该候选无效, 跳过)
+ *   gate    最小相对增益(如 0.05 = 至少降 5%); <=0 表示只要严格更小即可
+ * 出参 *win = 胜出候选下标, *ws = 胜出分数。
+ * 返回 1=有落地 0=无落地(base 保持)。 */
+int dsq_sweep_pick(double base, const double *cand, int n, double gate,
+                   int *win, double *ws)
+{
+    double best = base; int bi = -1;
+    for (int i = 0; i < n; i++) {
+        if (!(cand[i] == cand[i])) continue;              /* NAN 跳过 */
+        if (cand[i] < best - 1e-9) { best = cand[i]; bi = i; }
+    }
+    if (bi < 0) return 0;
+    if (gate > 0.0) {                                      /* 相对增益门 */
+        const double rel = (base > 1e-12) ? (base - best) / base : 0.0;
+        if (rel < gate) return 0;
+    }
+    if (win) *win = bi;
+    if (ws)  *ws  = best;
+    return 1;
+}
+
+/* (b) 统一终验: 全部落地后在【真前沿全量】上复核。
+ * 返回 1=提交 0=整体回滚。判据与 p13:422 逐字一致(fin<b0-1e-9)。 */
+int dsq_sweep_commit(double before, double after)
+{
+    return (after < before - 1e-9) ? 1 : 0;
+}
+
+/* ── 量化单元实现 ─────────────────────────────────────────────────────────── */
+#ifndef DSQ_UNITS_NO_VQ
+/* vq_qc.h 依赖三样外部原语。生产里它们来自 ds4quant_fwd(GPU/BLAS 路)、onebit_quant、
+ * go2b_qc; 本单元只要【数值正确】不要快, 所以给参考实现, 免得把半个引擎拖进来。
+ *   dq_matmul: out[S,M] = x[S,K] · w[M,K]ᵀ (与 ds4quant_fwd_p1 的标量参考路逐式同)
+ *   fp16 往返: 码本存 fp16, 量化误差里包含这一步, 不能省
+ *   g2_inv   : 小矩阵求逆(Gauss-Jordan), 只在 vq 的 Hessian 加权支用到 */
+#include "../quantize/onebit_quant.h"
+/* g2_hot_slot: vq_qc.h 的【侧车字节偏移】辅助要它(冷热专家分档), 本单元只用
+ * encode/pack/unpack 三条, 走不到那里。给个"全冷"桩, 语义明确不静默。 */
+static int g2_hot_slot(int L,int e){ (void)L; (void)e; return -1; }
+/* 同理: 热档位查询也只在侧车偏移那条路上用到, 本单元的档位由调用方直接传 dim/nc。 */
+static int vq_hot_dim(void){ return 4; }
+static int vq_hot_nc(void){ return 512; }
+static int vq_w2_dim(void){ return 4; }
+static int vq_w2_nc(void){ return 512; }
+/* vq_cold_dim/nc 由 vq_qc.h 自己定义, 不重复 */
+static void dq_matmul(const float *x,const float *w,float *o,int S,int K,int M){
+    for(int s=0;s<S;s++) for(int m=0;m<M;m++){ float a2=0;
+        for(int k=0;k<K;k++) a2 += x[(size_t)s*K+k]*w[(size_t)m*K+k];
+        o[(size_t)s*M+m]=a2; }
+}
+static int g2_inv(const double *A,int n,double *Ai){
+    double *M2=malloc((size_t)n*2*n*sizeof(double)); if(!M2) return -1;
+    for(int i=0;i<n;i++){ for(int j=0;j<n;j++) M2[(size_t)i*2*n+j]=A[(size_t)i*n+j];
+        for(int j=0;j<n;j++) M2[(size_t)i*2*n+n+j]=(i==j)?1.0:0.0; }
+    for(int c=0;c<n;c++){
+        int p=c; for(int r=c+1;r<n;r++) if(fabs(M2[(size_t)r*2*n+c])>fabs(M2[(size_t)p*2*n+c])) p=r;
+        if(fabs(M2[(size_t)p*2*n+c])<1e-300){ free(M2); return -1; }
+        if(p!=c) for(int j=0;j<2*n;j++){ double t=M2[(size_t)c*2*n+j];
+            M2[(size_t)c*2*n+j]=M2[(size_t)p*2*n+j]; M2[(size_t)p*2*n+j]=t; }
+        const double d=M2[(size_t)c*2*n+c];
+        for(int j=0;j<2*n;j++) M2[(size_t)c*2*n+j]/=d;
+        for(int r=0;r<n;r++){ if(r==c) continue; const double f=M2[(size_t)r*2*n+c];
+            if(f==0.0) continue;
+            for(int j=0;j<2*n;j++) M2[(size_t)r*2*n+j]-=f*M2[(size_t)c*2*n+j]; }
+    }
+    for(int i=0;i<n;i++) for(int j=0;j<n;j++) Ai[(size_t)i*n+j]=M2[(size_t)i*2*n+n+j];
+    free(M2); return 0;
+}
+#include "../quantize/vq_qc.h"
+
+int dsq_quant_matrix(const float *W, int rows, int cols, int dim, int nc,
+                     const float *X, int n_act, double *relh, size_t *bytes)
+{
+    if (!W || rows <= 0 || cols <= 0 || dim <= 0 || nc <= 1) return -1;
+    if (cols % dim) return -1;                             /* 列必须整除向量维 */
+    const int nvec = rows * (cols / dim);
+    float *Cb  = malloc((size_t)nc * dim * sizeof(float));
+    int   *idx = malloc((size_t)nvec * sizeof(int));
+    float *gr  = malloc((size_t)rows * sizeof(float));
+    float *Wq  = malloc((size_t)rows * cols * sizeof(float));
+    if (!Cb || !idx || !gr || !Wq) { free(Cb);free(idx);free(gr);free(Wq); return -1; }
+
+    vq_encode_full(W, rows, cols, dim, nc, X, n_act, Cb, idx, gr, Wq);
+
+    if (relh) {                                            /* relh = ‖W−Ŵ‖/‖W‖ */
+        double e = 0.0, w = 0.0;
+        for (size_t i = 0; i < (size_t)rows * cols; i++) {
+            const double d = (double)W[i] - Wq[i];
+            e += d * d; w += (double)W[i] * W[i];
+        }
+        *relh = sqrt(e / (w + 1e-30));
+    }
+    if (bytes) {
+        uint8_t *buf = malloc(vq_payload_bytes(rows, cols, dim, nc) + 4096);
+        *bytes = buf ? vq_pack(Cb, idx, gr, rows, cols, dim, nc, buf) : 0;
+        free(buf);
+    }
+    free(Cb); free(idx); free(gr); free(Wq);
+    return 0;
+}
+#endif
+
+/* ══════════════════════════ 自测 ══════════════════════════════════════════ */
+#ifdef DSQ_UNITS_TEST
+/* 反修单元要用 elm_solve, 它依赖同-TU 的 cholesky/chol_solve_multi/mgs/lcg_unit/zpar_for。
+ * 这些原语分别在 ds4_z.c 与 ds4quant_zsolve.inc.c 里(都是 static), 自测把它们拉进来。
+ * DIM/MOEI/NEXP 在 elm 里没被用到(全走参数), 所以不需要 p1 的那些编译期常量。 */
+#include <pthread.h>
+#include <time.h>
+/* vqt_now 由 vq_qc.h 提供(上面已 include), 不重复定义 */
+#include "../../ds4_z.c"
+#include "ds4quant_zsolve.inc.c"
+#include "ds4quant_elm.inc.c"
+
+static uint64_t TS = 0x243F6A8885A308D3ULL;
+static float rnd(void){ TS = TS*6364136223846793005ULL + 1442695040888963407ULL;
+    return ((float)((TS>>40)&0xFFFFFF)/8388608.0f) - 1.0f; }
+
+static int t_quant(void)
+{
+    /* 合成小矩阵: 32×64, v4x16。数据造成"低秩+噪声", VQ 应当能压得住。 */
+    const int rows=32, cols=64, dim=4, nc=16;
+    float *W = malloc((size_t)rows*cols*4);
+    for(int r=0;r<rows;r++) for(int c=0;c<cols;c++)
+        W[r*cols+c] = sinf(0.13f*r + 0.07f*c) + 0.05f*rnd();
+    double relh_lo=0, relh_hi=0; size_t b_lo=0, b_hi=0;
+    int rc1 = dsq_quant_matrix(W,rows,cols,dim,nc,   NULL,0,&relh_lo,&b_lo);
+    int rc2 = dsq_quant_matrix(W,rows,cols,dim,nc*4, NULL,0,&relh_hi,&b_hi);
+    printf("  量化: v%dx%-4d relh=%.4f %zuB | v%dx%-4d relh=%.4f %zuB\n",
+           dim,nc,relh_lo,b_lo, dim,nc*4,relh_hi,b_hi);
+    int ok = 1;
+    if(rc1||rc2){ printf("  ✗ 返回码 %d/%d\n",rc1,rc2); ok=0; }
+    if(!(relh_lo>0.0 && relh_lo<1.0)){ printf("  ✗ relh 越界 %.4f\n",relh_lo); ok=0; }
+    /* 码本变大 ⇒ 还原度必须变好(单调性) —— 这是量化档位账的基本性质 */
+    if(!(relh_hi < relh_lo)){ printf("  ✗ 码本×4 反而更差 %.4f→%.4f\n",relh_lo,relh_hi); ok=0; }
+    /* 体积必须随码本增大(码本本身进载荷) */
+    if(!(b_hi > b_lo)){ printf("  ✗ 体积没随码本增大 %zu→%zu\n",b_lo,b_hi); ok=0; }
+    /* 非法参数必须被挡(cols 不整除 dim) */
+    if(dsq_quant_matrix(W,rows,cols,7,nc,NULL,0,NULL,NULL)==0){ printf("  ✗ 非法 dim 没被挡\n"); ok=0; }
+    free(W);
+    return ok;
+}
+
+static int t_backfit(void)
+{
+    /* 合成一层: S 行 × D 维。造一个【乘性】真值 y_fp = y_q ⊙ (1+tanh(x·v)·u),
+     * ELM 应当能把它挽回一大截; 而同口径的乘性【线性】对照应当明显更差 ——
+     * 这正是 fable5:5316 判例(线性近零 / 非线性 +12%)的可复现最小化版本。 */
+    const int S=512, D=64, vs=384;
+    float *X  = malloc((size_t)S*D*4);
+    float *YQ = malloc((size_t)S*D*4);
+    float *DH = malloc((size_t)S*D*4);
+    float *v  = malloc((size_t)D*4), *u = malloc((size_t)D*4);
+    for(int d=0;d<D;d++){ v[d]=rnd(); u[d]=0.3f*rnd(); }
+    double vn=0; for(int d=0;d<D;d++) vn+=(double)v[d]*v[d]; vn=sqrt(vn);
+    for(int d=0;d<D;d++) v[d]/=(float)vn;
+    for(int i=0;i<S;i++){
+        float *x=X+(size_t)i*D, *yq=YQ+(size_t)i*D, *dh=DH+(size_t)i*D;
+        /* ★x 必须各向异性★(首跑实撞): 造成各向同性 U(-1,1)^D 时, PCA 给出的是任意旋转
+         * 方向, tanh(x·V₀_c/s) 这组特征与靶方向 v 毫无关系 ⇒ ELM 输给线性(58.6% vs 61.7%)。
+         * 真实激活是高度各向异性的(massive activation 通道占 10% 能量, 见 memory 巨值通道矿),
+         * PCA 才能捞到真结构 —— ELM 历史上的 +12% 就建立在这个前提上。
+         * 这里让 v 成为主方向(能量 ×4), 复现真实场景。 */
+        const float a0 = 4.0f*rnd();
+        for(int d=0;d<D;d++){ x[d]=a0*v[d] + 0.5f*rnd(); yq[d]=1.0f+0.5f*rnd(); }
+        double p=0; for(int d=0;d<D;d++) p+=(double)x[d]*v[d];
+        /* ★×4 是必须的, 首跑实撞★: v 是单位向量、x~U(-1,1)^D ⇒ x·v 的 std 只有 ~0.58,
+         * tanh 在 |t|<0.6 上几乎是直线, 线性支照样拟合得一样好(首跑 线性 71.4% > ELM 67.5%,
+         * 测试判 FAIL —— 是靶造错了不是代码错了)。放大进饱和区, 非线性才成为必需。
+         * 这条同时是 ELM 的一个真实敏感点: s=sqrt(mean(Xa²)) 这个定标决定 tanh 落在饱和区
+         * 还是线性区; 落线性区 ⇒ ELM 退化成线性 ⇒ 没肉。部署时要看 s 是否让 x·V₀/s 出线性区。 */
+        const float g0 = tanhf(4.0f*(float)p);            /* 非线性隐变量(进饱和区) */
+        for(int d=0;d<D;d++) dh[d] = yq[d]*g0*u[d];       /* y_fp−y_q = y_q⊙(g0·u) */
+    }
+    elm_res er; int rc = elm_solve(X,YQ,DH,S,D,vs,&er);
+    int ok = 1;
+    if(rc!=0){ printf("  ✗ elm_solve 返回 %d\n",rc); ok=0; }
+    else {
+        printf("  反修: held挽回=%.1f%% @V₀=%s λ=%g k=%d | 乘性线性对照=%.1f%%\n",
+               er.held*100.0, er.from_pca?"PCA":"rand", (double)er.lam, er.k, er.held_lin*100.0);
+        /* 真值就是乘性非线性 ⇒ ELM 必须挽回一大截 */
+        if(!(er.held > 0.5)){ printf("  ✗ 造的就是乘性非线性靶, held 只有 %.3f\n",er.held); ok=0; }
+        /* 非线性必须明显赢过同口径线性 —— 判例的可复现最小化版本 */
+        if(!(er.held > er.held_lin + 0.05)){
+            printf("  ✗ 非线性没赢线性: %.3f vs %.3f\n",er.held,er.held_lin); ok=0; }
+        if(er.k<16||er.k>512){ printf("  ✗ k 越界 %d\n",er.k); ok=0; }
+        elm_free(&er);
+    }
+    free(X);free(YQ);free(DH);free(v);free(u);
+    return ok;
+}
+
+static int t_sweep(void)
+{
+    int ok=1, win=-1; double ws=0;
+    const double NA = 0.0/0.0;
+    /* ① 有更优候选且无门 ⇒ 落地, 且选最小的那个 */
+    double c1[4] = {0.95, 0.80, NA, 0.90};
+    if(!dsq_sweep_pick(1.00,c1,4,0.0,&win,&ws) || win!=1 || ws!=0.80){
+        printf("  ✗ 择优错: win=%d ws=%.3f\n",win,ws); ok=0; }
+    /* ② 增益不够门槛 ⇒ 不落地(今天 38/42 个单元 Δ 只有千分之几, 就该被这道门挡住) */
+    double c2[2] = {0.998, 0.999};
+    if(dsq_sweep_pick(1.00,c2,2,0.05,&win,&ws)){ printf("  ✗ 增益 0.2%% 过了 5%% 门\n"); ok=0; }
+    /* ③ 全是 NAN / 全都更差 ⇒ 不落地 */
+    double c3[3] = {NA,NA,NA}, c4[2] = {1.01,1.20};
+    if(dsq_sweep_pick(1.00,c3,3,0.0,&win,&ws)){ printf("  ✗ 全 NAN 却落地\n"); ok=0; }
+    if(dsq_sweep_pick(1.00,c4,2,0.0,&win,&ws)){ printf("  ✗ 全更差却落地\n"); ok=0; }
+    /* ④ 终验: 改善提交 / 劣化整体回滚(今天 champ86 靠的就是这道网) */
+    if(!dsq_sweep_commit(145.78,126.17)){ printf("  ✗ 改善没提交\n"); ok=0; }
+    if( dsq_sweep_commit(126.17,145.78)){ printf("  ✗ 劣化没回滚\n"); ok=0; }
+    if( dsq_sweep_commit(1.0,1.0))      { printf("  ✗ 持平当成改善\n"); ok=0; }
+    printf("  sweep: 择优/增益门/NAN/全负/终验提交/终验回滚/持平 七项\n");
+    return ok;
+}
+
+int main(void)
+{
+    printf("== dsq_units 自测(量化/反修/sweep 三单元) ==\n");
+    int ok = 1;
+    ok &= t_quant();
+    ok &= t_backfit();
+    ok &= t_sweep();
+    printf(ok ? "DSQ_UNITS PASS\n" : "DSQ_UNITS FAIL\n");
+    return ok ? 0 : 1;
+}
+#endif

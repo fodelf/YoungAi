@@ -355,6 +355,7 @@ tools-test:
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(NATIVE) $(INC) -DGO1B_TEST    $(QZ)/onebit_quant.c -o $(BUILD)/onebit_test -lm && $(BUILD)/onebit_test
 	$(CC) $(CFLAGS) $(NATIVE) $(INC) -DLINALG_TEST  $(AMP)/linalg_small.c -o $(BUILD)/linalg_test -lm && $(BUILD)/linalg_test
+	$(CC) $(CFLAGS) $(NATIVE) $(INC) -DDSQ_UNITS_TEST $(AMP)/dsq_units.c -o $(BUILD)/dsq_units_test $(BLAS_LIBS) -lpthread -lm && $(BUILD)/dsq_units_test
 	$(CC) $(CFLAGS) $(NATIVE) $(INC) -DPROBE_TEST   $(CAL)/layer_probe.c  -o $(BUILD)/probe_test  -lpthread -lm && $(BUILD)/probe_test
 	$(CC) $(CFLAGS) $(NATIVE) $(INC) -DHVSOLVE_TEST $(AMP)/hiddenvar_solve.c $(AMP)/linalg_small.c -o $(BUILD)/hv_test -lm && $(BUILD)/hv_test
 	$(CC) $(CFLAGS) $(NATIVE) $(INC) -DNPY_TEST     $(CAL)/npy.c -o $(BUILD)/npy_test -lm && $(BUILD)/npy_test
