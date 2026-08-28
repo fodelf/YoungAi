@@ -232,6 +232,9 @@ static int bmw_batch_dequant(lfile_t*lf){
 }
 #endif
 static void bytes_moe(lfile_t*lf,int S,const float*Fin,const int*idx,const float*rw,float*Fout){
+    /* ★逐层口径(2026-08-28 改)★ 原为全程累计, 我曾把它当墙钟误读一次(1731s 实为 20 线程
+     * 累计 ÷20 = 87s)。改为每次进本函数清零 + 每层打印, 并显式标注"20线程累计/墙钟"两栏。 */
+    { extern double g_bmw_t[2]; g_bmw_t[0]=0; g_bmw_t[1]=0; }
 #ifdef DS4QUANT_CUDA
     g_bmw_batched=bmw_batch_dequant(lf);
 #endif
@@ -344,8 +347,9 @@ static void bytes_moe(lfile_t*lf,int S,const float*Fin,const int*idx,const float
     }
     if(xn)free(xn); if(pj)free(pj);
     free(Fbase); free(Fcur);
-    { static int bn=0; if((++bn%43)==0||getenv("DS4_BMW_TIMING"))
-        fprintf(stderr,"[bmwt] dequant=%.1fs 前向=%.1fs (bytes_moe 累计)\n",g_bmw_t[0],g_bmw_t[1]); }
+    { int nth2=NTHREADS>0?NTHREADS:1;
+      fprintf(stderr,"[bmwt] 本层 dequant=%.2fs 前向=%.2fs (20线程累计) | 墙钟约 %.2f/%.2fs\n",
+              g_bmw_t[0],g_bmw_t[1],g_bmw_t[0]/nth2,g_bmw_t[1]/nth2); }
 }
 /* 可复用调优轮(GL重拟合→GLdyn2→GLdyn8→TREF), 循环至整轮零接管; 返回是否有过接管 */
 typedef struct { int L,S,n_fit,vs; size_t rowsz; double bval,bheld;
