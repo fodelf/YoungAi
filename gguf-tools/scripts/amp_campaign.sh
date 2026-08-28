@@ -331,14 +331,24 @@ for d in alld:
           len(pools[0][d]), len(pools[1][d]), len(pools[2][d])))
 
 def sample(pool, N, path):
-    """按域配额分层抽: 配额∝该域全局占比, 域内等距铺窗(窗宽 128)。小域至少给 1 窗。"""
+    """按域配额分层抽, 域内等距铺窗(窗宽 128)。
+    ★配额=域等权(2026-08-28 用户令"领域都不对等")★: 8 域各 N/8。
+    原来按语料占比分配, 直接继承了语料本身 prose:academic = 64:1 的失衡 ——
+    cjk/arabic/cyrillic/academic 各只分到 128 token, 去校准 43 层×256 专家等于没有信号,
+    而北极星是【全能力还原】不是【还原语料里最多的那一类】。
+    等权的上限由最小域的池子定: academic 每份 ~1198 token ⇒ 严格等权 S 最大约 8×1198。
+    池子不够的域, 拿满它全部池子, 缺口按池子大小回补给其余域(不留空域)。"""
     W = 128
-    share = {d: sum(len(c[2]) for c in byd[d])/tot for d in byd}
-    quota = {d: max(W, int(N*share[d])//W*W) for d in byd if pool[d]}
-    while sum(quota.values()) > N:                       # 从最大域回收超额
+    D = [d for d in byd if pool[d]]
+    per = max(W, (N//len(D))//W*W)
+    quota = {d: min(per, len(pool[d])//W*W or len(pool[d])) for d in D}
+    short = N - sum(quota.values())
+    while short > 0:                                     # 缺口按剩余池子大小回补
+        cand = [d for d in D if len(pool[d]) - quota[d] >= W]
+        if not cand: break
+        d = max(cand, key=lambda x: len(pool[x]) - quota[x]); quota[d] += W; short -= W
+    while sum(quota.values()) > N:                       # 超额从最大配额回收
         d = max(quota, key=lambda x: quota[x]); quota[d] -= W
-    while sum(quota.values()) < N:
-        d = max(quota, key=lambda x: share[x]); quota[d] += W
     sel, got = [], {}
     for d in sorted(quota, key=lambda x: -quota[x]):
         p, q = pool[d], min(quota[d], len(pool[d])//W*W or len(pool[d]))
