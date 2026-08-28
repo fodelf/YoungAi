@@ -243,8 +243,8 @@ stage_dilute(){
 # 产出: vqhalf_q.ids(量化半) / vqhalf_a.ids(放大器半)。
 stage_idshalf(){
     local D2="$ROOT/gguf/go-onebit/vqhalf"; mkdir -p "$D2"
-    local QI="$D2/vqhalf_q.ids" AI="$D2/vqhalf_a.ids"
-    [ -s "$QI" ] && [ -s "$AI" ] && { LOG "①ids 两半已在, 跳过(要重切先 mv 走)"; return 0; }
+    local QI="$D2/vqhalf_q.ids" AI="$D2/vqhalf_a.ids" JI="$D2/vqhalf_j.ids"
+    [ -s "$QI" ] && [ -s "$AI" ] && [ -s "$JI" ] && { LOG "①ids 三份已在, 跳过(要重切先 mv 走)"; return 0; }
     # ★域分层整簇切半(2026-08-28 用户令"不要相似的, 全域都要有")★
     # 旧切法(B=256 token 定长块偶奇交替)的病: 同一篇文档的【相邻段落】被分进两半 —— 实测
     # 两半各自取到的是同一篇小鼠肠道菌群论文的相邻段, 两半几乎是复制品。校准半见过的东西
@@ -258,11 +258,12 @@ stage_idshalf(){
     #      且每域 token 量接近
     # 抽样也按域分层: 每半每域按其全局占比取配额, 域内等距铺窗, 保证抽出来的 8192 token
     # 仍然全域齐全(旧切法 64 窗盲抽, 小域可能一个 token 都抽不到)。
-    LOG "①域分层整簇切半 → 两半各 S=8192(全域齐全, 整簇不拆, 零重叠)"
-    python3 - "$CORPUS" "$QI" "$AI" 8192 "$DS4_HF" "$ROOT/gguf/go-onebit/g7/wt2.ids" <<'PY' || DIE "切半失败"
+    LOG "①域分层整簇三切 → 量化/反修/判决 各 S=8192(全域齐全, 整簇不拆, 三份零重叠)"
+    python3 - "$CORPUS" "$QI" "$AI" "$JI" 8192 "$DS4_HF" "$ROOT/gguf/go-onebit/g7/wt2.ids" <<'PY' || DIE "三切失败"
 import re, sys, collections
 from tokenizers import Tokenizer
-src, oq, oa, N, hf, wt2 = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5], sys.argv[6]
+src, oq, oa, oj, N, hf, wt2 = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5]), sys.argv[6], sys.argv[7]
+OUTS = [("量化份", oq), ("反修份", oa), ("判决份", oj)]
 tok = Tokenizer.from_file(f"{hf}/tokenizer.json")
 lines = [ln for ln in open(src, encoding="utf-8").read().split("\n") if ln.strip()]
 
@@ -310,20 +311,24 @@ for c in clusters:
 # ③ 每域内贪心平衡: 大簇优先给当前 token 较少的一半
 byd = collections.defaultdict(list)
 for c in clusters: byd[c[0]].append(c)
-poolQ, poolA = collections.defaultdict(list), collections.defaultdict(list)
+# ★三路贪心(2026-08-28 用户令"切三份: 量化/反修/判决")★ 每域各自把文档簇按 token 降序
+# 依次投给当前最轻的一份 ⇒ 三份都拿到全部域, 且每域 token 量近乎相等; 整簇不拆 ⇒ 同源
+# 文档绝不跨份(这正是两份时代"两半是同篇论文相邻段"的根治法)。
+K = 3
+pools = [collections.defaultdict(list) for _ in range(K)]
 for d, cs in byd.items():
     cs.sort(key=lambda c: -len(c[2]))
-    tq = ta = 0
+    tk = [0]*K
     for c in cs:
-        if tq <= ta: poolQ[d] += c[2]; tq += len(c[2])
-        else:        poolA[d] += c[2]; ta += len(c[2])
+        i = tk.index(min(tk)); pools[i][d] += c[2]; tk[i] += len(c[2])
 
 alld = sorted(byd, key=lambda d: -sum(len(c[2]) for c in byd[d]))
 tot = sum(len(c[2]) for cs in byd.values() for c in cs)
-print("  语料 %d token / %d 行 / %d 文档簇, %d 个域" % (tot, len(lines), len(clusters), len(byd)))
-print("  %-10s %8s | %8s %8s" % ("域", "全语料", "量化半池", "反修半池"))
+print("  语料 %d token / %d 行 / %d 文档簇, %d 个域 → 三份" % (tot, len(lines), len(clusters), len(byd)))
+print("  %-10s %8s | %8s %8s %8s" % ("域", "全语料", "量化池", "反修池", "判决池"))
 for d in alld:
-    print("  %-10s %8d | %8d %8d" % (d, sum(len(c[2]) for c in byd[d]), len(poolQ[d]), len(poolA[d])))
+    print("  %-10s %8d | %8d %8d %8d" % (d, sum(len(c[2]) for c in byd[d]),
+          len(pools[0][d]), len(pools[1][d]), len(pools[2][d])))
 
 def sample(pool, N, path):
     """按域配额分层抽: 配额∝该域全局占比, 域内等距铺窗(窗宽 128)。小域至少给 1 窗。"""
@@ -348,13 +353,14 @@ def sample(pool, N, path):
     open(path, "w").write("\n".join(str(t) for t in sel) + "\n")
     return sel, got
 
-selQ, gq = sample(poolQ, N, oq)
-selA, ga = sample(poolA, N, oa)
+sels, gots = [], []
+for i, (nm, path) in enumerate(OUTS):
+    sel, got = sample(pools[i], N, path); sels.append(sel); gots.append(got)
 print()
 print("  抽样后每域 token(★全域都要有★):")
-print("  %-10s %8s %8s" % ("域", "量化半", "反修半"))
-for d in alld: print("  %-10s %8d %8d" % (d, gq.get(d,0), ga.get(d,0)))
-miss = [d for d in byd if gq.get(d,0)==0 or ga.get(d,0)==0]
+print("  %-10s %8s %8s %8s" % ("域", "量化份", "反修份", "判决份"))
+for d in alld: print("  %-10s %8d %8d %8d" % (d, *[g.get(d,0) for g in gots]))
+miss = [d for d in byd if any(g.get(d,0)==0 for g in gots)]
 assert not miss, "★有域没被抽到: %s★" % miss
 
 def ov(a, b):
@@ -362,9 +368,12 @@ def ov(a, b):
     return sum(min(ca[t]/na, cb[t]/nb) for t in set(a)|set(b))
 w = [int(x) for x in open(wt2) if x.strip()]
 print()
-print("  ★两半 token 分布重合 = %.3f★ (越低越好: 两半越不像, 反修才有独立拟合料)" % ov(selQ, selA))
-print("  两半对 wt2 词表覆盖: 量化半 %.1f%% / 反修半 %.1f%%" % (
-    100*len(set(w)&set(selQ))/len(set(w)), 100*len(set(w)&set(selA))/len(set(w))))
+print("  三份两两 token 分布重合(越低越不像):")
+for i in range(K):
+    for j in range(i+1, K):
+        print("    %s ↔ %s  %.3f" % (OUTS[i][0], OUTS[j][0], ov(sels[i], sels[j])))
+print("  三份对 wt2 词表覆盖: " + " / ".join(
+    "%s %.1f%%" % (OUTS[i][0], 100*len(set(w)&set(sels[i]))/len(set(w))) for i in range(K)))
 PY
 }
 
