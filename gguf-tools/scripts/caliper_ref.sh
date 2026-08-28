@@ -10,6 +10,13 @@ LAYERS="$(realpath "${1:?层件目录}")"; OUT="${2:?输出logits}"; THR="${3:-2
 RB="${4:-}"; RBA="${5:-2.5}"
 RB_ENV=(); [ -n "$RB" ] && RB_ENV=(DS4_ROUTE_BIAS="$RB" DS4_ROUTE_BIAS_ALPHA="$RBA")
 R30="$ROOT/gguf/go-onebit/r30"; G7="$ROOT/gguf/go-onebit/g7"
+# ★$6=ids $7=锚: 只给【诊断针】用, 不是判决★(2026-08-28)
+# 判决口径永远是 wt2(默认值), 铁律"判决只认参考前向尺"不因这两个可选参数松动。
+# 加它们是为了回答一个具体问题: 反修在【与校准语料同源但不相交】的片上是改善还是退化 ——
+# 改善=分布错配(换语料有用), 退化=对那 8192 token 过拟合(换语料白搭)。
+# 换了语料就必须自己配对应的 FP 锚, 两者错配会出 PPL 2.4e7 这种一眼假的数。
+IDS="${6:-$G7/wt2.ids}"; ANC="${7:-$R30/anchor_wt2_s2653.bin}"
+SN=8000; [ "$IDS" != "$G7/wt2.ids" ] && { SN=$(wc -l < "$IDS"); echo "★★诊断针口径(非判决): ids=$(basename "$IDS") S=$SN 锚=$(basename "$ANC")★★" >&2; }
 N=$(ls "$LAYERS"/dql_vq_L*.bin 2>/dev/null | wc -l)
 [ "$N" = 43 ] || { echo "层件不齐 $N/43" >&2; exit 2; }
 # ★内存预算按机器给, 不写死★(2026-08-27): 原为 DS4_BF_MEMGB=8(16GiB Mac 时代), 在 121GiB
@@ -24,12 +31,12 @@ LCx=$(printf "g%.0s" $(seq 1 43))
 cd "$ROOT/gguf-tools/amp"
 env DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-0731" OPENBLAS_NUM_THREADS=1 DS4_BF_MEMGB="$BFMEM" \
     DS4_GSWEEP=0 DS4_BF_TERMINAL=0 DS4_BF_ONLY=1 DS4_COADAPT=1 DS4_CALIB_FULLSET=1 \
-    DS4_EXPORT_BYTES=0 DS4_ANCHOR="$R30/anchor_wt2_s2653.bin" DS4_NFIT=1 DS4_THREADS="$THR" \
+    DS4_EXPORT_BYTES=0 DS4_ANCHOR="$ANC" DS4_NFIT=1 DS4_THREADS="$THR" \
     DS4_LAYER_DIR="$LAYERS" DS4_LCFG="$LCx" DS4_VQ=1 DS4_TGT_ALPHA=1.0 \
-    DS4_DUMP_LOGITS="$OUT" "${RB_ENV[@]}" ./ds4quant_run.old "$G7/wt2.ids" 8000 2>&1 | tail -2
+    DS4_DUMP_LOGITS="$OUT" "${RB_ENV[@]}" ./ds4quant_run.old "$IDS" "$SN" 2>&1 | tail -2
 cd "$ROOT"
 # 五指标判决器=C 版(2026-08-25 Python→C 迁移 Wave A; 金标对拍 amp2 verdict 全五指标
 # 与 anchor_metrics.py 逐字符一致, C 版另多 Σmin 主尺; 金标记录 migrate/golden.txt)
 AM="$ROOT/gguf-tools/bench/anchor_metrics"
 [ -x "$AM" ] || make -C "$ROOT/gguf-tools" anchor_metrics
-"$AM" --ref "$R30/anchor_wt2_s2653.bin" --ids "$G7/wt2.ids" --student "$OUT" --tail 3
+"$AM" --ref "$ANC" --ids "$IDS" --student "$OUT" --tail 3
