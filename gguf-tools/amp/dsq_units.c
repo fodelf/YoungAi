@@ -15,6 +15,9 @@
  *
  * 自测: make -C gguf-tools tools-test 会带上 -DDSQ_UNITS_TEST 编译本文件并跑。
  */
+/* Linux 上 -std=c11 是严格 ISO 模式, POSIX 的 clock_gettime/pwrite 不会暴露
+ * (vq_qc.h 两处都要)。必须在任何 include 之前开。 */
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
