@@ -331,7 +331,7 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
             else { vrej++; form=0; }                        /* 全闸拒: 不落地(计入汇总) */
         }
         if(form){
-            char al[64],rs[80]; uint64_t vol=4;
+            char al[64],rs[128]; uint64_t vol=4;
             if(form==5){   /* ★机制本体: 重解自有 z 落地(原地改写该 op 系数)★ */
                 lf->ops[ze]=opE; zfile_commit(J,&lf->ops[ze],(float)bestsc);
                 vol=opE.type==3?36:opE.type==2?16:4;
