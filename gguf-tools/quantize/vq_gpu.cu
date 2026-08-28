@@ -360,13 +360,23 @@ __global__ static void vqg_dequant_batch_kernel(
         Cs[i] = __half2float(*(const __half *)&h);
     }
     __syncthreads();
-    for (int r = blockIdx.x * blockDim.x + threadIdx.x; r < j.rows; r += gridDim.x * blockDim.x) {
+    /* ★写地址必须合并★(2026-08-28 实测 bug): 原版是"一个线程负责一整行"——
+     * for(r = blockIdx.x*blockDim.x + threadIdx.x; ...) 里层再扫完整行。于是同一 warp 的
+     * 32 个线程写的是【相邻的行】, 而一行 = cols(4096) 个 float = 16KB ⇒ 相邻线程地址相隔
+     * 16KB, 完全不合并, 每次写都是独立事务。实测整层 26GB 写用 6.69s = ★3.9 GB/s★,
+     * 在 GB10 上低了一个数量级, 且它不随抽格行数缩小(行少了权重还是要全量 dequant),
+     * 占 bytes_moe 8.3s 的 81%、占单层 11.3s 的 59%。
+     * 改为"一个 block 负责一行(blockIdx.x 跨行), threadIdx.x 沿列走": 相邻线程写相邻的
+     * dim(=4) 个 float, 16B 步长 ⇒ 每 8 线程凑满一个 128B 事务。
+     * ★数值零影响★: 同样的值、同样的目标地址, 只是写入顺序变了; 无归约无竞争(每个
+     * (r,c) 由唯一线程独占写)。 */
+    const int nidx_row = j.cols / dim;
+    for (int r = blockIdx.x; r < j.rows; r += gridDim.x) {
         uint16_t gh = (uint16_t)gr_h[r * 2] | ((uint16_t)gr_h[r * 2 + 1] << 8);
         const float g = __half2float(*(const __half *)&gh);
-        const int nidx_row = j.cols / dim;
         const size_t i0 = (size_t)r * nidx_row;
         float *wr = W + (size_t)r * j.cols;
-        for (int c = 0; c < nidx_row; c++) {
+        for (int c = threadIdx.x; c < nidx_row; c += blockDim.x) {
             uint32_t v;
             if (j.nbit == 8) v = ix[i0 + c];
             else {
@@ -388,7 +398,9 @@ extern "C" int vqg_dequant_batch(const uint8_t *base, float *dst_base,
     cudaStream_t st = vqg_stream();
     cudaMemcpyAsync(jobs_d, jobs_h, (size_t)njobs * sizeof(vqg_deq_job), cudaMemcpyHostToDevice, st);
     size_t shm = (size_t)nc_max * dim * sizeof(float);
-    dim3 grid(16, njobs);
+    /* grid.x = 并发处理的行数(一 block 一行)。原值 16 是"线程跨行"布局下的分片数,
+     * 新布局下它直接决定行并行度, 提到 256 让 SM 吃饱(rows=2048/4096, 循环步进覆盖余下)。 */
+    dim3 grid(256, njobs);
     vqg_dequant_batch_kernel<<<grid, 128, shm, st>>>(base, dst_base, jobs_d, njobs, dim);
     return cudaStreamSynchronize(st) == cudaSuccess;
 }
