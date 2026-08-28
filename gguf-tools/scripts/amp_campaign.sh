@@ -244,56 +244,113 @@ stage_dilute(){
 stage_idshalf(){
     local D2="$ROOT/gguf/go-onebit/vqhalf"; mkdir -p "$D2"
     local QI="$D2/vqhalf_q.ids" AI="$D2/vqhalf_a.ids"
-    [ -s "$QI" ] && [ -s "$AI" ] && { LOG "①ids 两半已在, 跳过"; return 0; }
-    LOG "①语料交错切半 → 两半各 S=8192(对称; 每专家 192 校准行, base86p 的 2906 只有 68)"
-    python3 - "$CORPUS" "$QI" "$AI" 8192 8192 64 "$DS4_HF" <<'PY' || DIE "切半失败"
-import re, sys
+    [ -s "$QI" ] && [ -s "$AI" ] && { LOG "①ids 两半已在, 跳过(要重切先 mv 走)"; return 0; }
+    # ★域分层整簇切半(2026-08-28 用户令"不要相似的, 全域都要有")★
+    # 旧切法(B=256 token 定长块偶奇交替)的病: 同一篇文档的【相邻段落】被分进两半 —— 实测
+    # 两半各自取到的是同一篇小鼠肠道菌群论文的相邻段, 两半几乎是复制品。校准半见过的东西
+    # 反修半又见一遍, 等于没有独立的拟合料。
+    # 新切法三条:
+    #   ① 一行=一个文档(这份语料的代码是用字面 \n 转义嵌在行内的, 所以最长行 13183 字符,
+    #      按行切绝不会把一段代码劈开)
+    #   ② 按内容分 8 域(prose/code/math/euro/cyrillic/arabic/cjk/academic), 连续同域行合成
+    #      "文档簇", ★整簇只进一半★ —— 相邻段落再不可能跨半
+    #   ③ 每个域【各自】做贪心平衡分配(大簇优先给当前较轻的一半) ⇒ 两半都拿到全部 8 个域,
+    #      且每域 token 量接近
+    # 抽样也按域分层: 每半每域按其全局占比取配额, 域内等距铺窗, 保证抽出来的 8192 token
+    # 仍然全域齐全(旧切法 64 窗盲抽, 小域可能一个 token 都抽不到)。
+    LOG "①域分层整簇切半 → 两半各 S=8192(全域齐全, 整簇不拆, 零重叠)"
+    python3 - "$CORPUS" "$QI" "$AI" 8192 "$DS4_HF" "$ROOT/gguf/go-onebit/g7/wt2.ids" <<'PY' || DIE "切半失败"
+import re, sys, collections
 from tokenizers import Tokenizer
-src, oq, oa, NQ, NA, CH, hf = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5]), int(sys.argv[6]), sys.argv[7]
+src, oq, oa, N, hf, wt2 = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5], sys.argv[6]
 tok = Tokenizer.from_file(f"{hf}/tokenizer.json")
-text = open(src, encoding="utf-8").read()
-enc = tok.encode(text, add_special_tokens=False)
-allids, offs = enc.ids, enc.offsets
+lines = [ln for ln in open(src, encoding="utf-8").read().split("\n") if ln.strip()]
 
-# 代码区 = ``` 围栏之间(在【原文】上定界, 切半后不再重算 —— 交错切会把围栏拆散,
-# 在半文本上数 ``` 必然错配, 这正是先前算出"两半都 40% 代码"的原因)。
-fences = [m.start() for m in re.finditer("```", text)]
-spans = [(fences[i], fences[i+1]) for i in range(0, len(fences)-1, 2)]
-def in_code(pos):
-    for a, b in spans:
-        if a <= pos < b: return True
-        if pos < a: return False
-    return False
-mark = [in_code(o[0]) for o in offs]          # 每 token 是否落在代码围栏内
-print("  全语料 %d token, 代码 token 占比 %.1f%% (围栏 %d 段)" % (
-    len(allids), 100.0*sum(mark)/len(mark), len(spans)))
+def dom(s):
+    n = [c for c in s if not c.isspace()]
+    if "```" in s: return "code"
+    if re.search(r"\$[^$\n]{2,}\$|\\frac|\\alpha|\\beta", s): return "math"
+    if re.search(r"\b(How many|What is the|Find the|Calculate|Simplify|Solve for|Evaluate)\b", s): return "math"
+    cjk = sum(1 for c in n if 0x3040<=ord(c)<=0x30ff or 0x4e00<=ord(c)<=0x9fff or 0xac00<=ord(c)<=0xd7af)
+    cyr = sum(1 for c in n if 0x400<=ord(c)<=0x4ff)
+    ara = sum(1 for c in n if 0x600<=ord(c)<=0x6ff)
+    if (cjk+cyr+ara)/len(n) > 0.10:
+        return "cjk" if cjk>=max(cyr,ara) else ("cyrillic" if cyr>=ara else "arabic")
+    if sum(1 for c in n if 128<=ord(c)<0x250)/len(n) > 0.015: return "euro"
+    if re.search(r"\{#sec|\[@ref|\{ref-type=|\^\[@", s): return "academic"
+    if re.search(r"^\s*(def |function |class |public |private |import )", s): return "code"
+    return "prose"
 
-B = 256   # 块越细, 交错后两半的主题组成越接近
-idx = list(range(len(allids)))
-blocks = [idx[i:i+B] for i in range(0, len(idx), B)]
-halfQ = [t for i, b in enumerate(blocks) if i % 2 == 0 for t in b]
-halfA = [t for i, b in enumerate(blocks) if i % 2 == 1 for t in b]
-def code_pct(sel): return 100.0*sum(mark[t] for t in sel)/max(len(sel), 1)
-pq, pa = code_pct(halfQ), code_pct(halfA)
-print("  交错切半(块=%d, 零重叠): 量化半 %d token 代码 %.1f%% | 放大器半 %d token 代码 %.1f%% (差 %.2fpp)" % (
-    B, len(halfQ), pq, len(halfA), pa, abs(pq-pa)))
-if abs(pq - pa) > 2.0: sys.exit("★两半池子组成失衡 —— 切法不合格★")
+# ② 连续同域行 → 文档簇(整簇不拆)
+clusters, cur = [], None
+for ln in lines:
+    d = dom(ln)
+    if cur and cur[0] == d: cur[1].append(ln)
+    else:
+        if cur: clusters.append(cur)
+        cur = [d, [ln]]
+if cur: clusters.append(cur)
+for c in clusters:
+    c.append(tok.encode("\n".join(c[1]), add_special_tokens=False).ids)
 
-def sample_win(pool, N, CH, path):
-    w = N // CH; step = (len(pool) - w - N % CH) // (CH - 1)
-    sel = []
-    for c in range(CH):
-        ww = w + (N % CH if c == CH - 1 else 0)
-        sel += pool[c*step : c*step+ww]
+# ③ 每域内贪心平衡: 大簇优先给当前 token 较少的一半
+byd = collections.defaultdict(list)
+for c in clusters: byd[c[0]].append(c)
+poolQ, poolA = collections.defaultdict(list), collections.defaultdict(list)
+for d, cs in byd.items():
+    cs.sort(key=lambda c: -len(c[2]))
+    tq = ta = 0
+    for c in cs:
+        if tq <= ta: poolQ[d] += c[2]; tq += len(c[2])
+        else:        poolA[d] += c[2]; ta += len(c[2])
+
+alld = sorted(byd, key=lambda d: -sum(len(c[2]) for c in byd[d]))
+tot = sum(len(c[2]) for cs in byd.values() for c in cs)
+print("  语料 %d token / %d 行 / %d 文档簇, %d 个域" % (tot, len(lines), len(clusters), len(byd)))
+print("  %-10s %8s | %8s %8s" % ("域", "全语料", "量化半池", "反修半池"))
+for d in alld:
+    print("  %-10s %8d | %8d %8d" % (d, sum(len(c[2]) for c in byd[d]), len(poolQ[d]), len(poolA[d])))
+
+def sample(pool, N, path):
+    """按域配额分层抽: 配额∝该域全局占比, 域内等距铺窗(窗宽 128)。小域至少给 1 窗。"""
+    W = 128
+    share = {d: sum(len(c[2]) for c in byd[d])/tot for d in byd}
+    quota = {d: max(W, int(N*share[d])//W*W) for d in byd if pool[d]}
+    while sum(quota.values()) > N:                       # 从最大域回收超额
+        d = max(quota, key=lambda x: quota[x]); quota[d] -= W
+    while sum(quota.values()) < N:
+        d = max(quota, key=lambda x: share[x]); quota[d] += W
+    sel, got = [], {}
+    for d in sorted(quota, key=lambda x: -quota[x]):
+        p, q = pool[d], min(quota[d], len(pool[d])//W*W or len(pool[d]))
+        nw = max(1, q//W)
+        step = max(1, (len(p)-W)//max(1, nw-1)) if nw > 1 else 0
+        s2 = []
+        for k in range(nw): s2 += p[k*step : k*step+W]
+        s2 = s2[:q]; got[d] = len(s2); sel += s2
+    if len(sel) < N:                                     # 补足: 从最大域续窗
+        d = max(pool, key=lambda x: len(pool[x])); sel += pool[d][:N-len(sel)]; got[d] = got.get(d,0)+N-len(sel)
     sel = sel[:N]
-    assert len(sel) == N, (len(sel), N)
-    open(path, "w").write("\n".join(str(allids[t]) for t in sel) + "\n")
-    print("  %-16s %6d token  代码 %.1f%%" % (path.split("/")[-1], N, code_pct(sel)))
-    return code_pct(sel)
-cq = sample_win(halfQ, NQ, CH, oq)
-ca = sample_win(halfA, NA, CH, oa)
-if abs(cq - ca) > 6.0:
-    print("  注: 两半抽样代码占比差 %.1fpp (64 窗仅覆盖池子 4%%, 抽样方差); 判据以池子为准。" % abs(cq-ca))
+    open(path, "w").write("\n".join(str(t) for t in sel) + "\n")
+    return sel, got
+
+selQ, gq = sample(poolQ, N, oq)
+selA, ga = sample(poolA, N, oa)
+print()
+print("  抽样后每域 token(★全域都要有★):")
+print("  %-10s %8s %8s" % ("域", "量化半", "反修半"))
+for d in alld: print("  %-10s %8d %8d" % (d, gq.get(d,0), ga.get(d,0)))
+miss = [d for d in byd if gq.get(d,0)==0 or ga.get(d,0)==0]
+assert not miss, "★有域没被抽到: %s★" % miss
+
+def ov(a, b):
+    ca, cb = collections.Counter(a), collections.Counter(b); na, nb = len(a), len(b)
+    return sum(min(ca[t]/na, cb[t]/nb) for t in set(a)|set(b))
+w = [int(x) for x in open(wt2) if x.strip()]
+print()
+print("  ★两半 token 分布重合 = %.3f★ (越低越好: 两半越不像, 反修才有独立拟合料)" % ov(selQ, selA))
+print("  两半对 wt2 词表覆盖: 量化半 %.1f%% / 反修半 %.1f%%" % (
+    100*len(set(w)&set(selQ))/len(set(w)), 100*len(set(w)&set(selA))/len(set(w))))
 PY
 }
 
