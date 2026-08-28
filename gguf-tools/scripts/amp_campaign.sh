@@ -813,6 +813,67 @@ stage_judge3(){
     echo "★注: 这是同域尺, 不取代 wt2 官方判决 —— 两个数一起看★"
 }
 
+# ═══ 三段单层针(2026-08-28 用户令"量化/反修/sweep 各一层, 速度质量都要")═══
+# 用【旧锚+配套旧 ids】跑, 不等新锚(新锚要 90 分钟, 而这针要的是速度和质量的当前读数)。
+#   锚 anchor_a_clean_s8192.bin(8月24, 30.8G) ↔ old_split/vqhalf_a.ids —— 这一对是配套的;
+#   量化锚已被 anchors3 的 rm -f 删掉(重捕被我停在半路), 所以量化段也借这一对, 反正针只量
+#   速度和质量, 不产交付物。
+# 三段各跑一层, 每段单独计墙钟 + 打质量:
+#   ①量化一层: 时间 + VQ 逐层 cos/bpw + 收官 VERDICT(Σmin/KL/top1)
+#   ②反修一层: 时间 + 分布还原率(Σmin/KL/top1) + 逐段计时 [LT]
+#   ③sweep 一层: 时间 + BFUNIT Δ + 出口分
+# 目标 20s/段(用户令)。跑完把三个数并排打出来, 达不到就报实测不粉饰。
+stage_probe3(){
+    local D2="$ROOT/gguf/go-onebit/vqhalf"
+    local W="$D2/champ86"
+    local AN="$D2/anchor_a_clean_s8192.bin"
+    local ID="$D2/old_split/vqhalf_a.ids"
+    local PW="$D2/p3"
+    [ -s "$AN" ] || DIE "旧反修锚不在: $AN"
+    [ -s "$ID" ] || DIE "旧 ids 不在: $ID"
+    local T0 T1 T2 T3
+    # ── ①量化一层(写进独立 scratch, 不碰任何交付层件) ──
+    LOG "①量化一层 → $PW"
+    rm -rf "$PW"; mkdir -p "$PW"
+    T0=$(date +%s)
+    watchdog_start
+    ( cd "$ROOT" && env PROBE1=1 QBIN_OVERRIDE="$ROOT/gguf-tools/amp/ds4quant_run" \
+        Q86_IDS="$ID" Q86_S=8192 Q86_NFIT=6144 Q86_ANCHOR="$AN" Q86_OUT="$PW" \
+        RPLAN86="$ROOT/gguf/go-onebit/r30/rplan_base86p.txt" VOLB86=76 \
+        DS4_BF_MEMGB=55 DS4_THREADS=20 OPENBLAS_NUM_THREADS=1 \
+        DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-0731" \
+        bash "$SC/r30_campaign.sh" quant86 ) > /tmp/p3_quant.log 2>&1
+    watchdog_stop
+    T1=$(date +%s)
+    # ── ②反修一层(层件先复位到纯净量化态) ──
+    LOG "②反修一层"
+    stage_champ_reset >/dev/null 2>&1 || true
+    T1=$(date +%s)
+    stage_champbf champ86 probe >/dev/null 2>&1 || true
+    cp -f "$W/backfit.log" /tmp/p3_bf.log 2>/dev/null || true
+    T2=$(date +%s)
+    # ── ③sweep 一层(要 ≥2 层才有 BFUNIT 单元: 前沿 L1 修前层 L0) ──
+    LOG "③sweep 一层"
+    stage_champ_reset >/dev/null 2>&1 || true
+    T2=$(date +%s)
+    ( cd "$ROOT" && env PROBE_NL2=1 OUTF_OVERRIDE="$W" ANCHOR_OVERRIDE="$AN" IDS_OVERRIDE="$ID" \
+        BF_S=8192 BF_NFIT=6144 DS4_THREADS=20 DS4_NL=2 DS4_GSWEEP=0 DS4_GO2B_HOT=0 \
+        DS4_BF_MEMGB=55 OPENBLAS_NUM_THREADS=1 DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-0731" \
+        MALLOC_MMAP_THRESHOLD_=1073741824 MALLOC_TRIM_THRESHOLD_=1073741824 \
+        QBIN_OVERRIDE="$ROOT/gguf-tools/amp/ds4quant_run" \
+        bash "$SC/r30_campaign.sh" backfit ) > /tmp/p3_sweep.log 2>&1
+    T3=$(date +%s)
+    echo
+    echo "════════ 三段单层针 ════════"
+    printf "①量化一层   墙钟 %3ds\n" $((T1-T0))
+    grep -aE "cos=|bpw|VERDICT" /tmp/p3_quant.log | tail -4 | sed 's/^/    /'
+    printf "②反修一层   墙钟 %3ds\n" $((T2-T1))
+    grep -aE "\[LT\] L00|分布还原率" /tmp/p3_bf.log 2>/dev/null | tail -3 | sed 's/^/    /'
+    printf "③sweep 一层 墙钟 %3ds\n" $((T3-T2))
+    grep -aE "^BFUNIT|出口L|BF_ONEPASS 终验" /tmp/p3_sweep.log | tail -4 | sed 's/^/    /'
+    echo "★目标 20s/段。日志: /tmp/p3_{quant,bf,sweep}.log★"
+}
+
 # ═══ ELM 针(2026-08-28 用户令"1、2 打一针再决策")═══
 # 要回答两件事, 都靠同一次跑的读数, 不靠推理:
 #   ①ELM 闭式乘性非线性 z 在【本底座本语料】上 held 行为挽回能不能上 10%
@@ -1020,7 +1081,7 @@ ST="${1:-all}"
 case "$ST" in
   preflight) stage_preflight;; ids) stage_ids;; anchor) stage_anchor;;
   capture) stage_capture;; probe) stage_probe;; solve) stage_solve;; pass2) stage_pass2;;
-  chain) stage_chain;; judge) stage_judge;; dilute) stage_dilute;; idshalf) stage_idshalf;; idshalf_ext) shift; stage_idshalf_ext "$@";; vqquant) stage_vqquant;; vqmerge) stage_vqmerge;; vqcap) stage_vqcap;; vqsolve) stage_vqsolve;; dynladder) stage_dynladder;; dynquant) shift; stage_dynquant "$@";; dynjudge) stage_dynjudge;; champbf) shift; stage_champbf "$@";; champ86) stage_champ86;; champreset) stage_champ_reset;; champ3rd) stage_champ3rd;; corpdiff) stage_corpdiff;; anchors3) stage_anchors3;; champ3) stage_champ3;; elmprobe) stage_elmprobe;; judge3) shift; stage_judge3 "$@";; champrb) stage_champ_rbsweep;; full) shift; stage_full "$@";;
+  chain) stage_chain;; judge) stage_judge;; dilute) stage_dilute;; idshalf) stage_idshalf;; idshalf_ext) shift; stage_idshalf_ext "$@";; vqquant) stage_vqquant;; vqmerge) stage_vqmerge;; vqcap) stage_vqcap;; vqsolve) stage_vqsolve;; dynladder) stage_dynladder;; dynquant) shift; stage_dynquant "$@";; dynjudge) stage_dynjudge;; champbf) shift; stage_champbf "$@";; champ86) stage_champ86;; champreset) stage_champ_reset;; champ3rd) stage_champ3rd;; corpdiff) stage_corpdiff;; anchors3) stage_anchors3;; champ3) stage_champ3;; elmprobe) stage_elmprobe;; probe3) stage_probe3;; judge3) shift; stage_judge3 "$@";; champrb) stage_champ_rbsweep;; full) shift; stage_full "$@";;
   all) stage_preflight; stage_ids; stage_anchor; stage_capture
        stage_solve; stage_chain; stage_judge;;
   *) echo "未知段: $ST"; echo "段: preflight ids anchor capture solve pass2 chain judge dilute all (probe/dilute=诊断)"; exit 2;;
