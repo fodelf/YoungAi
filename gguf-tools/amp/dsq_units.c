@@ -154,14 +154,15 @@ int dsq_quant_matrix(const float *W, int rows, int cols, int dim, int nc,
 }
 
 /* 同上, 但把反量化后的权重写出来(反修要拿量化态权重再前向一遍) */
-int dsq_quant_matrix_wq(const float *W,int rows,int cols,int dim,int nc,float *Wq_out,double *relh)
+int dsq_quant_matrix_wq(const float *W,int rows,int cols,int dim,int nc,
+                        const float *X,int n_act,float *Wq_out,double *relh)
 {
     if(!W||!Wq_out||cols%dim) return -1;
     const int nvec=rows*(cols/dim);
     float *Cb=malloc((size_t)nc*dim*4); int *idx=malloc((size_t)nvec*4);
     float *gr=malloc((size_t)rows*4);
     if(!Cb||!idx||!gr){ free(Cb);free(idx);free(gr); return -1; }
-    vq_encode_full(W,rows,cols,dim,nc,NULL,0,Cb,idx,gr,Wq_out);
+    vq_encode_full(W,rows,cols,dim,nc,X,n_act,Cb,idx,gr,Wq_out);
     if(relh){ double e=0,w=0;
         for(size_t i=0;i<(size_t)rows*cols;i++){ const double d=(double)W[i]-Wq_out[i]; e+=d*d; w+=(double)W[i]*W[i]; }
         *relh=sqrt(e/(w+1e-30)); }
@@ -283,7 +284,8 @@ static int t_sweep(void)
 /* ══ 真模型一层模式 ══════════════════════════════════════════════════════════
  * 用法: dsq_units_test --hf <HF目录> --anchor <锚文件> --layer L [--experts N] [--rows S]
  * 三段全吃真数据, 各报墙钟 + 质量:
- *   ①量化 : 从 HF 读第 L 层前 N 个专家的 w1/w3/w2, 逐个走 dsq_quant_matrix
+ *   ①量化 : 从 HF 读第 L 层前 N 个专家的 w1/w3/w2 全部量化(v4x512=86G 平权档),
+ *           校准激活按生产口径分矩阵给: w1/w3←Xc(命中 token 的 x), w2←中间态 h
  *   ②反修 : x 取锚里的 fin[L](★这就是该层 MoE 的真输入★), 路由取 ridx/rw;
  *           y_fp = FP 专家前向, y_q = 量化权重前向, dH = 差 ⇒ elm_solve
  *   ③sweep: 用②的真实候选分跑落地决策
@@ -353,29 +355,36 @@ static int real_layer(const char *hf,const char *anc,int L,int NE,int SROW)
         float *e1=st_read_weight(&C,n1,&r,&c), *e3=st_read_weight(&C,n3,&r,&c),
               *e2=st_read_weight(&C,n2,&r,&c);
         if(!e1||!e3||!e2){ printf("专家 %d 权重缺\n",e); free(e1);free(e3);free(e2); break; }
-        double rh; size_t bt;
-        for(int w=0;w<3;w++){
-            const float *W = w==0?e1:(w==1?e3:e2);
-            const int rows = w==2?D:M, cols = w==2?M:D;
-            if(dsq_quant_matrix(W,rows,cols,4,512,NULL,0,&rh,&bt)==0){
-                relh_sum+=rh; bytes+=bt; nq++; }
-        }
-        /* 本专家的 token 集合(路由命中), FP 与量化各前向一遍 */
+        /* 本专家命中的 token = 该专家的校准激活 Xc(生产口径, ds4quant_run_p9:89) */
         int nt=0;
         for(int s2=0;s2<SROW;s2++) for(int a2=0;a2<NACT;a2++)
             if(RI[(size_t)s2*NACT+a2]==e){ tok[nt]=s2; ww[nt]=RW[(size_t)s2*NACT+a2];
                 memcpy(xs+(size_t)nt*D,X+(size_t)s2*D,(size_t)D*4); nt++; break; }
-        if(nt){
-            float *aF=calloc((size_t)nt*D,4), *aQ=calloc((size_t)nt*D,4);
-            expert_fwd(xs,e1,e3,e2,ww,aF,nt,D,M);
-            /* 量化态 w2(最肥的那个)重建后前向, w1/w3 用 FP —— 隔离出 w2 的量化误差 */
-            double rh2; dsq_quant_matrix_wq(e2,D,M,4,512,Wq,&rh2);
-            expert_fwd(xs,e1,e3,Wq,ww,aQ,nt,D,M);
-            for(int i=0;i<nt;i++) for(int d=0;d<D;d++){
-                YF[(size_t)tok[i]*D+d]+=aF[(size_t)i*D+d];
-                YQ[(size_t)tok[i]*D+d]+=aQ[(size_t)i*D+d]; }
-            free(aF);free(aQ);
-        }
+        if(!nt){ free(e1);free(e3);free(e2); continue; }
+        /* ★校准激活按生产口径分矩阵给★(p9:89/145 w1,w3←Xc; p9:155-161 w2←中间态 h):
+         * 全传 NULL(无加权)会把 relh 从 0.09-0.18 抬到 0.27, 完全不是生产质量。 */
+        double rh; size_t bt;
+        float *q1=malloc((size_t)M*D*4), *q3=malloc((size_t)M*D*4);
+        if(dsq_quant_matrix(e1,M,D,4,512,xs,nt,&rh,&bt)==0){ relh_sum+=rh; bytes+=bt; nq++; }
+        dsq_quant_matrix_wq(e1,M,D,4,512,xs,nt,q1,NULL);
+        if(dsq_quant_matrix(e3,M,D,4,512,xs,nt,&rh,&bt)==0){ relh_sum+=rh; bytes+=bt; nq++; }
+        dsq_quant_matrix_wq(e3,M,D,4,512,xs,nt,q3,NULL);
+        /* w2 的校准激活 = 中间态 h = silu(x@w1)·(x@w3) */
+        float *hc=malloc((size_t)nt*M*4),*gg=malloc((size_t)nt*M*4);
+        dq_matmul(xs,e1,hc,nt,D,M); dq_matmul(xs,e3,gg,nt,D,M);
+        for(size_t i=0;i<(size_t)nt*M;i++){ const float t=hc[i]; hc[i]=(t/(1.0f+expf(-t)))*gg[i]; }
+        free(gg);
+        if(dsq_quant_matrix(e2,D,M,4,512,hc,nt,&rh,&bt)==0){ relh_sum+=rh; bytes+=bt; nq++; }
+        dsq_quant_matrix_wq(e2,D,M,4,512,hc,nt,Wq,NULL);
+        free(hc);
+        /* FP 与【三矩阵全量化】各前向一遍 —— 这才是该层真实的量化误差 */
+        float *aF=calloc((size_t)nt*D,4), *aQ=calloc((size_t)nt*D,4);
+        expert_fwd(xs,e1,e3,e2,ww,aF,nt,D,M);
+        expert_fwd(xs,q1,q3,Wq,ww,aQ,nt,D,M);
+        for(int i=0;i<nt;i++) for(int d=0;d<D;d++){
+            YF[(size_t)tok[i]*D+d]+=aF[(size_t)i*D+d];
+            YQ[(size_t)tok[i]*D+d]+=aQ[(size_t)i*D+d]; }
+        free(aF);free(aQ);free(q1);free(q3);
         free(e1);free(e3);free(e2);
     }
     const double t1=vqt_now();
