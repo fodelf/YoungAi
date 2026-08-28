@@ -621,6 +621,38 @@ stage_champ86(){
     bash "$SC/caliper_ref.sh" "$W/layers" /tmp/qc_champ86.bin 2>&1 | tail -10
 }
 
+# ═══ champ86 ⓪: 把层件复位成"刚量化完"的状态(2026-08-28)═══
+# 用途: 反修被打断/中途改过代码后重跑。用户令是"重头跑从量化开始", 而量化段 08-28 09:26
+# 已 rc=0 跑满 43/43, 且 champ86/layers/dql_L00.bin 与只读原件 vq86h_noz 的同名文件
+# ★md5 逐字节相同★ —— 说明这套量化是确定性的, 重跑只会产出同样的字节。
+# 于是"从量化开始"在实质上 = 把层件恢复到量化刚结束的字节状态, 再让反修从零起跑。
+# (铁律 feedback_staged_rerun_scope: 下游段失败不许无脑销毁完好的上游产物。)
+# 反修会往层件里追加记录、并落 zrec_LXX.bin, 所以复位 = 逐文件比对只读原件, 不等就覆盖,
+# 原件没有的(zrec 等反修产物)一律删。全程只动 champ86, 绝不碰 vq86h_noz。
+stage_champ_reset(){
+    local D2="$ROOT/gguf/go-onebit/vqhalf" W="$D2/champ86" SRC="$D2/vq86h_noz"
+    [ -d "$SRC/layers" ] || DIE "只读原件不在: $SRC/layers"
+    [ -d "$W/layers" ]   || DIE "工作副本不在: $W/layers"
+    local n_rm=0 n_cp=0 n_ok=0
+    # ① 原件没有的文件 = 反修产物, 删
+    for f in "$W/layers"/*; do
+        local b; b=$(basename "$f")
+        [ -e "$SRC/layers/$b" ] || { rm -f "$f"; n_rm=$((n_rm+1)); }
+    done
+    # ② 原件有的: 逐字节比, 不等就从原件覆盖
+    for f in "$SRC/layers"/*; do
+        local b; b=$(basename "$f")
+        if cmp -s "$f" "$W/layers/$b"; then n_ok=$((n_ok+1))
+        else cp -f "$f" "$W/layers/$b"; n_cp=$((n_cp+1)); LOG "  复位 $b"; fi
+    done
+    rm -f "$W/backfit.log" "$W/route_bias_r30.bin" "$W/route_bias_r30.bin.alpha.txt" "$W/rb_alpha.txt"
+    LOG "层件复位完成: 原样 $n_ok / 覆盖 $n_cp / 删反修产物 $n_rm"
+    # ③ 复位后逐字节全量复核(不许只信上面的循环)
+    if diff -rq "$SRC/layers" "$W/layers" > /tmp/champ_reset_diff.txt 2>&1; then
+        LOG "★复核通过: champ86/layers 与只读原件逐字节一致★"
+    else DIE "复核失败, 差异见 /tmp/champ_reset_diff.txt: $(head -3 /tmp/champ_reset_diff.txt)"; fi
+}
+
 # ═══ champ86 ④: 路由偏置 α 在【本底座本语料】上实扫(2026-08-28 用户纠)═══
 # ★不许直接用冠军的 2.5★ 那是 r64 在【它自己的底座(热108 go2b+冷1bit)+它自己的语料
 # (rr code S=305)】上扫出来的峰(曲线: ≤1.0 阈下无效 / 1.5→80.3 / 2.0→81.6 / ★2.5→84.2★
@@ -649,7 +681,7 @@ ST="${1:-all}"
 case "$ST" in
   preflight) stage_preflight;; ids) stage_ids;; anchor) stage_anchor;;
   capture) stage_capture;; probe) stage_probe;; solve) stage_solve;; pass2) stage_pass2;;
-  chain) stage_chain;; judge) stage_judge;; dilute) stage_dilute;; idshalf) stage_idshalf;; idshalf_ext) shift; stage_idshalf_ext "$@";; vqquant) stage_vqquant;; vqmerge) stage_vqmerge;; vqcap) stage_vqcap;; vqsolve) stage_vqsolve;; dynladder) stage_dynladder;; dynquant) shift; stage_dynquant "$@";; dynjudge) stage_dynjudge;; champbf) shift; stage_champbf "$@";; champ86) stage_champ86;; champrb) stage_champ_rbsweep;; full) shift; stage_full "$@";;
+  chain) stage_chain;; judge) stage_judge;; dilute) stage_dilute;; idshalf) stage_idshalf;; idshalf_ext) shift; stage_idshalf_ext "$@";; vqquant) stage_vqquant;; vqmerge) stage_vqmerge;; vqcap) stage_vqcap;; vqsolve) stage_vqsolve;; dynladder) stage_dynladder;; dynquant) shift; stage_dynquant "$@";; dynjudge) stage_dynjudge;; champbf) shift; stage_champbf "$@";; champ86) stage_champ86;; champreset) stage_champ_reset;; champrb) stage_champ_rbsweep;; full) shift; stage_full "$@";;
   all) stage_preflight; stage_ids; stage_anchor; stage_capture
        stage_solve; stage_chain; stage_judge;;
   *) echo "未知段: $ST"; echo "段: preflight ids anchor capture solve pass2 chain judge dilute all (probe/dilute=诊断)"; exit 2;;
