@@ -109,31 +109,22 @@ static void elma_worker(void *vc, int i0, int i1){
  * 逐个 deflation 求 512 个特征对是 O(k²n), 太慢; 块幂迭代一次拿整个子空间。
  * PCA 方向只是 tanh 的特征基(ELM 随机特征同族), 近似子空间足够 —— 何况最终还要
  * 和"固定 seed 随机方向"在 held 上比一场, approximation 好不好由 held 说了算。 */
-typedef struct { const double *M; const float *V; float *T; int D, K; } elmp_ctx;
-static void elmp_worker(void *vc, int j0, int j1){   /* 按输出列 j 切: T[j] = Σ_i M[i][j]·V[i] */
-    elmp_ctx *c = (elmp_ctx*)vc;
-    for(int j=j0;j<j1;j++){
-        float *Tj = c->T + (size_t)j*c->K;
-        for(int k2=0;k2<c->K;k2++) Tj[k2] = 0.0f;
-        for(int i=0;i<c->D;i++){
-            const double m = (j>=i) ? c->M[(size_t)i*c->D+j] : c->M[(size_t)j*c->D+i];
-            if(m == 0.0) continue;
-            const float *Vi = c->V + (size_t)i*c->K;
-            for(int k2=0;k2<c->K;k2++) Tj[k2] += (float)(m*Vi[k2]);
-        }
-    }
-}
-static void elm_pca_dirs(const double *M, int D, int K, float *V0, uint64_t *seed){
-    float *V = malloc((size_t)D*K*4), *T = malloc((size_t)D*K*4);
+/* ★块幂迭代走生产 GEMM(铁律: 只有 GPU 版本)★ 12 轮 × D²K ≈ 1e11, 自己写循环即使 20 线程
+ * 也要几十秒。M 是【全对称阵】(dq_matmul 出的完整 D×D, 不是上三角), 所以
+ * T[D,K] = M[D,D]·V[D,K] 可以直接 dq_matmul(A=M[D,D], B=VT[K,D], out=T[D,K]) = M·VTᵀ。
+ * V 在 mgs 里是 [D][K] 布局, 故每轮转一次 VT[K][D](D·K=2M 元素, 忽略不计)。 */
+static void elm_pca_dirs(const float *M, int D, int K, float *V0, uint64_t *seed){
+    float *V = malloc((size_t)D*K*4), *T = malloc((size_t)D*K*4), *VT = malloc((size_t)K*D*4);
     for(size_t i=0;i<(size_t)D*K;i++) V[i] = lcg_unit(seed);
     mgs(V, (uint32_t)D, (uint32_t)K, seed);
-    for(int it=0; it<12; it++){                      /* 块幂迭代: 12 轮 × D²K ≈ 1e11, 必须并行 */
-        elmp_ctx pc={M,V,T,D,K}; zpar_for(D, 20, elmp_worker, &pc);
+    for(int it=0; it<12; it++){
+        for(int d=0;d<D;d++) for(int c=0;c<K;c++) VT[(size_t)c*D+d] = V[(size_t)d*K+c];
+        dq_matmul(M, VT, T, D, D, K);                /* T[D,K] = M[D,D]·VT[K,D]ᵀ */
         memcpy(V, T, (size_t)D*K*4);
         mgs(V, (uint32_t)D, (uint32_t)K, seed);
     }
     memcpy(V0, V, (size_t)D*K*4);
-    free(V); free(T);
+    free(V); free(T); free(VT);
 }
 
 /* ── 主解算 ─────────────────────────────────────────────────────────────────
@@ -206,15 +197,20 @@ static int elm_solve(const float *X, const float *YQ, const float *DH,
 
     /* ④ 两套 V₀: PCA(Xa 去均值的二阶矩 top-K) 与 固定 seed 随机 */
     float *Vp = malloc((size_t)D*K*4), *Vr = malloc((size_t)D*K*4);
-    {   double *M = calloc((size_t)D*D, sizeof(double));
+    {   /* ★协方差走生产 GEMM(铁律 2026-08-28 只有 GPU 版本)★
+         * 原来是 elmg_worker 的 D²/2×na ≈ 1.03e11 次 double 标量乘加(20 线程也要 40 秒),
+         * 换 dq_matmul(带 -DDS4QUANT_CUDA 走 cuBLAS, 否则走 BLAS sgemm) 一句解决。
+         * dq_matmul(A[S,K],B[M,K],out[S,M]) = A·Bᵀ ⇒ 要 XcT[D][na], 转置一次(200MB)。 */
         float *mu = calloc((size_t)D, 4);
         for(int i=0;i<na;i++){ const float *x=Xa+(size_t)i*D; for(int d=0;d<D;d++) mu[d]+=x[d]; }
         for(int d=0;d<D;d++) mu[d] /= (float)na;
-        float *Xc = malloc((size_t)na*D*4);
-        for(int i=0;i<na;i++){ const float *x=Xa+(size_t)i*D; float *y=Xc+(size_t)i*D;
-            for(int d=0;d<D;d++) y[d] = x[d]-mu[d]; }
-        { elmg_ctx gc={Xc,M,na,D}; zpar_for(D, 20, elmg_worker, &gc); }
-        free(Xc); free(mu);
+        float *XcT = malloc((size_t)D*na*4);
+        for(int i=0;i<na;i++){ const float *x=Xa+(size_t)i*D;
+            for(int d=0;d<D;d++) XcT[(size_t)d*na+i] = x[d]-mu[d]; }
+        free(mu);
+        float *M = malloc((size_t)D*D*4);
+        dq_matmul(XcT, XcT, M, D, na, D);      /* M[D,D] = XcT·XcTᵀ = XcᵀXc */
+        free(XcT);
         uint64_t s3 = 0x5A5A1EEDULL;
         elm_pca_dirs(M, D, K, Vp, &s3);
         free(M);
