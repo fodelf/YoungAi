@@ -277,7 +277,9 @@ static void bytes_moe(lfile_t*lf,int S,const float*Fin,const int*idx,const float
     const int lay_skip=replay_layer_skipped();
     if(!lay_skip) for(int i=lf->nops-1;i>=0;i--) if(lf->ops[i].type==5&&lf->ops[i].ge){ ge=lf->ops[i].ge; break; }
     int nth=NTHREADS<1?1:(NTHREADS>NEXP?NEXP:NTHREADS); int e_next=0;
+    double bmt0=vqt_now();
     bmw_pool(nth,S);
+    double bmt_pool=vqt_now()-bmt0;
     bmw_t *ws=calloc((size_t)nth,sizeof(bmw_t)); pthread_t *th=malloc((size_t)nth*sizeof(pthread_t));
     for(int t=0;t<nth;t++){ ws[t]=(bmw_t){lf,S,Fin,idx,rw,&e_next,BMW_BUF[t].partial,ge,
                                           BMW_BUF[t].partial_c,t};
@@ -285,6 +287,7 @@ static void bytes_moe(lfile_t*lf,int S,const float*Fin,const int*idx,const float
     /* 冷热分桶缓存重建(hot=partial / cold=partial_c 归约) */
     if(BM_S!=S){ free(BM_RH); free(BM_RC); BM_RH=malloc((size_t)S*DIM*4); BM_RC=malloc((size_t)S*DIM*4); BM_S=S; }
     for(int t=0;t<nth;t++) pthread_join(th[t],NULL);
+    double bmt_wk=vqt_now()-bmt0-bmt_pool, bmt1=vqt_now();
     /* ★归约并行化(2026-08-28)★ 原为主线程串行 20×2×S·DIM 次加(S=8192 时 13.4 亿次 +
      * 5.4GB 读)。按元素区间切给线程, 每元素内仍按 t 升序累加 ⇒ 浮点求和顺序不变, 逐位同值。 */
     { bmred_t *rs=malloc((size_t)nth*sizeof(bmred_t));
@@ -294,6 +297,8 @@ static void bytes_moe(lfile_t*lf,int S,const float*Fin,const int*idx,const float
           pthread_create(&th[t],NULL,bmw_reduce_worker,&rs[t]); }
       for(int t=0;t<nth;t++) pthread_join(th[t],NULL);
       free(rs); }
+    fprintf(stderr,"[bm2] 池=%.2f 专家墙钟=%.2f(内 dequant=%.2f 前向墙钟=%.2f) 归约=%.2f\n",
+            bmt_pool,bmt_wk,g_bmw_t[0],g_bmw_t[1]/(double)nth,vqt_now()-bmt1);
     free(ws);free(th);
     /* ★Fcur=专家后·ops前的态(shared+base_routed)=coadapt 的 base态 Fcur★: TREF(type4)按 coadapt 口径
      * 从 Fcur 插值(Fout=Fcur+t·(Fout−Fcur)), 而非从 shared 缩放(否则 t 把 routed 整体放大, 抵消临界点处 Fout 翻倍误差)。*/
