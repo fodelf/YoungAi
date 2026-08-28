@@ -270,16 +270,16 @@ static int elm_solve(const float *X, const float *YQ, const float *DH,
                 memcpy(G, ZtZ, (size_t)K*K*sizeof(double));
                 for(int a=0;a<K;a++) G[(size_t)a*K+a] += lam*trz/K + 1e-10;
                 if(cholesky(G,(uint32_t)K) != 0) continue;
+                /* U = G⁻¹·ZᵀR。★走 BLAS 三角求解, 不用自写回代★(铁律: 只有 GPU 版本)
+                 * 原来是 chol_solve_multi 按 16 列分块自写前代/回代: K²×D×5λ×3支 ≈ 1.6e10 次
+                 * 标量运算 + 每块一次 malloc/两次拷贝, 是反修剩下的最后一个 CPU 大头。
+                 * cholesky() 把 L 写在【行主序下三角】(A[i*d+j], i≥j), 正是 CblasLower 的口径;
+                 * 一次 dtrsm 解 L·Y=B, 再一次(Trans)解 Lᵀ·X=Y, 全部 D 列一起做, 零分块零拷贝。 */
                 memcpy(Ub, ZtR, (size_t)K*D*sizeof(double));
-                /* U = G⁻¹·ZᵀR: chol_solve_multi 吃 [d][nr] 布局, 这里 D 列一次 16 个 */
-                for(int d0=0; d0<D; d0+=16){
-                    const int nr = (d0+16<=D)?16:(D-d0);
-                    double *B = malloc((size_t)K*nr*sizeof(double));
-                    for(int a=0;a<K;a++) for(int r=0;r<nr;r++) B[(size_t)a*nr+r] = ZtR[(size_t)a*D+d0+r];
-                    chol_solve_multi(G,(uint32_t)K,B,nr);
-                    for(int a=0;a<K;a++) for(int r=0;r<nr;r++) Ub[(size_t)a*D+d0+r] = B[(size_t)a*nr+r];
-                    free(B);
-                }
+                cblas_dtrsm(CblasRowMajor, CblasLeft, CblasLower, CblasNoTrans,
+                            CblasNonUnit, K, D, 1.0, G, K, Ub, D);
+                cblas_dtrsm(CblasRowMajor, CblasLeft, CblasLower, CblasTrans,
+                            CblasNonUnit, K, D, 1.0, G, K, Ub, D);
                 /* k 是前缀: 按列秩-1 累加, 在网格点上评 held(免得每个 k 重算整个矩阵乘) */
                 /* ★k 网格改按点 GEMM(铁律: 只有 GPU 版本)★ 原来是"按列秩-1 累加, 到网格点取快照",
                  * 省 flops 但全是 CPU 标量(K×nev×D×5λ×3支 ≈ 1.6e10, 实测占反修剩余时间一半)。
