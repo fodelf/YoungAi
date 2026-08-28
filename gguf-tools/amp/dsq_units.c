@@ -414,22 +414,76 @@ static int real_layer(const char *hf,const char *anc,int L,int NE,int SROW,int V
                sqrt(eq/(ef+1e-30)), vs, SROW-vs);
     } else printf("②反修   %6.1fs  解算失败(rc=%d)\n", t3-t2, erc);
 
-    /* ── ③sweep ── */
+    /* ── ③sweep: 候选评估(真活) ──
+     * ★口径与限制, 先说清楚★: 候选评估逐行同生产(dsq_sweep_layer ← p7:410-440)。
+     * 但 hc 混合系数 post/comb 是链上残差流经 dq_hc_sinkhorn 现算的, 全流程不落盘
+     * ⇒ per-layer 单测拿不到链上真值(这是结构性限制, 不是没做)。这里用锚的 H[L]
+     * (教师 hc 真值)当 resid 与 Hf, post/comb 由生产 dq_hc_sinkhorn 从 H 的确定性
+     * 归约现算。所以:
+     *   ✓ 速度 = 真(工作量纯由形状定: 每候选一次 S×HCM×DIM 的 hc 合成 + val 行出口分)
+     *   ✓ 门行为 = 真(真 z、真信任域夹持、真判据 e1<e0-1e-9、首个过门即落地)
+     *   ★✗ 出口分【绝对值】≠ 生产链上的 e0 —— 不许拿它跟战役日志里的 e0 对表★
+     * 反修臂用生产 ds4_z_solve(闭式 ridge + 秩截断)=冠军 r64c 那一族(加性 zl.RRR),
+     * 不是 ②的乘性 ELM —— FP 口径下乘性已判无肉(fable5:5330), 加性才是冠军主力。 */
     const double t4=vqt_now();
-    const double base=1.0;
-    double cand[2]={ erc==0 ? 1.0-er.held : (0.0/0.0),
-                     erc==0 ? 1.0-er.held_lin : (0.0/0.0) };
-    int win=-1; double ws=base;                       /* ★不落地时 ws 必须留在 base★ */
-    const int land=dsq_sweep_pick(base,cand,2,0.05,&win,&ws);
-    /* ★不落地就没有"终验"可言★(2026-08-28 修): 原来无条件调 dsq_sweep_commit(base,ws),
-     * 而 land=0 时 ws 是未初始化的 0 ⇒ 0<1.0 恒真 ⇒ 报"终验=提交" —— 假读数。
-     * 终验的语义是"落了东西之后在全量上复核", 没落地时它不该被调用。 */
+    int land=-1, k_land=0, n_eval=0; double e0s=0, e1s=0, t_zsolve=0, t_hcw=0;
+    if(ancHCM!=HCM){
+        printf("③sweep  锚 HCM=%d ≠ 编译期 HCM=%d, 跳过(生产 p1 也是写死 4)\n", ancHCM, HCM);
+    } else {
+        const size_t hb=(size_t)SROW*HCM*D;
+        float *HF=malloc(hb*4), *HQ=malloc(hb*4);
+        float *mix=malloc((size_t)SROW*(2*HCM+HCM*HCM)*4);
+        float *pre=malloc((size_t)SROW*HCM*4), *pst=malloc((size_t)SROW*HCM*4);
+        float *cmb=malloc((size_t)SROW*HCM*HCM*4);
+        float *Ftry=malloc((size_t)SROW*D*4), *Fout=malloc((size_t)SROW*D*4);
+        /* 锚布局: [40] fin | ridx | rw | H[NL][S][HCM][DIM] | logits */
+        const size_t rw_b=(size_t)NL*S*NACT*4;
+        int hrc = HF&&HQ&&mix&&pre&&pst&&cmb&&Ftry&&Fout &&
+                  fseek(f,40+(long)fin_b+(long)ridx_b+(long)rw_b+
+                          (long)((size_t)L*S*HCM*D*4),SEEK_SET)==0 &&
+                  fread(HF,4,hb,f)==hb;
+        if(!hrc){ printf("③sweep  锚 H[L] 读失败, 跳过\n"); }
+        else {
+            /* mixes 的确定性归约(见上"限制"): 每行取 H 各 hc 分量的均值做特征 */
+            const int nm=2*HCM+HCM*HCM;
+            for(int sx=0;sx<SROW;sx++){
+                float *mo=mix+(size_t)sx*nm;
+                for(int j=0;j<HCM;j++){ double m=0; const float*h=HF+((size_t)sx*HCM+j)*D;
+                    for(int d=0;d<D;d++) m+=h[d]; m/=D;
+                    mo[j]=(float)m; mo[HCM+j]=(float)m; }
+                for(int j=0;j<HCM*HCM;j++) mo[2*HCM+j]=mix[(size_t)sx*nm+(j%HCM)];
+            }
+            const float hsc[2]={1.0f,1.0f}; float hbase[2*HCM+HCM*HCM]; 
+            for(int j=0;j<nm;j++) hbase[j]=0.0f;
+            const double th0=vqt_now();
+            dq_hc_sinkhorn(mix,hsc,hbase,pre,pst,cmb,SROW,HCM,3,1e-6f);
+            t_hcw=vqt_now()-th0;
+            /* 反修臂: 生产闭式解, rank=64(冠军 K64) */
+            const double tz0=vqt_now();
+            ds4_z *zl=ds4_z_solve(X,DH,(uint32_t)SROW,(uint32_t)D,(uint32_t)D,64,1.0f);
+            t_zsolve=vqt_now()-tz0;
+            if(!zl) printf("③sweep  ds4_z_solve 返回 NULL, 跳过\n");
+            else {
+                memcpy(Fout,YQ,(size_t)SROW*D*4);
+                const int LZRANK=64;
+                const int cand[7]={LZRANK,LZRANK/2,16,8,8,4,1};   /* 生产 cand0 同款 */
+                printf("③sweep  候选评估(生产 ZLGATE 口径, 真 z rank=64, 信任域 LZTR=0.5):\n");
+                land=dsq_sweep_layer(zl,X,Fout,Ftry,HF,pst,cmb,HQ,HF,
+                                     SROW,vs,SROW,0.5f,cand,7,&k_land,&e0s,&e1s,&n_eval);
+                ds4_z_free(zl);
+            }
+        }
+        free(HF);free(HQ);free(mix);free(pre);free(pst);free(cmb);free(Ftry);free(Fout);
+    }
     const double t5=vqt_now();
-    printf("③sweep  %6.3fs  基线=%.6f 候选{ELM %.6f, 线性 %.6f} 增益门=5%%\n",
-           t5-t4, base, cand[0], cand[1]);
-    if(land) printf("         → 落地 win=%d ws=%.6f | 终验(base→ws)=%s\n",
-                    win, ws, dsq_sweep_commit(base,ws)?"提交":"回滚");
-    else     printf("         → 不落地(无候选过门) —— 终验不适用, 不调用\n");
+    if(land>=0){
+        printf("③sweep  %6.1fs  评了 %d 个候选 (z解算 %.1fs + hc系数 %.2fs + 候选评估 %.1fs)\n",
+               t5-t4, n_eval, t_zsolve, t_hcw, (t5-t4)-t_zsolve-t_hcw);
+        if(land==1) printf("         → k=%d 落地  出口分 %.6f→%.6f (降 %.3f%%)\n",
+                           k_land,e0s,e1s,(e0s-e1s)/(e0s>1e-30?e0s:1)*100.0);
+        else        printf("         → 全拒(%d 个候选无一过门 e1<e0-1e-9), Fout 不动\n", n_eval);
+        printf("         ★出口分绝对值不可与战役日志对表(hc 系数非链上真值, 见代码注释)★\n");
+    }
     if(erc==0) elm_free(&er);
     free(X);free(RI);free(RW);free(YQ);free(YF);free(DH);free(tok);free(ww);free(xs);free(Wq);
     return 0;
