@@ -34,3 +34,18 @@ LOG "合并发车(全 VQ --no-down)"
     --dql-host 127.0.0.1 --dql-dir "$LAYERS" \
     --out "$MDL" || { LOG "★合并失败★"; exit 5; }
 LOG "合并完: $(ls -la "$MDL" | awk '{printf "%.2f GB", $5/1e9}')"
+
+# ★路由反修落地: α·Δb 烘进 blk.L.exp_probs_b.bias(冠军 r64 原样)★
+# 2026-08-28 补: 反修段(DS4_ROUTE_BIAS_FIT)会产出 Δb, 但本脚本此前【零处理】—— Δb 算了
+# 没人用, 等于路由反修白做。冠军是在合并时烘进去, 引擎侧零改动(只改选择分不动权重分)。
+# α=2.5 是冠军定值(实测曲线 ≤1.0 阈下无效 / 1.5→80.3 / 2.0→81.6 / ★2.5→84.2★ / 3.0 过冲回落)。
+# route_alpha_set 幂等: 首跑存裸态快照 <model>.bias0.bin, 之后每次从快照绝对重写, α 可来回扫。
+RB="${M86_RB:-$(dirname "$LAYERS")/route_bias_r30.bin}"
+if [ -s "$RB" ]; then
+    RBA="${M86_RB_ALPHA:-2.5}"
+    "$ROOT/gguf-tools/route_alpha_set" "$MDL" "$RB" "$RBA" \
+        && LOG "路由偏置已烘: α=$RBA Δb=$(ls -l "$RB" | awk '{printf "%.1fKB", $5/1024}')" \
+        || { LOG "★路由偏置烘焙失败★"; exit 6; }
+else
+    LOG "★Δb 不在($RB) — 路由反修未落地, 合并出的是无路由修正版★"
+fi

@@ -288,21 +288,17 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
         { double cand=scE; if(scF<cand)cand=scF; if(scA<cand)cand=scA; if(scB<cand)cand=scB; if(scC<cand)cand=scC; if(scD<cand)cand=scD;
           double dl=(base-cand)/(base>1e-12?base:1); jdl=100.0*dl;
           if(dl>bf_bestdl){ bf_bestdl=dl; bf_bestJ=J; } }
-        if(form&&scr){
+        if(form&&scr&&!onep){
             /* ★全闸复核★: 粗筛只定排序; 胜者内存试装 → 真前沿×全token 重打, 必须净降才放行
              * (落地判据与旧全量逐字节同口径; 未过=还原+保持, 复检 pass 仍可再试)
+             * ONEPASS: 跳过 — 逐单元全程复核被收尾统一终验+全回滚取代
              *
-             * ★2026-08-27: ONEPASS 不再跳过这道闸(原 !onep 条件已删)★
-             * 原理由"逐单元全程复核被收尾统一终验+全回滚取代"经实测证伪:
-             *   粗筛口径 = 抽 1/12 行(DS4_BF_SCREEN_DIV) × 近视野出口(eF=min(J+BK,Lfront))。
-             *   标量候选(bf.GL 乘常数)对这个近似免疫; ★dyn8 不免疫★ —— 它的 9 dof 在抽样行上
-             *   岭回归拟合、增益 c=w8[0]+Σw8[1+k]·pr[k] 是输入投影的线性函数, 换到全量分布
-             *   立刻失配并系统性撞 clamp 上限 4.0。
-             *   实撞(lyr86, 两跑逐位复现): L41 bf.GL −2.38% + L40 bf.GL −2.00% + L39
-             *   ★bf.GLdyn8★ −5.09% 三个粗筛口径下都是真收益 → 评 L38 时基线
-             *   0.4302→34.8462(80×) 链闸硬停, 收尾统一终验根本没机会执行。
-             * 本块只读不写 HQE(胜者试装后完整还原), 打开它不破坏 ONEPASS 冻结基线语义,
-             * 代价=每个有胜者的单元多一次真前沿全量前向。 */
+             * ★2026-08-28 用户令还原冠军原版★ 我 08-27 曾删掉 !onep 让 ONEPASS 也走这道闸,
+             * 理由是"三候选复合炸 L38"。该理由已被证伪(零落地那跑照样炸, 真因=锚索引 bug,
+             * 已单独修复)。且实测它把落地全挡死(0落地/4保持): 粗筛分只在 128 行上估
+             * (SDIV=12, 打分区 1536 行抽 128), 相对标准误 ~1/√128≈8.8%, 要求每个候选单独
+             * 在噪声里自证必然过不了。冠军设计本就是靠【聚合】对抗噪声 —— 不看单个候选,
+             * 只看所有落地合起来在全量行上净降(功效高得多)。恢复原状。 */
             g_anc_rowmap = NULL;   /* 复核走全量行 ⇒ 锚回恒等映射 */
             float*Hf0=gs_forward_exit(J,Lfront,Hin,ids,S,n_fit,NULL);
             double basef=co_score(Hf0,Htgt,vs,n_fit,rowsz); free(Hf0);
@@ -460,15 +456,9 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
     return changed;
 }
 
-/* 分块驱动: 从高层往低层, 每 CH 层一块(见 backfit_prev_chunk 头注)。 */
+/* ★2026-08-28 用户令: 冠军 r64(08-05)没有分块, 还原单次全域调用★
+ * DS4_BF_CHUNK 是 08-07 "增益蒸发"战役才加的后续修复, 不属于 r64 配方。
+ * backfit_prev_chunk 的实现保留(参数化的边界), 这里只用 [0,Lfront) 一次调完 = 原语义。 */
 static int backfit_prev(int Lfront,const long*ids,int S,int n_fit){
-    const int CH=7;   /* 冠军 r64 用值; 写死不走 env */
-    int changed=0;
-    for(int hi=Lfront; hi>0; ){
-        int lo=hi-CH; if(lo<0) lo=0;
-        fprintf(stderr,"[分块ONEPASS] 块 [L%02d,L%02d) / 真前沿 L%d\n",lo,hi,Lfront);
-        changed |= backfit_prev_chunk(lo,hi,Lfront,ids,S,n_fit);
-        hi=lo;
-    }
-    return changed;
+    return backfit_prev_chunk(0,Lfront,Lfront,ids,S,n_fit);
 }
