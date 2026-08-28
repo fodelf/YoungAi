@@ -230,18 +230,13 @@ void dq_attention(const float *x, const float *wqa, const float *qnorm, const fl
                   float *out, int S, int DIM, int NH, int HD, int RD, int QLR, int OLR, int OG,
                   int WIN, int Sc, int ratio, float EPS) {
     int N = S + Sc;
-    double dt_[7]; struct timespec _p,_c; clock_gettime(CLOCK_MONOTONIC,&_p);
-    #define _MK(i) do{ clock_gettime(CLOCK_MONOTONIC,&_c); \
-        dt_[i]=(_c.tv_sec-_p.tv_sec)+1e-9*(_c.tv_nsec-_p.tv_nsec); _p=_c; }while(0)
     float *qr = (float*)malloc((size_t)S*QLR*sizeof(float));
     float *qra = (float*)malloc((size_t)S*QLR*sizeof(float));
     dq_matmul(x, wqa, qra, S, DIM, QLR);
     for (int s=0;s<S;s++) dq_rms(qra+(size_t)s*QLR, qnorm, qr+(size_t)s*QLR, QLR, EPS);
-    _MK(0);
     att_pool((size_t)S*NH*HD);
     float *q = ATT_Q;
     dq_matmul(qr, wqb, q, S, QLR, NH*HD);
-    _MK(1);
     /* per-head rms (mean over HD) + rope — s 切片并行(逐位同) */
     dq_arw arw = { q, NULL, NULL, NULL, cos_t, sin_t, S, NH, HD, RD, EPS };
     dq_ar_par(dq_ar_qrms, &arw, S);
@@ -256,9 +251,7 @@ void dq_attention(const float *x, const float *wqa, const float *qnorm, const fl
     memcpy(kva, kv, (size_t)S*HD*sizeof(float));
     if (Sc>0) memcpy(kva+(size_t)S*HD, kvc, (size_t)Sc*HD*sizeof(float));
     float scale = 1.0f/sqrtf((float)HD);
-    _MK(2);
     float *o = ATT_O;
-    _MK(3);
 #ifdef DQ_BLAS
     /* per-head 两个 gemm: SC_h=Q_h·kva^T, O_h=P_h·kva. mask/softmax/sink 逻辑与标量路径逐字一致. */
 #ifdef DS4QUANT_CUDA
@@ -284,10 +277,8 @@ void dq_attention(const float *x, const float *wqa, const float *qnorm, const fl
 #ifdef DS4QUANT_CUDA
     }
 #endif
-    _MK(4);
     arw.o = o;
     dq_ar_par(dq_ar_irope, &arw, S);       /* inverse rope — s 切片并行(逐位同) */
-    _MK(5);
 #else
     float *scr = (float*)malloc((size_t)N*sizeof(float));
     for (int s=0;s<S;s++) for (int h=0;h<NH;h++) {
@@ -328,7 +319,7 @@ void dq_attention(const float *x, const float *wqa, const float *qnorm, const fl
      * GPU 经 ATS 页粒度直访只有几 GB/s —— 本文件顶部 2026-08-22 那条注释记的就是这个坑)。
      * 要让 GPU 划算, 得先让 o 全程留在显存(irope 也得上 GPU), 那是另一件事。 */
     { typedef struct { const float*o,*wa; float*oo; int S,GD,OLR,NHHD,ldc; } wog_t;
-      const int RB=3, NT=OG*RB;            /* 8 组 × 3 行块 = 24 任务, 铺满 20 核 */
+      const int RB=3;                      /* 8 组 × 3 行块 = 24 任务, 铺满 20 核 */
       wog_t wg[OG*3]; pthread_t wt[OG*3]; int nt=0;
       for(int g=0;g<OG;g++) for(int b=0;b<RB;b++){
           int s0=(int)((long)S*b/RB), s1=(int)((long)S*(b+1)/RB);
@@ -343,13 +334,7 @@ void dq_attention(const float *x, const float *wqa, const float *qnorm, const fl
         for(int r=0;r<OLR;r++){ const float *wr=wo_a+((size_t)g*OLR+r)*GD; float a=0; for(int d=0;d<GD;d++) a+=od[d]*wr[d]; oo[((size_t)s*OG+g)*OLR+r]=a; }
     }
 #endif
-    _MK(6);
     dq_matmul(oo, wo_b, out, S, OG*OLR, DIM);   /* [S,OG*OLR]@wo_b[DIM,OG*OLR].T */
-    { struct timespec _e; clock_gettime(CLOCK_MONOTONIC,&_e);
-      double wob=(_e.tv_sec-_p.tv_sec)+1e-9*(_e.tv_nsec-_p.tv_nsec);
-      fprintf(stderr,"[att2] qa+qrms=%.3f qb(→%dMB)=%.3f kv+qrope=%.3f 核=%.3f irope=%.3f woa=%.3f wob=%.3f\n",
-            dt_[0],(int)((size_t)S*NH*HD*4/1048576),dt_[1],dt_[2],dt_[4],dt_[5],dt_[6],wob); }
-    #undef _MK
     free(qr);free(qra);free(kv);free(kva);free(oo);   /* q/o 属池, 不 free */
 }
 

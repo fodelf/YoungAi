@@ -28,6 +28,7 @@
  * p14: 冷专家修复 + global_sweep + main
  */
 #include "ds4quant_run_p1.inc.c"
+#include "ds4quant_zsolve.inc.c"
 #include "ds4quant_xcap.inc.c"
 #include "ds4quant_anchor.inc.c"
 #include "ds4quant_run_p2.inc.c"
@@ -35,6 +36,7 @@
 #include "ds4quant_run_p4.inc.c"
 #include "ds4quant_run_p5.inc.c"
 #include "ds4quant_run_p6.inc.c"
+#include "ds4quant_bfkernel.inc.c"
 #include "ds4quant_run_p7.inc.c"
 #include "ds4quant_run_p8.inc.c"
 #include "ds4quant_run_p9.inc.c"

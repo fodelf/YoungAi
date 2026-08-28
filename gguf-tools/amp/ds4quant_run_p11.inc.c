@@ -349,7 +349,6 @@
                 } else {
                 int co3=COADAPT; COADAPT=0;
                 g_rb_fit_L=L; RB_ALPHA_L[L]=0;
-                time_t trb=time(NULL);
                 memcpy(Hw,H,lstride*4); set_cand(&MV_G10);
                 lstat_t stq; memset(&stq,0,sizeof(stq));
                 fprintf(stderr,"L%02d [路由FIT] ",L);
@@ -496,14 +495,3 @@
 #ifdef __linux__
         malloc_trim(0);
 #endif
-        /* 护栏碑已删除(2026-08-18 用户令"删除里程碑评估"; 08-04 已裁"没有意义"):
-         * 质量判决由收官 VERDICT/五指标全权。 */
-        /* 单层探针(2026-07-28 用户: "先跑一层看看, 不要蒙头就跑"): 锁满 MAXL 层即收工。
-         * plan/ckpt/产物均已落盘; zfile/zchain 也刷终值(全程跑在 main 尾做, 探针早退补齐);
-         * RESUME=1 从下一层无损续跑。 */
-        if(minvol&&getenv("DS4_MINVOL_MAXL")&&L+1>=atoi(getenv("DS4_MINVOL_MAXL"))){
-            rb_save(); zfile_write(); zchain_write();
-            fprintf(stderr,"[贪心探针] 已锁 %d 层(DS4_MINVOL_MAXL) → 提前收工; RESUME=1 续跑\n",L+1);
-            exit(0);
-        }
-    }

@@ -19,27 +19,18 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
     float *cosr=malloc((size_t)S*(RD/2)*4),*sinr=malloc((size_t)S*(RD/2)*4);
     if(CR[L]>0) dq_freqs_cis(RD,S,65536.0,160000.0,16.0,32.0,1.0,cosr,sinr);
     else dq_freqs_cis(RD,S,0.0,10000.0,16.0,32.0,1.0,cosr,sinr);
-    double at_[7], at_m=vqt_now();
     float *y=malloc((size_t)S*DIM*4),*post=malloc((size_t)S*HCM*4),*comb=malloc((size_t)S*HCM*HCM*4);
     dq_hc_pre(H,W->afn,W->asc,W->abase,y,post,comb,S,HCM,DIM,mixd,HCIT,EPSF,EPSF);
-    at_[0]=vqt_now()-at_m; at_m=vqt_now();
     float *xn=malloc((size_t)S*DIM*4); for(int s=0;s<S;s++)dq_rms(y+(size_t)s*DIM,W->an,xn+(size_t)s*DIM,DIM,EPSF);
     int Sc=0; float *kvc=NULL;
     if(CR[L]>0){ kvc=malloc((size_t)((S/CR[L]+2)*2)*HD*4); Sc=dq_compressor(xn,W->cwkv,W->cwgate,W->cnorm,W->cape,cosr,sinr,kvc,S,DIM,HD,RD,CR[L],EPSF); }
-    at_[1]=vqt_now()-at_m; at_m=vqt_now();
     float *a=malloc((size_t)S*DIM*4);
     dq_attention(xn,W->wqa,W->qn,W->wqb,W->wkv,W->kvn,W->sink,W->woa,W->wob,kvc,cosr,sinr,a,S,DIM,NH,HD,RD,QLR,OLR,OG,WIN,Sc,CR[L],EPSF);
-    at_[2]=vqt_now()-at_m; at_m=vqt_now();
     float *H2=malloc((size_t)S*HCM*DIM*4); dq_hc_post(a,H,post,comb,H2,S,HCM,DIM);
-    at_[3]=vqt_now()-at_m; at_m=vqt_now();
     float *y2=malloc((size_t)S*DIM*4),*post2=malloc((size_t)S*HCM*4),*comb2=malloc((size_t)S*HCM*HCM*4);
     dq_hc_pre(H2,W->ffn,W->fsc,W->fbase,y2,post2,comb2,S,HCM,DIM,mixd,HCIT,EPSF,EPSF);
-    at_[4]=vqt_now()-at_m; at_m=vqt_now();
     float *Fin=malloc((size_t)S*DIM*4); for(int s=0;s<S;s++)dq_rms(y2+(size_t)s*DIM,W->fn,Fin+(size_t)s*DIM,DIM,EPSF);
     if(GS_CAP_L==L&&GS_FIN) memcpy(GS_FIN,Fin,(size_t)S*DIM*4);  if(g_xcap_out) xcap_dump_fin(L,Fin,S);   /* 反修取料 + 量化链 x 捕获 */
-    at_[5]=vqt_now()-at_m;
-    fprintf(stderr,"[atn] hc_pre1=%.2f 压缩=%.2f attention=%.2f hc_post=%.2f hc_pre2=%.2f rms+尾=%.2f\n",
-            at_[0],at_[1],at_[2],at_[3],at_[4],at_[5]);
     g_lt[0]=vqt_now()-lt_mark; lt_mark=vqt_now();   /* ①attn+hc 段完 */
     /* moe 路由(实际激活: 量化遍即被污染激活 = 部署运行时口径) */
     int *idx=malloc((size_t)S*NACT_RT*sizeof(int)); float *rw=malloc((size_t)S*NACT_RT*4);
@@ -361,13 +352,7 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
         if(BF_LT&&BF_LT_L==L){   /* ★B路序贯: 层局部靶(见 bf_fp_routed 注释); 非B路走原漂移靶 */
             memcpy(DF,BF_LT,(size_t)S*DIM*4);
         } else {
-        for(int s=0;s<S;s++){
-            const float *ps=post2+(size_t)s*HCM; double pd=1e-12;
-            for(int j=0;j<HCM;j++) pd+=(double)ps[j]*ps[j];
-            for(int d=0;d<DIM;d++){ double a2=0;
-                for(int j=0;j<HCM;j++) a2+=(double)ps[j]*((double)Hf[((size_t)ANCROW(s)*HCM+j)*DIM+d]-(double)Hq[((size_t)s*HCM+j)*DIM+d]);
-                DF[(size_t)s*DIM+d]=(float)(a2/pd); }
-        }
+            bfdf_ctx dfc={post2,Hf,Hq,DF}; zpar_for(S,20,bfdf_worker,&dfc);
         }
         free(Hq);
         /* fit 内部再切 val: 前 vs 行拟合, [vs,n_fit) 选秩+GO门(k=0 可关本层 z); held 永不参与 */
@@ -396,10 +381,7 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
               const float *Hf2=ANC.H+(size_t)L*ancS*HCM*DIM;   /* 同上: 锚步长用 ancS 不是 lst2(=S*HCM*DIM) */
               /* 基线 val 出口 relL2 */
               double e0; { dq_hc_post(Fout,H2,post2,comb2,Hq2,S,HCM,DIM);
-                double e2=0,a2=0;
-                for(int s=vs;s<n_fit;s++){ const float*hq=Hq2+(size_t)s*HCM*DIM,*hf=Hf2+(size_t)ANCROW(s)*HCM*DIM;
-                    for(size_t i=0;i<(size_t)HCM*DIM;i++){ double d=(double)hq[i]-hf[i]; e2+=d*d; a2+=(double)hf[i]*hf[i]; } }
-                e0=sqrt(e2/(a2+1e-30)); }
+                e0=bf_exit_relL2(Hq2,Hf2,vs,n_fit); }
               g_lt[4]=vqt_now()-lt_mark-g_lt[3]-g_lt[6]-g_lt[7]; lt_mark=vqt_now();   /* ④其余(扣三项) */
               { static double bf_e0_prev=-1.0;   /* ★链闸(2026-08-25)★: 逐层基线日志+失控守卫 */
                 fprintf(stderr,"[链闸] L%02d 基线val出口=%.4f 前层=%.4f 靶=%s\n",
@@ -426,10 +408,7 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
                     for(int d2=0;d2<DIM;d2++) fw[d2]+=sc2*zd[d2];
                 }
                 double e1; { dq_hc_post(Ftry,H2,post2,comb2,Hq2,S,HCM,DIM);
-                  double e2=0,a2=0;
-                  for(int s=vs;s<n_fit;s++){ const float*hq=Hq2+(size_t)s*HCM*DIM,*hf=Hf2+(size_t)ANCROW(s)*HCM*DIM;
-                      for(size_t i=0;i<(size_t)HCM*DIM;i++){ double d=(double)hq[i]-hf[i]; e2+=d*d; a2+=(double)hf[i]*hf[i]; } }
-                  e1=sqrt(e2/(a2+1e-30)); }
+                  e1=bf_exit_relL2(Hq2,Hf2,vs,n_fit); }
                 printf("ZLGATE L=%d k=%d val出口relL2 %.6f→%.6f %s\n",L,kk,e0,e1,e1<e0-1e-9?"✓落地":"✗拒");
                 fflush(stdout);
                 if(e1<e0-1e-9){

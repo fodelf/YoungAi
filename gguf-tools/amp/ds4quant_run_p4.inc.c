@@ -251,9 +251,7 @@ static int bmw_batch_dequant(lfile_t*lf){
      * 768 个矩阵头(每个 16 字节, 分散在整个文件里)。实测这一段 3.1s, 而真正的 GPU dequant
      * 内核只有 0.90s —— 全是逐 4KB 按需缺页的代价。MADV_WILLNEED 让内核一次性顺序预读整段,
      * 后面的 kernel 也要读同一片payload, 一并受益。异步返回, 不阻塞。 */
-    double jt0=vqt_now();
     madvise((void*)lf->vqmap, lf->vqmsz, MADV_WILLNEED);
-    double jt_adv=vqt_now()-jt0;
     for(int e=0;e<NEXP;e++) for(int w=0;w<3;w++){
         const uint64_t off=vtab[(size_t)e*3+w];
         if(!off) return 0;                       /* 冷槽混合层: 退回逐矩阵路径 */
@@ -278,19 +276,15 @@ static void bytes_moe(lfile_t*lf,int S,const float*Fin,const int*idx,const float
     /* ★逐层口径(2026-08-28 改)★ 原为全程累计, 我曾把它当墙钟误读一次(1731s 实为 20 线程
      * 累计 ÷20 = 87s)。改为每次进本函数清零 + 每层打印, 并显式标注"20线程累计/墙钟"两栏。 */
     { extern double g_bmw_t[2]; g_bmw_t[0]=0; g_bmw_t[1]=0; }
-    double bm_ent=vqt_now();
 #ifdef DS4QUANT_CUDA
     g_bmw_batched=bmw_batch_dequant(lf);
 #endif
-    double bm_deq=vqt_now()-bm_ent;
     float *Fbase=malloc((size_t)S*DIM*4); memcpy(Fbase,Fout,(size_t)S*DIM*4);   /* shared 基 */
     const float *ge=NULL;   /* bf.GE(type-5, 取最后一条): per-expert 增益, 专家累加时乘(链 op 之前) */
     const int lay_skip=replay_layer_skipped();
     if(!lay_skip) for(int i=lf->nops-1;i>=0;i--) if(lf->ops[i].type==5&&lf->ops[i].ge){ ge=lf->ops[i].ge; break; }
     int nth=NTHREADS<1?1:(NTHREADS>NEXP?NEXP:NTHREADS); int e_next=0;
-    double bmt0=vqt_now();
     bmw_pool(nth,S);
-    double bmt_pool=vqt_now()-bmt0;
     bmw_t *ws=calloc((size_t)nth,sizeof(bmw_t)); pthread_t *th=malloc((size_t)nth*sizeof(pthread_t));
     for(int t=0;t<nth;t++){ ws[t]=(bmw_t){lf,S,Fin,idx,rw,&e_next,BMW_BUF[t].partial,ge,
                                           BMW_BUF[t].partial_c,t};
@@ -298,7 +292,6 @@ static void bytes_moe(lfile_t*lf,int S,const float*Fin,const int*idx,const float
     /* 冷热分桶缓存重建(hot=partial / cold=partial_c 归约) */
     if(BM_S!=S){ free(BM_RH); free(BM_RC); BM_RH=malloc((size_t)S*DIM*4); BM_RC=malloc((size_t)S*DIM*4); BM_S=S; }
     for(int t=0;t<nth;t++) pthread_join(th[t],NULL);
-    double bmt_wk=vqt_now()-bmt0-bmt_pool, bmt1=vqt_now();
     /* ★归约并行化(2026-08-28)★ 原为主线程串行 20×2×S·DIM 次加(S=8192 时 13.4 亿次 +
      * 5.4GB 读)。按元素区间切给线程, 每元素内仍按 t 升序累加 ⇒ 浮点求和顺序不变, 逐位同值。 */
     { bmred_t *rs=malloc((size_t)nth*sizeof(bmred_t));
@@ -308,7 +301,6 @@ static void bytes_moe(lfile_t*lf,int S,const float*Fin,const int*idx,const float
           pthread_create(&th[t],NULL,bmw_reduce_worker,&rs[t]); }
       for(int t=0;t<nth;t++) pthread_join(th[t],NULL);
       free(rs); }
-    double bm_red=vqt_now()-bmt1;
     free(ws);free(th);
     /* ★Fcur=专家后·ops前的态(shared+base_routed)=coadapt 的 base态 Fcur★: TREF(type4)按 coadapt 口径
      * 从 Fcur 插值(Fout=Fcur+t·(Fout−Fcur)), 而非从 shared 缩放(否则 t 把 routed 整体放大, 抵消临界点处 Fout 翻倍误差)。*/
@@ -402,9 +394,6 @@ static void bytes_moe(lfile_t*lf,int S,const float*Fin,const int*idx,const float
     }
     if(xn)free(xn); if(pj)free(pj);
     free(Fbase); free(Fcur);
-    fprintf(stderr,"[bm2] 总=%.2f | dequant=%.2f 前段(Fbase+ge扫)=%.2f 池=%.2f 专家墙钟=%.2f 归约=%.2f 尾段(Fcur+回放链)=%.2f | nops=%d\n",
-            vqt_now()-bm_ent, bm_deq, bmt0-bm_ent-bm_deq, bmt_pool, bmt_wk, bm_red,
-            vqt_now()-bmt1-bm_red, lf->nops);
     { int nth2=NTHREADS>0?NTHREADS:1;
       /* ★口径必须显式标注★: dequant 计数器同时接收两条路 —— 批量路(单线程调一次, 值即墙钟)
        * 与逐矩阵回退路(20 线程累计, 要 ÷线程数)。不标 batched 旗标就无法判读, 我曾误读过一次。 */

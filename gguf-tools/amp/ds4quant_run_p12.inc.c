@@ -1,3 +1,15 @@
+        /* 护栏碑已删除(2026-08-18 用户令"删除里程碑评估"; 08-04 已裁"没有意义"):
+         * 质量判决由收官 VERDICT/五指标全权。 */
+        /* 单层探针(2026-07-28 用户: "先跑一层看看, 不要蒙头就跑"): 锁满 MAXL 层即收工。
+         * plan/ckpt/产物均已落盘; zfile/zchain 也刷终值(全程跑在 main 尾做, 探针早退补齐);
+         * RESUME=1 从下一层无损续跑。 */
+
+        if(minvol&&getenv("DS4_MINVOL_MAXL")&&L+1>=atoi(getenv("DS4_MINVOL_MAXL"))){
+            rb_save(); zfile_write(); zchain_write();
+            fprintf(stderr,"[贪心探针] 已锁 %d 层(DS4_MINVOL_MAXL) → 提前收工; RESUME=1 续跑\n",L+1);
+            exit(0);
+        }
+    }
     plan_out[NLAYERS]=0;
     rb_save();   /* 序贯路由: 收官落盘 Δb+α(交付侧车) */
     free(Hw);free(Hb);free(Hf2); if(H2)free(H2);

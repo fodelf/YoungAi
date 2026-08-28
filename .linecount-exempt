@@ -28,3 +28,8 @@ gguf-tools/amp/hbase.c
 
 # GPU 单文件工具惯例(续): IQ2_XXS 编码器 CUDA 化, 逐位契约绑 CPU 版
 gguf-tools/quantize/quantize_gpu.cu
+
+# EXCEPTION: 单函数 >500 行(续)。layer_fwd 是反修的单层前向, 一个函数从头到尾;
+# 2026-08-28 为记录两个隐蔽 bug 的根因(锚索引用了抽格后的 S / bf_fp_routed 生产者守卫
+# 与消费者不对齐)加了必要注释而越线 —— 拆函数体要真模型逐位闸, 是后续工序。
+gguf-tools/amp/ds4quant_run_p7.inc.c

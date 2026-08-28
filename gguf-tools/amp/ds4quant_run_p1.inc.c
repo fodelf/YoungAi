@@ -329,91 +329,10 @@ static void gs_lw_evict(int upto){   /* 驱逐 [0,upto) 里已缓存的最低层
  * 复用 ds4_z.c 同-TU static 原语 cholesky/cholesky_solve/mgs/lcg_unit + 子空间迭代因子分解.
  * (遗留 z 工具链的落地实现, 本文件当前不调用, 保留供 z_explore 流复活。) */
 __attribute__((unused))
-/* ★z_solve_dual 并行化(2026-08-23 时长账: 单线程 600GFLOP=5min/层 → 20 线程)★
- * 数学不动: Gram 上三角/回代列/W 重建行 三段独立可并行; cholesky 分解保持单线程。 */
-typedef struct { void (*fn)(void*,int,int); void *ctx; int i0,i1; } zpf_arg;
-static void *zpf_tramp(void *a){ zpf_arg *p=(zpf_arg*)a; p->fn(p->ctx,p->i0,p->i1); return NULL; }
-static void zpar_for(int n,int nth,void (*fn)(void*,int,int),void *ctx){
-    if(nth>n)nth=n>0?n:1; if(nth>32)nth=32;
-    pthread_t th[32]; zpf_arg pa[32]; int per=(n+nth-1)/nth,cnt=0;
-    for(int t=0;t<nth;t++){ int i0=t*per,i1=i0+per>n?n:i0+per; if(i0>=i1)break;
-        pa[cnt]=(zpf_arg){fn,ctx,i0,i1};
-        if(pthread_create(&th[cnt],NULL,zpf_tramp,&pa[cnt])){ pa[cnt].fn(ctx,i0,i1); continue; }
-        cnt++; }
-    for(int t=0;t<cnt;t++) pthread_join(th[t],NULL);
-}
-typedef struct { const float*X; double*G; uint32_t n,d_in; } zg_ctx;
-static void zg_worker(void *vc,int a0,int a1){ zg_ctx*c=(zg_ctx*)vc;
-    for(int a=a0;a<a1;a++){ const float*xa=c->X+(size_t)a*c->d_in;
-        for(uint32_t b=(uint32_t)a;b<c->n;b++){ const float*xb=c->X+(size_t)b*c->d_in; double s=0;
-            for(uint32_t i=0;i<c->d_in;i++) s+=(double)xa[i]*xb[i]; c->G[(size_t)a*c->n+b]=s; } } }
-typedef struct { const double*G; const float*R; double*al; uint32_t n,d_out; } zs_ctx;
-static void cholesky_solve(const double *L, uint32_t d, double *b);   /* ds4_z.c 同-TU 原语(本就 const) */
-#define cholesky_solve_nc cholesky_solve
-static void zs_worker(void *vc,int j0,int j1){ zs_ctx*c=(zs_ctx*)vc;
-    double *cc=malloc((size_t)c->n*sizeof(double));
-    for(int j=j0;j<j1;j++){ for(uint32_t a=0;a<c->n;a++) cc[a]=c->R[(size_t)a*c->d_out+j];
-        cholesky_solve_nc(c->G,c->n,cc);
-        for(uint32_t a=0;a<c->n;a++) c->al[(size_t)a*c->d_out+j]=cc[a]; }
-    free(cc); }
-typedef struct { const float*X; const double*al; float*W; uint32_t n,d_in,d_out; } zw_ctx;
-static void zw_worker(void *vc,int i0,int i1){ zw_ctx*c=(zw_ctx*)vc;
-    for(int i=i0;i<i1;i++){ float*Wi=c->W+(size_t)i*c->d_out;
-        for(uint32_t j=0;j<c->d_out;j++)Wi[j]=0.0f;
-        for(uint32_t a=0;a<c->n;a++){ double xai=c->X[(size_t)a*c->d_in+i]; if(xai==0.0)continue;
-            const double*ala=c->al+(size_t)a*c->d_out;
-            for(uint32_t j=0;j<c->d_out;j++) Wi[j]+=(float)(xai*ala[j]); } } }
+/* z_solve_dual 拆去了 ds4quant_zsolve.inc.c(紧跟本文件 include), 但本文件后面还有调用者,
+ * 故留一条 static 前向声明。 */
 static ds4_z *z_solve_dual(const float *X, const float *R, uint32_t n,
-                           uint32_t d_in, uint32_t d_out, uint32_t rank, float lambda){
-    if(!X||!R||!n||!d_in||!d_out||!rank) return NULL;
-    if(rank>d_in)rank=d_in; if(rank>d_out)rank=d_out; if(rank>n)rank=n;
-    double *G=calloc((size_t)n*n,sizeof(double)); if(!G) return NULL;
-    { zg_ctx gc={X,G,n,d_in}; zpar_for((int)n,20,zg_worker,&gc); }
-    double tr=0; for(uint32_t a=0;a<n;a++) tr+=G[(size_t)a*n+a];       /* tr(XX^T)=tr(X^TX) */
-    double ridge=(double)lambda*(tr/(double)d_in)+1e-10;              /* primal 口径 ridge */
-    for(uint32_t a=0;a<n;a++){ G[(size_t)a*n+a]+=ridge;
-        for(uint32_t b=a+1;b<n;b++) G[(size_t)b*n+a]=G[(size_t)a*n+b]; }
-    if(cholesky(G,n)!=0){ free(G); return NULL; }
-    double *al=malloc((size_t)n*d_out*sizeof(double));
-    if(!al){free(G);return NULL;}
-    { zs_ctx sc={G,R,al,n,d_out}; zpar_for((int)d_out,20,zs_worker,&sc); }   /* α=G^-1 R, 列并行 */
-    free(G);
-    float *W=malloc((size_t)d_in*d_out*sizeof(float)); if(!W){free(al);return NULL;}
-    { zw_ctx wc={X,al,W,n,d_in,d_out}; zpar_for((int)d_in,20,zw_worker,&wc); }  /* W=X^T α, 行并行 */
-    free(al);
-    /* 子空间迭代 rank-k 截断 (与 ds4_z_solve 尾部一致) */
-    ds4_z *zl=calloc(1,sizeof(*zl));
-    float *V=malloc((size_t)d_in*rank*4),*T=malloc((size_t)d_out*rank*4),*M=malloc((size_t)rank*d_out*4),*U=malloc((size_t)d_out*rank*4),*z=malloc((size_t)rank*4);
-    if(!zl||!V||!T||!M||!U||!z){free(zl);free(V);free(T);free(M);free(U);free(z);free(W);return NULL;}
-    uint64_t seed=0x5A5A1EEDULL;
-    for(size_t i=0;i<(size_t)d_in*rank;i++) V[i]=lcg_unit(&seed);
-    mgs(V,d_in,rank,&seed);
-    for(int it=0;it<12;it++){
-        memset(T,0,(size_t)d_out*rank*4);
-        for(uint32_t i=0;i<d_in;i++){ const float*Wi=W+(size_t)i*d_out,*Vi=V+(size_t)i*rank;
-            for(uint32_t j=0;j<d_out;j++){ float wij=Wi[j]; if(wij==0.0f)continue; float*Tj=T+(size_t)j*rank;
-                for(uint32_t c=0;c<rank;c++) Tj[c]+=wij*Vi[c]; } }
-        for(uint32_t i=0;i<d_in;i++){ const float*Wi=W+(size_t)i*d_out; float*Vi=V+(size_t)i*rank;
-            for(uint32_t c=0;c<rank;c++)Vi[c]=0.0f;
-            for(uint32_t j=0;j<d_out;j++){ float wij=Wi[j]; if(wij==0.0f)continue; const float*Tj=T+(size_t)j*rank;
-                for(uint32_t c=0;c<rank;c++) Vi[c]+=wij*Tj[c]; } }
-        mgs(V,d_in,rank,&seed);
-    }
-    memset(M,0,(size_t)rank*d_out*4);
-    for(uint32_t i=0;i<d_in;i++){ const float*Wi=W+(size_t)i*d_out,*Vi=V+(size_t)i*rank;
-        for(uint32_t c=0;c<rank;c++){ float v=Vi[c]; if(v==0.0f)continue; float*Mc=M+(size_t)c*d_out;
-            for(uint32_t j=0;j<d_out;j++) Mc[j]+=v*Wi[j]; } }
-    for(uint32_t c=0;c<rank;c++){ double nrm=0; const float*Mc=M+(size_t)c*d_out;
-        for(uint32_t j=0;j<d_out;j++) nrm+=(double)Mc[j]*Mc[j]; nrm=sqrt(nrm); z[c]=(float)nrm;
-        float inv=nrm>1e-20?(float)(1.0/nrm):0.0f; for(uint32_t j=0;j<d_out;j++) U[(size_t)j*rank+c]=Mc[j]*inv; }
-    free(M);free(T);free(W);
-    for(uint32_t a=0;a<rank;a++){ uint32_t best=a; for(uint32_t b=a+1;b<rank;b++) if(z[b]>z[best])best=b;
-        if(best!=a){ float tz=z[a];z[a]=z[best];z[best]=tz;
-            for(uint32_t i=0;i<d_in;i++){float tv=V[(size_t)i*rank+a];V[(size_t)i*rank+a]=V[(size_t)i*rank+best];V[(size_t)i*rank+best]=tv;}
-            for(uint32_t j=0;j<d_out;j++){float tu=U[(size_t)j*rank+a];U[(size_t)j*rank+a]=U[(size_t)j*rank+best];U[(size_t)j*rank+best]=tu;} } }
-    zl->U=U;zl->V=V;zl->z=z;zl->d_in=d_in;zl->d_out=d_out;zl->rank=rank;zl->k=rank; return zl;
-}
-
+                           uint32_t d_in, uint32_t d_out, uint32_t rank, float lambda);
 /* 四损失选秩 k_L (产物③旋钮): 在【留出 val 行】(X[n,d]→R[n,d]) 上对候选 k(含 k=0=该层
  * z 关闭的 GO/NO-GO 门) 算 L_align/L_classify/L_smooth/L_fixed, 归一加权取最小。
  * gz 首跑教训: 在拟合行自评→过拟合链式反应(L26 拉出流形→L28 累积1.79); val 评估+k0 门是正解。 */

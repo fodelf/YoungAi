@@ -178,10 +178,10 @@ extern "C" int vqg_attention(const float *q, const float *kva, const float *sink
                     clock_gettime(CLOCK_MONOTONIC, &_t2);
                     if (cudaMemcpy(o, g_at_o, nq * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) return 0;
                     clock_gettime(CLOCK_MONOTONIC, &_t3);
-                    #define _EL2(a,b) ((b).tv_sec-(a).tv_sec + 1e-9*((b).tv_nsec-(a).tv_nsec))
-                    fprintf(stderr,"[gatt] 带状 S=%d N=%d NH=%d HD=%d WIN=%d | H2D=%.3f 核=%.3f D2H=%.3f\n",
-                            S,N,NH,HD,WIN,_EL2(_t0,_t1),_EL2(_t1,_t2),_EL2(_t2,_t3));
-                    #undef _EL2
+                    /* 只报一次: 用来确认带状路真的走上了(静默回落两 gemm 老路 = 慢 5 倍
+                     * 却没有任何症状), 不是逐层刷屏。 */
+                    { static int said = 0; if (!said) { said = 1;
+                        fprintf(stderr,"[gatt] 带状路已启用 S=%d N=%d NH=%d HD=%d WIN=%d\n",S,N,NH,HD,WIN); } }
                     return 1;
                 }
                 cudaGetLastError();   /* 清错, 回落老路 */
@@ -204,9 +204,7 @@ extern "C" int vqg_attention(const float *q, const float *kva, const float *sink
     clock_gettime(CLOCK_MONOTONIC,&_t2);
     if (cudaMemcpy(o, g_at_o, nq * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) return 0;
     clock_gettime(CLOCK_MONOTONIC,&_t3);
-    #define _EL(a,b) ((b).tv_sec-(a).tv_sec + 1e-9*((b).tv_nsec-(a).tv_nsec))
-    fprintf(stderr,"[gatt] S=%d N=%d NH=%d HD=%d WIN=%d | H2D=%.3f 头循环=%.3f D2H=%.3f\n",
-            S,N,NH,HD,WIN,_EL(_t0,_t1),_EL(_t1,_t2),_EL(_t2,_t3));
-    #undef _EL
+    { static int said2 = 0; if (!said2) { said2 = 1;
+        fprintf(stderr,"[gatt] ★回落两-gemm 老路★ S=%d N=%d NH=%d HD=%d WIN=%d\n",S,N,NH,HD,WIN); } }
     return 1;
 }
