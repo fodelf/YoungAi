@@ -274,10 +274,15 @@ def dom(s):
     高符号密度+代码关键词三选一), math 只留真数学(LaTeX 或算术应用题且不带代码特征)。"""
     n = [c for c in s if not c.isspace()]
     if "```" in s: return "code"
+    # ★LaTeX 判定必须在代码关键词之前(2026-08-28 二次收紧)★: 数学题常把 Asymptote 绘图码
+    # 嵌在题面里(如 "The function $f(x)=|x+2|+1$ is graphed below. [asy] import graph;"),
+    # 里面的 import/size() 会让它落进 code —— 它本质是数学题。带 LaTeX 的一律先归 math,
+    # 真代码里出现 $ 的只有 shell/PHP 变量, 不会同时命中 \frac|\cos|\[ 这类。
+    if re.search(r"\\frac|\\sqrt|\\cos|\\sin|\\sum|\\int|\\alpha|\\beta|\\pi\b|\\\[", s): return "math"
+    if re.search(r"\$[^$\n]{2,}\$", s) and not re.search(r"\$\w+\s*=|\$\{", s): return "math"
     if "\\n" in s and len(CODEKW.findall(s)) >= 2: return "code"
     sym = sum(1 for c in s if c in "{}[]()=;<>+*/_|&")
     if sym/max(len(s), 1) > 0.08 and CODEKW.search(s): return "code"
-    if re.search(r"\$[^$\n]{2,}\$|\\frac|\\sqrt|\\alpha|\\beta|\\pi\b", s): return "math"
     if re.search(r"\b(How many|How much|What is the (value|number|smallest|largest|sum|product)|"
                  r"Find the (value|number|sum|area)|Calculate the|Simplify|Solve for|Evaluate the)\b", s) \
        and not CODEKW.search(s): return "math"
