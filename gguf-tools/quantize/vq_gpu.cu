@@ -414,8 +414,10 @@ extern "C" int vqg_alloc_managed(void **p, size_t bytes) {
      * SetPreferredLocation + 预取到设备 ⇒ 页常驻 GPU, 免掉每层的迁移往返。
      * ★数值零影响★: 只是页驻留策略, 不改任何值。 */
     int dev = 0; cudaGetDevice(&dev);
-    cudaMemAdvise(*p, bytes, cudaMemAdviseSetPreferredLocation, dev);
-    cudaMemPrefetchAsync(*p, bytes, dev, 0);
+    /* CUDA 13 起 cudaMemAdvise/Prefetch 收 cudaMemLocation 结构体(不再是 int device) */
+    cudaMemLocation loc; loc.type = cudaMemLocationTypeDevice; loc.id = dev;
+    cudaMemAdvise(*p, bytes, cudaMemAdviseSetPreferredLocation, loc);
+    cudaMemPrefetchAsync(*p, bytes, loc, 0, (cudaStream_t)0);
     cudaDeviceSynchronize();
     cudaGetLastError();   /* 提示类 API 失败不致命, 清错继续(退化=原迁移行为) */
     return 1;
