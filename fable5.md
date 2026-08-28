@@ -7478,3 +7478,44 @@ L37 及以下 (38 个)  近视野 L41/…/L32(量级仅 ~2.5) +0.01% ~ +0.31%
 无约束的 op 就多伤一点。
 **待裁决的单一动作**: DS4_BF_SCREEN_K 4 → ≥42, 让每个单元的落地判据都直接对着真前沿 L42,
 其余照冠军配方不动。代价=sweep 变慢(今天已把层时间 77s→41s, 有预算)。
+
+### 十三、★语料切半重做: 域分层整簇切法(2026-08-28 用户令"不要相似的, 全域都要有")★
+**旧切法的病**: `B=256` token 定长块偶奇交替 —— 同一篇文档的【相邻段落】被分进两半。
+实测两半开头分别是同一篇 IOE/IOP 小鼠肠道菌群论文的相邻段(量化半 "In addition to a
+significant decrease in hepatic lipid..." / 反修半 "SCFA profiles. IOE increased the
+levels of propionate-producing bacteria...")。校准半见过的东西反修半又见一遍, 等于没有
+独立拟合料。
+**新切法三条**:
+① 一行 = 一个文档(这份语料的代码是用字面 `\n` 转义嵌在行内的, 最长行 13183 字符, 按行切
+   绝不会把一段代码劈开);
+② 按内容分 8 域, 连续同域行合成"文档簇", ★整簇只进一半★;
+③ 每域【各自】贪心平衡(大簇优先给较轻的一半) ⇒ 两半都拿到全部 8 域且每域 token 量近乎相等。
+抽样也按域配额分层(旧法 64 窗盲抽, 小域可能一个 token 都抽不到)。
+**分域规则两次收紧**(都是抽样实样逮到的):
+- 一收: 首版把 "Fix this code taken from an OCR result..." 判进 math ⇒ math 段抽出来是代码。
+  改成 code 最优先(围栏/行内转义代码/高符号密度+代码关键词)。
+- 二收: 数学题里嵌的 Asymptote 绘图码("The function $f(x)=|x+2|+1$ is graphed below.
+  [asy] import graph;")被 `import ` 判成 code。改成 LaTeX 判定提到代码关键词之前。
+**终态**(410865 token / 5160 行 / 1819 簇 / 8 域):
+```
+域         全语料 |  量化半池  反修半池      抽样后  量化半  反修半
+prose     236052 |  118026   118026              4736    4736
+code       83823 |   41912    41911              1664    1664
+math       52393 |   26197    26196              1024    1024
+euro       16194 |    8098     8096               256     256
+cjk         8226 |    4113     4113               128     128
+cyrillic    5410 |    2706     2704               128     128
+arabic      5174 |    2588     2586               128     128
+academic    3593 |    1795     1798               128     128
+```
+八域两半内容全不同源(academic: 量化半=De Finetti/PLoS NTD, 反修半=IOE 小鼠论文;
+cjk: 日语地名 vs 繁体政治新闻; euro: 法语 vs 波兰语)。
+**★8-gram 共享不是本语料的有效判据★**: 新法 29 条共享 8-gram, 逐条看全是合成数据集的
+【指令模板】("the bugs in the following code snippet." / "What corrections are needed in
+this code?" / "const SCHEMA_DUBLINC" / "the function $f(x) = \sin("), 没有一条是同一篇
+文档的连续正文。两半都要有 code/math 域就必然共享模板句, 切法消不掉也不该消。真判据是
+"同源文档有没有跨半", 由整簇不拆保证。
+(旧法只有 23 条, 是因为定长块把代码切碎了模板撞得少 —— 代价正是把论文劈成两半。)
+**前置**: 新 ids 已落盘, 但两个 FP 锚(anchor_vqhalf_q_s8192 / anchor_a_clean_s8192)还是
+旧 ids 的, 直接跑会锚料错配(PPL 会飙到 2.4e7 一眼假), 必须先重捕。旧 ids 备份在
+gguf/go-onebit/vqhalf/old_split/。
