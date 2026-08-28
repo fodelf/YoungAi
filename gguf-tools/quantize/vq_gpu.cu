@@ -10,6 +10,7 @@
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
 #include <stdio.h>
+#include <time.h>
 #include <stdint.h>
 
 #define VQG_MAX_NC 512
@@ -496,8 +497,10 @@ extern "C" int vqg_attention(const float *q, const float *kva, const float *sink
     const size_t nq = (size_t)S * NH * HD, nkva = (size_t)N * HD, nsc = (size_t)S * N;
     if (!vqg_at_need(&g_at_q, &g_at_nq, nq) || !vqg_at_need(&g_at_kva, &g_at_nkva, nkva) ||
         !vqg_at_need(&g_at_sc, &g_at_nsc, nsc) || !vqg_at_need(&g_at_o, &g_at_no, nq)) return 0;
+    struct timespec _t0,_t1,_t2,_t3; clock_gettime(CLOCK_MONOTONIC,&_t0);
     if (cudaMemcpy(g_at_q, q, nq * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
     if (cudaMemcpy(g_at_kva, kva, nkva * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) return 0;
+    clock_gettime(CLOCK_MONOTONIC,&_t1);
 
     const float one = 1.0f, zero = 0.0f;
     for (int h = 0; h < NH; h++) {
@@ -512,6 +515,12 @@ extern "C" int vqg_attention(const float *q, const float *kva, const float *sink
                         &zero, g_at_o + (size_t)h * HD, NH * HD) != CUBLAS_STATUS_SUCCESS) return 0;
     }
     if (cudaDeviceSynchronize() != cudaSuccess) return 0;
+    clock_gettime(CLOCK_MONOTONIC,&_t2);
     if (cudaMemcpy(o, g_at_o, nq * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) return 0;
+    clock_gettime(CLOCK_MONOTONIC,&_t3);
+    #define _EL(a,b) ((b).tv_sec-(a).tv_sec + 1e-9*((b).tv_nsec-(a).tv_nsec))
+    fprintf(stderr,"[gatt] S=%d N=%d NH=%d HD=%d WIN=%d | H2D=%.3f 头循环=%.3f D2H=%.3f\n",
+            S,N,NH,HD,WIN,_EL(_t0,_t1),_EL(_t1,_t2),_EL(_t2,_t3));
+    #undef _EL
     return 1;
 }
