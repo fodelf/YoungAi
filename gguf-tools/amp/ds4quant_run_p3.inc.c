@@ -413,7 +413,8 @@ static void zchain_write(void){
 /* 并行专家 worker(bytes_moe): 原子计数器分发 e, 私有 partial 累加, 主线程归约 */
 typedef struct { lfile_t*lf; int S; const float*Fin; const int*idx; const float*rw;
                  int *e_next; float *partial; const float*ge; float *partial_c; int ti;
-                 int e_end; int zero_first; } bmw_t;   /* 分块: 本块专家上界 + 是否首块(清零 partial) */
+                 int _pad; void *bar; int nchunk; } bmw_t;   /* 分块: 屏障 + 块数(上界走全局 ws_e_end) */
+extern volatile int ws_e_end;   /* 本块专家上界: 主线程每块更新一次, 屏障保证可见性 */
 /* ★冷热分桶缓存(2026-08-06 用户令"冷热双通道")★: bytes_moe 按专家冷热分离累计
  * routed = R_hot + R_cold(贡献项分桶, 非按 token)。热判定=合并态口径(vq w2 槽非零 /
  * g2slot>=0)。供 GLhc(type7) 求解与回放; 每次 bytes_moe 重写。 */

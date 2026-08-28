@@ -132,6 +132,10 @@ static int dq_dev_ptr(const void *p) {
 }
 static __thread cublasHandle_t g_dqh = NULL;
 static __thread cudaStream_t g_dqs = NULL;
+/* strided 两个变体各自的句柄/流。★必须放文件作用域★: 原来它们是函数内的 static __thread,
+ * dq_gpu_thread_release 根本看不见 ⇒ 收不掉(2026-08-28 补)。 */
+static __thread cublasHandle_t g_dqh2 = NULL, g_dqh3 = NULL;
+static __thread cudaStream_t g_dqs2 = NULL, g_dqs3 = NULL;
 static __thread dq_dbuf dX = {0, 0}, dW = {0, 0}, dO = {0, 0};
 #endif
 /* ★退出前必须调用(每层新建的专家 worker 线程)★: __thread CUDA 资源(句柄/流/显存暂存)
@@ -144,6 +148,10 @@ static void dq_gpu_thread_release(void) {
     if (dO.p) { cudaFree(dO.p); dO.p = NULL; dO.n = 0; }
     if (g_dqh) { cublasDestroy(g_dqh); g_dqh = NULL; }
     if (g_dqs) { cudaStreamDestroy(g_dqs); g_dqs = NULL; }
+    if (g_dqh2) { cublasDestroy(g_dqh2); g_dqh2 = NULL; }
+    if (g_dqs2) { cudaStreamDestroy(g_dqs2); g_dqs2 = NULL; }
+    if (g_dqh3) { cublasDestroy(g_dqh3); g_dqh3 = NULL; }
+    if (g_dqs3) { cudaStreamDestroy(g_dqs3); g_dqs3 = NULL; }
 #endif
 }
 /* strided 版(08-18 attention GPU 化): C[S,M]=A[S,K](lda)·B[M,K](ldb)^T, 行主序任意行距 */
@@ -151,11 +159,11 @@ void dq_matmul_strided(const float *A, int lda, const float *B, int ldb,
                        float *Cst, int ldc, int S, int K, int M, float alpha) {
 #ifdef DS4QUANT_CUDA
     if ((double)S * K * (double)M * 2.0 >= 2.0e8) {
-        static __thread cublasHandle_t h2 = NULL;
-        static __thread cudaStream_t s2 = NULL;
+        cublasHandle_t h2 = g_dqh2; cudaStream_t s2 = g_dqs2;
         if (!h2) {
             if (cublasCreate(&h2) != CUBLAS_STATUS_SUCCESS) h2 = NULL;
             else { cudaStreamCreateWithFlags(&s2, cudaStreamNonBlocking); cublasSetStream(h2, s2); }
+            g_dqh2 = h2; g_dqs2 = s2;
         }
         if (h2) {
             const float zero = 0.0f;
@@ -183,11 +191,11 @@ void dq_matmul_nt_strided(const float *A, int lda, const float *B, int ldb,
                           float *Cst, int ldc, int S, int K, int M) {
 #ifdef DS4QUANT_CUDA
     if ((double)S * K * (double)M * 2.0 >= 2.0e8) {
-        static __thread cublasHandle_t h3 = NULL;
-        static __thread cudaStream_t s3 = NULL;
+        cublasHandle_t h3 = g_dqh3; cudaStream_t s3 = g_dqs3;
         if (!h3) {
             if (cublasCreate(&h3) != CUBLAS_STATUS_SUCCESS) h3 = NULL;
             else { cudaStreamCreateWithFlags(&s3, cudaStreamNonBlocking); cublasSetStream(h3, s3); }
+            g_dqh3 = h3; g_dqs3 = s3;
         }
         if (h3) {
             const float one = 1.0f, zero = 0.0f;

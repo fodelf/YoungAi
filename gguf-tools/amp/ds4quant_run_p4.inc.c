@@ -4,6 +4,18 @@
  * 20 线程合计约 10GB/层, 全是 mmap 新页 ⇒ 首触零页故障是纯开销。改成按 (nth,S) 缓存复用,
  * 只在形状变化时重分配。数值零影响: 唯一依赖初值的是 partial/partial_c 与 aq(都是 += 累加),
  * 已在 worker 内显式 memset。 */
+/* 自造屏障(macOS 没有 pthread_barrier_t)。用途见下面 bytes_moe 的分块循环: 20 条 worker
+ * 线程跨 4 个专家块复用, 每块前后各会合一次。 */
+volatile int ws_e_end=0;   /* 见 ds4quant_run_p3 的声明 */
+typedef struct { pthread_mutex_t m; pthread_cond_t c; int need, cnt, gen; } bmbar_t;
+static void bmbar_init(bmbar_t*b,int need){ pthread_mutex_init(&b->m,NULL);
+    pthread_cond_init(&b->c,NULL); b->need=need; b->cnt=0; b->gen=0; }
+static void bmbar_wait(bmbar_t*b){ pthread_mutex_lock(&b->m);
+    int g=b->gen;
+    if(++b->cnt==b->need){ b->cnt=0; b->gen++; pthread_cond_broadcast(&b->c); }
+    else while(g==b->gen) pthread_cond_wait(&b->c,&b->m);
+    pthread_mutex_unlock(&b->m); }
+static void bmbar_destroy(bmbar_t*b){ pthread_mutex_destroy(&b->m); pthread_cond_destroy(&b->c); }
 typedef struct { float *q1,*q3,*q2,*xs,*wwv,*partial,*partial_c,*aq; int *tok; } bmwbuf_t;
 static bmwbuf_t *BMW_BUF=NULL; static int BMW_BUF_N=0, BMW_BUF_S=0;
 static void bmw_pool(int nth,int S){
@@ -37,9 +49,11 @@ static void *bytes_moe_worker(void*a){
     bmwbuf_t *B=&BMW_BUF[w->ti];
     float *q1=B->q1,*q3=B->q3,*q2=B->q2;
     int *tok=B->tok; float *xs=B->xs,*wwv=B->wwv;
-    if(w->zero_first){ memset(w->partial,0,(size_t)S*DIM*4); memset(w->partial_c,0,(size_t)S*DIM*4); }
+    memset(w->partial,0,(size_t)S*DIM*4); memset(w->partial_c,0,(size_t)S*DIM*4);
+  for(int _ck=0;_ck<w->nchunk;_ck++){
+    bmbar_wait((bmbar_t*)w->bar);   /* 等主线程把本块的 64 个专家反量化好 */
     float *w1p=NULL,*w3p=NULL,*w2p=NULL;   /* 本迭代实际权重指针(本地缓冲或批 dequant 切片) */
-    for(;;){ int e=__sync_fetch_and_add(w->e_next,1); if(e>=w->e_end)break;
+    for(;;){ int e=__sync_fetch_and_add(w->e_next,1); if(e>=ws_e_end)break;
         int nt=0; float gee=w->ge?w->ge[e]:1.0f;   /* bf.GE: per-expert 增益, 累加时乘 */
         for(int s2=0;s2<S;s2++)for(int a2=0;a2<NACT_RT;a2++)
             if(w->idx[(size_t)s2*NACT_RT+a2]==e){ tok[nt]=s2; wwv[nt]=gee*w->rw[(size_t)s2*NACT_RT+a2];
@@ -130,6 +144,15 @@ static void *bytes_moe_worker(void*a){
         }
         erf_skip: ;
     }
+    bmbar_wait((bmbar_t*)w->bar);   /* 告诉主线程本块做完, 它去准备下一块 */
+  }
+    /* ★必须收 __thread CUDA 资源(2026-08-28 实撞 OOM)★ dq_matmul 给每条线程留了 cuBLAS
+     * 句柄/流 + dX/dW/dO 三块显存暂存(dW 就是 DIM×MOEI=33.5MB), 线程退出不自动释放。
+     * p1 里早就写好了 dq_gpu_thread_release(注释还记着"32k 锚实锤 ~2-3GB/层泄漏"), 但
+     * 只有量化遍的 worker(p2:156)调了它 —— 反修全程走的是本函数, 一次没调过。
+     * 实撞: /proc/meminfo 只认得 57GB/121GB, 另外 65GB 在 GPU 驱动手里(nvidia-smi 该进程
+     * 56.7GB, 而本路显式分配只有 ~9GB), MemAvailable 逐层单调降, 两跑都被看门狗停在半路。 */
+    dq_gpu_thread_release();
     return NULL;   /* 缓冲属池, 不 free */
 }
 static lfile_t *GS_LF=NULL;    /* 回扫: 全43层文件 mmap 只开一次(禁重复 mmap+解析) */
@@ -302,19 +325,28 @@ static void bytes_moe(lfile_t*lf,int S,const float*Fin,const int*idx,const float
     bmw_t *ws=calloc((size_t)nth,sizeof(bmw_t)); pthread_t *th=malloc((size_t)nth*sizeof(pthread_t));
     /* 冷热分桶缓存重建(hot=partial / cold=partial_c 归约) */
     if(BM_S!=S){ free(BM_RH); free(BM_RC); BM_RH=malloc((size_t)S*DIM*4); BM_RC=malloc((size_t)S*DIM*4); BM_S=S; }
-    for(int ec=0;ec<NEXP;ec+=BMW_CHUNK){   /* 每块先反量化这 64 个专家, 再放 worker 只在块内抢活 */
+    /* ★线程只建一次, 跨 4 个块复用(2026-08-28)★ 每条线程退出时要 dq_gpu_thread_release
+     * (见 worker 尾注释), 那是 cublasDestroy + 三次 cudaFree, 几十毫秒起。若每块都重建
+     * 20 条线程, 分块本身就把这笔开销翻 4 倍。用屏障把主线程的"准备下一块"和 worker 的
+     * "干完本块"串起来: 建 20 条, 每块前后各会合一次。 */
+    const int nchunk=(NEXP+BMW_CHUNK-1)/BMW_CHUNK;
+    bmbar_t bar; bmbar_init(&bar,nth+1);
+    for(int t=0;t<nth;t++){ ws[t]=(bmw_t){lf,S,Fin,idx,rw,&e_next,BMW_BUF[t].partial,ge,
+                                          BMW_BUF[t].partial_c,t,0,&bar,nchunk};
+        pthread_create(&th[t],NULL,bytes_moe_worker,&ws[t]); }
+    for(int ec=0;ec<NEXP;ec+=BMW_CHUNK){
         const int ec1=(ec+BMW_CHUNK<NEXP)?ec+BMW_CHUNK:NEXP;
 #ifdef DS4QUANT_CUDA
         g_bmw_batched=bmw_batch_dequant(lf,ec,ec1);
 #else
         g_bmw_e0=ec;
 #endif
-        e_next=ec;
-        for(int t=0;t<nth;t++){ ws[t]=(bmw_t){lf,S,Fin,idx,rw,&e_next,BMW_BUF[t].partial,ge,
-                                              BMW_BUF[t].partial_c,t,ec1,ec==0};
-            pthread_create(&th[t],NULL,bytes_moe_worker,&ws[t]); }
-        for(int t=0;t<nth;t++) pthread_join(th[t],NULL);
+        e_next=ec; ws_e_end=ec1;
+        bmbar_wait(&bar);   /* 放行本块 */
+        bmbar_wait(&bar);   /* 等本块做完 */
     }
+    for(int t=0;t<nth;t++) pthread_join(th[t],NULL);
+    bmbar_destroy(&bar);
     /* ★归约并行化(2026-08-28)★ 原为主线程串行 20×2×S·DIM 次加(S=8192 时 13.4 亿次 +
      * 5.4GB 读)。按元素区间切给线程, 每元素内仍按 t 升序累加 ⇒ 浮点求和顺序不变, 逐位同值。 */
     { bmred_t *rs=malloc((size_t)nth*sizeof(bmred_t));
