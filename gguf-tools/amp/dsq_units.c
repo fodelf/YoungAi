@@ -298,7 +298,7 @@ static void expert_fwd(const float *x,const float *w1,const float *w3,const floa
     free(g);free(u);free(t2);
 }
 
-static int real_layer(const char *hf,const char *anc,int L,int NE,int SROW)
+static int real_layer(const char *hf,const char *anc,int L,int NE,int SROW,int VDIM,int VNC)
 {
     /* ── 读锚头 ── */
     FILE *f=fopen(anc,"rb"); if(!f){ printf("锚打不开: %s\n",anc); return 1; }
@@ -360,9 +360,9 @@ static int real_layer(const char *hf,const char *anc,int L,int NE,int SROW)
         /* ★只编码一次★: wq 版同时出 relh/bytes/Wq。原来 dsq_quant_matrix + _wq 各调一遍,
          * 24 个矩阵编码了 48 次, 还把这笔重复算进了"量化速度"。 */
         const double tq0=vqt_now();
-        if(dsq_quant_matrix_wq(e1,M,D,4,512,xs,nt,q1,&rh,&bt)==0){ relh_sum+=rh; bytes+=bt; nq++; }
-        if(dsq_quant_matrix_wq(e3,M,D,4,512,xs,nt,q3,&rh,&bt)==0){ relh_sum+=rh; bytes+=bt; nq++; }
-        if(dsq_quant_matrix_wq(e2,D,M,4,512,hc,nt,Wq,&rh,&bt)==0){ relh_sum+=rh; bytes+=bt; nq++; }
+        if(dsq_quant_matrix_wq(e1,M,D,VDIM,VNC,xs,nt,q1,&rh,&bt)==0){ relh_sum+=rh; bytes+=bt; nq++; }
+        if(dsq_quant_matrix_wq(e3,M,D,VDIM,VNC,xs,nt,q3,&rh,&bt)==0){ relh_sum+=rh; bytes+=bt; nq++; }
+        if(dsq_quant_matrix_wq(e2,D,M,VDIM,VNC,hc,nt,Wq,&rh,&bt)==0){ relh_sum+=rh; bytes+=bt; nq++; }
         t_q += vqt_now()-tq0;
         free(hc);
         /* FP 与【三矩阵全量化】各前向一遍 —— 这才是该层真实的量化误差 */
@@ -433,13 +433,18 @@ static int real_layer(const char *hf,const char *anc,int L,int NE,int SROW)
 
 int main(int argc, char **argv)
 {
-    const char *hf=NULL,*anc=NULL; int L=0,NE=8,SROW=0;
+    const char *hf=NULL,*anc=NULL; int L=0,NE=8,SROW=0,VDIM=4,VNC=512;
     for(int i=1;i<argc-1;i++){
         if(!strcmp(argv[i],"--hf")) hf=argv[i+1];
         else if(!strcmp(argv[i],"--anchor")) anc=argv[i+1];
         else if(!strcmp(argv[i],"--layer")) L=atoi(argv[i+1]);
         else if(!strcmp(argv[i],"--experts")) NE=atoi(argv[i+1]);
         else if(!strcmp(argv[i],"--rows")) SROW=atoi(argv[i+1]);
+        /* ★量化档位可调(2026-08-28)★: 用来验"ELM 收益随底座变差而上升"这个假说 ——
+         * 历史 +12% 是在 allq2 烂底座(裸 KLD 1.63)上测的, 我们现在是平权 VQ(0.47), 好 4.3 倍。
+         * 同一层同一份 x 只改 nc, 看 held 会不会跟着量化误差一起涨。 */
+        else if(!strcmp(argv[i],"--vdim")) VDIM=atoi(argv[i+1]);
+        else if(!strcmp(argv[i],"--vnc"))  VNC=atoi(argv[i+1]);
     }
     if(hf&&anc){
 #ifndef DS4QUANT_CUDA
@@ -452,8 +457,8 @@ int main(int argc, char **argv)
             "  (vq_gpu.o 是 C++ 目标, 缺 -lstdc++ 会报 __cxa_guard_acquire 未定义)\n");
         return 2;
 #endif
-        printf("== dsq_units 真模型一层(L%d) ==\n",L);
-        return real_layer(hf,anc,L,NE,SROW);
+        printf("== dsq_units 真模型一层(L%d, v%dx%d) ==\n",L,VDIM,VNC);
+        return real_layer(hf,anc,L,NE,SROW,VDIM,VNC);
     }
     printf("== dsq_units 自测(量化/反修/sweep 三单元, 合成数据) ==\n");
     printf("   ★只验数值正确性, 不产任何速度/质量读数★ —— 那些必须走真层 GPU 模式(铁律 08-28)\n");
