@@ -51,7 +51,9 @@ int dsq_quant_matrix(const float *W, int rows, int cols, int dim, int nc,
  * sweep 的决策核心有两处, 原样搬出来:
  *   (a) 单元择优: 从候选出口分里挑最优, 过增益门才算落地(p13:280-285)
  *   (b) 统一终验: 全部落地后一次全程复核, 不改善就整体回滚(p13:417-425)
- * 口径约定: 分数【越小越好】(出口误差)。 */
+ * 口径约定: 分数【越小越好】(出口误差)。
+ * ★(c) 候选评估 dsq_sweep_layer 在本文件下方(要等 ds4_z/dq_hc_post/bf_exit_relL2
+ *   都 include 进来才能写) —— sweep 的耗时全在 (c), (a)(b) 只是决策收尾。★ */
 
 /* (a) 候选择优 + 增益门。
  *   base    基线分
@@ -163,6 +165,8 @@ int dsq_quant_matrix_wq(const float *W,int rows,int cols,int dim,int nc,
 #include "../../ds4_z.c"
 #include "ds4quant_zsolve.inc.c"
 #include "ds4quant_elm.inc.c"
+
+#include "dsq_units_sweep.inc.c"   /* ③ 候选评估(500 行守卫所迫的物理分片) */
 
 static uint64_t TS = 0x243F6A8885A308D3ULL;
 static float rnd(void){ TS = TS*6364136223846793005ULL + 1442695040888963407ULL;
@@ -305,12 +309,12 @@ static int real_layer(const char *hf,const char *anc,int L,int NE,int SROW,int V
     uint32_t hd[8]; uint64_t idh;
     if(fread(hd,4,8,f)!=8||fread(&idh,8,1,f)!=1){ printf("锚头读失败\n"); fclose(f); return 1; }
     if(hd[0]!=0x32415144u){ printf("锚 magic 不对 0x%08X\n",hd[0]); fclose(f); return 1; }
-    const int S=(int)hd[1], HCM=(int)hd[2], D=(int)hd[3], NL=(int)hd[4], NACT=(int)hd[6];
+    const int S=(int)hd[1], ancHCM=(int)hd[2], D=(int)hd[3], NL=(int)hd[4], NACT=(int)hd[6];
     const int M=2048;                              /* MOEI, 与 p1 一致 */
     if(L<0||L>=NL){ printf("层号越界 %d/%d\n",L,NL); fclose(f); return 1; }
     if(SROW<=0||SROW>S) SROW=S;
     printf("锚: S=%d HCM=%d DIM=%d NLAYERS=%d NACT=%d → 取 L%d 前 %d 行, %d 个专家\n",
-           S,HCM,D,NL,NACT,L,SROW,NE);
+           S,ancHCM,D,NL,NACT,L,SROW,NE);
     const size_t fin_b=(size_t)NL*S*D*4, ridx_b=(size_t)NL*S*NACT*4;
     float *X=malloc((size_t)SROW*D*4);
     int32_t *RI=malloc((size_t)SROW*NACT*4); float *RW=malloc((size_t)SROW*NACT*4);
