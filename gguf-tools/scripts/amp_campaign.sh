@@ -266,19 +266,28 @@ src, oq, oa, N, hf, wt2 = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]
 tok = Tokenizer.from_file(f"{hf}/tokenizer.json")
 lines = [ln for ln in open(src, encoding="utf-8").read().split("\n") if ln.strip()]
 
+CODEKW = re.compile(r"\b(import |from \w+ import|def |class |function |const |let |var |public |private |return |print\(|console\.log|#include|package |func |fn |=>|\bfor\s*\(|\bif\s*\()")
 def dom(s):
+    """★域判定, 顺序即优先级(2026-08-28 收紧)★
+    首版把 'Fix this code taken from an OCR result ...' 判进了 math(触发词误命中), 抽样时
+    math 段抽出来的其实是代码。规则改成: code 一律最优先(围栏 / 行内转义换行里的代码 /
+    高符号密度+代码关键词三选一), math 只留真数学(LaTeX 或算术应用题且不带代码特征)。"""
     n = [c for c in s if not c.isspace()]
     if "```" in s: return "code"
-    if re.search(r"\$[^$\n]{2,}\$|\\frac|\\alpha|\\beta", s): return "math"
-    if re.search(r"\b(How many|What is the|Find the|Calculate|Simplify|Solve for|Evaluate)\b", s): return "math"
+    if "\\n" in s and len(CODEKW.findall(s)) >= 2: return "code"
+    sym = sum(1 for c in s if c in "{}[]()=;<>+*/_|&")
+    if sym/max(len(s), 1) > 0.08 and CODEKW.search(s): return "code"
+    if re.search(r"\$[^$\n]{2,}\$|\\frac|\\sqrt|\\alpha|\\beta|\\pi\b", s): return "math"
+    if re.search(r"\b(How many|How much|What is the (value|number|smallest|largest|sum|product)|"
+                 r"Find the (value|number|sum|area)|Calculate the|Simplify|Solve for|Evaluate the)\b", s) \
+       and not CODEKW.search(s): return "math"
     cjk = sum(1 for c in n if 0x3040<=ord(c)<=0x30ff or 0x4e00<=ord(c)<=0x9fff or 0xac00<=ord(c)<=0xd7af)
     cyr = sum(1 for c in n if 0x400<=ord(c)<=0x4ff)
     ara = sum(1 for c in n if 0x600<=ord(c)<=0x6ff)
-    if (cjk+cyr+ara)/len(n) > 0.10:
+    if (cjk+cyr+ara)/max(len(n), 1) > 0.10:
         return "cjk" if cjk>=max(cyr,ara) else ("cyrillic" if cyr>=ara else "arabic")
-    if sum(1 for c in n if 128<=ord(c)<0x250)/len(n) > 0.015: return "euro"
+    if sum(1 for c in n if 128<=ord(c)<0x250)/max(len(n), 1) > 0.015: return "euro"
     if re.search(r"\{#sec|\[@ref|\{ref-type=|\^\[@", s): return "academic"
-    if re.search(r"^\s*(def |function |class |public |private |import )", s): return "code"
     return "prose"
 
 # ② 连续同域行 → 文档簇(整簇不拆)
