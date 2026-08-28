@@ -401,21 +401,32 @@ static int real_layer(const char *hf,const char *anc,int L,int NE,int SROW)
     const int erc = elm_solve(X,YQ,DH,SROW,D,vs,&er);
     const double t3=vqt_now();
     if(erc==0){
-        printf("②反修   %6.1fs  held行为挽回=%.2f%%  @V₀=%s λ=%g k=%d | 乘性线性对照=%.2f%%\n",
-               t3-t2, er.held*100.0, er.from_pca?"PCA":"rand", (double)er.lam, er.k, er.held_lin*100.0);
+        /* ★精度要够★: -0.00% 看不出是 -1e-8 还是 -1e-3, 用科学计数把量级摆出来。
+         * λ 顶格 100 + k 最小 16 是"什么都没学到"的典型签名(强正则把 U 压到近 0)。 */
+        printf("②反修   %6.1fs  held行为挽回=%.4f%% (%.3e)  @V₀=%s λ=%g k=%d | 乘性线性对照=%.4f%% (%.3e)%s\n",
+               t3-t2, er.held*100.0, er.held, er.from_pca?"PCA":"rand", (double)er.lam, er.k,
+               er.held_lin*100.0, er.held_lin,
+               (er.lam>=100.0f && er.k<=16) ? "  ★λ顶格+k最低=网格全负,解不出东西★" : "");
         printf("         量化误差基线: ‖dH‖/‖y_fp‖=%.4f (fit=%d行 held=%d行)\n",
                sqrt(eq/(ef+1e-30)), vs, SROW-vs);
     } else printf("②反修   %6.1fs  解算失败(rc=%d)\n", t3-t2, erc);
 
     /* ── ③sweep ── */
     const double t4=vqt_now();
-    double base=1.0, cand[3]={ 1.0-er.held, 1.0-er.held_lin, 1.0 };
-    int win=-1; double ws=0;
-    const int land=dsq_sweep_pick(base,cand,3,0.05,&win,&ws);
-    const int commit=dsq_sweep_commit(base,ws);
+    const double base=1.0;
+    double cand[2]={ erc==0 ? 1.0-er.held : (0.0/0.0),
+                     erc==0 ? 1.0-er.held_lin : (0.0/0.0) };
+    int win=-1; double ws=base;                       /* ★不落地时 ws 必须留在 base★ */
+    const int land=dsq_sweep_pick(base,cand,2,0.05,&win,&ws);
+    /* ★不落地就没有"终验"可言★(2026-08-28 修): 原来无条件调 dsq_sweep_commit(base,ws),
+     * 而 land=0 时 ws 是未初始化的 0 ⇒ 0<1.0 恒真 ⇒ 报"终验=提交" —— 假读数。
+     * 终验的语义是"落了东西之后在全量上复核", 没落地时它不该被调用。 */
     const double t5=vqt_now();
-    printf("③sweep  %6.3fs  候选{ELM %.4f, 线性 %.4f, 基线 %.4f} → %s(win=%d ws=%.4f) 终验=%s\n",
-           t5-t4, cand[0],cand[1],cand[2], land?"落地":"不落地", win, ws, commit?"提交":"回滚");
+    printf("③sweep  %6.3fs  基线=%.6f 候选{ELM %.6f, 线性 %.6f} 增益门=5%%\n",
+           t5-t4, base, cand[0], cand[1]);
+    if(land) printf("         → 落地 win=%d ws=%.6f | 终验(base→ws)=%s\n",
+                    win, ws, dsq_sweep_commit(base,ws)?"提交":"回滚");
+    else     printf("         → 不落地(无候选过门) —— 终验不适用, 不调用\n");
     if(erc==0) elm_free(&er);
     free(X);free(RI);free(RW);free(YQ);free(YF);free(DH);free(tok);free(ww);free(xs);free(Wq);
     return 0;
