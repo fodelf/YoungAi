@@ -704,6 +704,20 @@ stage_champ86(){
         watchdog_stop
         LOG "①量化收官 $(ls "$W/layers"/dql_vq_L*.bin | wc -l)/43"
     else LOG "①平权量化已在 43/43, 跳过"; fi
+    # ★量化态立刻备份(2026-08-28 用户令, 破坏前先保全铁律)★
+    # 反修/sweep 是【往 dql 层文件里追加记录 + 原地改写】—— 改的就是量化产物本身。
+    # 今天 champreset 能救回来靠的是只读原件 vq86h_noz, 但那是【旧语料】量化出来的;
+    # 换语料后新底座没有任何后备, 反修一跑量化态就永久没了, 想重来只能整轮重量化(25 min)。
+    # 这里存一份纯净量化态, 后续任意次反修实验都从它还原, 不用重量化。
+    # ext4 不支持 reflink(实测), 只能真拷贝: 37GB / 约 30s / 盘上余 2.1T。
+    if [ ! -d "$W/layers_quant" ]; then
+        LOG "备份量化态层件 → layers_quant(反修唯一还原点)"
+        cp -a "$W/layers" "$W/layers_quant.part" || DIE "量化态备份失败"
+        mv "$W/layers_quant.part" "$W/layers_quant"
+        if diff -rq "$W/layers" "$W/layers_quant" >/dev/null 2>&1; then
+            LOG "备份 ✓ 逐字节一致 $(du -sh "$W/layers_quant" | cut -f1)"
+        else DIE "★备份逐字节复核失败★"; fi
+    else LOG "量化态备份已在, 跳过"; fi
     # ②冠军反修(含路由反修, 一段做完)
     stage_champbf champ86
     # ③五指标(判决尺吃层件, 08-24 铁律: 只认参考前向)
@@ -724,17 +738,23 @@ stage_champ_reset(){
     # 再逐个赋值, 于是同句里引用前一个名字在 set -u 下直接报"未绑定的变量"。分三句写。
     local D2="$ROOT/gguf/go-onebit/vqhalf"
     local W="$D2/champ86"
+    # ★还原点优先级★: ①本战役自己的量化态备份 layers_quant(同语料同配方, 唯一正确的还原点)
+    # ②只读原件 vq86h_noz(旧语料, 只在没备份时兜底 —— 换语料后它已不是同一个底座)
     local SRC="$D2/vq86h_noz"
-    [ -d "$SRC/layers" ] || DIE "只读原件不在: $SRC/layers"
+    [ -d "$W/layers_quant" ] && SRC="$W"   # layers_quant 就在 W 底下, 下面统一按 $SRC/layers 取
+    local SUB="layers"
+    [ "$SRC" = "$W" ] && SUB="layers_quant"
+    [ -d "$SRC/$SUB" ] || DIE "还原点不在: $SRC/$SUB"
+    LOG "还原点 = $SRC/$SUB"
     [ -d "$W/layers" ]   || DIE "工作副本不在: $W/layers"
     local n_rm=0 n_cp=0 n_ok=0
     # ① 原件没有的文件 = 反修产物, 删
     for f in "$W/layers"/*; do
         local b; b=$(basename "$f")
-        [ -e "$SRC/layers/$b" ] || { rm -f "$f"; n_rm=$((n_rm+1)); }
+        [ -e "$SRC/$SUB/$b" ] || { rm -f "$f"; n_rm=$((n_rm+1)); }
     done
     # ② 原件有的: 逐字节比, 不等就从原件覆盖
-    for f in "$SRC/layers"/*; do
+    for f in "$SRC/$SUB"/*; do
         local b; b=$(basename "$f")
         if cmp -s "$f" "$W/layers/$b"; then n_ok=$((n_ok+1))
         else cp -f "$f" "$W/layers/$b"; n_cp=$((n_cp+1)); LOG "  复位 $b"; fi
@@ -742,8 +762,8 @@ stage_champ_reset(){
     rm -f "$W/backfit.log" "$W/route_bias_r30.bin" "$W/route_bias_r30.bin.alpha.txt" "$W/rb_alpha.txt"
     LOG "层件复位完成: 原样 $n_ok / 覆盖 $n_cp / 删反修产物 $n_rm"
     # ③ 复位后逐字节全量复核(不许只信上面的循环)
-    if diff -rq "$SRC/layers" "$W/layers" > /tmp/champ_reset_diff.txt 2>&1; then
-        LOG "★复核通过: champ86/layers 与只读原件逐字节一致★"
+    if diff -rq "$SRC/$SUB" "$W/layers" > /tmp/champ_reset_diff.txt 2>&1; then
+        LOG "★复核通过: champ86/layers 与还原点逐字节一致★"
     else DIE "复核失败, 差异见 /tmp/champ_reset_diff.txt: $(head -3 /tmp/champ_reset_diff.txt)"; fi
 }
 
