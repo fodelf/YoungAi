@@ -7351,3 +7351,31 @@ S=512 上比 S=8192 还慢(都是冷读盘)。
 `BMW_CHUNK=64` 分块, 缓冲 6.4GB, 省 19.4GB。跑完 MemAvailable 117G。
 分块首版 SIGSEGV: worker 里是**手写的绝对下标**没减本块首专家号(写 job 表那侧走
 `bmw_slot_off` 已折算) —— 两处必须同口径。
+
+### 六、★两次跑挂的真根因: bytes_moe_worker 从不收 __thread CUDA 资源★
+现象: MemAvailable 逐层单调降, run1 停在 L36+8 单元, run2 停在 L36, 都是看门狗
+`MemAvailable=3GB < 4GB ★杀本段★`。
+定位靠对账而不是猜: `/proc/meminfo` 只认得 57GB/121GB(AnonPages 47.5 + Cached 5.7 +
+Slab 2.2 + MemFree 1.0), **另外 65GB 在 GPU 驱动手里** —— `nvidia-smi` 该进程 56.7GB, 而
+本路显式 GPU 分配只有 ~9GB(g_bmw_buf 6.4 + attention 四块 2.4)。
+真因: `dq_matmul` 给每条线程留 `__thread` 的 cuBLAS 句柄/流 + dX/dW/dO 三块显存暂存
+(dW 就是 DIM×MOEI=33.5MB)。`bytes_moe` 每次调用新建 20 条 worker 线程干完就退, **线程退出
+这些资源不自动释放**。43 层 × 每层多次前向 = 几千条线程, 全泄在驱动侧。
+★修复代码 p1:140 `dq_gpu_thread_release()` 早就在仓库里, 注释还记着"32k 锚实锤 ~2-3GB/层
+泄漏, L11 处 available 118→10G" —— 但只有量化遍的 worker(p2:156)调了它, 反修全程走的
+`bytes_moe_worker` 一次没调过。★
+另外它只收 g_dqh/g_dqs, 漏了两个 strided 变体里各自的函数内 `static __thread` h2/h3
+(release 根本看不见) —— 已提到文件作用域。
+
+**修法演进(两次都实测了才定)**:
+1. 直接补 `dq_gpu_thread_release()` 调用 ⇒ 不泄了但 **bmoe1 5.5→20.5s**
+   (cublasDestroy+cudaFree 每条线程几百毫秒 × 20 条)。
+2. 改**常驻 worker 线程池**(建一次全进程复用, 屏障对齐每个专家块): 句柄跟着线程活到进程
+   结束, 不泄也不用反复建销。单层探针 **11.3(开工) → 7.6 → 4.4s**, 数值恒定。
+实测斜率: run2 −1.3GB/层(L01 50G → L31 11G); run3 −0.2GB/层且走平(L03 94G → L16 91G),
+GPU 侧 60MiB/层。
+
+### 七、教训: 速度读数必须先清场
+probeY(22.8s)/probeZ(92.4s) 两个读数是废的 —— 机器上有个 `ds4quant_run.old`(判决尺, 48GB
+RSS/121% CPU)在跑, 是 run2 被看门狗停掉后战役脚本自动进③五指标段起的。清掉它重测 4.4s。
+差一点第三次拿污染数据下结论(前两次: 线程累计当墙钟、探针构成当全量构成)。
