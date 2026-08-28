@@ -163,26 +163,21 @@ static float *fwd_all(const long*ids,int S,int n_fit,int do_quant,const char*lcf
              * mmap(MAP_SHARED) — 有磁盘后备可换出, 内存压力下自回收, 与锚 mmap 合计砍反修
              * 基线脏内存 ~7G ⇒ 终局 sweep 进 12G 红线(2026-07-31 用户令核心价值必须反修)。 */
             size_t hb=(size_t)(NLAYERS+1)*lstride*4;
-            /* ★内存够就别落盘★(2026-08-27): 文件后备是 16GiB Mac 时代为"可换出"设的续命手段,
-             * 在 121GiB 机器上白换来 page fault + 盘 IO。物理内存 ≥ 快照的 4 倍时走匿名 mmap
-             * (纯内存); 否则保留原文件后备路(小机器行为逐字节不变)。 */
-            double need_gb=hb/1073741824.0;
-            if(dq_host_ram_gb() >= need_gb*4.0){
-                HQE=mmap(NULL,hb,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
-                if(HQE==MAP_FAILED){ perror("hqe-anon"); exit(1); }
-                fprintf(stderr,"[反修] HQE 快照 %.2f GiB → 匿名 mmap(纯内存; 机器 %.0f GiB)\n",
-                        need_gb,dq_host_ram_gb());
-            } else {
-                char hqp[]="/tmp/ds4_hqe_XXXXXX"; int hfd=mkstemp(hqp);
-                if(hfd<0){ perror("hqe-tmp"); exit(1); }
-                unlink(hqp);
-                if(ftruncate(hfd,(off_t)hb)!=0){ perror("hqe-trunc"); exit(1); }
-                HQE=mmap(NULL,hb,PROT_READ|PROT_WRITE,MAP_SHARED,hfd,0);
-                close(hfd);
-                if(HQE==MAP_FAILED){ perror("hqe-mmap"); exit(1); }
-                fprintf(stderr,"[反修] HQE 快照 %.2f GiB → 文件后备 mmap(可换出; 机器仅 %.0f GiB)\n",
-                        need_gb,dq_host_ram_gb());
-            }
+            /* ★回退匿名 mmap "优化"(2026-08-27 我引入, 08-28 实撞回退)★
+             * 我当时按"物理内存 ≥ 快照 4 倍"就改走匿名 mmap(纯内存), 判据只看了快照本身
+             * (22GiB×4=88 ≤ 121GiB 通过), ★没算这活儿自身还要 ~95GB★ ⇒ 95+22=117 把 121GB
+             * 机器挤到 MemAvailable=2GB, 被看门狗停在 sweep 第 4 个单元。
+             * 文件后备的价值恰恰在"可回收": MAP_SHARED 有磁盘后备, 内存压力下内核直接丢页;
+             * 匿名页(无 swap)不可回收。这是原设计的安全性质, 不是小机器遗留。
+             * 而且这个"优化"从头到尾没测过收益 —— 属于照注释猜的改动, 不该有。 */
+            char hqp[]="/tmp/ds4_hqe_XXXXXX"; int hfd=mkstemp(hqp);
+            if(hfd<0){ perror("hqe-tmp"); exit(1); }
+            unlink(hqp);
+            if(ftruncate(hfd,(off_t)hb)!=0){ perror("hqe-trunc"); exit(1); }
+            HQE=mmap(NULL,hb,PROT_READ|PROT_WRITE,MAP_SHARED,hfd,0);
+            close(hfd);
+            if(HQE==MAP_FAILED){ perror("hqe-mmap"); exit(1); }
+            fprintf(stderr,"[反修] HQE 快照 %.2f GiB → 文件后备 mmap(可换出)\n",hb/1073741824.0);
             g_hqe_lstride=lstride;
         }
         if(!BF_FINOP){ BF_FINOP=malloc((size_t)NLAYERS*sizeof(int)); for(int i=0;i<NLAYERS;i++) BF_FINOP[i]=-1; }
