@@ -578,11 +578,54 @@ stage_full(){
     stage_champbf "model_$V"
 }
 
+# ═══ champ86: 冠军 r64 原设计全链(2026-08-28 用户令"一切还原冠军设计")═══
+# 与 r64 的差异仅三项(用户已确认): 语料(calibration_datav5 切半) / 体积(87.04GB) /
+# 底座类型(平权 VQ 2.25bpw, 非热108 go2b+冷1bit ⇒ DS4_GO2B_HOT=0)。
+# 其余一律 r64 原样: ONEPASS 不分块(CHUNK 是 08-07 才加的, r64 没有)、粗筛只定排序
+# (全闸复核维持 !onep 跳过)、不加 ERF(它在 zside2 链不在冠军段)。
+#
+# 链: ①平权量化(量化半语料+量化半锚) → ②反修+路由反修(放大器半语料+放大器半锚, 冠军
+#     stage_backfit 一段做完) → ③五指标(判决尺吃层件) → ④合并+烘 α·Δb
+# ★锚口径★ 两个锚各配各的语料, 已用 anchor_metrics 实测校验:
+#   量化半 anchor_vqhalf_q_s8192 + vqhalf_q.ids → PPL 13.55/top1 52.5% ✓
+#   放大器半 anchor_a_clean_s8192 + vqhalf_a.ids → PPL 11.95/top1 55.7% ✓
+#   (交叉喂错语料 PPL 会飙到 2.4e7/top1 0.8%, 即错锚一眼可辨)
+# 冠军 stage_backfit 默认也是"反修锚=反修语料的 FP 锚"(anchor_r30_s1716 配
+# rr_calib_prog_v5mini.ids), 口径一致。
+stage_champ86(){
+    local D2="$ROOT/gguf/go-onebit/vqhalf" W="$ROOT/gguf/go-onebit/vqhalf/champ86"
+    [ -s "$D2/vqhalf_q.ids" ] && [ -s "$D2/vqhalf_a.ids" ] || DIE "两半语料 ids 缺"
+    [ -s "$D2/anchor_vqhalf_q_s8192.bin" ] || DIE "量化半锚缺"
+    [ -s "$D2/anchor_a_clean_s8192.bin" ] || DIE "放大器半锚缺"
+    # ①平权量化 — 从头, 不复用任何既有层件
+    if [ "$(ls "$W/layers"/dql_vq_L*.bin 2>/dev/null | wc -l)" != 43 ]; then
+        LOG "①平权量化发车(vq4x512 ×43 不动态, 量化半语料 S=8192)"
+        rm -rf "$W"; mkdir -p "$W"
+        export DS4_BF_MEMGB=55 DS4_VQ_TIMING=1 DS4_CALIB_CAP=512 DS4_CALIB_EXPORT_CAP=512
+        export MALLOC_MMAP_THRESHOLD_=1073741824 MALLOC_TRIM_THRESHOLD_=1073741824
+        export OPENBLAS_NUM_THREADS=1 DS4_THREADS=20 DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-0731"
+        watchdog_start
+        if ! env QBIN_OVERRIDE="$ROOT/gguf-tools/amp/ds4quant_run" Q86_IDS="$D2/vqhalf_q.ids" \
+            Q86_S=8192 Q86_NFIT=8192 Q86_ANCHOR="$D2/anchor_vqhalf_q_s8192.bin" Q86_OUT="$W" \
+            RPLAN86="$ROOT/gguf/go-onebit/r30/rplan_base86p.txt" VOLB86=76 \
+            bash "$SC/r30_campaign.sh" quant86 >> "$W/quant.log" 2>&1; then
+            watchdog_stop; tail -8 "$W/quant.log"; DIE "平权量化失败"
+        fi
+        watchdog_stop
+        LOG "①量化收官 $(ls "$W/layers"/dql_vq_L*.bin | wc -l)/43"
+    else LOG "①平权量化已在 43/43, 跳过"; fi
+    # ②冠军反修(含路由反修, 一段做完)
+    stage_champbf champ86
+    # ③五指标(判决尺吃层件, 08-24 铁律: 只认参考前向)
+    LOG "③五指标; 对表平权裸 KLD 0.47055 / Σmin 0.7799 / top1 78.36%"
+    bash "$SC/caliper_ref.sh" "$W/layers" /tmp/qc_champ86.bin 2>&1 | tail -10
+}
+
 ST="${1:-all}"
 case "$ST" in
   preflight) stage_preflight;; ids) stage_ids;; anchor) stage_anchor;;
   capture) stage_capture;; probe) stage_probe;; solve) stage_solve;; pass2) stage_pass2;;
-  chain) stage_chain;; judge) stage_judge;; dilute) stage_dilute;; idshalf) stage_idshalf;; idshalf_ext) shift; stage_idshalf_ext "$@";; vqquant) stage_vqquant;; vqmerge) stage_vqmerge;; vqcap) stage_vqcap;; vqsolve) stage_vqsolve;; dynladder) stage_dynladder;; dynquant) shift; stage_dynquant "$@";; dynjudge) stage_dynjudge;; champbf) shift; stage_champbf "$@";; full) shift; stage_full "$@";;
+  chain) stage_chain;; judge) stage_judge;; dilute) stage_dilute;; idshalf) stage_idshalf;; idshalf_ext) shift; stage_idshalf_ext "$@";; vqquant) stage_vqquant;; vqmerge) stage_vqmerge;; vqcap) stage_vqcap;; vqsolve) stage_vqsolve;; dynladder) stage_dynladder;; dynquant) shift; stage_dynquant "$@";; dynjudge) stage_dynjudge;; champbf) shift; stage_champbf "$@";; champ86) stage_champ86;; full) shift; stage_full "$@";;
   all) stage_preflight; stage_ids; stage_anchor; stage_capture
        stage_solve; stage_chain; stage_judge;;
   *) echo "未知段: $ST"; echo "段: preflight ids anchor capture solve pass2 chain judge dilute all (probe/dilute=诊断)"; exit 2;;
