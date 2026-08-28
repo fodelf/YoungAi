@@ -14,10 +14,20 @@ static void zpar_for(int n,int nth,void (*fn)(void*,int,int),void *ctx){
     for(int t=0;t<cnt;t++) pthread_join(th[t],NULL);
 }
 typedef struct { const float*X; double*G; uint32_t n,d_in; } zg_ctx;
+/* Gram G[a][b]=⟨X_a,X_b⟩ (上三角)。原来是 a 外 b 内: 每换一个 a 就把 X 的 b..n 段
+ * (最多 75MB)重读一遍, 每线程约 8.5GB。改成先把 a 切成 32 行一小块常驻 L2, 再让 b 扫一遍
+ * —— X_b 读进来后立刻服务这 32 个 a, 流量降 16 倍。
+ * ★逐位不变★: 每个 G[a][b] 的点积仍按 i 升序一次算完, 只是 (a,b) 的遍历次序变了。 */
 static void zg_worker(void *vc,int a0,int a1){ zg_ctx*c=(zg_ctx*)vc;
-    for(int a=a0;a<a1;a++){ const float*xa=c->X+(size_t)a*c->d_in;
-        for(uint32_t b=(uint32_t)a;b<c->n;b++){ const float*xb=c->X+(size_t)b*c->d_in; double s=0;
-            for(uint32_t i=0;i<c->d_in;i++) s+=(double)xa[i]*xb[i]; c->G[(size_t)a*c->n+b]=s; } } }
+    const int BA=32;
+    for(int ab0=a0;ab0<a1;ab0+=BA){
+        const int ab1=(ab0+BA<a1)?ab0+BA:a1;
+        for(uint32_t b=(uint32_t)ab0;b<c->n;b++){
+            const float*xb=c->X+(size_t)b*c->d_in;
+            for(int a=ab0;a<ab1&&(uint32_t)a<=b;a++){
+                const float*xa=c->X+(size_t)a*c->d_in; double s=0;
+                for(uint32_t i=0;i<c->d_in;i++) s+=(double)xa[i]*xb[i];
+                c->G[(size_t)a*c->n+b]=s; } } } }
 typedef struct { const double*G; const float*R; double*al; uint32_t n,d_out; } zs_ctx;
 static void cholesky_solve(const double *L, uint32_t d, double *b);   /* ds4_z.c 同-TU 原语(本就 const) */
 #define cholesky_solve_nc cholesky_solve
