@@ -209,6 +209,15 @@ static void dq_ar_par(void (*fn)(dq_arw *, int, int), dq_arw *w, int S) {
  * 数值零影响: 两块都是被完整写满后才读(q 由 gemm 写满, o 由 D2H/头循环写满)。
  * 全部调用点(ds4quant_layer.c / p7 / p2 自测)都是单线程串行, 不存在并发进入。 */
 static float *ATT_Q=NULL,*ATT_O=NULL; static size_t ATT_N=0;
+#ifdef DQ_BLAS
+/* wo_a 的每组 gemm(见下方调用点注释): C[S,OLR] = o_g[S,GD](lda=NHHD) · wa_g[OLR,GD]^T */
+static void *dq_wog_worker(void*a_){
+    struct wog_s { const float*o,*wa; float*oo; int S,GD,OLR,NHHD,ldc; } *w=a_;
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, w->S, w->OLR, w->GD,
+                1.0f, w->o, w->NHHD, w->wa, w->GD, 0.0f, w->oo, w->ldc);
+    return NULL;
+}
+#endif
 static void att_pool(size_t n){
     if(ATT_N==n) return;
     free(ATT_Q); free(ATT_O);
@@ -305,13 +314,17 @@ void dq_attention(const float *x, const float *wqa, const float *qnorm, const fl
     int GD = (NH*HD)/OG;
     float *oo = (float*)malloc((size_t)S*OG*OLR*sizeof(float));
 #ifdef DQ_BLAS
-    /* ★2026-08-28★ 原来这里直调 cblas_sgemm, 而本进程 OPENBLAS_NUM_THREADS=1 ⇒ 单核磨,
-     * 实测 wo 段 0.78s/层。dq_matmul_strided 的参数与这次调用逐项同构(NoTrans×Trans,
-     * lda=NH*HD, ldb=GD, ldc=OG*OLR, alpha=1), 且自带"够大就上 cuBLAS、否则回落同一句
-     * cblas"的门 —— 换过去等于免费拿到 GPU 路, 不够大的形状行为一字不变。 */
-    for(int g=0;g<OG;g++)
-        dq_matmul_strided(o + (size_t)g*GD, NH*HD, wo_a + (size_t)g*OLR*GD, GD,
-                          oo + (size_t)g*OLR, OG*OLR, S, GD, OLR, 1.0f);
+    /* ★OG 路 g 并行(2026-08-28)★ 本进程 OPENBLAS_NUM_THREADS=1(必须, 否则 bytes_moe 的
+     * 20 个 worker 里再套 BLAS 线程=超订阅), 于是这 8 个 gemm 是单核串行磨, 实测 0.78s/层。
+     * 试过换 dq_matmul_strided 走 cuBLAS —— 更慢(1.36s): 每个 g 都以 lda=NH*HD 跨步读遍
+     * 整块 1GB 的 o, 8 次调用就是 8GB 的 HMM 读, GPU 这边一点也不划算。
+     * 改为 8 条线程各跑一个原样的 cblas_sgemm: 各 g 只写 oo 的不相交列段 ⇒ 逐位不变。 */
+    { typedef struct { const float*o,*wa; float*oo; int S,GD,OLR,NHHD,ldc; } wog_t;
+      wog_t wg[OG]; pthread_t wt[OG];
+      for(int g=0;g<OG;g++) wg[g]=(wog_t){o+(size_t)g*GD, wo_a+(size_t)g*OLR*GD,
+                                          oo+(size_t)g*OLR, S, GD, OLR, NH*HD, OG*OLR};
+      for(int g=0;g<OG;g++) pthread_create(&wt[g],NULL,dq_wog_worker,&wg[g]);
+      for(int g=0;g<OG;g++) pthread_join(wt[g],NULL); }
 #else
     for(int s=0;s<S;s++) for(int g=0;g<OG;g++){
         const float *od = o + (size_t)s*NH*HD + (size_t)g*GD;
