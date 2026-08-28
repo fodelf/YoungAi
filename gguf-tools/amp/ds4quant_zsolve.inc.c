@@ -28,12 +28,25 @@ static void zs_worker(void *vc,int j0,int j1){ zs_ctx*c=(zs_ctx*)vc;
         for(uint32_t a=0;a<c->n;a++) c->al[(size_t)a*c->d_out+j]=cc[a]; }
     free(cc); }
 typedef struct { const float*X; const double*al; float*W; uint32_t n,d_in,d_out; } zw_ctx;
+/* ★W=Xᵀα 的访存重排(2026-08-28)★
+ * 原来是 for(i){ for(a){ 整行 α[a][0..d_out) } }: α 是 n×d_out 的 double = 4608×4096×8
+ * ≈ 151MB, 每换一个 i 就把它从头到尾再读一遍。每线程 205 个 i × 151MB ≈ 31GB, 20 线程
+ * 合计 620GB —— 77 亿次乘加本身只要不到 1 秒, 时间全耗在把同一份 α 反复搬进 cache。
+ * 改成 for(j 分块){ for(a){ for(i){ ... } } }: α[a][j0..j1) 只有 2KB, 装进 L1 后给本线程
+ * 全部 205 个 i 复用; 每线程的 W 条带 205×256×4≈205KB 常驻 L2。总流量降到 ~210MB/线程。
+ * ★逐位不变★: 每个输出元素 W[i][j] 的累加仍然严格按 a 升序, 一次没变;
+ * 只是把 (i,j,a) 三重循环的外两层换了个顺序 + 对 j 分块。 */
 static void zw_worker(void *vc,int i0,int i1){ zw_ctx*c=(zw_ctx*)vc;
-    for(int i=i0;i<i1;i++){ float*Wi=c->W+(size_t)i*c->d_out;
-        for(uint32_t j=0;j<c->d_out;j++)Wi[j]=0.0f;
-        for(uint32_t a=0;a<c->n;a++){ double xai=c->X[(size_t)a*c->d_in+i]; if(xai==0.0)continue;
+    const uint32_t BJ=256;   /* j 块宽: α 片 BJ*8=2KB 进 L1, W 条带 (i1-i0)*BJ*4 进 L2 */
+    for(int i=i0;i<i1;i++) memset(c->W+(size_t)i*c->d_out,0,(size_t)c->d_out*4);
+    for(uint32_t j0=0;j0<c->d_out;j0+=BJ){
+        const uint32_t j1=(j0+BJ<c->d_out)?j0+BJ:c->d_out;
+        for(uint32_t a=0;a<c->n;a++){
             const double*ala=c->al+(size_t)a*c->d_out;
-            for(uint32_t j=0;j<c->d_out;j++) Wi[j]+=(float)(xai*ala[j]); } } }
+            const float *Xa=c->X+(size_t)a*c->d_in;
+            for(int i=i0;i<i1;i++){ double xai=Xa[i]; if(xai==0.0)continue;
+                float*Wi=c->W+(size_t)i*c->d_out;
+                for(uint32_t j=j0;j<j1;j++) Wi[j]+=(float)(xai*ala[j]); } } } }
 /* 子空间迭代的三个并行核(切法与逐位不变的理由见 z_solve_dual 里的调用点注释) */
 typedef struct { const float*W; float*V,*T,*M; uint32_t d_in,d_out,rank; } zsub_ctx;
 static void zsub_T(void *vc,int j0,int j1){ zsub_ctx*c=(zsub_ctx*)vc;
