@@ -210,12 +210,17 @@ void dq_attention(const float *x, const float *wqa, const float *qnorm, const fl
                   float *out, int S, int DIM, int NH, int HD, int RD, int QLR, int OLR, int OG,
                   int WIN, int Sc, int ratio, float EPS) {
     int N = S + Sc;
+    double dt_[7]; struct timespec _p,_c; clock_gettime(CLOCK_MONOTONIC,&_p);
+    #define _MK(i) do{ clock_gettime(CLOCK_MONOTONIC,&_c); \
+        dt_[i]=(_c.tv_sec-_p.tv_sec)+1e-9*(_c.tv_nsec-_p.tv_nsec); _p=_c; }while(0)
     float *qr = (float*)malloc((size_t)S*QLR*sizeof(float));
     float *qra = (float*)malloc((size_t)S*QLR*sizeof(float));
     dq_matmul(x, wqa, qra, S, DIM, QLR);
     for (int s=0;s<S;s++) dq_rms(qra+(size_t)s*QLR, qnorm, qr+(size_t)s*QLR, QLR, EPS);
+    _MK(0);
     float *q = (float*)malloc((size_t)S*NH*HD*sizeof(float));
     dq_matmul(qr, wqb, q, S, QLR, NH*HD);
+    _MK(1);
     /* per-head rms (mean over HD) + rope — s 切片并行(逐位同) */
     dq_arw arw = { q, NULL, NULL, NULL, cos_t, sin_t, S, NH, HD, RD, EPS };
     dq_ar_par(dq_ar_qrms, &arw, S);
@@ -230,7 +235,9 @@ void dq_attention(const float *x, const float *wqa, const float *qnorm, const fl
     memcpy(kva, kv, (size_t)S*HD*sizeof(float));
     if (Sc>0) memcpy(kva+(size_t)S*HD, kvc, (size_t)Sc*HD*sizeof(float));
     float scale = 1.0f/sqrtf((float)HD);
+    _MK(2);
     float *o = (float*)malloc((size_t)S*NH*HD*sizeof(float));
+    _MK(3);
 #ifdef DQ_BLAS
     /* per-head 两个 gemm: SC_h=Q_h·kva^T, O_h=P_h·kva. mask/softmax/sink 逻辑与标量路径逐字一致. */
 #ifdef DS4QUANT_CUDA
@@ -256,8 +263,10 @@ void dq_attention(const float *x, const float *wqa, const float *qnorm, const fl
 #ifdef DS4QUANT_CUDA
     }
 #endif
+    _MK(4);
     arw.o = o;
     dq_ar_par(dq_ar_irope, &arw, S);       /* inverse rope — s 切片并行(逐位同) */
+    _MK(5);
 #else
     float *scr = (float*)malloc((size_t)N*sizeof(float));
     for (int s=0;s<S;s++) for (int h=0;h<NH;h++) {
@@ -295,6 +304,10 @@ void dq_attention(const float *x, const float *wqa, const float *qnorm, const fl
     }
 #endif
     dq_matmul(oo, wo_b, out, S, OG*OLR, DIM);   /* [S,OG*OLR]@wo_b[DIM,OG*OLR].T */
+    _MK(6);
+    fprintf(stderr,"[att2] qa+qrms=%.3f qb(→%dMB)=%.3f kv+qrope=%.3f o分配=%.3f 核=%.3f irope=%.3f wo=%.3f\n",
+            dt_[0],(int)((size_t)S*NH*HD*4/1048576),dt_[1],dt_[2],dt_[3],dt_[4],dt_[5],dt_[6]);
+    #undef _MK
     free(qr);free(qra);free(q);free(kv);free(kva);free(o);free(oo);
 }
 
