@@ -53,11 +53,16 @@ static void *bytes_moe_worker(void*a){
             extern double g_bmw_t[2];
             w1p=q1; w3p=q3; w2p=q2;   /* 默认走本地 dequant 缓冲 */
 #ifdef DS4QUANT_CUDA
-            extern float *g_bmw_buf; extern int g_bmw_batched;
+            extern float *g_bmw_buf; extern int g_bmw_batched; extern int g_bmw_e0;
             if(g_bmw_batched){   /* 批 dequant 已就位: 指针别名切片, 不动 q1..q2 生命周期 */
-                w1p=g_bmw_buf+((size_t)e*3+0)*((size_t)DIM*MOEI);
-                w3p=g_bmw_buf+((size_t)e*3+1)*((size_t)DIM*MOEI);
-                w2p=g_bmw_buf+((size_t)e*3+2)*((size_t)DIM*MOEI);
+                /* ★下标必须减去本块首专家号★(2026-08-28 分块后 SIGSEGV 实撞): 缓冲从
+                 * 全部 256 专家(25.8GB)改成一块 64 个(6.4GB)后, 这里的绝对 e 一过 64
+                 * 就指到缓冲外面去了。写 job 表那侧走的是 bmw_slot_off(已折算), 这侧是
+                 * 手写公式 —— 两处必须同口径。 */
+                const size_t sl0=(size_t)(e-g_bmw_e0)*3;
+                w1p=g_bmw_buf+(sl0+0)*((size_t)DIM*MOEI);
+                w3p=g_bmw_buf+(sl0+1)*((size_t)DIM*MOEI);
+                w2p=g_bmw_buf+(sl0+2)*((size_t)DIM*MOEI);
             } else {
 #endif
             double bt0=vqt_now();
