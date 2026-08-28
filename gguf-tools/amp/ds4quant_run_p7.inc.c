@@ -8,6 +8,14 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
     double lt_t0=vqt_now(), lt_mark=lt_t0;
     for(int i=0;i<8;i++) g_lt[i]=0;
     int mixd=2*HCM+HCM*HCM;
+    /* ★zrec 存在性提前判定(2026-08-28 前移)★ 原在函数中段(z 解算块之前), 但 bf_fp_routed
+     * 这个【生产者】比它更早执行, 拿不到 zrec_done ⇒ 守卫无法与消费者对齐, 见下。 */
+    int zrec_done=0;
+    {
+        const char*ld2=getenv("DS4_LAYER_DIR");
+        if(ld2){ char zp2[1024]; snprintf(zp2,sizeof zp2,"%s/zrec_L%02d.bin",ld2,L);
+                 FILE*zf2=fopen(zp2,"rb"); if(zf2){ fclose(zf2); zrec_done=1; } }
+    }
     float *cosr=malloc((size_t)S*(RD/2)*4),*sinr=malloc((size_t)S*(RD/2)*4);
     if(CR[L]>0) dq_freqs_cis(RD,S,65536.0,160000.0,16.0,32.0,1.0,cosr,sinr);
     else dq_freqs_cis(RD,S,0.0,10000.0,16.0,32.0,1.0,cosr,sinr);
@@ -242,7 +250,14 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
                 if(L<NL&&GBL_G[L]!=1.0f) for(size_t i=0;i<(size_t)S*DIM;i++) Fout[i]=shb[i]+GBL_G[L]*(Fout[i]-shb[i]);
             } else fprintf(stderr,"[B] 层文件 %s 读失败 — Fout 只含 shared\n",lp);
         }
-        if(LZRANK>0&&do_quant){   /* ★层局部靶物料(两分支汇合点, shb 仍活): R=FP专家@Fin−回放routed */
+        /* ★守卫必须与唯一消费者(下方 z 解算块 + 343 行 memcpy)对齐★(2026-08-28 实锤 bug)
+         * 原守卫只有 LZRANK>0&&do_quant, 而消费者还要 ANC_OK && cfg!='F' && !zrec_done。
+         * 后果: 推进段跑完 43 层全有 zrec ⇒ sweep 里消费者一次都不执行, 生产者却每层每次
+         * 前向照跑 —— bf_fp_routed 是【读 25.7GB FP 权重 + 全精度专家前向】, 且它不随抽格
+         * 行数缩小(行少了权重还是要全读)。实测: 推进段 6.6s/层, sweep 每单元 7 次前向×5 层
+         * ≈231s 纯浪费, 占 BFUNIT 460s 的一半。
+         * (COADAPT 那支由外层 else-if 排除, 无需重复判。) */
+        if(LZRANK>0&&do_quant&&ANC_OK&&cfg!='F'&&!zrec_done){   /* ★层局部靶物料: R=FP专家@Fin−回放routed */
             if(!BF_LT) BF_LT=malloc((size_t)S*DIM*4);
             { double _f0=vqt_now(); bf_fp_routed(L,Fin,idx,rw,S,BF_LT); g_lt[7]+=vqt_now()-_f0; }
             for(size_t i=0;i<(size_t)S*DIM;i++) BF_LT[i]-=(Fout[i]-shb[i]);
@@ -311,12 +326,6 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
      * dql 层文件不动。'F'(FP 锚遍)仍禁。 */
     /* ★搬到三分支合流点(2026-08-23): z 段原长在专家量化分支体内, B 回放分支(纯 VQ
      * 战役唯一前向)从不经过 → ZDIAG 无声实锤。coadapt 分支自带 z, 条件排除。 */
-    int zrec_done=0;
-    {
-        const char*ld2=getenv("DS4_LAYER_DIR");
-        if(ld2){ char zp2[1024]; snprintf(zp2,sizeof zp2,"%s/zrec_L%02d.bin",ld2,L);
-                 FILE*zf2=fopen(zp2,"rb"); if(zf2){ fclose(zf2); zrec_done=1; } }
-    }
     if(do_quant&&ANC_OK&&LZRANK>0&&cfg!='F'&&!zrec_done&&!(cfg=='g'&&COADAPT>0)){   /* ★'B'回放禁入已撤(见上) — 原注: 活体 z^L 每前向对锚重解会
         (a)把反修候选扰动拉回锚投影(橡皮筋, 候选逐位无效) (b)回放偷加不在文件的修正(合并模型没有→假忠实) */
         /* ★逐层动态 z^L(用户四支柱正确形态, 序贯锚定回拉)★: 输出端单点 z 要一口气补 43 层
