@@ -262,6 +262,23 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
             { double _f0=vqt_now(); bf_fp_routed(L,Fin,idx,rw,S,BF_LT); g_lt[7]+=vqt_now()-_f0; }
             for(size_t i=0;i<(size_t)S*DIM;i++) BF_LT[i]-=(Fout[i]-shb[i]);
             BF_LT_L=L;
+            /* ★ELM 针(2026-08-28 用户令"1、2 打一针再决策")★
+             * 此刻三样物料正好齐: x=Fin(部署口径, 量化链的真 Fin, 不是锚 fin)、
+             * y_q=Fout−shb(量化 routed)、dH=BF_LT(FP routed−量化 routed)。
+             * 只在 --elm-probe 点名的层上跑, 不落盘不改模型, 纯读数。 */
+            if(elm_probe_hit(L)){
+                float *yq=malloc((size_t)S*DIM*4);
+                for(size_t i=0;i<(size_t)S*DIM;i++) yq[i]=Fout[i]-shb[i];
+                elm_res er; double t0=vqt_now();
+                if(elm_solve(Fin,yq,BF_LT,S,DIM,n_fit,&er)==0){
+                    printf("★ELM L%02d held行为挽回 %.2f%% @V₀=%s λ=%g k=%d "
+                           "| 同口径乘性【线性】对照 %.2f%%(判例+0.6%%) | s=%.4g | %.0fs\n",
+                           L, er.held*100.0, er.from_pca?"PCA":"rand", (double)er.lam, er.k,
+                           er.held_lin*100.0, (double)er.s, vqt_now()-t0);
+                    fflush(stdout); elm_free(&er);
+                } else printf("★ELM L%02d 解算失败\n",L), fflush(stdout);
+                free(yq);
+            }
         }
         free(shb);
     } else if(do_quant&&cfg=='g'&&COADAPT>0&&ANC_OK){

@@ -29,6 +29,7 @@
  */
 #include "ds4quant_run_p1.inc.c"
 #include "ds4quant_zsolve.inc.c"
+#include "ds4quant_elm.inc.c"
 #include "ds4quant_xcap.inc.c"
 #include "ds4quant_anchor.inc.c"
 #include "ds4quant_run_p2.inc.c"
