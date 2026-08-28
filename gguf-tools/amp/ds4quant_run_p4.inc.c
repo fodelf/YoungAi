@@ -1,7 +1,42 @@
+/* ★跨层线程缓冲池(2026-08-28 速度)★ 原来 bytes_moe 每次调用给每个 worker 新 malloc:
+ * q1/q3/q2 各 MOEI·DIM·4 = 33MB×3, xs/partial/partial_c/aq 各 S·DIM·4(S=8192 时 134MB)。
+ * 20 线程合计约 10GB/层, 全是 mmap 新页 ⇒ 首触零页故障是纯开销。改成按 (nth,S) 缓存复用,
+ * 只在形状变化时重分配。数值零影响: 唯一依赖初值的是 partial/partial_c 与 aq(都是 += 累加),
+ * 已在 worker 内显式 memset。 */
+typedef struct { float *q1,*q3,*q2,*xs,*wwv,*partial,*partial_c,*aq; int *tok; } bmwbuf_t;
+static bmwbuf_t *BMW_BUF=NULL; static int BMW_BUF_N=0, BMW_BUF_S=0;
+static void bmw_pool(int nth,int S){
+    if(BMW_BUF_N==nth&&BMW_BUF_S==S) return;
+    for(int t=0;t<BMW_BUF_N;t++){ bmwbuf_t*b=&BMW_BUF[t];
+        free(b->q1);free(b->q3);free(b->q2);free(b->xs);free(b->wwv);
+        free(b->partial);free(b->partial_c);free(b->aq);free(b->tok); }
+    free(BMW_BUF); BMW_BUF=calloc((size_t)nth,sizeof(bmwbuf_t)); BMW_BUF_N=nth; BMW_BUF_S=S;
+    for(int t=0;t<nth;t++){ bmwbuf_t*b=&BMW_BUF[t];
+        b->q1=malloc((size_t)MOEI*DIM*4); b->q3=malloc((size_t)MOEI*DIM*4); b->q2=malloc((size_t)DIM*MOEI*4);
+        b->xs=malloc((size_t)S*DIM*4);      b->aq=malloc((size_t)S*DIM*4);
+        b->partial=malloc((size_t)S*DIM*4); b->partial_c=malloc((size_t)S*DIM*4);
+        b->wwv=malloc((size_t)S*4);         b->tok=malloc((size_t)S*sizeof(int)); }
+}
+/* 归约 worker: 元素区间 [i0,i1) 上按 t 升序求和(与原串行同序=逐位同值) */
+typedef struct { size_t i0,i1; int nth; float *rh,*rc,*fout; } bmred_t;
+static void *bmw_reduce_worker(void*a){
+    bmred_t*r=a;
+    for(size_t i=r->i0;i<r->i1;i++){
+        float h=0,c=0;
+        for(int t=0;t<r->nth;t++){ h+=BMW_BUF[t].partial[i]; c+=BMW_BUF[t].partial_c[i]; }
+        r->rh[i]=h; r->rc[i]=c; r->fout[i]+=h+c;
+    }
+    return NULL;
+}
 static void *bytes_moe_worker(void*a){
     bmw_t*w=a; lfile_t*lf=w->lf; int S=w->S;
-    float *q1=malloc((size_t)MOEI*DIM*4),*q3=malloc((size_t)MOEI*DIM*4),*q2=malloc((size_t)DIM*MOEI*4);
-    int *tok=malloc((size_t)S*sizeof(int)); float *xs=malloc((size_t)S*DIM*4),*wwv=malloc((size_t)S*4);
+    /* ★缓冲取自跨层池(2026-08-28)★ 见 bmw_pool 注释: 原来这里每层每线程新 malloc 约 500MB,
+     * 20 线程 = 每层 10GB 首触零页, 实测吃掉 bmoe1 的 4.6s。partial/partial_c 由本线程自己
+     * memset(20 路并行, 替代主线程串行 calloc)。 */
+    bmwbuf_t *B=&BMW_BUF[w->ti];
+    float *q1=B->q1,*q3=B->q3,*q2=B->q2;
+    int *tok=B->tok; float *xs=B->xs,*wwv=B->wwv;
+    memset(w->partial,0,(size_t)S*DIM*4); memset(w->partial_c,0,(size_t)S*DIM*4);
     float *w1p=NULL,*w3p=NULL,*w2p=NULL;   /* 本迭代实际权重指针(本地缓冲或批 dequant 切片) */
     for(;;){ int e=__sync_fetch_and_add(w->e_next,1); if(e>=NEXP)break;
         int nt=0; float gee=w->ge?w->ge[e]:1.0f;   /* bf.GE: per-expert 增益, 累加时乘 */
@@ -46,14 +81,13 @@ static void *bytes_moe_worker(void*a){
             dq_go1b_bytes_dequant(lf->w3+(size_t)e*lf->szG,MOEI,DIM,q3);
             dq_go1b_bytes_dequant(lf->w2+(size_t)e*lf->szD,DIM,MOEI,q2);
         } }
-        float *aq=calloc((size_t)nt*DIM,4);
+        float *aq=B->aq; memset(aq,0,(size_t)nt*DIM*4);   /* 池化: dq_expert_fp 是 += 累加, 必须先清零 */
         { extern double g_bmw_t[2]; double bt1=vqt_now();
           dq_expert_fp(xs,w1p?w1p:q1,w3p?w3p:q3,w2p?w2p:q2,wwv,aq,nt,DIM,MOEI,SWLIM);
           g_bmw_t[1]+=vqt_now()-bt1; }
         for(int i=0;i<nt;i++){ float*dst=(e_hot?w->partial:w->partial_c)+(size_t)tok[i]*DIM;
             const float*yi=aq+(size_t)i*DIM;
             for(int d2=0;d2<DIM;d2++) dst[d2]+=yi[d2]; }
-        free(aq);
         /* ★zl.ERF 死层补丁回放(2026-08-12)★: c=w·(h@Vᵀ)@Uᵀ(U折S/V折α), token门 |c|²≥τ。
          * h 与 dq_expert_fp 完全同式(clip+silu); 只在带 type8 记录且本专家在册的层花算力。
          * DS4_TYPE8_OFF=1 消融开关(同态 A/B 归因用)。 */
@@ -90,7 +124,7 @@ static void *bytes_moe_worker(void*a){
         }
         erf_skip: ;
     }
-    free(q1);free(q3);free(q2);free(tok);free(xs);free(wwv); return NULL;
+    return NULL;   /* 缓冲属池, 不 free */
 }
 static lfile_t *GS_LF=NULL;    /* 回扫: 全43层文件 mmap 只开一次(禁重复 mmap+解析) */
 /* ★真·反修前层★ 状态: 目标层 z 系数以【最终输出 KL】重解时用 */
@@ -243,17 +277,23 @@ static void bytes_moe(lfile_t*lf,int S,const float*Fin,const int*idx,const float
     const int lay_skip=replay_layer_skipped();
     if(!lay_skip) for(int i=lf->nops-1;i>=0;i--) if(lf->ops[i].type==5&&lf->ops[i].ge){ ge=lf->ops[i].ge; break; }
     int nth=NTHREADS<1?1:(NTHREADS>NEXP?NEXP:NTHREADS); int e_next=0;
+    bmw_pool(nth,S);
     bmw_t *ws=calloc((size_t)nth,sizeof(bmw_t)); pthread_t *th=malloc((size_t)nth*sizeof(pthread_t));
-    for(int t=0;t<nth;t++){ ws[t]=(bmw_t){lf,S,Fin,idx,rw,&e_next,calloc((size_t)S*DIM,4),ge,
-                                          calloc((size_t)S*DIM,4)};
+    for(int t=0;t<nth;t++){ ws[t]=(bmw_t){lf,S,Fin,idx,rw,&e_next,BMW_BUF[t].partial,ge,
+                                          BMW_BUF[t].partial_c,t};
         pthread_create(&th[t],NULL,bytes_moe_worker,&ws[t]); }
     /* 冷热分桶缓存重建(hot=partial / cold=partial_c 归约) */
     if(BM_S!=S){ free(BM_RH); free(BM_RC); BM_RH=malloc((size_t)S*DIM*4); BM_RC=malloc((size_t)S*DIM*4); BM_S=S; }
-    memset(BM_RH,0,(size_t)S*DIM*4); memset(BM_RC,0,(size_t)S*DIM*4);
-    for(int t=0;t<nth;t++){ pthread_join(th[t],NULL);
-        for(size_t i=0;i<(size_t)S*DIM;i++){ BM_RH[i]+=ws[t].partial[i]; BM_RC[i]+=ws[t].partial_c[i]; }
-        free(ws[t].partial); free(ws[t].partial_c); }
-    for(size_t i=0;i<(size_t)S*DIM;i++) Fout[i]+=BM_RH[i]+BM_RC[i];
+    for(int t=0;t<nth;t++) pthread_join(th[t],NULL);
+    /* ★归约并行化(2026-08-28)★ 原为主线程串行 20×2×S·DIM 次加(S=8192 时 13.4 亿次 +
+     * 5.4GB 读)。按元素区间切给线程, 每元素内仍按 t 升序累加 ⇒ 浮点求和顺序不变, 逐位同值。 */
+    { bmred_t *rs=malloc((size_t)nth*sizeof(bmred_t));
+      size_t N=(size_t)S*DIM, chunk=(N+nth-1)/nth;
+      for(int t=0;t<nth;t++){ size_t a=chunk*(size_t)t, b=a+chunk>N?N:a+chunk; if(a>N)a=N;
+          rs[t]=(bmred_t){a,b,nth,BM_RH,BM_RC,Fout};
+          pthread_create(&th[t],NULL,bmw_reduce_worker,&rs[t]); }
+      for(int t=0;t<nth;t++) pthread_join(th[t],NULL);
+      free(rs); }
     free(ws);free(th);
     /* ★Fcur=专家后·ops前的态(shared+base_routed)=coadapt 的 base态 Fcur★: TREF(type4)按 coadapt 口径
      * 从 Fcur 插值(Fout=Fcur+t·(Fout−Fcur)), 而非从 shared 缩放(否则 t 把 routed 整体放大, 抵消临界点处 Fout 翻倍误差)。*/
