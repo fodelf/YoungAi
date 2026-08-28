@@ -737,6 +737,51 @@ stage_champ_reset(){
     else DIE "复核失败, 差异见 /tmp/champ_reset_diff.txt: $(head -3 /tmp/champ_reset_diff.txt)"; fi
 }
 
+# ═══ 三份锚捕获 + 判决份同域尺(2026-08-28 用户令"切三份: 量化/反修/判决")═══
+# ids 一变锚就废(锚与 ids 错配会出 PPL 2.4e7 这种一眼假的数), 所以三份各配一个 FP 锚。
+# ★两把尺并存★: wt2 仍是官方判决(铁律"判决只认参考前向尺"+所有历史数字都在它上面:
+#   官方 q2 KLD 0.4207 / 平权裸 Σmin 0.7799 / 冠军对表); 判决份是【同域全能力尺】——
+#   8 个域齐全, 覆盖 wt2 完全不测的代码/数学/多语。两个数一起报, 不互相取代。
+stage_anchors3(){
+    local D2="$ROOT/gguf/go-onebit/vqhalf"
+    local NAMES=(量化 反修 判决)
+    local IDSF=("$D2/vqhalf_q.ids" "$D2/vqhalf_a.ids" "$D2/vqhalf_j.ids")
+    local ANCF=("$D2/anchor_vqhalf_q_s8192.bin" "$D2/anchor_a_clean_s8192.bin" "$D2/anchor_j_s8192.bin")
+    local i
+    for i in 0 1 2; do
+        [ -s "${IDSF[$i]}" ] || DIE "${NAMES[$i]}份 ids 缺: ${IDSF[$i]}"
+        # 锚比 ids 旧 = 上一版 ids 的锚, 必须重捕
+        if [ -s "${ANCF[$i]}" ] && [ "${ANCF[$i]}" -nt "${IDSF[$i]}" ]; then
+            LOG "${NAMES[$i]}锚已是最新, 跳过"; continue; fi
+        LOG "捕${NAMES[$i]}锚 S=8192 (约 30 分钟, 23GB)"
+        rm -f "${ANCF[$i]}"
+        watchdog_start
+        ( cd "$ROOT/gguf-tools/amp" && env DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-0731" \
+            OPENBLAS_NUM_THREADS=1 DS4_THREADS=20 DS4_BF_MEMGB=55 \
+            DS4_FP_ONLY=1 DS4_ANCHOR="${ANCF[$i]}" ./ds4quant_run.old "${IDSF[$i]}" 8192 ) \
+            > "/tmp/anc3_$i.log" 2>&1
+        watchdog_stop
+        [ -s "${ANCF[$i]}" ] || { tail -5 "/tmp/anc3_$i.log"; DIE "${NAMES[$i]}锚没落盘"; }
+        LOG "${NAMES[$i]}锚 ✓ $(ls -l "${ANCF[$i]}" | awk '{printf "%.1f GiB", $5/1073741824}')"
+    done
+}
+# 判决份同域尺: 对任意层件目录出五指标(与 wt2 尺同一把 caliper, 只换 ids/锚)
+stage_judge3(){
+    local D2="$ROOT/gguf/go-onebit/vqhalf" V="${1:-champ86}"
+    local JI="$D2/vqhalf_j.ids" JA="$D2/anchor_j_s8192.bin"
+    [ -s "$JA" ] && [ "$JA" -nt "$JI" ] || DIE "判决份锚缺或过期, 先跑 anchors3"
+    echo "══ 同域全能力尺(判决份 8 域齐全) ══"
+    for B in vq86h_noz "$V"; do
+        [ -d "$D2/$B/layers" ] || continue
+        LOG "尺: $B"
+        bash "$SC/caliper_ref.sh" "$D2/$B/layers" "/tmp/j3_$B.bin" 20 "" 2.5 "$JI" "$JA" \
+            > "/tmp/j3_$B.log" 2>&1 || { LOG "$B 失败"; tail -3 "/tmp/j3_$B.log"; continue; }
+        printf -- "── %s ──\n" "$B"
+        grep -aE "PPL\(student\)|分布还原率|Mean KLD|Same top" "/tmp/j3_$B.log"
+    done
+    echo "★注: 这是同域尺, 不取代 wt2 官方判决 —— 两个数一起看★"
+}
+
 # ═══ 语料对拍: 判决尺(wt2) vs 切半的开源语料(datav5 两半)(2026-08-28 用户令)═══
 # 把三份 ids 解回文本逐项量: 字符构成 / 代码占比 / 词表重合 / token 分布重合。
 # 目的是给"校准料和判决尺到底差多远"一个硬数字, 不再靠"感觉像"。
@@ -901,7 +946,7 @@ ST="${1:-all}"
 case "$ST" in
   preflight) stage_preflight;; ids) stage_ids;; anchor) stage_anchor;;
   capture) stage_capture;; probe) stage_probe;; solve) stage_solve;; pass2) stage_pass2;;
-  chain) stage_chain;; judge) stage_judge;; dilute) stage_dilute;; idshalf) stage_idshalf;; idshalf_ext) shift; stage_idshalf_ext "$@";; vqquant) stage_vqquant;; vqmerge) stage_vqmerge;; vqcap) stage_vqcap;; vqsolve) stage_vqsolve;; dynladder) stage_dynladder;; dynquant) shift; stage_dynquant "$@";; dynjudge) stage_dynjudge;; champbf) shift; stage_champbf "$@";; champ86) stage_champ86;; champreset) stage_champ_reset;; champ3rd) stage_champ3rd;; corpdiff) stage_corpdiff;; champrb) stage_champ_rbsweep;; full) shift; stage_full "$@";;
+  chain) stage_chain;; judge) stage_judge;; dilute) stage_dilute;; idshalf) stage_idshalf;; idshalf_ext) shift; stage_idshalf_ext "$@";; vqquant) stage_vqquant;; vqmerge) stage_vqmerge;; vqcap) stage_vqcap;; vqsolve) stage_vqsolve;; dynladder) stage_dynladder;; dynquant) shift; stage_dynquant "$@";; dynjudge) stage_dynjudge;; champbf) shift; stage_champbf "$@";; champ86) stage_champ86;; champreset) stage_champ_reset;; champ3rd) stage_champ3rd;; corpdiff) stage_corpdiff;; anchors3) stage_anchors3;; judge3) shift; stage_judge3 "$@";; champrb) stage_champ_rbsweep;; full) shift; stage_full "$@";;
   all) stage_preflight; stage_ids; stage_anchor; stage_capture
        stage_solve; stage_chain; stage_judge;;
   *) echo "未知段: $ST"; echo "段: preflight ids anchor capture solve pass2 chain judge dilute all (probe/dilute=诊断)"; exit 2;;
