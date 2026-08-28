@@ -203,6 +203,17 @@ static void dq_ar_par(void (*fn)(dq_arw *, int, int), dq_arw *w, int S) {
     for (int t = 0; t < n; t++) pthread_join(th[t], NULL);
 }
 
+/* ★q/o 跨调用缓冲池(2026-08-28 速度)★ 两块各 S·NH·HD·4 = S=8192 时 1024MB。原来每次
+ * dq_attention 都新 malloc/free: 新页第一次被写(o 是 D2H 目的地)要逐页缺页+清零, 实测
+ * 1GB D2H 只跑到 3.6 GB/s。跨层复用后页已在场, 拷贝走满带宽。仅在尺寸变化时重分配。
+ * 数值零影响: 两块都是被完整写满后才读(q 由 gemm 写满, o 由 D2H/头循环写满)。
+ * 全部调用点(ds4quant_layer.c / p7 / p2 自测)都是单线程串行, 不存在并发进入。 */
+static float *ATT_Q=NULL,*ATT_O=NULL; static size_t ATT_N=0;
+static void att_pool(size_t n){
+    if(ATT_N==n) return;
+    free(ATT_Q); free(ATT_O);
+    ATT_Q=(float*)malloc(n*sizeof(float)); ATT_O=(float*)malloc(n*sizeof(float)); ATT_N=n;
+}
 void dq_attention(const float *x, const float *wqa, const float *qnorm, const float *wqb,
                   const float *wkv, const float *kvnorm, const float *sink,
                   const float *wo_a, const float *wo_b, const float *kvc,
@@ -218,7 +229,8 @@ void dq_attention(const float *x, const float *wqa, const float *qnorm, const fl
     dq_matmul(x, wqa, qra, S, DIM, QLR);
     for (int s=0;s<S;s++) dq_rms(qra+(size_t)s*QLR, qnorm, qr+(size_t)s*QLR, QLR, EPS);
     _MK(0);
-    float *q = (float*)malloc((size_t)S*NH*HD*sizeof(float));
+    att_pool((size_t)S*NH*HD);
+    float *q = ATT_Q;
     dq_matmul(qr, wqb, q, S, QLR, NH*HD);
     _MK(1);
     /* per-head rms (mean over HD) + rope — s 切片并行(逐位同) */
@@ -236,7 +248,7 @@ void dq_attention(const float *x, const float *wqa, const float *qnorm, const fl
     if (Sc>0) memcpy(kva+(size_t)S*HD, kvc, (size_t)Sc*HD*sizeof(float));
     float scale = 1.0f/sqrtf((float)HD);
     _MK(2);
-    float *o = (float*)malloc((size_t)S*NH*HD*sizeof(float));
+    float *o = ATT_O;
     _MK(3);
 #ifdef DQ_BLAS
     /* per-head 两个 gemm: SC_h=Q_h·kva^T, O_h=P_h·kva. mask/softmax/sink 逻辑与标量路径逐字一致. */
@@ -293,22 +305,27 @@ void dq_attention(const float *x, const float *wqa, const float *qnorm, const fl
     int GD = (NH*HD)/OG;
     float *oo = (float*)malloc((size_t)S*OG*OLR*sizeof(float));
 #ifdef DQ_BLAS
+    /* ★2026-08-28★ 原来这里直调 cblas_sgemm, 而本进程 OPENBLAS_NUM_THREADS=1 ⇒ 单核磨,
+     * 实测 wo 段 0.78s/层。dq_matmul_strided 的参数与这次调用逐项同构(NoTrans×Trans,
+     * lda=NH*HD, ldb=GD, ldc=OG*OLR, alpha=1), 且自带"够大就上 cuBLAS、否则回落同一句
+     * cblas"的门 —— 换过去等于免费拿到 GPU 路, 不够大的形状行为一字不变。 */
     for(int g=0;g<OG;g++)
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, S, OLR, GD,
-                    1.0f, o + (size_t)g*GD, NH*HD, wo_a + (size_t)g*OLR*GD, GD,
-                    0.0f, oo + (size_t)g*OLR, OG*OLR);
+        dq_matmul_strided(o + (size_t)g*GD, NH*HD, wo_a + (size_t)g*OLR*GD, GD,
+                          oo + (size_t)g*OLR, OG*OLR, S, GD, OLR, 1.0f);
 #else
     for(int s=0;s<S;s++) for(int g=0;g<OG;g++){
         const float *od = o + (size_t)s*NH*HD + (size_t)g*GD;
         for(int r=0;r<OLR;r++){ const float *wr=wo_a+((size_t)g*OLR+r)*GD; float a=0; for(int d=0;d<GD;d++) a+=od[d]*wr[d]; oo[((size_t)s*OG+g)*OLR+r]=a; }
     }
 #endif
-    dq_matmul(oo, wo_b, out, S, OG*OLR, DIM);   /* [S,OG*OLR]@wo_b[DIM,OG*OLR].T */
     _MK(6);
-    fprintf(stderr,"[att2] qa+qrms=%.3f qb(→%dMB)=%.3f kv+qrope=%.3f o分配=%.3f 核=%.3f irope=%.3f wo=%.3f\n",
-            dt_[0],(int)((size_t)S*NH*HD*4/1048576),dt_[1],dt_[2],dt_[3],dt_[4],dt_[5],dt_[6]);
+    dq_matmul(oo, wo_b, out, S, OG*OLR, DIM);   /* [S,OG*OLR]@wo_b[DIM,OG*OLR].T */
+    { struct timespec _e; clock_gettime(CLOCK_MONOTONIC,&_e);
+      double wob=(_e.tv_sec-_p.tv_sec)+1e-9*(_e.tv_nsec-_p.tv_nsec);
+      fprintf(stderr,"[att2] qa+qrms=%.3f qb(→%dMB)=%.3f kv+qrope=%.3f 核=%.3f irope=%.3f woa=%.3f wob=%.3f\n",
+            dt_[0],(int)((size_t)S*NH*HD*4/1048576),dt_[1],dt_[2],dt_[4],dt_[5],dt_[6],wob); }
     #undef _MK
-    free(qr);free(qra);free(q);free(kv);free(kva);free(o);free(oo);
+    free(qr);free(qra);free(kv);free(kva);free(oo);   /* q/o 属池, 不 free */
 }
 
 #ifdef DS4QUANT_SELFTEST
