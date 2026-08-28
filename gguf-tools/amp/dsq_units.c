@@ -20,6 +20,8 @@
 #include <string.h>
 #include <math.h>
 #include <stdint.h>
+#include <time.h>      /* vq_qc.h 的 vqt_now 用 clock_gettime, Linux 上必须先有这个 */
+#include <pthread.h>
 
 /* ══ ① 量化单元 ════════════════════════════════════════════════════════════
  * 量化一个权重矩阵并回报还原度。这是"量化一层"的最小可测单位 —— 一层就是
@@ -154,9 +156,7 @@ int dsq_quant_matrix(const float *W, int rows, int cols, int dim, int nc,
 /* 反修单元要用 elm_solve, 它依赖同-TU 的 cholesky/chol_solve_multi/mgs/lcg_unit/zpar_for。
  * 这些原语分别在 ds4_z.c 与 ds4quant_zsolve.inc.c 里(都是 static), 自测把它们拉进来。
  * DIM/MOEI/NEXP 在 elm 里没被用到(全走参数), 所以不需要 p1 的那些编译期常量。 */
-#include <pthread.h>
-#include <time.h>
-/* vqt_now 由 vq_qc.h 提供(上面已 include), 不重复定义 */
+/* vqt_now/time.h/pthread.h 见文件头 */
 #include "../../ds4_z.c"
 #include "ds4quant_zsolve.inc.c"
 #include "ds4quant_elm.inc.c"
