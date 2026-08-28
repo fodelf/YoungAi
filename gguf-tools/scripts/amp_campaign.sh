@@ -657,6 +657,64 @@ stage_champ_reset(){
     else DIE "复核失败, 差异见 /tmp/champ_reset_diff.txt: $(head -3 /tmp/champ_reset_diff.txt)"; fi
 }
 
+# ═══ 诊断针: 第三片(同语料·不相交)★不是判决★(2026-08-28)═══
+# 要回答的问题只有一个: 反修在【与校准语料同源、但一个 token 都不重叠】的片上, 是改善还是退化?
+#   改善 ⇒ 问题是分布错配(校准语料混合场景+22.4%代码, 判决尺是 WikiText-2) ⇒ 换/扩语料有用
+#   退化 ⇒ 问题是对那 8192 个 token 过拟合(每专家才 ~192 行) ⇒ 换语料白搭, 要加量或改设计
+# 切得出第三片的依据: calibration_datav5.txt 约 40 万 token, 两半各只取 8192(64 个 128-token
+# 窗口), 95% 从没用过。第三片取【同一个奇数块池(放大器半的池子)、窗口整体后移一个窗宽】——
+# 分布同源、位置零重叠。判决口径不变: 终判永远只认 wt2。
+stage_champ3rd(){
+    local D2="$ROOT/gguf/go-onebit/vqhalf"
+    local CI="$D2/vqhalf_c.ids"
+    local CA="$D2/anchor_c_s8192.bin"
+    if [ ! -s "$CI" ]; then
+        LOG "①切第三片(同池·后移一窗·零重叠)"
+        python3 - "$CORPUS" "$CI" 8192 64 "$DS4_HF" <<'PY2' || DIE "第三片切失败"
+import sys
+from tokenizers import Tokenizer
+src, oc, N, CH, hf = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
+tok = Tokenizer.from_file(f"{hf}/tokenizer.json")
+allids = tok.encode(open(src, encoding="utf-8").read(), add_special_tokens=False).ids
+B = 256
+blocks = [list(range(i, min(i+B, len(allids)))) for i in range(0, len(allids), B)]
+poolA = [t for i, b in enumerate(blocks) if i % 2 == 1 for t in b]
+w = N // CH
+step = (len(poolA) - w - N % CH) // (CH - 1)
+used, sel = set(), []
+for c in range(CH):
+    ww = w + (N % CH if c == CH-1 else 0)
+    used.update(poolA[c*step : c*step + ww])
+    sel += poolA[c*step + w : c*step + w + ww]
+sel = sel[:N]
+assert len(sel) == N, (len(sel), N)
+ov = len(set(sel) & used)
+assert ov == 0, "★与放大器半重叠 %d 个位置★" % ov
+open(oc, "w").write("\n".join(str(allids[t]) for t in sel) + "\n")
+print("  第三片 %d token, 与放大器半位置重叠=0 ✓ (池 %d token)" % (N, len(poolA)))
+PY2
+    fi
+    if [ ! -s "$CA" ]; then
+        LOG "②给第三片跑 FP 锚(锚与 ids 错配会出 PPL 2.4e7 这种一眼假的数, 必须自己配)"
+        watchdog_start
+        ( cd "$ROOT/gguf-tools/amp" && env DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-0731" \
+            OPENBLAS_NUM_THREADS=1 DS4_THREADS=20 DS4_BF_MEMGB=55 \
+            DS4_FP_ONLY=1 DS4_ANCHOR="$CA" ./ds4quant_run.old "$CI" 8192 ) > /tmp/anc_c.log 2>&1
+        watchdog_stop
+        [ -s "$CA" ] || { tail -5 /tmp/anc_c.log; DIE "第三片锚没落盘"; }
+        LOG "②锚 ✓ $(ls -l "$CA" | awk '{printf "%.1f GiB", $5/1073741824}')"
+    fi
+    echo "══ 诊断针(★不是判决★): 同语料不相交第三片 ══"
+    for V in vq86h_noz champ86; do
+        LOG "针: $V"
+        bash "$SC/caliper_ref.sh" "$D2/$V/layers" "/tmp/c3_$V.bin" 20 "" 2.5 "$CI" "$CA" \
+            > "/tmp/c3_$V.log" 2>&1 || { LOG "$V 针失败"; tail -3 "/tmp/c3_$V.log"; continue; }
+        printf -- "── %s ──\n" "$V"
+        grep -aE "PPL\(student\)|分布还原率|Mean KLD|Same top" "/tmp/c3_$V.log"
+    done
+    echo "★读法: champ86 相对 vq86h_noz 若【改善】=分布错配(换语料有用); 若【退化】=过拟合(换语料白搭)★"
+}
+
 # ═══ champ86 ④: 路由偏置 α 在【本底座本语料】上实扫(2026-08-28 用户纠)═══
 # ★不许直接用冠军的 2.5★ 那是 r64 在【它自己的底座(热108 go2b+冷1bit)+它自己的语料
 # (rr code S=305)】上扫出来的峰(曲线: ≤1.0 阈下无效 / 1.5→80.3 / 2.0→81.6 / ★2.5→84.2★
@@ -685,7 +743,7 @@ ST="${1:-all}"
 case "$ST" in
   preflight) stage_preflight;; ids) stage_ids;; anchor) stage_anchor;;
   capture) stage_capture;; probe) stage_probe;; solve) stage_solve;; pass2) stage_pass2;;
-  chain) stage_chain;; judge) stage_judge;; dilute) stage_dilute;; idshalf) stage_idshalf;; idshalf_ext) shift; stage_idshalf_ext "$@";; vqquant) stage_vqquant;; vqmerge) stage_vqmerge;; vqcap) stage_vqcap;; vqsolve) stage_vqsolve;; dynladder) stage_dynladder;; dynquant) shift; stage_dynquant "$@";; dynjudge) stage_dynjudge;; champbf) shift; stage_champbf "$@";; champ86) stage_champ86;; champreset) stage_champ_reset;; champrb) stage_champ_rbsweep;; full) shift; stage_full "$@";;
+  chain) stage_chain;; judge) stage_judge;; dilute) stage_dilute;; idshalf) stage_idshalf;; idshalf_ext) shift; stage_idshalf_ext "$@";; vqquant) stage_vqquant;; vqmerge) stage_vqmerge;; vqcap) stage_vqcap;; vqsolve) stage_vqsolve;; dynladder) stage_dynladder;; dynquant) shift; stage_dynquant "$@";; dynjudge) stage_dynjudge;; champbf) shift; stage_champbf "$@";; champ86) stage_champ86;; champreset) stage_champ_reset;; champ3rd) stage_champ3rd;; champrb) stage_champ_rbsweep;; full) shift; stage_full "$@";;
   all) stage_preflight; stage_ids; stage_anchor; stage_capture
        stage_solve; stage_chain; stage_judge;;
   *) echo "未知段: $ST"; echo "段: preflight ids anchor capture solve pass2 chain judge dilute all (probe/dilute=诊断)"; exit 2;;
