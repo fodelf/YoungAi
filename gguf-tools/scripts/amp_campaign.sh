@@ -792,6 +792,24 @@ stage_judge3(){
     echo "★注: 这是同域尺, 不取代 wt2 官方判决 —— 两个数一起看★"
 }
 
+# ═══ champ3: 三份语料全链一条龙(2026-08-28 用户令"三份 8192 每个域都有")═══
+# ①三锚 → ②平权 86G 量化(量化份) → ③冠军反修+路由 Δb(反修份) → ④双尺判决
+# 中间不留人工接力(接力是今天多次事故的来源)。语料换了 ⇒ 层件必须重量化, 所以先清 champ86;
+# 只读原件 vq86h_noz 与 95G 备份都不动。
+stage_champ3(){
+    local D2="$ROOT/gguf/go-onebit/vqhalf" W="$D2/champ86"
+    [ -s "$D2/vqhalf_q.ids" ] && [ -s "$D2/vqhalf_a.ids" ] && [ -s "$D2/vqhalf_j.ids" ] \
+        || DIE "三份 ids 不齐, 先跑 idshalf"
+    stage_anchors3
+    if [ -d "$W" ]; then
+        cp -f "$W/backfit.log" /tmp/champ86_prev_backfit.log 2>/dev/null || true
+        LOG "语料已换 ⇒ 清 champ86 重量化(只读原件 vq86h_noz 不动; 上轮日志留 /tmp)"
+        rm -rf "$W"
+    fi
+    stage_champ86          # ①量化 ②反修 ③wt2 官方五指标
+    stage_judge3 champ86   # ④判决份同域全能力尺
+}
+
 # ═══ 语料对拍: 判决尺(wt2) vs 切半的开源语料(datav5 两半)(2026-08-28 用户令)═══
 # 把三份 ids 解回文本逐项量: 字符构成 / 代码占比 / 词表重合 / token 分布重合。
 # 目的是给"校准料和判决尺到底差多远"一个硬数字, 不再靠"感觉像"。
@@ -956,7 +974,7 @@ ST="${1:-all}"
 case "$ST" in
   preflight) stage_preflight;; ids) stage_ids;; anchor) stage_anchor;;
   capture) stage_capture;; probe) stage_probe;; solve) stage_solve;; pass2) stage_pass2;;
-  chain) stage_chain;; judge) stage_judge;; dilute) stage_dilute;; idshalf) stage_idshalf;; idshalf_ext) shift; stage_idshalf_ext "$@";; vqquant) stage_vqquant;; vqmerge) stage_vqmerge;; vqcap) stage_vqcap;; vqsolve) stage_vqsolve;; dynladder) stage_dynladder;; dynquant) shift; stage_dynquant "$@";; dynjudge) stage_dynjudge;; champbf) shift; stage_champbf "$@";; champ86) stage_champ86;; champreset) stage_champ_reset;; champ3rd) stage_champ3rd;; corpdiff) stage_corpdiff;; anchors3) stage_anchors3;; judge3) shift; stage_judge3 "$@";; champrb) stage_champ_rbsweep;; full) shift; stage_full "$@";;
+  chain) stage_chain;; judge) stage_judge;; dilute) stage_dilute;; idshalf) stage_idshalf;; idshalf_ext) shift; stage_idshalf_ext "$@";; vqquant) stage_vqquant;; vqmerge) stage_vqmerge;; vqcap) stage_vqcap;; vqsolve) stage_vqsolve;; dynladder) stage_dynladder;; dynquant) shift; stage_dynquant "$@";; dynjudge) stage_dynjudge;; champbf) shift; stage_champbf "$@";; champ86) stage_champ86;; champreset) stage_champ_reset;; champ3rd) stage_champ3rd;; corpdiff) stage_corpdiff;; anchors3) stage_anchors3;; champ3) stage_champ3;; judge3) shift; stage_judge3 "$@";; champrb) stage_champ_rbsweep;; full) shift; stage_full "$@";;
   all) stage_preflight; stage_ids; stage_anchor; stage_capture
        stage_solve; stage_chain; stage_judge;;
   *) echo "未知段: $ST"; echo "段: preflight ids anchor capture solve pass2 chain judge dilute all (probe/dilute=诊断)"; exit 2;;
