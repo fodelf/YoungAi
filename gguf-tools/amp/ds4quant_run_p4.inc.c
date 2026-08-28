@@ -37,9 +37,9 @@ static void *bytes_moe_worker(void*a){
     bmwbuf_t *B=&BMW_BUF[w->ti];
     float *q1=B->q1,*q3=B->q3,*q2=B->q2;
     int *tok=B->tok; float *xs=B->xs,*wwv=B->wwv;
-    memset(w->partial,0,(size_t)S*DIM*4); memset(w->partial_c,0,(size_t)S*DIM*4);
+    if(w->zero_first){ memset(w->partial,0,(size_t)S*DIM*4); memset(w->partial_c,0,(size_t)S*DIM*4); }
     float *w1p=NULL,*w3p=NULL,*w2p=NULL;   /* 本迭代实际权重指针(本地缓冲或批 dequant 切片) */
-    for(;;){ int e=__sync_fetch_and_add(w->e_next,1); if(e>=NEXP)break;
+    for(;;){ int e=__sync_fetch_and_add(w->e_next,1); if(e>=w->e_end)break;
         int nt=0; float gee=w->ge?w->ge[e]:1.0f;   /* bf.GE: per-expert 增益, 累加时乘 */
         for(int s2=0;s2<S;s2++)for(int a2=0;a2<NACT_RT;a2++)
             if(w->idx[(size_t)s2*NACT_RT+a2]==e){ tok[nt]=s2; wwv[nt]=gee*w->rw[(size_t)s2*NACT_RT+a2];
@@ -231,28 +231,41 @@ static size_t append_rec(const char*path,const char*nm0,const char*al0,const voi
     return (size_t)eof + 116;   /* 载荷偏移 = 记录起点 + (name16+algo64+vol8+psz8+mean16+vd4) */
 }
 double g_bmw_t[2]={0,0};
+/* 分块反量化的两个量必须在 #ifdef 外: CPU 参考路(-DDS4_NO_GPU / 无 CUDA)同样按块跑循环, 只是
+ * 块内走逐矩阵 dequant。理由见下面 bmw_batch_dequant 的注释。 */
+#define BMW_CHUNK 64
+int g_bmw_e0=0;          /* 本块首个专家号(把绝对 e 折成块内下标) */
 #ifdef DS4QUANT_CUDA
 /* 第三刀(08-18): 整层 768 矩阵一次批 dequant(vq_gpu.cu), 消 99k 次 per-矩阵 sync。
  * 26GB fp32 缓冲静态复用(裸判期内存空闲); worker 前向直接吃切片指针零拷贝。 */
 typedef struct { uint64_t pay_off, dst_off; int rows, cols, nc, nbit; } vqg_deq_job;
 extern int vqg_dequant_batch(const uint8_t*, float*, const vqg_deq_job*, int, int, int);
 extern int vqg_ready(void);
-float *g_bmw_buf=NULL;   /* [256][3][8.4M] 切片: e*3+w */
-int g_bmw_batched=0;     /* 本层批 dequant 成功旗标 */
-static size_t bmw_slot_off(int e,int w){ return ((size_t)e*3+w)*( (size_t)DIM*MOEI ); }
-static int bmw_batch_dequant(lfile_t*lf){
+/* ★分块 dequant(2026-08-28 内存回归修)★
+ * 原来一次把 256 个专家 ×3 个矩阵全反量化进一块 fp32 缓冲 = 256×3×4096×2048×4 = 25.8GB,
+ * 且 08-28 把它 cudaMemAdvise 钉在 GPU 常驻(那是 dequant 6.8× 提速的来源, 必须保留)。
+ * 后果: 常驻 25.8GB + 锚 23.1GB + HQE 23.6GB + 线程池 5.4GB ⇒ 121GB 机器的 MemAvailable
+ * 在 12 分钟里从 12GB 单调掉到 3GB, 眼看要 OOM(实撞, 已停车)。
+ * 专家前向本来就是 20 个线程从原子计数器抢活, 任一时刻在飞的只有 20 个 —— 256 个同时
+ * 在场纯属浪费。改成一批 64: 缓冲 6.4GB, 省 19.4GB。代价是每层多 3 次 join 屏障(µs 级),
+ * 块内仍是 20 路动态调度。★数值零影响★: 同样的专家同样的权重, 只是分批喂。 */
+float *g_bmw_buf=NULL;   /* [BMW_CHUNK][3][8.4M] 切片: (e-g_bmw_e0)*3+w */
+int g_bmw_batched=0;     /* 本块批 dequant 成功旗标 */
+static size_t bmw_slot_off(int e,int w){ return ((size_t)(e-g_bmw_e0)*3+w)*( (size_t)DIM*MOEI ); }
+static int bmw_batch_dequant(lfile_t*lf,int e0,int e1){
     if(!lf->vqmap||!vqg_ready()) return 0;
     const uint64_t *vtab=(const uint64_t*)(lf->vqmap+16);
     if(!g_bmw_buf){   /* managed: GPU 写零页故障(malloc 26GB 首触=百万级 HMM fault, 实测比逐矩阵还慢) */
         extern int vqg_alloc_managed(void**,size_t);
-        if(!vqg_alloc_managed((void**)&g_bmw_buf,(size_t)NEXP*3*DIM*MOEI*4)) return 0; }
-    static vqg_deq_job jobs[NEXP*3]; int nj=0, nc_max=0;
+        if(!vqg_alloc_managed((void**)&g_bmw_buf,(size_t)BMW_CHUNK*3*DIM*MOEI*4)) return 0; }
+    g_bmw_e0=e0;
+    static vqg_deq_job jobs[BMW_CHUNK*3]; int nj=0, nc_max=0;
     /* ★批量预读(2026-08-28)★ 下面这个 768 次的表构建循环要在 855MB 的 mmap 层件里随机点
      * 768 个矩阵头(每个 16 字节, 分散在整个文件里)。实测这一段 3.1s, 而真正的 GPU dequant
      * 内核只有 0.90s —— 全是逐 4KB 按需缺页的代价。MADV_WILLNEED 让内核一次性顺序预读整段,
      * 后面的 kernel 也要读同一片payload, 一并受益。异步返回, 不阻塞。 */
     madvise((void*)lf->vqmap, lf->vqmsz, MADV_WILLNEED);
-    for(int e=0;e<NEXP;e++) for(int w=0;w<3;w++){
+    for(int e=e0;e<e1;e++) for(int w=0;w<3;w++){
         const uint64_t off=vtab[(size_t)e*3+w];
         if(!off) return 0;                       /* 冷槽混合层: 退回逐矩阵路径 */
         const uint8_t *pay=lf->vqmap+off;
@@ -276,9 +289,6 @@ static void bytes_moe(lfile_t*lf,int S,const float*Fin,const int*idx,const float
     /* ★逐层口径(2026-08-28 改)★ 原为全程累计, 我曾把它当墙钟误读一次(1731s 实为 20 线程
      * 累计 ÷20 = 87s)。改为每次进本函数清零 + 每层打印, 并显式标注"20线程累计/墙钟"两栏。 */
     { extern double g_bmw_t[2]; g_bmw_t[0]=0; g_bmw_t[1]=0; }
-#ifdef DS4QUANT_CUDA
-    g_bmw_batched=bmw_batch_dequant(lf);
-#endif
     float *Fbase=malloc((size_t)S*DIM*4); memcpy(Fbase,Fout,(size_t)S*DIM*4);   /* shared 基 */
     const float *ge=NULL;   /* bf.GE(type-5, 取最后一条): per-expert 增益, 专家累加时乘(链 op 之前) */
     const int lay_skip=replay_layer_skipped();
@@ -286,12 +296,21 @@ static void bytes_moe(lfile_t*lf,int S,const float*Fin,const int*idx,const float
     int nth=NTHREADS<1?1:(NTHREADS>NEXP?NEXP:NTHREADS); int e_next=0;
     bmw_pool(nth,S);
     bmw_t *ws=calloc((size_t)nth,sizeof(bmw_t)); pthread_t *th=malloc((size_t)nth*sizeof(pthread_t));
-    for(int t=0;t<nth;t++){ ws[t]=(bmw_t){lf,S,Fin,idx,rw,&e_next,BMW_BUF[t].partial,ge,
-                                          BMW_BUF[t].partial_c,t};
-        pthread_create(&th[t],NULL,bytes_moe_worker,&ws[t]); }
     /* 冷热分桶缓存重建(hot=partial / cold=partial_c 归约) */
     if(BM_S!=S){ free(BM_RH); free(BM_RC); BM_RH=malloc((size_t)S*DIM*4); BM_RC=malloc((size_t)S*DIM*4); BM_S=S; }
-    for(int t=0;t<nth;t++) pthread_join(th[t],NULL);
+    for(int ec=0;ec<NEXP;ec+=BMW_CHUNK){   /* 每块先反量化这 64 个专家, 再放 worker 只在块内抢活 */
+        const int ec1=(ec+BMW_CHUNK<NEXP)?ec+BMW_CHUNK:NEXP;
+#ifdef DS4QUANT_CUDA
+        g_bmw_batched=bmw_batch_dequant(lf,ec,ec1);
+#else
+        g_bmw_e0=ec;
+#endif
+        e_next=ec;
+        for(int t=0;t<nth;t++){ ws[t]=(bmw_t){lf,S,Fin,idx,rw,&e_next,BMW_BUF[t].partial,ge,
+                                              BMW_BUF[t].partial_c,t,ec1,ec==0};
+            pthread_create(&th[t],NULL,bytes_moe_worker,&ws[t]); }
+        for(int t=0;t<nth;t++) pthread_join(th[t],NULL);
+    }
     /* ★归约并行化(2026-08-28)★ 原为主线程串行 20×2×S·DIM 次加(S=8192 时 13.4 亿次 +
      * 5.4GB 读)。按元素区间切给线程, 每元素内仍按 t 升序累加 ⇒ 浮点求和顺序不变, 逐位同值。 */
     { bmred_t *rs=malloc((size_t)nth*sizeof(bmred_t));

@@ -383,8 +383,14 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
                 if(!onep){ float*Hr=gs_forward_exit(J,Lfront,Hin,ids,S,n_fit,HQE); free(Hr); }
                 else oland[J]=1;   /* ONEPASS: 基线冻结不刷 HQE, 终验统一做 */
                 changed++; simpr+=(base-bestsc); done[J]=1;
-                snprintf(rs,80,"前沿L%d出口分 %.5g→%.5g 降%.2f%%%s",Lfront,base,bestsc,
-                         100.0*(base-bestsc)/(base>1e-12?base:1),pass?"(复检)":"");
+                /* ★打印必须报真出口层(2026-08-28 用户揪出)★ 原来这里恒打 Lfront, 而 base/bestsc
+                 * 是在【近视野出口 eF=min(J+BK,Lfront)】上算的(BK 由 DS4_BF_SCREEN_K 给, 战役脚本
+                 * 设 4)。于是 J≥Lfront−BK 的单元报 L42, 再往前的单元实际在 L41/L40 上评分却照报
+                 * L42 —— 日志里就出现"出口分 200.35 → 4.6968"这种 42 倍断崖, 看着像数值炸了。
+                 * 后果不止是误读: 换了出口层, 各单元的 Δ% 根本不可比, 也不能拿去对冠军的 −58.4%。 */
+                snprintf(rs,128,"出口L%d分 %.5g→%.5g 降%.2f%%%s%s",eF,base,bestsc,
+                         100.0*(base-bestsc)/(base>1e-12?base:1),
+                         eF!=Lfront?"(近视野, 与前沿L42单元不可比)":"",pass?"(复检)":"");
                 mlog(J,"向前反修",al,"已改写层文件",vol,rs,"✓正向落地");
             }
         }
