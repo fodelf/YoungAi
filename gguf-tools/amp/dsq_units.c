@@ -155,7 +155,7 @@ int dsq_quant_matrix(const float *W, int rows, int cols, int dim, int nc,
 
 /* 同上, 但把反量化后的权重写出来(反修要拿量化态权重再前向一遍) */
 int dsq_quant_matrix_wq(const float *W,int rows,int cols,int dim,int nc,
-                        const float *X,int n_act,float *Wq_out,double *relh)
+                        const float *X,int n_act,float *Wq_out,double *relh,size_t *bytes)
 {
     if(!W||!Wq_out||cols%dim) return -1;
     const int nvec=rows*(cols/dim);
@@ -166,6 +166,8 @@ int dsq_quant_matrix_wq(const float *W,int rows,int cols,int dim,int nc,
     if(relh){ double e=0,w=0;
         for(size_t i=0;i<(size_t)rows*cols;i++){ const double d=(double)W[i]-Wq_out[i]; e+=d*d; w+=(double)W[i]*W[i]; }
         *relh=sqrt(e/(w+1e-30)); }
+    if(bytes){ uint8_t *bf=malloc(vq_payload_bytes(rows,cols,dim,nc)+4096);
+        *bytes = bf ? vq_pack(Cb,idx,gr,rows,cols,dim,nc,bf) : 0; free(bf); }
     free(Cb);free(idx);free(gr); return 0;
 }
 #endif
@@ -342,6 +344,7 @@ static int real_layer(const char *hf,const char *anc,int L,int NE,int SROW)
     st_ctx C; memset(&C,0,sizeof C); st_open(&C,hf);
     float *YQ=calloc((size_t)SROW*D,4), *YF=calloc((size_t)SROW*D,4);
     double relh_sum=0; size_t bytes=0; int nq=0;
+    double t_rd=0, t_q=0, t_hc=0, t_fwd=0;   /* 分段: 读盘 / 纯量化 / 中间态 / 前向 */
     int *tok=malloc((size_t)SROW*4); float *ww=malloc((size_t)SROW*4);
     float *xs=malloc((size_t)SROW*D*4), *Wq=malloc((size_t)M*D*4);
 
@@ -352,8 +355,10 @@ static int real_layer(const char *hf,const char *anc,int L,int NE,int SROW)
         snprintf(n1,sizeof n1,"layers.%d.ffn.experts.%d.w1.weight",L,e);
         snprintf(n3,sizeof n3,"layers.%d.ffn.experts.%d.w3.weight",L,e);
         snprintf(n2,sizeof n2,"layers.%d.ffn.experts.%d.w2.weight",L,e);
+        const double tr0=vqt_now();
         float *e1=st_read_weight(&C,n1,&r,&c), *e3=st_read_weight(&C,n3,&r,&c),
               *e2=st_read_weight(&C,n2,&r,&c);
+        t_rd += vqt_now()-tr0;
         if(!e1||!e3||!e2){ printf("专家 %d 权重缺\n",e); free(e1);free(e3);free(e2); break; }
         /* 本专家命中的 token = 该专家的校准激活 Xc(生产口径, ds4quant_run_p9:89) */
         int nt=0;
@@ -361,23 +366,25 @@ static int real_layer(const char *hf,const char *anc,int L,int NE,int SROW)
             if(RI[(size_t)s2*NACT+a2]==e){ tok[nt]=s2; ww[nt]=RW[(size_t)s2*NACT+a2];
                 memcpy(xs+(size_t)nt*D,X+(size_t)s2*D,(size_t)D*4); nt++; break; }
         if(!nt){ free(e1);free(e3);free(e2); continue; }
-        /* ★校准激活按生产口径分矩阵给★(p9:89/145 w1,w3←Xc; p9:155-161 w2←中间态 h):
-         * 全传 NULL(无加权)会把 relh 从 0.09-0.18 抬到 0.27, 完全不是生产质量。 */
+        /* ★校准激活按生产口径分矩阵给★(p9:89/145 w1,w3←Xc; p9:155-161 w2←中间态 h) */
         double rh; size_t bt;
         float *q1=malloc((size_t)M*D*4), *q3=malloc((size_t)M*D*4);
-        if(dsq_quant_matrix(e1,M,D,4,512,xs,nt,&rh,&bt)==0){ relh_sum+=rh; bytes+=bt; nq++; }
-        dsq_quant_matrix_wq(e1,M,D,4,512,xs,nt,q1,NULL);
-        if(dsq_quant_matrix(e3,M,D,4,512,xs,nt,&rh,&bt)==0){ relh_sum+=rh; bytes+=bt; nq++; }
-        dsq_quant_matrix_wq(e3,M,D,4,512,xs,nt,q3,NULL);
-        /* w2 的校准激活 = 中间态 h = silu(x@w1)·(x@w3) */
+        /* w2 的校准激活 = 中间态 h = silu(x@w1)·(x@w3), 用 FP 权重算(生产同) */
         float *hc=malloc((size_t)nt*M*4),*gg=malloc((size_t)nt*M*4);
+        const double th0=vqt_now();
         dq_matmul(xs,e1,hc,nt,D,M); dq_matmul(xs,e3,gg,nt,D,M);
         for(size_t i=0;i<(size_t)nt*M;i++){ const float t=hc[i]; hc[i]=(t/(1.0f+expf(-t)))*gg[i]; }
-        free(gg);
-        if(dsq_quant_matrix(e2,D,M,4,512,hc,nt,&rh,&bt)==0){ relh_sum+=rh; bytes+=bt; nq++; }
-        dsq_quant_matrix_wq(e2,D,M,4,512,hc,nt,Wq,NULL);
+        free(gg); t_hc += vqt_now()-th0;
+        /* ★只编码一次★: wq 版同时出 relh/bytes/Wq。原来 dsq_quant_matrix + _wq 各调一遍,
+         * 24 个矩阵编码了 48 次, 还把这笔重复算进了"量化速度"。 */
+        const double tq0=vqt_now();
+        if(dsq_quant_matrix_wq(e1,M,D,4,512,xs,nt,q1,&rh,&bt)==0){ relh_sum+=rh; bytes+=bt; nq++; }
+        if(dsq_quant_matrix_wq(e3,M,D,4,512,xs,nt,q3,&rh,&bt)==0){ relh_sum+=rh; bytes+=bt; nq++; }
+        if(dsq_quant_matrix_wq(e2,D,M,4,512,hc,nt,Wq,&rh,&bt)==0){ relh_sum+=rh; bytes+=bt; nq++; }
+        t_q += vqt_now()-tq0;
         free(hc);
         /* FP 与【三矩阵全量化】各前向一遍 —— 这才是该层真实的量化误差 */
+        const double tf0=vqt_now();
         float *aF=calloc((size_t)nt*D,4), *aQ=calloc((size_t)nt*D,4);
         expert_fwd(xs,e1,e3,e2,ww,aF,nt,D,M);
         expert_fwd(xs,q1,q3,Wq,ww,aQ,nt,D,M);
@@ -385,12 +392,18 @@ static int real_layer(const char *hf,const char *anc,int L,int NE,int SROW)
             YF[(size_t)tok[i]*D+d]+=aF[(size_t)i*D+d];
             YQ[(size_t)tok[i]*D+d]+=aQ[(size_t)i*D+d]; }
         free(aF);free(aQ);free(q1);free(q3);
+        t_fwd += vqt_now()-tf0;
         free(e1);free(e3);free(e2);
     }
     const double t1=vqt_now();
     if(!nq){ printf("★量化 0 个矩阵 —— HF 路径或层号不对★\n"); return 1; }
-    printf("①量化   %6.1fs  %d 个矩阵  平均relh=%.4f  载荷=%.1f MiB  (★CPU 参考路, 生产走 GPU★)\n",
-           t1-t0, nq, relh_sum/nq, bytes/1048576.0);
+    /* ★速度必须分段★(2026-08-28 用户揪出): 原来一个计时器包住整个专家循环, 把
+     * 读盘(HF FP8 反量化)、中间态两次大 GEMM、两次全量专家前向 全算进了"量化速度"。 */
+    printf("①量化   ★纯编码 %6.1fs★ (%d 矩阵, %.2fs/矩阵)  平均relh=%.4f  载荷=%.1f MiB\n",
+           t_q, nq, t_q/(nq?nq:1), relh_sum/nq, bytes/1048576.0);
+    printf("         同循环其余: 读HF权重 %.1fs | 中间态h %.1fs | FP+量化双前向 %.1fs | 合计 %.1fs\n",
+           t_rd, t_hc, t_fwd, t1-t0);
+    printf("         ★CPU 参考路; 生产走 vq_gpu.cu 的 GPU kmeans, 实测整层(768矩阵) 60-80s★\n");
 
     /* ── ②反修 ── */
     float *DH=malloc((size_t)SROW*D*4);
