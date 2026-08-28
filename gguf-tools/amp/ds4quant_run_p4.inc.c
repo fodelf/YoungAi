@@ -1,3 +1,4 @@
+#include <sys/mman.h>
 /* ★跨层线程缓冲池(2026-08-28 速度)★ 原来 bytes_moe 每次调用给每个 worker 新 malloc:
  * q1/q3/q2 各 MOEI·DIM·4 = 33MB×3, xs/partial/partial_c/aq 各 S·DIM·4(S=8192 时 134MB)。
  * 20 线程合计约 10GB/层, 全是 mmap 新页 ⇒ 首触零页故障是纯开销。改成按 (nth,S) 缓存复用,
@@ -246,6 +247,13 @@ static int bmw_batch_dequant(lfile_t*lf){
         extern int vqg_alloc_managed(void**,size_t);
         if(!vqg_alloc_managed((void**)&g_bmw_buf,(size_t)NEXP*3*DIM*MOEI*4)) return 0; }
     static vqg_deq_job jobs[NEXP*3]; int nj=0, nc_max=0;
+    /* ★批量预读(2026-08-28)★ 下面这个 768 次的表构建循环要在 855MB 的 mmap 层件里随机点
+     * 768 个矩阵头(每个 16 字节, 分散在整个文件里)。实测这一段 3.1s, 而真正的 GPU dequant
+     * 内核只有 0.90s —— 全是逐 4KB 按需缺页的代价。MADV_WILLNEED 让内核一次性顺序预读整段,
+     * 后面的 kernel 也要读同一片payload, 一并受益。异步返回, 不阻塞。 */
+    double jt0=vqt_now();
+    madvise((void*)lf->vqmap, lf->vqmsz, MADV_WILLNEED);
+    double jt_adv=vqt_now()-jt0;
     for(int e=0;e<NEXP;e++) for(int w=0;w<3;w++){
         const uint64_t off=vtab[(size_t)e*3+w];
         if(!off) return 0;                       /* 冷槽混合层: 退回逐矩阵路径 */
@@ -260,6 +268,7 @@ static int bmw_batch_dequant(lfile_t*lf){
         nj++;
     }
     double bt0=vqt_now();
+    fprintf(stderr,"[bmjob] madvise=%.2f 表构建=%.2f\n",jt_adv,bt0-jt0-jt_adv);
     int ok=vqg_dequant_batch(lf->vqmap,g_bmw_buf,jobs,nj,4,nc_max);
     g_bmw_t[0]+=vqt_now()-bt0;
     return ok;
