@@ -358,17 +358,16 @@ static float *fwd_all(const long*ids,int S,int n_fit,int do_quant,const char*lcf
     if(BF_GEOP){ free(BF_GEOP); BF_GEOP=NULL; }
     if(BF_HCOP){ free(BF_HCOP); BF_HCOP=NULL; }
     if(GS_IDXC){ free(GS_IDXC); GS_IDXC=NULL; } if(GS_RWC){ free(GS_RWC); GS_RWC=NULL; }
-    if(RB_ACC&&getenv("DS4_ROUTE_BIAS_FIT")){   /* ★路由偏置侧车: 均值化+落盘★ */
-        const char*rp=getenv("DS4_ROUTE_BIAS_FIT");
-        float *rbo=malloc((size_t)NLAYERS*NEXP*4); long rbtot=0;
-        for(size_t i=0;i<(size_t)NLAYERS*NEXP;i++){ rbo[i]=RB_CNT[i]?RB_ACC[i]/(float)RB_CNT[i]:0.0f; rbtot+=RB_CNT[i]; }
-        FILE*rbf=fopen(rp,"wb");
-        if(rbf){ uint32_t hd[4]={0x41494252u,(uint32_t)NLAYERS,(uint32_t)NEXP,0};
-            fwrite(hd,4,4,rbf); fwrite(rbo,4,(size_t)NLAYERS*NEXP,rbf);
-            fwrite(RB_CNT,4,(size_t)NLAYERS*NEXP,rbf); fclose(rbf);
-            printf("ROUTE_BIAS fit → %s (margin事件=%ld)\n",rp,rbtot); }
-        free(rbo); free(RB_ACC); RB_ACC=NULL; free(RB_CNT); RB_CNT=NULL;
-    }
+    /* ★这里原来有第二个 Δb 落盘器, 已删(2026-08-28 实锤 bug)★
+     * 它写的是 `getenv("DS4_ROUTE_BIAS_FIT")` —— 那是【开关】不是路径, 战役脚本给的值是 "1",
+     * 于是整个路由偏置侧车被写进了工作目录下一个名叫 `1` 的文件(实撞: gguf-tools/amp/1,
+     * 88080 字节 = 16 头 + 43×256×4 均值 + 43×256×4 计数, margin 事件 659 万条)。
+     * 更要命的是它写完就 free(RB_ACC) —— 而本函数 fwd_all 每跑完一遍完整前向就执行到这里,
+     * 收官时真正的落盘函数 rb_save(用 DS4_ROUTE_BIAS_OUT, 还额外产 .alpha.txt)拿到的永远是
+     * 空指针, 打印"Δb 无统计可落盘(哈希路由=选择零漂移)" —— 那句话把人往哈希路由上带,
+     * 跟真因(变量名用错)毫无关系, 我第一遍就被它带偏了。
+     * 落盘只留 rb_save 一处(铁律: 一份代码, 禁同功能重复); 它的 mincnt 门比这里更严。
+     * RB_ACC/RB_CNT 各 44KB, 留到进程退出, 不再在这里 free。 */
     free(H);free(hcfn);free(hcb);free(hcs);free(norm);free(hw);return logits;
 }
 
