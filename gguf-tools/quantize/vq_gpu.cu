@@ -407,6 +407,17 @@ extern "C" int vqg_dequant_batch(const uint8_t *base, float *dst_base,
 
 extern "C" int vqg_alloc_managed(void **p, size_t bytes) {
     if (cudaMallocManaged(p, bytes) != cudaSuccess) return 0;
+    /* ★把首选驻留地钉在 GPU★(2026-08-28): 这块 26GiB 是批 dequant 的目的地, 写方是 GPU
+     * kernel、读方也是 GPU(dq_matmul 已改为托管指针直喂 cuBLAS, CPU 不再碰权重)。
+     * 不给提示时托管页会按首触方在 CPU/GPU 间来回迁移, 26GiB 逐页搬运 = 实测整层 dequant
+     * 5.62s(4.6 GB/s), 比 GB10 该有的带宽低一到两个数量级。
+     * SetPreferredLocation + 预取到设备 ⇒ 页常驻 GPU, 免掉每层的迁移往返。
+     * ★数值零影响★: 只是页驻留策略, 不改任何值。 */
+    int dev = 0; cudaGetDevice(&dev);
+    cudaMemAdvise(*p, bytes, cudaMemAdviseSetPreferredLocation, dev);
+    cudaMemPrefetchAsync(*p, bytes, dev, 0);
+    cudaDeviceSynchronize();
+    cudaGetLastError();   /* 提示类 API 失败不致命, 清错继续(退化=原迁移行为) */
     return 1;
 }
 
