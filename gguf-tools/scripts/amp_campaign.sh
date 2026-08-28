@@ -797,7 +797,8 @@ stage_judge3(){
 # 中间不留人工接力(接力是今天多次事故的来源)。语料换了 ⇒ 层件必须重量化, 所以先清 champ86;
 # 只读原件 vq86h_noz 与 95G 备份都不动。
 stage_champ3(){
-    local D2="$ROOT/gguf/go-onebit/vqhalf" W="$D2/champ86"
+    local D2="$ROOT/gguf/go-onebit/vqhalf"
+    local W="$D2/champ86"   # 见 champreset 注释: local 同句不能引用前一个名字
     [ -s "$D2/vqhalf_q.ids" ] && [ -s "$D2/vqhalf_a.ids" ] && [ -s "$D2/vqhalf_j.ids" ] \
         || DIE "三份 ids 不齐, 先跑 idshalf"
     stage_anchors3
