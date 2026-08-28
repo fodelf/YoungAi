@@ -319,18 +319,24 @@ void dq_attention(const float *x, const float *wqa, const float *qnorm, const fl
      * 试过换 dq_matmul_strided 走 cuBLAS —— 更慢(1.36s): 每个 g 都以 lda=NH*HD 跨步读遍
      * 整块 1GB 的 o, 8 次调用就是 8GB 的 HMM 读, GPU 这边一点也不划算。
      * 改为 8 条线程各跑一个原样的 cblas_sgemm: 各 g 只写 oo 的不相交列段 ⇒ 逐位不变。 */
-    int _wo_gpu = 0;
-#ifdef DS4QUANT_CUDA
-    { extern int vqg_wo_a(const float*,const float*,float*,int,int,int,int,int);
-      _wo_gpu = vqg_wo_a(o, wo_a, oo, S, NH*HD, OG, GD, OLR); }
-#endif
-    if(!_wo_gpu)
+    /* ★(g, 行块)二维切 20 路(2026-08-28)★ 这段是 550 GFLOP(OG·S·OLR·GD·2, S=8192/
+     * OLR=1024/GD=4096)。只按 g 切最多 OG=8 路, 实测 0.70s=786 GFLOPS 已贴住 8 核峰值,
+     * 剩下 12 个核全闲。gemm 的输出行彼此独立 ⇒ 再按行段切开, 每段仍是一句原样的
+     * cblas_sgemm, 逐位不变。
+     * ★GPU 两条路都试过, 都更慢★: 逐 g 调 cuBLAS 1.36s(每个 g 以 lda=NH*HD 跨步扫遍整块
+     * 1GB 的 o, 8 次=8GB); 合成一次 SgemmStridedBatched 1.57s(只扫一遍, 但 o 在主机内存,
+     * GPU 经 ATS 页粒度直访只有几 GB/s —— 本文件顶部 2026-08-22 那条注释记的就是这个坑)。
+     * 要让 GPU 划算, 得先让 o 全程留在显存(irope 也得上 GPU), 那是另一件事。 */
     { typedef struct { const float*o,*wa; float*oo; int S,GD,OLR,NHHD,ldc; } wog_t;
-      wog_t wg[OG]; pthread_t wt[OG];
-      for(int g=0;g<OG;g++) wg[g]=(wog_t){o+(size_t)g*GD, wo_a+(size_t)g*OLR*GD,
-                                          oo+(size_t)g*OLR, S, GD, OLR, NH*HD, OG*OLR};
-      for(int g=0;g<OG;g++) pthread_create(&wt[g],NULL,dq_wog_worker,&wg[g]);
-      for(int g=0;g<OG;g++) pthread_join(wt[g],NULL); }
+      const int RB=3, NT=OG*RB;            /* 8 组 × 3 行块 = 24 任务, 铺满 20 核 */
+      wog_t wg[OG*3]; pthread_t wt[OG*3]; int nt=0;
+      for(int g=0;g<OG;g++) for(int b=0;b<RB;b++){
+          int s0=(int)((long)S*b/RB), s1=(int)((long)S*(b+1)/RB);
+          if(s1<=s0) continue;
+          wg[nt++]=(wog_t){o+(size_t)s0*NH*HD+(size_t)g*GD, wo_a+(size_t)g*OLR*GD,
+                           oo+(size_t)s0*OG*OLR+(size_t)g*OLR, s1-s0, GD, OLR, NH*HD, OG*OLR}; }
+      for(int i=0;i<nt;i++) pthread_create(&wt[i],NULL,dq_wog_worker,&wg[i]);
+      for(int i=0;i<nt;i++) pthread_join(wt[i],NULL); }
 #else
     for(int s=0;s<S;s++) for(int g=0;g<OG;g++){
         const float *od = o + (size_t)s*NH*HD + (size_t)g*GD;

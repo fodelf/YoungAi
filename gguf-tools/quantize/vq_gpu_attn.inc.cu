@@ -210,28 +210,3 @@ extern "C" int vqg_attention(const float *q, const float *kva, const float *sink
     #undef _EL
     return 1;
 }
-
-/* ═══ wo_a 的 OG 组 gemm 合成一次 batched(2026-08-28)═══
- * 原来是 OG=8 次 cblas_sgemm。算力上 550 GFLOP(8×S×OLR×GD×2, S=8192/OLR=1024/GD=4096),
- * 8 线程实测 0.70s = 786 GFLOPS —— 已经贴住 CPU 峰值, 加线程也不动了。
- * 试过逐 g 调 cuBLAS: 更慢(1.36s), 因为每个 g 都以 lda=NH*HD 跨步把整块 1GB 的 o 扫一遍,
- * 8 次调用 = 8GB 主机侧读 + 8 次同步。StridedBatched 把 8 组合成一次发射 ⇒ o 只扫一遍。
- * 语义与那 8 句 cblas 逐参数同构(NoTrans×Trans, lda/ldb/ldc/stride 全对齐), 只有 cuBLAS
- * 与 OpenBLAS 的归约顺序不同 —— 与本管线其余 GEMM 早已上 GPU 是同一量级的抖动。
- * 返回 0 = 调用方回落 8 线程 cblas 老路。 */
-extern "C" int vqg_wo_a(const float *o, const float *wo_a, float *oo,
-                        int S, int NHHD, int OG, int GD, int OLR) {
-    if (!vqg_ready() || S <= 0 || OG <= 0 || GD <= 0 || OLR <= 0) return 0;
-    if (!g_at_h && cublasCreate(&g_at_h) != CUBLAS_STATUS_SUCCESS) { g_at_h = NULL; return 0; }
-    const float one = 1.0f, zero = 0.0f;
-    /* RowMajor C[S,OLR] = A[S,GD](lda=NHHD) · B[OLR,GD]^T(ldb=GD)
-     * ⇔ ColMajor: m=OLR, n=S, k=GD, 左操作数给 B、右操作数给 A(见 dq_matmul_strided) */
-    if (cublasSgemmStridedBatched(g_at_h, CUBLAS_OP_T, CUBLAS_OP_N,
-            OLR, S, GD,
-            &one,  wo_a, GD,   (long long)OLR * GD,
-                   o,    NHHD, (long long)GD,
-            &zero, oo,   OG * OLR, (long long)OLR,
-            OG) != CUBLAS_STATUS_SUCCESS) return 0;
-    if (cudaDeviceSynchronize() != cudaSuccess) { cudaGetLastError(); return 0; }
-    return 1;
-}
