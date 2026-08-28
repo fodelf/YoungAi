@@ -630,7 +630,11 @@ stage_champ86(){
 # 反修会往层件里追加记录、并落 zrec_LXX.bin, 所以复位 = 逐文件比对只读原件, 不等就覆盖,
 # 原件没有的(zrec 等反修产物)一律删。全程只动 champ86, 绝不碰 vq86h_noz。
 stage_champ_reset(){
-    local D2="$ROOT/gguf/go-onebit/vqhalf" W="$D2/champ86" SRC="$D2/vq86h_noz"
+    # ★别写成一句 local A=.. B="$A/.."★: bash 会先把这一行的所有名字建成(未赋值的)局部变量,
+    # 再逐个赋值, 于是同句里引用前一个名字在 set -u 下直接报"未绑定的变量"。分三句写。
+    local D2="$ROOT/gguf/go-onebit/vqhalf"
+    local W="$D2/champ86"
+    local SRC="$D2/vq86h_noz"
     [ -d "$SRC/layers" ] || DIE "只读原件不在: $SRC/layers"
     [ -d "$W/layers" ]   || DIE "工作副本不在: $W/layers"
     local n_rm=0 n_cp=0 n_ok=0
