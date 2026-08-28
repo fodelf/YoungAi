@@ -657,6 +657,84 @@ stage_champ_reset(){
     else DIE "复核失败, 差异见 /tmp/champ_reset_diff.txt: $(head -3 /tmp/champ_reset_diff.txt)"; fi
 }
 
+# ═══ 语料对拍: 判决尺(wt2) vs 切半的开源语料(datav5 两半)(2026-08-28 用户令)═══
+# 把三份 ids 解回文本逐项量: 字符构成 / 代码占比 / 词表重合 / token 分布重合。
+# 目的是给"校准料和判决尺到底差多远"一个硬数字, 不再靠"感觉像"。
+stage_corpdiff(){
+    local D2="$ROOT/gguf/go-onebit/vqhalf" G7="$ROOT/gguf/go-onebit/g7"
+    python3 - "$DS4_HF" "$G7/wt2.ids" "$D2/vqhalf_q.ids" "$D2/vqhalf_a.ids" <<'PY2'
+import sys, re, collections, math
+from tokenizers import Tokenizer
+hf = sys.argv[1]
+tok = Tokenizer.from_file(f"{hf}/tokenizer.json")
+names = ["判决尺 wt2", "量化半 q", "反修半 a"]
+paths = sys.argv[2:5]
+docs = []
+for nm, p in zip(names, paths):
+    ids = [int(x) for x in open(p) if x.strip()]
+    txt = tok.decode(ids)
+    docs.append((nm, ids, txt))
+
+def compo(t):
+    f = [m.start() for m in re.finditer("```", t)]
+    code = set()
+    for i in range(0, len(f)-1, 2):
+        code.update(range(f[i], f[i+1]))
+    c = collections.Counter()
+    for i, ch in enumerate(t):
+        if ch.isspace(): continue
+        o = ord(ch)
+        if i in code: k = "代码围栏"
+        elif 0x3040 <= o <= 0x30ff or 0x4e00 <= o <= 0x9fff: k = "CJK"
+        elif 0x400 <= o <= 0x4ff: k = "西里尔"
+        elif 0x600 <= o <= 0x6ff: k = "阿拉伯"
+        elif o < 128: k = "ASCII"
+        else: k = "其他非ASCII"
+        c[k] += 1
+    return c
+
+print("═══ ① 体量与字符构成 ═══")
+print("%-12s %8s %9s | %s" % ("语料", "token", "字符", "构成(非空白)"))
+for nm, ids, txt in docs:
+    c = compo(txt); tot = sum(c.values())
+    top = "  ".join("%s %.1f%%" % (k, 100*v/tot) for k, v in c.most_common(4))
+    print("%-12s %8d %9d | %s" % (nm, len(ids), len(txt), top))
+
+print()
+print("═══ ② 内容指纹(每千字符出现次数) ═══")
+pats = [("LaTeX $..$", r"\$[^$\n]{2,}\$"), ("代码围栏 ```", r"```"),
+        ("数学题触发词", r"\b(How many|what is the|Find the|Calculate)\b"),
+        ("维基式括注 (born|born in|is a)", r"\b(is a|was a|born)\b"),
+        ("URL/markup", r"https?://|\{ref-type|\[@ref")]
+print("%-32s %s" % ("指纹", "  ".join("%-12s" % n for n, _, in [(d[0], 0) for d in docs])))
+for nm, pat in pats:
+    row = []
+    for _, _, txt in docs:
+        row.append("%-12.2f" % (1000.0*len(re.findall(pat, txt, re.I))/max(len(txt), 1)))
+    print("%-32s %s" % (nm, "  ".join(row)))
+
+print()
+print("═══ ③ 词表重合 / token 分布重合(以判决尺 wt2 为基准) ═══")
+base_ids = docs[0][1]
+bs, bc = set(base_ids), collections.Counter(base_ids)
+bn = sum(bc.values())
+for nm, ids, _ in docs[1:]:
+    s2, c2 = set(ids), collections.Counter(ids)
+    n2 = sum(c2.values())
+    jac = len(bs & s2) / len(bs | s2)
+    cov = len(bs & s2) / len(bs)          # wt2 的词有多少被校准料见过
+    over = sum(min(bc[t]/bn, c2[t]/n2) for t in bs | s2)   # 分布重合(Σmin, 与主尺同式)
+    print("  %-10s 唯一token %5d | Jaccard %.3f | 覆盖wt2词表 %.1f%% | ★token分布重合 %.3f★"
+          % (nm, len(s2), jac, 100*cov, over))
+print("  %-10s 唯一token %5d (基准)" % (docs[0][0], len(bs)))
+
+print()
+print("═══ ④ 实际长相(各取 200 字符) ═══")
+for nm, _, txt in docs:
+    print("[%s] %s" % (nm, txt[300:500].replace("\n", " ⏎ ")))
+PY2
+}
+
 # ═══ 诊断针: 第三片(同语料·不相交)★不是判决★(2026-08-28)═══
 # 要回答的问题只有一个: 反修在【与校准语料同源、但一个 token 都不重叠】的片上, 是改善还是退化?
 #   改善 ⇒ 问题是分布错配(校准语料混合场景+22.4%代码, 判决尺是 WikiText-2) ⇒ 换/扩语料有用
@@ -743,7 +821,7 @@ ST="${1:-all}"
 case "$ST" in
   preflight) stage_preflight;; ids) stage_ids;; anchor) stage_anchor;;
   capture) stage_capture;; probe) stage_probe;; solve) stage_solve;; pass2) stage_pass2;;
-  chain) stage_chain;; judge) stage_judge;; dilute) stage_dilute;; idshalf) stage_idshalf;; idshalf_ext) shift; stage_idshalf_ext "$@";; vqquant) stage_vqquant;; vqmerge) stage_vqmerge;; vqcap) stage_vqcap;; vqsolve) stage_vqsolve;; dynladder) stage_dynladder;; dynquant) shift; stage_dynquant "$@";; dynjudge) stage_dynjudge;; champbf) shift; stage_champbf "$@";; champ86) stage_champ86;; champreset) stage_champ_reset;; champ3rd) stage_champ3rd;; champrb) stage_champ_rbsweep;; full) shift; stage_full "$@";;
+  chain) stage_chain;; judge) stage_judge;; dilute) stage_dilute;; idshalf) stage_idshalf;; idshalf_ext) shift; stage_idshalf_ext "$@";; vqquant) stage_vqquant;; vqmerge) stage_vqmerge;; vqcap) stage_vqcap;; vqsolve) stage_vqsolve;; dynladder) stage_dynladder;; dynquant) shift; stage_dynquant "$@";; dynjudge) stage_dynjudge;; champbf) shift; stage_champbf "$@";; champ86) stage_champ86;; champreset) stage_champ_reset;; champ3rd) stage_champ3rd;; corpdiff) stage_corpdiff;; champrb) stage_champ_rbsweep;; full) shift; stage_full "$@";;
   all) stage_preflight; stage_ids; stage_anchor; stage_capture
        stage_solve; stage_chain; stage_judge;;
   *) echo "未知段: $ST"; echo "段: preflight ids anchor capture solve pass2 chain judge dilute all (probe/dilute=诊断)"; exit 2;;
