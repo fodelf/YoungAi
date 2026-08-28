@@ -149,6 +149,12 @@ Behavior has many `DS4_*` env switches; treat them as diagnostic/tuning switches
 - **Keep model loading mmap-backed**; do not eagerly copy the full GGUF.
 - **Correctness before speed.** Don't keep a faster path with unexplained attention/KV/logit drift.
 - **单文件 ≤500 行**(make linecount 强制); 注释写"为什么"不复述代码。
+- **★只写 GPU 版本, 禁写 CPU 路径★**(铁律 2026-08-28): 新代码一律只走 GPU; 缺原语就接
+  生产的 GPU 实现, 不许为了能编过补标量参考版。单测/探针同样必须走生产 GPU 路
+  ( + 链  + )。实撞代价: 单测走了
+  CPU 参考路, 量化报 4.33s/矩阵(推一层 55 分钟), 而生产 GPU 一层只要 60-80s —— **失真 40 倍
+  且自洽**, 拿它对比目标全是废话。已有的 CPU fallback 是历史遗留, 不扩散不新增, 不拿它出
+  任何速度/质量读数。
 - **macOS CPU danger:** running the CPU inference path on macOS can crash the kernel — avoid large CPU runs there.
 - **Instance lock is intentional:** do not run multiple huge-model processes concurrently.
 
