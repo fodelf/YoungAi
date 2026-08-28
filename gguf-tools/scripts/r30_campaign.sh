@@ -44,7 +44,7 @@ LOG(){ echo "[r30 $(date +%H:%M:%S)] $*" >&2; }
 
 WDOG(){ while true; do
     P=$(pgrep -nf "${WDOG_PAT:-[d]s4quant_run.* $IDS}" || true); [ -n "$P" ] || { sleep 5; continue; }
-    MB=$(proc_mem_mb "$P" || true)
+    MB=$(proc_anon_mb "$P" || true); RSS=$(proc_mem_mb "$P" || true)
     # ★进程 RSS 红线 = 总内存 − 12GB(为 OS/page cache 留)★
     # 2026-08-27 定值依据(实测, 别再拍脑袋):
     #   · 原默认 11900MB 是 16GiB Mac 时代遗留, 在 121GB 机上 21 秒就杀掉正常反修
@@ -54,7 +54,11 @@ WDOG(){ while true; do
     # 所以红线要按"给系统留多少"定, 不是按"进程占几分之几"定。最后一道网是
     # amp_campaign 的 MemAvailable 地板(4GB)。
     _WD_DEF=$(awk '/MemTotal/{g=int($2/1024)-12288; if(g<8192)g=8192; printf "%d", g}' /proc/meminfo 2>/dev/null || echo 11900)
-    [ -n "${MB:-}" ] && [ "$MB" -gt "${WDOG_MB:-$_WD_DEF}" ] && { echo "[r30][wdog] ${MB}MB >${WDOG_MB:-$_WD_DEF}MB 杀" >&2; kill -9 "$P" 2>/dev/null || true; }
+    # ★量 anon 不量 VmRSS(2026-08-28 实撞, 见 _portable.sh proc_anon_mb 注释)★
+    # 08-27 那条"本负载正常峰值就是 ~95GB RSS"的观察没错, 但结论下歪了: 那 95GB 里绝大部分
+    # 是 HF 权重与层文件的干净 mmap 页, 丢了就丢了。按 VmRSS 定红线 ⇒ 反修跑到 L40/43 被
+    # 杀在 112485MB, 而同一时刻 MemAvailable 还有 86GB。两个数都打出来, 免得又判错。
+    [ -n "${MB:-}" ] && [ "$MB" -gt "${WDOG_MB:-$_WD_DEF}" ] && { echo "[r30][wdog] anon=${MB}MB(VmRSS=${RSS:-?}MB) >${WDOG_MB:-$_WD_DEF}MB 杀" >&2; kill -9 "$P" 2>/dev/null || true; }
     sleep 5; done }
 
 stage_anchor(){
