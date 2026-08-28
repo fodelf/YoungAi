@@ -391,18 +391,32 @@ __global__ static void vqg_dequant_batch_kernel(
     }
 }
 
-extern "C" int vqg_dequant_batch(const uint8_t *base, float *dst_base,
+extern "C" int vqg_dequant_batch(const uint8_t *base, size_t base_sz, float *dst_base,
                                  const vqg_deq_job *jobs_h, int njobs, int dim, int nc_max) {
     static __thread vqg_deq_job *jobs_d = NULL;
     static __thread int jcap = 0;
     if (jcap < njobs) { if (jobs_d) cudaFree(jobs_d); cudaMalloc((void **)&jobs_d, (size_t)njobs * sizeof(vqg_deq_job)); jcap = njobs; }
     cudaStream_t st = vqg_stream();
+    /* ★payload 先整块搬进显存(2026-08-28)★ base 是层件的 mmap, 属主机内存。GPU 经 GB10
+     * 的 ATS 直访主机页是【页粒度、非流式】, 本文件 08-22 那条注释已经踩过一次这个坑。
+     * 这里更狠: 每个 block 都要把自己那份码本(nc*dim 个 half)从主机拉一遍, 196608 个 block
+     * 累计几百 MB 的散读, 加上索引流本身。整块 H2D 一次(855MB, 实测 ~60 GB/s)之后内核全程
+     * 读显存。★数值零影响★: 逐字节同一份数据。 */
+    static __thread uint8_t *pay_d = NULL; static __thread size_t pay_cap = 0;
+    const uint8_t *base_use = base;
+    if (base_sz > 0) {
+        if (pay_cap < base_sz) { if (pay_d) cudaFree(pay_d);
+            if (cudaMalloc((void **)&pay_d, base_sz) != cudaSuccess) { pay_d = NULL; pay_cap = 0; }
+            else pay_cap = base_sz; }
+        if (pay_d && cudaMemcpyAsync(pay_d, base, base_sz, cudaMemcpyHostToDevice, st) == cudaSuccess)
+            base_use = pay_d;
+    }
     cudaMemcpyAsync(jobs_d, jobs_h, (size_t)njobs * sizeof(vqg_deq_job), cudaMemcpyHostToDevice, st);
     size_t shm = (size_t)nc_max * dim * sizeof(float);
     /* grid.x = 并发处理的行数(一 block 一行)。原值 16 是"线程跨行"布局下的分片数,
      * 新布局下它直接决定行并行度, 提到 256 让 SM 吃饱(rows=2048/4096, 循环步进覆盖余下)。 */
     dim3 grid(256, njobs);
-    vqg_dequant_batch_kernel<<<grid, 128, shm, st>>>(base, dst_base, jobs_d, njobs, dim);
+    vqg_dequant_batch_kernel<<<grid, 128, shm, st>>>(base_use, dst_base, jobs_d, njobs, dim);
     return cudaStreamSynchronize(st) == cudaSuccess;
 }
 
