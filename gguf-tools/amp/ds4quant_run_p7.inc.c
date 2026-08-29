@@ -343,6 +343,9 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
      * dql 层文件不动。'F'(FP 锚遍)仍禁。 */
     /* ★搬到三分支合流点(2026-08-23): z 段原长在专家量化分支体内, B 回放分支(纯 VQ
      * 战役唯一前向)从不经过 → ZDIAG 无声实锤。coadapt 分支自带 z, 条件排除。 */
+    { static int zc_diag=0;   /* 进入条件诊断(2026-08-29): 上轮进了这轮没进, 不猜, 打出来 */
+      if(zc_diag++<2) fprintf(stderr,"[z块条件] do_quant=%d ANC_OK=%d LZRANK=%d cfg=%c zrec_done=%d COADAPT=%d\n",
+                              do_quant,ANC_OK,LZRANK,cfg,zrec_done,COADAPT); }
     if(do_quant&&ANC_OK&&LZRANK>0&&cfg!='F'&&!zrec_done&&!(cfg=='g'&&COADAPT>0)){   /* ★'B'回放禁入已撤(见上) — 原注: 活体 z^L 每前向对锚重解会
         (a)把反修候选扰动拉回锚投影(橡皮筋, 候选逐位无效) (b)回放偷加不在文件的修正(合并模型没有→假忠实) */
         /* ★逐层动态 z^L(用户四支柱正确形态, 序贯锚定回拉)★: 输出端单点 z 要一口气补 43 层
