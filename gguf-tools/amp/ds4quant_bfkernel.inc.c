@@ -26,6 +26,18 @@ static void bfrl_worker(void *vc,int t0,int t1){ bfrl_ctx*c=(bfrl_ctx*)vc;
         const float*hf=c->Hf+(size_t)(g_anc_rowmap?g_anc_rowmap[s]:s)*HCM*DIM;
         for(size_t i=0;i<(size_t)HCM*DIM;i++){ double d=(double)hq[i]-hf[i]; e2+=d*d; a2+=(double)hf[i]*hf[i]; } }
     c->pe[slot]=e2; c->pa[slot]=a2; }
+/* ★行表版(2026-08-29)★ rows[nr]=原始行号。旧的 (vs,n_fit) 连续区间在"域按块连续铺"的
+ * 语料上只覆盖 2/8 个域(实测 [4608,6144)=西里尔后半+math) —— 反修的 z 闸与 GE 闸、以及
+ * sweep 的全部判定都靠它, 于是层内全绿、判决份四项全负。行表由 <锚>.layout 推导 ⇒ 跨全域。 */
+static double bf_exit_relL2_rows(const float *Hq, const float *Hf, const int *rows, int nr){
+    if (nr < 1 || !rows) return 0.0;
+    double e2=0, a2=0;
+    for (int i=0;i<nr;i++){ const int s=rows[i];
+        const float *hq=Hq+(size_t)s*HCM*DIM;
+        const float *hf=Hf+(size_t)(g_anc_rowmap?g_anc_rowmap[s]:s)*HCM*DIM;
+        for (size_t k=0;k<(size_t)HCM*DIM;k++){ double d=(double)hq[k]-hf[k]; e2+=d*d; a2+=(double)hf[k]*hf[k]; } }
+    return sqrt(e2/(a2+1e-30));
+}
 static double bf_exit_relL2(const float *Hq, const float *Hf, int vs, int n_fit){
     const int nrow=n_fit-vs; if(nrow<=0) return 0.0;
     int nth=20; if(nth>nrow) nth=nrow;

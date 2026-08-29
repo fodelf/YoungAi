@@ -373,6 +373,15 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
         }
         free(Hq);
         /* fit 内部再切 val: 前 vs 行拟合, [vs,n_fit) 选秩+GO门(k=0 可关本层 z); held 永不参与 */
+        /* ★打分行域=布局分层, 不是行号区间(2026-08-29)★
+         * 旧: vs=(n_fit*3)/4 ⇒ 打分区 [4608,6144)。抽样把 8 个域【连续】铺进 8192 行,
+         * 那个区间只覆盖西里尔后半+math 两个域 —— z 闸(401/428)与 GE 闸(506/511)都靠它,
+         * 于是"层内正向落地"是拿 2/8 个域判的。行表由 <锚>.layout 推导, 跨全域。
+         * vs/nval 仍保留: 它们还管【解算用哪些行】(z_solve_dual 取前 vs 行), 那是拟合侧;
+         * 这里换掉的只是【打分侧】。 */
+        int nEV=0; const int *EVR=row_layout_ev(anchor_path(),&nEV);
+        if(!EVR||nEV<2){ fprintf(stderr,"★反修停车: 行布局缺 %s.layout★\n",anchor_path());
+            fprintf(stderr,"  补法: bash gguf-tools/scripts/amp_campaign.sh idshalf 然后 anchors3\n"); exit(9); }
         int vs=(n_fit*3)/4; int nval=n_fit-vs;
         if(nval<8){ vs=n_fit; nval=0; }
         /* 行帽已撤(2026-08-23): 2048 行全梯拒(过拟合), 行数是拟合质量的硬需求;
@@ -398,7 +407,7 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
               const float *Hf2=ANC.H+(size_t)L*ancS*HCM*DIM;   /* 同上: 锚步长用 ancS 不是 lst2(=S*HCM*DIM) */
               /* 基线 val 出口 relL2 */
               double e0; { dq_hc_post(Fout,H2,post2,comb2,Hq2,S,HCM,DIM);
-                e0=bf_exit_relL2(Hq2,Hf2,vs,n_fit); }
+                e0=bf_exit_relL2_rows(Hq2,Hf2,EVR,nEV); }
               g_lt[4]=vqt_now()-lt_mark-g_lt[3]-g_lt[6]-g_lt[7]; lt_mark=vqt_now();   /* ④其余(扣三项) */
               { static double bf_e0_prev=-1.0;   /* ★链闸(2026-08-25)★: 逐层基线日志+失控守卫 */
                 fprintf(stderr,"[链闸] L%02d 基线val出口=%.4f 前层=%.4f 靶=%s\n",
@@ -425,7 +434,7 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
                     for(int d2=0;d2<DIM;d2++) fw[d2]+=sc2*zd[d2];
                 }
                 double e1; { dq_hc_post(Ftry,H2,post2,comb2,Hq2,S,HCM,DIM);
-                  e1=bf_exit_relL2(Hq2,Hf2,vs,n_fit); }
+                  e1=bf_exit_relL2_rows(Hq2,Hf2,EVR,nEV); }
                 printf("ZLGATE L=%d k=%d val出口relL2 %.6f→%.6f %s\n",L,kk,e0,e1,e1<e0-1e-9?"✓落地":"✗拒");
                 fflush(stdout);
                 if(e1<e0-1e-9){
@@ -503,12 +512,14 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
                     double e0g,e1g;
                     { dq_hc_post(Fout,H2,post2,comb2,Hq3,S,HCM,DIM);
                       double e2s=0,a2s=0;
-                      for(int s2=vs2;s2<n_fit;s2++){ const float*hq=Hq3+(size_t)s2*HCM*DIM,*hf=Hf3+(size_t)ANCROW(s2)*HCM*DIM;
+                      for(int ri=0;ri<nEV;ri++){ const int s2=EVR[ri];
+                          const float*hq=Hq3+(size_t)s2*HCM*DIM,*hf=Hf3+(size_t)ANCROW(s2)*HCM*DIM;
                           for(size_t i2=0;i2<(size_t)HCM*DIM;i2++){ double d3=(double)hq[i2]-hf[i2]; e2s+=d3*d3; a2s+=(double)hf[i2]*hf[i2]; } }
                       e0g=sqrt(e2s/(a2s+1e-30)); }
                     { dq_hc_post(Ftry2,H2,post2,comb2,Hq3,S,HCM,DIM);
                       double e2s=0,a2s=0;
-                      for(int s2=vs2;s2<n_fit;s2++){ const float*hq=Hq3+(size_t)s2*HCM*DIM,*hf=Hf3+(size_t)ANCROW(s2)*HCM*DIM;
+                      for(int ri=0;ri<nEV;ri++){ const int s2=EVR[ri];
+                          const float*hq=Hq3+(size_t)s2*HCM*DIM,*hf=Hf3+(size_t)ANCROW(s2)*HCM*DIM;
                           for(size_t i2=0;i2<(size_t)HCM*DIM;i2++){ double d3=(double)hq[i2]-hf[i2]; e2s+=d3*d3; a2s+=(double)hf[i2]*hf[i2]; } }
                       e1g=sqrt(e2s/(a2s+1e-30)); }
                     printf("ZLGATE L=%d GE(路由投影) val出口relL2 %.6f→%.6f %s (活门=%d)\n",

@@ -71,3 +71,17 @@ static int row_layout_split(const char *ids_path,
     *fit_out = fit; *nfit_out = nf; *ev_out = ev; *nev_out = ne;
     return 0;
 }
+
+/* ★进程内缓存(2026-08-29)★ 布局只解析一次, 反修(p7 的 z 闸/GE 闸)与 sweep(p13)共用同一份
+ * 行表 —— 两处用【同一批打分行】才有可比性, 也免得各解析一遍各写一套。
+ * 返回 eval 行表(打分行), *n 给长度; 布局缺则返回 NULL, 调用方必须硬停不许回退按行号切。 */
+static int *g_rl_fit = NULL, *g_rl_ev = NULL;
+static int  g_rl_nfit = 0,   g_rl_nev = 0, g_rl_tried = 0;
+static const int *row_layout_ev(const char *base, int *n)
+{
+    if (!g_rl_tried) { g_rl_tried = 1;
+        if (row_layout_split(base, &g_rl_fit, &g_rl_nfit, &g_rl_ev, &g_rl_nev) != 0) {
+            g_rl_fit = g_rl_ev = NULL; g_rl_nfit = g_rl_nev = 0; } }
+    if (n) *n = g_rl_nev;
+    return g_rl_ev;
+}
