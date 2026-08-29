@@ -54,6 +54,8 @@ static void *bmw_reduce_worker(void*a){
     }
     return NULL;
 }
+#include "ds4quant_moe_gpu.inc.c"   /* GPU 批量专家路(500 行守卫所迫的物理分片) */
+
 static void *bytes_moe_worker(void*a){
     const int _ti=(int)(intptr_t)a;
   for(;;){
@@ -70,6 +72,12 @@ static void *bytes_moe_worker(void*a){
     int *tok=B->tok; float *xs=B->xs,*wwv=B->wwv;
     if(BMW_ZERO){ memset(w->partial,0,(size_t)S*DIM*4); memset(w->partial_c,0,(size_t)S*DIM*4); }
     float *w1p=NULL,*w3p=NULL,*w2p=NULL;   /* 本迭代实际权重指针(本地缓冲或批 dequant 切片) */
+#ifdef DS4QUANT_CUDA
+    /* GPU 批量路只在单线程模式下接管(见 bytes_moe 的 nth 决策): 一条线程吃掉整块,
+     * partial/partial_c/归约全部沿用原结构不动。失败即落回下面的逐专家 CPU 路。 */
+    if(BMW_NTH==1&&g_bmw_batched&&bmw_gpu_chunk(w,BMW_ENEXT,ws_e_end)){
+        BMW_ENEXT=ws_e_end; goto chunk_done; }
+#endif
     for(;;){ int e=__sync_fetch_and_add(w->e_next,1); if(e>=ws_e_end)break;
         int nt=0; float gee=w->ge?w->ge[e]:1.0f;   /* bf.GE: per-expert 增益, 累加时乘 */
         for(int s2=0;s2<S;s2++)for(int a2=0;a2<NACT_RT;a2++)
@@ -161,6 +169,7 @@ static void *bytes_moe_worker(void*a){
         }
         erf_skip: ;
     }
+  chunk_done:
     bmbar_wait(&BMW_BAR);                 /* 告诉主线程本块做完 */
   }
     /* ★必须收 __thread CUDA 资源(2026-08-28 实撞 OOM)★ dq_matmul 给每条线程留了 cuBLAS
@@ -338,6 +347,14 @@ static void bytes_moe(lfile_t*lf,int S,const float*Fin,const int*idx,const float
     const int lay_skip=replay_layer_skipped();
     if(!lay_skip) for(int i=lf->nops-1;i>=0;i--) if(lf->ops[i].type==5&&lf->ops[i].ge){ ge=lf->ops[i].ge; break; }
     int nth=NTHREADS<1?1:(NTHREADS>NEXP?NEXP:NTHREADS);
+#ifdef DS4QUANT_CUDA
+    /* ★GPU 批量路用单线程(2026-08-29)★ 一条线程把整块 64 专家补齐后一次提交 cuBLAS
+     * strided-batched, 取代 20 线程 × 每专家 3 次小 GEMM(那正是 dq_matmul 注释里"队列争用
+     * 吃掉全部收益"的形态)。gather/scatter 退成单线程是内存带宽活(实测量级 0.1s/块),
+     * 相对省下的 17.7s GEMM 可忽略。GPU 不可用/补齐过胖时 bmw_gpu_chunk 返回 0,
+     * 该块自动落回下面的多线程 CPU 逐专家路 —— 那条路逐字节不变。 */
+    if(vqg_ready()) nth=1;
+#endif
     bmw_pool(nth,S);
     /* 冷热分桶缓存重建(hot=partial / cold=partial_c 归约) */
     if(BM_S!=S){ free(BM_RH); free(BM_RC); BM_RH=malloc((size_t)S*DIM*4); BM_RC=malloc((size_t)S*DIM*4); BM_S=S; }
