@@ -75,8 +75,9 @@ static void *bytes_moe_worker(void*a){
 #ifdef DS4QUANT_CUDA
     /* GPU 批量路只在单线程模式下接管(见 bytes_moe 的 nth 决策): 一条线程吃掉整块,
      * partial/partial_c/归约全部沿用原结构不动。失败即落回下面的逐专家 CPU 路。 */
+    { extern int g_bmw_batched;   /* 定义在本文件后段, 这里同原 worker 一样用块内 extern */
     if(BMW_NTH==1&&g_bmw_batched&&bmw_gpu_chunk(w,BMW_ENEXT,ws_e_end)){
-        BMW_ENEXT=ws_e_end; goto chunk_done; }
+        BMW_ENEXT=ws_e_end; goto chunk_done; } }
 #endif
     for(;;){ int e=__sync_fetch_and_add(w->e_next,1); if(e>=ws_e_end)break;
         int nt=0; float gee=w->ge?w->ge[e]:1.0f;   /* bf.GE: per-expert 增益, 累加时乘 */
