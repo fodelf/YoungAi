@@ -363,8 +363,7 @@ static void bytes_moe(lfile_t*lf,int S,const float*Fin,const int*idx,const float
         const int ec1=(ec+BMW_CHUNK<NEXP)?ec+BMW_CHUNK:NEXP;
         int gdone=0;
 #ifdef DS4QUANT_CUDA
-        /* ★slot 清零必须无条件(首块)★: 若放进 if(g_bmw_batched) 里, 首块批 dequant 失败时
-         * slot[nth] 留着上一层的脏数据, 归约照读 ⇒ 结果错。 */
+        /* ★slot 清零必须无条件★: 放进 if(g_bmw_batched) 的话首块 dequant 失败=归约读脏数据。 */
         if(ec==0){ memset(BMW_BUF[nth].partial,0,(size_t)S*DIM*4);
                    memset(BMW_BUF[nth].partial_c,0,(size_t)S*DIM*4); }
         g_bmw_batched=bmw_batch_dequant(lf,ec,ec1);
