@@ -7694,3 +7694,41 @@ SKIP=32/EVW=2` 生成 —— **每个域块各取** 6 窗给 fit、2 窗给 eval
 | z 落地 | **378/378 全拒** | ✓ |
 | L20 held | — | z^L **1.8%** / 组合 **3.2%** |
 | L0 held | — | z^L **3.3%** / 组合 **11.3%** |
+
+## 2026-08-29 sweep GPU 化 + ★spark 假死事故(我的进程管理失误)★
+
+用户令"先把 sweep 改成 gpu, 速度太慢了" → 批量专家核落地; 随后用户令"结束所有任务重新
+审查代码" → 自审揪出 3 个 bug; 期间 spark 被我跑挂一次。
+
+### 速度问题的定位
+sweep 单层 ~105s 的真因: 抽格(SDIV=12)后每专家只分到 nt≈12 token, 单次 GEMM 2.0e8 FLOP
+正好卡在 dq_matmul 的 GPU 门槛(>=2e8)上 ⇒ 全落 CPU, 20 线程满载 17.7s/前向 × 6 形态。
+"降门槛"已被 08-18 实测判死(5e6 阈负收益 259s vs 181s/层, 小 GEMM 队列争用), 正解=批量
+结构改造: 专家权重批 dequant 后本就在 managed g_bmw_buf, 排布 [nE][3][DIM*MOEI] 等步长
+⇒ cublasSgemmStridedBatched ×3 + SwiGLU kernel 一次吃 64 专家。
+产物: gguf-tools/quantize/vq_gpu_moe.inc.cu(设备侧) + gguf-tools/amp/ds4quant_moe_gpu.inc.c(宿主侧)。
+
+### 自审揪出的 bug(时序)
+1. ★G/U 共用一个 cap 变量★: moe_need(G,&cap_h) 先置 cap_h, moe_need(U,&cap_h) 见
+   cap_h 够就直接"成功"返回 —— U 从未分配(NULL), 第二个 GEMM 必失败 ⇒ 静默落回 CPU。
+   而当时 nth 被我设成 1 ⇒ 单线程 CPU 跑 64 专家 = 571s/层(比原 20 线程慢 20 倍)。
+   裸 return 0 无任何报错, "GPU 慢"与"落回 CPU"不可区分 → 已全路径加错误码上报。
+2. ★gather 语义数值 bug★: 原 worker 是每个专家独立扫全表; 我写成"token 首个命中块内
+   任意专家就 break" ⇒ 同 token 命中块内两个不同专家时第二个被丢(激活少算)。
+   修=不 break, 同行同专家查重(NACT=6 线性查重)。计数循环同语义同修。
+3. ★nth=1 结构错误★: fallback 变单线程。重做: worker 池 20 线程不动, 主线程在放行
+   屏障前试 GPU(结果进 slot[nth], 归约含 nth+1 条) —— 成功则 worker 空手过屏障,
+   失败则 20 线程满速接管。slot 清零必须无条件(否则首块 dequant 失败读脏数据)。
+4. Makefile 依赖缺口: vq_gpu.o 更新后 ds4quant_run 不自动重链(要 touch), 待补规则。
+
+### 修好后的实测(修 cap bug 后, gather bug 修复前)
+[moe-gpu] e[0,64) S=8192 ntmax=302 补齐率=1.6x GPU 3.30s ×4 块 ≈ 11s/层(GPU 段)
+—— 但该跑的数值产物无效(gather bug 在场), 且当时三进程互抢, 速度数不作准, 需干净重测。
+
+### ★spark 假死事故(根因=我)★
+11:35 前后 spark 失联, available 121→9G。真因: **三个 ds4quant_run 并发**(10:35/10:48/
+11:24 三次发车) —— 每个按 BF_MEMGB=55 预算设计, 三个=165G>121G。
+过失链: ①10:48 重发 sweep 前只删了 zrec, ★没杀上一个进程★; ②后续几次 pkill 打完
+"已停"就走, ★没用 pgrep 验证★ —— 进程在 mmap 缺页风暴里(D 态)对 SIGTERM 无响应,
+pkill 形同虚设。恢复靠反复 kill -9(SIGKILL 不可忽略)。
+★教训(硬规矩)★: 杀进程必须 kill -9 + pgrep 验证为空才算停; 任何重发前先验旧进程死透。
