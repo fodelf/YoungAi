@@ -182,7 +182,11 @@
         for (int e = 0; e < NEXP; e++) { ge16[e] = f64_to_f16(1.0); gf[e] = 1.0f; }
         comb = rz; USE_GE = 0;
     }
-    eff = USE_GE ? comb : rz;
+    /* ★闸判定量修正(2026-08-29 用户指出"没收益不应该不进入")★
+     * 原 eff=USE_GE?comb:rz —— z 支微正时(USE_GE=0)闸只看 rz, 完全无视组合;
+     * 而注入载荷是 z+GE【组合】: L42 rz=+0.2% 过闸, 注入的组合实测 −3.8% 有害。
+     * 闸必须判【注进去的那个东西】的实测收益 = comb(GE 关时 comb=rz, 语义不变)。 */
+    eff = comb;
 
     /* 分域终验: held 前半=prog 后半=fin(注意 py 这里【总是】叠 GE 效应, GE 关时 gf≡1 无害) */
     if (nev >= 2) {
