@@ -83,12 +83,29 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
               for(int s=0;s<Ss;s++) ids_s[s]=ids[sidx[s]];
               Hin_s=malloc((size_t)Ss*rowsz*4); Ht_s=malloc((size_t)Ss*rowsz*4); }
     }
-    /* ★Lfront 出口锚的抽格视图(2026-08-29 逐单元全程复核用)★: 复核前向跑抽格行,
-     * 打分要对 Lfront 锚的同一批行 —— 按 sidx gather 一次, 43 个单元共用。 */
-    float *HtF_s=NULL;
-    if(sidx){ HtF_s=malloc((size_t)Ss*rowsz*4);
-        for(int s2=0;s2<Ss;s2++)
-            memcpy(HtF_s+(size_t)s2*rowsz,ANC.H+(size_t)Lfront*lstride+(size_t)sidx[s2]*rowsz,rowsz*4); }
+    /* ★复核专用前缀(2026-08-29 二修)★: 第一版复核打分用 EVc(抽格 128 行), 标准误 ~8.8%,
+     * 而层级增益只有 0.02-1.03% —— 128 行上的"改善"全是噪声(4 层链实测: 复核全放行,
+     * 终验 1536 行上仍劣化 20% 全回滚)。历史注释早警告过这一点, 我重启复核时没听。
+     * 修 = 打分行用【LEV 全集 1536 行】(与终验同行集 ⇒ 判据方向必然对齐), 前向行数
+     * 1536+FIT抽格≈1920(升序归并, moe GPU 照常接管), 全程复核 ~40s×2/单元, 可负担。 */
+    int *sidx2=NULL,*EVc2=NULL,S2=0,nEVc2=0; long *ids2=NULL;
+    float *HtF2=NULL,*Hin2=NULL;
+    if(sidx){
+        sidx2=malloc(sizeof(int)*(size_t)(nLFIT+nLEV+1));
+        EVc2=malloc(sizeof(int)*(size_t)(nLEV+1));
+        { int i=0,j=0;
+          while(i<nLFIT||j<nLEV){
+              const int a=i<nLFIT?LFIT[i]:0x7fffffff, b=j<nLEV?LEV[j]:0x7fffffff;
+              if(a<=b){ sidx2[S2++]=a; i+=SDIV; }             /* fit 侧仍抽格(不参与打分) */
+              else    { EVc2[nEVc2++]=S2; sidx2[S2++]=b; j++; } } }   /* ★eval 全集不抽格★ */
+        ids2=malloc(sizeof(long)*(size_t)S2);
+        for(int s2=0;s2<S2;s2++) ids2[s2]=ids[sidx2[s2]];
+        HtF2=malloc((size_t)S2*rowsz*4);
+        for(int s2=0;s2<S2;s2++)
+            memcpy(HtF2+(size_t)s2*rowsz,ANC.H+(size_t)Lfront*lstride+(size_t)sidx2[s2]*rowsz,rowsz*4);
+        Hin2=malloc((size_t)S2*rowsz*4);
+        fprintf(stderr,"[sweep] 复核前缀: %d 行(eval 全集 %d + fit 抽格 %d)\n",S2,nEVc2,S2-nEVc2);
+    }
     /* ★同前沿复检★: sweep 高层→低层, 低层落地会刷新高层输入上下文(HQE), 但高层已评过 →
      * 第一遍有落地则对"保持"层用新上下文再重解一遍(pass=1), 堵"评估时机"漏 */
     g_anc_rowmap = NULL;   /* 进函数先清干净 */
@@ -296,8 +313,11 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
              * 单元 +2 次全程前向 ≈ 20-40s, 可负担。打分行=EVc(跨全域 eval 抽格), 判据=配对
              * 差分(同行集 basef vs scv), 行少的噪声在差分里大幅相消。
              * 统一终验保留(双保险, 应恒过 —— 每个落地都单独全程验证过)。 */
-            float*Hf0=gs_forward_exit(J,Lfront,eHin,eIds,eS,eNf,NULL);
-            double basef=co_score_rows(Hf0,HtF_s,EVc,nEVc,rowsz); free(Hf0);
+            for(int s2=0;s2<S2;s2++)
+                memcpy(Hin2+(size_t)s2*rowsz,Hin+(size_t)sidx2[s2]*rowsz,rowsz*4);
+            g_anc_rowmap=sidx2;                       /* 锚行映射切到复核前缀 */
+            float*Hf0=gs_forward_exit(J,Lfront,Hin2,ids2,S2,S2,NULL);
+            double basef=co_score_rows(Hf0,HtF2,EVc2,nEVc2,rowsz); free(Hf0);
             lop_t svE; float svg=0,svt=0,svw2[4]; float*gbak=NULL; int tmpop=-1;
             memset(&svE,0,sizeof(svE));
             if(form==5){ svE=lf->ops[ze]; lf->ops[ze]=opE; }
@@ -314,8 +334,9 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
                     for(int e=0;e<NEXP;e++) lf->ops[go].ge[e]*=geD[e]; }
                 else if(lf->nops<32){ tmpop=lf->nops; memset(&lf->ops[tmpop],0,sizeof(lop_t));
                     lf->ops[tmpop].type=5; lf->ops[tmpop].ge=geD; lf->nops++; } }   /* geD 所有权不转移 */
-            float*Hv=gs_forward_exit(J,Lfront,eHin,eIds,eS,eNf,NULL);
-            double scv=co_score_rows(Hv,HtF_s,EVc,nEVc,rowsz); free(Hv);
+            float*Hv=gs_forward_exit(J,Lfront,Hin2,ids2,S2,S2,NULL);
+            double scv=co_score_rows(Hv,HtF2,EVc2,nEVc2,rowsz); free(Hv);
+            g_anc_rowmap=scr?sidx:NULL;               /* 还原本单元的粗筛映射 */
             if(form==5) lf->ops[ze]=svE;
             else if(form==6) lf->nops--;
             else if(form==1){ if(tmpop>=0) lf->nops--; else lf->ops[fo].g=svg; }
@@ -443,7 +464,7 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
             }
         }
         for(int i=0;i<NBFU;i++) free(BFU[i].old);
-        free(LFIT); free(LEV); LFIT=LEV=NULL; free(FITc); free(EVc); FITc=EVc=NULL; free(HtF_s); HtF_s=NULL;
+        free(LFIT); free(LEV); LFIT=LEV=NULL; free(FITc); free(EVc); FITc=EVc=NULL; free(sidx2); free(EVc2); free(ids2); free(HtF2); free(Hin2);
         NBFU=0; free(ofl); free(oland);
     }
     for(int J=Lfront-1;J>=Jlo;J--) if(!done[J]){   /* 仍未正向: 逐层上日志(重解=原值, 非隐身) */
