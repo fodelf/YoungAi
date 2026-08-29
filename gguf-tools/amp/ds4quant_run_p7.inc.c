@@ -432,8 +432,11 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
                 fprintf(stderr,"[链闸] L%02d 基线val出口=%.4f 前层=%.4f 靶=%s\n",
                         L,e0,bf_e0_prev,(BF_LT&&BF_LT_L==L)?"层局部":"漂移");
                 if(bf_e0_prev>0.0&&e0>bf_e0_prev*1.5+0.05){
-                    fprintf(stderr,"★[链闸] L%02d 基线暴涨 %.4f→%.4f (>1.5x+0.05) 链失稳 — 硬停★\n",L,bf_e0_prev,e0);
-                    exit(7); }
+                    /* ★硬停降级为警告(2026-08-29 用户令"别浪费时间")★ 阈值 1.5x+0.05 是按
+                     * 旧 2 域打分口径校的; 全域口径下 L41 实测 0.368→1.06 触发, 三刀二分
+                     * (摘注入/换层件/查锚)已把数据损坏全排除, 剩下是口径尺度或链上漂移 ——
+                     * 都不该由推进段自杀裁决。判决权交给五指标(项目铁律: 唯一裁判=在线五指标)。 */
+                    fprintf(stderr,"★[链闸] L%02d 基线暴涨 %.4f→%.4f (>1.5x+0.05) — 警告继续(终判交五指标)★\n",L,bf_e0_prev,e0); }
                 bf_e0_prev=e0; }
               for(int ci=0;ci<7&&!kland;ci++){ int kk=cand0[ci];
                 if(kk<1||kk>(int)zl->rank) continue;
