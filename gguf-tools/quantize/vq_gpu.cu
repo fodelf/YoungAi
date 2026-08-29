@@ -19,6 +19,10 @@
 static __thread cudaStream_t g_vqg_stream = NULL;
 static int g_vqg_ok = -1;
 
+extern "C" void vqg_last_err(const char *tag) {
+    cudaError_t e = cudaGetLastError();   /* 读并清除粘连错误 */
+    if (e != cudaSuccess) { static int w=0; if(w++<4) fprintf(stderr, "[vqg] ★%s: 粘连CUDA错误=%s★\n", tag, cudaGetErrorString(e)); }
+}
 extern "C" int vqg_ready(void) {
     if (g_vqg_ok < 0) g_vqg_ok = (cudaFree(0) == cudaSuccess) ? 1 : 0;
     return g_vqg_ok;

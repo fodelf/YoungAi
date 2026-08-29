@@ -303,11 +303,12 @@ float *g_bmw_buf=NULL;   /* [BMW_CHUNK][3][8.4M] 切片: (e-g_bmw_e0)*3+w */
 int g_bmw_batched=0;     /* 本块批 dequant 成功旗标 */
 static size_t bmw_slot_off(int e,int w){ return ((size_t)(e-g_bmw_e0)*3+w)*( (size_t)DIM*MOEI ); }
 static int bmw_batch_dequant(lfile_t*lf,int e0,int e1){
-    if(!lf->vqmap||!vqg_ready()) return 0;
+    { extern void vqg_last_err(const char*); vqg_last_err("bdq入口"); }   /* 诊断: 粘连错误 */
+    if(!lf->vqmap||!vqg_ready()) { static int _w1=0; if(!_w1++) fprintf(stderr,"[bdq] ★首次失败点#1★\n"); return 0; }
     const uint64_t *vtab=(const uint64_t*)(lf->vqmap+16);
     if(!g_bmw_buf){   /* managed: GPU 写零页故障(malloc 26GB 首触=百万级 HMM fault, 实测比逐矩阵还慢) */
         extern int vqg_alloc_managed(void**,size_t);
-        if(!vqg_alloc_managed((void**)&g_bmw_buf,(size_t)BMW_CHUNK*3*DIM*MOEI*4)) return 0; }
+        if(!vqg_alloc_managed((void**)&g_bmw_buf,(size_t)BMW_CHUNK*3*DIM*MOEI*4)) { static int _w2=0; if(!_w2++) fprintf(stderr,"[bdq] ★首次失败点#2★\n"); return 0; } }
     g_bmw_e0=e0;
     static vqg_deq_job jobs[BMW_CHUNK*3]; int nj=0, nc_max=0;
     /* ★批量预读(2026-08-28)★ 下面这个 768 次的表构建循环要在 855MB 的 mmap 层件里随机点
@@ -317,11 +318,11 @@ static int bmw_batch_dequant(lfile_t*lf,int e0,int e1){
     madvise((void*)lf->vqmap, lf->vqmsz, MADV_WILLNEED);
     for(int e=e0;e<e1;e++) for(int w=0;w<3;w++){
         const uint64_t off=vtab[(size_t)e*3+w];
-        if(!off) return 0;                       /* 冷槽混合层: 退回逐矩阵路径 */
+        if(!off) { static int _w3=0; if(!_w3++) fprintf(stderr,"[bdq] ★首次失败点#3★\n"); return 0; }                       /* 冷槽混合层: 退回逐矩阵路径 */
         const uint8_t *pay=lf->vqmap+off;
         uint16_t d16,n16; uint32_t rr,cc;
         memcpy(&d16,pay+4,2); memcpy(&n16,pay+6,2); memcpy(&rr,pay+8,4); memcpy(&cc,pay+12,4);
-        if(d16!=4||n16>1024) return 0;
+        if(d16!=4||n16>1024) { static int _w4=0; if(!_w4++) fprintf(stderr,"[bdq] ★首次失败点#4★\n"); return 0; }
         int nb=1; while((1<<nb)<n16) nb++;
         jobs[nj].pay_off=off; jobs[nj].dst_off=bmw_slot_off(e,w);
         jobs[nj].rows=(int)rr; jobs[nj].cols=(int)cc; jobs[nj].nc=(int)n16; jobs[nj].nbit=nb;
