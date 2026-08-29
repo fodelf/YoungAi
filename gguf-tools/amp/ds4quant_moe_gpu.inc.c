@@ -15,7 +15,14 @@ static int bmw_gpu_chunk(bmw_t *w, int e0, int e1)
 {
     lfile_t *lf=w->lf; const int S=w->S, nE=e1-e0;
     extern float *g_bmw_buf; extern int g_bmw_e0;
-    if(nE<1||!lf->vqmap||!g_bmw_buf||g_bmw_e0!=e0) return 0;
+    /* ★为什么要这行诊断★: GPU 路一旦静默落回 CPU, 而 nth 又被设成 1(见 bytes_moe),
+     * 就变成【一条线程跑 64 专家的 CPU GEMM】= 比原来 20 线程慢 20 倍。实撞过一次
+     * (571s/层 vs 22s/层), 当时没有任何输出能区分"GPU 慢"和"落回单线程 CPU"。 */
+    static int diag=0;
+    if(nE<1||!lf->vqmap||!g_bmw_buf||g_bmw_e0!=e0){
+        if(!diag++) fprintf(stderr,"[moe-gpu] 不适用: nE=%d vqmap=%p buf=%p e0=%d/%d ⇒ 落回 CPU 路\n",
+                            nE,(void*)lf->vqmap,(void*)g_bmw_buf,g_bmw_e0,e0);
+        return 0; }
     int *nt=(int*)calloc((size_t)nE,sizeof(int)); if(!nt) return 0;
     for(int s=0;s<S;s++) for(int a=0;a<NACT_RT;a++){
         const int e=w->idx[(size_t)s*NACT_RT+a];
@@ -38,7 +45,10 @@ static int bmw_gpu_chunk(bmw_t *w, int e0, int e1)
         Wt[(size_t)j*ntmax+i]=gee*w->rw[(size_t)s*NACT_RT+a];
         memcpy(Xp+((size_t)j*ntmax+i)*DIM, w->Fin+(size_t)s*DIM, (size_t)DIM*4);
         break; }
+    const double gt0=vqt_now();
     const int ok=vqg_moe_batch(g_bmw_buf,Xp,Wt,Yp,nE,ntmax,DIM,MOEI,SWLIM);
+    { static int d2=0; if(d2++<4) fprintf(stderr,"[moe-gpu] e[%d,%d) S=%d ntmax=%d 补齐率=%.1fx %s %.2fs\n",
+        e0,e1,S,ntmax,(double)nE*ntmax/((double)S*NACT_RT/NEXP*nE),ok?"GPU":"★失败→CPU★",vqt_now()-gt0); }
     if(ok){   /* scatter: 冷热分桶与原路同判据(vtab 的 w2 槽非零=热) */
         const uint64_t *vtab=(const uint64_t*)(lf->vqmap+16);
         for(int j=0;j<nE;j++){
