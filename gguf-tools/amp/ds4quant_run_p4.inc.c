@@ -72,13 +72,7 @@ static void *bytes_moe_worker(void*a){
     int *tok=B->tok; float *xs=B->xs,*wwv=B->wwv;
     if(BMW_ZERO){ memset(w->partial,0,(size_t)S*DIM*4); memset(w->partial_c,0,(size_t)S*DIM*4); }
     float *w1p=NULL,*w3p=NULL,*w2p=NULL;   /* 本迭代实际权重指针(本地缓冲或批 dequant 切片) */
-#ifdef DS4QUANT_CUDA
-    /* GPU 批量路只在单线程模式下接管(见 bytes_moe 的 nth 决策): 一条线程吃掉整块,
-     * partial/partial_c/归约全部沿用原结构不动。失败即落回下面的逐专家 CPU 路。 */
-    { extern int g_bmw_batched;   /* 定义在本文件后段, 这里同原 worker 一样用块内 extern */
-    if(BMW_NTH==1&&g_bmw_batched&&bmw_gpu_chunk(w,BMW_ENEXT,ws_e_end)){
-        BMW_ENEXT=ws_e_end; goto chunk_done; } }
-#endif
+/* (GPU 批量路在主线程, 见 bytes_moe 块循环; worker 只负责 CPU 逐专家) */
     for(;;){ int e=__sync_fetch_and_add(w->e_next,1); if(e>=ws_e_end)break;
         int nt=0; float gee=w->ge?w->ge[e]:1.0f;   /* bf.GE: per-expert 增益, 累加时乘 */
         for(int s2=0;s2<S;s2++)for(int a2=0;a2<NACT_RT;a2++)
@@ -170,7 +164,6 @@ static void *bytes_moe_worker(void*a){
         }
         erf_skip: ;
     }
-  chunk_done:
     bmbar_wait(&BMW_BAR);                 /* 告诉主线程本块做完 */
   }
     /* ★必须收 __thread CUDA 资源(2026-08-28 实撞 OOM)★ dq_matmul 给每条线程留了 cuBLAS
@@ -348,15 +341,10 @@ static void bytes_moe(lfile_t*lf,int S,const float*Fin,const int*idx,const float
     const int lay_skip=replay_layer_skipped();
     if(!lay_skip) for(int i=lf->nops-1;i>=0;i--) if(lf->ops[i].type==5&&lf->ops[i].ge){ ge=lf->ops[i].ge; break; }
     int nth=NTHREADS<1?1:(NTHREADS>NEXP?NEXP:NTHREADS);
-#ifdef DS4QUANT_CUDA
-    /* ★GPU 批量路用单线程(2026-08-29)★ 一条线程把整块 64 专家补齐后一次提交 cuBLAS
-     * strided-batched, 取代 20 线程 × 每专家 3 次小 GEMM(那正是 dq_matmul 注释里"队列争用
-     * 吃掉全部收益"的形态)。gather/scatter 退成单线程是内存带宽活(实测量级 0.1s/块),
-     * 相对省下的 17.7s GEMM 可忽略。GPU 不可用/补齐过胖时 bmw_gpu_chunk 返回 0,
-     * 该块自动落回下面的多线程 CPU 逐专家路 —— 那条路逐字节不变。 */
-    if(vqg_ready()) nth=1;
-#endif
-    bmw_pool(nth,S);
+/* (2026-08-29 自审撤销"GPU 路 nth=1"设计: GPU 一失败 fallback 就是【单线程】CPU =
+     * 比原来慢 20 倍, 571s/层实撞。现设计: worker 池 20 线程不动, 主线程在放行前试 GPU —
+     * 成功则 worker 空手而归, 失败则 20 线程正常接管, fallback 永远是满速 CPU 路。) */
+    bmw_pool(nth+1,S);   /* +1: 最后一条 slot 归主线程 GPU 批量路(见块循环) */
     /* 冷热分桶缓存重建(hot=partial / cold=partial_c 归约) */
     if(BM_S!=S){ free(BM_RH); free(BM_RC); BM_RH=malloc((size_t)S*DIM*4); BM_RC=malloc((size_t)S*DIM*4); BM_S=S; }
     /* ★线程只建一次, 跨 4 个块复用(2026-08-28)★ 每条线程退出时要 dq_gpu_thread_release
@@ -373,12 +361,24 @@ static void bytes_moe(lfile_t*lf,int S,const float*Fin,const int*idx,const float
     BMW_JOB.lf=lf; BMW_JOB.S=S; BMW_JOB.Fin=Fin; BMW_JOB.idx=idx; BMW_JOB.rw=rw; BMW_JOB.ge=ge;
     for(int ec=0;ec<NEXP;ec+=BMW_CHUNK){
         const int ec1=(ec+BMW_CHUNK<NEXP)?ec+BMW_CHUNK:NEXP;
+        int gdone=0;
 #ifdef DS4QUANT_CUDA
+        /* ★slot 清零必须无条件(首块)★: 若放进 if(g_bmw_batched) 里, 首块批 dequant 失败时
+         * slot[nth] 留着上一层的脏数据, 归约照读 ⇒ 结果错。 */
+        if(ec==0){ memset(BMW_BUF[nth].partial,0,(size_t)S*DIM*4);
+                   memset(BMW_BUF[nth].partial_c,0,(size_t)S*DIM*4); }
         g_bmw_batched=bmw_batch_dequant(lf,ec,ec1);
+        /* ★主线程试 GPU 批量(2026-08-29)★: 成功则本块专家一次算完, worker 拿不到活直接过
+         * 屏障; 失败则 worker 20 线程照旧 —— fallback 永远是满速多线程 CPU, 不是单线程。
+         * GPU 结果累加进 slot[nth](主线程私有), 归约时和 worker 的 20 条一起求和。 */
+        if(g_bmw_batched){
+            bmw_t gv={lf,S,Fin,idx,rw,NULL,BMW_BUF[nth].partial,ge,BMW_BUF[nth].partial_c,nth,0,NULL,0};
+            gdone=bmw_gpu_chunk(&gv,ec,ec1);
+        }
 #else
         g_bmw_e0=ec;
 #endif
-        BMW_ENEXT=ec; ws_e_end=ec1; BMW_ZERO=(ec==0);
+        BMW_ENEXT=gdone?ec1:ec; ws_e_end=ec1; BMW_ZERO=(ec==0);
         bmbar_wait(&BMW_BAR);   /* 放行本块 */
         bmbar_wait(&BMW_BAR);   /* 等本块做完 */
     }
@@ -387,7 +387,7 @@ static void bytes_moe(lfile_t*lf,int S,const float*Fin,const int*idx,const float
     { bmred_t *rs=malloc((size_t)nth*sizeof(bmred_t)); pthread_t *th=malloc((size_t)nth*sizeof(pthread_t));
       size_t N=(size_t)S*DIM, chunk=(N+nth-1)/nth;
       for(int t=0;t<nth;t++){ size_t a=chunk*(size_t)t, b=a+chunk>N?N:a+chunk; if(a>N)a=N;
-          rs[t]=(bmred_t){a,b,nth,BM_RH,BM_RC,Fout};
+          rs[t]=(bmred_t){a,b,nth+1,BM_RH,BM_RC,Fout};   /* +1: 含主线程 GPU slot */
           pthread_create(&th[t],NULL,bmw_reduce_worker,&rs[t]); }
       for(int t=0;t<nth;t++) pthread_join(th[t],NULL);
       free(rs); free(th); }

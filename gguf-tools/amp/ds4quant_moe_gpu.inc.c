@@ -23,10 +23,17 @@ static int bmw_gpu_chunk(bmw_t *w, int e0, int e1)
         if(!diag++) fprintf(stderr,"[moe-gpu] 不适用: nE=%d vqmap=%p buf=%p e0=%d/%d ⇒ 落回 CPU 路\n",
                             nE,(void*)lf->vqmap,(void*)g_bmw_buf,g_bmw_e0,e0);
         return 0; }
+    /* ★gather 语义必须与原 worker 完全一致(2026-08-29 自审出的数值 bug)★
+     * 原 worker 是【每个专家】独立扫全表: 对 (s,e) 只取首个匹配槽, 但同一 token 的 6 个槽
+     * 命中本块【不同】专家时, 每个专家都要处理它。我第一版写成"首个命中块内任意专家就
+     * break" —— 后面的专家被丢, 激活直接少算。修法: 不 break, 改查重(同行同专家才跳过;
+     * NACT=6, 线性查重零成本)。计数循环与 gather 循环必须同语义, 否则 fill 越界。 */
     int *nt=(int*)calloc((size_t)nE,sizeof(int)); if(!nt) return 0;
     for(int s=0;s<S;s++) for(int a=0;a<NACT_RT;a++){
         const int e=w->idx[(size_t)s*NACT_RT+a];
-        if(e>=e0&&e<e1){ nt[e-e0]++; break; } }
+        if(e<e0||e>=e1) continue;
+        int dup=0; for(int b=0;b<a;b++) if(w->idx[(size_t)s*NACT_RT+b]==e){ dup=1; break; }
+        if(!dup) nt[e-e0]++; }
     int ntmax=0; for(int i=0;i<nE;i++) if(nt[i]>ntmax) ntmax=nt[i];
     if(ntmax<1){ free(nt); return 1; }
     const size_t npad=(size_t)nE*ntmax;
@@ -39,12 +46,13 @@ static int bmw_gpu_chunk(bmw_t *w, int e0, int e1)
     for(int s=0;s<S;s++) for(int a=0;a<NACT_RT;a++){
         const int e=w->idx[(size_t)s*NACT_RT+a];
         if(e<e0||e>=e1) continue;
+        { int dup=0; for(int b=0;b<a;b++) if(w->idx[(size_t)s*NACT_RT+b]==e){ dup=1; break; }
+          if(dup) continue; }
         const int j=e-e0, i=fill[j]++;
         const float gee=w->ge?w->ge[e]:1.0f;
         tk[(size_t)j*ntmax+i]=s;
         Wt[(size_t)j*ntmax+i]=gee*w->rw[(size_t)s*NACT_RT+a];
-        memcpy(Xp+((size_t)j*ntmax+i)*DIM, w->Fin+(size_t)s*DIM, (size_t)DIM*4);
-        break; }
+        memcpy(Xp+((size_t)j*ntmax+i)*DIM, w->Fin+(size_t)s*DIM, (size_t)DIM*4); }
     const double gt0=vqt_now();
     const int ok=vqg_moe_batch(g_bmw_buf,Xp,Wt,Yp,nE,ntmax,DIM,MOEI,SWLIM);
     { static int d2=0; if(d2++<4) fprintf(stderr,"[moe-gpu] e[%d,%d) S=%d ntmax=%d 补齐率=%.1fx %s %.2fs\n",
