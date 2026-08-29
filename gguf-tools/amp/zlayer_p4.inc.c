@@ -282,12 +282,15 @@
     for (size_t i = 0; i < (size_t)NTOK * D; i++) X[i] = XSOLVE[i];
 
     int ntr = 0, nev = 0, *tr = NULL, *ev = NULL;
-    const char *fr = getenv("DS4_ZL_FIT_RANGES"), *er = getenv("DS4_ZL_EV_RANGE");
-    if (fr) {
-        if (!er) die("DS4_ZL_FIT_RANGES 设了但 DS4_ZL_EV_RANGE 没设 — .py 同样会崩");
-        tr = parse_ranges(fr, &ntr);
-        ev = parse_ranges(er, &nev);
-    } else {
+    /* ★行域 = <锚>.layout 分层, 不走 env(2026-08-29 用户令"不要环境变量控制逻辑")★
+     * 旧路是 DS4_ZL_FIT_RANGES/EV_RANGE 两个 env, 由调用脚本现算现传 —— 掩码一旦写死在
+     * 脚本里(旧版 32 块×256), 语料换了就静默错位, 没人记得回来改。实撞后果: 反修在拉丁文
+     * 上拟合、西里尔文上判落地、阿拉伯+中日韩当 held ⇒ z 落地 378/378 全拒。
+     * 现在布局由生产方(抽样)落盘、随锚走, 消费方从【自己已经拿到的锚路径】推导。
+     * 读不到就死, 不许退回"按行号切"—— 那正是出事的默认。 */
+    if (row_layout_split(ap, &tr, &ntr, &ev, &nev) != 0)
+        die("行布局缺 %s.layout — 先跑 amp_campaign.sh idshalf(补布局) 与 anchors3(随锚落一份)", ap);
+    if (0) {
         int NF = env_int("DS4_ZL_NFIT", 1287);
         ntr = NF; nev = NTOK - NF;
         tr = (int *)xmalloc((size_t)ntr * sizeof(int));

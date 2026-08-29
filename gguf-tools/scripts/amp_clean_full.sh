@@ -15,12 +15,11 @@ export DS4_HF=$HOME/ds4-main/hf/DeepSeek-V4-Flash-0731
 D2=gguf/go-onebit/vqhalf
 WS=${1:-amp_clean}
 XC=${2:-}
-K=${3:-1024}
+K=${3:?秩 K 必传(冠军=64)。★不给默认★: 旧版 ${3:-1024} 让漏传时静默变成 1024, 与 LZRANK 静默兜底 16 同款事故}
 XA=${4:-}
 ANCOV=${5:-}
-IDSP=${6:-$D2/vqhalf_a.ids}   # ★$6=ids 路径(必须与 $5 锚配对)★ 行布局从 $IDSP.layout 读
-LRANGE=${7:-}          # ★$7=层范围 "a b"(默认全 43 层): 10 分钟级单层验证用, 不新造脚本
-ANC=${ANCOV:-$D2/anchor_a_clean_s8192.bin}
+LRANGE=${6:-}          # ★$6=层范围 "a b"(默认全 43 层): 10 分钟级单层验证用, 不新造脚本
+ANC=${ANCOV:?锚路径必传($5)。★不给默认★: 喂错锚 PPL 会飙到 2.4e7, 但喂【旧】锚只会静默出错数}
 LOG(){ echo "[$WS $(date +%H:%M:%S)] $*"; }
 # ①等锚(FP遍写完的判据=文件尺寸到位)  [python3 内联清零(2026-08-25 迁移 Wave C): bash 算术同式]
 EXP=$(( 40 + 43*8192*4096*4 + 2*43*8192*6*4 + 43*8192*4*4096*4 + 8192*129280*4 ))
@@ -37,40 +36,15 @@ fi
 # ②反修工作区(全量重跑铁律: 从 noz 干净态起)
 rm -rf $D2/$WS
 mkdir -p $D2/$WS/layers
-cd $D2/${SRCBASE:-vq86h_noz/layers}   # SRCBASE=相对 D2 的【层件目录】(如 champ86/layers_quant)
+cd $D2/${SRCBASE:?底座层件目录必传(env SRCBASE=, 如 champ86/layers_quant)。★不给默认★: 默认到 vq86h_noz 会拿旧语料量化的底座当新底座}
 for f in dql_vq_L*.bin; do ln -f "$f" "$HOME/ds4-main/$D2/$WS/layers/$f" 2>/dev/null || cp "$f" "$HOME/ds4-main/$D2/$WS/layers/"; done
 cp dql_ops_L*.bin opt_L*.bin manifest.txt "$HOME/ds4-main/$D2/$WS/layers/" 2>/dev/null
 cp dql_L*.bin "$HOME/ds4-main/$D2/$WS/layers/"
 cd ~/ds4-main
 LOG "②工作区就绪"
-# ★行掩码: 一个数字都不写死, 全从布局文件读(2026-08-29 用户令)★
-# 为什么不能写死: 旧版把 "32块×256" 抄死在这里。语料后来换成 8域×1024行/窗128, 掩码
-# 静默错位 —— 没人记得回来改。后果实测: fit 拉丁91% / val 西里尔26% / held 阿拉伯59%+
-# 中日韩33%, 三段几乎零重叠 ⇒ z 落地 378/378 全拒。改成读布局后同一层 z 立刻复活
-# (L0 组合 held 11.3%)。布局由 amp_campaign.sh stage_idshalf 在抽样时落盘, 生产方写、
-# 消费方读, 换语料自动跟随。★读不到就硬停, 绝不回退到猜★。
-LAY="$IDSP.layout"
-[ -s "$LAY" ] || { LOG "★行布局缺: $LAY"; LOG "  先跑: bash gguf-tools/scripts/amp_campaign.sh idshalf (ids 已在时它只补布局, 逐字节校验, 不动 ids)"; exit 1; }
-W=$(awk '$1=="win"{print $2}' "$LAY")
-[ -n "$W" ] && [ "$W" -gt 0 ] 2>/dev/null || { LOG "★布局里没有 win"; exit 1; }
-# 两个比例沿用冠军配方(唯一的"配方常数", 与语料无关, 就地注明出处):
-#   剔窗首 25%(冠军 64/256) = 拼接毒: 窗首是源语料里的跳跃, 模型在那儿没上下文
-#   末 25% 窗给 eval(冠军 8/32) = fit/eval 同分布: 【每个域块各出一份】而不是按行号切
-FR=""; ER=""
-while read -r d off cnt; do
-  case "$d" in \#*|win|"") continue;; esac
-  nw=$(( cnt / W )); [ "$nw" -lt 2 ] && nw=2
-  skip=$(( W / 4 ))
-  nev=$(( nw / 4 )); [ "$nev" -lt 1 ] && nev=1
-  for w in $(seq 0 $((nw-1))); do
-    x=$(( off + w*W + skip )); y=$(( off + (w+1)*W ))
-    [ "$y" -gt $(( off + cnt )) ] && y=$(( off + cnt ))
-    [ "$x" -ge "$y" ] && continue
-    if [ "$w" -lt $(( nw - nev )) ]; then FR="${FR:+$FR,}$x:$y"; else ER="${ER:+$ER,}$x:$y"; fi
-  done
-done < "$LAY"
-[ -n "$FR" ] && [ -n "$ER" ] || { LOG "★行掩码算空(布局有问题)"; exit 1; }
-LOG "行掩码 ← $LAY: win=$W, fit $(echo "$FR"|tr , '\n'|wc -l) 段 / eval $(echo "$ER"|tr , '\n'|wc -l) 段"
+# 行掩码不再在这里算(2026-08-29): 已下沉进 zlayer/ds4quant_run —— 它们从【自己拿到的
+# 锚路径】读 <锚>.layout 推导行域。脚本现算现传(DS4_ZL_FIT_RANGES/EV_RANGE)那条路已删:
+# 掩码写在脚本里 = 语料一换就静默错位 = 今天 z 全拒 378/378 的根因。
 # ③zlayer 全家 43 层(干净锚; XC 非空=第7参引擎捕获)
 # zlayer=C 版(2026-08-25 迁移 Wave B 一期, 金标 migrate/golden.txt: z支线与py精确一致/
 # GE=py-CPU路真解口径(py-GPU路 XCAP 下 GE 恒死是 py 自身分裂, 见 zlayer_transcription_notes #1)/
@@ -80,7 +54,7 @@ ZLB="$HOME/ds4-main/gguf-tools/amp/zlayer"
 # 构建收进 gguf-tools/Makefile(批1): 平台特判(Accelerate/scipy_openblas/CUDA)都在那边。
 [ -x "$ZLB" ] || make -C "$HOME/ds4-main/gguf-tools" zlayer
 for L in ${LRANGE:-$(seq 0 42)}; do
-  env DS4_ZL_NTOK=8192 DS4_ZL_NFIT=6144 ${XA:+DS4_ZL_XANCHOR=$XA} DS4_ZL_FIT_RANGES="$FR" DS4_ZL_EV_RANGE="$ER" \
+  env DS4_ZL_NTOK=8192 DS4_ZL_NFIT=6144 ${XA:+DS4_ZL_XANCHOR=$XA} \
   "$ZLB" "$DS4_HF" $D2/$WS/layers "$ANC" $L ${K:-1024} 1 ${XC:+$D2/$XC} \
     2>&1 | grep -aE "XCAP|Error|assert|★" || { LOG "★L$L 失败★"; exit 1; }
   # 进度可观测铁律: 每层收官打一行(tail -f 就能看到 43 层推进)

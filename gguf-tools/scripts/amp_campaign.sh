@@ -765,7 +765,7 @@ stage_champ86(){
     # 08-29 产出 42 层过拟合标量增益(判决份四项全负)的来源。
     LOG "②反修+sweep(冠军 zlayer 路 K=64; 行掩码从 vqhalf_a.ids.layout 读, 缺则硬停)"
     SRCBASE=champ86/layers_quant bash "$SC/amp_clean_full.sh" \
-        champ86amp "" 64 "" "$D2/anchor_a_clean_s8192.bin" "$D2/vqhalf_a.ids" \
+        champ86amp "" 64 "" "$D2/anchor_a_clean_s8192.bin" \
         || DIE "冠军路反修失败"
     # ③五指标: amp_clean_full 的 ④ 已出 wt2 官方尺; 这里补【判决份同域全能力尺】(裸+反修后两跑)
     LOG "③判决份同域尺; wt2 官方尺已由 ② 内部跑完(对表平权裸 KLD 0.47055 / Σmin 0.7799 / top1 78.36%)"
@@ -839,6 +839,11 @@ stage_anchors3(){
             > "/tmp/anc3_$i.log" 2>&1
         watchdog_stop
         [ -s "${ANCF[$i]}" ] || { tail -5 "/tmp/anc3_$i.log"; DIE "${NAMES[$i]}锚没落盘"; }
+        # ★布局随锚走(2026-08-29)★: 消费方(zlayer / ds4quant_run 的 sweep)手里只有【锚路径】,
+        # 没有 ids 路径。把 <ids>.layout 复制成 <锚>.layout, 它们就能从自己已有的路径推导出
+        # 行域, 不需要任何 env 开关、不需要额外参数。缺布局 = 硬停, 不许回退到"按行号切"。
+        [ -s "${IDSF[$i]}.layout" ] || DIE "${NAMES[$i]}份行布局缺(先跑 idshalf 补)"
+        cp -f "${IDSF[$i]}.layout" "${ANCF[$i]}.layout"
         LOG "${NAMES[$i]}锚 ✓ $(ls -l "${ANCF[$i]}" | awk '{printf "%.1f GiB", $5/1073741824}')"
     done
 }

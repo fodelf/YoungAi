@@ -129,6 +129,21 @@ static double co_score(const float*Hq,const float*Hf,int a,int b,size_t rowsz){
     free(wv);
     return la+0.5*lc;
 }
+/* ★行表版打分(2026-08-29)★ rows[nr]=【原始行号】, gather 成紧凑前缀后走【同一个】co_score。
+ * 为什么必须有它: 旧的 (a,b) 连续区间在"域按块连续铺"的语料上只覆盖 1-2 个域 —— 实测
+ * [4608,6144) = 西里尔后半+math, 而 sweep 的候选择优/落地/终验【全部】用这个区间打分,
+ * 于是 42 层"层内正向落地 + 终验✓改善"在判决份 8 域尺上四项全负。行表由布局推导 ⇒ 跨全域。 */
+static double co_score_rows(const float*Hq,const float*Hf,const int*rows,int nr,size_t rowsz){
+    if(nr<1||!rows) return 0.0;
+    float *ga=malloc((size_t)nr*rowsz*4), *gb=malloc((size_t)nr*rowsz*4);
+    if(!ga||!gb){ free(ga); free(gb); return 0.0; }
+    for(int i=0;i<nr;i++){
+        memcpy(ga+(size_t)i*rowsz, Hq+(size_t)rows[i]*rowsz, rowsz*4);
+        memcpy(gb+(size_t)i*rowsz, Hf+(size_t)rows[i]*rowsz, rowsz*4); }
+    double v=co_score(ga,gb,0,nr,rowsz);
+    free(ga); free(gb); return v;
+}
+
 /* ===== 从层文件重前向(跨层反向的执行引擎): 文件即真相 =====
  * 读 dql_L<NN>.bin: 1bit 权重字节 + 落地修正记录(按时间序回放 GL/dyn2/dyn8/TREF)。
  * 不重量化 — 直接 dequant 字节 → 专家前向 → 修正链回放。 */

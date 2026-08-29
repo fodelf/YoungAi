@@ -1,0 +1,73 @@
+/* row_layout.inc.c — 行布局(域块) → fit/eval 行选取。★唯一实现★, zlayer 与 ds4quant_run 共用。
+ *
+ * ★为什么不走 env(2026-08-29 用户令"不要环境变量控制逻辑, 每次都这样不是丢了吗")★
+ * 用 env 传行掩码 = 下次没人记得设 = 静默走回错的默认。今天两处实撞:
+ *   ① LZRANK 未设 → p14:289 静默兜底 16(冠军是 64), 日志里只能从"试过的 k 只有 16/8/4/1"倒推
+ *   ② 行掩码把 "32 块 × 256" 抄死在脚本里; 语料换成 8 域 × 1024 行 / 窗 128 后静默错位
+ *      ⇒ 反修在拉丁文上拟合、西里尔文上判落地、阿拉伯+中日韩当 held(解码实测三段几乎零重叠)
+ *      ⇒ z 落地 378/378 全拒。修掉后同一层 z 立刻复活(L0 组合 held 11.3%)。
+ * 所以布局【跟着 ids 走】: <ids>.layout 由 amp_campaign.sh stage_idshalf 在抽样时落盘,
+ * 消费方从【自己本来就拿到的 ids 路径】推导出来, 不经过任何开关、任何默认值。
+ *
+ * 布局文件格式(生产方写, 勿手改):
+ *   win <窗宽>              窗与窗之间是源语料里的跳跃 = 上下文断点
+ *   <域名> <起始行> <行数>   各域在 8192 行里【连续】铺开
+ *
+ * 选取规则 — 两个比例来自冠军 r64c 配方, 与语料无关, 故是仅有的两个常数:
+ *   剔每个窗的前 25%(冠军 64/256): 窗首是跳跃点, 模型在那儿没有上下文 = "拼接毒"
+ *   每个域块末 25% 的窗给 eval(冠军 8/32): ★fit 与 eval 都【从每个域块各取】★,
+ *   而不是按行号切 —— 后者在"域连续铺"的布局下必然让两段落到不同的域上。 */
+
+/* 自带头文件: 本片被两个 TU 在【不同位置】include(ds4quant_run 在 anchor 之后 /
+ * zlayer 必须在 p1 之前=文件作用域), 不能假设调用方已经引好。重复 include 有守卫, 无害。 */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* 返回 0=成功(out 数组由 malloc 给出, 调用方负责 free); -1=布局文件不在或不合法。
+ * 硬失败由调用方决定: 需要分层的路径(反修/sweep 的落地判据)必须停, 不许猜。 */
+static int row_layout_split(const char *ids_path,
+                            int **fit_out, int *nfit_out, int **ev_out, int *nev_out)
+{
+    if (!ids_path) return -1;
+    char lp[1024];
+    snprintf(lp, sizeof lp, "%s.layout", ids_path);
+    FILE *f = fopen(lp, "r");
+    if (!f) return -1;
+
+    int win = 0, cap = 1024, nf = 0, ne = 0;
+    int *fit = (int *)malloc(sizeof(int) * (size_t)cap);
+    int *ev  = (int *)malloc(sizeof(int) * (size_t)cap);
+    if (!fit || !ev) { free(fit); free(ev); fclose(f); return -1; }
+
+    char line[512];
+    while (fgets(line, sizeof line, f)) {
+        if (line[0] == '#' || line[0] == '\n') continue;
+        char nm[128]; long a = 0, b = 0;
+        if (sscanf(line, "win %d", &win) == 1) continue;
+        if (sscanf(line, "%127s %ld %ld", nm, &a, &b) != 3) continue;
+        if (win <= 0 || b <= 0) continue;
+        const int off = (int)a, cnt = (int)b;
+        int nw = cnt / win; if (nw < 2) nw = 2;          /* 至少留一窗给 eval */
+        const int skip = win / 4;                        /* 剔窗首 25% */
+        int nev = nw / 4; if (nev < 1) nev = 1;          /* 末 25% 窗给 eval */
+        for (int w = 0; w < nw; w++) {
+            int x = off + w * win + skip, y = off + (w + 1) * win;
+            if (y > off + cnt) y = off + cnt;
+            for (int r = x; r < y; r++) {
+                int **dst = (w < nw - nev) ? &fit : &ev;
+                int *n    = (w < nw - nev) ? &nf  : &ne;
+                if (*n >= cap) { cap *= 2;
+                    int *t1 = (int *)realloc(fit, sizeof(int) * (size_t)cap);
+                    int *t2 = (int *)realloc(ev,  sizeof(int) * (size_t)cap);
+                    if (!t1 || !t2) { free(t1 ? t1 : fit); free(t2 ? t2 : ev); fclose(f); return -1; }
+                    fit = t1; ev = t2; dst = (w < nw - nev) ? &fit : &ev; }
+                (*dst)[(*n)++] = r;
+            }
+        }
+    }
+    fclose(f);
+    if (win <= 0 || nf < 8 || ne < 2) { free(fit); free(ev); return -1; }
+    *fit_out = fit; *nfit_out = nf; *ev_out = ev; *nev_out = ne;
+    return 0;
+}

@@ -38,17 +38,36 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
      * 保 train/val 切分)上进行 — 只定形态排序; 落地闸门不变: 胜者按真前沿×全token 复核必须净降。
      * 质量最坏情形=多几个"保持", 判据口径与旧全量一致, 永不反向。
      * DS4_BF_SCREEN_K=0 回旧全量行为; DS4_BF_SCREEN_DIV=1 只截深度不抽token。 */
-    int BK=getenv("DS4_BF_SCREEN_K")?atoi(getenv("DS4_BF_SCREEN_K")):8;
-    int SDIV=getenv("DS4_BF_SCREEN_DIV")?atoi(getenv("DS4_BF_SCREEN_DIV")):4; if(SDIV<1)SDIV=1;
+    /* ★写死不走 env(2026-08-29 用户令"不要环境变量控制逻辑, 每次都这样不是丢了吗")★
+     * 原来这五个都是 getenv+默认值。危害不是"可配", 是【C 默认与脚本实际值不一致】:
+     * SCREEN_DIV 的 C 默认是 4 而 r30_campaign.sh 一直导出 12 —— 不经脚本直接跑二进制,
+     * 抽格密度就悄悄变了。同款事故今天已撞两次(LZRANK 未设静默兜底 16 / 行掩码写死 32×256)。
+     * 取值 = 脚本一直在用的那一组, 行为逐位不变。 */
+    int BK=8;   /* 后面粗筛关闭时会置 0, 故不 const */
+    const int SDIV=12;   /* r30_campaign.sh 一直导出的值(C 旧默认 4 与之不符) */
     /* ★2026-08-02: 原来这里有 "DS4_ANCHOR_ROUTE ⇒ BK=0 硬关粗筛"。已删 —— 不相容的根源
      * (锚按原始行号、抽格前向按紧凑行号)由 g_anc_rowmap 行映射解决了。关粗筛的代价是
      * 本文件自己注明的 "旧式全量 ≈0.40·F² min/前沿, 43 层≈7 天", 交付不了。 */
     int Ss=0,vss=0,vrej=0; int*sidx=NULL; long*ids_s=NULL; float*Hin_s=NULL,*Ht_s=NULL;
+    /* ★行域 = 布局分层, 不是行号区间(2026-08-29)★
+     * 旧写法 fit=[0,vs) / 打分=[vs,n_fit)。抽样把 8 个域【连续】铺进 8192 行(实测
+     * [0,4096) 拉丁 / [4096,5120) 西里尔 / [6144,7168) 阿拉伯 / [7168,8192) 中日韩),
+     * 于是打分区 [4608,6144) 只覆盖【西里尔后半+math】两个域 —— sweep 的六候选择优、
+     * 逐层落地、连同最后的统一终验, 全部只看 2/8 个域。上一轮 42 层"✓正向落地"+终验
+     * "✓改善→提交", 判决份 8 域尺上四项全负, 就是这么来的。
+     * 布局由 <锚>.layout 给(amp_campaign.sh 抽样时落盘 → anchors3 随锚落一份),
+     * 从【本进程已经拿到的锚路径】推导, 不经任何开关。读不到=硬停, 不许猜。 */
+    int *LFIT=NULL,*LEV=NULL,nLFIT=0,nLEV=0;
+    if(row_layout_split(anchor_path(),&LFIT,&nLFIT,&LEV,&nLEV)!=0){
+        fprintf(stderr,"★sweep 停车: 行布局缺 %s.layout★\n",anchor_path());
+        fprintf(stderr,"  补法: bash gguf-tools/scripts/amp_campaign.sh idshalf (只补布局, 逐字节校验, 不动 ids)\n");
+        exit(9); }
+    fprintf(stderr,"[sweep] 行域←%s.layout: fit %d 行 / 打分 %d 行(跨全域)\n",anchor_path(),nLFIT,nLEV);
     if(BK>0){
-        sidx=malloc(sizeof(int)*(size_t)(n_fit+1));
-        for(int s=0;s<vs;s+=SDIV) sidx[Ss++]=s;
+        sidx=malloc(sizeof(int)*(size_t)(nLFIT+nLEV+1));
+        for(int i=0;i<nLFIT;i+=SDIV) sidx[Ss++]=LFIT[i];
         vss=Ss;
-        for(int s=vs;s<n_fit;s+=SDIV) sidx[Ss++]=s;
+        for(int i=0;i<nLEV;i+=SDIV) sidx[Ss++]=LEV[i];
         if(Ss<8||Ss-vss<2){ free(sidx); sidx=NULL; BK=0; Ss=0; }   /* 校准太小: 粗筛无意义 */
         else{ ids_s=malloc(sizeof(long)*(size_t)Ss);
               for(int s=0;s<Ss;s++) ids_s[s]=ids[sidx[s]];
@@ -64,14 +83,17 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
      * 段栈取中点评估, 中点 Δbest≥DS4_BF_BISECT_SKIP(%, 默认0.05)或落地才细分两侧;
      * 平坦段整段剪枝(done=1 ⇒ 复检遍与收尾日志都不再访问, 时间真省)。
      * 复检遍(pass=1)不变: 线性只扫已评估且保持的层("最后收尾一次")。 */
-    int bis_on=(getenv("DS4_BF_SWEEP_ORDER")&&!strcmp(getenv("DS4_BF_SWEEP_ORDER"),"bisect"));
-    double bskip=getenv("DS4_BF_BISECT_SKIP")?atof(getenv("DS4_BF_BISECT_SKIP")):0.05;
+    /* 二分 sweep 已实现但【不武装】(见下方 08-04 单测实账: 剪枝与零漏检不可兼得,
+     * 质量门铁律优先) —— 写死 0, 要开就改这一行, 不留 env。 */
+    const int bis_on=0;
+    double bskip=0.05;
     int (*bseg)[2]=bis_on?malloc(sizeof(int[2])*(size_t)(2*Lfront+8)):NULL; int bsp=0;
     /* ★ONEPASS(2026-08-04 用户裁决: "一遍就够, 每层落地反复矫正=后面跑偏")★
      * 冻结基线 Jacobi 式: 单元判据=近视野粗筛(不跑每单元全程复核), 落地不刷 HQE(所有层
      * 在同一反修完成态上选型互不污染), 单 pass, 收尾一次全程终验 — 劣化=全回滚
      * (truncate 掉 append + BFU 表回写原地改 + lfile 重读)。sweep 7.8h → ~1.5h。 */
-    int onep=getenv("DS4_BF_ONEPASS")&&atoi(getenv("DS4_BF_ONEPASS"));
+    /* ONEPASS = 2026-08-04 用户终裁"一遍就够"; r30_campaign.sh 一直导出 1 ⇒ 写死。 */
+    const int onep=1;
     size_t *ofl=onep?calloc((size_t)Lfront,sizeof(size_t)):NULL;   /* 每层落地前文件长度 */
     char *oland=onep?calloc((size_t)Lfront,1):NULL;                /* 本 pass 落地标记 */
     if(onep){ BFU_ARM=1; NBFU=0;
@@ -82,7 +104,7 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
     /* ★判决前置(用户裁决 2026-07-21)★: DS4_BF_NO_RECHECK=1 跳过全量复检遍 —
      * 先出 rr 终判"验证有没有问题", 有问题再手动 backfit 定向补(实测账: 复检遍 ~2h
      * 换 ~2% 出口分, 判决才是定谳)。默认 0 = 旧行为。 */
-    if(pass==1&&getenv("DS4_BF_NO_RECHECK")){
+    if(0){   /* 复检遍从不禁用(脚本从未设过 DS4_BF_NO_RECHECK); 开关删除 */
         fprintf(stderr,"[反修] DS4_BF_NO_RECHECK=1: 跳过复检遍 → 直接判决\n"); break; }
     /* 访问驱动器: linear=Lfront-1..0 递减(默认, 原行为); bisect(仅首遍)=段栈中点序 */
     int bis=(bis_on&&pass==0);
@@ -130,8 +152,8 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
             double kv2=db[s]/(tn+1e-20); if(kv2>4.0)kv2=4.0; kkrow[s]=(float)kv2; }
         /* ★联合损失(2026-08-05 用户终裁: 四损失+感知同一目标并存, 非网格选一)★
          * 行权恒开: effw=1+W_pc·kk(W_pc 全局常数, →0 逐位退化基线解) */
-        { static float JWPC=-1.0f;
-          if(JWPC<0){ const char*e=getenv("DS4_JOINT_WPC"); JWPC=e?(float)atof(e):0.35f; }
+        { static float JWPC=0.35f;
+          if(0)JWPC=0.35f;
           for(int s=0;s<eS;s++) effw[s]=1.0f+JWPC*kkrow[s]; }
         evald++;
         /* --- 形态A: 全局α(链末 bf.GL, 已有则临时累乘) + 顶点细搜(粗网格漏±1%级最优) --- */
@@ -301,7 +323,7 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
              * 只看所有落地合起来在全量行上净降(功效高得多)。恢复原状。 */
             g_anc_rowmap = NULL;   /* 复核走全量行 ⇒ 锚回恒等映射 */
             float*Hf0=gs_forward_exit(J,Lfront,Hin,ids,S,n_fit,NULL);
-            double basef=co_score(Hf0,Htgt,vs,n_fit,rowsz); free(Hf0);
+            double basef=co_score_rows(Hf0,Htgt,LEV,nLEV,rowsz); free(Hf0);
             lop_t svE; float svg=0,svt=0,svw2[4]; float*gbak=NULL; int tmpop=-1;
             memset(&svE,0,sizeof(svE));
             if(form==5){ svE=lf->ops[ze]; lf->ops[ze]=opE; }
@@ -319,7 +341,7 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
                 else if(lf->nops<32){ tmpop=lf->nops; memset(&lf->ops[tmpop],0,sizeof(lop_t));
                     lf->ops[tmpop].type=5; lf->ops[tmpop].ge=geD; lf->nops++; } }   /* geD 所有权不转移 */
             float*Hv=gs_forward_exit(J,Lfront,Hin,ids,S,n_fit,NULL);
-            double scv=co_score(Hv,Htgt,vs,n_fit,rowsz); free(Hv);
+            double scv=co_score_rows(Hv,Htgt,LEV,nLEV,rowsz); free(Hv);
             if(form==5) lf->ops[ze]=svE;
             else if(form==6) lf->nops--;
             else if(form==1){ if(tmpop>=0) lf->nops--; else lf->ops[fo].g=svg; }
@@ -404,7 +426,7 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
              * 段长>DS4_BF_BISECT_MAXSEG(默认3)时 mid 平坦也必须细分; 只许剪 ≤MAXSEG 的小段
              * ⇒ 漏检窗口≤相邻2层, 增益孤岛必被四分位链命中。 */
             int seglen=bhi-blo+1;
-            int mseg=getenv("DS4_BF_BISECT_MAXSEG")?atoi(getenv("DS4_BF_BISECT_MAXSEG")):3;
+            int mseg=3;
             if(form||jdl>=bskip||seglen>mseg){ /* 有增益或段还长 → 两侧细分(右段后压=先访问深层) */
                 if(blo<=J-1){ bseg[bsp][0]=blo; bseg[bsp][1]=J-1; bsp++; }
                 if(J+1<=bhi){ bseg[bsp][0]=J+1; bseg[bsp][1]=bhi; bsp++; }
@@ -422,9 +444,9 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
         if(nland){
             /* 统一终验: 冻结基线上全部落地 → 一次全程出口分 vs 进入时基线(HQE[Lfront+1]=反修态出口) */
             g_anc_rowmap=NULL;
-            double b0=co_score(HQE+(size_t)(Lfront+1)*lstride,Htgt,vs,n_fit,rowsz);
+            double b0=co_score_rows(HQE+(size_t)(Lfront+1)*lstride,Htgt,LEV,nLEV,rowsz);
             float*Hf=gs_forward_exit(Jlo,Lfront,HQE+(size_t)Jlo*lstride,ids,S,n_fit,NULL);
-            double fin=co_score(Hf,Htgt,vs,n_fit,rowsz); free(Hf);
+            double fin=co_score_rows(Hf,Htgt,LEV,nLEV,rowsz); free(Hf);
             printf("BF_ONEPASS 终验 落地=%d 出口分 %.5g→%.5g %s\n",nland,b0,fin,
                    fin<b0-1e-9?"✓改善→提交":"✗劣化→全回滚"); fflush(stdout);
             if(fin<b0-1e-9){
@@ -446,6 +468,7 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
             }
         }
         for(int i=0;i<NBFU;i++) free(BFU[i].old);
+        free(LFIT); free(LEV); LFIT=LEV=NULL;
         NBFU=0; free(ofl); free(oland);
     }
     for(int J=Lfront-1;J>=Jlo;J--) if(!done[J]){   /* 仍未正向: 逐层上日志(重解=原值, 非隐身) */

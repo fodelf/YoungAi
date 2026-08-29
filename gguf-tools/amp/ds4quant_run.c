@@ -32,6 +32,7 @@
 #include "ds4quant_elm.inc.c"
 #include "ds4quant_xcap.inc.c"
 #include "ds4quant_anchor.inc.c"
+#include "row_layout.inc.c"   /* 行布局→分层行选取(与 zlayer 共用一份) */
 #include "ds4quant_run_p2.inc.c"
 #include "ds4quant_run_p3.inc.c"
 #include "ds4quant_run_p4.inc.c"

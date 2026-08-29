@@ -21,6 +21,7 @@
  * p6: main: ERF 死层部件
  * p7: main: 注入载荷 + 写出收尾
  */
+#include "row_layout.inc.c"   /* 行布局→分层行选取(与 ds4quant_run 共用一份); 必须在 p1 之前=文件作用域 */
 #include "zlayer_p1.inc.c"
 #include "zlayer_p2.inc.c"
 #include "zlayer_p3.inc.c"
