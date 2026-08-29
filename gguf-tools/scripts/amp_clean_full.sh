@@ -18,6 +18,7 @@ XC=${2:-}
 K=${3:-1024}
 XA=${4:-}
 ANCOV=${5:-}
+LRANGE=${6:-}          # ★$6=层范围 "a b"(默认全 43 层): 10 分钟级单层验证用, 不新造脚本
 ANC=${ANCOV:-$D2/anchor_a_clean_s8192.bin}
 LOG(){ echo "[$WS $(date +%H:%M:%S)] $*"; }
 # ①等锚(FP遍写完的判据=文件尺寸到位)  [python3 内联清零(2026-08-25 迁移 Wave C): bash 算术同式]
@@ -35,18 +36,32 @@ fi
 # ②反修工作区(全量重跑铁律: 从 noz 干净态起)
 rm -rf $D2/$WS
 mkdir -p $D2/$WS/layers
-cd $D2/vq86h_noz/layers
+cd $D2/${SRCBASE:-vq86h_noz}/layers
 for f in dql_vq_L*.bin; do ln -f "$f" "$HOME/ds4-main/$D2/$WS/layers/$f" 2>/dev/null || cp "$f" "$HOME/ds4-main/$D2/$WS/layers/"; done
 cp dql_ops_L*.bin opt_L*.bin manifest.txt "$HOME/ds4-main/$D2/$WS/layers/" 2>/dev/null
 cp dql_L*.bin "$HOME/ds4-main/$D2/$WS/layers/"
 cd ~/ds4-main
 LOG "②工作区就绪"
-# 行掩码(2026-08-24 拼接毒定罪: 256块互织语料每块前64行=异域上下文污染行, z被毒死;
-# 剔污染行后 z 复活 L3 7.2%/组合11.7%=连续锚同档) — 复用 08-09 拼接修正既有开关
+# ★行掩码(2026-08-29 重写: 旧版硬编码 32块×256 与新语料布局不符)★
+# 两件事一起做, 缺一个 z 就死:
+#  ①【剔拼接毒】2026-08-24 定罪: 抽样是等距铺窗, 每个窗的开头是源语料里的【跳跃】,
+#    模型在那儿没有上下文 ⇒ 前若干行是污染行。剔掉后 z 复活(L3 7.2%/组合 11.7% 在案)。
+#  ②【域分层】2026-08-29 定位: 新切分把 8 个域按【连续块】铺(实测 [0:4096) 拉丁 /
+#    [4096:5120) 西里尔 / [6144:7168) 阿拉伯 / [7168:8192) 中日韩)。若按行号顺序切
+#    fit/val, 就变成"拉丁上拟合、西里尔上判落地、阿拉伯+中日韩当 held" —— 实测
+#    fit latin91% vs held ara59%+cjk33%, 三段几乎零重叠, z 必然 100% 全拒(378/378 在案)。
+#    修法: fit 与 eval 都【从每个域块里各取】, 域内按窗划分 ⇒ 两段同分布。
+# 布局参数(与 amp_campaign.sh stage_idshalf 的抽样一致: 8 域等权 × 1024 行, 窗宽 128):
+NDOM=${NDOM:-8}; DOMROWS=${DOMROWS:-1024}; WIN=${WIN:-128}; SKIP=${SKIP:-32}
+NW=$(( DOMROWS / WIN ))          # 每域窗数 = 8
+EVW=${EVW:-2}                    # 每域末尾 EVW 个窗给 eval, 其余给 fit
 FR=""; ER=""
-for b in $(seq 0 31); do
-  seg="$((b*256+64)):$(( (b+1)*256 ))"
-  if [ "$b" -lt 24 ]; then FR="${FR:+$FR,}$seg"; else ER="${ER:+$ER,}$seg"; fi
+for d in $(seq 0 $((NDOM-1))); do
+  for w in $(seq 0 $((NW-1))); do
+    a=$(( d*DOMROWS + w*WIN + SKIP ))     # 跳过本窗前 SKIP 行(拼接毒)
+    b=$(( d*DOMROWS + (w+1)*WIN ))
+    if [ "$w" -lt $((NW-EVW)) ]; then FR="${FR:+$FR,}$a:$b"; else ER="${ER:+$ER,}$a:$b"; fi
+  done
 done
 # ③zlayer 全家 43 层(干净锚; XC 非空=第7参引擎捕获)
 # zlayer=C 版(2026-08-25 迁移 Wave B 一期, 金标 migrate/golden.txt: z支线与py精确一致/
@@ -56,7 +71,7 @@ done
 ZLB="$HOME/ds4-main/gguf-tools/amp/zlayer"
 # 构建收进 gguf-tools/Makefile(批1): 平台特判(Accelerate/scipy_openblas/CUDA)都在那边。
 [ -x "$ZLB" ] || make -C "$HOME/ds4-main/gguf-tools" zlayer
-for L in $(seq 0 42); do
+for L in ${LRANGE:-$(seq 0 42)}; do
   env DS4_ZL_NTOK=8192 DS4_ZL_NFIT=6144 ${XA:+DS4_ZL_XANCHOR=$XA} DS4_ZL_FIT_RANGES="$FR" DS4_ZL_EV_RANGE="$ER" \
   "$ZLB" "$DS4_HF" $D2/$WS/layers "$ANC" $L ${K:-1024} 1 ${XC:+$D2/$XC} \
     2>&1 | grep -aE "XCAP|Error|assert|★" || { LOG "★L$L 失败★"; exit 1; }
