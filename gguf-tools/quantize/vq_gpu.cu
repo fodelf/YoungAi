@@ -80,6 +80,7 @@ extern "C" void vqg_assign(const float *V, int nv, const float *C, int nc, int d
     cudaStream_t st = vqg_stream();
     size_t shm = (size_t)(nc * dim + nc) * sizeof(float);
     vqg_assign_kernel<<<(nv + 255) / 256, 256, shm, st>>>(V, nv, C, nc, dim, idx);
+    { vqg_last_err("vqg_assign_kernel后"); }
     cudaStreamSynchronize(st);
 }
 
@@ -340,6 +341,7 @@ extern "C" int vqg_unpack_dequant(const uint8_t *pay, float *W,
     cudaStream_t st = vqg_stream();
     size_t shm = (size_t)nc * dim * sizeof(float);
     vqg_dequant_kernel<<<(rows + 127) / 128, 128, shm, st>>>(cb, gr, ix, W, rows, cols, dim, nc, nbit);
+    { vqg_last_err("vqg_dequant_kernel后"); }
     return cudaStreamSynchronize(st) == cudaSuccess;
 }
 
@@ -407,6 +409,7 @@ extern "C" int vqg_dequant_batch(const uint8_t *base, float *dst_base,
      * 新布局下它直接决定行并行度, 提到 256 让 SM 吃饱(rows=2048/4096, 循环步进覆盖余下)。 */
     dim3 grid(256, njobs);
     vqg_dequant_batch_kernel<<<grid, 128, shm, st>>>(base, dst_base, jobs_d, njobs, dim);
+    { vqg_last_err("vqg_dequant_batch_kernel后"); }
     return cudaStreamSynchronize(st) == cudaSuccess;
 }
 

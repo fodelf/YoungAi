@@ -174,6 +174,7 @@ extern "C" int vqg_attention(const float *q, const float *kva, const float *sink
                 dim3 gr(S, NH);
                 vqg_attn_band_kernel<<<gr, VQG_BAT_TPB, shbytes>>>(
                     g_at_q, g_at_kva, g_at_sink, g_at_o, S, N, NH, HD, WIN, ratio, scale);
+    { void vqg_last_err(const char*); vqg_last_err("vqg_attn_band_kernel后"); }
                 if (cudaDeviceSynchronize() == cudaSuccess && cudaGetLastError() == cudaSuccess) {
                     clock_gettime(CLOCK_MONOTONIC, &_t2);
                     if (cudaMemcpy(o, g_at_o, nq * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) return 0;
@@ -195,6 +196,7 @@ extern "C" int vqg_attention(const float *q, const float *kva, const float *sink
                         &scale, g_at_kva, HD, g_at_q + (size_t)h * HD, NH * HD,
                         &zero, g_at_sc, N) != CUBLAS_STATUS_SUCCESS) return 0;
         vqg_attn_softmax_kernel<<<S, VQG_ATT_TPB>>>(g_at_sc, sink[h], S, N, WIN, ratio);
+    { void vqg_last_err(const char*); vqg_last_err("vqg_attn_softmax_kernel后"); }
         /* RowMajor o_h[S,HD] = SC[S,N](lda=N) · kva[N,HD](ldb=HD), o 行距 NH*HD */
         if (cublasSgemm(g_at_h, CUBLAS_OP_N, CUBLAS_OP_N, HD, S, N,
                         &one, g_at_kva, HD, g_at_sc, N,
