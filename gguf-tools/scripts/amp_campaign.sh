@@ -752,11 +752,24 @@ stage_champ86(){
             LOG "备份 ✓ 逐字节一致 $(du -sh "$W/layers_quant" | cut -f1)"
         else DIE "★备份逐字节复核失败★"; fi
     else LOG "量化态备份已在, 跳过"; fi
-    # ②冠军反修(含路由反修, 一段做完)
-    stage_champbf champ86
-    # ③五指标(判决尺吃层件, 08-24 铁律: 只认参考前向)
-    LOG "③五指标; 对表平权裸 KLD 0.47055 / Σmin 0.7799 / top1 78.36%"
-    bash "$SC/caliper_ref.sh" "$W/layers" /tmp/qc_champ86.bin 2>&1 | tail -10
+    # ★②反修+sweep: 改走冠军 zlayer 路(2026-08-29)★
+    # 原来这里是 stage_champbf → r30_campaign backfit → ds4quant_run 内建反修。三处与
+    # 冠军 r64c(0.42510 = −9.7%)不符, 合起来让 z 落地 378/378 全拒:
+    #   ①ds4quant_run 反修路【没有行掩码】(DS4_ZL_FIT_RANGES 只有 zlayer 认, zlayer_p4:285)
+    #     ⇒ fit/val 按行号切; 而新语料 8 个域各占一个连续 1024 行块 ⇒ 拉丁上拟合、
+    #     西里尔上判落地、阿拉伯+中日韩当 held(解码实测三段几乎零重叠)
+    #   ②秩顶格静默兜底 16(p14:289 COADAPT 分支), 冠军是 K=64
+    #   ③冠军压根不走这条: r64c = amp_clean_full.sh → zlayer 二进制 ×43(fable5 6685)
+    # sweep 在 zlayer 内部就有(p5:50-54 秩网格逐秩算 held 取最大 / p5:48 落地闸 /
+    # p7:141 不过闸写空 zrec), 不需要 ds4quant_run 那个"终局收敛 sweep" —— 后者正是
+    # 08-29 产出 42 层过拟合标量增益(判决份四项全负)的来源。
+    LOG "②反修+sweep(冠军 zlayer 路 K=64; 行掩码从 vqhalf_a.ids.layout 读, 缺则硬停)"
+    SRCBASE=champ86/layers_quant bash "$SC/amp_clean_full.sh" \
+        champ86amp "" 64 "" "$D2/anchor_a_clean_s8192.bin" "$D2/vqhalf_a.ids" \
+        || DIE "冠军路反修失败"
+    # ③五指标: amp_clean_full 的 ④ 已出 wt2 官方尺; 这里补【判决份同域全能力尺】(裸+反修后两跑)
+    LOG "③判决份同域尺; wt2 官方尺已由 ② 内部跑完(对表平权裸 KLD 0.47055 / Σmin 0.7799 / top1 78.36%)"
+    stage_judge3 champ86amp
 }
 
 # ═══ champ86 ⓪: 把层件复位成"刚量化完"的状态(2026-08-28)═══
@@ -943,6 +956,10 @@ stage_champ3(){
     local W="$D2/champ86"   # 见 champreset 注释: local 同句不能引用前一个名字
     [ -s "$D2/vqhalf_q.ids" ] && [ -s "$D2/vqhalf_a.ids" ] && [ -s "$D2/vqhalf_j.ids" ] \
         || DIE "三份 ids 不齐, 先跑 idshalf"
+    # ★行布局必须在场(2026-08-29)★: ②反修的行掩码从 <ids>.layout 读, 缺了会硬停。
+    # idshalf 在 ids 已存在时不会重切, 只做"确定性重算 + 逐字节校验 + 装布局", 不动 ids
+    # ⇒ 三个锚(各 30.8G/57 分钟)不作废。
+    stage_idshalf
     stage_anchors3
     if [ -d "$W" ]; then
         cp -f "$W/backfit.log" /tmp/champ86_prev_backfit.log 2>/dev/null || true

@@ -4,7 +4,11 @@
 # 用法: caliper_ref.sh <层件目录> <输出logits> [线程=20]
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-LAYERS="$(realpath "${1:?层件目录}")"; OUT="${2:?输出logits}"; THR="${3:-20}"
+LAYERS="$(realpath "${1:?层件目录}")"
+# ★OUT 必须 realpath(2026-08-29 实撞)★: 本脚本中途 cd 到 gguf-tools/amp, 传相对路径会
+# 跑偏到那里 → 前向报"打不开" → 后面的 anchor_metrics 拿不到 student 文件【静默跳过】,
+# 只剩前向内部 VERDICT, 五指标看着像没跑。-m 允许目标尚不存在。
+OUT="$(realpath -m "${2:?输出logits}")"; THR="${3:-20}"
 # 可选路由偏置(2026-08-27): $4=Δb 文件 $5=α。不给则完全走原路, 字节与历史判决逐位同。
 # 尺子只此一份 —— 想量"带偏置的分数"就从这里量, 不许另抄一份判决脚本。
 RB="${4:-}"; RBA="${5:-2.5}"
