@@ -174,6 +174,10 @@ void dq_matmul_strided(const float *A, int lda, const float *B, int ldb,
         }
     }
 #endif
+#ifdef DS4QUANT_CUDA
+    { static int _f2=0; cudaError_t _e=cudaGetLastError();
+      if(_e!=cudaSuccess&&_f2++<3) fprintf(stderr,"[dqmm] ★strided2 检出粘连: %s (S=%d K=%d M=%d)★\n",cudaGetErrorString(_e),S,K,M); }
+#endif
 #ifdef DQ_BLAS
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, S, M, K,
                 alpha, A, lda, B, ldb, 0.0f, Cst, ldc);
@@ -206,6 +210,10 @@ void dq_matmul_nt_strided(const float *A, int lda, const float *B, int ldb,
                 return;
         }
     }
+#endif
+#ifdef DS4QUANT_CUDA
+    { static int _f3=0; cudaError_t _e=cudaGetLastError();
+      if(_e!=cudaSuccess&&_f3++<3) fprintf(stderr,"[dqmm] ★ntstrided3 检出粘连: %s (S=%d K=%d M=%d)★\n",cudaGetErrorString(_e),S,K,M); }
 #endif
 #ifdef DQ_BLAS
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, S, M, K,
@@ -260,6 +268,10 @@ void dq_matmul(const float *X, const float *W, float *out, int S, int K, int M) 
             cudaGetLastError();   /* 失败则落 CPU 路, 先清错免污染后续调用 */
         }
     }
+#endif
+#ifdef DS4QUANT_CUDA
+    { static int _f1=0; cudaError_t _e=cudaGetLastError();
+      if(_e!=cudaSuccess&&_f1++<3) fprintf(stderr,"[dqmm] ★matmul主1 检出粘连: %s (S=%d K=%d M=%d)★\n",cudaGetErrorString(_e),S,K,M); }
 #endif
 #ifdef DQ_BLAS
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, S, M, K,
