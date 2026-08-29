@@ -83,6 +83,12 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
               for(int s=0;s<Ss;s++) ids_s[s]=ids[sidx[s]];
               Hin_s=malloc((size_t)Ss*rowsz*4); Ht_s=malloc((size_t)Ss*rowsz*4); }
     }
+    /* ★Lfront 出口锚的抽格视图(2026-08-29 逐单元全程复核用)★: 复核前向跑抽格行,
+     * 打分要对 Lfront 锚的同一批行 —— 按 sidx gather 一次, 43 个单元共用。 */
+    float *HtF_s=NULL;
+    if(sidx){ HtF_s=malloc((size_t)Ss*rowsz*4);
+        for(int s2=0;s2<Ss;s2++)
+            memcpy(HtF_s+(size_t)s2*rowsz,ANC.H+(size_t)Lfront*lstride+(size_t)sidx[s2]*rowsz,rowsz*4); }
     /* ★同前沿复检★: sweep 高层→低层, 低层落地会刷新高层输入上下文(HQE), 但高层已评过 →
      * 第一遍有落地则对"保持"层用新上下文再重解一遍(pass=1), 堵"评估时机"漏 */
     g_anc_rowmap = NULL;   /* 进函数先清干净 */
@@ -142,6 +148,7 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
         int eF=scr?Fj:Lfront, eS=scr?Ss:S, eNf=scr?Ss:n_fit, eVs=scr?vss:vs;
         /* 打分行表: 紧凑前缀里的 eval 行(scr=0 全量行时=LEV 原始行号)。拟合视图见 ms 之后。 */
         const int *SEV=scr?EVc:LEV; const int nSEV=scr?nEVc:nLEV;
+        int eFlog=0;   /* 日志口径: 复核放行后 base/bestsc 是全程(Lfront)分, 标签必须跟着换 */
         /* ★锚路由行映射★ 抽格前向期间让锚按原始行号取; scr=0 时置空 = 恒等(原行为)。 */
         g_anc_rowmap = scr ? sidx : NULL; g_anc_rowstride = S;
         const float*eHin=Hin; const long*eIds=ids; const float*eTgt=Htgt;
@@ -278,20 +285,19 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
         { double cand=scE; if(scF<cand)cand=scF; if(scA<cand)cand=scA; if(scB<cand)cand=scB; if(scC<cand)cand=scC; if(scD<cand)cand=scD;
           double dl=(base-cand)/(base>1e-12?base:1); jdl=100.0*dl;
           if(dl>bf_bestdl){ bf_bestdl=dl; bf_bestJ=J; } }
-        if(form&&scr&&!onep){
-            /* ★全闸复核★: 粗筛只定排序; 胜者内存试装 → 真前沿×全token 重打, 必须净降才放行
-             * (落地判据与旧全量逐字节同口径; 未过=还原+保持, 复检 pass 仍可再试)
-             * ONEPASS: 跳过 — 逐单元全程复核被收尾统一终验+全回滚取代
-             *
-             * ★2026-08-28 用户令还原冠军原版★ 我 08-27 曾删掉 !onep 让 ONEPASS 也走这道闸,
-             * 理由是"三候选复合炸 L38"。该理由已被证伪(零落地那跑照样炸, 真因=锚索引 bug,
-             * 已单独修复)。且实测它把落地全挡死(0落地/4保持): 粗筛分只在 128 行上估
-             * (SDIV=12, 打分区 1536 行抽 128), 相对标准误 ~1/√128≈8.8%, 要求每个候选单独
-             * 在噪声里自证必然过不了。冠军设计本就是靠【聚合】对抗噪声 —— 不看单个候选,
-             * 只看所有落地合起来在全量行上净降(功效高得多)。恢复原状。 */
-            g_anc_rowmap = NULL;   /* 复核走全量行 ⇒ 锚回恒等映射 */
-            float*Hf0=gs_forward_exit(J,Lfront,Hin,ids,S,n_fit,NULL);
-            double basef=co_score_rows(Hf0,Htgt,LEV,nLEV,rowsz); free(Hf0);
+        if(form&&scr){
+            /* ★逐单元全程复核, ONEPASS 恒开(2026-08-29 终验判决后重启)★
+             * 历史脉络: 08-27 我开过→08-28 用户令还原冠军原版(当时实测 0落地/4保持=全挡死,
+             * 且"聚合终验功效更高"论成立)→08-29 全域行域修复后终验实测: 41 个近视野全正的
+             * 落地在全程出口上净劣化 27% 被【整体】回滚 —— 聚合终验只能全灭全存, 好坏不分;
+             * 逐单元近视野判据与全程出口不对齐是结构性的(en86 同构)。
+             * 当年"全挡死"的两个前提都已变: ①坏行域(2域)+锚索引 bug 已修 ②复核成本 —— 旧版
+             * 走【全量行】前向(43 层×8.5s), 现在走【抽格行】(moe GPU 接管, ~0.5s/层),
+             * 单元 +2 次全程前向 ≈ 20-40s, 可负担。打分行=EVc(跨全域 eval 抽格), 判据=配对
+             * 差分(同行集 basef vs scv), 行少的噪声在差分里大幅相消。
+             * 统一终验保留(双保险, 应恒过 —— 每个落地都单独全程验证过)。 */
+            float*Hf0=gs_forward_exit(J,Lfront,eHin,eIds,eS,eNf,NULL);
+            double basef=co_score_rows(Hf0,HtF_s,EVc,nEVc,rowsz); free(Hf0);
             lop_t svE; float svg=0,svt=0,svw2[4]; float*gbak=NULL; int tmpop=-1;
             memset(&svE,0,sizeof(svE));
             if(form==5){ svE=lf->ops[ze]; lf->ops[ze]=opE; }
@@ -308,8 +314,8 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
                     for(int e=0;e<NEXP;e++) lf->ops[go].ge[e]*=geD[e]; }
                 else if(lf->nops<32){ tmpop=lf->nops; memset(&lf->ops[tmpop],0,sizeof(lop_t));
                     lf->ops[tmpop].type=5; lf->ops[tmpop].ge=geD; lf->nops++; } }   /* geD 所有权不转移 */
-            float*Hv=gs_forward_exit(J,Lfront,Hin,ids,S,n_fit,NULL);
-            double scv=co_score_rows(Hv,Htgt,LEV,nLEV,rowsz); free(Hv);
+            float*Hv=gs_forward_exit(J,Lfront,eHin,eIds,eS,eNf,NULL);
+            double scv=co_score_rows(Hv,HtF_s,EVc,nEVc,rowsz); free(Hv);
             if(form==5) lf->ops[ze]=svE;
             else if(form==6) lf->nops--;
             else if(form==1){ if(tmpop>=0) lf->nops--; else lf->ops[fo].g=svg; }
@@ -317,7 +323,7 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
             else if(form==3){ if(tmpop>=0) lf->nops--; else memcpy(lf->ops[BF_DYN2OP[J]].w2p,svw2,16); }
             else { if(tmpop>=0) lf->nops--; else memcpy(lf->ops[BF_GEOP[J]].ge,gbak,(size_t)NEXP*4); }
             if(gbak){ free(gbak); gbak=NULL; }
-            if(scv<basef-1e-9){ base=basef; bestsc=scv; }   /* 放行: 日志/账目切换到全口径分 */
+            if(scv<basef-1e-9){ base=basef; bestsc=scv; eFlog=Lfront; }   /* 放行: 日志/账目切换到全程口径分 */
             else { vrej++; form=0; }                        /* 全闸拒: 不落地(计入汇总) */
         }
         if(form){
@@ -378,7 +384,7 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
                  * 设 4)。于是 J≥Lfront−BK 的单元报 L42, 再往前的单元实际在 L41/L40 上评分却照报
                  * L42 —— 日志里就出现"出口分 200.35 → 4.6968"这种 42 倍断崖, 看着像数值炸了。
                  * 后果不止是误读: 换了出口层, 各单元的 Δ% 根本不可比, 也不能拿去对冠军的 −58.4%。 */
-                snprintf(rs,128,"出口L%d分 %.5g→%.5g 降%.2f%%%s%s",eF,base,bestsc,
+                snprintf(rs,128,"出口L%d分 %.5g→%.5g 降%.2f%%%s%s",eFlog?eFlog:eF,base,bestsc,
                          100.0*(base-bestsc)/(base>1e-12?base:1),
                          eF!=Lfront?"(近视野, 与前沿L42单元不可比)":"",pass?"(复检)":"");
                 mlog(J,"向前反修",al,"已改写层文件",vol,rs,"✓正向落地");
@@ -437,7 +443,7 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
             }
         }
         for(int i=0;i<NBFU;i++) free(BFU[i].old);
-        free(LFIT); free(LEV); LFIT=LEV=NULL; free(FITc); free(EVc); FITc=EVc=NULL;
+        free(LFIT); free(LEV); LFIT=LEV=NULL; free(FITc); free(EVc); FITc=EVc=NULL; free(HtF_s); HtF_s=NULL;
         NBFU=0; free(ofl); free(oland);
     }
     for(int J=Lfront-1;J>=Jlo;J--) if(!done[J]){   /* 仍未正向: 逐层上日志(重解=原值, 非隐身) */
