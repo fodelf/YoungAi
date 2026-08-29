@@ -341,9 +341,8 @@ static void bytes_moe(lfile_t*lf,int S,const float*Fin,const int*idx,const float
     const int lay_skip=replay_layer_skipped();
     if(!lay_skip) for(int i=lf->nops-1;i>=0;i--) if(lf->ops[i].type==5&&lf->ops[i].ge){ ge=lf->ops[i].ge; break; }
     int nth=NTHREADS<1?1:(NTHREADS>NEXP?NEXP:NTHREADS);
-/* (2026-08-29 自审撤销"GPU 路 nth=1"设计: GPU 一失败 fallback 就是【单线程】CPU =
-     * 比原来慢 20 倍, 571s/层实撞。现设计: worker 池 20 线程不动, 主线程在放行前试 GPU —
-     * 成功则 worker 空手而归, 失败则 20 线程正常接管, fallback 永远是满速 CPU 路。) */
+/* (2026-08-29 自审撤销"GPU 路 nth=1": fallback 变单线程 CPU=慢 20 倍(571s/层实撞)。
+     * 现设计: worker 池不动, 主线程放行前试 GPU; 失败则 20 线程满速接管。) */
     bmw_pool(nth+1,S);   /* +1: 最后一条 slot 归主线程 GPU 批量路(见块循环) */
     /* 冷热分桶缓存重建(hot=partial / cold=partial_c 归约) */
     if(BM_S!=S){ free(BM_RH); free(BM_RC); BM_RH=malloc((size_t)S*DIM*4); BM_RC=malloc((size_t)S*DIM*4); BM_S=S; }

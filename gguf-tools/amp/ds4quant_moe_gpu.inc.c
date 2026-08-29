@@ -55,6 +55,8 @@ static int bmw_gpu_chunk(bmw_t *w, int e0, int e1)
         memcpy(Xp+((size_t)j*ntmax+i)*DIM, w->Fin+(size_t)s*DIM, (size_t)DIM*4); }
     const double gt0=vqt_now();
     const int ok=vqg_moe_batch(g_bmw_buf,Xp,Wt,Yp,nE,ntmax,DIM,MOEI,SWLIM);
+    /* GPU 时间计入 bmwt"前向"栏(原来只在 CPU worker 里累计 ⇒ GPU 路打 0.00s, 看着像没干活) */
+    { extern double g_bmw_t[2]; if(ok) g_bmw_t[1]+=vqt_now()-gt0; }
     { static int d2=0; if(d2++<4) fprintf(stderr,"[moe-gpu] e[%d,%d) S=%d ntmax=%d 补齐率=%.1fx %s %.2fs\n",
         e0,e1,S,ntmax,(double)nE*ntmax/((double)S*NACT_RT/NEXP*nE),ok?"GPU":"★失败→CPU★",vqt_now()-gt0); }
     if(ok){   /* scatter: 冷热分桶与原路同判据(vtab 的 w2 槽非零=热) */

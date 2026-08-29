@@ -63,12 +63,22 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
         fprintf(stderr,"  补法: bash gguf-tools/scripts/amp_campaign.sh idshalf (只补布局, 逐字节校验, 不动 ids)\n");
         exit(9); }
     fprintf(stderr,"[sweep] 行域←%s.layout: fit %d 行 / 打分 %d 行(跨全域)\n",anchor_path(),nLFIT,nLEV);
+    /* ★sidx 必须升序(2026-08-29 自审第 4 bug)★: 抽格前向的滑窗 attention 按【行下标】判
+     * 因果(vq_gpu_attn:24 `n<=s && n>s-WIN`)。我上一版把 fit 抽格(0..8100)和 eval 抽格
+     * (800..8191)首尾相接 —— 拼接处时序回跳, attention 因果全乱, 粗筛分数失真。
+     * 修=两路各自升序、归并进 sidx; "哪些是打分行"不再靠"前段/后段"位置, 改由 EVc
+     * (eval 行在紧凑前缀中的下标表)表达, 拟合侧同理用 FITc。 */
+    int *FITc=NULL,*EVc=NULL,nFITc=0,nEVc=0;
     if(BK>0){
         sidx=malloc(sizeof(int)*(size_t)(nLFIT+nLEV+1));
-        for(int i=0;i<nLFIT;i+=SDIV) sidx[Ss++]=LFIT[i];
-        vss=Ss;
-        for(int i=0;i<nLEV;i+=SDIV) sidx[Ss++]=LEV[i];
-        if(Ss<8||Ss-vss<2){ free(sidx); sidx=NULL; BK=0; Ss=0; }   /* 校准太小: 粗筛无意义 */
+        FITc=malloc(sizeof(int)*(size_t)(nLFIT+1)); EVc=malloc(sizeof(int)*(size_t)(nLEV+1));
+        { int i=0,j=0;                                   /* 两路抽格归并(各自升序) */
+          while(i<nLFIT||j<nLEV){
+              const int a=i<nLFIT?LFIT[i]:0x7fffffff, b=j<nLEV?LEV[j]:0x7fffffff;
+              if(a<=b){ FITc[nFITc++]=Ss; sidx[Ss++]=a; i+=SDIV; }
+              else    { EVc[nEVc++]=Ss;  sidx[Ss++]=b; j+=SDIV; } } }
+        vss=nFITc;   /* 旧变量只剩守卫在用 */
+        if(Ss<8||nEVc<2){ free(sidx); sidx=NULL; free(FITc); free(EVc); FITc=EVc=NULL; BK=0; Ss=0; }   /* 校准太小: 粗筛无意义 */
         else{ ids_s=malloc(sizeof(long)*(size_t)Ss);
               for(int s=0;s<Ss;s++) ids_s[s]=ids[sidx[s]];
               Hin_s=malloc((size_t)Ss*rowsz*4); Ht_s=malloc((size_t)Ss*rowsz*4); }
@@ -130,6 +140,8 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
         int Fj=(BK>0&&J+BK<Lfront)?J+BK:Lfront;
         int scr=(BK>0)&&(Fj<Lfront||Ss<S);
         int eF=scr?Fj:Lfront, eS=scr?Ss:S, eNf=scr?Ss:n_fit, eVs=scr?vss:vs;
+        /* 打分行表: 紧凑前缀里的 eval 行(scr=0 全量行时=LEV 原始行号)。拟合视图见 ms 之后。 */
+        const int *SEV=scr?EVc:LEV; const int nSEV=scr?nEVc:nLEV;
         /* ★锚路由行映射★ 抽格前向期间让锚按原始行号取; scr=0 时置空 = 恒等(原行为)。 */
         g_anc_rowmap = scr ? sidx : NULL; g_anc_rowstride = S;
         const float*eHin=Hin; const long*eIds=ids; const float*eTgt=Htgt;
@@ -144,7 +156,7 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
         GS_CAP_L=J;
         float*Hb=gs_forward_exit(J,eF,eHin,eIds,eS,eNf,NULL);
         GS_CAP_L=-1;
-        double base=co_score(Hb,eTgt,eVs,eNf,rowsz);
+        double base=co_score_rows(Hb,eTgt,SEV,nSEV,rowsz);
         bf_rowdist(Hb,eTgt,eS,rowsz,db); free(Hb);
         /* 行权系数 kk_s(2026-08-05 分类/感知布线): 行残差能量/行目标能量, clamp[0,4] */
         for(int s=0;s<eS;s++){ const float*b=eTgt+(size_t)s*rowsz; double tn=0;
@@ -165,7 +177,7 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
                 lf->ops[tmp].type=1; lf->ops[tmp].g=a; lf->nops++; undo=1; }
             else break;
             float*Hg=gs_forward_exit(J,eF,eHin,eIds,eS,eNf,NULL);
-            double sc=co_score(Hg,eTgt,eVs,eNf,rowsz); scg[gi]=sc;
+            double sc=co_score_rows(Hg,eTgt,SEV,nSEV,rowsz); scg[gi]=sc;
             bf_rowdist(Hg,eTgt,eS,rowsz,dg+(size_t)gi*S); free(Hg);
             if(sc<scA){ scA=sc; aA=a; }
             if(undo) lf->nops--; else lf->ops[tmp].g=baseg;
@@ -179,7 +191,7 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
                   lf->ops[tmp].type=1; lf->ops[tmp].g=(float)av; lf->nops++; undo=1; }
               if(tmp>=0){
                   float*Hg=gs_forward_exit(J,eF,eHin,eIds,eS,eNf,NULL);
-                  double sc=co_score(Hg,eTgt,eVs,eNf,rowsz); free(Hg);
+                  double sc=co_score_rows(Hg,eTgt,SEV,nSEV,rowsz); free(Hg);
                   if(sc<scA){ scA=sc; aA=(float)av; }
                   if(undo) lf->nops--; else lf->ops[tmp].g=baseg;
               } } }
@@ -189,7 +201,7 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
         if(to>=0){ float t0v=lf->ops[to].t; const float TG[2]={0.94f,1.06f}; double scT[2];
             for(int ti=0;ti<2;ti++){ lf->ops[to].t=t0v*TG[ti];
                 float*Hg=gs_forward_exit(J,eF,eHin,eIds,eS,eNf,NULL);
-                double sc=co_score(Hg,eTgt,eVs,eNf,rowsz); free(Hg); scT[ti]=sc;
+                double sc=co_score_rows(Hg,eTgt,SEV,nSEV,rowsz); free(Hg); scT[ti]=sc;
                 if(sc<scB){ scB=sc; tB=t0v*TG[ti]; }
                 lf->ops[to].t=t0v; }
             double rv=bf_vertex(TG[0],scT[0],1.0,base,TG[1],scT[1]);
@@ -197,7 +209,7 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
             if(fabs(rv-1.0)>2e-3&&(tB==0||fabs(rv-(double)(tB/t0v))>2e-3)){
                 lf->ops[to].t=t0v*(float)rv;
                 float*Hg=gs_forward_exit(J,eF,eHin,eIds,eS,eNf,NULL);
-                double sc=co_score(Hg,eTgt,eVs,eNf,rowsz); free(Hg);
+                double sc=co_score_rows(Hg,eTgt,SEV,nSEV,rowsz); free(Hg);
                 if(sc<scB){ scB=sc; tB=t0v*(float)rv; }
                 lf->ops[to].t=t0v; } }
         /* per-token 连续目标 α*_s(抛物线顶点; 全部重解形态共用; 行域=粗筛行) */
@@ -205,8 +217,20 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
             double mv=bf_vertex(AG[0],dg[s],1.0,db[s],AG[NA-1],dg[(size_t)(NA-1)*S+s]);
             if(mv<0.85)mv=0.85; if(mv>1.15)mv=1.15; ms[s]=(float)mv;   /* clamp=探针包络(随探针加宽) */
         }
+        /* ★拟合视图(与升序 sidx 配套)★: 原语义"前 eVs 行=fit 行"在归并后不成立。
+         * zrefit_w/bf_pca8/nmix/dyn2 的 mu·sd 都是【fit 行】上的统计/最小二乘 —— 与行序
+         * 无关, 只与行集合有关 ⇒ 把 fit 行 gather 成小前缀喂它们, 接口一个不动。
+         * scr=0(全量行, 罕见路径)保持旧口径 [0,vs)。 */
+        int nFV = scr?nFITc:eVs;
+        float *msf=ms, *FINf=GS_FIN, *effwf=effw;   /* scr=0: 原地前缀 */
+        float *_fv=NULL;
+        if(scr){ _fv=malloc((size_t)nFV*(DIM+2)*4);
+            msf=_fv; effwf=_fv+nFV; FINf=_fv+(size_t)2*nFV;
+            for(int i=0;i<nFV;i++){ const int r=FITc[i];
+                msf[i]=ms[r]; effwf[i]=effw[r];
+                memcpy(FINf+(size_t)i*DIM,GS_FIN+(size_t)r*DIM,(size_t)DIM*4); } }
         int nmix=0;
-        for(int s=0;s<eVs;s++) if(fabsf(ms[s]-1.0f)>2e-3f) nmix++;
+        for(int s=0;s<nFV;s++) if(fabsf(msf[s]-1.0f)>2e-3f) nmix++;
         /* --- 形态E(★真·机制★): 重解本层自有 z 系数(最后 type3(带V8)>type2>type1 op) —
          * 闭式拟合 c_new(x)=α*_s·c_old(x)(zrefit, 非扰动试探), β 信赖域{1,0.5,0.25} 全步过冲退半步 --- */
         double scE=base; int ze=-1; lop_t opE; float bE=0;
@@ -221,11 +245,11 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
                 /* ★联合损失单次求解(2026-08-05 用户终裁: 网格选一=割裂+选择噪声, 已废)★
                  * 对齐=主项 / 感知·分类=effw 行权恒开 / 固定·光滑=λ 结构(df 锚定恒等基线) */
                 lop_t fit=old;
-                zrefit_w(&fit,ms,eVs,GS_FIN,effw);
+                zrefit_w(&fit,msf,nFV,FINf,effwf);
                 for(int bi=0;bi<3;bi++){
                     op_blend(&lf->ops[ze],&old,&fit,BB[bi]);
                     float*Hg=gs_forward_exit(J,eF,eHin,eIds,eS,eNf,NULL);
-                    double sc=co_score(Hg,eTgt,eVs,eNf,rowsz); free(Hg);
+                    double sc=co_score_rows(Hg,eTgt,SEV,nSEV,rowsz); free(Hg);
                     if(sc<scE){ scE=sc; opE=lf->ops[ze]; bE=BB[bi]; }
                     lf->ops[ze]=old;
                     if(scE<base-1e-9) break;           /* 已改善即止(基线语义) */
@@ -239,73 +263,17 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
         double scF=base; lop_t opF; memset(&opF,0,sizeof(opF)); float*V8F=NULL;
         {
             int hasd8=0; for(int i=0;i<lf->nops;i++) if(lf->ops[i].type==3){ hasd8=1; break; }
-            if(!hasd8&&nmix>=3&&lf->nops<32&&(V8F=bf_pca8(GS_FIN,eVs))!=NULL){
+            if(!hasd8&&nmix>=3&&lf->nops<32&&(V8F=bf_pca8(FINf,nFV))!=NULL){
                 /* 联合损失单次求解(同形态E) */
                 opF.type=3; opF.V8=V8F; opF.w8[0]=1.0f;      /* 起点=恒等, zrefit 9-dof 岭回归拟 per-token 靶 */
-                zrefit_w(&opF,ms,eVs,GS_FIN,effw);
+                zrefit_w(&opF,msf,nFV,FINf,effwf);
                 int tmp=lf->nops; lf->ops[tmp]=opF; lf->nops++;
                 float*Hg=gs_forward_exit(J,eF,eHin,eIds,eS,eNf,NULL);
-                scF=co_score(Hg,eTgt,eVs,eNf,rowsz); free(Hg);
+                scF=co_score_rows(Hg,eTgt,SEV,nSEV,rowsz); free(Hg);
                 lf->nops--;
             }
         }
-        /* --- 形态C: per-token 动态 → bf.GLdyn2(范数特征拟合) --- */
-        double scC=base; lop_t opC; memset(&opC,0,sizeof(opC));
-        if(nmix>=2&&lf->nops<32){
-            double mu=0,sd=0; float*fn=malloc((size_t)S*4);
-            for(int s=0;s<eS;s++){ const float*fx=GS_FIN+(size_t)s*DIM; double v=0;
-                for(int d=0;d<DIM;d++) v+=(double)fx[d]*fx[d]; fn[s]=(float)sqrt(v); }
-            for(int s=0;s<eVs;s++) mu+=fn[s]; mu/=(eVs>0?eVs:1);
-            for(int s=0;s<eVs;s++){ double d=fn[s]-mu; sd+=d*d; } sd=sqrt(sd/(eVs>0?eVs:1))+1e-9;
-            /* 联合损失单次求解(dyn2 新建: 行权恒开+λ df 锚定) */
-            { double A[4]={0,0,0,0},b2[2]={0,0},x2[2];
-              for(int s=0;s<eVs;s++){ double f=((double)fn[s]-mu)/sd, wr=(double)effw[s];
-                  A[0]+=wr; A[1]+=wr*f; A[3]+=wr*f*f; b2[0]+=wr*ms[s]; b2[1]+=wr*f*ms[s]; }
-              A[2]=A[1];
-              double lam=1e-3*(A[0]+A[3])/2.0+1e-9;
-              A[0]+=lam; A[3]+=lam;
-              if(solve_sym(A,b2,2,x2)==0){
-                opC.type=2; opC.w2p[0]=(float)x2[0]; opC.w2p[1]=(float)x2[1];
-                opC.w2p[2]=(float)mu; opC.w2p[3]=(float)sd;
-                int tmp=lf->nops; lf->ops[tmp]=opC; lf->nops++;
-                float*Hg=gs_forward_exit(J,eF,eHin,eIds,eS,eNf,NULL);
-                scC=co_score(Hg,eTgt,eVs,eNf,rowsz); free(Hg);
-                lf->nops--;
-              } }
-            free(fn);
-        }
-        /* --- 形态D: per-expert 增益投影(256-dof; per-token 目标 m*_s 按路由权重投到专家) --- */
-        double scD=base; float *geD=NULL;
-        if(nmix>=1&&lf->nops<32){
-            geD=malloc((size_t)NEXP*4);
-            double *gnum=calloc((size_t)NEXP,sizeof(double)),*gden=calloc((size_t)NEXP,sizeof(double));
-            for(int s=0;s<eVs;s++) for(int a2=0;a2<NACT;a2++){
-                int e=GS_IDXC[(size_t)s*NACT+a2]; double w=GS_RWC[(size_t)s*NACT+a2];
-                if(e>=0&&e<NEXP&&w>0){ gnum[e]+=w*ms[s]; gden[e]+=w; } }
-            int nge=0;
-            for(int e=0;e<NEXP;e++){ double g=gden[e]>1e-12?gnum[e]/gden[e]:1.0;
-                if(g<0.80)g=0.80; if(g>1.20)g=1.20; geD[e]=(float)g; if(g!=1.0)nge++; }
-            free(gnum); free(gden);
-            if(nge>=2){
-                int go=BF_GEOP[J]; float *gbak=NULL;
-                if(go>=0){ gbak=malloc((size_t)NEXP*4); memcpy(gbak,lf->ops[go].ge,(size_t)NEXP*4);
-                    for(int e=0;e<NEXP;e++) lf->ops[go].ge[e]*=geD[e]; }   /* 已有: 临时累乘 */
-                else { go=lf->nops; memset(&lf->ops[go],0,sizeof(lop_t));
-                    lf->ops[go].type=5; lf->ops[go].ge=geD; lf->nops++; }
-                float*Hg=gs_forward_exit(J,eF,eHin,eIds,eS,eNf,NULL);
-                scD=co_score(Hg,eTgt,eVs,eNf,rowsz); free(Hg);
-                if(gbak){ memcpy(lf->ops[go].ge,gbak,(size_t)NEXP*4); free(gbak); }   /* 复原 */
-                else { lf->nops--; }   /* 临时 op 移除(geD 保留待提交) */
-            } else { free(geD); geD=NULL; }
-        }
-        /* --- 择优提交(字节回放分, 与合并同口径; 永不劣化; 同改善优先自有 z 重解=机制本体) --- */
-        double bestsc=base; int form=0;
-        if(scE<bestsc-1e-9){ bestsc=scE; form=5; }
-        if(scF<bestsc-1e-9){ bestsc=scF; form=6; }
-        if(scA<bestsc-1e-9){ bestsc=scA; form=1; }
-        if(scB<bestsc-1e-9){ bestsc=scB; form=2; }
-        if(scC<bestsc-1e-9){ bestsc=scC; form=3; }
-        if(scD<bestsc-1e-9){ bestsc=scD; form=4; }
+#include "ds4quant_sweep_arms.inc.c"   /* 形态C(dyn2)/形态D(GE投影) 候选臂(500 行守卫所迫的物理分片) */
         double jdl;   /* 本层最优候选Δ%(负=候选都更差) */
         { double cand=scE; if(scF<cand)cand=scF; if(scA<cand)cand=scA; if(scB<cand)cand=scB; if(scC<cand)cand=scC; if(scD<cand)cand=scD;
           double dl=(base-cand)/(base>1e-12?base:1); jdl=100.0*dl;
@@ -419,6 +387,7 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
         if(geD){ free(geD); geD=NULL; }
         if(V8F){ free(V8F); V8F=NULL; }     /* F 候选没落地(落地时所有权已交 op) */
         if(!form) jd[J]=jdl;                /* 未正向: 记录候选Δ, 收尾统一上日志(复检后) */
+        free(_fv); _fv=NULL;   /* 拟合视图: 每单元重建(ms 逐单元算) */
         printf("BFUNIT L=%02d Δbest=%+.3f%% %s 用时=%lds\n",J,jdl,form?"落地":"保持",(long)(time(NULL)-ut0));
         fflush(stdout);                     /* 实时可观测(用户裁决: 未落地层不许等到轮末才现身) */
         if(bis){
@@ -468,7 +437,7 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
             }
         }
         for(int i=0;i<NBFU;i++) free(BFU[i].old);
-        free(LFIT); free(LEV); LFIT=LEV=NULL;
+        free(LFIT); free(LEV); LFIT=LEV=NULL; free(FITc); free(EVc); FITc=EVc=NULL;
         NBFU=0; free(ofl); free(oland);
     }
     for(int J=Lfront-1;J>=Jlo;J--) if(!done[J]){   /* 仍未正向: 逐层上日志(重解=原值, 非隐身) */
