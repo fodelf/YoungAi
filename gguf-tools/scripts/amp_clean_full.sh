@@ -55,7 +55,7 @@ ZLB="$HOME/ds4-main/gguf-tools/amp/zlayer"
 [ -x "$ZLB" ] || make -C "$HOME/ds4-main/gguf-tools" zlayer
 for L in ${LRANGE:-$(seq 0 42)}; do
   env DS4_ZL_NTOK=8192 DS4_ZL_NFIT=6144 ${XA:+DS4_ZL_XANCHOR=$XA} \
-  "$ZLB" "$DS4_HF" $D2/$WS/layers "$ANC" $L ${K:-1024} 1 ${XC:+$D2/$XC} \
+  "$ZLB" "$DS4_HF" $D2/$WS/layers "$ANC" $L "$K" 1 ${XC:+$D2/$XC} \
     2>&1 | grep -aE "XCAP|Error|assert|★" || { LOG "★L$L 失败★"; exit 1; }
   # 进度可观测铁律: 每层收官打一行(tail -f 就能看到 43 层推进)
   LOG "L$L ✓ $(ls "$D2/$WS/layers"/zrec_L*.bin 2>/dev/null | wc -l | tr -d ' ')/43 K=$K"
