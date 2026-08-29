@@ -78,7 +78,13 @@ __global__ static void vqg_attn_band_kernel(const float *__restrict__ q,
     float *shq = bsh;                 /* [HD]  本行本头的 q */
     float *shs = shq + HD;            /* [tot] 分数/概率 */
     float *shm = shs + (WIN + Sc);    /* [TPB] 归约暂存(float) */
-    double *shd = (double *)(shm + VQG_BAT_TPB);   /* [TPB] 归约暂存(double) */
+    /* ★shd 必须 8 字节对齐(2026-08-30 misaligned-address 实锤修)★
+     * 偏移=(HD+WIN+Sc+TPB)*4 字节; Sc=S/ratio+2 为【奇数】时(实撞: 复核前缀 S=1920→Sc=17)
+     * 偏移≡4 (mod 8) → double 写错位 → misaligned address, 且该错误是 sticky(context 报废,
+     * cudaGetLastError 清不掉) → 此后同进程所有 CUDA 调用永久失败(batched 永久翻 0,
+     * sweep 掉纯 CPU 慢 9 倍的元凶)。S=8192(Sc=66)/512(Sc=6) 恰为偶数所以从未暴露。 */
+    size_t _off = ((size_t)((shm + VQG_BAT_TPB) - bsh) * 4 + 7) & ~(size_t)7;
+    double *shd = (double *)((char *)bsh + _off);   /* [TPB] 归约暂存(double, 8 对齐) */
 
     for (int d = tid; d < HD; d += VQG_BAT_TPB) shq[d] = q[((size_t)s * NH + h) * HD + d];
     __syncthreads();
@@ -160,8 +166,9 @@ extern "C" int vqg_attention(const float *q, const float *kva, const float *sink
     /* 带状路优先(见 vqg_attn_band_kernel 注释); 条件不满足静默走下面的两 gemm 老路 */
     {
         const int Sc = N - S;
-        const size_t shbytes = (size_t)HD * 4 + (size_t)(WIN + (Sc > 0 ? Sc : 0)) * 4
-                             + (size_t)VQG_BAT_TPB * 4 + (size_t)VQG_BAT_TPB * 8;
+        const size_t _fpart = (size_t)HD * 4 + (size_t)(WIN + (Sc > 0 ? Sc : 0)) * 4
+                             + (size_t)VQG_BAT_TPB * 4;
+        const size_t shbytes = ((_fpart + 7) & ~(size_t)7) + (size_t)VQG_BAT_TPB * 8;   /* double 段 8 对齐(与 kernel 内 _off 同式) */
         int shmax = 0, dev = 0; cudaGetDevice(&dev);
         cudaDeviceGetAttribute(&shmax, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
         if (HD <= 4 * VQG_BAT_TPB && Sc >= 0 && shbytes <= (size_t)shmax && NH <= 65535) {
