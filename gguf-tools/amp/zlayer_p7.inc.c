@@ -272,9 +272,17 @@
       float acc = 0.0f;
       for (int e = 0; e < NEXP; e++) acc += f16_to_f32(ge16[e]);
       gemean = (double)f16_to_f32(f64_to_f16((double)(acc / (float)NEXP))); }
-    printf("★L%d z侧车: held挽回 z^L %.1f%% 组合 %.1f%%  GE均值 %.4f  体积 %.1fMB | "
+    /* ★体积用自适应单位(2026-08-29 用户指出"GE 应该也有体积")★
+     * 原来固定 %.1fMB: z 判空、只落 GE 的层打出来是"体积 0.0MB", 看着像什么都没落 ——
+     * 实际 GE 记录 = 116B 头 + NEXP(256) × f16 = 628B, 43 层合计 26.4KB。
+     * 打印精度不该把真实存在的产物显示成 0。 */
+    char volbuf[32];
+    if (add_len >= 1048576)   snprintf(volbuf, sizeof volbuf, "%.1fMB", add_len / 1048576.0);
+    else if (add_len >= 1024) snprintf(volbuf, sizeof volbuf, "%.1fKB", add_len / 1024.0);
+    else                      snprintf(volbuf, sizeof volbuf, "%zuB", add_len);
+    printf("★L%d z侧车: held挽回 z^L %.1f%% 组合 %.1f%%  GE均值 %.4f  体积 %s | "
            "缓存 %.0fs 解算 %.0fs 总 %.0fs | %s\n",
-           L, rz * 100, comb * 100, gemean, add_len / 1048576.0,
+           L, rz * 100, comb * 100, gemean, volbuf,
            t1 - t0, t2 - t1, t3 - t0, status);
 #ifdef ZL_CUDA
     fprintf(stderr, "[zg] gemm卸载 命中=%ld 回落=%ld\n", zg_hits, zg_miss);
