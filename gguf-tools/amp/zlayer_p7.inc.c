@@ -144,6 +144,12 @@
             snprintf(status, sizeof status, "zrec 落盘(+%d记录 %.1fMB)", nrec_add, add_len / 1048576.0);
         }
         fclose(zf);
+    } else if (INJ && eff <= GATE) {
+        /* ★注入模式补闸(2026-08-29 用户指出"没收益不应该不进入吗之前有这个约定的")★
+         * GATE 闸(组合增益≤闸 → 不落)此前只在 zrec 模式(INJ==2)实现, 注入模式(INJ==1,
+         * amp_clean_full 走的)完全绕过 —— L42 组合 −3.8% 负增益、L32/L40 零增益照样
+         * append 进 dql(合计 ~37MB, 且 L41/L42 正是链闸炸点邻域)。同一道闸, 同一判定。 */
+        snprintf(status, sizeof status, "组合增益 %.1f%% ≤闸%.1f%% → ★不注入★(约定: 没收益不进入)", comb * 100, GATE * 100);
     } else if (INJ) {
         char man[1300]; snprintf(man, sizeof man, "%s/zinject_manifest.txt", ld);
         char mlk[1400]; snprintf(mlk, sizeof mlk, "%s.lock", man);
