@@ -385,6 +385,22 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
         int nEV=0; const int *EVR=row_layout_ev(anchor_path(),&nEV);
         if(!EVR||nEV<2){ fprintf(stderr,"★反修停车: 行布局缺 %s.layout★\n",anchor_path());
             fprintf(stderr,"  补法: bash gguf-tools/scripts/amp_campaign.sh idshalf 然后 anchors3\n"); exit(9); }
+        /* ★抽格语境换算(2026-08-29 SIGSEGV 实锤修)★ EVR 是【原始行号】(0..S_full)。
+         * 推进段 S=S_full 行号=下标, 直接用没事; 但 sweep 的 backfit_prev_chunk 会用
+         * 【抽格前向】(S=Ss≈512 紧凑数组)重跑无 zrec 层的本块 —— 拿 8000 级原始行号去
+         * 索引 512 行的 Hq ⇒ 越界段错(gdb 栈: layer_fwd←gs_forward_exit←backfit_prev_chunk)。
+         * p13 处理了这个换算(scr?EVc:LEV), 这里漏了。紧凑行 s 的原始行号=g_anc_rowmap[s],
+         * 故紧凑打分行 = {s: g_anc_rowmap[s] ∈ EVR}。 */
+        int *evr_loc=NULL;
+        if(g_anc_rowmap){
+            char *inev=calloc((size_t)g_anc_rowstride,1);
+            for(int i=0;i<nEV;i++) if(EVR[i]<g_anc_rowstride) inev[EVR[i]]=1;
+            evr_loc=malloc((size_t)S*sizeof(int)); int m=0;
+            for(int sx=0;sx<S;sx++) if(inev[g_anc_rowmap[sx]]) evr_loc[m++]=sx;
+            free(inev);
+            if(m<2){ free(evr_loc); evr_loc=NULL; }   /* 抽格里 eval 行太少: 本层 z 块跳过打分侧 */
+            else { EVR=evr_loc; nEV=m; }
+        }
         int vs=(n_fit*3)/4; int nval=n_fit-vs;
         if(nval<8){ vs=n_fit; nval=0; }
         /* 行帽已撤(2026-08-23): 2048 行全梯拒(过拟合), 行数是拟合质量的硬需求;
@@ -469,6 +485,7 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
                           for(size_t i3=0;i3<(size_t)DIM*kk;i3++) h3[o3++]=go1b_fp32_to_fp16(ZLP_V[i3]);
                           fwrite(h3,2,o3,zf3); free(h3); fclose(zf3);
                 g_lt[5]=vqt_now()-lt_mark;   /* ⑤ZLGATE 候选评估段完 */
+                free(evr_loc); evr_loc=NULL;
                           printf("ZREC L=%d k=%d → zrec_L%02d.bin\n",L,kk,L); fflush(stdout);
                         } } }
                 }
