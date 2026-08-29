@@ -32,10 +32,9 @@ static struct { lfile_t*lf; int S; const float*Fin; const int*idx; const float*r
 typedef struct { float *q1,*q3,*q2,*xs,*wwv,*partial,*partial_c,*aq; int *tok; } bmwbuf_t;
 static bmwbuf_t *BMW_BUF=NULL; static int BMW_BUF_N=0, BMW_BUF_S=0;
 static void bmw_pool(int nth,int S){
-    /* ★cap 语义(2026-08-29 内存事故修)★: 原判定 ==S, 而复核(1920 行)与粗筛(512 行)交替
-     * ⇒ 每单元多次毁建 21 条 slot(~12GB 名义流转); MALLOC_MMAP_THRESHOLD_=1GB 下这些大块
-     * free 后滞留 glibc arena 不还 OS ⇒ RSS 单调涨到 111G ⇒ 统一内存分配失败 ⇒
-     * batched=0 掉 CPU 路(310s/层)。改 >=: 缓冲够大就复用, 只增不缩。 */
+    /* ★cap 语义(2026-08-29 内存事故修)★ 原==S: 复核1920/粗筛512交替毁建21slot(12GB流转),
+     * 1GB MMAP_THRESHOLD 下 free 滞留 arena→RSS 涨到111G→managed 分配失败→batched=0。
+     * 改>=: 够大就复用只增不缩。 */
     if(BMW_BUF_N==nth&&BMW_BUF_S>=S) return;
     for(int t=0;t<BMW_BUF_N;t++){ bmwbuf_t*b=&BMW_BUF[t];
         free(b->q1);free(b->q3);free(b->q2);free(b->xs);free(b->wwv);

@@ -1,3 +1,9 @@
+/* malloc_trim 需要 <malloc.h>(Linux 专有); Darwin 没有, 空宏(mac 只做语法检查不跑) */
+#if defined(__linux__)
+#include <malloc.h>
+#else
+#define malloc_trim(x) ((void)0)
+#endif
 /* ★分块 ONEPASS(2026-08-27 重新实现)★
  * 冠军 r64 用的是 DS4_BF_CHUNK=7, 但那份 C 实现【从未进过 git】(只活在当时的
  * ds4quant_run.dchunk 二进制里, 已佚), fable5 4985 留着完整设计, 照它重写。
