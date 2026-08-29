@@ -36,7 +36,7 @@ fi
 # ②反修工作区(全量重跑铁律: 从 noz 干净态起)
 rm -rf $D2/$WS
 mkdir -p $D2/$WS/layers
-cd $D2/${SRCBASE:-vq86h_noz}/layers
+cd $D2/${SRCBASE:-vq86h_noz/layers}   # SRCBASE=相对 D2 的【层件目录】(如 champ86/layers_quant)
 for f in dql_vq_L*.bin; do ln -f "$f" "$HOME/ds4-main/$D2/$WS/layers/$f" 2>/dev/null || cp "$f" "$HOME/ds4-main/$D2/$WS/layers/"; done
 cp dql_ops_L*.bin opt_L*.bin manifest.txt "$HOME/ds4-main/$D2/$WS/layers/" 2>/dev/null
 cp dql_L*.bin "$HOME/ds4-main/$D2/$WS/layers/"
@@ -80,7 +80,8 @@ for L in ${LRANGE:-$(seq 0 42)}; do
 done
 rm -f $D2/$WS/layers/zcache_L*.npz
 LOG "③反修收官"
-# ④官方语料五指标终判
+# ④官方语料五指标终判(单层验证 LRANGE 在场时跳过 — 10 分钟级铁律)
+[ -n "$LRANGE" ] && { LOG "④跳过(单层验证)"; exit 0; }
 bash gguf-tools/scripts/caliper_ref.sh $D2/$WS/layers /tmp/qc_${WS}_wt2.bin > /tmp/caliper_${WS}.log 2>&1
 grep -E "PPL\(stu|Mean KLD|RMS|Same top|Δp" /tmp/caliper_${WS}.log
 LOG "④五指标终判完成"
