@@ -1,6 +1,5 @@
-/* malloc_trim 需要 <malloc.h>(Linux 专有); Darwin 没有, 空宏(mac 只做语法检查不跑) */
 #if defined(__linux__)
-#include <malloc.h>
+#include <malloc.h>   /* malloc_trim(arena 归还); Darwin 无此函数→空宏(mac 只编不跑) */
 #else
 #define malloc_trim(x) ((void)0)
 #endif
@@ -421,11 +420,9 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
         if(V8F){ free(V8F); V8F=NULL; }     /* F 候选没落地(落地时所有权已交 op) */
         if(!form) jd[J]=jdl;                /* 未正向: 记录候选Δ, 收尾统一上日志(复检后) */
         free(_fv); _fv=NULL;   /* 拟合视图: 每单元重建(ms 逐单元算) */
-        /* ★arena 归还(2026-08-29 内存事故二修)★ 复核循环每单元 ~17 次 30MB 级 malloc/free,
-         * 在 MALLOC_MMAP_THRESHOLD_=1GB(历史设定, 为 fp16 层缓存 arena 复用防 9分/层重读)下
-         * 全走 arena, free 后【不还 OS】⇒ RSS 单调涨到 available 4G ⇒ cudaMallocManaged
-         * 失败 ⇒ batched=0 掉 CPU 路。threshold 不能动(动了层缓存遭殃), 正解=每单元收尾
-         * malloc_trim(0) 强制归还 arena 空闲页: 在用块不动, 已 free 碎片即刻还 OS, ms 级开销。 */
+        /* ★arena 归还(2026-08-29 二修)★ 复核每单元~17次30MB malloc/free 在 1GB MMAP_THRESHOLD
+         * (历史设定护 fp16 层缓存复用, 不能动)下滞留 arena→available 4G→managed 分配失败。
+         * trim 只还已 free 碎片, 在用块不动, ms 级。 */
         malloc_trim(0);
         printf("BFUNIT L=%02d Δbest=%+.3f%% %s 用时=%lds\n",J,jdl,form?"落地":"保持",(long)(time(NULL)-ut0));
         fflush(stdout);                     /* 实时可观测(用户裁决: 未落地层不许等到轮末才现身) */
