@@ -18,6 +18,13 @@ static int bmw_gpu_chunk(bmw_t *w, int e0, int e1)
     /* ★为什么要这行诊断★: GPU 路一旦静默落回 CPU, 而 nth 又被设成 1(见 bytes_moe),
      * 就变成【一条线程跑 64 专家的 CPU GEMM】= 比原来 20 线程慢 20 倍。实撞过一次
      * (571s/层 vs 22s/层), 当时没有任何输出能区分"GPU 慢"和"落回单线程 CPU"。 */
+    /* ★只在抽格模式接管(2026-08-29 实测判据)★
+     * 全量行(S=8192)时每专家 nt≈192, 单 GEMM 3.2e9 FLOP 早过 dq_matmul 的 GPU 门槛 ——
+     * 原路本来就是 GPU 加速的。批量版在这被补齐(2.2×)+单线程 gather/scatter 拖慢:
+     * 实测 bmoe1 原路 8.5s vs 批量 24.4s。批量路的价值场景只有 sweep 的抽格行
+     * (Ss≈512, nt≈12 的小 GEMM 全落 CPU, 20 线程满载 17.7s)。
+     * 判据用现成的抽格标志 g_anc_rowmap(p6 全局), 零新常数。 */
+    if(!g_anc_rowmap) return 0;
     static int diag=0;
     if(nE<1||!lf->vqmap||!g_bmw_buf||g_bmw_e0!=e0){
         if(!diag++) fprintf(stderr,"[moe-gpu] 不适用: nE=%d vqmap=%p buf=%p e0=%d/%d ⇒ 落回 CPU 路\n",
