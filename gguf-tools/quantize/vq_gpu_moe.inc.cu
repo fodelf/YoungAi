@@ -24,7 +24,7 @@ static cublasHandle_t g_moe_h = NULL;
 static cudaStream_t   g_moe_s = NULL;
 /* 补齐缓冲(按需增长, 进程内复用): Xg/Hg/Ug/Yg */
 static float *g_moe_X = NULL, *g_moe_G = NULL, *g_moe_U = NULL, *g_moe_Y = NULL, *g_moe_W = NULL;
-static size_t g_moe_cap_x = 0, g_moe_cap_h = 0, g_moe_cap_y = 0, g_moe_cap_w = 0;
+static size_t g_moe_cap_x = 0, g_moe_cap_g = 0, g_moe_cap_u = 0, g_moe_cap_y = 0, g_moe_cap_w = 0;
 
 static int moe_need(float **p, size_t *cap, size_t n) {
     if (*cap >= n) return 1;
@@ -63,16 +63,28 @@ __global__ static void moe_swiglu_kernel(float *G, const float *U, const float *
 extern "C" int vqg_moe_batch(const float *Wbuf, const float *Xpad, const float *Wt, float *Ypad,
                              int nE, int ntmax, int DIM, int MOEI, float swlim)
 {
+    /* ★失败必须说清在哪一步(2026-08-29)★: 第一版全是裸 return 0, 一失败就静默落回
+     * 单线程 CPU(571s/层), 完全查不出是分配失败、拷贝失败还是 GEMM 参数错。 */
+    #define MOE_FAIL(tag, code) do{ static int _d=0; if(!_d++) \
+        fprintf(stderr,"[moe-gpu] ★%s 失败 code=%d★ nE=%d ntmax=%d DIM=%d MOEI=%d\n", \
+                (tag),(int)(code),nE,ntmax,DIM,MOEI); return 0; }while(0)
     if (nE < 1 || ntmax < 1) return 0;
     if (!g_moe_h) {
-        if (cublasCreate(&g_moe_h) != CUBLAS_STATUS_SUCCESS) { g_moe_h = NULL; return 0; }
+        cublasStatus_t cs = cublasCreate(&g_moe_h);
+        if (cs != CUBLAS_STATUS_SUCCESS) { g_moe_h = NULL; MOE_FAIL("cublasCreate", cs); }
         cudaStreamCreateWithFlags(&g_moe_s, cudaStreamNonBlocking);
         cublasSetStream(g_moe_h, g_moe_s);
     }
     const size_t nx = (size_t)nE * ntmax * DIM, nh = (size_t)nE * ntmax * MOEI;
-    if (!moe_need(&g_moe_X, &g_moe_cap_x, nx) || !moe_need(&g_moe_Y, &g_moe_cap_y, nx) ||
-        !moe_need(&g_moe_G, &g_moe_cap_h, nh) || !moe_need(&g_moe_U, &g_moe_cap_h, nh)) return 0;
-    if (cudaMemcpyAsync(g_moe_X, Xpad, nx * sizeof(float), cudaMemcpyHostToDevice, g_moe_s) != cudaSuccess) return 0;
+    /* ★两个缓冲共用一个 cap 变量是 bug(第一版)★: moe_need(G,&cap_h,nh) 先把 cap_h 设成 nh,
+     * 紧接着 moe_need(U,&cap_h,nh) 看见 cap_h>=nh 就【直接返回成功】—— U 根本没分配, 保持
+     * NULL, 后面 GEMM 拿 NULL 指针必然失败。各给各的 cap。 */
+    if (!moe_need(&g_moe_X, &g_moe_cap_x, nx)) MOE_FAIL("alloc X", 0);
+    if (!moe_need(&g_moe_Y, &g_moe_cap_y, nx)) MOE_FAIL("alloc Y", 0);
+    if (!moe_need(&g_moe_G, &g_moe_cap_g, nh)) MOE_FAIL("alloc G", 0);
+    if (!moe_need(&g_moe_U, &g_moe_cap_u, nh)) MOE_FAIL("alloc U", 0);
+    { cudaError_t e = cudaMemcpyAsync(g_moe_X, Xpad, nx * sizeof(float), cudaMemcpyHostToDevice, g_moe_s);
+      if (e != cudaSuccess) MOE_FAIL("H2D X", e); }
 
     const float one = 1.0f, zero = 0.0f;
     const long long sW = (long long)3 * DIM * MOEI;          /* 专家间权重步长 */
@@ -81,27 +93,29 @@ extern "C" int vqg_moe_batch(const float *Wbuf, const float *Xpad, const float *
     #define MOE_GEMM(Bp, Ap, Cp, m, n, k, sb, sa, sc) \
         cublasSgemmStridedBatched(g_moe_h, CUBLAS_OP_T, CUBLAS_OP_N, (m), (n), (k), \
             &one, (Bp), (k), (sb), (Ap), (k), (sa), &zero, (Cp), (m), (sc), nE)
-    if (MOE_GEMM(Wbuf,                     g_moe_X, g_moe_G, MOEI, ntmax, DIM, sW, sX, sH) != CUBLAS_STATUS_SUCCESS) return 0;
-    if (MOE_GEMM(Wbuf + (size_t)DIM*MOEI,  g_moe_X, g_moe_U, MOEI, ntmax, DIM, sW, sX, sH) != CUBLAS_STATUS_SUCCESS) return 0;
+    { cublasStatus_t st = MOE_GEMM(Wbuf,                     g_moe_X, g_moe_G, MOEI, ntmax, DIM, sW, sX, sH); if (st != CUBLAS_STATUS_SUCCESS) MOE_FAIL("gemm", st); }
+    { cublasStatus_t st = MOE_GEMM(Wbuf + (size_t)DIM*MOEI,  g_moe_X, g_moe_U, MOEI, ntmax, DIM, sW, sX, sH); if (st != CUBLAS_STATUS_SUCCESS) MOE_FAIL("gemm", st); }
     {   /* 路由权重上设备(小: nE*ntmax 个 float) */
         float *dWt = NULL;
-        if (Wt) { if (!moe_need(&g_moe_W, &g_moe_cap_w, (size_t)nE*ntmax)) return 0;
+        if (Wt) { if (!moe_need(&g_moe_W, &g_moe_cap_w, (size_t)nE*ntmax)) MOE_FAIL("alloc Wt", 0);
                   if (cudaMemcpyAsync(g_moe_W, Wt, (size_t)nE*ntmax*sizeof(float),
-                                      cudaMemcpyHostToDevice, g_moe_s) != cudaSuccess) return 0;
+                                      cudaMemcpyHostToDevice, g_moe_s) != cudaSuccess) MOE_FAIL("H2D Wt", 0);
                   dWt = g_moe_W; }
         const int T = 256; const size_t nblk = (nh + T - 1) / T;
         moe_swiglu_kernel<<<(unsigned)nblk, T, 0, g_moe_s>>>(g_moe_G, g_moe_U, dWt, ntmax, MOEI, nh, swlim); }
-    if (MOE_GEMM(Wbuf + (size_t)2*DIM*MOEI, g_moe_G, g_moe_Y, DIM, ntmax, MOEI, sW, sH, sX) != CUBLAS_STATUS_SUCCESS) return 0;
+    { cublasStatus_t st = MOE_GEMM(Wbuf + (size_t)2*DIM*MOEI, g_moe_G, g_moe_Y, DIM, ntmax, MOEI, sW, sH, sX); if (st != CUBLAS_STATUS_SUCCESS) MOE_FAIL("gemm", st); }
     #undef MOE_GEMM
-    if (cudaMemcpyAsync(Ypad, g_moe_Y, nx * sizeof(float), cudaMemcpyDeviceToHost, g_moe_s) != cudaSuccess) return 0;
-    return cudaStreamSynchronize(g_moe_s) == cudaSuccess;
+    { cudaError_t e = cudaMemcpyAsync(Ypad, g_moe_Y, nx * sizeof(float), cudaMemcpyDeviceToHost, g_moe_s);
+      if (e != cudaSuccess) MOE_FAIL("D2H Y", e); }
+    { cudaError_t e = cudaStreamSynchronize(g_moe_s); if (e != cudaSuccess) MOE_FAIL("sync", e); }
+    return 1;
 }
 
 extern "C" void vqg_moe_release(void) {
     if (g_moe_X) { cudaFree(g_moe_X); g_moe_X = NULL; g_moe_cap_x = 0; }
     if (g_moe_Y) { cudaFree(g_moe_Y); g_moe_Y = NULL; g_moe_cap_y = 0; }
-    if (g_moe_G) { cudaFree(g_moe_G); g_moe_G = NULL; }
-    if (g_moe_U) { cudaFree(g_moe_U); g_moe_U = NULL; g_moe_cap_h = 0; }
+    if (g_moe_G) { cudaFree(g_moe_G); g_moe_G = NULL; g_moe_cap_g = 0; }
+    if (g_moe_U) { cudaFree(g_moe_U); g_moe_U = NULL; g_moe_cap_u = 0; }
     if (g_moe_W) { cudaFree(g_moe_W); g_moe_W = NULL; g_moe_cap_w = 0; }
     if (g_moe_h) { cublasDestroy(g_moe_h); g_moe_h = NULL; }
     if (g_moe_s) { cudaStreamDestroy(g_moe_s); g_moe_s = NULL; }
