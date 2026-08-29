@@ -2,6 +2,8 @@
  * 物理分片, 只被 ds4quant_run_p4.inc.c include; 逻辑上是 bytes_moe 的 GPU 分支, 不是另一份实现。
  * 设备侧核在 gguf-tools/quantize/vq_gpu_moe.inc.cu。 */
 #ifdef DS4QUANT_CUDA
+static const int *g_anc_rowmap;   /* 前向声明: 定义在 p6:360(本分片被 p4 include, 在 p6 之前);
+                                   * 同 TU 双 tentative definition 合并, 合法 */
 extern int vqg_moe_batch(const float*,const float*,const float*,float*,int,int,int,int,float);
 /* ★一块专家一次提交 GPU(2026-08-29 用户令"先把 sweep 改成 gpu")★
  * 原路: 20 线程各跑【单专家】3 次 GEMM。sweep 抽格到 ~512 行后每专家只有 nt≈12 个 token,
