@@ -214,28 +214,13 @@
         } else if (done) {
             snprintf(status, sizeof status, "已注入过, 跳过(回滚请按账本截断)");
         } else if (eff <= GATE) {
-            if (ERF_ADD) {          /* ★死层部件接管★: z 被闸拒但 ERF 过闸 → 同账本注入 */
-                struct stat ds;
-                if (stat(dql, &ds)) die("dql 不存在: %s", dql);
-                long long osz = (long long)ds.st_size;
-                FILE *df = fopen(dql, "r+b");
-                if (!df) die("dql 打不开(r+b): %s", dql);
-                uint32_t n0;
-                if (fseeko(df, 8, SEEK_SET) || fread(&n0, 4, 1, df) != 1) die("dql nrec 读不到");
-                if (fseeko(df, 0, SEEK_END)) die("dql seek end 失败");
-                if (fwrite(ERF_ADD, 1, ERF_LEN, df) != ERF_LEN) die("dql 追加失败");
-                uint32_t n1 = n0 + 1;
-                if (fseeko(df, 8, SEEK_SET) || fwrite(&n1, 4, 1, df) != 1) die("dql nrec 回写失败");
-                fclose(df);
-                mf = fopen(man, "a"); if (!mf) die("账本写不开");
-                fprintf(mf, "%d %lld %u\n", L, osz, n0); fclose(mf);
-                snprintf(status, sizeof status, "ERF死层注入(+1记录 %.1fMB, held+%.1f%%, 专家%d)",
-                         ERF_LEN / 1048576.0, ERF_GAIN * 100, ERF_NE);
-            } else {
-                mf = fopen(man, "a"); if (!mf) die("账本写不开");
-                fprintf(mf, "%d -1 -1\n", L); fclose(mf);
-                snprintf(status, sizeof status, "组合增益 %.1f%% ≤闸%.1f%% → 本层不注入(闸)", comb * 100, GATE * 100);
-            }
+            /* ★闸拒=整层收官(2026-08-29 用户裁决"进去了就结束啊")★ 原"ERF 死层接管"
+             * (z 被拒但 ERF 顶上, +12MB/层 held+0.3% 级)废除: 没收益不进入=拒了就干净
+             * 结束, 不换族继续塞。实测支持: 摘4层(整层空)Same-top 79.16 距冠军 0.03pp,
+             * 已优于塞 ERF 的版本。过闸层的 ERF 叠加(有收益层的附加部件)不在此列, 保留。 */
+            mf = fopen(man, "a"); if (!mf) die("账本写不开");
+            fprintf(mf, "%d -1 -1\n", L); fclose(mf);
+            snprintf(status, sizeof status, "组合增益 %.1f%% ≤闸%.1f%% → ★整层不注入(闸拒=收官)★", comb * 100, GATE * 100);
         } else {
             if (ERF_ADD) {          /* ★叠加★: z/GE 之上再追加 ERF 残差补丁 */
                 add = (uint8_t *)realloc(add, add_len + ERF_LEN); if (!add) die("realloc");
