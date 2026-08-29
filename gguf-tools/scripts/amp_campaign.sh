@@ -665,6 +665,7 @@ stage_champbf(){
     case "$V" in
       vq86h_noz) OUT="$D2/vq86h_noz";;
       champ86)   OUT="$D2/champ86";;    # 平权底座工作副本(原始 vq86h_noz 只读保全)
+      champ86amp) OUT="$D2/champ86amp";;  # zlayer 反修完成态 ⇒ sweep 在它上面做
       *)         OUT="$D2/dyn86/$V";;
     esac
     [ "$(ls "$OUT/layers"/dql_L*.bin 2>/dev/null | wc -l)" = 43 ] || DIE "层件不齐 $OUT/layers"
@@ -677,7 +678,11 @@ stage_champbf(){
     export OPENBLAS_NUM_THREADS=1 DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-0731"
     # 这四个必须不在场, 否则 backfit 走错分支(段内自带硬闸会停)
     unset DS4_TUNE DS4_MINVOL DS4_MV_BASELINE DS4_VQ_RPLAN
-    shift 2 2>/dev/null || true       # 余下参数原样透传给 QBIN(如 --elm-probe 2,20,40)
+    # ★bug#5 修(2026-08-29)★ 原写法 `shift 2 2>/dev/null || true`: 只传 1 个参数时 shift 2
+    # 失败, || true 把错吞了, "$@" 里还剩【工作区名】—— 于是 ds4quant_run <ids> 8192 champ86,
+    # 那个位置本该是冠军的秩(r64c 传的是 64)。argv[3] 无人解析 ⇒ 静默丢弃, 秩落到 p14:289
+    # 的 COADAPT 兜底 16。改成按实际参数个数 shift, 少于 2 个就清空透传。
+    if [ "$#" -ge 2 ]; then shift 2; else shift "$#"; fi
     local PB=""; [ "$MODE" = probe ] && PB=1
     # 纯 VQ 底座无 go2b 热专家 ⇒ 关 GO2B_HOT(冠军底座是 go2b 热, 这是底座差异不是配方改动)
     local G2H=0
@@ -767,8 +772,15 @@ stage_champ86(){
     SRCBASE=champ86/layers_quant bash "$SC/amp_clean_full.sh" \
         champ86amp "" 64 "" "$D2/anchor_a_clean_s8192.bin" \
         || DIE "冠军路反修失败"
-    # ③五指标: amp_clean_full 的 ④ 已出 wt2 官方尺; 这里补【判决份同域全能力尺】(裸+反修后两跑)
-    LOG "③判决份同域尺; wt2 官方尺已由 ② 内部跑完(对表平权裸 KLD 0.47055 / Σmin 0.7799 / top1 78.36%)"
+    # ★③sweep: 全层再扫一遍(2026-08-29 用户"之前的 sweep 不就是所有层再跑一遍吗")★
+    # 反修(zlayer)是一遍过、逐层独立解; sweep 是在【反修完成态】上以最终出口为判据把 43 层
+    # 再扫一遍, 逐层试 6 种形态(GL/TREF/dyn2/GE/own-z重解/…)择优落地, 收尾统一终验、劣化全回滚。
+    # ★本轮之前它是坏的★: 打分行域固定 [vs,n_fit)=[4608,6144), 在"域按块连续铺"的语料上
+    # 只覆盖西里尔后半+math 两个域 ⇒ 候选择优/落地/终验全瞎。已改成从 <锚>.layout 分层推导。
+    LOG "③sweep(全层再扫一遍, 行域已改分层; 反修完成态上做)"
+    stage_champbf champ86amp full
+    # ④五指标: amp_clean_full 的 ④ 已出 wt2 官方尺; 这里补【判决份同域全能力尺】(裸+反修后两跑)
+    LOG "④判决份同域尺; wt2 官方尺已由 ② 内部跑完(对表平权裸 KLD 0.47055 / Σmin 0.7799 / top1 78.36%)"
     stage_judge3 champ86amp
 }
 
