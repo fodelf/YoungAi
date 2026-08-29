@@ -18,7 +18,8 @@ XC=${2:-}
 K=${3:-1024}
 XA=${4:-}
 ANCOV=${5:-}
-LRANGE=${6:-}          # ★$6=层范围 "a b"(默认全 43 层): 10 分钟级单层验证用, 不新造脚本
+IDSP=${6:-$D2/vqhalf_a.ids}   # ★$6=ids 路径(必须与 $5 锚配对)★ 行布局从 $IDSP.layout 读
+LRANGE=${7:-}          # ★$7=层范围 "a b"(默认全 43 层): 10 分钟级单层验证用, 不新造脚本
 ANC=${ANCOV:-$D2/anchor_a_clean_s8192.bin}
 LOG(){ echo "[$WS $(date +%H:%M:%S)] $*"; }
 # ①等锚(FP遍写完的判据=文件尺寸到位)  [python3 内联清零(2026-08-25 迁移 Wave C): bash 算术同式]
@@ -42,27 +43,34 @@ cp dql_ops_L*.bin opt_L*.bin manifest.txt "$HOME/ds4-main/$D2/$WS/layers/" 2>/de
 cp dql_L*.bin "$HOME/ds4-main/$D2/$WS/layers/"
 cd ~/ds4-main
 LOG "②工作区就绪"
-# ★行掩码(2026-08-29 重写: 旧版硬编码 32块×256 与新语料布局不符)★
-# 两件事一起做, 缺一个 z 就死:
-#  ①【剔拼接毒】2026-08-24 定罪: 抽样是等距铺窗, 每个窗的开头是源语料里的【跳跃】,
-#    模型在那儿没有上下文 ⇒ 前若干行是污染行。剔掉后 z 复活(L3 7.2%/组合 11.7% 在案)。
-#  ②【域分层】2026-08-29 定位: 新切分把 8 个域按【连续块】铺(实测 [0:4096) 拉丁 /
-#    [4096:5120) 西里尔 / [6144:7168) 阿拉伯 / [7168:8192) 中日韩)。若按行号顺序切
-#    fit/val, 就变成"拉丁上拟合、西里尔上判落地、阿拉伯+中日韩当 held" —— 实测
-#    fit latin91% vs held ara59%+cjk33%, 三段几乎零重叠, z 必然 100% 全拒(378/378 在案)。
-#    修法: fit 与 eval 都【从每个域块里各取】, 域内按窗划分 ⇒ 两段同分布。
-# 布局参数(与 amp_campaign.sh stage_idshalf 的抽样一致: 8 域等权 × 1024 行, 窗宽 128):
-NDOM=${NDOM:-8}; DOMROWS=${DOMROWS:-1024}; WIN=${WIN:-128}; SKIP=${SKIP:-32}
-NW=$(( DOMROWS / WIN ))          # 每域窗数 = 8
-EVW=${EVW:-2}                    # 每域末尾 EVW 个窗给 eval, 其余给 fit
+# ★行掩码: 一个数字都不写死, 全从布局文件读(2026-08-29 用户令)★
+# 为什么不能写死: 旧版把 "32块×256" 抄死在这里。语料后来换成 8域×1024行/窗128, 掩码
+# 静默错位 —— 没人记得回来改。后果实测: fit 拉丁91% / val 西里尔26% / held 阿拉伯59%+
+# 中日韩33%, 三段几乎零重叠 ⇒ z 落地 378/378 全拒。改成读布局后同一层 z 立刻复活
+# (L0 组合 held 11.3%)。布局由 amp_campaign.sh stage_idshalf 在抽样时落盘, 生产方写、
+# 消费方读, 换语料自动跟随。★读不到就硬停, 绝不回退到猜★。
+LAY="$IDSP.layout"
+[ -s "$LAY" ] || { LOG "★行布局缺: $LAY"; LOG "  先跑: bash gguf-tools/scripts/amp_campaign.sh idshalf (ids 已在时它只补布局, 逐字节校验, 不动 ids)"; exit 1; }
+W=$(awk '$1=="win"{print $2}' "$LAY")
+[ -n "$W" ] && [ "$W" -gt 0 ] 2>/dev/null || { LOG "★布局里没有 win"; exit 1; }
+# 两个比例沿用冠军配方(唯一的"配方常数", 与语料无关, 就地注明出处):
+#   剔窗首 25%(冠军 64/256) = 拼接毒: 窗首是源语料里的跳跃, 模型在那儿没上下文
+#   末 25% 窗给 eval(冠军 8/32) = fit/eval 同分布: 【每个域块各出一份】而不是按行号切
 FR=""; ER=""
-for d in $(seq 0 $((NDOM-1))); do
-  for w in $(seq 0 $((NW-1))); do
-    a=$(( d*DOMROWS + w*WIN + SKIP ))     # 跳过本窗前 SKIP 行(拼接毒)
-    b=$(( d*DOMROWS + (w+1)*WIN ))
-    if [ "$w" -lt $((NW-EVW)) ]; then FR="${FR:+$FR,}$a:$b"; else ER="${ER:+$ER,}$a:$b"; fi
+while read -r d off cnt; do
+  case "$d" in \#*|win|"") continue;; esac
+  nw=$(( cnt / W )); [ "$nw" -lt 2 ] && nw=2
+  skip=$(( W / 4 ))
+  nev=$(( nw / 4 )); [ "$nev" -lt 1 ] && nev=1
+  for w in $(seq 0 $((nw-1))); do
+    x=$(( off + w*W + skip )); y=$(( off + (w+1)*W ))
+    [ "$y" -gt $(( off + cnt )) ] && y=$(( off + cnt ))
+    [ "$x" -ge "$y" ] && continue
+    if [ "$w" -lt $(( nw - nev )) ]; then FR="${FR:+$FR,}$x:$y"; else ER="${ER:+$ER,}$x:$y"; fi
   done
-done
+done < "$LAY"
+[ -n "$FR" ] && [ -n "$ER" ] || { LOG "★行掩码算空(布局有问题)"; exit 1; }
+LOG "行掩码 ← $LAY: win=$W, fit $(echo "$FR"|tr , '\n'|wc -l) 段 / eval $(echo "$ER"|tr , '\n'|wc -l) 段"
 # ③zlayer 全家 43 层(干净锚; XC 非空=第7参引擎捕获)
 # zlayer=C 版(2026-08-25 迁移 Wave B 一期, 金标 migrate/golden.txt: z支线与py精确一致/
 # GE=py-CPU路真解口径(py-GPU路 XCAP 下 GE 恒死是 py 自身分裂, 见 zlayer_transcription_notes #1)/

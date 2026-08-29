@@ -244,7 +244,19 @@ stage_dilute(){
 stage_idshalf(){
     local D2="$ROOT/gguf/go-onebit/vqhalf"; mkdir -p "$D2"
     local QI="$D2/vqhalf_q.ids" AI="$D2/vqhalf_a.ids" JI="$D2/vqhalf_j.ids"
-    [ -s "$QI" ] && [ -s "$AI" ] && [ -s "$JI" ] && { LOG "①ids 三份已在, 跳过(要重切先 mv 走)"; return 0; }
+    # ★布局是产物的一部分(2026-08-29)★: ids 在但 .layout 缺 = 补布局机制之前切的。
+    # 切分是确定性的(无随机源), 所以同一段代码重跑到 tmp、逐字节比对 ids 一致后, 只把
+    # .layout 装回去 —— ids 一个字节不动 ⇒ 三个锚(各 30.8G/57 分钟)不作废。
+    # 比对不过就硬停: 宁可没布局, 也不许拿一份【算出来的】布局去配一份【对不上的】ids。
+    local HAVE=0 T=""
+    [ -s "$QI" ] && [ -s "$AI" ] && [ -s "$JI" ] && HAVE=1
+    if [ "$HAVE" = 1 ] && [ -s "$QI.layout" ] && [ -s "$AI.layout" ] && [ -s "$JI.layout" ]; then
+        LOG "①ids 三份 + 行布局已在, 跳过(要重切先 mv 走)"; return 0; fi
+    local OQ="$QI" OA="$AI" OJ="$JI"
+    if [ "$HAVE" = 1 ]; then
+        T="$(mktemp -d)"; OQ="$T/q.ids"; OA="$T/a.ids"; OJ="$T/j.ids"
+        LOG "①ids 已在但行布局缺 → 确定性重算 + 逐字节校验, 只补布局(不动 ids)"
+    fi
     # ★域分层整簇切半(2026-08-28 用户令"不要相似的, 全域都要有")★
     # 旧切法(B=256 token 定长块偶奇交替)的病: 同一篇文档的【相邻段落】被分进两半 —— 实测
     # 两半各自取到的是同一篇小鼠肠道菌群论文的相邻段, 两半几乎是复制品。校准半见过的东西
@@ -259,7 +271,7 @@ stage_idshalf(){
     # 抽样也按域分层: 每半每域按其全局占比取配额, 域内等距铺窗, 保证抽出来的 8192 token
     # 仍然全域齐全(旧切法 64 窗盲抽, 小域可能一个 token 都抽不到)。
     LOG "①域分层整簇三切 → 量化/反修/判决 各 S=8192(全域齐全, 整簇不拆, 三份零重叠)"
-    python3 - "$CORPUS" "$QI" "$AI" "$JI" 8192 "$DS4_HF" "$ROOT/gguf/go-onebit/g7/wt2.ids" <<'PY' || DIE "三切失败"
+    python3 - "$CORPUS" "$OQ" "$OA" "$OJ" 8192 "$DS4_HF" "$ROOT/gguf/go-onebit/g7/wt2.ids" <<'PY' || DIE "三切失败"
 import re, sys, collections
 from tokenizers import Tokenizer
 src, oq, oa, oj, N, hf, wt2 = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5]), sys.argv[6], sys.argv[7]
@@ -357,10 +369,25 @@ def sample(pool, N, path):
         s2 = []
         for k in range(nw): s2 += p[k*step : k*step+W]
         s2 = s2[:q]; got[d] = len(s2); sel += s2
+    order = [d for d in sorted(quota, key=lambda x: -quota[x]) if got.get(d)]
     if len(sel) < N:                                     # 补足: 从最大域续窗
-        d = max(pool, key=lambda x: len(pool[x])); sel += pool[d][:N-len(sel)]; got[d] = got.get(d,0)+N-len(sel)
+        d = max(pool, key=lambda x: len(pool[x])); need = N-len(sel)
+        sel += pool[d][:need]; got[d] = got.get(d,0)+need; order.append(d)
     sel = sel[:N]
     open(path, "w").write("\n".join(str(t) for t in sel) + "\n")
+    # ★布局落盘(2026-08-29 用户令"不要写死任何参数")★
+    # 抽样把各域【连续】铺进 8192 行, 每域内部又是 W 宽的等距窗 —— 这个布局只有本函数
+    # 知道。下游(行掩码/fit-val 切分)以前是把 "32块×256" 抄死在脚本里, 语料一换就静默
+    # 错位, 而且没人记得回来改 —— 2026-08-29 的 z 全拒(378/378)就是这么来的。
+    # 从此布局由生产方落盘, 消费方一律读这个文件; 文件缺失=硬失败, 不许猜。
+    with open(path + ".layout", "w") as lf:
+        lf.write("# %s 的行布局 — stage_idshalf 自动产出, 勿手改\n" % path.split("/")[-1])
+        lf.write("# win=每域内的等距窗宽(窗与窗之间是源语料里的跳跃=上下文断点)\n")
+        lf.write("# 每行: <域名> <起始行> <行数>\n")
+        lf.write("win %d\n" % W)
+        off = 0
+        for d in order:
+            lf.write("%s %d %d\n" % (d, off, got[d])); off += got[d]
     return sel, got
 
 sels, gots = [], []
@@ -385,6 +412,12 @@ for i in range(K):
 print("  三份对 wt2 词表覆盖: " + " / ".join(
     "%s %.1f%%" % (OUTS[i][0], 100*len(set(w)&set(sels[i]))/len(set(w))) for i in range(K)))
 PY
+    if [ -n "$T" ]; then
+        cmp -s "$OQ" "$QI" && cmp -s "$OA" "$AI" && cmp -s "$OJ" "$JI" \
+            || DIE "★重算 ids 与盘上不一致(切分不确定 或 语料变过) — 停, 不许拿算出来的布局配对不上的 ids★"
+        cp "$OQ.layout" "$QI.layout"; cp "$OA.layout" "$AI.layout"; cp "$OJ.layout" "$JI.layout"
+        rm -rf "$T"; LOG "①行布局补齐 ✓ (三份 ids 逐字节复现, 锚全部继续有效)"
+    fi
 }
 
 # ★放大器半扩样(2026-08-26 zloss90 战役, 用户令: 体积≤2GB 换 Σmin→0.90)★
