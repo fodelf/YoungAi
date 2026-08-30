@@ -20,25 +20,35 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
     if(CR[L]>0) dq_freqs_cis(RD,S,65536.0,160000.0,16.0,32.0,1.0,cosr,sinr);
     else dq_freqs_cis(RD,S,0.0,10000.0,16.0,32.0,1.0,cosr,sinr);
     float *y=malloc((size_t)S*DIM*4),*post=malloc((size_t)S*HCM*4),*comb=malloc((size_t)S*HCM*HCM*4);
+    double _am=vqt_now();   /* attn 子账(BFLT 二级): hc/comp/核 三桶, 残差=freqs/malloc/捕获 */
     dq_hc_pre(H,W->afn,W->asc,W->abase,y,post,comb,S,HCM,DIM,mixd,HCIT,EPSF,EPSF);
     float *xn=malloc((size_t)S*DIM*4); for(int s=0;s<S;s++)dq_rms(y+(size_t)s*DIM,W->an,xn+(size_t)s*DIM,DIM,EPSF);
+    g_bflt[12]+=vqt_now()-_am; _am=vqt_now();
     int Sc=0; float *kvc=NULL;
     if(CR[L]>0){ kvc=malloc((size_t)((S/CR[L]+2)*2)*HD*4); Sc=dq_compressor(xn,W->cwkv,W->cwgate,W->cnorm,W->cape,cosr,sinr,kvc,S,DIM,HD,RD,CR[L],EPSF); }
+    g_bflt[13]+=vqt_now()-_am; _am=vqt_now();
     float *a=malloc((size_t)S*DIM*4);
     dq_attention(xn,W->wqa,W->qn,W->wqb,W->wkv,W->kvn,W->sink,W->woa,W->wob,kvc,cosr,sinr,a,S,DIM,NH,HD,RD,QLR,OLR,OG,WIN,Sc,CR[L],EPSF);
+    g_bflt[14]+=vqt_now()-_am; _am=vqt_now();
     float *H2=malloc((size_t)S*HCM*DIM*4); dq_hc_post(a,H,post,comb,H2,S,HCM,DIM);
     float *y2=malloc((size_t)S*DIM*4),*post2=malloc((size_t)S*HCM*4),*comb2=malloc((size_t)S*HCM*HCM*4);
     dq_hc_pre(H2,W->ffn,W->fsc,W->fbase,y2,post2,comb2,S,HCM,DIM,mixd,HCIT,EPSF,EPSF);
     float *Fin=malloc((size_t)S*DIM*4); for(int s=0;s<S;s++)dq_rms(y2+(size_t)s*DIM,W->fn,Fin+(size_t)s*DIM,DIM,EPSF);
+    g_bflt[12]+=vqt_now()-_am;
     if(GS_CAP_L==L&&GS_FIN) memcpy(GS_FIN,Fin,(size_t)S*DIM*4);  if(g_xcap_out) xcap_dump_fin(L,Fin,S);   /* 反修取料 + 量化链 x 捕获 */
     g_lt[0]=vqt_now()-lt_mark; lt_mark=vqt_now();   /* ①attn+hc 段完 */
     /* moe 路由(实际激活: 量化遍即被污染激活 = 部署运行时口径) */
     int *idx=malloc((size_t)S*NACT_RT*sizeof(int)); float *rw=malloc((size_t)S*NACT_RT*4);
+    /* ★锚 override 在场时 gate 分数是白算(2026-08-30 BFLT 实测路由 16s/单元)★: 下方
+     * ANCHOR_ROUTE/BF_ANCROUTE 块会把 idx/rw【整个】覆盖, hash 路由的 gate GEMM+softmax
+     * 输出无人消费。跳过条件与覆盖条件逐字相同 ⇒ 覆盖后字节不变。NACT_RT>NACT(rroute
+     * 加宽)时尾槽无人覆盖, 不跳(保原行为)。只跳 hash 分支: score 分支带 RB Δb 采集寄生。 */
+    const int rt_ov=do_quant&&ANC_OK&&(getenv("DS4_ANCHOR_ROUTE")||BF_ANCROUTE)&&NACT_RT==NACT;
     if(W->t2ei){ static int hbn=0;
         if(!hbn&&do_quant){ hbn=1;
             fprintf(stderr,"[路由] tid2eid 哈希路由生效(0731 原生): 专家选择=token 哈希表, 结构性零漂移;\n"
                            "[路由] Δb 选择偏置在此无对象(老 base 分数近似路由时代的机制), RB 族不武装。\n"); }
-        dq_gate_route_hash(Fin,W->gate,W->t2ei,ids,idx,rw,S,DIM,NEXP,NACT,ROUTE_SCALE);
+        if(!rt_ov) dq_gate_route_hash(Fin,W->gate,W->t2ei,ids,idx,rw,S,DIM,NEXP,NACT,ROUTE_SCALE);
     }
     else{
         if(!RB_TRIED&&getenv("DS4_ROUTE_BIAS")){   /* 懒加载路由偏置侧车(一次) */

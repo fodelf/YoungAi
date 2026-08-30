@@ -137,13 +137,18 @@ static double co_score(const float*Hq,const float*Hf,int a,int b,size_t rowsz){
  * 只占 28s, 其余在账外(主线程单核 99.9%, GPU 采样半数 0%)。sweep 单元臂内(g_bflt_on)
  * 逐段累计: 0..7=g_lt 同槽位 8=打分(co_score_rows+bf_rowdist) 9=layer_fwd 总墙钟
  * 10=前向次数 11=骨干fp16展开(lwh_expand/load_layer, gs_forward_exit 每层每候选翻炒)。
+ * 首账(champ86amp L40): 层前向77s/单元81s, attn=26 moe=34 路由=16, 展开/打分/胶水≈0 →
+ * 二级子账: 12=hc(pre/post/rms) 13=compressor 14=attn核 | 16=bdq 17=gemm+sync 18=gather
+ * 19=scatter 20=池/memset 21=归约 22=修正链回放(含z) 23=其中z(type6双投影,单线程嫌疑#1)。
  * 胶水=单元墙钟−[9]−[8]−[11](malloc/gather/zrefit/pca/落地IO)。量化遍/终验不臂→零扰动。 */
-double g_bflt[12]; int g_bflt_on=0;
+double g_bflt[24]; int g_bflt_on=0;
 static void bflt_print(int J,double uw){
     if(!g_bflt_on) return; g_bflt_on=0;
     double fw=g_bflt[9],sc=g_bflt[8],xp=g_bflt[11],gl=uw-fw-sc-xp; if(gl<0)gl=0;
-    printf("[BFLT] L=%02d 层前向%d次=%.0fs(attn=%.0f 路由=%.0f 共享=%.0f moe=%.0f+%.0f lfload=%.0f 其余=%.0f zl=%.0f) 展开=%.0fs 打分=%.0fs 胶水=%.0fs | 单元=%.0fs\n",
-           J,(int)g_bflt[10],fw,g_bflt[0],g_bflt[1],g_bflt[2],g_bflt[3],g_bflt[7],g_bflt[6],g_bflt[4],g_bflt[5],xp,sc,gl,uw);
+    printf("[BFLT] L=%02d 层前向%d次=%.0fs(attn=%.0f[hc%.0f/comp%.0f/核%.0f] 路由=%.0f 共享=%.0f moe=%.0f[bdq%.0f/gemm%.0f/取%.0f/散%.0f/池%.0f/归%.0f/链%.0f内z%.0f] lfload=%.0f 其余=%.0f zl=%.0f) 展开=%.0f 打分=%.0f 胶水=%.0f | 单元=%.0fs\n",
+           J,(int)g_bflt[10],fw,g_bflt[0],g_bflt[12],g_bflt[13],g_bflt[14],g_bflt[1],g_bflt[2],g_bflt[3],
+           g_bflt[16],g_bflt[17],g_bflt[18],g_bflt[19],g_bflt[20],g_bflt[21],g_bflt[22],g_bflt[23],
+           g_bflt[6],g_bflt[4],g_bflt[5],xp,sc,gl,uw);
     fflush(stdout);
 }
 static double co_score_rows(const float*Hq,const float*Hf,const int*rows,int nr,size_t rowsz){

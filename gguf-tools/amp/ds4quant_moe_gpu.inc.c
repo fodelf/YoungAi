@@ -37,6 +37,7 @@ static int bmw_gpu_chunk(bmw_t *w, int e0, int e1)
      * 命中本块【不同】专家时, 每个专家都要处理它。我第一版写成"首个命中块内任意专家就
      * break" —— 后面的专家被丢, 激活直接少算。修法: 不 break, 改查重(同行同专家才跳过;
      * NACT=6, 线性查重零成本)。计数循环与 gather 循环必须同语义, 否则 fill 越界。 */
+    const double _g0=vqt_now();   /* BFLT 子账[18]: gather/补齐(单线程宿主) */
     int *nt=(int*)calloc((size_t)nE,sizeof(int)); if(!nt) return 0;
     for(int s=0;s<S;s++) for(int a=0;a<NACT_RT;a++){
         const int e=w->idx[(size_t)s*NACT_RT+a];
@@ -62,12 +63,14 @@ static int bmw_gpu_chunk(bmw_t *w, int e0, int e1)
         tk[(size_t)j*ntmax+i]=s;
         Wt[(size_t)j*ntmax+i]=gee*w->rw[(size_t)s*NACT_RT+a];
         memcpy(Xp+((size_t)j*ntmax+i)*DIM, w->Fin+(size_t)s*DIM, (size_t)DIM*4); }
+    if(g_bflt_on) g_bflt[18]+=vqt_now()-_g0;
     const double gt0=vqt_now();
     const int ok=vqg_moe_batch(g_bmw_buf,Xp,Wt,Yp,nE,ntmax,DIM,MOEI,SWLIM);
     /* GPU 时间计入 bmwt"前向"栏(原来只在 CPU worker 里累计 ⇒ GPU 路打 0.00s, 看着像没干活) */
     { extern double g_bmw_t[2]; if(ok) g_bmw_t[1]+=vqt_now()-gt0; }
     { static int d2=0; if(d2++<4) fprintf(stderr,"[moe-gpu] e[%d,%d) S=%d ntmax=%d 补齐率=%.1fx %s %.2fs\n",
         e0,e1,S,ntmax,(double)nE*ntmax/((double)S*NACT_RT/NEXP*nE),ok?"GPU":"★失败→CPU★",vqt_now()-gt0); }
+    const double _s0=vqt_now();   /* BFLT 子账[19]: scatter(单线程宿主) */
     if(ok){   /* scatter: 冷热分桶与原路同判据(vtab 的 w2 槽非零=热) */
         const uint64_t *vtab=(const uint64_t*)(lf->vqmap+16);
         for(int j=0;j<nE;j++){
@@ -76,6 +79,7 @@ static int bmw_gpu_chunk(bmw_t *w, int e0, int e1)
             for(int i=0;i<nt[j];i++){ float *dst=bucket+(size_t)tk[(size_t)j*ntmax+i]*DIM;
                 const float *yi=Yp+((size_t)j*ntmax+i)*DIM;
                 for(int d=0;d<DIM;d++) dst[d]+=yi[d]; } } }
+    if(ok&&g_bflt_on) g_bflt[19]+=vqt_now()-_s0;
     free(nt);free(fill);free(Xp);free(Yp);free(Wt);free(tk);
     return ok;
 }

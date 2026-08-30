@@ -337,7 +337,7 @@ static int bmw_batch_dequant(lfile_t*lf,int e0,int e1){
 static void bytes_moe(lfile_t*lf,int S,const float*Fin,const int*idx,const float*rw,float*Fout){
     /* ★逐层口径(2026-08-28 改)★ 原为全程累计, 我曾把它当墙钟误读一次(1731s 实为 20 线程
      * 累计 ÷20 = 87s)。改为每次进本函数清零 + 每层打印, 并显式标注"20线程累计/墙钟"两栏。 */
-    { extern double g_bmw_t[2]; g_bmw_t[0]=0; g_bmw_t[1]=0; }
+    { extern double g_bmw_t[2]; g_bmw_t[0]=0; g_bmw_t[1]=0; } double _bm0=vqt_now();
     float *Fbase=malloc((size_t)S*DIM*4); memcpy(Fbase,Fout,(size_t)S*DIM*4);   /* shared 基 */
     const float *ge=NULL;   /* bf.GE(type-5, 取最后一条): per-expert 增益, 专家累加时乘(链 op 之前) */
     const int lay_skip=replay_layer_skipped();
@@ -358,7 +358,7 @@ static void bytes_moe(lfile_t*lf,int S,const float*Fin,const int*idx,const float
         bmbar_init(&BMW_BAR,nth+1); BMW_TH=malloc((size_t)nth*sizeof(pthread_t));
         for(int t=0;t<nth;t++) pthread_create(&BMW_TH[t],NULL,bytes_moe_worker,(void*)(intptr_t)t);
         BMW_NTH=nth; }
-    BMW_JOB.lf=lf; BMW_JOB.S=S; BMW_JOB.Fin=Fin; BMW_JOB.idx=idx; BMW_JOB.rw=rw; BMW_JOB.ge=ge;
+    BMW_JOB.lf=lf; BMW_JOB.S=S; BMW_JOB.Fin=Fin; BMW_JOB.idx=idx; BMW_JOB.rw=rw; BMW_JOB.ge=ge; g_bflt[20]+=vqt_now()-_bm0;
     for(int ec=0;ec<NEXP;ec+=BMW_CHUNK){
         const int ec1=(ec+BMW_CHUNK<NEXP)?ec+BMW_CHUNK:NEXP;
         int gdone=0;
@@ -383,17 +383,17 @@ static void bytes_moe(lfile_t*lf,int S,const float*Fin,const int*idx,const float
     }
     /* ★归约并行化(2026-08-28)★ 原为主线程串行 20×2×S·DIM 次加(S=8192 时 13.4 亿次 +
      * 5.4GB 读)。按元素区间切给线程, 每元素内仍按 t 升序累加 ⇒ 浮点求和顺序不变, 逐位同值。 */
-    { bmred_t *rs=malloc((size_t)nth*sizeof(bmred_t)); pthread_t *th=malloc((size_t)nth*sizeof(pthread_t));
+    { double _r0=vqt_now(); bmred_t *rs=malloc((size_t)nth*sizeof(bmred_t)); pthread_t *th=malloc((size_t)nth*sizeof(pthread_t));
       size_t N=(size_t)S*DIM, chunk=(N+nth-1)/nth;
       for(int t=0;t<nth;t++){ size_t a=chunk*(size_t)t, b=a+chunk>N?N:a+chunk; if(a>N)a=N;
           rs[t]=(bmred_t){a,b,nth+1,BM_RH,BM_RC,Fout};   /* +1: 含主线程 GPU slot */
           pthread_create(&th[t],NULL,bmw_reduce_worker,&rs[t]); }
       for(int t=0;t<nth;t++) pthread_join(th[t],NULL);
-      free(rs); free(th); }
+      free(rs); free(th); g_bflt[21]+=vqt_now()-_r0; }
     /* ★Fcur=专家后·ops前的态(shared+base_routed)=coadapt 的 base态 Fcur★: TREF(type4)按 coadapt 口径
      * 从 Fcur 插值(Fout=Fcur+t·(Fout−Fcur)), 而非从 shared 缩放(否则 t 把 routed 整体放大, 抵消临界点处 Fout 翻倍误差)。*/
     /* (worker 内 bf.GE 已乘; Fcur 捕获在专家累加+GE 之后 = 调优的 base态口径) */
-    float *Fcur=malloc((size_t)S*DIM*4); memcpy(Fcur,Fout,(size_t)S*DIM*4);
+    float *Fcur=malloc((size_t)S*DIM*4); memcpy(Fcur,Fout,(size_t)S*DIM*4); double _op0=vqt_now();
     /* 修正链回放(时间序): 缩放型(GL/dyn)以 Fbase=shared 为基; TREF 以 Fcur=base态 为基(与调优一致) */
     float *xn=NULL,*pj=NULL; const float*pjV8=NULL;
     /* ★op 族消融门(2026-08-04 诊断)★ DS4_REPLAY_SKIP_TYPES="4,6": 回放时跳过指定 type 的
@@ -441,7 +441,7 @@ static void bytes_moe(lfile_t*lf,int S,const float*Fin,const int*idx,const float
                 float*fw=Fout+(size_t)s2*DIM; const float*fb=Fbase+(size_t)s2*DIM;
                 for(int d2=0;d2<DIM;d2++) fw[d2]=fb[d2]+(float)c*(fw[d2]-fb[d2]); } }
         else if(o->type==4){ for(size_t i=0;i<(size_t)S*DIM;i++) Fout[i]=Fcur[i]+o->t*(Fout[i]-Fcur[i]); }   /* TREF: 从 base态 Fcur 插值(coadapt 口径) */
-        else if(o->type==6&&o->zlk>0){
+        else if(o->type==6&&o->zlk>0){ double _z0=vqt_now();
             double zdiag_nd=0,zdiag_nf=0,zdiag_sc=0; long long zdiag_n=0,zdiag_clip=0;
             /* ★冻结 z^L 回放(2026-07-14, 产物③)★: Fout += clip·U diag(z) Vᵀ Fin,
              * clip=min(1, tr·‖Fout‖/‖zd‖) 逐 token(与活体/引擎同口径的信赖域) */
@@ -477,11 +477,11 @@ static void bytes_moe(lfile_t*lf,int S,const float*Fin,const int*idx,const float
             if(zdiag_n) fprintf(stderr,"[zdiag]L%02d k=%d tr=%.2f 行=%lld |z|/|routed|=%.4f "
                 "夹持率=%.1f%% 平均缩放=%.3f\n", g_replay_cur_L, zk, (double)o->zltr, zdiag_n,
                 zdiag_nf>0?zdiag_nd/zdiag_nf:0.0, 100.0*zdiag_clip/zdiag_n, zdiag_sc/zdiag_n);
-            free(zd); free(pv); if(phi)free(phi);
+            free(zd); free(pv); if(phi)free(phi); g_bflt[23]+=vqt_now()-_z0;
         }
     }
     if(xn)free(xn); if(pj)free(pj);
-    free(Fbase); free(Fcur);
+    free(Fbase); free(Fcur); g_bflt[22]+=vqt_now()-_op0;
     { int nth2=NTHREADS>0?NTHREADS:1;
       /* ★口径必须显式标注★: dequant 计数器同时接收两条路 —— 批量路(单线程调一次, 值即墙钟)
        * 与逐矩阵回退路(20 线程累计, 要 ÷线程数)。不标 batched 旗标就无法判读, 我曾误读过一次。 */
