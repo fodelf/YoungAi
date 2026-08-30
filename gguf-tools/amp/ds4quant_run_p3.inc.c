@@ -141,17 +141,27 @@ static double co_score(const float*Hq,const float*Hf,int a,int b,size_t rowsz){
  * 二级子账: 12=hc(pre/post/rms) 13=compressor 14=attn核 | 16=bdq 17=gemm+sync 18=gather
  * 19=scatter 20=池/memset 21=归约 22=修正链回放(含z) 23=其中z(type6双投影,单线程嫌疑#1)。
  * 胶水=单元墙钟−[9]−[8]−[11](malloc/gather/zrefit/pca/落地IO)。量化遍/终验不臂→零扰动。 */
-double g_bflt[24]; int g_bflt_on=0;
+double g_bflt[26]; int g_bflt_on=0;   /* 24=attn投影GEMM 25=oo/wo_b 输出投影(2026-08-30 二级细账) */
+double vqt_now_ref(void){ return vqt_now(); }   /* fwd_p2 埋点用(fwd 在 vq_qc.h 之前 include, 看不见 static inline vqt_now) */
 static void bflt_print(int J,double uw){
     if(!g_bflt_on) return; g_bflt_on=0;
     double fw=g_bflt[9],sc=g_bflt[8],xp=g_bflt[11],gl=uw-fw-sc-xp; if(gl<0)gl=0;
-    printf("[BFLT] L=%02d 层前向%d次=%.0fs(attn=%.0f[hc%.0f/comp%.0f/核%.0f] 路由=%.0f 共享=%.0f moe=%.0f[bdq%.0f/gemm%.0f/取%.0f/散%.0f/池%.0f/归%.0f/链%.0f内z%.0f] lfload=%.0f 其余=%.0f zl=%.0f) 展开=%.0f 打分=%.0f 胶水=%.0f | 单元=%.0fs\n",
-           J,(int)g_bflt[10],fw,g_bflt[0],g_bflt[12],g_bflt[13],g_bflt[14],g_bflt[1],g_bflt[2],g_bflt[3],
+    printf("[BFLT] L=%02d 层前向%d次=%.0fs(attn=%.0f[hc%.0f/comp%.0f/核%.0f=投%.0f+带%.0f+出%.0f+胶] 路由=%.0f 共享=%.0f moe=%.0f[bdq%.0f/gemm%.0f/取%.0f/散%.0f/池%.0f/归%.0f/链%.0f内z%.0f] lfload=%.0f 其余=%.0f zl=%.0f) 展开=%.0f 打分=%.0f 胶水=%.0f | 单元=%.0fs\n",
+           J,(int)g_bflt[10],fw,g_bflt[0],g_bflt[12],g_bflt[13],g_bflt[14],g_bflt[24],g_bflt[15],g_bflt[25],g_bflt[1],g_bflt[2],g_bflt[3],
            g_bflt[16],g_bflt[17],g_bflt[18],g_bflt[19],g_bflt[20],g_bflt[21],g_bflt[22],g_bflt[23],
            g_bflt[6],g_bflt[4],g_bflt[5],xp,sc,gl,uw);
     fflush(stdout);
 }
-static double co_score_rows(const float*Hq,const float*Hf,const int*rows,int nr,size_t rowsz){
+/* ★dirn=1 方向域(2026-08-30 判据病修)★ head 的 rms 抹掉每 token 模长 → 打分前逐行 rms
+ * 归一, 只计 head 看得见的方向分量。42 单元实锤: L2 版被模长假肉喂饱(隐分↑/cos平/KL↑),
+ * 真肉(L31/L19 型)反被打负分。sweep 侧全部传 1; 传 0=原语义(其他消费者不动)。 */
+static void rows_rmsn(float*g,int nr,size_t rowsz){
+    for(int i=0;i<nr;i++){ float*r=g+(size_t)i*rowsz; double n2=0;
+        for(size_t k=0;k<rowsz;k++) n2+=(double)r[k]*r[k];
+        float sc=(float)(1.0/sqrt(n2/rowsz+1e-12));
+        for(size_t k=0;k<rowsz;k++) r[k]*=sc; }
+}
+static double co_score_rows(const float*Hq,const float*Hf,const int*rows,int nr,size_t rowsz,int dirn){
     if(nr<1||!rows) return 0.0;
     double _t0=g_bflt_on?vqt_now():0.0;
     float *ga=malloc((size_t)nr*rowsz*4), *gb=malloc((size_t)nr*rowsz*4);
@@ -159,6 +169,7 @@ static double co_score_rows(const float*Hq,const float*Hf,const int*rows,int nr,
     for(int i=0;i<nr;i++){
         memcpy(ga+(size_t)i*rowsz, Hq+(size_t)rows[i]*rowsz, rowsz*4);
         memcpy(gb+(size_t)i*rowsz, Hf+(size_t)rows[i]*rowsz, rowsz*4); }
+    if(dirn){ rows_rmsn(ga,nr,rowsz); rows_rmsn(gb,nr,rowsz); }
     double v=co_score(ga,gb,0,nr,rowsz);
     free(ga); free(gb); if(g_bflt_on) g_bflt[8]+=vqt_now()-_t0; return v;
 }
@@ -179,7 +190,7 @@ static double bf_base_gate(int J,double base,float**Hb,int eF,const float*eHin,c
     printf("★[BF诊断] L=%02d base=%g 非有限: 出口H NaN行=%zu/%d 全零行=%zu — 复跑一次判瞬态/确定性\n",
            J,base,nanr,eS,zr); fflush(stdout);
     free(*Hb); *Hb=gs_forward_exit(J,eF,eHin,eIds,eS,eNf,NULL);
-    double b2=co_score_rows(*Hb,eTgt,SEV,nSEV,rowsz);
+    double b2=co_score_rows(*Hb,eTgt,SEV,nSEV,rowsz,1);
     if(isfinite(b2)) printf("★[BF诊断] L=%02d 复跑base=%.6g 有限 → ★瞬态实锤(嫌疑=GB10托管内存)★ 单元以复跑值继续\n",J,b2);
     else             printf("★[BF诊断] L=%02d 复跑base=%g 仍非有限 → 确定性异常, 单元跳过\n",J,b2);
     fflush(stdout);

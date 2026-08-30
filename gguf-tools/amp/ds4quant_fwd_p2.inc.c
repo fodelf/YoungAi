@@ -235,6 +235,7 @@ static void att_pool(size_t n){
 #endif
     ATT_N=n;
 }
+extern double g_bflt[26]; extern int g_bflt_on; extern double vqt_now_ref(void);
 void dq_attention(const float *x, const float *wqa, const float *qnorm, const float *wqb,
                   const float *wkv, const float *kvnorm, const float *sink,
                   const float *wo_a, const float *wo_b, const float *kvc,
@@ -242,6 +243,7 @@ void dq_attention(const float *x, const float *wqa, const float *qnorm, const fl
                   float *out, int S, int DIM, int NH, int HD, int RD, int QLR, int OLR, int OG,
                   int WIN, int Sc, int ratio, float EPS) {
     int N = S + Sc;
+    double _p0=g_bflt_on?vqt_now_ref():0.0;   /* BFLT attn 三桶: [24]投影 [15]带核 [25]输出投影 */
     float *qr = (float*)malloc((size_t)S*QLR*sizeof(float));
     float *qra = (float*)malloc((size_t)S*QLR*sizeof(float));
     dq_matmul(x, wqa, qra, S, DIM, QLR);
@@ -252,6 +254,7 @@ void dq_attention(const float *x, const float *wqa, const float *qnorm, const fl
     /* per-head rms (mean over HD) + rope — s 切片并行(逐位同) */
     dq_arw arw = { q, NULL, NULL, NULL, cos_t, sin_t, S, NH, HD, RD, EPS };
     dq_ar_par(dq_ar_qrms, &arw, S);
+    if(g_bflt_on){ g_bflt[24]+=vqt_now_ref()-_p0; }
     float *kv = (float*)malloc((size_t)S*HD*sizeof(float));
     { float *kvr=(float*)malloc((size_t)S*HD*sizeof(float));
       dq_matmul(x, wkv, kvr, S, DIM, HD);
@@ -264,6 +267,7 @@ void dq_attention(const float *x, const float *wqa, const float *qnorm, const fl
     if (Sc>0) memcpy(kva+(size_t)S*HD, kvc, (size_t)Sc*HD*sizeof(float));
     float scale = 1.0f/sqrtf((float)HD);
     float *o = ATT_O;
+    double _b0=g_bflt_on?vqt_now_ref():0.0;
 #ifdef DQ_BLAS
     /* per-head 两个 gemm: SC_h=Q_h·kva^T, O_h=P_h·kva. mask/softmax/sink 逻辑与标量路径逐字一致. */
 #ifdef DS4QUANT_CUDA
@@ -289,6 +293,7 @@ void dq_attention(const float *x, const float *wqa, const float *qnorm, const fl
 #ifdef DS4QUANT_CUDA
     }
 #endif
+    if(g_bflt_on){ g_bflt[15]+=vqt_now_ref()-_b0; }
     arw.o = o;
     dq_ar_par(dq_ar_irope, &arw, S);       /* inverse rope — s 切片并行(逐位同) */
 #else
@@ -315,6 +320,7 @@ void dq_attention(const float *x, const float *wqa, const float *qnorm, const fl
 #endif
     /* o[S,NH*HD] reshape [S,OG,NH*HD/OG]; woa=wo_a.reshape(OG,OLR,NH*HD/OG); oo[s,g,r]=Σ_d o[s,g,d]*woa[g,r,d] */
     int GD = (NH*HD)/OG;
+    double _o0=g_bflt_on?vqt_now_ref():0.0;
     float *oo = (float*)malloc((size_t)S*OG*OLR*sizeof(float));
 #ifdef DQ_BLAS
     /* ★OG 路 g 并行(2026-08-28)★ 本进程 OPENBLAS_NUM_THREADS=1(必须, 否则 bytes_moe 的
@@ -347,6 +353,7 @@ void dq_attention(const float *x, const float *wqa, const float *qnorm, const fl
     }
 #endif
     dq_matmul(oo, wo_b, out, S, OG*OLR, DIM);   /* [S,OG*OLR]@wo_b[DIM,OG*OLR].T */
+    if(g_bflt_on){ g_bflt[25]+=vqt_now_ref()-_o0; }
     free(qr);free(qra);free(kv);free(kva);free(oo);   /* q/o 属池, 不 free */
 }
 

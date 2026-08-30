@@ -418,10 +418,14 @@ static float *gs_forward_exit(int J,int Lend,const float*Hin,const long*ids,int 
     return H;
 }
 /* 每行前沿出口 L2 距离(per-token 反修目标用) */
-static void bf_rowdist(const float*H,const float*Htgt,int S,size_t rowsz,double*d){
-    double _t0=g_bflt_on?vqt_now():0.0;
+static void bf_rowdist(const float*H,const float*Htgt,int S,size_t rowsz,double*d,int dirn){
+    double _t0=g_bflt_on?vqt_now():0.0;   /* dirn=1: 行 rms 归一后距离(方向域, 与打分同口径) */
     for(int s=0;s<S;s++){ double e=0; const float*a=H+(size_t)s*rowsz,*b=Htgt+(size_t)s*rowsz;
-        for(size_t i=0;i<rowsz;i++){ double dd=(double)a[i]-b[i]; e+=dd*dd; } d[s]=e; }
+        double sa=1.0,sb=1.0;
+        if(dirn){ double na=0,nb=0;
+            for(size_t i=0;i<rowsz;i++){ na+=(double)a[i]*a[i]; nb+=(double)b[i]*b[i]; }
+            sa=1.0/sqrt(na/rowsz+1e-12); sb=1.0/sqrt(nb/rowsz+1e-12); }
+        for(size_t i=0;i<rowsz;i++){ double dd=(double)a[i]*sa-(double)b[i]*sb; e+=dd*dd; } d[s]=e; }
     if(g_bflt_on) g_bflt[8]+=vqt_now()-_t0;
 }
 /* β 信赖域混合: dst 系数 = (1−β)·old + β·fitted(特征参数 μ/σ/V8 不动, 只混系数) */

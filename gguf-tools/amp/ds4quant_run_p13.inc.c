@@ -170,9 +170,9 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
         GS_CAP_L=J;
         float*Hb=gs_forward_exit(J,eF,eHin,eIds,eS,eNf,NULL);
         GS_CAP_L=-1;
-        double base=co_score_rows(Hb,eTgt,SEV,nSEV,rowsz);
+        double base=co_score_rows(Hb,eTgt,SEV,nSEV,rowsz,1);
         { GS_CAP_L=J; base=bf_base_gate(J,base,&Hb,eF,eHin,eIds,eS,eNf,eTgt,SEV,nSEV,rowsz); GS_CAP_L=-1; if(!isfinite(base)){ free(Hb); mlog(J,"向前反修","base非有限(诊断已打)","跳过",0,"NaN闸","探索中"); done[J]=1; jd[J]=0; g_bflt_on=0; continue; } }   /* L11 NaN 实案闸(p3 bf_base_gate) */
-        bf_rowdist(Hb,eTgt,eS,rowsz,db); free(Hb);
+        bf_rowdist(Hb,eTgt,eS,rowsz,db,1); free(Hb);
         /* 行权系数 kk_s(2026-08-05 分类/感知布线): 行残差能量/行目标能量, clamp[0,4] */
         for(int s=0;s<eS;s++){ const float*b=eTgt+(size_t)s*rowsz; double tn=0;
             for(size_t i2=0;i2<rowsz;i2++) tn+=(double)b[i2]*b[i2];
@@ -192,8 +192,8 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
                 lf->ops[tmp].type=1; lf->ops[tmp].g=a; lf->nops++; undo=1; }
             else break;
             float*Hg=gs_forward_exit(J,eF,eHin,eIds,eS,eNf,NULL);
-            double sc=co_score_rows(Hg,eTgt,SEV,nSEV,rowsz); scg[gi]=sc;
-            bf_rowdist(Hg,eTgt,eS,rowsz,dg+(size_t)gi*S); free(Hg);
+            double sc=co_score_rows(Hg,eTgt,SEV,nSEV,rowsz,1); scg[gi]=sc;
+            bf_rowdist(Hg,eTgt,eS,rowsz,dg+(size_t)gi*S,1); free(Hg);
             if(sc<scA){ scA=sc; aA=a; }
             if(undo) lf->nops--; else lf->ops[tmp].g=baseg;
         }
@@ -208,7 +208,7 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
                   lf->ops[tmp].type=1; lf->ops[tmp].g=(float)av; lf->nops++; undo=1; }
               if(tmp>=0){
                   float*Hg=gs_forward_exit(J,eF,eHin,eIds,eS,eNf,NULL);
-                  double sc=co_score_rows(Hg,eTgt,SEV,nSEV,rowsz); free(Hg);
+                  double sc=co_score_rows(Hg,eTgt,SEV,nSEV,rowsz,1); free(Hg);
                   if(sc<scA){ scA=sc; aA=(float)av; }
                   if(undo) lf->nops--; else lf->ops[tmp].g=baseg;
               } } }
@@ -218,7 +218,7 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
         if(to>=0){ float t0v=lf->ops[to].t; const float TG[2]={0.94f,1.06f}; double scT[2];
             for(int ti=0;ti<2;ti++){ lf->ops[to].t=t0v*TG[ti];
                 float*Hg=gs_forward_exit(J,eF,eHin,eIds,eS,eNf,NULL);
-                double sc=co_score_rows(Hg,eTgt,SEV,nSEV,rowsz); free(Hg); scT[ti]=sc;
+                double sc=co_score_rows(Hg,eTgt,SEV,nSEV,rowsz,1); free(Hg); scT[ti]=sc;
                 if(sc<scB){ scB=sc; tB=t0v*TG[ti]; }
                 lf->ops[to].t=t0v; }
             double rv=bf_vertex(TG[0],scT[0],1.0,base,TG[1],scT[1]);
@@ -226,7 +226,7 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
             if(fabs(rv-1.0)>2e-3&&(tB==0||fabs(rv-(double)(tB/t0v))>2e-3)){
                 lf->ops[to].t=t0v*(float)rv;
                 float*Hg=gs_forward_exit(J,eF,eHin,eIds,eS,eNf,NULL);
-                double sc=co_score_rows(Hg,eTgt,SEV,nSEV,rowsz); free(Hg);
+                double sc=co_score_rows(Hg,eTgt,SEV,nSEV,rowsz,1); free(Hg);
                 if(sc<scB){ scB=sc; tB=t0v*(float)rv; }
                 lf->ops[to].t=t0v; } }
         /* per-token 连续目标 α*_s(抛物线顶点; 全部重解形态共用; 行域=粗筛行) */
@@ -266,7 +266,7 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
                 for(int bi=0;bi<3;bi++){
                     op_blend(&lf->ops[ze],&old,&fit,BB[bi]);
                     float*Hg=gs_forward_exit(J,eF,eHin,eIds,eS,eNf,NULL);
-                    double sc=co_score_rows(Hg,eTgt,SEV,nSEV,rowsz); free(Hg);
+                    double sc=co_score_rows(Hg,eTgt,SEV,nSEV,rowsz,1); free(Hg);
                     if(sc<scE){ scE=sc; opE=lf->ops[ze]; bE=BB[bi]; }
                     lf->ops[ze]=old;
                     if(scE<base-1e-9) break;           /* 已改善即止(基线语义) */
@@ -286,7 +286,7 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
                 zrefit_w(&opF,msf,nFV,FINf,effwf);
                 int tmp=lf->nops; lf->ops[tmp]=opF; lf->nops++;
                 float*Hg=gs_forward_exit(J,eF,eHin,eIds,eS,eNf,NULL);
-                scF=co_score_rows(Hg,eTgt,SEV,nSEV,rowsz); free(Hg);
+                scF=co_score_rows(Hg,eTgt,SEV,nSEV,rowsz,1); free(Hg);
                 lf->nops--;
             }
         }
@@ -438,10 +438,10 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
         if(nland){
             /* 统一终验: 冻结基线上全部落地 → 一次全程出口分 vs 进入时基线(HQE[Lfront+1]=反修态出口) */
             g_anc_rowmap=NULL;
-            double b0=co_score_rows(HQE+(size_t)(Lfront+1)*lstride,Htgt,LEV,nLEV,rowsz);
+            double b0=co_score_rows(HQE+(size_t)(Lfront+1)*lstride,Htgt,LEV,nLEV,rowsz,1);
             double b0kl=BKL_FPLP?bkl_exit_kl(HQE+(size_t)(Lfront+1)*lstride,rowsz):1e300;
             float*Hf=gs_forward_exit(Jlo,Lfront,HQE+(size_t)Jlo*lstride,ids,S,n_fit,NULL);
-            double fin=co_score_rows(Hf,Htgt,LEV,nLEV,rowsz);
+            double fin=co_score_rows(Hf,Htgt,LEV,nLEV,rowsz,1);
             double finkl=BKL_FPLP?bkl_exit_kl(Hf,rowsz):1e300; free(Hf);
             int keep=BKL_FPLP?(finkl<b0kl-1e-9):0;   /* 判据=held-KL; 闸拒臂时无落地可判(fail-closed) */
             printf("BF_ONEPASS 终验 落地=%d heldKL %.5f→%.5f(真尺判据) 出口分 %.5g→%.5g(对照) %s\n",

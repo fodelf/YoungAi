@@ -23,7 +23,7 @@
                 opC.w2p[2]=(float)mu; opC.w2p[3]=(float)sd;
                 int tmp=lf->nops; lf->ops[tmp]=opC; lf->nops++;
                 float*Hg=gs_forward_exit(J,eF,eHin,eIds,eS,eNf,NULL);
-                scC=co_score_rows(Hg,eTgt,SEV,nSEV,rowsz); free(Hg);
+                scC=co_score_rows(Hg,eTgt,SEV,nSEV,rowsz,1); free(Hg);
                 lf->nops--;
               } }
             free(fn);
@@ -48,7 +48,7 @@
                 else { go=lf->nops; memset(&lf->ops[go],0,sizeof(lop_t));
                     lf->ops[go].type=5; lf->ops[go].ge=geD; lf->nops++; }
                 float*Hg=gs_forward_exit(J,eF,eHin,eIds,eS,eNf,NULL);
-                scD=co_score_rows(Hg,eTgt,SEV,nSEV,rowsz); free(Hg);
+                scD=co_score_rows(Hg,eTgt,SEV,nSEV,rowsz,1); free(Hg);
                 if(gbak){ memcpy(lf->ops[go].ge,gbak,(size_t)NEXP*4); free(gbak); }   /* 复原 */
                 else { lf->nops--; }   /* 临时 op 移除(geD 保留待提交) */
             } else { free(geD); geD=NULL; }
