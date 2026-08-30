@@ -367,14 +367,11 @@ static void bytes_moe(lfile_t*lf,int S,const float*Fin,const int*idx,const float
         /* ★slot 清零必须无条件★: 放进 if(g_bmw_batched) 的话首块 dequant 失败=归约读脏数据。 */
         if(ec==0){ memset(BMW_BUF[nth].partial,0,(size_t)S*DIM*4);
                    memset(BMW_BUF[nth].partial_c,0,(size_t)S*DIM*4); }
-        g_bmw_batched=bmw_batch_dequant(lf,ec,ec1);
-        /* ★主线程试 GPU 批量(2026-08-29)★: 成功则本块专家一次算完, worker 拿不到活直接过
-         * 屏障; 失败则 worker 20 线程照旧 —— fallback 永远是满速多线程 CPU, 不是单线程。
-         * GPU 结果累加进 slot[nth](主线程私有), 归约时和 worker 的 20 条一起求和。 */
-        if(g_bmw_batched){
-            bmw_t gv={lf,S,Fin,idx,rw,NULL,BMW_BUF[nth].partial,ge,BMW_BUF[nth].partial_c,nth,0,NULL,0};
-            gdone=bmw_gpu_chunk(&gv,ec,ec1);
-        }
+        /* ★主线程 GPU 批量(2026-08-30 融合版重排)★: bdq 决策下沉进 bmw_gpu_chunk —
+         * fused 走通则整块免物化(g_bmw_batched=2); 否则其内部 bdq+cublas(=1); 再败
+         * worker 20 线程照旧(=1 时可别名物化缓冲, =0 时逐专家 dequant), 永不单线程。 */
+        { bmw_t gv={lf,S,Fin,idx,rw,NULL,BMW_BUF[nth].partial,ge,BMW_BUF[nth].partial_c,nth,0,NULL,0};
+          gdone=bmw_gpu_chunk(&gv,ec,ec1); }
 #else
         g_bmw_e0=ec;
 #endif

@@ -437,4 +437,5 @@ extern "C" int vqg_alloc_managed(void **p, size_t bytes) {
 
 /* attention 整层驻留 GPU 的实现(2026-08-28 拆出): 单 TU 语义, 见 vq_gpu_attn.inc.cu */
 #include "vq_gpu_attn.inc.cu"
-#include "vq_gpu_moe.inc.cu"   /* 批量专家前向(sweep GPU 化) */
+#include "vq_gpu_moe.inc.cu"
+#include "vq_gpu_moefused.inc.cu"   /* VQ-fused 批量专家(dequant 融进 GEMM), 依赖 moe 分片的池与流 */   /* 批量专家前向(sweep GPU 化) */
