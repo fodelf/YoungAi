@@ -191,9 +191,8 @@ static double bf_base_gate(int J,double base,float**Hb,int eF,const float*eHin,c
            J,base,nanr,eS,zr); fflush(stdout);
     free(*Hb); *Hb=gs_forward_exit(J,eF,eHin,eIds,eS,eNf,NULL);
     double b2=co_score_rows(*Hb,eTgt,SEV,nSEV,rowsz,1);
-    if(isfinite(b2)) printf("★[BF诊断] L=%02d 复跑base=%.6g 有限 → ★瞬态实锤(嫌疑=GB10托管内存)★ 单元以复跑值继续\n",J,b2);
-    else             printf("★[BF诊断] L=%02d 复跑base=%g 仍非有限 → 确定性异常, 单元跳过\n",J,b2);
-    fflush(stdout);
+    printf(isfinite(b2)?"★[BF诊断] L=%02d 复跑base=%.6g 有限 → ★瞬态实锤(嫌疑=GB10托管内存)★ 单元以复跑值继续\n"
+                        :"★[BF诊断] L=%02d 复跑base=%g 仍非有限 → 确定性异常, 单元跳过\n",J,b2); fflush(stdout);
     return b2;
 }
 
