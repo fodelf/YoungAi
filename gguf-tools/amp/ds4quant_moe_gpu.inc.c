@@ -18,7 +18,7 @@ extern int vqg_moe_batch_fused(const uint8_t*,const vqg_fj*,const float*,const f
 static int bmw_gpu_chunk(bmw_t *w, int e0, int e1)
 {
     lfile_t *lf=w->lf; const int S=w->S, nE=e1-e0;
-    extern float *g_bmw_buf; extern int g_bmw_e0;
+    extern float *g_bmw_buf; extern int g_bmw_batched;   /* 定义在 p4 本 include 之后(同 TU) */
     g_bmw_batched=0;
     if(nE<1||!lf->vqmap) return 0;                       /* 非 VQ 层: CPU 逐专家 */
     /* ★全量行(非抽格)保持原两级(2026-08-29 实测: 大 nt 时 dq_matmul 原路本就 GPU, 批量版
