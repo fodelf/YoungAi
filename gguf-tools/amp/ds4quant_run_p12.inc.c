@@ -87,6 +87,85 @@ static float *gs_forward_from(int L0,const float *Hin,const long*ids,int S,int n
     free(H);
     return lg;
 }
+/* ★held-KL 落地闸(2026-08-30 用户令"不应该出现质量下降")★ 实锤: 22 落地自家终验+13.2%
+ * 而 wt2 官方尺五项全负且尾部先毁(KLD p95 +9%)。三层口径错位: ①选型行=自家拟合语料
+ * ②判据=隐藏态 co_score(不过 head — 投影洗掉/背叛 logits, fable5 已有判例) ③近视野窗外
+ * 伤害不可见。修法=钱袋口换真尺: 放行复核与 ONEPASS 终验改判 held 抽格行(选型未染指)
+ * 全程出口→head→对 FP logits 的行均 KL, 不降即拒; 粗筛仍 co_score(便宜)。FP 参考=锚出口
+ * hidden 过同一 head; 初始化自检打 held-FP-PPL, 量级不对(槽位语义错位)即拒臂 —— 拒臂
+ * fail-closed: 一律拒落地, sweep 退化为零落地=③态原样, 宁可不赚不许亏(质量门铁律)。 */
+static int BKL_N=0; static int *BKL_ROWS=NULL; static long *BKL_IDS=NULL;
+static float *BKL_FPLP=NULL, *BKL_HTG=NULL;   /* FP log-prob [N,VOCAB] / FP 出口 hidden [N,rowsz] */
+typedef struct { const float*lg; int r0,r1; double kl; } bklw_t;
+static void *bkl_worker(void*a){
+    bklw_t*w=a; double kl=0;
+    for(int r=w->r0;r<w->r1;r++){
+        const float*q=w->lg+(size_t)r*VOCAB; const float*f=BKL_FPLP+(size_t)r*VOCAB;
+        float m=q[0]; for(int v=1;v<VOCAB;v++) if(q[v]>m) m=q[v];
+        double se=0; for(int v=0;v<VOCAB;v++) se+=exp((double)q[v]-m);
+        double ls=log(se),krow=0;
+        for(int v=0;v<VOCAB;v++){ double pf=exp((double)f[v]);
+            if(pf>1e-12) krow+=pf*((double)f[v]-((double)q[v]-m-ls)); }
+        kl+=krow;
+    }
+    w->kl=kl; return NULL;
+}
+static double bkl_eval(const float*lg){   /* 学生 logits → 对 FP 的行均 KL(nats), 行独立线程化 */
+    int nth=NTHREADS>1?NTHREADS:8; if(nth>BKL_N)nth=BKL_N; if(nth>32)nth=32;
+    bklw_t w[32]; pthread_t th[32];
+    for(int t=0;t<nth;t++){ w[t]=(bklw_t){lg,BKL_N*t/nth,BKL_N*(t+1)/nth,0}; pthread_create(&th[t],NULL,bkl_worker,&w[t]); }
+    double kl=0; for(int t=0;t<nth;t++){ pthread_join(th[t],NULL); kl+=w[t].kl; }
+    return kl/(BKL_N>0?BKL_N:1);
+}
+static float *bkl_head(const float*Hex){   /* 出口 hidden[N,rowsz] → logits[N,VOCAB](调用方 free) */
+    if(!GS_HW){ GS_HCFN=st_read_weight(&C,"hc_head_fn",NULL,NULL); GS_HCB=st_read_weight(&C,"hc_head_base",NULL,NULL);
+        GS_HCS=st_read_weight(&C,"hc_head_scale",NULL,NULL); GS_NORM=st_read_weight(&C,"norm.weight",NULL,NULL);
+        GS_HW=st_read_weight(&C,"head.weight",NULL,NULL); }
+    float *lg=malloc((size_t)BKL_N*VOCAB*4);
+    head_fwd((float*)Hex,BKL_N,GS_HCFN,GS_HCB,GS_HCS,GS_NORM,GS_HW,lg);
+    return lg;
+}
+static int bkl_init(const float*Htgt,const long*ids,int S,int n_fit,size_t rowsz){
+    if(BKL_FPLP) return 1;
+    int h0=n_fit,hn=S-1-h0; if(hn<8) return 0;      /* held [n_fit,S-1): 与收官 VERDICT 同域 */
+    int step=hn>512?hn/512:1;
+    BKL_ROWS=malloc(sizeof(int)*(size_t)(hn/step+2)); BKL_IDS=malloc(sizeof(long)*(size_t)(hn/step+2));
+    BKL_N=0; for(int r=h0;r<h0+hn;r+=step){ BKL_ROWS[BKL_N]=r; BKL_IDS[BKL_N]=ids[r]; BKL_N++; }
+    BKL_HTG=malloc((size_t)BKL_N*rowsz*4);
+    for(int i=0;i<BKL_N;i++) memcpy(BKL_HTG+(size_t)i*rowsz,Htgt+(size_t)BKL_ROWS[i]*rowsz,rowsz*4);
+    float *lgf=bkl_head(BKL_HTG);
+    double nllf=0;   /* 原地转 log-prob + FP-PPL 自检(单线程一次性, ~1.3亿元素) */
+    for(int i=0;i<BKL_N;i++){ float*q=lgf+(size_t)i*VOCAB;
+        float m=q[0]; for(int v=1;v<VOCAB;v++) if(q[v]>m) m=q[v];
+        double se=0; for(int v=0;v<VOCAB;v++) se+=exp((double)q[v]-m);
+        float ls=(float)log(se);
+        for(int v=0;v<VOCAB;v++) q[v]=q[v]-m-ls;
+        nllf+=-(double)q[(int)ids[BKL_ROWS[i]+1]];  }
+    double pplf=exp(nllf/BKL_N);
+    printf("[BKL] held-KL 闸: 行=%d FP-PPL=%.4f (对账: 应与收官 VERDICT fp 同量级; 错位即拒臂)\n",BKL_N,pplf);
+    fflush(stdout);
+    if(!(pplf>1.2&&pplf<2000.0)){ printf("[BKL]★FP-PPL 量级异常 → 拒臂(fail-closed: 全部拒落地)★\n");
+        free(lgf); free(BKL_ROWS); free(BKL_IDS); free(BKL_HTG); BKL_ROWS=NULL; BKL_IDS=NULL; BKL_HTG=NULL; BKL_N=0; return 0; }
+    BKL_FPLP=lgf; return 1;
+}
+static double bkl_gate(int J,int Lfront,const float*Hin,size_t rowsz,int Sfull,double*hs){
+    /* 复核一击: 从 HQE[J] gather held 行 → 全程回放 → head → KL; hs 回传隐分(仅日志) */
+    float *hb=malloc((size_t)BKL_N*rowsz*4);
+    for(int i=0;i<BKL_N;i++) memcpy(hb+(size_t)i*rowsz,Hin+(size_t)BKL_ROWS[i]*rowsz,rowsz*4);
+    const int *sv=g_anc_rowmap; int svs=g_anc_rowstride;
+    g_anc_rowmap=BKL_ROWS; g_anc_rowstride=Sfull;
+    float *Hx=gs_forward_exit(J,Lfront,hb,BKL_IDS,BKL_N,BKL_N,NULL);
+    g_anc_rowmap=sv; g_anc_rowstride=svs; free(hb);
+    float *lg=bkl_head(Hx); double kl=bkl_eval(lg); free(lg);
+    if(hs)*hs=co_score(Hx,BKL_HTG,0,BKL_N,rowsz);
+    free(Hx); return kl;
+}
+static double bkl_exit_kl(const float*Hex,size_t rowsz){   /* 终验用: 全 S 出口 hidden → held KL */
+    float *hg=malloc((size_t)BKL_N*rowsz*4);
+    for(int i=0;i<BKL_N;i++) memcpy(hg+(size_t)i*rowsz,Hex+(size_t)BKL_ROWS[i]*rowsz,rowsz*4);
+    float *lg=bkl_head(hg); double kl=bkl_eval(lg); free(hg); free(lg);
+    return kl;
+}
 /* ★真·反修前层(判据=最终输出 KL, 全局联合最优)★
  * 第 L 层的 z 系数用【最终 logits KL】重解, 不再只往文件尾巴粘标量:
  *   每 token 搜最优 routed 乘子 m_s* → 目标系数 new_c=m_s*·cur_c → 同特征最小二乘重拟合 →

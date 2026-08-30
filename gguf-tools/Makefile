@@ -57,7 +57,8 @@ TRAJ_INC := $(wildcard $(CAL)/traj_analyze_p*.inc.c)
 HFREAD_INC := $(wildcard $(CAL)/hf_read_p*.inc.c)
 VQMERGE_INC := $(wildcard $(QZ)/vq_merge_v4_p*.inc.c)
 ZLAYER_INC := $(wildcard $(AMP)/zlayer_p*.inc.c)
-DSQRUN_INC := $(wildcard $(AMP)/ds4quant_run_p*.inc.c) $(AMP)/ds4quant_anchor.inc.c
+DSQRUN_INC := $(wildcard $(AMP)/ds4quant_run_p*.inc.c) $(AMP)/ds4quant_anchor.inc.c \
+              $(AMP)/ds4quant_moe_gpu.inc.c $(AMP)/ds4quant_zreplay.inc.c $(AMP)/ds4quant_bfkernel.inc.c $(AMP)/ds4quant_sweep_arms.inc.c
 
 ifeq ($(UNAME_S),Darwin)
 NATIVE ?= -mcpu=native

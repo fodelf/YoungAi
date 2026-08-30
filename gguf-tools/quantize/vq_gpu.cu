@@ -413,6 +413,10 @@ extern "C" int vqg_dequant_batch(const uint8_t *base, float *dst_base,
     return cudaStreamSynchronize(st) == cudaSuccess;
 }
 
+extern "C" int vqg_host_alloc(void **p, size_t bytes) {   /* 钉页宿主内存: DMA 满带宽(pageable 走 staging 慢 3-5x) */
+    return cudaMallocHost(p, bytes) == cudaSuccess;
+}
+extern "C" void vqg_host_free(void *p) { cudaFreeHost(p); }
 extern "C" int vqg_alloc_managed(void **p, size_t bytes) {
     if (cudaMallocManaged(p, bytes) != cudaSuccess) return 0;
     /* ★把首选驻留地钉在 GPU★(2026-08-28): 这块 26GiB 是批 dequant 的目的地, 写方是 GPU

@@ -218,10 +218,22 @@ static void *dq_wog_worker(void*a_){
     return NULL;
 }
 #endif
+static int ATT_PIN=0;   /* 1=cudaMallocHost 钉页(2026-08-30 BFLT: attn核桶里 q/o 各 67MB/调用往返) */
 static void att_pool(size_t n){
-    if(ATT_N==n) return;
+    if(ATT_N>=n) return;   /* cap 语义: 够大就复用(粗筛512/复核行交替不毁建) */
+#ifdef DS4QUANT_CUDA
+    extern int vqg_host_alloc(void**,size_t); extern void vqg_host_free(void*);
+    if(ATT_PIN){ vqg_host_free(ATT_Q); vqg_host_free(ATT_O); } else { free(ATT_Q); free(ATT_O); }
+    ATT_Q=ATT_O=NULL;
+    if(vqg_host_alloc((void**)&ATT_Q,n*sizeof(float))&&vqg_host_alloc((void**)&ATT_O,n*sizeof(float))) ATT_PIN=1;
+    else { static int _w=0; if(!_w++) fprintf(stderr,"[att] ★钉页失败 → 普通 malloc★\n");
+        if(ATT_Q){ vqg_host_free(ATT_Q); }
+        ATT_Q=(float*)malloc(n*sizeof(float)); ATT_O=(float*)malloc(n*sizeof(float)); ATT_PIN=0; }
+#else
     free(ATT_Q); free(ATT_O);
-    ATT_Q=(float*)malloc(n*sizeof(float)); ATT_O=(float*)malloc(n*sizeof(float)); ATT_N=n;
+    ATT_Q=(float*)malloc(n*sizeof(float)); ATT_O=(float*)malloc(n*sizeof(float));
+#endif
+    ATT_N=n;
 }
 void dq_attention(const float *x, const float *wqa, const float *qnorm, const float *wqb,
                   const float *wkv, const float *kvnorm, const float *sink,
