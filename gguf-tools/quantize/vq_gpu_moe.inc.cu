@@ -19,6 +19,7 @@
  * 原 CPU 路径 —— 那条路逐字节不变, 不是"兜底近似"。 */
 
 #include <cublas_v2.h>
+extern "C" void vqg_last_err(const char *tag);   /* 文件作用域声明(函数体内放 extern"C" 是编译错) */
 
 static cublasHandle_t g_moe_h = NULL;
 static cudaStream_t   g_moe_s = NULL;
@@ -103,7 +104,7 @@ extern "C" int vqg_moe_batch(const float *Wbuf, const float *Xpad, const float *
                   dWt = g_moe_W; }
         const int T = 256; const size_t nblk = (nh + T - 1) / T;
         moe_swiglu_kernel<<<(unsigned)nblk, T, 0, g_moe_s>>>(g_moe_G, g_moe_U, dWt, ntmax, MOEI, nh, swlim);
-        { extern "C" void vqg_last_err(const char*); vqg_last_err("moe_swiglu后"); } }
+        vqg_last_err("moe_swiglu后"); }
     { cublasStatus_t st = MOE_GEMM(Wbuf + (size_t)2*DIM*MOEI, g_moe_G, g_moe_Y, DIM, ntmax, MOEI, sW, sH, sX); if (st != CUBLAS_STATUS_SUCCESS) MOE_FAIL("gemm", st); }
     #undef MOE_GEMM
     { cudaError_t e = cudaMemcpyAsync(Ypad, g_moe_Y, nx * sizeof(float), cudaMemcpyDeviceToHost, g_moe_s);
