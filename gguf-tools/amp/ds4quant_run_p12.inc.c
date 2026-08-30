@@ -65,13 +65,13 @@ static float *gs_forward_from(int L0,const float *Hin,const long*ids,int S,int n
     float *H=malloc(lstride*4); memcpy(H,Hin,lstride*4);
     for(int L=L0;L<NLAYERS;L++){
         if(Hcache) memcpy(Hcache+(size_t)L*lstride,H,lstride*4);
-        if(GS_LW&&GS_LW[L].loaded){ LW T=lwh_expand(&GS_LW[L]);
+        if(GS_LW&&GS_LW[L].loaded){ LW*_c32=lw32_get(L,&GS_LW[L]); LW T=_c32?*_c32:lwh_expand(&GS_LW[L]);
             if(getenv("DS4_GS_DIAG")){ fprintf(stderr,"[回扫诊断] L%d cache态 t2ei=%p 缺字段:",L,(void*)T.t2ei);
 #define XN(f) if(!T.f) fprintf(stderr," %s",#f);
                 LWF_LIST(XN)
 #undef XN
                 fprintf(stderr," <end>\n"); }
-            layer_fwd(L,&T,H,ids,S,n_fit,1,'B',NULL); free_layer(&T); }   /* ★fp16缓存展开★ */
+            layer_fwd(L,&T,H,ids,S,n_fit,1,'B',NULL); if(!_c32) free_layer(&T); }   /* ★fp16缓存展开(lw32 常驻优先)★ */
         else { LW W=load_layer(L);
             if(getenv("DS4_GS_DIAG")) fprintf(stderr,"[回扫诊断] L%d 重载态 t2ei=%p gate=%p ids=%p rowmap=%p\n",
                     L,(void*)W.t2ei,(void*)W.gate,(const void*)ids,(void*)g_anc_rowmap);
@@ -316,9 +316,11 @@ static float *gs_forward_exit(int J,int Lend,const float*Hin,const long*ids,int 
     float *H=malloc(lstride*4); memcpy(H,Hin,lstride*4);
     for(int L=J;L<=Lend;L++){
         if(HQcache) memcpy(HQcache+(size_t)L*lstride,H,lstride*4);   /* 层 L 入口 */
-        double _x0=g_bflt_on?vqt_now():0.0; LW T=GS_LW[L].loaded?lwh_expand(&GS_LW[L]):load_layer(L); if(g_bflt_on) g_bflt[11]+=vqt_now()-_x0;   /* fp16 展开; 被驱逐层临时从 HF 重载; 展开翻炒入单元账[11] */
+        double _x0=g_bflt_on?vqt_now():0.0; LW*_c32=GS_LW?lw32_get(L,&GS_LW[L]):NULL;   /* 驱逐层也先问缓存 */
+        LW T; if(_c32) T=*_c32; else T=GS_LW[L].loaded?lwh_expand(&GS_LW[L]):load_layer(L);
+        if(g_bflt_on) g_bflt[11]+=vqt_now()-_x0;   /* fp16 展开(lw32 命中≈0); 被驱逐层临时从 HF 重载 */
         layer_fwd(L,&T,H,ids,S,n_fit,1,'B',NULL);
-        free_layer(&T);
+        if(!_c32) free_layer(&T);
     }
     if(HQcache) memcpy(HQcache+(size_t)(Lend+1)*lstride,H,lstride*4); /* Lend 出口 */
     return H;

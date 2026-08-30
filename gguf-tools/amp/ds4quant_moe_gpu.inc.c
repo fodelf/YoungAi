@@ -48,9 +48,25 @@ static int bmw_gpu_chunk(bmw_t *w, int e0, int e1)
     if(ntmax<1){ free(nt); return 1; }
     const size_t npad=(size_t)nE*ntmax;
     if((double)npad*DIM*4.0*2.0 > 8.0e9){ free(nt); return 0; }   /* 补齐太胖: 让 CPU 路接 */
-    float *Xp=(float*)calloc(npad*DIM,4), *Yp=(float*)malloc(npad*(size_t)DIM*4);
-    float *Wt=(float*)calloc(npad,4);  int *tk=(int*)malloc(npad*sizeof(int));
-    if(!Xp||!Yp||!Wt||!tk){ free(nt);free(Xp);free(Yp);free(Wt);free(tk); return 0; }
+    /* ★钉页常驻暂存(2026-08-30 BFLT: gemm 桶 23s/单元)★ 原每 chunk calloc/free 10MB×2:
+     * 页表毁建+pageable 拷贝走 staging(慢 3-5×)。改 cudaMallocHost 常驻只增不缩; Xp 补齐行
+     * 内容任意(头注原文), 无需清零; Wt 补齐槽必须 0 → 每次全段 memset(npad×4, KB 级)。
+     * 单线程调用(主线程批量路), 静态无竞争; 钉页失败大声回退普通 malloc(不静默)。 */
+    static float *Xp=NULL,*Yp=NULL,*Wt=NULL; static int *tk=NULL; static size_t _xc=0,_wc=0; static int _pin=-1;
+    if(_xc<npad*(size_t)DIM){
+        if(_pin==1){ cudaFreeHost(Xp); cudaFreeHost(Yp); } else { free(Xp); free(Yp); }
+        Xp=Yp=NULL; _xc=0;
+        if(cudaMallocHost((void**)&Xp,npad*(size_t)DIM*4)==cudaSuccess&&
+           cudaMallocHost((void**)&Yp,npad*(size_t)DIM*4)==cudaSuccess) _pin=1;
+        else { if(Xp){cudaFreeHost(Xp);Xp=NULL;} static int _w9=0; if(!_w9++) fprintf(stderr,"[moe-gpu] ★钉页分配失败 → 普通 malloc 暂存★\n");
+               Xp=(float*)malloc(npad*(size_t)DIM*4); Yp=(float*)malloc(npad*(size_t)DIM*4); _pin=0; }
+        if(Xp&&Yp) _xc=npad*(size_t)DIM;
+    }
+    if(_wc<npad){ if(_pin==1&&Wt){cudaFreeHost(Wt);} else free(Wt); free(tk); Wt=NULL; tk=NULL; _wc=0;
+        if(_pin!=1||cudaMallocHost((void**)&Wt,npad*4)!=cudaSuccess) Wt=(float*)malloc(npad*4);
+        tk=(int*)malloc(npad*sizeof(int)); if(Wt&&tk) _wc=npad; }
+    if(!Xp||!Yp||!Wt||!tk){ free(nt); return 0; }
+    memset(Wt,0,npad*4);
     /* gather: 与原 worker 同序(按 s 升序, 每 token 取首个命中的槽) */
     int *fill=(int*)calloc((size_t)nE,sizeof(int));
     for(int s=0;s<S;s++) for(int a=0;a<NACT_RT;a++){
@@ -80,7 +96,7 @@ static int bmw_gpu_chunk(bmw_t *w, int e0, int e1)
                 const float *yi=Yp+((size_t)j*ntmax+i)*DIM;
                 for(int d=0;d<DIM;d++) dst[d]+=yi[d]; } } }
     if(ok&&g_bflt_on) g_bflt[19]+=vqt_now()-_s0;
-    free(nt);free(fill);free(Xp);free(Yp);free(Wt);free(tk);
+    free(nt);free(fill);   /* Xp/Yp/Wt/tk 常驻(见上) */
     return ok;
 }
 #endif

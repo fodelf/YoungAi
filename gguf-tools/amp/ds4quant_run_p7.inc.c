@@ -44,6 +44,25 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
      * 输出无人消费。跳过条件与覆盖条件逐字相同 ⇒ 覆盖后字节不变。NACT_RT>NACT(rroute
      * 加宽)时尾槽无人覆盖, 不跳(保原行为)。只跳 hash 分支: score 分支带 RB Δb 采集寄生。 */
     const int rt_ov=do_quant&&ANC_OK&&(getenv("DS4_ANCHOR_ROUTE")||BF_ANCROUTE)&&NACT_RT==NACT;
+    /* ★路由缓存(2026-08-30 BFLT 二级账定谳)★ gate 跳过后路由段仍 16s/单元 ⇒ 真大头是
+     * override 循环对 30GB 锚 mmap 的重复随机读(页被逐→每次前向重缺页)。idx/rw 在 rt_ov
+     * 态下是 (L,rowmap,S) 纯函数且抽格行集全 sweep 固定 → 首访算一次存 RAM(粗筛512+复核
+     * 1920 两路×43层≈5MB), 后续 memcpy, 值逐字节同。全量行/量化遍(rowmap=NULL)不缓存。
+     * 键含首尾行号防指针复用假命中(旧逐前沿模式 sidx 会重建, 现役终局模式只建一次)。 */
+    static const int *rtc_map[2]={0,0}; static int rtc_S[2]={0,0}, rtc_ab[2][2];
+    static int *rtc_idx[2][64]; static float *rtc_rw[2][64];
+    int rtw=-1;
+    if(rt_ov&&g_anc_rowmap&&L<64){
+        for(int w2=0;w2<2;w2++)
+            if(rtc_map[w2]==g_anc_rowmap&&rtc_S[w2]==S&&rtc_ab[w2][0]==g_anc_rowmap[0]&&rtc_ab[w2][1]==g_anc_rowmap[S-1]){ rtw=w2; break; }
+        if(rtw<0) for(int w2=0;w2<2;w2++) if(!rtc_map[w2]){
+            rtc_map[w2]=g_anc_rowmap; rtc_S[w2]=S; rtc_ab[w2][0]=g_anc_rowmap[0]; rtc_ab[w2][1]=g_anc_rowmap[S-1]; rtw=w2; break; }
+        if(rtw>=0&&rtc_idx[rtw][L]){
+            memcpy(idx,rtc_idx[rtw][L],(size_t)S*NACT*sizeof(int));
+            memcpy(rw, rtc_rw[rtw][L], (size_t)S*NACT*4);
+            goto rt_done;   /* 命中: gate+锚 override 全免, 字节同 */
+        }
+    }
     if(W->t2ei){ static int hbn=0;
         if(!hbn&&do_quant){ hbn=1;
             fprintf(stderr,"[路由] tid2eid 哈希路由生效(0731 原生): 专家选择=token 哈希表, 结构性零漂移;\n"
@@ -164,6 +183,11 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
             memcpy(rw+(size_t)s*NACT, rbase+(size_t)src*NACT, (size_t)NACT*4);
         }
     }
+    if(rtw>=0&&!rtc_idx[rtw][L]){   /* 路由缓存回填(miss 后) */
+        rtc_idx[rtw][L]=malloc((size_t)S*NACT*sizeof(int)); rtc_rw[rtw][L]=malloc((size_t)S*NACT*4);
+        memcpy(rtc_idx[rtw][L],idx,(size_t)S*NACT*sizeof(int)); memcpy(rtc_rw[rtw][L],rw,(size_t)S*NACT*4);
+    }
+rt_done:
     if(GS_CAP_L==L&&GS_IDXC&&GS_RWC){   /* ★反修 GE 投影: 捕获目标层实际路由(命中+权重)★ */
         memcpy(GS_IDXC,idx,(size_t)S*NACT*sizeof(int));
         memcpy(GS_RWC,rw,(size_t)S*NACT*4);

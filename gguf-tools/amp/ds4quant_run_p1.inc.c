@@ -275,6 +275,36 @@ static void lwh_free(LWH*H){
     if(H->t2ei) free(H->t2ei);
     memset(H,0,sizeof(*H));
 }
+/* ★fp32 展开缓存(2026-08-30 BFLT 定谳)★ sweep 单元 attn核 24s 的真因: lwh_expand 每次
+ * 前向展开完就 free ⇒ dq_matmul 对普通 malloc 权重(!wdev)每调用 H2D 重传 ~0.3GB。
+ * 改成每层展开一次进 managed 单板(vqg_alloc_managed: preferred-GPU+prefetch), cuBLAS
+ * 直读零拷贝, 页首触后常驻。0.43GB/层×43=18.7GB, 分配失败则大声回退逐调用展开(不静默)。
+ * 前提已核: layer_fwd 对 W-> 零写(权重只读), fp16 母本不变 ⇒ 缓存永不过期。 */
+static LW *lw32_get(int L,const LWH*H){
+    static LW c[64]; static char ok[64], fail=0;
+    if(L>=64) return NULL;
+    if(ok[L]) return &c[L];   /* 命中判定先于 loaded 守卫: fp16 母本被预算驱逐后缓存仍有效(展开自不变 fp16, 免 HF 重载) */
+    if(fail||!H->loaded) return NULL;
+    size_t tot=0;
+#define XS(f) tot+=(size_t)H->n_##f;
+    LWF_LIST(XS)
+#undef XS
+    float *slab=NULL;
+    size_t bytes=tot*4+(H->t2ei?(size_t)VOCAB*NACT*sizeof(int):0);
+#ifdef DS4QUANT_CUDA
+    { extern int vqg_alloc_managed(void**,size_t);
+      if(!vqg_alloc_managed((void**)&slab,bytes)) slab=NULL; }
+#else
+    slab=malloc(bytes);
+#endif
+    if(!slab){ if(!fail){ fail=1; fprintf(stderr,"[lw32] ★managed 分配失败(L%02d, %.2fGB/层) → 回退逐调用展开★\n",L,bytes/1073741824.0); } return NULL; }
+    float *p=slab; LW W={0};
+#define XE(f) if(H->f){ W.f=p; for(long i=0;i<H->n_##f;i++) p[i]=go1b_fp16_to_fp32(H->f[i]); p+=H->n_##f; }
+    LWF_LIST(XE)
+#undef XE
+    if(H->t2ei){ W.t2ei=(int*)p; memcpy(W.t2ei,H->t2ei,(size_t)VOCAB*NACT*sizeof(int)); }
+    c[L]=W; ok[L]=1; return &c[L];
+}
 static LWH *GS_LW=NULL;        /* 回扫/反修: 全43层骨干 fp16 缓存(只加载一次, 前向按层临时展开) */
 /* ★内存卫兵★: 实测斜率 0.281GB/层(fp16 0.217 + 杂项), 外推 L38 必撞 11.5G 看门狗 →
  * 超预算(DS4_BF_MEMGB, 默认9.5)驱逐最低层号的 fp16 缓存; 被驱逐层前向时临时从 HF 重载(慢~0.6s/访, 换到头)。*/
