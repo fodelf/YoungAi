@@ -7732,3 +7732,38 @@ sweep 单层 ~105s 的真因: 抽格(SDIV=12)后每专家只分到 nt≈12 token
 "已停"就走, ★没用 pgrep 验证★ —— 进程在 mmap 缺页风暴里(D 态)对 SIGTERM 无响应,
 pkill 形同虚设。恢复靠反复 kill -9(SIGKILL 不可忽略)。
 ★教训(硬规矩)★: 杀进程必须 kill -9 + pgrep 验证为空才算停; 任何重发前先验旧进程死透。
+
+## 2026-08-30 ★sweep 慢 9 倍连根拔除: band kernel 共享内存错位(sticky CUDA 错误)★
+
+用户三问("哪有这么慢"/"从来没这么慢过"/"128G 设备为什么内存紧")逼出三层真因, 全修:
+
+### 定位链(逐层剥洋葱)
+1. 单元 950s(历史 105s): 拆账 → `batched=0` 全程, 前向 20 线程纯 CPU(500s 墙钟/单元)
+2. 翻转点 = 首次 1920 行复核前向后, batched 永不恢复
+3. 粘连错误 `misaligned address` = **sticky**(context 报废, cudaGetLastError 清不掉)
+   ⇒ 此后同进程一切 CUDA 调用永久失败 —— "永不恢复"的机制
+4. 层层装弹(bdq 4 个 return 0/各 kernel 检查点/三 GEMM 回落点)排除自家嫌疑
+5. ★代码审查命中★: `vqg_attn_band_kernel` 共享内存布局
+   `float[HD] + float[WIN+Sc] + float[TPB] + double[TPB]`
+   double 段偏移=(HD+WIN+Sc+TPB)×4; **Sc=S/128+2 为奇数时错位 4 字节**。
+   S=8192→Sc=66(偶)/512→6(偶) 从未暴露; 复核前缀 S=1920→Sc=17(奇) 首踩。
+6. sanitizer 佐证插曲: 报 vqg_dequant_batch_kernel 1 字节越界 = **ATS 假阳性**
+   (GB10 ATS 直读 host mmap, sanitizer 不认识 mmap 区域; 1 字节读不可能 misalign)
+
+### 修复(vq_gpu_attn.inc.cu 双侧 8 字节圆整)
+kernel: `_off=((shm+TPB-bsh)*4+7)&~7; shd=(double*)((char*)bsh+_off)`
+host:   `shbytes=((float段+7)&~7)+TPB*8` —— 任何 S 安全。
+
+### 验证(干净 4 层针)
+batched 95 次全 1 / 粘连 0 / 1920 复核踩 10 次无恙;
+**BFUNIT L=02 保持 37s / L=01 落地 51s** —— 比历史 105s 还快 2-3 倍, 拒假收真行为不变。
+
+### 同场修的另两笔
+- glibc arena 滞留: 复核 30MB 级高频 malloc/free 在 1GB MMAP_THRESHOLD(护 fp16 层缓存的
+  历史设定, 不能动)下不还 OS → 每 sweep 单元收尾 `malloc_trim(0)`
+- bmw_pool 毁建: `==S`→`>=S` cap 语义(粗筛512/复核1920交替不再重建 21 slot)
+
+### 教训入库
+- sticky CUDA 错误(misaligned/illegal address)= context 级, 静默回落路径会把它养成
+  "永久掉 CPU 却零报错"; 回落必须打印 + 定位期用 CUDA_LAUNCH_BLOCKING/sanitizer
+- 诊断包装脚本的还原不能挂在会被 kill 的守候尾部(本次 sanitizer 包装漏还原, 反而因祸得福)
