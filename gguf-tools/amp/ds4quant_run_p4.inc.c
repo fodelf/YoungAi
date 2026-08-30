@@ -57,7 +57,6 @@ static void *bmw_reduce_worker(void*a){
     return NULL;
 }
 #include "ds4quant_moe_gpu.inc.c"   /* GPU 批量专家路(500 行守卫所迫的物理分片) */
-
 static void *bytes_moe_worker(void*a){
     const int _ti=(int)(intptr_t)a;
   for(;;){
