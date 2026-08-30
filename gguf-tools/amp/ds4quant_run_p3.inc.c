@@ -157,6 +157,29 @@ static double co_score_rows(const float*Hq,const float*Hf,const int*rows,int nr,
     double v=co_score(ga,gb,0,nr,rowsz);
     free(ga); free(gb); if(g_bflt_on) g_bflt[8]+=vqt_now()-_t0; return v;
 }
+/* ★base 非有限闸(2026-08-30 L11 实案)★ champ86amp sweep 34 单元炸 1 次: base 遍前向内
+ * 产生 NaN(zdiag |z|/|routed| 打 0.0000 是 nf>0 对 NaN 为假的掩码), 污染链 = NaN base →
+ * bf_vertex→ms→zrefit 拟出 NaN 系数→形态E/F 两遍 NaN 前向全废, Δbest=+nan% 假"保持"。
+ * 单发+只在 fresh-dequant 首遍 ⇒ 头号嫌疑 GB10 托管内存瞬态, 日志无法定谳。此闸不是兜底:
+ * ①打印 NaN行/全零行 取证 ②复跑一次当场判"瞬态(复跑有限, 用有效值继续)/确定性(仍非有限,
+ * 跳过单元防污染)" —— 每次触发都留完整证据链。 */
+static float *gs_forward_exit(int J,int Lend,const float*Hin,const long*ids,int S,int n_fit,float*HQcache);
+static double bf_base_gate(int J,double base,float**Hb,int eF,const float*eHin,const long*eIds,
+                           int eS,int eNf,const float*eTgt,const int*SEV,int nSEV,size_t rowsz){
+    if(isfinite(base)) return base;
+    size_t nanr=0,zr=0;
+    for(int s=0;s<eS;s++){ const float*r=*Hb+(size_t)s*rowsz; int h=0; double e=0;
+        for(size_t i=0;i<rowsz;i++){ if(!isfinite(r[i])) h=1; else e+=fabs(r[i]); }
+        if(h) nanr++; else if(e==0.0) zr++; }
+    printf("★[BF诊断] L=%02d base=%g 非有限: 出口H NaN行=%zu/%d 全零行=%zu — 复跑一次判瞬态/确定性\n",
+           J,base,nanr,eS,zr); fflush(stdout);
+    free(*Hb); *Hb=gs_forward_exit(J,eF,eHin,eIds,eS,eNf,NULL);
+    double b2=co_score_rows(*Hb,eTgt,SEV,nSEV,rowsz);
+    if(isfinite(b2)) printf("★[BF诊断] L=%02d 复跑base=%.6g 有限 → ★瞬态实锤(嫌疑=GB10托管内存)★ 单元以复跑值继续\n",J,b2);
+    else             printf("★[BF诊断] L=%02d 复跑base=%g 仍非有限 → 确定性异常, 单元跳过\n",J,b2);
+    fflush(stdout);
+    return b2;
+}
 
 /* ===== 从层文件重前向(跨层反向的执行引擎): 文件即真相 =====
  * 读 dql_L<NN>.bin: 1bit 权重字节 + 落地修正记录(按时间序回放 GL/dyn2/dyn8/TREF)。

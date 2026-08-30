@@ -186,6 +186,7 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
         float*Hb=gs_forward_exit(J,eF,eHin,eIds,eS,eNf,NULL);
         GS_CAP_L=-1;
         double base=co_score_rows(Hb,eTgt,SEV,nSEV,rowsz);
+        { GS_CAP_L=J; base=bf_base_gate(J,base,&Hb,eF,eHin,eIds,eS,eNf,eTgt,SEV,nSEV,rowsz); GS_CAP_L=-1; if(!isfinite(base)){ free(Hb); mlog(J,"向前反修","base非有限(诊断已打)","跳过",0,"NaN闸","探索中"); done[J]=1; jd[J]=0; g_bflt_on=0; continue; } }   /* L11 NaN 实案闸(p3 bf_base_gate) */
         bf_rowdist(Hb,eTgt,eS,rowsz,db); free(Hb);
         /* 行权系数 kk_s(2026-08-05 分类/感知布线): 行残差能量/行目标能量, clamp[0,4] */
         for(int s=0;s<eS;s++){ const float*b=eTgt+(size_t)s*rowsz; double tn=0;
