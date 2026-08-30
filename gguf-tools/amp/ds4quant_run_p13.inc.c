@@ -96,6 +96,11 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
     /* ★复核前缀(eval 1536+fit 384, co_score 判)已废(2026-08-30)★: 三层口径错位实锤后,
      * 放行判据改 held-KL 闸(bkl_*, p12), 行少(512)且判的是 head 后真尺 → 又快又对。 */
     if(sidx&&!bkl_init(Htgt,ids,S,n_fit,rowsz)) fprintf(stderr,"[BKL]★init 失败/拒臂 → 本 sweep 全部拒落地(fail-closed)★\n");
+    if(BKL_FPLP&&BKL_B0LIVE>1e299){   /* ③态部署基线: 全 S 自由路由回放一次(终验真尺锚点) */
+        g_bkl_live=1; float*Hb0=gs_forward_exit(Jlo,Lfront,HQE+(size_t)Jlo*lstride,ids,S,n_fit,NULL); g_bkl_live=0;
+        BKL_B0LIVE=bkl_exit_kl(Hb0,rowsz); free(Hb0);
+        printf("[BKL] ③态部署KL基线(全S自由路由)=%.5f\n",BKL_B0LIVE); fflush(stdout);
+    }
     /* ★同前沿复检★: sweep 高层→低层, 低层落地会刷新高层输入上下文(HQE), 但高层已评过 →
      * 第一遍有落地则对"保持"层用新上下文再重解一遍(pass=1), 堵"评估时机"漏 */
     g_anc_rowmap = NULL;   /* 进函数先清干净 */
@@ -309,8 +314,8 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
              * 单元 +2 次全程前向 ≈ 20-40s, 可负担。打分行=EVc(跨全域 eval 抽格), 判据=配对
              * 差分(同行集 basef vs scv), 行少的噪声在差分里大幅相消。
              * 统一终验保留(双保险, 应恒过 —— 每个落地都单独全程验证过)。 */
-            double basef=0,scv=0,c0=0,m0=0,c1=0,m1=0;
-            double basekl=bkl_gate(J,Lfront,Hin,rowsz,S,&basef,&c0,&m0);
+            double basef=0,scv=0,c0=0,m0=0,c1=0,m1=0,kp0=0,kp1=0;
+            double basekl=bkl_gate(J,Lfront,Hin,rowsz,S,&basef,&c0,&m0,&kp0);
             lop_t svE; float svg=0,svt=0,svw2[4]; float*gbak=NULL; int tmpop=-1;
             memset(&svE,0,sizeof(svE));
             if(form==5){ svE=lf->ops[ze]; lf->ops[ze]=opE; }
@@ -327,7 +332,7 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
                     for(int e=0;e<NEXP;e++) lf->ops[go].ge[e]*=geD[e]; }
                 else if(lf->nops<32){ tmpop=lf->nops; memset(&lf->ops[tmpop],0,sizeof(lop_t));
                     lf->ops[tmpop].type=5; lf->ops[tmpop].ge=geD; lf->nops++; } }   /* geD 所有权不转移 */
-            double candkl=bkl_gate(J,Lfront,Hin,rowsz,S,&scv,&c1,&m1);
+            double candkl=bkl_gate(J,Lfront,Hin,rowsz,S,&scv,&c1,&m1,&kp1);
             g_anc_rowmap=scr?sidx:NULL;               /* 还原本单元的粗筛映射 */
             if(form==5) lf->ops[ze]=svE;
             else if(form==6) lf->nops--;
@@ -336,8 +341,8 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
             else if(form==3){ if(tmpop>=0) lf->nops--; else memcpy(lf->ops[BF_DYN2OP[J]].w2p,svw2,16); }
             else { if(tmpop>=0) lf->nops--; else memcpy(lf->ops[BF_GEOP[J]].ge,gbak,(size_t)NEXP*4); }
             if(gbak){ free(gbak); gbak=NULL; }
-            printf("[BKL] L=%02d 复核: heldKL %.5f→%.5f(%s) 隐分 %.5g→%.5g | 方向cos %.5f→%.5f 模长误差 %.3f%%→%.3f%%\n",
-                   J,basekl,candkl,candkl<basekl-1e-9?"降✓放行":"不降✗拒",basef,scv,c0,c1,100*m0,100*m1); fflush(stdout);
+            printf("[BKL] L=%02d 复核: 部署KL %.5f→%.5f(%s) | 钉路KL %.5f→%.5f(对照,判向异=盲区实锤) | 隐分 %.5g→%.5g cos %.5f→%.5f\n",
+                   J,basekl,candkl,candkl<basekl-1e-9?"降✓放行":"不降✗拒",kp0,kp1,basef,scv,c0,c1); fflush(stdout);
             if(candkl<basekl-1e-9){ base=basef; bestsc=scv; eFlog=Lfront; }   /* 放行: 真尺(held-KL)降 */
             else { vrej++; form=0; }                        /* KL 不降: 拒落地(隐分再好也不算肉) */
         }
@@ -440,12 +445,14 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
             g_anc_rowmap=NULL;
             double b0=co_score_rows(HQE+(size_t)(Lfront+1)*lstride,Htgt,LEV,nLEV,rowsz,1);
             double b0kl=BKL_FPLP?bkl_exit_kl(HQE+(size_t)(Lfront+1)*lstride,rowsz):1e300;
+            g_bkl_live=1;   /* ★终验=部署态(自由路由, 与 caliper 同语义)★ */
             float*Hf=gs_forward_exit(Jlo,Lfront,HQE+(size_t)Jlo*lstride,ids,S,n_fit,NULL);
+            g_bkl_live=0;
             double fin=co_score_rows(Hf,Htgt,LEV,nLEV,rowsz,1);
             double finkl=BKL_FPLP?bkl_exit_kl(Hf,rowsz):1e300; free(Hf);
-            int keep=BKL_FPLP?(finkl<b0kl-1e-9):0;   /* 判据=held-KL; 闸拒臂时无落地可判(fail-closed) */
-            printf("BF_ONEPASS 终验 落地=%d heldKL %.5f→%.5f(真尺判据) 出口分 %.5g→%.5g(对照) %s\n",
-                   nland,b0kl,finkl,b0,fin,keep?"✓改善→提交":"✗劣化→全回滚"); fflush(stdout);
+            int keep=BKL_FPLP?(finkl<BKL_B0LIVE-1e-9):0;   /* 判据=部署KL vs ③态部署基线 */
+            printf("BF_ONEPASS 终验 落地=%d 部署KL %.5f→%.5f(真尺判据) 钉路出口对照%.5f 出口分 %.5g→%.5g %s\n",
+                   nland,BKL_B0LIVE,finkl,b0kl,b0,fin,keep?"✓改善→提交":"✗劣化→全回滚"); fflush(stdout);
             if(keep){
                 float*Hr=gs_forward_exit(Jlo,Lfront,HQE+(size_t)Jlo*lstride,ids,S,n_fit,HQE); free(Hr);
             } else {

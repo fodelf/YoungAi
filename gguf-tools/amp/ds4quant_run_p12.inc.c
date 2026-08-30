@@ -160,18 +160,26 @@ static void bf_dirmag(const float*Hq,const float*Hf,int n,size_t rowsz,double*co
         if(na>0&&nb>0){ cs+=d/(sqrt(na)*sqrt(nb)); mg+=fabs(sqrt(na)-sqrt(nb))/sqrt(nb); } }
     *cosm=cs/(n>0?n:1); *magm=mg/(n>0?n:1);
 }
-static double bkl_gate(int J,int Lfront,const float*Hin,size_t rowsz,int Sfull,double*hs,double*cosm,double*magm){
-    /* 复核一击: 从 HQE[J] gather held 行 → 全程回放 → head → KL; hs 回传隐分(仅日志) */
+static double BKL_B0LIVE=1e300;   /* ③态部署 KL 基线(全 S 自由路由, chunk 起算一次) */
+static double bkl_gate(int J,int Lfront,const float*Hin,size_t rowsz,int Sfull,double*hs,double*cosm,double*magm,double*klpin){
+    /* ★部署态判决(2026-08-30 深夜正修)★ 判决回放跑模型自己的路由权重(g_bkl_live 抑制锚
+     * override) = caliper/部署同语义 — 钉路盲区(op 改 hidden → 下游 rw 漂移不可见)是
+     * "内部优/端到端劣"的机理级引擎 bug。klpin 非空时再跑一遍钉路回放(旧口径, 只作对照)。 */
     float *hb=malloc((size_t)BKL_N*rowsz*4);
     for(int i=0;i<BKL_N;i++) memcpy(hb+(size_t)i*rowsz,Hin+(size_t)BKL_ROWS[i]*rowsz,rowsz*4);
     const int *sv=g_anc_rowmap; int svs=g_anc_rowstride;
     g_anc_rowmap=BKL_ROWS; g_anc_rowstride=Sfull;
+    g_bkl_live=1;
     float *Hx=gs_forward_exit(J,Lfront,hb,BKL_IDS,BKL_N,BKL_N,NULL);
-    g_anc_rowmap=sv; g_anc_rowstride=svs; free(hb);
+    g_bkl_live=0;
     float *lg=bkl_head(Hx); double kl=bkl_eval(lg); free(lg);
     if(hs)*hs=co_score(Hx,BKL_HTG,0,BKL_N,rowsz);
     if(cosm&&magm) bf_dirmag(Hx,BKL_HTG,BKL_N,rowsz,cosm,magm);
-    free(Hx); return kl;
+    free(Hx);
+    if(klpin){ float *Hp=gs_forward_exit(J,Lfront,hb,BKL_IDS,BKL_N,BKL_N,NULL);
+        float *lp=bkl_head(Hp); *klpin=bkl_eval(lp); free(lp); free(Hp); }
+    g_anc_rowmap=sv; g_anc_rowstride=svs; free(hb);
+    return kl;
 }
 static double bkl_exit_kl(const float*Hex,size_t rowsz){   /* 终验用: 全 S 出口 hidden → held KL */
     float *hg=malloc((size_t)BKL_N*rowsz*4);

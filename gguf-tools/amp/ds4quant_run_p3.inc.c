@@ -141,7 +141,7 @@ static double co_score(const float*Hq,const float*Hf,int a,int b,size_t rowsz){
  * 二级子账: 12=hc(pre/post/rms) 13=compressor 14=attn核 | 16=bdq 17=gemm+sync 18=gather
  * 19=scatter 20=池/memset 21=归约 22=修正链回放(含z) 23=其中z(type6双投影,单线程嫌疑#1)。
  * 胶水=单元墙钟−[9]−[8]−[11](malloc/gather/zrefit/pca/落地IO)。量化遍/终验不臂→零扰动。 */
-double g_bflt[26]; int g_bflt_on=0;   /* 24=attn投影GEMM 25=oo/wo_b 输出投影(2026-08-30 二级细账) */
+double g_bflt[26]; int g_bflt_on=0, g_bkl_live=0;   /* 24/25=attn投影/输出投影; g_bkl_live=1 抑制锚路由override(判决回放跑模型自己的rw=部署/caliper同语义; 钉路盲区=内部优端到端劣的机理级bug, 2026-08-30深夜) */
 double vqt_now_ref(void){ return vqt_now(); }   /* fwd_p2 埋点用(fwd 在 vq_qc.h 之前 include, 看不见 static inline vqt_now) */
 static void bflt_print(int J,double uw){
     if(!g_bflt_on) return; g_bflt_on=0;

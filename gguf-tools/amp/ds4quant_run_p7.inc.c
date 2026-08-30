@@ -43,7 +43,7 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
      * ANCHOR_ROUTE/BF_ANCROUTE 块会把 idx/rw【整个】覆盖, hash 路由的 gate GEMM+softmax
      * 输出无人消费。跳过条件与覆盖条件逐字相同 ⇒ 覆盖后字节不变。NACT_RT>NACT(rroute
      * 加宽)时尾槽无人覆盖, 不跳(保原行为)。只跳 hash 分支: score 分支带 RB Δb 采集寄生。 */
-    const int rt_ov=do_quant&&ANC_OK&&(getenv("DS4_ANCHOR_ROUTE")||BF_ANCROUTE)&&NACT_RT==NACT;
+    const int rt_ov=do_quant&&ANC_OK&&(getenv("DS4_ANCHOR_ROUTE")||BF_ANCROUTE)&&NACT_RT==NACT&&!g_bkl_live;
     /* ★路由缓存(2026-08-30 BFLT 二级账定谳)★ gate 跳过后路由段仍 16s/单元 ⇒ 真大头是
      * override 循环对 30GB 锚 mmap 的重复随机读(页被逐→每次前向重缺页)。idx/rw 在 rt_ov
      * 态下是 (L,rowmap,S) 纯函数且抽格行集全 sweep 固定 → 首访算一次存 RAM(粗筛512+复核
@@ -170,7 +170,7 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
             free(scv);
         }
     }
-    if(do_quant&&ANC_OK&&(getenv("DS4_ANCHOR_ROUTE")||BF_ANCROUTE)){   /* 神谕路由归因: 强制 FP 路由(专家选择+权重),
+    if(do_quant&&ANC_OK&&(getenv("DS4_ANCHOR_ROUTE")||BF_ANCROUTE)&&!g_bkl_live){   /* 神谕路由归因: 强制 FP 路由(专家选择+权重),
         隔离"路由漂移"对最终质量的贡献; 反修判据也用它禁翻转噪声 */
         /* g_anc_rowmap 非空 = 反修粗筛的抽格前向: 锚按【原始行号】取, stride 用原始 S。
          * 为空则恒等映射, 与改动前逐字节一致。 */
