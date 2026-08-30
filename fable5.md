@@ -7767,3 +7767,45 @@ batched 95 次全 1 / 粘连 0 / 1920 复核踩 10 次无恙;
 - sticky CUDA 错误(misaligned/illegal address)= context 级, 静默回落路径会把它养成
   "永久掉 CPU 却零报错"; 回落必须打印 + 定位期用 CUDA_LAUNCH_BLOCKING/sanitizer
 - 诊断包装脚本的还原不能挂在会被 kill 的守候尾部(本次 sanitizer 包装漏还原, 反而因祸得福)
+
+## 2026-08-30 下午 ★sweep 单元账连根拆解: 三刀 −40% + L11 NaN 实案闸★
+
+用户令"结束所有任务, 修复bug和速度问题"(上午链跑到 sweep 34/42 被停)。
+
+### L11 NaN 实案(上午链唯一异常单元: Δbest=+nan% 125s)
+定谳链: ①zdiag `|z|/|routed|=0.0000` 是打印掩码(nf 为 NaN 时 `nf>0` 为假打 0) ②
+`cand` 从 scE 起筛而全形态分数以 base 起种 ⇒ **jdl=NaN ⟺ base=NaN** ③NaN base →
+bf_vertex→ms→zrefit 拟出 NaN 系数→形态E/F 两遍 NaN 前向全废。34 单元炸 1 次、只在
+fresh-dequant 的 base 首遍(dequant 0.56s vs 常态 0.22), L10 窗穿 L11 层正常 ⇒ 层文件
+无损, 头号嫌疑 GB10 托管内存瞬态(日志不可定谳)。修: `bf_base_gate`(p3) —— base 非有限
+→ 取证(NaN行/全零行计数)+复跑一次当场判瞬态(用有效值继续+大字实锤)/确定性(跳过单元防
+污染), 复跑重臂 GS_CAP_L。不是兜底: 每次触发留全证据链。
+
+### BFLT 单元账(埋点两级, 因 perf_event_paranoid=4 + ptrace_scope=1 全被挡)
+一级账(L40, 84s 单元, 42 次层前向)推翻全部预判: 展开(lwh_expand)/打分/胶水≈0,
+热点全在 layer_fwd 内 —— **attn核24 + gemm23 + 路由16 + bdq10**。二级账再翻案:
+moe 里 取/散/池/归/z 全≈0(z 并行化嫌疑出局)。
+
+### 三刀(全部值不变, 一次构建一次验证)
+1. **路由缓存**(p7): gate 跳过(override 整覆盖=白算)后路由段仍 16s ⇒ 真大头=override
+   对 30G 锚 mmap 重复缺页。idx/rw 在锚路由态=(L,rowmap,S) 纯函数, 抽格行集全 sweep
+   固定 → 2路×43层≈5MB RAM 缓存, 键含首尾行号防指针复用。16s→1s。
+2. **lw32 fp32 权重 managed 常驻**(p1/p12): lwh_expand 每前向展开完就 free ⇒ dq_matmul
+   对 !wdev 权重每调用 H2D。改每层展开一次进 vqg_alloc_managed 单板(0.43GB/层×43=
+   18.7GB, preferred-GPU), cuBLAS 零拷直读; 命中判定先于 loaded 守卫(fp16 被预算驱逐后
+   缓存仍有效)。展开 3s→0; **但 attn核 24→22 没动 ⇒ H2D-权重假设对 attn 不成立**,
+   attn 核 22s 的肉在 dq_attention 内部(q/o 各 67MB/调用的 pageable 传输+投影), 止刀留账。
+3. **moe 暂存钉页常驻**(moe_gpu): Xp/Yp 每 chunk calloc/free 10MB×2 → cudaMallocHost
+   常驻只增不缩(Xp 补齐行本就"内容任意", Wt 补齐槽 memset 保 0)。gemm 23→10s。
+
+**战果: L40 同口径 84s→50s(−40%); 深层单元外推 234→~130s; sweep ~4h→~2h。**
+剩余肉(有账未动): attn核22(dq_attention 内部传输/投影) bdq10(每调用重 dequant, 需
+每层 26G 驻留=内存墙) gemm10(n≈12 瘦 GEMM 形状税)。
+
+### 教训又入库
+- **pgrep/pkill -f 自匹配三连击**(本日两次+历史两次): 远程命令行含匹配串=自杀。规避=
+  `[r]` 方括号技巧 或 先 pgrep 拿 PID 再 kill 数字。
+- 探针验证周期 15min 的大头是 sweep 前 43 层回放推进热身; 多刀合批一次验证, 不逐刀逐验。
+
+13:36 生产链重跑发车(②从 layers_quant 重建干净工作区→③zlayer→④sweep→⑤双尺五指标),
+探针污染的工作区随②作废。NaN 闸武装在场, 触发即留证。
