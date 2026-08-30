@@ -1,5 +1,6 @@
     dq_hc_post(Fout,H2,post2,comb2,H,S,HCM,DIM);   /* 就地更新 H(误差传下层=累积) */
     free(cosr);free(sinr);free(y);free(post);free(comb);free(xn);if(kvc)free(kvc);free(a);free(H2);free(y2);free(post2);free(comb2);free(Fin);free(idx);free(rw);free(Fout);
+    if(g_bflt_on){ for(int i=0;i<8;i++) g_bflt[i]+=g_lt[i]; g_bflt[9]+=vqt_now()-lt_t0; g_bflt[10]+=1.0; }   /* BFUNIT 单元账(p3 bflt_print) */
 }
 
 /* head: H[S,HCM,DIM] → logits[S,VOCAB] (vocab 投影批量 sgemm) */

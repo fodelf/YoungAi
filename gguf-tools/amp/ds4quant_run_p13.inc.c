@@ -159,7 +159,7 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
         if(done[J]) continue;
         if(!GS_LF[J].map){ done[J]=1; jd[J]=0;
             mlog(J,"向前反修","层文件缓存缺失","跳过",0,"lfile未加载","探索中"); continue; }
-        time_t ut0=time(NULL);   /* 单元计时(BFUNIT 可观测行) */
+        time_t ut0=time(NULL); double ut0d=vqt_now(); memset(g_bflt,0,sizeof g_bflt); g_bflt_on=1;   /* 单元计时(BFUNIT 可观测行)+段账臂(p3 bflt_print) */
         lfile_t*lf=&GS_LF[J];
         char pj[512]; op_host_path(J,pj,sizeof(pj));   /* ★平行架构: 反修落地只写 op 侧车, 量化 dql 不可触 */
         if(onep&&!ofl[J]){ struct stat fst; ofl[J]=stat(pj,&fst)==0?(size_t)fst.st_size:0; }   /* 回滚锚点 */
@@ -425,7 +425,7 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
          * trim 只还已 free 碎片, 在用块不动, ms 级。 */
         malloc_trim(0);
         printf("BFUNIT L=%02d Δbest=%+.3f%% %s 用时=%lds\n",J,jdl,form?"落地":"保持",(long)(time(NULL)-ut0));
-        fflush(stdout);                     /* 实时可观测(用户裁决: 未落地层不许等到轮末才现身) */
+        fflush(stdout); bflt_print(J,vqt_now()-ut0d);   /* 实时可观测(用户裁决: 未落地层不许等到轮末才现身)+单元段账 */
         if(bis){
             /* ★一点采样不判整段生死(单测实锤: mid 平坦剪长段 ⇒ 深尾大增益整段漏检)★
              * 段长>DS4_BF_BISECT_MAXSEG(默认3)时 mid 平坦也必须细分; 只许剪 ≤MAXSEG 的小段

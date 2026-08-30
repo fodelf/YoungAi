@@ -316,7 +316,7 @@ static float *gs_forward_exit(int J,int Lend,const float*Hin,const long*ids,int 
     float *H=malloc(lstride*4); memcpy(H,Hin,lstride*4);
     for(int L=J;L<=Lend;L++){
         if(HQcache) memcpy(HQcache+(size_t)L*lstride,H,lstride*4);   /* 层 L 入口 */
-        LW T=GS_LW[L].loaded?lwh_expand(&GS_LW[L]):load_layer(L);   /* fp16 展开; 被驱逐层临时从 HF 重载 */
+        double _x0=g_bflt_on?vqt_now():0.0; LW T=GS_LW[L].loaded?lwh_expand(&GS_LW[L]):load_layer(L); if(g_bflt_on) g_bflt[11]+=vqt_now()-_x0;   /* fp16 展开; 被驱逐层临时从 HF 重载; 展开翻炒入单元账[11] */
         layer_fwd(L,&T,H,ids,S,n_fit,1,'B',NULL);
         free_layer(&T);
     }
@@ -325,8 +325,10 @@ static float *gs_forward_exit(int J,int Lend,const float*Hin,const long*ids,int 
 }
 /* 每行前沿出口 L2 距离(per-token 反修目标用) */
 static void bf_rowdist(const float*H,const float*Htgt,int S,size_t rowsz,double*d){
+    double _t0=g_bflt_on?vqt_now():0.0;
     for(int s=0;s<S;s++){ double e=0; const float*a=H+(size_t)s*rowsz,*b=Htgt+(size_t)s*rowsz;
         for(size_t i=0;i<rowsz;i++){ double dd=(double)a[i]-b[i]; e+=dd*dd; } d[s]=e; }
+    if(g_bflt_on) g_bflt[8]+=vqt_now()-_t0;
 }
 /* β 信赖域混合: dst 系数 = (1−β)·old + β·fitted(特征参数 μ/σ/V8 不动, 只混系数) */
 static void op_blend(lop_t*dst,const lop_t*o,const lop_t*f,float b){

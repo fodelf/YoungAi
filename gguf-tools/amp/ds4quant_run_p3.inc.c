@@ -133,15 +133,29 @@ static double co_score(const float*Hq,const float*Hf,int a,int b,size_t rowsz){
  * 为什么必须有它: 旧的 (a,b) 连续区间在"域按块连续铺"的语料上只覆盖 1-2 个域 —— 实测
  * [4608,6144) = 西里尔后半+math, 而 sweep 的候选择优/落地/终验【全部】用这个区间打分,
  * 于是 42 层"层内正向落地 + 终验✓改善"在判决份 8 域尺上四项全负。行表由布局推导 ⇒ 跨全域。 */
+/* ★BFUNIT 单元账(2026-08-30 用户"改成GPU了怎么还这么慢")★ 实测 L27 单元 234s 里 [bmwt]
+ * 只占 28s, 其余在账外(主线程单核 99.9%, GPU 采样半数 0%)。sweep 单元臂内(g_bflt_on)
+ * 逐段累计: 0..7=g_lt 同槽位 8=打分(co_score_rows+bf_rowdist) 9=layer_fwd 总墙钟
+ * 10=前向次数 11=骨干fp16展开(lwh_expand/load_layer, gs_forward_exit 每层每候选翻炒)。
+ * 胶水=单元墙钟−[9]−[8]−[11](malloc/gather/zrefit/pca/落地IO)。量化遍/终验不臂→零扰动。 */
+double g_bflt[12]; int g_bflt_on=0;
+static void bflt_print(int J,double uw){
+    if(!g_bflt_on) return; g_bflt_on=0;
+    double fw=g_bflt[9],sc=g_bflt[8],xp=g_bflt[11],gl=uw-fw-sc-xp; if(gl<0)gl=0;
+    printf("[BFLT] L=%02d 层前向%d次=%.0fs(attn=%.0f 路由=%.0f 共享=%.0f moe=%.0f+%.0f lfload=%.0f 其余=%.0f zl=%.0f) 展开=%.0fs 打分=%.0fs 胶水=%.0fs | 单元=%.0fs\n",
+           J,(int)g_bflt[10],fw,g_bflt[0],g_bflt[1],g_bflt[2],g_bflt[3],g_bflt[7],g_bflt[6],g_bflt[4],g_bflt[5],xp,sc,gl,uw);
+    fflush(stdout);
+}
 static double co_score_rows(const float*Hq,const float*Hf,const int*rows,int nr,size_t rowsz){
     if(nr<1||!rows) return 0.0;
+    double _t0=g_bflt_on?vqt_now():0.0;
     float *ga=malloc((size_t)nr*rowsz*4), *gb=malloc((size_t)nr*rowsz*4);
     if(!ga||!gb){ free(ga); free(gb); return 0.0; }
     for(int i=0;i<nr;i++){
         memcpy(ga+(size_t)i*rowsz, Hq+(size_t)rows[i]*rowsz, rowsz*4);
         memcpy(gb+(size_t)i*rowsz, Hf+(size_t)rows[i]*rowsz, rowsz*4); }
     double v=co_score(ga,gb,0,nr,rowsz);
-    free(ga); free(gb); return v;
+    free(ga); free(gb); if(g_bflt_on) g_bflt[8]+=vqt_now()-_t0; return v;
 }
 
 /* ===== 从层文件重前向(跨层反向的执行引擎): 文件即真相 =====
