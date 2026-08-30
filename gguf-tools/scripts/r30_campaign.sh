@@ -111,7 +111,6 @@ stage_quant(){
     export DS4_VOL_BUDGET_GIB="$BUDGET"
     export DS4_GO2B_HOT=1 DS4_GO2B_HOT_TABLE="${HOT_TABLE:-$ROOT/gguf-tools/data/corpus/prog_active_top49.txt}"
     export DS4_ROUTE_BIAS_FIT=1 DS4_ROUTE_BIAS_OUT="$OUTF/route_bias_r30.bin" DS4_ROUTE_BIAS_ALPHA=1.0
-    export DS4_ANCHOR_ROUTE=1                       # 100% 锚路由(R29 起标配)
     export DS4_BF_GAIN_GATE="${GAIN_GATE:-0.05}"    # 落地增益门
     export DS4_PLAN="$OUTF/plan.txt" DS4_CKPT_DIR="$OUTF/ckpt"
     export DS4_LAYER_DIR="$OUTF/layers" DS4_ZFILE="$OUTF/zfile.bin" DS4_ZCHAIN="$OUTF/zchain.bin"
@@ -175,12 +174,10 @@ stage_backfit(){
     #   寄生在反修自身前向(零额外前向, 统计段在锚 override 之前读学生 top-k), rb_save 收官
     #   落盘 → merge 段烘进 exp_probs_b(α 冠军档)。多次同层前向重复累计=均值归一无偏。
     export DS4_ROUTE_BIAS_FIT=1 DS4_ROUTE_BIAS_OUT="$OUTF/route_bias_r30.bin"
-    export DS4_ANCHOR_ROUTE=1   # 超冠原样(2026-08-08 用户令还原): 锚路由反修
     export DS4_BF_GAIN_GATE="${GAIN_GATE:-0.05}"
     for v in DS4_TUNE DS4_MINVOL DS4_MV_BASELINE DS4_VQ_RPLAN; do
         [ -z "$(eval echo \"\${$v:-}\")" ] || { LOG "★$v 仍在场, 反修会走错分支 — 停★"; exit 8; }
     done
-    [ -n "${DS4_ANCHOR_ROUTE:-}" ] || { LOG "★DS4_ANCHOR_ROUTE 不在场 — 停★"; exit 8; }
     [ -n "${PROBE1:-}" ] && { export DS4_NL=1; LOG "★探针模式: 只反修 L00(DS4_NL=1)★"; }
     LOG "反修起跑"
     "$QBIN" "$IDS" "${BF_S:-1716}" "$@"
@@ -221,7 +218,7 @@ stage_student(){
         DS4_GO2B_HOT=1 DS4_GO2B_HOT_TABLE="${HOT_TABLE:-$ROOT/gguf-tools/data/corpus/prog_active_top49.txt}" \
         DS4_ZFILE="$OUTF/zfile.bin" DS4_ZCHAIN="$OUTF/zchain.bin" \
         DS4_ROUTE_BIAS="$OUTF/route_bias_r30.bin" DS4_ROUTE_BIAS_ALPHA="${RB_ALPHA:-2.5}" DS4_ROUTE_BIAS_MINCNT=8 \
-        DS4_ANCHOR_ROUTE=1 DS4_DUMP_LOGITS="$OUTF/student_logits.bin" \
+        DS4_DUMP_LOGITS="$OUTF/student_logits.bin" \
         "$QBIN" "$IDS" 1716 || { LOG "★学生回放失败★"; exit 3; }
     [ -f "$OUTF/student_logits.bin" ] || { LOG "★学生 logits 没落盘★"; exit 3; }
     # ★假✓自曝闸(2026-08-07: 两次静默秒过事故): logits 必须比本段起跑新

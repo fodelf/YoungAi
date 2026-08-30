@@ -16,19 +16,21 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
         if(ld2){ char zp2[1024]; snprintf(zp2,sizeof zp2,"%s/zrec_L%02d.bin",ld2,L);
                  FILE*zf2=fopen(zp2,"rb"); if(zf2){ fclose(zf2); zrec_done=1; } }
     }
-    float *cosr=malloc((size_t)S*(RD/2)*4),*sinr=malloc((size_t)S*(RD/2)*4);
-    if(CR[L]>0) dq_freqs_cis(RD,S,65536.0,160000.0,16.0,32.0,1.0,cosr,sinr);
-    else dq_freqs_cis(RD,S,0.0,10000.0,16.0,32.0,1.0,cosr,sinr);
+    const int _po=g_pos_off;   /* ★真实位置回放(2026-08-31)★ bkl 连续 held 块从流位置 n_fit 起 */
+    float *cosr=malloc((size_t)(S+_po)*(RD/2)*4),*sinr=malloc((size_t)(S+_po)*(RD/2)*4);
+    if(CR[L]>0) dq_freqs_cis(RD,S+_po,65536.0,160000.0,16.0,32.0,1.0,cosr,sinr);
+    else dq_freqs_cis(RD,S+_po,0.0,10000.0,16.0,32.0,1.0,cosr,sinr);
+    float *cosu=cosr+(size_t)_po*(RD/2), *sinu=sinr+(size_t)_po*(RD/2);
     float *y=malloc((size_t)S*DIM*4),*post=malloc((size_t)S*HCM*4),*comb=malloc((size_t)S*HCM*HCM*4);
     double _am=vqt_now();   /* attn 子账(BFLT 二级): hc/comp/核 三桶, 残差=freqs/malloc/捕获 */
     dq_hc_pre(H,W->afn,W->asc,W->abase,y,post,comb,S,HCM,DIM,mixd,HCIT,EPSF,EPSF);
     float *xn=malloc((size_t)S*DIM*4); for(int s=0;s<S;s++)dq_rms(y+(size_t)s*DIM,W->an,xn+(size_t)s*DIM,DIM,EPSF);
     g_bflt[12]+=vqt_now()-_am; _am=vqt_now();
     int Sc=0; float *kvc=NULL;
-    if(CR[L]>0){ kvc=malloc((size_t)((S/CR[L]+2)*2)*HD*4); Sc=dq_compressor(xn,W->cwkv,W->cwgate,W->cnorm,W->cape,cosr,sinr,kvc,S,DIM,HD,RD,CR[L],EPSF); }
+    if(CR[L]>0){ kvc=malloc((size_t)((S/CR[L]+2)*2)*HD*4); Sc=dq_compressor(xn,W->cwkv,W->cwgate,W->cnorm,W->cape,cosu,sinu,kvc,S,DIM,HD,RD,CR[L],EPSF); }
     g_bflt[13]+=vqt_now()-_am; _am=vqt_now();
     float *a=malloc((size_t)S*DIM*4);
-    dq_attention(xn,W->wqa,W->qn,W->wqb,W->wkv,W->kvn,W->sink,W->woa,W->wob,kvc,cosr,sinr,a,S,DIM,NH,HD,RD,QLR,OLR,OG,WIN,Sc,CR[L],EPSF);
+    dq_attention(xn,W->wqa,W->qn,W->wqb,W->wkv,W->kvn,W->sink,W->woa,W->wob,kvc,cosu,sinu,a,S,DIM,NH,HD,RD,QLR,OLR,OG,WIN,Sc,CR[L],EPSF);
     g_bflt[14]+=vqt_now()-_am; _am=vqt_now();
     float *H2=malloc((size_t)S*HCM*DIM*4); dq_hc_post(a,H,post,comb,H2,S,HCM,DIM);
     float *y2=malloc((size_t)S*DIM*4),*post2=malloc((size_t)S*HCM*4),*comb2=malloc((size_t)S*HCM*HCM*4);
@@ -39,35 +41,15 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
     g_lt[0]=vqt_now()-lt_mark; lt_mark=vqt_now();   /* ①attn+hc 段完 */
     /* moe 路由(实际激活: 量化遍即被污染激活 = 部署运行时口径) */
     int *idx=malloc((size_t)S*NACT_RT*sizeof(int)); float *rw=malloc((size_t)S*NACT_RT*4);
-    /* ★锚 override 在场时 gate 分数是白算(2026-08-30 BFLT 实测路由 16s/单元)★: 下方
-     * ANCHOR_ROUTE/BF_ANCROUTE 块会把 idx/rw【整个】覆盖, hash 路由的 gate GEMM+softmax
-     * 输出无人消费。跳过条件与覆盖条件逐字相同 ⇒ 覆盖后字节不变。NACT_RT>NACT(rroute
-     * 加宽)时尾槽无人覆盖, 不跳(保原行为)。只跳 hash 分支: score 分支带 RB Δb 采集寄生。 */
-    const int rt_ov=do_quant&&ANC_OK&&(getenv("DS4_ANCHOR_ROUTE")||BF_ANCROUTE)&&NACT_RT==NACT&&!g_bkl_live;
-    /* ★路由缓存(2026-08-30 BFLT 二级账定谳)★ gate 跳过后路由段仍 16s/单元 ⇒ 真大头是
-     * override 循环对 30GB 锚 mmap 的重复随机读(页被逐→每次前向重缺页)。idx/rw 在 rt_ov
-     * 态下是 (L,rowmap,S) 纯函数且抽格行集全 sweep 固定 → 首访算一次存 RAM(粗筛512+复核
-     * 1920 两路×43层≈5MB), 后续 memcpy, 值逐字节同。全量行/量化遍(rowmap=NULL)不缓存。
-     * 键含首尾行号防指针复用假命中(旧逐前沿模式 sidx 会重建, 现役终局模式只建一次)。 */
-    static const int *rtc_map[2]={0,0}; static int rtc_S[2]={0,0}, rtc_ab[2][2];
-    static int *rtc_idx[2][64]; static float *rtc_rw[2][64];
-    int rtw=-1;
-    if(rt_ov&&g_anc_rowmap&&L<64){
-        for(int w2=0;w2<2;w2++)
-            if(rtc_map[w2]==g_anc_rowmap&&rtc_S[w2]==S&&rtc_ab[w2][0]==g_anc_rowmap[0]&&rtc_ab[w2][1]==g_anc_rowmap[S-1]){ rtw=w2; break; }
-        if(rtw<0) for(int w2=0;w2<2;w2++) if(!rtc_map[w2]){
-            rtc_map[w2]=g_anc_rowmap; rtc_S[w2]=S; rtc_ab[w2][0]=g_anc_rowmap[0]; rtc_ab[w2][1]=g_anc_rowmap[S-1]; rtw=w2; break; }
-        if(rtw>=0&&rtc_idx[rtw][L]){
-            memcpy(idx,rtc_idx[rtw][L],(size_t)S*NACT*sizeof(int));
-            memcpy(rw, rtc_rw[rtw][L], (size_t)S*NACT*4);
-            goto rt_done;   /* 命中: gate+锚 override 全免, 字节同 */
-        }
-    }
+    /* ★锚路由 override 已整体删除(2026-08-31 用户令)★: 判据/回放不许带部署没有的神谕输入
+     * (FP 锚路由权重), env 控制逻辑(DS4_ANCHOR_ROUTE)同拔。一切前向(量化遍/粗筛/复核/终验)
+     * 一律模型自己的路由=部署语义; FP 锚只做拟合目标数据。附带死亡: 路由缓存/白算跳过
+     * (皆依附 override)。神谕虚高实测: 同模型同行集 钉路KL 0.602 vs 部署 0.741。 */
     if(W->t2ei){ static int hbn=0;
         if(!hbn&&do_quant){ hbn=1;
             fprintf(stderr,"[路由] tid2eid 哈希路由生效(0731 原生): 专家选择=token 哈希表, 结构性零漂移;\n"
                            "[路由] Δb 选择偏置在此无对象(老 base 分数近似路由时代的机制), RB 族不武装。\n"); }
-        if(!rt_ov) dq_gate_route_hash(Fin,W->gate,W->t2ei,ids,idx,rw,S,DIM,NEXP,NACT,ROUTE_SCALE);
+        dq_gate_route_hash(Fin,W->gate,W->t2ei,ids,idx,rw,S,DIM,NEXP,NACT,ROUTE_SCALE);
     }
     else{
         if(!RB_TRIED&&getenv("DS4_ROUTE_BIAS")){   /* 懒加载路由偏置侧车(一次) */
@@ -170,24 +152,6 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
             free(scv);
         }
     }
-    if(do_quant&&ANC_OK&&(getenv("DS4_ANCHOR_ROUTE")||BF_ANCROUTE)&&!g_bkl_live){   /* 神谕路由归因: 强制 FP 路由(专家选择+权重),
-        隔离"路由漂移"对最终质量的贡献; 反修判据也用它禁翻转噪声 */
-        /* g_anc_rowmap 非空 = 反修粗筛的抽格前向: 锚按【原始行号】取, stride 用原始 S。
-         * 为空则恒等映射, 与改动前逐字节一致。 */
-        const int astride = g_anc_rowmap ? g_anc_rowstride : S;
-        const int32_t *abase = ANC.ridx+(size_t)L*astride*NACT;
-        const float   *rbase = ANC.rw  +(size_t)L*astride*NACT;
-        for(int s=0;s<S;s++){
-            const int src = g_anc_rowmap ? g_anc_rowmap[s] : s;
-            for(int a=0;a<NACT;a++) idx[(size_t)s*NACT+a]=abase[(size_t)src*NACT+a];
-            memcpy(rw+(size_t)s*NACT, rbase+(size_t)src*NACT, (size_t)NACT*4);
-        }
-    }
-    if(rtw>=0&&!rtc_idx[rtw][L]){   /* 路由缓存回填(miss 后) */
-        rtc_idx[rtw][L]=malloc((size_t)S*NACT*sizeof(int)); rtc_rw[rtw][L]=malloc((size_t)S*NACT*4);
-        memcpy(rtc_idx[rtw][L],idx,(size_t)S*NACT*sizeof(int)); memcpy(rtc_rw[rtw][L],rw,(size_t)S*NACT*4);
-    }
-rt_done:
     if(GS_CAP_L==L&&GS_IDXC&&GS_RWC){   /* ★反修 GE 投影: 捕获目标层实际路由(命中+权重)★ */
         memcpy(GS_IDXC,idx,(size_t)S*NACT*sizeof(int));
         memcpy(GS_RWC,rw,(size_t)S*NACT*4);

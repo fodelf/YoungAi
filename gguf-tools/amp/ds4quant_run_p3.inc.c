@@ -141,7 +141,7 @@ static double co_score(const float*Hq,const float*Hf,int a,int b,size_t rowsz){
  * 二级子账: 12=hc(pre/post/rms) 13=compressor 14=attn核 | 16=bdq 17=gemm+sync 18=gather
  * 19=scatter 20=池/memset 21=归约 22=修正链回放(含z) 23=其中z(type6双投影,单线程嫌疑#1)。
  * 胶水=单元墙钟−[9]−[8]−[11](malloc/gather/zrefit/pca/落地IO)。量化遍/终验不臂→零扰动。 */
-double g_bflt[26]; int g_bflt_on=0, g_bkl_live=0;   /* 24/25=attn投影/输出投影; g_bkl_live=1 抑制锚路由override(判决回放跑模型自己的rw=部署/caliper同语义; 钉路盲区=内部优端到端劣的机理级bug, 2026-08-30深夜) */
+double g_bflt[26]; int g_bflt_on=0, g_pos_off=0;   /* 24/25=attn投影/输出投影; g_pos_off=bkl真位置偏移(2026-08-31) */
 double vqt_now_ref(void){ return vqt_now(); }   /* fwd_p2 埋点用(fwd 在 vq_qc.h 之前 include, 看不见 static inline vqt_now) */
 static void bflt_print(int J,double uw){
     if(!g_bflt_on) return; g_bflt_on=0;
@@ -489,12 +489,4 @@ static float *BM_RH=NULL,*BM_RC=NULL; static int BM_S=0;
 /* ★层级消融门(2026-08-19 五指标诊断)★ DS4_REPLAY_SKIP_LAYERS="24,25,..": 回放时
  * 整层跳过修正链(权重字节前向保留) — 与 DS4_REPLAY_SKIP_TYPES 正交组合。 */
 static int g_replay_cur_L=-1;
-static int replay_layer_skipped(void){
-    static int init=0, skip[64]={0};
-    if(!init){ init=1; const char*sv=getenv("DS4_REPLAY_SKIP_LAYERS");
-        if(sv&&*sv){ char b2[256]; snprintf(b2,256,"%s",sv);
-            for(char*tk=strtok(b2,",");tk;tk=strtok(NULL,",")){ int t2=atoi(tk);
-                if(t2>=0&&t2<64) skip[t2]=1; }
-            fprintf(stderr,"[replay] 层消融: 跳过修正链 层{%s}\n",sv); } }
-    return g_replay_cur_L>=0&&g_replay_cur_L<64&&skip[g_replay_cur_L];
-}
+static int replay_layer_skipped(void){ return 0; }   /* 层消融脚手架已删(2026-08-31 用完即删律) */

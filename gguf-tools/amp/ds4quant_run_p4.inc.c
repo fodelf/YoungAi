@@ -133,7 +133,6 @@ static void *bytes_moe_worker(void*a){
         /* ★zl.ERF 死层补丁回放(2026-08-12)★: c=w·(h@Vᵀ)@Uᵀ(U折S/V折α), token门 |c|²≥τ。
          * h 与 dq_expert_fp 完全同式(clip+silu); 只在带 type8 记录且本专家在册的层花算力。
          * DS4_TYPE8_OFF=1 消融开关(同态 A/B 归因用)。 */
-        if(getenv("DS4_TYPE8_OFF")) goto erf_skip;
         for(int oi2=0;oi2<lf->nops;oi2++){
             lop_t*op=&lf->ops[oi2];
             if(op->type!=8) continue;
@@ -164,7 +163,6 @@ static void *bytes_moe_worker(void*a){
             free(hh);free(uu2);free(gvb);free(cb);
             break;
         }
-        erf_skip: ;
     }
     bmbar_wait(&BMW_BAR);                 /* 告诉主线程本块做完 */
   }
@@ -396,12 +394,7 @@ static void bytes_moe(lfile_t*lf,int S,const float*Fin,const int*idx,const float
     float *xn=NULL,*pj=NULL; const float*pjV8=NULL;
     /* ★op 族消融门(2026-08-04 诊断)★ DS4_REPLAY_SKIP_TYPES="4,6": 回放时跳过指定 type 的
      * 修正 op — 定位"过程态1.853 vs 回放2.001"分叉的元凶族。生产不设=全应用(原行为)。 */
-    static int skip_t[8]={0}, skip_init=0;
-    if(!skip_init){ skip_init=1; const char*sv=getenv("DS4_REPLAY_SKIP_TYPES");
-        if(sv&&*sv){ char b2[64]; snprintf(b2,64,"%s",sv);
-            for(char*tk=strtok(b2,",");tk;tk=strtok(NULL,",")){ int t2=atoi(tk);
-                if(t2>=1&&t2<=7) skip_t[t2]=1; }
-            fprintf(stderr,"[replay] 消融: 跳过 op type {%s}\n",sv); } }
+    static const int skip_t[8]={0};   /* op 族消融脚手架已删(2026-08-31 用完即删律): 恒全应用 */
     /* ★冷热基座先行(2026-08-06)★: type7 无论侧车序恒为链首 — 先应用基座分桶, 其余缩放
      * op 在其结果上链式作用(尾置=毁链: 覆盖式会丢掉已调 op 效果, 10 连全负实锤)。 */
     for(int oi=0;oi<lf->nops&&!lay_skip;oi++){ lop_t*o=&lf->ops[oi];

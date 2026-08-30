@@ -186,9 +186,7 @@ static float *fwd_all(const long*ids,int S,int n_fit,int do_quant,const char*lcf
         if(!BF_GEOP){ BF_GEOP=malloc((size_t)NLAYERS*sizeof(int)); for(int i=0;i<NLAYERS;i++) BF_GEOP[i]=-1;
             BF_HCOP=malloc((size_t)NLAYERS*sizeof(int)); for(int i9=0;i9<NLAYERS;i9++) BF_HCOP[i9]=-1; }
         if(!GS_IDXC){ GS_IDXC=malloc((size_t)S*NACT*sizeof(int)); GS_RWC=malloc((size_t)S*NACT*4); }
-        if(getenv("DS4_BF_TERMINAL")&&atoi(getenv("DS4_BF_TERMINAL"))==0)
-                 fprintf(stderr,"[逐层反修] 开(逐前沿·旧): 每前沿全量反修所有前层; 判据=前沿出口 vs FP锚(移动代理, O(L³))\n");
-        else     fprintf(stderr,"[逐层反修] 开(终局收敛): 推进段不修(误差前向吸收=部署口径), 收尾以最终出口为判据全层 sweep 到无落地(O(K·L²)); 旧逐前沿语义用 DS4_BF_TERMINAL=0\n");
+        fprintf(stderr,"[逐层反修] 开(终局收敛): 推进段不修(误差前向吸收=部署口径), 收尾以最终出口为判据全层 sweep(旧逐前沿模式已删, 2026-08-31 env逻辑清退)\n");
     }
     for(int L=L0;L<NLAYERS;L++){
         LW W=load_layer2(L,incr?&GS_LW[L]:NULL); lstat_t st; memset(&st,0,sizeof(st));   /* incr: 顺带录元素数(fp16缓存用) */
@@ -285,16 +283,11 @@ static float *fwd_all(const long*ids,int S,int n_fit,int do_quant,const char*lcf
                 lfile_load(lp,&GS_LF[L]);                        /* 本层文件进缓存 */
                 zc_opt_emit(L,&GS_LF[L]);      /* 一层两份: dql(量化)+opt(优化)并排落盘; 终值由 zchain_write 刷新 */
                 memcpy(HQE+(size_t)(L+1)*lstride,H,lstride*4);   /* 层 L 量化态出口(终局sweep重放起点; fast 也反修) */
-                if(!FAST&&getenv("DS4_BF_TERMINAL")&&atoi(getenv("DS4_BF_TERMINAL"))==0){
-                    /* 旧·逐前沿反修: 判据=前沿出口(移动代理, 同层随前沿推进被反复翻修 → O(L³)) */
-                    int chg=backfit_prev(L,ids,S,n_fit);
-                    if(chg) memcpy(H,HQE+(size_t)(L+1)*lstride,lstride*4);  /* 用反修后累积态继续前进 */
-                }
+                /* 旧·逐前沿反修分支已删(2026-08-31 env 逻辑清退): 只存终局收敛一种语义 */
             }
         }
     }
-    if(do_quant&&incr&&HQE&&GS_LF&&NLAYERS>1
-       &&!(getenv("DS4_BF_TERMINAL")&&atoi(getenv("DS4_BF_TERMINAL"))==0)){   /* 2026-07-14: fast 也跑终局反修(用户裁决) */
+    if(do_quant&&incr&&HQE&&GS_LF&&NLAYERS>1){   /* 2026-07-14: fast 也跑终局反修(用户裁决) */
         /* ★终局收敛反修(2026-07-13)★: 判据=最终层出口 vs FP锚(真目标), 全层 sweep 循环到无落地。
          * 取代逐前沿 O(L³): 前沿判据是移动代理靶(同层随推进被反复翻修, 增量互相覆盖), 推进段的
          * 误差本就由下游各层自适应求解前向吸收(部署口径); 终局判据下每份修正只做一次、直指真目标。
