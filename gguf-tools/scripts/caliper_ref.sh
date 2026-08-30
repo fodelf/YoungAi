@@ -1,6 +1,7 @@
 #!/bin/bash
 # caliper_ref.sh — 校尺: 量化器参考前向对任意层件出 wt2 判决(2026-08-24 尺子事故)。
-# 口径=base86p_spark.sh 裸判段逐字照抄; 二进制=ds4quant_run.old(08-22, 08-23 改动把 lfile 加载改坏待修)(历史对表 M10裸底0.4956/官方q2 0.4207 同尺)。
+# 口径=base86p_spark.sh 裸判段逐字照抄。二进制=现行 ds4quant_run(2026-08-31 用户令"同一功能只许一份实现",
+# .old 冻结判官清除; n_fit=1 ⇒ 纯回放不 sweep)。
 # 用法: caliper_ref.sh <层件目录> <输出logits> [线程=20]
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -34,10 +35,10 @@ export MALLOC_MMAP_THRESHOLD_=1073741824 MALLOC_TRIM_THRESHOLD_=1073741824
 LCx=$(printf "g%.0s" $(seq 1 43))
 cd "$ROOT/gguf-tools/amp"
 env DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-0731" OPENBLAS_NUM_THREADS=1 DS4_BF_MEMGB="$BFMEM" \
-    DS4_GSWEEP=0 DS4_BF_TERMINAL=0 DS4_BF_ONLY=1 DS4_COADAPT=1 DS4_CALIB_FULLSET=1 \
+    DS4_BF_ONLY=1 DS4_COADAPT=1 DS4_CALIB_FULLSET=1 \
     DS4_EXPORT_BYTES=0 DS4_ANCHOR="$ANC" DS4_NFIT=1 DS4_THREADS="$THR" \
     DS4_LAYER_DIR="$LAYERS" DS4_LCFG="$LCx" DS4_VQ=1 DS4_TGT_ALPHA=1.0 \
-    DS4_DUMP_LOGITS="$OUT" "${RB_ENV[@]}" ./ds4quant_run.old "$IDS" "$SN" 2>&1 | tail -2
+    DS4_DUMP_LOGITS="$OUT" "${RB_ENV[@]}" ./ds4quant_run "$IDS" "$SN" 2>&1 | tail -2
 cd "$ROOT"
 # 五指标判决器=C 版(2026-08-25 Python→C 迁移 Wave A; 金标对拍 amp2 verdict 全五指标
 # 与 anchor_metrics.py 逐字符一致, C 版另多 Σmin 主尺; 金标记录 migrate/golden.txt)

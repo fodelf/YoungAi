@@ -287,7 +287,7 @@ static float *fwd_all(const long*ids,int S,int n_fit,int do_quant,const char*lcf
             }
         }
     }
-    if(do_quant&&incr&&HQE&&GS_LF&&NLAYERS>1){   /* 2026-07-14: fast 也跑终局反修(用户裁决) */
+    if(do_quant&&incr&&HQE&&GS_LF&&NLAYERS>1&&n_fit>1){   /* n_fit<=1=判尺纯回放(caliper 既有约定 DS4_NFIT=1), 无 fit 行无可解, sweep 不触发 */
         /* ★终局收敛反修(2026-07-13)★: 判据=最终层出口 vs FP锚(真目标), 全层 sweep 循环到无落地。
          * 取代逐前沿 O(L³): 前沿判据是移动代理靶(同层随推进被反复翻修, 增量互相覆盖), 推进段的
          * 误差本就由下游各层自适应求解前向吸收(部署口径); 终局判据下每份修正只做一次、直指真目标。
