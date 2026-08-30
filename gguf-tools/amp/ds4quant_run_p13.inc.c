@@ -197,6 +197,8 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
             if(sc<scA){ scA=sc; aA=a; }
             if(undo) lf->nops--; else lf->ops[tmp].g=baseg;
         }
+        { char gb[128]; int go=0; for(int gi=0;gi<NA;gi++) go+=snprintf(gb+go,(size_t)(128-go),"%.2f:%.5g ",AG[gi],scg[gi]);
+          printf("[BFA] L=%02d base=%.6g 网格 %s→选α=%.3f\n",J,base,gb,aA); fflush(stdout); }
         { double av=bf_vertex(AG[0],scg[0],1.0,base,AG[NA-1],scg[NA-1]);
           if(av<0.80)av=0.80; if(av>1.20)av=1.20;
           if(fabs(av-1.0)>2e-3&&fabs(av-(double)aA)>2e-3){   /* 顶点≠已测点才补一枪 */
@@ -307,8 +309,8 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
              * 单元 +2 次全程前向 ≈ 20-40s, 可负担。打分行=EVc(跨全域 eval 抽格), 判据=配对
              * 差分(同行集 basef vs scv), 行少的噪声在差分里大幅相消。
              * 统一终验保留(双保险, 应恒过 —— 每个落地都单独全程验证过)。 */
-            double basef=0,scv=0;
-            double basekl=bkl_gate(J,Lfront,Hin,rowsz,S,&basef);
+            double basef=0,scv=0,c0=0,m0=0,c1=0,m1=0;
+            double basekl=bkl_gate(J,Lfront,Hin,rowsz,S,&basef,&c0,&m0);
             lop_t svE; float svg=0,svt=0,svw2[4]; float*gbak=NULL; int tmpop=-1;
             memset(&svE,0,sizeof(svE));
             if(form==5){ svE=lf->ops[ze]; lf->ops[ze]=opE; }
@@ -325,7 +327,7 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
                     for(int e=0;e<NEXP;e++) lf->ops[go].ge[e]*=geD[e]; }
                 else if(lf->nops<32){ tmpop=lf->nops; memset(&lf->ops[tmpop],0,sizeof(lop_t));
                     lf->ops[tmpop].type=5; lf->ops[tmpop].ge=geD; lf->nops++; } }   /* geD 所有权不转移 */
-            double candkl=bkl_gate(J,Lfront,Hin,rowsz,S,&scv);
+            double candkl=bkl_gate(J,Lfront,Hin,rowsz,S,&scv,&c1,&m1);
             g_anc_rowmap=scr?sidx:NULL;               /* 还原本单元的粗筛映射 */
             if(form==5) lf->ops[ze]=svE;
             else if(form==6) lf->nops--;
@@ -334,8 +336,8 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
             else if(form==3){ if(tmpop>=0) lf->nops--; else memcpy(lf->ops[BF_DYN2OP[J]].w2p,svw2,16); }
             else { if(tmpop>=0) lf->nops--; else memcpy(lf->ops[BF_GEOP[J]].ge,gbak,(size_t)NEXP*4); }
             if(gbak){ free(gbak); gbak=NULL; }
-            printf("[BKL] L=%02d 复核: heldKL %.5f→%.5f(%s) 隐分 %.5g→%.5g\n",J,basekl,candkl,
-                   candkl<basekl-1e-9?"降✓放行":"不降✗拒",basef,scv); fflush(stdout);
+            printf("[BKL] L=%02d 复核: heldKL %.5f→%.5f(%s) 隐分 %.5g→%.5g | 方向cos %.5f→%.5f 模长误差 %.3f%%→%.3f%%\n",
+                   J,basekl,candkl,candkl<basekl-1e-9?"降✓放行":"不降✗拒",basef,scv,c0,c1,100*m0,100*m1); fflush(stdout);
             if(candkl<basekl-1e-9){ base=basef; bestsc=scv; eFlog=Lfront; }   /* 放行: 真尺(held-KL)降 */
             else { vrej++; form=0; }                        /* KL 不降: 拒落地(隐分再好也不算肉) */
         }

@@ -148,7 +148,19 @@ static int bkl_init(const float*Htgt,const long*ids,int S,int n_fit,size_t rowsz
         free(lgf); free(BKL_ROWS); free(BKL_IDS); free(BKL_HTG); BKL_ROWS=NULL; BKL_IDS=NULL; BKL_HTG=NULL; BKL_N=0; return 0; }
     BKL_FPLP=lgf; return 1;
 }
-static double bkl_gate(int J,int Lfront,const float*Hin,size_t rowsz,int Sfull,double*hs){
+/* ★方向/模长拆解(2026-08-30 排查)★ head 的 rms 抹掉每 token 模长 ⇒ 隐藏态 L2 改善若集中
+ * 在模长分量, head 后一分不值(08-27 库内实测先例: L40 relL2 −41.6% 对 KLD −0.27%)。
+ * α 缩放 op 正是模长操纵器 → 在放行复核处把候选态拆成 cos(方向)/模长误差两栏,
+ * 判据被哪种分量喂饱一眼定谳。 */
+static void bf_dirmag(const float*Hq,const float*Hf,int n,size_t rowsz,double*cosm,double*magm){
+    double cs=0,mg=0;
+    for(int s=0;s<n;s++){ const float*a=Hq+(size_t)s*rowsz,*b=Hf+(size_t)s*rowsz;
+        double d=0,na=0,nb=0;
+        for(size_t i=0;i<rowsz;i++){ d+=(double)a[i]*b[i]; na+=(double)a[i]*a[i]; nb+=(double)b[i]*b[i]; }
+        if(na>0&&nb>0){ cs+=d/(sqrt(na)*sqrt(nb)); mg+=fabs(sqrt(na)-sqrt(nb))/sqrt(nb); } }
+    *cosm=cs/(n>0?n:1); *magm=mg/(n>0?n:1);
+}
+static double bkl_gate(int J,int Lfront,const float*Hin,size_t rowsz,int Sfull,double*hs,double*cosm,double*magm){
     /* 复核一击: 从 HQE[J] gather held 行 → 全程回放 → head → KL; hs 回传隐分(仅日志) */
     float *hb=malloc((size_t)BKL_N*rowsz*4);
     for(int i=0;i<BKL_N;i++) memcpy(hb+(size_t)i*rowsz,Hin+(size_t)BKL_ROWS[i]*rowsz,rowsz*4);
@@ -158,6 +170,7 @@ static double bkl_gate(int J,int Lfront,const float*Hin,size_t rowsz,int Sfull,d
     g_anc_rowmap=sv; g_anc_rowstride=svs; free(hb);
     float *lg=bkl_head(Hx); double kl=bkl_eval(lg); free(lg);
     if(hs)*hs=co_score(Hx,BKL_HTG,0,BKL_N,rowsz);
+    if(cosm&&magm) bf_dirmag(Hx,BKL_HTG,BKL_N,rowsz,cosm,magm);
     free(Hx); return kl;
 }
 static double bkl_exit_kl(const float*Hex,size_t rowsz){   /* 终验用: 全 S 出口 hidden → held KL */
