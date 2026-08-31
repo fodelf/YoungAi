@@ -12,8 +12,14 @@ LAYERS="$(realpath "${1:?层件目录}")"
 OUT="$(realpath -m "${2:?输出logits}")"; THR="${3:-20}"
 # 可选路由偏置(2026-08-27): $4=Δb 文件 $5=α。不给则完全走原路, 字节与历史判决逐位同。
 # 尺子只此一份 —— 想量"带偏置的分数"就从这里量, 不许另抄一份判决脚本。
-RB="${4:-}"; RBA="${5:-2.5}"
-RB_FLAGS=(); [ -n "$RB" ] && RB_FLAGS=(--route-bias "$RB" --route-bias-alpha "$RBA")
+# ★α 必须显式给(2026-08-31 魔数扫除)★: 旧默认 2.5 是 v4bf 冠军值, 但 α 在平权 86G
+# 底座上已判"单调有害"(fable5 十一) —— 只传 Δb 不传 α 会静默吃到有害值。
+RB="${4:-}"; RBA="${5:-}"
+RB_FLAGS=()
+if [ -n "$RB" ]; then
+    [ -n "$RBA" ] || { echo "给了路由偏置 Δb($RB)必须显式给 α(\$5): 无默认值" >&2; exit 2; }
+    RB_FLAGS=(--route-bias "$RB" --route-bias-alpha "$RBA")
+fi
 R30="$ROOT/gguf/go-onebit/r30"; G7="$ROOT/gguf/go-onebit/g7"
 # ★$6=ids $7=锚: 只给【诊断针】用, 不是判决★(2026-08-28)
 # 判决口径永远是 wt2(默认值), 铁律"判决只认参考前向尺"不因这两个可选参数松动。
