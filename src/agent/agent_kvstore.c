@@ -136,7 +136,7 @@ bool agent_kv_load_path(agent_worker *w, const char *path,
         ok = false;
     }
     if (ok && hdr.payload_bytes != 0 &&
-        hdr.quant_bits != (uint8_t)ds4_engine_routed_quant_bits(w->engine))
+        hdr.quant_bits != (uint8_t)ds4_engine_routed_kv_key(w->engine))
     {
         snprintf(err, err_len, "KV checkpoint was written for a different quantization");
         ok = false;
@@ -218,8 +218,8 @@ bool agent_kv_save_path(agent_worker *w, const char *path,
         snprintf(err, err_len, "live KV state does not match session transcript");
         return false;
     }
-    const int quant_bits = ds4_engine_routed_quant_bits(w->engine);
-    if (quant_bits != 2 && quant_bits != 4) {
+    const int quant_bits = ds4_engine_routed_kv_key(w->engine);   /* 兼容键=类型码 */
+    if (quant_bits <= 0) {
         snprintf(err, err_len, "unsupported routed quantization for KV save");
         return false;
     }

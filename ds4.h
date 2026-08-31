@@ -375,6 +375,9 @@ int ds4_session_pos(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);
 int ds4_session_prefill_cap(ds4_session *s);
 int ds4_engine_routed_quant_bits(ds4_engine *e);
+/* 磁盘 KV 兼容键(routed 张量类型码; 0=无 routed=不可存)。bits 口径会把不同 2-bit
+ * 格式塌成同一个 2, 造成跨模型 KV 静默互认 —— 兼容判定一律用这个, bits 只作显示。 */
+int ds4_engine_routed_kv_key(ds4_engine *e);
 const ds4_tokens *ds4_session_tokens(ds4_session *s);
 
 /* Low-level graph slice entry points used by distributed inference.  The

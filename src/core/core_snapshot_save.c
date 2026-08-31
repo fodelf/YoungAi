@@ -14,6 +14,19 @@ int ds4_engine_routed_quant_bits(ds4_engine *e) {
     return gate->type == DS4_TENSOR_Q4_K ? 4 : 2;
 }
 
+/* 磁盘 KV 兼容键: routed 专家张量【类型码】, 不是位宽。位宽口径把 IQ2_XXS/Q2_K/
+ * GO1B/GO2B 全塌成 2 —— 两个不同 2-bit 档 GGUF(如 allq2 与 vq86h)存的 KV 互相
+ * 通过校验被复用, 而 KV 数值由 routed 前向决定 = 静默数值污染。换类型码后旧缓存
+ * (存 2/4)自然失配重算, 方向安全。展示/dist 协议仍走 bits 口径(那边是显示值)。 */
+int ds4_engine_routed_kv_key(ds4_engine *e) {
+    const ds4_tensor *gate = NULL;
+    for (uint32_t il = 0; il < DS4_N_LAYER && !gate; il++) {
+        gate = e->weights.layer[il].ffn_gate_exps;
+    }
+    if (!gate) return (e->model.residual && e->model.residual->present) ? 254 : 0;   /* 254=合一 VQ blob 档 */
+    return (int)gate->type;
+}
+
 /* Mode P / Mode G dynamic routing brain: a cheap, model-free heuristic that
  * classifies a user prompt as a programming task (-> resident programming model,
  * Mode P) vs everyday chat (-> full cached model, Mode G). Pure text signals so

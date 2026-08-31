@@ -76,8 +76,9 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     ds4_tokens store_tokens = {0};
     ds4_kvstore_tokens_copy_prefix(&store_tokens, tokens, store_len);
 
-    const int quant_bits = ds4_engine_routed_quant_bits(engine);
-    if (quant_bits != 2 && quant_bits != 4) {
+    /* 兼容键=routed 类型码(bits 口径会把不同 2-bit 格式塌成同一个 2, 跨模型互认) */
+    const int quant_bits = ds4_engine_routed_kv_key(engine);
+    if (quant_bits <= 0) {
         ds4_tokens_free(&store_tokens);
         return false;
     }
@@ -360,8 +361,8 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
     if (result) memset(result, 0, sizeof(*result));
     if (effective_prompt) effective_prompt->len = 0;
     if (!kc->enabled || !prompt_text) return 0;
-    const int quant_bits = ds4_engine_routed_quant_bits(engine);
-    if (quant_bits != 2 && quant_bits != 4) return 0;
+    const int quant_bits = ds4_engine_routed_kv_key(engine);   /* 兼容键=类型码 */
+    if (quant_bits <= 0) return 0;
     const int model_id = ds4_engine_model_id(engine);
     const size_t prompt_bytes = strlen(prompt_text);
     int idx = ds4_kvstore_find_text_prefix(kc, prompt_text, model_id, quant_bits,
