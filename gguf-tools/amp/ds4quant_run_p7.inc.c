@@ -212,7 +212,9 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
          * 行数缩小(行少了权重还是要全读)。实测: 推进段 6.6s/层, sweep 每单元 7 次前向×5 层
          * ≈231s 纯浪费, 占 BFUNIT 460s 的一半。
          * (COADAPT 那支由外层 else-if 排除, 无需重复判。) */
-        if(LZRANK>0&&do_quant&&ANC_OK&&cfg!='F'&&!zrec_done){   /* ★层局部靶物料: R=FP专家@Fin−回放routed */
+        /* ★n_fit>1 与消费者对齐(2026-08-31)★ 判尺(--nfit 1 纯回放)曾在没有 zrec 的层
+         * 每层白跑一次 bf_fp_routed(读 25.7GB FP 权重+全精度专家前向), 消费者却被 n_fit>1 关死。 */
+        if(LZRANK>0&&do_quant&&ANC_OK&&cfg!='F'&&!zrec_done&&n_fit>1){   /* ★层局部靶物料: R=FP专家@Fin−回放routed */
             if(!BF_LT) BF_LT=malloc((size_t)S*DIM*4);
             { double _f0=vqt_now(); bf_fp_routed(L,Fin,idx,rw,S,BF_LT); g_lt[7]+=vqt_now()-_f0; }
             for(size_t i=0;i<(size_t)S*DIM;i++) BF_LT[i]-=(Fout[i]-shb[i]);
