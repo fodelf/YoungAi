@@ -29,6 +29,7 @@
 #include <stdint.h>
 #include <time.h>      /* vq_qc.h 的 vqt_now 用 clock_gettime, Linux 上必须先有这个 */
 #include <pthread.h>
+#include "../../src/common/ds4_amp_fmt.h"   /* fit/val 切分契约(单一定义源) */
 
 /* ══ ① 量化单元 ════════════════════════════════════════════════════════════
  * 量化一个权重矩阵并回报还原度。这是"量化一层"的最小可测单位 —— 一层就是
