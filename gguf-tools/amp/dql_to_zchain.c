@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include "../../src/common/ds4_amp_fmt.h"   /* 116 记录头契约(单一定义源) */
 
 static void put32(FILE *f, uint32_t v) { fwrite(&v, 4, 1, f); }
 
@@ -28,15 +29,15 @@ int main(int argc, char **argv) {
         typedef struct { uint32_t ty; uint64_t psz; uint8_t *pay; } op_t;
         op_t ops[64]; int nops = 0;
         long long off = 12;
-        for (uint32_t r = 0; r < nrec && off + 116 <= sz; r++) {
-            uint8_t rh[116];
+        for (uint32_t r = 0; r < nrec && off + DS4_AMP_REC_HDR <= sz; r++) {
+            uint8_t rh[DS4_AMP_REC_HDR];
             fseek(f, (long)off, SEEK_SET);
-            if (fread(rh, 1, 116, f) != 116) break;
+            if (fread(rh, 1, DS4_AMP_REC_HDR, f) != DS4_AMP_REC_HDR) break;
             char nm[17]; memcpy(nm, rh, 16); nm[16] = 0;
-            uint64_t psz; memcpy(&psz, rh + 88, 8);
-            int32_t vd; memcpy(&vd, rh + 112, 4);
-            long long payoff = off + 116;
-            off += 116 + (long long)psz;
+            uint64_t psz; memcpy(&psz, rh + DS4_AMP_REC_OFF_PSZ, 8);
+            int32_t vd; memcpy(&vd, rh + DS4_AMP_REC_OFF_VD, 4);
+            long long payoff = off + DS4_AMP_REC_HDR;
+            off += DS4_AMP_REC_HDR + (long long)psz;
             if (vd != 1) continue;
             uint32_t ty = 0;
             if (strstr(nm, "bf.GE") && psz >= 512) { ty = 5; tot5++; }

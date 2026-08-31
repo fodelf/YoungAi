@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include "../../src/common/ds4_amp_fmt.h"   /* 116 记录头契约(单一定义源) */
 
 static void put32(FILE *f, uint32_t v) { fwrite(&v, 4, 1, f); }
 
@@ -47,11 +48,11 @@ int main(int argc, char **argv) {
             if (fread(raw, 1, sz, f) != (size_t)sz) { fclose(f); free(raw); continue; }
             fclose(f);
             long long off = 0;
-            while (off + 116 <= sz && nops < 64) {
+            while (off + DS4_AMP_REC_HDR <= sz) {
                 char nm[17]; memcpy(nm, raw + off, 16); nm[16] = 0;
-                uint64_t psz; memcpy(&psz, raw + off + 88, 8);
-                uint8_t *pay = raw + off + 116;
-                off += 116 + (long long)psz;
+                uint64_t psz; memcpy(&psz, raw + off + DS4_AMP_REC_OFF_PSZ, 8);
+                uint8_t *pay = raw + off + DS4_AMP_REC_HDR;
+                off += DS4_AMP_REC_HDR + (long long)psz;
                 uint32_t ty = 0;   /* AMPD 判在 AMP 之前(子串陷阱, 见文件头) */
                 if (strstr(nm, "bf.GE") && psz >= 512) ty = 5;
                 else if (strstr(nm, "zl.RRR") && psz >= 16) ty = 6;
@@ -59,6 +60,10 @@ int main(int argc, char **argv) {
                 else if (strstr(nm, "zl.AMP") && psz >= 16) ty = 7;
                 else if (strstr(nm, "zl.RTE") && psz >= 16) ty = 8;
                 if (ty && !skip[ty]) {
+                    if (nops >= 64) {   /* 静默丢修正=转出的 zchain≠盘上 zrec, 停车 */
+                        fprintf(stderr, "zrec_to_zchain: L%d op 超容量 64, 拒绝静默丢; 提容量重编\n", L);
+                        exit(1);
+                    }
                     ops[nops].ty = ty; ops[nops].psz = psz;
                     ops[nops].pay = malloc(psz); memcpy(ops[nops].pay, pay, psz);
                     nops++; tot[ty]++;
