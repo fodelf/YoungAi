@@ -38,13 +38,13 @@
 #include "ds4_z.c"                      /* -I.. 仓库根: 与引擎同一份实现(复用铁律) */
 #include "ds4_loss.c"
 #include "linalg_small.h"               /* GE 256×256 正规方程用 chol_solve_spd */
+#include "row_layout.inc.c"             /* 行布局→fit/held(与 zlayer/ds4quant_run 同一份) */
 #define D 4096
 #define MAXG 8                          /* λ/k/M 网格上限 */
 #define MAXM 32                         /* 单档模式数上限 */
 
 static double tnow(void) {              /* 相位计时(提速轮的肥肉探测器) */
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 static void die(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
@@ -94,7 +94,6 @@ static float *anchor_load(const char *ap, int L, int ntok, int **top1_out) {
     free(ridx); free(rw);
     *top1_out = top1; return fin;
 }
-
 
 /* 图应用: d_in=3D 的 ftA 图先做 φ 提升(与引擎 type6 ftA 路同式) */
 static void apply_any(const ds4_z *zl, const float *x, float *phib, float *y) {
@@ -255,12 +254,13 @@ int main(int argc, char **argv) {
     if (frs) {
         if (!ers) die("--fit-ranges 设了必须同时给 --ev-ranges");
         fit = parse_ranges(frs, &nf); ev = parse_ranges(ers, &nev);
-    } else {
+    } else if (selftest) {               /* 合成行独立同分布, 按行号切无泄漏 */
         nf = nfit; nev = ntok - nfit;
         fit = xmalloc((size_t)nf * sizeof(int)); ev = xmalloc((size_t)nev * sizeof(int));
         for (int i = 0; i < nf; i++) fit[i] = i;
         for (int i = 0; i < nev; i++) ev[i] = nfit + i;
-    }
+    } else if (row_layout_split(anc, &fit, &nf, &ev, &nev) != 0)
+        die("行布局缺 %s.layout — 按行号切=已实锤的域错位事故路(zlayer 同款硬停), 显式行域走 --fit-ranges", anc);
     for (int i = 0; i < nf; i++) if (fit[i] >= ntok) die("fit 行 %d ≥ ntok", fit[i]);
     for (int i = 0; i < nev; i++) if (ev[i] >= ntok) die("ev 行 %d ≥ ntok", ev[i]);
     int maxk = 0, maxM = 0;
