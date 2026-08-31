@@ -7963,3 +7963,24 @@ dspark_anchor_corpus.sh 锚采集腿(诊断已删)。
 真模型套件 SKIP), make -C gguf-tools amp + tools-test 全绿, zloss --selftest 绿。
 未修(结构性, 非本轮): x/路由在 FP 锚空间拟合部署在链态空间(XCAP 支柱挂账)、跨语料闸缺失。
 ★spark 侧须重编 zlayer/zloss_solve/ds4quant_run+引擎后才可发车下一轮反修。★
+
+## 2026-08-31 续: 剩余三条重定性为 bug/死代码并落地(用户裁决"三等分后这三个要么bug要么无效代码")
+
+⑥ **跨语料闸落地**(0e0/…): 三等分语料切了却无闸消费第二份 —— zlayer 新增
+  --gate-anchor(闸料=量化半锚: 与反修半零重叠、非判决锚), 全锚等距抽 2048 行,
+  打分与 held 全同式(f16 因子+整行夹持+GE), 挽回≤0 拒注。配对构建从 p4 内联块
+  抽成 zlayer_build.inc.c 唯一实现(算术逐字未动), 主解算与闸同源。
+  amp_clean_full 冠军链已接闸料并硬检。
+  ★金标欠账: 构建体是 py 金标口径, 抽函数=纯搬移, spark 下轮发车前复跑一层对拍
+  migrate/golden.txt 确认字节未漂。★
+⑦ **链态口径判决针入库**(c77f4e1): --chain-anchor 捕获与 zlayer --xanchor 全套
+  机器一直是冠军链外死代码(08-24 主 bug 修法挂账)。amp_campaign 新增 chainx 段:
+  判决尺同款回放顺手捕裸量化链 fin/路由 → 探针工作区两臂(FP-x vs --xanchor)单层
+  L20, INJ=0 零注入, 判据=跨语料闸挽回谁高。历史两次链态翻车都判在旧尺(无夹持
+  无 f16 无行掩码)下, 本针在修好的尺上重问。10 分钟铁律内, 发车须批准。
+⑧ 陈注释修正(eba95f8): amp_clean_full"XANCHOR/GGUF/ADDON C 版硬拒"不实, C 版全实现。
+
+至此 9 条审计项全部落地: 6 条点状 bug 修复 + 跨语料闸 + 链态判决针 + 注释对账。
+验证: zlayer/zloss 编译绿, tools-test 绿, linecount 绿, bash -n 绿。
+待 spark: ①金标一层对拍(zlayer_build 抽取复核) ②champ86 底座 dql op 盘点(守卫会不会
+停车) ③chainx 针发车(要批准) ④重编三件套+引擎。
