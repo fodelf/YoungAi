@@ -69,15 +69,17 @@ static uint8_t *rec_ge(uint8_t *buf, size_t *len, const float *dz256) {
     return rec_append(buf, len, "bf.GE", g16, sizeof g16);
 }
 
-/* zl.RRR 载荷: k(u32) tr=0.5(f32) din(u32) dout(u32) + f16 z[k]|U[dout×k]|V[din×k]
- * (zlayer_p7 非 ADDON 路同构; tr 槽写 0.5=引擎信任域契约) */
-static uint8_t *rec_rrr(uint8_t *buf, size_t *len, const ds4_z *zl) {
+/* zl.RRR 载荷: k(u32) tr(f32) din(u32) dout(u32) + f16 z[k]|U[dout×k]|V[din×k]
+ * (zlayer_p7 非 ADDON 路同构)。★tr 写评估实际用的 --tr★: 旧版死写 0.5, --tr≠0.5 时
+ * held 择优与部署夹持强度分叉 = 选出来的冠军部署行为没被评过。tr≤0(评估"不夹")
+ * 无部署编码 —— 引擎把 cap=0 读成整条修正清零, 落这种产物=静默假落地, 停车。 */
+static uint8_t *rec_rrr(uint8_t *buf, size_t *len, const ds4_z *zl, float tr) {
+    if (!(tr > 0)) die("--tr %.3g 无部署编码(引擎 cap=tr·‖routed‖, ≤0=修正清零), 拒发射", tr);
     uint32_t K = zl->k, din = zl->d_in, dout = zl->d_out;
     size_t nh = (size_t)K + (size_t)dout * K + (size_t)din * K;
     size_t psz = 16 + nh * 2;
     uint8_t *pay = xmalloc(psz);
-    float tr05 = 0.5f;
-    memcpy(pay, &K, 4); memcpy(pay + 4, &tr05, 4);
+    memcpy(pay, &K, 4); memcpy(pay + 4, &tr, 4);
     memcpy(pay + 8, &din, 4); memcpy(pay + 12, &dout, 4);
     uint16_t *h = (uint16_t *)(pay + 16);
     for (uint32_t c = 0; c < K; c++) h[c] = ds4_f64_to_f16((double)zl->z[c]);
@@ -168,11 +170,11 @@ static void run_emit_ge(const char *ldir, int L, const zpairs *zp, const float *
     free(gecorr);
 }
 
-/* 全网格路终局: 四损失冠军整体落地。ge_dz=基 GE δ(组合臂的 bf.GE 基)。 */
+/* 全网格路终局: 四损失冠军整体落地。ge_dz=基 GE δ(组合臂的 bf.GE 基); tr=评估用的信任域。 */
 static void emit_z_finish(const char *ldir, int L, best_t *best, const float *ge_dz,
                           float la0, float lc0, float tot0, const ds4_loss_weights *lw,
                           const float *Yt, const int *fit, int nf,
-                          uint64_t seed, float dscale, int ge_wins) {
+                          uint64_t seed, float dscale, int ge_wins, float tr) {
     float *wclsf = xmalloc(D * sizeof(float));   /* fit 侧教师 per-dim 方差(引擎 classify 权) */
     {
         float *Ytf = xmalloc((size_t)nf * D * sizeof(float));
@@ -192,7 +194,7 @@ static void emit_z_finish(const char *ldir, int L, best_t *best, const float *ge
         uint8_t *recs = NULL; size_t len = 0; int nrec = 0;
         const int with_ge = (best->zkeep_hasge || ge_solo) && ge_dz;
         if (with_ge) { recs = rec_ge(recs, &len, ge_dz); nrec++; }
-        recs = rec_rrr(recs, &len, best->zkeep); nrec++;
+        recs = rec_rrr(recs, &len, best->zkeep, tr); nrec++;
         recs = rec_4l(recs, &len, lw, seed, dscale, wclsf, D); nrec++;   /* 四损失参数随 z 落地 */
         inject_recs(ldir, L, recs, len, nrec);
         free(recs);

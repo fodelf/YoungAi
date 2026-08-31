@@ -82,7 +82,7 @@
             size_t psz = 16 + nh * 2;
             uint8_t *pay = (uint8_t *)xmalloc(psz);
             uint32_t u32k = (uint32_t)km, u32di = (uint32_t)DIW, u32do = (uint32_t)D;
-            float tr05 = 0.5f;
+            float tr05 = DS4_AMP_ZL_TR;
             memcpy(pay, &u32k, 4); memcpy(pay + 4, &tr05, 4);
             memcpy(pay + 8, &u32di, 4); memcpy(pay + 12, &u32do, 4);
             uint16_t *h = (uint16_t *)(pay + 16);
@@ -113,9 +113,9 @@
         size_t psz = 16 + nh * 2;
         uint8_t *pay = (uint8_t *)xmalloc(psz);
         uint32_t u32k = (uint32_t)K, u32di = (uint32_t)din, u32do = (uint32_t)D;
-        /* ★tr 槽写 0.5★ 引擎 type6 拿它当信任域上限(‖z 出力‖ ≤ tr·‖routed‖), 不是"关闭夹持"
-         * 的大数 —— 今晨定的契约, 写 1e6 等于事实上无夹持。 */
-        float tr05 = 0.5f;
+        /* ★tr 槽★ 引擎 type6 拿它当信任域上限(‖z 出力‖ ≤ tr·‖routed‖), 不是"关闭夹持"
+         * 的大数 —— 写 1e6 等于事实上无夹持。写值收进 ds4_amp_fmt.h 单一定义源。 */
+        float tr05 = DS4_AMP_ZL_TR;
         memcpy(pay, &u32k, 4); memcpy(pay + 4, &tr05, 4);
         memcpy(pay + 8, &u32di, 4); memcpy(pay + 12, &u32do, 4);
         uint16_t *h = (uint16_t *)(pay + 16);

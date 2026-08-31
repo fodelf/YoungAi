@@ -213,7 +213,7 @@ int main(int argc, char **argv) {
     int ranks[MAXG] = {16, 64, 128, 256}; int nrank = 4;
     double lambdas[MAXG] = {3e-3, 3e-2, 3e-1}; int nlam = 3;
     ds4_loss_weights lw = {1.0f, 0.5f, 0.1f, 1e-3f};
-    double dscale = 0.04, trclamp = 0.5; uint64_t seed = 1;
+    double dscale = 0.04, trclamp = DS4_AMP_ZL_TR; uint64_t seed = 1;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--anchor") && i + 1 < argc) anc = argv[++i];
         else if (!strcmp(argv[i], "--zcache") && i + 1 < argc) zdir = argv[++i];
@@ -477,8 +477,8 @@ int main(int argc, char **argv) {
             z_fp16_recheck(&best, best.zkeep_hasge ? gecorr : NULL, X, Ys, R, Yt_ev,
                            wv, ev, mode0, nev, dscale, seed, nth, L, lf);
             fclose(lf);
-            emit_z_finish(emitz, L, &best, ge_dz, la0, lc0,
-                          tot0, &lw, Yt, fit, nf, seed, (float)dscale, ge_wins);
+            emit_z_finish(emitz, L, &best, ge_dz, la0, lc0, tot0, &lw, Yt, fit,
+                          nf, seed, (float)dscale, ge_wins, (float)trclamp);
         } else fclose(lf);
         if (!won && !emitz) any_lost = 1;   /* 落地跑: 输裸层=记档不注入, 不停车 */
         if (selftest) {

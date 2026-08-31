@@ -27,6 +27,11 @@
  * 超过它=GPU 端越界踩共享内存(08-30 band kernel 错位同族事故)。提秩必须先改 shader。 */
 #define DS4_AMP_ZK_MAX 1024
 
+/* z^L 信任域默认(‖Δ‖≤tr·‖routed‖ 的 tr): 载荷 tr 槽的生产写值。曾在 zlayer_p7 两处
+ * 与 zloss_emit 各写一份 0.5f 字面量 —— 部署强度是判决尺/引擎/解算评估共用的契约,
+ * 散写=改一处漏两处的静默分叉。tr≤0 无部署编码(引擎把 cap=0 读成整条修正清零)。 */
+#define DS4_AMP_ZL_TR 0.5f
+
 /* fit/val 切分: 前 3/4 拟合、尾 1/4 验证。ds4quant_run_p14 的 checkpoint 续跑用同一
  * 公式从旧 S 反推旧切分 —— 改比例=历史 checkpoint 全部静默错切, 视为格式冻结。 */
 #define DS4_AMP_FIT_SPLIT(n) (((n) * 3) / 4)
