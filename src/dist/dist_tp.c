@@ -162,7 +162,7 @@ static void *dist_tp_selftest_thread(void *ud) {
 }
 
 int ds4_dist_tp_selftest(void) {
-    const uint32_t count = 4096; /* one n_embd vector */
+    const uint32_t count = 4096; /* 任意自测长度(凑典型隐维体量; 回环自测不依赖模型 shape) */
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -1;
 
@@ -302,7 +302,13 @@ static int dist_run_tp_leader(ds4_engine *engine, const ds4_dist_options *opt,
                               const ds4_dist_generation_options *gen) {
     char err[256];
     ds4_session *session = NULL;
-    if (ds4_session_create(&session, engine, gen->ctx_size > 0 ? gen->ctx_size : 4096) != 0) {
+    /* 不兜底(与 coordinator/worker 路一致): TP 两侧 session ctx 必须同值, 这里静默
+     * 落一个默认值会让双机 KV 容量劈叉。CLI 默认 32768 保证正常路径恒 >0。 */
+    if (gen->ctx_size <= 0) {
+        fprintf(stderr, "ds4: TP leader: ctx_size must be > 0 (got %d)\n", gen->ctx_size);
+        return 1;
+    }
+    if (ds4_session_create(&session, engine, gen->ctx_size) != 0) {
         fprintf(stderr, "ds4: TP leader: failed to create session\n");
         return 1;
     }
@@ -387,7 +393,11 @@ static int dist_run_tp_follower(ds4_engine *engine, const ds4_dist_options *opt,
     (void)opt;
     char err[256];
     ds4_session *session = NULL;
-    if (ds4_session_create(&session, engine, ctx_size > 0 ? ctx_size : 4096) != 0) {
+    if (ctx_size <= 0) {   /* 同 leader: 静默默认会与对侧 ctx 劈叉, 拒绝 */
+        fprintf(stderr, "ds4: TP follower: ctx_size must be > 0 (got %d)\n", ctx_size);
+        return 1;
+    }
+    if (ds4_session_create(&session, engine, ctx_size) != 0) {
         fprintf(stderr, "ds4: TP follower: failed to create session\n");
         return 1;
     }

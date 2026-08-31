@@ -49,7 +49,9 @@ while kill -0 "$DPID" 2>/dev/null; do
   [ "$EL" -ge "$RUN_TIMEOUT" ] && { echo "[watchdog] 超时 ${EL}s 杀" >> "$RPT"; kill -9 "$DPID"; break; }
   MB=$(footprint -p "$DPID" 2>/dev/null | grep -Eo 'Footprint: *[0-9.]+ *[KMG]B' | head -1 \
        | awk '{v=$2;u=$3; if(u=="GB")v*=1024; else if(u=="KB")v/=1024; printf "%d",v}')
-  [ -n "${MB:-}" ] && [ "${MB:-0}" -gt "$MAXMB" ] && { echo "[watchdog] ${MB}MB>红线 杀" >> "$RPT"; kill -9 "$DPID"; break; }
+  # fail-closed: footprint 读不出=失明, 按危险杀(旧版读空跳过判断=看门狗静默缴械)
+  [ -z "${MB:-}" ] && { echo "[watchdog] footprint 读取失败(失明)=按危险处理 杀" >> "$RPT"; kill -9 "$DPID"; break; }
+  [ "$MB" -gt "$MAXMB" ] && { echo "[watchdog] ${MB}MB>红线 杀" >> "$RPT"; kill -9 "$DPID"; break; }
   sleep 3
 done
 wait "$DPID" 2>/dev/null; RC=$?

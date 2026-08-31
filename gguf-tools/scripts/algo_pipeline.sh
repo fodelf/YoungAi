@@ -38,8 +38,14 @@ PY
   ( sleep 15
     while true; do
       cp=$(pgrep -f "role coordinator" | head -1); [ -z "$cp" ] && exit 0
-      kb=$(ps -o rss= -p "$cp" 2>/dev/null | tr -d ' '); g=$(( ${kb:-0} / 1048576 ))
-      rkb=$(ssh "$M1" "pgrep -f 'role worker' | head -1 | xargs -I{} ps -o rss= -p {}" 2>/dev/null | tr -d ' '); rg=$(( ${rkb:-0} / 1048576 ))
+      # fail-closed: 读数为空(本地竞态/ssh 断)旧版落 0=失明放行; 12G 红线是双机最高约束,
+      # 失明按越线同杀(误杀=重跑, 漏拦=OOM 挂机)。
+      kb=$(ps -o rss= -p "$cp" 2>/dev/null | tr -d ' ')
+      rkb=$(ssh "$M1" "pgrep -f 'role worker' | head -1 | xargs -I{} ps -o rss= -p {}" 2>/dev/null | tr -d ' ')
+      if [ -z "$kb" ] || [ -z "$rkb" ]; then
+          echo "[algo-pipeline] 看门狗失明(L='${kb}' R='${rkb}')=按越线处理 同杀"; kill "$cp"; ssh "$M1" "pkill -f 'role worker'"; exit 1
+      fi
+      g=$(( kb / 1048576 )); rg=$(( rkb / 1048576 ))
       if [ "$g" -gt 12 ] || [ "$rg" -gt 12 ]; then echo "[algo-pipeline] MEM-BREACH L=${g}G R=${rg}G 同杀"; kill "$cp"; ssh "$M1" "pkill -f 'role worker'"; exit 1; fi
       sleep 20
     done ) & WD=$!
