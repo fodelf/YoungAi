@@ -269,6 +269,22 @@
         if (lu_solve(Gg, NEXP, bg)) die("GE 解算奇异 — 停车");
         for (int e = 0; e < NEXP; e++) { ge16[e] = f64_to_f16(1.0 + bg[e]); gf[e] = f16_to_f32(ge16[e]); }
         free(Gg); free(bg);
+        if (GE_DEMEAN) {
+            /* ★GE 去均值(2026-09-01 GE 针)★ 判决份 PPL 反向(裸 1.065→反修 1.272)与
+             * chainx B臂 GE<1 换 PPL 互为镜像 ⇒ 病根假设=增益的整体放大分量(层均值
+             * 1.04-1.09)锐化分布, 压掉硬文本真 token 的尾部概率; 专家间相对修正才是
+             * 要保的信号。均值按部署使用频次(配对计数)加权, 归一后 f16 再舍(与存储
+             * 一致); 后续组合/分域/闸全部评的是归一后增益(择优与部署同物)。 */
+            long long *uc = (long long *)xcalloc((size_t)NEXP, sizeof(long long));
+            for (long long p2 = 0; p2 < npair; p2++) uc[pe[p2]]++;
+            double sw = 0, sg = 0;
+            for (int e = 0; e < NEXP; e++) { sw += (double)uc[e]; sg += (double)uc[e] * gf[e]; }
+            const double gm = sw > 0 ? sg / sw : 1.0;
+            if (gm > 1e-6) for (int e = 0; e < NEXP; e++) {
+                ge16[e] = f64_to_f16(gf[e] / gm); gf[e] = f16_to_f32(ge16[e]); }
+            free(uc);
+            printf("  L%d GE去均值: 部署加权均值 %.4f → 1.0\n", L, gm);
+        }
         /* 组合终验: z^L(K)+GE 在 held 段的总增益(行权同打分口径) */
         double eng = 0;
         double *rr = (double *)xmalloc((size_t)D * sizeof(double));

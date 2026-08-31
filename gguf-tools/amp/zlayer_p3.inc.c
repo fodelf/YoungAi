@@ -344,7 +344,7 @@ int main(int argc, char **argv) {
      * 是 .py 权威口径(它把 ADDON 的读取整块写在 if XAP: 里面), 不"修正", 只多打一行提示。 */
     const char *GGP = NULL, *XAP = NULL, *GATEA = NULL;
     int ADDON = 0, CACHE_ONLY = 0, NGATE = 2048;
-    int NTOK = 0, FTA = 1, GE_ON = 1, ERF_EN = 1, ERF_RANK = 8;
+    int NTOK = 0, FTA = 1, GE_ON = 1, ERF_EN = 1, ERF_RANK = 8, GE_DEMEAN = 0;
     float SWLIM = 10.0f;
     double GATE = 0.0, GELAM = 1e-3, ERF_BAR = 0.01;
     for (int ai = nfx; ai < argc; ai++) {
@@ -352,6 +352,7 @@ int main(int argc, char **argv) {
         const char *v = (ai + 1 < argc) ? argv[ai + 1] : NULL;
         if      (!strcmp(a, "--addon"))      ADDON = 1;
         else if (!strcmp(a, "--cache-only")) CACHE_ONLY = 1;
+        else if (!strcmp(a, "--ge-demean"))  GE_DEMEAN = 1;   /* GE 针: 增益部署加权均值归一 */
         else if (!v) die("flag %s 缺值", a);
         else if (!strcmp(a, "--gguf"))    { GGP = *v ? v : NULL; ai++; }
         else if (!strcmp(a, "--xanchor")) { XAP = *v ? v : NULL; ai++; }

@@ -27,6 +27,14 @@ HF=$HOME/ds4-main/hf/DeepSeek-V4-Flash-0731
 # x=锚fin 与部署分布错位, 行cos L3=0.961/L20=0.875/L40=0.797, z 层内收益部署不兑现,
 # 2026-08-24 定位的主 bug)。判决针已入库: amp_campaign.sh chainx(FP-x vs --xanchor 单层
 # A/B, 部署同式打分+跨语料闸口径) —— 链态臂胜出之日把 --xanchor 接进这里的常量区。
+# GE 针透传(2026-09-01 用户令): 实验臂参数不进配方常量区, 不给=现役 full。
+# --ge-demean=增益部署加权均值归一 / --ge 0=纯 z 归因臂。
+GEFLAGS=()
+while [ $# -gt 0 ]; do case "$1" in
+  --ge) GEFLAGS+=(--ge "${2:?--ge 要值}"); shift 2;;
+  --ge-demean) GEFLAGS+=(--ge-demean); shift;;
+  *) break;;
+esac; done
 LRANGE=""
 if [ $# -gt 0 ]; then LRANGE=$(seq "${1:?}" "${2:?给了 L_lo 必须给 L_hi}"); fi
 LOG(){ echo "[$WS $(date +%H:%M:%S)] $*"; }
@@ -58,8 +66,8 @@ ZLB="$HOME/ds4-main/gguf-tools/amp/zlayer"
 [ -x "$ZLB" ] || make -C "$HOME/ds4-main/gguf-tools" zlayer
 for L in ${LRANGE:-$(seq 0 42)}; do
   "$ZLB" "$HF" $D2/$WS/layers "$ANC" $L "$ZL_K" 1 \
-    --ntok "$ZL_NTOK" --gate-anchor "$QANC" \
-    2>&1 | grep -aE "XCAP|跨语料|Error|assert|★" || { LOG "★L$L 失败★"; exit 1; }
+    --ntok "$ZL_NTOK" --gate-anchor "$QANC" ${GEFLAGS[@]+"${GEFLAGS[@]}"} \
+    2>&1 | grep -aE "XCAP|跨语料|GE去均值|Error|assert|★" || { LOG "★L$L 失败★"; exit 1; }
   # 进度可观测铁律: 每层收官打一行(tail -f 就能看到 43 层推进)
   # INJ=1 走 dql 注入不写 zrec ⇒ 旧的 zrec 计数恒 0/43(观测 bug); 改数注入账本行
   LOG "L$L ✓ $(grep -c '' "$D2/$WS/layers/zinject_manifest.txt" 2>/dev/null || echo 0)/43 K=$ZL_K"
