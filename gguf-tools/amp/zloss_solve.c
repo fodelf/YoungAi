@@ -34,10 +34,10 @@
 #include <math.h>
 #include <pthread.h>
 #include "npy.h"
+#include "../../src/common/ds4_amp_fmt.h"   /* 116 记录头契约(单一定义源) */
 #include "ds4_z.c"                      /* -I.. 仓库根: 与引擎同一份实现(复用铁律) */
 #include "ds4_loss.c"
 #include "linalg_small.h"               /* GE 256×256 正规方程用 chol_solve_spd */
-
 #define D 4096
 #define MAXG 8                          /* λ/k/M 网格上限 */
 #define MAXM 32                         /* 单档模式数上限 */

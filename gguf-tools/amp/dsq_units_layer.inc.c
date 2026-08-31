@@ -98,7 +98,7 @@ static int real_layer(const char *hf,const char *anc,int L,int NE,int SROW,int V
     float *DH=malloc((size_t)SROW*D*4);
     for(size_t i=0;i<(size_t)SROW*D;i++) DH[i]=YF[i]-YQ[i];
     double eq=0,ef=0; for(size_t i=0;i<(size_t)SROW*D;i++){ eq+=(double)DH[i]*DH[i]; ef+=(double)YF[i]*YF[i]; }
-    const int vs=(SROW*3)/4;
+    const int vs=DS4_AMP_FIT_SPLIT(SROW);
     elm_res er; const double t2=vqt_now();
     const int erc = elm_solve(X,YQ,DH,SROW,D,vs,&er);
     const double t3=vqt_now();

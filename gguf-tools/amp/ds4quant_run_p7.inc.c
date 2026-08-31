@@ -355,7 +355,7 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
             if(m<2){ free(evr_loc); evr_loc=NULL; }   /* 抽格里 eval 行太少: 本层 z 块跳过打分侧 */
             else { EVR=evr_loc; nEV=m; }
         }
-        int vs=(n_fit*3)/4; int nval=n_fit-vs;
+        int vs=DS4_AMP_FIT_SPLIT(n_fit); int nval=n_fit-vs;
         if(nval<8){ vs=n_fit; nval=0; }
         /* 行帽已撤(2026-08-23): 2048 行全梯拒(过拟合), 行数是拟合质量的硬需求;
          * 时长改从 z_solve_dual 并行化拿(600GFLOP 单线程→20 线程)。 */
@@ -432,11 +432,11 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
                     { const char*ld3=g_cli.layer_dir;
                       if(ld3){ char zp3[1024]; snprintf(zp3,sizeof zp3,"%s/zrec_L%02d.bin",ld3,L);
                         FILE*zf3=fopen(zp3,"wb");
-                        if(zf3){ unsigned char hdr3[116]; memset(hdr3,0,116);
+                        if(zf3){ unsigned char hdr3[DS4_AMP_REC_HDR]; memset(hdr3,0,DS4_AMP_REC_HDR);
                           memcpy(hdr3,"zl.RRR",6);
                           unsigned long long psz3=16ull+2ull*((unsigned long long)kk+2ull*(unsigned long long)kk*DIM);
-                          memcpy(hdr3+88,&psz3,8); int one3=1; memcpy(hdr3+112,&one3,4);
-                          fwrite(hdr3,1,116,zf3);
+                          memcpy(hdr3+DS4_AMP_REC_OFF_PSZ,&psz3,8); int one3=1; memcpy(hdr3+DS4_AMP_REC_OFF_VD,&one3,4);
+                          fwrite(hdr3,1,DS4_AMP_REC_HDR,zf3);
                           uint32_t zk3=(uint32_t)kk,di3=(uint32_t)DIM,do3=(uint32_t)DIM; float tr3=(float)LZTR;
                           fwrite(&zk3,4,1,zf3); fwrite(&tr3,4,1,zf3); fwrite(&di3,4,1,zf3); fwrite(&do3,4,1,zf3);
                           uint16_t*h3=malloc(((size_t)kk+2*(size_t)kk*DIM)*2); size_t o3=0;
@@ -460,7 +460,7 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
              * 近似 —— 专家间差异被平均抹平=低估改善, 过闸则真实改善≥评估(保守安全)。
              * 落地: Fout*=ĝ(序贯传链) + zrec 追加 bf.GE(引擎 type5 精确 per-expert 执行)。 */
             if(kland==0){
-                int vs2=(n_fit*3)/4; int nval2=n_fit-vs2; if(nval2<8){ vs2=n_fit; nval2=0; }
+                int vs2=DS4_AMP_FIT_SPLIT(n_fit); int nval2=n_fit-vs2; if(nval2<8){ vs2=n_fit; nval2=0; }
                 double *gnum=calloc((size_t)NEXP,sizeof(double)),*gden=calloc((size_t)NEXP,sizeof(double));
                 for(int s2=0;s2<vs2;s2++){
                     /* ★口径正修(2026-08-31)★ 部署的 GE 乘的是 routed(引擎乘门权/回放专家累加时乘),
@@ -512,11 +512,11 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
                         const char*ld4=g_cli.layer_dir;
                         if(ld4){ char zp4[1024]; snprintf(zp4,sizeof zp4,"%s/zrec_L%02d.bin",ld4,L);
                             FILE*zf4=fopen(zp4,"ab");   /* 追加(层可同时有 zl.RRR + bf.GE; 拒层=仅 GE) */
-                            if(zf4){ unsigned char hdr4[116]; memset(hdr4,0,116);
+                            if(zf4){ unsigned char hdr4[DS4_AMP_REC_HDR]; memset(hdr4,0,DS4_AMP_REC_HDR);
                                 memcpy(hdr4,"bf.GE",5);
                                 unsigned long long psz4=(unsigned long long)NEXP*2;
-                                memcpy(hdr4+88,&psz4,8); int one4=1; memcpy(hdr4+112,&one4,4);
-                                fwrite(hdr4,1,116,zf4);
+                                memcpy(hdr4+DS4_AMP_REC_OFF_PSZ,&psz4,8); int one4=1; memcpy(hdr4+DS4_AMP_REC_OFF_VD,&one4,4);
+                                fwrite(hdr4,1,DS4_AMP_REC_HDR,zf4);
                                 uint16_t geh4[NEXP];
                                 for(int e2=0;e2<NEXP;e2++) geh4[e2]=go1b_fp32_to_fp16(gev[e2]);
                                 fwrite(geh4,2,NEXP,zf4); fclose(zf4);

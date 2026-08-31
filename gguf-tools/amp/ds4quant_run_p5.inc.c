@@ -193,7 +193,7 @@ static void coadapt_moe(int L,int S,int n_fit,const float*Fin,const int*idx,cons
     size_t rowsz=(size_t)HCM*DIM, lstride=(size_t)S*rowsz;
     const float *Hf=ANC.H+(size_t)L*lstride;   /* 目标仍是 FP 输出(要还原原模型) */
     const float *afin=Fin;   /* ★累加前层★: 校准/锚基底=当前累积激活(前层量化+z 已注入), 非 FP 锚 */
-    int vs=(n_fit*3)/4, nval=n_fit-vs; if(nval<8){ vs=n_fit; nval=0; }
+    int vs=DS4_AMP_FIT_SPLIT(n_fit), nval=n_fit-vs; if(nval<8){ vs=n_fit; nval=0; }
     float *shared=malloc((size_t)S*DIM*4); memcpy(shared,Fout,(size_t)S*DIM*4);
     coexp_t *ex=calloc((size_t)NEXP,sizeof(coexp_t));
     float *routed=malloc((size_t)S*DIM*4),*Fcur=malloc((size_t)S*DIM*4),*Ftest=malloc((size_t)S*DIM*4);

@@ -29,6 +29,7 @@
 #include "../quantize/vq_qc.h"            /* v2.2 VQ 码本(DS4_VQ=1): 热 vq4x512 全三矩阵 / 冷 w1w3 vq8x256 / 冷 w2 signref */
 #include "ds4_z.c"            /* 闭式秩-k RRR 隐变量 z (产物③) */
 #include "ds4_loss.c"        /* 四损失: align/classify/smooth/fixed */
+#include "../../src/common/ds4_amp_fmt.h"   /* 记录头/λ clamp/秩上限/fit切分: 与引擎同一契约 */
 #include <pthread.h>
 #include <time.h>
 #include <fcntl.h>

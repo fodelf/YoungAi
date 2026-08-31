@@ -218,21 +218,21 @@ int main(int argc, char **argv) {
         snprintf(p, sizeof p, "%s/zrec_L%02d.bin", outd, L);
         FILE *f = fopen(p, "wb");
         if (!f) { fprintf(stderr, "L%d: %s 打不开\n", L, p); return 4; }
-        uint8_t hdr[116]; memset(hdr, 0, sizeof hdr);
+        uint8_t hdr[DS4_AMP_REC_HDR]; memset(hdr, 0, sizeof hdr);
         if (best_rec <= cos0 + 2e-4 || best_lam < 0) {   /* 层闸: held 对齐度无增益 */
             memcpy(hdr, "zl.AMP", 6);
-            uint64_t psz = 0; memcpy(hdr + 88, &psz, 8);
-            int32_t one = 1; memcpy(hdr + 112, &one, 4);
-            fwrite(hdr, 1, 116, f); fclose(f);
+            uint64_t psz = 0; memcpy(hdr + DS4_AMP_REC_OFF_PSZ, &psz, 8);
+            int32_t one = 1; memcpy(hdr + DS4_AMP_REC_OFF_VD, &one, 4);
+            fwrite(hdr, 1, DS4_AMP_REC_HDR, f); fclose(f);
             printf("★L%d 放大器(C): held对齐 %.4f→%.4f 无增益 → 层闸 | %lds\n",
                    L, cos0, best_rec, (long)(time(NULL) - t0));
         } else {
             const int k = best_k;
             memcpy(hdr, "zl.AMPD", 7);
             uint64_t psz = 16 + (size_t)2 * DIN * k * 2 + (size_t)D * k * 2;
-            memcpy(hdr + 88, &psz, 8);
-            int32_t one = 1; memcpy(hdr + 112, &one, 4);
-            fwrite(hdr, 1, 116, f);
+            memcpy(hdr + DS4_AMP_REC_OFF_PSZ, &psz, 8);
+            int32_t one = 1; memcpy(hdr + DS4_AMP_REC_OFF_VD, &one, 4);
+            fwrite(hdr, 1, DS4_AMP_REC_HDR, f);
             uint32_t ku = (uint32_t)k, dinu = (uint32_t)DIN, du = (uint32_t)D;
             fwrite(&ku, 4, 1, f); fwrite(&scale, 4, 1, f); fwrite(&dinu, 4, 1, f); fwrite(&du, 4, 1, f);
             uint16_t *h16 = malloc((size_t)DIN * k * sizeof(uint16_t));

@@ -9,11 +9,11 @@
         snprintf(path, sizeof path, "%s/zrec_L%02d.bin", PREV, L);
         FILE *pf = fopen(path, "rb");
         if (!pf) die("上一轮记录打不开: %s", path);
-        uint8_t hdr[116];
-        if (fread(hdr, 1, 116, pf) != 116) die("%s 头截断", path);
+        uint8_t hdr[DS4_AMP_REC_HDR];
+        if (fread(hdr, 1, DS4_AMP_REC_HDR, pf) != DS4_AMP_REC_HDR) die("%s 头截断", path);
         char nm[17]; memcpy(nm, hdr, 16); nm[16] = 0;
         if (!strstr(nm, "zl.AMPD")) die("assert 失败: L%d 上一轮记录不是 AMPD(%s), 无法还原增益", L, nm);
-        uint64_t psz; memcpy(&psz, hdr + 88, 8);
+        uint64_t psz; memcpy(&psz, hdr + DS4_AMP_REC_OFF_PSZ, 8);
         uint8_t *pay = (uint8_t *)xmalloc((size_t)psz);
         if (fread(pay, 1, (size_t)psz, pf) != psz) die("%s 载荷截断", path);
         fclose(pf);

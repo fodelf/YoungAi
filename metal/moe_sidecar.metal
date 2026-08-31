@@ -362,7 +362,8 @@ kernel void kernel_dsv4_zchain_scale(
             lam = op[1] * lam;
         } else if (ty == 2u) {
             float c = op[2] + op[3] * ((xnorm - op[4]) / op[5]);
-            c = clamp(c, 0.25f, 4.0f);
+            c = clamp(c, 0.25f, 4.0f);   // 镜像字面量: 单一定义 src/common/ds4_amp_fmt.h(shader 无 include 路径), 改必同步
+
             lam = c * lam;
         } else if (ty == 3u) {
             const int blk = (int)op[15];
@@ -375,7 +376,8 @@ kernel void kernel_dsv4_zchain_scale(
                     const float dot = zc_tg_reduce_add(dk, red, tid, ntg);
                     c += op[7 + k] * dot;
                 }
-                c = clamp(c, 0.25f, 4.0f);
+                c = clamp(c, 0.25f, 4.0f);   // 镜像字面量: 单一定义 src/common/ds4_amp_fmt.h(shader 无 include 路径), 改必同步
+
                 lam = c * lam;
             }
         } else if (ty == 4u) {
@@ -395,7 +397,7 @@ kernel void kernel_dsv4_zchain_scale(
         device const half *hV = hU + (uint64_t)d * zk;
         // pv 挪 threadgroup(k>16 时寄存器放不下); c 归属制: 每线程认领 c 子集算完整
         // 点积, 免去逐 c 树归约(k=1024 时归约 barrier 是主开销)。
-        threadgroup float pvS[1024];
+        threadgroup float pvS[1024];   // = DS4_AMP_ZK_MAX(src/common/ds4_amp_fmt.h): z 秩全仓硬上限的物理来源, 提秩先改这里
         const uint din = (args.zl_din > 0u) ? args.zl_din : d;
         float nrm = 0.0f;
         if (din == 3u * d) {   // md86 ftA: φ=[x, x⊙x/rms, relu(x)], rms=sqrt(mean(x²))+1e-6

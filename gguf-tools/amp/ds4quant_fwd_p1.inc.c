@@ -10,6 +10,11 @@
  */
 #include <stdio.h>
 #include <stdlib.h>
+
+/* GPU GEMM 起送阈(FLOP=2·S·K·M), 08-18 实测校准: 只让 g_r 级大 GEMM(24 GFLOP)上 GPU。
+ * 5e6 低阈实测负收益(259s vs 181s/层): 20 线程高频小 GEMM 并发提交, launch+sync 队列
+ * 争用吃掉全部收益。本文件三个 matmul 变体共用这一个阈值。 */
+#define DQ_GPU_GEMM_MIN_FLOP 2.0e8
 #include <string.h>
 #include <math.h>
 #ifndef M_PI
@@ -158,7 +163,7 @@ static void dq_gpu_thread_release(void) {
 void dq_matmul_strided(const float *A, int lda, const float *B, int ldb,
                        float *Cst, int ldc, int S, int K, int M, float alpha) {
 #ifdef DS4QUANT_CUDA
-    if ((double)S * K * (double)M * 2.0 >= 2.0e8) {
+    if ((double)S * K * (double)M * 2.0 >= DQ_GPU_GEMM_MIN_FLOP) {
         cublasHandle_t h2 = g_dqh2; cudaStream_t s2 = g_dqs2;
         if (!h2) {
             if (cublasCreate(&h2) != CUBLAS_STATUS_SUCCESS) h2 = NULL;
@@ -194,7 +199,7 @@ void dq_matmul_strided(const float *A, int lda, const float *B, int ldb,
 void dq_matmul_nt_strided(const float *A, int lda, const float *B, int ldb,
                           float *Cst, int ldc, int S, int K, int M) {
 #ifdef DS4QUANT_CUDA
-    if ((double)S * K * (double)M * 2.0 >= 2.0e8) {
+    if ((double)S * K * (double)M * 2.0 >= DQ_GPU_GEMM_MIN_FLOP) {
         cublasHandle_t h3 = g_dqh3; cudaStream_t s3 = g_dqs3;
         if (!h3) {
             if (cublasCreate(&h3) != CUBLAS_STATUS_SUCCESS) h3 = NULL;
@@ -236,7 +241,7 @@ void dq_matmul(const float *X, const float *W, float *out, int S, int K, int M) 
     /* 阈=2e8(08-18 实测校准): 只让 g_r 级大 GEMM(24 GFLOP)上 GPU。5e6 低阈实测负收益
      * (259s vs 181s/层): 20 线程高频小 GEMM 并发提交, launch+sync 队列争用吃掉全部收益。
      * 高频小矩阵的正确姿势是批量结构改造(GPTQ 段 GPU 常驻), 不是逐调用换后端。 */
-    if ((double)S * K * (double)M * 2.0 >= 2.0e8) {
+    if ((double)S * K * (double)M * 2.0 >= DQ_GPU_GEMM_MIN_FLOP) {
         if (!g_dqh) {
             if (cublasCreate(&g_dqh) != CUBLAS_STATUS_SUCCESS) g_dqh = NULL;
             else { cudaStreamCreateWithFlags(&g_dqs, cudaStreamNonBlocking); cublasSetStream(g_dqh, g_dqs); }

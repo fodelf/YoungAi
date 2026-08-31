@@ -20,7 +20,7 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
     if(!GS_LW||!GS_LF||!HQE||Lfront<1||Jhi<=Jlo_in) return 0;
     size_t lstride=(size_t)S*HCM*DIM, rowsz=(size_t)HCM*DIM;
     const float*Htgt=ANC.H+(size_t)Lfront*lstride;
-    int vs=(n_fit*3)/4, changed=0, evald=0; double simpr=0;
+    int vs=DS4_AMP_FIT_SPLIT(n_fit), changed=0, evald=0; double simpr=0;
     double bf_bestdl=-1e300; int bf_bestJ=-1;   /* 可视化: 全部候选里最接近正向的Δ(没提交也看得见搜索) */
     char uc[300]; int ucl=0; uc[0]=0;           /* 未正向层清单(层号+最优候选Δ), 铁律: 不许隐身 */
     /* ★用户裁决2026-07-12★: 每前沿全量反修所有前层("末层最后一次全量"特例取消; fast 不进本函数) */

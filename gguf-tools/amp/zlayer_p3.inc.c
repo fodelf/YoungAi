@@ -225,12 +225,12 @@ static double fro_norm(const float *a, size_t n) {
 
 /* ---------------- 116B 记录头(py 的 rec()) ---------------- */
 static uint8_t *make_rec(const char *nm, const void *pay, size_t psz, size_t *out_len) {
-    uint8_t *r = (uint8_t *)xcalloc(116 + psz, 1);
+    uint8_t *r = (uint8_t *)xcalloc(DS4_AMP_REC_HDR + psz, 1);
     memcpy(r, nm, strlen(nm));
-    uint64_t p64 = psz; memcpy(r + 88, &p64, 8);
-    int32_t one = 1; memcpy(r + 112, &one, 4);
-    if (psz) memcpy(r + 116, pay, psz);
-    *out_len = 116 + psz;
+    uint64_t p64 = psz; memcpy(r + DS4_AMP_REC_OFF_PSZ, &p64, 8);
+    int32_t one = 1; memcpy(r + DS4_AMP_REC_OFF_VD, &one, 4);
+    if (psz) memcpy(r + DS4_AMP_REC_HDR, pay, psz);
+    *out_len = DS4_AMP_REC_HDR + psz;
     return r;
 }
 
@@ -424,13 +424,13 @@ int main(int argc, char **argv) {
         uint32_t nr2; memcpy(&nr2, draw + 8, 4);
         size_t off2 = 12;
         for (uint32_t i = 0; i < nr2; i++) {
-            if (off2 + 116 > dsz2) die("ADDON: dql 记录 %u 头越界", i);
+            if (off2 + DS4_AMP_REC_HDR > dsz2) die("ADDON: dql 记录 %u 头越界", i);
             char nm2[17]; memcpy(nm2, draw + off2, 16); nm2[16] = 0;
-            uint64_t psz2; memcpy(&psz2, draw + off2 + 88, 8);
-            int32_t vd; memcpy(&vd, draw + off2 + 112, 4);
-            if (off2 + 116 + psz2 > dsz2) die("ADDON: dql 记录 %u 载荷越界", i);
-            const uint8_t *pay2 = draw + off2 + 116;
-            off2 += 116 + (size_t)psz2;
+            uint64_t psz2; memcpy(&psz2, draw + off2 + DS4_AMP_REC_OFF_PSZ, 8);
+            int32_t vd; memcpy(&vd, draw + off2 + DS4_AMP_REC_OFF_VD, 4);
+            if (off2 + DS4_AMP_REC_HDR + psz2 > dsz2) die("ADDON: dql 记录 %u 载荷越界", i);
+            const uint8_t *pay2 = draw + off2 + DS4_AMP_REC_HDR;
+            off2 += DS4_AMP_REC_HDR + (size_t)psz2;
             if (vd != 1) continue;
             if (strstr(nm2, "bf.GE") && psz2 >= 512) {
                 if (!ge_old) ge_old = (float *)xmalloc(NEXP * 4);

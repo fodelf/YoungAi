@@ -289,7 +289,7 @@ static float *fwd_all(const long*ids,int S,int n_fit,int do_quant,const char*lcf
     if(do_quant&&ANC_OK&&BWD_L>=0&&g_cli.bwd_final){
         /* 向后·终端反调: 层出口 H 对修正量线性 → H(t)=lerp(H_base,H_corr,t);
          * t 网格重跑后缀+head 到最终 logits, val 行(fit 尾 1/4)选 t, held 行不参与选择 */
-        int vsq=(n_fit*3)/4;
+        int vsq=DS4_AMP_FIT_SPLIT(n_fit);
         double kl1=bwd_val_kl(ANC.logits,logits,vsq,n_fit);
         printf("BWDFIN L=%d t=1.00 val行KL=%.4f (基准)\n",BWD_L,kl1); fflush(stdout);
         double bestkl=kl1; float bestt=1.0f; float *bestlog=NULL;

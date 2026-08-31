@@ -36,6 +36,7 @@
 #include <math.h>
 #include <errno.h>
 #include <unistd.h>
+#include "../../src/common/ds4_amp_fmt.h"   /* 116 记录头契约(单一定义源) */
 #include <sys/stat.h>
 
 #define ALIGN            32
@@ -47,7 +48,7 @@
                                                    * 真 D 偏移一律走 --down-offsets 逐层文件 */
 #define DOWN_LAYER_BYTES ((uint64_t)NEXP * SZ_D)  /* 285,212,672 */
 #define RB_MINCNT        8                        /* 与 ds4quant_run RB_MINCNT 同步 */
-#define REC_HDR          116
+#define REC_HDR          DS4_AMP_REC_HDR   /* 116: 单一定义在 src/common/ds4_amp_fmt.h */
 
 #define CHUNK_SKEL (1u << 26)   /* .py: src.read(min(1 << 26, left)) */
 #define CHUNK_STRM (1u << 24)   /* .py: f.read(min(1 << 24, left)) / p.stdout.read(1 << 24) */

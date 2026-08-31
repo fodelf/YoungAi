@@ -278,7 +278,7 @@ static void zfile_commit(int L,lop_t*z,float m1metric){
  * zfile_commit, 否则全回退 — 判据不妥协(质量门)。一轮 ≈ 探测2-3min + 终验6min×β次。 */
 static void op_blend(lop_t*dst,const lop_t*o,const lop_t*f,float b);   /* 定义在下方 β信赖域区 */
 static int backfit_joint_round(const long*ids,int S,int n_fit,const float*H0,float*Hc,size_t lstride,double*kl0){
-    int vs=(n_fit*3)/4;
+    int vs=DS4_AMP_FIT_SPLIT(n_fit);
     size_t rowsz=(size_t)HCM*DIM;
     const int gdiv=DSQ_GS_SCREEN_DIV;   /* 与 p13 sweep 粗筛共用一份抽格密度(原两份拷贝合一) */
     int Sg=0,*gsx=malloc(sizeof(int)*(size_t)(S/gdiv+2));

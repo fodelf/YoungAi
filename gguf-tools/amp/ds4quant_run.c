@@ -36,6 +36,7 @@
 #include "row_layout.inc.c"   /* 行布局→分层行选取(与 zlayer 共用一份) */
 #include "ds4quant_run_p2.inc.c"
 #include "ds4quant_run_p3.inc.c"
+#include "dsq_lfile.inc.c"   /* 层文件读取+修正链(op 解析/zrec 并挂/DQZ2 发射), 自 p3 尾段切出 */
 #include "ds4quant_run_p4.inc.c"
 #include "ds4quant_run_p5.inc.c"
 #include "ds4quant_run_p6.inc.c"

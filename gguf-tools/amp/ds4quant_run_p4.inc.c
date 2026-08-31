@@ -268,7 +268,7 @@ static size_t append_rec(const char*path,const char*nm0,const char*al0,const voi
     fwrite(m,4,4,f); fwrite(&vd,4,1,f); fwrite(pay,1,(size_t)paysz,f);
     fseek(f,8,SEEK_SET); nrec++; fwrite(&nrec,4,1,f);
     fclose(f);
-    return (size_t)eof + 116;   /* 载荷偏移 = 记录起点 + (name16+algo64+vol8+psz8+mean16+vd4) */
+    return (size_t)eof + DS4_AMP_REC_HDR;   /* 载荷偏移 = 记录起点 + 记录头 */
 }
 double g_bmw_t[2]={0,0};
 /* 分块反量化的两个量必须在 #ifdef 外: CPU 参考路(-DDS4_NO_GPU / 无 CUDA)同样按块跑循环, 只是
@@ -406,7 +406,7 @@ static void bytes_moe(lfile_t*lf,int S,const float*Fin,const int*idx,const float
                 for(int s2=0;s2<S;s2++){ const float*x=Fin+(size_t)s2*DIM; double v=0;
                     for(int d2=0;d2<DIM;d2++) v+=(double)x[d2]*x[d2]; xn[s2]=(float)sqrt(v); } }
             for(int s2=0;s2<S;s2++){ double c=o->w2p[0]+o->w2p[1]*((double)xn[s2]-o->w2p[2])/o->w2p[3];
-                if(c<0.25)c=0.25; if(c>4.0)c=4.0;
+                if(c<DS4_AMP_LAM_MIN)c=DS4_AMP_LAM_MIN; if(c>DS4_AMP_LAM_MAX)c=DS4_AMP_LAM_MAX;
                 float*fw=Fout+(size_t)s2*DIM; const float*fb=Fbase+(size_t)s2*DIM;
                 for(int d2=0;d2<DIM;d2++) fw[d2]=fb[d2]+(float)c*(fw[d2]-fb[d2]); } }
         else if(o->type==3&&o->V8){
@@ -420,7 +420,7 @@ static void bytes_moe(lfile_t*lf,int S,const float*Fin,const int*idx,const float
                         for(int d2=0;d2<DIM;d2++) a2+=(double)x[d2]*vc[d2]; pr[c]=(float)a2; } } }
             for(int s2=0;s2<S;s2++){ const float*pr=pj+(size_t)s2*8;
                 double c=o->w8[0]; for(int k=0;k<8;k++) c+=o->w8[1+k]*pr[k];
-                if(c<0.25)c=0.25; if(c>4.0)c=4.0;
+                if(c<DS4_AMP_LAM_MIN)c=DS4_AMP_LAM_MIN; if(c>DS4_AMP_LAM_MAX)c=DS4_AMP_LAM_MAX;
                 float*fw=Fout+(size_t)s2*DIM; const float*fb=Fbase+(size_t)s2*DIM;
                 for(int d2=0;d2<DIM;d2++) fw[d2]=fb[d2]+(float)c*(fw[d2]-fb[d2]); } }
         else if(o->type==4){ for(size_t i=0;i<(size_t)S*DIM;i++) Fout[i]=Fcur[i]+o->t*(Fout[i]-Fcur[i]); }   /* TREF: 从 base态 Fcur 插值(coadapt 口径) */

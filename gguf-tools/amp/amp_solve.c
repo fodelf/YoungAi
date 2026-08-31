@@ -7,5 +7,6 @@
  *     ZtZ 累加/held 增量评估/rec worker 群
  * p2: main(乘性动态 z 放大器逐层闭式解算 CLI 驱动)
  */
+#include "../../src/common/ds4_amp_fmt.h"   /* 116 记录头契约(单一定义源) */
 #include "amp_solve_p1.inc.c"
 #include "amp_solve_p2.inc.c"

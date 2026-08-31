@@ -51,15 +51,15 @@ static void inject_recs(const char *ldir, int L, const uint8_t *recs, size_t len
 /* 116B 记录头+载荷(zlayer make_rec 同构), 追加进动态缓冲 */
 static uint8_t *rec_append(uint8_t *buf, size_t *len, const char *nm,
                            const void *pay, size_t psz) {
-    buf = realloc(buf, *len + 116 + psz);
+    buf = realloc(buf, *len + DS4_AMP_REC_HDR + psz);
     if (!buf) die("rec OOM");
     uint8_t *r = buf + *len;
-    memset(r, 0, 116);
+    memset(r, 0, DS4_AMP_REC_HDR);
     memcpy(r, nm, strlen(nm));
-    uint64_t p64 = psz; memcpy(r + 88, &p64, 8);
-    int32_t vd = 1; memcpy(r + 112, &vd, 4);
-    memcpy(r + 116, pay, psz);
-    *len += 116 + psz;
+    uint64_t p64 = psz; memcpy(r + DS4_AMP_REC_OFF_PSZ, &p64, 8);
+    int32_t vd = 1; memcpy(r + DS4_AMP_REC_OFF_VD, &vd, 4);
+    memcpy(r + DS4_AMP_REC_HDR, pay, psz);
+    *len += DS4_AMP_REC_HDR + psz;
     return buf;
 }
 

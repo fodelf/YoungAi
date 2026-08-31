@@ -69,6 +69,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include "../../src/common/ds4_amp_fmt.h"   /* 116 记录头/秩上限/fit切分: 与 ds4quant_run/引擎同一契约 */
 #include <pthread.h>
 #include <sys/stat.h>
 #include <sys/mman.h>

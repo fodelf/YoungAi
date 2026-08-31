@@ -103,7 +103,7 @@ static __global__ void zchain_scale_kernel(
         if (ty == 1u) lam = op[1] * lam;
         else if (ty == 2u) {
             float c = op[2] + op[3] * ((xnorm - op[4]) / op[5]);
-            c = fminf(fmaxf(c, 0.25f), 4.0f);
+            c = fminf(fmaxf(c, (float)DS4_AMP_LAM_MIN), (float)DS4_AMP_LAM_MAX);
             lam = c * lam;
         } else if (ty == 3u) {
             int blk = (int)op[15];
@@ -115,7 +115,7 @@ static __global__ void zchain_scale_kernel(
                     for (uint32_t j = tid; j < d; j += ZC_NTG) dk += xt[j] * __half2float(vr[j]);
                     c += op[7 + k] * zc_red_add(dk, red);
                 }
-                c = fminf(fmaxf(c, 0.25f), 4.0f);
+                c = fminf(fmaxf(c, (float)DS4_AMP_LAM_MIN), (float)DS4_AMP_LAM_MAX);
                 lam = c * lam;
             }
         } else if (ty == 4u) lam = 1.0f + op[1] * (lam - 1.0f);

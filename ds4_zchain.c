@@ -7,6 +7,7 @@
  *   V8[8][d_model] when carried) | 4=TREF f32 t | 5=GE fp16[n_expert]. */
 #include "ds4_zchain.h"
 #include "ds4_loss.h"   /* posttrain 钩子: 四损失(dither/权)同一份实现 */
+#include "src/common/ds4_amp_fmt.h"   /* λ clamp/秩上限: 与 CUDA/Metal/工具回放同一契约 */
 
 #include <fcntl.h>
 #include <math.h>
@@ -93,7 +94,7 @@ ds4_zchain *ds4_zchain_load(const char *path, uint32_t n_layer, uint32_t n_exper
                 memcpy(&zk, pay, 4); memcpy(&tr, pay + 4, 4);
                 memcpy(&din, pay + 8, 4); memcpy(&dout, pay + 12, 4);
                 size_t nh = (size_t)zk + (size_t)zk * din + (size_t)zk * dout;
-                if (zk > 0 && zk <= 1024 && din == d_model && dout == n_expert &&
+                if (zk > 0 && zk <= DS4_AMP_ZK_MAX && din == d_model && dout == n_expert &&
                     psz >= 16 + nh * 2) {
                     zl->rte.zlk = zk; zl->rte.zltr = tr; zl->rte.zdin = din;
                     zl->rte.zmul = 2u;                       /* 标记: 路由偏置形态 */
@@ -135,7 +136,7 @@ ds4_zchain *ds4_zchain_load(const char *path, uint32_t n_layer, uint32_t n_exper
                 memcpy(&zk, pay, 4); memcpy(&tr, pay + 4, 4);
                 memcpy(&din, pay + 8, 4); memcpy(&dout, pay + 12, 4);
                 size_t nh = (size_t)zk * din * 2u + (size_t)zk * dout;
-                if (zk > 0 && zk <= 1024 && (din == d_model || din == 3u * d_model)
+                if (zk > 0 && zk <= DS4_AMP_ZK_MAX && (din == d_model || din == 3u * d_model)
                     && dout == d_model && psz >= 16 + nh * 2) {
                     zl->zl.zlk = zk; zl->zl.zltr = tr; zl->zl.zdin = din;
                     zl->zl.zmul = 3u;                            /* 动态 z 乘性 */
@@ -148,7 +149,7 @@ ds4_zchain *ds4_zchain_load(const char *path, uint32_t n_layer, uint32_t n_exper
                 memcpy(&zk, pay, 4); memcpy(&tr, pay + 4, 4);
                 memcpy(&din, pay + 8, 4); memcpy(&dout, pay + 12, 4);
                 size_t nh = (size_t)zk + (size_t)zk * din + (size_t)zk * dout;
-                if (zk > 0 && zk <= 1024 && (din == d_model || din == 3u * d_model)
+                if (zk > 0 && zk <= DS4_AMP_ZK_MAX && (din == d_model || din == 3u * d_model)
                     && dout == d_model && psz >= 16 + nh * 2) {
                     zl->zl.zlk = zk; zl->zl.zltr = tr; zl->zl.zdin = din;
                     zl->zl.zmul = 1u; zl->zl.zlm = (const uint16_t *)(pay + 16);
@@ -161,7 +162,7 @@ ds4_zchain *ds4_zchain_load(const char *path, uint32_t n_layer, uint32_t n_exper
                 memcpy(&zk, pay, 4); memcpy(&tr, pay + 4, 4);
                 memcpy(&din, pay + 8, 4); memcpy(&dout, pay + 12, 4);
                 size_t nh = (size_t)zk + (size_t)zk * din + (size_t)zk * dout;
-                if (zk > 0 && zk <= 1024 && (din == d_model || din == 3u * d_model)
+                if (zk > 0 && zk <= DS4_AMP_ZK_MAX && (din == d_model || din == 3u * d_model)
                     && dout == d_model && psz >= 16 + nh * 2) {
                     zl->zl.zlk = zk; zl->zl.zltr = tr; zl->zl.zdin = din;
                     zl->zl.zmul = 0u;
@@ -250,8 +251,8 @@ float ds4_zchain_lambda(const ds4_zchain *z, uint32_t il, const float *x) {
                 xnorm = (float)sqrt(v);
             }
             double c = (double)o->w2p[0] + (double)o->w2p[1] * (((double)xnorm - o->w2p[2]) / o->w2p[3]);
-            if (c < 0.25) c = 0.25;
-            if (c > 4.0)  c = 4.0;
+            if (c < DS4_AMP_LAM_MIN) c = DS4_AMP_LAM_MIN;
+            if (c > DS4_AMP_LAM_MAX) c = DS4_AMP_LAM_MAX;
             lam = (float)c * lam;
         } else if (o->type == 3u && o->v8) {
             double c = o->w8[0];
@@ -261,8 +262,8 @@ float ds4_zchain_lambda(const ds4_zchain *z, uint32_t il, const float *x) {
                 for (uint32_t j = 0; j < d; j++) a += (double)x[j] * (double)zc_fp16_to_fp32(vr[j]);
                 c += (double)o->w8[1 + k] * a;
             }
-            if (c < 0.25) c = 0.25;
-            if (c > 4.0)  c = 4.0;
+            if (c < DS4_AMP_LAM_MIN) c = DS4_AMP_LAM_MIN;
+            if (c > DS4_AMP_LAM_MAX) c = DS4_AMP_LAM_MAX;
             lam = (float)c * lam;
         } else if (o->type == 4u) {
             lam = 1.0f + o->g * (lam - 1.0f);

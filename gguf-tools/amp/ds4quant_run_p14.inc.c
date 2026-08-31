@@ -52,7 +52,7 @@ static void repair_cold(int S,int n_fit){
     if(fread(hd,4,8,fo)!=8||fread(&idh0,8,1,fo)!=1){ fprintf(stderr,"[repair] 旧锚读失败\n"); exit(2); }
     if(hd[0]!=0x32415144u||hd[4]!=(uint32_t)NLAYERS||hd[6]!=(uint32_t)NACT||hd[3]!=(uint32_t)DIM){
         fprintf(stderr,"[repair] 旧锚头不符(NL/NACT/DIM)\n"); exit(2); }
-    int S_old=(int)hd[1], n_fit_old=(S_old*3)/4;
+    int S_old=(int)hd[1], n_fit_old=DS4_AMP_FIT_SPLIT(S_old);   /* 从旧 S 反推旧切分: 公式=契约, 禁改 */
     fseeko(fo,(off_t)(40+(uint64_t)NLAYERS*(uint64_t)S_old*DIM*4),SEEK_SET);
     int32_t*ridx_old=malloc((size_t)NLAYERS*S_old*NACT*4);
     if(fread(ridx_old,4,(size_t)NLAYERS*S_old*NACT,fo)!=(size_t)NLAYERS*S_old*NACT){
@@ -118,7 +118,7 @@ static void global_sweep(const long*ids,int S,int n_fit){
     for(int s=0;s<S;s++)for(int j=0;j<HCM;j++)memcpy(H0+((size_t)s*HCM+j)*DIM,emb+(size_t)ids[s]*DIM,(size_t)DIM*4);
     free(emb);
     float *Hc=malloc((size_t)(NLAYERS+1)*lstride*4);
-    int vs=(n_fit*3)/4;   /* 判据行 = fit 尾部 val, held 只观测 */
+    int vs=DS4_AMP_FIT_SPLIT(n_fit);   /* 判据行 = fit 尾部 val, held 只观测 */
     fprintf(stderr,"\n[全局回扫] %d 轮 — 逐前层 z 系数以【最终输出 KL】重解并原地改写层文件(真·反修, 全局联合最优)\n",MAXS);
     float *lg=gs_forward_from(0,H0,ids,S,n_fit,Hc);
     double kl0=bwd_val_kl(ANC.logits,lg,vs,n_fit); free(lg);
@@ -224,9 +224,9 @@ int main(int argc,char**argv){
             /* 定位 1bit 记录 payload */
             const uint8_t*p=mp+12,*end=mp+msz,*w1=NULL,*w3=NULL,*w2=NULL;
             uint32_t nrec; memcpy(&nrec,mp+8,4);
-            for(uint32_t i=0;i<nrec&&p+116<=end;i++){
+            for(uint32_t i=0;i<nrec&&p+DS4_AMP_REC_HDR<=end;i++){
                 char nm[17]; memcpy(nm,p,16); nm[16]=0;
-                uint64_t psz; memcpy(&psz,p+88,8); const uint8_t*pay=p+116; p=pay+psz;
+                uint64_t psz; memcpy(&psz,p+DS4_AMP_REC_OFF_PSZ,8); const uint8_t*pay=p+DS4_AMP_REC_HDR; p=pay+psz;
                 if(!strcmp(nm,"1bit")&&psz>=(uint64_t)NEXP*(2*szG+szD)){
                     w1=pay; w3=pay+(size_t)NEXP*szG; w2=pay+2*(size_t)NEXP*szG; break; }
             }
@@ -285,7 +285,7 @@ int main(int argc,char**argv){
     if(!f){ fprintf(stderr,"ids 文件 %s 打不开\n",idf); return 1; }
     { char ln[64]; while(S<ntok&&fgets(ln,sizeof(ln),f))ids[S++]=atol(ln); fclose(f); }
     if(S<3){ fprintf(stderr,"token 太少 (S=%d)\n",S); return 1; }
-    int n_fit=(int)(S*3/4);
+    int n_fit=DS4_AMP_FIT_SPLIT(S);
     if(g_cli.nfit>=0) n_fit=g_cli.nfit;   /* ★判尺既有约定: --nfit 1 ⇒ n_fit=1=纯回放, sweep/z 解算不触发★ */
     if(n_fit<1)n_fit=1; if(n_fit>=S)n_fit=S>1?S-1:1;   /* 3/4 fit(校准), 1/4 held-out(判决) */
     /* 逐层档位: --lcfg(NL字符或1字符广播) > 全'1'。单层探针用 43 字符串精确表达

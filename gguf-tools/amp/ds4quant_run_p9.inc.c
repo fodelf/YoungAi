@@ -224,11 +224,11 @@ static void export_layer_file(int L,int S,int n_fit,const char*lf){
          * 其余全部记录(z 家族/zl.RRR/loss/bwd/探索账)→ op 侧车 dql_ops_LXX.bin(应用序=侧车序)。 */
         uint32_t nbyte=0;
         for(int i=0;i<NELE;i++) if(!strcmp(ELE[i].name,"1bit")){ nbyte++;
-            off_scan+=116+rec_paysz(&ELE[i],szG,szD); }
+            off_scan+=DS4_AMP_REC_HDR+rec_paysz(&ELE[i],szG,szD); }
         if(g_cli.minvol&&g2k>0){
             embK=g2k;
             g2_psz=(uint64_t)g2_sidecar_hdr(embK)+2*(uint64_t)embK*szG2+(uint64_t)embK*szD2;
-            off_g2_rec=off_scan; off_g2=off_g2_rec+116; off_scan=off_g2+(size_t)g2_psz; nextra++;
+            off_g2_rec=off_scan; off_g2=off_g2_rec+DS4_AMP_REC_HDR; off_scan=off_g2+(size_t)g2_psz; nextra++;
         }
         double g2_mc=0;   /* 热门统计 mean_cos(内嵌 g2hot 记录头用) */
         uint32_t mg=0x324C5144,Lu=(uint32_t)L,nr=(uint32_t)(nbyte+nextra);

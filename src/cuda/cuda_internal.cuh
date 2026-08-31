@@ -39,6 +39,9 @@ static unsigned ds4_grid_cap(void) {
  * 共用同一份解码, 保证三端逐位同义。 */
 #include "vq_fmt.h"
 
+/* 反修产物契约(λ clamp/z 秩上限): 与引擎 ds4_zchain.c、工具回放同一份定义 */
+#include "src/common/ds4_amp_fmt.h"
+
 /* GPU 契约头(子头带 extern "C" 守卫)。API 定义因此直接继承 C 链接与签名检查:
  * 实现与契约不一致会在编译期报 conflicting declaration, 而不是静默的 ABI 错位。
  * ds4_gpu_tensor 在契约里是 opaque typedef, 下面补上 CUDA 侧的具体定义;
