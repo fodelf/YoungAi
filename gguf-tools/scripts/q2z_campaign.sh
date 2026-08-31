@@ -13,39 +13,45 @@ ZLB="$ROOT/gguf-tools/amp/zlayer"   # C 反修解算器(zlayer.py 已删)
 R30="$ROOT/gguf/go-onebit/r30"
 OUTF="$R30/full"
 LAYERS="$OUTF/layers"
-QBIN="$ROOT/gguf-tools/amp/ds4quant_run.dchunk"     # 量化(已验证 L00/L21 配方)
-RBIN="$ROOT/gguf-tools/amp/ds4quant_run.zk1024"     # 回放/指标(zl k≤1024 + pv堆化)
+# 2026-08-31: .dchunk/.zk1024 冻结件已从盘上删除(判官归一"同功能只许一份实现"),
+# 量化与回放同走现役 ds4quant_run(env 大扫除后的 --flag 也只有它认)
+QBIN="$ROOT/gguf-tools/amp/ds4quant_run"
+RBIN="$ROOT/gguf-tools/amp/ds4quant_run"
 ANCHOR="$R30/anchor_r30_s1716.bin"
 IDS="$ROOT/gguf/go-onebit/g7/rr_calib_prog_v5mini.ids"
 export DS4_HF="${DS4_HF:-$HOME/ds4-main/hf/DeepSeek-V4-Flash-0731}"
 LOG(){ echo "[q2z $(date +%H:%M:%S)] $*" >&2; }
 NL=43
 
-quant_env(){  # 已验证配方(L00/L21 同款): 平权 VQ, 锚路由, FULLSET
-    export DS4_ANCHOR="$ANCHOR" DS4_NFIT=933 DS4_THREADS="${DS4_THREADS:-8}" DS4_CALIB_FULLSET=1
-    export DS4_MINVOL=1 DS4_MV_BASELINE=1 DS4_TUNE=1 DS4_PURE_VQ=1
-    export DS4_VQ=1 DS4_TGT_ALPHA=1.0 DS4_VQ_RPLAN="$OUTF/rplan.txt" DS4_VOL_BUDGET_GIB=72
-    export DS4_GO2B_HOT=1 DS4_GO2B_HOT_TABLE="$ROOT/gguf-tools/data/corpus/prog_active_top49.txt"
-    export DS4_ANCHOR_ROUTE=1 DS4_BF_GAIN_GATE=0.05
-    export DS4_PLAN="$OUTF/plan.txt" DS4_CKPT_DIR="$OUTF/ckpt" DS4_LAYER_DIR="$LAYERS"
-    export DS4_ZFILE=/tmp/zfile_junk.bin DS4_ZCHAIN=/tmp/zchain_junk.bin
-    unset DS4_COADAPT DS4_MV_COAD_BASE DS4_BF_ONLY DS4_GSWEEP 2>/dev/null || true
+quant_flags(){  # 已验证配方(L00/L21 同款): 平权 VQ, FULLSET; 2026-08-31 env 大扫除改 flag 拼装
+    # 锚路由(原 DS4_ANCHOR_ROUTE)已写死进二进制; 体积闸(原 DS4_VOL_BUDGET_GIB=72)随 env
+    # 拔死, 判停看产物 manifest 实账。
+    QF=(--hf "$DS4_HF" --anchor "$ANCHOR" --nfit 933 --threads "${DS4_THREADS:-8}" --calib-fullset)
+    QF+=(--minvol --mv-baseline --tune --pure-vq)
+    QF+=(--vq --tgt-alpha 1.0 --vq-rplan "$OUTF/rplan.txt")
+    QF+=(--go2b-hot 1 --go2b-hot-table "$ROOT/gguf-tools/data/corpus/prog_active_top49.txt")
+    QF+=(--bf-gain-gate 0.05)
+    QF+=(--plan "$OUTF/plan.txt" --ckpt-dir "$OUTF/ckpt" --layer-dir "$LAYERS")
+    QF+=(--zfile /tmp/zfile_junk.bin --zchain /tmp/zchain_junk.bin)
 }
 
 stage_quantL(){   # 单层计时: quantL <L>
-    local L=$1; quant_env
+    local L=$1; quant_flags
+    # ★单层隔离钩 DS4_MV_PROBE_L 已随 env 大扫除拔死(C 零读者)★: 只剩 --minvol-maxl 早退,
+    # 其语义=量化 0..L 全部层, 只有 L=0 与原"只该层"一致 — L>0 响亮拒跑, 不静默变味。
+    [ "$L" = 0 ] || { LOG "★quantL 现只支持 L=0(隔离钩已删); L>0 会变成量化 0..L★"; exit 2; }
     cd "$ROOT/gguf-tools/amp"
     local T0=$(date +%s)
-    env DS4_MV_PROBE_L=$L DS4_MINVOL_MAXL=$((L+1)) "$QBIN" "$IDS" 1716
+    "$QBIN" "$IDS" 1716 "${QF[@]}" --minvol-maxl $((L+1))
     LOG "量化 L$L 用时 $(( $(date +%s)-T0 ))s"
     ls -la "$LAYERS/$(printf 'dql_vq_L%02d.bin' $L)" || { LOG "★产物缺★"; exit 2; }
 }
 
 stage_quant(){    # 43 层批量顺序(单进程, 误差前向吸收=部署口径, 里程碑每5层)
-    quant_env
+    quant_flags
     cd "$ROOT/gguf-tools/amp"
     local T0=$(date +%s)
-    "$QBIN" "$IDS" 1716 || { LOG "★量化批量失败 rc=$?★"; exit 2; }
+    "$QBIN" "$IDS" 1716 "${QF[@]}" || { LOG "★量化批量失败 rc=$?★"; exit 2; }
     LOG "量化批量完 $(( $(date +%s)-T0 ))s: $(ls "$LAYERS"/dql_vq_L*.bin | wc -l | tr -d ' ')/43 层"
 }
 
@@ -68,12 +74,12 @@ stage_zside(){    # 逐层反修: 第一层到最后一层
 stage_metrics(){  # 五指标: 全43层回放(量化+z侧车) vs FP 锚, held=位置1287..1716
     cd "$ROOT/gguf-tools/amp"
     local T0=$(date +%s)
-    env -u DS4_TUNE -u DS4_MINVOL -u DS4_VQ_RPLAN -u DS4_ZCHAIN \
-        DS4_GSWEEP=0 DS4_BF_TERMINAL=0 DS4_BF_ONLY=1 DS4_COADAPT=1 DS4_CALIB_FULLSET=1 \
-        DS4_EXPORT_BYTES=0 DS4_ANCHOR="$ANCHOR" DS4_NFIT=1287 DS4_THREADS=8 \
-        DS4_LAYER_DIR="$LAYERS" DS4_LCFG=$(printf 'g%.0s' $(seq 1 $NL)) \
-        DS4_VQ=1 DS4_TGT_ALPHA=1.0 DS4_DUMP_LOGITS=/tmp/q2z_student.bin \
-        "$RBIN" "$IDS" 1716 2>&1 | grep -E 'ops=|VERDICT' | tail -5
+    "$RBIN" "$IDS" 1716 --hf "$DS4_HF" \
+        --gsweep 0 --bf-only --coadapt 1 --calib-fullset \
+        --export-bytes 0 --anchor "$ANCHOR" --nfit 1287 --threads 8 \
+        --layer-dir "$LAYERS" --lcfg "$(printf 'g%.0s' $(seq 1 $NL))" \
+        --vq --tgt-alpha 1.0 --dump-logits /tmp/q2z_student.bin \
+        2>&1 | grep -E 'ops=|VERDICT' | tail -5
     LOG "回放遍用时 $(( $(date +%s)-T0 ))s"
     cd "$ROOT"
     "$(dirname "$0")/../bench/anchor_metrics" --ref "$ANCHOR" --ids "$IDS" \

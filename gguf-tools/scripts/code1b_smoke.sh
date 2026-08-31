@@ -8,9 +8,9 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."   # → repo 根(ds4 与 metal/*.metal 在此)
 MODEL="${MODEL:-gguf/go-onebit/ds4-code1b.gguf}"
 NPRED="${NPRED:-48}"; TIMEOUT_S="${TIMEOUT_S:-300}"; MAXMB="${MAXMB:-11776}"
-# RESID 口(2026-07-21): 与 pillar_probe.sh 同语义 — 显式空=裸, 非空=挂残差侧车。
+# RESID 口(2026-07-21): 与 pillar_probe.sh 同语义 — 显式空=裸, 非空=挂残差侧车(--residual)。
 # 此前本脚本静默无视 RESID → "带残差"针实际跑裸腿且输出逐字节同裸(已踩)。
-if [ -n "${RESID:-}" ]; then export DS4_RESIDUAL="$RESID"; fi
+RESID_ARGS=""; [ -n "${RESID:-}" ] && RESID_ARGS="--residual $RESID"
 if [ -z "${PROMPT+x}" ]; then
   PROMPT=$(cat <<'PEOF'
 <｜begin▁of▁sentence｜>// twoSum returns the indices of the two numbers in nums that add up to target.
@@ -25,8 +25,8 @@ OUT=/tmp/code1b_smoke.out; LOG=/tmp/code1b_smoke.log
 pkill -9 -x ds4 2>/dev/null || true
 # M1 Pro GPU 工作集天花板 ~10.67G: 默认 prefill chunk 4096 的 scratch 池(~4.8G)+骨干 wired 8.2G
 # 必穿顶(kIOGPU CB OOM, mtp_pipe 同坑实测)。短 prompt 冒烟 512 足够, 大上下文再显式调。
-DS4_MEM_BUDGET_MB="${DS4_MEM_BUDGET_MB:-12000}" \
-DS4_METAL_PREFILL_CHUNK="${DS4_METAL_PREFILL_CHUNK:-512}" ./ds4 -m "$MODEL" -n "$NPRED" \
+./ds4 -m "$MODEL" $RESID_ARGS --mem-budget-mb "${MEM_BUDGET_MB:-12000}" \
+    --prefill-chunk "${PREFILL_CHUNK:-512}" -n "$NPRED" \
     --temp 0 --seed 1 --nothink -p "$PROMPT" >"$OUT" 2>"$LOG" &
 P=$!
 trap 'kill -9 "$P" 2>/dev/null || true; echo "[smoke] 中断已清" >&2; exit 130' INT TERM

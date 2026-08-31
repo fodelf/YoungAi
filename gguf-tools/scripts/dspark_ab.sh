@@ -16,9 +16,10 @@ cd "$ROOT"
 declare -a A_ACC B_ACC A_TS B_TS
 for i in $(seq 1 "$R"); do
     for M in with without; do
-        if [ "$M" = with ]; then export DS4_DRAFT_ZCHAIN="$ZC"; else unset DS4_DRAFT_ZCHAIN; fi
-        DS4_DRAFT_GGUF="$STUDENT" DS4_DSPARK_SPEC=1 DS4_DSPARK_STAT=1 \
-            timeout 1800 ./ds4 --cuda -m "$MAIN" --zchain "$MAIN_ZC" --temp 0 -n "$N" -p "$PROMPT" \
+        DZC=""; [ "$M" = with ] && DZC="--draft-zchain $ZC"
+        # (DSPARK_STAT 已删, avg_acc 腿失效, A/B 只看 t/s)
+        timeout 1800 ./ds4 --cuda -m "$MAIN" --zchain "$MAIN_ZC" \
+            --draft-gguf "$STUDENT" --spec $DZC --temp 0 -n "$N" -p "$PROMPT" \
             </dev/null >/dev/null 2>/tmp/ab_$M.log
         acc=$(grep -a avg_acc /tmp/ab_$M.log | tail -1 | sed 's/.*avg_acc=//')
         ts=$(grep -a generation /tmp/ab_$M.log | tail -1 | sed 's/.*generation: //; s/ t\/s//')

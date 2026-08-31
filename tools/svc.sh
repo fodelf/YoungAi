@@ -29,37 +29,29 @@ CAP=${CAP:-512}
 CORR=${CORR:-}
 # SOUL=行为示例文件 (P3, 默认修复灵魂; 空串禁用)。只 server 侧 (prompt 渲染)。
 SOUL=${SOUL-gguf-tools/data/corpus/soul/soul_server_v3.txt}
-# EXPERT_PREAD + PREFETCH_AHEAD: 历史实测"赢家 2.2×"(fable5 L297, 位精确输出逐字节不变) —
-# 单拷贝 direct pread 替代 mmap+memcpy + 跨层 router 预测预取。EVENT_DRAIN: MTLSharedEvent
-# 快路径主机等待(Anukari 先例, 去 per-CB 调度开销)。这些是本日基线 1.18 缺失的 IO 杠杆。
-ENVSTR="DS4_DIST_REVERSE_CONNECT=1 DS4_METAL_EXPERT_OFFLOAD=1 DS4_METAL_EXPERT_PREAD=1 DS4_METAL_EXPERT_PREFETCH_AHEAD=1 DS4_METAL_EXPERT_EVENT_DRAIN=1 DS4_METAL_PREFILL_CHUNK=2048 DS4_DIST_PREFILL_CAP=2048 DS4_METAL_EXPERT_GATHER_THREADS=8 DS4_METAL_NO_MODEL_WARMUP=1 DS4_MEM_BUDGET_MB=12000 DS4_PRIMER_BATCH_INJECT=1 DS4_PRIMER_FREE_BUDGET=96 ${EXTRA_ENV:-}"
-# ↑ 批注入+小自由区(2026-07-16 CC 攻3 A/B 胜: 引导轮 15min→5min; 心跳 PRIMER_KA 已在 server 内建)
-# RESID=相对路径的热专家残差侧车(2026-07-14 方向A): 走 DS4_RESIDUAL, 两端都要(各自持有的层
+# 2026-08-31 env 大扫除后, 行为杠杆全部走 CLI flag:
+#   IO 杠杆(pread/prefetch/event-drain/gather 线程=8)已写死或随 offload 自适应, 无需再传;
+#   批注入+自由区 96 预算已写死(2026-07-16 CC 攻3 A/B 定版); offload 由 --mem-budget-mb
+#   喂给 AUTO 判定(80G 模型 vs 12G 预算 ⇒ 必然流式, 与旧 EXPERT_OFFLOAD=1 同效)。
+COMMON_FLAGS="--reverse-connect --prefill-chunk 2048 --mem-budget-mb 12000"
+# RESID=相对路径的热专家残差侧车(2026-07-14 方向A): 两端都要(各自持有的层
 # 才用得上自己那部分)。侧车须已 scp 到 $M1DIR/同名相对路径。空=不挂。
 RESID=${RESID-gguf/sidecars/code-hot-res-prog.gguf}   # 显式空=裸; 默认挂 prog 残差(2026-07-23 换代, 旧 v3p 版已删)
-[ -n "$RESID" ] && ENVSTR="$ENVSTR DS4_RESIDUAL=$RESID"
-[ -n "${EXTRA_ENV:-}" ] && ENVSTR="$ENVSTR $EXTRA_ENV"   # 附加调优env透传(熵门等A/B用)
 # BASE_NATIVE=1(默认开): go-onebit 是 BASE 底模, chat 角色帧会出符号汤 → 母语骨架渲染
 # (# User:/# Assistant: 注释体) + 默认 stop; 工具帧仍由 --tool-primer 强制。只 server 侧生效。
 BASE_NATIVE=${BASE_NATIVE:-1}
-[ "$BASE_NATIVE" != 0 ] && ENVSTR="$ENVSTR DS4_BASE_NATIVE=$BASE_NATIVE"
+SRV_FLAGS=""
+[ "$BASE_NATIVE" != 0 ] && SRV_FLAGS="$SRV_FLAGS --base-native"
 # KNOWLEDGE=知识环检索库(2026-07-23): server 端 knowledge-primer 参考注入, 治无据知识问答
 # 复读/幻觉(g1/g4/singleflight/read/commit 5针 A/B 全过)。纯 prompt 零模型零体积。默认挂。
 KNOWLEDGE=${KNOWLEDGE-gguf-tools/data/corpus/knowledge.txt}
-[ -n "$KNOWLEDGE" ] && ENVSTR="$ENVSTR DS4_KNOWLEDGE_FILE=$KNOWLEDGE"
-# 值区置信门控(2026-07-14): 自由 argmax 概率 ≥p 时放行自由构造, 否则 copy 约束防占位符。
-# 【negative result】实测模型的自由生成本身就是占位符($PARAMETER_VALUE), 对占位符反而"有把握"
-# → 门控放行的恰恰是垃圾。生产不设(纯 copy)。
-[ -n "${FREE_CONF:-}" ] && ENVSTR="$ENVSTR DS4_PRIMER_FREE_CONF=$FREE_CONF"
+[ -n "$KNOWLEDGE" ] && SRV_FLAGS="$SRV_FLAGS --knowledge $KNOWLEDGE"
+# COMPACT=1(2026-07-14 速度): 结构 token 只把语义锚点送进 KV(text 输出仍是完整合法 DSML)。
+# 实测 inject 占热轮 68%(32.8s/48.4s) → edit 68 tok → ~20 tok。质量 A/B 后定版。
+[ -n "${COMPACT:-}" ] && SRV_FLAGS="$SRV_FLAGS --primer-compact"
 # POOL_MB=专家常驻池(2026-07-14 速度): 热专家反复命中 → 钉进 GPU 池免每 token 重拉 SSD。
 # 保守起步(教训: 过大的显式 RAM 缓存会饿死 page cache 反而变慢, 3.84→1.84 实测)。
 # 自动热锁: 每 N token 统计命中, top-K 常驻。空=不开池(今日基线 1.18 t/s)。
-# BATCH_INJECT=1(2026-07-14 速度): tool-primer 的结构 token 走批量 prefill 而非逐 token
-# decode(实测一轮 gen=2 却 38s: 时间全在几十个已知结构 token 的逐 token forward 上)。
-[ -n "${BATCH_INJECT:-}" ] && ENVSTR="$ENVSTR DS4_PRIMER_BATCH_INJECT=$BATCH_INJECT"
-# COMPACT=1(2026-07-14 速度): 结构 token 只把语义锚点送进 KV(text 输出仍是完整合法 DSML)。
-# 实测 inject 占热轮 68%(32.8s/48.4s) → edit 68 tok → ~20 tok。质量 A/B 后定版。
-[ -n "${COMPACT:-}" ] && ENVSTR="$ENVSTR DS4_PRIMER_COMPACT=$COMPACT"
 # PIN=1(2026-07-14 用户洞察: 活跃专家进RAM): 静态白名单钉 code 域 top-k 活跃专家进
 # GPU 常驻池(绕过自动热锁 warmup, 确定性)。表 /tmp/code_pin.{coord,worker}.pinned 由
 # gen_pinned.py(已删, 见 git 历史)当年从 s305 锚生成, 按层切(coord 0-19 / worker 20-42);
@@ -68,13 +60,11 @@ KNOWLEDGE=${KNOWLEDGE-gguf-tools/data/corpus/knowledge.txt}
 PIN=${PIN:-}
 POOL_MB=${POOL_MB:-}
 [ -n "$PIN" ] && POOL_MB=${POOL_MB:-5000}
+POOL_FLAGS=""
 if [ -n "$POOL_MB" ]; then
-  ENVSTR="$ENVSTR DS4_METAL_EXPERT_POOL_MB=$POOL_MB"
-  if [ -z "$PIN" ]; then   # 无静态钉时用自动热锁
-    ENVSTR="$ENVSTR DS4_METAL_EXPERT_POOL_AUTO_PIN_TOP=${POOL_PIN_TOP:-32}"
-    ENVSTR="$ENVSTR DS4_METAL_EXPERT_POOL_AUTO_PIN_INTERVAL=${POOL_PIN_INTERVAL:-16}"
-  fi
-  ENVSTR="$ENVSTR DS4_METAL_EXPERT_POOL_PREFETCH_TOP=${POOL_PREFETCH_TOP:-16}"
+  POOL_FLAGS="--expert-pool-mb $POOL_MB --expert-pool-prefetch-top ${POOL_PREFETCH_TOP:-16}"
+  # 无静态钉时用自动热锁(auto-pin 间隔已写死默认 32)
+  [ -z "$PIN" ] && POOL_FLAGS="$POOL_FLAGS --expert-pool-auto-pin-top ${POOL_PIN_TOP:-32}"
 fi
 PIN_COORD=${PIN_COORD:-/tmp/code_pin.coord.pinned}
 PIN_WORKER=${PIN_WORKER:-/tmp/code_pin.worker.pinned}
@@ -86,24 +76,18 @@ PIN_WORKER=${PIN_WORKER:-/tmp/code_pin.worker.pinned}
 PINRAM=${PINRAM:-}
 CPINRAM=""; WPINRAM=""
 if [ -n "$PINRAM" ]; then
-  PINRAM_COMMON="DS4_EXPERT_PIN_MLOCK_MB=${PINRAM_MB:-3000} DS4_EXPERT_PIN_TOPK=${PINRAM_TOPK:-32} DS4_RESID_PIN_MLOCK_MB=${PINRAM_RESID_MB:-3000}"
-  CPINRAM="DS4_EXPERT_PIN_FILE=$PIN_COORD $PINRAM_COMMON"
-  WPINRAM="DS4_EXPERT_PIN_FILE=$PIN_WORKER $PINRAM_COMMON"
+  # TOPK 已写死 256(实际钉数由 mlock 预算封顶, 3000MB ≈ 旧 TOPK=32 的量级)
+  PINRAM_COMMON="--expert-pin-mlock-mb ${PINRAM_MB:-3000} --resid-pin-mlock-mb ${PINRAM_RESID_MB:-3000}"
+  CPINRAM="--expert-pin-file $PIN_COORD $PINRAM_COMMON"
+  WPINRAM="--expert-pin-file $PIN_WORKER $PINRAM_COMMON"
 fi
 # ZCHAIN(2026-08-06 用户令"修通op"): 反修动态系数(GL/dyn2/dyn8/GE)的运行时通路。
 # 规则=文件驱动零开关: <MODEL>.zchain.bin 在则两端固定挂载(与模型同目录同名衍生, 随模型分发)。
-ZCH="$MODEL.zchain.bin"
+# ZCH=path 可显式覆盖(r29_bench 等 lane 用; 这是脚本变量, 落地仍走 --zchain flag)。
+ZCH=${ZCH-$MODEL.zchain.bin}
 [ -f "$DIR/$ZCH" ] || ZCH=""
-# NOGE=1: 跳过 zchain GE 表(2026-07-21 四腿 A/B: GE 对 Go 针实测伤害; C 配置=残差+NO_GE
-# 为最优腿)。两端都要(各自持有层的 zchain 各自装载)。值语义已修(空串/0=不跳过)。
-[ -n "${NOGE:-}" ] && ENVSTR="$ENVSTR DS4_ZCHAIN_NO_GE=1"
-# CS_CAP=copy-spec 批长上限 (探针实测 verify 行成本≈整次 forward, 长批净亏; 4-8 是
-# 甜点)。PIPE_CHUNK=verify 批双机行分块流水 (已落地 wave69, 默认关)。都只 server 侧。
-CS_CAP=${CS_CAP-6}; PIPE_CHUNK=${PIPE_CHUNK-2}   # 冠军默认(07-18 归因表 +34%/+63%); 显式空=关
-[ -n "${CS_CAP:-}" ] && ENVSTR="$ENVSTR DS4_DIST_CS_LEN_CAP=$CS_CAP"
-[ -n "${PIPE_CHUNK:-}" ] && ENVSTR="$ENVSTR DS4_DIST_PIPE_CHUNK=$PIPE_CHUNK"
-# PROFILE=1: 每 forward 打 t_local/t_remote_blocked + 每 MoE 层 IO 拆解 (已落地观测)
-[ -n "${PROFILE:-}" ] && ENVSTR="$ENVSTR DS4_DIST_PIPE_PROFILE=1 DS4_METAL_EXPERT_IO_PROFILE=1"
+# (NOGE/CS_CAP/PIPE_CHUNK/PROFILE 钩子已随 env 大扫除清退: GE 恒开; copy-spec 族 08-05
+#  已删, 那两个 env 早无读取者; 诊断开关连代码一起删了。)
 log(){ echo "[svc] $*"; }
 
 # pgrep 锚定真二进制: 裸 "ds4-server.*$PORT"/"role worker" 会匹配看门狗自身命令行与 bash 包壳
@@ -138,17 +122,17 @@ up(){
     log "起 M1 worker (常驻)…"
     # 整个后台列表包 ( ) 重定向全 fd, 否则中间子壳持 sshd 管道 → ssh 挂到 worker 退出
     # PIN: worker 侧远程 cat 自己的白名单(\$( ) 转义 → 在 M1 shell 展开; 值无空格安全)
-    WPIN=""; [ -n "$PIN" ] && WPIN="DS4_METAL_EXPERT_POOL_PINNED=\$(cat $PIN_WORKER)"
-    ssh "$M1" "rm -f /tmp/ds4_worker_svc.log; ( cd $M1DIR && $WPIN $WPINRAM $ENVSTR nohup ./ds4 -m $MODEL ${CORR:+--corr $(basename "$CORR")} ${ZCH:+--zchain $ZCH} --role worker --listen $M1 $DPORT --layers 20:output -c $CTX --temp 0 --nothink ) > /tmp/ds4_worker_svc.log 2>&1 < /dev/null & echo ok" 2>/dev/null
+    WPIN=""; [ -n "$PIN" ] && WPIN="--expert-pool-pinned \$(cat $PIN_WORKER)"
+    ssh "$M1" "rm -f /tmp/ds4_worker_svc.log; ( cd $M1DIR && nohup ./ds4 -m $MODEL ${CORR:+--corr $(basename "$CORR")} ${ZCH:+--zchain $ZCH} ${RESID:+--residual $RESID} $COMMON_FLAGS $POOL_FLAGS $WPIN $WPINRAM --role worker --listen $M1 $DPORT --layers 20:output -c $CTX --temp 0 --nothink ) > /tmp/ds4_worker_svc.log 2>&1 < /dev/null & echo ok" 2>/dev/null
     until ssh "$M1" "grep -q 'waiting for coordinator' /tmp/ds4_worker_svc.log" 2>/dev/null; do sleep 3; done
   fi
   if [ -z "$(server_pid)" ]; then
     log "起本机 ds4-server coordinator (常驻)…"
     rm -f /tmp/ds4-svc.log
-    CPIN=""; [ -n "$PIN" ] && CPIN="DS4_METAL_EXPERT_POOL_PINNED=$(cat "$PIN_COORD")"
+    CPIN=""; [ -n "$PIN" ] && CPIN="--expert-pool-pinned $(cat "$PIN_COORD")"
     # perl setpgid: server 自成进程组 —— 宿主 shell/任务被按组清理时不连带杀 server
     # (2026-07-17 实证两次: 后台任务清理连带 SERVER_GONE)。macOS 无 setsid(1), 用 perl。
-    ( cd "$DIR" && env $CPIN $CPINRAM $ENVSTR nohup perl -e 'setpgrp(0,0); exec @ARGV or die $!' ./ds4-server -m "$MODEL" ${CORR:+--corr "$CORR"} ${ZCH:+--zchain "$ZCH"} --role coordinator --coordinator "$M1" "$DPORT" --layers 0:19 -c "$CTX" --port "$PORT" --kv-disk-dir /tmp/ds4-kv-svc --kv-disk-space-mb 8192 --max-output-tokens "$CAP" --nothink --tool-primer ${SOUL:+--soul "$SOUL"} --trace /tmp/ds4-svc-trace.txt > /tmp/ds4-svc.log 2>&1 & )
+    ( cd "$DIR" && nohup perl -e 'setpgrp(0,0); exec @ARGV or die $!' ./ds4-server -m "$MODEL" ${CORR:+--corr "$CORR"} ${ZCH:+--zchain "$ZCH"} ${RESID:+--residual "$RESID"} $COMMON_FLAGS --dist-prefill-cap 2048 $POOL_FLAGS $CPIN $CPINRAM $SRV_FLAGS --role coordinator --coordinator "$M1" "$DPORT" --layers 0:19 -c "$CTX" --port "$PORT" --kv-disk-dir /tmp/ds4-kv-svc --kv-disk-space-mb 8192 --max-output-tokens "$CAP" --nothink --tool-primer ${SOUL:+--soul "$SOUL"} --trace /tmp/ds4-svc-trace.txt > /tmp/ds4-svc.log 2>&1 & )
     until grep -qE "listening|refusing" /tmp/ds4-svc.log 2>/dev/null; do sleep 3; done
     grep -q refusing /tmp/ds4-svc.log && { log "实例锁: 有别的 ds4 进程 (ds4_test?) 先退出它"; tail -2 /tmp/ds4-svc.log; return 1; }
   fi

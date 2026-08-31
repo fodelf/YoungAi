@@ -49,17 +49,19 @@ echo "【全模型】脚本 算法=进程纪律 进度=启动 体积=- 还原度
 trap 'echo "[中断] 杀本机量化进程" >&2; pkill -9 -f ds4quant_run 2>/dev/null || true; exit 130' INT TERM
 
 # ---------- 换档 ----------
+TMAXP=""   # 满档模式下由下面置 0(--bf-term-maxp), 其余模式不传=二进制默认
 if [ "$FAST" = 1 ]; then
-    NLAY="${DS4_FAST_LAYERS:-43}"; NTOK="${DS4_FAST_NTOK:-16}"; BWD=1; GSW="${DS4_GSWEEP:-0}"   # fast=不向前修复: 逐层反修 C 侧按 DS4_FAST 硬跳, GSWEEP 回扫默认也关(DS4_GSWEEP=1 可开; 全缓存路径有 12G OOM bug 待修)
-    echo "【全模型】脚本 算法=快速模式 进度=开始 体积=- 还原度=- 研判=全${NLAY}层快速档: S=${NTOK}·DS4_FAST(QC1+2轮封顶)·含末层终局反修(裁决2026-07-14)·GSWEEP=${GSW}·产物完整(dql/opt/zchain/合一GGUF)" >&2
+    NLAY="${DS4_FAST_LAYERS:-43}"; NTOK="${DS4_FAST_NTOK:-16}"; BWD=1; GSW="${DS4_GSWEEP:-0}"   # fast=不向前修复: 逐层反修 C 侧按 --fast 硬跳, GSWEEP 回扫默认也关(DS4_GSWEEP=1 可开; 全缓存路径有 12G OOM bug 待修)
+    echo "【全模型】脚本 算法=快速模式 进度=开始 体积=- 还原度=- 研判=全${NLAY}层快速档: S=${NTOK}·--fast(QC1+2轮封顶)·含末层终局反修(裁决2026-07-14)·GSWEEP=${GSW}·产物完整(dql/opt/zchain/合一GGUF)" >&2
 elif [ -z "$TMIN" ]; then NLAY=43; NTOK="${DS4_NTOK:-305}"
     # ★反修前提铁律(用户裁决2026-07-22)★: 反修族(终端反调BWD/终端反修TERM/回扫GSWEEP/复检)
     # 必须先有"指标(rr)+真实场景(行为门)"双判决依据才许开——满档默认全关, 出基线模型先判,
     # 有问题且反修对症再走 ./quant_layer.sh backfit(带 DS4_BF_JUSTIFIED=1)。
     # 实证依据: v2 重型终端反修 rr 零贡献+行为面回退(假工具帧, fable5 2026-07-22 三腿合判)。
+    # (2026-08-31 env 大扫除: 复检遍开关 DS4_BF_NO_RECHECK 已删 — C 侧裁"复检遍从不禁用",
+    #  行为以 C 为准; 终端反修轮上限走 --bf-term-maxp)
     BWD="${DS4_BWD:-0}"; GSW="${DS4_GSWEEP:-0}"
-    export DS4_BF_TERM_MAXP="${DS4_BF_TERM_MAXP:-0}"
-    export DS4_BF_NO_RECHECK="${DS4_BF_NO_RECHECK:-1}"   # 判决前置(2026-07-21): 复检遍默认关
+    TMAXP="${DS4_BF_TERM_MAXP:-0}"
 else
     NLAY=43; GSW="${DS4_GSWEEP:-3}"
     TI=${TMIN%.*}; [ -n "$TI" ] || TI=0
@@ -81,8 +83,8 @@ HF="${DS4_HF:-/Users/fodelf/ds4-main/hf/DeepSeek-V4-Flash-Base}"
 if [ ! -d "$HF" ]; then
     REMOTE="${DS4_REMOTE:-192.168.1.2}"; RPATH="${DS4_REMOTE_ROOT:-/Users/fodelf/ds4-main}"
     echo "【全模型】脚本 算法=ssh转发 进度=开始 体积=- 还原度=- 研判=本机无HF→转 $REMOTE" >&2
-    EFWD=""   # ★转发本机 DS4_* 调优 env 到 M1(否则 DS4_FAST_LAYERS 等在 ssh 后丢失)★
-    for v in DS4_FAST_LAYERS DS4_FAST_NTOK DS4_NTOK DS4_GSWEEP DS4_BWD DS4_BF_TERM_MAXP DS4_BACKFIT_INCR DS4_CORPUS DS4_THREADS DS4_SKELETON DS4_SIGNREF_MU; do
+    EFWD=""   # ★转发本机 DS4_* 调优 env 到 M1(否则 DS4_FAST_LAYERS 等在 ssh 后丢失; DS4_BACKFIT_INCR 死名已删)★
+    for v in DS4_FAST_LAYERS DS4_FAST_NTOK DS4_NTOK DS4_GSWEEP DS4_BWD DS4_BF_TERM_MAXP DS4_CORPUS DS4_THREADS DS4_SKELETON DS4_SIGNREF_MU; do
         eval "val=\${$v:-}"; [ -n "$val" ] && EFWD="$EFWD $v='$val'"
     done
     echo "【全模型】脚本 算法=ssh转发 进度=- 体积=- 还原度=- 研判=转发env:${EFWD:-无}; Ctrl+C/kill 将同时清远端" >&2
@@ -109,11 +111,11 @@ zchain_fix(){   # 截停恢复: 优化链侧车缺失/过期(量化没跑到 zch
     ZCB0="$ROOT/gguf/go-onebit/zchain_all.bin"
     NEWEST_DQL=$(ls -t "$LDIR"/dql_L*.bin 2>/dev/null | head -1)
     if [ -n "$NEWEST_DQL" ] && { [ ! -s "$ZCB0" ] || [ "$ZCB0" -ot "$NEWEST_DQL" ]; }; then
-        echo "【全模型】脚本 算法=$1 进度=补优化侧车 体积=- 还原度=- 研判=zchain/opt 缺失或旧于层文件 → DS4_ZCHAIN_ONLY 从 dql 重建" >&2
-        DS4_ZCHAIN_ONLY=1 DS4_LAYER_DIR="$LDIR" DS4_ZCHAIN="$ZCB0" DS4_NL="$NLAY" ./ds4quant_run 2>&1 | grep -a ZCHAIN || true
+        echo "【全模型】脚本 算法=$1 进度=补优化侧车 体积=- 还原度=- 研判=zchain/opt 缺失或旧于层文件 → --zchain-only 从 dql 重建" >&2
+        ./ds4quant_run --hf "$HF" --zchain-only --layer-dir "$LDIR" --zchain "$ZCB0" --nl "$NLAY" 2>&1 | grep -a ZCHAIN || true
     fi
 }
-RESUME=""   # merge-续并态(部分 dql 已消费): M4.6 禁重建骨架 + 注入传 DS4_MERGE_RESUME
+RESUME=""   # merge-续并态(部分 dql 已消费): M4.6 禁重建骨架 + 注入传 --merge-resume
 if [ "$MODE" = merge ]; then
     # ---------- merge-only 入口: 量化 M2 完成后被看门狗/中断截停时, 层文件+OUT 已齐 → 跳过清理/锚/量化, 直补 M3 表 + M4.6 GGUF ----------
     OUT=/tmp/quant_all.out; LOG=/tmp/quant_all.log; ZFILE="$ROOT/gguf/go-onebit/zfile_all.bin"
@@ -177,7 +179,8 @@ if [ -f "$ANCH" ]; then
     [ "$ASZ" = "$EXP_SZ" ] || { echo "[M0] 锚 $ANCH 尺寸 $ASZ ≠ $EXP_SZ — 硬拒(防覆盖)" >&2; exit 2; }
 else
     echo "【全模型】脚本 算法=FP建锚(S=$NTOK,${NLAY}层) 进度=开始(一次性) 体积=$EXP_SZ 还原度=- 研判=锚缺失全新生成" >&2
-    DS4_ANCHOR="$ANCH" DS4_NL="$NLAY" DS4_FP_ONLY=1 ./ds4quant_run "$IDS" "$NTOK" >/tmp/anchor_build.out 2>/tmp/anchor_build.log \
+    ./ds4quant_run "$IDS" "$NTOK" --hf "$HF" --anchor "$ANCH" --nl "$NLAY" --fp-only \
+        >/tmp/anchor_build.out 2>/tmp/anchor_build.log \
         || { echo "[M0] 建锚失败, 见 /tmp/anchor_build.log" >&2; exit 2; }
     ASZ=$(stat -f%z "$ANCH" 2>/dev/null || echo 0)
     [ "$ASZ" = "$EXP_SZ" ] || { echo "[M0] 建锚后尺寸 $ASZ ≠ $EXP_SZ — 停" >&2; exit 2; }
@@ -189,15 +192,16 @@ ZFILE="$ROOT/gguf/go-onebit/zfile_all.bin"
 echo "【全模型】脚本 算法=渐进${NLAY}层 进度=启动 体积=- 还原度=- 研判=每层收敛制(不截断), 产物 $TBL/ + $ZFILE" >&2
 BIN_PAT="ds4quant_run $IDS"
 if [ "$MODE" != backfit ]; then : >"$OUT"; : >"$LOG"; fi   # backfit=追加(保留推进段 TABREC/日志供 M4 出表)
-( export DS4_ANCHOR="$ANCH" DS4_NL="$NLAY" DS4_LCFG=g DS4_SIGNREF_MU=10 DS4_COADAPT=1 \
-         DS4_ZFILE="$ZFILE" DS4_ZCHAIN="$ROOT/gguf/go-onebit/zchain_all.bin" \
-         DS4_TUNE_MIN="${TMIN:-0}" DS4_THREADS="${DS4_THREADS:-6}" \
-         DS4_LAYER_DIR="$LDIR"
-  if [ "$GSW" != 0 ]; then export DS4_GSWEEP="$GSW"; fi   # C 门只查存在性: "0" 也会触发 → 0 时不导出
-  if [ "$BWD" = 1 ]; then export DS4_BWD_FINAL=1; fi
-  if [ "$FAST" = 1 ]; then export DS4_FAST=1; fi
-  if [ "$MODE" = backfit ]; then export DS4_BF_ONLY=1; fi
-  exec ./ds4quant_run "$IDS" "$NTOK"
+( QFLAGS=(--hf "$HF" --anchor "$ANCH" --nl "$NLAY" --lcfg g --signref-mu 10 --coadapt 1
+          --zfile "$ZFILE" --zchain "$ROOT/gguf/go-onebit/zchain_all.bin"
+          --tune-min "${TMIN:-0}" --threads "${DS4_THREADS:-6}"
+          --layer-dir "$LDIR")
+  if [ "$GSW" != 0 ]; then QFLAGS+=(--gsweep "$GSW"); fi   # 0 时不传 = 不回扫(原 env 存在性门同语义)
+  if [ "$BWD" = 1 ]; then QFLAGS+=(--bwd-final); fi
+  if [ "$FAST" = 1 ]; then QFLAGS+=(--fast); fi
+  if [ "$MODE" = backfit ]; then QFLAGS+=(--bf-only); fi
+  if [ -n "$TMAXP" ]; then QFLAGS+=(--bf-term-maxp "$TMAXP"); fi
+  exec ./ds4quant_run "$IDS" "$NTOK" "${QFLAGS[@]}"
 ) >>"$OUT" 2> >(tee -a "$LOG" >&2) &
 SPID=$!   # exec 后 SPID 即量化进程本体
 trap 'kill -9 $(pgrep -f "$BIN_PAT") "$SPID" 2>/dev/null || true; echo "[中断] 已杀量化进程" >&2; exit 130' INT TERM
@@ -238,7 +242,7 @@ if [ "$TIMEDOUT" = 1 ] || [ "$WDOG" = 1 ] || [ "$RC" != 0 ]; then
         if [ "${DS4_SKIP_RRVERDICT:-0}" != "1" ]; then
             for RRIDS in /tmp/rr_hard.ids:64 /tmp/rr_code.ids:305; do
                 RRF="${RRIDS%%:*}"; RRN="${RRIDS##*:}"
-                [ -f "$RRF" ] && env -u DS4_ANCHOR_ROUTE bash "$ROOT/gguf-tools/scripts/rr_verdict.sh" "$RRF" "$RRN" 2>&1 \
+                [ -f "$RRF" ] && bash "$ROOT/gguf-tools/scripts/rr_verdict.sh" "$RRF" "$RRN" 2>&1 \
                     | grep -E 'VERDICT|watchdog' || echo "[自动merge] rr_verdict $RRF 未出分(不阻塞合并)" >&2
             done
         fi
@@ -309,7 +313,7 @@ if [ "${DS4_SKIP_MERGE:-0}" = 1 ]; then
     if [ "${DS4_SKIP_RRVERDICT:-0}" != "1" ]; then
         for RRIDS in /tmp/rr_hard.ids:64 /tmp/rr_code.ids:305; do
             RRF="${RRIDS%%:*}"; RRN="${RRIDS##*:}"
-            [ -f "$RRF" ] && env -u DS4_ANCHOR_ROUTE bash "$ROOT/gguf-tools/scripts/rr_verdict.sh" "$RRF" "$RRN" 2>&1 \
+            [ -f "$RRF" ] && bash "$ROOT/gguf-tools/scripts/rr_verdict.sh" "$RRF" "$RRN" 2>&1 \
                 | grep -E 'VERDICT|watchdog' || echo "[skip-merge] rr_verdict $RRF 未出分(不阻塞停点)" >&2
         done
     fi
@@ -352,7 +356,7 @@ fi
 
 # ---------- M4.6 GGUF(★铁律: 不管什么模式最后都要生成 GGUF★) ----------
 # 稀疏骨架: --experts-hole 专家槽只留洞(不算不写, 实占≈骨干几GB), merge 按偏移 pwrite 层文件字节回填;
-# 盘紧(<载荷×1.2)自动 DS4_MERGE_CONSUME=1 边并边释放层文件(峰值盘占恒定)。
+# 盘紧(<载荷×1.2)自动 --merge-consume 边并边释放层文件(峰值盘占恒定)。
 GGUF_OUT="$ROOT/gguf/go-onebit/ds4-code1b.gguf"
 SKEL="${DS4_SKELETON:-$ROOT/gguf/go-onebit/skeleton_go1b.gguf}"
 OFF="$ROOT/gguf/go-onebit/skeleton_off.txt"
@@ -398,11 +402,11 @@ if [ -s "$GGUF_OUT" ]; then
     exit 4
     PAY_KB=$(du -sk "$LDIR" | awk '{print $1}'); FREE_KB=$(df -k / | tail -1 | awk '{print $4}')
     CONSUME=""; [ "$FREE_KB" -lt $(( PAY_KB + PAY_KB/5 )) ] && CONSUME=1 \
-        && echo "[M4.6] 盘紧(余$((FREE_KB/1048576))G<载荷$((PAY_KB/1048576))G×1.2) → 边并边释放层文件(DS4_MERGE_CONSUME)" >&2
-    ( cd "$QDIR" && export DS4_MERGE_GGUF="$GGUF_OUT" DS4_MERGE_OFF="$OFF" DS4_LAYER_DIR="$LDIR" DS4_NL="$NLAY"
-      [ -n "$CONSUME" ] && export DS4_MERGE_CONSUME=1   # C 门只查存在性: 空值也触发 → 必须条件导出(此前 ""=恒consume 是bug)
-      [ -n "$RESUME" ]  && export DS4_MERGE_RESUME=1
-      ./ds4quant_run 2>&1 | tee -a "$LOG" ) || true
+        && echo "[M4.6] 盘紧(余$((FREE_KB/1048576))G<载荷$((PAY_KB/1048576))G×1.2) → 边并边释放层文件(--merge-consume)" >&2
+    ( cd "$QDIR" && MFLAGS=(--hf "$HF" --merge-gguf "$GGUF_OUT" --merge-off "$OFF" --layer-dir "$LDIR" --nl "$NLAY")
+      [ -n "$CONSUME" ] && MFLAGS+=(--merge-consume)   # 开关型 flag 条件追加(原 env 存在性门同语义)
+      [ -n "$RESUME" ]  && MFLAGS+=(--merge-resume)
+      ./ds4quant_run "${MFLAGS[@]}" 2>&1 | tee -a "$LOG" ) || true
     if grep -q "MERGE_GGUF.*完成" "$LOG" 2>/dev/null; then
         MSMK=""; [ "$FAST" = 1 ] && MSMK="(fast冒烟档S=$NTOK)"
         echo "【全模型】脚本 算法=合并GGUF 进度=完成 体积=$(stat -f%z "$GGUF_OUT" 2>/dev/null || echo 0)B 还原度=- 研判=✓ $GGUF_OUT(可 ds4 -m 加载)$MSMK" >&2

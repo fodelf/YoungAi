@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # prefill 分块一致性/正确性裁判:
-#   同一 id 流在不同 DS4_EVAL_CHUNK 下走批前向, 逐位置导出 logits, 算 next-token NLL。
+#   同一 id 流在不同 --prefill-chunk 下走批前向, 逐位置导出 logits, 算 next-token NLL。
 #   批路径若数值正确, NLL 应与分块无关; 谁的 NLL 最低谁离真模型最近。
+#   (env 大扫除 2026-08-31: 原 DS4_EVAL_CHUNK 已死; eval-ids 仪器固定 512 分块并被
+#    session prefill_cap 封顶, 故 ≤512 的扫点经 --prefill-chunk 依旧成立, >512 扫不动)
 set -euo pipefail
 MODEL=${MODEL:-gguf/ds4-allq2.gguf}
 ZCHAIN=${ZCHAIN:-gguf/go-onebit/r30/full86/zchain_noge.bin}
@@ -12,8 +14,8 @@ EXTRA=${EXTRA:-}
 mkdir -p "$OUT"
 for C in $CHUNKS; do
   echo "=== chunk=$C ===" >&2
-  env DS4_EVAL_IDS="$IDS" DS4_EVAL_LOGITS="$OUT/lg_$C.bin" DS4_EVAL_CHUNK="$C" \
-      ./ds4 --cuda -m "$MODEL" ${ZCHAIN:+--zchain "$ZCHAIN"} ${EXTRA:-} -n 1 -p x </dev/null \
+  ./ds4 --cuda -m "$MODEL" --eval-ids "$IDS" --eval-logits "$OUT/lg_$C.bin" --prefill-chunk "$C" \
+      ${ZCHAIN:+--zchain "$ZCHAIN"} ${EXTRA:-} -n 1 -p x </dev/null \
       >"$OUT/run_$C.log" 2>&1 || { tail -5 "$OUT/run_$C.log"; exit 1; }
 done
 python3 - "$IDS" "$OUT" $CHUNKS <<'PY'

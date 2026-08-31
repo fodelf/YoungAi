@@ -50,7 +50,7 @@ stage_serve(){
     ssh $M1 "[ -f $M1DIR/$ZC ]" || { LOG "★zchain 侧车不在 M1 — 反修产物缺★"; exit 3; }
     LOG "起双机 lane(MODEL=$REL, zchain=$ZC)"
     MODEL="$REL" RESID= CORR= CTX="${CTX:-8192}" \
-        EXTRA_ENV="DS4_ZCHAIN=$ZC" "$ROOT/tools/svc.sh" up 2>&1 | tail -5 >&2
+        ZCH="$ZC" "$ROOT/tools/svc.sh" up 2>&1 | tail -5 >&2
     sleep 5
     curl -s -m 10 "http://127.0.0.1:${PORT:-8013}/v1/models" >/dev/null 2>&1 \
         && LOG "server 就绪 ✓" || LOG "★server 未响应(基准仍会逐题重启, 继续)★"

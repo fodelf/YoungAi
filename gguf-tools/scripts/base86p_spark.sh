@@ -20,16 +20,18 @@ JUDGE_DUMP="${JUDGE_DUMP:-/tmp/base86p_wt2.bin}"
 if ! { [ -f "$Q86_ANCHOR" ] && "$(dirname "$0")/../bench/anchor_metrics" --ref "$Q86_ANCHOR" --ids "$Q86_IDS" >/dev/null 2>&1; }; then
     LOG "锚缺, FP 前向现造 S=$Q86_S → $Q86_ANCHOR"
     cd "$ROOT/gguf-tools/amp"
-    DS4_HF="${DS4_HF:-$ROOT/hf/DeepSeek-V4-Flash-0731}" \
-    DS4_FP_ONLY=1 DS4_ANCHOR="$Q86_ANCHOR" DS4_THREADS=20 OPENBLAS_NUM_THREADS=1 \
-        ./ds4quant_run "$Q86_IDS" "$Q86_S" || { LOG "★锚捕获失败★"; exit 3; }
+    env OPENBLAS_NUM_THREADS=1 ./ds4quant_run "$Q86_IDS" "$Q86_S" \
+        --hf "${DS4_HF:-$ROOT/hf/DeepSeek-V4-Flash-0731}" \
+        --fp-only --anchor "$Q86_ANCHOR" --threads 20 || { LOG "★锚捕获失败★"; exit 3; }
     cd "$ROOT"
     [ -f "$Q86_ANCHOR" ] || { LOG "★锚没落盘★"; exit 3; }
 fi
 LOG "锚 ✓"
 tmux kill-session -t rb86 2>/dev/null; sleep 2
 P=quant; pkill -9 -f "ds4${P}_run" 2>/dev/null; sleep 2
-export DS4_BF_MEMGB=80 DS4_VQ_TIMING=1
+# 脚本间接口: r30_campaign quant86 段把这些转成 --bf-memgb/--calib-cap/--calib-export-cap
+# (DS4_VQ_TIMING 死名已删)
+export DS4_BF_MEMGB=80
 export DS4_CALIB_CAP=512 DS4_CALIB_EXPORT_CAP=512   # 每专家校准行帽(08-18): H/g_r ∝行数, 512=4×过采样质量安全
 # mmap 锁争用根修(2026-08-18 wchan 实锤 vm_mmap_pgoff/__vm_munmap): 专家循环反复 malloc/free
 # 大缓冲走 mmap 路径, 20 线程抢进程 mmap 写锁 → CPU 只吃一半。强制大分配走堆复用。
@@ -43,11 +45,13 @@ LOG "量化收官(43/43)"
 LOG "wt2 裸判"
 LCx=$(printf 'g%.0s' $(seq 1 43))
 cd "$ROOT/gguf-tools/amp"
-env DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-0731" OPENBLAS_NUM_THREADS=1 \
-    DS4_GSWEEP=0 DS4_BF_TERMINAL=0 DS4_BF_ONLY=1 DS4_COADAPT=1 DS4_CALIB_FULLSET=1 \
-    DS4_EXPORT_BYTES=0 DS4_ANCHOR="$R30/anchor_wt2_s2653.bin" DS4_NFIT=1 DS4_THREADS=20 \
-    DS4_LAYER_DIR="$Q86_OUT/layers" DS4_LCFG="$LCx" DS4_VQ=1 DS4_TGT_ALPHA=1.0 \
-    DS4_DUMP_LOGITS="$JUDGE_DUMP" ./ds4quant_run "$G7/wt2.ids" 8000 2>&1 | tail -2
+# --nfit 1 = 纯回放(判尺约定, 不 sweep) — caliper_ref.sh 同口径
+env OPENBLAS_NUM_THREADS=1 ./ds4quant_run "$G7/wt2.ids" 8000 \
+    --hf "$ROOT/hf/DeepSeek-V4-Flash-0731" \
+    --bf-only --coadapt 1 --calib-fullset \
+    --export-bytes 0 --anchor "$R30/anchor_wt2_s2653.bin" --nfit 1 --threads 20 \
+    --layer-dir "$Q86_OUT/layers" --lcfg "$LCx" --vq --tgt-alpha 1.0 \
+    --dump-logits "$JUDGE_DUMP" 2>&1 | tail -2
 cd "$ROOT"
 echo "══ $(basename "$Q86_OUT") 裸判 wt2 五指标(对表: M10裸底 0.4956 | 官方q2 0.4207) ══"
 "$(dirname "$0")/../bench/anchor_metrics" --ref "$R30/anchor_wt2_s2653.bin" --ids "$G7/wt2.ids" \

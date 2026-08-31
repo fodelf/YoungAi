@@ -24,7 +24,7 @@ func TestDuplicatedLinks(t *testing.T) {
 
 EOF
 )
-DS4_RESIDUAL="${RESID:-gguf/sidecars/code-hot-res-v2.gguf}" \
+RESID="${RESID:-gguf/sidecars/code-hot-res-v2.gguf}" \
 PROMPT="<｜begin▁of▁sentence｜>${CTX}func twoSum(nums []int, target int) []int {" \
 MODEL="${MODEL:-gguf/go-onebit/ds4-code1b-v2.gguf}" NPRED="${NPRED:-28}" TIMEOUT_S=420 \
   ./scripts/code1b_smoke.sh

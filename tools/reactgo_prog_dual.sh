@@ -4,7 +4,7 @@
 # 这是诊断/运行驱动, 不改模型。TEMP 是本轮 quality 诊断的关键变量(贪心塌缩 vs 真 bug)。
 #
 # 安全闸(铁律, 硬约束):
-#   - DS4_MEM_BUDGET_MB 各自 GPU 上限内(M4 11500<11840 / M1 10400<10670)+ 引擎 L1 resident gate 拒超预算启动。
+#   - --mem-budget-mb 各自 GPU 上限内(M4 11500<11840 / M1 10400<10670)+ 引擎 L1 resident gate 拒超预算启动。
 #   - 后台 RSS 看门狗: 两机各 12 GiB 红线, 超即杀两边 + abort。
 #   - 超时 RUN_TIMEOUT_SEC 兜底。cleanup 只杀 ds4 进程, 绝不删任何文件(尤其不碰 M1 上的分片)。
 set -uo pipefail
@@ -35,23 +35,17 @@ export default function TodoApp() {
 "}
 # PREFILL_CHUNK: 降 prefill 分块 → 缩小 MoE prefill scratch(模型贴满 GPU 上限时让 prefill 装得下)。空=引擎默认。
 PREFILL_CHUNK=${PREFILL_CHUNK:-}
-PC_ENV=""; [ -n "$PREFILL_CHUNK" ] && PC_ENV="DS4_METAL_PREFILL_CHUNK=$PREFILL_CHUNK"
-COMMON_ENV="DS4_DIST_REVERSE_CONNECT=1 DS4_METAL_EXPERT_OFFLOAD=0 DS4_METAL_NO_MODEL_WARMUP=1 $PC_ENV"
+PC_ARG=""; [ -n "$PREFILL_CHUNK" ] && PC_ARG="--prefill-chunk $PREFILL_CHUNK"
+# (env 大扫除 2026-08-31: EXPERT_OFFLOAD=0 无 flag 等价物 — offload 由 AUTO 按 --mem-budget-mb
+#  判定; NO_MODEL_WARMUP、ROUTER_FREQ_FILE(直方图采集器)、投机 SPEC env 族均已从引擎删除)
+COMMON_ARGS="--reverse-connect $PC_ARG"
 # DUMP: 设成文件路径 → coordinator 加 --dump-logprobs(贪心续写 + 每步 top-k 分布 JSON, 诊断重复可救性)。
 DUMP=${DUMP:-}
 DUMP_ARG=""; [ -n "$DUMP" ] && DUMP_ARG="--dump-logprobs $DUMP"
-# EXTRA_ENV: 透传任意 env 给 coordinator(如 DS4_METAL_GRAPH_DUMP_* 逐层 dump 中间张量定位 bug)
+# EXTRA_ENV: 透传任意系统 env 给 coordinator(引擎自身已不读任何 DS4_* env)
 EXTRA_ENV=${EXTRA_ENV:-}
-# FREQ: 文件路径 → 两机各加 DS4_ROUTER_FREQ_FILE(收集 base router raw top-k 偏好, 退出各写各的)
-FREQ=${FREQ:-}
-FREQ_ENV=""; [ -n "$FREQ" ] && FREQ_ENV="DS4_ROUTER_FREQ_FILE=$FREQ"
-COMMON_ENV="$COMMON_ENV $FREQ_ENV"
-# SPEC: 任意投机解码 env 透传两机(如 DS4_DIST_SPEC_PIPE=1; copy-spec 已是引擎天然默认无需 env)
-SPEC=${SPEC:-}
-COMMON_ENV="$COMMON_ENV $SPEC"
 # MTP_ARGS: 本机-MTP coordinator 的 --mtp 参数(--mtp FILE --mtp-role coordinator --mtp-draft N)。
 # output head 经 --mtp-role coordinator 自动归 M4; worker 分片须不含 output(--head none)。
-# 配 EXTRA_ENV=DS4_MTP_NO_RESIDENCY=0(wired 快/紧) 或 1(可驱逐 省内存/冷读慢)。
 MTP_ARGS=${MTP_ARGS:-}
 WORKER_LOG=/tmp/reactgo_prog_worker.log
 WORKER_PID_FILE=/tmp/reactgo_prog_worker.pid
@@ -81,8 +75,7 @@ sleep 1
 # ---- 起 M1 worker (nohup, control listen 等 coordinator) ----
 log "启动 M1 worker: -m $M1_MODEL --layers $WORKER_LAYERS (budget ${M1_BUDGET}MB, reverse-accept)"
 ssh "$M1" "cd '$REMOTE_DIR' && rm -f '$WORKER_LOG'; \
-  $COMMON_ENV DS4_MEM_BUDGET_MB=$M1_BUDGET \
-  nohup ./ds4 -m '$M1_MODEL' --role worker --listen '$M1' '$PORT' \
+  nohup ./ds4 -m '$M1_MODEL' $COMMON_ARGS --mem-budget-mb $M1_BUDGET --role worker --listen '$M1' '$PORT' \
   --layers '$WORKER_LAYERS' -c '$CTX' --temp 0 --nothink > '$WORKER_LOG' 2>&1 & echo \$! > '$WORKER_PID_FILE'; echo launched" 2>/dev/null
 
 log "等 M1 worker 就绪 (control listen)…"
@@ -102,8 +95,8 @@ sleep 1
 log "启动 M4 coordinator: -m $M4_MODEL --layers $COORD_LAYERS temp=$TEMP n=$NPRED (budget ${M4_BUDGET}MB)"
 rm -f "$COORD_LOG" "$COORD_OUT"
 # env(非 eval): 直接子进程, $! 就是 ds4 PID, 看门狗 RSS 才读得到。
-env DS4_DIST_REVERSE_CONNECT=1 DS4_METAL_EXPERT_OFFLOAD=0 DS4_METAL_NO_MODEL_WARMUP=1 $PC_ENV $EXTRA_ENV $FREQ_ENV $SPEC DS4_MEM_BUDGET_MB=$M4_BUDGET \
-  ./ds4 -m "$M4_MODEL" --role coordinator --coordinator "$M1" "$PORT" \
+env $EXTRA_ENV \
+  ./ds4 -m "$M4_MODEL" $COMMON_ARGS --mem-budget-mb $M4_BUDGET --role coordinator --coordinator "$M1" "$PORT" \
   --layers "$COORD_LAYERS" -c "$CTX" -n "$NPRED" --temp "$TEMP" --seed "$SEED" --nothink \
   $MTP_ARGS $DUMP_ARG -p "$PROMPT" > "$COORD_OUT" 2> "$COORD_LOG" &
 COORD_PID=$!

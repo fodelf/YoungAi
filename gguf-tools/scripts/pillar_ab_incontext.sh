@@ -17,7 +17,7 @@ BOS='<｜begin▁of▁sentence｜>'
 
 run() { # $1=tag $2=prompt
     echo "[ic] $1 跑中..." >&2
-    DS4_RESIDUAL="$RESID" PROMPT="$2" MODEL="$MODEL" NPRED="$NPRED" TIMEOUT_S=420 \
+    RESID="$RESID" PROMPT="$2" MODEL="$MODEL" NPRED="$NPRED" TIMEOUT_S=420 \
       ./scripts/code1b_smoke.sh > /tmp/ic_$1.out 2>/tmp/ic_$1.err || true
     {   echo "════ $1 ════"
         sed -n '/原始输出/,/引擎速度/p' /tmp/ic_$1.out | sed '1d;$d'

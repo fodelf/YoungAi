@@ -8,6 +8,11 @@
 # 口径: zlayer ADDON模式(M10记录之上), 零注入(zrec 逐臂挪 /tmp/zrec_probe_bak, 目录还原)。
 set -e
 export LC_ALL=en_US.UTF-8
+# ★停用(2026-08-31 env 大扫除)★: 本针的核心机制=每臂不同 fit 范围(原 DS4_ZL_FIT_RANGES/
+# EV_RANGE), 这对死名已从 zlayer 删除(行域改从 <锚>.layout 推导, 全臂同域) — 各臂再无区分,
+# 读数只会是三份重复。响亮失败, 不静默出误导数据(照 r30 stage_dynvol 前例)。
+echo "★probe_domz 停用: 分臂行掩码机制(DS4_ZL_FIT_RANGES)已随 env 大扫除删除, 无 flag 承接★" >&2
+exit 2
 ROOT=/Users/fodelf/ds4-main
 [ -x "$ROOT/gguf-tools/amp/zlayer" ] || make -C "$ROOT/gguf-tools" zlayer   # C 反修解算器(zlayer.py 已删)
 R30=$ROOT/gguf/go-onebit/r30
@@ -34,8 +39,8 @@ if [ ! -f "$ANCHOR" ]; then
   [ "$FREE" -ge 15 ] || { echo "★盘闸 free ${FREE}G <15G 停★" >> $SUM; exit 6; }
   echo "捕锚 $ANCHOR S=$NTOK $(date +%T)" >> $SUM
   ( cd $ROOT/gguf-tools/amp && \
-    env DS4_HF=$DS4_HF DS4_FP_ONLY=1 DS4_ANCHOR="$ANCHOR" DS4_THREADS=8 \
-      ./ds4quant_run.dchunk "$IDS" "$NTOK" >/tmp/domz_anchor$TAG.log 2>&1 )
+    ./ds4quant_run "$IDS" "$NTOK" --hf "$DS4_HF" --fp-only --anchor "$ANCHOR" \
+      --threads 8 >/tmp/domz_anchor$TAG.log 2>&1 )
   "$(dirname "$0")/../bench/anchor_metrics" --ref "$ANCHOR" --ids "$IDS" >/dev/null 2>&1 \
     || { echo "★锚完整性闸失败★" >> $SUM; exit 3; }
   echo "锚 ✓ $(ls -l "$ANCHOR" | awk '{printf "%.2f GiB",$5/1073741824}') $(date +%T)" >> $SUM
@@ -50,12 +55,11 @@ for Lz in 00 30; do
   [ -f $LD/zrec_L$Lz.bin ] && mv $LD/zrec_L$Lz.bin $BK/zrec_L$Lz.pre$TAG.bin
 done
 
-run_arm() { # $1=layer $2=臂名 $3=fit范围
+run_arm() { # $1=layer $2=臂名 $3=fit范围(死参: 行掩码机制已删, 见头部停用说明)
   Lz=$(printf "%02d" "$1"); lg=/tmp/domz_${2}_L$Lz$TAG.log
-  env VECLIB_MAXIMUM_THREADS=4 DS4_ZL_NTOK=$NTOK DS4_ZL_FIT_RANGES="$3" \
-    DS4_ZL_EV_RANGE="$EVR" DS4_ZL_SWLIM=60 \
+  env VECLIB_MAXIMUM_THREADS=4 \
     gguf-tools/amp/zlayer \
-    "$DS4_HF" "$LD" "$ANCHOR" "$1" 1024 2 >"$lg" 2>&1
+    "$DS4_HF" "$LD" "$ANCHOR" "$1" 1024 2 --ntok "$NTOK" --swlim 60 >"$lg" 2>&1
   grep -E "分域组合|held挽回" "$lg" | sed "s/^/[$2 L$Lz] /" >> $SUM
   mv "$LD/zrec_L$Lz.bin" "$BK/zrec_L$Lz.$2$TAG.bin" 2>/dev/null || true
   echo "ARM_DONE $2 L$Lz $(date +%T)" >> $SUM

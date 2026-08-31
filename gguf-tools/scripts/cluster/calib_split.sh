@@ -5,7 +5,7 @@
 cd "$1" || exit 1
 NX="${6:-256}"
 echo "host calib: layers=$2 cap=$3 zdir=$5 nx=$NX"
-DS4_Z_DUMP_DIR="$5" ./calib_run --hf "$4" --cap "$3" --layers "$2" --solver "${SOLVER:-hv}" ${EXTRA_ARGS:-} --nx "$NX" --threads 8 > /tmp/calib_z.log 2>&1 &
+./calib_run --hf "$4" --cap "$3" --layers "$2" --z-dump-dir "$5" --solver "${SOLVER:-hv}" ${EXTRA_ARGS:-} --nx "$NX" --threads 8 > /tmp/calib_z.log 2>&1 &
 QPID=$!
 echo "calib_run pid=$QPID watchdog@13GiB"
 PEAK=0

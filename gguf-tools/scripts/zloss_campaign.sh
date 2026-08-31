@@ -10,9 +10,9 @@
 #     → judge/engine(动态 z 注入格式 + 判决尺升级闸, 针后设计)
 # 目标: Σmin ≥ 0.90(裸 0.7799/冠军 r64c 0.7903), 体积 ≤ 2GB(用户 08-26 拍板)。
 # 用法: bash zloss_campaign.sh [needle|solve|full4l|judge|engine]
-# ★无环境变量铁律: 本脚本参数全部写死; DS4_ZL_* 是 zlayer(冻结转录件)的既有
-# 面板, 只用不新增。zlayer 只当 zcache 数据生产器(CACHE_ONLY), 解算线唯一
-# = zloss_solve(反修只留一份解算器, 用户 08-26 铁律)。★
+# ★无环境变量铁律: 本脚本参数全部写死; zlayer 面板走位置参数后的 --flag(原 DS4_ZL_*
+# env 已随 2026-08-31 大扫除拔死)。zlayer 只当 zcache 数据生产器(--cache-only), 解算线
+# 唯一 = zloss_solve(反修只留一份解算器, 用户 08-26 铁律)。★
 set -uo pipefail
 ROOT="$HOME/ds4-main"; GT="$ROOT/gguf-tools"
 D2="$ROOT/gguf/go-onebit/vqhalf"
@@ -29,6 +29,8 @@ DIE(){ LOG "★$*★"; exit 1; }
 
 # 行掩码(08-24 拼接毒定罪沿用): 256-token 块互织语料, 每块前 64 行=异域上下文
 # 污染行剔除; 前 24 块=拟合, 后 8 块=held。
+# ★只喂 zloss_solve(--fit-ranges/--ev-ranges)★: zlayer 侧的行掩码死名(DS4_ZL_FIT_RANGES/
+# EV_RANGE)已删, zlayer 自己从 <锚>.layout 推导行域。
 FR=""; ER=""
 for b in $(seq 0 31); do
     seg="$((b*256+64)):$(( (b+1)*256 ))"
@@ -66,8 +68,8 @@ stage_needle(){
         Lz=$(printf '%02d' "$L")
         if [ ! -s "$WS/layers/zcache_L$Lz.npz" ]; then
             LOG "①L$L zcache 重建(zlayer 模式①: 锚 x + 本进程重算量化学生, 只建缓存)"
-            env DS4_ZL_NTOK=$NTOK DS4_ZL_NFIT=$NFIT DS4_ZL_FIT_RANGES="$FR" DS4_ZL_EV_RANGE="$ER" \
-                DS4_ZL_CACHE_ONLY=1 "$GT/amp/zlayer" "$HF" "$WS/layers" "$ANC" "$L" 1024 0 \
+            "$GT/amp/zlayer" "$HF" "$WS/layers" "$ANC" "$L" 1024 0 \
+                --ntok $NTOK --cache-only \
                 2>&1 | grep -aE "zcache|缓存|Error|assert|★" || DIE "L$L zcache 失败"
         else
             LOG "①L$L zcache 已在, 复用"
@@ -113,8 +115,8 @@ stage_solve(){
     for L in $(seq 0 42); do
         Lz=$(printf '%02d' "$L")
         if [ ! -s "$WS/layers/zcache_L$Lz.npz" ]; then
-            env DS4_ZL_NTOK=$NTOK DS4_ZL_NFIT=$NFIT DS4_ZL_FIT_RANGES="$FR" DS4_ZL_EV_RANGE="$ER" \
-                DS4_ZL_CACHE_ONLY=1 "$GT/amp/zlayer" "$HF" "$WS/layers" "$ANC" "$L" 1024 0 \
+            "$GT/amp/zlayer" "$HF" "$WS/layers" "$ANC" "$L" 1024 0 \
+                --ntok $NTOK --cache-only \
                 2>&1 | grep -aE "zcache|就绪|Error|assert|★" || DIE "L$L zcache 失败"
         fi
         "$GT/amp/zloss_solve" --anchor "$ANC" --zcache "$WS/layers" --out "$WS/ge" \
@@ -176,11 +178,11 @@ stage_full4l(){
         LOG "量化链 x 捕获($BASE, 现有 $n/43) → $XC"
         mkdir -p "$XC"
         LCx=$(printf 'g%.0s' $(seq 1 43))
-        ( cd "$GT/amp" && env DS4_HF="$HF" OPENBLAS_NUM_THREADS=1 DS4_BF_MEMGB=8 \
-            DS4_GSWEEP=0 DS4_BF_TERMINAL=0 DS4_BF_ONLY=1 DS4_COADAPT=1 DS4_CALIB_FULLSET=1 \
-            DS4_EXPORT_BYTES=0 DS4_ANCHOR="$ANC" DS4_NFIT=1 DS4_THREADS=20 \
-            DS4_LAYER_DIR="$BASE_LAYERS" DS4_LCFG="$LCx" DS4_VQ=1 DS4_TGT_ALPHA=1.0 \
-            ./ds4quant_run "$D2/vqhalf_a.ids" 8192 --xcap-out "$XC" 2>&1 | tail -2 ) \
+        ( cd "$GT/amp" && env OPENBLAS_NUM_THREADS=1 \
+            ./ds4quant_run "$D2/vqhalf_a.ids" 8192 --xcap-out "$XC" \
+            --hf "$HF" --bf-memgb 8 --bf-only --coadapt 1 --calib-fullset \
+            --export-bytes 0 --anchor "$ANC" --nfit 1 --threads 20 \
+            --layer-dir "$BASE_LAYERS" --lcfg "$LCx" --vq --tgt-alpha 1.0 2>&1 | tail -2 ) \
             || DIE "x 捕获失败"
         n=$(ls "$XC"/raw_ffn_in_L* 2>/dev/null | wc -l)
         [ "$n" -eq 43 ] || DIE "x 捕获仍不齐 $n/43"
@@ -191,8 +193,8 @@ stage_full4l(){
         Lz=$(printf '%02d' "$L")
         if [ ! -s "$WSX/zcache_L$Lz.npz" ]; then
             LOG "L$L zcache 重建(量化链 x)"
-            env DS4_ZL_NTOK=$NTOK DS4_ZL_NFIT=$NFIT DS4_ZL_FIT_RANGES="$FR" DS4_ZL_EV_RANGE="$ER" \
-                DS4_ZL_CACHE_ONLY=1 "$GT/amp/zlayer" "$HF" "$WSX" "$ANC" "$L" 1024 0 "$XC" \
+            "$GT/amp/zlayer" "$HF" "$WSX" "$ANC" "$L" 1024 0 "$XC" \
+                --ntok $NTOK --cache-only \
                 2>&1 | grep -aE "zcache|就绪|XCAP|只换|Error|assert|★" || DIE "L$L zcache 失败"
         fi
         "$GT/amp/zloss_solve" --anchor "$ANC" --zcache "$WSX" --out "$WS/n4l" \

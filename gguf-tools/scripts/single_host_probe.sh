@@ -12,10 +12,10 @@ cd "$ROOT"
 pkill -9 -f 'ds4 ' 2>/dev/null; sleep 1
 
 echo "[单机] mono $MODEL, n=$N, offload+GO数值, 看门狗 free<${KILL_PCT}%"
-DS4_MEM_BUDGET_MB=11000 DS4_METAL_EXPERT_OFFLOAD=1 DS4_METAL_EXPERT_OFFLOAD_DIRECT=1 \
-  DS4_METAL_PREFILL_CHUNK=256 DS4_REPEAT_FREQ=1 \
-  DS4_METAL_MATH_SAFE=1 DS4_METAL_KV_RAW_F32=1 DS4_METAL_ROPE_EXP2_LOG2=1 \
-  nohup ./ds4 -m "$MODEL" --metal --ctx 4096 --temp 0 -n "$N" -p "$PROMPT" \
+# (env 大扫除 2026-08-31: EXPERT_OFFLOAD/OFFLOAD_DIRECT 归 AUTO 按 --mem-budget-mb 判定;
+#  REPEAT_FREQ 引擎已无此路; MATH_SAFE 三件套成组升格为 --strict-fp)
+nohup ./ds4 -m "$MODEL" --mem-budget-mb 11000 --prefill-chunk 256 --strict-fp \
+  --metal --ctx 4096 --temp 0 -n "$N" -p "$PROMPT" \
   > /tmp/single_probe.out 2> /tmp/single_probe.log &
 DSPID=$!
 echo "ds4 PID=$DSPID"

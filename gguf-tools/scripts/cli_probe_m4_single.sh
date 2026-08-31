@@ -3,7 +3,7 @@
 # 背景: 双机 lane 需 M1 侧模型文件, M1 已无(盘不容 53G) → 行为门走 M4 单机
 # (合一 VQ GGUF 引擎自动加载, pubbench 时代已验证单机路径)。
 # 口径与 cli_coding_probe.sh 同源: go_013 LRU 契约前缀, BOS 裸续写 greedy temp0,
-# 判定=组装文件可编译+过官方 solution_test.go。数值 env 与 dual_vq.sh NUM_ENV 同。
+# 判定=组装文件可编译+过官方 solution_test.go。数值 flag 与 dual_vq.sh NUM_FLAGS 同。
 # 用法: [MODEL=gguf/go-onebit/ds4-vq4bf.gguf] [NPRED=360] [TAG=v4bf] ./cli_probe_m4_single.sh
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd); ROOT=$(cd "$HERE/../.." && pwd)
@@ -37,11 +37,10 @@ printf '%s' "$PREFIX" > "$WORK/prefix.txt"
 cd "$ROOT"
 : > "$RPT"
 echo "════ go_013 LRU (M4 单机裸续写 $MODEL NPRED=$NPRED) ════" >> "$RPT"
-env DS4_METAL_MATH_SAFE=1 DS4_METAL_KV_RAW_F32=1 DS4_METAL_ROPE_EXP2_LOG2=1 \
-    DS4_REPEAT_FREQ=0 DS4_METAL_PREFILL_CHUNK=8 \
-    ${VQ_GPU:+DS4_VQ_GPU=1} \
-    DS4_MEM_BUDGET_MB=$MAXMB \
-  ./ds4 -m "$MODEL" -c "$CTX" -n "$NPRED" --temp 0 --seed 1 --nothink \
+# (env 大扫除 2026-08-31: MATH_SAFE 三件套成组升格为 --strict-fp; REPEAT_FREQ 引擎已无
+#  此路; VQ_GPU 诊断口已删)
+./ds4 -m "$MODEL" --strict-fp --prefill-chunk 8 --mem-budget-mb "$MAXMB" \
+    -c "$CTX" -n "$NPRED" --temp 0 --seed 1 --nothink \
     -p "<｜begin▁of▁sentence｜>${PREFIX}" > "$WORK/gen.out" 2> "$WORK/gen.log" &
 DPID=$!
 T0=$(date +%s)

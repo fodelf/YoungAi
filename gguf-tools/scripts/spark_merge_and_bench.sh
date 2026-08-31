@@ -85,7 +85,7 @@ do_bench(){
 
     LOG "跑 $suite 全 164 题"
     cd "$ROOT/gguf-tools" || exit 1
-    PUBBENCH_CACHE="$PWD/bench/data" "$(dirname "$0")/../bench/pubbench" \
+    "$(dirname "$0")/../bench/pubbench" --cache-dir "$PWD/bench/data" \
         --suite "$suite" --limit 164 --tag "${TAG:-en86}" --api completions
 }
 

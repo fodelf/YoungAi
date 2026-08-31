@@ -9,7 +9,7 @@ cd "$(dirname "$0")/.."     # → gguf-tools/(批4: go-onebit 目录消亡)
 MODEL="${MODEL:-gguf/go-onebit/ds4-code1b-v2.gguf}"
 # RESID="" 显式=无侧车(裸底座); 未设才回 v2 默认(- 与 :- 语义之差, 07-15 12针空跑教训)
 RESID="${RESID-gguf/sidecars/code-hot-res-v2.gguf}"
-if [ -n "$RESID" ]; then export DS4_RESIDUAL="$RESID"; else unset DS4_RESIDUAL; fi
+export RESID   # code1b_smoke.sh 读 RESID(空=裸腿, 非空=--residual 挂载)
 NPRED="${NPRED:-28}"
 SEL="${PROBES:-first}"
 CORPUS="${CORPUS:-data/corpus/pillar_probes.txt}"   # 扩域口(2026-07-21): 换语料复用同判据

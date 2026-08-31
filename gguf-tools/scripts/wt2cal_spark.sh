@@ -44,9 +44,9 @@ if [ "$ST" = all ] || [ "$ST" = zside ]; then
         if [ ! -f "$ZA" ]; then
             LOG "反修锚缺, FP 前向现造(odd 半) → $ZA"
             cd "$ROOT/gguf-tools/amp"
-            DS4_HF="${DS4_HF:-$ROOT/hf/DeepSeek-V4-Flash-0731}" \
-            DS4_FP_ONLY=1 DS4_ANCHOR="$ZA" DS4_THREADS=20 OPENBLAS_NUM_THREADS=1 \
-                ./ds4quant_run "$IDSZ" "$N" || { LOG "★反修锚失败★"; exit 3; }
+            env OPENBLAS_NUM_THREADS=1 ./ds4quant_run "$IDSZ" "$N" \
+                --hf "${DS4_HF:-$ROOT/hf/DeepSeek-V4-Flash-0731}" \
+                --fp-only --anchor "$ZA" --threads 20 || { LOG "★反修锚失败★"; exit 3; }
             cd "$ROOT"
         fi
     fi

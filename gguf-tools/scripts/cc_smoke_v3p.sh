@@ -46,10 +46,10 @@ pkill -9 -x ds4-server 2>/dev/null; sleep 1
 rm -rf /tmp/ds4-kv-ccsmoke   # 陈旧跨会话检查点塞满盘帽=攻7死因(hits=0全量冷灌)
 # 批量注入+小自由区(2026-07-16 凌晨实证: 26k ctx 下 9s/token, 引导轮15-17min 撞客户端
 # 流静默超时, 三次死在+68token; 批注入=结构token一次forward, 07-14预留的本场景最大杠杆)
-DS4_BASE_NATIVE=1 DS4_RESIDUAL=gguf/sidecars/code-hot-res-v3p.gguf \
-DS4_PRIMER_BATCH_INJECT=1 DS4_PRIMER_FREE_BUDGET=8 \
-DS4_MEM_BUDGET_MB=12000 DS4_METAL_PREFILL_CHUNK=512 \
+# (env 大扫除 2026-08-31: PRIMER_BATCH_INJECT/PRIMER_FREE_BUDGET 已写死进 server, env 无读取者)
   ./ds4-server -m gguf/go-onebit/ds4-code1b-v3p.gguf --port "$PORT" --ctx 65536 \
+    --base-native --residual gguf/sidecars/code-hot-res-v3p.gguf \
+    --mem-budget-mb 12000 --prefill-chunk 512 \
     --max-output-tokens 64 \
     --nothink --tool-primer --soul gguf-tools/data/corpus/soul/soul_server_v3.txt \
     --kv-disk-dir /tmp/ds4-kv-ccsmoke --kv-disk-space-mb 8192 \

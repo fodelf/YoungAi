@@ -7,14 +7,18 @@ set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd); ROOT=$(cd "$HERE/../.." && pwd)
 M1=192.168.1.2; M1DIR=/Users/fodelf/ds4-main; DPORT=5599
 MODEL=${MODEL:-gguf/ds4-mono-mixed.gguf}   # 2026-07-21: env 可覆盖(v2 捕获用)
-ENVSTR="DS4_DIST_REVERSE_CONNECT=1 DS4_METAL_EXPERT_OFFLOAD=1 DS4_METAL_PREFILL_CHUNK=2048 DS4_DIST_PREFILL_CAP=2048 DS4_METAL_EXPERT_GATHER_THREADS=8 DS4_METAL_NO_MODEL_WARMUP=1 DS4_MEM_BUDGET_MB=12000 DS4_METAL_EXPERT_PREFETCH_AHEAD=0"
+# (env 大扫除 2026-08-31: EXPERT_OFFLOAD=1 归 AUTO 按 --mem-budget-mb 判定; GATHER_THREADS
+#  写死 8; NO_MODEL_WARMUP 已删; PREFETCH_AHEAD=0 不再需要 — 捕获仪器武装时引擎自动关预取;
+#  层过滤 env(原 DS4_CAP_LAYERS)已死 — 双机各自只算本片层, 捕获天然只落本片)
+FLAGSTR="--reverse-connect --prefill-chunk 2048 --mem-budget-mb 12000"
+COORD_FLAGS="--dist-prefill-cap 2048"   # 只 coordinator 侧认
 # 校准 prompt: 默认 DSML seg0; PROMPT_FILE 可覆盖 (代码域校准用 gocode_calib.txt)
 PROMPT_FILE=${PROMPT_FILE:-$ROOT/cap_dsml/seg0.txt}
 PROMPT=$(cat "$PROMPT_FILE")
 CAP=${CAP:-capall}   # CAP=capcode 代码域
 
 ssh "$M1" "pkill -f 'role worker'; mkdir -p /tmp/${CAP} && rm -f /tmp/${CAP}/raw_* /tmp/ds4_worker_cap.log" 2>/dev/null; sleep 2
-ssh "$M1" "( cd $M1DIR && $ENVSTR DS4_CAP_DIR=/tmp/${CAP} DS4_CAP_LAYERS=20-42 nohup ./ds4 -m $MODEL --role worker --listen $M1 $DPORT --layers 20:output -c 4096 --temp 0 --nothink ) > /tmp/ds4_worker_cap.log 2>&1 < /dev/null & echo ok"
+ssh "$M1" "( cd $M1DIR && nohup ./ds4 -m $MODEL $FLAGSTR --cap-dir /tmp/${CAP} --role worker --listen $M1 $DPORT --layers 20:output -c 4096 --temp 0 --nothink ) > /tmp/ds4_worker_cap.log 2>&1 < /dev/null & echo ok"
 until ssh "$M1" "grep -q 'waiting for coordinator' /tmp/ds4_worker_cap.log" 2>/dev/null; do sleep 3; done
 echo "[capall] worker 就绪, 起 coordinator (M4 存 L0-19)"
 mkdir -p /tmp/${CAP}_m4 && rm -f /tmp/${CAP}_m4/raw_*
@@ -24,7 +28,7 @@ mkdir -p /tmp/${CAP}_m4 && rm -f /tmp/${CAP}_m4/raw_*
     rkb=$(ssh "$M1" "pgrep -f 'role worker'|head -1|xargs -I{} ps -o rss= -p {}" 2>/dev/null|tr -d ' '); rg=$((${rkb:-0}/1048576))
     [ "$g" -gt 12 ] || [ "$rg" -gt 12 ] && { echo "[capall] MEM-BREACH L=${g}G R=${rg}G"; kill "$cp"; ssh "$M1" "pkill -f 'role worker'"; break; }
     sleep 20; done ) & WD=$!
-( cd "$ROOT" && env $ENVSTR DS4_CAP_DIR=/tmp/${CAP}_m4 DS4_CAP_LAYERS=0-19 ./ds4 -m "$MODEL" --role coordinator --coordinator "$M1" "$DPORT" --layers 0:19 -c 4096 -n 1 --temp 0 --nothink -p "$PROMPT" > /tmp/${CAP}_coord.out 2> /tmp/${CAP}_coord.log )
+( cd "$ROOT" && ./ds4 -m "$MODEL" $FLAGSTR $COORD_FLAGS --cap-dir /tmp/${CAP}_m4 --role coordinator --coordinator "$M1" "$DPORT" --layers 0:19 -c 4096 -n 1 --temp 0 --nothink -p "$PROMPT" > /tmp/${CAP}_coord.out 2> /tmp/${CAP}_coord.log )
 kill "$WD" 2>/dev/null; ssh "$M1" "pkill -f 'role worker'" 2>/dev/null; sleep 3
 # harvest: M4 的 L0-19 送 M1, 与 M1 的 L20-42 合并
 echo "[capall] harvest L0-19 (M4) → M1"

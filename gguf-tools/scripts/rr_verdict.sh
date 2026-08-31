@@ -2,21 +2,19 @@
 # rr_verdict.sh [ids] [ntok] — 还原率铁律判决(2026-07-13): 硬文本分布还原率 Σmin/KL, teacher-forced 字节回放
 #
 # 口径(★还原率评分铁律★): top-1 一致率退役; 只认分布还原率 + 硬多样高PPL文本(默认 /tmp/rr_hard.ids)。
-# 机制: 复用 DS4_BF_ONLY 纯回放(SEARCH 跳过, DS4_BF_TERM_MAXP=0 = 不进 sweep/反调/回扫),
+# 机制: 复用 --bf-only 纯回放(SEARCH 跳过, --bf-term-maxp 0 = 不进 sweep/反调/回扫),
 #       对 dql 层文件按 op 链字节回放全 43 层 → 与 FP 锚同口径打 VERDICT。只读产物, 不改写。
 # 前提: gguf/go-onebit/layers/dql_L*.bin 全齐 — 必须在 merge consume 之前运行!
 # 产物: /tmp/rr_verdict.out 全量原始输出; stdout 摘要(VERDICT/回放累积行)。
 set -euo pipefail
-# ★裁判自清扫(2026-07-28 事故修): 调用方(campaign backfit)泄漏的反修/sweep 族旗标会把
-# BF_ONLY 纯回放重新点成 SEARCH+落盘 = 在判决语料上拟合并改写 dql(L0-L9 实际发生)。
-# 本脚本语义=只读判决, 与外部反修 env 永不兼容 → 顶部无条件剥离, 防御一切调用方。
-unset DS4_ANCHOR_ROUTE DS4_BWD DS4_BWD_FINAL DS4_BF_JUSTIFIED DS4_GSWEEP \
-      DS4_BACKFIT_INCR DS4_BF_MEMGB DS4_SIGNREF_MU DS4_BF_SCREEN_K DS4_BF_SCREEN_DIV DS4_NFIT
+# (2026-08-31 env 大扫除: 二进制不再读 env, 原"裁判自清扫 unset 反修族旗标"防御随之退役 —
+#  本脚本只传回放 flag, 调用方泄漏什么 env 都点不着 SEARCH。)
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 QDIR="$ROOT/gguf-tools/amp"
 LDIR="$ROOT/gguf/go-onebit/layers"
 IDS="${1:-/tmp/rr_hard.ids}"; NTOK="${2:-64}"
 NLAY="${DS4_NL:-43}"   # NL 覆盖口(2026-07-16): 小探针标定用 NL=6 局部判决(相对排序口径)
+HF="${DS4_HF:-$ROOT/hf/DeepSeek-V4-Flash-Base}"   # 原二进制 DS4_HF 写死回落=Flash-Base, 现显式 --hf 同值
 [ -f "$IDS" ] || { echo "[rr_verdict] 语料 $IDS 缺失 — 拒跑" >&2; exit 2; }
 CTOK=$(grep -c . "$IDS"); [ "$NTOK" -gt "$CTOK" ] && NTOK=$CTOK
 N_HAVE=$(ls "$LDIR"/dql_L*.bin 2>/dev/null | wc -l | tr -d ' ' || true)
@@ -46,15 +44,16 @@ if [ -f "$ANCH" ]; then
     [ "$ASZ" = "$EXP_SZ" ] || { echo "[rr_verdict] 锚 $ANCH 尺寸 $ASZ ≠ $EXP_SZ — 硬拒(防覆盖)" >&2; exit 2; }
 else
     echo "[rr_verdict] FP建锚 S=$NTOK → $ANCH (一次性)" >&2
-    DS4_ANCHOR="$ANCH" DS4_NL="$NLAY" DS4_FP_ONLY=1 DS4_THREADS="${DS4_THREADS:-6}" \
-        ./ds4quant_run "$IDS" "$NTOK" >/tmp/rr_anchor_build.out 2>&1 \
+    ./ds4quant_run "$IDS" "$NTOK" --hf "$HF" \
+        --anchor "$ANCH" --nl "$NLAY" --fp-only --threads "${DS4_THREADS:-6}" \
+        >/tmp/rr_anchor_build.out 2>&1 \
         || { echo "[rr_verdict] 建锚失败, 见 /tmp/rr_anchor_build.out" >&2; exit 2; }
 fi
 
 # ---- 纯回放判决 ----
-echo "[rr_verdict] 回放判决 S=$NTOK 语料=$IDS (BF_ONLY+MAXP=0: 只回放+VERDICT)" >&2
-( export DS4_ANCHOR="$ANCH" DS4_NL="$NLAY" DS4_LCFG=g DS4_COADAPT=1 DS4_LAYER_DIR="$LDIR" \
-         DS4_BF_ONLY=1 DS4_BF_TERM_MAXP=0 DS4_THREADS="${DS4_THREADS:-6}"
-  exec ./ds4quant_run "$IDS" "$NTOK" ) >/tmp/rr_verdict.out 2>&1 || true
+echo "[rr_verdict] 回放判决 S=$NTOK 语料=$IDS (--bf-only + --bf-term-maxp 0: 只回放+VERDICT)" >&2
+( exec ./ds4quant_run "$IDS" "$NTOK" --hf "$HF" \
+       --anchor "$ANCH" --nl "$NLAY" --lcfg g --coadapt 1 --layer-dir "$LDIR" \
+       --bf-only --bf-term-maxp 0 --threads "${DS4_THREADS:-6}" ) >/tmp/rr_verdict.out 2>&1 || true
 grep -aE "VERDICT|回放累积relL2|Σmin|ratio|KL|ppl|PPL" /tmp/rr_verdict.out || {
     echo "[rr_verdict] 无 VERDICT 行 — 看 /tmp/rr_verdict.out 尾部:" >&2; tail -5 /tmp/rr_verdict.out >&2; exit 1; }

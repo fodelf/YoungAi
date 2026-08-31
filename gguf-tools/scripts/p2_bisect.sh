@@ -18,7 +18,8 @@ case "$ST" in
 score_iq2)
     cd "$ROOT"
     LOG "引擎在线 score-ids: ds4-iq2.gguf(量化器直产) × wt2.ids 2653tok"
-    env DS4_CUDA_NO_TOKEN_GRAPH=1 timeout --foreground 3000 ./ds4 --cuda \
+    # (env 大扫除 2026-08-31: CUDA_NO_TOKEN_GRAPH 已无读取者, 删)
+    timeout --foreground 3000 ./ds4 --cuda \
         -m "$ROOT/gguf/ds4-iq2.gguf" --score-ids "$G7/wt2.ids" \
         --score-out /tmp/p2_iq2_wt2.bin </dev/null 2>&1 | grep -aE "score|完成|error|fail" | tail -3
     [ -s /tmp/p2_iq2_wt2.bin ] || { LOG "★score 没落盘★"; exit 2; }

@@ -14,7 +14,10 @@ RANK=${RANK:-32}
 OUT=${OUT:-$ROOT/gguf/sidecars/algo.gguf}
 M1=${M1:-192.168.1.2}; M1DIR=${M1DIR:-/Users/fodelf/ds4-main}; DPORT=${DPORT:-5599}
 MODEL=gguf/go-onebit/ds4-code1b.gguf
-ENVSTR="DS4_RESIDUAL=gguf/sidecars/code-hot-res-v3p.gguf DS4_DIST_REVERSE_CONNECT=1 DS4_METAL_EXPERT_OFFLOAD=1 DS4_METAL_PREFILL_CHUNK=2048 DS4_DIST_PREFILL_CAP=2048 DS4_METAL_EXPERT_GATHER_THREADS=8 DS4_METAL_NO_MODEL_WARMUP=1 DS4_MEM_BUDGET_MB=12000 DS4_METAL_EXPERT_PREFETCH_AHEAD=0"
+# (env 大扫除 2026-08-31: EXPERT_OFFLOAD=1 归 AUTO 按 --mem-budget-mb 判定; GATHER_THREADS
+#  写死 8; NO_MODEL_WARMUP 已删; PREFETCH_AHEAD=0 不再需要 — 捕获仪器武装时引擎自动关预取)
+FLAGSTR="--residual gguf/sidecars/code-hot-res-v3p.gguf --reverse-connect --prefill-chunk 2048 --mem-budget-mb 12000"
+COORD_FLAGS="--dist-prefill-cap 2048"   # 只 coordinator 侧认
 log(){ echo "[algo-pipeline] $*"; }
 
 case "${1:-status}" in
@@ -29,7 +32,8 @@ open(f"{sys.argv[2]}/seg0.txt", "w").write("<｜begin▁of▁sentence｜>" + tex
 print("[algo-pipeline] seg0:", len(text), "字节")
 PY
   ssh "$M1" "pkill -f 'role worker'; mkdir -p /tmp/cap_algo2 && rm -f /tmp/cap_algo2/raw_* /tmp/ds4_worker_cap.log" 2>/dev/null; sleep 2
-  ssh "$M1" "( cd $M1DIR && $ENVSTR DS4_CAP_DIR=/tmp/cap_algo2 DS4_CAP_LAYERS=$LAYERS nohup ./ds4 -m $MODEL --role worker --listen $M1 $DPORT --layers 20:output -c 4096 --temp 0 --nothink ) > /tmp/ds4_worker_cap.log 2>&1 < /dev/null & echo ok"
+  # 层过滤 env(原 DS4_CAP_LAYERS)已死: worker 只算 20:output 那片, 捕获天然只落本片层
+  ssh "$M1" "( cd $M1DIR && nohup ./ds4 -m $MODEL $FLAGSTR --cap-dir /tmp/cap_algo2 --role worker --listen $M1 $DPORT --layers 20:output -c 4096 --temp 0 --nothink ) > /tmp/ds4_worker_cap.log 2>&1 < /dev/null & echo ok"
   until ssh "$M1" "grep -q 'waiting for coordinator' /tmp/ds4_worker_cap.log" 2>/dev/null; do sleep 3; done
   ( sleep 15
     while true; do
@@ -39,7 +43,7 @@ PY
       if [ "$g" -gt 12 ] || [ "$rg" -gt 12 ]; then echo "[algo-pipeline] MEM-BREACH L=${g}G R=${rg}G 同杀"; kill "$cp"; ssh "$M1" "pkill -f 'role worker'"; exit 1; fi
       sleep 20
     done ) & WD=$!
-  ( cd "$ROOT" && env $ENVSTR ./ds4 -m "$MODEL" --role coordinator --coordinator "$M1" "$DPORT" \
+  ( cd "$ROOT" && ./ds4 -m "$MODEL" $FLAGSTR $COORD_FLAGS --role coordinator --coordinator "$M1" "$DPORT" \
       --layers 0:19 -c 4096 -n 1 --temp 0 --nothink \
       -p "$(cat "$CAPDIR/seg0.txt")" > /tmp/algo_cap_seg0.out 2> /tmp/algo_cap_seg0.log )
   kill "$WD" 2>/dev/null

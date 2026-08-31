@@ -63,8 +63,9 @@ cat "$RPT/speed_c4.txt"
 LOG "② 328 题基准"
 cd "$ROOT/gguf-tools"
 export PATH="$HOME/opt/go/bin:$PATH"
-DS4_URL=http://127.0.0.1:8000 PUBBENCH_CACHE="$PWD/bench/data" "$(dirname "$0")/../bench/pubbench" --suite humaneval --limit 164 --tag f86v2 --api completions 2>&1 | tail -6 | tee "$RPT/bench_py.txt"
-DS4_URL=http://127.0.0.1:8000 PUBBENCH_CACHE="$PWD/bench/data" "$(dirname "$0")/../bench/pubbench" --suite humaneval-x-go --limit 164 --tag f86v2 --api completions 2>&1 | tail -6 | tee "$RPT/bench_go.txt"
+# (2026-08-31 env 大扫除: DS4_URL/PUBBENCH_CACHE → --url/--cache-dir; --api completions=真代码基准口径铁律)
+"$(dirname "$0")/../bench/pubbench" --url http://127.0.0.1:8000 --cache-dir "$PWD/bench/data" --suite humaneval --limit 164 --tag f86v2 --api completions 2>&1 | tail -6 | tee "$RPT/bench_py.txt"
+"$(dirname "$0")/../bench/pubbench" --url http://127.0.0.1:8000 --cache-dir "$PWD/bench/data" --suite humaneval-x-go --limit 164 --tag f86v2 --api completions 2>&1 | tail -6 | tee "$RPT/bench_go.txt"
 LOG "② 基准完, 杀 server"
 pkill -x ds4-server 2>/dev/null; sleep 3; rm -f /tmp/ds4.lock
 

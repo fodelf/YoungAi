@@ -13,7 +13,7 @@ LOG "①重铸 allq2+drafter(q8 全家)"
     --mtp-append 3 --tensor-type mtp.=q8_0 || { LOG "★重铸失败★"; exit 2; }
 LOG "②投机 A/B (acc 统计)"
 cd "$ROOT"
-env DS4_DSPARK_SPEC=1 DS4_DSPARK_STAT=1 timeout 900 ./ds4 --cuda -m "$OUT" \
+timeout 900 ./ds4 --cuda -m "$OUT" --spec \
     --zchain gguf/go-onebit/r30/full86/zchain_noge.bin \
     --temp 0 -n 128 -p "Write a Python quicksort function." </dev/null 2>&1 \
     | grep -aE "t/s|dspark-stat|armed" | tail -6

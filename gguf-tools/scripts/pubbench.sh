@@ -20,12 +20,18 @@ TAG="${TAG:-run}"
 LIMIT="${LIMIT:-20}"
 URL="${DS4_URL:-http://127.0.0.1:8080}"
 SMOKE="${SMOKE:-1}"
+# --api 现为必填(2026-08-31 env 大扫除, 原 PUBBENCH_API 已拔死)。本包装历史上没设口径
+# = 走当时的默认 chat, 原样保留不偷改判决语义; ★口径铁律在案: 真代码基准必须 completions
+# 口径(chat 模板曾把 17/20 压成 5/20), 换口径=判决语义变更, 须用户令。
+API=chat
+# 缓存目录: 调用方(full328_spark 等)仍以 PUBBENCH_CACHE env 递入(脚本间接口), 二进制走 --cache-dir
+CACHE_FLAGS=(); [ -n "${PUBBENCH_CACHE:-}" ] && CACHE_FLAGS=(--cache-dir "$PUBBENCH_CACHE")
 
-echo "[pubbench] suite=$SUITE tag=$TAG url=$URL limit=$LIMIT" >&2
+echo "[pubbench] suite=$SUITE tag=$TAG url=$URL limit=$LIMIT api=$API" >&2
 
 if [ "$SMOKE" = "1" ]; then
   echo "[pubbench] smoke: 2 题先行, 判据=请求通+抽取出代码体+judge 正常给出 PASS/FAIL" >&2
-  "$(dirname "$0")/../bench/pubbench" --suite "$SUITE" --url "$URL" --tag "${TAG}_smoke" --limit 2 || {
+  "$(dirname "$0")/../bench/pubbench" --suite "$SUITE" --url "$URL" --api "$API" "${CACHE_FLAGS[@]+"${CACHE_FLAGS[@]}"}" --tag "${TAG}_smoke" --limit 2 || {
     echo "[pubbench] smoke FAILED — 不放全量, 先查 server 字段/抽取/judge" >&2
     exit 1
   }
@@ -39,4 +45,4 @@ if [ "$SMOKE" = "1" ]; then
   echo "[pubbench] smoke 通过, 放全量 $LIMIT 题" >&2
 fi
 
-exec "$(dirname "$0")/../bench/pubbench" --suite "$SUITE" --url "$URL" --tag "$TAG" --limit "$LIMIT"
+exec "$(dirname "$0")/../bench/pubbench" --suite "$SUITE" --url "$URL" --api "$API" "${CACHE_FLAGS[@]+"${CACHE_FLAGS[@]}"}" --tag "$TAG" --limit "$LIMIT"

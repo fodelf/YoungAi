@@ -43,8 +43,8 @@ cp dql_L*.bin "$HOME/ds4-main/$D2/$WS/layers/"
 cd ~/ds4-main
 LOG "②工作区就绪"
 # 行掩码不再在这里算(2026-08-29): 已下沉进 zlayer/ds4quant_run —— 它们从【自己拿到的
-# 锚路径】读 <锚>.layout 推导行域。脚本现算现传(DS4_ZL_FIT_RANGES/EV_RANGE)那条路已删:
-# 掩码写在脚本里 = 语料一换就静默错位 = 今天 z 全拒 378/378 的根因。
+# 锚路径】读 <锚>.layout 推导行域。脚本现算现传(原 DS4_ZL_FIT_RANGES/EV_RANGE, 死名已删)
+# 那条路已删: 掩码写在脚本里 = 语料一换就静默错位 = 今天 z 全拒 378/378 的根因。
 # ③zlayer 全家 43 层(干净锚; XC 非空=第7参引擎捕获)
 # zlayer=C 版(2026-08-25 迁移 Wave B 一期, 金标 migrate/golden.txt: z支线与py精确一致/
 # GE=py-CPU路真解口径(py-GPU路 XCAP 下 GE 恒死是 py 自身分裂, 见 zlayer_transcription_notes #1)/
@@ -54,8 +54,9 @@ ZLB="$HOME/ds4-main/gguf-tools/amp/zlayer"
 # 构建收进 gguf-tools/Makefile(批1): 平台特判(Accelerate/scipy_openblas/CUDA)都在那边。
 [ -x "$ZLB" ] || make -C "$HOME/ds4-main/gguf-tools" zlayer
 for L in ${LRANGE:-$(seq 0 42)}; do
-  env DS4_ZL_NTOK=8192 DS4_ZL_NFIT=6144 ${XA:+DS4_ZL_XANCHOR=$XA} \
+  # 原 DS4_ZL_NTOK/XANCHOR env → 位置参数后的 --flag(env 大扫除); DS4_ZL_NFIT 死名已删
   "$ZLB" "$DS4_HF" $D2/$WS/layers "$ANC" $L "$K" 1 ${XC:+$D2/$XC} \
+    --ntok 8192 ${XA:+--xanchor "$XA"} \
     2>&1 | grep -aE "XCAP|Error|assert|★" || { LOG "★L$L 失败★"; exit 1; }
   # 进度可观测铁律: 每层收官打一行(tail -f 就能看到 43 层推进)
   LOG "L$L ✓ $(ls "$D2/$WS/layers"/zrec_L*.bin 2>/dev/null | wc -l | tr -d ' ')/43 K=$K"

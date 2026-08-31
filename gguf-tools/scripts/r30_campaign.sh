@@ -24,7 +24,9 @@ SC="$ROOT/gguf-tools/scripts"
 G7="$ROOT/gguf/go-onebit/g7"
 R30="$ROOT/gguf/go-onebit/r30"
 OUTF="${OUTF_OVERRIDE:-$R30/full}"          # ★nl86 复用(2026-08-12 用户令"反修全部用C"): 战役目录可覆盖
-QBIN="${QBIN_OVERRIDE:-$ROOT/gguf-tools/amp/ds4quant_run.r30}"   # QBIN_OVERRIDE: 探针 A/B(旧二进制/lldb 包装)
+# 默认=现役量化器(2026-08-31: .r30 冻结件已从盘上删除, 且 env 大扫除后的 --flag 只有现役二进制认)
+QBIN="${QBIN_OVERRIDE:-$ROOT/gguf-tools/amp/ds4quant_run}"   # QBIN_OVERRIDE: 探针 A/B(lldb 包装等)
+# DS4_HF 仍作脚本间接口(调用方 env 递入, 子脚本/zlayer 位置参数用); 二进制一律走 --hf 显式传
 export DS4_HF="${DS4_HF:-$HOME/ds4-main/hf/DeepSeek-V4-Flash-0731}"
 ANCHOR="${ANCHOR_OVERRIDE:-$R30/anchor_r30_s1716.bin}"
 IDS="${IDS_OVERRIDE:-$G7/rr_calib_prog_v5mini.ids}"
@@ -68,8 +70,8 @@ stage_anchor(){
     [ "$FREE" -ge 10 ] || { LOG "★盘闸 free ${FREE}G <10G 停★"; exit 6; }
     LOG "0731 全 FP 锚定遍 S=1716(同时是五指标的参考分布)"
     cd "$ROOT/gguf-tools/amp"
-    DS4_FP_ONLY=1 DS4_ANCHOR="$ANCHOR" DS4_NFIT=933 DS4_THREADS="${DS4_THREADS:-8}" \
-        "$QBIN" "$IDS" 1716
+    "$QBIN" "$IDS" 1716 --hf "$DS4_HF" --fp-only --anchor "$ANCHOR" \
+        --nfit 933 --threads "${DS4_THREADS:-8}"
     [ -f "$ANCHOR" ] || { LOG "★锚没落盘★"; exit 3; }
     LOG "锚 ✓ $(ls -l "$ANCHOR" | awk '{printf "%.2f GiB",$5/1073741824}')"
     # 冒烟判决同款自检: FP 参考 PPL 必须在正常范围(权重读错这里当场炸)
@@ -100,27 +102,35 @@ stage_quant(){
         || { LOG "★配置 JSON 校验不通过, 拒跑★"; exit 7; }
     cp "$PLAN_JSON" "$OUTF/plan_config.json"
     cd "$ROOT/gguf-tools/amp"
-    export DS4_ANCHOR="$ANCHOR" DS4_NFIT=933 DS4_THREADS="${DS4_THREADS:-6}"
-    export DS4_CALIB_FULLSET=1   # ★冠军工序(campaign_v4 同款): g_r/GPTQ-H 全集喂入, 修每专家~9行饿死
+    # 2026-08-31 env 大扫除: 量化器全参数走 CLI flag(发车命令一眼可见); 上游脚本递来的旋钮
+    # (DS4_BF_MEMGB/DS4_CALIB_*CAP 等)仍是脚本间 env 接口, 在这里显式转接成 flag。
+    QF=(--hf "$DS4_HF" --anchor "$ANCHOR" --nfit 933 --threads "${DS4_THREADS:-6}")
+    QF+=(--calib-fullset)   # ★冠军工序(campaign_v4 同款): g_r/GPTQ-H 全集喂入, 修每专家~9行饿死
     # ★纯VQ量化(2026-08-03 用户令"只要vq量化"): 量化段不跑 coadapt 定稿(菜单/z/四损失/感知/向后D3
-    #   全撤到反修段), 每层=计划表档位量化+前向+导出。DS4_MV_COAD_BASE/DS4_COADAPT 即定稿遍火源。
-    export DS4_MINVOL=1 DS4_MV_BASELINE=1 DS4_TUNE=1
-    export DS4_PURE_VQ=1   # ★导出先行+B回放: 每层=量化落盘一遍+盘上字节回放出链态(裸评撤, 省一遍VQ编码)
-    unset DS4_COADAPT DS4_MV_COAD_BASE 2>/dev/null || true
-    export DS4_VQ=1 DS4_TGT_ALPHA=1.0 DS4_VQ_RPLAN="$RPLAN"
-    export DS4_VOL_BUDGET_GIB="$BUDGET"
-    export DS4_GO2B_HOT=1 DS4_GO2B_HOT_TABLE="${HOT_TABLE:-$ROOT/gguf-tools/data/corpus/prog_active_top49.txt}"
-    export DS4_ROUTE_BIAS_FIT=1 DS4_ROUTE_BIAS_OUT="$OUTF/route_bias_r30.bin" DS4_ROUTE_BIAS_ALPHA=1.0
-    export DS4_BF_GAIN_GATE="${GAIN_GATE:-0.05}"    # 落地增益门
-    export DS4_PLAN="$OUTF/plan.txt" DS4_CKPT_DIR="$OUTF/ckpt"
-    export DS4_LAYER_DIR="$OUTF/layers" DS4_ZFILE="$OUTF/zfile.bin" DS4_ZCHAIN="$OUTF/zchain.bin"
-    unset DS4_MV_PROBE_L DS4_MINVOL_MAXL \
-          DS4_MINVOL_HIST DS4_MINVOL_FLOOR DS4_VQ_COLD_DIM DS4_VQ_COLD_NC \
-          DS4_MV_FLOOR_LINE DS4_RR_IDS DS4_ANCHOR2 DS4_MINVOL_TARGET DS4_BWD DS4_FP_ONLY 2>/dev/null || true
-    [ -n "${PROBE1:-}" ] && { export DS4_MINVOL_MAXL="${PROBE_MAXL:-1}"; LOG "★探针模式: 只量化前 ${DS4_MINVOL_MAXL} 层早退★"; }
+    #   全撤到反修段), 每层=计划表档位量化+前向+导出。不传 --coadapt = 定稿遍不点燃。
+    QF+=(--minvol --mv-baseline --tune)
+    QF+=(--pure-vq)   # ★导出先行+B回放: 每层=量化落盘一遍+盘上字节回放出链态(裸评撤, 省一遍VQ编码)
+    QF+=(--vq --tgt-alpha 1.0 --vq-rplan "$RPLAN")
+    QF+=(--go2b-hot 1 --go2b-hot-table "${HOT_TABLE:-$ROOT/gguf-tools/data/corpus/prog_active_top49.txt}")
+    QF+=(--route-bias-fit --route-bias-out "$OUTF/route_bias_r30.bin" --route-bias-alpha 1.0)
+    QF+=(--bf-gain-gate "${GAIN_GATE:-0.05}")    # 落地增益门
+    QF+=(--plan "$OUTF/plan.txt" --ckpt-dir "$OUTF/ckpt")
+    QF+=(--layer-dir "$OUTF/layers" --zfile "$OUTF/zfile.bin" --zchain "$OUTF/zchain.bin")
+    [ -n "${DS4_BF_MEMGB:-}" ] && QF+=(--bf-memgb "$DS4_BF_MEMGB")
+    [ -n "${DS4_CALIB_CAP:-}" ] && QF+=(--calib-cap "$DS4_CALIB_CAP")
+    [ -n "${DS4_CALIB_EXPORT_CAP:-}" ] && QF+=(--calib-export-cap "$DS4_CALIB_EXPORT_CAP")
+    [ -n "${PROBE1:-}" ] && { QF+=(--minvol-maxl "${PROBE_MAXL:-1}"); LOG "★探针模式: 只量化前 ${PROBE_MAXL:-1} 层早退★"; }
     LOG "量化起跑 $([ -n "${PROBE1:-}" ] && echo 'L00 探针' || echo '43 层')(0731 源, 预算 ${BUDGET} GiB 载荷)"
-    "$QBIN" "$IDS" 1716
+    "$QBIN" "$IDS" 1716 "${QF[@]}"
     LOG "量化 rc=$?"
+    # ★体积闸挪脚本侧(2026-08-31)★: 原 DS4_VOL_BUDGET_GIB env 已拔死(C 零读者), 预算判停
+    # 改按 manifest 实账在这里执行, 语义不变(blob 载荷超预算即停)。
+    if [ -f "$OUTF/layers/manifest.txt" ]; then
+        TOTG=$(awk '{s+=$2} END{printf "%.3f", s/1073741824}' "$OUTF/layers/manifest.txt")
+        awk -v t="$TOTG" -v b="$BUDGET" 'BEGIN{exit !(t>b)}' \
+            && { LOG "★体积闸: blob ${TOTG} GiB > 预算 ${BUDGET} GiB — 停★"; exit 7; }
+        LOG "体积账: blob ${TOTG} GiB ≤ 预算 ${BUDGET} GiB ✓"
+    fi
 }
 
 # 额外 CLI 参数(如 --elm-probe 2,20,40)原样透传给 QBIN。走位置参数不走 env —— 铁律 08-22。
@@ -135,52 +145,44 @@ stage_backfit(){
         [ "$N" = 43 ] || { LOG "层文件 $N/43 不齐, 拒反修"; exit 2; }
     fi
     cd "$ROOT/gguf-tools/amp"
-    export DS4_ANCHOR="$ANCHOR" DS4_NFIT="${BF_NFIT:-933}" DS4_THREADS="${DS4_THREADS:-6}"
-    export DS4_CALIB_FULLSET=1
-    export DS4_LAYER_DIR="$OUTF/layers" DS4_LCFG=$(printf 'g%.0s' $(seq 1 43)) DS4_COADAPT=1
-    export DS4_VQ=1 DS4_TGT_ALPHA=1.0
+    # 2026-08-31 env 大扫除: 全参数走 CLI flag。不传 --tune/--minvol/--mv-baseline/--vq-rplan
+    # 结构上就不会走错分支 — 原"unset+在场自检"防调用方泄漏的两道闸随之退役。
+    BFF=(--hf "$DS4_HF" --anchor "$ANCHOR" --nfit "${BF_NFIT:-933}" --threads "${DS4_THREADS:-6}")
+    BFF+=(--calib-fullset)
+    BFF+=(--layer-dir "$OUTF/layers" --lcfg "$(printf 'g%.0s' $(seq 1 43))" --coadapt 1)
+    BFF+=(--vq --tgt-alpha 1.0)
     # go2b 热专家: 冠军底座是"热 go2b 合并态 + 冷 go1b", 默认 1=原样。但纯 VQ 底座没有
     # go2b 热专家(如 lyr86 全 256 专家层内同档 hot=0), armed 一张不属于它的热表 = 反修按
-    # "这些专家是合并 2bit"建模 = 错模型。故认既有开关 DS4_GO2B_HOT(非新增 env), 缺省保持
+    # "这些专家是合并 2bit"建模 = 错模型。故认既有脚本间开关 DS4_GO2B_HOT, 缺省保持
     # 冠军行为。★热表读失败是硬拒 rc=8★ —— 要关就明确传 0, 它不会静默退化。
-    export DS4_GO2B_HOT="${DS4_GO2B_HOT:-1}"
-    export DS4_GO2B_HOT_TABLE="${HOT_TABLE:-$ROOT/gguf-tools/data/corpus/prog_active_top49.txt}"
-    export DS4_ZFILE="$OUTF/zfile.bin" DS4_ZCHAIN="$OUTF/zchain.bin"
+    G2H="${DS4_GO2B_HOT:-1}"
+    [ "$G2H" != 0 ] && BFF+=(--go2b-hot "$G2H" --go2b-hot-table "${HOT_TABLE:-$ROOT/gguf-tools/data/corpus/prog_active_top49.txt}")
+    BFF+=(--zfile "$OUTF/zfile.bin" --zchain "$OUTF/zchain.bin")
     # ★一次从头到尾的反修(2026-08-04 用户终裁)★: 不要 ALT逐层+sweep+回扫三段叠罗汉 —
-    #   ①BF_ONLY: 跳过 ALT 逐层反修(层内判据, 保险门实锤端到端负贡献 1.9045>1.6474)
-    #   ②ONEPASS sweep: 每层在端到端判据下选型+解z, 冻结基线一次遍历+统一终验+劣化全回滚
-    #   ③GSWEEP=0: 回扫不跑 — 侧车架构下需要时删侧车一条 env 即可补跑
+    #   ①--bf-only: 跳过 ALT 逐层反修(层内判据, 保险门实锤端到端负贡献 1.9045>1.6474)
+    #   ②ONEPASS sweep(冻结基线一次遍历+统一终验+劣化全回滚)已写死进二进制(原 DS4_BF_ONEPASS
+    #     等开关族随 env 大扫除拔死: FROM_BYTES/SCREEN_DIV=12/SCREEN_K=4/GS_CONV_PCT=0.1/
+    #     二分 sweep 全部固化或清除, 见 ds4quant_cli.inc.c 常量区)
+    #   ③--gsweep 0: 回扫不跑 — 可外覆盖(2026-08-05 一遍全局回扫)
     LOG "★架构组件在场自检(2026-08-05 铁律)★ z变量[E/C/F] 四损失[KGRID la/lf/ls+lc] 感知[pc行权] 向后[TREF-B] 路由[GE-D投影; RB对哈希路由无对象(终审)]"
-    export DS4_BF_ONLY=1
-    export DS4_BWD=1 DS4_GSWEEP="${DS4_GSWEEP:-0}" DS4_BF_JUSTIFIED=1   # GSWEEP 可外覆盖(2026-08-05 一遍全局回扫) DS4_BF_TERM_MAXP=1 DS4_BF_MEMGB="${BF_MEMGB:-1}"
-    export DS4_BF_FROM_BYTES=1   # ★字节起步(2026-08-03): 冷基座=量化段盘上字节 dequant, 免重编码
-    export DS4_EXPORT_BYTES=0    # ★平行架构(2026-08-04): 反修段 dql 不可变 — export 只重建 op 侧车
-    export DS4_BF_SCREEN_DIV=12 DS4_BF_SCREEN_K=4   # sweep 快刀(抽1/12行+top4候选)
-    export DS4_BF_ONEPASS=1
-    export DS4_GS_CONV_PCT=0.1   # (回扫若手动补跑: 轮间判停)
-    # 二分 sweep(DS4_BF_SWEEP_ORDER=bisect + DS4_BF_BISECT_SKIP/_MAXSEG)已实现但默认不武装:
-    #   单测实账(2026-08-04, mock=R30 首遍真实Δbest): 密集分布(35/42层有增益)只省2单元还漏
-    #   L08(+0.53%)/L24(+0.29%); 稀疏分布端点孤岛(L41+3.0%)会被相邻平坦mid连坐剪掉 —
-    #   剪枝与零漏检不可兼得, 质量门铁律优先。增益稀疏的增量复跑场景可手动开。
-    export DS4_ROUTE_BIAS="$OUTF/route_bias_r30.bin" DS4_ROUTE_BIAS_ALPHA="${RB_ALPHA:-2.5}" DS4_ROUTE_BIAS_MINCNT=8
-    unset DS4_TUNE DS4_MINVOL DS4_MV_BASELINE DS4_MV_COAD_BASE \
-          DS4_MV_PROBE_L DS4_MINVOL_MAXL \
-          DS4_MINVOL_HIST DS4_MINVOL_FLOOR DS4_MINVOL_TARGET DS4_MINVOL_ALPHA \
-          DS4_VQ_RPLAN DS4_VOL_BUDGET_GIB DS4_PLAN DS4_CKPT_DIR \
-          DS4_ROUTE_SEQ \
-          DS4_RR_IDS DS4_ANCHOR2 DS4_EXPORT_GGUF DS4_REPAIR_COLD DS4_FP_ONLY 2>/dev/null || true
+    BFF+=(--bf-only)
+    BFF+=(--bwd --gsweep "${DS4_GSWEEP:-0}")
+    BFF+=(--export-bytes 0)    # ★平行架构(2026-08-04): 反修段 dql 不可变 — export 只重建 op 侧车
+    BFF+=(--route-bias "$OUTF/route_bias_r30.bin" --route-bias-alpha "${RB_ALPHA:-2.5}" --route-bias-mincnt 8)
     # ★RB FIT 复活(2026-08-05 用户批): 0731 只有 L0-L2 哈希路由(hash_layer_count=3 实锤),
     #   L3-L42 部署态活分数 top-k — 8-03"全程哈希→RB 无对象"终审只对 3 层成立。Δb 统计
     #   寄生在反修自身前向(零额外前向, 统计段在锚 override 之前读学生 top-k), rb_save 收官
     #   落盘 → merge 段烘进 exp_probs_b(α 冠军档)。多次同层前向重复累计=均值归一无偏。
-    export DS4_ROUTE_BIAS_FIT=1 DS4_ROUTE_BIAS_OUT="$OUTF/route_bias_r30.bin"
-    export DS4_BF_GAIN_GATE="${GAIN_GATE:-0.05}"
-    for v in DS4_TUNE DS4_MINVOL DS4_MV_BASELINE DS4_VQ_RPLAN; do
-        [ -z "$(eval echo \"\${$v:-}\")" ] || { LOG "★$v 仍在场, 反修会走错分支 — 停★"; exit 8; }
-    done
-    [ -n "${PROBE1:-}" ] && { export DS4_NL=1; LOG "★探针模式: 只反修 L00(DS4_NL=1)★"; }
+    BFF+=(--route-bias-fit --route-bias-out "$OUTF/route_bias_r30.bin")
+    BFF+=(--bf-gain-gate "${GAIN_GATE:-0.05}")
+    [ -n "${DS4_BF_MEMGB:-}" ] && BFF+=(--bf-memgb "$DS4_BF_MEMGB")
+    [ -n "${DS4_CALIB_CAP:-}" ] && BFF+=(--calib-cap "$DS4_CALIB_CAP")
+    [ -n "${DS4_CALIB_EXPORT_CAP:-}" ] && BFF+=(--calib-export-cap "$DS4_CALIB_EXPORT_CAP")
+    NLX="${DS4_NL:-}"
+    [ -n "${PROBE1:-}" ] && { NLX=1; LOG "★探针模式: 只反修 L00(--nl 1)★"; }
+    [ -n "$NLX" ] && BFF+=(--nl "$NLX")
     LOG "反修起跑"
-    "$QBIN" "$IDS" "${BF_S:-1716}" "$@"
+    "$QBIN" "$IDS" "${BF_S:-1716}" "${BFF[@]}" "$@"
     LOG "反修 rc=$?"
 }
 
@@ -207,19 +209,19 @@ stage_student(){
     cd "$ROOT/gguf-tools/amp"
     STU_T0=$(date +%s)
     LOG "学生回放遍(层文件 + 100%锚路由 + Δb α 部署态, dump [S,VOCAB])"
-    # ★真·纯回放(2026-08-03 实锤): -u DS4_GSWEEP 是暗雷(代码默认3=回扫照跑); COADAPT=1 会点燃
-    #   逐层sweep(incr 门)。显式 GSWEEP=0 + BACKFIT_INCR=0 + BF_ONLY=1 ⇒ 字节回放+VERDICT+logits dump。
-    env -u DS4_TUNE -u DS4_MINVOL -u DS4_MV_BASELINE -u DS4_VQ_RPLAN -u DS4_BWD \
-        DS4_GSWEEP=0 DS4_BF_TERMINAL=0 DS4_BF_ONLY=1 \
-        DS4_CALIB_FULLSET=1 \
-        DS4_ANCHOR="$ANCHOR" DS4_NFIT=933 DS4_THREADS="${DS4_THREADS:-8}" \
-        DS4_LAYER_DIR="$OUTF/layers" DS4_LCFG=$(printf 'g%.0s' $(seq 1 43)) \
-        DS4_VQ=1 DS4_TGT_ALPHA=1.0 DS4_COADAPT=1 \
-        DS4_GO2B_HOT=1 DS4_GO2B_HOT_TABLE="${HOT_TABLE:-$ROOT/gguf-tools/data/corpus/prog_active_top49.txt}" \
-        DS4_ZFILE="$OUTF/zfile.bin" DS4_ZCHAIN="$OUTF/zchain.bin" \
-        DS4_ROUTE_BIAS="$OUTF/route_bias_r30.bin" DS4_ROUTE_BIAS_ALPHA="${RB_ALPHA:-2.5}" DS4_ROUTE_BIAS_MINCNT=8 \
-        DS4_DUMP_LOGITS="$OUTF/student_logits.bin" \
-        "$QBIN" "$IDS" 1716 || { LOG "★学生回放失败★"; exit 3; }
+    # ★真·纯回放(2026-08-31 env 大扫除后成结构保证): 不传 --tune/--minvol/--vq-rplan/--bwd,
+    #   --gsweep 0 显式(原"-u DS4_GSWEEP 暗雷=代码默认3"随 env 一起拔死) + --bf-only
+    #   ⇒ 字节回放+VERDICT+logits dump。
+    "$QBIN" "$IDS" 1716 --hf "$DS4_HF" \
+        --gsweep 0 --bf-only \
+        --calib-fullset \
+        --anchor "$ANCHOR" --nfit 933 --threads "${DS4_THREADS:-8}" \
+        --layer-dir "$OUTF/layers" --lcfg "$(printf 'g%.0s' $(seq 1 43))" \
+        --vq --tgt-alpha 1.0 --coadapt 1 \
+        --go2b-hot 1 --go2b-hot-table "${HOT_TABLE:-$ROOT/gguf-tools/data/corpus/prog_active_top49.txt}" \
+        --zfile "$OUTF/zfile.bin" --zchain "$OUTF/zchain.bin" \
+        --route-bias "$OUTF/route_bias_r30.bin" --route-bias-alpha "${RB_ALPHA:-2.5}" --route-bias-mincnt 8 \
+        --dump-logits "$OUTF/student_logits.bin" || { LOG "★学生回放失败★"; exit 3; }
     [ -f "$OUTF/student_logits.bin" ] || { LOG "★学生 logits 没落盘★"; exit 3; }
     # ★假✓自曝闸(2026-08-07: 两次静默秒过事故): logits 必须比本段起跑新
     [ "$(file_mtime "$OUTF/student_logits.bin")" -ge "$STU_T0" ] \
@@ -327,22 +329,22 @@ stage_metrics(){
 }
 
 # ==== md86 两段式反修(2026-08-10 归并; 用户设计: ①每层贪心最优 ②收尾链态一遍) ====
-# 消费 zlayer(C 版)全套旋钮(组件门/ftA/链模式); 锚与层目录经 env 注入:
-#   MD_ANCHOR=FP锚  MD_CHAIN=链态锚  MD_LAYERS=层目录  MD_IDS=ids  MD_S=总token  MD_FR=fit区间  MD_EV=ev区间
+# 消费 zlayer(C 版)旋钮(现为位置参数后的 --flag, 原 DS4_ZL_* env 已随大扫除拔死); 锚与层目录经 env 注入:
+#   MD_ANCHOR=FP锚  MD_CHAIN=链态锚  MD_LAYERS=层目录  MD_IDS=ids  MD_S=总token
+#   (原 MD_FR/MD_EV 行掩码死名已删: zlayer 从 <锚>.layout 推导行域, 缺布局=硬停不猜)
 stage_zside2(){   # ①统一反修43层(2026-08-13 定版): 每层 z+GE → 组合<ERF_BAR 时叠加 ERF(权重空间
     #   ΔW_w2 SVD r 方向+α残差重加权+token能量门, 记录 zl.ERF, C 回放 type8)。双路并行;
-    #   MD_L0/MD_L1 层范围(单层修复同用)。默认口径=md86v2 布局(可 env 覆盖)。
+    #   MD_L0/MD_L1 层范围(单层修复同用)。
     MD_S="${MD_S:-4683}"
-    MD_FR="${MD_FR:-0:1287,1716:3003,3383:4683}"
-    MD_EV="${MD_EV:-1287:1716}"
     MD_LAYERS="${MD_LAYERS:-$OUTF/layers}"
     MD_ANCHOR="${MD_ANCHOR:?需 MD_ANCHOR=解算FP锚(与量化校准语料不相交)}"
     cd "$ROOT"
     _glane(){ for L in "$@"; do
         rm -f "$MD_LAYERS/zcache_L$(printf %02d $L).npz"   # 层前必删: 陈旧缓存(异尺锚)复用=IndexError 崩 lane(08-14 事故)
-        env VECLIB_MAXIMUM_THREADS=4 DS4_ZL_NTOK=$MD_S DS4_ZL_FIT_RANGES=$MD_FR DS4_ZL_EV_RANGE=$MD_EV \
-            DS4_ZL_ERF_R="${ERF_R:-16}" DS4_ZL_ERF_BAR="${ERF_BAR:-0.01}" DS4_ZL_SWLIM="${ZL_SWLIM:-10}" DS4_ZL_GE_LAM="${GE_LAM:-1e-3}" \
+        env VECLIB_MAXIMUM_THREADS=4 \
             gguf-tools/amp/zlayer "$DS4_HF" "$MD_LAYERS" "$MD_ANCHOR" $L 1024 1 \
+            --ntok "$MD_S" --erf-r "${ERF_R:-16}" --erf-bar "${ERF_BAR:-0.01}" \
+            --swlim "${ZL_SWLIM:-10}" --ge-lam "${GE_LAM:-1e-3}" \
             || LOG "★贪心L${L}失败★"
         rm -f "$MD_LAYERS/zcache_L$(printf %02d $L).npz"
     done; }
@@ -357,11 +359,11 @@ stage_zside2(){   # ①统一反修43层(2026-08-13 定版): 每层 z+GE → 组
 }
 stage_sweep(){    # ②收尾链态一遍: 回放建链锚(带全部贪心记录)→双路并行逐层整替
     cd "$ROOT/gguf-tools/amp"
-    env DS4_HF=$DS4_HF DS4_GSWEEP=0 DS4_BF_TERMINAL=0 DS4_BF_ONLY=1 DS4_COADAPT=1 \
-        DS4_CALIB_FULLSET=1 DS4_EXPORT_BYTES=0 DS4_ANCHOR=$MD_ANCHOR DS4_NFIT=${MD_NFIT:-3874} \
-        DS4_THREADS=8 DS4_LAYER_DIR=$MD_LAYERS DS4_LCFG=$(printf "g%.0s" $(seq 1 43)) \
-        DS4_VQ=1 DS4_TGT_ALPHA=1.0 DS4_CHAIN_ANCHOR=$MD_CHAIN \
-        "$QBIN" "$MD_IDS" "$MD_S" >/dev/null || { LOG "★链锚回放失败★"; exit 2; }
+    "$QBIN" "$MD_IDS" "$MD_S" --hf "$DS4_HF" --gsweep 0 --bf-only --coadapt 1 \
+        --calib-fullset --export-bytes 0 --anchor "$MD_ANCHOR" --nfit "${MD_NFIT:-3874}" \
+        --threads 8 --layer-dir "$MD_LAYERS" --lcfg "$(printf "g%.0s" $(seq 1 43))" \
+        --vq --tgt-alpha 1.0 --chain-anchor "$MD_CHAIN" \
+        >/dev/null || { LOG "★链锚回放失败★"; exit 2; }
     cd "$ROOT"
     _lane(){ for L in "$@"; do
         local LL=$(printf %02d $L)
@@ -371,9 +373,9 @@ stage_sweep(){    # ②收尾链态一遍: 回放建链锚(带全部贪心记录
         # pop_layer.py 已删(见 git 历史), 弹层重解无 C 承接 — stage_sweep 响亮失败不静默。
         LOG "★pop_layer 生成器已删(见 git 历史), 收尾链态整替段不可跑★"; exit 2
         rm -f "$MD_LAYERS/zcache_L$LL.npz"
-        env VECLIB_MAXIMUM_THREADS=4 DS4_ZL_XANCHOR=$MD_CHAIN DS4_ZL_NTOK=$MD_S \
-            DS4_ZL_FIT_RANGES=$MD_FR DS4_ZL_EV_RANGE=$MD_EV \
+        env VECLIB_MAXIMUM_THREADS=4 \
             gguf-tools/amp/zlayer "$DS4_HF" "$MD_LAYERS" "$MD_ANCHOR" $L 1024 1 \
+            --xanchor "$MD_CHAIN" --ntok "$MD_S" \
             || LOG "★收尾L$L失败★"
         rm -f "$MD_LAYERS/zcache_L$LL.npz"
         if ! grep -q "^$L " "$MD_LAYERS/zinject_manifest.txt" 2>/dev/null; then
@@ -393,17 +395,17 @@ stage_sweep(){    # ②收尾链态一遍: 回放建链锚(带全部贪心记录
 
 stage_addon(){   # ②叠加式链修正遍(2026-08-10 用户设计): 链回放(带贪心记录)→双路Δ解算+合并注入
     cd "$ROOT/gguf-tools/amp"
-    env DS4_HF=$DS4_HF DS4_GSWEEP=0 DS4_BF_TERMINAL=0 DS4_BF_ONLY=1 DS4_COADAPT=1 \
-        DS4_CALIB_FULLSET=1 DS4_EXPORT_BYTES=0 DS4_ANCHOR=$MD_ANCHOR DS4_NFIT=${MD_NFIT:-3874} \
-        DS4_THREADS=8 DS4_LAYER_DIR=$MD_LAYERS DS4_LCFG=$(printf "g%.0s" $(seq 1 43)) \
-        DS4_VQ=1 DS4_TGT_ALPHA=1.0 DS4_CHAIN_ANCHOR=$MD_CHAIN \
-        "$QBIN" "$MD_IDS" "$MD_S" >/dev/null || { LOG "★链锚回放失败★"; exit 2; }
+    "$QBIN" "$MD_IDS" "$MD_S" --hf "$DS4_HF" --gsweep 0 --bf-only --coadapt 1 \
+        --calib-fullset --export-bytes 0 --anchor "$MD_ANCHOR" --nfit "${MD_NFIT:-3874}" \
+        --threads 8 --layer-dir "$MD_LAYERS" --lcfg "$(printf "g%.0s" $(seq 1 43))" \
+        --vq --tgt-alpha 1.0 --chain-anchor "$MD_CHAIN" \
+        >/dev/null || { LOG "★链锚回放失败★"; exit 2; }
     cd "$ROOT"
     _alane(){ for L in "$@"; do
         rm -f "$MD_LAYERS/zcache_L$(printf %02d $L).npz"
-        env VECLIB_MAXIMUM_THREADS=4 DS4_ZL_ADDON=1 DS4_ZL_XANCHOR=$MD_CHAIN DS4_ZL_NTOK=$MD_S \
-            DS4_ZL_FIT_RANGES=$MD_FR DS4_ZL_EV_RANGE=$MD_EV \
+        env VECLIB_MAXIMUM_THREADS=4 \
             gguf-tools/amp/zlayer "$DS4_HF" "$MD_LAYERS" "$MD_ANCHOR" $L 1024 1 \
+            --addon --xanchor "$MD_CHAIN" --ntok "$MD_S" \
             || LOG "★叠加L${L}失败★"
         rm -f "$MD_LAYERS/zcache_L$(printf %02d $L).npz"
     done; }
@@ -416,21 +418,19 @@ stage_addon(){   # ②叠加式链修正遍(2026-08-10 用户设计): 链回放(
 stage_score2(){   # 五指标双尺: A=老编程锚(历史对表) B=当前战役锚(MD_ANCHOR 在则跑)
     cd "$ROOT/gguf-tools/amp"
     local LCx=$(printf "g%.0s" $(seq 1 43))
-    env DS4_HF=$DS4_HF DS4_GSWEEP=0 DS4_BF_TERMINAL=0 DS4_BF_ONLY=1 DS4_COADAPT=1 \
-        DS4_CALIB_FULLSET=1 DS4_EXPORT_BYTES=0 DS4_ANCHOR=$R30/anchor_r30_s1716.bin DS4_NFIT=1287 \
-        DS4_THREADS=8 DS4_LAYER_DIR=$MD_LAYERS DS4_LCFG=$LCx DS4_VQ=1 DS4_TGT_ALPHA=1.0 \
-        DS4_DUMP_LOGITS=/tmp/score_prog_student.bin \
-        "$QBIN" "$IDS" 1716 2>&1 | tail -3
+    "$QBIN" "$IDS" 1716 --hf "$DS4_HF" --gsweep 0 --bf-only --coadapt 1 \
+        --calib-fullset --export-bytes 0 --anchor "$R30/anchor_r30_s1716.bin" --nfit 1287 \
+        --threads 8 --layer-dir "$MD_LAYERS" --lcfg "$LCx" --vq --tgt-alpha 1.0 \
+        --dump-logits /tmp/score_prog_student.bin 2>&1 | tail -3
     cd "$ROOT"
     "$(dirname "$0")/../bench/anchor_metrics" --ref $R30/anchor_r30_s1716.bin \
         --ids "$IDS" --student /tmp/score_prog_student.bin --fit 1287
     if [ -n "${MD_ANCHOR:-}" ] && [ -n "${MD_IDS:-}" ]; then
         cd "$ROOT/gguf-tools/amp"
-        env DS4_HF=$DS4_HF DS4_GSWEEP=0 DS4_BF_TERMINAL=0 DS4_BF_ONLY=1 DS4_COADAPT=1 \
-            DS4_CALIB_FULLSET=1 DS4_EXPORT_BYTES=0 DS4_ANCHOR=$MD_ANCHOR DS4_NFIT=${MD_NFIT:-3874} \
-            DS4_THREADS=8 DS4_LAYER_DIR=$MD_LAYERS DS4_LCFG=$LCx DS4_VQ=1 DS4_TGT_ALPHA=1.0 \
-            DS4_DUMP_LOGITS=/tmp/score_md_student.bin \
-            "$QBIN" "$MD_IDS" "$MD_S" 2>&1 | tail -3
+        "$QBIN" "$MD_IDS" "$MD_S" --hf "$DS4_HF" --gsweep 0 --bf-only --coadapt 1 \
+            --calib-fullset --export-bytes 0 --anchor "$MD_ANCHOR" --nfit "${MD_NFIT:-3874}" \
+            --threads 8 --layer-dir "$MD_LAYERS" --lcfg "$LCx" --vq --tgt-alpha 1.0 \
+            --dump-logits /tmp/score_md_student.bin 2>&1 | tail -3
         cd "$ROOT"
         "$(dirname "$0")/../bench/anchor_metrics" --ref $MD_ANCHOR \
             --ids "$MD_IDS" --student /tmp/score_md_student.bin --fit ${MD_NFIT:-3874}
@@ -438,6 +438,10 @@ stage_score2(){   # 五指标双尺: A=老编程锚(历史对表) B=当前战役
 }
 
 stage_dynvol(){   # 动态体积单层探针(2026-08-11 用户令): PL=层 PT=档nc — 该层@PT 隔离量化 + z重解只报数
+    # ★停用(2026-08-31 env 大扫除)★: 单层隔离量化的钩子 DS4_MV_PROBE_L 已从 C 拔死(零读者)且
+    # 无 flag 承接 — 只按 rplan 改档会把 0..PL 全量化, 不再是"该层@PT 隔离"。照 stage_sweep
+    # pop_layer 前例响亮失败, 不静默跑错语义。
+    LOG "★dynvol 停用: DS4_MV_PROBE_L 单层隔离机制已随 env 大扫除删除, 无 flag 承接★"; exit 2
     local PL=${PL:?需 PL=层号} PT=${PT:?需 PT=档位nc}
     local DV="$R30/dynvol"; mkdir -p "$DV"
     local LL=$(printf %02d $PL)
@@ -448,17 +452,18 @@ stage_dynvol(){   # 动态体积单层探针(2026-08-11 用户令): PL=层 PT=�
     sed "s/^L=$PL dim=4 nc=[0-9]*/L=$PL dim=4 nc=$PT/" "$R30/rplan_q2_86g.txt" > "$DV/rplan_L${LL}_$PT.txt"
     LOG "dynvol L$LL@$PT 量化发车(隔离探针, v2锚)"
     cd "$ROOT/gguf-tools/amp"
-    env DS4_HF=$DS4_HF DS4_ANCHOR=$R30/anchor_md86v2_s4683.bin DS4_NFIT=3874 DS4_THREADS=8 \
-        DS4_CALIB_FULLSET=1 DS4_MINVOL=1 DS4_MV_BASELINE=1 DS4_TUNE=1 DS4_PURE_VQ=1 DS4_VQ=1 \
-        DS4_TGT_ALPHA=1.0 DS4_VQ_RPLAN="$DV/rplan_L${LL}_$PT.txt" DS4_VOL_BUDGET_GIB=92 \
-        DS4_MV_PROBE_L=$PL DS4_ANCHOR_ROUTE=1 DS4_BF_GAIN_GATE=0.05 DS4_PLAN=$R30/nl86/plan.txt \
-        DS4_CKPT_DIR=$R30/nl86/ckpt DS4_LAYER_DIR=$R30/nl86/layers DS4_ZFILE=$R30/nl86/zfile.bin \
-        DS4_ZCHAIN=$R30/nl86/zchain.bin \
-        "$QBIN" "$G7/rr_md86v2.ids" 4683 2>&1 | grep -E "贪心选|体积账|held|VERDICT" | tail -8
+    "$QBIN" "$G7/rr_md86v2.ids" 4683 --hf "$DS4_HF" --anchor "$R30/anchor_md86v2_s4683.bin" \
+        --nfit 3874 --threads 8 \
+        --calib-fullset --minvol --mv-baseline --tune --pure-vq --vq \
+        --tgt-alpha 1.0 --vq-rplan "$DV/rplan_L${LL}_$PT.txt" \
+        --bf-gain-gate 0.05 --plan "$R30/nl86/plan.txt" \
+        --ckpt-dir "$R30/nl86/ckpt" --layer-dir "$R30/nl86/layers" --zfile "$R30/nl86/zfile.bin" \
+        --zchain "$R30/nl86/zchain.bin" 2>&1 | grep -E "贪心选|体积账|held|VERDICT" | tail -8
     cd "$ROOT"
     rm -f "$R30/nl86/layers/zcache_L$LL.npz"
-    env VECLIB_MAXIMUM_THREADS=4 DS4_ZL_NTOK=4683 DS4_ZL_FIT_RANGES=0:1287,1716:3003,3383:4683 DS4_ZL_EV_RANGE=1287:1716 \
-        gguf-tools/amp/zlayer "$DS4_HF" "$R30/nl86/layers" "$R30/anchor_md86v2_s4683.bin" $PL 1024 1 2>&1 | tail -6
+    env VECLIB_MAXIMUM_THREADS=4 \
+        gguf-tools/amp/zlayer "$DS4_HF" "$R30/nl86/layers" "$R30/anchor_md86v2_s4683.bin" $PL 1024 1 \
+        --ntok 4683 2>&1 | tail -6
     rm -f "$R30/nl86/layers/zcache_L$LL.npz"
     LOG "dynvol L$LL@$PT 完"
 }
@@ -490,15 +495,29 @@ stage_quant86(){   # 86G 底座量化(冠军 08-13 配方原样 env 化; en86 �
     FREE=$(disk_free_gb "$R30")
     [ "$FREE" -ge 75 ] || { LOG "★盘闸 free ${FREE}G <75G 停★"; exit 6; }
     cd "$ROOT/gguf-tools/amp"
-    env DS4_HF=$DS4_HF DS4_ANCHOR="$Q_ANCHOR" DS4_NFIT=$Q_NFIT DS4_THREADS="${DS4_THREADS:-8}" DS4_CALIB_FULLSET=1 \
-        DS4_MINVOL=1 DS4_MV_BASELINE=1 DS4_TUNE=1 DS4_PURE_VQ=1 DS4_VQ=1 DS4_TGT_ALPHA=1.0 \
-        DS4_VQ_RPLAN="${RPLAN86:-$R30/rplan_q2_86g.txt}" DS4_VOL_BUDGET_GIB="${VOLB86:-92}" \
-        DS4_ANCHOR_ROUTE=1 DS4_BF_GAIN_GATE=0.05 DS4_PLAN=$Q_OUT/plan.txt DS4_CKPT_DIR=$Q_OUT/ckpt \
-        DS4_LAYER_DIR=$Q_OUT/layers DS4_ZFILE=$Q_OUT/zfile.bin DS4_ZCHAIN=$Q_OUT/zchain.bin \
-        "$QBIN" "$Q_IDS" "$Q_S"
+    # 2026-08-31 env 大扫除: 二进制只认 flag; 上游递来的脚本间 env(DS4_MINVOL_MAXL/DS4_BF_MEMGB/
+    # DS4_CALIB_*CAP)在这里显式转接。锚路由(原 DS4_ANCHOR_ROUTE)已写死进二进制。
+    Q86F=(--hf "$DS4_HF" --anchor "$Q_ANCHOR" --nfit "$Q_NFIT" --threads "${DS4_THREADS:-8}" --calib-fullset)
+    Q86F+=(--minvol --mv-baseline --tune --pure-vq --vq --tgt-alpha 1.0)
+    Q86F+=(--vq-rplan "${RPLAN86:-$R30/rplan_q2_86g.txt}")
+    Q86F+=(--bf-gain-gate 0.05 --plan "$Q_OUT/plan.txt" --ckpt-dir "$Q_OUT/ckpt")
+    Q86F+=(--layer-dir "$Q_OUT/layers" --zfile "$Q_OUT/zfile.bin" --zchain "$Q_OUT/zchain.bin")
+    [ -n "${DS4_MINVOL_MAXL:-}" ] && Q86F+=(--minvol-maxl "$DS4_MINVOL_MAXL")
+    [ -n "${DS4_BF_MEMGB:-}" ] && Q86F+=(--bf-memgb "$DS4_BF_MEMGB")
+    [ -n "${DS4_CALIB_CAP:-}" ] && Q86F+=(--calib-cap "$DS4_CALIB_CAP")
+    [ -n "${DS4_CALIB_EXPORT_CAP:-}" ] && Q86F+=(--calib-export-cap "$DS4_CALIB_EXPORT_CAP")
+    "$QBIN" "$Q_IDS" "$Q_S" "${Q86F[@]}"
     LOG "quant86 rc=$?"
+    # ★体积闸挪脚本侧(2026-08-31)★: 原 DS4_VOL_BUDGET_GIB="${VOLB86:-92}" env 已拔死,
+    # 预算判停改按 manifest 实账在这里执行, 语义不变。
+    if [ -f "$Q_OUT/layers/manifest.txt" ]; then
+        TOTG=$(awk '{s+=$2} END{printf "%.3f", s/1073741824}' "$Q_OUT/layers/manifest.txt")
+        awk -v t="$TOTG" -v b="${VOLB86:-92}" 'BEGIN{exit !(t>b)}' \
+            && { LOG "★体积闸: blob ${TOTG} GiB > 预算 ${VOLB86:-92} GiB — 停★"; exit 6; }
+    fi
     N=$(ls "$Q_OUT"/layers/dql_L*.bin 2>/dev/null | wc -l | tr -d ' ')
-    # 探针模式(DS4_MINVOL_MAXL=N)按 N 层收工是设计内提前退出, 完整性闸随之改口径, 否则探针必 exit 3。
+    # 探针模式(DS4_MINVOL_MAXL=N, 上面已转 --minvol-maxl)按 N 层收工是设计内提前退出,
+    # 完整性闸随之改口径, 否则探针必 exit 3。
     local WANT="${DS4_MINVOL_MAXL:-43}"
     [ "$N" -ge "$WANT" ] || { LOG "★quant86 层不齐 $N/$WANT★"; exit 3; }
 }
@@ -511,12 +530,12 @@ stage_en86_anchors(){   # en86 双锚捕获(缺/废哪捕哪): 底座校准锚 +
     cd "$ROOT/gguf-tools/amp"
     if ! _anchor_ok "$Q86_ANCHOR" "$Q86_IDS"; then
         rm -f "$Q86_ANCHOR"; LOG "捕底座校准锚 S=$Q86_S"
-        DS4_FP_ONLY=1 DS4_ANCHOR="$Q86_ANCHOR" DS4_THREADS="${DS4_THREADS:-8}" "$QBIN" "$Q86_IDS" "$Q86_S"
+        "$QBIN" "$Q86_IDS" "$Q86_S" --hf "$DS4_HF" --fp-only --anchor "$Q86_ANCHOR" --threads "${DS4_THREADS:-8}"
         _anchor_ok "$Q86_ANCHOR" "$Q86_IDS" || { LOG "★校准锚缺/截断★"; exit 3; }
     fi
     if ! _anchor_ok "$EN_MD_ANCHOR" "$EN_MD_IDS"; then
         rm -f "$EN_MD_ANCHOR"; LOG "捕反修解算锚 S=$EN_MD_S"
-        DS4_FP_ONLY=1 DS4_ANCHOR="$EN_MD_ANCHOR" DS4_THREADS="${DS4_THREADS:-8}" "$QBIN" "$EN_MD_IDS" "$EN_MD_S"
+        "$QBIN" "$EN_MD_IDS" "$EN_MD_S" --hf "$DS4_HF" --fp-only --anchor "$EN_MD_ANCHOR" --threads "${DS4_THREADS:-8}"
         _anchor_ok "$EN_MD_ANCHOR" "$EN_MD_IDS" || { LOG "★解算锚缺/截断★"; exit 3; }
     fi
     LOG "双锚 ✓ $(ls -l "$Q86_ANCHOR" "$EN_MD_ANCHOR" | awk '{printf "%.1fG ",$5/1073741824}')"
@@ -529,10 +548,11 @@ stage_en86_judge(){   # 双盲判(零泄漏协议=08-13 盲判同款: NFIT=1 无
         IFS=: read -r TAG AN ID ST <<<"$J"
         [ -f "$AN" ] || { LOG "★判决锚缺 $AN★"; continue; }
         cd "$ROOT/gguf-tools/amp"
-        env DS4_HF=$DS4_HF DS4_GSWEEP=0 DS4_BF_TERMINAL=0 DS4_BF_ONLY=1 DS4_COADAPT=1 \
-            DS4_CALIB_FULLSET=1 DS4_EXPORT_BYTES=0 DS4_ANCHOR="$AN" DS4_NFIT=1 DS4_THREADS=8 \
-            DS4_LAYER_DIR=$R30/en86/layers DS4_LCFG=$LCx DS4_VQ=1 DS4_TGT_ALPHA=1.0 \
-            DS4_DUMP_LOGITS="$ST" "$QBIN" "$ID" 8000 2>&1 | tail -3
+        # --nfit 1 = 纯回放(判尺既有约定, 不 sweep) — caliper_ref.sh 同口径, --gsweep 不再传
+        "$QBIN" "$ID" 8000 --hf "$DS4_HF" --bf-only --coadapt 1 \
+            --calib-fullset --export-bytes 0 --anchor "$AN" --nfit 1 --threads 8 \
+            --layer-dir "$R30/en86/layers" --lcfg "$LCx" --vq --tgt-alpha 1.0 \
+            --dump-logits "$ST" 2>&1 | tail -3
         cd "$ROOT"
         echo "== 盲判[$TAG] =="
         "$(dirname "$0")/../bench/anchor_metrics" --ref "$AN" --ids "$ID" --student "$ST" --tail 5
@@ -542,10 +562,10 @@ stage_en86_judge(){   # 双盲判(零泄漏协议=08-13 盲判同款: NFIT=1 无
 stage_progz_judge(){   # 真域held盲判(2026-08-16 用户设计): prog语料回放, --fit 1287 → held 1287:1716 解算全程未见
     local LCx=$(printf "g%.0s" $(seq 1 43))
     cd "$ROOT/gguf-tools/amp"
-    env DS4_HF=$DS4_HF DS4_GSWEEP=0 DS4_BF_TERMINAL=0 DS4_BF_ONLY=1 DS4_COADAPT=1 \
-        DS4_CALIB_FULLSET=1 DS4_EXPORT_BYTES=0 DS4_ANCHOR="$R30/anchor_prog_s1716.bin" DS4_NFIT=1 DS4_THREADS=8 \
-        DS4_LAYER_DIR=$R30/en86/layers DS4_LCFG=$LCx DS4_VQ=1 DS4_TGT_ALPHA=1.0 \
-        DS4_DUMP_LOGITS="${PROG_ST:-/tmp/progz_student.bin}" "$QBIN" "$G7/rr_calib_prog_v5mini.ids" 8000 2>&1 | tail -3
+    "$QBIN" "$G7/rr_calib_prog_v5mini.ids" 8000 --hf "$DS4_HF" --bf-only --coadapt 1 \
+        --calib-fullset --export-bytes 0 --anchor "$R30/anchor_prog_s1716.bin" --nfit 1 --threads 8 \
+        --layer-dir "$R30/en86/layers" --lcfg "$LCx" --vq --tgt-alpha 1.0 \
+        --dump-logits "${PROG_ST:-/tmp/progz_student.bin}" 2>&1 | tail -3
     cd "$ROOT"
     echo "== 真域盲判[prog held=1287:1716] =="
     "$(dirname "$0")/../bench/anchor_metrics" --ref "$R30/anchor_prog_s1716.bin" --ids "$G7/rr_calib_prog_v5mini.ids" \
@@ -566,9 +586,9 @@ case "${1:-all}" in
            stage_quant86
            export OUTF_DIR="$Q86_OUT" MD_LAYERS="$Q86_OUT/layers"
            stage_zstrip
-           # ★组件门评审区=prog+EN 混合(2026-08-14 用户令"全能力不跑偏"): EN 尾 250tok 出解算池入 EV★
-           MD_ANCHOR="$EN_MD_ANCHOR" MD_IDS="$EN_MD_IDS" MD_S="$EN_MD_S" MD_NFIT=3874 \
-               MD_FR="0:1287,1716:3003,3383:5720" MD_EV="1287:1716,5720:5970" stage_zside2
+           # ★组件门评审区=prog+EN 混合(2026-08-14 用户令"全能力不跑偏")★
+           # 原 MD_FR/MD_EV 行掩码死名已删(env 大扫除): zlayer 从 <锚>.layout 推导行域
+           MD_ANCHOR="$EN_MD_ANCHOR" MD_IDS="$EN_MD_IDS" MD_S="$EN_MD_S" MD_NFIT=3874 stage_zside2
            stage_en86_judge ;;
     en86judge) stage_en86_judge ;;
     progzjudge) stage_progz_judge ;;
@@ -591,7 +611,7 @@ case "${1:-all}" in
               fi
               export OUTF_DIR="$R30/en86" MD_LAYERS="$R30/en86/layers" ZL_SWLIM=60
               stage_zstrip
-              MD_ANCHOR="$R30/anchor_prog_s1716.bin" MD_S=1716 MD_FR="0:1150" MD_EV="1150:1287" stage_zside2
+              MD_ANCHOR="$R30/anchor_prog_s1716.bin" MD_S=1716 stage_zside2   # MD_FR/MD_EV 死名已删(行域走 <锚>.layout)
               LOG "== 终判: 裸底+progz 态 三尺 =="
               PROG_ST=/tmp/progz_student_post.bin stage_progz_judge
               stage_en86_judge

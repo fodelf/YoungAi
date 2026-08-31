@@ -10,15 +10,22 @@
 #   ./quant_verify.sh selftest [ids] [ntok]      # 全F自检: VERDICT 必须 ratio=1.0000/Σmin≈1
 #   ./quant_verify.sh cfg <LCFG> [ids] [ntok]    # 单配置判决 (LCFG=43字符 或 1字符广播;
 #                                                #   档位 F=不量化 n=朴素1b 1=joint1b z=1b+低秩 2=1b+Q2 3=1b+Q3)
-#   ./quant_verify.sh inject [qchar] [ids] [ntok]# 43×单层注入: 只该层量化(其余F) → 对最终输出的真实伤害排序
-#   ./quant_verify.sh spare  [qchar] [ids] [ntok]# 43×单层豁免: 全量化只该层F → 该层升位的边际收益排序
-# env: DS4_HF DS4_THREADS DS4_NL DS4_ANCHOR DS4_ABLATE DS4_LOCAL_Q DS4_NFIT
+#   ./quant_verify.sh inject [qchar] [ids] [ntok]# ★停用: 单层注入钩(原 DS4_INJECT)已随 env 大扫除删除
+#   ./quant_verify.sh spare  [qchar] [ids] [ntok]# ★停用: 单层豁免钩(原 DS4_SPARE)已随 env 大扫除删除
+# 脚本间 env 接口(转成 flag 递给二进制): DS4_HF DS4_THREADS DS4_NL DS4_ANCHOR DS4_NFIT
+# (DS4_ABLATE/DS4_LOCAL_Q 死名已删)
 # 默认判决文本 = /tmp/rr_hard.ids (还原率铁律: 硬多样高PPL文本), ntok 默认 64。
 set -euo pipefail
 cd "$(dirname "$0")/../amp"
 ROOT="$(cd ../.. && pwd)"
 BIN=./ds4quant_run
 NLDEF=${DS4_NL:-43}
+HF="${DS4_HF:-$ROOT/hf/DeepSeek-V4-Flash-Base}"   # 原二进制 DS4_HF 写死回落=Flash-Base, 现显式 --hf 同值
+# 调用方 env 旋钮 → flag 条件转接(不设=二进制默认, 与原 env 语义一致)
+FW=(--hf "$HF" --nl "$NLDEF")
+[ -n "${DS4_THREADS:-}" ] && FW+=(--threads "$DS4_THREADS")
+[ -n "${DS4_ANCHOR:-}" ] && FW+=(--anchor "$DS4_ANCHOR")
+[ -n "${DS4_NFIT:-}" ] && FW+=(--nfit "$DS4_NFIT")
 
 build(){ cc -O3 -Wall -Wextra -Wno-unused-parameter -lm -framework Accelerate \
             -I"$ROOT" -o "$BIN" ds4quant_run.c -lpthread; echo "[build] $BIN ✓" >&2; }
@@ -28,35 +35,16 @@ sort_by_kl(){ awk '{k=""; for(i=1;i<=NF;i++) if($i~/^kl=/){split($i,a,"=");k=a[2
 MODE="${1:-}"
 case "$MODE" in
 build) build ;;
-anchor) build; DS4_FP_ONLY=1 "$BIN" "${2:-/tmp/rr_hard.ids}" "${3:-64}" ;;
-selftest) build; DS4_LCFG=F "$BIN" "${2:-/tmp/rr_hard.ids}" "${3:-64}" ;;
+anchor) build; "$BIN" "${2:-/tmp/rr_hard.ids}" "${3:-64}" "${FW[@]}" --fp-only ;;
+selftest) build; "$BIN" "${2:-/tmp/rr_hard.ids}" "${3:-64}" "${FW[@]}" --lcfg F ;;
 cfg)
     [ -n "${2:-}" ] || { echo "用法: $0 cfg <LCFG> [ids] [ntok]" >&2; exit 1; }
-    build; DS4_LCFG="$2" "$BIN" "${3:-/tmp/rr_hard.ids}" "${4:-64}" ;;
+    build; "$BIN" "${3:-/tmp/rr_hard.ids}" "${4:-64}" "${FW[@]}" --lcfg "$2" ;;
 inject|spare)
-    Q="${2:-1}"; IDS="${3:-/tmp/rr_hard.ids}"; NTOK="${4:-64}"
-    build
-    OUT=/tmp/quant_verify_${MODE}_q${Q}_$(basename "$IDS" .ids)_S${NTOK}.csv
-    : > "$OUT"
-    DS4_FP_ONLY=1 "$BIN" "$IDS" "$NTOK"    # 锚定就位(缓存命中则秒过)
-    for L in $(seq 0 $((NLDEF-1))); do
-        echo "[$MODE L=$L $((L+1))/$NLDEF $(date +%H:%M:%S)]" >&2
-        if [ "$MODE" = inject ]; then
-            DS4_INJECT=$L DS4_QCHAR="$Q" "$BIN" "$IDS" "$NTOK" 2>/dev/null \
-                | grep '^VERDICT' | sed "s/^VERDICT/L=$L/" | tee -a "$OUT"
-        else
-            DS4_SPARE=$L DS4_QCHAR="$Q" "$BIN" "$IDS" "$NTOK" 2>/dev/null \
-                | grep '^VERDICT' | sed "s/^VERDICT/L=$L/" | tee -a "$OUT"
-        fi
-    done
-    echo
-    if [ "$MODE" = inject ]; then
-        echo "=== 单层注入按 KL 降序 (最终输出伤害最大→最小; 取代旧局部 relL2 排序表) ==="
-    else
-        echo "=== 单层豁免按 KL 降序 (KL 仍大=该层升位收益小; KL 掉最多=该层最该升位) ==="
-    fi
-    sort_by_kl "$OUT"
-    echo "[saved] $OUT"
+    # ★停用(2026-08-31 env 大扫除)★: 单层注入/豁免钩(原 DS4_INJECT/DS4_SPARE/DS4_QCHAR)
+    # 已从 C 拔死(零读者), 无 flag 承接 — 响亮失败, 不静默跑成整模判决冒充单层排序。
+    echo "[$MODE] ★停用: DS4_INJECT/DS4_SPARE 机制已随 env 大扫除删除, 无 flag 承接★" >&2
+    exit 2
     ;;
 *)  sed -n '2,20p' "$0"; exit 1 ;;
 esac

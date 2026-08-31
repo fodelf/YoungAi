@@ -56,7 +56,7 @@ MEM_FLOOR_GB=4   # 系统 MemAvailable 地板 —— ★4 是实测值, 不是�
 #   · 这里 = 系统 MemAvailable 最后一道网, 只为抢在内核 OOM killer 前面留个可控停车点。
 #     它必须【低于】负载的正常低点, 否则每次都误杀。调高 = 把正常工况判成失控。
 DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-0731"
-export DS4_HF   # 上游既有 env, 非本轮新增
+export DS4_HF   # 脚本间接口(r30_campaign 等子脚本读); 二进制一律走 --hf 显式传(2026-08-31 env 大扫除)
 
 D="$ROOT/gguf/go-onebit/$NAME"
 IDS="$D/$NAME.ids"
@@ -138,7 +138,7 @@ stage_anchor(){    # FP 教师: 每层 MoE 输入/FP 路由/每层出口 H/最�
     # 放宽阈值让大块留在堆里复用: S=256 实测 164s → 119s。
     # 分配器(mallopt: top_pad/mmap/trim)与 BLAS 线程数已写进 ds4quant_run 的 main,
     # 不再靠 MALLOC_*/OPENBLAS_NUM_THREADS 环境变量 —— 配置跟着二进制走, 漏设不会静默变慢。
-    ( cd "$QD" && DS4_FP_ONLY=1 DS4_ANCHOR="$ANCHOR" DS4_THREADS=20 ./ds4quant_run "$IDS" "$S" )
+    ( cd "$QD" && ./ds4quant_run "$IDS" "$S" --hf "$DS4_HF" --fp-only --anchor "$ANCHOR" --threads 20 )
     watchdog_stop
     [ -s "$ANCHOR" ] || DIE "锚没落盘"
     LOG "②收官 $(ls -l "$ANCHOR" | awk '{printf "%.1f GB", $5/1e9}')"
@@ -160,11 +160,10 @@ stage_capture(){   # 学生: 引擎跑普通全 q2 基座的真值(一切都是�
 
 solve_one(){   # $1=层 $2=(保留位) $3=输出
     local L=$1 ZCF="$AMP/zcache_L$(printf %02d $1).npz"
-    # 第 7 位置参数 = 引擎捕获目录(x 与被乘量取真值), 命令行里可见, 不用 env。
-    # 其余 DS4_ZL_* 是 zlayer(C 版)既有开关, 非本轮新增。
-    [ -f "$ZCF" ] || env DS4_ZL_GGUF="$MDL" DS4_ZL_NTOK="$S" \
-        DS4_ZL_GE=0 DS4_ZL_FTA=0 DS4_ZL_ERF=0 DS4_ZL_SWLIM=60 DS4_ZL_GATE=99 \
-        "$ZLB" "$DS4_HF" "$AMP" "$ANCHOR" "$L" 1024 0 "$CAP" "${PREV:--}" 2>&1 \
+    # 第 7 位置参数 = 引擎捕获目录(x 与被乘量取真值)。原 DS4_ZL_* 开关已随 env 大扫除
+    # 改为位置参数后的 --flag(值语义未动)。
+    [ -f "$ZCF" ] || "$ZLB" "$DS4_HF" "$AMP" "$ANCHOR" "$L" 1024 0 "$CAP" "${PREV:--}" \
+        --gguf "$MDL" --ntok "$S" --ge 0 --fta 0 --erf 0 --swlim 60 --gate 99 2>&1 \
         | grep -aE "XCAP|Error|assert|★" \
         || DIE "L$L zcache 失败(完整输出见上)"
     "$(dirname "$0")/../legacy/amp_solve_zc" "$ANCHOR" "$ZCF" "$3" || DIE "L$L 解算失败"   # 动态 z 已写死
@@ -568,7 +567,7 @@ stage_dynladder(){
     [ -s "$D2/anchor_vqhalf_q_s8192.bin" ] || DIE "量化半锚缺"
     mkdir -p "$P"
     # base86p_spark.sh 同款运行时设置: 缺了会从 24s/层 劣化到 9min/层(mmap 写锁争用实锤)
-    export DS4_BF_MEMGB=80 DS4_VQ_TIMING=1 DS4_CALIB_CAP=512 DS4_CALIB_EXPORT_CAP=512
+    export DS4_BF_MEMGB=80 DS4_CALIB_CAP=512 DS4_CALIB_EXPORT_CAP=512
     export MALLOC_MMAP_THRESHOLD_=1073741824 MALLOC_TRIM_THRESHOLD_=1073741824
     export OPENBLAS_NUM_THREADS=1 DS4_THREADS=20 DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-0731"
     local NC L
@@ -577,7 +576,7 @@ stage_dynladder(){
         : > "$RP"; for L in $(seq 0 42); do echo "L=$L dim=4 nc=$NC hot=0 w2dim=4 w2nc=$NC" >> "$RP"; done
         if grep -q "VQ_GATE" "$P/nc$NC.log" 2>/dev/null; then LOG "  档 vq4x$NC 已标定, 跳过"; continue; fi
         LOG "  档 vq4x$NC 标定发车(L0-5)"
-        # QBIN_OVERRIDE: r30_campaign 默认找 ds4quant_run.r30(重构后不存在), 指到现役量化器。
+        # QBIN_OVERRIDE: 显式钉现役量化器(2026-08-31 起 r30_campaign 默认已是它, 留着只为发车命令自明)。
         # ★别用管道包 grep★: 管道退出码是 grep 的, 量化器崩了也报"完成"(08-27 首跑即中招)。
         if ! env DS4_MINVOL_MAXL=6 QBIN_OVERRIDE="$ROOT/gguf-tools/amp/ds4quant_run" Q86_IDS="$D2/vqhalf_q.ids" Q86_S=8192 Q86_NFIT=8192 Q86_ANCHOR="$D2/anchor_vqhalf_q_s8192.bin" Q86_OUT="$P/nc$NC" RPLAN86="$RP" bash "$SC/r30_campaign.sh" quant86 > "$P/nc$NC.log" 2>&1; then
             tail -6 "$P/nc$NC.log"; DIE "档 vq4x$NC 标定失败, 见 $P/nc$NC.log"
@@ -610,7 +609,7 @@ stage_dynquant(){
     [ "$V" = dyn86 ] && { [ -s "$P/rplan_dyn86.txt" ] && RP="$P/rplan_dyn86.txt"; MODEL="$P/model"; }
     [ -s "$RP" ] || DIE "计划表缺 $RP"
     [ -s "$D2/anchor_vqhalf_q_s8192.bin" ] || DIE "量化半锚缺"
-    export DS4_BF_MEMGB=80 DS4_VQ_TIMING=1 DS4_CALIB_CAP=512 DS4_CALIB_EXPORT_CAP=512
+    export DS4_BF_MEMGB=80 DS4_CALIB_CAP=512 DS4_CALIB_EXPORT_CAP=512
     export MALLOC_MMAP_THRESHOLD_=1073741824 MALLOC_TRIM_THRESHOLD_=1073741824
     export OPENBLAS_NUM_THREADS=1 DS4_THREADS=20 DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-0731"
     LOG "②量化发车 变体=$V 计划表=$RP → $MODEL"
@@ -636,10 +635,8 @@ stage_dynjudge(){
     local N; N=$(ls "$P/model/layers"/dql_vq_L*.bin 2>/dev/null | wc -l)
     [ "$N" = 43 ] || DIE "dyn86 层不齐($N/43)"
     # caliper 直接吃层件目录, 判决不需要先合 GGUF(合并留给引擎部署/真代码基准那一步)。
-    # ★口径风险在案★ 判决尺是冻结的 ds4quant_run.old(08-22), 早于本次热档可配改动, 不认
-    # hotdim/hotnc。理论上无碍: VQ blob 自描述(每载荷头带 dim/nc, 偏移走 blob 内 256×3 表),
-    # 老二进制照样解得开。但这是理论 —— 读数落在 0.40-0.50 合理带才可信, 若崩成天文数字
-    # 就是老尺读不了新格式, 那时必须先解决尺子问题再谈质量, 不许拿坏尺的数当结论。
+    # (历史口径风险已解除: 判决尺曾是冻结 ds4quant_run.old, 2026-08-31 判官归一后
+    # caliper_ref.sh 走现行 ds4quant_run, .old 已删。读数仍应落 0.40-0.50 合理带才可信。)
     LOG "③dyn86 裸判(参考前向尺); 对表平权 vq86h_noz: KLD 0.47055 / Σmin 0.7799 / top1 78.36%"
     watchdog_start
     bash "$SC/caliper_ref.sh" "$P/model/layers" /tmp/qc_dyn86_wt2.bin 2>&1 | tail -14
@@ -648,13 +645,13 @@ stage_dynjudge(){
 
 # ═══ 冠军配方反修(2026-08-27 用户令"按 67g 冠军版设计重新反修和路由反修")═══
 # 【这不是新写的东西】直接调 r30_campaign.sh backfit —— 那就是超冠当时跑的那一段, 原封不动。
-# 它一段里同时做完【反修 + 路由反修】, 不是两件事:
-#   DS4_BF_ONLY=1     跳过 ALT 逐层(层内判据, 保险门实锤端到端负贡献)
-#   DS4_BF_ONEPASS=1  冻结基线一遍选型 + 统一终验 + 劣化全回滚(用户 08-04 裁决"一遍就够")
-#   DS4_GSWEEP=0      回扫不跑(侧车架构下需要时删侧车补跑即可)
-#   DS4_EXPORT_BYTES=0 平行架构: dql 只读不可变, 只重建 op 侧车(用户"反修不许动量化模型")
-#   DS4_ROUTE_BIAS_FIT=1 + ALPHA=2.5  ★路由偏置寄生在反修自身前向, 零额外前向★
-#   DS4_ANCHOR_ROUTE=1 锚路由反修(超冠原样)
+# 它一段里同时做完【反修 + 路由反修】, 不是两件事(2026-08-31 env 大扫除后为 flag/写死):
+#   --bf-only         跳过 ALT 逐层(层内判据, 保险门实锤端到端负贡献)
+#   ONEPASS(写死)     冻结基线一遍选型 + 统一终验 + 劣化全回滚(用户 08-04 裁决"一遍就够")
+#   --gsweep 0        回扫不跑(侧车架构下需要时删侧车补跑即可)
+#   --export-bytes 0  平行架构: dql 只读不可变, 只重建 op 侧车(用户"反修不许动量化模型")
+#   --route-bias-fit + α2.5  ★路由偏置寄生在反修自身前向, 零额外前向★
+#   锚路由(写死)      锚路由反修(超冠原样)
 # 段内自带"架构组件在场自检": z变量[E/C/F] 四损失[KGRID la/lf/ls+lc] 感知[pc行权]
 # 向后[TREF-B] 路由[GE-D投影] —— 四损失本来就在这一段, 不在后来另起的 zloss_solve 里。
 #
@@ -676,8 +673,8 @@ stage_champbf(){
     # 说明 60 左右是本负载的自然工作点, 取 55 让驱逐早介入, 给杀线留 38G 缓冲。
     export DS4_BF_MEMGB=55 MALLOC_MMAP_THRESHOLD_=1073741824 MALLOC_TRIM_THRESHOLD_=1073741824
     export OPENBLAS_NUM_THREADS=1 DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-0731"
-    # 这四个必须不在场, 否则 backfit 走错分支(段内自带硬闸会停)
-    unset DS4_TUNE DS4_MINVOL DS4_MV_BASELINE DS4_VQ_RPLAN
+    # (2026-08-31 env 大扫除: 原"这四个必须不在场"的 unset DS4_TUNE/MINVOL/MV_BASELINE/VQ_RPLAN
+    #  已无必要 — backfit 段现按 flag 拼装, 不传这些开关结构上就不会走错分支)
     # ★bug#5 修(2026-08-29)★ 原写法 `shift 2 2>/dev/null || true`: 只传 1 个参数时 shift 2
     # 失败, || true 把错吞了, "$@" 里还剩【工作区名】—— 于是 ds4quant_run <ids> 8192 champ86,
     # 那个位置本该是冠军的秩(r64c 传的是 64)。argv[3] 无人解析 ⇒ 静默丢弃, 秩落到 p14:289
@@ -730,7 +727,7 @@ stage_champ86(){
     if [ "$(ls "$W/layers"/dql_vq_L*.bin 2>/dev/null | wc -l)" != 43 ]; then
         LOG "①平权量化发车(vq4x512 ×43 不动态, 量化半语料 S=8192)"
         rm -rf "$W"; mkdir -p "$W"
-        export DS4_BF_MEMGB=55 DS4_VQ_TIMING=1 DS4_CALIB_CAP=512 DS4_CALIB_EXPORT_CAP=512
+        export DS4_BF_MEMGB=55 DS4_CALIB_CAP=512 DS4_CALIB_EXPORT_CAP=512
         export MALLOC_MMAP_THRESHOLD_=1073741824 MALLOC_TRIM_THRESHOLD_=1073741824
         export OPENBLAS_NUM_THREADS=1 DS4_THREADS=20 DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-0731"
         watchdog_start
@@ -845,9 +842,10 @@ stage_anchors3(){
         LOG "捕${NAMES[$i]}锚 S=8192 (约 30 分钟, 23GB)"
         rm -f "${ANCF[$i]}"
         watchdog_start
-        ( cd "$ROOT/gguf-tools/amp" && env DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-0731" \
-            OPENBLAS_NUM_THREADS=1 DS4_THREADS=20 DS4_BF_MEMGB=55 \
-            DS4_FP_ONLY=1 DS4_ANCHOR="${ANCF[$i]}" ./ds4quant_run.old "${IDSF[$i]}" 8192 ) \
+        # 判官归一(2026-08-31): .old 冻结件已删, 建锚同走现行 ds4quant_run + flag
+        ( cd "$ROOT/gguf-tools/amp" && env OPENBLAS_NUM_THREADS=1 \
+            ./ds4quant_run "${IDSF[$i]}" 8192 --hf "$ROOT/hf/DeepSeek-V4-Flash-0731" \
+            --threads 20 --bf-memgb 55 --fp-only --anchor "${ANCF[$i]}" ) \
             > "/tmp/anc3_$i.log" 2>&1
         watchdog_stop
         [ -s "${ANCF[$i]}" ] || { tail -5 "/tmp/anc3_$i.log"; DIE "${NAMES[$i]}锚没落盘"; }
@@ -1105,9 +1103,10 @@ PY2
     if [ ! -s "$CA" ]; then
         LOG "②给第三片跑 FP 锚(锚与 ids 错配会出 PPL 2.4e7 这种一眼假的数, 必须自己配)"
         watchdog_start
-        ( cd "$ROOT/gguf-tools/amp" && env DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-0731" \
-            OPENBLAS_NUM_THREADS=1 DS4_THREADS=20 DS4_BF_MEMGB=55 \
-            DS4_FP_ONLY=1 DS4_ANCHOR="$CA" ./ds4quant_run.old "$CI" 8192 ) > /tmp/anc_c.log 2>&1
+        # 判官归一(2026-08-31): .old 冻结件已删, 建锚同走现行 ds4quant_run + flag
+        ( cd "$ROOT/gguf-tools/amp" && env OPENBLAS_NUM_THREADS=1 \
+            ./ds4quant_run "$CI" 8192 --hf "$ROOT/hf/DeepSeek-V4-Flash-0731" \
+            --threads 20 --bf-memgb 55 --fp-only --anchor "$CA" ) > /tmp/anc_c.log 2>&1
         watchdog_stop
         [ -s "$CA" ] || { tail -5 /tmp/anc_c.log; DIE "第三片锚没落盘"; }
         LOG "②锚 ✓ $(ls -l "$CA" | awk '{printf "%.1f GiB", $5/1073741824}')"

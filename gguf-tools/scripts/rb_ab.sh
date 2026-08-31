@@ -17,7 +17,7 @@
 #  ② 哈希路由层(如 L0)选择零漂移, 这层拿不到收益, 日志会打"RB 不适用", 属正常。
 #
 # 【口径】拟合走校准语料(放大器半), 判决走 wt2 —— 在判决语料上拟合=作弊。
-# 拟合与判决同一个二进制(ds4quant_run.old, 判决尺铁律), 零口径缝。
+# 拟合与判决同一个二进制(现行 ds4quant_run — 判官归一 2026-08-31, .old 冻结件已删), 零口径缝。
 #
 # 用法: rb_ab.sh fit   <层件目录> <输出.bin>
 #       rb_ab.sh sweep <层件目录> <Δb.bin> [α...]   默认 α=1.5 2.0 2.5 3.0
@@ -37,13 +37,14 @@ stage_fit(){
     LOG "拟合: $LAY × 放大器半 8192 → $OUT"
     export MALLOC_MMAP_THRESHOLD_=1073741824 MALLOC_TRIM_THRESHOLD_=1073741824
     local LCx; LCx=$(printf 'g%.0s' $(seq 1 43))
-    ( cd "$GT/amp" && env DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-0731" OPENBLAS_NUM_THREADS=1 \
-        DS4_BF_MEMGB=8 DS4_GSWEEP=0 DS4_BF_TERMINAL=0 DS4_BF_ONLY=1 DS4_COADAPT=1 \
-        DS4_CALIB_FULLSET=1 DS4_EXPORT_BYTES=0 DS4_ANCHOR="$ANC" DS4_NFIT=1 DS4_THREADS=20 \
-        DS4_LAYER_DIR="$LAY" DS4_LCFG="$LCx" DS4_VQ=1 DS4_TGT_ALPHA=1.0 \
-        DS4_ROUTE_BIAS_FIT=1 DS4_ROUTE_BIAS_OUT="$OUT" \
-        ./ds4quant_run.old "$IDS" 8192 2>&1 | grep -aE "路由|Δb|rb_save" | tail -6 ) || DIE "拟合失败"
-    [ -s "$OUT" ] || DIE "Δb 没落盘(看是否全是哈希路由层, 或 DS4_ROUTE_BIAS_OUT 未生效)"
+    ( cd "$GT/amp" && env OPENBLAS_NUM_THREADS=1 \
+        ./ds4quant_run "$IDS" 8192 --hf "$ROOT/hf/DeepSeek-V4-Flash-0731" \
+        --bf-memgb 8 --bf-only --coadapt 1 \
+        --calib-fullset --export-bytes 0 --anchor "$ANC" --nfit 1 --threads 20 \
+        --layer-dir "$LAY" --lcfg "$LCx" --vq --tgt-alpha 1.0 \
+        --route-bias-fit --route-bias-out "$OUT" \
+        2>&1 | grep -aE "路由|Δb|rb_save" | tail -6 ) || DIE "拟合失败"
+    [ -s "$OUT" ] || DIE "Δb 没落盘(看是否全是哈希路由层, 或 --route-bias-out 未生效)"
     LOG "Δb 落盘 $(ls -l --block-size=1 "$OUT" | awk '{printf "%.1f KB", $5/1024}')"
     awk '{s+=$0}END{}' /dev/null
 }

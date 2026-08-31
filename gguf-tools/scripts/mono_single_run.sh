@@ -2,10 +2,10 @@
 # mono_single_run.sh — 本机(M4)单机跑 go2b 全 EF mono, offload, 写 Go 代码。
 # 单机在一块 GPU 上 → 无跨 GPU fp 漂移问题, 不需要 math_safe(单机已验证能写出干净 twoSum 函数体)。
 #
-# 已验证配置 (2026-07-06):
-#   DS4_METAL_EXPERT_OFFLOAD=1  59GB mono 在 16GB M4 上按需流式(不然放不下)
-#   DS4_METAL_PREFILL_CHUNK=512 prefill 分块(内存有界)
-#   DS4_REPEAT_FREQ=1           repeat penalty 防贪心退化循环
+# 已验证配置 (2026-07-06, env 大扫除 2026-08-31 迁 flag):
+#   专家流式 offload 由 AUTO 按内存预算判定(原 EXPERT_OFFLOAD=1 env 已删)
+#   --prefill-chunk 512         prefill 分块(内存有界)
+#   (原 REPEAT_FREQ=1 repeat penalty 路已随 env 大扫除从引擎删除, 恒裸解码)
 #   --ctx 4096                  KV 有界(避免默认 32768 撑内存)
 #   BOS 前缀 (<｜begin▁of▁sentence｜>)  裸续写绕 chat 模板 → 直接续写代码
 #   空默认系统提示词 + 防-panic 压力守卫 = 二进制默认 (ds4_cli.c / ds4.c)
@@ -43,9 +43,8 @@ trap 'kill $WD 2>/dev/null' EXIT INT TERM
 
 echo "=== mono 单机 $(date +%H:%M:%S) model=$(basename "$MODEL") ctx=$CTX n=$NPRED ===" >&2
 echo "---------- 生成(原始输出) ----------"
-DS4_METAL_EXPERT_OFFLOAD=1 DS4_METAL_PREFILL_CHUNK=512 DS4_REPEAT_FREQ=1 \
-  perl -e 'alarm 600; exec @ARGV' \
-  "$ROOT/ds4" -m "$MODEL" --ctx "$CTX" --temp 0 -n "$NPRED" -p "$PROMPT" --metal \
+perl -e 'alarm 600; exec @ARGV' \
+  "$ROOT/ds4" -m "$MODEL" --prefill-chunk 512 --ctx "$CTX" --temp 0 -n "$NPRED" -p "$PROMPT" --metal \
   2> "$LOG" | tee "$OUT"
 rc=$?
 kill $WD 2>/dev/null

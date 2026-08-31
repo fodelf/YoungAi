@@ -13,7 +13,7 @@ OUT="$(realpath -m "${2:?输出logits}")"; THR="${3:-20}"
 # 可选路由偏置(2026-08-27): $4=Δb 文件 $5=α。不给则完全走原路, 字节与历史判决逐位同。
 # 尺子只此一份 —— 想量"带偏置的分数"就从这里量, 不许另抄一份判决脚本。
 RB="${4:-}"; RBA="${5:-2.5}"
-RB_ENV=(); [ -n "$RB" ] && RB_ENV=(DS4_ROUTE_BIAS="$RB" DS4_ROUTE_BIAS_ALPHA="$RBA")
+RB_FLAGS=(); [ -n "$RB" ] && RB_FLAGS=(--route-bias "$RB" --route-bias-alpha "$RBA")
 R30="$ROOT/gguf/go-onebit/r30"; G7="$ROOT/gguf/go-onebit/g7"
 # ★$6=ids $7=锚: 只给【诊断针】用, 不是判决★(2026-08-28)
 # 判决口径永远是 wt2(默认值), 铁律"判决只认参考前向尺"不因这两个可选参数松动。
@@ -24,21 +24,22 @@ IDS="${6:-$G7/wt2.ids}"; ANC="${7:-$R30/anchor_wt2_s2653.bin}"
 SN=8000; [ "$IDS" != "$G7/wt2.ids" ] && { SN=$(wc -l < "$IDS"); echo "★★诊断针口径(非判决): ids=$(basename "$IDS") S=$SN 锚=$(basename "$ANC")★★" >&2; }
 N=$(ls "$LAYERS"/dql_vq_L*.bin 2>/dev/null | wc -l)
 [ "$N" = 43 ] || { echo "层件不齐 $N/43" >&2; exit 2; }
-# ★内存预算按机器给, 不写死★(2026-08-27): 原为 DS4_BF_MEMGB=8(16GiB Mac 时代), 在 121GiB
-# 机器上逼着判决尺反复驱逐 fp16 层缓存再从 HF 盘重载(~0.6s/访)。
-# ★注意: 判决尺跑的是冻结的 ds4quant_run.old, 源码改不进去 —— 必须走 env 覆盖★
-# (老二进制内置默认也才 9.5, 去掉 =8 等于没改)。
+# ★内存预算按机器给, 不写死★(2026-08-27): 16GiB Mac 时代的 8GiB 缓存预算在 121GiB
+# 机器上逼着判决尺反复驱逐 fp16 层缓存再从 HF 盘重载(~0.6s/访)。取物理内存一半。
 # ★纯速度开关, 不动数值★: 驱逐后重载回来的权重逐位相同; 已用同一层件前后两跑
-# logits md5 对拍验证(见 fable5)。
-BFMEM=$(awk '/MemTotal/{printf "%.0f", $2/1048576/2}' /proc/meminfo 2>/dev/null || echo 8)
+# logits md5 对拍验证(见 fable5)。macOS 无 /proc ⇒ 落 0 = 二进制默认(同样是物理内存一半)。
+BFMEM=$(awk '/MemTotal/{printf "%.0f", $2/1048576/2}' /proc/meminfo 2>/dev/null || echo 0)
 export MALLOC_MMAP_THRESHOLD_=1073741824 MALLOC_TRIM_THRESHOLD_=1073741824
 LCx=$(printf "g%.0s" $(seq 1 43))
 cd "$ROOT/gguf-tools/amp"
-env DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-0731" OPENBLAS_NUM_THREADS=1 DS4_BF_MEMGB="$BFMEM" \
-    DS4_BF_ONLY=1 DS4_COADAPT=1 DS4_CALIB_FULLSET=1 \
-    DS4_EXPORT_BYTES=0 DS4_ANCHOR="$ANC" DS4_NFIT=1 DS4_THREADS="$THR" \
-    DS4_LAYER_DIR="$LAYERS" DS4_LCFG="$LCx" DS4_VQ=1 DS4_TGT_ALPHA=1.0 \
-    DS4_DUMP_LOGITS="$OUT" "${RB_ENV[@]}" ./ds4quant_run "$IDS" "$SN" 2>&1 | tail -2
+# 2026-08-31 env 大扫除: 判决尺全参数走 CLI flag(发车命令一眼可见), OPENBLAS 线程是
+# 外部库自己的 env 不在禁令内。
+env OPENBLAS_NUM_THREADS=1 ./ds4quant_run "$IDS" "$SN" \
+    --hf "$ROOT/hf/DeepSeek-V4-Flash-0731" --bf-memgb "$BFMEM" \
+    --bf-only --coadapt 1 --calib-fullset \
+    --export-bytes 0 --anchor "$ANC" --nfit 1 --threads "$THR" \
+    --layer-dir "$LAYERS" --lcfg "$LCx" --vq --tgt-alpha 1.0 \
+    --dump-logits "$OUT" "${RB_FLAGS[@]}" 2>&1 | tail -2
 cd "$ROOT"
 # 五指标判决器=C 版(2026-08-25 Python→C 迁移 Wave A; 金标对拍 amp2 verdict 全五指标
 # 与 anchor_metrics.py 逐字符一致, C 版另多 Σmin 主尺; 金标记录 migrate/golden.txt)

@@ -19,34 +19,34 @@ NL=43
 stage_anchor(){
     [ -f "$ANCHOR" ] && { LOG "锚已在"; return 0; }
     cd "$ROOT/gguf-tools/amp"
-    DS4_FP_ONLY=1 DS4_ANCHOR="$ANCHOR" DS4_NFIT=933 DS4_THREADS="${DS4_THREADS:-20}" \
-        "$QBIN" "$IDS" 1716 || { LOG "★锚失败 rc=$?★"; exit 3; }
+    "$QBIN" "$IDS" 1716 --hf "$DS4_HF" --fp-only --anchor "$ANCHOR" \
+        --nfit 933 --threads "${DS4_THREADS:-20}" || { LOG "★锚失败 rc=$?★"; exit 3; }
     [ -f "$ANCHOR" ] || { LOG "★锚没落盘★"; exit 3; }
     LOG "锚 ✓ $(ls -l "$ANCHOR" | awk '{printf "%.2f GiB",$5/1073741824}')"
 }
 
-quant_env(){  # q2z_campaign.sh 原样配方(平权 VQ + 锚路由 + FULLSET)
+quant_flags(){  # q2z_campaign.sh 原样配方(平权 VQ + FULLSET); 2026-08-31 env 大扫除改 flag 拼装
     # 外层专家循环已 pthread 并行; scipy-openblas 内层再开线程=20×20 锁争用(实测 CPU
-    # 只吃 11.5/20 核) → BLAS 钉单线程
+    # 只吃 11.5/20 核) → BLAS 钉单线程。锚路由(原 DS4_ANCHOR_ROUTE)/体积闸(原
+    # DS4_VOL_BUDGET_GIB=72)已分别写死进二进制/由产物 manifest 核账。
     export OPENBLAS_NUM_THREADS=1
-    export DS4_ANCHOR="$ANCHOR" DS4_NFIT=933 DS4_THREADS="${DS4_THREADS:-20}" DS4_CALIB_FULLSET=1
-    export DS4_MINVOL=1 DS4_MV_BASELINE=1 DS4_TUNE=1 DS4_PURE_VQ=1
-    export DS4_VQ=1 DS4_TGT_ALPHA=1.0 DS4_VQ_RPLAN="$OUTF/rplan.txt" DS4_VOL_BUDGET_GIB=72
-    export DS4_GO2B_HOT=1 DS4_GO2B_HOT_TABLE="$ROOT/gguf-tools/data/corpus/prog_active_top49.txt"
-    export DS4_ANCHOR_ROUTE=1 DS4_BF_GAIN_GATE=0.05
-    export DS4_PLAN="$OUTF/plan.txt" DS4_CKPT_DIR="$OUTF/ckpt" DS4_LAYER_DIR="$LAYERS"
-    export DS4_ZFILE=/tmp/zfile_junk.bin DS4_ZCHAIN=/tmp/zchain_junk.bin
-    export DS4_BF_MEMGB="${DS4_BF_MEMGB:-60}"   # spark 121G: 放宽 fp16 缓存驱逐阈
-    unset DS4_COADAPT DS4_MV_COAD_BASE DS4_BF_ONLY DS4_GSWEEP DS4_FP_ONLY 2>/dev/null || true
+    QF=(--hf "$DS4_HF" --anchor "$ANCHOR" --nfit 933 --threads "${DS4_THREADS:-20}" --calib-fullset)
+    QF+=(--minvol --mv-baseline --tune --pure-vq)
+    QF+=(--vq --tgt-alpha 1.0 --vq-rplan "$OUTF/rplan.txt")
+    QF+=(--go2b-hot 1 --go2b-hot-table "$ROOT/gguf-tools/data/corpus/prog_active_top49.txt")
+    QF+=(--bf-gain-gate 0.05)
+    QF+=(--plan "$OUTF/plan.txt" --ckpt-dir "$OUTF/ckpt" --layer-dir "$LAYERS")
+    QF+=(--zfile /tmp/zfile_junk.bin --zchain /tmp/zchain_junk.bin)
+    QF+=(--bf-memgb "${DS4_BF_MEMGB:-60}")   # spark 121G: 放宽 fp16 缓存驱逐阈
 }
 
 stage_quant(){
     mkdir -p "$LAYERS" "$OUTF/ckpt"
-    quant_env
+    quant_flags
     # rplan: q2z 平权计划(原战役产物); 缺则从 q2_plan.json 生成或停
     [ -f "$OUTF/rplan.txt" ] || { LOG "★rplan 缺: $OUTF/rplan.txt — 看 r30/plan 或重生成★"; exit 2; }
     cd "$ROOT/gguf-tools/amp"
-    "$QBIN" "$IDS" 1716 || { LOG "★量化批量失败 rc=$?★"; exit 2; }
+    "$QBIN" "$IDS" 1716 "${QF[@]}" || { LOG "★量化批量失败 rc=$?★"; exit 2; }
     LOG "量化批量完: $(ls "$LAYERS"/dql_vq_L*.bin 2>/dev/null | wc -l | tr -d ' ')/43 层"
 }
 
@@ -81,13 +81,13 @@ stage_merge(){   # 合并 GGUF(q2z_campaign stage_merge 的 spark 适配): skele
 
 stage_metrics(){  # 五指标回放(量化+z侧车 vs FP 锚, held=位置1287..1716) — q2z_campaign 同口径
     cd "$ROOT/gguf-tools/amp"
-    env -u DS4_TUNE -u DS4_MINVOL -u DS4_VQ_RPLAN -u DS4_ZCHAIN \
-        OPENBLAS_NUM_THREADS=1 \
-        DS4_GSWEEP=0 DS4_BF_TERMINAL=0 DS4_BF_ONLY=1 DS4_COADAPT=1 DS4_CALIB_FULLSET=1 \
-        DS4_EXPORT_BYTES=0 DS4_ANCHOR="$ANCHOR" DS4_NFIT=1287 DS4_THREADS=20 \
-        DS4_LAYER_DIR="$LAYERS" DS4_LCFG=$(printf 'g%.0s' $(seq 1 $NL)) \
-        DS4_VQ=1 DS4_TGT_ALPHA=1.0 DS4_DUMP_LOGITS=/tmp/q2z_student.bin \
-        ./ds4quant_run "$IDS" 1716 2>&1 | grep -E 'ops=|VERDICT' | tail -5
+    env OPENBLAS_NUM_THREADS=1 \
+        ./ds4quant_run "$IDS" 1716 --hf "$DS4_HF" \
+        --gsweep 0 --bf-only --coadapt 1 --calib-fullset \
+        --export-bytes 0 --anchor "$ANCHOR" --nfit 1287 --threads 20 \
+        --layer-dir "$LAYERS" --lcfg "$(printf 'g%.0s' $(seq 1 $NL))" \
+        --vq --tgt-alpha 1.0 --dump-logits /tmp/q2z_student.bin \
+        2>&1 | grep -E 'ops=|VERDICT' | tail -5
     cd "$ROOT"
     "$(dirname "$0")/../bench/anchor_metrics" --ref "$ANCHOR" --ids "$IDS" \
         --student /tmp/q2z_student.bin --fit 1287 || true

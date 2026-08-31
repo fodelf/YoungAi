@@ -41,9 +41,9 @@ PY
 i=0
 for f in "$TMP"/p*.txt; do
     P="$(cat "$f")"
-    env DS4_DRAFT_GGUF="$STUDENT" DS4_DSPARK_SPEC=1 \
-        DS4_DSPARK_ANCHOR="$TMP/a$(printf %02d $i).bin" \
-        timeout 900 ./ds4 --cuda -m "$MAIN" --zchain "$MAIN_ZC" --temp 0 -n "$NGEN" \
+    # ⚠DSPARK_ANCHOR 捕获诊断已随 env 大扫除删除(2026-08-31): 本脚本的锚采集腿失效,
+    # 跑出来的 a*.bin 不会生成。需要 drafter 锚时按新机制重建采集器再启用。
+    timeout 900 ./ds4 --cuda -m "$MAIN" --zchain "$MAIN_ZC" --spec --temp 0 -n "$NGEN" \
         -p "$P" </dev/null >/dev/null 2>&1
     sz=$(stat -c%s "$TMP/a$(printf %02d $i).bin" 2>/dev/null || echo 0)
     echo "  块 $i: 锚 $((sz/1000000))MB"

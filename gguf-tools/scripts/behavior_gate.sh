@@ -16,7 +16,7 @@ BOS='<｜begin▁of▁sentence｜>'
 
 run() { # $1=tag $2=prompt $3=预钉子串(ERE, 空=不判)
     echo "[gate] $1 跑中..." >&2
-    DS4_RESIDUAL="$RESID" PROMPT="$2" MODEL="$MODEL" NPRED="$NPRED" TIMEOUT_S=480 \
+    RESID="$RESID" PROMPT="$2" MODEL="$MODEL" NPRED="$NPRED" TIMEOUT_S=480 \
       ./scripts/code1b_smoke.sh > /tmp/bg_$1.out 2>/tmp/bg_$1.err || true
     local body; body=$(sed -n '/原始输出/,/引擎速度/p' /tmp/bg_$1.out | sed '1d;$d')
     {   echo "════ $1 ════"

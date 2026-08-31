@@ -18,17 +18,17 @@ LOG(){ echo "[wt2 $(date +%H:%M:%S)] $*"; }
 if [ ! -f "$ANCHOR" ]; then
     LOG "wt2 FP 锚生成(2653 tok)"
     cd "$ROOT/gguf-tools/amp"
-    DS4_FP_ONLY=1 DS4_ANCHOR="$ANCHOR" DS4_NFIT=2653 DS4_THREADS=20 \
-        "$QBIN" "$IDS" 2653 || { LOG "★锚失败★"; exit 3; }
+    "$QBIN" "$IDS" 2653 --hf "$DS4_HF" --fp-only --anchor "$ANCHOR" \
+        --nfit 2653 --threads 20 || { LOG "★锚失败★"; exit 3; }
 fi
 LOG "学生回放(量化+z侧车)"
 cd "$ROOT/gguf-tools/amp"
-env -u DS4_TUNE -u DS4_MINVOL -u DS4_VQ_RPLAN -u DS4_ZCHAIN \
-    DS4_GSWEEP=0 DS4_BF_TERMINAL=0 DS4_BF_ONLY=1 DS4_COADAPT=1 DS4_CALIB_FULLSET=1 \
-    DS4_EXPORT_BYTES=0 DS4_ANCHOR="$ANCHOR" DS4_NFIT=2653 DS4_THREADS=20 \
-    DS4_LAYER_DIR="$LAYERS" DS4_LCFG=$(printf 'g%.0s' $(seq 1 $NL)) \
-    DS4_VQ=1 DS4_TGT_ALPHA=1.0 DS4_DUMP_LOGITS=/tmp/q2z_wt2_student.bin \
-    "$QBIN" "$IDS" 2653 2>&1 | grep -E 'ops=|VERDICT' | tail -3
+"$QBIN" "$IDS" 2653 --hf "$DS4_HF" \
+    --gsweep 0 --bf-only --coadapt 1 --calib-fullset \
+    --export-bytes 0 --anchor "$ANCHOR" --nfit 2653 --threads 20 \
+    --layer-dir "$LAYERS" --lcfg "$(printf 'g%.0s' $(seq 1 $NL))" \
+    --vq --tgt-alpha 1.0 --dump-logits /tmp/q2z_wt2_student.bin \
+    2>&1 | grep -E 'ops=|VERDICT' | tail -3
 cd "$ROOT"
 "$(dirname "$0")/../bench/anchor_metrics" --ref "$ANCHOR" --ids "$IDS" \
     --student /tmp/q2z_wt2_student.bin --fit 2653 || true

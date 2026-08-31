@@ -19,10 +19,12 @@ P1='<｜begin▁of▁sentence｜>Cache penetration means queries for keys that e
 P2='<｜begin▁of▁sentence｜>// twoSum returns the indices of the two numbers in nums that add up to target.
 func twoSum(nums []int, target int) []int {'
 
-run() { # $1=tag $2=prompt $3=refenv
+run() { # $1=tag $2=prompt $3=refenv(死参: ref-corpus/copy-spec 族已从引擎删除, 见头注)
     local out=/tmp/ab_$1.out
     echo "[ab] $1 跑中..." >&2
-    DS4_RESIDUAL="$RESID" DS4_COPY_SPEC_LOG=1 DS4_REF_CORPUS="$3" \
+    # (env 大扫除 2026-08-31: COPY_SPEC_LOG/REF_CORPUS 已无读取者 — copy-spec 族 08-05
+    #  用户裁决整删, 本 A/B 的 ref 腿已无机制可开, 两腿等价 → 判决语义失效待裁)
+    RESID="$RESID" \
       PROMPT="$2" MODEL="$MODEL" NPRED="$NPRED" TIMEOUT_S=300 \
       ./scripts/code1b_smoke.sh > "$out" 2>/tmp/ab_$1.err || true
     {   echo "──── $1 ────"

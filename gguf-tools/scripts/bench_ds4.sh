@@ -20,7 +20,9 @@ MODEL=${1:?MODEL.gguf}
 CORPUS="$ROOT/gguf-tools/data/prompts/coding_eval.txt"
 PROMPT='func twoSum(nums []int, target int) []int {
 	for i := 0; i < len(nums); i++ {'
-GOENV="DS4_METAL_EXPERT_OFFLOAD=1 DS4_METAL_PREFILL_CHUNK=512 DS4_REPEAT_FREQ=1 DS4_METAL_MATH_SAFE=1 DS4_METAL_KV_RAW_F32=1 DS4_METAL_ROPE_EXP2_LOG2=1"
+# (env 大扫除 2026-08-31: EXPERT_OFFLOAD=1 归 AUTO 按 --mem-budget-mb 判定; REPEAT_FREQ
+#  引擎已无此路; MATH_SAFE+KV_RAW_F32+ROPE_EXP2_LOG2 三件套成组升格为 --strict-fp)
+GOFLAGS="--prefill-chunk 512 --strict-fp"
 cd "$ROOT"
 
 echo "=== ★统一基准★ ds4引擎 × $MODEL × 固定语料 $(basename $CORPUS) ==="
@@ -28,25 +30,25 @@ pkill -9 -f 'ds4 ' 2>/dev/null; ssh -o BatchMode=yes $M1 "pkill -9 -f 'ds4 ' 2>/
 
 if [ "${SINGLE:-0}" = 1 ]; then
   echo "[单机] "
-  env $GOENV DS4_MEM_BUDGET_MB=11000 ./ds4 -m "$MODEL" --metal --ctx 4096 --perplexity-file "$CORPUS" 2>/tmp/bench_ppl.log | tee /tmp/bench_ppl.txt
+  ./ds4 -m "$MODEL" $GOFLAGS --mem-budget-mb 11000 --metal --ctx 4096 --perplexity-file "$CORPUS" 2>/tmp/bench_ppl.log | tee /tmp/bench_ppl.txt
   echo "--- 自由生成 ---"
-  env $GOENV DS4_MEM_BUDGET_MB=11000 ./ds4 -m "$MODEL" --metal --ctx 4096 --temp 0 -n 64 -p "$PROMPT" 2>/dev/null | tee /tmp/bench_gen.txt
+  ./ds4 -m "$MODEL" $GOFLAGS --mem-budget-mb 11000 --metal --ctx 4096 --temp 0 -n 64 -p "$PROMPT" 2>/dev/null | tee /tmp/bench_gen.txt
 else
   # 双机: M1 worker 25:output (反连) + M4 coordinator 0:24
   cat > /tmp/bench_worker.sh <<EOF
 #!/bin/sh
 cd $M1ROOT
 pkill -9 -f 'ds4 --role worker' 2>/dev/null; sleep 1
-DS4_DIST_REVERSE_CONNECT=1 $GOENV nohup ./ds4 --role worker --listen 0.0.0.0 $PORT --coordinator $M4IP $PORT \
+nohup ./ds4 --reverse-connect $GOFLAGS --role worker --listen 0.0.0.0 $PORT --coordinator $M4IP $PORT \
   --layers 25:output --ctx 4096 -m $MODEL --metal > /tmp/bench_worker.log 2>&1 &
 echo W-\$!
 EOF
   scp -o BatchMode=yes -q /tmp/bench_worker.sh $M1:/tmp/; ssh -o BatchMode=yes $M1 'sh /tmp/bench_worker.sh </dev/null'; sleep 4
   echo "--- ① teacher-forced PPL (双机) ---"
-  DS4_DIST_REVERSE_CONNECT=1 env $GOENV ./ds4 --role coordinator --coordinator $M1 $PORT --layers 0:24 --ctx 4096 \
+  ./ds4 --reverse-connect $GOFLAGS --role coordinator --coordinator $M1 $PORT --layers 0:24 --ctx 4096 \
     -m "$MODEL" --perplexity-file "$CORPUS" --metal 2>/tmp/bench_ppl.log | tee /tmp/bench_ppl.txt
   echo "--- ② 自由生成 (双机, 代码强制prompt) ---"
-  DS4_DIST_REVERSE_CONNECT=1 env $GOENV ./ds4 --role coordinator --coordinator $M1 $PORT --layers 0:24 --ctx 4096 \
+  ./ds4 --reverse-connect $GOFLAGS --role coordinator --coordinator $M1 $PORT --layers 0:24 --ctx 4096 \
     -m "$MODEL" --temp 0 -n 64 -p "$PROMPT" --metal 2>/dev/null | tee /tmp/bench_gen.txt
   ssh -o BatchMode=yes $M1 "pkill -f 'ds4 --role worker' 2>/dev/null" 2>/dev/null
 fi

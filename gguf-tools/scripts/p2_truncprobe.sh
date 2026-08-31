@@ -14,7 +14,8 @@ open("/tmp/p2_trunc217.ids","w").write(" ".join(ids[:217]))
 print("truncated ids written:", len(ids[:1528]), len(ids[:217]))
 PY
 for N in 1528 217; do
-    env DS4_CUDA_NO_TOKEN_GRAPH=1 timeout --foreground 1200 ./ds4 --cuda \
+    # (env 大扫除 2026-08-31: CUDA_NO_TOKEN_GRAPH 已无读取者, 删)
+    timeout --foreground 1200 ./ds4 --cuda \
         -m "$ROOT/gguf/ds4-iq2.gguf" --score-ids "/tmp/p2_trunc$N.ids" \
         --score-out "/tmp/p2_trunc$N.bin" </dev/null 2>&1 | grep -aE "完成" | tail -1
 done

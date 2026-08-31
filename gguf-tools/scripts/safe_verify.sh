@@ -21,10 +21,10 @@ LOG=/tmp/safe_verify.log; : > "$LOG"
 WD=$!
 
 echo "=== safe_verify $(date +%H:%M:%S) slice=$(basename "$SLICE") ctx=$CTX ===" | tee -a "$LOG"
-# proven flags: OFFLOAD + NO_RESIDENCY(不 wire buffer) + PREFILL_CHUNK(分块) + bound ctx; 不设 MEM_BUDGET
-DS4_METAL_EXPERT_OFFLOAD=1 DS4_METAL_NO_RESIDENCY=1 DS4_METAL_PREFILL_CHUNK=512 \
+# proven flags: --no-residency(不 wire buffer) + --prefill-chunk(分块) + bound ctx; 不设 mem budget
+# (env 大扫除 2026-08-31: EXPERT_OFFLOAD=1 归 AUTO 判定已删; PREFILL_CHUNK 迁 --prefill-chunk;
   perl -e 'alarm 600; exec @ARGV' \
-  "$ROOT/ds4" -m "$MONO" --ctx "$CTX" --perplexity-file "$SLICE" --metal 2>&1 | tee -a "$LOG"
+  "$ROOT/ds4" -m "$MONO" --no-residency --prefill-chunk 512 --ctx "$CTX" --perplexity-file "$SLICE" --metal 2>&1 | tee -a "$LOG"
 rc=$?
 kill $WD 2>/dev/null
 echo "VERIFY-EXIT-$rc  还原度=(5.6185-NLL)/(5.6185-0.5522)x100 [教师锚0.5522/v2裸0%]" | tee -a "$LOG"

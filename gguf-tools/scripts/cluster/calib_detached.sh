@@ -6,7 +6,7 @@
 cd "$1" || exit 1
 NX="${6:-256}"; LOG="${7:-/tmp/calib_z.log}"
 rm -f "$LOG"
-( DS4_Z_DUMP_DIR="$5" nohup ./calib_run --hf "$4" --cap "$3" --layers "$2" --solver "${SOLVER:-hv}" ${EXTRA_ARGS:-} --nx "$NX" --threads 8 > "$LOG" 2>&1 & )
+( nohup ./calib_run --hf "$4" --cap "$3" --layers "$2" --z-dump-dir "$5" --solver "${SOLVER:-hv}" ${EXTRA_ARGS:-} --nx "$NX" --threads 8 > "$LOG" 2>&1 & )
 sleep 3
 P=$(pgrep -f "calib_run" | head -1)
 [ -n "$P" ] && echo "calib_run DETACHED pid=$P RSS=$(ps -o rss= -p "$P"|awk '{print int($1/1024)"MiB"}') layers=$2" \

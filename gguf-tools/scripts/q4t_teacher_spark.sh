@@ -47,7 +47,8 @@ stage_smoke(){
     cd "$ROOT"
     local WD; WD=$(guard_mem); trap "kill $WD 2>/dev/null" RETURN
     LOG "smoke 生成(原始输出如下)"
-    env DS4_CUDA_DIRECT_MODEL=1 timeout --foreground 900 ./ds4 --cuda -m "$MDL" -n 48 \
+    # (env 大扫除 2026-08-31: CUDA_DIRECT_MODEL 已无读取者, 删)
+    timeout --foreground 900 ./ds4 --cuda -m "$MDL" -n 48 \
         -p "Explain what a hash map is in one paragraph." </dev/null 2>&1 \
         | grep -aE "moe-init|t/s|." | tail -12
 }
@@ -59,7 +60,7 @@ stage_score(){
         local NM="${P%%:*}" IDS="${P#*:}"
         [ -s "$TD/q4t_$NM.bin" ] && { LOG "score $NM 已在, 跳过"; continue; }
         LOG "score $NM 教师 logits"
-        env DS4_CUDA_DIRECT_MODEL=1 DS4_CUDA_NO_TOKEN_GRAPH=1 timeout --foreground 3000 ./ds4 --cuda -m "$MDL" \
+        timeout --foreground 3000 ./ds4 --cuda -m "$MDL" \
             --score-ids "$IDS" --score-out "$TD/q4t_$NM.bin" </dev/null 2>&1 \
             | grep -aE "完成" | tail -1
         [ -s "$TD/q4t_$NM.bin" ] || { LOG "★score $NM 没落盘★"; exit 3; }

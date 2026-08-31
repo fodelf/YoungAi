@@ -6,7 +6,8 @@
 # 门: 自等 α1 完成且判决过闸(wt2 KL<0.60 且 rrh Σmin>0.83), 不过即停(元凶另有其人, 等人工)。
 set -u
 R=/Users/fodelf/ds4-main; R30=$R/gguf/go-onebit/r30; G7=$R/gguf/go-onebit/g7
-Q=$R/gguf-tools/amp/ds4quant_run.dchunk
+# 2026-08-31: .dchunk 冻结件已删, 走现役 ds4quant_run(env 大扫除后 flag 只有它认)
+Q=$R/gguf-tools/amp/ds4quant_run
 AL=/tmp/en86_alpha1.log
 ENIDS=$G7/wt2train_en.ids; ENS=2383; ENFIT=2083
 ENA=$R30/anchor_entrain_s2383.bin; ENC=$R30/anchor_chain_entrain_s2383.bin
@@ -22,7 +23,7 @@ echo "PASS2_GATE_OK wt2KL=$WKL $(date +%T)"
 cd $R/gguf-tools/amp
 if ! ( cd $R && "$(dirname "$0")/../bench/anchor_metrics" --ref $ENA --ids $ENIDS >/dev/null 2>&1 ); then
   rm -f $ENA; echo "捕干净EN FP锚 S=$ENS $(date +%T)"
-  env DS4_HF=$R/hf/DeepSeek-V4-Flash-0731 DS4_FP_ONLY=1 DS4_ANCHOR=$ENA DS4_THREADS=8 "$Q" $ENIDS 9999 2>&1 | tail -2
+  "$Q" $ENIDS 9999 --hf "$R/hf/DeepSeek-V4-Flash-0731" --fp-only --anchor "$ENA" --threads 8 2>&1 | tail -2
   ( cd $R && "$(dirname "$0")/../bench/anchor_metrics" --ref $ENA --ids $ENIDS >/dev/null 2>&1 ) \
     || { echo "PASS2_EN_ANCHOR_BAD"; exit 2; }
 fi
@@ -30,10 +31,10 @@ echo "EN锚 ✓ $(date +%T)"
 
 cd $R
 rm -f $ENC
+# (MD_FR/MD_EV 行掩码死名已删: zlayer 从 <锚>.layout 推导行域)
 env WDOG_MB=27648 ZL_SWLIM=60 QBIN_OVERRIDE=$Q \
     MD_ANCHOR=$ENA MD_CHAIN=$ENC MD_LAYERS=$R30/en86/layers \
     MD_IDS=$ENIDS MD_S=$ENS MD_NFIT=$ENFIT \
-    MD_FR=0:$ENFIT MD_EV=$ENFIT:$ENS \
     bash gguf-tools/scripts/r30_campaign.sh addon
 echo "ADDON段完 $(date +%T)"
 env Q86_OUT=$R30/en86 QBIN_OVERRIDE=$Q bash gguf-tools/scripts/r30_campaign.sh en86judge

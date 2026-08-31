@@ -15,9 +15,10 @@ PROMPT="${PROMPT:-Write a Python function that reverses a string.}"
 cd "$ROOT"
 run(){   # $1=标签 $2=drafter $3=zchain(空=无)
     local acc ts
-    if [ -n "${3:-}" ]; then export DS4_DRAFT_ZCHAIN="$3"; else unset DS4_DRAFT_ZCHAIN; fi
-    DS4_DRAFT_GGUF="$2" DS4_DSPARK_SPEC=1 DS4_DSPARK_STAT=1 \
-        timeout 1800 ./ds4 --cuda -m "$MAIN" --zchain "$MAIN_ZC" --temp 0 -n "$N" -p "$PROMPT" \
+    DZC=""; [ -n "${3:-}" ] && DZC="--draft-zchain $3"
+    # (DSPARK_STAT 统计行已随诊断清退, avg_acc 腿失效, 判读只看 t/s)
+    timeout 1800 ./ds4 --cuda -m "$MAIN" --zchain "$MAIN_ZC" \
+        --draft-gguf "$2" --spec $DZC --temp 0 -n "$N" -p "$PROMPT" \
         </dev/null >/dev/null 2>/tmp/hr.log
     acc=$(grep -a avg_acc /tmp/hr.log | tail -1 | sed 's/.*avg_acc=//')
     ts=$(grep -a generation /tmp/hr.log | tail -1 | sed 's/.*generation: //; s/ t\/s//')

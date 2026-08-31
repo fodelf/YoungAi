@@ -10,12 +10,13 @@
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd); ROOT=$(cd "$HERE/../.." && pwd)
 SUITE="${SUITE:-humaneval}"; TAG="${TAG:-vq22}"; N="${N:-20}"; PORT="${PORT:-8013}"
-# VQ lane 已验证 env(与 CLI dual_vq 同源): span/批 ≤8(VQ scratch 墙), GPU F16W 路,
-# 关 q2 IO 杠杆, 无残差侧车, PIPE_CHUNK 关(VQ lane 未验证)。
 # ★域中立判定(2026-08-05 用户铁律: 域注入/定型配方全清, 裸模型裸判)★
-export RESID= CTX=4096 PIPE_CHUNK= SOUL= KNOWLEDGE=
+export RESID= CTX=4096 SOUL= KNOWLEDGE=
 # 2026-07-28: DS4_VQ_DIR 摘除 — v4bf 起 blob 内嵌合一卷(引擎自动装载), 侧车目录已清
-export EXTRA_ENV="DS4_PRIMER_BATCH_INJECT=0 DS4_METAL_PREFILL_CHUNK=${PB_CHUNK:-8} DS4_DIST_PREFILL_CAP=${PB_CHUNK:-8} DS4_VQ_GPU=1 DS4_METAL_EXPERT_PREAD=0 DS4_METAL_EXPERT_PREFETCH_AHEAD=0 DS4_METAL_EXPERT_EVENT_DRAIN=0 ${PB_EXTRA:-}"
+# ★env 大扫除 2026-08-31: 原 EXTRA_ENV(PRIMER_BATCH_INJECT/PREFILL_CHUNK=8/PREFILL_CAP=8/
+# VQ_GPU/PREAD/PREFETCH_AHEAD/EVENT_DRAIN + PIPE_CHUNK 钩)整块拆除 — 这些 env 已无读取者,
+# 且 svc.sh 的 env 覆盖口已随大扫除清退(现写死 --prefill-chunk 2048/--dist-prefill-cap 2048)。
+# ⚠ VQ lane 的"span/批 ≤8"(VQ scratch 墙)覆盖手段随之丢失, 需要时要给 svc.sh 开 CLI 覆盖口。
 OUT="$ROOT/gguf-tools/reports/pubbench"; mkdir -p "$OUT"
 FINAL="$OUT/pubbench_${SUITE}_${TAG}.jsonl"; : > "$FINAL"
 REQ_FAIL=0

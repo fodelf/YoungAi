@@ -5,7 +5,7 @@
 #   FIT 区(前段): 全部治疗剂量 — Go 重剂量(LFU 文件形态+gin) + 六语言真代码(v2 同款切片)
 #   HELD 区(尾段): 判决集 — 各语言同函数的【后续行】(与 fit 行零重叠, 温和相关性已知
 #     并接受, 判决锚不混入纪律仍守) + 非代码尾巴
-# 配套: 输出 /tmp/rr_calib_prog_v4.meta (NTOK/NFIT), 战役 env 用 DS4_NFIT 显式钉边界。
+# 配套: 输出 /tmp/rr_calib_prog_v4.meta (NTOK/NFIT), 战役侧用 --nfit 显式钉边界。
 set -euo pipefail
 cd "$(dirname "$0")"
 ROOT="$(cd ../.. && pwd)"

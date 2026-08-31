@@ -45,12 +45,12 @@ PEOF
 
 leg() { # $1=腿名 $2=soul文件(空=bare)
   pkill -9 -x ds4-server 2>/dev/null; pkill -9 -x ds4 2>/dev/null; sleep 2
-  local args=(-m "$MODEL" --port "$PORT" --ctx 8192 --nothink --tool-primer)
+  local args=(-m "$MODEL" --port "$PORT" --ctx 8192 --nothink --tool-primer
+              --base-native --residual gguf/sidecars/code-hot-res-v2.gguf
+              --mem-budget-mb 12000 --prefill-chunk 512)
   [ -n "$2" ] && args+=(--soul "$2")
   echo "[srv] 起 $1 server..." >&2
-  DS4_BASE_NATIVE=1 DS4_RESIDUAL=gguf/sidecars/code-hot-res-v2.gguf \
-  DS4_MEM_BUDGET_MB=12000 DS4_METAL_PREFILL_CHUNK=512 \
-    ./ds4-server "${args[@]}" > "/tmp/bg_srv_$1.log" 2>&1 &
+  ./ds4-server "${args[@]}" > "/tmp/bg_srv_$1.log" 2>&1 &
   local SP=$!
   ( while kill -0 "$SP" 2>/dev/null; do   # 全程看门狗
       MB=$(footprint -p "$SP" 2>/dev/null | grep -Eo 'Footprint: *[0-9.]+ *[KMG]B' | head -1 \
