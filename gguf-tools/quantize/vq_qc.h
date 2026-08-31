@@ -111,17 +111,13 @@ static void vq_encode_full(const float *W,int rows,int cols,int dim,int nc,
     int *sidx=malloc((size_t)rows*sizeof(int));
     double *H=malloc((size_t)grp*grp*8),*Hi=malloc((size_t)grp*grp*8);
     float *XbT=(X&&n_act>0)?malloc((size_t)grp*n_act*4):NULL;
-    /* ★通道能量权(2026-08-31 巨值通道矿)★ s_j=E[x_j²]: 选码字距离从平权 L2 换成
-     * 输出误差口径 Σs_d(v−c)² —— 平权 VQ 抹零 massive 通道(10% 输出能量)的病根在
-     * 选码字, 官方 q2(imatrix 机理)裸 0.4207 < 我们整链 0.4397 实证此矿。X 就是
-     * GPTQ 已在用的校准行, 零新捕获。码本训练(kmeans)暂不加权=v1 改动面最小。 */
+    /* ★通道加权选码字 v2: GPTQ 一致权 1/diag(H⁻¹)(2026-08-31 深夜)★
+     * v1 用 s_j=E[x_j²] 实测退化(wt2 裸 KLD 0.46186→0.48138, Σmin 0.7855→0.7802;
+     * top1 反 +0.49pp = 机制生效但方向错): H_jj 忽略"该列误差可否被后续列补偿",
+     * 把可补偿的 massive 列过度保护, 牺牲不可补偿列。GPTQ 贪心的真列成本 =
+     * 1/[H⁻¹]_jj(可补偿列自动降权), Hi 每组现成, 零新计算。无反馈组(求逆失败)平权。 */
     float *cw=NULL;
-    if(XbT){
-        cw=malloc((size_t)cols*4);
-        for(int j=0;j<cols;j++){ double s=0;
-            for(int t=0;t<n_act;t++){ double v=X[(size_t)t*cols+j]; s+=v*v; }
-            cw[j]=(float)(s/n_act)+1e-12f; }
-    }
+    if(XbT) cw=calloc((size_t)cols,4);   /* 逐组从 Hi 对角填, 0=该组平权 */
     float *Wq=Wq_opt?Wq_opt:malloc(N*4); int own=Wq_opt?0:1;
 #ifdef DS4QUANT_CUDA
     /* v3 全矩阵批量(08-18): 组间独立 → 先算全部组 Hi(H cublas 逐组+CPU inv), 再一次
@@ -141,6 +137,9 @@ static void vq_encode_full(const float *W,int rows,int cols,int dim,int nc,
                 double dm=0; for(int i=0;i<grp;i++) dm+=H[(size_t)i*grp+i]; dm/=grp;
                 for(int i=0;i<grp;i++) H[(size_t)i*grp+i]+=0.02*(dm+1e-9);
                 if(g2_inv(H,grp,Hi_all+(size_t)gi*grp*grp)!=0) fb_all=0;
+                else if(cw){ const double *hi2=Hi_all+(size_t)gi*grp*grp;
+                    for(int j=0;j<grp;j++){ double d=hi2[(size_t)j*grp+j];
+                        cw[j0+j]=(float)(1.0/(d>1e-12?d:1e-12)); } }
             }
         }
         float *WkF=malloc((size_t)rows*cols*4);
@@ -148,7 +147,7 @@ static void vq_encode_full(const float *W,int rows,int cols,int dim,int nc,
         static __thread int *sidx_f=NULL; static __thread int sf_cap=0;
         const int nsegs=cols/dim;
         if(sf_cap<rows*nsegs){ free(sidx_f); sidx_f=malloc((size_t)rows*nsegs*sizeof(int)); sf_cap=rows*nsegs; }
-        vqg_gptq_full(WkF,C,Hi_all,rows,cols,grp,dim,nc,fb_all,sidx_f,cw);
+        vqg_gptq_full(WkF,C,Hi_all,rows,cols,grp,dim,nc,fb_all,sidx_f,fb_all?cw:NULL);
         for(size_t i=0;i<(size_t)rows*nsegs;i++){
             const int c=sidx_f[i];
             idx_out[i]=c;
@@ -172,6 +171,8 @@ static void vq_encode_full(const float *W,int rows,int cols,int dim,int nc,
             double dm=0; for(int i=0;i<g;i++) dm+=H[(size_t)i*g+i]; dm/=g;
             for(int i=0;i<g;i++) H[(size_t)i*g+i]+=0.02*(dm+1e-9);
             ok=g2_inv(H,g,Hi)==0;
+            if(ok&&cw) for(int j=0;j<g;j++){ double d=Hi[(size_t)j*g+j];
+                cw[j0+j]=(float)(1.0/(d>1e-12?d:1e-12)); }
         }
         for(int r=0;r<rows;r++) memcpy(Wk+(size_t)r*g,W+(size_t)r*cols+j0,(size_t)g*4);
 #ifdef DS4QUANT_CUDA
@@ -181,7 +182,7 @@ static void vq_encode_full(const float *W,int rows,int cols,int dim,int nc,
             const int nseg2=g/dim;
             static __thread int *sidx_g=NULL; static __thread int sg_cap=0;
             if(sg_cap<rows*nseg2){ free(sidx_g); sidx_g=malloc((size_t)rows*nseg2*sizeof(int)); sg_cap=rows*nseg2; }
-            vqg_gptq_group(Wk,C,Hi,rows,g,dim,nc,ok,sidx_g,cw?cw+j0:NULL);
+            vqg_gptq_group(Wk,C,Hi,rows,g,dim,nc,ok,sidx_g,(ok&&cw)?cw+j0:NULL);
             for(int s2=0;s2<nseg2;s2++){ const int jj=s2*dim;
                 for(int r=0;r<rows;r++){ const int c=sidx_g[(size_t)r*nseg2+s2];
                     idx_out[((size_t)r*cols+j0+jj)/dim]=c;
@@ -191,7 +192,7 @@ static void vq_encode_full(const float *W,int rows,int cols,int dim,int nc,
 #endif
         for(int jj=0;jj+dim<=g;jj+=dim){
             for(int r=0;r<rows;r++) memcpy(seg+(size_t)r*dim,Wk+(size_t)r*g+jj,(size_t)dim*4);
-            if(cw){ /* 加权选码字(与 GPU 核同式, 防两路静默分歧); 平权走 vq_assign_q 快路 */
+            if(cw&&ok){ /* 加权选码字(与 GPU 核同式, 防两路静默分歧); 无 Hi 组/平权走 vq_assign_q 快路 */
                 const float *wv=cw+j0+jj;
                 for(int r=0;r<rows;r++){ const float *v=seg+(size_t)r*dim;
                     float best=3.4e38f; int bi=0;
