@@ -269,8 +269,11 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             }
             uint64_t auto_budget = ds4_runtime_mem_budget_bytes();
             if (auto_budget == 0) auto_budget = ds4_gpu_recommended_max_working_set_bytes();
+            /* 判定线=预算 85%(与 L1 闸同值是巧合, 语义独立): 全驻留贴线时 KV/scratch
+             * 一涨就顶穿看门狗, 提前转 stream(offload)保命换速。 */
+            #define DS4_OFFLOAD_AUTO_FRAC 0.85
             expert_offload_requested = (auto_budget > 0) && (full_resident_bytes > 0) &&
-                (full_resident_bytes > (uint64_t)((double)auto_budget * 0.85));
+                (full_resident_bytes > (uint64_t)((double)auto_budget * DS4_OFFLOAD_AUTO_FRAC));
             fprintf(stderr,
                     "ds4: expert-offload AUTO: full-resident %.2f GiB vs %.2f GiB budget -> %s\n",
                     (double)full_resident_bytes / DS4_GIB, (double)auto_budget / DS4_GIB,

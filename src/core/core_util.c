@@ -1,6 +1,14 @@
 /* core_util.c — die/分配守卫/xmalloc族/内存看门狗/日志 (机械拆分自 ds4.c, 重构阶段4)。 */
 #include "core_internal.h"
 
+/* 内存护栏两道线(同值不同义, 别合并):
+ *  - 看门狗越线 = 预算 90%: 运行时 phys_footprint 实测, 早于 100% abort, 抢在
+ *    wired 暴涨/页抖动把机器拖死之前(12G 红线是系统级最高约束)。
+ *  - L1 静态闸 = 预算 85%: 启动时的静态估计(模型驻留+KV/scratch 估计), 留 15%
+ *    余量吸收估计误差与运行期增长; 运行时仍由看门狗兜底。 */
+#define DS4_WATCHDOG_TRIP_FRAC 0.90
+#define DS4_L1_GATE_FRAC       0.85
+
 /* =========================================================================
  * Shared Helpers, Allocation Guards, Threads, and Cursor Reads.
  * =========================================================================
@@ -148,7 +156,7 @@ static void *ds4_mem_watchdog_main(void *arg) {
     unsigned crit_ms = 0;   /* consecutive system-CRITICAL accumulator for the pressure guard */
     while (g_mem_watch_run) {
         uint64_t fp = ds4_phys_footprint_bytes();
-        if (g_mem_budget_bytes != 0 && fp > (uint64_t)((double)g_mem_budget_bytes * 0.9)) {
+        if (g_mem_budget_bytes != 0 && fp > (uint64_t)((double)g_mem_budget_bytes * DS4_WATCHDOG_TRIP_FRAC)) {
             fprintf(stderr,
                     "\n[ds4-watchdog] phys_footprint %.2f GiB crossed 90%% of the "
                     "%.2f GiB budget -- aborting before page thrash.\n",
@@ -224,7 +232,7 @@ DS4_MAYBE_UNUSED void ds4_l1_budget_gate(uint64_t resident_model_bytes,
                                                 uint64_t kv_and_scratch_bytes) {
     if (g_mem_budget_bytes == 0) return;
     const uint64_t planned = resident_model_bytes + kv_and_scratch_bytes;
-    const uint64_t limit = (uint64_t)((double)g_mem_budget_bytes * 0.85);
+    const uint64_t limit = (uint64_t)((double)g_mem_budget_bytes * DS4_L1_GATE_FRAC);
     if (planned > limit) {
         fprintf(stderr,
                 "\n[ds4-l1-gate] planned resident %.2f GiB (model %.2f + kv/scratch %.2f) "
