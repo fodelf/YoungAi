@@ -221,7 +221,8 @@ static uint64_t zc_emit_layer(FILE*f, uint32_t Lw, lfile_t*lf){
             for(int e=0;e<NEXP;e++) h[e]=go1b_fp32_to_fp16(o->ge[e]);
             fwrite(h,2,(size_t)NEXP,f); free(h); }
         else if(o->type==6&&o->zlk>0&&o->zlU&&o->zlV&&o->zlz){   /* 冻结 z^L: 头16B + fp16{z,U[dout·k],V[din·k]} */
-            uint32_t zk=(uint32_t)o->zlk, din=(uint32_t)DIM, dout=(uint32_t)DIM;
+            /* din 按记录真值走(旧写死 DIM: ftA op(zdin=3D)导出时 V 静默截 2/3 且头自述错) */
+            uint32_t zk=(uint32_t)o->zlk, din=(uint32_t)(o->zdin?o->zdin:DIM), dout=(uint32_t)DIM;
             size_t nh=(size_t)zk+(size_t)zk*din+(size_t)zk*dout;
             psz=16+(uint32_t)(2*nh);
             fwrite(&ty,4,1,f); fwrite(&psz,4,1,f);
