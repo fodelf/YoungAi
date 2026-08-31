@@ -74,10 +74,8 @@
 #define DS4_DEFAULT_ROPE_ORIG_CTX       UINT64_C(65536)
 
 
-/* DeepSeek recommends Think Max only with at least a 384K-token context window.
- * Below that size we keep ordinary thinking to avoid injecting a prompt that
- * asks for a reasoning budget the allocated context is not meant to hold. */
-#define DS4_THINK_MAX_MIN_CONTEXT 393216u
+/* DS4_THINK_MAX_MIN_CONTEXT 已升入 ds4.h(公共 API): server --help 文本经
+ * DS4_STRINGIFY 与门槛同源, 不再各写一份 393216。 */
 
 #if defined(__GNUC__) || defined(__clang__)
 #define DS4_MAYBE_UNUSED __attribute__((unused))

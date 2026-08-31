@@ -41,7 +41,7 @@ void usage(FILE *fp) {
         "  -m, --model FILE\n"
         "      GGUF model path. Default: ds4flash.gguf\n"
         "  -c, --ctx N\n"
-        "      Context size allocated for the session. Default: 32768\n"
+        "      Context size allocated for the session. Default: " DS4_STRINGIFY(DS4_DEFAULT_CTX_SIZE) "\n"
         "  --metal\n"
         "      Use the Metal graph backend. This is the normal fast path on macOS.\n"
         "  --cuda\n"

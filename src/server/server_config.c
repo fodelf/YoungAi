@@ -1,6 +1,10 @@
 /* server_config.c — 机械拆分自 ds4_server.c (12787-13152 行): 命令行解析与 usage。 */
 
 #include "server_internal.h"
+
+/* 服务端默认输出 token 上限(384K)。与 DS4_THINK_MAX_MIN_CONTEXT 同数是巧合
+ * (一个是输出上限, 一个是 think-max 的最小 ctx), 语义独立, 别合并。 */
+#define SERVER_DEFAULT_MAX_TOKENS 393216
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
 #endif
@@ -87,9 +91,10 @@ void usage(FILE *fp) {
         "  -m, --model FILE\n"
         "      GGUF model path. Default: ds4flash.gguf\n"
         "  -c, --ctx N\n"
-        "      Context size allocated at startup. Default: 32768\n"
+        "      Context size allocated at startup. Default: " DS4_STRINGIFY(DS4_DEFAULT_CTX_SIZE) "\n"
         "  -n, --tokens N\n"
-        "      Default max output tokens when the client omits a limit. Default: 393216 (384K)\n"
+        "      Default max output tokens when the client omits a limit. Default: "
+        DS4_STRINGIFY(SERVER_DEFAULT_MAX_TOKENS) " (384K)\n"
         "  --max-output-tokens N\n"
         "      Hard server-side cap on output tokens per request, overriding larger client limits.\n"
         "      0 disables; protects a single-worker local server from runaway generations. Default: 0\n"
@@ -164,7 +169,8 @@ void usage(FILE *fp) {
         "Thinking and sampling:\n"
         "  DeepSeek-compatible chat requests default to thinking mode with high effort.\n"
         "  Only reasoning_effort=max or output_config.effort=max requests Think Max.\n"
-        "  Think Max is applied only when --ctx is at least 393216 tokens; smaller contexts use high.\n"
+        "  Think Max is applied only when --ctx is at least " DS4_STRINGIFY(DS4_THINK_MAX_MIN_CONTEXT)
+        " tokens; smaller contexts use high.\n"
         "  thinking={type:disabled}, think=false, or model=deepseek-chat selects non-thinking mode.\n"
         "  API defaults are temperature=1, top_p=1, min_p=0.05, and no top-k cap.\n"
         "  In thinking mode, client sampling knobs are ignored like the official API.\n"
@@ -239,8 +245,8 @@ server_config parse_options(int argc, char **argv) {
         },
         .host = "127.0.0.1",
         .port = 8000,
-        .ctx_size = 32768,
-        .default_tokens = 393216,
+        .ctx_size = DS4_DEFAULT_CTX_SIZE,
+        .default_tokens = SERVER_DEFAULT_MAX_TOKENS,
         .max_output_tokens = 0,
         .force_nothink = false,
         .tool_primer = false,

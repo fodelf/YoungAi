@@ -53,6 +53,16 @@ typedef struct {
 #define DS4_DEFAULT_TEMPERATURE 1.0f
 #define DS4_DEFAULT_TOP_P 1.0f
 #define DS4_DEFAULT_MIN_P 0.05f
+/* session 默认 ctx: CLI(-c)与 server(--ctx) 同一个默认, help 文本经 DS4_STRINGIFY
+ * 同源拼接 —— 改这里, 代码与 --help 显示一起变, 不会再各写一份跑飞。 */
+#define DS4_DEFAULT_CTX_SIZE 32768
+#define DS4_STRINGIFY_(x) #x
+#define DS4_STRINGIFY(x) DS4_STRINGIFY_(x)
+/* DeepSeek recommends Think Max only with at least a 384K-token context window.
+ * Below that size we keep ordinary thinking to avoid injecting a prompt that
+ * asks for a reasoning budget the allocated context is not meant to hold.
+ * (无 u 后缀: server --help 经 DS4_STRINGIFY 拼进文本, 比较端自行转 uint32。) */
+#define DS4_THINK_MAX_MIN_CONTEXT 393216
 
 typedef struct ds4_engine ds4_engine;
 typedef struct ds4_session ds4_session;

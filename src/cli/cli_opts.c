@@ -144,7 +144,7 @@ cli_config parse_options(int argc, char **argv) {
                              * base code continuation (model answers the persona instead of
                              * continuing the code). Pass -sys "..." to set one explicitly. */
             .n_predict = 50000,
-            .ctx_size = 32768,
+            .ctx_size = DS4_DEFAULT_CTX_SIZE,
             .temperature = DS4_DEFAULT_TEMPERATURE,
             .top_p = DS4_DEFAULT_TOP_P,
             .min_p = DS4_DEFAULT_MIN_P,
