@@ -121,12 +121,12 @@ static int build_opt_tensors(const char *dql_dir, int L, elist_t *out) {
                     uint32_t zk, din, dout; float tr;
                     memcpy(&zk, pay, 4); memcpy(&tr, pay + 4, 4);
                     memcpy(&din, pay + 8, 4); memcpy(&dout, pay + 12, 4);
-                    uint64_t nh = (uint64_t)zk + (uint64_t)zk * dout + (uint64_t)zk * din;
+                    uint64_t nh = DS4_AMP_ZL_ELEMS(zk, din, dout);
                     if (!(zk > 0 && zk <= DS4_AMP_ZK_MAX && dout == (uint32_t)D_MODEL
-                          && (din == dout || din == 3u * dout) && plen >= 16 + nh * 2))
+                          && (din == dout || din == 3u * dout) && plen >= DS4_AMP_OP_HDR + nh * 2))
                         die("zl.RRR L%d 混装记录非法: k=%u din=%u dout=%u plen=%llu need=%llu — 拒绝静默丢放大器",
                             L, zk, din, dout, (unsigned long long)plen,
-                            (unsigned long long)(16 + nh * 2));
+                            (unsigned long long)(DS4_AMP_OP_HDR + nh * 2));
                     row[0] = 6.0f; row[1] = tr; row[2] = (float)zk; row[3] = (float)din;
                     chain_add(&chain, row);
                     free(zlm); zlm_len = (size_t)(nh * 2); zlm = xmalloc(zlm_len);
@@ -166,11 +166,11 @@ static int build_opt_tensors(const char *dql_dir, int L, elist_t *out) {
                         uint32_t zk, din, dout; float tr;
                         memcpy(&zk, pay, 4); memcpy(&tr, pay + 4, 4);
                         memcpy(&din, pay + 8, 4); memcpy(&dout, pay + 12, 4);
-                        uint64_t nh = (uint64_t)zk + (uint64_t)zk * dout + (uint64_t)zk * din;
+                        uint64_t nh = DS4_AMP_ZL_ELEMS(zk, din, dout);
                         if (!(zk > 0 && zk <= DS4_AMP_ZK_MAX && dout == (uint32_t)D_MODEL
-                              && (din == dout || din == 3u * dout) && pn >= 16 + nh * 2))
+                              && (din == dout || din == 3u * dout) && pn >= DS4_AMP_OP_HDR + nh * 2))
                             die("zl.RRR L%d 记录非法: k=%u din=%u dout=%u pn=%zu need=%llu — 拒绝静默丢放大器",
-                                L, zk, din, dout, pn, (unsigned long long)(16 + nh * 2));
+                                L, zk, din, dout, pn, (unsigned long long)(DS4_AMP_OP_HDR + nh * 2));
                         float row[16]; memset(row, 0, sizeof row);
                         row[0] = 6.0f; row[1] = tr; row[2] = (float)zk; row[3] = (float)din;
                         chain_add(&chain, row);
@@ -209,11 +209,11 @@ static int build_opt_tensors(const char *dql_dir, int L, elist_t *out) {
     int n = 0;
     char nmbuf[128];
     if (chain.n) {
-        size_t nb = chain.n * 16 * sizeof(float);
+        size_t nb = chain.n * DS4_AMP_CHAIN_FLOATS * sizeof(float);
         uint8_t *data = xmalloc(nb);
         memcpy(data, chain.r, nb);
         snprintf(nmbuf, sizeof nmbuf, "blk.%d.opt_chain.weight", L);
-        el_push1(out, nmbuf, (uint64_t)(chain.n * 16), 0, nb, K_OPT)->data = data;
+        el_push1(out, nmbuf, (uint64_t)(chain.n * DS4_AMP_CHAIN_FLOATS), 0, nb, K_OPT)->data = data;
         n++;
     }
     if (ge_len) {

@@ -165,14 +165,14 @@ struct ds4_zchain *zchain_from_model(const ds4_model *m) {
                 z->n_ge_layers++;
             }
         }
-        if (tc && tc->dim[0] >= 16) {
+        if (tc && tc->dim[0] >= DS4_AMP_CHAIN_FLOATS) {
             const float *ch = (const float *)tensor_data(m, tc);
-            const uint32_t nops = (uint32_t)(tc->dim[0] / 16);
+            const uint32_t nops = (uint32_t)(tc->dim[0] / DS4_AMP_CHAIN_FLOATS);
             if (ch && nops) {
                 z->layer[il].ops = xcalloc(nops, sizeof(ds4_zchain_op));
                 uint32_t kept = 0;
                 for (uint32_t i = 0; i < nops; i++) {
-                    const float *f = ch + (size_t)i * 16;
+                    const float *f = ch + (size_t)i * DS4_AMP_CHAIN_FLOATS;
                     ds4_zchain_op *o = &z->layer[il].ops[kept];
                     memset(o, 0, sizeof(*o));
                     o->type = (uint32_t)f[0];
@@ -195,7 +195,7 @@ struct ds4_zchain *zchain_from_model(const ds4_model *m) {
                         /* f[3]=V 输入维: 旧 GGUF 写者不填(0)=线性 din=D; 3D=ftA 特征提升。
                          * 旧公式写死 din=D, ftA 载荷会被按错布局静默别解 —— 尺寸按真 din 算。 */
                         const uint32_t din = f[3] > 0.0f ? (uint32_t)f[3] : DS4_N_EMBD;
-                        const uint64_t nh = (uint64_t)zk * (1ull + DS4_N_EMBD + din);
+                        const uint64_t nh = DS4_AMP_ZL_ELEMS(zk, din, DS4_N_EMBD);
                         if (zk > 0 && zk <= DS4_AMP_ZK_MAX
                             && (din == DS4_N_EMBD || din == 3u * DS4_N_EMBD)
                             && zlm && (tzl ? tzl->dim[0] : 0) >= nh) {

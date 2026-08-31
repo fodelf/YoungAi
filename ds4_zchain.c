@@ -93,15 +93,15 @@ ds4_zchain *ds4_zchain_load(const char *path, uint32_t n_layer, uint32_t n_exper
                 uint32_t zk, din, dout; float tr;
                 memcpy(&zk, pay, 4); memcpy(&tr, pay + 4, 4);
                 memcpy(&din, pay + 8, 4); memcpy(&dout, pay + 12, 4);
-                size_t nh = (size_t)zk + (size_t)zk * din + (size_t)zk * dout;
+                size_t nh = DS4_AMP_ZL_ELEMS(zk, din, dout);
                 if (zk > 0 && zk <= DS4_AMP_ZK_MAX && din == d_model && dout == n_expert &&
-                    psz >= 16 + nh * 2) {
+                    psz >= DS4_AMP_OP_HDR + nh * 2) {
                     zl->rte.zlk = zk; zl->rte.zltr = tr; zl->rte.zdin = din;
                     zl->rte.zmul = 2u;                       /* 标记: 路由偏置形态 */
                     zl->rte.zlm = (const uint16_t *)(pay + 16);
                 } else {
                     fprintf(stderr, "ds4: zchain L%u type8 dropped: k=%u din=%u dout=%u psz=%u need=%llu\n",
-                            L, zk, din, dout, psz, (unsigned long long)(16 + nh * 2));
+                            L, zk, din, dout, psz, (unsigned long long)(DS4_AMP_OP_HDR + nh * 2));
                 }
                 continue;
             }
@@ -138,15 +138,15 @@ ds4_zchain *ds4_zchain_load(const char *path, uint32_t n_layer, uint32_t n_exper
                 uint32_t zk, din, dout; float tr;
                 memcpy(&zk, pay, 4); memcpy(&tr, pay + 4, 4);
                 memcpy(&din, pay + 8, 4); memcpy(&dout, pay + 12, 4);
-                size_t nh = (size_t)zk * din * 2u + (size_t)zk * dout;
+                size_t nh = DS4_AMP_AMPD_ELEMS(zk, din, dout);
                 if (zk > 0 && zk <= DS4_AMP_ZK_MAX && (din == d_model || din == 3u * d_model)
-                    && dout == d_model && psz >= 16 + nh * 2) {
+                    && dout == d_model && psz >= DS4_AMP_OP_HDR + nh * 2) {
                     zl->zl.zlk = zk; zl->zl.zltr = tr; zl->zl.zdin = din;
                     zl->zl.zmul = 3u;                            /* 动态 z 乘性 */
                     zl->zl.zlm = (const uint16_t *)(pay + 16);
                 } else {
                     fprintf(stderr, "ds4: zchain L%u type9 dropped: k=%u din=%u dout=%u psz=%u need=%llu\n",
-                            L, zk, din, dout, psz, (unsigned long long)(16 + nh * 2));
+                            L, zk, din, dout, psz, (unsigned long long)(DS4_AMP_OP_HDR + nh * 2));
                 }
                 continue;
             }
@@ -154,14 +154,14 @@ ds4_zchain *ds4_zchain_load(const char *path, uint32_t n_layer, uint32_t n_exper
                 uint32_t zk, din, dout; float tr;
                 memcpy(&zk, pay, 4); memcpy(&tr, pay + 4, 4);
                 memcpy(&din, pay + 8, 4); memcpy(&dout, pay + 12, 4);
-                size_t nh = (size_t)zk + (size_t)zk * din + (size_t)zk * dout;
+                size_t nh = DS4_AMP_ZL_ELEMS(zk, din, dout);
                 if (zk > 0 && zk <= DS4_AMP_ZK_MAX && (din == d_model || din == 3u * d_model)
-                    && dout == d_model && psz >= 16 + nh * 2) {
+                    && dout == d_model && psz >= DS4_AMP_OP_HDR + nh * 2) {
                     zl->zl.zlk = zk; zl->zl.zltr = tr; zl->zl.zdin = din;
                     zl->zl.zmul = 1u; zl->zl.zlm = (const uint16_t *)(pay + 16);
                 } else {
                     fprintf(stderr, "ds4: zchain L%u type7 dropped: k=%u din=%u dout=%u psz=%u need=%llu\n",
-                            L, zk, din, dout, psz, (unsigned long long)(16 + nh * 2));
+                            L, zk, din, dout, psz, (unsigned long long)(DS4_AMP_OP_HDR + nh * 2));
                 }
                 continue;
             }
@@ -170,9 +170,9 @@ ds4_zchain *ds4_zchain_load(const char *path, uint32_t n_layer, uint32_t n_exper
                 uint32_t zk, din, dout; float tr;
                 memcpy(&zk, pay, 4); memcpy(&tr, pay + 4, 4);
                 memcpy(&din, pay + 8, 4); memcpy(&dout, pay + 12, 4);
-                size_t nh = (size_t)zk + (size_t)zk * din + (size_t)zk * dout;
+                size_t nh = DS4_AMP_ZL_ELEMS(zk, din, dout);
                 if (zk > 0 && zk <= DS4_AMP_ZK_MAX && (din == d_model || din == 3u * d_model)
-                    && dout == d_model && psz >= 16 + nh * 2) {
+                    && dout == d_model && psz >= DS4_AMP_OP_HDR + nh * 2) {
                     zl->zl.zlk = zk; zl->zl.zltr = tr; zl->zl.zdin = din;
                     zl->zl.zmul = 0u;
                     zl->zl.zlm = (const uint16_t *)(pay + 16);   /* aliases the mmap */
@@ -197,7 +197,7 @@ ds4_zchain *ds4_zchain_load(const char *path, uint32_t n_layer, uint32_t n_exper
                     }
                 } else {
                     fprintf(stderr, "ds4: zchain L%u type6 dropped: k=%u din=%u dout=%u psz=%u need=%llu\n",
-                            L, zk, din, dout, psz, (unsigned long long)(16 + nh * 2));
+                            L, zk, din, dout, psz, (unsigned long long)(DS4_AMP_OP_HDR + nh * 2));
                 }
                 continue;
             }

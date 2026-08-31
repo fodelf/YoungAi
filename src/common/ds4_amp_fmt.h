@@ -31,4 +31,14 @@
  * 公式从旧 S 反推旧切分 —— 改比例=历史 checkpoint 全部静默错切, 视为格式冻结。 */
 #define DS4_AMP_FIT_SPLIT(n) (((n) * 3) / 4)
 
+/* z 族 op 载荷布局: 16B 头(u32 k | f32 tr/s | u32 din | u32 dout) + fp16 元素。
+ * 元素数按形态分两种; 写者/读者共 10+ 处必须逐位同, 从此只认这两个公式。 */
+#define DS4_AMP_OP_HDR 16
+#define DS4_AMP_ZL_ELEMS(k, din, dout)   ((size_t)(k) + (size_t)(k) * (din) + (size_t)(k) * (dout))   /* z[k]|U[dout·k]|V[din·k] (type6/7/8) */
+#define DS4_AMP_AMPD_ELEMS(k, din, dout) (2u * (size_t)(k) * (din) + (size_t)(k) * (dout))            /* A[din·k]|U|V (type9 zl.AMPD) */
+
+/* 合一 GGUF opt_chain: 每 op 16 个 f32 槽。槽位: f[0]=type, f[1]=g/tr, f[2..5]=w2p
+ * (type6: f[2]=k, f[3]=din, 0=D), f[6..14]=w8, f[15]=v8 块号(-1 无)。 */
+#define DS4_AMP_CHAIN_FLOATS 16
+
 #endif

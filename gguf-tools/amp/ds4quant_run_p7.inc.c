@@ -434,7 +434,7 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
                         FILE*zf3=fopen(zp3,"wb");
                         if(zf3){ unsigned char hdr3[DS4_AMP_REC_HDR]; memset(hdr3,0,DS4_AMP_REC_HDR);
                           memcpy(hdr3,"zl.RRR",6);
-                          unsigned long long psz3=16ull+2ull*((unsigned long long)kk+2ull*(unsigned long long)kk*DIM);
+                          unsigned long long psz3=DS4_AMP_OP_HDR+2ull*DS4_AMP_ZL_ELEMS((unsigned long long)kk,DIM,DIM);
                           memcpy(hdr3+DS4_AMP_REC_OFF_PSZ,&psz3,8); int one3=1; memcpy(hdr3+DS4_AMP_REC_OFF_VD,&one3,4);
                           fwrite(hdr3,1,DS4_AMP_REC_HDR,zf3);
                           uint32_t zk3=(uint32_t)kk,di3=(uint32_t)DIM,do3=(uint32_t)DIM; float tr3=(float)LZTR;

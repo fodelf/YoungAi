@@ -274,18 +274,18 @@ static int zchain_in_load(const char *path) {
                 uint32_t zk, din, dout; float tr;
                 memcpy(&zk, pay, 4); memcpy(&tr, pay + 4, 4);
                 memcpy(&din, pay + 8, 4); memcpy(&dout, pay + 12, 4);
-                size_t nh = (size_t)zk + (size_t)zk * din + (size_t)zk * dout;
+                size_t nh = DS4_AMP_ZL_ELEMS(zk, din, dout);
                 /* 旧闸 zk<=64 && din==dout 会把冠军级秩/ftA(din=3D)记录静默丢掉:
                  * 合出的 GGUF 少放大器还不吭声。契约=zk≤1024, din∈{D,3D}, d_model 取 dout。 */
                 if (!(zk > 0 && zk <= DS4_AMP_ZK_MAX && (din == dout || din == 3u * dout)
-                      && psz >= 16 + nh * 2)) {
+                      && psz >= DS4_AMP_OP_HDR + nh * 2)) {
                     fprintf(stderr, "zchain zl 记录非法: k=%u din=%u dout=%u psz=%u need=%zu\n",
-                            zk, din, dout, psz, (size_t)16 + nh * 2);
+                            zk, din, dout, psz, (size_t)DS4_AMP_OP_HDR + nh * 2);
                     die("zchain zl record invalid");
                 }
                 if (!g_zc.d_model) g_zc.d_model = (int)dout;
                 if ((int)dout != g_zc.d_model) die("zchain zl d_model mismatch");
-                float *f = ch + (size_t)oi * 16;
+                float *f = ch + (size_t)oi * DS4_AMP_CHAIN_FLOATS;
                 f[0] = 6.0f; f[1] = tr; f[2] = (float)zk; f[3] = (float)din; f[15] = 0.0f;
                 free(g_zc.zlm[L]);
                 g_zc.zlm[L] = xmalloc(nh * 2);
@@ -300,7 +300,7 @@ static int zchain_in_load(const char *path) {
                 for (int e = 0; e < ne; e++)
                     g_zc.ge[L][e] = ds4q_f16_to_f32(load_u16_le(pay + (size_t)e * 2));
             } else if (ty >= 1u && ty <= 4u) {
-                float *f = ch + (size_t)oi * 16;
+                float *f = ch + (size_t)oi * DS4_AMP_CHAIN_FLOATS;
                 f[0] = (float)ty; f[15] = -1.0f;
                 if (ty == 1u && psz >= 4) memcpy(&f[1], pay, 4);
                 else if (ty == 2u && psz >= 16) memcpy(&f[2], pay, 16);

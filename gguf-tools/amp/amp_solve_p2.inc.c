@@ -229,7 +229,7 @@ int main(int argc, char **argv) {
         } else {
             const int k = best_k;
             memcpy(hdr, "zl.AMPD", 7);
-            uint64_t psz = 16 + (size_t)2 * DIN * k * 2 + (size_t)D * k * 2;
+            uint64_t psz = DS4_AMP_OP_HDR + 2 * DS4_AMP_AMPD_ELEMS((size_t)k, DIN, D);   /* zl.AMPD: A|U|V */
             memcpy(hdr + DS4_AMP_REC_OFF_PSZ, &psz, 8);
             int32_t one = 1; memcpy(hdr + DS4_AMP_REC_OFF_VD, &one, 4);
             fwrite(hdr, 1, DS4_AMP_REC_HDR, f);

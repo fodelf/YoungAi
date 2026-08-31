@@ -27,7 +27,7 @@ static void parse_op_rec(lfile_t*lf,const char*nm,const uint8_t*pay,uint64_t psz
         uint32_t zk,din,dout; float ztr;
         memcpy(&zk,pay,4); memcpy(&ztr,pay+4,4); memcpy(&din,pay+8,4); memcpy(&dout,pay+12,4);
         if(zk>0&&zk<=DS4_AMP_ZK_MAX&&(din==(uint32_t)DIM||din==3u*(uint32_t)DIM)&&dout==(uint32_t)DIM
-           &&psz>=16+(uint64_t)2*(zk+(uint64_t)zk*din+(uint64_t)zk*dout)){
+           &&psz>=DS4_AMP_OP_HDR+(uint64_t)2*DS4_AMP_ZL_ELEMS(zk,din,dout)){
             o->type=6; o->zlk=(int)zk; o->zltr=ztr; o->zdin=(int)din;
             const uint16_t*h=(const uint16_t*)(pay+16);
             o->zlz=malloc((size_t)zk*4);
@@ -223,8 +223,8 @@ static uint64_t zc_emit_layer(FILE*f, uint32_t Lw, lfile_t*lf){
         else if(o->type==6&&o->zlk>0&&o->zlU&&o->zlV&&o->zlz){   /* 冻结 z^L: 头16B + fp16{z,U[dout·k],V[din·k]} */
             /* din 按记录真值走(旧写死 DIM: ftA op(zdin=3D)导出时 V 静默截 2/3 且头自述错) */
             uint32_t zk=(uint32_t)o->zlk, din=(uint32_t)(o->zdin?o->zdin:DIM), dout=(uint32_t)DIM;
-            size_t nh=(size_t)zk+(size_t)zk*din+(size_t)zk*dout;
-            psz=16+(uint32_t)(2*nh);
+            size_t nh=DS4_AMP_ZL_ELEMS(zk,din,dout);
+            psz=DS4_AMP_OP_HDR+(uint32_t)(2*nh);
             fwrite(&ty,4,1,f); fwrite(&psz,4,1,f);
             fwrite(&zk,4,1,f); fwrite(&o->zltr,4,1,f); fwrite(&din,4,1,f); fwrite(&dout,4,1,f);
             uint16_t*h=malloc(nh*2); size_t off2=0;
