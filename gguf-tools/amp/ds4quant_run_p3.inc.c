@@ -212,7 +212,8 @@ typedef struct { uint8_t *map; size_t msz; const uint8_t *w1,*w3,*w2; size_t szG
                  const uint8_t *g2w1,*g2w3,*g2w2; int g2k; int16_t g2slot[256];   /* 热专家 2bit 覆盖 */
                  uint8_t *vqmap; size_t vqmsz;                                    /* v2.2 VQ 侧车 mmap(dql_vq_L%02d.bin) */
                  uint8_t *opsmap; size_t opsmsz; int has_ops;                     /* op 侧车 mmap(dql_ops_L%02d.bin, 平行架构权威源) */
-                 lop_t ops[32]; int nops;
+#define LOPS_MAX 32   /* 单层 op 链容量; 超限=停车(修正静默消失过的判决不可信), 不静默丢 */
+                 lop_t ops[LOPS_MAX]; int nops;
                  int zl_stub_at; } lfile_t;   /* zl.RRR 空壳占位序号(真载荷回填正位用; -1=无) */
 /* go2b 侧车路径: --go2b-dir(默认=层文件同目录)/dql_go2b_L<NN>.bin — 分储设计:
  * 冷 go1b dql 在本机(热专家稀疏洞), 热 go2b 侧车可放对机 NFS(两机 16G 盘都装不下合体) */
@@ -244,7 +245,11 @@ static void op_host_path(int L,char*out,size_t outsz){
 /* op 记录解析(主文件旧混装 与 zrec 外挂 共用): curfoff=载荷在其宿主文件内的偏移 */
 static int g_parse_ext=0;   /* 1=正在解析 zrec 外挂(记录打 ext 标, 禁原地改写) */
 static void parse_op_rec(lfile_t*lf,const char*nm,const uint8_t*pay,uint64_t psz,size_t curfoff){
-    if(lf->nops>=32) return;
+    if(lf->nops>=LOPS_MAX){   /* zrec 并链后单层=dql 内嵌+外挂之和, 更易逼近容量 */
+        fprintf(stderr,"[lfile]★op 链超容量 %d(记录 %.16s 装不下): 静默丢修正=判决模型≠部署模型, "
+                       "停车; 提高 LOPS_MAX 重编★\n",LOPS_MAX,nm);
+        exit(1);
+    }
     lop_t*o=&lf->ops[lf->nops];
     memset(o,0,sizeof(*o)); o->ext=g_parse_ext;
     if(strstr(nm,"GLhc")&&psz>=8){ o->type=7; memcpy(o->ghc,pay,8); o->foff=curfoff; lf->nops++; }
