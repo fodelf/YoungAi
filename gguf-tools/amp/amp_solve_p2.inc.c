@@ -2,7 +2,7 @@ int main(int argc, char **argv) {
     const char *cap = NULL, *outd = NULL, *layers = NULL;
     int threads = 20, KMAX = 1024, nfit_arg = 0, feat_yq = 0;
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--cap") && i + 1 < argc) cap = argv[++i];
+        if ((!strcmp(argv[i], "--cap") || !strcmp(argv[i], "--cap-dir")) && i + 1 < argc) cap = argv[++i];   /* --cap-dir=引擎同名别名 */
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) outd = argv[++i];
         else if (!strcmp(argv[i], "--layers") && i + 1 < argc) layers = argv[++i];
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) threads = atoi(argv[++i]);

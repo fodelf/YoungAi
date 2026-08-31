@@ -81,7 +81,7 @@ int main(int argc, char **argv) {
     float swlim = 0.0f; const char *anchor = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i],"--hf") && i+1<argc) hf_dir = argv[++i];
-        else if (!strcmp(argv[i],"--cap") && i+1<argc) cap = argv[++i];
+        else if ((!strcmp(argv[i],"--cap")||!strcmp(argv[i],"--cap-dir")) && i+1<argc) cap = argv[++i];   /* --cap-dir=引擎同名别名 */
         else if (!strcmp(argv[i],"--ntok") && i+1<argc) ntok_want = atoi(argv[++i]);
         else if (!strcmp(argv[i],"--threads") && i+1<argc) nth = atoi(argv[++i]);
         else if (!strcmp(argv[i],"--swlim") && i+1<argc) swlim = (float)atof(argv[++i]);
