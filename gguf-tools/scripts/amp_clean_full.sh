@@ -21,7 +21,8 @@ QANC=$D2/anchor_vqhalf_q_s8192.bin
 HF=$HOME/ds4-main/hf/DeepSeek-V4-Flash-0731
 # XCAP/XANCHOR 不在冠军配方(FP-x 口径; "学生=引擎真值"支柱未兑现 —— 实测不接引擎捕获时
 # x=锚fin 与部署分布错位, 行cos L3=0.961/L20=0.875/L40=0.797, z 层内收益部署不兑现,
-# 2026-08-24 定位的主 bug, 修法挂账)。zlayer 的 XCAP 代码路保留, 兑现之日改这里接上。
+# 2026-08-24 定位的主 bug)。判决针已入库: amp_campaign.sh chainx(FP-x vs --xanchor 单层
+# A/B, 部署同式打分+跨语料闸口径) —— 链态臂胜出之日把 --xanchor 接进这里的常量区。
 LRANGE=""
 if [ $# -gt 0 ]; then LRANGE=$(seq "${1:?}" "${2:?给了 L_lo 必须给 L_hi}"); fi
 LOG(){ echo "[$WS $(date +%H:%M:%S)] $*"; }
@@ -47,7 +48,8 @@ LOG "②工作区就绪(底座=$SRCBASE)"
 # 锚路径】读 <锚>.layout 推导行域。掩码写在脚本里 = 语料一换就静默错位 = z 全拒 378/378 的根因。
 # ③zlayer 全家 43 层(干净锚)
 # zlayer=C 版(2026-08-25 迁移 Wave B 一期, 金标 migrate/golden.txt: z支线与py精确一致/
-# GE=py-CPU路真解口径/注入产物 rec_fidelity 复评一致)。XANCHOR/GGUF/ADDON 等二期模式 C 版硬拒。
+# GE=py-CPU路真解口径/注入产物 rec_fidelity 复评一致)。XANCHOR/GGUF/ADDON 二期模式 C 版
+# 已实现(2026-08-31 复核: --xanchor/--gguf/--addon 全在, 旧注释"硬拒"是陈的)。
 ZLB="$HOME/ds4-main/gguf-tools/amp/zlayer"
 [ -x "$ZLB" ] || make -C "$HOME/ds4-main/gguf-tools" zlayer
 for L in ${LRANGE:-$(seq 0 42)}; do
