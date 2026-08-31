@@ -457,19 +457,8 @@ print("  %s: %d token / 池 %d / 窗 %d×%d / 步距 %d" % (oa.split("/")[-1], N
 PY
 }
 
-# ★VQ86 半语料量化(2026-08-23): 与 base86p 单变量对照 —— 配方(平权 vq4x512 = 2.25bpw × 43 层)
-# 完全不动, 只换两样: ① 语料 wt2train_cal9 → 开源全场景 v5 的【量化半】; ② 校准规模
-# S 2906 → 8192(每专家 192 校准行 vs 68, DS4_CALIB_CAP 帽是 512, 原来欠采样 7.5 倍)。
-# 放大器只许看【放大器半】, 与量化半零重叠 —— 这是本战役的核心实验纪律。
-stage_vqquant(){
-    local D2="$ROOT/gguf/go-onebit/vqhalf"
-    [ -s "$D2/vqhalf_q.ids" ] || DIE "量化半 ids 缺, 先跑 idshalf"
-    LOG "②VQ86 量化发车: 平权 vq4x512 2.25bpw × 43 层, 语料=量化半 S=8192"
-    Q86_IDS="$D2/vqhalf_q.ids" Q86_S=8192 Q86_NFIT=8192 \
-    Q86_ANCHOR="$D2/anchor_vqhalf_q_s8192.bin" Q86_OUT="$D2/vq86h" \
-    RPLAN86="$ROOT/gguf/go-onebit/r30/rplan_base86p.txt" \
-        bash "$SC/base86p_spark.sh" quant
-}
+# (stage_vqquant 已删 2026-08-31: 与 stage_champ86 ① 同配方的旧道 —— 双份配方=静默分叉
+#  风险本尊, 冠军量化配方唯一权威在 stage_champ86 常量区; 半语料切分纪律见 idshalf 段注)
 
 # VQ86 合并 + 裸判: 复用参数化的 merge_base86p.sh(幂等), 判决=wt2 五指标, 对表 base86p 4.1222。
 stage_vqmerge(){
@@ -725,24 +714,49 @@ stage_full(){
 # rr_calib_prog_v5mini.ids), 口径一致。
 stage_champ86(){
     local D2="$ROOT/gguf/go-onebit/vqhalf" W="$ROOT/gguf/go-onebit/vqhalf/champ86"
-    [ -s "$D2/vqhalf_q.ids" ] && [ -s "$D2/vqhalf_a.ids" ] || DIE "两半语料 ids 缺"
-    [ -s "$D2/anchor_vqhalf_q_s8192.bin" ] || DIE "量化半锚缺"
-    [ -s "$D2/anchor_a_clean_s8192.bin" ] || DIE "放大器半锚缺"
+    # ══ 冠军量化配方常量区(2026-08-31 用户令"硬编码全部删除": 配方死写唯一入口,
+    #    原 QBIN_OVERRIDE/Q86_*/RPLAN86/VOLB86/DS4_* 穿三层脚本的 env 接力全拔) ══
+    local QBIN="$ROOT/gguf-tools/amp/ds4quant_run"
+    local Q_IDS="$D2/vqhalf_q.ids" Q_S=8192          # 量化半语料全量(256-token 块交错切半零重叠)
+    local Q_ANCHOR="$D2/anchor_vqhalf_q_s8192.bin"   # 量化半 FP 锚(与 ids 同源)
+    local Q_RPLAN="$ROOT/gguf/go-onebit/r30/rplan_base86p.txt"   # 平权计划表 vq4x512 2.25bpw ×43(全领域平权铁律)
+    local Q_VOLGIB=76      # blob 载荷预算闸(manifest 实账; 86G 模型的专家载荷上限)
+    local Q_BF_MEMGB=55    # fp16 层缓存 footprint 帽(121G spark; ★不等于 RSS★, 实测峰值 RSS ~95G)
+    local Q_CALIB_CAP=512  # 每专家校准行帽(08-18): H/g_r ∝行数, 512=4×过采样质量安全
+    local Q_THREADS=20     # 纯速度值(数值无关); champ86 08-28 实跑值
+    [ -s "$Q_IDS" ] && [ -s "$D2/vqhalf_a.ids" ] || DIE "两半语料 ids 缺"
+    [ -s "$Q_ANCHOR" ] || DIE "量化半锚缺"
     # ①平权量化 — 从头, 不复用任何既有层件
     if [ "$(ls "$W/layers"/dql_vq_L*.bin 2>/dev/null | wc -l)" != 43 ]; then
-        LOG "①平权量化发车(vq4x512 ×43 不动态, 量化半语料 S=8192)"
-        rm -rf "$W"; mkdir -p "$W"
-        export DS4_BF_MEMGB=55 DS4_CALIB_CAP=512 DS4_CALIB_EXPORT_CAP=512
-        export MALLOC_MMAP_THRESHOLD_=1073741824 MALLOC_TRIM_THRESHOLD_=1073741824
-        export OPENBLAS_NUM_THREADS=1 DS4_THREADS=20 DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-0731"
+        LOG "①平权量化发车(vq4x512 ×43 不动态, 量化半语料 S=$Q_S)"
+        rm -rf "$W"; mkdir -p "$W/layers" "$W/ckpt"
+        FREE=$(df -BG --output=avail "$D2" 2>/dev/null | tail -1 | tr -dc 0-9)
+        [ -n "$FREE" ] && [ "$FREE" -ge 75 ] || DIE "盘闸 free ${FREE:-?}G <75G"
         watchdog_start
-        if ! env QBIN_OVERRIDE="$ROOT/gguf-tools/amp/ds4quant_run" Q86_IDS="$D2/vqhalf_q.ids" \
-            Q86_S=8192 Q86_NFIT=8192 Q86_ANCHOR="$D2/anchor_vqhalf_q_s8192.bin" Q86_OUT="$W" \
-            RPLAN86="$ROOT/gguf/go-onebit/r30/rplan_base86p.txt" VOLB86=76 \
-            bash "$SC/r30_campaign.sh" quant86 >> "$W/quant.log" 2>&1; then
+        # MALLOC_*: glibc 自己的 env(mmap 锁争用根修 08-18 wchan 实锤), 不在 env 禁令内
+        if ! ( cd "$ROOT/gguf-tools/amp" && \
+            env MALLOC_MMAP_THRESHOLD_=1073741824 MALLOC_TRIM_THRESHOLD_=1073741824 \
+                OPENBLAS_NUM_THREADS=1 \
+            "$QBIN" "$Q_IDS" "$Q_S" \
+                --hf "$ROOT/hf/DeepSeek-V4-Flash-0731" --anchor "$Q_ANCHOR" \
+                --nfit "$Q_S" --threads "$Q_THREADS" --calib-fullset \
+                --minvol --mv-baseline --tune --pure-vq --vq --tgt-alpha 1.0 \
+                --vq-rplan "$Q_RPLAN" \
+                --bf-gain-gate 0.05 --plan "$W/plan.txt" --ckpt-dir "$W/ckpt" \
+                --layer-dir "$W/layers" --zfile "$W/zfile.bin" --zchain "$W/zchain.bin" \
+                --bf-memgb "$Q_BF_MEMGB" --calib-cap "$Q_CALIB_CAP" --calib-export-cap "$Q_CALIB_CAP" \
+            ) >> "$W/quant.log" 2>&1; then
             watchdog_stop; tail -8 "$W/quant.log"; DIE "平权量化失败"
         fi
         watchdog_stop
+        # 体积闸(manifest 实账, 语义=原 quant86 段 VOLB86)
+        if [ -f "$W/layers/manifest.txt" ]; then
+            TOTG=$(awk '{s+=$2} END{printf "%.3f", s/1073741824}' "$W/layers/manifest.txt")
+            awk -v t="$TOTG" -v b="$Q_VOLGIB" 'BEGIN{exit !(t>b)}' \
+                && DIE "体积闸: blob ${TOTG} GiB > 预算 ${Q_VOLGIB} GiB"
+            LOG "体积账: blob ${TOTG} GiB ≤ ${Q_VOLGIB} GiB ✓"
+        fi
+        [ "$(ls "$W/layers"/dql_L*.bin 2>/dev/null | wc -l)" = 43 ] || DIE "量化层不齐"
         LOG "①量化收官 $(ls "$W/layers"/dql_vq_L*.bin | wc -l)/43"
     else LOG "①平权量化已在 43/43, 跳过"; fi
     # ★量化态立刻备份(2026-08-28 用户令, 破坏前先保全铁律)★
@@ -776,10 +790,9 @@ stage_champ86(){
     # sweep 在 zlayer 内部就有(p5:50-54 秩网格逐秩算 held 取最大 / p5:48 落地闸 /
     # p7:141 不过闸写空 zrec), 不需要 ds4quant_run 那个"终局收敛 sweep" —— 后者正是
     # 08-29 产出 42 层过拟合标量增益(判决份四项全负)的来源。
-    LOG "②反修+sweep(冠军 zlayer 路 K=64; 行掩码从 vqhalf_a.ids.layout 读, 缺则硬停)"
-    SRCBASE=champ86/layers_quant bash "$SC/amp_clean_full.sh" \
-        champ86amp "" 64 "" "$D2/anchor_a_clean_s8192.bin" \
-        || DIE "冠军路反修失败"
+    # 反修配方(K/锚/底座/工作区)死写在 amp_clean_full.sh 常量区 —— 单一权威, 这里零传参。
+    LOG "②反修(冠军 zlayer 路; 配方见 amp_clean_full.sh 常量区; 行掩码从锚 .layout 读, 缺则硬停)"
+    bash "$SC/amp_clean_full.sh" || DIE "冠军路反修失败"
     # ★③sweep 已下链(2026-08-31 chain9 定谳, fable5)★: 部署真尺(g_bkl_live 抑制钉路)下
     # 逐单元真降不可组合(全 8192 行终验 0.74096→0.74271 劣化), GL/GE/z重解 op 族在
     # 跨语料闸落地前无净肉 —— 生产链只到 ②反修完成态(=③态交付物)。
@@ -874,7 +887,7 @@ stage_judge3(){
     for B in vq86h_noz "$V"; do
         [ -d "$D2/$B/layers" ] || continue
         LOG "尺: $B"
-        bash "$SC/caliper_ref.sh" "$D2/$B/layers" "/tmp/j3_$B.bin" 20 "" 2.5 "$JI" "$JA" \
+        bash "$SC/caliper_ref.sh" "$D2/$B/layers" "/tmp/j3_$B.bin" 20 "" "" "$JI" "$JA" \
             > "/tmp/j3_$B.log" 2>&1 || { LOG "$B 失败"; tail -3 "/tmp/j3_$B.log"; continue; }
         printf -- "── %s ──\n" "$B"
         grep -aE "PPL\(student\)|分布还原率|Mean KLD|Same top" "/tmp/j3_$B.log"
@@ -1158,7 +1171,7 @@ ST="${1:-all}"
 case "$ST" in
   preflight) stage_preflight;; ids) stage_ids;; anchor) stage_anchor;;
   capture) stage_capture;; probe) stage_probe;; solve) stage_solve;; pass2) stage_pass2;;
-  chain) stage_chain;; judge) stage_judge;; dilute) stage_dilute;; idshalf) stage_idshalf;; idshalf_ext) shift; stage_idshalf_ext "$@";; vqquant) stage_vqquant;; vqmerge) stage_vqmerge;; vqcap) stage_vqcap;; vqsolve) stage_vqsolve;; dynladder) stage_dynladder;; dynquant) shift; stage_dynquant "$@";; dynjudge) stage_dynjudge;; champbf) shift; stage_champbf "$@";; champ86) stage_champ86;; champreset) stage_champ_reset;; champ3rd) stage_champ3rd;; corpdiff) stage_corpdiff;; anchors3) stage_anchors3;; champ3) stage_champ3;; elmprobe) stage_elmprobe;; probe3) stage_probe3;; judge3) shift; stage_judge3 "$@";; champrb) stage_champ_rbsweep;; full) shift; stage_full "$@";;
+  chain) stage_chain;; judge) stage_judge;; dilute) stage_dilute;; idshalf) stage_idshalf;; idshalf_ext) shift; stage_idshalf_ext "$@";; vqmerge) stage_vqmerge;; vqcap) stage_vqcap;; vqsolve) stage_vqsolve;; dynladder) stage_dynladder;; dynquant) shift; stage_dynquant "$@";; dynjudge) stage_dynjudge;; champbf) shift; stage_champbf "$@";; champ86) stage_champ86;; champreset) stage_champ_reset;; champ3rd) stage_champ3rd;; corpdiff) stage_corpdiff;; anchors3) stage_anchors3;; champ3) stage_champ3;; elmprobe) stage_elmprobe;; probe3) stage_probe3;; judge3) shift; stage_judge3 "$@";; champrb) stage_champ_rbsweep;; full) shift; stage_full "$@";;
   all) stage_preflight; stage_ids; stage_anchor; stage_capture
        stage_solve; stage_chain; stage_judge;;
   *) echo "未知段: $ST"; echo "段: preflight ids anchor capture solve pass2 chain judge dilute all (probe/dilute=诊断)"; exit 2;;
