@@ -52,7 +52,8 @@ static int dq_vq_on(void){ return dq_vq_requested; }
 extern int vqg_ready(void);
 extern void vqg_assign(const float*,int,const float*,int,int,int*);
 extern int vqg_shm_ok(int nc,int dim);   /* GPU 可跑判定=共享内存真限额, 不是魔法数(见 vq_gpu.cu) */
-extern void vqg_gptq_group(float*,const float*,const double*,int,int,int,int,int,int*);
+extern void vqg_gptq_group(float*,const float*,const double*,int,int,int,int,int,int*,const float*);
+extern void vqg_gptq_full(float*,const float*,const double*,int,int,int,int,int,int,int*,const float*);
 #endif
 static void vq_assign_q(const float *V,int nv,int dim,const float *C,int nc,int *idx){
 #ifdef DS4QUANT_CUDA
@@ -110,6 +111,17 @@ static void vq_encode_full(const float *W,int rows,int cols,int dim,int nc,
     int *sidx=malloc((size_t)rows*sizeof(int));
     double *H=malloc((size_t)grp*grp*8),*Hi=malloc((size_t)grp*grp*8);
     float *XbT=(X&&n_act>0)?malloc((size_t)grp*n_act*4):NULL;
+    /* ★通道能量权(2026-08-31 巨值通道矿)★ s_j=E[x_j²]: 选码字距离从平权 L2 换成
+     * 输出误差口径 Σs_d(v−c)² —— 平权 VQ 抹零 massive 通道(10% 输出能量)的病根在
+     * 选码字, 官方 q2(imatrix 机理)裸 0.4207 < 我们整链 0.4397 实证此矿。X 就是
+     * GPTQ 已在用的校准行, 零新捕获。码本训练(kmeans)暂不加权=v1 改动面最小。 */
+    float *cw=NULL;
+    if(XbT){
+        cw=malloc((size_t)cols*4);
+        for(int j=0;j<cols;j++){ double s=0;
+            for(int t=0;t<n_act;t++){ double v=X[(size_t)t*cols+j]; s+=v*v; }
+            cw[j]=(float)(s/n_act)+1e-12f; }
+    }
     float *Wq=Wq_opt?Wq_opt:malloc(N*4); int own=Wq_opt?0:1;
 #ifdef DS4QUANT_CUDA
     /* v3 全矩阵批量(08-18): 组间独立 → 先算全部组 Hi(H cublas 逐组+CPU inv), 再一次
@@ -136,7 +148,7 @@ static void vq_encode_full(const float *W,int rows,int cols,int dim,int nc,
         static __thread int *sidx_f=NULL; static __thread int sf_cap=0;
         const int nsegs=cols/dim;
         if(sf_cap<rows*nsegs){ free(sidx_f); sidx_f=malloc((size_t)rows*nsegs*sizeof(int)); sf_cap=rows*nsegs; }
-        vqg_gptq_full(WkF,C,Hi_all,rows,cols,grp,dim,nc,fb_all,sidx_f);
+        vqg_gptq_full(WkF,C,Hi_all,rows,cols,grp,dim,nc,fb_all,sidx_f,cw);
         for(size_t i=0;i<(size_t)rows*nsegs;i++){
             const int c=sidx_f[i];
             idx_out[i]=c;
@@ -169,7 +181,7 @@ static void vq_encode_full(const float *W,int rows,int cols,int dim,int nc,
             const int nseg2=g/dim;
             static __thread int *sidx_g=NULL; static __thread int sg_cap=0;
             if(sg_cap<rows*nseg2){ free(sidx_g); sidx_g=malloc((size_t)rows*nseg2*sizeof(int)); sg_cap=rows*nseg2; }
-            vqg_gptq_group(Wk,C,Hi,rows,g,dim,nc,ok,sidx_g);
+            vqg_gptq_group(Wk,C,Hi,rows,g,dim,nc,ok,sidx_g,cw?cw+j0:NULL);
             for(int s2=0;s2<nseg2;s2++){ const int jj=s2*dim;
                 for(int r=0;r<rows;r++){ const int c=sidx_g[(size_t)r*nseg2+s2];
                     idx_out[((size_t)r*cols+j0+jj)/dim]=c;
@@ -179,7 +191,15 @@ static void vq_encode_full(const float *W,int rows,int cols,int dim,int nc,
 #endif
         for(int jj=0;jj+dim<=g;jj+=dim){
             for(int r=0;r<rows;r++) memcpy(seg+(size_t)r*dim,Wk+(size_t)r*g+jj,(size_t)dim*4);
-            vq_assign_q(seg,rows,dim,C,nc,sidx);
+            if(cw){ /* 加权选码字(与 GPU 核同式, 防两路静默分歧); 平权走 vq_assign_q 快路 */
+                const float *wv=cw+j0+jj;
+                for(int r=0;r<rows;r++){ const float *v=seg+(size_t)r*dim;
+                    float best=3.4e38f; int bi=0;
+                    for(int c=0;c<nc;c++){ const float *cb=C+(size_t)c*dim; float val=0.0f;
+                        for(int d=0;d<dim;d++){ const float dd=v[d]-cb[d]; val+=wv[d]*dd*dd; }
+                        if(val<best){best=val;bi=c;} }
+                    sidx[r]=bi; }
+            } else vq_assign_q(seg,rows,dim,C,nc,sidx);
             for(int r=0;r<rows;r++){
                 const float *q=C+(size_t)sidx[r]*dim;
                 idx_out[((size_t)r*cols+j0+jj)/dim]=sidx[r];
@@ -197,7 +217,7 @@ static void vq_encode_full(const float *W,int rows,int cols,int dim,int nc,
 #ifdef DS4QUANT_CUDA
 gptq_done:
 #endif
-    free(Wk);free(seg);free(sidx);free(H);free(Hi); if(XbT)free(XbT);
+    free(Wk);free(seg);free(sidx);free(H);free(Hi); if(XbT)free(XbT); if(cw)free(cw);
     /* 行乘子 g_r(闭式 ridge) + f16 往返 */
     if(X&&n_act>=8){
         float *P=malloc((size_t)n_act*rows*4),*Y=malloc((size_t)n_act*rows*4);

@@ -90,7 +90,8 @@ extern "C" void vqg_assign(const float *V, int nv, const float *C, int nc, int d
 __global__ static void vqg_gptq_rows_warp_kernel(
         float *__restrict__ Wk, const float *__restrict__ C,
         const float *__restrict__ Hi, int rows, int g, int dim, int nc, int fb,
-        int *__restrict__ sidx) {
+        int *__restrict__ sidx,
+        const float *__restrict__ colw) {   /* [g] 通道能量权; NULL=平权(旧径逐位同) */
     extern __shared__ float sh[];
     float *Cs = sh, *c2 = sh + nc * dim;          /* 码本 + |c|² */
     float *His = c2 + nc;                          /* [g,g] f32 (fb 时装载) */
@@ -112,12 +113,23 @@ __global__ static void vqg_gptq_rows_warp_kernel(
             const int jj = s * dim;
             float seg[VQG_MAX_DIM];
             for (int d = 0; d < dim; d++) seg[d] = wkr[jj + d];
+            /* ★通道能量加权选码字(2026-08-31 巨值通道矿)★ dist=Σ s_d(v−c)²:
+             * s_d=E[x²] ⇒ 输出误差口径的最优码字, 平权 L2 抹零 massive 通道的病根。
+             * 常数项 Σs·v² 不进 argmin; colw=NULL 走旧平权路逐位不变。 */
+            float ws[VQG_MAX_DIM], wseg[VQG_MAX_DIM];
+            if (colw) for (int d = 0; d < dim; d++) { ws[d] = colw[jj + d]; wseg[d] = ws[d] * seg[d]; }
             /* lane 分质心: 每 lane nc/32 个, 保序 argmin(先 val 后 idx = 全局首现) */
             float best = 3.4e38f; int bi = nc;
             for (int c = lane; c < nc; c += 32) {
-                float gd = 0.0f;
-                for (int d = 0; d < dim; d++) gd += seg[d] * Cs[c * dim + d];
-                float val = c2[c] - 2.0f * gd;
+                float val;
+                if (colw) {
+                    val = 0.0f;
+                    for (int d = 0; d < dim; d++) { const float cd = Cs[c * dim + d]; val += cd * (ws[d] * cd - 2.0f * wseg[d]); }
+                } else {
+                    float gd = 0.0f;
+                    for (int d = 0; d < dim; d++) gd += seg[d] * Cs[c * dim + d];
+                    val = c2[c] - 2.0f * gd;
+                }
                 if (val < best || (val == best && c < bi)) { best = val; bi = c; }
             }
             for (int off = 16; off > 0; off >>= 1) {
@@ -150,7 +162,8 @@ __global__ static void vqg_gptq_rows_kernel(
         const float *__restrict__ C,           /* [nc, dim] */
         const float *__restrict__ Hi,          /* [g, g] f32(double 转换) */
         int rows, int g, int dim, int nc, int fb,
-        int *__restrict__ sidx) {              /* [rows, g/dim] */
+        int *__restrict__ sidx,                /* [rows, g/dim] */
+        const float *__restrict__ colw) {      /* [g] 通道能量权; NULL=平权 */
     extern __shared__ float sh[];
     float *Cs = sh, *c2 = sh + nc * dim;
     for (int i = threadIdx.x; i < nc * dim; i += blockDim.x) Cs[i] = C[i];
@@ -169,11 +182,19 @@ __global__ static void vqg_gptq_rows_kernel(
         const int jj = s * dim;
         float seg[VQG_MAX_DIM];
         for (int d = 0; d < dim; d++) seg[d] = wkr[jj + d];
+        float ws[VQG_MAX_DIM], wseg[VQG_MAX_DIM];   /* 加权选码字, 见 warp 核注释 */
+        if (colw) for (int d = 0; d < dim; d++) { ws[d] = colw[jj + d]; wseg[d] = ws[d] * seg[d]; }
         float best = 3.4e38f; int bi = 0;
         for (int c = 0; c < nc; c++) {
-            float gd = 0.0f;
-            for (int d = 0; d < dim; d++) gd += seg[d] * Cs[c * dim + d];
-            float val = c2[c] - 2.0f * gd;
+            float val;
+            if (colw) {
+                val = 0.0f;
+                for (int d = 0; d < dim; d++) { const float cd = Cs[c * dim + d]; val += cd * (ws[d] * cd - 2.0f * wseg[d]); }
+            } else {
+                float gd = 0.0f;
+                for (int d = 0; d < dim; d++) gd += seg[d] * Cs[c * dim + d];
+                val = c2[c] - 2.0f * gd;
+            }
             if (val < best) { best = val; bi = c; }
         }
         sidx[(size_t)r * nseg + s] = bi;
@@ -199,7 +220,8 @@ __global__ static void vqg_gptq_full_kernel(
         const float *__restrict__ C,
         const float *__restrict__ Hi_all,     /* [ngrp, g, g] f32; NULL=无反馈 */
         int rows, int cols, int grp, int dim, int nc,
-        int *__restrict__ sidx) {             /* [rows, cols/dim] */
+        int *__restrict__ sidx,               /* [rows, cols/dim] */
+        const float *__restrict__ colw) {     /* [cols] 通道能量权; NULL=平权 */
     extern __shared__ float sh[];
     float *Cs = sh, *c2 = sh + nc * dim;
     for (int i = threadIdx.x; i < nc * dim; i += blockDim.x) Cs[i] = C[i];
@@ -224,11 +246,19 @@ __global__ static void vqg_gptq_full_kernel(
             const int jj = s * dim;
             float seg[VQG_MAX_DIM];
             for (int d = 0; d < dim; d++) seg[d] = wkr[jj + d];
+            float ws[VQG_MAX_DIM], wseg[VQG_MAX_DIM];   /* 加权选码字, 见 warp 核注释 */
+            if (colw) for (int d = 0; d < dim; d++) { ws[d] = colw[j0 + jj + d]; wseg[d] = ws[d] * seg[d]; }
             float best = 3.4e38f; int bi = nc;
             for (int c = lane; c < nc; c += 32) {
-                float gd = 0.0f;
-                for (int d = 0; d < dim; d++) gd += seg[d] * Cs[c * dim + d];
-                float val = c2[c] - 2.0f * gd;
+                float val;
+                if (colw) {
+                    val = 0.0f;
+                    for (int d = 0; d < dim; d++) { const float cd = Cs[c * dim + d]; val += cd * (ws[d] * cd - 2.0f * wseg[d]); }
+                } else {
+                    float gd = 0.0f;
+                    for (int d = 0; d < dim; d++) gd += seg[d] * Cs[c * dim + d];
+                    val = c2[c] - 2.0f * gd;
+                }
                 if (val < best || (val == best && c < bi)) { best = val; bi = c; }
             }
             for (int off = 16; off > 0; off >>= 1) {
@@ -255,9 +285,19 @@ __global__ static void vqg_gptq_full_kernel(
     }
 }
 
+/* colw 设备缓存: 每矩阵一次 [cols] 上传(≤16KB), 线程私有随用随长 */
+static __thread float *g_colw_d = NULL;
+static __thread int g_colw_cap = 0;
+static const float *vqg_colw_up(const float *colw_h, int n) {
+    if (!colw_h) return NULL;
+    if (g_colw_cap < n) { if (g_colw_d) cudaFree(g_colw_d); if (cudaMalloc((void **)&g_colw_d, (size_t)n * sizeof(float)) != cudaSuccess) { g_colw_d = NULL; g_colw_cap = 0; return NULL; } g_colw_cap = n; }
+    if (cudaMemcpy(g_colw_d, colw_h, (size_t)n * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) return NULL;
+    return g_colw_d;
+}
+
 extern "C" void vqg_gptq_full(float *Wk, const float *C, const double *Hi_all_d,
                               int rows, int cols, int grp, int dim, int nc,
-                              int has_fb, int *sidx) {
+                              int has_fb, int *sidx, const float *colw_h) {
     static __thread float *hi_f = NULL;
     static __thread int hi_cap = 0;
     const int ngrp = (cols + grp - 1) / grp;
@@ -266,33 +306,36 @@ extern "C" void vqg_gptq_full(float *Wk, const float *C, const double *Hi_all_d,
         if (hi_cap < need) { if (hi_f) cudaFreeHost(hi_f); cudaMallocHost((void **)&hi_f, (size_t)need * sizeof(float)); hi_cap = need; }
         for (int i = 0; i < need; i++) hi_f[i] = (float)Hi_all_d[i];
     }
+    const float *cw_d = vqg_colw_up(colw_h, cols);
     cudaStream_t st = vqg_stream();
     size_t shm = (size_t)(nc * dim + nc) * sizeof(float);
     dim3 grid((rows + 3) / 4, ngrp);
     vqg_gptq_full_kernel<<<grid, 128, shm, st>>>(
-        Wk, C, has_fb ? hi_f : NULL, rows, cols, grp, dim, nc, sidx);
+        Wk, C, has_fb ? hi_f : NULL, rows, cols, grp, dim, nc, sidx, cw_d);
     cudaStreamSynchronize(st);
 }
 
 extern "C" void vqg_gptq_group(float *Wk, const float *C, const double *Hi_d,
-                               int rows, int g, int dim, int nc, int has_fb, int *sidx) {
+                               int rows, int g, int dim, int nc, int has_fb, int *sidx,
+                               const float *colw_h) {
     static __thread float *hi_f = NULL;
     static __thread int hi_cap = 0;
     if (has_fb) {
         if (hi_cap < g * g) { if (hi_f) cudaFreeHost(hi_f); cudaMallocHost((void **)&hi_f, (size_t)g * g * sizeof(float)); hi_cap = g * g; }
         for (int i = 0; i < g * g; i++) hi_f[i] = (float)Hi_d[i];
     }
+    const float *cw_d = vqg_colw_up(colw_h, g);
     cudaStream_t st = vqg_stream();
     size_t shm2 = (size_t)(nc * dim + nc + (has_fb ? g * g : 0)) * sizeof(float);
     if (shm2 <= 96 * 1024) {   /* warp 版: Hi 进 shared(128²×4=64KB, GB10 上限内) */
         static int attr_set = 0;
         if (!attr_set) { cudaFuncSetAttribute(vqg_gptq_rows_warp_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024); attr_set = 1; }
         vqg_gptq_rows_warp_kernel<<<(rows + 3) / 4, 128, shm2, st>>>(
-            Wk, C, has_fb ? hi_f : NULL, rows, g, dim, nc, has_fb, sidx);
+            Wk, C, has_fb ? hi_f : NULL, rows, g, dim, nc, has_fb, sidx, cw_d);
     } else {
         size_t shm = (size_t)(nc * dim + nc) * sizeof(float);
         vqg_gptq_rows_kernel<<<(rows + 127) / 128, 128, shm, st>>>(
-            Wk, C, has_fb ? hi_f : NULL, rows, g, dim, nc, has_fb, sidx);
+            Wk, C, has_fb ? hi_f : NULL, rows, g, dim, nc, has_fb, sidx, cw_d);
     }
     cudaStreamSynchronize(st);
 }
