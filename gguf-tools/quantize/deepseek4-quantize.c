@@ -10,6 +10,7 @@
  * p5: gguf 元数据加载 + MTP 追加 + zchain 载入 + 输出上下文构建
  * p6: write_full_gguf 全量写出 + plan 打印 + usage/parse_args + main
  */
+#include "../../src/common/ds4_amp_fmt.h"   /* z 秩上限等反修契约(单一定义源) */
 #include "deepseek4-quantize_p1.inc.c"
 #include "deepseek4-quantize_p2.inc.c"
 #include "deepseek4-quantize_p3.inc.c"

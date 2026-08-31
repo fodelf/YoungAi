@@ -153,16 +153,22 @@ static int build_opt_tensors(const char *dql_dir, int L, elist_t *out) {
                     if (strstr(nm, "zl.RRR") && psz >= 16) {
                         uint8_t *pay = xmalloc((size_t)psz);
                         size_t pn = fread(pay, 1, (size_t)psz, f);
-                        if (pn < 8) die("struct.error: unpack_from requires a buffer of at least 8 bytes");
-                        uint32_t zk; float tr; memcpy(&zk, pay, 4); memcpy(&tr, pay + 4, 4);
-                        uint64_t nh = (uint64_t)zk + 2ULL * zk * 4096;
-                        if (zk > 0 && zk <= 16 && pn >= 16 + nh * 2) {
-                            float row[16]; memset(row, 0, sizeof row);
-                            row[0] = 6.0f; row[1] = tr; row[2] = (float)zk;
-                            chain_add(&chain, row);
-                            zlm_len = (size_t)(nh * 2); zlm = xmalloc(zlm_len);
-                            memcpy(zlm, pay + 16, zlm_len);
-                        }
+                        if (pn < 16) die("struct.error: zl.RRR 头截断(<16B)");
+                        /* 尺寸按载荷自述 din/dout 算(旧版写死 din=dout=4096 且 zk<=16:
+                         * ftA 载荷 V 被截 1/3, 冠军 k=64 直接静默丢 —— 判的模型≠部署的模型)。 */
+                        uint32_t zk, din, dout; float tr;
+                        memcpy(&zk, pay, 4); memcpy(&tr, pay + 4, 4);
+                        memcpy(&din, pay + 8, 4); memcpy(&dout, pay + 12, 4);
+                        uint64_t nh = (uint64_t)zk + (uint64_t)zk * dout + (uint64_t)zk * din;
+                        if (!(zk > 0 && zk <= DS4_AMP_ZK_MAX && dout == 4096u
+                              && (din == dout || din == 3u * dout) && pn >= 16 + nh * 2))
+                            die("zl.RRR L%d 记录非法: k=%u din=%u dout=%u pn=%zu need=%llu — 拒绝静默丢放大器",
+                                L, zk, din, dout, pn, (unsigned long long)(16 + nh * 2));
+                        float row[16]; memset(row, 0, sizeof row);
+                        row[0] = 6.0f; row[1] = tr; row[2] = (float)zk; row[3] = (float)din;
+                        chain_add(&chain, row);
+                        zlm_len = (size_t)(nh * 2); zlm = xmalloc(zlm_len);
+                        memcpy(zlm, pay + 16, zlm_len);
                         free(pay);
                         break;
                     }

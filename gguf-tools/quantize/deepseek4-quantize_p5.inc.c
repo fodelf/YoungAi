@@ -275,17 +275,23 @@ static int zchain_in_load(const char *path) {
                 memcpy(&zk, pay, 4); memcpy(&tr, pay + 4, 4);
                 memcpy(&din, pay + 8, 4); memcpy(&dout, pay + 12, 4);
                 size_t nh = (size_t)zk + (size_t)zk * din + (size_t)zk * dout;
-                if (zk > 0 && zk <= 64 && din == dout && psz >= 16 + nh * 2) {
-                    if (!g_zc.d_model) g_zc.d_model = (int)din;
-                    if ((int)din != g_zc.d_model) die("zchain zl d_model mismatch");
-                    float *f = ch + (size_t)oi * 16;
-                    f[0] = 6.0f; f[1] = tr; f[2] = (float)zk; f[15] = 0.0f;
-                    free(g_zc.zlm[L]);
-                    g_zc.zlm[L] = xmalloc(nh * 2);
-                    memcpy(g_zc.zlm[L], pay + 16, nh * 2);
-                    g_zc.zlm_ne[L] = (uint32_t)nh;
-                    oi++;
+                /* 旧闸 zk<=64 && din==dout 会把冠军级秩/ftA(din=3D)记录静默丢掉:
+                 * 合出的 GGUF 少放大器还不吭声。契约=zk≤1024, din∈{D,3D}, d_model 取 dout。 */
+                if (!(zk > 0 && zk <= DS4_AMP_ZK_MAX && (din == dout || din == 3u * dout)
+                      && psz >= 16 + nh * 2)) {
+                    fprintf(stderr, "zchain zl 记录非法: k=%u din=%u dout=%u psz=%u need=%zu\n",
+                            zk, din, dout, psz, (size_t)16 + nh * 2);
+                    die("zchain zl record invalid");
                 }
+                if (!g_zc.d_model) g_zc.d_model = (int)dout;
+                if ((int)dout != g_zc.d_model) die("zchain zl d_model mismatch");
+                float *f = ch + (size_t)oi * 16;
+                f[0] = 6.0f; f[1] = tr; f[2] = (float)zk; f[3] = (float)din; f[15] = 0.0f;
+                free(g_zc.zlm[L]);
+                g_zc.zlm[L] = xmalloc(nh * 2);
+                memcpy(g_zc.zlm[L], pay + 16, nh * 2);
+                g_zc.zlm_ne[L] = (uint32_t)nh;
+                oi++;
             } else if (ty == 5u && psz >= 2) {   /* GE: 取最后一条(量化器回放口径) */
                 int ne = (int)(psz / 2);
                 if (!g_zc.n_expert) g_zc.n_expert = ne;

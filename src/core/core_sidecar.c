@@ -1,5 +1,6 @@
 /* core_sidecar.c — residual/vq/zchain 侧车加载与 GPU 上载 (机械拆分自 ds4.c, 重构阶段4)。 */
 #include "core_internal.h"
+#include "src/common/ds4_amp_fmt.h"   /* z 秩上限: 与工具/CUDA 同一契约 */
 /* =========================================================================
  * go1b "hidden variable z^L" four-loss correction sidecar.
  * =========================================================================
@@ -189,13 +190,23 @@ struct ds4_zchain *zchain_from_model(const ds4_model *m) {
                         }
                         o->v8 = v8 + (size_t)blk * 8u * DS4_N_EMBD;
                     }
-                    if (o->type == 6u) {   /* 冻结 z^L: 槽{f[1]=tr,f[2]=k} + opt_zlm 张量; 不进 λ 链 */
+                    if (o->type == 6u) {   /* 冻结 z^L: 槽{f[1]=tr,f[2]=k,f[3]=din} + opt_zlm 张量; 不进 λ 链 */
                         const uint32_t zk = (uint32_t)f[2];
-                        const uint64_t nh = (uint64_t)zk + 2ull * zk * DS4_N_EMBD;
-                        if (zk > 0 && zk <= 1024 && zlm && (tzl ? tzl->dim[0] : 0) >= nh) {
+                        /* f[3]=V 输入维: 旧 GGUF 写者不填(0)=线性 din=D; 3D=ftA 特征提升。
+                         * 旧公式写死 din=D, ftA 载荷会被按错布局静默别解 —— 尺寸按真 din 算。 */
+                        const uint32_t din = f[3] > 0.0f ? (uint32_t)f[3] : DS4_N_EMBD;
+                        const uint64_t nh = (uint64_t)zk * (1ull + DS4_N_EMBD + din);
+                        if (zk > 0 && zk <= DS4_AMP_ZK_MAX
+                            && (din == DS4_N_EMBD || din == 3u * DS4_N_EMBD)
+                            && zlm && (tzl ? tzl->dim[0] : 0) >= nh) {
                             z->layer[il].zl.zlk = zk;
                             z->layer[il].zl.zltr = f[1];
+                            z->layer[il].zl.zdin = din;
                             z->layer[il].zl.zlm = zlm;   /* aliases model mmap */
+                        } else {
+                            fprintf(stderr, "ds4: zchain L%u z^L dropped: k=%u din=%u zlm_ne=%llu need=%llu\n",
+                                    il, zk, din, (unsigned long long)(tzl ? tzl->dim[0] : 0),
+                                    (unsigned long long)nh);
                         }
                         continue;
                     }
