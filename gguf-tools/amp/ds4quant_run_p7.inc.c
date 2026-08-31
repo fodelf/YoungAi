@@ -205,6 +205,17 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
                 if(L<NL&&GBL_G[L]!=1.0f) for(size_t i=0;i<(size_t)S*DIM;i++) Fout[i]=shb[i]+GBL_G[L]*(Fout[i]-shb[i]);
             } else fprintf(stderr,"[B] 层文件 %s 读失败 — Fout 只含 shared\n",lp);
         }
+        /* ★fp-oracle 上界探针(2026-08-31)★ 逐层把 routed 换成 FP 专家@链态Fin(部署路由)。
+         * 回答一个判决性问题: 若逐层输出空间修正做到 100%(任何形态族的天花板), 端到端
+         * 还剩多少误差 —— 剩的就是 routed 之外(attn/压缩KV/累积态)的账。读数≠模型。 */
+        if(g_cli.fp_oracle){
+            float *lt=malloc((size_t)S*DIM*4);
+            bf_fp_routed(L,Fin,idx,rw,S,lt);
+            for(size_t i=0;i<(size_t)S*DIM;i++) Fout[i]=shb[i]+lt[i];
+            free(lt);
+            static int on1=0; if(!on1){ on1=1;
+                fprintf(stderr,"[fp-oracle] ★上界探针武装: 逐层 routed←FP@链态(部署路由), 读数是天花板不是模型★\n"); }
+        }
         /* ★守卫必须与唯一消费者(下方 z 解算块 + 343 行 memcpy)对齐★(2026-08-28 实锤 bug)
          * 原守卫只有 LZRANK>0&&do_quant, 而消费者还要 ANC_OK && cfg!='F' && !zrec_done。
          * 后果: 推进段跑完 43 层全有 zrec ⇒ sweep 里消费者一次都不执行, 生产者却每层每次
