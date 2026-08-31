@@ -312,7 +312,11 @@ server_config parse_options(int argc, char **argv) {
             ds4_tool_set_prefill_chunk(parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg));
         } else if (!strcmp(arg, "--batch")) {
             c.batch_max = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
-            if (c.batch_max > DS4_SERVER_BATCH_LANES) c.batch_max = DS4_SERVER_BATCH_LANES;
+            if (c.batch_max > DS4_SERVER_BATCH_LANES) {
+                fprintf(stderr, "ds4-server: --batch %d exceeds lane cap, clamped to %d\n",
+                        c.batch_max, DS4_SERVER_BATCH_LANES);   /* 静默钳=用户以为开了更多路 */
+                c.batch_max = DS4_SERVER_BATCH_LANES;
+            }
         } else if (!strcmp(arg, "--base-native")) {
             g_base_native = 1;
         } else if (!strcmp(arg, "--primer-compact")) {
@@ -374,6 +378,11 @@ server_config parse_options(int argc, char **argv) {
             c.disable_exact_dsml_tool_replay = true;
         } else if (!strcmp(arg, "--tool-memory-max-ids")) {
             c.tool_memory_max_ids = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            if (c.tool_memory_max_ids <= 0) {   /* 旧行为: 0 被 getter 静默兜回默认 100000 */
+                fprintf(stderr, "ds4-server: --tool-memory-max-ids must be > 0 (got %d); "
+                                "0 does not mean unlimited\n", c.tool_memory_max_ids);
+                exit(1);
+            }
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
         } else if (!strcmp(arg, "--power")) {

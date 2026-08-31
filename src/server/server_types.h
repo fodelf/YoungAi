@@ -82,6 +82,12 @@
  * 8 = 单 graph worker 上稀疏 MoE tile 欠填的聚合甜点(见 request-batching 设计)。 */
 #define DS4_SERVER_BATCH_LANES 8
 
+/* 工具 id 前缀: 它是 DSML 精确重放表的键(id → 采样原字节), 生成与重渲染两侧
+ * 必须同前缀 —— 原来三处手写字符串, 改一处漏一处 = 重放查不到, 重渲染 prompt
+ * 与活 KV 不再逐字节匹配。 */
+#define DS4_TOOL_ID_PREFIX_ANTHROPIC "toolu_"
+#define DS4_TOOL_ID_PREFIX_OPENAI    "call_"
+
 /* 合批出队前的聚集窗口: 首请求到达后再等这么久收拢同型请求, 换 tile 填充率。 */
 #define DS4_SERVER_BATCH_WAIT_MS 60
 

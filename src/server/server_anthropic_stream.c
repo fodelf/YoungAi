@@ -234,7 +234,7 @@ static bool anthropic_sse_tool_blocks_live(int fd, const request *r, const char 
     for (int i = already_streamed; i < calls->len; i++, st->next_index++) {
         const tool_call *tc = &calls->v[i];
         char idbuf[128];
-        snprintf(idbuf, sizeof(idbuf), "toolu_%s_%d", id, i);
+        snprintf(idbuf, sizeof(idbuf), DS4_TOOL_ID_PREFIX_ANTHROPIC "%s_%d", id, i);
         buf_printf(&b,
                    "{\"type\":\"content_block_start\",\"index\":%d,"
                    "\"content_block\":{\"type\":\"tool_use\",\"id\":",

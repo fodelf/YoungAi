@@ -12,7 +12,7 @@ static void append_anthropic_tool_use(buf *b, const tool_call *tc, const char *i
                                       const tool_schema_orders *orders) {
     (void)orders;
     char idbuf[128];
-    snprintf(idbuf, sizeof(idbuf), "toolu_%s_%d", id_prefix, i);
+    snprintf(idbuf, sizeof(idbuf), DS4_TOOL_ID_PREFIX_ANTHROPIC "%s_%d", id_prefix, i);
     buf_puts(b, "{\"type\":\"tool_use\",\"id\":");
     json_escape(b, tc->id && tc->id[0] ? tc->id : idbuf);
     buf_puts(b, ",\"name\":");

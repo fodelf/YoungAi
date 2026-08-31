@@ -396,6 +396,8 @@ typedef struct {
  * continuation of `parameter name="file_path">` is a documentation-style
  * placeholder ($FILE_PATH) — constraining decode turns "copy the value"
  * from a probability hope into a structural guarantee (fable5 判决链). */
+/* 候选位置容量: 超过即停止搜集(server_primer.c 会打一次性 warning)。截断的后果
+ * 不是崩, 而是位置集不全 → 可行续写被误判 infeasible → 走 best-logit 另选 token。 */
 #define PRIMER_COPY_MAX_POS 64
 
 typedef struct {

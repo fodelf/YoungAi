@@ -18,7 +18,17 @@ static bool primer_copy_extends(const primer_copy *cm, const char *t, size_t tl,
     if (!cm->started) {
         const char *hay = cm->src;
         size_t left = cm->len;
-        while (left >= tl && n < PRIMER_COPY_MAX_POS) {
+        /* 位置集截断可见化: 静默截断会把可行续写误判 infeasible → 换 token */
+        while (left >= tl) {
+            if (n >= PRIMER_COPY_MAX_POS) {
+                static bool primer_warned = false;
+                if (!primer_warned) {
+                    primer_warned = true;
+                    fprintf(stderr, "ds4-server: primer copy positions hit cap %d, truncated (warned once)\n",
+                            PRIMER_COPY_MAX_POS);
+                }
+                break;
+            }
             const char *hit = memmem(hay, left, t, tl);
             if (!hit) break;
             size_t off = (size_t)(hit - cm->src);
@@ -29,6 +39,7 @@ static bool primer_copy_extends(const primer_copy *cm, const char *t, size_t tl,
             left -= adv;
         }
     } else {
+        /* 已 started 路径: 输入 n_pos 本身 ≤ 上限(首轮搜集已截断并警告过), 此处不会再截 */
         for (int i = 0; i < cm->n_pos && n < PRIMER_COPY_MAX_POS; i++) {
             size_t o = cm->pos[i];
             if (o + tl <= cm->len && memcmp(cm->src + o, t, tl) == 0)

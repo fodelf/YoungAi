@@ -5,7 +5,7 @@
 void random_tool_id(char *dst, size_t dstlen, api_style api) {
     static uint64_t fallback_ctr;
     unsigned char bytes[16];
-    const char *prefix = api == API_ANTHROPIC ? "toolu_" : "call_";
+    const char *prefix = api == API_ANTHROPIC ? DS4_TOOL_ID_PREFIX_ANTHROPIC : DS4_TOOL_ID_PREFIX_OPENAI;
     size_t pos = snprintf(dst, dstlen, "%s", prefix);
     if (pos >= dstlen) return;
 

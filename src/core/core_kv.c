@@ -23,6 +23,9 @@ uint32_t ds4_default_raw_cap(uint32_t ctx_size) {
  * 的配置(42 t/s), 小块反而快。加了 token 分片 GEMM(激活按 tile 进 shared, 块内共用)之后
  * 大块重新变优: 实测 3800 token prompt chunk=128 119 / 256 **123** / 512 116 t/s。
  * 分片 kernel 与原路逐位一致(NLL 与 max|Δlogit| 均为 0 差)。Metal 侧保持原行为。 */
+/* 默认 prefill 分块上限: 影响批 prefill 的切分边界, 而批路路由本就不确定 —— 改它
+ * 会改捕获轨迹的可复现性(见 memory 捕获铁律), 不是单纯的性能旋钮。 */
+#define DS4_PREFILL_CHUNK_DEFAULT 4096u
 uint32_t ds4_default_prefill_cap_for_prompt(int prompt_len) {
     if (prompt_len <= 0) return 1;
     uint32_t cap = (uint32_t)prompt_len;
@@ -33,8 +36,8 @@ uint32_t ds4_default_prefill_cap_for_prompt(int prompt_len) {
         cap = (uint32_t)req;
     } else if (g_prefill_chunk_cuda > 0) {
         cap = (uint32_t)g_prefill_chunk_cuda;
-    } else if (prompt_len > 4096) {
-        cap = 4096u;
+    } else if (prompt_len > DS4_PREFILL_CHUNK_DEFAULT) {
+        cap = DS4_PREFILL_CHUNK_DEFAULT;
     }
 
     if (cap == 0) cap = 1;

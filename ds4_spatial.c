@@ -234,7 +234,7 @@ int ds4_ui_stack(const ds4_ui_scene *s, const int *kids, int n,
     }
     /* row: re-check in x order (reading order sorts x within equal y only) */
     int xo[64];
-    if (n > 64) return 0;
+    if (n > 64) return 0;   /* 上限来自 xo[64] 栈数组: 超限=判定"无法确认横排", 非错误 */
     memcpy(xo, kids, (size_t)n * sizeof(*kids));
     for (int i = 1; i < n; i++) {   /* insertion sort by x */
         const int v = xo[i];

@@ -258,11 +258,22 @@ int sample_top_p_min_p(
     if (top_p <= 0.0f || top_p > 1.0f) top_p = 1.0f;
     if (min_p < 0.0f) min_p = 0.0f;
     if (top_k <= 0) return sample_full_vocab(logits, n_vocab, temperature, top_p, min_p, rng);
-    if (top_k > 1024) top_k = 1024;
+    /* 上限=栈数组容量。客户端 JSON 的 top_k 直达这里且上游零校验, 静默截断=引擎
+     * 擅自改采样分布(铁律禁) —— 至少让截断可见(打一次)。 */
+    #define DS4_SAMPLE_TOPK_MAX 1024
+    if (top_k > DS4_SAMPLE_TOPK_MAX) {
+        static bool topk_warned = false;
+        if (!topk_warned) {
+            topk_warned = true;
+            fprintf(stderr, "ds4: top_k %d exceeds cap %d, clamped (warned once)\n",
+                    top_k, DS4_SAMPLE_TOPK_MAX);
+        }
+        top_k = DS4_SAMPLE_TOPK_MAX;
+    }
     if ((uint32_t)top_k > n_vocab) top_k = (int)n_vocab;
 
-    int ids[1024];
-    float vals[1024];
+    int ids[DS4_SAMPLE_TOPK_MAX];
+    float vals[DS4_SAMPLE_TOPK_MAX];
     int n = 0;
     for (uint32_t i = 0; i < n_vocab; i++) {
         float v = logits[i];
