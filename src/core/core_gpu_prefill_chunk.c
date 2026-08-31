@@ -153,14 +153,8 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size
         m.prefill_cap = metal_graph_prefill_cap_for_prompt((int)ctx);
         m.raw_cap = metal_graph_raw_cap_for_context((int)ctx, m.prefill_cap);
 
-        uint32_t min_ratio = UINT32_MAX;
-        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-            const uint32_t ratio = ds4_layer_compress_ratio(il);
-            if (ratio != 0 && ratio < min_ratio) min_ratio = ratio;
-        }
-        if (min_ratio == UINT32_MAX) min_ratio = ctx;
-        m.comp_cap = ctx / min_ratio + 2u;
-        if (m.comp_cap < 2u) m.comp_cap = 2u;
+        const uint32_t min_ratio = ds4_min_compress_ratio(ctx);
+        m.comp_cap = ds4_comp_cap_for(ctx, min_ratio);
 
         m.raw_bytes = (uint64_t)DS4_N_LAYER *
                       m.raw_cap *
@@ -169,7 +163,7 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
             const uint32_t ratio = ds4_layer_compress_ratio(il);
             if (ratio == 0) continue;
-            const uint32_t layer_comp_cap = ctx / ratio + 2u;
+            const uint32_t layer_comp_cap = ds4_comp_cap_for(ctx, ratio);
             m.compressed_bytes += (uint64_t)layer_comp_cap *
                                   DS4_N_HEAD_DIM *
                                   (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
@@ -179,8 +173,7 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size
                                       sizeof(float);
             }
         }
-        uint64_t attn_stage_cap = (uint64_t)(m.prefill_cap / min_ratio + 2u);
-        if (attn_stage_cap < 2u) attn_stage_cap = 2u;
+        const uint64_t attn_stage_cap = ds4_comp_cap_for(m.prefill_cap, min_ratio);
         m.scratch_bytes = 2ull *
                           m.comp_cap *
                           m.prefill_cap *
@@ -195,7 +188,7 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
             const uint32_t ratio = ds4_layer_compress_ratio(il);
             if (ratio == 0) continue;
-            const uint32_t comp_cap = ctx / ratio + 2u;
+            const uint32_t comp_cap = ds4_comp_cap_for(ctx, ratio);
             if (ratio == 4) m.comp_cap = comp_cap;
             m.compressed_bytes += (uint64_t)comp_cap *
                                   DS4_N_HEAD_DIM *
@@ -206,7 +199,7 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size
                                       sizeof(float);
             }
         }
-        if (m.comp_cap == 0) m.comp_cap = ctx / 4u + 2u;
+        if (m.comp_cap == 0) m.comp_cap = ds4_comp_cap_for(ctx, 4);   /* 4 = 最小压缩比上界 */
         m.scratch_bytes = ((uint64_t)(m.raw_cap + m.comp_cap) * sizeof(float)) +
                           ((uint64_t)m.comp_cap * sizeof(float)) +
                           ((uint64_t)m.comp_cap * sizeof(bool));

@@ -227,7 +227,7 @@ bool metal_graph_encode_layer_attention_batch_stages(
         }
         if (ok) batch_attention_done = true;
     } else if (ok && ratio != 0) {
-        const uint32_t coff = ratio == 4 ? 2u : 1u;
+        const uint32_t coff = ds4_comp_row_slots(ratio);
         const uint32_t comp_width = coff * DS4_N_HEAD_DIM;
         const bool have_attn_comp = layer->attn_compressor_kv && layer->attn_compressor_gate &&
                                     layer->attn_compressor_ape && layer->attn_compressor_norm;

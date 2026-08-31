@@ -290,8 +290,7 @@ void weights_validate_layout(const ds4_model *m, const ds4_weights *w) {
         tensor_expect_layout(l->attn_output_b,  l->attn_output_b && (l->attn_output_b->type == DS4_TENSOR_Q4_K || l->attn_output_b->type == DS4_TENSOR_Q2_K) ? l->attn_output_b->type : DS4_TENSOR_Q8_0, 2, out_low_dim, DS4_N_EMBD, 0);
 
         if (ratio != 0) {
-            const uint32_t coff = ratio == 4 ? 2u : 1u;
-            const uint64_t comp_width = (uint64_t)coff * DS4_N_HEAD_DIM;
+            const uint64_t comp_width = ds4_comp_row_width(ratio, DS4_N_HEAD_DIM);
             tensor_expect_f16_q2(m, l->attn_compressor_ape, comp_width, ratio);
             tensor_expect_f16_q2(m, l->attn_compressor_kv, DS4_N_EMBD, comp_width);
             tensor_expect_f16_q2(m, l->attn_compressor_gate, DS4_N_EMBD, comp_width);

@@ -119,7 +119,7 @@ bool metal_graph_spec_comp_fastforward(ds4_gpu_graph *g, const ds4_model *model,
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
         const ds4_layer_weights *layer = &weights->layer[il];
-        const uint32_t coff = ratio == 4 ? 2u : 1u;
+        const uint32_t coff = ds4_comp_row_slots(ratio);
         const uint32_t comp_width = coff * DS4_N_HEAD_DIM;
         const float freq_base = layer_rope_freq_base(il);
         const float freq_scale = layer_rope_freq_scale(il);

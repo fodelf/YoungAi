@@ -67,25 +67,16 @@ bool metal_graph_alloc_raw_cap(
     g->raw_cap = raw_cap;
     g->raw_window = raw_window;
     g->prefill_cap = prefill_cap;
-    uint32_t min_ratio = UINT32_MAX;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        const uint32_t ratio = ds4_layer_compress_ratio(il);
-        if (ratio != 0 && ratio < min_ratio) min_ratio = ratio;
-    }
-    if (min_ratio == UINT32_MAX) min_ratio = ctx_size ? ctx_size : 1u;
-    g->comp_cap = ctx_size / min_ratio + 2u;
-    if (g->comp_cap < 2u) g->comp_cap = 2u;
-    if (DS4_GPU_ATTN_COMP_CACHE_F16) {
-        g->attn_comp_stage_cap = prefill_cap / min_ratio + 2u;
-        if (g->attn_comp_stage_cap < 2u) g->attn_comp_stage_cap = 2u;
-    }
+    const uint32_t min_ratio = ds4_min_compress_ratio(ctx_size);
+    g->comp_cap = ds4_comp_cap_for(ctx_size, min_ratio);
+    if (DS4_GPU_ATTN_COMP_CACHE_F16)
+        g->attn_comp_stage_cap = ds4_comp_cap_for(prefill_cap, min_ratio);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) {
             g->layer_comp_cap[il] = 0;
         } else {
-            g->layer_comp_cap[il] = ctx_size / ratio + 2u;
-            if (g->layer_comp_cap[il] < 2u) g->layer_comp_cap[il] = 2u;
+            g->layer_comp_cap[il] = ds4_comp_cap_for(ctx_size, ratio);
         }
     }
 
@@ -155,7 +146,7 @@ bool metal_graph_alloc_raw_cap(
                 (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio != 0) {
-            const uint32_t coff = ratio == 4 ? 2u : 1u;
+            const uint32_t coff = ds4_comp_row_slots(ratio);
             const uint64_t attn_width = (uint64_t)coff * DS4_N_HEAD_DIM;
             const uint64_t attn_rows = (uint64_t)coff * ratio;
             g->layer_attn_comp_cache[il] = metal_graph_alloc_kv_cache_tensor(

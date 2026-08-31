@@ -15,10 +15,9 @@ bool compressor_decode_one_decode_scratch(
         uint32_t                 il,
         uint32_t                 pos,
         ds4_cpu_decode_scratch * scratch) {
-    const uint32_t coff = compress_ratio == 4 ? 2u : 1u;
-    const uint32_t width = coff * head_dim;
+    const uint32_t width = ds4_comp_row_width(compress_ratio, head_dim);
     const uint32_t pos_mod = pos % compress_ratio;
-    const uint32_t row = compress_ratio == 4 ? compress_ratio + pos_mod : pos_mod;
+    const uint32_t row = ds4_comp_stage_base(compress_ratio) + pos_mod;
     const bool should_compress = ((pos + 1) % compress_ratio) == 0;
 
     if (width > 2u * DS4_N_HEAD_DIM) ds4_die("compressor scratch width is outside the fixed model layout");

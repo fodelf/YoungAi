@@ -216,6 +216,29 @@ int session_penalties_active(const ds4_session *s);
 void print_vec_stats(const char *name, const float *x, uint64_t n);
 bool ds4_backend_uses_graph(ds4_backend backend);
 uint32_t ds4_layer_compress_ratio(uint32_t il);
+
+/* ===== 压缩 KV 行布局契约(2026-08-31 魔数收拢; 原 16 份手写拷贝散在校验/分配/
+ * 写/清/读/内存估算六个环节, 改一处漏一处=分配与读写错位, 不崩只漂数值):
+ *  - ratio-4 层每行 2 槽, 其余 1 槽; 行宽 = 槽数×head_dim。
+ *  - 压缩暂存 stage 行基址: ratio-4 层用后半区(基址=ratio), 其余前半区(0);
+ *    写侧行号 = 基址+pos%ratio, 清侧区间 = [基址+rem, 基址+ratio)。
+ *  - 容量 = ctx/ratio + 2(+2 的来由九处原码均无记载, 考据前禁改; 无符号算术下
+ *    结果恒 ≥2, 旧散点的 if(<2)=2 钳是死防御, 收拢时已删)。 ===== */
+static inline uint32_t ds4_comp_row_slots(uint32_t ratio) { return ratio == 4u ? 2u : 1u; }
+static inline uint32_t ds4_comp_row_width(uint32_t ratio, uint32_t head_dim) {
+    return ds4_comp_row_slots(ratio) * head_dim;
+}
+static inline uint32_t ds4_comp_stage_base(uint32_t ratio) { return ratio == 4u ? ratio : 0u; }
+static inline uint32_t ds4_comp_cap_for(uint32_t ctx, uint32_t ratio) { return ctx / ratio + 2u; }
+/* 全层最小压缩比(内存上界口径); 无压缩层时退 ctx(≥1)。三份散点的 fallback 写法已统一。 */
+static inline uint32_t ds4_min_compress_ratio(uint32_t ctx_fallback) {
+    uint32_t mr = UINT32_MAX;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t r = ds4_layer_compress_ratio(il);
+        if (r != 0 && r < mr) mr = r;
+    }
+    return mr != UINT32_MAX ? mr : (ctx_fallback ? ctx_fallback : 1u);
+}
 uint32_t ds4_expected_layer_compress_ratio(uint32_t il);
 char *byte_encode(ds4_str in, uint64_t *out_len);
 bool compressor_decode_one( float * out_comp, const ds4_model * model, const ds4_tensor * wkv, const ds4_tensor * wgate, const ds4_tensor * ape, const ds4_tensor * norm, const float * x, float * state_kv, float * state_score, uint32_t head_dim, uint32_t compress_ratio, uint32_t il, uint32_t pos);

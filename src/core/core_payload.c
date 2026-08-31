@@ -116,12 +116,12 @@ int payload_copy_file_bytes(FILE *src, FILE *dst, uint64_t bytes, char *err, siz
 }
 
 DS4_MAYBE_UNUSED uint64_t layer_attn_state_bytes(uint32_t ratio) {
-    const uint32_t coff = ratio == 4 ? 2u : 1u;
+    const uint32_t coff = ds4_comp_row_slots(ratio);
     return (uint64_t)coff * DS4_N_HEAD_DIM * coff * ratio * sizeof(float);
 }
 
 DS4_MAYBE_UNUSED uint64_t layer_index_state_bytes(uint32_t ratio) {
-    const uint32_t coff = ratio == 4 ? 2u : 1u;
+    const uint32_t coff = ds4_comp_row_slots(ratio);
     return (uint64_t)coff * DS4_N_INDEXER_HEAD_DIM * coff * ratio * sizeof(float);
 }
 

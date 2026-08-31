@@ -48,7 +48,7 @@ void cpu_decode_scratch_init(ds4_cpu_decode_scratch *scratch, uint32_t ctx_size)
     memset(scratch, 0, sizeof(*scratch));
     if (ctx_size == 0) ctx_size = 1;
     const uint32_t raw_cap = ds4_default_raw_cap(ctx_size);
-    const uint32_t comp_cap = ctx_size / 4 + 2;
+    const uint32_t comp_cap = ds4_comp_cap_for(ctx_size, 4);   /* 4 = 全仓最小压缩比(上界口径) */
     const uint32_t attn_score_cap = raw_cap + comp_cap;
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
@@ -185,10 +185,9 @@ void kv_cache_init(ds4_kv_cache *cache, uint32_t ctx_size, uint32_t raw_cap) {
         cache->layer[il].compress_ratio = ratio;
 
         if (ratio != 0) {
-            const uint32_t coff = ratio == 4 ? 2u : 1u;
-            const uint32_t comp_cap = ctx_size / ratio + 2;
-            const uint32_t attn_width = coff * DS4_N_HEAD_DIM;
-            const uint32_t attn_rows = coff * ratio;
+            const uint32_t comp_cap = ds4_comp_cap_for(ctx_size, ratio);
+            const uint32_t attn_width = ds4_comp_row_width(ratio, DS4_N_HEAD_DIM);
+            const uint32_t attn_rows = ds4_comp_row_slots(ratio) * ratio;
 
             cache->layer[il].comp_cap = comp_cap;
             cache->layer[il].attn_comp_kv = xmalloc_zeroed((size_t)comp_cap * DS4_N_HEAD_DIM, sizeof(float));
@@ -199,8 +198,8 @@ void kv_cache_init(ds4_kv_cache *cache, uint32_t ctx_size, uint32_t raw_cap) {
             }
 
             if (ratio == 4) {
-                const uint32_t index_width = coff * DS4_N_INDEXER_HEAD_DIM;
-                const uint32_t index_rows = coff * ratio;
+                const uint32_t index_width = ds4_comp_row_width(ratio, DS4_N_INDEXER_HEAD_DIM);
+                const uint32_t index_rows = ds4_comp_row_slots(ratio) * ratio;
                 cache->layer[il].index_comp_kv = xmalloc_zeroed((size_t)comp_cap * DS4_N_INDEXER_HEAD_DIM, sizeof(float));
                 cache->layer[il].index_state_kv = xmalloc_zeroed((size_t)index_width * index_rows, sizeof(float));
                 cache->layer[il].index_state_score = xmalloc((size_t)index_width * index_rows * sizeof(float));
@@ -259,11 +258,10 @@ static void compressor_finish_prefill_state_cpu(
         uint32_t   n_tokens) {
     if (!state_kv || !state_score || head_dim == 0 || compress_ratio == 0) return;
 
-    const uint32_t coff = compress_ratio == 4 ? 2u : 1u;
-    const uint32_t width = coff * head_dim;
+    const uint32_t width = ds4_comp_row_width(compress_ratio, head_dim);
     const uint32_t rem = n_tokens % compress_ratio;
-    const uint32_t clear_start = compress_ratio == 4 ? compress_ratio + rem : rem;
-    const uint32_t clear_end = compress_ratio == 4 ? 2u * compress_ratio : compress_ratio;
+    const uint32_t clear_start = ds4_comp_stage_base(compress_ratio) + rem;
+    const uint32_t clear_end = ds4_comp_stage_base(compress_ratio) + compress_ratio;
 
     for (uint32_t row = clear_start; row < clear_end; row++) {
         float *kv = state_kv + (uint64_t)row * width;
@@ -302,8 +300,7 @@ void compressor_pool_decode_state(
         float    * state_score,
         uint32_t   head_dim,
         uint32_t   compress_ratio) {
-    const uint32_t coff = compress_ratio == 4 ? 2u : 1u;
-    const uint32_t width = coff * head_dim;
+    const uint32_t width = ds4_comp_row_width(compress_ratio, head_dim);
 
     for (uint32_t j = 0; j < head_dim; j++) {
         float max_score = DS4_NEG_INF;
@@ -365,7 +362,7 @@ bool compressor_decode_one(
         uint32_t                  compress_ratio,
         uint32_t                  il,
         uint32_t                  pos) {
-    const uint32_t coff = compress_ratio == 4 ? 2u : 1u;
+    const uint32_t coff = ds4_comp_row_slots(compress_ratio);
     const uint32_t width = coff * head_dim;
     const uint32_t pos_mod = pos % compress_ratio;
     const uint32_t row = compress_ratio == 4 ? compress_ratio + pos_mod : pos_mod;

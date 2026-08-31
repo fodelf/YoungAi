@@ -9,7 +9,7 @@ bool metal_graph_reset_prefill_state(ds4_gpu_graph *g) {
         if (!metal_graph_layer_is_active(g, il)) continue;
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
-        const uint32_t coff = ratio == 4 ? 2u : 1u;
+        const uint32_t coff = ds4_comp_row_slots(ratio);
         const uint64_t attn_width = (uint64_t)coff * DS4_N_HEAD_DIM;
         const uint64_t attn_rows = (uint64_t)coff * ratio;
         if (!metal_tensor_fill_f32(g->layer_attn_state_kv[il], 0.0f, attn_width * attn_rows)) return false;

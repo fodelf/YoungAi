@@ -130,7 +130,7 @@ bool metal_graph_encode_decode_layer(
     uint32_t n_selected = 0;
     if (ok && compressed) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
-        const uint32_t coff = ratio == 4 ? 2u : 1u;
+        const uint32_t coff = ds4_comp_row_slots(ratio);
         const uint32_t comp_width = coff * DS4_N_HEAD_DIM;
         const bool emit = ((pos + 1u) % ratio) == 0u;
         if (!layer->attn_compressor_kv || !layer->attn_compressor_gate ||

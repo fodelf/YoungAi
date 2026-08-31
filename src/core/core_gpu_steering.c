@@ -263,7 +263,7 @@ static uint64_t metal_graph_kv_cache_bytes_for_context(uint32_t ctx_size, uint32
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
-        const uint64_t comp_cap = (uint64_t)(ctx_size / ratio + 2u);
+        const uint64_t comp_cap = ds4_comp_cap_for(ctx_size, ratio);
         bytes += comp_cap * DS4_N_HEAD_DIM *
                  (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
         if (ratio == 4) {
@@ -278,21 +278,14 @@ uint64_t metal_graph_context_bytes_for_kv_policy(
         uint32_t  raw_cap,
         uint32_t  prefill_cap,
         uint64_t *kv_cache_bytes_out) {
-    uint32_t min_ratio = UINT32_MAX;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        const uint32_t ratio = ds4_layer_compress_ratio(il);
-        if (ratio != 0 && ratio < min_ratio) min_ratio = ratio;
-    }
-    if (min_ratio == UINT32_MAX) min_ratio = ctx_size ? ctx_size : 1u;
-    uint64_t comp_cap = (uint64_t)(ctx_size / min_ratio + 2u);
-    if (comp_cap < 2u) comp_cap = 2u;
+    const uint64_t comp_cap = ds4_comp_cap_for(ctx_size, ds4_min_compress_ratio(ctx_size));
     const uint64_t kv_cache_bytes = metal_graph_kv_cache_bytes_for_context(ctx_size, raw_cap);
     if (kv_cache_bytes_out) *kv_cache_bytes_out = kv_cache_bytes;
     uint64_t bytes = kv_cache_bytes +
                      2ull * comp_cap * prefill_cap * sizeof(float);
     if (DS4_GPU_ATTN_COMP_CACHE_F16) {
-        uint64_t attn_stage_cap = (uint64_t)(prefill_cap / min_ratio + 2u);
-        if (attn_stage_cap < 2u) attn_stage_cap = 2u;
+        const uint64_t attn_stage_cap =
+            ds4_comp_cap_for(prefill_cap, ds4_min_compress_ratio(ctx_size));
         bytes += attn_stage_cap * DS4_N_HEAD_DIM * sizeof(float);
     }
     return bytes;
