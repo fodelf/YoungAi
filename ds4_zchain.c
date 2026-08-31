@@ -99,6 +99,9 @@ ds4_zchain *ds4_zchain_load(const char *path, uint32_t n_layer, uint32_t n_exper
                     zl->rte.zlk = zk; zl->rte.zltr = tr; zl->rte.zdin = din;
                     zl->rte.zmul = 2u;                       /* 标记: 路由偏置形态 */
                     zl->rte.zlm = (const uint16_t *)(pay + 16);
+                } else {
+                    fprintf(stderr, "ds4: zchain L%u type8 dropped: k=%u din=%u dout=%u psz=%u need=%llu\n",
+                            L, zk, din, dout, psz, (unsigned long long)(16 + nh * 2));
                 }
                 continue;
             }
@@ -141,6 +144,9 @@ ds4_zchain *ds4_zchain_load(const char *path, uint32_t n_layer, uint32_t n_exper
                     zl->zl.zlk = zk; zl->zl.zltr = tr; zl->zl.zdin = din;
                     zl->zl.zmul = 3u;                            /* 动态 z 乘性 */
                     zl->zl.zlm = (const uint16_t *)(pay + 16);
+                } else {
+                    fprintf(stderr, "ds4: zchain L%u type9 dropped: k=%u din=%u dout=%u psz=%u need=%llu\n",
+                            L, zk, din, dout, psz, (unsigned long long)(16 + nh * 2));
                 }
                 continue;
             }
@@ -153,6 +159,9 @@ ds4_zchain *ds4_zchain_load(const char *path, uint32_t n_layer, uint32_t n_exper
                     && dout == d_model && psz >= 16 + nh * 2) {
                     zl->zl.zlk = zk; zl->zl.zltr = tr; zl->zl.zdin = din;
                     zl->zl.zmul = 1u; zl->zl.zlm = (const uint16_t *)(pay + 16);
+                } else {
+                    fprintf(stderr, "ds4: zchain L%u type7 dropped: k=%u din=%u dout=%u psz=%u need=%llu\n",
+                            L, zk, din, dout, psz, (unsigned long long)(16 + nh * 2));
                 }
                 continue;
             }
@@ -186,6 +195,9 @@ ds4_zchain *ds4_zchain_load(const char *path, uint32_t n_layer, uint32_t n_exper
                             } else { free(zm->z); free(zm->U); free(zm->V); free(zm); }
                         }
                     }
+                } else {
+                    fprintf(stderr, "ds4: zchain L%u type6 dropped: k=%u din=%u dout=%u psz=%u need=%llu\n",
+                            L, zk, din, dout, psz, (unsigned long long)(16 + nh * 2));
                 }
                 continue;
             }
