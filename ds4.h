@@ -53,15 +53,12 @@ typedef struct {
 #define DS4_DEFAULT_TEMPERATURE 1.0f
 #define DS4_DEFAULT_TOP_P 1.0f
 #define DS4_DEFAULT_MIN_P 0.05f
-/* session 默认 ctx: CLI(-c)与 server(--ctx) 同一个默认, help 文本经 DS4_STRINGIFY
- * 同源拼接 —— 改这里, 代码与 --help 显示一起变, 不会再各写一份跑飞。 */
+/* session 默认 ctx: CLI 与 server 共用, help 文本经 DS4_STRINGIFY 同源(改此处代码与文档一起变) */
 #define DS4_DEFAULT_CTX_SIZE 32768
 #define DS4_STRINGIFY_(x) #x
 #define DS4_STRINGIFY(x) DS4_STRINGIFY_(x)
-/* DeepSeek recommends Think Max only with at least a 384K-token context window.
- * Below that size we keep ordinary thinking to avoid injecting a prompt that
- * asks for a reasoning budget the allocated context is not meant to hold.
- * (无 u 后缀: server --help 经 DS4_STRINGIFY 拼进文本, 比较端自行转 uint32。) */
+/* DeepSeek recommends Think Max only with >=384K ctx; below that keep ordinary thinking.
+ * (无 u 后缀: server --help 经 DS4_STRINGIFY 拼文本, 比较端自行转 uint32。) */
 #define DS4_THINK_MAX_MIN_CONTEXT 393216
 
 typedef struct ds4_engine ds4_engine;
@@ -258,8 +255,7 @@ uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
  * KV files with the previously-zero reserved byte remain Flash-compatible;
  * Pro and later shapes must use nonzero ids. */
 int ds4_engine_model_id(ds4_engine *e);
-/* 磁盘 KV 兼容键的模型半(u8 文件指纹; model_id 只分 Flash/PRO, 不够当键)。 */
-int ds4_engine_model_kv_id(ds4_engine *e);
+int ds4_engine_model_kv_id(ds4_engine *e);   /* KV 兼容键模型半: u8 文件指纹(model_id 只分 Flash/PRO 不够当键) */
 const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 const char *ds4_think_mode_name(ds4_think_mode mode);
@@ -377,8 +373,7 @@ int ds4_session_pos(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);
 int ds4_session_prefill_cap(ds4_session *s);
 int ds4_engine_routed_quant_bits(ds4_engine *e);
-/* 磁盘 KV 兼容键(routed 张量类型码; 0=无 routed=不可存)。bits 口径会把不同 2-bit
- * 格式塌成同一个 2, 造成跨模型 KV 静默互认 —— 兼容判定一律用这个, bits 只作显示。 */
+/* 磁盘 KV 兼容键(routed 类型码; 0=不可存)。bits 口径塌格式=跨模型互认, 兼容判定一律用这个。 */
 int ds4_engine_routed_kv_key(ds4_engine *e);
 const ds4_tokens *ds4_session_tokens(ds4_session *s);
 
@@ -425,12 +420,21 @@ uint32_t ds4_session_layer_slice_len(const ds4_session *s);
 
 /* Disk KV payload helpers.  HTTP/agent code owns the outer file header and
  * persistence policy; the engine owns the DS4-specific serialized graph state. */
+/* DSV4 载荷头字段下标(字节序=枚举序; 写读共 6 处曾各用裸下标, 加字段漏改=读侧错位取数
+ * 而版本校验照过)。层分片头 DSVL 前 11 字段同布局尾部分叉。改布局: 枚举+_COUNT+VERSION 同改。 */
+enum {
+    DS4_SPH_MAGIC = 0, DS4_SPH_VERSION, DS4_SPH_CTX, DS4_SPH_PREFILL_CAP,
+    DS4_SPH_RAW_CAP, DS4_SPH_RAW_WINDOW, DS4_SPH_COMP_CAP, DS4_SPH_TOKENS,
+    DS4_SPH_LAYERS, DS4_SPH_HEAD_DIM, DS4_SPH_IDX_HEAD_DIM,
+    DS4_SPH_VOCAB = 11, DS4_SPH_RAW_LIVE = 12, DS4_SPH_COUNT = 13,
+    DS4_SLH_LAYER_START = 11, DS4_SLH_LAYER_END = 12, DS4_SLH_RAW_LIVE = 13, DS4_SLH_COUNT = 14
+};
 #define DS4_SESSION_PAYLOAD_MAGIC UINT32_C(0x34565344) /* "DSV4" */
 #define DS4_SESSION_PAYLOAD_VERSION UINT32_C(2)
-#define DS4_SESSION_PAYLOAD_U32_FIELDS 13u
+#define DS4_SESSION_PAYLOAD_U32_FIELDS ((uint32_t)DS4_SPH_COUNT)
 #define DS4_SESSION_LAYER_PAYLOAD_MAGIC UINT32_C(0x4c565344) /* "DSVL" */
 #define DS4_SESSION_LAYER_PAYLOAD_VERSION UINT32_C(1)
-#define DS4_SESSION_LAYER_PAYLOAD_U32_FIELDS 14u
+#define DS4_SESSION_LAYER_PAYLOAD_U32_FIELDS ((uint32_t)DS4_SLH_COUNT)
 
 uint64_t ds4_session_payload_bytes(ds4_session *s);
 int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,

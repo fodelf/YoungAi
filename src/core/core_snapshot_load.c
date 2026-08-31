@@ -13,26 +13,26 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
         if (payload_read_u32(fp, &h[i], &remaining, err, errlen) != 0) return 1;
     }
-    if (h[0] != DS4_SESSION_PAYLOAD_MAGIC || h[1] != DS4_SESSION_PAYLOAD_VERSION) {
+    if (h[DS4_SPH_MAGIC] != DS4_SESSION_PAYLOAD_MAGIC || h[DS4_SPH_VERSION] != DS4_SESSION_PAYLOAD_VERSION) {
         payload_set_err(err, errlen, "unsupported session payload version");
         return 1;
     }
     if (ds4_session_is_cpu(s)) {
-        const uint32_t saved_ctx = h[2];
-        const uint32_t saved_prefill_cap = h[3];
-        const uint32_t saved_raw_cap = h[4];
-        const uint32_t saved_raw_window = h[5];
-        const uint32_t saved_comp_cap = h[6];
-        const uint32_t saved_tokens = h[7];
-        const uint32_t saved_raw_live = h[12];
+        const uint32_t saved_ctx = h[DS4_SPH_CTX];
+        const uint32_t saved_prefill_cap = h[DS4_SPH_PREFILL_CAP];
+        const uint32_t saved_raw_cap = h[DS4_SPH_RAW_CAP];
+        const uint32_t saved_raw_window = h[DS4_SPH_RAW_WINDOW];
+        const uint32_t saved_comp_cap = h[DS4_SPH_COMP_CAP];
+        const uint32_t saved_tokens = h[DS4_SPH_TOKENS];
+        const uint32_t saved_raw_live = h[DS4_SPH_RAW_LIVE];
         const uint32_t cpu_raw_cap = ds4_default_raw_cap((uint32_t)s->ctx_size);
         const uint32_t cpu_comp_cap = session_cpu_comp_cap(s);
         if (saved_ctx > (uint32_t)s->ctx_size || saved_tokens >= (uint32_t)s->ctx_size) {
             payload_set_err(err, errlen, "KV checkpoint does not fit current context");
             return 1;
         }
-        if (h[8] != DS4_N_LAYER || h[9] != DS4_N_HEAD_DIM ||
-            h[10] != DS4_N_INDEXER_HEAD_DIM || h[11] != DS4_N_VOCAB)
+        if (h[DS4_SPH_LAYERS] != DS4_N_LAYER || h[DS4_SPH_HEAD_DIM] != DS4_N_HEAD_DIM ||
+            h[DS4_SPH_IDX_HEAD_DIM] != DS4_N_INDEXER_HEAD_DIM || h[DS4_SPH_VOCAB] != DS4_N_VOCAB)
         {
             payload_set_err(err, errlen, "KV checkpoint was written for a different DS4 layout");
             return 1;
@@ -159,19 +159,19 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     return 1;
 #else
     ds4_gpu_graph *g = &s->graph;
-    const uint32_t saved_ctx = h[2];
-    const uint32_t saved_prefill_cap = h[3];
-    const uint32_t saved_raw_cap = h[4];
-    const uint32_t saved_raw_window = h[5];
-    const uint32_t saved_comp_cap = h[6];
-    const uint32_t saved_tokens = h[7];
-    const uint32_t saved_raw_live = h[12];
+    const uint32_t saved_ctx = h[DS4_SPH_CTX];
+    const uint32_t saved_prefill_cap = h[DS4_SPH_PREFILL_CAP];
+    const uint32_t saved_raw_cap = h[DS4_SPH_RAW_CAP];
+    const uint32_t saved_raw_window = h[DS4_SPH_RAW_WINDOW];
+    const uint32_t saved_comp_cap = h[DS4_SPH_COMP_CAP];
+    const uint32_t saved_tokens = h[DS4_SPH_TOKENS];
+    const uint32_t saved_raw_live = h[DS4_SPH_RAW_LIVE];
     if (saved_ctx > (uint32_t)s->ctx_size || saved_tokens >= (uint32_t)s->ctx_size) {
         payload_set_err(err, errlen, "KV checkpoint does not fit current context");
         return 1;
     }
-    if (h[8] != DS4_N_LAYER || h[9] != DS4_N_HEAD_DIM ||
-        h[10] != DS4_N_INDEXER_HEAD_DIM || h[11] != DS4_N_VOCAB)
+    if (h[DS4_SPH_LAYERS] != DS4_N_LAYER || h[DS4_SPH_HEAD_DIM] != DS4_N_HEAD_DIM ||
+        h[DS4_SPH_IDX_HEAD_DIM] != DS4_N_INDEXER_HEAD_DIM || h[DS4_SPH_VOCAB] != DS4_N_VOCAB)
     {
         payload_set_err(err, errlen, "KV checkpoint was written for a different DS4 layout");
         return 1;

@@ -63,20 +63,20 @@ int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
     ds4_gpu_graph *g = &s->graph;
     const uint32_t raw_live = session_raw_live_rows(g, (uint32_t)s->checkpoint.len);
     uint32_t header[DS4_SESSION_LAYER_PAYLOAD_U32_FIELDS] = {
-        DS4_SESSION_LAYER_PAYLOAD_MAGIC,
-        DS4_SESSION_LAYER_PAYLOAD_VERSION,
-        (uint32_t)s->ctx_size,
-        s->prefill_cap,
-        g->raw_cap,
-        g->raw_window,
-        g->comp_cap,
-        (uint32_t)s->checkpoint.len,
-        DS4_N_LAYER,
-        DS4_N_HEAD_DIM,
-        DS4_N_INDEXER_HEAD_DIM,
-        layer_start,
-        layer_end,
-        raw_live,
+        [DS4_SPH_MAGIC] = DS4_SESSION_LAYER_PAYLOAD_MAGIC,
+        [DS4_SPH_VERSION] = DS4_SESSION_LAYER_PAYLOAD_VERSION,
+        [DS4_SPH_CTX] = (uint32_t)s->ctx_size,
+        [DS4_SPH_PREFILL_CAP] = s->prefill_cap,
+        [DS4_SPH_RAW_CAP] = g->raw_cap,
+        [DS4_SPH_RAW_WINDOW] = g->raw_window,
+        [DS4_SPH_COMP_CAP] = g->comp_cap,
+        [DS4_SPH_TOKENS] = (uint32_t)s->checkpoint.len,
+        [DS4_SPH_LAYERS] = DS4_N_LAYER,
+        [DS4_SPH_HEAD_DIM] = DS4_N_HEAD_DIM,
+        [DS4_SPH_IDX_HEAD_DIM] = DS4_N_INDEXER_HEAD_DIM,
+        [DS4_SLH_LAYER_START] = layer_start,
+        [DS4_SLH_LAYER_END] = layer_end,
+        [DS4_SLH_RAW_LIVE] = raw_live,
     };
     for (uint32_t i = 0; i < DS4_SESSION_LAYER_PAYLOAD_U32_FIELDS; i++) {
         if (payload_write_u32(fp, header[i], err, errlen) != 0) return 1;
@@ -198,22 +198,22 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
     for (uint32_t i = 0; i < DS4_SESSION_LAYER_PAYLOAD_U32_FIELDS; i++) {
         if (payload_read_u32(fp, &h[i], &remaining, err, errlen) != 0) return 1;
     }
-    if (h[0] != DS4_SESSION_LAYER_PAYLOAD_MAGIC ||
-        h[1] != DS4_SESSION_LAYER_PAYLOAD_VERSION) {
+    if (h[DS4_SPH_MAGIC] != DS4_SESSION_LAYER_PAYLOAD_MAGIC ||
+        h[DS4_SPH_VERSION] != DS4_SESSION_LAYER_PAYLOAD_VERSION) {
         payload_set_err(err, errlen, "unsupported session layer payload version");
         return 1;
     }
 
     ds4_gpu_graph *g = &s->graph;
-    const uint32_t saved_ctx = h[2];
-    const uint32_t saved_prefill_cap = h[3];
-    const uint32_t saved_raw_cap = h[4];
-    const uint32_t saved_raw_window = h[5];
-    const uint32_t saved_comp_cap = h[6];
-    const uint32_t saved_tokens = h[7];
-    const uint32_t saved_layer_start = h[11];
-    const uint32_t saved_layer_end = h[12];
-    const uint32_t saved_raw_live = h[13];
+    const uint32_t saved_ctx = h[DS4_SPH_CTX];
+    const uint32_t saved_prefill_cap = h[DS4_SPH_PREFILL_CAP];
+    const uint32_t saved_raw_cap = h[DS4_SPH_RAW_CAP];
+    const uint32_t saved_raw_window = h[DS4_SPH_RAW_WINDOW];
+    const uint32_t saved_comp_cap = h[DS4_SPH_COMP_CAP];
+    const uint32_t saved_tokens = h[DS4_SPH_TOKENS];
+    const uint32_t saved_layer_start = h[DS4_SLH_LAYER_START];
+    const uint32_t saved_layer_end = h[DS4_SLH_LAYER_END];
+    const uint32_t saved_raw_live = h[DS4_SLH_RAW_LIVE];
     (void)saved_prefill_cap;
     if (saved_layer_start != layer_start || saved_layer_end != layer_end) {
         payload_set_err(err, errlen, "KV shard layer range does not match requested worker");
@@ -225,8 +225,8 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
         payload_set_err(err, errlen, "KV shard does not fit current context");
         return 1;
     }
-    if (h[8] != DS4_N_LAYER || h[9] != DS4_N_HEAD_DIM ||
-        h[10] != DS4_N_INDEXER_HEAD_DIM) {
+    if (h[DS4_SPH_LAYERS] != DS4_N_LAYER || h[DS4_SPH_HEAD_DIM] != DS4_N_HEAD_DIM ||
+        h[DS4_SPH_IDX_HEAD_DIM] != DS4_N_INDEXER_HEAD_DIM) {
         payload_set_err(err, errlen, "KV shard was written for a different DS4 layout");
         return 1;
     }

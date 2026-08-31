@@ -208,19 +208,19 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         const uint32_t raw_cap = ds4_default_raw_cap((uint32_t)s->ctx_size);
         const uint32_t comp_cap = session_cpu_comp_cap(s);
         uint32_t header[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
-            DS4_SESSION_PAYLOAD_MAGIC,
-            DS4_SESSION_PAYLOAD_VERSION,
-            (uint32_t)s->ctx_size,
-            s->prefill_cap,
-            raw_cap,
-            raw_cap,
-            comp_cap,
-            (uint32_t)s->checkpoint.len,
-            DS4_N_LAYER,
-            DS4_N_HEAD_DIM,
-            DS4_N_INDEXER_HEAD_DIM,
-            DS4_N_VOCAB,
-            raw_live,
+            [DS4_SPH_MAGIC] = DS4_SESSION_PAYLOAD_MAGIC,
+            [DS4_SPH_VERSION] = DS4_SESSION_PAYLOAD_VERSION,
+            [DS4_SPH_CTX] = (uint32_t)s->ctx_size,
+            [DS4_SPH_PREFILL_CAP] = s->prefill_cap,
+            [DS4_SPH_RAW_CAP] = raw_cap,
+            [DS4_SPH_RAW_WINDOW] = raw_cap,   /* CPU 路: 窗=容量 */
+            [DS4_SPH_COMP_CAP] = comp_cap,
+            [DS4_SPH_TOKENS] = (uint32_t)s->checkpoint.len,
+            [DS4_SPH_LAYERS] = DS4_N_LAYER,
+            [DS4_SPH_HEAD_DIM] = DS4_N_HEAD_DIM,
+            [DS4_SPH_IDX_HEAD_DIM] = DS4_N_INDEXER_HEAD_DIM,
+            [DS4_SPH_VOCAB] = DS4_N_VOCAB,
+            [DS4_SPH_RAW_LIVE] = raw_live,
         };
         for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
             if (payload_write_u32(fp, header[i], err, errlen) != 0) return 1;
@@ -286,19 +286,19 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
      *   12 live raw rows serialized below.
      */
     uint32_t header[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
-        DS4_SESSION_PAYLOAD_MAGIC,
-        DS4_SESSION_PAYLOAD_VERSION,
-        (uint32_t)s->ctx_size,
-        s->prefill_cap,
-        g->raw_cap,
-        g->raw_window,
-        g->comp_cap,
-        (uint32_t)s->checkpoint.len,
-        DS4_N_LAYER,
-        DS4_N_HEAD_DIM,
-        DS4_N_INDEXER_HEAD_DIM,
-        DS4_N_VOCAB,
-        raw_live,
+        [DS4_SPH_MAGIC] = DS4_SESSION_PAYLOAD_MAGIC,
+        [DS4_SPH_VERSION] = DS4_SESSION_PAYLOAD_VERSION,
+        [DS4_SPH_CTX] = (uint32_t)s->ctx_size,
+        [DS4_SPH_PREFILL_CAP] = s->prefill_cap,
+        [DS4_SPH_RAW_CAP] = g->raw_cap,
+        [DS4_SPH_RAW_WINDOW] = g->raw_window,
+        [DS4_SPH_COMP_CAP] = g->comp_cap,
+        [DS4_SPH_TOKENS] = (uint32_t)s->checkpoint.len,
+        [DS4_SPH_LAYERS] = DS4_N_LAYER,
+        [DS4_SPH_HEAD_DIM] = DS4_N_HEAD_DIM,
+        [DS4_SPH_IDX_HEAD_DIM] = DS4_N_INDEXER_HEAD_DIM,
+        [DS4_SPH_VOCAB] = DS4_N_VOCAB,
+        [DS4_SPH_RAW_LIVE] = raw_live,
     };
     for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
         if (payload_write_u32(fp, header[i], err, errlen) != 0) return 1;

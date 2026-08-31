@@ -158,23 +158,23 @@ int ds4_dist_session_load_payload(
         if (dist_payload_read_u32(fp, &h[i], &remaining, err, errlen) != 0)
             return 1;
     }
-    if (h[0] != DS4_SESSION_PAYLOAD_MAGIC ||
-        h[1] != DS4_SESSION_PAYLOAD_VERSION) {
+    if (h[DS4_SPH_MAGIC] != DS4_SESSION_PAYLOAD_MAGIC ||
+        h[DS4_SPH_VERSION] != DS4_SESSION_PAYLOAD_VERSION) {
         if (errlen) snprintf(err, errlen, "unsupported DS4 KV payload version");
         return 1;
     }
     ds4_dist_kv_layout layout = {
-        .ctx = h[2],
-        .prefill_cap = h[3],
-        .raw_cap = h[4],
-        .raw_window = h[5],
-        .comp_cap = h[6],
-        .token_count = h[7],
-        .n_layers = h[8],
-        .head_dim = h[9],
-        .indexer_head_dim = h[10],
-        .vocab = h[11],
-        .raw_live = h[12],
+        .ctx = h[DS4_SPH_CTX],
+        .prefill_cap = h[DS4_SPH_PREFILL_CAP],
+        .raw_cap = h[DS4_SPH_RAW_CAP],
+        .raw_window = h[DS4_SPH_RAW_WINDOW],
+        .comp_cap = h[DS4_SPH_COMP_CAP],
+        .token_count = h[DS4_SPH_TOKENS],
+        .n_layers = h[DS4_SPH_LAYERS],
+        .head_dim = h[DS4_SPH_HEAD_DIM],
+        .indexer_head_dim = h[DS4_SPH_IDX_HEAD_DIM],
+        .vocab = h[DS4_SPH_VOCAB],
+        .raw_live = h[DS4_SPH_RAW_LIVE],
     };
     if (layout.n_layers != d->state.n_layers ||
         layout.ctx > (uint32_t)ds4_session_ctx(owner) ||
