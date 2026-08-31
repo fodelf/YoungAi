@@ -38,8 +38,14 @@ MDL="$ROOT/gguf/go-onebit/ds4-r30.gguf"
 # ★体积单点真相(2026-08-06 用户问责"漏闸"后修根)★: 载荷预算从 plan json 派生
 # (budget_GiB=blob 载荷)+0.5 垫, 不再各处写死; VOL_BUDGET 仍可显式覆盖。
 # ★读不出 plan 即停(旧 || echo 37.0 = 预算静默换口径; 历次战役实际预算 95/86/24.9, 37 谁都不是)
-BUDGET="${VOL_BUDGET:-$(python3 -c "import json,sys;print(round(json.load(open('$PLAN_JSON'))['budget_GiB']+0.5,1))")}" || { echo "★plan json 读不出 budget_GiB, 拒绝无预算发车★" >&2; exit 7; }
-[ -n "$BUDGET" ] || { echo "★BUDGET 为空, 拒绝无预算发车★" >&2; exit 7; }       # ★v4b★ blob 实测 592M/层(热113.6+冷w1w3 1bit副本478.6, 引擎热侧车布局需要)×43=24.9G; GGUF 仍=骨架+GUD 42.468(blob 外挂)
+# ★预算读取收窄到消费段(2026-08-31)★: BUDGET 只有 stage_quant 用(plan_json2rplan +
+# 体积闸); quant86 段自带 VOLB86+manifest 实账闸, 不消费它。原顶层必读让 r30_rplan.json
+# (08-26 大清理已删)把 quant86 也闸死 —— 无关段不该被别人的配置文件拦停。语义不变:
+# stage_quant 读不出 plan 仍然即停(旧 || echo 37.0 静默换口径的兜底不回来)。
+budget_resolve(){
+    BUDGET="${VOL_BUDGET:-$(python3 -c "import json,sys;print(round(json.load(open('$PLAN_JSON'))['budget_GiB']+0.5,1))")}" || { echo "★plan json 读不出 budget_GiB, 拒绝无预算发车★" >&2; exit 7; }
+    [ -n "$BUDGET" ] || { echo "★BUDGET 为空, 拒绝无预算发车★" >&2; exit 7; }   # ★v4b★ blob 实测 592M/层(热113.6+冷w1w3 1bit副本478.6, 引擎热侧车布局需要)×43=24.9G; GGUF 仍=骨架+GUD 42.468(blob 外挂)
+}
 # v2 与 v1 的差异(首跑 25 层实测审计后): ①证据换混合(L00-24 R30 实测 / L25-42 R29 抬地板 0.015,
 # 上轮深层自愈是背上游债的表象已实证失效) ②"撑着层免底线"例外删除 ③hot 硬地板 24。
 # 失配层修正: L23 hot7→104 / L21 16→80 / L20 29→84 / L10 28→68; bpw 0.776-1.556 均值 1.048。
@@ -91,6 +97,7 @@ stage_plan(){
 }
 
 stage_quant(){
+    budget_resolve
     [ -f "$PLAN_JSON" ] || { LOG "配置 JSON $PLAN_JSON 缺, 先 plan"; exit 2; }
     pgrep -f "[d]s4quant_run.* $IDS" >/dev/null && { LOG "已有量化进程"; exit 3; }
     [ -n "${RESUME_QUANT:-}" ] || rm -rf "$OUTF/layers" "$OUTF/ckpt"
