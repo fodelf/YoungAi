@@ -205,6 +205,7 @@ typedef struct { int type; float g,t; float w2p[4]; float w8[9]; float *V8; floa
                  int erf_ne,erf_r; uint32_t *erf_eid; float *erf_tau; float *erf_UV;
                  /* 8=zl.ERF 死层部件(2026-08-12): 每专家 w2 低秩补丁 U[D,r](折S)·V[r,MOEI](折α)+token能量门τ */
                  size_t foff;     float ghc[2];   /* type7 GLhc: g_hot, g_cold(2026-08-06 冷热双通道) */
+                 int ext;   /* 1=记录宿主是 zrec 外挂(foff 不在 dql, 禁 zfile_commit 原地改写) */
 } lop_t;   /* 1=GL 2=dyn2 3=dyn8 4=TREF 5=GE(per-expert增益,累加时乘) 6=zl.RRR 8=zl.ERF; foff=载荷文件偏移(反修原地改写用) */
 typedef struct { uint8_t *map; size_t msz; const uint8_t *w1,*w3,*w2; size_t szG,szD;
                  uint8_t *g2map; size_t g2msz;                                    /* go2b 侧车 mmap(可异机盘/NFS; 内嵌时 NULL, g2w* 指进主 map) */
@@ -240,10 +241,12 @@ static void ops_sidecar_path(const char*dql_path,int L,char*out,size_t outsz){
 static void op_host_path(int L,char*out,size_t outsz){
     snprintf(out,outsz,"%s/dql_L%02d.bin",dsq_layer_dir_req(),L);
 }
-/* op 记录解析(主文件旧混装 与 op 侧车 共用): curfoff=载荷在其宿主文件内的偏移 */
+/* op 记录解析(主文件旧混装 与 zrec 外挂 共用): curfoff=载荷在其宿主文件内的偏移 */
+static int g_parse_ext=0;   /* 1=正在解析 zrec 外挂(记录打 ext 标, 禁原地改写) */
 static void parse_op_rec(lfile_t*lf,const char*nm,const uint8_t*pay,uint64_t psz,size_t curfoff){
     if(lf->nops>=32) return;
     lop_t*o=&lf->ops[lf->nops];
+    memset(o,0,sizeof(*o)); o->ext=g_parse_ext;
     if(strstr(nm,"GLhc")&&psz>=8){ o->type=7; memcpy(o->ghc,pay,8); o->foff=curfoff; lf->nops++; }
     else if(strstr(nm,"GLdyn2")&&psz>=16){ o->type=2; memcpy(o->w2p,pay,16); o->foff=curfoff; lf->nops++; }
     else if(strstr(nm,"GLdyn8")&&psz>=36){ o->type=3; memcpy(o->w8,pay,36); o->foff=curfoff;
@@ -375,6 +378,33 @@ static int lfile_load(const char*path,lfile_t*lf){
             else { uint32_t mgv; memcpy(&mgv,lf->vqmap,4);
                    if(mgv!=VQSC_MAGIC||lf->vqmsz<vq_hdr_bytes()){ munmap(lf->vqmap,lf->vqmsz); lf->vqmap=NULL; } }
         }
+      }
+      /* ★zrec 并链(2026-08-31 回放盲区正修)★ B路 ZLGATE 与 zlayer INJ=2 落地的 z/GE 住独立
+       * zrec_L%02d.bin(dql 不动), 而回放只执行 dql 内嵌 op ⇒ sweep 基线/终验/判决尺全都看不见
+       * 已落地修正, 引擎(zrec→zchain type5/6)却会执行 —— 判决的模型≠部署的模型, 跨调用的
+       * 序贯前提也断裂。这里把 zrec 记录并进 op 链, 回放=部署。现役写者(zlayer INJ=2 /
+       * ZLGATE zrec 直写)都不同时注入 dql ⇒ 无双重应用; 空文件=INJ=2 的"闸拒"标记, 跳过。 */
+      { char zp[512], zdir[512]; snprintf(zdir,sizeof(zdir),"%s",path);
+        char*zsl=strrchr(zdir,'/'); if(zsl)*zsl=0; else snprintf(zdir,sizeof(zdir),".");
+        snprintf(zp,sizeof(zp),"%s/zrec_L%02d.bin",zdir,(int)Lh);
+        int zfd=open(zp,O_RDONLY);
+        if(zfd>=0){ struct stat zst;
+            if(!fstat(zfd,&zst)&&zst.st_size>=116){
+                lf->opsmsz=(size_t)zst.st_size;
+                lf->opsmap=mmap(NULL,lf->opsmsz,PROT_READ,MAP_PRIVATE,zfd,0);
+                if(lf->opsmap==MAP_FAILED){ lf->opsmap=NULL; lf->opsmsz=0; }
+                else { const uint8_t*q=lf->opsmap,*qe=lf->opsmap+lf->opsmsz; int nz0=lf->nops;
+                    g_parse_ext=1;
+                    while(q+116<=qe){ char nm2[17]; memcpy(nm2,q,16); nm2[16]=0;
+                        uint64_t psz2; memcpy(&psz2,q+88,8);
+                        int vd2; memcpy(&vd2,q+112,4);
+                        const uint8_t*pay2=q+116; q=pay2+psz2; if(q>qe) break;
+                        if(vd2==1) parse_op_rec(lf,nm2,pay2,psz2,(size_t)(pay2-(const uint8_t*)lf->opsmap)); }
+                    g_parse_ext=0;
+                    if(lf->nops>nz0) fprintf(stderr,"[zrec并链] L%02d +%d op ← %s(部署态回放)\n",
+                                             (int)Lh,lf->nops-nz0,zp);
+                } }
+            close(zfd); }
       }
       if(GO2B_HOT&&(int)Lh<64&&G2_K[Lh]>0&&lf->g2k<=0&&!lf->vqmap){
           fprintf(stderr,"[go2b] ★L%u 侧车 %s 缺失/损坏(无 VQ 侧车) — 热槽位是稀疏洞, 拒加载★\n",Lh,gp);

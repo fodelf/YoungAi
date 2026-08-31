@@ -250,6 +250,9 @@ static void op_backup(int L,int fd,size_t foff,size_t len){
 /* z 载荷原地改写(内容真的变, mtime/字节变) + 记录 mean[0]=新判据
  * ★平行架构: 宿主=op 侧车(在则), 量化 dql 永不被 commit 触碰 */
 static void zfile_commit(int L,lop_t*z,float m1metric){
+    if(z->ext){   /* zrec 外挂 op: foff 指向 zrec 文件, 按此偏移写 dql=砸错文件 */
+        fprintf(stderr,"[zcommit]★拒: L%d type%d 宿主是 zrec 外挂, 原地改写会砸 dql — 该 op 只能重解重落 zrec★\n",L,z->type);
+        return; }
     char lp[512]; op_host_path(L,lp,sizeof(lp));
     int fd=open(lp,O_RDWR); if(fd<0){ perror("zcommit-open"); return; }
     { size_t blen=z->type==1?4:z->type==2?16:z->type==4?4:z->type==5?(size_t)NEXP*2:36;
