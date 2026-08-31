@@ -43,7 +43,8 @@
 #define N_LAYER          43
 #define NEXP             256
 #define SZ_G             (2048ULL * 16 * 34)      /* dql G/U 段每专家字节 = 1,114,112 */
-#define SZ_D             (4096ULL * 8 * 34)       /* dql D 段每专家字节 = 1,114,112 */
+#define D_MODEL          4096                     /* DeepSeek V4 Flash 隐维(z^L dout/V8 行宽同源) */
+#define SZ_D             ((uint64_t)D_MODEL * 8 * 34)   /* dql D 段每专家字节 = 1,114,112 */
 #define DQL_HDR          35104                    /* dql_L*.bin 头(实测 dql_L00); 只作文档常量,
                                                    * 真 D 偏移一律走 --down-offsets 逐层文件 */
 #define DOWN_LAYER_BYTES ((uint64_t)NEXP * SZ_D)  /* 285,212,672 */

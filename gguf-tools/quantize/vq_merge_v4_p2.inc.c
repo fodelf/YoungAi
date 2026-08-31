@@ -66,7 +66,7 @@ static void ssh_stream(const char *host, const char *path, uint64_t nbytes, FILE
  * 编成引擎 zchain_from_model 期望的四类张量内嵌进合并 GGUF(blk.L.opt_chain/ge/v8/zlm
  * + kv ds4.zchain.present=true)。模型自包含, 运行时零外挂零开关。 */
 
-#define V8SZ (8u * 4096u * 2u)   /* 65536 */
+#define V8SZ (8u * D_MODEL * 2u)   /* 65536 */
 
 typedef struct { float (*r)[16]; size_t n, cap; } chain_t;
 static void chain_add(chain_t *c, const float *row) {
@@ -97,8 +97,8 @@ static int build_opt_tensors(const char *dql_dir, int L, elist_t *out) {
             for (uint32_t k = 0; k < nrec; k++) {
                 if (off > rlen || rlen - off < REC_HDR) break;
                 char nm[17]; memcpy(nm, raw + (size_t)off, 16); nm[16] = 0;   /* split(b"\0")[0] */
-                uint64_t psz; memcpy(&psz, raw + (size_t)off + 88, 8);
-                int32_t vd; memcpy(&vd, raw + (size_t)off + 112, 4);
+                uint64_t psz; memcpy(&psz, raw + (size_t)off + DS4_AMP_REC_OFF_PSZ, 8);
+                int32_t vd; memcpy(&vd, raw + (size_t)off + DS4_AMP_REC_OFF_VD, 4);
                 uint64_t pstart = off + REC_HDR;
                 uint64_t plen = rlen - pstart; if (plen > psz) plen = psz;   /* py 切片自动截断 */
                 const uint8_t *pay = raw + (size_t)pstart;
@@ -117,13 +117,20 @@ static int build_opt_tensors(const char *dql_dir, int L, elist_t *out) {
                     for (int e = 0; e < NEXP; e++) { uint16_t h; memcpy(&h, pay + 2 * e, 2); g[e] = f16_to_f32(h); }
                     free(ge); ge = (uint8_t *)g; ge_len = NEXP * 4;
                 } else if (strstr(nm, "zl.RRR") && plen >= 16) {
-                    uint32_t zk; float tr; memcpy(&zk, pay, 4); memcpy(&tr, pay + 4, 4);
-                    uint64_t nh = (uint64_t)zk + 2ULL * zk * 4096;
-                    if (zk > 0 && zk <= 16 && plen >= 16 + nh * 2) {
-                        row[0] = 6.0f; row[1] = tr; row[2] = (float)zk; chain_add(&chain, row);
-                        free(zlm); zlm_len = (size_t)(nh * 2); zlm = xmalloc(zlm_len);
-                        memcpy(zlm, pay + 16, zlm_len);
-                    }
+                    /* 与下方 dql 正位读取点同契约(旧版此处同样 zk<=16+写死4096 静默丢冠军) */
+                    uint32_t zk, din, dout; float tr;
+                    memcpy(&zk, pay, 4); memcpy(&tr, pay + 4, 4);
+                    memcpy(&din, pay + 8, 4); memcpy(&dout, pay + 12, 4);
+                    uint64_t nh = (uint64_t)zk + (uint64_t)zk * dout + (uint64_t)zk * din;
+                    if (!(zk > 0 && zk <= DS4_AMP_ZK_MAX && dout == (uint32_t)D_MODEL
+                          && (din == dout || din == 3u * dout) && plen >= 16 + nh * 2))
+                        die("zl.RRR L%d 混装记录非法: k=%u din=%u dout=%u plen=%llu need=%llu — 拒绝静默丢放大器",
+                            L, zk, din, dout, (unsigned long long)plen,
+                            (unsigned long long)(16 + nh * 2));
+                    row[0] = 6.0f; row[1] = tr; row[2] = (float)zk; row[3] = (float)din;
+                    chain_add(&chain, row);
+                    free(zlm); zlm_len = (size_t)(nh * 2); zlm = xmalloc(zlm_len);
+                    memcpy(zlm, pay + 16, zlm_len);
                 } else if (strstr(nm, "GLhc") && plen >= 8) {
                     memcpy(&gh, pay, 4); memcpy(&gc, pay + 4, 4); has_glhc = 1;
                 } else if (strstr(nm, ".GL") && plen >= 4) {
@@ -149,7 +156,7 @@ static int build_opt_tensors(const char *dql_dir, int L, elist_t *out) {
                     uint8_t hdr[REC_HDR];
                     if (fread(hdr, 1, REC_HDR, f) < REC_HDR) break;
                     char nm[17]; memcpy(nm, hdr, 16); nm[16] = 0;
-                    uint64_t psz; memcpy(&psz, hdr + 88, 8);
+                    uint64_t psz; memcpy(&psz, hdr + DS4_AMP_REC_OFF_PSZ, 8);
                     if (strstr(nm, "zl.RRR") && psz >= 16) {
                         uint8_t *pay = xmalloc((size_t)psz);
                         size_t pn = fread(pay, 1, (size_t)psz, f);
@@ -160,7 +167,7 @@ static int build_opt_tensors(const char *dql_dir, int L, elist_t *out) {
                         memcpy(&zk, pay, 4); memcpy(&tr, pay + 4, 4);
                         memcpy(&din, pay + 8, 4); memcpy(&dout, pay + 12, 4);
                         uint64_t nh = (uint64_t)zk + (uint64_t)zk * dout + (uint64_t)zk * din;
-                        if (!(zk > 0 && zk <= DS4_AMP_ZK_MAX && dout == 4096u
+                        if (!(zk > 0 && zk <= DS4_AMP_ZK_MAX && dout == (uint32_t)D_MODEL
                               && (din == dout || din == 3u * dout) && pn >= 16 + nh * 2))
                             die("zl.RRR L%d 记录非法: k=%u din=%u dout=%u pn=%zu need=%llu — 拒绝静默丢放大器",
                                 L, zk, din, dout, pn, (unsigned long long)(16 + nh * 2));
@@ -219,7 +226,7 @@ static int build_opt_tensors(const char *dql_dir, int L, elist_t *out) {
         uint8_t *data = xmalloc(nb);
         for (size_t i = 0; i < v8.n; i++) memcpy(data + i * V8SZ, v8.b[i], V8SZ);
         snprintf(nmbuf, sizeof nmbuf, "blk.%d.opt_v8.weight", L);
-        el_push1(out, nmbuf, (uint64_t)(v8.n * 8 * 4096), 1, nb, K_OPT)->data = data;
+        el_push1(out, nmbuf, (uint64_t)(v8.n * 8 * D_MODEL), 1, nb, K_OPT)->data = data;
         n++;
     }
     if (zlm) {
