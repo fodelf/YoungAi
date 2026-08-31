@@ -7935,3 +7935,31 @@ make -C gguf-tools all amp calib bench tools-test 全绿。
 CUDA 首编三项真模型闸未跑, 须在有模型的机器补验后才算过 per-merge 闸。★
 遗骸待用户裁决: tools/mtp_pipe_q2_speed.sh(MTP 遗骸)/refcorpus_ab.sh(A/B 两腿已等价)/
 dspark_anchor_corpus.sh 锚采集腿(诊断已删)。
+
+## 2026-08-31 反修已知 bug 五连修(纯代码审计发现, restructure 分支)
+
+用户令"重新只看代码分析层内好/端到端差, 再把已知 bug 修复"。五个独立 commit:
+
+① **z 夹持契约统一无权范数**(bc346ff): CPU host 曾按 zl.4L classify 权加权夹持,
+  CUDA/Metal kernel 与判决尺 zreplay 全是无权 —— 同一份侧车三种前向, 且择优从未
+  评过加权口径。删 host 特例(w4norm 字段整族), 契约收敛全线 ‖Δ‖≤tr·‖routed‖;
+  zl.4L 保留给 posttrain_z。ut_4l 前向调制用例随删, 其余单测绿。
+② **tr 写值单一定义源**(56d70b1): DS4_AMP_ZL_TR=0.5f 入 ds4_amp_fmt.h; zloss_solve
+  发射评估实际用的 --tr(旧版死写 0.5 = --tr≠0.5 时择优与部署夹持强度分叉);
+  tr≤0 无部署编码(引擎读成修正清零), 发射时停车。
+③ **zloss_solve 禁默认按行号切**(25c2d0f): 无 --fit-ranges 时从 <锚>.layout 推导
+  (row_layout 同一份实现), 读不到硬停 —— 与 zlayer 同款; 只 --selftest 保留行号切。
+④ **zlayer held 打分改部署同式**(fd4d84b): 旧评估 f64 无夹持选 K/过闸/报层内挽回,
+  落盘却是 f16+整行 0.5 夹持 ⇒ 层内数字系统性虚高("层内好端到端差"的评估侧直接
+  来源)。解算因子就地舍 f16 格点(emit 幂等字节不变); k曲线/GE靶/组合终验全按每行
+  夹持基打分(XCAP=YQE, 否则 Σw·pYQ 重建)。★下轮 43 层的 held 读数会比旧口径低,
+  那是挤掉的水分, 不是退化。★
+⑤ **非 ADDON 注入前对账底座 dql**(5684425): 底座带 vd=1 λ族/实体 zl.RRR/zl.ERF
+  op 即停车(bf.GE 例外=末条替换语义自洽) —— 非 ADDON 解算不建模既有链, 注入=同一
+  残差修两遍。合成 dql 六例冒烟全对。★若 champ86 的 layers_quant 真带 --tune 落的
+  op, 下轮 amp_clean_full 会在 L0 停车 —— 那是 bug 现形, 选剥离或 --addon。★
+
+验证: make test 全绿(unit/linecount/server/engine-units/rax/tp-allreduce/metal-kernels;
+真模型套件 SKIP), make -C gguf-tools amp + tools-test 全绿, zloss --selftest 绿。
+未修(结构性, 非本轮): x/路由在 FP 锚空间拟合部署在链态空间(XCAP 支柱挂账)、跨语料闸缺失。
+★spark 侧须重编 zlayer/zloss_solve/ds4quant_run+引擎后才可发车下一轮反修。★
