@@ -1167,11 +1167,62 @@ stage_champ_rbsweep(){
     echo "选定后写 $W/rb_alpha.txt, 合并段自动读取"
 }
 
+# ═══ 链态口径 A/B 针(2026-08-31, 纯诊断不在 all 链)═══
+# 回答 08-24 挂账的主 bug(x=锚 fin 与部署分布错位, 行 cos L3=0.961/L20=0.875/L40=0.797):
+# 在部署同式打分+跨语料闸(本日落地)下, 链态 x 解算(--xanchor)的层内→跨语料兑现是否
+# 优于冠军 FP-x 口径。历史上链态口径两次翻车(XCAP 全量 0.47364 / v1 混合口径 36 层判空),
+# 但那是在旧评估(无夹持无 f16 无行掩码)下判的 —— 本针在修好的尺上重新问一遍。
+# 两臂唯一差异=--xanchor; INJ=0 纯解算, 探针工作区用后即弃, 不碰任何量化产物。
+CHAINX_L=20   # 08-24 实测行 cos 0.875 的中深层: 错位已显著、又不是最深的极端样本
+stage_chainx(){
+    local D2="$ROOT/gguf/go-onebit/vqhalf" W="$D2/champ86"
+    local AIDS="$D2/vqhalf_a.ids" AANC="$D2/anchor_a_clean_s8192.bin"
+    local QANC="$D2/anchor_vqhalf_q_s8192.bin" CHANC="$D2/chain_a_champ86.bin"
+    [ -d "$W/layers_quant" ] || DIE "纯净量化态缺($W/layers_quant)"
+    [ -s "$AANC" ] && [ -s "$AANC.layout" ] || DIE "反修锚/布局缺"
+    [ -s "$QANC" ] || DIE "量化半锚缺(跨语料闸料)"
+    # ①链态锚: 判决尺同款回放(caliper_ref 口径)跑反修半 ids, 顺手 --chain-anchor 直写
+    #   链态 fin/路由 —— 捕的是【裸量化链】(零放大器), 正是第一轮解算的部署输入。
+    if [ ! -s "$CHANC" ]; then
+        LOG "①链态锚捕获(裸量化链回放 a 份 8192 行, 约 30 分钟/23GB)"
+        watchdog_start
+        local LCx BFMEM
+        LCx=$(printf "g%.0s" $(seq 1 43))
+        BFMEM=$(awk '/MemTotal/{printf "%.0f", $2/1048576/2}' /proc/meminfo 2>/dev/null || echo 0)
+        ( cd "$QD" && env OPENBLAS_NUM_THREADS=1 \
+            MALLOC_MMAP_THRESHOLD_=1073741824 MALLOC_TRIM_THRESHOLD_=1073741824 \
+            ./ds4quant_run "$AIDS" "$S" --hf "$DS4_HF" --bf-memgb "$BFMEM" \
+            --bf-only --coadapt 1 --calib-fullset --export-bytes 0 \
+            --anchor "$AANC" --nfit 1 --threads 20 \
+            --layer-dir "$W/layers_quant" --lcfg "$LCx" --vq --tgt-alpha 1.0 \
+            --chain-anchor "$CHANC" ) > /tmp/chainx_cap.log 2>&1
+        watchdog_stop
+        [ -s "$CHANC" ] || { tail -5 /tmp/chainx_cap.log; DIE "链态锚没落盘"; }
+    else LOG "①链态锚已在, 跳过"; fi
+    # ②探针工作区(dql_vq 硬链只读 + dql 真拷贝, layers_quant 一个字节不动)
+    local P="$D2/chainx_probe"; rm -rf "$P"; mkdir -p "$P"
+    ( cd "$W/layers_quant" && \
+      for f in dql_vq_L*.bin; do ln -f "$f" "$P/$f" 2>/dev/null || cp "$f" "$P/"; done && \
+      cp dql_L*.bin "$P/" )
+    # ③两臂同层同闸(INJ=0 纯解算): 读数各四样 = held挽回 / 分域 / 跨语料闸 / 组合
+    local ZLB2="$ROOT/gguf-tools/amp/zlayer"
+    [ -x "$ZLB2" ] || make -C "$ROOT/gguf-tools" zlayer
+    LOG "③A臂 FP-x(冠军口径) L$CHAINX_L"
+    "$ZLB2" "$DS4_HF" "$P" "$AANC" "$CHAINX_L" 64 0 --ntok "$S" --gate-anchor "$QANC" \
+        2>&1 | grep -aE "k曲线|终判|分域|跨语料|z侧车|Error|assert|★"
+    rm -f "$P"/zcache_L*.npz
+    LOG "③B臂 链态x(--xanchor) L$CHAINX_L"
+    "$ZLB2" "$DS4_HF" "$P" "$AANC" "$CHAINX_L" 64 0 --ntok "$S" --gate-anchor "$QANC" \
+        --xanchor "$CHANC" 2>&1 | grep -aE "k曲线|终判|分域|跨语料|z侧车|Error|assert|★"
+    rm -rf "$P"
+    LOG "④读法: 比两臂【跨语料闸挽回】—— 链态x 更高=兑现改善(换口径有肉), 更低=历史判决维持"
+}
+
 ST="${1:-all}"
 case "$ST" in
   preflight) stage_preflight;; ids) stage_ids;; anchor) stage_anchor;;
   capture) stage_capture;; probe) stage_probe;; solve) stage_solve;; pass2) stage_pass2;;
-  chain) stage_chain;; judge) stage_judge;; dilute) stage_dilute;; idshalf) stage_idshalf;; idshalf_ext) shift; stage_idshalf_ext "$@";; vqmerge) stage_vqmerge;; vqcap) stage_vqcap;; vqsolve) stage_vqsolve;; dynladder) stage_dynladder;; dynquant) shift; stage_dynquant "$@";; dynjudge) stage_dynjudge;; champbf) shift; stage_champbf "$@";; champ86) stage_champ86;; champreset) stage_champ_reset;; champ3rd) stage_champ3rd;; corpdiff) stage_corpdiff;; anchors3) stage_anchors3;; champ3) stage_champ3;; elmprobe) stage_elmprobe;; probe3) stage_probe3;; judge3) shift; stage_judge3 "$@";; champrb) stage_champ_rbsweep;; full) shift; stage_full "$@";;
+  chain) stage_chain;; judge) stage_judge;; dilute) stage_dilute;; idshalf) stage_idshalf;; idshalf_ext) shift; stage_idshalf_ext "$@";; vqmerge) stage_vqmerge;; vqcap) stage_vqcap;; vqsolve) stage_vqsolve;; dynladder) stage_dynladder;; dynquant) shift; stage_dynquant "$@";; dynjudge) stage_dynjudge;; champbf) shift; stage_champbf "$@";; champ86) stage_champ86;; champreset) stage_champ_reset;; champ3rd) stage_champ3rd;; corpdiff) stage_corpdiff;; anchors3) stage_anchors3;; champ3) stage_champ3;; elmprobe) stage_elmprobe;; probe3) stage_probe3;; judge3) shift; stage_judge3 "$@";; champrb) stage_champ_rbsweep;; chainx) stage_chainx;; full) shift; stage_full "$@";;
   all) stage_preflight; stage_ids; stage_anchor; stage_capture
        stage_solve; stage_chain; stage_judge;;
   *) echo "未知段: $ST"; echo "段: preflight ids anchor capture solve pass2 chain judge dilute all (probe/dilute=诊断)"; exit 2;;
