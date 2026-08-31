@@ -1,4 +1,8 @@
-/* metal_args.h — ds4_metal.m 全部 kernel args typedef(机械搬移)。仅经 metal_internal.h 包含。 */
+/* metal_args.h — ds4_metal.m 全部 kernel args typedef(机械搬移)。仅经 metal_internal.h 包含。
+ * ★双写契约(2026-08-31 魔数扫描建档)★: 本文件每个 ds4_gpu_*_args 在 metal/*.metal 里
+ * 都有一份逐字段手写的 MSL struct 镜像(共 40+ 对), 二进制布局(字段序/宽度/隐式对齐)
+ * 必须逐位一致, 而全仓无自动对拍 —— shader 运行时源码编译, host 侧 static_assert 够不到
+ * 它。改任何 args: 两侧同改, 并留意 uint64_t 引入的 8 字节对齐洞。 */
 #ifndef DS4_METAL_ARGS_H
 #define DS4_METAL_ARGS_H
 

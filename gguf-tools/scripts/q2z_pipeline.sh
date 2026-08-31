@@ -6,7 +6,12 @@ SC="$HOME/ds4-main/gguf-tools/scripts"
 LAYERS="$HOME/ds4-main/gguf/go-onebit/r30/full/layers"
 LOG(){ echo "[pipeline $(date +%H:%M:%S)] $*"; }
 
-while [ "$(wc -l < "$LAYERS/zinject_manifest.txt" 2>/dev/null || echo 0)" -lt 43 ]; do sleep 300; done
+# 等待上限 24h: manifest 永不出现时旧版无限死等, 现在超时响亮退出
+_wait=0
+while [ "$(wc -l < "$LAYERS/zinject_manifest.txt" 2>/dev/null || echo 0)" -lt 43 ]; do
+  sleep 300; _wait=$((_wait+300))
+  [ "$_wait" -ge 86400 ] && { LOG "★等 zinject_manifest 超 24h, 上游没跑或路径错, 停★"; exit 1; }
+done
 LOG "① metrics 回放验证"
 bash "$SC/q2z_spark.sh" metrics > /tmp/q2z_metrics.log 2>&1
 LOG "metrics rc=$? (指标在 /tmp/q2z_metrics.log)"

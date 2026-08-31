@@ -137,7 +137,7 @@ typedef struct { pf_fn fn; void *ctx; int i0, i1; } pf_arg;
 static void *pf_tramp(void *a) { pf_arg *p = (pf_arg *)a; p->fn(p->ctx, p->i0, p->i1); return NULL; }
 static void parallel_for(int n, int threads, pf_fn fn, void *ctx) {
     if (threads > n) threads = n > 0 ? n : 1;
-    if (threads > 64) threads = 64;
+    if (threads > 64) threads = 64;   /* 帽=th[64]/pa[64] 栈数组; 只影响速度不影响数值 */
     pthread_t th[64]; pf_arg pa[64];
     int per = (n + threads - 1) / threads, nt = 0;
     for (int t = 0; t < threads; t++) {
