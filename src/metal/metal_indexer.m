@@ -286,7 +286,7 @@ static int ds4_gpu_indexer_scores_batch_tensor(
             [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_comp + 31u) / 32u,
                                                   ((NSUInteger)n_tokens + 7u) / 8u,
                                                   1)
-                 threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+                 threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];   /* =128 线程: shader 循环步长裸写 i+=128, 改这里必改 dsv4_misc_indexer.metal */
         } else {
             const NSUInteger q_shared = 8u * 128u;
             const NSUInteger k_shared = 32u * 128u;
@@ -296,7 +296,7 @@ static int ds4_gpu_indexer_scores_batch_tensor(
             [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_comp + 31u) / 32u,
                                                   ((NSUInteger)n_tokens + 7u) / 8u,
                                                   1)
-                 threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+                 threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];   /* 同上: 128 线程与 shader i+=128 成对 */
         }
         ds4_gpu_end_compute_encoder(cb, enc);
 

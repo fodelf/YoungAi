@@ -329,6 +329,8 @@ int ds4_gpu_matmul_f16_tensor(
         [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        /* 6144/8192 从 dense_mm.metal 的布局手推(sb=shmem+4096, NR0=64, NR1=32,
+         * bc 尾块加 temp_str 段) —— shader 无 include 路径, 改布局必同步这两个数 */
         [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u) atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_tok + 31u) / 32u,
                                               ((NSUInteger)out_dim + 63u) / 64u,

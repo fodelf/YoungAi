@@ -135,7 +135,11 @@ static uint64_t ds4_phys_footprint_bytes(void) {
  * footprint yet DO drive system pressure. Sustained critical pressure starves
  * watchdogd -> kernel watchdog panic + reboot (observed 2026-07-06: single-host
  * offload generation on the full mono panicked M4 while footprint read a healthy
- * 8.2 GiB). Returns 1 (normal) on any read failure so the guard fails safe. */
+ * 8.2 GiB). Read failure returns 1 (normal) ON PURPOSE, not as a silent
+ * disarm: the non-Apple branch below has no such sysctl at all (Linux/CUDA
+ * hosts rely on their own guards), and failing closed there would read as
+ * permanent CRITICAL and _exit() every process within 4s. On Apple this
+ * sysctl is always readable in practice. */
 static int ds4_system_mem_pressure_level(void) {
     int level = 1; size_t len = sizeof(level);
     if (sysctlbyname("kern.memorystatus_vm_pressure_level", &level, &len, NULL, 0) != 0) return 1;
