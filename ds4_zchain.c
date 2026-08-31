@@ -218,7 +218,6 @@ ds4_zchain *ds4_zchain_load(const char *path, uint32_t n_layer, uint32_t n_exper
     }
     uint32_t n_zl = 0, n_rte = 0;
     for (uint32_t il = 0; il < n_layer; il++) {
-        z->layer[il].zl.w4norm = z->layer[il].l4.wnorm;   /* 4L→z 信任域加权链接 */
         if (z->layer[il].ge) z->n_ge_layers++;
         if (z->layer[il].zl.zlk) n_zl++;
         if (z->layer[il].rte.zlk) n_rte++;
@@ -290,18 +289,18 @@ void ds4_zchain_zl_apply(const ds4_zchain_zl *zl, uint32_t d_model, const float 
     const uint32_t din = zl->zdin ? zl->zdin : d;   /* md86: 3d = ftA feature lift */
 
     /* 线性 z(din==d): 修正走 ds4_z 模块 —— 与反修解算器同一份实现(2026-08-26 复用定案)。
-     * 信任域夹持(‖Δ‖ ≤ tr·‖routed‖)是运行时语义, 留在模块外面(判决尺 tr=0.5 同契约)。
+     * 信任域夹持(‖Δ‖ ≤ tr·‖routed‖)是运行时语义, 留在模块外面。★无权范数是三方契约★
+     * (2026-08-31): CUDA/Metal kernel 与判决尺 zreplay 都是无权, 曾经只在这里按 zl.4L
+     * classify 权加权 = 同一份侧车 CPU/GPU/判决尺三种前向, 已删。
      * 精度注: 模块 f32 累加 vs 旧手抄 f64, 尾位差(单测 ut_zmod_parity 盯 1e-4 相对)。 */
     if (zl->zmod) {
         float *delta = calloc(d, sizeof(float));
         if (!delta) return;
         ds4_z_apply(zl->zmod, x, delta);
         double nd = 0.0, nr = 0.0;
-        const float *w4 = zl->w4norm;    /* zl.4L classify 权: 重要维度说了算的夹持 */
         for (uint32_t j = 0; j < d; j++) {
-            const double wj = w4 ? (double)w4[j] : 1.0;
-            nd += wj * (double)delta[j] * delta[j];
-            nr += wj * (double)routed[j] * routed[j];
+            nd += (double)delta[j] * delta[j];
+            nr += (double)routed[j] * routed[j];
         }
         nd = sqrt(nd); nr = sqrt(nr);
         const double cap = (double)zl->zltr * nr;
@@ -370,9 +369,8 @@ void ds4_zchain_zl_apply(const ds4_zchain_zl *zl, uint32_t d_model, const float 
         double a = 0.0;
         const uint16_t *ur = hU + (size_t)j * k;
         for (uint32_t c = 0; c < k; c++) a += pv[c] * (double)zc_fp16_to_fp32(ur[c]);
-        const double wj = zl->w4norm ? (double)zl->w4norm[j] : 1.0;
-        nd += wj * a * a;
-        nr += wj * (double)routed[j] * (double)routed[j];
+        nd += a * a;
+        nr += (double)routed[j] * (double)routed[j];
     }
     nd = sqrt(nd); nr = sqrt(nr);
     double cap = (double)zl->zltr * nr;

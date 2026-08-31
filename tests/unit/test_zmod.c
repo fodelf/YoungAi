@@ -56,10 +56,10 @@ static int zm_case(uint32_t d, uint32_t k, float zscale, const char *tag) {
 }
 
 /* ---- ut_4l: 四损失参数在引擎侧真生效(2026-08-26 用户架构落地闸) ----
- * ①前向调制: zl.4L 的 classify 权进信任域范数 ⇒ 同一份 z 在加权/平权下夹持不同,
- *   且"重要维度大误差"必须被压得更狠(w4norm 挂上后 Δ 缩放更小)。
- * ②引擎内调 z: ds4_zchain_posttrain_z 用四损失权闭式重解 z, 对种进去的真 z
- *   必须显著收回(align 口径的相对误差降一个量级以上)。 */
+ * 引擎内调 z: ds4_zchain_posttrain_z 用四损失权闭式重解 z, 对种进去的真 z
+ * 必须显著收回(align 口径的相对误差降一个量级以上)。
+ * (旧①"前向调制夹持分叉"用例已删 2026-08-31: w4 加权夹持只有 CPU host 实现过,
+ * CUDA/Metal/判决尺全是无权 —— 特例整族删除, 夹持契约全线无权。) */
 static int fourl_case(void) {
     const uint32_t d = 256, k = 6;
     ds4_z zm; memset(&zm, 0, sizeof zm);
@@ -74,21 +74,7 @@ static int fourl_case(void) {
     float *w4 = malloc(d * 4);
     for (uint32_t j = 0; j < d; j++) w4[j] = (j < d / 8) ? 8.0f : 0.5f;   /* 前 1/8 维=重要 */
 
-    /* ① 加权 vs 平权信任域: Δ 能量集中在重要维 ⇒ 加权范数更大 ⇒ 夹持更狠 */
-    for (uint32_t c = 0; c < k; c++) zm.z[c] = ztrue[c] * 40.0f;          /* 触发夹持 */
-    float *x = malloc(d * 4), *r1 = malloc(d * 4), *r2 = malloc(d * 4);
-    for (uint32_t j = 0; j < d; j++) { x[j] = (j < d / 8) ? 3.0f * zm_rnd() : 0.2f * zm_rnd(); }
-    for (uint32_t j = 0; j < d; j++) r1[j] = r2[j] = zm_rnd();
-    a.w4norm = NULL;  ds4_zchain_zl_apply(&a, d, x, r1);
-    a.w4norm = w4;    ds4_zchain_zl_apply(&a, d, x, r2);
-    double n1 = 0, n2b = 0, base = 0;
-    for (uint32_t j = 0; j < d; j++) {
-        n1 += (double)r1[j] * r1[j]; n2b += (double)r2[j] * r2[j]; base += 1.0;
-    }
-    int bad1 = !(fabs(n1 - n2b) > 1e-9);   /* 两路必须真不同 = 参数确实进了前向 */
-    printf("  ut_4l 前向调制 ‖r‖²平权=%.4f 加权=%.4f %s\n", n1, n2b, bad1 ? "FAIL" : "PASS");
-
-    /* ② 引擎内调 z: 造 (X,R,Yt), R 由 ztrue 生成, 看闭式重解能否收回 */
+    /* 引擎内调 z: 造 (X,R,Yt), R 由 ztrue 生成, 看闭式重解能否收回 */
     const uint32_t n = 400;
     float *X = malloc((size_t)n * d * 4), *R = malloc((size_t)n * d * 4), *Yt = malloc((size_t)n * d * 4);
     for (uint32_t c = 0; c < k; c++) zm.z[c] = ztrue[c];
@@ -104,7 +90,7 @@ static int fourl_case(void) {
     l4.seed = 1; l4.dscale = 0.04f; l4.d = d; l4.wnorm = w4;
     ds4_zchain zc; memset(&zc, 0, sizeof zc);
     ds4_zchain_layer lay; memset(&lay, 0, sizeof lay);
-    lay.zl = a; lay.zl.w4norm = w4; lay.l4 = l4;
+    lay.zl = a; lay.l4 = l4;
     zc.n_layer = 1; zc.d_model = d; zc.layer = &lay;
     double e0 = 0, tn = 0;
     for (uint32_t c = 0; c < k; c++) { zm.z[c] = 0.0f; e0 += (double)ztrue[c] * ztrue[c]; tn += (double)ztrue[c] * ztrue[c]; }
@@ -116,8 +102,8 @@ static int fourl_case(void) {
     printf("  ut_4l 引擎内调z rc=%d 相对误差 %.3f→%.3f %s\n", rc, rel0, rel1, bad2 ? "FAIL" : "PASS");
 
     free(zm.z); free(zm.U); free(zm.V); free(ztrue); free(w4);
-    free(x); free(r1); free(r2); free(X); free(R); free(Yt);
-    return bad1 + bad2;
+    free(X); free(R); free(Yt);
+    return bad2;
 }
 
 int unit_zmod(void) {

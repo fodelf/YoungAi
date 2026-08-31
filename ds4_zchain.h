@@ -60,12 +60,13 @@ typedef struct {
     const uint16_t *zlm;    /* fp16 z[k] | U[d_model*k] | V[zdin*k] */
     ds4_z          *zmod;   /* din==d_model 的线性 z: 载入时转 f32, apply 走 ds4_z 模块
                              * (与反修解算器同一份实现); din=3d ftA 走下方 fp16 旧路 */
-    const float    *w4norm; /* 同层 zl.4L 的归一 classify 权(载入后链接); NULL=平权范数 */
 } ds4_zchain_zl;
 
-/* type10 zl.4L(2026-08-26 用户架构定案): 四损失参数文件 — 放大器产/引擎耗, 双用:
- * ①前向调制: classify 权向量进 z 信任域范数(重要维度说了算的夹持, w4norm 挂到 zl);
- * ②引擎内调 z 的尺: ds4_zchain_posttrain_z 按四权重解 z 对角(z=天然 LoRA 位)。 */
+/* type10 zl.4L(2026-08-26 用户架构定案): 四损失参数文件 — 放大器产/引擎耗:
+ * 引擎内调 z 的尺 — ds4_zchain_posttrain_z 按四权重解 z 对角(z=天然 LoRA 位)。
+ * ★前向调制(classify 权进夹持范数)已删(2026-08-31)★: 只有 CPU host 实现了它,
+ * CUDA/Metal kernel 与判决尺回放全是无权范数, 解算器择优也没建模 —— 同一份侧车
+ * 三种前向结果。夹持契约收敛为全线无权(‖Δ‖≤tr·‖routed‖, 判决尺同式)。 */
 typedef struct {
     float           w[4];    /* w_align, w_classify, w_smooth, w_fixed */
     uint64_t        seed;    /* dither 种子(L_smooth) */
