@@ -24,6 +24,7 @@
 #include "row_layout.inc.c"   /* 行布局→分层行选取(与 ds4quant_run 共用一份); 必须在 p1 之前=文件作用域 */
 #include "zlayer_p1.inc.c"
 #include "zlayer_p2.inc.c"
+#include "zlayer_build.inc.c" /* 配对构建唯一实现(主解算+跨语料闸两处同源); p3 起进 main, 须在此前 */
 #include "zlayer_p3.inc.c"
 #include "zlayer_p4.inc.c"
 #include "zlayer_p5.inc.c"

@@ -15,6 +15,9 @@ SRCBASE=$D2/champ86/layers_quant     # 底座=本轮量化态备份(唯一还原
 ANC=$D2/anchor_a_clean_s8192.bin     # 干净 FP 锚(2026-08-24 毒锚事故后口径; 尺寸下面实检, 错锚 PPL 飙 2.4e7 一眼假)
 ZL_K=64                              # 冠军秩: K64 直解 0.42510 > k1024 解算再截断 0.43410 > amp2 0.42792(fable5 6688)
 ZL_NTOK=8192                         # 拟合行数=放大器半语料全量(与锚同源 S=8192)
+# 跨语料闸料(2026-08-31 落地): 量化半 FP 锚 —— 与反修半零重叠、又不是判决锚(判决锚进闸
+# =对判决做模型选择, 铁律禁止)。同语料 held 正/量化半负 = 过拟合层, zlayer 闸内自动拒注。
+QANC=$D2/anchor_vqhalf_q_s8192.bin
 HF=$HOME/ds4-main/hf/DeepSeek-V4-Flash-0731
 # XCAP/XANCHOR 不在冠军配方(FP-x 口径; "学生=引擎真值"支柱未兑现 —— 实测不接引擎捕获时
 # x=锚fin 与部署分布错位, 行cos L3=0.961/L20=0.875/L40=0.797, z 层内收益部署不兑现,
@@ -29,7 +32,8 @@ NL=43; S=8192; DIM=4096; NSEL=6; VOCAB=129280   # 层数/校准行数/隐维/每
 EXP=$(( 40 + NL*S*DIM*4 + 2*NL*S*NSEL*4 + NL*S*4*DIM*4 + S*VOCAB*4 ))
 sz=$(stat -c %s "$ANC" 2>/dev/null || echo 0)
 [ "$sz" -eq "$EXP" ] || { LOG "★锚缺/尺寸不符($sz≠$EXP): $ANC★"; exit 1; }
-LOG "①干净锚实检 ✓ $(du -h $ANC | cut -f1)"
+[ -s "$QANC" ] || { LOG "★跨语料闸料缺(量化半锚): $QANC★"; exit 1; }
+LOG "①干净锚实检 ✓ $(du -h $ANC | cut -f1) + 闸料 ✓"
 # ②反修工作区(全量重跑铁律: 从量化态备份干净起; dql_vq 硬链只读, dql_L 真拷贝可注入)
 rm -rf $D2/$WS
 mkdir -p $D2/$WS/layers
@@ -48,8 +52,8 @@ ZLB="$HOME/ds4-main/gguf-tools/amp/zlayer"
 [ -x "$ZLB" ] || make -C "$HOME/ds4-main/gguf-tools" zlayer
 for L in ${LRANGE:-$(seq 0 42)}; do
   "$ZLB" "$HF" $D2/$WS/layers "$ANC" $L "$ZL_K" 1 \
-    --ntok "$ZL_NTOK" \
-    2>&1 | grep -aE "XCAP|Error|assert|★" || { LOG "★L$L 失败★"; exit 1; }
+    --ntok "$ZL_NTOK" --gate-anchor "$QANC" \
+    2>&1 | grep -aE "XCAP|跨语料|Error|assert|★" || { LOG "★L$L 失败★"; exit 1; }
   # 进度可观测铁律: 每层收官打一行(tail -f 就能看到 43 层推进)
   # INJ=1 走 dql 注入不写 zrec ⇒ 旧的 zrec 计数恒 0/43(观测 bug); 改数注入账本行
   LOG "L$L ✓ $(grep -c '' "$D2/$WS/layers/zinject_manifest.txt" 2>/dev/null || echo 0)/43 K=$ZL_K"

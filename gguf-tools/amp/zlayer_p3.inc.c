@@ -342,8 +342,8 @@ int main(int argc, char **argv) {
     /* 二期支路与解算参数。原 DS4_ZL_* env(2026-08-31 禁 env 铁律清退), 现为跟在位置参数
      * 后的 --flag; 缺省值 = 原 env 不设时的行为, 逐个未动。ADDON 的"没 XANCHOR 就不生效"
      * 是 .py 权威口径(它把 ADDON 的读取整块写在 if XAP: 里面), 不"修正", 只多打一行提示。 */
-    const char *GGP = NULL, *XAP = NULL;
-    int ADDON = 0, CACHE_ONLY = 0;
+    const char *GGP = NULL, *XAP = NULL, *GATEA = NULL;
+    int ADDON = 0, CACHE_ONLY = 0, NGATE = 2048;
     int NTOK = 0, FTA = 1, GE_ON = 1, ERF_EN = 1, ERF_RANK = 8;
     float SWLIM = 10.0f;
     double GATE = 0.0, GELAM = 1e-3, ERF_BAR = 0.01;
@@ -355,6 +355,8 @@ int main(int argc, char **argv) {
         else if (!v) die("flag %s 缺值", a);
         else if (!strcmp(a, "--gguf"))    { GGP = *v ? v : NULL; ai++; }
         else if (!strcmp(a, "--xanchor")) { XAP = *v ? v : NULL; ai++; }
+        else if (!strcmp(a, "--gate-anchor")) { GATEA = *v ? v : NULL; ai++; }
+        else if (!strcmp(a, "--gate-rows"))   { NGATE = atoi(v); ai++; }
         else if (!strcmp(a, "--ntok"))    { NTOK = atoi(v); ai++; }
         else if (!strcmp(a, "--swlim"))   { SWLIM = (float)atof(v); ai++; }
         else if (!strcmp(a, "--fta"))     { FTA = atoi(v); ai++; }

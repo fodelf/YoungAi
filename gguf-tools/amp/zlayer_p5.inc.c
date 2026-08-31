@@ -273,5 +273,86 @@
          * 一正一负。不同向 ⇒ eff 记 0, p7 的闸自动拒。NAN(半区空)同拒, 保守方向。 */
         if (eff > 0 && !(dv[0] > 0 && dv[1] > 0)) eff = 0.0;
     }
+    /* ★跨语料闸(--gate-anchor, 2026-08-31)★ 三等分语料后闸一直只看同语料 held ⇒
+     * 256 门+rank64 图对拟合语料过拟合照样过闸(同文档相邻段同分布, held 虚高)。
+     * 闸料=量化半锚: 与反修半零重叠、又不是判决锚(判决锚进闸=对判决做模型选择,
+     * run_p4 路由 FIT 同款铁律禁止)。口径与主解算同(FP 自洽, 同 dql 学生), 打分与
+     * held 同式(f16 因子+整行夹持+GE)。行=全锚等距抽(闸锚行序是域连续块, 取头 N 行
+     * 只会闸到第一个域); 闸是读数不是拟合, 默认 2048 行足够判符号。挽回≤0 ⇒ 拒注。
+     * ADDON 不闸(部署 op 是新旧合并体, 单评新解=错对象; 冠军配方非 ADDON)。 */
+    if (GATEA && !ADDON && eff > GATE && (K > 0 || USE_GE)) {
+        int Sg = 0;
+        { FILE *gfp = fopen(GATEA, "rb"); uint32_t h8[8];
+          if (!gfp || fread(h8, 4, 8, gfp) != 8) die("闸锚打不开: %s", GATEA);
+          fclose(gfp); Sg = (int)h8[1]; }
+        float *Xg = NULL, *rwg = NULL; int *ridxg = NULL; ameta_t amg;
+        anchor_layer(GATEA, L, Sg, &Xg, &ridxg, &rwg, &amg);
+        if (amg.NACT != am.NACT) die("闸锚 NACT=%d ≠ 主锚 %d — 口径不明拒闸", amg.NACT, am.NACT);
+        int NG = NGATE > Sg ? Sg : NGATE, step = Sg / NG;
+        for (int i = 0; i < NG; i++) {          /* 等距压紧到前 NG 行(src≥dst, 前向安全) */
+            int s2 = i * step;
+            memmove(Xg + (size_t)i * D, Xg + (size_t)s2 * D, (size_t)D * 4);
+            memmove(ridxg + (size_t)i * amg.NACT, ridxg + (size_t)s2 * amg.NACT, (size_t)amg.NACT * 4);
+            memmove(rwg + (size_t)i * amg.NACT, rwg + (size_t)s2 * amg.NACT, (size_t)amg.NACT * 4);
+        }
+        float *dHg, *pwg, *pYQg; int *prowg, *peg; long long npg;
+        zl_build_pairs(hf, ld, GGP, &gg, L, NG, amg.NACT, SWLIM, Xg, ridxg, rwg,
+                       0, NULL, NULL, NULL, NULL, 1, &dHg, &prowg, &peg, &pwg, &pYQg, &npg);
+        float *ysg = (float *)xcalloc((size_t)NG * D, 4);   /* 学生基行范数=夹持 cap */
+        for (long long p2 = 0; p2 < npg; p2++) {
+            float *dst = ysg + (size_t)prowg[p2] * D;
+            const float *y = pYQg + (size_t)p2 * D;
+            for (int j = 0; j < D; j++) dst[j] += pwg[p2] * y[j];
+        }
+        float *corr = (float *)xcalloc((size_t)NG * D, 4);
+        if (K > 0) {                            /* 冠军形态投影(因子已在 f16 格点) */
+            const int ftaW = !strcmp(FORM, "ftA");
+            const int din = ftaW ? DIN3 : D, r = ftaW ? rfta : rlin;
+            const double *AA = ftaW ? Af : A, *SS2 = ftaW ? Sf : S, *BB = ftaW ? Bf : Bt;
+            double *Ph = (double *)xmalloc((size_t)NG * din * sizeof(double));
+            if (ftaW) {
+                float *P32 = (float *)xmalloc((size_t)NG * DIN3 * 4);
+                phi32_ctx pc = {Xg, P32, D};
+                parallel_for(NG, phi32_worker, &pc);
+                for (size_t i2 = 0; i2 < (size_t)NG * DIN3; i2++) Ph[i2] = P32[i2];
+                free(P32);
+            } else for (size_t i2 = 0; i2 < (size_t)NG * D; i2++) Ph[i2] = Xg[i2];
+            double *AS = (double *)xmalloc((size_t)din * K * sizeof(double));
+            for (int i2 = 0; i2 < din; i2++) for (int c = 0; c < K; c++)
+                AS[(size_t)i2 * K + c] = AA[(size_t)i2 * r + c] * SS2[c];
+            double *Pv = (double *)xmalloc((size_t)NG * K * sizeof(double));
+            mm64(0, 0, NG, K, din, Ph, din, AS, K, Pv, K);
+            double *pr2 = (double *)xmalloc((size_t)NG * D * sizeof(double));
+            mm64(0, 0, NG, D, K, Pv, K, BB, D, pr2, D);
+            for (int t2 = 0; t2 < NG; t2++) {   /* 部署同式整行夹持 */
+                double nd2 = 0, nb2 = 0;
+                for (int j = 0; j < D; j++) {
+                    nd2 += pr2[(size_t)t2 * D + j] * pr2[(size_t)t2 * D + j];
+                    nb2 += (double)ysg[(size_t)t2 * D + j] * ysg[(size_t)t2 * D + j];
+                }
+                const double cap = (double)DS4_AMP_ZL_TR * sqrt(nb2);
+                const double sc2 = (nd2 > cap * cap && nd2 > 0) ? cap / sqrt(nd2) : 1.0;
+                for (int j = 0; j < D; j++) corr[(size_t)t2 * D + j] = (float)(sc2 * pr2[(size_t)t2 * D + j]);
+            }
+            free(Ph); free(AS); free(Pv); free(pr2);
+        }
+        if (USE_GE) for (long long p2 = 0; p2 < npg; p2++) {
+            const float g1 = gf[peg[p2]] - 1.0f;
+            float *dst = corr + (size_t)prowg[p2] * D;
+            const float *y = pYQg + (size_t)p2 * D;
+            for (int j = 0; j < D; j++) dst[j] += g1 * pwg[p2] * y[j];
+        }
+        double eg0 = 0, eg1 = 0;
+        for (size_t i2 = 0; i2 < (size_t)NG * D; i2++) {
+            const double e2 = (double)dHg[i2] - corr[i2];
+            eg1 += e2 * e2; eg0 += (double)dHg[i2] * dHg[i2];
+        }
+        const double recg = eg0 > 0 ? 1.0 - eg1 / eg0 : 0.0;
+        printf("  L%d 跨语料闸(量化半 %d 行): 挽回 %.2f%% → %s\n", L, NG, recg * 100,
+               recg > 0 ? "通过" : "★拒: 同语料 held 正/跨语料负 = 过拟合★");
+        if (recg <= 0) eff = 0.0;
+        free(Xg); free(ridxg); free(rwg); free(dHg); free(prowg); free(peg);
+        free(pwg); free(pYQg); free(ysg); free(corr);
+    }
     double t2 = now_s();
 

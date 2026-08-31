@@ -68,7 +68,6 @@
     }
 
     /* ---------------- 缓存: dH 与配对记录 ---------------- */
-    const long long NPAIR = (long long)NTOK * NACT;
     float *dH = NULL, *pw = NULL, *pYQ = NULL;
     int *prow = NULL, *pe = NULL;
     long long npair = 0;
@@ -98,127 +97,10 @@
                 die("zcache 配对越界: prow=%d pe=%d (NTOK=%d)", prow[i], pe[i], NTOK);
         munmap(zb, zsz); close(fd);
     } else {
-        st_ctx *sc = (st_ctx *)xmalloc(sizeof(st_ctx));
-        st_open(sc, hf);
-        /* GGUF 标量模式下 py 是 `blob=None if _GG else open(...)` —— 根本不碰 dql_vq。
-         * 所以这里也只在非 GGUF 时才要求侧车存在(全q2 底座那条产线压根没有 dql_vq)。 */
-        const uint8_t *blob = NULL; size_t bsz = 0; int bfd = -1;
-        if (!GGP) {
-            snprintf(path, sizeof path, "%s/dql_vq_L%02d.bin", ld, L);
-            bfd = open(path, O_RDONLY);
-            if (bfd < 0) die("VQ 侧车打不开: %s", path);
-            struct stat bst; fstat(bfd, &bst);
-            bsz = (size_t)bst.st_size;
-            blob = (const uint8_t *)mmap(NULL, bsz, PROT_READ, MAP_PRIVATE, bfd, 0);
-            if (blob == MAP_FAILED) die("VQ 侧车 mmap 失败: %s", path);
-        }
-
-        /* need = 教师路由用到的专家 ∪ 部署路由用到的专家(py: XAP 时取并集) */
-        int seen[NEXP]; memset(seen, 0, sizeof seen);
-        for (long long i = 0; i < (long long)NTOK * NACT; i++) {
-            int e = ridx[i];
-            if (e < 0 || e >= NEXP) die("锚 ridx 越界: %d", e);
-            seen[e] = 1;
-        }
-        if (XAP) for (long long i = 0; i < (long long)NTOK * NACT; i++) {
-            int e = ridxq[i];
-            if (e < 0 || e >= NEXP) die("链态锚 ridx 越界: %d", e);
-            seen[e] = 1;
-        }
-        int need[NEXP], nneed = 0;
-        for (int e = 0; e < NEXP; e++) if (seen[e]) need[nneed++] = e;
-
-        dH = (float *)xcalloc((size_t)NTOK * D, 4);
-        prow = (int *)xmalloc((size_t)NPAIR * sizeof(int));
-        pe = (int *)xmalloc((size_t)NPAIR * sizeof(int));
-        pw = (float *)xmalloc((size_t)NPAIR * 4);
-        pYQ = (float *)xmalloc((size_t)NPAIR * D * 4);
-
-        int *rows = (int *)xmalloc((size_t)NTOK * NACT * sizeof(int));
-        int *slots = (int *)xmalloc((size_t)NTOK * NACT * sizeof(int));
-        int *rowsq = XAP ? (int *)xmalloc((size_t)NTOK * NACT * sizeof(int)) : NULL;
-        int *slotsq = XAP ? (int *)xmalloc((size_t)NTOK * NACT * sizeof(int)) : NULL;
-        float *xs = (float *)xmalloc((size_t)NTOK * D * 4);
-        float *Y = (float *)xmalloc((size_t)NTOK * D * 4);
-        float *gb = NULL, *ub = NULL;
-        int MOEI = 0;
-
-        for (int i = 0; i < nneed; i++) {
-            int e = need[i];
-            int nr = 0;
-            for (int t = 0; t < NTOK; t++)                    /* np.where(ridx==e): 行升序, 行内槽升序 */
-                for (int s = 0; s < NACT; s++)
-                    if (ridx[(size_t)t * NACT + s] == e) { rows[nr] = t; slots[nr] = s; nr++; }
-            int nrq = nr;
-            if (XAP) {
-                nrq = 0;
-                for (int t = 0; t < NTOK; t++)
-                    for (int s = 0; s < NACT; s++)
-                        if (ridxq[(size_t)t * NACT + s] == e) { rowsq[nrq] = t; slotsq[nrq] = s; nrq++; }
-            }
-            if (!nr && !nrq) continue;                        /* py: len(rows)==0 and len(rowsq)==0 */
-            const int *QR_ROW = XAP ? rowsq : rows, *QR_SLOT = XAP ? slotsq : slots;
-            const float *XQSRC = XAP ? XQ0 : X0, *RWQ = XAP ? rwq : rw;
-            float *Wf[3], *Wq[3];
-            static const char *NMS[3] = {"w1", "w3", "w2"};
-            for (int wi = 0; wi < 3; wi++) {
-                char tn[256];
-                snprintf(tn, sizeof tn, "layers.%d.ffn.experts.%d.%s.weight", L, e, NMS[wi]);
-                long R = 0, C = 0;
-                float *wf = st_read_weight(sc, tn, &R, &C);
-                if (!wf) die("HF 权重读不到: %s", tn);
-                long rq = 0, cq = 0;
-                float *wq = GGP ? gg_expert(&gg, L, NMS[wi], e, &rq, &cq)
-                                : vq_dequant(blob, bsz, vq_slot(blob, bsz, e, wi), &rq, &cq);
-                if (wq && (R != rq || C != cq)) {             /* py: Wf.shape != Wq.shape → Wf = Wf.T */
-                    float *tr = (float *)xmalloc((size_t)R * C * 4);
-                    for (long r = 0; r < R; r++) for (long c = 0; c < C; c++) tr[(size_t)c * R + r] = wf[(size_t)r * C + c];
-                    free(wf); wf = tr; long t = R; R = C; C = t;
-                }
-                Wf[wi] = wf; Wq[wi] = wq ? wq : wf;           /* 无 vq 槽 ⇒ 量化侧退回 FP(py 同) */
-                if (wi == 0) {
-                    if (C != D) die("w1 列数 %ld ≠ D=%d(L%d e%d) — 方向判定失败", C, D, L, e);
-                    if (!MOEI) { MOEI = (int)R;
-                        gb = (float *)xmalloc((size_t)NTOK * MOEI * 4);
-                        ub = (float *)xmalloc((size_t)NTOK * MOEI * 4); }
-                    if (R != MOEI) die("w1 行数 %ld ≠ MOEI=%d", R, MOEI);
-                } else if (wi == 2 && (R != D || C != MOEI))
-                    die("w2 形状 %ldx%ld ≠ %dx%d", R, C, D, MOEI);
-            }
-            /* FP 目标侧: (XCAP 时 x=引擎真值, 否则 x=锚 fin) + FP 锚路由 + FP 权重 */
-            if (nr > 0) {
-                for (int j = 0; j < nr; j++) memcpy(xs + (size_t)j * D, X0 + (size_t)rows[j] * D, (size_t)D * 4);
-                zl_expert_fwd(xs, nr, Wf[0], Wf[1], Wf[2], MOEI, SWLIM, Y, gb, ub);
-                for (int j = 0; j < nr; j++) {
-                    float w = rw[(size_t)rows[j] * NACT + slots[j]];
-                    float *dst = dH + (size_t)rows[j] * D;
-                    const float *y = Y + (size_t)j * D;
-                    for (int d2 = 0; d2 < D; d2++) dst[d2] += w * y[d2];
-                }
-            }
-            /* 部署侧: 链模式=链态 x_q + 部署路由 + 量化权重; XCAP 时 dH 不减 Yq(直接用引擎
-             * raw_ffn_out), 但 pYQ/pw 仍要留给 GE。ADDON 时学生权重先乘既有 GE。 */
-            if (nrq > 0) {
-                for (int j = 0; j < nrq; j++) memcpy(xs + (size_t)j * D, XQSRC + (size_t)QR_ROW[j] * D, (size_t)D * 4);
-                zl_expert_fwd(xs, nrq, Wq[0], Wq[1], Wq[2], MOEI, SWLIM, Y, gb, ub);
-                for (int j = 0; j < nrq; j++) {
-                    float wq2 = RWQ[(size_t)QR_ROW[j] * NACT + QR_SLOT[j]];
-                    if (ge_old) wq2 *= ge_old[e];             /* py: wq = wq*ge_old[e] */
-                    if (!XCAP || !YQE) {   /* 只换 x 模式: 学生由本进程重算, 逐专家减 */
-                        float *dst = dH + (size_t)QR_ROW[j] * D;
-                        const float *y = Y + (size_t)j * D;
-                        for (int d2 = 0; d2 < D; d2++) dst[d2] -= wq2 * y[d2];
-                    }
-                    prow[npair] = QR_ROW[j];
-                    pe[npair] = e;
-                    pw[npair] = wq2;
-                    memcpy(pYQ + (size_t)npair * D, Y + (size_t)j * D, (size_t)D * 4);
-                    npair++;
-                }
-            }
-            for (int wi = 0; wi < 3; wi++) { if (Wq[wi] != Wf[wi]) free(Wq[wi]); free(Wf[wi]); }
-            if ((i + 1) % 64 == 0) printf("  L%d 缓存 …%d/%d\n", L, i + 1, nneed);
-        }
+        /* 构建体在 zlayer_build.inc.c(唯一实现, 跨语料闸复用同源); 算术逐字未动。 */
+        zl_build_pairs(hf, ld, GGP, &gg, L, NTOK, NACT, SWLIM, X0, ridx, rw,
+                       XAP ? 1 : 0, XQ0, ridxq, rwq, ge_old, !(XCAP && YQE),
+                       &dH, &prow, &pe, &pw, &pYQ, &npair);
         /* ADDON: 既有 z 的出力从 dH 扣掉 → dH = 贪心修完之后的残差(全 f32, 与 py 同) */
         if (ADDON && zo_z) {
             const float *Xq = XAP ? XQ0 : X0;
@@ -243,9 +125,6 @@
         /* dH = Σw·Y_fp(锚教师) − 引擎真实量化 routed。非 XCAP 时这一减法已经逐专家做过了。 */
         if (XCAP && YQE) for (size_t i = 0; i < (size_t)NTOK * D; i++) dH[i] -= YQE[i];
 
-        free(rows); free(slots); free(rowsq); free(slotsq); free(xs); free(Y); free(gb); free(ub);
-        if (blob) { munmap((void *)blob, bsz); close(bfd); }
-
         /* 原子换名: 并行 amp_solve 只见完整 zcache */
         char tmp[1300]; snprintf(tmp, sizeof tmp, "%s.tmp.npz", cache);
         zwr_t zw; memset(&zw, 0, sizeof zw);
@@ -269,7 +148,6 @@
         fclose(zw.f);
         free(prow64);
         if (rename(tmp, cache)) die("zcache 换名失败: %s", strerror(errno));
-        free(sc);
     }
     double t1 = now_s();
     if (CACHE_ONLY) { printf("★L%d zcache-only: 就绪(%.0fs), 解算交外部\n", L, t1 - t0); return 0; }
