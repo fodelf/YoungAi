@@ -239,7 +239,6 @@ int ds4_gpu_indexer_topk_tensor(
         return cuda_ok(cudaGetLastError(), "indexer topk 4096 launch");
     }
     if (top_k == 512u && n_comp <= 8192u &&
-        1 &&
         1) {
         if (n_comp > 4096u) {
             using TopkCubSort = cub::BlockRadixSort<uint64_t, 512, 16>;
@@ -269,7 +268,7 @@ int ds4_gpu_indexer_topk_tensor(
                                                                n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 8192 launch");
     }
-    if (top_k == 512u && 1 &&
+    if (top_k == 512u &&
         1) {
         const uint32_t chunk_n = 4096u;
         const uint32_t n_chunks = (n_comp + chunk_n - 1u) / chunk_n;

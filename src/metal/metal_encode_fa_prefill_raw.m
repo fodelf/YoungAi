@@ -31,8 +31,8 @@ static int ds4_gpu_encode_flash_attention_prefill_raw_heads_nonvec(
         return 0;
     }
 
-    const uint32_t nqptg = 8;
-    const uint32_t ncpsg = 64;
+    const uint32_t nqptg = DS4_FA_NQPTG;   /* = shader OP_FLASH_ATTN_EXT_NQPSG/NCPSG */
+    const uint32_t ncpsg = DS4_FA_NCPSG;
     const uint32_t nsg = head_dim >= 512 ? 8u : 4u;
     const bool has_kvpad = (n_tokens % ncpsg) != 0;
     const bool bc_mask = (n_tokens % nqptg) != 0;
@@ -178,10 +178,7 @@ static int ds4_gpu_encode_flash_attention_prefill_raw_heads_nonvec(
         .logit_softcap = 0.0f,
     };
 
-    const NSUInteger padded_v = ds4_gpu_align_up_ns(head_dim, 64u);
-    const NSUInteger shared_elems = (NSUInteger)nqptg *
-        ((NSUInteger)head_dim + 2u * padded_v + 2u * (2u * (NSUInteger)ncpsg));
-    const NSUInteger shared_bytes = ds4_gpu_align_up_ns(shared_elems * (sizeof(float) / 2u), 16u);
+    const NSUInteger shared_bytes = ds4_fa_shared_bytes(head_dim);   /* 契约与陷阱见 metal_internal.h */
 
     enc = ds4_gpu_compute_encoder(cb);
     [enc setComputePipelineState:attn_pipeline];

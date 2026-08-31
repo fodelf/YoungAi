@@ -258,7 +258,7 @@ out:
 
 int main(int argc, char **argv) {
     const char *hf_dir = "hf/DeepSeek-V4-Flash-Base";
-    const char *cap_dir = "/private/tmp/m1_ds4/cap_m1";
+    const char *cap_dir = NULL;   /* 必传: 旧默认是某台机的 /tmp 取料目录, 漏传=静默读错机器 */
     const char *layers_s = "0,4,8";
     int n_x = 64, n_threads = 6, max_rank = 64, rank = 8, ntrain = 0, n_feat = 1024;
     int n_exp = NEXP;  /* --n-experts: subset of experts for fast iteration (default all 256) */
@@ -317,6 +317,7 @@ int main(int argc, char **argv) {
 
     if (gostats_path && gostats_load(gostats_path)) return 2;
 
+    if (!cap_dir) { fprintf(stderr, "calib_run: --cap <取料目录> 必传(无默认)\n"); return 2; }
     printf("calib_run: hf=%s cap=%s layers=%s n_x=%d n_exp=%d threads=%d energy=%.3f maxrank=%d%s\n",
            hf_dir, cap_dir, layers_s, n_x, n_exp, n_threads, energy, max_rank,
            g_gs_n ? " [go-stats L_fix scales]" : "");

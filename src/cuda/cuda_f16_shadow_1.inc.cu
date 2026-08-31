@@ -296,7 +296,6 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
     if (is_primary_map && (g_model_device_owned || g_model_registered))
         return cuda_model_ptr(model_map, offset);
     if (is_primary_map && g_model_hmm_direct &&
-        1 &&
         1) {
         return cuda_model_ptr(model_map, offset);
     }

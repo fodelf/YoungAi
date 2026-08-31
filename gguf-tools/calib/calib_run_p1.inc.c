@@ -178,21 +178,7 @@ done:
 }
 
 /* baseline (no correction) metrics: rel-L2 = ‖Δo‖/‖o_ref‖, mean cosine(ô,o_ref). */
-static void baseline_metrics(const double *o_ref, const double *o_hat, const double *delta,
-                             int n_exp, int n_x, int d_model, double *rel_l2, double *cos_mean) {
-    double num = 0, den = 0, csum = 0; long cnt = 0;
-    for (long ei = 0; ei < (long)n_exp * n_x; ei++) {
-        const double *r = o_ref + (size_t)ei * d_model;
-        const double *h = o_hat + (size_t)ei * d_model;
-        const double *d = delta + (size_t)ei * d_model;
-        double dot = 0, nr = 0, nh = 0, dd = 0, rr = 0;
-        for (int j = 0; j < d_model; j++) { dot += r[j]*h[j]; nr += r[j]*r[j]; nh += h[j]*h[j]; dd += d[j]*d[j]; rr += r[j]*r[j]; }
-        num += dd; den += rr;
-        if (nr > 0 && nh > 0) { csum += dot / (sqrt(nr) * sqrt(nh)); cnt++; }
-    }
-    *rel_l2 = den > 0 ? sqrt(num / den) : 0;
-    *cos_mean = cnt ? csum / cnt : 0;
-}
+#include "calib_shared.inc.c"   /* baseline_metrics/quant_dequant: 判决原语单一实现 */
 
 /* ====================== aggregate branch (--solver rrr) ======================
  * Fits the runtime corr semantics on per-TOKEN aggregates instead of the dense

@@ -396,7 +396,7 @@ void ds4_gpu_set_quality(bool quality) {
     g_quality_mode = quality ? 1 : 0;
     if (g_cublas_ready) {
         const cublasMath_t math_mode =
-            (g_quality_mode || 0)
+            g_quality_mode
                 ? CUBLAS_DEFAULT_MATH
                 : CUBLAS_TF32_TENSOR_OP_MATH;
         (void)cublasSetMathMode(g_cublas, math_mode);

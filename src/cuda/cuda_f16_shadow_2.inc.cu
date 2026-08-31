@@ -44,7 +44,6 @@ static int cuda_q8_use_dp4a(void) {
 
 static int cuda_q8_f16_preload_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
     if (cuda_q8_label_is_attention_output(label) &&
-        1 &&
         1) {
         return 0;
     }

@@ -143,7 +143,7 @@ int ds4_gpu_matmul_q2_K_tensor(
     const uint32_t tpg_use = (wstat > 1u) ? tpg : 1u;
     uint32_t xsm = 0u;
     size_t sh_use = (q2lv || fused) ? q2sh : 0u;
-    if (!fused && q2lv && tpg_use > 1u && 1 &&
+    if (!fused && q2lv && tpg_use > 1u &&
         blocks <= 32u && (blocks & 3u) == 0u) {
         const size_t xbytes = (size_t)tpg_use * blocks * sizeof(cuda_block_q8_K);
         const size_t want = q2sh + xbytes;

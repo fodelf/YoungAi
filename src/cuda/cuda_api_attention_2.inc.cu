@@ -32,7 +32,6 @@ static int attention_prefill_mixed_launch(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
     if (!use_comp_mask && n_tokens > 1 && head_dim == 512 &&
-        1 &&
         (0 || (!g_quality_mode && n_tokens >= 128u))) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
         attention_static_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,

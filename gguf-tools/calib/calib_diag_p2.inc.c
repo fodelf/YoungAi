@@ -22,13 +22,7 @@ typedef struct {
     int    done_experts;
 } worker_ctx;
 
-/* go1b round-trip a weight matrix [rows×cols] → w_hat (the 1-bit reconstruction). */
-static void quant_dequant(const float *w, float *wh, int rows, int cols, unsigned char *scratch) {
-    size_t rb = go1b_row_bytes(cols);
-    go1b_quantize(w, scratch, rows, cols);
-    for (int r = 0; r < rows; r++)
-        go1b_dequantize_row(scratch + (size_t)r * rb, wh + (size_t)r * cols, cols);
-}
+#include "calib_shared.inc.c"   /* baseline_metrics/quant_dequant: 判决原语单一实现 */
 
 static void *worker(void *arg) {
     worker_ctx *c = (worker_ctx *)arg;
@@ -90,25 +84,11 @@ done:
 }
 
 /* baseline (no correction) metrics: rel-L2 = ‖Δo‖/‖o_ref‖, mean cosine(ô,o_ref). */
-static void baseline_metrics(const double *o_ref, const double *o_hat, const double *delta,
-                             int n_exp, int n_x, int d_model, double *rel_l2, double *cos_mean) {
-    double num = 0, den = 0, csum = 0; long cnt = 0;
-    for (long ei = 0; ei < (long)n_exp * n_x; ei++) {
-        const double *r = o_ref + (size_t)ei * d_model;
-        const double *h = o_hat + (size_t)ei * d_model;
-        const double *d = delta + (size_t)ei * d_model;
-        double dot = 0, nr = 0, nh = 0, dd = 0, rr = 0;
-        for (int j = 0; j < d_model; j++) { dot += r[j]*h[j]; nr += r[j]*r[j]; nh += h[j]*h[j]; dd += d[j]*d[j]; rr += r[j]*r[j]; }
-        num += dd; den += rr;
-        if (nr > 0 && nh > 0) { csum += dot / (sqrt(nr) * sqrt(nh)); cnt++; }
-    }
-    *rel_l2 = den > 0 ? sqrt(num / den) : 0;
-    *cos_mean = cnt ? csum / cnt : 0;
-}
+/* baseline_metrics: 见 calib_shared.inc.c(上方已 include) */
 
 int main(int argc, char **argv) {
     const char *hf_dir = "hf/DeepSeek-V4-Flash-Base";
-    const char *cap_dir = "/private/tmp/m1_ds4/cap_m1";
+    const char *cap_dir = NULL;   /* 必传: 旧默认是某台机的 /tmp 取料目录, 漏传=静默读错机器 */
     const char *layers_s = "0,4,8";
     int n_x = 64, n_threads = 6, max_rank = 64;
     double energy = 0.95, lambda = -1.0;
@@ -137,6 +117,7 @@ int main(int argc, char **argv) {
     double reg_lambda = (lambda >= 0.0) ? lambda : 1e-4;
     const char *target_s = (target == TGT_OREF) ? "oref(direct-gen)" : "delta(1-bit residual)";
 
+    if (!cap_dir) { fprintf(stderr, "calib_diag: --cap <取料目录> 必传(无默认)\n"); return 2; }
     printf("calib_diag: hf=%s cap=%s layers=%s n_x=%d threads=%d energy=%.3f maxrank=%d target=%s\n",
            hf_dir, cap_dir, layers_s, n_x, n_threads, energy, max_rank, target_s);
     printf("deep diagnostics: out-PCA(o_ref,o_hat) | ORACLE Δo rank-d | x->Δo linear R^2 | hv-solve(%s)\n\n",

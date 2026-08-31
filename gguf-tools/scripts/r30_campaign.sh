@@ -35,7 +35,9 @@ RPLAN="$OUTF/rplan.txt"
 MDL="$ROOT/gguf/go-onebit/ds4-r30.gguf"
 # ★体积单点真相(2026-08-06 用户问责"漏闸"后修根)★: 载荷预算从 plan json 派生
 # (budget_GiB=blob 载荷)+0.5 垫, 不再各处写死; VOL_BUDGET 仍可显式覆盖。
-BUDGET="${VOL_BUDGET:-$(python3 -c "import json,sys;print(round(json.load(open('$PLAN_JSON'))['budget_GiB']+0.5,1))" 2>/dev/null || echo 37.0)}"       # ★v4b★ blob 实测 592M/层(热113.6+冷w1w3 1bit副本478.6, 引擎热侧车布局需要)×43=24.9G; GGUF 仍=骨架+GUD 42.468(blob 外挂)
+# ★读不出 plan 即停(旧 || echo 37.0 = 预算静默换口径; 历次战役实际预算 95/86/24.9, 37 谁都不是)
+BUDGET="${VOL_BUDGET:-$(python3 -c "import json,sys;print(round(json.load(open('$PLAN_JSON'))['budget_GiB']+0.5,1))")}" || { echo "★plan json 读不出 budget_GiB, 拒绝无预算发车★" >&2; exit 7; }
+[ -n "$BUDGET" ] || { echo "★BUDGET 为空, 拒绝无预算发车★" >&2; exit 7; }       # ★v4b★ blob 实测 592M/层(热113.6+冷w1w3 1bit副本478.6, 引擎热侧车布局需要)×43=24.9G; GGUF 仍=骨架+GUD 42.468(blob 外挂)
 # v2 与 v1 的差异(首跑 25 层实测审计后): ①证据换混合(L00-24 R30 实测 / L25-42 R29 抬地板 0.015,
 # 上轮深层自愈是背上游债的表象已实证失效) ②"撑着层免底线"例外删除 ③hot 硬地板 24。
 # 失配层修正: L23 hot7→104 / L21 16→80 / L20 29→84 / L10 28→68; bpw 0.776-1.556 均值 1.048。
@@ -290,7 +292,8 @@ PYEOF
     GB=$(ls -l "$MDL" | awk '{printf "%.2f",$5/1e9}')
     GIB=$(ls -l "$MDL" | awk '{printf "%.2f",$5/1073741824}')
     LOG "合并 ✓ 落地 ${GB} GB (${GIB} GiB) — 口径=Finder十进制GB(2026-08-05 用户终裁)"
-    CAPGB=$(python3 -c "import json;print(json.load(open('$PLAN_JSON'))['model_GB']+1)" 2>/dev/null || echo 999)
+    CAPGB=$(python3 -c "import json;print(json.load(open('$PLAN_JSON'))['model_GB']+1)") \
+        || { LOG "★plan json 读不出 model_GB — 体积闸失明, 停★"; exit 7; }   # 旧 || echo 999 = 闸门被摘
     awk -v g="$GB" -v c="$CAPGB" 'BEGIN{exit !(g>c)}' && { LOG "★落地 ${GB} GB > 计划 ${CAPGB} GB — 停★"; exit 7; }
     # ★RB 烘焙(2026-08-05 用户批, 8-03 终审纠偏): 哈希路由只有 L0-L2, L3-L42 部署态
     #   活分数 top-k 有量化漂移 — 反修段 FIT 落盘的 α·Δb 烘进 exp_probs_b.bias(原位,

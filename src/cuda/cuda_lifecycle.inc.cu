@@ -12,7 +12,7 @@ int ds4_gpu_init(void) {
     if (!g_cublas_ready) {
         if (!cublas_ok(cublasCreate(&g_cublas), "create handle")) return 0;
         const cublasMath_t math_mode =
-            (g_quality_mode || 0)
+            g_quality_mode
                 ? CUBLAS_DEFAULT_MATH
                 : CUBLAS_TF32_TENSOR_OP_MATH;
         (void)cublasSetMathMode(g_cublas, math_mode);

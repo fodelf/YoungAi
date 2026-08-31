@@ -411,6 +411,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--heldout")) { goaware = 1; heldout = 1; }
         else { fprintf(stderr, "unknown/incomplete arg: %s\n", argv[i]); return 2; }
     }
+    if (!cap_dir) { fprintf(stderr, "validate_fwd: --cap <取料目录> 必传(无默认)\n"); return 2; }
     if (nx < 1) nx = 1;
 
     printf("== validate_fwd: %s gate ==\n",

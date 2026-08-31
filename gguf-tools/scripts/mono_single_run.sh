@@ -34,8 +34,9 @@ pkill -f 'ds4 --role' 2>/dev/null; pkill -f "ds4 -m " 2>/dev/null; sleep 1
 # 外部内存看门狗(引擎已有同款, 这是双保险): 系统压力持续 CRITICAL ~6s → 杀 ds4, 抢在内核 watchdog panic 前。
 # 用 pressure-level(1正常/2警告/4临界), 不用 free%(offload 下 page cache 填满 free% 本就低, 会误杀)。
 ( crit=0; while :; do
-    lvl=$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null || echo 1)
-    if [ "$lvl" -ge 4 ]; then crit=$((crit+1)); else crit=0; fi
+    # fail-closed: 读不到压力等级=失明, 按 critical 计(旧 || echo 1 = 看门狗静默缴械)
+    lvl=$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null)
+    if [ -z "$lvl" ] || [ "$lvl" -ge 4 ]; then crit=$((crit+1)); else crit=0; fi
     [ "$crit" -ge 3 ] && { echo "[watchdog] 系统压力 critical → 杀 ds4" >&2; pkill -f "ds4 -m $MODEL"; break; }
     sleep 2
   done ) & WD=$!

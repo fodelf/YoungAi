@@ -30,12 +30,17 @@ int ds4_gpu_attention_decode_heads_tensor(
         (use_mask && comp_mask->bytes < (uint64_t)n_comp * sizeof(float))) {
         return 0;
     }
+    /* kernel 侧 __shared__ raw_rows[256] 是硬容量, 超出会被 kernel 静默钳(丢 key 不报错)。
+     * 现值 n_swa=128(GGUF 元数据)远低于帽; host 先拦, 免得换 n_swa>256 的模型时静默丢。 */
+    if (n_raw > 256u) {
+        fprintf(stderr, "ds4: cuda attention n_raw=%u exceeds kernel raw_rows[256] capacity\n", n_raw);
+        return 0;
+    }
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
     if (!cuda_attention_score_buffer_fits(n_comp)) {
-        if (!use_mask && head_dim == 512u &&
-            1) {
+        if (!use_mask && head_dim == 512u) {
             dim3 online_grid(1, (n_head + 7u) / 8u, 1);
             attention_decode_mixed_heads8_online_kernel<<<online_grid, 256>>>((float *)heads->ptr,
                                                                               sinks,
@@ -80,7 +85,6 @@ int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads, const void
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
     if (n_tokens > 1 && head_dim == 512 &&
-        1 &&
         (0 || (!g_quality_mode && n_tokens >= 128u))) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
         attention_static_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
@@ -231,7 +235,6 @@ static int attention_decode_batch_launch(
         return 0;
     }
     if (!use_comp_mask && n_tokens > 1 && head_dim == 512 &&
-        1 &&
         (0 || (!g_quality_mode && n_tokens >= 128u))) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
         attention_decode_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,

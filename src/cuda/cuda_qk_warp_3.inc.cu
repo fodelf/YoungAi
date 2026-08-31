@@ -275,7 +275,7 @@ int ds4_gpu_matmul_q2_K_pair_batch_tensor(
     {   /* 大批: 激活分片进 shared(与 dense/grouped 同一修法) */
         static uint32_t ptmin = 0u;
         if (ptmin == 0u) { const char *e = ((const char *)0) /* DS4_Q2K_TILED_MIN: 路径开关已删(2026-08-22 隐形炸弹清理) */; ptmin = e ? (uint32_t)atoi(e) : 16u; }
-        if (n_tok >= ptmin && 1 &&
+        if (n_tok >= ptmin &&
             1) {
             const size_t budget = 96u * 1024u;
             uint32_t tile = (uint32_t)((budget - sh) / ((size_t)blocks * sizeof(cuda_block_q8_K)));

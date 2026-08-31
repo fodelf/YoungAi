@@ -66,7 +66,7 @@
 #define MAX_LAYERS  32
 static const float ROUTED_SCALING = 1.5f; /* routed_scaling_factor */
 
-static const char *DEF_CAP = "/private/tmp/m1_ds4/cap_m1";
+static const char *DEF_CAP = NULL;   /* 必传: 旧默认是某台机的 /tmp 取料目录, 漏传=静默读错机器 */
 static const char *DEF_HF  =
   "/private/tmp/claude-501/-Users-fodelf-git-ds4-main/"
   "24503593-c406-4203-a34b-b2d8ea433b47/scratchpad/hf_all";
@@ -79,16 +79,7 @@ static double softplus_d(double z) {
 /* sqrtsoftplus score used by the V4 router. */
 static double sqrtsoftplus_d(double z) { return sqrt(softplus_d(z)); }
 
-/* go1b strict-1-bit round-trip of a [rows×cols] row-major matrix into wh (ŵ).
- * Identical to calib_run.c's helper: quantize the whole matrix into `scratch`,
- * then per-row dequantize. */
-static void quant_dequant(const float *w, float *wh, int rows, int cols,
-                          unsigned char *scratch) {
-    size_t rb = go1b_row_bytes(cols);
-    go1b_quantize(w, scratch, rows, cols);
-    for (int r = 0; r < rows; r++)
-        go1b_dequantize_row(scratch + (size_t)r * rb, wh + (size_t)r * cols, cols);
-}
+#include "calib_shared.inc.c"   /* baseline_metrics/quant_dequant: 判决原语单一实现 */
 
 /* full-precision f64 dot of a float row with x. */
 static double dot_f32(const float *a, const float *b, int n) {

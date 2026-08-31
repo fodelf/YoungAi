@@ -236,10 +236,11 @@ static void part4(const char *cap) {
 /* ------------------------------------------------------------------ */
 
 int main(int argc, char **argv) {
-    const char *cap = "/private/tmp/m1_ds4/cap_m1";
+    const char *cap = NULL;   /* 必传: 旧默认是某台机的 /tmp 取料目录, 漏传=静默读错机器 */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--cap") == 0 && i + 1 < argc) cap = argv[++i];
     }
+    if (!cap) { fprintf(stderr, "traj_analyze: --cap <取料目录> 必传(无默认)\n"); return 2; }
 
     printf("################################################################################\n");
     printf("# Go-domain trajectory (go-trace) structure analysis\n");

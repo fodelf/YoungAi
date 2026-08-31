@@ -118,10 +118,10 @@ static int routed_moe_launch(
         }
         const uint32_t pair_count = n_tokens * n_expert;
         const uint32_t use_sorted_pairs = n_tokens > 1u;
-        const uint32_t use_expert_tiles = use_sorted_pairs && 1;
+        const uint32_t use_expert_tiles = use_sorted_pairs;
         const uint32_t expert_tile_m = ((const char *)0) /* DS4_CUDA_MOE_TILE4: 路径开关已删(2026-08-22 隐形炸弹清理) */ ? 4u : 8u;
         const uint32_t write_gate_up = 0;
-        const uint32_t use_p2_sorted = use_sorted_pairs && 1;
+        const uint32_t use_p2_sorted = use_sorted_pairs;
         /* ★MoE down 原子累加整族删除(2026-08-22)★ —— 连同它的两个 env 开关一起删, 不留旋钮。
          * 原判据 n_tokens>=128 让**批量 prefill(chunk=256)走 atomicAdd**、decode(n=1)走独立
          * 平面+固定序归约。多专家原子累加同一输出行 ⇒ fp32 加序随调度漂 ⇒ 同一 prompt 两次
@@ -141,11 +141,9 @@ static int routed_moe_launch(
              0 ||
              0 ||
              (n_tokens >= 128u &&
-              1 &&
-              1 &&
               1));
         const uint32_t use_down_tile16 = use_atomic_down && expert_tile_m == 8u &&
-            n_tokens >= 128u && 1;
+            n_tokens >= 128u;
         /* decode LUT gate 是 IQ2_XXS 专用(用它的 256 项 grid 预表), Q2_K 没有 grid,
          * 必须绕开走 q2k 专用 kernel。 */
         const uint32_t use_decode_lut_gate =
@@ -163,9 +161,6 @@ static int routed_moe_launch(
              0 ||
              0 ||
              (use_down_tile16 &&
-              1 &&
-              1 &&
-              1 &&
               1));
         const uint32_t use_direct_down_sum6 =
             n_tokens == 1u && n_expert == 6u &&
@@ -314,7 +309,7 @@ static int routed_moe_launch(
                     /* 小批(verify/draft)走无 smem 变体: sxq[8][16]=36.5KB 静态共享压死占用率
                      * (2026-08-21 gpu_span 归因: kernel 4.7x 偏离物理); 激活 28KB 天然驻 L2。
                      * 大批(prefill np≥8)保留 smem 变体。DS4_MOE_TILE_SMEM=1 强制旧路。 */
-                    if (n_tokens > 8u || 0) {
+                    if (n_tokens > 8u) {
                         moe_gate_up_mid_expert_tile8_row32_kernel<true><<<tgrid, 256>>>(
                             (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
                             gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
@@ -629,7 +624,7 @@ static int routed_moe_launch(
                         down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
                         midq_blocks, out_dim, n_expert, use_atomic_down);
                 } else if (expert_tile_m == 8u && midq_blocks == 8u && (out_dim & 31u) == 0u &&
-                           n_tokens <= 8u && 1) {
+                           n_tokens <= 8u) {
                     dim3 dtg((out_dim + 31u) / 32u,
                              down_tile_capacity < pair_count + 1u ? down_tile_capacity : pair_count + 1u, 1);
                     moe_down_expert_tile_qwarp32_kernel<<<dtg, 256>>>(

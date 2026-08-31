@@ -415,4 +415,24 @@ static inline NSUInteger ds4_gpu_bin_threads(uint32_t width, id<MTLComputePipeli
 
 #include "metal_expert.h"
 
+
+/* ===== FlashAttention host 侧契约(2026-08-31 魔数扫除; 与 metal/flash_attn_ext.metal
+ * + flash_attn_pad.metal 镜像, shader 无 include 路径, 改任一侧必须同步) =====
+ *  - tile: nqptg=8(每 threadgroup Q 行) / ncpsg=64 = shader OP_FLASH_ATTN_EXT_NQPSG/NCPSG。
+ *  - threadgroup 内存只覆盖 shader 的 sq/so/ss 三段。sk/sv 段(还要加 nsg*4*16*KV =
+ *    每 simdgroup 512 half)只有【量化 K/V】实例的 dequant 路才触碰; 现役唯一实例
+ *    f16_dk512_dv512 走 is_same 的 device 直读分支, 不碰共享 K/V 区, 故不分配。
+ *  ★谁要新增量化 KV 变体: 本公式必须补 nsg*(4*16*KV) 项, 且 dk512/nsg=8 时总需求
+ *    36864B 超 Apple 32KiB threadgroup 上限 —— 必须先引入 nsg 收缩(上游 llama.cpp
+ *    是 while(smem>max) nsg/=2, 本仓 host 写死 nsg = head_dim>=512 ? 8 : 4)★
+ *  原四个 encode 文件各手写一份公式, 现收拢单点。 */
+#define DS4_FA_NQPTG 8u
+#define DS4_FA_NCPSG 64u
+static inline NSUInteger ds4_fa_shared_bytes(uint32_t head_dim) {
+    const NSUInteger padded_v = ds4_gpu_align_up_ns(head_dim, 64u);
+    const NSUInteger elems = (NSUInteger)DS4_FA_NQPTG *
+        ((NSUInteger)head_dim + 2u * padded_v + 2u * (2u * (NSUInteger)DS4_FA_NCPSG));
+    return ds4_gpu_align_up_ns(elems * (sizeof(float) / 2u), 16u);
+}
+
 #endif /* DS4_METAL_INTERNAL_H */

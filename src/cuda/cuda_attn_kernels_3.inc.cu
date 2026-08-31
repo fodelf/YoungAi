@@ -27,6 +27,8 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
     const uint32_t head = head_group * 8u + warp;
     const bool valid_head = head < n_head;
 
+    /* 容量恒等式(三个字面量互相咬合, 改一个必改三个): scores 每 head 768 行
+     * = raw_rows 帽 256 + comp_rows 帽 512。host 侧 n_raw>256 已在入口拦截。 */
     __shared__ uint32_t raw_rows[256];
     __shared__ uint32_t comp_rows[512];
     __shared__ uint32_t raw_count;

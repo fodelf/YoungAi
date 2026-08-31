@@ -429,7 +429,11 @@ int ds4_gpu_dsv4_indexer_qat_tensor(
         uint32_t          n_rows,
         uint32_t          head_dim) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
-    if (!x || n_rows == 0 || head_dim != 128u) return 0;
+    if (!x || n_rows == 0) return 0;
+    if (head_dim != 128u) {   /* shader 布局写死 128 宽(absbuf=scratch+128); 静默跳过=QAT 悄没做 */
+        fprintf(stderr, "ds4: Metal DSV4 indexer QAT expects 128-wide rows (got %u), skipped\n", head_dim);
+        return 0;
+    }
 
     @autoreleasepool {
         id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);

@@ -92,7 +92,7 @@ size_t go1b_blk_quantize(const float *src, void *dst, int64_t nrows, int64_t nco
 /* Input-aware (L_fix): ew[ncols] = per-channel Go activation second moments
  * E[x²] (the per-expert imatrix slice). Sign stays sign(w); the scale re-fits
  * closed-form s* = Σ ew·|w| / Σ ew (per-row, or block-local under
- * DS4_GO1B_PER_BLOCK). ew=NULL / zero mass → plain go1b_blk_quantize. */
+ * per-block 模式(原 DS4_GO1B_PER_BLOCK env, 已随 env 大扫除拔除)). ew=NULL / zero mass → plain go1b_blk_quantize. */
 /* joint-LS 输出最优 per-block scale (79% 质量关键): X[n_act×ncols] 行主序激活;
  * per-row 联合解 nblk block scale 使 Σ_b s_b·(B_b·x)≈w·x。X=NULL→退回 mean|w|。 */
 size_t go1b_blk_quantize_joint(const float *src, void *dst, int64_t nrows, int64_t ncols,

@@ -13,8 +13,9 @@ LOG=/tmp/safe_verify.log; : > "$LOG"
 # ---- 外部内存看门狗(引擎内已有同款守卫, 这是双保险): 用系统压力等级(1正常/2警告/4临界),
 #      不用 free%(offload 下 page cache 填满 free% 本就低但可回收→会误杀)。持续 critical ~6s 才杀。----
 ( crit=0; while :; do
-    lvl=$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null || echo 1)
-    if [ "$lvl" -ge 4 ]; then crit=$((crit+1)); else crit=0; fi
+    # fail-closed: 读不到压力等级=失明, 按 critical 计(旧 || echo 1 = 看门狗静默缴械)
+    lvl=$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null)
+    if [ -z "$lvl" ] || [ "$lvl" -ge 4 ]; then crit=$((crit+1)); else crit=0; fi
     [ "$crit" -ge 3 ] && { echo "WATCHDOG-KILL pressure=critical x$crit → 杀 ds4" >>"$LOG"; pkill -f "ds4 -m $MONO"; break; }
     sleep 2
   done ) &

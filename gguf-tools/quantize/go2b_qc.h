@@ -1,6 +1,6 @@
 /* go2b_qc.h — GO2B(type41) C 编码/解码 + 热表 (go2b_encode.py 数值口径逐行移植)。
  * 块 68B/256el: [f16 d1][f16 d2][s1 32B][s2 32B]; 值=(s1?+d1:-d1)+(s2?+d2:-d2), 位 g→字节 g/8 位 g%8。
- * 编码链(= DS4_GO2B_ACT_SCALE 验证赢家口径, 全43层 +27.2%):
+ * 编码链(= act-scale(原 DS4_GO2B_ACT_SCALE env, 已随 env 大扫除拔除) 验证赢家口径, 全43层 +27.2%):
  *   ① _fit_d1d2 nf: 行分位点(75/25)初值 + 3轮 Lloyd(level3/2 条件均值, 空集回 hi/lo)
  *   ② GPTQ 误差反馈分配(校准行≥8; 列组128 Hessian=XbᵀXb+0.02·mean(diag), err/Hinv[j,j] 反馈后列)
  *   ③ 2轮联合迭代: 固定码解每行 2×2 输出最优(d1,d2) → f16 往返重建 level → 重分配
