@@ -1,4 +1,34 @@
     /* --- 活 k_L: held 段 k 曲线 --- */
+    /* ★held 打分=部署同式(2026-08-31)★ 落盘是 f16, 回放还有 ‖Δ‖≤tr·‖routed‖ 整行
+     * 夹持(zreplay) —— 旧评估两样都不建模: 选 K/过闸全用 f64 无夹持数字, 层内挽回率
+     * 系统性高于盘上能兑现的量("层内好端到端差"的评估侧来源)。修法两刀:
+     * ①解算因子就地舍到 f16 格点(p7 emit 再舍=幂等, 载荷字节不变);
+     * ②每行夹持基=学生 routed 行范数(XCAP 用引擎捕获 YQE, 否则 Σw·pYQ 重建;
+     *   GE 折权对基范数是 1e-3 级且 GE 在 z 后才解, 不进基)。 */
+    { double *fs[6] = {A, S, Bt, Af, Sf, Bf};
+      size_t ns[6] = {(size_t)D * rlin, (size_t)rlin, (size_t)rlin * D,
+                      (size_t)DIN3 * rfta, (size_t)rfta, (size_t)rfta * D};
+      for (int fi = 0; fi < 6; fi++) if (fs[fi])
+          for (size_t i2 = 0; i2 < ns[fi]; i2++)
+              fs[fi][i2] = (double)f16_to_f32(f64_to_f16(fs[fi][i2])); }
+    float *bnorm = (float *)xmalloc((size_t)NTOK * 4);
+    if (XCAP && YQE) {
+        for (int t2 = 0; t2 < NTOK; t2++) { double s2 = 0;
+            const float *y = YQE + (size_t)t2 * D;
+            for (int j = 0; j < D; j++) s2 += (double)y[j] * y[j];
+            bnorm[t2] = (float)sqrt(s2); }
+    } else {
+        float *ys = (float *)xcalloc((size_t)NTOK * D, 4);
+        for (long long p2 = 0; p2 < npair; p2++) {
+            float *dst = ys + (size_t)prow[p2] * D;
+            const float *y = pYQ + (size_t)p2 * D;
+            for (int j = 0; j < D; j++) dst[j] += pw[p2] * y[j]; }
+        for (int t2 = 0; t2 < NTOK; t2++) { double s2 = 0;
+            const float *y = ys + (size_t)t2 * D;
+            for (int j = 0; j < D; j++) s2 += (double)y[j] * y[j];
+            bnorm[t2] = (float)sqrt(s2); }
+        free(ys);
+    }
     double e0 = 0;
     for (int i = 0; i < nev; i++) { const float *d2 = dH + (size_t)ev[i] * D;
         for (int j = 0; j < D; j++) e0 += (double)d2[j] * d2[j]; }
@@ -27,8 +57,15 @@
                 for (int i = 0; i < nev; i++) {
                     const float *d2 = dH + (size_t)ev[i] * D;
                     const double *p = pbuf + (size_t)i * D;
+                    double sc = 1.0;
+                    if (k > 0) {                 /* 部署同式: zreplay 整行信任域夹持 */
+                        double nd2 = 0;
+                        for (int j = 0; j < D; j++) nd2 += p[j] * p[j];
+                        const double cap = (double)DS4_AMP_ZL_TR * bnorm[ev[i]];
+                        if (nd2 > cap * cap && nd2 > 0) sc = cap / sqrt(nd2);
+                    }
                     for (int j = 0; j < D; j++) {
-                        float res = d2[j] - (k > 0 ? (float)p[j] : 0.0f);   /* py: 先降 f32 再平方 */
+                        float res = d2[j] - (k > 0 ? (float)(sc * p[j]) : 0.0f);   /* py: 先降 f32 再平方 */
                         e1 += (double)res * res;
                     }
                 }
@@ -100,9 +137,18 @@
         mm64(0, 0, NTOK, D, K, Pv, K, BB, D, prj, D);
         free(Pv);
         R = (float *)xmalloc((size_t)NTOK * D * 4);
-        for (size_t i = 0; i < (size_t)NTOK * D; i++) R[i] = dH[i] - (float)prj[i];
+        for (int t2 = 0; t2 < NTOK; t2++) {   /* GE 靶=夹持后残差(与 held 打分同式) */
+            const double *pj = prj + (size_t)t2 * D;
+            double nd2 = 0;
+            for (int j = 0; j < D; j++) nd2 += pj[j] * pj[j];
+            const double cap = (double)DS4_AMP_ZL_TR * bnorm[t2];
+            const double sc = (nd2 > cap * cap && nd2 > 0) ? cap / sqrt(nd2) : 1.0;
+            for (int j = 0; j < D; j++)
+                R[(size_t)t2 * D + j] = dH[(size_t)t2 * D + j] - (float)(sc * pj[j]);
+        }
         free(prj);
     }
+    free(bnorm);
 
     /* tok_pairs: 每 token 的配对下标(CSR), 与 py 的 append 顺序一致(p 升序) */
     int *pcnt = (int *)xcalloc((size_t)NTOK + 1, sizeof(int));
