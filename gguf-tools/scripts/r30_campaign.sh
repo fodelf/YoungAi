@@ -27,6 +27,8 @@ OUTF="${OUTF_OVERRIDE:-$R30/full}"          # ★nl86 复用(2026-08-12 用户�
 # 默认=现役量化器(2026-08-31: .r30 冻结件已从盘上删除, 且 env 大扫除后的 --flag 只有现役二进制认)
 QBIN="${QBIN_OVERRIDE:-$ROOT/gguf-tools/amp/ds4quant_run}"   # QBIN_OVERRIDE: 探针 A/B(lldb 包装等)
 # DS4_HF 仍作脚本间接口(调用方 env 递入, 子脚本/zlayer 位置参数用); 二进制一律走 --hf 显式传
+# DS4_THREADS 兜底在各段分别是 8/6(段级速度调优值, 只影响速度不影响数值);
+# 上游战役脚本(base86p 等)恒显式 export, 兜底只在手跑单段时生效。
 export DS4_HF="${DS4_HF:-$HOME/ds4-main/hf/DeepSeek-V4-Flash-0731}"
 ANCHOR="${ANCHOR_OVERRIDE:-$R30/anchor_r30_s1716.bin}"
 IDS="${IDS_OVERRIDE:-$G7/rr_calib_prog_v5mini.ids}"
@@ -502,7 +504,9 @@ stage_quant86(){   # 86G 底座量化(冠军 08-13 配方原样 env 化; en86 �
     # DS4_CALIB_*CAP)在这里显式转接。锚路由(原 DS4_ANCHOR_ROUTE)已写死进二进制。
     Q86F=(--hf "$DS4_HF" --anchor "$Q_ANCHOR" --nfit "$Q_NFIT" --threads "${DS4_THREADS:-8}" --calib-fullset)
     Q86F+=(--minvol --mv-baseline --tune --pure-vq --vq --tgt-alpha 1.0)
-    Q86F+=(--vq-rplan "${RPLAN86:-$R30/rplan_q2_86g.txt}")
+    # ★rplan 必传(2026-08-31 魔数扫除)★: 旧兜底 rplan_q2_86g.txt 与上游 base86p 的默认
+    # (rplan_base86p.txt)不同 —— 谁漏 export 谁静默换量化计划表, 整跑作废还看不出来。
+    Q86F+=(--vq-rplan "${RPLAN86:?RPLAN86 计划表必传(无默认: 双默认曾致静默换配方风险)}")
     Q86F+=(--bf-gain-gate 0.05 --plan "$Q_OUT/plan.txt" --ckpt-dir "$Q_OUT/ckpt")
     Q86F+=(--layer-dir "$Q_OUT/layers" --zfile "$Q_OUT/zfile.bin" --zchain "$Q_OUT/zchain.bin")
     [ -n "${DS4_MINVOL_MAXL:-}" ] && Q86F+=(--minvol-maxl "$DS4_MINVOL_MAXL")
