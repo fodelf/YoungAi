@@ -884,7 +884,11 @@ stage_judge3(){
     local JI="$D2/vqhalf_j.ids" JA="$D2/anchor_j_s8192.bin"
     [ -s "$JA" ] && [ "$JA" -nt "$JI" ] || DIE "判决份锚缺或过期, 先跑 anchors3"
     echo "══ 同域全能力尺(判决份 8 域齐全) ══"
-    for B in vq86h_noz "$V"; do
+    # noz 对照下线(2026-08-31 用户"超1h=有bug"判据翻出的白磨): 旧语料底座不在对比范围
+    # (铁律: 没过质量门不进对比), 其判决份读数已冻结在案(Σmin 0.7415/KLD 0.5535/top
+    # 72.66%/PPL 1.060); champ3 调本段两次 ⇒ 每轮重扫它两趟 ≈ 20 分钟纯浪费。
+    # 要复测就把它显式当 $1 传进来。
+    for B in "$V"; do
         [ -d "$D2/$B/layers" ] || continue
         LOG "尺: $B"
         bash "$SC/caliper_ref.sh" "$D2/$B/layers" "/tmp/j3_$B.bin" 20 "" "" "$JI" "$JA" \
