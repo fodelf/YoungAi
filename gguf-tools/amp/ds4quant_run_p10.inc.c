@@ -159,8 +159,9 @@ static char plan_lookup_mv(int L,char*nm_out){
 }
 static void set_cand(const cand_t*c){
     dq_signref_mu=c->mu; dq_signref_rounds=c->rounds;
-    /* 候选未带 lz(=0) ⇒ 关本层 z(原 DS4_LZ env 回落已清退; env-不设时代即 0, 行为持平)。 */
-    LZRANK = c->lz;
+    /* 候选未带 lz(=0) ⇒ 回落 --lz(原 DS4_LZ 的 CLI 正名; env 清退时漏建口, 08-29 兜底16
+     * 事故因此固化成"64 设不进去"的死配置)。--lz 也不传 ⇒ 0=关本层 z, 行为持平。 */
+    LZRANK = c->lz ? c->lz : g_cli.lz;
     if(c->lztr) LZTR=c->lztr; if(c->lz)LZLAMBDA=c->lzlam;
 }
 /* verdict-lite: 只算 held Σmin/KL(里程碑探针用) */

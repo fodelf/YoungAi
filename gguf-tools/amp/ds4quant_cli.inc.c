@@ -52,6 +52,7 @@ typedef struct {
     int zchain_only, merge_resume, merge_consume, repair_cold, fast;
     int bwd, bwd_final, route_bias_fit, vq;
     int fp_oracle;   /* 上界探针: B 回放逐层 routed←FP@链态(读数是天花板不是模型) */
+    int lz;          /* z 秩上限(候选表 lz=0 时生效; 原 DS4_LZ, env 清退时漏建 CLI 口) */
 } dsq_cli_t;
 static dsq_cli_t g_cli = {
     .nfit=-1, .gsweep=-1, .coadapt=-1, .export_layer=-1,
@@ -116,6 +117,7 @@ static const dqo_t DQOPT[] = {
     {"zchain",          DQO_STR, &g_cli.zchain,          "DQZ2 全链侧车路径"},
     {"zchain-only",     DQO_BOOL,&g_cli.zchain_only,     "只从 dql 重建 zchain/opt(不量化)"},
     {"fp-oracle",       DQO_BOOL,&g_cli.fp_oracle,       "上界探针: B 回放逐层 routed←FP@链态(需 --hf; 读数≠模型)"},
+    {"lz",              DQO_INT, &g_cli.lz,              "z 秩上限(冠军 64; 0=按候选表/coadapt 兜底 16; 原 DS4_LZ)"},
     {"merge-gguf",      DQO_STR, &g_cli.merge_gguf,      "合并: go1b 骨架 GGUF"},
     {"merge-off",       DQO_STR, &g_cli.merge_off,       "合并: 偏移表(gguf_offsets 输出)"},
     {"merge-resume",    DQO_BOOL,&g_cli.merge_resume,    "续并: 缺层=已消费跳过"},

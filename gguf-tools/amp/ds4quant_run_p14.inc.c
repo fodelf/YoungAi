@@ -261,9 +261,10 @@ int main(int argc,char**argv){
     TUNE_MIN=g_cli.tune_min;
     if(g_cli.fast) FAST=1;
     if(g_cli.bf_memgb>0) BF_MEMGB=g_cli.bf_memgb;
+    if(g_cli.lz>0) LZRANK=g_cli.lz;   /* --lz: z 秩上限显式口(候选带 lz 的层仍按候选覆盖) */
     if(g_cli.coadapt>=0){ COADAPT=g_cli.coadapt; if(COADAPT<0)COADAPT=0;
         if(COADAPT>0&&LZRANK==0){ LZRANK=DSQ_COADAPT_LZRANK;
-            fprintf(stderr,"[共适应] z 秩未定 → 写死秩上限 %d(原 DS4_LZ 静默兜底显式化)\n",DSQ_COADAPT_LZRANK); } }
+            fprintf(stderr,"[共适应] z 秩未定 → 写死秩上限 %d(原 DS4_LZ 静默兜底显式化; 冠军 64 须显式 --lz 64)\n",DSQ_COADAPT_LZRANK); } }
     if(g_cli.go2b_hot){
         /* 热专家 go2b 合并态量化(残差+量化一体, 消漂移): 热表必须显式给(2026-08-31 删双重
          * 默认表回落 — r30 实传 top49 而 C 默认 top64, 静默口径漂移源), 加载失败=硬拒。 */
