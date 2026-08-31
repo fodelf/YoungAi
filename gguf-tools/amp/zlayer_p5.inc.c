@@ -29,9 +29,26 @@
             bnorm[t2] = (float)sqrt(s2); }
         free(ys);
     }
-    double e0 = 0;
+    /* ★行影响力有界打分(2026-08-31 第四刀)★ 官方判决尺(KLD/Σmin)每行等权, 层内打分却
+     * 是行能量 L2 —— 单个狂野行统治整层判定(L41 实测: held 靶RMS 3.14=邻层 20×, 分域
+     * prog/fin 11.8/1.3 撕裂, GE 缩 0.3% 在狂野行上冒充组合 11.8%)。行权 1/(行靶能量+
+     * 中位数): 零新常数, 狂野行影响力从 ~100× 封到 ~2×, 正常行几乎不动。只动打分
+     * (选k/筛向/组合/分域/闸), 解算不动。e0raw 留给靶RMS 诊断(物理量不加权)。 */
+    double *rowE = (double *)xmalloc((size_t)nev * sizeof(double));
+    double *rowW = (double *)xmalloc((size_t)nev * sizeof(double));
+    double e0raw = 0;
     for (int i = 0; i < nev; i++) { const float *d2 = dH + (size_t)ev[i] * D;
-        for (int j = 0; j < D; j++) e0 += (double)d2[j] * d2[j]; }
+        double s2 = 0;
+        for (int j = 0; j < D; j++) s2 += (double)d2[j] * d2[j];
+        rowE[i] = s2; e0raw += s2; }
+    double medE;
+    { double *tmp = (double *)xmalloc((size_t)nev * sizeof(double));
+      memcpy(tmp, rowE, (size_t)nev * sizeof(double));
+      for (int a2 = 0; a2 < nev; a2++) for (int b2 = a2 + 1; b2 < nev; b2++)
+          if (tmp[b2] < tmp[a2]) { double t3 = tmp[a2]; tmp[a2] = tmp[b2]; tmp[b2] = t3; }
+      medE = tmp[nev / 2]; free(tmp); }
+    double e0 = 0;
+    for (int i = 0; i < nev; i++) { rowW[i] = 1.0 / (rowE[i] + medE); e0 += rowW[i] * rowE[i]; }
 
     double curve[16], curvef[16];
     for (int i = 0; i < nKG; i++) { curve[i] = 0.0; curvef[i] = 0.0; }
@@ -66,9 +83,9 @@
                 for (int c = 0; c < r; c++) {
                     double bb = 0, sp = 0, s22 = 0;
                     for (int j = 0; j < D; j++) bb += BB[(size_t)c * D + j] * BB[(size_t)c * D + j];
-                    for (int i = 0; i < nev; i++) {
+                    for (int i = 0; i < nev; i++) {   /* 行权同打分口径, 筛向与选k同一目标 */
                         const double pv = Pev[(size_t)i * r + c];
-                        sp += pv * T[(size_t)i * r + c]; s22 += pv * pv;
+                        sp += rowW[i] * pv * T[(size_t)i * r + c]; s22 += rowW[i] * pv * pv;
                     }
                     gain[c] = 2.0 * sp - s22 * bb;
                 }
@@ -109,10 +126,12 @@
                         const double cap = (double)DS4_AMP_ZL_TR * bnorm[ev[i]];
                         if (nd2 > cap * cap && nd2 > 0) sc = cap / sqrt(nd2);
                     }
+                    double rs = 0;
                     for (int j = 0; j < D; j++) {
                         float res = d2[j] - (k > 0 ? (float)(sc * p[j]) : 0.0f);   /* py: 先降 f32 再平方 */
-                        e1 += (double)res * res;
+                        rs += (double)res * res;
                     }
+                    e1 += rowW[i] * rs;
                 }
                 double v = 1.0 - e1 / e0;
                 if (pass) curvef[ki] = v; else curve[ki] = v;
@@ -250,7 +269,7 @@
         if (lu_solve(Gg, NEXP, bg)) die("GE 解算奇异 — 停车");
         for (int e = 0; e < NEXP; e++) { ge16[e] = f64_to_f16(1.0 + bg[e]); gf[e] = f16_to_f32(ge16[e]); }
         free(Gg); free(bg);
-        /* 组合终验: z^L(K)+GE 在 held 段的总增益 */
+        /* 组合终验: z^L(K)+GE 在 held 段的总增益(行权同打分口径) */
         double eng = 0;
         double *rr = (double *)xmalloc((size_t)D * sizeof(double));
         for (int i = 0; i < nev; i++) {
@@ -264,7 +283,9 @@
                 float w = pw[p];
                 for (int j = 0; j < D; j++) rr[j] -= g1 * (double)(w * y[j]);
             }
-            for (int j = 0; j < D; j++) eng += rr[j] * rr[j];
+            double rs = 0;
+            for (int j = 0; j < D; j++) rs += rr[j] * rr[j];
+            eng += rowW[i] * rs;
         }
         free(rr);
         comb = 1.0 - eng / e0;
@@ -285,11 +306,11 @@
         double dv[2];
         for (int side = 0; side < 2; side++) {
             const int *idx = side ? ev + half : ev;
+            const int off = side ? half : 0;      /* rowW 按 ev 位序索引 */
             int n = side ? nev - half : half;
             if (n == 0) { dv[side] = NAN; continue; }
             double e0d = 0;
-            for (int i = 0; i < n; i++) { const float *d2 = dH + (size_t)idx[i] * D;
-                for (int j = 0; j < D; j++) e0d += (double)d2[j] * d2[j]; }
+            for (int i = 0; i < n; i++) e0d += rowW[off + i] * rowE[off + i];
             if (e0d <= 0) { dv[side] = NAN; continue; }
             double ed = 0;
             double *rr = (double *)xmalloc((size_t)D * sizeof(double));
@@ -304,7 +325,9 @@
                     float w = pw[p];
                     for (int j = 0; j < D; j++) rr[j] -= g1 * (double)(w * y[j]);
                 }
-                for (int j = 0; j < D; j++) ed += rr[j] * rr[j];
+                double rs = 0;
+                for (int j = 0; j < D; j++) rs += rr[j] * rr[j];
+                ed += rowW[off + i] * rs;
             }
             free(rr);
             dv[side] = 1.0 - ed / e0d;
@@ -406,11 +429,22 @@
             const float *y = pYQg + (size_t)p2 * D;
             for (int j = 0; j < D; j++) dst[j] += g1 * pwg[p2] * y[j];
         }
-        double eg0 = 0, eg1 = 0;
-        for (size_t i2 = 0; i2 < (size_t)NG * D; i2++) {
-            const double e2 = (double)dHg[i2] - corr[i2];
-            eg1 += e2 * e2; eg0 += (double)dHg[i2] * dHg[i2];
-        }
+        /* 行影响力有界(与 held 打分同口径); eg0raw 留给靶RMS 诊断 */
+        double eg0 = 0, eg1 = 0, eg0raw = 0, medg = 0;
+        { double *ge2 = (double *)xmalloc((size_t)NG * sizeof(double));
+          for (int i2 = 0; i2 < NG; i2++) { double s3 = 0;
+              for (int j = 0; j < D; j++) { const double d3 = dHg[(size_t)i2 * D + j]; s3 += d3 * d3; }
+              ge2[i2] = s3; eg0raw += s3; }
+          double *tmp = (double *)xmalloc((size_t)NG * sizeof(double));
+          memcpy(tmp, ge2, (size_t)NG * sizeof(double));
+          for (int a2 = 0; a2 < NG; a2++) for (int b2 = a2 + 1; b2 < NG; b2++)
+              if (tmp[b2] < tmp[a2]) { double t3 = tmp[a2]; tmp[a2] = tmp[b2]; tmp[b2] = t3; }
+          medg = tmp[NG / 2]; free(tmp);
+          for (int i2 = 0; i2 < NG; i2++) { const double wg = 1.0 / (ge2[i2] + medg);
+              double rs = 0;
+              for (int j = 0; j < D; j++) { const double e2 = (double)dHg[(size_t)i2 * D + j] - corr[(size_t)i2 * D + j]; rs += e2 * e2; }
+              eg1 += wg * rs; eg0 += wg * ge2[i2]; }
+          free(ge2); }
         const double recg = eg0 > 0 ? 1.0 - eg1 / eg0 : 0.0;
         /* 靶量级随行打印(2026-08-31): 挽回是比值, FP 靶塌缩层分母≈0 ⇒ 读数±爆表
          * (champ3 实况: L31-L37 −91~−280% 与 L35/38 +89/+97% 同深度带并存)。
@@ -419,12 +453,13 @@
         double gb = 0;
         for (size_t i2 = 0; i2 < (size_t)NG * D; i2++) gb += (double)ysg[i2] * ysg[i2];
         printf("  L%d 跨语料闸(量化半 %d 行): 挽回 %.2f%% [靶RMS %.3e 基RMS %.3e 靶占比 %.2f%% | held靶RMS %.3e] → %s\n",
-               L, NG, recg * 100, sqrt(eg0 / ((double)NG * D)), sqrt(gb / ((double)NG * D)),
-               gb > 0 ? 100.0 * sqrt(eg0 / gb) : -1.0, nev > 0 ? sqrt(e0 / ((double)nev * D)) : 0.0,
+               L, NG, recg * 100, sqrt(eg0raw / ((double)NG * D)), sqrt(gb / ((double)NG * D)),
+               gb > 0 ? 100.0 * sqrt(eg0raw / gb) : -1.0, nev > 0 ? sqrt(e0raw / ((double)nev * D)) : 0.0,
                recg > 0 ? "通过" : "★拒: 同语料 held 正/跨语料负 = 过拟合★");
         if (recg <= 0) eff = 0.0;
         free(Xg); free(ridxg); free(rwg); free(dHg); free(prowg); free(peg);
         free(pwg); free(pYQg); free(ysg); free(corr);
     }
+    free(rowE); free(rowW);
     double t2 = now_s();
 
