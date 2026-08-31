@@ -30,8 +30,6 @@
 #include "web_internal.h"
 
 char *web_chrome_executable(void) {
-    const char *env = getenv("DS4_CHROME");
-    if (env && env[0]) return web_xstrdup(env);
 #ifdef __APPLE__
     if (access("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", X_OK) == 0)
         return web_xstrdup("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
@@ -80,7 +78,6 @@ char *web_chrome_executable(void) {
 
 #ifdef __APPLE__
 const char *web_macos_chrome_app_name(void) {
-    if (getenv("DS4_CHROME")) return NULL;
     if (access("/Applications/Google Chrome.app", F_OK) == 0)
         return "Google Chrome";
     if (access("/Applications/Chromium.app", F_OK) == 0)

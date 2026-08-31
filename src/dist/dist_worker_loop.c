@@ -1,85 +1,9 @@
 /* dist_worker_loop.c — 机械拆自 ds4_distributed.c: worker 控制循环与结果帧(Worker Control Loop And Result Frames)。行为零变化。 */
 #include "dist_internal.h"
 
-/* 文件内前置声明(原文件同名声明原样搬入): 定义在调用者之后。 */
-static int dist_worker_handle_work(
-        ds4_dist_worker_state *state,
-        ds4_dist_worker_upstream *upstream,
-        uint32_t bytes);
-
 /* =========================================================================
  * Worker Control Loop And Result Frames
  * ========================================================================= */
-
-int dist_worker_read_loop(ds4_dist_worker_state *state, int fd) {
-    ds4_dist_worker_upstream upstream;
-    dist_worker_upstream_init(&upstream, state, fd);
-    int loop_rc = 0;
-
-    for (;;) {
-        uint32_t type = 0, bytes = 0;
-        char err[256];
-        int rc = dist_read_frame_header(fd, &type, &bytes, err, sizeof(err));
-        if (rc == 0) break;
-        if (rc < 0) {
-            fprintf(stderr, "ds4: distributed worker: protocol error: %s\n", err);
-            loop_rc = 1;
-            break;
-        }
-        if (type == DS4_DIST_MSG_ERROR) {
-            char msg[512];
-            uint32_t n = bytes < sizeof(msg) - 1u ? bytes : (uint32_t)sizeof(msg) - 1u;
-            rc = dist_read_full(fd, msg, n);
-            if (rc <= 0) {
-                loop_rc = 1;
-                break;
-            }
-            msg[n] = '\0';
-            if (bytes > n) dist_discard_bytes(fd, bytes - n);
-            fprintf(stderr, "ds4: distributed worker: coordinator error: %s\n", msg);
-            loop_rc = 1;
-            break;
-        }
-        if (type == DS4_DIST_MSG_WORK) {
-            rc = dist_worker_handle_work(state, &upstream, bytes);
-            if (rc <= 0) {
-                loop_rc = rc == 0 ? 0 : 1;
-                break;
-            }
-            continue;
-        }
-        if (type == DS4_DIST_MSG_SNAPSHOT_SAVE_REQ) {
-            rc = dist_worker_handle_snapshot_save(state, &upstream, bytes);
-            if (rc <= 0) {
-                loop_rc = rc == 0 ? 0 : 1;
-                break;
-            }
-            continue;
-        }
-        if (type == DS4_DIST_MSG_SNAPSHOT_LOAD_BEGIN) {
-            rc = dist_worker_handle_snapshot_load(state, &upstream, bytes);
-            if (rc <= 0) {
-                loop_rc = rc == 0 ? 0 : 1;
-                break;
-            }
-            continue;
-        }
-        rc = dist_discard_bytes(fd, bytes);
-        if (rc <= 0) {
-            loop_rc = rc == 0 ? 0 : 1;
-            break;
-        }
-        pthread_mutex_lock(&upstream.write_mu);
-        dist_send_error(fd, "unsupported distributed worker frame");
-        pthread_mutex_unlock(&upstream.write_mu);
-        fprintf(stderr, "ds4: distributed worker: rejected unsupported frame type %u\n", type);
-        loop_rc = 1;
-        break;
-    }
-
-    dist_worker_upstream_destroy(&upstream);
-    return loop_rc;
-}
 
 int dist_send_work_result(
         int fd,
@@ -258,26 +182,6 @@ int dist_send_snapshot_file_chunks(int fd, uint64_t request_id, FILE *fp, uint64
         bytes -= n;
     }
     free(buf);
-    return rc;
-}
-
-
-static int dist_worker_handle_work(
-        ds4_dist_worker_state *state,
-        ds4_dist_worker_upstream *upstream,
-        uint32_t bytes) {
-    void *payload = malloc(bytes);
-    if (!payload) {
-        dist_discard_bytes(upstream->fd, bytes);
-        return dist_worker_upstream_send_work_error(upstream, 0, "out of memory reading distributed WORK frame");
-    }
-    int rc = dist_read_full(upstream->fd, payload, bytes);
-    if (rc <= 0) {
-        free(payload);
-        return rc == 0 ? 0 : -1;
-    }
-    rc = dist_worker_process_work_payload(state, upstream, payload, bytes);
-    free(payload);
     return rc;
 }
 

@@ -47,11 +47,12 @@ static void test_print_help(const char *prog) {
     puts("  -h, --help");
     puts("      Show this help.");
     puts("\nEnvironment:");
-    puts("  DS4_TEST_MODEL=FILE        Model path. Default: ds4flash.gguf");
-    puts("  DS4_TEST_LONG_PROMPT=FILE  Rendered long-context story fact prompt.");
-    puts("  DS4_TEST_VECTOR_FILE=FILE  Simple official-vector fixture.");
-    puts("  DS4_TEST_LOCAL_GOLDEN_FILE=FILE  Local top-k golden-vector fixture.");
-    puts("  DS4_TEST_MPP_EQ_CASE=NAME  Run only Tensor equivalence cases whose id contains NAME.");
+    puts("  --model FILE         GGUF model for the real-model suites (default ds4flash.gguf).");
+    puts("  --long-prompt FILE   Rendered long-context story fact prompt.");
+    puts("  --vector-file FILE   Simple official-vector fixture.");
+    puts("  --local-golden FILE  Local top-k golden-vector fixture.");
+    puts("  --mpp-case NAME      Run only Tensor equivalence cases whose id contains NAME.");
+    puts("  --keep-metal4        Keep Metal4 enabled during the logprob-vector suite.");
 }
 
 static const ds4_test_entry *test_find_entry(const char *arg) {
@@ -70,7 +71,7 @@ static void test_run_entry(const ds4_test_entry *entry) {
     if (entry->needs_model) {
         FILE *mf = fopen(test_model_path(), "rb");
         if (!mf) {
-            fprintf(stderr, "%s: SKIP (model '%s' 不存在 — 该套件要真模型, 见 DS4_TEST_MODEL)\n",
+            fprintf(stderr, "%s: SKIP (model '%s' 不存在 — 该套件要真模型, 见 --model)\n",
                     entry->name, test_model_path());
             return;
         }
@@ -85,6 +86,21 @@ static void test_run_entry(const ds4_test_entry *entry) {
             "%s",
             test_failures == before ? "OK" : "ERR");
     fputc('\n', stderr);
+}
+
+const char *g_test_model = NULL;
+const char *g_test_vector_file = NULL;
+const char *g_test_long_prompt = NULL;
+const char *g_test_mpp_case = NULL;
+const char *g_test_local_golden = NULL;
+int g_test_keep_metal4 = 0;
+
+static const char *test_need_value(int *i, int argc, char **argv) {
+    if (*i + 1 >= argc) {
+        fprintf(stderr, "ds4-test: %s requires a value\n", argv[*i]);
+        exit(2);
+    }
+    return argv[++*i];
 }
 
 int main(int argc, char **argv) {
@@ -102,6 +118,18 @@ int main(int argc, char **argv) {
         } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             test_print_help(argv[0]);
             return 0;
+        } else if (!strcmp(argv[i], "--model")) {
+            g_test_model = test_need_value(&i, argc, argv);
+        } else if (!strcmp(argv[i], "--vector-file")) {
+            g_test_vector_file = test_need_value(&i, argc, argv);
+        } else if (!strcmp(argv[i], "--long-prompt")) {
+            g_test_long_prompt = test_need_value(&i, argc, argv);
+        } else if (!strcmp(argv[i], "--mpp-case")) {
+            g_test_mpp_case = test_need_value(&i, argc, argv);
+        } else if (!strcmp(argv[i], "--local-golden")) {
+            g_test_local_golden = test_need_value(&i, argc, argv);
+        } else if (!strcmp(argv[i], "--keep-metal4")) {
+            g_test_keep_metal4 = 1;
         } else {
             const ds4_test_entry *entry = test_find_entry(argv[i]);
             if (!entry) {

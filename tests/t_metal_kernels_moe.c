@@ -147,10 +147,9 @@ static void test_fill_go1b_expert(uint8_t *base, uint32_t tag, uint32_t e,
 
 void test_metal_go1b_routed_moe(void) {
     /* Exercise the over-budget OFFLOAD dispatch (CPU gather -> resident scratch ->
-     * mm_id). pread auto-falls back to memcpy with no model fd; force it off so the
-     * synthetic host-buffer model is gathered by memcpy. */
-    setenv("DS4_METAL_EXPERT_OFFLOAD", "1", 1);
-    setenv("DS4_METAL_EXPERT_PREAD", "0", 1);
+     * mm_id). pread self-disables without a model fd, so the synthetic
+     * host-buffer model is gathered by memcpy. */
+    ds4_gpu_set_expert_offload(1);
 
     /* Real-model shapes: multi-block rows (in_dim=2048 -> 8 go1b blocks/row,
      * mid_dim=2048 -> 8 blocks) so the test exercises the per-block scale/sign
@@ -323,8 +322,7 @@ static void test_fill_go2b_expert(uint8_t *base, uint32_t tag, uint32_t e,
     }
 }
 void test_metal_go2b_routed_moe(void) {
-    setenv("DS4_METAL_EXPERT_OFFLOAD", "1", 1);
-    setenv("DS4_METAL_EXPERT_PREAD", "0", 1);
+    ds4_gpu_set_expert_offload(1);
     const uint32_t in_dim = 2048, mid_dim = 2048, out_dim = 2048;
     const uint32_t n_total = 8, n_sel = 6;
     const uint64_t blk = 68u;   /* sizeof(block_go2b) */

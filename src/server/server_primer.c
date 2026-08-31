@@ -86,38 +86,9 @@ int primer_copy_step(server *s, primer_copy *cm, const char *stopchars,
         free(gp);
         return free_tok;
     }
-    /* ★置信门控的混合值区(2026-07-14, DS4_PRIMER_FREE_CONF=p, 0=关)★
-     * 纯 copy 的抄写陷阱: 值需要"构造"(如 `go test ./...` 不在上下文里)时, 任何能延续
-     * 某个 span 的 token 都被接受, 模型被拽去抄语义无关的 span(实测 ROUND2: command
-     * 抄成 "clamp.go")。而占位符($PARAMETER_VALUE)恰恰出现在模型没把握的位置。
-     * 门控: 自由 argmax 的 softmax 概率 ≥ p 时放行自由 token(模型有把握=让它构造),
-     * 否则维持 copy 约束(没把握=抄上下文, 防占位符)。hard(verbatim)契约不受影响。
-     * 视图统一(COPY_EMISSION lane): 本函数只在 PRIMER_GEN_COPY_C 内被调, 会话在
-     * COPY lane 下 ds4_session_argmax 返回 raw 结果 —— p1 与放行的 free_tok 如今
-     * 同为 raw argmax(旧状态: p1 按 raw logits 量、放行的却是惩罚后 argmax,
-     * "量A放B")。下面的 max 扫描与 lane 无关地重算 raw argmax logit, 保留。 */
-    if (gp && !hard) {
-        const char *cs = getenv("DS4_PRIMER_FREE_CONF");
-        const double thr = cs ? atof(cs) : 0.0;
-        if (thr > 0.0) {
-            const int nv0 = ds4_engine_vocab_size(s->engine);
-            float *l0 = malloc((size_t)nv0 * sizeof(*l0));
-            if (l0 && ds4_session_copy_logits(s->session, l0, nv0) == nv0) {
-                float mx = l0[0];
-                for (int i = 1; i < nv0; i++) if (l0[i] > mx) mx = l0[i];
-                double sum = 0.0;
-                for (int i = 0; i < nv0; i++) sum += exp((double)(l0[i] - mx));
-                const double p1 = sum > 0.0 ? 1.0 / sum : 0.0;   /* free_tok(=raw argmax) 的概率 */
-                if (p1 >= thr) {
-                    free(l0); free(gp);
-                    cm->dead = true;               /* 本参数值后续也自由(已进构造模式) */
-                    if (fell_back) *fell_back = true;
-                    return free_tok;
-                }
-            }
-            free(l0);
-        }
-    }
+    /* 置信门控的混合值区已删(2026-07-14 negative result 定案): 模型的自由生成本身就是
+     * 占位符($PARAMETER_VALUE), 对占位符反而"有把握" → 门控放行的恰恰是垃圾。
+     * 生产=纯 copy 约束。 */
     free(gp);
 
     /* free choice infeasible: take the best-logit feasible token instead */

@@ -135,19 +135,6 @@ typedef struct {
 } ds4_cursor;
 
 
-typedef struct {
-    int      inited;
-    int      enabled;
-    const char *csv_path;
-    double   load_sec;
-    uint64_t load_footprint_delta;
-    uint64_t prefill_tokens;
-    uint32_t prefill_chunks;
-    double   prefill_sec;
-    uint64_t decode_tokens;
-    double   decode_sec;
-} ds4_profile_state;
-
 typedef void (*ds4_parallel_fn)(void *ctx, uint64_t row0, uint64_t row1);
 
 
@@ -463,7 +450,6 @@ struct ds4_vocab {
 
 struct ds4_engine {
     ds4_model model;
-    ds4_model mtp_model;
     ds4_vocab vocab;
     ds4_weights weights;
     ds4_mtp_weights mtp_weights;
@@ -488,7 +474,6 @@ struct ds4_engine {
     bool quality;
     ds4_distributed_options distributed;
     bool metal_ready;
-    bool mtp_ready;
     /* TP peer connection (Stage 2). Established lazily on first session use when
      * distributed.tp_enabled, shared read-only by the session graph. */
     ds4_dist_tp *tp;

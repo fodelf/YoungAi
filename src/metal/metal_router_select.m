@@ -47,9 +47,10 @@ int ds4_gpu_encode_router_select(
         fabsf(expert_weight_scale - 1.5f) <= 1.0e-6f;
 
     int ok = 0;
+    /* 非融合路仍可达: 非 256/6/1.5 的路由形状、--quality、批 >1 token 都走下面
+     * 的通用编码 —— 这里只删了 env 关闭口。 */
     if (flash_router_fast_path &&
-        !g_quality_mode && n_tokens == 1 &&
-        getenv("DS4_METAL_DISABLE_ROUTER_SELECT_FUSION") == NULL) {
+        !g_quality_mode && n_tokens == 1) {
         id<MTLComputePipelineState> softplus_sqrt_pipeline =
             ds4_gpu_hot_pipeline(g_dsv4_softplus_sqrt_pipeline,
                                     "kernel_dsv4_softplus_sqrt_f32_4");
@@ -326,58 +327,10 @@ int ds4_gpu_set_expert_keep_lut(const int16_t *lut, uint32_t n_layer) {
     return 1;
 }
 
-/* B2b fail-loud dump (react-go-execution-plan M-1.2), runs at process exit when
- * verify is on. Mode P masks every cold expert out of routing, so a non-zero
- * clamp tally is a correctness failure: a dropped expert was selected and the
- * translate kernel silently re-routed it to slot 0. Lists every offending
- * (layer, original-expert id) so a leak points straight at the masking gap. */
-static void ds4_gpu_route_clamp_dump(void) {
-    if (g_route_clamp_verify != 1 || !g_route_clamp_buf) return;
-    const uint32_t *cnt = (const uint32_t *)g_route_clamp_buf.contents;
-    uint64_t total = 0;
-    for (uint32_t i = 0; i < g_route_clamp_layers * 256u; i++) total += cnt[i];
-    if (total == 0) {
-        fprintf(stderr,
-                "ds4: [B2b] route-translate clamp verify: 0 cold-expert clamps "
-                "across the run -- Mode P masking is tight (clamp count = 0)\n");
-        return;
-    }
-    fprintf(stderr,
-            "ds4: [B2b] *** ROUTE-TRANSLATE CLAMP LEAK *** %llu cold-expert "
-            "selection(s) clamped to slot 0 -- Mode P masking LEAKED:\n",
-            (unsigned long long)total);
-    for (uint32_t L = 0; L < g_route_clamp_layers; L++) {
-        for (uint32_t e = 0; e < 256u; e++) {
-            const uint32_t c = cnt[L * 256u + e];
-            if (c)
-                fprintf(stderr,
-                        "ds4: [B2b]   layer %02u expert %03u clamped %u time(s)\n",
-                        L, e, c);
-        }
-    }
-}
-
-/* B2b: read DS4_VERIFY_ROUTE_CLAMP once; on first enable register the atexit
- * fail-loud dump. The tally buffer is allocated lazily by ensure_buf() below once
- * the kept-layer count is known. Default (unset) => verify off => byte-identical
- * routing (kernel skips the atomic). */
-int ds4_gpu_route_clamp_verify_enabled(void) {
-    if (g_route_clamp_verify < 0) {
-        g_route_clamp_verify = ds4_gpu_env_bool("DS4_VERIFY_ROUTE_CLAMP") > 0 ? 1 : 0;
-        if (g_route_clamp_verify == 1) {
-            atexit(ds4_gpu_route_clamp_dump);
-            fprintf(stderr,
-                    "ds4: [B2b] route-translate clamp verify enabled "
-                    "(DS4_VERIFY_ROUTE_CLAMP=1) -- Mode P clamp count must be 0\n");
-        }
-    }
-    return g_route_clamp_verify;
-}
-
-/* B2b: lazily allocate the [n_layer*256] uint32 clamp tally, sized to the kept-
+/* Lazily allocate the [n_layer*256] uint32 clamp tally, sized to the kept-
  * layer count (DeepSeek V4 = 43 layers, ~43 KiB). Allocated for any keep-map
- * model so the kernel always has a bound buffer at index 3; the atomic write is
- * gated by args.verify, so non-verify runs leave it untouched. */
+ * model so the translate kernel always has a bound buffer at index 3; the
+ * atomic write is gated by args.verify (now always 0), so it stays untouched. */
 id<MTLBuffer> ds4_gpu_route_clamp_ensure_buf(void) {
     if (!g_route_clamp_buf || g_route_clamp_layers != g_expert_keep_lut_layers) {
         const size_t n = (size_t)g_expert_keep_lut_layers * 256u * sizeof(uint32_t);

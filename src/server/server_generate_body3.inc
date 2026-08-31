@@ -33,11 +33,10 @@
         int toks[513];  /* wave 69: chained spec-pipe, up to 1 + DEPTH(<=7) verify cycles
                          * (8*64 rows + first_token); was [65]/[129]. */
         int ntok = 0;
-        /* Greedy decode always takes the speculative path: the n-gram copy
-         * drafter is the natural default (self-gating, lossless), with MTP
-         * drafting when a draft model is loaded. */
-        if (temperature <= 0.0f &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL)
+        /* Greedy decode always takes the speculative entry: it self-gates to
+         * plain flat decode unless a drafter is armed (--spec), so this path
+         * is lossless either way. */
+        if (temperature <= 0.0f)
         {
             ntok = ds4_session_eval_speculative_argmax(s->session,
                                                        token,

@@ -65,7 +65,6 @@ void ds4_engine_close(ds4_engine *e) {
     weights_free(&e->weights);
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
-    if (e->mtp_ready) model_close(&e->mtp_model);
     model_close(&e->model);
 #ifndef DS4_NO_GPU
     ds4_gpu_cleanup();
@@ -111,14 +110,11 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     session_reset_request_policy(s);
     s->ctx_size = ctx_size;
     s->prefill_cap = metal_graph_prefill_cap_for_prompt(ctx_size);
-    const char *dist_prefill_env = getenv("DS4_DIST_PREFILL_CAP");
-    if (dist_prefill_env && dist_prefill_env[0] &&
-        e->distributed.role != DS4_DISTRIBUTED_NONE && e->distributed.layers.set) {
-        char *endp = NULL;
-        unsigned long v = strtoul(dist_prefill_env, &endp, 10);
-        if (endp != dist_prefill_env && v > 0 && v <= (unsigned long)ctx_size) {
-            s->prefill_cap = (uint32_t)v;
-        }
+    /* --dist-prefill-cap: 分布式会话的 prefill 批上限覆盖(压住宽批的专家工作集)。 */
+    if (e->distributed.prefill_cap > 0 &&
+        e->distributed.role != DS4_DISTRIBUTED_NONE && e->distributed.layers.set &&
+        e->distributed.prefill_cap <= (uint32_t)ctx_size) {
+        s->prefill_cap = e->distributed.prefill_cap;
     }
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, s->prefill_cap);
     bool active_slice = false;
@@ -130,9 +126,9 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         active_end = e->distributed.layers.has_output ?
                      ((uint32_t)DS4_N_LAYER - 1u) : e->distributed.layers.end;
     }
-    s->graph.dspark_capture = e->dspark.ready ? 1 : 0;
+    s->graph.dspark_capture = (e->dspark.ready && g_ds4_spec_enabled) ? 1 : 0;
     if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, &e->weights.layer[0],
-                                   raw_cap, (uint32_t)ctx_size, s->prefill_cap, e->mtp_ready,
+                                   raw_cap, (uint32_t)ctx_size, s->prefill_cap, false,
                                    active_start, active_end, active_slice))
     {
         free(s);
@@ -142,17 +138,16 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->graph.power_percent = (uint32_t)e->power_percent;
     if (e->distributed.tp_enabled) {
         /* Establish the TP peer link once per engine. By default the coordinator
-         * listens and the worker connects. DS4_TP_REVERSE_CONNECT=1 flips the
-         * network roles (coordinator connects, worker listens) to work around a
-         * host where one direction's connect() fails (observed: an M1 where ds4's
+         * listens and the worker connects. --reverse-connect flips the network
+         * roles (coordinator connects, worker listens) to work around a host
+         * where one direction's connect() fails (observed: an M1 where ds4's
          * outbound connect returns EHOSTUNREACH while nc/plain connect succeed).
          * The TP all-reduce is a symmetric sum, so connect direction does not
          * affect results; tp_owns_low stays tied to role, not to who listens.
          * Blocks until both peers are up; KB-level buffers only. */
         if (!e->tp) {
             char terr[256] = {0};
-            const char *rev = getenv("DS4_TP_REVERSE_CONNECT");
-            bool reverse = (rev && *rev && rev[0] != '0');
+            bool reverse = e->distributed.reverse_connect;
             bool coordinator = (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR);
             bool i_listen = reverse ? !coordinator : coordinator;
             if (i_listen) {
@@ -184,10 +179,6 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         return 1;
     }
     s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
-    if (e->mtp_ready) {
-        s->mtp_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->mtp_logits[0]));
-        s->mtp_draft_token = -1;
-    }
     if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR && !e->distributed.tp_enabled) {
         char err[256];
         if (ds4_dist_session_create(&s->distributed,

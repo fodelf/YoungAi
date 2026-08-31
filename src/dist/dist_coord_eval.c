@@ -201,13 +201,6 @@ int dist_coordinator_eval_span(
         }
     }
 
-    /* DS4_DIST_PIPE_PROFILE: per-forward split of coord-local compute vs the
-     * time the coordinator is BLOCKED on the worker (send + worker compute +
-     * return). In layer-pipeline decode the two hosts never overlap for a single
-     * forward, so t_remote is exactly the coordinator-idle the user asked about
-     * ("双机分层是否存在等待"). One stderr line per cross-machine forward. */
-    const bool pipe_profile = dist_env_enabled("DS4_DIST_PIPE_PROFILE");
-    const double t0 = pipe_profile ? dist_now_sec() : 0.0;
     int rc;
     if (state->spec_precomputed_hidden && !local_logits && plan->count != 0) {
         /* Wave 68+ spec-pipe: reuse the hidden computed during the PREVIOUS
@@ -230,7 +223,6 @@ int dist_coordinator_eval_span(
                                           err,
                                           errlen);
     }
-    const double t_local = pipe_profile ? dist_now_sec() : 0.0;
     if (rc == 0 && plan->count != 0) {
         rc = dist_coordinator_eval_remote_on_fd(state,
                                                 session,
@@ -250,20 +242,6 @@ int dist_coordinator_eval_span(
                                                 spec,
                                                 err,
                                                 errlen);
-    }
-    if (pipe_profile) {
-        const double t_remote = dist_now_sec();
-        const double local_ms = (t_local - t0) * 1000.0;
-        const double remote_ms = (t_remote - t_local) * 1000.0;
-        const double total_ms = local_ms + remote_ms;
-        const bool verify = spec && (spec->extra_flags & DS4_DIST_WORK_F_VERIFY) != 0;
-        const bool draft = spec && (spec->extra_flags & DS4_DIST_WORK_F_DRAFT) != 0;
-        fprintf(stderr,
-                "ds4: dist-pipe: pos=%u n_tokens=%u%s%s t_local=%.1fms "
-                "t_remote_blocked=%.1fms remote_frac=%.0f%% rc=%d\n",
-                pos0, n_tokens, verify ? " verify" : "", draft ? " draft" : "",
-                local_ms, remote_ms,
-                total_ms > 0.0 ? 100.0 * remote_ms / total_ms : 0.0, rc);
     }
     free(hidden);
     return rc;

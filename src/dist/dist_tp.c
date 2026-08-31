@@ -96,12 +96,7 @@ static int dist_tp_exchange(ds4_dist_tp *tp, const float *buf, uint32_t count) {
     const size_t total = sizeof(sh) + payload;
     size_t sent = 0, got = 0;
 
-    int timeout_sec = 60;
-    const char *te = getenv("DS4_DIST_SOCKET_TIMEOUT_SEC");
-    if (te && te[0]) {
-        char *end = NULL; long v = strtol(te, &end, 10);
-        if (end != te && *end == '\0' && v > 0 && v <= 3600) timeout_sec = (int)v;
-    }
+    const int timeout_sec = DIST_SOCKET_TIMEOUT_SEC;
 
     while (sent < total || got < total) {
         struct pollfd pfd = { .fd = tp->fd, .events = 0, .revents = 0 };
@@ -243,11 +238,9 @@ static int dist_tp_recv_prompt(ds4_dist_tp *tp, ds4_tokens *out) {
 /* TP prefill feeds the whole prompt through all layers. With expert-offload the
  * set of routed experts touched by a wide token batch can blow past a 16 GB
  * GPU's wired limit, so feed the prompt in small chunks to bound the live
- * expert working set. Tunable; small default keeps both peers (incl. M1 Pro)
- * under the wired ceiling. */
+ * expert working set. 4 keeps both peers (incl. M1 Pro) under the wired
+ * ceiling. */
 static uint32_t dist_tp_prefill_chunk(void) {
-    const char *e = getenv("DS4_TP_PREFILL_CHUNK");
-    if (e && *e) { long v = strtol(e, NULL, 10); if (v >= 1 && v <= 512) return (uint32_t)v; }
     return 4u;
 }
 

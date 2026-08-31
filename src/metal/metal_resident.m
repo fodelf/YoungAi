@@ -1,6 +1,16 @@
 /* metal_resident.m — ds4_metal.m 机械拆分产物(不改名/不改逻辑/不改字符串)。 */
 #import "metal_internal.h"
 
+/* 保命旗(--no-residency / ds4_gpu_set_no_residency): 单机跑超大 mono 模型时
+ * 跳过 MTLResidencySet wiring 与 view warmup。2026-07-06 实撞在案: 全 EF mono
+ * 的 wired 暴涨饿死 watchdogd → macOS 内核 panic; 预算闸挡不住 wired 增长,
+ * 只有不请求驻留才安全(gguf-tools/scripts/safe_verify.sh 依赖)。 */
+static int g_no_residency;
+
+void ds4_gpu_set_no_residency(int on) {
+    g_no_residency = on ? 1 : 0;
+}
+
 void ds4_gpu_model_views_clear(void) {
     for (uint32_t i = 0; i < g_model_view_count; i++) {
         g_model_views[i].buffer = nil;
@@ -26,7 +36,7 @@ void ds4_gpu_model_residency_clear(void) {
 }
 
 static int ds4_gpu_model_residency_request_views(void) {
-    if (g_model_view_count == 0 || getenv("DS4_METAL_NO_RESIDENCY") != NULL) return 1;
+    if (g_model_view_count == 0 || g_no_residency) return 1;
 
 #if TARGET_OS_OSX
     if (@available(macOS 15.0, *)) {
@@ -198,7 +208,7 @@ int ds4_gpu_finish_model_views(
         uint64_t mapped_model_size,
         uint64_t display_offset) {
     const double t_mapped = ds4_gpu_now_ms();
-    const int request_residency = getenv("DS4_METAL_NO_RESIDENCY") == NULL;
+    const int request_residency = !g_no_residency;
     if (request_residency) ds4_gpu_progress_begin("requesting Metal residency (may take tens of seconds)");
     if (!ds4_gpu_model_residency_request_views()) {
         if (request_residency) ds4_gpu_progress_failed();
@@ -208,9 +218,7 @@ int ds4_gpu_finish_model_views(
     const double t_resident = ds4_gpu_now_ms();
     int warmed = 1;
     const double t_warm0 = ds4_gpu_now_ms();
-    const int warm_model_views = getenv("DS4_METAL_NO_RESIDENCY") == NULL &&
-                                 getenv("DS4_METAL_NO_MODEL_WARMUP") == NULL;
-    if (warm_model_views) {
+    if (request_residency) {
         /*
          * The first GPU command touching no-copy mmap storage can pay command
          * queue setup, page-table validation, and shared-allocation residency
@@ -237,10 +245,6 @@ int ds4_gpu_finish_model_views(
     return 1;
 }
 
-void ds4_gpu_set_model_map_nonresident_hint(int on) {
-    g_model_view_force_nonresident = on ? 1 : 0;
-}
-
 int ds4_gpu_map_model_views(
         const void *model_map,
         uint64_t    model_size,
@@ -249,13 +253,12 @@ int ds4_gpu_map_model_views(
         uint64_t    max_tensor_bytes) {
     const double t0 = ds4_gpu_now_ms();
     uint64_t mapped_model_size = 0;
-    const bool resident = g_model_view_force_nonresident ? false : true;
     if (!ds4_gpu_add_model_view_range(model_map,
                                       model_size,
                                       map_offset,
                                       map_size,
                                       max_tensor_bytes,
-                                      resident,
+                                      true,
                                       &mapped_model_size)) {
         return 0;
     }

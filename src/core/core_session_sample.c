@@ -56,22 +56,6 @@ static void session_apply_repeat_penalty(ds4_session *s) {
 }
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
-    if (getenv("DS4_DECODE_DIAG")) {
-        /* [decode-diag] inspect the logits the sampler is about to draw from:
-         * argmax + its value + how many entries are non-finite (NaN/inf => the
-         * distributed worker returned garbage logits rather than a real head). */
-        int argmax = 0;
-        float amv = s->logits[0];
-        uint32_t nonfinite = 0;
-        for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
-            const float v = s->logits[i];
-            if (!isfinite(v)) { nonfinite++; continue; }
-            if (v > amv) { amv = v; argmax = (int)i; }
-        }
-        fprintf(stderr,
-                "ds4: [decode-diag] logits argmax=%d val=%.4f nonfinite=%u/%u\n",
-                argmax, amv, nonfinite, (unsigned)DS4_N_VOCAB);
-    }
     session_apply_repeat_penalty(s);
     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k, top_p, min_p, rng);
 }

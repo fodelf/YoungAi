@@ -6,18 +6,18 @@
  * ========================================================================= */
 
 /* Layer-pipeline reverse-connect: by default the worker dials the coordinator's
- * control port. DS4_DIST_REVERSE_CONNECT=1 (also honors the legacy
- * DS4_TP_REVERSE_CONNECT) flips it so the COORDINATOR dials a listening worker
- * and the worker only ever accept()s. Works around a host where the worker's
- * outbound connect to the local link is denied (observed: macOS Local Network
- * privacy refusing ds4 over the thunderbolt bridge -> connect EHOSTUNREACH while
- * nc succeeds). The activation/data channel is already coordinator->worker, so
- * only the control direction changes; HELLO still flows worker->coordinator over
- * the socket no matter who dialed. Single remote worker only. */
+ * control port. --reverse-connect flips it so the COORDINATOR dials a listening
+ * worker and the worker only ever accept()s. Works around a host where the
+ * worker's outbound connect to the local link is denied (observed: macOS Local
+ * Network privacy refusing ds4 over the thunderbolt bridge -> connect
+ * EHOSTUNREACH while nc succeeds). The activation/data channel is already
+ * coordinator->worker, so only the control direction changes; HELLO still flows
+ * worker->coordinator over the socket no matter who dialed. Single remote
+ * worker only. Set at CLI parse (dist_cli.c) — a process-wide fact, kept as a
+ * global because callers (worker loop, coord session) have no options struct. */
+int g_dist_reverse_connect = 0;
 bool dist_reverse_connect_enabled(void) {
-    const char *e = getenv("DS4_DIST_REVERSE_CONNECT");
-    if (!e || !*e) e = getenv("DS4_TP_REVERSE_CONNECT");
-    return e && *e && e[0] != '0';
+    return g_dist_reverse_connect != 0;
 }
 
 void *dist_coordinator_reverse_connect_main(void *arg) {

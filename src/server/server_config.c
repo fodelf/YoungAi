@@ -1,6 +1,9 @@
 /* server_config.c — 机械拆分自 ds4_server.c (12787-13152 行): 命令行解析与 usage。 */
 
 #include "server_internal.h"
+#ifndef DS4_NO_GPU
+#include "ds4_gpu.h"
+#endif
 
 static int parse_int_arg(const char *s, const char *opt) {
     char *end = NULL;
@@ -72,6 +75,10 @@ void server_close_resources(server *s) {
     memset(s, 0, sizeof(*s));
 }
 
+/* 跨文件全局 (声明在 server_types2.h): 渲染/引导层没有 cfg 可传, 走全局。 */
+int g_base_native = 0;
+bool g_primer_compact = false;
+
 void usage(FILE *fp) {
     fprintf(fp,
         "Usage: ds4-server [options]\n"
@@ -92,6 +99,30 @@ void usage(FILE *fp) {
         "  --tool-primer\n"
         "      Seed tool-enabled turns with the DSML tool-call opener (base/continuation\n"
         "      models act by continuing a prefix, not by following instructions).\n"
+        "  --residual FILE\n"
+        "      1-bit residual expert sidecar GGUF layered over the base quant.\n"
+        "  --vq-dir DIR\n"
+        "      VQ codebook sidecar directory (takes precedence over --residual).\n"
+        "  --spec\n"
+        "      DSpark speculative decoding + online scheduler (greedy-lossless).\n"
+        "  --draft-gguf FILE | --draft-zchain FILE\n"
+        "      Standalone DSpark drafter GGUF and its amplifier sidecar.\n"
+        "  --mm-image-cmd CMD\n"
+        "      External multimodal image encoder command (default: probe ./mm-ui).\n"
+        "  --mem-budget-mb N\n"
+        "      Arm the memory guardrails (watchdog 90%% abort, L1 85%% load gate,\n"
+        "      expert resident/stream AUTO verdict). Unset = disarmed.\n"
+        "  --prefill-chunk N\n"
+        "      Prefill batch chunk cap in tokens (0 = whole prompt as one batch).\n"
+        "  --batch N\n"
+        "      Merge up to N concurrent non-streaming tool-free chat requests into one\n"
+        "      batched decode (0 disables; max 8). Default: 0\n"
+        "  --base-native\n"
+        "      Render chat as base-model native scaffolding (# User:/# Assistant:)\n"
+        "      instead of DSML role frames; for served base models.\n"
+        "  --primer-compact\n"
+        "      Tool-primer injects only semantic anchors into the KV (client-visible\n"
+        "      text remains full DSML).\n"
         "  -t, --threads N\n"
         "      CPU helper threads for lightweight host-side work.\n"
         "  --chdir DIR\n"
@@ -110,6 +141,15 @@ void usage(FILE *fp) {
         "      Target GPU duty cycle percentage, 1..100. Default: 100\n"
         "  --metal | --cuda | --cpu | --backend NAME\n"
         "      Select backend explicitly. Defaults to Metal on macOS and CUDA on CUDA builds.\n"
+        "  --strict-fp\n"
+        "      Strict IEEE-754 shader math (safe math + f32 raw KV + exp2/log2 RoPE)\n"
+        "      for cross-GPU parity lanes. Metal only.\n"
+        "  --expert-pool-mb N | --expert-pool-pinned SPEC | --expert-pool-auto-pin-top N | --expert-pool-prefetch-top N\n"
+        "      Resident routed-expert LRU pool: MiB budget (0 = off), pin whitelist\n"
+        "      (\"L20:1,2;L21:7\"), auto-pin top-N, prefetch margin. Metal only.\n"
+        "  --expert-pin-file FILE | --expert-pin-mlock-mb N | --resid-pin-mlock-mb N\n"
+        "      Frequency hot-expert mlock pins: pin list file, wired budget, and the\n"
+        "      residual sidecar's wired budget (0 = off). Metal only.\n"
         "\n"
         "HTTP API:\n"
         "  --host HOST\n"
@@ -208,6 +248,16 @@ server_config parse_options(int argc, char **argv) {
     };
     c.kv_cache = kv_cache_default_options();
 
+#ifndef DS4_NO_GPU
+    /* GPU 侧成组 setter 的累积量: 解析完一次性下发(池 setter 一次收全四项)。 */
+    uint64_t expert_pool_mb = 0;
+    const char *expert_pool_pinned = NULL;
+    uint32_t expert_pool_auto_pin_top = 0;
+    uint32_t expert_pool_prefetch_top = 0;
+    const char *expert_pin_file = NULL;
+    uint64_t expert_pin_mlock_mb = 0;
+    uint64_t resid_pin_mlock_mb = 0;
+#endif
     bool directional_steering_scale_set = false;
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
@@ -238,6 +288,29 @@ server_config parse_options(int argc, char **argv) {
             c.engine.corr_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--zchain")) {
             c.engine.zchain_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--residual")) {
+            c.engine.residual_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--vq-dir")) {
+            c.engine.vq_dir_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--spec")) {
+            c.engine.spec = true;
+        } else if (!strcmp(arg, "--draft-gguf")) {
+            c.engine.draft_gguf_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--draft-zchain")) {
+            c.engine.draft_zchain_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--mm-image-cmd")) {
+            c.engine.mm_image_cmd = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--mem-budget-mb")) {
+            ds4_set_mem_budget_mb(parse_int_arg(need_arg(&i, argc, argv, arg), arg));
+        } else if (!strcmp(arg, "--prefill-chunk")) {
+            ds4_tool_set_prefill_chunk(parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg));
+        } else if (!strcmp(arg, "--batch")) {
+            c.batch_max = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+            if (c.batch_max > DS4_SERVER_BATCH_LANES) c.batch_max = DS4_SERVER_BATCH_LANES;
+        } else if (!strcmp(arg, "--base-native")) {
+            g_base_native = 1;
+        } else if (!strcmp(arg, "--primer-compact")) {
+            g_primer_compact = true;
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
             c.ctx_size = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
@@ -313,6 +386,24 @@ server_config parse_options(int argc, char **argv) {
             directional_steering_scale_set = true;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
+#ifndef DS4_NO_GPU
+        } else if (!strcmp(arg, "--strict-fp")) {
+            ds4_gpu_set_strict_fp(1);
+        } else if (!strcmp(arg, "--expert-pool-mb")) {
+            expert_pool_mb = (uint64_t)parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--expert-pool-pinned")) {
+            expert_pool_pinned = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--expert-pool-auto-pin-top")) {
+            expert_pool_auto_pin_top = (uint32_t)parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--expert-pool-prefetch-top")) {
+            expert_pool_prefetch_top = (uint32_t)parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--expert-pin-file")) {
+            expert_pin_file = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--expert-pin-mlock-mb")) {
+            expert_pin_mlock_mb = (uint64_t)parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--resid-pin-mlock-mb")) {
+            resid_pin_mlock_mb = (uint64_t)parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+#endif
         } else if (!strcmp(arg, "--metal")) {
             c.engine.backend = DS4_BACKEND_METAL;
         } else if (!strcmp(arg, "--cuda")) {
@@ -334,6 +425,11 @@ server_config parse_options(int argc, char **argv) {
                    "ds4-server: --kv-cache-cold-max-tokens must be 0 or >= --kv-cache-min-tokens");
         exit(2);
     }
+#ifndef DS4_NO_GPU
+    ds4_gpu_set_expert_pool(expert_pool_mb, expert_pool_pinned,
+                            expert_pool_auto_pin_top, expert_pool_prefetch_top);
+    ds4_gpu_set_expert_pin(expert_pin_file, expert_pin_mlock_mb, resid_pin_mlock_mb);
+#endif
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
     }

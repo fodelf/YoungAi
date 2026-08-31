@@ -266,89 +266,27 @@ int metal_graph_first_token_full_test(
 
     ds4_gpu_graph g;
     bool ok = metal_graph_alloc(&g, weights, &weights->layer[0]);
-    const bool trace_layers = getenv("DS4_METAL_GRAPH_TRACE_LAYERS") != NULL;
-    if (trace_layers && ok) {
-        g.materialize_ffn_out = true;
-        const bool teacher_force = getenv("DS4_METAL_GRAPH_TEACHER_FORCE") != NULL;
-        const char *stage_layer_env = getenv("DS4_METAL_GRAPH_TRACE_STAGE_LAYER");
-        const long stage_layer = stage_layer_env ? strtol(stage_layer_env, NULL, 10) : -1;
-        float *plain = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
-        float *cpu_cur = xmalloc((size_t)hc_dim * sizeof(float));
-        float *cpu_next = xmalloc((size_t)hc_dim * sizeof(float));
+    if (ok) ok = ds4_gpu_begin_commands() != 0;
+    if (ok) ok = ds4_gpu_embed_token_hc_tensor(g.cur_hc,
+                                                 model->map,
+                                                 model->size,
+                                                 weights->token_embd->abs_offset,
+                                                 (uint32_t)weights->token_embd->dim[1],
+                                                 (uint32_t)token,
+                                                 DS4_N_EMBD,
+                                                 DS4_N_HC) != 0;
 
-        embed_token_f16(model, weights, token, plain);
-        hc_from_plain_embedding(cpu_cur, plain, DS4_N_EMBD, DS4_N_HC);
-        ok = ds4_gpu_begin_commands() != 0;
-        if (ok) ok = ds4_gpu_embed_token_hc_tensor(g.cur_hc,
-                                                     model->map,
-                                                     model->size,
-                                                     weights->token_embd->abs_offset,
-                                                     (uint32_t)weights->token_embd->dim[1],
-                                                     (uint32_t)token,
-                                                     DS4_N_EMBD,
-                                                     DS4_N_HC) != 0;
-        if (ok) ok = ds4_gpu_end_commands() != 0;
-
-        for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
-            if (teacher_force) {
-                ok = ds4_gpu_tensor_write(g.cur_hc, 0, cpu_cur, hc_dim * sizeof(float)) != 0;
-            }
-            ok = ds4_gpu_begin_commands() != 0;
-            if (ok) ok = metal_graph_encode_decode_layer(&g, model, &weights->layer[il],
-                                                       il, 0, g.layer_raw_cache[il], g.raw_cap, 0, 1, token);
-            ds4_gpu_tensor *tmp = g.cur_hc;
-            g.cur_hc = g.after_ffn_hc;
-            g.after_ffn_hc = tmp;
-            if (ok) ok = ds4_gpu_end_commands() != 0;
-
-            layer_forward_self_one(cpu_next, model, &weights->layer[il], cpu_cur, il, 0, token);
-            if (ok) ok = ds4_gpu_tensor_read(g.cur_hc, 0, gpu_hc, hc_dim * sizeof(float)) != 0;
-            if (ok) {
-                fprintf(stderr,
-                        "ds4: Metal full graph layer %u%s hc_max=%g hc_rms=%g\n",
-                        il,
-                        teacher_force ? " teacher" : "",
-                        max_abs_diff(cpu_next, gpu_hc, hc_dim),
-                        rms_abs_diff(cpu_next, gpu_hc, hc_dim));
-                if (stage_layer == (long)il) {
-                    metal_graph_trace_layer_stages(&g, model, &weights->layer[il], cpu_cur, il, token);
-                }
-            }
-            float *ctmp = cpu_cur;
-            cpu_cur = cpu_next;
-            cpu_next = ctmp;
-        }
-
-        if (ok) ok = ds4_gpu_begin_commands() != 0;
-        if (ok) ok = metal_graph_encode_output_head(&g, model, weights, vocab_dim);
-        if (ok) ok = ds4_gpu_end_commands() != 0;
-
-        free(cpu_next);
-        free(cpu_cur);
-        free(plain);
-    } else {
-        if (ok) ok = ds4_gpu_begin_commands() != 0;
-        if (ok) ok = ds4_gpu_embed_token_hc_tensor(g.cur_hc,
-                                                     model->map,
-                                                     model->size,
-                                                     weights->token_embd->abs_offset,
-                                                     (uint32_t)weights->token_embd->dim[1],
-                                                     (uint32_t)token,
-                                                     DS4_N_EMBD,
-                                                     DS4_N_HC) != 0;
-
-        for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
-            ok = metal_graph_encode_decode_layer(&g, model, &weights->layer[il],
-                                                 il, 0, g.layer_raw_cache[il],
-                                                 g.raw_cap, 0, 1, token);
-            ds4_gpu_tensor *tmp = g.cur_hc;
-            g.cur_hc = g.after_ffn_hc;
-            g.after_ffn_hc = tmp;
-        }
-
-        if (ok) ok = metal_graph_encode_output_head(&g, model, weights, vocab_dim);
-        if (ok) ok = ds4_gpu_end_commands() != 0;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        ok = metal_graph_encode_decode_layer(&g, model, &weights->layer[il],
+                                             il, 0, g.layer_raw_cache[il],
+                                             g.raw_cap, 0, 1, token);
+        ds4_gpu_tensor *tmp = g.cur_hc;
+        g.cur_hc = g.after_ffn_hc;
+        g.after_ffn_hc = tmp;
     }
+
+    if (ok) ok = metal_graph_encode_output_head(&g, model, weights, vocab_dim);
+    if (ok) ok = ds4_gpu_end_commands() != 0;
 
     if (ok) {
         ok = ds4_gpu_tensor_read(g.cur_hc, 0, gpu_hc, hc_dim * sizeof(float)) != 0 &&

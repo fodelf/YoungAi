@@ -82,11 +82,9 @@ decode_again:
         } \
     } while (0)
     bool primer_free_retry = false;
-    int primer_free_budget = 0;
-    {   const char *fb = getenv("DS4_PRIMER_FREE_BUDGET");
-        primer_free_budget = fb ? atoi(fb) : 24;
-        if (primer_free_budget < 0) primer_free_budget = 0;
-    }
+    /* 工具调用帧之前自由文本区的 token 预算。96 = 生产定版值(svc.sh 2026-07-16
+     * CC 攻3 A/B: 批注入+小自由区, 引导轮 15min→5min); 旧代码默认 24 是陈值。 */
+    const int primer_free_budget = 96;
     const bool primer_eligible = s->tool_primer && j->req.kind == REQ_CHAT &&
                                  j->req.has_tools && !dsml_recovery_attempted;
     /* Forced tool_choice (named or "any") skips the free region: the client has
@@ -137,7 +135,7 @@ guided_primer:
          * on when it commits verified draft batches).  Expected: ~26 s/turn ->
          * 3 small spans (opener/param-head/closer), measured small-span cost
          * 6-10 s total, i.e. roughly -16..-20 s per guided tool-call turn. */
-        /* P6 批量注入 (2026-07-14 重启, DS4_PRIMER_BATCH_INJECT=1):
+        /* P6 批量注入 (2026-07-14 重启; 2026-07-16 CC 攻3 A/B 胜出后定版恒开):
          *
          * 2026-07-07 曾回退为逐 token, 理由"batch 与 single 数值路径不同, 翻转了
          * 近平局贪心(参数值变 $FILE_PATH)"。重审: 注入的是 **已知字面 token**, 不采样
@@ -152,8 +150,8 @@ guided_primer:
          *
          * 实现: 累积 (session 现有 token + 本段字面 token) 交给 ds4_session_sync() ——
          * 这正是 server prompt prefill 走的同一入口(分布式侧=一个 WORK 帧的 layer-major
-         * 批)。默认关, A/B 验证(质量: A/B 探针工具调用参数; 速度: bench_dual)后再定版。 */
-        /* ★紧凑 KV 注入 (2026-07-14, DS4_PRIMER_COMPACT=1)★
+         * 批)。 */
+        /* ★紧凑 KV 注入 (2026-07-14, --primer-compact)★
          *
          * 成本实测(双机, 热轮): inject=32.8s / gen=3.6s / 总 48.4s —— 结构 token 的
          * forward 占 68%, 而模型真正的生成只有 3.6s。每个结构 token 都要跑一次完整
@@ -174,8 +172,7 @@ guided_primer:
             ds4_tokens itoks = {0}; \
             ds4_tokenize_rendered_chat(s->engine, ktxt, &itoks); \
             const double inj_t0 = now_sec(); \
-            const char *bi = getenv("DS4_PRIMER_BATCH_INJECT"); \
-            const bool batch = bi && bi[0] && bi[0] != '0' && itoks.len > 1; \
+            const bool batch = itoks.len > 1; \
             if (batch) { \
                 const ds4_tokens *cur = ds4_session_tokens(s->session); \
                 if (!cur || ds4_session_pos(s->session) + itoks.len > ds4_session_ctx(s->session)) gok = false; \
@@ -195,9 +192,6 @@ guided_primer:
             } \
             if (gok) buf_append(&text, (lit), strlen(lit)); \
             inject_sec += now_sec() - inj_t0; \
-            if (getenv("DS4_PRIMER_COMPACT")) \
-                fprintf(stderr, "ds4: [primer-inject] kv=%d tok (text %zu B)\n", \
-                        itoks.len, strlen(lit)); \
             ds4_tokens_free(&itoks); \
         } while (0)
         /* 兼容入口: KV 与 text 同串(非紧凑模式) */
@@ -217,37 +211,19 @@ guided_primer:
          * limit on record: a budget-exhausted equal value is not caught (the
          * closer is injected structurally afterwards); at 384-token budgets
          * this path is not reachable for realistic old_string lengths. */
-        /* 值区局部反复读 (DS4_PRIMER_VALUE_FREQ, 默认关): 自由生成值区的 token 级
-         * 复读劣化 ("return hi, hi" — 2026-07-17 A/B 实证) 用值区内 freq 惩罚压制。
-         * 只罚本值区已产 token (gen_start=0 of vtoks), 不触碰全局采样 — GO1B 全局
-         * REPEAT_FREQ=1 是在案乱码判决, 局部窗不受其约束。 */
-        const float primer_value_freq = getenv("DS4_PRIMER_VALUE_FREQ")
-            ? (float)atof(getenv("DS4_PRIMER_VALUE_FREQ")) : 0.0f;
         /* 拷贝约束区 = COPY_EMISSION lane: 逐字复用上下文正是契约, 核心采样器在此
-         * lane 下返回 raw 无惩罚结果(全局 anticycle 自抄禁令让位; 值区复读由上面的
-         * 局部 DS4_PRIMER_VALUE_FREQ 窗管)。lane 在宏体内成对设置: 宏体是单一
-         * do{} 出口, 内层 break(收束/gok=false/预算尽/发散)都落到尾部, 尾部恢复
-         * FREE 覆盖所有退出路径(含 fell_back 后的自由续跑与外层 echo/rewind)。 */
+         * lane 下返回 raw 无惩罚结果(全局 anticycle 自抄禁令让位)。lane 在宏体内成对
+         * 设置: 宏体是单一 do{} 出口, 内层 break(收束/gok=false/预算尽/发散)都落到
+         * 尾部, 尾部恢复 FREE 覆盖所有退出路径(含 fell_back 后的自由续跑与外层
+         * echo/rewind)。 */
         #define PRIMER_GEN_COPY_C(cmp, stopchars, stoptok, hard, budget, oldp, oldl) do { \
             const double gen_t0 = now_sec(); \
             ds4_session_set_lane(s->session, DS4_LANE_COPY_EMISSION); \
             int left = (budget); \
             bool fell_back = false; \
             const size_t nv_start = text.len; \
-            int vtoks[512]; int vtok_n = 0; \
             while (gok && left-- > 0) { \
                 if (ds4_session_pos(s->session) >= ds4_session_ctx(s->session)) { gok = false; break; } \
-                if (primer_value_freq > 0.0f && vtok_n > 0) { \
-                    const int pv_nv = ds4_engine_vocab_size(s->engine); \
-                    float *pv_lg = malloc((size_t)pv_nv * sizeof(*pv_lg)); \
-                    if (pv_lg && ds4_session_copy_logits(s->session, pv_lg, pv_nv) == pv_nv) { \
-                        for (int pv_i = 0; pv_i < vtok_n; pv_i++) \
-                            if (vtoks[pv_i] >= 0 && vtoks[pv_i] < pv_nv) \
-                                pv_lg[vtoks[pv_i]] -= primer_value_freq; \
-                        (void)ds4_session_set_logits(s->session, pv_lg, pv_nv); \
-                    } \
-                    free(pv_lg); \
-                } \
                 int gt = primer_copy_step(s, (cmp), (stopchars), (stoptok), (hard), &fell_back); \
                 if (gt < 0) { \
                     if ((oldp) != NULL && (oldl) > 0 && \
@@ -263,7 +239,6 @@ guided_primer:
                 if (ds4_session_eval(s->session, gt, perr, sizeof(perr)) != 0) { gok = false; free(gp); break; } \
                 if (gp) buf_append(&text, gp, gl); \
                 free(gp); \
-                if (vtok_n < (int)(sizeof(vtoks) / sizeof(vtoks[0]))) vtoks[vtok_n++] = gt; \
                 gen_used++; \
                 PRIMER_KA(); \
             } \
@@ -328,15 +303,12 @@ guided_primer:
             /* 紧凑模式下 KV 里的参数分隔是 "\n"(不是 DSML 关闭 tag) → 停止 token 随之改;
              * 多行值(content/new_string)在紧凑模式下靠字符集停止(见下 multiline 分支)。 */
             const char *close_lit =
-                (getenv("DS4_PRIMER_COMPACT") && getenv("DS4_PRIMER_COMPACT")[0] != '0')
-                    ? "\n" : "</｜DSML｜parameter>";
+                g_primer_compact ? "\n" : "</｜DSML｜parameter>";
             ds4_tokenize_rendered_chat(s->engine, close_lit, &ct);
             if (ct.len > 0) par_close_tok = ct.v[0];
             ds4_tokens_free(&ct);
         }
 
-        const bool g_primer_compact = getenv("DS4_PRIMER_COMPACT") != NULL &&
-                                      getenv("DS4_PRIMER_COMPACT")[0] != '0';
         PRIMER_CK("<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"", "\ncall ");
         if (j->req.tool_force_name) {
             /* named tool_choice: the name region is a known literal — inject it
@@ -393,12 +365,12 @@ guided_primer:
                 const bool hard = !strcmp(pn, "old_string");
                 /* ★new_string 解除 copy 约束走自由(2026-07-17 场景2 实证)★: new_string
                  * 按定义是"要写入的新内容", 修复后的行(如 i < n)从不以完整 span 出现在
-                 * 上下文 → copy 约束物理上只能抄回旧行(i <= n)。DS4_PRIMER_NEWSTR_COPY=1
-                 * 回旧行为。生成型参数(content/body/text 同理)也解除。 */
+                 * 上下文 → copy 约束物理上只能抄回旧行(i <= n)。生成型参数
+                 * (content/body/text 同理)也解除。 */
                 const bool gen_param = !strcmp(pn, "new_string") ||
                                        !strcmp(pn, "content") ||
                                        !strcmp(pn, "body") || !strcmp(pn, "text");
-                const bool free_gen = gen_param && !getenv("DS4_PRIMER_NEWSTR_COPY");
+                const bool free_gen = gen_param;
                 primer_copy pc;
                 primer_copy_init(&pc, free_gen ? "" : vsrc, free_gen ? 0 : vlen, false);
                 const size_t val_start = text.len;
@@ -407,7 +379,7 @@ guided_primer:
                 /* ★同调用禁重契约(2026-07-22)★: 上一调用同工具同参数的值字节在案时武装 —
                  * 闭合时值逐字节等于上一调用 → 拒闭合走分歧(多轮回路实证失败形态:
                  * 消化 tool_result 后原样重发同一命令)。neq 契约优先(同为闭合检查通道)。 */
-                const bool arm_same = !arm_neq && !getenv("DS4_PRIMER_SAMECALL_OK") &&
+                const bool arm_same = !arm_neq &&
                                       s->prev_call_tool && ts->name &&
                                       !strcmp(s->prev_call_tool, ts->name) &&
                                       s->prev_call_param && !strcmp(s->prev_call_param, pn) &&

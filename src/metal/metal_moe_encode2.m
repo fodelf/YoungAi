@@ -281,7 +281,9 @@ int ds4_gpu_encode_moe_swiglu_weight(
         .up_row_stride = (uint64_t)width * sizeof(float),
         .mid_row_stride = (uint64_t)width * (mid_f16 ? sizeof(uint16_t) : sizeof(float)),
         .weight_stride = sizeof(float),
-        .write_clamped = getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") != NULL ? 1u : 0u,
+        /* 恒 0: kernel 侧 uniform 保留(ABI 与 shader 对齐), 写回 clamped 激活的
+         * 诊断路已删 —— 置 1 会强制非融合 kernel, 那是它删除的原因之一。 */
+        .write_clamped = 0u,
         .clamp_value = clamp_value,
     };
 

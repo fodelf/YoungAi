@@ -11,14 +11,6 @@ static double monotonic_seconds(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
 }
 
-static double getenv_seconds(const char *name, double fallback) {
-    const char *s = getenv(name);
-    if (!s || !s[0]) return fallback;
-    char *end = NULL;
-    const double v = strtod(s, &end);
-    return end != s && v > 0.0 ? v : fallback;
-}
-
 static int check_large_topk(void) {
     const uint32_t n_comp = 32768;
     const uint32_t n_tokens = 32;
@@ -63,7 +55,8 @@ static int check_large_topk(void) {
         }
     }
     if (rc == 0) {
-        const double max_seconds = getenv_seconds("DS4_CUDA_TOPK_REGRESSION_SEC", 2.0);
+        /* 2s: JIT 后复跑的 top-k 墙钟红线(首跑 PTX JIT 不算数, 见 CLAUDE.md)。 */
+        const double max_seconds = 2.0;
         fprintf(stderr, "cuda-regression: top-k n_comp=%u n_tokens=%u elapsed=%.3fs\n",
                 n_comp, n_tokens, elapsed);
         if (elapsed > max_seconds) {

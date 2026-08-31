@@ -395,6 +395,8 @@ static ds4_tensor *dspark_tensorf(const ds4_model *m, const char *fmt, uint32_t 
 }
 
 int g_dspark_ready_global = 0;   /* engine open 后置; graph alloc 统一消费 */
+int g_ds4_spec_enabled = 0;      /* --spec: 投机解码+调度仲裁总闸(engine open 从 opt 置位) */
+const char *g_ds4_draft_gguf_path = NULL;   /* --draft-gguf (engine open 从 opt 置位) */
 const ds4_dspark_weights *g_dspark_bound_for_prefill = NULL;   /* prefill 建窗弱引用 */
 
 static void dspark_weights_bind(ds4_dspark_weights *w, const ds4_model *m) {
@@ -452,14 +454,14 @@ static void dspark_weights_bind(ds4_dspark_weights *w, const ds4_model *m) {
                 w->markov_w1 ? " +markov" : "");
 }
 
-/* DS4_DRAFT_GGUF(2026-08-20): 独立 drafter gguf(官方开源 DSpark 量化版形态, 仅 mtp.*)
+/* --draft-gguf(2026-08-20): 独立 drafter gguf(官方开源 DSpark 量化版形态, 仅 mtp.*)
  * 挂在主模型旁。主模型自带 mtp.* 时优先; 副 model 懒加载单例, 进程生命周期持有。
  * CUDA (map,offset)→device 解析按 host_base 区分文件, 第二 mmap 天然可用。 */
 ds4_model *g_draft_model = NULL;
 void dspark_bind_with_draft(ds4_dspark_weights *w, const ds4_model *m, bool graph_backend) {
     dspark_weights_bind(w, m);
     if (w->ready) { w->src = m; w->head_src = m; return; }
-    const char *p = getenv("DS4_DRAFT_GGUF");
+    const char *p = g_ds4_draft_gguf_path;
     if (!p || !p[0]) return;
     if (!g_draft_model) {
         g_draft_model = xmalloc(sizeof(*g_draft_model));

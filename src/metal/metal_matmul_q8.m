@@ -134,7 +134,7 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
             return 1;
         }
 
-        if (n_tok <= 8 && (in_dim % 128u) == 0) {
+        if (n_tok <= DS4_METAL_SMALL_BATCH_MV_MAX_TOKENS && (in_dim % 128u) == 0) {
             const int16_t nsg = 2;
             const int16_t nxpsg = ds4_gpu_mv_ext_nxpsg(in_dim, n_tok);
             const int16_t r1ptg = ds4_gpu_mv_ext_r1ptg(n_tok);
@@ -276,58 +276,9 @@ int ds4_gpu_matmul_q8_0_tensor(
         return 0;
     }
 
-    const int profile_requested =
-        n_tok > 8u && ds4_gpu_env_bool("DS4_METAL_Q8_PREFILL_PROFILE") > 0;
-    int profile_prefill = 0;
-    int split_batch_for_profile = 0;
-    const char *profile_label = NULL;
-    char profile_label_buf[128];
-    char profile_fallback[128];
-    if (profile_requested) {
-        snprintf(profile_fallback, sizeof(profile_fallback),
-                 "q8 weight_off=%llu in=%llu out=%llu tok=%llu",
-                 (unsigned long long)weight_offset,
-                 (unsigned long long)in_dim,
-                 (unsigned long long)out_dim,
-                 (unsigned long long)n_tok);
-        snprintf(profile_label_buf, sizeof(profile_label_buf), "%s", profile_fallback);
-        profile_label = profile_label_buf;
-        const char *profile_filter = getenv("DS4_METAL_Q8_PREFILL_PROFILE_FILTER");
-        profile_prefill =
-            profile_requested &&
-            (!profile_filter || !profile_filter[0] ||
-             strstr(profile_label, profile_filter) != NULL);
-    }
-    if (profile_prefill) {
-        if (g_batch_cb) {
-            if (ds4_gpu_end_commands() == 0 || ds4_gpu_begin_commands() == 0) {
-                return 0;
-            }
-            split_batch_for_profile = 1;
-        }
-    }
-
-    const double profile_t0 = profile_prefill ? ds4_gpu_now_ms() : 0.0;
-    int ok = ds4_gpu_matmul_q8_0_legacy_tensor(out, model_map, model_size,
-                                                weight_offset, in_dim, out_dim,
-                                                x, n_tok);
-    if (profile_prefill) {
-        if (split_batch_for_profile && ds4_gpu_end_commands() == 0) {
-            ok = 0;
-        }
-        const double elapsed_ms = ds4_gpu_now_ms() - profile_t0;
-        fprintf(stderr,
-                "ds4: Metal Q8_0 prefill profile %s in=%llu out=%llu tok=%llu %.3f ms\n",
-                profile_label ? profile_label : profile_fallback,
-                (unsigned long long)in_dim,
-                (unsigned long long)out_dim,
-                (unsigned long long)n_tok,
-                elapsed_ms);
-        if (split_batch_for_profile && ds4_gpu_begin_commands() == 0) {
-            ok = 0;
-        }
-    }
-    return ok;
+    return ds4_gpu_matmul_q8_0_legacy_tensor(out, model_map, model_size,
+                                              weight_offset, in_dim, out_dim,
+                                              x, n_tok);
 }
 
 /* Tensor-parallel row-parallel Q8_0 matvec (decode/n_tok=1 only).

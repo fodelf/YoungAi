@@ -1,44 +1,6 @@
 /* metal_expert_gather_run.m — ds4_metal.m 机械拆分产物(不改名/不改逻辑/不改字符串)。 */
 #import "metal_internal.h"
 
-static void *ds4_gpu_expert_gather_pool_worker(void *arg) {
-    ds4_metal_expert_gather_worker_arg *warg = (ds4_metal_expert_gather_worker_arg *)arg;
-    ds4_metal_expert_gather_pool *pool = warg->pool;
-    const uint32_t worker_index = warg->index;
-    uint64_t seen_generation = 0;
-    for (;;) {
-        pthread_mutex_lock(&pool->mu);
-        while (!pool->shutdown && pool->generation == seen_generation) {
-            pthread_cond_wait(&pool->cv, &pool->mu);
-        }
-        if (pool->shutdown) {
-            pthread_mutex_unlock(&pool->mu);
-            break;
-        }
-        seen_generation = pool->generation;
-        const uint32_t participates = worker_index < pool->target_workers;
-        ds4_metal_expert_gather_ctx *ctx = participates ? pool->ctx : NULL;
-        pthread_mutex_unlock(&pool->mu);
-
-        if (!participates) continue;
-        for (;;) {
-            const uint32_t unit = __sync_fetch_and_add(&ctx->next_slot, 1u);
-            if (unit >= ctx->n_active * 3u) break;
-            ds4_gpu_expert_gather_copy_unit(ctx, unit);
-            __sync_fetch_and_add(&ctx->done, 1u);
-        }
-
-        pthread_mutex_lock(&pool->mu);
-        if (pool->active_workers > 0) pool->active_workers--;
-        if (pool->active_workers == 0) {
-            pool->completed_generation = seen_generation;
-            pthread_cond_signal(&pool->done_cv);
-        }
-        pthread_mutex_unlock(&pool->mu);
-    }
-    return NULL;
-}
-
 void *ds4_gpu_expert_gather_temp_worker(void *arg) {
     ds4_metal_expert_gather_ctx *ctx = (ds4_metal_expert_gather_ctx *)arg;
     for (;;) {
@@ -115,23 +77,30 @@ static uint64_t g_expert_pin_mlock_used;
 
 static uint64_t g_expert_pin_mlock_budget;
 
+/* --expert-pin-* config (ds4_gpu_set_expert_pin). */
+static char    *g_expert_pin_cfg_file;
+static uint64_t g_expert_pin_cfg_mlock_mb;
+static uint64_t g_resid_pin_cfg_mlock_mb;
+
+void ds4_gpu_set_expert_pin(const char *file, uint64_t mlock_mb, uint64_t resid_mlock_mb) {
+    free(g_expert_pin_cfg_file);
+    g_expert_pin_cfg_file = file && file[0] ? strdup(file) : NULL;
+    g_expert_pin_cfg_mlock_mb = mlock_mb;
+    g_resid_pin_cfg_mlock_mb = resid_mlock_mb;
+    g_expert_pin_parsed = -1;   /* re-parse on next query */
+}
+
 static int ds4_gpu_expert_pin_enabled(void) {
     if (g_expert_pin_parsed < 0) {
         g_expert_pin_parsed = 0;
-        g_expert_pin_mlock_budget =
-            ds4_gpu_env_u64("DS4_EXPERT_PIN_MLOCK_MB", 0u) * 1024ull * 1024ull;
-        const char *path = getenv("DS4_EXPERT_PIN_FILE");
+        g_expert_pin_mlock_budget = g_expert_pin_cfg_mlock_mb * 1024ull * 1024ull;
+        const char *path = g_expert_pin_cfg_file;
         if (path && *path && g_expert_pin_mlock_budget > 0) {
             FILE *f = fopen(path, "r");
             if (f) {
                 /* Accepts both "20:1,2,..." per line and the gen_pinned.py emit
                  * ("L20:...;L0:..." -- optional L prefix, ';' record separator,
-                 * possibly one single line). File order per layer is frequency
-                 * order, so the per-layer DS4_EXPERT_PIN_TOPK cut keeps the
-                 * hottest K (uniform per-layer budget instead of the old
-                 * whole-file first-come truncation). */
-                const uint32_t topk = (uint32_t)ds4_gpu_env_u64("DS4_EXPERT_PIN_TOPK", 256u);
-                uint32_t added[DS4_METAL_EXPERT_PROFILE_MAX_LAYERS] = {0};
+                 * possibly one single line). */
                 char line[8192];
                 while (fgets(line, sizeof(line), f)) {
                     char *save = NULL;
@@ -150,9 +119,8 @@ static int ds4_gpu_expert_pin_enabled(void) {
                             char *end = NULL;
                             const uint32_t e = (uint32_t)strtoul(p, &end, 10);
                             if (end == p) break;
-                            if (e < 256u && added[L] < topk && !g_expert_pin[L][e]) {
+                            if (e < 256u && !g_expert_pin[L][e]) {
                                 g_expert_pin[L][e] = true;
-                                added[L]++;
                                 g_expert_pin_parsed = 1;
                             }
                             p = end;
@@ -215,14 +183,14 @@ void ds4_gpu_expert_pin_mlock_layer(uint32_t layer_index, const void *model_map,
                 (double)g_expert_pin_mlock_budget / (1024.0 * 1024.0 * 1024.0));
 }
 
-/* Residual-sidecar twin of the frequency pin above (DS4_RESID_PIN_MLOCK_MB, default
- * 0 = off). The go1b residual gather is a single-thread memcpy straight off the
- * sidecar mmap (metal.m:21874/22117) -- measured 18% of coordinator decode wall,
- * mostly page-fault stalls, because the 9.2 GiB sidecar competes for page cache it
+/* Residual-sidecar twin of the frequency pin above (--resid-pin-mlock-mb,
+ * default 0 = off). The go1b residual gather is a single-thread memcpy straight
+ * off the sidecar mmap -- measured 18% of coordinator decode wall, mostly
+ * page-fault stalls, because the 9.2 GiB sidecar competes for page cache it
  * never wins. Pin the residual slot ranges of the SAME pin-file experts (the
  * sidecar's hot-64 superset) so those memcpys run at RAM speed. Residency-only:
- * bytes and results are bit-exact. Shares DS4_EXPERT_PIN_FILE via g_expert_pin[][]
- * (so DS4_EXPERT_PIN_TOPK sizes both pins); budget-capped separately. */
+ * bytes and results are bit-exact. Shares --expert-pin-file via g_expert_pin[][];
+ * budget-capped separately. */
 static bool     g_resid_pin_mlocked[DS4_METAL_EXPERT_PROFILE_MAX_LAYERS];
 
 static uint64_t g_resid_pin_mlock_used;
@@ -234,8 +202,7 @@ void ds4_gpu_resid_pin_mlock_layer(uint32_t layer_index,
                                           const float *res_lut,
                                           uint64_t gate_expert_bytes,
                                           uint64_t down_expert_bytes) {
-    static int64_t budget = -1;
-    if (budget < 0) budget = (int64_t)(ds4_gpu_env_u64("DS4_RESID_PIN_MLOCK_MB", 0u) * 1024ull * 1024ull);
+    const int64_t budget = (int64_t)(g_resid_pin_cfg_mlock_mb * 1024ull * 1024ull);
     if (budget == 0 || ds4_gpu_expert_pin_enabled() != 1) return;
     if (!res_gate_ptr || !res_up_ptr || !res_down_ptr) return;
     if (layer_index >= DS4_METAL_EXPERT_PROFILE_MAX_LAYERS || g_resid_pin_mlocked[layer_index]) return;

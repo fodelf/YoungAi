@@ -8,9 +8,8 @@ bool metal_graph_eval_token_raw_swa(
         int                    token,
         uint32_t               pos,
         float                 *logits) {
-    const bool profile = getenv("DS4_METAL_GRAPH_TOKEN_PROFILE") != NULL;
     const bool throttle = graph_power_throttle_enabled(g);
-    const double t0 = (profile || throttle) ? now_sec() : 0.0;
+    const double t0 = throttle ? now_sec() : 0.0;
 
     bool ok = ds4_gpu_begin_commands() != 0;
     /* decode 单 token CUDA graph: capture 包住 encode(纯 kernel 段), 失败则重编码直跑。
@@ -32,35 +31,17 @@ bool metal_graph_eval_token_raw_swa(
         (void)ds4_gpu_token_graph_end_launch();
     }
     if (ok && (launched || tok_graph)) {
-        const bool tdbg = getenv("DS4_TOK_GRAPH_DEBUG") != NULL;
-        const double tp0 = tdbg ? now_sec() : 0.0;
         if (ds4_gpu_token_graph_precapture_begin() > 0) {
-            const double tp1 = tdbg ? now_sec() : 0.0;
             const bool pok = metal_graph_encode_token_raw_swa(g, model, weights, 0, pos + 1u, true, true);
-            const double tp2 = tdbg ? now_sec() : 0.0;
             (void)ds4_gpu_token_graph_precapture_end(pos + 1u, 1, pok ? 1 : 0);
-            if (tdbg) fprintf(stderr, "[tokdbg] precap pos=%u begin=%.1f encode=%.1f end=%.1f (ms)\n",
-                              pos, (tp1 - tp0) * 1e3, (tp2 - tp1) * 1e3, (now_sec() - tp2) * 1e3);
         }
     }
-    const double t_encoded = (profile || throttle) ? now_sec() : 0.0;
     if (ok) ok = ds4_gpu_end_commands() != 0;
-    const double t_done = (profile || throttle) ? now_sec() : 0.0;
 
     if (ok && logits) {
         ok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
-    const double t_read = (profile || throttle) ? now_sec() : 0.0;
-    if (profile) {
-        fprintf(stderr,
-                "ds4: metal graph token pos=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms logits=%d\n",
-                pos,
-                (t_encoded - t0) * 1000.0,
-                (t_done - t_encoded) * 1000.0,
-                (t_read - t_done) * 1000.0,
-                (t_read - t0) * 1000.0,
-                logits != NULL);
-    }
+    const double t_read = throttle ? now_sec() : 0.0;
     if (ok) graph_power_note_decode_token(g, t_read - t0);
     if (!ok) {
         if (ds4_gpu_synchronize() == 0) {

@@ -9,14 +9,7 @@ int dist_set_socket_low_latency(int fd) {
     int one = 1;
     int rc = 0;
     int buffer_bytes = dist_socket_buffer_bytes();
-    int timeout_sec = 60;
-    const char *timeout_env = getenv("DS4_DIST_SOCKET_TIMEOUT_SEC");
-    if (timeout_env && timeout_env[0]) {
-        char *end = NULL;
-        long v = strtol(timeout_env, &end, 10);
-        if (end != timeout_env && *end == '\0' && v > 0 && v <= 3600)
-            timeout_sec = (int)v;
-    }
+    int timeout_sec = DIST_SOCKET_TIMEOUT_SEC;
     struct timeval tv = {
         .tv_sec = timeout_sec,
         .tv_usec = 0,
@@ -235,59 +228,16 @@ int dist_connect_endpoint_once(const char *host, int port, int *last_errno, char
 
     int fd = -1;
     int saved_errno = 0;
-    /* Diagnostic: DS4_TP_CONNECT_DEBUG=1 logs the resolved target, the chosen
-     * source address, and connect errno. Capped so a 200x retry storm cannot
-     * flood. */
-    static int dbg = -1, dbg_n = 0;
-    if (dbg < 0) { const char *e = getenv("DS4_TP_CONNECT_DEBUG"); dbg = (e && *e) ? 1 : 0; }
     for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
-        if (dbg && dbg_n < 12) {
-            char ip[64] = "?";
-            void *ad = ai->ai_family == AF_INET
-                ? (void *)&((struct sockaddr_in *)ai->ai_addr)->sin_addr
-                : (void *)&((struct sockaddr_in6 *)ai->ai_addr)->sin6_addr;
-            inet_ntop(ai->ai_family, ad, ip, sizeof(ip));
-            fprintf(stderr, "ds4: [tp-connect-dbg] try family=%s dst=%s:%s\n",
-                    ai->ai_family == AF_INET ? "IPv4" : "IPv6", ip, portbuf);
-            dbg_n++;
-        }
         fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (fd < 0) {
             saved_errno = errno;
-            if (dbg && dbg_n < 12) { fprintf(stderr, "ds4: [tp-connect-dbg] socket errno=%s\n", strerror(saved_errno)); dbg_n++; }
             continue;
         }
         dist_set_socket_low_latency(fd);
-        /* Optional: force the connect source address (出接口) to a specific local
-         * IP. Diagnoses/works around the kernel picking an unreachable source. */
-        const char *src_ip = getenv("DS4_TP_SRC_IP");
-        if (src_ip && *src_ip && ai->ai_family == AF_INET) {
-            struct sockaddr_in sa; memset(&sa, 0, sizeof(sa));
-            sa.sin_family = AF_INET;
-#ifdef __APPLE__
-            sa.sin_len = sizeof(sa);   /* BSD 专有字段; Linux 的 sockaddr_in 没有 */
-#endif
-            if (inet_pton(AF_INET, src_ip, &sa.sin_addr) == 1) {
-                if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
-                    if (dbg && dbg_n < 12) { fprintf(stderr, "ds4: [tp-connect-dbg] bind src %s errno=%s\n", src_ip, strerror(errno)); dbg_n++; }
-                } else if (dbg && dbg_n < 12) { fprintf(stderr, "ds4: [tp-connect-dbg] bound src=%s\n", src_ip); dbg_n++; }
-            }
-        }
-        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) {
-            if (dbg) {
-                struct sockaddr_storage ss; socklen_t sl = sizeof(ss); char sip[64] = "?";
-                if (getsockname(fd, (struct sockaddr *)&ss, &sl) == 0) {
-                    void *sa = ss.ss_family == AF_INET
-                        ? (void *)&((struct sockaddr_in *)&ss)->sin_addr
-                        : (void *)&((struct sockaddr_in6 *)&ss)->sin6_addr;
-                    inet_ntop(ss.ss_family, sa, sip, sizeof(sip));
-                }
-                fprintf(stderr, "ds4: [tp-connect-dbg] CONNECT OK src=%s\n", sip);
-            }
+        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0)
             break;
-        }
         saved_errno = errno;
-        if (dbg && dbg_n < 12) { fprintf(stderr, "ds4: [tp-connect-dbg] connect errno=%s\n", strerror(saved_errno)); dbg_n++; }
         close(fd);
         fd = -1;
     }
@@ -301,13 +251,18 @@ int dist_connect_endpoint_once(const char *host, int port, int *last_errno, char
     return fd;
 }
 
+/* 对端起步竞态窗口: 200 次 × 25ms ≈ 5 秒盲重试, 只覆盖双机脚本先后拉起进程的间隙;
+ * 更慢的对端交给上层循环(dist_sleep_reconnect)。 */
+#define DIST_CONNECT_RETRY_MAX 200
+#define DIST_CONNECT_RETRY_BACKOFF_NS (25 * 1000 * 1000)
+
 int dist_connect_endpoint(const char *host, int port, char *err, size_t errlen) {
     int last_errno = 0;
-    for (int attempt = 0; attempt < 200; attempt++) {
+    for (int attempt = 0; attempt < DIST_CONNECT_RETRY_MAX; attempt++) {
         int fd = dist_connect_endpoint_once(host, port, &last_errno, err, errlen);
         if (fd >= 0) return fd;
         if (!dist_connect_errno_retryable(last_errno)) break;
-        struct timespec ts = {0, 25 * 1000 * 1000};
+        struct timespec ts = {0, DIST_CONNECT_RETRY_BACKOFF_NS};
         nanosleep(&ts, NULL);
     }
     return -1;

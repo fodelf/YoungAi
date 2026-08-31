@@ -1,15 +1,9 @@
 /* metal_expert_prefetch.m — ds4_metal.m 机械拆分产物(不改名/不改逻辑/不改字符串)。 */
 #import "metal_internal.h"
 
+/* Prediction margin: top-8 predicted experts are read ahead per next layer. */
 int ds4_gpu_expert_prefetch_top(void) {
-    static int cached;
-    if (cached == 0) {
-        uint64_t v = ds4_gpu_env_u64("DS4_METAL_EXPERT_PREFETCH_TOP", 8u);
-        if (v < 1u) v = 1u;
-        if (v > DS4_METAL_PF_MAX_TOP) v = DS4_METAL_PF_MAX_TOP;
-        cached = (int)v;
-    }
-    return cached;
+    return 8;
 }
 
 /* Predict a RANGE of upcoming layers (L+1 .. L+depth) from the same hidden
@@ -18,18 +12,9 @@ int ds4_gpu_expert_prefetch_top(void) {
  * before its gather arrives.  Closest deadline (L+1) is advised first, and
  * mincore skips ranges an earlier job already pulled in, so deeper lookahead
  * degrades gracefully.  Accuracy cost is measurable via the ds4-io pf= field
- * (predictions for L+d use a hidden state that is d-1 layers stale).
- * Honors DS4_METAL_EXPERT_PREFETCH_DELTA as a legacy alias. */
+ * (predictions for L+d use a hidden state that is d-1 layers stale). */
 uint32_t ds4_gpu_expert_prefetch_depth(void) {
-    static uint32_t cached;
-    if (cached == 0) {
-        uint64_t v = ds4_gpu_env_u64("DS4_METAL_EXPERT_PREFETCH_DEPTH",
-                                     ds4_gpu_env_u64("DS4_METAL_EXPERT_PREFETCH_DELTA", 1u));
-        if (v < 1u) v = 1u;
-        if (v > 4u) v = 4u;
-        cached = (uint32_t)v;
-    }
-    return cached;
+    return 1u;
 }
 
 /* Scheduling (v2, after the 1.56->1.49 regression): decode keeps the SSD
@@ -197,7 +182,8 @@ int ds4_gpu_expert_prefetch_predict_one(uint32_t layer, const float *x, uint32_t
     /* Opportunistic staging depth: the top-n_top experts saturate the link
      * budget; a couple of extra candidates ride the idle tail of the window
      * (fetched last, in score order) and convert some prediction misses. */
-    uint32_t n_top_total = n_top + (uint32_t)ds4_gpu_env_u64("DS4_METAL_EXPERT_STAGE_EXTRA", 2u);
+    /* Stage 2 extras beyond the top set: cheap hedge against routing jitter. */
+    uint32_t n_top_total = n_top + 2u;
     if (n_top_total > DS4_METAL_PF_MAX_TOP) n_top_total = DS4_METAL_PF_MAX_TOP;
 
     /* score = sqrt(softplus(gate_inp . x)) + bias, matching the selection rule

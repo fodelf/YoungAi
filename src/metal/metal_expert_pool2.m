@@ -252,9 +252,9 @@ void ds4_gpu_expert_pool_predict_enqueue(
                                                                 next_layer,
                                                                 g_expert_pool_last_active[next_layer][i]);
         }
-        /* Predictor 3: measured hot experts per layer, updated by the existing
-         * profiler counters. This is opt-in via PREFETCH_TOP/HOTLOCK and helps
-         * when a few code/text experts dominate. */
+        /* Predictor 3: measured hot experts per layer (pool request counters).
+         * Opt-in via --expert-pool-prefetch-top; helps when a few code/text
+         * experts dominate. */
         if (g_expert_pool_prefetch_top != 0) {
             bool printed[DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS] = { false };
             for (uint32_t k = 0; k < g_expert_pool_prefetch_top; k++) {
@@ -262,8 +262,7 @@ void ds4_gpu_expert_pool_predict_enqueue(
                 uint64_t best_req = 0;
                 for (uint32_t e = 0; e < DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS; e++) {
                     if (printed[e]) continue;
-                    const uint64_t req = g_expert_pool_hot_count[next_layer][e] +
-                                         g_expert_profile_slot[next_layer][e].requests;
+                    const uint64_t req = g_expert_pool_hot_count[next_layer][e];
                     if (req > best_req) {
                         best_req = req;
                         best = (int)e;
@@ -364,7 +363,7 @@ void ds4_gpu_expert_pool_auto_pin_layer(
         uint32_t layer,
         uint32_t layer_cap) {
     if (!model_map || g_expert_pool_auto_pin_top == 0) return;
-    if (layer >= DS4_METAL_EXPERT_PROFILE_MAX_LAYERS || layer_cap <= 6u) return;
+    if (layer >= DS4_METAL_EXPERT_PROFILE_MAX_LAYERS || layer_cap <= DS4_METAL_ROUTED_TOPK) return;
 
     uint64_t layer_req = 0;
     for (uint32_t expert = 0; expert < DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS; expert++) {
@@ -379,7 +378,7 @@ void ds4_gpu_expert_pool_auto_pin_layer(
 
     uint32_t max_pin = g_expert_pool_auto_pin_top;
     uint32_t reserve = g_expert_pool_pin_reserve;
-    if (reserve < 6u) reserve = 6u;
+    if (reserve < DS4_METAL_ROUTED_TOPK) reserve = DS4_METAL_ROUTED_TOPK;
     if (layer_cap > reserve) {
         const uint32_t cap_limit = layer_cap - reserve;
         if (max_pin > cap_limit) max_pin = cap_limit;
@@ -435,8 +434,7 @@ static bool ds4_gpu_expert_pool_choose_hotlock(
         uint64_t best_req = 0;
         for (uint32_t e = 0; e < DS4_METAL_EXPERT_PROFILE_MAX_EXPERTS; e++) {
             if (printed[e]) continue;
-            const uint64_t req = g_expert_pool_hot_count[layer][e] +
-                                 g_expert_profile_slot[layer][e].requests;
+            const uint64_t req = g_expert_pool_hot_count[layer][e];
             if (req > best_req) {
                 best_req = req;
                 best = (int)e;

@@ -227,9 +227,9 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
                          * spec-pipe 2nd cycle on full accepts (n_acc+spec_next_kb>65 -> the
                          * ~1/9 fire rate); 129 enabled 1 lookahead; 513 enables the chain. */
         int ntok = 0;
-        /* Greedy decode always takes the speculative path (copy-spec / MTP). */
-        if (cfg->gen.temperature <= 0.0f &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+        /* Greedy decode always takes the speculative entry: it self-gates to
+         * plain flat decode unless a drafter is armed (--spec). */
+        if (cfg->gen.temperature <= 0.0f) {
             cli_dist_busy_set(cfg, true);
             ntok = ds4_session_eval_speculative_argmax(chat->session,
                                                        token,

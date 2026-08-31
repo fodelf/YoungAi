@@ -66,33 +66,17 @@ int ds4_gpu_compressor_update_tensor(
             return 0;
         }
 
-        const bool use_store_one =
-            getenv("DS4_METAL_DISABLE_COMPRESSOR_STORE_ONE") == NULL;
-        const int store_ok = use_store_one
-            ? ds4_gpu_compressor_store_one_tensor(kv_cur,
-                                                    sc_cur,
-                                                    state_kv,
-                                                    state_score,
-                                                    model_map,
-                                                    model_size,
-                                                    ape_offset,
-                                                    ape_type,
-                                                    width,
-                                                    ratio,
-                                                    pos)
-            : ds4_gpu_compressor_store_batch_tensor(kv_cur,
-                                                      sc_cur,
-                                                      state_kv,
-                                                      state_score,
-                                                      model_map,
-                                                      model_size,
-                                                      ape_offset,
-                                                      ape_type,
-                                                      head_dim,
-                                                      ratio,
-                                                      pos,
-                                                      1);
-        if (!store_ok) {
+        if (!ds4_gpu_compressor_store_one_tensor(kv_cur,
+                                                 sc_cur,
+                                                 state_kv,
+                                                 state_score,
+                                                 model_map,
+                                                 model_size,
+                                                 ape_offset,
+                                                 ape_type,
+                                                 width,
+                                                 ratio,
+                                                 pos)) {
             return 0;
         }
         if (!emit) return 1;

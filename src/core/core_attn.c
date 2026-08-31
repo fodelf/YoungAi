@@ -209,53 +209,6 @@ void rope_tail_layer_inplace(
                           inverse);
 }
 
-typedef struct {
-    float            *x;
-    uint64_t          stride;
-    uint32_t          n_head;
-    uint32_t          head_dim;
-    uint32_t          n_rot;
-    uint32_t          pos0;
-    uint32_t          il;
-    bool              inverse;
-} rope_tail_batch_ctx;
-
-static void rope_tail_batch_worker(void *vctx, uint64_t t0, uint64_t t1) {
-    rope_tail_batch_ctx *ctx = vctx;
-    for (uint64_t tt = t0; tt < t1; tt++) {
-        rope_tail_layer_inplace(ctx->x + tt * ctx->stride,
-                                ctx->n_head,
-                                ctx->head_dim,
-                                ctx->n_rot,
-                                ctx->pos0 + (uint32_t)tt,
-                                ctx->il,
-                                ctx->inverse);
-    }
-}
-
-void rope_tail_layer_batch_inplace(
-        float            *x,
-        uint64_t          stride,
-        uint32_t          n_head,
-        uint32_t          head_dim,
-        uint32_t          n_rot,
-        uint32_t          pos0,
-        uint32_t          il,
-        bool              inverse,
-        uint32_t          n_tok) {
-    rope_tail_batch_ctx ctx = {
-        .x = x,
-        .stride = stride,
-        .n_head = n_head,
-        .head_dim = head_dim,
-        .n_rot = n_rot,
-        .pos0 = pos0,
-        .il = il,
-        .inverse = inverse,
-    };
-    ds4_parallel_for_min_rows(n_tok, rope_tail_batch_worker, &ctx, 1);
-}
-
 /* Sink-aware attention over a set of KV rows.  The learned sink logit is part
  * of the softmax denominator but contributes no value vector. */
 void layer_attention_rows_one(

@@ -70,19 +70,6 @@ static id<MTLSharedEvent> g_a3_drain_event;
 
 static uint64_t g_a3_drain_event_value;
 
-static int ds4_gpu_expert_event_drain_enabled(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        cached = ds4_gpu_env_bool("DS4_METAL_EXPERT_EVENT_DRAIN") > 0 ? 1 : 0;
-        if (cached) {
-            fprintf(stderr,
-                    "ds4: A3 expert drain uses MTLSharedEvent fast host wait "
-                    "(DS4_METAL_EXPERT_EVENT_DRAIN=1)\n");
-        }
-    }
-    return cached;
-}
-
 static int ds4_gpu_end_commands_event(const char *label) {
     if (!g_batch_cb) return 0;
     if (!g_a3_drain_event) {
@@ -95,7 +82,7 @@ static int ds4_gpu_end_commands_event(const char *label) {
     const uint64_t value = ++g_a3_drain_event_value;
     [cb encodeSignalEvent:g_a3_drain_event value:value];
     [cb commit];
-    if (![g_a3_drain_event waitUntilSignaledValue:value timeoutMS:60000]) {
+    if (![g_a3_drain_event waitUntilSignaledValue:value timeoutMS:DS4_METAL_TP_EVENT_TIMEOUT_MS]) {
         fprintf(stderr,
                 "ds4: Metal %s event drain timed out; falling back to waitUntilCompleted\n",
                 label);
@@ -109,9 +96,11 @@ static int ds4_gpu_end_commands_event(const char *label) {
     return ok;
 }
 
+/* Always the event fast path (deliberate default-on: bytes identical to the
+ * classic drain, ~150ms -> <50us per sync, and it self-degrades — event
+ * allocation failure or a wait timeout falls back to waitUntilCompleted). */
 int ds4_gpu_expert_drain_commands(const char *label) {
-    if (ds4_gpu_expert_event_drain_enabled()) return ds4_gpu_end_commands_event(label);
-    return ds4_gpu_end_commands();
+    return ds4_gpu_end_commands_event(label);
 }
 
 /* Tensor-parallel host/GPU rendezvous. Instead of draining the whole pipeline
@@ -139,58 +128,7 @@ uint64_t ds4_gpu_tp_signal_after_batch(void) {
 
 int ds4_gpu_tp_host_wait(uint64_t value) {
     if (!g_tp_event || value == 0) return 0;
-    uint64_t timeout_ms = 60000;
-    const char *env = getenv("DS4_TP_EVENT_TIMEOUT_MS");
-    if (env && env[0]) {
-        char *end = NULL;
-        unsigned long v = strtoul(env, &end, 10);
-        if (end != env && *end == '\0' && v > 0) timeout_ms = (uint64_t)v;
-    }
-    return [g_tp_event waitUntilSignaledValue:value timeoutMS:timeout_ms] ? 1 : 0;
-}
-
-int ds4_gpu_flash_attn_stage_profile_boundary(
-        id<MTLCommandBuffer> __strong *cbp,
-        const char           *mode,
-        const char           *stage,
-        uint32_t              n_tokens,
-        uint32_t              n_comp,
-        uint32_t              n_keys,
-        uint32_t              n_head,
-        uint32_t              head_dim,
-        uint32_t              window,
-        uint32_t              ratio,
-        double               *stage_t0) {
-    if (!cbp || !*cbp || !stage_t0 || !stage) return 0;
-    if (ds4_gpu_end_commands() == 0) return 0;
-
-    const double now_ms = ds4_gpu_now_ms();
-    const char *filter = getenv("DS4_METAL_FLASH_ATTN_STAGE_PROFILE_FILTER");
-    const int print_stage =
-        !filter || !filter[0] ||
-        strstr(stage, filter) != NULL ||
-        (mode && strstr(mode, filter) != NULL);
-    if (print_stage) {
-        fprintf(stderr,
-                "ds4: Metal FlashAttention prefill stage mode=%s tokens=%u comp=%u "
-                "keys=%u heads=%u dim=%u window=%u ratio=%u %s=%.3f ms\n",
-                mode ? mode : "unknown",
-                n_tokens,
-                n_comp,
-                n_keys,
-                n_head,
-                head_dim,
-                window,
-                ratio,
-                stage,
-                now_ms - *stage_t0);
-    }
-    *stage_t0 = now_ms;
-
-    if (ds4_gpu_begin_commands() == 0) return 0;
-    int owned = 0;
-    *cbp = ds4_gpu_command_buffer(&owned);
-    return *cbp != nil && owned == 0;
+    return [g_tp_event waitUntilSignaledValue:value timeoutMS:DS4_METAL_TP_EVENT_TIMEOUT_MS] ? 1 : 0;
 }
 
 int ds4_gpu_synchronize(void) {

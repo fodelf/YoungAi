@@ -202,14 +202,12 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
 
 /* Only the engine BASE model may arm process-wide env defaults from its
  * tensor types (the go1b/go2b numeric-safety block inside model_open below).
- * Support-model opens run in the base model's process -- the MTP draft
- * sidecar (a go-family draft would arm DS4_REPEAT_FREQ etc. onto a non-go
- * BASE sampler), the residual/corr sidecars, and tokenizer-only opens. This
- * is the same cross-model pollution as the GPU keep-LUT, which is restored at
- * the MTP call site; the env leak was missed there. model_open's signature is
- * frozen (ds4_internal.h; external caller ds4_corr.c), so the base loader
- * opts in through this file-scope flag instead of a new parameter -- default
- * false keeps every sidecar/tokenizer open arming-free. */
+ * Support-model opens run in the base model's process -- the residual/corr
+ * sidecars and tokenizer-only opens (a go-family sidecar would otherwise arm
+ * go defaults onto a non-go BASE sampler). model_open's signature is frozen
+ * (ds4_internal.h; external caller ds4_corr.c), so the base loader opts in
+ * through this file-scope flag instead of a new parameter -- default false
+ * keeps every sidecar/tokenizer open arming-free. */
 bool g_model_open_arm_env_defaults = false;
 
 /* Open and map the GGUF once.  Metal needs a shared mapping for no-copy
@@ -246,15 +244,14 @@ void model_open(ds4_model *m, const char *path, bool metal_mapping,
     /* 先丢掉本文件已有的 page cache 页, 再带 MADV_HUGEPAGE 映射 —— 否则内核会拿
      * cache 里现成的 4KiB 页直接用, 大页永远只覆盖新读入的那部分(实测卡在 12-16%)。
      * POSIX_FADV_DONTNEED 只作用于这一个 fd 对应的文件, 是进程级操作, 不需要特权。 */
-    if (getenv("DS4_NO_HUGEPAGE") == NULL)
-        (void)posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+    (void)posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
 #endif
 #if defined(__linux__) && defined(MADV_HUGEPAGE)
     /* ★2MiB 对齐映射★: 文件页 THP 要求虚拟地址按大页对齐(文件偏移 0 本就满足),
      * 否则整段退回 4KiB。内核给的地址通常不对齐, 实测大页覆盖率只有 8.5%。
      * 做法: 先占一段带余量的匿名区探出对齐地址, 再 MAP_FIXED 把文件映上去 ——
      * MAP_FIXED 直接覆盖占位区, 中间没有别的线程能插进来抢地址。 */
-    if (getenv("DS4_NO_HUGEPAGE") == NULL) {
+    {
         const size_t HP = 2u * 1024u * 1024u;
         const size_t want = (size_t)st.st_size;
         void *probe = mmap(NULL, want + HP, PROT_NONE,
@@ -285,7 +282,7 @@ void model_open(ds4_model *m, const char *path, bool metal_mapping,
      * 2200 万个页表项, TLB 完全装不下 —— 每次专家读都在做地址翻译, 表现为 GPU 利用率
      * 只有 6% 而 CPU/GPU/磁盘全都不忙。本机 THP 是 madvise 模式(不显式要就永远 4KiB),
      * 故此处显式请求; 内核不支持文件页 THP 时该调用无害地失败。 */
-    if (getenv("DS4_NO_HUGEPAGE") == NULL) {
+    {
         (void)madvise(map, (size_t)st.st_size, MADV_HUGEPAGE);
         /* MADV_HUGEPAGE 只影响"之后新读入"的页; 已在 page cache 里的 4KiB 页不会自动
          * 合并(khugepaged 每 10s 才扫 16MiB, 对 90GiB 等于没有)。MADV_COLLAPSE(6.1+)
@@ -294,19 +291,15 @@ void model_open(ds4_model *m, const char *path, bool metal_mapping,
 #ifndef MADV_COLLAPSE
 #define MADV_COLLAPSE 25
 #endif
-        if (getenv("DS4_NO_HUGEPAGE_COLLAPSE") == NULL) {
+        {
             const size_t CH = 512u * 1024u * 1024u;   /* 每次 512MiB, 避免一次长阻塞 */
-            const double ct0 = now_sec();
-            size_t done = 0, ok_bytes = 0;
+            size_t done = 0;
             while (done < (size_t)st.st_size) {
                 size_t n = (size_t)st.st_size - done;
                 if (n > CH) n = CH;
-                if (madvise((char *)map + done, n, MADV_COLLAPSE) == 0) ok_bytes += n;
+                (void)madvise((char *)map + done, n, MADV_COLLAPSE);
                 done += n;
             }
-            if (getenv("DS4_HUGEPAGE_VERBOSE"))
-                fprintf(stderr, "ds4: MADV_COLLAPSE %.1f/%.1f GiB in %.2fs\n",
-                        ok_bytes / 1073741824.0, st.st_size / 1073741824.0, now_sec() - ct0);
         }
     }
 #endif

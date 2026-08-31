@@ -245,9 +245,7 @@ static void *dist_worker_data_client_main(void *arg) {
     snprintf(peer_port, sizeof(peer_port), "%s", ctx->peer_port);
     free(ctx);
 
-    int rc = getenv("DS4_DIST_DISABLE_WORKER_PREFETCH")
-        ? dist_worker_read_loop(state, fd)
-        : dist_worker_read_loop_prefetch(state, fd);
+    int rc = dist_worker_read_loop_prefetch(state, fd);
     if (rc != 0) {
         fprintf(stderr,
                 "ds4: distributed worker: data connection %s:%s closed after error\n",

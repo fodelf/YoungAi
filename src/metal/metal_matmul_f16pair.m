@@ -53,11 +53,6 @@ int ds4_gpu_matmul_f16_pair_tensor(
 
         ds4_gpu_f16_matvec_args mv_args = ds4_gpu_make_f16_mv_args(in_dim, out_dim);
         ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_plain_mv_dispatch(in_dim, 0);
-        if (ds4_gpu_use_compressor_pair_nr4() &&
-            (out_dim == 512u || out_dim == 1024u) && in_dim >= 4096u) {
-            mv_dispatch.nr0 = 4;
-            mv_dispatch.smem = 32u * 4u * sizeof(float);
-        }
         mv_args.nr0 = mv_dispatch.nr0;
         id<MTLComputePipelineState> pipeline =
             ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_f16_f32_pair_4", mv_dispatch.nsg);

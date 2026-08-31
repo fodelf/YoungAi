@@ -121,24 +121,45 @@ int ds4_gpu_matmul_q2_K_pair_batch_tensor(ds4_gpu_tensor *out0, ds4_gpu_tensor *
                                           const ds4_gpu_tensor *x, uint64_t n_tok);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
-/* When on!=0, the NEXT ds4_gpu_set_model_map_range wraps its views without
- * adding them to the GPU residency set (evictable mmap, not wired).  Auto-state;
- * set before the MTP draft map to keep it off the worker's wired budget. CPU
- * builds ignore it. */
-void ds4_gpu_set_model_map_nonresident_hint(int on);
 int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, uint32_t count, uint64_t max_tensor_bytes);
 /* Reduced-memory model loader. Identical to ds4_gpu_set_model_map_spans but each
  * span carries a resident flag: resident spans (backbone) are wired into the GPU
  * residency set; non-resident spans (routed experts) are still wrapped so the hot
  * path can resolve their buffers, but are kept out of the residency set so their
  * clean file-backed pages stay reclaimable under memory pressure. resident_flags
- * must be non-NULL with one entry per span. Used for DS4_METAL_EXPERT_OFFLOAD. */
+ * must be non-NULL with one entry per span. Used for routed-expert offload. */
 int ds4_gpu_set_model_map_spans_split(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, const bool *resident_flags, uint32_t count, uint64_t max_tensor_bytes);
 /* Dynamic routed-expert residency route. The host decides at load time whether
  * the fully-resident model fits the memory budget and pushes the verdict here so
- * the hot-path gather agrees (1 = stream/offload, 0 = keep resident). An explicit
- * DS4_METAL_EXPERT_OFFLOAD env always overrides this. CPU builds ignore it. */
+ * the hot-path gather agrees (1 = stream/offload, 0 = keep resident).
+ * CPU builds ignore it. */
 void ds4_gpu_set_expert_offload(int enabled);
+/* Survival flag for oversized single-host models (--no-residency): skip
+ * MTLResidencySet wiring and view warmup so wired memory cannot balloon into
+ * a kernel panic (2026-07-06 on record). Set before the model map. CUDA no-op. */
+void ds4_gpu_set_no_residency(int on);
+/* Strict IEEE-754 shader math (safe math mode + f32 raw KV + exp2/log2 RoPE)
+ * for cross-GPU parity lanes. Must be set before ds4_gpu_init compiles the
+ * shader library. Default off. CUDA no-op. */
+void ds4_gpu_set_strict_fp(int on);
+/* Metal 4 tensor API gate: 1 (default) = auto-probe per hardware generation;
+ * 0 = force the legacy kernels (deterministic logprob-vector runs). Must be
+ * set before ds4_gpu_init. CUDA no-op. */
+void ds4_gpu_set_metal4_enabled(int on);
+/* Resident routed-expert LRU pool (--expert-pool-*): mb==0 disables (default).
+ * pinned_spec is the "L20:1,2;L21:7" whitelist text or NULL. CUDA no-op. */
+void ds4_gpu_set_expert_pool(uint64_t mb, const char *pinned_spec, uint32_t auto_pin_top, uint32_t prefetch_top);
+/* Frequency-pinned expert mlock cache (--expert-pin-*): file==NULL or
+ * mlock_mb==0 disables; resid_mlock_mb wires the residual sidecar's slots of
+ * the same pin set (0 = off). CUDA no-op. */
+void ds4_gpu_set_expert_pin(const char *file, uint64_t mlock_mb, uint64_t resid_mlock_mb);
+/* Dual-host expert fetch, client half: host!=NULL dials host:port (port 0 =
+ * 5606); accept_port!=0 listens instead (reverse-established transport for
+ * peers whose outbound connect is broken). CUDA no-op. */
+void ds4_gpu_set_expert_fetch_client(const char *host, int port, int accept_port);
+/* Predicted-expert peer staging (--expert-stage). Self-disables unless the
+ * expert-fetch client is configured. CUDA no-op. */
+void ds4_gpu_set_expert_stage(int on);
 /* Device recommended max GPU working-set in bytes (0 if unknown / CPU build).
  * Used as the AUTO offload budget when DS4_MEM_BUDGET_MB is unset. */
 uint64_t ds4_gpu_recommended_max_working_set_bytes(void);

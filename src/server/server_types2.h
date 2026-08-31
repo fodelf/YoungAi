@@ -266,7 +266,7 @@ struct server {
     /* 同调用禁重契约(2026-07-22): 上一次发出的工具调用 (工具名, 参数名, 值字节)。
      * 多轮回路实证失败形态 = 消化 tool_result 后逐字节重发同一调用(复读吸引子);
      * 值区闭合时与上一调用同名同参数同值 → 拒闭合走分歧(new≠old 契约同族)。
-     * 跟 session 生命周期走(跨请求保持), DS4_PRIMER_SAMECALL_OK=1 关闭契约。 */
+     * 跟 session 生命周期走(跨请求保持)。 */
     char *prev_call_tool;
     char *prev_call_param;
     char *prev_call_val;
@@ -425,6 +425,7 @@ typedef struct {
     const char *host;
     int port;
     int ctx_size;
+    int batch_max;             /* --batch: 并发合批上限(0=关, 钳到 DS4_SERVER_BATCH_LANES) */
     bool tool_primer;
     bool force_nothink;
     int max_output_tokens;
@@ -445,6 +446,12 @@ typedef struct {
 extern volatile sig_atomic_t g_stop_requested;
 
 extern bool g_force_nothink;
+
+/* --base-native: base 底模用母语骨架渲染(# User:/# Assistant:)替代 chat 角色帧。 */
+extern int g_base_native;
+
+/* --primer-compact: 引导注入只把语义锚点送进 KV(对外 text 仍是完整合法 DSML)。 */
+extern bool g_primer_compact;
 
 extern volatile sig_atomic_t g_listen_fd;
 

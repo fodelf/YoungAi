@@ -7,7 +7,6 @@ bool dist_coordinator_can_pipeline_prefill(
         ds4_session *session,
         uint32_t n_tokens,
         uint32_t chunk_cap) {
-    if (getenv("DS4_DIST_DISABLE_PREFILL_PIPELINE")) return false;
     if (!state || !plan) return false;
     (void)session;
     if (chunk_cap == 0 || n_tokens <= chunk_cap) return false;
@@ -34,13 +33,7 @@ int dist_coordinator_prefill_chunk_cap(
         return 1;
     }
     const uint32_t prefill_cap = (uint32_t)prefill_cap_i;
-    uint32_t requested = state ? state->prefill_chunk : 0u;
-    const char *env = getenv("DS4_DIST_PREFILL_CHUNK");
-    if (requested == 0 && env && env[0]) {
-        if (!dist_parse_positive_u32(env, "DS4_DIST_PREFILL_CHUNK", &requested, err, errlen)) {
-            return 1;
-        }
-    }
+    uint32_t requested = state ? state->prefill_chunk : 0u;   /* --dist-prefill-chunk */
     if (requested == 0) requested = prefill_cap;
     if (requested > prefill_cap) {
         if (errlen) {
@@ -64,13 +57,7 @@ static int dist_coordinator_prefill_window(
         char *err,
         size_t errlen) {
     if (!window) return 1;
-    uint32_t requested = state ? state->prefill_window : 0u;
-    const char *env = getenv("DS4_DIST_PREFILL_WINDOW");
-    if (requested == 0 && env && env[0]) {
-        if (!dist_parse_positive_u32(env, "DS4_DIST_PREFILL_WINDOW", &requested, err, errlen)) {
-            return 1;
-        }
-    }
+    uint32_t requested = state ? state->prefill_window : 0u;   /* --dist-prefill-window */
     if (requested > 64u) {
         if (errlen) snprintf(err, errlen, "distributed prefill window %u exceeds limit 64", requested);
         return 1;
@@ -272,8 +259,7 @@ int dist_coordinator_prefill_prompt_pipelined(
         slot->prefix_hash = next_prefix_hash;
         slot->result_hash = reader.expected_hashes[submitted_chunks];
         slot->reset_session = reset_first_chunk && pos == span_start;
-        slot->ack_only = !getenv("DS4_DIST_DISABLE_PREFILL_ACK_ONLY") &&
-                         pos + chunk < span_end;
+        slot->ack_only = pos + chunk < span_end;
         rc = dist_prefill_sender_enqueue_slot(&sender, err, errlen);
         if (rc != 0) break;
 

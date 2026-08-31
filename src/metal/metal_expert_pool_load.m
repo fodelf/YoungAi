@@ -56,7 +56,7 @@ int ds4_gpu_try_load_layer_experts_to_pool(
         if (!warned[layer_index]) {
             fprintf(stderr,
                     "ds4: expert-pool pinned whitelist layer %u has %u experts but layer cap is %u; "
-                    "LRU misses may fall back until DS4_METAL_EXPERT_POOL_MB or min_layer_slots is increased.\n",
+                    "LRU misses may fall back until --expert-pool-mb or min_layer_slots is increased.\n",
                     layer_index,
                     g_expert_pool_pinned_per_layer[layer_index],
                     layer_cap);
@@ -65,8 +65,8 @@ int ds4_gpu_try_load_layer_experts_to_pool(
     }
     if (selectedbuf.storageMode != MTLStorageModeShared) return 0;
 
-    int32_t pool_slots[1024];
-    if (n_active > 1024) return 0;
+    int32_t pool_slots[DS4_METAL_ACTIVE_EXPERTS_MAX];
+    if (n_active > DS4_METAL_ACTIVE_EXPERTS_MAX) return 0;
     if (!g_expert_pool_gate.contents || !g_expert_pool_up.contents || !g_expert_pool_down.contents) return 0;
 
     ds4_metal_expert_pool_meta meta = {
@@ -92,7 +92,7 @@ int ds4_gpu_try_load_layer_experts_to_pool(
 
     if (g_expert_pool_hit_only) {
         bool all_ready = true;
-        bool ready_flags[1024] = { false };
+        bool ready_flags[DS4_METAL_ACTIVE_EXPERTS_MAX] = { false };
         pthread_mutex_lock(&g_expert_pool_mu);
         for (uint32_t i = 0; i < n_active; i++) {
             const uint32_t expert = active_ids[i];
@@ -144,7 +144,7 @@ int ds4_gpu_try_load_layer_experts_to_pool(
 
     double copy_t0 = 0.0;
     bool copied_any = false;
-    int32_t marked_busy[1024];
+    int32_t marked_busy[DS4_METAL_ACTIVE_EXPERTS_MAX];
     uint32_t n_marked_busy = 0;
 
     for (uint32_t i = 0; i < n_active; i++) {
@@ -187,7 +187,7 @@ int ds4_gpu_try_load_layer_experts_to_pool(
                     e->last_used = ++g_expert_pool_clock;
                     ds4_gpu_expert_pool_lru_touch(slot);
                     pool_slots[i] = slot;
-                    if (n_marked_busy < 1024u) marked_busy[n_marked_busy++] = slot;
+                    if (n_marked_busy < DS4_METAL_ACTIVE_EXPERTS_MAX) marked_busy[n_marked_busy++] = slot;
                     pthread_mutex_unlock(&g_expert_pool_mu);
                     break;
                 }
@@ -315,7 +315,7 @@ int ds4_gpu_try_load_layer_experts_to_pool(
                         e->last_used = ++g_expert_pool_clock;
                         ds4_gpu_expert_pool_lru_touch(slot);
                         pool_slots[i] = slot;
-                        if (n_marked_busy < 1024u) marked_busy[n_marked_busy++] = slot;
+                        if (n_marked_busy < DS4_METAL_ACTIVE_EXPERTS_MAX) marked_busy[n_marked_busy++] = slot;
                         g_expert_pool_miss_copy_bytes += g_expert_pool_slot_bytes;
                         pthread_cond_broadcast(&g_expert_pool_cv);
                         pthread_mutex_unlock(&g_expert_pool_mu);
@@ -353,9 +353,6 @@ int ds4_gpu_try_load_layer_experts_to_pool(
     *down_buf = g_expert_pool_down;
     *source_n_total_expert = g_expert_pool_slots;
     g_expert_pool_calls++;
-    if (g_expert_pool_interval != 0 && (g_expert_pool_calls % g_expert_pool_interval) == 0) {
-        ds4_gpu_expert_pool_print("live");
-    }
     if (g_expert_pool_hotlist_interval != 0 &&
         g_expert_pool_hotlist_top != 0 &&
         (g_expert_pool_calls % g_expert_pool_hotlist_interval) == 0) {

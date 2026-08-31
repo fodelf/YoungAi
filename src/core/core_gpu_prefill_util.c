@@ -10,24 +10,10 @@
  * flow and their CPU reads stay outside these generation entry points.
  */
 
-static bool metal_graph_env_bool_enabled(const char *name) {
-    const char *v = getenv(name);
-    return v && v[0] && !(v[0] == '0' && v[1] == '\0');
-}
-
-bool metal_graph_direct_expert_read_enabled(void) {
-    return metal_graph_env_bool_enabled("DS4_METAL_EXPERT_OFFLOAD_DIRECT");
-}
-
 uint32_t metal_graph_token_split_after_layers(void) {
-    uint32_t split_after_layers = metal_graph_direct_expert_read_enabled() ? 1u : 4u;
-    const char *split_env = getenv("DS4_METAL_GRAPH_TOKEN_SPLIT_LAYERS");
-    if (split_env && split_env[0]) {
-        char *end = NULL;
-        unsigned long v = strtoul(split_env, &end, 10);
-        if (end != split_env && v <= DS4_N_LAYER) split_after_layers = (uint32_t)v;
-    }
-    return split_after_layers;
+    /* 四层一切: 前缀 command buffer 足够大到能藏住有用执行, 又不饿死第二个
+     * command buffer(实测的甜点, 见 encode_token_raw_swa 的注释)。 */
+    return 4u;
 }
 
 /* Encode a full single-token decode step on Metal.  This is the generation
@@ -88,11 +74,7 @@ bool metal_graph_encode_token_raw_swa(
         }
         if (ok && allow_split_flush && split_after_layers != 0 &&
             ((il + 1u) % split_after_layers) == 0 && il + 1u < (uint32_t)DS4_N_LAYER) {
-            if (metal_graph_direct_expert_read_enabled()) {
-                ok = ds4_gpu_end_commands() != 0 && ds4_gpu_begin_commands() != 0;
-            } else {
-                ok = ds4_gpu_flush_commands() != 0;
-            }
+            ok = ds4_gpu_flush_commands() != 0;
         }
     }
 
@@ -247,18 +229,11 @@ bool metal_graph_upload_prompt_embeddings_hc(
         uint32_t            n_tokens) {
     if (pos0 > (uint32_t)prompt->len || n_tokens > (uint32_t)prompt->len - pos0) return false;
 
-    /* 默认 1(2026-08-21): CPU 侧 embed_token_f16 与 decode 路的 GPU embed kernel 是两套
-     * 解量化实现, 同一 token 差 ~2e-4 —— 这是批 verify 与 decode 分叉的 L0 种子, 实测把
-     * 批/解码 argmax 一致率从 91.7% 抬到 97.9%。批走 GPU 路即与 decode 同源。 */
-    uint32_t gpu_min = 1;
-    const char *gpu_min_env = getenv("DS4_METAL_GPU_BATCH_EMBED_MIN");
-    if (gpu_min_env && gpu_min_env[0]) {
-        char *end = NULL;
-        unsigned long v = strtoul(gpu_min_env, &end, 10);
-        if (end != gpu_min_env && v <= UINT32_MAX) gpu_min = (uint32_t)v;
-    }
-
-    if (tokens && n_tokens >= gpu_min) {
+    /* 永远走 GPU embed(2026-08-21): CPU 侧 embed_token_f16 与 decode 路的 GPU embed
+     * kernel 是两套解量化实现, 同一 token 差 ~2e-4 —— 这是批 verify 与 decode 分叉的
+     * L0 种子, 实测把批/解码 argmax 一致率从 91.7% 抬到 97.9%。批走 GPU 路即与 decode
+     * 同源; CPU 路只剩 tokens 缓冲缺席的小批兜底。 */
+    if (tokens && n_tokens >= 1) {
         return ds4_gpu_embed_tokens_hc_tensor(out_hc,
                                                 tokens,
                                                 model->map,
@@ -284,7 +259,7 @@ bool metal_graph_warmup_prefill_kernels(
         const ds4_weights *weights,
         uint32_t           n_tokens) {
     static bool warmed = false;
-    if (warmed || getenv("DS4_METAL_NO_PREFILL_KERNEL_WARMUP") != NULL) return true;
+    if (warmed) return true;
 
     /*
      * The first batched F16 matmul can pay Metal's one-time pipeline execution

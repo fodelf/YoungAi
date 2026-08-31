@@ -233,13 +233,9 @@ int ds4_dist_session_sync(
         }
 
         uint32_t pos = pos0;
-        if (dist_env_enabled("DS4_DIST_SPAN_TIMING"))
-            fprintf(stderr, "ds4: [span-timing] sync suffix=%u pos0=%u chunk_cap=%u (non-pipelined batch path)\n",
-                    suffix, pos0, chunk_cap);
         while (pos < (uint32_t)prompt->len) {
             const uint32_t remaining = (uint32_t)prompt->len - pos;
             const uint32_t chunk = remaining < chunk_cap ? remaining : chunk_cap;
-            const double span_t0 = dist_env_enabled("DS4_DIST_SPAN_TIMING") ? dist_now_sec() : 0.0;
             int eval_rc = dist_coordinator_eval_span(&d->state,
                                                      owner,
                                                      &d->plan,
@@ -253,10 +249,6 @@ int ds4_dist_session_sync(
                                                      NULL,
                                                      err,
                                                      errlen);
-            if (dist_env_enabled("DS4_DIST_SPAN_TIMING"))
-                fprintf(stderr, "ds4: [span-timing] eval_span n=%u took %.2fs (%.2f t/s)\n",
-                        chunk, dist_now_sec() - span_t0,
-                        (dist_now_sec() - span_t0) > 0 ? chunk / (dist_now_sec() - span_t0) : 0.0);
             if (eval_rc != 0) {
                 if (dist_coordinator_rebuild_from_transcript(&d->state,
                                                              owner,

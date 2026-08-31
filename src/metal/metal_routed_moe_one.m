@@ -78,7 +78,6 @@ int ds4_gpu_routed_moe_one_tensor(
          * 从 blob+down 取数, gate/up view 不建也不引用 — 建 0 区间 view 会硬失败。 */
         const int vq_no_base_gate =
             (go1b_res && go1b_res->vq && gate_expert_bytes == 0);
-        g_wrap_mlock_suppress = 1;   /* routed expert tensors: gathered, never wired */
         id<MTLBuffer> gate_buf = nil, up_buf = nil, down_buf = nil;
         if (!vq_no_base_gate) {
             gate_buf = ds4_gpu_wrap_model_range(model_map, model_size, gate_offset, gate_tensor_bytes, &gate_inner);
@@ -92,7 +91,6 @@ int ds4_gpu_routed_moe_one_tensor(
         const int vq_no_base_down = (down_offset == 0);
         if (!vq_no_base_down)
             down_buf = ds4_gpu_wrap_model_range(model_map, model_size, down_offset, down_tensor_bytes, &down_inner);
-        g_wrap_mlock_suppress = 0;
         if ((!vq_no_base_gate && (!gate_buf || !up_buf)) || (!vq_no_base_down && !down_buf)) {
             fprintf(stderr, "ds4: [moe-buf-nil] L%u gate=%d up=%d down=%d vq_no_base_gate=%d\n",
                     layer_index, gate_buf != nil, up_buf != nil, down_buf != nil, (int)vq_no_base_gate);
@@ -100,27 +98,21 @@ int ds4_gpu_routed_moe_one_tensor(
         }
         uint32_t source_n_total_expert = n_total_expert;
 
-        /* DS4_METAL_EXPERT_OFFLOAD is meant for the full q2 target model, whose
-         * routed experts are deliberately non-resident and must be gathered into
-         * compact scratch/pool before the MoE kernels index them.  The MTP support
-         * model is mapped as a fully resident model range; forcing its Q4_K routed
-         * experts through the A3 scratch path just copies resident bytes again and
-         * made distributed MTP a net slowdown.  Leave non-q2 routed tensors on the
-         * direct resident-buffer path. */
+        /* Expert offload is meant for the full q2 target model, whose routed
+         * experts are deliberately non-resident and must be gathered into
+         * compact scratch/pool before the MoE kernels index them.  A fully
+         * resident support model would just re-copy resident bytes through the
+         * A3 scratch path, so non-q2 routed tensors stay on the direct
+         * resident-buffer path. */
         const bool a3_expert_offload =
             ds4_gpu_expert_offload_enabled() &&
-            !ds4_gpu_expert_offload_direct_enabled() &&
             gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
             down_type == DS4_METAL_TENSOR_Q2_K;
         if (a3_expert_offload) {
-            const int io_profile = ds4_gpu_expert_io_profile_enabled();
             g_expert_gather_nocache_call = 0;   /* decode reads stay page-cache friendly */
             const int was_batched = (g_batch_cb != nil);
-            double drain_ms = 0.0;
             if (was_batched) {
-                const double drain_t0 = io_profile ? ds4_gpu_now_ms() : 0.0;
                 if (ds4_gpu_expert_drain_commands("routed MoE drain") == 0) return 0;
-                if (io_profile) drain_ms = ds4_gpu_now_ms() - drain_t0;
             }
             /* P2.1: snapshot this layer's router input and kick next-layer
              * router prediction + expert read-ahead on the background thread;
@@ -132,19 +124,14 @@ int ds4_gpu_routed_moe_one_tensor(
                                                      (size_t)ds4_gpu_tensor_offset(x));
                 ds4_gpu_expert_prefetch_enqueue(layer_index + 1u, x_cpu, expert_in_dim);
             }
-            /* §2.4/§3.5 降激活 (decode single token): thin picks before the union so
-             * the per-token expert IO drops toward the W3 ceiling.  Default OFF => no-op. */
-            ds4_gpu_moe_thin_picks(selectedbuf, selected_off, weightsbuf,
-                                   ds4_gpu_tensor_offset(weights), 1u, n_expert,
-                                   gate_type);
-            uint32_t active_ids[1024];
+            uint32_t active_ids[DS4_METAL_ACTIVE_EXPERTS_MAX];
             uint32_t n_active = 0;
             int compact_ok = ds4_gpu_compact_selected_experts(selectedbuf,
                                                               selected_off,
                                                               n_expert,
                                                               n_total_expert,
                                                               active_ids,
-                                                              1024,
+                                                              DS4_METAL_ACTIVE_EXPERTS_MAX,
                                                               &n_active);
             /* Compare this layer's actual active set against the latest
              * prediction made for it (stats feed the ds4-io pf= field). */
@@ -175,21 +162,6 @@ int ds4_gpu_routed_moe_one_tensor(
                                                                    &down_buf,
                                                                    &source_n_total_expert);
             }
-            if (compact_ok && !pool_used && gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
-                down_type == DS4_METAL_TENSOR_Q2_K) {
-                ds4_gpu_expert_source_cache_note(model_map,
-                                                 layer_index,
-                                                 n_active,
-                                                 active_ids,
-                                                 gate_offset,
-                                                 up_offset,
-                                                 down_offset,
-                                                 gate_expert_bytes,
-                                                 down_expert_bytes);
-            }
-            if (io_profile) ds4_gpu_expert_io_prof_reset();
-            const double gather_t0 = io_profile ? ds4_gpu_now_ms() : 0.0;
-            const double copy_t0 = (!pool_used && ds4_gpu_expert_profile_is_enabled()) ? ds4_gpu_now_ms() : 0.0;
             int load_ok = compact_ok && (pool_used ||
                           ds4_gpu_load_layer_experts_to_scratch(model_map,
                                                                  layer_index,
@@ -201,25 +173,6 @@ int ds4_gpu_routed_moe_one_tensor(
                                                                  gate_expert_bytes,
                                                                  down_expert_bytes,
                                                                  n_total_expert));
-            if (io_profile) {
-                ds4_gpu_expert_io_prof_report("decode",
-                                              pool_used ? "pool" : "gather",
-                                              layer_index,
-                                              n_active,
-                                              1u,
-                                              ds4_gpu_now_ms() - gather_t0,
-                                              drain_ms);
-            }
-            if (!pool_used && compact_ok && ds4_gpu_expert_profile_is_enabled()) {
-                ds4_gpu_expert_profile_record(layer_index,
-                                              active_ids,
-                                              n_active,
-                                              n_total_expert,
-                                              gate_expert_bytes,
-                                              down_expert_bytes,
-                                              n_expert,
-                                              ds4_gpu_now_ms() - copy_t0);
-            }
             if (!load_ok) {
                 if (was_batched) (void)ds4_gpu_begin_commands();
                 return 0;
@@ -272,24 +225,21 @@ int ds4_gpu_routed_moe_one_tensor(
 
         /* 1-bit residual is applied in the batch (mm_id) decode path; go1b decode does
          * not use this one_tensor path, so no residual is applied here. */
-        int do_residual = 0;
         (void)go1b_res;
 
         const NSUInteger gate_smem = ds4_gpu_routed_mv_smem(gate_type);
         const NSUInteger down_smem = ds4_gpu_routed_mv_smem(down_type);
         int ok = 1;
-        const bool write_clamped_moe =
-            getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") != NULL;
         id<MTLComputePipelineState> pair_swiglu_pipeline = nil;
         if (gate_type == DS4_METAL_TENSOR_IQ2_XXS) {
             pair_swiglu_pipeline = g_moe_mul_mv_id_iq2_xxs_pair_swiglu_pipeline;
         } else if (gate_type == DS4_METAL_TENSOR_Q4_K) {
             pair_swiglu_pipeline = g_moe_mul_mv_id_q4_k_pair_swiglu_pipeline;
         }
+        /* 非融合路仍可达: --quality 或该 quant 无 pair_swiglu kernel 时走下面的
+         * 分步编码, 不是死分支。 */
         const bool fuse_pair_swiglu =
             !g_quality_mode &&
-            !write_clamped_moe &&
-            getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") == NULL &&
             pair_swiglu_pipeline != nil;
         if (fuse_pair_swiglu) {
             ds4_gpu_dsv4_moe_swiglu_weight_args act_args = {

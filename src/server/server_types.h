@@ -78,6 +78,13 @@
 
 #define DS4_SERVER_SEND_STALL_TIMEOUT_MS 2000
 
+/* 并发合批的最大路数: batch worker 的会话/状态数组全按它定长, --batch 钳到它。
+ * 8 = 单 graph worker 上稀疏 MoE tile 欠填的聚合甜点(见 request-batching 设计)。 */
+#define DS4_SERVER_BATCH_LANES 8
+
+/* 合批出队前的聚集窗口: 首请求到达后再等这么久收拢同型请求, 换 tile 填充率。 */
+#define DS4_SERVER_BATCH_WAIT_MS 60
+
 typedef struct {
     char *ptr;
     size_t len;

@@ -287,16 +287,15 @@ static char *render_chat_prompt_base_native(const chat_msgs *msgs, const char *t
         }
     }
     buf_puts(&out, "# Assistant:\n");
-    /* 续写锚(DS4_BASE_NATIVE_ANCHOR): base 惯性会"评论任务"而非动手 → 锚把续写钉进
-     * 干活分布。默认锚=工具调用帧首行(agent 场景); 设为 "" 关闭, 或自定义。 */
+    /* 续写锚: base 惯性会"评论任务"而非动手 → 锚把续写钉进干活分布。 */
     {   /* 有 tools 时不设锚: 工具调用帧归 --tool-primer 引导采样接管(server 注入全部
          * 结构 token, 模型只填值) —— 1-bit 下 DSML 特殊 token 会被采成汉字, 结构必须
          * 由 server 强制。无 tools 时默认代码块锚(把 base 的"评论惯性"钉进干活分布)。 */
-        const char *anchor = getenv("DS4_BASE_NATIVE_ANCHOR");
+        const char *anchor = NULL;
         /* knowledge 命中 → 散文答问锚(不是代码块): 否则 ```go 锚把知识问答顶进
          * `func xxx(){ // 抄参考 }` 代码框(2026-07-23 g1 实证)。参考已在 header,
          * 这里只给"用参考直接答"的散文起手, 让续写落到答案分布而非代码分布。 */
-        if (!anchor) {
+        {
             /* knowledge 命中→答问脚手架(不是空锚: 空锚下 base 会回显问题,
              * singleflight/read 实证; 引导词把续写钉进"陈述答案"分布)。 */
             if (knowledge_hit) anchor = "Based on the reference: ";
@@ -337,8 +336,7 @@ static char *render_chat_prompt_base_native(const chat_msgs *msgs, const char *t
 /* base-native 的边界: 母语骨架里没有 EOS 角色帧, base 会继续自问自答("# User:" 再来一轮)
  * → 服务端注入默认 stop, 任何客户端都拿到干净单轮(客户端自带的 stop_sequences 一并生效)。 */
 void base_native_default_stops(stop_list *stops) {
-    const char *bn = getenv("DS4_BASE_NATIVE");
-    if (!bn || !bn[0] || bn[0] == '0') return;
+    if (!g_base_native) return;
     stop_list_push(stops, xstrdup("\n# User:"));
     stop_list_push(stops, xstrdup("\n# Tool result:"));
     stop_list_push(stops, xstrdup("\n# Assistant:"));
@@ -349,11 +347,9 @@ char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
                                      ds4_think_mode think_mode, size_t *conv_off) {
     (void)tool_orders;
     if (conv_off) *conv_off = 0;   /* 0=未知 → 消费端退回 strstr 启发式(chat 帧路径不变) */
-    {   /* base 底模: 换母语骨架(env 开关; 默认=既有 chat 帧, 字节不变) */
-        const char *bn = getenv("DS4_BASE_NATIVE");
-        if (bn && bn[0] && bn[0] != '0')
-            return render_chat_prompt_base_native(msgs, tool_schemas, conv_off);
-    }
+    /* base 底模 (--base-native): 换母语骨架; 默认=既有 chat 帧, 字节不变 */
+    if (g_base_native)
+        return render_chat_prompt_base_native(msgs, tool_schemas, conv_off);
     const bool think = ds4_think_mode_enabled(think_mode);
     const bool tool_context = chat_history_uses_tool_context(msgs, tool_schemas);
     int last_user_idx = -1;

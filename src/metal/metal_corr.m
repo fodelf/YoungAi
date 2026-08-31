@@ -251,17 +251,6 @@ static int ds4_gpu_corr_apply_impl(
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
-        if (getenv("DS4_CORR_CB_TRACE")) {
-            static _Atomic uint64_t n_owned, n_ride;
-            uint64_t o = owned ? ++n_owned : n_owned, r = owned ? n_ride : ++n_ride;
-            if ((o + r) % 64 == 1)
-                fprintf(stderr, "ds4: corr-cb owned=%llu ride=%llu\n",
-                        (unsigned long long)o, (unsigned long long)r);
-        }
-        /* DS4_CORR_SCRATCH_PROBE=1: bind throwaway out/x so the dispatch keeps
-         * its full encode+exec cost but carries NO data hazard with the MoE
-         * producer / shared-add consumer. Output is garbage — perf probe only,
-         * splits "dependency bubble" from "dispatch mechanics". */
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
         [enc setComputePipelineState:pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];

@@ -358,29 +358,12 @@ static void cuda_q8_f16_cache_release_all(void) {
     g_q8_f16_bytes = 0;
 }
 
-static uint64_t cuda_parse_mib_env(const char *name, int *present) {
-    const char *env = getenv(name);
-    if (present) *present = 0;
-    if (!env || !env[0]) return 0;
-    char *end = NULL;
-    unsigned long long v = strtoull(env, &end, 10);
-    if (end == env || *end != '\0') return 0;
-    if (present) *present = 1;
-    if (v > UINT64_MAX / 1048576ull) return UINT64_MAX;
-    return (uint64_t)v * 1048576ull;
-}
-
+/* No byte cap on the expanded cache itself: the reserve below is the guard. */
 static uint64_t cuda_q8_f16_cache_limit_bytes(void) {
-    int present = 0;
-    const uint64_t limit = cuda_parse_mib_env("DS4_CUDA_Q8_F16_CACHE_MB", &present);
-    return present ? limit : UINT64_MAX;
+    return UINT64_MAX;
 }
 
 static uint64_t cuda_q8_f16_cache_reserve_bytes(uint64_t total_bytes) {
-    int present = 0;
-    const uint64_t reserve = cuda_parse_mib_env("DS4_CUDA_Q8_F16_CACHE_RESERVE_MB", &present);
-    if (present) return reserve;
-
     if (total_bytes >= 112ull * 1024ull * 1024ull * 1024ull) {
         return 512ull * 1048576ull;
     }

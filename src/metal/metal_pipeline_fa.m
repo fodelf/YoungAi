@@ -298,12 +298,3 @@ uint32_t ds4_gpu_flash_attn_vec_nsg(uint32_t n_keys, uint32_t nwg, uint32_t ncps
     return nsg;
 }
 
-int ds4_gpu_trace_allocs(void) {
-    static int initialized;
-    static int enabled;
-    if (!initialized) {
-        enabled = getenv("DS4_METAL_TRACE_ALLOCS") != NULL;
-        initialized = 1;
-    }
-    return enabled;
-}

@@ -125,16 +125,30 @@ int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     return 1;
 }
 
-/* Metal-only residency hint (see ds4_gpu.h); CUDA uses an HBM-cache model and
- * ignores it. No-op so the shared core links against either backend. */
-void ds4_gpu_set_model_map_nonresident_hint(int on) { (void)on; }
-
 /* Dynamic resident/offload route (ds4_gpu.h) is a Metal unified-memory concept;
  * CUDA manages residency via its HBM weight cache. Accept the host verdict as a
  * no-op and report no working-set ceiling so the AUTO path falls back to the
  * explicit DS4_MEM_BUDGET_MB (or resident) without a spurious offload. */
 void ds4_gpu_set_expert_offload(int enabled) { (void)enabled; }
 uint64_t ds4_gpu_recommended_max_working_set_bytes(void) { return 0; }
+
+/* Metal-only tuning setters (see ds4_gpu.h): strict-fp shader parity, Metal 4
+ * gate, expert pool/pin, dual-host expert fetch, staging. CUDA has none of
+ * these mechanisms — no-op stubs keep the shared CLI/server option code
+ * linking against either backend. */
+void ds4_gpu_set_no_residency(int on) { (void)on; }
+void ds4_gpu_set_strict_fp(int on) { (void)on; }
+void ds4_gpu_set_metal4_enabled(int on) { (void)on; }
+void ds4_gpu_set_expert_pool(uint64_t mb, const char *pinned_spec, uint32_t auto_pin_top, uint32_t prefetch_top) {
+    (void)mb; (void)pinned_spec; (void)auto_pin_top; (void)prefetch_top;
+}
+void ds4_gpu_set_expert_pin(const char *file, uint64_t mlock_mb, uint64_t resid_mlock_mb) {
+    (void)file; (void)mlock_mb; (void)resid_mlock_mb;
+}
+void ds4_gpu_set_expert_fetch_client(const char *host, int port, int accept_port) {
+    (void)host; (void)port; (void)accept_port;
+}
+void ds4_gpu_set_expert_stage(int on) { (void)on; }
 
 /* ---- 共享核心无条件调用、但只有 Metal 实现过的接口 ----
  * ds4.o / ds4_distributed.o 对两个后端只编译一份, 所以 CUDA 必须给出符号

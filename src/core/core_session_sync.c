@@ -196,19 +196,7 @@ int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, char *er
 }
 
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
-    if (!g_prof.enabled) return ds4_session_sync_internal(s, prompt, err, errlen);
-    /* Tokens actually prefilled = prompt length minus the matching live prefix.
-     * Captured before the call because the internal sync mutates the checkpoint. */
-    const int start_len = (s && s->checkpoint_valid &&
-                           prompt && prompt->len >= s->checkpoint.len &&
-                           ds4_tokens_starts_with(prompt, &s->checkpoint))
-                          ? s->checkpoint.len : 0;
-    const double t0 = now_sec();
-    int rc = ds4_session_sync_internal(s, prompt, err, errlen);
-    if (rc == 0 && prompt && prompt->len > start_len) {
-        ds4_profile_add_prefill((uint64_t)(prompt->len - start_len), now_sec() - t0);
-    }
-    return rc;
+    return ds4_session_sync_internal(s, prompt, err, errlen);
 }
 
 /* Return true when canonicalization would replace already-sampled tokens.

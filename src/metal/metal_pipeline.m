@@ -96,71 +96,22 @@ id<MTLComputePipelineState> ds4_gpu_get_pipeline(
     return pipeline;
 }
 
-static int ds4_gpu_disable_hot_pipeline_statics(void) {
-    static int initialized;
-    static int disabled;
-    if (!initialized) {
-        disabled = getenv("DS4_METAL_DISABLE_HOT_PIPELINE_STATICS") != NULL;
-        initialized = 1;
-    }
-    return disabled;
-}
-
 id<MTLComputePipelineState> ds4_gpu_hot_pipeline(
         id<MTLComputePipelineState> pipeline,
         const char *fallback_name) {
-    if (!ds4_gpu_disable_hot_pipeline_statics()) return pipeline;
-    return ds4_gpu_get_pipeline(fallback_name);
+    (void)fallback_name;
+    return pipeline;
 }
 
-int ds4_gpu_use_compressor_pair_nr4(void) {
-    static int initialized;
-    static int enabled;
-    if (!initialized) {
-        enabled = getenv("DS4_METAL_COMPRESSOR_PAIR_NR4") != NULL;
-        initialized = 1;
-    }
-    return enabled;
+/* Both gates must be set before ds4_gpu_init: strict-fp picks the shader
+ * preprocessor macros and math mode at library compile time, and the Metal 4
+ * gate feeds ds4_gpu_detect_metal4_features which runs during init. */
+void ds4_gpu_set_strict_fp(int on) {
+    g_strict_fp = on ? 1 : 0;
 }
 
-static int ds4_gpu_env_value_eq(const char *v, size_t n, const char *literal) {
-    size_t m = strlen(literal);
-    if (n != m) return 0;
-    for (size_t i = 0; i < n; i++) {
-        if (tolower((unsigned char)v[i]) != tolower((unsigned char)literal[i])) return 0;
-    }
-    return 1;
-}
-
-int ds4_gpu_env_bool(const char *name) {
-    const char *v = getenv(name);
-    if (!v) return -1;
-
-    while (isspace((unsigned char)*v)) v++;
-    size_t n = strlen(v);
-    while (n > 0 && isspace((unsigned char)v[n - 1])) n--;
-    if (n == 0) return 1;
-
-    if (ds4_gpu_env_value_eq(v, n, "1") ||
-        ds4_gpu_env_value_eq(v, n, "true") ||
-        ds4_gpu_env_value_eq(v, n, "yes") ||
-        ds4_gpu_env_value_eq(v, n, "on")) {
-        return 1;
-    }
-    if (ds4_gpu_env_value_eq(v, n, "0") ||
-        ds4_gpu_env_value_eq(v, n, "false") ||
-        ds4_gpu_env_value_eq(v, n, "no") ||
-        ds4_gpu_env_value_eq(v, n, "off")) {
-        return 0;
-    }
-
-    if (!g_mpp_invalid_env_reported) {
-        fprintf(stderr,
-                "ds4: invalid Metal boolean environment value %s=%.*s; treating presence as enabled\n",
-                name, (int)n, v);
-        g_mpp_invalid_env_reported = 1;
-    }
-    return 1;
+void ds4_gpu_set_metal4_enabled(int on) {
+    g_metal4_enabled = on ? 1 : 0;
 }
 
 int ds4_gpu_mpp_available(void) {
@@ -170,9 +121,9 @@ int ds4_gpu_mpp_available(void) {
 /*
  * Retained Metal4 defaults live here instead of behind user-visible options.
  * The public runtime has one automatic accelerated path plus the global
- * DS4_METAL_DISABLE_METAL4 comparison switch.  Benchmark-only alternatives that
- * lost during M5 work are removed or kept out of the dispatch path so future
- * changes do not accidentally turn old experiments into new modes.
+ * ds4_gpu_set_metal4_enabled comparison switch.  Benchmark-only alternatives
+ * that lost during M5 work are removed or kept out of the dispatch path so
+ * future changes do not accidentally turn old experiments into new modes.
  */
 int ds4_gpu_use_mpp_attn_out_low_matmul(void) {
     return ds4_gpu_mpp_available();
@@ -258,7 +209,7 @@ void ds4_gpu_detect_metal4_features(void) {
         snprintf(g_metal_device_name, sizeof(g_metal_device_name), "%s", name);
     }
 
-    const int metal4_disabled = ds4_gpu_env_bool("DS4_METAL_DISABLE_METAL4") > 0;
+    const int metal4_disabled = !g_metal4_enabled;
 
 #if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
     if (@available(macOS 26.0, *)) {
@@ -311,15 +262,8 @@ int ds4_gpu_warm_model_views(void) {
     id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_touch_u8_stride");
     if (!pipeline) return 0;
 
-    uint64_t stride = 1024ull * 1024ull;
-    const char *stride_env = getenv("DS4_METAL_MODEL_WARMUP_STRIDE_MB");
-    if (stride_env && stride_env[0]) {
-        char *end = NULL;
-        unsigned long long mb = strtoull(stride_env, &end, 10);
-        if (end != stride_env && mb > 0 && mb <= 1024) {
-            stride = mb * 1024ull * 1024ull;
-        }
-    }
+    /* 1 MiB stride: a validation touch over the VM ranges, not a prefetch. */
+    const uint64_t stride = 1024ull * 1024ull;
 
     uint64_t total_touches = 0;
     for (uint32_t i = 0; i < g_model_view_count; i++) {

@@ -30,7 +30,9 @@ bool metal_graph_alloc_raw_cap(
         uint32_t                active_layer_end,
         bool                    active_layer_slice) {
     memset(g, 0, sizeof(*g));
-    g->dspark_capture = g_dspark_ready_global;
+    /* 捕获(40..42 层 HC-mean + drafter 环形窗)只在 --spec 武装时跑: 投机关着时它是
+     * 纯 prefill 开销零收益(2026-08-31 收口)。 */
+    g->dspark_capture = (g_dspark_ready_global && g_ds4_spec_enabled) ? 1 : 0;
     g->active_layer_slice = active_layer_slice;
     if (active_layer_start >= (uint32_t)DS4_N_LAYER) active_layer_start = 0;
     if (active_layer_end >= (uint32_t)DS4_N_LAYER) active_layer_end = (uint32_t)DS4_N_LAYER - 1u;

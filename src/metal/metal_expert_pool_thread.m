@@ -175,7 +175,7 @@ int ds4_gpu_expert_pool_init(uint64_t gate_expert_bytes, uint64_t down_expert_by
     g_expert_pool_slot_bytes = slot_bytes;
     g_expert_pool_slots = slots;
     if ((g_expert_pool_lookahead != 0 || g_expert_pool_pinned_total != 0 || g_expert_pool_hit_only) && !g_expert_pool_prefetch_queue) {
-        uint64_t qcap64 = ds4_gpu_env_u64("DS4_METAL_EXPERT_POOL_PREFETCH_QUEUE", (uint64_t)slots * 8ull);
+        uint64_t qcap64 = (uint64_t)slots * 8ull;
         if (qcap64 < 64u) qcap64 = 64u;
         if (qcap64 > 65536u) qcap64 = 65536u;
         g_expert_pool_prefetch_qcap = (uint32_t)qcap64;
@@ -201,39 +201,21 @@ int ds4_gpu_expert_pool_init(uint64_t gate_expert_bytes, uint64_t down_expert_by
     }
     fprintf(stderr,
             "ds4: expert-pool enabled: %.2f MiB, %u slots, one expert %.3f MiB "
-            "(gate=%.3f up=%.3f down=%.3f), configured layers %u:%u, serving tail %u/%u layers with >=%u slots/layer. "
-            "LRU resident pool with async predictor prefetch lookahead=%u top=%u q=%u "
-            "self=%s adjacent=%s admit_after=%u pinned=%u static=%u dynamic=%u auto_pin_top=%u min_req=%u reserve=%u hotlist=%u/%u hit_only=%s wait_inflight=%s foreground_fill=%s warm_batch=%s pf_evict=%s%s; hits bypass A3 scratch copy.\n",
+            "(gate=%.3f up=%.3f down=%.3f), serving tail %u/%u layers with >=%u slots/layer. "
+            "LRU resident pool, prefetch top=%u q=%u pinned=%u auto_pin_top=%u; "
+            "hits bypass A3 scratch copy.\n",
             (double)(2ull * gate_total + down_total) / (1024.0 * 1024.0),
             slots,
             (double)slot_bytes / (1024.0 * 1024.0),
             (double)gate_expert_bytes / (1024.0 * 1024.0),
             (double)gate_expert_bytes / (1024.0 * 1024.0),
             (double)down_expert_bytes / (1024.0 * 1024.0),
-            g_expert_pool_layer_start,
-            g_expert_pool_layer_end,
             ds4_gpu_expert_pool_served_layers(),
             ds4_gpu_expert_pool_requested_layers(),
             ds4_gpu_expert_pool_min_layer_slots(),
-            g_expert_pool_lookahead,
             g_expert_pool_prefetch_top,
             g_expert_pool_prefetch_qcap,
-            g_expert_pool_prefetch_self ? "on" : "off",
-            g_expert_pool_prefetch_adjacent ? "on" : "off",
-            g_expert_pool_admit_after,
             g_expert_pool_pinned_total,
-            g_expert_pool_static_pinned_total,
-            g_expert_pool_dynamic_pinned_total,
-            g_expert_pool_auto_pin_top,
-            g_expert_pool_auto_pin_min_req,
-            g_expert_pool_pin_reserve,
-            g_expert_pool_hotlist_top,
-            g_expert_pool_hotlist_interval,
-            g_expert_pool_hit_only ? "on" : "off",
-            g_expert_pool_wait_inflight ? "on" : "off",
-            g_expert_pool_foreground_fill ? "on" : "off",
-            g_expert_pool_warm_batch ? "on" : "off",
-            g_expert_pool_prefetch_evict ? "on" : "off",
-            g_expert_pool_hotlock_enabled ? " +hotlock" : "");
+            g_expert_pool_auto_pin_top);
     return 1;
 }

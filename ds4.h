@@ -81,6 +81,8 @@ typedef struct {
     int coordinator_port;
     uint32_t prefill_chunk;
     uint32_t prefill_window;
+    /* --dist-prefill-cap: 分布式会话 prefill 批上限(0=自动), 压宽批的专家工作集。 */
+    uint32_t prefill_cap;
     uint32_t activation_bits;
     bool replay_check;
     bool debug;
@@ -93,6 +95,12 @@ typedef struct {
      * existing role/listen/coordinator host:port fields select who listens. */
     bool tp_enabled;
     uint32_t tp_layers;
+    /* --reverse-connect: flip who dials whom (coordinator dials a listening
+     * worker; TP 模式同义)。Works around a host where one connect direction
+     * fails (observed: macOS Local Network privacy refusing in-process connect
+     * over the thunderbolt bridge -> EHOSTUNREACH while nc succeeds). The
+     * address flags swap accordingly (see dist_cli validation). */
+    bool reverse_connect;
 } ds4_distributed_options;
 
 typedef struct {
@@ -104,16 +112,22 @@ typedef struct {
     /* Optional 1-bit residual sidecar GGUF (blk.{L}.ffn_*_exps_res, go1b). When set,
      * the routed-MoE sums a second 1-bit layer into each expert. Absent => single 1-bit. */
     const char *residual_path;
-    /* Optional go-onebit DQZ2 runtime sidecar (--zchain FILE, or DS4_ZCHAIN env):
+    /* Optional go-onebit DQZ2 runtime sidecar (--zchain FILE):
      * the quantizer's per-layer multiplicative correction chain -- GE per-expert
      * gains folded into the router weights + a per-token scale λ(x) on the routed
-     * MoE contribution. Absent => raw 1-bit+signref base, exactly today's path. */
+     * MoE contribution. Absent => embedded blk.L.opt_* auto-load, else bare base. */
     const char *zchain_path;
-    /* Optional Go-domain n-gram trie (--go-trie FILE, or DS4_GO_TRIE env): a
-     * corpus-statistics drafter that feeds the existing single-machine copy-spec
-     * verify pipeline with boilerplate continuations the transcript has not seen
-     * yet. Greedy-lossless (target argmax gates every token). NULL + no env =>
-     * exactly today's n-gram-only path. */
+    /* --vq-dir: VQ 码本目录侧车(优先于 residual_path; 都缺则用 GGUF 内嵌 blob)。 */
+    const char *vq_dir_path;
+    /* --draft-gguf: 独立 DSpark drafter GGUF(仅 mtp.* 张量); 主模型自带 mtp.* 时优先。 */
+    const char *draft_gguf_path;
+    /* --draft-zchain: drafter 反修放大器侧车, 3 层链合并进主链槽 43..45。 */
+    const char *draft_zchain_path;
+    /* --mm-image-cmd: 多模态外部图像编码器命令(缺省探 ./mm-ui)。 */
+    const char *mm_image_cmd;
+    /* --spec: DSpark 投机解码 + 在线调度仲裁(投机/纯解码谁快用谁)。贪心 verify
+     * 逐位对照 ⇒ token 序列与纯解码逐字一致, 只换速度不换输出。默认关。 */
+    bool spec;
     ds4_backend backend;
     int n_threads;
     const char *directional_steering_file;
@@ -173,7 +187,7 @@ int ds4_engine_set_power(ds4_engine *e, int power_percent);
 int ds4_engine_corr_switch(ds4_engine *e, const char *path);
 /* Multimodal registry (ds4_multimodal.c): "text" built in; the "image"
  * family auto-binds the frontend-domain UI-sketch encoder at open when
- * present (DS4_MM_IMAGE_CMD env > ./mm-ui, built by `make mm-ui`). Server
+ * present (--mm-image-cmd > ./mm-ui, built by `make mm-ui`). Server
  * /v1/messages image content blocks consume the registry's TEXT form so
  * rendered prompts / disk-KV prefix keys / exact replay stay byte-stable.
  * NULL before open or on OOM (consumers must fail closed, not fake). */
@@ -190,8 +204,6 @@ struct ds4_mm *ds4_engine_mm(ds4_engine *e);
  *   COPY_EMISSION - copy-constrained value emission (server primer values):
  *                   raw logits; the copy contract REQUIRES verbatim context
  *                   reuse, which the anticycle self-copy ban would forbid.
- *                   Value-region repetition control belongs to the local
- *                   DS4_PRIMER_VALUE_FREQ window, not the global penalty.
  * Anticycle bans scan only [generation start, end). Mark the boundary with
  * ds4_session_mark_generation_start (pins at the current checkpoint length;
  * call after prefill, before the first sampled token of a response) or set it
@@ -210,8 +222,7 @@ int  ds4_session_lane(const ds4_session *s);
 void ds4_session_mark_generation_start(ds4_session *s);
 void ds4_session_set_generation_start(ds4_session *s, int pos);
 /* Per-request penalties (OpenAI frequency_penalty / presence_penalty semantics,
- * counted over the generated region only), applied on top of the env-armed
- * freq penalty, FREE lane only. Sessions are reused across requests: call on
+ * counted over the generated region only), FREE lane only. Sessions are reused across requests: call on
  * EVERY request; (0,0) = none/clear. */
 void ds4_session_set_request_penalties(ds4_session *s, float freq, float presence);
 /* Whether greedy speculative acceptance (copy-spec / MTP argmax gating) is
@@ -430,7 +441,7 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
                                    uint32_t layer_start, uint32_t layer_end,
                                    char *err, size_t errlen);
 
-/* Live Mach phys_footprint (bytes) and the configured DS4_MEM_BUDGET_MB budget
+/* Live Mach phys_footprint (bytes) and the configured --mem-budget-mb budget
  * (bytes, 0 if unset).  Exposed for backends that size caches dynamically
  * against the headroom rather than a fixed cap. */
 uint64_t ds4_runtime_phys_footprint_bytes(void);
@@ -443,12 +454,28 @@ uint64_t ds4_runtime_mem_budget_bytes(void);
  * (本项目已因此废掉一整轮反修)。改成命令行参数: 发车命令里一眼可见, 进程内全局存取。 */
 void        ds4_tool_set_cap_dir(const char *p);
 const char *ds4_tool_cap_dir(void);
+void        ds4_tool_set_cap_layers(const char *p);   /* --cap-layers "lo-hi" */
+const char *ds4_tool_cap_layers(void);
 void        ds4_tool_set_eval_ids(const char *p);
 const char *ds4_tool_eval_ids(void);
 void        ds4_tool_set_eval_hdump(const char *p);
 const char *ds4_tool_eval_hdump(void);
 void        ds4_tool_set_eval_logits(const char *p);
 void        ds4_tool_set_eval_no_bos(int v);
+int         ds4_tool_eval_no_bos(void);
 const char *ds4_tool_eval_logits(void);
+/* --amp-anchor FILE [--amp-anchor-route]: 捕获回放钉锚(判决仪器)。 */
+void        ds4_tool_set_amp_anchor(const char *p, int route_on);
+const char *ds4_tool_amp_anchor(void);
+int         ds4_tool_amp_anchor_route(void);
+/* --multi-bench N: N 会话并发批基准仪器(跑完 exit)。 */
+void        ds4_tool_set_multi_bench(int n);
+int         ds4_tool_multi_bench(void);
+/* --prefill-chunk N: prefill 分块 token 上限(0=整段一批; 不设=按后端默认)。 */
+void        ds4_tool_set_prefill_chunk(int chunk);
+int         ds4_tool_prefill_chunk(void);
+/* --mem-budget-mb N: 进程内存红线; 看门狗 90% abort + L1 装载闸 85% 拒载。
+ * 不设 = 护栏不武装(危险, 加载大模型的脚本必须传)。 */
+void        ds4_set_mem_budget_mb(int mb);
 
 #endif

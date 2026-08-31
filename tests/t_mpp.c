@@ -246,7 +246,7 @@ static bool test_mpp_capture(ds4_engine *engine, const test_mpp_eq_case *tc,
 }
 
 static bool test_mpp_eq_case_selected(const char *id) {
-    const char *filter = getenv("DS4_TEST_MPP_EQ_CASE");
+    const char *filter = g_test_mpp_case;
     if (!filter || !filter[0]) return true;
 
     char buf[256];
@@ -259,7 +259,7 @@ static bool test_mpp_eq_case_selected(const char *id) {
 }
 
 static int test_load_mpp_cases(ds4_engine *engine, test_mpp_eq_case *cases, int cap) {
-    const char *path = getenv("DS4_TEST_VECTOR_FILE");
+    const char *path = g_test_vector_file;
     if (!path || !path[0]) path = "tests/test-vectors/official.vec";
     FILE *fp = fopen(path, "rb");
     TEST_ASSERT(fp != NULL);
@@ -380,11 +380,10 @@ void test_metal_mpp_equivalence(void) {
     test_mpp_eq_case cases[TEST_MPP_EQ_MAX_CASES];
     memset(cases, 0, sizeof(cases));
 
-    char *saved_disable_metal4 = test_save_env("DS4_METAL_DISABLE_METAL4");
-    setenv("DS4_METAL_DISABLE_METAL4", "1", 1);
+    ds4_gpu_set_metal4_enabled(0);   /* 参考 logits 必须走 legacy kernel 路 */
     ds4_engine *ref_engine = test_open_engine(false);
     if (!ref_engine) {
-        test_restore_env("DS4_METAL_DISABLE_METAL4", saved_disable_metal4);
+        ds4_gpu_set_metal4_enabled(1);
         return;
     }
 
@@ -401,7 +400,7 @@ void test_metal_mpp_equivalence(void) {
                                      &tc->ref_gen_len));
     }
     ds4_engine_close(ref_engine);
-    test_restore_env("DS4_METAL_DISABLE_METAL4", saved_disable_metal4);
+    ds4_gpu_set_metal4_enabled(1);
 
     test_run_mpp_candidate("auto", cases, ncase);
 

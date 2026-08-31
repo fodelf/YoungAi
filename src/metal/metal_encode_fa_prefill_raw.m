@@ -65,32 +65,8 @@ static int ds4_gpu_encode_flash_attention_prefill_raw_heads_nonvec(
         return 0;
     }
 
-    const bool flash_stage_profile =
-        getenv("DS4_METAL_FLASH_ATTN_STAGE_PROFILE") != NULL && g_batch_cb != nil;
-    double flash_stage_t0 = 0.0;
-    if (flash_stage_profile) {
-        if (ds4_gpu_end_commands() == 0 || ds4_gpu_begin_commands() == 0) {
-            return 0;
-        }
-        int profile_owned = 0;
-        cb = ds4_gpu_command_buffer(&profile_owned);
-        if (!cb || profile_owned) return 0;
-        *cbp = cb;
-        flash_stage_t0 = ds4_gpu_now_ms();
-    }
-#define DS4_METAL_PROFILE_FLASH_ATTN_STAGE(name) do { \
-        if (flash_stage_profile) { \
-            if (!ds4_gpu_flash_attn_stage_profile_boundary(cbp, \
-                    "raw_nonvec", (name), n_tokens, 0, n_tokens, \
-                    n_head, head_dim, window, 0, &flash_stage_t0)) { \
-                return 0; \
-            } \
-            cb = *cbp; \
-        } \
-    } while (0)
 
     ds4_gpu_fill_raw_prefill_mask((uint16_t *)[mask_buffer contents], n_tokens, window);
-    DS4_METAL_PROFILE_FLASH_ATTN_STAGE("mask_fill");
 
     id<MTLComputePipelineState> pad_pipeline = nil;
     if (has_kvpad) {
@@ -115,7 +91,6 @@ static int ds4_gpu_encode_flash_attention_prefill_raw_heads_nonvec(
                                          n_tokens * head_dim)) {
         return 0;
     }
-    DS4_METAL_PROFILE_FLASH_ATTN_STAGE("copy_raw");
 
     if (has_kvpad) {
         ds4_gpu_flash_attn_pad_args pad_args = {
@@ -146,7 +121,6 @@ static int ds4_gpu_encode_flash_attention_prefill_raw_heads_nonvec(
         [enc dispatchThreadgroups:MTLSizeMake(ncpsg, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
-        DS4_METAL_PROFILE_FLASH_ATTN_STAGE("pad");
     }
 
     ds4_gpu_flash_attn_blk_args blk_args = {
@@ -168,7 +142,6 @@ static int ds4_gpu_encode_flash_attention_prefill_raw_heads_nonvec(
     [enc dispatchThreadgroups:MTLSizeMake(nblk0, nblk1, 1)
          threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
-    DS4_METAL_PROFILE_FLASH_ATTN_STAGE("block_map");
 
     ds4_gpu_flash_attn_vec_args args = {
         .ne01 = (int32_t)n_tokens,
@@ -225,9 +198,7 @@ static int ds4_gpu_encode_flash_attention_prefill_raw_heads_nonvec(
     [enc dispatchThreadgroups:MTLSizeMake(nblk1, n_head, 1)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
-    DS4_METAL_PROFILE_FLASH_ATTN_STAGE("attention");
 
-#undef DS4_METAL_PROFILE_FLASH_ATTN_STAGE
     return 1;
 }
 
@@ -247,7 +218,7 @@ int ds4_gpu_encode_flash_attention_prefill_raw_heads(
     if (head_dim != 512 || n_head == 0 || n_tokens == 0) {
         return 0;
     }
-    if (n_tokens >= 20) {
+    if (n_tokens >= DS4_METAL_FA_LONG_MIN_TOKENS) {
         return ds4_gpu_encode_flash_attention_prefill_raw_heads_nonvec(cbp,
                                                                          heads,
                                                                          sinks_buf,
@@ -305,32 +276,8 @@ int ds4_gpu_encode_flash_attention_prefill_raw_heads(
         return 0;
     }
 
-    const bool flash_stage_profile =
-        getenv("DS4_METAL_FLASH_ATTN_STAGE_PROFILE") != NULL && g_batch_cb != nil;
-    double flash_stage_t0 = 0.0;
-    if (flash_stage_profile) {
-        if (ds4_gpu_end_commands() == 0 || ds4_gpu_begin_commands() == 0) {
-            return 0;
-        }
-        int profile_owned = 0;
-        cb = ds4_gpu_command_buffer(&profile_owned);
-        if (!cb || profile_owned) return 0;
-        *cbp = cb;
-        flash_stage_t0 = ds4_gpu_now_ms();
-    }
-#define DS4_METAL_PROFILE_FLASH_ATTN_STAGE(name) do { \
-        if (flash_stage_profile) { \
-            if (!ds4_gpu_flash_attn_stage_profile_boundary(cbp, \
-                    "raw_vec", (name), n_tokens, 0, n_tokens, \
-                    n_head, head_dim, window, 0, &flash_stage_t0)) { \
-                return 0; \
-            } \
-            cb = *cbp; \
-        } \
-    } while (0)
 
     ds4_gpu_fill_raw_prefill_mask((uint16_t *)[mask_buffer contents], n_tokens, window);
-    DS4_METAL_PROFILE_FLASH_ATTN_STAGE("mask_fill");
 
     id<MTLComputePipelineState> pad_pipeline = nil;
     if ((n_tokens % ncpsg) != 0) {
@@ -356,7 +303,6 @@ int ds4_gpu_encode_flash_attention_prefill_raw_heads(
                                          n_tokens * head_dim)) {
         return 0;
     }
-    DS4_METAL_PROFILE_FLASH_ATTN_STAGE("copy_raw");
 
     if ((n_tokens % ncpsg) != 0) {
         ds4_gpu_flash_attn_pad_args pad_args = {
@@ -387,7 +333,6 @@ int ds4_gpu_encode_flash_attention_prefill_raw_heads(
         [enc dispatchThreadgroups:MTLSizeMake(ncpsg, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
-        DS4_METAL_PROFILE_FLASH_ATTN_STAGE("pad");
     }
 
     ds4_gpu_flash_attn_vec_args vec_args = {
@@ -444,7 +389,6 @@ int ds4_gpu_encode_flash_attention_prefill_raw_heads(
     [enc dispatchThreadgroups:MTLSizeMake(n_tokens, n_head, nwg)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
-    DS4_METAL_PROFILE_FLASH_ATTN_STAGE("attention_vec");
 
     ds4_gpu_flash_attn_reduce_args reduce_args = {
         .nrows = (int32_t)nrows,
@@ -457,8 +401,6 @@ int ds4_gpu_encode_flash_attention_prefill_raw_heads(
     [enc dispatchThreadgroups:MTLSizeMake(nrows, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(32u * nwg, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
-    DS4_METAL_PROFILE_FLASH_ATTN_STAGE("attention_reduce");
 
-#undef DS4_METAL_PROFILE_FLASH_ATTN_STAGE
     return 1;
 }

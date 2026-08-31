@@ -125,16 +125,9 @@ static int accelerator_tensor_span_cmp(const void *a, const void *b) {
 }
 
 static uint64_t accelerator_cuda_preload_span_bytes(void) {
-    uint64_t mb = 1024;
-    const char *env = getenv("DS4_CUDA_WEIGHT_PRELOAD_SPAN_MB");
-    if (env && env[0]) {
-        char *end = NULL;
-        unsigned long long v = strtoull(env, &end, 10);
-        if (end != env && v > 0) mb = (uint64_t)v;
-    }
-    if (mb < 64) mb = 64;
-    if (mb > 4096) mb = 4096;
-    return mb * 1048576ull;
+    /* 1 GiB/段: 单段 cudaMalloc 足够大到吃满预载带宽, 又不至于让 arena
+     * 一次性要走巨块(超大张量自成整段, 见下方分组逻辑)。 */
+    return 1024ull * 1048576ull;
 }
 
 static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *cached_out) {
@@ -156,26 +149,21 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
         }
         /* Routed-expert weights are the only tensors with "_exps." in the
          * name; memmem is safe on short names (returns NULL).
-         * ★DS4_CACHE_EXPERTS=1 收编专家★: 上面"缓存冷专家浪费预算"的前提是显存
-         * 远小于模型(独显 24-80GB vs 89GB)。统一内存机器(GB10 121GiB)整模型装得下,
-         * 此时跳过反而让每次专家读都跨 C2C 去 host 内存 —— 实测 GPU 利用率被按在 6%,
-         * CPU 同时也闲着。开启需同时抬高 DS4_CUDA_WEIGHT_CACHE_LIMIT_GB(默认 24)。 */
+         * ★收编专家★: 上面"缓存冷专家浪费预算"的前提是显存远小于模型
+         * (独显 24-80GB vs 89GB)。统一内存机器(GB10 121GiB)整模型装得下,
+         * 此时跳过反而让每次专家读都跨 C2C 去 host 内存 —— 实测 GPU 利用率
+         * 被按在 6%, CPU 同时也闲着。 */
         static int cache_exps = -1;
         if (cache_exps < 0) {
-            const char *ce = getenv("DS4_CACHE_EXPERTS");
-            if (ce && ce[0]) {
-                cache_exps = (ce[0] == '1') ? 1 : 0;
-            } else {
 #ifdef DS4_CUDA_SPARK_HBM_CACHE
-                /* GB10 默认收编专家(实测 decode 26.8→28.7): 内存账=模型+20GiB 余量
-                 * 装得下才开, 装不下回退老策略(只缓 backbone) */
-                const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
-                const uint64_t total = (uint64_t)sysconf(_SC_PHYS_PAGES) * page;
-                cache_exps = (m->size + 20ull * 1073741824ull <= total) ? 1 : 0;
+            /* GB10 默认收编专家(实测 decode 26.8→28.7): 内存账=模型+20GiB 余量
+             * 装得下才开, 装不下回退老策略(只缓 backbone) */
+            const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
+            const uint64_t total = (uint64_t)sysconf(_SC_PHYS_PAGES) * page;
+            cache_exps = (m->size + 20ull * 1073741824ull <= total) ? 1 : 0;
 #else
-                cache_exps = 0;
+            cache_exps = 0;
 #endif
-            }
         }
         if (!cache_exps && memmem(t->name.ptr, t->name.len, "_exps.", 6) != NULL) {
             continue;
@@ -237,9 +225,6 @@ bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m) {
     if (backend == DS4_BACKEND_CUDA && g_prefill_chunk_cuda == 0) g_prefill_chunk_cuda = 256;
     if (backend != DS4_BACKEND_CUDA) return true;
     if (!m || !m->map || m->size == 0) return false;
-    if (getenv("DS4_CUDA_DIRECT_MODEL") != NULL) {
-        return true;
-    }
 
 #ifdef DS4_CUDA_SPARK_HBM_CACHE
     const double t0 = now_sec();
@@ -248,22 +233,6 @@ bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m) {
 #else
     uint64_t cached = 0;
 #endif
-    if (getenv("DS4_CUDA_Q8_F16_PRELOAD") != NULL ||
-        getenv("DS4_CUDA_Q8_F32_PRELOAD") != NULL) {
-        for (uint64_t i = 0; i < m->n_tensors; i++) {
-            const ds4_tensor *t = &m->tensors[i];
-            if (t->bytes == 0) continue;
-            if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) return false;
-            char label[128];
-            snprintf(label, sizeof(label), "tensor:%.*s", (int)t->name.len, t->name.ptr);
-            if (t->type == DS4_TENSOR_Q8_0 && t->ndim == 2 &&
-                ds4_gpu_cache_q8_f16_range(m->map, m->size, t->abs_offset, t->bytes, t->dim[0], t->dim[1], label) == 0) {
-                fprintf(stderr, "ds4: accelerator failed to cache dequantized Q8 tensor %.*s\n",
-                        (int)t->name.len, t->name.ptr);
-                return false;
-            }
-        }
-    }
 #ifdef DS4_CUDA_SPARK_HBM_CACHE
     {   /* q8 repack 预建(decode gemv 快路): 必须先于 token graph capture */
         uint64_t q8r_bytes = 0;

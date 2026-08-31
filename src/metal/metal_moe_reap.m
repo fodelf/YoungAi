@@ -27,114 +27,6 @@ typedef struct {
     uint64_t dst_token_stride;
 } ds4_gpu_dsv4_moe_sum6_args;
 
-typedef struct { uint32_t tokens, width, n_used, layer; uint64_t src_token_stride; } ds4_gpu_reap_args;
-
-static int           g_reap_enabled = -1;
-
-static id<MTLBuffer> g_reap_saliency_buf;
-
-/* [DS4_REAP_MAX_LAYERS*256] uint32 fixed-point */
-static id<MTLBuffer> g_reap_counts_buf;
-
-/* [DS4_REAP_MAX_LAYERS*256] uint32 */
-static id<MTLComputePipelineState> g_reap_accum_pipeline;
-
-/* stashed at router-select, consumed at the immediately-following sum6 (same layer,
- * in-order cb execution makes the per-layer pairing exact even with a reused buffer) */
-id<MTLBuffer> g_reap_sel_buf;
-
-NSUInteger    g_reap_sel_off;
-
-uint32_t      g_reap_layer;
-
-uint32_t      g_reap_n_used;
-
-static void ds4_gpu_reap_dump(void) {
-    if (g_reap_enabled != 1 || !g_reap_saliency_buf || !g_reap_counts_buf) return;
-    const uint32_t *sal = (const uint32_t *)g_reap_saliency_buf.contents;
-    const uint32_t *cnt = (const uint32_t *)g_reap_counts_buf.contents;
-    /* Write to a BUFFERED file, not unbuffered stderr: a SIGTERM'd worker has only a
-     * brief window before the harness escalates to SIGKILL, and ~5k line-buffered
-     * stderr syscalls lose the race.  layer = per-machine first-seen slot (coord slot s
-     * == global layer s; worker slot s == global layer 20+s -- remap when merging). */
-    const char *path = getenv("DS4_REAP_DUMP_FILE");
-    FILE *f = fopen(path && *path ? path : "/tmp/reap_saliency.txt", "w");
-    if (!f) { fprintf(stderr, "ds4: REAP dump fopen failed\n"); return; }
-    for (uint32_t L = 0; L < DS4_REAP_MAX_LAYERS; L++) {
-        uint32_t used = 0;
-        for (uint32_t e = 0; e < 256u; e++) if (cnt[L * 256u + e]) used++;
-        if (!used) continue;
-        bool printed[256] = { false };
-        for (uint32_t r = 0; r < 256u; r++) {
-            int best = -1; double bestS = -1.0;
-            for (uint32_t e = 0; e < 256u; e++) {
-                if (printed[e] || !cnt[L * 256u + e]) continue;
-                const double S = (double)sal[L * 256u + e] / (256.0 * (double)cnt[L * 256u + e]);
-                if (S > bestS) { bestS = S; best = (int)e; }
-            }
-            if (best < 0) break;
-            printed[best] = true;
-            fprintf(f, "reap-saliency L%02u E%03d S=%.5f count=%u\n",
-                    L, best, bestS, cnt[L * 256u + (uint32_t)best]);
-        }
-    }
-    fclose(f);
-    fprintf(stderr, "ds4: REAP saliency written to %s\n", path && *path ? path : "/tmp/reap_saliency.txt");
-}
-
-/* A layer-sliced worker is shut down with SIGTERM (no atexit), so its 20-42 saliency
- * would never dump.  When REAP is collecting, route SIGTERM through exit() so the
- * atexit(reap_dump) fires -- by then its last forward's cb has completed and the
- * Shared accumulator buffers are populated. */
-static void ds4_gpu_reap_sigterm(int sig) { (void)sig; exit(0); }
-
-int ds4_gpu_reap_enabled(void) {
-    if (g_reap_enabled < 0) {
-        g_reap_enabled = ds4_gpu_env_bool("DS4_REAP_COLLECT") > 0 ? 1 : 0;
-        if (g_reap_enabled == 1) {
-            const size_t n = (size_t)DS4_REAP_MAX_LAYERS * 256u * sizeof(uint32_t);
-            g_reap_saliency_buf = [g_device newBufferWithLength:n options:MTLResourceStorageModeShared];
-            g_reap_counts_buf   = [g_device newBufferWithLength:n options:MTLResourceStorageModeShared];
-            g_reap_accum_pipeline = ds4_gpu_get_pipeline("kernel_dsv4_reap_accum");
-            if (!g_reap_saliency_buf || !g_reap_counts_buf || !g_reap_accum_pipeline) {
-                fprintf(stderr, "ds4: REAP collect init failed\n");
-                g_reap_enabled = 0;
-            } else {
-                memset(g_reap_saliency_buf.contents, 0, n);
-                memset(g_reap_counts_buf.contents, 0, n);
-                atexit(ds4_gpu_reap_dump);
-                signal(SIGTERM, ds4_gpu_reap_sigterm);
-                fprintf(stderr, "ds4: REAP saliency collection enabled (DS4_REAP_COLLECT=1)\n");
-            }
-        }
-    }
-    return g_reap_enabled;
-}
-
-/* Dispatch reap_accum over the sum6 input (the per-expert gated outputs). */
-static void ds4_gpu_reap_dispatch(id<MTLCommandBuffer> cb, id<MTLBuffer> experts,
-                                  NSUInteger experts_off, uint32_t width, uint32_t n_tokens) {
-    if (ds4_gpu_reap_enabled() != 1 || !cb || !experts || !g_reap_sel_buf ||
-        !g_reap_accum_pipeline || width == 0 || n_tokens == 0) return;
-    const uint32_t n_used = g_reap_n_used ? g_reap_n_used : 6u;
-    ds4_gpu_reap_args args = { .tokens = n_tokens, .width = width, .n_used = n_used,
-                               .layer = g_reap_layer,
-                               .src_token_stride = (uint64_t)n_used * width * sizeof(float) };
-    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-    [enc setComputePipelineState:g_reap_accum_pipeline];
-    [enc setBytes:&args length:sizeof(args) atIndex:0];
-    [enc setBuffer:experts offset:experts_off atIndex:1];
-    [enc setBuffer:g_reap_sel_buf offset:g_reap_sel_off atIndex:2];
-    [enc setBuffer:g_reap_saliency_buf offset:0 atIndex:3];
-    [enc setBuffer:g_reap_counts_buf offset:0 atIndex:4];
-    const NSUInteger total = (NSUInteger)n_tokens * n_used;
-    NSUInteger tg = g_reap_accum_pipeline.maxTotalThreadsPerThreadgroup;
-    if (tg > 256u) tg = 256u; if (tg == 0u) tg = 1u;
-    const NSUInteger groups = (total + tg - 1u) / tg;
-    [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-    ds4_gpu_end_compute_encoder(cb, enc);
-}
-
 static int ds4_gpu_encode_moe_sum6(
         id<MTLCommandBuffer> cb,
         id<MTLBuffer>        experts,
@@ -168,9 +60,6 @@ static int ds4_gpu_encode_moe_sum6(
     [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
-    /* REAP: ||gated expert output||_2 per (token,slot) -> saliency, keyed by the
-     * router selection stashed at this layer's router-select (no-op unless enabled). */
-    ds4_gpu_reap_dispatch(cb, experts, experts_off, out_dim, n_tokens);
     return 1;
 }
 
@@ -412,11 +301,3 @@ int ds4_gpu_encode_sum_rows_f32(
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
 }
-
-/* REAP expert keep-mask (Stage 4a quality test): restrict the router to the kept
- * experts (top-K saliency) per layer by reusing the bias path -- pruned experts get
- * bias -inf so they never enter the top-6, and the router renormalizes over the
- * survivors.  No repack / no memory change here -- this checks whether the pruned
- * model holds Go+React quality before committing to a repack.  Keep-set is
- * slot-indexed (machine-local first-seen layer order, matching the saliency dump). */
-bool g_reap_keep[DS4_ROUTER_CACHE_HOT_LAYERS][256];

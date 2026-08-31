@@ -102,11 +102,6 @@ int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, const ds4_
     while (generated < max_tokens && !cli_interrupt_requested()) {
         int token = ds4_session_sample(session, cfg->gen.temperature, 0,
                                        cfg->gen.top_p, cfg->gen.min_p, &rng);
-        if (getenv("DS4_DECODE_DIAG")) {
-            fprintf(stderr,
-                    "ds4: [decode-diag] sample#%d token=%d eos=%d max_tokens=%d\n",
-                    generated, token, ds4_token_eos(engine), max_tokens);
-        }
         if (token == ds4_token_eos(engine)) break;
 
         int toks[513];  /* wave 69: chained spec-pipe, up to 1 + DEPTH(<=7) verify cycles
@@ -117,8 +112,7 @@ int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, const ds4_
         /* Greedy decode always takes the speculative path: the n-gram copy
          * drafter is the natural default (self-gating, lossless), with MTP
          * drafting when a draft model is loaded. */
-        if (cfg->gen.temperature <= 0.0f &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+        if (cfg->gen.temperature <= 0.0f) {
             cli_dist_busy_set(cfg, true);
             ntok = ds4_session_eval_speculative_argmax(session,
                                                        token,

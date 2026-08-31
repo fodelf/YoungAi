@@ -21,92 +21,22 @@ bool metal_graph_capture_prefix1_index_state(ds4_gpu_graph *g, uint32_t il) {
                                  g->layer_index_state_score[il], 0, bytes) != 0;
 }
 
+/* Keep dense attention longer than the legacy 512-row window.
+ * Around the 2K frontier the sparse path's score/top-k setup dominates
+ * the smaller attention scan, while larger contexts benefit from sparse
+ * indexed attention.  This threshold changes only the implementation used
+ * to consume the compressed rows; it must not lower the 512-row indexer
+ * selection defined by DS4_N_INDEXER_TOP_K. */
+#define DS4_METAL_DECODE_INDEXER_SPARSE_THRESHOLD_ROWS 1024u
+
 uint32_t metal_graph_decode_indexer_sparse_threshold(const ds4_gpu_graph *g) {
     (void)g;
-    static int parsed = -1;
-    static uint32_t cached = 0;
-    if (parsed < 0) {
-        parsed = 0;
-        const char *env = getenv("DS4_METAL_DECODE_INDEXER_SPARSE_THRESHOLD");
-        if (env && env[0]) {
-            char *end = NULL;
-            unsigned long v = strtoul(env, &end, 10);
-            while (end && isspace((unsigned char)*end)) end++;
-            if (end != env && end && *end == '\0' &&
-                (v == 64ul || v == 128ul || v == 256ul || v == 512ul ||
-                 v == 1024ul || v == 2048ul || v == 4096ul)) {
-                cached = (uint32_t)v;
-                parsed = 1;
-            } else {
-                fprintf(stderr,
-                        "ds4: invalid DS4_METAL_DECODE_INDEXER_SPARSE_THRESHOLD=%s; "
-                        "expected 64, 128, 256, 512, 1024, 2048, or 4096\n",
-                        env);
-            }
-        }
-    }
-    if (parsed > 0) return cached;
-
-    /* Keep dense attention longer than the legacy 512-row window by default.
-     * Around the 2K frontier the sparse path's score/top-k setup dominates
-     * the smaller attention scan, while larger contexts benefit from sparse
-     * indexed attention.  This threshold changes only the implementation used
-     * to consume the compressed rows; it must not lower the 512-row indexer
-     * selection defined by DS4_N_INDEXER_TOP_K. */
-    return 1024u;
+    return DS4_METAL_DECODE_INDEXER_SPARSE_THRESHOLD_ROWS;
 }
 
 /* =========================================================================
- * Metal Decode Release Helpers and Reference Fallbacks.
- * =========================================================================
- *
- * The normal generation path uses the fused helpers below.  The older unfused
- * kernels remain available as diagnostic reference paths selected only by the
- * DS4_METAL_DISABLE_*_FUSION environment switches.
- */
-
-static bool metal_graph_env_flag(const char *name, int *cache) {
-    if (*cache == -1) {
-        const char *env = getenv(name);
-        *cache = env && env[0] && strcmp(env, "0") != 0;
-    }
-    return *cache != 0;
-}
-
-bool metal_graph_use_reference_hc_decode(void) {
-    static int cache = -1;
-    return metal_graph_env_flag("DS4_METAL_DISABLE_HC_FUSION", &cache);
-}
-
-bool metal_graph_use_reference_kv_decode(void) {
-    static int cache = -1;
-    return metal_graph_env_flag("DS4_METAL_DISABLE_KV_FUSION", &cache);
-}
-
-bool metal_graph_use_reference_qkv_norm(void) {
-    static int cache = -1;
-    return metal_graph_env_flag("DS4_METAL_DISABLE_QKV_NORM_FUSION", &cache);
-}
-
-bool metal_graph_use_reference_compressor_pair_proj(void) {
-    static int cache = -1;
-    return metal_graph_env_flag("DS4_METAL_DISABLE_COMPRESSOR_PAIR_PROJ", &cache);
-}
-
-bool metal_graph_use_reference_hc_norm_decode(void) {
-    static int cache = -1;
-    return metal_graph_env_flag("DS4_METAL_DISABLE_HC_NORM_FUSION", &cache);
-}
-
-bool metal_graph_use_reference_shared_down_hc(void) {
-    static int cache = -1;
-    return metal_graph_env_flag("DS4_METAL_DISABLE_SHARED_DOWN_HC_FUSION", &cache);
-}
-
-bool metal_graph_use_reference_attn_out_hc(void) {
-    static int cache = -1;
-    return metal_graph_env_flag("DS4_METAL_DISABLE_ATTN_OUT_HC_FUSION", &cache);
-}
+ * Metal Decode Release Helpers.
+ * ========================================================================= */
 
 bool metal_graph_decode_hc_pre(
         ds4_gpu_tensor       *out,
@@ -116,23 +46,6 @@ bool metal_graph_decode_hc_pre(
         const ds4_model        *model,
         uint64_t                scale_offset,
         uint64_t                base_offset) {
-    if (metal_graph_use_reference_hc_decode()) {
-        return ds4_gpu_hc_split_sinkhorn_tensor(split,
-                                                  mix,
-                                                  model->map,
-                                                  model->size,
-                                                  scale_offset,
-                                                  base_offset,
-                                                  DS4_N_HC,
-                                                  DS4_N_HC_SINKHORN_ITER,
-                                                  DS4_HC_EPS) != 0 &&
-               ds4_gpu_hc_weighted_sum_tensor(out,
-                                                 residual_hc,
-                                                 split,
-                                                 DS4_N_EMBD,
-                                                 DS4_N_HC) != 0;
-    }
-
     return ds4_gpu_hc_split_weighted_sum_tensor(out,
                                                   split,
                                                   mix,
@@ -152,11 +65,6 @@ bool metal_graph_decode_kv_store(
         ds4_gpu_tensor *raw_cache,
         uint32_t          raw_cap,
         uint32_t          raw_row) {
-    if (metal_graph_use_reference_kv_decode()) {
-        return ds4_gpu_dsv4_fp8_kv_quantize_tensor(kv, 1, DS4_N_HEAD_DIM, DS4_N_ROT) != 0 &&
-               ds4_gpu_store_raw_kv_tensor(raw_cache, kv, raw_cap, raw_row, DS4_N_HEAD_DIM) != 0;
-    }
-
     return ds4_gpu_kv_fp8_store_raw_tensor(kv,
                                              raw_cache,
                                              raw_cap,

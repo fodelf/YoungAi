@@ -36,23 +36,11 @@ bool metal_graph_encode_decode_layer(
     if (ext_factor != 0.0f && freq_scale > 0.0f) {
         attn_factor /= 1.0f + 0.1f * logf(1.0f / freq_scale);
     }
-    const bool qkv_rms_fused = !metal_graph_use_reference_qkv_norm();
-
     bool ok = true;
-    const bool decode_stage_profile = getenv("DS4_METAL_DECODE_STAGE_PROFILE") != NULL;
-    double decode_stage_t0 = decode_stage_profile ? now_sec() : 0.0;
-#define DS4_METAL_PROFILE_DECODE_STAGE(name) do { \
-        if (ok && decode_stage_profile) { \
-            ok = metal_graph_layer_stage_profile_boundary("decode", (name), il, pos, 1, &decode_stage_t0); \
-        } \
-    } while (0)
     if (ok) ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
     if (ok) ok = metal_graph_matmul_plain_tensor(g->hc_mix, model, layer->hc_attn_fn,
                                                  hc_dim, mix_hc, g->flat_hc, 1);
-    const bool fuse_hc_norm =
-        DS4_MODEL_VARIANT == DS4_VARIANT_FLASH &&
-        !metal_graph_use_reference_hc_decode() &&
-        !metal_graph_use_reference_hc_norm_decode();
+    const bool fuse_hc_norm = DS4_MODEL_VARIANT == DS4_VARIANT_FLASH;
     if (ok && fuse_hc_norm) {
         ok = ds4_gpu_hc_split_weighted_sum_norm_tensor(g->attn_cur,
                                                          g->attn_norm,
@@ -78,25 +66,11 @@ bool metal_graph_encode_decode_layer(
                                        layer->hc_attn_scale->abs_offset,
                                        layer->hc_attn_base->abs_offset);
     }
-    DS4_METAL_PROFILE_DECODE_STAGE("attn_hc_pre");
-    if (ok) {
-        metal_graph_debug_dump_tensor("hc_attn_pre_mixes", g->hc_mix, mix_hc, il, pos);
-        metal_graph_debug_dump_tensor("hc_attn_pre_weights", g->hc_pre, DS4_N_HC, il, pos);
-        metal_graph_debug_dump_tensor("hc_attn_pre_post_weights", g->hc_post, DS4_N_HC, il, pos);
-        metal_graph_debug_dump_tensor("hc_attn_pre_comb", g->hc_comb, (uint64_t)DS4_N_HC * DS4_N_HC, il, pos);
-    }
-    if (ok) {
-        metal_graph_debug_dump_tensor("hc_attn_pre", g->attn_cur, DS4_N_EMBD, il, pos);
-    }
     if (ok && !fuse_hc_norm) ok = ds4_gpu_rms_norm_weight_tensor(g->attn_norm, g->attn_cur,
                                                                    model->map, model->size,
                                                                    layer->attn_norm->abs_offset,
                                                                    DS4_N_EMBD, DS4_RMS_EPS) != 0;
-    DS4_METAL_PROFILE_DECODE_STAGE("attn_norm");
-    if (ok) {
-        metal_graph_debug_dump_tensor("attn_norm", g->attn_norm, DS4_N_EMBD, il, pos);
-    }
-    const bool qa_kv_pair = qkv_rms_fused &&
+    const bool qa_kv_pair =
         layer->attn_q_a->type == DS4_TENSOR_Q4_K && layer->attn_kv->type == DS4_TENSOR_Q4_K;
     if (ok && qa_kv_pair) {
         ok = dense_matmul_pair_typed(g->qr, g->kv_raw, model,
@@ -106,88 +80,34 @@ bool metal_graph_encode_decode_layer(
         ok = dense_matmul_typed(g->qr, model, layer->attn_q_a,
                                 DS4_N_EMBD, q_rank, g->attn_norm, 1) != 0;
     }
-    if (ok) {
-        metal_graph_debug_dump_tensor("q_lora", g->qr, q_rank, il, pos);
-    }
-    if (qkv_rms_fused) {
-        if (ok && !qa_kv_pair) ok = dense_matmul_typed(g->kv_raw, model, layer->attn_kv,
-                                          DS4_N_EMBD, DS4_N_HEAD_DIM, g->attn_norm, 1) != 0;
-        if (ok) {
-            metal_graph_debug_dump_tensor("KVraw", g->kv_raw, DS4_N_HEAD_DIM, il, pos);
-        }
-        if (ok) ok = ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(g->qr_norm,
-                                                             g->qr,
-                                                             model->map,
-                                                             model->size,
-                                                             layer->attn_q_a_norm->abs_offset,
-                                                             (uint32_t)q_rank,
-                                                             g->kv,
-                                                             g->kv_raw,
-                                                             layer->attn_kv_a_norm->abs_offset,
-                                                             DS4_N_HEAD_DIM,
-                                                             1,
-                                                             DS4_RMS_EPS) != 0;
-    } else {
-        if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->qr_norm, g->qr,
-                                                      model->map, model->size,
-                                                      layer->attn_q_a_norm->abs_offset,
-                                                      (uint32_t)q_rank, DS4_RMS_EPS) != 0;
-    }
-    if (ok) {
-        metal_graph_debug_dump_tensor("q_lora_norm", g->qr_norm, q_rank, il, pos);
-    }
-    if (qkv_rms_fused && ok) {
-        metal_graph_debug_dump_tensor("KVnorm", g->kv, DS4_N_HEAD_DIM, il, pos);
-    }
+    if (ok && !qa_kv_pair) ok = dense_matmul_typed(g->kv_raw, model, layer->attn_kv,
+                                      DS4_N_EMBD, DS4_N_HEAD_DIM, g->attn_norm, 1) != 0;
+    if (ok) ok = ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(g->qr_norm,
+                                                         g->qr,
+                                                         model->map,
+                                                         model->size,
+                                                         layer->attn_q_a_norm->abs_offset,
+                                                         (uint32_t)q_rank,
+                                                         g->kv,
+                                                         g->kv_raw,
+                                                         layer->attn_kv_a_norm->abs_offset,
+                                                         DS4_N_HEAD_DIM,
+                                                         1,
+                                                         DS4_RMS_EPS) != 0;
     if (ok) ok = dense_matmul_typed(g->q, model, layer->attn_q_b,
                                       q_rank, q_dim, g->qr_norm, 1) != 0;
-    if (ok) {
-        metal_graph_debug_dump_tensor("Qraw", g->q, q_dim, il, pos);
-    }
-    {   /* G1a 融合(2026-08-20 megakernel 施工): q 的 head_rms+rope 一发(CUDA 融合核
-         * 早已在库但零接线; scale 折进旋转=容差级序差)。DS4_FUSE_QROPE=0 回两发。 */
-        static int fq = -1;
-        if (fq < 0) { const char *e = getenv("DS4_FUSE_QROPE"); fq = e ? atoi(e) : 1; }
-        if (fq) {
-            if (ok) ok = ds4_gpu_head_rms_norm_rope_tail_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM,
-                                            DS4_N_ROT, pos,
-                                            compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                                            false, freq_base, freq_scale, ext_factor, attn_factor,
-                                            DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW,
-                                            DS4_RMS_EPS) != 0;
-        } else {
-            if (ok) ok = ds4_gpu_head_rms_norm_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0;
-            if (ok) ok = ds4_gpu_rope_tail_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM,
-                                            DS4_N_ROT, pos,
-                                            compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                                            false, freq_base, freq_scale, ext_factor, attn_factor,
-                                            DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
-        }
-    }
-    DS4_METAL_PROFILE_DECODE_STAGE("q_path");
-    if (ok) {
-        metal_graph_debug_dump_tensor("Qcur", g->q, q_dim, il, pos);
-    }
-    if (!qkv_rms_fused) {
-        if (ok) ok = dense_matmul_typed(g->kv_raw, model, layer->attn_kv,
-                                          DS4_N_EMBD, DS4_N_HEAD_DIM, g->attn_norm, 1) != 0;
-        if (ok) {
-            metal_graph_debug_dump_tensor("KVraw", g->kv_raw, DS4_N_HEAD_DIM, il, pos);
-        }
-        if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->kv, g->kv_raw,
-                                                      model->map, model->size,
-                                                      layer->attn_kv_a_norm->abs_offset,
-                                                      DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0;
-        if (ok) {
-            metal_graph_debug_dump_tensor("KVnorm", g->kv, DS4_N_HEAD_DIM, il, pos);
-        }
-    }
+    /* G1a 融合(2026-08-20 megakernel 施工): q 的 head_rms+rope 一发(CUDA 融合核
+     * 早已在库但零接线; scale 折进旋转=容差级序差)。 */
+    if (ok) ok = ds4_gpu_head_rms_norm_rope_tail_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM,
+                                    DS4_N_ROT, pos,
+                                    compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                                    false, freq_base, freq_scale, ext_factor, attn_factor,
+                                    DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW,
+                                    DS4_RMS_EPS) != 0;
     {   /* G1b 三合一(2026-08-20 megakernel 施工): rope(kv)+fp8+store 一发(CUDA 真核;
          * rope 作用 rot 尾段/fp8 作用 nope 前段不相交, fp8 64线程树逐位照抄)。
-         * DS4_FUSE_KVTAIL=0 或 n_head_kv≠1 走原三发。 */
-        static int fkv = -1;
-        if (fkv < 0) { const char *e = getenv("DS4_FUSE_KVTAIL"); fkv = e ? atoi(e) : 1; }
-        if (fkv && DS4_N_HEAD_KV == 1 && !metal_graph_use_reference_kv_decode()) {
+         * n_head_kv≠1 走原三发。 */
+        if (DS4_N_HEAD_KV == 1) {
             if (ok) ok = ds4_gpu_kv_rope_fp8_store_raw_tensor(g->kv, raw_cache, raw_cap, raw_row,
                                             DS4_N_HEAD_DIM, DS4_N_ROT, pos,
                                             compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
@@ -199,15 +119,8 @@ bool metal_graph_encode_decode_layer(
                                             compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
                                             false, freq_base, freq_scale, ext_factor, attn_factor,
                                             DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
-            if (ok) {
-                metal_graph_debug_dump_tensor("KVrope", g->kv, DS4_N_HEAD_DIM, il, pos);
-            }
             if (ok) ok = metal_graph_decode_kv_store(g->kv, raw_cache, raw_cap, raw_row);
         }
-    }
-    DS4_METAL_PROFILE_DECODE_STAGE("kv_path");
-    if (ok) {
-        metal_graph_debug_dump_tensor("KVcur", g->kv, DS4_N_HEAD_DIM, il, pos);
     }
 
     uint32_t n_comp = 0;
@@ -215,8 +128,6 @@ bool metal_graph_encode_decode_layer(
     ds4_gpu_tensor *comp_cache = NULL;
     ds4_gpu_tensor *comp_selected = NULL;
     uint32_t n_selected = 0;
-    double decode_index_stage_t0 = 0.0;
-    const bool decode_index_stage_profile = getenv("DS4_METAL_INDEXER_STAGE_PROFILE") != NULL;
     if (ok && compressed) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         const uint32_t coff = ratio == 4 ? 2u : 1u;
@@ -242,7 +153,7 @@ bool metal_graph_encode_decode_layer(
          * (n=256)每 run 输出漂移, 关闭后逐字节可复现。侧流机制保留给 shared expert
          * 段(已验证确定且无竞争)。 */
         comp_side = 0; (void)emit;
-        if (ok && !metal_graph_use_reference_compressor_pair_proj()) {
+        if (ok) {
             ok = ds4_gpu_matmul_f16_pair_tensor(g->comp_kv_side,
                                                   g->comp_sc_side,
                                                   model->map,
@@ -295,9 +206,6 @@ bool metal_graph_encode_decode_layer(
                 ok = false;
             } else {
                 ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_row_view, 1, DS4_N_HEAD_DIM, DS4_N_ROT) != 0;
-                if (ok) {
-                    metal_graph_debug_dump_tensor("KVcompress", comp_row_view, DS4_N_HEAD_DIM, il, pos);
-                }
                 ds4_gpu_tensor_free(comp_row_view);
             }
             if (ok) ok = metal_graph_commit_attn_comp_stage(g, il, comp_row, 1);
@@ -321,7 +229,7 @@ bool metal_graph_encode_decode_layer(
                 fprintf(stderr, "ds4: Metal graph indexer compressed KV cache capacity exceeded at layer %u\n", il);
                 ok = false;
             }
-            if (ok && !metal_graph_use_reference_compressor_pair_proj()) {
+            if (ok) {
                 ok = ds4_gpu_matmul_f16_pair_tensor(g->comp_kv_cur,
                                                       g->comp_sc_cur,
                                                       model->map,
@@ -427,14 +335,6 @@ bool metal_graph_encode_decode_layer(
                                                          DS4_N_EMBD, DS4_N_INDEXER_HEAD,
                                                          g->attn_norm, 1) != 0;
                 const float index_scale = 1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
-                if (ok && decode_index_stage_profile) {
-                    ok = metal_graph_indexer_stage_profile_boundary(NULL,
-                                                                    il,
-                                                                    pos,
-                                                                    1,
-                                                                    g->layer_n_index_comp[il],
-                                                                    &decode_index_stage_t0);
-                }
                 if (ok) ok = ds4_gpu_indexer_score_one_tensor(g->indexer_scores,
                                                                 g->indexer_q,
                                                                 g->indexer_weights,
@@ -443,27 +343,11 @@ bool metal_graph_encode_decode_layer(
                                                                 DS4_N_INDEXER_HEAD,
                                                                 DS4_N_INDEXER_HEAD_DIM,
                                                                 index_scale) != 0;
-                if (ok && decode_index_stage_profile) {
-                    ok = metal_graph_indexer_stage_profile_boundary("decode_score",
-                                                                    il,
-                                                                    pos,
-                                                                    1,
-                                                                    g->layer_n_index_comp[il],
-                                                                    &decode_index_stage_t0);
-                }
                 if (ok) ok = ds4_gpu_indexer_topk_tensor(g->comp_selected,
                                                            g->indexer_scores,
                                                            g->layer_n_index_comp[il],
                                                            1,
                                                            DS4_N_INDEXER_TOP_K) != 0;
-                if (ok && decode_index_stage_profile) {
-                    ok = metal_graph_indexer_stage_profile_boundary("decode_topk",
-                                                                    il,
-                                                                    pos,
-                                                                    1,
-                                                                    g->layer_n_index_comp[il],
-                                                                    &decode_index_stage_t0);
-                }
                 /* Decode used to materialize a dense compressed-row mask and
                  * call the generic gathered FlashAttention wrapper below.
                  * That wrapper scans every compressed row and rejects long
@@ -509,7 +393,6 @@ bool metal_graph_encode_decode_layer(
         n_comp = g->layer_n_comp[il];
         comp_cache = g->layer_attn_comp_cache[il];
     }
-    DS4_METAL_PROFILE_DECODE_STAGE("compressor_indexer");
 
     if (ok) {
         const uint32_t raw_start = metal_graph_raw_start_for_span(g, pos, n_raw);
@@ -535,14 +418,6 @@ bool metal_graph_encode_decode_layer(
                     ds4_layer_compress_ratio(il),
                     DS4_N_HEAD,
                     DS4_N_HEAD_DIM) != 0;
-            if (ok && decode_index_stage_profile) {
-                ok = metal_graph_indexer_stage_profile_boundary("decode_attention",
-                                                                il,
-                                                                pos,
-                                                                1,
-                                                                n_comp,
-                                                                &decode_index_stage_t0);
-            }
         } else {
             ok = ds4_gpu_attention_decode_heads_tensor(g->heads,
                                                          model->map, model->size,
@@ -559,10 +434,6 @@ bool metal_graph_encode_decode_layer(
         }
     }
     if (comp_side) { (void)ds4_gpu_side_join(); comp_side = 0; }
-    DS4_METAL_PROFILE_DECODE_STAGE("attention");
-    if (ok) {
-        metal_graph_debug_dump_tensor("kqv_out", g->heads, q_dim, il, pos);
-    }
     if (ok) ok = ds4_gpu_rope_tail_tensor(g->heads,
                                             1, DS4_N_HEAD, DS4_N_HEAD_DIM,
                                             DS4_N_ROT, pos,
@@ -574,12 +445,8 @@ bool metal_graph_encode_decode_layer(
                                             attn_factor,
                                             DS4_ROPE_YARN_BETA_FAST,
                                             DS4_ROPE_YARN_BETA_SLOW) != 0;
-    if (ok) {
-        metal_graph_debug_dump_tensor("kqv_back", g->heads, q_dim, il, pos);
-    }
     const bool fuse_attn_out_hc =
         !metal_graph_directional_steering_attn_enabled(g) &&
-        !metal_graph_use_reference_attn_out_hc() &&
         layer->attn_output_a->type != DS4_TENSOR_Q2_K &&   /* 全q2: 融合家族无 q2 实现, 落批量路 */
         layer->attn_output_b->type != DS4_TENSOR_Q2_K;
     if (ok && fuse_attn_out_hc) {
@@ -650,23 +517,12 @@ bool metal_graph_encode_decode_layer(
                                                              n_groups, DS4_N_EMBD,
                                                              g->heads, 1)) != 0;
     }
-    DS4_METAL_PROFILE_DECODE_STAGE("attn_output");
-    if (ok) {
-        metal_graph_debug_dump_tensor("attn_low", g->attn_low, (uint64_t)n_groups * rank, il, pos);
-    }
-    if (ok) {
-        metal_graph_debug_dump_tensor("attn_out", g->attn_out, DS4_N_EMBD, il, pos);
-    }
     if (ok && metal_graph_directional_steering_attn_enabled(g)) {
         ok = metal_graph_apply_directional_steering_attn(g, g->attn_out, il, 1);
     }
     if (ok && !fuse_attn_out_hc) {
         ok = ds4_gpu_hc_expand_tensor(g->after_attn_hc, g->attn_out, g->cur_hc,
                                         g->hc_post, g->hc_comb, DS4_N_EMBD, DS4_N_HC) != 0;
-    }
-    DS4_METAL_PROFILE_DECODE_STAGE("attn_hc_post");
-    if (ok) {
-        metal_graph_debug_dump_tensor("hc_attn_post", g->after_attn_hc, hc_dim, il, pos);
     }
     if (ok) ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->after_attn_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
     if (ok) ok = metal_graph_matmul_plain_tensor(g->hc_mix, model, layer->hc_ffn_fn,
@@ -696,24 +552,12 @@ bool metal_graph_encode_decode_layer(
                                        layer->hc_ffn_scale->abs_offset,
                                        layer->hc_ffn_base->abs_offset);
     }
-    DS4_METAL_PROFILE_DECODE_STAGE("ffn_hc_pre");
     if (ok) {
-        metal_graph_debug_dump_tensor("hc_ffn_pre_mixes", g->hc_mix, mix_hc, il, pos);
-        metal_graph_debug_dump_tensor("hc_ffn_pre_weights", g->hc_pre, DS4_N_HC, il, pos);
-        metal_graph_debug_dump_tensor("hc_ffn_pre_post_weights", g->hc_post, DS4_N_HC, il, pos);
-        metal_graph_debug_dump_tensor("hc_ffn_pre_comb", g->hc_comb, (uint64_t)DS4_N_HC * DS4_N_HC, il, pos);
-    }
-    if (ok) {
-        metal_graph_debug_dump_tensor("hc_ffn_pre", g->ffn_cur, DS4_N_EMBD, il, pos);
     }
     if (ok && !fuse_hc_norm) ok = ds4_gpu_rms_norm_weight_tensor(g->ffn_norm, g->ffn_cur,
                                                                    model->map, model->size,
                                                                    layer->ffn_norm->abs_offset,
                                                                    DS4_N_EMBD, DS4_RMS_EPS) != 0;
-    DS4_METAL_PROFILE_DECODE_STAGE("ffn_norm");
-    if (ok) {
-        metal_graph_debug_dump_tensor("ffn_norm", g->ffn_norm, DS4_N_EMBD, il, pos);
-    }
     const uint64_t gate_row_bytes = (layer->ffn_gate_exps ? routed_expert_row_bytes(layer->ffn_gate_exps) : 0);
     const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
     const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
@@ -746,12 +590,7 @@ bool metal_graph_encode_decode_layer(
                                                 layer->ffn_exp_probs_b != NULL,
                                                 layer->ffn_gate_tid2eid != NULL,
                                                 g->router_logits, il) != 0;
-    DS4_METAL_PROFILE_DECODE_STAGE("router");
     if (ok) {
-        metal_graph_debug_dump_tensor("ffn_moe_logits", g->router_logits, DS4_N_EXPERT, il, pos);
-        metal_graph_debug_dump_tensor("ffn_moe_probs", g->router_probs, DS4_N_EXPERT, il, pos);
-        metal_graph_debug_dump_i32_tensor("ffn_moe_topk", g->router_selected, DS4_N_EXPERT_USED, il, pos);
-        metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->router_weights, DS4_N_EXPERT_USED, il, pos);
     }
     /* 判决钩: 路由+专家输入钉锚(解算 yq 口径完整还原)。router kernel 仍在队列 →
      * 必须先定格(signal→flush→host_wait, cap_batch_layer 同款)再覆写, 否则 host 写
@@ -791,38 +630,6 @@ bool metal_graph_encode_decode_layer(
         ok = ds4_gpu_translate_expert_ids(g->router_selected, il, DS4_N_EXPERT_USED, 1,
                                           model_expert_kept_count(model, il)) != 0;
     }
-    /* TP Phase 3 (DS4_TP_EXPERT_SPLIT): each peer gathers + computes only its half
-     * of the routed experts (owns_low: slots [0,k); owns_high: [k,n_used)), then the
-     * partial routed_out is all-reduce SUMMED below (no zero-half). The gather
-     * (compact_selected_experts reads n_expert slots from selected_off) thus fetches
-     * only k experts per peer => halves the per-token routed-expert SSD IO, the
-     * dominant cold-decode cost. Views pick the owned slots (contiguous for the
-     * single decode token). Default OFF => full gather + skeleton zero-half. */
-    const char *tp_es_env = getenv("DS4_TP_EXPERT_SPLIT");
-    bool tp_expert_split = false;
-    ds4_gpu_tensor *es_sel = NULL, *es_wt = NULL;
-    uint32_t es_n = DS4_N_EXPERT_USED;
-    if (g->tp && il < g->tp_layers && tp_es_env && tp_es_env[0] && tp_es_env[0] != '0' &&
-        DS4_N_EXPERT_USED >= 2u) {
-        const uint32_t n_used = DS4_N_EXPERT_USED;
-        /* Asymmetric split (DS4_TP_SPLIT_LOW): the coordinator (owns_low, faster M4)
-         * takes k experts, the worker (owns_high, slower M1) takes n_used-k. Tuning k
-         * up balances the per-layer time so the AR's lockstep wait (the dominant cold
-         * TP cost) shrinks. Default n_used/2 (50/50). */
-        uint32_t k = n_used / 2u;
-        const char *sl = getenv("DS4_TP_SPLIT_LOW");
-        if (sl && sl[0]) { unsigned long v = strtoul(sl, NULL, 10); if (v >= 1u && v < n_used) k = (uint32_t)v; }
-        const uint32_t slot_start = g->tp_owns_low ? 0u : k;
-        const uint32_t cnt = g->tp_owns_low ? k : (n_used - k);
-        es_sel = ds4_gpu_tensor_view(g->router_selected,
-                                     (uint64_t)slot_start * sizeof(int32_t),
-                                     (uint64_t)cnt * sizeof(int32_t));
-        es_wt = ds4_gpu_tensor_view(g->router_weights,
-                                    (uint64_t)slot_start * sizeof(float),
-                                    (uint64_t)cnt * sizeof(float));
-        if (es_sel && es_wt) { tp_expert_split = true; es_n = cnt; }
-        else { ds4_gpu_tensor_free(es_sel); ds4_gpu_tensor_free(es_wt); es_sel = es_wt = NULL; }
-    }
     const int moe_side_mark = ok ? ds4_gpu_side_mark() : 0;
     (void)moe_side_mark;
     if (ok && (routed_expert_quant_type(layer) == DS4_TENSOR_GO1B ||
@@ -851,10 +658,10 @@ bool metal_graph_encode_decode_layer(
                                              (uint32_t)expert_in_dim,
                                              (uint32_t)down_in_dim,
                                              (uint32_t)routed_out_dim,
-                                             tp_expert_split ? es_sel : g->router_selected,
-                                             tp_expert_split ? es_wt  : g->router_weights,
+                                             g->router_selected,
+                                             g->router_weights,
                                              model_expert_kept_count(model, il),
-                                             es_n, DS4_SWIGLU_CLAMP_EXP, anc_moe_x,
+                                             DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, anc_moe_x,
                                              il, 1u, 0u, 0u, &go1b_mid_f16) != 0;
     } else if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
                                                  g->routed_gate,
@@ -873,31 +680,11 @@ bool metal_graph_encode_decode_layer(
                                                  (uint32_t)expert_in_dim,
                                                  (uint32_t)down_in_dim,
                                                  (uint32_t)routed_out_dim,
-                                                 tp_expert_split ? es_sel : g->router_selected,
-                                                 tp_expert_split ? es_wt  : g->router_weights,
+                                                 g->router_selected,
+                                                 g->router_weights,
                                                  model_expert_kept_count(model, il),
-                                                 es_n, DS4_SWIGLU_CLAMP_EXP, anc_moe_x,
+                                                 DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, anc_moe_x,
                                                  il) != 0;
-    ds4_gpu_tensor_free(es_sel);   /* NULL-safe; views are cheap wrappers */
-    ds4_gpu_tensor_free(es_wt);
-    DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
-    if (ok) {
-        metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->routed_gate,
-                                      (uint64_t)DS4_N_EXPERT_USED * down_in_dim, il, pos);
-        metal_graph_debug_dump_tensor("ffn_moe_up_clamped", g->routed_up,
-                                      (uint64_t)DS4_N_EXPERT_USED * down_in_dim, il, pos);
-    }
-    if (ok) {
-        metal_graph_debug_dump_tensor("ffn_moe_weighted_swiglu", g->routed_mid,
-                                      (uint64_t)DS4_N_EXPERT_USED * down_in_dim, il, pos);
-    }
-    if (ok) {
-        metal_graph_debug_dump_tensor("ffn_moe_down", g->routed_down,
-                                      (uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD, il, pos);
-    }
-    if (ok) {
-        metal_graph_debug_dump_tensor("ffn_moe_out", g->routed_out, DS4_N_EMBD, il, pos);
-    }
     /* TP Stage 2: recombine routed_out across the two peers. Rather than draining
      * the whole pipeline (waitUntilCompleted), signal a MTLSharedEvent at the end
      * of the batch, flush (commit without a full wait), and host-wait that value
@@ -907,26 +694,17 @@ bool metal_graph_encode_decode_layer(
      * memory before the (now reopened) batch's combine is committed, so no GPU
      * wait-back is needed. Guarded by g->tp ⇒ non-TP path never touches this. */
     if (ok && g->tp && il < g->tp_layers) {
-        /* wave-72 diag (DS4_TP_AR_LOG): the decode TP all-reduce had never run
-         * dual-host before Phase 1 (prefill uses prefill_layer_major, not this
-         * encode_decode_layer path). Per-step logging pins which of the 6 calls
-         * flips ok on first real use. */
-        const bool ar_log = getenv("DS4_TP_AR_LOG") != NULL;
-        const double ar_t0 = ar_log ? now_sec() : 0.0;
         const uint64_t ev = ds4_gpu_tp_signal_after_batch();
         ok = ev != 0;
         if (ok) ok = ds4_gpu_flush_commands() != 0;   /* commit (no full drain), reopen batch */
         if (ok) ok = ds4_gpu_tp_host_wait(ev) != 0;    /* fast wait until routed_moe done */
-        const double ar_t_drain = ar_log ? now_sec() : 0.0;   /* signal+flush+host_wait = GPU drain */
         if (ok) ok = ds4_gpu_tensor_read(g->routed_out, 0, g->tp_vec,
                                          (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
         if (ok) {
-            /* Phase 3: with the expert split, routed_out is already this peer's
-             * partial (weighted sum over its owned slots) -> AR-sum reconstructs
-             * the full routed output. Without it (skeleton), each peer computed the
-             * FULL routed_out, so zero the non-owned n_embd half before the sum to
-             * avoid double-counting (the original element-range placeholder). */
-            if (!tp_expert_split) {
+            /* Each peer computed the FULL routed_out, so zero the non-owned n_embd
+             * half before the sum to avoid double-counting (the element-range
+             * skeleton split). */
+            {
                 const uint32_t half = DS4_N_EMBD / 2;
                 if (g->tp_owns_low) {
                     for (uint32_t i = half; i < DS4_N_EMBD; i++) g->tp_vec[i] = 0.0f;
@@ -938,12 +716,6 @@ bool metal_graph_encode_decode_layer(
         }
         if (ok) ok = ds4_gpu_tensor_write(g->routed_out, 0, g->tp_vec,
                                           (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
-        if (ar_log) {
-            const double ar_t1 = now_sec();
-            fprintf(stderr, "ds4: tp-ar il=%u pos=%u ok=%d drain=%.1fms net=%.1fms total=%.1fms\n",
-                    il, pos, ok, (ar_t_drain - ar_t0) * 1e3,
-                    (ar_t1 - ar_t_drain) * 1e3, (ar_t1 - ar_t0) * 1e3);
-        }
     }
     /* zchain λ(x): scale the (now complete) routed output. After the TP
      * all-reduce so every path sees the full routed sum; before the additive
@@ -979,21 +751,12 @@ bool metal_graph_encode_decode_layer(
      * (the one kernel that performs the routed+delta add) is what will run
      * below — every other consumer keeps the legacy in-place corr. */
     const bool keep_ffn_out = metal_graph_needs_ffn_out(g, il, pos);
-    const char *tp_split_env = getenv("DS4_TP_SHARED_SPLIT");
-    const bool tp_shared_split =
-        g->tp && il < g->tp_layers &&
-        tp_split_env && tp_split_env[0] && tp_split_env[0] != '0' &&
-        (shared_dim % 64u) == 0;   /* half must stay 32-block aligned */
     const bool fuse_shared_down_hc =
-        !tp_shared_split &&
         layer->ffn_down_shexp->type == DS4_TENSOR_Q8_0 &&   /* 融合 down+hc kernel 是 q8 专用;
                                                              * q4_K 落到下方非融合 dense_matmul_typed */
-        !keep_ffn_out && !metal_graph_use_reference_shared_down_hc();
+        !keep_ffn_out;
     bool corr_delta_live = false;
-    /* DS4_CORR_SKIP=1: load the sidecar but skip the decode dispatch — perf
-     * splitter isolating "corr resident" from "corr kernel dispatched". */
-    if (ok && model->corr && il < DS4_MAX_LAYER && model->corr->layer[il].present &&
-        !getenv("DS4_CORR_SKIP")) {
+    if (ok && model->corr && il < DS4_MAX_LAYER && model->corr->layer[il].present) {
         const ds4_corr_layer *cl = &model->corr->layer[il];
         /* For go1b the routed MoE (offload batch-tensor path) REMAPS g->router_selected
          * to compact slots IN PLACE before this point, so the corr must index per-expert
@@ -1005,15 +768,7 @@ bool metal_graph_encode_decode_layer(
         /* φ selector: legacy x = ffn_norm; --feat yhat sidecars read routed_out
          * itself (kernel phase1 consumes φ fully before phase2 writes out). */
         const ds4_gpu_tensor *phi = model->corr->phi_yhat ? g->routed_out : g->ffn_norm;
-        if (getenv("DS4_CORR_MODE_TRACE")) {
-            static int traced;
-            if (traced++ < 4)
-                fprintf(stderr, "ds4: corr-mode il=%u fuse=%d delta_buf=%d supported=%d\n",
-                        il, (int)fuse_shared_down_hc, g->corr_delta != NULL,
-                        ds4_gpu_corr_delta_supported());
-        }
-        if (fuse_shared_down_hc && g->corr_delta && ds4_gpu_corr_delta_supported() &&
-            !getenv("DS4_CORR_INPLACE")) {
+        if (fuse_shared_down_hc && g->corr_delta && ds4_gpu_corr_delta_supported()) {
             /* Store variant: the tiny corr dispatch writing the hot routed_out
              * costs a full pipeline drain per layer (measured ~23ms; φ=ŷ makes
              * it a R/W self-alias). Write the correction to corr_delta and let
@@ -1030,40 +785,11 @@ bool metal_graph_encode_decode_layer(
                                     DS4_N_EMBD, cl->d_l, DS4_N_EXPERT, DS4_N_EXPERT_USED, 1) != 0;
         }
     }
-    /* TP Phase 1 (DS4_TP_SHARED_SPLIT): split the shared-expert dense FFN across
-     * the two peers. gate/up are column-parallel (each peer computes its half of
-     * the shared_dim rows, compacted into mid[0,half)); down is row-parallel
-     * (partial out[n_embd] over the owned input-dim half) then all-reduced. Decode
-     * only (this is the n_tok=1 layer encode; prefill stays replicated/full). Halves
-     * the shared-FFN weight bandwidth per peer. Off => byte-identical to the legacy
-     * path. tp_owns_low owns the low half, matching the routed-MoE skeleton above.
-     * (tp_shared_split itself is hoisted above the corr dispatch: the corr
-     * delta-vs-in-place choice must know which shared-down consumer runs.) */
-    const uint32_t tp_half = shared_dim / 2u;
-    const uint32_t tp_out_start = g->tp_owns_low ? 0u : tp_half;
     const bool fuse_shared_gate_up =
-        !tp_shared_split &&
         !g->quality &&
-        layer->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 &&   /* 融合 kernel 是 q8 专用 */
-        getenv("DS4_METAL_DISABLE_SHARED_GATE_UP_SWIGLU_FUSION") == NULL;
+        layer->ffn_gate_shexp->type == DS4_TENSOR_Q8_0;   /* 融合 kernel 是 q8 专用 */
     int shared_side = 0;   /* 本层 shared 三件套是否发在侧流(与 MoE 并发) */
-    if (ok && tp_shared_split) {
-        /* column-parallel gate/up: owned half rows -> shared_mid[0, tp_half). The
-         * kernel's output row index starts at 0, so shifting the weight offset by
-         * the owned rows writes the owned slice compacted into [0, tp_half). */
-        const uint64_t gate_row_bytes = ((uint64_t)DS4_N_EMBD / 32u) * 34u;
-        ok = ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(g->shared_gate,
-                                                         g->shared_up,
-                                                         g->shared_mid,
-                                                         model->map,
-                                                         model->size,
-                                                         layer->ffn_gate_shexp->abs_offset + (uint64_t)tp_out_start * gate_row_bytes,
-                                                         layer->ffn_up_shexp->abs_offset   + (uint64_t)tp_out_start * gate_row_bytes,
-                                                         DS4_N_EMBD,
-                                                         tp_half,
-                                                         g->ffn_norm,
-                                                         DS4_SWIGLU_CLAMP_EXP) != 0;
-    } else if (ok && fuse_shared_gate_up) {
+    if (ok && fuse_shared_gate_up) {
         ok = ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(g->shared_gate,
                                                          g->shared_up,
                                                          g->shared_mid,
@@ -1091,32 +817,8 @@ bool metal_graph_encode_decode_layer(
             (void)ds4_gpu_side_join();
         }
     }
-    DS4_METAL_PROFILE_DECODE_STAGE("shared_gate_up");
     /* keep_ffn_out / fuse_shared_down_hc are declared above the corr dispatch */
-    if (ok && tp_shared_split) {
-        /* row-parallel down: partial out[n_embd] over the owned in-dim half (x is
-         * the compacted shared_mid[0, tp_half); the weight starts tp_out_start/32
-         * blocks * 34 bytes into each row), then all-reduce to the full down output.
-         * Same MTLSharedEvent fast-wait + host all-reduce as the routed-MoE skeleton:
-         * signal end of batch, flush (no full drain), fast-wait, read partial, sum
-         * across peers, write back. Combine into the residual via the unfused
-         * hc_expand_add_split path below (fuse_shared_down_hc forced false). */
-        ok = ds4_gpu_matmul_q8_0_rowslice_tensor(g->shared_out, model->map, model->size,
-                                                  layer->ffn_down_shexp->abs_offset + ((uint64_t)tp_out_start / 32u) * 34u,
-                                                  shared_dim, tp_half, DS4_N_EMBD,
-                                                  g->shared_mid) != 0;
-        if (ok) {
-            const uint64_t ev = ds4_gpu_tp_signal_after_batch();
-            ok = ev != 0;
-            if (ok) ok = ds4_gpu_flush_commands() != 0;
-            if (ok) ok = ds4_gpu_tp_host_wait(ev) != 0;
-            if (ok) ok = ds4_gpu_tensor_read(g->shared_out, 0, g->tp_vec,
-                                             (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
-            if (ok) ok = ds4_dist_tp_allreduce_f32(g->tp, g->tp_vec, DS4_N_EMBD) == 0;
-            if (ok) ok = ds4_gpu_tensor_write(g->shared_out, 0, g->tp_vec,
-                                              (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
-        }
-    } else if (ok && fuse_shared_down_hc) {
+    if (ok && fuse_shared_down_hc) {
         ok = ds4_gpu_shared_down_hc_expand_q8_0_tensor(g->after_ffn_hc,
                                                          g->shared_out,
                                                          model->map,
@@ -1135,16 +837,9 @@ bool metal_graph_encode_decode_layer(
         ok = dense_matmul_typed(g->shared_out, model, layer->ffn_down_shexp,
                                   shared_dim, DS4_N_EMBD, g->shared_mid, 1) != 0;
     }
-    DS4_METAL_PROFILE_DECODE_STAGE("shared_down");
-    if (ok) {
-        metal_graph_debug_dump_tensor("ffn_shexp", g->shared_out, DS4_N_EMBD, il, pos);
-    }
     if (ok && keep_ffn_out) {
         ok = metal_graph_ensure_ffn_out(g) &&
              ds4_gpu_add_tensor(g->ffn_out, g->shared_out, g->routed_out, DS4_N_EMBD) != 0;
-    }
-    if (ok && keep_ffn_out) {
-        metal_graph_debug_dump_tensor("ffn_out", g->ffn_out, DS4_N_EMBD, il, pos);
     }
     if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
         ok = metal_graph_apply_directional_steering_ffn(g, g->ffn_out, il, 1);
@@ -1166,12 +861,6 @@ bool metal_graph_encode_decode_layer(
                                                   DS4_N_EMBD,
                                                   DS4_N_HC) != 0;
     }
-    DS4_METAL_PROFILE_DECODE_STAGE("ffn_hc_post");
-#undef DS4_METAL_PROFILE_DECODE_STAGE
-    if (ok) {
-        metal_graph_debug_dump_tensor("hc_ffn_post", g->after_ffn_hc, hc_dim, il, pos);
-    }
-    if (ok) trace_hnorm_layer(g, il, pos, hc_dim);
     return ok;
 }
 

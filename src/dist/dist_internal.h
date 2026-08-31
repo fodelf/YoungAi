@@ -218,12 +218,23 @@ int dist_prepare_shard_from_session_payload( ds4_dist_session *d, FILE *src, uin
 int dist_load_remote_shard_from_payload( ds4_dist_session *d, const ds4_dist_route_entry *entry, const int *tokens, uint32_t token_count, uint64_t token_hash, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen);
 
 /* — 定义于 dist_coord_main.c — */
+extern int g_dist_reverse_connect;   /* --reverse-connect (dist_cli.c 置位) */
+
+/* expert-fetch 服务端配置 (--expert-fetch-serve / --expert-fetch-port /
+ * --expert-fetch-dial, dist_cli.c 置位; 定义在 dist_rfetch.c)。 */
+extern int g_efetch_serve;
+extern int g_efetch_port;
+extern const char *g_efetch_dial_host;
+extern int g_efetch_dial_port;
 bool dist_reverse_connect_enabled(void);
+
+/* 所有 dist socket 的收发超时(秒)。60 秒 = 远大于任何一次跨机 forward,
+ * 又能让真死链在一分钟内暴露而不是永久挂住 graph worker。 */
+#define DIST_SOCKET_TIMEOUT_SEC 60
 void *dist_coordinator_reverse_connect_main(void *arg);
 int dist_run_coordinator(ds4_engine *engine, const ds4_dist_options *opt, const ds4_dist_generation_options *gen);
 
 /* — 定义于 dist_worker_loop.c — */
-int dist_worker_read_loop(ds4_dist_worker_state *state, int fd);
 int dist_send_work_result( int fd, uint64_t request_id, uint64_t result_hash, uint32_t status, uint32_t result_kind, uint32_t payload_bits, const ds4_dist_telemetry_fixed *telemetry, uint32_t telemetry_count, const void *payload, uint32_t payload_bytes, const uint32_t *draft_tokens, uint32_t draft_count);
 int dist_send_work_error(int fd, uint64_t request_id, const char *msg);
 int dist_send_snapshot_begin( int fd, const ds4_dist_snapshot_begin_fixed *begin, const int *tokens, const char *msg);

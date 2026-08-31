@@ -187,14 +187,10 @@ id<MTLBuffer> g_expert_keep_lut_buffer;
 
 uint32_t g_expert_keep_lut_layers;
 
-/* B2b verify-mode clamp tally (react-go-execution-plan M-1.2): [n_layer*256]
- * uint32, atomic-incremented by kernel_dsv4_route_translate whenever a routed
- * expert id is clamped to slot 0 (i.e. a cold/dropped expert leaked into the
- * top-k). Persists across teardown like the REAP buffers so its atexit dump
- * still sees the last forward's result. nil until DS4_VERIFY_ROUTE_CLAMP. */
-int           g_route_clamp_verify = -1;
-
-/* -1 uninit, 0 off, 1 on */
+/* Route-translate clamp tally buffer: kernel_dsv4_route_translate requires a
+ * bound buffer at index 3 even though the verify path that tallied into it is
+ * gone (args.verify is now always 0, so the kernel takes its default
+ * skip-the-atomic branch and never writes here). */
 id<MTLBuffer> g_route_clamp_buf;
 
 uint32_t      g_route_clamp_layers;
@@ -218,10 +214,10 @@ id<MTLBuffer> g_moe_id_map_buffer;
 
 id<MTLBuffer> g_attn_out_group_ids_buffer;
 
-/* A3 routed-expert offload scratch.  When DS4_METAL_EXPERT_OFFLOAD=1 the
- * routed MoE kernels read only the active expert slots copied from the GGUF mmap
- * into these compact resident buffers, instead of binding the huge mmap-backed
- * expert tensors to each command buffer. */
+/* A3 routed-expert offload scratch.  With expert offload on (over-budget model
+ * verdict) the routed MoE kernels read only the active expert slots copied from
+ * the GGUF mmap into these compact resident buffers, instead of binding the
+ * huge mmap-backed expert tensors to each command buffer. */
 id<MTLBuffer> g_moe_scratch_gate;
 
 id<MTLBuffer> g_moe_scratch_up;
@@ -280,12 +276,8 @@ uint64_t g_model_map_size;
 
 /* Largest model file size ever mapped this process. The expert-fetch transport
  * reads expert bytes from the BASE GGUF (~81 GiB) and handshakes the peer's
- * served file size against it; but loading the small MTP draft model
- * (~2.14 GiB, 本机 MTP topology) overwrites g_model_map_size with the draft's
- * size, which made the efetch handshake reject every connection ("remote size
- * <base> vs local <draft>") and silently starved the coordinator of the peer's
- * fast SSD. Tracking the max (the base model is always the largest) keeps the
- * efetch size stable regardless of MTP load order. */
+ * served file size against it; a later, smaller auxiliary map must not shrink
+ * the handshake size, so track the max (the base model is always largest). */
 uint64_t g_efetch_model_size;
 
 uint64_t g_model_mapped_offset;
@@ -380,7 +372,13 @@ int g_initialized;
 
 int g_quality_mode;
 
-int g_mpp_invalid_env_reported;
+/* Cross-GPU parity lane: strict IEEE-754 shader math + f32 raw KV + exp2/log2
+ * RoPE, set via ds4_gpu_set_strict_fp before the shader library compiles. */
+int g_strict_fp;
+
+/* Metal 4 tensor API gate (ds4_gpu_set_metal4_enabled): default 1 = auto-probe
+ * per hardware generation; 0 forces the legacy kernels for determinism. */
+int g_metal4_enabled = 1;
 
 static uint64_t ds4_gpu_system_memory_bytes(void) {
     uint64_t bytes = 0;
@@ -406,11 +404,3 @@ uint32_t g_model_view_count;
 
 @implementation DS4MetalTensor
 @end
-
-/* When set, the next contiguous-range model map (ds4_gpu_set_model_map_range)
- * wraps its views WITHOUT adding them to the GPU residency set, so their clean
- * mmap pages stay reclaimable instead of pinning the wired working set.  Used
- * for the MTP draft model on the memory-tight worker (DS4_MTP_NO_RESIDENCY):
- * the draft tensors are read via the no-copy mmap views (fine on Metal) and the
- * hot, every-step ones stay warm in the page cache.  Auto-resets after use. */
-int g_model_view_force_nonresident;

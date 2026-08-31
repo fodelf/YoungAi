@@ -11,7 +11,7 @@
  * Token count = file bytes / (width × elem size); cap_raw2npy.py converts to
  * the cap npy schema. DS4_CAP_LAYERS="lo-hi" filters layers (default all). */
 static int cap_layer_enabled(uint32_t il) {
-    const char *r = getenv("DS4_CAP_LAYERS");
+    const char *r = ds4_tool_cap_layers();
     if (!r || !r[0]) return 1;
     unsigned lo = 0, hi = DS4_MAX_LAYER;
     if (sscanf(r, "%u-%u", &lo, &hi) != 2) return 1;
@@ -49,7 +49,7 @@ static void cap_append_k(const char *dir, const char *name, uint32_t il, int kin
      strcmp(name, "raw_route_w") == 0 ? 2 : strcmp(name, "raw_ffn_out") == 0 ? 4 : 3), buf, bytes)
 
 void cap_batch_layer(ds4_gpu_graph *g, uint32_t il, uint32_t n_tokens) {
-    const char *dir = getenv("DS4_CAP_DIR");
+    const char *dir = ds4_tool_cap_dir();
     if (!dir || !dir[0] || n_tokens == 0 || !cap_layer_enabled(il)) return;
 
     /* ★捕获前 GPU 定格(2026-07-22 根因修复)★: batch_routed_out 由仍在队列里的
@@ -118,7 +118,7 @@ ds4_ampanc_state g_ampanc;
 int ampanc_on(void) {
     if (g_ampanc.state) return g_ampanc.state > 0;
     g_ampanc.state = -1;
-    const char *p = getenv("DS4_AMP_ANCHOR");
+    const char *p = ds4_tool_amp_anchor();
     if (!p || !p[0]) return 0;
     int fd = open(p, O_RDONLY);
     if (fd < 0) { fprintf(stderr, "ds4: AMP_ANCHOR %s: open failed\n", p); return 0; }
@@ -142,7 +142,7 @@ int ampanc_on(void) {
     g_ampanc.ridx = (const int32_t *)q;
     q += (size_t)g_ampanc.nl * g_ampanc.S * g_ampanc.nact * 4u;
     g_ampanc.rw = (const float *)q;
-    g_ampanc.route_on = getenv("DS4_AMP_ANCHOR_ROUTE") != NULL;
+    g_ampanc.route_on = ds4_tool_amp_anchor_route();
     g_ampanc.state = 1;
     fprintf(stderr, "ds4: AMP_ANCHOR armed: S=%u NL=%u x=钉锚 route=%s (判决钩)\n",
             g_ampanc.S, g_ampanc.nl, g_ampanc.route_on ? "钉锚" : "在线");
@@ -154,7 +154,7 @@ int ampanc_on(void) {
  * of a teacher-forced trajectory capture actually flows (the batch hook only
  * sees the 32-token seed prefix). */
 void cap_decode_layer(ds4_gpu_graph *g, uint32_t il) {
-    const char *dir = getenv("DS4_CAP_DIR");
+    const char *dir = ds4_tool_cap_dir();
     if (!dir || !dir[0] || !cap_layer_enabled(il)) return;
 
     const uint32_t d = DS4_N_EMBD, ne = DS4_N_EXPERT, ku = DS4_N_EXPERT_USED;

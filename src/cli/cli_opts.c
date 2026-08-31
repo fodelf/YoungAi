@@ -1,5 +1,8 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
+#ifndef DS4_NO_GPU
+#include "ds4_gpu.h"
+#endif
 #include "linenoise.h"
 
 /* ds4 CLI.
@@ -156,6 +159,16 @@ cli_config parse_options(int argc, char **argv) {
         exit(1);
     }
 
+#ifndef DS4_NO_GPU
+    /* GPU 侧成组 setter 的累积量: 解析完一次性下发(池 setter 一次收全四项)。 */
+    uint64_t expert_pool_mb = 0;
+    const char *expert_pool_pinned = NULL;
+    uint32_t expert_pool_auto_pin_top = 0;
+    uint32_t expert_pool_prefetch_top = 0;
+    const char *expert_pin_file = NULL;
+    uint64_t expert_pin_mlock_mb = 0;
+    uint64_t resid_pin_mlock_mb = 0;
+#endif
     bool directional_steering_scale_set = false;
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
@@ -209,6 +222,27 @@ cli_config parse_options(int argc, char **argv) {
             ds4_tool_set_eval_logits(need_arg(&i, argc, argv, arg));
         } else if (!strcmp(arg, "--eval-no-bos")) {
             ds4_tool_set_eval_no_bos(1);
+        } else if (!strcmp(arg, "--cap-layers")) {
+            ds4_tool_set_cap_layers(need_arg(&i, argc, argv, arg));
+        } else if (!strcmp(arg, "--amp-anchor")) {
+            ds4_tool_set_amp_anchor(need_arg(&i, argc, argv, arg),
+                                    ds4_tool_amp_anchor_route());
+        } else if (!strcmp(arg, "--amp-anchor-route")) {
+            ds4_tool_set_amp_anchor(ds4_tool_amp_anchor(), 1);
+        } else if (!strcmp(arg, "--multi-bench")) {
+            ds4_tool_set_multi_bench(parse_int(need_arg(&i, argc, argv, arg), arg));
+        } else if (!strcmp(arg, "--prefill-chunk")) {
+            ds4_tool_set_prefill_chunk(atoi(need_arg(&i, argc, argv, arg)));
+        } else if (!strcmp(arg, "--mem-budget-mb")) {
+            ds4_set_mem_budget_mb(parse_int(need_arg(&i, argc, argv, arg), arg));
+        } else if (!strcmp(arg, "--spec")) {
+            c.engine.spec = true;
+        } else if (!strcmp(arg, "--draft-gguf")) {
+            c.engine.draft_gguf_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--draft-zchain")) {
+            c.engine.draft_zchain_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--vq-dir")) {
+            c.engine.vq_dir_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--zchain")) {
             c.engine.zchain_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
@@ -306,6 +340,26 @@ cli_config parse_options(int argc, char **argv) {
             exit(2);
         } else if (!strcmp(arg, "--inspect")) {
             c.inspect = true;
+#ifndef DS4_NO_GPU
+        } else if (!strcmp(arg, "--no-residency")) {
+            ds4_gpu_set_no_residency(1);
+        } else if (!strcmp(arg, "--strict-fp")) {
+            ds4_gpu_set_strict_fp(1);
+        } else if (!strcmp(arg, "--expert-pool-mb")) {
+            expert_pool_mb = parse_u64(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--expert-pool-pinned")) {
+            expert_pool_pinned = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--expert-pool-auto-pin-top")) {
+            expert_pool_auto_pin_top = (uint32_t)parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--expert-pool-prefetch-top")) {
+            expert_pool_prefetch_top = (uint32_t)parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--expert-pin-file")) {
+            expert_pin_file = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--expert-pin-mlock-mb")) {
+            expert_pin_mlock_mb = parse_u64(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--resid-pin-mlock-mb")) {
+            resid_pin_mlock_mb = parse_u64(need_arg(&i, argc, argv, arg), arg);
+#endif
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--server")) {
@@ -318,6 +372,11 @@ cli_config parse_options(int argc, char **argv) {
         }
     }
 
+#ifndef DS4_NO_GPU
+    ds4_gpu_set_expert_pool(expert_pool_mb, expert_pool_pinned,
+                            expert_pool_auto_pin_top, expert_pool_prefetch_top);
+    ds4_gpu_set_expert_pin(expert_pin_file, expert_pin_mlock_mb, resid_pin_mlock_mb);
+#endif
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
     }

@@ -1,5 +1,8 @@
 /* dist_cli.c — 机械拆自 ds4_distributed.c: CLI 解析与公共入口(CLI Option Parsing And Public Entrypoint)。行为零变化。 */
 #include "dist_internal.h"
+#ifndef DS4_NO_GPU
+#include "ds4_gpu.h"
+#endif
 
 /* =========================================================================
  * CLI Option Parsing And Public Entrypoint
@@ -134,6 +137,9 @@ void ds4_dist_usage(FILE *fp) {
         "  --dist-prefill-chunk N\n"
         "      Coordinator prefill pipeline chunk size. Default: session cap, normally 4096.\n"
         "      Non-default values are experimental and can change logits unless validated.\n"
+        "  --dist-prefill-cap N\n"
+        "      Coordinator session prefill batch cap (0 = auto); bounds the routed-expert\n"
+        "      working set of wide prefill batches on offload hosts.\n"
         "  --dist-prefill-window N\n"
         "      Coordinator max end-to-end prefill chunks in flight. Default: workers+2, capped at 8.\n"
         "  --dist-activation-bits N\n"
@@ -147,12 +153,29 @@ void ds4_dist_usage(FILE *fp) {
         "  --tp-layers N\n"
         "      Apply the TP down_proj split only to the first N layers (implies --tp).\n"
         "      0 (default with --tp) means all layers; small N brings the path up on 2-3 layers.\n"
-        "  --mtp-role worker|coordinator\n"
-        "      Layer-pipeline only. 'worker': run the MTP drafter on the worker that\n"
-        "      holds the final layers + output head (drafts from its own final hidden;\n"
-        "      requires --mtp on that worker). 'coordinator': run the drafter on the\n"
-        "      coordinator (holds output head + token_embd + MTP; worker runs only the\n"
-        "      backbone slice and returns hidden state). Requires --mtp on that side.\n"
+        "  --expert-fetch-serve\n"
+        "      Serve routed-expert byte ranges from this host's model file to the peer\n"
+        "      (dual-host expert streaming; pairs with the peer's expert-fetch client).\n"
+        "  --expert-fetch-port N\n"
+        "      Listen port for --expert-fetch-serve. Default: 5606.\n"
+        "  --expert-fetch-dial HOST PORT\n"
+        "      Serve-dial mode: this host dials the peer's expert-fetch accept listener\n"
+        "      instead of listening (for peers whose outbound connect is broken).\n"
+        "  --expert-fetch-host HOST\n"
+        "      Client half: pull routed-expert bytes from the peer serving at HOST\n"
+        "      (port from --expert-fetch-port, default 5606). GPU builds only.\n"
+        "  --expert-fetch-accept-port N\n"
+        "      Client half, accept mode: LISTEN on N for the peer's serve-dial. GPU builds only.\n"
+        "  --expert-stage\n"
+        "      Stage predicted next-layer experts from the peer into RAM one layer\n"
+        "      ahead (needs a configured expert-fetch client). GPU builds only.\n"
+        "  --reverse-connect\n"
+        "      Flip who dials whom: the coordinator connects to a LISTENING worker\n"
+        "      (pipeline and TP modes). For hosts where one connect direction fails\n"
+        "      (macOS Local Network privacy: in-process connect over the bridge gets\n"
+        "      EHOSTUNREACH). Pass the same flag on both peers; address flags swap:\n"
+        "      coordinator takes --coordinator HOST PORT (the worker's listen address),\n"
+        "      worker takes --listen HOST PORT.\n"
         "  --debug\n"
         "      Print coordinator route/debug logs. Workers keep their normal logs without this.\n"
     );
@@ -257,6 +280,18 @@ ds4_dist_cli_parse_result ds4_dist_parse_cli_arg(
         }
         return DS4_DIST_CLI_MATCHED;
     }
+    if (!strcmp(arg, "--dist-prefill-cap")) {
+        if (!opt) {
+            if (errlen) snprintf(err, errlen, "missing distributed options");
+            return DS4_DIST_CLI_ERROR;
+        }
+        const char *value = dist_cli_need_arg(index, argc, argv, arg, err, errlen);
+        if (!value) return DS4_DIST_CLI_ERROR;
+        if (!dist_parse_positive_u32(value, arg, &opt->prefill_cap, err, errlen)) {
+            return DS4_DIST_CLI_ERROR;
+        }
+        return DS4_DIST_CLI_MATCHED;
+    }
     if (!strcmp(arg, "--dist-activation-bits")) {
         if (!opt) {
             if (errlen) snprintf(err, errlen, "missing distributed options");
@@ -304,6 +339,84 @@ ds4_dist_cli_parse_result ds4_dist_parse_cli_arg(
         opt->tp_enabled = true; /* --tp-layers implies TP mode */
         return DS4_DIST_CLI_MATCHED;
     }
+    if (!strcmp(arg, "--expert-fetch-serve")) {
+        g_efetch_serve = 1;
+        return DS4_DIST_CLI_MATCHED;
+    }
+    if (!strcmp(arg, "--expert-fetch-port")) {
+        const char *value = dist_cli_need_arg(index, argc, argv, arg, err, errlen);
+        if (!value) return DS4_DIST_CLI_ERROR;
+        uint32_t port = 0;
+        if (!dist_parse_positive_u32(value, arg, &port, err, errlen) || port > 65535u) {
+            if (errlen) snprintf(err, errlen, "--expert-fetch-port must be 1..65535");
+            return DS4_DIST_CLI_ERROR;
+        }
+        g_efetch_port = (int)port;
+#ifndef DS4_NO_GPU
+        /* 同一 rendezvous 端口: serve 半边在这听, client 半边往这拨。 */
+        ds4_gpu_set_expert_fetch_client(NULL, (int)port, 0);
+#endif
+        return DS4_DIST_CLI_MATCHED;
+    }
+    if (!strcmp(arg, "--expert-fetch-host")) {
+        const char *host = dist_cli_need_arg(index, argc, argv, arg, err, errlen);
+        if (!host) return DS4_DIST_CLI_ERROR;
+#ifndef DS4_NO_GPU
+        ds4_gpu_set_expert_fetch_client(host, 0, 0);
+        return DS4_DIST_CLI_MATCHED;
+#else
+        if (errlen) snprintf(err, errlen, "%s is not supported in CPU builds", arg);
+        return DS4_DIST_CLI_ERROR;
+#endif
+    }
+    if (!strcmp(arg, "--expert-fetch-accept-port")) {
+        const char *value = dist_cli_need_arg(index, argc, argv, arg, err, errlen);
+        if (!value) return DS4_DIST_CLI_ERROR;
+        uint32_t port = 0;
+        if (!dist_parse_positive_u32(value, arg, &port, err, errlen) || port > 65535u) {
+            if (errlen) snprintf(err, errlen, "--expert-fetch-accept-port must be 1..65535");
+            return DS4_DIST_CLI_ERROR;
+        }
+#ifndef DS4_NO_GPU
+        ds4_gpu_set_expert_fetch_client(NULL, 0, (int)port);
+        return DS4_DIST_CLI_MATCHED;
+#else
+        if (errlen) snprintf(err, errlen, "%s is not supported in CPU builds", arg);
+        return DS4_DIST_CLI_ERROR;
+#endif
+    }
+    if (!strcmp(arg, "--expert-stage")) {
+#ifndef DS4_NO_GPU
+        ds4_gpu_set_expert_stage(1);
+        return DS4_DIST_CLI_MATCHED;
+#else
+        if (errlen) snprintf(err, errlen, "%s is not supported in CPU builds", arg);
+        return DS4_DIST_CLI_ERROR;
+#endif
+    }
+    if (!strcmp(arg, "--expert-fetch-dial")) {
+        const char *host = dist_cli_need_arg(index, argc, argv, arg, err, errlen);
+        if (!host) return DS4_DIST_CLI_ERROR;
+        const char *value = dist_cli_need_arg(index, argc, argv, arg, err, errlen);
+        if (!value) return DS4_DIST_CLI_ERROR;
+        uint32_t port = 0;
+        if (!dist_parse_positive_u32(value, arg, &port, err, errlen) || port > 65535u) {
+            if (errlen) snprintf(err, errlen, "--expert-fetch-dial PORT must be 1..65535");
+            return DS4_DIST_CLI_ERROR;
+        }
+        g_efetch_dial_host = host;
+        g_efetch_dial_port = (int)port;
+        return DS4_DIST_CLI_MATCHED;
+    }
+    if (!strcmp(arg, "--reverse-connect")) {
+        if (!opt) {
+            if (errlen) snprintf(err, errlen, "missing distributed options");
+            return DS4_DIST_CLI_ERROR;
+        }
+        opt->reverse_connect = true;
+        g_dist_reverse_connect = 1;
+        return DS4_DIST_CLI_MATCHED;
+    }
     if (!strcmp(arg, "--debug")) {
         if (!opt) {
             if (errlen) snprintf(err, errlen, "missing distributed options");
@@ -313,157 +426,5 @@ ds4_dist_cli_parse_result ds4_dist_parse_cli_arg(
         return DS4_DIST_CLI_MATCHED;
     }
     return DS4_DIST_CLI_NOT_MATCHED;
-}
-
-int dist_validate_options(const ds4_dist_options *opt, char *err, size_t errlen) {
-    if (!opt) {
-        if (errlen) snprintf(err, errlen, "missing distributed options");
-        return 1;
-    }
-
-    if (opt->role == DS4_DISTRIBUTED_NONE) {
-        if (opt->layers.set || opt->listen_host || opt->listen_port ||
-            opt->coordinator_host || opt->coordinator_port ||
-            opt->prefill_chunk != 0 || opt->prefill_window != 0 ||
-            opt->activation_bits != 0) {
-            if (errlen) snprintf(err, errlen, "distributed options require --role coordinator or --role worker");
-            return 1;
-        }
-        return 0;
-    }
-
-    /* Tensor-parallel mode loads the whole model on every peer (it recombines
-     * routed_out element-wise, not by layer slice), so it does not take a
-     * --layers range. Pipeline (layer-slice) mode still requires it. */
-    if (!opt->layers.set && !opt->tp_enabled) {
-        if (errlen) snprintf(err, errlen, "--role %s requires --layers", dist_role_name(opt->role));
-        return 1;
-    }
-    if (opt->prefill_window > 64u) {
-        if (errlen) snprintf(err, errlen, "--dist-prefill-window must be <= 64");
-        return 1;
-    }
-    if (opt->activation_bits != 0 && !dist_activation_bits_valid(opt->activation_bits)) {
-        if (errlen) snprintf(err, errlen, "--dist-activation-bits must be 32, 16, or 8");
-        return 1;
-    }
-
-    /* TP reverse-connect (DS4_TP_REVERSE_CONNECT=1) flips network roles so the
-     * coordinator connects and the worker listens — used to dodge a host where
-     * one connect direction fails. The address flags swap accordingly. */
-    bool tp_rev = false;
-    if (opt->tp_enabled) {
-        const char *rev = getenv("DS4_TP_REVERSE_CONNECT");
-        tp_rev = (rev && *rev && rev[0] != '0');
-    }
-    /* Layer-pipeline reverse-connect (DS4_DIST_REVERSE_CONNECT, legacy
-     * DS4_TP_REVERSE_CONNECT): coordinator dials a listening worker. Only for the
-     * non-TP layer-pipeline path; same address-flag swap as TP reverse. */
-    bool dist_rev = false;
-    if (!opt->tp_enabled) {
-        const char *rev = getenv("DS4_DIST_REVERSE_CONNECT");
-        if (!rev || !*rev) rev = getenv("DS4_TP_REVERSE_CONNECT");
-        dist_rev = (rev && *rev && rev[0] != '0');
-    }
-
-    if (opt->role == DS4_DISTRIBUTED_COORDINATOR) {
-        if (tp_rev || dist_rev) {
-            if (!opt->coordinator_host || opt->coordinator_port <= 0) {
-                if (errlen) snprintf(err, errlen, "--role coordinator (reverse-connect) requires --coordinator HOST PORT (the worker's listen address)");
-                return 1;
-            }
-            return 0;
-        }
-        if (!opt->listen_host || opt->listen_port <= 0) {
-            if (errlen) snprintf(err, errlen, "--role coordinator requires --listen HOST PORT");
-            return 1;
-        }
-        if (opt->coordinator_host || opt->coordinator_port) {
-            if (errlen) snprintf(err, errlen, "--role coordinator must not use --coordinator");
-            return 1;
-        }
-        return 0;
-    }
-
-    if (opt->role == DS4_DISTRIBUTED_WORKER) {
-        if (tp_rev || dist_rev) {
-            if (!opt->listen_host || opt->listen_port <= 0) {
-                if (errlen) snprintf(err, errlen, "--role worker (reverse-connect) requires --listen HOST PORT");
-                return 1;
-            }
-            return 0;
-        }
-        if (!opt->coordinator_host || opt->coordinator_port <= 0) {
-            if (errlen) snprintf(err, errlen, "--role worker requires --coordinator HOST PORT");
-            return 1;
-        }
-        if (opt->prefill_chunk != 0) {
-            if (errlen) snprintf(err, errlen, "--dist-prefill-chunk requires --role coordinator");
-            return 1;
-        }
-        if (opt->prefill_window != 0) {
-            if (errlen) snprintf(err, errlen, "--dist-prefill-window requires --role coordinator");
-            return 1;
-        }
-        if (opt->activation_bits != 0) {
-            if (errlen) snprintf(err, errlen, "--dist-activation-bits requires --role coordinator");
-            return 1;
-        }
-        return 0;
-    }
-
-    if (errlen) snprintf(err, errlen, "invalid distributed role");
-    return 1;
-}
-
-int ds4_dist_prepare_engine_options(
-        const ds4_dist_options *opt,
-        ds4_engine_options *engine,
-        char *err,
-        size_t errlen) {
-    if (dist_validate_options(opt, err, errlen) != 0) return 1;
-    if (opt && opt->replay_check && opt->role != DS4_DISTRIBUTED_COORDINATOR) {
-        if (errlen) snprintf(err, errlen, "--dist-replay-check requires --role coordinator");
-        return 1;
-    }
-    if (engine && opt) {
-        engine->distributed = *opt;
-        if (opt->tp_enabled) {
-            /* Tensor parallelism replicates the whole layer stack on both peers
-             * and splits only the down_proj compute, so each machine must load
-             * the full model (no pipeline slice). */
-            engine->load_slice = false;
-            engine->load_output = true;
-        } else if (ds4_dist_enabled(opt)) {
-            engine->load_slice = true;
-            engine->load_layer_start = opt->layers.start;
-            engine->load_layer_end = opt->layers.has_output ? UINT32_MAX : opt->layers.end;
-            engine->load_output = opt->layers.has_output || opt->role == DS4_DISTRIBUTED_COORDINATOR;
-        }
-    }
-    return 0;
-}
-
-int dist_validate_layers_for_model(const ds4_dist_options *opt, uint32_t n_layers, char *err, size_t errlen) {
-    if (!opt || opt->role == DS4_DISTRIBUTED_NONE || !opt->layers.set) return 0;
-    if (n_layers == 0) {
-        if (errlen) snprintf(err, errlen, "model reports no layers");
-        return 1;
-    }
-
-    const uint32_t last = n_layers - 1u;
-    if (opt->layers.start > last) {
-        if (errlen) snprintf(err, errlen, "layer range starts past final model layer %u", last);
-        return 1;
-    }
-    if (!opt->layers.has_output && opt->layers.end > last) {
-        if (errlen) snprintf(err, errlen, "layer range ends past final model layer %u", last);
-        return 1;
-    }
-    if (opt->role == DS4_DISTRIBUTED_COORDINATOR && opt->layers.start != 0) {
-        if (errlen) snprintf(err, errlen, "coordinator layer range must start at layer 0");
-        return 1;
-    }
-    return 0;
 }
 

@@ -34,18 +34,24 @@ static uint64_t g_stage_slots_total;
 
 /* sum of armed expert counts (completion denominator) */
 
+static int g_expert_stage_requested;
+
+void ds4_gpu_set_expert_stage(int on) {
+    g_expert_stage_requested = on ? 1 : 0;
+}
+
 int ds4_gpu_expert_stage_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
-        cached = ds4_gpu_env_bool("DS4_METAL_EXPERT_STAGE") > 0 ? 1 : 0;
+        cached = g_expert_stage_requested;
         /* Wave 33: staging needs working fetch connections to the peer, not
          * specifically the forward-dial client.  Accept mode (worker side:
-         * peer dials in, DS4_DIST_EXPERT_FETCH_ACCEPT_PORT) provides the same
+         * peer dials in, --expert-fetch-accept-port) provides the same
          * connections -- and the measured asymmetry was exactly this gate:
          * coordinator decode layers hit 50-100% staged RAM (hit_mib 20-40 of
          * 40.5) while worker decode ran 100% cold (hit_mib=0.0 all run). */
-        if (cached && !getenv("DS4_DIST_EXPERT_FETCH_HOST") &&
-            !getenv("DS4_DIST_EXPERT_FETCH_ACCEPT_PORT")) cached = 0;
+        if (cached && !g_efetch_client_host[0] &&
+            g_efetch_client_accept_port <= 0) cached = 0;
         if (cached) {
             fprintf(stderr,
                     "ds4: predicted experts staged from peer SSD into RAM one layer ahead\n");
@@ -282,16 +288,9 @@ int ds4_gpu_expert_stage_pending(uint32_t layer, uint32_t id) {
 
 /* A staged-but-late expert finishes within ~2.5ms (pipelined fetch); local
  * cold pread costs ~2.7ms+ of the slow disk *and* its bandwidth.  Waiting a
- * bounded moment for in-flight bytes converts late completions into hits.
- * 0 disables. */
+ * bounded moment for in-flight bytes converts late completions into hits. */
 uint32_t ds4_gpu_expert_stage_wait_us(void) {
-    static uint32_t cached = UINT32_MAX;
-    if (cached == UINT32_MAX) {
-        uint64_t v = ds4_gpu_env_u64("DS4_METAL_EXPERT_STAGE_WAIT_US", 2500u);
-        if (v > 20000u) v = 20000u;
-        cached = (uint32_t)v;
-    }
-    return cached;
+    return 2500u;
 }
 
 /* Gather side: return the staged bytes for (layer, expert, part) or NULL.
@@ -329,9 +328,3 @@ void ds4_gpu_expert_prefetch_note_actual(uint32_t layer, const uint32_t *ids, ui
         if (g_pf_pred_mark[layer][ids[i]] == gen) g_pf_pred_hits++;
     }
 }
-
-static ds4_metal_expert_gather_pool g_expert_gather_pool = {
-    .mu = PTHREAD_MUTEX_INITIALIZER,
-    .cv = PTHREAD_COND_INITIALIZER,
-    .done_cv = PTHREAD_COND_INITIALIZER,
-};

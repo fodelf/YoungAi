@@ -14,20 +14,37 @@ static int g_ds4_lock_fd = -1;
  * to the CLI and server.
  */
 
-/* 取料入口 setter 家族(ds4.h 同名注释): CLI 参数是对外入口, 进程内的唯一消费点
- * 目前仍是 DS4_CAP_DIR/DS4_EVAL_* 的 getenv 读点(散在 capture/终审仪器几处),
- * 所以 setter 落到 setenv——单一事实源不变, 旗标即时生效, 不造第二条配置路径。
- * (2026-08-22 env→CLI 迁移只 land 了 CLI 半边, setter 无实现曾链接失败;
- * 消费点集中化到进程内全局属 ds4.c 拆分工序, 见重构阶段4。) */
-void ds4_tool_set_cap_dir(const char *p)     { if (p) setenv("DS4_CAP_DIR", p, 1); }
-const char *ds4_tool_cap_dir(void)           { return getenv("DS4_CAP_DIR"); }
-void ds4_tool_set_eval_ids(const char *p)    { if (p) setenv("DS4_EVAL_IDS", p, 1); }
-const char *ds4_tool_eval_ids(void)          { return getenv("DS4_EVAL_IDS"); }
-void ds4_tool_set_eval_hdump(const char *p)  { if (p) setenv("DS4_EVAL_HDUMP", p, 1); }
-const char *ds4_tool_eval_hdump(void)        { return getenv("DS4_EVAL_HDUMP"); }
-void ds4_tool_set_eval_logits(const char *p) { if (p) setenv("DS4_EVAL_LOGITS", p, 1); }
-const char *ds4_tool_eval_logits(void)       { return getenv("DS4_EVAL_LOGITS"); }
-void ds4_tool_set_eval_no_bos(int v)         { if (v) setenv("DS4_EVAL_NO_BOS", "1", 1); else unsetenv("DS4_EVAL_NO_BOS"); }
+/* 取料入口 setter 家族(ds4.h 同名注释): CLI 参数是唯一对外入口, 存进程内全局,
+ * capture/终审仪器直接读 getter——env 传输层已删(2026-08-31 env 大扫除收口)。 */
+static const char *g_tool_cap_dir;
+static const char *g_tool_cap_layers;
+static const char *g_tool_eval_ids;
+static const char *g_tool_eval_hdump;
+static const char *g_tool_eval_logits;
+static const char *g_tool_amp_anchor;
+static int g_tool_amp_anchor_route;
+static int g_tool_eval_no_bos;
+static int g_tool_multi_bench;
+static int g_tool_prefill_chunk = -1;   /* <0 = 自动(按后端/URL prompt 长度) */
+void ds4_tool_set_cap_dir(const char *p)     { g_tool_cap_dir = p; }
+const char *ds4_tool_cap_dir(void)           { return g_tool_cap_dir; }
+void ds4_tool_set_cap_layers(const char *p)  { g_tool_cap_layers = p; }
+const char *ds4_tool_cap_layers(void)        { return g_tool_cap_layers; }
+void ds4_tool_set_eval_ids(const char *p)    { g_tool_eval_ids = p; }
+const char *ds4_tool_eval_ids(void)          { return g_tool_eval_ids; }
+void ds4_tool_set_eval_hdump(const char *p)  { g_tool_eval_hdump = p; }
+const char *ds4_tool_eval_hdump(void)        { return g_tool_eval_hdump; }
+void ds4_tool_set_eval_logits(const char *p) { g_tool_eval_logits = p; }
+const char *ds4_tool_eval_logits(void)       { return g_tool_eval_logits; }
+void ds4_tool_set_eval_no_bos(int v)         { g_tool_eval_no_bos = v; }
+int  ds4_tool_eval_no_bos(void)              { return g_tool_eval_no_bos; }
+void ds4_tool_set_amp_anchor(const char *p, int route_on) { g_tool_amp_anchor = p; g_tool_amp_anchor_route = route_on; }
+const char *ds4_tool_amp_anchor(void)        { return g_tool_amp_anchor; }
+int  ds4_tool_amp_anchor_route(void)         { return g_tool_amp_anchor_route; }
+void ds4_tool_set_multi_bench(int n)         { g_tool_multi_bench = n; }
+int  ds4_tool_multi_bench(void)              { return g_tool_multi_bench; }
+void ds4_tool_set_prefill_chunk(int chunk)   { g_tool_prefill_chunk = chunk; }
+int  ds4_tool_prefill_chunk(void)            { return g_tool_prefill_chunk; }
 
 const char *ds4_backend_name(ds4_backend backend) {
     switch (backend) {
@@ -76,8 +93,7 @@ void ds4_release_instance_lock(void) {
 /* Refuse to start a second ds4 process.  The model can map tens of GiB, so a
  * stale accidental second run is more dangerous than a normal CLI error. */
 void ds4_acquire_instance_lock(void) {
-    const char *path = getenv("DS4_LOCK_FILE");
-    if (!path || !path[0]) path = "/tmp/ds4.lock";
+    const char *path = "/tmp/ds4.lock";
 
     const int fd = open(path, O_RDWR | O_CREAT, 0600);
     if (fd < 0) {

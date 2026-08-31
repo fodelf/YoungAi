@@ -149,13 +149,20 @@ static void *ds4_gpu_expert_prefetch_thread(void *arg) {
 int ds4_gpu_expert_prefetch_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
-        {
-            int e = ds4_gpu_env_bool("DS4_METAL_EXPERT_PREFETCH_AHEAD");
-            cached = (e < 0) ? (ds4_gpu_expert_offload_enabled() ? 1 : 0) : (e > 0 ? 1 : 0);
+        /* Auto-adapts to the offload verdict (resident models never need
+         * read-ahead) — EXCEPT while capture/eval instrumentation is armed:
+         * 捕获铁律(2026-06-24)=取料必须可复现, 预取线程引入非决定性与 OOM 风
+         * 险, 所以 --cap-dir/--eval-ids 在场时强制关。 */
+        const char *cap = ds4_tool_cap_dir();
+        const char *ids = ds4_tool_eval_ids();
+        if ((cap && cap[0]) || (ids && ids[0])) {
+            cached = 0;
+        } else {
+            cached = ds4_gpu_expert_offload_enabled() ? 1 : 0;
         }
         if (cached && g_model_fd < 0) {
             fprintf(stderr,
-                    "ds4: DS4_METAL_EXPERT_PREFETCH_AHEAD=1 requested but no model fd; disabled\n");
+                    "ds4: expert prefetch needs a model fd; disabled\n");
             cached = 0;
         }
         if (cached) {

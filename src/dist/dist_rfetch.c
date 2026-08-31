@@ -23,6 +23,8 @@
 #define DS4_EFETCH_MAGIC 0x4453344546563101ULL   /* "DS4EFV1" + 0x01 */
 #define DS4_EFETCH_MAX_LEN (8u << 20)
 #define DS4_EFETCH_MAX_CONNS 8
+#define DS4_EFETCH_DEFAULT_PORT 5606        /* 服务端监听 */
+#define DS4_EFETCH_DEFAULT_DIAL_PORT 5607   /* serve-dial 拨对端 accept 口 */
 
 typedef struct {
     uint64_t off;
@@ -115,17 +117,16 @@ static void *ds4_efetch_accept_thread(void *arg) {
     return NULL;
 }
 
-int ds4_dist_expert_fetch_maybe_serve(int model_fd, uint64_t model_size) {
-    const char *serve = getenv("DS4_DIST_EXPERT_FETCH_SERVE");
-    if (!serve || serve[0] != '1' || model_fd < 0 || model_size == 0) return 0;
+/* --expert-fetch-serve / --expert-fetch-dial 的进程级配置 (dist_cli.c 置位)。 */
+int g_efetch_serve = 0;
+int g_efetch_port = DS4_EFETCH_DEFAULT_PORT;
+const char *g_efetch_dial_host = NULL;
+int g_efetch_dial_port = DS4_EFETCH_DEFAULT_DIAL_PORT;
 
-    int port = 5606;
-    const char *penv = getenv("DS4_DIST_EXPERT_FETCH_PORT");
-    if (penv && penv[0]) {
-        char *end = NULL;
-        long v = strtol(penv, &end, 10);
-        if (end != penv && *end == '\0' && v > 0 && v <= 65535) port = (int)v;
-    }
+int ds4_dist_expert_fetch_maybe_serve(int model_fd, uint64_t model_size) {
+    if (!g_efetch_serve || model_fd < 0 || model_size == 0) return 0;
+
+    const int port = g_efetch_port;
 
     static ds4_efetch_server srv;   /* one server per process */
     if (srv.listen_fd > 0) return 1;
@@ -270,21 +271,18 @@ int ds4_dist_expert_fetch_accept_init(int port, int n_conns, uint64_t model_size
 
 static void *ds4_efetch_serve_dial_main(void *arg) {
     ds4_efetch_server *srv = (ds4_efetch_server *)arg;
-    const char *host = getenv("DS4_DIST_EXPERT_FETCH_SERVE_DIAL_HOST");
+    const char *host = g_efetch_dial_host;
     if (!host || !host[0]) return NULL;
-    int port = 5607;
-    const char *penv = getenv("DS4_DIST_EXPERT_FETCH_SERVE_DIAL_PORT");
-    if (penv && penv[0]) {
-        char *end = NULL;
-        long v = strtol(penv, &end, 10);
-        if (end != penv && *end == '\0' && v > 0 && v <= 65535) port = (int)v;
-    }
-    int conns = (int)dist_env_u32_clamped("DS4_DIST_EXPERT_FETCH_SERVE_DIAL_CONNS", 4, 1,
-                                          DS4_EFETCH_MAX_CONNS);
+    const int port = g_efetch_dial_port;
+    /* 4 条连接: 单条 TCP 塞不满桥接带宽, 4 条已到收益平台。 */
+    int conns = 4;
+    if (conns > DS4_EFETCH_MAX_CONNS) conns = DS4_EFETCH_MAX_CONNS;
     /* The peer's accept-listener comes up a few seconds in (right after the
-     * worker accepts the control connection); dial with a 2s backoff. */
+     * worker accepts the control connection); dial with a 2s backoff.
+     * 150 × 2s = 5 分钟上限: 覆盖对端慢启动, 之后放弃并明说, 不无限重试。 */
+    enum { EFETCH_DIAL_ATTEMPTS = 150, EFETCH_DIAL_BACKOFF_SEC = 2 };
     int dialed = 0;
-    for (int attempt = 0; dialed < conns && attempt < 150; attempt++) {
+    for (int attempt = 0; dialed < conns && attempt < EFETCH_DIAL_ATTEMPTS; attempt++) {
         char err[256] = {0};
         int fd = dist_connect_endpoint_once(host, port, NULL, err, sizeof(err));
         if (fd < 0) {
@@ -292,7 +290,7 @@ static void *ds4_efetch_serve_dial_main(void *arg) {
                 fprintf(stderr, "ds4: expert-fetch serve-dial %s:%d failed (%s)\n",
                         host, port, err);
             }
-            struct timespec ts = { .tv_sec = 2, .tv_nsec = 0 };
+            struct timespec ts = { .tv_sec = EFETCH_DIAL_BACKOFF_SEC, .tv_nsec = 0 };
             nanosleep(&ts, NULL);
             continue;
         }
@@ -321,7 +319,7 @@ static void *ds4_efetch_serve_dial_main(void *arg) {
 }
 
 int ds4_dist_expert_fetch_serve_dial(int model_fd, uint64_t model_size) {
-    const char *host = getenv("DS4_DIST_EXPERT_FETCH_SERVE_DIAL_HOST");
+    const char *host = g_efetch_dial_host;
     if (!host || !host[0] || model_fd < 0 || model_size == 0) return 0;
     static ds4_efetch_server srv;   /* one serve-dial set per process */
     if (srv.model_fd > 0) return 1;

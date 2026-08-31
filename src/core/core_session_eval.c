@@ -24,7 +24,7 @@ int ds4_session_eval_multi(ds4_session **ss, const int *tokens, uint32_t n,
         if (errlen) snprintf(err, errlen, "invalid multi-session batch request");
         return 1;
     }
-    if (n == 1 && !getenv("DS4_MULTI_FORCE")) return ds4_session_eval(ss[0], tokens[0], err, errlen);
+    if (n == 1) return ds4_session_eval(ss[0], tokens[0], err, errlen);
     ds4_engine *e = ss[0]->engine;
     ds4_gpu_graph *gb = &ss[0]->graph;          /* 共享执行器(它的 batch_* 缓冲够 N 行) */
     if (n > gb->prefill_cap) {
@@ -43,8 +43,6 @@ int ds4_session_eval_multi(ds4_session **ss, const int *tokens, uint32_t n,
         }
     }
 
-    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
-    const uint64_t hc_bytes = hc_dim * sizeof(float);
     const uint64_t q_bytes  = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(float);
     const uint64_t kv_bytes = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
     const uint64_t nm_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
@@ -70,32 +68,6 @@ int ds4_session_eval_multi(ds4_session **ss, const int *tokens, uint32_t n,
                                                 e->weights.token_embd->abs_offset,
                                                 (uint32_t)e->weights.token_embd->dim[1],
                                                 n, DS4_N_EMBD, DS4_N_HC) != 0;
-    /* 对照开关(DS4_MULTI_NO_SHARE=1): 每个会话整层都在自己的图上跑, 只共享输出头。
-     * 用来把"驱动接线"和"分段共享"分开定位 —— 这条路应当与单路解码同残差档。 */
-    static int no_share = -1;
-    if (no_share < 0) no_share = getenv("DS4_MULTI_NO_SHARE") ? 1 : 0;
-    if (ok && no_share) {
-        for (uint32_t i = 0; ok && i < n; i++) {
-            ds4_gpu_graph *gi = &ss[i]->graph;
-            /* 直接嵌入各自图: 不能从 gb 取行 —— 会话 0 跑完 43 层后 gb->batch_cur_hc
-             * 指针已被交换 43 次, 那里放的是它自己的层输出, 不是嵌入。 */
-            if (i != 0) ok = ds4_gpu_embed_tokens_hc_tensor(gi->batch_cur_hc, gi->prefill_tokens,
-                                                            e->model.map, e->model.size,
-                                                            e->weights.token_embd->abs_offset,
-                                                            (uint32_t)e->weights.token_embd->dim[1],
-                                                            1u, DS4_N_EMBD, DS4_N_HC) != 0;
-            for (uint32_t il = 0; ok && il < (uint32_t)DS4_N_LAYER; il++) {
-                ok = metal_graph_encode_layer_attention_batch(gi, &e->model, &e->weights.layer[il],
-                                                              il, (uint32_t)ss[i]->checkpoint.len, 1u) &&
-                     metal_graph_encode_layer_ffn_batch(gi, &e->model, &e->weights.layer[il],
-                                                        il, (uint32_t)ss[i]->checkpoint.len, 1u);
-                if (ok) { ds4_gpu_tensor *t = gi->batch_cur_hc; gi->batch_cur_hc = gi->batch_next_hc; gi->batch_next_hc = t; }
-            }
-            if (ok && i != 0) ok = ds4_gpu_tensor_copy(gb->batch_cur_hc, (uint64_t)i * hc_bytes,
-                                                       gi->batch_cur_hc, 0, hc_bytes) != 0;
-        }
-        goto multi_head;
-    }
     for (uint32_t il = 0; ok && il < (uint32_t)DS4_N_LAYER; il++) {
         const ds4_layer_weights *lw = &e->weights.layer[il];
         const uint64_t qr_bytes = lw->attn_q_a->dim[1] * sizeof(float);
@@ -130,18 +102,9 @@ int ds4_session_eval_multi(ds4_session **ss, const int *tokens, uint32_t n,
             }
         }
         /* ② KV 段: 每个会话回自己的图算(压缩器/索引器/注意力状态都在那儿) */
-        static int pre_per_sess = -1;
-        if (pre_per_sess < 0) pre_per_sess = getenv("DS4_MULTI_PRE_PER_SESSION") ? 1 : 0;
         for (uint32_t i = 0; ok && i < n; i++) {
             ds4_gpu_graph *gi = &ss[i]->graph;
-            if (pre_per_sess && i != 0) {
-                /* 二分用: 会话自己跑投影段(要先把自己的 hc 行搬回来), 不走拷贝集 */
-                ok = ds4_gpu_tensor_copy(gi->batch_cur_hc, 0, gb->batch_cur_hc,
-                                         (uint64_t)i * hc_bytes, hc_bytes) != 0 &&
-                     metal_graph_encode_layer_attention_batch_stages(gi, &e->model, lw, il,
-                                                                    (uint32_t)ss[i]->checkpoint.len,
-                                                                    1u, DS4_ATTN_STAGE_PRE);
-            } else if (i != 0) {
+            if (i != 0) {
                 ok = ds4_gpu_tensor_copy(gi->batch_q, 0, gb->batch_q, (uint64_t)i * q_bytes, q_bytes) != 0 &&
                      ds4_gpu_tensor_copy(gi->batch_kv, 0, gb->batch_kv, (uint64_t)i * kv_bytes, kv_bytes) != 0 &&
                      ds4_gpu_tensor_copy(gi->batch_attn_norm, 0, gb->batch_attn_norm,
@@ -175,27 +138,7 @@ int ds4_session_eval_multi(ds4_session **ss, const int *tokens, uint32_t n,
                 ds4_gpu_tensor_free(hv);
             }
         }
-        static int post_per_sess = -1;
-        if (post_per_sess < 0) post_per_sess = getenv("DS4_MULTI_POST_PER_SESSION") ? 1 : 0;
-        if (ok && post_per_sess) {
-            /* 二分用: 出口段也各自跑(需要把该行的 hc 与 hc_split 搬回去) */
-            const uint64_t mix_bytes = (2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC) * sizeof(float);
-            for (uint32_t i = 0; ok && i < n; i++) {
-                ds4_gpu_graph *gi = &ss[i]->graph;
-                if (i != 0) {
-                    ok = ds4_gpu_tensor_copy(gi->batch_cur_hc, 0, gb->batch_cur_hc,
-                                             (uint64_t)i * hc_bytes, hc_bytes) != 0 &&
-                         ds4_gpu_tensor_copy(gi->batch_hc_split, 0, gb->batch_hc_split,
-                                             (uint64_t)i * mix_bytes, mix_bytes) != 0;
-                }
-                if (ok) ok = metal_graph_encode_layer_attention_batch_stages(
-                        gi, &e->model, lw, il, (uint32_t)ss[i]->checkpoint.len, 1u,
-                        DS4_ATTN_STAGE_POST | DS4_ATTN_STAGE_NOROPE);
-                if (ok && i != 0)
-                    ok = ds4_gpu_tensor_copy(gb->batch_after_attn_hc, (uint64_t)i * hc_bytes,
-                                             gi->batch_after_attn_hc, 0, hc_bytes) != 0;
-            }
-        } else if (ok) {
+        if (ok) {
             ok = metal_graph_encode_layer_attention_batch_stages(gb, &e->model, lw, il, 0u, n,
                                                                  DS4_ATTN_STAGE_POST | DS4_ATTN_STAGE_NOROPE);
         }
@@ -206,7 +149,6 @@ int ds4_session_eval_multi(ds4_session **ss, const int *tokens, uint32_t n,
             gb->batch_next_hc = tmp;
         }
     }
-multi_head:
     if (ok) ok = metal_graph_encode_output_head_batch(gb, &e->model, &e->weights,
                                                       n, e->weights.output->dim[1]);
     if (ok) ok = ds4_gpu_end_commands() != 0;
@@ -240,11 +182,7 @@ multi_head:
 }
 
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
-    if (!g_prof.enabled) return ds4_session_eval_internal(s, token, true, err, errlen);
-    const double t0 = now_sec();
-    int rc = ds4_session_eval_internal(s, token, true, err, errlen);
-    if (rc == 0) ds4_profile_add_decode(1, now_sec() - t0);
-    return rc;
+    return ds4_session_eval_internal(s, token, true, err, errlen);
 }
 
 /* Append N KNOWN tokens to the live KV in ONE layer-major batch (2026-07-14).
@@ -282,13 +220,9 @@ int ds4_session_eval_span(ds4_session *s, const int *tokens, int n,
     if (s->checkpoint_valid)
         for (int i = 0; i < s->checkpoint.len; i++) ds4_tokens_push(&want, s->checkpoint.v[i]);
     for (int i = 0; i < n; i++) ds4_tokens_push(&want, tokens[i]);
-    const double t0 = now_sec();
     int rc = ds4_session_sync_internal(s, &want, err, errlen);
     ds4_tokens_free(&want);
-    if (rc == 0) {
-        if (g_prof.enabled) ds4_profile_add_decode((uint64_t)n, now_sec() - t0);
-        return 0;
-    }
+    if (rc == 0) return 0;
     /* Any batch failure: fall back to the exact per-token semantics. */
     for (int i = 0; i < n; i++)
         if (ds4_session_eval(s, tokens[i], err, errlen) != 0) return 1;

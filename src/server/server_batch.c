@@ -79,13 +79,14 @@ static void job_finish(job *j) {
 
 static void generate_jobs_batched(server *s, job **jobs, uint32_t n) {
     char err[160];
-    ds4_session *sess[8] = {0};
-    buf text[8];
-    int completion[8] = {0}, maxtok[8] = {0}, prompt_tokens[8] = {0};
-    bool done[8] = {false};
-    const char *finish[8];
-    uint64_t rng[8];
-    char id[8][96];
+    ds4_session *sess[DS4_SERVER_BATCH_LANES] = {0};
+    buf text[DS4_SERVER_BATCH_LANES];
+    int completion[DS4_SERVER_BATCH_LANES] = {0}, maxtok[DS4_SERVER_BATCH_LANES] = {0},
+        prompt_tokens[DS4_SERVER_BATCH_LANES] = {0};
+    bool done[DS4_SERVER_BATCH_LANES] = {false};
+    const char *finish[DS4_SERVER_BATCH_LANES];
+    uint64_t rng[DS4_SERVER_BATCH_LANES];
+    char id[DS4_SERVER_BATCH_LANES][96];
     memset(text, 0, sizeof(text));
     const double t0 = now_sec();
 
@@ -117,7 +118,8 @@ static void generate_jobs_batched(server *s, job **jobs, uint32_t n) {
 
     /* 联合解码: 每步各自采样, 活跃行拼成一次前向 */
     for (;;) {
-        ds4_session *act[8]; int tok[8]; uint32_t idx[8], na = 0;
+        ds4_session *act[DS4_SERVER_BATCH_LANES]; int tok[DS4_SERVER_BATCH_LANES];
+        uint32_t idx[DS4_SERVER_BATCH_LANES], na = 0;
         for (uint32_t i = 0; i < n; i++) {
             if (done[i]) continue;
             if (completion[i] >= maxtok[i]) { done[i] = true; finish[i] = "length"; continue; }
@@ -184,15 +186,14 @@ void *worker_main(void *arg) {
         job *j = dequeue(s);
         if (!j) break;
         if (s->batch_max >= 2 && job_batchable(j)) {
-            job *batch[8];
+            job *batch[DS4_SERVER_BATCH_LANES];
             batch[0] = j;
             /* 聚集窗口: 首个可合批的 job 到达后等一小会儿, 让同时发出的其余请求也排进来
-             * (实测不等的话 8 路里常有 1 路晚到, 只能合 7 路)。默认 60ms, 对单请求延迟
+             * (实测不等的话 8 路里常有 1 路晚到, 只能合 7 路)。60ms 对单请求延迟
              * 的影响远小于一次前向(29ms/token × N)。 */
-            static int wait_ms = -1;
-            if (wait_ms < 0) { const char *w = getenv("DS4_SERVER_BATCH_WAIT_MS"); wait_ms = w ? atoi(w) : 60; }
-            if (wait_ms > 0) {
-                struct timespec ts = { .tv_sec = wait_ms / 1000, .tv_nsec = (long)(wait_ms % 1000) * 1000000L };
+            {
+                struct timespec ts = { .tv_sec = DS4_SERVER_BATCH_WAIT_MS / 1000,
+                                       .tv_nsec = (long)(DS4_SERVER_BATCH_WAIT_MS % 1000) * 1000000L };
                 nanosleep(&ts, NULL);
             }
             const uint32_t extra = dequeue_batchable(s, batch + 1, (uint32_t)s->batch_max - 1u);

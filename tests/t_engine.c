@@ -1,4 +1,4 @@
-/* t_engine.c — 测试共享引擎缓存 + env 保存恢复 + f16 转换助手 (机械拆分自 tests/ds4_test.c, 重构阶段8)。 */
+/* t_engine.c — 测试共享引擎缓存 + f16 转换助手 (机械拆分自 tests/ds4_test.c, 重构阶段8)。 */
 #include "test_internal.h"
 #ifndef DS4_NO_GPU
 
@@ -6,28 +6,7 @@ static ds4_engine *test_engine_fast;
 static ds4_engine *test_engine_quality;
 
 const char *test_model_path(void) {
-    const char *model_path = getenv("DS4_TEST_MODEL");
-    return (model_path && model_path[0]) ? model_path : "ds4flash.gguf";
-}
-
-char *test_save_env(const char *name) {
-    const char *value = getenv(name);
-    if (!value) return NULL;
-    size_t len = strlen(value);
-    char *copy = malloc(len + 1);
-    TEST_ASSERT(copy != NULL);
-    if (!copy) return NULL;
-    memcpy(copy, value, len + 1);
-    return copy;
-}
-
-void test_restore_env(const char *name, char *saved) {
-    if (saved) {
-        setenv(name, saved, 1);
-        free(saved);
-    } else {
-        unsetenv(name);
-    }
+    return (g_test_model && g_test_model[0]) ? g_test_model : "ds4flash.gguf";
 }
 
 ds4_engine *test_open_engine(bool quality) {

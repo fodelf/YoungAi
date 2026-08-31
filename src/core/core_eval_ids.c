@@ -117,22 +117,16 @@ static int *eval_ids_load(const char *path, uint32_t *out_n, uint32_t vocab) {
     return ids;
 }
 
-/* 并发批实测(DS4_MULTI_BENCH=N, 2026-08-21): 建 N 个会话各喂不同 prompt, 先各自
+/* 并发批实测(--multi-bench N, 2026-08-21): 建 N 个会话各喂不同 prompt, 先各自
  * 单独解码若干步做基准, 再用 ds4_session_eval_multi 批量推进同样的步数, 对比
- *   ①聚合 token/s(红利有多大)  ②每个会话选出的 token 序列是否与单独解码逐字相同(无损)。
- * 用 DS4_MULTI_BENCH_STEPS 调步数(默认 48)。 */
+ *   ①聚合 token/s(红利有多大)  ②每个会话选出的 token 序列是否与单独解码逐字相同(无损)。 */
 void ds4_multi_bench_run(ds4_engine *e) {
-    const char *env = getenv("DS4_MULTI_BENCH");
-    if (!env || !env[0]) return;
-    uint32_t n = (uint32_t)atoi(env);
-    if (n < 2u && !getenv("DS4_MULTI_FORCE")) n = 2u;
-    if (n < 1u) n = 1u;
+    const int mb_n = ds4_tool_multi_bench();
+    if (mb_n <= 0) return;
+    uint32_t n = (uint32_t)mb_n;
+    if (n < 2u) n = 2u;
     if (n > 8u) n = 8u;
-    uint32_t steps = 48u;
-    { const char *sv = getenv("DS4_MULTI_BENCH_STEPS"); if (sv && atoi(sv) > 0) steps = (uint32_t)atoi(sv); }
-    if (steps > 500u) steps = 500u;
-    /* 只跑批模式(跳过单路基准): 演示 8 路并发时不必等基准 */
-    const int batch_only = getenv("DS4_MULTI_BENCH_BATCH_ONLY") != NULL;
+    const uint32_t steps = 48u;   /* 足够覆盖 tile 填充稳态, 又是分钟级 */
 
     /* 8 道真代码题(并发批处理演示用): 各自独立、长度相近, 便于横向比较 */
     static const char *prompts[8] = {
@@ -153,13 +147,8 @@ void ds4_multi_bench_run(ds4_engine *e) {
         if (ds4_session_create(&ss[i], e, 4096) != 0 || !ss[i]) {
             fprintf(stderr, "ds4: [multi-bench] 会话 %u 创建失败\n", i); exit(1);
         }
-        { uint32_t pi = i;
-          const char *sv = getenv("DS4_MULTI_BENCH_START");
-          if (sv) pi = ((uint32_t)atoi(sv) + i) & 7u;
-          const char *ptext = getenv("DS4_MULTI_BENCH_SAMEPROMPT") ? prompts[0] : prompts[pi];
-          /* 与 CLI 同一条渲染路: 走 chat 模板才是正经问答, 裸文本只会续写题面 */
-          if (getenv("DS4_MULTI_BENCH_RAW")) ds4_tokenize_text(e, ptext, &toks[i]);
-          else ds4_encode_chat_prompt(e, NULL, ptext, DS4_THINK_NONE, &toks[i]); }
+        /* 与 CLI 同一条渲染路: 走 chat 模板才是正经问答, 裸文本只会续写题面 */
+        ds4_encode_chat_prompt(e, NULL, prompts[i], DS4_THINK_NONE, &toks[i]);
         if (ds4_session_sync(ss[i], &toks[i], err, sizeof err) != 0) {
             fprintf(stderr, "ds4: [multi-bench] 会话 %u prefill 失败: %s\n", i, err); exit(1);
         }
@@ -169,7 +158,7 @@ void ds4_multi_bench_run(ds4_engine *e) {
     float *ref_l1 = xmalloc((size_t)n * DS4_N_VOCAB * sizeof(float));   /* 第 1 步后的 logits */
     int (*bat)[512] = xmalloc((size_t)n * sizeof(*bat));
     double t0 = now_sec();
-    for (uint32_t i = 0; !batch_only && i < n; i++) {
+    for (uint32_t i = 0; i < n; i++) {
         for (uint32_t k = 0; k < steps; k++) {
             int best = 0; float bv = -1e30f;
             for (uint32_t v = 0; v < (uint32_t)DS4_N_VOCAB; v++)
@@ -183,9 +172,8 @@ void ds4_multi_bench_run(ds4_engine *e) {
         }
     }
     const double seq_s = now_sec() - t0;
-    if (!batch_only)
-        fprintf(stderr, "ds4: [multi-bench] 单路逐个跑: %u 会话 × %u token = %u, 用时 %.2fs ⇒ 聚合 %.2f t/s\n",
-                n, steps, n * steps, seq_s, (double)(n * steps) / seq_s);
+    fprintf(stderr, "ds4: [multi-bench] 单路逐个跑: %u 会话 × %u token = %u, 用时 %.2fs ⇒ 聚合 %.2f t/s\n",
+            n, steps, n * steps, seq_s, (double)(n * steps) / seq_s);
 
     /* 批: 重建会话到同一起点, 用 eval_multi 同步推进 */
     for (uint32_t i = 0; i < n; i++) {
@@ -211,7 +199,7 @@ void ds4_multi_bench_run(ds4_engine *e) {
         if (ds4_session_eval_multi(ss, cur, n, err, sizeof err) != 0) {
             fprintf(stderr, "ds4: [multi-bench] 批解码失败: %s\n", err); exit(1);
         }
-        if (k == 0 && !batch_only) {   /* 第 1 步 logits 与单路对账 */
+        if (k == 0) {   /* 第 1 步 logits 与单路对账 */
             for (uint32_t i = 0; i < n; i++) {
                 const float *r = ref_l1 + (uint64_t)i * DS4_N_VOCAB;
                 double dmax = 0.0; int ar = 0, ab = 0; float br = -1e30f, bb = -1e30f;
@@ -227,43 +215,20 @@ void ds4_multi_bench_run(ds4_engine *e) {
         }
     }
     const double bat_s = now_sec() - t0;
-    fprintf(stderr, "ds4: [multi-bench] %u 路批处理: %u token, 用时 %.2fs ⇒ 聚合 %.2f t/s%s\n",
-            n, n * steps, bat_s, (double)(n * steps) / bat_s,
-            batch_only ? "" : "");
-    if (!batch_only)
-        fprintf(stderr, "ds4: [multi-bench] 相对单路加速 %.2fx\n", seq_s / bat_s);
-    /* 质量目视: 两种模式各自的文本(逐位不同是数值等价的正常结果, 关键看是否连贯) */
-    if (getenv("DS4_MULTI_BENCH_TEXT")) {
-        for (uint32_t i = 0; i < n; i++) {
-            static char buf[16384]; size_t off = 0;
-            for (uint32_t k = 0; k < steps && off < sizeof(buf) - 64; k++) {
-                size_t l = 0;
-                const char *p = ds4_token_text(e, ref[i][k], &l);
-                if (p && off + l < sizeof(buf) - 1) { memcpy(buf + off, p, l); off += l; }
-            }
-            buf[off] = 0;
-            if (!batch_only) fprintf(stderr, "ds4: [multi-bench] 会话%u 单路: %s\n", i, buf);
-            off = 0;
-            for (uint32_t k = 0; k < steps && off < sizeof(buf) - 64; k++) {
-                size_t l = 0;
-                const char *p = ds4_token_text(e, bat[i][k], &l);
-                if (p && off + l < sizeof(buf) - 1) { memcpy(buf + off, p, l); off += l; }
-            }
-            buf[off] = 0;
-            fprintf(stderr, "\n===== 会话 %u =====\n%s\n", i, buf);
-        }
-    }
-    if (!batch_only) fprintf(stderr, "ds4: [multi-bench] 与单路逐位对照: %s (不同 %u/%u%s)\n",
+    fprintf(stderr, "ds4: [multi-bench] %u 路批处理: %u token, 用时 %.2fs ⇒ 聚合 %.2f t/s\n",
+            n, n * steps, bat_s, (double)(n * steps) / bat_s);
+    fprintf(stderr, "ds4: [multi-bench] 相对单路加速 %.2fx\n", seq_s / bat_s);
+    fprintf(stderr, "ds4: [multi-bench] 与单路逐位对照: %s (不同 %u/%u%s)\n",
             mismatch ? "有差异" : "完全一致", mismatch, n * steps,
             mismatch ? "" : ", 无损");
-    if (mismatch && !batch_only) fprintf(stderr, "ds4: [multi-bench] 首个不同在第 %u 步\n", first_bad);
+    if (mismatch) fprintf(stderr, "ds4: [multi-bench] 首个不同在第 %u 步\n", first_bad);
     for (uint32_t i = 0; i < n; i++) ds4_session_free(ss[i]);
     free(ref);
     exit(0);
 }
 
 void ds4_eval_ids_run(ds4_engine *e) {
-    const char *idp = getenv("DS4_EVAL_IDS");
+    const char *idp = ds4_tool_eval_ids();
     if (!idp || !idp[0]) return;
 #ifdef DS4_NO_GPU
     (void)e;
@@ -275,7 +240,7 @@ void ds4_eval_ids_run(ds4_engine *e) {
     int *file_ids = eval_ids_load(idp, &nfile, vocab);
 
     /* 默认在流首插 BOS(裸 BOS 起); DS4_EVAL_NO_BOS=1 则原样喂。 */
-    const int no_bos = getenv("DS4_EVAL_NO_BOS") != NULL;
+    const int no_bos = ds4_tool_eval_no_bos();
     const uint32_t n = no_bos ? nfile : nfile + 1u;
     int *ids = xmalloc((size_t)n * sizeof(int));
     if (no_bos) {
@@ -298,17 +263,15 @@ void ds4_eval_ids_run(ds4_engine *e) {
     }
     const uint32_t pcap = (uint32_t)ds4_session_prefill_cap(s);
     if (!pcap) { fprintf(stderr, "ds4: [EVAL_IDS] prefill_cap=0 -- aborting\n"); exit(1); }
-    /* 不设 DS4_METAL_PREFILL_CHUNK 时 prefill_cap 等于整个 ctx(一次灌完), 那会让 hc
-     * 暂存和单批显存都按 S 放大。仪器自己按 512 分块(DS4_EVAL_CHUNK 可调), 与 A3
-     * 的 PREFILL_CHUNK=512 口径一致; 分块只影响批大小, 不影响数值。 */
+    /* 仪器固定按 512 分块: 不分块时 prefill_cap 等于整个 ctx(一次灌完), hc 暂存和
+     * 单批显存都按 S 放大。分块只影响批大小, 不影响数值。 */
     uint32_t cap = 512u;
-    { const char *cv = getenv("DS4_EVAL_CHUNK"); if (cv && atoi(cv) > 0) cap = (uint32_t)atoi(cv); }
     if (cap > pcap) cap = pcap;
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     float *hc = xmalloc((size_t)cap * hc_dim * sizeof(float));
 
     FILE *lf = NULL; float *lg = NULL;
-    const char *lp = getenv("DS4_EVAL_LOGITS");
+    const char *lp = ds4_tool_eval_logits();
     if (lp && lp[0]) {
         lf = fopen(lp, "wb");
         if (!lf) {
@@ -353,7 +316,7 @@ void ds4_eval_ids_run(ds4_engine *e) {
     }
     fprintf(stderr, "ds4: [EVAL_IDS] 完成 S=%u vocab=%u%s%s\n", n, vocab,
             lp && lp[0] ? " logits已写" : "",
-            getenv("DS4_EVAL_HDUMP") ? " hidden已写" : "");
+            ds4_tool_eval_hdump() ? " hidden已写" : "");
     ds4_session_free(s);
     free(hc); free(lg); free(ids);
     exit(0);

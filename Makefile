@@ -31,6 +31,7 @@ DIST_OBJS = src/dist/dist_util.o src/dist/dist_transport.o src/dist/dist_framing
     src/dist/dist_coord_main.o src/dist/dist_worker_loop.o src/dist/dist_worker_route.o \
     src/dist/dist_worker_fwd.o src/dist/dist_worker_kv.o src/dist/dist_worker_exec.o \
     src/dist/dist_worker_prefetch.o src/dist/dist_worker_main.o src/dist/dist_cli.o \
+    src/dist/dist_cli_check.o \
     src/dist/dist_rfetch.o
 # EVAL 模块(重构阶段3: ds4_eval.c 拆分为 src/eval/*.c)
 EVAL_SRCS := $(wildcard src/eval/*.c)

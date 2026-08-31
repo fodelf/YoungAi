@@ -78,29 +78,6 @@ int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec_long(
         return 0;
     }
 
-    const bool flash_stage_profile =
-        getenv("DS4_METAL_FLASH_ATTN_STAGE_PROFILE") != NULL && g_batch_cb != nil;
-    double flash_stage_t0 = 0.0;
-    if (flash_stage_profile) {
-        if (ds4_gpu_end_commands() == 0 || ds4_gpu_begin_commands() == 0) {
-            return 0;
-        }
-        int profile_owned = 0;
-        cb = ds4_gpu_command_buffer(&profile_owned);
-        if (!cb || profile_owned) return 0;
-        *cbp = cb;
-        flash_stage_t0 = ds4_gpu_now_ms();
-    }
-#define DS4_METAL_PROFILE_FLASH_ATTN_STAGE(name) do { \
-        if (flash_stage_profile) { \
-            if (!ds4_gpu_flash_attn_stage_profile_boundary(cbp, \
-                    "static_mixed_nonvec", (name), n_tokens, n_comp, n_keys, \
-                    n_head, head_dim, window, ratio, &flash_stage_t0)) { \
-                return 0; \
-            } \
-            cb = *cbp; \
-        } \
-    } while (0)
 
     if (!ds4_gpu_encode_cpy_f32_f16_1d(cb,
                                          rawbuf,
@@ -110,7 +87,6 @@ int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec_long(
                                          n_tokens * head_dim)) {
         return 0;
     }
-    DS4_METAL_PROFILE_FLASH_ATTN_STAGE("copy_raw");
     if (n_comp &&
         !ds4_gpu_encode_copy_to_f16_1d(cb,
                                        compbuf,
@@ -122,7 +98,6 @@ int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec_long(
         return 0;
     }
     if (n_comp) {
-        DS4_METAL_PROFILE_FLASH_ATTN_STAGE("copy_comp");
     }
 
     ds4_gpu_fill_static_mixed_prefill_mask((uint16_t *)[mask_buffer contents],
@@ -130,7 +105,6 @@ int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec_long(
                                              n_comp,
                                              window,
                                              ratio);
-    DS4_METAL_PROFILE_FLASH_ATTN_STAGE("mask_fill");
     if (use_comp_mask && n_comp != 0) {
         if (!ds4_gpu_encode_cpy_f32_f16_2d(cb,
                                              maskbuf,
@@ -143,7 +117,6 @@ int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec_long(
                                              (uint64_t)n_keys * sizeof(uint16_t))) {
             return 0;
         }
-        DS4_METAL_PROFILE_FLASH_ATTN_STAGE("mask_comp_copy");
     }
 
     id<MTLComputePipelineState> pad_pipeline = nil;
@@ -190,7 +163,6 @@ int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec_long(
         [enc dispatchThreadgroups:MTLSizeMake(ncpsg, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
-        DS4_METAL_PROFILE_FLASH_ATTN_STAGE("pad");
     }
 
     ds4_gpu_flash_attn_blk_args blk_args = {
@@ -213,7 +185,6 @@ int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec_long(
     [enc dispatchThreadgroups:MTLSizeMake(nblk0, nblk1, 1)
          threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
-    DS4_METAL_PROFILE_FLASH_ATTN_STAGE("block_map");
 
     ds4_gpu_flash_attn_vec_args args = {
         .ne01 = (int32_t)n_tokens,
@@ -270,8 +241,6 @@ int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec_long(
     [enc dispatchThreadgroups:MTLSizeMake(nblk1, n_head, 1)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
-    DS4_METAL_PROFILE_FLASH_ATTN_STAGE("attention");
 
-#undef DS4_METAL_PROFILE_FLASH_ATTN_STAGE
     return 1;
 }

@@ -1,18 +1,12 @@
 /* metal_moe_vq.m — ds4_metal.m 机械拆分产物(不改名/不改逻辑/不改字符串)。 */
 #import "metal_internal.h"
 
-/* Pass 2: optionally sort the active ids ascending (= ascending file offsets,
- * so cold reads walk the GGUF forward instead of jumping around) and rewrite
- * the selected-id buffer from original expert ids to compact scratch slots.
- * Bit-exact either way: per-pick results and their summation order are
+/* Pass 2: rewrite the selected-id buffer from original expert ids to compact
+ * scratch slots.  Bit-exact: per-pick results and their summation order are
  * unchanged, only the scratch slot numbering moves. */
 #include "vq_fmt.h"
 
 id<MTLBuffer> g_moe_vq_gate_scratch, g_moe_vq_up_scratch, g_moe_vq_down_scratch;
-
-float *g_vq_diag_ref;
-
-uint32_t g_vq_diag_layer, g_vq_diag_ntok, g_vq_diag_out;
 
 static void *ds4_vq_gather_worker(void *arg) {
     ds4_vq_gather_task *t = (ds4_vq_gather_task *)arg;
@@ -64,7 +58,7 @@ static void *ds4_vq_gather_worker(void *arg) {
 }
 
 /* v2.2 VQ unified gather: 全活跃专家 dequant→f16 scratch(热三矩阵/冷 w1w3 走层 blob;
- * 冷 w2 从 base go1b 字节展开 ±d)。scratch 上限护栏 DS4_VQ_SCRATCH_GB(默认3)。 */
+ * 冷 w2 从 base go1b 字节展开 ±d)。scratch 上限护栏 DS4_METAL_VQ_SCRATCH_CAP_BYTES。 */
 int ds4_gpu_vq_unified_gather(
         const void *model_map, const uint8_t *blob,
         uint32_t n_active, const uint32_t *active_ids,
@@ -73,11 +67,10 @@ int ds4_gpu_vq_unified_gather(
     const uint64_t ge = (uint64_t)expert_mid_dim * expert_in_dim * 2u;   /* f16 gate/up 每专家 */
     const uint64_t de = (uint64_t)out_dim * expert_mid_dim * 2u;
     const uint64_t need_g = (uint64_t)n_active * ge, need_d = (uint64_t)n_active * de;
-    static uint64_t cap = 0;
-    if (!cap) { const char *e = getenv("DS4_VQ_SCRATCH_GB"); double g = e ? atof(e) : 3.0; cap = (uint64_t)(g * 1073741824.0); }
-    if (2 * need_g + need_d > cap) {
-        fprintf(stderr, "ds4: VQ gather scratch %.2fGB > cap(降 DS4_METAL_PREFILL_CHUNK 或调 DS4_VQ_SCRATCH_GB)\n",
-                (2.0 * need_g + need_d) / 1073741824.0);
+    if (2 * need_g + need_d > DS4_METAL_VQ_SCRATCH_CAP_BYTES) {
+        fprintf(stderr, "ds4: VQ gather scratch %.2fGB > cap %.1fGB (降 prefill chunk)\n",
+                (2.0 * need_g + need_d) / 1073741824.0,
+                (double)DS4_METAL_VQ_SCRATCH_CAP_BYTES / 1073741824.0);
         return 0;
     }
     if (!g_moe_vq_gate_scratch || (uint64_t)g_moe_vq_gate_scratch.length < need_g) {
@@ -88,9 +81,8 @@ int ds4_gpu_vq_unified_gather(
         g_moe_vq_down_scratch = [g_device newBufferWithLength:(NSUInteger)need_d options:MTLResourceStorageModeShared];
     if (!g_moe_vq_gate_scratch || !g_moe_vq_up_scratch || !g_moe_vq_down_scratch) return 0;
     /* memset 移除: 下面 dequant 填满全部 n_active 专家 gate/up/down, 清零冗余(省~300ms/token, ~730MB memset) */
-    double _vqgt = getenv("DS4_VQ_GT") ? ds4_gpu_now_ms() : 0.0;
-    /* 8 线程并行 dequant(各专家写不相交 scratch, 无锁); 串行是 decode 慢主因 */
-    int vqnth = 8; { const char *te = getenv("DS4_METAL_EXPERT_GATHER_THREADS"); if (te && atoi(te) > 0) vqnth = atoi(te); }
+    /* 并行 dequant(各专家写不相交 scratch, 无锁); 串行是 decode 慢主因 */
+    int vqnth = (int)ds4_gpu_expert_gather_threads();
     if ((uint32_t)vqnth > n_active) vqnth = (int)(n_active ? n_active : 1);
     if (vqnth > 32) vqnth = 32;
     volatile int vqerr = 0;
@@ -106,19 +98,6 @@ int ds4_gpu_vq_unified_gather(
     }
     for (int ti = 0; ti < vqnth; ti++) pthread_join(vqth[ti], NULL);
     if (vqerr) return 0;
-    if (_vqgt) fprintf(stderr, "[VQ_GT] n_active=%u nth=%d dequant=%.1fms\n", n_active, vqnth, ds4_gpu_now_ms() - _vqgt);
-    if (getenv("DS4_VQ_DEBUG") && n_active > 0) {
-        const uint16_t *g0 = (const uint16_t *)g_moe_vq_gate_scratch.contents;
-        const uint16_t *d0 = (const uint16_t *)g_moe_vq_down_scratch.contents;
-        int nz_g = 0, nz_d = 0;
-        for (uint64_t k = 0; k < ge / 2u; k++) if (g0[k]) nz_g++;
-        for (uint64_t k = 0; k < de / 2u; k++) if (d0[k]) nz_d++;
-        uint64_t o1 = ds4vq_slot(blob, (int)active_ids[0], 0);
-        uint64_t o2 = ds4vq_slot(blob, (int)active_ids[0], 2);
-        fprintf(stderr, "[VQ_DBG] n_active=%u e0=%u gate_nz=%d/%llu(w0=%.4f) down_nz=%d/%llu o1=%llu o2=%llu(w2hot=%d)\n",
-                n_active, active_ids[0], nz_g, (unsigned long long)(ge/2u), ds4vq_f16(g0[0]),
-                nz_d, (unsigned long long)(de/2u), (unsigned long long)o1, (unsigned long long)o2, o2!=0);
-    }
     return 1;
 }
 
@@ -184,14 +163,12 @@ int ds4_gpu_remap_selected_to_slots(
         uint32_t      n_expert_total,
         uint32_t     *active_ids,
         uint32_t      n_active) {
-    if (!selectedbuf || !active_ids || n_active == 0 || n_active > 1024u) return 0;
-    if (ds4_gpu_expert_sort_ids_enabled() && n_active > 1u) {
-        qsort(active_ids, n_active, sizeof(uint32_t), ds4_gpu_cmp_u32);
-    }
-    int16_t compact_lut[1024];
-    for (uint32_t i = 0; i < 1024u; i++) compact_lut[i] = -1;
+    if (!selectedbuf || !active_ids || n_active == 0 ||
+        n_active > DS4_METAL_ACTIVE_EXPERTS_MAX) return 0;
+    int16_t compact_lut[DS4_METAL_ACTIVE_EXPERTS_MAX];
+    for (uint32_t i = 0; i < DS4_METAL_ACTIVE_EXPERTS_MAX; i++) compact_lut[i] = -1;
     for (uint32_t s = 0; s < n_active; s++) {
-        if (active_ids[s] >= 1024u) return 0;
+        if (active_ids[s] >= DS4_METAL_ACTIVE_EXPERTS_MAX) return 0;
         compact_lut[active_ids[s]] = (int16_t)s;
     }
     int32_t *sel_cpu =
@@ -199,7 +176,7 @@ int ds4_gpu_remap_selected_to_slots(
     for (uint32_t i = 0; i < n_picks; i++) {
         int32_t raw = sel_cpu[i];
         uint32_t id = (raw >= 0 && (uint32_t)raw < n_expert_total) ? (uint32_t)raw : 0u;
-        if (id >= 1024u || compact_lut[id] < 0) return 0;
+        if (id >= DS4_METAL_ACTIVE_EXPERTS_MAX || compact_lut[id] < 0) return 0;
         sel_cpu[i] = (int32_t)compact_lut[id];
     }
     return 1;

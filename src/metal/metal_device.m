@@ -9,14 +9,6 @@ void ds4_gpu_close_batch_encoder(void) {
 
 int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *label) {
     [cb waitUntilCompleted];
-    if (getenv("DS4_DRAIN_GPU_TIME")) {
-        /* GPU-busy vs host-wait splitter: kernelEnd-kernelStart = scheduling+
-         * encode validation; GPUEnd-GPUStart = shader execution. */
-        fprintf(stderr, "ds4: cb-time %s gpu=%.2fms sched=%.2fms\n",
-                label ? label : "?",
-                (cb.GPUEndTime - cb.GPUStartTime) * 1e3,
-                (cb.kernelEndTime - cb.kernelStartTime) * 1e3);
-    }
     if (cb.status == MTLCommandBufferStatusError) {
         fprintf(stderr, "ds4: Metal %s failed: %s\n",
                 label, [[cb.error localizedDescription] UTF8String]);
@@ -49,7 +41,9 @@ int ds4_gpu_finish_command_buffer(id<MTLCommandBuffer> cb, int owned, const char
     [cb commit];
     int ok = ds4_gpu_wait_pending_command_buffers(label);
     if (!ds4_gpu_wait_command_buffer(cb, label)) ok = 0;
-    if (!ok && cb.error && getenv("DS4_RESIDUAL_DEBUG"))
+    /* Always surface the real CB error object — this used to hide behind a
+     * debug env and swallowed genuine GPU faults. */
+    if (!ok && cb.error)
         fprintf(stderr, "ds4: [cb-error] %s: %s\n", label ? label : "?",
                 cb.error.localizedDescription.UTF8String);
     [g_transient_buffers removeAllObjects];

@@ -27,7 +27,6 @@ static ssize_t st_pread(int fd, void *buf, size_t n, off_t off) {
 #include "ds4_fp8.h"
 
 static float ST_LUT[256];
-static int g_bbq4 = -1;   /* backbone q4 往返: -1=看 DS4_BB_Q4 env, 0/1=运行时切(BBQ4_AB 同进程 A/B) */
 /* LUT 改由 src/common/ds4_fp8.h 的唯一 E4M3 解码填充(重构阶段2 收敛 6 份副本)。
  * 数值逐位等价原 powf 式: 全部是 2 的幂精确缩放, NaN/±0 槽位同。 */
 static void st_lut_init(void) {
@@ -241,31 +240,15 @@ float *st_read_weight(st_ctx *c, const char *name, long *R_out, long *C_out) {
     } else { /* F32 */
         if(st_pread(fdw,w,(size_t)Rr*Cc*4,ds+off[0])!=(ssize_t)((size_t)Rr*Cc*4)){fprintf(stderr,"st: F32 读不满 %s\n",name);exit(1);}
     }
-    /* DS4_BB_Q4(2026-07-28 backbone 体积针): 非专家 2D 矩阵 q4 往返(32组非对称≈Q4_K 略保守)。
-     * 排除: routed 专家(量化主体另有管线)/norm/embed/head/scale/bias。shared_experts 属
-     * backbone 驻留=纳入。FP 锚必须走缓存(本钩子武装时不得重建锚, 否则参照系被污染)。 */
-    {int bb_on = (g_bbq4==-1) ? (getenv("DS4_BB_Q4")!=NULL) : g_bbq4;
-    if(bb_on && Rr>1 && Cc>=256 && !strstr(name,".ffn.experts.")
-       && !strstr(name,"norm") && !strstr(name,"embed") && !strstr(name,"head")
-       && !strstr(name,"bias")){
-        static int bn=0;
-        if(!bn){ fprintf(stderr,"[bbq4] backbone q4 往返已武装(32组非对称)\n"); bn=1; }
-        for(long r=0;r<Rr;r++){ float*row=w+(size_t)r*Cc;
-            for(long j0=0;j0<Cc;j0+=32){ long g=Cc-j0<32?Cc-j0:32;
-                float mn=row[j0],mx=row[j0];
-                for(long j=1;j<g;j++){ float v=row[j0+j]; if(v<mn)mn=v; if(v>mx)mx=v; }
-                float d=(mx-mn)/15.0f; if(d<=0.0f) continue;
-                for(long j=0;j<g;j++){ int q=(int)((row[j0+j]-mn)/d+0.5f);
-                    row[j0+j]=mn+(float)q*d; } } }
-    }}
     if(R_out)*R_out=Rr; if(C_out)*C_out=Cc; return w;   /* fd/头由 st_ctx 缓存持有, 不在这里关 */
 }
 
 #ifdef ST_READ_SELFTEST
 int main(int argc,char**argv){
-    const char *hf=getenv("DS4_HF"); if(!hf) hf="/Users/fodelf/ds4-main/hf/DeepSeek-V4-Flash-Base";
+    if(argc<2){fprintf(stderr,"usage: st_selftest <hf-dir> [tensor-name]\n");return 2;}
+    const char *hf=argv[1];
     st_ctx c; st_open(&c,hf);
-    const char *name=argc>1?argv[1]:"layers.0.attn_norm.weight";
+    const char *name=argc>2?argv[2]:"layers.0.attn_norm.weight";
     long R,C; float *w=st_read_weight(&c,name,&R,&C);
     if(!w){printf("FAIL read %s\n",name);return 1;}
     printf("%s R=%ld C=%ld first6:",name,R,C);

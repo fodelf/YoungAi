@@ -12,14 +12,19 @@
  * guard 外 — 该构建本就不链 GPU suite, 缺定义只在真被调用时才暴露(与拆分前
  * 隐式声明的行为一致, 但编译期干净)。 */
 const char *test_model_path(void);
+/* ds4_test 的带值参数 (t_main.c 解析; 默认值在各消费点)。 */
+extern const char *g_test_model;
+extern const char *g_test_vector_file;
+extern const char *g_test_long_prompt;
+extern const char *g_test_mpp_case;
+extern const char *g_test_local_golden;
+extern int g_test_keep_metal4;   /* --keep-metal4: logprob 向量测试期间不强制关 Metal4 */
 
 #ifndef DS4_NO_GPU
 #include "../ds4_gpu.h"
 #include <math.h>
 
 /* ---- t_engine.c: 共享引擎缓存 + env 保存恢复 + f16 转换 ---- */
-char *test_save_env(const char *name);
-void test_restore_env(const char *name, char *saved);
 ds4_engine *test_open_engine(bool quality);
 ds4_engine *test_get_engine(bool quality);
 void test_close_engines(void);

@@ -156,11 +156,7 @@ struct ds4_zchain *zchain_from_model(const ds4_model *m) {
         snprintf(nm, sizeof nm, "blk.%u.opt_zlm.weight", il);
         ds4_tensor *tzl = model_find_tensor(m, nm);
         const uint16_t *zlm = tzl ? (const uint16_t *)tensor_data(m, tzl) : NULL;
-        /* DS4_ZCHAIN_NO_GE=1: 诊断开关 — 跳过 GE 表装载(所有折叠点按 ge==NULL 自然短路)。
-         * 依据(2026-07-21): GE=per-expert 增益把 base 修向 FP; 加性残差侧车的前提是
-         * base≈裸 Q1 → GE×残差=按专家双重修正嫌疑(Go-hot 命中面上集中爆), A/B 判决用。 */
-        const char *nge = getenv("DS4_ZCHAIN_NO_GE");   /* 值语义: 空串/"0"=不跳过(在案空串陷阱, quant_layer M4.6 同款) */
-        if (tg && tg->dim[0] == DS4_N_EXPERT && !(nge && *nge && *nge != '0')) {
+        if (tg && tg->dim[0] == DS4_N_EXPERT) {
             const float *ge = (const float *)tensor_data(m, tg);
             if (ge) {
                 z->layer[il].ge = xmalloc((size_t)DS4_N_EXPERT * sizeof(float));

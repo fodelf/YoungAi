@@ -51,33 +51,24 @@ int ds4_gpu_attention_output_q8_batch_tensor(
         (void)group_tmp;
         (void)low_tmp;
 
-        const bool use_direct_low =
-            n_tokens < 32u && getenv("DS4_METAL_DISABLE_ATTN_OUT_LOW_DIRECT") == NULL;
+        const bool use_direct_low = n_tokens < DS4_METAL_ATTN_OUT_MM_MIN_TOKENS;
         /* The exported TensorOps attention-output kernel is a 64-token tile.
          * Keep this on full tiles only; smaller multiples of 32 use the legacy
          * path instead of relying on cooperative tensor partial RHS bounds. */
         const bool use_mpp_low =
-            n_tokens >= 32u &&
+            n_tokens >= DS4_METAL_ATTN_OUT_MM_MIN_TOKENS &&
             (n_tokens % DS4_METAL_ATTN_OUT_MPP_TILE_N) == 0 &&
             ds4_gpu_use_mpp_attn_out_low_matmul();
         const NSUInteger ids_bytes = (NSUInteger)n_tokens * (NSUInteger)n_groups * sizeof(int32_t);
         id<MTLBuffer> group_ids_buffer = nil;
         if (!use_direct_low && !use_mpp_low) {
-            if (getenv("DS4_METAL_DISABLE_ATTN_OUT_IDS_CACHE") != NULL) {
-                group_ids_buffer =
-                    ds4_gpu_new_transient_buffer(ids_bytes, "attention output group ids");
-                if (!group_ids_buffer) {
-                    return 0;
-                }
-            } else {
-                if (!ds4_gpu_ensure_scratch_buffer(&g_attn_out_group_ids_buffer,
-                                                     &g_attn_out_group_ids_bytes,
-                                                     ids_bytes,
-                                                     "ds4_attention_output_group_ids")) {
-                    return 0;
-                }
-                group_ids_buffer = g_attn_out_group_ids_buffer;
+            if (!ds4_gpu_ensure_scratch_buffer(&g_attn_out_group_ids_buffer,
+                                                 &g_attn_out_group_ids_bytes,
+                                                 ids_bytes,
+                                                 "ds4_attention_output_group_ids")) {
+                return 0;
             }
+            group_ids_buffer = g_attn_out_group_ids_buffer;
             int32_t *ids = (int32_t *)[group_ids_buffer contents];
             for (uint32_t t = 0; t < n_tokens; t++) {
                 for (uint32_t group = 0; group < n_groups; group++) {
@@ -102,37 +93,6 @@ int ds4_gpu_attention_output_q8_batch_tensor(
         if (!cb || owned) {
             ok = false;
         }
-        const bool attn_out_profile =
-            getenv("DS4_METAL_ATTN_OUT_STAGE_PROFILE") != NULL && g_batch_cb != nil;
-        if (ok && attn_out_profile) {
-            if (ds4_gpu_end_commands() == 0 || ds4_gpu_begin_commands() == 0) {
-                ok = false;
-            } else {
-                cb = ds4_gpu_command_buffer(&owned);
-                if (!cb || owned) ok = false;
-            }
-        }
-        double attn_out_t0 = attn_out_profile ? ds4_gpu_now_ms() : 0.0;
-#define DS4_METAL_PROFILE_ATTN_OUT_STAGE(name) do { \
-            if (ok && attn_out_profile) { \
-                if (ds4_gpu_end_commands() == 0) { \
-                    ok = false; \
-                } else { \
-                    const double now_ms = ds4_gpu_now_ms(); \
-                    fprintf(stderr, \
-                            "ds4: Metal attention output stage tokens=%u %s=%.3f ms\n", \
-                            n_tokens, (name), now_ms - attn_out_t0); \
-                    attn_out_t0 = now_ms; \
-                    if (ds4_gpu_begin_commands() == 0) { \
-                        ok = false; \
-                    } else { \
-                        cb = ds4_gpu_command_buffer(&owned); \
-                        if (!cb || owned) ok = false; \
-                    } \
-                } \
-            } \
-        } while (0)
-
         if (ok) {
             /*
              * Batched attention-output projections switch from the vector
@@ -173,13 +133,10 @@ int ds4_gpu_attention_output_q8_batch_tensor(
                 if (!ok) {
                     ds4_gpu_warn_mpp_fallback();
                     if (ds4_gpu_mul_mm_id_map0_name(n_groups) != NULL) {
-                        if (getenv("DS4_METAL_DISABLE_ATTN_OUT_IDS_CACHE") != NULL) {
-                            group_ids_buffer =
-                                ds4_gpu_new_transient_buffer(ids_bytes, "attention output group ids");
-                        } else if (ds4_gpu_ensure_scratch_buffer(&g_attn_out_group_ids_buffer,
-                                                                   &g_attn_out_group_ids_bytes,
-                                                                   ids_bytes,
-                                                                   "ds4_attention_output_group_ids")) {
+                        if (ds4_gpu_ensure_scratch_buffer(&g_attn_out_group_ids_buffer,
+                                                            &g_attn_out_group_ids_bytes,
+                                                            ids_bytes,
+                                                            "ds4_attention_output_group_ids")) {
                             group_ids_buffer = g_attn_out_group_ids_buffer;
                         }
                         if (group_ids_buffer) {
@@ -215,7 +172,7 @@ int ds4_gpu_attention_output_q8_batch_tensor(
                         }
                     }
                 }
-            } else if (n_tokens >= 32u && ds4_gpu_mul_mm_id_map0_name(n_groups) != NULL) {
+            } else if (n_tokens >= DS4_METAL_ATTN_OUT_MM_MIN_TOKENS && ds4_gpu_mul_mm_id_map0_name(n_groups) != NULL) {
                 ds4_gpu_mul_mm_id_map_args map_args =
                     ds4_gpu_make_mul_mm_id_map_args((uint32_t)group_dim,
                                                       n_groups,
@@ -325,19 +282,16 @@ int ds4_gpu_attention_output_q8_batch_tensor(
                                                 true) != 0;
             }
         }
-        DS4_METAL_PROFILE_ATTN_OUT_STAGE("low_proj");
 
         if (ok) {
             ok = ds4_gpu_matmul_q8_0_tensor(out, model_map, model_size,
                                               out_b_offset,
                                               low_dim, out_dim, low, n_tokens) != 0;
         }
-        DS4_METAL_PROFILE_ATTN_OUT_STAGE("out_proj");
 
         if (!had_batch) {
             ok = ds4_gpu_end_commands() != 0 && ok;
         }
-#undef DS4_METAL_PROFILE_ATTN_OUT_STAGE
         return ok ? 1 : 0;
     }
 }

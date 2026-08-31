@@ -19,13 +19,6 @@ ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
         if (g_tensor_alloc_live_bytes > g_tensor_alloc_peak_bytes) {
             g_tensor_alloc_peak_bytes = g_tensor_alloc_live_bytes;
         }
-        if (ds4_gpu_trace_allocs()) {
-            fprintf(stderr,
-                    "ds4: Metal tensor alloc %.3f MiB live %.3f MiB peak %.3f MiB\n",
-                    (double)bytes / (1024.0 * 1024.0),
-                    (double)g_tensor_alloc_live_bytes / (1024.0 * 1024.0),
-                    (double)g_tensor_alloc_peak_bytes / (1024.0 * 1024.0));
-        }
         return (__bridge_retained ds4_gpu_tensor *)tensor;
     }
 }
@@ -67,13 +60,6 @@ void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
                 g_tensor_alloc_live_bytes -= obj.bytes;
             } else {
                 g_tensor_alloc_live_bytes = 0;
-            }
-            if (ds4_gpu_trace_allocs()) {
-                fprintf(stderr,
-                        "ds4: Metal tensor free %.3f MiB live %.3f MiB peak %.3f MiB\n",
-                        (double)obj.bytes / (1024.0 * 1024.0),
-                        (double)g_tensor_alloc_live_bytes / (1024.0 * 1024.0),
-                        (double)g_tensor_alloc_peak_bytes / (1024.0 * 1024.0));
             }
         }
         obj.buffer = nil;

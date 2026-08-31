@@ -26,7 +26,6 @@ int generate_raw_swa_cpu(
 
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
     int pos = prompt->len;
-    const bool trace_top = getenv("DS4_TRACE_TOP") != NULL;
     const double t_prefill0 = now_sec();
 
     if (prompt->len <= 0 || prompt->len > ctx_size) {
@@ -44,28 +43,10 @@ int generate_raw_swa_cpu(
 
     const double t_prefill1 = now_sec();
     fprintf(stderr, "ds4: prefill %d/%d done\n", prompt->len, prompt->len);
-    const char *dump_prefill_logits = getenv("DS4_CPU_DUMP_PREFILL_LOGITS");
-    if (dump_prefill_logits && dump_prefill_logits[0]) {
-        if (!write_f32_binary_file(dump_prefill_logits, logits, DS4_N_VOCAB)) {
-            free(logits);
-            cpu_decode_scratch_free(&decode_scratch);
-            kv_cache_free(&cache);
-            return 1;
-        }
-        fprintf(stderr, "ds4: wrote CPU prefill logits to %s\n", dump_prefill_logits);
-    }
 
     int n_generated = 0;
-    int n_decode_eval = 0;
-    const bool token_timing = getenv("DS4_TOKEN_TIMING") != NULL;
     const double t_decode0 = now_sec();
     for (int i = 0; i < n_predict && pos < ctx_size; i++) {
-        if (trace_top) {
-            char label[64];
-            snprintf(label, sizeof(label), "step %d", i);
-            print_top_logits(stderr, label, vocab, logits, DS4_N_VOCAB, 10);
-        }
-
         int token = sample_argmax(logits, DS4_N_VOCAB);
         if (token == vocab->eos_id) break;
 
@@ -77,7 +58,6 @@ int generate_raw_swa_cpu(
             break;
         }
 
-        const double t_eval0 = token_timing ? now_sec() : 0.0;
         /* The CPU decode step is expected to reuse buffers from
          * cpu_decode_scratch.  Keep the allocation guard tightly scoped to the
          * decode math itself; sampling, token emission, tracing, and callbacks
@@ -90,11 +70,6 @@ int generate_raw_swa_cpu(
                                                  directional_steering_ffn,
                                                  &decode_scratch);
         ds4_alloc_guard_end();
-        if (token_timing) {
-            const double t_eval1 = now_sec();
-            fprintf(stderr, "ds4: decode eval %d took %.3f ms\n", n_decode_eval + 1, (t_eval1 - t_eval0) * 1000.0);
-        }
-        n_decode_eval++;
         pos++;
     }
     const double t_decode1 = now_sec();
@@ -166,12 +141,7 @@ int generate_metal_graph_raw_swa(
         metal_graph_free(&g);
         return 1;
     }
-    const bool memory_report = getenv("DS4_METAL_MEMORY_REPORT") != NULL;
-    if (memory_report) ds4_gpu_print_memory_report("after graph alloc");
-
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
-    const bool trace_top = getenv("DS4_TRACE_TOP") != NULL;
-    const bool token_timing = getenv("DS4_TOKEN_TIMING") != NULL;
 
     const double t_prefill0 = now_sec();
     if (prefill_cap < (uint32_t)prompt->len) {
@@ -185,73 +155,19 @@ int generate_metal_graph_raw_swa(
                                          progress, progress_ud);
     }
     const double t_prefill1 = now_sec();
-    if (memory_report) ds4_gpu_print_memory_report("after prefill");
 
     if (!ok) {
         free(logits);
         metal_graph_free(&g);
         return 1;
     }
-    const char *dump_prefill_logits = getenv("DS4_METAL_DUMP_PREFILL_LOGITS");
-    if (dump_prefill_logits && dump_prefill_logits[0]) {
-        if (!write_f32_binary_file(dump_prefill_logits, logits, DS4_N_VOCAB)) {
-            free(logits);
-            metal_graph_free(&g);
-            return 1;
-        }
-        fprintf(stderr, "ds4: wrote GPU prefill logits to %s\n", dump_prefill_logits);
-    }
 
-        /* DSpark 探针(DS4_DSPARK_PROBE=1): 每 decode token 后跑 drafter 块, 打印草稿与
-     * 后续真实 token 的命中; capture buffer 补分配(graph alloc 时 flag 未置)。 */
-    static ds4_dspark_weights g_dsw;
-    const bool dspark_probe = getenv("DS4_DSPARK_PROBE") != NULL;
-    if (getenv("DS4_DSPARK_PROBE"))
-        fprintf(stderr, "ds4: [dspark-probe] enter generate loop, probe=%d\n", (int)dspark_probe);
-    int dspark_pending[DS4_DSPARK_BLK]; int dspark_pending_n = 0; uint32_t dspark_hit = 0, dspark_tot = 0;
-    if (dspark_probe) {
-        dspark_bind_with_draft(&g_dsw, model, true);
-        if (g_dsw.ready) {
-            g.dspark_capture = 1;
-            if (!g.dspark_main_hidden) {
-                const uint32_t B = 5u;
-                g.dspark_main_hidden = ds4_gpu_tensor_alloc(3ull * DS4_N_EMBD * sizeof(float));
-                g.dspark_main_x_raw = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-                g.dspark_main_x = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-                g.dspark_kv_tmp = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
-                for (int b = 0; b < 3; b++)
-                    g.dspark_win_kv[b] = ds4_gpu_tensor_alloc(128ull * DS4_N_HEAD_DIM * sizeof(float));
-                g.dspark_ids = ds4_gpu_tensor_alloc(B * sizeof(int32_t));
-                g.dspark_hc_pre = ds4_gpu_tensor_alloc((uint64_t)B * DS4_N_HC * sizeof(float));
-                g.dspark_hc_w = ds4_gpu_tensor_alloc((uint64_t)B * DS4_N_HC * sizeof(float));
-                g.dspark_flat = ds4_gpu_tensor_alloc((uint64_t)B * DS4_N_EMBD * sizeof(float));
-                g.dspark_flat_norm = ds4_gpu_tensor_alloc((uint64_t)B * DS4_N_EMBD * sizeof(float));
-                g.dspark_logits = ds4_gpu_tensor_alloc((uint64_t)B * DS4_N_VOCAB * sizeof(float));
-                g.dspark_prev_id = ds4_gpu_tensor_alloc(sizeof(int32_t));
-                g.dspark_out_id = ds4_gpu_tensor_alloc(sizeof(int32_t));
-            }
-        } else {
-            fprintf(stderr, "ds4: [dspark-probe] drafter not armed, probe off\n");
-        }
-    }
     int pos = prompt->len;
     int n_generated = 0;
-    int n_decode_eval = 0;
     const double t_decode0 = now_sec();
     for (int i = 0; i < n_predict && pos < ctx_size; i++) {
-        if (trace_top) {
-            char label[64];
-            snprintf(label, sizeof(label), "step %d", i);
-            print_top_logits(stderr, label, vocab, logits, DS4_N_VOCAB, 10);
-        }
-
         int token = sample_argmax(logits, DS4_N_VOCAB);
         if (token == vocab->eos_id) break;
-        if (dspark_probe && dspark_pending_n > 0) {
-            dspark_tot++;
-            if (dspark_pending[0] == token) dspark_hit++;
-            dspark_pending_n = 0;
-        }
 
         if (emit) emit(emit_ud, token);
         n_generated++;
@@ -261,7 +177,6 @@ int generate_metal_graph_raw_swa(
             break;
         }
 
-        const double t_eval0 = token_timing ? now_sec() : 0.0;
         ok = metal_graph_eval_token_raw_swa(&g,
                                             model,
                                             weights,
@@ -269,28 +184,8 @@ int generate_metal_graph_raw_swa(
                                             (uint32_t)pos,
                                             logits);
         if (!ok) break;
-        if (token_timing) {
-            const double t_eval1 = now_sec();
-            fprintf(stderr, "ds4: gpu decode eval %d took %.3f ms\n", n_decode_eval + 1, (t_eval1 - t_eval0) * 1000.0);
-        }
-        n_decode_eval++;
         pos++;
-        if (dspark_probe && g_dsw.ready) {
-            int ids[DS4_DSPARK_BLK] = {0};
-            if (metal_graph_dspark_step(&g, model, weights, &g_dsw, token, (uint32_t)(pos - 1), ids)) {
-                memcpy(dspark_pending, ids, sizeof(int) * DS4_DSPARK_BLK);
-                dspark_pending_n = DS4_DSPARK_BLK;
-                if (n_decode_eval <= 8)
-                    fprintf(stderr, "ds4: [dspark] pos=%d anchor=%d draft= %d %d %d %d %d\n",
-                            pos - 1, token, ids[0], ids[1], ids[2], ids[3], ids[4]);
-            } else if (n_decode_eval <= 3) {
-                fprintf(stderr, "ds4: [dspark] step failed at pos=%d\n", pos - 1);
-            }
-        }
     }
-    if (dspark_probe && dspark_tot)
-        fprintf(stderr, "ds4: [dspark] first-token hit %u/%u = %.1f%%\n",
-                dspark_hit, dspark_tot, 100.0 * dspark_hit / dspark_tot);
     const double t_decode1 = now_sec();
     if (done) done(emit_ud);
 
@@ -302,7 +197,6 @@ int generate_metal_graph_raw_swa(
             prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
             decode_s > 0.0 ? (double)n_generated / decode_s : 0.0);
 
-    if (memory_report) ds4_gpu_print_memory_report("before graph free");
     free(logits);
     metal_graph_free(&g);
     return ok ? 0 : 1;

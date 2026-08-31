@@ -284,7 +284,6 @@ typedef struct {
 extern ds4_ampanc_state g_ampanc;
 
 /* ---- GPU 跨文件函数声明(拆分工序新增; 定义散于 core_gpu_*.c) ---- */
-extern const char *g_dump_tag;
 bool metal_graph_spec_raw_snapshot(ds4_gpu_graph *g, uint32_t il, uint32_t pos0, uint32_t n);
 bool metal_graph_spec_raw_restore(ds4_gpu_graph *g, uint32_t pos0, uint32_t from, uint32_t to);
 bool metal_graph_indexer_stage_profile_boundary( const char *stage, uint32_t il, uint32_t pos0, uint32_t n_tokens, uint32_t n_comp, double *stage_t0);
@@ -312,11 +311,8 @@ uint32_t metal_graph_attn_comp_update_row(uint32_t row);
 ds4_gpu_tensor *metal_graph_attn_comp_update_target( ds4_gpu_graph *g, uint32_t il);
 bool metal_graph_commit_attn_comp_stage( ds4_gpu_graph *g, uint32_t il, uint32_t first_row, uint32_t rows);
 uint64_t metal_graph_context_bytes_for_kv_policy( uint32_t ctx_size, uint32_t raw_cap, uint32_t prefill_cap, uint64_t *kv_cache_bytes_out);
-void metal_graph_debug_dump_i32_tensor( const char *name, ds4_gpu_tensor *t, uint64_t n_i32, uint32_t il, uint32_t pos);
-void metal_graph_debug_dump_tensor( const char *name, ds4_gpu_tensor *t, uint64_t n_f32, uint32_t il, uint32_t pos);
 bool metal_graph_decode_hc_pre( ds4_gpu_tensor *out, ds4_gpu_tensor *split, const ds4_gpu_tensor *mix, const ds4_gpu_tensor *residual_hc, const ds4_model *model, uint64_t scale_offset, uint64_t base_offset);
 int metal_graph_decode_test( const ds4_model *model, const ds4_weights *weights, const token_vec *prompt);
-bool metal_graph_direct_expert_read_enabled(void);
 bool metal_graph_directional_steering_ffn_enabled(const ds4_gpu_graph *g);
 bool metal_graph_dspark_state_restore(ds4_gpu_graph *g);
 bool metal_graph_dspark_state_snapshot(ds4_gpu_graph *g);
@@ -354,19 +350,14 @@ ds4_gpu_tensor *metal_graph_tensor_row_view( ds4_gpu_tensor *base, uint32_t row,
 uint32_t metal_graph_token_split_after_layers(void);
 bool metal_graph_upload_prompt_embeddings_hc( ds4_gpu_tensor *out_hc, ds4_gpu_tensor *tokens, const ds4_model *model, const ds4_weights *weights, const token_vec *prompt, uint32_t pos0, uint32_t n_tokens);
 bool metal_graph_upload_prompt_tokens( ds4_gpu_tensor *out_tokens, const token_vec *prompt, uint32_t pos0, uint32_t n_tokens);
-bool metal_graph_use_reference_hc_decode(void);
-bool metal_graph_use_reference_hc_norm_decode(void);
-bool metal_graph_use_reference_qkv_norm(void);
 bool metal_graph_warmup_prefill_kernels( ds4_gpu_graph *g, const ds4_model *model, const ds4_weights *weights, uint32_t n_tokens);
 bool metal_tensor_fill_f32(ds4_gpu_tensor *t, float v, uint64_t n);
 int payload_write_tensor_span(FILE *fp, const ds4_gpu_tensor *tensor, uint64_t offset, uint64_t bytes, uint8_t *buf, size_t cap, char *err, size_t errlen);
 DS4_MAYBE_UNUSED int payload_write_tensor_span_f16_as_f32(FILE *fp, const ds4_gpu_tensor *tensor, uint64_t offset_f16, uint64_t count, uint8_t *buf, size_t cap, char *err, size_t errlen);
 const ds4_gpu_residual_set *residual_set_for(const ds4_model *m, uint32_t il);
 float rms_abs_diff(const float *a, const float *b, uint64_t n);
-void router_freq_collect(ds4_gpu_tensor *logits_t, uint32_t il, uint32_t n_tokens);
 uint64_t session_payload_live_tensor_bytes(const ds4_gpu_graph *g, uint32_t checkpoint_len);
 uint32_t session_raw_live_rows(const ds4_gpu_graph *g, uint32_t checkpoint_len);
-void trace_hnorm_head(ds4_gpu_graph *g, uint32_t vocab_dim);
 int zchain_gpu_upload(const struct ds4_zchain *z);
 int ampanc_on(void);
 void cap_batch_layer(ds4_gpu_graph *g, uint32_t il, uint32_t n_tokens);
@@ -380,7 +371,6 @@ ds4_gpu_tensor *metal_graph_attn_comp_prefill_target( ds4_gpu_graph *g, uint32_t
 void metal_graph_attn_comp_prefill_target_free(ds4_gpu_tensor *t);
 bool metal_graph_capture_prefix1_attn_state(ds4_gpu_graph *g, uint32_t il);
 bool metal_graph_capture_prefix1_index_state(ds4_gpu_graph *g, uint32_t il);
-void metal_graph_debug_dump_f16_tensor( const char *name, ds4_gpu_tensor *t, uint64_t n_f16, uint32_t il, uint32_t pos);
 uint32_t metal_graph_decode_indexer_sparse_threshold(const ds4_gpu_graph *g);
 bool metal_graph_decode_kv_store( ds4_gpu_tensor *kv, ds4_gpu_tensor *raw_cache, uint32_t raw_cap, uint32_t raw_row);
 bool metal_graph_directional_steering_attn_enabled(const ds4_gpu_graph *g);
@@ -389,14 +379,8 @@ bool metal_graph_ensure_ffn_out(ds4_gpu_graph *g);
 bool metal_graph_needs_ffn_out(const ds4_gpu_graph *g, uint32_t il, uint32_t pos);
 uint32_t metal_graph_raw_start_for_span( const ds4_gpu_graph *g, uint32_t last_pos, uint32_t n_raw);
 bool metal_graph_refresh_ratio4_compressor_state( ds4_gpu_graph *g, const ds4_model *model, ds4_gpu_tensor *state_kv, ds4_gpu_tensor *state_score, const ds4_tensor *kv_weight, const ds4_tensor *score_weight, const ds4_tensor *ape, uint32_t head_dim, uint32_t width, uint32_t pos0, uint32_t n_tokens);
-void metal_graph_trace_layer_stages( ds4_gpu_graph *g, const ds4_model *model, const ds4_layer_weights *layer, const float *cpu_in_hc, uint32_t il, int token);
-bool metal_graph_use_reference_attn_out_hc(void);
-bool metal_graph_use_reference_compressor_pair_proj(void);
-bool metal_graph_use_reference_kv_decode(void);
-bool metal_graph_use_reference_shared_down_hc(void);
 int payload_read_tensor_span(FILE *fp, ds4_gpu_tensor *tensor, uint64_t offset, uint64_t bytes, uint8_t *buf, size_t cap, uint64_t *remaining, char *err, size_t errlen);
 DS4_MAYBE_UNUSED int payload_read_tensor_span_f32_as_f16(FILE *fp, ds4_gpu_tensor *tensor, uint64_t offset_f16, uint64_t count, uint8_t *buf, size_t cap, uint64_t *remaining, char *err, size_t errlen);
-void trace_hnorm_layer(ds4_gpu_graph *g, uint32_t il, uint32_t pos, uint64_t hc_dim);
 
 #endif /* !DS4_NO_GPU */
 #endif /* DS4_CORE_GPU_GRAPH_H */

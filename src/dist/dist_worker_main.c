@@ -94,9 +94,7 @@ int dist_run_worker(ds4_engine *engine, const ds4_dist_options *opt, int ctx_siz
                 close(fd);
                 continue;
             }
-            int rc = getenv("DS4_DIST_DISABLE_WORKER_PREFETCH")
-                ? dist_worker_read_loop(&state, fd)
-                : dist_worker_read_loop_prefetch(&state, fd);
+            int rc = dist_worker_read_loop_prefetch(&state, fd);
             close(fd);
             uint32_t dropped_sessions = dist_worker_clear_sessions(&state);
             if (dropped_sessions) {
@@ -138,9 +136,7 @@ int dist_run_worker(ds4_engine *engine, const ds4_dist_options *opt, int ctx_siz
             continue;
         }
 
-        int rc = getenv("DS4_DIST_DISABLE_WORKER_PREFETCH")
-            ? dist_worker_read_loop(&state, fd)
-            : dist_worker_read_loop_prefetch(&state, fd);
+        int rc = dist_worker_read_loop_prefetch(&state, fd);
         close(fd);
         uint32_t dropped_sessions = dist_worker_clear_sessions(&state);
         if (dropped_sessions) {

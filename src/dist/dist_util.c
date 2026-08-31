@@ -40,16 +40,8 @@ void dist_mtp_print_summary(ds4_dist_session *d, const char *tag) {
  * ========================================================================= */
 
 uint32_t dist_prefill_send_depth(uint32_t chunk_count) {
+    /* 2 = 发送线程只保持一个在途 + 一个在扣的分块: 更深实测不涨吞吐, 只涨对端内存。 */
     uint32_t depth = 2;
-    const char *env = getenv("DS4_DIST_PREFILL_SEND_DEPTH");
-    if (env && env[0]) {
-        errno = 0;
-        char *end = NULL;
-        long v = strtol(env, &end, 10);
-        if (errno == 0 && end != env && *end == '\0' && v >= 1 && v <= 8) {
-            depth = (uint32_t)v;
-        }
-    }
     if (chunk_count != 0 && depth > chunk_count) depth = chunk_count;
     return depth ? depth : 1;
 }
@@ -238,45 +230,19 @@ bool dist_u64_mul(uint64_t a, uint64_t b, uint64_t *out) {
  * ========================================================================= */
 
 int dist_socket_buffer_bytes(void) {
-    int mb = 128;
-    const char *env = getenv("DS4_DIST_SOCKET_BUFFER_MB");
-    if (env && env[0]) {
-        errno = 0;
-        char *end = NULL;
-        long v = strtol(env, &end, 10);
-        if (errno == 0 && end != env && *end == '\0' && v >= 0 && v <= 512) {
-            mb = (int)v;
-        }
-    }
-    return mb > 0 ? mb * 1024 * 1024 : 0;
+    /* 128 MB SO_SNDBUF/RCVBUF: 一个 prefill 分块的激活字节远小于此, 大缓冲让内核
+     * 吸收跨机 forward 的突发而不阻塞 graph worker。 */
+    return 128 * 1024 * 1024;
 }
 
 uint32_t dist_worker_prefetch_depth(void) {
-    uint32_t depth = 2;
-    const char *env = getenv("DS4_DIST_WORKER_PREFETCH_DEPTH");
-    if (env && env[0]) {
-        errno = 0;
-        char *end = NULL;
-        long v = strtol(env, &end, 10);
-        if (errno == 0 && end != env && *end == '\0' && v >= 1 && v <= 8) {
-            depth = (uint32_t)v;
-        }
-    }
-    return depth;
+    /* worker 预取队列深度 2: 一个在算 + 一个在收; 更深只是把内存押给未验证的批。 */
+    return 2;
 }
 
 uint32_t dist_worker_forward_window(void) {
-    uint32_t depth = 4;
-    const char *env = getenv("DS4_DIST_WORKER_FORWARD_WINDOW");
-    if (env && env[0]) {
-        errno = 0;
-        char *end = NULL;
-        long v = strtol(env, &end, 10);
-        if (errno == 0 && end != env && *end == '\0' && v >= 1 && v <= 64) {
-            depth = (uint32_t)v;
-        }
-    }
-    return depth;
+    /* worker forward 流水线窗口 4: 覆盖 RTT 的在途 forward 数。 */
+    return 4;
 }
 
 bool dist_parse_positive_u32(
@@ -300,20 +266,4 @@ bool dist_parse_positive_u32(
     return true;
 }
 
-uint32_t dist_env_u32_clamped(const char *name, uint32_t defv, uint32_t minv, uint32_t maxv) {
-    const char *s = getenv(name);
-    if (!s || !s[0]) return defv;
-    errno = 0;
-    char *end = NULL;
-    unsigned long v = strtoul(s, &end, 10);
-    if (errno != 0 || s[0] == '\0' || *end != '\0') return defv;
-    if (v < minv) v = minv;
-    if (v > maxv) v = maxv;
-    return (uint32_t)v;
-}
-
-bool dist_env_enabled(const char *name) {
-    const char *v = getenv(name);
-    return v && v[0] && !(v[0] == '0' && v[1] == '\0');
-}
 

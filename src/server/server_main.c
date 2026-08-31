@@ -13,9 +13,6 @@ int main(int argc, char **argv) {
     sigaction(SIGTERM, &sa, NULL);
 
     server_config cfg = parse_options(argc, argv);
-    /* DS4_KNOWLEDGE_FILE: 与 --knowledge 等价的 env 口 (svc.sh 集成用; 二者可叠加) */
-    if (g_knowledge_n == 0 && getenv("DS4_KNOWLEDGE_FILE"))
-        knowledge_load(getenv("DS4_KNOWLEDGE_FILE"));
     if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: failed to chdir to %s: %s",
                    cfg.chdir_path, strerror(errno));
@@ -94,14 +91,11 @@ int main(int argc, char **argv) {
 
     pthread_t worker;
     s.ctx_size = cfg.ctx_size;
-    { const char *bv = getenv("DS4_SERVER_BATCH");
-      s.batch_max = bv ? atoi(bv) : 0;
-      if (s.batch_max > 8) s.batch_max = 8;
-      if (s.batch_max < 0) s.batch_max = 0;
-      if (s.batch_max >= 2)
-          server_log(DS4_LOG_GENERATION,
-                     "ds4-server: 并发批处理已开 (最多 %d 路合批; 仅非流式/无工具的 chat 请求)",
-                     s.batch_max); }
+    s.batch_max = cfg.batch_max;
+    if (s.batch_max >= 2)
+        server_log(DS4_LOG_GENERATION,
+                   "ds4-server: 并发批处理已开 (最多 %d 路合批; 仅非流式/无工具的 chat 请求)",
+                   s.batch_max);
     if (pthread_create(&worker, NULL, worker_main, &s) != 0) die("failed to start worker");
 
     int lfd = listen_on(cfg.host, cfg.port);

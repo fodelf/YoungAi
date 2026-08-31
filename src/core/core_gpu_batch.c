@@ -2,7 +2,7 @@
 #include "core_internal.h"
 #ifndef DS4_NO_GPU
 void eval_hdump_batch_layer(ds4_gpu_graph *g, uint32_t il, uint32_t n_tokens) {
-    const char *dir = getenv("DS4_EVAL_HDUMP");
+    const char *dir = ds4_tool_eval_hdump();
     if (!dir || !dir[0] || n_tokens == 0) return;
     {
         const uint64_t ev = ds4_gpu_tp_signal_after_batch();
@@ -47,11 +47,8 @@ bool metal_graph_encode_layer_batch(
         uint32_t                il,
         uint32_t                pos0,
         uint32_t                n_tokens) {
-    const bool attn_ok = metal_graph_encode_layer_attention_batch(g, model, layer, il, pos0, n_tokens);
-    bool ok = attn_ok;
+    bool ok = metal_graph_encode_layer_attention_batch(g, model, layer, il, pos0, n_tokens);
     if (ok) ok = metal_graph_encode_layer_ffn_batch(g, model, layer, il, pos0, n_tokens);
-    if (!ok && getenv("DS4_GRAPH_FAIL_TRACE"))
-        fprintf(stderr, "ds4: [fail-trace] L%u %s_batch failed\n", il, attn_ok ? "ffn" : "attention");
     if (ok) {
         ds4_gpu_tensor *tmp = g->batch_cur_hc;
         g->batch_cur_hc = g->batch_next_hc;
@@ -59,10 +56,6 @@ bool metal_graph_encode_layer_batch(
     }
     /* DSpark prefill 抓取(层出口 HC 均值)与建窗: prompt 每 token 的 main_kv 进环形窗,
      * 与官方 prefill(start_pos==0 只建 KV)语义一致 */
-    if (getenv("DS4_DSPARK_DIAG") && il == 42u)
-        fprintf(stderr, "ds4: [dspark-diag] prefill L42 cap=%d pf=%p bound=%p n=%u\n",
-                g->dspark_capture, (void *)g->dspark_pf_hidden,
-                (const void *)g_dspark_bound_for_prefill, n_tokens);
     if (ok && g->dspark_capture && g->dspark_pf_hidden && il >= 40u && il <= 42u) {
         ok = ds4_gpu_dspark_hc_mean_tensor(g->dspark_pf_hidden, g->batch_cur_hc,
                                            DS4_N_EMBD, DS4_N_HC, il - 40u, n_tokens) != 0;

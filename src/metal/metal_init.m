@@ -53,13 +53,12 @@ int ds4_gpu_init(void) {
             fprintf(stderr, "ds4: Metal 4 tensor API enabled for Tensor kernels\n");
         }
 
-        const int drift_hc_stable        = ds4_gpu_env_bool("DS4_METAL_HC_STABLE")          != 0; // default ON
-        const int drift_norm_unify       = ds4_gpu_env_bool("DS4_METAL_NORM_RSQRT_DISABLE") != 0; // default ON
-        const int drift_kv_raw_f32       = ds4_gpu_env_bool("DS4_METAL_KV_RAW_F32")         >  0; // default OFF
-        const int drift_rope_exp2_log2   = ds4_gpu_env_bool("DS4_METAL_ROPE_EXP2_LOG2")     >  0; // default OFF
-        const int drift_math_safe        = ds4_gpu_env_bool("DS4_METAL_MATH_SAFE")          >  0; // default OFF
-
-        if (drift_math_safe) {
+        /* 常开数值口径(改动=跨 43 层静默漂移, 全部判决读数被污染):
+         * HC sigmoid 走 0.5*tanh(z/2)+0.5, RMSNorm 走 1.0f/sqrt() 而非硬件
+         * rsqrt。剩下三项(safe math + f32 raw KV + exp2/log2 RoPE)是双机对拍
+         * lane 的成套 fp 严格化, 由 --strict-fp (ds4_gpu_set_strict_fp) 整组
+         * 拨开, 默认关。 */
+        if (g_strict_fp) {
             // MTLCompileOptions.fastMathEnabled defaults to YES and Apple's
             // headers explicitly say this "may violate the IEEE 754 standard".
             // Different fast-math optimizations get applied across the
@@ -70,27 +69,25 @@ int ds4_gpu_init(void) {
             // sources but not to ship as a default.
             if (@available(macOS 15.0, *)) {
                 options.mathMode = MTLMathModeSafe;
-                fprintf(stderr, "ds4: Metal shader library math mode = safe (strict IEEE-754) by DS4_METAL_MATH_SAFE\n");
+                fprintf(stderr, "ds4: Metal shader library math mode = safe (strict IEEE-754) by --strict-fp\n");
             } else {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
                 options.fastMathEnabled = NO;
 #pragma clang diagnostic pop
-                fprintf(stderr, "ds4: Metal shader library fast-math disabled by DS4_METAL_MATH_SAFE (pre-macOS 15)\n");
+                fprintf(stderr, "ds4: Metal shader library fast-math disabled by --strict-fp (pre-macOS 15)\n");
             }
         }
 
-        if (drift_hc_stable)      macros[@"DS4_METAL_HC_STABLE"]          = @"1";
-        if (drift_norm_unify)     macros[@"DS4_METAL_NORM_RSQRT_DISABLE"] = @"1";
-        if (drift_kv_raw_f32)     macros[@"DS4_METAL_KV_RAW_F32"]         = @"1";
-        if (drift_rope_exp2_log2) macros[@"DS4_METAL_ROPE_EXP2_LOG2"]     = @"1";
+        macros[@"DS4_METAL_HC_STABLE"]          = @"1";
+        macros[@"DS4_METAL_NORM_RSQRT_DISABLE"] = @"1";
+        if (g_strict_fp) {
+            macros[@"DS4_METAL_KV_RAW_F32"]     = @"1";
+            macros[@"DS4_METAL_ROPE_EXP2_LOG2"] = @"1";
+        }
         fprintf(stderr,
-                "ds4: drift-patch flags hc_stable=%s norm_unify=%s kv_raw_f32=%s rope_exp2_log2=%s math_safe=%s tensor_matmul=%s\n",
-                drift_hc_stable      ? "on"  : "off",
-                drift_norm_unify     ? "on"  : "off",
-                drift_kv_raw_f32     ? "on"  : "off",
-                drift_rope_exp2_log2 ? "on"  : "off",
-                drift_math_safe      ? "on"  : "off",
+                "ds4: drift-patch flags strict_fp=%s tensor_matmul=%s\n",
+                g_strict_fp ? "on" : "off",
                 g_metal4_tensor_api_enabled ? "on" : "off");
         options.preprocessorMacros = macros;
         id<MTLLibrary> library = [g_device newLibraryWithSource:source options:options error:&error];

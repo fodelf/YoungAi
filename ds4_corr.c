@@ -103,16 +103,8 @@ struct ds4_corr *corr_load(const char *path, bool metal_mapping) {
 #ifndef DS4_NO_GPU
         cl->gU     = corr_upload(cl->U,     d_model * d_l);
         cl->gV     = corr_upload(cl->V,     d_l * d_model);
-        /* DS4_CORR_SCALE=α (默认1): 逐层修正阻尼, 压 23 层激活空间 corr 的联合复利
-         * 爆炸(2026-07-23 找到根因: 单层可辨识/23层乱码)。C 是 mmap 只读→缩放副本上传。 */
-        const char *cs = getenv("DS4_CORR_SCALE");
-        float corr_scale = cs ? (float)atof(cs) : 1.0f;
-        if (corr_scale != 1.0f) {
-            float *Cs = xmalloc((size_t)n_exp * d_l * sizeof(float));
-            for (size_t i = 0; i < (size_t)n_exp * d_l; i++) Cs[i] = cl->C[i] * corr_scale;
-            cl->gC = corr_upload(Cs, n_exp * d_l);
-            free(Cs);
-        } else
+        /* corr 阻尼 α 已定 1(不阻尼): 23 层联合复利爆炸的历史雷(2026-07-23)最终解
+         * 在侧车拟合侧, 运行时不再缩放 C。 */
         cl->gC     = corr_upload(cl->C,     n_exp * d_l);
         cl->gb     = corr_upload(cl->b,     d_model);
         cl->gbeta  = corr_upload(cl->beta,  n_exp);

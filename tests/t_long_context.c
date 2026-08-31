@@ -149,7 +149,7 @@ static void test_long_prefill_progress(void *ud, const char *event, int current,
 }
 
 void test_long_story_fact_recall(void) {
-    const char *prompt_path = getenv("DS4_TEST_LONG_PROMPT");
+    const char *prompt_path = g_test_long_prompt;
     if (!prompt_path || !prompt_path[0]) {
         prompt_path = "tests/long_context_story_prompt.txt";
     }

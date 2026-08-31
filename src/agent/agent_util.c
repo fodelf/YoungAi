@@ -258,7 +258,9 @@ agent_config parse_options(int argc, char **argv) {
         }
         if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
 
-        if (!strcmp(arg, "-p") || !strcmp(arg, "--prompt")) {
+        if (!strcmp(arg, "--mem-budget-mb")) {
+            ds4_set_mem_budget_mb(atoi(need_arg(&i, argc, argv, arg)));
+        } else if (!strcmp(arg, "-p") || !strcmp(arg, "--prompt")) {
             c.gen.prompt = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--non-interactive")) {
             c.non_interactive = true;

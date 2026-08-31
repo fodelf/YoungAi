@@ -27,14 +27,10 @@ uint32_t ds4_default_prefill_cap_for_prompt(int prompt_len) {
     if (prompt_len <= 0) return 1;
     uint32_t cap = (uint32_t)prompt_len;
 
-    const char *env = getenv("DS4_METAL_PREFILL_CHUNK");
-    if (env && env[0]) {
-        char *endp = NULL;
-        const long v = strtol(env, &endp, 10);
-        if (endp != env) {
-            if (v <= 0) return cap;
-            cap = (uint32_t)v;
-        }
+    const int req = ds4_tool_prefill_chunk();   /* --prefill-chunk (0=整段一批) */
+    if (req >= 0) {
+        if (req == 0) return cap;
+        cap = (uint32_t)req;
     } else if (g_prefill_chunk_cuda > 0) {
         cap = (uint32_t)g_prefill_chunk_cuda;
     } else if (prompt_len > 4096) {

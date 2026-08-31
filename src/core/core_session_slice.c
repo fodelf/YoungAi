@@ -170,11 +170,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                 (encoded_layers % split_after_layers) == 0 &&
                 il < layer_end)
             {
-                if (metal_graph_direct_expert_read_enabled()) {
-                    ok = ds4_gpu_end_commands() != 0 && ds4_gpu_begin_commands() != 0;
-                } else {
-                    ok = ds4_gpu_flush_commands() != 0;
-                }
+                ok = ds4_gpu_flush_commands() != 0;
             }
         }
         if (ok && output_logits) {
@@ -337,9 +333,6 @@ int ds4_session_verify_batch_argmax(ds4_session *s,
                                                      0,
                                                      n_tokens);
     }
-    const bool vprof = getenv("DS4_SPEC_PROF") != NULL;
-    const double vt0 = vprof ? now_sec() : 0.0;
-    if (vprof) ds4_gpu_span_begin();
     if (ok) ok = ds4_gpu_begin_commands() != 0;
     /* 批 CUDA 图(2026-08-21): 43 层 ~3.5k kernel 的相邻间隙吃掉 31% GPU 时间。
      * 捕获成图后单次发射, 间隙归零。编码会推进 host 侧压缩器计数 ⇒ 捕获失败必须先
@@ -368,18 +361,8 @@ int ds4_session_verify_batch_argmax(ds4_session *s,
             }
         }
     }
-    const double vt1 = vprof ? now_sec() : 0.0;
     if (ok) ok = ds4_gpu_end_commands() != 0;
-    if (vprof) {
-        static double enc_acc, wait_acc, gpu_acc; static uint32_t vn;
-        const float gpu_ms = ds4_gpu_span_end();
-        enc_acc += vt1 - vt0; wait_acc += now_sec() - vt1; vn++;
-        if (gpu_ms > 0.0f) gpu_acc += gpu_ms;
-        if ((vn & 15u) == 0)
-            fprintf(stderr, "ds4: [vfy-prof] n=%u avg_ms: encode_cpu=%.1f end_wait=%.1f gpu_span=%.1f\n",
-                    vn, enc_acc * 1e3 / vn, wait_acc * 1e3 / vn, gpu_acc / vn);
-    }
-    else (void)ds4_gpu_synchronize();
+    (void)ds4_gpu_synchronize();
     if (!ok) {
         if (errlen) snprintf(err, errlen, "%s verify batch layers failed",
                              ds4_backend_name(e->backend));

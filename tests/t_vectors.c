@@ -153,24 +153,20 @@ static bool test_logprob_vector_case_disabled(const test_vec_case *vc) {
 }
 
 void test_official_logprob_vectors(void) {
-    const char *path = getenv("DS4_TEST_VECTOR_FILE");
+    const char *path = g_test_vector_file;
     if (!path || !path[0]) path = "tests/test-vectors/official.vec";
     FILE *fp = fopen(path, "rb");
     TEST_ASSERT(fp != NULL);
     if (!fp) return;
 
-    char *saved_prefill_chunk = test_save_env("DS4_METAL_PREFILL_CHUNK");
-    char *saved_disable_metal4 = test_save_env("DS4_METAL_DISABLE_METAL4");
-    setenv("DS4_METAL_PREFILL_CHUNK", "2048", 1);
-    if (getenv("DS4_TEST_LOGPROB_AUTO_METAL") == NULL) {
-        setenv("DS4_METAL_DISABLE_METAL4", "1", 1);
-    } else {
-        unsetenv("DS4_METAL_DISABLE_METAL4");
-    }
+    const int saved_prefill_chunk = ds4_tool_prefill_chunk();
+    ds4_tool_set_prefill_chunk(2048);
+    /* 决定论: 逐位对拍要求关 Metal4 tensor 路(--keep-metal4 留开)。 */
+    ds4_gpu_set_metal4_enabled(g_test_keep_metal4 ? 1 : 0);
     ds4_engine *engine = test_open_engine(false);
     if (!engine) {
-        test_restore_env("DS4_METAL_DISABLE_METAL4", saved_disable_metal4);
-        test_restore_env("DS4_METAL_PREFILL_CHUNK", saved_prefill_chunk);
+        ds4_gpu_set_metal4_enabled(1);
+        ds4_tool_set_prefill_chunk(saved_prefill_chunk);
         fclose(fp);
         return;
     }
@@ -187,8 +183,8 @@ void test_official_logprob_vectors(void) {
         test_logprob_vector_case(engine, &vc);
     }
     ds4_engine_close(engine);
-    test_restore_env("DS4_METAL_DISABLE_METAL4", saved_disable_metal4);
-    test_restore_env("DS4_METAL_PREFILL_CHUNK", saved_prefill_chunk);
+    ds4_gpu_set_metal4_enabled(1);
+    ds4_tool_set_prefill_chunk(saved_prefill_chunk);
     fclose(fp);
 }
 
@@ -364,24 +360,20 @@ static void test_local_golden_case_run(ds4_engine *engine,
 }
 
 void test_local_golden_vectors(void) {
-    const char *path = getenv("DS4_TEST_LOCAL_GOLDEN_FILE");
+    const char *path = g_test_local_golden;
     if (!path || !path[0]) path = "tests/test-vectors/local-golden.vec";
     FILE *fp = fopen(path, "rb");
     TEST_ASSERT(fp != NULL);
     if (!fp) return;
 
-    char *saved_prefill_chunk = test_save_env("DS4_METAL_PREFILL_CHUNK");
-    char *saved_disable_metal4 = test_save_env("DS4_METAL_DISABLE_METAL4");
-    char *saved_moe_tile_max = test_save_env("DS4_METAL_MOE_TILE_MAX");
-    setenv("DS4_METAL_PREFILL_CHUNK", "4096", 1);
-    setenv("DS4_METAL_DISABLE_METAL4", "1", 1);
-    unsetenv("DS4_METAL_MOE_TILE_MAX");
+    const int saved_prefill_chunk = ds4_tool_prefill_chunk();
+    ds4_tool_set_prefill_chunk(4096);
+    ds4_gpu_set_metal4_enabled(0);   /* 决定论: 金标向量在 legacy kernel 路采的 */
 
     ds4_engine *engine = test_open_engine(false);
     if (!engine) {
-        test_restore_env("DS4_METAL_MOE_TILE_MAX", saved_moe_tile_max);
-        test_restore_env("DS4_METAL_DISABLE_METAL4", saved_disable_metal4);
-        test_restore_env("DS4_METAL_PREFILL_CHUNK", saved_prefill_chunk);
+        ds4_gpu_set_metal4_enabled(1);
+        ds4_tool_set_prefill_chunk(saved_prefill_chunk);
         fclose(fp);
         return;
     }
@@ -393,9 +385,8 @@ void test_local_golden_vectors(void) {
     }
 
     ds4_engine_close(engine);
-    test_restore_env("DS4_METAL_MOE_TILE_MAX", saved_moe_tile_max);
-    test_restore_env("DS4_METAL_DISABLE_METAL4", saved_disable_metal4);
-    test_restore_env("DS4_METAL_PREFILL_CHUNK", saved_prefill_chunk);
+    ds4_gpu_set_metal4_enabled(1);
+    ds4_tool_set_prefill_chunk(saved_prefill_chunk);
     fclose(fp);
 }
 

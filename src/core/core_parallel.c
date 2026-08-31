@@ -119,11 +119,6 @@ static void ds4_threads_init(void) {
         n_threads = online_cpus < 12 ? (uint32_t)online_cpus : 12;
     }
 
-    const char *env = getenv("DS4_THREADS");
-    if (env && env[0]) {
-        long v = strtol(env, NULL, 10);
-        if (v > 0) n_threads = (uint32_t)v;
-    }
     if (g_requested_threads > 0) n_threads = g_requested_threads;
     if (n_threads > DS4_MAX_THREADS) n_threads = DS4_MAX_THREADS;
     if (n_threads == 0) n_threads = 1;

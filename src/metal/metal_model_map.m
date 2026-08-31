@@ -216,7 +216,7 @@ int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint
  * an optional per-span bool array: when NULL every span is resident (legacy
  * behaviour); otherwise a false entry wraps that span's views without adding them
  * to the model residency set, so their clean file-backed pages stay reclaimable
- * (routed-expert offload under DS4_METAL_EXPERT_OFFLOAD). */
+ * (routed-expert offload). */
 static int ds4_gpu_set_model_map_spans_impl(
         const void *model_map,
         uint64_t model_size,
@@ -352,8 +352,8 @@ int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
 
 /* Main-model GGUF file descriptor, registered by the engine right after the
  * model is opened (the whole file is mmapped from offset 0, so file offset ==
- * map offset).  The P1.1 single-copy expert gather (DS4_METAL_EXPERT_PREAD=1,
- * project.md) preads cold expert bytes straight from this fd into the Shared
+ * map offset).  The P1.1 single-copy expert gather (project.md) preads cold
+ * expert bytes straight from this fd into the Shared
  * scratch MTLBuffer, bypassing the mmap page-fault + memcpy double copy. */
 int g_model_fd = -1;
 
@@ -368,73 +368,6 @@ int ds4_gpu_set_model_fd(int fd) {
     }
     g_model_fd = fd;
     return 1;
-}
-
-/* Wave 25: backbone wiring.  Verify rounds stream GiBs of one-shot expert
- * bytes and evict the mmap-resident backbone (Q8 attention/shared) pages;
- * the next frame's GPU work then re-faults the backbone inside command
- * execution (measured: coord decode drain 14.5 -> 46ms/layer, spikes 855ms).
- * Instead of bending the batch IO around the page cache, pin the backbone:
- * every model range the encoder wraps for GPU use is by definition this
- * machine's working set -- mlock it once (routed expert tensors are
- * suppressed at their wrap sites; they are gathered, not mapped).
- * DS4_METAL_BACKBONE_MLOCK=1 enables (script sets it per side);
- * DS4_METAL_BACKBONE_MLOCK_BUDGET_MB caps the wired total (default 4608). */
-int g_wrap_mlock_suppress;
-
-/* set around routed-expert wrap calls */
-
-void ds4_gpu_backbone_mlock_register(const void *model_map,
-                                            uint64_t offset,
-                                            uint64_t len) {
-    static int enabled = -1;
-    static uint64_t budget_bytes;
-    static uint64_t wired_bytes;
-    static uint64_t logged_half_gib;
-    static int budget_warned;
-    static uint32_t n_ranges;
-    static struct { uint64_t off, len; } ranges[4096];
-    if (enabled < 0) {
-        const char *v = getenv("DS4_METAL_BACKBONE_MLOCK");
-        enabled = (v && *v && v[0] != '0') ? 1 : 0;
-        if (enabled) {
-            const char *b = getenv("DS4_METAL_BACKBONE_MLOCK_BUDGET_MB");
-            uint64_t mb = b ? strtoull(b, NULL, 10) : 0;
-            if (mb == 0) mb = 4608;
-            budget_bytes = mb << 20;
-            fprintf(stderr, "ds4: backbone mlock enabled (budget %llu MiB)\n",
-                    (unsigned long long)mb);
-        }
-    }
-    if (!enabled || len == 0 || g_wrap_mlock_suppress) return;
-    for (uint32_t i = 0; i < n_ranges; i++) {
-        if (ranges[i].off == offset && ranges[i].len == len) return;
-    }
-    if (n_ranges >= 4096) return;
-    ranges[n_ranges].off = offset;
-    ranges[n_ranges].len = len;
-    n_ranges++;
-    const uint64_t page = (uint64_t)getpagesize();
-    const uint64_t start = offset & ~(page - 1u);
-    const uint64_t end = (offset + len + page - 1u) & ~(page - 1u);
-    if (wired_bytes + (end - start) > budget_bytes) {
-        if (!budget_warned) {
-            budget_warned = 1;
-            fprintf(stderr,
-                    "ds4: backbone mlock budget exhausted at %.2f GiB (%u ranges); "
-                    "remaining ranges stay evictable\n",
-                    ds4_gpu_gib(wired_bytes), n_ranges);
-        }
-        return;
-    }
-    if (mlock((const uint8_t *)model_map + start, (size_t)(end - start)) == 0) {
-        wired_bytes += end - start;
-        if ((wired_bytes >> 29) > logged_half_gib) {   /* log every 512MiB */
-            logged_half_gib = wired_bytes >> 29;
-            fprintf(stderr, "ds4: backbone mlock wired %.2f GiB (%u ranges)\n",
-                    ds4_gpu_gib(wired_bytes), n_ranges);
-        }
-    }
 }
 
 id<MTLBuffer> ds4_gpu_wrap_model_range(
@@ -457,7 +390,6 @@ id<MTLBuffer> ds4_gpu_wrap_model_range(
         const uint64_t view_start = g_model_views[i].model_offset;
         const uint64_t view_end = view_start + g_model_views[i].bytes;
         if (offset >= view_start && end <= view_end) {
-            ds4_gpu_backbone_mlock_register(model_map, offset, len);
             *inner_offset = offset - view_start;
             return g_model_views[i].buffer;
         }
@@ -467,18 +399,5 @@ id<MTLBuffer> ds4_gpu_wrap_model_range(
             "ds4: Metal model range %.2f..%.2f GiB is not covered by mapped model views\n",
             ds4_gpu_gib(offset),
             ds4_gpu_gib(end));
-    if (getenv("DS4_METAL_EXPERT_OFFLOAD_DEBUG") != NULL) {
-        fprintf(stderr, "ds4:   wanted exact bytes [%llu, %llu) over %u views:\n",
-                (unsigned long long)offset, (unsigned long long)end, g_model_view_count);
-        for (uint32_t i = 0; i < g_model_view_count; i++) {
-            const uint64_t vs = g_model_views[i].model_offset;
-            const uint64_t ve = vs + g_model_views[i].bytes;
-            if (offset < ve + (64ull << 20) && end + (64ull << 20) > vs) {
-                fprintf(stderr, "ds4:     view[%u] bytes [%llu, %llu) resident=%d\n",
-                        i, (unsigned long long)vs, (unsigned long long)ve,
-                        g_model_views[i].resident_hint);
-            }
-        }
-    }
     return nil;
 }
