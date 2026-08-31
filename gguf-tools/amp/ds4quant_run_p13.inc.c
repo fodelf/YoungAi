@@ -151,7 +151,7 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
             mlog(J,"向前反修","层文件缓存缺失","跳过",0,"lfile未加载","探索中"); continue; }
         time_t ut0=time(NULL); double ut0d=vqt_now(); memset(g_bflt,0,sizeof g_bflt); g_bflt_on=1;   /* 单元计时(BFUNIT 可观测行)+段账臂(p3 bflt_print) */
         lfile_t*lf=&GS_LF[J];
-        char pj[512]; op_host_path(J,pj,sizeof(pj));   /* ★平行架构: 反修落地只写 op 侧车, 量化 dql 不可触 */
+        char pj[512]; op_host_path(J,pj,sizeof(pj));   /* op 宿主=dql 主文件(08-08 用户令还原混装; 旧"op 侧车"注释已过期) */
         if(onep&&!ofl[J]){ struct stat fst; ofl[J]=stat(pj,&fst)==0?(size_t)fst.st_size:0; }   /* 回滚锚点 */
         const float*Hin=HQE+(size_t)J*lstride;
         /* 粗筛视野: e* 别名 = 本单元候选比价用的(出口层/输入/ids/行数/切分); scr=0 时即旧全量口径 */
@@ -454,7 +454,7 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
             if(keep){
                 float*Hr=gs_forward_exit(Jlo,Lfront,HQE+(size_t)Jlo*lstride,ids,S,n_fit,HQE); free(Hr);
             } else {
-                for(int J=Lfront-1;J>=Jlo;J--) if(oland[J]&&ofl[J]){          /* ①截掉 append(宿主=op 侧车) */
+                for(int J=Lfront-1;J>=Jlo;J--) if(oland[J]&&ofl[J]){          /* ①截掉 append(宿主=dql 主文件, 混装) */
                     char pj2[512]; op_host_path(J,pj2,sizeof(pj2));
                     if(truncate(pj2,(off_t)ofl[J])!=0) perror("onep-trunc"); }
                 for(int i=NBFU-1;i>=0;i--){ bfu_t*u=&BFU[i];                   /* ②逆序回写原地改(宿主同上) */

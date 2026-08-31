@@ -59,7 +59,8 @@ for L in ${LRANGE:-$(seq 0 42)}; do
     --ntok 8192 ${XA:+--xanchor "$XA"} \
     2>&1 | grep -aE "XCAP|Error|assert|★" || { LOG "★L$L 失败★"; exit 1; }
   # 进度可观测铁律: 每层收官打一行(tail -f 就能看到 43 层推进)
-  LOG "L$L ✓ $(ls "$D2/$WS/layers"/zrec_L*.bin 2>/dev/null | wc -l | tr -d ' ')/43 K=$K"
+  # INJ=1 走 dql 注入不写 zrec ⇒ 旧的 zrec 计数恒 0/43(观测 bug); 改数注入账本行
+  LOG "L$L ✓ $(grep -c '' "$D2/$WS/layers/zinject_manifest.txt" 2>/dev/null || echo 0)/43 K=$K"
 done
 rm -f $D2/$WS/layers/zcache_L*.npz
 LOG "③反修收官"
