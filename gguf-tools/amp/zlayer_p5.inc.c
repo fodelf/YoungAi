@@ -50,6 +50,51 @@
             double *Pev = (double *)xmalloc((size_t)nev * r * sizeof(double));
             mm64(0, 0, nev, r, din, Ph, din, AS, r, Pev, r);
             free(Ph); free(AS);
+            /* ★方向筛选(2026-08-31 用户令"找到没有肉的问题")★ SVD 前缀截断按能量序取头,
+             * 深层能量头部=massive 通道舍入噪声方向 ⇒ 任何 k 都被迫先装噪声, held 全 k≈0
+             * ="深层没肉"假象(L20/22 实测靶占比 32% 而 z 只收 0.5-1.8%)。解跨度不动, 按
+             * held 逐方向增益(2⟨dH,p_c⟩−‖p_c‖², 独立近似)把因子列重排, 噪声方向沉底;
+             * 部署=分量求和, 列序透明, 下游前缀-K 语义不变。held 复用风险由净行闸兜底。 */
+            {
+                double *dHev = (double *)xmalloc((size_t)nev * D * sizeof(double));
+                for (int i = 0; i < nev; i++) for (int j = 0; j < D; j++)
+                    dHev[(size_t)i * D + j] = dH[(size_t)ev[i] * D + j];
+                double *T = (double *)xmalloc((size_t)nev * r * sizeof(double));
+                mm64(0, 1, nev, r, D, dHev, D, BB, D, T, r);
+                free(dHev);
+                double *gain = (double *)xmalloc((size_t)r * sizeof(double));
+                for (int c = 0; c < r; c++) {
+                    double bb = 0, sp = 0, s22 = 0;
+                    for (int j = 0; j < D; j++) bb += BB[(size_t)c * D + j] * BB[(size_t)c * D + j];
+                    for (int i = 0; i < nev; i++) {
+                        const double pv = Pev[(size_t)i * r + c];
+                        sp += pv * T[(size_t)i * r + c]; s22 += pv * pv;
+                    }
+                    gain[c] = 2.0 * sp - s22 * bb;
+                }
+                free(T);
+                int *ord = (int *)xmalloc((size_t)r * sizeof(int));
+                for (int c = 0; c < r; c++) ord[c] = c;
+                for (int a2 = 0; a2 < r; a2++) for (int b2 = a2 + 1; b2 < r; b2++)
+                    if (gain[ord[b2]] > gain[ord[a2]]) { int t3 = ord[a2]; ord[a2] = ord[b2]; ord[b2] = t3; }
+                double *Anc = pass ? Af : A, *Snc = pass ? Sf : S, *Bnc = pass ? Bf : Bt;
+                double *Am = (double *)xmalloc((size_t)din * r * sizeof(double));
+                double *Sm2 = (double *)xmalloc((size_t)r * sizeof(double));
+                double *Bm = (double *)xmalloc((size_t)r * D * sizeof(double));
+                double *Pm = (double *)xmalloc((size_t)nev * r * sizeof(double));
+                for (int c = 0; c < r; c++) {
+                    const int s3 = ord[c];
+                    for (int i = 0; i < din; i++) Am[(size_t)i * r + c] = Anc[(size_t)i * r + s3];
+                    Sm2[c] = Snc[s3];
+                    memcpy(Bm + (size_t)c * D, Bnc + (size_t)s3 * D, (size_t)D * sizeof(double));
+                    for (int i = 0; i < nev; i++) Pm[(size_t)i * r + c] = Pev[(size_t)i * r + s3];
+                }
+                memcpy(Anc, Am, (size_t)din * r * sizeof(double));
+                memcpy(Snc, Sm2, (size_t)r * sizeof(double));
+                memcpy(Bnc, Bm, (size_t)r * D * sizeof(double));
+                memcpy(Pev, Pm, (size_t)nev * r * sizeof(double));
+                free(Am); free(Sm2); free(Bm); free(Pm); free(gain); free(ord);
+            }
             for (int ki = 0; ki < nKG; ki++) {
                 int k = KG[ki];
                 if (k > 0) mm64(0, 0, nev, D, k, Pev, r, BB, D, pbuf, D);
@@ -288,13 +333,32 @@
         float *Xg = NULL, *rwg = NULL; int *ridxg = NULL; ameta_t amg;
         anchor_layer(GATEA, L, Sg, &Xg, &ridxg, &rwg, &amg);
         if (amg.NACT != am.NACT) die("闸锚 NACT=%d ≠ 主锚 %d — 口径不明拒闸", amg.NACT, am.NACT);
-        int NG = NGATE > Sg ? Sg : NGATE, step = Sg / NG;
-        for (int i = 0; i < NG; i++) {          /* 等距压紧到前 NG 行(src≥dst, 前向安全) */
-            int s2 = i * step;
+        /* ★闸行必须过行掩码(2026-08-31 探针实锤)★ 旧版盲等距抽全锚, 吃进拼接毒行
+         * (每 128 行窗头 32 行=全锚 25%, 语料切窗的上下文断点)。毒行活性浅层正常、
+         * 深层滚雪球: L31 实测闸靶RMS 5.9e-1 = held 侧(掩码后) 1.5e-1 的 4×, 基RMS
+         * 11×于 L20 —— 深层闸读数被毒行统治(−149~−280% 与 +89/+97% 同带并存), 拒注
+         * 判的是毒不是过拟合。净行=闸锚自己 .layout 的 fit∪eval(两表各自升序, 归并),
+         * 再等距。归并后 cln[i]≥i ⇒ 压紧仍 src≥dst 前向安全。 */
+        int *gtr = NULL, *gev = NULL; int gntr = 0, gnev = 0;
+        if (row_layout_split(GATEA, &gtr, &gntr, &gev, &gnev) != 0)
+            die("闸锚行布局缺 %s.layout — 先跑 amp_campaign.sh anchors3 补", GATEA);
+        int ncln = gntr + gnev;
+        int *cln = (int *)xmalloc((size_t)ncln * sizeof(int));
+        { int a2 = 0, b2 = 0, w2 = 0, mono = 1;
+          while (a2 < gntr || b2 < gnev)
+              cln[w2++] = (b2 >= gnev || (a2 < gntr && gtr[a2] <= gev[b2])) ? gtr[a2++] : gev[b2++];
+          for (int i = 1; i < ncln; i++) if (cln[i] <= cln[i - 1]) mono = 0;
+          if (!mono || cln[ncln - 1] >= Sg) die("闸锚布局行序异常 — 停车不带毒判"); }
+        free(gtr); free(gev);
+        int NG = NGATE > ncln ? ncln : NGATE;
+        const int stepc = ncln / NG;
+        for (int i = 0; i < NG; i++) {          /* 净行等距压紧到前 NG 行 */
+            int s2 = cln[(size_t)i * stepc];
             memmove(Xg + (size_t)i * D, Xg + (size_t)s2 * D, (size_t)D * 4);
             memmove(ridxg + (size_t)i * amg.NACT, ridxg + (size_t)s2 * amg.NACT, (size_t)amg.NACT * 4);
             memmove(rwg + (size_t)i * amg.NACT, rwg + (size_t)s2 * amg.NACT, (size_t)amg.NACT * 4);
         }
+        free(cln);
         float *dHg, *pwg, *pYQg; int *prowg, *peg; long long npg;
         zl_build_pairs(hf, ld, GGP, &gg, L, NG, amg.NACT, SWLIM, Xg, ridxg, rwg,
                        0, NULL, NULL, NULL, NULL, 1, &dHg, &prowg, &peg, &pwg, &pYQg, &npg);
