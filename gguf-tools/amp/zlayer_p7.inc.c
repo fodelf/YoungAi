@@ -140,6 +140,7 @@
         if (eff <= GATE) {
             snprintf(status, sizeof status, "组合增益 %.1f%% ≤闸%.1f%% → 空 zrec(skip 标记)", comb * 100, GATE * 100);
         } else {
+            if (!ADDON) zl_dql_guard(ld, L);   /* 底座带未建模 op ⇒ 停车(注释见 p1) */
             if (add_len && fwrite(add, 1, add_len, zf) != add_len) die("zrec 写失败");
             snprintf(status, sizeof status, "zrec 落盘(+%d记录 %.1fMB)", nrec_add, add_len / 1048576.0);
         }
@@ -222,6 +223,7 @@
             fprintf(mf, "%d -1 -1\n", L); fclose(mf);
             snprintf(status, sizeof status, "组合增益 %.1f%% ≤闸%.1f%% → ★整层不注入(闸拒=收官)★", comb * 100, GATE * 100);
         } else {
+            zl_dql_guard(ld, L);    /* 底座带未建模 op ⇒ 停车(注释见 p1); 本支恒非 ADDON */
             if (ERF_ADD) {          /* ★叠加★: z/GE 之上再追加 ERF 残差补丁 */
                 add = (uint8_t *)realloc(add, add_len + ERF_LEN); if (!add) die("realloc");
                 memcpy(add + add_len, ERF_ADD, ERF_LEN); add_len += ERF_LEN; nrec_add++;

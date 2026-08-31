@@ -426,3 +426,40 @@ static int lu_solve(double *A, int n, double *b) {
     return 0;
 }
 
+/* ★非 ADDON 注入前的底座对账(2026-08-31)★ 非 ADDON 解算把学生当"裸专家加权和" ——
+ * zcache 既不读也不建模底座 dql 已落地的修正链 op; 回放却会先应用它们再叠新 z:
+ * λ 族(bf.GL/GLdyn/GLhc/TREF)缩放同一块 routed, 而新 z 按"填满 teacher−裸学生全缺口"
+ * 解, 重叠部分被修两遍; 既有 zl.RRR/zl.ERF 同理(回放逐条应用, 无末条胜出语义)。
+ * bf.GE 例外: 回放只取末条=替换语义, 新解相对裸基自洽。发现未建模 op 即停车, 由人
+ * 决定剥离(champ_reset 回纯净量化态)还是走 --addon, 不许静默叠加出双重修正。 */
+static void zl_dql_guard(const char *ld, int L) {
+    char p[1200]; snprintf(p, sizeof p, "%s/dql_L%02d.bin", ld, L);
+    FILE *f = fopen(p, "rb");
+    if (!f) return;                              /* dql 缺失由注入路自己报错 */
+    uint8_t hd[12];
+    if (fread(hd, 1, 12, f) != 12 || memcmp(hd, "DQL2", 4)) { fclose(f); return; }
+    uint32_t nr; memcpy(&nr, hd + 8, 4);
+    char bad[256] = ""; int nbad = 0;
+    for (uint32_t i = 0; i < nr; i++) {
+        uint8_t rh[DS4_AMP_REC_HDR];
+        if (fread(rh, 1, DS4_AMP_REC_HDR, f) != DS4_AMP_REC_HDR) break;
+        char nm[17]; memcpy(nm, rh, 16); nm[16] = 0;
+        uint64_t psz; memcpy(&psz, rh + DS4_AMP_REC_OFF_PSZ, 8);
+        int32_t vd; memcpy(&vd, rh + DS4_AMP_REC_OFF_VD, 4);
+        if (fseeko(f, (off_t)psz, SEEK_CUR)) break;
+        if (vd != 1) continue;
+        /* 活 op 名单镜像 dsq_lfile parse_op_rec(bf.GE 之外全算; RRR 空壳 psz<16 是占位) */
+        const int live = strstr(nm, ".GL") || strstr(nm, "TREF") || strstr(nm, "xlayer")
+                      || strstr(nm, "zl.ERF") || (strstr(nm, "zl.RRR") && psz >= 16);
+        if (!live) continue;
+        if (nbad < 4) snprintf(bad + strlen(bad), sizeof bad - strlen(bad),
+                               "%s%.16s", nbad ? "," : "", nm);
+        nbad++;
+    }
+    fclose(f);
+    if (nbad)
+        die("L%d 底座 dql 已带 %d 条落地修正 op(%s%s) — 非 ADDON 解算不建模既有链, "
+            "注入=同一残差修两遍。先还原纯净量化态(champ_reset/layers_quant)或走 --addon",
+            L, nbad, bad, nbad > 4 ? ",…" : "");
+}
+
