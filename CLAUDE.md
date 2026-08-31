@@ -87,7 +87,7 @@ make cuda-regression           # Linux/CUDA only(首跑含 PTX JIT 可能超时,
 make -C gguf-tools tools-test  # 工具链 9 项 -D*_TEST 自测
 ```
 
-Override test inputs with env vars: `DS4_TEST_MODEL`, `DS4_TEST_VECTOR_FILE`, `DS4_TEST_LONG_PROMPT`.
+Override test inputs with `ds4_test` flags: `--model FILE`, `--vector-file FILE`, `--long-prompt FILE`, `--local-golden FILE`, `--mpp-case NAME`, `--keep-metal4`.
 
 For generation-drift-sensitive changes, also run the deterministic q1..q4 eval gate (expected token counts are in `README.md` → Capability Evaluation):
 
@@ -124,7 +124,7 @@ Quantization/GGUF changes are scored with `gguf-tools/bench/quality-testing` (`m
   五指标, 见 memory 铁律); 迁移金标账本在 `gguf-tools/migrate/golden.txt`。格式基元
   一律走 `src/common`——工具侧禁止再抄第二份 dequant/GGUF/safetensors 实现。
 
-Behavior has many `DS4_*` env switches; treat them as diagnostic/tuning switches around the single release path, not permanent feature flags. **本项目禁止新增 env 配置**(铁律 2026-08-22): 行为写死进代码, 取料入口走 CLI 参数(`--cap-dir`/`--eval-ids` 等)。
+**全仓零 env 配置**(2026-08-31 大扫除收口): 引擎与工具链不读任何 `DS4_*` 环境变量——行为写死进代码(命名常量+why 注释), 取料/运维入口全走 CLI 参数(`--cap-dir`/`--eval-ids`/`--mem-budget-mb`/`--spec` 等, 见 README → Runtime Configuration)。**禁止新增 env 配置**(铁律 2026-08-22), 脚本 `${VAR:-默认}` 直喂二进制同样算。
 
 ## 当前主记录
 
@@ -135,7 +135,7 @@ Behavior has many `DS4_*` env switches; treat them as diagnostic/tuning switches
 
 ## Guardrails (hard)
 
-- Watchdog red line **12/12 GiB** (both hosts on dual-Mac runs); `DS4_MEM_BUDGET_MB` + L1 resident gate must refuse startup over budget. **Any model-loading script must prove memory safety (RSS budget + watchdog) before it runs.** Never double-load an 80+ GiB base on one host.
+- Watchdog red line **12/12 GiB** (both hosts on dual-Mac runs); `--mem-budget-mb` + L1 resident gate must refuse startup over budget (flag 不传=护栏不武装, 加载大模型的脚本必须传). **Any model-loading script must prove memory safety (RSS budget + watchdog) before it runs.** Never double-load an 80+ GiB base on one host.
 - After a local rebuild, consider whether the other machine needs the synced binary too (shared engine objects). Never delete files on the other host without explicit confirmation — "cleanup" means killing the process, not removing files.
 - **Per-merge correctness gates**: `make test` 全绿(含 linecount); 推理路改动加
   `--dump-logprobs` parity 与 `ds4_test --logprob-vectors`(有模型的机器);

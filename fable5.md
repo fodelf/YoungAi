@@ -7872,3 +7872,66 @@ chain9 双列证据(42 单元全表): 盲区双向 —
 - judge3 八域尺补账(04:45 收官): ③ vs 裸基座 Σmin 0.7415→0.7737 / KLD 0.5535→0.4396(−20.6%)
   / agree 72.7→75.6 — 反修价值在第二把尺确认; 裸 PPL 比值 1.060 更小=已知 PPL/KL 分歧,
   主判据按铁律认 Σmin/KLD。全链 00:02→04:45 干净收官, 双机同步。
+
+## 2026-08-31 ★env 大扫除收官: 全仓零环境变量, 行为写死+入口全 CLI 化★
+
+用户令"消除项目里面硬编码包括控制逻辑的环境变量, 各种魔术数字"。起点盘点: 516 处
+getenv / ~330 个 DS4_* 名(另有三个缓存 helper 藏了 ~85 个名, 真实规模 ~470 名)。
+保底不变式: **删 env 后的行为 = env 不设时的现行为**; 例外逐条列账(见下)。
+
+### 各域清账
+- src/core: 136 名清零(−3776 行)。MTP 死块(mtp_ready 恒 false)连 mtp_model 字段
+  连根删; CPU 路 opt-in 并行变体/解融合参考路/TP 专家切分实验(k48 墙)/hugepage
+  开关全删; 诊断 51 名连代码删(dump/trace/profile/atexit 钩全清)。
+- src/metal+cuda: 146 名清零(−3964 行)。MOE_THIN 整族(数量裁专家=在案质量灾难)/
+  SOURCE_CACHE 整族(mlock/hard_copy 饿死 page cache 在案负结果)/BACKBONE_MLOCK/
+  ROUTER_CACHE_BIAS+KEEP_FILE(改路由=改输出, 引擎不得改模型输出铁律)/REAP/
+  19 名 shader 源覆盖机制/全部 stage-profile 陪跑设施连代码删。VQ_GPU=0 的 CPU
+  参考 MoE 分支连根删(GPU-only 铁律)。★HC_STABLE/NORM_RSQRT_DISABLE 是默认开的
+  反向开关, 写死"开"支(tanh 形 sigmoid / 1/sqrt 归一), 未动数值。★
+- src/dist/server/cli/web/common/tests: 全清。dist 数值旋钮写死为命名常量;
+  worker 非预取循环(env 独占)删; server 的 FREE_CONF 门控(在案 negative result)
+  连代码删; tests 的 DS4_TEST_* 六名转 ds4_test 带值参数。
+- gguf-tools: ds4quant_run 158 处清零, 新表驱动解析器 ds4quant_cli.inc.c(57 个
+  flag); 判尺红线逐条核验(--nfit 1 纯回放/锚 43 层护栏/--export-bytes 0 judge 零
+  漂移)。GS_PERCOL(旧 20-30h 坐标下降)/ROUTE_SEQ 族/MINVOL_HIST 影子链/
+  INJECT-SPARE(--lcfg 全覆盖)等死代码删。zlayer/calib/pubbench/zrec 全 flag 化;
+  DS4Q_GPU=0 强制 CPU 编码分支删。孤儿 env 14 名(脚本在设、代码早没读者:
+  BF_TERMINAL/ZL_FIT_RANGES/REPEAT_FREQ/COPY_SPEC_LOG 等)从脚本清除。
+- 脚本: svc.sh/caliper_ref.sh/dual_vq.sh 及 gguf-tools/scripts 50+ 脚本全部改
+  flag 传参(bash -n 全绿)。svc.sh 里 EXPERT_PREAD/EVENT_DRAIN/MATH_SAFE 等一批
+  env 在重构后早已无读者(脚本自以为在调的杠杆其实没生效), 本轮一并对齐。
+
+### 新 CLI 面(README → Runtime Configuration 全表)
+--mem-budget-mb(看门狗 90%+L1 闸 85%+offload AUTO 判定共用一个预算)/--prefill-chunk/
+--spec(DSpark 投机+在线调度, 贪心逐位无损, 默认关=现状)/--draft-gguf/--draft-zchain/
+--vq-dir/--base-native/--batch/--primer-compact/--mm-image-cmd/--strict-fp(三宏成套)/
+--no-residency(单机超大模型防 panic 保命旗, 07-06 实撞语义保留)/--reverse-connect/
+--dist-prefill-cap/--expert-fetch-*(双机配对两半同批转)/--expert-pool-*/--expert-pin-*/
+--cap-layers/--amp-anchor(-route)/--multi-bench; ds4_test --model/--vector-file/…。
+
+### 刻意偏离"不变式"的账(全列)
+① PRIMER_BATCH_INJECT 写死开+FREE_BUDGET 写死 96(svc.sh 生产恒设, 代码默认 24 是陈值);
+② EXPERT_GATHER_THREADS 写死 8(同名双 reader 双默认 1/8 合一, 生产脚本一贯传 8);
+③ EVENT_DRAIN 写死开(Anukari 快路, 字节不变, 自带分配失败/超时回退);
+④ dspark 捕获(40..42 层 HC-mean+环形窗)改为仅 --spec 时武装(原无条件跑=纯开销);
+⑤ 捕获仪器武装时强制关专家预取(捕获可复现铁律写进机理);
+⑥ pubbench --api 必填无默认(旧默认 chat 恰是错口径, 逼显式选 completions);
+⑦ 引擎 EXPERT_OFFLOAD 人工覆盖口删除, AUTO(按 --mem-budget-mb)成唯一判定
+  (svc.sh 传 12000 后 80G 模型必然流式, 与旧 =1 同效)。
+
+### 魔数命名(同批)
+0.85 offload 判定/0.9 看门狗/4000ms 压力窗/孪生阈值合一(小批 mv 8×2、FA long 20×2、
+attn-out 32×3、活跃上限 1024×3)/efetch 150×2s 永久禁用语义注明/server 合批宽度 8
+的 12 处裸数组界统一 DS4_SERVER_BATCH_LANES/BFLT 段账 SDIV=12 与 GS_SCREEN_DIV
+两份拷贝合一/信赖域 [0.25,4] 等 tools 侧常量化。顺修: tools-test 断链(10763e5 BFLT
+埋点缺零值桩)已修通; dist_cli.c 拆出 dist_cli_check.c(500 行守卫)。
+
+### 验证
+make clean 全量重编绿(ds4/server/eval/bench/agent); make linecount 绿;
+ds4_unit + ds4_test --server/--engine-units/--rax/--tp-allreduce/--metal-kernels 全绿;
+make -C gguf-tools all amp calib bench tools-test 全绿。
+★欠账: 本机已无完整 GGUF(模型在 spark), --logprob-vectors/--dump-logprobs parity/
+CUDA 首编三项真模型闸未跑, 须在有模型的机器补验后才算过 per-merge 闸。★
+遗骸待用户裁决: tools/mtp_pipe_q2_speed.sh(MTP 遗骸)/refcorpus_ab.sh(A/B 两腿已等价)/
+dspark_anchor_corpus.sh 锚采集腿(诊断已删)。

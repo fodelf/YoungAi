@@ -463,10 +463,10 @@ exponential sweeps. Output is CSV with one row per frontier: latest prefill
 interval tokens/sec, generation tokens/sec at that frontier, and
 `kvcache_bytes`.
 
-Sessions prefill long prompts in 4096-token chunks by default. Set
-`DS4_METAL_PREFILL_CHUNK=N` to compare another chunk size, for example `2048`
+Sessions prefill long prompts in 4096-token chunks by default. Pass
+`--prefill-chunk N` to compare another chunk size, for example `2048`
 to match the strict official-vector checkpoint path, or
-`DS4_METAL_PREFILL_CHUNK=0` to prefill a prompt as one whole batch when memory
+`--prefill-chunk 0` to prefill a prompt as one whole batch when memory
 allows. Changing the chunk changes the KV checkpoint/logit path, so compare it
 as an explicit run configuration.
 Chunked Metal prefill reuses the same range-capable layer-major graph for each
@@ -672,7 +672,7 @@ coordinates. The enriched sketch is spliced into the message content as
 `<image>...</image>`, so prompt rendering, disk-KV prefix keys and exact
 replay stay byte-stable — pasting the same screenshot again hits the KV
 cache. Without an encoder (no `./mm-ui` next to the server, no
-`DS4_MM_IMAGE_CMD` override) image blocks are rejected with a 400 rather than
+`--mm-image-cmd` override) image blocks are rejected with a 400 rather than
 silently dropped.
 
 Default sampled API generation uses `temperature=1`, `top_p=1`, and
@@ -1135,120 +1135,40 @@ support the CPU backend for reference/debug use and share the same KV session
 and snapshot format as Metal and CUDA, but normal inference should use Metal or
 CUDA.
 
-## Environment Variables
+## Runtime Configuration
 
-There is exactly one release inference path; every `DS4_*` variable below is a
-tuning or diagnostic lever *around* that path, read by the engine at startup.
-Unset always means the release default. Booleans accept `0`/`1`. These
-one-liners are summaries — the authoritative documentation is the comment at
-each variable's `getenv` site in the source.
+There is exactly one release inference path, and it is configured **only by
+command-line flags** — the engine reads no `DS4_*` environment variables at all
+(2026-08-31 大扫除: 全部 env 开关或写死为唯一行为, 或转为下列 CLI 参数; 诊断
+脚手架连代码一起删除)。The historical env catalog lives in git history.
 
-### Core / memory safety
+Flags beyond the basics documented above:
 
-| Variable | What it does |
-| --- | --- |
-| `DS4_MEM_BUDGET_MB` | Hard per-process memory budget: feeds the memory watchdog and the L1 resident-budget startup gate (a run that cannot fit refuses to start instead of OOMing). |
-| `DS4_REPEAT_FREQ` | Frequency-based repeat penalty applied during greedy decode (anti-degeneration). `0` (default) disables. |
-| `DS4_METAL_MATH_SAFE` | Strict IEEE-754 Metal kernels (no fast-math reassociation). Fixes cross-GPU fp drift in distributed runs; near-zero cost when experts stream from disk. |
-| `DS4_METAL_PREFILL_CHUNK` | Prefill batch chunk size in tokens (`0` = whole prompt as one batch). See the Benchmarking section. |
-| `DS4_METAL_NO_MODEL_WARMUP` | Skip the startup warm-up pass over model views (avoids touching cold routed-expert pages on streamed runs). |
-| `DS4_MTP_NO_RESIDENCY` | Leave the MTP draft model evictable (not GPU-wired) and exclude it from the L1 resident budget. |
-| `DS4_REAP_COLLECT` | Collect per-layer expert saliency (REAP) counters and dump them at exit (also on SIGTERM for layer-sliced workers). |
-| `DS4_COPY_SPEC_LOG` | Diagnostic: one log line per copy-speculation verify batch (anchor/sent/accepted). Copy-spec itself is always armed with calibrated constants; this is its only remaining switch. |
+| Flag | Binaries | What it does |
+|---|---|---|
+| `--mem-budget-mb N` | all | Arms the memory guardrails: watchdog aborts at 90% of N, the L1 load gate refuses startup when planned resident bytes exceed 85% of N, and the expert resident/stream AUTO verdict compares against it. Unset = guardrails disarmed (model-loading scripts must pass it; 12000 on the 16 GB Macs). |
+| `--prefill-chunk N` | all | Prefill batch chunk cap in tokens (`0` = whole prompt as one batch). Default: backend-specific (Metal min(prompt, 4096), CUDA token-sliced 256). |
+| `--spec` | ds4, ds4-server | DSpark speculative decoding with the online speculate-vs-flat scheduler. Greedy verify is position-exact, so token output is byte-identical to flat decode; default off. |
+| `--draft-gguf FILE` / `--draft-zchain FILE` | ds4, ds4-server | Mount a standalone DSpark drafter GGUF / its amplifier sidecar (merged into chain slots 43..45). |
+| `--vq-dir DIR` | ds4, ds4-server | VQ codebook sidecar directory (takes precedence over `--residual`; both absent = embedded blob auto-load). |
+| `--residual FILE` | ds4, ds4-server | 1-bit residual expert sidecar GGUF. |
+| `--base-native` | ds4-server | Render chat as base-model native scaffolding (`# User:`/`# Assistant:`) with default stops; for served base models. |
+| `--batch N` | ds4-server | Merge up to N concurrent non-streaming tool-free chat requests into one batched decode (max 8). |
+| `--primer-compact` | ds4-server | Tool-primer injects only semantic anchors into the KV; client-visible text stays full DSML. |
+| `--mm-image-cmd CMD` | ds4-server | External multimodal image encoder command (default: probe `./mm-ui`). |
+| `--strict-fp` | ds4, ds4-server | Strict IEEE-754 shader math (safe math + f32 raw KV + exp2/log2 RoPE) for cross-GPU parity lanes. Not a production setting. |
+| `--reverse-connect` | dist binaries | Coordinator dials a listening worker (pipeline and TP); for hosts whose in-process outbound connect fails. |
+| `--dist-prefill-cap N` | coordinator | Session prefill batch cap bounding the routed-expert working set of wide batches. |
+| `--expert-fetch-serve` / `--expert-fetch-port N` / `--expert-fetch-dial HOST PORT` | dist binaries | Dual-host expert-fetch server half. |
+| `--expert-fetch-host HOST` / `--expert-fetch-accept-port N` | dist binaries | Dual-host expert-fetch client half (dial / accept modes). |
+| `--expert-stage` | dist binaries | Stage predicted experts from the peer's SSD one layer ahead (needs an expert-fetch link). |
+| `--expert-pool-mb N` / `--expert-pool-pinned SPEC` / `--expert-pool-auto-pin-top N` / `--expert-pool-prefetch-top N` | ds4, ds4-server | GPU-resident expert LRU pool and its pinning modes. |
+| `--expert-pin-file F` / `--expert-pin-mlock-mb N` / `--resid-pin-mlock-mb N` | ds4, ds4-server | mlock hot experts (base / residual sidecar) listed in F, capped by the MB budgets. |
+| `--cap-dir DIR` / `--cap-layers LO-HI` / `--eval-ids FILE` / `--eval-logits FILE` / `--eval-hdump DIR` / `--eval-no-bos` / `--amp-anchor FILE` / `--amp-anchor-route` / `--multi-bench N` | ds4 | Capture / teacher-forced scoring / anchored-replay / batching-bench instruments (the 反修 data plane). |
 
-### Routed-expert streaming (Metal, A3 offload)
-
-| Variable | What it does |
-| --- | --- |
-| `DS4_METAL_EXPERT_OFFLOAD` | Unset = AUTO: experts stay GPU-resident when the whole model fits the budget, stream from SSD otherwise. `1` forces streaming, `0` forces resident. |
-| `DS4_METAL_EXPERT_OFFLOAD_DIRECT` | Per-tensor direct GPU views instead of CPU gather staging (no-OOM validated but far slower; experiments only). |
-| `DS4_METAL_EXPERT_GATHER_THREADS` | CPU gather thread count for streamed expert reads. |
-| `DS4_METAL_EXPERT_PREAD` / `DS4_METAL_EXPERT_PREAD_NOCACHE` | Single-copy `pread` instead of mmap+memcpy for expert bytes; `NOCACHE` additionally bypasses the page cache. |
-| `DS4_METAL_EXPERT_BATCH_NOCACHE_MIN` | Minimum batch token count before `NOCACHE` reads apply (keeps small verify rounds on the cached fd, which re-hit warm bytes). |
-| `DS4_METAL_EXPERT_EVENT_DRAIN` | `MTLSharedEvent` host-wait fast path instead of `waitUntilCompleted` when draining gather command buffers. |
-| `DS4_METAL_EXPERT_FULL_LAYER_STREAM` | Prefill full-layer sequential expert streaming when most of a layer is active; `DS4_METAL_EXPERT_STREAM_THRESHOLD_PCT` (default 60) sets the trigger, `DS4_METAL_EXPERT_STREAM_CHUNK_MB` (default 16) the read chunk. |
-| `DS4_METAL_EXPERT_SORT_IDS` | Sort gathered expert ids so streamed reads are sequential on disk. |
-| `DS4_METAL_EXPERT_PREFETCH_AHEAD` | Cross-layer router-prediction read-ahead: predict upcoming layers' experts from the current hidden state and fault their pages in SSD-idle windows. `DS4_METAL_EXPERT_PREFETCH_DEPTH` sets how many layers ahead (L+1..L+D), `DS4_METAL_EXPERT_PREFETCH_TOP` the predicted top-N per layer. |
-| `DS4_METAL_EXPERT_REMOTE_TAIL_RESERVE` | Number of tail gather units per layer that must stay on the local disk (a remote round-trip claimed at the end of a layer stalls every finished local thread). |
-| `DS4_METAL_EXPERT_STAGE` | Predictive staging of the next layer's expert bytes into a double-buffered slot (`0` disables). |
-| `DS4_METAL_EXPERT_IO_PROFILE` | Diagnostic: per-stage gather timing (fault/memcpy/pread/drain) counters. |
-
-### Expert RAM pool (`DS4_METAL_EXPERT_POOL_*`, per-layer LRU)
-
-`DS4_METAL_EXPERT_POOL_MB` (default 0 = off) enables a RAM pool of gathered
-routed experts with per-layer LRU eviction.
-
-| Variable | What it does |
-| --- | --- |
-| `DS4_METAL_EXPERT_POOL_LAYER_START` / `DS4_METAL_EXPERT_POOL_LAYER_END` | Layer range the pool covers. |
-| `DS4_METAL_EXPERT_POOL_MIN_LAYER_SLOTS` | Guaranteed slots per layer. |
-| `DS4_METAL_EXPERT_POOL_ADMIT_AFTER` | Admit an expert only after N requests. |
-| `DS4_METAL_EXPERT_POOL_HIT_ONLY` | Fill from demand gathers only — the predictor prefetch becomes an explicit opt-in. |
-| `DS4_METAL_EXPERT_POOL_FOREGROUND_FILL` / `DS4_METAL_EXPERT_POOL_WARM_BATCH` | Fill the pool on the foreground gather path / via the batch warm path. |
-| `DS4_METAL_EXPERT_POOL_WAIT_INFLIGHT` | A demand gather waits for an in-flight prefetch of the same expert instead of re-reading it. |
-| `DS4_METAL_EXPERT_POOL_PREFETCH_LOOKAHEAD` / `DS4_METAL_EXPERT_POOL_PREFETCH_TOP` / `DS4_METAL_EXPERT_POOL_PREFETCH_SELF` / `DS4_METAL_EXPERT_POOL_PREFETCH_ADJACENT` / `DS4_METAL_EXPERT_POOL_PREFETCH_EVICT` / `DS4_METAL_EXPERT_POOL_PREFETCH_QUEUE` | Router-prediction prefetcher shape: layers ahead, predicted top-N per layer, include the current layer's own next-token prediction, also fetch adjacent expert ids, allow prefetch to evict, and queue capacity. |
-| `DS4_METAL_EXPERT_POOL_HOTLOCK_TOP` | Lock the hottest N experts per layer against eviction. |
-| `DS4_METAL_EXPERT_POOL_AUTO_PIN_TOP` / `DS4_METAL_EXPERT_POOL_AUTO_PIN_MIN_REQ` / `DS4_METAL_EXPERT_POOL_AUTO_PIN_INTERVAL` / `DS4_METAL_EXPERT_POOL_PIN_RESERVE` | Periodic automatic pinning of the top-N experts with at least MIN_REQ requests, with slots reserved for pins. |
-| `DS4_METAL_EXPERT_POOL_PINNED` | Static pin whitelist, format `L23:1,2,3/L24:...`. |
-| `DS4_METAL_EXPERT_POOL_HOTLIST_TOP` / `DS4_METAL_EXPERT_POOL_HOTLIST_INTERVAL` / `DS4_METAL_EXPERT_POOL_INTERVAL` | Periodic hot-expert list and pool stats logging. |
-
-### Expert source cache (`DS4_METAL_EXPERT_SOURCE_CACHE_*`)
-
-`DS4_METAL_EXPERT_SOURCE_CACHE_MB` (default 0 = off) keeps raw source expert
-bytes in a RAM LRU so repeat gathers skip the SSD.
-
-| Variable | What it does |
-| --- | --- |
-| `DS4_METAL_EXPERT_SOURCE_CACHE_LAYER_START` / `DS4_METAL_EXPERT_SOURCE_CACHE_LAYER_END` | Layer range the cache covers. |
-| `DS4_METAL_EXPERT_SOURCE_CACHE_ADMIT_AFTER` | Admit an expert only after N requests. |
-| `DS4_METAL_EXPERT_SOURCE_CACHE_HARD_COPY` | Own private copies instead of mmap-backed pages. |
-| `DS4_METAL_EXPERT_SOURCE_CACHE_ASYNC` | Fill the cache off the gather thread. |
-| `DS4_METAL_EXPERT_SOURCE_CACHE_MLOCK` | Wire the cache pages. |
-| `DS4_METAL_EXPERT_SOURCE_CACHE_DYNAMIC` / `DS4_METAL_EXPERT_SOURCE_CACHE_DYN_MARGIN_MB` | Size the cache to free-RAM headroom (up to the MB ceiling) and yield it back as the working set grows. |
-| `DS4_METAL_EXPERT_SOURCE_CACHE_INTERVAL` | Periodic stats logging. |
-
-### Expert access profiler (simulation only, changes no inference)
-
-`DS4_METAL_EXPERT_OFFLOAD_PROFILE=1` logs, per CPU gather, what an LRU expert
-cache *would* have hit. `DS4_METAL_EXPERT_PROFILE_CACHE_MB` sets the simulated
-size, `DS4_METAL_EXPERT_PROFILE_TOP` the per-layer top-N printed at exit,
-`DS4_METAL_EXPERT_PROFILE_INTERVAL` a periodic dump, and
-`DS4_METAL_EXPERT_PROFILE_ALL=1` dumps every expert seen.
-
-### Routing / MoE kernels (quality-sensitive — gate with `ds4-eval` + `--logprob-vectors`)
-
-| Variable | What it does |
-| --- | --- |
-| `DS4_METAL_ROUTER_CACHE_BIAS` | Cache-aware routing bias lambda: nudge top-k selection toward page-cache-hot experts. `0` (default) is bit-exact off; route weights always stay on unbiased probs. `DS4_METAL_ROUTER_CACHE_DECAY` (default 0.85) is the hotness score decay. |
-| `DS4_METAL_MOE_THIN_TOPK` / `DS4_METAL_MOE_THIN_ALPHA` | Reduced-activation thinning: keep fewer routed experts per token (drop low-weight picks, renormalize the survivors) on eligible batches. |
-| `DS4_METAL_MOE_THIN_MIN_TOKENS` / `DS4_METAL_MOE_THIN_MAX_TOKENS` | Batch-size gates for thinning; e.g. `MAX_TOKENS=1` thins only bare single-token decode so copy-spec verify batches stay byte-identical. |
-| `DS4_METAL_MOE_MM_ID_MIN` | Minimum batch token count for the grouped-GEMM (`mm_id`) routed-MoE path. |
-| `DS4_METAL_MOE_OVERLAP` | P-OVL: split a verify batch's expert set into two passes so the CPU disk gather of pass 1 overlaps the GPU GEMM of pass 0 (bit-exact, default off). `DS4_METAL_MOE_OVERLAP_MIN_EXPERTS` (default 8) and `DS4_METAL_MOE_OVERLAP_PASSES` (default 2) shape it. |
-| `DS4_EXPERT_KEEP_FILE` | REAP keep-mask quality experiment: restrict the router per layer to the listed experts (pruned experts get bias −inf, survivors renormalize). No repack, no memory change. |
-
-### Residency pinning
-
-| Variable | What it does |
-| --- | --- |
-| `DS4_METAL_BACKBONE_MLOCK` | `mlock` the non-expert backbone slice so cold expert streams cannot evict its hot pages; `DS4_METAL_BACKBONE_MLOCK_BUDGET_MB` caps the wired bytes. |
-| `DS4_EXPERT_PIN_FILE` | Pin the experts listed in the file (frequency top-K from profiling) in RAM; `DS4_EXPERT_PIN_MLOCK_MB` caps the wired bytes. |
-
-### Distributed inference (`DS4_DIST_*`, `DS4_TP_*`)
-
-| Variable | What it does |
-| --- | --- |
-| `DS4_DIST_REVERSE_CONNECT` | Layer-pipeline control channel direction flip: the coordinator dials a listening worker (for hosts whose outbound connects are blocked by macOS local-network privacy). |
-| `DS4_DIST_PREFILL_CAP` | Clamp the distributed prefill batch scratch cap (tokens) to the real prompt scale. |
-| `DS4_DIST_PIPE_CHUNK` | Prefill pipeline chunking (1..16): worker computes chunk c−1 while the coordinator prepares chunk c, reclaiming serial coordinator-idle time. |
-| `DS4_DIST_SPEC_PIPE` / `DS4_DIST_SPEC_PIPE_DEPTH` | Cross-round speculative pipelining: the coordinator pre-computes round N+1 locally while the worker runs round N; `DEPTH` chains N+1..N+D. Bit-exact. |
-| `DS4_DIST_MTP_CARRY_DRAFT` | Off-host MTP carry-over: draft from the previous verify batch's boundary hidden instead of a dedicated round-1 forward (one fused forward per cycle, greedy-only). |
-| `DS4_DIST_MTP_LOG` / `DS4_DIST_PIPE_PROFILE` | Diagnostics: per-call MTP forward/accept accounting; per-forward local-compute vs worker-wait split. |
-| `DS4_DIST_EXPERT_FETCH_SERVE` | Serve this host's model file bytes over TCP so the peer can gather routed experts from the faster remote disk. |
-| `DS4_DIST_EXPERT_FETCH_HOST` / `DS4_DIST_EXPERT_FETCH_PORT` / `DS4_DIST_EXPERT_FETCH_CONNS` | Client side of the expert byte service: where to fetch remote expert bytes and over how many connections. |
-| `DS4_DIST_EXPERT_FETCH_ACCEPT_PORT` | Reverse-transport mode: the fetching side listens and the serving side dials in via `DS4_DIST_EXPERT_FETCH_SERVE_DIAL_HOST` / `DS4_DIST_EXPERT_FETCH_SERVE_DIAL_PORT` / `DS4_DIST_EXPERT_FETCH_SERVE_DIAL_CONNS` (same macOS outbound-connect workaround as above). |
-| `DS4_TP_REVERSE_CONNECT` | Tensor-parallel control channel direction flip (TP twin of `DS4_DIST_REVERSE_CONNECT`). |
-| `DS4_TP_EXPERT_SPLIT` | TP phase 3: split each token's routed experts across peers so each fetches only its share of the per-token SSD IO. `DS4_TP_SPLIT_LOW` sets how many experts the faster peer takes (default half). |
-| `DS4_TP_SHARED_SPLIT` | TP: also element-split the shared-expert FFN across peers. |
+Everything that used to be an env tuning lever is now either a named constant
+at its point of use (with a why-comment) or gone together with the code path it
+guarded.
 
 ## Steering
 
@@ -1269,7 +1189,7 @@ captured from the official DeepSeek V4 Flash API. The requests use
 `top_logprobs` slice exposed by the API. Local vectors are generated with
 `./ds4 --dump-logprobs` and compared by token bytes, so tokenizer/template or
 attention regressions show up before they become long generation failures. The
-C runner pins `DS4_METAL_PREFILL_CHUNK=2048` for this strict API-vector
+C runner pins a 2048-token prefill chunk for this strict API-vector
 comparison.
 
 All project tests are driven by the C runner. `make test` also runs the
