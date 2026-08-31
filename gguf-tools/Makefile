@@ -59,6 +59,9 @@ VQMERGE_INC := $(wildcard $(QZ)/vq_merge_v4_p*.inc.c)
 ZLAYER_INC := $(wildcard $(AMP)/zlayer_p*.inc.c)
 DSQRUN_INC := $(wildcard $(AMP)/ds4quant_run_p*.inc.c) $(AMP)/ds4quant_anchor.inc.c \
               $(AMP)/ds4quant_moe_gpu.inc.c $(AMP)/ds4quant_zreplay.inc.c $(AMP)/ds4quant_bfkernel.inc.c $(AMP)/ds4quant_sweep_arms.inc.c
+# 仓库根同源实现+116 契约头: wildcard 罩不到 gguf-tools 外, 漏列=改完静默不重编
+# (2026-08-31 实撞: ds4_amp_fmt.h 收 tr 单一定义源后 Linux 侧 make 说"无需做任何事")
+AMP_ROOT_SRC := ../ds4_z.c ../ds4_z.h ../ds4_loss.c ../ds4_loss.h ../src/common/ds4_amp_fmt.h
 
 ifeq ($(UNAME_S),Darwin)
 NATIVE ?= -mcpu=native
@@ -168,7 +171,7 @@ DSQR_FLAGS := $(BARE) $(NATIVE) -Wall -Wno-unused-parameter -Wno-unused-function
 ifeq ($(UNAME_S),Darwin)
 ds4quant_run: $(AMP)/ds4quant_run
 $(AMP)/ds4quant_run: $(AMP)/ds4quant_run.c $(DSQRUN_INC) $(AMP)/ds4quant_fwd.c $(DSQFWD_INC) $(QZ)/onebit_quant.c \
-                     $(AMP)/ds4quant_qhelp.h $(QZ)/go2b_qc.h $(QZ)/vq_qc.h
+                     $(AMP)/ds4quant_qhelp.h $(QZ)/go2b_qc.h $(QZ)/vq_qc.h $(AMP_ROOT_SRC)
 	$(CC) $(DSQR_FLAGS) -o $@ $(AMP)/ds4quant_run.c $(BLAS_LIBS) -lm -lpthread
 else
 ifeq ($(CUDA),1)
@@ -178,13 +181,13 @@ ds4quant_run: $(AMP)/ds4quant_run
 # 头文件依赖必须列全: 2026-08-27 改 vq_qc.h 后 Linux 侧静默不重编(Darwin 分支列了, 这里漏了),
 # 表现是"改完照跑, 行为没变", 极难察觉。改这条规则时同步 Darwin 分支。
 $(AMP)/ds4quant_run: $(AMP)/ds4quant_run.c $(DSQRUN_INC) $(QZ)/vq_gpu.o $(AMP)/ds4quant_fwd.c \
-                     $(DSQFWD_INC) $(QZ)/onebit_quant.c $(AMP)/ds4quant_qhelp.h $(QZ)/go2b_qc.h $(QZ)/vq_qc.h
+                     $(DSQFWD_INC) $(QZ)/onebit_quant.c $(AMP)/ds4quant_qhelp.h $(QZ)/go2b_qc.h $(QZ)/vq_qc.h $(AMP_ROOT_SRC)
 	$(CC) $(DSQR_FLAGS) $(if $(filter 1,$(HAVE_BLAS)),-DDQ_BLAS -DDS4QUANT_OPENBLAS $(BLAS_CFLAGS)) \
 	    -DDS4QUANT_CUDA -I$(CUDA_HOME)/include -o $@ $(AMP)/ds4quant_run.c $(QZ)/vq_gpu.o \
 	    $(CUDA_LIBS) -lcublas $(BLAS_LIBS) -lm -lpthread
 else
 ds4quant_run: $(AMP)/ds4quant_run
-$(AMP)/ds4quant_run: $(AMP)/ds4quant_run.c $(DSQRUN_INC)
+$(AMP)/ds4quant_run: $(AMP)/ds4quant_run.c $(DSQRUN_INC) $(AMP_ROOT_SRC)
 	$(CC) $(DSQR_FLAGS) $(if $(filter 1,$(HAVE_BLAS)),-DDQ_BLAS -DDS4QUANT_OPENBLAS $(BLAS_CFLAGS)) \
 	    -o $@ $(AMP)/ds4quant_run.c $(BLAS_LIBS) -lm -lpthread
 endif
@@ -195,7 +198,7 @@ endif
 # zlayer_gpu.o(cuBLAS 薄封装, GPU 缺时运行时自动回落 CPU 路)。
 zlayer: $(AMP)/zlayer
 ifeq ($(UNAME_S),Darwin)
-$(AMP)/zlayer: $(AMP)/zlayer.c $(ZLAYER_INC) ../src/common/ds4_quantfmt.c ../src/common/ds4_gguf.c
+$(AMP)/zlayer: $(AMP)/zlayer.c $(ZLAYER_INC) ../src/common/ds4_quantfmt.c ../src/common/ds4_gguf.c ../src/common/ds4_amp_fmt.h
 	$(CC) $(BARE) $(NATIVE) -DDQ_BLAS -o $@ $(AMP)/zlayer.c $(BLAS_LIBS) -lm -lpthread
 else
 ifeq ($(HAVE_BLAS),0)
@@ -205,11 +208,11 @@ else
 ifeq ($(CUDA),1)
 $(AMP)/zlayer_gpu.o: $(AMP)/zlayer_gpu.cu
 	$(NVCC) -O3 -arch=native -c $< -o $@
-$(AMP)/zlayer: $(AMP)/zlayer.c $(ZLAYER_INC) $(AMP)/zlayer_gpu.o ../src/common/ds4_quantfmt.c ../src/common/ds4_gguf.c
+$(AMP)/zlayer: $(AMP)/zlayer.c $(ZLAYER_INC) $(AMP)/zlayer_gpu.o ../src/common/ds4_quantfmt.c ../src/common/ds4_gguf.c ../src/common/ds4_amp_fmt.h
 	$(CC) $(BARE) $(NATIVE) -DDQ_BLAS $(BLAS_CFLAGS) -DZL_CUDA -o $@ $(AMP)/zlayer.c \
 	    $(AMP)/zlayer_gpu.o $(BLAS_LIBS) -lcublas -lcusolver $(CUDA_LIBS) -lm -lpthread
 else
-$(AMP)/zlayer: $(AMP)/zlayer.c $(ZLAYER_INC) ../src/common/ds4_quantfmt.c ../src/common/ds4_gguf.c
+$(AMP)/zlayer: $(AMP)/zlayer.c $(ZLAYER_INC) ../src/common/ds4_quantfmt.c ../src/common/ds4_gguf.c ../src/common/ds4_amp_fmt.h
 	$(CC) $(BARE) $(NATIVE) -DDQ_BLAS $(BLAS_CFLAGS) -o $@ $(AMP)/zlayer.c $(BLAS_LIBS) -lm -lpthread
 endif
 endif
@@ -246,7 +249,7 @@ zrec_to_zchain: zrec_to_zchain.bin
 zrec_to_zchain.bin: $(AMP)/zrec_to_zchain.c
 	$(CC) $(BARE) $(NATIVE) -o zrec_to_zchain $< -lm -lpthread
 
-ZLOSS_DEPS := $(AMP)/zloss_solve.c $(AMP)/zloss_arms.inc.c $(AMP)/zloss_gate.inc.c $(AMP)/zloss_emit.inc.c $(AMP)/zloss_dynz.inc.c $(AMP)/linalg_small.c $(CAL)/npy.c ../ds4_z.c ../ds4_z.h ../ds4_loss.c ../ds4_loss.h
+ZLOSS_DEPS := $(AMP)/zloss_solve.c $(AMP)/zloss_arms.inc.c $(AMP)/zloss_gate.inc.c $(AMP)/zloss_emit.inc.c $(AMP)/zloss_dynz.inc.c $(AMP)/linalg_small.c $(CAL)/npy.c ../ds4_z.c ../ds4_z.h ../ds4_loss.c ../ds4_loss.h ../src/common/ds4_amp_fmt.h
 ifeq ($(HAVE_BLAS)-$(CUDA),1-1)
 # GPU 路(2026-08-26 提速令"必须用GPU"): gemm/potrf/potrs/QR 走 zlayer_gpu.o(cuBLAS+cuSOLVER)
 $(AMP)/zloss_solve: $(ZLOSS_DEPS) $(AMP)/zlayer_gpu.o
