@@ -173,6 +173,11 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
     g_lt[1]=vqt_now()-lt_mark; lt_mark=vqt_now();   /* ①路由段完 */
     float *Fout=calloc((size_t)S*DIM,4); dq_expert_fp(Fin,W->s1,W->s3,W->s2,NULL,Fout,S,DIM,MOEI,SWLIM);
     g_lt[2]=vqt_now()-lt_mark; lt_mark=vqt_now();   /* ②共享专家(全 S 稠密前向)完 */
+    /* ★z/GE 闸信任域口径正修(2026-08-31)★ 闸曾用 ‖Fout‖=‖shared+routed‖ 当信任域基准,
+     * 而回放(zreplay:28 rt=fw−fb)与引擎(ds4_zchain nr=‖routed‖)都用 ‖routed‖ —— 闸比部署
+     * 宽 ‖Fout‖/‖routed‖ 倍, 过闸的 z 落盘后被夹更狠 = "层内正向、盘上打折"的结构源之一。
+     * 修法: 共享基所有权移交到 z 块(z_shb), 闸内 routed = Fout−z_shb。 */
+    float *z_shb=NULL;
     if(do_quant&&cfg=='B'){
         /* 字节重前向: 从层文件(权重字节+落地修正链)执行, 不重量化 — 全局回扫的引擎 */
         float *shb=malloc((size_t)S*DIM*4); memcpy(shb,Fout,(size_t)S*DIM*4);   /* shared 基 */
@@ -230,7 +235,7 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
                 free(yq);
             }
         }
-        free(shb);
+        z_shb=shb;   /* 所有权移交 z/GE 闸(routed 口径), p8 统一释放 */
     } else if(do_quant&&cfg=='g'&&COADAPT>0&&ANC_OK){
         /* 共适应路径: base(w2)↔z 交替闭式收敛(取代下方一次性 worker + 一次性 z 块) */
         coadapt_moe(L,S,n_fit,Fin,idx,rw,Fout,H2,post2,comb2,st);
@@ -269,7 +274,8 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
         st->loc_r2=1.0-DQ_E2(Fout)/sa; st->have_loc=1;
         #undef DQ_E2
     }
-    if(shared)free(shared); if(Ffp)free(Ffp);
+    if(shared){ z_shb=shared; shared=NULL; }   /* 所有权移交 z/GE 闸(routed 口径), p8 统一释放 */
+    if(Ffp)free(Ffp);
     }   /* end 非共适应路径 */
     /* ★纯VQ路径接入(2026-08-23)★: 纯 VQ 战役唯一的量化前向就是 B 回放(裸评撤),
      * cfg!='B' 禁入让序贯 z^L 在纯 VQ 下永不触发(ZLGATE=0 实锤)。B 禁入的两个理由
@@ -358,6 +364,7 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
             { int cand0[7]={LZRANK,LZRANK/2,16,kL>0?kL:8,8,4,1}, tried[7]={0,0,0,0,0,0,0};
               size_t lst2=(size_t)S*HCM*DIM;
               float *Hq2=malloc(lst2*4), *Ftry=malloc((size_t)S*DIM*4), *zd=malloc((size_t)DIM*4);
+              if(!z_shb){ fprintf(stderr,"★z闸 L%d: 共享基缺失(分支断言破) — 信任域无 routed 口径, 拒解算★\n",L); exit(1); }
               const float *Hf2=ANC.H+(size_t)L*ancS*HCM*DIM;   /* 同上: 锚步长用 ancS 不是 lst2(=S*HCM*DIM) */
               /* 基线 val 出口 relL2 */
               double e0; { dq_hc_post(Fout,H2,post2,comb2,Hq2,S,HCM,DIM);
@@ -382,8 +389,10 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
                 memcpy(Ftry,Fout,(size_t)S*DIM*4);
                 for(int s=0;s<S;s++){
                     memset(zd,0,(size_t)DIM*4); ds4_z_apply(zl,Fin+(size_t)s*DIM,zd);
-                    double nd=0,nf=0; const float*fo=Ftry+(size_t)s*DIM;
-                    for(int d2=0;d2<DIM;d2++){ nd+=(double)zd[d2]*zd[d2]; nf+=(double)fo[d2]*fo[d2]; }
+                    /* 信任域基准=routed(Ftry−共享基), 与 zreplay/引擎同口径 */
+                    double nd=0,nf=0; const float*fo=Ftry+(size_t)s*DIM,*zb=z_shb+(size_t)s*DIM;
+                    for(int d2=0;d2<DIM;d2++){ nd+=(double)zd[d2]*zd[d2];
+                        double rt3=(double)fo[d2]-zb[d2]; nf+=rt3*rt3; }
                     nd=sqrt(nd); nf=sqrt(nf);
                     double cap=LZTR*nf; float sc2=1.0f;
                     if(nd>cap&&nd>0) sc2=(float)(cap/nd);
@@ -433,7 +442,7 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
             /* ★拒层 GE 兜底(2026-08-23 用户令"抓不到肉是bug·先修bug")★
              * 哈希层(L1/L2 实锤)误差由离散专家身份决定, 连续 x 特征的 z^L 数学上抓不住
              * (L0 尚存 token 身份残留可修, L1+ 解耦后全梯拒)。对症=per-expert 门:
-             * m*_s=<Fout+ΔF,Fout>/<Fout,Fout>(每 token 最优缩放) 按路由权重投到专家
+             * m*_s=<routed+ΔF,routed>/<routed,routed>(每 token 最优缩放, routed=Fout−共享基) 按路由权重投到专家
              * (backfit form==4 同式), clamp[0.8,1.2]。评估用 ĝ_s(token 的 gate 加权平均门)
              * 近似 —— 专家间差异被平均抹平=低估改善, 过闸则真实改善≥评估(保守安全)。
              * 落地: Fout*=ĝ(序贯传链) + zrec 追加 bf.GE(引擎 type5 精确 per-expert 执行)。 */
@@ -441,9 +450,12 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
                 int vs2=(n_fit*3)/4; int nval2=n_fit-vs2; if(nval2<8){ vs2=n_fit; nval2=0; }
                 double *gnum=calloc((size_t)NEXP,sizeof(double)),*gden=calloc((size_t)NEXP,sizeof(double));
                 for(int s2=0;s2<vs2;s2++){
-                    const float*fo=Fout+(size_t)s2*DIM,*df=DF+(size_t)s2*DIM;
+                    /* ★口径正修(2026-08-31)★ 部署的 GE 乘的是 routed(引擎乘门权/回放专家累加时乘),
+                     * 旧式在 Fout=shared+routed 上投影+缩放 = 解算与部署不是同一个变换。 */
+                    const float*fo=Fout+(size_t)s2*DIM,*df=DF+(size_t)s2*DIM,*zb2=z_shb+(size_t)s2*DIM;
                     double num=0,den=1e-12;
-                    for(int d2=0;d2<DIM;d2++){ num+=((double)fo[d2]+df[d2])*fo[d2]; den+=(double)fo[d2]*fo[d2]; }
+                    for(int d2=0;d2<DIM;d2++){ double rd=(double)fo[d2]-zb2[d2];
+                        num+=(rd+df[d2])*rd; den+=rd*rd; }
                     double ms2=num/den;
                     for(int a2=0;a2<NACT;a2++){ int e2=idx[(size_t)s2*NACT+a2]; double w2=rw[(size_t)s2*NACT+a2];
                         if(e2>=0&&e2<NEXP&&w2>0){ gnum[e2]+=w2*ms2; gden[e2]+=w2; } }
@@ -463,8 +475,8 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
                         for(int a2=0;a2<NACT;a2++){ int e2=idx[(size_t)s2*NACT+a2]; double w2=rw[(size_t)s2*NACT+a2];
                             if(e2>=0&&e2<NEXP&&w2>0){ gw+=w2*gev[e2]; ww+=w2; } }
                         float gh=(float)(gw/ww);
-                        float*fw=Ftry2+(size_t)s2*DIM;
-                        for(int d2=0;d2<DIM;d2++) fw[d2]*=gh;
+                        float*fw=Ftry2+(size_t)s2*DIM; const float*zb3=z_shb+(size_t)s2*DIM;
+                        for(int d2=0;d2<DIM;d2++) fw[d2]=zb3[d2]+gh*(fw[d2]-zb3[d2]);   /* 只缩放 routed, 与部署同变换 */
                     }
                     const float *Hf3=ANC.H+(size_t)L*ancS*HCM*DIM;
                     double e0g,e1g;

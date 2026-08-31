@@ -167,7 +167,7 @@ static int real_layer(const char *hf,const char *anc,int L,int NE,int SROW,int V
                 const int LZRANK=64;
                 const int cand[7]={LZRANK,LZRANK/2,16,8,8,4,1};   /* 生产 cand0 同款 */
                 printf("③sweep  候选评估(生产 ZLGATE 口径, 真 z rank=64, 信任域 LZTR=0.5):\n");
-                land=dsq_sweep_layer(zl,X,Fout,Ftry,HF,pst,cmb,HQ,HF,
+                land=dsq_sweep_layer(zl,X,Fout,Ftry,HF,pst,cmb,HQ,HF,NULL /* 单元 Fout=YQ 无共享基 */,
                                      SROW,vs,SROW,0.5f,cand,7,&k_land,&e0s,&e1s,&n_eval);
                 ds4_z_free(zl);
             }

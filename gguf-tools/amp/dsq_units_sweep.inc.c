@@ -15,11 +15,12 @@ static int        g_anc_rowstride = 0;
  * ★我最初只搬了 (a), 所以 ③ 报 0.000s —— 那不是"快", 是根本没测东西。★
  * 首个过门的候选【立即落地并写回 Fout】(序贯: 下一层看到校正后的激活), 与生产同,
  * 不是"全扫完再挑最优" —— 改成后者会与生产的落地序偏离, 结果不可比。
- * 信任域夹持 ‖z(x_s)‖ ≤ LZTR·‖Fout_s‖ 防把激活拉出流形(生产 LZTR=0.5)。
+ * 信任域夹持 ‖z(x_s)‖ ≤ LZTR·‖routed_s‖ 防把激活拉出流形(生产 LZTR=0.5;
+ * 2026-08-31 口径正修: 基准=routed, 与 zreplay/引擎同; shb=共享基, NULL=Fout 已是 routed)。
  * 返回 1=有候选落地 0=全拒(Fout 不动), -1=内存失败。 */
 int dsq_sweep_layer(ds4_z *zl, const float *Fin, float *Fout, float *Ftry,
                     const float *resid, const float *post, const float *comb,
-                    float *Hq, const float *Hf,
+                    float *Hq, const float *Hf, const float *shb,
                     int S, int vs, int n_fit, float LZTR,
                     const int *cand, int ncand,
                     int *k_land, double *e0_out, double *e1_out, int *n_eval)
@@ -49,7 +50,9 @@ int dsq_sweep_layer(ds4_z *zl, const float *Fin, float *Fout, float *Ftry,
             ds4_z_apply(zl, Fin + (size_t)sx * DIM, zd);
             double nd = 0, nf = 0;
             const float *fo = Ftry + (size_t)sx * DIM;
-            for (int d = 0; d < DIM; d++) { nd += (double)zd[d]*zd[d]; nf += (double)fo[d]*fo[d]; }
+            const float *zb = shb ? shb + (size_t)sx * DIM : NULL;
+            for (int d = 0; d < DIM; d++) { nd += (double)zd[d]*zd[d];
+                const double rt = (double)fo[d] - (zb ? zb[d] : 0.0); nf += rt*rt; }
             nd = sqrt(nd); nf = sqrt(nf);
             const double cap = (double)LZTR * nf;
             float sc = 1.0f;
