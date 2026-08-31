@@ -759,6 +759,12 @@ stage_champ86(){
             LOG "备份 ✓ 逐字节一致 $(du -sh "$W/layers_quant" | cut -f1)"
         else DIE "★备份逐字节复核失败★"; fi
     else LOG "量化态备份已在, 跳过"; fi
+    # ①b 裸态 wt2 五指标(2026-08-31 全链重跑补位): 量化产物先出自己的官方尺读数,
+    # 反修的增益才有同一轮的裸对照 —— 不再拿旧语料 vq86h_noz 的 0.47055 隔轮对表。
+    LOG "①b 裸态 wt2 官方尺(layers_quant)"
+    bash "$SC/caliper_ref.sh" "$W/layers_quant" /tmp/qc_champ86_bare_wt2.bin \
+        > /tmp/caliper_champ86_bare.log 2>&1 || { tail -3 /tmp/caliper_champ86_bare.log; DIE "裸判失败"; }
+    grep -aE "PPL\(stu|分布还原率|Mean KLD|Same top" /tmp/caliper_champ86_bare.log
     # ★②反修+sweep: 改走冠军 zlayer 路(2026-08-29)★
     # 原来这里是 stage_champbf → r30_campaign backfit → ds4quant_run 内建反修。三处与
     # 冠军 r64c(0.42510 = −9.7%)不符, 合起来让 z 落地 378/378 全拒:
@@ -774,15 +780,12 @@ stage_champ86(){
     SRCBASE=champ86/layers_quant bash "$SC/amp_clean_full.sh" \
         champ86amp "" 64 "" "$D2/anchor_a_clean_s8192.bin" \
         || DIE "冠军路反修失败"
-    # ★③sweep: 全层再扫一遍(2026-08-29 用户"之前的 sweep 不就是所有层再跑一遍吗")★
-    # 反修(zlayer)是一遍过、逐层独立解; sweep 是在【反修完成态】上以最终出口为判据把 43 层
-    # 再扫一遍, 逐层试 6 种形态(GL/TREF/dyn2/GE/own-z重解/…)择优落地, 收尾统一终验、劣化全回滚。
-    # ★本轮之前它是坏的★: 打分行域固定 [vs,n_fit)=[4608,6144), 在"域按块连续铺"的语料上
-    # 只覆盖西里尔后半+math 两个域 ⇒ 候选择优/落地/终验全瞎。已改成从 <锚>.layout 分层推导。
-    LOG "③sweep(全层再扫一遍, 行域已改分层; 反修完成态上做)"
-    stage_champbf champ86amp full
+    # ★③sweep 已下链(2026-08-31 chain9 定谳, fable5)★: 部署真尺(g_bkl_live 抑制钉路)下
+    # 逐单元真降不可组合(全 8192 行终验 0.74096→0.74271 劣化), GL/GE/z重解 op 族在
+    # 跨语料闸落地前无净肉 —— 生产链只到 ②反修完成态(=③态交付物)。
+    # 单独复扫走 `amp_campaign.sh champbf champ86amp full`, 不进本段。
     # ④五指标: amp_clean_full 的 ④ 已出 wt2 官方尺; 这里补【判决份同域全能力尺】(裸+反修后两跑)
-    LOG "④判决份同域尺; wt2 官方尺已由 ② 内部跑完(对表平权裸 KLD 0.47055 / Σmin 0.7799 / top1 78.36%)"
+    LOG "④判决份同域尺; wt2 官方尺已由 ② 内部跑完(裸对照见 ①b 本轮读数)"
     stage_judge3 champ86amp
 }
 
