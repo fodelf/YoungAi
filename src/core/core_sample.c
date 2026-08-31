@@ -319,37 +319,5 @@ int sample_top_p_min_p(
     return ids[filtered - 1];
 }
 
-void print_top_logits(
-        FILE          * fp,
-        const char    * label,
-        const ds4_vocab * vocab,
-        const float   * logits,
-        uint32_t        n_vocab,
-        int             k) {
-    int best[16];
-    if (k > 16) k = 16;
-    for (int i = 0; i < k; i++) best[i] = -1;
-
-    for (uint32_t i = 0; i < n_vocab; i++) {
-        for (int j = 0; j < k; j++) {
-            if (best[j] < 0 || logits[i] > logits[best[j]]) {
-                for (int l = k - 1; l > j; l--) best[l] = best[l - 1];
-                best[j] = (int)i;
-                break;
-            }
-        }
-    }
-
-    fprintf(fp, "ds4: top logits %s:\n", label);
-    for (int i = 0; i < k && best[i] >= 0; i++) {
-        const int id = best[i];
-        fprintf(fp, "  %2d %7d % .9g  ", i, id, logits[id]);
-        if (id >= 0 && id < vocab->n_vocab) {
-            fprintf(fp, "%.*s", (int)vocab->token[id].len, vocab->token[id].ptr);
-        }
-        fputc('\n', fp);
-    }
-}
-
 /* CPU generation entry point.  It runs layer-major prefill once, then decodes
  * one token at a time using the persistent KV cache and scratch arena. */

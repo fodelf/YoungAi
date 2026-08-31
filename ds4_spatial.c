@@ -273,6 +273,8 @@ static const char *zone_name(const ds4_ui_scene *s, const ds4_ui_elem *e) {
         {"bottom-left", "bottom", "bottom-right"},
     };
     int cx = e->x + e->w / 2, cy = e->y + e->h / 2;
+    /* img_w/h=0 的 ?:1 只防除零: 此时 col/row 会钳到 2(right/bottom), 方位名不可信
+     * —— 但输入尺寸缺失本身是上游病, 这里只出 UI 描述文本, 不升级为错误。 */
     int col = cx * 3 / (s->img_w > 0 ? s->img_w : 1);
     int row = cy * 3 / (s->img_h > 0 ? s->img_h : 1);
     if (col < 0) col = 0;

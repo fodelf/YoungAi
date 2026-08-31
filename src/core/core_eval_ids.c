@@ -1,4 +1,4 @@
-/* core_eval_ids.c — 路由预取注册 + DS4_EVAL_IDS 终审 (机械拆分自 ds4.c, 重构阶段4)。 */
+/* core_eval_ids.c — 路由预取注册 + --eval-ids 终审 (机械拆分自 ds4.c, 重构阶段4)。 */
 #include "core_internal.h"
 #ifndef DS4_NO_GPU
 /* project.md P2.1: register the locally-loaded routed layers' router metadata
@@ -73,14 +73,14 @@ void engine_register_layer_routers(ds4_engine *e, uint32_t start, uint32_t end) 
 }
 #endif
 
-/* ---- DS4_EVAL_IDS 终审仪器 -------------------------------------------------
+/* ---- --eval-ids 终审仪器 -------------------------------------------------
  * 用途: 与量化器锚文件里同序列的 FP logits 直接对账(held 区 Σmin), 判"引擎口径
  * 还原率 vs 量化器口径"。差距大时再用 HDUMP 的逐层 hidden 找第一分歧层。
  *
- *   DS4_EVAL_IDS=<ids文件>     原始 token id 流, 空白分隔的十进制整数(每行一个亦可)
- *   DS4_EVAL_LOGITS=<out.bin>  每位置最终 logits, f32 [S][DS4_N_VOCAB], 顺序流式写盘
- *   DS4_EVAL_HDUMP=<dir>       每层出口 hidden → h_L%02d.bin(见 eval_hdump_batch_layer)
- *   DS4_EVAL_NO_BOS=1          不在流首插 BOS(默认插, 即"裸 BOS 起")
+ *   --eval-ids <ids文件>     原始 token id 流, 空白分隔的十进制整数(每行一个亦可)
+ *   --eval-logits <out.bin>  每位置最终 logits, f32 [S][DS4_N_VOCAB], 顺序流式写盘
+ *   --eval-hdump <dir>       每层出口 hidden → h_L%02d.bin(见 eval_hdump_batch_layer)
+ *   --eval-no-bos          不在流首插 BOS(默认插, 即"裸 BOS 起")
  *
  * 走的是分布式推理那条已验证的裸 token 通道(ds4_session_eval_layer_slice), 天然不过
  * chat 模板/DSML, 与量化器 embed(ids) 直喂同口径。跑完 exit(0), 不采样。
@@ -239,7 +239,7 @@ void ds4_eval_ids_run(ds4_engine *e) {
     uint32_t nfile = 0;
     int *file_ids = eval_ids_load(idp, &nfile, vocab);
 
-    /* 默认在流首插 BOS(裸 BOS 起); DS4_EVAL_NO_BOS=1 则原样喂。 */
+    /* 默认在流首插 BOS(裸 BOS 起); --eval-no-bos 则原样喂。 */
     const int no_bos = ds4_tool_eval_no_bos();
     const uint32_t n = no_bos ? nfile : nfile + 1u;
     int *ids = xmalloc((size_t)n * sizeof(int));

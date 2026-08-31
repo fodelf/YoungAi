@@ -1,7 +1,7 @@
-/* core_gpu_capture.c — 引擎轨迹捕获(DS4_CAP_DIR)+ampanc (机械拆分自 ds4.c, 重构阶段4)。 */
+/* core_gpu_capture.c — 引擎轨迹捕获(--cap-dir)+ampanc (机械拆分自 ds4.c, 重构阶段4)。 */
 #include "core_internal.h"
 #ifndef DS4_NO_GPU
-/* ---- engine-trajectory batch capture (DS4_CAP_DIR) ------------------------
+/* ---- engine-trajectory batch capture (--cap-dir) ------------------------
  * Appends, per routed layer and per prefill chunk, the tensors the offline
  * error-feedback calibration needs, as raw little-endian shards:
  *   raw_ffn_in_L{L}.f16        x̂ = post-RMSNorm expert input   [n×4096]
@@ -9,7 +9,7 @@
  *   raw_route_logits_L{L}.f16  RAW router logits (pre-δ)       [n×256]
  *   raw_route_w_L{L}.f16       applied gate weights            [n×6]
  * Token count = file bytes / (width × elem size); cap_raw2npy.py converts to
- * the cap npy schema. DS4_CAP_LAYERS="lo-hi" filters layers (default all). */
+ * the cap npy schema. --cap-layers "lo-hi" filters layers (default all). */
 static int cap_layer_enabled(uint32_t il) {
     const char *r = ds4_tool_cap_layers();
     if (!r || !r[0]) return 1;
@@ -108,9 +108,9 @@ void cap_batch_layer(ds4_gpu_graph *g, uint32_t il, uint32_t n_tokens) {
                 il, n_tokens, (unsigned long long)cap_tok_total);
 }
 
-/* ---- 反修百分百还原判决钩(DS4_AMP_ANCHOR, 2026-08-19) ----------------------
+/* ---- 反修百分百还原判决钩(--amp-anchor, 2026-08-19) ----------------------
  * 判决实验专用, 不进产线: 把反修解算时的输入条件在线还原 — zchain(放大器)的 x 用
- * 解算锚(DQA2)的 FP fin; DS4_AMP_ANCHOR_ROUTE=1 时路由(selected/weights)也钉锚
+ * 解算锚(DQA2)的 FP fin; --amp-anchor-route 时路由(selected/weights)也钉锚
  * ridx/rw。用于把"解算产物/引擎应用有病"与"解算口径 vs 在线口径漂移"分开归因。
  * 只挂 decode 路(score 链除首 token 外全走这里; 首 token 批路不钉, 偏差 1/S 在案)。 */
 ds4_ampanc_state g_ampanc;

@@ -740,7 +740,7 @@ bool metal_graph_encode_decode_layer(
      * routed MoE output. Placed after the TP all-reduce so routed_out is complete
      * for every path (single-host, layer-sliced, and TP expert-split); g->ffn_norm
      * (the expert input x) and g->router_selected (full 6 ids) are still intact. */
-    /* Engine-trajectory decode capture (DS4_CAP_DIR): the perplexity scorer
+    /* Engine-trajectory decode capture (--cap-dir): the perplexity scorer
      * (teacher-forced trajectory runs) flows token-by-token through HERE, not
      * the batch path — same shards, one token per call. Reads happen before
      * the corr mutates routed_out semantics for downstream x̂ definitions

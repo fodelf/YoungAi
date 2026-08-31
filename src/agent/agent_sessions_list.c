@@ -155,7 +155,7 @@ void agent_worker_list_sessions(agent_worker *w) {
 
     agent_session_list_item *sessions = NULL;
     int sessions_len = 0, sessions_cap = 0;
-    const uint8_t model_id = (uint8_t)ds4_engine_model_id(w->engine);
+    const uint8_t model_id = (uint8_t)ds4_engine_model_kv_id(w->engine);
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
         char sha[41];
@@ -263,7 +263,7 @@ void agent_switch_completion_callback(const char *buf,
     if (!d) return;
 
     agent_completion_sessions sessions = {0};
-    const uint8_t model_id = (uint8_t)ds4_engine_model_id(w->engine);
+    const uint8_t model_id = (uint8_t)ds4_engine_model_kv_id(w->engine);
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
         char sha[41];
@@ -322,7 +322,7 @@ bool agent_worker_find_session(agent_worker *w, const char *prefix,
     int matches = 0;
     char match_sha[41] = {0};
     char *match_path = NULL;
-    const uint8_t model_id = (uint8_t)ds4_engine_model_id(w->engine);
+    const uint8_t model_id = (uint8_t)ds4_engine_model_kv_id(w->engine);
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
         char sha[41];

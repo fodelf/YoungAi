@@ -130,7 +130,7 @@ bool agent_kv_load_path(agent_worker *w, const char *path,
         ok = agent_kv_read_title_trailer(fp, &hdr, &title, err, err_len);
     uint32_t expected_tokens = hdr.tokens;
     if (ok && hdr.payload_bytes != 0 &&
-        hdr.model_id != (uint8_t)ds4_engine_model_id(w->engine))
+        hdr.model_id != (uint8_t)ds4_engine_model_kv_id(w->engine))
     {
         snprintf(err, err_len, "KV checkpoint was written for a different model");
         ok = false;
@@ -223,7 +223,7 @@ bool agent_kv_save_path(agent_worker *w, const char *path,
         snprintf(err, err_len, "unsupported routed quantization for KV save");
         return false;
     }
-    const int model_id = ds4_engine_model_id(w->engine);
+    const int model_id = ds4_engine_model_kv_id(w->engine);
 
     size_t text_len = 0;
     char *text = ds4_kvstore_render_tokens_text(w->engine, tokens, &text_len);

@@ -180,13 +180,13 @@ bool metal_graph_encode_layer_ffn_batch_ex(
         ok = ds4_gpu_zchain_scale_routed(g->batch_routed_out, g->batch_ffn_norm,
                                          il, n_tokens) != 0;
     }
-    /* Engine-trajectory batch capture (DS4_CAP_DIR [+DS4_CAP_LAYERS lo-hi]):
+    /* Engine-trajectory batch capture (--cap-dir [+--cap-layers lo-hi]):
      * append this chunk's x̂ / routing / raw router logits / gate weights as
      * raw f16/i16 shards — THE ground-truth student trajectory for error-
      * feedback calibration (the Python fp32-backbone simulation drifts from
      * the engine in deep layers; R2 verdict). ffn_norm and router_logits are
      * final at this point; selected uses the same pre-remap snapshot the corr
-     * dispatch uses. Off unless DS4_CAP_DIR is set. */
+     * dispatch uses. Off unless --cap-dir is set. */
     if (ok) cap_batch_layer(g, il, n_tokens);
     /* go1b correction: per-token low-rank residual onto the full routed MoE output
      * (after any TP all-reduce). x=g->batch_ffn_norm, selected=g->batch_router_selected. */
@@ -290,7 +290,7 @@ bool metal_graph_encode_layer_ffn_batch_ex(
 }
 
 /* Encode one complete layer for prefill by chaining attention and FFN batches. */
-/* DS4_EVAL_HDUMP=<dir>: 每层出口 HC 隐状态整批追加写出 h_L%02d.bin
+/* --eval-hdump <dir>: 每层出口 HC 隐状态整批追加写出 h_L%02d.bin
  * (f32, [S][DS4_N_HC][DS4_N_EMBD], chunk 顺序即 token 顺序)。
  * 挂在 HC 交换之后 —— 那时 batch_cur_hc 才是本层出口。GPU 定格用 cap_batch_layer
  * 同款 signal→flush→host_wait: 本层的核还在队列里, 不 drain 就 read 会拿到上一层

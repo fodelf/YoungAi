@@ -392,7 +392,7 @@ void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs *msgs)
     /* Tool replay payloads are stored next to KV checkpoints; keep them model
      * scoped too, since token positions and graph state are not portable across
      * Flash/Pro shapes even when the rendered chat text is identical. */
-    uint8_t model_id = s->engine ? (uint8_t)ds4_engine_model_id(s->engine) : 0;
+    uint8_t model_id = s->engine ? (uint8_t)ds4_engine_model_kv_id(s->engine) : 0;
 
     DIR *d = opendir(s->kv.dir);
     if (!d) {

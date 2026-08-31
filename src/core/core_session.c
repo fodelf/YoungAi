@@ -59,6 +59,19 @@ int ds4_engine_model_id(ds4_engine *e) {
     return (int)DS4_MODEL_VARIANT;
 }
 
+/* 磁盘 KV 兼容键的模型半: u8 文件指纹。旧键=model_id 只分 Flash/PRO, 同 variant
+ * 的两个不同 GGUF(不同量化配方/反修链)存的 KV 互认 —— 与 routed 类型码键合并后
+ * 仍有盲区(同类型不同放大器)。文件字节量 FNV 折 8 位: 不同配方几乎必不同长,
+ * 碰撞剩 1/255 且还要同时撞 routed 类型码。variant 显示语义留在 model_id。 */
+int ds4_engine_model_kv_id(ds4_engine *e) {
+    uint64_t h = 1469598103934665603ull ^ (uint64_t)DS4_MODEL_VARIANT;
+    uint64_t v = (uint64_t)e->model.size;
+    for (int i = 0; i < 8; i++) { h ^= (v >> (8 * i)) & 0xffu; h *= 1099511628211ull; }
+    uint8_t k = (uint8_t)(h ^ (h >> 8) ^ (h >> 16) ^ (h >> 24) ^
+                          (h >> 32) ^ (h >> 40) ^ (h >> 48) ^ (h >> 56));
+    return k ? k : 1;   /* 0 预留"无模型" */
+}
+
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
     ds4_mm_free(e->mm);

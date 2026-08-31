@@ -118,7 +118,7 @@ void *xmalloc_zeroed(size_t n, size_t size) {
  * covered, without touching any hot path. The always-on system-pressure guard
  * keeps a lightweight poll thread running for every process (one sysctl / 200ms)
  * so the machine can never be driven into a kernel-watchdog panic; safety
- * guards take no opt-out. DS4_MEM_BUDGET_MB adds the phys_footprint ceiling. */
+ * guards take no opt-out. --mem-budget-mb adds the phys_footprint ceiling. */
 #if defined(__APPLE__)
 #include <mach/mach.h>
 #include <sys/sysctl.h>
@@ -158,9 +158,10 @@ static void *ds4_mem_watchdog_main(void *arg) {
         uint64_t fp = ds4_phys_footprint_bytes();
         if (g_mem_budget_bytes != 0 && fp > (uint64_t)((double)g_mem_budget_bytes * DS4_WATCHDOG_TRIP_FRAC)) {
             fprintf(stderr,
-                    "\n[ds4-watchdog] phys_footprint %.2f GiB crossed 90%% of the "
+                    "\n[ds4-watchdog] phys_footprint %.2f GiB crossed %.0f%% of the "
                     "%.2f GiB budget -- aborting before page thrash.\n",
-                    (double)fp / DS4_GIB, (double)g_mem_budget_bytes / DS4_GIB);
+                    (double)fp / DS4_GIB, DS4_WATCHDOG_TRIP_FRAC * 100.0,
+                    (double)g_mem_budget_bytes / DS4_GIB);
             fflush(stderr);
             _exit(137);
         }
@@ -225,7 +226,7 @@ __attribute__((constructor)) static void ds4_stage0_autostart(void) {
 /* L1 pre-flight static budget gate. Called once the resident model byte total is
  * known (model map span sums), before any GPU buffer is bound. Aborts a planned
  * OOM at load time -- well ahead of the runtime watchdog -- when the closed-form
- * resident estimate crosses 85% of DS4_MEM_BUDGET_MB. kv_and_scratch_bytes is the
+ * resident estimate crosses 85% of --mem-budget-mb. kv_and_scratch_bytes is the
  * caller's estimate of KV + prefill scratch + fixed overhead (0 if unknown; the
  * runtime watchdog still backstops). No budget set => no-op (zero behavior change). */
 DS4_MAYBE_UNUSED void ds4_l1_budget_gate(uint64_t resident_model_bytes,
@@ -236,8 +237,9 @@ DS4_MAYBE_UNUSED void ds4_l1_budget_gate(uint64_t resident_model_bytes,
     if (planned > limit) {
         fprintf(stderr,
                 "\n[ds4-l1-gate] planned resident %.2f GiB (model %.2f + kv/scratch %.2f) "
-                "exceeds 85%% of the %.2f GiB budget -- refusing to load.\n",
+                "exceeds %.0f%% of the %.2f GiB budget -- refusing to load.\n",
                 (double)planned / DS4_GIB,
+                DS4_L1_GATE_FRAC * 100.0,
                 (double)resident_model_bytes / DS4_GIB,
                 (double)kv_and_scratch_bytes / DS4_GIB,
                 (double)g_mem_budget_bytes / DS4_GIB);

@@ -354,7 +354,6 @@ DS4_MAYBE_UNUSED int payload_read_u32(FILE *fp, uint32_t *v, uint64_t *remaining
 void payload_set_err(char *err, size_t errlen, const char *msg);
 DS4_MAYBE_UNUSED int payload_write_u32(FILE *fp, uint32_t v, char *err, size_t errlen);
 void prefill_layer_major_cpu( float * logits, const ds4_model * model, const ds4_weights * weights, ds4_kv_cache * cache, const token_vec * prompt, const float * steering_dirs, float steering_attn_scale, float steering_ffn_scale);
-void print_top_logits( FILE * fp, const char * label, const ds4_vocab * vocab, const float * logits, uint32_t n_vocab, int k);
 void quantize_q8_0_activation(const float *x, int8_t *xq, float *scale, uint64_t n);
 void quantize_q8_0_activation_batch( const float *x, int8_t *xq, float *xscale, uint64_t n_tok, uint64_t in_dim);
 bool read_f32_binary_file(const char *path, float *data, uint64_t n);

@@ -138,7 +138,7 @@ struct ds4_residual *residual_load(const char *path, bool metal_mapping) {
  * the 1bit expert bytes; KV ds4.zchain.present gates this). Op records mirror
  * the ds4_gpu packed layout (16 floats, [15]=layer-local V8 block). v8 points
  * into the model mmap (zero-copy); map stays NULL so ds4_zchain_free never
- * munmaps model memory. External --zchain/DS4_ZCHAIN overrides this loader. */
+ * munmaps model memory. External --zchain overrides this loader. */
 struct ds4_zchain *zchain_from_model(const ds4_model *m) {
     bool present = false;
     if (!model_get_bool(m, "ds4.zchain.present", &present) || !present) return NULL;
@@ -211,6 +211,9 @@ struct ds4_zchain *zchain_from_model(const ds4_model *m) {
                         continue;
                     }
                     if (o->type >= 1u && o->type <= 4u) { kept++; z->n_ops_total++; }
+                    else if (o->type != 0u)   /* 合并格式只承载 1-4/6/GE; 别的型静默吞会瞒 */
+                        fprintf(stderr, "ds4: zchain L%u opt_chain op type %u unsupported on merged GGUF, dropped\n",
+                                il, o->type);
                 }
                 z->layer[il].n_ops = kept;
             }

@@ -258,6 +258,8 @@ uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
  * KV files with the previously-zero reserved byte remain Flash-compatible;
  * Pro and later shapes must use nonzero ids. */
 int ds4_engine_model_id(ds4_engine *e);
+/* 磁盘 KV 兼容键的模型半(u8 文件指纹; model_id 只分 Flash/PRO, 不够当键)。 */
+int ds4_engine_model_kv_id(ds4_engine *e);
 const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 const char *ds4_think_mode_name(ds4_think_mode mode);

@@ -10,6 +10,13 @@ void random_tool_id(char *dst, size_t dstlen, api_style api) {
     if (pos >= dstlen) return;
 
     if (!random_bytes(bytes, sizeof(bytes))) {
+        /* 弱熵降级: 计数器保证进程内不撞, 跨进程重启才有理论撞窗。工具 id 是 DSML
+         * 重放表的键, 撞了=串号 —— 降级必须可见。 */
+        static bool weak_warned = false;
+        if (!weak_warned) {
+            weak_warned = true;
+            fprintf(stderr, "ds4-server: random_bytes failed, tool ids fall back to time^pid^counter (warned once)\n");
+        }
         uint64_t a = ((uint64_t)time(NULL) << 32) ^ (uint64_t)getpid();
         uint64_t b = ++fallback_ctr ^ (uint64_t)(uintptr_t)dst;
         memcpy(bytes, &a, sizeof(a));

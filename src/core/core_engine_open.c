@@ -523,7 +523,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
 #endif
 
     ds4_multi_bench_run(e);   /* DS4_MULTI_BENCH=N: 并发批实测(跑完退出) */
-    ds4_eval_ids_run(e);   /* DS4_EVAL_IDS 在场则跑完仪器直接退出, 不返回 */
+    ds4_eval_ids_run(e);   /* --eval-ids 在场则跑完仪器直接退出, 不返回 */
     *out = e;
     return 0;
 }

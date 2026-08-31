@@ -82,7 +82,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         ds4_tokens_free(&store_tokens);
         return false;
     }
-    const int model_id = ds4_engine_model_id(engine);
+    const int model_id = ds4_engine_model_kv_id(engine);
 
     char save_err[160] = {0};
     const ds4_tokens *live_tokens = ds4_session_tokens(session);
@@ -363,7 +363,7 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
     if (!kc->enabled || !prompt_text) return 0;
     const int quant_bits = ds4_engine_routed_kv_key(engine);   /* 兼容键=类型码 */
     if (quant_bits <= 0) return 0;
-    const int model_id = ds4_engine_model_id(engine);
+    const int model_id = ds4_engine_model_kv_id(engine);
     const size_t prompt_bytes = strlen(prompt_text);
     int idx = ds4_kvstore_find_text_prefix(kc, prompt_text, model_id, quant_bits,
                                            ds4_session_ctx(session));
