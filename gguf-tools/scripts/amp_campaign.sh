@@ -74,10 +74,15 @@ mkdir -p "$D" "$AMP"
 
 WD=""
 watchdog_start(){
+    # fail-closed(2026-08-31 魔数扫除): 旧版 ${A:-99} 在 meminfo 读不出时按"99GB 可用"放行,
+    # 等于看门狗静默缴械(macOS 无 /proc = 结构性瞎; Linux 读取抖动同样瞎)。内存护栏是
+    # 最高铁律, 读不到内存数一律当危险处理: 启动即验一次, 循环内读空同样杀。
+    awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo >/dev/null 2>&1 \
+        || DIE "看门狗读不到 /proc/meminfo(此机不支持), 拒绝无护栏发车"
     ( while true; do
-        A=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo)
-        if [ "${A:-99}" -lt "$MEM_FLOOR_GB" ]; then
-            echo "[watchdog] MemAvailable=${A}GB < ${MEM_FLOOR_GB}GB ★杀本段★" >&2
+        A=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo 2>/dev/null)
+        if [ -z "$A" ] || [ "$A" -lt "$MEM_FLOOR_GB" ]; then
+            echo "[watchdog] MemAvailable=${A:-读取失败}GB (地板 ${MEM_FLOOR_GB}GB) ★杀本段★" >&2
             pkill -9 -f 'ds4 --cuda'; pkill -9 -f ds4quant_run; pkill -9 -f 'amp/zlayer'
             break
         fi; sleep 5
