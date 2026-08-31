@@ -272,7 +272,7 @@ static float *vq_dequant(const uint8_t *blob, size_t bsz, uint64_t off, long *R_
     return W;
 }
 
-/* ================= GGUF 标量模式(DS4_ZL_GGUF) =================
+/* ================= GGUF 标量模式(--gguf) =================
  * py 侧: gguf.GGUFReader 取张量 + gguf.quants.dequantize 反量化, 专家沿【外维】连续,
  *        所以"第 e 个专家"= 该张量原始字节按专家数均分后的第 e 段(py: per=db.size//nexp)。
  * 这里对齐的是【数值结果】不是实现 —— py 走 gguf-py 的 numpy 向量化路, 这里走标量循环。
@@ -319,7 +319,7 @@ static void gg_dequant(uint32_t ty, const uint8_t *src, uint64_t nelem, float *o
 
 static void gg_open(gg_ctx *g, const char *path) {
     char err[256];
-    if (ds4_gguf_open(g, path, err, sizeof err)) die("DS4_ZL_GGUF %s", err);
+    if (ds4_gguf_open(g, path, err, sizeof err)) die("--gguf %s", err);
 }
 
 /* py 的 _gg_expert(l,nm,e): 张量 blk.<L>.ffn_{gate,up,down}_exps.weight,
@@ -364,7 +364,7 @@ static void anchor_layer(const char *ap, int L, int ntok, float **fin, int **rid
     m->S = (int)hd[1]; m->HCM = (int)hd[2]; m->DIM = (int)hd[3];
     m->NL = (int)hd[4]; m->VOCAB = (int)hd[5]; m->NACT = (int)hd[6];
     if (m->DIM != D) die("锚 DIM=%d ≠ %d — .py 写死 D=4096, 口径不明拒跑", m->DIM, D);
-    if (ntok > m->S) die("DS4_ZL_NTOK=%d > 锚 S=%d", ntok, m->S);
+    if (ntok > m->S) die("--ntok %d > 锚 S=%d", ntok, m->S);
     long long fin_off = 40;
     long long ridx_off = fin_off + (long long)m->NL * m->S * m->DIM * 4;
     long long rw_off = ridx_off + (long long)m->NL * m->S * m->NACT * 4;
@@ -384,7 +384,7 @@ static void anchor_layer(const char *ap, int L, int ntok, float **fin, int **rid
  * ★分歧点★ ds4quant_fwd.c 的 dq_expert_fp 只夹 gate 的上侧(gg>swlim), .py 的 swiglu 是
  * 【双侧】夹(g 和 u 都夹到 [-lim,lim])。这里按 .py 写 —— 解算目标必须和 .py 的目标一致,
  * 否则 held 挽回率没法对拍。内层 exp 的 ±60 夹在 lim>0 时是死代码(g 已在 ±lim 内),
- * 只有 DS4_ZL_SWLIM=0(关截断)时才起作用, 照抄 CPU 路的 probe_layer_behavior.swiglu。 */
+ * 只有 --swlim 0(关截断)时才起作用, 照抄 CPU 路的 probe_layer_behavior.swiglu。 */
 static float zl_swiglu1(float g, float u, float lim) {
     if (lim > 0) {
         if (g > lim) g = lim; else if (g < -lim) g = -lim;

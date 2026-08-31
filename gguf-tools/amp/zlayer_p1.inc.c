@@ -20,14 +20,14 @@
  * 【第二期补齐(2026-08-25)】一期只做 XCAP 口径, 二期把 .py 剩下的四个模式全转录进来。
  *   ① 非 XCAP 口径: x=锚 fin, 学生=本进程重算量化专家(VQ blob 或 GGUF 切片),
  *      dH = Σw·Y_fp − Σw_q·Y_q。amp86/dspark86 战役走的就是这一路(见 scripts/amp86_spark.sh)。
- *   ② DS4_ZL_GGUF 标量模式: 学生权重从 GGUF 专家张量按字节均分切片再 dequant。
- *   ③ DS4_ZL_XANCHOR / DS4_ZL_ADDON 链模式: 链态锚(x_q/路由_q 从第二个锚读) +
+ *   ② --gguf 标量模式: 学生权重从 GGUF 专家张量按字节均分切片再 dequant。
+ *   ③ --xanchor / --addon 链模式: 链态锚(x_q/路由_q 从第二个锚读) +
  *      叠加式合并注入(既有 GE 乘入学生权重、既有 z 出力从 dH 扣除、新旧合并成单条记录)。
  *      ★照抄 .py 的缩进事实★: ADDON 的读取整块嵌在 `if XAP:` 里 —— 也就是说
- *      【只设 DS4_ZL_ADDON 而不设 DS4_ZL_XANCHOR 时, ADDON 完全不生效】。这不是笔误顺手
+ *      【只给 --addon 而不给 --xanchor 时, ADDON 完全不生效】。这不是笔误顺手
  *      改掉的地方: .py 是权威, 改了就等于 C 与 py 同参数下产物不同。C 里额外加一行提示,
  *      免得有人设了 ADDON 却以为生效了(提示不改行为)。
- *   ④ ERF 死层部件: 组合增益 < DS4_ZL_ERF_BAR 时上的每专家 ΔW_w2 加权低秩补丁。
+ *   ④ ERF 死层部件: 组合增益 < --erf-bar 时上的每专家 ΔW_w2 加权低秩补丁。
  *   仍然【不做】: cupy/GPU 路径(纯 CPU + 可选 BLAS)。
  *
  * 【二期新增的不可逐位点】(判定看打印读数与结构, 不看载荷字节):
@@ -45,15 +45,10 @@
  *   【不能逐位对拍 .py】。判定口径 = ①打印出来的 held 挽回率(0.1% 精度)对齐
  *   ②产物用 calib/rec_fidelity 复评(载荷重放挽回率)对齐。
  *
- * 用法(与 .py 完全一致):
- *   zlayer <hf> <layers_dir> <anchor> <L> [K=1024] [inject=1] [XCAP目录] [PREV目录]
+ * 用法(位置参数与 .py 一致; 原 DS4_ZL_* env 已随 2026-08-31 env 大扫除改为 --flag,
+ * 值语义未动, 完整面板见 p3 用法打印; K 与 --ntok 必传, 静默默认已删):
+ *   zlayer <hf> <layers_dir> <anchor> <L> <K> [inject=1] [XCAP目录] [PREV目录] --ntok N [...]
  *   zlayer --selftest-rng
- * 环境变量(只认既有的这几个, 禁新增):
- *   DS4_ZL_NTOK=1716 DS4_ZL_NFIT=1287 DS4_ZL_FIT_RANGES DS4_ZL_EV_RANGE
- *   DS4_ZL_GE=1 DS4_ZL_GE_LAM=1e-3 DS4_ZL_FTA=1 DS4_ZL_ERF=1 DS4_ZL_GATE=0 DS4_ZL_SWLIM=10
- *   DS4_ZL_ERF_BAR=0.01 DS4_ZL_ERF_R=8
- *   DS4_ZL_GGUF=<模型路径> DS4_ZL_XANCHOR=<第二个锚> DS4_ZL_ADDON=1(要配 XANCHOR 才生效)
- *   DS4_ZL_CACHE_ONLY=0(纯控制流, 不参与数值)
  * 编译:
  *   gcc -O3 -march=native -o zlayer zlayer.c -lm -lpthread              (纯循环, 慢但能跑)
  *   gcc -O3 -march=native -DDQ_BLAS -o zlayer zlayer.c -lm -lpthread -framework Accelerate

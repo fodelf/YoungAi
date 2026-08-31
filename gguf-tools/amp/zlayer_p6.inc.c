@@ -1,5 +1,5 @@
     /* ================= ERF 死层部件 =================
-     * 触发线(py): (not ADDON) and eff < DS4_ZL_ERF_BAR(0.01) and DS4_ZL_ERF。
+     * 触发线(py): (not ADDON) and eff < --erf-bar(0.01) 且 --erf 开。
      * 做的事: 逐专家在【已中标 z 与 GE 之上】的真残差里, 用 ΔW_w2 = W_fp − W_q 的
      * 加权低秩方向再修一刀 ——
      *   ① 用该专家在 fit 行上的隐层能量 _sh 给 ΔW_w2 的列加权, 取 r 个主方向(randomized SVD);

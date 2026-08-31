@@ -318,9 +318,9 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (argc < 5) {
-        fprintf(stderr, "用法: zlayer <hf> <layers_dir> <anchor> <L> [K=1024] [inject=1] [XCAP目录] [PREV目录]\n"
+        fprintf(stderr, "用法: zlayer <hf> <layers_dir> <anchor> <L> <K(秩,必传)> [inject=1] [XCAP目录] [PREV目录]\n"
                         "             [--gguf P] [--xanchor P] [--addon] [--cache-only]\n"
-                        "             [--ntok N=1716] [--swlim F=10] [--fta N=1] [--ge N=1]\n"
+                        "             --ntok N(必传) [--swlim F=10] [--fta N=1] [--ge N=1]\n"
                         "             [--gate F=0] [--ge-lam F=1e-3] [--erf N=1] [--erf-bar F=0.01] [--erf-r N=8]\n"
                         "      zlayer --selftest-rng\n");
         return 1;
@@ -331,7 +331,10 @@ int main(int argc, char **argv) {
      * argv[5..], 不设界会把 "--ntok" 当 K 吃掉。 */
     int nfx = argc;
     for (int ai = 5; ai < argc; ai++) if (!strncmp(argv[ai], "--", 2)) { nfx = ai; break; }
-    int K = nfx > 5 ? atoi(argv[5]) : 1024;
+    /* K/NTOK 必传(2026-08-31 魔数扫除): 旧静默默认 K=1024/NTOK=1716 与脚本恒传值
+     * (冠军 K=64 / --ntok 8192)不一致, 手跑漏传会静默换口径 —— SCREEN_DIV 同款事故形态。 */
+    if (nfx <= 5) die("K(z 秩)必传: 静默默认 1024 已删(冠军=64)");
+    int K = atoi(argv[5]);
     int INJ = nfx > 6 ? atoi(argv[6]) : 1;
     const char *XCAP = (nfx > 7 && argv[7][0] && strcmp(argv[7], "-")) ? argv[7] : NULL;
     const char *PREV = (nfx > 8 && argv[8][0] && strcmp(argv[8], "-")) ? argv[8] : NULL;
@@ -341,7 +344,7 @@ int main(int argc, char **argv) {
      * 是 .py 权威口径(它把 ADDON 的读取整块写在 if XAP: 里面), 不"修正", 只多打一行提示。 */
     const char *GGP = NULL, *XAP = NULL;
     int ADDON = 0, CACHE_ONLY = 0;
-    int NTOK = 1716, FTA = 1, GE_ON = 1, ERF_EN = 1, ERF_RANK = 8;
+    int NTOK = 0, FTA = 1, GE_ON = 1, ERF_EN = 1, ERF_RANK = 8;
     float SWLIM = 10.0f;
     double GATE = 0.0, GELAM = 1e-3, ERF_BAR = 0.01;
     for (int ai = nfx; ai < argc; ai++) {
@@ -363,6 +366,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--erf-r"))   { ERF_RANK = atoi(v); ai++; }
         else die("不认识的 flag: %s", a);
     }
+    if (NTOK <= 0) die("--ntok 必传(校准 token 行数): 静默默认 1716 已删(脚本恒传 8192)");
     if (ADDON && !XAP) {
         printf("  L%d 提示: 给了 --addon 但没给 --xanchor — .py 里 ADDON 的读取整块"
                "嵌在 if XAP: 内, 此时不生效, 本次照 .py 走非叠加路\n", L);
@@ -398,7 +402,7 @@ int main(int argc, char **argv) {
         else printf("  L%d XCAP 只换 x 模式(无 raw_ffn_out): 学生/教师同 x 重算\n", L);
     }
 
-    /* ★链态锚(DS4_ZL_XANCHOR)★ 部署侧的 x_q 与路由_q 从第二个锚读; 教师侧仍用主锚。 */
+    /* ★链态锚(--xanchor)★ 部署侧的 x_q 与路由_q 从第二个锚读; 教师侧仍用主锚。 */
     float *XQ0 = NULL, *rwq = NULL; int *ridxq = NULL;
     if (XAP) {
         ameta_t amq;
@@ -406,7 +410,7 @@ int main(int argc, char **argv) {
         if (amq.NACT != am.NACT) die("链态锚 NACT=%d ≠ 主锚 %d — 槽宽不同, 口径不明拒跑", amq.NACT, am.NACT);
     }
 
-    /* ★叠加式(DS4_ZL_ADDON)★ 读本层 dql 里【已有】的记录: bf.GE 的每专家门 ge_old,
+    /* ★叠加式(--addon)★ 读本层 dql 里【已有】的记录: bf.GE 的每专家门 ge_old,
      * zl.RRR 的低秩 z_old。同名记录后出现的覆盖前面的(py 的循环就是这个语义)。 */
     float *ge_old = NULL;                       /* [NEXP] f32, NULL = 没有既有 GE */
     int zo_k0 = 0, zo_di = 0, zo_do = 0;        /* zo=(k0,di,do,z0,U0[do,k0],V0[di,k0]) */

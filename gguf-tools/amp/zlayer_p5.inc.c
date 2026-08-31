@@ -64,15 +64,15 @@
 
     /* R = dH − 中标形态的 z 出力(f32, 与 py 的 .astype(np.float32) 同位置) */
     /* ★.py 的一个潜伏坑, 这里改成停车而不是跟着崩★
-     * 关了 ftA 时 py 把 curvef 全填 0 ⇒ rz_fta=0.0。要是线性 k 曲线【全负】而 DS4_ZL_GATE
+     * 关了 ftA 时 py 把 curvef 全填 0 ⇒ rz_fta=0.0。要是线性 k 曲线【全负】而 --gate
      * 比它更低(比如 -100), 选形态那一步就走成 `elif rz_fta>rz_lin: FORM="ftA"` ——
      * 而 Af/Sf/Bf 在 _FTA=0 时是 None, 下一行 Af[:,:K] 直接
      *   TypeError: 'NoneType' object is not subscriptable
      * C 这边照抄的话是空指针解引用(段错误), 症状比 py 还难查。判据与 py 完全一致, 只是
      * 换成一句能 grep 的停车话。产线用的 GATE 是 0 或 99, 撞不到这个角落。 */
     if (!strcmp(FORM, "ftA") && !(FTA && rfta > 0))
-        die("assert 失败: 关了 ftA(DS4_ZL_FTA=%d) 却把赢家判成 ftA —— 线性 k 曲线全负"
-            "(rz_lin=%.4f) 且 DS4_ZL_GATE=%.4f 比它还低。.py 在这里会抛 "
+        die("assert 失败: 关了 ftA(--fta %d) 却把赢家判成 ftA —— 线性 k 曲线全负"
+            "(rz_lin=%.4f) 且 --gate=%.4f 比它还低。.py 在这里会抛 "
             "TypeError: 'NoneType' object is not subscriptable。把闸调回 ≥0 即可绕开。",
             FTA, rz_lin, GATE);
 
