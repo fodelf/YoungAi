@@ -1179,9 +1179,12 @@ stage_champ_rbsweep(){
 # 两臂唯一差异=--xanchor; INJ=0 纯解算, 探针工作区用后即弃, 不碰任何量化产物。
 CHAINX_L=20   # 08-24 实测行 cos 0.875 的中深层: 错位已显著、又不是最深的极端样本
 stage_chainx(){
-    local D2="$ROOT/gguf/go-onebit/vqhalf" W="$D2/champ86"
+    # 见 champreset 注: local 同句不能引用前一个名字(set -u 炸), 分句写
+    local D2="$ROOT/gguf/go-onebit/vqhalf"
+    local W="$D2/champ86"
     local AIDS="$D2/vqhalf_a.ids" AANC="$D2/anchor_a_clean_s8192.bin"
-    local QANC="$D2/anchor_vqhalf_q_s8192.bin" CHANC="$D2/chain_a_champ86.bin"
+    local QANC="$D2/anchor_vqhalf_q_s8192.bin"
+    local CHANC="$D2/chain_a_champ86.bin"
     [ -d "$W/layers_quant" ] || DIE "纯净量化态缺($W/layers_quant)"
     [ -s "$AANC" ] && [ -s "$AANC.layout" ] || DIE "反修锚/布局缺"
     [ -s "$QANC" ] || DIE "量化半锚缺(跨语料闸料)"
