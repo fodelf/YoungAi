@@ -115,19 +115,6 @@ static void quant_dequant_ew(const float *w, float *wh, int rows, int cols,
     go1b_blk_quantize_imat(w, scratch, rows, cols, ew);
     for (int r = 0; r < rows; r++)
         go1b_blk_dequantize_row(scratch + (size_t)r * rb, wh + (size_t)r * cols, cols);
-    if (getenv("DS4_GO1B_RESIDUAL")) {
-        size_t n = (size_t)rows * (size_t)cols;
-        float *res = (float *)malloc(n * sizeof(float));
-        if (res) {
-            for (size_t i = 0; i < n; i++) res[i] = w[i] - wh[i];
-            go1b_blk_quantize_imat(res, scratch, rows, cols, ew);
-            for (int r = 0; r < rows; r++) {
-                go1b_blk_dequantize_row(scratch + (size_t)r * rb, res + (size_t)r * cols, cols);
-                for (int j = 0; j < cols; j++) wh[(size_t)r * cols + j] += res[(size_t)r * cols + j];
-            }
-            free(res);
-        }
-    }
 }
 
 static void *worker(void *arg) {
@@ -282,8 +269,11 @@ static double rrr_sqrtsoftplus(double zv) {
     return sqrt((zv > 0.0 ? zv : 0.0) + log1p(exp(-az)));
 }
 
+/* z 落盘目录: --z-dump-dir(原 DS4_Z_DUMP_DIR env, 2026-08-31 禁 env 清退); NULL=不落盘 */
+static const char *g_z_dump_dir = NULL;
+
 static void rrr_dump_z(const z_layer *z, int L) {
-    const char *zdir = getenv("DS4_Z_DUMP_DIR");
+    const char *zdir = g_z_dump_dir;
     if (!zdir || !zdir[0]) return;
     char zpath[1024], ztmp[1060];
     snprintf(zpath, sizeof zpath, "%s/z_L%d.bin", zdir, L);

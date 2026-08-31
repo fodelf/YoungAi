@@ -386,27 +386,19 @@ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_cond = PTHREAD_COND_INITIALIZER;
 static int g_state = 0; /* 0=未初始化 1=可用 -1=不可用 */
 static int g_nctx = 0;
-static int g_threads_per_block = 128;
+static int g_threads_per_block = 128;   /* __launch_bounds__(128) 的上限值; 原 DS4Q_GPU_BLOCK 从无活脚本改过, 写死 */
 static gpu_ctx g_ctx[DSQ_MAX_CTX];
 static uint64_t *g_grid = NULL;
 static int *g_map = NULL;
 static uint16_t *g_neigh = NULL;
 
-static int env_int(const char *name, int dflt) {
-    const char *v = getenv(name);
-    if (!v || !*v) return dflt;
-    return atoi(v);
-}
-
-/* 表上传 + 流/缓冲创建。持 g_lock 调用。 */
+/* 表上传 + 流/缓冲创建。持 g_lock 调用。
+ * 编了 DS4Q_CUDA 就走 GPU(★只写 GPU 铁律 2026-08-28★); 原 DS4Q_GPU=0 强制 CPU
+ * 的诊断分支已删, 仅设备真不可用时回落 CPU 编码器。 */
 static int gpu_init_locked(void) {
     if (g_state) return g_state > 0;
     g_state = -1;
 
-    if (env_int("DS4Q_GPU", 1) == 0) {
-        fprintf(stderr, "iq2_xxs: DS4Q_GPU=0, 走 CPU 编码器\n");
-        return 0;
-    }
     int ndev = 0;
     if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev < 1) {
         fprintf(stderr, "iq2_xxs: 无可用 CUDA 设备, 回落 CPU 编码器\n");
@@ -436,9 +428,7 @@ static int gpu_init_locked(void) {
         return 0;
     }
 
-    int n = env_int("DS4Q_GPU_STREAMS", 4);
-    if (n < 1) n = 1;
-    if (n > DSQ_MAX_CTX) n = DSQ_MAX_CTX;
+    const int n = 4;   /* 并发流数: 原 DS4Q_GPU_STREAMS 缺省, 从无活脚本改过, 写死 */
     for (int i = 0; i < n; i++) {
         if (cudaStreamCreate(&g_ctx[i].stream) != cudaSuccess) break;
         g_nctx++;
@@ -447,9 +437,6 @@ static int gpu_init_locked(void) {
         fprintf(stderr, "iq2_xxs: 创建 stream 失败, 回落 CPU 编码器\n");
         return 0;
     }
-    g_threads_per_block = env_int("DS4Q_GPU_BLOCK", 128);
-    if (g_threads_per_block < 32) g_threads_per_block = 32;
-    if (g_threads_per_block > 128) g_threads_per_block = 128; /* __launch_bounds__(128) */
 
     fprintf(stderr, "iq2_xxs: CUDA 编码器启用 (streams=%d, block=%d, neigh=%lld)\n",
             g_nctx, g_threads_per_block, (long long)neigh_n);

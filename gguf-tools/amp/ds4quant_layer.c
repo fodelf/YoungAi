@@ -52,10 +52,14 @@ static float *dq_quant_expert(const float *W, int nrows, int ncols, const float 
 #define ROPE_THETA 10000.0
 
 int main(int argc, char **argv) {
-    const char *hf = getenv("DS4_HF"); if (!hf) hf = "/Users/fodelf/ds4-main/hf/DeepSeek-V4-Flash-Base";
+    const char *hf = NULL;   /* 写死回落已删(2026-08-31 env 清退): HF 目录必须显式给 */
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--hf") && i + 1 < argc) hf = argv[++i];
+        else if (!strncmp(argv[i], "--hf=", 5)) hf = argv[i] + 5;
+    }
+    if (!hf) { fprintf(stderr, "--hf <dir> is required (HF safetensors 目录)\n"); return 2; }
     st_ctx c; st_open(&c, hf);
     long ids[4] = {100, 200, 300, 400}; int S = 4;
-    (void)argc; (void)argv;
 
     /* embed[ids] → H[S,HCM,DIM] (repeat HCM) */
     long er, ec; float *emb = st_read_weight(&c, "embed.weight", &er, &ec);

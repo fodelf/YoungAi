@@ -99,6 +99,10 @@ int dsq_sweep_commit(double before, double after)
  * ★include 顺序照抄 ds4quant_run_p1(27→28→30→167)★: fwd 在前, DIM/MOEI 的
  * #define 必须排在它们【之后】—— dq_expert_fp 的形参名就叫 DIM/MOEI, 先 define 会把
  * 函数签名撞碎(实撞: "expected ')'" + swlim undeclared)。go2b_qc.h 用 dq_matmul, 也得在后。 */
+/* fwd_p2 的 BFLT 段账埋点引用 ds4quant_run 的账本(p3 定义); dsq_units 不做段账,
+ * 给零值桩满足链接(10763e5 埋点后 tools-test 断链的正修)。 */
+double g_bflt[26]; int g_bflt_on = 0;
+double vqt_now_ref(void) { return 0.0; }
 #include "ds4quant_fwd.c"
 #include "../quantize/onebit_quant.c"
 #include "../quantize/go2b_qc.h"

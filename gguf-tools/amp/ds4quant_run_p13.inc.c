@@ -44,12 +44,12 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
      * 质量最坏情形=多几个"保持", 判据口径与旧全量一致, 永不反向。
      * DS4_BF_SCREEN_K=0 回旧全量行为; DS4_BF_SCREEN_DIV=1 只截深度不抽token。 */
     /* ★写死不走 env(2026-08-29 用户令"不要环境变量控制逻辑, 每次都这样不是丢了吗")★
-     * 原来这五个都是 getenv+默认值。危害不是"可配", 是【C 默认与脚本实际值不一致】:
+     * 原来这五个都是 env 读取+默认值。危害不是"可配", 是【C 默认与脚本实际值不一致】:
      * SCREEN_DIV 的 C 默认是 4 而 r30_campaign.sh 一直导出 12 —— 不经脚本直接跑二进制,
      * 抽格密度就悄悄变了。同款事故今天已撞两次(LZRANK 未设静默兜底 16 / 行掩码写死 32×256)。
      * 取值 = 脚本一直在用的那一组, 行为逐位不变。 */
     int BK=8;   /* 后面粗筛关闭时会置 0, 故不 const */
-    const int SDIV=12;   /* r30_campaign.sh 一直导出的值(C 旧默认 4 与之不符) */
+    const int SDIV=DSQ_GS_SCREEN_DIV;   /* r30_campaign.sh 一直用的 12; 与 p12 回扫探测共用一份常量 */
     /* ★2026-08-02: 原来这里有 "DS4_ANCHOR_ROUTE ⇒ BK=0 硬关粗筛"。已删 —— 不相容的根源
      * (锚按原始行号、抽格前向按紧凑行号)由 g_anc_rowmap 行映射解决了。关粗筛的代价是
      * 本文件自己注明的 "旧式全量 ≈0.40·F² min/前沿, 43 层≈7 天", 交付不了。 */
@@ -463,8 +463,7 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
                     if(fd2>=0){ if(pwrite(fd2,u->old,u->len,(off_t)u->foff)!=(ssize_t)u->len) perror("bfu-rb");
                         close(fd2); } }
                 for(int J=Jlo;J<Lfront;J++) if(oland[J]){                     /* ③重读: 主 dql 路径(侧车自动挂) */
-                    char pj2[512]; snprintf(pj2,sizeof(pj2),"%s/dql_L%02d.bin",
-                        getenv("DS4_LAYER_DIR")?getenv("DS4_LAYER_DIR"):".",J);
+                    char pj2[512]; snprintf(pj2,sizeof(pj2),"%s/dql_L%02d.bin",dsq_layer_dir_req(),J);
                     lfile_free(&GS_LF[J]); memset(&GS_LF[J],0,sizeof(lfile_t)); lfile_load(pj2,&GS_LF[J]); }
                 changed=0;
             }

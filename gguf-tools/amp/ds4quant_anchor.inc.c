@@ -18,7 +18,7 @@ static int g_chfd=-1; static int g_chS=0;
 static anchor_t ANC2; static int ANC2_OK=0;
 static long *g_ids2=NULL; static int g_S2=0;
 
-static const char *anchor_path(void){ const char*p=getenv("DS4_ANCHOR"); return p?p:"/tmp/ds4quant_anchor.bin"; }
+static const char *anchor_path(void){ return g_cli.anchor?g_cli.anchor:"/tmp/ds4quant_anchor.bin"; }
 static uint64_t dq_ids_hash(const long*ids,int S){
     uint64_t h=1469598103934665603ULL;
     for(int i=0;i<S;i++){ uint64_t v=(uint64_t)ids[i];
@@ -35,7 +35,7 @@ static void anchor_alloc(int S){
      * 会落盘的锚(NL=43+DS4_ANCHOR)改为目标文件 MAP_SHARED 直写 — 写=脏文件页, 内核
      * writeback 落盘, RSS 只剩真工作集; logits 仍由 fwd_all malloc(单段, save 时 pwrite 进尾)。
      * 截断锚(NL<43, 本来不落盘)保留 malloc 原样。mmap 失败=响亮停车, 不许滑回 OOM 路。 */
-    if(NLAYERS==43 && getenv("DS4_ANCHOR")){
+    if(NLAYERS==43 && g_cli.anchor){   /* ★护栏: 显式给了 --anchor 且全 43 层才走落盘直写(截断锚只在内存) */
         g_ancneed=40+fin_b+2*ridx_b+H_b+lg_b;
         g_ancfd=open(anchor_path(),O_RDWR|O_CREAT,0644);
         if(g_ancfd<0||ftruncate(g_ancfd,(off_t)g_ancneed)!=0){

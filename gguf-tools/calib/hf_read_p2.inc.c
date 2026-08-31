@@ -295,11 +295,10 @@ static int shard_num(const char *file) {
 }
 
 int main(void) {
-    /* External-data test: prefer DS4_HF, then repo-root hf/ (make runs from
+    /* External-data test: probe repo-root hf/ then ../hf/ (make runs from
      * gguf-tools). SKIP (exit 0) when the checkpoint is absent — a self-test
      * must not fail on machines without the 87 GiB HF tree. */
-    const char *dir = getenv("DS4_HF");
-    if (!dir || !dir[0]) dir = "hf/DeepSeek-V4-Flash-Base";
+    const char *dir = "hf/DeepSeek-V4-Flash-Base";
     hf_db *db = hf_open(dir);
     if (!db) {
         dir = "../hf/DeepSeek-V4-Flash-Base";

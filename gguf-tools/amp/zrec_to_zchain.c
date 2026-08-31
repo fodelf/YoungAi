@@ -3,8 +3,8 @@
  * zrec 内容 = 116B 头记录串(bf.GE/zl.RRR/...), 载荷逐字节直通; 空文件=该层被闸(skip)。
  * ★AMPD 必须在 AMP 之前判★: 'zl.AMP' 是 'zl.AMPD' 的子串, 顺序反了会把动态 z 侧车
  * 错标成 type7 —— 载荷 A|U|V 按 z|U|V 解析, 引擎跑出垃圾且不报错(2026-08-22 教训)。
- * ZC_SKIP="5,7": 合并时按类型过滤(5=GE 6=z^L 7=AMP 8=RTE 9=AMPD), 组合裁剪对照用(既有 env)。
- * 用法: zrec_to_zchain <layers_dir> <out.zchain.bin> [nl=43] */
+ * --skip 5,7: 合并时按类型过滤(5=GE 6=z^L 7=AMP 8=RTE 9=AMPD), 组合裁剪对照用。
+ * 用法: zrec_to_zchain <layers_dir> <out.zchain.bin> [nl=43] [--skip TYPES] */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,14 +13,17 @@
 static void put32(FILE *f, uint32_t v) { fwrite(&v, 4, 1, f); }
 
 int main(int argc, char **argv) {
-    if (argc < 3) { fprintf(stderr, "用法: zrec_to_zchain <layers_dir> <out.zchain.bin> [nl=43]\n"); return 1; }
+    if (argc < 3) { fprintf(stderr, "用法: zrec_to_zchain <layers_dir> <out.zchain.bin> [nl=43] [--skip TYPES]\n"); return 1; }
     const char *ld = argv[1], *outp = argv[2];
-    int NL = argc > 3 ? atoi(argv[3]) : 43;
+    int NL = (argc > 3 && strncmp(argv[3], "--", 2)) ? atoi(argv[3]) : 43;
     int skip[16] = {0};
-    { const char *sv = getenv("ZC_SKIP");
-      if (sv && *sv) { char b[128]; snprintf(b, sizeof b, "%s", sv);
-          for (char *tk = strtok(b, ","); tk; tk = strtok(NULL, ",")) {
-              int t = atoi(tk); if (t >= 0 && t < 16) skip[t] = 1; } } }
+    for (int i = 3; i < argc; i++) {
+        if (strcmp(argv[i], "--skip")) continue;
+        if (i + 1 >= argc) { fprintf(stderr, "--skip 缺值(逗号分隔类型号, 如 5,7)\n"); return 1; }
+        char b[128]; snprintf(b, sizeof b, "%s", argv[++i]);
+        for (char *tk = strtok(b, ","); tk; tk = strtok(NULL, ","))
+            { int t = atoi(tk); if (t >= 0 && t < 16) skip[t] = 1; }
+    }
     FILE *out = fopen(outp, "wb");
     if (!out) { fprintf(stderr, "%s 打不开\n", outp); return 2; }
     put32(out, 0x325A5144u); put32(out, (uint32_t)NL);

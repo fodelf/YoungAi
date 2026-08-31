@@ -84,11 +84,12 @@ static int g2_inv(const double*A,int n,double*Ainv){
     for(int i=0;i<n;i++) memcpy(Ainv+(size_t)i*n,M+(size_t)i*stride+n,(size_t)n*sizeof(double));
     free(M); return 0;
 }
-/* _gptq_assign 口径: X 有效(≥8行, 未禁)走误差反馈; 否则纯最近邻 */
+/* _gptq_assign 口径: X 有效(≥8行)走误差反馈; 否则纯最近邻。
+ * GPTQ 恒开(原 DS4_GO2B_NO_GPTQ 诊断关断已随禁 env 铁律删除)。 */
 static void g2_assign(const float*W,int rows,int cols,const float*L4,
                       const float*X,int n,int grp,float ridge,
                       float*Wq,int8_t*sidx){
-    if(!X||n<8||getenv("DS4_GO2B_NO_GPTQ")){
+    if(!X||n<8){
         for(int r=0;r<rows;r++){ const float*wr=W+(size_t)r*cols; const float*l4=L4+(size_t)r*4;
             float*qr=Wq+(size_t)r*cols; int8_t*sr=sidx+(size_t)r*cols;
             for(int j=0;j<cols;j++){ int k=g2_nearest(wr[j],l4); sr[j]=(int8_t)k; qr[j]=l4[k]; } }
@@ -168,11 +169,10 @@ static void dq_go2b_encode_adj(const float*W,int nrows,int ncols,const float*X,i
     int own_wq=0; float*Wq=wq_opt;
     if(!Wq){ Wq=malloc((size_t)nrows*ncols*sizeof(float)); own_wq=1; }
     int8_t *sidx=malloc((size_t)nrows*ncols);
-    int grp=128; { const char*ge=getenv("DS4_GO2B_GRP"); if(ge){ int v=atoi(ge); if(v>=16&&v<=512) grp=v; } }
+    const int grp=128;       /* GPTQ 组宽: 原 DS4_GO2B_GRP 从无活脚本改过, 写死 */
     float ridge=0.02f;
     g2_assign(W,nrows,ncols,L4,X,n_act,grp,ridge,Wq,sidx);
-    int actrounds=2; { const char*ae=getenv("DS4_GO2B_ACT"); if(ae&&!atoi(ae)) actrounds=0; }
-    if(!X||n_act<8) actrounds=0;
+    int actrounds=(!X||n_act<8)?0:2;   /* 激活重拟合轮数: 原 DS4_GO2B_ACT 关断诊断已删 */
     for(int round=0;round<actrounds;round++){
         g2_act_d1d2(W,nrows,ncols,sidx,X,n_act,d1,d2,Yadj);
         for(int r=0;r<nrows;r++){
@@ -236,9 +236,6 @@ static int go2b_hot_load(const char*path,int nlayers){
     fclose(f); return 0;
 }
 static inline int g2_hot_slot(int L,int e){ return (GO2B_HOT&&L>=0&&L<64&&G2_K[L]>0)?(int)G2_SLOT[L][e]:-1; }   /* G2_K[L]>0: 未 arm 层静态零初值防误判热(多层回放雷, 2026-07-29) */
-static inline int g2_replay_en(void){   /* DS4_GO2B_REPLAY=0 → 回放强制 go1b(A/B 用) */
-    static int v=-1;
-    if(v<0){ const char*s=getenv("DS4_GO2B_REPLAY"); v=(s&&!atoi(s))?0:1; }
-    return v;
-}
+/* 回放恒走 go2b(原 DS4_GO2B_REPLAY=0 强制 go1b 的 A/B 诊断已随禁 env 铁律删除)。 */
+static inline int g2_replay_en(void){ return 1; }
 #endif

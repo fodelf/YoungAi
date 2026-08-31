@@ -186,10 +186,7 @@ static int BF_ANCROUTE=0;   /* 反修前向强制锚路由(禁稀疏路由翻转
 static float *RB_ACC=NULL; static uint32_t *RB_CNT=NULL;  /* fit 累计 [NLAYERS][NEXP] */
 static float *RB_APPLY=NULL; static int RB_TRIED=0;       /* apply Δb_raw [NLAYERS][NEXP] */
 static float RB_ALPHA=1.0f; static int RB_MINCNT=8;
-/* ★序贯路由(2026-07-29 用户终令"添加路由和动态α扫"): 贪心内每层锁定后 FIT 本层 Δb →
- * α 三点扫选层优(负收益自动关) → 定稿/链推进带路由修正, 下游继承; 收官 Δb+α 落盘。 */
-static int RB_SEQ=0;                 /* DS4_ROUTE_SEQ=1 */
-static float RB_ALPHA_L[64]={0};     /* per-layer 动态 α(0=该层关) */
+/* (序贯路由 RB_SEQ/per-layer α 已删: DS4_ROUTE_SEQ 实验路, 无脚本设置, 2026-08-31 env 清退) */
 /* ★热启动记录(2026-07-30 用户"每层太慢"): 上层锁定档族/热数, 深带同带惯性 —
  * 上层 'g' 族 ⇒ 本层跳 g10 裸基线+rank 二分(g10 曾被每层裸评两次), 直接从上层档-1 起试 */
 static char g_mv_pcfg=0; static int g_mv_phot=0;
@@ -219,7 +216,6 @@ static void mv_prev_note(char cfg,const char*nm){
     g_mv_phot = h? atoi(h+1) : 0;
     if(cfg=='g'&&h&&g_mv_phot==0) g_mv_phot=16;   /* 旧名 "g10h"(基线) = 热16 */
 }
-static int g_rb_fit_L=-1;            /* 序贯: FIT 只统计该层(-1=全层旧行为) */
 static void rb_commit(int L){        /* 本层 FIT 累计折算进 RB_APPLY(内存直通, mincnt 门) */
     if(!RB_ACC) return;
     if(!RB_APPLY) RB_APPLY=calloc((size_t)NL*NEXP,4);
@@ -229,37 +225,33 @@ static void rb_commit(int L){        /* 本层 FIT 累计折算进 RB_APPLY(内�
         if(RB_APPLY[i]!=0.0f) armed++; }
     fprintf(stderr,"L%02d [路由] Δb 就位(武装槽=%ld)\n",L,armed);
 }
-static void rb_save(void){           /* 收官/探针早退: Δb+cnt(0x41494252 同格式)+α 表落盘 */
-    /* ★固定规则模式补路由 FIT(2026-07-31 实锤: RB_SEQ 两处入口都带 !mv_base, R36 战役
-     * (mv_base 固定档)从未跑过路由 FIT ⇒ 裸路由 ⇒ 自回归活路由漂移无补偿 → 退化循环。
-     * DS4_ROUTE_BIAS_FIT 走非序贯统计(在既有量化前向里顺带累计, 零额外前向), 落盘同格式,
-     * α 由烘焙侧给(冠军同款 2.5)。teacher-forced 指标不受影响, 修的是自由生成稳定性。 */
+static void rb_save(void){           /* 收官/探针早退: Δb+cnt(0x41494252 同格式)落盘 */
+    /* ★固定规则模式补路由 FIT(2026-07-31 实锤): R36 战役(mv_base 固定档)从未跑过路由 FIT
+     * ⇒ 裸路由 ⇒ 自回归活路由漂移无补偿 → 退化循环。--route-bias-fit 走非序贯统计(在既有
+     * 量化前向里顺带累计, 零额外前向), 落盘同格式, α 由烘焙侧给(冠军同款 2.5)。
+     * teacher-forced 指标不受影响, 修的是自由生成稳定性。 */
     { long nz=0; if(RB_CNT) for(size_t i=0;i<(size_t)NL*NEXP;i++) if(RB_CNT[i]) nz++;
       fprintf(stderr,"[路由][diag] rb_save入口 ACC=%p APPLY=%p 非零CNT槽=%ld\n",(void*)RB_ACC,(void*)RB_APPLY,nz); }
     if(RB_ACC&&!RB_APPLY){   /* ★评测遍FIT(2026-08-13): BF_ONLY 无逐层 rb_commit, 收官一次性折算 */
         for(int l=0;l<NL;l++) rb_commit(l); }
-    if(!(RB_SEQ||getenv("DS4_ROUTE_BIAS_FIT"))||!RB_APPLY){
-        if(RB_SEQ||getenv("DS4_ROUTE_BIAS_FIT"))
+    if(!g_cli.route_bias_fit||!RB_APPLY){
+        if(g_cli.route_bias_fit)
             fprintf(stderr,"[路由] Δb 无统计可落盘(哈希路由=选择零漂移, RB 不适用)\n");
         return; }
-    const char*rp=getenv("DS4_ROUTE_BIAS_OUT"); if(!rp) return;
+    const char*rp=g_cli.route_bias_out; if(!rp) return;
     FILE*f=fopen(rp,"wb");
     if(f){ uint32_t hd[4]={0x41494252u,(uint32_t)NL,(uint32_t)NEXP,0};
         fwrite(hd,4,4,f); fwrite(RB_APPLY,4,(size_t)NL*NEXP,f);
         if(RB_CNT) fwrite(RB_CNT,4,(size_t)NL*NEXP,f); fclose(f); }
-    char ap[512]; snprintf(ap,sizeof(ap),"%s.alpha.txt",rp);
-    FILE*g=fopen(ap,"w");
-    if(g){ for(int l=0;l<NL;l++) fprintf(g,"L=%d a=%.1f\n",l,RB_ALPHA_L[l]); fclose(g); }
-    fprintf(stderr,"[路由] Δb+α 落盘 → %s(+.alpha.txt)\n",rp);
+    fprintf(stderr,"[路由] Δb 落盘 → %s\n",rp);
 }
 static float *GS_GV=NULL; static int GS_GV_L=-1;   /* 目标层 per-token routed 增益向量(搜每 token 最优乘子) */
 static float *GS_FIN=NULL; static int GS_CAP_L=-1; /* 目标层 MoE 输入 Fin_L 捕获(重算 z 特征/当前系数) */
 static int *GS_IDXC=NULL; static float *GS_RWC=NULL; /* 目标层路由捕获(GE 投影: token→专家 命中+权重) */
 static float *HQE=NULL;    /* ★逐层反修★: 每层量化态入口隐藏 [NLAYERS+1][lstride](反修前层时从此重前向) */
 static size_t g_hqe_lstride=0;   /* HQE mmap 尺寸记账(munmap 用; 文件后备映射禁 free) */
-static int BACKFIT_INCR=1; /* DS4_BACKFIT_INCR: 逐层前进即反修(1=开, 默认); 0=只末尾全局回扫。
-                              裁决2026-07-12: 非fast=每前沿全量反修所有前层(取消"末层最后一次全量"特例, 原DS4_BF_SWEEP已删);
-                              fast=不向前修复(反修整个跳过, dql/opt 层文件照常落盘) */
+/* 增量反修恒开(2026-08-31 删关闭开关 DS4_BACKFIT_INCR, 恒开=原默认):
+ * 裁决2026-07-12: 非fast=每前沿全量反修所有前层; fast=不向前修复(dql/opt 照常落盘) */
 static int *BF_FINOP=NULL;  /* 逐层反修: 每层"最终缩放α op"(bf.GL) 在 ops[] 的下标(-1=未加) */
 static int *BF_DYN2OP=NULL; /* 逐层反修: 每层"per-token 动态 op"(bf.GLdyn2) 下标(-1=未加); 更新原地不重复追加 */
 static int *BF_GEOP=NULL;   /* 逐层反修: 每层"per-expert 增益 op"(bf.GE, type-5) 下标(-1=未加) */

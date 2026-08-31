@@ -305,11 +305,12 @@ static int selftest(const char *suite, int limit, int offset, int eval_timeout) 
 /* ============================ main / argparse ============================ */
 
 static const char *USAGE =
-    "usage: pubbench [-h] [--suite {humaneval,humaneval-x-go}] [--url URL] [--tag TAG]\n"
+    "usage: pubbench [-h] --api {chat,completions} [--suite {humaneval,humaneval-x-go}]\n"
+    "                [--url URL] [--tag TAG]\n"
     "                [--limit LIMIT] [--offset OFFSET] [--max-tokens MAX_TOKENS]\n"
-    "                [--mode MODE] [--api {chat,completions}]\n"
+    "                [--mode MODE]\n"
     "                [--http-timeout HTTP_TIMEOUT] [--jobs JOBS]\n"
-    "                [--eval-timeout EVAL_TIMEOUT] [--out-dir OUT_DIR]\n"
+    "                [--eval-timeout EVAL_TIMEOUT] [--out-dir OUT_DIR] [--cache-dir DIR]\n"
     "                [--compare A.jsonl B.jsonl] [--rejudge FILE.jsonl] [--selftest]\n";
 
 static void ap_err(const char *fmt, ...) {
@@ -325,16 +326,6 @@ static int ap_int(const char *opt, const char *s) {
     if (end == s || *end) ap_err("argument %s: invalid int value: '%s'", opt, s);
     return (int)v;
 }
-static int env_int(const char *name, const char *def) {
-    const char *s = getenv(name);
-    if (!s) s = def;
-    char *end;
-    long v = strtol(s, &end, 10);
-    if (end == s || *end) die("ValueError: invalid literal for int() with base 10: '%s'", s);
-    return (int)v;
-}
-static const char *env_str(const char *name, const char *def) { const char *s = getenv(name); return s ? s : def; }
-
 /* .py 的 out-dir 默认 = os.path.dirname(os.path.abspath(__file__)) + "/../reports/pubbench"
  * (未规范化, 打印时带 "..")。C 版同形, 但 dirname 是可执行文件所在目录(calib/ 而非
  * scripts/) —— 落地目录同一个, 打印出来的路径少一处目录名差异, 见转录清单 B 组。*/
@@ -359,21 +350,23 @@ int main(int argc, char **argv) {
     setvbuf(stderr, NULL, _IONBF, 0);
     signal(SIGPIPE, SIG_IGN);
     curl_global_init(CURL_GLOBAL_DEFAULT);
-    CACHE = env_str("PUBBENCH_CACHE", "/tmp/pubbench_cache");
+    CACHE = "/tmp/pubbench_cache";                      /* --cache-dir 可换(离线机指 bench/data) */
 
     args_t a;
     a.suite = "humaneval";
-    a.url = env_str("DS4_URL", "http://127.0.0.1:8080");
+    a.url = "http://127.0.0.1:8080";
     a.tag = "run";                                      /* 例: base_q2 / vq14 */
     a.limit = 20;
     a.offset = 0;
     a.max_tokens = 320;
     a.mode = "code";                                    /* ds4 server mode:code */
-    a.api = env_str("PUBBENCH_API", "chat");            /* completions=BASE 裸续写口径 */
+    a.api = NULL;                                       /* ★无默认, 必填★: 真代码基准必须 completions
+                                                         * 口径(铁律), 旧 env 默认 "chat" 恰是错口径 —
+                                                         * 禁 env 后逼调用者显式选 */
     a.http_timeout = 900;                               /* 慢机 2-5 t/s 留足 */
-    a.jobs = env_int("PUBBENCH_JOBS", "4");             /* 并发(生成+判题流水) */
+    a.jobs = 4;                                         /* 并发(生成+判题流水) */
     a.eval_timeout = 15;
-    a.out_dir = env_str("PUBBENCH_OUT", default_out_dir());
+    a.out_dir = default_out_dir();
     a.cmp_a = a.cmp_b = a.rejudge_path = NULL;
     a.selftest = 0;
 
@@ -405,6 +398,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(opt, "--jobs")) a.jobs = ap_int("--jobs", NEXTV("--jobs"));
         else if (!strcmp(opt, "--eval-timeout")) a.eval_timeout = ap_int("--eval-timeout", NEXTV("--eval-timeout"));
         else if (!strcmp(opt, "--out-dir")) a.out_dir = NEXTV("--out-dir");
+        else if (!strcmp(opt, "--cache-dir")) CACHE = NEXTV("--cache-dir");
         else if (!strcmp(opt, "--compare")) {
             if (inline_val) ap_err("argument --compare: expected 2 arguments");
             if (i + 2 >= argc) ap_err("argument --compare: expected 2 arguments");
@@ -417,6 +411,8 @@ int main(int argc, char **argv) {
     }
 
     if (a.selftest) return selftest(a.suite, a.limit, a.offset, a.eval_timeout) ? 0 : 1;
+    if (!a.api && (a.rejudge_path || !a.cmp_a))   /* 跑题/重判必填口径; selftest/compare 不碰 API */
+        ap_err("argument --api is required (真代码基准必须 completions 口径, 无默认值)");
     if (a.rejudge_path) { rejudge(a.rejudge_path, a.api); return 0; }
     if (a.cmp_a) compare(a.cmp_a, a.cmp_b);
     else run_suite(&a);

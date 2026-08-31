@@ -11,7 +11,7 @@
      * 逐位的是: 专家序、专家数 ne、记录头、记录总长度; τ 与挽回率对到打印精度。 */
     uint8_t *ERF_ADD = NULL; size_t ERF_LEN = 0;
     double ERF_GAIN = 0.0; int ERF_NE = 0;
-    if (!ADDON && eff < env_dbl("DS4_ZL_ERF_BAR", 0.01) && env_int("DS4_ZL_ERF", 1)) {
+    if (!ADDON && eff < ERF_BAR && ERF_EN) {
         snprintf(path, sizeof path, "%s/dql_vq_L%02d.bin", ld, L);
         int efd = open(path, O_RDONLY);
         if (efd < 0) {
@@ -26,8 +26,8 @@
             close(efd);
             st_ctx *esc = (st_ctx *)xmalloc(sizeof(st_ctx));
             st_open(esc, hf);
-            const int ERF_R = env_int("DS4_ZL_ERF_R", 8);
-            if (ERF_R < 1 || ERF_R > 256) die("DS4_ZL_ERF_R=%d 超范围", ERF_R);
+            const int ERF_R = ERF_RANK;
+            if (ERF_R < 1 || ERF_R > 256) die("--erf-r %d 超范围", ERF_R);
             const int RP8 = ERF_R + 8;                       /* py: _rsvd 的过采样 k+8 */
 
             char *trm = (char *)xcalloc((size_t)NTOK, 1), *evm = (char *)xcalloc((size_t)NTOK, 1);

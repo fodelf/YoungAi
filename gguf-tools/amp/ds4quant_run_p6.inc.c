@@ -38,11 +38,7 @@
         free(gt);
         pay=co_pay_mult_dyn(ex,afin,&paysz);
     }
-    else if(!strncmp(win.algo,"ZL",2)){ /* 确定性重解并截断打包 */
-        ds4_z *zl=z_solve_fourloss(Fin,DF,vs,DIM,DIM,16,win.lam,colw,vs,0.25f,
-                                   0x51F0F00DULL+(win.lam>5?1:0));
-        if(zl){ pay=co_pay_zl(zl,win.k,&paysz); ds4_z_free(zl); }
-    }
+    /* (ZL 胜者重建已删: 加法菜单 2026-08-31 随 DS4_ADD_FORMS 清退, "ZL" 不再可能胜出) */
     /* ---- BWD(向后, D3): 每专家乘法胜者之下 base 重解一轮, 胜了才接管(GL 无 per-expert 目标不参与) ---- */
     if(!strncmp(win.algo,"GE",2)||!strncmp(win.algo,"CE",2)){
         long nf2=co_base_pass(L,S,n_fit,1,Fin,idx,rw,ex,routed,NULL);
@@ -122,7 +118,7 @@
      * 已落地的 Fstate 上原地重解(BF_*OP 下标复用不重复追加; ZLP 暂存整体替换; loss.*
      * 记账在循环外只记终态)。质量保底: 全链统一 sc 闸只进不退 ⇒ 最坏零接管纯耗时。
      * 提前收敛: 某轮里阶段7+9 都零接管 ⇒ 下一轮无新增在场机制, 必零改善, 直接跳出。 */
-    { int BF_ALT=getenv("DS4_BF_ALT")?atoi(getenv("DS4_BF_ALT")):2; if(BF_ALT<1)BF_ALT=1;
+    { const int BF_ALT=DSQ_BF_ALT;   /* 写死 2(原 DS4_BF_ALT env, 无脚本设置) */
     for(int alt=0;alt<BF_ALT;alt++){
     double alt_entry=v_cur, alt_s2exit=v_cur;
     /* ★一次解决(2026-08-02 用户令"两轮时间投入不一定收益高")★: 完全 one-shot 无闭式
@@ -308,7 +304,7 @@
      * win 记回基座值, 该层什么都不改。 */
     {
         double gain_pct = 100.0*(bheld - win.held)/bheld;
-        double gate = getenv("DS4_BF_GAIN_GATE")?atof(getenv("DS4_BF_GAIN_GATE")):0.05;
+        double gate = g_cli.bf_gain_gate;
         if(gain_pct < gate){
             printf("SEARCH_GATE L=%d 增益 %+.3f%% < 门 %.2f%% -> 空手回退(侧车 %.1fKB->0)\n",
                    L,gain_pct,gate,(double)paysz/1024.0);
@@ -336,7 +332,7 @@
         printf("TABREC L=%d %-12s vol=%llu m=[%.4f %.4f %.1f %.2f] 判定=%d | %s\n",
                L,r->name,(unsigned long long)r->vol,r->m1,r->m2,r->m3,r->m4,r->verdict,r->algo); }
     fflush(stdout);
-    if(getenv("DS4_BWD_FINAL")){   /* 终端反调物料: base/校正 两份出口 H(hc_post 线性 → t 插值合法) */
+    if(g_cli.bwd_final){   /* 终端反调物料: base/校正 两份出口 H(hc_post 线性 → t 插值合法) */
         if(!BWD_Hb){ BWD_Hb=malloc(lstride*4); BWD_Hc=malloc(lstride*4); }
         dq_hc_post(Fcur,H2,post2,comb2,BWD_Hb,S,HCM,DIM);
         dq_hc_post(Fout,H2,post2,comb2,BWD_Hc,S,HCM,DIM);

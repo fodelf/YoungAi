@@ -28,6 +28,7 @@
  * p14: 冷专家修复 + global_sweep + main
  */
 #include "ds4quant_run_p1.inc.c"
+#include "ds4quant_cli.inc.c"   /* 运行配置: 原 ~160 处 env 读取收敛为一张 flag 表(2026-08-31) */
 #include "ds4quant_zsolve.inc.c"
 #include "ds4quant_elm.inc.c"
 #include "ds4quant_xcap.inc.c"

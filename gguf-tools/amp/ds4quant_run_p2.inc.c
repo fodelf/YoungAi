@@ -5,11 +5,11 @@
 #define MV_HOTK 16   /* 冠军热档专家数(g10h16 档梯/影子链用) */
 
 static void co_hc(const float*X,int n,const float*q1,const float*q3,float*hc);
-/* ★不得 static 缓存(2026-08-01 实锤 bug): 计划表 vq_rplan(L) 每层 setenv 改 w2 档, 一次性
- * 缓存会把全 43 层锁死在 L00 的值 —— 实测 L18 起 w2 该 24×256 却仍用 16×256, 每层多 38 MiB,
- * 全模型超支 1.27 GiB(29.2 vs 目标 28), 且会在 L38 撞体积闸掐断整轮。冷档 vq_cold_dim()
- * 无此病(它读每层更新的全局 g_vq_dim)。每次 getenv 的开销相对一层 VQ 编码可忽略。 */
-static int vq_w2_dim(void){ const char*e=getenv("DS4_VQ_W2_DIM"); int v=e?atoi(e):0; if(v&&v!=4&&v!=8&&v!=12&&v!=16&&v!=24&&v!=32) v=0; return v; }
+/* w2 档全局(2026-08-31 env 清退): 原是 vq_rplan 写环境、vq_w2_dim 再读回来的自通信通道
+ * (2026-08-01 static 缓存 bug 之源: 一次性缓存把 43 层锁死在 L00 的值)。改直写全局,
+ * 与 g_vq_dim/g_vq_nc 同款, 逐层 vq_rplan 更新即刻可见。 */
+static int g_vq_w2_dim=0, g_vq_w2_nc=256;
+static int vq_w2_dim(void){ int v=g_vq_w2_dim; if(v&&v!=4&&v!=8&&v!=12&&v!=16&&v!=24&&v!=32) v=0; return v; }
 /* ★R28 每层计划(DS4_VQ_RPLAN, 2026-07-31): "L=%d dim=%d nc=%d hot=%d w2dim=%d w2nc=%d"
  * 动态层大小(每层不同码本档) + 动态冷热(每层不同热专家数)。层序处理, 单全局安全。 */
 static int g_vq_L=-1; int g_vq_dim=0, g_vq_nc=0; static int g_vq_hot=0;
@@ -19,7 +19,7 @@ static int g_vq_hot_dim=4, g_vq_hot_nc=512;
 static int vq_hot_dim(void){ return g_vq_hot_dim; }
 static int vq_hot_nc(void){ return g_vq_hot_nc; }
 static int vq_rplan(int L){
-    const char*pp=getenv("DS4_VQ_RPLAN"); if(!pp) return 0;
+    const char*pp=g_cli.vq_rplan; if(!pp) return 0;
     FILE*f=fopen(pp,"r"); if(!f){ fprintf(stderr,"[R28] 计划表打不开 %s\n",pp); exit(2); }
     char ln[256]; int l,d,n,h,wd,wn,ok=0;
     while(fgets(ln,sizeof(ln),f))
@@ -30,15 +30,14 @@ static int vq_rplan(int L){
             { const char*hp=strstr(ln,"hotdim="); int hd,hn;
               if(hp && sscanf(hp,"hotdim=%d hotnc=%d",&hd,&hn)==2){ g_vq_hot_dim=hd; g_vq_hot_nc=hn; }
               else { g_vq_hot_dim=4; g_vq_hot_nc=512; } }
-            char b[16]; snprintf(b,16,"%d",wd); setenv("DS4_VQ_W2_DIM",b,1);
-            snprintf(b,16,"%d",wn); setenv("DS4_VQ_W2_NC",b,1);
+            g_vq_w2_dim=wd; g_vq_w2_nc=wn;
             break; }
     fclose(f);
     if(!ok){ fprintf(stderr,"[R28] 计划表缺 L%d\n",L); exit(2); }
     fprintf(stderr,"[R28] L%02d 冷档 vq%dx%d 热%d(vq%dx%d) w2 vq%dx%d\n",L,d,n,h,g_vq_hot_dim,g_vq_hot_nc,wd,wn);
     return 1;
 }
-static int vq_w2_nc(void){ const char*e=getenv("DS4_VQ_W2_NC"); int v=e?atoi(e):256; if(v<16||v>4096) v=256; return v; }   /* 同上: 禁 static 缓存, 计划表逐层改档 */
+static int vq_w2_nc(void){ int v=g_vq_w2_nc; if(v<16||v>4096) v=256; return v; }
 static int hot_from_anchor(int L,int S,int K);   /* 前置声明: 回放自动 arm 用(定义在贪心段) */
 static void quant_apply(char cfg,const float*e1,const float*e3,const float*e2,
                         const float*Xc,int ncal,const float*xs,const float*wwv,int nt,
@@ -82,7 +81,6 @@ typedef struct {
     int *e_next;
     float *fout;        /* [S*DIM] 选定档 routed 累积 (私有) */
     float *ffp;         /* [S*DIM] FP routed (局部质量对照; NULL=不算) */
-    float *abl[4];      /* 消融档 n/1/z/2 (DS4_ABLATE; NULL=不算) */
     double calib_rows; int calib_empty,nhit;
 } ework_t;
 
@@ -121,15 +119,15 @@ static void *expert_worker(void*arg){
             if(ANC_OK&&Xc){
                 const float *afin=ANC.fin+(size_t)L*S*DIM;
                 const int32_t *aidx=ANC.ridx+(size_t)L*S*NACT;
-                /* DS4_CALIB_FULLSET(2026-07-27 g_r 饿死审计): 命中过滤在 n_fit~400 时每专家
+                /* --calib-fullset(2026-07-27 g_r 饿死审计): 命中过滤在 n_fit~400 时每专家
                  * 仅~9行 → GPTQ-H 是 rank-9 残料, g_r 被 lam=sp2/(n+1) 钉死在 1(实测全模型
                  * g_r≈1.000)。全集喂入(ncal=n_fit)统计充分, lam 公式随 n 自愈。默认保持旧行为。 */
-                static int fullset=-1; if(fullset<0) fullset=getenv("DS4_CALIB_FULLSET")?1:0;
-                /* DS4_CALIB_CAP(2026-08-18 用户问"语料需要那么多吗"): FULLSET 每专家全集
+                const int fullset=g_cli.calib_fullset;
+                /* --calib-cap(2026-08-18 用户问"语料需要那么多吗"): FULLSET 每专家全集
                  * 2906 行是对"9行饿死"的矫枉过正 — H 只有 128 维, 512 行=4×过采样已统计
                  * 充分, 而 GPTQ-H/g_r 两个最重段都 ∝ 行数。激活行全保, 全集行均匀 stride
-                 * 补到上限。0/未设=原全集行为。 */
-                static int calcap=-1; if(calcap<0){ const char*cc=getenv("DS4_CALIB_CAP"); calcap=cc?atoi(cc):0; }
+                 * 补到上限。0/未传=原全集行为。 */
+                const int calcap=g_cli.calib_cap;
                 if(fullset&&calcap>0&&n_fit>calcap){
                     int nact_e=0;   /* 先收激活行(全保) */
                     for(int s=0;s<n_fit;s++){ int hit=0;
@@ -147,8 +145,6 @@ static void *expert_worker(void*arg){
             }
             w->nhit++; w->calib_rows+=ncal; if(!ncal) w->calib_empty++;
             quant_apply(w->cfg,e1,e3,e2,ncal?Xc:NULL,ncal,xs,wwv,nt,toks,w->fout,L,e);
-            if(w->abl[0]){ const char AC[4]={'n','1','z','2'};
-                for(int ci=0;ci<4;ci++) quant_apply(AC[ci],e1,e3,e2,ncal?Xc:NULL,ncal,xs,wwv,nt,toks,w->abl[ci],L,e); }
         }
         free(e1);free(e3);free(e2);
     }
@@ -161,8 +157,7 @@ static void *expert_worker(void*arg){
  * 就地更新 H[S,HCM,DIM]。do_quant: routed 专家按 cfg 档量化(校准=anchor 部署口径), 误差随深度累积。
  * st(可NULL): 路由一致率/校准统计/局部质量。 */
 typedef struct { double agree; double calib_rows; int calib_empty,nhit;
-                 int have_loc; double loc_r2; double rs_ratio; int zk;
-                 double abl_r2[4],abl_rel[2],abl_la,abl_lc; } lstat_t;
+                 int have_loc; double loc_r2; double rs_ratio; int zk; } lstat_t;
 
 /* ===================== 每层修正算法搜索 + 合并动态侧车 (DS4_COADAPT) ===================== *
  * 用户设计(2026-07-10 定稿口径): 每层的任务是【找到那一层最好的算法】——不存在"没提升
@@ -254,14 +249,10 @@ static void *coadapt_worker(void*a){
             char n1[160],n3[160];
             snprintf(n1,sizeof(n1),"layers.%d.ffn.experts.%d.w1.weight",w->L,e);
             snprintf(n3,sizeof(n3),"layers.%d.ffn.experts.%d.w3.weight",w->L,e);
-            const uint64_t *bfvt0=(bf_from_bytes()&&BFB_VQMAP)?(const uint64_t*)(BFB_VQMAP+16):NULL;
-            int bfsk13=(bfvt0&&g2_hot_slot(w->L,e)<0
-                        &&bfvt0[(size_t)e*3]&&bfvt0[(size_t)e*3+1]);   /* ★字节起步冷专家: e1/e3 免读免转(~16GB/层);
-                        * 盘上字节=量化段导出解, 已含同α GPTAQ 目标(export 侧 yadjE), 本处 yadj 块一并跳过 */
-            float *e1=bfsk13?NULL:st_read_weight(&C,n1,&rr,&cc);
-            float *e3=bfsk13?NULL:st_read_weight(&C,n3,&rr,&cc);
+            float *e1=st_read_weight(&C,n1,&rr,&cc);
+            float *e3=st_read_weight(&C,n3,&rr,&cc);
             float *e2=st_read_weight(&C,n2,&rr,&cc);
-            if((!bfsk13&&(!e1||!e3))||!e2){ if(e1)free(e1);if(e3)free(e3);if(e2)free(e2);
+            if(!e1||!e3||!e2){ if(e1)free(e1);if(e3)free(e3);if(e2)free(e2);
                 fprintf(stderr,"\n[!] L%d e%d 读失败\n",w->L,e); continue; }
             int ncal=0;
             for(int s2=0;s2<w->n_fit;s2++)for(int a2=0;a2<NACT;a2++)
@@ -284,7 +275,7 @@ static void *coadapt_worker(void*a){
             /* GPTAQ 非对称目标(2026-07-25 G1b): y_ref=W·x̂+α·W·(x̃−x̂); x̃=锚 FP 流(量化全程不被覆盖)。
              * 回归仍在漂移输入 x̂ 上(合并态), 只有目标含 FP 流 ⇒ 纠正累积上游漂移而非仅条件于它。 */
             float *yadj1=NULL,*yadj3=NULL; float tga=dq_tgt_alpha();
-            if(!bfsk13&&tga>0.0f&&ncal&&ANC_OK){
+            if(tga>0.0f&&ncal&&ANC_OK){
                 float *dx=malloc((size_t)ncal*DIM*4);
                 const float *afp=ANC.fin+(size_t)w->L*w->S*DIM;
                 for(int t=0;t<ncal;t++){ int s2=ce->calS[t];
@@ -296,11 +287,7 @@ static void *coadapt_worker(void*a){
                 free(dx);
             }
             float *q1,*q3;
-            if(bfsk13){   /* ★字节起步: 冷 w1/w3=盘上 VQ 载荷 dequant */
-                q1=malloc((size_t)MOEI*DIM*4); q3=malloc((size_t)MOEI*DIM*4);
-                vq_unpack_dequant(BFB_VQMAP+bfvt0[(size_t)e*3],BFB_VQMSZ-bfvt0[(size_t)e*3],q1,NULL,NULL);
-                vq_unpack_dequant(BFB_VQMAP+bfvt0[(size_t)e*3+1],BFB_VQMSZ-bfvt0[(size_t)e*3+1],q3,NULL,NULL);
-            } else if(dq_vq_on()){   /* v2.2: 码本量化(α 目标暂不进 VQ 内环, 行乘子已含激活拟合) */
+            if(dq_vq_on()){   /* v2.2: 码本量化(α 目标暂不进 VQ 内环, 行乘子已含激活拟合) */
                 q1=g2hot?dq_quant_expert_vq(e1,MOEI,DIM,Xc,ncal,vq_hot_dim(),vq_hot_nc()):dq_quant_expert_vq(e1,MOEI,DIM,Xc,ncal,vq_cold_dim(),vq_cold_nc());
                 q3=g2hot?dq_quant_expert_vq(e3,MOEI,DIM,Xc,ncal,vq_hot_dim(),vq_hot_nc()):dq_quant_expert_vq(e3,MOEI,DIM,Xc,ncal,vq_cold_dim(),vq_cold_nc());
             } else {
@@ -325,11 +312,7 @@ static void *coadapt_worker(void*a){
                 dq_matmul(ce->hc_cal,e2,ce->y2ref,ce->ncal,MOEI,DIM);
             }
             float *w2q;
-            if(bf_from_bytes()&&BFB_W2&&!g2hot){   /* ★字节起步: 冷 w2 基座=盘上 D 段 go1b(同 μ10 FULLSET 解); D3 后续照常重解 */
-                w2q=malloc((size_t)DIM*MOEI*4);
-                dq_go1b_bytes_dequant(BFB_W2+(size_t)e*BFB_SZD,DIM,MOEI,w2q);
-            }
-            else if(dq_vq_on()&&g2hot) w2q=dq_quant_expert_vq(e2,DIM,MOEI,ce->hc_cal,ce->ncal,vq_hot_dim(),vq_hot_nc());
+            if(dq_vq_on()&&g2hot) w2q=dq_quant_expert_vq(e2,DIM,MOEI,ce->hc_cal,ce->ncal,vq_hot_dim(),vq_hot_nc());
             /* ★冷 w2 评估路径带顺序补偿(2026-08-03): 与导出路径(vq_export_matrix_seq)同解,
              * 搜索/调优/z 全链看到的就是部署态 — 失配事故修 */
             else if(dq_vq_on()&&vq_w2_dim()>0)   /* R28: 冷 w2 码本(省 6.2G 给 w13; 冠军此处是 signref) */

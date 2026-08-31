@@ -167,7 +167,7 @@ static const char *BOS = "<\xef\xbd\x9c" "begin\xe2\x96\x81" "of\xe2\x96\x81" "s
 #define FULLMARK "\x00" "FULL" "\x00"   /* 6 字节, 含 NUL */
 static const char FULL_MARK[6] = { 0, 'F', 'U', 'L', 'L', 0 };
 
-/* 默认仍是 /tmp(旧行为不变)。PUBBENCH_CACHE 指向 gguf-tools/bench/data/
+/* 默认仍是 /tmp(旧行为不变)。--cache-dir 指向 gguf-tools/bench/data/
  * 可跑在联不上外网的机器上(Spark 直连 GitHub/HF 超时) —— 那两份 164 题 jsonl 已入库。*/
 static const char *CACHE;
 

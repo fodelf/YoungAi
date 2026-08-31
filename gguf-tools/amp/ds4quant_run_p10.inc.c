@@ -1,6 +1,6 @@
 static void export_gguf(int S,int n_fit){
-    const char*gp=getenv("DS4_EXPORT_GGUF"), *op=getenv("DS4_EXPORT_OFF");
-    if(!op){ fprintf(stderr,"需 DS4_EXPORT_OFF=偏移表(gguf_offsets.py 输出)\n"); exit(1); }
+    const char*gp=g_cli.export_gguf, *op=g_cli.export_off;
+    if(!op){ fprintf(stderr,"需 --export-off 偏移表(gguf_offsets 输出)\n"); exit(1); }
     GOFF=calloc((size_t)NL*3,sizeof(goff_t)); NGOFF=0;
     FILE*f=fopen(op,"r"); if(!f){perror("off");exit(1);}
     { char nm[256]; int ty; long off,nel;
@@ -90,8 +90,8 @@ static double held_score(const float*H,int S,int n_fit,int L,double*relh){
     free(wv);
     return la+0.5*lc;
 }
-static const char*ckpt_dir(void){ const char*p=getenv("DS4_CKPT_DIR"); return p?p:"/tmp/ds4q_ckpt"; }
-static const char*plan_path(void){ const char*p=getenv("DS4_PLAN"); return p?p:"/tmp/ds4quant_plan.txt"; }
+static const char*ckpt_dir(void){ return g_cli.ckpt_dir; }
+static const char*plan_path(void){ return g_cli.plan; }
 /* 读 plan 中第 L 层已锁链式 relh(增长率门用; 无记录=-1) */
 static double plan_relh_of(int L){
     FILE*f=fopen(plan_path(),"r"); if(!f) return -1;
@@ -113,19 +113,7 @@ static void ckpt_save(int L,const float*H,size_t n,uint64_t idh){
     uint64_t hd[2]={idh,(uint64_t)n};
     fwrite(hd,8,2,f); fwrite(H,4,n,f); fclose(f);
 }
-/* 影子冠军链 ckpt(断点续跑不重算影子) */
-static int ckpt_load_s(int L,float*H,size_t n,uint64_t idh){
-    char p[512]; snprintf(p,sizeof(p),"%s/L%02d.sh.bin",ckpt_dir(),L);
-    FILE*f=fopen(p,"rb"); if(!f)return 0;
-    uint64_t hd[2]; int ok=fread(hd,8,2,f)==2&&hd[0]==idh&&hd[1]==(uint64_t)n&&fread(H,4,n,f)==n;
-    fclose(f); return ok;
-}
-static void ckpt_save_s(int L,const float*H,size_t n,uint64_t idh){
-    char p[512]; snprintf(p,sizeof(p),"%s/L%02d.sh.bin",ckpt_dir(),L);
-    FILE*f=fopen(p,"wb"); if(!f)return;
-    uint64_t hd[2]={idh,(uint64_t)n};
-    fwrite(hd,8,2,f); fwrite(H,4,n,f); fclose(f);
-}
+/* (影子冠军链 ckpt 已删: DS4_MINVOL_HIST 门A实验路 2026-08-31 env 清退) */
 /* rr 判决链 H2 的 ckpt(断点续跑与主链同粒度; 头校验=rr 锚 ids 哈希) */
 static int ckpt2_load(int L,float*H,size_t n){
     char p[512]; snprintf(p,sizeof(p),"%s/L%02d.rr.bin",ckpt_dir(),L);
@@ -171,9 +159,8 @@ static char plan_lookup_mv(int L,char*nm_out){
 }
 static void set_cand(const cand_t*c){
     dq_signref_mu=c->mu; dq_signref_rounds=c->rounds;
-    /* ★候选未带 lz(=0)时回落 env(2026-08-23): pure 模式 set_cand(&MV_G10) 曾把
-     * DS4_LZ=8 覆写清零 —— ZDIAG LZRANK=0 实锤。档位自带 lz 仍优先。 */
-    LZRANK = c->lz ? c->lz : (getenv("DS4_LZ") ? atoi(getenv("DS4_LZ")) : 0);
+    /* 候选未带 lz(=0) ⇒ 关本层 z(原 DS4_LZ env 回落已清退; env-不设时代即 0, 行为持平)。 */
+    LZRANK = c->lz;
     if(c->lztr) LZTR=c->lztr; if(c->lz)LZLAMBDA=c->lzlam;
 }
 /* verdict-lite: 只算 held Σmin/KL(里程碑探针用) */
@@ -218,14 +205,14 @@ static int rr_ids_load(const char*p){
     fclose(f); g_S2=n; return n>0;
 }
 static void rr_anchor_init(void){
-    const char*ip=getenv("DS4_RR_IDS"); if(!ip) return;
-    const char*ap=getenv("DS4_ANCHOR2");
-    if(!ap){ fprintf(stderr,"[rr锚] 需 DS4_ANCHOR2 路径 — 硬拒\n"); exit(2); }
+    const char*ip=g_cli.rr_ids; if(!ip) return;
+    const char*ap=g_cli.anchor2;
+    if(!ap){ fprintf(stderr,"[rr锚] 需 --anchor2 路径 — 硬拒\n"); exit(2); }
     if(!rr_ids_load(ip)){ fprintf(stderr,"[rr锚] ids 读取失败 %s — 硬拒\n",ip); exit(2); }
     fprintf(stderr,"[rr锚] 判决语料 %s S=%d (统一标准: 判决口径=rr_hard, 冠军尺 0.7680/0.3602)\n",ip,g_S2);
     anchor_t sv=ANC; int svok=ANC_OK;
-    char svpath[512]; snprintf(svpath,sizeof(svpath),"%s",anchor_path());
-    setenv("DS4_ANCHOR",ap,1);
+    const char*svpath=g_cli.anchor;   /* 借道 g_cli.anchor 让 anchor_load/save 指向锚2(原 setenv 戏法同语义) */
+    g_cli.anchor=ap;
     memset(&ANC,0,sizeof(ANC)); ANC_OK=0;
     uint64_t idh2=dq_ids_hash(g_ids2,g_S2);
     if(anchor_load(g_S2,idh2)) fprintf(stderr,"[rr锚] 命中缓存 %s (FP 遍跳过)\n",ap);
@@ -238,7 +225,7 @@ static void rr_anchor_init(void){
     }
     ANC2=ANC; ANC2_OK=1;
     ANC=sv; ANC_OK=svok;
-    setenv("DS4_ANCHOR",svpath,1);
+    g_cli.anchor=svpath;
 }
 /* rr 里程碑(判决口径): H2 前缀量化链 + 后缀 FP → 全段 Σmin/KL vs rr FP logits。
  * H2=裸胜者档链(不含 coadapt z 微增益) ⇒ 保守下界; 终验用完整回放取真值。 */
@@ -279,20 +266,18 @@ static float *fwd_all_tune(const long*ids,int S,int n_fit,char*plan_out){
     size_t lstride=(size_t)S*HCM*DIM;
     uint64_t idh=ANC.idh;
     mkdir(ckpt_dir(),0755);
-    double gain_th=0.15; if(getenv("DS4_TUNE_GAIN")) gain_th=atof(getenv("DS4_TUNE_GAIN"));
+    const double gain_th=DSQ_TUNE_GAIN;
     float *H=malloc(lstride*4),*Hw=malloc(lstride*4),*Hb=malloc(lstride*4),*Hf2=malloc(lstride*4);
     { float *emb=st_read_weight(&C,"embed.weight",NULL,NULL);
       for(int s=0;s<S;s++)for(int j=0;j<HCM;j++)memcpy(H+((size_t)s*HCM+j)*DIM,emb+(size_t)ids[s]*DIM,(size_t)DIM*4);
       free(emb); }
-    int minvol=getenv("DS4_MINVOL")?1:0;
-    /* ★隔离探针(R24 D1, 2026-07-30 用户"先跑两个代表层试一试"): 上游=FP 锚定直通,
-     * 只评 DS4_MV_PROBE_L 层 — 干净的单层判决(无上游漂移), R24 vs 冠军档同足对比。 */
-    int g_probe_l=getenv("DS4_MV_PROBE_L")?atoi(getenv("DS4_MV_PROBE_L")):-1;
-    double mv_alpha=getenv("DS4_MINVOL_ALPHA")?atof(getenv("DS4_MINVOL_ALPHA")):1.03;
+    int minvol=g_cli.minvol;
+    /* (DS4_MV_PROBE_L 隔离探针已删: 2026-08-31 env 清退, 单层判决改走 --nl/--lcfg 组合) */
+    const double mv_alpha=DSQ_MINVOL_ALPHA;
     /* 活 α(2026-07-28 用户: "为啥α不能是活的"): 里程碑斜率外推终点 Σmin_proj,
      * proj<T−0.03 → α 收 0.03; proj>T+0.03 → α 放 0.02(顶 1.15)。
-     * ★统一标准后: 外推/目标线一律 rr 口径(冠军尺), 默认终线 0.77≈v4bf 0.7680。 */
-    double mv_target=getenv("DS4_MINVOL_TARGET")?atof(getenv("DS4_MINVOL_TARGET")):0.768;
+     * ★统一标准后: 外推/目标线一律 rr 口径(冠军尺), 终线 0.768≈v4bf 冠军尺(写死)。 */
+    const double mv_target=DSQ_MINVOL_TARGET;
     double mprev=-1;   /* rr 里程碑滚动值(预算门状态; -1=未初始化, RESUME 时现算恢复) */
     /* rr 判决链 H2(统一标准): 与主链同粒度推进, embed 起点 */
     size_t lstride2=ANC2_OK?(size_t)g_S2*HCM*DIM:0; float *H2=NULL;
@@ -303,8 +288,6 @@ static float *fwd_all_tune(const long*ids,int S,int n_fit,char*plan_out){
         free(emb2);
     }
     if(minvol){
-        RB_SEQ=getenv("DS4_ROUTE_SEQ")?1:0;
-        if(RB_SEQ) fprintf(stderr,"[序贯路由] 开: 每层 FIT Δb + α{1.0,2.5,4.0} 扫(负收益自动关), 定稿/推进带修正, 收官落盘\n");
-        fprintf(stderr,"\n[最小体积·计划表驱动] 每层档位由 DS4_VQ_RPLAN 计划表定; "
+        fprintf(stderr,"\n[最小体积·计划表驱动] 每层档位由 --vq-rplan 计划表定; "
                        "地板门 α=%.2f; v5mini 里程碑每5层=护栏\n",mv_alpha); }
     else fprintf(stderr,"\n[渐进调优v2·目标导向] 免费候选(r/g)选最优; q2 挽回≥%.0f%% 才升位(+0.84GiB/层); 里程碑 L9/20/31\n",gain_th*100);

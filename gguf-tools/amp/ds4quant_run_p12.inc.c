@@ -4,9 +4,9 @@
          * plan/ckpt/产物均已落盘; zfile/zchain 也刷终值(全程跑在 main 尾做, 探针早退补齐);
          * RESUME=1 从下一层无损续跑。 */
 
-        if(minvol&&getenv("DS4_MINVOL_MAXL")&&L+1>=atoi(getenv("DS4_MINVOL_MAXL"))){
+        if(minvol&&g_cli.minvol_maxl>0&&L+1>=g_cli.minvol_maxl){
             rb_save(); zfile_write(); zchain_write();
-            fprintf(stderr,"[贪心探针] 已锁 %d 层(DS4_MINVOL_MAXL) → 提前收工; RESUME=1 续跑\n",L+1);
+            fprintf(stderr,"[贪心探针] 已锁 %d 层(--minvol-maxl) → 提前收工; RESUME=1 续跑\n",L+1);
             exit(0);
         }
     }
@@ -242,8 +242,7 @@ static void op_backup(int L,int fd,size_t foff,size_t len){
     if(nseen<4096) seen[nseen++]=key;
     uint8_t old[8192]; if(len>sizeof(old)) return;
     if(pread(fd,old,len,(off_t)foff)!=(ssize_t)len) return;
-    char bp[512]; snprintf(bp,sizeof(bp),"%s/opbak_L%02d.bin",
-        getenv("DS4_LAYER_DIR")?getenv("DS4_LAYER_DIR"):".",L);
+    char bp[512]; snprintf(bp,sizeof(bp),"%s/opbak_L%02d.bin",dsq_layer_dir_req(),L);
     FILE*bf=fopen(bp,"ab"); if(!bf) return;
     uint64_t f64=(uint64_t)foff; uint32_t l32=(uint32_t)len;
     fwrite(&f64,8,1,bf); fwrite(&l32,4,1,bf); fwrite(old,1,len,bf); fclose(bf);
@@ -266,63 +265,19 @@ static void zfile_commit(int L,lop_t*z,float m1metric){
     if(pwrite(fd,&m1metric,4,(off_t)(z->foff-20))!=4) perror("bf-m1");
     close(fd);
 }
-static int backfit_layer_z(int L,const long*ids,int S,int n_fit,float*Hc,size_t lstride,double*kl0){
-    if(!GS_LF||L>=NLAYERS||!GS_LF[L].map) return 0;
-    lfile_t*lf=&GS_LF[L]; int zi=-1;
-    for(int i=0;i<lf->nops;i++) if(lf->ops[i].type>=1&&lf->ops[i].type<=3){ zi=i; break; }
-    if(zi<0) return 0;                          /* 该层无 z 载荷可重解 */
-    lop_t*z=&lf->ops[zi]; lop_t zbak=*z;        /* 备份系数(回退用; V8 指针共享不动) */
-    int vs=(n_fit*3)/4; const float*Hin=Hc+(size_t)L*lstride;
-    if(!GS_FIN) GS_FIN=malloc((size_t)S*DIM*4);
-    /* (a) 基线: 捕获 Fin_L(算 z 特征) + per-token 基线 KL */
-    GS_CAP_L=L; GS_GV=NULL; GS_GV_L=-1;
-    float*lgb=gs_forward_from(L,Hin,ids,S,n_fit,NULL); GS_CAP_L=-1;
-    float*ms=malloc((size_t)S*4); double*kb=malloc((size_t)S*sizeof(double));
-    for(int s=0;s<S;s++){ ms[s]=1.0f; kb[s]=bwd_tok_kl(ANC.logits+(size_t)s*VOCAB,lgb+(size_t)s*VOCAB); }
-    free(lgb);
-    /* (b) per-token 最优乘子: 网格各前向一次(仅目标层 routed 缩放) */
-    const float MG[4]={0.8f,0.9f,1.1f,1.25f};
-    GS_GV=malloc((size_t)S*4); GS_GV_L=L;
-    for(int gi=0;gi<4;gi++){ float m=MG[gi];
-        for(int s=0;s<S;s++) GS_GV[s]=m;
-        float*lgc=gs_forward_from(L,Hin,ids,S,n_fit,NULL);
-        for(int s=0;s<S;s++){ double k=bwd_tok_kl(ANC.logits+(size_t)s*VOCAB,lgc+(size_t)s*VOCAB);
-            if(k<kb[s]){ kb[s]=k; ms[s]=m; } }
-        free(lgc);
-    }
-    GS_GV_L=-1; free(GS_GV); GS_GV=NULL; free(kb);
-    /* (c) 目标 new_c=m_s*·cur_c, 同特征最小二乘重拟合(fit 行) → 写入内存 z */
-    zrefit(z,ms,n_fit,GS_FIN); free(ms);
-    /* (d) 验证: 新 z 已在内存, 前向到最终, val-KL 改善才提交 */
-    float*lgv=gs_forward_from(L,Hin,ids,S,n_fit,NULL);
-    double kln=bwd_val_kl(ANC.logits,lgv,vs,n_fit); free(lgv);
-    if(kln<*kl0-1e-9){
-        zfile_commit(L,z,(float)kln);          /* ★原地改写文件 z 载荷: 内容真的变★ */
-        double imp=100.0*(*kl0-kln)/(*kl0>1e-9?*kl0:1);
-        char rs[80]; snprintf(rs,80,"最终KL %.5f→%.5f 降%.1f%%",*kl0,kln,imp);
-        mlog(L,"向后·反修",z->type==3?"z.GLdyn8 最终KL重解":z->type==2?"z.GLdyn2 最终KL重解":"z.GL 最终KL重解",
-             "已改写文件",z->type==3?36+(uint64_t)8*DIM*2:z->type==2?16:4,rs,"✓正向落地");
-        { float*lgx=gs_forward_from(L,Hin,ids,S,n_fit,Hc); free(lgx); }   /* 刷新下游 Hc[L+1..](用提交后 z) */
-        *kl0=kln; return 1;
-    } else {
-        *z=zbak;                               /* 回退内存系数(文件未动) */
-        char rs[48]; snprintf(rs,48,"最终KL=%.5f(未降)",*kl0);
-        mlog(L,"向后·反修","z 最终KL重解","已最优保持",0,rs,"保持");
-        return 0;
-    }
-}
+/* (旧逐层坐标下降版 backfit_layer_z 已删: DS4_GS_PERCOL 对照路(20-30h)独占代码,
+ * 2026-08-31 env 清退; 回扫只存联合批式 backfit_joint_round 一种语义) */
 /* ★联合批式回扫轮(2026-08-04 结构病重构)★
  * 旧逐层坐标下降 = 每层 6-7 次【全量行×全后缀】前向 ⇒ L00≈35min, 一轮 7-10h(实测掐停)。
  * 本轮结构: ①探测=每层 5 次【抽行×单层】前向(基线+4乘子网格), 判据=层出口 vs FP锚 ANC.H[L]
  * 的 per-token L2(局部, 零全程前向; 抽行/紧凑 zrefit 与 sweep 粗筛同先例) → 全部层闭式重解
  * ②终验=1 次【全量×全程】val-KL + β信赖域{1,0.5,0.25}(op_blend 向基线退) ③改善才逐层
- * zfile_commit, 否则全回退 — 判据不妥协(质量门)。一轮 ≈ 探测2-3min + 终验6min×β次。
- * DS4_GS_PERCOL=1 走旧逐层版(A/B 对照口径)。 */
+ * zfile_commit, 否则全回退 — 判据不妥协(质量门)。一轮 ≈ 探测2-3min + 终验6min×β次。 */
 static void op_blend(lop_t*dst,const lop_t*o,const lop_t*f,float b);   /* 定义在下方 β信赖域区 */
 static int backfit_joint_round(const long*ids,int S,int n_fit,const float*H0,float*Hc,size_t lstride,double*kl0){
     int vs=(n_fit*3)/4;
     size_t rowsz=(size_t)HCM*DIM;
-    int gdiv=getenv("DS4_GS_SCREEN_DIV")?atoi(getenv("DS4_GS_SCREEN_DIV")):12; if(gdiv<1)gdiv=1;
+    const int gdiv=DSQ_GS_SCREEN_DIV;   /* 与 p13 sweep 粗筛共用一份抽格密度(原两份拷贝合一) */
     int Sg=0,*gsx=malloc(sizeof(int)*(size_t)(S/gdiv+2));
     for(int s=0;s<n_fit;s+=gdiv) gsx[Sg++]=s;              /* 只抽 fit 行(zrefit 域) */
     if(!GS_FIN) GS_FIN=malloc((size_t)S*DIM*4);

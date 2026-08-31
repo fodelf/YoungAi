@@ -309,6 +309,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--dump-sel") && i+1<argc) dump_sel = argv[++i];
         else if (!strcmp(argv[i], "--load-sel") && i+1<argc) load_sel = argv[++i];
         else if (!strcmp(argv[i], "--obase-dir") && i+1<argc) obase_dir = argv[++i];
+        else if (!strcmp(argv[i], "--z-dump-dir") && i+1<argc) g_z_dump_dir = argv[++i];
         else { fprintf(stderr, "unknown arg %s\n", argv[i]); return 2; }
     }
     if (n_threads < 1) n_threads = 1;
@@ -437,7 +438,7 @@ int main(int argc, char **argv) {
             if (rc) { fprintf(stderr, "L%d: hv_solve rc=%d\n", L, rc); continue; }
             hv_fidelity(&z, delta, x_d, o_hat, n_exp, n_x, DM, &fid);  /* n_exp (not NEXP): arrays sized to n_exp -> OOB/segfault when n_exp<256 */
             /* Dump z^L {d_model,n_exp,d_l, U,V,C,b,beta,delta} as float32 for GGUF emit + ds4 apply. */
-            const char *zdir = getenv("DS4_Z_DUMP_DIR");
+            const char *zdir = g_z_dump_dir;
             if (zdir && zdir[0]) {
                 char zpath[1024];
                 snprintf(zpath, sizeof zpath, "%s/z_L%d.bin", zdir, L);

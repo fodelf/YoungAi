@@ -96,68 +96,31 @@ static float *dq_quant_expert_rowscale(const float *W,int nrows,int ncols,const 
  * μ·权重锚 Σ_j(w_j−q_j)²】。翻转 j 的增量闭式: ΔE_out = 4s·σ_j·Σ_t e_t x_tj + 4s²Σ_t x_tj²,
  * ΔE_w = 4s·σ_j·w_j·μ; ΔE<0 才翻。每轮后重解 s(rowscale 闭式)。X=NULL → 退化 rowscale。
  * μ 与 ridge-to-prior 同哲学: 样本少 → 权重锚压住输出项过拟合。 */
-static double dq_signref_mu=1.0;   /* 权重锚强度(渐进调优逐层可变, main 从 env 初始化) */
+static double dq_signref_mu=1.0;   /* 权重锚强度(渐进调优逐层可变, main 从 --signref-mu 初始化) */
 static int    dq_signref_rounds=3;
+/* signref 行子采样帽: 求的是 256-block 标量 scale+符号翻转, ~128 行统计已饱和; 帽掉
+ * fullset 抬上来的行数(量化路/导出路两处同语义共用这一份, 原 env 时代是两处裸 128)。 */
+#define DQ_SIGNREF_NACT_CAP 128
 /* _adj 核心: Yadj[n_act×nrows] 非 NULL 时, 行 r 在校准行 t 的目标从 w_r·x_t 变为
  * w_r·x_t + Yadj[t*nrows+r] —— 共适应(D3)用: base 的重解目标 = z 校正后残差
  * (Yadj = −该专家按路由权归因到的 z 份额)。μ 权重锚仍对原 FP w(先验不动)。
  * nflip 非 NULL 时累加最终符号 vs sign(w) 的翻转数(观测 base 是否真的在动)。 */
-/* B0b(2026-07-25 G1a 判决落地): 符号固定后 per-256-block scale 联合 ridge LS。
- * go1b 块 f16 槽位本就逐块存在(生产=行值复制进每块=浪费); 两层探针 −6.9%/−12.5% relF。
- * DS4_SIGNREF_BLK=1 启用(默认关=现基线)。解 (PᵀP+λI)s = Pᵀy+λs0, clamp[0,4·s0_b],
- * p_b(t)=Σ_{j∈块b} sg_j·x_tj, y(t)=w·x_t(+Yadj)。sblk 输出未经 f16 往返。 */
-static int dq_signref_blk_on(void){ static int v=-1; if(v<0) v=getenv("DS4_SIGNREF_BLK")?1:0; return v; }
-/* DS4_TGT_ALPHA∈[0,1]: GPTAQ 非对称目标强度(0=现基线只条件于漂移, 1=全额纠正累积漂移) */
-static float dq_tgt_alpha(void){ static float v=-1.0f;
-    if(v<0.0f){ const char*e2=getenv("DS4_TGT_ALPHA"); double d=e2?atof(e2):0.0;
-        if(d<0.0)d=0.0; if(d>1.0)d=1.0; v=(float)d; } return v; }
-static void dq_blk_scales_solve(const float *w,const float *X,int n_act,int ncols,
-                                const signed char *sg,const float *Yadj,int r,int nrows,
-                                double *sblk,int nblk){
-    double A[16*16],rhs[16],s0b[16],p[16];
-    if(nblk>16){ nblk=16; }
-    for(int i=0;i<nblk*nblk;i++)A[i]=0.0;
-    for(int b=0;b<nblk;b++){ rhs[b]=0.0; double m=0; int j0=b*GO1B_BLK_QK, j1=j0+GO1B_BLK_QK;
-        if(j1>ncols)j1=ncols;
-        for(int j=j0;j<j1;j++) m+= w[j]<0?-(double)w[j]:(double)w[j];
-        s0b[b]=m/(double)(j1-j0>0?j1-j0:1); }
-    for(int t=0;t<n_act;t++){
-        const float *x=X+(size_t)t*ncols; double y=0;
-        for(int b=0;b<nblk;b++){ double pb=0; int j0=b*GO1B_BLK_QK, j1=j0+GO1B_BLK_QK; if(j1>ncols)j1=ncols;
-            for(int j=j0;j<j1;j++){ double xj=x[j]; pb+= sg[j]>0?xj:-xj; y+=(double)w[j]*xj; }
-            p[b]=pb; }
-        if(Yadj) y+=(double)Yadj[(size_t)t*nrows+r];
-        for(int b=0;b<nblk;b++){ rhs[b]+=p[b]*y;
-            for(int c=b;c<nblk;c++) A[b*nblk+c]+=p[b]*p[c]; }
-    }
-    for(int b=0;b<nblk;b++)for(int c=0;c<b;c++) A[b*nblk+c]=A[c*nblk+b];
-    double tr=0; for(int b=0;b<nblk;b++) tr+=A[b*nblk+b];
-    double lam=tr/((double)n_act+1.0)/(double)nblk; double lam0=1e-9+1e-4*tr/(double)nblk; if(lam<lam0)lam=lam0;
-    for(int b=0;b<nblk;b++){ A[b*nblk+b]+=lam; rhs[b]+=lam*s0b[b]; }
-    /* Gauss-Jordan 消元(nblk≤16) */
-    for(int c2=0;c2<nblk;c2++){
-        int piv=c2; for(int rr2=c2+1;rr2<nblk;rr2++) if((A[rr2*nblk+c2]>0?A[rr2*nblk+c2]:-A[rr2*nblk+c2])>(A[piv*nblk+c2]>0?A[piv*nblk+c2]:-A[piv*nblk+c2])) piv=rr2;
-        if(piv!=c2){ for(int k=0;k<nblk;k++){ double tt=A[c2*nblk+k];A[c2*nblk+k]=A[piv*nblk+k];A[piv*nblk+k]=tt; } double tt=rhs[c2];rhs[c2]=rhs[piv];rhs[piv]=tt; }
-        double d=A[c2*nblk+c2]; if(d==0.0){ sblk[c2]=s0b[c2]; continue; }
-        for(int rr2=0;rr2<nblk;rr2++){ if(rr2==c2)continue; double f=A[rr2*nblk+c2]/d;
-            if(f!=0.0){ for(int k=c2;k<nblk;k++) A[rr2*nblk+k]-=f*A[c2*nblk+k]; rhs[rr2]-=f*rhs[c2]; } }
-    }
-    for(int b=0;b<nblk;b++){
-        double d=A[b*nblk+b]; double s= d!=0.0? rhs[b]/d : s0b[b];
-        if(s<0.0)s=s0b[b]; else if(s>4.0*s0b[b]+1e-12)s=4.0*s0b[b]+1e-12;
-        sblk[b]=s;
-    }
-}
+/* --tgt-alpha∈[0,1]: GPTAQ 非对称目标强度(0=现基线只条件于漂移, 1=全额纠正累积漂移)。
+ * 值住本头(而非 g_cli): vq_shim.c 也 include 本头, 该 TU 无 CLI, 各自拷贝默认 0=旧行为。 */
+static double dq_tgt_alpha_v=0.0;
+static float dq_tgt_alpha(void){ double d=dq_tgt_alpha_v;
+    if(d<0.0)d=0.0; if(d>1.0)d=1.0; return (float)d; }
+/* (B0b per-block scale 联合 LS 已删: DS4_SIGNREF_BLK 实验路, 无脚本设置, 2026-08-31 env 清退) */
 static float *dq_quant_expert_signref_adj(const float *W,int nrows,int ncols,const float *X,int n_act,
                                           const float *Yadj,long *nflip){
     float *wq=malloc((size_t)nrows*ncols*sizeof(float));
     if(!X||n_act<1){ free(wq); return dq_quant_expert_rowscale(W,nrows,ncols,NULL,0); }
     double MU_SCALE=dq_signref_mu;
     int ROUNDS=dq_signref_rounds;
-    /* DS4_SIGNREF_NACT_CAP: 量化路同款行子采样(第四处同型实现, 2026-07-27 profile 复采
-     * 实锤 cap 后仍 5449 采样在此) — 与 export 路完全同语义。 */
+    /* 量化路行子采样(第四处同型实现, 2026-07-27 profile 复采实锤 cap 后仍 5449 采样在此)
+     * — 与 export 路完全同语义, 帽共用 DQ_SIGNREF_NACT_CAP。 */
     float *Xsub2=NULL,*Yadjsub2=NULL;
-    {   static int cap2=-2; if(cap2==-2){ const char*c=getenv("DS4_SIGNREF_NACT_CAP"); cap2=c?atoi(c):128; }
+    {   const int cap2=DQ_SIGNREF_NACT_CAP;
         if(cap2>0&&n_act>cap2){
             int stride=n_act/cap2;
             Xsub2=malloc((size_t)cap2*ncols*sizeof(float));
@@ -213,13 +176,7 @@ static float *dq_quant_expert_signref_adj(const float *W,int nrows,int ncols,con
             }
         }
         float *o=wq+(size_t)r*ncols;
-        if(dq_signref_blk_on()){
-            int nblk2=(ncols+GO1B_BLK_QK-1)/GO1B_BLK_QK; double sb[16];
-            dq_blk_scales_solve(w,X,n_act,ncols,sg,Yadj,r,nrows,sb,nblk2);
-            for(int b=0;b<nblk2;b++){ float sf2=go1b_fp16_to_fp32(go1b_fp32_to_fp16((float)sb[b]));
-                int j0=b*GO1B_BLK_QK,j1=j0+GO1B_BLK_QK; if(j1>ncols)j1=ncols;
-                for(int j=j0;j<j1;j++) o[j]= sg[j]>0? sf2:-sf2; }
-        } else {
+        {
             float sf=go1b_fp16_to_fp32(go1b_fp32_to_fp16((float)s));
             for(int j=0;j<ncols;j++) o[j]= sg[j]>0? sf:-sf;
         }
@@ -245,12 +202,11 @@ static void dq_signref_export_adj(const float *W,int nrows,int ncols,const float
     size_t rb=go1b_blk_row_bytes(ncols);
     int nblk=(ncols+GO1B_BLK_QK-1)/GO1B_BLK_QK;
     double MU_SCALE=dq_signref_mu; int ROUNDS=dq_signref_rounds;
-    /* DS4_SIGNREF_NACT_CAP(2026-07-27 提速, 默认128): signref 求的是 256-block 标量
-     * scale+符号翻转, ~128 行统计已饱和; fullset 把 n_act 抬到 612 后本函数的手写
-     * 标量循环(∝n_act×ncols×rows×rounds)吃掉 ~70% 层时(sample 实测 14030/19k)。
-     * 均匀 stride 子采样, X/Yadj 同步; 0=不 cap。 */
+    /* 行子采样(2026-07-27 提速): fullset 把 n_act 抬到 612 后本函数的手写标量循环
+     * (∝n_act×ncols×rows×rounds)吃掉 ~70% 层时(sample 实锤 14030/19k)。
+     * 均匀 stride 子采样, X/Yadj 同步; 帽=DQ_SIGNREF_NACT_CAP(与量化路同一份)。 */
     float *Xsub=NULL,*Yadjsub=NULL;
-    {   static int cap=-2; if(cap==-2){ const char*c=getenv("DS4_SIGNREF_NACT_CAP"); cap=c?atoi(c):128; }
+    {   const int cap=DQ_SIGNREF_NACT_CAP;
         if(cap>0&&X&&n_act>cap){
             int stride=n_act/cap;
             Xsub=malloc((size_t)cap*ncols*sizeof(float));
@@ -328,12 +284,10 @@ static void dq_signref_export_adj(const float *W,int nrows,int ncols,const float
             free(sgf); free(ef); free(g1v); free(y0);
         }
         uint16_t shrow=go1b_fp32_to_fp16((float)s);
-        double sbx[16]; int blkon=dq_signref_blk_on();
-        if(blkon&&X&&n_act>=1) dq_blk_scales_solve(w,X,n_act,ncols,sg,Yadj,r,nrows,sbx,nblk);
         uint8_t *rd=out+(size_t)r*rb;
         for(int b=0;b<nblk;b++){
             uint8_t *bd=rd+(size_t)b*GO1B_BLK_BYTES;
-            uint16_t sh=(blkon&&X&&n_act>=1)?go1b_fp32_to_fp16((float)sbx[b]):shrow;
+            uint16_t sh=shrow;
             go1b_store_u16_le(bd,sh);
             uint8_t *sgb=bd+2;
             for(int k=0;k<GO1B_BLK_QK/8;k++){

@@ -83,6 +83,10 @@ size_t ds4q_quantize_chunk(ds4q_type type, const float *src, void *dst,
 void ds4q_iq2_xxs_tables(const uint64_t **grid, const int **map, const uint16_t **neighbours,
                          int *grid_size, int *map_size, int64_t *neighbours_len);
 
+/* --gpu-verify: GPU 编码后再跑一遍 CPU 编码器逐字节对拍(慢, 只用于闸门)。
+ * 解析器(deepseek4-quantize)与读点(quants.c)是不同 TU, 走这个外部 setter。 */
+void ds4q_gpu_verify_set(int on);
+
 float ds4q_f16_to_f32(uint16_t bits);
 float ds4q_bf16_to_f32(uint16_t bits);
 void ds4q_f32_to_f16_row(const float *src, uint16_t *dst, int64_t n);

@@ -24,17 +24,6 @@ static void *export_worker(void*a){
         if((e&31)==0){ char pg[24]; snprintf(pg,sizeof(pg),"%d/%d",e,NEXP);
             mlog(w->L,"量化文件","DQL2·signref字节",pg,
                  (uint64_t)NEXP*(2*w->szG+w->szD),"—","导出中"); }
-        if(bf_from_bytes()&&BFB_W2COPY){   /* ★反修导出复用(2026-08-03 用户令"反修速度"): 冷 w2=量化段字节
-                                             * 直拷(确定性同源: 同FP+同Xc+同μ10 ⇒ 同解, memcpy 使其构造性成立);
-                                             * 热=洞(VQ 载荷 vq_keep 已保), G/U=VQ 洞 ⇒ 导出塌缩为纯 IO。 */
-            int slr=(w->g2fd>0||dq_vq_on())?g2_hot_slot(w->L,e):-1;
-            if(slr<0){
-                uint8_t *dDr=w->bd?w->bd+(size_t)e*w->szD:tD;
-                memcpy(dDr,BFB_W2COPY+(size_t)e*w->szD,w->szD);
-                if(!w->bg){ if(pwrite(w->fd,dDr,w->szD,(off_t)(w->off0+2*(size_t)NEXP*w->szG+(size_t)e*w->szD))!=(ssize_t)w->szD) perror("exp-pw-d"); }
-            }
-            continue;
-        }
         char n1[160],n3[160],n2[160];
         snprintf(n1,sizeof(n1),"layers.%d.ffn.experts.%d.w1.weight",w->L,e);
         snprintf(n3,sizeof(n3),"layers.%d.ffn.experts.%d.w3.weight",w->L,e);
@@ -49,14 +38,13 @@ static void *export_worker(void*a){
         if(EXP_FIN&&EXP_IDX&&EXP_L==w->L){ afin=EXP_FIN; aidx_i=EXP_IDX; }   /* ★调优同口径 */
         else if(ANC_OK){ afin=ANC.fin+(size_t)w->L*w->S*DIM; aidx_a=ANC.ridx+(size_t)w->L*w->S*NACT; }
         if(afin){
-            /* DS4_CALIB_FULLSET: 导出段(blob g_r/GPTQ-H 的真正产地)同款全集喂入 —
+            /* --calib-fullset: 导出段(blob g_r/GPTQ-H 的真正产地)同款全集喂入 —
              * hit 过滤在 n_fit~400 时每专家仅~9行, g_r 被钉死 1.000(全模型实测)。 */
-            static int fullset2=-1; if(fullset2<0) fullset2=getenv("DS4_CALIB_FULLSET")?1:0;
+            const int fullset2=g_cli.calib_fullset;
             /* ★导出侧行帽(2026-08-09 提速定罪: 导出相位 8:48/层, 全在 per-expert 校准行
              * 矩阵乘/kmeans/GPTQ-H, 与行数线性)★: FULLSET 语义保留(全集均匀 stride 采样,
-             * 无 routed-hit 饿死), 默认帽 512; DS4_CALIB_EXPORT_CAP=0 回全集。 */
-            static int expcap=-2; if(expcap==-2){ const char*ecv=getenv("DS4_CALIB_EXPORT_CAP");
-                expcap=ecv?atoi(ecv):0; }   /* 默认0=全集(行帽实测: 速度无效+质量-0.2pt, 2026-08-09) */
+             * 无 routed-hit 饿死); --calib-export-cap 0/未传=全集(行帽实测: 速度无效+质量-0.2pt)。 */
+            const int expcap=g_cli.calib_export_cap;
             int estride=1;
             if(fullset2&&expcap>0&&w->n_fit>expcap) estride=(w->n_fit+expcap-1)/expcap;   /* ceil: 933/512→2 */
             for(int s=0;s<w->n_fit;s++){ int hit=fullset2&&(s%estride==0);
@@ -220,9 +208,9 @@ static void export_layer_file(int L,int S,int n_fit,const char*lf){
         size_t rbD=go1b_blk_row_bytes(MOEI), szD=(size_t)DIM*rbD;
         /* ★流式导出★: 旧版三块整拼 buffer=855MB 瞬时尖峰(实测在 L20 把 footprint 顶过 12G 看门狗);
          * 改为先写记录头到 1bit 载荷处 → 扩文件 → worker 按偏移并行 pwrite(3.4MB/worker), 字节布局不变。 */
-        /* ★DS4_EXPORT_BYTES=0(反修段)★: dql 不可变 — 跳过全部字节写(1bit/g2hot/dql 本体),
+        /* ★--export-bytes 0(反修段)★: dql 不可变 — 跳过全部字节写(1bit/g2hot/dql 本体),
          * 只重建 op 侧车(probe1 实锤: 反修段曾整写 dql 918M→816M, 平行架构破洞)。 */
-        int wb=!(getenv("DS4_EXPORT_BYTES")&&atoi(getenv("DS4_EXPORT_BYTES"))==0);
+        int wb=(g_cli.export_bytes!=0);
         FILE*f=wb?fopen(lf,"wb"):NULL;
         if(wb&&!f){ perror("layerfile"); return; }
         int g2k=(GO2B_HOT&&L<64)?G2_K[L]:0;   /* 本层热专家数 */
@@ -237,7 +225,7 @@ static void export_layer_file(int L,int S,int n_fit,const char*lf){
         uint32_t nbyte=0;
         for(int i=0;i<NELE;i++) if(!strcmp(ELE[i].name,"1bit")){ nbyte++;
             off_scan+=116+rec_paysz(&ELE[i],szG,szD); }
-        if(getenv("DS4_MINVOL")&&g2k>0){
+        if(g_cli.minvol&&g2k>0){
             embK=g2k;
             g2_psz=(uint64_t)g2_sidecar_hdr(embK)+2*(uint64_t)embK*szG2+(uint64_t)embK*szD2;
             off_g2_rec=off_scan; off_g2=off_g2_rec+116; off_scan=off_g2+(size_t)g2_psz; nextra++;
@@ -280,7 +268,7 @@ static void export_layer_file(int L,int S,int n_fit,const char*lf){
                     int vq_keep=0;
                     if(dq_vq_on()){
                         vq_sidecar_path(lf,L,vqpath,sizeof(vqpath));
-                        if(getenv("DS4_BWD")){
+                        if(g_cli.bwd){
                             int pf=open(vqpath,O_RDONLY);
                             if(pf>=0){ uint32_t h4[4]={0};
                                 if(read(pf,h4,16)==16&&h4[0]==VQSC_MAGIC&&h4[2]==(uint32_t)L&&h4[3]==256){

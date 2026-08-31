@@ -256,9 +256,6 @@ static int *parse_ranges(const char *s, int *n_out) {
     return v;
 }
 
-static int env_int(const char *k, int dflt) { const char *v = getenv(k); return v ? atoi(v) : dflt; }
-static double env_dbl(const char *k, double dflt) { const char *v = getenv(k); return v ? atof(v) : dflt; }
-
 /* ======================================================================== *
  *                                  main                                    *
  * ======================================================================== */
@@ -322,38 +319,55 @@ int main(int argc, char **argv) {
     }
     if (argc < 5) {
         fprintf(stderr, "用法: zlayer <hf> <layers_dir> <anchor> <L> [K=1024] [inject=1] [XCAP目录] [PREV目录]\n"
+                        "             [--gguf P] [--xanchor P] [--addon] [--cache-only]\n"
+                        "             [--ntok N=1716] [--swlim F=10] [--fta N=1] [--ge N=1]\n"
+                        "             [--gate F=0] [--ge-lam F=1e-3] [--erf N=1] [--erf-bar F=0.01] [--erf-r N=8]\n"
                         "      zlayer --selftest-rng\n");
         return 1;
     }
     const char *hf = argv[1], *ld = argv[2], *ap = argv[3];
     int L = atoi(argv[4]);
-    int K = argc > 5 ? atoi(argv[5]) : 1024;
-    int INJ = argc > 6 ? atoi(argv[6]) : 1;
-    const char *XCAP = (argc > 7 && argv[7][0] && strcmp(argv[7], "-")) ? argv[7] : NULL;
-    const char *PREV = (argc > 8 && argv[8][0] && strcmp(argv[8], "-")) ? argv[8] : NULL;
+    /* 位置参数只数到第一个 --flag 为止: 可选位置参数(K/INJ/XCAP/PREV)省略时 flag 会顶到
+     * argv[5..], 不设界会把 "--ntok" 当 K 吃掉。 */
+    int nfx = argc;
+    for (int ai = 5; ai < argc; ai++) if (!strncmp(argv[ai], "--", 2)) { nfx = ai; break; }
+    int K = nfx > 5 ? atoi(argv[5]) : 1024;
+    int INJ = nfx > 6 ? atoi(argv[6]) : 1;
+    const char *XCAP = (nfx > 7 && argv[7][0] && strcmp(argv[7], "-")) ? argv[7] : NULL;
+    const char *PREV = (nfx > 8 && argv[8][0] && strcmp(argv[8], "-")) ? argv[8] : NULL;
 
-    /* 二期支路开关。.py 是权威, 三条都照抄它的口径:
-     *   _GG   = DS4_ZL_GGUF 有值即开(空串视为关, 与 py 的 `if _GG:` 同);
-     *   XAP   = DS4_ZL_XANCHOR;
-     *   ADDON = DS4_ZL_ADDON, 但 py 把它的读取整块写在 `if XAP:` 里面 —— 没 XANCHOR 时
-     *           ADDON 是死的。这里不"修正", 只多打一行提示。 */
-    const char *GGP = getenv("DS4_ZL_GGUF"); if (GGP && !*GGP) GGP = NULL;
-    const char *XAP = getenv("DS4_ZL_XANCHOR"); if (XAP && !*XAP) XAP = NULL;
-    const char *ADDON = NULL;
-    if (XAP) { ADDON = getenv("DS4_ZL_ADDON"); if (ADDON && !*ADDON) ADDON = NULL; }
-    else if (getenv("DS4_ZL_ADDON") && *getenv("DS4_ZL_ADDON"))
-        printf("  L%d 提示: 设了 DS4_ZL_ADDON 但没设 DS4_ZL_XANCHOR — .py 里 ADDON 的读取整块"
+    /* 二期支路与解算参数。原 DS4_ZL_* env(2026-08-31 禁 env 铁律清退), 现为跟在位置参数
+     * 后的 --flag; 缺省值 = 原 env 不设时的行为, 逐个未动。ADDON 的"没 XANCHOR 就不生效"
+     * 是 .py 权威口径(它把 ADDON 的读取整块写在 if XAP: 里面), 不"修正", 只多打一行提示。 */
+    const char *GGP = NULL, *XAP = NULL;
+    int ADDON = 0, CACHE_ONLY = 0;
+    int NTOK = 1716, FTA = 1, GE_ON = 1, ERF_EN = 1, ERF_RANK = 8;
+    float SWLIM = 10.0f;
+    double GATE = 0.0, GELAM = 1e-3, ERF_BAR = 0.01;
+    for (int ai = nfx; ai < argc; ai++) {
+        const char *a = argv[ai];
+        const char *v = (ai + 1 < argc) ? argv[ai + 1] : NULL;
+        if      (!strcmp(a, "--addon"))      ADDON = 1;
+        else if (!strcmp(a, "--cache-only")) CACHE_ONLY = 1;
+        else if (!v) die("flag %s 缺值", a);
+        else if (!strcmp(a, "--gguf"))    { GGP = *v ? v : NULL; ai++; }
+        else if (!strcmp(a, "--xanchor")) { XAP = *v ? v : NULL; ai++; }
+        else if (!strcmp(a, "--ntok"))    { NTOK = atoi(v); ai++; }
+        else if (!strcmp(a, "--swlim"))   { SWLIM = (float)atof(v); ai++; }
+        else if (!strcmp(a, "--fta"))     { FTA = atoi(v); ai++; }
+        else if (!strcmp(a, "--ge"))      { GE_ON = atoi(v); ai++; }
+        else if (!strcmp(a, "--gate"))    { GATE = atof(v); ai++; }
+        else if (!strcmp(a, "--ge-lam"))  { GELAM = atof(v); ai++; }
+        else if (!strcmp(a, "--erf"))     { ERF_EN = atoi(v); ai++; }
+        else if (!strcmp(a, "--erf-bar")) { ERF_BAR = atof(v); ai++; }
+        else if (!strcmp(a, "--erf-r"))   { ERF_RANK = atoi(v); ai++; }
+        else die("不认识的 flag: %s", a);
+    }
+    if (ADDON && !XAP) {
+        printf("  L%d 提示: 给了 --addon 但没给 --xanchor — .py 里 ADDON 的读取整块"
                "嵌在 if XAP: 内, 此时不生效, 本次照 .py 走非叠加路\n", L);
-
-    const int NTOK = env_int("DS4_ZL_NTOK", 1716);
-    const int CACHE_ONLY = (getenv("DS4_ZL_CACHE_ONLY") &&
-                            strcmp(getenv("DS4_ZL_CACHE_ONLY"), "") &&
-                            strcmp(getenv("DS4_ZL_CACHE_ONLY"), "0")) ? 1 : 0;
-    const float SWLIM = (float)env_dbl("DS4_ZL_SWLIM", 10.0);
-    const int FTA = env_int("DS4_ZL_FTA", 1);
-    const int GE_ON = env_int("DS4_ZL_GE", 1);
-    const double GATE = env_dbl("DS4_ZL_GATE", 0.0);
-    const double GELAM = env_dbl("DS4_ZL_GE_LAM", 1e-3);
+        ADDON = 0;
+    }
     char path[1200];
 
     if (INJ == 2) {   /* 外挂模式断点续跑: zrec 已在则整层跳过(解算也省) */

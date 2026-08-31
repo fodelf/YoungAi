@@ -37,7 +37,12 @@ static int vq_w2_dim(void); static int vq_w2_nc(void);
  * = 平权, 86G 预算下分配器无处可花钱, 专家分档实验根本跑不起来。现由计划表 hotdim/hotnc
  * 决定, 缺省仍是 4/512 ⇒ 所有历史 rplan 文件行为逐字节不变。 */
 static int vq_hot_dim(void); static int vq_hot_nc(void);
-static int dq_vq_on(void){ static int v=-1; if(v<0) v=getenv("DS4_VQ")?1:0; return v; }
+/* --vq 请求位(原 DS4_VQ env, 2026-08-31 禁 env 铁律清退): ds4quant_run 与
+ * deepseek4-quantize 都是单 TU 且各自 include 本头 → 头内 static 即进程内共享,
+ * 各自的 CLI 解析器在解析期调 setter 置位, 之后所有读点走 dq_vq_on()。 */
+static int dq_vq_requested=0;
+static inline void dq_vq_set(int on){ dq_vq_requested=on?1:0; }
+static int dq_vq_on(void){ return dq_vq_requested; }
 
 #include "vq_qc_bytes.h"   /* vq_idx_bytes / vq_payload_bytes: 与体积分配器共用同一份字节账 */
 
@@ -72,16 +77,14 @@ static void vq_assign_q(const float *V,int nv,int dim,const float *C,int nc,int 
     free(c2);free(G);free(vtmp);
 }
 
-/* 段计时(DS4_VQ_TIMING=1): kmeans/GPTQ/g_r 三段全局累计秒, 收官打一行(GPU 化热点归因) */
-static double g_vqt[8]; static int g_vqt_on=-1;
+/* vqt_now: 单调时钟。名字是段计时时代的遗产, 但 ds4quant_run 的 BFLT 段账/层账全用它,
+ * 是共享基元不是诊断(诊断累计 g_vqt/DS4_VQ_TIMING 已随禁 env 铁律删除)。 */
 #include <time.h>
 static double vqt_now(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return ts.tv_sec+ts.tv_nsec*1e-9; }
 /* ---- 编码: kmeans(步长子采样,8轮) + GPTQ 列组反馈 + 行乘子; 输出码本/索引/g_r + dequant ---- */
 static void vq_encode_full(const float *W,int rows,int cols,int dim,int nc,
                            const float *X,int n_act,
                            float *Cb_out,int *idx_out,float *gr_out,float *Wq_opt){
-    if(g_vqt_on<0) g_vqt_on=getenv("DS4_VQ_TIMING")?1:0;
-    double vt0=g_vqt_on?vqt_now():0;
     size_t N=(size_t)rows*cols; int nv=(int)(N/dim);
     int nsub=nv<200000?nv:200000, stride=nv/nsub;
     float *sub=malloc((size_t)nsub*dim*4);
@@ -100,17 +103,13 @@ static void vq_encode_full(const float *W,int rows,int cols,int dim,int nc,
             for(int d=0;d<dim;d++) C[(size_t)c*dim+d]=(float)(acc[(size_t)c*dim+d]/cnt[c]);
     }
     free(sub);free(ai);free(acc);free(cnt);
-    if(g_vqt_on){ double t=vqt_now(); g_vqt[0]+=t-vt0; vt0=t; }   /* 多线程累计有竞争, 计时近似可容忍 */
     /* f16 往返码本(与存储一致再分配) */
     for(int i=0;i<nc*dim;i++) C[i]=go1b_fp16_to_fp32(go1b_fp32_to_fp16(C[i]));
     int grp=128;
     float *Wk=malloc((size_t)rows*grp*4),*seg=malloc((size_t)rows*dim*4);
     int *sidx=malloc((size_t)rows*sizeof(int));
     double *H=malloc((size_t)grp*grp*8),*Hi=malloc((size_t)grp*grp*8);
-    /* ★快档旋钮(2026-08-09 用户令"开档验证")★: DS4_VQ_NOFB=1 关 GPTQ 列组误差反馈
-     * (编码退化为单遍最近邻, ~17×省时); g_r 行乘子不受影响(仍用 X 校准)。 */
-    static int nofb=-1; if(nofb<0) nofb=getenv("DS4_VQ_NOFB")?1:0;
-    float *XbT=(!nofb&&X&&n_act>0)?malloc((size_t)grp*n_act*4):NULL;
+    float *XbT=(X&&n_act>0)?malloc((size_t)grp*n_act*4):NULL;
     float *Wq=Wq_opt?Wq_opt:malloc(N*4); int own=Wq_opt?0:1;
 #ifdef DS4QUANT_CUDA
     /* v3 全矩阵批量(08-18): 组间独立 → 先算全部组 Hi(H cublas 逐组+CPU inv), 再一次
@@ -122,7 +121,6 @@ static void vq_encode_full(const float *W,int rows,int cols,int dim,int nc,
             Hi_all=malloc((size_t)ngrp*grp*grp*8); fb_all=1;
             for(int gi=0;gi<ngrp&&fb_all;gi++){
                 const int j0=gi*grp;
-                double gt0=g_vqt_on?vqt_now():0;
                 for(int j=0;j<grp;j++) for(int t=0;t<n_act;t++) XbT[(size_t)j*n_act+t]=X[(size_t)t*cols+j0+j];
                 { float *Hf=malloc((size_t)grp*grp*4);
                   dq_matmul(XbT,XbT,Hf,grp,n_act,grp);
@@ -130,9 +128,7 @@ static void vq_encode_full(const float *W,int rows,int cols,int dim,int nc,
                   free(Hf); }
                 double dm=0; for(int i=0;i<grp;i++) dm+=H[(size_t)i*grp+i]; dm/=grp;
                 for(int i=0;i<grp;i++) H[(size_t)i*grp+i]+=0.02*(dm+1e-9);
-                if(g_vqt_on){ double t=vqt_now(); g_vqt[3]+=t-gt0; gt0=t; }
                 if(g2_inv(H,grp,Hi_all+(size_t)gi*grp*grp)!=0) fb_all=0;
-                if(g_vqt_on){ g_vqt[4]+=vqt_now()-gt0; }
             }
         }
         float *WkF=malloc((size_t)rows*cols*4);
@@ -140,9 +136,7 @@ static void vq_encode_full(const float *W,int rows,int cols,int dim,int nc,
         static __thread int *sidx_f=NULL; static __thread int sf_cap=0;
         const int nsegs=cols/dim;
         if(sf_cap<rows*nsegs){ free(sidx_f); sidx_f=malloc((size_t)rows*nsegs*sizeof(int)); sf_cap=rows*nsegs; }
-        double gk0=g_vqt_on?vqt_now():0;
         vqg_gptq_full(WkF,C,Hi_all,rows,cols,grp,dim,nc,fb_all,sidx_f);
-        if(g_vqt_on){ g_vqt[5]+=vqt_now()-gk0; }
         for(size_t i=0;i<(size_t)rows*nsegs;i++){
             const int c=sidx_f[i];
             idx_out[i]=c;
@@ -154,7 +148,6 @@ static void vq_encode_full(const float *W,int rows,int cols,int dim,int nc,
 #endif
     for(int j0=0;j0<cols;j0+=grp){
         int g=cols-j0<grp?cols-j0:grp; int ok=0;
-        double gt0=g_vqt_on?vqt_now():0;
         if(XbT){
             for(int j=0;j<g;j++) for(int t=0;t<n_act;t++) XbT[(size_t)j*n_act+t]=X[(size_t)t*cols+j0+j];
             /* H=XbT·XbTᵀ 改走 dq_matmul(GPU 化 2026-08-18): 原手写标量三重循环
@@ -166,9 +159,7 @@ static void vq_encode_full(const float *W,int rows,int cols,int dim,int nc,
               free(Hf); }
             double dm=0; for(int i=0;i<g;i++) dm+=H[(size_t)i*g+i]; dm/=g;
             for(int i=0;i<g;i++) H[(size_t)i*g+i]+=0.02*(dm+1e-9);
-            if(g_vqt_on){ double t=vqt_now(); g_vqt[3]+=t-gt0; gt0=t; }
             ok=g2_inv(H,g,Hi)==0;
-            if(g_vqt_on){ double t=vqt_now(); g_vqt[4]+=t-gt0; gt0=t; }
         }
         for(int r=0;r<rows;r++) memcpy(Wk+(size_t)r*g,W+(size_t)r*cols+j0,(size_t)g*4);
 #ifdef DS4QUANT_CUDA
@@ -178,9 +169,7 @@ static void vq_encode_full(const float *W,int rows,int cols,int dim,int nc,
             const int nseg2=g/dim;
             static __thread int *sidx_g=NULL; static __thread int sg_cap=0;
             if(sg_cap<rows*nseg2){ free(sidx_g); sidx_g=malloc((size_t)rows*nseg2*sizeof(int)); sg_cap=rows*nseg2; }
-            if(g_vqt_on) gt0=vqt_now();
             vqg_gptq_group(Wk,C,Hi,rows,g,dim,nc,ok,sidx_g);
-            if(g_vqt_on){ g_vqt[5]+=vqt_now()-gt0; }
             for(int s2=0;s2<nseg2;s2++){ const int jj=s2*dim;
                 for(int r=0;r<rows;r++){ const int c=sidx_g[(size_t)r*nseg2+s2];
                     idx_out[((size_t)r*cols+j0+jj)/dim]=c;
@@ -209,7 +198,6 @@ static void vq_encode_full(const float *W,int rows,int cols,int dim,int nc,
 gptq_done:
 #endif
     free(Wk);free(seg);free(sidx);free(H);free(Hi); if(XbT)free(XbT);
-    if(g_vqt_on){ double t=vqt_now(); g_vqt[1]+=t-vt0; vt0=t; }
     /* 行乘子 g_r(闭式 ridge) + f16 往返 */
     if(X&&n_act>=8){
         float *P=malloc((size_t)n_act*rows*4),*Y=malloc((size_t)n_act*rows*4);
@@ -226,9 +214,6 @@ gptq_done:
         free(P);free(Y);
     } else for(int r=0;r<rows;r++) gr_out[r]=1.0f;
     if(own) free(Wq);
-    if(g_vqt_on){ g_vqt[2]+=vqt_now()-vt0;
-        static int vq_n=0;
-        if((++vq_n&255)==0) fprintf(stderr,"[vqt] kmeans=%.0fs gptq=%.0fs gr=%.0fs | 转置H=%.0fs inv=%.0fs 组核=%.0fs (n=%d)\n",g_vqt[0],g_vqt[1],g_vqt[2],g_vqt[3],g_vqt[4],g_vqt[5],vq_n); }
 }
 
 /* ---- 打包/解包 ---- */
@@ -361,10 +346,10 @@ static float *dq_quant_expert_vq(const float *W,int nrows,int ncols,const float 
 /* ── 战役期 API 重建(2026-08-09: git checkout 误覆盖未提交现版, 按主文件调用面重建;
  *    验收闸 = r30_campaign.sh probe1 复现 cos=0.9699 / held=0.0668 / vq md5=4843132e…) ── */
 extern int g_vq_dim, g_vq_nc;   /* rplan 逐层档位全局(主文件 vq_rplan 写入) */
-static int vq_cold_dim(void){ if(g_vq_dim) return g_vq_dim;
-    const char*e=getenv("DS4_VQ_COLD_DIM"); return e?atoi(e):8; }
-static int vq_cold_nc(void){ if(g_vq_nc) return g_vq_nc;
-    const char*e=getenv("DS4_VQ_COLD_NC"); return e?atoi(e):256; }
+/* 冷档 8 维/256 码 = 2.25bpw 的既有定数(改它 = 换盘上格式, 侧车偏移表全体挪位);
+ * 原 DS4_VQ_COLD_DIM/NC 两个 env 从无活脚本设过, 2026-08-31 随禁 env 铁律写死。 */
+static int vq_cold_dim(void){ return g_vq_dim?g_vq_dim:8; }
+static int vq_cold_nc(void){ return g_vq_nc?g_vq_nc:256; }
 /* 顺序补偿变体: 调用侧已传量化态 hidden(hc), 每行输出匹配闭式缩放本就烘在
  * vq_encode_full 的 g_r 段 → 与非 seq 同实现, flag 仅语义标注。 */
 static float *vq_export_matrix_seq(const float*W,int rows,int cols,const float*X,int n_act,

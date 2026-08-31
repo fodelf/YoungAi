@@ -7,18 +7,16 @@
  *      → 量化遍逐层打印【累积】偏差(H_q vs anchor H_fp)+路由一致率, 结束打 VERDICT(Σmin/KL/PPL 主判据)。
  *
  * 机制:
- *   - FP 锚定遍只跑一次, 缓存到 DS4_ANCHOR(默认 /tmp/ds4quant_anchor.bin): 每层 MoE 输入 Fin_fp、
+ *   - FP 锚定遍只跑一次, 缓存到 --anchor(默认 /tmp/ds4quant_anchor.bin): 每层 MoE 输入 Fin_fp、
  *     FP 路由、每层出口 H_fp、最终 logits。之后所有配置验证只跑量化遍。
- *   - DS4_LCFG 逐层档位(NL 字符或 1 字符广播): F=不量化 n=朴素1bit 1=joint1bit(块scale,1.0625b)
+ *   - --lcfg 逐层档位(NL 字符或 1 字符广播): F=不量化 n=朴素1bit 1=joint1bit(块scale,1.0625b)
  *     r=行scale1bit(1.0052b, 纯1bit体积主线) z=1bit+低秩 2=1bit+Q2 3=1bit+Q2+Q3。
- *     便捷: DS4_INJECT=L(只 L 层量化, 其余 F; F 前缀直接从 anchor 恢复跳过) / DS4_SPARE=L(只 L 层保 F)。
  *     全 F 配置是框架自检: VERDICT 必须 ratio=1.0000/Σmin≈1。
- *   - 专家循环 pthread 并行(DS4_THREADS) + Accelerate sgemm(ds4quant_fwd.c) → 单配置分钟级。
- *   - DS4_ABLATE=1 恢复旧 4 档局部消融表(慢, 诊断用); DS4_LOCAL_Q=0 可关每层局部 R²。
+ *   - 专家循环 pthread 并行(--threads) + Accelerate sgemm(ds4quant_fwd.c) → 单配置分钟级。
  *
  * 编译: cc -O3 -lm -framework Accelerate -I<repo根> ds4quant_run.c -o ds4quant_run -lpthread
- * 用法: DS4_HF=... ./ds4quant_run [ids_file=/tmp/rr_hard.ids] [ntok=64]
- *       (还原率铁律: 判决用硬多样文本 rr_hard.ids; Σmin/KL/PPL 为主, top1 仅参考)
+ * 用法: ./ds4quant_run [ids_file=/tmp/rr_hard.ids] [ntok=64] --hf <dir> [--flag ...]
+ *       (全部旋钮见 ds4quant_cli.inc.c 的表; 还原率铁律: 判决用硬多样文本 rr_hard.ids)
  */
 #ifdef __linux__
 #include <malloc.h>   /* mallopt: 分配器设置写进代码, 不走 env(2026-08-22 铁律); glibc 专属, macOS 无此接口 */
@@ -42,27 +40,19 @@
 #ifdef __APPLE__
 #include <mach/mach.h>   /* 内存自报: task_info phys_footprint(看门狗同口径) */
 #endif
-static int   ZRANK=16;        /* z 最大秩 (DS4_Z_RANK; 遗留 z 工具用) */
-static float ZLAMBDA=0.1f;    /* ridge (无量纲, DS4_Z_LAMBDA) = L_fixed 锚 */
-static int   NLAYERS=43;      /* 前向层数上限 (DS4_NL; <43 绝对PPL无效, 相对指标同深度仍可比) */
-static int   ZK=16;           /* 低秩档 'z' 的秩 (DS4_ZK) */
-static int   NTHREADS=8;      /* 专家循环并行度 (DS4_THREADS) */
-static int   ABLATE=0;        /* DS4_ABLATE: 每量化层附带旧 4 档局部消融(慢) */
-static int   LOCALQ=1;        /* DS4_LOCAL_Q: 每量化层局部 R²(选定档, held 行) */
-static int   LZRANK=0;        /* DS4_LZ: 逐层动态 z^L 最大秩(0=关): 序贯锚定回拉+四损失选秩 */
-static float LZLAMBDA=1.0f;   /* DS4_LZ_LAMBDA: z^L ridge(比全局 ZLAMBDA 紧; gz首跑过拟合链式反应教训) */
-static float LZTR=0.5f;       /* DS4_LZ_TR: 信赖域 — 每 token ‖z(Fin)‖≤TR·‖Fout‖, 防把激活拉出流形 */
+static int   ZRANK=16;        /* z 最大秩(遗留 z 工具用; 2026-08-31 起写死, env 旋钮已清退) */
+static float ZLAMBDA=0.1f;    /* ridge (无量纲) = L_fixed 锚 */
+static int   NLAYERS=43;      /* 前向层数上限 (--nl; <43 绝对PPL无效, 相对指标同深度仍可比) */
+static int   ZK=16;           /* 低秩档 'z' 的秩(写死) */
+static int   NTHREADS=8;      /* 专家循环并行度 (--threads) */
+static int   LZRANK=0;        /* 逐层动态 z^L 最大秩(0=关): --coadapt>0 时升 DSQ_COADAPT_LZRANK */
+static float LZLAMBDA=1.0f;   /* z^L ridge(比全局 ZLAMBDA 紧; gz首跑过拟合链式反应教训) */
+static float LZTR=0.5f;       /* 信赖域 — 每 token ‖z(Fin)‖≤TR·‖Fout‖, 防把激活拉出流形 */
 static long  LZ_TOTAL_K=0;    /* Σk_L (侧车体积账) */
-static int   COADAPT=0;       /* DS4_COADAPT: 每层 base(w2)↔z 交替闭式共适应轮数(0=关=原路径不变) */
-/* ★反修字节起步(2026-08-03 用户令"提速"): 冷专家基座=量化段盘上字节 dequant(部署口径,
- * 免重编码 480 冷 VQ + 240 冷 w2 重解); 热/D3/菜单/z/GSWEEP 反修本职照常。层入口 arm, 导出前 free。 */
-static const uint8_t *BFB_VQMAP=NULL; static size_t BFB_VQMSZ=0;
-static const uint8_t *BFB_W2=NULL;    static size_t BFB_SZD=0;
-static uint8_t *BFB_W2COPY=NULL;      /* 冷 w2 字节快照(导出直拷; mmap 先释放故需持有副本) */
-static int bf_from_bytes(void){ static int v=-1; if(v<0) v=getenv("DS4_BF_FROM_BYTES")?1:0; return v; }
+static int   COADAPT=0;       /* --coadapt: 每层 base(w2)↔z 交替闭式共适应轮数(0=关=原路径不变) */
 static time_t TUNE_T0=0;      /* 全程计时起点 */
-static double TUNE_MIN=0;     /* DS4_TUNE_MIN: 总时间预算(分钟, 0=不限) */
-static int FAST=0;            /* DS4_FAST: 快速走流程(QC 5→1 变体, co_rounds 512→2 轮封顶, 不向前修复=逐层反修跳过); 验流程非出质量 */
+static double TUNE_MIN=0;     /* --tune-min: 总时间预算(分钟, 0=不限) */
+static int FAST=0;            /* --fast: 快速走流程(QC 5→1 变体, co_rounds 512→2 轮封顶, 不向前修复=逐层反修跳过); 验流程非出质量 */
 static time_t CO_LT0=0;       /* 当前层调优起点 */
 static double TUNE_LSEC=0;    /* 每层调优死线(秒)=总预算/量化层数; 超时→该层落当前累计最优 */
 static int tune_over(void){
@@ -116,18 +106,7 @@ static void hb64(uint64_t n,char*b,size_t bs){
     else if(n>=1024) snprintf(b,bs,"%.1fKB",(double)n/1024.0);
     else snprintf(b,bs,"%lluB",(unsigned long long)n);
 }
-/* 最小 npy v1 写出(f32 C-order, 64 对齐) — corr 重建门 X/R 捕获用 */
-static void xr_npy(const char*p,const float*A,int n,int d){
-    FILE*f=fopen(p,"wb"); if(!f){ perror(p); return; }
-    char hdr[128]; int hl=snprintf(hdr,sizeof(hdr),"{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }",n,d);
-    int total=10+hl, pad=((total+63)/64)*64-total;
-    unsigned short hlen=(unsigned short)(hl+pad);
-    fwrite("\x93NUMPY\x01\x00",1,8,f); fwrite(&hlen,2,1,f);
-    fwrite(hdr,1,(size_t)hl,f);
-    for(int i=0;i<pad-1;i++) fputc(' ',f);
-    fputc('\n',f);
-    fwrite(A,4,(size_t)n*d,f); fclose(f);
-}
+/* (xr_npy 捕获器已删: DS4_BF_DUMPXR 诊断路 2026-08-31 env 清退) */
 static void mlog(int L,const char*elem,const char*algo,const char*prog,uint64_t vol,
                  const char*restore,const char*verdict){
     char vb[24]; hb64(vol,vb,sizeof(vb));
@@ -307,7 +286,7 @@ static LW *lw32_get(int L,const LWH*H){
 }
 static LWH *GS_LW=NULL;        /* 回扫/反修: 全43层骨干 fp16 缓存(只加载一次, 前向按层临时展开) */
 /* ★内存卫兵★: 实测斜率 0.281GB/层(fp16 0.217 + 杂项), 外推 L38 必撞 11.5G 看门狗 →
- * 超预算(DS4_BF_MEMGB, 默认9.5)驱逐最低层号的 fp16 缓存; 被驱逐层前向时临时从 HF 重载(慢~0.6s/访, 换到头)。*/
+ * 超预算(--bf-memgb, 默认=物理内存一半)驱逐最低层号的 fp16 缓存; 被驱逐层前向时临时从 HF 重载(慢~0.6s/访, 换到头)。*/
 #ifdef __APPLE__
 static double mem_gb(void){ task_vm_info_data_t vi; mach_msg_type_number_t vc=TASK_VM_INFO_COUNT;
     if(task_info(mach_task_self(),TASK_VM_INFO,(task_info_t)&vi,&vc)!=KERN_SUCCESS) return 0;
@@ -339,9 +318,9 @@ static double dq_host_ram_gb(void) {
 }
 /* ★别写死 9.5★(2026-08-27): 这是 16GiB Mac 时代的预算。超预算就驱逐 fp16 层缓存, 该层
  * 下次被访问时从 HF 盘重载(~0.6s/访) —— 在 121GiB 机器上等于"内存明明够, 却坚持走盘"。
- * 改为物理内存的一半(spark≈60GiB, 旧 16G 机上≈8GiB 与原值同量级), DS4_BF_MEMGB 仍可覆盖。 */
+ * 改为物理内存的一半(spark≈60GiB, 旧 16G 机上≈8GiB 与原值同量级), --bf-memgb 仍可覆盖。 */
 static double BF_MEMGB_init(void){ return dq_host_ram_gb() * 0.5; }
-static double BF_MEMGB=0;   /* 0=未初始化, 首次 mem_evict 时由 BF_MEMGB_init 填(见 p14 env 覆盖) */
+static double BF_MEMGB=0;   /* 0=未初始化, 首次 mem_evict 时由 BF_MEMGB_init 填(见 p14 flag 覆盖) */
 static void lwh_free(LWH*H);
 static void gs_lw_evict(int upto){   /* 驱逐 [0,upto) 里已缓存的最低层, 直到回预算 */
     if(!GS_LW) return;

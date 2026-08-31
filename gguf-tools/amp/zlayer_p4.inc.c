@@ -290,14 +290,6 @@
      * 读不到就死, 不许退回"按行号切"—— 那正是出事的默认。 */
     if (row_layout_split(ap, &tr, &ntr, &ev, &nev) != 0)
         die("行布局缺 %s.layout — 先跑 amp_campaign.sh idshalf(补布局) 与 anchors3(随锚落一份)", ap);
-    if (0) {
-        int NF = env_int("DS4_ZL_NFIT", 1287);
-        ntr = NF; nev = NTOK - NF;
-        tr = (int *)xmalloc((size_t)ntr * sizeof(int));
-        ev = (int *)xmalloc((size_t)(nev > 0 ? nev : 1) * sizeof(int));
-        for (int i = 0; i < ntr; i++) tr[i] = i;
-        for (int i = 0; i < nev; i++) ev[i] = NF + i;
-    }
     for (int i = 0; i < ntr; i++) if (tr[i] < 0 || tr[i] >= NTOK) die("fit 行号 %d 越界", tr[i]);
     for (int i = 0; i < nev; i++) if (ev[i] < 0 || ev[i] >= NTOK) die("ev 行号 %d 越界", ev[i]);
 

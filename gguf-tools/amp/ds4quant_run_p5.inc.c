@@ -204,7 +204,7 @@ static void coadapt_moe(int L,int S,int n_fit,const float*Fin,const int*idx,cons
     STK_DYN=0; STK8_ON=0;                    /* 层间清零(修 L1+ 乱序: PCA方向/动态参数不跨层复用) */
     if(STK8_V8){ free(STK8_V8); STK8_V8=NULL; }
     if(STK_CLSV){ free(STK_CLSV); STK_CLSV=NULL; }
-    if(getenv("DS4_LAYER_DIR")){   /* 导出口径=调优口径: 存本层累积激活+实际路由 */
+    if(g_cli.layer_dir){   /* 导出口径=调优口径: 存本层累积激活+实际路由 */
         if(!EXP_FIN) EXP_FIN=malloc((size_t)S*DIM*4);
         if(!EXP_IDX) EXP_IDX=malloc((size_t)S*NACT_RT*sizeof(int));
         memcpy(EXP_FIN,Fin,(size_t)S*DIM*4);
@@ -228,7 +228,7 @@ static void coadapt_moe(int L,int S,int n_fit,const float*Fin,const int*idx,cons
     };
     /* FAST: 只跑首个变体走流程; VQ 模式: μ 只剩冷 w2 一处消费, 5 配置全层重量化=4/5 空转
      * (VQ 编码单价又是 signref 3-5×), 裁到单配置 μ10×3(生产惯用中档) */
-    const int nqc=(FAST||dq_vq_on()||getenv("DS4_MINVOL"))?1:(int)(sizeof(QC)/sizeof(QC[0]));   /* minvol: g10 定稿单配置(g10=历史最优代表, 13.4→~3min/层) */
+    const int nqc=(FAST||dq_vq_on()||g_cli.minvol)?1:(int)(sizeof(QC)/sizeof(QC[0]));   /* minvol: g10 定稿单配置(g10=历史最优代表, 13.4→~3min/层) */
     const uint64_t QVOL=(uint64_t)NEXP*(2*(uint64_t)MOEI*go1b_blk_row_bytes(DIM)+(uint64_t)DIM*go1b_blk_row_bytes(MOEI));
     int qbest=-1; double qsc=1e300,qv=0,qh=0,qf=0; long nflip=0;
     double bfit,bval,bheld,scb;
@@ -342,34 +342,5 @@ static void coadapt_moe(int L,int S,int n_fit,const float*Fin,const int*idx,cons
       }
       free(gt);
     }
-    /* ZL: 加法低秩 — 用户裁决删除加法元素(2026-07-11), 默认关, DS4_ADD_FORMS=1 可复活 */
-    if(getenv("DS4_ADD_FORMS")){ ds4_loss_dim_variance(DF,(uint32_t)(vs>0?vs:1),(uint32_t)DIM,colw);
-      double m=0; for(int j=0;j<DIM;j++) m+=colw[j]; m/=DIM; if(m<1e-30)m=1e-30;
-      for(int j=0;j<DIM;j++){ colw[j]=(float)(colw[j]/m); if(colw[j]<0.05f)colw[j]=0.05f; }
-      const double ZLAM[2]={1,10};
-      for(int li=0;li<2;li++){
-        ds4_z *zl=z_solve_fourloss(Fin,DF,vs,DIM,DIM,16,(float)ZLAM[li],colw,vs,0.25f,0x51F0F00DULL+li);
-        if(!zl) continue;
-        int kp = nval>0 ? z_pick_rank(zl,Fin+(size_t)vs*DIM,DF+(size_t)vs*DIM,nval,DIM,NULL,NULL,NULL,NULL) : 4;
-        int ks[2]={kp,4}; float *zd=malloc((size_t)DIM*4);
-        for(int ki=0;ki<2;ki++){ int k=ks[ki];
-            if(k<1||(ki==1&&ks[0]==4)) continue;
-            ds4_z_set_rank(zl,(uint32_t)k);
-            memcpy(Ftest,Fcur,(size_t)S*DIM*4);
-            for(int s=0;s<S;s++){
-                memset(zd,0,(size_t)DIM*4); ds4_z_apply(zl,Fin+(size_t)s*DIM,zd);
-                double nd=0,nf=0; const float*fo=Fcur+(size_t)s*DIM;
-                for(int d2=0;d2<DIM;d2++){ nd+=(double)zd[d2]*zd[d2]; nf+=(double)fo[d2]*fo[d2]; }
-                nd=sqrt(nd); nf=sqrt(nf); double cap=LZTR*nf; float s2=1.0f;
-                if(nd>cap&&nd>0) s2=(float)(cap/nd);
-                float*fw=Ftest+(size_t)s*DIM;
-                for(int d2=0;d2<DIM;d2++) fw[d2]+=s2*zd[d2];
-            }
-            co_eval(Ftest,H2,post2,comb2,Hf,Hq,S,vs,n_fit,rowsz,&fitr,&valr,&heldr,&sc);
-            printf("SEARCH L=%d ZL λ=%-3g k=%-2d val=%.4f(%+.1f%%) held=%.4f(%+.2f%%) fit=%.4f sc=%.5g\n",
-                   L,ZLAM[li],k,valr,100*(valr-bval)/bval,heldr,100*(heldr-bheld)/bheld,fitr,sc);
-            CK("ZL",ZLAM[li],0,k);
-        }
-        free(zd); ds4_z_free(zl);
-      }
-    }
+    /* (ZL 加法低秩菜单已删: 用户裁决删除加法元素(2026-07-11)后仅存 DS4_ADD_FORMS 复活口,
+     * 无脚本设置, 2026-08-31 env 清退连同独占代码一并移除) */

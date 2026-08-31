@@ -2,7 +2,7 @@
  * See onebit_quant.h for the authoritative byte layout and the per-row scale math. */
 
 #include "onebit_quant.h"
-#include <stdlib.h>   /* getenv for the per-block-scale toggle */
+#include <stdlib.h>
 
 size_t go1b_row_bytes(int64_t ncols) {
     if (ncols <= 0) return sizeof(uint16_t); /* scale only; no sign words */
@@ -84,11 +84,6 @@ size_t go1b_blk_quantize(const float *src, void *dst, int64_t nrows, int64_t nco
     const int64_t nblocks  = (ncols > 0) ? (ncols + GO1B_BLK_QK - 1) / GO1B_BLK_QK : 0;
     const size_t  row_bytes = (size_t)nblocks * GO1B_BLK_BYTES;
     uint8_t *out = (uint8_t *)dst;
-    /* DS4_GO1B_PER_BLOCK: each 256-block carries its OWN scale = mean(|w|) over that
-     * block (finer than per-row → dequant magnitude closer to W → better output
-     * direction/base_cos), zero size cost (the d field already exists) and no kernel
-     * change (runtime dequant already reads d per block). Default off = per-row baseline. */
-    const int per_block = (getenv("DS4_GO1B_PER_BLOCK") != NULL);
 
     for (int64_t r = 0; r < nrows; r++) {
         const float *rs = src + (size_t)r * (size_t)ncols;
@@ -104,21 +99,13 @@ size_t go1b_blk_quantize(const float *src, void *dst, int64_t nrows, int64_t nco
         float scale = (ncols > 0) ? (float)(sum_abs / (double)ncols) : 0.0f;
         const uint16_t hd = go1b_fp32_to_fp16(scale);
 
-        /* One 34-byte block per 256 columns. d = per-row scale (replicated, baseline)
-         * or per-block scale (DS4_GO1B_PER_BLOCK); signs packed bit j -> signs[j/8] bit (j%8). */
+        /* One 34-byte block per 256 columns. d = per-row scale, replicated into every
+         * block (per-block local scale variant retired 2026-08-31 with the env purge);
+         * signs packed bit j -> signs[j/8] bit (j%8). */
         for (int64_t b = 0; b < nblocks; b++) {
             uint8_t *bd = rd + (size_t)b * GO1B_BLK_BYTES;
             const int64_t base = b * GO1B_BLK_QK;
-            uint16_t bd_scale = hd;                    /* default: replicated per-row scale */
-            if (per_block) {                           /* local scale = mean(|w|) over this block */
-                double bsum = 0.0; int64_t bn = 0;
-                for (int k = 0; k < GO1B_BLK_QK; k++) {
-                    int64_t j = base + (int64_t)k;
-                    if (j < ncols) { float v = rs[j]; bsum += (v < 0.0f) ? -(double)v : (double)v; bn++; }
-                }
-                bd_scale = go1b_fp32_to_fp16((bn > 0) ? (float)(bsum / (double)bn) : 0.0f);
-            }
-            go1b_store_u16_le(bd, bd_scale);           /* offset 0: fp16 scale */
+            go1b_store_u16_le(bd, hd);                 /* offset 0: fp16 scale */
             uint8_t *sg  = bd + sizeof(uint16_t);      /* offset 2: 32 sign bytes */
             for (int k = 0; k < GO1B_BLK_QK / 8; k++) { /* 32 bytes = 256 sign bits */
                 uint8_t byte = 0;
@@ -252,15 +239,13 @@ size_t go1b_blk_quantize_joint(const float *src, void *dst, int64_t nrows, int64
  * moments E[x_j²] (per-expert slice of the imatrix). Sign stays sign(w); only
  * the scale re-fits so the OUTPUT error (w−s·b)·x is minimized under the
  * diagonal activation model:  s* = Σ_j ew_j·|w_j| / Σ_j ew_j   (closed form).
- * ew NULL / non-positive mass → identical to go1b_blk_quantize (mean|w|).
- * DS4_GO1B_PER_BLOCK does the same weighted fit block-locally. */
+ * ew NULL / non-positive mass → identical to go1b_blk_quantize (mean|w|). */
 size_t go1b_blk_quantize_imat(const float *src, void *dst, int64_t nrows, int64_t ncols,
                               const float *ew) {
     if (!ew) return go1b_blk_quantize(src, dst, nrows, ncols);
     const int64_t nblocks  = (ncols > 0) ? (ncols + GO1B_BLK_QK - 1) / GO1B_BLK_QK : 0;
     const size_t  row_bytes = (size_t)nblocks * GO1B_BLK_BYTES;
     uint8_t *out = (uint8_t *)dst;
-    const int per_block = (getenv("DS4_GO1B_PER_BLOCK") != NULL);
 
     for (int64_t r = 0; r < nrows; r++) {
         const float *rs = src + (size_t)r * (size_t)ncols;
@@ -283,23 +268,7 @@ size_t go1b_blk_quantize_imat(const float *src, void *dst, int64_t nrows, int64_
         for (int64_t b = 0; b < nblocks; b++) {
             uint8_t *bd = rd + (size_t)b * GO1B_BLK_BYTES;
             const int64_t base = b * GO1B_BLK_QK;
-            uint16_t bd_scale = hd;
-            if (per_block) {
-                double bnum = 0.0, bden = 0.0, babs = 0.0; int64_t bn = 0;
-                for (int k = 0; k < GO1B_BLK_QK; k++) {
-                    int64_t j = base + (int64_t)k;
-                    if (j >= ncols) break;
-                    float v = rs[j];
-                    double av = (v < 0.0f) ? -(double)v : (double)v;
-                    double w = (double)ew[j];
-                    if (w > 0.0) { bnum += w * av; bden += w; }
-                    babs += av; bn++;
-                }
-                float bs = (bden > 0.0) ? (float)(bnum / bden)
-                                        : ((bn > 0) ? (float)(babs / (double)bn) : 0.0f);
-                bd_scale = go1b_fp32_to_fp16(bs);
-            }
-            go1b_store_u16_le(bd, bd_scale);
+            go1b_store_u16_le(bd, hd);
             uint8_t *sg  = bd + sizeof(uint16_t);
             for (int k = 0; k < GO1B_BLK_QK / 8; k++) {
                 uint8_t byte = 0;

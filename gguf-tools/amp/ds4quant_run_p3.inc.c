@@ -53,7 +53,7 @@ typedef struct { int L; char algo[12]; float lam,g; int k,backward;
 static zrec_t ZREC[NL]; static int NZREC=0;
 static void zfile_write(void){
     if(!NZREC) return;
-    const char*p=getenv("DS4_ZFILE"); if(!p)p="/tmp/ds4quant_zfile.bin";
+    const char*p=g_cli.zfile;
     FILE*f=fopen(p,"wb"); if(!f){ fprintf(stderr,"[zfile] 写 %s 失败\n",p); return; }
     uint32_t magic=0x315A5144; uint32_t nr=(uint32_t)NZREC;   /* "DQZ1" */
     fwrite(&magic,4,1,f); fwrite(&nr,4,1,f);
@@ -213,10 +213,10 @@ typedef struct { uint8_t *map; size_t msz; const uint8_t *w1,*w3,*w2; size_t szG
                  uint8_t *opsmap; size_t opsmsz; int has_ops;                     /* op 侧车 mmap(dql_ops_L%02d.bin, 平行架构权威源) */
                  lop_t ops[32]; int nops;
                  int zl_stub_at; } lfile_t;   /* zl.RRR 空壳占位序号(真载荷回填正位用; -1=无) */
-/* go2b 侧车路径: DS4_GO2B_DIR(默认=层文件同目录)/dql_go2b_L<NN>.bin — 分储设计:
+/* go2b 侧车路径: --go2b-dir(默认=层文件同目录)/dql_go2b_L<NN>.bin — 分储设计:
  * 冷 go1b dql 在本机(热专家稀疏洞), 热 go2b 侧车可放对机 NFS(两机 16G 盘都装不下合体) */
 static void g2_sidecar_path(const char*dql_path,int L,char*out,size_t outsz){
-    const char*gd=getenv("DS4_GO2B_DIR");
+    const char*gd=g_cli.go2b_dir;
     if(gd){ snprintf(out,outsz,"%s/dql_go2b_L%02d.bin",gd,L); return; }
     char dir[512]; snprintf(dir,sizeof(dir),"%s",dql_path);
     char*sl=strrchr(dir,'/'); if(sl)*sl=0; else snprintf(dir,sizeof(dir),".");
@@ -238,10 +238,8 @@ static void ops_sidecar_path(const char*dql_path,int L,char*out,size_t outsz){
 /* op 宿主文件 = dql 主文件(超冠 573b7f5 混装架构; 2026-08-08 用户令还原:
  * "侧车不是我要求加入的" — 平行架构 op 侧车 2026-08-04 系擅自引入, 已删)。 */
 static void op_host_path(int L,char*out,size_t outsz){
-    snprintf(out,outsz,"%s/dql_L%02d.bin",
-        getenv("DS4_LAYER_DIR")?getenv("DS4_LAYER_DIR"):".",L);
+    snprintf(out,outsz,"%s/dql_L%02d.bin",dsq_layer_dir_req(),L);
 }
-static lfile_t BF_LFF; static int BF_LFF_ON=0;   /* 反修字节起步的层 mmap 持有者 */
 /* op 记录解析(主文件旧混装 与 op 侧车 共用): curfoff=载荷在其宿主文件内的偏移 */
 static void parse_op_rec(lfile_t*lf,const char*nm,const uint8_t*pay,uint64_t psz,size_t curfoff){
     if(lf->nops>=32) return;
@@ -446,7 +444,7 @@ static uint64_t zc_emit_layer(FILE*f, uint32_t Lw, lfile_t*lf){
 /* 每层"优化文件"(用户产品形态: 一层两份 = dql_LXX.bin 量化 + opt_LXX.bin 优化):
  * 单层 DQZ2(nlayers=1), 任何 DQZ2 读者可直接消费。导出时写初版, zchain_write 刷终值。 */
 static void zc_opt_emit(int L, lfile_t*lf){
-    const char*ld=getenv("DS4_LAYER_DIR"); if(!ld) return;
+    const char*ld=g_cli.layer_dir; if(!ld) return;
     char op2[512]; snprintf(op2,sizeof(op2),"%s/opt_L%02d.bin",ld,L);
     FILE*f=fopen(op2,"wb"); if(!f) return;
     uint32_t magic=0x325A5144, one=1;
@@ -455,10 +453,10 @@ static void zc_opt_emit(int L, lfile_t*lf){
     fclose(f);
 }
 static void zchain_write(void){
-    const char*p=getenv("DS4_ZCHAIN"); if(!p) return;
-    if(getenv("DS4_MINVOL_MAXL")){   /* ★探针/部分层跑禁写(2026-08-03 事故: 7层探针把 43 层终值 zchain 覆盖成空链) */
-        fprintf(stderr,"[zchain] 探针模式(MAXL)跳过落盘, 防覆盖全量终值\n"); return; }
-    const char*ld=getenv("DS4_LAYER_DIR"); if(!ld) return;
+    const char*p=g_cli.zchain; if(!p) return;
+    if(g_cli.minvol_maxl>0){   /* ★探针/部分层跑禁写(2026-08-03 事故: 7层探针把 43 层终值 zchain 覆盖成空链) */
+        fprintf(stderr,"[zchain] 探针模式(--minvol-maxl)跳过落盘, 防覆盖全量终值\n"); return; }
+    const char*ld=g_cli.layer_dir; if(!ld) return;
     FILE*f=fopen(p,"wb"); if(!f){ fprintf(stderr,"[zchain] 写 %s 失败\n",p); return; }
     uint32_t magic=0x325A5144, nlay=(uint32_t)NL;
     fwrite(&magic,4,1,f); fwrite(&nlay,4,1,f);

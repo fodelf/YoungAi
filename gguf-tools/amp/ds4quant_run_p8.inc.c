@@ -135,7 +135,6 @@ static float *gs_forward_exit(int J,int Lend,const float*Hin,const long*ids,int 
 static double held_score(const float*Hq,int S,int n_fit,int L,double*relh_out);   /* 反修内动态α用(定义在贪心段) */
 static float *fwd_all(const long*ids,int S,int n_fit,int do_quant,const char*lcfg){
     size_t lstride=(size_t)S*HCM*DIM;
-    if(!RB_SEQ&&getenv("DS4_ROUTE_SEQ")) RB_SEQ=1;   /* 反修路径也需 per-layer α(minvol 分支之外) */
     float *H=malloc(lstride*4);
     int L0=0;
     if(do_quant&&ANC_OK){   /* F 前缀 = FP 锚定原样, 直接恢复跳过 */
@@ -150,11 +149,11 @@ static float *fwd_all(const long*ids,int S,int n_fit,int do_quant,const char*lcf
     }
     if(do_quant) fprintf(stderr,"\n判决=最终输出; 逐层为诊断: 累积=H_q vs FP锚定(误差爆炸在哪层) 局部=该层专家复现(旧口径)\n");
     /* ★逐层反修★缓存: 骨干权重(留存不 free)+层文件(export 后开)+量化态入口隐藏; 前沿层完成即反修 0..L-1 */
-    int incr = do_quant && ANC_OK && COADAPT>0 && BACKFIT_INCR && getenv("DS4_LAYER_DIR") && lcfg;
+    int incr = do_quant && ANC_OK && COADAPT>0 && g_cli.layer_dir && lcfg;   /* 增量反修恒开(关闭开关 2026-08-31 清退) */
     /* ★只跑反修(2026-07-13, 用户裁决: "加个参数只跑返修")★: 推进段不重跑 SEARCH —
      * 逐层加载既有 dql 按 op 链字节回放推进累积态+建 HQE/GS_LF/GS_LW, 直达终局收敛 sweep。
      * 前提=层文件全齐(缺一层硬停); 已落地的 bf.* 修正随层文件一并回放(在其上继续叠加)。 */
-    int BF_ONLY = incr && !FAST && getenv("DS4_BF_ONLY") && atoi(getenv("DS4_BF_ONLY"));
+    int BF_ONLY = incr && !FAST && g_cli.bf_only;
     if(BF_ONLY) fprintf(stderr,"[只跑反修] 开: 复用既有层文件(SEARCH 跳过), 回放推进 → 终局收敛 sweep\n");
     if(incr){
         if(!GS_LW) GS_LW=calloc((size_t)NLAYERS,sizeof(LWH));
@@ -196,7 +195,7 @@ static float *fwd_all(const long*ids,int S,int n_fit,int do_quant,const char*lcf
         if(BF_ONLY&&do_quant&&lcfg[L]=='g'){
             /* 只跑反修: 加载既有 dql(含已落地 bf.* 修正)→ 绑定链末 op 槽位 → 字节回放本层 */
             lwh_absorb(&GS_LW[L],&W);
-            char lp0[512]; snprintf(lp0,sizeof(lp0),"%s/dql_L%02d.bin",getenv("DS4_LAYER_DIR"),L);
+            char lp0[512]; snprintf(lp0,sizeof(lp0),"%s/dql_L%02d.bin",g_cli.layer_dir,L);
             if(GS_LF[L].map){ lfile_free(&GS_LF[L]); memset(&GS_LF[L],0,sizeof(lfile_t)); }
             if(lfile_load(lp0,&GS_LF[L])!=0){
                 fprintf(stderr,"[只跑反修] L%02d 层文件缺失/损坏(%s) — 需 %d 层全齐, 硬停\n",L,lp0,NLAYERS);
@@ -232,20 +231,7 @@ static float *fwd_all(const long*ids,int S,int n_fit,int do_quant,const char*lcf
             free_layer(&W);
             continue;
         }
-        if(bf_from_bytes()&&do_quant&&lcfg&&lcfg[L]=='g'&&getenv("DS4_LAYER_DIR")){
-            char bfp[512]; snprintf(bfp,sizeof(bfp),"%s/dql_L%02d.bin",getenv("DS4_LAYER_DIR"),L);
-            if(!BF_LFF_ON&&lfile_load(bfp,&BF_LFF)==0&&BF_LFF.vqmap&&BF_LFF.w2){
-                BFB_VQMAP=BF_LFF.vqmap; BFB_VQMSZ=BF_LFF.vqmsz; BFB_W2=BF_LFF.w2; BFB_SZD=BF_LFF.szD; BF_LFF_ON=1;
-                if(BFB_W2COPY){ free(BFB_W2COPY); BFB_W2COPY=NULL; }
-                BFB_W2COPY=malloc((size_t)NEXP*BF_LFF.szD);
-                if(BFB_W2COPY) memcpy(BFB_W2COPY,BF_LFF.w2,(size_t)NEXP*BF_LFF.szD);
-                fprintf(stderr,"[反修字节起步] L%02d 冷基座=盘上字节(vq blob + dql D 段, w2快照%.0fMB)\n",
-                        L,(double)NEXP*BF_LFF.szD/1048576.0);
-            }
-        }
         layer_fwd(L,&W,H,ids,S,n_fit,do_quant,do_quant?lcfg[L]:'F',&st);
-        if(BF_LFF_ON){ BFB_VQMAP=NULL; BFB_W2=NULL; lfile_free(&BF_LFF);
-            memset(&BF_LFF,0,sizeof(BF_LFF)); BF_LFF_ON=0; }   /* 导出重写(截断)前必须解除 mmap */
         if(ANC_BUILD) memcpy(ANC.H+(size_t)L*lstride,H,lstride*4);
         if(do_quant&&ANC_OK){
             /* 累积偏差拆 fit/held: z^L 的优化目标=压低 fit 行, held 列才是逐层可见的泛化真相 */
@@ -264,19 +250,15 @@ static float *fwd_all(const long*ids,int S,int n_fit,int do_quant,const char*lcf
             }
             fputc('\n',stderr);
             go1b_joint_neg=go1b_joint_clip=go1b_joint_fail=go1b_joint_rows=0;   /* 计数按层清零 */
-            if(ABLATE&&lcfg[L]!='F'&&st.have_loc)
-                fprintf(stderr,"      消融R²(局部): 朴素%5.1f%% joint%5.1f%% z%5.1f%% Q2残差%5.1f%% | relL2 朴素%.3f z%.3f | 损[al %.3f cl %.3f]\n",
-                        st.abl_r2[0]*100,st.abl_r2[1]*100,st.abl_r2[2]*100,st.abl_r2[3]*100,st.abl_rel[0],st.abl_rel[1],st.abl_la,st.abl_lc);
         } else fprintf(stderr," | anchor 捕获\n");
         if(incr){ lwh_absorb(&GS_LW[L],&W);          /* incr: 骨干 fp16 进缓存(fp32 即刻还, 防单调涨爆12G) */
             fprintf(stderr,"[mem] L%02d footprint=%.2fGB fp16缓存至本层\n",L,mem_gb());
             gs_lw_evict(L-6>0?L-6:0);                /* 超预算驱逐最远层(近6层是每条链的尾巴, 不驱逐) */
         }
         free_layer(&W);
-        if(do_quant&&COADAPT>0&&lcfg&&lcfg[L]=='g'&&getenv("DS4_LAYER_DIR")){
-            char lp[512]; snprintf(lp,sizeof(lp),"%s/dql_L%02d.bin",getenv("DS4_LAYER_DIR"),L);
+        if(do_quant&&COADAPT>0&&lcfg&&lcfg[L]=='g'&&g_cli.layer_dir){
+            char lp[512]; snprintf(lp,sizeof(lp),"%s/dql_L%02d.bin",g_cli.layer_dir,L);
             export_layer_file(L,S,n_fit,lp);   /* 每层产物当场留存(可单层重跑微调, 最后合并) */
-            if(BFB_W2COPY){ free(BFB_W2COPY); BFB_W2COPY=NULL; }   /* 反修复用快照层内即弃 */
             /* (z^L 落盘已并入 export_layer_file 正位直写 op 侧车 — 旧 append 块删除, 错序温床根除) */
             if(incr){                          /* ★逐层前进即反修前面所有层(用户设计)★ */
                 if(GS_LF[L].map){ lfile_free(&GS_LF[L]); memset(&GS_LF[L],0,sizeof(lfile_t)); }
@@ -292,7 +274,7 @@ static float *fwd_all(const long*ids,int S,int n_fit,int do_quant,const char*lcf
          * 取代逐前沿 O(L³): 前沿判据是移动代理靶(同层随推进被反复翻修, 增量互相覆盖), 推进段的
          * 误差本就由下游各层自适应求解前向吸收(部署口径); 终局判据下每份修正只做一次、直指真目标。
          * 复杂度 O(K·L²), 实测类坐标下降 2-3 轮即干; DS4_BF_TERM_MAXP 护栏防不收敛。 */
-        int maxp=getenv("DS4_BF_TERM_MAXP")?atoi(getenv("DS4_BF_TERM_MAXP")):1;   /* 默认=用户设计: 末层反修一遍(含复检)即止; 实测第2轮2.7h只换-0.7%, 多轮重扫默认不开 */
+        int maxp=g_cli.bf_term_maxp;   /* 默认=用户设计: 末层反修一遍(含复检)即止; 实测第2轮2.7h只换-0.7%, 多轮重扫默认不开 */
         for(int p=0;p<maxp;p++){
             int ch=backfit_prev(NLAYERS-1,ids,S,n_fit);
             printf("BACKFIT_TERM pass=%d 落地=%d%s\n",p,ch,ch?"":" → 收敛"); fflush(stdout);
@@ -300,12 +282,11 @@ static float *fwd_all(const long*ids,int S,int n_fit,int do_quant,const char*lcf
         }
         memcpy(H,HQE+(size_t)NLAYERS*lstride,lstride*4);   /* 反修后最终出口 → 下方 logits/BWDFIN 同口径 */
     }
-    if(getenv("DS4_DUMPH")){ const char*p=do_quant?"/tmp/hq.bin":"/tmp/hfp.bin"; FILE*fp=fopen(p,"wb");
-        if(fp){ int hd[3]={S,HCM,DIM}; fwrite(hd,4,3,fp); fwrite(H,4,lstride,fp); fclose(fp); } }  /* final hidden 捕获 */
+    /* (final hidden 捕获已删: DS4_DUMPH 诊断路 2026-08-31 env 清退) */
     float *hcfn=st_read_weight(&C,"hc_head_fn",NULL,NULL),*hcb=st_read_weight(&C,"hc_head_base",NULL,NULL),*hcs=st_read_weight(&C,"hc_head_scale",NULL,NULL);
     float *norm=st_read_weight(&C,"norm.weight",NULL,NULL),*hw=st_read_weight(&C,"head.weight",NULL,NULL);
     float *logits=malloc((size_t)S*VOCAB*4); head_fwd(H,S,hcfn,hcb,hcs,norm,hw,logits);
-    if(do_quant&&ANC_OK&&BWD_L>=0&&getenv("DS4_BWD_FINAL")){
+    if(do_quant&&ANC_OK&&BWD_L>=0&&g_cli.bwd_final){
         /* 向后·终端反调: 层出口 H 对修正量线性 → H(t)=lerp(H_base,H_corr,t);
          * t 网格重跑后缀+head 到最终 logits, val 行(fit 尾 1/4)选 t, held 行不参与选择 */
         int vsq=(n_fit*3)/4;
@@ -331,7 +312,7 @@ static float *fwd_all(const long*ids,int S,int n_fit,int do_quant,const char*lcf
         BWDFIN_T=bestt;
         el_add("bwd.final","H(t)线性插值+后缀重前向, final-logits val行KL 选 t",4,
                kl1,bestkl,kl1>1e-12?100.0*(kl1-bestkl)/kl1:0.0,bestt,bestt!=1.0f?1:3);
-        if(bestt!=1.0f&&getenv("DS4_LAYER_DIR")){
+        if(bestt!=1.0f&&g_cli.layer_dir){
             /* ★落地缺口修复★: 判决用了 H(t) 但此前只写台账行 → 文件回放/DQZ2/运行时全缺此项
              * (t=1 无实害, t≠1 判决虚高)。hc_post 对 F 线性 ⇒ H(t)=lerp ≡ 末层 TREF(锚 Fcur),
              * 名含 TREF → lfile_load/zchain/引擎三方零改动直接认。 */
@@ -353,7 +334,7 @@ static float *fwd_all(const long*ids,int S,int n_fit,int do_quant,const char*lcf
     if(BF_HCOP){ free(BF_HCOP); BF_HCOP=NULL; }
     if(GS_IDXC){ free(GS_IDXC); GS_IDXC=NULL; } if(GS_RWC){ free(GS_RWC); GS_RWC=NULL; }
     /* ★这里原来有第二个 Δb 落盘器, 已删(2026-08-28 实锤 bug)★
-     * 它写的是 `getenv("DS4_ROUTE_BIAS_FIT")` —— 那是【开关】不是路径, 战役脚本给的值是 "1",
+     * 它读的是 DS4_ROUTE_BIAS_FIT 这个【开关】的值当路径 —— 那是【开关】不是路径, 战役脚本给的值是 "1",
      * 于是整个路由偏置侧车被写进了工作目录下一个名叫 `1` 的文件(实撞: gguf-tools/amp/1,
      * 88080 字节 = 16 头 + 43×256×4 均值 + 43×256×4 计数, margin 事件 659 万条)。
      * 更要命的是它写完就 free(RB_ACC) —— 而本函数 fwd_all 每跑完一遍完整前向就执行到这里,

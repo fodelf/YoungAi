@@ -153,6 +153,7 @@ static void usage(const char *argv0) {
     printf("  --dry-run              print output plan without reading HF tensor data\n");
     printf("  --imatrix FILE         legacy .dat imatrix from ds4 --imatrix-out\n");
     printf("  --imatrix-strict       fail if a quantized tensor has no matching imatrix vector\n");
+    printf("  --gpu-verify           re-run the CPU encoder after each GPU encode and byte-compare\n");
     printf("  --experts-hot-mask F   DSXM mask: emit ONLY kept (hot) experts per layer,\n");
     printf("                         compacted, + ds4.expert_keep_map.* metadata (cold\n");
     printf("                         experts dropped; streamed from HF in hybrid layout)\n");
@@ -231,6 +232,8 @@ static params parse_args(int argc, char **argv) {
             p.imatrix_file = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--imatrix-strict") == 0) {
             p.imatrix_strict = true;
+        } else if (strcmp(arg, "--gpu-verify") == 0) {
+            ds4q_gpu_verify_set(1);   /* 读点在 quants.c(GPU 编码后 CPU 逐字节对拍闸) */
         } else if (strcmp(arg, "--experts-hot-mask") == 0) {
             p.hot_mask_file = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--experts") == 0 || strcmp(arg, "--routed") == 0) {

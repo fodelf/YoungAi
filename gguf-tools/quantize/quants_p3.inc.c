@@ -187,20 +187,17 @@ static void ds4q_iq2_xxs_encode_cpu(const float *src, uint8_t *out, int64_t nrow
     }
 }
 
+/* --gpu-verify 请求位(原 DS4Q_GPU_VERIFY env): setter 无条件存在(非 CUDA 构建
+ * 置了也没有 GPU 结果可对拍, 与旧 env 在 CPU 构建下无效的行为一致)。 */
+static int ds4q_gpu_verify_requested = 0;
+void ds4q_gpu_verify_set(int on) { ds4q_gpu_verify_requested = on ? 1 : 0; }
+
 #ifdef DS4Q_CUDA
 /* quantize_gpu.cu: 返回 1 = GPU 已写出全部字节, 0 = 不可用/失败(回落 CPU)。 */
 int ds4q_iq2xxs_encode_gpu(const float *src, void *dst, int64_t nrows, int64_t ncols,
                            const float *imatrix_row_weights);
 
-/* DS4Q_GPU_VERIFY=1: GPU 出结果后再跑一遍 CPU 编码器逐字节对拍(慢, 只用于闸门)。 */
-static int ds4q_gpu_verify_on(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *v = getenv("DS4Q_GPU_VERIFY");
-        cached = (v && *v && *v != '0') ? 1 : 0;
-    }
-    return cached;
-}
+static int ds4q_gpu_verify_on(void) { return ds4q_gpu_verify_requested; }
 #endif
 
 static size_t ds4q_quantize_iq2_xxs(const float *src, void *dst, int64_t start,
