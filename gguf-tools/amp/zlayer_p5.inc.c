@@ -348,7 +348,15 @@
             eg1 += e2 * e2; eg0 += (double)dHg[i2] * dHg[i2];
         }
         const double recg = eg0 > 0 ? 1.0 - eg1 / eg0 : 0.0;
-        printf("  L%d 跨语料闸(量化半 %d 行): 挽回 %.2f%% → %s\n", L, NG, recg * 100,
+        /* 靶量级随行打印(2026-08-31): 挽回是比值, FP 靶塌缩层分母≈0 ⇒ 读数±爆表
+         * (champ3 实况: L31-L37 −91~−280% 与 L35/38 +89/+97% 同深度带并存)。
+         * 靶占比 = 靶RMS/学生基RMS = 该层量化误差在 FP-x 口径下的相对大小 —— 没有它,
+         * "挽回 -225%"与"挽回 97%"分不清是信号还是分母噪声。 */
+        double gb = 0;
+        for (size_t i2 = 0; i2 < (size_t)NG * D; i2++) gb += (double)ysg[i2] * ysg[i2];
+        printf("  L%d 跨语料闸(量化半 %d 行): 挽回 %.2f%% [靶RMS %.3e 基RMS %.3e 靶占比 %.2f%% | held靶RMS %.3e] → %s\n",
+               L, NG, recg * 100, sqrt(eg0 / ((double)NG * D)), sqrt(gb / ((double)NG * D)),
+               gb > 0 ? 100.0 * sqrt(eg0 / gb) : -1.0, nev > 0 ? sqrt(e0 / ((double)nev * D)) : 0.0,
                recg > 0 ? "通过" : "★拒: 同语料 held 正/跨语料负 = 过拟合★");
         if (recg <= 0) eff = 0.0;
         free(Xg); free(ridxg); free(rwg); free(dHg); free(prowg); free(peg);
