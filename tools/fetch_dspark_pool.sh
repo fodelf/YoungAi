@@ -89,8 +89,12 @@ for s in d.get("siblings", []):
     n = s.get("rfilename")
     if not n: continue
     sz = s.get("size"); lfs = s.get("lfs") or {}
+    # ?blobs=true spells the digest "sha256"; only the paths-info endpoint
+    # calls it "oid". Reading just "oid" here made every file look
+    # digest-less, so verify skipped all of them and still printed
+    # "all sha256 match" -- a decorative gate. Accept both spellings.
     # "-" placeholder: an empty middle field would be collapsed by tab-IFS.
-    print("%d\t%s\t%s" % (sz if isinstance(sz, int) else -1, (lfs.get("oid") or "-"), n))
+    print("%d\t%s\t%s" % (sz if isinstance(sz, int) else -1, (lfs.get("oid") or lfs.get("sha256") or "-"), n))
 ' > "$LIST".full 2>/dev/null
     if [ ! -s "$LIST".full ]; then
         curl -fsSL --max-time 60 "$MS_BASE/api/v1/models/$REPO/repo/files?Revision=$MS_REV&Recursive=true" | python3 -c '
@@ -299,6 +303,12 @@ run_status() {
 
 run_verify() {
     fetch_list
+    # A digest-less list means the gate would silently pass everything, which
+    # is exactly the failure this used to have. Refuse instead.
+    if ! awk -F"$TAB" '$2 != "-" { found = 1 } END { exit !found }' "$LIST".full; then
+        echo "FATAL: file list carries no sha256 at all -- refusing to fake a pass" >&2
+        rm -f "$LIST" "$LIST".full; exit 1
+    fi
     fail=0
     while IFS="$TAB" read -r size oid name <&3; do
         [ -n "$name" ] || continue
