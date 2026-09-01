@@ -698,9 +698,11 @@ stage_full(){
     stage_champbf "model_$V"
 }
 
-# ═══ champ86: 冠军 r64 原设计全链(2026-08-28 用户令"一切还原冠军设计")═══
-# 与 r64 的差异仅三项(用户已确认): 语料(calibration_datav5 切半) / 体积(87.04GB) /
-# 底座类型(平权 VQ 2.25bpw, 非热108 go2b+冷1bit ⇒ DS4_GO2B_HOT=0)。
+# ═══ champ86: 标准全链(冠军 r64 设计 + 2026-09-01 用户裁决 v2 标准基座)═══
+# 与 r64 的差异(用户已确认): 语料(三等分量化份) / 体积(87.04GB) / 底座类型
+# (VQ 2.25bpw ⇒ DS4_GO2B_HOT=0) / ★通道加权选码字 v2=标准★(1/diag H⁻¹, vq_qc.h;
+# 语料域平权与位宽平权 vq4x512×43 不变, 加权只在通道维度; wt2 裸态 top1 78.02→79.53,
+# 标准线反修后 79.95/Σmin 0.7910/RMS 5.4770 三新高+反修零 PPL 税, fable5 09-01)。
 # 其余一律 r64 原样: ONEPASS 不分块(CHUNK 是 08-07 才加的, r64 没有)、粗筛只定排序
 # (全闸复核维持 !onep 跳过)、不加 ERF(它在 zside2 链不在冠军段)。
 #
@@ -726,9 +728,9 @@ stage_champ86(){
     local Q_THREADS=20     # 纯速度值(数值无关); champ86 08-28 实跑值
     [ -s "$Q_IDS" ] && [ -s "$D2/vqhalf_a.ids" ] || DIE "两半语料 ids 缺"
     [ -s "$Q_ANCHOR" ] || DIE "量化半锚缺"
-    # ①平权量化 — 从头, 不复用任何既有层件
+    # ①量化(v2 通道加权标准配方) — 从头, 不复用任何既有层件
     if [ "$(ls "$W/layers"/dql_vq_L*.bin 2>/dev/null | wc -l)" != 43 ]; then
-        LOG "①平权量化发车(vq4x512 ×43 不动态, 量化半语料 S=$Q_S)"
+        LOG "①量化发车(vq4x512 ×43 不动态 + v2 通道加权, 量化半语料 S=$Q_S)"
         rm -rf "$W"; mkdir -p "$W/layers" "$W/ckpt"
         FREE=$(df -BG --output=avail "$D2" 2>/dev/null | tail -1 | tr -dc 0-9)
         [ -n "$FREE" ] && [ "$FREE" -ge 75 ] || DIE "盘闸 free ${FREE:-?}G <75G"
@@ -746,7 +748,7 @@ stage_champ86(){
                 --layer-dir "$W/layers" --zfile "$W/zfile.bin" --zchain "$W/zchain.bin" \
                 --bf-memgb "$Q_BF_MEMGB" --calib-cap "$Q_CALIB_CAP" --calib-export-cap "$Q_CALIB_CAP" \
             ) >> "$W/quant.log" 2>&1; then
-            watchdog_stop; tail -8 "$W/quant.log"; DIE "平权量化失败"
+            watchdog_stop; tail -8 "$W/quant.log"; DIE "量化失败"
         fi
         watchdog_stop
         # 体积闸(manifest 实账, 语义=原 quant86 段 VOLB86)
@@ -758,7 +760,7 @@ stage_champ86(){
         fi
         [ "$(ls "$W/layers"/dql_L*.bin 2>/dev/null | wc -l)" = 43 ] || DIE "量化层不齐"
         LOG "①量化收官 $(ls "$W/layers"/dql_vq_L*.bin | wc -l)/43"
-    else LOG "①平权量化已在 43/43, 跳过"; fi
+    else LOG "①量化已在 43/43, 跳过"; fi
     # ★量化态立刻备份(2026-08-28 用户令, 破坏前先保全铁律)★
     # 反修/sweep 是【往 dql 层文件里追加记录 + 原地改写】—— 改的就是量化产物本身。
     # 今天 champreset 能救回来靠的是只读原件 vq86h_noz, 但那是【旧语料】量化出来的;
