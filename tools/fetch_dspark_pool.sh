@@ -1,12 +1,17 @@
 #!/bin/sh
-# Pooled 3-host download of deepseek-ai/DeepSeek-V4-Flash-DSpark (155.4 GiB, 48
-# shards) with spark as the COLLECTOR: every file ends up in spark's
-# ~/ds4-main/hf/DeepSeek-V4-Flash-DSpark, nothing stays on the Macs.
+# Pooled 3-host download of one HF/ModelScope model repo with spark as the
+# COLLECTOR: every file ends up in spark's ~/ds4-main/hf/<repo-name>, nothing
+# stays on the Macs. Repo via REPO= (default DSpark, 155.4 GiB / 48 shards).
 #
-# Topology (measured 2026-08-20): spark's own outbound to hf-mirror is ~0.1
-# MB/s per lane (huggingface.co unreachable from it), the Macs get ~1 MB/s per
-# lane via hf-mirror direct, and Mac->spark LAN push runs ~14 MB/s — so the
-# Macs are the download muscle and the LAN hop is never the bottleneck.
+# Topology is NOT fixed — measure before assuming who the muscle is:
+#   2026-08-20 (DSpark run): spark->hf-mirror ~0.1 MB/s per lane, Macs ~1 MB/s
+#     per lane via hf-mirror, Mac->spark LAN push ~14 MB/s. Macs = the muscle.
+#   2026-09-01 (Vision-Exp run): spark reaches NEITHER huggingface.co NOR
+#     hf-mirror (both time out) but pulls 27.7 MB/s from ModelScope, while the
+#     Macs manage 0.19 MB/s (hf-mirror) / 0.28 MB/s (ModelScope). Spark = the
+#     muscle, ~100x the Macs; a Mac lane is worth roughly one small shard.
+# That reversal is why fetch_list falls back to the ModelScope copy of the same
+# repo and why DL_BASE exists — see fetch_list.
 #
 # There is NO fixed split. All hosts claim shards from ONE pool that lives on
 # spark's filesystem (atomic mkdir under $RDEST/.claims), so a fast host
@@ -37,6 +42,8 @@ RDEST="ds4-main/hf/$NAME"             # relative to $HOME on spark
 # 2026-08-20: 15.5 MB/s per connection from spark vs ~0.1 on hf-mirror; byte
 # range spot-check MS==HF, final sha256 verify is the hard gate anyway).
 DL_BASE=${DL_BASE:-}
+MS_BASE=${MS_BASE:-https://modelscope.cn}
+MS_REV=${MS_REV:-master}
 CLAIMS="$RDEST/.claims"
 ROLE=${1:-mac}
 RESERVE_GIB=${RESERVE_GIB:-8}
@@ -69,7 +76,13 @@ ckey()  { printf '%s' "$1" | tr '/' '_'; }
 # --- file list: "size<TAB>name", cached per run ------------------------------
 LIST=/tmp/dspark_pool_list.$$
 fetch_list() {
-    curl -fsSL --max-time 60 "$ENDPOINT/api/models/$REPO?blobs=true" | python3 -c '
+    # HF API first. Measured 2026-09-01: spark reaches neither huggingface.co
+    # nor hf-mirror (both time out), so fall back to the SAME repo on
+    # ModelScope -- file count, byte sizes and Sha256 all match HF, and
+    # ModelScope's Sha256 *is* the HF lfs oid (both are the file sha256), so
+    # `verify` keeps working from either source. When the list came from
+    # ModelScope the downloads must come from there too, hence DL_BASE.
+    curl -fsSL --max-time 60 "$ENDPOINT/api/models/$REPO?blobs=true" 2>/dev/null | python3 -c '
 import sys, json
 d = json.load(sys.stdin)
 for s in d.get("siblings", []):
@@ -78,7 +91,24 @@ for s in d.get("siblings", []):
     sz = s.get("size"); lfs = s.get("lfs") or {}
     # "-" placeholder: an empty middle field would be collapsed by tab-IFS.
     print("%d\t%s\t%s" % (sz if isinstance(sz, int) else -1, (lfs.get("oid") or "-"), n))
-' > "$LIST".full || { echo "FATAL: cannot fetch file list from $ENDPOINT" >&2; exit 1; }
+' > "$LIST".full 2>/dev/null
+    if [ ! -s "$LIST".full ]; then
+        curl -fsSL --max-time 60 "$MS_BASE/api/v1/models/$REPO/repo/files?Revision=$MS_REV&Recursive=true" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+for f in d.get("Data", {}).get("Files", []):
+    if f.get("Type") != "blob": continue
+    # Path, not Name: Name is only the basename, so inference/config.json
+    # would collide with the top-level config.json and clobber it.
+    p = f.get("Path")
+    if not p: continue
+    sz = f.get("Size")
+    print("%d\t%s\t%s" % (sz if isinstance(sz, int) else -1, (f.get("Sha256") or "-"), p))
+' > "$LIST".full || { echo "FATAL: cannot fetch file list from $ENDPOINT or $MS_BASE" >&2; exit 1; }
+        [ -s "$LIST".full ] || { echo "FATAL: empty file list from both sources" >&2; exit 1; }
+        [ -n "$DL_BASE" ] || DL_BASE="$MS_BASE/models/$REPO/resolve/$MS_REV"
+        echo "list: HF unreachable, using ModelScope ($DL_BASE)"
+    fi
     awk -F"$TAB" '{ print $1 "\t" $3 }' "$LIST".full > "$LIST"
     [ -s "$LIST" ] || { echo "FATAL: empty file list" >&2; exit 1; }
 }
