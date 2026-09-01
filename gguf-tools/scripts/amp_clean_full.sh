@@ -67,7 +67,9 @@ ZLB="$HOME/ds4-main/gguf-tools/amp/zlayer"
 for L in ${LRANGE:-$(seq 0 42)}; do
   "$ZLB" "$HF" $D2/$WS/layers "$ANC" $L "$ZL_K" 1 \
     --ntok "$ZL_NTOK" --gate-anchor "$QANC" ${GEFLAGS[@]+"${GEFLAGS[@]}"} \
-    2>&1 | grep -aE "XCAP|跨语料|GE去均值|Error|assert|★" || { LOG "★L$L 失败★"; exit 1; }
+    2>&1 | grep -aE "XCAP|跨语料|GE去均值|k曲线|纯z|Error|assert|★" || { LOG "★L$L 失败★"; exit 1; }
+  # ↑k曲线/纯z 必须入日志(2026-09-01): lin-vs-ftA 形态择优是深层"肉少"诊断的一手证据,
+  #   上一轮被滤掉后只能靠重跑单层找回。
   # 进度可观测铁律: 每层收官打一行(tail -f 就能看到 43 层推进)
   # INJ=1 走 dql 注入不写 zrec ⇒ 旧的 zrec 计数恒 0/43(观测 bug); 改数注入账本行
   LOG "L$L ✓ $(grep -c '' "$D2/$WS/layers/zinject_manifest.txt" 2>/dev/null || echo 0)/43 K=$ZL_K"

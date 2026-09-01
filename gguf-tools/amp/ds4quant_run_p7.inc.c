@@ -239,10 +239,10 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
                 for(size_t i=0;i<(size_t)S*DIM;i++) yq[i]=Fout[i]-shb[i];
                 elm_res er; double t0=vqt_now();
                 if(elm_solve(Fin,yq,BF_LT,S,DIM,n_fit,&er)==0){
-                    printf("★ELM L%02d held行为挽回 %.2f%% @V₀=%s λ=%g k=%d "
+                    printf("★ELM L%02d held行为挽回(行有界) %.2f%% [无界对表 %.2f%%] @V₀=%s λ=%g k=%d "
                            "| 同口径乘性【线性】对照 %.2f%%(判例+0.6%%) | s=%.4g | %.0fs\n",
-                           L, er.held*100.0, er.from_pca?"PCA":"rand", (double)er.lam, er.k,
-                           er.held_lin*100.0, (double)er.s, vqt_now()-t0);
+                           L, er.held*100.0, er.held_uw*100.0, er.from_pca?"PCA":"rand",
+                           (double)er.lam, er.k, er.held_lin*100.0, (double)er.s, vqt_now()-t0);
                     fflush(stdout); elm_free(&er);
                 } else printf("★ELM L%02d 解算失败\n",L), fflush(stdout);
                 free(yq);

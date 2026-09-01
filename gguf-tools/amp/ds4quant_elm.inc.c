@@ -31,7 +31,10 @@ static const int   ELM_KGRID[7] = {16, 32, 64, 128, 256, 384, 512};
 typedef struct {
     int   from_pca;          /* 1=PCA 方向胜 0=随机特征胜(held 择优的结果) */
     float lam; int k;        /* held 选出的 λ 与 k */
-    double held;             /* 行为挽回(小数, 0.12 = 12%) */
+    double held;             /* ★行有界行为挽回★(小数, 0.12 = 12%): 行权 1/(rowE+中位),
+                              * 与 zlayer 四刀(2026-08-31)同式 —— 无界打分被重行主导,
+                              * 深层薄肉被掩蔽是实测过的测量 bug, 探针必须同口径 */
+    double held_uw;          /* 同配置的无界(旧口径)读数, 只为与 08-28 历史针对表 */
     double held_lin;         /* 同口径对照: 乘性【线性】(不过 tanh), 判例 +0.6% */
     float  s;                /* tanh 定标 */
     float *V0;               /* [D][k] 胜出方向(已裁到 k 列) */
@@ -199,11 +202,23 @@ static int elm_solve(const float *X, const float *YQ, const float *DH,
     const float scale = (float)sqrt(sc2/((double)na*D));
     out->s = scale;
 
-    /* 基线误差 e0 = ‖y_fp − y_q‖² on held(y_fp = y_q + dH ⇒ 就是 ‖dH‖²) */
-    double e0 = 0.0;
-    for(int i=ev0;i<S;i++){ const float *dh = DH + (size_t)i*D;
-        for(int d=0;d<D;d++) e0 += (double)dh[d]*dh[d]; }
-    if(e0 <= 0.0){ free(R);free(eps);free(colw);free(Xa);free(Ra); return -1; }
+    /* 基线误差 e0 = ‖y_fp − y_q‖² on held(y_fp = y_q + dH ⇒ 就是 ‖dH‖²)。
+     * 同时算行有界权 rowW=1/(rowE+中位): 无界求和被少数重行主导(zlayer 四刀实锤的
+     * 测量 bug), 择优与主读数一律行有界, 无界只留对表。 */
+    double e0 = 0.0, e0w = 0.0;
+    double *rowE = malloc((size_t)nev*sizeof(double));
+    double *rowW = malloc((size_t)nev*sizeof(double));
+    for(int i=0;i<nev;i++){ const float *dh = DH + (size_t)(ev0+i)*D;
+        double s2r = 0.0; for(int d=0;d<D;d++) s2r += (double)dh[d]*dh[d];
+        rowE[i] = s2r; e0 += s2r; }
+    if(e0 <= 0.0){ free(R);free(eps);free(colw);free(Xa);free(Ra);free(rowE);free(rowW); return -1; }
+    {   double *srt = malloc((size_t)nev*sizeof(double));
+        memcpy(srt, rowE, (size_t)nev*sizeof(double));
+        for(int i=1;i<nev;i++){ double v=srt[i]; int j=i-1;   /* 插入排序: nev≈1.5k, 一次性 */
+            while(j>=0 && srt[j]>v){ srt[j+1]=srt[j]; j--; } srt[j+1]=v; }
+        const double med = srt[nev/2] + 1e-30; free(srt);
+        for(int i=0;i<nev;i++){ rowW[i] = 1.0/(rowE[i]+med); e0w += rowW[i]*rowE[i]; }
+    }
 
     /* ④ 两套 V₀: PCA(Xa 去均值的二阶矩 top-K) 与 固定 seed 随机 */
     float *Vp = malloc((size_t)D*K*4), *Vr = malloc((size_t)D*K*4);
@@ -292,20 +307,23 @@ static int elm_solve(const float *X, const float *YQ, const float *DH,
                     for(int d=0;d<D;d++) for(int c=0;c<kk;c++) UbT[(size_t)d*kk+c]=(float)Ub[(size_t)c*D+d];
                     for(int i=0;i<nev;i++) memcpy(ZeK+(size_t)i*kk, Ze+(size_t)i*K, (size_t)kk*4);
                     dq_matmul(ZeK, UbT, gacf, nev, kk, D);  /* g[nev,D] = ZeK[nev,kk]·UbT[D,kk]ᵀ */
-                    double err = 0.0;
+                    double err = 0.0, errw = 0.0;
                     for(int i=0;i<nev;i++){
                         const float *yq = YQ + (size_t)(ev0+i)*D, *dh = DH + (size_t)(ev0+i)*D;
                         const float *ga = gacf + (size_t)i*D;
+                        double rerr = 0.0;
                         for(int d=0;d<D;d++){
                             const double g2 = (double)ga[d]/colw[d];
                             const double e2 = (double)dh[d] - (double)yq[d]*g2;  /* y_fp−ŷ */
-                            err += e2*e2;
+                            rerr += e2*e2;
                         }
+                        err += rerr; errw += rowW[i]*rerr;
                     }
-                    const double hv = 1.0 - err/e0;
+                    const double hv = 1.0 - errw/e0w;        /* 行有界 = 择优判据 */
+                    const double hv_uw = 1.0 - err/e0;       /* 无界只对表不择优 */
                     if(lin){ if(hv > out->held_lin) out->held_lin = hv; continue; }
                     if(hv > out->held){
-                        out->held = hv; out->lam = (float)lam; out->k = kk;
+                        out->held = hv; out->held_uw = hv_uw; out->lam = (float)lam; out->k = kk;
                         out->from_pca = !variant;
                         free(out->V0); free(out->U);
                         out->V0 = malloc((size_t)D*kk*4);
@@ -321,6 +339,6 @@ static int elm_solve(const float *X, const float *YQ, const float *DH,
     }
     free(R);free(eps);free(colw);free(Xa);free(Ra);free(Vp);free(Vr);
     free(Za);free(Ze);free(ZtZ);free(ZtR);free(G);free(Ub);free(gacf);free(UbT);free(ZeK);
-    free(V0T);free(ZaT);free(RaT);
+    free(V0T);free(ZaT);free(RaT);free(rowE);free(rowW);
     return out->V0 ? 0 : -1;
 }
