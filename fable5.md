@@ -8270,3 +8270,61 @@ vs 浅层 5.7), 没多少可摊。B类底座剩余路=格码(QTIP trellis 族, �
 删产物 23, 文件清单与备份逐项一致); pkill 孤儿链复活两连(r30 中间层没死透重拉
 ds4quant_run, 与 reset 短暂并发)——终态校验干净, 但杀进程树必须自顶向下按 PID 全列。
 --rot-probe 代码按 09-01 新铁律留工作区待批准, 未提交。
+
+## 2026-09-01 DeepSeek-V4-Flash-Vision-Exp 落地 spark(156.31 GiB, sha256 全绿)
+
+用户令"下载这个新模型到 spark, 用 m1/m4/spark 一起下, 最后落地 spark"。走既有
+`tools/fetch_dspark_pool.sh`(三机共享一个 claim 池, spark 当 collector), REPO 换成
+新仓库即复用。**42 分钟落地 156.31 GiB, 48/48 shard, verify 逐个 sha ok**。
+
+**拓扑整个反过来了(必须现测, 别信上一轮结论)**: 8-20 那轮 DSpark 的注释写着
+"Macs 是下载主力", 这轮实测:
+
+| 主机 | 源 | 速度 |
+|---|---|---|
+| spark | ModelScope | **81.9 MB/s**(4 lane 合计) |
+| spark | huggingface.co / hf-mirror | **全超时不通** |
+| M4 | hf-mirror / ModelScope | 0.19 / 0.29 MB/s |
+| M1 | — | 不在网上(见下) |
+
+spark 快 M4 **280 倍**。lane 扫参: 4 lane 81.9 MB/s 是带宽上限, 加到 7 lane 反降到
+57.9 MB/s(纯损耗), 已退回 4。另: 重启 worker 后头 75 秒读数 16.5 MB/s 是建连开销,
+不是限流 —— 复测即回 81.9, **重启后的首个窗口不能当读数**。
+
+**两处代码修**(a770b26 / fd34089):
+1. spark 连不上 HF, 而原脚本第一步 `curl HF API || FATAL` 让 spark 角色根本起不来。
+   加 ModelScope 同仓库回退(文件数/字节/Sha256 全对得上); 列表退到 MS 时下载源自动
+   跟过去, 否则会"列表来自 A 而字节来自不可达的 B"。解析用 Path 不是 Name——Name
+   只是 basename, inference/config.json 会和顶层 config.json 撞名互相覆盖。
+2. **verify 的 sha256 闸一直是装饰品**: HF `?blobs=true` 把摘要字段叫 `sha256`,
+   只有 paths-info 才叫 `oid`, 而脚本读的是 `lfs.get("oid")` → 48 个 shard 全被当
+   "没摘要"跳过 → 照样打印 "all sha256 match"。**DSpark 那轮的"通过"同样是假的**。
+   两种拼写都收, 并补前置检查: 列表里一个摘要都没有直接 FATAL, 不许静默放行。
+   修后带 digest 文件数 0 → 49。同族教训见 memory 的"看门狗从未生效"。
+
+换源前提已坐实: model-00048 从 MS 下的文件实测 sha256 = 0de99b7d...ca5f909e, 与 HF
+paths-info 的 lfs.oid 逐字节一致。
+
+**模型结构**(vs 已有 DSpark, config 逐字段 diff): 骨架完全相同(43 层/256 专家/
+topk6/hidden4096/1M ctx/expert_dtype=fp4)。差异只有三处 + 视觉塔:
+- 新增 10 个 `vision_*` 字段: 32 层视觉塔, dim1024, patch14, 最多 384 图像 token
+- `num_nextn_predict_layers` 1 → 3; `rms_norm_eps` 1e-06 → **1e-20**; tfm 5.0.0
+- 索引 72633 tensor / 48 shard 齐全: vision 259 + aligner 4 + image_start/end/
+  newline/pad 各 1 + layers 67652 + mtp 4708 + hc_head_* 3
+
+**M1 缺席(用户侧待办)**: 脚本写死的 `192.168.1.2` 已失效——网段换到 192.168.2.x
+(M4=192.168.2.203)。全段扫 22 端口只有 M4 和一台 host key 对不上 M1 的设备; mDNS
+`_ssh._tcp` 只广播出 M4 和 spark-6b69; M4 的 en0 是 `media: autoselect (none)`。
+判定 M1 关机或没接这个网, 需物理介入。
+
+**Mac 入池是负优化, 照令执行但收尾接管**: M4 认领了最小的 00001(1.86 GiB), 288 KB/s
+跑到 1.30 GiB 时 spark 已把其余 47 个全下完。续完剩下的 0.56 GiB 要 32 分钟, 而 spark
+重下整个 1.86 GiB 只要 ~70 秒 —— 停 M4、释放 claim、spark 接管, 90 秒收官。凑机器数
+不该拖长总时间。
+
+工程账: **pkill 自匹配第五撞** —— `pkill -f "model-000$f-of-00048"` 的模式串出现在
+ssh 命令行自身里, 把会话自己杀了(exit 255), 与 09-01 早些时候记的第四撞同源。此后
+一律 pgrep 取 PID 再 kill; 且 `kill` 打 TERM 杀不死主脚本(它在 wait 里), 主进程会
+继续 fork 新一代 lane(实见 3933 又生出 10395→10534 一串), 必须 -9 且自顶向下按 PID
+全列、杀完再扫一遍。另: `pgrep -fc` 是 Linux 用法, macOS BSD pgrep 不认 -c, 会打
+usage 并让 `|| echo 0` 兜出一个假的"残留 0"——用 `pgrep -f ... | wc -l`。
