@@ -8742,3 +8742,17 @@ fit/held, 把样本子空间当成了模型子空间(与 08-23 dyn86"局部账"�
 处置: 子空间路 --subq 默认关(0), 旧层件行为逐字节不变; 工作区 champ86sub_k512_nc128 留盘(73 GiB)待用户裁;
 两处独立 bug 修法(线程暂存泄漏/续跑入口)与平权路同样受益。
 **裸态 判决份(主判): Σmin 0.7434 / KLD 0.52656 / top 71.66% / PPL 1.241 (平权裸态 0.7603 / 0.44710 / 73.86% / 1.131) ✗✗** —— 两尺同向, 封案。
+
+## 2026-09-02 ★回滚到 sweep3 最佳态(用户令"都不对就回滚代码, 回到上次最佳状态")★
+
+**代码**: 下午工作区(子空间联合量化路/输出头拟合器/lsens·hsum·route-miss·dep-check 针/sweep 四项修法/导出线程
+泄漏修/续跑入口/融合核退回, 共 19 改+3 新)整体 `git stash -u` 保全 → stash@{0}=8c513661。HEAD 上的四个探针提交
+(9fd1c31/61ad32b/7ced1e4/0e1db25)分文件提交漏了 include+Makefile 依赖, HEAD 编不过 —— 代码部分退回 b834d2a
+(=sweep3 产出态), fable5 记录全留, 提交 556bf66。Mac/spark 源码逐文件 diff 零差, spark 二进制 18:28 重编,
+--subq/--dep-check/--mc-probe/--hsum 等 flag 已不存在。
+**模型**: champ86amp/layers 从 archive_sweep4 恢复 sweep3 交付态: zrec 0→43(L00 md5 adc3361929cf 与 sweep3 时一致),
+zchain.bin 34432820 B, route_bias_r30.bin(注: HEAD 的 r30 backfit 仍传 --route-bias 读入, 下一轮 sweep 前须归档它,
+否则 α=2.5 施加 —— 该修法随 stash 一起收起了), backfit_sweep3.log。champ86sub_k512_nc128(73 GiB)、
+archive_sweep5/6/8 未删(待用户裁)。
+**回滚后未保留的两个真 bug 修法(在 stash 里, 平权路同样受益)**: ①导出 worker 退出不释放 __thread cuBLAS 暂存
+(每层 ~0.9GB 泄漏, 43 层 39GB, 靠 121GB 余量硬扛); ②sweep 发车吃上一轮 route_bias 文件。
