@@ -125,12 +125,18 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
             if(!RB_ACC){ RB_ACC=calloc((size_t)NLAYERS*NEXP,4); RB_CNT=calloc((size_t)NLAYERS*NEXP,4);
                 fprintf(stderr,"[路由] Δb 统计首次武装 L=%d cfg前向\n",L); }
             const int32_t *fpx=ANC.ridx+(size_t)L*(g_anc_rowmap?g_anc_rowstride:S)*NACT;
+            /* ★分数矩阵走 GPU GEMM(2026-09-01 用户令"改成GPU实现")★ 原逐 token 标量三重
+             * 循环 = S×NEXP×DIM 单线程重算路由 GEMM(~0.7s/层, BFLT 路由桶 150s/单元的主凶;
+             * 真尺 sweep 每单元 1+臂数 枪×全深前向把它放大成第一瓶颈)。且它与前向自己的
+             * 路由分数(dq_gate_route_topk 内 dq_matmul, GPU)是两套标量序算出来的分 ——
+             * 统计与前向同源化后口径反而更干净。变换/比对逻辑逐字不动。 */
+            float *rawm=malloc((size_t)S*NEXP*4);
+            dq_matmul(Fin,W->gate,rawm,S,DIM,NEXP);
             float *scv=malloc((size_t)NEXP*4);
             for(int s=0;s<S;s++){
-                const float *xr=Fin+(size_t)s*DIM;
-                for(int e=0;e<NEXP;e++){ const float*gr=W->gate+(size_t)e*DIM;
-                    float raw=0.0f; for(int k=0;k<DIM;k++) raw+=xr[k]*gr[k];
-                    scv[e]=sqrtf(log1pf(expf(raw)))+(W->gbias?W->gbias[e]:0.0f); }
+                const float *rr=rawm+(size_t)s*NEXP;
+                for(int e=0;e<NEXP;e++)
+                    scv[e]=sqrtf(log1pf(expf(rr[e])))+(W->gbias?W->gbias[e]:0.0f);
                 float thr=1e30f;
                 for(int a=0;a<NACT;a++){ float v=scv[idx[(size_t)s*NACT+a]]; if(v<thr)thr=v; }
                 const size_t frow=(size_t)(g_anc_rowmap?g_anc_rowmap[s]:s);
@@ -141,7 +147,7 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
                     for(int b=0;b<NACT;b++) if(fpx[frow*NACT+b]==e){in=1;break;}
                     if(!in){ RB_ACC[(size_t)L*NEXP+e]-=scv[e]-thr; RB_CNT[(size_t)L*NEXP+e]++; } }
             }
-            free(scv);
+            free(scv); free(rawm);
         }
     }
     if(GS_CAP_L==L&&GS_IDXC&&GS_RWC){   /* ★反修 GE 投影: 捕获目标层实际路由(命中+权重)★ */
