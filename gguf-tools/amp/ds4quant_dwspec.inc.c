@@ -244,3 +244,100 @@ static void sub_probe(int S){
     }
     exit(0);
 }
+
+/* ═══ 子空间联合量化针(2026-09-02 用户令"哪怕一点点提升都应该尝试")═══
+ * 把子空间针的估算换成生产量化器的真数, 矩阵级, held 行判:
+ *   高部 H = W·P_k(k=256, P_k=该层 Fin 协方差主方向, 层内共享) → 逐行 absmax 定点(int4 / int8);
+ *   余部 R = W − Ĥ·P_kᵀ → 生产 VQ(dq_quant_expert_vq: kmeans+GPTQ 反馈+通道权) 在等体积码本档量化,
+ *   重要性权重喂 x⊥ = x − P P^T x(余部实际看到的输入); 重建 Ŵ' = Ĥ·P_kᵀ + R̂。
+ * 等体积档(每矩阵 2048×4096, 现 v4x512 = 2.258 bpw): int4 高部 2.13 Mbit ⇒ 余部 v4x256(2.01 bpw);
+ *   int8 高部 4.23 Mbit ⇒ 余部 v4x128(1.76 bpw)。
+ * 判据 = held 行输出误差 ‖(W−Ŵ')X_h‖² 对 ①盘上 dql_vq ②同流程重量化 v4x512 两个基线的比值。只读。 */
+static const char *g_subq_probe = NULL;   /* --sub-quant-probe "0,12,24,36,41" */
+static void subq_rowquant(const float *H,int r,int k,int levels,float *Hq){   /* 逐行对称定点: levels=7(int4)/127(int8) */
+    for(int i=0;i<r;i++){ const float *h=H+(size_t)i*k; float *q=Hq+(size_t)i*k; float am=0;
+        for(int j=0;j<k;j++){ float a=fabsf(h[j]); if(a>am)am=a; }
+        float sc=am>0?am/levels:1.0f;
+        for(int j=0;j<k;j++){ float v=h[j]/sc; int iv=(int)floorf(v+0.5f); if(iv>levels)iv=levels; if(iv<-levels)iv=-levels; q[j]=iv*sc; } }
+}
+static double subq_err(const float *W,const float *Wq,const float *Xh,int nh,int r,int c){   /* ‖(W−Wq)·Xhᵀ‖² */
+    float *Dm=malloc((size_t)r*c*4); for(size_t i=0;i<(size_t)r*c;i++) Dm[i]=W[i]-Wq[i];
+    float *E=malloc((size_t)nh*r*4); dq_matmul(Xh,Dm,E,nh,c,r);
+    double s=0; for(size_t i=0;i<(size_t)nh*r;i++) s+=(double)E[i]*E[i]; free(Dm); free(E); return s;
+}
+static void sub_quant_probe(int S){
+    if(!g_subq_probe) return;
+    if(!ANC_OK||!ANC.fin||!ANC.ridx){ fprintf(stderr,"[SUBQ]★需 --anchor★\n"); exit(2); }
+    if(!g_cli.layer_dir){ fprintf(stderr,"[SUBQ]★需 --layer-dir★\n"); exit(2); }
+    const int EX[3]={0,128,255}, K=256, NEMAX=768; int nth=NTHREADS>1?NTHREADS:8;
+    printf("[SUBQ] 体积账(每矩阵 2048×4096 bit): 基线 v4x512=%.2fM | int4高部 %.2fM+v4x256 %.2fM=%.2fM | int8高部 %.2fM+v4x128 %.2fM=%.2fM\n",
+           vq_payload_bytes(MOEI,DIM,4,512)*8/1e6, (2048.0*256*4+2048*16)/1e6, vq_payload_bytes(MOEI,DIM,4,256)*8/1e6, (2048.0*256*4+2048*16)/1e6+vq_payload_bytes(MOEI,DIM,4,256)*8/1e6,
+           (2048.0*256*8+2048*16)/1e6, vq_payload_bytes(MOEI,DIM,4,128)*8/1e6, (2048.0*256*8+2048*16)/1e6+vq_payload_bytes(MOEI,DIM,4,128)*8/1e6);
+    char b[256]; snprintf(b,sizeof b,"%s",g_subq_probe);
+    double agg[4]={0,0,0,0}; int nagg=0;   /* 汇总: Σ err(dql, 512, V1, V2) 跨矩阵 */
+    for(char *tok=strtok(b,","); tok; tok=strtok(NULL,",")){ int L=atoi(tok);
+        const float *FIN=ANC.fin+(size_t)L*S*DIM; const int32_t *RIDX=ANC.ridx+(size_t)L*S*NACT;
+        float *Xt=malloc((size_t)DIM*S*4); for(int s=0;s<S;s++) for(int j=0;j<DIM;j++) Xt[(size_t)j*S+s]=FIN[(size_t)s*DIM+j];
+        double *G=malloc((size_t)DIM*DIM*8); { pthread_t th[32]; dws_gram_t gw[32]; int n2=nth>32?32:nth;
+          for(int t=0;t<n2;t++){ int r0=(int)(DIM*sqrt((double)t/n2)), r1=(int)(DIM*sqrt((double)(t+1)/n2)); if(t==n2-1)r1=DIM; gw[t]=(dws_gram_t){Xt,DIM,S,r0,r1,G}; pthread_create(&th[t],NULL,dws_gram_worker,&gw[t]); }
+          for(int t=0;t<n2;t++) pthread_join(th[t],NULL); }
+        free(Xt);
+        double *V=malloc((size_t)DIM*K*8), lam[256]; sp_top_eigvec(G,DIM,K,30,V,lam,nth); free(G);
+        float *P=malloc((size_t)DIM*K*4), *Pt=malloc((size_t)K*DIM*4);   /* P[D][k] 行主; Pt[k][D] */
+        for(int i=0;i<DIM;i++) for(int j=0;j<K;j++){ P[(size_t)i*K+j]=(float)V[(size_t)i*K+j]; Pt[(size_t)j*DIM+i]=(float)V[(size_t)i*K+j]; }
+        free(V);
+        char lp[512]; snprintf(lp,sizeof lp,"%s/dql_L%02d.bin",g_cli.layer_dir,L);
+        lfile_t lf; if(lfile_load(lp,&lf)!=0||!lf.vqmap){ fprintf(stderr,"[SUBQ]★L%d 层件缺★\n",L); free(P); free(Pt); continue; }
+        const uint64_t *vtab=(const uint64_t*)(lf.vqmap+16);
+        for(int xi=0;xi<3;xi++){ int e=EX[xi];
+            int *rows=malloc(S*sizeof(int)); int ne=0;
+            for(int s=0;s<S&&ne<NEMAX;s++){ for(int a=0;a<NACT;a++) if(RIDX[(size_t)s*NACT+a]==e){ rows[ne++]=s; break; } }
+            if(ne<16){ printf("  e%03d 路由行仅 %d, 跳过\n",e,ne); free(rows); continue; }
+            int nf=ne*3/4, nh=ne-nf;   /* fit 行喂量化器, held 行判 */
+            float *X=malloc((size_t)ne*DIM*4); for(int t=0;t<ne;t++) memcpy(X+(size_t)t*DIM,FIN+(size_t)rows[t]*DIM,(size_t)DIM*4);
+            /* x⊥ (余部重要性): x − P Pᵀ x */
+            float *Xp=malloc((size_t)ne*DIM*4); { float *cf=malloc((size_t)ne*K*4); dq_matmul(X,Pt,cf,ne,DIM,K);   /* cf = X·P */
+              float *rec=malloc((size_t)ne*DIM*4); dq_matmul(cf,P,rec,ne,K,DIM);                                    /* rec = cf·Pᵀ */
+              for(size_t i=0;i<(size_t)ne*DIM;i++) Xp[i]=X[i]-rec[i]; free(cf); free(rec); }
+            const float *Xf=X, *Xh=X+(size_t)nf*DIM, *Xpf=Xp;
+            const char *mn[2]={"w1","w3"}; uint64_t of[2]={vtab[(size_t)e*3],vtab[(size_t)e*3+1]};
+            for(int m=0;m<2;m++){
+                if(!of[m]){ printf("  L%02d e%03d %-2s 冷槽跳过\n",L,e,mn[m]); continue; }
+                char n[160]; snprintf(n,sizeof n,"layers.%d.ffn.experts.%d.%s.weight",L,e,mn[m]);
+                long r,c; float *W=st_read_weight(&C,n,&r,&c); if(!W){ printf("  %-2s HF 读失败\n",mn[m]); continue; }
+                float *Qd=malloc((size_t)r*c*4); int qr=0,qc=0;
+                if(vq_unpack_dequant(lf.vqmap+of[m],lf.vqmsz-of[m],Qd,&qr,&qc)!=0||qr!=r||qc!=c){ printf("  %-2s 反量化失败\n",mn[m]); free(W); free(Qd); continue; }
+                double t0=vqt_now();
+                float *Yref=malloc((size_t)nh*r*4); dq_matmul(Xh,W,Yref,nh,(int)c,(int)r); double sig=0; for(size_t i=0;i<(size_t)nh*r;i++) sig+=(double)Yref[i]*Yref[i];
+                /* held 行的结构化输入: x_k = Pᵀx (nh×k), x⊥ = x − P x_k —— 设计里余部只吃 x⊥, 主方向只经 Ĥ */
+                float *Xhk=malloc((size_t)nh*K*4); dq_matmul(Xh,Pt,Xhk,nh,(int)c,K);
+                float *Xhp=malloc((size_t)nh*c*4); { float *rec=malloc((size_t)nh*c*4); dq_matmul(Xhk,P,rec,nh,K,(int)c); for(size_t i=0;i<(size_t)nh*c;i++) Xhp[i]=Xh[i]-rec[i]; free(rec); }
+                double e_dql=subq_err(W,Qd,Xh,nh,(int)r,(int)c);
+                float *Q512=dq_quant_expert_vq(W,(int)r,(int)c,Xf,nf,4,512); double e_512=subq_err(W,Q512,Xh,nh,(int)r,(int)c); free(Q512);
+                /* 高部 H=W·P (r×k) */
+                float *H=malloc((size_t)r*K*4); dq_matmul(W,Pt,H,(int)r,(int)c,K);
+                double eV[2]; const int LV[2]={7,127}; const int NC[2]={256,128};
+                for(int v=0;v<2;v++){
+                    float *Hq=malloc((size_t)r*K*4); subq_rowquant(H,(int)r,K,LV[v],Hq);
+                    float *HP=malloc((size_t)r*c*4); dq_matmul(Hq,P,HP,(int)r,K,(int)c);           /* Ĥ·Pᵀ */
+                    float *R=malloc((size_t)r*c*4); for(size_t i=0;i<(size_t)r*c;i++) R[i]=W[i]-HP[i];
+                    float *Rq=dq_quant_expert_vq(R,(int)r,(int)c,Xpf,nf,4,NC[v]);                  /* 余部: 重要性=x⊥ */
+                    /* 结构化前向: y = Ĥ·x_k + R̂·x⊥ ; 误差 = Yref − Y1 − Y2 */
+                    float *Y1=malloc((size_t)nh*r*4); dq_matmul(Xhk,Hq,Y1,nh,K,(int)r);
+                    float *Y2=malloc((size_t)nh*r*4); dq_matmul(Xhp,Rq,Y2,nh,(int)c,(int)r);
+                    double es=0; for(size_t i=0;i<(size_t)nh*r;i++){ double d=(double)Yref[i]-Y1[i]-Y2[i]; es+=d*d; } eV[v]=es;
+                    free(Y1); free(Y2);
+                    free(Hq); free(HP); free(R); free(Rq); }
+                printf("  L%02d e%03d %-2s held=%d | 相对误差: dql %.4f | 同流程512 %.4f | int4+v256 %.4f (%.0f%% of 512) | int8+v128 %.4f (%.0f%% of 512) | %.0fs\n",
+                       L,e,mn[m],nh,e_dql/sig,e_512/sig,eV[0]/sig,100*eV[0]/e_512,eV[1]/sig,100*eV[1]/e_512,vqt_now()-t0); fflush(stdout);
+                agg[0]+=e_dql/sig; agg[1]+=e_512/sig; agg[2]+=eV[0]/sig; agg[3]+=eV[1]/sig; nagg++;
+                free(W); free(Qd); free(H); free(Yref); free(Xhk); free(Xhp);
+            }
+            free(X); free(Xp); free(rows);
+        }
+        lfile_free(&lf); free(P); free(Pt);
+    }
+    if(nagg) printf("[SUBQ] 汇总(%d 阵, 相对误差均值): dql %.4f | 同流程512 %.4f | int4+v256 %.4f (%.0f%%) | int8+v128 %.4f (%.0f%%)\n",
+                    nagg,agg[0]/nagg,agg[1]/nagg,agg[2]/nagg,100*agg[2]/agg[1],agg[3]/nagg,100*agg[3]/agg[1]);
+    exit(0);
+}

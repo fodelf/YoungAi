@@ -173,7 +173,7 @@ int main(int argc,char**argv){
     for(int i=0;i<NL;i++) GBL_G[i]=1.0f;   /* ★static 默认0=乘0清routed: 反修中途 'B' 回放被它抹平(实锤bug), 必须先置1★ */
     g_xcap_out=g_cli.xcap_out; g_elm_probe=g_cli.elm_probe;   /* 量化链 x 捕获 / ELM 针(见 xcap/elm 分片) */
     g_rot_probe=g_cli.rot_probe;                              /* B类底座旋转针(rotprobe 分片) */
-    g_dw_spec=g_cli.dw_spec; g_mc_probe=g_cli.mc_probe; g_sub_probe=g_cli.sub_probe;        /* ΔW 谱针 / 巨值通道针(dwspec 分片) */
+    g_dw_spec=g_cli.dw_spec; g_mc_probe=g_cli.mc_probe; g_sub_probe=g_cli.sub_probe; g_subq_probe=g_cli.subq_probe;        /* ΔW 谱针 / 巨值通道针(dwspec 分片) */
     nact_rt_init(g_cli.layer_dir);   /* 动态路由反修 Phase-B: 层目录 rroute.txt 门控 */
     st_open(&C,g_cli.hf);
     dw_spectrum_probe();   /* 针: 只读, 打完即退(在 HF 打开后、任何重活之前) */
@@ -314,7 +314,7 @@ int main(int argc,char**argv){
         ANC_BUILD=0; ANC_OK=1;
         if(anchor_save()) fprintf(stderr,"[anchor] 已写 %s\n",anchor_path());
     }
-    mc_probe(S); sub_probe(S);   /* 针: 巨值通道 / 子空间(要锚 fin/ridx), 只读, 打完即退 */
+    mc_probe(S); sub_probe(S); sub_quant_probe(S);   /* 针: 巨值通道 / 子空间 / 子空间联合量化(要锚), 只读, 打完即退 */
     if(g_cli.fp_only){ fprintf(stderr,"[anchor] --fp-only, 到此为止\n"); return 0; }
     /* (backbone q4 A/B 已删: DS4_BBQ4_AB 一次性实验路 2026-08-31 env 清退;
      * src/common/ds4_st.c 的 g_bbq4 因此失去唯一 setter, 保持默认 0) */
