@@ -295,57 +295,9 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
                 lf->nops--;
             }
         }
-#include "ds4quant_sweep_arms.inc.c"   /* 形态C(dyn2)/形态D(GE投影) 候选臂(500 行守卫所迫的物理分片) */
-        double jdl;   /* 本层最优候选Δ%(负=候选都更差) */
-        { double cand=scE; if(scF<cand)cand=scF; if(scA<cand)cand=scA; if(scB<cand)cand=scB; if(scC<cand)cand=scC; if(scD<cand)cand=scD;
-          double dl=(base-cand)/(base>1e-12?base:1); jdl=100.0*dl;
-          if(dl>bf_bestdl){ bf_bestdl=dl; bf_bestJ=J; } }
-        if(form){
-            if(!BKL_FPLP){ vrej++; form=0; }   /* 闸材料缺失: fail-closed 拒落地 */
-        }
-        if(form){
-            /* ★逐单元全程复核, ONEPASS 恒开(2026-08-29 终验判决后重启)★
-             * 历史脉络: 08-27 我开过→08-28 用户令还原冠军原版(当时实测 0落地/4保持=全挡死,
-             * 且"聚合终验功效更高"论成立)→08-29 全域行域修复后终验实测: 41 个近视野全正的
-             * 落地在全程出口上净劣化 27% 被【整体】回滚 —— 聚合终验只能全灭全存, 好坏不分;
-             * 逐单元近视野判据与全程出口不对齐是结构性的(en86 同构)。
-             * 当年"全挡死"的两个前提都已变: ①坏行域(2域)+锚索引 bug 已修 ②复核成本 —— 旧版
-             * 走【全量行】前向(43 层×8.5s), 现在走【抽格行】(moe GPU 接管, ~0.5s/层),
-             * 单元 +2 次全程前向 ≈ 20-40s, 可负担。打分行=EVc(跨全域 eval 抽格), 判据=配对
-             * 差分(同行集 basef vs scv), 行少的噪声在差分里大幅相消。
-             * 统一终验保留(双保险, 应恒过 —— 每个落地都单独全程验证过)。 */
-            double basef=0,scv=0,c0=0,m0=0,c1=0,m1=0;
-            double basekl=bkl_gate(J,Lfront,Hin,rowsz,S,&basef,&c0,&m0);
-            lop_t svE; float svg=0,svt=0,svw2[4]; float*gbak=NULL; int tmpop=-1;
-            memset(&svE,0,sizeof(svE));
-            if(form==5){ svE=lf->ops[ze]; lf->ops[ze]=opE; }
-            else if(form==6){ tmpop=lf->nops; lf->ops[tmpop]=opF; lf->nops++; }
-            else if(form==1){ if(fo>=0){ svg=lf->ops[fo].g; lf->ops[fo].g=baseg*aA; }
-                else if(lf->nops<32){ tmpop=lf->nops; memset(&lf->ops[tmpop],0,sizeof(lop_t));
-                    lf->ops[tmpop].type=1; lf->ops[tmpop].g=aA; lf->nops++; } }
-            else if(form==2){ svt=lf->ops[to].t; lf->ops[to].t=tB; }
-            else if(form==3){ int od=BF_DYN2OP[J];
-                if(od>=0){ memcpy(svw2,lf->ops[od].w2p,16); memcpy(lf->ops[od].w2p,opC.w2p,16); }
-                else if(lf->nops<32){ tmpop=lf->nops; lf->ops[tmpop]=opC; lf->nops++; } }
-            else { int go=BF_GEOP[J];
-                if(go>=0){ gbak=malloc((size_t)NEXP*4); memcpy(gbak,lf->ops[go].ge,(size_t)NEXP*4);
-                    for(int e=0;e<NEXP;e++) lf->ops[go].ge[e]*=geD[e]; }
-                else if(lf->nops<32){ tmpop=lf->nops; memset(&lf->ops[tmpop],0,sizeof(lop_t));
-                    lf->ops[tmpop].type=5; lf->ops[tmpop].ge=geD; lf->nops++; } }   /* geD 所有权不转移 */
-            double candkl=bkl_gate(J,Lfront,Hin,rowsz,S,&scv,&c1,&m1);
-            g_anc_rowmap=scr?sidx:NULL;               /* 还原本单元的粗筛映射 */
-            if(form==5) lf->ops[ze]=svE;
-            else if(form==6) lf->nops--;
-            else if(form==1){ if(tmpop>=0) lf->nops--; else lf->ops[fo].g=svg; }
-            else if(form==2) lf->ops[to].t=svt;
-            else if(form==3){ if(tmpop>=0) lf->nops--; else memcpy(lf->ops[BF_DYN2OP[J]].w2p,svw2,16); }
-            else { if(tmpop>=0) lf->nops--; else memcpy(lf->ops[BF_GEOP[J]].ge,gbak,(size_t)NEXP*4); }
-            if(gbak){ free(gbak); gbak=NULL; }
-            printf("[BKL] L=%02d 复核: 部署KL %.5f→%.5f(%s) 隐分 %.5g→%.5g cos %.5f→%.5f\n",
-                   J,basekl,candkl,candkl<basekl-1e-9?"降✓放行":"不降✗拒",basef,scv,c0,c1); fflush(stdout);
-            if(candkl<basekl-1e-9){ base=basef; bestsc=scv; eFlog=Lfront; }   /* 放行: 真尺(held-KL)降 */
-            else { vrej++; form=0; }                        /* KL 不降: 拒落地(隐分再好也不算肉) */
-        }
+#include "ds4quant_sweep_arms.inc.c"   /* 形态C/D 候选臂 + jdl + ★真尺择优/放行(bkl 逐臂, 2026-09-01)★ */
+        /* (旧"隐分择优→单臂 bkl 复核"两段已并入 sweep_arms 真尺块: 臂间裁决与放行全走部署KL,
+         * 历史脉络(08-27 全挡死→08-29 近视野与全程出口结构性不对齐→08-30 bkl 闸)见 git。) */
         if(form){
             char al[64],rs[128]; uint64_t vol=4;
             if(form==5){   /* ★机制本体: 重解自有 z 落地(原地改写该 op 系数)★ */
@@ -356,7 +308,7 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
                 if(fo>=0){ lf->ops[fo].g=baseg*aA; zfile_commit(J,&lf->ops[fo],(float)bestsc); }
                 else { fo=lf->nops; memset(&lf->ops[fo],0,sizeof(lop_t));
                     lf->ops[fo].type=1; lf->ops[fo].g=aA; lf->nops++;
-                    size_t off=append_rec(pj,"bf.GL","逐层反修最终缩放α(前沿判据)",&lf->ops[fo].g,4,aA);
+                    size_t off=append_rec(pj,"bf.GL","逐层反修最终缩放α(真尺bkl判据)",&lf->ops[fo].g,4,aA);
                     if(off){ lf->ops[fo].foff=off; BF_FINOP[J]=fo; } else { lf->nops--; form=0; } }
                 if(form) snprintf(al,64,"bf.GL α=%.3f(累计g=%.4f)",aA,lf->ops[fo].g);
             } else if(form==2){
@@ -366,7 +318,7 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
                 int od=BF_DYN2OP[J];
                 if(od>=0){ memcpy(lf->ops[od].w2p,opC.w2p,16); zfile_commit(J,&lf->ops[od],(float)bestsc); }
                 else { od=lf->nops; lf->ops[od]=opC; lf->nops++;
-                    size_t off=append_rec(pj,"bf.GLdyn2","逐层反修per-token动态(范数2dof,前沿判据)",opC.w2p,16,opC.w2p[0]);
+                    size_t off=append_rec(pj,"bf.GLdyn2","逐层反修per-token动态(范数2dof,真尺bkl判据)",opC.w2p,16,opC.w2p[0]);
                     if(off){ lf->ops[od].foff=off; BF_DYN2OP[J]=od; } else { lf->nops--; form=0; } }
                 vol=16; if(form) snprintf(al,64,"bf.GLdyn2 w=[%.3f,%.4f]",opC.w2p[0],opC.w2p[1]);
             } else if(form==6){   /* ★F: 新建 9-dof 动态 op(PCA8 方向, V8 内联)★ */
@@ -376,7 +328,7 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
                 memcpy(payb,opF.w8,36);
                 { uint16_t*h=(uint16_t*)(payb+36);
                   for(size_t j=0;j<(size_t)8*DIM;j++) h[j]=go1b_fp32_to_fp16(opF.V8[j]); }
-                size_t off=append_rec(pj,"bf.GLdyn8","逐层反修9dof动态新建(PCA8特征,前沿判据)",payb,plen,opF.w8[0]);
+                size_t off=append_rec(pj,"bf.GLdyn8","逐层反修9dof动态新建(PCA8特征,真尺bkl判据)",payb,plen,opF.w8[0]);
                 free(payb);
                 if(off){ lf->ops[od]=opF; lf->ops[od].foff=off; lf->nops++; V8F=NULL; /* 所有权交 op */ }
                 else form=0;
@@ -389,7 +341,7 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
                     lf->ops[go].type=5; lf->ops[go].ge=geD; lf->nops++;
                     uint16_t*h=malloc((size_t)NEXP*2);
                     for(int e=0;e<NEXP;e++) h[e]=go1b_fp32_to_fp16(geD[e]);
-                    size_t off=append_rec(pj,"bf.GE","逐层反修per-expert增益(路由投影,前沿判据)",h,(uint64_t)NEXP*2,1.0f);
+                    size_t off=append_rec(pj,"bf.GE","逐层反修per-expert增益(路由投影,真尺bkl判据)",h,(uint64_t)NEXP*2,1.0f);
                     free(h);
                     if(off){ lf->ops[go].foff=off; BF_GEOP[J]=go; geD=NULL; /* 所有权交 op */ }
                     else { lf->nops--; free(geD); geD=NULL; form=0; } }

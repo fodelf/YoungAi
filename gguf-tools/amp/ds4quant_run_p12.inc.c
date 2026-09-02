@@ -103,8 +103,8 @@ static void *bkl_worker(void*a){
     }
     w->kl=kl; return NULL;
 }
-static double bkl_eval(const float*lg){   /* 学生 logits → 对 FP 的行均 KL; 打分剔块首 WIN 行(无左上下文) */
-    const int r0=WIN<BKL_N?WIN:0, nr=BKL_N-r0;
+static double bkl_eval(const float*lg){   /* 学生 logits → 对 FP 的行均 KL(LEV 行, 全序列回放后无截断上下文行, 全计) */
+    const int r0=0, nr=BKL_N-r0;
     int nth=NTHREADS>1?NTHREADS:8; if(nth>nr)nth=nr; if(nth>32)nth=32;
     bklw_t w[32]; pthread_t th[32];
     for(int t=0;t<nth;t++){ w[t]=(bklw_t){lg,r0+nr*t/nth,r0+nr*(t+1)/nth,0}; pthread_create(&th[t],NULL,bkl_worker,&w[t]); }
@@ -121,11 +121,21 @@ static float *bkl_head(const float*Hex){   /* 出口 hidden[N,rowsz] → logits[
 }
 static int bkl_init(const float*Htgt,const long*ids,int S,int n_fit,size_t rowsz){
     if(BKL_FPLP) return 1;
-    int h0=n_fit,hn=S-1-h0; if(hn<8) return 0;      /* held [n_fit,S-1): 与收官 VERDICT 同域 */
-    /* ★全 held 连续块, 零抽样魔数(2026-08-31 用户令"写死的数据全部删除")★: 每隔3抽行的
-     * 科学怪人流已废 — 抽行回放实测把工作点打飞(L00 处 KL 6.58 vs 真值 0.74, 9 倍失真)。 */
-    BKL_ROWS=malloc(sizeof(int)*(size_t)(hn+2)); BKL_IDS=malloc(sizeof(long)*(size_t)(hn+2));
-    BKL_N=0; for(int r=h0;r<h0+hn;r++){ BKL_ROWS[BKL_N]=r; BKL_IDS[BKL_N]=ids[r]; BKL_N++; }
+    (void)n_fit;
+    /* ★闸行=布局打分行 LEV(2026-09-01 用户定谳"层内正/验证差=bug"·位置/域缺口正修)★
+     * 旧闸行=[n_fit,S-1) 字面尾块 —— 语料按域连续铺排 ⇒ 尾块只有阿拉伯+中日韩 2/8 域,
+     * 且位置全在 6144+(长上下文)。臂裁决/放行/终验全被这 2 域×晚位置喂判据, 落地算子
+     * "补晚伤早": 同语料全 8192 行复测 KLD 0.28253→0.29504 劣化, 而旧闸报 −5.4% 改善。
+     * 新闸行=<锚>.layout 的 LEV(八域配额+域内等距, 位置铺满全程), 与 zlayer/sweep 隐分
+     * 打分同一批行(row_layout 缓存同一份)。回放侧同步改全序列(见 bkl_gate) ⇒ LEV 散行
+     * 只做出口 gather, 不再有"抽行回放打飞工作点"的 9× 失真(那是把散行当连续块回放的病)。 */
+    int nev=0; const int *lev=row_layout_ev(anchor_path(),&nev);
+    if(!lev||nev<8){ printf("[BKL]★布局打分行缺(%s.layout) → 拒臂(fail-closed)★\n",anchor_path()); return 0; }
+    BKL_ROWS=malloc(sizeof(int)*(size_t)nev); BKL_IDS=malloc(sizeof(long)*(size_t)nev);
+    BKL_N=0; for(int i=0;i<nev;i++){ int r=lev[i];
+        if(r<0||r+1>=S) continue;               /* 末行无下一 token, 自检/评分都要 ids[r+1] */
+        BKL_ROWS[BKL_N]=r; BKL_IDS[BKL_N]=ids[r]; BKL_N++; }
+    if(BKL_N<8){ free(BKL_ROWS); free(BKL_IDS); BKL_ROWS=NULL; BKL_IDS=NULL; BKL_N=0; return 0; }
     BKL_HTG=malloc((size_t)BKL_N*rowsz*4);
     for(int i=0;i<BKL_N;i++) memcpy(BKL_HTG+(size_t)i*rowsz,Htgt+(size_t)BKL_ROWS[i]*rowsz,rowsz*4);
     float *lgf=bkl_head(BKL_HTG);
@@ -135,9 +145,9 @@ static int bkl_init(const float*Htgt,const long*ids,int S,int n_fit,size_t rowsz
         double se=0; for(int v=0;v<VOCAB;v++) se+=exp((double)q[v]-m);
         float ls=(float)log(se);
         for(int v=0;v<VOCAB;v++) q[v]=q[v]-m-ls;
-        if(i>=WIN){ nllf+=-(double)q[(int)ids[BKL_ROWS[i]+1]]; nppl++; }  }
+        nllf+=-(double)q[(int)ids[BKL_ROWS[i]+1]]; nppl++; }
     double pplf=exp(nllf/(nppl>0?nppl:1));
-    printf("[BKL] held-KL 闸: 行=%d FP-PPL=%.4f (对账: 应与收官 VERDICT fp 同量级; 错位即拒臂)\n",BKL_N,pplf);
+    printf("[BKL] held-KL 闸: LEV 行=%d(八域全位置) FP-PPL=%.4f (对账: 应与收官 VERDICT fp 同量级; 错位即拒臂)\n",BKL_N,pplf);
     fflush(stdout);
     if(!(pplf>1.2&&pplf<2000.0)){ printf("[BKL]★FP-PPL 量级异常 → 拒臂(fail-closed: 全部拒落地)★\n");
         free(lgf); free(BKL_ROWS); free(BKL_IDS); free(BKL_HTG); BKL_ROWS=NULL; BKL_IDS=NULL; BKL_HTG=NULL; BKL_N=0; return 0; }
@@ -156,19 +166,24 @@ static void bf_dirmag(const float*Hq,const float*Hf,int n,size_t rowsz,double*co
     *cosm=cs/(n>0?n:1); *magm=mg/(n>0?n:1);
 }
 static double BKL_B0LIVE=1e300;   /* ③态部署 KL 基线(全 S, chunk 起算一次) */
-static double bkl_gate(int J,int Lfront,const float*Hin,size_t rowsz,int Sfull,double*hs,double*cosm,double*magm){
-    /* ★真分布判据仪(2026-08-31)★: 连续 held 块+真实位置(g_pos_off=块首流位置)+模型自己
-     * 的路由 — 与部署/caliper 同工作点。钉路对照/抽行拼接/神谕 override 全删。 */
-    float *hb=malloc((size_t)BKL_N*rowsz*4);
-    for(int i=0;i<BKL_N;i++) memcpy(hb+(size_t)i*rowsz,Hin+(size_t)BKL_ROWS[i]*rowsz,rowsz*4);
-    const int *sv=g_anc_rowmap; int svs=g_anc_rowstride;
-    g_anc_rowmap=BKL_ROWS; g_anc_rowstride=Sfull; g_pos_off=BKL_ROWS[0];
-    float *Hx=gs_forward_exit(J,Lfront,hb,BKL_IDS,BKL_N,BKL_N,NULL);
-    g_pos_off=0; g_anc_rowmap=sv; g_anc_rowstride=svs; free(hb);
-    float *lg=bkl_head(Hx); double kl=bkl_eval(lg); free(lg);
-    if(hs)*hs=co_score(Hx,BKL_HTG,WIN,BKL_N,rowsz);
-    if(cosm&&magm) bf_dirmag(Hx+(size_t)WIN*rowsz,BKL_HTG+(size_t)WIN*rowsz,BKL_N-WIN,rowsz,cosm,magm);
+static double bkl_gate(int J,int Lfront,const float*Hin,size_t rowsz,int Sfull,
+                       const long*ids,int n_fit,double*hs,double*cosm,double*magm){
+    /* ★全序列真值回放(2026-09-01 位置/域缺口正修)★: 旧版把 held 尾块 gather 成紧凑块
+     * 单独回放(g_pos_off 平移位置) —— 块外压缩 KV 缺失+位置域只剩 6144+, 判据被
+     * 2/8 域×长上下文喂饱("补晚伤早"实锤)。新版=从 Hin(全 S 上下文, 即 HQE 行)整段
+     * 前向到出口 —— 与统一终验/caliper 逐字同工作点, 位置/压缩KV/路由全真; LEV 散行
+     * 只在出口 gather 打分(散行做打分零失真, 做回放才是 9× 失真的那口锅)。 */
+    const int *sv=g_anc_rowmap; int svs=g_anc_rowstride, svp=g_pos_off;
+    g_anc_rowmap=NULL; g_pos_off=0;
+    float *Hx=gs_forward_exit(J,Lfront,Hin,ids,Sfull,n_fit,NULL);
+    g_anc_rowmap=sv; g_anc_rowstride=svs; g_pos_off=svp;
+    float *hg=malloc((size_t)BKL_N*rowsz*4);
+    for(int i=0;i<BKL_N;i++) memcpy(hg+(size_t)i*rowsz,Hx+(size_t)BKL_ROWS[i]*rowsz,rowsz*4);
     free(Hx);
+    float *lg=bkl_head(hg); double kl=bkl_eval(lg); free(lg);
+    if(hs)*hs=co_score(hg,BKL_HTG,0,BKL_N,rowsz);
+    if(cosm&&magm) bf_dirmag(hg,BKL_HTG,BKL_N,rowsz,cosm,magm);
+    free(hg);
     return kl;
 }
 static double bkl_exit_kl(const float*Hex,size_t rowsz){   /* 终验用: 全 S 出口 hidden → held KL */
