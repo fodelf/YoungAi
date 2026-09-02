@@ -31,7 +31,6 @@ typedef struct {
     const char *rr_ids, *route_bias, *route_bias_out, *dump_logits;
     const char *merge_gguf, *merge_off, *export_gguf, *export_off, *layer_file;
     const char *go2b_hot_table, *go2b_dir, *vq_rplan, *xcap_out, *elm_probe, *rot_probe;
-    const char *route_miss_out, *hsum_out, *dw_spec, *dump_hidden, *mc_probe, *sub_probe, *subq_probe;   /* 针: 逐行路由错配落盘 / 逐层出口 hash 落盘(跑间对拍) */
     /* 数值(哨兵=env 不设) */
     int nfit;              /* -1=默认 3/4 切分; 1=判尺纯回放(caliper 既有约定) */
     int threads;           /* 0=按核数 */
@@ -40,7 +39,6 @@ typedef struct {
     int coadapt;           /* -1=不设 */
     int export_bytes;      /* 0=反修段 dql 不可变 */
     int go2b_hot;
-    int fp_ablate;         /* 针: 单层置 FP 链上敏感度(链填完即打, 不进 sweep) */
     int bf_term_maxp;
     int minvol_maxl;       /* 0=不设 */
     int calib_cap, calib_export_cap;
@@ -132,14 +130,6 @@ static const dqo_t DQOPT[] = {
     {"xcap-out",        DQO_STR, &g_cli.xcap_out,        "量化链 x 捕获目录"},
     {"elm-probe",       DQO_STR, &g_cli.elm_probe,       "ELM 针层号列表"},
     {"rot-probe",       DQO_STR, &g_cli.rot_probe,       "B类底座旋转针层号列表"},
-    {"route-miss-out",  DQO_STR, &g_cli.route_miss_out,  "针: 逐行路由错配计数落盘(学生top-k槽不在FP锚集)"},
-    {"hsum-out",        DQO_STR, &g_cli.hsum_out,        "针: 逐层出口 hidden FNV64 落盘(同态两跑对拍定位非确定层)"},
-    {"fp-ablate",       DQO_BOOL,&g_cli.fp_ablate,       "针: 单层置FP链上敏感度(43枪, 只读, 打完即退)"},
-    {"dw-spectrum",     DQO_STR, &g_cli.dw_spec,         "针: 量化残差ΔW奇异谱(层号列表; 每层3专家×w1/w3/w2), 打完即退"},
-    {"mc-probe",        DQO_STR, &g_cli.mc_probe,        "针: 巨值通道(层号列表): 通道 Σx² 集中度 + w1/w3 复原 top-c 列后输出误差剩余, 需 --anchor"},
-    {"sub-probe",       DQO_STR, &g_cli.sub_probe,       "针: 专家输入子空间(层号列表): Fin 协方差前k主方向份额 + 子空间精确后输出误差剩余, 需 --anchor"},
-    {"sub-quant-probe", DQO_STR, &g_cli.subq_probe,      "针: 子空间联合量化(层号列表): int4/int8 高部+等体积余部生产VQ, held 行输出误差 vs 基线, 需 --anchor"},
-    {"dump-hidden",     DQO_STR, &g_cli.dump_hidden,     "头前归一化隐状态落盘 [S][DIM] f32(另写 <路径>.head = head.weight [VOCAB][DIM]); 输出头放大器拟合料"},
 };
 #define NDQOPT ((int)(sizeof(DQOPT)/sizeof(DQOPT[0])))
 
