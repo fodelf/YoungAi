@@ -22,7 +22,7 @@ ZL_NTOK=8192                         # 拟合行数=语料份全量(与锚同源
 # 跨语料闸料=量化半锚: 与反修份零重叠的独立文档、又不是判决锚(判决锚进闸=对判决做
 # 模型选择, 铁律禁止)。同语料 held 正/跨份负 = 过拟合层, 闸内拒注。
 QANC=$D2/anchor_vqhalf_q_s8192.bin
-HF=$HOME/ds4-main/hf/DeepSeek-V4-Flash-0731
+HF=$HOME/ds4-main/hf/DeepSeek-V4-Flash-Vision-Exp
 # XCAP/XANCHOR 不在冠军配方(FP-x 口径; "学生=引擎真值"支柱未兑现 —— 实测不接引擎捕获时
 # x=锚fin 与部署分布错位, 行cos L3=0.961/L20=0.875/L40=0.797, z 层内收益部署不兑现,
 # 2026-08-24 定位的主 bug)。判决针已入库: amp_campaign.sh chainx(FP-x vs --xanchor 单层

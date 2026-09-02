@@ -55,7 +55,7 @@ MEM_FLOOR_GB=4   # 系统 MemAvailable 地板 —— ★4 是实测值, 不是�
 #   · 真限制 = 进程 RSS(r30_campaign 内部 wdog, 按机器内存 3/4) —— 那个该随机器缩放
 #   · 这里 = 系统 MemAvailable 最后一道网, 只为抢在内核 OOM killer 前面留个可控停车点。
 #     它必须【低于】负载的正常低点, 否则每次都误杀。调高 = 把正常工况判成失控。
-DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-0731"
+DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-Vision-Exp"
 export DS4_HF   # 脚本间接口(r30_campaign 等子脚本读); 二进制一律走 --hf 显式传(2026-08-31 env 大扫除)
 
 D="$ROOT/gguf/go-onebit/$NAME"
@@ -563,7 +563,7 @@ stage_dynladder(){
     # base86p_spark.sh 同款运行时设置: 缺了会从 24s/层 劣化到 9min/层(mmap 写锁争用实锤)
     export DS4_BF_MEMGB=80 DS4_CALIB_CAP=512 DS4_CALIB_EXPORT_CAP=512
     export MALLOC_MMAP_THRESHOLD_=1073741824 MALLOC_TRIM_THRESHOLD_=1073741824
-    export OPENBLAS_NUM_THREADS=1 DS4_THREADS=20 DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-0731"
+    export OPENBLAS_NUM_THREADS=1 DS4_THREADS=20 DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-Vision-Exp"
     local NC L
     for NC in 256 512 1024; do
         local RP="$P/rplan_nc$NC.txt"
@@ -605,7 +605,7 @@ stage_dynquant(){
     [ -s "$D2/anchor_vqhalf_q_s8192.bin" ] || DIE "量化半锚缺"
     export DS4_BF_MEMGB=80 DS4_CALIB_CAP=512 DS4_CALIB_EXPORT_CAP=512
     export MALLOC_MMAP_THRESHOLD_=1073741824 MALLOC_TRIM_THRESHOLD_=1073741824
-    export OPENBLAS_NUM_THREADS=1 DS4_THREADS=20 DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-0731"
+    export OPENBLAS_NUM_THREADS=1 DS4_THREADS=20 DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-Vision-Exp"
     LOG "②量化发车 变体=$V 计划表=$RP → $MODEL"
     # 断点续跑是自动的: plan_lookup(L) 命中且 ckpt 装得上就复用该层, 重跑同命令即续。
     # 看门狗必挂(2026-08-27 教训): 首跑 L36 被系统 OOM killer 干掉(rc=137), 用户态先杀才可控。
@@ -666,7 +666,7 @@ stage_champbf(){
     # 驱逐是渐进的, 触发点必须【远低于】杀线才来得及。上一跑 footprint 稳在 59-62G,
     # 说明 60 左右是本负载的自然工作点, 取 55 让驱逐早介入, 给杀线留 38G 缓冲。
     export DS4_BF_MEMGB=55 MALLOC_MMAP_THRESHOLD_=1073741824 MALLOC_TRIM_THRESHOLD_=1073741824
-    export OPENBLAS_NUM_THREADS=1 DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-0731"
+    export OPENBLAS_NUM_THREADS=1 DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-Vision-Exp"
     # (2026-08-31 env 大扫除: 原"这四个必须不在场"的 unset DS4_TUNE/MINVOL/MV_BASELINE/VQ_RPLAN
     #  已无必要 — backfit 段现按 flag 拼装, 不传这些开关结构上就不会走错分支)
     # ★bug#5 修(2026-08-29)★ 原写法 `shift 2 2>/dev/null || true`: 只传 1 个参数时 shift 2
@@ -740,7 +740,7 @@ stage_champ86(){
             env MALLOC_MMAP_THRESHOLD_=1073741824 MALLOC_TRIM_THRESHOLD_=1073741824 \
                 OPENBLAS_NUM_THREADS=1 \
             "$QBIN" "$Q_IDS" "$Q_S" \
-                --hf "$ROOT/hf/DeepSeek-V4-Flash-0731" --anchor "$Q_ANCHOR" \
+                --hf "$ROOT/hf/DeepSeek-V4-Flash-Vision-Exp" --anchor "$Q_ANCHOR" \
                 --nfit "$Q_S" --threads "$Q_THREADS" --calib-fullset \
                 --minvol --mv-baseline --tune --pure-vq --vq --tgt-alpha 1.0 \
                 --vq-rplan "$Q_RPLAN" \
@@ -867,7 +867,7 @@ stage_anchors3(){
         watchdog_start
         # 判官归一(2026-08-31): .old 冻结件已删, 建锚同走现行 ds4quant_run + flag
         ( cd "$ROOT/gguf-tools/amp" && env OPENBLAS_NUM_THREADS=1 \
-            ./ds4quant_run "${IDSF[$i]}" 8192 --hf "$ROOT/hf/DeepSeek-V4-Flash-0731" \
+            ./ds4quant_run "${IDSF[$i]}" 8192 --hf "$ROOT/hf/DeepSeek-V4-Flash-Vision-Exp" \
             --threads 20 --bf-memgb 55 --fp-only --anchor "${ANCF[$i]}" ) \
             > "/tmp/anc3_$i.log" 2>&1
         watchdog_stop
@@ -880,6 +880,31 @@ stage_anchors3(){
         LOG "${NAMES[$i]}锚 ✓ $(ls -l "${ANCF[$i]}" | awk '{printf "%.1f GiB", $5/1073741824}')"
     done
 }
+
+# ═══ wt2 官方判决锚(2026-09-01 底座换代补位)═══
+# 判决锚教师必须与现役底座同一个模型("锚教师缺indexer"同族教训: 教师与学生不同源=假账)。
+# 0731 时代此锚是 M1 一次性建的(fable5 08-14), 不在任何链上 —— 换底座时它不会自动重捕,
+# caliper 会拿旧模型当 FP 参照静默出假五指标。收进链: 锚在则跳过(重捕的动作=先归档旧锚)。
+stage_anchor_wt2(){
+    local AW="$R30/anchor_wt2_s2653.bin" WI="$G7/wt2.ids"
+    [ -s "$WI" ] || DIE "wt2.ids 缺"
+    [ -s "$AW" ] && { LOG "wt2 判决锚已在, 跳过(换底座须先归档旧锚再跑本段)"; return 0; }
+    local SW; SW=$(wc -l < "$WI")
+    LOG "捕 wt2 官方判决锚 S=$SW (~10.7GB)"
+    watchdog_start
+    ( cd "$ROOT/gguf-tools/amp" && env OPENBLAS_NUM_THREADS=1 \
+        ./ds4quant_run "$WI" "$SW" --hf "$ROOT/hf/DeepSeek-V4-Flash-Vision-Exp" \
+        --threads 20 --bf-memgb 55 --fp-only --anchor "$AW" ) \
+        > /tmp/anc_wt2.log 2>&1
+    watchdog_stop
+    [ -s "$AW" ] || { tail -5 /tmp/anc_wt2.log; DIE "wt2 判决锚没落盘"; }
+    # 锚自检(不带 --student = 只打 FP 教师对真值): 0731 对表 PPL 4.237/top1 67.4。
+    # 换底座绝对值会动, 量级不该变 —— 前向断了会出 2.4e7 这种一眼假的数。
+    "$ROOT/gguf-tools/bench/anchor_metrics" --ref "$AW" --ids "$WI" --tail 3 \
+        2>&1 | grep -aE "PPL|top" | head -4
+    LOG "wt2 判决锚 ✓ $(ls -l "$AW" | awk '{printf "%.1f GiB", $5/1073741824}')"
+}
+
 # 判决份同域尺: 对任意层件目录出五指标(与 wt2 尺同一把 caliper, 只换 ids/锚)
 stage_judge3(){
     local D2="$ROOT/gguf/go-onebit/vqhalf" V="${1:-champ86}"
@@ -932,7 +957,7 @@ stage_probe3(){
         Q86_IDS="$ID" Q86_S=8192 Q86_NFIT=6144 Q86_ANCHOR="$AN" Q86_OUT="$PW" \
         RPLAN86="$ROOT/gguf/go-onebit/r30/rplan_base86p.txt" VOLB86=76 \
         DS4_BF_MEMGB=55 DS4_THREADS=20 OPENBLAS_NUM_THREADS=1 \
-        DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-0731" \
+        DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-Vision-Exp" \
         bash "$SC/r30_campaign.sh" quant86 ) > /tmp/p3_quant.log 2>&1
     watchdog_stop
     T1=$(date +%s)
@@ -949,7 +974,7 @@ stage_probe3(){
     T2=$(date +%s)
     ( cd "$ROOT" && env PROBE_NL2=1 OUTF_OVERRIDE="$W" ANCHOR_OVERRIDE="$AN" IDS_OVERRIDE="$ID" \
         BF_S=8192 BF_NFIT=6144 DS4_THREADS=20 DS4_NL=2 DS4_GSWEEP=0 DS4_GO2B_HOT=0 \
-        DS4_BF_MEMGB=55 OPENBLAS_NUM_THREADS=1 DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-0731" \
+        DS4_BF_MEMGB=55 OPENBLAS_NUM_THREADS=1 DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-Vision-Exp" \
         MALLOC_MMAP_THRESHOLD_=1073741824 MALLOC_TRIM_THRESHOLD_=1073741824 \
         QBIN_OVERRIDE="$ROOT/gguf-tools/amp/ds4quant_run" \
         bash "$SC/r30_campaign.sh" backfit ) > /tmp/p3_sweep.log 2>&1
@@ -1003,6 +1028,7 @@ stage_champ3(){
     # ⇒ 三个锚(各 30.8G/57 分钟)不作废。
     stage_idshalf
     stage_anchors3
+    stage_anchor_wt2
     if [ -d "$W" ]; then
         cp -f "$W/backfit.log" /tmp/champ86_prev_backfit.log 2>/dev/null || true
         LOG "语料已换 ⇒ 清 champ86 重量化(只读原件 vq86h_noz 不动; 上轮日志留 /tmp)"
@@ -1132,7 +1158,7 @@ PY2
         watchdog_start
         # 判官归一(2026-08-31): .old 冻结件已删, 建锚同走现行 ds4quant_run + flag
         ( cd "$ROOT/gguf-tools/amp" && env OPENBLAS_NUM_THREADS=1 \
-            ./ds4quant_run "$CI" 8192 --hf "$ROOT/hf/DeepSeek-V4-Flash-0731" \
+            ./ds4quant_run "$CI" 8192 --hf "$ROOT/hf/DeepSeek-V4-Flash-Vision-Exp" \
             --threads 20 --bf-memgb 55 --fp-only --anchor "$CA" ) > /tmp/anc_c.log 2>&1
         watchdog_stop
         [ -s "$CA" ] || { tail -5 /tmp/anc_c.log; DIE "第三片锚没落盘"; }
@@ -1231,7 +1257,7 @@ ST="${1:-all}"
 case "$ST" in
   preflight) stage_preflight;; ids) stage_ids;; anchor) stage_anchor;;
   capture) stage_capture;; probe) stage_probe;; solve) stage_solve;; pass2) stage_pass2;;
-  chain) stage_chain;; judge) stage_judge;; dilute) stage_dilute;; idshalf) stage_idshalf;; idshalf_ext) shift; stage_idshalf_ext "$@";; vqmerge) stage_vqmerge;; vqcap) stage_vqcap;; vqsolve) stage_vqsolve;; dynladder) stage_dynladder;; dynquant) shift; stage_dynquant "$@";; dynjudge) stage_dynjudge;; champbf) shift; stage_champbf "$@";; champ86) stage_champ86;; champreset) stage_champ_reset;; champ3rd) stage_champ3rd;; corpdiff) stage_corpdiff;; anchors3) stage_anchors3;; champ3) stage_champ3;; elmprobe) stage_elmprobe;; probe3) stage_probe3;; judge3) shift; stage_judge3 "$@";; champrb) stage_champ_rbsweep;; chainx) stage_chainx;; full) shift; stage_full "$@";;
+  chain) stage_chain;; judge) stage_judge;; dilute) stage_dilute;; idshalf) stage_idshalf;; idshalf_ext) shift; stage_idshalf_ext "$@";; vqmerge) stage_vqmerge;; vqcap) stage_vqcap;; vqsolve) stage_vqsolve;; dynladder) stage_dynladder;; dynquant) shift; stage_dynquant "$@";; dynjudge) stage_dynjudge;; champbf) shift; stage_champbf "$@";; champ86) stage_champ86;; champreset) stage_champ_reset;; champ3rd) stage_champ3rd;; corpdiff) stage_corpdiff;; anchors3) stage_anchors3;; anchorwt2) stage_anchor_wt2;; champ3) stage_champ3;; elmprobe) stage_elmprobe;; probe3) stage_probe3;; judge3) shift; stage_judge3 "$@";; champrb) stage_champ_rbsweep;; chainx) stage_chainx;; full) shift; stage_full "$@";;
   all) stage_preflight; stage_ids; stage_anchor; stage_capture
        stage_solve; stage_chain; stage_judge;;
   *) echo "未知段: $ST"; echo "段: preflight ids anchor capture solve pass2 chain judge dilute all (probe/dilute=诊断)"; exit 2;;

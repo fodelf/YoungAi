@@ -41,7 +41,7 @@ cd "$ROOT/gguf-tools/amp"
 # 2026-08-31 env 大扫除: 判决尺全参数走 CLI flag(发车命令一眼可见), OPENBLAS 线程是
 # 外部库自己的 env 不在禁令内。
 env OPENBLAS_NUM_THREADS=1 ./ds4quant_run "$IDS" "$SN" \
-    --hf "$ROOT/hf/DeepSeek-V4-Flash-0731" --bf-memgb "$BFMEM" \
+    --hf "$ROOT/hf/DeepSeek-V4-Flash-Vision-Exp" --bf-memgb "$BFMEM" \
     --bf-only --coadapt 1 --calib-fullset \
     --export-bytes 0 --anchor "$ANC" --nfit 1 --threads "$THR" \
     --layer-dir "$LAYERS" --lcfg "$LCx" --vq --tgt-alpha 1.0 \
