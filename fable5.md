@@ -8756,3 +8756,5 @@ zchain.bin 34432820 B, route_bias_r30.bin(注: HEAD 的 r30 backfit 仍传 --rou
 archive_sweep5/6/8 未删(待用户裁)。
 **回滚后未保留的两个真 bug 修法(在 stash 里, 平权路同样受益)**: ①导出 worker 退出不释放 __thread cuBLAS 暂存
 (每层 ~0.9GB 泄漏, 43 层 39GB, 靠 121GB 余量硬扛); ②sweep 发车吃上一轮 route_bias 文件。
+**回滚复核(18:36, HEAD 二进制, 恢复后的 champ86amp)**: wt2 Σmin 0.8163 / KLD 0.32495 / top 81.87% / PPL 1.259 —— 与 sweep3 收官
+读数(0.8166 / 0.32461 / 81.83% / 1.257)在同态两跑噪声(KLD ±1.3e-3)内一致, 回滚坐实。机器空闲。
