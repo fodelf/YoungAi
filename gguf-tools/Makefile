@@ -58,7 +58,9 @@ HFREAD_INC := $(wildcard $(CAL)/hf_read_p*.inc.c)
 VQMERGE_INC := $(wildcard $(QZ)/vq_merge_v4_p*.inc.c)
 ZLAYER_INC := $(wildcard $(AMP)/zlayer_p*.inc.c)
 DSQRUN_INC := $(wildcard $(AMP)/ds4quant_run_p*.inc.c) $(AMP)/ds4quant_anchor.inc.c \
-              $(AMP)/ds4quant_moe_gpu.inc.c $(AMP)/ds4quant_zreplay.inc.c $(AMP)/ds4quant_bfkernel.inc.c $(AMP)/ds4quant_sweep_arms.inc.c
+              $(AMP)/ds4quant_moe_gpu.inc.c $(AMP)/ds4quant_zreplay.inc.c $(AMP)/ds4quant_bfkernel.inc.c $(AMP)/ds4quant_sweep_arms.inc.c \
+              $(AMP)/ds4quant_elm.inc.c $(AMP)/ds4quant_cli.inc.c $(AMP)/ds4quant_zsolve.inc.c \
+              $(AMP)/ds4quant_xcap.inc.c $(AMP)/dsq_lfile.inc.c $(AMP)/row_layout.inc.c $(AMP)/ds4quant_rotprobe.inc.c
 # 仓库根同源实现+116 契约头: wildcard 罩不到 gguf-tools 外, 漏列=改完静默不重编
 # (2026-08-31 实撞: ds4_amp_fmt.h 收 tr 单一定义源后 Linux 侧 make 说"无需做任何事")
 AMP_ROOT_SRC := ../ds4_z.c ../ds4_z.h ../ds4_loss.c ../ds4_loss.h ../src/common/ds4_amp_fmt.h

@@ -172,6 +172,7 @@ int main(int argc,char**argv){
     if(g_cli.vq) dq_vq_set(1);   /* 读点在 quantize/vq_qc.h 的头内 static, 单 TU 直连 */
     for(int i=0;i<NL;i++) GBL_G[i]=1.0f;   /* ★static 默认0=乘0清routed: 反修中途 'B' 回放被它抹平(实锤bug), 必须先置1★ */
     g_xcap_out=g_cli.xcap_out; g_elm_probe=g_cli.elm_probe;   /* 量化链 x 捕获 / ELM 针(见 xcap/elm 分片) */
+    g_rot_probe=g_cli.rot_probe;                              /* B类底座旋转针(rotprobe 分片) */
     nact_rt_init(g_cli.layer_dir);   /* 动态路由反修 Phase-B: 层目录 rroute.txt 门控 */
     st_open(&C,g_cli.hf);
     if(g_cli.nl){ NLAYERS=g_cli.nl; if(NLAYERS<1)NLAYERS=1; if(NLAYERS>NL)NLAYERS=NL; }

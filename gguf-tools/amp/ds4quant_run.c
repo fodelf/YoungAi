@@ -41,6 +41,7 @@
 #include "ds4quant_run_p5.inc.c"
 #include "ds4quant_run_p6.inc.c"
 #include "ds4quant_bfkernel.inc.c"
+#include "ds4quant_rotprobe.inc.c"   /* B类底座旋转针(要 p1 的 C/st_read 与 vq_qc.h, p7 挂钩) */
 #include "ds4quant_run_p7.inc.c"
 #include "ds4quant_run_p8.inc.c"
 #include "ds4quant_run_p9.inc.c"

@@ -30,7 +30,7 @@ typedef struct {
     const char *layer_dir, *lcfg, *zfile, *zchain, *ckpt_dir, *plan;
     const char *rr_ids, *route_bias, *route_bias_out, *dump_logits;
     const char *merge_gguf, *merge_off, *export_gguf, *export_off, *layer_file;
-    const char *go2b_hot_table, *go2b_dir, *vq_rplan, *xcap_out, *elm_probe;
+    const char *go2b_hot_table, *go2b_dir, *vq_rplan, *xcap_out, *elm_probe, *rot_probe;
     /* 数值(哨兵=env 不设) */
     int nfit;              /* -1=默认 3/4 切分; 1=判尺纯回放(caliper 既有约定) */
     int threads;           /* 0=按核数 */
@@ -129,6 +129,7 @@ static const dqo_t DQOPT[] = {
     {"repair-cold",     DQO_BOOL,&g_cli.repair_cold,     "②冷专家修复(需 --anchor-old + --layer-dir)"},
     {"xcap-out",        DQO_STR, &g_cli.xcap_out,        "量化链 x 捕获目录"},
     {"elm-probe",       DQO_STR, &g_cli.elm_probe,       "ELM 针层号列表"},
+    {"rot-probe",       DQO_STR, &g_cli.rot_probe,       "B类底座旋转针层号列表"},
 };
 #define NDQOPT ((int)(sizeof(DQOPT)/sizeof(DQOPT[0])))
 

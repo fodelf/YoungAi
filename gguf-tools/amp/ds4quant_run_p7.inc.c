@@ -247,6 +247,8 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
                 } else printf("★ELM L%02d 解算失败\n",L), fflush(stdout);
                 free(yq);
             }
+            /* B类底座旋转针(同物料位: Fin=部署口径x, idx=部署路由; 只读不写) */
+            if(rot_probe_hit(L)) rot_probe_layer(L,Fin,S,n_fit,idx);
         }
         z_shb=shb;   /* 所有权移交 z/GE 闸(routed 口径), p8 统一释放 */
     } else if(do_quant&&cfg=='g'&&COADAPT>0&&ANC_OK){
