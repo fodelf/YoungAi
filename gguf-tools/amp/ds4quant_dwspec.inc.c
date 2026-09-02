@@ -146,3 +146,101 @@ static void mc_probe(int S){
     }
     exit(0);
 }
+
+/* ═══ 子空间针(2026-09-02 用户批"打一针", 方案 C 最后一条有物理依据的线)═══
+ * 通道能量是对角视角(上面 mc-probe: 均匀); 这里看协方差: 专家输入 Fin 的能量是否集中在低维子空间
+ * (头前 h 前 64 主方向占 78.5%)。若是, 等体积联合设计="W 对子空间的作用存高精度 + 补空间低比特",
+ * 有效输出误差 ≈ 补空间能量份额 × 补空间误差。两个数: ①Fin 协方差前 k 主方向能量份额(k=64/128/256)
+ * ②把子空间部分设为精确后, 专家输出误差剩余 ‖ΔW·(I−PPᵀ)X‖²/‖ΔW·X‖²(对照 1−份额)。只读。 */
+static const char *g_sub_probe = NULL;   /* --sub-probe "0,12,24,36,41" */
+typedef struct { const double *G; const double *V; double *W; int D, k, i0, i1; } sp_mv_t;
+static void *sp_mv_worker(void *a){ sp_mv_t *m=(sp_mv_t*)a;   /* W[i][:] = G[i][:]·V */
+    for(int i=m->i0;i<m->i1;i++){ const double *gi=m->G+(size_t)i*m->D; double *wi=m->W+(size_t)i*m->k;
+        for(int j=0;j<m->k;j++) wi[j]=0;
+        for(int t=0;t<m->D;t++){ double g=gi[t]; if(g==0) continue; const double *vt=m->V+(size_t)t*m->k; for(int j=0;j<m->k;j++) wi[j]+=g*vt[j]; } }
+    return NULL; }
+/* 前 k 特征向量(列存 V[D][k]) + 特征值降序; 块幂迭代(多线程 G·V)+Gram-Schmidt */
+static void sp_top_eigvec(const double *G,int D,int k,int iters,double *V,double *lam,int nth){
+    double *W=malloc((size_t)D*k*8); unsigned s=777u;
+    for(size_t i=0;i<(size_t)D*k;i++){ s=s*1103515245u+12345u; V[i]=((s>>8)&0xffff)/65536.0-0.5; }
+    pthread_t th[32]; sp_mv_t mv[32]; if(nth>32)nth=32;
+    for(int it=0;it<iters;it++){
+        for(int t=0;t<nth;t++){ mv[t]=(sp_mv_t){G,V,W,D,k,D*t/nth,D*(t+1)/nth}; pthread_create(&th[t],NULL,sp_mv_worker,&mv[t]); }
+        for(int t=0;t<nth;t++) pthread_join(th[t],NULL);
+        for(int j=0;j<k;j++){
+            for(int p=0;p<j;p++){ double d=0; for(int i=0;i<D;i++) d+=W[(size_t)i*k+j]*W[(size_t)i*k+p]; for(int i=0;i<D;i++) W[(size_t)i*k+j]-=d*W[(size_t)i*k+p]; }
+            double n=0; for(int i=0;i<D;i++) n+=W[(size_t)i*k+j]*W[(size_t)i*k+j]; n=sqrt(n)+1e-300; for(int i=0;i<D;i++) W[(size_t)i*k+j]/=n; }
+        memcpy(V,W,(size_t)D*k*8);
+    }
+    for(int t=0;t<nth;t++){ mv[t]=(sp_mv_t){G,V,W,D,k,D*t/nth,D*(t+1)/nth}; pthread_create(&th[t],NULL,sp_mv_worker,&mv[t]); }
+    for(int t=0;t<nth;t++) pthread_join(th[t],NULL);
+    for(int j=0;j<k;j++){ double acc=0; for(int i=0;i<D;i++) acc+=V[(size_t)i*k+j]*W[(size_t)i*k+j]; lam[j]=acc; }
+    /* 按 λ 降序重排列(选择排序, k≤256) */
+    for(int a=0;a<k;a++){ int b=a; for(int c2=a+1;c2<k;c2++) if(lam[c2]>lam[b]) b=c2;
+        if(b!=a){ double t=lam[a]; lam[a]=lam[b]; lam[b]=t; for(int i=0;i<D;i++){ double v=V[(size_t)i*k+a]; V[(size_t)i*k+a]=V[(size_t)i*k+b]; V[(size_t)i*k+b]=v; } } }
+    free(W);
+}
+typedef struct { const float *D; const float *X; int r, c, n, i0, i1; double *err; } sp_err_t;
+static void *sp_err_worker(void *a){ sp_err_t *e=(sp_err_t*)a; double s=0;
+    for(int i=e->i0;i<e->i1;i++){ const float *di=e->D+(size_t)i*e->c; for(int t=0;t<e->n;t++){ const float *x=e->X+(size_t)t*e->c; double y=0; for(int j=0;j<e->c;j++) y+=(double)di[j]*x[j]; s+=y*y; } }
+    *e->err=s; return NULL; }
+static double sp_err(const float *D,const float *X,int r,int c,int n,int nth){   /* ‖D·Xᵀ‖² 多线程 */
+    pthread_t th[32]; sp_err_t ea[32]; double part[32]; if(nth>32)nth=32; if(nth>r)nth=r;
+    for(int t=0;t<nth;t++){ ea[t]=(sp_err_t){D,X,r,c,n,r*t/nth,r*(t+1)/nth,&part[t]}; pthread_create(&th[t],NULL,sp_err_worker,&ea[t]); }
+    double s=0; for(int t=0;t<nth;t++){ pthread_join(th[t],NULL); s+=part[t]; } return s; }
+static void sub_probe(int S){
+    if(!g_sub_probe) return;
+    if(!ANC_OK||!ANC.fin||!ANC.ridx){ fprintf(stderr,"[SUBPROBE]★需 --anchor★\n"); exit(2); }
+    if(!g_cli.layer_dir){ fprintf(stderr,"[SUBPROBE]★需 --layer-dir★\n"); exit(2); }
+    const int EX[3]={0,128,255}; const int KS[3]={64,128,256}; const int KM=256, NEMAX=768; int nth=NTHREADS>1?NTHREADS:8;
+    char b[256]; snprintf(b,sizeof b,"%s",g_sub_probe);
+    for(char *tok=strtok(b,","); tok; tok=strtok(NULL,",")){ int L=atoi(tok);
+        const float *FIN=ANC.fin+(size_t)L*S*DIM; const int32_t *RIDX=ANC.ridx+(size_t)L*S*NACT;
+        /* ①协方差 G=XᵀX: 先转置成 Xt[D][S] 复用行 Gram */
+        float *Xt=malloc((size_t)DIM*S*4); for(int s=0;s<S;s++) for(int j=0;j<DIM;j++) Xt[(size_t)j*S+s]=FIN[(size_t)s*DIM+j];
+        double *G=malloc((size_t)DIM*DIM*8); { pthread_t th[32]; dws_gram_t gw[32]; int n2=nth>32?32:nth;
+          for(int t=0;t<n2;t++){ int r0=(int)(DIM*sqrt((double)t/n2)), r1=(int)(DIM*sqrt((double)(t+1)/n2)); if(t==n2-1)r1=DIM; gw[t]=(dws_gram_t){Xt,DIM,S,r0,r1,G}; pthread_create(&th[t],NULL,dws_gram_worker,&gw[t]); }
+          for(int t=0;t<n2;t++) pthread_join(th[t],NULL); }
+        free(Xt);
+        double tr=0; for(int i=0;i<DIM;i++) tr+=G[(size_t)i*DIM+i];
+        double *V=malloc((size_t)DIM*KM*8), lam[256]; sp_top_eigvec(G,DIM,KM,30,V,lam,nth); free(G);
+        double c64=0,c128=0,c256=0; for(int j=0;j<KM;j++){ if(j<64)c64+=lam[j]; if(j<128)c128+=lam[j]; c256+=lam[j]; }
+        printf("[SUBPROBE] L%02d Fin 协方差前 k 主方向能量份额: k=64:%.1f%% k=128:%.1f%% k=256:%.1f%% (各向同性 k=256:%.1f%%; λ1 占 %.1f%%)\n",
+               L,100*c64/tr,100*c128/tr,100*c256/tr,100.0*KM/DIM,100*lam[0]/tr); fflush(stdout);
+        char lp[512]; snprintf(lp,sizeof lp,"%s/dql_L%02d.bin",g_cli.layer_dir,L);
+        lfile_t lf; if(lfile_load(lp,&lf)!=0||!lf.vqmap){ fprintf(stderr,"[SUBPROBE]★L%d 层件缺★\n",L); free(V); continue; }
+        const uint64_t *vtab=(const uint64_t*)(lf.vqmap+16);
+        float *Pf=malloc((size_t)DIM*KM*4); for(size_t i=0;i<(size_t)DIM*KM;i++) Pf[i]=(float)V[i];   /* P[D][k] 列=主方向 */
+        for(int xi=0;xi<3;xi++){ int e=EX[xi];
+            int *rows=malloc(S*sizeof(int)); int ne=0;
+            for(int s=0;s<S&&ne<NEMAX;s++){ for(int a=0;a<NACT;a++) if(RIDX[(size_t)s*NACT+a]==e){ rows[ne++]=s; break; } }
+            if(ne<8){ printf("  e%03d 路由行仅 %d, 跳过\n",e,ne); free(rows); continue; }
+            /* X_e 与三档补空间投影 X⊥_k = X − P_k P_kᵀ X */
+            float *X=malloc((size_t)ne*DIM*4); for(int t=0;t<ne;t++) memcpy(X+(size_t)t*DIM,FIN+(size_t)rows[t]*DIM,(size_t)DIM*4);
+            float *Xp[3]; double xe=0, xp[3]={0,0,0};
+            for(int t=0;t<ne;t++) for(int j=0;j<DIM;j++) xe+=(double)X[(size_t)t*DIM+j]*X[(size_t)t*DIM+j];
+            for(int ki=0;ki<3;ki++){ int k=KS[ki]; Xp[ki]=malloc((size_t)ne*DIM*4);
+                for(int t=0;t<ne;t++){ const float *x=X+(size_t)t*DIM; float *o=Xp[ki]+(size_t)t*DIM; double coef[256];
+                    for(int j=0;j<k;j++){ double sacc=0; for(int i=0;i<DIM;i++) sacc+=(double)Pf[(size_t)i*KM+j]*x[i]; coef[j]=sacc; }
+                    for(int i=0;i<DIM;i++){ double sacc=0; for(int j=0;j<k;j++) sacc+=coef[j]*Pf[(size_t)i*KM+j]; o[i]=(float)(x[i]-sacc); xp[ki]+=(double)o[i]*o[i]; } } }
+            printf("  e%03d 行=%d 该专家 x 在补空间的能量份额: k=64:%.1f%% k=128:%.1f%% k=256:%.1f%%\n",e,ne,100*xp[0]/xe,100*xp[1]/xe,100*xp[2]/xe); fflush(stdout);
+            const char *mn[2]={"w1","w3"}; uint64_t of[2]={vtab[(size_t)e*3],vtab[(size_t)e*3+1]};
+            for(int m=0;m<2;m++){
+                if(!of[m]){ printf("    %-2s 冷槽跳过\n",mn[m]); continue; }
+                char n[160]; snprintf(n,sizeof n,"layers.%d.ffn.experts.%d.%s.weight",L,e,mn[m]);
+                long r,c; float *W=st_read_weight(&C,n,&r,&c); if(!W){ printf("    %-2s HF 读失败\n",mn[m]); continue; }
+                float *Q=malloc((size_t)r*c*4); int qr=0,qc=0;
+                if(vq_unpack_dequant(lf.vqmap+of[m],lf.vqmsz-of[m],Q,&qr,&qc)!=0||qr!=r||qc!=c){ printf("    %-2s 反量化失败\n",mn[m]); free(W); free(Q); continue; }
+                float *Dm=malloc((size_t)r*c*4); for(size_t i=0;i<(size_t)r*c;i++) Dm[i]=W[i]-Q[i];
+                double err0=sp_err(Dm,X,(int)r,(int)c,ne,nth), sig=sp_err(W,X,(int)r,(int)c,ne,nth);
+                printf("    %-2s ‖ΔW·X‖²/‖W·X‖²=%.4f | 子空间精确后剩余: ",mn[m],err0/sig);
+                for(int ki=0;ki<3;ki++){ double ek=sp_err(Dm,Xp[ki],(int)r,(int)c,ne,nth); printf("k=%d:%.1f%%(x补空间%.1f%%) ",KS[ki],100*ek/err0,100*xp[ki]/xe); }
+                printf("\n"); fflush(stdout);
+                free(W); free(Q); free(Dm);
+            }
+            free(X); for(int ki=0;ki<3;ki++) free(Xp[ki]); free(rows);
+        }
+        lfile_free(&lf); free(V); free(Pf);
+    }
+    exit(0);
+}
