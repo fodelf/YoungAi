@@ -8810,3 +8810,35 @@ C. ★端到端逐层敏感度从未测出★: 单层置 FP 针(lsens, 在 stash
 不成立也不否定 —— 先修尺再判层。在案候选(待用户裁, 均需发车批准): (1) z 段空枪闸(小改, p7)+ z 段重跑;
 (2) lsens 43 枪(归档 route_bias_r30.bin 后从 stash 取针, 深层枪短浅层枪长); (3) HQE 链复现性二分
 (HQE[J+1] vs layer_fwd(HQE[J]) 逐层 md5/relL2, 定位漂移层)。
+
+## 2026-09-02 ★速度战役(用户令"停止所有任务, 先修速度, 最起码 30 秒一层"): 链枪逐层前向 8.4s→2.2s(S=2653) / 6.5~8s→2.2~2.4s(S=8192)★
+
+起因: zg1(z 段重跑, 空枪闸)L0/L1 单元各 10 分钟 —— 42 层链枪 275~331s, 折 6.5~8s/层。perf(paranoid=4)/gdb(ptrace_scope=1)
+均不可用, 靠程序自带 [GSX]/[LT]/[bmwt] 分段账定罪: MoE 2.5~3.2s/层(25.8GB fp32 物化进 managed + 768 次 dq_matmul 往返 + 20 线程
+动态抢专家的归约), attention 2.4s/层(q/o 各 1GB 三次往返 + wo_a 550 GFLOP 在 8 线程 cblas), fp16 层缓存驱逐重载。
+
+**改法(全部落地在工作区, 数值门=同一把尺五指标每版核对)**:
+| 版 | 改动 | wt2(S=2653) 43 层 | a 锚(S=8192) 43 层 |
+|---|---|---|---|
+| 原 | — | ≈360s | (zg2 首枪 42 层 275~331s) |
+| v1 | MoE 全序列 GPU 常驻: dequant 进显存、按专家序 GEMM+SwiGLU+scatter 全在设备(vq_gpu_moefull.inc.cu), 求和顺序固定 | 243s | — |
+| v2 | attention 设备全路: q 不回主机, 逐头 rms/rope/逆 rope 核, wo_a/wo_b cuBLAS(vqg_attention_full) | 432s(载荷 cudaMemcpy 拷 mmap 页 100MB/s 拖累) | — |
+| v3/v4 | 载荷 pread→钉页→显存; 只读本块矩阵、文件序 4 线程 | 145s / **114s** | — |
+| v6 | 下一层载荷后台预取(mf_pf_*) | — | 209s(推进段下一层未装, 预取未命中) |
+| v9 | 混合 attention(滑窗带核 + 压缩段 2048 键 cuBLAS 批量 GEMM, 并集 softmax) + 预取修正 + 共享专家设备一次过 | — | 170.6s |
+| v10 | zl.ERF(type8)层设备回放(此前 5 层退旧路 6~10s/层) + 归约跳过空 worker slot | — | **126.4s**(attn 74.8/moe 47.1) |
+五指标: wt2 Σmin 0.8165/KLD 0.32525/top 81.94/PPL 1.258(sweep3 态复核 0.8163/0.32495/81.87/1.259 噪声内); a 锚 8192 行
+Σmin 0.8116/KLD 0.27137/top 78.76/PPL 1.113 各版逐版不变(VERDICT 四位一致)。
+**慢的真相(逐版实锤)**: ①GPU 隔着 mmap 读文件页 3.8GB/s, cudaMemcpy 拷 mmap 页 100MB/s —— 慢的从来不是写 26GB 而是读文件页;
+②每层 1.8GB VQ 载荷 × 43 层 = 78GB/枪, 页缓存放不下, 是 NVMe 字节墙 ⇒ 只能靠预取藏进计算; ③带核每个 (s,h) block 重读全部
+K 行(64 头共用一份 kva 却读 64 遍), ratio=4 层 2.3TB L2 流量/层; ④共享专家/ERF 层/归约都是"能走 GPU 却在 CPU 兜圈"。
+**v11 分相(S=8192 设备侧)**: GEMM(wqb)+qrms/rope 0.12s, 注意力核 0.12s(Sc=0)/0.30s(Sc=2048 混合路), irope+wo_a+wo_b 0.13s, D2H≈0
+⇒ 设备侧 0.4~0.55s; [LT] attn 桶 0.9~1.1s, 差额=宿主 hc_pre/rms/压缩器/q 投影往返/470MB 权重 H2D。
+**当前每层(S=8192)**: attn 0.9~1.2 + moe 0.9~1.2 + 其余 0.1~0.2 ≈ 2.2~2.4s, 42 层链枪 ≈ 95~100s; 另有随机层 attn 尖峰
+(v9 L10/L11/L18/L30/L38 5~11s, v10 L11 10.9s)待 v12 逐层子桶定位。
+**离目标的距离(诚实账)**: 用户目标 ≤30s/层 ⇒ 链枪 ≤15s(两枪)或 ≤30s(一枪) ⇒ 逐层前向 ≤0.35~0.7s。剩余可动的: (a) 权重 fp16
+常驻显存免每层 470MB H2D(~0.1~0.15s) (b) TF32/fp16 张量核 GEMM(~0.2s, 改数值需用户裁) (c) 残差流 H 常驻设备、hc/rms/压缩器
+上 GPU(~0.3~0.5s, 等于把层前向改成引擎式) (d) 空枪策略已改"只在落地后重打", 大多数层一枪。(a)(c) 做完约 1s/层 ⇒ 链枪 ~40s。
+代码: gguf-tools/quantize/vq_gpu_moefull.inc.cu(新)/vq_gpu_attn.inc.cu(+混合路/全路)/amp/ds4quant_moe_gpu.inc.c(全序列路+预取+ERF)
+/ds4quant_fwd_p2(attention 接入)/p4(归约 t0)/p7(空枪策略/共享专家)/p8(重读/LT 子桶)/p12(链枪处女层缓存+GSX 账)/dsq_lfile(保留 vq fd)。
+均未提交(铁律: 验证成功+用户批准)。
