@@ -177,7 +177,7 @@ static pplr ppl_block(const float *lg, const long *ids, int nids, int V, int lo,
 
 int main(int argc, char **argv) {
     const char *refp = NULL, *rawp = NULL, *idsp = NULL, *stup = NULL, *sraw = NULL;
-    int fit = 0, tail = 0, threads = 16;
+    int fit = 0, tail = 0, threads = 16; const char *rowout = NULL;   /* 逐位置 KL/Σmin/same 落盘(尾部集中度诊断, 不动五指标) */
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--ref") && i + 1 < argc) refp = argv[++i];
         else if (!strcmp(argv[i], "--ref-raw") && i + 1 < argc) rawp = argv[++i];
@@ -187,6 +187,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--fit") && i + 1 < argc) fit = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--tail") && i + 1 < argc) tail = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) threads = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--row-out") && i + 1 < argc) rowout = argv[++i];
     }
     if ((!refp && !rawp) || !idsp) { fprintf(stderr, "需 --ref/--ref-raw 与 --ids\n"); return 2; }
 
@@ -266,6 +267,10 @@ int main(int argc, char **argv) {
         printf("  RMS Δp(top32窗) = %.4f%%\n", sqrt(mr / n) * 100);
         printf("  Same top token  = %.2f%%\n", ms / n * 100);
         printf("  Δp(ref top tok) = %.4f (p95 %.4f)\n", md / n, quantile(dtop, n, 0.95));
+        if (rowout) {   /* 行=位置 kld smin same(与上面五指标同一批数, 只是不聚合) */
+            FILE *fo = fopen(rowout, si == 0 ? "w" : "a");
+            if (fo) { for (int t = 0; t < n; t++) fprintf(fo, "%d %.6f %.6f %d\n", lo + t, kld[t], smin[t], same[t]); fclose(fo); }
+        }
         free(kld); free(rms); free(dtop); free(smin); free(same);
     }
 
