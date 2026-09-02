@@ -180,6 +180,9 @@ static double co_score_rows(const float*Hq,const float*Hf,const int*rows,int nr,
  * ①打印 NaN行/全零行 取证 ②复跑一次当场判"瞬态(复跑有限, 用有效值继续)/确定性(仍非有限,
  * 跳过单元防污染)" —— 每次触发都留完整证据链。 */
 static float *gs_forward_exit(int J,int Lend,const float*Hin,const long*ids,int S,int n_fit,float*HQcache);
+/* bkl 真尺(定义在 p12; p7 的 ZLGATE 链上落地闸要用, include 序在前 ⇒ 前置声明) */
+static int bkl_init(const float*Htgt,const long*ids,int S,int n_fit,size_t rowsz);
+static double bkl_exit_kl(const float*Hex,size_t rowsz);
 static double bf_base_gate(int J,double base,float**Hb,int eF,const float*eHin,const long*eIds,
                            int eS,int eNf,const float*eTgt,const int*SEV,int nSEV,size_t rowsz){
     if(isfinite(base)) return base;

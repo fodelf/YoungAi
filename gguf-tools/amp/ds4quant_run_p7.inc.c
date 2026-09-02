@@ -3,6 +3,18 @@
  * perf_event_paranoid 挡、gdb 无符号, 只能自己埋点。四段: attn(含 hc_pre/post) /
  * 路由 / 专家前向 / ZLGATE 候选评估。恒开(一层一行, 不新增 env)。 */
 double g_lt[8];   /* 0=attn 1=路由 2=共享专家 3=bytes_moe#1 4=段内其余 5=zlgate 6=lfile_load 7=bytes_moe#2 */
+int g_zg_replay=0;   /* ZLGATE 链上闸枪内=1: 枪会前向到 zrec_done=0 的处女层, 必须禁其 z 现场解算(递归雷) */
+/* ★ZGCHAIN 链上落地闸状态(2026-09-01 Bug#1 正修)★ z 段【全部】落地器(z^L 候选 + GE 路由
+ * 投影)共用: 单调纪录=上一次被接受的链上 KL(LEV 行, 全序列到终层出口+lm头), 候选必须
+ * 真降纪录才落地 —— 结构上杜绝层内微正复合成深层出口爆炸(负轮实锤 wt2 KLD +2.5%)。 */
+static double ZG_REC=1e300; static int ZG_ON=-1;
+static double zg_chain_shot(int L,const float*Hexit,const long*ids,int S,int n_fit){
+    float*Hx=NULL; g_zg_replay=1;
+    if(L+1<NLAYERS) Hx=gs_forward_exit(L+1,NLAYERS-1,Hexit,ids,S,n_fit,NULL);
+    g_zg_replay=0;
+    double kl=bkl_exit_kl(Hx?Hx:Hexit,(size_t)HCM*DIM); if(Hx)free(Hx);
+    return kl;
+}
 static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
                       int do_quant, char cfg, lstat_t*st){
     double lt_t0=vqt_now(), lt_mark=lt_t0;
@@ -308,7 +320,7 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
     { static int zc_diag=0;   /* 进入条件诊断(2026-08-29): 上轮进了这轮没进, 不猜, 打出来 */
       if(zc_diag++<2) fprintf(stderr,"[z块条件] do_quant=%d ANC_OK=%d LZRANK=%d cfg=%c zrec_done=%d COADAPT=%d\n",
                               do_quant,ANC_OK,LZRANK,cfg,zrec_done,COADAPT); }
-    if(do_quant&&ANC_OK&&LZRANK>0&&cfg!='F'&&!zrec_done&&n_fit>1&&!(cfg=='g'&&COADAPT>0)){   /* n_fit<=1=判尺纯回放: 绝不现场解算, 按盘上原样测量 */   /* ★'B'回放禁入已撤(见上) — 原注: 活体 z^L 每前向对锚重解会
+    if(do_quant&&ANC_OK&&LZRANK>0&&cfg!='F'&&!zrec_done&&n_fit>1&&!(cfg=='g'&&COADAPT>0)&&!g_zg_replay){   /* n_fit<=1=判尺纯回放: 绝不现场解算, 按盘上原样测量; g_zg_replay=链上闸枪内禁递归解算 */   /* ★'B'回放禁入已撤(见上) — 原注: 活体 z^L 每前向对锚重解会
         (a)把反修候选扰动拉回锚投影(橡皮筋, 候选逐位无效) (b)回放偷加不在文件的修正(合并模型没有→假忠实) */
         /* ★逐层动态 z^L(用户四支柱正确形态, 序贯锚定回拉)★: 输出端单点 z 要一口气补 43 层
          * 累积非线性误差(已证死路); z^L 每层只补【到本层为止的漂移】(小/局部/低秩可期), 分而治之。
@@ -401,6 +413,20 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
                      * 都不该由推进段自杀裁决。判决权交给五指标(项目铁律: 唯一裁判=在线五指标)。 */
                     fprintf(stderr,"★[链闸] L%02d 基线暴涨 %.4f→%.4f (>1.5x+0.05) — 警告继续(终判交五指标)★\n",L,bf_e0_prev,e0); }
                 bf_e0_prev=e0; }
+              /* ★ZLGATE 链上落地闸(2026-09-01 Bug#1 正修)★ 层内 relL2 降级为候选选择器;
+               * 落地必须链上 KL(全序列前向到终层出口+lm头, LEV 八域全位置行, 与 sweep/终验
+               * 同尺)相对【单调纪录】真降。纪录=上一次被接受的链上 KL ⇒ 结构上杜绝
+               * "32 个层内微正复合成 L41/42 出口爆炸"(本轮实锤 wt2 KLD +2.5%)。
+               * fail-closed: bkl 不可用(锚布局缺)= 一律拒落地。枪内 g_zg_replay=1 禁处女层
+               * 递归解算。 */
+              if(ZG_ON<0){
+                  ZG_ON=bkl_init(ANC.H+(size_t)(NLAYERS-1)*((size_t)ancS*HCM*DIM),ids,S,n_fit,(size_t)HCM*DIM)?1:0;
+                  if(!ZG_ON) fprintf(stderr,"★[ZGCHAIN] bkl 不可用 → z 段 fail-closed 全拒落地★\n");
+              }
+              if(ZG_ON&&ZG_REC>1e299){   /* 基线纪录: 当前态(Hq2=本层基线出口)链上 KL, 只算一次 */
+                  ZG_REC=zg_chain_shot(L,Hq2,ids,S,n_fit);
+                  printf("[ZGCHAIN] 基线链上KL=%.5f (L=%d 起算)\n",ZG_REC,L); fflush(stdout);
+              }
               for(int ci=0;ci<7&&!kland;ci++){ int kk=cand0[ci];
                 if(kk<1||kk>(int)zl->rank) continue;
                 int dup=0; for(int cj=0;cj<ci;cj++) if(cand0[cj]==kk&&tried[cj]) dup=1;
@@ -422,9 +448,17 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
                 }
                 double e1; { dq_hc_post(Ftry,H2,post2,comb2,Hq2,S,HCM,DIM);
                   e1=bf_exit_relL2_rows(Hq2,Hf2,EVR,nEV); }
-                printf("ZLGATE L=%d k=%d val出口relL2 %.6f→%.6f %s\n",L,kk,e0,e1,e1<e0-1e-9?"✓落地":"✗拒");
+                printf("ZLGATE L=%d k=%d val出口relL2 %.6f→%.6f %s\n",L,kk,e0,e1,e1<e0-1e-9?"✓候选":"✗拒");
                 fflush(stdout);
                 if(e1<e0-1e-9){
+                    /* 链上闸: Hq2 此刻=候选出口(e1 块刚写)。首个层内候选链上不降 ⇒ 本层
+                     * 不落地(不再试更低秩: 省枪, 且单调纪录不动, 语义与 11 层闸拒同)。 */
+                    if(!ZG_ON) break;
+                    double ck=zg_chain_shot(L,Hq2,ids,S,n_fit);
+                    printf("ZGCHAIN L=%d k=%d 链上KL %.5f→%.5f %s\n",L,kk,ZG_REC,ck,
+                           ck<ZG_REC-1e-9?"✓落地":"✗拒(层内正被链闸否)"); fflush(stdout);
+                    if(!(ck<ZG_REC-1e-9)) break;
+                    ZG_REC=ck;
                     kland=kk;
                     memcpy(Fout,Ftry,(size_t)S*DIM*4);   /* 序贯: 下层看到校正后激活 */
                     /* 冻结紧凑因子(活跃 k 列)暂存 → fwd_all 导出层文件后 append zl.RRR */
@@ -514,8 +548,18 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
                           for(size_t i2=0;i2<(size_t)HCM*DIM;i2++){ double d3=(double)hq[i2]-hf[i2]; e2s+=d3*d3; a2s+=(double)hf[i2]*hf[i2]; } }
                       e1g=sqrt(e2s/(a2s+1e-30)); }
                     printf("ZLGATE L=%d GE(路由投影) val出口relL2 %.6f→%.6f %s (活门=%d)\n",
-                           L,e0g,e1g,e1g<e0g-1e-9?"✓落地":"✗拒",nge); fflush(stdout);
-                    if(e1g<e0g-1e-9){
+                           L,e0g,e1g,e1g<e0g-1e-9?"✓候选":"✗拒",nge); fflush(stdout);
+                    /* ★GE 也过链上闸(2026-09-01 二修)★ 首版只闸了 z^L 候选, GE 仍层内
+                     * 1e-9 直落 zrec+序贯传链(sweep2 首跑 40 分钟即撞见 L2 GE −0.01% 直落,
+                     * 停车补此闸) —— z 段一切落地器共用同一杆 ZGCHAIN 枪与单调纪录。 */
+                    int ge_land=0;
+                    if(e1g<e0g-1e-9&&ZG_ON){   /* Hq3 此刻=GE 候选出口(e1g 块刚写) */
+                        double ckg=zg_chain_shot(L,Hq3,ids,S,n_fit);
+                        printf("ZGCHAIN L=%d GE 链上KL %.5f→%.5f %s\n",L,ZG_REC,ckg,
+                               ckg<ZG_REC-1e-9?"✓落地":"✗拒(层内正被链闸否)"); fflush(stdout);
+                        if(ckg<ZG_REC-1e-9){ ZG_REC=ckg; ge_land=1; }
+                    }
+                    if(ge_land){
                         memcpy(Fout,Ftry2,(size_t)S*DIM*4);   /* 序贯: ĝ 近似传链 */
                         const char*ld4=g_cli.layer_dir;
                         if(ld4){ char zp4[1024]; snprintf(zp4,sizeof zp4,"%s/zrec_L%02d.bin",ld4,L);
@@ -537,6 +581,14 @@ static void layer_fwd(int L, LW*W, float*H, const long*ids, int S, int n_fit,
             }
             if(st) st->zk=kland;
             if(kland>0) LZ_TOTAL_K+=kland;
+            /* ★闸拒空标记必落(2026-09-01 链闸二修)★ 旧实现全拒层不落 zrec ⇒ zrec_done 恒 0,
+             * 后续每次回放(含 sweep 阶段 bkl 枪, 彼时 g_zg_replay=0)都会重触发本块现场解算。
+             * 负轮没炸纯属侥幸: GE 兜底恰好接住了全部 11 个 z 拒层。链闸下 z+GE 双拒真实
+             * 存在, 这里无条件保证 zrec 在盘("ab" 缺则建空/在则无损): 空文件=闸拒标记,
+             * lfile 并链跳过, 语义与 INJ=2 一致。 */
+            { const char*ld5=g_cli.layer_dir;
+              if(ld5){ char zp5[1024]; snprintf(zp5,sizeof zp5,"%s/zrec_L%02d.bin",ld5,L);
+                  FILE*z5=fopen(zp5,"ab"); if(z5) fclose(z5); } }
             ds4_z_free(zl);
         }
         free(DF);
