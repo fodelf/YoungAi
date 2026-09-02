@@ -8842,3 +8842,11 @@ K 行(64 头共用一份 kva 却读 64 遍), ratio=4 层 2.3TB L2 流量/层; �
 代码: gguf-tools/quantize/vq_gpu_moefull.inc.cu(新)/vq_gpu_attn.inc.cu(+混合路/全路)/amp/ds4quant_moe_gpu.inc.c(全序列路+预取+ERF)
 /ds4quant_fwd_p2(attention 接入)/p4(归约 t0)/p7(空枪策略/共享专家)/p8(重读/LT 子桶)/p12(链枪处女层缓存+GSX 账)/dsq_lfile(保留 vq fd)。
 均未提交(铁律: 验证成功+用户批准)。
+- **速度战役续(v12~v18, 22:39~23:02)**: v14 设备全路前置(旧 q GEMM 1GB 回主机+CPU 逐头 rms/rope 原本在设备路之前白跑 ~0.2s/层)
+  + 双槽预取(本层 MoE 开始即读下一层); v15 attention 权重 4 线程 memcpy→钉页→DMA; v17 GPU 事件计时。8192 行 43 层:
+  v10 126.4 → v15 122.2 → v17 129(含尖峰) —— 正常层 1.7~2.0s, 随机 4~6 层 5~8s 尖峰。★尖峰定罪★: 落在 irope+wo_a/wo_b 纯设备相位,
+  GPU 事件耗时=墙钟(5.129s=5.129s), 即 GPU 真慢 40× 而非宿主被卡; 同期 vmstat allocstall 5.0M/compact_stall 6.3M, free 仅 1GB
+  (页缓存 69GB 被每枪 78GB 载荷冲刷) —— GB10 显存与主存同池, 内核回收/压缩搬页时设备 GEMM 停摆。v18: 载荷 pread 后立即
+  posix_fadvise(DONTNEED) 丢页(整文件 madvise WILLNEED 同撤), 效果待 zg3 分账。MoE 逐层分账(v17, 21 层均值/层): 等预取 0 /
+  H2D 0.12 / dequant 0.15 / fwd 0.41 / 刷回 0.04, bmoe1 桶 ~1.1s 里另 ~0.4s 在分桶/归约/op 链回放。
+  23:02 用 v18 发 zg3(sweeprun champ86amp zg3 --hqe-probe --zonly)回主线; sweep3 交付态归档 archive_zg3。
