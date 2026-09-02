@@ -4,6 +4,25 @@
 /* op 记录解析(主文件旧混装 与 zrec 外挂 共用): curfoff=载荷在其宿主文件内的偏移 */
 static int g_parse_ext=0;   /* 1=正在解析 zrec 外挂(记录打 ext 标, 禁原地改写) */
 static void parse_op_rec(lfile_t*lf,const char*nm,const uint8_t*pay,uint64_t psz,size_t curfoff){
+    /* ★sup.* 替换记录(2026-09-01 侧车化)★: sweep 的 commit 不再原地 pwrite 宿主(dql 只读
+     * 铁律), 改为往 zrec 追加 sup.<族> —— 语义=改写链上【最后一个同型 op】的载荷(与 sweep
+     * 找靶规则 for(i=nops-1..) if(type==X) 同式), 不新增 op ⇒ 链长/序不变, 回放/zchain
+     * 导出天然拿到终值。找不到靶=写者与读者错位, 打★丢弃(禁静默错位落地)。 */
+    if(!strncmp(nm,"sup.",4)){
+        int ty=strstr(nm,"GLdyn2")?2:strstr(nm,"GLdyn8")?3:strstr(nm,"TREF")?4:
+               strstr(nm,"GE")?5:strstr(nm,".GL")?1:0;
+        int at=-1; for(int i=lf->nops-1;i>=0;i--) if(lf->ops[i].type==ty){ at=i; break; }
+        if(!ty||at<0){ fprintf(stderr,"[lfile]★sup 记录 %.16s 无同型靶 op(链长%d) — 丢弃★\n",nm,lf->nops); return; }
+        lop_t*o=&lf->ops[at];
+        if(ty==1&&psz>=4) memcpy(&o->g,pay,4);
+        else if(ty==2&&psz>=16) memcpy(o->w2p,pay,16);
+        else if(ty==3&&psz>=36) memcpy(o->w8,pay,36);   /* w8 九系数; V8 不动(commit 同语义) */
+        else if(ty==4&&psz>=4) memcpy(&o->t,pay,4);
+        else if(ty==5&&psz>=(uint64_t)NEXP*2&&o->ge){ const uint16_t*h=(const uint16_t*)pay;
+            for(int e=0;e<NEXP;e++) o->ge[e]=go1b_fp16_to_fp32(h[e]); }
+        else fprintf(stderr,"[lfile]★sup 记录 %.16s 载荷不足(%llu B) — 丢弃★\n",nm,(unsigned long long)psz);
+        return;
+    }
     if(lf->nops>=LOPS_MAX){   /* zrec 并链后单层=dql 内嵌+外挂之和, 更易逼近容量 */
         fprintf(stderr,"[lfile]★op 链超容量 %d(记录 %.16s 装不下): 静默丢修正=判决模型≠部署模型, "
                        "停车; 提高 LOPS_MAX 重编★\n",LOPS_MAX,nm);

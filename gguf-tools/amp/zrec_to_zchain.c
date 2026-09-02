@@ -59,6 +59,14 @@ int main(int argc, char **argv) {
                 else if (strstr(nm, "zl.AMPD") && psz >= 16) ty = 9;
                 else if (strstr(nm, "zl.AMP") && psz >= 16) ty = 7;
                 else if (strstr(nm, "zl.RTE") && psz >= 16) ty = 8;
+                else if (!strncmp(nm, "sup.", 4) || !strncmp(nm, "bf.", 3) || !strncmp(nm, "bwd", 3)) {
+                    /* sweep 侧车化(2026-09-01)后 zrec 里会出现 bf.GL、bf.GLdyn 族、sup.* 等
+                     * 本工具不认的记录。静默丢=转出的链≠判决的链(假账), 硬停:
+                     * 含 sweep 记录的层件用 `ds4quant_run --zchain-only` 导链(lfile 全语义)。 */
+                    fprintf(stderr, "zrec_to_zchain: L%d 记录 %.16s 是 sweep 落地(本工具不认), "
+                                    "改用 ds4quant_run --zchain-only 导链\n", L, nm);
+                    exit(1);
+                }
                 if (ty && !skip[ty]) {
                     if (nops >= 64) {   /* 静默丢修正=转出的 zchain≠盘上 zrec, 停车 */
                         fprintf(stderr, "zrec_to_zchain: L%d op 超容量 64, 拒绝静默丢; 提容量重编\n", L);

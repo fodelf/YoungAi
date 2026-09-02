@@ -119,13 +119,14 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
     /* ★ONEPASS(2026-08-04 用户裁决: "一遍就够, 每层落地反复矫正=后面跑偏")★
      * 冻结基线 Jacobi 式: 单元判据=近视野粗筛(不跑每单元全程复核), 落地不刷 HQE(所有层
      * 在同一反修完成态上选型互不污染), 单 pass, 收尾一次全程终验 — 劣化=全回滚
-     * (truncate 掉 append + BFU 表回写原地改 + lfile 重读)。sweep 7.8h → ~1.5h。 */
+     * (侧车化 2026-09-01: 一切落地都在 zrec ⇒ 回滚=截 zrec + lfile 重读, dql 零触碰)。 */
     /* ONEPASS = 2026-08-04 用户终裁"一遍就够"; r30_campaign.sh 一直导出 1 ⇒ 写死。 */
     const int onep=1;
-    size_t *ofl=onep?calloc((size_t)Lfront,sizeof(size_t)):NULL;   /* 每层落地前文件长度 */
+    size_t *ofl=onep?calloc((size_t)Lfront,sizeof(size_t)):NULL;   /* 每层落地前 zrec 长度 */
+    char *oex=onep?calloc((size_t)Lfront,1):NULL;    /* bit0=已捕获 bit1=捕获时 zrec 在盘(回滚缺席则 unlink) */
     char *oland=onep?calloc((size_t)Lfront,1):NULL;                /* 本 pass 落地标记 */
-    if(onep){ BFU_ARM=1; NBFU=0;
-        fprintf(stderr,"[反修] ONEPASS: 冻结基线一遍选型+统一终验(近视野判据, 无逐单元全程复核/无复检遍)\n"); }
+    if(onep)
+        fprintf(stderr,"[反修] ONEPASS: 冻结基线一遍选型+统一终验(真尺选型, 落地全住 zrec 侧车)\n");
     for(int pass=0;pass<2;pass++){
     if(onep&&pass==1) break;   /* 单 pass: 复检遍的活交回扫 */
     if(pass==1&&changed==0) break;   /* 第一遍零落地 → 上下文没变, 复检无意义 */
@@ -151,8 +152,9 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
             mlog(J,"向前反修","层文件缓存缺失","跳过",0,"lfile未加载","探索中"); continue; }
         time_t ut0=time(NULL); double ut0d=vqt_now(); memset(g_bflt,0,sizeof g_bflt); g_bflt_on=1;   /* 单元计时(BFUNIT 可观测行)+段账臂(p3 bflt_print) */
         lfile_t*lf=&GS_LF[J];
-        char pj[512]; op_host_path(J,pj,sizeof(pj));   /* op 宿主=dql 主文件(08-08 用户令还原混装; 旧"op 侧车"注释已过期) */
-        if(onep&&!ofl[J]){ struct stat fst; ofl[J]=stat(pj,&fst)==0?(size_t)fst.st_size:0; }   /* 回滚锚点 */
+        char pj[512]; op_host_path(J,pj,sizeof(pj));   /* op 宿主=zrec 侧车(2026-09-01 用户令, 见 op_host_path 注释) */
+        if(onep&&!(oex[J]&1)){ struct stat fst; int in=stat(pj,&fst)==0;   /* 回滚锚点(zrec 可缺席/可为空) */
+            ofl[J]=in?(size_t)fst.st_size:0; oex[J]=(char)(1|(in?2:0)); }
         const float*Hin=HQE+(size_t)J*lstride;
         /* 粗筛视野: e* 别名 = 本单元候选比价用的(出口层/输入/ids/行数/切分); scr=0 时即旧全量口径 */
         int Fj=(BK>0&&J+BK<Lfront)?J+BK:Lfront;
@@ -359,7 +361,7 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
                 snprintf(rs,128,"出口L%d分 %.5g→%.5g 降%.2f%%%s%s",eFlog?eFlog:eF,base,bestsc,
                          100.0*(base-bestsc)/(base>1e-12?base:1),
                          eF!=Lfront?"(近视野, 与前沿L42单元不可比)":"",pass?"(复检)":"");
-                mlog(J,"向前反修",al,"已改写层文件",vol,rs,"✓正向落地");
+                mlog(J,"向前反修",al,"已落地zrec侧车",vol,rs,"✓正向落地");
             }
         }
         if(geD){ free(geD); geD=NULL; }
@@ -390,7 +392,7 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
         }
     }
     }   /* end pass 复检 */
-    if(onep){ BFU_ARM=0;
+    if(onep){
         int nland=0; for(int J=Jlo;J<Lfront;J++) if(oland[J]) nland++;
         if(nland){
             /* 统一终验: 冻结基线上全部落地 → 一次全程出口分 vs 进入时基线(HQE[Lfront+1]=反修态出口) */
@@ -406,23 +408,20 @@ static int backfit_prev_chunk(int Jlo_in,int Jhi,int Lfront,const long*ids,int S
             if(keep){
                 float*Hr=gs_forward_exit(Jlo,Lfront,HQE+(size_t)Jlo*lstride,ids,S,n_fit,HQE); free(Hr);
             } else {
-                for(int J=Lfront-1;J>=Jlo;J--) if(oland[J]&&ofl[J]){          /* ①截掉 append(宿主=dql 主文件, 混装) */
+                /* ①回滚=恢复 zrec 侧车原状(append 与 sup 替换全住这里, dql 本轮零字节被改):
+                 * 捕获时在盘→截回原长; 捕获时缺席→连文件一起删(不留空文件冒充 INJ=2 闸拒标记) */
+                for(int J=Lfront-1;J>=Jlo;J--) if(oland[J]){
                     char pj2[512]; op_host_path(J,pj2,sizeof(pj2));
-                    if(truncate(pj2,(off_t)ofl[J])!=0) perror("onep-trunc"); }
-                for(int i=NBFU-1;i>=0;i--){ bfu_t*u=&BFU[i];                   /* ②逆序回写原地改(宿主同上) */
-                    char pj2[512]; op_host_path(u->L,pj2,sizeof(pj2));
-                    int fd2=open(pj2,O_WRONLY);
-                    if(fd2>=0){ if(pwrite(fd2,u->old,u->len,(off_t)u->foff)!=(ssize_t)u->len) perror("bfu-rb");
-                        close(fd2); } }
-                for(int J=Jlo;J<Lfront;J++) if(oland[J]){                     /* ③重读: 主 dql 路径(侧车自动挂) */
+                    if(oex[J]&2){ if(truncate(pj2,(off_t)ofl[J])!=0) perror("onep-trunc"); }
+                    else if(unlink(pj2)!=0) perror("onep-unlink"); }
+                for(int J=Jlo;J<Lfront;J++) if(oland[J]){                     /* ②重读: 主 dql 路径(zrec 自动并链) */
                     char pj2[512]; snprintf(pj2,sizeof(pj2),"%s/dql_L%02d.bin",dsq_layer_dir_req(),J);
                     lfile_free(&GS_LF[J]); memset(&GS_LF[J],0,sizeof(lfile_t)); lfile_load(pj2,&GS_LF[J]); }
                 changed=0;
             }
         }
-        for(int i=0;i<NBFU;i++) free(BFU[i].old);
         free(LFIT); free(LEV); LFIT=LEV=NULL; free(FITc); free(EVc); FITc=EVc=NULL;
-        NBFU=0; free(ofl); free(oland);
+        free(ofl); free(oex); free(oland);
     }
     for(int J=Lfront-1;J>=Jlo;J--) if(!done[J]){   /* 仍未正向: 逐层上日志(重解=原值, 非隐身) */
         if(ucl<(int)sizeof(uc)-24) ucl+=snprintf(uc+ucl,sizeof(uc)-ucl," L%d(%+.2f%%)",J,jd[J]);

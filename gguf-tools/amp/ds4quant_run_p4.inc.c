@@ -256,17 +256,22 @@ static int *BF_FINOP=NULL;  /* 逐层反修: 每层"最终缩放α op"(bf.GL) �
 static int *BF_DYN2OP=NULL; /* 逐层反修: 每层"per-token 动态 op"(bf.GLdyn2) 下标(-1=未加); 更新原地不重复追加 */
 static int *BF_GEOP=NULL;   /* 逐层反修: 每层"per-expert 增益 op"(bf.GE, type-5) 下标(-1=未加) */
 static int *BF_HCOP=NULL;   /* 冷热双通道: 每层"GLhc op"(bf.GLhc, type-7) 下标(-1=未加)(2026-08-06) */
-/* 追加一条落地记录(vd=1, 链末回放; bf.GL/bf.GLdyn2 等), 返回其载荷文件偏移(原地更新用) */
+/* 追加一条落地记录(vd=1, 链末回放; bf.GL/sup.GL 等), 返回其载荷文件偏移。
+ * 宿主双态(2026-09-01 侧车化): DQL2 主文件=老混装(带 nrec 计数, 只剩历史文件会走到);
+ * zrec 侧车=裸记录流(lfile 从 0 偏移顺序走, 无头无计数), 不存在则创建。 */
 static size_t append_rec(const char*path,const char*nm0,const char*al0,const void*pay,uint64_t paysz,float m1){
-    FILE*f=fopen(path,"r+b"); if(!f) return 0;
-    uint32_t nrec; fseek(f,8,SEEK_SET);
-    if(fread(&nrec,4,1,f)!=1){ fclose(f); return 0; }
+    FILE*f=fopen(path,"r+b"); if(!f) f=fopen(path,"w+b");
+    if(!f) return 0;
+    uint32_t magic=0; int dql=0;
+    if(fread(&magic,4,1,f)==1&&magic==0x324C5144) dql=1;   /* "DQL2" */
+    uint32_t nrec=0;
+    if(dql){ fseek(f,8,SEEK_SET); if(fread(&nrec,4,1,f)!=1){ fclose(f); return 0; } }
     fseek(f,0,SEEK_END); long eof=ftell(f); if(eof<0){ fclose(f); return 0; }
     char nm[16]={0},al[64]={0}; snprintf(nm,16,"%s",nm0); snprintf(al,64,"%s",al0);
     uint64_t vol=paysz; float m[4]={m1,0,0,m1}; int vd=1;
     fwrite(nm,1,16,f); fwrite(al,1,64,f); fwrite(&vol,8,1,f); fwrite(&paysz,8,1,f);
     fwrite(m,4,4,f); fwrite(&vd,4,1,f); fwrite(pay,1,(size_t)paysz,f);
-    fseek(f,8,SEEK_SET); nrec++; fwrite(&nrec,4,1,f);
+    if(dql){ fseek(f,8,SEEK_SET); nrec++; fwrite(&nrec,4,1,f); }
     fclose(f);
     return (size_t)eof + DS4_AMP_REC_HDR;   /* 载荷偏移 = 记录起点 + 记录头 */
 }

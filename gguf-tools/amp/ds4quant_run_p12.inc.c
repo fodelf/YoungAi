@@ -239,49 +239,28 @@ static void zrefit_w(lop_t*z,const float*ms,int NF,const float*Fin,const float*w
         if(solve_sym(A,b9,9,x9)==0){ for(int i=0;i<9;i++) z->w8[i]=(float)x9[i]; }
     }
 }
-/* ★首写留档(2026-08-04 流程债)★: 反修 commit 原地覆盖量化段 op 原值 ⇒ 纯量化态从盘上消失,
- * 返修只能重量化(2.6h)。每个 (L,foff) 第一次改写前把原字节 append 进 layers/opbak_LXX.bin
- * (u64 foff|u32 len|bytes) — 恢复=按表回写, 反修从此可无损重来。 */
-/* ONEPASS sweep 的进程内 undo 表(终验劣化=全回滚): op_backup 在 BFU_ARM 时旁录旧值 */
-typedef struct { int L; size_t foff; uint32_t len; uint8_t*old; } bfu_t;
-static bfu_t *BFU=NULL; static int NBFU=0,BFU_CAP=0,BFU_ARM=0;
-static void op_backup(int L,int fd,size_t foff,size_t len){
-    if(BFU_ARM&&len<=65536){
-        if(NBFU>=BFU_CAP){ BFU_CAP=BFU_CAP?BFU_CAP*2:64; BFU=realloc(BFU,(size_t)BFU_CAP*sizeof(bfu_t)); }
-        bfu_t*u=&BFU[NBFU]; u->L=L; u->foff=foff; u->len=(uint32_t)len; u->old=malloc(len);
-        if(pread(fd,u->old,len,(off_t)foff)==(ssize_t)len) NBFU++; else free(u->old);
-    }
-    static uint64_t seen[4096]; static int nseen=0;   /* (L<<48|foff) 首写集(单进程规模足够) */
-    uint64_t key=((uint64_t)L<<48)|(uint64_t)foff;
-    for(int i=0;i<nseen;i++) if(seen[i]==key) return;
-    if(nseen<4096) seen[nseen++]=key;
-    uint8_t old[8192]; if(len>sizeof(old)) return;
-    if(pread(fd,old,len,(off_t)foff)!=(ssize_t)len) return;
-    char bp[512]; snprintf(bp,sizeof(bp),"%s/opbak_L%02d.bin",dsq_layer_dir_req(),L);
-    FILE*bf=fopen(bp,"ab"); if(!bf) return;
-    uint64_t f64=(uint64_t)foff; uint32_t l32=(uint32_t)len;
-    fwrite(&f64,8,1,bf); fwrite(&l32,4,1,bf); fwrite(old,1,len,bf); fclose(bf);
-}
-/* z 载荷原地改写(内容真的变, mtime/字节变) + 记录 mean[0]=新判据
- * ★平行架构: 宿主=op 侧车(在则), 量化 dql 永不被 commit 触碰 */
+/* ★侧车化(2026-09-01 用户令"sweep 只动侧车不动量化模型")★
+ * 旧 commit = 按 foff 原地 pwrite 宿主文件(混装时代宿主=dql ⇒ 量化态被弄脏, 逼出
+ * opbak 首写留档 + BFU 进程内 undo 两套保全脚手架, 全部随本次改造退役)。
+ * 新 commit = 往 zrec 侧车追加一条 sup.<族> 替换记录: parse_op_rec 读到它时改写链上
+ * 【最后一个同 type op】的载荷(与 sweep 找靶规则 for(i=nops-1..) if type==X 完全同式),
+ * 不新增 op ⇒ 修正链长度/序不变, 回放/zchain 导出自然拿到终值。dql 零触碰;
+ * 回滚 = 截断 zrec(见 p13 终验), 不再需要逐 foff 回写。ext 拒改分支同步退役:
+ * 替换记录对 dql 内嵌 op 与 zrec 外挂 op 一视同仁。 */
 static void zfile_commit(int L,lop_t*z,float m1metric){
-    if(z->ext){   /* zrec 外挂 op: foff 指向 zrec 文件, 按此偏移写 dql=砸错文件 */
-        fprintf(stderr,"[zcommit]★拒: L%d type%d 宿主是 zrec 外挂, 原地改写会砸 dql — 该 op 只能重解重落 zrec★\n",L,z->type);
-        return; }
     char lp[512]; op_host_path(L,lp,sizeof(lp));
-    int fd=open(lp,O_RDWR); if(fd<0){ perror("zcommit-open"); return; }
-    { size_t blen=z->type==1?4:z->type==2?16:z->type==4?4:z->type==5?(size_t)NEXP*2:36;
-      op_backup(L,fd,z->foff,blen); op_backup(L,fd,z->foff-20,4); }
-    if(z->type==1){ if(pwrite(fd,&z->g,4,(off_t)z->foff)!=4) perror("bf-w1"); }
-    else if(z->type==2){ if(pwrite(fd,z->w2p,16,(off_t)z->foff)!=16) perror("bf-w2"); }
-    else if(z->type==4){ if(pwrite(fd,&z->t,4,(off_t)z->foff)!=4) perror("bf-t"); }
+    const char*nm=z->type==1?"sup.GL":z->type==2?"sup.GLdyn2":z->type==4?"sup.TREF":
+                  z->type==5?"sup.GE":"sup.GLdyn8";
+    size_t off=0;
+    if(z->type==1)      off=append_rec(lp,nm,"替换链末同型op载荷(真尺commit)",&z->g,4,m1metric);
+    else if(z->type==2) off=append_rec(lp,nm,"替换链末同型op载荷(真尺commit)",z->w2p,16,m1metric);
+    else if(z->type==4) off=append_rec(lp,nm,"替换链末同型op载荷(真尺commit)",&z->t,4,m1metric);
     else if(z->type==5&&z->ge){ uint16_t*h=malloc((size_t)NEXP*2);
         for(int e=0;e<NEXP;e++) h[e]=go1b_fp32_to_fp16(z->ge[e]);
-        if(pwrite(fd,h,(size_t)NEXP*2,(off_t)z->foff)!=(ssize_t)((size_t)NEXP*2)) perror("bf-ge");
+        off=append_rec(lp,nm,"替换链末同型op载荷(真尺commit)",h,(uint64_t)NEXP*2,m1metric);
         free(h); }
-    else { if(pwrite(fd,z->w8,36,(off_t)z->foff)!=36) perror("bf-w8"); }
-    if(pwrite(fd,&m1metric,4,(off_t)(z->foff-20))!=4) perror("bf-m1");
-    close(fd);
+    else off=append_rec(lp,nm,"替换链末同型op载荷(真尺commit, w8九系数, V8不动)",z->w8,36,m1metric);
+    if(!off) fprintf(stderr,"[zcommit]★sup 追加失败: %s L%d type%d — 内存态与盘不一致!★\n",lp,L,z->type);
 }
 /* (旧逐层坐标下降版 backfit_layer_z 已删: DS4_GS_PERCOL 对照路(20-30h)独占代码,
  * 2026-08-31 env 清退; 回扫只存联合批式 backfit_joint_round 一种语义) */
@@ -361,7 +340,7 @@ static int backfit_joint_round(const long*ids,int S,int n_fit,const float*H0,flo
         int nc=0;
         for(int L=0;L<NLAYERS;L++) if(zidx[L]>=0){ zfile_commit(L,&GS_LF[L].ops[zidx[L]],(float)kln); nc++; }
         char rs[80]; snprintf(rs,80,"联合轮 最终KL %.5f→%.5f 提交%d层",*kl0,kln,nc);
-        mlog(0,"向后·反修","z 联合批式重解(抽行探测+全程终验)","已改写层文件",0,rs,"✓正向落地");
+        mlog(0,"向后·反修","z 联合批式重解(抽行探测+全程终验)","已落地zrec侧车",0,rs,"✓正向落地");
         *kl0=kln;
     } else {
         for(int L=0;L<NLAYERS;L++) if(zidx[L]>=0) GS_LF[L].ops[zidx[L]]=zbaks[L];

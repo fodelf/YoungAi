@@ -240,8 +240,12 @@ static void ops_sidecar_path(const char*dql_path,int L,char*out,size_t outsz){
     char*sl=strrchr(dir,'/'); if(sl)*sl=0; else snprintf(dir,sizeof(dir),".");
     snprintf(out,outsz,"%s/dql_ops_L%02d.bin",dir,L);
 }
-/* op 宿主文件 = dql 主文件(超冠 573b7f5 混装架构; 2026-08-08 用户令还原:
- * "侧车不是我要求加入的" — 平行架构 op 侧车 2026-08-04 系擅自引入, 已删)。 */
+/* op 宿主文件 = zrec 侧车(2026-09-01 用户令"sweep 只动侧车不动量化模型")。
+ * 历史: 超冠 573b7f5 混装(op 追加进 dql 主文件) ← 2026-08-08 用户令从 08-04 擅自引入的
+ * op 侧车还原回混装; 2026-09-01 再反转 —— 前提已变: 08-31 zrec 并链后, zrec_L 里的 op
+ * 与 dql 内嵌 op 在回放/判决/zchain 导出三方完全同权(判决=部署), 而混装的代价是量化态
+ * 被弄脏, 逼出 layers_quant 备份/champreset/opbak 整套保全脚手架。侧车化后: dql 只读,
+ * 回滚=截 zrec, 原地改写=sup.* 替换记录(见 zfile_commit)。 */
 static void op_host_path(int L,char*out,size_t outsz){
-    snprintf(out,outsz,"%s/dql_L%02d.bin",dsq_layer_dir_req(),L);
+    snprintf(out,outsz,"%s/zrec_L%02d.bin",dsq_layer_dir_req(),L);
 }
