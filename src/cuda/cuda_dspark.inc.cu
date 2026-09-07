@@ -310,6 +310,25 @@ static void tok_graph_ensure_id_slot(void) {
         cudaMallocHost(&g_tok_id_host, sizeof(int32_t)) != cudaSuccess) {
         g_tok_id_host = NULL; (void)cudaGetLastError();
     }
+    /* 预发射资源: 四相 {mode,id} pinned 槽(设备零拷贝读)、设备 argmax 槽、回传事件 */
+    if (!g_tok_slots_host) {
+        if (cudaHostAlloc(&g_tok_slots_host, 8u * sizeof(int32_t), cudaHostAllocMapped) != cudaSuccess ||
+            cudaHostGetDevicePointer(&g_tok_slots_dev, g_tok_slots_host, 0) != cudaSuccess) {
+            g_tok_slots_host = NULL; g_tok_slots_dev = NULL; (void)cudaGetLastError();
+        } else {
+            memset(g_tok_slots_host, 0, 8u * sizeof(int32_t));
+        }
+    }
+    if (!g_tok_next_dev && cudaMalloc(&g_tok_next_dev, sizeof(int32_t)) != cudaSuccess) {
+        g_tok_next_dev = NULL; (void)cudaGetLastError();
+    }
+    if (!g_argmax_pm && cudaMalloc(&g_argmax_pm, 64u * (sizeof(float) + sizeof(int32_t))) != cudaSuccess) {
+        g_argmax_pm = NULL; (void)cudaGetLastError();
+    }
+    if (g_argmax_pm) g_argmax_pi = (int32_t *)(g_argmax_pm + 64);
+    if (!g_readback_ev && cudaEventCreateWithFlags(&g_readback_ev, cudaEventDisableTiming) != cudaSuccess) {
+        g_readback_ev = NULL; (void)cudaGetLastError();
+    }
 }
 
 /* graph → exec 槽: 首次 Instantiate, 之后 ExecUpdate, 不匹配则重建 */

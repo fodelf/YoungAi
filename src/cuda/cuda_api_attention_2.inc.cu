@@ -17,14 +17,15 @@ static int attention_prefill_mixed_launch(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim) {
-    if (!heads || !q || !raw_kv || !model_map || n_tokens == 0 || ratio == 0 ||
+    if ((n_comp != 0 && head_dim != 512u) ||   /* 压缩缓存行格式钉死 512 维 */
+        !heads || !q || !raw_kv || !model_map || n_tokens == 0 || ratio == 0 ||
         (n_comp != 0 && !comp_kv) || (use_comp_mask && !comp_mask) ||
         sinks_offset > model_size ||
         (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
         heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         raw_kv->bytes < (uint64_t)n_tokens * head_dim * sizeof(float) ||
-        (n_comp && comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float)) ||
+        (n_comp && comp_kv->bytes < (uint64_t)n_comp * DS4_GPU_COMP_ROW_BYTES) ||
         (use_comp_mask && comp_mask->bytes < (uint64_t)n_tokens * n_comp * sizeof(float))) {
         return 0;
     }
@@ -38,7 +39,7 @@ static int attention_prefill_mixed_launch(
                                                                    sinks,
                                                                    (const float *)q->ptr,
                                                                    (const float *)raw_kv->ptr,
-                                                                   n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                                   n_comp ? (const uint8_t *)comp_kv->ptr : (const uint8_t *)raw_kv->ptr,
                                                                    n_tokens,
                                                                    n_comp,
                                                                    window,
@@ -66,7 +67,7 @@ static int attention_prefill_mixed_launch(
         attention_prefill_pack_mixed_kv_kernel<<<(kv_count + 255) / 256, 256>>>(
                 kv,
                 (const float *)raw_kv->ptr,
-                n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                n_comp ? (const uint8_t *)comp_kv->ptr : (const uint8_t *)raw_kv->ptr,
                 n_tokens,
                 n_comp,
                 head_dim);
@@ -137,7 +138,7 @@ static int attention_prefill_mixed_launch(
                                                   sinks,
                                                   (const float *)q->ptr,
                                                   (const float *)raw_kv->ptr,
-                                                  n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                  n_comp ? (const uint8_t *)comp_kv->ptr : (const uint8_t *)raw_kv->ptr,
                                                   use_comp_mask ? (const float *)comp_mask->ptr : NULL,
                                                   use_comp_mask, n_tokens, n_comp, window, ratio,
                                                   n_head, head_dim);
@@ -152,14 +153,12 @@ int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
         uint32_t                n_tokens,
         uint32_t                n_comp,
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim) {
-    if (comp_kv_f16) return 0;
     return attention_prefill_mixed_launch(heads, model_map, model_size, sinks_offset,
                                        q, raw_kv, comp_kv, NULL, 0, n_tokens,
                                        n_comp, window, ratio, n_head, head_dim);
@@ -173,7 +172,6 @@ int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
         const ds4_gpu_tensor *comp_mask,
         uint32_t                n_tokens,
         uint32_t                n_comp,
@@ -181,7 +179,6 @@ int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim) {
-    if (comp_kv_f16) return 0;
     return attention_prefill_mixed_launch(heads, model_map, model_size, sinks_offset,
                                        q, raw_kv, comp_kv, comp_mask, 1, n_tokens,
                                        n_comp, window, ratio, n_head, head_dim);
@@ -215,32 +212,48 @@ int ds4_gpu_attention_output_q4k_batch_tensor(
     const unsigned char *out_a = reinterpret_cast<const unsigned char *>(
             cuda_model_range_ptr(model_map, out_a_offset, out_a_bytes, "attn_out_a_q4k"));
     if (!out_a) return 0;
+    /* 批量(prefill): a 段分组 GEMM + b 段稠密 GEMM(cuda_q4k_gemm.inc.cu), 8192 token 一趟原路 29 s。 */
+    if (n_tokens >= DS4_Q4K_GEMM_MIN_TOK) {
+        if (!cuda_q4k_gemm_grouped((float *)low->ptr, out_a, group_dim, rank, n_groups,
+                                   (const float *)heads->ptr, n_tokens)) return 0;
+        return ds4_gpu_matmul_q4_K_tensor(out, model_map, model_size, out_b_offset,
+                                          low_dim, out_dim, low, n_tokens);
+    }
+    /* 09-07: 小批(< GEMM 阈值)同解码路: q8_0 激活(n_tokens×n_groups 行, 精度不变) + 分组 tile 核, grid.y = token */
+    if (!q4k_tile_supported((uint32_t)kblocks, (uint32_t)low_dim)) {
+        fprintf(stderr, "ds4: attn_output_a q4_K batch: 每行 %llu 块/低维 %llu 不在 tile 核支持的形状\n",
+                (unsigned long long)kblocks, (unsigned long long)low_dim);
+        return 0;
+    }
     const uint64_t x_rows = (uint64_t)n_tokens * n_groups;
     const uint64_t xq_bytes = x_rows * blocks_a * 32u;
     const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
-    const uint64_t tmp_bytes = scale_offset + x_rows * blocks_a * sizeof(float);
-    void *tmp = cuda_tmp_alloc(tmp_bytes, "attention output q4k batch prequant");
+    void *tmp = cuda_tmp_alloc(scale_offset + x_rows * blocks_a * sizeof(float), "attention output q4k batch prequant");
     if (!tmp) return 0;
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
-    const int use_dp4a = cuda_q8_use_dp4a();
-    dim3 qgrid((unsigned)blocks_a, (unsigned)x_rows, 1);
-    quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq, xscale, (const float *)heads->ptr,
-                                            group_dim, blocks_a);
+    ds4_launch_pdl(quantize_q8_0_f32_kernel, dim3((unsigned)blocks_a, (unsigned)x_rows, 1), 32, 0, 0,
+                   xq, xscale, (const float *)heads->ptr, group_dim, blocks_a);
     if (!cuda_ok(cudaGetLastError(), "attn_out_q4k_batch prequant launch")) return 0;
-    dim3 grid_a(((unsigned)low_dim + 15u) / 16u, (unsigned)n_tokens, 1);
-    if (use_dp4a && kblocks <= 16u) {
-        grouped_q4_K_a_preq_warp8_dp4a_kernel<<<grid_a, 256, (size_t)16u * (size_t)kblocks * 9u * sizeof(uint4)>>>((float *)low->ptr, out_a, xq, xscale,
-                                                          group_dim, rank, n_groups, n_tokens,
-                                                          kblocks);
-    } else {
-        grouped_q4_K_a_preq_warp8_kernel<<<grid_a, 256, (kblocks <= 16u) ? (size_t)16u * (size_t)kblocks * 9u * sizeof(uint4) : 0>>>((float *)low->ptr, out_a, xq, xscale,
-                                                          group_dim, rank, n_groups, n_tokens,
-                                                          kblocks, use_dp4a);
-    }
-    if (!cuda_ok(cudaGetLastError(), "attn_out_q4k_batch grouped launch")) return 0;
-    return ds4_gpu_matmul_q4_K_tensor(out, model_map, model_size, out_b_offset,
-                                      low_dim, out_dim, low, n_tokens);
+    if (!q4k_tile_grouped_launch((float *)low->ptr, (const char *)out_a, xq, xscale, (uint32_t)kblocks,
+                                 (uint32_t)rank, n_groups, n_tokens)) return 0;
+    /* b 段同解码路(09-07): low 按 q8_0(32 值一尺度)量化 + 整行 stage 的 q8_0 dot 核, 与 q4k_hc_expand 同轨;
+     * 此前走 q8_K 激活的 matmul_q4_K, 与解码不同轨。 */
+    const uint64_t kb_b = low_dim / 256u, blocks_b = low_dim / 32u;
+    const uint64_t out_b_bytes = out_dim * kb_b * sizeof(cuda_block_q4_K);
+    if (low_dim % 256u != 0 || out_b_offset > model_size || out_b_bytes > model_size - out_b_offset) return 0;
+    const char *out_b = cuda_model_range_ptr(model_map, out_b_offset, out_b_bytes, "attn_out_b_q4k");
+    if (!out_b) return 0;
+    const uint64_t xqb_bytes = (uint64_t)n_tokens * blocks_b * 32u;
+    const uint64_t sc_b = (xqb_bytes + 15u) & ~15ull;
+    void *tmpb = cuda_tmp_alloc(sc_b + (uint64_t)n_tokens * blocks_b * sizeof(float), "attention output b q4k batch prequant");
+    if (!tmpb) return 0;
+    int8_t *xqb = (int8_t *)tmpb;
+    float *xsb = (float *)((char *)tmpb + sc_b);
+    ds4_launch_pdl(quantize_q8_0_f32_kernel, dim3((unsigned)blocks_b, (unsigned)n_tokens, 1), 32, 0, 0,
+                   xqb, xsb, (const float *)low->ptr, low_dim, blocks_b);
+    if (!cuda_ok(cudaGetLastError(), "attn_out_b_q4k_batch prequant launch")) return 0;
+    return q4k_rows_q8_0_multi_launch((float *)out->ptr, out_b, xqb, xsb, (uint32_t)kb_b, (uint32_t)out_dim, n_tokens);
 }
 
 
@@ -359,7 +372,7 @@ int ds4_gpu_attention_output_q8_batch_tensor(
         float *xscale = (float *)((char *)tmp + scale_offset);
         const int use_dp4a = cuda_q8_use_dp4a();
         dim3 qgrid((unsigned)blocks_a, (unsigned)x_rows, 1);
-        quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq,
+        ds4_launch_pdl(quantize_q8_0_f32_kernel, qgrid, 32, 0, 0, xq,
                                                 xscale,
                                                 (const float *)heads->ptr,
                                                 group_dim,
@@ -426,7 +439,7 @@ int ds4_gpu_attention_output_low_q8_tensor(
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
     dim3 qgrid((unsigned)blocks_a, (unsigned)x_rows, 1);
-    quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq,
+    ds4_launch_pdl(quantize_q8_0_f32_kernel, qgrid, 32, 0, 0, xq,
                                             xscale,
                                             (const float *)heads->ptr,
                                             group_dim,

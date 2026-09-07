@@ -74,6 +74,7 @@ __global__ static void compressor_update_pool_kernel(
         const float *state_score,
         uint32_t head_dim,
         uint32_t ratio) {
+    DS4_PDL_WAIT(); DS4_PDL_TRIGGER();
     uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d >= head_dim) return;
     uint32_t coff = ratio == 4u ? 2u : 1u;
@@ -110,6 +111,7 @@ __global__ static void compressor_update_pool_kernel(
 }
 
 __global__ static void compressor_shift_ratio4_kernel(float *state_kv, float *state_score, uint32_t width) {
+    DS4_PDL_WAIT(); DS4_PDL_TRIGGER();
     uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t half = 4ull * width;
     if (i >= half) return;

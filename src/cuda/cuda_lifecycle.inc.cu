@@ -16,7 +16,31 @@ int ds4_gpu_init(void) {
                 ? CUBLAS_DEFAULT_MATH
                 : CUBLAS_TF32_TENSOR_OP_MATH;
         (void)cublasSetMathMode(g_cublas, math_mode);
+        /* 固定工作区(09-07): 流捕获态里 cuBLAS 不能自己 cudaMalloc 工作区 —— verify 批 CUDA 图里 drafter 建窗的
+         * q8 f16 影子 GEMM 报 status 14 让整张图捕获失败。给定 32 MB 用户工作区后 cuBLAS 不再内部分配, 图内可用。 */
+        static void *cublas_ws = NULL;
+        const size_t ws_bytes = 32u << 20;
+        if (!cublas_ws && cudaMalloc(&cublas_ws, ws_bytes) != cudaSuccess) { cublas_ws = NULL; (void)cudaGetLastError(); }
+        if (cublas_ws) (void)cublasSetWorkspace(g_cublas, cublas_ws, ws_bytes);
         g_cublas_ready = 1;
+        /* 预热(09-07 1M 投机剖面): 进程里第一次 cublasSgemm / GemmEx(f16) 各要 ~0.5 s 装核与选算法, 落在投机首轮里
+         * (drafter 建窗的 f16 影子 GEMM 与输出头前的 f32 GEMM), 64 token 的尺被拖 10%; 这里用 16×16 空算把它挪到初始化。 */
+        {
+            void *wa = NULL, *xa = NULL, *ya = NULL;
+            if (cudaMalloc(&wa, 16u * 16u * 4u) == cudaSuccess && cudaMalloc(&xa, 16u * 16u * 4u) == cudaSuccess &&
+                cudaMalloc(&ya, 16u * 16u * 4u) == cudaSuccess) {
+                const float alpha = 1.0f, beta = 0.0f;
+                (void)cudaMemset(wa, 0, 16u * 16u * 4u); (void)cudaMemset(xa, 0, 16u * 16u * 4u);
+                (void)cublasSgemm(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N, 16, 16, 16, &alpha, (const float *)wa, 16,
+                                  (const float *)xa, 16, &beta, (float *)ya, 16);
+                (void)cublasGemmEx(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N, 16, 16, 16, &alpha, wa, CUDA_R_16F, 16,
+                                   xa, CUDA_R_16F, 16, &beta, ya, CUDA_R_32F, 16, CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+                (void)cudaDeviceSynchronize(); (void)cudaGetLastError();
+            }
+            if (wa) (void)cudaFree(wa);
+            if (xa) (void)cudaFree(xa);
+            if (ya) (void)cudaFree(ya);
+        }
     }
     return 1;
 }
@@ -114,40 +138,37 @@ ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
     return t;
 }
 
-static uint64_t cuda_managed_kv_reserve_bytes(uint64_t total_bytes) {
-    const uint64_t min_reserve = 8ull * 1073741824ull;
-    const uint64_t max_reserve = 40ull * 1073741824ull;
-    uint64_t reserve = total_bytes / 4u;
-    if (reserve < min_reserve) reserve = min_reserve;
-    if (reserve > max_reserve) reserve = max_reserve;
-    return reserve;
-}
-
 int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes) {
     if (kv_cache_bytes == 0) return 0;
-
-    /* Very large KV caches are where device-only cudaMalloc() can make a
-     * unified-memory machine unresponsive.  Managed memory restores the old
-     * demand-paged behavior for this one long-lived allocation class only. */
-    const uint64_t huge_kv = 8ull * 1073741824ull;
-    if (kv_cache_bytes >= huge_kv) return 1;
-
-    const uint64_t large_context = 8ull * 1073741824ull;
-    if (context_bytes < large_context) return 0;
-
-    size_t free_b = 0;
-    size_t total_b = 0;
-    cudaError_t err = cudaMemGetInfo(&free_b, &total_b);
-    if (err != cudaSuccess) {
-        (void)cudaGetLastError();
-        return 0;
+    /* 2026-09-06: 原规则"KV ≥ 8 GiB 一律托管 / 上下文 ≥ 8 GiB 且余量 < total/4 也托管"让 1M 上下文(KV 13.6 GiB)
+     * 全程走 cudaMallocManaged: 合成上下文四点实测 1M prefill 76.9 / decode 14.7, 比按核账算的低一大截, 512k 同样
+     * 中招。121 GB 统一内存放得下就用设备内存; 只在真装不下时才托管 —— 装不下的判据是留 6 GiB 给系统, 与
+     * speed_champ_spark.sh 外部看门狗(available < 6000 MB 杀)同一条线。 */
+    /* 余量口径 = /proc/meminfo MemAvailable(与外部看门狗同一口径)。cudaMemGetInfo 在 GB10 统一内存上报的 free
+     * 是 MemFree: 模型载入后 page cache 里躺着几十 GB 干净页, 它报 0.79 GiB —— 1M 上下文按它判永远是"装不下"
+     * (09-06 实撞), 而 cudaMalloc 本身会回收这些干净页。没有 /proc/meminfo 的平台退回 cudaMemGetInfo。 */
+    uint64_t avail_b = 0;
+    {
+        FILE *mf = fopen("/proc/meminfo", "r");
+        if (mf) {
+            char line[256];
+            while (fgets(line, sizeof line, mf)) {
+                unsigned long long kb = 0;
+                if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) { avail_b = (uint64_t)kb * 1024ull; break; }
+            }
+            fclose(mf);
+        }
     }
-
-    const uint64_t free_bytes = (uint64_t)free_b;
-    const uint64_t total_bytes = (uint64_t)total_b;
-    const uint64_t reserve_bytes = cuda_managed_kv_reserve_bytes(total_bytes);
-    if (context_bytes > free_bytes) return 1;
-    return free_bytes - context_bytes < reserve_bytes;
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) { (void)cudaGetLastError(); free_b = 0; total_b = 0; }
+    if (avail_b == 0) avail_b = (uint64_t)free_b;
+    const uint64_t floor_bytes = 6ull * 1073741824ull;
+    const int managed = avail_b < context_bytes + floor_bytes;
+    fprintf(stderr, "ds4: KV policy: MemAvailable %.2f GiB (cuda free %.2f / total %.2f), context %.2f GiB, kv %.2f GiB -> %s\n",
+            (double)avail_b / 1073741824.0, (double)free_b / 1073741824.0, (double)total_b / 1073741824.0,
+            (double)context_bytes / 1073741824.0, (double)kv_cache_bytes / 1073741824.0,
+            managed ? "managed" : "device");
+    return managed;
 }
 
 ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes) {
@@ -210,6 +231,46 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                    "tensor copy");
 }
 
+
+/* f32 暂存 → f16 缓存(2026-09-06): 此前只有 Metal 实现, CUDA 的压缩/indexer 缓存一直是 f32 所以从没被调过;
+ * 1M 战役把 CUDA 缓存改 f16 后由 core 的 commit 路(metal_graph_commit_*_stage)调用。偏移按字节, count 按元素。 */
+/* f32 [rows][512] → 压缩缓存行格式(ds4_gpu_core.h DS4_GPU_COMP_ROW_*): 前 448 维转 f16, 后 64 维原样 f32 */
+__global__ static void comp_rows_commit_kernel(uint8_t *dst, const float *src, uint64_t n) {
+    DS4_PDL_WAIT(); DS4_PDL_TRIGGER();
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const uint64_t r = i / 512u, d = i - r * 512u;
+    uint8_t *row = dst + r * DS4_GPU_COMP_ROW_BYTES;
+    const float v = src[i];
+    if (d < DS4_GPU_COMP_ROW_NOPE) ((__half *)row)[d] = __float2half(v);
+    else *(float *)(row + DS4_GPU_COMP_ROW_NOPE * 2u + (d - DS4_GPU_COMP_ROW_NOPE) * 4u) = v;
+}
+int ds4_gpu_comp_rows_commit(ds4_gpu_tensor *dst, uint64_t first_row, const ds4_gpu_tensor *src, uint64_t rows) {
+    if (!dst || !src) return 0;
+    if (rows == 0) return 1;
+    const uint64_t dst_off = first_row * DS4_GPU_COMP_ROW_BYTES, dst_bytes = rows * DS4_GPU_COMP_ROW_BYTES;
+    const uint64_t src_bytes = rows * 512u * sizeof(float);
+    if (src_bytes > src->bytes || dst_off > dst->bytes || dst_bytes > dst->bytes - dst_off) return 0;
+    const uint64_t n = rows * 512u;
+    ds4_launch_pdl(comp_rows_commit_kernel, (unsigned)((n + 255u) / 256u), 256, 0, 0, 
+        (uint8_t *)dst->ptr + dst_off, (const float *)src->ptr, n);   /* 无流参数 = PTDS 默认流, 捕获态照样进图 */
+    return cuda_ok(cudaGetLastError(), "comp rows commit launch");
+}
+
+int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
+                                   const ds4_gpu_tensor *src, uint64_t src_offset,
+                                   uint64_t count) {
+    if (!dst || !src) return 0;
+    if (count == 0) return 1;
+    const uint64_t src_bytes = count * sizeof(float), dst_bytes = count * sizeof(uint16_t);
+    if (src_offset > src->bytes || src_bytes > src->bytes - src_offset ||
+        dst_offset > dst->bytes || dst_bytes > dst->bytes - dst_offset) return 0;
+    /* 无流参数 = PTDS 默认流(与其余无流 launch 同队, 捕获态里照样进图); g_cur_stream 定义在本文件更后面 */
+    ds4_launch_pdl(f32_to_f16_kernel, (unsigned)((count + 255u) / 256u), 256, 0, 0, 
+        (__half *)((char *)dst->ptr + dst_offset), (const float *)((const char *)src->ptr + src_offset), count);
+    return cuda_ok(cudaGetLastError(), "tensor copy f32->f16 launch");
+}
+
 /* ---- decode 单 token CUDA graph ----
  * 动机: decode 每 token ~900 个小 kernel launch, 提交间隙+延迟尾实测吃 ~10ms/token。
  * 方案(llama.cpp 同款): 每 token stream-capture(比真实提交便宜) → 首次 Instantiate,
@@ -235,10 +296,21 @@ static cudaStream_t g_side_stream = NULL;
 static cudaEvent_t g_side_fork_ev = NULL, g_side_join_ev = NULL;
 static cudaStream_t g_cur_stream = 0;     /* 0 == PTDS(-default-stream per-thread) */
 static int g_side_active = 0;
-static int32_t *g_tok_id_host = NULL;     /* pinned host 参数槽 */
+static int32_t *g_tok_id_host = NULL;     /* pinned host 参数槽(直发路写 token 用) */
 static int32_t g_tok_id_want = 0;         /* capture 期暂存的 token */
 static int g_tok_graph_on = -1;
 static uint32_t g_tok_launch_pos = 0;   /* 本 token pos(end_launch 相位选槽用) */
+/* 预发射(09-07): 图开头 tok_id_load 核从"本相位的 pinned 槽"取 {mode, id}: mode=0 用 id(主机给的
+ * token), mode=1 用 g_tok_next_dev(上一图末尾 decode_argmax 写的 argmax)。四相各一槽, 槽只在该相位
+ * 图发射前由主机写, 该图跑完(readback 落地)之前不会再被写 ⇒ 无竞态。旧的 4B H2D memcpy 节点删除:
+ * 它既是每 token 一个非核节点(切断 PDL 链), 又要求发射前主机已知 token。 */
+static int32_t *g_tok_slots_host = NULL;  /* pinned [4][2] = {mode, id} */
+static int32_t *g_tok_slots_dev = NULL;   /* 同一块内存的设备侧地址(零拷贝映射) */
+static int32_t *g_tok_next_dev = NULL;    /* 设备 argmax 槽 */
+static float *g_argmax_pm = NULL;         /* 两级 argmax 的分段候选 [DS4_ARGMAX_BLOCKS] */
+static int32_t *g_argmax_pi = NULL;
+static int64_t g_tok_prelaunched_pos = -1;   /* 已预发射的 pos(-1 无) */
+static cudaEvent_t g_readback_ev = NULL;     /* logits/next-tok 异步回传完成事件 */
 
 static void side_stream_ensure(void) {
     if (g_side_stream) return;

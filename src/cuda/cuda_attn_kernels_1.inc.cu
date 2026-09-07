@@ -2,6 +2,7 @@
  * attention kernel 族(indexed_mixed/heads8_online/hc_split_weighted_sum_norm_fused/compressor_set_rows)。
  */
 __global__ static void indexer_hadamard_fp4_kernel(float *x, uint32_t n_rows, uint32_t head_dim) {
+    DS4_PDL_WAIT(); DS4_PDL_TRIGGER();
     uint32_t row = blockIdx.x;
     uint32_t tid = threadIdx.x;
     if (row >= n_rows || head_dim != 128u || tid >= 128u) return;
@@ -122,12 +123,29 @@ __global__ static void attention_prefill_raw_kernel(
     }
 }
 
+/* 压缩缓存行格式(ds4_gpu_core.h DS4_GPU_COMP_ROW_*): [448 维 f16][64 维 f32], 行距 1152 B。
+ * ld_comp4: 第 c4 个 float4(0..127, 与原始 f32 行的 float4 读同形); ld_comp1: 第 d 维。 */
+#define COMP_ROW(base, c) ((const uint8_t *)(base) + (uint64_t)(c) * DS4_GPU_COMP_ROW_BYTES)
+__device__ static inline float4 ld_comp4(const uint8_t *row, uint32_t c4) {
+    if (c4 < DS4_GPU_COMP_ROW_NOPE / 4u) {
+        const uint2 u = *(const uint2 *)(row + (uint64_t)c4 * 8u);
+        const float2 a = __half22float2(*(const __half2 *)&u.x), b = __half22float2(*(const __half2 *)&u.y);
+        return make_float4(a.x, a.y, b.x, b.y);
+    }
+    return *(const float4 *)(row + DS4_GPU_COMP_ROW_NOPE * 2u + (uint64_t)(c4 - DS4_GPU_COMP_ROW_NOPE / 4u) * 16u);
+}
+__device__ static inline float ld_comp1(const uint8_t *row, uint32_t d) {
+    return d < DS4_GPU_COMP_ROW_NOPE
+        ? __half2float(((const __half *)row)[d])
+        : *(const float *)(row + DS4_GPU_COMP_ROW_NOPE * 2u + (uint64_t)(d - DS4_GPU_COMP_ROW_NOPE) * 4u);
+}
+
 __global__ static void attention_prefill_mixed_kernel(
         float *heads,
         const float *sinks,
         const float *q,
         const float *raw_kv,
-        const float *comp_kv,
+        const uint8_t *comp_kv,
         const float *comp_mask,
         uint32_t use_comp_mask,
         uint32_t n_tokens,
@@ -163,9 +181,9 @@ __global__ static void attention_prefill_mixed_kernel(
         float add = use_comp_mask ? comp_mask[(uint64_t)t * n_comp + c] : 0.0f;
         float s = -INFINITY;
         if (add > -1.0e20f) {
-            const float *kvrow = comp_kv + (uint64_t)c * head_dim;
+            const uint8_t *kvrow = COMP_ROW(comp_kv, c);
             float dot = 0.0f;
-            for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kvrow[d];
+            for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * ld_comp1(kvrow, d);
             s = dot * scale + add;
         }
         scores[raw_count + c] = s;
@@ -196,7 +214,7 @@ __global__ static void attention_prefill_mixed_kernel(
     for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
         for (uint32_t r = 0; r < raw_count; r++) acc += raw_kv[(uint64_t)(raw_start + r) * head_dim + d] * scores[r];
-        for (uint32_t c = 0; c < visible_comp; c++) acc += comp_kv[(uint64_t)c * head_dim + d] * scores[raw_count + c];
+        for (uint32_t c = 0; c < visible_comp; c++) acc += ld_comp1(COMP_ROW(comp_kv, c), d) * scores[raw_count + c];
         oh[d] = acc / denom;
     }
 }
@@ -307,7 +325,7 @@ __global__ static void attention_prefill_mixed_softmax_kernel(
 __global__ static void attention_prefill_pack_mixed_kv_kernel(
         float *dst,
         const float *raw_kv,
-        const float *comp_kv,
+        const uint8_t *comp_kv,
         uint32_t n_tokens,
         uint32_t n_comp,
         uint32_t head_dim) {
@@ -317,7 +335,7 @@ __global__ static void attention_prefill_pack_mixed_kv_kernel(
     uint32_t d = gid % head_dim;
     uint32_t r = gid / head_dim;
     dst[gid] = r < n_tokens ? raw_kv[(uint64_t)r * head_dim + d]
-                             : comp_kv[(uint64_t)(r - n_tokens) * head_dim + d];
+                             : ld_comp1(COMP_ROW(comp_kv, r - n_tokens), d);
 }
 
 __global__ static void attention_prefill_unpack_heads_kernel(

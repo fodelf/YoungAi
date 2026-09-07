@@ -6,7 +6,7 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
         const float *sinks,
         const float *q,
         const float *raw_kv,
-        const float *comp_kv,
+        const uint8_t *comp_kv,
         const int32_t *topk,
         uint32_t n_tokens,
         uint32_t pos0,
@@ -98,10 +98,9 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
             const uint32_t sr = row0 + rr;
-            const float4 *src = sr < raw_count
-                ? (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim)
-                : (const float4 *)(comp_kv + (uint64_t)comp_rows[sr - raw_count] * head_dim);
-            kv_shared[off] = src[c4];
+            kv_shared[off] = sr < raw_count
+                ? ((const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim))[c4]
+                : ld_comp4(COMP_ROW(comp_kv, comp_rows[sr - raw_count]), c4);
         }
         __syncthreads();
         if (valid_head) {
@@ -146,10 +145,9 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
             const uint32_t sr = row0 + rr;
-            const float4 *src = sr < raw_count
-                ? (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim)
-                : (const float4 *)(comp_kv + (uint64_t)comp_rows[sr - raw_count] * head_dim);
-            kv_shared[off] = src[c4];
+            kv_shared[off] = sr < raw_count
+                ? ((const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim))[c4]
+                : ld_comp4(COMP_ROW(comp_kv, comp_rows[sr - raw_count]), c4);
         }
         __syncthreads();
         if (valid_head) {
@@ -184,7 +182,7 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
         const float *sinks,
         const float *q,
         const float *raw_kv,
-        const float *comp_kv,
+        const uint8_t *comp_kv,
         const int32_t *topk,
         uint32_t n_tokens,
         uint32_t pos0,
@@ -274,10 +272,9 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
             const uint32_t comp_idx = sr < raw_count
                 ? 0u
                 : (uint32_t)topk[(uint64_t)t * top_k + (sr - raw_count)];
-            const float4 *src = sr < raw_count
-                ? (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim)
-                : (const float4 *)(comp_kv + (uint64_t)comp_idx * head_dim);
-            kv_shared[off] = src[c4];
+            kv_shared[off] = sr < raw_count
+                ? ((const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim))[c4]
+                : ld_comp4(COMP_ROW(comp_kv, comp_idx), c4);
         }
         __syncthreads();
         if (valid_head) {
@@ -349,7 +346,7 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
         const float *sinks,
         const float *q,
         const float *raw_kv,
-        const float *comp_kv,
+        const uint8_t *comp_kv,
         uint32_t n_tokens,
         uint32_t n_comp,
         uint32_t window,
@@ -398,10 +395,9 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
             const uint32_t sr = row0 + rr;
-            const float4 *src = sr < raw_count
-                ? (const float4 *)(raw_kv + (uint64_t)(raw_start + sr) * head_dim)
-                : (const float4 *)(comp_kv + (uint64_t)(sr - raw_count) * head_dim);
-            kv_shared[off] = src[c4];
+            kv_shared[off] = sr < raw_count
+                ? ((const float4 *)(raw_kv + (uint64_t)(raw_start + sr) * head_dim))[c4]
+                : ld_comp4(COMP_ROW(comp_kv, sr - raw_count), c4);
         }
         __syncthreads();
         if (valid_head) {

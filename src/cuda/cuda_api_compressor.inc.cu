@@ -34,7 +34,7 @@ int ds4_gpu_compressor_store_batch_tensor(
     const char *ape = cuda_model_range_ptr(model_map, ape_offset, ape_bytes, "compressor_ape");
     if (!ape) return 0;
     uint64_t n = (uint64_t)n_tokens * width;
-    compressor_store_kernel<<<(n + 255) / 256, 256>>>(
+    ds4_launch_pdl(compressor_store_kernel, (n + 255) / 256, 256, 0, 0, 
             (const float *)kv->ptr,
             (const float *)sc->ptr,
             (float *)state_kv->ptr,
@@ -49,7 +49,9 @@ int ds4_gpu_compressor_store_batch_tensor(
     return cuda_ok(cudaGetLastError(), "compressor store launch");
 }
 
-int ds4_gpu_compressor_update_tensor(
+/* 攒批版(2026-09-05): tokens [pos0, pos0+n_tokens) 的投影一次入 state, 末位落在 emit 位就
+ * 接原池化链(pool→norm→rope→ratio4 shift)。单 token 版是它的 n_tokens=1 特例。 */
+int ds4_gpu_compressor_update_batch_tensor(
         const ds4_gpu_tensor *kv_cur,
         const ds4_gpu_tensor *sc_cur,
         ds4_gpu_tensor       *state_kv,
@@ -63,7 +65,8 @@ int ds4_gpu_compressor_update_tensor(
         uint32_t                norm_type,
         uint32_t                head_dim,
         uint32_t                ratio,
-        uint32_t                pos,
+        uint32_t                pos0,
+        uint32_t                n_tokens,
         uint32_t                comp_row,
         uint32_t                n_rot,
         uint32_t                n_ctx_orig,
@@ -75,17 +78,18 @@ int ds4_gpu_compressor_update_tensor(
         float                   beta_slow,
         float                   rms_eps) {
     if (!kv_cur || !sc_cur || !state_kv || !state_score || !comp_cache ||
-        !model_map || head_dim == 0 || ratio == 0 ||
+        !model_map || head_dim == 0 || ratio == 0 || n_tokens == 0 || n_tokens > ratio ||
         n_rot > head_dim || (n_rot & 1u) != 0 ||
         (ape_type != 0u && ape_type != 1u) || norm_type != 0u) {
         return 0;
     }
+    const uint32_t pos = pos0 + n_tokens - 1u;
     const uint32_t coff = ratio == 4u ? 2u : 1u;
     const uint32_t width = coff * head_dim;
     const uint32_t state_rows = coff * ratio;
     const uint32_t emit = ((pos + 1u) % ratio) == 0u ? 1u : 0u;
     const uint64_t elem_ape = ape_type == 1u ? 2u : 4u;
-    const uint64_t kv_bytes = (uint64_t)width * sizeof(float);
+    const uint64_t kv_bytes = (uint64_t)n_tokens * width * sizeof(float);
     const uint64_t state_bytes = (uint64_t)state_rows * width * sizeof(float);
     const uint64_t comp_bytes = (uint64_t)(comp_row + (emit ? 1u : 0u)) * head_dim * sizeof(float);
     const uint64_t ape_bytes = (uint64_t)width * ratio * elem_ape;
@@ -99,7 +103,7 @@ int ds4_gpu_compressor_update_tensor(
     }
     if (!ds4_gpu_compressor_store_batch_tensor(kv_cur, sc_cur, state_kv, state_score,
                                                  model_map, model_size, ape_offset, ape_type,
-                                                 head_dim, ratio, pos, 1)) {
+                                                 head_dim, ratio, pos0, n_tokens)) {
         return 0;
     }
     if (!emit) return 1;
@@ -108,7 +112,7 @@ int ds4_gpu_compressor_update_tensor(
             (uint64_t)comp_row * head_dim * sizeof(float),
             (uint64_t)head_dim * sizeof(float));
     if (!comp_row_view) return 0;
-    compressor_update_pool_kernel<<<(head_dim + 255) / 256, 256, 0, g_cur_stream>>>(
+    ds4_launch_pdl(compressor_update_pool_kernel, (head_dim + 255) / 256, 256, 0, g_cur_stream, 
             (float *)comp_row_view->ptr,
             (const float *)state_kv->ptr,
             (const float *)state_score->ptr,
@@ -125,11 +129,24 @@ int ds4_gpu_compressor_update_tensor(
     ds4_gpu_tensor_free(comp_row_view);
     if (ok && ratio == 4u) {
         uint64_t half = 4ull * width;
-        compressor_shift_ratio4_kernel<<<(half + 255) / 256, 256>>>(
+        ds4_launch_pdl(compressor_shift_ratio4_kernel, (half + 255) / 256, 256, 0, 0, 
                 (float *)state_kv->ptr, (float *)state_score->ptr, width);
         ok = cuda_ok(cudaGetLastError(), "compressor ratio4 shift launch");
     }
     return ok;
+}
+int ds4_gpu_compressor_update_tensor(
+        const ds4_gpu_tensor *kv_cur, const ds4_gpu_tensor *sc_cur,
+        ds4_gpu_tensor *state_kv, ds4_gpu_tensor *state_score, ds4_gpu_tensor *comp_cache,
+        const void *model_map, uint64_t model_size, uint64_t ape_offset, uint32_t ape_type,
+        uint64_t norm_offset, uint32_t norm_type, uint32_t head_dim, uint32_t ratio, uint32_t pos,
+        uint32_t comp_row, uint32_t n_rot, uint32_t n_ctx_orig, float freq_base, float freq_scale,
+        float ext_factor, float attn_factor, float beta_fast, float beta_slow, float rms_eps) {
+    return ds4_gpu_compressor_update_batch_tensor(kv_cur, sc_cur, state_kv, state_score, comp_cache,
+                                                  model_map, model_size, ape_offset, ape_type,
+                                                  norm_offset, norm_type, head_dim, ratio, pos, 1u,
+                                                  comp_row, n_rot, n_ctx_orig, freq_base, freq_scale,
+                                                  ext_factor, attn_factor, beta_fast, beta_slow, rms_eps);
 }
 int ds4_gpu_compressor_prefill_tensor(
         ds4_gpu_tensor       *comp_cache,
@@ -237,7 +254,7 @@ int ds4_gpu_compressor_prefill_tensor(
                                                    head_dim, n_comp, rms_eps)) return 0;
         if (n_rot != 0) {
             const uint32_t pairs = n_comp * (n_rot / 2u);
-            rope_tail_kernel<<<(pairs + 255) / 256, 256>>>(
+            ds4_launch_pdl(rope_tail_kernel, (pairs + 255) / 256, 256, 0, 0, 
                     (float *)comp_cache->ptr, n_comp, 1, head_dim, n_rot,
                     pos0, ratio, n_ctx_orig, 0, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow);
@@ -312,7 +329,7 @@ int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
                                                head_dim, n_comp, rms_eps)) return 0;
     if (n_rot != 0) {
         const uint32_t pairs = n_comp * (n_rot / 2u);
-        rope_tail_kernel<<<(pairs + 255) / 256, 256>>>(
+        ds4_launch_pdl(rope_tail_kernel, (pairs + 255) / 256, 256, 0, 0, 
                 (float *)comp_cache->ptr, n_comp, 1, head_dim, n_rot,
                 pos0, ratio, n_ctx_orig, 0, freq_base, freq_scale,
                 ext_factor, attn_factor, beta_fast, beta_slow);

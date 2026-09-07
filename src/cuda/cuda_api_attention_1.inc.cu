@@ -12,13 +12,12 @@ int ds4_gpu_attention_decode_heads_tensor(
         uint32_t                raw_cap,
         uint32_t                raw_start,
         const ds4_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
         uint32_t                n_comp,
         const ds4_gpu_tensor *comp_mask,
         uint32_t                use_mask,
         uint32_t                n_head,
         uint32_t                head_dim) {
-    if (comp_kv_f16 ||
+    if ((n_comp != 0 && head_dim != 512u) ||   /* 压缩缓存行格式钉死 512 维 */
         !heads || !q || !raw_kv || !model_map || n_raw == 0 || raw_cap < n_raw ||
         raw_start >= raw_cap || (n_comp != 0 && !comp_kv) || (use_mask && !comp_mask) ||
         sinks_offset > model_size ||
@@ -26,7 +25,7 @@ int ds4_gpu_attention_decode_heads_tensor(
         heads->bytes < (uint64_t)n_head * head_dim * sizeof(float) ||
         q->bytes < (uint64_t)n_head * head_dim * sizeof(float) ||
         raw_kv->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
-        (n_comp && comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float)) ||
+        (n_comp && comp_kv->bytes < (uint64_t)n_comp * DS4_GPU_COMP_ROW_BYTES) ||
         (use_mask && comp_mask->bytes < (uint64_t)n_comp * sizeof(float))) {
         return 0;
     }
@@ -39,6 +38,15 @@ int ds4_gpu_attention_decode_heads_tensor(
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
+    /* 单 token 解码先走分行在线核(09-05, cuda_attn_kernels_6): 稠密 = 原始窗全部 + 压缩行
+     * [0,n_comp) 全部(single_all 语义)。<0 = 部分和暂存未就绪(捕获态), 退回老核。 */
+    if (!use_mask && head_dim == 512u) {
+        const int r = attention_decode_split_launch((float *)heads->ptr, sinks, (const float *)q->ptr,
+                                                    (const float *)raw_kv->ptr,
+                                                    n_comp ? (const uint8_t *)comp_kv->ptr : NULL, NULL,
+                                                    raw_cap, raw_start, 0u, n_raw, n_comp, n_comp, n_head);
+        if (r >= 0) return r;
+    }
     if (!cuda_attention_score_buffer_fits(n_comp)) {
         if (!use_mask && head_dim == 512u) {
             dim3 online_grid(1, (n_head + 7u) / 8u, 1);
@@ -46,7 +54,7 @@ int ds4_gpu_attention_decode_heads_tensor(
                                                                               sinks,
                                                                               (const float *)q->ptr,
                                                                               (const float *)raw_kv->ptr,
-                                                                              n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                                              n_comp ? (const uint8_t *)comp_kv->ptr : (const uint8_t *)raw_kv->ptr,
                                                                               1,
                                                                               0,
                                                                               n_raw,
@@ -67,7 +75,7 @@ int ds4_gpu_attention_decode_heads_tensor(
                                                  sinks,
                                                  (const float *)q->ptr,
                                                  (const float *)raw_kv->ptr,
-                                                 n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                 n_comp ? (const uint8_t *)comp_kv->ptr : (const uint8_t *)raw_kv->ptr,
                                                  use_mask ? (const float *)comp_mask->ptr : NULL,
                                                  use_mask,
                                                  1, 0, n_raw, raw_cap, raw_start, n_comp,
@@ -91,7 +99,7 @@ int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads, const void
                                                                    sinks,
                                                                    (const float *)q->ptr,
                                                                    (const float *)raw_kv->ptr,
-                                                                   (const float *)raw_kv->ptr,
+                                                                   (const uint8_t *)raw_kv->ptr,   /* 无压缩行, 占位不读 */
                                                                    n_tokens,
                                                                    0,
                                                                    window,
@@ -180,7 +188,6 @@ static int attention_decode_batch_launch(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
         const ds4_gpu_tensor *comp_mask,
         uint32_t                use_comp_mask,
         uint32_t                n_tokens,
@@ -193,7 +200,7 @@ static int attention_decode_batch_launch(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim) {
-    if (comp_kv_f16 ||
+    if ((n_comp != 0 && head_dim != 512u) ||   /* 压缩缓存行格式钉死 512 维 */
         !heads || !q || !raw_kv || !model_map || n_tokens == 0 ||
         n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
         (n_comp != 0 && !comp_kv) || (use_comp_mask && !comp_mask) ||
@@ -202,7 +209,7 @@ static int attention_decode_batch_launch(
         heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         raw_kv->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
-        (n_comp && comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float)) ||
+        (n_comp && comp_kv->bytes < (uint64_t)n_comp * DS4_GPU_COMP_ROW_BYTES) ||
         (use_comp_mask && comp_mask->bytes < (uint64_t)n_tokens * n_comp * sizeof(float))) {
         return 0;
     }
@@ -210,6 +217,23 @@ static int attention_decode_batch_launch(
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
+    /* 小批(投机 verify ≤8 token, 09-07): 走解码分行核(批版), 与纯解码同轨; <0 = 不适用退回批核。
+     * n_tokens==1 也走(k=1 对拍定罪: 批路 N=1 曾落到老 mixed 核, 层 0 出口就与解码不同)。 */
+    if (!use_comp_mask && head_dim == 512u && n_tokens <= 8u) {
+        const int r = attention_decode_split_tokens((float *)heads->ptr, sinks, (const float *)q->ptr,
+                                                    (const float *)raw_kv->ptr, n_comp ? (const uint8_t *)comp_kv->ptr : NULL,
+                                                    NULL, 0u, n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp,
+                                                    window, ratio, n_head);
+        if (r >= 0) return r;
+    }
+    /* 09-06: 压缩行多(≥1024, 即 ratio-128 层 128k 上下文以上)且是整批 prefill 时走 GEMM 版(cuda_api_attention_5);
+     * 老在线核每 token 重搬全部压缩行, 1M 时 420 ms/层块。<0 = 不适用(捕获态/cuBLAS 未就绪)退回下面。 */
+    if (!use_comp_mask && head_dim == 512u && n_tokens >= 128u && n_comp >= 1024u && !g_quality_mode) {
+        const int r = attention_static_gemm_launch((float *)heads->ptr, sinks, (const float *)q->ptr,
+                                                   (const float *)raw_kv->ptr, (const uint8_t *)comp_kv->ptr,
+                                                   n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio, n_head);
+        if (r >= 0) return r;
+    }
     if (!cuda_attention_score_buffer_fits(n_comp)) {
         if (!use_comp_mask && head_dim == 512u &&
             1) {
@@ -218,7 +242,7 @@ static int attention_decode_batch_launch(
                                                                               sinks,
                                                                               (const float *)q->ptr,
                                                                               (const float *)raw_kv->ptr,
-                                                                              n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                                              n_comp ? (const uint8_t *)comp_kv->ptr : (const uint8_t *)raw_kv->ptr,
                                                                               n_tokens,
                                                                               pos0,
                                                                               n_raw,
@@ -241,7 +265,7 @@ static int attention_decode_batch_launch(
                                                                    sinks,
                                                                    (const float *)q->ptr,
                                                                    (const float *)raw_kv->ptr,
-                                                                   n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                                   n_comp ? (const uint8_t *)comp_kv->ptr : (const uint8_t *)raw_kv->ptr,
                                                                    n_tokens,
                                                                    pos0,
                                                                    n_raw,
@@ -259,7 +283,7 @@ static int attention_decode_batch_launch(
                                                  sinks,
                                                  (const float *)q->ptr,
                                                  (const float *)raw_kv->ptr,
-                                                 n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                 n_comp ? (const uint8_t *)comp_kv->ptr : (const uint8_t *)raw_kv->ptr,
                                                  use_comp_mask ? (const float *)comp_mask->ptr : NULL,
                                                  use_comp_mask, n_tokens, pos0, n_raw, raw_cap,
                                                  raw_start, n_comp, window, ratio, n_head, head_dim);
@@ -282,7 +306,7 @@ int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim) {
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
-                                      q, raw_kv, NULL, 0, NULL, 0, n_tokens, pos0,
+                                      q, raw_kv, NULL, NULL, 0, n_tokens, pos0,
                                       n_raw, raw_cap, raw_start, 0, window, 1,
                                       n_head, head_dim);
 }
@@ -295,7 +319,6 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
         const ds4_gpu_tensor *comp_mask,
         uint32_t                use_comp_mask,
         uint32_t                n_tokens,
@@ -308,9 +331,8 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim) {
-    if (comp_kv_f16) return 0;
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
-                                      q, raw_kv, comp_kv, comp_kv_f16, comp_mask, use_comp_mask,
+                                      q, raw_kv, comp_kv, comp_mask, use_comp_mask,
                                       n_tokens, pos0, n_raw, raw_cap, raw_start,
                                       n_comp, window, ratio, n_head, head_dim);
 }
@@ -323,7 +345,6 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
         const ds4_gpu_tensor *topk,
         uint32_t                n_tokens,
         uint32_t                pos0,
@@ -336,7 +357,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim) {
-    if (comp_kv_f16 ||
+    if (head_dim != 512u ||   /* 压缩缓存行格式钉死 512 维 */
         !heads || !q || !raw_kv || !comp_kv || !topk || !model_map ||
         n_tokens == 0 || n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
         n_comp == 0 || top_k == 0 ||
@@ -345,7 +366,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         raw_kv->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
-        comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float) ||
+        comp_kv->bytes < (uint64_t)n_comp * DS4_GPU_COMP_ROW_BYTES ||
         topk->bytes < (uint64_t)n_tokens * top_k * sizeof(int32_t)) {
         return 0;
     }
@@ -354,6 +375,35 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
     const int32_t *topk_ptr = (const int32_t *)topk->ptr;
+    /* 小批(投机 verify ≤8 token, 09-07): 分行核批版(topk 行按各自的 topk 段), 与纯解码同轨; n==1 走下面原单 token 路 */
+    if (n_tokens > 1u && n_tokens <= 8u && head_dim == 512u) {
+        const int r = attention_decode_split_tokens((float *)heads->ptr, sinks, (const float *)q->ptr,
+                                                    (const float *)raw_kv->ptr, (const uint8_t *)comp_kv->ptr,
+                                                    topk_ptr, top_k, n_tokens, pos0, n_raw, raw_cap, raw_start,
+                                                    n_comp, window, ratio, n_head);
+        if (r >= 0) return r;
+    }
+    /* 单 token 解码先走分行在线核(09-05, cuda_attn_kernels_6): 原始窗范围按老核同式在 host
+     * 算(qpos=pos0, uint32 溢出语义照抄), 压缩行按 topk 顺序、越界/负项跳过。 */
+    if (n_tokens == 1u && head_dim == 512u) {
+        const uint32_t first_raw_pos = pos0 + 1u - n_raw;
+        uint32_t raw_count = 0u, raw_first_idx = 0u;
+        if (pos0 >= first_raw_pos) {
+            const uint32_t raw_last_pos = first_raw_pos + n_raw - 1u;
+            uint32_t lo = first_raw_pos;
+            if (window != 0u && pos0 + 1u > window && pos0 + 1u - window > lo) lo = pos0 + 1u - window;
+            const uint32_t hi = pos0 < raw_last_pos ? pos0 : raw_last_pos;
+            if (hi >= lo) { raw_first_idx = lo - first_raw_pos; raw_count = hi - lo + 1u; }
+            if (raw_count > 256u) raw_count = 256u;
+        }
+        uint32_t visible_comp = ratio != 0u ? (pos0 + 1u) / ratio : n_comp;
+        if (visible_comp > n_comp) visible_comp = n_comp;
+        const int r = attention_decode_split_launch((float *)heads->ptr, sinks, (const float *)q->ptr,
+                                                    (const float *)raw_kv->ptr, (const uint8_t *)comp_kv->ptr,
+                                                    topk_ptr, raw_cap, raw_start, raw_first_idx, raw_count,
+                                                    visible_comp, top_k, n_head);
+        if (r >= 0) return r;
+    }
     if (n_tokens > 1u && top_k == 512u &&
         1) {
         const uint64_t sort_bytes = (uint64_t)n_tokens * top_k * sizeof(int32_t);
@@ -371,7 +421,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                                                                sinks,
                                                                                (const float *)q->ptr,
                                                                                (const float *)raw_kv->ptr,
-                                                                               (const float *)comp_kv->ptr,
+                                                                               (const uint8_t *)comp_kv->ptr,
                                                                                topk_ptr,
                                                                                n_tokens,
                                                                                pos0,
@@ -391,7 +441,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                                                  sinks,
                                                                  (const float *)q->ptr,
                                                                  (const float *)raw_kv->ptr,
-                                                                 (const float *)comp_kv->ptr,
+                                                                 (const uint8_t *)comp_kv->ptr,
                                                                  topk_ptr,
                                                                  n_tokens,
                                                                  pos0,
@@ -411,7 +461,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                                   sinks,
                                                   (const float *)q->ptr,
                                                   (const float *)raw_kv->ptr,
-                                                  (const float *)comp_kv->ptr,
+                                                  (const uint8_t *)comp_kv->ptr,
                                                   topk_ptr,
                                                   n_tokens,
                                                   pos0,

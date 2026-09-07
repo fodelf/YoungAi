@@ -419,6 +419,7 @@ __global__ static void hc_mean_slot_kernel(
 
 /* token id 从 device 读的变体: 图重放时取参数槽最新值(流水线前提) */
 __global__ static void embed_token_hc_dev_kernel(float *out, const unsigned short *w, const int32_t *tok_dev, uint32_t n_vocab, uint32_t n_embd, uint32_t n_hc) {
+    DS4_PDL_WAIT(); DS4_PDL_TRIGGER();
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t n = n_embd * n_hc;
     if (i >= n) return;

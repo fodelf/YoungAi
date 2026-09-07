@@ -27,14 +27,20 @@ static int g_bat_graph_on = -1;
 static int g_bat_slot = -1;
 
 int ds4_gpu_batch_graph_begin(int slot) {
-    /* 默认关(2026-08-21 A/B): verify 64.9 vs 65.6 = 噪声内。批 kernel 比 decode 大 3x,
-     * launch 开销占比小 => 图收益消失; 31% 空转是 kernel 间排空(ramp/drain)不是发射延迟。 */
-    if (g_bat_graph_on < 0) g_bat_graph_on = ((const char *)0) /* DS4_CUDA_BATCH_GRAPH: 路径开关已删(2026-08-22 隐形炸弹清理) */ ? 1 : 0;
+    /* 08-21 关(verify 64.9 vs 65.6 无肉: 那时批核又大又慢, 发射税占比小)。09-07 重开: 批核已提到 decode 级, 剖面按
+     * "本核结束 − 上一核结束"算真实增量, 五个大核只占 ~23 ms/轮, 其余 ~60 ms 摊在 3198 个小核的发射/排空上 ——
+     * 与 decode token 图 09-05 的故事同构。候选数钉死 4 ⇒ 同相位拓扑同构, ExecUpdate 只改参数。 */
+    /* 09-07 实测(p15): 每轮重捕获 + ExecUpdate 的主机开销让轮空隙 3.8 → 12.3 ms, GPU 忙只省 3 ms ⇒ 净亏 6 ms/轮。
+     * 批图要赚钱得像 decode token 图那样一次捕获、参数走设备槽重放, 不是每轮重捕获; 先关。 */
+    if (g_bat_graph_on < 0) g_bat_graph_on = 0;
     if (!g_bat_graph_on || slot < 0 || slot > 3) return 0;
     cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
     if (cudaStreamIsCapturing(cudaStreamPerThread, &cs) == cudaSuccess &&
         cs != cudaStreamCaptureStatusNone) return 0;   /* 已在别的 capture 里 */
-    if (cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+    /* Relaxed 模式(09-07): 固定工作区后 cuBLAS GemmEx(drafter 建窗的 q8 f16 影子 GEMM)在 ThreadLocal 捕获态仍报
+     * status 14 —— cuBLAS 内部有 cudaStreamQuery 一类"可能不安全"的调用, 严格模式一律作废捕获。Relaxed 只是不拦这些
+     * 调用(它们不进图), kernel/memcpy 节点照常捕获; 批路里没有主机同步(有则 verify 结果早就错了)。token 图仍 ThreadLocal。 */
+    if (cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeRelaxed) != cudaSuccess) {
         (void)cudaGetLastError();
         g_bat_graph_on = 0;
         return 0;
@@ -121,6 +127,137 @@ int ds4_gpu_sanitize_finite_tensor(ds4_gpu_tensor *t, uint64_t n_float) {
     return cuda_ok(cudaGetLastError(), "sanitize finite");
 }
 
+/* ===== 预发射(2026-09-07): 图开头取 token / 图末尾 argmax / 主机侧发射与回传 =====
+ * 契约见 ds4_gpu_core.h。数值: 图内所有核不变, 只多了取槽核与两级 argmax; argmax 的并列语义
+ * 与主机 sample_argmax / ds4_session_argmax_excluding 同一条规则(严格大于, 首个最大胜, NaN 永不选)
+ * ⇒ 主机事后算出的 token 与设备槽逐位一致, core 用这一点做预发射对账。 */
+__global__ static void tok_id_load_kernel(int32_t *dev_id, const int32_t *slot, const int32_t *next_dev) {
+    DS4_PDL_WAIT(); DS4_PDL_TRIGGER();
+    /* slot 是主机 pinned 内存: GB10 统一内存下 GPU L2 会缓存它, 普通读拿到的是上一图的旧行(实撞:
+     * 输出"用户的用户的请求请求", 每个 token 慢一拍)。volatile = ld.volatile(系统作用域强读), 绕过缓存到
+     * 一致点取主机刚写的值; 主机侧写完做 fence(tok_slot_write)。 */
+    const volatile int32_t *vs = slot;
+    const int32_t mode = vs[0], id = vs[1];
+    *dev_id = mode ? *next_dev : id;
+}
+/* 规则(与主机 sample_argmax / ds4_session_argmax_excluding 同): 严格大于才替换 ⇒ 首个最大胜, NaN 永不
+ * 入选(x > m 对 NaN 恒假); 候选 (m, i), i<0 = 无候选。两级: 64 block 各扫一段连续下标, 再 1 block 归约。
+ * 首版单 block 串扫 129280 个 logit 要 653 µs/token(剖面实测), 把边界省下的时间又吃回去; 两级 ≈ 10 µs。 */
+#define DS4_ARGMAX_BLOCKS 64u
+__device__ __forceinline__ static void argmax_block_reduce(float *bm, int32_t *bi, float m, int32_t mi) {
+    bm[threadIdx.x] = m; bi[threadIdx.x] = mi;
+    __syncthreads();
+    for (uint32_t s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            const float lm = bm[threadIdx.x], rm = bm[threadIdx.x + s];
+            const int32_t li = bi[threadIdx.x], ri = bi[threadIdx.x + s];
+            const bool take = (ri >= 0) && (li < 0 || rm > lm || (rm == lm && ri < li));
+            if (take) { bm[threadIdx.x] = rm; bi[threadIdx.x] = ri; }
+        }
+        __syncthreads();
+    }
+}
+__global__ static void decode_argmax_part_kernel(float *pm, int32_t *pi, const float *logits,
+                                                 uint32_t vocab, int32_t exclude) {
+    DS4_PDL_WAIT(); DS4_PDL_TRIGGER();
+    __shared__ float bm[256];
+    __shared__ int32_t bi[256];
+    const uint32_t per = (vocab + gridDim.x - 1u) / gridDim.x;
+    const uint32_t beg = blockIdx.x * per, end = (beg + per < vocab) ? beg + per : vocab;
+    float m = -INFINITY; int32_t mi = -1;
+    for (uint32_t v = beg + threadIdx.x; v < end; v += blockDim.x) {
+        if ((int32_t)v == exclude) continue;
+        const float x = logits[v];
+        if (x > m) { m = x; mi = (int32_t)v; }
+    }
+    argmax_block_reduce(bm, bi, m, mi);
+    if (threadIdx.x == 0) { pm[blockIdx.x] = bm[0]; pi[blockIdx.x] = bi[0]; }
+}
+__global__ static void decode_argmax_final_kernel(int32_t *out_id, const float *pm, const int32_t *pi,
+                                                  uint32_t n, int32_t exclude) {
+    DS4_PDL_WAIT(); DS4_PDL_TRIGGER();
+    __shared__ float bm[256];
+    __shared__ int32_t bi[256];
+    const float m = (threadIdx.x < n) ? pm[threadIdx.x] : -INFINITY;
+    const int32_t mi = (threadIdx.x < n) ? pi[threadIdx.x] : -1;
+    argmax_block_reduce(bm, bi, m, mi);
+    if (threadIdx.x == 0) *out_id = (bi[0] < 0) ? ((exclude == 0) ? 1 : 0) : bi[0];   /* 全 -inf/NaN 兜底同主机 */
+}
+static void tok_slot_write(int slot, int32_t mode, int32_t id) {
+    if (!g_tok_slots_host) return;
+    ((volatile int32_t *)g_tok_slots_host)[2 * slot] = mode;
+    ((volatile int32_t *)g_tok_slots_host)[2 * slot + 1] = id;
+    __sync_synchronize();   /* 先落内存再发射, GPU 的系统作用域读才看得到 */
+}
+int ds4_gpu_decode_prelaunch_capable(void) { return 1; }
+int ds4_gpu_decode_argmax_tensor(const ds4_gpu_tensor *logits, uint32_t n_vocab, int exclude_id) {
+    if (!logits || logits->bytes < (uint64_t)n_vocab * sizeof(float)) return 0;
+    tok_graph_ensure_id_slot();   /* 首次解码 encode 在 capture 之前已建槽(token_graph_begin), 这里只是保险 */
+    if (!g_tok_next_dev || !g_argmax_pm) return 0;
+    /* 分段核故意不用 PDL 发射: 前序是 1.27 ms 的输出头矩阵, PDL 会让这 64 个 block 提前上 SM 干等
+     * 整段时间(剖面把等待算进核时长: 476 µs/token), 还占着输出头的驻留槽。普通发射只多 ~2 µs 边界。 */
+    decode_argmax_part_kernel<<<DS4_ARGMAX_BLOCKS, 256>>>(
+        g_argmax_pm, g_argmax_pi, (const float *)logits->ptr, n_vocab, (int32_t)exclude_id);
+    ds4_launch_pdl(decode_argmax_final_kernel, 1, 256, 0, 0,
+                   g_tok_next_dev, (const float *)g_argmax_pm, (const int32_t *)g_argmax_pi,
+                   DS4_ARGMAX_BLOCKS, (int32_t)exclude_id);
+    return cuda_ok(cudaGetLastError(), "decode argmax launch");
+}
+int ds4_gpu_token_graph_prelaunch(uint32_t pos, int need_logits) {
+    if (g_tok_graph_on <= 0 || g_tok_pending < 0 || g_tok_pending_pos != pos ||
+        g_tok_pending_logits != need_logits || !g_tok_execs[g_tok_pending] ||
+        !g_tok_slots_host || !g_tok_next_dev)
+        return 0;
+    const int slot = g_tok_pending;
+    g_tok_pending = -1;
+    tok_slot_write(slot, 1, 0);   /* 取设备槽 */
+    if (cudaGraphLaunch(g_tok_execs[slot], cudaStreamPerThread) != cudaSuccess) {
+        (void)cudaGetLastError();
+        g_tok_graph_on = 0;
+        return 0;
+    }
+    g_tok_cur = slot;
+    g_tok_prelaunched_pos = (int64_t)pos;
+    return 1;
+}
+/* core 在 eval(pos) 开头认领"pos 已预发射"(只有发起预发射的那个 graph 会来认领: 它自己记着
+ * prelaunched_pos, 别的会话不会误领), 认领即清; token 对账由 core 做。 */
+int ds4_gpu_token_graph_prelaunch_claim(uint32_t pos) {
+    if (g_tok_prelaunched_pos != (int64_t)pos) return 0;
+    g_tok_prelaunched_pos = -1;
+    return 1;
+}
+int ds4_gpu_decode_readback_async(const ds4_gpu_tensor *logits, uint64_t bytes,
+                                  float *pinned_logits, int32_t *pinned_next_tok) {
+    if (!logits || !pinned_logits || bytes > logits->bytes) return 0;
+    tok_graph_ensure_id_slot();
+    if (!g_readback_ev) return 0;
+    if (cudaMemcpyAsync(pinned_logits, logits->ptr, (size_t)bytes, cudaMemcpyDeviceToHost,
+                        cudaStreamPerThread) != cudaSuccess)
+        return cuda_ok(cudaGetLastError(), "logits readback");
+    if (pinned_next_tok) {
+        if (!g_tok_next_dev) return 0;
+        if (cudaMemcpyAsync(pinned_next_tok, g_tok_next_dev, sizeof(int32_t), cudaMemcpyDeviceToHost,
+                            cudaStreamPerThread) != cudaSuccess)
+            return cuda_ok(cudaGetLastError(), "next token readback");
+        /* [1] = 本图实际消费的 token(取槽核写的 g_tok_id_dev), core 对账/诊断用 */
+        if (g_tok_id_dev && cudaMemcpyAsync(pinned_next_tok + 1, g_tok_id_dev, sizeof(int32_t),
+                                            cudaMemcpyDeviceToHost, cudaStreamPerThread) != cudaSuccess)
+            return cuda_ok(cudaGetLastError(), "consumed token readback");
+    }
+    return cuda_ok(cudaEventRecord(g_readback_ev, cudaStreamPerThread), "readback event");
+}
+int ds4_gpu_decode_readback_wait(void) {
+    if (!g_readback_ev) return 0;
+    return cuda_ok(cudaEventSynchronize(g_readback_ev), "readback wait");
+}
+void *ds4_gpu_host_alloc(uint64_t bytes) {
+    void *p = NULL;
+    if (cudaHostAlloc(&p, (size_t)bytes, cudaHostAllocDefault) != cudaSuccess) { (void)cudaGetLastError(); return NULL; }
+    return p;
+}
+void ds4_gpu_host_free(void *p) { if (p) (void)cudaFreeHost(p); }
+
 void ds4_gpu_token_graph_set_pos(uint32_t pos) { g_tok_launch_pos = pos; }
 int ds4_gpu_token_graph_begin(void) {
     if (g_tok_graph_on < 0)
@@ -133,10 +270,18 @@ int ds4_gpu_token_graph_begin(void) {
          *     解码路 token图【关】 PPL = 45.72   ← 回到批量路水平
          * 影响面: decode 是生成的唯一路径, 所有生成质量都被它压着; 本项目此前全部判决
          * 数字都是在这个 bug 上量的。代价: generation 39.18 → 36.05 t/s(−8%), 换 25% PPL。
-         * 按"删除而非默认关闭"处理, 不留开关; 要恢复须先修好参数补丁并逐位对拍。 */
-        g_tok_graph_on = 0;
+         * 按"删除而非默认关闭"处理, 不留开关; 要恢复须先修好参数补丁并逐位对拍。
+         * ★09-05 重开并定罪(用户令"利用好 CUDA 架构")★: 08-22 "PPL 差 25%"的真身是三个
+         * 捕获态 bug, 全部机理级修掉(fable5 09-05 22:20 记录): ①fused2 探针在捕获态不跑 ⇒ 图内
+         * 走老 VQ 核(慢 2.9×, 这就是"开图反而掉"); ②splitk 部分和缓冲捕获态不分配 ⇒ 图内走另一
+         * 条归约序(现 cuda_decode_scratch_prepare 进捕获前预建); ③hash 路由 token id 以 host 标量
+         * 烤进预捕获的图 ⇒ 重放用上一个 token 的 id(现读设备槽 g_tok_id_dev)。验收尺 =
+         * tokgraph_ab_spark.sh 对直发二进制 --dump-logprobs 贪心逐字节比: 短提示 256 token +
+         * 长提示(4300 token, 稀疏 indexer 路)64 token 全同。任何触碰捕获态的改动都要复跑它。 */
+        g_tok_graph_on = 1;
     if (!g_tok_graph_on) return 0;
     tok_graph_ensure_id_slot();
+    cuda_decode_scratch_prepare();   /* capture 内禁分配的 decode scratch 先建好(见 cuda_internal.cuh) */
     if (cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
         (void)cudaGetLastError();
         g_tok_graph_on = 0;
@@ -164,7 +309,7 @@ int ds4_gpu_token_graph_end_launch(void) {
         return -1;
     }
     g_tok_cur = slot_el;
-    if (g_tok_id_host) *g_tok_id_host = g_tok_id_want;   /* 发射前落参数槽(此刻流已静) */
+    tok_slot_write(slot_el, 0, g_tok_id_want);   /* 发射前落本相位参数槽(此刻流已静) */
     if (cudaGraphLaunch(g_tok_execs[slot_el], cudaStreamPerThread) != cudaSuccess) {
         (void)cudaGetLastError();
         g_tok_graph_on = 0;
@@ -186,7 +331,7 @@ int ds4_gpu_token_graph_try_pending(int token, uint32_t pos, int need_logits) {
         return 0;
     const int slot = g_tok_pending;
     g_tok_pending = -1;
-    if (g_tok_id_host) *g_tok_id_host = (int32_t)token;
+    tok_slot_write(slot, 0, (int32_t)token);
     if (cudaGraphLaunch(g_tok_execs[slot], cudaStreamPerThread) != cudaSuccess) {
         (void)cudaGetLastError();
         g_tok_graph_on = 0;
@@ -195,6 +340,10 @@ int ds4_gpu_token_graph_try_pending(int token, uint32_t pos, int need_logits) {
     g_tok_cur = slot;
     return 1;
 }
+
+/* 待发射图作废: exec 槽留着(下次同相位 ExecUpdate 复用), 只清"待发射"标记, 免得一次位置错位后
+ * 又回到同一 pos 时把陈旧参数的图发出去。 */
+int ds4_gpu_token_graph_pending_discard(void) { g_tok_pending = -1; return 1; }
 
 int ds4_gpu_token_graph_precapture_begin(void) {
     if (g_tok_graph_on <= 0 || !g_tok_id_dev || !g_tok_id_host) {
@@ -250,6 +399,18 @@ int ds4_gpu_token_graph_precapture_end(uint32_t pos, int need_logits, int encode
     g_tok_pending = slot;
     g_tok_pending_pos = pos;
     g_tok_pending_logits = need_logits;
+    /* 预上传(09-05): ExecUpdate 改过参数的 exec 在下次 cudaGraphLaunch 时才把节点参数推到设备,
+     * nsys 见 bench 4096 ctx 每 token cudaGraphLaunch 平均 2.9~3.7 ms(短 ctx 0.48), 这段落在
+     * token 边界的关键路径上。cudaGraphUpload 在独立非阻塞流上做同一件事: 只排在本 exec 上一次
+     * 发射(4 token 前, 早完成)之后, 不排在主流当前 token 之后, 于是与 GPU 跑当前 token 重叠。
+     * 失败只是没预热, 发射时照常上传, 不影响正确性。 */
+    static cudaStream_t upload_stream = NULL;
+    if (!upload_stream &&
+        cudaStreamCreateWithFlags(&upload_stream, cudaStreamNonBlocking) != cudaSuccess) {
+        upload_stream = NULL; (void)cudaGetLastError();
+    }
+    if (upload_stream && cudaGraphUpload(g_tok_execs[slot], upload_stream) != cudaSuccess)
+        (void)cudaGetLastError();
     return 1;
 }
 

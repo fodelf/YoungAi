@@ -6,7 +6,7 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
         const float *sinks,
         const float *q,
         const float *raw_kv,
-        const float *comp_kv,
+        const uint8_t *comp_kv,
         uint32_t n_tokens,
         uint32_t pos0,
         uint32_t n_raw,
@@ -96,10 +96,9 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
             const uint32_t sr = row0 + rr;
-            const float4 *src = sr < raw_count
-                ? (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim)
-                : (const float4 *)(comp_kv + (uint64_t)(sr - raw_count) * head_dim);
-            kv_shared[off] = src[c4];
+            kv_shared[off] = sr < raw_count
+                ? ((const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim))[c4]
+                : ld_comp4(COMP_ROW(comp_kv, sr - raw_count), c4);
         }
         __syncthreads();
         if (valid_head) {
@@ -221,6 +220,7 @@ __global__ static void hc_split_sinkhorn_kernel(float *out, const float *mix, co
 }
 
 __global__ static void hc_weighted_sum_kernel(float *out, const float *x, const float *w, uint32_t n_embd, uint32_t n_hc, uint32_t n_tokens, uint32_t weight_stride_f32) {
+    DS4_PDL_WAIT(); DS4_PDL_TRIGGER();
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n = (uint64_t)n_embd * n_tokens;
     if (gid >= n) return;
@@ -247,6 +247,7 @@ __global__ static void hc_expand_kernel(
         uint32_t post_stride,
         uint32_t comb_stride,
         int has_add) {
+    DS4_PDL_WAIT(); DS4_PDL_TRIGGER();
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
     if (gid >= n_elem) return;
@@ -311,6 +312,7 @@ __global__ static void hc_split_wsn_fast_kernel(
         uint32_t sinkhorn_iters,
         float epsv,
         float norm_eps) {
+    DS4_PDL_WAIT(); DS4_PDL_TRIGGER();
     const uint32_t t = blockIdx.x;
     if (t >= n_rows) return;
     const uint32_t mix_hc = 24;
@@ -423,6 +425,7 @@ __global__ static void output_hc_weights_kernel(
         uint32_t n_hc,
         uint32_t n_tokens,
         float epsv) {
+    DS4_PDL_WAIT(); DS4_PDL_TRIGGER();
     uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t n = n_tokens * n_hc;
     if (gid >= n) return;
@@ -448,6 +451,7 @@ __global__ static void compressor_store_kernel(
         uint32_t ratio,
         uint32_t pos0,
         uint32_t n_tokens) {
+    DS4_PDL_WAIT(); DS4_PDL_TRIGGER();
     uint32_t coff = ratio == 4u ? 2u : 1u;
     uint32_t width = coff * head_dim;
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;

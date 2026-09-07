@@ -37,7 +37,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
             const uint64_t xh_count = n_tok * in_dim;
             __half *xh = (__half *)cuda_tmp_alloc(xh_count * sizeof(__half), "q8 f16 gemm activations");
             if (!xh) return 0;
-            f32_to_f16_kernel<<<(xh_count + 255) / 256, 256>>>(xh, (const float *)x->ptr, xh_count);
+            ds4_launch_pdl(f32_to_f16_kernel, (xh_count + 255) / 256, 256, 0, 0, xh, (const float *)x->ptr, xh_count);
             if (!cuda_ok(cudaGetLastError(), "q8 f16 activation convert launch")) return 0;
             const float alpha = 1.0f;
             const float beta = 0.0f;
@@ -80,7 +80,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
     dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1);
-    quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    ds4_launch_pdl(quantize_q8_0_f32_kernel, qgrid, 32, 0, 0, xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 quantize launch")) return 0;
     if (n_tok == 1) {
         /* in_dim 是 32 的倍数(本模型全部 q8 形状)时才走 repack 路(int4 整块读) */
@@ -118,6 +118,18 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                 blocks,
                 use_dp4a);
         return cuda_ok(cudaGetLastError(), "matmul_q8_0 batch warp launch");
+    }
+    /* 小批 blocks>32(09-07: 某层 q8_0 out_b 8192→4096, f16 影子被预算拒 ⇒ 泛化 preq 核 937 µs/轮 = 离墙 3×):
+     * 逐 token 走解码同款 q8r 整行核 —— 与解码同核同序(同轨), 每 token ~100 µs。 */
+    if (n_tok > 1 && n_tok <= 8 && (in_dim & 31u) == 0u) {
+        const cuda_q8r_entry *re = cuda_q8r_get(model_map, weight_offset, out_dim, blocks);
+        if (re) {
+            for (uint64_t tk = 0; tk < n_tok; tk++)
+                matmul_q8r_warp8_kernel<<<((unsigned)out_dim + 15u) / 16u, 256>>>(
+                        (float *)out->ptr + tk * out_dim, re->scales, re->qs,
+                        xq + tk * blocks * 32u, xscale + tk * blocks, out_dim, blocks);
+            return cuda_ok(cudaGetLastError(), "matmul_q8r multi launch");
+        }
     }
     dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
     matmul_q8_0_preq_kernel<<<grid, 256>>>((float *)out->ptr,
