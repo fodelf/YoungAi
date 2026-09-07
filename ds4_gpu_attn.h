@@ -45,6 +45,21 @@ int ds4_gpu_compressor_update_tensor(
         float                   beta_slow,
         float                   rms_eps);
 
+/* 攒批版(2026-09-05): tokens [pos0, pos0+n_tokens) 的投影(kv_cur/sc_cur 各 n_tokens 行)一次入
+ * state; 末位落在 emit 位时接池化链。单 token 版 = n_tokens=1 特例。 */
+int ds4_gpu_compressor_update_batch_tensor(
+        const ds4_gpu_tensor *kv_cur, const ds4_gpu_tensor *sc_cur,
+        ds4_gpu_tensor *state_kv, ds4_gpu_tensor *state_score, ds4_gpu_tensor *comp_cache,
+        const void *model_map, uint64_t model_size, uint64_t ape_offset, uint32_t ape_type,
+        uint64_t norm_offset, uint32_t norm_type, uint32_t head_dim, uint32_t ratio,
+        uint32_t pos0, uint32_t n_tokens, uint32_t comp_row, uint32_t n_rot, uint32_t n_ctx_orig,
+        float freq_base, float freq_scale, float ext_factor, float attn_factor,
+        float beta_fast, float beta_slow, float rms_eps);
+
+/* 把当前 token 的 x 行(n 个 f32, n%4==0)推进层环第 row 行(emit 时取回攒批投影)。 */
+int ds4_gpu_compressor_ring_push_tensor(ds4_gpu_tensor *ring, uint32_t row,
+                                        const ds4_gpu_tensor *x, uint32_t n);
+
 int ds4_gpu_compressor_store_batch_tensor(
         const ds4_gpu_tensor *kv,
         const ds4_gpu_tensor *sc,
@@ -135,7 +150,6 @@ int ds4_gpu_attention_decode_heads_tensor(
         uint32_t                raw_cap,
         uint32_t                raw_start,
         const ds4_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
         uint32_t                n_comp,
         const ds4_gpu_tensor *comp_mask,
         uint32_t                use_mask,
@@ -178,7 +192,6 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
         const ds4_gpu_tensor *comp_mask,
         uint32_t                use_comp_mask,
         uint32_t                n_tokens,
@@ -200,7 +213,6 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
         const ds4_gpu_tensor *topk,
         uint32_t                n_tokens,
         uint32_t                pos0,
@@ -222,7 +234,6 @@ int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
         uint32_t                n_tokens,
         uint32_t                n_comp,
         uint32_t                window,
@@ -238,7 +249,6 @@ int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
         const ds4_gpu_tensor *comp_mask,
         uint32_t                n_tokens,
         uint32_t                n_comp,

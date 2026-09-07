@@ -164,8 +164,11 @@ help:
 	@echo "  make test                Build and run tests"
 	@echo "  make clean               Remove build outputs"
 
+# 2026-09-06: 原来 CUDA_ARCH= 空(nvcc 默认 compute_75 PTX, 运行时 JIT 到 GB10 的 sm_121)。后果: __CUDA_ARCH__ 在设备
+# 编译期是 750, sm_80+ 才有的指令(mma.m16n8k16 / ldmatrix / cp.async)一律编不进去 —— indexer 打分核的 #if >= 800 分支
+# 被整个吃掉, 发出去的是空核(剖面 9.8 µs/发), 静默失效。改 native = 直出 sm_121 SASS。
 cuda-spark:
-	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH= CFLAGS="$(CFLAGS) $(CUDA_SPARK_FLAGS)" NVCCFLAGS="$(NVCCFLAGS) $(CUDA_SPARK_FLAGS) -default-stream per-thread"
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=native CFLAGS="$(CFLAGS) $(CUDA_SPARK_FLAGS)" NVCCFLAGS="$(NVCCFLAGS) $(CUDA_SPARK_FLAGS) -default-stream per-thread -arch=native"
 
 cuda-generic:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=native

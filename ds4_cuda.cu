@@ -3,7 +3,6 @@
  * 保持单 TU nvcc 编译语义(static/__constant__/模板实例化全部不变, 行为零改动)。
  * 分片 ≤500 行; EXCEPTION(单函数体超限, 无安全切割点):
  *   src/cuda/cuda_moe_launch.inc.cu (884 行)
- *   src/cuda/cuda_vq_fused2_3.inc.cu (514 行)
  * 跨分片共享的前奏(类型/表/前向声明)在 src/cuda/cuda_internal.cuh。 */
 
 #include "src/cuda/cuda_internal.cuh"
@@ -20,25 +19,36 @@
 #include "src/cuda/cuda_embed_norm_kernels_2.inc.cu"
 #include "src/cuda/cuda_embed_norm_kernels_3.inc.cu"
 #include "src/cuda/cuda_embed_norm_kernels_4.inc.cu"
+#include "src/cuda/cuda_compressor_kernels.inc.cu"
 #include "src/cuda/cuda_attn_kernels_1.inc.cu"
 #include "src/cuda/cuda_attn_kernels_2.inc.cu"
 #include "src/cuda/cuda_attn_kernels_3.inc.cu"
 #include "src/cuda/cuda_attn_kernels_4.inc.cu"
 #include "src/cuda/cuda_attn_kernels_5.inc.cu"
+#include "src/cuda/cuda_attn_kernels_6.inc.cu"
 #include "src/cuda/cuda_router_kernels.inc.cu"
 #include "src/cuda/cuda_indexer_kernels_1.inc.cu"
 #include "src/cuda/cuda_indexer_kernels_2.inc.cu"
 #include "src/cuda/cuda_indexer_kernels_3.inc.cu"
+#include "src/cuda/cuda_indexer_kernels_4.inc.cu"
+#include "src/cuda/cuda_indexer_kernels_5.inc.cu"
+#include "src/cuda/cuda_indexer_kernels_6.inc.cu"
 #include "src/cuda/cuda_api_embed_indexer_1.inc.cu"
 #include "src/cuda/cuda_api_embed_indexer_2.inc.cu"
 #include "src/cuda/cuda_api_matmul_1.inc.cu"
 #include "src/cuda/cuda_api_matmul_2.inc.cu"
+#include "src/cuda/cuda_api_matmul_3.inc.cu"
+#include "src/cuda/cuda_q4k_gemm.inc.cu"
 #include "src/cuda/cuda_api_compressor.inc.cu"
 #include "src/cuda/cuda_api_attention_1.inc.cu"
 #include "src/cuda/cuda_api_attention_2.inc.cu"
 #include "src/cuda/cuda_api_attention_3.inc.cu"
+#include "src/cuda/cuda_api_attention_4.inc.cu"
+#include "src/cuda/cuda_api_attention_5.inc.cu"
 #include "src/cuda/cuda_api_moe_corr_1.inc.cu"
-#include "src/cuda/cuda_api_moe_corr_2.inc.cu"
+#include "src/cuda/cuda_q4k_dot.inc.cu"     /* Q4_K 块点积/激活访问器/stage 助手(含多 token 预解 nibble 变体) */
+#include "src/cuda/cuda_q4k_multi.inc.cu"   /* Q4_K 小批多 token 核 + 发射 */
+#include "src/cuda/cuda_q4k_tile.inc.cu"
 #include "src/cuda/cuda_qk_warp_1.inc.cu"
 #include "src/cuda/cuda_qk_warp_2.inc.cu"
 #include "src/cuda/cuda_qk_warp_3.inc.cu"
@@ -48,8 +58,11 @@
 #include "src/cuda/cuda_moe_kernels_3.inc.cu"
 #include "src/cuda/cuda_moe_kernels_4.inc.cu"
 #include "src/cuda/cuda_moe_kernels_5.inc.cu"
+#include "src/cuda/cuda_moe_q4k_tile.inc.cu"   /* Q4_K 专家 tile 核(drafter), 用 cuda_q4k_tile 的辅助 */
 #include "src/cuda/cuda_moe_launch.inc.cu"
 #include "src/cuda/cuda_vq.inc.cu"
+#include "src/cuda/cuda_vq_prefill.inc.cu"
+#include "src/cuda/cuda_vq_fused2_0.inc.cu"
 #include "src/cuda/cuda_vq_fused2_1.inc.cu"
 #include "src/cuda/cuda_vq_fused2_2.inc.cu"
 #include "src/cuda/cuda_vq_fused2_3.inc.cu"

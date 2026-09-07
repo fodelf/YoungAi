@@ -105,6 +105,10 @@ int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weigh
     if (!selected || !weights || !probs || !logits || !model_map || n_expert_groups > 1u || n_group_used > 0u) return 0;
     if (n_expert != 256u || n_expert_used != 6u || fabsf(expert_weight_scale - 1.5f) > 1.0e-6f) return 0;
     int32_t tok = (int32_t)token;
+    /* ★09-05 定罪(08-22 "图重放参数未打补丁"的真身)★: hash 层按 token id 选专家, 原来 id 走
+     * kernel 标量实参 —— 预捕获的下一 token 图在建图时 id 未知(占位 0), 重放时 3 个 hash 层
+     * 全按 token 0 路由。token graph 开着时 id 走设备槽(embed 已同款间接), kernel 读槽。 */
+    const int32_t *tok_dev = (hash_mode && g_tok_id_dev) ? g_tok_id_dev : NULL;
     int ok = 1;
     const float *bias = NULL;
     const int32_t *hash = NULL;
@@ -123,16 +127,16 @@ int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weigh
         if (1 &&
             1) {
             dim3 block(32, 4, 1);
-            router_select_warp_topk_kernel<<<1, block>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
-                                                         bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
+            ds4_launch_pdl(router_select_warp_topk_kernel, 1, block, 0, 0, (int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
+                                                         bias, hash, (const float *)logits->ptr, tok_dev, tok, hash_rows, 1,
                                                          has_bias && !hash_mode, hash_mode);
         } else if (1) {
             router_select_parallel_kernel<<<1, 256>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
-                                                      bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
+                                                      bias, hash, (const float *)logits->ptr, tok_dev, tok, hash_rows, 1,
                                                       has_bias && !hash_mode, hash_mode);
         } else {
             router_select_kernel<<<1, 1>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
-                                          bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
+                                          bias, hash, (const float *)logits->ptr, tok_dev, tok, hash_rows, 1,
                                           has_bias && !hash_mode, hash_mode);
         }
         ok = cuda_ok(cudaGetLastError(), "router_select launch");
@@ -166,7 +170,7 @@ int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor 
     if (1 &&
         1) {
         dim3 block(32, 4, 1);
-        router_select_warp_topk_kernel<<<(n_tokens + 3u) / 4u, block>>>((int32_t *)selected->ptr,
+        ds4_launch_pdl(router_select_warp_topk_kernel, (n_tokens + 3u) / 4u, block, 0, 0, (int32_t *)selected->ptr,
                                                                         (float *)weights->ptr,
                                                                         (float *)probs->ptr,
                                                                         bias,

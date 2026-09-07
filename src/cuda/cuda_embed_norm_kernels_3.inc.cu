@@ -114,6 +114,7 @@ __global__ static void grouped_q8_0_a_preq_warp8_kernel(
  * + 1024 线程。w==NULL 即 plain。求和树固定 ⇒ 运行间确定。 */
 __global__ static void rms_norm_fast_kernel(
         float *out, const float *x, const float *w, uint32_t n, uint32_t rows, float eps) {
+    DS4_PDL_WAIT(); DS4_PDL_TRIGGER();
     const uint32_t row = blockIdx.x;
     if (row >= rows) return;
     const float *xr = x + (uint64_t)row * n;
@@ -219,6 +220,7 @@ __global__ static void dsv4_qkv_rms_norm_rows_kernel(
         uint32_t kv_n,
         uint32_t rows,
         float eps) {
+    DS4_PDL_WAIT(); DS4_PDL_TRIGGER();
     const uint32_t row = blockIdx.x;
     const uint32_t which = blockIdx.y;
     if (row >= rows || which > 1u) return;
@@ -282,6 +284,7 @@ __global__ static void head_rms_norm_rope_tail_kernel(
         float beta_fast,
         float beta_slow,
         float eps) {
+    DS4_PDL_WAIT(); DS4_PDL_TRIGGER();
     uint32_t row = blockIdx.x;
     if (row >= n_tok * n_head) return;
     uint32_t t = row / n_head;
@@ -355,6 +358,7 @@ __global__ static void rope_tail_kernel(
         float attn_factor,
         float beta_fast,
         float beta_slow) {
+    DS4_PDL_WAIT(); DS4_PDL_TRIGGER();
     uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t pairs = n_tok * n_head * (n_rot / 2);
     if (gid >= pairs) return;

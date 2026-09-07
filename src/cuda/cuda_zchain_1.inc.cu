@@ -43,28 +43,26 @@ int ds4_gpu_zchain_set(
             n_ops_total, n_v8_blocks, g_zc_ge ? "yes" : "no");
     return 1;
 }
-
 static __global__ void zchain_ge_kernel(
         float *weights, const int *selected, const float *ge,
         uint32_t n_expert, uint32_t total, uint32_t ge_base) {
+    DS4_PDL_WAIT(); DS4_PDL_TRIGGER();
     uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= total) return;
     int e = selected[gid];
     if (e < 0 || (uint32_t)e >= n_expert) return;
     weights[gid] *= ge[ge_base + (uint32_t)e];
 }
-
 int ds4_gpu_zchain_ge_apply(
         ds4_gpu_tensor *weights, const ds4_gpu_tensor *selected,
         uint32_t layer, uint32_t n_expert_used, uint32_t n_tokens) {
     if (!g_zc_ge || layer >= g_zc_n_layer || !g_zc_ge_present[layer]) return 1;
     uint32_t total = n_tokens * n_expert_used;
-    zchain_ge_kernel<<<(total + 255u) / 256u, 256, 0, g_cur_stream>>>(
+    ds4_launch_pdl(zchain_ge_kernel, (total + 255u) / 256u, 256, 0, g_cur_stream, 
         (float *)weights->ptr, (const int *)selected->ptr, g_zc_ge,
         g_zc_n_expert, total, layer * g_zc_n_expert);
     return 1;
 }
-
 #define ZC_NTG 256u
 /* 一 block 每 token。shared: red[256] 树归约 | pv[<=1024] z⊙(V^T x) | ua[d<=2048]
  * U pv 投影缓存(免二遍 U 读; 与 host ds4_zchain_zl_apply 数学等价)。 */
@@ -78,24 +76,22 @@ static __device__ __forceinline__ float zc_red_add(float v, float *red) {
     float r = red[0]; __syncthreads();
     return r;
 }
-
 static __global__ void zchain_scale_kernel(
         float *routed, const float *x, const float *ops, const __half *v8,
         const __half *zlm, uint32_t d, uint32_t n_tokens,
         uint32_t op_start, uint32_t op_count,
         uint32_t zl_k, uint32_t zl_off, uint32_t zl_din, float zl_tr, uint32_t zl_mul) {
+    DS4_PDL_WAIT(); DS4_PDL_TRIGGER();
     extern __shared__ float sh[];               /* red[ZC_NTG] | pv[zl_k] | ua[d] */
     float *red = sh, *pv = sh + ZC_NTG, *ua = pv + zl_k;
     uint32_t tok = blockIdx.x, tid = threadIdx.x;
     if (tok >= n_tokens) return;
     const float *xt = x + (uint64_t)tok * d;
     float *rt = routed + (uint64_t)tok * d;
-
     float acc = 0.0f;
     for (uint32_t j = tid; j < d; j += ZC_NTG) acc += xt[j] * xt[j];
     const float ss = zc_red_add(acc, red);
     const float xnorm = sqrtf(ss);
-
     float lam = 1.0f;
     for (uint32_t oi = 0; oi < op_count; oi++) {
         const float *op = ops + (uint64_t)(op_start + oi) * 16u;
@@ -121,7 +117,6 @@ static __global__ void zchain_scale_kernel(
         } else if (ty == 4u) lam = 1.0f + op[1] * (lam - 1.0f);
     }
     if (op_count) for (uint32_t j = tid; j < d; j += ZC_NTG) rt[j] *= lam;
-
     if (zl_k > 0u) {   /* frozen z^L: routed += clip * U diag(z) V^T x (λ 之后) */
         const uint32_t din = zl_din > 0u ? zl_din : d;
         const __half *hz = zlm + zl_off;
@@ -185,17 +180,16 @@ static __global__ void zchain_scale_kernel(
         }
     }
 }
-
 /* ★z^L decode 快路(2026-08-19): 老 zchain_scale_kernel 每 token 单 block, decode(n=1) 时
  * 全 GPU 只有 1 个 SM 干活且 U 段跨线程步长 k 非合并读 → 实测 ~2.7ms/层, 21.4→6.3 t/s。
  * 快路=三段网格化: pv=diag(z)Vᵀx(64列/块合并读) → ua=U·pv(warp/行合并读+范数原子归约)
- * → 信任域缩放加回。数值=同式(浮点归约序容差); 批量 prefill(n>16, 本身有 token 并行度)
- * 与 λ ops 仍走老 kernel。scratch 在 zl_set 预分配(graph capture 内禁 cudaMalloc)。 */
+ * → 信任域缩放加回。数值=同式(浮点归约序容差)。09-06 起 prefill 也按 256 token 切片走这条路(老
+ * kernel 每 token 一 block 逐列串行读 V/U, 4096 token 一层 10 ms); λ ops 与 AMPD 仍走老 kernel。 */
 static float *g_zc_zl_pv = NULL, *g_zc_zl_ua = NULL, *g_zc_zl_n2 = NULL;
 static float *g_zc_zl_pvp = NULL;      /* pv 两相归约 partial: MAXTOK×SEG×kmax */
 static uint8_t *g_zc_zlm8 = NULL;      /* U/V fp8(e4m3) 影子(2026-08-20 ②刀): 半字节读, 省168MB/tok */
 static uint32_t *g_zc_zl_mul = NULL;   /* per-layer 1=乘性AMP(type7) | 3=动态z(type9 AMPD) */
-#define ZC_ZL_FAST_MAXTOK 16u
+#define ZC_ZL_FAST_MAXTOK 256u   /* 09-06 16→256: prefill 按此切片走快路, scratch 按一片预分配(pvp 33 MB) */
 /* ★pv 占用率手术(2026-08-20)★: 老 zc_zl_pv_kernel 在 decode(n=1) 只开 k/64≈8 个 block,
  * GB10 绝大部分 SM 闲置 → nsys 实测 130µs/层(4MB V 只跑出 31GB/s), 42 层 AMP 链税 5.4ms。
  * 两相归约: A) 按 d 切 SEG 段并行出 partial(k/64×SEG×tok 个 block, 占用率拉满)
@@ -206,6 +200,7 @@ static uint32_t *g_zc_zl_mul = NULL;   /* per-layer 1=乘性AMP(type7) | 3=动�
 static __global__ void zc_zl_pv_kernel(
         const float *x, const __half *zlm, float *pv,
         uint32_t d, uint32_t k, uint32_t off, uint32_t fta, uint32_t mul, float mscale) {
+    DS4_PDL_WAIT(); DS4_PDL_TRIGGER();
     const uint32_t tok = blockIdx.y;
     const uint32_t tc = threadIdx.x & 63u, rg = threadIdx.x >> 6;   /* 64列×4行组 */
     const uint32_t c = blockIdx.x * 64u + tc;
@@ -259,6 +254,7 @@ static __global__ void zc_h2fp8_kernel(uint8_t *dst, const __half *src, uint64_t
 static __global__ void zc_zl_pv_part8_kernel(   /* fp8 版两相 A(V 读 e4m3) */
         const float *x, const uint8_t *zlm8, float *pvp,
         uint32_t d, uint32_t k, uint32_t off) {
+    DS4_PDL_WAIT(); DS4_PDL_TRIGGER();
     const uint32_t tok = blockIdx.z, seg = blockIdx.y;
     const uint32_t tc = threadIdx.x & 63u, rg = threadIdx.x >> 6;
     const uint32_t c = blockIdx.x * 64u + tc;
@@ -307,8 +303,9 @@ static __global__ void zc_zl_ua8_kernel(   /* fp8 版 UA(U 读 e4m3) */
     if (threadIdx.x == 0) {
         float nd = 0.0f, nr = 0.0f;
         for (int w = 0; w < 8; w++) { nd += snd[w]; nr += snr[w]; }
-        atomicAdd(&n2[(uint64_t)tok * 2u], nd);
-        atomicAdd(&n2[(uint64_t)tok * 2u + 1u], nr);
+        /* 09-05: 原 float atomicAdd 求和序随调度变(token graph 开/关分叉根因) → 每 block 部分和, add 核定序归约 */
+        n2[((uint64_t)tok * gridDim.x + blockIdx.x) * 2u]      = nd;
+        n2[((uint64_t)tok * gridDim.x + blockIdx.x) * 2u + 1u] = nr;
     }
 }
 
@@ -317,6 +314,7 @@ static __global__ void zc_zl_pv_part_kernel(   /* 两相 A: partial[seg][c]=Σ_{
      * 现一 block 承包段内全行×全列: 行内 k×2B 连续+行间顺序=纯流。线程持列 {t,t+256,..}。 */
         const float *x, const __half *zlm, float *pvp,
         uint32_t d, uint32_t k, uint32_t off) {
+    DS4_PDL_WAIT(); DS4_PDL_TRIGGER();
     const uint32_t tok = blockIdx.z, seg = blockIdx.y;
     const __half *hV = zlm + off + k + (uint64_t)d * k;
     const float *xt = x + (uint64_t)tok * d;
@@ -349,6 +347,7 @@ static __global__ void zc_zl_pv_part_kernel(   /* 两相 A: partial[seg][c]=Σ_{
 static __global__ void zc_zl_pv_reduce_kernel(   /* 两相 B: 跨段求和 + AMP tanh 定标 ×z */
         const __half *zlm, const float *pvp, float *pv,
         uint32_t k, uint32_t off, uint32_t mul, float mscale) {
+    DS4_PDL_WAIT(); DS4_PDL_TRIGGER();
     const uint32_t tok = blockIdx.y;
     const uint32_t c = blockIdx.x * 256u + threadIdx.x;
     if (c >= k) return;
@@ -362,6 +361,7 @@ static __global__ void zc_zl_pv_reduce_kernel(   /* 两相 B: 跨段求和 + AMP
 static __global__ void zc_zl_ua_kernel(
         const float *routed, const float *pv, const __half *zlm, float *ua, float *n2,
         uint32_t d, uint32_t k, uint32_t off, uint32_t mul) {
+    DS4_PDL_WAIT(); DS4_PDL_TRIGGER();
     const uint32_t tok = blockIdx.y;
     const uint32_t warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
     const uint32_t j = blockIdx.x * 8u + warp;   /* warp/行: ur[c..] 合并读 */
@@ -391,22 +391,41 @@ static __global__ void zc_zl_ua_kernel(
     if (threadIdx.x == 0) {
         float nd = 0.0f, nr = 0.0f;
         for (int w = 0; w < 8; w++) { nd += snd[w]; nr += snr[w]; }
-        atomicAdd(&n2[(uint64_t)tok * 2u], nd);
-        atomicAdd(&n2[(uint64_t)tok * 2u + 1u], nr);
+        /* 09-05: 原 float atomicAdd 求和序随调度变(token graph 开/关分叉根因) → 每 block 部分和, add 核定序归约 */
+        n2[((uint64_t)tok * gridDim.x + blockIdx.x) * 2u]      = nd;
+        n2[((uint64_t)tok * gridDim.x + blockIdx.x) * 2u + 1u] = nr;
     }
 }
 
 static __global__ void zc_zl_add_kernel(
-        float *routed, const float *ua, const float *n2, uint32_t d, float tr, uint32_t mul) {
+        float *routed, const float *ua, const float *n2, uint32_t d, float tr, uint32_t mul, uint32_t nblk) {
+    DS4_PDL_WAIT(); DS4_PDL_TRIGGER();
     const uint32_t tok = blockIdx.y;
     const uint32_t j = blockIdx.x * 256u + threadIdx.x;
-    if (j >= d) return;
     if (mul) {   /* AMP 乘性出口: ⊙(1+ua), 无信任域 */
-        routed[(uint64_t)tok * d + j] *= (1.0f + ua[(uint64_t)tok * d + j]);
+        if (j < d) routed[(uint64_t)tok * d + j] *= (1.0f + ua[(uint64_t)tok * d + j]);
         return;
     }
-    const float nd = sqrtf(n2[(uint64_t)tok * 2u]);
-    const float nr = sqrtf(n2[(uint64_t)tok * 2u + 1u]);
+    /* 范数 = ua 核各 block 部分和定序归约(线程 t 串 b≡t(mod 256), 线程 0 再按 t 序串) ⇒ 与调度无关 */
+    __shared__ float ps[2][256], sn[2];
+    {
+        float sd = 0.0f, sr = 0.0f;
+        for (uint32_t b = threadIdx.x; b < nblk; b += 256u) {
+            sd += n2[((uint64_t)tok * nblk + b) * 2u];
+            sr += n2[((uint64_t)tok * nblk + b) * 2u + 1u];
+        }
+        ps[0][threadIdx.x] = sd; ps[1][threadIdx.x] = sr;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float sd = 0.0f, sr = 0.0f;
+        for (uint32_t t = 0; t < 256u; t++) { sd += ps[0][t]; sr += ps[1][t]; }
+        sn[0] = sd; sn[1] = sr;
+    }
+    __syncthreads();
+    if (j >= d) return;
+    const float nd = sqrtf(sn[0]);
+    const float nr = sqrtf(sn[1]);
     const float cap = tr * nr;
     const float s = (nd > cap && nd > 0.0f) ? cap / nd : 1.0f;
     routed[(uint64_t)tok * d + j] += s * ua[(uint64_t)tok * d + j];
@@ -426,54 +445,53 @@ int ds4_gpu_zchain_scale_routed(
     /* decode 快路的 fp8 影子按 z|U|V 布局打包, type9(AMPD) 是 A|U|V —— 布局不同, 先走通用核
      * (数值同式, 只是 decode 慢一档)。快路的 AMPD 版待做。 */
     const uint32_t zmul_l = g_zc_zl_mul ? g_zc_zl_mul[layer] : 0u;
-    if (zk && zmul_l != 3u && n_tokens <= ZC_ZL_FAST_MAXTOK && g_zc_zl_pv &&
-        g_zc_d_model <= 4096u && zk <= 1024u) {
+    if (zk && zmul_l != 3u && g_zc_zl_pv && g_zc_d_model <= 4096u && zk <= 1024u) {
         if (op_count) {   /* λ ops 仍走老 kernel(zk=0 抑制其 zl 段) */
             size_t shmem0 = (ZC_NTG + g_zc_d_model) * sizeof(float);
-            zchain_scale_kernel<<<n_tokens, ZC_NTG, shmem0, g_cur_stream>>>(
+            ds4_launch_pdl(zchain_scale_kernel, n_tokens, ZC_NTG, shmem0, g_cur_stream, 
                 (float *)routed->ptr, (const float *)x->ptr, g_zc_ops, g_zc_v8, g_zc_zlm,
                 g_zc_d_model, n_tokens, op_start, op_count, 0u, 0u, 0u, 0.0f, 0u);
         }
         const uint32_t d = g_zc_d_model;
         const uint32_t fta = (zd == 3u * d) ? 1u : 0u;
         const uint32_t zmul = zmul_l;
-        if (!zmul)   /* AMP 无信任域不消费 n2 → 免每层 memset */
-            cudaMemsetAsync(g_zc_zl_n2, 0, (size_t)n_tokens * 2u * sizeof(float), g_cur_stream);
+        /* n2 现为每 block 部分和平面(ua 核每 block 直写, 不累加) ⇒ 无需 memset */
         const uint32_t use8 = (g_zc_zlm8 != NULL) ? 1u : 0u;   /* fp8 影子在 = 走半字节路 */
         const uint32_t v4ok = (((zo + zk) & 1u) == 0u && (zk & 1u) == 0u);
-        if (!fta && (d % ZC_ZL_SEG) == 0u && g_zc_zl_pvp && (use8 || v4ok)) {   /* 两相归约 */
-            if (use8) {
-                dim3 ga((zk + 63u) / 64u, ZC_ZL_SEG, n_tokens);
-                zc_zl_pv_part8_kernel<<<ga, 256u, 0, g_cur_stream>>>(
-                    (const float *)x->ptr, g_zc_zlm8, g_zc_zl_pvp, d, zk, zo);
+        /* 09-06: prefill 按片复用同一套核(核内 token 只从 grid 取, 基址平移即切片)。 */
+        for (uint32_t t0 = 0; t0 < n_tokens; t0 += ZC_ZL_FAST_MAXTOK) {
+            const uint32_t nt = (n_tokens - t0 < ZC_ZL_FAST_MAXTOK) ? (n_tokens - t0) : ZC_ZL_FAST_MAXTOK;
+            const float *xs = (const float *)x->ptr + (uint64_t)t0 * d; float *rs = (float *)routed->ptr + (uint64_t)t0 * d;
+            if (!fta && (d % ZC_ZL_SEG) == 0u && g_zc_zl_pvp && (use8 || v4ok)) {   /* 两相归约 */
+                if (use8) {
+                    dim3 ga((zk + 63u) / 64u, ZC_ZL_SEG, nt);
+                    ds4_launch_pdl(zc_zl_pv_part8_kernel, ga, 256u, 0, g_cur_stream, xs, g_zc_zlm8, g_zc_zl_pvp, d, zk, zo);
+                } else {
+                    /* v5: 64列对×4行组; half2 需 V 基址 4B 对齐(off+k 偶, v4ok 已闸) */
+                    dim3 ga((zk / 2u + 63u) / 64u, ZC_ZL_SEG, nt);
+                    ds4_launch_pdl(zc_zl_pv_part_kernel, ga, 256u, 0, g_cur_stream, xs, g_zc_zlm, g_zc_zl_pvp, d, zk, zo);
+                }
+                dim3 gb((zk + 255u) / 256u, nt);
+                ds4_launch_pdl(zc_zl_pv_reduce_kernel, gb, 256u, 0, g_cur_stream, 
+                    g_zc_zlm, g_zc_zl_pvp, g_zc_zl_pv, zk, zo, zmul, ztr);
             } else {
-                /* v5: 64列对×4行组; half2 需 V 基址 4B 对齐(off+k 偶, v4ok 已闸) */
-                dim3 ga((zk / 2u + 63u) / 64u, ZC_ZL_SEG, n_tokens);
-                zc_zl_pv_part_kernel<<<ga, 256u, 0, g_cur_stream>>>(
-                    (const float *)x->ptr, g_zc_zlm, g_zc_zl_pvp, d, zk, zo);
+                dim3 g1((zk + 63u) / 64u, nt);
+                ds4_launch_pdl(zc_zl_pv_kernel, g1, 256u, 0, g_cur_stream, xs, g_zc_zlm, g_zc_zl_pv, d, zk, zo, fta, zmul, ztr);
             }
-            dim3 gb((zk + 255u) / 256u, n_tokens);
-            zc_zl_pv_reduce_kernel<<<gb, 256u, 0, g_cur_stream>>>(
-                g_zc_zlm, g_zc_zl_pvp, g_zc_zl_pv, zk, zo, zmul, ztr);
-        } else {
-            dim3 g1((zk + 63u) / 64u, n_tokens);
-            zc_zl_pv_kernel<<<g1, 256u, 0, g_cur_stream>>>(
-                (const float *)x->ptr, g_zc_zlm, g_zc_zl_pv, d, zk, zo, fta, zmul, ztr);
+            dim3 g2((d + 7u) / 8u, nt);
+            if (use8 && !fta)
+                zc_zl_ua8_kernel<<<g2, 256u, (size_t)zk * sizeof(float), g_cur_stream>>>(
+                    rs, g_zc_zl_pv, g_zc_zlm8, g_zc_zl_ua, g_zc_zl_n2, d, zk, zo, zmul);
+            else
+                ds4_launch_pdl(zc_zl_ua_kernel, g2, 256u, (size_t)zk * sizeof(float), g_cur_stream, 
+                    rs, g_zc_zl_pv, g_zc_zlm, g_zc_zl_ua, g_zc_zl_n2, d, zk, zo, zmul);
+            dim3 g3((d + 255u) / 256u, nt);
+            ds4_launch_pdl(zc_zl_add_kernel, g3, 256u, 0, g_cur_stream, rs, g_zc_zl_ua, g_zc_zl_n2, d, ztr, zmul, g2.x);
         }
-        dim3 g2((d + 7u) / 8u, n_tokens);
-        if (use8 && !fta)
-            zc_zl_ua8_kernel<<<g2, 256u, (size_t)zk * sizeof(float), g_cur_stream>>>(
-                (const float *)routed->ptr, g_zc_zl_pv, g_zc_zlm8, g_zc_zl_ua, g_zc_zl_n2, d, zk, zo, zmul);
-        else
-            zc_zl_ua_kernel<<<g2, 256u, (size_t)zk * sizeof(float), g_cur_stream>>>(
-                (const float *)routed->ptr, g_zc_zl_pv, g_zc_zlm, g_zc_zl_ua, g_zc_zl_n2, d, zk, zo, zmul);
-        dim3 g3((d + 255u) / 256u, n_tokens);
-        zc_zl_add_kernel<<<g3, 256u, 0, g_cur_stream>>>(
-            (float *)routed->ptr, g_zc_zl_ua, g_zc_zl_n2, d, ztr, zmul);
         return 1;
     }
     size_t shmem = (ZC_NTG + zk + g_zc_d_model) * sizeof(float);
-    zchain_scale_kernel<<<n_tokens, ZC_NTG, shmem, g_cur_stream>>>(
+    ds4_launch_pdl(zchain_scale_kernel, n_tokens, ZC_NTG, shmem, g_cur_stream, 
         (float *)routed->ptr, (const float *)x->ptr, g_zc_ops, g_zc_v8, g_zc_zlm,
         g_zc_d_model, n_tokens, op_start, op_count, zk, zo, zd, ztr,
         g_zc_zl_mul ? g_zc_zl_mul[layer] : 0u);

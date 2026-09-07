@@ -63,7 +63,6 @@ typedef struct {
 
 typedef struct ds4_engine ds4_engine;
 typedef struct ds4_session ds4_session;
-
 typedef void (*ds4_session_progress_fn)(void *ud, const char *event, int current, int total);
 
 typedef enum {
@@ -238,6 +237,7 @@ void ds4_session_set_request_penalties(ds4_session *s, float freq, float presenc
  * dist accept gate falls back to plain decode instead of silently going
  * greedy on n-gram hits. */
 void ds4_session_set_spec_greedy(ds4_session *s, int greedy_ok);
+void ds4_session_set_argmax_exclude(ds4_session *s, int excluded_id);   /* 贪心 argmax 排除的 id(-1 无; bench 排 EOS), 与设备 argmax 同排除 */
 int  ds4_session_spec_greedy_ok(const ds4_session *s);
 /* Built-in reference-corpus (language-idiom) drafter lookup: longest suffix of
  * tail[0..len) (>= min_g tokens) occurring in the engine's idiom corpus; copies
@@ -367,6 +367,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen);
+void ds4_spec_stats_print(void);   /* --spec 投机账(轮数/接受/逐位接受率/draft·verify·恢复 ms), 生成结束时打 stderr */
 void ds4_session_invalidate(ds4_session *s);
 void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);
@@ -376,7 +377,6 @@ int ds4_engine_routed_quant_bits(ds4_engine *e);
 /* 磁盘 KV 兼容键(routed 类型码; 0=不可存)。bits 口径塌格式=跨模型互认, 兼容判定一律用这个。 */
 int ds4_engine_routed_kv_key(ds4_engine *e);
 const ds4_tokens *ds4_session_tokens(ds4_session *s);
-
 /* Low-level graph slice entry points used by distributed inference.  The
  * transport/session routing logic lives in ds4_distributed.c. */
 int ds4_session_layer_slice_reset(ds4_session *s, char *err, size_t errlen);
@@ -446,6 +446,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen);
 int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *err, size_t errlen);
 int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, char *err, size_t errlen);
+int ds4_session_fill_synthetic(ds4_session *s, const ds4_tokens *tokens, char *err, size_t errlen);   /* 合成上下文测速仪器(行数就位内容零), 见 core_session_fill.c */
 void ds4_session_snapshot_free(ds4_session_snapshot *snap);
 
 uint64_t ds4_session_layer_payload_bytes(ds4_session *s,
@@ -465,7 +466,6 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
  * against the headroom rather than a fixed cap. */
 uint64_t ds4_runtime_phys_footprint_bytes(void);
 uint64_t ds4_runtime_mem_budget_bytes(void);
-
 
 /* ---- 取料入口(2026-08-22: 从 env 迁到 CLI) --------------------------------
  * 捕获/评估的入口过去是 DS4_CAP_DIR / DS4_EVAL_IDS / DS4_EVAL_HDUMP /

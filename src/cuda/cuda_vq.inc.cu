@@ -3,133 +3,13 @@
  */
 /* ================= v2.2 VQ blob 专家前向 (DQVL) =================
  * 背景: 合一 VQ GGUF 把 routed 专家字节全塞进 blk.L.ffn_exps_vq.blob, base
- * gate/up 张量不在文件里(offset=0/bytes=0)。Metal 侧(ds4_metal.m:20630-21830)
- * 早有完整实现, CUDA 侧此前一行都没有 —— routed_moe_launch 开头的类型闸
- * (gate_type!=16||down_type!=10) 直接 return 0, 表现为 "cuda prefill failed"。
- *
- * 这里按 Metal 的同一语义落地, 不发明新算法:
- *   ① CPU 多线程把活跃专家 dequant 成 f16 scratch。scratch 用 cudaMallocManaged:
- *      GB10 是 Grace+Blackwell 统一内存, CPU 写 GPU 读与 Metal 的
- *      MTLResourceStorageModeShared 同构, 无需显式 H2D 拷贝。
- *   ② selected 里是原始 expert id, 但 gather 后权重按 active 紧凑排布 ⇒ 必须
- *      remap 成 slot(Metal 侧在别处已 remap, CUDA 侧这里自己做)。
- *   ③ GPU kernel 走 f16 mm_id: gate/up 融合 SwiGLU → down 加权累加。
- *   ④ DS4_VQ_GPU=0 回 CPU 参考路(与 Metal 同名开关同语义), 供数值对齐。
- * dequant 复用 vq_fmt.h 的 ds4vq_dequant_f16 —— 三端同一份解码。 */
+ * gate/up 张量不在文件里(offset=0/bytes=0)。两条生产路:
+ *   decode(n_tokens ≤ fuse_max): fused2 核直接从压缩态 blob 解码即乘(cuda_vq_fused2_*);
+ *   prefill(大批): 逐专家 dequant 成 f16 + cuBLAS GEMM(cuda_vq_prefill.inc.cu)。
+ * 09-06 删掉的老 prefill 路(CPU 多线程 gather / 托管 scratch / 逐层专家缓存 / 全层活跃专家
+ * dequant 落 12.9 GB scratch / 逐 (token,pick) warp 核)记在 fable5。本片只留公共件: GPU 载荷
+ * dequant 核(位流解析与 vq_fmt.h 的 ds4vq_dequant_f16 逐字同义)、冷 w2 展开、载荷头解析。 */
 
-static void *g_vq_gate_sc = NULL, *g_vq_up_sc = NULL, *g_vq_down_sc = NULL;
-static uint64_t g_vq_gu_bytes = 0, g_vq_dn_bytes = 0;
-static int32_t *g_vq_sel_dev = NULL;   /* remap 后的 slot 索引(设备端) */
-static uint64_t g_vq_sel_bytes = 0;
-
-/* ---- decode 专家 dequant 缓存 ----
- * 同一个专家的 dequant 结果与 token 无关(权重不变), 而 decode 每层只用 n_expert 个
- * 专家、相邻 token 的路由高度重叠 —— 每次 forward 全量重算是纯浪费, 且 dequant 占
- * 了 92.8% 的 GPU 时间。这里给每层留 K 个常驻槽, 命中就直接复用槽里的 f16 权重。
- * 只对 decode(n_tokens==1) 启用: prefill 的 n_active 远大于 K, 会把槽冲干净, 那时
- * 走直通并把缓存置空(scratch 被覆盖, 槽内容不再有效)。 */
-/* ★缓存必须是 per-layer 的存储, 不能只有 per-layer 的标记★
- * 第一版把 43 层共用一份 scratch, L1 立刻覆盖 L0 刚写的槽, 下个 token 回到 L0 时
- * 标记说"命中"、槽里装的却是 L42 的权重 ⇒ 输出退化成复读。所以缓存槽的显存按层独立
- * 分配(K×48MB×43 ≈ 16.5GB), prefill 的直通路另走一份共享临时 buffer。 */
-#define DS4_VQ_CACHE_SLOTS 8u
-#define DS4_VQ_CACHE_LAYERS 64u
-static struct {
-    int32_t  expert[DS4_VQ_CACHE_SLOTS];   /* 槽内当前专家 id, -1=空 */
-    uint64_t used[DS4_VQ_CACHE_SLOTS];     /* LRU 时钟 */
-    void    *gate, *up, *down;             /* 本层专属显存(K 槽), NULL=未分配 */
-} g_vq_cache[DS4_VQ_CACHE_LAYERS];
-static uint64_t g_vq_clock = 0;
-static int g_vq_cache_ready = 0;
-static uint64_t g_vq_hit = 0, g_vq_miss = 0;
-
-static void cuda_vq_cache_reset_all(void) {
-    for (uint32_t l = 0; l < DS4_VQ_CACHE_LAYERS; l++) {
-        for (uint32_t s = 0; s < DS4_VQ_CACHE_SLOTS; s++) {
-            g_vq_cache[l].expert[s] = -1;
-            g_vq_cache[l].used[s] = 0;
-        }
-        g_vq_cache[l].gate = g_vq_cache[l].up = g_vq_cache[l].down = NULL;
-    }
-    g_vq_cache_ready = 1;
-}
-
-/* 本层缓存显存(K 槽)按需分配; 分配不到就退回直通(不缓存), 不让它变成硬失败。 */
-static int cuda_vq_cache_ensure_mem(uint32_t layer, uint64_t ge, uint64_t de) {
-    if (g_vq_cache[layer].gate) return 1;
-    void *g = NULL, *u = NULL, *d = NULL;
-    const uint64_t gu = (uint64_t)DS4_VQ_CACHE_SLOTS * ge, dn = (uint64_t)DS4_VQ_CACHE_SLOTS * de;
-    if (cudaMalloc(&g, gu) != cudaSuccess || cudaMalloc(&u, gu) != cudaSuccess ||
-        cudaMalloc(&d, dn) != cudaSuccess) {
-        (void)cudaGetLastError();
-        if (g) (void)cudaFree(g);
-        if (u) (void)cudaFree(u);
-        if (d) (void)cudaFree(d);
-        return 0;
-    }
-    g_vq_cache[layer].gate = g; g_vq_cache[layer].up = u; g_vq_cache[layer].down = d;
-    return 1;
-}
-
-typedef struct {
-    const void *model_map; const uint8_t *blob; const uint32_t *active_ids;
-    uint16_t *gbase, *ubase, *dbase;
-    uint64_t down_offset, down_expert_bytes;
-    uint32_t in, mid, out_dim, lo, hi;
-    volatile int *err;
-} cuda_vq_gather_task;
-
-/* 逐专家 dequant, 各线程写不相交 scratch 段 ⇒ 无锁。与 Metal 的
- * ds4_vq_gather_worker 逐行同义(含冷 w2 从 base go1b 34B/256el 展开 ±d)。 */
-static void *cuda_vq_gather_worker(void *arg) {
-    cuda_vq_gather_task *t = (cuda_vq_gather_task *)arg;
-    for (uint32_t i = t->lo; i < t->hi && !*t->err; i++) {
-        const uint32_t e = t->active_ids[i];
-        uint16_t *dg = t->gbase + (uint64_t)i * t->mid * t->in;
-        uint16_t *du = t->ubase + (uint64_t)i * t->mid * t->in;
-        uint16_t *dd = t->dbase + (uint64_t)i * t->out_dim * t->mid;
-        uint64_t o1 = ds4vq_slot(t->blob, (int)e, 0);
-        uint64_t o3 = ds4vq_slot(t->blob, (int)e, 1);
-        uint64_t o2 = ds4vq_slot(t->blob, (int)e, 2);
-        int rc1 = (!o1) ? -9 : ds4vq_dequant_f16(t->blob + o1, dg, (int)t->mid, (int)t->in);
-        int rc3 = (rc1 == 0 && o3) ? ds4vq_dequant_f16(t->blob + o3, du, (int)t->mid, (int)t->in) : (!o3 ? -9 : 0);
-        if (rc1 != 0 || rc3 != 0) {
-            fprintf(stderr, "ds4: [cuda-vq-gather-err] e=%u o1=%llu o3=%llu rc1=%d rc3=%d mid=%u in=%u\n",
-                    e, (unsigned long long)o1, (unsigned long long)o3, rc1, rc3, t->mid, t->in);
-            *t->err = 1; return NULL;
-        }
-        if (o2) {
-            int rc2 = ds4vq_dequant_f16(t->blob + o2, dd, (int)t->out_dim, (int)t->mid);
-            if (rc2 != 0) {
-                fprintf(stderr, "ds4: [cuda-vq-gather-err] e=%u o2=%llu rc2=%d out=%u mid=%u\n",
-                        e, (unsigned long long)o2, rc2, t->out_dim, t->mid);
-                *t->err = 1; return NULL;
-            }
-        } else {
-            /* 冷 w2: blob 的 which=2 槽缺席 ⇒ 从 base go1b 字节展开。base down 是
-             * 影子张量(bytes=0)时硬失败, 不读 offset 0 的垃圾当权重。 */
-            if (t->down_expert_bytes == 0 || t->down_offset == 0) {
-                fprintf(stderr, "ds4: [cuda-vq-gather-err] e=%u 冷 w2 槽缺失且 base down 不在文件里"
-                                "(影子张量) -- aborting (no silent quality downgrade)\n", e);
-                *t->err = 1; return NULL;
-            }
-            const uint8_t *sd = (const uint8_t *)t->model_map + t->down_offset + (uint64_t)e * t->down_expert_bytes;
-            const uint64_t nblk_row = t->mid / 256u;
-            for (uint32_t r = 0; r < t->out_dim; r++) {
-                const uint8_t *rb = sd + (uint64_t)r * nblk_row * 34u;
-                uint16_t *orow = dd + (uint64_t)r * t->mid;
-                for (uint64_t b = 0; b < nblk_row; b++) {
-                    uint16_t dsc; memcpy(&dsc, rb + b * 34u, 2);
-                    const uint8_t *sg = rb + b * 34u + 2;
-                    uint16_t *o = orow + b * 256u;
-                    for (int k = 0; k < 256; k++)
-                        o[k] = (sg[k >> 3] >> (k & 7)) & 1 ? dsc : (uint16_t)(dsc ^ 0x8000u);
-                }
-            }
-        }
-    }
-    return NULL;
-}
 
 /* GPU 版 VQ 载荷解码。CPU 侧逐元素查表是 decode 0.6 t/s 的主因(每 token 约 6.5G
  * 元素), 而这活是纯并行查表: 值 = 码本[idx][d] * g_r[row]。blob 已随模型 mmap 被
@@ -155,6 +35,33 @@ __global__ static void vq_dequant_kernel(
     const float g = __half2float(gh);
     const size_t i0 = (size_t)r * nidx_row;
     __half *orow = out + (size_t)r * cols;
+    /* dim=4 快路(09-06, prefill 一块 4096 token 要发 3 万次本核, 占 28%): 码本条目 8 B 按两个
+     * 32 位读, 4 个 half 结果打包成一次 8 B 存 —— 原来每索引 4 次 2 B 散存, 相邻线程相距 8 B,
+     * 一条 warp 存指令只盖 256 B 里的 64 B。数值逐位同(同为 rn 舍入)。码本基址不 4 对齐时走
+     * 通用路(blob 槽 4 B 对齐是 fused2 探针也依赖的前提)。 */
+    if (dim == 4u && (((uintptr_t)cb) & 3u) == 0u) {
+        for (uint32_t i = threadIdx.x; i < nidx_row; i += blockDim.x) {
+            const size_t gi = i0 + i;
+            uint32_t v;
+            if (nbit == 8) {
+                v = ix[gi];
+            } else {
+                const size_t bit = gi * nbit;
+                const size_t by = bit >> 3;
+                uint32_t w; memcpy(&w, ix + by, 4);
+                v = (w >> (bit & 7)) & imsk;
+            }
+            const uint32_t *c4 = (const uint32_t *)(cb + (size_t)v * 8u);
+            const uint32_t w0 = c4[0], w1 = c4[1];
+            __half2 h0, h1; memcpy(&h0, &w0, 4); memcpy(&h1, &w1, 4);
+            const float2 f0 = __half22float2(h0), f1 = __half22float2(h1);
+            const __half2 r0 = __floats2half2_rn(f0.x * g, f0.y * g);
+            const __half2 r1 = __floats2half2_rn(f1.x * g, f1.y * g);
+            uint2 packed; memcpy(&packed.x, &r0, 4); memcpy(&packed.y, &r1, 4);
+            *(uint2 *)(orow + (size_t)i * 4u) = packed;
+        }
+        return;
+    }
     for (uint32_t i = threadIdx.x; i < nidx_row; i += blockDim.x) {
         const size_t gi = i0 + i;
         uint32_t v;
@@ -301,42 +208,9 @@ static int cuda_vq_pay_hdr(const uint8_t *pay, int exp_rows, int exp_cols,
     return 0;
 }
 
-/* scratch 用纯设备内存(cudaMalloc)而不是托管内存。托管内存会在 CPU/GPU 间按需页迁移,
- * 而 prefill 一层就要写 4GB scratch —— 迁移开销吃掉了绝大部分时间。dequant 现在全在
- * GPU 上做, CPU 侧只有两条调试路(DS4_VQ_CPU_GATHER / DS4_VQ_GPU=0)需要碰它, 那两条
- * 各自走显式 cudaMemcpy, 不该让生产路径为它们背上托管内存的代价。 */
-static int cuda_vq_ensure_scratch(uint64_t need_gu, uint64_t need_dn) {
-    if (need_gu > g_vq_gu_bytes) {
-        if (g_vq_gate_sc) (void)cudaFree(g_vq_gate_sc);
-        if (g_vq_up_sc) (void)cudaFree(g_vq_up_sc);
-        g_vq_gate_sc = g_vq_up_sc = NULL;
-        if (cudaMalloc(&g_vq_gate_sc, need_gu) != cudaSuccess ||
-            cudaMalloc(&g_vq_up_sc, need_gu) != cudaSuccess) {
-            (void)cudaGetLastError();
-            g_vq_gu_bytes = 0;
-            return 0;
-        }
-        g_vq_gu_bytes = need_gu;
-    }
-    if (need_dn > g_vq_dn_bytes) {
-        if (g_vq_down_sc) (void)cudaFree(g_vq_down_sc);
-        g_vq_down_sc = NULL;
-        if (cudaMalloc(&g_vq_down_sc, need_dn) != cudaSuccess) {
-            (void)cudaGetLastError();
-            g_vq_dn_bytes = 0;
-            return 0;
-        }
-        g_vq_dn_bytes = need_dn;
-    }
-    return 1;
-}
 
-/* f16 mm_id MoE, 两阶段。
- * 第一版是"每 (token,pick) 一个 block、每线程串行读整行", decode 时只有 6 个 block ⇒
- * SM 几乎全空转, 且线程内跨行跳读完全不合并访存, 实测只有带宽上限的 ~2%。
- * 现在: ① 每 warp 负责一行, warp 内 32 lane 沿 IN 连续取(合并访存)后 shfl 规约;
- *       ② 把 MID/OUT 维切成 grid.z, decode 也能铺满 SM。
- * clamp 语义与 Metal CPU 参考路逐字一致: gate 只截上界, up 双向截。 */
+/* fused 解码核的公共常量。clamp 语义与 Metal CPU 参考路逐字一致: gate 只截上界, up 双向截
+ * (prefill GEMM 路的 vqp_swiglu_kernel 同式)。 */
 #define DS4_VQ_WARPS_PER_BLOCK 8u
 /* 码本 shared 容量(半精度个数): 当前配方 nc=512×dim=4=2048, 留一倍余量 */
 #define DS4_VQ_CB_CAP_HALFS 4096u

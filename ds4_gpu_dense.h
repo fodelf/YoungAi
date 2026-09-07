@@ -146,6 +146,20 @@ int ds4_gpu_matmul_f16_pair_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+/* n_tok 行 x 一次过双矩阵(压缩器攒批投影, 2026-09-05): 每行数值与 n_tok=1 的 pair 核逐字相同
+ * (同累加序), 权重每读一遍算 8 行。in_dim 必须是 8 的倍数。 */
+int ds4_gpu_matmul_f16_pair_rows_tensor(
+        ds4_gpu_tensor       *out_a,
+        ds4_gpu_tensor       *out_b,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_a_offset,
+        uint64_t                weight_b_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok);
+
 int ds4_gpu_matmul_f32_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -230,6 +244,12 @@ int ds4_gpu_kv_rope_fp8_store_raw_tensor(
     ds4_gpu_tensor *kv, ds4_gpu_tensor *raw_cache,
     uint32_t raw_cap, uint32_t raw_row, uint32_t head_dim, uint32_t n_rot,
     uint32_t pos, uint32_t n_ctx_orig, float freq_base, float freq_scale,
+    float ext_factor, float attn_factor, float beta_fast, float beta_slow);
+/* 小批版(投机 verify ≤8 token): kv 连续 n_tok 行, 位置 pos0.., 环行 (pos0+t)%raw_cap; 逐 token 数值与单发同 */
+int ds4_gpu_kv_rope_fp8_store_raw_batch_tensor(
+    ds4_gpu_tensor *kv, ds4_gpu_tensor *raw_cache,
+    uint32_t raw_cap, uint32_t pos0, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot,
+    uint32_t n_ctx_orig, float freq_base, float freq_scale,
     float ext_factor, float attn_factor, float beta_fast, float beta_slow);
 int ds4_gpu_head_rms_norm_rope_tail_tensor(
     ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim,

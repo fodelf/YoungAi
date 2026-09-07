@@ -15,7 +15,6 @@ src/metal/metal_init.m
 src/metal/metal_routed_moe_batch.m
 metal/flash_attn_ext.metal
 src/cuda/cuda_moe_launch.inc.cu
-src/cuda/cuda_vq_fused2_3.inc.cu
 
 # 冻结转录(上一代放大器解算器, 文件头自述"复现旧战役用, 禁改进")
 gguf-tools/legacy/amp_solve_zc.c

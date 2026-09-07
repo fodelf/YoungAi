@@ -14,6 +14,7 @@ __global__ static void router_select_warp_topk_kernel(
         uint32_t n_tokens,
         int has_bias,
         int hash_mode) {
+    DS4_PDL_WAIT(); DS4_PDL_TRIGGER();
     const uint32_t lane = threadIdx.x;
     const uint32_t row_in_block = threadIdx.y;
     const uint32_t t = blockIdx.x * blockDim.y + row_in_block;
@@ -113,6 +114,7 @@ __global__ static void router_select_warp_topk_kernel(
 }
 
 __global__ static void swiglu_kernel(float *out, const float *gate, const float *up, uint32_t n, float clamp, float weight) {
+    DS4_PDL_WAIT(); DS4_PDL_TRIGGER();
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     float g = gate[i];

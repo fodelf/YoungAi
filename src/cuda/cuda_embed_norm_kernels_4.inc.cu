@@ -2,6 +2,7 @@
  * embed/corr/repeat/norm/matmul(f16/f32) kernel 族 + kv fp8 rope store。
  */
 __global__ static void fp8_kv_quantize_kernel(float *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot) {
+    DS4_PDL_WAIT(); DS4_PDL_TRIGGER();
     uint32_t row = blockIdx.x;
     uint32_t tid = threadIdx.x;
     uint32_t n_nope = head_dim - n_rot;
@@ -28,10 +29,16 @@ __global__ static void fp8_kv_quantize_kernel(float *x, uint32_t n_tok, uint32_t
 /* kv 尾链三合一(2026-08-20 megakernel G1b): rope(rot尾段) → fp8(nope前段, 64线程树
  * 逐位照抄, barrier 全 block 陪跑) → store(全行 f16 往返)。decode n=1 单行单 block。 */
 __global__ static void kv_rope_fp8_store_kernel(
-        float *kv, float *raw, uint32_t raw_cap, uint32_t raw_row,
-        uint32_t head_dim, uint32_t n_rot, uint32_t pos,
+        float *kv, float *raw, uint32_t raw_cap, uint32_t raw_row0,
+        uint32_t head_dim, uint32_t n_rot, uint32_t pos0,
         uint32_t n_ctx_orig, float freq_base, float freq_scale,
         float ext_factor, float attn_factor, float beta_fast, float beta_slow) {
+    DS4_PDL_WAIT(); DS4_PDL_TRIGGER();
+    /* 小批(投机 verify, 09-07): grid.x = token, 每 block 一行, 逐 token 数学与单 block 单行完全相同 */
+    const uint32_t t = blockIdx.x;
+    kv += (uint64_t)t * head_dim;
+    const uint32_t raw_row = (raw_row0 + t) % raw_cap;
+    const uint32_t pos = pos0 + t;
     const uint32_t tid = threadIdx.x;
     const uint32_t n_nope = head_dim - n_rot;
     /* 段B: rope(先于 fp8, 与原三发同序; 只动 [n_nope, head_dim)) */
@@ -95,10 +102,25 @@ int ds4_gpu_kv_rope_fp8_store_raw_tensor(
     if (!kv || !raw_cache || raw_cap == 0 || n_rot > head_dim || (n_rot & 1u) ||
         raw_cache->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
         kv->bytes < (uint64_t)head_dim * sizeof(float)) return 0;
-    kv_rope_fp8_store_kernel<<<1, 256>>>(
+    ds4_launch_pdl(kv_rope_fp8_store_kernel, 1, 256, 0, 0,
         (float *)kv->ptr, (float *)raw_cache->ptr, raw_cap, raw_row,
         head_dim, n_rot, pos, n_ctx_orig, freq_base, freq_scale,
         ext_factor, attn_factor, beta_fast, beta_slow);
     return cuda_ok(cudaGetLastError(), "kv_rope_fp8_store launch");
+}
+/* 小批版: kv 连续 n_tok 行, 位置 pos0.., 环行 (pos0+t) % raw_cap; 一发 n_tok 个 block(逐 token 与单发同数值) */
+int ds4_gpu_kv_rope_fp8_store_raw_batch_tensor(
+        ds4_gpu_tensor *kv, ds4_gpu_tensor *raw_cache,
+        uint32_t raw_cap, uint32_t pos0, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot,
+        uint32_t n_ctx_orig, float freq_base, float freq_scale,
+        float ext_factor, float attn_factor, float beta_fast, float beta_slow) {
+    if (!kv || !raw_cache || raw_cap == 0 || n_tok == 0 || n_rot > head_dim || (n_rot & 1u) ||
+        raw_cache->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
+        kv->bytes < (uint64_t)n_tok * head_dim * sizeof(float)) return 0;
+    ds4_launch_pdl(kv_rope_fp8_store_kernel, n_tok, 256, 0, 0,
+        (float *)kv->ptr, (float *)raw_cache->ptr, raw_cap, pos0 % raw_cap,
+        head_dim, n_rot, pos0, n_ctx_orig, freq_base, freq_scale,
+        ext_factor, attn_factor, beta_fast, beta_slow);
+    return cuda_ok(cudaGetLastError(), "kv_rope_fp8_store batch launch");
 }
 

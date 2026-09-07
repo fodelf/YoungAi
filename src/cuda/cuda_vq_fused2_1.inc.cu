@@ -9,112 +9,32 @@
  * 结构: 一 block 一 (token,expert), 4 warps×R 行/warp; x/h 与码本进 shared;
  * 位流按 lane 36B(9bit)/32B(8bit) 对齐段合并读进寄存器, funnelshift 纯 ALU 抽位。
  * 乘加顺序与旧 kernel 不同(重排容差), 对拍口径=vq diag cos/score-ids。 */
-#define DS4_VQ2_ROWS_PER_WARP 8u
+/* 常量/辅助函数(vq2_resolve/load/issue/park/take/dot/store)在 cuda_vq_fused2_0.inc.cu(先于本片包含)。 */
 
-typedef struct { uint64_t gr_off1, ix_off1, gr_off3, ix_off3; } ds4_vq2_hdr;
-
-/* thread0 per block: vtab→payload→gr/ix 偏移(全 block 共用, 一次) */
-__device__ __forceinline__ static void vq2_resolve(
-        const uint8_t *blob, int e, int which, uint32_t nc,
-        uint32_t rows, uint64_t *gr_off, uint64_t *ix_off) {
-    const uint64_t *vtab = (const uint64_t *)(blob + 16);
-    const uint64_t off = vtab[(size_t)e * 3 + which];
-    *gr_off = off + 16 + (uint64_t)nc * 4 * 2;
-    *ix_off = *gr_off + (uint64_t)rows * 2;
-}
-
-/* 一行 9bit 点积: lane 段=36B(9 u32), 32 idx funnelshift 抽位, 码本 shared gather */
-__device__ __forceinline__ static float vq2_row_dot9(
-        const uint8_t *ix, uint32_t row, const float *xs, const __half *cb,
-        uint32_t lane, uint32_t cols) {
-    const uint32_t nidx_row = cols >> 2;                   /* d16=4 */
-    /* lane 段覆盖 32 idx×4 元素=128 列; cols<4096(如 down 的 MID=2048)时高 lane
-     * 在行内无段 —— 越 shared/位流界, 必须先退出(warp_sum 汇 0)。 */
-    if ((lane << 7u) >= cols) return 0.0f;
-    const uint8_t *seg = ix + (size_t)row * ((nidx_row * 9u) >> 3) + (size_t)lane * 36u;
-    /* payload 无对齐保证(vq_pack 紧凑): 对齐基址读 40B 窗口, 错位字节并入位偏移 */
-    const uint32_t misal = (uint32_t)((uintptr_t)seg & 3u);
-    const uint32_t *wp = (const uint32_t *)(seg - misal);
-    uint32_t bw[10];
-    #pragma unroll
-    for (uint32_t k = 0; k < 10u; k++) bw[k] = wp[k];
-    float acc = 0.0f;
-    #pragma unroll
-    for (uint32_t k = 0; k < 32u; k++) {
-        const uint32_t bit = k * 9u + misal * 8u, wi = bit >> 5u, sh = bit & 31u;
-        const uint32_t v = __funnelshift_r(bw[wi], bw[wi + 1u < 10u ? wi + 1u : 9u], sh) & 511u;
-        const uint32_t col4 = (lane * 32u + k) << 2u;
-        const float4 xv = *(const float4 *)&xs[col4];
-        const uint32_t cq0 = ((const uint32_t *)cb)[v * 2u];
-        const uint32_t cq1 = ((const uint32_t *)cb)[v * 2u + 1u];
-        const float2 f01 = __half22float2(*(const half2 *)&cq0);
-        const float2 f23 = __half22float2(*(const half2 *)&cq1);
-        acc += f01.x * xv.x + f01.y * xv.y + f23.x * xv.z + f23.y * xv.w;
-    }
-    return acc;
-}
-
-/* 一行 8bit 点积(w2): lane 段=32B, idx 直取字节 */
-__device__ __forceinline__ static float vq2_row_dot8(
-        const uint8_t *ix, uint32_t row, const float *xs, const __half *cb,
-        uint32_t lane, uint32_t cols) {
-    const uint32_t nidx_row = cols >> 2u;
-    const uint8_t *seg = ix + (size_t)row * nidx_row + (size_t)lane * (nidx_row >> 5u);
-    const uint32_t per_lane = nidx_row >> 5u;              /* 2048/4/32 = 16 idx */
-    const uint32_t misal = (uint32_t)((uintptr_t)seg & 3u);
-    const uint32_t *wp = (const uint32_t *)(seg - misal);
-    uint32_t bw[5];
-    #pragma unroll
-    for (uint32_t k = 0; k < 5u; k++) bw[k] = wp[k];
-    float acc = 0.0f;
-    #pragma unroll
-    for (uint32_t k = 0; k < 16u; k++) {
-        const uint32_t bj = misal + k;
-        const uint32_t v = (bw[bj >> 2u] >> ((bj & 3u) * 8u)) & 255u;
-        const uint32_t col4 = (lane * per_lane + k) << 2u;
-        const float4 xv = *(const float4 *)&xs[col4];
-        const uint32_t cq0 = ((const uint32_t *)cb)[v * 2u];
-        const uint32_t cq1 = ((const uint32_t *)cb)[v * 2u + 1u];
-        const float2 f01 = __half22float2(*(const half2 *)&cq0);
-        const float2 f23 = __half22float2(*(const half2 *)&cq1);
-        acc += f01.x * xv.x + f01.y * xv.y + f23.x * xv.z + f23.y * xv.w;
-    }
-    return acc;
-}
-
-__device__ __forceinline__ static float vq2_warp_sum(float v) {
-    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffffu, v, off);
-    return v;
-}
-
-/* gateup: grid=(ntok, MID/(4*R), nexp), block=128。shared: x[IN] f32 + cb1/cb3 各 4KB */
-__global__ static void vq_moe_gateup_fused2_kernel(
-        float *mid_out, const uint8_t *blob, const int32_t *sel, const float *rw,
-        const float *x, uint32_t n_expert, uint32_t IN, uint32_t MID, float clamp) {
-    const uint32_t t = blockIdx.x, pk = blockIdx.z;
-    const uint64_t pair = (uint64_t)t * n_expert + pk;
-    const int32_t e = sel[pair];
-    if (e < 0 || rw[pair] == 0.0f) return;
-    extern __shared__ float sh2[];
-    float *xs = sh2;                                        /* IN floats */
-    __half *cb1 = (__half *)(xs + IN);                      /* 512*4 halfs */
-    __half *cb3 = cb1 + 2048;
+/* gateup: grid=(ntok, MID/(4*R), nexp), block=128。shared: x[IN] f32 + cb1/cb3 各 4KB
+ * 寄存器账(nsys Reg/Trd 实测): 外层行循环全展开时 nvcc 把 4 趟×4 窗口的读全部上提, 226
+ * 寄存器/线程 ⇒ 一个 SM 只驻 2 block(8 warp), 访存延迟盖不住(179 GB/s); 用 __launch_bounds__
+ * 硬压到 128 反而溢出 local memory(158→174 µs)。所以外层 `#pragma unroll 1`: 每趟只活 4 个
+ * 窗口(40 寄存器), 让 4~5 block/SM 常驻靠 warp 数盖延迟。 */
+/* 核体抽成 device 函数(09-07): (t, e, pair) 由调用核算好传入。并集去重核(曾用它, 两版实测无肉)已删, 抽出的形态留着 —— 任何
+ * 想换 block→(token,专家) 映射的变体都能逐位同义地复用。 */
+__device__ __forceinline__ static void vq2_gateup_body(
+        float *mid_out, const uint8_t *blob, const float *rw, const float *x,
+        uint32_t t, int32_t e, uint64_t pair, uint32_t IN, uint32_t MID, float clamp) {
+    extern __shared__ float4 sh2v[];
+    float4 *xs4 = sh2v;                                     /* IN/4 float4, 转置布局 */
+    uint2 *cb1 = (uint2 *)(xs4 + (IN >> 2u));               /* 512 词 × 8 B */
+    uint2 *cb3 = cb1 + 512u;
     __shared__ ds4_vq2_hdr hdr;
     if (threadIdx.x == 0) {
         vq2_resolve(blob, e, 0, 512u, MID, &hdr.gr_off1, &hdr.ix_off1);
         vq2_resolve(blob, e, 1, 512u, MID, &hdr.gr_off3, &hdr.ix_off3);
     }
-    const float *xt = x + (uint64_t)t * IN;
-    for (uint32_t i = threadIdx.x; i < IN; i += blockDim.x) xs[i] = xt[i];
+    vq2_load_vec_perm<32u>(xs4, x + (uint64_t)t * IN, IN);
     {   /* 码本: payload+16 起 512*4 halfs (payload 无对齐保证, u8 组装) */
         const uint64_t *vtab = (const uint64_t *)(blob + 16);
-        const uint8_t *c1 = blob + vtab[(size_t)e * 3] + 16;
-        const uint8_t *c3 = blob + vtab[(size_t)e * 3 + 1] + 16;
-        for (uint32_t i = threadIdx.x; i < 2048u; i += blockDim.x) {
-            uint16_t h1 = (uint16_t)c1[i * 2u] | ((uint16_t)c1[i * 2u + 1u] << 8);
-            uint16_t h3 = (uint16_t)c3[i * 2u] | ((uint16_t)c3[i * 2u + 1u] << 8);
-            cb1[i] = *(const __half *)&h1; cb3[i] = *(const __half *)&h3;
-        }
+        vq2_load_cb(cb1, blob + vtab[(size_t)e * 3] + 16, 512u);
+        vq2_load_cb(cb3, blob + vtab[(size_t)e * 3 + 1] + 16, 512u);
     }
     __syncthreads();
     const uint32_t warp = threadIdx.x >> 5u, lane = threadIdx.x & 31u;
@@ -122,84 +42,115 @@ __global__ static void vq_moe_gateup_fused2_kernel(
     const __half *gr1 = (const __half *)(blob + hdr.gr_off1);
     const __half *gr3 = (const __half *)(blob + hdr.gr_off3);
     const float w = rw[pair];
-    #pragma unroll
-    for (uint32_t r = 0; r < DS4_VQ2_ROWS_PER_WARP; r++) {
-        const uint32_t m = (blockIdx.y * 4u + warp) * DS4_VQ2_ROWS_PER_WARP + r;
-        if (m >= MID) return;
-        float g = vq2_row_dot9(ix1, m, xs, cb1, lane, IN);
-        float u = vq2_row_dot9(ix3, m, xs, cb3, lane, IN);
-        g = vq2_warp_sum(g);
-        u = vq2_warp_sum(u);
+    /* 两行一趟: 4 条位流窗口(g0/u0/g1/u1)先全发读再算, 外层不展开(消融定谳见 fused2_0 头注)。 */
+    #pragma unroll 1
+    for (uint32_t r = 0; r < DS4_VQ2_ROWS_PER_WARP; r += 2u) {
+        const uint32_t m0 = (blockIdx.y * 4u + warp) * DS4_VQ2_ROWS_PER_WARP + r;
+        if (m0 >= MID) return;
+        const uint32_t m1 = (m0 + 1u < MID) ? m0 + 1u : m0;   /* 越界时重算 m0, 不写 */
+        uint32_t bg0[10], bu0[10], bg1[10], bu1[10];
+        vq2_load9<32u, 10u>(ix1, m0, lane, IN, bg0);
+        vq2_load9<32u, 10u>(ix3, m0, lane, IN, bu0);
+        vq2_load9<32u, 10u>(ix1, m1, lane, IN, bg1);
+        vq2_load9<32u, 10u>(ix3, m1, lane, IN, bu1);
+        float g0 = vq2_dot<32u, 10u, 9u>(bg0, xs4, cb1, lane);
+        float u0 = vq2_dot<32u, 10u, 9u>(bu0, xs4, cb3, lane);
+        float g1 = vq2_dot<32u, 10u, 9u>(bg1, xs4, cb1, lane);
+        float u1 = vq2_dot<32u, 10u, 9u>(bu1, xs4, cb3, lane);
+        g0 = vq2_warp_sum(g0); u0 = vq2_warp_sum(u0);
+        g1 = vq2_warp_sum(g1); u1 = vq2_warp_sum(u1);
         if (lane == 0) {
-            uint16_t g1h = (uint16_t)((const uint8_t *)gr1)[m * 2u] | ((uint16_t)((const uint8_t *)gr1)[m * 2u + 1u] << 8);
-            uint16_t g3h = (uint16_t)((const uint8_t *)gr3)[m * 2u] | ((uint16_t)((const uint8_t *)gr3)[m * 2u + 1u] << 8);
-            g *= __half2float(*(const __half *)&g1h);
-            u *= __half2float(*(const __half *)&g3h);
-            if (clamp > 0.0f) {
-                if (g > clamp) g = clamp;
-                if (u > clamp) u = clamp;
-                if (u < -clamp) u = -clamp;
-            }
-            mid_out[pair * MID + m] = (g / (1.0f + __expf(-g))) * u * w;
+            vq2_store_mid(mid_out, pair, MID, m0, g0, u0, gr1, gr3, clamp, w);
+            if (m0 + 1u < MID) vq2_store_mid(mid_out, pair, MID, m1, g1, u1, gr1, gr3, clamp, w);
         }
     }
 }
-
-/* down: grid=(ntok, OUT/(4*R), nexp)。shared: h[MID] f32 + cb2 2KB。
- * 旧 fused 的 rw 乘在 down 段; fused2 把 rw 折进 gateup 的 mid(silu*u*w), down 直接累加。 */
-template <uint32_t NCB>
-__global__ static void vq_moe_down_fused2_kernel(
-        float *partial, const uint8_t *blob, const int32_t *sel, const float *rw,
-        const float *h, uint32_t n_expert, uint32_t MID, uint32_t OUT) {
-    /* per-pick 并行(原设计), 但各 pick 直写独立 partial 平面代替 atomicAdd —— 汇总由
-     * vq2_down_reduce_kernel 以固定 pk 序完成 ⇒ 温 0 逐 bit 可复现。
-     * NCB = w2 码本词数(256=8bit 索引, 512=9bit)。 */
+__global__ static void vq_moe_gateup_fused2_kernel(
+        float *mid_out, const uint8_t *blob, const int32_t *sel, const float *rw,
+        const float *x, uint32_t n_expert, uint32_t IN, uint32_t MID, float clamp) {
+    DS4_PDL_WAIT(); DS4_PDL_TRIGGER();
     const uint32_t t = blockIdx.x, pk = blockIdx.z;
     const uint64_t pair = (uint64_t)t * n_expert + pk;
     const int32_t e = sel[pair];
-    if (e < 0 || rw[pair] == 0.0f) return;   /* 未写平面由 reduce 按 sel/rw 跳过 */
-    extern __shared__ float sh2[];
-    float *hs = sh2;                                        /* MID floats */
-    __half *cb2 = (__half *)(hs + MID);                     /* NCB*4 halfs */
+    if (e < 0 || rw[pair] == 0.0f) return;
+    vq2_gateup_body(mid_out, blob, rw, x, t, e, pair, IN, MID, clamp);
+}
+
+/* down: grid=(ntok, OUT/(4*R), nexp)。shared: h[MID] f32 + cb2 2KB。
+ * 旧 fused 的 rw 乘在 down 段; fused2 把 rw 折进 gateup 的 mid(silu*u*w), down 直接累加。
+ * per-pick 并行(原设计), 但各 pick 直写独立 partial 平面代替 atomicAdd —— 汇总由
+ * vq2_down_reduce_kernel 以固定 pk 序完成 ⇒ 温 0 逐 bit 可复现。NCB = w2 码本词数(256=8bit 索引, 512=9bit)。 */
+template <uint32_t NCB>
+__device__ __forceinline__ static void vq2_down_body(
+        float *partial, const uint8_t *blob, const float *h, int32_t e, uint64_t pair, uint32_t MID, uint32_t OUT) {
+    extern __shared__ float4 sh2v[];
+    float4 *hs4 = sh2v;                                     /* MID/4 float4, 转置布局 */
+    uint2 *cb2 = (uint2 *)(hs4 + (MID >> 2u));              /* NCB 词 × 8 B */
     __shared__ uint64_t ix_off2, gr_off2;
     if (threadIdx.x == 0) {
         uint64_t g2, i2;
         vq2_resolve(blob, e, 2, NCB, OUT, &g2, &i2);
         gr_off2 = g2; ix_off2 = i2;
     }
-    const float *ht = h + pair * MID;
-    for (uint32_t i = threadIdx.x; i < MID; i += blockDim.x) hs[i] = ht[i];
+    vq2_load_vec_perm<16u>(hs4, h + pair * MID, MID);       /* MID=2048 ⇒ 16 idx/lane */
     {
         const uint64_t *vtab = (const uint64_t *)(blob + 16);
-        const uint8_t *c2 = blob + vtab[(size_t)e * 3 + 2] + 16;
-        for (uint32_t i = threadIdx.x; i < NCB * 4u; i += blockDim.x) {
-            uint16_t h2 = (uint16_t)c2[i * 2u] | ((uint16_t)c2[i * 2u + 1u] << 8);
-            cb2[i] = *(const __half *)&h2;
-        }
+        vq2_load_cb(cb2, blob + vtab[(size_t)e * 3 + 2] + 16, NCB);
     }
     __syncthreads();
     const uint32_t warp = threadIdx.x >> 5u, lane = threadIdx.x & 31u;
     const uint8_t *ix2 = blob + ix_off2;
     const __half *gr2 = (const __half *)(blob + gr_off2);
-    #pragma unroll
-    for (uint32_t r = 0; r < DS4_VQ2_ROWS_PER_WARP; r++) {
-        const uint32_t o = (blockIdx.y * 4u + warp) * DS4_VQ2_ROWS_PER_WARP + r;
-        if (o >= OUT) return;
-        float acc = (NCB == 512u) ? vq2_row_dot9(ix2, o, hs, cb2, lane, MID)
-                                  : vq2_row_dot8(ix2, o, hs, cb2, lane, MID);
-        acc = vq2_warp_sum(acc);
-        if (lane == 0) {
-            uint16_t g2h = (uint16_t)((const uint8_t *)gr2)[o * 2u] | ((uint16_t)((const uint8_t *)gr2)[o * 2u + 1u] << 8);
-            /* w 已由 gateup_fused2 乘进 h, 此处不乘 */
-            partial[pair * OUT + o] = acc * __half2float(*(const __half *)&g2h);
+    /* 四行一组: 窗口先全发读再算; 越界行重算 o0 不写。外层不展开。 */
+    #pragma unroll 1
+    for (uint32_t r = 0; r < DS4_VQ2_ROWS_PER_WARP; r += 4u) {
+        const uint32_t o0 = (blockIdx.y * 4u + warp) * DS4_VQ2_ROWS_PER_WARP + r;
+        if (o0 >= OUT) return;
+        float acc[4];
+        if (NCB == 512u) {
+            uint32_t bw[4][6];
+            #pragma unroll
+            for (uint32_t q = 0; q < 4u; q++)
+                vq2_load9<16u, 6u>(ix2, (o0 + q < OUT) ? o0 + q : o0, lane, MID, bw[q]);
+            #pragma unroll
+            for (uint32_t q = 0; q < 4u; q++) acc[q] = vq2_dot<16u, 6u, 9u>(bw[q], hs4, cb2, lane);
+        } else {
+            uint32_t bw[4][5];
+            #pragma unroll
+            for (uint32_t q = 0; q < 4u; q++)
+                vq2_load8<16u, 5u>(ix2, (o0 + q < OUT) ? o0 + q : o0, lane, MID, bw[q]);
+            #pragma unroll
+            for (uint32_t q = 0; q < 4u; q++) acc[q] = vq2_dot<16u, 5u, 8u>(bw[q], hs4, cb2, lane);
+        }
+        #pragma unroll
+        for (uint32_t q = 0; q < 4u; q++) {
+            const float s = vq2_warp_sum(acc[q]);
+            const uint32_t o = o0 + q;
+            if (lane == 0 && o < OUT) {
+                uint16_t g2h = (uint16_t)((const uint8_t *)gr2)[o * 2u] | ((uint16_t)((const uint8_t *)gr2)[o * 2u + 1u] << 8);
+                /* w 已由 gateup_fused2 乘进 h, 此处不乘 */
+                partial[pair * OUT + o] = s * __half2float(*(const __half *)&g2h);
+            }
         }
     }
+}
+template <uint32_t NCB>
+__global__ static void vq_moe_down_fused2_kernel(
+        float *partial, const uint8_t *blob, const int32_t *sel, const float *rw,
+        const float *h, uint32_t n_expert, uint32_t MID, uint32_t OUT) {
+    DS4_PDL_WAIT(); DS4_PDL_TRIGGER();
+    const uint32_t t = blockIdx.x, pk = blockIdx.z;
+    const uint64_t pair = (uint64_t)t * n_expert + pk;
+    const int32_t e = sel[pair];
+    if (e < 0 || rw[pair] == 0.0f) return;   /* 未写平面由 reduce 按 sel/rw 跳过 */
+    vq2_down_body<NCB>(partial, blob, h, e, pair, MID, OUT);
 }
 
 /* 固定 pk 序汇总 partial 平面 → out (确定性加序) */
 __global__ static void vq2_down_reduce_kernel(
         float *out, const float *partial, const int32_t *sel, const float *rw,
         uint32_t n_expert, uint32_t OUT) {
+    DS4_PDL_WAIT(); DS4_PDL_TRIGGER();
     const uint32_t t = blockIdx.y;
     const uint32_t o = blockIdx.x * blockDim.x + threadIdx.x;
     if (o >= OUT) return;

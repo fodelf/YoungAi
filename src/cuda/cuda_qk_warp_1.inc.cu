@@ -286,6 +286,7 @@ __device__ static float quarter_warp_sum_f32(float v, uint32_t lane8) {
 }
 
 __global__ static void q8_K_quantize_kernel(cuda_block_q8_K *out, const float *x, uint32_t in_dim, uint32_t n_rows) {
+    DS4_PDL_WAIT(); DS4_PDL_TRIGGER();
     uint32_t b = blockIdx.x;
     uint32_t row = blockIdx.y;
     if (row >= n_rows || b >= in_dim / CUDA_QK_K) return;
@@ -357,27 +358,6 @@ __device__ __forceinline__ static float dev_dot_q4_K_q8_K_block_vec(
     return dev_dot_q4_K_q8_K_block(x, y);
 }
 
-/* 16-lane 变体: blocks<=16 的小矩阵(attn q/kv/shared, L2 驻留)一 lane 一块零空转;
- * 大矩阵(logits 等)仍走 32-lane 版(A/B: 32-lane 对 DRAM 大矩阵最优)。 */
-__global__ static DS4_CUDA_UNUSED void matmul_q4_K_warp16_kernel(
-        float *out, const char *w_base, const cuda_block_q8_K *xq,
-        uint64_t row_bytes, uint32_t blocks, uint32_t out_dim) {
-    const uint32_t lane = threadIdx.x & 15u;
-    const uint32_t row = blockIdx.x * 16u + (threadIdx.x >> 4u);
-    const uint32_t tok = blockIdx.y;
-    if (row >= out_dim) return;
-    const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(w_base + (uint64_t)row * row_bytes);
-    const cuda_block_q8_K *xt = xq + (uint64_t)tok * blocks;
-    float acc = 0.0f;
-    for (uint32_t b = lane; b < blocks; b += 16u)
-        acc += dev_dot_q4_K_q8_K_block_vec(wr + b, xt + b);
-    acc += __shfl_down_sync(0xffffffffu, acc, 8);
-    acc += __shfl_down_sync(0xffffffffu, acc, 4);
-    acc += __shfl_down_sync(0xffffffffu, acc, 2);
-    acc += __shfl_down_sync(0xffffffffu, acc, 1);
-    if (lane == 0) out[(uint64_t)tok * out_dim + row] = acc;
-}
-
 /* q4_K 同输入矩阵对(2026-08-17 第八夜): q_a+kv / shared gate+up 各共读同一激活行,
  * 原两次发射=2 kernel+2 quantize 节点+双份小 grid 调度气泡。合并: 行号跨两矩阵
  * 连续编址, 前段 w0 后段 w1, staging/dot 与单矩阵版同构。 */
@@ -385,6 +365,7 @@ __global__ static void matmul_q4_K_pair_warp_kernel(
         float *out0, float *out1, const char *w0, const char *w1,
         const cuda_block_q8_K *xq,
         uint64_t row_bytes, uint32_t blocks, uint32_t out0_dim, uint32_t out1_dim) {
+    DS4_PDL_WAIT(); DS4_PDL_TRIGGER();
     const uint32_t warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
     const uint32_t total = out0_dim + out1_dim;
     for (uint32_t rg = blockIdx.x * 8u + warp; rg < total; rg += gridDim.x * 8u) {
@@ -400,13 +381,9 @@ __global__ static void matmul_q4_K_pair_warp_kernel(
             for (uint32_t i = lane; i < n16; i += 32u) my[i] = __ldcs(src16 + i);
             __syncwarp();
             const cuda_block_q4_K *wr = (const cuda_block_q4_K *)my;
-            if (blocks <= 16u) {
-                const uint32_t bi = lane >> 1u, hj = (lane & 1u) * 4u;
-                if (bi < blocks) acc += dev_dot_q4_K_q8_K_block_half(wr + bi, xq + bi, hj);
-            } else {
-                for (uint32_t b = lane; b < blocks; b += 32u)
-                    acc += dev_dot_q4_K_q8_K_block(wr + b, xq + b);
-            }
+            /* blocks≤16 的对已走 tile 核(cuda_q4k_tile), 这里只剩 17..32 块的整块/lane 路 */
+            for (uint32_t b = lane; b < blocks; b += 32u)
+                acc += dev_dot_q4_K_q8_K_block(wr + b, xq + b);
             __syncwarp();
         } else {
             const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(wb + (uint64_t)row * row_bytes);

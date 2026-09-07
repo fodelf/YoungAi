@@ -32,7 +32,7 @@ int ds4_gpu_attention_output_q2k_batch_tensor(
         if (cudaMalloc(&g_q4k_xq_sc, xq_need) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
         g_q4k_xq_bytes = xq_need;
     }
-    q8_K_quantize_kernel<<<dim3(blocks, (unsigned)xrows, 1), 256, 0, g_cur_stream>>>(
+    ds4_launch_pdl(q8_K_quantize_kernel, dim3(blocks, (unsigned)xrows, 1), 256, 0, g_cur_stream, 
         (cuda_block_q8_K *)g_q4k_xq_sc, (const float *)heads->ptr, (uint32_t)group_dim, (uint32_t)xrows);
     if (((const char *)0) /* DS4_F16_DIMS: 路径开关已删(2026-08-22 隐形炸弹清理) */) {   /* 诊断: grouped 形状一次性打印 */
         static int gseen = 0;
@@ -264,7 +264,7 @@ int ds4_gpu_matmul_q2_K_pair_batch_tensor(
         if (cudaMalloc(&g_q4k_xq_sc, xq_need) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
         g_q4k_xq_bytes = xq_need;
     }
-    q8_K_quantize_kernel<<<dim3(blocks, (unsigned)n_tok, 1), 256, 0, g_cur_stream>>>(
+    ds4_launch_pdl(q8_K_quantize_kernel, dim3(blocks, (unsigned)n_tok, 1), 256, 0, g_cur_stream, 
         (cuda_block_q8_K *)g_q4k_xq_sc, (const float *)x->ptr, (uint32_t)in_dim, (uint32_t)n_tok);
     static uint32_t plv = 99u, pmb = 999u;
     if (plv == 99u) { const char *e = ((const char *)0) /* DS4_Q2K_STAGE: 路径开关已删(2026-08-22 隐形炸弹清理) */; plv = e ? (uint32_t)atoi(e) : 2u; }

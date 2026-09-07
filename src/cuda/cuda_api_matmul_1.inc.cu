@@ -55,7 +55,7 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
     dim3 qgrid((unsigned)blocks, 1, 1);
-    quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    ds4_launch_pdl(quantize_q8_0_f32_kernel, qgrid, 32, 0, 0, xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 pair quantize launch")) return 0;
     const uint64_t max_out = out0_dim > out1_dim ? out0_dim : out1_dim;
     if ((in_dim & 31u) == 0u) {
@@ -129,7 +129,7 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
-    quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    ds4_launch_pdl(quantize_q8_0_f32_kernel, (unsigned)blocks, 32, 0, 0, xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand quantize launch")) return 0;
     if ((in_dim & 31u) == 0u) {
         const cuda_q8r_entry *re = cuda_q8r_get(model_map, weight_offset, out_dim, blocks);
@@ -197,101 +197,17 @@ int ds4_gpu_matmul_q4_K_hc_expand_tensor(
     }
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "q4k_hc_expand");
     if (!wptr) return 0;
+    /* 09-07: 整行 stage 整块/lane 核(cuda_q4k_tile.inc.cu), 激活仍是 q8_0 32 值块(精度不变)。 */
     const uint64_t xq_bytes = blocks * 32u;
     const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
-    const uint64_t tmp_bytes = scale_offset + blocks * sizeof(float);
-    void *tmp = cuda_tmp_alloc(tmp_bytes, "q4k hc expand prequant");
+    void *tmp = cuda_tmp_alloc(scale_offset + blocks * sizeof(float), "q4k hc expand prequant");
     if (!tmp) return 0;
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
-    const int use_dp4a = cuda_q8_use_dp4a();
-    quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    ds4_launch_pdl(quantize_q8_0_f32_kernel, (unsigned)blocks, 32, 0, 0, xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q4k_hc_expand quantize launch")) return 0;
-    if (use_dp4a && kblocks <= 32u) {
-        matmul_q4_K_hc_expand_preq_warp8_dp4a_kernel<<<((unsigned)out_dim + 7u) / 8u, 256, (size_t)8u * (size_t)((kblocks > 16u) ? 16u : kblocks) * 9u * sizeof(uint4)>>>(
-                (float *)out_hc->ptr,
-                (float *)block_out->ptr,
-                (const float *)block_out->ptr,   /* has_add=0, 占位 */
-                (const float *)residual_hc->ptr,
-                (const float *)split->ptr,
-                reinterpret_cast<const unsigned char *>(wptr),
-                xq,
-                xscale,
-                in_dim,
-                out_dim,
-                n_embd,
-                n_hc,
-                kblocks,
-                0);
-    } else {
-        matmul_q4_K_hc_expand_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256, (kblocks <= 32u) ? (size_t)8u * (size_t)((kblocks > 16u) ? 16u : kblocks) * 9u * sizeof(uint4) : 0>>>(
-                (float *)out_hc->ptr,
-                (float *)block_out->ptr,
-                (const float *)block_out->ptr,   /* has_add=0, 占位 */
-                (const float *)residual_hc->ptr,
-                (const float *)split->ptr,
-                reinterpret_cast<const unsigned char *>(wptr),
-                xq,
-                xscale,
-                in_dim,
-                out_dim,
-                n_embd,
-                n_hc,
-                kblocks,
-                0,
-                use_dp4a);
-    }
-    if (((const char *)0) /* DS4_AO_PROBE: 诊断开关已删(2026-08-22) */) {
-        static int onceb = 0;
-        if (onceb++ < 96) {
-            (void)cudaDeviceSynchronize();
-            float bo0 = 0; float *xh = (float *)malloc(in_dim * sizeof(float));
-            (void)cudaMemcpy(&bo0, block_out->ptr, 4, cudaMemcpyDeviceToHost);
-            (void)cudaMemcpy(xh, x->ptr, in_dim * sizeof(float), cudaMemcpyDeviceToHost);
-            const uint8_t *w0 = (const uint8_t *)model_map + weight_offset;
-            double ref = 0.0;
-            for (uint64_t b = 0; b < kblocks; b++) {
-                const uint8_t *blk = w0 + b * 144u;
-                uint16_t hd, hm; memcpy(&hd, blk + 0, 2); memcpy(&hm, blk + 2, 2);
-                const float d = dev_host_f16(hd), dmin = dev_host_f16(hm);
-                const uint8_t *scales = blk + 4; const uint8_t *qs = blk + 16;
-                for (uint32_t j = 0; j < 8u; j++) {
-                    uint8_t sc, m;
-                    if (j < 4u) { sc = scales[j] & 63u; m = scales[j + 4u] & 63u; }
-                    else { sc = (scales[j + 4u] & 0x0fu) | ((scales[j - 4u] >> 6u) << 4u);
-                           m = (scales[j + 4u] >> 4u) | ((scales[j] >> 6u) << 4u); }
-                    const uint32_t byte_off = (j >> 1u) * 32u;
-                    const int shift = (int)(j & 1u) * 4;
-                    for (uint32_t i = 0; i < 32u; i++) {
-                        const int q4 = (qs[byte_off + i] >> shift) & 0xF;
-                        ref += (double)(d * sc * q4 - dmin * m) * xh[b * 256u + j * 32u + i];
-                    }
-                }
-            }
-            /* out_hc[0][0] 校验: block_v*post[0] + Σ comb[0+src*n_hc]*res[src][0] */
-            float oh0 = 0; (void)cudaMemcpy(&oh0, out_hc->ptr, 4, cudaMemcpyDeviceToHost);
-            float spl[80]; float res0[4];
-            (void)cudaMemcpy(spl, split->ptr, sizeof(float) * (2u * n_hc + n_hc * n_hc), cudaMemcpyDeviceToHost);
-            for (uint32_t s = 0; s < n_hc && s < 4u; s++)
-                (void)cudaMemcpy(&res0[s], (const char *)residual_hc->ptr + (uint64_t)s * n_embd * 4, 4, cudaMemcpyDeviceToHost);
-            double ohref = ref * spl[n_hc];
-            for (uint32_t s = 0; s < n_hc; s++) ohref += spl[2u * n_hc + 0u + s * n_hc] * res0[s];
-            int hcnan = 0; float hcmax = 0;
-            {   const uint64_t hn = (uint64_t)n_hc * n_embd;
-                float *hf = (float *)malloc(hn * 4);
-                if (hf && cudaMemcpy(hf, out_hc->ptr, hn * 4, cudaMemcpyDeviceToHost) == cudaSuccess)
-                    for (uint64_t i2 = 0; i2 < hn; i2++) {
-                        if (hf[i2] != hf[i2]) hcnan++;
-                        else if (fabsf(hf[i2]) > hcmax) hcmax = fabsf(hf[i2]);
-                    }
-                free(hf);
-            }
-            fprintf(stderr, "ds4: [ao-b#%02d] bo0 g=%.3f h=%.3f | hc g=%.3f h=%.3f | hc_nan=%d hc_max=%.1f\n",
-                    onceb - 1, bo0, ref, oh0, ohref, hcnan, hcmax);
-            fflush(stderr); free(xh);
-        }
-    }
-    return cuda_ok(cudaGetLastError(), "matmul_q4k_hc_expand launch");
+    return q4k_hc_expand_launch((float *)out_hc->ptr, (float *)block_out->ptr, (const float *)residual_hc->ptr,
+                                (const float *)split->ptr, wptr, xq, xscale, (uint32_t)kblocks, (uint32_t)out_dim, n_embd, n_hc);
 }
 
 int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
@@ -324,7 +240,7 @@ int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64
         const uint64_t xh_count = n_tok * in_dim;
         __half *xh = (__half *)cuda_tmp_alloc(xh_count * sizeof(__half), "f16 gemm activations");
         if (!xh) return 0;
-        f32_to_f16_kernel<<<(xh_count + 255) / 256, 256>>>(xh, (const float *)x->ptr, xh_count);
+        ds4_launch_pdl(f32_to_f16_kernel, (xh_count + 255) / 256, 256, 0, 0, xh, (const float *)x->ptr, xh_count);
         if (!cuda_ok(cudaGetLastError(), "f16 activation convert launch")) return 0;
         const float alpha = 1.0f;
         const float beta = 0.0f;
@@ -365,18 +281,16 @@ int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64
     if (!g_f16sk_partial) {
         cudaStreamCaptureStatus fcs = cudaStreamCaptureStatusNone;
         (void)cudaStreamIsCapturing(0, &fcs);
-        if (fcs == cudaStreamCaptureStatusNone) {
-            /* [n_tok<=8][S*out<=4096] */
-            if (cudaMalloc(&g_f16sk_partial, 8u * 4096u * sizeof(float)) != cudaSuccess) {
-                g_f16sk_partial = NULL; (void)cudaGetLastError();
-            }
-        }
+        if (fcs == cudaStreamCaptureStatusNone) cuda_decode_scratch_prepare();
     }
     if (n_tok <= 8 && !serial_f16 && !serial_router &&
         (n_tok == 1 || 1) &&
         out_dim <= 512u && in_dim >= 4096u && g_f16sk_partial) {
         /* out≤64: 多段 split-K + 固定序 reduce; 64<out≤512: S=1 单段=一行一块直写
          * (原 8 行/块只发 out/8 个块, out=256 时 32 块=1/6 GPU)。 */
+        /* 09-06 K4 消融(负, 已回退): out≤64 的窄输出(hc_fn 16384→24)把段数 8→64 想靠更多块补
+         * 占用, 实测每发 8.3→10.0 µs、reduce 1.3→1.9 µs(+0.28 ms/token): 这类 0.8 MB 权重
+         * 本来就在 L2 里, 多段只是多了部分和写读。别再往段数上加。 */
         uint32_t S = (uint32_t)((192u + out_dim - 1u) / out_dim);
         if (S > 64u) S = 64u;
         if ((uint64_t)S * out_dim > 4096u) S = (uint32_t)(4096u / out_dim);
@@ -385,11 +299,11 @@ int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64
         float *pdst = (S == 1) ? (float *)out->ptr : g_f16sk_partial;
         unsigned skcells = (unsigned)out_dim * S * (unsigned)n_tok;
         if (skcells > 1024u) skcells = 1024u;
-        matmul_f16_splitk_kernel<<<skcells, 256, 0, g_cur_stream>>>(pdst, w, (const float *)x->ptr,
+        ds4_launch_pdl(matmul_f16_splitk_kernel, skcells, 256, 0, g_cur_stream, pdst, w, (const float *)x->ptr,
                                                   in_dim, out_dim, chunk, S, (uint32_t)n_tok);
         if (S > 1) {
             const unsigned rn = (unsigned)(out_dim * n_tok);
-            matmul_f16_splitk_reduce_kernel<<<(rn + 255u) / 256u, 256, 0, g_cur_stream>>>(
+            ds4_launch_pdl(matmul_f16_splitk_reduce_kernel, (rn + 255u) / 256u, 256, 0, g_cur_stream, 
                     (float *)out->ptr, g_f16sk_partial, (uint32_t)out_dim, S, (uint32_t)n_tok);
         }
         return cuda_ok(cudaGetLastError(), "matmul_f16_splitk launch");
@@ -406,6 +320,18 @@ int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64
     }
     matmul_f16_kernel<<<grid, 256>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
     return cuda_ok(cudaGetLastError(), "matmul_f16 launch");
+}
+
+/* decode scratch 预建(非 capture 时机调用): split-K f16 partial [n_tok<=8][S*out<=4096]。
+ * 09-05 定罪: token graph 开着时第一次解码就在 capture 里, 这里的惰性 cudaMalloc 被闸掉 ⇒
+ * hc_fn(16384→24) 走非 split-K 归约序, 与直发差几个 ulp, 43 层后路由翻转 ⇒ 图/直发分叉。 */
+static void cuda_decode_scratch_prepare(void) {
+    cuda_attn_split_scratch_prepare();   /* 解码注意力分行核部分和(cuda_api_attention_4) */
+    rtk_scratch_prepare();               /* indexer top-k 多 block 版暂存(cuda_indexer_kernels_6) */
+    if (g_f16sk_partial) return;
+    if (cudaMalloc(&g_f16sk_partial, 8u * 4096u * sizeof(float)) != cudaSuccess) {
+        g_f16sk_partial = NULL; (void)cudaGetLastError();
+    }
 }
 
 int ds4_gpu_matmul_f16_pair_tensor(

@@ -7,6 +7,7 @@ __global__ static void quantize_q8_0_f32_kernel(
         const float *x,
         uint64_t in_dim,
         uint64_t blocks) {
+    DS4_PDL_WAIT(); DS4_PDL_TRIGGER();
     uint64_t b = blockIdx.x;
     uint64_t tok = blockIdx.y;
     if (b >= blocks) return;

@@ -194,6 +194,7 @@ __global__ static void __launch_bounds__(256, DS4_Q2K_BLOCKS_PER_SM) matmul_q2_K
 __global__ static void matmul_q4_K_warp_kernel(
         float *out, const char *w_base, const cuda_block_q8_K *xq,
         uint64_t row_bytes, uint32_t blocks, uint32_t out_dim) {
+    DS4_PDL_WAIT(); DS4_PDL_TRIGGER();
     /* 每 warp 一行(32 lanes 分块)。A/B 记录: 8-lane×32行/block 版实测更慢
      * (16.84 vs 17.30 t/s) —— dev_dot 每块开销大, 每 lane 串行 2 块比半数 lane
      * 空转更亏。保留本版。 */
@@ -217,14 +218,9 @@ __global__ static void matmul_q4_K_warp_kernel(
             for (uint32_t i = lane; i < n16; i += 32u) my[i] = __ldcs(src16 + i);
             __syncwarp();
             const cuda_block_q4_K *wr = (const cuda_block_q4_K *)my;
-            if (blocks <= 16u) {
-                /* 半块拆分: blocks×2 单元≤32, 全 warp 活跃 */
-                const uint32_t bi = lane >> 1u, hj = (lane & 1u) * 4u;
-                if (bi < blocks) acc += dev_dot_q4_K_q8_K_block_half(wr + bi, xt + bi, hj);
-            } else {
-                for (uint32_t b = lane; b < blocks; b += 32u)
-                    acc += dev_dot_q4_K_q8_K_block(wr + b, xt + b);
-            }
+            /* 4/8/16 块的行已走 tile 核(cuda_q4k_tile, 09-07 微基准判决); 这里只剩 17..32 块整块/lane */
+            for (uint32_t b = lane; b < blocks; b += 32u)
+                acc += dev_dot_q4_K_q8_K_block(wr + b, xt + b);
             __syncwarp();   /* 下轮复写 stage 前全 lane 必须算完 */
         } else {
             const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(w_base + (uint64_t)row * row_bytes);
@@ -250,6 +246,11 @@ int ds4_gpu_matmul_q4_K_tensor(
         out->bytes < n_tok * out_dim * sizeof(float)) return 0;
     const char *w = cuda_model_range_ptr(model_map, weight_offset, w_bytes, "dense_q4k");
     if (!w) return 0;
+    /* 批量(prefill): 解成 f16 走 cuBLAS(cuda_q4k_gemm.inc.cu); 下面的 warp 核是 decode 形态,
+     * 每 token 重读整个矩阵, 8192 token 一趟 76 s。 */
+    if (n_tok >= DS4_Q4K_GEMM_MIN_TOK)
+        return cuda_q4k_gemm_dense((float *)out->ptr, (const unsigned char *)w, in_dim, out_dim,
+                                   (const float *)x->ptr, n_tok);
 
     const uint64_t xq_need = n_tok * blocks * sizeof(cuda_block_q8_K);
     if (xq_need > g_q4k_xq_bytes) {
@@ -259,7 +260,7 @@ int ds4_gpu_matmul_q4_K_tensor(
         g_q4k_xq_bytes = xq_need;
     }
     /* 该 kernel 的 grid 语义: blockIdx.x 就是量化块号(一 CUDA block 一 q8_K 块) */
-    q8_K_quantize_kernel<<<dim3(blocks, (unsigned)n_tok, 1), 256, 0, g_cur_stream>>>(
+    ds4_launch_pdl(q8_K_quantize_kernel, dim3(blocks, (unsigned)n_tok, 1), 256, 0, g_cur_stream, 
         (cuda_block_q8_K *)g_q4k_xq_sc, (const float *)x->ptr, (uint32_t)in_dim, (uint32_t)n_tok);
     /* A/B 三连档案: 16-lane 变体在小矩阵上仍输(18.84 vs 19.13) — dense 场景 32-lane
      * 恒胜, dev_dot 每块开销决定一切, lane 空转无关紧要。变体保留但不启用。 */
@@ -273,11 +274,21 @@ int ds4_gpu_matmul_q4_K_tensor(
                     (unsigned long long)in_dim, (unsigned long long)out_dim, (unsigned long long)n_tok);
         }
     }
+    /* 09-07: 4/8/16 块的行(q_b/shexp_down/输出头等)走 tile 核: 整块/lane + 一 warp 多行, 微基准
+     * 225→229~276 GB/s(cuda_q4k_tile.inc.cu 头注)。批量 n_tok 由 grid.y 承担。 */
+    if (q4k_tile_supported(blocks, (uint32_t)out_dim))
+        return q4k_tile_launch((float *)out->ptr, w, (const cuda_block_q8_K *)g_q4k_xq_sc, blocks,
+                               (uint32_t)out_dim, (uint32_t)n_tok);
+    /* 09-06 三刀消融记录(fable5): cp.async 双缓冲零收益 / q8_0+dp4a 口径反慢 20% ⇒ 本核保持原样。 */
+    /* 小批(投机 verify, 2..15 token) 17..32 块行: 整行 stage 一次逐 token(cuda_q4k_tile), 免每 token 重读权重 */
+    if (n_tok > 1u && blocks <= 32u)
+        return q4k_rows_multi_launch((float *)out->ptr, w, (const cuda_block_q8_K *)g_q4k_xq_sc, blocks,
+                                     (uint32_t)out_dim, (uint32_t)n_tok);
     /* 动态 shared: blocks≤32 时 kernel staging 需 8 warps×blocks×144B */
     const size_t q4k_shmem = (blocks <= 32u) ? (size_t)8u * blocks * 9u * sizeof(uint4) : 0;
     unsigned q4k_gx = (unsigned)((out_dim + 7u) / 8u);
     if (q4k_gx > ds4_grid_cap()) q4k_gx = ds4_grid_cap();   /* 48 SM × 4 驻留块: 单 wave 满载, 行循环吃尾 */
-    matmul_q4_K_warp_kernel<<<dim3(q4k_gx, (unsigned)n_tok, 1), 256, q4k_shmem, g_cur_stream>>>(
+    ds4_launch_pdl(matmul_q4_K_warp_kernel, dim3(q4k_gx, (unsigned)n_tok, 1), 256, q4k_shmem, g_cur_stream, 
         (float *)out->ptr, w, (const cuda_block_q8_K *)g_q4k_xq_sc,
         row_bytes, blocks, (uint32_t)out_dim);
     return cuda_ok(cudaGetLastError(), "dense q4_K matmul launch");

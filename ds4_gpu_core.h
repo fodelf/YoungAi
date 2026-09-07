@@ -38,12 +38,38 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
 int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                    const ds4_gpu_tensor *src, uint64_t src_offset,
                                    uint64_t count);
+/* 压缩缓存(attn comp)行格式 —— 两后端唯一的存储格式(09-07): [448 维 FP8 段 f16][64 维 RoPE 段 f32] = 1152 B/行。
+ * 为什么: FP8 段是 e4m3 × 2^k(fp8_kv_quantize 的 scale 恒为 2 的幂), f16 精确可表示; RoPE 段是 f32, 转 f16 丢位置精度
+ * (纯 f16 缓存实测 vs FP 锚 KL +0.9%), 所以保 f32。相对纯 f32 省 1.78×, 相对纯 f16 只多 12.5%, 数值与 f32 缓存逐位同。
+ * head_dim/n_rot 钉死 512/64(core 分配时校验模型形状, 不符拒绝启动)。 */
+#define DS4_GPU_COMP_ROW_NOPE  448u
+#define DS4_GPU_COMP_ROW_ROT   64u
+#define DS4_GPU_COMP_ROW_BYTES (DS4_GPU_COMP_ROW_NOPE * 2u + DS4_GPU_COMP_ROW_ROT * 4u)
+/* f32 [rows][512] 行(暂存) → 压缩缓存行格式, 写到 dst 的 first_row 行起 */
+int ds4_gpu_comp_rows_commit(ds4_gpu_tensor *dst, uint64_t first_row, const ds4_gpu_tensor *src, uint64_t rows);
 
 int ds4_gpu_token_graph_begin(void);
 void ds4_gpu_token_graph_set_pos(uint32_t pos);
 int ds4_gpu_token_graph_end_launch(void);
 /* decode 流水线: 命中预编码图直接发射 / GPU 忙时为 pos 预捕获下一图(CUDA-only) */
 int ds4_gpu_token_graph_try_pending(int token, uint32_t pos, int need_logits);
+/* 丢弃预捕获待发射的图(09-07): 下一步不是 eval(pos+1)(投机 verify 批插队/回退)时由核心侧连同主机计数器一起作废 */
+int ds4_gpu_token_graph_pending_discard(void);
+/* ===== 预发射(2026-09-07, CUDA): 贪心解码把下一图在本图跑完之前排进流 =====
+ * 每个 token 图末尾 decode_argmax 把 logits 的 argmax 写进设备 token 槽; 图开头从槽取 token
+ * (主机槽/设备槽二选一, 由每相位一份的 pinned 参数决定)。prelaunch(pos) 把已预捕获的 pos 图按
+ * "取设备槽"发射, 主机不必等本图 logits 回传再采样再发射 ⇒ token 边界 GPU 零空转。
+ * readback_async 把本图 logits + 设备槽 token 异步回传到 pinned 内存(排在本图之后、下一图之前);
+ * readback_wait 等它落地。capable=0 的后端(Metal)走原同步路, core 不会调其余入口。 */
+int ds4_gpu_decode_prelaunch_capable(void);
+int ds4_gpu_decode_argmax_tensor(const ds4_gpu_tensor *logits, uint32_t n_vocab, int exclude_id);
+int ds4_gpu_token_graph_prelaunch(uint32_t pos, int need_logits);
+int ds4_gpu_token_graph_prelaunch_claim(uint32_t pos);   /* eval(pos) 开头认领已预发射的 pos, 认领即清 */
+int ds4_gpu_decode_readback_async(const ds4_gpu_tensor *logits, uint64_t bytes,
+                                  float *pinned_logits, int32_t *pinned_next_tok);
+int ds4_gpu_decode_readback_wait(void);
+void *ds4_gpu_host_alloc(uint64_t bytes);   /* pinned(CUDA)/普通 malloc(Metal) 主机内存 */
+void ds4_gpu_host_free(void *p);
 /* decode 双流并发: mark(主流,MoE 前) → begin(shared 段切侧流) → join(汇合) */
 int ds4_gpu_side_mark(void);
 int ds4_gpu_side_begin(void);

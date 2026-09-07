@@ -136,6 +136,7 @@ __global__ static void matmul_f16_splitk_kernel(
         uint32_t chunk,               /* 每段元素数, 8 的倍数 */
         uint32_t n_s,
         uint32_t n_tok) {
+    DS4_PDL_WAIT(); DS4_PDL_TRIGGER();
     /* splitk3(施工日2): grid-stride cell 循环 — (out,S)≤4096 超短命块(每块~2KB即死)
      * 改常驻块循环(pair3 同配方); 单 cell 计算序不变=逐位一致。 */
     /* 批扩展(2026-08-21 verify 数值对齐): cell 空间加 token 维。每个 (tok,row,s) cell 的
@@ -190,6 +191,7 @@ __global__ static void matmul_f16_splitk_kernel(
 
 __global__ static void matmul_f16_splitk_reduce_kernel(
         float *out, const float *partial, uint32_t out_dim, uint32_t S, uint32_t n_tok) {
+    DS4_PDL_WAIT(); DS4_PDL_TRIGGER();
     const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= out_dim * n_tok) return;
     const uint32_t row = idx % out_dim;
@@ -372,6 +374,7 @@ __global__ static void repeat_hc_kernel(float *out, const float *row, uint32_t n
 }
 
 __global__ static void f32_to_f16_kernel(__half *out, const float *x, uint64_t n) {
+    DS4_PDL_WAIT(); DS4_PDL_TRIGGER();
     uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = __float2half(x[i]);
 }

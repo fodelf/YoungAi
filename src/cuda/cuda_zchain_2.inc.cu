@@ -52,7 +52,8 @@ int ds4_gpu_zchain_zl_set(
     if (!g_zc_zl_pv) {
         if (!cuda_ok(cudaMalloc(&g_zc_zl_pv, (size_t)ZC_ZL_FAST_MAXTOK * 1024u * sizeof(float)), "zl pv")) return 0;
         if (!cuda_ok(cudaMalloc(&g_zc_zl_ua, (size_t)ZC_ZL_FAST_MAXTOK * 4096u * sizeof(float)), "zl ua")) return 0;
-        if (!cuda_ok(cudaMalloc(&g_zc_zl_n2, (size_t)ZC_ZL_FAST_MAXTOK * 2u * sizeof(float)), "zl n2")) return 0;
+        /* n2 = 每 token × 每 ua block(d/8 ≤ 512) × {‖ua‖², ‖r‖²} 部分和平面(09-05 去原子, 定序归约) */
+        if (!cuda_ok(cudaMalloc(&g_zc_zl_n2, (size_t)ZC_ZL_FAST_MAXTOK * 512u * 2u * sizeof(float)), "zl n2")) return 0;
         if (!cuda_ok(cudaMalloc(&g_zc_zl_pvp, (size_t)ZC_ZL_FAST_MAXTOK * ZC_ZL_SEG * 1024u * sizeof(float)), "zl pvp")) return 0;
     }
     fprintf(stderr, "ds4: zchain CUDA z^L armed: %u layers (AMP=%u), kmax=%u (%.1f MB)\n",

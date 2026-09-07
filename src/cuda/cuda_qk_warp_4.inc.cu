@@ -30,7 +30,7 @@ int ds4_gpu_matmul_q2_K_tensor(
     if (q2fu == 99u) { const char *e = ((const char *)0) /* DS4_Q2K_FUSEQ: 路径开关已删(2026-08-22 隐形炸弹清理) */; q2fu = e ? (uint32_t)atoi(e) : 1u; }
     const int fused = (q2fu && n_tok == 1);   /* 碎片税刀①: decode 融合量化免独立发射 */
     if (!fused)
-        q8_K_quantize_kernel<<<dim3(blocks, (unsigned)n_tok, 1), 256, 0, g_cur_stream>>>(
+        ds4_launch_pdl(q8_K_quantize_kernel, dim3(blocks, (unsigned)n_tok, 1), 256, 0, g_cur_stream, 
             (cuda_block_q8_K *)g_q4k_xq_sc, (const float *)x->ptr, (uint32_t)in_dim, (uint32_t)n_tok);
     unsigned gx = (unsigned)((out_dim + 7u) / 8u);
     if (gx > ds4_grid_cap()) gx = ds4_grid_cap();   /* 08-20 阶梯审判: 384 比 192 +4-8GB/s(V1 222→229/V2 226→230) */
@@ -211,7 +211,7 @@ int ds4_gpu_matmul_q2_K_pair_tensor(
     static uint32_t pfu = 99u;
     if (pfu == 99u) { const char *e = ((const char *)0) /* DS4_Q2K_FUSEQ: 路径开关已删(2026-08-22 隐形炸弹清理) */; pfu = e ? (uint32_t)atoi(e) : 1u; }
     if (!pfu)
-        q8_K_quantize_kernel<<<dim3(blocks, 1, 1), 256, 0, g_cur_stream>>>(
+        ds4_launch_pdl(q8_K_quantize_kernel, dim3(blocks, 1, 1), 256, 0, g_cur_stream, 
             (cuda_block_q8_K *)g_q4k_xq_sc, (const float *)x->ptr, (uint32_t)in_dim, 1u);
     const float *xr = pfu ? (const float *)x->ptr : NULL;
     return q2k_matmul_from_xq(out0, model_map, model_size, off0, blocks, out0_dim, xr) &&
@@ -247,12 +247,16 @@ int ds4_gpu_matmul_q4_K_pair_tensor(
         if (cudaMalloc(&g_q4k_xq_sc, xq_need) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
         g_q4k_xq_bytes = xq_need;
     }
-    q8_K_quantize_kernel<<<dim3(blocks, 1, 1), 256, 0, g_cur_stream>>>(
+    ds4_launch_pdl(q8_K_quantize_kernel, dim3(blocks, 1, 1), 256, 0, g_cur_stream,
         (cuda_block_q8_K *)g_q4k_xq_sc, (const float *)x->ptr, (uint32_t)in_dim, 1u);
+    if (q4k_tile_supported(blocks, (uint32_t)out0_dim) && q4k_tile_supported(blocks, (uint32_t)out1_dim))
+        return q4k_tile_pair_launch((float *)out0->ptr, (float *)out1->ptr, w0, w1,
+                                    (const cuda_block_q8_K *)g_q4k_xq_sc, blocks,
+                                    (uint32_t)out0_dim, (uint32_t)out1_dim);
     unsigned gx = (unsigned)((out0_dim + out1_dim + 7u) / 8u);
     if (gx > ds4_grid_cap()) gx = ds4_grid_cap();   /* 08-20 阶梯审判: 384 比 192 +4-8GB/s(V1 222→229/V2 226→230) */
     const size_t shmem = (blocks <= 32u) ? (size_t)8u * blocks * 9u * sizeof(uint4) : 0;
-    matmul_q4_K_pair_warp_kernel<<<gx, 256, shmem, g_cur_stream>>>(
+    ds4_launch_pdl(matmul_q4_K_pair_warp_kernel, gx, 256, shmem, g_cur_stream, 
         (float *)out0->ptr, (float *)out1->ptr, w0, w1,
         (const cuda_block_q8_K *)g_q4k_xq_sc, row_bytes, blocks,
         (uint32_t)out0_dim, (uint32_t)out1_dim);

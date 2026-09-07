@@ -177,7 +177,7 @@ static int routed_moe_launch(
         uint32_t tile_capacity = 0;
         uint32_t tile16_capacity = 0;
         dim3 xq_grid(xq_blocks, n_tokens, 1);
-        q8_K_quantize_kernel<<<xq_grid, 256>>>(xq, (const float *)x->ptr, expert_in_dim, n_tokens);
+        ds4_launch_pdl(q8_K_quantize_kernel, xq_grid, 256, 0, 0, xq, (const float *)x->ptr, expert_in_dim, n_tokens);
         ok = cuda_ok(cudaGetLastError(), "routed_moe x quantize launch");
         if (prof_ev[1]) (void)cudaEventRecord(prof_ev[1], 0);
         if (ok && use_sorted_pairs) {
@@ -371,7 +371,16 @@ static int routed_moe_launch(
                     clamp);
             } else if (ok) {
                 dim3 qgrid((expert_mid_dim + 127u) / 128u, n_tokens * n_expert, 1);
-                if (q4k_path) {   /* decode 与 batch 同 kernel(pair=blockIdx.y 天然批) */
+                if (q4k_path) {
+                    /* 09-07: tile 结构核(cuda_moe_q4k_tile), 形状不符(-1)回老核; 必须整段留在 if(q4k_path) 里 ——
+                     * 首版把它拆成独立 if 再接原 else-if 链, tile 发射后又落进 IQ2 分支把 Q4_K 权重当 IQ2 算, 草稿全烂
+                     * (接受率 0.90 → 0.10)。 */
+                    const int r = moe_gate_up_q4k_tile_launch((float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                                                              gate_w, up_w, xq, (const int32_t *)selected->ptr,
+                                                              (const float *)weights->ptr, gate_expert_bytes, xq_blocks,
+                                                              expert_mid_dim, n_expert, n_tokens, write_gate_up, clamp);
+                    if (r == 0) ok = false;
+                    if (r < 0)   /* decode 与 batch 同 kernel(pair=blockIdx.y 天然批) */
                     moe_gate_up_mid_decode_q4K_qwarp32_kernel<<<qgrid, 256>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
@@ -515,7 +524,7 @@ static int routed_moe_launch(
         if (prof_ev[3]) (void)cudaEventRecord(prof_ev[3], 0);
         if (ok) {
             dim3 midq_grid(midq_blocks, n_tokens * n_expert, 1);
-            q8_K_quantize_kernel<<<midq_grid, 256>>>(midq, (const float *)mid->ptr, expert_mid_dim, n_tokens * n_expert);
+            ds4_launch_pdl(q8_K_quantize_kernel, midq_grid, 256, 0, 0, midq, (const float *)mid->ptr, expert_mid_dim, n_tokens * n_expert);
             ok = cuda_ok(cudaGetLastError(), "routed_moe mid quantize launch");
         }
         if (prof_ev[4]) (void)cudaEventRecord(prof_ev[4], 0);
@@ -673,8 +682,11 @@ static int routed_moe_launch(
                     midq_blocks,
                     out_dim,
                     n_expert);
+            } else if (q4k_path && midq_blocks == 8u && (out_dim & 3u) == 0u) {
+                /* 09-07: tile 结构核(cuda_moe_q4k_tile); 形状不符走下面老核 */
+                if (moe_down_q4k_tile_launch((float *)down->ptr, down_w, midq, (const int32_t *)selected->ptr,
+                                             down_expert_bytes, midq_blocks, out_dim, n_expert, n_tokens) <= 0) ok = false;
             } else if (q4k_path) {
-                if (((const char *)0) /* DS4_Q4K_BATCH_PROBE: 诊断开关已删(2026-08-22) */) fprintf(stderr, "ds4: [q4kbatch] down pairs kernel launch dgrid=(%u,%u)\n", dgrid.x, dgrid.y);
                 moe_down_q4K_pairs_qwarp32_kernel<<<dgrid, 256>>>(
                     (float *)down->ptr,
                     down_w,
