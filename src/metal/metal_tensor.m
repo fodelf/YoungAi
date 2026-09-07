@@ -182,3 +182,27 @@ int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
         return ok;
     }
 }
+
+/* f32 [rows][512] 暂存行 → 压缩缓存行格式(ds4_gpu_core.h DS4_GPU_COMP_ROW_*), 写到 dst 的 first_row 行起 */
+int ds4_gpu_comp_rows_commit(ds4_gpu_tensor *dst, uint64_t first_row, const ds4_gpu_tensor *src, uint64_t rows) {
+    if (!dst || !src) return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (rows == 0) return 1;
+    if (rows > UINT32_MAX / 512u) return 0;
+    DS4MetalTensor *d = ds4_gpu_tensor_obj(dst);
+    const DS4MetalTensor *s = ds4_gpu_tensor_const_obj(src);
+    const uint64_t src_bytes = rows * 512u * sizeof(float);
+    const uint64_t dst_off = first_row * DS4_GPU_COMP_ROW_BYTES;
+    const uint64_t dst_bytes = rows * DS4_GPU_COMP_ROW_BYTES;
+    if (src_bytes > s.bytes || dst_off > d.bytes || dst_bytes > d.bytes - dst_off) return 0;
+
+    @autoreleasepool {
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        int ok = ds4_gpu_encode_comp_rows_commit(cb, s.buffer, (NSUInteger)s.offset,
+                                                 d.buffer, (NSUInteger)(d.offset + dst_off), (uint32_t)rows);
+        if (ok) ok = ds4_gpu_finish_command_buffer(cb, owned, "comp rows commit");
+        return ok;
+    }
+}

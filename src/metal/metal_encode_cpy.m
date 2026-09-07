@@ -224,30 +224,44 @@ int ds4_gpu_encode_cpy_f16_f32_1d(
     return 1;
 }
 
-int ds4_gpu_encode_copy_to_f16_1d(
+/* 压缩缓存行格式(ds4_gpu_core.h DS4_GPU_COMP_ROW_*)的两个逐元素核: 行 → 连续 f16(flash-attention 打包) / f32 行 → 缓存行(提交) */
+static int ds4_gpu_encode_comp_rows_kernel(
         id<MTLCommandBuffer> cb,
+        const char          *name,
         id<MTLBuffer>        src,
         NSUInteger           src_off,
-        bool                 src_is_f16,
         id<MTLBuffer>        dst,
         NSUInteger           dst_off,
-        uint32_t             n) {
+        uint32_t             rows) {
     if (!cb || !src || !dst) return 0;
-    if (n == 0) return 1;
-    if (!src_is_f16) {
-        return ds4_gpu_encode_cpy_f32_f16_1d(cb, src, src_off, dst, dst_off, n);
-    }
+    if (rows == 0) return 1;
+    if (rows > UINT32_MAX / 512u) return 0;
+    id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(name);
+    if (!pipeline) return 0;
+    const uint32_t n = rows * 512u;
+    NSUInteger nth = 256u;
+    if (nth > pipeline.maxTotalThreadsPerThreadgroup) nth = pipeline.maxTotalThreadsPerThreadgroup;
+    const NSUInteger groups = ((NSUInteger)n + nth - 1u) / nth;
 
-    if (g_batch_cb && cb == g_batch_cb) ds4_gpu_close_batch_encoder();
-    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
-    if (!blit) return 0;
-    [blit copyFromBuffer:src
-            sourceOffset:src_off
-                toBuffer:dst
-       destinationOffset:dst_off
-                    size:(NSUInteger)n * sizeof(uint16_t)];
-    [blit endEncoding];
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:pipeline];
+    [enc setBytes:&n length:sizeof(n) atIndex:0];
+    [enc setBuffer:src offset:src_off atIndex:1];
+    [enc setBuffer:dst offset:dst_off atIndex:2];
+    [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
+}
+
+int ds4_gpu_encode_comp_rows_to_f16(id<MTLCommandBuffer> cb, id<MTLBuffer> src, NSUInteger src_off,
+                                    id<MTLBuffer> dst, NSUInteger dst_off, uint32_t rows) {
+    return ds4_gpu_encode_comp_rows_kernel(cb, "kernel_dsv4_comp_rows_to_f16", src, src_off, dst, dst_off, rows);
+}
+
+int ds4_gpu_encode_comp_rows_commit(id<MTLCommandBuffer> cb, id<MTLBuffer> src, NSUInteger src_off,
+                                    id<MTLBuffer> dst, NSUInteger dst_off, uint32_t rows) {
+    return ds4_gpu_encode_comp_rows_kernel(cb, "kernel_dsv4_comp_rows_commit", src, src_off, dst, dst_off, rows);
 }
 
 int ds4_gpu_encode_fill_f16_1d(

@@ -12,7 +12,6 @@ int ds4_gpu_encode_flash_attention_gathered_heads(
         uint32_t               raw_cap,
         uint32_t               raw_start,
         const ds4_gpu_tensor *comp_kv,
-        uint32_t               comp_kv_f16,
         uint32_t               n_comp,
         const ds4_gpu_tensor *comp_mask,
         uint32_t               use_mask,
@@ -31,8 +30,7 @@ int ds4_gpu_encode_flash_attention_gathered_heads(
     id<MTLBuffer> maskbuf = use_mask ? ds4_gpu_tensor_buffer(comp_mask) : nil;
     const uint64_t q_bytes = (uint64_t)n_head * head_dim * sizeof(float);
     const uint64_t raw_bytes = (uint64_t)raw_cap * head_dim * sizeof(float);
-    const uint64_t comp_bytes = (uint64_t)n_comp * head_dim *
-                                (comp_kv_f16 ? sizeof(uint16_t) : sizeof(float));
+    const uint64_t comp_bytes = (uint64_t)n_comp * DS4_GPU_COMP_ROW_BYTES;   /* 压缩缓存行格式, 见 ds4_gpu_core.h */
     const uint64_t comp_mask_bytes = use_mask ? (uint64_t)n_comp * sizeof(float) : 0u;
     if (!qbuf || !rawbuf || !headsbuf || !sinks_buf ||
         (n_comp && !compbuf) ||
@@ -137,13 +135,12 @@ int ds4_gpu_encode_flash_attention_gathered_heads(
         return 0;
     }
     if (n_comp) {
-        if (!ds4_gpu_encode_copy_to_f16_1d(cb,
-                                           compbuf,
-                                           ds4_gpu_tensor_offset(comp_kv),
-                                           comp_kv_f16 != 0,
-                                           g_flash_attn_kv_buffer,
-                                           (NSUInteger)n_raw * row_bytes_f16,
-                                           n_comp * head_dim)) {
+        if (!ds4_gpu_encode_comp_rows_to_f16(cb,
+                                             compbuf,
+                                             ds4_gpu_tensor_offset(comp_kv),
+                                             g_flash_attn_kv_buffer,
+                                             (NSUInteger)n_raw * row_bytes_f16,
+                                             n_comp)) {
             return 0;
         }
     }

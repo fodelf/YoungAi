@@ -9,7 +9,6 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_vec(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
-        uint32_t               comp_kv_f16,
         const ds4_gpu_tensor *comp_mask,
         uint32_t               use_comp_mask,
         uint32_t               n_tokens,
@@ -32,8 +31,7 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_vec(
     id<MTLBuffer> headsbuf = ds4_gpu_tensor_buffer(heads);
     const uint64_t q_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
     const uint64_t raw_bytes = (uint64_t)n_tokens * head_dim * sizeof(float);
-    const uint64_t comp_bytes = (uint64_t)n_comp * head_dim *
-                                (comp_kv_f16 ? sizeof(uint16_t) : sizeof(float));
+    const uint64_t comp_bytes = (uint64_t)n_comp * DS4_GPU_COMP_ROW_BYTES;   /* 压缩缓存行格式, 见 ds4_gpu_core.h */
     const uint64_t comp_mask_bytes = use_comp_mask ? (uint64_t)n_comp * n_tokens * sizeof(float) : 0u;
     if (!qbuf || !rawbuf || !compbuf || !maskbuf || !headsbuf || !sinks_buf ||
         ds4_gpu_tensor_bytes(q) < q_bytes ||
@@ -88,13 +86,12 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_vec(
         return 0;
     }
     if (n_comp) {
-        if (!ds4_gpu_encode_copy_to_f16_1d(cb,
-                                           compbuf,
-                                           ds4_gpu_tensor_offset(comp_kv),
-                                           comp_kv_f16 != 0,
-                                           g_flash_attn_kv_buffer,
-                                           (NSUInteger)n_tokens * row_bytes_f16,
-                                           n_comp * head_dim)) {
+        if (!ds4_gpu_encode_comp_rows_to_f16(cb,
+                                             compbuf,
+                                             ds4_gpu_tensor_offset(comp_kv),
+                                             g_flash_attn_kv_buffer,
+                                             (NSUInteger)n_tokens * row_bytes_f16,
+                                             n_comp)) {
             return 0;
         }
     }
@@ -244,7 +241,6 @@ int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
-        uint32_t               comp_kv_f16,
         const ds4_gpu_tensor *comp_mask,
         uint32_t               use_comp_mask,
         uint32_t               n_tokens,
@@ -261,7 +257,6 @@ int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec(
                                                                                        q,
                                                                                        raw_kv,
                                                                                        comp_kv,
-                                                                                       comp_kv_f16,
                                                                                        comp_mask,
                                                                                        use_comp_mask,
                                                                                        n_tokens,
@@ -278,7 +273,6 @@ int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec(
                                                                            q,
                                                                            raw_kv,
                                                                            comp_kv,
-                                                                           comp_kv_f16,
                                                                            comp_mask,
                                                                            use_comp_mask,
                                                                            n_tokens,

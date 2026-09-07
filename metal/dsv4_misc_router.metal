@@ -54,8 +54,6 @@ struct ds4_metal_args_dsv4_indexed_attention {
     uint32_t pos0;
     uint32_t window;
     uint32_t ratio;
-    uint32_t comp_kv_f16;
-    uint32_t pad0;
     uint64_t q_token_stride;
     uint64_t q_head_stride;
     uint64_t raw_row_stride;
@@ -158,9 +156,9 @@ kernel void kernel_dsv4_indexer_score_one_direct(
     threadgroup float *psum = ktg + 128u;   // [4]
 
     if (tid < 128u) {
-        device const float *krow = (device const float *)(index_comp +
+        device const half *krow = (device const half *)(index_comp +   // indexer 缓存恒 f16
             (uint64_t)row * args.index_row_stride);
-        ktg[tid] = krow[tid];
+        ktg[tid] = float(krow[tid]);
     }
 
     float acc = 0.0f;

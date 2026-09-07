@@ -310,6 +310,22 @@ int ds4_gpu_kv_rope_fp8_store_raw_tensor(
                                   beta_fast, beta_slow)) return 0;
     return ds4_gpu_kv_fp8_store_raw_tensor(kv, raw_cache, raw_cap, raw_row, head_dim, n_rot);
 }
+int ds4_gpu_kv_rope_fp8_store_raw_batch_tensor(
+    ds4_gpu_tensor *kv, ds4_gpu_tensor *raw_cache,
+    uint32_t raw_cap, uint32_t pos0, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot,
+    uint32_t n_ctx_orig, float freq_base, float freq_scale,
+    float ext_factor, float attn_factor, float beta_fast, float beta_slow) {
+    for (uint32_t t = 0; t < n_tok; t++) {   /* Metal: 逐行调单发版(语义同) */
+        ds4_gpu_tensor *row = ds4_gpu_tensor_view(kv, (uint64_t)t * head_dim * sizeof(float), (uint64_t)head_dim * sizeof(float));
+        if (!row) return 0;
+        const int ok = ds4_gpu_kv_rope_fp8_store_raw_tensor(row, raw_cache, raw_cap, (pos0 + t) % raw_cap, head_dim, n_rot,
+                                                            pos0 + t, n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor,
+                                                            beta_fast, beta_slow);
+        ds4_gpu_tensor_free(row);
+        if (!ok) return 0;
+    }
+    return 1;
+}
 
 int ds4_gpu_head_rms_norm_rope_tail_tensor(
     ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim,
@@ -326,8 +342,25 @@ int ds4_gpu_head_rms_norm_rope_tail_tensor(
 int ds4_gpu_token_graph_end_launch(void) { return 0; }
 
 int ds4_gpu_token_graph_try_pending(int token, uint32_t pos, int need_logits) { (void)token; (void)pos; (void)need_logits; return 0; }
+int ds4_gpu_token_graph_pending_discard(void) { return 0; }
 
 int ds4_gpu_token_graph_precapture_begin(void) { return 0; }
+
+/* 预发射族(ds4_gpu_core.h): CUDA-only。capable=0 ⇒ core 只调 host_alloc/free 与同步语义的 readback。 */
+int ds4_gpu_decode_prelaunch_capable(void) { return 0; }
+int ds4_gpu_decode_argmax_tensor(const ds4_gpu_tensor *logits, uint32_t n_vocab, int exclude_id) {
+    (void)logits; (void)n_vocab; (void)exclude_id; return 0;
+}
+int ds4_gpu_token_graph_prelaunch(uint32_t pos, int need_logits) { (void)pos; (void)need_logits; return 0; }
+int ds4_gpu_token_graph_prelaunch_claim(uint32_t pos) { (void)pos; return 0; }
+int ds4_gpu_decode_readback_async(const ds4_gpu_tensor *logits, uint64_t bytes,
+                                  float *pinned_logits, int32_t *pinned_next_tok) {
+    if (pinned_next_tok) *pinned_next_tok = -1;
+    return ds4_gpu_tensor_read(logits, 0, pinned_logits, bytes);   /* Metal: 同步读即落地 */
+}
+int ds4_gpu_decode_readback_wait(void) { return 1; }
+void *ds4_gpu_host_alloc(uint64_t bytes) { return malloc((size_t)bytes); }
+void ds4_gpu_host_free(void *p) { free(p); }
 
 int ds4_gpu_side_mark(void) { return 0; }
 

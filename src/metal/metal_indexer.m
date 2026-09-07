@@ -67,7 +67,7 @@ int ds4_gpu_indexer_score_one_tensor(
     @autoreleasepool {
         const uint64_t q_bytes = (uint64_t)n_head * head_dim * sizeof(float);
         const uint64_t weight_bytes = (uint64_t)n_head * sizeof(float);
-        const uint64_t comp_bytes = (uint64_t)n_comp * head_dim * sizeof(float);
+        const uint64_t comp_bytes = (uint64_t)n_comp * head_dim * sizeof(uint16_t);   /* indexer 缓存恒 f16 */
         const uint64_t score_bytes = (uint64_t)n_comp * sizeof(float);
         id<MTLBuffer> qbuf = ds4_gpu_tensor_buffer(q);
         id<MTLBuffer> wbuf = ds4_gpu_tensor_buffer(weights);
@@ -98,7 +98,7 @@ int ds4_gpu_indexer_score_one_tensor(
                 .q_token_stride = (uint64_t)n_head * head_dim * sizeof(float),
                 .q_head_stride = (uint64_t)head_dim * sizeof(float),
                 .weights_token_stride = (uint64_t)n_head * sizeof(float),
-                .index_row_stride = (uint64_t)head_dim * sizeof(float),
+                .index_row_stride = (uint64_t)head_dim * sizeof(uint16_t),
                 .score_token_stride = (uint64_t)n_comp * sizeof(float),
                 .scale = scale,
             };
@@ -212,7 +212,7 @@ static int ds4_gpu_indexer_scores_batch_tensor(
     @autoreleasepool {
         const uint64_t q_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
         const uint64_t weight_bytes = (uint64_t)n_tokens * n_head * sizeof(float);
-        const uint64_t comp_bytes = (uint64_t)n_comp * head_dim * sizeof(float);
+        const uint64_t comp_bytes = (uint64_t)n_comp * head_dim * sizeof(uint16_t);   /* indexer 缓存恒 f16 */
         const uint64_t score_bytes = (uint64_t)n_comp * n_tokens * sizeof(float);
         id<MTLBuffer> qbuf = ds4_gpu_tensor_buffer(q);
         id<MTLBuffer> wbuf = ds4_gpu_tensor_buffer(weights);
@@ -252,7 +252,7 @@ static int ds4_gpu_indexer_scores_batch_tensor(
             .q_token_stride = (uint64_t)n_head * head_dim * sizeof(float),
             .q_head_stride = (uint64_t)head_dim * sizeof(float),
             .weights_token_stride = (uint64_t)n_head * sizeof(float),
-            .index_row_stride = (uint64_t)head_dim * sizeof(float),
+            .index_row_stride = (uint64_t)head_dim * sizeof(uint16_t),
             .score_token_stride = (uint64_t)n_comp * sizeof(float),
             .scale = scale,
         };

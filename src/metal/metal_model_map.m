@@ -320,6 +320,11 @@ int ds4_gpu_set_model_map_spans_split(
 
 /* GPU 跨度计时: Metal 侧不做事件对(CUDA 专用归因工具), 返回 -1 表示不可用。 */
 int ds4_gpu_register_aux_model_map(const void *map, uint64_t size) { (void)map; (void)size; return 1; }
+/* q8 f16 影子缓存是 CUDA 的 cuBLAS 小批路专用(Metal 稠密核直接吃 q8_0), 预建入口空实现(drafter 绑定时调, 09-07) */
+int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes,
+                               uint64_t in_dim, uint64_t out_dim, const char *label) {
+    (void)model_map; (void)model_size; (void)offset; (void)bytes; (void)in_dim; (void)out_dim; (void)label; return 1;
+}
 
 int ds4_gpu_sanitize_finite_tensor(ds4_gpu_tensor *t, uint64_t n) { (void)t; (void)n; return 1; }
 

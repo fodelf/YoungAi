@@ -12,8 +12,6 @@ typedef struct {
     uint32_t pos0;
     uint32_t window;
     uint32_t ratio;
-    uint32_t comp_kv_f16;
-    uint32_t pad0;
     uint64_t q_token_stride;
     uint64_t q_head_stride;
     uint64_t raw_row_stride;
@@ -143,7 +141,6 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
         const ds4_gpu_tensor *comp_mask,
         uint32_t                use_comp_mask,
         uint32_t                n_tokens,
@@ -188,7 +185,6 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
                                                                        q,
                                                                        raw_kv,
                                                                        comp_kv,
-                                                                       comp_kv_f16,
                                                                        comp_mask,
                                                                        use_comp_mask,
                                                                        n_tokens,
@@ -218,7 +214,6 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
         const ds4_gpu_tensor *topk,
         uint32_t                n_tokens,
         uint32_t                pos0,
@@ -246,10 +241,9 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         }
 
         const uint64_t row_bytes = (uint64_t)head_dim * sizeof(float);
-        const uint64_t row_bytes_f16 = (uint64_t)head_dim * sizeof(uint16_t);
         const uint64_t q_bytes = (uint64_t)n_tokens * n_head * row_bytes;
         const uint64_t raw_bytes = (uint64_t)raw_cap * row_bytes;
-        const uint64_t comp_bytes = (uint64_t)n_comp * (comp_kv_f16 ? row_bytes_f16 : row_bytes);
+        const uint64_t comp_bytes = (uint64_t)n_comp * DS4_GPU_COMP_ROW_BYTES;   /* 压缩缓存行格式, 见 ds4_gpu_core.h */
         const uint64_t topk_bytes = (uint64_t)top_k * n_tokens * sizeof(int32_t);
         id<MTLBuffer> qbuf = ds4_gpu_tensor_buffer(q);
         id<MTLBuffer> rawbuf = ds4_gpu_tensor_buffer(raw_kv);
@@ -323,12 +317,10 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             .pos0 = pos0,
             .window = window,
             .ratio = ratio,
-            .comp_kv_f16 = comp_kv_f16 ? 1u : 0u,
-            .pad0 = 0,
             .q_token_stride = (uint64_t)n_head * row_bytes,
             .q_head_stride = row_bytes,
             .raw_row_stride = row_bytes,
-            .comp_row_stride = comp_kv_f16 ? row_bytes_f16 : row_bytes,
+            .comp_row_stride = DS4_GPU_COMP_ROW_BYTES,
             .topk_token_stride = (uint64_t)top_k * sizeof(int32_t),
             .dst_token_stride = (uint64_t)n_head * row_bytes,
             .dst_head_stride = row_bytes,

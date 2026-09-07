@@ -176,17 +176,15 @@ static inline void dsv4_attend_shared_h4_row_at(
                               o0, o1, o2, o3);
 }
 
+// 压缩缓存行格式(ds4_gpu_core.h DS4_GPU_COMP_ROW_*): [448 维 f16][64 维 f32], 行 1152 B; col = 第几个 4 维组(0..127)
 static inline half4 dsv4_load_cache_h4(
         device const char *kv,
         uint64_t row_stride,
         uint row,
-        uint col,
-        bool f16_rows) {
+        uint col) {
     device const char *base = kv + (uint64_t)row * row_stride;
-    if (f16_rows) {
-        return ((device const half4 *)base)[col];
-    }
-    return (half4)((device const float4 *)base)[col];
+    if (col < 112u) return ((device const half4 *)base)[col];
+    return (half4)((device const float4 *)(base + 896u))[col - 112u];
 }
 
 static inline void dsv4_attend_sink(
@@ -292,8 +290,7 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8(
             kv_shared[tid] = dsv4_load_cache_h4(comp_kv,
                                                 args.comp_row_stride,
                                                 (uint)idx,
-                                                tid,
-                                                args.comp_kv_f16 != 0u);
+                                                tid);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         dsv4_attend_shared_h4_row(kv_shared,
@@ -420,8 +417,7 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb16(
             kv_shared[off] = dsv4_load_cache_h4(comp_kv,
                                                 args.comp_row_stride,
                                                 rows[r],
-                                                c,
-                                                args.comp_kv_f16 != 0u);
+                                                c);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint r = 0; r < n_rows; r++) {

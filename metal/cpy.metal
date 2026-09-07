@@ -55,3 +55,32 @@ typedef decltype(kernel_cpy_t_t<float, float>) kernel_cpy_t;
 template [[host_name("kernel_cpy_f32_f32")]] kernel kernel_cpy_t kernel_cpy_t_t<float, float>;
 template [[host_name("kernel_cpy_f32_f16")]] kernel kernel_cpy_t kernel_cpy_t_t<float, half>;
 template [[host_name("kernel_cpy_f16_f32")]] kernel kernel_cpy_t kernel_cpy_t_t<half, float>;
+
+// 压缩缓存行格式(ds4_gpu_core.h DS4_GPU_COMP_ROW_*): [448 维 f16][64 维 f32], 行 1152 B。两后端唯一格式:
+// FP8 段 f16 精确, RoPE 段保 f32(转 f16 会丢位置精度)。
+// → 连续 f16 行: flash-attention 的 K/V 打包(RoPE 段在此转 f16, 与打包 f32 缓存时同数值); n = 行数 × 512
+kernel void kernel_dsv4_comp_rows_to_f16(
+        constant uint32_t & n,
+        device const char * src,
+        device       half * dst,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= n) return;
+    const uint r = gid / 512u, d = gid - r * 512u;
+    device const char *row = src + (uint64_t)r * 1152u;
+    dst[gid] = d < 448u ? ((device const half *)row)[d]
+                        : half(((device const float *)(row + 896u))[d - 448u]);
+}
+
+// f32 [rows][512](暂存) → 压缩缓存行
+kernel void kernel_dsv4_comp_rows_commit(
+        constant uint32_t & n,
+        device const float * src,
+        device       char * dst,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= n) return;
+    const uint r = gid / 512u, d = gid - r * 512u;
+    device char *row = dst + (uint64_t)r * 1152u;
+    const float v = src[gid];
+    if (d < 448u) ((device half *)row)[d] = half(v);
+    else ((device float *)(row + 896u))[d - 448u] = v;
+}

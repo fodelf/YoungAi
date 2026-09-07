@@ -9,7 +9,6 @@ int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
         uint32_t                n_tokens,
         uint32_t                n_comp,
         uint32_t                window,
@@ -46,7 +45,6 @@ int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
                                                                                 q,
                                                                                 raw_kv,
                                                                                 comp_kv,
-                                                                                comp_kv_f16,
                                                                                 NULL,
                                                                                 0,
                                                                                 n_tokens,
@@ -72,7 +70,6 @@ int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
         const ds4_gpu_tensor *comp_mask,
         uint32_t                n_tokens,
         uint32_t                n_comp,
@@ -110,7 +107,6 @@ int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
                                                                                 q,
                                                                                 raw_kv,
                                                                                 comp_kv,
-                                                                                comp_kv_f16,
                                                                                 comp_mask,
                                                                                 1,
                                                                                 n_tokens,
@@ -139,7 +135,6 @@ int ds4_gpu_attention_decode_heads_tensor(
         uint32_t                raw_cap,
         uint32_t                raw_start,
         const ds4_gpu_tensor *comp_kv,
-        uint32_t                comp_kv_f16,
         uint32_t                n_comp,
         const ds4_gpu_tensor *comp_mask,
         uint32_t                use_mask,
@@ -158,8 +153,7 @@ int ds4_gpu_attention_decode_heads_tensor(
     @autoreleasepool {
         const uint64_t q_bytes = (uint64_t)n_head * head_dim * sizeof(float);
         const uint64_t raw_bytes = (uint64_t)raw_cap * head_dim * sizeof(float);
-        const uint64_t comp_bytes = (uint64_t)n_comp * head_dim *
-                                    (comp_kv_f16 ? sizeof(uint16_t) : sizeof(float));
+        const uint64_t comp_bytes = (uint64_t)n_comp * DS4_GPU_COMP_ROW_BYTES;   /* 压缩缓存行格式, 见 ds4_gpu_core.h */
         const uint64_t sink_bytes = (uint64_t)n_head * sizeof(float);
         if (sinks_offset > model_size || sink_bytes > model_size - sinks_offset) {
             fprintf(stderr, "ds4: Metal graph attention heads sink range is outside the mapped model\n");
@@ -223,7 +217,6 @@ int ds4_gpu_attention_decode_heads_tensor(
                                                              raw_cap,
                                                              raw_start,
                                                              comp_kv,
-                                                             comp_kv_f16,
                                                              n_comp,
                                                              comp_mask,
                                                              use_mask,

@@ -77,9 +77,9 @@ kernel void kernel_dsv4_indexer_scores_tiled_f32(
         const uint comp = c0 + cc;
         float v = 0.0f;
         if (comp < args.n_comp) {
-            device const float *row = (device const float *)(index_comp +
+            device const half *row = (device const half *)(index_comp +   // indexer 缓存恒 f16
                 (uint64_t)comp * args.index_row_stride);
-            v = row[d];
+            v = float(row[d]);
         }
         ktg[i] = v;
     }
@@ -216,9 +216,9 @@ kernel void kernel_dsv4_indexer_scores_tiled(
         const uint comp = c0 + cc;
         half v = half(0.0f);
         if (comp < args.n_comp) {
-            device const float *row = (device const float *)(index_comp +
+            device const half *row = (device const half *)(index_comp +   // indexer 缓存恒 f16
                 (uint64_t)comp * args.index_row_stride);
-            v = half(row[d]);
+            v = row[d];
         }
         ktg[i] = v;
     }
@@ -359,9 +359,9 @@ kernel void kernel_dsv4_indexer_scores_nax(
         const uint comp = c0 + cc;
         half v = half(0.0f);
         if (comp < args.n_comp) {
-            device const float *krow = (device const float *)(index_comp +
+            device const half *krow = (device const half *)(index_comp +   // indexer 缓存恒 f16
                 (uint64_t)comp * args.index_row_stride);
-            v = half(krow[d]);
+            v = krow[d];
         }
         ktg[cc*D + d] = v;
     }
