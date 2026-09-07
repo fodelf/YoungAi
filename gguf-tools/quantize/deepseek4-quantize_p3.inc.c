@@ -235,6 +235,11 @@ typedef struct {
 } quant_policy;
 
 static bool is_attention_projection(const char *name) {
+    /* indexer 的 attn_q_b(blk.L.indexer.attn_q_b.weight)名字里也含 ".attn_q_b.weight", 但它属于
+     * 引擎的 f16 专线家族(装载 expect f16, 只认 Q2_K 影子): 2026-09-06 --attention-proj q8_0 把它
+     * 量成 q8_0 ⇒ "tensor blk.2.indexer.attn_q_b.weight has type q8_0, expected f16" 加载即死。
+     * 模版驱动的默认路(tmpl->type=f16)从没踩到, 显式旗标才露馅。indexer 归 --attention 档。 */
+    if (strstr(name, "indexer")) return false;
     return strstr(name, ".attn_kv.weight") || strstr(name, ".attn_q_a.weight") ||
            strstr(name, ".attn_q_b.weight") || strstr(name, ".attn_output_a.weight") ||
            strstr(name, ".attn_output_b.weight");

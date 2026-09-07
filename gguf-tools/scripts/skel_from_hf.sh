@@ -57,8 +57,11 @@ FREE=$(disk_free_gb "$(dirname "$OUT")")
     sleep 5; done ) & WD=$!
 trap 'kill $WD 2>/dev/null' EXIT
 
-LOG "阶段1: HF 原始 → 留洞骨架(专家不算不写, ${TH} 线程)"
-"$Q" --hf "$HF" --template "$TMPL" --out "$HOLE" --experts-hole --threads "$TH" --overwrite \
+LOG "阶段1: HF 原始 → 留洞骨架(专家不算不写, ${TH} 线程; 额外量化旗标: ${*:3})"
+# $3 起透传给量化器 = 骨架精度档(2026-09-05 骨架降字节战役): 不给 = 量化器默认(Q8 骨架, r30 同款);
+# 给 `--attention-proj q2_k --attention q2_k --shared q2_k --output q2_k --dense q2_k --embedding q2_k`
+# = allq2 同款全 Q2_K 骨架。精度档只在这一处决定, 合并/判决脚本不再各自猜。
+"$Q" --hf "$HF" --template "$TMPL" --out "$HOLE" --experts-hole --threads "$TH" --overwrite "${@:3}" \
     || { LOG "★留洞骨架失败★"; exit 3; }
 APP=$(file_apparent_bytes "$HOLE"); REAL=$(file_real_bytes "$HOLE")
 LOG "留洞文件 表观 $(awk -v v=$APP 'BEGIN{printf "%.1f GiB",v/2^30}') / 实占 $(awk -v v=$REAL 'BEGIN{printf "%.1f GiB",v/2^30}')"

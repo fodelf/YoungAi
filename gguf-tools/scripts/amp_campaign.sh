@@ -657,7 +657,7 @@ stage_champbf(){
       vq86h_noz) OUT="$D2/vq86h_noz";;
       champ86)   OUT="$D2/champ86";;    # 平权底座工作副本(原始 vq86h_noz 只读保全)
       champ86amp) OUT="$D2/champ86amp";;  # zlayer 反修完成态 ⇒ sweep 在它上面做
-      *)         OUT="$D2/dyn86/$V";;
+      *)  if [ -d "$D2/$V/layers" ]; then OUT="$D2/$V"; else OUT="$D2/dyn86/$V"; fi;;   # 09-06: 任意 vqhalf 工作区(champ86q2kamp 等)
     esac
     [ "$(ls "$OUT/layers"/dql_L*.bin 2>/dev/null | wc -l)" = 43 ] || DIE "层件不齐 $OUT/layers"
     [ -s "$D2/anchor_a_clean_s8192.bin" ] || DIE "校准锚缺"
