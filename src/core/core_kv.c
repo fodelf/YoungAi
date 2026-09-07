@@ -18,11 +18,11 @@ uint32_t ds4_default_raw_cap(uint32_t ctx_size) {
     return raw_cap;
 }
 
-/* CUDA 侧默认分块(2026-08-21): 原 dense/grouped 批 kernel 每个 warp 为自己那一行把整批
- * token 的激活重读一遍(340 token 的块 ≈ 12.9GB 流量, 权重才 11MB), 于是"一次灌完"是最慢
- * 的配置(42 t/s), 小块反而快。加了 token 分片 GEMM(激活按 tile 进 shared, 块内共用)之后
- * 大块重新变优: 实测 3800 token prompt chunk=128 119 / 256 **123** / 512 116 t/s。
- * 分片 kernel 与原路逐位一致(NLL 与 max|Δlogit| 均为 0 差)。Metal 侧保持原行为。 */
+/* 分块与后端无关(2026-09-06): CUDA 曾单独钉 256(08-21 那时 dense/grouped 批核每 warp 重读整批
+ * 激活, 小块反而快)。现在 CUDA 的 prefill 稠密 q4_K 与 VQ 专家都走"解成 f16 + cuBLAS GEMM"
+ * (cuda_q4k_gemm / cuda_vq_prefill), 每块有一笔固定成本(VQ 专家逐专家 dequant ≈3.5 s/块),
+ * 块越大摊得越薄: 256 块 ≈75 t/s, 4096 块 ≈800 t/s。--prefill-chunk 仍可覆盖(1M 上下文时
+ * 注意力暂存 2×comp_cap×块×4 B 会顶到 8.6 GB, 内存紧就降块)。 */
 /* 默认 prefill 分块上限: 影响批 prefill 的切分边界, 而批路路由本就不确定 —— 改它
  * 会改捕获轨迹的可复现性(见 memory 捕获铁律), 不是单纯的性能旋钮。 */
 #define DS4_PREFILL_CHUNK_DEFAULT 4096   /* 无 u 后缀: 与 int prompt_len 比较, 免 sign-compare */
@@ -34,8 +34,6 @@ uint32_t ds4_default_prefill_cap_for_prompt(int prompt_len) {
     if (req >= 0) {
         if (req == 0) return cap;
         cap = (uint32_t)req;
-    } else if (g_prefill_chunk_cuda > 0) {
-        cap = (uint32_t)g_prefill_chunk_cuda;
     } else if (prompt_len > DS4_PREFILL_CHUNK_DEFAULT) {
         cap = DS4_PREFILL_CHUNK_DEFAULT;
     }

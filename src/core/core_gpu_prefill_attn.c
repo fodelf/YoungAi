@@ -2,6 +2,19 @@
 /* EXCEPTION(>500行): 单函数 metal_graph_encode_layer_attention_batch_stages, 函数内拆分是后续工序(需真模型逐位闸) */
 #include "core_internal.h"
 #ifndef DS4_NO_GPU
+/* 小批 kv 入环(09-07): 解码同款 rope+fp8+环存三合一核逐 token 发(数值与单 token 解码同序), 大批/无 rope 段走原批存。
+ * 必须排在 spec 原始行快照之后(快照要的是入环前的旧行)。 */
+static bool batch_store_kv(ds4_gpu_graph *g, uint32_t il, uint32_t pos0, uint32_t n_tokens, bool fused, bool compressed,
+                           float freq_base, float freq_scale, float ext_factor, float attn_factor) {
+    if (!fused)
+        return ds4_gpu_store_raw_kv_batch_tensor(g->layer_raw_cache[il], g->batch_kv, g->raw_cap, pos0, n_tokens,
+                                                 DS4_N_HEAD_DIM) != 0;
+    return ds4_gpu_kv_rope_fp8_store_raw_batch_tensor(g->batch_kv, g->layer_raw_cache[il], g->raw_cap, pos0, n_tokens,
+                                                      DS4_N_HEAD_DIM, DS4_N_ROT, compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                                                      freq_base, freq_scale, ext_factor, attn_factor,
+                                                      DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
+}
+
 bool metal_graph_encode_layer_attention_batch_stages(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -41,6 +54,9 @@ bool metal_graph_encode_layer_attention_batch_stages(
     ds4_gpu_tensor *after_attn_hc_view = ds4_gpu_tensor_view(
             g->batch_after_attn_hc, 0, (uint64_t)n_tokens * hc_dim * sizeof(float));
     bool ok = hc_mix_view && hc_split_view && attn_cur_view && after_attn_hc_view;
+    const bool small_batch = n_tokens <= 8u;   /* 投机 verify 批: 核选择全按解码同款(同轨) */
+    /* 压缩器走解码攒行机制只给续接小批(verify); 从 0 起的短提示仍走批版 prefill(整块回放 + 余行入 state) */
+    const bool small_comp = small_batch && !zero_prefix;
     if (ok && (stages & DS4_ATTN_STAGE_PRE)) {
     if (ok) ok = ds4_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
                                                       g->batch_cur_hc,
@@ -55,6 +71,15 @@ bool metal_graph_encode_layer_attention_batch_stages(
                                              mix_hc,
                                              g->batch_flat_hc,
                                              n_tokens) != 0;
+    /* 小批(投机 verify ≤8 token, 09-07): hc 混合 + attn_norm 走解码同款融合核(wsn_fast), 与纯解码同序 ⇒ 同轨;
+     * 大批仍是分开的批核。 */
+    if (ok && small_batch) {
+        ok = ds4_gpu_hc_split_weighted_sum_norm_tensor(attn_cur_view, g->batch_attn_norm, hc_split_view, hc_mix_view,
+                                                         g->batch_cur_hc, model->map, model->size,
+                                                         layer->hc_attn_scale->abs_offset, layer->hc_attn_base->abs_offset,
+                                                         layer->attn_norm->abs_offset, DS4_N_EMBD, DS4_N_HC,
+                                                         DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS, DS4_RMS_EPS) != 0;
+    } else {
     if (ok) ok = ds4_gpu_hc_split_weighted_sum_tensor(attn_cur_view,
                                                         hc_split_view,
                                                         hc_mix_view,
@@ -76,6 +101,7 @@ bool metal_graph_encode_layer_attention_batch_stages(
                                                        DS4_N_EMBD,
                                                        n_tokens,
                                                        DS4_RMS_EPS) != 0;
+    }
     if (ok) ok = metal_graph_matmul_q8_0_named_tensor("attn_q_a",
                                                       il,
                                                       pos0,
@@ -118,12 +144,18 @@ bool metal_graph_encode_layer_attention_batch_stages(
                                                       q_dim,
                                                       g->batch_qr_norm,
                                                       n_tokens);
-    if (ok) ok = ds4_gpu_head_rms_norm_tensor(g->batch_q,
+    /* 小批: q 的 head_rms+rope 走解码的融合核(scale 折进旋转的序与单 token 同) */
+    const bool fused_q = small_batch && !(stages & DS4_ATTN_STAGE_NOROPE);
+    if (ok && fused_q) ok = ds4_gpu_head_rms_norm_rope_tail_tensor(g->batch_q, n_tokens, DS4_N_HEAD, DS4_N_HEAD_DIM,
+                                            DS4_N_ROT, pos0, compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0, false,
+                                            freq_base, freq_scale, ext_factor, attn_factor,
+                                            DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW, DS4_RMS_EPS) != 0;
+    if (ok && !fused_q) ok = ds4_gpu_head_rms_norm_tensor(g->batch_q,
                                                 n_tokens,
                                                 DS4_N_HEAD,
                                                 DS4_N_HEAD_DIM,
                                                 DS4_RMS_EPS) != 0;
-    if (ok && !(stages & DS4_ATTN_STAGE_NOROPE)) ok = ds4_gpu_rope_tail_tensor(g->batch_q,
+    if (ok && !fused_q && !(stages & DS4_ATTN_STAGE_NOROPE)) ok = ds4_gpu_rope_tail_tensor(g->batch_q,
                                             n_tokens,
                                             DS4_N_HEAD,
                                             DS4_N_HEAD_DIM,
@@ -137,7 +169,9 @@ bool metal_graph_encode_layer_attention_batch_stages(
                                             attn_factor,
                                             DS4_ROPE_YARN_BETA_FAST,
                                             DS4_ROPE_YARN_BETA_SLOW) != 0;
-    if (ok && !(stages & DS4_ATTN_STAGE_NOROPE)) ok = ds4_gpu_rope_tail_tensor(g->batch_kv,
+    /* 小批 kv: rope+fp8+环存三合一走解码同款核, 在 KV 段逐 token 发(须在 spec 原始行快照之后); 这里跳过分开的三发 */
+    const bool fused_kv = small_batch && !(stages & DS4_ATTN_STAGE_NOROPE) && DS4_N_HEAD_KV == 1;
+    if (ok && !fused_kv && !(stages & DS4_ATTN_STAGE_NOROPE)) ok = ds4_gpu_rope_tail_tensor(g->batch_kv,
                                             n_tokens,
                                             DS4_N_HEAD_KV,
                                             DS4_N_HEAD_DIM,
@@ -151,7 +185,7 @@ bool metal_graph_encode_layer_attention_batch_stages(
                                             attn_factor,
                                             DS4_ROPE_YARN_BETA_FAST,
                                             DS4_ROPE_YARN_BETA_SLOW) != 0;
-    if (ok && !(stages & DS4_ATTN_STAGE_NOROPE))
+    if (ok && !fused_kv && !(stages & DS4_ATTN_STAGE_NOROPE))
         ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(g->batch_kv,
                                                  n_tokens,
                                                  DS4_N_HEAD_DIM,
@@ -203,12 +237,10 @@ bool metal_graph_encode_layer_attention_batch_stages(
                                                                   n_raw);
         if (ok && g->spec_comp_capture)
             ok = metal_graph_spec_raw_snapshot(g, il, pos0, n_tokens);
-        if (ok) ok = ds4_gpu_store_raw_kv_batch_tensor(g->layer_raw_cache[il],
-                                                 g->batch_kv,
-                                                 g->raw_cap,
-                                                 pos0,
-                                                 n_tokens,
-                                                 DS4_N_HEAD_DIM) != 0;
+        if (ok && il == 0) eval_hdump_raw_rows(g->batch_kv, 97u, 0, n_tokens, n_tokens);   /* 入环前 f32 kv 行(L97) */
+        if (ok) ok = batch_store_kv(g, il, pos0, n_tokens, small_batch && !(stages & DS4_ATTN_STAGE_NOROPE) && DS4_N_HEAD_KV == 1,
+                                    compressed, freq_base, freq_scale, ext_factor, attn_factor);
+        if (ok && il == 0) eval_hdump_raw_rows(g->layer_raw_cache[il], 98u, pos0 % g->raw_cap, n_tokens, g->raw_cap);
         if (ok) {
             ok = ds4_gpu_attention_decode_raw_batch_heads_tensor(g->batch_heads,
                                                                    model->map,
@@ -235,7 +267,34 @@ bool metal_graph_encode_layer_attention_batch_stages(
             fprintf(stderr, "ds4: Metal layer-major prefill needs attention compressor weights\n");
             ok = false;
         }
-        if (ok) {
+        if (ok && small_comp) {
+            /* 小批(投机 verify, 09-07): 压缩器(attn + ratio-4 的 indexer)走解码同一套攒行机制 —— 每 token 把 attn_norm 行
+             * 推进 comp_x_ring, emit 位一次算攒下的行(含解码之前攒的). 此前批路每 token 自己投影自己 update, 解码攒在环里
+             * 的行永远进不了批的 state ⇒ 压缩行错(对拍钉在第 2 层注意力出口)。spec 捕获改存 attn_norm 行(16 KB/行)供快进重放。 */
+            for (uint32_t t = 0; ok && t < n_tokens; t++) {
+                const uint32_t pos = pos0 + t;
+                ds4_gpu_tensor *xrow = metal_graph_tensor_row_view(g->batch_attn_norm, t, DS4_N_EMBD);
+                ok = xrow != NULL;
+                if (ok && g->spec_comp_capture && t == 0 && g->spec_emit_t[il] >= (int8_t)1) {
+                    /* 回滚重放只需 emit 位之前的行(t < acc ≤ t_e): 一次拷 t_e 行(batch_attn_norm 行连续) */
+                    if (!g->spec_comp_rows_kv[il])
+                        g->spec_comp_rows_kv[il] = ds4_gpu_tensor_alloc(8ull * DS4_N_EMBD * sizeof(float));
+                    ok = g->spec_comp_rows_kv[il] &&
+                         ds4_gpu_tensor_copy(g->spec_comp_rows_kv[il], 0, g->batch_attn_norm, 0,
+                                             (uint64_t)g->spec_emit_t[il] * DS4_N_EMBD * sizeof(float)) != 0;
+                }
+                if (ok) ok = metal_graph_comp_push_row(g, il, ratio, pos, xrow);
+                if (xrow) ds4_gpu_tensor_free(xrow);
+                if (ok && ((pos + 1u) % ratio) == 0u) {
+                    ok = metal_graph_comp_emit_step(g, model, layer, il, ratio, compressed, freq_base, freq_scale,
+                                                    ext_factor, attn_factor);
+                    if (!ok) fprintf(stderr, "ds4: 小批压缩器 emit 失败 L%u pos %u\n", il, pos);
+                }
+                if (!ok) fprintf(stderr, "ds4: 小批压缩器 token %u(pos %u) L%u 失败\n", t, pos, il);
+                if (comp_counts) comp_counts[t] = (pos + 1u) / ratio;
+                if (index_counts) index_counts[t] = (pos + 1u) / ratio;
+            }
+        } else if (ok) {
             ok = ds4_gpu_matmul_f16_tensor(g->batch_comp_kv,
                                              model->map,
                                              model->size,
@@ -260,15 +319,14 @@ bool metal_graph_encode_layer_attention_batch_stages(
                 fprintf(stderr, "ds4: Metal layer-major compressed KV cache capacity exceeded at layer %u\n", il);
                 ok = false;
             }
-            if (ok && DS4_GPU_ATTN_COMP_CACHE_F16 && n_comp > g->attn_comp_stage_cap) {
+            if (ok && n_comp > g->attn_comp_stage_cap) {
                 fprintf(stderr, "ds4: Metal graph compressed KV staging capacity exceeded at layer %u\n", il);
                 ok = false;
             }
-            ds4_gpu_tensor *attn_comp_target = NULL;
+            /* 缓存 f16: 压缩器写 f32 暂存(行 0 起), 量化后提交转 f16 */
+            ds4_gpu_tensor *attn_comp_target = g->attn_comp_stage;
             if (ok) {
-                attn_comp_target = metal_graph_attn_comp_prefill_target(g, il, 0, n_comp);
-                ok = attn_comp_target != NULL &&
-                     ds4_gpu_compressor_prefill_tensor(attn_comp_target,
+                ok = ds4_gpu_compressor_prefill_tensor(attn_comp_target,
                                                          g->layer_attn_state_kv[il],
                                                          g->layer_attn_state_score[il],
                                                          g->batch_comp_kv,
@@ -318,8 +376,7 @@ bool metal_graph_encode_layer_attention_batch_stages(
                 if (n_comp != 0) {
                 }
             }
-            metal_graph_attn_comp_prefill_target_free(attn_comp_target);
-        } else {
+        } else if (!small_comp) {   /* 小批的压缩器已在上面按解码机制做完 */
             /* spec 捕获(update 前, 行未被就地处理): 本批压缩器输入行 */
             if (ok && g->spec_comp_capture && n_tokens <= 8u) {
                 const uint64_t rb = (uint64_t)n_tokens * comp_width * sizeof(float);
@@ -331,7 +388,7 @@ bool metal_graph_encode_layer_attention_batch_stages(
                      ds4_gpu_tensor_copy(g->spec_comp_rows_kv[il], 0, g->batch_comp_kv, 0, rb) != 0 &&
                      ds4_gpu_tensor_copy(g->spec_comp_rows_sc[il], 0, g->batch_comp_sc, 0, rb) != 0;
             }
-            const bool aligned_chunk = (pos0 % ratio) == 0u && (n_tokens % ratio) == 0u;
+            const bool aligned_chunk = (pos0 % ratio) == 0u && (n_tokens % ratio) == 0u && n_tokens > 8u;   /* 小批(投机 verify ≤8)走逐 token 增量更新 = 解码同轨(09-07); 整块回放的累加序不同 */
             if (aligned_chunk) {
                 const uint32_t comp_before = g->layer_n_comp[il];
                 const uint32_t comp_chunk = n_tokens / ratio;
@@ -339,13 +396,11 @@ bool metal_graph_encode_layer_attention_batch_stages(
                     fprintf(stderr, "ds4: Metal graph compressed KV cache capacity exceeded at layer %u\n", il);
                     ok = false;
                 }
-                if (ok && DS4_GPU_ATTN_COMP_CACHE_F16 && comp_chunk > g->attn_comp_stage_cap) {
+                if (ok && comp_chunk > g->attn_comp_stage_cap) {
                     fprintf(stderr, "ds4: Metal graph compressed KV staging capacity exceeded at layer %u\n", il);
                     ok = false;
                 }
-                ds4_gpu_tensor *attn_comp_target =
-                    ok ? metal_graph_attn_comp_prefill_target(g, il, comp_before, comp_chunk) : NULL;
-                if (ok && !attn_comp_target) ok = false;
+                ds4_gpu_tensor *attn_comp_target = g->attn_comp_stage;   /* 缓存 f16: 回放写 f32 暂存行 0 起 */
                 if (ok && ratio == 4) {
                     ok = ds4_gpu_compressor_prefill_ratio4_replay_tensor(
                             attn_comp_target,
@@ -424,7 +479,6 @@ bool metal_graph_encode_layer_attention_batch_stages(
                         }
                     }
                 }
-                metal_graph_attn_comp_prefill_target_free(attn_comp_target);
             } else {
                 for (uint32_t t = 0; ok && t < n_tokens; t++) {
                     const uint32_t pos = pos0 + t;
@@ -442,7 +496,7 @@ bool metal_graph_encode_layer_attention_batch_stages(
                                                             sc_view,
                                                             g->layer_attn_state_kv[il],
                                                             g->layer_attn_state_score[il],
-                                                            metal_graph_attn_comp_update_target(g, il),
+                                                            g->attn_comp_stage,   /* 缓存 f16: 先写 f32 暂存行 0 */
                                                             model->map,
                                                             model->size,
                                                             layer->attn_compressor_ape->abs_offset,
@@ -452,7 +506,7 @@ bool metal_graph_encode_layer_attention_batch_stages(
                                                             DS4_N_HEAD_DIM,
                                                             ratio,
                                                             pos,
-                                                            metal_graph_attn_comp_update_row(comp_row),
+                                                            0u,
                                                             DS4_N_ROT,
                                                             compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
                                                             freq_base,
@@ -463,7 +517,8 @@ bool metal_graph_encode_layer_attention_batch_stages(
                                                             DS4_ROPE_YARN_BETA_SLOW,
                                                             DS4_RMS_EPS) != 0;
                     if (ok && emit) {
-                        ds4_gpu_tensor *comp_row_view = metal_graph_attn_comp_row_view(g, il, comp_row);
+                        ds4_gpu_tensor *comp_row_view = ds4_gpu_tensor_view(g->attn_comp_stage, 0,
+                                                                            (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
                         ok = comp_row_view &&
                              ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_row_view,
                                                                    1,
@@ -482,6 +537,20 @@ bool metal_graph_encode_layer_attention_batch_stages(
             n_comp = g->layer_n_comp[il];
         }
 
+        /* ★小批与解码同规(09-07, 链 31 定罪)★: 解码的稀疏选择门槛 = n_comp > 1024(decode_util) 且 n_index_comp > TOP_K, 逐 token
+         * 用该 token emit 之后的计数判; 批路原来是 n_comp > 512 ⇒ 2.5K 上下文 (512, 1024] 区间一路选 top-512 一路全扫, spec/plain
+         * 分叉。批内跨门槛(每会话各一次)的那轮两种都算, 按 token 拼行。 */
+        uint8_t small_ix_tok[8] = {0};
+        bool small_ix_any = false, small_ix_all = false;
+        if (small_batch && ratio == 4 && comp_counts && index_counts) {
+            const uint32_t thr = metal_graph_decode_indexer_sparse_threshold(g);
+            small_ix_all = true;
+            for (uint32_t t = 0; t < n_tokens; t++) {
+                small_ix_tok[t] = (comp_counts[t] > thr && index_counts[t] > DS4_N_INDEXER_TOP_K) ? 1u : 0u;
+                small_ix_any = small_ix_any || small_ix_tok[t];
+                small_ix_all = small_ix_all && small_ix_tok[t];
+            }
+        }
         if (ok && ratio == 4) {
             const uint32_t index_width = coff * DS4_N_INDEXER_HEAD_DIM;
             if (!layer->indexer_compressor_kv || !layer->indexer_compressor_gate ||
@@ -490,7 +559,7 @@ bool metal_graph_encode_layer_attention_batch_stages(
                 fprintf(stderr, "ds4: Metal layer-major prefill needs indexer weights\n");
                 ok = false;
             }
-            if (ok) {
+            if (ok && !small_comp) {   /* 小批的 indexer 压缩器已随 attn 压缩器在 emit 步里算完 */
                 ok = ds4_gpu_matmul_f16_tensor(g->batch_comp_kv,
                                                  model->map,
                                                  model->size,
@@ -508,7 +577,10 @@ bool metal_graph_encode_layer_attention_batch_stages(
                                                          g->batch_attn_norm,
                                                          n_tokens) != 0;
             }
-            if (ok) ok = ds4_gpu_matmul_f16_tensor(g->batch_indexer_q,
+            /* 小批(09-07): indexer q/权重只有消费端会用, 短上下文无条件算是每轮 2.3 ms 白扔; 消费端规则 = 解码逐 token 同规
+             * (small_ix_tok, 见下文注意力处), 任一 token 要选就算。 */
+            const bool indexer_used = !small_batch || small_ix_any;
+            if (ok && indexer_used) ok = ds4_gpu_matmul_f16_tensor(g->batch_indexer_q,
                                                      model->map,
                                                      model->size,
                                                      layer->indexer_attn_q_b->abs_offset,
@@ -516,7 +588,7 @@ bool metal_graph_encode_layer_attention_batch_stages(
                                                      (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM,
                                                      g->batch_qr_norm,
                                                      n_tokens) != 0;
-            if (ok) ok = ds4_gpu_rope_tail_tensor(g->batch_indexer_q,
+            if (ok && indexer_used) ok = ds4_gpu_rope_tail_tensor(g->batch_indexer_q,
                                                     n_tokens,
                                                     DS4_N_INDEXER_HEAD,
                                                     DS4_N_INDEXER_HEAD_DIM,
@@ -530,10 +602,10 @@ bool metal_graph_encode_layer_attention_batch_stages(
                                                     attn_factor,
                                                     DS4_ROPE_YARN_BETA_FAST,
                                                     DS4_ROPE_YARN_BETA_SLOW) != 0;
-            if (ok) ok = ds4_gpu_dsv4_indexer_qat_tensor(g->batch_indexer_q,
+            if (ok && indexer_used) ok = ds4_gpu_dsv4_indexer_qat_tensor(g->batch_indexer_q,
                                                           n_tokens * DS4_N_INDEXER_HEAD,
                                                           DS4_N_INDEXER_HEAD_DIM) != 0;
-            if (ok) ok = ds4_gpu_matmul_f16_tensor(g->batch_indexer_weights,
+            if (ok && indexer_used) ok = ds4_gpu_matmul_f16_tensor(g->batch_indexer_weights,
                                                      model->map,
                                                      model->size,
                                                      layer->indexer_proj->abs_offset,
@@ -546,8 +618,10 @@ bool metal_graph_encode_layer_attention_batch_stages(
                     fprintf(stderr, "ds4: Metal layer-major indexer cache capacity exceeded at layer %u\n", il);
                     ok = false;
                 }
+                /* indexer 缓存 f16: 先写 f32 暂存(QAT 也在暂存上做), 再提交转 f16 */
+                ds4_gpu_tensor *index_target = g->attn_comp_stage;
                 if (ok) {
-                    ok = ds4_gpu_compressor_prefill_tensor(g->layer_index_comp_cache[il],
+                    ok = ds4_gpu_compressor_prefill_tensor(index_target,
                                                              g->layer_index_state_kv[il],
                                                              g->layer_index_state_score[il],
                                                              g->batch_comp_kv,
@@ -574,10 +648,11 @@ bool metal_graph_encode_layer_attention_batch_stages(
                                                              DS4_RMS_EPS) != 0;
                 }
                 if (ok && n_comp != 0) {
-                    ok = ds4_gpu_dsv4_indexer_qat_tensor(g->layer_index_comp_cache[il],
+                    ok = ds4_gpu_dsv4_indexer_qat_tensor(index_target,
                                                           n_comp,
                                                           DS4_N_INDEXER_HEAD_DIM) != 0;
                 }
+                if (ok && n_comp != 0) ok = metal_graph_commit_index_comp_stage(g, il, 0, n_comp);
                 if (ok) {
                     ok = metal_graph_refresh_ratio4_compressor_state(g,
                                                                      model,
@@ -599,8 +674,8 @@ bool metal_graph_encode_layer_attention_batch_stages(
                     if (n_comp != 0) {
                     }
                 }
-            } else {
-                const bool aligned_chunk = (pos0 % ratio) == 0u && (n_tokens % ratio) == 0u;
+            } else if (!small_comp) {
+                const bool aligned_chunk = (pos0 % ratio) == 0u && (n_tokens % ratio) == 0u && n_tokens > 8u;   /* 小批(投机 verify ≤8)走逐 token 增量更新 = 解码同轨(09-07); 整块回放的累加序不同 */
                 if (aligned_chunk) {
                     const uint32_t index_before = g->layer_n_index_comp[il];
                     const uint32_t index_chunk = n_tokens / ratio;
@@ -608,14 +683,8 @@ bool metal_graph_encode_layer_attention_batch_stages(
                         fprintf(stderr, "ds4: Metal graph indexer compressed KV cache capacity exceeded at layer %u\n", il);
                         ok = false;
                     }
-                    ds4_gpu_tensor *index_view = NULL;
-                    if (ok) {
-                        index_view = ds4_gpu_tensor_view(
-                                g->layer_index_comp_cache[il],
-                                (uint64_t)index_before * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
-                                (uint64_t)index_chunk * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
-                        ok = index_view != NULL;
-                    }
+                    /* indexer 缓存 f16: 回放写进 f32 暂存(行 0 起), QAT 后提交转 f16 */
+                    ds4_gpu_tensor *index_view = g->attn_comp_stage;
                     if (ok) {
                         ok = ds4_gpu_compressor_prefill_ratio4_replay_tensor(
                                 index_view,
@@ -648,6 +717,7 @@ bool metal_graph_encode_layer_attention_batch_stages(
                                                               index_chunk,
                                                               DS4_N_INDEXER_HEAD_DIM) != 0;
                     }
+                    if (ok && index_chunk != 0) ok = metal_graph_commit_index_comp_stage(g, il, index_before, index_chunk);
                     if (ok) {
                         ok = metal_graph_refresh_ratio4_compressor_state(g,
                                                                          model,
@@ -669,7 +739,6 @@ bool metal_graph_encode_layer_attention_batch_stages(
                             }
                         }
                     }
-                    ds4_gpu_tensor_free(index_view);
                 } else {
                     /* spec 捕获(update 前): indexer 压缩器输入行 */
                     if (ok && g->spec_comp_capture && n_tokens <= 8u) {
@@ -698,7 +767,7 @@ bool metal_graph_encode_layer_attention_batch_stages(
                                                                 sc_view,
                                                                 g->layer_index_state_kv[il],
                                                                 g->layer_index_state_score[il],
-                                                                g->layer_index_comp_cache[il],
+                                                                g->attn_comp_stage,   /* f16 缓存: 先写 f32 暂存行 0 */
                                                                 model->map,
                                                                 model->size,
                                                                 layer->indexer_compressor_ape->abs_offset,
@@ -708,7 +777,7 @@ bool metal_graph_encode_layer_attention_batch_stages(
                                                                 DS4_N_INDEXER_HEAD_DIM,
                                                                 ratio,
                                                                 pos,
-                                                                index_row,
+                                                                0u,
                                                                 DS4_N_ROT,
                                                                 compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
                                                                 freq_base,
@@ -720,8 +789,7 @@ bool metal_graph_encode_layer_attention_batch_stages(
                                                                 DS4_RMS_EPS) != 0;
                         if (ok && emit) {
                             ds4_gpu_tensor *index_row_view = ds4_gpu_tensor_view(
-                                    g->layer_index_comp_cache[il],
-                                    (uint64_t)index_row * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                                    g->attn_comp_stage, 0,
                                     (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float));
                             if (!index_row_view) {
                                 ok = false;
@@ -731,6 +799,7 @@ bool metal_graph_encode_layer_attention_batch_stages(
                                                                       DS4_N_INDEXER_HEAD_DIM) != 0;
                                 ds4_gpu_tensor_free(index_row_view);
                             }
+                            if (ok) ok = metal_graph_commit_index_comp_stage(g, il, index_row, 1);
                         }
                         if (ok && emit) g->layer_n_index_comp[il]++;
                         if (index_counts) index_counts[t] = g->layer_n_index_comp[il];
@@ -754,13 +823,10 @@ bool metal_graph_encode_layer_attention_batch_stages(
 
             if (ok && g->spec_comp_capture)
                 ok = metal_graph_spec_raw_snapshot(g, il, pos0, n_tokens);
-            if (ok) ok = ds4_gpu_store_raw_kv_batch_tensor(g->layer_raw_cache[il],
-                                                     g->batch_kv,
-                                                     g->raw_cap,
-                                                     pos0,
-                                                     n_tokens,
-                                                     DS4_N_HEAD_DIM) != 0;
-            if (ok && ratio == 4 && n_comp > DS4_N_INDEXER_TOP_K) {
+            if (ok) ok = batch_store_kv(g, il, pos0, n_tokens, small_batch && !(stages & DS4_ATTN_STAGE_NOROPE) && DS4_N_HEAD_KV == 1,
+                                    compressed, freq_base, freq_scale, ext_factor, attn_factor);
+            const bool want_indexed = small_batch ? small_ix_any : (ratio == 4 && n_comp > DS4_N_INDEXER_TOP_K);
+            if (ok && ratio == 4 && want_indexed) {
                 const float index_scale = 1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
                 ok = ds4_gpu_indexer_scores_decode_batch_tensor(g->indexer_scores,
                                                                   g->batch_indexer_q,
@@ -783,7 +849,7 @@ bool metal_graph_encode_layer_attention_batch_stages(
                 if (ok) {
                     use_indexed_comp = true;
                 }
-                use_comp_mask = 1;
+                use_comp_mask = small_batch ? 0u : 1u;   /* 解码稠密路无 mask; 小批同规 */
             }
             if (ok) {
                 if (use_indexed_comp) {
@@ -794,7 +860,6 @@ bool metal_graph_encode_layer_attention_batch_stages(
                                                                               g->batch_q,
                                                                               g->layer_raw_cache[il],
                                                                               g->layer_attn_comp_cache[il],
-                                                                              metal_graph_attn_comp_cache_is_f16(),
                                                                               g->comp_selected,
                                                                               n_tokens,
                                                                               pos0,
@@ -807,6 +872,19 @@ bool metal_graph_encode_layer_attention_batch_stages(
                                                                               ratio,
                                                                               DS4_N_HEAD,
                                                                               DS4_N_HEAD_DIM) != 0;
+                    if (ok && small_batch && !small_ix_all) {
+                        /* 跨门槛轮: 稠密再算一遍到暂存, 把不选 top-k 的 token 行拷回(每会话两次, 各 ~50 µs) */
+                        const uint64_t rowb = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(float);
+                        if (!g->spec_heads_alt) g->spec_heads_alt = ds4_gpu_tensor_alloc(8ull * rowb);
+                        ok = g->spec_heads_alt &&
+                             ds4_gpu_attention_decode_mixed_batch_heads_tensor(g->spec_heads_alt, model->map, model->size,
+                                     layer->attn_sinks->abs_offset, g->batch_q, g->layer_raw_cache[il], g->layer_attn_comp_cache[il],
+                                     NULL, 0u, n_tokens, pos0, n_raw, g->raw_cap, raw_start, n_comp, g->raw_window, ratio,
+                                     DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
+                        for (uint32_t t = 0; ok && t < n_tokens; t++)
+                            if (!small_ix_tok[t])
+                                ok = ds4_gpu_tensor_copy(g->batch_heads, (uint64_t)t * rowb, g->spec_heads_alt, (uint64_t)t * rowb, rowb) != 0;
+                    }
                 } else {
                     ok = ds4_gpu_attention_decode_mixed_batch_heads_tensor(g->batch_heads,
                                                                              model->map,
@@ -815,7 +893,6 @@ bool metal_graph_encode_layer_attention_batch_stages(
                                                                              g->batch_q,
                                                                              g->layer_raw_cache[il],
                                                                              g->layer_attn_comp_cache[il],
-                                                                             metal_graph_attn_comp_cache_is_f16(),
                                                                              use_comp_mask ? g->comp_mask : NULL,
                                                                              use_comp_mask,
                                                                              n_tokens,
@@ -861,7 +938,6 @@ bool metal_graph_encode_layer_attention_batch_stages(
                                                                           g->batch_q,
                                                                           g->layer_raw_cache[il],
                                                                           g->layer_attn_comp_cache[il],
-                                                                          metal_graph_attn_comp_cache_is_f16(),
                                                                           g->comp_selected,
                                                                           n_tokens,
                                                                           pos0,
@@ -885,7 +961,6 @@ bool metal_graph_encode_layer_attention_batch_stages(
                                                                        g->batch_q,
                                                                        g->batch_kv,
                                                                        g->layer_attn_comp_cache[il],
-                                                                       metal_graph_attn_comp_cache_is_f16(),
                                                                        n_tokens,
                                                                        n_comp,
                                                                        g->raw_window,
@@ -980,7 +1055,6 @@ bool metal_graph_encode_layer_attention_batch_stages(
                                                                               q_view,
                                                                               g->layer_raw_cache[il],
                                                                               g->layer_attn_comp_cache[il],
-                                                                              metal_graph_attn_comp_cache_is_f16(),
                                                                               g->comp_selected,
                                                                               1,
                                                                               pos,
@@ -1004,7 +1078,6 @@ bool metal_graph_encode_layer_attention_batch_stages(
                                                                  g->raw_cap,
                                                                  raw_start,
                                                                  cur_comp ? g->layer_attn_comp_cache[il] : NULL,
-                                                                 metal_graph_attn_comp_cache_is_f16(),
                                                                  cur_comp,
                                                                  comp_mask,
                                                                  n_selected,

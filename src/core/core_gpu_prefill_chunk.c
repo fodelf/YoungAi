@@ -18,6 +18,9 @@ bool metal_graph_prefill_chunked_range(
     if (n_tokens == 0 || g->prefill_cap == 0) return false;
     if (start > (uint32_t)prompt->len) return false;
     if (n_tokens > (uint32_t)prompt->len - start) return false;
+    /* 续接 prefill(core_session_sync 扩 checkpoint = 多轮第二轮)从真实计数器起步: 上一 decode token 末尾的
+     * 预捕获把压缩器计数器多推了一步(09-07 定罪, 见 core_gpu_graph.h pend_pos)。 */
+    metal_graph_token_pending_discard(g);
 
     uint32_t chunk_cap = g->prefill_cap;
     if (start != 0 && chunk_cap > g->raw_cap) chunk_cap = g->raw_cap;
@@ -164,13 +167,11 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size
             const uint32_t ratio = ds4_layer_compress_ratio(il);
             if (ratio == 0) continue;
             const uint32_t layer_comp_cap = ds4_comp_cap_for(ctx, ratio);
-            m.compressed_bytes += (uint64_t)layer_comp_cap *
-                                  DS4_N_HEAD_DIM *
-                                  (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
+            m.compressed_bytes += (uint64_t)layer_comp_cap * DS4_GPU_COMP_ROW_BYTES;   /* 行格式见 ds4_gpu_core.h */
             if (ratio == 4) {
                 m.compressed_bytes += (uint64_t)layer_comp_cap *
                                       DS4_N_INDEXER_HEAD_DIM *
-                                      sizeof(float);
+                                      sizeof(uint16_t);   /* indexer 缓存恒 f16 */
             }
         }
         const uint64_t attn_stage_cap = ds4_comp_cap_for(m.prefill_cap, min_ratio);

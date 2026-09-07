@@ -107,6 +107,7 @@ bool metal_graph_encode_decode_layer(
     {   /* G1b 三合一(2026-08-20 megakernel 施工): rope(kv)+fp8+store 一发(CUDA 真核;
          * rope 作用 rot 尾段/fp8 作用 nope 前段不相交, fp8 64线程树逐位照抄)。
          * n_head_kv≠1 走原三发。 */
+        if (ok && il == 0) eval_hdump_raw_rows(g->kv, 97u, 0, 1, 1);   /* 入环前 f32 kv 行(L97) */
         if (DS4_N_HEAD_KV == 1) {
             if (ok) ok = ds4_gpu_kv_rope_fp8_store_raw_tensor(g->kv, raw_cache, raw_cap, raw_row,
                                             DS4_N_HEAD_DIM, DS4_N_ROT, pos,
@@ -122,6 +123,7 @@ bool metal_graph_encode_decode_layer(
             if (ok) ok = metal_graph_decode_kv_store(g->kv, raw_cache, raw_cap, raw_row);
         }
     }
+    if (ok && il == 0) eval_hdump_raw_rows(raw_cache, 98u, raw_row, 1, raw_cap);
 
     uint32_t n_comp = 0;
     int comp_side = 0;   /* 非 emit token: comp 链发侧流与 indexer/attention 并发 */
@@ -152,34 +154,20 @@ bool metal_graph_encode_decode_layer(
          * decode 吞吐零收益, 且与主流 indexer 链存在未根除的数据竞争 —— 温 0 长生成
          * (n=256)每 run 输出漂移, 关闭后逐字节可复现。侧流机制保留给 shared expert
          * 段(已验证确定且无竞争)。 */
-        comp_side = 0; (void)emit;
-        if (ok) {
-            ok = ds4_gpu_matmul_f16_pair_tensor(g->comp_kv_side,
-                                                  g->comp_sc_side,
-                                                  model->map,
-                                                  model->size,
-                                                  layer->attn_compressor_kv->abs_offset,
-                                                  layer->attn_compressor_gate->abs_offset,
-                                                  DS4_N_EMBD,
-                                                  comp_width,
-                                                  g->attn_norm,
-                                                  1) != 0;
-        } else {
-            if (ok) ok = ds4_gpu_matmul_f16_tensor(g->comp_kv_side, model->map, model->size,
-                                                     layer->attn_compressor_kv->abs_offset,
-                                                     DS4_N_EMBD, comp_width,
-                                                     g->attn_norm, 1) != 0;
-            if (ok) ok = ds4_gpu_matmul_f16_tensor(g->comp_sc_side, model->map, model->size,
-                                                     layer->attn_compressor_gate->abs_offset,
-                                                     DS4_N_EMBD, comp_width,
-                                                     g->attn_norm, 1) != 0;
-        }
+        comp_side = 0;
+        /* 攒批(2026-09-05, core_gpu_decode_comp.c): 每 token 只把 x 行推进环; emit 位一次算攒下的
+         * n 行投影再入 state+池化。非 emit token 不再读压缩器权重(每 token 省 609 MB f16 读)。 */
+        if (ok) ok = metal_graph_comp_push(g, il, ratio, pos);
         const uint32_t comp_row = g->layer_n_comp[il];
-        if (ok) ok = ds4_gpu_compressor_update_tensor(g->comp_kv_side,
-                                                        g->comp_sc_side,
+        uint32_t n_pend = 0, pos0 = 0;
+        if (ok && emit) ok = metal_graph_comp_project_pending(g, model, layer->attn_compressor_kv,
+                                                              layer->attn_compressor_gate, il, ratio,
+                                                              comp_width, &n_pend, &pos0);
+        if (ok && emit) ok = ds4_gpu_compressor_update_batch_tensor(g->comp_kv_batch,
+                                                        g->comp_sc_batch,
                                                         g->layer_attn_state_kv[il],
                                                         g->layer_attn_state_score[il],
-                                                        metal_graph_attn_comp_update_target(g, il),
+                                                        g->attn_comp_stage,   /* 缓存 f16: 先写 f32 暂存行 0 */
                                                         model->map,
                                                         model->size,
                                                         layer->attn_compressor_ape->abs_offset,
@@ -188,8 +176,8 @@ bool metal_graph_encode_decode_layer(
                                                         layer->attn_compressor_norm->type,
                                                         DS4_N_HEAD_DIM,
                                                         ratio,
-                                                        pos,
-                                                        metal_graph_attn_comp_update_row(comp_row),
+                                                        pos0, n_pend,
+                                                        0u,
                                                         DS4_N_ROT,
                                                         compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
                                                         freq_base,
@@ -201,7 +189,8 @@ bool metal_graph_encode_decode_layer(
                                                         DS4_RMS_EPS) != 0;
         if (comp_side) (void)ds4_gpu_side_main();   /* comp 链留侧流, 主流继续 indexer */
         if (ok && emit) {
-            ds4_gpu_tensor *comp_row_view = metal_graph_attn_comp_row_view(g, il, comp_row);
+            ds4_gpu_tensor *comp_row_view = ds4_gpu_tensor_view(g->attn_comp_stage, 0,
+                                                                (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
             if (!comp_row_view) {
                 ok = false;
             } else {
@@ -211,6 +200,7 @@ bool metal_graph_encode_decode_layer(
             if (ok) ok = metal_graph_commit_attn_comp_stage(g, il, comp_row, 1);
         }
         if (ok && emit) g->layer_n_comp[il]++;
+        if (ok && emit && ratio != 4u) g->comp_x_pending[il] = 0;   /* ratio-4 层等 indexer 压缩器也算完再清 */
 
         if (ok && ratio == 4) {
             const uint32_t index_width = coff * DS4_N_INDEXER_HEAD_DIM;
@@ -229,33 +219,16 @@ bool metal_graph_encode_decode_layer(
                 fprintf(stderr, "ds4: Metal graph indexer compressed KV cache capacity exceeded at layer %u\n", il);
                 ok = false;
             }
-            if (ok) {
-                ok = ds4_gpu_matmul_f16_pair_tensor(g->comp_kv_cur,
-                                                      g->comp_sc_cur,
-                                                      model->map,
-                                                      model->size,
-                                                      layer->indexer_compressor_kv->abs_offset,
-                                                      layer->indexer_compressor_gate->abs_offset,
-                                                      DS4_N_EMBD,
-                                                      index_width,
-                                                      g->attn_norm,
-                                                      1) != 0;
-            } else {
-                if (ok) ok = ds4_gpu_matmul_f16_tensor(g->comp_kv_cur, model->map, model->size,
-                                                         layer->indexer_compressor_kv->abs_offset,
-                                                         DS4_N_EMBD, index_width,
-                                                         g->attn_norm, 1) != 0;
-                if (ok) ok = ds4_gpu_matmul_f16_tensor(g->comp_sc_cur, model->map, model->size,
-                                                         layer->indexer_compressor_gate->abs_offset,
-                                                         DS4_N_EMBD, index_width,
-                                                         g->attn_norm, 1) != 0;
-            }
             const uint32_t index_row = g->layer_n_index_comp[il];
-            if (ok) ok = ds4_gpu_compressor_update_tensor(g->comp_kv_cur,
-                                                            g->comp_sc_cur,
+            /* indexer 压缩器同环攒批(x 同为 attn_norm), emit 位与 attn 压缩器一起算 */
+            if (ok && emit) ok = metal_graph_comp_project_pending(g, model, layer->indexer_compressor_kv,
+                                                                  layer->indexer_compressor_gate, il, ratio,
+                                                                  index_width, &n_pend, &pos0);
+            if (ok && emit) ok = ds4_gpu_compressor_update_batch_tensor(g->comp_kv_batch,
+                                                            g->comp_sc_batch,
                                                             g->layer_index_state_kv[il],
                                                             g->layer_index_state_score[il],
-                                                            g->layer_index_comp_cache[il],
+                                                            g->attn_comp_stage,   /* indexer 缓存 f16: 先写 f32 暂存行 0 */
                                                             model->map,
                                                             model->size,
                                                             layer->indexer_compressor_ape->abs_offset,
@@ -264,8 +237,8 @@ bool metal_graph_encode_decode_layer(
                                                             layer->indexer_compressor_norm->type,
                                                             DS4_N_INDEXER_HEAD_DIM,
                                                             ratio,
-                                                            pos,
-                                                            index_row,
+                                                            pos0, n_pend,
+                                                            0u,
                                                             DS4_N_ROT,
                                                             compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
                                                             freq_base,
@@ -277,8 +250,7 @@ bool metal_graph_encode_decode_layer(
                                                             DS4_RMS_EPS) != 0;
             if (ok && emit) {
                 ds4_gpu_tensor *index_row_view = ds4_gpu_tensor_view(
-                        g->layer_index_comp_cache[il],
-                        (uint64_t)index_row * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                        g->attn_comp_stage, 0,
                         (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float));
                 if (!index_row_view) {
                     ok = false;
@@ -288,8 +260,10 @@ bool metal_graph_encode_decode_layer(
                                                           DS4_N_INDEXER_HEAD_DIM) != 0;
                     ds4_gpu_tensor_free(index_row_view);
                 }
+                if (ok) ok = metal_graph_commit_index_comp_stage(g, il, index_row, 1);   /* f16 缓存: 暂存行 → 缓存 */
             }
             if (ok && emit) g->layer_n_index_comp[il]++;
+            if (ok && emit) g->comp_x_pending[il] = 0;   /* 本块攒的行已全部入两份 state */
             const uint32_t decode_sparse_threshold =
                 metal_graph_decode_indexer_sparse_threshold(g);
             if (ok &&
@@ -405,7 +379,6 @@ bool metal_graph_encode_decode_layer(
                     g->q,
                     raw_cache,
                     g->layer_attn_comp_cache[il],
-                    metal_graph_attn_comp_cache_is_f16(),
                     comp_selected,
                     1,
                     pos,
@@ -426,7 +399,6 @@ bool metal_graph_encode_decode_layer(
                                                          raw_cap,
                                                          raw_start,
                                                          n_comp ? comp_cache : NULL,
-                                                         metal_graph_attn_comp_cache_is_f16(),
                                                          n_comp,
                                                          NULL,
                                                          0,
@@ -524,6 +496,14 @@ bool metal_graph_encode_decode_layer(
         ok = ds4_gpu_hc_expand_tensor(g->after_attn_hc, g->attn_out, g->cur_hc,
                                         g->hc_post, g->hc_comb, DS4_N_EMBD, DS4_N_HC) != 0;
     }
+#ifdef DS4_STATE_DUMP
+    /* 诊断快照(层 0 内四个点, D2D 异步拷贝): pt0=注意力块后 hc */
+    {   extern ds4_gpu_tensor *g_sd_pt[8];
+        if (ok && il == 0u && g_sd_pt[0])
+            (void)ds4_gpu_tensor_copy(g_sd_pt[0], 0, g->after_attn_hc, 0, (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float));
+    }
+#endif
+    if (ok) eval_hdump_tensor_rows(g->after_attn_hc, 50u + il, 1);   /* --eval-hdump: 注意力块出口 hc 记为 L50+il */
     if (ok) ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->after_attn_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
     if (ok) ok = metal_graph_matmul_plain_tensor(g->hc_mix, model, layer->hc_ffn_fn,
                                                  hc_dim, mix_hc, g->flat_hc, 1);
@@ -734,7 +714,19 @@ bool metal_graph_encode_decode_layer(
                                      (uint64_t)DS4_N_EMBD * sizeof(float)) != 0)
                 anc_zx = g_ampanc.xbuf[il];
         }
+#ifdef DS4_STATE_DUMP
+        {   extern ds4_gpu_tensor *g_sd_pt[8];   /* pt1=路由专家输出(链前) */
+            if (ok && il == 0u && g_sd_pt[1])
+                (void)ds4_gpu_tensor_copy(g_sd_pt[1], 0, g->routed_out, 0, (uint64_t)DS4_N_EMBD * sizeof(float));
+        }
+#endif
         ok = ds4_gpu_zchain_scale_routed(g->routed_out, anc_zx, il, 1) != 0;
+#ifdef DS4_STATE_DUMP
+        {   extern ds4_gpu_tensor *g_sd_pt[8];   /* pt2=链后 */
+            if (ok && il == 0u && g_sd_pt[2])
+                (void)ds4_gpu_tensor_copy(g_sd_pt[2], 0, g->routed_out, 0, (uint64_t)DS4_N_EMBD * sizeof(float));
+        }
+#endif
     }
     /* go1b correction: add the low-rank per-expert residual onto the (now full)
      * routed MoE output. Placed after the TP all-reduce so routed_out is complete
@@ -841,6 +833,12 @@ bool metal_graph_encode_decode_layer(
         ok = metal_graph_ensure_ffn_out(g) &&
              ds4_gpu_add_tensor(g->ffn_out, g->shared_out, g->routed_out, DS4_N_EMBD) != 0;
     }
+#ifdef DS4_STATE_DUMP
+    {   extern ds4_gpu_tensor *g_sd_pt[8];   /* pt3=共享专家输出 pt4=路由专家终值 */
+        if (ok && il == 0u && g_sd_pt[3]) (void)ds4_gpu_tensor_copy(g_sd_pt[3], 0, g->shared_out, 0, (uint64_t)DS4_N_EMBD * sizeof(float));
+        if (ok && il == 0u && g_sd_pt[4]) (void)ds4_gpu_tensor_copy(g_sd_pt[4], 0, g->routed_out, 0, (uint64_t)DS4_N_EMBD * sizeof(float));
+    }
+#endif
     if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
         ok = metal_graph_apply_directional_steering_ffn(g, g->ffn_out, il, 1);
     }

@@ -47,6 +47,7 @@ int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
         payload_set_err(err, errlen, "invalid session layer payload save");
         return 1;
     }
+    metal_graph_token_pending_discard(&s->graph);   /* 计数器真实态(见 ds4_session_save_payload) */
     if (ds4_session_is_cpu(s)) {
         payload_set_err(err, errlen, "distributed layer payloads require the graph backend");
         return 1;
@@ -106,25 +107,8 @@ int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
         }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (rc != 0 || ratio == 0) continue;
-        if (DS4_GPU_ATTN_COMP_CACHE_F16) {
-            rc = payload_write_tensor_span_f16_as_f32(fp,
-                                                      g->layer_attn_comp_cache[il],
-                                                      0,
-                                                      (uint64_t)g->layer_n_comp[il] * DS4_N_HEAD_DIM,
-                                                      buf,
-                                                      DS4_SESSION_IO_CHUNK,
-                                                      err,
-                                                      errlen);
-        } else {
-            rc = payload_write_tensor_span(fp,
-                                           g->layer_attn_comp_cache[il],
-                                           0,
-                                           (uint64_t)g->layer_n_comp[il] * DS4_N_HEAD_DIM * sizeof(float),
-                                           buf,
-                                           DS4_SESSION_IO_CHUNK,
-                                           err,
-                                           errlen);
-        }
+        rc = payload_write_comp_rows_as_f32(fp, g->layer_attn_comp_cache[il], g->layer_n_comp[il],   /* 外部格式仍 f32 */
+                                            buf, DS4_SESSION_IO_CHUNK, err, errlen);
         if (rc == 0) rc = payload_write_tensor_span(fp,
                                                     g->layer_attn_state_kv[il],
                                                     0,
@@ -142,14 +126,14 @@ int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
                                                     err,
                                                     errlen);
         if (rc == 0 && ratio == 4) {
-            rc = payload_write_tensor_span(fp,
-                                           g->layer_index_comp_cache[il],
-                                           0,
-                                           (uint64_t)g->layer_n_index_comp[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
-                                           buf,
-                                           DS4_SESSION_IO_CHUNK,
-                                           err,
-                                           errlen);
+            rc = payload_write_tensor_span_f16_as_f32(fp,   /* 缓存 f16, 外部格式仍 f32 */
+                                                      g->layer_index_comp_cache[il],
+                                                      0,
+                                                      (uint64_t)g->layer_n_index_comp[il] * DS4_N_INDEXER_HEAD_DIM,
+                                                      buf,
+                                                      DS4_SESSION_IO_CHUNK,
+                                                      err,
+                                                      errlen);
             if (rc == 0) rc = payload_write_tensor_span(fp,
                                                         g->layer_index_state_kv[il],
                                                         0,
@@ -307,27 +291,8 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
         }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (rc != 0 || ratio == 0) continue;
-        if (DS4_GPU_ATTN_COMP_CACHE_F16) {
-            rc = payload_read_tensor_span_f32_as_f16(fp,
-                                                     g->layer_attn_comp_cache[il],
-                                                     0,
-                                                     (uint64_t)n_comp[i] * DS4_N_HEAD_DIM,
-                                                     buf,
-                                                     DS4_SESSION_IO_CHUNK,
-                                                     &remaining,
-                                                     err,
-                                                     errlen);
-        } else {
-            rc = payload_read_tensor_span(fp,
-                                          g->layer_attn_comp_cache[il],
-                                          0,
-                                          (uint64_t)n_comp[i] * DS4_N_HEAD_DIM * sizeof(float),
-                                          buf,
-                                          DS4_SESSION_IO_CHUNK,
-                                          &remaining,
-                                          err,
-                                          errlen);
-        }
+        rc = payload_read_f32_as_comp_rows(fp, g->layer_attn_comp_cache[il], n_comp[i],   /* 外部 f32 → 缓存行格式 */
+                                           buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
         if (rc == 0) rc = payload_read_tensor_span(fp,
                                                    g->layer_attn_state_kv[il],
                                                    0,
@@ -347,15 +312,15 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
                                                    err,
                                                    errlen);
         if (rc == 0 && ratio == 4) {
-            rc = payload_read_tensor_span(fp,
-                                          g->layer_index_comp_cache[il],
-                                          0,
-                                          (uint64_t)n_index_comp[i] * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
-                                          buf,
-                                          DS4_SESSION_IO_CHUNK,
-                                          &remaining,
-                                          err,
-                                          errlen);
+            rc = payload_read_tensor_span_f32_as_f16(fp,   /* 外部 f32 → 缓存 f16 */
+                                                     g->layer_index_comp_cache[il],
+                                                     0,
+                                                     (uint64_t)n_index_comp[i] * DS4_N_INDEXER_HEAD_DIM,
+                                                     buf,
+                                                     DS4_SESSION_IO_CHUNK,
+                                                     &remaining,
+                                                     err,
+                                                     errlen);
             if (rc == 0) rc = payload_read_tensor_span(fp,
                                                        g->layer_index_state_kv[il],
                                                        0,
@@ -389,6 +354,7 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
         token_vec_free(&s->checkpoint);
         memset(&s->checkpoint, 0, sizeof(s->checkpoint));
         for (uint32_t i = 0; i < n_tokens; i++) token_vec_push(&s->checkpoint, tokens[i]);
+        metal_graph_token_pending_forget(g);   /* 计数器来自载荷, 预捕获快照作废(不回滚) */
         for (uint32_t i = 0; i < n_layers; i++) {
             const uint32_t il = layer_start + i;
             g->layer_n_comp[il] = n_comp[i];

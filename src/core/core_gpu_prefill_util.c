@@ -41,6 +41,7 @@ bool metal_graph_encode_token_raw_swa(
                                               (uint32_t)token,
                                               DS4_N_EMBD,
                                               DS4_N_HC) != 0;
+    if (ok) { eval_hdump_tensor_rows(g->cur_hc, 99u, 1); eval_hdump_pos(pos, 1); }   /* --eval-hdump: 嵌入(层 0 输入)记为 L99 + 位置边车 */
 
     /*
      * Start executing the prefix of the decode graph while the CPU is still
@@ -65,6 +66,14 @@ bool metal_graph_encode_token_raw_swa(
         ds4_gpu_tensor *tmp = g->cur_hc;
         g->cur_hc = g->after_ffn_hc;
         g->after_ffn_hc = tmp;
+        if (ok) eval_hdump_tensor_rows(g->cur_hc, il, 1);   /* --eval-hdump: 解码路逐层出口 hc(与批路同格式), 开着时不进图 */
+#ifdef DS4_STATE_DUMP
+        /* 诊断: 逐层输出 hc 快照(D2D 异步拷贝, capture 内成图节点, 直发内立即执行) */
+        {   extern ds4_gpu_tensor *g_sd_hc[64];
+            if (ok && il < 64u && g_sd_hc[il])
+                (void)ds4_gpu_tensor_copy(g_sd_hc[il], 0, g->cur_hc, 0, (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float));
+        }
+#endif
         /* DSpark: target 层输出 HC 均值 → main_hidden[slot](官方 h.mean(dim=2) 语义;
          * 0731 固定 dspark_target_layer_ids=[40,41,42]) */
         if (ok && g->dspark_capture && g->dspark_main_hidden &&
@@ -80,6 +89,11 @@ bool metal_graph_encode_token_raw_swa(
 
     if (ok && need_logits) {
         ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+        /* 预发射的 token 源: 图末尾把 logits 的 argmax 写进设备槽(core_gpu_imatrix.c)。
+         * 只在能预发射的后端编码, 与主机 sample_argmax/argmax_excluding 逐位同义。 */
+        if (ok && g->prelaunch_capable > 0)
+            ok = ds4_gpu_decode_argmax_tensor(g->logits, (uint32_t)weights->output->dim[1],
+                                              g->argmax_exclude) != 0;
     }
     return ok;
 }

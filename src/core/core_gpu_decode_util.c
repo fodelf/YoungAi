@@ -73,16 +73,10 @@ bool metal_graph_decode_kv_store(
                                              DS4_N_ROT) != 0;
 }
 
-static uint64_t metal_graph_attn_comp_cache_row_bytes(void) {
-    return (uint64_t)DS4_N_HEAD_DIM *
-           (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
-}
-
-uint32_t metal_graph_attn_comp_cache_is_f16(void) {
-    return DS4_GPU_ATTN_COMP_CACHE_F16 ? 1u : 0u;
-}
-
-static bool metal_graph_store_attn_comp_stage(
+/* ---- 压缩缓存(两后端唯一行格式 [448 f16][64 f32], 见 ds4_gpu_core.h; 09-07 拔掉 Apple/CUDA 开关): 写入方(压缩器
+ * prefill/replay/update)照旧写 f32, 目标是 g->attn_comp_stage 行 0 起, FP8 KV 量化也在暂存上做, 然后由这里提交:
+ * 后端把 f32 行转成缓存行格式抄进 layer_attn_comp_cache 的 first_row 行起。 */
+bool metal_graph_commit_attn_comp_stage(
         ds4_gpu_graph *g,
         uint32_t       il,
         uint32_t       first_row,
@@ -94,74 +88,25 @@ static bool metal_graph_store_attn_comp_stage(
         rows > g->layer_comp_cap[il] - first_row) {
         return false;
     }
+    return ds4_gpu_comp_rows_commit(g->layer_attn_comp_cache[il], first_row, g->attn_comp_stage, rows) != 0;
+}
 
-    const uint64_t count = (uint64_t)rows * DS4_N_HEAD_DIM;
-    const uint64_t dst_offset = (uint64_t)first_row *
-                                metal_graph_attn_comp_cache_row_bytes();
-    if (DS4_GPU_ATTN_COMP_CACHE_F16) {
-        return ds4_gpu_tensor_copy_f32_to_f16(g->layer_attn_comp_cache[il],
-                                               dst_offset,
-                                               g->attn_comp_stage,
-                                               0,
-                                               count) != 0;
+/* ---- indexer 缓存(2026-09-06, 两后端恒 f16): 写入方(压缩器 prefill/replay/update)照旧写 f32, 但目标是
+ * g->attn_comp_stage 的行 0 起(其 attn_comp_stage_cap 行 × 512 宽足够放同样行数的 128 宽 indexer 行),
+ * QAT 在暂存上做, 然后由这里提交: f32→f16 抄进 layer_index_comp_cache 的 first_row 行起。 */
+bool metal_graph_commit_index_comp_stage(ds4_gpu_graph *g, uint32_t il, uint32_t first_row, uint32_t rows) {
+    if (!g || il >= DS4_N_LAYER) return false;
+    if (rows == 0) return true;
+    if (!g->layer_index_comp_cache[il] || !g->attn_comp_stage) return false;
+    /* 暂存按 attn_comp_stage_cap 行 × DS4_N_HEAD_DIM 宽分配, 128 宽的 indexer 行能放 4 倍行数 */
+    if (first_row > g->layer_comp_cap[il] || rows > g->layer_comp_cap[il] - first_row ||
+        (uint64_t)rows * DS4_N_INDEXER_HEAD_DIM > (uint64_t)g->attn_comp_stage_cap * DS4_N_HEAD_DIM) {
+        return false;
     }
-
-    return ds4_gpu_tensor_copy(g->layer_attn_comp_cache[il],
-                               dst_offset,
-                               g->attn_comp_stage,
-                               0,
-                               count * sizeof(float)) != 0;
-}
-
-ds4_gpu_tensor *metal_graph_attn_comp_update_target(
-        ds4_gpu_graph *g,
-        uint32_t       il) {
-    return DS4_GPU_ATTN_COMP_CACHE_F16
-        ? g->attn_comp_stage
-        : g->layer_attn_comp_cache[il];
-}
-
-uint32_t metal_graph_attn_comp_update_row(uint32_t row) {
-    return DS4_GPU_ATTN_COMP_CACHE_F16 ? 0u : row;
-}
-
-bool metal_graph_commit_attn_comp_stage(
-        ds4_gpu_graph *g,
-        uint32_t       il,
-        uint32_t       first_row,
-        uint32_t       rows) {
-    if (!DS4_GPU_ATTN_COMP_CACHE_F16) return true;
-    return metal_graph_store_attn_comp_stage(g, il, first_row, rows);
-}
-
-ds4_gpu_tensor *metal_graph_attn_comp_row_view(
-        ds4_gpu_graph *g,
-        uint32_t       il,
-        uint32_t       row) {
-    if (DS4_GPU_ATTN_COMP_CACHE_F16) {
-        return ds4_gpu_tensor_view(g->attn_comp_stage,
-                                   0,
-                                   (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
-    }
-    return ds4_gpu_tensor_view(g->layer_attn_comp_cache[il],
-                               (uint64_t)row * DS4_N_HEAD_DIM * sizeof(float),
-                               (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
-}
-
-ds4_gpu_tensor *metal_graph_attn_comp_prefill_target(
-        ds4_gpu_graph *g,
-        uint32_t       il,
-        uint32_t       first_row,
-        uint32_t       rows) {
-    if (DS4_GPU_ATTN_COMP_CACHE_F16) return g->attn_comp_stage;
-    const uint32_t view_rows = rows ? rows : 1u;
-    return ds4_gpu_tensor_view(g->layer_attn_comp_cache[il],
-                               (uint64_t)first_row * DS4_N_HEAD_DIM * sizeof(float),
-                               (uint64_t)view_rows * DS4_N_HEAD_DIM * sizeof(float));
-}
-
-void metal_graph_attn_comp_prefill_target_free(ds4_gpu_tensor *t) {
-    if (!DS4_GPU_ATTN_COMP_CACHE_F16) ds4_gpu_tensor_free(t);
+    return ds4_gpu_tensor_copy_f32_to_f16(g->layer_index_comp_cache[il],
+                                           (uint64_t)first_row * DS4_N_INDEXER_HEAD_DIM * sizeof(uint16_t),
+                                           g->attn_comp_stage, 0,
+                                           (uint64_t)rows * DS4_N_INDEXER_HEAD_DIM) != 0;
 }
 
 /* Encode one DS4 decode layer on Metal.  This is the release single-token

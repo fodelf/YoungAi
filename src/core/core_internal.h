@@ -195,7 +195,6 @@ extern uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER];
 extern uint32_t g_requested_threads;
 extern const gguf_type_info gguf_types[43];
 extern bool g_model_open_arm_env_defaults;
-extern int g_prefill_chunk_cuda;
 extern bool g_vq_experts_blob;
 extern pthread_once_t iq2xxs_signed_grid_once;
 void iq2xxs_signed_grid_init(void);
@@ -402,6 +401,7 @@ void *xmalloc_zeroed(size_t n, size_t size);
 void *xrealloc(void *ptr, size_t size);
 struct ds4_zchain *zchain_from_model(const ds4_model *m);
 bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m);
+void model_preload_q8_f16_shadows(const ds4_model *m);   /* q8_0 二维张量的 f16 影子预建(drafter 绑定期, 见 core_model_map) */
 bool cpu_load_directional_steering(ds4_engine *e);
 DS4_MAYBE_UNUSED void ds4_l1_budget_gate(uint64_t resident_model_bytes, uint64_t kv_and_scratch_bytes);
 void dump_tokens(const ds4_vocab *vocab, const token_vec *tokens);

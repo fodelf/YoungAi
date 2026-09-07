@@ -46,6 +46,13 @@ void ds4_session_set_spec_greedy(ds4_session *s, int greedy_ok) {
     s->spec_greedy = greedy_ok ? 1 : 0;
 }
 
+/* 调用方声明"下一 token 取 argmax 时排除这个 id"(ds4-bench 排除 EOS 保持续写)。图末尾的设备
+ * argmax 与主机 ds4_session_argmax_excluding 必须同一排除, 预发射对账才成立。 */
+void ds4_session_set_argmax_exclude(ds4_session *s, int excluded_id) {
+    if (!s) return;
+    s->graph.argmax_exclude = excluded_id;
+}
+
 int ds4_session_spec_greedy_ok(const ds4_session *s) {
     return s ? s->spec_greedy : 1;
 }
@@ -176,6 +183,11 @@ int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     ds4_engine *e = s->engine;
     /* MTP probe 已整族删除(2026-08-05)。 */
     (void)probe_mtp;
+    /* 预发射前提: 调用方声明贪心(set_spec_greedy) 且本会话无逐请求惩罚 ⇒ 它喂回的下一 token 就是
+     * 裸 argmax, 与图末尾的设备 argmax 同值。有惩罚/采样时下一 token 主机才知道, 不预发射。
+     * --spec 下也不预发射: 投机轮在本 token 之后走 verify 批处理 pos+1.., 预发射的 pos+1 单 token
+     * 图会先把 KV/压缩器态推进一步, 再被 verify 批重做一遍 ⇒ 状态双推进(09-07)。 */
+    s->graph.prelaunch_want = (s->spec_greedy && !session_penalties_active(s) && !g_ds4_spec_enabled) ? 1 : 0;
     if (!metal_graph_eval_token_raw_swa(&s->graph, &e->model, &e->weights,
                                         (uint32_t)token,
                                         (uint32_t)s->checkpoint.len,
@@ -186,6 +198,7 @@ int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         return 1;
     }
     token_vec_push(&s->checkpoint, token);
+    eval_hdump_logits_rows(s->logits, 1);   /* --eval-hdump: 解码路 logits 行(L96), 与 verify 批同格式 */
     /* MTP draft 已整族删除(2026-08-05)。 */
     return 0;
 #endif

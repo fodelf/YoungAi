@@ -5,6 +5,7 @@ bool metal_graph_reset_prefill_state(ds4_gpu_graph *g) {
     memset(g->layer_n_comp, 0, sizeof(g->layer_n_comp));
     memset(g->layer_n_index_comp, 0, sizeof(g->layer_n_index_comp));
     g->mtp_n_raw = 0;
+    metal_graph_comp_pending_clear(g);   /* state 整体清零, 环上攒的行随之作废 */
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         if (!metal_graph_layer_is_active(g, il)) continue;
         const uint32_t ratio = ds4_layer_compress_ratio(il);
@@ -53,6 +54,7 @@ bool metal_graph_prefill_layer_major(
         ds4_imatrix_collector *imatrix,
         ds4_session_progress_fn display_progress,
         void                  *display_progress_ud) {
+    metal_graph_token_pending_discard(g);   /* 续接 prefill 从真实计数器起步(预捕获多推的一步回滚) */
     if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
     if (start > (uint32_t)prompt->len) return false;
     if (n_tokens > (uint32_t)prompt->len - start) return false;
@@ -62,6 +64,8 @@ bool metal_graph_prefill_layer_major(
 
     bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, prompt, start, n_tokens);
     if (!ok) return false;
+    /* 解码攒着的压缩器投影先入 state: 下面的 ratio-4 replay/prev-state 重建都读 state 行 */
+    if (!metal_graph_comp_flush_pending(g, model, weights)) return false;
 
     if (!metal_graph_warmup_prefill_kernels(g, model, weights, n_tokens)) return false;
 
@@ -219,6 +223,7 @@ bool metal_graph_prefill_raw_swa(
         void                  *display_progress_ud) {
     if (n_tokens <= 0 || n_tokens > prompt->len) return false;
     if ((uint32_t)n_tokens > g->prefill_cap) return false;
+    metal_graph_token_pending_discard(g);   /* 同 layer_major: 续接 prefill 前回滚预捕获 */
     return metal_graph_prefill_layer_major(g,
                                            model,
                                            weights,

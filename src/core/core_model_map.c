@@ -101,11 +101,6 @@ ds4_tensor *model_find_tensor(const ds4_model *m, const char *name) {
     return NULL;
 }
 
-/* CUDA 默认 prefill 分块(见 ds4_default_prefill_cap_for_prompt 的实测注释); 0=未定。
- * 必须无条件声明: 使用点 ds4_default_prefill_cap_for_prompt 在所有构建里都编译,
- * 原先声明被圈进 #ifndef __APPLE__ 导致 Mac 构建 undeclared(stale .o 曾掩盖)。 */
-int g_prefill_chunk_cuda = 0;
-
 #ifndef DS4_NO_GPU
 #ifndef __APPLE__
 #ifdef DS4_CUDA_SPARK_HBM_CACHE
@@ -222,7 +217,6 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
 #endif
 
 bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m) {
-    if (backend == DS4_BACKEND_CUDA && g_prefill_chunk_cuda == 0) g_prefill_chunk_cuda = 256;
     if (backend != DS4_BACKEND_CUDA) return true;
     if (!m || !m->map || m->size == 0) return false;
 
@@ -274,3 +268,20 @@ const void *tensor_data(const ds4_model *m, const ds4_tensor *t) {
     return m->map + t->abs_offset;
 }
 
+
+/* 09-07(1M 投机剖面): drafter 的 q8_0 投影走 cuBLAS f16 影子 GEMM, 影子原本在首个投机轮里才懒建(dequant + cudaMalloc ~0.5 s),
+ * 短尺被首轮拖 10%。这里按后端运行时同一形状规则预建(不满足规则的张量后端自己跳过, Metal 是空实现), 把一次性开销挪到加载期。
+ * 主模型的影子随 prefill 首块建, 不在这里。 */
+void model_preload_q8_f16_shadows(const ds4_model *m) {
+#ifndef DS4_NO_GPU
+    if (!m || !m->tensors) return;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *t = &m->tensors[i];
+        if (t->type != DS4_TENSOR_Q8_0 || t->ndim != 2 || t->bytes == 0) continue;
+        if (memmem(t->name.ptr, t->name.len, "_exps.", 6) != NULL) continue;
+        (void)ds4_gpu_cache_q8_f16_range(m->map, m->size, t->abs_offset, t->bytes, t->dim[0], t->dim[1], "q8_0");
+    }
+#else
+    (void)m;
+#endif
+}

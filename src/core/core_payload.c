@@ -287,6 +287,76 @@ DS4_MAYBE_UNUSED int payload_read_tensor_span_f32_as_f16(FILE *fp, ds4_gpu_tenso
     }
     return 0;
 }
+
+/* 压缩缓存行格式(ds4_gpu_core.h DS4_GPU_COMP_ROW_*: [448 f16][64 f32], 1152 B/行) ↔ 外部 f32 [rows][512]:
+ * 快照/回放的外部格式不变(f32), 转换在宿主逐行做; 两个方向都逐位可逆(f16 段本就是 f16 精确值, f32 段原样)。 */
+#define COMP_ROW_WIDTH (DS4_GPU_COMP_ROW_NOPE + DS4_GPU_COMP_ROW_ROT)
+DS4_MAYBE_UNUSED int payload_write_comp_rows_as_f32(FILE *fp, const ds4_gpu_tensor *tensor, uint64_t rows,
+                                                     uint8_t *buf, size_t cap, char *err, size_t errlen) {
+    const size_t rb = DS4_GPU_COMP_ROW_BYTES, fb = (size_t)COMP_ROW_WIDTH * sizeof(float);
+    if (!tensor || rows > ds4_gpu_tensor_bytes(tensor) / rb) {
+        payload_set_err(err, errlen, "session tensor is smaller than the compressed-row payload");
+        return 1;
+    }
+    const size_t cap_rows = cap / (rb + fb);
+    if (cap_rows == 0) {
+        payload_set_err(err, errlen, "session tensor conversion buffer is too small");
+        return 1;
+    }
+    uint8_t *r = buf;
+    float *f = (float *)(void *)(buf + cap_rows * rb);
+    uint64_t done = 0;
+    while (done < rows) {
+        const size_t n = rows - done > (uint64_t)cap_rows ? cap_rows : (size_t)(rows - done);
+        if (ds4_gpu_tensor_read(tensor, done * rb, r, n * rb) == 0) {
+            payload_set_err(err, errlen, "failed to read compressed-row session tensor");
+            return 1;
+        }
+        for (size_t i = 0; i < n; i++) {
+            const uint8_t *row = r + i * rb;
+            float *out = f + i * COMP_ROW_WIDTH;
+            for (uint32_t d = 0; d < DS4_GPU_COMP_ROW_NOPE; d++) out[d] = f16_to_f32(((const uint16_t *)(const void *)row)[d]);
+            memcpy(out + DS4_GPU_COMP_ROW_NOPE, row + DS4_GPU_COMP_ROW_NOPE * 2u, DS4_GPU_COMP_ROW_ROT * sizeof(float));
+        }
+        if (payload_write_bytes(fp, f, (uint64_t)n * fb, err, errlen) != 0) return 1;
+        done += n;
+    }
+    return 0;
+}
+
+DS4_MAYBE_UNUSED int payload_read_f32_as_comp_rows(FILE *fp, ds4_gpu_tensor *tensor, uint64_t rows,
+                                                    uint8_t *buf, size_t cap, uint64_t *remaining,
+                                                    char *err, size_t errlen) {
+    const size_t rb = DS4_GPU_COMP_ROW_BYTES, fb = (size_t)COMP_ROW_WIDTH * sizeof(float);
+    if (!tensor || rows > ds4_gpu_tensor_bytes(tensor) / rb) {
+        payload_set_err(err, errlen, "session tensor is smaller than the compressed-row payload");
+        return 1;
+    }
+    const size_t cap_rows = cap / (rb + fb);
+    if (cap_rows == 0) {
+        payload_set_err(err, errlen, "session tensor conversion buffer is too small");
+        return 1;
+    }
+    uint8_t *r = buf;
+    float *f = (float *)(void *)(buf + cap_rows * rb);
+    uint64_t done = 0;
+    while (done < rows) {
+        const size_t n = rows - done > (uint64_t)cap_rows ? cap_rows : (size_t)(rows - done);
+        if (payload_read_bytes(fp, f, (uint64_t)n * fb, remaining, err, errlen) != 0) return 1;
+        for (size_t i = 0; i < n; i++) {
+            uint8_t *row = r + i * rb;
+            const float *in = f + i * COMP_ROW_WIDTH;
+            for (uint32_t d = 0; d < DS4_GPU_COMP_ROW_NOPE; d++) ((uint16_t *)(void *)row)[d] = f32_to_f16(in[d]);
+            memcpy(row + DS4_GPU_COMP_ROW_NOPE * 2u, in + DS4_GPU_COMP_ROW_NOPE, DS4_GPU_COMP_ROW_ROT * sizeof(float));
+        }
+        if (ds4_gpu_tensor_write(tensor, done * rb, r, n * rb) == 0) {
+            payload_set_err(err, errlen, "failed to restore compressed-row session tensor");
+            return 1;
+        }
+        done += n;
+    }
+    return 0;
+}
 #endif
 
 bool ds4_session_is_cpu(const ds4_session *s) {

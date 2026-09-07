@@ -472,6 +472,7 @@ void dspark_bind_with_draft(ds4_dspark_weights *w, const ds4_model *m, bool grap
     dspark_weights_bind(w, g_draft_model);
     w->src = g_draft_model;
     w->head_src = g_draft_model;
+    if (graph_backend) model_preload_q8_f16_shadows(g_draft_model);   /* 09-07: 影子预建挪到绑定期(见 core_model_map) */
     /* 出口侧借主模型(官方: drafter 复用主 head)。norm 是 ready 硬条件, hc_head 是
      * step ④ 的硬解引用 —— 三者齐借, head_src 指向主模型供 step 选 map。 */
     if (!w->ready && w->n_blocks > 0 && w->main_proj) {

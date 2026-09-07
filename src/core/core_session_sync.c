@@ -292,16 +292,19 @@ int ds4_session_argmax(ds4_session *s) {
  * second choice for stable speed measurement, not a sampling path. */
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
     if (!s || !s->logits) return -1;
+    /* 并列/NaN 规则与 sample_argmax 同: 严格大于才替换(首个最大胜, NaN 永不选); 全 -inf/NaN 时兜底
+     * 首个未排除位。CUDA 图末尾的 decode_argmax 核逐字镜像这条规则(预发射对账靠它)。 */
     int best = -1;
     float best_logit = DS4_NEG_INF;
     for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
         if ((int)i == excluded_id) continue;
         const float v = s->logits[i];
-        if (best < 0 || v > best_logit) {
+        if (v > best_logit) {
             best = (int)i;
             best_logit = v;
         }
     }
+    if (best < 0) best = (excluded_id == 0) ? 1 : 0;
     return best;
 }
 

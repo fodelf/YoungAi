@@ -60,6 +60,14 @@ bool metal_graph_encode_layer_ffn_batch_ex(
                                              mix_hc,
                                              g->batch_flat_hc,
                                              n_tokens) != 0;
+    /* 小批(投机 verify ≤8 token, 09-07): hc 混合 + ffn_norm 走解码同款融合核, 同轨 */
+    if (ok && n_tokens <= 8u) {
+        ok = ds4_gpu_hc_split_weighted_sum_norm_tensor(ffn_cur_view, g->batch_ffn_norm, hc_split_view, hc_mix_view,
+                                                         g->batch_after_attn_hc, model->map, model->size,
+                                                         layer->hc_ffn_scale->abs_offset, layer->hc_ffn_base->abs_offset,
+                                                         layer->ffn_norm->abs_offset, DS4_N_EMBD, DS4_N_HC,
+                                                         DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS, DS4_RMS_EPS) != 0;
+    } else {
     if (ok) ok = ds4_gpu_hc_split_weighted_sum_tensor(ffn_cur_view,
                                                         hc_split_view,
                                                         hc_mix_view,
@@ -81,6 +89,7 @@ bool metal_graph_encode_layer_ffn_batch_ex(
                                                        DS4_N_EMBD,
                                                        n_tokens,
                                                        DS4_RMS_EPS) != 0;
+    }
     if (ok) ok = ds4_gpu_matmul_f16_tensor(g->batch_router_logits,
                                              model->map,
                                              model->size,

@@ -102,6 +102,7 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
 #ifdef DS4_NO_GPU
     return 0;
 #else
+    metal_graph_token_pending_discard(&s->graph);   /* 计数器回到真实态再算尺寸(预捕获会多推一步) */
     const ds4_gpu_graph *g = &s->graph;
     uint64_t bytes = (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
     bytes += (uint64_t)s->checkpoint.len * sizeof(uint32_t);
@@ -200,6 +201,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         payload_set_err(err, errlen, "session has no valid checkpoint to save");
         return 1;
     }
+    metal_graph_token_pending_discard(&s->graph);   /* 落盘的压缩行计数必须是真实态, 不含预捕获多推的一步 */
     if (s->distributed) {
         return ds4_dist_session_save_payload(s->distributed, s, fp, err, errlen);
     }
@@ -272,6 +274,11 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
     payload_set_err(err, errlen, "graph backend support is not compiled in");
     return 1;
 #else
+    /* 解码攒着的压缩器投影先入 state, 否则序列化出去的 state 缺行(core_gpu_decode_comp.c) */
+    if (!metal_graph_comp_flush_pending(&s->graph, &s->engine->model, &s->engine->weights)) {
+        payload_set_err(err, errlen, "failed to flush pending compressor rows before snapshot");
+        return 1;
+    }
     if (ds4_gpu_synchronize() == 0) {
         payload_set_err(err, errlen, "failed to synchronize accelerator before snapshot");
         return 1;
@@ -337,25 +344,8 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         /* Compressed rows are append-only from row zero, so the live prefix is
          * contiguous.  The two compressor state tensors hold the partial window
          * that will become the next compressed row. */
-        if (DS4_GPU_ATTN_COMP_CACHE_F16) {
-            rc = payload_write_tensor_span_f16_as_f32(fp,
-                                                      g->layer_attn_comp_cache[il],
-                                                      0,
-                                                      (uint64_t)g->layer_n_comp[il] * DS4_N_HEAD_DIM,
-                                                      buf,
-                                                      DS4_SESSION_IO_CHUNK,
-                                                      err,
-                                                      errlen);
-        } else {
-            rc = payload_write_tensor_span(fp,
-                                           g->layer_attn_comp_cache[il],
-                                           0,
-                                           (uint64_t)g->layer_n_comp[il] * DS4_N_HEAD_DIM * sizeof(float),
-                                           buf,
-                                           DS4_SESSION_IO_CHUNK,
-                                           err,
-                                           errlen);
-        }
+        rc = payload_write_comp_rows_as_f32(fp, g->layer_attn_comp_cache[il], g->layer_n_comp[il],   /* 外部格式仍 f32 */
+                                            buf, DS4_SESSION_IO_CHUNK, err, errlen);
         if (rc == 0) rc = payload_write_tensor_span(fp,
                                                     g->layer_attn_state_kv[il],
                                                     0,
@@ -373,14 +363,14 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
                                                     err,
                                                     errlen);
         if (rc == 0 && ratio == 4) {
-            rc = payload_write_tensor_span(fp,
-                                           g->layer_index_comp_cache[il],
-                                           0,
-                                           (uint64_t)g->layer_n_index_comp[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
-                                           buf,
-                                           DS4_SESSION_IO_CHUNK,
-                                           err,
-                                           errlen);
+            rc = payload_write_tensor_span_f16_as_f32(fp,   /* 缓存 f16, 外部格式仍 f32 */
+                                                      g->layer_index_comp_cache[il],
+                                                      0,
+                                                      (uint64_t)g->layer_n_index_comp[il] * DS4_N_INDEXER_HEAD_DIM,
+                                                      buf,
+                                                      DS4_SESSION_IO_CHUNK,
+                                                      err,
+                                                      errlen);
             if (rc == 0) rc = payload_write_tensor_span(fp,
                                                         g->layer_index_state_kv[il],
                                                         0,

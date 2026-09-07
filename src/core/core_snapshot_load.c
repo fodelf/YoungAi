@@ -269,27 +269,8 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (rc != 0 || ratio == 0) continue;
-        if (DS4_GPU_ATTN_COMP_CACHE_F16) {
-            rc = payload_read_tensor_span_f32_as_f16(fp,
-                                                     g->layer_attn_comp_cache[il],
-                                                     0,
-                                                     (uint64_t)n_comp[il] * DS4_N_HEAD_DIM,
-                                                     buf,
-                                                     DS4_SESSION_IO_CHUNK,
-                                                     &remaining,
-                                                     err,
-                                                     errlen);
-        } else {
-            rc = payload_read_tensor_span(fp,
-                                          g->layer_attn_comp_cache[il],
-                                          0,
-                                          (uint64_t)n_comp[il] * DS4_N_HEAD_DIM * sizeof(float),
-                                          buf,
-                                          DS4_SESSION_IO_CHUNK,
-                                          &remaining,
-                                          err,
-                                          errlen);
-        }
+        rc = payload_read_f32_as_comp_rows(fp, g->layer_attn_comp_cache[il], n_comp[il],   /* 外部 f32 → 缓存行格式 */
+                                           buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
         if (rc == 0) rc = payload_read_tensor_span(fp,
                                                    g->layer_attn_state_kv[il],
                                                    0,
@@ -309,15 +290,15 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
                                                    err,
                                                    errlen);
         if (rc == 0 && ratio == 4) {
-            rc = payload_read_tensor_span(fp,
-                                          g->layer_index_comp_cache[il],
-                                          0,
-                                          (uint64_t)n_index_comp[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
-                                          buf,
-                                          DS4_SESSION_IO_CHUNK,
-                                          &remaining,
-                                          err,
-                                          errlen);
+            rc = payload_read_tensor_span_f32_as_f16(fp,   /* 外部 f32 → 缓存 f16 */
+                                                     g->layer_index_comp_cache[il],
+                                                     0,
+                                                     (uint64_t)n_index_comp[il] * DS4_N_INDEXER_HEAD_DIM,
+                                                     buf,
+                                                     DS4_SESSION_IO_CHUNK,
+                                                     &remaining,
+                                                     err,
+                                                     errlen);
             if (rc == 0) rc = payload_read_tensor_span(fp,
                                                        g->layer_index_state_kv[il],
                                                        0,
@@ -360,6 +341,8 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         g->layer_n_comp[il] = n_comp[il];
         g->layer_n_index_comp[il] = n_index_comp[il];
     }
+    metal_graph_token_pending_forget(g);   /* 计数器来自快照, 预捕获快照作废(不回滚) */
+    metal_graph_comp_pending_clear(g);   /* 载入的 state 已含其位置的全部行(保存前冲刷过) */
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
     g->mtp_n_raw = 0;
@@ -372,6 +355,7 @@ int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *
         payload_set_err(err, errlen, "invalid session snapshot save");
         return 1;
     }
+    metal_graph_token_pending_discard(&s->graph);   /* 同 ds4_session_save_payload: 计数器真实态 */
     if (s->distributed) {
         payload_set_err(err, errlen, "distributed session snapshots are not supported yet");
         return 1;
