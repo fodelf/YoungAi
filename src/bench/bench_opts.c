@@ -47,6 +47,10 @@ static void usage(FILE *fp) {
         "\n"
         "Model and backend:\n"
         "  -m, --model FILE       GGUF model path. Default: ds4flash.gguf\n"
+        "  --vq-dir DIR           VQ expert sidecar directory (dql_vq_L%%02d.bin), same as ds4.\n"
+        "  --zchain FILE          DQZ2 amplifier chain sidecar, same as ds4.\n"
+        "  --draft-gguf FILE      DSpark drafter GGUF, same as ds4 (needed by --spec).\n"
+        "  --spec                 Generate through the speculative (MTP verify-batch) path, same as ds4.\n"
         "  --metal | --cuda | --cpu | --backend NAME\n"
         "      Select backend explicitly. Defaults to Metal on macOS, CUDA elsewhere.\n"
         "  -t, --threads N        CPU helper threads.\n"
@@ -66,6 +70,12 @@ static void usage(FILE *fp) {
         "  --step-mul F           Multiplicative step. Default: 1\n"
         "  --step-incr N          Linear step when --step-mul is 1. Default: 2048\n"
         "  --gen-tokens N         Greedy decode tokens per frontier. Use 0 for pure prefill. Default: 128\n"
+        "  --gen-final-only       Decode only at the last frontier and skip its snapshot (a snapshot is a\n"
+        "                         host copy of the whole KV: ~14.5 GB at 1M tokens). Other rows report gen 0.\n"
+        "  --fill-ctx N           Synthetic context: mark the first N prompt tokens as already processed\n"
+        "                         (KV row counts set, contents zeroed) without computing them, then measure\n"
+        "                         frontiers above N. Speed-only instrument (output is garbage); e.g.\n"
+        "                         --fill-ctx 1046528 --ctx-start 1048576 --ctx-max 1048576 measures 1M in minutes.\n"
         "\n"
         "Output:\n"
         "  --csv FILE             Write CSV there instead of stdout.\n"
@@ -211,6 +221,10 @@ bench_config parse_options(int argc, char **argv) {
             ds4_tool_set_prefill_chunk(atoi(need_arg(&i, argc, argv, arg)));
         } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--vq-dir")) {
+            c.vq_dir_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--zchain")) {
+            c.zchain_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--prompt-file")) {
             c.prompt_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--chat-prompt-file")) {
@@ -229,6 +243,14 @@ bench_config parse_options(int argc, char **argv) {
             c.step_mul = parse_double_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--gen-tokens") || !strcmp(arg, "--tokens") || !strcmp(arg, "-n")) {
             c.gen_tokens = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--gen-final-only")) {
+            c.gen_final_only = 1;
+        } else if (!strcmp(arg, "--fill-ctx")) {
+            c.fill_ctx = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--spec")) {
+            c.spec = 1;
+        } else if (!strcmp(arg, "--draft-gguf")) {
+            c.draft_gguf_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--csv")) {
             c.csv_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-frontier-logits-dir")) {
@@ -278,6 +300,10 @@ bench_config parse_options(int argc, char **argv) {
     }
     if (c.ctx_max > INT_MAX - c.gen_tokens - 1) {
         fprintf(stderr, "ds4-bench: requested context is too large\n");
+        exit(2);
+    }
+    if (c.fill_ctx > 0 && c.fill_ctx >= c.ctx_start) {
+        fprintf(stderr, "ds4-bench: --fill-ctx must be below --ctx-start\n");
         exit(2);
     }
     if (c.ctx_alloc == 0) c.ctx_alloc = c.ctx_max + c.gen_tokens + 1;

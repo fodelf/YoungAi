@@ -199,12 +199,16 @@ int main(int argc, char **argv) {
 
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
+        .zchain_path = cfg.zchain_path,
+        .vq_dir_path = cfg.vq_dir_path,
         .backend = cfg.backend,
         .n_threads = cfg.threads,
         .power_percent = cfg.power_percent,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
         .distributed = cfg.dist,
+        .spec = cfg.spec,
+        .draft_gguf_path = cfg.draft_gguf_path,
     };
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&cfg.dist, &opt, dist_err, sizeof(dist_err)) != 0) {
@@ -251,6 +255,20 @@ int main(int argc, char **argv) {
     }
     maybe_warn_distributed_step_shape(&cfg, session);
 
+    /* --fill-ctx: 前 N 个 token 摆成"已处理"(行数就位, 内容零), 前沿从 N 之后起量 —— 量 1M 处的速度不必真灌 1M */
+    if (cfg.fill_ctx > 0) {
+        char ferr[256] = {0};
+        ds4_tokens fill = { .v = prompt.v, .len = cfg.fill_ctx, .cap = cfg.fill_ctx };
+        if (ds4_session_fill_synthetic(session, &fill, ferr, sizeof(ferr)) != 0) {
+            fprintf(stderr, "ds4-bench: synthetic fill to %d failed: %s\n", cfg.fill_ctx, ferr);
+            ds4_session_free(session);
+            ds4_tokens_free(&prompt);
+            ds4_engine_close(engine);
+            return 1;
+        }
+        fprintf(stderr, "ds4-bench: synthetic context filled to %d tokens (contents zero, speed-only)\n", cfg.fill_ctx);
+    }
+
     FILE *out = stdout;
     if (cfg.csv_path) {
         out = fopen(cfg.csv_path, "wb");
@@ -266,10 +284,14 @@ int main(int argc, char **argv) {
     fflush(out);
 
     const int eos = ds4_token_eos(engine);
+    /* 续写 token 恒为"排除 EOS 的裸 argmax"(ds4_session_argmax_excluding): 向会话声明贪心 +
+     * 同一排除, CUDA 解码路据此把下一图在本图跑完前预发射(core_gpu_imatrix.c)。 */
+    ds4_session_set_spec_greedy(session, 1);
+    ds4_session_set_argmax_exclude(session, eos);
     const bool distributed = cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR;
     ds4_session_snapshot snap = {0};
     char err[256];
-    int previous = 0;
+    int previous = cfg.fill_ctx > 0 ? cfg.fill_ctx : 0;
     int rc = 0;
 
     for (int frontier = cfg.ctx_start; ; frontier = next_frontier(&cfg, frontier)) {
@@ -294,7 +316,12 @@ int main(int argc, char **argv) {
             break;
         }
 
-        if (cfg.gen_tokens > 0 && !distributed) {
+        /* --gen-final-only(09-06 1M 尺): 中间前沿不解码不快照, 最后前沿解码但不快照(之后无需恢复)。
+         * 快照是整段 KV 的主机拷贝(1M ≈ 14.5 GB), 121 GB 统一内存里引擎已驻留 ~110 GB, 放不下。 */
+        const int gen_here = (cfg.gen_final_only && frontier < cfg.ctx_max) ? 0 : cfg.gen_tokens;
+        const bool do_snap = gen_here > 0 && !distributed &&
+                             !(cfg.gen_final_only && frontier >= cfg.ctx_max);
+        if (do_snap) {
             if (ds4_session_save_snapshot(session, &snap, err, sizeof(err)) != 0) {
                 fprintf(stderr, "ds4-bench: snapshot at %d failed: %s\n", frontier, err);
                 rc = 1;
@@ -303,7 +330,9 @@ int main(int argc, char **argv) {
         }
 
         const double gen_t0 = bench_now_sec();
-        for (int i = 0; i < cfg.gen_tokens; i++) {
+        int gen_done = 0;   /* 投机一次可提交多 token, 按实际提交数算 t/s */
+        while (gen_done < gen_here) {
+            /* 投机路在 verify 批放不下时自己退回单 token(core_session_spec), 这里只守单 token 的余量 */
             if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
                 fprintf(stderr, "ds4-bench: generation would exceed allocated context at frontier %d\n", frontier);
                 rc = 1;
@@ -315,16 +344,32 @@ int main(int argc, char **argv) {
                 rc = 1;
                 break;
             }
+            if (cfg.spec) {
+                /* 与 CLI 同路: 首 token 解码 + DSpark 草稿/verify 轮, 直到凑够或遇 EOS(遇 EOS 本次少交几个, 下轮继续) */
+                int toks[513];
+                const int n = ds4_session_eval_speculative_argmax(session, token, gen_here - gen_done, eos,
+                                                                  toks, (int)(sizeof(toks) / sizeof(toks[0])),
+                                                                  err, sizeof(err));
+                if (n < 0) {
+                    fprintf(stderr, "ds4-bench: speculative decode at frontier %d failed: %s\n", frontier, err);
+                    rc = 1;
+                    break;
+                }
+                gen_done += n > 0 ? n : 1;
+                continue;
+            }
             if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
                 fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
                 rc = 1;
                 break;
             }
+            gen_done++;
         }
         const double gen_t1 = bench_now_sec();
+        if (cfg.spec && gen_here > 0) ds4_spec_stats_print();   /* 投机账(轮数/接受率/每轮 draft·verify ms) */
         if (rc != 0) break;
 
-        if (cfg.gen_tokens == 0) {
+        if (gen_here == 0) {
             /* Pure prefill benchmark: leave the live session at the frontier. */
         } else if (distributed) {
             if (ds4_session_sync(session, &prefix, err, sizeof(err)) != 0) {
@@ -332,7 +377,7 @@ int main(int argc, char **argv) {
                 rc = 1;
                 break;
             }
-        } else {
+        } else if (do_snap) {
             if (ds4_session_load_snapshot(session, &snap, err, sizeof(err)) != 0) {
                 fprintf(stderr, "ds4-bench: restore at %d failed: %s\n", frontier, err);
                 rc = 1;
@@ -346,9 +391,9 @@ int main(int argc, char **argv) {
                 frontier,
                 prefill_tokens,
                 prefill_sec > 0.0 ? (double)prefill_tokens / prefill_sec : 0.0,
-                cfg.gen_tokens,
-                gen_sec > 0.0 ? (double)cfg.gen_tokens / gen_sec : 0.0,
-                (unsigned long long)(distributed ? 0 : snap.len));
+                gen_done,
+                gen_sec > 0.0 ? (double)gen_done / gen_sec : 0.0,
+                (unsigned long long)((distributed || !do_snap) ? 0 : snap.len));
         fflush(out);
 
         previous = frontier;
