@@ -3,6 +3,7 @@
 #ifndef DS4_NO_GPU
 void metal_graph_free(ds4_gpu_graph *g) {
     free(g->tp_vec); /* TP host staging buffer (the tp socket is owned by the engine) */
+    ds4_gpu_host_free(g->logits_pinned);   /* tok_next_pinned 在同一块里 */
     ds4_gpu_tensor_free(g->directional_steering_dirs);
     ds4_gpu_tensor_free(g->batch_ffn_out);
     ds4_gpu_tensor_free(g->batch_routed_out);
@@ -105,6 +106,9 @@ void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->comp_kv_cur);
     ds4_gpu_tensor_free(g->comp_sc_side);
     ds4_gpu_tensor_free(g->comp_kv_side);
+    ds4_gpu_tensor_free(g->comp_kv_batch);
+    ds4_gpu_tensor_free(g->comp_sc_batch);
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) ds4_gpu_tensor_free(g->comp_x_ring[il]);
     ds4_gpu_tensor_free(g->attn_comp_stage);
     ds4_gpu_tensor_free(g->comp_mask);
     ds4_gpu_tensor_free(g->comp_selected);
@@ -264,10 +268,10 @@ static uint64_t metal_graph_kv_cache_bytes_for_context(uint32_t ctx_size, uint32
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
         const uint64_t comp_cap = ds4_comp_cap_for(ctx_size, ratio);
-        bytes += comp_cap * DS4_N_HEAD_DIM *
-                 (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
+        bytes += comp_cap * DS4_GPU_COMP_ROW_BYTES;   /* 行格式见 ds4_gpu_core.h */
         if (ratio == 4) {
-            bytes += comp_cap * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+            bytes += comp_cap * DS4_N_INDEXER_HEAD_DIM *
+                     sizeof(uint16_t);   /* indexer 缓存恒 f16 */
         }
     }
     return bytes;
@@ -283,7 +287,7 @@ uint64_t metal_graph_context_bytes_for_kv_policy(
     if (kv_cache_bytes_out) *kv_cache_bytes_out = kv_cache_bytes;
     uint64_t bytes = kv_cache_bytes +
                      2ull * comp_cap * prefill_cap * sizeof(float);
-    if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+    {   /* f32 暂存(indexer 缓存 f16 的写入中转), 与 core_gpu_alloc.c 同式 */
         const uint64_t attn_stage_cap =
             ds4_comp_cap_for(prefill_cap, ds4_min_compress_ratio(ctx_size));
         bytes += attn_stage_cap * DS4_N_HEAD_DIM * sizeof(float);

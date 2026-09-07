@@ -140,8 +140,11 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                      ((uint32_t)DS4_N_LAYER - 1u) : e->distributed.layers.end;
     }
     s->graph.dspark_capture = (e->dspark.ready && g_ds4_spec_enabled) ? 1 : 0;
+    /* enable_mtp 必须跟投机开关走: 它决定 spec_prefix1_* 快照缓冲是否分配, 而 dspark_state_snapshot/restore 对没缓冲的层
+     * 直接 continue —— 09-07 前这里写死 false, 部分接受后的"恢复"实际是空操作(旧批路按位置写 state 把它盖住了,
+     * 压缩器改攒行机制后暴露为 L3 攒行 129 > 128)。 */
     if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, &e->weights.layer[0],
-                                   raw_cap, (uint32_t)ctx_size, s->prefill_cap, false,
+                                   raw_cap, (uint32_t)ctx_size, s->prefill_cap, s->graph.dspark_capture != 0,
                                    active_start, active_end, active_slice))
     {
         free(s);
@@ -393,6 +396,7 @@ DS4_MAYBE_UNUSED void ds4_session_slice_commit_timeline(ds4_session *s, const in
 void ds4_session_invalidate(ds4_session *s) {
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
+    metal_graph_token_pending_forget(&s->graph);   /* 从头重放, 预捕获快照作废 */
     /* Also drops lane/request-penalty/spec-greedy back to defaults (and
      * repeat_gen_start to -1): an invalidated checkpoint means the next
      * request re-renders and re-declares its policy from scratch. */
@@ -403,6 +407,13 @@ void ds4_session_invalidate(ds4_session *s) {
 void ds4_session_rewind(ds4_session *s, int pos) {
     if (pos < 0) pos = 0;
     if (pos > s->checkpoint.len) pos = s->checkpoint.len;
+    metal_graph_token_pending_discard(&s->graph);   /* 先把预捕获多推的一步回滚, 再冲刷/截断(09-07) */
+#ifndef DS4_NO_GPU
+    /* 部分回卷前把攒着的压缩器投影入 state(与逐 token 即时入 state 的老语义一致: 回卷掉的
+     * token 行留在 state 里, 后续 token 覆盖同槽); 冷回卷下面整体清零, 不用冲。 */
+    if (pos > 0 && pos < s->checkpoint.len)
+        (void)metal_graph_comp_flush_pending(&s->graph, &s->engine->model, &s->engine->weights);
+#endif
     s->checkpoint.len = pos;
     s->mtp_draft_valid = false;
     /* 冷回卷(pos==0)= 从头重放: 必须连 comp/indexer 计数与压缩器累积 state 一起清。

@@ -1,5 +1,37 @@
 /* core_session_spec.c — 投机 eval(纯平解码收束) (机械拆分自 ds4.c, 重构阶段4)。 */
 #include "core_internal.h"
+/* --spec 投机账(09-07): 进程级累计, 生成结束由 CLI 打印(ds4_spec_stats_print)。速度判决要的是轮成本
+ * 分解(draft/verify/恢复)和逐位接受率 p_i(候选 i 被验证时命中的比例, 只在其前全接受时才算被验证),
+ * 单看 t/s 分不清是 drafter 不准还是 verify 太贵。 */
+static struct {
+    uint64_t rounds_spec, rounds_plain, tok_spec, tok_plain, crash_rounds;
+    double ms_spec, ms_plain, ms_draft, ms_verify, ms_restore;
+    uint64_t pos_test[8], pos_hit[8], k_hist[8];
+} g_spec_stats;
+void ds4_spec_stats_print(void) {
+    const uint64_t R = g_spec_stats.rounds_spec, R0 = g_spec_stats.rounds_plain;
+    if (R + R0 == 0) return;
+    fprintf(stderr, "ds4: spec 账: 投机轮 %llu (token %llu, 均接受 %.2f, %.1f ms/轮 = %.1f ms/token)",
+            (unsigned long long)R, (unsigned long long)g_spec_stats.tok_spec,
+            R ? (double)g_spec_stats.tok_spec / (double)R : 0.0,
+            R ? g_spec_stats.ms_spec / (double)R : 0.0,
+            g_spec_stats.tok_spec ? g_spec_stats.ms_spec / (double)g_spec_stats.tok_spec : 0.0);
+    fprintf(stderr, " | 纯解码轮 %llu (%.1f ms/token)", (unsigned long long)R0,
+            R0 ? g_spec_stats.ms_plain / (double)R0 : 0.0);
+    fprintf(stderr, " | 每轮 draft %.1f verify %.1f 恢复 %.1f ms | 崩轮 %llu\n",
+            R ? g_spec_stats.ms_draft / (double)R : 0.0, R ? g_spec_stats.ms_verify / (double)R : 0.0,
+            R ? g_spec_stats.ms_restore / (double)R : 0.0, (unsigned long long)g_spec_stats.crash_rounds);
+    fprintf(stderr, "ds4: spec 逐位接受率:");
+    for (int i = 0; i < 8; i++)
+        if (g_spec_stats.pos_test[i])
+            fprintf(stderr, " p%d=%.3f(n=%llu)", i + 1,
+                    (double)g_spec_stats.pos_hit[i] / (double)g_spec_stats.pos_test[i],
+                    (unsigned long long)g_spec_stats.pos_test[i]);
+    fprintf(stderr, " | 候选数分布:");
+    for (int k = 0; k < 8; k++)
+        if (g_spec_stats.k_hist[k]) fprintf(stderr, " k%d×%llu", k, (unsigned long long)g_spec_stats.k_hist[k]);
+    fprintf(stderr, "\n");
+}
 int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
@@ -81,43 +113,26 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             static double cal_sum[DS4_DSPARK_BLK] = {0};
             static double cal_hit[DS4_DSPARK_BLK] = {0};
             static uint32_t cal_n[DS4_DSPARK_BLK] = {0};
-            /* 投机开关闸(2026-08-21): drafter 不是白送的 —— 一轮草稿 ~9ms, 每个候选边际
-             * ~12ms。文本难预测时(bash/概念解释)接受率掉到 1.8, 投机反而比纯解码慢 20%。
-             * 在线对比两种模式的实测 token/ms, 谁快用谁, 并按固定比例回探另一种以便文本
-             * 变好预测时能切回来。纯解码轮直接走单 token 解码路 = 无损且零草稿开销。 */
-            static double md_tok[2] = {0, 0}, md_ms[2] = {0, 0};   /* 0=纯解码 1=投机 */
-            static uint32_t md_n[2] = {0, 0}, md_round = 0;
-            int mode = 1;
-            if (sched) {
-                /* 起步先给投机 16 轮把 T/m/校准跑热, 之后按实测吞吐择优, 每 32 轮回探 1 轮。 */
-                const int explore = (md_round % 32u) == 31u;
-                if (md_round >= 16u && md_n[0] >= 3u && md_n[1] >= 8u) {
-                    const double t0 = md_tok[0] / md_ms[0], t1 = md_tok[1] / md_ms[1];
-                    mode = (t1 >= t0 * 0.98) ? 1 : 0;   /* 平手偏投机(它还带 acc 上升空间) */
-                } else if (md_round >= 16u && md_n[0] < 3u) {
-                    mode = 0;                            /* 先取几个纯解码样本 */
-                }
-                if (explore) mode = 1 - mode;
-                md_round++;
-            }
+            /* 投机/纯解码的墙钟仲裁("谁快用谁", 08-21)已删(09-07): 它让温 0 的输出随时钟变(两次同参跑, 纯解码轮
+             * 5 vs 32, 文本从第 421 字节分叉), 温 0 必须可复现; 投机在同底座 drafter 下稳定快于纯解码, 慢就是核的
+             * 问题, 不靠回退遮。 */
             const double mode_t0 = now_sec();
-            if (sched && mode == 0) {
-                /* 纯解码轮: 提交 next, 不草稿不批验证 */
-                if (ds4_session_eval(s, next, err, errlen) != 0) { s->checkpoint_valid = false; return -1; }
-                accepted[n_acc++] = next;
-                const double dt = (now_sec() - mode_t0) * 1e3;
-                md_tok[0] += 1.0; md_ms[0] += dt; md_n[0]++;
-                /* 不喂 sch_tok/sch_ms: k 调度器的 T 是"投机模式下的吞吐", 掺进纯解码轮会
-                 * 抬高阈值 → k 变小 → 投机更差 → 更偏纯解码, 形成死亡螺旋。 */
-                continue;
-            }
 
             float conf[DS4_DSPARK_BLK] = {0};
-            uint32_t draft_n = sched ? (uint32_t)DS4_DSPARK_BLK : spec_k - 1u;
+            /* 草稿位数 = 候选上限 − 1 = 3(09-07): verify 批 ≤ 4 token 才走 VQ fused2 解码即乘核(fuse_max=4),
+             * 5~6 token 掉进 prefill 的 dequant+cuBLAS 路(实测 verify 393 ms/轮)。并集去重批核落地后再放开。 */
+            uint32_t draft_n = sched ? 3u : spec_k - 1u;
+            const double t_draft0 = now_sec();
             if (!metal_graph_dspark_step_n(&s->graph, &e->model, &e->weights, &e->dspark,
                                            next, pos_now - 1u, ids, draft_n,
                                            sched ? conf : NULL)) {
                 break;
+            }
+            g_spec_stats.ms_draft += (now_sec() - t_draft0) * 1e3;
+            {   /* 崩轮指纹(08-21): 草稿全 0 = drafter 输入态坏了, 整轮白验 */
+                int allz = 1;
+                for (uint32_t i = 0; i < draft_n; i++) if (ids[i] != 0) { allz = 0; break; }
+                if (allz) g_spec_stats.crash_rounds++;
             }
             uint32_t round_k = spec_k;
             if (sched) {
@@ -140,11 +155,26 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                 round_k = adm + 1u;
                 if (round_k < 2u) round_k = 2u;
                 if (round_k > (uint32_t)DS4_DSPARK_BLK + 1u) round_k = (uint32_t)DS4_DSPARK_BLK + 1u;
+                /* 09-07: 置信门控停用, 候选数钉死 = 草稿位 + 1。同底座 drafter 每位接受率 ~0.9, 而门控的阈值
+                 * T·m 随 verify 变快自动抬高, 实测把 k 压到 2(均接受 3.1 → 2.4, 36 → 31 t/s)。置信头留着当账。 */
+                round_k = draft_n + 1u;
             }
             for (uint32_t i = 0; i + 1u < round_k; i++) cand[1 + i] = ids[i];
-            if (!metal_graph_dspark_state_snapshot(&s->graph)) {
+            g_spec_stats.k_hist[round_k < 8u ? round_k : 7u]++;
+            /* ★先作废上一步解码预编码的 pos+1 图, 再快照★(09-07 定罪, 2.8K 意语分叉 + 1M "攒行 5 超 ratio 4" 同根):
+             * 预编码把 comp_x_pending/last_pos/n_comp 推到 pos+1 之后, 回滚原来发生在 verify 批里 —— 晚于这里的快照 ⇒
+             * 快照存的是污染值, 部分接受回滚后再快进一行, 攒行多 1: 凑巧 =ratio 时压缩块多混一行陈旧行(温 0 分叉),
+             * 超 ratio 时环拷贝越界/push 报错。 */
+            metal_graph_token_pending_discard(&s->graph);
+            /* 上下文末尾(09-07 1M 尺实撞 "token span exceeds context"): verify 批 round_k 个位置放不下就不再投机,
+             * 交回调用方按单 token 走完最后几位。 */
+            if (pos_now + round_k > (uint32_t)s->ctx_size) break;
+            const double t_snap0 = now_sec();
+            if (!metal_graph_dspark_state_snapshot(&s->graph, pos_now, round_k)) {
                 break;
             }
+            const double t_vfy0 = now_sec();
+            g_spec_stats.ms_restore += (t_vfy0 - t_snap0) * 1e3;
             s->graph.spec_comp_capture = 1;   /* verify 批捕获压缩器输入行(快进用) */
             if (ds4_session_verify_batch_argmax(s, cand, round_k, pos_now,
                                                 0u, (uint32_t)DS4_N_LAYER - 1u,
@@ -160,9 +190,13 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                 const float *row = row_logits + (uint64_t)i * DS4_N_VOCAB;
                 for (uint32_t v = 0; v < (uint32_t)DS4_N_VOCAB; v++)
                     if (row[v] > bb) { bb = row[v]; am = (int)v; }
+                g_spec_stats.pos_test[i < 8 ? i : 7]++;
                 if (am != cand[i + 1]) break;
+                g_spec_stats.pos_hit[i < 8 ? i : 7]++;
                 acc++;
             }
+            const double t_rst0 = now_sec();
+            g_spec_stats.ms_verify += (t_rst0 - t_vfy0) * 1e3;
             if (acc < (int)round_k &&
                 !metal_graph_spec_raw_restore(&s->graph, pos_now, (uint32_t)acc, round_k)) {
                 if (errlen) snprintf(err, errlen, "spec raw KV restore failed");
@@ -177,7 +211,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             /* timeline 已 commit 6 位 → 截到接受数 */
             s->checkpoint.len = (int)(pos_now + (uint32_t)acc);
             if (acc < (int)round_k) {
-                if (!metal_graph_dspark_state_restore(&s->graph)) break;
+                if (!metal_graph_dspark_state_restore(&s->graph, (uint32_t)acc)) break;
                 if (!metal_graph_spec_comp_fastforward(&s->graph, &e->model, &e->weights,
                                                        pos_now, (uint32_t)acc)) {
                     /* replay 消除(2026-08-20): KV raw 行 verify 已写好且 restore 不动;
@@ -190,9 +224,12 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             }
             memcpy(s->logits, row_logits + (uint64_t)(acc - 1) * DS4_N_VOCAB,
                    (size_t)DS4_N_VOCAB * sizeof(float));
+            g_spec_stats.ms_restore += (now_sec() - t_rst0) * 1e3;
+            {
+                const double dt_round = (now_sec() - mode_t0) * 1e3;
+                g_spec_stats.rounds_spec++; g_spec_stats.tok_spec += (uint64_t)acc; g_spec_stats.ms_spec += dt_round;
+            }
             if (sched) {
-                const double dt_mode = (now_sec() - mode_t0) * 1e3;
-                md_tok[1] += (double)acc; md_ms[1] += dt_mode; md_n[1]++;
                 /* 校准喂数: 草稿位 j 被真正验证过(前缀全接受)才计数; j = acc-1 是被拒的那位。 */
                 for (uint32_t j = 0; j + 1u < round_k && j < (uint32_t)acc; j++) {
                     cal_n[j]++; cal_sum[j] += (double)conf[j];

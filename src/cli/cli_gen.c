@@ -168,6 +168,7 @@ int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, const ds4_
             "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
             prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
             decode_s > 0.0 ? (double)generated / decode_s : 0.0);
+    ds4_spec_stats_print();
 
     ds4_session_free(session);
     return 0;

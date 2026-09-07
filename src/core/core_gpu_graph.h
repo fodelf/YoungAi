@@ -12,11 +12,11 @@
  * than a semantic approximation: all Metal attention consumers already run the
  * compressed K/V rows through F16 FlashAttention/indexed-attention paths.
  */
-#if defined(__APPLE__)
-#define DS4_GPU_ATTN_COMP_CACHE_F16 1
-#else
-#define DS4_GPU_ATTN_COMP_CACHE_F16 0
-#endif
+/* 压缩缓存(attn comp 行)与 indexer 缓存两后端一律 f16, 无开关(09-07)。 */
+/* indexer 压缩缓存(2026-09-06, 1M 战役): 两个后端一律 f16, 没有开关。行值是 hadamard+FP4 QAT 后的量化格点
+ * (f32 里存的就是 scale×小整数), f16 存几乎无损; 写入一律"f32 暂存(attn_comp_stage) → QAT → 提交转 f16"
+ * (core_gpu_decode_util.c), 快照/调试导出仍按 f32 外部格式。曾做成 Apple 0/CUDA 1 的开关: 暂存分配与容量挂在
+ * 另一个开关下, 两开关不同步 ⇒ CUDA 运行时炸两次(09-06), 故拔掉。 */
 
 /* =========================================================================
  * Metal Release Graph State.
@@ -85,6 +85,16 @@ typedef struct {
     ds4_gpu_tensor *spec_comp_rows_sc[DS4_MAX_LAYER];
     ds4_gpu_tensor *spec_idx_rows_kv[DS4_MAX_LAYER];
     ds4_gpu_tensor *spec_idx_rows_sc[DS4_MAX_LAYER];
+    /* 09-07 小批压缩器改走解码攒行机制: 轮前快照要带上环里攒着的行 + 计数(comp_x_pending/last_pos), 部分接受后
+     * 恢复再按接受位重放 push/emit。spec_ring_save[il] = ratio 行 × DS4_N_EMBD f32(懒分配, 非 capture 时机)。 */
+    ds4_gpu_tensor *spec_ring_save[DS4_MAX_LAYER];
+    uint32_t spec_prefix1_x_pending[DS4_MAX_LAYER];
+    uint32_t spec_prefix1_x_last[DS4_MAX_LAYER];
+    /* 按需快照(09-07): 批内 emit 位 t_e(无则 -1)。压缩器 state 只在 emit 位变, 所以只有 t_e ≥ 1 的层要拷 state/环/行;
+     * 回滚只在 t_e ≥ acc(emit 用了被拒行)时做, 其余层只改计数。此前每轮 43 层全拷 = 500 次 memcpy/轮。 */
+    int8_t   spec_emit_t[DS4_MAX_LAYER];
+    uint32_t spec_pos0, spec_k;
+    ds4_gpu_tensor *spec_heads_alt;   /* 小批跨 indexer 门槛轮的稠密注意力暂存(8 行, 懒分配) */
     int spec_comp_capture;
     bool spec_capture_prefix1;
     uint32_t raw_cap;
@@ -107,6 +117,14 @@ typedef struct {
      * so the side chain must not share them (2026-08-19 determinism fix). */
     ds4_gpu_tensor *comp_kv_side;
     ds4_gpu_tensor *comp_sc_side;
+    /* 压缩器投影攒批(2026-09-05, core_gpu_decode_comp.c): 每压缩层一个 x 行环(ratio 行×n_embd),
+     * 解码每 token 只推一行, emit 时一次算攒下的 n 行投影进 comp_kv_batch/comp_sc_batch
+     * (128 行×最大压缩宽)。pending = 环上攒着还没入 state 的行数, last_pos = 最后推入的 pos。 */
+    ds4_gpu_tensor *comp_x_ring[DS4_MAX_LAYER];
+    uint32_t comp_x_pending[DS4_MAX_LAYER];
+    uint32_t comp_x_last_pos[DS4_MAX_LAYER];
+    ds4_gpu_tensor *comp_kv_batch;
+    ds4_gpu_tensor *comp_sc_batch;
     ds4_gpu_tensor *attn_comp_stage;
     ds4_gpu_tensor *indexer_q;
     ds4_gpu_tensor *indexer_weights;
@@ -250,6 +268,27 @@ typedef struct {
     uint32_t tp_layers;
     bool tp_owns_low; /* true ⇒ this peer owns the low half of routed_out */
     float *tp_vec;    /* host staging buffer [DS4_N_EMBD], allocated when tp set */
+    /* 预发射(2026-09-07, core_gpu_imatrix.c metal_graph_eval_token_raw_swa): 贪心解码把 pos+1 的图在
+     * pos 图跑完前排进流, token 由图末尾的设备 argmax 供给。只在 pos+1 非 emit 位做(设备侧只写可覆写
+     * 行), 主机计数器留快照, 调用方喂的 token 与设备 argmax 不一致时回滚重编码。 */
+    float *logits_pinned;        /* 本图 logits 异步回传落点(pinned, DS4_N_VOCAB) */
+    int32_t *tok_next_pinned;    /* 本图设备 argmax 回传落点 */
+    int prelaunch_capable;       /* 0 未查, 1 能(CUDA), -1 不能(Metal) */
+    int prelaunch_want;          /* 会话声明: 下一 token = 无惩罚 argmax(core_session_sample.c) */
+    int argmax_exclude;          /* argmax 排除的 id(-1 无; ds4-bench 排除 EOS 保持续写) */
+    int64_t prelaunched_pos;     /* 已预发射的位置(-1 无) */
+    int32_t prelaunched_token;   /* 预发射图消费的 token = 上一图 logits 的设备 argmax */
+    /* 已预捕获(未必预发射)的位置(-1 无): 预捕获 = 在捕获态 encode pos+1, 主机计数器(layer_n_comp/
+     * comp_x_pending)已按 pos+1 推进。下一步若不是 eval(pos+1)(投机 verify 批/回退), 必须先回滚到
+     * snap_* 并作废待发射图(metal_graph_token_pending_discard), 否则 pos+1 被推进两次(09-07 定罪:
+     * --spec 首跑 "cuda decode failed")。 */
+    int64_t pend_pos;
+    uint32_t snap_n_comp[DS4_MAX_LAYER];        /* 预捕获前的主机计数器快照(对账失败时回滚) */
+    uint32_t snap_n_index_comp[DS4_MAX_LAYER];
+    uint32_t snap_x_pending[DS4_MAX_LAYER];
+    /* 09-07 定罪: 预编码 pos+1 的 comp_push 把 comp_x_last_pos 推到 pos+1, 回滚漏了它 ⇒ 投机第 1 轮快照按陈旧 last_pos 算
+     * 攒行环保存段(错一格), 部分接受回滚把错位段写回环, ratio-4 层那块压缩行被污染(2.8K 意语第 377 字节分叉, pos0%4==2/3 相位才撞)。 */
+    uint32_t snap_x_last[DS4_MAX_LAYER];
 } ds4_gpu_graph;
 
 
@@ -294,6 +333,10 @@ int attn_output_kq_batch(const ds4_tensor *a, ds4_gpu_tensor *out, ds4_gpu_tenso
 int dense_matmul_pair_typed(ds4_gpu_tensor *out0, ds4_gpu_tensor *out1, const ds4_model *m, const ds4_tensor *w0, const ds4_tensor *w1, uint64_t in_dim, uint64_t out0_dim, uint64_t out1_dim, const ds4_gpu_tensor *x);
 int dense_matmul_typed(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor *w, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok);
 void eval_hdump_batch_layer(ds4_gpu_graph *g, uint32_t il, uint32_t n_tokens);
+void eval_hdump_tensor_rows(const ds4_gpu_tensor *hc, uint32_t il, uint32_t n_tokens);
+void eval_hdump_raw_rows(const ds4_gpu_tensor *raw, uint32_t tag, uint32_t slot0, uint32_t n, uint32_t raw_cap);   /* --eval-hdump 通用行写出(解码路也用) */
+void eval_hdump_pos(uint32_t pos0, uint32_t n);                 /* --eval-hdump 位置边车 h_pos.bin(与 L99 同序, 脚本按位置对齐) */
+void eval_hdump_logits_rows(const float *logits, uint32_t n);   /* --eval-hdump 主机侧 logits 行 h_L96.bin(与 L99 同序) */
 void forward_token_raw_swa_cpu( float * logits, const ds4_model * model, const ds4_weights * weights, ds4_kv_cache * cache, int token, uint32_t pos);
 int generate_metal_graph_raw_swa( const ds4_model * model, const ds4_vocab * vocab, const ds4_weights * weights, const token_vec * prompt, int n_predict, int ctx_size, bool quality, int power_percent, const char * directional_steering_file, float directional_steering_attn, float directional_steering_ffn, ds4_token_emit_fn emit, ds4_generation_done_fn done, void * emit_ud, ds4_session_progress_fn progress, void * progress_ud);
 void graph_power_note_decode_token(ds4_gpu_graph *g, double elapsed_sec);
@@ -306,16 +349,28 @@ bool imatrix_collector_save( const ds4_imatrix_collector *c, const ds4_weights *
 float max_abs_diff(const float *a, const float *b, uint64_t n);
 ds4_gpu_tensor *metal_graph_alloc_kv_cache_tensor(bool managed, uint64_t bytes);
 bool metal_graph_alloc_raw_cap( ds4_gpu_graph *g, const ds4_weights *weights, const ds4_layer_weights *layer, uint32_t raw_cap, uint32_t ctx_size, uint32_t prefill_cap, bool enable_mtp, uint32_t active_layer_start, uint32_t active_layer_end, bool active_layer_slice);
-ds4_gpu_tensor *metal_graph_attn_comp_row_view( ds4_gpu_graph *g, uint32_t il, uint32_t row);
-uint32_t metal_graph_attn_comp_update_row(uint32_t row);
-ds4_gpu_tensor *metal_graph_attn_comp_update_target( ds4_gpu_graph *g, uint32_t il);
+/* 两种缓存(压缩行 / indexer 行)恒 f16: 写入方把 f32 行写进 g->attn_comp_stage 行 0 起并做量化, 然后由 commit 抄成 f16 落缓存 */
 bool metal_graph_commit_attn_comp_stage( ds4_gpu_graph *g, uint32_t il, uint32_t first_row, uint32_t rows);
+bool metal_graph_commit_index_comp_stage(ds4_gpu_graph *g, uint32_t il, uint32_t first_row, uint32_t rows);
+/* 压缩器投影攒批(core_gpu_decode_comp.c): push 每 token 一行; project_pending 在 emit 位一次算
+ * 攒下的 n 行到 comp_kv_batch/comp_sc_batch; flush_pending 是非解码入口(prefill/快照/回卷)
+ * 前的强制冲刷(只入 state 不池化); pending_clear 在 state 被整体重建/重载后调。 */
+bool metal_graph_comp_push(ds4_gpu_graph *g, uint32_t il, uint32_t ratio, uint32_t pos);
+bool metal_graph_comp_push_row(ds4_gpu_graph *g, uint32_t il, uint32_t ratio, uint32_t pos, const ds4_gpu_tensor *row);
+bool metal_graph_comp_emit_step(ds4_gpu_graph *g, const ds4_model *model, const ds4_layer_weights *layer,
+                                uint32_t il, uint32_t ratio, bool compressed, float freq_base, float freq_scale,
+                                float ext_factor, float attn_factor);
+bool metal_graph_comp_project_pending( ds4_gpu_graph *g, const ds4_model *model, const ds4_tensor *kv_weight, const ds4_tensor *gate_weight, uint32_t il, uint32_t ratio, uint32_t width, uint32_t *n_out, uint32_t *pos0_out);
+bool metal_graph_comp_flush_pending(ds4_gpu_graph *g, const ds4_model *model, const ds4_weights *weights);
+void metal_graph_comp_pending_clear(ds4_gpu_graph *g);
 uint64_t metal_graph_context_bytes_for_kv_policy( uint32_t ctx_size, uint32_t raw_cap, uint32_t prefill_cap, uint64_t *kv_cache_bytes_out);
 bool metal_graph_decode_hc_pre( ds4_gpu_tensor *out, ds4_gpu_tensor *split, const ds4_gpu_tensor *mix, const ds4_gpu_tensor *residual_hc, const ds4_model *model, uint64_t scale_offset, uint64_t base_offset);
 int metal_graph_decode_test( const ds4_model *model, const ds4_weights *weights, const token_vec *prompt);
 bool metal_graph_directional_steering_ffn_enabled(const ds4_gpu_graph *g);
-bool metal_graph_dspark_state_restore(ds4_gpu_graph *g);
-bool metal_graph_dspark_state_snapshot(ds4_gpu_graph *g);
+bool metal_graph_dspark_state_restore(ds4_gpu_graph *g, uint32_t acc);
+bool metal_graph_dspark_state_snapshot(ds4_gpu_graph *g, uint32_t pos0, uint32_t k);
+void metal_graph_token_pending_discard(ds4_gpu_graph *g);   /* 预捕获图作废 + 主机计数器回滚(见 pend_pos) */
+void metal_graph_token_pending_forget(ds4_gpu_graph *g);    /* 只作废不回滚: 计数器已被外部整体改写时用 */
 bool metal_graph_dspark_step( ds4_gpu_graph *g, const ds4_model *model, const ds4_weights *weights, const ds4_dspark_weights *dw, int anchor_token, uint32_t pos, int out_ids[DS4_DSPARK_BLK]);
 bool metal_graph_dspark_step_n( ds4_gpu_graph *g, const ds4_model *model, const ds4_weights *weights, const ds4_dspark_weights *dw, int anchor_token, uint32_t pos, int out_ids[DS4_DSPARK_BLK], uint32_t n_need, float *out_conf);
 bool metal_graph_dspark_win_commit(ds4_gpu_graph *g, uint32_t pos0, uint32_t n_acc);
@@ -366,9 +421,6 @@ void engine_register_layer_routers(ds4_engine *e, uint32_t start, uint32_t end);
 bool metal_graph_alloc( ds4_gpu_graph *g, const ds4_weights *weights, const ds4_layer_weights *layer);
 bool metal_graph_apply_directional_steering_attn( ds4_gpu_graph *g, ds4_gpu_tensor *x, uint32_t il, uint32_t rows);
 bool metal_graph_apply_directional_steering_ffn( ds4_gpu_graph *g, ds4_gpu_tensor *x, uint32_t il, uint32_t rows);
-uint32_t metal_graph_attn_comp_cache_is_f16(void);
-ds4_gpu_tensor *metal_graph_attn_comp_prefill_target( ds4_gpu_graph *g, uint32_t il, uint32_t first_row, uint32_t rows);
-void metal_graph_attn_comp_prefill_target_free(ds4_gpu_tensor *t);
 bool metal_graph_capture_prefix1_attn_state(ds4_gpu_graph *g, uint32_t il);
 bool metal_graph_capture_prefix1_index_state(ds4_gpu_graph *g, uint32_t il);
 uint32_t metal_graph_decode_indexer_sparse_threshold(const ds4_gpu_graph *g);
@@ -381,6 +433,9 @@ uint32_t metal_graph_raw_start_for_span( const ds4_gpu_graph *g, uint32_t last_p
 bool metal_graph_refresh_ratio4_compressor_state( ds4_gpu_graph *g, const ds4_model *model, ds4_gpu_tensor *state_kv, ds4_gpu_tensor *state_score, const ds4_tensor *kv_weight, const ds4_tensor *score_weight, const ds4_tensor *ape, uint32_t head_dim, uint32_t width, uint32_t pos0, uint32_t n_tokens);
 int payload_read_tensor_span(FILE *fp, ds4_gpu_tensor *tensor, uint64_t offset, uint64_t bytes, uint8_t *buf, size_t cap, uint64_t *remaining, char *err, size_t errlen);
 DS4_MAYBE_UNUSED int payload_read_tensor_span_f32_as_f16(FILE *fp, ds4_gpu_tensor *tensor, uint64_t offset_f16, uint64_t count, uint8_t *buf, size_t cap, uint64_t *remaining, char *err, size_t errlen);
+/* 压缩缓存行格式 ↔ 外部 f32 行(core_payload.c) */
+DS4_MAYBE_UNUSED int payload_write_comp_rows_as_f32(FILE *fp, const ds4_gpu_tensor *tensor, uint64_t rows, uint8_t *buf, size_t cap, char *err, size_t errlen);
+DS4_MAYBE_UNUSED int payload_read_f32_as_comp_rows(FILE *fp, ds4_gpu_tensor *tensor, uint64_t rows, uint8_t *buf, size_t cap, uint64_t *remaining, char *err, size_t errlen);
 
 #endif /* !DS4_NO_GPU */
 #endif /* DS4_CORE_GPU_GRAPH_H */

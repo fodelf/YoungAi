@@ -30,6 +30,9 @@ bool metal_graph_alloc_raw_cap(
         uint32_t                active_layer_end,
         bool                    active_layer_slice) {
     memset(g, 0, sizeof(*g));
+    g->argmax_exclude = -1;     /* 0 是合法 token id, 不能拿零值当"无排除" */
+    g->prelaunched_pos = -1;
+    g->pend_pos = -1;
     /* 捕获(40..42 层 HC-mean + drafter 环形窗)只在 --spec 武装时跑: 投机关着时它是
      * 纯 prefill 开销零收益(2026-08-31 收口)。 */
     g->dspark_capture = (g_dspark_ready_global && g_ds4_spec_enabled) ? 1 : 0;
@@ -50,6 +53,13 @@ bool metal_graph_alloc_raw_cap(
     if (weights && (!layer || !layer->attn_norm)) {
         layer = &weights->layer[active_layer_start];
     }
+    /* 压缩缓存行格式钉死 head_dim 512 / n_rot 64(ds4_gpu_core.h DS4_GPU_COMP_ROW_*); 形状不符的模型拒绝启动, 不许静默错位 */
+    if (DS4_N_HEAD_DIM != DS4_GPU_COMP_ROW_NOPE + DS4_GPU_COMP_ROW_ROT || DS4_N_ROT != DS4_GPU_COMP_ROW_ROT) {
+        fprintf(stderr, "ds4: compressed KV row format expects head_dim %u / n_rot %u, model has %u / %u\n",
+                DS4_GPU_COMP_ROW_NOPE + DS4_GPU_COMP_ROW_ROT, DS4_GPU_COMP_ROW_ROT,
+                (unsigned)DS4_N_HEAD_DIM, (unsigned)DS4_N_ROT);
+        return false;
+    }
     g->mtp_enabled = enable_mtp;
     /* Single-machine copy-spec reuses the spec frontier snapshot buffers
      * (spec_attn/index_state_{kv,score}), so allocate those when copy-spec is on,
@@ -69,8 +79,8 @@ bool metal_graph_alloc_raw_cap(
     g->prefill_cap = prefill_cap;
     const uint32_t min_ratio = ds4_min_compress_ratio(ctx_size);
     g->comp_cap = ds4_comp_cap_for(ctx_size, min_ratio);
-    if (DS4_GPU_ATTN_COMP_CACHE_F16)
-        g->attn_comp_stage_cap = ds4_comp_cap_for(prefill_cap, min_ratio);
+    /* f32 暂存容量(indexer 缓存恒 f16, Metal 的压缩缓存也 f16): 容量为 0 ⇒ 暂存提交必败(09-06 CUDA 实撞) */
+    g->attn_comp_stage_cap = ds4_comp_cap_for(prefill_cap, min_ratio);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) {
@@ -151,10 +161,12 @@ bool metal_graph_alloc_raw_cap(
             const uint64_t attn_rows = (uint64_t)coff * ratio;
             g->layer_attn_comp_cache[il] = metal_graph_alloc_kv_cache_tensor(
                     managed_kv_cache,
-                    (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM *
-                    (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float)));
+                    (uint64_t)g->layer_comp_cap[il] * DS4_GPU_COMP_ROW_BYTES);   /* 行格式见 ds4_gpu_core.h */
             g->layer_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
             g->layer_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
+            /* 压缩器攒批 x 环: ratio 行 × n_embd f32(ratio-4 64 KB, ratio-128 2 MB), 见 core_gpu_decode_comp.c */
+            g->comp_x_ring[il] = ds4_gpu_tensor_alloc((uint64_t)ratio * DS4_N_EMBD * sizeof(float));
+            g->comp_x_pending[il] = 0;
             if (enable_spec) {
                 g->spec_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
                 g->spec_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
@@ -177,7 +189,8 @@ bool metal_graph_alloc_raw_cap(
                 const uint64_t index_rows = (uint64_t)coff * ratio;
                 g->layer_index_comp_cache[il] = metal_graph_alloc_kv_cache_tensor(
                         managed_kv_cache,
-                        (uint64_t)g->layer_comp_cap[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+                        (uint64_t)g->layer_comp_cap[il] * DS4_N_INDEXER_HEAD_DIM *
+                        sizeof(uint16_t));   /* indexer 缓存恒 f16(core_gpu_graph.h) */
                 g->layer_index_state_kv[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
                 g->layer_index_state_score[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
                 if (enable_spec) {
@@ -203,10 +216,12 @@ bool metal_graph_alloc_raw_cap(
     g->comp_sc_cur = ds4_gpu_tensor_alloc(comp_width_max * sizeof(float));
     g->comp_kv_side = ds4_gpu_tensor_alloc(comp_width_max * sizeof(float));
     g->comp_sc_side = ds4_gpu_tensor_alloc(comp_width_max * sizeof(float));
-    if (DS4_GPU_ATTN_COMP_CACHE_F16) {
-        g->attn_comp_stage = ds4_gpu_tensor_alloc((uint64_t)g->attn_comp_stage_cap *
-                                                  DS4_N_HEAD_DIM * sizeof(float));
-    }
+    /* 攒批投影输出: 最多 128 行(ratio-128 一整块) × 最大压缩宽 */
+    g->comp_kv_batch = ds4_gpu_tensor_alloc(128ull * comp_width_max * sizeof(float));
+    g->comp_sc_batch = ds4_gpu_tensor_alloc(128ull * comp_width_max * sizeof(float));
+    /* f32 暂存: indexer 缓存(两后端 f16)与 Metal 压缩缓存(f16)的写入中转, 无条件分配 */
+    g->attn_comp_stage = ds4_gpu_tensor_alloc((uint64_t)g->attn_comp_stage_cap *
+                                              DS4_N_HEAD_DIM * sizeof(float));
     g->indexer_q = ds4_gpu_tensor_alloc(indexer_q_dim * sizeof(float));
     g->indexer_weights = ds4_gpu_tensor_alloc((uint64_t)DS4_N_INDEXER_HEAD * sizeof(float));
     g->indexer_scores = ds4_gpu_tensor_alloc((uint64_t)g->comp_cap * pc * sizeof(float));
@@ -342,7 +357,8 @@ bool metal_graph_alloc_raw_cap(
                     g->attn_cur && g->attn_norm && g->qr && g->qr_norm &&
                     g->q && g->kv_raw && g->kv &&
                     g->comp_kv_cur && g->comp_sc_cur &&
-                    (!DS4_GPU_ATTN_COMP_CACHE_F16 || g->attn_comp_stage) &&
+                    g->comp_kv_batch && g->comp_sc_batch &&
+                    g->attn_comp_stage &&
                     g->indexer_q && g->indexer_weights && g->indexer_scores &&
                     g->comp_mask && g->comp_selected &&
                     g->heads && g->attn_low && g->attn_out &&

@@ -333,6 +333,9 @@ int ds4_session_verify_batch_argmax(ds4_session *s,
                                                      0,
                                                      n_tokens);
     }
+    /* 上一 token 的 eval 已为 pos0 预捕获了单 token 图并推进了主机计数器; 本批要自己走 pos0.. ⇒ 作废+回滚 */
+    metal_graph_token_pending_discard(g);
+    if (ok) { eval_hdump_tensor_rows(g->batch_cur_hc, 99u, n_tokens); eval_hdump_pos(pos0, n_tokens); }   /* --eval-hdump: verify 批的嵌入行(L99) + 位置边车 */
     if (ok) ok = ds4_gpu_begin_commands() != 0;
     /* 批 CUDA 图(2026-08-21): 43 层 ~3.5k kernel 的相邻间隙吃掉 31% GPU 时间。
      * 捕获成图后单次发射, 间隙归零。编码会推进 host 侧压缩器计数 ⇒ 捕获失败必须先
@@ -342,24 +345,37 @@ int ds4_session_verify_batch_argmax(ds4_session *s,
         saved_n_comp[il] = g->layer_n_comp[il];
         saved_n_index[il] = g->layer_n_index_comp[il];
     }
-    const int bgraph = (ok && layer_start == 0) ? ds4_gpu_batch_graph_begin((int)(pos0 & 3u)) : 0;
-    for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
+    /* 首次 verify 不捕获: 批路里的懒分配(spec_comp_rows/分行核暂存/tmp arena 增长)要在非 capture 时机做完;
+     * 第二次起按 (pos0&3) 四相捕获重放。 */
+    static uint32_t verify_calls = 0;
+    /* 图只包 0..39 层: 40~42 层里有 DSpark 建窗(drafter q8_0 主投影走 cuBLAS f16 影子 GEMM), cuBLAS GemmEx 在流捕获态
+     * 恒报 status 14(固定工作区 + relaxed 模式都救不回, 09-07 实撞) ⇒ 那三层直发。 */
+    const uint32_t graph_end = (layer_end < 39u) ? layer_end : 39u;
+    const int bgraph = (ok && layer_start == 0 && verify_calls++ >= 1u) ? ds4_gpu_batch_graph_begin((int)(pos0 & 3u)) : 0;
+    for (uint32_t il = layer_start; ok && il <= graph_end; il++) {
         ok = metal_graph_encode_layer_batch(g, &e->model, &e->weights.layer[il],
                                             il, pos0, n_tokens);
     }
+    bool graph_failed = false;
     if (bgraph) {
         const int r = ds4_gpu_batch_graph_end_launch(ok ? 1 : 0);
         if (r < 0) {   /* 捕获失败: 图内 kernel 未执行 ⇒ 还原计数后重编码直发 */
+            graph_failed = true;
             for (uint32_t il = 0; il < (uint32_t)DS4_N_LAYER; il++) {
                 g->layer_n_comp[il] = saved_n_comp[il];
                 g->layer_n_index_comp[il] = saved_n_index[il];
             }
             ok = true;
-            for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
+            for (uint32_t il = layer_start; ok && il <= graph_end; il++) {
                 ok = metal_graph_encode_layer_batch(g, &e->model, &e->weights.layer[il],
                                                     il, pos0, n_tokens);
             }
         }
+    }
+    (void)graph_failed;
+    for (uint32_t il = graph_end + 1u; ok && il <= layer_end; il++) {   /* 40..42 直发 */
+        ok = metal_graph_encode_layer_batch(g, &e->model, &e->weights.layer[il],
+                                            il, pos0, n_tokens);
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     (void)ds4_gpu_synchronize();
@@ -379,6 +395,7 @@ int ds4_session_verify_batch_argmax(ds4_session *s,
     if (ok) {
         ok = ds4_gpu_tensor_read(g->spec_logits, 0, row_logits,
                                  (uint64_t)n_tokens * DS4_N_VOCAB * sizeof(row_logits[0])) != 0;
+        if (ok) eval_hdump_logits_rows(row_logits, n_tokens);   /* --eval-hdump: verify 批 logits 行(L96) */
     }
     if (!ok) {
         if (errlen) snprintf(err, errlen, "%s verify batch output head failed",
