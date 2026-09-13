@@ -35,6 +35,19 @@ set -e
 REPO=${HF_REPO:-deepseek-ai/DeepSeek-V4-Flash-Base}
 ENDPOINT=${HF_ENDPOINT:-https://huggingface.co}
 
+# --- 双源下载 (--ms-repo, 2026-09-10) ---------------------------------------
+# 起因: spark(Linux, 无梯子)从国内直连 huggingface.co 直接超时, 借 Mac 的 clash 走
+# ssh 反向隧道只有 0.76 MB/s, hf-mirror 直连 4 并发 10.7 MB/s, 而 modelscope.cn
+# 直连 4 并发实测 64.5 MB/s —— 差 6 倍。但 ModelScope 的 V4.1 仓库只同步了 1-44 片,
+# 缺 45-48(MTP×2 + layers.1/14.engram×2, 合计 194 GiB), 那 4 片只能回落 HF 侧。
+# 所以按"这个文件 ModelScope 有没有"逐个选源: 有就走快路, 没有就走 --endpoint。
+# 不分源会怎样: 全压 hf-mirror, 281 GiB 的大头白白慢 6 倍; 全压 ModelScope 则
+# 45-48 片 404, 下出来的模型缺 engram 和 MTP, 加载时报张量缺失而不是下载失败。
+# --ms-repo 留空 = 关闭双源, 脚本行为与加这段之前完全一致。
+MS_REPO=${MS_REPO:-}
+MS_ENDPOINT=https://modelscope.cn
+MS_LIST=""   # ModelScope 侧实际存在的文件名, 换行分隔; 启动时拉一次
+
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${DS4_HF_DIR:-}
 OUT_DIR_SET=0; [ -n "$OUT_DIR" ] && OUT_DIR_SET=1
@@ -134,6 +147,14 @@ Options:
                           --relay-reserve GiB free locally as staging scratch.
   --relay-reserve N       GiB to keep free locally for relay staging (default 14).
   --repo REPO             HF repo to download (default: $REPO).
+  --endpoint URL          HF-compatible host for the API and for any file the
+                          ModelScope lane does not have (default: $ENDPOINT).
+                          Use https://hf-mirror.com from a host with no VPN.
+  --ms-repo REPO          Also pull from ModelScope, per file: anything that repo
+                          has comes from modelscope.cn (measured 64.5 MB/s on
+                          spark vs 10.7 on hf-mirror), the rest from --endpoint.
+                          Sizes are still checked against the --endpoint list.
+                          Omit it to keep the old single-source behaviour.
   --local-share F         Aim F (0..1) of the model at the local disk instead of
                           filling local first. Set it to the local host's share
                           of the two download rates so both finish together.
@@ -179,6 +200,12 @@ while [ $# -gt 0 ]; do
         --repo)
             shift; [ $# -gt 0 ] || { echo "Missing value after --repo" >&2; exit 1; }
             REPO=$1 ;;
+        --endpoint)
+            shift; [ $# -gt 0 ] || { echo "Missing value after --endpoint" >&2; exit 1; }
+            ENDPOINT=${1%/} ;;
+        --ms-repo)
+            shift; [ $# -gt 0 ] || { echo "Missing value after --ms-repo" >&2; exit 1; }
+            MS_REPO=$1 ;;
         --remote-mode)
             shift; [ $# -gt 0 ] || { echo "Missing value after --remote-mode" >&2; exit 1; }
             REMOTE_MODE=$1
@@ -259,6 +286,41 @@ if [ "$CONFIG_ONLY" = 1 ]; then
 fi
 
 total_bytes=$(printf '%s\n' "$LIST" | awk -F"$TAB" '{ if ($1>0) t+=$1 } END { printf "%.0f", t+0 }')
+
+# ModelScope 侧的文件清单。只用来判断"这个文件能不能走快路", 大小/总量仍以上面的
+# HF 清单为准 —— 两边同名文件已逐片核对过字节一致(1-44 片, 首片 970533624)。
+# 拉不到就静默退回单源: 少一条快路不该让整个下载失败。
+if [ -n "$MS_REPO" ]; then
+    echo "Fetching ModelScope file list for $MS_REPO ..."
+    MS_LIST=$(curl -fsSL --noproxy '*' --max-time 60 \
+        "$MS_ENDPOINT/api/v1/models/$MS_REPO/repo/files?Revision=master&Recursive=true" \
+        | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for f in d.get("Data", {}).get("Files", []) or []:
+    n = f.get("Name")
+    if n: print(n)
+' 2>/dev/null) || MS_LIST=""
+    if [ -n "$MS_LIST" ]; then
+        echo "ModelScope has $(printf '%s\n' "$MS_LIST" | grep -c '\.safetensors$') safetensors shards (fast lane)"
+    else
+        echo "ModelScope list unavailable -- falling back to $ENDPOINT for everything" >&2
+    fi
+fi
+
+# 逐文件选源: ModelScope 有就走它(快 6 倍), 否则回落 --endpoint。
+shard_url() { # name -> url on stdout
+    _su_n=$1
+    if [ -n "$MS_LIST" ] && printf '%s\n' "$MS_LIST" | grep -qxF "$_su_n"; then
+        printf '%s/api/v1/models/%s/repo?Revision=master&FilePath=%s' \
+            "$MS_ENDPOINT" "$MS_REPO" "$_su_n"
+    else
+        printf '%s/%s/resolve/main/%s' "$ENDPOINT" "$REPO" "$_su_n"
+    fi
+}
 
 # --- free space on each disk -------------------------------------------------
 
@@ -385,6 +447,12 @@ fi
 # --- downloaders -------------------------------------------------------------
 
 file_size_local() { [ -f "$1" ] && wc -c < "$1" | tr -d ' ' || echo 0; }
+
+# API 报的 size 只对 LFS 文件(权重分片)可信。普通小文件拿到的是 git blob 大小,
+# 跟镜像实际吐出的字节常对不上 —— 实测 hf-mirror 上 README.md api=1622 实际=12944,
+# encoding/encoding.py api=35338 实际=35310。拿它当完成判据, 这些文件会永远"没下完",
+# 每轮重下一次且永不转正。1 MiB 以上按 LFS 严格逐字节卡, 以下只要求非空。
+size_trusted() { [ "$1" -ge 1048576 ] 2>/dev/null; }
 file_size_remote() { # always emits an integer (0 if missing/unreachable)
     # </dev/null: ssh must NOT read the caller's stdin (it would swallow the
     # PLAN file when called inside a `while read ... < PLAN` loop).
@@ -396,9 +464,18 @@ have_aria2=0
 [ "$USE_ARIA2" = 1 ] && command -v aria2c >/dev/null 2>&1 && have_aria2=1
 
 download_local() { # size name
-    size=$1; name=$2; out="$OUT_DIR/$name"; url="$ENDPOINT/$REPO/resolve/main/$name"
+    size=$1; name=$2; out="$OUT_DIR/$name"; url=$(shard_url "$name")
+    # 仓库里带子目录的文件(V4.1 有 encoding/ assets/ inference/ evaluation/)必须先
+    # 建父目录: aria2c 会自己建, curl 不会 —— 它报 "(23) Failure writing output to
+    # destination" 然后被上面的重试循环反复重试到耗尽, 看着像网络问题, 其实是本地
+    # 目录不存在。老的 BASE 仓库全是平铺文件, 所以这条路一直没被走到过。
+    case "$name" in */*) mkdir -p "$(dirname "$out")" ;; esac
     have=$(file_size_local "$out")
-    if [ "$size" -ge 0 ] 2>/dev/null && [ "$have" = "$size" ]; then echo "ok  L  $name ($(human "$size"))"; return; fi
+    if size_trusted "$size"; then
+        [ "$have" = "$size" ] && { echo "ok  L  $name ($(human "$size"))"; return; }
+    else
+        [ "$have" -gt 0 ] && { echo "ok  L  $name ($(human "$have"))"; return; }
+    fi
     echo "get L  $name ($(human "$size"))"
     if [ "$have_aria2" = 1 ]; then
         # Flaky proxy/CDN + 1h-expiring HF presigned URLs: retry forever (each
@@ -418,10 +495,40 @@ download_local() { # size name
         # -s: this runs for hours into a log file; curl's progress meter would
         # bury the get/ok lines under megabytes of redraw noise. Progress is
         # observed from the file sizes instead (tools/dl_0731_progress.sh).
-        set -- -fsSL -C -
+        # 僵死熔断 (2026-09-10): 这条 curl 以前只有 -fsSL -C -, 没有超时也没有重试。
+        # hf-mirror 的连接会挂住既不返回也不报错 —— 实测 encoding/ 里几 KB 的小文件
+        # 卡了十分钟 0 字节, 而 aria2c 分支一直有 --timeout/--max-tries, 只有 curl
+        # 分支漏了。不加会怎样: 那条 lane 静默停摆, 日志既不报错也不推进, 看着像
+        # "还在下载", 实际 0 进度(历史上同样的裸 curl 挂过 6 天)。
+        # --speed-limit/--speed-time: 60 秒内平均低于 50 KB/s 就掐断; -C - 让下一次
+        # 重试从已落盘的字节接着走, 所以掐断不浪费已下内容。
+        set -- -fsSL -C - --connect-timeout 30 --retry 5 --retry-delay 5 \
+            --speed-limit 51200 --speed-time 60
         if [ -n "$PROXY" ]; then set -- -x "$PROXY" "$@"; else set -- --noproxy '*' "$@"; fi
         [ -n "$TOKEN" ] && set -- -H "Authorization: Bearer $TOKEN" "$@"
-        curl "$@" -o "$out.part" "$url" && mv "$out.part" "$out" || true
+        _try=0
+        while [ "$_try" -lt 30 ]; do
+            curl "$@" -o "$out.part" "$url" && break
+            _rc=$?
+            # curl 33 = 服务端不认 Range, 续传没法做。ModelScope 的下载端点对超大文件
+            # 就是这样: model-00047/48(各 101.5 GB 的 engram 片)首段请求返回 200 而不是
+            # 206(Range 头被整个忽略), 中段请求直接 404 —— 而前 46 片是支持的。
+            # 后果: .part 一旦非空, 之后每一次 -C - 都以 33 失败, 那条 lane 一个字节也
+            # 推不进去, 日志刷满 "Cannot resume" 却看不出是源的问题(实测卡在 0.7/0.5 GiB)。
+            # 只能丢掉已下字节从头拉。代价是断一次就得重来, 所以别在这种源上做长尾重试:
+            # 拉不动就让它落到下一轮, 由 hf-mirror 那条(支持 Range)接手。
+            if [ "$_rc" = 33 ]; then rm -f "$out.part"; fi
+            _try=$((_try + 1))
+            sleep 5
+        done
+        # 只有拿到 API 声明的完整字节才转正, 否则留 .part 等下一轮续传 —— 半截文件
+        # 改名成正式名会让下一次运行的 size 检查判定"已完成", 静默交付一个残缺分片。
+        _got=$(file_size_local "$out.part")
+        if [ "$_got" -gt 0 ] && { ! size_trusted "$size" || [ "$_got" = "$size" ]; }; then
+            mv "$out.part" "$out"
+        elif [ "$_got" -gt 0 ]; then
+            echo "ERR L  $name: $(human "$_got") / $(human "$size") — 留作 .part, 重跑续传" >&2
+        fi
     fi
 }
 
@@ -535,7 +642,15 @@ local_lane() {
             claim "$name" || continue
             download_local "$size" "$name"
             have=$(file_size_local "$OUT_DIR/$name")
-            [ "$have" = "$size" ] || unclaim "$name"
+            # 判据必须和 download_local 一致。用不可信的小文件 size 比对会判成"没下完"
+            # 而 unclaim, 于是下一条 lane 立刻重新 claim 同一个文件, download_local 打
+            # 一行 ok 就返回, 再 unclaim —— 所有 lane 死死卡在这 36 个小文件上空转
+            # (实测 21154 行 ok), 只剩一条 lane 真在下权重分片, 8 并发退化成 1。
+            if size_trusted "$size"; then
+                [ "$have" = "$size" ] || unclaim "$name"
+            else
+                [ "$have" -gt 0 ] || unclaim "$name"
+            fi
             _got=1
             break
         done 3< "$PLAN"
@@ -557,7 +672,14 @@ run_remote_pass() {
             [ -n "$name" ] || continue
             [ "$dest" = R ] || continue
             have=$(file_size_remote "$REMOTE_DIR/$name")
-            if [ "$size" -ge 0 ] 2>/dev/null && [ "$have" != "$size" ]; then pending=1; fi
+            # 与 download_local 同一判据: 小文件的 API size 不可信, 拿它比对会让
+            # 这一轮永远 pending, 外层 10s 一轮无限重试, 每轮把已完成的全部重扫重打
+            # (实测刷了 55552 行 ok)。只有 LFS 分片才逐字节卡。
+            if size_trusted "$size"; then
+                [ "$have" != "$size" ] && pending=1
+            else
+                [ "$have" -gt 0 ] || pending=1
+            fi
         done 3< "$PLAN"
         [ "$pending" = 0 ] && break
         echo "remote: shards still incomplete, retry round in 10s ..."
@@ -576,7 +698,14 @@ run_local_pass() {
             [ -n "$name" ] || continue
             [ "$dest" = L ] || continue
             have=$(file_size_local "$OUT_DIR/$name")
-            if [ "$size" -ge 0 ] 2>/dev/null && [ "$have" != "$size" ]; then pending=1; fi
+            # 与 download_local 同一判据: 小文件的 API size 不可信, 拿它比对会让
+            # 这一轮永远 pending, 外层 10s 一轮无限重试, 每轮把已完成的全部重扫重打
+            # (实测刷了 55552 行 ok)。只有 LFS 分片才逐字节卡。
+            if size_trusted "$size"; then
+                [ "$have" != "$size" ] && pending=1
+            else
+                [ "$have" -gt 0 ] || pending=1
+            fi
         done 3< "$PLAN"
         [ "$pending" = 0 ] && break
         echo "local: shards still incomplete, retry round in 10s ..."

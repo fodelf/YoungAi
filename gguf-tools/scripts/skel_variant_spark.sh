@@ -16,16 +16,31 @@
 # 产物: gguf/go-onebit/skel/<标签>_skeleton.gguf, gguf/ds4-champ86<标签>.gguf, vqhalf/champ86<标签>/{zchain.bin→冠军, metrics_wt2.txt, speed/}
 set -uo pipefail
 ROOT="$HOME/ds4-main"; cd "$ROOT" || exit 1
+# --profile general|fin(2026-09-08): 选哪个语料根的冠军层件/zchain 来合并; 骨架(skel/)两者共用。
+#   fin 产物改名 ds4-fin86<标签>.gguf / vqfin/fin86<标签>/, 与通用冠军 ds4-champ86<标签>.gguf 并存不覆盖。
+PROFILE=general
+if [ "${1:-}" = "--profile" ]; then PROFILE="${2:?--profile 要值 general|fin}"; shift 2; fi
 TAG="${1:?标签}"; shift
-SC="$ROOT/gguf-tools/scripts"; VQH="$ROOT/gguf/go-onebit/vqhalf"; R30="$ROOT/gguf/go-onebit/r30"; G7="$ROOT/gguf/go-onebit/g7"
+case "$PROFILE" in
+  general) VQH="$ROOT/gguf/go-onebit/vqhalf"; WS="champ86$TAG";;
+  fin)     VQH="$ROOT/gguf/go-onebit/vqfin";  WS="fin86$TAG";;
+  *) echo "未知 profile: $PROFILE(general|fin)" >&2; exit 2;;
+esac
+SC="$ROOT/gguf-tools/scripts"; R30="$ROOT/gguf/go-onebit/r30"; G7="$ROOT/gguf/go-onebit/g7"
 HF="$ROOT/hf/DeepSeek-V4-Flash-Vision-Exp"
 SKD="$ROOT/gguf/go-onebit/skel"; SKEL="$SKD/${TAG}_skeleton.gguf"
-WS="champ86$TAG"; D="$VQH/$WS"; MDL="$ROOT/gguf/ds4-$WS.gguf"
+D="$VQH/$WS"; MDL="$ROOT/gguf/ds4-$WS.gguf"
 CH="$VQH/champ86amp"
 LOG(){ echo "[skelvar $TAG $(date '+%m-%d %H:%M:%S')] $*"; }
 mkdir -p "$SKD" "$D"
 [ -d "$HF" ] || { LOG "★HF 缺 $HF★"; exit 2; }
-[ -s "$CH/zchain.bin" ] || { LOG "★冠军 zchain 缺★"; exit 2; }
+# zchain: 通用冠军的是 sweep 导出的完整部署链(已在 ⇒ 合并时 M86_ZCH= 跳过抽取); zlayer 态(fin profile, 无 sweep)的链只嵌在
+# dql_L*.bin 的注入记录里 ⇒ 交给 merge_base86p.sh 用 dql_to_zchain 抽成 $CH/zchain.bin(判决尺读的就是这份 dql, 部署链与判决同源)。
+MZ=""
+if [ ! -s "$CH/zchain.bin" ]; then
+    [ -s "$CH/layers/zinject_manifest.txt" ] || { LOG "★冠军 zchain 缺, 且层件无 zlayer 注入账本(不是反修态)★"; exit 2; }
+    MZ="$CH/zchain.bin"; LOG "zchain 不在, 合并时从 dql 注入记录抽取 → $MZ"
+fi
 [ "$(ls "$CH/layers"/dql_vq_L*.bin 2>/dev/null | wc -l)" = 43 ] || { LOG "★冠军层件不齐★"; exit 2; }
 [ -s "$R30/template_head.gguf" ] || { LOG "★模版缺(从 ds4-allq2.gguf 头 64 MiB 重建: head -c 67108864)★"; exit 2; }
 BUSY=$(for p in ds4 ds4-bench ds4-server ds4quant_run zlayer vq_merge_v4 deepseek4-quantize; do pgrep -x "$p"; done)
@@ -44,7 +59,7 @@ fi
 LOG "骨架 $(ls -l "$SKEL" | awk '{printf "%.2f GB", $5/1e9}')"
 
 LOG "② 合并 骨架 + 冠军 43 层 VQ → $MDL"
-M86_LAYERS="$CH/layers" M86_MDL="$MDL" M86_SKEL="$SKEL" M86_ZCH= M86_RB=/dev/null \
+M86_LAYERS="$CH/layers" M86_MDL="$MDL" M86_SKEL="$SKEL" M86_ZCH="$MZ" M86_RB=/dev/null \
     bash "$SC/merge_base86p.sh" || { LOG "★合并失败★"; exit 6; }
 LOG "模型 $(ls -l "$MDL" | awk '{printf "%.2f GB", $5/1e9}')"
 ln -sfn "$CH/zchain.bin" "$D/zchain.bin"
@@ -60,6 +75,6 @@ gguf-tools/bench/anchor_metrics --ref "$R30/anchor_wt2_s2653.bin" --ids "$G7/wt2
 kill $WD 2>/dev/null
 
 LOG "④ 速度曲线"
-bash "$SC/speed_champ_spark.sh" "$WS" "$WS" 8192 || LOG "★速度段失败★"
+bash "$SC/speed_champ_spark.sh" "$D" "$WS" 8192 || LOG "★速度段失败★"   # 工作区传绝对路径: fin profile 的根不是 vqhalf
 LOG "收官: 模型 $MDL, 指标 $D/metrics_wt2.txt, 速度 $D/speed/${WS}_zchain.csv"
 LOG "SKELVAR_${TAG}_DONE"

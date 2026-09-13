@@ -22,14 +22,18 @@
 set -uo pipefail
 ROOT="$HOME/ds4-main"; VQH="$ROOT/gguf/go-onebit/vqhalf"
 WS="${1:-champ86amp}"; TAG="${2:-$WS}"; CTXMAX="${3:-8192}"
+# 工作区给绝对路径时(2026-09-08 fin profile: gguf/go-onebit/vqfin/fin86q8ve)按路径用, 名字取 basename; 否则仍是 vqhalf 下的名字
+case "$WS" in /*) WSD="$WS"; WS="$(basename "$WSD")";; *) WSD="$VQH/$WS";; esac
 MDL="${4:-$ROOT/gguf/ds4-$WS.gguf}"; STEP="${5:-2048}"; GEN="${6:-128}"
-ZCH="${7:-$VQH/$WS/zchain.bin}"; CORPUS="${8:-speed-bench/promessi_sposi.txt}"
+# 默认语料=英文 README×80(09-07 用户令: 测试一律不用意语, promessi 退役); 不入库, 缺则现生成(与 speed_longctx_spark.sh 同式)
+ZCH="${7:-$WSD/zchain.bin}"; CORPUS="${8:-speed-bench/readme_en_x80.txt}"
 EXTRA="${9:-}"   # 透传给 ds4-bench 的额外参数(如 1M 尺: "--prefill-chunk 2048 --gen-final-only"), 空格分隔
-OUT="$VQH/$WS/speed"; mkdir -p "$OUT"
+OUT="$WSD/speed"; mkdir -p "$OUT"
 if [ "$STEP" = x2 ]; then STEPARGS=(--step-mul 2); else STEPARGS=(--step-incr "$STEP"); fi
 BUDGET_MB=110000
 LOG(){ echo "[speed $(date +%H:%M:%S)] $*"; }
 cd "$ROOT" || exit 1
+[ "$CORPUS" != speed-bench/readme_en_x80.txt ] || [ -s "$CORPUS" ] || for i in $(seq 80); do cat README.md; echo; done > "$CORPUS"
 
 # ---- 起跑清单: 模型在/链在/机器空/内存够 ----
 [ -s "$MDL" ] || { LOG "★合一 GGUF 缺 $MDL (先跑 merge_base86p.sh)★"; exit 2; }

@@ -23,11 +23,17 @@
 #   方案B: pv_c(x) = tanh(V_c·x/s) · tanh(A_c·x/s), 两个 tanh 的乘积 = 真二阶门,
 #   对 U 仍线性 ⇒ 闭式 ridge 不变、零训练不变。落地 type9 `zl.AMPD`, 载荷 A|U|V。
 #
-# 用法: bash amp_campaign.sh [段|all]
+# 用法: bash amp_campaign.sh [--profile general|fin] [段|all]
 # 段: preflight ids anchor capture solve chain judge   (probe = 可选诊断, 不在 all 链里)
 #
 # ★本脚本不接受任何环境变量(2026-08-22 铁律: 本项目不得新增 env 配置)★
 #   语料/尺寸/路径全部写死在下面。要换一轮就改这里并记录, 不靠发车姿势决定行为。
+# --profile(2026-09-08 用户令"用金融语料量化/反修/看股票金融五指标"): 只选【哪份语料 + 哪个工作区根】,
+#   不是配方旋钮 —— 两个 profile 的量化/反修/判决配方逐字相同, 差别只在 CORPUS 与 VQD 两个常量:
+#     general  calibration_datav5.txt(开源全场景) → gguf/go-onebit/vqhalf(现役冠军 champ86 所在, 默认, 行为与改前逐字同)
+#     fin      gguf-tools/data/corpus/fin/(目录: 一文件一域, 一行一篇; fin_corpus_build.sh 产) → gguf/go-onebit/vqfin
+#   为什么分根不共目录: 三份 ids/三个锚/champ86/champ86amp 都按固定文件名落在工作区根下, 共根 = 金融跑一遍就把
+#   通用冠军的锚和层件盖掉。wt2 官方判决锚(r30/anchor_wt2_s2653)与骨架(skel/)是底座级产物, 两个 profile 共用。
 set -uo pipefail
 ROOT="$HOME/ds4-main"
 SC="$ROOT/gguf-tools/scripts"
@@ -37,8 +43,26 @@ QD="$ROOT/gguf-tools/amp"
 R30="$ROOT/gguf/go-onebit/r30"
 G7="$ROOT/gguf/go-onebit/g7"
 
-NAME="v5full"
-CORPUS="$ROOT/gguf-tools/data/corpus/calibration_datav5.txt"   # 开源全场景, 22.4% 字符在代码围栏内
+PROFILE=general
+if [ "${1:-}" = "--profile" ]; then PROFILE="${2:?--profile 要值 general|fin|fin41}"; shift 2; fi
+HF_SET=""
+case "$PROFILE" in
+  general) NAME="v5full"
+           CORPUS="$ROOT/gguf-tools/data/corpus/calibration_datav5.txt"   # 开源全场景, 22.4% 字符在代码围栏内
+           VQD="$VQD";;
+  fin)     NAME="fin"
+           CORPUS="$ROOT/gguf-tools/data/corpus/fin"   # 目录模式: fin_announce/fin_article/fin_news/fin_exam/fin_flash 五域
+           VQD="$ROOT/gguf/go-onebit/vqfin";;
+  # fin41(2026-09-11): 金融语料 + ★V4.1-Flash 底座★, 工作区与 fin 分开不互盖。
+  # ★只有 idshalf 这个 stage 对 V4.1 有效★ —— 它只用 tokenizer.json 切 ids, 与模型结构无关
+  # (且已实测 V4.1 与 V4 的 tokenizer 兼容: vocab 均 129280, wt2.ids 解出通顺原文)。
+  # 其余 stage(锚/量化/反修)全是 V4 结构写死的, V4.1 走 v41_teacher.py 那条线, 别在这里发车。
+  fin41)   NAME="fin41"
+           CORPUS="$ROOT/gguf-tools/data/corpus/fin"
+           VQD="$ROOT/gguf/go-onebit/vqfin41"
+           HF_SET="$ROOT/hf/DeepSeek-V4.1-Flash";;
+  *) echo "未知 profile: $PROFILE(general|fin|fin41)" >&2; exit 2;;
+esac
 S=8192                       # 锚 token 数(整份语料等距窗抽样)
 IDS_WIN=64                   # 等距窗数, 跨度铺满全文
 MDL="$ROOT/gguf/ds4-allq2.gguf"   # 普通 RTN 全 q2, 零语料, 本战役不重量化
@@ -55,7 +79,7 @@ MEM_FLOOR_GB=4   # 系统 MemAvailable 地板 —— ★4 是实测值, 不是�
 #   · 真限制 = 进程 RSS(r30_campaign 内部 wdog, 按机器内存 3/4) —— 那个该随机器缩放
 #   · 这里 = 系统 MemAvailable 最后一道网, 只为抢在内核 OOM killer 前面留个可控停车点。
 #     它必须【低于】负载的正常低点, 否则每次都误杀。调高 = 把正常工况判成失控。
-DS4_HF="$ROOT/hf/DeepSeek-V4-Flash-Vision-Exp"
+DS4_HF="${HF_SET:-$ROOT/hf/DeepSeek-V4-Flash-Vision-Exp}"   # fin41 profile 覆盖成 V4.1
 export DS4_HF   # 脚本间接口(r30_campaign 等子脚本读); 二进制一律走 --hf 显式传(2026-08-31 env 大扫除)
 
 D="$ROOT/gguf/go-onebit/$NAME"
@@ -93,7 +117,7 @@ trap 'watchdog_stop' EXIT
 
 stage_preflight(){
     LOG "⓪preflight"
-    [ -s "$CORPUS" ] || DIE "语料缺 $CORPUS"
+    { [ -s "$CORPUS" ] || [ -d "$CORPUS" ]; } || DIE "语料缺 $CORPUS"
     [ -d "$DS4_HF" ] || DIE "HF 缺 $DS4_HF"
     [ -s "$MDL" ]    || DIE "基座缺 $MDL(普通 RTN 全 q2, 本战役不重量化)"
     [ -x "$ROOT/ds4" ] || ( cd "$ROOT" && make cuda-spark ) || DIE "引擎编译失败"
@@ -246,7 +270,7 @@ stage_dilute(){
 # (语料是按主题拼接的), 交错切则两半的全场景组成/代码占比几乎逐块相同, 且零重叠。
 # 产出: vqhalf_q.ids(量化半) / vqhalf_a.ids(放大器半)。
 stage_idshalf(){
-    local D2="$ROOT/gguf/go-onebit/vqhalf"; mkdir -p "$D2"
+    local D2="$VQD"; mkdir -p "$D2"
     local QI="$D2/vqhalf_q.ids" AI="$D2/vqhalf_a.ids" JI="$D2/vqhalf_j.ids"
     # ★布局是产物的一部分(2026-08-29)★: ids 在但 .layout 缺 = 补布局机制之前切的。
     # 切分是确定性的(无随机源), 所以同一段代码重跑到 tmp、逐字节比对 ids 一致后, 只把
@@ -281,7 +305,19 @@ from tokenizers import Tokenizer
 src, oq, oa, oj, N, hf, wt2 = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5]), sys.argv[6], sys.argv[7]
 OUTS = [("量化份", oq), ("反修份", oa), ("判决份", oj)]
 tok = Tokenizer.from_file(f"{hf}/tokenizer.json")
-lines = [ln for ln in open(src, encoding="utf-8").read().split("\n") if ln.strip()]
+# ★目录模式(2026-09-08 fin profile)★: 语料是目录时, 一文件 = 一域(域名 = 文件名去 .txt), 一行 = 一篇文档 = 一个簇。
+# 为什么不走下面的 dom() 正则: 金融语料全是中文, 正则只会判成一个 cjk 域 → 全语料一个簇 → 整簇进一份, 另两份空。
+# 每篇独立成簇: 同一篇公告只进量化/反修/判决之一(独立性同"整簇不拆"的初衷), 域内三路贪心仍按 token 平衡。
+import os
+pre_clusters = None
+if os.path.isdir(src):
+    lines, pre_clusters = [], []
+    for fn in sorted(os.listdir(src)):
+        if not fn.endswith(".txt"): continue
+        for ln in open(os.path.join(src, fn), encoding="utf-8").read().split("\n"):
+            if ln.strip(): lines.append(ln); pre_clusters.append([fn[:-4], [ln]])
+else:
+    lines = [ln for ln in open(src, encoding="utf-8").read().split("\n") if ln.strip()]
 
 CODEKW = re.compile(r"\b(import |from \w+ import|def |class |function |const |let |var |public |private |return |print\(|console\.log|#include|package |func |fn |=>|\bfor\s*\(|\bif\s*\()")
 def dom(s):
@@ -312,15 +348,18 @@ def dom(s):
     if re.search(r"\{#sec|\[@ref|\{ref-type=|\^\[@", s): return "academic"
     return "prose"
 
-# ② 连续同域行 → 文档簇(整簇不拆)
+# ② 连续同域行 → 文档簇(整簇不拆); 目录模式的簇已在上面按篇定好
 clusters, cur = [], None
-for ln in lines:
+if pre_clusters is not None:
+    clusters = pre_clusters
+else:
+  for ln in lines:
     d = dom(ln)
     if cur and cur[0] == d: cur[1].append(ln)
     else:
         if cur: clusters.append(cur)
         cur = [d, [ln]]
-if cur: clusters.append(cur)
+  if cur: clusters.append(cur)
 for c in clusters:
     c.append(tok.encode("\n".join(c[1]), add_special_tokens=False).ids)
 
@@ -431,7 +470,7 @@ PY
 # 量化半 ids 一字不动(零重叠纪律)。窗宽 128 与原 vqhalf_a.ids 同(行掩码几何不变)。
 # 用法: amp_campaign.sh idshalf_ext [N=32768] [CH=256] [出名=vqhalf_a32k.ids]
 stage_idshalf_ext(){
-    local D2="$ROOT/gguf/go-onebit/vqhalf"
+    local D2="$VQD"
     local N="${1:-32768}" CH="${2:-256}" OUT="$D2/${3:-vqhalf_a32k.ids}"
     [ -s "$OUT" ] && { LOG "①扩样 ids 已在 $OUT, 跳过"; return 0; }
     LOG "①放大器半扩样 → $OUT (N=$N CH=$CH; 量化半不动)"
@@ -462,7 +501,7 @@ PY
 
 # VQ86 合并 + 裸判: 复用参数化的 merge_base86p.sh(幂等), 判决=wt2 五指标, 对表 base86p 4.1222。
 stage_vqmerge(){
-    local D2="$ROOT/gguf/go-onebit/vqhalf"
+    local D2="$VQD"
     local N=$(ls "$D2/vq86h/layers"/dql_vq_L*.bin 2>/dev/null | wc -l)
     [ "$N" = 43 ] || DIE "vq86h 层不齐($N/43), 量化未收官"
     M86_LAYERS="$D2/vq86h/layers" M86_MDL="$ROOT/gguf/ds4-vq86h.gguf" \
@@ -481,7 +520,7 @@ stage_vqmerge(){
 # 取料走解码路(--score-ids+--cap-dir)=部署同路+确定(铁律); 批量路(--eval-ids)只出 hdump 杠杆诊断。
 # 捕获即验: 同命令两次, L0/L16/L32 三档逐位比对(浅=哈希层不算数, 必须含中深)。
 stage_vqcap(){
-    local D2="$ROOT/gguf/go-onebit/vqhalf" M="$ROOT/gguf/ds4-vq86h.gguf"
+    local D2="$VQD" M="$ROOT/gguf/ds4-vq86h.gguf"
     [ -s "$M" ] || DIE "vq86h.gguf 缺, 先跑 vqmerge"
     [ -s "$D2/vqhalf_a.ids" ] || DIE "放大器半 ids 缺"
     cd "$ROOT"; watchdog_start
@@ -518,7 +557,7 @@ stage_vqcap(){
 # VQ86 放大器解算(C, amp_solve.c) + 合链 + 端到端判决。
 # 解算=铁律 C 实现(乘性动态z, 随机基, 四损失行为空间目标); 合并器只做字节编排(许可的 Python)。
 stage_vqsolve(){
-    local D2="$ROOT/gguf/go-onebit/vqhalf"
+    local D2="$VQD"
     [ -s "$D2/capnpy_a/routed_L42.npy" ] || DIE "教师 npy 缺, 先跑 vqcap"
     mkdir -p "$D2/amp_c"
     LOG "⑤C 解算 43 层(乘性动态z, ~1.2h)"
@@ -556,7 +595,7 @@ stage_judge(){
 #   dim 固定 4 只动 nc ⇒ 位宽 = ceil(log2 nc)/4 bpw, 单变量。nc=512 也重跑一遍(不复用
 #   vq86h 旧日志)是为了三档同批同语料同口径, 跨批比 cos 会把批次差当成档位差。
 stage_dynladder(){
-    local D2="$ROOT/gguf/go-onebit/vqhalf" P="$ROOT/gguf/go-onebit/vqhalf/dyn86"
+    local D2="$VQD" P="$VQD/dyn86"
     [ -s "$D2/vqhalf_q.ids" ] || DIE "量化半 ids 缺"
     [ -s "$D2/anchor_vqhalf_q_s8192.bin" ] || DIE "量化半锚缺"
     mkdir -p "$P"
@@ -597,7 +636,7 @@ stage_dynladder(){
 # 与 vq86h 的唯一变量 = 位宽分配方式; 语料/锚/S/工序全部相同, 所以判决可直接对表。
 # $1 = 计划表变体: dyn86(动态专家+动态层) | lyr86(纯动态层, 全 256 专家层内同档)
 stage_dynquant(){
-    local D2="$ROOT/gguf/go-onebit/vqhalf" P="$ROOT/gguf/go-onebit/vqhalf/dyn86"
+    local D2="$VQD" P="$VQD/dyn86"
     local V="${1:-dyn86}" RP MODEL
     RP="$P/rplan_$V.txt"; MODEL="$P/model_$V"
     [ "$V" = dyn86 ] && { [ -s "$P/rplan_dyn86.txt" ] && RP="$P/rplan_dyn86.txt"; MODEL="$P/model"; }
@@ -625,7 +664,7 @@ stage_dynquant(){
 # 判决尺只认参考前向(caliper_ref.sh, 铁律 08-24: 引擎 CUDA score/eval 路 4× 分歧未修前不当判官)。
 # 对表 = 同语料同锚同工序的平权 vq86h_noz, 唯一变量 = 位宽分配方式。
 stage_dynjudge(){
-    local P="$ROOT/gguf/go-onebit/vqhalf/dyn86"
+    local P="$VQD/dyn86"
     local N; N=$(ls "$P/model/layers"/dql_vq_L*.bin 2>/dev/null | wc -l)
     [ "$N" = 43 ] || DIE "dyn86 层不齐($N/43)"
     # caliper 直接吃层件目录, 判决不需要先合 GGUF(合并留给引擎部署/真代码基准那一步)。
@@ -651,7 +690,7 @@ stage_dynjudge(){
 #
 # $1 = 层件目录名(model_lyr86 | model | vq86h_noz); $2 = probe 则只跑 L00 验机制
 stage_champbf(){
-    local D2="$ROOT/gguf/go-onebit/vqhalf" V="${1:?层件目录}" MODE="${2:-full}"
+    local D2="$VQD" V="${1:?层件目录}" MODE="${2:-full}"
     local OUT
     case "$V" in
       vq86h_noz) OUT="$D2/vq86h_noz";;
@@ -715,7 +754,7 @@ stage_full(){
 # 冠军 stage_backfit 默认也是"反修锚=反修语料的 FP 锚"(anchor_r30_s1716 配
 # rr_calib_prog_v5mini.ids), 口径一致。
 stage_champ86(){
-    local D2="$ROOT/gguf/go-onebit/vqhalf" W="$ROOT/gguf/go-onebit/vqhalf/champ86"
+    local D2="$VQD" W="$VQD/champ86"
     # ══ 冠军量化配方常量区(2026-08-31 用户令"硬编码全部删除": 配方死写唯一入口,
     #    原 QBIN_OVERRIDE/Q86_*/RPLAN86/VOLB86/DS4_* 穿三层脚本的 env 接力全拔) ══
     local QBIN="$ROOT/gguf-tools/amp/ds4quant_run"
@@ -794,7 +833,7 @@ stage_champ86(){
     # 08-29 产出 42 层过拟合标量增益(判决份四项全负)的来源。
     # 反修配方(K/锚/底座/工作区)死写在 amp_clean_full.sh 常量区 —— 单一权威, 这里零传参。
     LOG "②反修(冠军 zlayer 路; 配方见 amp_clean_full.sh 常量区; 行掩码从锚 .layout 读, 缺则硬停)"
-    bash "$SC/amp_clean_full.sh" || DIE "冠军路反修失败"
+    bash "$SC/amp_clean_full.sh" --profile "$PROFILE" || DIE "冠军路反修失败"
     # ★③sweep 已下链(2026-08-31 chain9 定谳, fable5)★: 部署真尺(g_bkl_live 抑制钉路)下
     # 逐单元真降不可组合(全 8192 行终验 0.74096→0.74271 劣化), GL/GE/z重解 op 族在
     # 跨语料闸落地前无净肉 —— 生产链只到 ②反修完成态(=③态交付物)。
@@ -815,7 +854,7 @@ stage_champ86(){
 stage_champ_reset(){
     # ★别写成一句 local A=.. B="$A/.."★: bash 会先把这一行的所有名字建成(未赋值的)局部变量,
     # 再逐个赋值, 于是同句里引用前一个名字在 set -u 下直接报"未绑定的变量"。分三句写。
-    local D2="$ROOT/gguf/go-onebit/vqhalf"
+    local D2="$VQD"
     local W="$D2/champ86"
     # ★还原点优先级★: ①本战役自己的量化态备份 layers_quant(同语料同配方, 唯一正确的还原点)
     # ②只读原件 vq86h_noz(旧语料, 只在没备份时兜底 —— 换语料后它已不是同一个底座)
@@ -852,7 +891,7 @@ stage_champ_reset(){
 #   官方 q2 KLD 0.4207 / 平权裸 Σmin 0.7799 / 冠军对表); 判决份是【同域全能力尺】——
 #   8 个域齐全, 覆盖 wt2 完全不测的代码/数学/多语。两个数一起报, 不互相取代。
 stage_anchors3(){
-    local D2="$ROOT/gguf/go-onebit/vqhalf"
+    local D2="$VQD"
     local NAMES=(量化 反修 判决)
     local IDSF=("$D2/vqhalf_q.ids" "$D2/vqhalf_a.ids" "$D2/vqhalf_j.ids")
     local ANCF=("$D2/anchor_vqhalf_q_s8192.bin" "$D2/anchor_a_clean_s8192.bin" "$D2/anchor_j_s8192.bin")
@@ -907,7 +946,7 @@ stage_anchor_wt2(){
 
 # 判决份同域尺: 对任意层件目录出五指标(与 wt2 尺同一把 caliper, 只换 ids/锚)
 stage_judge3(){
-    local D2="$ROOT/gguf/go-onebit/vqhalf" V="${1:-champ86}"
+    local D2="$VQD" V="${1:-champ86}"
     local JI="$D2/vqhalf_j.ids" JA="$D2/anchor_j_s8192.bin"
     [ -s "$JA" ] && [ "$JA" -nt "$JI" ] || DIE "判决份锚缺或过期, 先跑 anchors3"
     echo "══ 同域全能力尺(判决份 8 域齐全) ══"
@@ -937,7 +976,7 @@ stage_judge3(){
 #   ③sweep 一层: 时间 + BFUNIT Δ + 出口分
 # 目标 20s/段(用户令)。跑完把三个数并排打出来, 达不到就报实测不粉饰。
 stage_probe3(){
-    local D2="$ROOT/gguf/go-onebit/vqhalf"
+    local D2="$VQD"
     local W="$D2/champ86"
     local AN="$D2/anchor_a_clean_s8192.bin"
     local ID="$D2/old_split/vqhalf_a.ids"
@@ -999,7 +1038,7 @@ stage_probe3(){
 # 针只读不写: 不落侧车、不改层件、不动模型。层选 L2/L20/L40(与历史三层针同位置, 可直接对表)。
 # 前置: ①反修锚必须与 vqhalf_a.ids 配套(anchors3) ②层件必须是纯净量化态(champreset)。
 stage_elmprobe(){
-    local D2="$ROOT/gguf/go-onebit/vqhalf"
+    local D2="$VQD"
     local W="$D2/champ86"
     local AN="$D2/anchor_a_clean_s8192.bin"
     local ID="$D2/vqhalf_a.ids"
@@ -1019,7 +1058,7 @@ stage_elmprobe(){
 # 中间不留人工接力(接力是今天多次事故的来源)。语料换了 ⇒ 层件必须重量化, 所以先清 champ86;
 # 只读原件 vq86h_noz 与 95G 备份都不动。
 stage_champ3(){
-    local D2="$ROOT/gguf/go-onebit/vqhalf"
+    local D2="$VQD"
     local W="$D2/champ86"   # 见 champreset 注释: local 同句不能引用前一个名字
     [ -s "$D2/vqhalf_q.ids" ] && [ -s "$D2/vqhalf_a.ids" ] && [ -s "$D2/vqhalf_j.ids" ] \
         || DIE "三份 ids 不齐, 先跑 idshalf"
@@ -1042,7 +1081,7 @@ stage_champ3(){
 # 把三份 ids 解回文本逐项量: 字符构成 / 代码占比 / 词表重合 / token 分布重合。
 # 目的是给"校准料和判决尺到底差多远"一个硬数字, 不再靠"感觉像"。
 stage_corpdiff(){
-    local D2="$ROOT/gguf/go-onebit/vqhalf" G7="$ROOT/gguf/go-onebit/g7"
+    local D2="$VQD" G7="$ROOT/gguf/go-onebit/g7"
     python3 - "$DS4_HF" "$G7/wt2.ids" "$D2/vqhalf_q.ids" "$D2/vqhalf_a.ids" <<'PY2'
 import sys, re, collections, math
 from tokenizers import Tokenizer
@@ -1124,7 +1163,7 @@ PY2
 # 窗口), 95% 从没用过。第三片取【同一个奇数块池(放大器半的池子)、窗口整体后移一个窗宽】——
 # 分布同源、位置零重叠。判决口径不变: 终判永远只认 wt2。
 stage_champ3rd(){
-    local D2="$ROOT/gguf/go-onebit/vqhalf"
+    local D2="$VQD"
     local CI="$D2/vqhalf_c.ids"
     local CA="$D2/anchor_c_s8192.bin"
     if [ ! -s "$CI" ]; then
@@ -1184,7 +1223,7 @@ PY2
 # 判决尺应用 DS4_ROUTE_BIAS/ALPHA 与合并时烘进 exp_probs_b.bias 语义同构, 故层件上扫即可
 # 预测合并后行为, 不必每个 α 合一次 87GB 模型。
 stage_champ_rbsweep(){
-    local W="$ROOT/gguf/go-onebit/vqhalf/champ86" RB="$ROOT/gguf/go-onebit/vqhalf/champ86/route_bias_r30.bin"
+    local W="$VQD/champ86" RB="$VQD/champ86/route_bias_r30.bin"
     [ -s "$RB" ] || DIE "Δb 不在($RB) — 反修未跑到 rb_save 或哈希路由无对象"
     local AS=(1.5 2.0 2.5 3.0)
     echo "══ α 扫描(本底座本语料); α=0 基线见 ③ 的五指标 ══"
@@ -1208,7 +1247,7 @@ stage_champ_rbsweep(){
 CHAINX_L=20   # 08-24 实测行 cos 0.875 的中深层: 错位已显著、又不是最深的极端样本
 stage_chainx(){
     # 见 champreset 注: local 同句不能引用前一个名字(set -u 炸), 分句写
-    local D2="$ROOT/gguf/go-onebit/vqhalf"
+    local D2="$VQD"
     local W="$D2/champ86"
     local AIDS="$D2/vqhalf_a.ids" AANC="$D2/anchor_a_clean_s8192.bin"
     local QANC="$D2/anchor_vqhalf_q_s8192.bin"
