@@ -17,9 +17,11 @@
  * dequant 后的 f16(16MB/专家), 字节数还少 5 倍。
  * 位流解析与 vq_fmt.h 的 ds4vq_dequant_f16 逐字同义(nbit 由 nc 推导, 9/10bit 走
  * 三字节窗口, 8bit 走字节流)。 */
+/* gov(2026-09-13, 权重侧反修): 逐行增益【缩放因子】覆盖表 [rows] f32, NULL = 按载荷原样。
+ * 用乘的不是替换: 盘上的 g_r 一个字节不动, 插件只说"这一行乘多少", 不挂就是裸底座。 */
 __global__ static void vq_dequant_kernel(
         __half *out, const uint8_t *pay,
-        uint32_t rows, uint32_t cols, uint32_t dim, uint32_t nc, uint32_t nbit) {
+        uint32_t rows, uint32_t cols, uint32_t dim, uint32_t nc, uint32_t nbit, const float *gov) {
     /* 每 block 一行。两次优化尝试均被实测否决, 记在这里免得再走一遍:
      *   ① 码本搬 shared(grid=rows): 2048 个 block 各搬一次 4KB, 净变慢;
      *   ② 多行/block + shared 摊薄加载: 速度未验先崩 —— 输出塌成全 BOS。
@@ -32,7 +34,7 @@ __global__ static void vq_dequant_kernel(
     const uint32_t r = blockIdx.x;
     if (r >= rows) return;
     __half gh; memcpy(&gh, gr + (size_t)r * 2, 2);
-    const float g = __half2float(gh);
+    const float g = __half2float(gh) * (gov ? gov[r] : 1.0f);
     const size_t i0 = (size_t)r * nidx_row;
     __half *orow = out + (size_t)r * cols;
     /* dim=4 快路(09-06, prefill 一块 4096 token 要发 3 万次本核, 占 28%): 码本条目 8 B 按两个
@@ -59,6 +61,31 @@ __global__ static void vq_dequant_kernel(
             const __half2 r1 = __floats2half2_rn(f1.x * g, f1.y * g);
             uint2 packed; memcpy(&packed.x, &r0, 4); memcpy(&packed.y, &r1, 4);
             *(uint2 *)(orow + (size_t)i * 4u) = packed;
+        }
+        return;
+    }
+    /* dim=8 快路(2026-09-12, V4.1 配方 vq8x4096 的 prefill: 512 token 一层 768 次本核, 每次 0.7 ms = 整趟 prefill 的大头):
+     * 码本条目 16 B 按两个 8 B 读(载荷只保证 8 B 对齐), 8 个 half 结果打包成一次 16 B 存。数值与通用路逐位同(同为 rn)。 */
+    if (dim == 8u && (((uintptr_t)cb) & 7u) == 0u && (((uintptr_t)orow) & 15u) == 0u) {
+        for (uint32_t i = threadIdx.x; i < nidx_row; i += blockDim.x) {
+            const size_t gi = i0 + i;
+            uint32_t v;
+            if (nbit == 8) {
+                v = ix[gi];
+            } else {
+                const size_t bit = gi * nbit;
+                const size_t by = bit >> 3;
+                uint32_t w; memcpy(&w, ix + by, 4);
+                v = (w >> (bit & 7)) & imsk;
+            }
+            const uint2 *c8 = (const uint2 *)(cb + (size_t)v * 16u);
+            const uint2 w0 = c8[0], w1 = c8[1];
+            __half2 h0, h1, h2, h3; memcpy(&h0, &w0.x, 4); memcpy(&h1, &w0.y, 4); memcpy(&h2, &w1.x, 4); memcpy(&h3, &w1.y, 4);
+            const float2 f0 = __half22float2(h0), f1 = __half22float2(h1), f2 = __half22float2(h2), f3 = __half22float2(h3);
+            const __half2 r0 = __floats2half2_rn(f0.x * g, f0.y * g), r1 = __floats2half2_rn(f1.x * g, f1.y * g);
+            const __half2 r2 = __floats2half2_rn(f2.x * g, f2.y * g), r3 = __floats2half2_rn(f3.x * g, f3.y * g);
+            uint4 packed; memcpy(&packed.x, &r0, 4); memcpy(&packed.y, &r1, 4); memcpy(&packed.z, &r2, 4); memcpy(&packed.w, &r3, 4);
+            *(uint4 *)(orow + (size_t)i * 8u) = packed;
         }
         return;
     }

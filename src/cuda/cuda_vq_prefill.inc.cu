@@ -13,6 +13,10 @@
  * 改了会怎样: 把 dequant 改回"全层落缓存跨块复用"要 43 层 × 12.9 GB, 单机放不下, 别走回头路;
  * reduce 若改成 atomicAdd 会回到 08-22 删掉的"同 prompt 两次跑不同"。 */
 
+/* 权重侧反修(--zchain 目录里的 gr_Lnn.bin): [layer] → 设备上的 s[n_expert][OUT] 缩放因子, NULL = 该层不挂。
+ * 只作用在 down 的行增益上(行 = 输出通道)。挂了就 100% 生效, 不做任何静默回退。 */
+static float *g_v41_gr[64];
+
 static struct {
     __half  *xs;   uint64_t xs_cap;    /* 排序后的激活 [nvalid][IN] f16 */
     float   *ys;   uint64_t ys_cap;    /* 排序后的 down 输出 [nvalid][OUT] f32 */
@@ -34,6 +38,10 @@ typedef struct {
     __half  *wgu;  uint64_t wgu_cap;   /* 单专家权重 gate|up [2·MID][IN] f16 */
     __half  *wd;   uint64_t wd_cap;    /* 单专家权重 down [OUT][MID] f16 */
 } vqp_lane;
+/* 反修取料(2026-09-13): 上一次 prefill MoE 的形状 + 展开缓冲。形状用来校验取料方要的层对不对得上。 */
+static uint32_t g_vqp_last_tok = 0, g_vqp_last_used = 0, g_vqp_last_out = 0;
+static float *g_vqp_cap = NULL; static uint64_t g_vqp_cap_n = 0;
+
 static vqp_lane g_vqp_lane[VQP_NLANE];
 static cudaEvent_t g_vqp_ev_start = NULL;
 static int g_vqp_lanes_ready = 0;
@@ -161,7 +169,9 @@ static int vqp_hdr_build(uint32_t layer, const uint8_t *blob, uint32_t n_total,
                     layer, e, which, d[2], d[4], d[5], exp_rows, exp_cols);
             bad = 1; break;
         }
-        if ((size_t)n16 * d16 * 2u > 48u * 1024u) {
+        /* 48 KB 是 fused2(dim4) 把码本搬 shared 的上限; 本路的 vq_dequant_kernel 码本走全局读, 不受限。
+         * V4.1 dim8×nc4096 码本 64 KB 正好踩线(2026-09-12), 只对 dim==4 仍按 fused2 口径把关。 */
+        if (d16 == 4u && (size_t)n16 * d16 * 2u > 48u * 1024u) {
             fprintf(stderr, "ds4: [vq-prefill] L%u e=%u 码本 %u×%u 超 shared 上限 48KB -- aborting\n", layer, e, n16, d16);
             bad = 1; break;
         }
@@ -267,11 +277,14 @@ static int cuda_vq_moe_prefill_gemm(
                 fprintf(stderr, "ds4: [vq-prefill] L%u e=%u w1/w3 槽缺失 -- aborting\n", layer_index, e);
                 bad = 1; break;
             }
-            vq_dequant_kernel<<<MID, 256, 0, L->st>>>(L->wgu, blob + h1->off, MID, IN, h1->dim, h1->nc, h1->nbit);
+            vq_dequant_kernel<<<MID, 256, 0, L->st>>>(L->wgu, blob + h1->off, MID, IN, h1->dim, h1->nc, h1->nbit, NULL);
             vq_dequant_kernel<<<MID, 256, 0, L->st>>>(L->wgu + (uint64_t)MID * IN, blob + h3->off,
-                                                      MID, IN, h3->dim, h3->nc, h3->nbit);
+                                                      MID, IN, h3->dim, h3->nc, h3->nbit, NULL);
             if (h2->off) {
-                vq_dequant_kernel<<<OUT, 256, 0, L->st>>>(L->wd, blob + h2->off, OUT, MID, h2->dim, h2->nc, h2->nbit);
+                /* down 的行 = 输出通道 ⇒ 权重侧反修的增益覆盖挂在这里(只有 down 解了增益) */
+                const float *gov = g_v41_gr[layer_index < 64u ? layer_index : 0];
+                vq_dequant_kernel<<<OUT, 256, 0, L->st>>>(L->wd, blob + h2->off, OUT, MID, h2->dim, h2->nc, h2->nbit,
+                                                          gov ? gov + (size_t)e * OUT : NULL);
             } else {
                 /* 冷 w2 回退: base down 是影子张量时硬失败, 不读垃圾当权重(同 decode 路)。 */
                 if (down_expert_bytes == 0 || down_offset == 0) {
@@ -300,7 +313,48 @@ static int cuda_vq_moe_prefill_gemm(
         vqp_reduce_kernel<<<dim3((OUT + 255u) / 256u, n_tokens, 1), 256, 0, g_cur_stream>>>(
             (float *)out->ptr, g_vqp.ys, g_vqp.inv, (const float *)weights->ptr, n_expert, OUT);
         ok = cuda_ok(cudaGetLastError(), "vq prefill reduce launch");
+        if (ok) { g_vqp_last_tok = n_tokens; g_vqp_last_used = n_expert; g_vqp_last_out = OUT; }
     } while (0);
     free(sel_h); free(perm_h); free(inv_h); free(cnt); free(off); free(cur);
     return ok;
+}
+
+/* ---- 反修取料: 逐专家 down 输出(reduce 前, 未乘路由权重) ---- */
+/* out[t][k][o] = ys[inv[t·n_used+k]][o], 缺席配对填 0。与 vqp_reduce_kernel 读的是同一份 ys/inv,
+ * 所以取到的就是引擎这一层真正加权求和的那些数 —— 不是另算一遍的近似。 */
+__global__ static void vqp_expand_pairs_kernel(float *dst, const float *ys, const int32_t *inv,
+                                               uint32_t n_used, uint32_t OUT) {
+    const uint32_t pk = blockIdx.y;                 /* = t·n_used + k */
+    const uint32_t o = blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= OUT) return;
+    const int32_t i = inv[pk];
+    dst[(uint64_t)pk * OUT + o] = i < 0 ? 0.0f : ys[(uint64_t)i * OUT + o];
+}
+
+int ds4_gpu_v41_vq_capture_expert_out(float *host, uint32_t n_tok, uint32_t n_used, uint32_t out_dim) {
+    /* 形状必须与刚跑完的那一层逐项对上 —— 对不上说明取的不是这一层(或走的是解码 gemv 路,
+     * 那条路不物化 ys)。宁可返回 0 让上层硬失败, 也不给一块"能用但对不上号"的数。 */
+    if (!host || n_tok != g_vqp_last_tok || n_used != g_vqp_last_used || out_dim != g_vqp_last_out) return 0;
+    const uint64_t npair = (uint64_t)n_tok * n_used, nel = npair * out_dim;
+    if (!vqp_grow((void **)&g_vqp_cap, &g_vqp_cap_n, nel, sizeof(float), "vq 取料展开")) return 0;
+    float *dev = g_vqp_cap;
+    vqp_expand_pairs_kernel<<<dim3((out_dim + 255u) / 256u, (unsigned)npair), 256, 0, g_cur_stream>>>(
+        dev, g_vqp.ys, g_vqp.inv, n_used, out_dim);
+    if (!cuda_ok(cudaGetLastError(), "vq 取料展开")) return 0;
+    if (cudaStreamSynchronize(g_cur_stream) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
+    if (cudaMemcpy(host, dev, (size_t)nel * 4, cudaMemcpyDeviceToHost) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
+    return 1;
+}
+
+/* 装/卸某层的增益覆盖表。host=NULL 卸掉。n_expert×out_dim 必须与该层实际形状一致(调用方核过)。 */
+int ds4_gpu_v41_set_gr_override(uint32_t layer, const float *host, uint32_t n_expert, uint32_t out_dim) {
+    if (layer >= 64u) return 0;
+    if (g_v41_gr[layer]) { (void)cudaFree(g_v41_gr[layer]); g_v41_gr[layer] = NULL; }
+    if (!host) return 1;
+    const size_t nb = (size_t)n_expert * out_dim * 4;
+    if (cudaMalloc((void **)&g_v41_gr[layer], nb) != cudaSuccess) { (void)cudaGetLastError(); g_v41_gr[layer] = NULL; return 0; }
+    if (cudaMemcpy(g_v41_gr[layer], host, nb, cudaMemcpyHostToDevice) != cudaSuccess) {
+        (void)cudaGetLastError(); (void)cudaFree(g_v41_gr[layer]); g_v41_gr[layer] = NULL; return 0;
+    }
+    return 1;
 }
