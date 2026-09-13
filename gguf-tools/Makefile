@@ -123,13 +123,13 @@ endif
 # ---------------------------------------------------------------- 目标分组
 .PHONY: all amp legacy calib bench tools-test go-onebit-test quality-score clean everything dsq_units_gpu
 .PHONY: deepseek4-quantize-alias anchor_metrics compare_scores ds4quant_run zlayer \
-        dql_to_zchain teacher_routed zloss_solve \
+        dql_to_zchain teacher_routed zloss_solve finetune_solve \
         calib_run calib_diag validate_fwd traj_analyze cap_raw2npy vq_blob_truesize dump_gguf_meta \
         kl_forensic trace_ladder rec_fidelity pubbench pubbench_extract_test vq_merge_v4 \
         go2b_parity vq2q2k_probe vq_em deepseek4-quantize-cpu
 
 all: deepseek4-quantize anchor_metrics compare_scores rplan_solve route_alpha_set
-amp: ds4quant_run zlayer dql_to_zchain teacher_routed zloss_solve
+amp: ds4quant_run zlayer dql_to_zchain teacher_routed zloss_solve finetune_solve
 # legacy 二进制已随 2026-08-26 清仓删除(用户令); solvers 源仅作 calib_run 链接件存续。
 legacy:
 	@echo "legacy 目标已清空(2026-08-26 清仓)"
@@ -223,6 +223,46 @@ endif
 dql_to_zchain: $(AMP)/dql_to_zchain
 $(AMP)/dql_to_zchain: $(AMP)/dql_to_zchain.c
 	$(CC) $(BARE) $(NATIVE) -o $@ $< -lm -lpthread
+# finetune_solve: 微调侧车解算器(2026-09-08 用户三文件定案)。取料=引擎 --cap-dir 的
+# 逐层 raw_ffn_in/raw_ffn_out(部署同路), 解算复用仓库根 ds4_z.c(与引擎/反修同一份实现)。
+# BLAS 在则开 DQ_BLAS 快路 —— d=4096 的正规方程没有 BLAS 会慢一个量级。
+finetune_solve: $(AMP)/finetune_solve
+$(AMP)/finetune_solve: $(AMP)/finetune_solve.c $(AMP)/finetune_sft_target.inc.c ../ds4_z.c ../ds4_z.h ../src/common/ds4_float.h ../src/common/ds4_amp_fmt.h ../src/common/ds4_gguf.c ../src/common/ds4_quantfmt.c
+ifeq ($(HAVE_BLAS),1)
+	$(CC) $(BARE) $(NATIVE) -I.. -DDQ_BLAS $(BLAS_CFLAGS) -o $@ $(AMP)/finetune_solve.c ../ds4_z.c ../src/common/ds4_gguf.c ../src/common/ds4_quantfmt.c $(BLAS_LIBS) -lm -lpthread
+else
+	$(CC) $(BARE) $(NATIVE) -I.. -o $@ $(AMP)/finetune_solve.c ../ds4_z.c ../src/common/ds4_gguf.c ../src/common/ds4_quantfmt.c -lm -lpthread
+endif
+# v41_amp_run: V4.1 反修驱动(2026-09-13) —— 在 ds4 引擎真前向上序贯解放大器(Linux+CUDA; 要先在仓库根
+# make cuda-spark 出引擎对象)。链引擎对象与 quality-score 同法(解析期不 wildcard, 配方里 shell find)。解算器
+# v41_amp_solve.cu 以 -DV41_AMP_NOMAIN 当对象链进来 —— 与 libv41amp.so(Python 路)同一份源, 不许再抄; -fmad=false
+# 与 .so 同旗标, 否则同输入两路出不同数。v41_fp_moe.cu 用 --use_fast_math: 它抄的是引擎核, 引擎就是这么编的。
+ifeq ($(CUDA),1)
+V41AMP_ENGINE_OBJS_CMD = find ../src/core ../src/dist -name '*.o' ! -name '*_cpu.o' ! -name '*_test.o'; \
+    echo ../src/common/ds4_quantfmt.o ../ds4_corr.o ../ds4_zchain.o ../ds4_zfinetune.o ../ds4_z.o ../ds4_loss.o \
+         ../ds4_multimodal.o ../ds4_spatial.o ../ds4_css.o ../ds4_cuda.o
+v41_amp_run: $(AMP)/v41_amp_run
+$(AMP)/v41_amp_solve.o: $(AMP)/v41_amp_solve.cu $(AMP)/v41_amp_diag.inc.cu
+	$(NVCC) -O3 -fmad=false -arch=native -DV41_AMP_NOMAIN -c $< -o $@
+$(AMP)/v41_fp_moe.o: $(AMP)/v41_fp_moe.cu $(AMP)/v41_fp_moe.h ../src/common/ds4_fp8.h ../src/common/ds4_float.h
+	$(NVCC) -O3 --use_fast_math -arch=native -c $< -o $@
+$(AMP)/v41_gr_solve.o: $(AMP)/v41_gr_solve.cu
+	$(NVCC) -O3 -fmad=false -arch=native -c $< -o $@
+$(AMP)/v41_amp_run.o: $(AMP)/v41_amp_run.c $(AMP)/v41_gr_run.inc.c $(AMP)/v41_fp_moe.h $(AMP)/v41_kl_target.h ../src/common/ds4_st41.h ../src/common/ds4_quantfmt.h ../ds4.h ../ds4_v41_api.h
+	$(CC) $(BARE) $(NATIVE) -std=c99 -Wall -I.. -I$(CUDA_HOME)/include -c $< -o $@
+# 蒸馏靶: -fmad=false 与解算器同旗标(同输入两路必须出同一个数); 链 cublas 与 src/common 的 GGUF 读器/type43 解码
+$(AMP)/v41_kl_target.o: $(AMP)/v41_kl_target.cu $(AMP)/v41_kl_target.h ../src/common/ds4_gguf.h ../src/common/ds4_quantfmt.h
+	$(NVCC) -O3 -fmad=false -arch=native -c $< -o $@
+# GGUF 读器: 父仓只在 ds4_unit 里直接编它, 没有现成 .o —— 这里自己编一份(同一份源, 不是抄第二份实现)
+$(AMP)/ds4_gguf.o: ../src/common/ds4_gguf.c ../src/common/ds4_gguf.h
+	$(CC) $(BARE) $(NATIVE) -std=c99 -Wall -I.. -c $< -o $@
+$(AMP)/v41_amp_run: $(AMP)/v41_amp_run.o $(AMP)/v41_amp_solve.o $(AMP)/v41_fp_moe.o $(AMP)/v41_kl_target.o $(AMP)/v41_gr_solve.o $(AMP)/ds4_gguf.o
+	@test -f ../ds4_cuda.o || { echo "★引擎对象缺: 先在仓库根 make cuda-spark★"; exit 1; }
+	$(NVCC) -O3 -o $@ $^ $$( $(V41AMP_ENGINE_OBJS_CMD) ) $(QUALITY_LDLIBS) -lcusolver
+else
+v41_amp_run:
+	@echo "v41_amp_run: Linux+CUDA 专属, 本平台跳过"
+endif
 # zloss_solve: 单层贪心四损失解算器(2026-08-26 用户设计)。-I.. 吃仓库根 ds4_z.c/
 # ds4_loss.c(与引擎同一份实现); BLAS 在则开 DQ_BLAS 快路(ds4_z.c 内守卫)。
 zloss_solve: $(AMP)/zloss_solve
@@ -355,6 +395,31 @@ else
 vq_em:
 	@echo "vq_em: Linux+CUDA 专属(GPU-EM), 本平台跳过"
 endif
+
+# v41_quantize: V4.1 量化器(routed 专家 VQ + 骨架 FP4 + safetensors 落盘), Linux+CUDA 专属。
+# libv41vq.so 是教师端(v41_teacher.py)解码 VQ 产物用的 —— 与量化器链的是【同一个 v41_vq.o】,
+# 解码核只有一份, 量化器报的残差就是教师端读到的残差。-fmad=false 与 09-11 起的 judge 路同旗标。
+V41_DQH := $(QZ)/v41_dq.cuh ../src/common/ds4_fp8.h ../src/common/ds4_float.h
+ifeq ($(UNAME_S)-$(CUDA),Linux-1)
+v41_quantize: $(QZ)/v41_quantize $(QZ)/libv41vq.so
+$(QZ)/v41_vq.o: $(QZ)/v41_vq.cu $(V41_DQH)
+	$(NVCC) -O3 -arch=native -fmad=false -Xcompiler -fPIC -c $< -o $@
+$(QZ)/v41_fp4.o: $(QZ)/v41_fp4.cu $(V41_DQH)
+	$(NVCC) -O3 -arch=native -fmad=false -Xcompiler -fPIC -c $< -o $@
+$(QZ)/libv41vq.so: $(QZ)/v41_vq.o
+	$(NVCC) -shared -o $@ $<
+$(QZ)/v41_quantize: $(QZ)/v41_quantize.c ../src/common/ds4_st41.h $(QZ)/v41_st_write.h $(QZ)/v41_vq.o $(QZ)/v41_fp4.o
+	$(CC) $(BARE) -std=c99 -Wall -o $@ $(QZ)/v41_quantize.c $(QZ)/v41_vq.o $(QZ)/v41_fp4.o $(CUDA_LIBS) -lm
+else
+v41_quantize:
+	@echo "v41_quantize: Linux+CUDA 专属, 本平台跳过"
+endif
+
+# V4.1 量化目录(safetensors) → 单 GGUF 转换器(纯 C, 无 CUDA; 格式基元全走 ../src/common)
+.PHONY: v41_to_gguf
+v41_to_gguf: $(QZ)/v41_to_gguf
+$(QZ)/v41_to_gguf: $(QZ)/v41_to_gguf.c ../src/common/ds4_st41.h ../src/common/ds4_gguf_write.h ../src/common/ds4_quantfmt.c ../src/common/ds4_fp8.h ../src/common/ds4_float.h
+	$(CC) $(BARE) -std=c99 -Wall -D_POSIX_C_SOURCE=200809L -I.. -o $@ $(QZ)/v41_to_gguf.c ../src/common/ds4_quantfmt.c -lm
 
 # ---------------------------------------------------------------- 自测(9 项, 纯 C 无模型)
 # ★真层单元针: 编译参数与 ds4quant_run 逐项相同★(铁律 2026-08-28 "单测和生产一套代码")
