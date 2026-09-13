@@ -33,6 +33,9 @@ typedef struct {
     const char *dump_logits_path;
     const char *score_ids_path;   /* --score-ids: teacher-forced 逐位打分(公开对拍) */
     const char *score_out_path;
+    int v41_no_engram;           /* --v41-no-engram: V4.1 前向跳过 engram 层(与 Python --no-engram 同口径的对拍夹具) */
+    int v41_chunk;               /* --v41-chunk N: V4.1 --score-ids 的分块大小(0=默认 512; 对拍夹具, 看分块与整批自洽) */
+    int v41_prof;                /* --v41-prof: V4.1 每次前向打逐层毫秒(查速度用) */
     const char *dump_logprobs_path;
     int dump_logprobs_top_k;
     const char *perplexity_file_path;
@@ -122,6 +125,7 @@ int  run_generation(ds4_engine *engine, const cli_config *cfg);
 
 /* cli_diag.c */
 int run_score_ids(ds4_engine *engine, const cli_config *cfg);
+int run_v41_generation(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt);   /* V4.1 贪心生成(cli_diag.c) */
 int run_logits_dump(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt);
 int run_logprob_dump(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt);
 int run_perplexity_file(ds4_engine *engine, const cli_config *cfg);

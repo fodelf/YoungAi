@@ -294,6 +294,8 @@ server_config parse_options(int argc, char **argv) {
             c.engine.corr_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--zchain")) {
             c.engine.zchain_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--finetune")) {
+            c.engine.finetune_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--residual")) {
             c.engine.residual_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--vq-dir")) {

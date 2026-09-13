@@ -44,7 +44,30 @@ enum {
 typedef enum {
     DS4_VARIANT_FLASH = 0,
     DS4_VARIANT_PRO   = 1,
+    DS4_VARIANT_V41   = 2,   /* DeepSeek V4.1 Flash(2026-09-12 战役): 40 层 CED, 共享压缩 KV 源层, engram */
 } ds4_variant;
+
+/* V4.1 专属结构元数据(全部来自 GGUF deepseek4.* 键, 由 core_validate_v41.c 装填; V4 模型下 active=0)。
+ * 为什么单列一个结构而不塞进 ds4_shape: shape 是"维度", 这些是"接线"(哪层读哪层的缓存),
+ * 热路径按层查表, 不能每层再去扫元数据。 */
+#define DS4_V41_MAX_ENGRAM 4
+typedef struct {
+    int      active;
+    uint8_t  is_kv_source[DS4_MAX_LAYER];     /* 本层自己压缩并持有压缩 KV 缓存 */
+    int16_t  kv_source_of[DS4_MAX_LAYER];     /* 本层读哪层的压缩 KV(源层=自己; ratio 0 层 = -1) */
+    uint8_t  is_index_source[DS4_MAX_LAYER];  /* 本层自己跑 indexer 产 topk */
+    int16_t  index_source_of[DS4_MAX_LAYER];  /* 本层用哪层的 topk(ratio 0 层 = -1) */
+    int32_t  candidate_source_layer;          /* 两级 topk: 该层筛候选块, 其后各层只在块内 topk; <0 = 无 */
+    int32_t  candidate_topk_blocks, candidate_block_size;
+    uint32_t n_engram;
+    int32_t  engram_layer[DS4_V41_MAX_ENGRAM];
+    int16_t  engram_index_of[DS4_MAX_LAYER];  /* 层 → engram 序号, -1 = 无 */
+    uint64_t engram_rows[DS4_V41_MAX_ENGRAM], engram_weight_off[DS4_V41_MAX_ENGRAM], engram_scale_off[DS4_V41_MAX_ENGRAM];
+    char     engram_table_path[DS4_V41_MAX_ENGRAM][1024];
+    uint32_t engram_max_ngram, engram_heads, engram_head_dim, engram_vocab, engram_cvocab, engram_pad;
+    float    swiglu_limit;
+} ds4_v41_cfg;
+extern ds4_v41_cfg g_ds4_v41;
 
 typedef struct {
     const char *name;
@@ -139,6 +162,8 @@ enum {
     DS4_TENSOR_I32      = 26,
     DS4_TENSOR_GO1B     = 40,   /* strict-1-bit routed expert; mirrors GGUF ggml type 40 */
     DS4_TENSOR_GO2B     = 41,   /* merged base+residual binary pair (R5-C go2b) */
+    DS4_TENSOR_VQBLOB   = 42,   /* VQ 层 blob(DQVL), 字节不透明 */
+    DS4_TENSOR_FP4X32   = 43,   /* V4.1 骨架: FP4 E2M1 + ue8m0/32, 17 B/32 元素(src/common/ds4_quantfmt.h) */
 };
 
 typedef struct {

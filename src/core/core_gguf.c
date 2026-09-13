@@ -93,6 +93,8 @@ const gguf_type_info gguf_types[] = {
     [41] = {"go2b",   256,  68},
     /* v2.2 VQ 层 blob(不透明字节: DQVL 表+DQVQ 载荷; shape=[nbytes]) */
     [42] = {"vqblob",  1,   1},
+    /* V4.1 骨架 FP4 E2M1 + ue8m0/32(2026-09-12): 16 B nibble + 1 B scale, 见 ds4_quantfmt.h */
+    [43] = {"fp4x32", 32,  17},
 };
 
 

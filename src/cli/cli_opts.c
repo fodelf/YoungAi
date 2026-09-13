@@ -220,6 +220,11 @@ cli_config parse_options(int argc, char **argv) {
             ds4_tool_set_eval_hdump(need_arg(&i, argc, argv, arg));
         } else if (!strcmp(arg, "--eval-logits")) {
             ds4_tool_set_eval_logits(need_arg(&i, argc, argv, arg));
+        } else if (!strcmp(arg, "--eval-nll")) {
+            ds4_tool_set_eval_nll(need_arg(&i, argc, argv, arg));
+        } else if (!strcmp(arg, "--eval-topk")) {
+            const int k = atoi(need_arg(&i, argc, argv, arg));
+            ds4_tool_set_eval_topk(k, need_arg(&i, argc, argv, "--eval-topk <K> <out>"));
         } else if (!strcmp(arg, "--eval-no-bos")) {
             ds4_tool_set_eval_no_bos(1);
         } else if (!strcmp(arg, "--cap-layers")) {
@@ -245,6 +250,11 @@ cli_config parse_options(int argc, char **argv) {
             c.engine.vq_dir_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--zchain")) {
             c.engine.zchain_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--zchain-scale")) {
+            /* 全局 setter(同 --mem-budget-mb): 只有 V4.1 放大器目录形态消费它, 不进 ds4_engine_opts */
+            ds4_engine_v41_set_amp_scale((float)atof(need_arg(&i, argc, argv, arg)));
+        } else if (!strcmp(arg, "--finetune")) {
+            c.engine.finetune_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
             c.gen.n_predict = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
@@ -299,6 +309,12 @@ cli_config parse_options(int argc, char **argv) {
             c.gen.score_ids_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--score-out")) {
             c.gen.score_out_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--v41-no-engram")) {
+            c.gen.v41_no_engram = 1;
+        } else if (!strcmp(arg, "--v41-chunk")) {
+            c.gen.v41_chunk = atoi(need_arg(&i, argc, argv, arg));
+        } else if (!strcmp(arg, "--v41-prof")) {
+            c.gen.v41_prof = 1;
         } else if (!strcmp(arg, "--dump-logprobs")) {
             c.gen.dump_logprobs_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--logprobs-top-k")) {

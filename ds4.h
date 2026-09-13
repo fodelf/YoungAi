@@ -118,10 +118,8 @@ typedef struct {
     /* Optional 1-bit residual sidecar GGUF (blk.{L}.ffn_*_exps_res, go1b). When set,
      * the routed-MoE sums a second 1-bit layer into each expert. Absent => single 1-bit. */
     const char *residual_path;
-    /* Optional go-onebit DQZ2 runtime sidecar (--zchain FILE):
-     * the quantizer's per-layer multiplicative correction chain -- GE per-expert
-     * gains folded into the router weights + a per-token scale λ(x) on the routed
-     * MoE contribution. Absent => embedded blk.L.opt_* auto-load, else bare base. */
+    /* go-onebit DQZ2 侧车(--zchain FILE): 逐层 GE 每专家增益(乘进路由权重) + 逐 token
+     * 的 routed 缩放 λ(x) + 冻结 z^L。缺省 => 读 GGUF 内嵌 blk.L.opt_*, 都无 => 裸底座。 */
     const char *zchain_path;
     /* --vq-dir: VQ 码本目录侧车(优先于 residual_path; 都缺则用 GGUF 内嵌 blob)。 */
     const char *vq_dir_path;
@@ -129,6 +127,7 @@ typedef struct {
     const char *draft_gguf_path;
     /* --draft-zchain: drafter 反修放大器侧车, 3 层链合并进主链槽 43..45。 */
     const char *draft_zchain_path;
+    const char *finetune_path;   /* --finetune: 三文件部署的第三件, 契约见 ds4_zfinetune.h */
     /* --mm-image-cmd: 多模态外部图像编码器命令(缺省探 ./mm-ui)。 */
     const char *mm_image_cmd;
     /* --spec: DSpark 投机解码 + 在线调度仲裁(投机/纯解码谁快用谁)。贪心 verify
@@ -283,6 +282,7 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
 void ds4_engine_dump_tokens(ds4_engine *e, const ds4_tokens *tokens);
 int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *fp);
 int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt);
+#include "ds4_v41_api.h"   /* V4.1 出口(2026-09-12): --score-ids 分块前向 + 贪心生成 */
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_full_test(ds4_engine *e, const ds4_tokens *prompt);
@@ -475,14 +475,14 @@ void        ds4_tool_set_cap_dir(const char *p);
 const char *ds4_tool_cap_dir(void);
 void        ds4_tool_set_cap_layers(const char *p);   /* --cap-layers "lo-hi" */
 const char *ds4_tool_cap_layers(void);
-void        ds4_tool_set_eval_ids(const char *p);
-const char *ds4_tool_eval_ids(void);
-void        ds4_tool_set_eval_hdump(const char *p);
-const char *ds4_tool_eval_hdump(void);
+void ds4_tool_set_eval_ids(const char *p);   const char *ds4_tool_eval_ids(void);
+void ds4_tool_set_eval_hdump(const char *p); const char *ds4_tool_eval_hdump(void);
 void        ds4_tool_set_eval_logits(const char *p);
 void        ds4_tool_set_eval_no_bos(int v);
 int         ds4_tool_eval_no_bos(void);
 const char *ds4_tool_eval_logits(void);
+void ds4_tool_set_eval_nll(const char *p); const char *ds4_tool_eval_nll(void);
+void ds4_tool_set_eval_topk(int k, const char *p); int ds4_tool_eval_topk(void); const char *ds4_tool_eval_topk_out(void);  /* --eval-topk: 后训练靶, 见 core_eval_ids.c */  /* --eval-nll: 逐位 NLL f32[S] 替代全词表 logits, 为什么见 core_eval_ids.c */
 /* --amp-anchor FILE [--amp-anchor-route]: 捕获回放钉锚(判决仪器)。 */
 void        ds4_tool_set_amp_anchor(const char *p, int route_on);
 const char *ds4_tool_amp_anchor(void);

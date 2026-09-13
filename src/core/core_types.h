@@ -191,6 +191,13 @@ typedef struct {
     ds4_tensor *indexer_compressor_kv;
     ds4_tensor *indexer_compressor_gate;
     ds4_tensor *indexer_compressor_norm;
+    /* V4.1 专属(V4 模型下全 NULL): indexer 键由压缩 latent 经 wk+k_norm 得(只在 kv 源层);
+     * engram 三件只在 engram 层(表本体在盘, 见 g_ds4_v41)。 */
+    ds4_tensor *indexer_wk;
+    ds4_tensor *indexer_k_norm;
+    ds4_tensor *engram_wkv;
+    ds4_tensor *engram_q;
+    ds4_tensor *engram_k;
     ds4_tensor *hc_ffn_fn;
     ds4_tensor *hc_ffn_scale;
     ds4_tensor *hc_ffn_base;
@@ -213,6 +220,11 @@ typedef struct {
     ds4_tensor *output_hc_scale;
     ds4_tensor *output_norm;
     ds4_tensor *output;
+    /* V4.1 engram 哈希常量(转换器从 tokenizer 算好嵌入的张量; V4 下 NULL) */
+    ds4_tensor *engram_token_map;     /* I32 [vocab]: 原 id → 压缩 id */
+    ds4_tensor *engram_multipliers;   /* I64 [n_engram][max_ngram] */
+    ds4_tensor *engram_primes;        /* I64 [n_engram][max_ngram-1][heads] */
+    ds4_tensor *engram_offsets;       /* I64 [n_engram][(max_ngram-1)*heads] */
     ds4_layer_weights layer[DS4_MAX_LAYER];
 } ds4_weights;
 

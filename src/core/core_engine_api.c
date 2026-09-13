@@ -21,6 +21,9 @@ static const char *g_tool_cap_layers;
 static const char *g_tool_eval_ids;
 static const char *g_tool_eval_hdump;
 static const char *g_tool_eval_logits;
+static const char *g_tool_eval_nll;
+static const char *g_tool_eval_topk_out;
+static int g_tool_eval_topk;
 static const char *g_tool_amp_anchor;
 static int g_tool_amp_anchor_route;
 static int g_tool_eval_no_bos;
@@ -36,6 +39,11 @@ void ds4_tool_set_eval_hdump(const char *p)  { g_tool_eval_hdump = p; }
 const char *ds4_tool_eval_hdump(void)        { return g_tool_eval_hdump; }
 void ds4_tool_set_eval_logits(const char *p) { g_tool_eval_logits = p; }
 const char *ds4_tool_eval_logits(void)       { return g_tool_eval_logits; }
+void ds4_tool_set_eval_nll(const char *p)    { g_tool_eval_nll = p; }
+const char *ds4_tool_eval_nll(void)          { return g_tool_eval_nll; }
+void ds4_tool_set_eval_topk(int k, const char *p) { g_tool_eval_topk = k; g_tool_eval_topk_out = p; }
+int  ds4_tool_eval_topk(void)                { return g_tool_eval_topk; }
+const char *ds4_tool_eval_topk_out(void)     { return g_tool_eval_topk_out; }
 void ds4_tool_set_eval_no_bos(int v)         { g_tool_eval_no_bos = v; }
 int  ds4_tool_eval_no_bos(void)              { return g_tool_eval_no_bos; }
 void ds4_tool_set_amp_anchor(const char *p, int route_on) { g_tool_amp_anchor = p; g_tool_amp_anchor_route = route_on; }

@@ -66,7 +66,10 @@ static void test_deq_error_paths(void) {
 static void test_fp8(void) {
     /* E4M3FN 边界值: 0x00=+0, 0x80=-0, 0x7E=448(最大), 0x7F=NaN, 0x08=2^-6 */
     CHECK(ds4_e4m3fn_to_f32(0x00) == 0.0f, "e4m3 0x00");
-    CHECK(signbit(ds4_e4m3fn_to_f32(0x80)), "e4m3 0x80 = -0");
+    /* ★−0 要查位型, 不能用 signbit()★: 全仓编译带 -ffast-math, 它明确允许编译器无视 −0 的符号,
+     * gcc/aarch64 就把 signbit(常量 −0.0f) 直接折叠成 false(spark 上实撞两条 FAIL, Mac clang 不折)。
+     * 内存里的常量位型不受这个优化影响, 查它才是真在验解码表。 */
+    { uint32_t b; const float v = ds4_e4m3fn_to_f32(0x80); memcpy(&b, &v, 4); CHECK(b == 0x80000000u, "e4m3 0x80 = -0 位型(得 %08x)", b); }
     CHECK(ds4_e4m3fn_to_f32(0x7E) == 448.0f, "e4m3 0x7E = 448, 得 %g", ds4_e4m3fn_to_f32(0x7E));
     CHECK(isnan(ds4_e4m3fn_to_f32(0x7F)), "e4m3 0x7F = NaN");
     CHECK(isnan(ds4_e4m3fn_to_f32(0xFF)), "e4m3 0xFF = NaN");
@@ -89,7 +92,15 @@ static void test_fp8(void) {
     CHECK(ds4_e2m1fn_value(7) == 6.0f, "e2m1 表尾 = 6");
     CHECK(ds4_e2m1fn_round(100.0f) == 6.0f, "e2m1 round 饱和");
     CHECK(ds4_fp4_nibble_to_f32(0x9) == -0.5f, "fp4 0x9 = -0.5");
-    CHECK(signbit(ds4_fp4_nibble_to_f32(0x8)), "fp4 0x8 = -0");
+    { uint32_t b; const float v = ds4_fp4_nibble_to_f32(0x8); memcpy(&b, &v, 4); CHECK(b == 0x80000000u, "fp4 0x8 = -0 位型(得 %08x)", b); }
+    /* f32→nibble 与 nibble→f32 严格互逆(除 8 号 −0 槽统一走 0): 编码端漂了, 放大器落盘就是垃圾 */
+    for (int i = 0; i < 16; i++) {
+        if (i == 8) continue;   /* −0.0 编到 0 号槽, 见 ds4_fp4_f32_to_nibble 头注释 */
+        CHECK(ds4_fp4_f32_to_nibble(ds4_fp4_nibble_to_f32((uint8_t)i)) == (uint8_t)i, "fp4 nibble %d 往返", i);
+    }
+    CHECK(ds4_fp4_f32_to_nibble(ds4_fp4_nibble_to_f32(0x8)) == 0, "fp4 −0 → 0 号槽");
+    CHECK(ds4_fp4_f32_to_nibble(100.0f) == 7, "fp4 正饱和 = 6");
+    CHECK(ds4_fp4_f32_to_nibble(-100.0f) == 15, "fp4 负饱和 = −6");
     /* f16: 已知值 0x3C00=1.0, 0xC000=-2.0, 0x7C00=Inf, 次正规 0x0001=2^-24 */
     CHECK(ds4_f16_to_f32(0x3C00) == 1.0f, "f16 1.0");
     CHECK(ds4_f16_to_f32(0xC000) == -2.0f, "f16 -2.0");
@@ -98,6 +109,42 @@ static void test_fp8(void) {
     CHECK(ds4_f64_to_f16(1.0) == 0x3C00, "f64→f16 1.0");
     CHECK(ds4_f64_to_f16(65536.0) == 0x7C00, "f64→f16 上溢=Inf");
     CHECK(ds4_bf16_to_f32(0x3F80) == 1.0f, "bf16 1.0");
+}
+
+/* ---- 2b) fp4x32 编码(2026-09-13, 反修放大器产物格式) ---- */
+static void test_quant_fp4x32(void) {
+    uint8_t blk[17 * 3];
+    float in[96], out[96];
+    /* ① 格点上的值必须逐位精确还原: nibble 表 × 2^0, scale 搜出来就该是 2^0 */
+    const float grid[8] = { 0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f };
+    for (int i = 0; i < 32; i++) in[i] = (i & 1) ? -grid[(i >> 1) & 7] : grid[(i >> 1) & 7];
+    ds4_quant_fp4x32(in, 1, blk);
+    ds4_deq_fp4x32(blk, 1, out);
+    for (int i = 0; i < 32; i++) CHECK(out[i] == in[i], "fp4x32 格点值 [%d] %g ≠ %g", i, out[i], in[i]);
+    /* ② 缩放不变性: 整块乘 2^k, scale 跟着走, 还原值也应精确乘 2^k(ue8m0 存的就是 2 的幂) */
+    for (int i = 0; i < 32; i++) in[i] *= ldexpf(1.0f, -9);
+    ds4_quant_fp4x32(in, 1, blk);
+    ds4_deq_fp4x32(blk, 1, out);
+    for (int i = 0; i < 32; i++) CHECK(out[i] == in[i], "fp4x32 缩放后 [%d] %g ≠ %g", i, out[i], in[i]);
+    /* ③ 全零块: 位型唯一(16 B 零 + scale 127), 解出来全零 —— 不留随机残字节 */
+    memset(blk, 0xAB, sizeof blk);
+    for (int i = 0; i < 32; i++) in[i] = 0.f;
+    ds4_quant_fp4x32(in, 1, blk);
+    ds4_deq_fp4x32(blk, 1, out);
+    for (int i = 0; i < 16; i++) CHECK(blk[i] == 0, "fp4x32 全零块 nibble[%d] 非零", i);
+    CHECK(blk[16] == 127, "fp4x32 全零块 scale = 127");
+    for (int i = 0; i < 32; i++) CHECK(out[i] == 0.f, "fp4x32 全零块解出非零");
+    /* ④ 一般分布: 逐块搜 scale 后, 相对 RMS 误差必须落在 FP4 的理论量级内(格点最密处间隔 0.5/6) */
+    uint32_t s = 12345u;
+    double e2 = 0.0, x2 = 0.0;
+    for (int i = 0; i < 96; i++) {
+        s = s * 1664525u + 1013904223u;
+        in[i] = ((float)(s >> 8) / 8388608.0f - 1.0f) * ldexpf(1.0f, (int)(s & 7) - 3);   /* 跨 3 个数量级 */
+    }
+    ds4_quant_fp4x32(in, 3, blk);
+    ds4_deq_fp4x32(blk, 3, out);
+    for (int i = 0; i < 96; i++) { const double d = (double)out[i] - in[i]; e2 += d * d; x2 += (double)in[i] * in[i]; }
+    CHECK(sqrt(e2 / x2) < 0.12, "fp4x32 相对 RMS 误差 %.4f 超 0.12 —— scale 搜坏了", sqrt(e2 / x2));
 }
 
 /* ---- 3) GGUF 合成往返 ---- */
@@ -169,8 +216,10 @@ int main(void) {
     test_deq_fixture(DS4_GGT_BF16,    "bf16",    32);
     test_deq_error_paths();
     test_fp8();
+    test_quant_fp4x32();
     test_gguf_roundtrip();
     { extern int unit_zmod(void); g_fail += unit_zmod(); }   /* 引擎 z 双路对拍(2026-08-26) */
+    { extern int unit_zfinetune(void); g_fail += unit_zfinetune(); }   /* 微调侧车按秩拼接(2026-09-08) */
     if (g_fail) { fprintf(stderr, "ds4_unit: %d failure(s)\n", g_fail); return 1; }
     puts("ds4_unit: ok");
     return 0;

@@ -2,6 +2,7 @@
  * 一切改动先过 tests/unit/test_common.c 的金标夹具逐字节闸。 */
 #include "ds4_quantfmt.h"
 #include "ds4_float.h"
+#include "ds4_fp8.h"
 
 #include <assert.h>
 #include <string.h>
@@ -15,7 +16,66 @@ int ds4_ggt_geom(uint32_t ty, uint64_t *blk, uint64_t *tsz) {
         case DS4_GGT_Q2_K:    *blk = 256; *tsz = 84;  return 1;
         case DS4_GGT_Q4_K:    *blk = 256; *tsz = 144; return 1;
         case DS4_GGT_IQ2_XXS: *blk = 256; *tsz = 66;  return 1;
+        case DS4_GGT_VQBLOB:  *blk = 1;   *tsz = 1;   return 1;
+        case DS4_GGT_FP4X32:  *blk = 32;  *tsz = 17;  return 1;
         default: return 0;
+    }
+}
+
+/* fp4x32: 16 B nibble + 1 B e8m0。nibble 表与 scale 解码都走 ds4_fp8.h(全仓唯一基元)。 */
+void ds4_deq_fp4x32(const uint8_t *src, uint64_t nblk, float *out) {
+    for (uint64_t b = 0; b < nblk; b++) {
+        const uint8_t *blk = src + b * 17u;
+        const float s = ds4_e8m0_to_f32(blk[16]);
+        float *o = out + b * 32u;
+        for (int j = 0; j < 16; j++) {
+            o[2 * j]     = ds4_fp4_nibble_to_f32(blk[j] & 0x0F) * s;
+            o[2 * j + 1] = ds4_fp4_nibble_to_f32(blk[j] >> 4) * s;
+        }
+    }
+}
+
+/* f32 → fp4x32。
+ * 【scale 为什么要逐块搜】E2M1 的幅值格点是 {0,.5,1,1.5,2,3,4,6}, 一块 32 个元素共用一个
+ * 2 的幂 scale。选大了格点太粗, 选小了大值被饱和裁到 ±6·scale。哪种更亏取决于这一块的分布:
+ * 反修放大器的 A/B 是解算出来的低秩因子, 行与行的动态范围能差一个量级, 固定口径(只按 RMS
+ * 或只按 amax)在另一半块上就是系统性误差。scale 本来就逐块存在文件里, 搜它不要钱 ——
+ * 6 档 × 32 元素, 整份 A/B 编一次也就几百毫秒。
+ * 【搜哪 6 档】e0 = ceil(log2(amax/6)) 是"一个都不裁"的最小指数; 从 e0−1(允许少量裁剪, 重尾
+ * 块上反而更准) 到 e0+4 各试一次, 取块内平方误差最小的。
+ * 【全零块】scale 存 127(=2^0), nibble 全 0 —— 解出来就是 0, 且位型唯一(不留随机残字节)。 */
+void ds4_quant_fp4x32(const float *src, uint64_t nblk, uint8_t *out) {
+    for (uint64_t b = 0; b < nblk; b++) {
+        const float *in = src + b * 32u;
+        uint8_t *blk = out + b * 17u;
+        float amax = 0.0f;
+        for (int j = 0; j < 32; j++) {
+            const float a = fabsf(in[j]);
+            if (a > amax) amax = a;
+        }
+        if (!(amax > 0.0f)) { memset(blk, 0, 16); blk[16] = 127; continue; }
+        const int e0 = (int)ceilf(log2f(amax / 6.0f));
+        int ebest = 0;
+        float errbest = -1.0f;
+        for (int d = -1; d <= 4; d++) {
+            int e = e0 + d;
+            if (e < -126) e = -126;          /* e8m0 字节 = e+127, 0 号是次正规特例, 255 是 NaN 槽 */
+            if (e > 127) e = 127;
+            const float s = ldexpf(1.0f, e), inv = 1.0f / s;
+            float err = 0.0f;
+            for (int j = 0; j < 32; j++) {
+                const float r = ds4_e2m1fn_round(in[j] * inv) * s - in[j];
+                err += r * r;
+            }
+            if (errbest < 0.0f || err < errbest) { errbest = err; ebest = e; }
+        }
+        const float inv = 1.0f / ldexpf(1.0f, ebest);
+        for (int j = 0; j < 16; j++) {
+            const uint8_t lo = ds4_fp4_f32_to_nibble(in[2 * j] * inv);
+            const uint8_t hi = ds4_fp4_f32_to_nibble(in[2 * j + 1] * inv);
+            blk[j] = (uint8_t)(lo | (uint8_t)(hi << 4));
+        }
+        blk[16] = (uint8_t)(ebest + 127);
     }
 }
 
@@ -150,6 +210,7 @@ int ds4_deq_bytes(uint32_t ty, const uint8_t *src, uint64_t nelem, float *out) {
         case DS4_GGT_Q2_K:    ds4_deq_q2_K(src, nb, out);    return 0;
         case DS4_GGT_Q4_K:    ds4_deq_q4_K(src, nb, out);    return 0;
         case DS4_GGT_IQ2_XXS: ds4_deq_iq2_xxs(src, nb, out); return 0;
+        case DS4_GGT_FP4X32:  ds4_deq_fp4x32(src, nb, out);  return 0;
         default: return -1;
     }
 }

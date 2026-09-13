@@ -21,11 +21,18 @@ static inline float ds4vq_f16(uint16_t h) {
     float out; memcpy(&out, &f, 4); return out;
 }
 
-/* blob 校验 + 取矩阵载荷偏移(0=无) */
+/* blob 校验 + 取矿阵载荷偏移(0=无)。
+ * ★nexp 读头里的字段(偏移 12), 不再写死 256★(2026-09-12): V4.1 一层 384 专家, 表是 384×3;
+ * 旧 V4 blob 的头同样写着 256, 所以老文件语义不变。 */
+static inline uint32_t ds4vq_blob_nexp(const uint8_t *blob) {
+    uint32_t n; memcpy(&n, blob + 12, 4); return n;
+}
 static inline int ds4vq_blob_ok(const uint8_t *blob, size_t sz) {
-    if (!blob || sz < 16 + 256 * 3 * 8) return 0;
+    if (!blob || sz < 16) return 0;
     uint32_t mg; memcpy(&mg, blob, 4);
-    return mg == DS4VQ_BLOB_MAGIC;
+    if (mg != DS4VQ_BLOB_MAGIC) return 0;
+    const uint32_t nexp = ds4vq_blob_nexp(blob);
+    return nexp >= 1 && nexp <= 4096 && sz >= 16 + (size_t)nexp * 3 * 8;
 }
 static inline uint64_t ds4vq_slot(const uint8_t *blob, int e, int which) {
     uint64_t off; memcpy(&off, blob + 16 + ((size_t)e * 3 + which) * 8, 8);

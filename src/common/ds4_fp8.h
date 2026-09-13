@@ -121,4 +121,18 @@ DS4_HOSTDEV_FP8 float ds4_fp4_nibble_to_f32(uint8_t n) {
     return t[n & 15];
 }
 
+/* f32 → FP4 nibble(0..15), ds4_fp4_nibble_to_f32 的逆向那一半(2026-09-13, 反修放大器落 fp4 用)。
+ * 舍入与饱和全走 ds4_e2m1fn_round —— 编码端自己再写一遍最近搜索, 迟早与它漂开。
+ * 【−0.0 走 0 号槽】8 号槽解出来是 −0.0f, 数值上与 +0.0 相同; 统一编到 0 号槽, "编码→解码→
+ * 再编码"才稳定到同一个位型(否则同一份权重存两次出两种字节, 逐字节对拍全废)。 */
+DS4_HOSTDEV_FP8 uint8_t ds4_fp4_f32_to_nibble(float x) {
+    const float v = ds4_e2m1fn_round(x);
+    const float av = fabsf(v);
+    uint8_t n = 0;
+    for (int i = 1; i < 8; i++) {
+        if (av == ds4_e2m1fn_value(i)) { n = (uint8_t)i; break; }   /* 表里的精确值, 相等比较安全 */
+    }
+    return n == 0 ? (uint8_t)0 : (uint8_t)(v < 0.0f ? (n | 8u) : n);
+}
+
 #endif /* DS4_COMMON_FP8_H */

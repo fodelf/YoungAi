@@ -62,6 +62,10 @@
 #include "src/cuda/cuda_moe_launch.inc.cu"
 #include "src/cuda/cuda_vq.inc.cu"
 #include "src/cuda/cuda_vq_prefill.inc.cu"
+#include "src/cuda/cuda_v41_1.inc.cu"   /* DeepSeek V4.1 批前向原语 ①②③(2026-09-12): 稠密/hc/norm | rope/量化/indexer/attn | 路由/MoE */
+#include "src/cuda/cuda_v41_2.inc.cu"
+#include "src/cuda/cuda_v41_3.inc.cu"
+#include "src/cuda/cuda_v41_4.inc.cu"   /* V4.1 解码小批融合核(fp4x32 GEMV / VQ 即乘 / 缩放舍入 / argmax) */
 #include "src/cuda/cuda_vq_fused2_0.inc.cu"
 #include "src/cuda/cuda_vq_fused2_1.inc.cu"
 #include "src/cuda/cuda_vq_fused2_2.inc.cu"

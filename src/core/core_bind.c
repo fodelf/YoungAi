@@ -2,6 +2,7 @@
 #include "core_internal.h"
 void weights_bind(ds4_weights *w, const ds4_model *m) {
     memset(w, 0, sizeof(*w));
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_V41) { weights_bind_v41(w, m); return; }   /* V4.1 张量名/类型另一套 */
     /* Head tensors are optional so a sharded per-machine slice can hold only the
      * half it needs: the coordinator (first slice) carries token_embd, the last
      * slice carries output*. A whole-model GGUF has them all -> model_find_tensor

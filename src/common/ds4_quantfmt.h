@@ -26,6 +26,12 @@ enum {
     DS4_GGT_Q4_K    = 12,
     DS4_GGT_IQ2_XXS = 16,
     DS4_GGT_BF16    = 30,
+    DS4_GGT_VQBLOB  = 42,   /* 本仓自定: VQ 层 blob(DQVL 表+DQVQ 载荷), 不透明字节, shape=[nbytes] */
+    /* 本仓自定(2026-09-12, V4.1 骨架): FP4 E2M1 + 每 32 元素一个 ue8m0 指数 scale。
+     * 块 = 16 B nibble(字节 j 低 4 位 = 元素 2j, 高 4 位 = 元素 2j+1, 与 HF/官方 convert.py 同序)
+     * + 1 B scale(e8m0, 值 = 2^(e-127)) = 17 B / 32 元素 = 4.25 bpw。值 = nibble 表 × scale。
+     * 与 HF 出厂专家/我们量化器的 FP4 1×32 块语义逐位同, 只是把 weight/scale 两张量交织成 GGUF 块。 */
+    DS4_GGT_FP4X32  = 43,
 };
 
 /* 类型几何: 每块元素数 blk 与每块字节数 tsz。认识返回 1, 不认识返回 0。 */
@@ -36,6 +42,12 @@ void ds4_deq_q8_0(const uint8_t *src, uint64_t nblk, float *out);
 void ds4_deq_q2_K(const uint8_t *src, uint64_t nblk, float *out);
 void ds4_deq_q4_K(const uint8_t *src, uint64_t nblk, float *out);
 void ds4_deq_iq2_xxs(const uint8_t *src, uint64_t nblk, float *out);
+void ds4_deq_fp4x32(const uint8_t *src, uint64_t nblk, float *out);
+
+/* fp4x32 编码(2026-09-13, 反修放大器产物落 fp4 用): f32[nblk*32] → nblk 个 17 B 块。
+ * 与 ds4_deq_fp4x32 配对: 解码端只做 表[nibble]×2^(e−127), 所以 e 怎么选是编码端的自由度,
+ * 本函数逐块搜最优(判据 = 块内平方误差)。为什么要搜见 .c 里的注释。 */
+void ds4_quant_fp4x32(const float *src, uint64_t nblk, uint8_t *out);
 
 /* 分派入口: 一段字节 → f32[nelem]。nelem 必须是块大小整数倍。
  * 成功返回 0; 类型不认识/不整除返回 -1(不打印不退出, 调用方决定停车口径)。 */

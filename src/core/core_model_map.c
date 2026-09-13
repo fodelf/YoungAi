@@ -107,15 +107,13 @@ ds4_tensor *model_find_tensor(const ds4_model *m, const char *name) {
 typedef struct {
     uint64_t off;
     uint64_t end;
+    uint32_t prio;   /* 0 骨架(先拷) 1 专家/blob(后填) */
 } accelerator_tensor_span;
 
 static int accelerator_tensor_span_cmp(const void *a, const void *b) {
-    const accelerator_tensor_span *sa = a;
-    const accelerator_tensor_span *sb = b;
-    if (sa->off < sb->off) return -1;
-    if (sa->off > sb->off) return 1;
-    if (sa->end < sb->end) return -1;
-    if (sa->end > sb->end) return 1;
+    const accelerator_tensor_span *x = a, *y = b;
+    if (x->prio != y->prio) return x->prio < y->prio ? -1 : 1;   /* 骨架优先 */
+    if (x->off != y->off) return x->off < y->off ? -1 : 1;
     return 0;
 }
 
@@ -160,14 +158,21 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
             cache_exps = 0;
 #endif
         }
-        if (!cache_exps && memmem(t->name.ptr, t->name.len, "_exps.", 6) != NULL) {
+        const bool is_exp = memmem(t->name.ptr, t->name.len, "_exps.", 6) != NULL;
+        const bool is_blob = memmem(t->name.ptr, t->name.len, "_exps_vq.", 9) != NULL;   /* 合一 VQ blob(V4/V4.1 专家字节) */
+        if (!cache_exps && is_exp) {
             continue;
         }
         spans[nspan++] = (accelerator_tensor_span){
             .off = t->abs_offset,
             .end = t->abs_offset + t->bytes,
+            .prio = (is_exp || is_blob) ? 1u : 0u,
         };
     }
+    /* ★骨架先拷、专家/blob 后填(2026-09-12)★: 之前纯按偏移排, V4.1 的 103 GiB 里 98 GB 是 40 层 blob, 预算(总内存-24 GiB)
+     * 被前面的 blob 吃光, 排在文件最末的 output.weight(350 MB)没拷进设备, 只能经 cudaHostRegister 的文件映射读 ——
+     * 实测该映射尾页首次被 GPU 读偶发返回垃圾(e8m0 垃圾 → 2^128 → f16 inf → 整列 logits NaN, 重读即对)。
+     * 骨架(每 token 都读、含 head)必须常驻; blob 再按偏移顺序填到预算为止, 余下走映射。 */
     qsort(spans, (size_t)nspan, sizeof(spans[0]), accelerator_tensor_span_cmp);
 
     const uint64_t max_span = accelerator_cuda_preload_span_bytes();

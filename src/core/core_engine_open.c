@@ -115,7 +115,10 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         {
             const char *zchain_path = (opt->zchain_path && opt->zchain_path[0])
                                     ? opt->zchain_path : NULL;
-            if (zchain_path && zchain_path[0]) {
+            if (zchain_path && DS4_MODEL_VARIANT == DS4_VARIANT_V41) {
+                /* V4.1 的 zchain 形态 = 反修放大器目录(amp_Lnn.bin), 由 V4.1 前向状态自己加载/应用(core_v41_amp.c) */
+                ds4_engine_v41_set_amp_dir(zchain_path);
+            } else if (zchain_path && zchain_path[0]) {
                 e->model.zchain = ds4_zchain_load(zchain_path, DS4_N_LAYER,
                                                   DS4_N_EXPERT, DS4_N_EMBD);
                 /* 显式请求的侧车打不开/空链 => 硬失败。静默裸跑过一次假对照
@@ -127,6 +130,48 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 }
             } else {
                 e->model.zchain = zchain_from_model(&e->model);
+            }
+            /* 第三个文件: 微调侧车(--finetune)。zchain 冻结不动, 微调按秩拼进它的
+             * z^L —— 运行时一次矩阵乘同时生效, GPU 上传/kernel 零改动(ds4_zfinetune.h)。
+             * 显式请求打不开/合不上 => 硬失败, 与 --zchain 同规矩: 静默裸跑会出假对照。 */
+            /* ★逗号分隔可挂多个★(2026-09-10 迭代 SFT 需要): 一步低秩解走不到位, 要
+             * θ₂ = θ₁ + Δ₂ 这样累积 —— 而 z 是加性低秩项, 多个文件按秩拼进同一个 z^L
+             * 与"先合并成一个文件再挂"逐位等价(ds4_zfinetune_merge 本来就是就地累积的)。
+             * 所以不必造一个离线合并工具去抄第二份拼接逻辑, 依次 merge 即可。 */
+            const char *ft_path = opt->finetune_path;
+            if (ft_path && ft_path[0]) {
+                if (!e->model.zchain) {
+                    fprintf(stderr, "ds4: --finetune requires a zchain (pass --zchain or use an embedded one)\n");
+                    exit(1);
+                }
+                char *ftlist = strdup(ft_path);
+                if (!ftlist) { fprintf(stderr, "ds4: --finetune strdup failed\n"); exit(1); }
+                int n = 0, nfile = 0;
+                for (char *save = NULL, *tok = strtok_r(ftlist, ",", &save);
+                     tok; tok = strtok_r(NULL, ",", &save)) {
+                    while (*tok == ' ') tok++;
+                    if (!*tok) continue;
+                    ds4_zchain *one = ds4_zchain_load(tok, DS4_N_LAYER, DS4_N_EXPERT, DS4_N_EMBD);
+                    const int m = one ? ds4_zfinetune_merge(e->model.zchain, one) : -1;
+                    if (one) ds4_zchain_free(one);
+                    if (m < 0) {
+                        fprintf(stderr, "ds4: finetune %s requested but unusable -- aborting\n", tok);
+                        exit(1);
+                    }
+                    if (m > n) n = m;
+                    nfile++;
+                }
+                free(ftlist);
+                if (!nfile) {
+                    fprintf(stderr, "ds4: --finetune %s 里没有可用路径 -- aborting\n", ft_path);
+                    exit(1);
+                }
+                /* ★措辞要说清是内存内★: 早先这里写 "merged into zchain", 读起来像把微调写进了
+                 * zchain.bin —— 实际是进程内把载荷按秩拼成一个更宽的 z^L 喂 kernel,
+                 * zchain.bin 是 PROT_READ|MAP_PRIVATE 只读映射, 全程只 memcpy 出来不写回。
+                 * 盘上永远是各自独立的文件, 删掉微调即回到"量化+zchain"。 */
+                fprintf(stderr, "ds4: finetune %s 已挂载(%d 个文件, 内存内按秩拼接 %d 层; "
+                                "zchain.bin 只读未改动)\n", ft_path, nfile, n);
             }
         /* 第4文件(2026-08-20 用户四文件设计): drafter 反修放大器侧车 --draft-zchain。
          * 3 层链(mtp.0/1/2)合并进主链尾部槽 43..45 ⇒ 单 GPU 表一次上传;

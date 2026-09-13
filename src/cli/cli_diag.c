@@ -29,6 +29,22 @@
 /* teacher-forced 逐位打分(2026-08-14 公开对拍): 读 ids 文件(空白分隔 token id),
  * 首 token prefill 后逐位: 导出全词表 raw logits → 强制喂真值下一 token。
  * 输出=量化器 DS4_DUMP_LOGITS 同构二进制(int32 S,V + fp32[S*V]) → anchor_metrics 直接对表。 */
+/* V4.1 贪心生成(P2c 冒烟出口): 逐 token 打印文本, 采样/会话/服务接入是 P5 */
+static int v41_emit_print(int token, void *ud) {
+    ds4_engine *engine = (ds4_engine *)ud;
+    if (token == ds4_token_eos(engine)) return 1;
+    size_t len = 0; char *txt = ds4_token_text(engine, token, &len);
+    if (txt) { fwrite(txt, 1, len, stdout); fflush(stdout); }
+    return 0;
+}
+int run_v41_generation(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
+    if (cfg->gen.temperature > 0.0f) fprintf(stderr, "ds4: V4.1 当前只有贪心解码(temp 0), 忽略 --temp %.2f\n", (double)cfg->gen.temperature);
+    ds4_engine_v41_set_prof(cfg->gen.v41_prof);
+    int rc = ds4_engine_v41_generate_argmax(engine, prompt->v, (int)prompt->len, cfg->gen.n_predict, cfg->gen.ctx_size, v41_emit_print, engine);
+    fputc('\n', stdout);
+    return rc;
+}
+
 int run_score_ids(ds4_engine *engine, const cli_config *cfg) {
     FILE *fi = fopen(cfg->gen.score_ids_path, "r");
     if (!fi) { fprintf(stderr, "ds4: --score-ids 打不开 %s\n", cfg->gen.score_ids_path); return 1; }
@@ -40,6 +56,13 @@ int run_score_ids(ds4_engine *engine, const cli_config *cfg) {
     }
     fclose(fi);
     if (n < 2) { fprintf(stderr, "ds4: score-ids 少于 2 token\n"); free(ids); return 1; }
+    /* V4.1(2026-09-12): 分块增量前向出全位置 logits(同构输出, anchor_metrics 直接对表) */
+    if (ds4_engine_is_v41(engine)) {
+        ds4_engine_v41_set_prof(cfg->gen.v41_prof);
+        int rc = ds4_engine_v41_score_ids(engine, ids, n, cfg->gen.score_out_path ? cfg->gen.score_out_path : "/tmp/ds4_score.bin",
+                                          cfg->gen.v41_no_engram, cfg->gen.v41_chunk);
+        free(ids); return rc;
+    }
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
         fprintf(stderr, "ds4: --score-ids 需要图会话后端\n"); free(ids); return 1;

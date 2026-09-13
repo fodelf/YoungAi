@@ -46,6 +46,7 @@
 #include "ds4_distributed.h"
 #include "ds4_multimodal.h"
 #include "ds4_zchain.h"
+#include "ds4_zfinetune.h"   /* 微调侧车(第三个文件)与 zchain 的按秩拼接 */
 #include "ds4_spatial.h"
 #include "ds4_css.h"
 
@@ -115,6 +116,7 @@
 #include "core_types.h"
 #include "core_inline.h"
 #include "core_gpu_graph.h"
+#include "core_v41.h"   /* DeepSeek V4.1 批前向工作缓冲(2026-09-12) */
 
 struct ds4_session {
     ds4_engine *engine;
@@ -193,7 +195,7 @@ struct ds4_session {
 extern const char DS4_REASONING_EFFORT_MAX_PREFIX[];
 extern uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER];
 extern uint32_t g_requested_threads;
-extern const gguf_type_info gguf_types[43];
+extern const gguf_type_info gguf_types[44];   /* [43]=fp4x32(V4.1 骨架) */
 extern bool g_model_open_arm_env_defaults;
 extern bool g_vq_experts_blob;
 extern pthread_once_t iq2xxs_signed_grid_once;
@@ -244,6 +246,13 @@ bool compressor_decode_one( float * out_comp, const ds4_model * model, const ds4
 bool compressor_decode_one_decode_scratch( float * out_comp, const ds4_model * model, const ds4_tensor * wkv, const ds4_tensor * wgate, const ds4_tensor * ape, const ds4_tensor * norm, const float * x, float * state_kv, float * state_score, uint32_t head_dim, uint32_t compress_ratio, uint32_t il, uint32_t pos, ds4_cpu_decode_scratch * scratch);
 void compressor_pool_decode_state( float * out, float * state_kv, float * state_score, uint32_t head_dim, uint32_t compress_ratio);
 void config_validate_model(const ds4_model *m);
+void v41_load_metadata(const ds4_model *m);          /* core_validate_v41.c: V4.1 接线表装填 */
+void ds4_select_shape_from_metadata(uint32_t n_layer, uint32_t n_embd, uint32_t n_vocab, uint32_t n_head, uint32_t n_head_kv,
+        uint32_t n_head_dim, uint32_t n_value_dim, uint32_t n_rot, uint32_t n_lora_q, uint32_t n_lora_o, uint32_t n_out_group,
+        uint32_t n_expert, uint32_t n_expert_used, uint32_t n_ff_exp, uint32_t n_expert_shared, uint32_t n_hash_layer,
+        uint32_t n_swa, uint32_t n_indexer_head, uint32_t n_indexer_head_dim, uint32_t n_indexer_top_k, uint32_t n_hc,
+        uint32_t n_hc_sinkhorn_iter);   /* core_shape_select.c */
+void weights_bind_v41(ds4_weights *w, const ds4_model *m);   /* core_bind_v41.c */
 void cpu_decode_scratch_free(ds4_cpu_decode_scratch *scratch);
 void cpu_decode_scratch_init(ds4_cpu_decode_scratch *scratch, uint32_t ctx_size);
 ds4_cursor cursor_at(const ds4_model *m, uint64_t pos);

@@ -64,6 +64,7 @@ ds4_shape g_ds4_shape = {
 };
 
 uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER] = {0};
+ds4_v41_cfg g_ds4_v41;   /* V4.1 接线表; V4 模型下 active=0, 由 core_validate_v41.c 装填 */
 /* Attention compression is read from GGUF metadata after validating that it
  * matches the exact layout expected for the loaded model shape. */
 uint32_t ds4_layer_compress_ratio(uint32_t il) {
@@ -81,6 +82,10 @@ uint32_t ds4_expected_layer_compress_ratio(uint32_t il) {
     case DS4_VARIANT_PRO:
         if (il < 2) return 128u;
         return (il & 1u) == 0 ? 4u : 128u;
+    case DS4_VARIANT_V41:
+        /* V4.1 的压缩比是元数据的真值(0/1/2 按官方 config 逐层给), 没有"预期公式";
+         * 校验在 core_validate_v41.c 只做取值范围检查。 */
+        return g_ds4_compress_ratios[il];
     default:
         ds4_die("unsupported DeepSeek4 model variant");
     }

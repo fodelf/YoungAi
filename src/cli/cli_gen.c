@@ -179,6 +179,11 @@ int run_generation(ds4_engine *engine, const cli_config *cfg) {
     build_prompt(engine, &cfg->gen, &prompt);
 
     int rc = 0;
+    if (ds4_engine_is_v41(engine)) {   /* V4.1(2026-09-12 P2c): 会话/采样还没接, 走贪心增量前向直接吐字 */
+        rc = run_v41_generation(engine, cfg, &prompt);
+        ds4_tokens_free(&prompt);
+        return rc;
+    }
     if (cfg->gen.metal_graph_test) {
         rc = ds4_engine_metal_graph_test(engine, &prompt);
         ds4_tokens_free(&prompt);
