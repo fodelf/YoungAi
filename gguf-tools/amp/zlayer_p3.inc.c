@@ -177,6 +177,11 @@ static void zl_expert_fwd(const float *x, int n, const float *w1, const float *w
 /* ---------------- XCAP 捕获读取与对齐自检 ----------------
  * 引擎走 DS4_EVAL_IDS 时流首插了 BOS, 捕获会比锚多一行(NTOK+1)。差这一行就是整体错位
  * 一格 —— 每个 token 的 x 配到前一个 token 的目标上, 不报错、照样出挽回率。 */
+/* ★行偏移(2026-09-08 夜间 z 微调)★ 学生捕获按学生行号落盘, 比锚少 g_xn 行(教师独有的事后上下文);
+ * 按 <锚>.layout 的 "xshift S0 N" 映射回锚行(row_layout_xshift 注释有映射表)。上下文那 N 行学生
+ * 没有 → 这里留零, main 里用教师 fin 回填(它们不在任何域块 ⇒ 非 fit/eval 行, 回填只为让对齐自检
+ * 与全表统计有定义, 不进解算)。g_xn=0 = 无偏移 = 原路一字不改。 */
+static int g_xs0 = -1, g_xn = 0;
 static float *capload(const char *xcap, const char *nm, int L, int NTOK, int cols) {
     char p[1024];
     snprintf(p, sizeof p, "%s/%s_L%d", xcap, nm, L);
@@ -185,15 +190,24 @@ static float *capload(const char *xcap, const char *nm, int L, int NTOK, int col
     fseeko(f, 0, SEEK_END);
     long long sz = ftello(f);
     long long n = sz / 2 / cols;
-    if (n != NTOK && n != NTOK + 1)
-        die("assert 失败: %s: %lld 行, 既非 NTOK=%d 也非 NTOK+1(BOS) — 口径不明, 拒跑", p, n, NTOK);
-    long long off = n - NTOK;                            /* 1 = 掐掉流首 BOS 行 */
+    const long long need = g_xn > 0 ? (long long)NTOK - g_xn : NTOK;   /* 学生行数 */
+    if (n != need && n != need + 1)
+        die("assert 失败: %s: %lld 行, 既非 %lld 也非 %lld+1(BOS)(NTOK=%d, xshift N=%d) — 口径不明, 拒跑",
+            p, n, need, need, NTOK, g_xn);
+    long long off = n - need;                            /* 1 = 掐掉流首 BOS 行 */
     if (fseeko(f, (off_t)(off * cols * 2), SEEK_SET)) die("%s seek 失败", p);
-    uint16_t *h = (uint16_t *)xmalloc((size_t)NTOK * cols * 2);
-    if (fread(h, 2, (size_t)NTOK * cols, f) != (size_t)NTOK * cols) die("%s 读不满", p);
+    uint16_t *h = (uint16_t *)xmalloc((size_t)need * cols * 2);
+    if (fread(h, 2, (size_t)need * cols, f) != (size_t)need * cols) die("%s 读不满", p);
     fclose(f);
-    float *o = (float *)xmalloc((size_t)NTOK * cols * sizeof(float));
-    for (size_t i = 0; i < (size_t)NTOK * cols; i++) o[i] = f16_to_f32(h[i]);
+    float *o = (float *)xcalloc((size_t)NTOK * cols, sizeof(float));
+    for (int r = 0; r < NTOK; r++) {
+        long long src = r;
+        if (g_xn > 0) src = r < g_xs0 ? r : (r >= g_xs0 + g_xn ? r - g_xn : -1);
+        if (src < 0) continue;                           /* 上下文行: 学生没有, 留零待回填 */
+        const uint16_t *hr = h + (size_t)src * cols;
+        float *orow = o + (size_t)r * cols;
+        for (int j = 0; j < cols; j++) orow[j] = f16_to_f32(hr[j]);
+    }
     free(h);
     return o;
 }
@@ -327,6 +341,10 @@ int main(int argc, char **argv) {
     }
     const char *hf = argv[1], *ld = argv[2], *ap = argv[3];
     int L = atoi(argv[4]);
+    { int s0 = 0, xn = 0;                                /* 行偏移随锚布局走(row_layout_xshift 注释) */
+      if (row_layout_xshift(ap, &s0, &xn)) { g_xs0 = s0; g_xn = xn;
+          printf("  L%d 行偏移: 锚行 [%d,%d) 是教师独有上下文, 锚行 >= %d ↔ 学生行 − %d\n",
+                 L, s0, s0 + xn, s0 + xn, xn); } }
     /* 位置参数只数到第一个 --flag 为止: 可选位置参数(K/INJ/XCAP/PREV)省略时 flag 会顶到
      * argv[5..], 不设界会把 "--ntok" 当 K 吃掉。 */
     int nfx = argc;
@@ -393,6 +411,8 @@ int main(int argc, char **argv) {
      * 没给 XCAP 目录 = 非 XCAP 口径: x 就是锚 fin(py: X0 保持 anchor_layer 的返回值),
      * 学生输出 Y_q 由本进程重算(VQ blob 或 GGUF 切片), 没有 YQE。 */
     float *X0 = XCAP ? capload(XCAP, "raw_ffn_in", L, NTOK, D) : X0fp;
+    if (XCAP && g_xn > 0)                                /* 上下文行学生没有: 教师 fin 回填(非拟合行, 见 capload) */
+        memcpy(X0 + (size_t)g_xs0 * D, X0fp + (size_t)g_xs0 * D, (size_t)g_xn * D * sizeof(float));
     /* ★只换 x 模式(2026-08-27)★: XCAP 目录只给 raw_ffn_in 时 YQE=NULL —— 学生与教师
      * 都由本进程在【同一个量化链 x】上重算, 靶=纯量化误差(不掺引擎实现差)。用户口径:
      * "用量化链给反修用去对齐原始模型"。给了 raw_ffn_out 才走旧的引擎输出口径。 */

@@ -45,6 +45,7 @@ static int row_layout_split(const char *ids_path,
         if (line[0] == '#' || line[0] == '\n') continue;
         char nm[128]; long a = 0, b = 0;
         if (sscanf(line, "win %d", &win) == 1) continue;
+        if (!strncmp(line, "xshift ", 7)) continue;      /* 行偏移行不是域块(见 row_layout_xshift) */
         if (sscanf(line, "%127s %ld %ld", nm, &a, &b) != 3) continue;
         if (win <= 0 || b <= 0) continue;
         const int off = (int)a, cnt = (int)b;
@@ -70,6 +71,31 @@ static int row_layout_split(const char *ids_path,
     if (win <= 0 || nf < 8 || ne < 2) { free(fit); free(ev); return -1; }
     *fit_out = fit; *nfit_out = nf; *ev_out = ev; *nev_out = ne;
     return 0;
+}
+
+/* ★行偏移 "xshift <S0> <N>"(2026-09-08 夜间 z 微调)★ 教师序列 = [前段 S0 行 ‖ 事后上下文 N 行 ‖ 正文],
+ * 学生序列(部署口径)没有那 N 行上下文, 所以学生侧的捕获/打分比锚少 N 行, 行号映射:
+ *     锚行 r < S0        → 学生行 r
+ *     S0 <= r < S0+N     → 学生没有(上下文只给教师看; 这 N 行不在任何域块里 ⇒ 永不是 fit/eval 行)
+ *     r >= S0+N          → 学生行 r − N
+ * 为什么写进 .layout 而不是命令行: 消费方(zlayer / anchor_metrics)手里只有锚/ids 路径, 偏移与行域
+ * 是同一份事实, 分两处传迟早对不上(2026-08-29 行掩码抄死在脚本里的同款事故)。缺此行 = 无偏移。
+ * 返回 1=有偏移(*s0,*n 有效), 0=无。 */
+static int __attribute__((unused)) row_layout_xshift(const char *ids_path, int *s0, int *n)
+{
+    if (!ids_path) return 0;
+    char lp[1024];
+    snprintf(lp, sizeof lp, "%s.layout", ids_path);
+    FILE *f = fopen(lp, "r");
+    if (!f) return 0;
+    int found = 0; long a = 0, b = 0;
+    char line[512];
+    while (fgets(line, sizeof line, f))
+        if (sscanf(line, "xshift %ld %ld", &a, &b) == 2 && a >= 0 && b > 0) { found = 1; break; }
+    fclose(f);
+    if (!found) return 0;
+    *s0 = (int)a; *n = (int)b;
+    return 1;
 }
 
 /* ★进程内缓存(2026-08-29)★ 布局只解析一次, 反修(p7 的 z 闸/GE 闸)与 sweep(p13)共用同一份

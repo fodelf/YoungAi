@@ -9,7 +9,11 @@
  * 锚格式 DQA2: <8×u32 头> <8B idh> <跳 fin/ridx/rw/H> <f32 logits[S][VOCAB]>
  * 学生格式:   <i32 S><i32 V><f32 logits[S][V]>
  * 用法: anchor_metrics --ref anchor.bin --ids ids.txt [--student stu.bin]
- *       [--ref-raw raw.bin] [--fit N] [--tail N]                            */
+ *       [--ref-raw raw.bin | --ref-eval eval.bin] [--fit N] [--tail N] [--rows a:b[,c:d,...]]
+ * --ref-raw = --score-out(解码路, 带 <S,V> 头); --ref-eval = --eval-logits(prefill 批路, 无头带 BOS 行)
+ * --ref-nll = --eval-nll 的 f32[S](引擎已算好逐位 NLL, 只出 PPL/NLL; 省掉 5 个数量级的盘)
+ * ★--rows 收多段(2026-09-08)★: 后训练判决只算"本应写出的报告"那些 token, 每条样本的
+ * 材料段不算数 ⇒ N 条样本 = N 段不连续行, 合成一个池子出一份平均 NLL(不是每段各出一份)。*/
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,6 +39,38 @@ static float *read_anchor(const char *path, meta_t *m) {
     float *lg = malloc(n * sizeof(float));
     if (!lg || fread(lg, 4, n, f) != n) { fprintf(stderr, "%s: logits 截断\n", path); exit(2); }
     fclose(f);
+    return lg;
+}
+
+/* --eval-ids 批量路(prefill)的输出: 裸 f32 [n][V] 无头, 且流首插了 BOS ⇒ 比 ids 多一行。
+ * V 由文件大小反推(rows = nids+1), 掐掉 BOS 行后取前 nids 行 —— 与 --stu-raw 同一口径。
+ * 为什么要这条路: 逐 token 的 --score-ids 是解码路(~20 t/s), 一份 8000 字的报告就要 4 分钟;
+ * 批路做同样的 teacher-forced 打分快一个量级, 长报告的判决只能走它。 */
+static float *read_eval_raw(const char *path, int nids, int *S, int *V) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "%s 打不开\n", path); exit(2); }
+    fseek(f, 0, SEEK_END);
+    long long fsz = ftell(f);
+    /* --eval-ids 默认在流首插 BOS(行数=nids+1), --eval-no-bos 则不插(行数=nids)。
+     * 两种都要能读: 按行数反推 VOCAB, 只有一种能整除(129280 词表下不会撞车)。 */
+    long long v = 0, skip = 0;
+    if (nids > 0 && fsz % ((long long)(nids + 1) * 4) == 0) {
+        v = fsz / ((long long)(nids + 1) * 4); skip = 1;          /* 首行是 BOS 的输出, 掐掉 */
+    } else if (nids > 0 && fsz % ((long long)nids * 4) == 0) {
+        v = fsz / ((long long)nids * 4); skip = 0;
+    } else {
+        fprintf(stderr, "%s: %lld 字节 与 ids 数 %d 对不上(含/不含 BOS 都除不尽)\n", path, fsz, nids);
+        exit(2);
+    }
+    if (v < 1024 || v > (1 << 22)) { fprintf(stderr, "%s: 反推 VOCAB=%lld 不合理\n", path, v); exit(2); }
+    fprintf(stderr, "%s: %d 行 × VOCAB %lld%s\n", path, nids, v, skip ? " (掐掉流首 BOS 行)" : " (无 BOS)");
+    fseek(f, (long)(skip * v * 4), SEEK_SET);
+    float *lg = malloc((size_t)nids * (size_t)v * sizeof(float));
+    if (!lg || fread(lg, 4, (size_t)nids * (size_t)v, f) != (size_t)nids * (size_t)v) {
+        fprintf(stderr, "%s: logits 截断\n", path); exit(2);
+    }
+    fclose(f);
+    *S = nids; *V = (int)v;
     return lg;
 }
 
@@ -90,7 +126,8 @@ static int cmp_dbl_desc(const void *a, const void *b) {
 /* ---- 逐位置指标 worker(位置块并行) ---- */
 typedef struct {
     const float *ref, *stu;
-    int V, lo;
+    int V;
+    const int *row;             /* [n] 绝对行号: 判决行集合可以不连续(见 --rows) */
     double *kld, *rms, *dtop, *smin;   /* [n] */
     uint8_t *same;              /* [n] */
 } met_ctx;
@@ -100,8 +137,8 @@ static void met_worker(void *vc, int t0, int t1) {
     double *lr = malloc(V * sizeof(double)), *ls = malloc(V * sizeof(double));
     double *pr = malloc(V * sizeof(double)), *ps = malloc(V * sizeof(double));
     for (int t = t0; t < t1; t++) {
-        const float *r = c->ref + (size_t)(c->lo + t) * V;
-        const float *s = c->stu + (size_t)(c->lo + t) * V;
+        const float *r = c->ref + (size_t)c->row[t] * V;
+        const float *s = c->stu + (size_t)c->row[t] * V;
         log_softmax_row(r, lr, V); log_softmax_row(s, ls, V);
         double kl = 0; int ir = 0, iu = 0;
         for (int v = 0; v < V; v++) {
@@ -164,23 +201,86 @@ static double quantile(double *v, int n, double q) {   /* numpy 线性插值同�
     return lo_v + (hi_v - lo_v) * fr;
 }
 
-typedef struct { double ppl; int n; } pplr;
-static pplr ppl_block(const float *lg, const long *ids, int nids, int V, int lo, int hi) {
-    if (hi > nids - 1) hi = nids - 1;
-    pplr r = {NAN, 0};
-    if (hi <= lo) return r;
-    double s = 0;
-    for (int i = lo; i < hi; i++) s += nll_at(lg + (size_t)i * V, V, (int)ids[i + 1]);
-    r.ppl = exp(s / (hi - lo)); r.n = hi - lo;
+typedef struct { double ppl, nll; int n; } pplr;
+/* 行集合口径: row[] 是绝对行号(可不连续), 位置 i 预测 ids[i+1]。
+ * nll = 目标 token 的平均负对数似然 —— ★后训练唯一的尺★(PPL=exp(nll) 只是它的另一种写法)。 */
+static pplr ppl_block(const float *lg, const long *ids, int nids, int V, const int *row, int n) {
+    pplr r = {NAN, NAN, 0};
+    double s = 0; int used = 0;
+    for (int t = 0; t < n; t++) {
+        int i = row[t];
+        if (i + 1 >= nids) continue;                     /* 末位没有下一个 token 可预测 */
+        s += nll_at(lg + (size_t)i * V, V, (int)ids[i + 1]);
+        used++;
+    }
+    if (!used) return r;
+    r.nll = s / used; r.ppl = exp(r.nll); r.n = used;
+    return r;
+}
+
+/* 引擎 --eval-nll 已经把每位置目标 token 的 NLL 算好了(f32[S]), 这里只按行取平均。
+ * 口径与 ppl_block 逐式相同 —— 差别只在"谁来做那次 log_softmax": 那边现算, 这边引擎
+ * 在同一趟前向里顺手算完。★为什么值得单开一条路★: 全词表 logits 每位置 517 KB,
+ * 16 条样本要 46 GB, 统一内存机器上写它就是在掏 GPU 的内存(09-08 实撞崩机)。
+ * 末位是 NaN(没有下一个 token 可预测), 跳过不计 —— 与 ppl_block 的 i+1>=nids 同义。 */
+static pplr ppl_block_nll(const float *v, int S, const int *row, int n) {
+    pplr r = {NAN, NAN, 0};
+    double s = 0; int used = 0;
+    for (int t = 0; t < n; t++) {
+        int i = row[t];
+        if (i < 0 || i >= S) continue;
+        if (!(v[i] == v[i])) continue;                   /* NaN: 该位置没有目标 token */
+        s += v[i]; used++;
+    }
+    if (!used) return r;
+    r.nll = s / used; r.ppl = exp(r.nll); r.n = used;
+    return r;
+}
+
+/* --rows "a:b" 或 "a:b,c:d,..." → 绝对行号数组(升序去重不做, 由调用方保证不重叠)。
+ * 为什么要多段: 每条样本是[当日材料][本应写的报告], 只有报告那一段是后训练的目标 token,
+ * 材料段不算数; N 条样本 = N 段不连续区间, 但要合成一个池子出一份平均 NLL。 */
+static int *rows_parse(const char *spec, int S, int *out_n) {
+    int cap = 64, n = 0;
+    int *r = malloc((size_t)cap * sizeof(int));
+    const char *p = spec;
+    while (*p) {
+        int a, b, adv = 0;
+        if (sscanf(p, "%d:%d%n", &a, &b, &adv) != 2) { free(r); return NULL; }
+        if (b > S) b = S;
+        for (int i = a; i < b; i++) {
+            if (i < 0) { free(r); return NULL; }
+            if (n == cap) { cap *= 2; r = realloc(r, (size_t)cap * sizeof(int)); }
+            r[n++] = i;
+        }
+        p += adv;
+        if (*p == ',') p++;
+        else if (*p) { free(r); return NULL; }
+    }
+    if (!n) { free(r); return NULL; }
+    *out_n = n;
+    return r;
+}
+static int *rows_range(int lo, int hi) {
+    int *r = malloc((size_t)(hi - lo) * sizeof(int));
+    for (int i = lo; i < hi; i++) r[i - lo] = i;
     return r;
 }
 
 int main(int argc, char **argv) {
-    const char *refp = NULL, *rawp = NULL, *idsp = NULL, *stup = NULL, *sraw = NULL;
+    const char *refp = NULL, *rawp = NULL, *idsp = NULL, *stup = NULL, *sraw = NULL, *revl = NULL;
     int fit = 0, tail = 0, threads = 16; const char *rowout = NULL;   /* 逐位置 KL/Σmin/same 落盘(尾部集中度诊断, 不动五指标) */
+    /* ★行偏移/行段(2026-09-08 夜间 z 微调)★ --xshift S0 N: 学生 logits 比锚少 N 行(锚行 [S0,S0+N) 是教师独有
+     * 的事后上下文, 部署侧没有), 锚行 r>=S0+N ↔ 学生行 r−N(与 row_layout.inc.c 的 xshift 同一映射);
+     * 上下文行用锚自己回填(KLD=0), 所以有偏移时必须配 --rows a:b 只看正文行, 不然全段被回填行冲稀。 */
+    int xs0 = -1, xn = 0; const char *rowspec = NULL, *rnll = NULL;
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--ref") && i + 1 < argc) refp = argv[++i];
+        if (!strcmp(argv[i], "--xshift") && i + 2 < argc) { xs0 = atoi(argv[++i]); xn = atoi(argv[++i]); }
+        else if (!strcmp(argv[i], "--rows") && i + 1 < argc) rowspec = argv[++i];
+        else if (!strcmp(argv[i], "--ref") && i + 1 < argc) refp = argv[++i];
         else if (!strcmp(argv[i], "--ref-raw") && i + 1 < argc) rawp = argv[++i];
+        else if (!strcmp(argv[i], "--ref-eval") && i + 1 < argc) revl = argv[++i];
+        else if (!strcmp(argv[i], "--ref-nll") && i + 1 < argc) rnll = argv[++i];
         else if (!strcmp(argv[i], "--ids") && i + 1 < argc) idsp = argv[++i];
         else if (!strcmp(argv[i], "--student") && i + 1 < argc) stup = argv[++i];
         else if (!strcmp(argv[i], "--stu-raw") && i + 1 < argc) sraw = argv[++i];
@@ -189,30 +289,82 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) threads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--row-out") && i + 1 < argc) rowout = argv[++i];
     }
-    if ((!refp && !rawp) || !idsp) { fprintf(stderr, "需 --ref/--ref-raw 与 --ids\n"); return 2; }
+    if ((!refp && !rawp && !revl && !rnll) || !idsp) { fprintf(stderr, "需 --ref/--ref-raw/--ref-eval/--ref-nll 与 --ids\n"); return 2; }
 
-    /* ids */
-    long ids[65536]; int nids = 0;
+    /* ids: 动态扩容 —— 一条 8000 字的报告就 5k token, 17 条样本 11 万 token,
+     * 原来的定长 65536 栈数组会静默截断(判决行落到序列外) */
+    long *ids = NULL; int nids = 0, icap = 0;
     { FILE *f = fopen(idsp, "r");
       if (!f) { fprintf(stderr, "%s 打不开\n", idsp); return 2; }
-      while (nids < 65536 && fscanf(f, "%ld", &ids[nids]) == 1) nids++;
-      fclose(f); }
+      long v;
+      while (fscanf(f, "%ld", &v) == 1) {
+          if (nids == icap) { icap = icap ? icap * 2 : 8192;
+                              long *nb = realloc(ids, (size_t)icap * sizeof(long));
+                              if (!nb) { fprintf(stderr, "ids 扩容失败\n"); return 2; }
+                              ids = nb; }
+          ids[nids++] = v;
+      }
+      fclose(f);
+      if (!nids) { fprintf(stderr, "%s: 一个 id 都没读到\n", idsp); return 2; } }
+
+    /* --ref-nll: 引擎 --eval-nll 出的 f32[S], 只出 PPL/NLL 就退出。
+     * 其余四指标(KLD/RMSΔp/Same top/Δp)要的是完整分布, 这条路上没有 —— 不糊弄, 直接不出。
+     * 后训练判决要的本来也只有 NLL 这一个数(ppl_block 的注释: ★后训练唯一的尺★)。 */
+    if (rnll) {
+        FILE *f = fopen(rnll, "rb");
+        if (!f) { fprintf(stderr, "%s 打不开\n", rnll); return 2; }
+        fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+        if (sz <= 0 || sz % 4) { fprintf(stderr, "%s: 不是 f32[S](%ld 字节)\n", rnll, sz); fclose(f); return 2; }
+        int S = (int)(sz / 4);
+        float *v = malloc((size_t)S * sizeof(float));
+        if (!v || fread(v, 4, (size_t)S, f) != (size_t)S) { fprintf(stderr, "%s 读失败\n", rnll); fclose(f); return 2; }
+        fclose(f);
+        /* ids 只用来核对长度: NLL 已经是算好的, 但行数对不上就说明喂错了文件, 那种
+         * "安静的错数"比报错难查十倍(定长 ids 截断那次就是这么栽的)。 */
+        if (S != nids)
+            printf("★注意: nll 文件 %d 行 vs ids %d 行 —— 行号口径不同会判错行★\n", S, nids);
+        int rn = S; int *rr = rows_range(0, S); const char *nm = "全段";
+        if (rowspec) {
+            free(rr); rr = rows_parse(rowspec, S, &rn);
+            if (!rr) { fprintf(stderr, "--rows 要 a:b 或 a:b,c:d,...(得到 \"%s\", S=%d)\n", rowspec, S); return 2; }
+            nm = "行段";
+            printf("行段 %s → n=%d 行(不连续段已合成一个池子)\n", rowspec, rn);
+        }
+        pplr r = ppl_block_nll(v, S, rr, rn);
+        printf("参考 PPL[%s n=%d] = %.4f   (平均 NLL %.4f)\n", nm, r.n, r.ppl, r.nll);
+        free(rr); free(v); free(ids);
+        return 0;
+    }
 
     meta_t m; float *ref;
-    if (rawp) { int S, V; ref = read_student(rawp, &S, &V);
+    if (revl) { int S, V; ref = read_eval_raw(revl, nids, &S, &V);
+                memset(&m, 0, sizeof m); m.S = S; m.VOCAB = V; m.NL = m.HCM = m.NACT = -1; }
+    else if (rawp) { int S, V; ref = read_student(rawp, &S, &V);
                 memset(&m, 0, sizeof m); m.S = S; m.VOCAB = V; m.NL = m.HCM = m.NACT = -1; }
     else ref = read_anchor(refp, &m);
     int S = m.S, V = m.VOCAB;
     if (nids > S) nids = S;
     printf("锚: S=%d VOCAB=%d NL=%d HCM=%d NACT=%d\n", S, V, m.NL, m.HCM, m.NACT);
 
-    struct { const char *nm; int lo, hi; } segs[2] = {{"全段", 0, S}, {NULL, 0, 0}};
+    struct { const char *nm; int *row; int n; } segs[2] = {{"全段", NULL, 0}, {NULL, NULL, 0}};
     int nseg = 1;
-    if (fit && fit < S) { segs[0].nm = "held"; segs[0].lo = fit; segs[1].nm = "全段"; segs[1].hi = S; nseg = 2; }
+    segs[0].row = rows_range(0, S); segs[0].n = S;
+    if (fit && fit < S) {
+        free(segs[0].row);
+        segs[0].nm = "held"; segs[0].row = rows_range(fit, S); segs[0].n = S - fit;
+        segs[1].nm = "全段"; segs[1].row = rows_range(0, S);   segs[1].n = S; nseg = 2;
+    }
+    if (rowspec) {                                       /* --rows: 只判这些行(锚行号), 其余不出数 */
+        for (int si = 0; si < nseg; si++) free(segs[si].row);
+        int rn = 0; int *rr = rows_parse(rowspec, S, &rn);
+        if (!rr) { fprintf(stderr, "--rows 要 a:b 或 a:b,c:d,...(得到 \"%s\", S=%d)\n", rowspec, S); return 2; }
+        segs[0].nm = "行段"; segs[0].row = rr; segs[0].n = rn; nseg = 1;
+        printf("行段 %s → n=%d 行(不连续段已合成一个池子)\n", rowspec, rn);
+    }
 
     for (int si = 0; si < nseg; si++) {
-        pplr r = ppl_block(ref, ids, nids, V, segs[si].lo, segs[si].hi);
-        printf("参考 PPL[%s n=%d] = %.4f\n", segs[si].nm, r.n, r.ppl);
+        pplr r = ppl_block(ref, ids, nids, V, segs[si].row, segs[si].n);
+        printf("参考 PPL[%s n=%d] = %.4f   (平均 NLL %.4f)\n", segs[si].nm, r.n, r.ppl, r.nll);
     }
     { long hit = 0, n = 0;
       for (int i = 0; i < S - 1 && i + 1 < nids; i++) {
@@ -223,7 +375,7 @@ int main(int argc, char **argv) {
       printf("参考 next-token top-1 命中 = %.1f%%   (FP 模型对本语料的自然可预测度)\n", 100.0 * hit / n); }
 
     if (!stup && !sraw) {
-        pplr r = ppl_block(ref, ids, nids, V, 0, S);
+        pplr r = ppl_block(ref, ids, nids, V, segs[0].row, segs[0].n);
         int ok = isfinite(r.ppl) && r.ppl > 1.0 && r.ppl < 30.0;
         printf(ok ? "★冒烟判决: PASS(前向/读权重正确)★\n" : "★冒烟判决: FAIL(PPL=%f)★\n", r.ppl);
         return ok ? 0 : 1;
@@ -245,21 +397,36 @@ int main(int argc, char **argv) {
     } else {
         stu = read_student(stup, &Ss, &Vs);
     }
+    if (xn > 0) {                                        /* 学生行 → 锚行(映射见 --xshift 注释) */
+        if (xs0 < 0 || xs0 + xn > S) { fprintf(stderr, "--xshift %d %d 越界(S=%d)\n", xs0, xn, S); return 2; }
+        if (Ss != S - xn || Vs != V) { fprintf(stderr, "形状不齐(偏移口径): ref(%d,%d) 期望学生 (%d,%d) 实得 (%d,%d)\n", S, V, S - xn, V, Ss, Vs); return 2; }
+        float *full = malloc((size_t)S * V * sizeof(float));
+        if (!full) { fprintf(stderr, "内存\n"); return 2; }
+        for (int r = 0; r < S; r++) {
+            int src = r < xs0 ? r : (r >= xs0 + xn ? r - xn : -1);
+            memcpy(full + (size_t)r * V, src < 0 ? ref + (size_t)r * V : stu + (size_t)src * V, (size_t)V * sizeof(float));
+        }
+        free(stu); stu = full; Ss = S;
+        printf("行偏移: 锚行 [%d,%d) 教师独有上下文(用锚回填, 不算数), 锚行 >= %d ↔ 学生行 − %d%s\n",
+               xs0, xs0 + xn, xs0 + xn, xn, rowspec ? "" : " ★未给 --rows, 全段含回填行★");
+    }
     if (Ss != S || Vs != V) { fprintf(stderr, "形状不齐: ref(%d,%d) stu(%d,%d)\n", S, V, Ss, Vs); return 2; }
 
     for (int si = 0; si < nseg; si++) {
-        int lo = segs[si].lo, hi = segs[si].hi, n = hi - lo;
+        const int *row = segs[si].row; int n = segs[si].n;
         double *kld = malloc(n * sizeof(double)), *rms = malloc(n * sizeof(double));
         double *dtop = malloc(n * sizeof(double)), *smin = malloc(n * sizeof(double));
         uint8_t *same = malloc(n);
-        met_ctx mc = {ref, stu, V, lo, kld, rms, dtop, smin, same};
+        met_ctx mc = {ref, stu, V, row, kld, rms, dtop, smin, same};
         parallel_for(n, threads, met_worker, &mc);
-        pplr sp = ppl_block(stu, ids, nids, V, lo, hi);
-        pplr rp = ppl_block(ref, ids, nids, V, lo, hi);
+        pplr sp = ppl_block(stu, ids, nids, V, row, n);
+        pplr rp = ppl_block(ref, ids, nids, V, row, n);
         double mk = 0, mr = 0, ms = 0, md = 0, sm = 0;
         for (int t = 0; t < n; t++) { mk += kld[t]; mr += rms[t]; ms += same[t]; md += dtop[t]; sm += smin[t]; }
         printf("\n== %s (n=%d) ==\n", segs[si].nm, n);
         printf("  PPL(student)    = %.4f   (ref %.4f, 比值 %.3f)\n", sp.ppl, rp.ppl, sp.ppl / rp.ppl);
+        printf("  平均 NLL(学生)  = %.4f   (ref %.4f, 差 %+.4f) ★后训练的尺: 越低越好★\n",
+               sp.nll, rp.nll, sp.nll - rp.nll);
         printf("  分布还原率 Σmin = %.4f   (中位 %.4f, p5 %.4f) ★主尺, 对标≥0.90★\n",
                sm / n, quantile(smin, n, 0.5), quantile(smin, n, 0.05));
         printf("  Mean KLD        = %.5f   (中位 %.5f, p95 %.5f)\n", mk / n,
@@ -269,20 +436,21 @@ int main(int argc, char **argv) {
         printf("  Δp(ref top tok) = %.4f (p95 %.4f)\n", md / n, quantile(dtop, n, 0.95));
         if (rowout) {   /* 行=位置 kld smin same(与上面五指标同一批数, 只是不聚合) */
             FILE *fo = fopen(rowout, si == 0 ? "w" : "a");
-            if (fo) { for (int t = 0; t < n; t++) fprintf(fo, "%d %.6f %.6f %d\n", lo + t, kld[t], smin[t], same[t]); fclose(fo); }
+            if (fo) { for (int t = 0; t < n; t++) fprintf(fo, "%d %.6f %.6f %d\n", row[t], kld[t], smin[t], same[t]); fclose(fo); }
         }
         free(kld); free(rms); free(dtop); free(smin); free(same);
     }
 
     if (tail) {
-        int lo = (fit && fit < S) ? fit : 0, hi = S;
-        if (hi > nids - 1) hi = nids - 1;
-        int n = hi - lo;
+        /* 判决行集合与上面同一个(segs[0]) —— 给了 --rows 就只查那些行, 否则 held/全段。 */
+        const int *trow = segs[0].row; int n = 0;
+        int *tr = malloc((size_t)segs[0].n * sizeof(int));
+        for (int t = 0; t < segs[0].n; t++) if (trow[t] + 1 < nids) tr[n++] = trow[t];
         double *d = malloc(n * sizeof(double)), *nr = malloc(n * sizeof(double)), *ns = malloc(n * sizeof(double));
         for (int i = 0; i < n; i++) {
-            int tgt = (int)ids[lo + i + 1];
-            nr[i] = nll_at(ref + (size_t)(lo + i) * V, V, tgt);
-            ns[i] = nll_at(stu + (size_t)(lo + i) * V, V, tgt);
+            int tgt = (int)ids[tr[i] + 1];
+            nr[i] = nll_at(ref + (size_t)tr[i] * V, V, tgt);
+            ns[i] = nll_at(stu + (size_t)tr[i] * V, V, tgt);
             d[i] = ns[i] - nr[i];
         }
         double gap = 0; for (int i = 0; i < n; i++) gap += d[i];
@@ -295,17 +463,17 @@ int main(int argc, char **argv) {
             int tmp = ord[a]; ord[a] = ord[mi]; ord[mi] = tmp;
         }
         double topsum = 0; for (int a = 0; a < tail && a < n; a++) topsum += d[ord[a]];
-        printf("\n== 尾部报表(held ΔNLL=stu−ref, 总log差=%.2f, 均值=%.4f) ==\n", gap, gap / n);
+        printf("\n== 尾部报表(判决行 ΔNLL=stu−ref, 总log差=%.2f, 均值=%.4f) ==\n", gap, gap / n);
         printf("  top%d token 承担全部 PPL 差的 %.0f%%\n", tail, topsum / (gap > 1e-9 ? gap : 1e-9) * 100);
         for (int a = 0; a < tail && a < n; a++) {
-            int i = ord[a], tgt = (int)ids[lo + i + 1];
-            const float *rr = ref + (size_t)(lo + i) * V, *ss = stu + (size_t)(lo + i) * V;
+            int i = ord[a], tgt = (int)ids[tr[i] + 1];
+            const float *rr = ref + (size_t)tr[i] * V, *ss = stu + (size_t)tr[i] * V;
             int rt = 0, st = 0;
             for (int v = 1; v < V; v++) { if (rr[v] > rr[rt]) rt = v; if (ss[v] > ss[st]) st = v; }
             printf("  pos=%d tgt=%d dNLL=%+.3f (ref%.2f->stu%.2f) refTop=%d stuTop=%d%s\n",
-                   lo + i, tgt, d[i], nr[i], ns[i], rt, st, ns[i] > 6 ? " ★" : " ");
+                   tr[i], tgt, d[i], nr[i], ns[i], rt, st, ns[i] > 6 ? " ★" : " ");
         }
-        free(d); free(nr); free(ns); free(ord);
+        free(d); free(nr); free(ns); free(ord); free(tr);
     }
     free(ref); free(stu);
     return 0;
