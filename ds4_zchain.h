@@ -85,6 +85,9 @@ typedef struct {
                              * 语义 δlogits = U·tanh(Vᵀx/s) 加在 router raw logits 上
                              * (select 前)。zdin=d_model, U 行数=n_expert(非 d_model)。 */
     ds4_zchain_4l  l4;      /* type10 zl.4L 四损失参数(wnorm==NULL 时缺席) */
+    uint16_t      *zlm_own; /* 非 NULL = zl.zlm 指向本层自有缓冲(微调侧车按秩拼接后的
+                             * 合并载荷, 见 ds4_zfinetune.c), 不再别名 mmap; free 时释放 */
+    uint16_t      *rtem_own;/* 同上, 给 rte(type8 路由侧车): 微调搬进来的载荷 */
 } ds4_zchain_layer;
 
 typedef struct ds4_zchain {
