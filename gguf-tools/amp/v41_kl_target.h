@@ -41,6 +41,23 @@ int v41_klt_open(v41_klt **out, const char *gguf_path, int D);
 int v41_klt_target(v41_klt *k, const char *ref_path, const char *stu_path, const float *alpha, const int *perm,
                    int n, int D, double qnorm, float eta_rel, const float *dYq, float *dYfp_out, float *out_stat);
 
+/* ★后训练第二版的方向表★(2026-09-13 夜, back.md §4.1): 决策差解算器要的 C[n][D]
+ *     C[i][d] = α_i · inv_i · γ[d] · (W[a_i][d] − W[b_i][d])
+ * a_i/b_i = 这一行要比较的两个 token: 决策行 = (对版, 错版), 约束行 = (它原本的 top1, top2)。
+ * inv[n] 来自引擎 --score-rms(出口 RMSNorm 的 rsqrt 标量), α[n] 来自钩子。
+ * 出口头 W 用的就是已经常驻的那份 f16(它是【落地量化后】的头 —— 判决与部署必须同一份权重)。
+ * dC 设备缓冲 [n][D] f32 由调用方备好。a 或 b 为负 = 这一行没有可比的两个 token, 整行写 0
+ * (它在解算里既不提供方程也不被约束)。返回 0 成功。 */
+int v41_klt_margin_dirs(v41_klt *k, const int *a, const int *b, const float *alpha, const float *inv,
+                        int n, int D, float *dC);
+
+/* ★主动集扫榜★: 给定这一版修正让本层输出挪了多少(dY[n][D], 设备), 算出榜上每个 token 的
+ * logit 各动了多少 dLogit[n][K](设备)。dIds[n][K] 是 top-K 表的 id 列(设备)。
+ * 用途: 每行只钉一对不够 —— 钉住的那对分毫不差, 冒头的却是第三个 token(09-13 实测 37% 的位置
+ * argmax 变了)。有了这张表, 主动集在解算器内部就能找出冒头的是谁, 不必为此跑真前向。返回 0 成功。 */
+int v41_klt_margin_scan(v41_klt *k, const float *dY, const float *alpha, const float *inv,
+                        const int *dIds, int n, int K, int D, float *dLogit);
+
 void v41_klt_close(v41_klt *k);
 
 #ifdef __cplusplus

@@ -158,7 +158,9 @@ deepseek4-quantize-cpu: $(DSQ_SRC) $(QUANTS_INC) $(DSQMAIN_INC)
 	$(CC) $(CFLAGS) $(NATIVE) $(CPPFLAGS) $(INC) -o $@ $(DSQ_SRC) -lm -pthread
 
 anchor_metrics: $(BEN)/anchor_metrics
-$(BEN)/anchor_metrics: $(BEN)/anchor_metrics.c
+# 依赖里必须列上 .inc.c 与共用头: 少列一项就会"编译成功但跑的是旧二进制", 而自检照样 PASS
+# (2026-09-13 实撞: 改了 --ref-topk 的读取, make 说"无需做任何事", 自检过的是上一版)
+$(BEN)/anchor_metrics: $(BEN)/anchor_metrics.c $(BEN)/anchor_metrics_topk.inc.c $(BEN)/anchor_metrics_rows.inc.c ../src/common/ds4_etgd.h
 	$(CC) $(BARE) $(NATIVE) -o $@ $< -lm -lpthread
 
 compare_scores: $(QT)/compare_scores
@@ -246,9 +248,15 @@ $(AMP)/v41_amp_solve.o: $(AMP)/v41_amp_solve.cu $(AMP)/v41_amp_diag.inc.cu
 	$(NVCC) -O3 -fmad=false -arch=native -DV41_AMP_NOMAIN -c $< -o $@
 $(AMP)/v41_fp_moe.o: $(AMP)/v41_fp_moe.cu $(AMP)/v41_fp_moe.h ../src/common/ds4_fp8.h ../src/common/ds4_float.h
 	$(NVCC) -O3 --use_fast_math -arch=native -c $< -o $@
-$(AMP)/v41_gr_solve.o: $(AMP)/v41_gr_solve.cu
+$(AMP)/v41_gr_solve.o: $(AMP)/v41_gr_solve.cu $(AMP)/v41_gr_margin.inc.cu ../src/common/ds4_fp8.h
 	$(NVCC) -O3 -fmad=false -arch=native -c $< -o $@
-$(AMP)/v41_amp_run.o: $(AMP)/v41_amp_run.c $(AMP)/v41_gr_run.inc.c $(AMP)/v41_fp_moe.h $(AMP)/v41_kl_target.h ../src/common/ds4_st41.h ../src/common/ds4_quantfmt.h ../ds4.h ../ds4_v41_api.h
+# ★依赖必须列全所有 .inc.c 与共用头★(2026-09-13 两次实撞): 漏一项 make 就说"无需做任何事",
+# 跑的是旧二进制, 而且不会报错 —— 第一次是判决器(自检照样 PASS), 第二次是这里(新加的 @行号文件
+# 写法旧二进制不认识, 报的却是"行段不合法", 查了半天才发现是二进制没换)。
+$(AMP)/v41_amp_run.o: $(AMP)/v41_amp_run.c $(AMP)/v41_gr_run.inc.c $(AMP)/v41_amp_lowrank.inc.c $(AMP)/v41_sft_run.inc.c $(AMP)/v41_margin_solve.inc.c \
+                      $(AMP)/v41_margin_gen.inc.c $(AMP)/v41_fp_bind.inc.c \
+                      $(AMP)/v41_fp_moe.h $(AMP)/v41_kl_target.h ../src/common/ds4_st41.h ../src/common/ds4_quantfmt.h \
+                      ../src/common/ds4_etgd.h ../src/common/ds4_gr_fnv.h ../ds4.h ../ds4_v41_api.h
 	$(CC) $(BARE) $(NATIVE) -std=c99 -Wall -I.. -I$(CUDA_HOME)/include -c $< -o $@
 # 蒸馏靶: -fmad=false 与解算器同旗标(同输入两路必须出同一个数); 链 cublas 与 src/common 的 GGUF 读器/type43 解码
 $(AMP)/v41_kl_target.o: $(AMP)/v41_kl_target.cu $(AMP)/v41_kl_target.h ../src/common/ds4_gguf.h ../src/common/ds4_quantfmt.h

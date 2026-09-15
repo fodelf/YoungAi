@@ -136,16 +136,17 @@ static FILE *klt_open_logits(const char *path, int n, int V) {
     return f;
 }
 
-int v41_klt_target(v41_klt *k, const char *ref_path, const char *stu_path, const float *alpha, const int *perm,
-                   int n, int D, double qnorm, float eta_rel, const float *dYq, float *dR, float *out_stat) {
-    if (D != k->D) { fprintf(stderr, "★KL 靶 D %d ≠ %d★\n", D, k->D); return -1; }
+/* 填一块 dp 的回调: 蒸馏靶读两份 logits, SFT 靶读 top-K 表 —— 只有这一步不同, 后面
+ * (出口头 GEMM → output_norm → α → 置换 → 缩放到 eta_rel·‖y_q‖ → 加 y_q)两条路一个字不差,
+ * 所以主循环只有一份。返回非 0 = 这一块取不到料, 停车。 */
+typedef int (*klt_fill_fn)(void *ud, __half *dp, int off, int rows, int V);
+
+static int klt_core(v41_klt *k, klt_fill_fn fill, void *ud, const float *alpha, const int *perm,
+                    int n, int D, double qnorm, float eta_rel, const float *dYq, float *dR, float *out_stat) {
     const int V = k->V;
-    FILE *fr = klt_open_logits(ref_path, n, V), *fs = klt_open_logits(stu_path, n, V);
-    if (!fr || !fs) { if (fr) fclose(fr); if (fs) fclose(fs); return -1; }
-    float *hb = (float *)malloc((size_t)KLT_BLK * V * 4), *hb2 = (float *)malloc((size_t)KLT_BLK * V * 4);
     __half *hdp = (__half *)malloc((size_t)KLT_BLK * V * sizeof(__half));
     float *dAl = NULL, *dGall = NULL; int *dPerm = NULL;
-    if (!hb || !hb2 || !hdp) { fprintf(stderr, "★KL 靶主机缓冲失败★\n"); return -1; }
+    if (!hdp) { fprintf(stderr, "★KL 靶主机缓冲失败★\n"); return -1; }
     CKC(cudaMalloc((void **)&dAl, (size_t)n * 4));
     CKC(cudaMemcpy(dAl, alpha, (size_t)n * 4, cudaMemcpyHostToDevice));
     if (perm) { CKC(cudaMalloc((void **)&dPerm, (size_t)n * 4)); CKC(cudaMemcpy(dPerm, perm, (size_t)n * 4, cudaMemcpyHostToDevice)); }
@@ -153,10 +154,7 @@ int v41_klt_target(v41_klt *k, const char *ref_path, const char *stu_path, const
     const float one = 1.f, zero = 0.f;
     for (int off = 0; off < n; off += KLT_BLK) {
         const int rows = (n - off < KLT_BLK) ? n - off : KLT_BLK;
-        if (fread(hb, 4, (size_t)rows * V, fs) != (size_t)rows * V || fread(hb2, 4, (size_t)rows * V, fr) != (size_t)rows * V) {
-            fprintf(stderr, "★logits 读到第 %d 行截断★\n", off); return -1;
-        }
-        klt_block_dp(hb, hb2, hdp, rows, V);
+        if (fill(ud, hdp, off, rows, V)) return -1;
         CKC(cudaMemcpy(k->dDP, hdp, (size_t)rows * V * sizeof(__half), cudaMemcpyHostToDevice));
         /* 列主序: G_cm[D][rows] = W_cm[D][V] × dp_cm[V][rows](两边都无转置) */
         if (cublasGemmEx(k->cb, CUBLAS_OP_N, CUBLAS_OP_N, D, rows, V, &one,
@@ -167,8 +165,7 @@ int v41_klt_target(v41_klt *k, const char *ref_path, const char *stu_path, const
         klt_scale_on<<<dim3((D + 255) / 256, rows), 256>>>(k->dG, k->dOn, rows, D);
         CKC(cudaMemcpy(dGall + (size_t)off * D, k->dG, (size_t)rows * D * 4, cudaMemcpyDeviceToDevice));
     }
-    fclose(fr); fclose(fs);
-    free(hb); free(hb2); free(hdp);
+    free(hdp);
     /* ‖g‖ → 缩放到 ‖R‖ = eta_rel·‖y_q‖; α 的极值一并报(它若跨零, 靶方向在那些行上是反的, 必须看见) */
     float gn = 0.f;
     if ((long long)n * D > 2147483647LL) { fprintf(stderr, "★n×D 超 int(cublas 接口上限)★\n"); return -1; }
@@ -193,6 +190,125 @@ int v41_klt_target(v41_klt *k, const char *ref_path, const char *stu_path, const
     cudaFree(dAl); cudaFree(dGall); if (dPerm) cudaFree(dPerm);
     if (out_stat) { out_stat[0] = (float)(gan / (qnorm > 0 ? qnorm : 1.0)); out_stat[1] = (float)amin; out_stat[2] = (float)amax; out_stat[3] = (float)(asum / n); }
     return (int)cudaDeviceSynchronize();
+}
+
+/* ---- 蒸馏靶(教师−学生两份 logits) ---- */
+typedef struct { FILE *fs, *fr; float *hb, *hb2; } kl_ud;
+static int kl_fill(void *ud, __half *dp, int off, int rows, int V) {
+    kl_ud *u = (kl_ud *)ud;
+    if (fread(u->hb, 4, (size_t)rows * V, u->fs) != (size_t)rows * V ||
+        fread(u->hb2, 4, (size_t)rows * V, u->fr) != (size_t)rows * V) {
+        fprintf(stderr, "★logits 读到第 %d 行截断★\n", off); return -1;
+    }
+    klt_block_dp(u->hb, u->hb2, dp, rows, V);
+    return 0;
+}
+
+int v41_klt_target(v41_klt *k, const char *ref_path, const char *stu_path, const float *alpha, const int *perm,
+                   int n, int D, double qnorm, float eta_rel, const float *dYq, float *dR, float *out_stat) {
+    if (D != k->D) { fprintf(stderr, "★KL 靶 D %d ≠ %d★\n", D, k->D); return -1; }
+    kl_ud u;
+    u.fs = klt_open_logits(stu_path, n, k->V);
+    u.fr = klt_open_logits(ref_path, n, k->V);
+    u.hb = (float *)malloc((size_t)KLT_BLK * k->V * 4);
+    u.hb2 = (float *)malloc((size_t)KLT_BLK * k->V * 4);
+    int rc = -1;
+    if (u.fs && u.fr && u.hb && u.hb2)
+        rc = klt_core(k, kl_fill, &u, alpha, perm, n, D, qnorm, eta_rel, dYq, dR, out_stat);
+    if (u.fs) fclose(u.fs);
+    if (u.fr) fclose(u.fr);
+    free(u.hb); free(u.hb2);
+    return rc;
+}
+
+/* ★第一版的 SFT 梯度靶(dp = p − onehot + 成对项)已删★(09-13 夜): 实测在 y 空间只挽回 0.20%,
+ * 定罪见 v41_sft_run.inc.c 头注释。留着它只会让人以为还有第二条路可选。后训练现在只有决策差一条。 */
+
+/* ---- 决策差方向表(后训练第二版) ---- */
+/* C[i][d] = sc_i · γ[d] · (W[a_i][d] − W[b_i][d]), sc_i = α_i·inv_i。
+ * 一行一个 blockIdx.y; W 是 f16 行主序 [V][D], 两行都是顺序读 ⇒ 合并访存。 */
+__global__ static void klt_dirs_kernel(float *C, const __half *W, const float *on, const int *a, const int *b,
+                                       const float *sc, int D) {
+    const int d = blockIdx.x * blockDim.x + threadIdx.x, i = blockIdx.y;
+    if (d >= D) return;
+    const int ai = a[i], bi = b[i];
+    float v = 0.f;
+    if (ai >= 0 && bi >= 0 && ai != bi)
+        v = sc[i] * on[d] * (__half2float(W[(size_t)ai * D + d]) - __half2float(W[(size_t)bi * D + d]));
+    C[(size_t)i * D + d] = v;
+}
+
+int v41_klt_margin_dirs(v41_klt *k, const int *a, const int *b, const float *alpha, const float *inv,
+                        int n, int D, float *dC) {
+    if (D != k->D) { fprintf(stderr, "★方向表 D %d ≠ %d★\n", D, k->D); return -1; }
+    float *hsc = (float *)malloc((size_t)n * 4);
+    int *hab = (int *)malloc((size_t)n * 8);
+    if (!hsc || !hab) { fprintf(stderr, "★方向表主机缓冲失败★\n"); free(hsc); free(hab); return -1; }
+    int nbad = 0;
+    for (int i = 0; i < n; i++) {
+        /* inv 必须是正的: 它是 rsqrt 的结果。是 0 或负 = 读错了文件(行号错位/文件是别的趟的),
+         * 那样解出来的方向表整行是零, 解算照样跑得出一个数 —— 所以这里数出来报给人看。 */
+        if (!(inv[i] > 0.f)) { nbad++; hsc[i] = 0.f; }
+        else hsc[i] = alpha[i] * inv[i];
+        if (a[i] < 0 || b[i] < 0 || a[i] >= k->V || b[i] >= k->V) { hab[i] = -1; hab[n + i] = -1; }
+        else { hab[i] = a[i]; hab[n + i] = b[i]; }
+    }
+    if (nbad) fprintf(stderr, "★方向表: %d/%d 行的 inv 不是正数(整行按 0 处理)★\n", nbad, n);
+    float *dsc = NULL; int *dab = NULL;
+    int rc = -1;
+    if (cudaMalloc((void **)&dsc, (size_t)n * 4) == cudaSuccess &&
+        cudaMalloc((void **)&dab, (size_t)n * 8) == cudaSuccess &&
+        cudaMemcpy(dsc, hsc, (size_t)n * 4, cudaMemcpyHostToDevice) == cudaSuccess &&
+        cudaMemcpy(dab, hab, (size_t)n * 8, cudaMemcpyHostToDevice) == cudaSuccess) {
+        klt_dirs_kernel<<<dim3((D + 255) / 256, n), 256>>>(dC, k->dW, k->dOn, dab, dab + n, dsc, D);
+        rc = (int)cudaDeviceSynchronize();
+        if (rc) fprintf(stderr, "★方向表核失败: %s★\n", cudaGetErrorString((cudaError_t)rc));
+    } else fprintf(stderr, "★方向表设备缓冲/上传失败★\n");
+    free(hsc); free(hab);
+    if (dsc) cudaFree(dsc);
+    if (dab) cudaFree(dab);
+    return rc;
+}
+
+/* ★主动集扫榜★(2026-09-13 夜第三针): 修正把 Δy 挪出去之后, 榜上【每个】token 的 logit 各动了多少。
+ *   Δℓ[i][q] = α_i·inv_i · Σ_d γ[d]·W[ids[i][q]][d] · Δy[i][d]
+ * 为什么必须扫整张榜: 每行只钉一对时, 钉住的那一对分毫不差(自检 2 相关 1.0000), 而 37% 的位置
+ * argmax 还是变了 —— 冒头的是第三个 token。有了这张表, 主动集就能在【解算器内部】找出冒头的是谁,
+ * 不用为此跑一趟真前向(一趟 3 分钟, 而这个核是毫秒级)。
+ * 一行一个 block, 每个线程管榜上一格; W 行是顺序读。 */
+__global__ static void klt_scan_kernel(float *dl, const __half *W, const float *on, const float *dY,
+                                       const int *ids, const float *sc, int K, int D, int V) {
+    const int i = blockIdx.x, q = threadIdx.x;
+    if (q >= K) return;
+    const int v = ids[(size_t)i * K + q];
+    /* ★v 必须在词表内★: 榜是主机侧拼的, 拼错了(行错位、槽没写过)在这里就是越界读 1.3 GB 的
+     * 出口头 —— 实撞过一次(09-13 22:29, 压实行时漏搬了榜)。按 0 处理并让上面的自检去发现, 
+     * 好过让整个 CUDA 上下文报废。 */
+    if (v < 0 || v >= V) { dl[(size_t)i * K + q] = 0.f; return; }
+    const __half *wv = W + (size_t)v * D;
+    const float *y = dY + (size_t)i * D;
+    double acc = 0.0;
+    for (int d = 0; d < D; d++) acc += (double)on[d] * __half2float(wv[d]) * y[d];
+    dl[(size_t)i * K + q] = (float)(acc * sc[i]);
+}
+
+int v41_klt_margin_scan(v41_klt *k, const float *dY, const float *alpha, const float *inv,
+                        const int *dIds, int n, int K, int D, float *dLogit) {
+    if (D != k->D) { fprintf(stderr, "★扫榜 D %d ≠ %d★\n", D, k->D); return -1; }
+    if (K > 1024) { fprintf(stderr, "★扫榜 K=%d > 1024(一个 block 一行)★\n", K); return -1; }
+    float *hsc = (float *)malloc((size_t)n * 4), *dsc = NULL;
+    if (!hsc) return -1;
+    for (int i = 0; i < n; i++) hsc[i] = (inv[i] > 0.f) ? alpha[i] * inv[i] : 0.f;
+    int rc = -1;
+    if (cudaMalloc((void **)&dsc, (size_t)n * 4) == cudaSuccess &&
+        cudaMemcpy(dsc, hsc, (size_t)n * 4, cudaMemcpyHostToDevice) == cudaSuccess) {
+        klt_scan_kernel<<<n, ((K + 31) / 32) * 32>>>(dLogit, k->dW, k->dOn, dY, dIds, dsc, K, D, k->V);
+        rc = (int)cudaDeviceSynchronize();
+        if (rc) fprintf(stderr, "★扫榜核失败: %s★\n", cudaGetErrorString((cudaError_t)rc));
+    } else fprintf(stderr, "★扫榜缓冲失败★\n");
+    free(hsc);
+    if (dsc) cudaFree(dsc);
+    return rc;
 }
 
 void v41_klt_close(v41_klt *k) {
