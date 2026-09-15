@@ -255,6 +255,21 @@ cli_config parse_options(int argc, char **argv) {
             ds4_engine_v41_set_amp_scale((float)atof(need_arg(&i, argc, argv, arg)));
         } else if (!strcmp(arg, "--finetune")) {
             c.engine.finetune_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--posttrain")) {
+            /* 三文件部署的第三件(V4.1 形态): 与 --zchain 同构的增益目录, 表逐元素相乘。
+             * 走全局 setter(同 --zchain-scale): ds4.h 已 500 行顶格, 不进 ds4_engine_opts。 */
+            ds4_engine_v41_set_posttrain_dir(need_arg(&i, argc, argv, arg));
+        } else if (!strcmp(arg, "--score-nll")) {
+            c.gen.score_nll_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--score-topk")) {
+            c.gen.score_topk = atoi(need_arg(&i, argc, argv, arg));
+            c.gen.score_topk_path = need_arg(&i, argc, argv, "--score-topk <K> <out>");
+        } else if (!strcmp(arg, "--score-rms")) {
+            /* 出口 RMSNorm 的 inv(见 core_score_aux.h)。后训练第二版靠它把"增益改动"换算成
+             * "logit 差改动"; 不传就只有形状没有单位。 */
+            c.gen.score_rms_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--score-no-logits")) {
+            c.gen.score_no_logits = 1;
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
             c.gen.n_predict = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {

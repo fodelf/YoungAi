@@ -36,6 +36,11 @@ typedef struct {
     int v41_no_engram;           /* --v41-no-engram: V4.1 前向跳过 engram 层(与 Python --no-engram 同口径的对拍夹具) */
     int v41_chunk;               /* --v41-chunk N: V4.1 --score-ids 的分块大小(0=默认 512; 对拍夹具, 看分块与整批自洽) */
     int v41_prof;                /* --v41-prof: V4.1 每次前向打逐层毫秒(查速度用) */
+    const char *score_nll_path;  /* --score-nll FILE: 逐位 NLL f32[S](后训练判决尺, 4 B/位置) */
+    const char *score_topk_path; /* --score-topk K FILE: 逐位 top-K (id,p)+目标 p+覆盖质量(后训练靶) */
+    int score_topk;
+    const char *score_rms_path;  /* --score-rms FILE: 逐位 inv=rsqrt(mean(x²)+eps) f32[S](后训练靶的单位) */
+    int score_no_logits;         /* --score-no-logits: 不写全词表 logits(统一内存机器上那是 517 KB/位置) */
     const char *dump_logprobs_path;
     int dump_logprobs_top_k;
     const char *perplexity_file_path;

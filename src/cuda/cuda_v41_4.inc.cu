@@ -123,7 +123,13 @@ __device__ __forceinline__ static void v41_vq_cb_to_shared(uint8_t *dst, const u
     const uint2 *s = (const uint2 *)src; uint2 *d = (uint2 *)dst;
     for (uint32_t i = threadIdx.x; i < bytes / 8u; i += blockDim.x) d[i] = s[i];
 }
-#define V41_VQ_SH_ROWS 32u   /* shared 码本版: 一 block 32 warp = 32 行, 摊薄 64~128 KB 的码本搬运 */
+/* ★shared 码本版的一 block 行数★(2026-09-14 二改)。
+ * 一 block 32 warp, 每 warp 再循环 V41_VQ_ITERS 行 ⇒ 一 block 管 32×ITERS 行, 码本只搬一次。
+ * 为什么必须循环而不是一 block 32 行: 码本 64 KB 占满设备每 block 动态 shared 上限(GB10 = 99 KB)的一大半,
+ * 每个 SM 只塞得下 1 个 block; 一 block 只算 32 行就重搬一次 64 KB, 而这 32 行的索引流才 30 KB ——
+ * 搬运是有效数据的 2 倍多, 40 层累计好几 GB。行数翻 8 倍, 码本搬运就摊薄 8 倍, 有效带宽利用直接上去。 */
+#define V41_VQ_ITERS   8u
+#define V41_VQ_SH_ROWS (32u * V41_VQ_ITERS)
 /* gate/up 同核(官方 Expert: w1/w3 出 bf16 → f32 截断 → silu(g)·u → bf16); cb_bytes>0: 码本进 shared(grid.x 按 32 行),
  * 否则全局 gather(grid.x 按 8 行)。x 已是 bf16 格点(调用方 rms_norm 出口舍过)。 */
 __global__ static void v41_vq_gateup_kernel(float *h, const uint8_t *blob, const int32_t *sel, const float *x,
@@ -134,20 +140,36 @@ __global__ static void v41_vq_gateup_kernel(float *h, const uint8_t *blob, const
     if (e < 0) return;
     const v41_vq_mat mg = v41_vq_open(blob, e, 0, MID, IN, NULL), mu = v41_vq_open(blob, e, 1, MID, IN, NULL);
     if (!mg.ok || !mu.ok) return;
-    const uint8_t *cbg = mg.cb, *cbu = mu.cb;
-    if (cb_bytes) {
-        if (mg.nc * 16u != cb_bytes || mu.nc * 16u != cb_bytes) return;
-        v41_vq_cb_to_shared(vqsh, mg.cb, cb_bytes); v41_vq_cb_to_shared(vqsh + cb_bytes, mu.cb, cb_bytes);
-        __syncthreads();
-        cbg = vqsh; cbu = vqsh + cb_bytes;
-    }
-    const uint32_t r = blockIdx.x * rows + (threadIdx.x >> 5);
-    if (r >= MID) return;
+    const uint32_t r0 = blockIdx.x * rows + (threadIdx.x >> 5), nit = cb_bytes ? V41_VQ_ITERS : 1u;
     const float *xs = x + (uint64_t)t * IN;
-    float g = v41_bf16r(v41_vq_row_dot(mg, r, xs, cbg, cb_bytes != 0)), u = v41_bf16r(v41_vq_row_dot(mu, r, xs, cbu, cb_bytes != 0));
-    if (clamp > 0.f) { if (g > clamp) g = clamp; if (u > clamp) u = clamp; if (u < -clamp) u = -clamp; }
-    const float sg = g / (1.0f + expf(-g));
-    if ((threadIdx.x & 31u) == 0) h[(uint64_t)pair * MID + r] = v41_bf16r(sg * u);
+    float g[V41_VQ_ITERS], u[V41_VQ_ITERS];
+    #pragma unroll
+    for (uint32_t i = 0; i < V41_VQ_ITERS; i++) { g[i] = 0.f; u[i] = 0.f; }
+    if (cb_bytes) {
+        /* ★一块 shared 用两遍★(2026-09-14): gate 与 up 各有一本 64 KB 码本, 一次性放两本要 128 KB,
+         * 超过 GB10 每 block 的上限(99 KB) ⇒ 整个核被打回全局 gather。改成先载 gate 算完这 block 的
+         * 全部行, 同步后把同一块 shared 覆盖成 up 的码本再算 u: 峰值只要一本的量。
+         * ★循环里不能 return★: 后面还有 __syncthreads, 少一个 warp 就死锁, 越界的行只跳过计算。 */
+        if (mg.nc * 16u != cb_bytes || mu.nc * 16u != cb_bytes) return;
+        v41_vq_cb_to_shared(vqsh, mg.cb, cb_bytes);
+        __syncthreads();
+        for (uint32_t i = 0; i < nit; i++) { const uint32_t r = r0 + i * 32u; if (r < MID) g[i] = v41_bf16r(v41_vq_row_dot(mg, r, xs, vqsh, 1)); }
+        __syncthreads();                            /* 等所有 warp 读完 gate 码本, 才能覆盖它 */
+        v41_vq_cb_to_shared(vqsh, mu.cb, cb_bytes);
+        __syncthreads();
+        for (uint32_t i = 0; i < nit; i++) { const uint32_t r = r0 + i * 32u; if (r < MID) u[i] = v41_bf16r(v41_vq_row_dot(mu, r, xs, vqsh, 1)); }
+    } else if (r0 < MID) {
+        g[0] = v41_bf16r(v41_vq_row_dot(mg, r0, xs, mg.cb, 0));
+        u[0] = v41_bf16r(v41_vq_row_dot(mu, r0, xs, mu.cb, 0));
+    }
+    for (uint32_t i = 0; i < nit; i++) {
+        const uint32_t r = r0 + i * 32u;
+        if (r >= MID) break;
+        float gi = g[i], ui = u[i];
+        if (clamp > 0.f) { if (gi > clamp) gi = clamp; if (ui > clamp) ui = clamp; if (ui < -clamp) ui = -clamp; }
+        const float sg = gi / (1.0f + expf(-gi));
+        if ((threadIdx.x & 31u) == 0) h[(uint64_t)pair * MID + r] = v41_bf16r(sg * ui);
+    }
 }
 /* down: partial[pair][OUT] = bf16(W2·h) */
 __global__ static void v41_vq_down_kernel(float *partial, const uint8_t *blob, const int32_t *sel, const float *h,
@@ -157,8 +179,11 @@ __global__ static void v41_vq_down_kernel(float *partial, const uint8_t *blob, c
     const int32_t e = sel[pair];
     if (e < 0) return;
     const v41_vq_mat md = v41_vq_open(blob, e, 2, OUT, MID, gr ? gr + (size_t)e * OUT : NULL);
-    const uint32_t r = blockIdx.x * rows + (threadIdx.x >> 5);
-    if (!md.ok) { if (r < OUT && (threadIdx.x & 31u) == 0) partial[(uint64_t)pair * OUT + r] = 0.f; return; }
+    const uint32_t r0 = blockIdx.x * rows + (threadIdx.x >> 5), nit = cb_bytes ? V41_VQ_ITERS : 1u;
+    if (!md.ok) {   /* 载荷不对: 这 block 负责的行全写 0(不能只写一行, 下游 reduce 会读到脏值) */
+        for (uint32_t i = 0; i < nit; i++) { const uint32_t r = r0 + i * 32u; if (r < OUT && (threadIdx.x & 31u) == 0) partial[(uint64_t)pair * OUT + r] = 0.f; }
+        return;
+    }
     const uint8_t *cbd = md.cb;
     if (cb_bytes) {
         if (md.nc * 16u != cb_bytes) return;
@@ -166,9 +191,13 @@ __global__ static void v41_vq_down_kernel(float *partial, const uint8_t *blob, c
         __syncthreads();
         cbd = vqsh;
     }
-    if (r >= OUT) return;
-    const float y = v41_bf16r(v41_vq_row_dot(md, r, h + (uint64_t)pair * MID, cbd, cb_bytes != 0));
-    if ((threadIdx.x & 31u) == 0) partial[(uint64_t)pair * OUT + r] = y;
+    const float *hs = h + (uint64_t)pair * MID;
+    for (uint32_t i = 0; i < nit; i++) {   /* 一 block 管 32×ITERS 行, 码本只搬一次(见 V41_VQ_ITERS 注释) */
+        const uint32_t r = r0 + i * 32u;
+        if (r >= OUT) break;
+        const float y = v41_bf16r(v41_vq_row_dot(md, r, hs, cbd, cb_bytes != 0));
+        if ((threadIdx.x & 31u) == 0) partial[(uint64_t)pair * OUT + r] = y;
+    }
     (void)K;
 }
 /* out[t][o] = Σ_k w[t][k]·partial[t·K+k][o](f32, 官方 y += weights·expert_out) */
@@ -180,7 +209,11 @@ __global__ static void v41_vq_reduce_kernel(float *out, const float *partial, co
     out[(uint64_t)t * OUT + o] = a;
 }
 static v41_scratch g_v41_vq_h, g_v41_vq_part;
-static int g_v41_vq_sh_state = 0;   /* 0 未判定, 1 shared 码本可用, -1 不可用(动态 shared 上限不够) */
+/* ★两个核分开判定★(2026-09-14 实撞): 码本 4096×16 B = 64 KB/本。gateup 要 gate+up 两本 = 128 KB,
+ * 超过 GB10 每 block 的动态 shared 上限; down 只要一本 64 KB, 本来放得下。原先一个 ok 变量把两个核
+ * 绑在一起, gateup 申请失败就把 down 一起打回全局 gather —— 解码实测只有 1.60 t/s(prefill 45 t/s 正常)。
+ * 0 未判定, 1 可用, -1 不可用。 */
+static int g_v41_vq_sh_gateup = 0, g_v41_vq_sh_down = 0;
 static int v41_vq_fused_moe(float *out, const uint8_t *blob, uint32_t IN, uint32_t MID, uint32_t OUT,
                             const int32_t *sel, const float *w, uint32_t K, float clamp, const float *x, uint32_t n_tok, uint32_t nc,
                             const float *gr) {
@@ -190,18 +223,24 @@ static int v41_vq_fused_moe(float *out, const uint8_t *blob, uint32_t IN, uint32
     float *part = (float *)v41_grow(&g_v41_vq_part, np * OUT * 4, "v41 vq partial");
     if (!h || !part) return 0;
     const uint32_t cbb = nc * 16u;
-    if (!g_v41_vq_sh_state) {   /* 一次性: 申请 2 本码本(gate+up)的动态 shared; 不够就回全局 gather 路 */
-        const bool ok = cudaFuncSetAttribute(v41_vq_gateup_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(2u * cbb)) == cudaSuccess &&
-                        cudaFuncSetAttribute(v41_vq_down_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)cbb) == cudaSuccess;
+    if (!g_v41_vq_sh_gateup) {   /* 一次性, 两个核各问各的: gateup 要两本(gate+up), down 只要一本 */
+        int cap = 0; (void)cudaDeviceGetAttribute(&cap, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
+        const bool og = cudaFuncSetAttribute(v41_vq_gateup_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)cbb) == cudaSuccess;
+        const bool od = cudaFuncSetAttribute(v41_vq_down_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)cbb) == cudaSuccess;
         (void)cudaGetLastError();
-        g_v41_vq_sh_state = ok ? 1 : -1;
-        fprintf(stderr, "ds4: [v41] VQ 码本 %u×16 B %s shared\n", nc, ok ? "进" : "进不了(回全局 gather)");
+        g_v41_vq_sh_gateup = og ? 1 : -1;
+        g_v41_vq_sh_down = od ? 1 : -1;
+        fprintf(stderr, "ds4: [v41] VQ 码本 %u×16 B(%u KB/本); 设备每 block 动态 shared 上限 %d KB ⇒ gate+up %s / down %s\n",
+                nc, cbb >> 10, cap >> 10, og ? "进 shared(一块用两遍)" : "回全局 gather", od ? "进 shared" : "回全局 gather");
     }
-    const bool sh = g_v41_vq_sh_state == 1;
-    const uint32_t rows = sh ? V41_VQ_SH_ROWS : 8u, thr = rows * 32u, cbarg = sh ? cbb : 0u;
-    v41_vq_gateup_kernel<<<dim3((MID + rows - 1u) / rows, (unsigned)np), thr, sh ? 2u * cbb : 0u, g_cur_stream>>>(h, blob, sel, x, IN, MID, K, clamp, cbarg);
+    const bool shg = g_v41_vq_sh_gateup == 1, shd = g_v41_vq_sh_down == 1;
+    /* 线程数恒为 32 warp(shared 版一 warp 循环 ITERS 行)或 8 warp(全局 gather 版一 warp 一行);
+     * ★不能写成 rows×32★: shared 版 rows 已是 256, 那会要 8192 个线程, 超过每 block 1024 的上限。 */
+    const uint32_t rg = shg ? V41_VQ_SH_ROWS : 8u, rd = shd ? V41_VQ_SH_ROWS : 8u;
+    const uint32_t tg = shg ? 32u * 32u : 8u * 32u, td = shd ? 32u * 32u : 8u * 32u;
+    v41_vq_gateup_kernel<<<dim3((MID + rg - 1u) / rg, (unsigned)np), tg, shg ? cbb : 0u, g_cur_stream>>>(h, blob, sel, x, IN, MID, K, clamp, shg ? cbb : 0u);
     if (!cuda_ok(cudaGetLastError(), "v41 vq gateup")) return 0;
-    v41_vq_down_kernel<<<dim3((OUT + rows - 1u) / rows, (unsigned)np), thr, sh ? cbb : 0u, g_cur_stream>>>(part, blob, sel, h, MID, OUT, K, cbarg, gr);
+    v41_vq_down_kernel<<<dim3((OUT + rd - 1u) / rd, (unsigned)np), td, shd ? cbb : 0u, g_cur_stream>>>(part, blob, sel, h, MID, OUT, K, shd ? cbb : 0u, gr);
     if (!cuda_ok(cudaGetLastError(), "v41 vq down")) return 0;
     v41_vq_reduce_kernel<<<dim3((OUT + 255u) / 256u, n_tok), 256, 0, g_cur_stream>>>(out, part, w, K, OUT);
     return cuda_ok(cudaGetLastError(), "v41 vq reduce");

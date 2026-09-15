@@ -10,6 +10,8 @@
  * 学生格式:   <i32 S><i32 V><f32 logits[S][V]>
  * 用法: anchor_metrics --ref anchor.bin --ids ids.txt [--student stu.bin]
  *       [--ref-raw raw.bin | --ref-eval eval.bin] [--fit N] [--tail N] [--rows a:b[,c:d,...]]
+ *       --ref-topk topk.bin --predict <候选目录/predict.txt> --predict-sample N  (自检 2)
+ *       --ref-topk 基线.bin --vs-topk 候选.bin [--rows R]   (守门 1: 两态 argmax 变了多少)
  * --ref-raw = --score-out(解码路, 带 <S,V> 头); --ref-eval = --eval-logits(prefill 批路, 无头带 BOS 行)
  * --ref-nll = --eval-nll 的 f32[S](引擎已算好逐位 NLL, 只出 PPL/NLL; 省掉 5 个数量级的盘)
  * ★--rows 收多段(2026-09-08)★: 后训练判决只算"本应写出的报告"那些 token, 每条样本的
@@ -237,35 +239,10 @@ static pplr ppl_block_nll(const float *v, int S, const int *row, int n) {
     return r;
 }
 
-/* --rows "a:b" 或 "a:b,c:d,..." → 绝对行号数组(升序去重不做, 由调用方保证不重叠)。
- * 为什么要多段: 每条样本是[当日材料][本应写的报告], 只有报告那一段是后训练的目标 token,
- * 材料段不算数; N 条样本 = N 段不连续区间, 但要合成一个池子出一份平均 NLL。 */
-static int *rows_parse(const char *spec, int S, int *out_n) {
-    int cap = 64, n = 0;
-    int *r = malloc((size_t)cap * sizeof(int));
-    const char *p = spec;
-    while (*p) {
-        int a, b, adv = 0;
-        if (sscanf(p, "%d:%d%n", &a, &b, &adv) != 2) { free(r); return NULL; }
-        if (b > S) b = S;
-        for (int i = a; i < b; i++) {
-            if (i < 0) { free(r); return NULL; }
-            if (n == cap) { cap *= 2; r = realloc(r, (size_t)cap * sizeof(int)); }
-            r[n++] = i;
-        }
-        p += adv;
-        if (*p == ',') p++;
-        else if (*p) { free(r); return NULL; }
-    }
-    if (!n) { free(r); return NULL; }
-    *out_n = n;
-    return r;
-}
-static int *rows_range(int lo, int hi) {
-    int *r = malloc((size_t)(hi - lo) * sizeof(int));
-    for (int i = lo; i < hi; i++) r[i - lo] = i;
-    return r;
-}
+#include "anchor_metrics_rows.inc.c"   /* --rows 的两个取行号小工具(拆文件只为守 500 行) */
+
+
+#include "anchor_metrics_topk.inc.c"   /* --ref-topk: 决策点 argmax 命中率(后训练主尺) */
 
 int main(int argc, char **argv) {
     const char *refp = NULL, *rawp = NULL, *idsp = NULL, *stup = NULL, *sraw = NULL, *revl = NULL;
@@ -274,6 +251,8 @@ int main(int argc, char **argv) {
      * 的事后上下文, 部署侧没有), 锚行 r>=S0+N ↔ 学生行 r−N(与 row_layout.inc.c 的 xshift 同一映射);
      * 上下文行用锚自己回填(KLD=0), 所以有偏移时必须配 --rows a:b 只看正文行, 不然全段被回填行冲稀。 */
     int xs0 = -1, xn = 0; const char *rowspec = NULL, *rnll = NULL;
+    /* --ref-topk: 引擎 --score-topk 的产物; 后训练主尺(决策点 argmax 命中率)。--alt: 另一版 ids。 */
+    const char *rtopk = NULL, *altp = NULL, *predp = NULL, *vstopk = NULL; int preds = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--xshift") && i + 2 < argc) { xs0 = atoi(argv[++i]); xn = atoi(argv[++i]); }
         else if (!strcmp(argv[i], "--rows") && i + 1 < argc) rowspec = argv[++i];
@@ -281,6 +260,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--ref-raw") && i + 1 < argc) rawp = argv[++i];
         else if (!strcmp(argv[i], "--ref-eval") && i + 1 < argc) revl = argv[++i];
         else if (!strcmp(argv[i], "--ref-nll") && i + 1 < argc) rnll = argv[++i];
+        else if (!strcmp(argv[i], "--ref-topk") && i + 1 < argc) rtopk = argv[++i];
+        else if (!strcmp(argv[i], "--alt") && i + 1 < argc) altp = argv[++i];
+        else if (!strcmp(argv[i], "--vs-topk") && i + 1 < argc) vstopk = argv[++i];
+        else if (!strcmp(argv[i], "--predict") && i + 1 < argc) predp = argv[++i];
+        else if (!strcmp(argv[i], "--predict-sample") && i + 1 < argc) preds = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--ids") && i + 1 < argc) idsp = argv[++i];
         else if (!strcmp(argv[i], "--student") && i + 1 < argc) stup = argv[++i];
         else if (!strcmp(argv[i], "--stu-raw") && i + 1 < argc) sraw = argv[++i];
@@ -289,7 +273,12 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) threads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--row-out") && i + 1 < argc) rowout = argv[++i];
     }
-    if ((!refp && !rawp && !revl && !rnll) || !idsp) { fprintf(stderr, "需 --ref/--ref-raw/--ref-eval/--ref-nll 与 --ids\n"); return 2; }
+    /* --ref-topk 自带行号与目标 token, 不需要 --ids —— 早退在读 ids 之前, 免得为一把
+     * 只看 argmax 的尺去准备它用不上的东西。 */
+    if (rtopk && vstopk) return topk_vs(rtopk, vstopk, rowspec);    /* 守门 1: 两态 argmax 有没有变 */
+    if (rtopk && predp) return topk_predict(rtopk, predp, preds);   /* 自检 2: 预测 vs 真前向 */
+    if (rtopk) return topk_report(rtopk, rowspec, altp);
+    if ((!refp && !rawp && !revl && !rnll) || !idsp) { fprintf(stderr, "需 --ref/--ref-raw/--ref-eval/--ref-nll/--ref-topk 与 --ids\n"); return 2; }
 
     /* ids: 动态扩容 —— 一条 8000 字的报告就 5k token, 17 条样本 11 万 token,
      * 原来的定长 65536 栈数组会静默截断(判决行落到序列外) */

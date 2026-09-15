@@ -13,6 +13,7 @@
 #include "core_internal.h"
 #include "../common/ds4_quantfmt.h"
 #include "../common/ds4_float.h"
+#include "../common/ds4_gr_fnv.h"   /* 指纹算法: 引擎核对与解算器落盘共用一份 */
 #ifndef DS4_NO_GPU
 
 /* 读一块 [K][D] 权重到 buf(f32)。ty 43 = fp4x32 按块解码, 1 = 直接 f32。返回 false = 截断/类型不认。 */
@@ -26,46 +27,131 @@ static bool amp_read_mat(FILE *f, int32_t ty, size_t nel, float *buf, uint8_t *p
     return fread(buf, 4, nel, f) == nel;
 }
 
-/* 权重侧反修(gr_Lnn.bin): 逐专家逐输出通道的增益【缩放因子】, 头 <i32 n_expert><i32 D><i32 1(f32)>。
- * 装进 GPU 后 VQ 解码时 g_eff = 载荷 g_r × s —— 盘上权重不动。返回挂上的层数, <0 = 有文件但读坏了。 */
-static int v41_gr_load(const char *dir) {
-    int n = 0; double mb = 0;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        char p[4200]; snprintf(p, sizeof p, "%s/gr_L%02u.bin", dir, il);
-        FILE *f = fopen(p, "rb");
-        if (!f) continue;
-        int32_t hd[3];
-        if (fread(hd, 4, 3, f) != 3 || hd[0] != (int32_t)DS4_N_EXPERT || hd[1] != (int32_t)DS4_N_EMBD ||
-            (hd[2] != 1 && hd[2] != 2)) {
-            fprintf(stderr, "ds4: 增益覆盖 %s 头不对(专家 %d 通道 %d 类型 %d; 要 %u/%u/1或2)\n",
-                    p, hd[0], hd[1], hd[2], (unsigned)DS4_N_EXPERT, (unsigned)DS4_N_EMBD);
-            fclose(f); return -1;
-        }
-        const size_t nel = (size_t)hd[0] * hd[1];
-        const int f16 = hd[2] == 2;
-        float *buf = xmalloc(nel * 4);
-        bool ok;
-        if (f16) {   /* 盘上 f16(缩放因子恒在 1 附近, f16 相对精度 0.1%), 解成 f32 上设备 */
-            uint16_t *raw = xmalloc(nel * 2);
-            ok = fread(raw, 2, nel, f) == nel;
-            if (ok) for (size_t t = 0; t < nel; t++) buf[t] = ds4_f16_to_f32(raw[t]);
-            free(raw);
-        } else ok = fread(buf, 4, nel, f) == nel;
-        ok = ok && ds4_gpu_v41_set_gr_override(il, buf, (uint32_t)hd[0], (uint32_t)hd[1]);
-        free(buf); fclose(f);
-        if (!ok) { fprintf(stderr, "ds4: 增益覆盖 %s 读/上传失败\n", p); return -1; }
-        n++; mb += (double)nel * (f16 ? 2 : 4) / 1e6;
+/* 读一层的增益缩放因子文件 gr_Lnn.bin 并【乘进】acc(acc 进来必须已初始化为 1)。
+ * 头 <i32 n_expert><i32 D><i32 类型>, 类型: 1 = f32(s 本身) / 2 = f16(s 本身) / 43 = fp4x32(★存 s−1★)。
+ *
+ * ★为什么 fp4 必须存 s−1 而不是 s★(2026-09-13, 用户要求插件走 fp4 精度): fp4 是 E2M1 加每 32 个数
+ * 一个块缩放, 格点 ±{0,.5,1,1.5,2,3,4,6}×块缩放。增益因子全挤在 1 附近(实测 |s−1| 中位 0.09~0.31),
+ * 直接存 s 的话块缩放被最大值(≈1.3)定死在 0.22, 格点间隔 0.11 ⇒ 量化误差 ±0.055, 是修正量本身的
+ * 20~60% —— 等于把插件的作用抹掉大半。存 s−1 则以 0 为中心、动态范围大, 正是块缩放擅长的形态,
+ * 相对误差降到 8% 量级(失真的是修正的 8%, 不是 60%)。加载时 +1 还原。
+ * 返回 1 = 有这个文件且读好了, 0 = 没这个文件, <0 = 有文件但坏了(不静默跳过: 显式给的目录里有
+ * 坏文件, 跳过就是拿半份插件出假账)。 */
+static int v41_gr_accum_layer(const char *dir, uint32_t il, float *acc, size_t nel, double *mb) {
+    char p[4200]; snprintf(p, sizeof p, "%s/gr_L%02u.bin", dir, il);
+    FILE *f = fopen(p, "rb");
+    if (!f) return 0;
+    int32_t hd[3];
+    if (fread(hd, 4, 3, f) != 3 || hd[0] != (int32_t)DS4_N_EXPERT || hd[1] != (int32_t)DS4_N_EMBD ||
+        (hd[2] != 1 && hd[2] != 2 && hd[2] != (int32_t)DS4_GGT_FP4X32)) {
+        fprintf(stderr, "ds4: 增益覆盖 %s 头不对(专家 %d 通道 %d 类型 %d; 要 %u/%u/1|2|43)\n",
+                p, hd[0], hd[1], hd[2], (unsigned)DS4_N_EXPERT, (unsigned)DS4_N_EMBD);
+        fclose(f); return -1;
     }
-    if (n) fprintf(stderr, "ds4: [反修·权重侧] %d 层挂上逐专家增益覆盖 (盘上 %.1f MB)\n", n, mb);
+    bool ok;
+    double bytes;
+    if (hd[2] == (int32_t)DS4_GGT_FP4X32) {
+        if (nel % 32u) { fprintf(stderr, "ds4: %s 元素数 %zu 不是 32 的整数倍, fp4x32 装不下\n", p, nel); fclose(f); return -1; }
+        const size_t nb = nel / 32u, nby = nb * 17u;
+        uint8_t *pk = xmalloc(nby);
+        float *raw = xmalloc(nel * 4);
+        ok = fread(pk, 1, nby, f) == nby;
+        if (ok) {
+            ds4_deq_fp4x32(pk, nb, raw);
+            for (size_t t = 0; t < nel; t++) acc[t] *= 1.0f + raw[t];   /* 盘上是 s−1 */
+        }
+        free(pk); free(raw);
+        bytes = (double)nby;
+    } else if (hd[2] == 2) {   /* f16(s 本身): 1 附近分辨率 2^-10 ≈ 0.001 */
+        uint16_t *raw = xmalloc(nel * 2);
+        ok = fread(raw, 2, nel, f) == nel;
+        if (ok) for (size_t t = 0; t < nel; t++) acc[t] *= ds4_f16_to_f32(raw[t]);
+        free(raw);
+        bytes = (double)nel * 2;
+    } else {
+        float *raw = xmalloc(nel * 4);
+        ok = fread(raw, 4, nel, f) == nel;
+        if (ok) for (size_t t = 0; t < nel; t++) acc[t] *= raw[t];
+        free(raw);
+        bytes = (double)nel * 4;
+    }
+    fclose(f);
+    if (!ok) { fprintf(stderr, "ds4: 增益覆盖 %s 截断\n", p); return -1; }
+    *mb += bytes / 1e6;
+    return 1;
+}
+
+/* 三文件部署(2026-09-13): ②反修目录与③后训练目录的增益表【逐元素相乘】后一次上设备 ——
+ *     g_eff = 载荷 g_r × s₂ × s₃
+ * 盘上权重一个字节不动; 任一目录不挂, 该项就是 1(数学上就是不挂)。为什么必须先乘再上传:
+ * ds4_gpu_v41_set_gr_override 是"这一层的表就是它", 两个目录各 set 一次 = 后者顶掉前者,
+ * 而且不报错 —— 那就是安静地只挂了一件插件, 读数还长得挺合理。
+ * 返回挂上的层数, <0 = 有文件但读坏了。 */
+static int v41_gr_load(const char *amp_dir, const char *pt_dir) {
+    int n = 0; double mb = 0;
+    const size_t nel = (size_t)DS4_N_EXPERT * DS4_N_EMBD;
+    float *acc = xmalloc(nel * 4);
+    int rc = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER && rc >= 0; il++) {
+        for (size_t t = 0; t < nel; t++) acc[t] = 1.0f;
+        int got = 0;
+        for (int src = 0; src < 2; src++) {
+            const char *d = src == 0 ? amp_dir : pt_dir;
+            if (!d || !d[0]) continue;
+            const int r = v41_gr_accum_layer(d, il, acc, nel, &mb);
+            if (r < 0) { rc = -1; break; }
+            got += r;
+        }
+        if (rc < 0 || !got) continue;
+        if (!ds4_gpu_v41_set_gr_override(il, acc, (uint32_t)DS4_N_EXPERT, (uint32_t)DS4_N_EMBD)) {
+            fprintf(stderr, "ds4: L%02u 增益覆盖上传失败\n", il); rc = -1; break;
+        }
+        n++;
+    }
+    free(acc);
+    if (rc < 0) return -1;
+    if (n) fprintf(stderr, "ds4: [反修·权重侧] %d 层挂上逐专家增益覆盖 (盘上 %.1f MB%s)\n",
+                   n, mb, (pt_dir && pt_dir[0]) ? ", 含后训练第三件" : "");
     return n;
 }
 
-bool v41_amp_load(ds4_v41_state *st, const char *dir) {
+/* 后训练目录的底座指纹核对(三文件部署的硬闸)。③ 是对"①+②这个部署态"解出来的修正:
+ * ② 换了版, ③ 就打在错的基线上, 而且照样能跑、照样出一个像模像样的读数。所以 ③ 落盘时
+ * 把 ② 目录的指纹写进 base.fnv, 加载时重算比对。指纹 = 按层号顺序对 ② 的 gr_Lnn.bin 全字节
+ * 做 FNV-1a 64(不引哈希库; 这里防的是"拿错了文件", 不是防篡改)。
+ * ③ 目录没有 base.fnv => 打警告放行(手搓的实验产物), 有但对不上 => 停车。 */
+static bool v41_pt_base_ok(const char *pt_dir, const char *amp_dir) {
+    char p[4200]; snprintf(p, sizeof p, "%s/base.fnv", pt_dir);
+    FILE *f = fopen(p, "rb");
+    if (!f) {
+        fprintf(stderr, "ds4: ★后训练目录 %s 没有 base.fnv, 无法核对它是解在哪个反修态上的 —— 放行但读数自负★\n", pt_dir);
+        return true;
+    }
+    unsigned long long want = 0; unsigned want_n = 0;
+    const int got = fscanf(f, "%llx %u", &want, &want_n);
+    fclose(f);
+    if (got != 2) { fprintf(stderr, "ds4: %s 读不出指纹 -- aborting\n", p); return false; }
+    uint32_t have_n = 0;
+    unsigned hn = 0;
+    const uint64_t have = (amp_dir && amp_dir[0]) ? ds4_gr_dir_fnv(amp_dir, DS4_N_LAYER, &hn) : DS4_GR_FNV_SEED;
+    have_n = hn;
+    if (have != (uint64_t)want || have_n != want_n) {
+        fprintf(stderr, "ds4: ★后训练件 %s 是解在另一个反修态上的(指纹 %016llx/%u 层, 现挂 %016llx/%u 层)★\n"
+                        "     ② 换版后 ③ 必须重解 —— 停车, 不出假读数\n",
+                pt_dir, want, want_n, (unsigned long long)have, have_n);
+        return false;
+    }
+    fprintf(stderr, "ds4: [后训练] 底座指纹核对通过(%016llx, %u 层)\n", (unsigned long long)have, have_n);
+    return true;
+}
+
+bool v41_amp_load(ds4_v41_state *st, const char *dir, const char *pt_dir) {
     uint32_t n_arm = 0, kmin = 0, kmax = 0; double mb = 0.0;
     const char *tyname = "";
-    const int n_gr = v41_gr_load(dir);
+    if (pt_dir && pt_dir[0] && !v41_pt_base_ok(pt_dir, dir)) return false;
+    const int n_gr = v41_gr_load(dir, pt_dir);
     if (n_gr < 0) return false;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+    for (uint32_t il = 0; dir && dir[0] && il < DS4_N_LAYER; il++) {
         char p[4200]; snprintf(p, sizeof p, "%s/amp_L%02u.bin", dir, il);
         FILE *f = fopen(p, "rb");
         if (!f) continue;
@@ -104,9 +190,11 @@ bool v41_amp_load(ds4_v41_state *st, const char *dir) {
         tyname = ty == (int32_t)DS4_GGT_FP4X32 ? "fp4x32" : "f32";
     }
     if (!n_arm) {
-        /* 只有增益覆盖、没有低秩放大器也是合法的一种插件(权重侧反修的产物就长这样) */
+        /* 只有增益覆盖、没有低秩放大器也是合法的一种插件(权重侧反修与后训练的产物都长这样) */
         if (n_gr > 0) return true;
-        fprintf(stderr, "ds4: 反修目录 %s 里既没有 amp_Lnn.bin 也没有 gr_Lnn.bin\n", dir); return false;
+        fprintf(stderr, "ds4: 目录里既没有 amp_Lnn.bin 也没有 gr_Lnn.bin(反修 %s / 后训练 %s)\n",
+                dir && dir[0] ? dir : "(无)", pt_dir && pt_dir[0] ? pt_dir : "(无)");
+        return false;
     }
     st->ampT = ds4_gpu_tensor_alloc((uint64_t)st->cap_tok * kmax * 4);
     if (!st->ampT) return false;
@@ -119,6 +207,9 @@ bool v41_amp_load(ds4_v41_state *st, const char *dir) {
  * 不同步就 D2H 读到的是半成品。回调说 1 = 取完了 ⇒ 置 stop_early, 前向驱动跳过余下层与出口。 */
 int v41_amp_hook(ds4_v41_state *st, uint32_t il) {
     if (!g_ds4_v41_hook) return 0;
+    /* 层过滤要在所有拷贝之前: 下面那串 D2H 一层就是几十 MB(prefill 路还有 63 MB 的逐专家输出),
+     * 取料方只要一层时, 不过滤等于每块白拷 39 层。 */
+    if (g_ds4_v41_hook_layer >= 0 && (int)il != g_ds4_v41_hook_layer) return 0;
     const uint32_t n = st->n, D = DS4_N_EMBD, NU = DS4_N_EXPERT_USED;
     if (!ds4_gpu_flush_commands() || !ds4_gpu_synchronize()) return -1;
     const uint32_t HC = DS4_N_HC;

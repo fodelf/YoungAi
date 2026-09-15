@@ -64,8 +64,12 @@ bool v41_state_alloc(ds4_v41_state *st, uint32_t cap, uint32_t ctx) {
             st->cpre_sc[il] = v41_alloc((ratio + (uint64_t)cap) * HD * 4, &ok);
         }
     }
-    if (ok && g_ds4_v41_amp_dir && !v41_amp_load(st, g_ds4_v41_amp_dir)) {   /* 显式要了放大器就必须挂上, 不许静默裸跑 */
-        fprintf(stderr, "ds4: 放大器 %s 挂不上, 停车(不做静默裸模型对照)\n", g_ds4_v41_amp_dir); ok = false;
+    /* 三文件部署: ②反修目录 与 ③后训练目录 各自可缺席; 显式要了的挂不上就停车, 不许静默裸跑。 */
+    if (ok && (g_ds4_v41_amp_dir || g_ds4_v41_pt_dir) &&
+        !v41_amp_load(st, g_ds4_v41_amp_dir, g_ds4_v41_pt_dir)) {
+        fprintf(stderr, "ds4: 插件挂不上, 停车(不做静默裸模型对照): 反修 %s / 后训练 %s\n",
+                g_ds4_v41_amp_dir ? g_ds4_v41_amp_dir : "(无)", g_ds4_v41_pt_dir ? g_ds4_v41_pt_dir : "(无)");
+        ok = false;
     }
     if (!ok) { fprintf(stderr, "ds4: V4.1 状态缓冲分配失败(cap=%u ctx=%u)\n", cap, ctx); v41_state_free(st); }
     return ok;

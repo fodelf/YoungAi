@@ -286,40 +286,14 @@ void ds4_eval_ids_run(ds4_engine *e) {
             exit(1);
         }
     }
-    /* --eval-nll: 判决只要目标 token 的 -log p, 4 字节/位置。为什么必须有这条 ——
-     * 全词表 logits 每位置 129280×4 = 517 KB, 一趟 7.3k token 就是 8.1 GB; GB10 的
-     * 121 GB 是 CPU/GPU 统一内存, 那 8 GB 落盘会灌满 page cache, 下一趟引擎启动时
-     * MemAvailable 被掏空 → GPU 分配失败。2026-09-08 夜就是这么把机器写崩的
-     * (NVRM: Out of memory, 六个时间点全对上那几轮判决)。★写大文件=占 GPU 内存★。 */
-    FILE *nf = NULL; double nll_sum = 0.0; uint32_t nll_cnt = 0;
-    const char *np = ds4_tool_eval_nll();
-    if (np && np[0]) {
-        nf = fopen(np, "wb");
-        if (!nf) {
-            fprintf(stderr, "ds4: [EVAL_IDS] 打不开 %s -- aborting\n", np);
-            exit(1);
-        }
-    }
-    /* --eval-topk K --eval-topk-out FILE: 每个判决行落 top-K 的 (id, p) + 目标 token 的 p。
-     * 用途是后训练的靶: dL/d(output_norm)_j = Σ_v p_v·W[v][j] − W[t][j] —— 这个和只有
-     * top-K 有份量(语言模型的 p 极度集中), 所以解算侧只要 dequant 那 K+1 行权重就够,
-     * 不需要把 129280×4096 的输出头整个搬过去, 也不需要一个新的转置 GEMV kernel。
-     * ★覆盖的概率质量一起落盘★: 近似有多糙必须是可测量的, 不能靠"应该够了"。 */
-    FILE *tf = NULL; const int topk = ds4_tool_eval_topk();
-    const char *tp = ds4_tool_eval_topk_out();
-    double tk_mass_sum = 0.0; uint32_t tk_rows = 0;
-    if (topk > 0 && tp && tp[0]) {
-        tf = fopen(tp, "wb");
-        if (!tf) { fprintf(stderr, "ds4: [EVAL_IDS] 打不开 %s -- aborting\n", tp); exit(1); }
-        /* 头: magic/K/S —— 解算侧靠它自证读的是同一趟的产物, 不用另传参数 */
-        const uint32_t hd[4] = { 0x44475445u /* "ETGD" */, (uint32_t)topk, n, vocab };
-        if (fwrite(hd, sizeof(uint32_t), 4, tf) != 4) {
-            fprintf(stderr, "ds4: [EVAL_IDS] topk 头短写 -- aborting\n"); exit(1);
-        }
-    }
-    if (lf || nf || tf) lg = xmalloc((size_t)vocab * sizeof(float));
-    float *tk_p = NULL; int *tk_id = NULL;
-    if (tf) { tk_p = xmalloc((size_t)topk * sizeof(float)); tk_id = xmalloc((size_t)topk * sizeof(int)); }
+    /* --eval-nll / --eval-topk: 两个【小】出口, 实现在 core_score_aux.c(V4.1 的 --score-ids
+     * 用的是同一份 —— 两条路写的是同一种文件, 抄第二份迟早对不上)。为什么必须有它们:
+     * 全词表 logits 每位置 129280×4 = 517 KB, 一趟 7.3k token 就是 8.1 GB; GB10 的 121 GB 是
+     * CPU/GPU 统一内存, 那 8 GB 落盘灌满 page cache ⇒ 下一趟引擎启动时 MemAvailable 被掏空
+     * ⇒ GPU 分配失败。2026-09-08 夜就是这么把机器写崩的。★写大文件 = 占 GPU 内存★。 */
+    ds4_score_aux *aux = ds4_score_aux_open(ds4_tool_eval_nll(), ds4_tool_eval_topk_out(),
+                                            ds4_tool_eval_topk(), NULL, n, vocab, "EVAL_IDS");
+    if (lf || aux) lg = xmalloc((size_t)vocab * sizeof(float));
 
     char err[256];
     for (uint32_t p0 = 0; p0 < n; p0 += cap) {
@@ -331,7 +305,7 @@ void ds4_eval_ids_run(ds4_engine *e) {
             fprintf(stderr, "ds4: [EVAL_IDS] prefill 失败 @pos %u: %s -- aborting\n", p0, err);
             exit(1);
         }
-        if (lf || nf || tf) {
+        if (lf || aux) {
             /* 逐位置过输出头: eval_output_head_from_hc 只算传入批的最后一行, 所以按
              * n_tokens=1 逐位置喂该位置的 HC 隐状态。 */
             for (uint32_t t = 0; t < nt; t++) {
@@ -345,69 +319,12 @@ void ds4_eval_ids_run(ds4_engine *e) {
                     fprintf(stderr, "ds4: [EVAL_IDS] logits 短写 @pos %u -- aborting\n", p0 + t);
                     exit(1);
                 }
-                if (nf) {
-                    /* 位置 i 的 logits 预测 ids[i+1] —— 这个"错一格"是 teacher-forced
-                     * 打分的全部要害, 下游判决行也按它左移一格(z_nightly_spark.sh 的
-                     * segs 注释)。最后一位没有下一个 token, 写 NaN 占位: 行数恒等于 S,
-                     * 下游按行号取值不用做边界特判, 而 NaN 参与任何统计都会立刻暴露,
-                     * 不像 0.0 会被当成"这个位置预测得完美"悄悄拉低平均。 */
-                    const uint32_t i = p0 + t;
-                    float v;
-                    if (i + 1u < n) {
-                        /* log_softmax 走 max 平移: logits 绝对值能到几十, 直接 expf 会溢出。
-                         * NLL = logsumexp(lg) − lg[tgt], 与 anchor_metrics 的 C 实现同式。 */
-                        float mx = lg[0];
-                        for (uint32_t k = 1; k < vocab; k++) if (lg[k] > mx) mx = lg[k];
-                        double se = 0.0;
-                        for (uint32_t k = 0; k < vocab; k++) se += exp((double)(lg[k] - mx));
-                        v = (float)(log(se) - (double)(lg[ids[i + 1u]] - mx));
-                        nll_sum += v; nll_cnt++;
-                    } else {
-                        v = NAN;
-                    }
-                    if (fwrite(&v, sizeof(float), 1, nf) != 1) {
-                        fprintf(stderr, "ds4: [EVAL_IDS] nll 短写 @pos %u -- aborting\n", i);
-                        exit(1);
-                    }
-                }
-                if (tf) {
-                    const uint32_t i = p0 + t;
-                    const int tgt = (i + 1u < n) ? ids[i + 1u] : -1;
-                    /* softmax 走同一套 max 平移(与上面 NLL 逐式同源, 免得两处口径漂移) */
-                    float mx = lg[0];
-                    for (uint32_t k = 1; k < vocab; k++) if (lg[k] > mx) mx = lg[k];
-                    double se = 0.0;
-                    for (uint32_t k = 0; k < vocab; k++) se += exp((double)(lg[k] - mx));
-                    /* top-K 选择: K 槽最小值替换。K 只有几十, 比排 12.9 万个数便宜得多。 */
-                    int nk = 0;
-                    for (uint32_t k = 0; k < vocab; k++) {
-                        if (nk < topk) { tk_id[nk] = (int)k; tk_p[nk] = lg[k]; nk++; continue; }
-                        int mi = 0;
-                        for (int q = 1; q < topk; q++) if (tk_p[q] < tk_p[mi]) mi = q;
-                        if (lg[k] > tk_p[mi]) { tk_p[mi] = lg[k]; tk_id[mi] = (int)k; }
-                    }
-                    double mass = 0.0;
-                    for (int q = 0; q < nk; q++) {
-                        tk_p[q] = (float)(exp((double)(tk_p[q] - mx)) / se);
-                        mass += tk_p[q];
-                    }
-                    const float tgt_p = (tgt >= 0)
-                        ? (float)(exp((double)(lg[tgt] - mx)) / se) : 0.0f;
-                    const float massf = (float)mass;
-                    tk_mass_sum += mass; tk_rows++;
-                    if (fwrite(&i, sizeof(uint32_t), 1, tf) != 1 ||
-                        fwrite(&tgt, sizeof(int), 1, tf) != 1 ||
-                        fwrite(&tgt_p, sizeof(float), 1, tf) != 1 ||
-                        fwrite(&massf, sizeof(float), 1, tf) != 1 ||
-                        fwrite(tk_id, sizeof(int), (size_t)nk, tf) != (size_t)nk ||
-                        fwrite(tk_p, sizeof(float), (size_t)nk, tf) != (size_t)nk) {
-                        fprintf(stderr, "ds4: [EVAL_IDS] topk 短写 @pos %u -- aborting\n", i);
-                        exit(1);
-                    }
-                }
+                /* 位置 i 的 logits 预测 ids[i+1] —— 这个"错一格"是 teacher-forced 打分的
+                 * 全部要害, 下游判决行也按它左移一格(z_nightly_spark.sh 的 segs 注释)。 */
+                const uint32_t i = p0 + t;
+                ds4_score_aux_row(aux, i, lg, i + 1u < n ? ids[i + 1u] : -1);
             }
             if (lf) fflush(lf);
-            if (nf) fflush(nf);
         }
         fprintf(stderr, "ds4: [EVAL_IDS] %u/%u\n", p0 + nt, n);
     }
@@ -415,32 +332,12 @@ void ds4_eval_ids_run(ds4_engine *e) {
         fprintf(stderr, "ds4: [EVAL_IDS] 关闭 %s 失败 -- aborting\n", lp);
         exit(1);
     }
-    if (nf) {
-        if (fclose(nf) != 0) {
-            fprintf(stderr, "ds4: [EVAL_IDS] 关闭 %s 失败 -- aborting\n", np);
-            exit(1);
-        }
-        /* 全序列平均只是个冒烟读数(判决要按 --rows 取报告段/分歧段, 见 anchor_metrics)。
-         * 打出来是为了跑完立刻能看出"这趟是不是废的"——数量级不对就不用往下走了。 */
-        fprintf(stderr, "ds4: [EVAL_IDS] NLL 已写 %s: n=%u 全序列平均 %.4f (PPL %.4f)\n",
-                np, nll_cnt, nll_cnt ? nll_sum / nll_cnt : 0.0,
-                nll_cnt ? exp(nll_sum / nll_cnt) : 0.0);
-    }
-    if (tf) {
-        if (fclose(tf) != 0) {
-            fprintf(stderr, "ds4: [EVAL_IDS] 关闭 %s 失败 -- aborting\n", tp);
-            exit(1);
-        }
-        /* ★平均覆盖质量是这条近似路的自证★: 它低了就说明 top-K 截得太狠,
-         * 靶里丢掉的那部分梯度不是小量, 该把 K 调大而不是硬解。 */
-        fprintf(stderr, "ds4: [EVAL_IDS] topK=%d 已写 %s: %u 行, 平均覆盖概率质量 %.4f\n",
-                topk, tp, tk_rows, tk_rows ? tk_mass_sum / tk_rows : 0.0);
-    }
+    ds4_score_aux_close(aux);
     fprintf(stderr, "ds4: [EVAL_IDS] 完成 S=%u vocab=%u%s%s\n", n, vocab,
             lp && lp[0] ? " logits已写" : "",
             ds4_tool_eval_hdump() ? " hidden已写" : "");
     ds4_session_free(s);
-    free(hc); free(lg); free(ids); free(tk_p); free(tk_id);
+    free(hc); free(lg); free(ids);
     exit(0);
 #endif
 }

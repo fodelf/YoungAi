@@ -16,6 +16,7 @@
 #       v41_judge.sh gguf/go-onebit/g7/wt2.ids 512 amp:<拟合ids>:<拟合ntok>:8:4096:64
 #       v41_judge.sh gguf/go-onebit/vqfin41/vqhalf_j.ids 8192 engine engine::<放大器目录>   引擎学生(裸 / 挂放大器)
 #       v41_judge.sh ... engine::<放大器目录>:0.25    同上但每层修正缩到 0.25 倍(步长扫描, 2026-09-13)
+#       v41_judge.sh ... engine::<放大器目录>::<后训练目录>   三文件全挂(①+②+③), 守门尺"不忘老本事"
 #       v41_judge.sh gguf/go-onebit/vqfin41/vqhalf_j.ids 8192 engamp:<拟合ids>:8192           引擎上解放大器再判(2026-09-13)
 #       v41_judge.sh gguf/go-onebit/vqfin41/vqhalf_j.ids 8192 engkl:<拟合ids>:8192:0.10        蒸馏靶(末层, KL 梯度)解+判(2026-09-13)
 #
@@ -85,7 +86,7 @@ run_py() {
 # 落盘再喂引擎(引擎读整个文件)。与 run_py 同一套纪律: 全量日志落盘, 过滤上屏, PIPESTATUS 判真实退出码。
 GG_DEFAULT="$ROOT/gguf/v41/DeepSeek-V4.1-Flash-vq8x4096-fp4.gguf"
 run_eng() {
-    local stu="$1" gg="$2" zarg="$3" tag="$4"
+    local stu="$1" gg="$2" zarg="$3" tag="$4"   # zarg 里可以带 --zchain/--zchain-scale/--posttrain
     local idsn="$OUT/ids_${TAG}.txt" lf="$OUT/log_${tag}.txt"
     head -n "$NTOK" "$IDS" > "$idsn"
     [ -x "$ROOT/ds4" ] || { LOG "★$ROOT/ds4 没编(make cuda-spark)★"; return 1; }
@@ -275,7 +276,7 @@ for NB in "$@"; do
     engine|engine:*) # 引擎学生档(2026-09-13): engine[:<gguf>[:<放大器目录>]] —— 学生 = ds4 引擎 --score-ids(部署同路);
       # gguf 空 = 默认 1.5 bpw 文件; 给放大器目录则 --zchain 挂上(目录 manifest 须有 "# 完成", 半成品不判)。
       # 教师锚照旧(FP 教师与学生走哪条路无关); 判决器同一份 anchor_metrics。
-      IFS=: read -r _ GG ARMD BETA <<<"$NB"; GG="${GG:-$GG_DEFAULT}"
+      IFS=: read -r _ GG ARMD BETA PTD <<<"$NB"; GG="${GG:-$GG_DEFAULT}"
       [ -s "$GG" ] || { LOG "★$GG 不存在★"; continue; }
       ZARG=""; SFX=""
       if [ -n "${ARMD:-}" ]; then
@@ -283,6 +284,12 @@ for NB in "$@"; do
           ZARG="--zchain $ARMD"; SFX="_amp_$(basename "$ARMD")"
           # 第四字段 β(--zchain-scale): 每层修正整体缩到 β 倍 —— 步长扫描(针 0)。空 = 1.0 = 原样。
           [ -n "${BETA:-}" ] && { ZARG="$ZARG --zchain-scale $BETA"; SFX="${SFX}_b$BETA"; }
+      fi
+      # 第五字段 = ③ 后训练目录(三文件部署的第三件, 2026-09-13 夜)。守门尺"不忘老本事"就靠这个档:
+      # 同一把判决料, ②态 vs ②+③态, 比 Same top / KLD 退了多少。
+      if [ -n "${PTD:-}" ]; then
+          [ -s "$PTD/gr_L39.bin" ] || { LOG "★后训练目录 $PTD 里没有 gr_L39.bin, 不判★"; continue; }
+          ZARG="$ZARG --posttrain $PTD"; SFX="${SFX}_pt_$(basename "$PTD")"
       fi
       STU="$OUT/stu_${TAG}_eng_$(basename "$GG" .gguf)${SFX}.bin"
       LOG "② 学生 = 引擎 $(basename "$GG")${ARMD:+ + 放大器 $(basename "$ARMD")} (判决料 $(basename "$IDS") n=$NTOK)"

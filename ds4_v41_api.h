@@ -16,6 +16,12 @@ int ds4_engine_is_v41(ds4_engine *e);
 void ds4_engine_v41_set_prof(int on);   /* --v41-prof: 每次前向打逐层毫秒(每层同步一次, 只在查速度时开) */
 void ds4_engine_v41_set_amp_dir(const char *dir);   /* --zchain <dir>: V4.1 反修放大器目录(amp_Lnn.bin), 每层 MoE 出口 y += x·(B·A) */
 void ds4_engine_v41_set_amp_scale(float s);         /* --zchain-scale β: 加载时把 A 乘 β(修正整体缩到 β 倍); ≤0 = 1.0 */
+void ds4_engine_v41_set_posttrain_dir(const char *dir);   /* --posttrain <dir>: 三文件部署的第三件(后训练增益), 与 --zchain 的表逐元素相乘 */
+/* --score-nll FILE / --score-topk K FILE / --score-no-logits: --score-ids 的三个小出口。
+ * 与 V4 的 --eval-nll/--eval-topk 同一份实现(core_score_aux.c)、同一种字节。
+ * 后训练一趟 5.8 万行, 全词表 logits 就是 30 GB —— 统一内存机器上写它 = 掏 GPU 内存(09-08 崩机)。 */
+void ds4_engine_v41_set_score_aux(const char *nll_path, const char *topk_path, int topk,
+                                  const char *rms_path, int skip_logits);
 int ds4_engine_v41_score_ids(ds4_engine *e, const int *ids, int n_ids, const char *out_path, int no_engram, int chunk);
 int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_prompt, int n_predict, int ctx_size,
                                    ds4_v41_emit_fn emit, void *ud);
@@ -42,6 +48,8 @@ typedef int (*ds4_v41_moe_hook_fn)(void *ud, int il, int pos0, int n, int D, int
                                    const float *x, const float *y, const int *sel, const float *rw, const float *alpha,
                                    const float *ye, const float *ysh);
 void ds4_engine_v41_set_moe_hook(ds4_v41_moe_hook_fn fn, void *ud);
+/* 只在第 il 层回调(-1 = 每层)。取料的 D2H 发生在回调之前, 只要一层时不设它 = 每块白拷 39 层。 */
+void ds4_engine_v41_set_moe_hook_layer(int il);
 
 #ifdef __cplusplus
 }

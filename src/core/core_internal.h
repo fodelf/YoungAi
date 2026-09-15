@@ -117,6 +117,7 @@
 #include "core_inline.h"
 #include "core_gpu_graph.h"
 #include "core_v41.h"   /* DeepSeek V4.1 批前向工作缓冲(2026-09-12) */
+#include "core_score_aux.h"   /* 逐位 NLL / top-K 出口: V4 eval 路与 V4.1 score 路共用一份(2026-09-13) */
 
 struct ds4_session {
     ds4_engine *engine;

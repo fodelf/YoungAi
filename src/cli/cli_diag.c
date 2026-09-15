@@ -59,6 +59,8 @@ int run_score_ids(ds4_engine *engine, const cli_config *cfg) {
     /* V4.1(2026-09-12): 分块增量前向出全位置 logits(同构输出, anchor_metrics 直接对表) */
     if (ds4_engine_is_v41(engine)) {
         ds4_engine_v41_set_prof(cfg->gen.v41_prof);
+        ds4_engine_v41_set_score_aux(cfg->gen.score_nll_path, cfg->gen.score_topk_path,
+                                     cfg->gen.score_topk, cfg->gen.score_rms_path, cfg->gen.score_no_logits);
         int rc = ds4_engine_v41_score_ids(engine, ids, n, cfg->gen.score_out_path ? cfg->gen.score_out_path : "/tmp/ds4_score.bin",
                                           cfg->gen.v41_no_engram, cfg->gen.v41_chunk);
         free(ids); return rc;

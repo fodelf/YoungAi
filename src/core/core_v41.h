@@ -53,9 +53,11 @@ typedef struct {
 extern int g_ds4_v41_prof;   /* --v41-prof(core_v41_api.c) */
 extern const char *g_ds4_v41_amp_dir;   /* --zchain <dir>(V4.1 形态: amp_Lnn.bin 目录), core_engine_open.c 转来 */
 extern float g_ds4_v41_amp_scale;       /* --zchain-scale β: 加载时 A *= β(默认 1.0) */
+extern const char *g_ds4_v41_pt_dir;    /* --posttrain <dir>: 三文件部署第三件(后训练增益目录), 与 ② 的表逐元素相乘 */
 extern ds4_v41_moe_hook_fn g_ds4_v41_hook;   /* 反修钩子(ds4_engine_v41_set_moe_hook), 无=NULL */
 extern void *g_ds4_v41_hook_ud;
-bool v41_amp_load(ds4_v41_state *st, const char *dir);   /* core_v41_amp.c */
+extern int g_ds4_v41_hook_layer;   /* 钩子只在这一层回调(-1=每层); 见 ds4_engine_v41_set_moe_hook_layer */
+bool v41_amp_load(ds4_v41_state *st, const char *dir, const char *pt_dir);   /* core_v41_amp.c: ②反修目录 + ③后训练目录 */
 void v41_amp_free(ds4_v41_state *st);
 int v41_amp_hook(ds4_v41_state *st, uint32_t il);        /* 钩子回调(挂了才动): 同步 → x/y/sel/rw 下主机 → 回调; 0 继续 / 1 提前结束(置 stop_early) / <0 失败 */
 bool v41_amp_apply(ds4_v41_state *st, uint32_t il);      /* y += x·(B·A) → bf16(挂了该层才动) */
