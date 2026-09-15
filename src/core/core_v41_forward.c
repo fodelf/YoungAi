@@ -145,6 +145,8 @@ static bool v41_moe(const ds4_model *m, const ds4_layer_weights *l, ds4_v41_stat
                                        DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, st->xn, il, n)) return false;
     }
     /* shared expert: w1/w3 → bf16 → swiglu(截断) → bf16 → w2 → bf16 */
+    /* ★判负存档(single.md S5①, 09-16)★: gate 与 up 同形状同输入, 合成一发试过 —— 55.2 vs 55.2, 持平。
+     * 小矩阵的固定开销不在"发数"上(每发才 41 µs, 启动只占几微秒), 合发省不出东西。pair 那条核路已删。 */
     if (!ds4_gpu_v41_matmul_fp4x32_tensor(st->sg, m->map, m->size, l->ffn_gate_shexp->abs_offset, E, FF, st->xn, n, 1)) return false;
     if (!ds4_gpu_v41_matmul_fp4x32_tensor(st->su, m->map, m->size, l->ffn_up_shexp->abs_offset, E, FF, st->xn, n, 1)) return false;
     if (!ds4_gpu_v41_swiglu_tensor(st->sh, st->sg, st->su, n, FF, DS4_SWIGLU_CLAMP_EXP)) return false;

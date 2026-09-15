@@ -11,6 +11,10 @@
  * + wo_a 八组一发 + bf16 舍入并进尾巴。VQ 侧: ①码本 L1 全局 gather(每层 1.7 千万次随机 16 B, 扇区流量 566 MB/层)
  * → ②(本版)码本整块搬进 shared(64 KB/矩阵, sm_121 动态 shared 上限 227 KB), 一 block 32 行摊薄搬运。 */
 
+/* 一 block 多少个 warp。16 试过(激活复用翻倍): 55.4 vs 8 warp 的 55.2 —— 持平偏差, 维持 8。
+ * 连同平面副本只值 4% 这件事一起说明: 这个核的大矩阵**已经贴着带宽墙**(wo_b 单发 22.3 MB/~110 µs),
+ * 剩下的差距在小矩阵的固定开销上, 不在激活重读。 */
+#define V41_GEMV_WARPS 8u
 /* ---- fp4x32 GEMV ----
  * grid (ceil(out_dim/(8/ksplit)), n_groups), block 256 = 8 warp; 同一行由 ksplit 个 warp 分 K 段(块号 ≡ kpart mod ksplit),
  * 各自 lane 取块内第 l 个元素(半字节 p[l/2] + 共用 scale p[16]; x 读 128 B 连续, 权重读同扇区), 段和经 shared 按固定序相加。
@@ -22,16 +26,25 @@
  * 正解是把 token 数变成模板参数: NT=1 时内层就是一条 FFMA, acc 就是一个寄存器。
  * 实测背景: 提占用率(ksplit 目标 2048→32768)只换来 3%, 一 warp 管 4 行更是慢 2.8 倍 ⇒ 这个核
  * 既不是延迟受限也不是激活重读受限, 剩下的嫌疑就是指令数。★数值逐位同: 只是把死代码删掉。★ */
-template <uint32_t NT>
-__global__ static void v41_fp4x32_gemv_kernel(float *out, const uint8_t *w, const float *x, uint32_t in_dim, uint32_t out_dim,
+/* PLANAR=1: 权重来自平面副本(nibble 一片 16 B/块 + scale 一片 1 B/块, 见 cuda_v41_fp4_planar.inc.cu),
+ * 一个 warp 一轮读的 8 个块正好是 128 B 连续。PLANAR=0: 盘上的交错布局(17 B 跨距)。
+ * 两条路的字节与配对完全相同 ⇒ 数值逐位同。 */
+template <uint32_t NT, uint32_t PLANAR>
+__global__ static void v41_fp4x32_gemv_kernel(float *out, const uint8_t *w, const uint8_t *wsc, const float *x, uint32_t in_dim, uint32_t out_dim,
                                               uint32_t x_stride, uint32_t out_stride, uint32_t ksplit,
                                               uint64_t w_gstride, uint32_t x_gstride, uint32_t out_gstride, int round_out) {
-    const uint32_t g = blockIdx.y;
-    w += (uint64_t)g * w_gstride; x += (uint64_t)g * x_gstride; out += (uint64_t)g * out_gstride;
+    const uint32_t g = blockIdx.y;   /* 块对角(wo_a)的"第几组": 权重/输入/输出各按步长偏移 */
+    x += (uint64_t)g * x_gstride; out += (uint64_t)g * out_gstride;
+    if (PLANAR) { const uint64_t nb = (uint64_t)out_dim * (in_dim / 32u); w += (uint64_t)g * nb * 16u; wsc += (uint64_t)g * nb; }
+    else w += (uint64_t)g * w_gstride;
     const uint32_t warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
-    const uint32_t rows_per_block = 8u / ksplit, rloc = warp / ksplit, kpart = warp % ksplit;
+    /* ★一 block 16 warp(single.md §2.6 后续): 治的是"激活重读"★
+     * 一个 block 管 rows_per_block 行, 这些行共用同一条激活(在 L1 里)。warp 少 ⇒ 一 block 管的行少 ⇒
+     * 同一条激活被更多 block 各读一遍。wo_b [5120][8192] 在 8 warp/ksplit=2 时激活读 41 MB, 权重才 22 MB;
+     * 16 warp 把它减半。ncu 那 24.92 扇区/请求里, 权重只占小头(平面化后只省了 4%), 大头就是这个。 */
+    const uint32_t rows_per_block = V41_GEMV_WARPS / ksplit, rloc = warp / ksplit, kpart = warp % ksplit;
     const uint32_t r = blockIdx.x * rows_per_block + rloc;
-    __shared__ float red[8][NT];
+    __shared__ float red[V41_GEMV_WARPS][NT];
     float acc[NT];
     #pragma unroll
     for (uint32_t t = 0; t < NT; t++) acc[t] = 0.f;
@@ -42,7 +55,8 @@ __global__ static void v41_fp4x32_gemv_kernel(float *out, const uint8_t *w, cons
      * 写入 + 一次 __syncthreads, 还把 32 KB shared 占掉压低了占用率。 */
     if (r < out_dim) {
         const uint32_t nblk = in_dim / 32u;
-        const uint8_t *wr = w + (uint64_t)r * nblk * 17u;
+        const uint8_t *wr = w + (uint64_t)r * nblk * (PLANAR ? 16u : 17u);
+        const uint8_t *wrs = PLANAR ? wsc + (uint64_t)r * nblk : NULL;
         /* ★2026-09-15 段 2: 一个 lane 从"管 1 个元素"改成"管 4 个字节 = 8 个元素"★
          * 病因(接着模板特化那一针往下挖): 旧排布里 lane l 只负责块内第 l 个元素, 于是每算一次乘加要付
          * 权重字节读 + scale 字节读 + e8m0 解码 + nibble 解码 + 激活读 + bf16 舍 —— 6 条指令换 1 次 FFMA,
@@ -63,8 +77,8 @@ __global__ static void v41_fp4x32_gemv_kernel(float *out, const uint8_t *w, cons
         #define V41_GEMV_BLK(BI) do {                                                        \
             const uint32_t b = (BI) * 8u + sub;                                              \
             if (b < nblk) {                                                                  \
-                const uint8_t *p = wr + (uint64_t)b * 17u;                                   \
-                const float sc = ds4_e8m0_to_f32(p[16]);                                     \
+                const uint8_t *p = wr + (uint64_t)b * (PLANAR ? 16u : 17u);                  \
+                const float sc = ds4_e8m0_to_f32(PLANAR ? wrs[b] : p[16]);                   \
                 /* 块跨距 17 B 天然不对齐, 4 B 一次 memcpy 让编译器发一条非对齐 32 位读      \
                  * (同一个 32 B 扇区内), 比 4 条 LDG.U8 少 3 条指令; 字节一个没变。 */        \
                 uint32_t w4; memcpy(&w4, p + q * 4u, 4);                                     \
@@ -128,6 +142,12 @@ static int v41_fp4x32_gemv(const void *model_map, uint64_t model_size, uint64_t 
     if (off > model_size || wbytes > model_size - off) return 0;
     const uint8_t *w = (const uint8_t *)cuda_model_range_ptr(model_map, off, wbytes, what);
     if (!w) return 0;
+    /* ★平面副本(single.md §2.6 A 路)★: 盘上 17 B 跨距让每个块都不对齐(ncu: 24.92 扇区/请求);
+     * 平面版一个 warp 一轮读的 8 个块是 128 B 连续。拿不到就照旧走交错, 不是必需品。
+     * n_groups>1(wo_a 的块对角)那条路暂不建副本 —— 它的分组偏移语义要另算, 收益也小。 */
+    const v41_fp4_planar pl = (n_groups == 1u)
+        ? v41_fp4_planar_get(model_map, model_size, off, in_dim, out_dim, what)
+        : (v41_fp4_planar){ NULL, NULL };
     /* ★并行度目标: 2048(段 2 前) → 32768(段 2) → 8192(single.md S5, 09-16)★
      * 这个数字是"并行度"与"激活复用"的折中, 两边都实测过:
      *   ksplit 大 ⇒ 一 block 管的行少(rpb = 8/ksplit), 同一条激活被更多 block 各读一遍。
@@ -141,16 +161,22 @@ static int v41_fp4x32_gemv(const void *model_map, uint64_t model_size, uint64_t 
      * ★数值★: ksplit 变了 = K 维分段变了, 段和按 red[] 固定序相加(仍然确定), 但与别的 ksplit 不是逐位同,
      *   所以门是 speed-bench/prefill_2048_ruler.sh 的 NLL/PPL, 不是逐位。 */
     uint32_t ksplit = 1;
-    while (ksplit < 8u && out_dim * ksplit * n_groups < 8192u) ksplit <<= 1;
+    while (ksplit < V41_GEMV_WARPS && out_dim * ksplit * n_groups < 8192u) ksplit <<= 1;
     /* ★K 的分段单位现在是"8 个 k 块一组"(见核里的 lane 排布注释)★ 分不出这么多组就把 ksplit 收回来,
      * 否则多出来的 warp 一轮都跑不到(in_dim=1280 只有 5 组, ksplit=8 时 8 个 warp 里 3 个是空转)。 */
     const uint32_t ngrp = (uint32_t)((in_dim / 32u + 7u) / 8u);
     while (ksplit > 1u && ksplit > ngrp) ksplit >>= 1;
-    const uint32_t rpb = 8u / ksplit;
+    const uint32_t rpb = V41_GEMV_WARPS / ksplit;
     const dim3 grid((unsigned)((out_dim + rpb - 1u) / rpb), n_groups);
     /* NT 是模板参数 ⇒ 按实际 token 数挑一份实例(解码恒走 NT=1 那份, 内层只有一条 FFMA) */
-    #define V41_GEMV_LAUNCH(NT) v41_fp4x32_gemv_kernel<NT><<<grid, 256, 0, g_cur_stream>>>( \
-        out, w, x, (uint32_t)in_dim, (uint32_t)out_dim, x_stride, out_stride, ksplit, wg, x_gstride, out_gstride, round_out)
+    #define V41_GEMV_LAUNCH(NT) do {                                                                       \
+        if (pl.nib) v41_fp4x32_gemv_kernel<NT, 1u><<<grid, V41_GEMV_WARPS * 32u, 0, g_cur_stream>>>(         \
+            out, pl.nib, pl.sc, x, (uint32_t)in_dim, (uint32_t)out_dim, x_stride, out_stride, ksplit, wg,    \
+            x_gstride, out_gstride, round_out);                                            \
+        else v41_fp4x32_gemv_kernel<NT, 0u><<<grid, V41_GEMV_WARPS * 32u, 0, g_cur_stream>>>(                \
+            out, w, NULL, x, (uint32_t)in_dim, (uint32_t)out_dim, x_stride, out_stride, ksplit, wg,          \
+            x_gstride, out_gstride, round_out);                                            \
+    } while (0)
     switch (n_tok) {
         case 1: V41_GEMV_LAUNCH(1u); break;  case 2: V41_GEMV_LAUNCH(2u); break;
         case 3: V41_GEMV_LAUNCH(3u); break;  case 4: V41_GEMV_LAUNCH(4u); break;

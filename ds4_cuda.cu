@@ -68,6 +68,7 @@
 #include "src/cuda/cuda_v41_attn_split.inc.cu"   /* 解码路稀疏注意力 split-K(single.md S4); 在 v41_2 之前(被它调) */
 #include "src/cuda/cuda_v41_2.inc.cu"
 #include "src/cuda/cuda_v41_3.inc.cu"
+#include "src/cuda/cuda_v41_fp4_planar.inc.cu"   /* fp4x32 权重的平面副本(single.md §2.6 A 路); 在 v41_4 之前(被它的 GEMV 调) */
 #include "src/cuda/cuda_v41_4.inc.cu"   /* V4.1 解码小批融合核(fp4x32 GEMV / VQ 即乘 / 缩放舍入 / argmax) */
 #include "src/cuda/cuda_v41_draft.inc.cu"   /* DSpark 草稿塔(speed.md 段 6 D1): 逐专家 FP4 dense MoE / hc 四路均值 / markov 行 gather; 必须在 v41_4 之后(用它的 reduce 核与暂存槽) */
 #include "src/cuda/cuda_v41_gemv_highprec.inc.cu"   /* 非 FP4 权重(BF16 gate/compressor/indexer, F32 mHC)的小批 GEMV; clear.md C1 过门后整片删 */
