@@ -72,6 +72,9 @@ nsys stats --report cuda_api_sum "$OUT/dec.nsys-rep" 2>/dev/null | head -20
 #    怎么读: 核忙 ≈ 墙钟 ⇒ 瓶颈在核内; 间隙大 ⇒ 发射/主机; 专家逐层里某几层 10 倍 ⇒ 那几层的 blob 没进设备缓存。
 echo
 echo "== ③ 逐核时间线分账"
+# ★先删旧的 sqlite 与 csv★: nsys stats 见到已存在的导出就直接复用("Existing SQLite export found"),
+# 于是这一版的核占比表里全是上一版的核 —— 2026-09-15 实撞, 差点按旧账去改核。
+rm -f "$OUT/dec.sqlite" "$OUT/trace_cuda_gpu_trace.csv"
 nsys stats --report cuda_gpu_trace --format csv -o "$OUT/trace" "$OUT/dec.nsys-rep" >/dev/null 2>&1
 awk -F, '
 NR>1 { st=$1+0; du=$2+0; line=$0;

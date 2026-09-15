@@ -54,30 +54,46 @@ __global__ static void v41_fp4x32_gemv_kernel(float *out, const uint8_t *w, cons
          * ★一 warp 一轮覆盖 8 个 k 块★, 所以 K 的分段单位从"块"变成"8 块一组", ksplit 语义不变。 */
         const uint32_t q = lane & 3u, sub = lane >> 2;
         const uint32_t ngrp = (nblk + 7u) / 8u;
-        for (uint32_t gi = kpart; gi < ngrp; gi += ksplit) {
-            const uint32_t b = gi * 8u + sub;
-            if (b >= nblk) continue;   /* 尾组: in_dim/32 不是 8 的倍数时有空位, 不能 break(别的 lane 还有活) */
-            const uint8_t *p = wr + (uint64_t)b * 17u;
-            const float sc = ds4_e8m0_to_f32(p[16]);
-            /* ★4 个字节一次读进来★: 块跨距是 17 B(16 B nibble + 1 B scale), 天然不对齐, 所以原来写成
-             * 4 次单字节取 —— 那是 4 条 LDG.U8 换 8 次乘加。memcpy 4 B 让编译器发一条非对齐 32 位读
-             * (同一个 32 B 扇区内, L1 一次命中), 指令少 3 条。★字节一个没变, 数值逐位同。★ */
-            uint32_t w4; memcpy(&w4, p + q * 4u, 4);
-            float wv[8];
-            #pragma unroll
-            for (uint32_t j = 0; j < 4u; j++) {
-                const uint32_t byte = (w4 >> (8u * j)) & 0xFFu;
-                wv[2u * j]      = ds4_fp4_nibble_to_f32(byte & 0x0Fu) * sc;
-                wv[2u * j + 1u] = ds4_fp4_nibble_to_f32(byte >> 4) * sc;
-            }
-            const float *xb = x + b * 32u + q * 8u;
-            #pragma unroll
-            for (uint32_t t = 0; t < NT; t++) {
-                const float *xt = xb + (uint64_t)t * x_stride;
-                #pragma unroll
-                for (uint32_t j = 0; j < 8u; j++) acc[t] += wv[j] * v41_bf16r(xt[j]);
-            }
-        }
+        /* ★两组一轮, 先把两边的权重 load 都发出去再算(single.md S5)★
+         * 病: 这个核是**访存延迟**受限(165 GB/s = 墙的 69%, 而算的部分只有 8 次 FFMA)。原来一轮只发
+         * 2 条权重 load(4 B nibble + 1 B scale)就立刻用它们, 每个 warp 同时在飞的访存请求太少,
+         * 延迟盖不住。展开成两组 ⇒ 4 条 load 并行在飞, ILP 翻倍。
+         * ★数值逐位同★: 两组仍按 gi 升序先后累加进同一个 acc, 加法次序一个没变。
+         * ★为什么不是"一 warp 管多行"★: 那条 09-15 试过, 慢 2.8 倍(每行的 scale/激活都要重读一遍)。 */
+        #define V41_GEMV_BLK(BI) do {                                                        \
+            const uint32_t b = (BI) * 8u + sub;                                              \
+            if (b < nblk) {                                                                  \
+                const uint8_t *p = wr + (uint64_t)b * 17u;                                   \
+                const float sc = ds4_e8m0_to_f32(p[16]);                                     \
+                /* 块跨距 17 B 天然不对齐, 4 B 一次 memcpy 让编译器发一条非对齐 32 位读      \
+                 * (同一个 32 B 扇区内), 比 4 条 LDG.U8 少 3 条指令; 字节一个没变。 */        \
+                uint32_t w4; memcpy(&w4, p + q * 4u, 4);                                     \
+                float wv[8];                                                                 \
+                _Pragma("unroll")                                                            \
+                for (uint32_t j = 0; j < 4u; j++) {                                          \
+                    const uint32_t byte = (w4 >> (8u * j)) & 0xFFu;                          \
+                    wv[2u * j]      = ds4_fp4_nibble_to_f32(byte & 0x0Fu) * sc;              \
+                    wv[2u * j + 1u] = ds4_fp4_nibble_to_f32(byte >> 4) * sc;                 \
+                }                                                                            \
+                const float *xb = x + b * 32u + q * 8u;                                      \
+                /* ★这里不再舍 bf16★: 进这个核的激活**已经在 bf16 格点上** —— rms_norm / hc_fused /  \
+                 * swiglu / sparse_attn / 上一发 GEMV 的 round_out, 每一条产出 x 的路都在出口舍过。  \
+                 * v41_bf16r 对已在格点的值是恒等(RNE 的不动点), 所以去掉它**数值逐位同**, 省的是    \
+                 * 每轮每 lane 8×4 条 ALU —— 这个核是延迟/指令受限的(165 GB/s = 墙的 69%), 指令值钱。\
+                 * ★前提写死在这里★: 以后若有哪条路把非格点的 f32 直接喂进来, 结果会与官方差一个   \
+                 * 舍入位, 不报错 —— 加新调用点时先确认输入是不是 bf16 格点。 */                     \
+                _Pragma("unroll")                                                            \
+                for (uint32_t t = 0; t < NT; t++) {                                          \
+                    const float *xt = xb + (uint64_t)t * x_stride;                           \
+                    _Pragma("unroll")                                                        \
+                    for (uint32_t j = 0; j < 8u; j++) acc[t] += wv[j] * xt[j];               \
+                }                                                                            \
+            }                                                                                \
+        } while (0)
+        uint32_t gi = kpart;
+        for (; gi + ksplit < ngrp; gi += 2u * ksplit) { V41_GEMV_BLK(gi); V41_GEMV_BLK(gi + ksplit); }
+        for (; gi < ngrp; gi += ksplit) V41_GEMV_BLK(gi);
+        #undef V41_GEMV_BLK
         #pragma unroll
         for (uint32_t t = 0; t < NT; t++) {
             float v = acc[t];
@@ -112,16 +128,20 @@ static int v41_fp4x32_gemv(const void *model_map, uint64_t model_size, uint64_t 
     if (off > model_size || wbytes > model_size - off) return 0;
     const uint8_t *w = (const uint8_t *)cuda_model_range_ptr(model_map, off, wbytes, what);
     if (!w) return 0;
-    /* ★2026-09-15 段 2★ 并行度目标从 2048 warp 提到 32768。
-     * 旧目标 2048 warp = 48 SM × 每 SM 约 43 warp = **1.1 个 wave** —— ncu 实测 gemv 的 launch
-     * 多落在 0.89~2.22 waves/SM: 一个 wave 的活付两个 wave 的延迟, 而且 warp 数根本不够盖
-     * LPDDR 的访存延迟(解码骨架 GEMV 只跑到 62 GB/s = 带宽墙 240 的 26%, 一个人吃掉每步 61.6 ms)。
-     * 32768 warp ≈ 每 SM 8 个 wave, 让访存延迟被后续 warp 盖住。总 warp 数 = out_dim × ksplit × n_groups
-     * (一 block 恒 8 warp, 管 8/ksplit 行)。ksplit 上限仍是 8 —— 再大就 rows_per_block < 1。
-     * ★数值★: ksplit 变了 = K 维分段变了, 段和按 red[] 固定序相加(仍然确定), 但与 ksplit=1 不是逐位同,
-     * 所以门是 speed-bench/prefill_2048_ruler.sh 的 NLL/PPL, 不是逐位。 */
+    /* ★并行度目标: 2048(段 2 前) → 32768(段 2) → 8192(single.md S5, 09-16)★
+     * 这个数字是"并行度"与"激活复用"的折中, 两边都实测过:
+     *   ksplit 大 ⇒ 一 block 管的行少(rpb = 8/ksplit), 同一条激活被更多 block 各读一遍。
+     *   wo_b 那种 [5120][8192]: ksplit=8 时 rpb=1, 32 KB 激活被 5120 个 block 读 = 164 MB,
+     *   而权重才 22 MB —— ncu 实测这个核 24.92 个扇区/请求(理想 4), 一大半是激活重读。
+     * 扫过三档(同机器状态中位): 32768 = 56.0 ms / **8192 = 55.7** / 4096 = 57.0。
+     * 8192 让 wo_b/wq_b/head 这些大矩阵回到 rpb=8(激活复用 8 倍), 小矩阵(wkv/wq_a)仍吃满 ksplit=8。
+     * ★别再往下调★: 4096 时小矩阵的 warp 数不够盖访存延迟, 反而退(2048 那一版更是只有 1.1 个 wave,
+     *   gemv 只跑到 62 GB/s)。总 warp 数 = out_dim × ksplit × n_groups(一 block 恒 8 warp, 管 8/ksplit 行);
+     *   ksplit 上限是 8 —— 再大 rows_per_block 就不足 1。
+     * ★数值★: ksplit 变了 = K 维分段变了, 段和按 red[] 固定序相加(仍然确定), 但与别的 ksplit 不是逐位同,
+     *   所以门是 speed-bench/prefill_2048_ruler.sh 的 NLL/PPL, 不是逐位。 */
     uint32_t ksplit = 1;
-    while (ksplit < 8u && out_dim * ksplit * n_groups < 32768u) ksplit <<= 1;
+    while (ksplit < 8u && out_dim * ksplit * n_groups < 8192u) ksplit <<= 1;
     /* ★K 的分段单位现在是"8 个 k 块一组"(见核里的 lane 排布注释)★ 分不出这么多组就把 ksplit 收回来,
      * 否则多出来的 warp 一轮都跑不到(in_dim=1280 只有 5 组, ksplit=8 时 8 个 warp 里 3 个是空转)。 */
     const uint32_t ngrp = (uint32_t)((in_dim / 32u + 7u) / 8u);
