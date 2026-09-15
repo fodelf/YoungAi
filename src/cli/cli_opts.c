@@ -328,6 +328,10 @@ cli_config parse_options(int argc, char **argv) {
             c.gen.v41_no_engram = 1;
         } else if (!strcmp(arg, "--v41-chunk")) {
             c.gen.v41_chunk = atoi(need_arg(&i, argc, argv, arg));
+        } else if (!strcmp(arg, "--decoder-full")) {
+            c.gen.decoder_full = 1;
+        } else if (!strcmp(arg, "--no-dspark")) {
+            c.gen.no_dspark = 1;
         } else if (!strcmp(arg, "--v41-prof")) {
             c.gen.v41_prof = 1;
         } else if (!strcmp(arg, "--dump-logprobs")) {

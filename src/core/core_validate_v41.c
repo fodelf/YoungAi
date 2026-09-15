@@ -71,6 +71,35 @@ void v41_load_metadata(const ds4_model *m) {
         if (v->is_kv_source[il] && !v->is_index_source[il])
             ds4_die("V4.1: a kv source layer must also be an index source (indexer keys come from its latent)");
     }
+    /* DSpark 三塔: 可选 —— 09-15 之前转出来的 GGUF 没带, 那时 mtp_towers=0, 引擎就走纯单 token 解码。
+     * 不用 required_u32: 那会让旧模型直接起不来(铁律: 不破坏已有产物)。 */
+    if (!model_get_u32(m, "deepseek4.mtp.tower_count", &v->mtp_towers)) v->mtp_towers = 0;
+    if (!model_get_u32(m, "deepseek4.mtp.expert_count", &v->mtp_experts)) v->mtp_experts = 0;
+    if (v->mtp_towers > DS4_MTP_MAX_TOWERS || v->mtp_experts > DS4_MTP_MAX_EXPERTS)
+        ds4_die("mtp tower/expert count over engine limit");
+    /* 草稿器跑起来要的五件(speed.md 段 6 D1)。同样可选: 少一件就把 mtp_block 归零 = 投机路不武装,
+     * 引擎照常单 token 解码 —— 不猜默认值(猜错了不报错, 只是草稿全不对, 接受率掉到 0)。 */
+    for (uint32_t i = 0; i < DS4_MAX_LAYER; i++) v->mtp_target_slot[i] = -1;
+    if (v->mtp_towers) {
+        uint32_t blk = 0, used = 0, noise = 0, rank = 0;
+        const int have = model_get_u32(m, "deepseek4.mtp.block_size", &blk) &&
+                         model_get_u32(m, "deepseek4.mtp.expert_used_count", &used) &&
+                         model_get_u32(m, "deepseek4.mtp.noise_token_id", &noise) &&
+                         model_get_u32(m, "deepseek4.mtp.markov_rank", &rank);
+        int32_t tids[DS4_MTP_MAX_TOWERS * 2];
+        const uint32_t nt = have ? v41_arr_i32(m, "deepseek4.mtp.target_layers", tids, DS4_MTP_MAX_TOWERS * 2) : 0;
+        if (have && nt) {
+            v->mtp_block = blk; v->mtp_used = used; v->mtp_noise_id = noise; v->mtp_markov_rank = rank;
+            v->n_mtp_target = nt;
+            for (uint32_t i = 0; i < nt; i++) {
+                if (tids[i] < 0 || (uint32_t)tids[i] >= DS4_N_LAYER) ds4_die("mtp target layer out of range");
+                v->mtp_target[i] = (int16_t)tids[i];
+                v->mtp_target_slot[tids[i]] = (int16_t)i;
+            }
+        } else {
+            fprintf(stderr, "ds4: [v41] 这份 GGUF 带了三塔但没带 DSpark 运行参数(block_size/target_layers 等) ⇒ 投机解码不武装\n");
+        }
+    }
     v->candidate_source_layer = (int32_t)required_u32(m, "deepseek4.attention.candidate.source_layer");
     v->candidate_topk_blocks = (int32_t)required_u32(m, "deepseek4.attention.candidate.topk_blocks");
     v->candidate_block_size = (int32_t)required_u32(m, "deepseek4.attention.candidate.block_size");

@@ -19,6 +19,7 @@ static unsigned ds4_grid_cap(void) {
 #include <cuda_pipeline_primitives.h>
 #include <mma.h>
 #include <cublas_v2.h>
+#include <cublasLt.h>   /* V4.1 预填 NVFP4 张量核路(cuda_v41_nvfp4.inc.cu)要块缩放 matmul */
 #include <cub/block/block_radix_sort.cuh>
 
 #include <stdint.h>

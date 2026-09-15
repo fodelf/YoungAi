@@ -32,6 +32,10 @@ enum {
      * + 1 B scale(e8m0, 值 = 2^(e-127)) = 17 B / 32 元素 = 4.25 bpw。值 = nibble 表 × scale。
      * 与 HF 出厂专家/我们量化器的 FP4 1×32 块语义逐位同, 只是把 weight/scale 两张量交织成 GGUF 块。 */
     DS4_GGT_FP4X32  = 43,
+    /* 本仓自定: FP8 E4M3 + 32×32 块 ue8m0 缩放(engram wkv 的官方盘上格式, 2026-09-15 clear.md C1)。
+     * 字节布局 = 先 rows×cols 个 e4m3, 紧跟 ceil(rows/32)×ceil(cols/32) 个 ue8m0 缩放字节。
+     * 不是逐行块(所以进不了 gguf_types 的 block/size 表), shape 记 [cols][rows], 字节数显式给。 */
+    DS4_GGT_FP8_32X32 = 44,
 };
 
 /* 类型几何: 每块元素数 blk 与每块字节数 tsz。认识返回 1, 不认识返回 0。 */

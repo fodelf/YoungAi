@@ -63,9 +63,17 @@
 #include "src/cuda/cuda_vq.inc.cu"
 #include "src/cuda/cuda_vq_prefill.inc.cu"
 #include "src/cuda/cuda_v41_1.inc.cu"   /* DeepSeek V4.1 批前向原语 ①②③(2026-09-12): 稠密/hc/norm | rope/量化/indexer/attn | 路由/MoE */
+#include "src/cuda/cuda_sparse_attn_mma.inc.cu"   /* 稀疏注意力张量核版(speed.md 段 4); 必须在 v41_1 之后(用 v41_bf16r)、v41_2 之前(被它调) */
+#include "src/cuda/cuda_v41_hc.inc.cu"   /* mHC 一族(mix/sinkhorn/hc_pre/hc_post/合一核); 在 v41_1 之后(用它的 bf16r 与暂存槽) */
+#include "src/cuda/cuda_v41_attn_split.inc.cu"   /* 解码路稀疏注意力 split-K(single.md S4); 在 v41_2 之前(被它调) */
 #include "src/cuda/cuda_v41_2.inc.cu"
 #include "src/cuda/cuda_v41_3.inc.cu"
 #include "src/cuda/cuda_v41_4.inc.cu"   /* V4.1 解码小批融合核(fp4x32 GEMV / VQ 即乘 / 缩放舍入 / argmax) */
+#include "src/cuda/cuda_v41_draft.inc.cu"   /* DSpark 草稿塔(speed.md 段 6 D1): 逐专家 FP4 dense MoE / hc 四路均值 / markov 行 gather; 必须在 v41_4 之后(用它的 reduce 核与暂存槽) */
+#include "src/cuda/cuda_v41_gemv_highprec.inc.cu"   /* 非 FP4 权重(BF16 gate/compressor/indexer, F32 mHC)的小批 GEMV; clear.md C1 过门后整片删 */
+#include "src/cuda/cuda_v41_nvfp4.inc.cu"   /* V4.1 预填稠密 GEMM 走 NVFP4 张量核(2026-09-15 speed.md S1) */
+#include "src/cuda/cuda_vq_prefill_nvfp4.inc.cu"   /* 预填专家: VQ 解到 NVFP4 暂存 + 板子原生 FP4 张量核(speed.md 段 5); 在融合路之前, 被它调 */
+#include "src/cuda/cuda_vq_prefill_fused.inc.cu"   /* 预填专家: VQ 解码即乘, 不落 f16 暂存(2026-09-15 第三轮) */
 #include "src/cuda/cuda_vq_fused2_0.inc.cu"
 #include "src/cuda/cuda_vq_fused2_1.inc.cu"
 #include "src/cuda/cuda_vq_fused2_2.inc.cu"

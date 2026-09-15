@@ -15,51 +15,93 @@
  * grid (ceil(out_dim/(8/ksplit)), n_groups), block 256 = 8 warp; 同一行由 ksplit 个 warp 分 K 段(块号 ≡ kpart mod ksplit),
  * 各自 lane 取块内第 l 个元素(半字节 p[l/2] + 共用 scale p[16]; x 读 128 B 连续, 权重读同扇区), 段和经 shared 按固定序相加。
  * n_groups>1 = 块对角(wo_a): 第 g 组权重/输入/输出各按步长偏移。round_out: 出口直接舍 bf16(省一次 round 核)。 */
+/* ★2026-09-15 段 2: 按 token 数 NT 模板特化★
+ * 病因: 内层原来是 `#pragma unroll over V41_GEMV_MAX_TOK(=8)` 再用 `if (t < n_tok)` 挡掉多余的。
+ * n_tok 是运行期值, 所以编译器老老实实展开 8 份带谓词的代码 —— **解码时 n_tok=1, 八分之七的指令
+ * 是白跑的**。不能改成 `for (t < n_tok)` 动态循环, 因为 acc[t] 用动态下标会掉进 local memory。
+ * 正解是把 token 数变成模板参数: NT=1 时内层就是一条 FFMA, acc 就是一个寄存器。
+ * 实测背景: 提占用率(ksplit 目标 2048→32768)只换来 3%, 一 warp 管 4 行更是慢 2.8 倍 ⇒ 这个核
+ * 既不是延迟受限也不是激活重读受限, 剩下的嫌疑就是指令数。★数值逐位同: 只是把死代码删掉。★ */
+template <uint32_t NT>
 __global__ static void v41_fp4x32_gemv_kernel(float *out, const uint8_t *w, const float *x, uint32_t in_dim, uint32_t out_dim,
-                                              uint32_t n_tok, uint32_t x_stride, uint32_t out_stride, uint32_t ksplit,
+                                              uint32_t x_stride, uint32_t out_stride, uint32_t ksplit,
                                               uint64_t w_gstride, uint32_t x_gstride, uint32_t out_gstride, int round_out) {
     const uint32_t g = blockIdx.y;
     w += (uint64_t)g * w_gstride; x += (uint64_t)g * x_gstride; out += (uint64_t)g * out_gstride;
     const uint32_t warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
     const uint32_t rows_per_block = 8u / ksplit, rloc = warp / ksplit, kpart = warp % ksplit;
     const uint32_t r = blockIdx.x * rows_per_block + rloc;
-    __shared__ float red[8][V41_GEMV_MAX_TOK];
-    float acc[V41_GEMV_MAX_TOK];
+    __shared__ float red[8][NT];
+    float acc[NT];
     #pragma unroll
-    for (uint32_t t = 0; t < V41_GEMV_MAX_TOK; t++) acc[t] = 0.f;
+    for (uint32_t t = 0; t < NT; t++) acc[t] = 0.f;
+    /* ★09-15 判负存档: "把整条激活载进 shared 让全 block 共用"★
+     * 想法: 每个 warp 管一行, 内层每个权重块都为 32 个 lane 读 128 B 激活并重新舍一遍 bf16, 而一条激活
+     * 才 ≤32 KB 却被 block 里 8 行各读各舍一遍。实测 **44.7 → 74.3 ms/token(慢 66%)**, 回退。
+     * 原因和 09-15 那四个"省访存"的假设同源: L1 本来就把这条激活接住了, 换成 shared 反而多付一次
+     * 写入 + 一次 __syncthreads, 还把 32 KB shared 占掉压低了占用率。 */
     if (r < out_dim) {
         const uint32_t nblk = in_dim / 32u;
         const uint8_t *wr = w + (uint64_t)r * nblk * 17u;
-        const uint32_t half = lane >> 1, hi = lane & 1u;
-        for (uint32_t b = kpart; b < nblk; b += ksplit) {
+        /* ★2026-09-15 段 2: 一个 lane 从"管 1 个元素"改成"管 4 个字节 = 8 个元素"★
+         * 病因(接着模板特化那一针往下挖): 旧排布里 lane l 只负责块内第 l 个元素, 于是每算一次乘加要付
+         * 权重字节读 + scale 字节读 + e8m0 解码 + nibble 解码 + 激活读 + bf16 舍 —— 6 条指令换 1 次 FFMA,
+         * 而 scale 是整块共用的却被 32 个 lane 各读各解一遍。改成 4 个 lane 分一个块(每 lane 拿 4 个连续字节),
+         * scale 的读与解码摊到 8 个元素上(省 8 倍), 权重字节读从每元素 2 次降到 0.625 次。
+         * ★排布与旧版逐元素对得上★: 块内元素 e ↔ 字节 e/2, 偶数是低半字节、奇数是高半字节(旧版 half/hi 同义);
+         * lane 只是换了负责哪几个 e, 权重与激活的配对一个都没动。
+         * ★数值★: 段和的相加次序变了(warp 规约里各 lane 的分担变了), 与旧版不是逐位同 ⇒ 门是 NLL/PPL 尺, 不是逐位。
+         * ★一 warp 一轮覆盖 8 个 k 块★, 所以 K 的分段单位从"块"变成"8 块一组", ksplit 语义不变。 */
+        const uint32_t q = lane & 3u, sub = lane >> 2;
+        const uint32_t ngrp = (nblk + 7u) / 8u;
+        for (uint32_t gi = kpart; gi < ngrp; gi += ksplit) {
+            const uint32_t b = gi * 8u + sub;
+            if (b >= nblk) continue;   /* 尾组: in_dim/32 不是 8 的倍数时有空位, 不能 break(别的 lane 还有活) */
             const uint8_t *p = wr + (uint64_t)b * 17u;
-            const uint8_t byte = p[half];
-            const float wv = ds4_fp4_nibble_to_f32(hi ? (byte >> 4) : (byte & 0x0F)) * ds4_e8m0_to_f32(p[16]);
-            const float *xb = x + b * 32u + lane;
+            const float sc = ds4_e8m0_to_f32(p[16]);
+            /* ★4 个字节一次读进来★: 块跨距是 17 B(16 B nibble + 1 B scale), 天然不对齐, 所以原来写成
+             * 4 次单字节取 —— 那是 4 条 LDG.U8 换 8 次乘加。memcpy 4 B 让编译器发一条非对齐 32 位读
+             * (同一个 32 B 扇区内, L1 一次命中), 指令少 3 条。★字节一个没变, 数值逐位同。★ */
+            uint32_t w4; memcpy(&w4, p + q * 4u, 4);
+            float wv[8];
             #pragma unroll
-            for (uint32_t t = 0; t < V41_GEMV_MAX_TOK; t++)
-                if (t < n_tok) acc[t] += wv * v41_bf16r(xb[(uint64_t)t * x_stride]);
+            for (uint32_t j = 0; j < 4u; j++) {
+                const uint32_t byte = (w4 >> (8u * j)) & 0xFFu;
+                wv[2u * j]      = ds4_fp4_nibble_to_f32(byte & 0x0Fu) * sc;
+                wv[2u * j + 1u] = ds4_fp4_nibble_to_f32(byte >> 4) * sc;
+            }
+            const float *xb = x + b * 32u + q * 8u;
+            #pragma unroll
+            for (uint32_t t = 0; t < NT; t++) {
+                const float *xt = xb + (uint64_t)t * x_stride;
+                #pragma unroll
+                for (uint32_t j = 0; j < 8u; j++) acc[t] += wv[j] * v41_bf16r(xt[j]);
+            }
         }
         #pragma unroll
-        for (uint32_t t = 0; t < V41_GEMV_MAX_TOK; t++) {
-            if (t >= n_tok) break;
+        for (uint32_t t = 0; t < NT; t++) {
             float v = acc[t];
             for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
             acc[t] = v;
         }
     }
     if (ksplit > 1u) {
-        if (lane == 0) { for (uint32_t t = 0; t < n_tok; t++) red[warp][t] = acc[t]; }
+        if (lane == 0) {
+            #pragma unroll
+            for (uint32_t t = 0; t < NT; t++) red[warp][t] = acc[t];
+        }
         __syncthreads();
         if (kpart == 0 && lane == 0 && r < out_dim) {
-            for (uint32_t t = 0; t < n_tok; t++) {
+            #pragma unroll
+            for (uint32_t t = 0; t < NT; t++) {
                 float v = 0.f;
                 for (uint32_t k = 0; k < ksplit; k++) v += red[rloc * ksplit + k][t];
                 out[(uint64_t)t * out_stride + r] = round_out ? v41_bf16r(v) : v;
             }
         }
     } else if (lane == 0 && r < out_dim) {
-        for (uint32_t t = 0; t < n_tok; t++) out[(uint64_t)t * out_stride + r] = round_out ? v41_bf16r(acc[t]) : acc[t];
+        #pragma unroll
+        for (uint32_t t = 0; t < NT; t++) out[(uint64_t)t * out_stride + r] = round_out ? v41_bf16r(acc[t]) : acc[t];
     }
 }
 static int v41_fp4x32_gemv(const void *model_map, uint64_t model_size, uint64_t off, uint64_t in_dim, uint64_t out_dim,
@@ -70,11 +112,32 @@ static int v41_fp4x32_gemv(const void *model_map, uint64_t model_size, uint64_t 
     if (off > model_size || wbytes > model_size - off) return 0;
     const uint8_t *w = (const uint8_t *)cuda_model_range_ptr(model_map, off, wbytes, what);
     if (!w) return 0;
-    uint32_t ksplit = 1;   /* 小矩阵填不满 GPU: 行数×ksplit ≥ 2048 个 warp(48 SM × ~40 warp) */
-    while (ksplit < 8u && out_dim * ksplit * n_groups < 2048u) ksplit <<= 1;
+    /* ★2026-09-15 段 2★ 并行度目标从 2048 warp 提到 32768。
+     * 旧目标 2048 warp = 48 SM × 每 SM 约 43 warp = **1.1 个 wave** —— ncu 实测 gemv 的 launch
+     * 多落在 0.89~2.22 waves/SM: 一个 wave 的活付两个 wave 的延迟, 而且 warp 数根本不够盖
+     * LPDDR 的访存延迟(解码骨架 GEMV 只跑到 62 GB/s = 带宽墙 240 的 26%, 一个人吃掉每步 61.6 ms)。
+     * 32768 warp ≈ 每 SM 8 个 wave, 让访存延迟被后续 warp 盖住。总 warp 数 = out_dim × ksplit × n_groups
+     * (一 block 恒 8 warp, 管 8/ksplit 行)。ksplit 上限仍是 8 —— 再大就 rows_per_block < 1。
+     * ★数值★: ksplit 变了 = K 维分段变了, 段和按 red[] 固定序相加(仍然确定), 但与 ksplit=1 不是逐位同,
+     * 所以门是 speed-bench/prefill_2048_ruler.sh 的 NLL/PPL, 不是逐位。 */
+    uint32_t ksplit = 1;
+    while (ksplit < 8u && out_dim * ksplit * n_groups < 32768u) ksplit <<= 1;
+    /* ★K 的分段单位现在是"8 个 k 块一组"(见核里的 lane 排布注释)★ 分不出这么多组就把 ksplit 收回来,
+     * 否则多出来的 warp 一轮都跑不到(in_dim=1280 只有 5 组, ksplit=8 时 8 个 warp 里 3 个是空转)。 */
+    const uint32_t ngrp = (uint32_t)((in_dim / 32u + 7u) / 8u);
+    while (ksplit > 1u && ksplit > ngrp) ksplit >>= 1;
     const uint32_t rpb = 8u / ksplit;
-    v41_fp4x32_gemv_kernel<<<dim3((unsigned)((out_dim + rpb - 1u) / rpb), n_groups), 256, 0, g_cur_stream>>>(
-        out, w, x, (uint32_t)in_dim, (uint32_t)out_dim, n_tok, x_stride, out_stride, ksplit, wg, x_gstride, out_gstride, round_out);
+    const dim3 grid((unsigned)((out_dim + rpb - 1u) / rpb), n_groups);
+    /* NT 是模板参数 ⇒ 按实际 token 数挑一份实例(解码恒走 NT=1 那份, 内层只有一条 FFMA) */
+    #define V41_GEMV_LAUNCH(NT) v41_fp4x32_gemv_kernel<NT><<<grid, 256, 0, g_cur_stream>>>( \
+        out, w, x, (uint32_t)in_dim, (uint32_t)out_dim, x_stride, out_stride, ksplit, wg, x_gstride, out_gstride, round_out)
+    switch (n_tok) {
+        case 1: V41_GEMV_LAUNCH(1u); break;  case 2: V41_GEMV_LAUNCH(2u); break;
+        case 3: V41_GEMV_LAUNCH(3u); break;  case 4: V41_GEMV_LAUNCH(4u); break;
+        case 5: V41_GEMV_LAUNCH(5u); break;  case 6: V41_GEMV_LAUNCH(6u); break;
+        case 7: V41_GEMV_LAUNCH(7u); break;  default: V41_GEMV_LAUNCH(8u); break;
+    }
+    #undef V41_GEMV_LAUNCH
     return cuda_ok(cudaGetLastError(), what);
 }
 
@@ -119,6 +182,13 @@ __device__ __forceinline__ static float v41_vq_row_dot(const v41_vq_mat &m, uint
     __half gh; memcpy(&gh, m.gr + (size_t)r * 2u, 2);
     return acc * __half2float(gh) * (m.gov ? m.gov[r] : 1.0f);
 }
+/* ★2026-09-15 single.md S2 判负存档: "码本条目改 20 B 跨距消 bank conflict"★
+ * 假设: 条目 16 B = 4 个 bank, 32 个 lane 拿随机码本号 v, 地址 v*16 落在 bank 组 (v*4)%32 只有 8 个值
+ * ⇒ 平均 4 路冲突。改 20 B(5 bank, gcd(5,32)=1)让它铺满 32 个 bank。
+ * 实测 **58.7 → 59.9 ms(持平偏慢)**, 回退。两个原因: ①20 B 不是 8 的倍数, uint2 读直接
+ * misaligned 崩(CUDA flush failed: misaligned address), 只能退成 4 次 uint 读, 多出来的指令
+ * 吃掉了省下的冲突; ②8 的倍数的跨距做不到 bank 全覆盖(stride/4 必为偶数) —— 对齐与全覆盖互斥。
+ * ⇒ 这个核的瓶颈也不是 shared bank。 */
 __device__ __forceinline__ static void v41_vq_cb_to_shared(uint8_t *dst, const uint8_t *src, uint32_t bytes) {   /* bytes 是 8 的倍数 */
     const uint2 *s = (const uint2 *)src; uint2 *d = (uint2 *)dst;
     for (uint32_t i = threadIdx.x; i < bytes / 8u; i += blockDim.x) d[i] = s[i];
@@ -128,7 +198,14 @@ __device__ __forceinline__ static void v41_vq_cb_to_shared(uint8_t *dst, const u
  * 为什么必须循环而不是一 block 32 行: 码本 64 KB 占满设备每 block 动态 shared 上限(GB10 = 99 KB)的一大半,
  * 每个 SM 只塞得下 1 个 block; 一 block 只算 32 行就重搬一次 64 KB, 而这 32 行的索引流才 30 KB ——
  * 搬运是有效数据的 2 倍多, 40 层累计好几 GB。行数翻 8 倍, 码本搬运就摊薄 8 倍, 有效带宽利用直接上去。 */
-#define V41_VQ_ITERS   8u
+/* ★2026-09-15 段 2 下调 8 → 2★: 上面那笔"摊薄码本搬运"的账只算了 L2 流量, 漏了**尾巴**。
+ * 码本 64 KB ⇒ 每个 SM 只驻 1 个 block, 而 ITERS=8 时 grid = (2304/256, 6 专家) = **54 个 block**
+ * 撒在 48 个 SM 上 = ncu 实测 1.12 waves/SM: 第二个 wave 只有 6 个 block 在跑、42 个 SM 干等,
+ * 这个核一个人吃掉解码每步 21 ms。ITERS=2 ⇒ 一 block 64 行 ⇒ grid 216 = 4.5 waves, 尾巴损失从
+ * 约一半降到约一成。多出来的码本搬运是 L2 命中(6 个专家的码本合计 384 KB, 远小于 24 MB L2),
+ * 每层多几微秒, 换回来的是几十微秒。★口径没变, 数值逐位同 —— 只是行怎么分给 block。★
+ * (09-15 长尾修掉后重扫 ITERS: 2 = 58.7 ms < 4 = 59.8 < 8 = 63.0, 维持 2。) */
+#define V41_VQ_ITERS   2u
 #define V41_VQ_SH_ROWS (32u * V41_VQ_ITERS)
 /* gate/up 同核(官方 Expert: w1/w3 出 bf16 → f32 截断 → silu(g)·u → bf16); cb_bytes>0: 码本进 shared(grid.x 按 32 行),
  * 否则全局 gather(grid.x 按 8 行)。x 已是 bf16 格点(调用方 rms_norm 出口舍过)。 */

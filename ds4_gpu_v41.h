@@ -52,6 +52,18 @@ int ds4_gpu_v41_hc_split_tensor(ds4_gpu_tensor *pre, ds4_gpu_tensor *post, ds4_g
                                 uint64_t scale_offset, uint64_t base_offset, uint32_t n_hc, uint32_t iters,
                                 float eps, uint32_t n_tok);
 
+/* ★合一(single.md S3)★: hc_split + hc_pre + rms_norm 一发做完。解码一步有约 900 发这种"读几十 KB、
+ * 花几微秒"的小核, 时间全在启动与排空。三件是同一条串行链, 中间量照旧写回(别人还要用), 只是不再各起一发。
+ * pre/post/comb = 本层 split 的输出; pre_in = **上一层**传下来的 pre(hc_pre 用它, 别用错); x/xn = 出口。
+ * 数值与三发版逐位同(sinkhorn 同序、c 循环同序、rms 归约同形状)。 */
+int ds4_gpu_v41_hc_fused_tensor(ds4_gpu_tensor *pre, ds4_gpu_tensor *post, ds4_gpu_tensor *comb,
+                                ds4_gpu_tensor *x, ds4_gpu_tensor *xn, const ds4_gpu_tensor *mix,
+                                const ds4_gpu_tensor *hc, const ds4_gpu_tensor *pre_in,
+                                const void *model_map, uint64_t model_size,
+                                uint64_t scale_offset, uint64_t base_offset, uint64_t norm_offset,
+                                uint32_t n_embd, uint32_t n_hc, uint32_t iters, float hc_eps, float norm_eps,
+                                uint32_t n_tok);
+
 /* hc_pre: out[n][d] = Σ_c pre[n][c]·hc[n][c][d] (f32 累加, 结果舍 bf16) */
 int ds4_gpu_v41_hc_pre_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *hc, const ds4_gpu_tensor *pre,
                               uint32_t n_embd, uint32_t n_hc, uint32_t n_tok);
@@ -104,12 +116,15 @@ int ds4_gpu_v41_indexer_topk_tensor(ds4_gpu_tensor *idx, const ds4_gpu_tensor *s
 /* 稀疏注意力(官方 sparse_attn 逐式, 在线 softmax, sink 只进分母):
  * q[n][h][d]; kv_win[(window+n)][d] 窗口缓冲: 行 r ↔ 绝对位置 pos0-window+r(前 window 行是历史, 后 n 行是本 chunk),
  * 第 i 个 query 看位置 [max(0, p+1-window), p], p = pos0+i; kv_comp[ng][d] + idx[n][topk](组号, -1 无);
- * o[n][h][d] f32(官方出 bf16, 由调用方舍)。 */
+ * o[n][h][d] f32(官方出 bf16, 由调用方舍)。
+ * full_block≠0(DSpark 草稿块专用): 本 chunk 的 n 行**互相全可见**, 不做因果截断 —— 官方
+ * get_dspark_topk_idxs 给每一位的候选都是"整个窗口 + 整块 block_size 位", 块内 5 个草稿位同时出。
+ * 主路一律传 0; 传错不报错, 只是草稿位看见了未来(或主路漏看), 症状是接受率异常。 */
 int ds4_gpu_v41_sparse_attn_tensor(ds4_gpu_tensor *o, const ds4_gpu_tensor *q, const ds4_gpu_tensor *kv_win,
                                    const ds4_gpu_tensor *kv_comp, const ds4_gpu_tensor *idx,
                                    const void *model_map, uint64_t model_size, uint64_t sink_offset,
                                    uint32_t n_tok, uint32_t pos0, uint32_t window, uint32_t ng, uint32_t topk,
-                                   uint32_t n_head, uint32_t head_dim, float scale);
+                                   uint32_t n_head, uint32_t head_dim, float scale, int full_block);
 
 /* 路由(官方 Gate, sqrtsoftplus): logits[n][E] f32 → probs=√softplus; (probs+bias) 选 topk;
  * weights = probs/Σ(+1e-20)·route_scale; selected[n][k] int32, weights[n][k] f32。 */
@@ -132,6 +147,14 @@ int ds4_gpu_v41_routed_moe_tensor(ds4_gpu_tensor *out, const void *model_map, ui
 
 /* f32 权重 GEMM(hc_fn / 压缩器 / 路由 gate_inp / indexer proj,wk / engram q,k): out[n][out_dim] = x·Wᵀ, 纯 f32 */
 int ds4_gpu_v41_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+                                  uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+                                  const ds4_gpu_tensor *x, uint32_t n_tok);
+/* BF16 权重(官方原生精度)版; clear.md C1 起 gate/compressor/indexer 走这条 */
+int ds4_gpu_v41_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+                                  uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+                                  const ds4_gpu_tensor *x, uint32_t n_tok);
+/* engram wkv: FP8 e4m3 + 32×32 块 ue8m0(官方盘上格式); clear.md C1 */
+int ds4_gpu_v41_matmul_fp8blk_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
                                   uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
                                   const ds4_gpu_tensor *x, uint32_t n_tok);
 
@@ -174,6 +197,30 @@ int ds4_gpu_v41_vq_capture_expert_out(float *host, uint32_t n_tok, uint32_t n_us
  * 生效方式 = VQ 解码时 g_eff[row] = 载荷里的 g_r[row] × s[e][row] —— 盘上权重一个字节不动, 不挂就是裸底座。
  * host=NULL 卸掉该层。解码 gemv 路与 prefill GEMM 路都吃这张表(两路同式, 判决与部署不分叉)。 */
 int ds4_gpu_v41_set_gr_override(uint32_t layer, const float *host, uint32_t n_expert, uint32_t out_dim);
+
+/* ---- DSpark 草稿塔(speed.md 段 6 D1; 实现在 src/cuda/cuda_v41_draft.inc.cu) ---- */
+
+/* 逐专家 FP4 的 dense MoE: out[n][out_dim] = Σ_k w[n][k]·Expert_{sel[n][k]}(x[n])。
+ * 与主路 routed MoE 的差别只在权重来源: 那边是一整个 VQ blob, 这边是 n_expert 个独立 fp4x32 张量,
+ * 所以要一张偏移表 exp_off[3][n_expert](gate/up/down 各一段, 主机数组, 内部解析成设备指针并按塔缓存)。 */
+int ds4_gpu_v41_mtp_moe_tensor(ds4_gpu_tensor *out, const void *model_map, uint32_t tower, const uint64_t *exp_off,
+                               uint32_t in_dim, uint32_t mid_dim, uint32_t out_dim,
+                               const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+                               uint32_t n_expert, uint32_t topk, float clamp,
+                               const ds4_gpu_tensor *x, uint32_t n_tok);
+
+/* hc 四路均值 → out[n][n_slot][E] 的第 slot 段(官方 main_hiddens.append(h.mean(dim=2))) */
+int ds4_gpu_v41_hc_mean_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *hc, uint32_t n_embd, uint32_t n_hc,
+                               uint32_t n_rows, uint32_t src_row0, uint32_t slot, uint32_t n_slot);
+
+/* 按设备上的 ids[which] 取表的一行 → out 的第 out_row 行(f32)。elem_bytes = 盘上这张表的元素字节
+ * (4 = f32, 2 = bf16), 由调用方按 GGUF 登记的类型给 —— 引擎不假设。 */
+int ds4_gpu_v41_row_gather_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+                                  uint64_t tab_offset, uint64_t n_rows, uint32_t dim, uint32_t elem_bytes,
+                                  const ds4_gpu_tensor *ids, uint32_t which, uint32_t out_row);
+
+/* dst 的第 dst_row 行(长 n) += src[0..n)(markov 偏置) */
+int ds4_gpu_v41_row_add_tensor(ds4_gpu_tensor *dst, uint64_t dst_row, const ds4_gpu_tensor *src, uint64_t n);
 
 #ifdef __cplusplus
 }

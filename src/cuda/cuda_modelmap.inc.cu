@@ -367,6 +367,17 @@ int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64
 #endif
 }
 
+/* 装进设备副本的总字节(single.md S1 的对账): core 侧拿它和"请求装的字节"比, 差值就是走主机映射的量。
+ * 为什么要报: 超预算时 ds4_gpu_cache_model_range 是**静默**返回 1 的(映射指针照样能读), 那几 GiB
+ * 就成了每步 5~25 ms 的长尾, 而启动日志上一个字都看不见。 */
+uint64_t ds4_gpu_model_cache_bytes(void) {
+#ifdef DS4_CUDA_SPARK_HBM_CACHE
+    return g_model_range_bytes;
+#else
+    return 0;
+#endif
+}
+
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label) {
     if (!model_map || bytes == 0) return 1;
     if (offset > model_size || bytes > model_size - offset) return 0;

@@ -213,6 +213,8 @@ typedef struct {
     ds4_tensor *ffn_down_shexp;
 } ds4_layer_weights;
 
+#include "core_draft_tower_types.h"
+
 typedef struct {
     ds4_tensor *token_embd;
     ds4_tensor *output_hc_base;
@@ -226,6 +228,7 @@ typedef struct {
     ds4_tensor *engram_primes;        /* I64 [n_engram][max_ngram-1][heads] */
     ds4_tensor *engram_offsets;       /* I64 [n_engram][(max_ngram-1)*heads] */
     ds4_layer_weights layer[DS4_MAX_LAYER];
+    ds4_draft_tower_weights mtp;   /* DSpark 三塔(speed.md 段 6); 定义见 core_draft_tower_types.h */
 } ds4_weights;
 
 typedef struct {

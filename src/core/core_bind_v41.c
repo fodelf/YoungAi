@@ -9,6 +9,12 @@
 #include "core_internal.h"
 
 static ds4_tensor *need(const ds4_model *m, const char *fmt, uint32_t il) { return required_tensorf(m, fmt, il); }
+/* 按整名取(三塔的专家名字里有两个数字, 那几个头则没有层号可带) */
+static ds4_tensor *required_tensor_name(const ds4_model *m, const char *name) {
+    ds4_tensor *t = model_find_tensor(m, name);
+    if (!t) { fprintf(stderr, "ds4: 缺张量 %s\n", name); exit(1); }
+    return t;
+}
 
 static void expect(const ds4_tensor *t, uint32_t type, uint32_t ndim, uint64_t d0, uint64_t d1) {
     if (!t) return;
@@ -84,6 +90,47 @@ void weights_bind_v41(ds4_weights *w, const ds4_model *m) {
         }
     }
 
+    /* ---- DSpark 三塔(speed.md 段 6, 2026-09-15): 结构与普通层同构, 专家不走 VQ 而是逐专家 FP4 ---- */
+    for (uint32_t T = 0; T < v->mtp_towers; T++) {
+        ds4_layer_weights *t = &w->mtp.tower[T];
+        t->hc_attn_fn     = need(m, "mtp.%u.hc_attn_fn.weight", T);
+        t->hc_attn_scale  = need(m, "mtp.%u.hc_attn_scale.weight", T);
+        t->hc_attn_base   = need(m, "mtp.%u.hc_attn_base.weight", T);
+        t->attn_norm      = need(m, "mtp.%u.attn_norm.weight", T);
+        t->attn_q_a       = need(m, "mtp.%u.attn_q_a.weight", T);
+        t->attn_q_a_norm  = need(m, "mtp.%u.attn_q_a_norm.weight", T);
+        t->attn_q_b       = need(m, "mtp.%u.attn_q_b.weight", T);
+        t->attn_kv        = need(m, "mtp.%u.attn_kv.weight", T);
+        t->attn_kv_a_norm = need(m, "mtp.%u.attn_kv_a_norm.weight", T);
+        t->attn_sinks     = need(m, "mtp.%u.attn_sinks.weight", T);
+        t->attn_output_a  = need(m, "mtp.%u.attn_output_a.weight", T);
+        t->attn_output_b  = need(m, "mtp.%u.attn_output_b.weight", T);
+        t->hc_ffn_fn      = need(m, "mtp.%u.hc_ffn_fn.weight", T);
+        t->hc_ffn_scale   = need(m, "mtp.%u.hc_ffn_scale.weight", T);
+        t->hc_ffn_base    = need(m, "mtp.%u.hc_ffn_base.weight", T);
+        t->ffn_norm       = need(m, "mtp.%u.ffn_norm.weight", T);
+        t->ffn_gate_inp   = need(m, "mtp.%u.ffn_gate_inp.weight", T);
+        t->ffn_exp_probs_b= need(m, "mtp.%u.exp_probs_b.bias", T);
+        t->ffn_gate_shexp = need(m, "mtp.%u.ffn_gate_shexp.weight", T);
+        t->ffn_up_shexp   = need(m, "mtp.%u.ffn_up_shexp.weight", T);
+        t->ffn_down_shexp = need(m, "mtp.%u.ffn_down_shexp.weight", T);
+        for (uint32_t e = 0; e < v->mtp_experts; e++) {
+            char nm[96];
+            snprintf(nm, sizeof nm, "mtp.%u.ffn_exp.%u.gate.weight", T, e); w->mtp.exp_gate[T][e] = required_tensor_name(m, nm);
+            snprintf(nm, sizeof nm, "mtp.%u.ffn_exp.%u.up.weight", T, e);   w->mtp.exp_up[T][e]   = required_tensor_name(m, nm);
+            snprintf(nm, sizeof nm, "mtp.%u.ffn_exp.%u.down.weight", T, e); w->mtp.exp_down[T][e] = required_tensor_name(m, nm);
+        }
+    }
+    if (v->mtp_towers) {
+        w->mtp.main_proj   = required_tensor_name(m, "mtp.main_proj.weight");
+        w->mtp.main_norm   = required_tensor_name(m, "mtp.main_norm.weight");
+        w->mtp.markov_embd = required_tensor_name(m, "mtp.markov_embd.weight");
+        w->mtp.markov_head = required_tensor_name(m, "mtp.markov_head.weight");
+        w->mtp.confidence  = required_tensor_name(m, "mtp.confidence.weight");
+        w->mtp.out_norm    = required_tensor_name(m, "mtp.out_norm.weight");
+        fprintf(stderr, "ds4: [v41] DSpark 三塔已接线: %u 塔 × %u 专家\n", v->mtp_towers, v->mtp_experts);
+    }
+
     /* ---- 形状/类型校验: 一处错就停(V4.1 的格式解错不报错只出假数) ---- */
     const uint64_t E = DS4_N_EMBD, hc_dim = (uint64_t)E * DS4_N_HC, mix = 2u * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM, out_low = (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O;
@@ -114,27 +161,27 @@ void weights_bind_v41(ds4_weights *w, const ds4_model *m) {
         expect(l->attn_output_a, DS4_TENSOR_FP4X32, 2, grp_in, out_low);
         expect(l->attn_output_b, DS4_TENSOR_FP4X32, 2, out_low, E);
         if (v->is_kv_source[il]) {
-            expect(l->attn_compressor_kv, DS4_TENSOR_F32, 2, E, DS4_N_HEAD_DIM);
-            if (ratio > 1) expect(l->attn_compressor_gate, DS4_TENSOR_F32, 2, E, DS4_N_HEAD_DIM);
+            expect(l->attn_compressor_kv, DS4_TENSOR_BF16, 2, E, DS4_N_HEAD_DIM);
+            if (ratio > 1) expect(l->attn_compressor_gate, DS4_TENSOR_BF16, 2, E, DS4_N_HEAD_DIM);
             expect(l->attn_compressor_norm, DS4_TENSOR_F32, 1, DS4_N_HEAD_DIM, 0);
-            expect(l->indexer_wk, DS4_TENSOR_F32, 2, DS4_N_HEAD_DIM, DS4_N_INDEXER_HEAD_DIM);
+            expect(l->indexer_wk, DS4_TENSOR_BF16, 2, DS4_N_HEAD_DIM, DS4_N_INDEXER_HEAD_DIM);
             expect(l->indexer_k_norm, DS4_TENSOR_F32, 1, DS4_N_INDEXER_HEAD_DIM, 0);
         }
         if (v->is_index_source[il]) {
             expect(l->indexer_attn_q_b, DS4_TENSOR_FP4X32, 2, DS4_N_LORA_Q, (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM);
-            expect(l->indexer_proj, DS4_TENSOR_F32, 2, E, DS4_N_INDEXER_HEAD);
+            expect(l->indexer_proj, DS4_TENSOR_BF16, 2, E, DS4_N_INDEXER_HEAD);
         }
         expect(l->hc_ffn_fn, DS4_TENSOR_F32, 2, hc_dim, mix);
         expect(l->hc_ffn_scale, DS4_TENSOR_F32, 1, 3, 0);
         expect(l->hc_ffn_base, DS4_TENSOR_F32, 1, mix, 0);
         expect(l->ffn_norm, DS4_TENSOR_F32, 1, E, 0);
-        expect(l->ffn_gate_inp, DS4_TENSOR_F32, 2, E, DS4_N_EXPERT);
+        expect(l->ffn_gate_inp, DS4_TENSOR_BF16, 2, E, DS4_N_EXPERT);
         expect(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, DS4_N_EXPERT, 0);
         expect(l->ffn_gate_shexp, DS4_TENSOR_FP4X32, 2, E, DS4_N_FF_EXP);
         expect(l->ffn_up_shexp, DS4_TENSOR_FP4X32, 2, E, DS4_N_FF_EXP);
         expect(l->ffn_down_shexp, DS4_TENSOR_FP4X32, 2, DS4_N_FF_EXP, E);
         if (v->engram_index_of[il] >= 0) {
-            expect(l->engram_wkv, DS4_TENSOR_F16, 2, (uint64_t)(v->engram_max_ngram - 1) * v->engram_heads * v->engram_head_dim, E * (DS4_N_HC + 1));
+            expect(l->engram_wkv, DS4_TENSOR_FP8_32X32, 2, (uint64_t)(v->engram_max_ngram - 1) * v->engram_heads * v->engram_head_dim, E * (DS4_N_HC + 1));
             expect(l->engram_q, DS4_TENSOR_F32, 2, E, DS4_N_HC);
             expect(l->engram_k, DS4_TENSOR_F32, 2, E, DS4_N_HC);
         }

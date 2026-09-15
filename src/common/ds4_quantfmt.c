@@ -12,6 +12,8 @@ int ds4_ggt_geom(uint32_t ty, uint64_t *blk, uint64_t *tsz) {
         case DS4_GGT_F32:     *blk = 1;   *tsz = 4;   return 1;
         case DS4_GGT_F16:     *blk = 1;   *tsz = 2;   return 1;
         case DS4_GGT_BF16:    *blk = 1;   *tsz = 2;   return 1;
+        /* e4m3 平面 + 32×32 块缩放: 1024 个元素配 1 个缩放字节(见 core_gguf.c 类型表的注释) */
+        case DS4_GGT_FP8_32X32: *blk = 1024; *tsz = 1025; return 1;
         case DS4_GGT_Q8_0:    *blk = 32;  *tsz = 34;  return 1;
         case DS4_GGT_Q2_K:    *blk = 256; *tsz = 84;  return 1;
         case DS4_GGT_Q4_K:    *blk = 256; *tsz = 144; return 1;

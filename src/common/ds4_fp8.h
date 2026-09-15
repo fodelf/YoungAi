@@ -113,6 +113,11 @@ DS4_HOSTDEV_FP8 float ds4_e2m1fn_round(float x) {
 
 /* FP4 nibble(带符号位, 0..15) → f32。与 deepseek4-quantize.c fp4_table /
  * st_read.c FP4T 逐值同(注意 8 号槽是 -0.0f)。 */
+/* ★2026-09-15 判负存档: 把这张表换成纯位运算(算 f32 位型, 零访存)★
+ * 假设: 这个函数在 GPU 解码核里每个权重元素都调一次, 下标逐 lane 不同, 非一致索引的常量内存读
+ * 会按不同下标串行重放(一个 warp 最多 16 次)。实测 **解码 60.7 → 65.6 ms/token(慢 8%)**, 已回退。
+ * 真因大概是: 这个核是访存延迟受限的, LDC 的重放被后续 warp 盖住了, 而位运算那 6 条 ALU 指令
+ * 是实打实多出来的。位型版逐值与本表 16/16 逐位同(核过), 不是数值问题, 纯是代价问题。 */
 DS4_HOSTDEV_FP8 float ds4_fp4_nibble_to_f32(uint8_t n) {
     static const float t[16] = {
         0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,

@@ -7,6 +7,7 @@
  * 取行(P4): 两个 engram 层的行在前向一开始就由 48 个线程一次性 pread(一线程一行, NVMe 吃并发), 与前面几层的 GPU 算重叠;
  * 到 engram 层只收结果。第一版 mmap 逐行页错误串行: 512 token 两层吃 16.6 s/38 s; 第二版每层各自 16 线程: 解码 16 ms/层。
  * 回看的 3 个 token 可能在上一块 —— 取自 st->hist(整段 token 历史), 按绝对位置索引。 */
+#include <fcntl.h>   /* posix_fadvise: 关 engram 表的内核预读, 见 v41_engram_open_shard */
 #include "core_internal.h"
 #ifndef DS4_NO_GPU
 
@@ -14,12 +15,45 @@
 
 static const void *v41_tensor_host(const ds4_model *m, const ds4_tensor *t) { return tensor_data(m, t); }
 
+#define V41_EDIO_ALIGN 4096u   /* O_DIRECT 的对齐粒度(逻辑块); 行只有 264 B, 所以要对齐超集 + 落脚点 */
+
+/* 从 O_DIRECT 的 fd 读任意 [off, off+len) —— 对齐到块读进 bounce 再拷出来。
+ * len 最大 = HD(256) ⇒ 跨块最多 2 块, bounce 给 2×ALIGN 就够。 */
+static int v41_edio_pread(int fd, uint8_t *bounce, void *dst, uint64_t off, uint32_t len) {
+    const uint64_t a = off & ~(uint64_t)(V41_EDIO_ALIGN - 1u);
+    const uint64_t span = off + len - a;
+    const uint32_t nb = (uint32_t)((span + V41_EDIO_ALIGN - 1u) / V41_EDIO_ALIGN) * V41_EDIO_ALIGN;
+    if (pread(fd, bounce, nb, (off_t)a) != (ssize_t)nb) return 0;
+    memcpy(dst, bounce + (off - a), len);
+    return 1;
+}
+
 static bool v41_engram_open_shard(ds4_v41_state *st, uint32_t ei) {
     if (st->eshard[ei].fd >= 0) return true;
     const char *path = g_ds4_v41.engram_table_path[ei];
-    int fd = open(path, O_RDONLY);
+    /* ★O_DIRECT(2026-09-15)★: 表 203 GB, 每块 512 token 要 ~49k 次 264 B 随机读 = 200 MB 灌进页缓存,
+     * 把引擎那 103 GiB 注册映射的模型页挤出去再回填 —— 09-12 定罪过的"回收压力下瞬时脏读"就是这么来的。
+     * 实撞后果不是变慢而是**温度 0 下两次输出不同**(09-15: 开 engram 两跑不同, --v41-no-engram 两跑逐字同)。
+     * 绕开页缓存 = 既不污染别人, 自己也不需要缓存(行号随机, 命中率本来就≈0)。
+     * 拿不到 O_DIRECT(文件系统不支持)就退普通读 + FADV_RANDOM, 并把话说在日志里, 不装作没事。 */
+    int fd = -1, dio = 1;
+#ifdef O_DIRECT
+    fd = open(path, O_RDONLY | O_DIRECT);
+#endif
+    if (fd < 0) { dio = 0; fd = open(path, O_RDONLY); }
     if (fd < 0) { fprintf(stderr, "ds4: engram 表打不开 %s\n", path); return false; }
     struct stat sb; if (fstat(fd, &sb) != 0) { close(fd); return false; }
+    /* ★关预读(2026-09-15)★: 表是 203 GB 的 HF 分片, 每行只读 264 B 且行号随机, 而内核默认预读会把每次
+     * 读放大成 128 KB 灌进页缓存 —— 512 token 一块、两层、24 行就是 GB 级的churn, 把模型的 103 GiB 映射页
+     * 挤出去再回填。实撞的后果不是变慢而是**温度 0 下两次输出不同**(09-15: 开 engram 两跑不同, --v41-no-engram
+     * 两跑逐字同; 与 09-12 定罪的"映射页回收压力下瞬时脏读"同一条链)。FADV_RANDOM 让内核按请求大小读。 */
+    if (!dio) {
+#ifdef POSIX_FADV_RANDOM
+        (void)posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+#endif
+        fprintf(stderr, "ds4: ★engram 表拿不到 O_DIRECT, 退普通读 —— 页缓存会被搅动, 输出可能不可复现★\n");
+    }
+    st->eshard[ei].dio = dio;
     st->eshard[ei].fd = fd; st->eshard[ei].size = (uint64_t)sb.st_size;
     return true;
 }
@@ -56,6 +90,7 @@ static void v41_engram_hash(const ds4_engine *e, const ds4_v41_state *st, uint32
 /* 后台取行任务: 工作单元 = (engram 层 ei, 位置 p, 列 c) 一行; 线程按单元区间切, 同 (ei,p) 的哈希只算一次 */
 typedef struct {
     const ds4_engine *e; const ds4_v41_state *st; uint64_t u0, u1; int err;
+    uint8_t *bounce;   /* O_DIRECT 的对齐落脚点(V41_EDIO_ALIGN 对齐, 2 个块) */
 } v41_eworker;
 typedef struct {
     uint32_t n_eng, n, cols, HD, nsc;
@@ -82,8 +117,15 @@ static void *v41_eworker_run(void *arg) {
         if (r < 0 || (uint64_t)r >= v->engram_rows[ei]) { wk->err = 1; return NULL; }
         uint8_t *dst = J->raw[ei] + ((size_t)p * J->cols + c) * stride;
         const int fd = st->eshard[ei].fd;
-        if (pread(fd, dst, J->HD, (off_t)(v->engram_weight_off[ei] + (uint64_t)r * J->HD)) != (ssize_t)J->HD) { wk->err = 2; return NULL; }
-        if (pread(fd, dst + J->HD, J->nsc, (off_t)(v->engram_scale_off[ei] + (uint64_t)r * J->nsc)) != (ssize_t)J->nsc) { wk->err = 2; return NULL; }
+        const uint64_t woff = v->engram_weight_off[ei] + (uint64_t)r * J->HD;
+        const uint64_t soff = v->engram_scale_off[ei] + (uint64_t)r * J->nsc;
+        if (st->eshard[ei].dio) {
+            if (!v41_edio_pread(fd, wk->bounce, dst, woff, J->HD) ||
+                !v41_edio_pread(fd, wk->bounce, dst + J->HD, soff, J->nsc)) { wk->err = 2; return NULL; }
+        } else {
+            if (pread(fd, dst, J->HD, (off_t)woff) != (ssize_t)J->HD) { wk->err = 2; return NULL; }
+            if (pread(fd, dst + J->HD, J->nsc, (off_t)soff) != (ssize_t)J->nsc) { wk->err = 2; return NULL; }
+        }
     }
     return NULL;
 }
@@ -92,6 +134,7 @@ static void v41_ejob_free(ds4_v41_state *st) {
     v41_ejob *J = (v41_ejob *)st->ejob;
     if (!J) return;
     if (J->started && !J->joined) for (uint32_t t = 0; t < J->nth; t++) pthread_join(J->th[t], NULL);
+    for (uint32_t t = 0; t < J->nth; t++) free(J->w[t].bounce);
     for (uint32_t i = 0; i < DS4_V41_MAX_ENGRAM; i++) { free(J->raw[i]); free(J->rows[i]); }
     free(J); st->ejob = NULL;
 }
@@ -113,7 +156,10 @@ bool v41_engram_prefetch(ds4_engine *e, ds4_v41_state *st) {
     const uint64_t U = (uint64_t)J->n_eng * J->n * J->cols;
     J->nth = U < V41_EGATHER_THREADS ? (uint32_t)U : V41_EGATHER_THREADS;
     for (uint32_t t = 0; t < J->nth; t++) {
-        J->w[t] = (v41_eworker){ e, st, U * t / J->nth, U * (t + 1) / J->nth, 0 };
+        J->w[t] = (v41_eworker){ e, st, U * t / J->nth, U * (t + 1) / J->nth, 0, NULL };
+        if (posix_memalign((void **)&J->w[t].bounce, V41_EDIO_ALIGN, 2u * V41_EDIO_ALIGN) != 0) {
+            fprintf(stderr, "ds4: engram O_DIRECT 落脚点分配失败\n"); return false;
+        }
         if (pthread_create(&J->th[t], NULL, v41_eworker_run, &J->w[t]) != 0) {   /* 起不来就本线程同步做 */
             v41_eworker_run(&J->w[t]); J->th[t] = pthread_self();
         }
@@ -144,6 +190,28 @@ void v41_engram_close(ds4_v41_state *st) {
     if (st->ekv) { ds4_gpu_tensor_free(st->ekv); st->ekv = NULL; }
 }
 
+/* 温 0 不确定定位(2026-09-15 段 0): 同一份输入跑两遍, 比这三个 64 位指纹就知道病在哪一段 ——
+ * rows 变 = 哈希/hist 路(主机纯计算, 不该变); raw 变 = 盘上读回的字节(pread/O_DIRECT 路);
+ * 前两个都不变而 hc 变 = GPU 路(dequant 核 / wkv mmap 脏读 / 门核)。FNV-1a 64。 */
+static uint64_t v41_fnv1a(const void *p, size_t n) {
+    const uint8_t *b = (const uint8_t *)p; uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ULL; }
+    return h;
+}
+
+static void v41_engram_fingerprint(const ds4_v41_state *st, const v41_ejob *J, uint32_t il, uint32_t ei) {
+    const uint32_t n = st->n, cols = J->cols, stride = J->HD + J->nsc;
+    const uint64_t cnt = (uint64_t)n * DS4_N_HC * DS4_N_EMBD;
+    float *buf = xmalloc((size_t)cnt * 4);
+    ds4_gpu_synchronize();
+    const uint64_t hhc = ds4_gpu_tensor_read(st->hc, 0, buf, cnt * 4) ? v41_fnv1a(buf, (size_t)cnt * 4) : 0;
+    free(buf);
+    fprintf(stderr, "[v41-prof] L%02u engram 指纹 rows %016llx raw %016llx hc %016llx\n", il,
+            (unsigned long long)v41_fnv1a(J->rows[ei], (size_t)n * cols * sizeof(int64_t)),
+            (unsigned long long)v41_fnv1a(J->raw[ei], (size_t)n * cols * stride),
+            (unsigned long long)hhc);
+}
+
 bool v41_engram(ds4_engine *e, ds4_v41_state *st, uint32_t il) {
     const ds4_v41_cfg *v = &g_ds4_v41;
     const int16_t ei = v->engram_index_of[il];
@@ -167,8 +235,8 @@ bool v41_engram(ds4_engine *e, ds4_v41_state *st, uint32_t il) {
     }
     if (!ds4_gpu_tensor_write(st->eraw, 0, J->raw[ei], (uint64_t)n * cols * stride)) return false;
     if (!ds4_gpu_v41_engram_rows_tensor(st->erows, st->eraw, n * cols, HD)) return false;
-    /* wkv(f16 权重, fp8 线性 → bf16 输出) → 门 → hc 就地 */
-    if (!ds4_gpu_matmul_f16_tensor(st->ekv, m->map, m->size, l->engram_wkv->abs_offset, in_dim, out_dim, st->erows, n)) return false;
+    /* wkv(盘上就是官方 FP8: e4m3 + 32×32 块缩放, clear.md C1) → 门 → hc 就地 */
+    if (!ds4_gpu_v41_matmul_fp8blk_tensor(st->ekv, m->map, m->size, l->engram_wkv->abs_offset, in_dim, out_dim, st->erows, n)) return false;
     if (!ds4_gpu_v41_round_bf16_tensor(st->ekv, (uint64_t)n * out_dim)) return false;
     if (!ds4_gpu_v41_engram_gate_tensor(st->hc, st->ekv, m->map, m->size, l->engram_q->abs_offset, l->engram_k->abs_offset, E, HC, n, DS4_RMS_EPS)) return false;
     if (st->dump_prefix) {   /* 对拍夹具: engram 后的 hc [n][HC][E] 落 <prefix>.hce_Lnn.bin(对 Python engram 模块输出) */
@@ -177,6 +245,7 @@ bool v41_engram(ds4_engine *e, ds4_v41_state *st, uint32_t il) {
         if (ds4_gpu_tensor_read(st->hc, 0, buf, (uint64_t)n * HC * E * 4)) { FILE *f = fopen(p, "wb"); if (f) { fwrite(buf, 4, (size_t)n * HC * E, f); fclose(f); } }
         free(buf);
     }
+    if (g_ds4_v41_prof) v41_engram_fingerprint(st, J, il, (uint32_t)ei);
     return true;
 }
 #endif /* !DS4_NO_GPU */

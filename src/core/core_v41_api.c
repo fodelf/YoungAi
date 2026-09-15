@@ -4,7 +4,15 @@
 
 int ds4_engine_is_v41(ds4_engine *e) { (void)e; return DS4_MODEL_VARIANT == DS4_VARIANT_V41; }
 int g_ds4_v41_prof = 0;
+/* ★--decoder-full★: 关掉 CED, 提示的每一块都跑满 40 层(精确路, 用来跟 CED 对质量)。
+ * 默认是官方部署语义(CED 开), 见 core_v41_forward.c 的 ced_edge 注释。 */
+int g_ds4_v41_decoder_full = 0;
+void ds4_engine_v41_set_decoder_full(int on) { g_ds4_v41_decoder_full = on; }
 void ds4_engine_v41_set_prof(int on) { g_ds4_v41_prof = on; }
+/* ★--no-dspark★: 关掉投机解码, 回到逐 token。温 0 下两条路必须**逐字节同** ——
+ * 投机的接受条件就是"主模型自己也会选这个 token", 所以它只省时间不改输出; 不同就是回滚漏了东西。 */
+int g_ds4_v41_dspark = 1;
+void ds4_engine_v41_set_dspark(int on) { g_ds4_v41_dspark = on; }
 const char *g_ds4_v41_amp_dir = NULL;
 void ds4_engine_v41_set_amp_dir(const char *dir) { g_ds4_v41_amp_dir = (dir && dir[0]) ? dir : NULL; }
 const char *g_ds4_v41_pt_dir = NULL;
@@ -110,6 +118,12 @@ int ds4_engine_v41_score_ids(ds4_engine *e, const int *ids, int n_ids, const cha
     return ok ? 0 : 1;
 }
 
+/* --v41-chunk 也管生成路的预填分块(以前只管 --score-ids, 生成路写死 DS4_V41_CHUNK=512)。
+ * 为什么要管: 段 5 的专家路每层要把 384 个专家全解一遍成 NVFP4, 这个代价**与块里有几个 token 无关** ——
+ * 块 512 时它摊不开(实测 TTFT 193 t/s, 还不如融合路的 206), 块开大才反超。 */
+int g_ds4_v41_chunk = 0;
+void ds4_engine_v41_set_chunk(int n) { g_ds4_v41_chunk = n > 0 ? n : 0; }
+
 int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_prompt, int n_predict, int ctx_size,
                                    ds4_v41_emit_fn emit, void *ud) {
     if (!e || !prompt || n_prompt < 1 || !ds4_engine_is_v41(e)) return 1;
@@ -118,7 +132,8 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
     uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : np + (uint32_t)(n_predict > 0 ? n_predict : 0) + 1;
     if (ctx < np + 1) ctx = np + 1;
     if (ctx > DS4_V41_MAX_CTX_P2C) ctx = DS4_V41_MAX_CTX_P2C;
-    const uint32_t cap = DS4_V41_CHUNK < np ? DS4_V41_CHUNK : np;
+    const uint32_t ck = g_ds4_v41_chunk > 0 ? (uint32_t)g_ds4_v41_chunk : DS4_V41_CHUNK;
+    const uint32_t cap = ck < np ? ck : np;
     ds4_v41_state st;
     if (!v41_state_alloc(&st, cap, ctx)) return 1;
     ds4_gpu_tensor *am = ds4_gpu_tensor_alloc(16);   /* argmax 在设备上做, 只读回 4 B */
@@ -130,6 +145,8 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
         bool ok = true;
         for (uint32_t c0 = 0; ok && c0 < np; c0 += cap) {
             const uint32_t nc = np - c0 < cap ? np - c0 : cap;
+            /* CED: 除最后一块外, 只跑编码器段 + 分界层 KV(最后一块同时充当官方说的"解码器有界回放") */
+            st.ced_skip = (!g_ds4_v41_decoder_full && c0 + nc < np) ? 1 : 0;
             ok = v41_forward(e, &st, prompt + c0, nc);
         }
         if (!ok) break;
@@ -149,17 +166,66 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
         }
         int tok = (int)tok32;
         int produced = 0;
+        /* ---- DSpark 投机解码(speed.md 段 6 D1) ----
+         * 没带三塔/没带运行参数的 GGUF: dr.ready=0, 下面整段跳过, 走原来的单 token 环。
+         * 一轮 = 草稿器出 block 位 → 主模型一次验证 1+k 位 → 逐位比贪心结果, 接受最长前缀。
+         * ★温 0 下这与纯解码逐 token 是同一串输出★: 接受的条件就是"主模型自己也会选这个 token",
+         * 不接受的位置全部回滚。所以它是纯粹的省时间, 不是近似 —— 门也就是逐字节同。 */
+        ds4_v41_draft dr;
+        const bool spec = g_ds4_v41_dspark && v41_draft_alloc(e, &dr);
+        uint32_t spec_rounds = 0, spec_acc = 0, spec_hist[DS4_MTP_MAX_BLOCK + 1];
+        for (uint32_t i = 0; i <= DS4_MTP_MAX_BLOCK; i++) spec_hist[i] = 0;
+        uint32_t confirmed = st.mainh_rows;   /* 上一批新确认了几个位置(预填后 = 窗口预热的那些行) */
         while (produced < n_predict) {
             produced++;
             if (emit && emit(tok, ud) != 0) break;
             if (tok == eos) break;
             if (st.n_past + 1 > st.ctx) { fprintf(stderr, "\n[v41] 上下文满 %u\n", st.ctx); break; }
-            const int32_t t32 = (int32_t)tok;
-            if (!v41_forward(e, &st, &t32, 1)) { ok = false; break; }
-            if (!ds4_gpu_v41_argmax_tensor(am, st.logits, 0, DS4_N_VOCAB) || !ds4_gpu_synchronize() ||
-                !ds4_gpu_tensor_read(am, 0, &tok32, 4)) { ok = false; break; }
-            tok = (int)tok32;
+            uint32_t k = 0;
+            int32_t batch[DS4_MTP_MAX_BLOCK + 1];
+            batch[0] = (int32_t)tok;
+            if (spec && v41_draft_step(e, &st, &dr, (int32_t)tok, st.n_past - 1u, confirmed)) {
+                k = dr.block;
+                for (uint32_t i = 0; i < k; i++) batch[i + 1u] = dr.host_ids[i + 1u];
+            }
+            const uint32_t nb = 1u + k;
+            if (k && !v41_spec_snapshot(&st)) { ok = false; break; }
+            if (!v41_forward(e, &st, batch, nb)) { ok = false; break; }
+            /* 逐位取主模型的贪心结果, 与草稿比: 第 i 位的 logits 预测的是 batch[i] 之后那一位 */
+            int32_t want[DS4_MTP_MAX_BLOCK + 1];
+            for (uint32_t i = 0; i < nb; i++)
+                if (!ds4_gpu_v41_argmax_tensor(am, st.logits, i, DS4_N_VOCAB) || !ds4_gpu_synchronize() ||
+                    !ds4_gpu_tensor_read(am, 0, &want[i], 4)) { ok = false; break; }
+            if (!ok) break;
+            uint32_t a = 0;
+            while (a < k && want[a] == batch[a + 1u]) a++;   /* 接受最长前缀 */
+            if (k && g_ds4_v41_prof) {   /* 诊断: 草稿这 5 位 vs 主模型自己的 5 位 —— 看是"接近但不同"还是"完全不搭" */
+                fprintf(stderr, "\n[dspark] 草稿");
+                for (uint32_t i = 0; i < k; i++) fprintf(stderr, " %d", batch[i + 1u]);
+                fprintf(stderr, " | 主模型");
+                for (uint32_t i = 0; i < nb; i++) fprintf(stderr, " %d", want[i]);
+                fprintf(stderr, " | 接受 %u | conf", a);
+                for (uint32_t i = 0; i < k; i++) fprintf(stderr, " %.2f", (double)dr.host_conf[i]);
+                fprintf(stderr, "\n");
+            }
+            if (k) {
+                spec_rounds++; spec_acc += a; spec_hist[a]++;
+                if (!v41_spec_rollback(&st, 1u + a)) { ok = false; break; }
+            }
+            for (uint32_t i = 0; i < a; i++) {   /* 白赚的那几位: 草稿与主模型一致, 直接吐 */
+                produced++;
+                const int t = (int)batch[i + 1u];
+                if ((emit && emit(t, ud) != 0) || t == eos) { produced = n_predict; break; }
+            }
+            confirmed = 1u + a;
+            tok = (int)want[a];
         }
+        if (spec_rounds) {
+            fprintf(stderr, "\n[v41] DSpark: %u 轮, 平均接受 %.2f/%u 位; 直方图", spec_rounds, (double)spec_acc / spec_rounds, dr.block);
+            for (uint32_t i = 0; i <= dr.block; i++) fprintf(stderr, " %u:%u", i, spec_hist[i]);
+            fprintf(stderr, "\n");
+        }
+        if (spec) v41_draft_free(&dr);
         const double t2 = now_sec();
         if (produced > 1) fprintf(stderr, "\n[v41] decode %d token %.1fs (%.2f t/s)\n", produced - 1, t2 - t1, (double)(produced - 1) / (t2 - t1 + 1e-9));
         rc = ok ? 0 : 1;

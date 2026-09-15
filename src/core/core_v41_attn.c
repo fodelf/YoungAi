@@ -26,13 +26,24 @@ static bool v41_compress_source(ds4_engine *e, ds4_v41_state *st, uint32_t il, u
     const uint32_t g0 = st->pos0 / ratio;     /* 缓存里已有的组数 */
     uint32_t ng_new;
     if (ratio > 1) {   /* Compressor ratio>1: f32 权重, x 进, 组内逐维 softmax 池化 → bf16 */
-        if (!ds4_gpu_v41_matmul_f32_tensor(st->ckv, m->map, m->size, l->attn_compressor_kv->abs_offset, E, HD, st->xn, n)) return false;
-        if (!ds4_gpu_v41_matmul_f32_tensor(st->csc, m->map, m->size, l->attn_compressor_gate->abs_offset, E, HD, st->xn, n)) return false;
+        if (!ds4_gpu_v41_matmul_bf16_tensor(st->ckv, m->map, m->size, l->attn_compressor_kv->abs_offset, E, HD, st->xn, n)) return false;
+        if (!ds4_gpu_v41_matmul_bf16_tensor(st->csc, m->map, m->size, l->attn_compressor_gate->abs_offset, E, HD, st->xn, n)) return false;
         const uint32_t pend = st->cpend[il];
         if (!ds4_gpu_tensor_copy(st->cpre_kv[il], (uint64_t)pend * rowb, st->ckv, 0, (uint64_t)n * rowb)) return false;
         if (!ds4_gpu_tensor_copy(st->cpre_sc[il], (uint64_t)pend * rowb, st->csc, 0, (uint64_t)n * rowb)) return false;
         const uint32_t tot = pend + n, rem = tot % ratio;
         ng_new = tot / ratio;
+        /* ★投机验证的回滚点★(speed.md 段 6 D1): 下面的"余行挪到头"是破坏性的, 挪完就找不回
+         * 本批那几个 token 的压缩器输入了。所以在挪之前把整块存一份, 回滚时按接受数从里面取。 */
+        if (st->snap_on) {
+            bool sok = true;
+            const uint64_t nb = ((uint64_t)ratio + st->cap_tok) * rowb;   /* 与 v41_state_alloc 里 cpre_* 的分配式同源 */
+            if (!st->snap_cpre_kv[il]) { st->snap_cpre_kv[il] = v41_alloc(nb, &sok); st->snap_cpre_sc[il] = v41_alloc(nb, &sok); }
+            if (!sok) return false;
+            if (!ds4_gpu_tensor_copy(st->snap_cpre_kv[il], 0, st->cpre_kv[il], 0, (uint64_t)tot * rowb)) return false;
+            if (!ds4_gpu_tensor_copy(st->snap_cpre_sc[il], 0, st->cpre_sc[il], 0, (uint64_t)tot * rowb)) return false;
+            st->snap_cpend[il] = pend;
+        }
         if (ng_new) {
             if (!ds4_gpu_v41_compress_pool_tensor(st->pooled, st->cpre_kv[il], st->cpre_sc[il], tot, ratio, HD)) return false;
             if (rem) {   /* 余行挪到头(源行号 ≥ ratio > rem, 不重叠) */
@@ -42,7 +53,7 @@ static bool v41_compress_source(ds4_engine *e, ds4_v41_state *st, uint32_t il, u
         }
         st->cpend[il] = rem;
     } else {           /* ratio 1: 纯投影(bf16 权重值) → bf16 */
-        if (!ds4_gpu_v41_matmul_f32_tensor(st->pooled, m->map, m->size, l->attn_compressor_kv->abs_offset, E, HD, st->xn, n)) return false;
+        if (!ds4_gpu_v41_matmul_bf16_tensor(st->pooled, m->map, m->size, l->attn_compressor_kv->abs_offset, E, HD, st->xn, n)) return false;
         if (!ds4_gpu_v41_round_bf16_tensor(st->pooled, (uint64_t)n * HD)) return false;
         ng_new = n;
     }
@@ -57,7 +68,7 @@ static bool v41_compress_source(ds4_engine *e, ds4_v41_state *st, uint32_t il, u
     }
     if (!ds4_gpu_v41_rms_norm_tensor(st->latent, st->pooled, m->map, m->size, l->attn_compressor_norm->abs_offset, HD, ng_new, DS4_RMS_EPS)) return false;
     /* indexer 键: k = k_norm(wk(latent)) → rope(组位置) → fp4(ue8m0/32) —— 用 latent 的未 rope 形; ckv 借作 [ng_new][IK] 出口 */
-    if (!ds4_gpu_v41_matmul_f32_tensor(st->ktmp, m->map, m->size, l->indexer_wk->abs_offset, HD, IK, st->latent, ng_new)) return false;
+    if (!ds4_gpu_v41_matmul_bf16_tensor(st->ktmp, m->map, m->size, l->indexer_wk->abs_offset, HD, IK, st->latent, ng_new)) return false;
     if (!ds4_gpu_v41_round_bf16_tensor(st->ktmp, (uint64_t)ng_new * IK)) return false;
     if (!ds4_gpu_v41_rms_norm_tensor(st->ckv, st->ktmp, m->map, m->size, l->indexer_k_norm->abs_offset, IK, ng_new, DS4_RMS_EPS)) return false;
     if (!v41_rope(st->ckv, st->posg, ng_new, 1, IK, ratio, false)) return false;
@@ -83,7 +94,7 @@ static bool v41_index_source(ds4_engine *e, ds4_v41_state *st, uint32_t il, uint
     if (!ds4_gpu_v41_matmul_fp4x32_tensor(st->iq, m->map, m->size, l->indexer_attn_q_b->abs_offset, DS4_N_LORA_Q, (uint64_t)IH * IK, st->qrn, n, 1)) return false;
     if (!v41_rope(st->iq, st->pos, n, IH, IK, ratio, false)) return false;
     if (!ds4_gpu_v41_act_quant_fp4_tensor(st->iq, (uint64_t)n * IH, IK, 32, false)) return false;
-    if (!ds4_gpu_v41_matmul_f32_tensor(st->iw, m->map, m->size, l->indexer_proj->abs_offset, E, IH, st->xn, n)) return false;
+    if (!ds4_gpu_v41_matmul_bf16_tensor(st->iw, m->map, m->size, l->indexer_proj->abs_offset, E, IH, st->xn, n)) return false;
     if (!ds4_gpu_v41_round_bf16_tensor(st->iw, (uint64_t)n * IH)) return false;
     /* weights = proj(x) * (softmax_scale · n_heads^-0.5), 官方在 bf16 上乘 → 再舍 bf16 */
     if (!ds4_gpu_v41_scale_round_tensor(st->iw, (uint64_t)n * IH, (float)(1.0 / sqrt((double)IK) / sqrt((double)IH)))) return false;
@@ -99,7 +110,69 @@ static bool v41_index_source(ds4_engine *e, ds4_v41_state *st, uint32_t il, uint
     return true;
 }
 
+/* ★CED 的分界层专用★: 只把本层的压缩 KV + 索引键写进源层缓存, 其余(q 路/窗口 kv/注意力/输出投影)全不做。
+ * 为什么够: 解码器段所有层的全局 KV 都读这一层的缓存(kv_source_of), 而中间块的解码器段不跑, 也就没人要
+ * 这一层的注意力输出。出错会怎样: 漏了这一步, 解码器段在最后一块里读到的全局 KV 只有最后一块那几百个位置,
+ * 前面的上下文整段丢失 —— 表现是长提示答非所问, 不报错。 */
+bool v41_attention_kv_only(ds4_engine *e, ds4_v41_state *st, uint32_t il) {
+    const uint32_t ratio = ds4_layer_compress_ratio(il);
+    if (!ratio || !g_ds4_v41.is_kv_source[il]) return true;
+    return v41_compress_source(e, st, il, ratio);
+}
+
+/* ★DSpark 草稿塔的注意力(官方 DSparkAttention)★
+ * 与主路的三处不同: ①没有压缩 KV/indexer(compress_ratio==0), 只有 SWA 窗口;
+ * ②窗口里装的不是塔自己的 kv, 而是**主模型那一位的 main_x 投影**(由 v41_draft_push_main 推进);
+ * ③块内 n 位互相全可见(官方 get_dspark_topk_idxs), 所以 sparse_attn 传 full_block。
+ * ★块的 kv 不进历史窗口★: 草稿是试算, 只有主模型确认过的位置才配进窗口 —— 写进去了下一轮就在
+ * 一份含"没被接受的草稿"的历史上出草稿, 不报错, 接受率慢慢烂掉。 */
+static bool v41_draft_attention(ds4_engine *e, ds4_v41_state *st, uint32_t il) {
+    const ds4_model *m = &e->model; const ds4_layer_weights *l = &e->weights.mtp.tower[il];
+    const uint32_t n = st->n, E = DS4_N_EMBD, HD = DS4_N_HEAD_DIM, NH = DS4_N_HEAD, Q = DS4_N_LORA_Q, SWA = DS4_N_SWA;
+    const uint64_t rowb = (uint64_t)HD * 4;
+    if (!ds4_gpu_v41_matmul_fp4x32_tensor(st->qr, m->map, m->size, l->attn_q_a->abs_offset, E, Q, st->xn, n, 1)) return false;
+    if (!ds4_gpu_v41_rms_norm_tensor(st->qrn, st->qr, m->map, m->size, l->attn_q_a_norm->abs_offset, Q, n, DS4_RMS_EPS)) return false;
+    if (!ds4_gpu_v41_matmul_fp4x32_tensor(st->q, m->map, m->size, l->attn_q_b->abs_offset, Q, (uint64_t)NH * HD, st->qrn, n, 1)) return false;
+    if (!v41_rope(st->q, st->pos, n, NH, HD, 0, false)) return false;
+    if (!ds4_gpu_v41_matmul_fp4x32_tensor(st->kv, m->map, m->size, l->attn_kv->abs_offset, E, HD, st->xn, n, 1)) return false;
+    if (!ds4_gpu_v41_rms_norm_tensor(st->kvn, st->kv, m->map, m->size, l->attn_kv_a_norm->abs_offset, HD, n, DS4_RMS_EPS)) return false;
+    if (!v41_rope(st->kvn, st->pos, n, 1, HD, 0, false)) return false;
+    if (!ds4_gpu_v41_act_quant_fp8_tensor(st->kvn, n, HD, 32)) return false;
+    if (!ds4_gpu_tensor_copy(st->win[il], (uint64_t)SWA * rowb, st->kvn, 0, (uint64_t)n * rowb)) return false;
+    if (!ds4_gpu_v41_sparse_attn_tensor(st->o, st->q, st->win[il], NULL, NULL, m->map, m->size,
+                                        l->attn_sinks->abs_offset, n, st->pos0, SWA, 0, 0, NH, HD,
+                                        (float)(1.0 / sqrt((double)HD)), 1)) return false;
+    if (!v41_rope(st->o, st->pos, n, NH, HD, 0, true)) return false;
+    const uint32_t grp = NH / DS4_N_OUT_GROUP;
+    if (!ds4_gpu_v41_grouped_matmul_fp4x32_tensor(st->low, m->map, m->size, l->attn_output_a->abs_offset, DS4_N_OUT_GROUP,
+                                                  (uint64_t)grp * HD, DS4_N_LORA_O, st->o, n, 1)) return false;
+    return ds4_gpu_v41_matmul_fp4x32_tensor(st->attn_out, m->map, m->size, l->attn_output_b->abs_offset,
+                                            (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O, E, st->low, n, 1) != 0;
+}
+
+/* 把 rows 个**已确认位置**的 main_x 投影进每个塔的窗口(官方 self.window_kv_cache[start_pos % win] = main_kv)。
+ * 我们的窗口是线性缓冲不是环形: 新行先写块区, 再整体左移 rows 行 —— 效果一样, 省一个取模索引。
+ * pos 张量由调用方填成这 rows 个位置的绝对位置(rope 要它)。 */
+bool v41_draft_push_main(ds4_engine *e, ds4_v41_state *st, uint32_t rows) {
+    const ds4_model *m = &e->model;
+    const uint32_t E = DS4_N_EMBD, HD = DS4_N_HEAD_DIM, SWA = DS4_N_SWA;
+    const uint64_t rowb = (uint64_t)HD * 4;
+    if (!rows) return true;
+    for (uint32_t T = 0; T < g_ds4_v41.mtp_towers; T++) {
+        const ds4_layer_weights *l = &e->weights.mtp.tower[T];
+        if (!ds4_gpu_v41_matmul_fp4x32_tensor(st->kv, m->map, m->size, l->attn_kv->abs_offset, E, HD, st->main_x, rows, 1)) return false;
+        if (!ds4_gpu_v41_rms_norm_tensor(st->kvn, st->kv, m->map, m->size, l->attn_kv_a_norm->abs_offset, HD, rows, DS4_RMS_EPS)) return false;
+        if (!v41_rope(st->kvn, st->pos, rows, 1, HD, 0, false)) return false;
+        if (!ds4_gpu_v41_act_quant_fp8_tensor(st->kvn, rows, HD, 32)) return false;
+        if (!ds4_gpu_tensor_copy(st->win[T], (uint64_t)SWA * rowb, st->kvn, 0, (uint64_t)rows * rowb)) return false;
+        if (!ds4_gpu_tensor_copy(st->wintmp, 0, st->win[T], (uint64_t)rows * rowb, (uint64_t)SWA * rowb)) return false;
+        if (!ds4_gpu_tensor_copy(st->win[T], 0, st->wintmp, 0, (uint64_t)SWA * rowb)) return false;
+    }
+    return true;
+}
+
 bool v41_attention(ds4_engine *e, ds4_v41_state *st, uint32_t il) {
+    if (st->draft) return v41_draft_attention(e, st, il);
     const ds4_model *m = &e->model; const ds4_layer_weights *l = &e->weights.layer[il];
     const ds4_v41_cfg *v = &g_ds4_v41;
     const uint32_t n = st->n, E = DS4_N_EMBD, HD = DS4_N_HEAD_DIM, NH = DS4_N_HEAD, Q = DS4_N_LORA_Q, SWA = DS4_N_SWA;
@@ -131,7 +204,7 @@ bool v41_attention(ds4_engine *e, ds4_v41_state *st, uint32_t il) {
     }
     /* 稀疏注意力(窗口 128 + topk 压缩行, sink 进分母) → bf16 → 逆 rope */
     if (!ds4_gpu_v41_sparse_attn_tensor(st->o, st->q, st->win[il], (ng && topk) ? comp : NULL, (ng && topk) ? st->idx : NULL, m->map, m->size,
-                                        l->attn_sinks->abs_offset, n, st->pos0, SWA, ng, topk, NH, HD, (float)(1.0 / sqrt((double)HD)))) return false;
+                                        l->attn_sinks->abs_offset, n, st->pos0, SWA, ng, topk, NH, HD, (float)(1.0 / sqrt((double)HD)), 0)) return false;
     /* 窗口缓冲平移: 行 [n, n+SWA) → [0, SWA)(经暂存, 免重叠) */
     if (!ds4_gpu_tensor_copy(st->wintmp, 0, st->win[il], (uint64_t)n * rowb, (uint64_t)SWA * rowb)) return false;
     if (!ds4_gpu_tensor_copy(st->win[il], 0, st->wintmp, 0, (uint64_t)SWA * rowb)) return false;

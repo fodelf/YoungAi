@@ -47,9 +47,14 @@ __device__ __forceinline__ static float v41_pow2_ceil_log2(float v) {
     int e; const float m = frexpf(v, &e);      /* v = m·2^e, m∈[0.5,1) ⇒ log2 v = e + log2 m ∈ (e-1, e] */
     return ldexpf(1.0f, (m == 0.5f) ? e - 1 : e);
 }
-__global__ static void v41_act_quant_kernel(float *x, uint32_t dim, uint32_t block, int mode) {
+/* ★2026-09-15 段 5: 网格从二维改成一维展平★
+ * 实撞: `--v41-chunk 2048` 在 L02 报 "act quant fp4 failed: invalid argument"。原因是索引器那一路
+ * 按 (n_tok × 32 个索引头) 当行数, 2048 × 32 = **65536**, 而 CUDA 的 gridDim.y 上限是 **65535** —— 差一个。
+ * 报的是 invalid argument, 不是"超上限", 看着像参数写错, 实际是网格形状。展平成一维后上限变成 2^31-1,
+ * 块开到 4096(段 5 要的)也够。 */
+__global__ static void v41_act_quant_kernel(float *x, uint32_t dim, uint32_t block, int mode, uint32_t nb_row) {
     /* mode 0: fp8 e4m3 值 + ue8m0 scale(max 448); 1: fp4 + ue8m0(max 6); 2: fp4 + e4m3 scale(max 6) */
-    const uint32_t row = blockIdx.y, b = blockIdx.x;
+    const uint32_t row = blockIdx.x / nb_row, b = blockIdx.x % nb_row;
     const uint32_t lane = threadIdx.x;
     float *p = x + (uint64_t)row * dim + (uint64_t)b * block;
     float v = lane < block ? p[lane] : 0.0f;
@@ -68,12 +73,12 @@ __global__ static void v41_act_quant_kernel(float *x, uint32_t dim, uint32_t blo
 }
 int ds4_gpu_v41_act_quant_fp8_tensor(ds4_gpu_tensor *x, uint32_t n_rows, uint32_t dim, uint32_t block) {
     if (!x || block == 0 || block > 32u || (dim % block)) return 0;
-    v41_act_quant_kernel<<<dim3(dim / block, n_rows), 32, 0, g_cur_stream>>>((float *)x->ptr, dim, block, 0);
+    v41_act_quant_kernel<<<(unsigned)((uint64_t)n_rows * (dim / block)), 32, 0, g_cur_stream>>>((float *)x->ptr, dim, block, 0, dim / block);
     return cuda_ok(cudaGetLastError(), "v41 act quant fp8");
 }
 int ds4_gpu_v41_act_quant_fp4_tensor(ds4_gpu_tensor *x, uint32_t n_rows, uint32_t dim, uint32_t block, bool e4m3_scale) {
     if (!x || block == 0 || block > 32u || (dim % block)) return 0;
-    v41_act_quant_kernel<<<dim3(dim / block, n_rows), 32, 0, g_cur_stream>>>((float *)x->ptr, dim, block, e4m3_scale ? 2 : 1);
+    v41_act_quant_kernel<<<(unsigned)((uint64_t)n_rows * (dim / block)), 32, 0, g_cur_stream>>>((float *)x->ptr, dim, block, e4m3_scale ? 2 : 1, dim / block);
     return cuda_ok(cudaGetLastError(), "v41 act quant fp4");
 }
 
@@ -248,54 +253,83 @@ int ds4_gpu_v41_indexer_topk_tensor(ds4_gpu_tensor *idx, const ds4_gpu_tensor *s
  * 分母用未舍的 exp 和; sink 只进分母。q/k 值已是 bf16 格点, 点积 f32。
  * 第一版一 block 包 64 头(1024 线程): 解码 n=1 时整层只有 1 个 block 在一个 SM 上逐键 syncthreads, 0.5 ms/层 = 20 ms/token;
  * 拆成 8 个头组 block 后键行多读 8 次(L2 命中), 换 8 个 SM 并行。 ---- */
+#ifndef V41_ATTN_HEADS_PER_BLOCK   /* split-K 分片(cuda_v41_attn_split.inc.cu)排在前面, 可能已经定义过 */
 #define V41_ATTN_HEADS_PER_BLOCK 8u
+#endif
+#ifndef V41_ATTN_KTILE
+#define V41_ATTN_KTILE 8u          /* 一次进 shared 的键行数: 8×512×4 B = 16 KB ⇒ 每 SM 能驻 6 个 block */
+#endif
+/* ★2026-09-15 按键分块重写(speed.md 第二轮; nsys 定罪: 这个核占预填 32.3%, 116 ms/层)★
+ * 旧版逐键一轮: 每键两次 __syncthreads + 每键把整个累加器重缩放一遍(16 FMA/头/键)。
+ * 现在一次搬 8 个键进 shared: 同步次数降到 1/8, 重缩放摊到 1/8(每块只按块内最大值缩一次) ——
+ * 这正是 flash 式在线 softmax 的标准做法, 官方 sparse_attn_kernel 也是按 64 键一块做的
+ * (我们用不了 64: 官方那份要 q_shared+kv_shared 各 64 KB = 128 KB 动态 shared, GB10 opt-in 上限只有 99 KB)。
+ * ★数值★: 分块改变了在线 softmax 的分组, 与旧版不是逐位同(与官方的分组也不同, 官方 64 我们 8);
+ * 判据因此是 NLL/五指标, 不是逐位 —— 这一条在 speed.md §6 D 段写明。
+ * 无效 topk 槽(idx<0)不跳过而是记 -inf 分数, 让它在块内自然得到 p=0(跳过会打乱分块结构)。 */
 __global__ static void v41_sparse_attn_kernel(float *o, const float *q, const float *kvw, const float *kvc, const int32_t *idx,
                                               const float *sink, uint32_t pos0, uint32_t window, uint32_t ng, uint32_t topk,
-                                              uint32_t n_head, uint32_t hd, float scale, int use_sh) {
+                                              uint32_t n_head, uint32_t hd, float scale, uint32_t full_block) {
     const uint32_t i = blockIdx.x, lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
     const uint32_t per = hd / 32u;                 /* 512/32 = 16 维/lane */
-    /* ★2026-09-14: 去掉 "整 block 把 krow 搬进 shared" 那一层★。
-     * 原版每个 key 都要两次 __syncthreads(搬前搬后), 而解码时 nkeys = 窗口 + topk ≈ 6000 ⇒
-     * 一层就是一万二千次 block 同步, 实测这个核占解码 GPU 时间的 46%(2.49 ms/层)。
-     * 每个 lane 本来就只用 krow 里自己那 16 个连续维(warp 内 32 lane 正好盖满一整行 2 KB, 是合并访问),
-     * 直接从 global 读即可: 同 block 的几个 warp 读同一行, L1 命中, 不需要手动中转, 更不需要同步。
-     * 读进寄存器 kreg 后两个头复用 ⇒ 读取次数也减半。累加顺序与原版逐位相同(等价性靠这一条)。
-     * ★只在解码(n_tok 小)走这条★: prefill 时 block 多、同一行被很多 query 同时要, shared 中转是划算的,
-     * 去掉它实测 prefill 46.7 → 33.9 t/s。所以按 use_sh 分两路, 两路都只是把同样的 16 个数填进 kreg。 */
-    __shared__ float ks[512];
-    float qa[2][16], acc[2][16], mx[2], sum[2], kreg[16];
+    __shared__ float ks[V41_ATTN_KTILE][512];
+    __shared__ int   kok[V41_ATTN_KTILE];          /* 这一槽是不是有效键 */
+    float qa[2][16], acc[2][16], mx[2], sum[2];
     for (int hh = 0; hh < 2; hh++) {
         const uint32_t h = blockIdx.y * V41_ATTN_HEADS_PER_BLOCK + warp * 2u + hh;
         for (uint32_t e = 0; e < per; e++) { qa[hh][e] = q[((uint64_t)i * n_head + h) * hd + lane * per + e]; acc[hh][e] = 0.f; }
         mx[hh] = -1e30f; sum[hh] = 0.f;
     }
     const uint32_t p = pos0 + i;                   /* 绝对位置 */
-    const uint32_t lo = p + 1u > window ? p + 1u - window : 0u;
-    const uint32_t nwin = p - lo + 1u;
+    /* ★full_block(DSpark 草稿块)★: 本 chunk 的每一位看同一个键集合 = 整个窗口 + 块内全部 n 位
+     * (官方 get_dspark_topk_idxs, 与 i 无关, 也不做因果截断 —— 5 个草稿位是一次出的)。
+     * 主路(full_block=0)是因果的: 第 i 位只看到 [p+1-window, p]。 */
+    const uint32_t last = full_block ? pos0 + full_block - 1u : p;
+    const uint32_t lo = full_block ? (pos0 > window ? pos0 - window : 0u)      /* 窗口 = 块前面那 window 个位置 */
+                                   : (p + 1u > window ? p + 1u - window : 0u); /* 因果: 含自己那一位 */
+    const uint32_t nwin = last - lo + 1u;
     const uint32_t nkeys = nwin + topk;
-    for (uint32_t kk = 0; kk < nkeys; kk++) {
-        const float *krow;
-        if (kk < nwin) krow = kvw + (uint64_t)((int64_t)lo + kk - ((int64_t)pos0 - (int64_t)window)) * hd;   /* 缓冲行 = 位置 - (pos0-window) */
-        else { const int32_t g = idx[(uint64_t)i * topk + (kk - nwin)]; if (g < 0 || (uint32_t)g >= ng) continue; krow = kvc + (uint64_t)g * hd; }
-        if (use_sh) {
-            __syncthreads();
-            for (uint32_t d = threadIdx.x; d < hd; d += blockDim.x) ks[d] = krow[d];
-            __syncthreads();
-            for (uint32_t e = 0; e < per; e++) kreg[e] = ks[lane * per + e];
-        } else {
-            for (uint32_t e = 0; e < per; e++) kreg[e] = krow[lane * per + e];
+    for (uint32_t base = 0; base < nkeys; base += V41_ATTN_KTILE) {
+        const uint32_t nt = (nkeys - base) < V41_ATTN_KTILE ? (nkeys - base) : V41_ATTN_KTILE;
+        __syncthreads();                            /* 上一块的 ks 已被读完才能覆盖 */
+        for (uint32_t t = threadIdx.x / 32u; t < nt; t += blockDim.x / 32u) {
+            const uint32_t kk = base + t;
+            const float *krow = NULL;
+            if (kk < nwin) krow = kvw + (uint64_t)((int64_t)lo + kk - ((int64_t)pos0 - (int64_t)window)) * hd;
+            else { const int32_t g = idx[(uint64_t)i * topk + (kk - nwin)];
+                   if (g >= 0 && (uint32_t)g < ng) krow = kvc + (uint64_t)g * hd; }
+            if (lane == 0) kok[t] = krow != NULL;
+            /* ★无效槽必须写 0, 不能留着上一块的残留(2026-09-15 定罪)★: 下面算 acc_add 时对无效槽
+             * 乘的是 p=0, 但 0 × 残留值只有在残留是有限值时才等于 0 —— shared 里上一个 block 留下的
+             * 字节按 float 解释出来可能是 NaN/Inf, 于是 0×NaN = NaN。实撞后果: 位置 0 的 512 个 topk 槽
+             * 几乎全无效 ⇒ token 0 的整份 hc(20480 个)在 L02 变非有限值, 而残留内容取决于哪个 block
+             * 先用过这块 shared ⇒ 同一份输入温度 0 跑两遍结果不同。 */
+            for (uint32_t d = lane; d < hd; d += 32u) ks[t][d] = krow ? krow[d] : 0.f;   /* warp 内合并读 2 KB */
         }
+        __syncthreads();
         for (int hh = 0; hh < 2; hh++) {
-            float d = 0.f;
-            for (uint32_t e = 0; e < per; e++) d += qa[hh][e] * kreg[e];
-            for (int off = 16; off > 0; off >>= 1) d += __shfl_xor_sync(0xffffffffu, d, off);
-            const float s = d * scale;
-            const float nm = fmaxf(mx[hh], s);
-            const float rs = expf(mx[hh] - nm);
-            const float p = expf(s - nm);
-            sum[hh] = sum[hh] * rs + p;
-            const float pb = v41_bf16r(p);
-            for (uint32_t e = 0; e < per; e++) acc[hh][e] = acc[hh][e] * rs + pb * kreg[e];
+            float s[V41_ATTN_KTILE];
+            float tm = -1e30f;
+            for (uint32_t t = 0; t < nt; t++) {
+                float d = 0.f;
+                for (uint32_t e = 0; e < per; e++) d += qa[hh][e] * ks[t][lane * per + e];
+                for (int off = 16; off > 0; off >>= 1) d += __shfl_xor_sync(0xffffffffu, d, off);
+                s[t] = kok[t] ? d * scale : -1e30f;
+                tm = fmaxf(tm, s[t]);
+            }
+            const float nm = fmaxf(mx[hh], tm);
+            const float rs = expf(mx[hh] - nm);     /* 整块只缩一次 */
+            float acc_add[16];
+            for (uint32_t e = 0; e < per; e++) acc_add[e] = 0.f;
+            float ps = 0.f;
+            for (uint32_t t = 0; t < nt; t++) {
+                const float pv = expf(s[t] - nm);
+                ps += pv;
+                const float pb = v41_bf16r(pv);
+                for (uint32_t e = 0; e < per; e++) acc_add[e] += pb * ks[t][lane * per + e];
+            }
+            sum[hh] = sum[hh] * rs + ps;
+            for (uint32_t e = 0; e < per; e++) acc[hh][e] = acc[hh][e] * rs + acc_add[e];
             mx[hh] = nm;
         }
     }
@@ -309,13 +343,29 @@ int ds4_gpu_v41_sparse_attn_tensor(ds4_gpu_tensor *o, const ds4_gpu_tensor *q, c
                                    const ds4_gpu_tensor *kv_comp, const ds4_gpu_tensor *idx,
                                    const void *model_map, uint64_t model_size, uint64_t sink_offset,
                                    uint32_t n_tok, uint32_t pos0, uint32_t window, uint32_t ng, uint32_t topk,
-                                   uint32_t n_head, uint32_t head_dim, float scale) {
+                                   uint32_t n_head, uint32_t head_dim, float scale, int full_block) {
     if (!o || !q || !kv_win || n_head != 64u || head_dim != 512u) { fprintf(stderr, "ds4: [v41] sparse attn 只实现 64 头×512\n"); return 0; }
     if (kv_win->bytes < (uint64_t)(window + n_tok) * head_dim * 4) { fprintf(stderr, "ds4: [v41] 窗口缓冲不够 %u+%u 行\n", window, n_tok); return 0; }
     const float *sink = (const float *)cuda_model_range_ptr(model_map, sink_offset, (uint64_t)n_head * 4, "v41 sink");
     if (!sink) return 0;
+    /* ★段 4★ 预填先走张量核版(cuda_sparse_attn_mma.inc.cu); 它自己判形状/块大小/shared, 不适用返回 0 回这里。
+     * 解码(n_tok 小)恒走标量版: 那时 grid 只有 n_tok×4 个 block, 填不满 48 个 SM。 */
+    /* ★解码(n_tok=1)先走 split-K★(single.md S4): 原核那时 grid 只有 8 个 block, 48 个 SM 里 40 个干等,
+     * 键只能串着啃(实测 5.3 µs/键, 且随上下文线性涨)。split 把键切段铺满 SM; 键太少或形状不合它返回 0。
+     * 草稿块(full_block)不走: 它的可见性是"块内全可见", 与 split 里按 pos0 算的因果窗口不是一回事。 */
+    if (!full_block &&
+        v41_sparse_attn_split((float *)o->ptr, (const float *)q->ptr, (const float *)kv_win->ptr,
+                              kv_comp ? (const float *)kv_comp->ptr : NULL, idx ? (const int32_t *)idx->ptr : NULL,
+                              sink, n_tok, pos0, window, ng, (kv_comp && idx) ? topk : 0u, n_head, head_dim, scale))
+        return 1;
+    /* 草稿块(full_block)不走 mma 版: 那份是按因果窗口写的, 块内全可见的语义它没有(而且 n=5 也填不满张量核) */
+    if (!full_block && ds4_sparse_attn_mma_launch((float *)o->ptr, (const float *)q->ptr, (const float *)kv_win->ptr,
+                                   kv_comp ? (const float *)kv_comp->ptr : NULL, idx ? (const int32_t *)idx->ptr : NULL,
+                                   sink, n_tok, pos0, window, ng, (kv_comp && idx) ? topk : 0u, n_head, head_dim, scale))
+        return 1;
     v41_sparse_attn_kernel<<<dim3(n_tok, n_head / V41_ATTN_HEADS_PER_BLOCK), V41_ATTN_HEADS_PER_BLOCK * 16u, 0, g_cur_stream>>>(
         (float *)o->ptr, (const float *)q->ptr, (const float *)kv_win->ptr,
-        kv_comp ? (const float *)kv_comp->ptr : NULL, idx ? (const int32_t *)idx->ptr : NULL, sink, pos0, window, ng, (kv_comp && idx) ? topk : 0u, n_head, head_dim, scale, n_tok > 1u);
+        kv_comp ? (const float *)kv_comp->ptr : NULL, idx ? (const int32_t *)idx->ptr : NULL, sink, pos0, window, ng,
+        (kv_comp && idx) ? topk : 0u, n_head, head_dim, scale, full_block ? n_tok : 0u);
     return cuda_ok(cudaGetLastError(), "v41 sparse attn");
 }

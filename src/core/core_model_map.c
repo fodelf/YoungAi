@@ -107,7 +107,7 @@ ds4_tensor *model_find_tensor(const ds4_model *m, const char *name) {
 typedef struct {
     uint64_t off;
     uint64_t end;
-    uint32_t prio;   /* 0 骨架(先拷) 1 专家/blob(后填) */
+    uint32_t prio;   /* 0 主干骨架(先拷) 1 主干专家/blob 2 DSpark 三塔(最后; 投机不开时一次都不读) */
 } accelerator_tensor_span;
 
 static int accelerator_tensor_span_cmp(const void *a, const void *b) {
@@ -117,13 +117,29 @@ static int accelerator_tensor_span_cmp(const void *a, const void *b) {
     return 0;
 }
 
+/* 装载期的内存地板(single.md S1 §4 第一条): 拷进设备副本的那一刻, 源 mmap 页还没被回收,
+ * 同一份字节短暂占两份 —— 实测 109.79 GiB 装完时 MemAvailable 谷底 10.5 GB, 只比地板(10 GB, 09-08
+ * 实撞 5 GB 时 swap、解码 21.6 → 12.5)高 0.5 GB。所以每装一段就看一眼真实余量, 低于 12 GB 就收手:
+ * 剩下的张量走主机映射(慢, 但对账会大声报), 总比把机器推进 swap 强。★别 OOM 是最高约束★ */
+#define DS4_CACHE_AVAIL_FLOOR_BYTES (12ull * 1000000000ull)   /* 十进制 GB, 与 /proc/meminfo 同口径 */
+static uint64_t accelerator_mem_available_bytes(void) {
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return UINT64_MAX;   /* 读不到就不闸(别把功能建在探测上) */
+    char line[256];
+    uint64_t kb = 0;
+    while (fgets(line, sizeof line, f))
+        if (sscanf(line, "MemAvailable: %llu kB", (unsigned long long *)&kb) == 1) break;
+    fclose(f);
+    return kb ? kb * 1024ull : UINT64_MAX;
+}
+
 static uint64_t accelerator_cuda_preload_span_bytes(void) {
     /* 1 GiB/段: 单段 cudaMalloc 足够大到吃满预载带宽, 又不至于让 arena
      * 一次性要走巨块(超大张量自成整段, 见下方分组逻辑)。 */
     return 1024ull * 1048576ull;
 }
 
-static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *cached_out) {
+static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *cached_out, uint64_t *want_out) {
     /* Routed MoE expert weights (`*_exps.weight`) are ~65 GiB of the model on
      * V4-Flash but only top-K of N=256 experts fire per token — pre-caching
      * them in HBM wastes most of the budget on cold weights and starves the
@@ -163,10 +179,15 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
         if (!cache_exps && is_exp) {
             continue;
         }
+        /* ★2026-09-15 single.md S1: 三塔排最后★ —— `mtp.*` 是 DSpark 草稿器的 7.3 GiB,
+         * 它的名字里既没有 "_exps." 也没有 "_exps_vq.", 原来算 prio 0 跟骨架抢在最前面装。
+         * 而投机没开(--no-dspark, 本底座默认)时这 7.3 GiB 一次都不会被读, 却把主干最后几层的
+         * 专家 blob 挤出了预算 —— 挤出去的那几层每步要多付 5~25 ms(见 single.md §2.1)。 */
+        const bool is_mtp = t->name.len > 4 && memcmp(t->name.ptr, "mtp.", 4) == 0;
         spans[nspan++] = (accelerator_tensor_span){
             .off = t->abs_offset,
             .end = t->abs_offset + t->bytes,
-            .prio = (is_exp || is_blob) ? 1u : 0u,
+            .prio = is_mtp ? 2u : ((is_exp || is_blob) ? 1u : 0u),
         };
     }
     /* ★骨架先拷、专家/blob 后填(2026-09-12)★: 之前纯按偏移排, V4.1 的 103 GiB 里 98 GB 是 40 层 blob, 预算(总内存-24 GiB)
@@ -176,6 +197,8 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
     qsort(spans, (size_t)nspan, sizeof(spans[0]), accelerator_tensor_span_cmp);
 
     const uint64_t max_span = accelerator_cuda_preload_span_bytes();
+    uint64_t total_bytes = 0;
+    for (uint64_t i = 0; i < nspan; i++) total_bytes += spans[i].end - spans[i].off;
     uint64_t cached = 0;
     uint64_t merged = 0;
     for (uint64_t i = 0; i < nspan;) {
@@ -203,6 +226,17 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
             }
             char label[96];
             snprintf(label, sizeof(label), "tensor-span:%" PRIu64, merged);
+            if (accelerator_mem_available_bytes() < DS4_CACHE_AVAIL_FLOOR_BYTES) {
+                fprintf(stderr,
+                        "ds4: ★内存地板★ MemAvailable 已低于 %.0f GB, 停止把权重拷进设备副本;\n"
+                        "     余下 %.2f GiB 走主机映射(每步会有长尾, 见 single.md §2.1)\n",
+                        (double)DS4_CACHE_AVAIL_FLOOR_BYTES / 1e9,
+                        (double)(total_bytes - cached) / 1073741824.0);
+                free(spans);
+                if (cached_out) *cached_out = cached;
+                if (want_out) *want_out = total_bytes;
+                return true;
+            }
             if (ds4_gpu_cache_model_range(m->map, m->size, off, chunk_end - off, label) == 0) {
                 fprintf(stderr,
                         "ds4: accelerator failed to cache model tensor span %" PRIu64
@@ -217,6 +251,7 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
     }
     free(spans);
     if (cached_out) *cached_out = cached;
+    if (want_out) *want_out = total_bytes;
     return true;
 }
 #endif
@@ -227,8 +262,8 @@ bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m) {
 
 #ifdef DS4_CUDA_SPARK_HBM_CACHE
     const double t0 = now_sec();
-    uint64_t cached = 0;
-    if (!accelerator_cache_model_tensor_spans(m, &cached)) return false;
+    uint64_t cached = 0, want = 0;
+    if (!accelerator_cache_model_tensor_spans(m, &cached, &want)) return false;
 #else
     uint64_t cached = 0;
 #endif
@@ -249,10 +284,25 @@ bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m) {
     if (cached != 0) {
         const double t1 = now_sec();
         if (ds4_log_is_tty(stderr)) fputc('\n', stderr);
+        /* ★对账(single.md S1)★: `cached` 是我们**请求**装的字节, `ds4_gpu_model_cache_bytes()` 是
+         * 真正拷进设备副本的。超预算的段是静默走主机映射的 —— 那几 GiB 就是每步 5~25 ms 的长尾,
+         * 而以前的日志一个字都看不见。差值 >0 必须大声说, 否则后面每一刀的速度读数都被它糊掉。 */
+        const uint64_t in_dev = ds4_gpu_model_cache_bytes();
+        /* ★分母是"该装的全部"(want), 不是"这趟装成了的"(cached)★ —— 拿 cached 当分母, 闸一提前收手
+         * 差值就恒为 0, 对账等于没做(2026-09-15 第一版就这么写错过)。 */
+        const uint64_t mapped = want > in_dev ? want - in_dev : 0;
         fprintf(stderr,
                 "ds4: CUDA startup model cache prepared %.2f GiB of tensor spans in %.3fs\n",
                 (double)cached / 1073741824.0,
                 t1 - t0);
+        fprintf(stderr, "ds4: [缓存对账] 装进设备 %.2f GiB / 走主机映射 %.2f GiB\n",
+                (double)in_dev / 1073741824.0, (double)mapped / 1073741824.0);
+        if (mapped > 0)
+            fprintf(stderr,
+                    "ds4: ★%.2f GiB 权重没进设备副本, 走 cudaHostRegister 映射 —— 若解码路会读它, 每步要被页回收\n"
+                    "     拖出几毫秒到几十毫秒的长尾(single.md §2.1)。被挤出的是最后装的那批(装载优先级:\n"
+                    "     主干骨架 > 主干专家 blob > DSpark 三塔), 所以三塔被挤出时解码不受影响(它一次都不读)。★\n",
+                    (double)mapped / 1073741824.0);
     }
 #else
     (void)cached;

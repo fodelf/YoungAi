@@ -196,7 +196,7 @@ struct ds4_session {
 extern const char DS4_REASONING_EFFORT_MAX_PREFIX[];
 extern uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER];
 extern uint32_t g_requested_threads;
-extern const gguf_type_info gguf_types[44];   /* [43]=fp4x32(V4.1 骨架) */
+extern const gguf_type_info gguf_types[45];   /* [43]=fp4x32(V4.1 骨架) [44]=fp8_32x32(engram wkv) */
 extern bool g_model_open_arm_env_defaults;
 extern bool g_vq_experts_blob;
 extern pthread_once_t iq2xxs_signed_grid_once;

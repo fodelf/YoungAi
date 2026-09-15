@@ -126,7 +126,7 @@ endif
         dql_to_zchain teacher_routed zloss_solve finetune_solve \
         calib_run calib_diag validate_fwd traj_analyze cap_raw2npy vq_blob_truesize dump_gguf_meta \
         kl_forensic trace_ladder rec_fidelity pubbench pubbench_extract_test vq_merge_v4 \
-        go2b_parity vq2q2k_probe vq_em deepseek4-quantize-cpu
+        go2b_parity vq2q2k_probe vq_em deepseek4-quantize-cpu gemm_fp4_ceiling
 
 all: deepseek4-quantize anchor_metrics compare_scores rplan_solve route_alpha_set
 amp: ds4quant_run zlayer dql_to_zchain teacher_routed zloss_solve finetune_solve
@@ -392,6 +392,16 @@ $(QZ)/vq2q2k_probe: $(QZ)/vq2q2k_probe.c $(QZ)/quants.c $(QUANTS_INC) $(QZ)/oneb
 	$(CC) $(BARE) $(NATIVE) -o $@ $(QZ)/vq2q2k_probe.c $(QZ)/quants.c $(QZ)/onebit_quant.c -lm -lpthread
 
 # vq_em: GPU-EM 码本精修, Linux+CUDA 专属(st_bridge.c 桥接 st_read)。
+# gemm_fp4_ceiling: speed.md S0 探针(窄精度 GEMM 天花板)。不进 bench 全目标 —— 它要 GB10 实机,
+# 且只在速度战役起跑时跑一次; Mac 上没有 cuBLASLt 的 FP4 路。
+ifeq ($(UNAME_S)-$(CUDA),Linux-1)
+gemm_fp4_ceiling: $(BEN)/gemm_fp4_ceiling.cu
+	$(NVCC) -O3 -arch=native -o $@ $< -lcublasLt -lcublas
+else
+gemm_fp4_ceiling:
+	@echo "gemm_fp4_ceiling: Linux+CUDA 专属(cuBLASLt FP4), 本平台跳过"
+endif
+
 ifeq ($(UNAME_S)-$(CUDA),Linux-1)
 vq_em: vq_em.bin
 .PHONY: vq_em.bin

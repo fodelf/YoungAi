@@ -51,6 +51,8 @@ typedef enum {
  * 为什么单列一个结构而不塞进 ds4_shape: shape 是"维度", 这些是"接线"(哪层读哪层的缓存),
  * 热路径按层查表, 不能每层再去扫元数据。 */
 #define DS4_V41_MAX_ENGRAM 4
+#define DS4_MTP_MAX_TOWERS 4      /* DSpark 草稿塔数上限(官方 3); 真值读元数据 */
+#define DS4_MTP_MAX_EXPERTS 256   /* 每塔专家数上限(官方 128); 真值读元数据 */
 typedef struct {
     int      active;
     uint8_t  is_kv_source[DS4_MAX_LAYER];     /* 本层自己压缩并持有压缩 KV 缓存 */
@@ -66,6 +68,14 @@ typedef struct {
     char     engram_table_path[DS4_V41_MAX_ENGRAM][1024];
     uint32_t engram_max_ngram, engram_heads, engram_head_dim, engram_vocab, engram_cvocab, engram_pad;
     float    swiglu_limit;
+    uint32_t mtp_towers, mtp_experts;   /* DSpark: 塔数 / 每塔专家数, 0 = 这份 GGUF 没带三塔 */
+    uint32_t mtp_used;         /* 每个草稿位在每塔选几个专家(官方 3) */
+    uint32_t mtp_block;        /* 一次出几个草稿位(官方 5); 0 = 元数据没带 ⇒ 投机路不武装 */
+    uint32_t mtp_noise_id;     /* 草稿块首位之后那几位的占位 token id(官方 128799) */
+    uint32_t mtp_markov_rank;  /* markov 头的秩(官方 256) */
+    int16_t  mtp_target[DS4_MTP_MAX_TOWERS * 2];   /* main_x 取哪几层的注意力输入(官方 37/38/39) */
+    int16_t  mtp_target_slot[DS4_MAX_LAYER];       /* 层 → 在 main_hidden 里的第几段, -1 = 不取 */
+    uint32_t n_mtp_target;
 } ds4_v41_cfg;
 extern ds4_v41_cfg g_ds4_v41;
 
@@ -160,10 +170,12 @@ enum {
     DS4_TENSOR_Q4_K     = 12,
     DS4_TENSOR_IQ2_XXS  = 16,
     DS4_TENSOR_I32      = 26,
+    DS4_TENSOR_BF16     = 30,   /* 官方权重的原生精度: 转换器不再展开成 f32(clear.md C1, 2026-09-15) */
     DS4_TENSOR_GO1B     = 40,   /* strict-1-bit routed expert; mirrors GGUF ggml type 40 */
     DS4_TENSOR_GO2B     = 41,   /* merged base+residual binary pair (R5-C go2b) */
     DS4_TENSOR_VQBLOB   = 42,   /* VQ 层 blob(DQVL), 字节不透明 */
-    DS4_TENSOR_FP4X32   = 43,   /* V4.1 骨架: FP4 E2M1 + ue8m0/32, 17 B/32 元素(src/common/ds4_quantfmt.h) */
+    DS4_TENSOR_FP4X32   = 43,
+    DS4_TENSOR_FP8_32X32 = 44,  /* engram wkv: e4m3 + 32×32 块 ue8m0(src/common/ds4_quantfmt.h) */   /* V4.1 骨架: FP4 E2M1 + ue8m0/32, 17 B/32 元素(src/common/ds4_quantfmt.h) */
 };
 
 typedef struct {

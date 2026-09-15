@@ -95,7 +95,7 @@ CUDA_SPARK_FLAGS := -DDS4_CUDA_SPARK_HBM_CACHE=1
 MM_OBJS = ds4_multimodal.o ds4_spatial.o ds4_css.o
 CORE_OBJS = $(CORE_ENGINE_OBJS) $(COMMON_FMT_OBJS) ds4_corr.o ds4_zchain.o ds4_zfinetune.o ds4_z.o ds4_loss.o $(MM_OBJS) $(DIST_OBJS) ds4_cuda.o
 CPU_CORE_OBJS = $(CORE_ENGINE_CPU_OBJS) $(COMMON_FMT_OBJS) ds4_corr_cpu.o ds4_zchain.o ds4_zfinetune.o ds4_z.o ds4_loss.o $(MM_OBJS) $(DIST_OBJS)
-CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
+CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt
 METAL_LDLIBS := $(LDLIBS)
 endif
 

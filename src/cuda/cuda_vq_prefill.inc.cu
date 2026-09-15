@@ -1,71 +1,47 @@
-/* cuda_vq_prefill.inc.cu — VQ 专家的批量(prefill) GEMM 路(2026-09-06)。
+/* cuda_vq_prefill.inc.cu — VQ 专家批量(prefill)路的【调度骨架】(2026-09-06 建, 09-15 清到只剩骨架)。
  *
- * 为什么: 原 prefill 路(已删)每个 256 token 块把本层全部活跃专家(≈256 个)dequant 成 f16 落
- * 12.9 GB scratch, 再用逐 (token,pick) 的 warp 核算 —— 8192 token 一趟 dequant 60 万次(63 s)、
- * gateup/down 核 78 s, 算力只跑到 44 GFLOPS; 合起来 prefill 20 t/s, 比 decode 还慢。
- * 这里: (token,pick) 对按专家排序 → 每个专家只 dequant 一次(3 个矩阵 42 MB, 用完即弃, 不落
- * 缓存)→ 该专家名下的 n_e 行激活做两发 cuBLAS f16 GEMM(gate+up 拼成一个 [2·MID×IN] 权重
- * 一发, down 一发)→ 最后按 token 以固定 pick 序加权求和(定序 ⇒ 同输入可复现)。scratch 不到
- * 1 GB。每块固定成本 = 43 层 × 256 专家 × 3 次 dequant ≈ 3.5 s, 所以 prefill 块越大越省:
- * 块 4096 时折合 0.85 ms/token(块默认值见 core_kv.c)。
- * 数值: 激活 f32→f16、h f32→f16(与 f16 骨架 prefill 同口径); decode 路(fused2)读 f32 激活。
- * 两路不逐位同, 判决走批路五指标(kernel_parity_spark.sh … prefill)。
- * 改了会怎样: 把 dequant 改回"全层落缓存跨块复用"要 43 层 × 12.9 GB, 单机放不下, 别走回头路;
- * reduce 若改成 atomicAdd 会回到 08-22 删掉的"同 prompt 两次跑不同"。 */
+ * 这个文件不做乘法。它干的是乘法之前和之后的事:
+ *   ① (token,pick) 对按专家做稳定计数排序 —— 同一个专家名下的激活行排到一起, 一个专家的权重只碰一次;
+ *   ② 每层一次把 blob 里 384×3 个槽的头抄到主机缓存(vqp_hdr_build), 免得主机逐个碰 mmap 缺页;
+ *   ③ 算完之后按 token 以固定 pick 序加权求和(vqp_reduce_kernel, 定序 ⇒ 同输入逐位可复现);
+ *   ④ 反修取料(逐专家 down 输出)与 gr 覆盖。
+ * 真正的乘法在 vqp_fused_run(cuda_vq_prefill_fused.inc.cu → cuda_vq_prefill_nvfp4.inc.cu):
+ * VQ 位流直接解成 NVFP4 喂板子的 FP4 张量核, 不落任何 f16 暂存。
+ *
+ * ★2026-09-15 clear.md C0 删掉的: 老的"逐专家 dequant 成 f16 → cuBLAS f16 GEMM"那条路★
+ * (vqp_gemm / vqp_gather_kernel(f32→f16) / vqp_swiglu_kernel(出 f16) / g_vqp.xs 暂存 / 4 条侧流 lane)。
+ * 09-15 第三轮起预填专家已走融合路, 这些件再没被调用过, 但侧流初始化还在每次跑时建 4 个流 +
+ * 4 个 cuBLAS 句柄 + 5 个事件。删它不改任何数值。
+ *
+ * 改了会怎样: reduce 若改成 atomicAdd 会回到 08-22 删掉的"同 prompt 两次跑不同"; 排序若丢了稳定性
+ * (同专家内不保持 token 序)同样不可复现 —— 两者都不报错, 只是同一份输入跑出两个 PPL。 */
 
 /* 权重侧反修(--zchain 目录里的 gr_Lnn.bin): [layer] → 设备上的 s[n_expert][OUT] 缩放因子, NULL = 该层不挂。
  * 只作用在 down 的行增益上(行 = 输出通道)。挂了就 100% 生效, 不做任何静默回退。 */
 static float *g_v41_gr[64];
 
+/* 融合路(cuda_vq_prefill_fused.inc.cu, 同一 TU 后面定义): VQ 解码即乘, 不落 f16 暂存。
+ * 2026-09-15 第三轮起它是【唯一】的预填专家路 —— 逐专家 dequant + cuBLAS 那条已删(算术强度只有 8,
+ * 为 8 个 token 解一整份权重, 见新文件头的账)。 */
+static int vqp_fused_run(const uint8_t *blob, const uint32_t *cnt, const uint32_t *off_h, uint32_t n_total_expert,
+                         uint32_t nvalid, uint32_t IN, uint32_t MID, uint32_t OUT, uint32_t nc, float clamp,
+                         const float *x, const int32_t *perm, uint32_t n_expert, uint32_t layer_index);
+
 static struct {
-    __half  *xs;   uint64_t xs_cap;    /* 排序后的激活 [nvalid][IN] f16 */
     float   *ys;   uint64_t ys_cap;    /* 排序后的 down 输出 [nvalid][OUT] f32 */
     int32_t *perm; uint64_t perm_cap;  /* 排序位置 → pair 编号 */
     int32_t *inv;  uint64_t inv_cap;   /* pair 编号 → 排序位置(-1=无效 pick) */
 } g_vqp;
 
-/* 侧流流水(pf3): 专家 i 走 lane i%N, lane 内串行(dequant→GEMM→swiglu→GEMM), lane 间并行 ⇒
- * 带宽型 dequant(每专家 42 MB f16 落盘, 180 GB/s)与算力型 GEMM 重叠; 小 n 的专家 GEMM
- * (m=4096 一段只有 32 个 CTA, 填不满 48 SM)也能几发并跑。每 lane 自带 cuBLAS 句柄: 同一句柄
- * 换流会让各流共用一份 workspace(cuBLAS 文档明令禁止)。同步只靠事件: 主流 gather 后记 start,
- * lane 等 start; 末尾主流等全部 lane 的 done 再 reduce —— lane 是 NonBlocking 流, 不与
- * 默认流隐式同步。结果逐位不变: 每专家写自己的 ys 行段, reduce 定序。 */
-#define VQP_NLANE 4u
-typedef struct {
-    cudaStream_t st; cublasHandle_t bl; cudaEvent_t done;
-    float   *gu;   uint64_t gu_cap;    /* 单专家 gate|up 输出 [ne_max][2·MID] f32 */
-    __half  *h;    uint64_t h_cap;     /* 单专家 SwiGLU 中间 [ne_max][MID] f16 */
-    __half  *wgu;  uint64_t wgu_cap;   /* 单专家权重 gate|up [2·MID][IN] f16 */
-    __half  *wd;   uint64_t wd_cap;    /* 单专家权重 down [OUT][MID] f16 */
-} vqp_lane;
 /* 反修取料(2026-09-13): 上一次 prefill MoE 的形状 + 展开缓冲。形状用来校验取料方要的层对不对得上。 */
 static uint32_t g_vqp_last_tok = 0, g_vqp_last_used = 0, g_vqp_last_out = 0;
 static float *g_vqp_cap = NULL; static uint64_t g_vqp_cap_n = 0;
 
-static vqp_lane g_vqp_lane[VQP_NLANE];
-static cudaEvent_t g_vqp_ev_start = NULL;
-static int g_vqp_lanes_ready = 0;
-
-static int vqp_lanes_init(void) {
-    if (g_vqp_lanes_ready) return 1;
-    cublasMath_t mm = CUBLAS_DEFAULT_MATH;
-    (void)cublasGetMathMode(g_cublas, &mm);   /* 与主句柄同数学模式(quality 开关) */
-    if (cudaEventCreateWithFlags(&g_vqp_ev_start, cudaEventDisableTiming) != cudaSuccess) {
-        (void)cudaGetLastError(); return 0;
-    }
-    for (uint32_t s = 0; s < VQP_NLANE; s++) {
-        vqp_lane *L = &g_vqp_lane[s];
-        if (cudaStreamCreateWithFlags(&L->st, cudaStreamNonBlocking) != cudaSuccess ||
-            cudaEventCreateWithFlags(&L->done, cudaEventDisableTiming) != cudaSuccess) {
-            (void)cudaGetLastError(); return 0;
-        }
-        if (!cublas_ok(cublasCreate(&L->bl), "vq prefill lane handle")) return 0;
-        (void)cublasSetMathMode(L->bl, mm);
-        if (!cublas_ok(cublasSetStream(L->bl, L->st), "vq prefill lane stream")) return 0;
-    }
-    g_vqp_lanes_ready = 1;
-    return 1;
-}
+/* ★2026-09-15 clear.md C0: 侧流流水(4 lane × 流/cuBLAS 句柄/事件 + 每 lane 的 f16 权重暂存)已删★
+ * 它是"逐专家 dequant 成 f16 → cuBLAS"那条路的配套: 让带宽型 dequant 与算力型 GEMM 重叠。
+ * 09-15 第三轮起预填专家走融合/NVFP4, 权重不再落 f16 暂存, 这 4 条 lane 就再没人往里发过东西 ——
+ * 但初始化还在每次跑时建 4 个流 + 4 个 cuBLAS 句柄 + 5 个事件(cuBLAS 句柄各自带 workspace)。
+ * 删它不改任何数值: 全路径都在 g_cur_stream 上。 */
 
 static int vqp_grow(void **p, uint64_t *cap, uint64_t need, size_t elem, const char *what) {
     if (need <= *cap) return 1;
@@ -79,32 +55,6 @@ static int vqp_grow(void **p, uint64_t *cap, uint64_t need, size_t elem, const c
     }
     *cap = need;
     return 1;
-}
-
-/* 排序位置 i 取 pair perm[i] 所属 token 的激活行, f32→f16 */
-__global__ static void vqp_gather_kernel(__half *xs, const float *x, const int32_t *perm,
-                                         uint32_t n_expert, uint32_t IN) {
-    const uint32_t i = blockIdx.x;
-    const uint32_t t = (uint32_t)perm[i] / n_expert;
-    const float *src = x + (uint64_t)t * IN;
-    __half *dst = xs + (uint64_t)i * IN;
-    for (uint32_t k = threadIdx.x; k < IN; k += blockDim.x) dst[k] = __float2half(src[k]);
-}
-
-/* h = silu(clamp_hi(g)) · clamp(u): clamp 语义同 decode 路(gate 只截上界, up 双向截) */
-__global__ static void vqp_swiglu_kernel(__half *h, const float *gu, uint32_t MID, float clamp) {
-    const uint32_t row = blockIdx.x;
-    const float *g = gu + (uint64_t)row * 2u * MID, *u = g + MID;
-    __half *o = h + (uint64_t)row * MID;
-    for (uint32_t m = threadIdx.x; m < MID; m += blockDim.x) {
-        float gv = g[m], uv = u[m];
-        if (clamp > 0.0f) {
-            if (gv > clamp) gv = clamp;
-            if (uv > clamp) uv = clamp;
-            if (uv < -clamp) uv = -clamp;
-        }
-        o[m] = __float2half((gv / (1.0f + __expf(-gv))) * uv);
-    }
 }
 
 /* out[t][o] = Σ_pk w[t][pk] · ys[inv[t·n_expert+pk]][o], pick 序固定 ⇒ 可复现 */
@@ -184,16 +134,6 @@ static int vqp_hdr_build(uint32_t layer, const uint8_t *blob, uint32_t n_total,
     return 1;
 }
 
-/* C[n][m] = B[n][k] · A[m][k]^T (行主序视角), f16 输入 f32 累加, 与稠密 f16 路同一 cuBLAS 口径 */
-static int vqp_gemm(cublasHandle_t bl, const __half *A, int lda, const __half *B, int ldb, float *C, int ldc,
-                    int m, int n, int k, const char *what) {
-    const float alpha = 1.0f, beta = 0.0f;
-    cublasStatus_t st = cublasGemmEx(bl, CUBLAS_OP_T, CUBLAS_OP_N, m, n, k, &alpha,
-                                     A, CUDA_R_16F, lda, B, CUDA_R_16F, ldb, &beta,
-                                     C, CUDA_R_32F, ldc, CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
-    return cublas_ok(st, what);
-}
-
 static int cuda_vq_moe_prefill_gemm(
         ds4_gpu_tensor *out, const uint8_t *blob,
         const void *model_map, uint64_t down_offset, uint64_t down_expert_bytes,
@@ -202,7 +142,6 @@ static int cuda_vq_moe_prefill_gemm(
         uint32_t n_total_expert, uint32_t n_expert, float clamp,
         const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens) {
     if (!g_cublas_ready) { fprintf(stderr, "ds4: [vq-prefill] cuBLAS 未就绪 (L%u)\n", layer_index); return 0; }
-    if (!vqp_lanes_init()) { fprintf(stderr, "ds4: [vq-prefill] 侧流初始化失败 (L%u)\n", layer_index); return 0; }
     if (!vqp_hdr_build(layer_index, blob, n_total_expert, IN, MID, OUT)) return 0;
     const vqp_slot_hdr *tab = g_vqp_hdr[layer_index];
     const uint64_t npair = (uint64_t)n_tokens * n_expert;
@@ -242,74 +181,31 @@ static int cuda_vq_moe_prefill_gemm(
             perm_h[pos] = (int32_t)k;
             inv_h[k] = (int32_t)pos;
         }
-        if (!vqp_grow((void **)&g_vqp.xs, &g_vqp.xs_cap, (uint64_t)nvalid * IN, sizeof(__half), "xs") ||
-            !vqp_grow((void **)&g_vqp.ys, &g_vqp.ys_cap, (uint64_t)nvalid * OUT, sizeof(float), "ys") ||
+        /* +V41_VQN_PAD 行: NVFP4 路把 GEMM 的 n 对齐到 2 的幂, 最后一个专家的补齐行落在这里 */
+        if (!vqp_grow((void **)&g_vqp.ys, &g_vqp.ys_cap, ((uint64_t)nvalid + 2048u) * OUT, sizeof(float), "ys") ||
             !vqp_grow((void **)&g_vqp.perm, &g_vqp.perm_cap, nvalid, sizeof(int32_t), "perm") ||
             !vqp_grow((void **)&g_vqp.inv, &g_vqp.inv_cap, npair, sizeof(int32_t), "inv")) break;
-        int grown = 1;
-        for (uint32_t s = 0; s < VQP_NLANE && grown; s++) {
-            vqp_lane *L = &g_vqp_lane[s];
-            grown = vqp_grow((void **)&L->gu, &L->gu_cap, (uint64_t)ne_max * 2u * MID, sizeof(float), "gu") &&
-                    vqp_grow((void **)&L->h, &L->h_cap, (uint64_t)ne_max * MID, sizeof(__half), "h") &&
-                    vqp_grow((void **)&L->wgu, &L->wgu_cap, (uint64_t)2u * MID * IN, sizeof(__half), "wgu") &&
-                    vqp_grow((void **)&L->wd, &L->wd_cap, (uint64_t)OUT * MID, sizeof(__half), "wd");
-        }
-        if (!grown) break;
+        (void)ne_max;   /* 融合路按工作项(≤8 token)开寄存器累加器, 不需要按最大专家宽度预分配 */
         if (cudaMemcpy(g_vqp.perm, perm_h, (size_t)nvalid * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess ||
             cudaMemcpy(g_vqp.inv, inv_h, (size_t)npair * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
             (void)cudaGetLastError(); break;
         }
-        vqp_gather_kernel<<<nvalid, 256, 0, g_cur_stream>>>(g_vqp.xs, (const float *)x->ptr, g_vqp.perm, n_expert, IN);
-        if (!cuda_ok(cudaGetLastError(), "vq prefill gather launch")) break;
-        if (cudaEventRecord(g_vqp_ev_start, g_cur_stream) != cudaSuccess) { (void)cudaGetLastError(); break; }
+        /* ★2026-09-15 第三轮: 逐专家 dequant→cuBLAS 换成融合路(解码即乘)★
+         * 先在主机把槽表查一遍: 有 token 的专家缺 w1/w3/w2 槽就硬失败, 不让核里写 0 悄悄降质。 */
         int bad = 0;
-        for (uint32_t s = 0; s < VQP_NLANE; s++)
-            if (cudaStreamWaitEvent(g_vqp_lane[s].st, g_vqp_ev_start, 0) != cudaSuccess) { (void)cudaGetLastError(); bad = 1; }
-        if (bad) break;
-
-        uint32_t li = 0;
         for (uint32_t e = 0; e < n_total_expert && !bad; e++) {
-            const uint32_t ne = cnt[e];
-            if (!ne) continue;
-            vqp_lane *L = &g_vqp_lane[li++ % VQP_NLANE];
-            const vqp_slot_hdr *h1 = &tab[(size_t)e * 3u], *h3 = h1 + 1, *h2 = h1 + 2;
-            if (!h1->off || !h3->off) {
-                fprintf(stderr, "ds4: [vq-prefill] L%u e=%u w1/w3 槽缺失 -- aborting\n", layer_index, e);
-                bad = 1; break;
+            if (!cnt[e]) continue;
+            const vqp_slot_hdr *h1 = &tab[(size_t)e * 3u];
+            if (!h1->off || !(h1 + 1)->off || !(h1 + 2)->off) {
+                fprintf(stderr, "ds4: [vq-prefill] L%u e=%u 槽缺失(w1/w3/w2) -- aborting (no silent quality downgrade)\n",
+                        layer_index, e);
+                bad = 1;
             }
-            vq_dequant_kernel<<<MID, 256, 0, L->st>>>(L->wgu, blob + h1->off, MID, IN, h1->dim, h1->nc, h1->nbit, NULL);
-            vq_dequant_kernel<<<MID, 256, 0, L->st>>>(L->wgu + (uint64_t)MID * IN, blob + h3->off,
-                                                      MID, IN, h3->dim, h3->nc, h3->nbit, NULL);
-            if (h2->off) {
-                /* down 的行 = 输出通道 ⇒ 权重侧反修的增益覆盖挂在这里(只有 down 解了增益) */
-                const float *gov = g_v41_gr[layer_index < 64u ? layer_index : 0];
-                vq_dequant_kernel<<<OUT, 256, 0, L->st>>>(L->wd, blob + h2->off, OUT, MID, h2->dim, h2->nc, h2->nbit,
-                                                          gov ? gov + (size_t)e * OUT : NULL);
-            } else {
-                /* 冷 w2 回退: base down 是影子张量时硬失败, 不读垃圾当权重(同 decode 路)。 */
-                if (down_expert_bytes == 0 || down_offset == 0) {
-                    fprintf(stderr, "ds4: [vq-prefill] L%u e=%u 冷 w2 槽缺失且 base down 不在文件里"
-                                    "(影子张量) -- aborting (no silent quality downgrade)\n", layer_index, e);
-                    bad = 1; break;
-                }
-                const uint8_t *sd = (const uint8_t *)model_map + down_offset + (uint64_t)e * down_expert_bytes;
-                vq_cold_w2_kernel<<<OUT, 256, 0, L->st>>>(L->wd, sd, OUT, MID);
-            }
-            if (!cuda_ok(cudaGetLastError(), "vq prefill dequant launch")) { bad = 1; break; }
-            const __half *xe = g_vqp.xs + (uint64_t)off[e] * IN;
-            if (!vqp_gemm(L->bl, L->wgu, (int)IN, xe, (int)IN, L->gu, (int)(2u * MID),
-                          (int)(2u * MID), (int)ne, (int)IN, "vq prefill gate/up gemm")) { bad = 1; break; }
-            vqp_swiglu_kernel<<<ne, 256, 0, L->st>>>(L->h, L->gu, MID, clamp);
-            if (!cuda_ok(cudaGetLastError(), "vq prefill swiglu launch")) { bad = 1; break; }
-            if (!vqp_gemm(L->bl, L->wd, (int)MID, L->h, (int)MID, g_vqp.ys + (uint64_t)off[e] * OUT, (int)OUT,
-                          (int)OUT, (int)ne, (int)MID, "vq prefill down gemm")) { bad = 1; break; }
-        }
-        for (uint32_t s = 0; s < VQP_NLANE; s++) {   /* 出错也要把主流拴回来, 别让下一层踩在飞的 lane */
-            vqp_lane *L = &g_vqp_lane[s];
-            if (cudaEventRecord(L->done, L->st) != cudaSuccess ||
-                cudaStreamWaitEvent(g_cur_stream, L->done, 0) != cudaSuccess) { (void)cudaGetLastError(); bad = 1; }
         }
         if (bad) break;
+        (void)model_map; (void)down_offset; (void)down_expert_bytes;
+        if (!vqp_fused_run(blob, cnt, off, n_total_expert, nvalid, IN, MID, OUT,
+                           tab[0].nc, clamp, (const float *)x->ptr, g_vqp.perm, n_expert, layer_index)) break;
         vqp_reduce_kernel<<<dim3((OUT + 255u) / 256u, n_tokens, 1), 256, 0, g_cur_stream>>>(
             (float *)out->ptr, g_vqp.ys, g_vqp.inv, (const float *)weights->ptr, n_expert, OUT);
         ok = cuda_ok(cudaGetLastError(), "vq prefill reduce launch");

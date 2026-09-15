@@ -204,6 +204,9 @@ uint64_t ds4_gpu_current_allocated_bytes(void);
  * as the token is known.  hash_table_offset == UINT64_MAX for score routing. */
 int ds4_gpu_register_layer_router(const void *model_map, uint32_t layer, uint64_t gate_inp_offset, int gate_inp_is_f32, uint64_t probs_bias_offset, uint64_t gate_exps_offset, uint64_t up_exps_offset, uint64_t down_exps_offset, uint64_t gate_expert_bytes, uint64_t down_expert_bytes, uint32_t n_embd, uint32_t n_expert, uint64_t hash_table_offset, uint32_t hash_k, uint32_t hash_rows);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
+/* 已装进设备副本的总字节。超预算的段是静默走主机映射的(每步 5~25 ms 长尾, 见 single.md S1),
+ * 所以起跑时必须拿它跟"请求装的字节"对账并打印。CUDA 以外的后端返回 0。 */
+uint64_t ds4_gpu_model_cache_bytes(void);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 /* CUDA decode: 启动期把 q8_0 权重 repack 成 scale/qs 分离平面(对齐 128bit 读)。
  * token graph capture 时 host dispatch 只跑一次, repack 表必须先建好。 */

@@ -434,12 +434,20 @@ static uint64_t cuda_model_cache_limit_bytes(void) {
      * DS4_CUDA_WEIGHT_CACHE_LIMIT_GB on hosts with more memory budget. */
 #ifdef DS4_CUDA_SPARK_HBM_CACHE
     /* Spark/GB10 统一内存: 实测 registered-host 页表读被钉在 ~185 GB/s, 设备拷贝 255
-     * (2026-08-17)。默认预算=总内存-24GiB 余量, 整模型尽量收编; 拷贝后源 mmap 页
-     * madvise(DONTNEED), 净占用不翻倍。 */
+     * (2026-08-17)。默认预算=总内存-余量, 整模型尽量收编; 拷贝后源 mmap 页
+     * madvise(DONTNEED), 净占用不翻倍。
+     * ★2026-09-15 single.md S1: 余量 24 → 8 GiB★
+     * 24 GiB 是 V4 时代按"给 page cache 留活路"定的, 而拷进设备的段立刻 MADV_DONTNEED,
+     * page cache 根本不承重。代价是实打实的: 117.9 GB 的模型有约 12 GiB(最后 4~5 层的专家 blob)
+     * 装不进预算, 只能走 cudaHostRegister 的主机映射 —— 那些页在 130 GB 机器上被 kswapd 一直回收,
+     * 每步都有几层缺页从 NVMe 重读。**实测这几层的专家核 235 µs → 1100~4500 µs**(逐核时间线,
+     * gateup 第 10 步 L35/L37/L38/L39), 一步 66 ms 里 5~25 ms 是这个长尾, 首步更是 95 ms。
+     * 8 GiB 盖得住实际的非模型占用: KV@32k 2.4 + 中间张量暂存 ≈2 + CUDA 上下文/cuBLASLt ≈1.5, 留 2 兜底。
+     * ★别 OOM 是最高约束★: 起跑后由 core_model_map.c 的对账打印 + available 检查兜底(见那里的注释)。 */
     {
         const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
         const uint64_t total = (uint64_t)sysconf(_SC_PHYS_PAGES) * page;
-        const uint64_t headroom = 24ull * 1073741824ull;
+        const uint64_t headroom = 8ull * 1073741824ull;
         if (total > headroom * 2) return total - headroom;
     }
 #endif

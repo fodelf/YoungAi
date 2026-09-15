@@ -29,7 +29,7 @@
 #include "../../src/common/ds4_float.h"
 #include "v41_cfg.h"
 
-enum { J_F32_BF16, J_F32_COPY, J_F16_FP8BLK, J_FP4X32, J_VQBLOB, J_RAW };
+enum { J_F32_BF16, J_F32_COPY, J_BF16_COPY, J_FP8BLK, J_FP4X32, J_VQBLOB, J_RAW };
 typedef struct { int kind; char src[192]; int layer; const void *raw; } job_t;
 static job_t *g_jobs; static int g_nj, g_cj;
 static v41_st S; static v41_cfg C; static ds4gw W;
@@ -57,6 +57,17 @@ static void plan_small(const char *gname, const char *src) {            /* bf16/
     if (kind < 0) { fprintf(stderr, "★%s dtype %s 不是 BF16/F32★\n", src, e->dtype); exit(1); }
     add_job(kind, gname, DS4_GGT_F32, (uint32_t)e->nd, ne, (uint64_t)v41_st_numel(e) * 4, src, -1, NULL);
 }
+/* ★2026-09-15 clear.md C1: BF16 原样存, 不再展开成 f32★
+ * 这几个矩阵(路由 gate / compressor / indexer 投影)在 HF 原件里本来就是 BF16, 是我们的转换器
+ * 把它们展成 f32 才让每 token 多读了 0.20 GB。存回 BF16 = **拿回官方精度**, 逐位无损, 字节减半。
+ * 为什么不顺手压 FP4: 这几个矩阵决定"选哪 6 个专家"和"哪些位置进候选池", 位宽一动行为就跳 ——
+ * 要压得单独过五指标门(clear.md C1 的 A/B 项), 不许搭这一刀的便车。 */
+static void plan_bf16(const char *gname, const char *src) {
+    const v41_st_ent *e = need(src);
+    if (strcmp(e->dtype, "BF16")) { fprintf(stderr, "★%s dtype %s 不是 BF16★\n", src, e->dtype); exit(1); }
+    uint64_t ne[4]; for (int i = 0; i < e->nd; i++) ne[i] = (uint64_t)e->shape[e->nd - 1 - i];
+    add_job(J_BF16_COPY, gname, DS4_GGT_BF16, (uint32_t)e->nd, ne, (uint64_t)v41_st_numel(e) * 2, src, -1, NULL);
+}
 static void plan_fp4(const char *gname, const char *src) {             /* FP4 1×32 → fp4x32 */
     const v41_st_ent *e = need(src);
     char sn[192]; snprintf(sn, sizeof sn, "%s", src); char *dot = strrchr(sn, '.'); strcpy(dot, ".scale"); need(sn);
@@ -66,11 +77,21 @@ static void plan_fp4(const char *gname, const char *src) {             /* FP4 1�
     uint64_t ne[2] = {cols, rows};
     add_job(J_FP4X32, gname, DS4_GGT_FP4X32, 2, ne, rows * cols / 32 * 17, src, -1, NULL);
 }
-static void plan_f16_fp8(const char *gname, const char *src) {         /* FP8 32×32 块 → f16 */
+/* ★2026-09-15 clear.md C1: engram wkv 原样存 FP8, 不再展开成 f16★
+ * 这张表 6144×25600, 两层共 0.315 GB。原来转换器把 e4m3×块缩放算成 f16 落盘 —— 字节翻倍(0.63 GB),
+ * **而且是有损的**: f16 只有 10 位尾数, e4m3 的 3 位尾数乘上 2 的幂之后不一定落在 f16 格点上,
+ * 大值还可能溢出(老代码专门数了 over/nan 就是防这个)。原样存反而更准, 且每 token 少读 0.31 GB。
+ * 布局: 先 rows×cols 个 e4m3 字节, 紧跟 ceil(rows/32)×ceil(cols/32) 个 ue8m0 缩放字节。 */
+static void plan_fp8blk(const char *gname, const char *src) {
     const v41_st_ent *e = need(src);
     if (e->nd != 2 || strcmp(e->dtype, "F8_E4M3")) { fprintf(stderr, "★%s 不是 F8_E4M3 二维★\n", src); exit(1); }
-    uint64_t ne[2] = {(uint64_t)e->shape[1], (uint64_t)e->shape[0]};
-    add_job(J_F16_FP8BLK, gname, DS4_GGT_F16, 2, ne, (uint64_t)v41_st_numel(e) * 2, src, -1, NULL);
+    char sn[192]; snprintf(sn, sizeof sn, "%s", src); strcpy(strrchr(sn, '.'), ".scale");
+    const v41_st_ent *se = need(sn);
+    uint64_t rows = (uint64_t)e->shape[0], cols = (uint64_t)e->shape[1];
+    if ((uint64_t)se->shape[0] != (rows + 31) / 32 || (uint64_t)se->shape[1] != (cols + 31) / 32)
+        { fprintf(stderr, "★%s 32×32 scale 形状不配★\n", src); exit(1); }
+    uint64_t ne[2] = {cols, rows};
+    add_job(J_FP8BLK, gname, DS4_GGT_FP8_32X32, 2, ne, rows * cols + ((rows + 31) / 32) * ((cols + 31) / 32), src, -1, NULL);
 }
 static uint64_t vq_payload_bytes(int L, int e, const char *m, uint64_t *rows, uint64_t *cols) {
     char n[192];
@@ -98,6 +119,7 @@ static int in_list(const int *v, int n, int x) { for (int i = 0; i < n; i++) if 
 static void plan_layer(int L) {
     char g[96], s[192];
 #define SMALL(gf, sf) do { snprintf(g, sizeof g, gf, L); snprintf(s, sizeof s, sf, L); plan_small(g, s); } while (0)
+#define BF16(gf, sf)  do { snprintf(g, sizeof g, gf, L); snprintf(s, sizeof s, sf, L); plan_bf16(g, s); } while (0)
 #define FP4(gf, sf)   do { snprintf(g, sizeof g, gf, L); snprintf(s, sizeof s, sf, L); plan_fp4(g, s); } while (0)
     SMALL("blk.%d.hc_attn_fn.weight", "layers.%d.hc_attn_fn");
     SMALL("blk.%d.hc_attn_scale.weight", "layers.%d.hc_attn_scale");
@@ -113,33 +135,91 @@ static void plan_layer(int L) {
     FP4("blk.%d.attn_output_b.weight", "layers.%d.attn.wo_b.weight");
     const int ratio = C.compress_ratios[L];
     if (in_list(C.kv_source_layers, C.n_kv_source, L)) {
-        SMALL("blk.%d.attn_compressor_kv.weight", "layers.%d.attn.compressor.wkv.weight");
-        if (ratio > 1) SMALL("blk.%d.attn_compressor_gate.weight", "layers.%d.attn.compressor.wgate.weight");
+        BF16("blk.%d.attn_compressor_kv.weight", "layers.%d.attn.compressor.wkv.weight");
+        if (ratio > 1) BF16("blk.%d.attn_compressor_gate.weight", "layers.%d.attn.compressor.wgate.weight");
         SMALL("blk.%d.attn_compressor_norm.weight", "layers.%d.attn.compressor.norm.weight");
-        SMALL("blk.%d.indexer.wk.weight", "layers.%d.attn.indexer.wk.weight");
+        BF16("blk.%d.indexer.wk.weight", "layers.%d.attn.indexer.wk.weight");
         SMALL("blk.%d.indexer.k_norm.weight", "layers.%d.attn.indexer.k_norm.weight");
     }
     if (in_list(C.index_source_layers, C.n_index_source, L)) {
         FP4("blk.%d.indexer.attn_q_b.weight", "layers.%d.attn.indexer.wq_b.weight");
-        SMALL("blk.%d.indexer.proj.weight", "layers.%d.attn.indexer.weights_proj.weight");
+        BF16("blk.%d.indexer.proj.weight", "layers.%d.attn.indexer.weights_proj.weight");
     }
     SMALL("blk.%d.hc_ffn_fn.weight", "layers.%d.hc_ffn_fn");
     SMALL("blk.%d.hc_ffn_scale.weight", "layers.%d.hc_ffn_scale");
     SMALL("blk.%d.hc_ffn_base.weight", "layers.%d.hc_ffn_base");
     SMALL("blk.%d.ffn_norm.weight", "layers.%d.ffn_norm.weight");
-    SMALL("blk.%d.ffn_gate_inp.weight", "layers.%d.ffn.gate.weight");
+    BF16("blk.%d.ffn_gate_inp.weight", "layers.%d.ffn.gate.weight");
     SMALL("blk.%d.exp_probs_b.bias", "layers.%d.ffn.gate.bias");
     plan_vqblob(L);
     FP4("blk.%d.ffn_gate_shexp.weight", "layers.%d.ffn.shared_experts.w1.weight");
     FP4("blk.%d.ffn_up_shexp.weight", "layers.%d.ffn.shared_experts.w3.weight");
     FP4("blk.%d.ffn_down_shexp.weight", "layers.%d.ffn.shared_experts.w2.weight");
     if (in_list(C.engram_layer_ids, C.n_engram, L)) {
-        snprintf(g, sizeof g, "blk.%d.engram_wkv.weight", L); snprintf(s, sizeof s, "layers.%d.engram.wkv.weight", L); plan_f16_fp8(g, s);
+        snprintf(g, sizeof g, "blk.%d.engram_wkv.weight", L); snprintf(s, sizeof s, "layers.%d.engram.wkv.weight", L); plan_fp8blk(g, s);
         SMALL("blk.%d.engram_q.weight", "layers.%d.engram.q_weight");
         SMALL("blk.%d.engram_k.weight", "layers.%d.engram.k_weight");
     }
 #undef SMALL
+#undef BF16
 #undef FP4
+}
+
+/* ---- DSpark 三塔(speed.md 段 6 S1, 2026-09-15) ----
+ * 官方 model.py: `mtp.0/1/2` 是三个 SWA(128) 草稿块, 各 128 个专家 top-3。结构与普通层一模一样
+ * (hc 六件 + attn 五投影 + ffn gate/专家/shared), 外加五个只此一份的头:
+ *   mtp.0.main_proj / main_norm  —— 主模型 L37/38/39 的注意力输入(hc 四路均值)拼成 15360 维再投回 5120,
+ *                                   得到 main_x, 它是块注意力的主 KV 来源。取错位置不报错, 只是接受率掉到 1 附近。
+ *   mtp.2.markov_head.embed/head —— 秩 256 的 markov 头, 按块内前一个草稿 token 给 logit 加偏置。
+ *   mtp.2.confidence_head.proj   —— 出每一位的条件接受概率, 调度器据此决定每轮验证几个。
+ *   mtp.2.norm                   —— 三塔共用的出口 norm(官方 self.mtp[-1] 借主模型的 embed/head, GGUF 不再存一份)。
+ * ★专家走 FP4 直透, 不做 VQ★(speed.md §2: "草稿质量 = 接受率 = 速度, 不省这里")。
+ * ★不要的★: gate.bias_vl(视觉路), 与文件头第 16 行同一条规矩。 */
+/* 塔数与每塔专家数一律从 config.json 读(C.n_mtp_layers / C.dspark_n_routed_experts) —— 写死数字
+ * 就是把模型架构焊进工具, 换一版模型静默出错(铁律 2026-09-15: 禁魔数硬编码)。 */
+static void plan_mtp(int T) {
+    char g[96], s[192];
+#define MSMALL(gf, sf) do { snprintf(g, sizeof g, gf, T); snprintf(s, sizeof s, sf, T); plan_small(g, s); } while (0)
+#define MFP4(gf, sf)   do { snprintf(g, sizeof g, gf, T); snprintf(s, sizeof s, sf, T); plan_fp4(g, s); } while (0)
+    MSMALL("mtp.%d.hc_attn_fn.weight", "mtp.%d.hc_attn_fn");
+    MSMALL("mtp.%d.hc_attn_scale.weight", "mtp.%d.hc_attn_scale");
+    MSMALL("mtp.%d.hc_attn_base.weight", "mtp.%d.hc_attn_base");
+    MSMALL("mtp.%d.attn_norm.weight", "mtp.%d.attn_norm.weight");
+    MFP4("mtp.%d.attn_q_a.weight", "mtp.%d.attn.wq_a.weight");
+    MSMALL("mtp.%d.attn_q_a_norm.weight", "mtp.%d.attn.q_norm.weight");
+    MFP4("mtp.%d.attn_q_b.weight", "mtp.%d.attn.wq_b.weight");
+    MFP4("mtp.%d.attn_kv.weight", "mtp.%d.attn.wkv.weight");
+    MSMALL("mtp.%d.attn_kv_a_norm.weight", "mtp.%d.attn.kv_norm.weight");
+    MSMALL("mtp.%d.attn_sinks.weight", "mtp.%d.attn.attn_sink");
+    MFP4("mtp.%d.attn_output_a.weight", "mtp.%d.attn.wo_a.weight");
+    MFP4("mtp.%d.attn_output_b.weight", "mtp.%d.attn.wo_b.weight");
+    MSMALL("mtp.%d.hc_ffn_fn.weight", "mtp.%d.hc_ffn_fn");
+    MSMALL("mtp.%d.hc_ffn_scale.weight", "mtp.%d.hc_ffn_scale");
+    MSMALL("mtp.%d.hc_ffn_base.weight", "mtp.%d.hc_ffn_base");
+    MSMALL("mtp.%d.ffn_norm.weight", "mtp.%d.ffn_norm.weight");
+    MSMALL("mtp.%d.ffn_gate_inp.weight", "mtp.%d.ffn.gate.weight");
+    MSMALL("mtp.%d.exp_probs_b.bias", "mtp.%d.ffn.gate.bias");
+    MFP4("mtp.%d.ffn_gate_shexp.weight", "mtp.%d.ffn.shared_experts.w1.weight");
+    MFP4("mtp.%d.ffn_up_shexp.weight", "mtp.%d.ffn.shared_experts.w3.weight");
+    MFP4("mtp.%d.ffn_down_shexp.weight", "mtp.%d.ffn.shared_experts.w2.weight");
+    for (int e = 0; e < C.dspark_n_routed_experts; e++) {
+        snprintf(g, sizeof g, "mtp.%d.ffn_exp.%d.gate.weight", T, e); snprintf(s, sizeof s, "mtp.%d.ffn.experts.%d.w1.weight", T, e); plan_fp4(g, s);
+        snprintf(g, sizeof g, "mtp.%d.ffn_exp.%d.up.weight",   T, e); snprintf(s, sizeof s, "mtp.%d.ffn.experts.%d.w3.weight", T, e); plan_fp4(g, s);
+        snprintf(g, sizeof g, "mtp.%d.ffn_exp.%d.down.weight", T, e); snprintf(s, sizeof s, "mtp.%d.ffn.experts.%d.w2.weight", T, e); plan_fp4(g, s);
+    }
+    if (T == 0) {   /* main_proj: 原始 HF 是 FP8 32×32, 但量化目录里已经是 FP4 1×32(I8 + E8M0/32) —— 
+                     * 正是 speed.md §2 要的"三塔 FP4 全透传", 直接走 FP4 路 */
+        plan_fp4("mtp.main_proj.weight", "mtp.0.main_proj.weight");
+        plan_small("mtp.main_norm.weight", "mtp.0.main_norm.weight");
+    }
+    if (T == 2) {
+        plan_small("mtp.markov_embd.weight", "mtp.2.markov_head.embed.weight");
+        plan_small("mtp.markov_head.weight", "mtp.2.markov_head.head.weight");
+        plan_small("mtp.confidence.weight", "mtp.2.confidence_head.proj.weight");
+        plan_small("mtp.out_norm.weight", "mtp.2.norm.weight");
+    }
+#undef MSMALL
+#undef MFP4
 }
 
 /* ---- 生成字节 ---- */
@@ -149,6 +229,7 @@ static uint8_t *buf(uint64_t n) { if (n > g_cap) { g_cap = n + (n >> 3); g_buf =
 static uint64_t gen_small(const job_t *j) {
     const v41_st_ent *e = need(j->src); const uint8_t *p = v41_st_data(&S, e); if (!p) exit(1);
     uint64_t n = (uint64_t)v41_st_numel(e); float *o = (float *)buf(n * 4);
+    if (j->kind == J_BF16_COPY) { memcpy(o, p, n * 2); return n * 2; }   /* 原样搬 2 字节, 一位都不动 */
     if (j->kind == J_F32_COPY) memcpy(o, p, n * 4);
     else for (uint64_t i = 0; i < n; i++) { uint16_t h; memcpy(&h, p + 2 * i, 2); o[i] = ds4_bf16_to_f32(h); }
     return n * 4;
@@ -169,23 +250,17 @@ static uint64_t gen_fp4(const job_t *j) {
         }
     return rows * cb * 17;
 }
-static uint64_t gen_f16_fp8(const job_t *j) {
+static uint64_t gen_fp8blk(const job_t *j) {
     const v41_st_ent *e = need(j->src); const uint8_t *w = v41_st_data(&S, e);
     char sn[192]; snprintf(sn, sizeof sn, "%s", j->src); strcpy(strrchr(sn, '.'), ".scale");
     const v41_st_ent *se = need(sn); const uint8_t *sc = v41_st_data(&S, se);
     if (!w || !sc) exit(1);
-    uint64_t rows = (uint64_t)e->shape[0], cols = (uint64_t)e->shape[1], sbc = (uint64_t)se->shape[1];
-    if ((uint64_t)se->shape[0] != (rows + 31) / 32 || sbc != (cols + 31) / 32) { fprintf(stderr, "★%s 32×32 scale 形状不配★\n", j->src); exit(1); }
-    uint16_t *o = (uint16_t *)buf(rows * cols * 2); uint64_t over = 0, nan = 0;
-    for (uint64_t r = 0; r < rows; r++)
-        for (uint64_t c = 0; c < cols; c++) {
-            float v = ds4_e4m3fn_to_f32(w[r * cols + c]) * ds4_e8m0_to_f32(sc[(r / 32) * sbc + c / 32]);
-            if (isnan(v)) { nan++; v = 0.f; }
-            if (fabsf(v) > 65504.f) over++;
-            o[r * cols + c] = ds4_f64_to_f16((double)v);
-        }
-    if (over || nan) { fprintf(stderr, "★%s: f16 溢出 %llu 个 / NaN %llu 个 —— fp8→f16 口径不成立★\n", j->src, (unsigned long long)over, (unsigned long long)nan); exit(1); }
-    return rows * cols * 2;
+    uint64_t rows = (uint64_t)e->shape[0], cols = (uint64_t)e->shape[1];
+    uint64_t sr = (rows + 31) / 32, scn = (cols + 31) / 32, n = rows * cols + sr * scn;
+    uint8_t *o = buf(n);
+    memcpy(o, w, rows * cols);                 /* e4m3 平面, 一位不动 */
+    memcpy(o + rows * cols, sc, sr * scn);     /* ue8m0 缩放平面 */
+    return n;
 }
 static uint64_t gen_vqblob(const job_t *j) {
     const int L = j->layer, nexp = C.n_routed_experts;
@@ -280,6 +355,16 @@ int main(int argc, char **argv) {
     ds4gw_kv_u32(&W, "deepseek4.attention.output_lora_rank", (uint32_t)C.o_lora_rank);
     ds4gw_kv_u32(&W, "deepseek4.attention.output_group_count", (uint32_t)C.o_groups);
     ds4gw_kv_u32(&W, "deepseek4.expert_count", (uint32_t)C.n_routed_experts);
+    /* 引擎按元数据认三塔, 不写死数字(铁律: 引擎禁版本名/魔数硬编码) */
+    ds4gw_kv_u32(&W, "deepseek4.mtp.tower_count", (uint32_t)C.n_mtp_layers);
+    ds4gw_kv_u32(&W, "deepseek4.mtp.expert_count", (uint32_t)C.dspark_n_routed_experts);
+    /* 草稿器跑起来还要这五件(speed.md 段 6 D1): 每塔选几个专家 / 一块出几位 / 占位 token 的 id /
+     * markov 头的秩 / 主模型哪几层的注意力输入拼成 main_x。少一件引擎就只能猜, 所以全部落元数据。 */
+    ds4gw_kv_u32(&W, "deepseek4.mtp.expert_used_count", (uint32_t)C.dspark_n_activated_experts);
+    ds4gw_kv_u32(&W, "deepseek4.mtp.block_size", (uint32_t)C.dspark_block_size);
+    ds4gw_kv_u32(&W, "deepseek4.mtp.noise_token_id", (uint32_t)C.dspark_noise_token_id);
+    ds4gw_kv_u32(&W, "deepseek4.mtp.markov_rank", (uint32_t)C.dspark_markov_rank);
+    ds4gw_kv_arr_i32(&W, "deepseek4.mtp.target_layers", C.dspark_target_layer_ids, (uint64_t)C.n_dspark_target);
     ds4gw_kv_u32(&W, "deepseek4.expert_used_count", (uint32_t)C.n_activated_experts);
     ds4gw_kv_u32(&W, "deepseek4.expert_feed_forward_length", (uint32_t)C.moe_inter_dim);
     ds4gw_kv_u32(&W, "deepseek4.expert_shared_count", (uint32_t)C.n_shared_experts);
@@ -338,6 +423,7 @@ int main(int argc, char **argv) {
     /* ---- 张量登记 ---- */
     plan_fp4("token_embd.weight", "embed.weight");
     for (int L = 0; L < C.n_layers; L++) plan_layer(L);
+    for (int T = 0; T < C.n_mtp_layers; T++) plan_mtp(T);   /* DSpark 三塔(段 6 S1) */
     plan_small("output_norm.weight", "norm.weight");
     plan_fp4("output.weight", "head.weight");
     { uint64_t ne[3];
@@ -352,9 +438,9 @@ int main(int argc, char **argv) {
     for (int i = 0; i < g_nj; i++) {
         const job_t *j = &g_jobs[i]; uint64_t n = 0; const void *d = g_buf;
         switch (j->kind) {
-            case J_F32_BF16: case J_F32_COPY: n = gen_small(j); d = g_buf; break;
+            case J_F32_BF16: case J_F32_COPY: case J_BF16_COPY: n = gen_small(j); d = g_buf; break;
             case J_FP4X32: n = gen_fp4(j); d = g_buf; break;
-            case J_F16_FP8BLK: n = gen_f16_fp8(j); d = g_buf; break;
+            case J_FP8BLK: n = gen_fp8blk(j); d = g_buf; break;
             case J_VQBLOB: n = gen_vqblob(j); d = g_buf; break;
             case J_RAW: n = W.t[i].nbytes; d = j->raw; break;
         }

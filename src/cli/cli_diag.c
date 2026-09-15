@@ -40,6 +40,9 @@ static int v41_emit_print(int token, void *ud) {
 int run_v41_generation(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
     if (cfg->gen.temperature > 0.0f) fprintf(stderr, "ds4: V4.1 当前只有贪心解码(temp 0), 忽略 --temp %.2f\n", (double)cfg->gen.temperature);
     ds4_engine_v41_set_prof(cfg->gen.v41_prof);
+    ds4_engine_v41_set_decoder_full(cfg->gen.decoder_full);
+    ds4_engine_v41_set_dspark(!cfg->gen.no_dspark);
+    ds4_engine_v41_set_chunk(cfg->gen.v41_chunk);
     int rc = ds4_engine_v41_generate_argmax(engine, prompt->v, (int)prompt->len, cfg->gen.n_predict, cfg->gen.ctx_size, v41_emit_print, engine);
     fputc('\n', stdout);
     return rc;

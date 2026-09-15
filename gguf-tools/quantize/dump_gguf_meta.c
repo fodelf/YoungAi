@@ -2,7 +2,12 @@
  * (C, 2026-08-25 Python→C 迁移; 取代 dump_gguf_meta.py, 输出对齐 python 打印形态:
  *  bool=True/False, 数组=python list 形态, 字符串截80+"...", f32 用最短往返打印 —
  *  奇异浮点 KV 的 repr 尾数可能与 python 差末位, 属打印面非数值面)
- * 用法: dump_gguf_meta FILE.gguf [--stats] [--vqhead] */
+ * 用法: dump_gguf_meta FILE.gguf [--stats] [--vqhead] [--fp4scan]
+ *
+ * --fp4scan(2026-09-15, speed.md S1 前置): 扫全部 fp4x32(type 43)张量的 ue8m0 缩放指数直方图。
+ * 【为什么要它】S0 判决 = 预填要走 NVFP4(E2M1 + 每 16 通道 E4M3 缩放), 而盘上是 MXFP4(ue8m0/32)。
+ * 两者数值恒等的前提是那个 2 的幂能被 e4m3 精确表示, 即 2^(e−127) ∈ [2^−9, 2^8] ⇒ e ∈ [118, 135]。
+ * 越界块若非全零, 转换就是有损的 —— 那必须在转换器里停车, 而不是静默饱和。本扫描先回答"有没有越界块"。*/
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -59,10 +64,11 @@ static int cmp_tinfo(const void *a, const void *b) {
 
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "用法: dump_gguf_meta FILE.gguf [--stats] [--vqhead]\n"); return 1; }
-    int stats = 0, vqhead = 0;
+    int stats = 0, vqhead = 0, fp4scan = 0;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--stats")) stats = 1;
         if (!strcmp(argv[i], "--vqhead")) vqhead = 1;
+        if (!strcmp(argv[i], "--fp4scan")) fp4scan = 1;
     }
     F = fopen(argv[1], "rb");
     if (!F) { fprintf(stderr, "%s 打不开\n", argv[1]); return 2; }
@@ -180,6 +186,54 @@ int main(int argc, char **argv) {
             break;
         }
         fclose(F); return 0;
+    }
+    if (fp4scan) {
+        /* e4m3fn 能精确表示的 2 的幂: 次正规 2^-9..2^-7 + 正规 2^-6..2^8 ⇒ ue8m0 字节 e ∈ [118, 135] */
+        enum { E_LO = 118, E_HI = 135, CHUNK = 17 * 65536 };
+        long align = 32;
+        long long base = ftell(F);
+        if (base % align) base += align - (base % align);
+        unsigned char *buf = malloc(CHUNK);
+        long long hist[256]; memset(hist, 0, sizeof hist);
+        long long nblk_tot = 0, nbad = 0, nbad_nz = 0, ntensor = 0;
+        char worst[128] = ""; int worst_e = -1;
+        for (uint64_t i = 0; i < n_tensors; i++) {
+            if (infos[i].tt != 43) continue;   /* DS4_GGT_FP4X32 */
+            uint64_t numel = 1;
+            for (int d = 0; d < infos[i].nd; d++) numel *= infos[i].dims[d];
+            const uint64_t nblk = numel / 32;
+            ntensor++;
+            if (fseek(F, (long)(base + infos[i].off), SEEK_SET)) { printf("  seek 失败 %s\n", infos[i].name); continue; }
+            uint64_t left = nblk;
+            while (left) {
+                const uint64_t take = left > 65536 ? 65536 : left;
+                if (fread(buf, 1, (size_t)take * 17, F) != (size_t)take * 17) { printf("  读不满 %s\n", infos[i].name); break; }
+                for (uint64_t b = 0; b < take; b++) {
+                    const unsigned char *blk = buf + b * 17;
+                    const unsigned e = blk[16];
+                    hist[e]++;
+                    if (e < E_LO || e > E_HI) {
+                        nbad++;
+                        int nz = 0;
+                        for (int j = 0; j < 16; j++) if (blk[j]) { nz = 1; break; }
+                        if (nz) { nbad_nz++; if ((int)e > worst_e) { worst_e = (int)e; snprintf(worst, sizeof worst, "%s", infos[i].name); } }
+                    }
+                }
+                left -= take; nblk_tot += take;
+            }
+        }
+        free(buf);
+        printf("--- FP4X32 缩放扫描(%lld 个张量, %lld 块)\n", ntensor, nblk_tot);
+        int lo = 255, hi = 0;
+        for (int e = 0; e < 256; e++) if (hist[e]) { if (e < lo) lo = e; if (e > hi) hi = e; }
+        printf("  ue8m0 指数字节范围 [%d, %d] = 2^[%d, %d]   (e4m3 可表示区间 [%d, %d] = 2^[-9, 8])\n",
+               lo, hi, lo - 127, hi - 127, E_LO, E_HI);
+        for (int e = lo; e <= hi && e < 256; e++)
+            if (hist[e]) printf("    2^%-4d %12lld 块 %6.2f%%%s\n", e - 127, hist[e],
+                                100.0 * hist[e] / (nblk_tot ? nblk_tot : 1), (e < E_LO || e > E_HI) ? "  ★越界★" : "");
+        printf("  越界块 %lld(其中非全零 %lld)%s\n", nbad, nbad_nz,
+               nbad_nz ? "  ★MXFP4→NVFP4 非恒等, 转换器必须停车★" : "  ⇒ ★MXFP4→NVFP4 数值恒等★");
+        if (nbad_nz) printf("  最大越界指数出现在 %s (2^%d)\n", worst, worst_e - 127);
     }
     if (stats) {
         struct stat st; stat(argv[1], &st);
