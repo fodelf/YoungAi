@@ -13,6 +13,12 @@ void ds4_engine_v41_set_prof(int on) { g_ds4_v41_prof = on; }
  * 投机的接受条件就是"主模型自己也会选这个 token", 所以它只省时间不改输出; 不同就是回滚漏了东西。 */
 int g_ds4_v41_dspark = 1;
 void ds4_engine_v41_set_dspark(int on) { g_ds4_v41_dspark = on; }
+const char *g_ds4_v41_draft_amp = NULL;
+void ds4_engine_v41_set_draft_amp(const char *path) { g_ds4_v41_draft_amp = path; }
+/* --draft-amp-scale β: 装载时 A *= β。用来分辨"方向错"还是"幅度过头" ——
+ * β 小了就好转 = 幅度问题(过拟合/欠定); β 怎么调都不如不挂 = 目标函数选错了(L2 隐态 ≠ argmax)。 */
+float g_ds4_v41_draft_amp_scale = 1.0f;
+void ds4_engine_v41_set_draft_amp_scale(float s) { g_ds4_v41_draft_amp_scale = s; }
 const char *g_ds4_v41_amp_dir = NULL;
 void ds4_engine_v41_set_amp_dir(const char *dir) { g_ds4_v41_amp_dir = (dir && dir[0]) ? dir : NULL; }
 const char *g_ds4_v41_pt_dir = NULL;
@@ -174,6 +180,10 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
         ds4_v41_draft dr;
         const bool spec = g_ds4_v41_dspark && v41_draft_alloc(e, &dr);
         uint32_t spec_rounds = 0, spec_acc = 0, spec_hist[DS4_MTP_MAX_BLOCK + 1];
+        /* 一轮的壁钟分账(2026-09-16): 投机赢不赢是个除法 —— 一轮的耗时要压到 E[接受+1] × 纯解码一步
+         * 以下。实测一轮 118 ms 对预算 72 ms, 超 64%, 而这 118 从来没拆过。四项分开计, 就能分清
+         * "草稿器自己太贵"(那接受率再高也救不回来)还是"验证/回滚的边角料吃掉了"。 */
+        double ms_draft = 0, ms_verify = 0, ms_argmax = 0, ms_snap = 0;
         for (uint32_t i = 0; i <= DS4_MTP_MAX_BLOCK; i++) spec_hist[i] = 0;
         uint32_t confirmed = st.mainh_rows;   /* 上一批新确认了几个位置(预填后 = 窗口预热的那些行) */
         while (produced < n_predict) {
@@ -184,19 +194,36 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
             uint32_t k = 0;
             int32_t batch[DS4_MTP_MAX_BLOCK + 1];
             batch[0] = (int32_t)tok;
+            const double tr0 = now_sec();
             if (spec && v41_draft_step(e, &st, &dr, (int32_t)tok, st.n_past - 1u, confirmed)) {
-                k = dr.block;
+                /* ★验证几位, 是一笔字节账(2026-09-16, mtp.md §5)★
+                 * 一轮读 = 骨架 4.4 GB(与 k 无关, 这正是投机的全部收益来源) + (1+k) 份专家 1.61 GB
+                 * + 草稿 ≈2 GB; 产出 = 1 + E[接受]。拿实测的接受率(首位 0.61, 均接受 1.39/5)算:
+                 *   k=5: 16.1 GB ÷ 2.39 = 6.72 GB/token —— 比纯解码的 6.0 **还多**, 轮再快也是亏的
+                 *   k=3: 12.8 GB ÷ 2.10 = 6.11 GB/token —— 打平
+                 * 官方的做法是置信头 + 调度器每轮定几位(报告 §2.4.3); 那是 mtp.md M5。
+                 * 在调度器落地之前先钉死 3 —— 第 4、5 位的边际接受概率(直方图 4:3 5:0)撑不住
+                 * 它们那份专家字节。★别往上调★: 调之前先把上面那个除法重算一遍。
+                 * 块本身仍按模型定的 5 位出(草稿器一次前向就是 5 位), 只是**验证**少验两位。 */
+                const uint32_t use = 3u;
+                k = dr.block < use ? dr.block : use;
                 for (uint32_t i = 0; i < k; i++) batch[i + 1u] = dr.host_ids[i + 1u];
             }
             const uint32_t nb = 1u + k;
-            if (k && !v41_spec_snapshot(&st)) { ok = false; break; }
+            const double tr1 = now_sec();
+            if (k && !v41_spec_snapshot(&st, nb)) { ok = false; break; }
+            const double tr2 = now_sec();
             if (!v41_forward(e, &st, batch, nb)) { ok = false; break; }
+            if (k && !ds4_gpu_synchronize()) { ok = false; break; }   /* 分账要真壁钟, 不同步量到的是发射时间 */
+            const double tr3 = now_sec();
             /* 逐位取主模型的贪心结果, 与草稿比: 第 i 位的 logits 预测的是 batch[i] 之后那一位 */
             int32_t want[DS4_MTP_MAX_BLOCK + 1];
             for (uint32_t i = 0; i < nb; i++)
                 if (!ds4_gpu_v41_argmax_tensor(am, st.logits, i, DS4_N_VOCAB) || !ds4_gpu_synchronize() ||
                     !ds4_gpu_tensor_read(am, 0, &want[i], 4)) { ok = false; break; }
             if (!ok) break;
+            if (k) { ms_draft += (tr1 - tr0) * 1e3; ms_snap += (tr2 - tr1) * 1e3;
+                     ms_verify += (tr3 - tr2) * 1e3; ms_argmax += (now_sec() - tr3) * 1e3; }
             uint32_t a = 0;
             while (a < k && want[a] == batch[a + 1u]) a++;   /* 接受最长前缀 */
             if (k && g_ds4_v41_prof) {   /* 诊断: 草稿这 5 位 vs 主模型自己的 5 位 —— 看是"接近但不同"还是"完全不搭" */
@@ -210,7 +237,9 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
             }
             if (k) {
                 spec_rounds++; spec_acc += a; spec_hist[a]++;
+                const double tb0 = now_sec();
                 if (!v41_spec_rollback(&st, 1u + a)) { ok = false; break; }
+                ms_snap += (now_sec() - tb0) * 1e3;
             }
             for (uint32_t i = 0; i < a; i++) {   /* 白赚的那几位: 草稿与主模型一致, 直接吐 */
                 produced++;
@@ -223,7 +252,11 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
         if (spec_rounds) {
             fprintf(stderr, "\n[v41] DSpark: %u 轮, 平均接受 %.2f/%u 位; 直方图", spec_rounds, (double)spec_acc / spec_rounds, dr.block);
             for (uint32_t i = 0; i <= dr.block; i++) fprintf(stderr, " %u:%u", i, spec_hist[i]);
-            fprintf(stderr, "\n");
+            const double R = (double)spec_rounds, ea = 1.0 + (double)spec_acc / R;
+            const double per = (ms_draft + ms_snap + ms_verify + ms_argmax) / R;
+            fprintf(stderr, "\n[v41] 一轮 %.1f ms = 草稿 %.1f + 快照回滚 %.1f + 验证 %.1f + argmax %.1f"
+                            "; 产出 %.2f token ⇒ %.1f ms/token\n",
+                    per, ms_draft / R, ms_snap / R, ms_verify / R, ms_argmax / R, ea, per / ea);
         }
         if (spec) v41_draft_free(&dr);
         const double t2 = now_sec();

@@ -63,9 +63,11 @@
 #include "src/cuda/cuda_vq.inc.cu"
 #include "src/cuda/cuda_vq_prefill.inc.cu"
 #include "src/cuda/cuda_v41_1.inc.cu"   /* DeepSeek V4.1 批前向原语 ①②③(2026-09-12): 稠密/hc/norm | rope/量化/indexer/attn | 路由/MoE */
+#include "src/cuda/cuda_kv_pack.inc.cu"   /* 全局 KV 按官方格式打包(decode.md D1): 主 KV 288 B/组、索引 K 72 B/组; 在 v41_1 之后(用 bf16r/pow2_ceil_log2), 在三个注意力核之前(被它们解包) */
 #include "src/cuda/cuda_sparse_attn_mma.inc.cu"   /* 稀疏注意力张量核版(speed.md 段 4); 必须在 v41_1 之后(用 v41_bf16r)、v41_2 之前(被它调) */
 #include "src/cuda/cuda_v41_hc.inc.cu"   /* mHC 一族(mix/sinkhorn/hc_pre/hc_post/合一核); 在 v41_1 之后(用它的 bf16r 与暂存槽) */
 #include "src/cuda/cuda_v41_attn_split.inc.cu"   /* 解码路稀疏注意力 split-K(single.md S4); 在 v41_2 之前(被它调) */
+#include "src/cuda/cuda_kv_ring.inc.cu"   /* SWA 窗口的环维护(decode.md D1): 提交/快照/回滚; 在 v41_1 之后(用 v41_win_row 的同一套行号约定) */
 #include "src/cuda/cuda_v41_2.inc.cu"
 #include "src/cuda/cuda_v41_3.inc.cu"
 #include "src/cuda/cuda_v41_fp4_planar.inc.cu"   /* fp4x32 权重的平面副本(single.md §2.6 A 路); 在 v41_4 之前(被它的 GEMV 调) */

@@ -140,4 +140,28 @@ DS4_HOSTDEV_FP8 uint8_t ds4_fp4_f32_to_nibble(float x) {
     return n == 0 ? (uint8_t)0 : (uint8_t)(v < 0.0f ? (n | 8u) : n);
 }
 
+/* f32 → E8M0 字节(ds4_e8m0_to_f32 的逆)。入参必须已经是 2 的整数幂 —— 缩放因子本来就是
+ * 这么算出来的(ceil(log2) 取幂), 所以这里只做位型搬运, 不做舍入。
+ * 次正规那一格(位型 0x00400000 = 2^-127)编回 0, 与解码端的特例对上, 往返才闭合。 */
+DS4_HOSTDEV_FP8 uint8_t ds4_e8m0_f32_to_byte(float s) {
+    uint32_t bits;
+    memcpy(&bits, &s, sizeof(bits));
+    if (bits == 0x00400000u) return 0;
+    return (uint8_t)((bits >> 23) & 0xffu);
+}
+
+/* f32 → E4M3FN 字节。先过 ds4_e4m3fn_round(编码端不另写一套最近搜索 —— 同 ds4_fp4_f32_to_nibble
+ * 那条注释的理由: 写两份迟早漂开), 再在幅值表上二分找回下标。幅值表对下标单调递增, 二分安全。 */
+DS4_HOSTDEV_FP8 uint8_t ds4_e4m3fn_f32_to_byte(float x) {
+    const float v = ds4_e4m3fn_round(x);
+    const float av = fabsf(v);
+    int lo = 0, hi = 126;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) >> 1;
+        if (ds4_e4m3fn_value(mid) <= av) lo = mid;
+        else hi = mid - 1;
+    }
+    return (uint8_t)((v < 0.0f && av != 0.0f) ? (lo | 0x80) : lo);
+}
+
 #endif /* DS4_COMMON_FP8_H */

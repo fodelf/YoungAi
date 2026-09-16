@@ -119,12 +119,38 @@ int ds4_gpu_v41_indexer_topk_tensor(ds4_gpu_tensor *idx, const ds4_gpu_tensor *s
  * o[n][h][d] f32(官方出 bf16, 由调用方舍)。
  * full_block≠0(DSpark 草稿块专用): 本 chunk 的 n 行**互相全可见**, 不做因果截断 —— 官方
  * get_dspark_topk_idxs 给每一位的候选都是"整个窗口 + 整块 block_size 位", 块内 5 个草稿位同时出。
- * 主路一律传 0; 传错不报错, 只是草稿位看见了未来(或主路漏看), 症状是接受率异常。 */
+ * 主路一律传 0; 传错不报错, 只是草稿位看见了未来(或主路漏看), 症状是接受率异常。
+ * ring(decode.md D1): 窗口缓冲前 window 行怎么排 —— 1 = 环(位置 a 住 a % window, 官方
+ * window_kv_cache[start_pos % win], 主路用); 0 = 线性排好序(DSpark 草稿塔用, 由 push_main 左移维护)。
+ * 环的维护(提交/快照/回滚)是下面 ds4_gpu_v41_win_* 三件。 */
 int ds4_gpu_v41_sparse_attn_tensor(ds4_gpu_tensor *o, const ds4_gpu_tensor *q, const ds4_gpu_tensor *kv_win,
                                    const ds4_gpu_tensor *kv_comp, const ds4_gpu_tensor *idx,
                                    const void *model_map, uint64_t model_size, uint64_t sink_offset,
                                    uint32_t n_tok, uint32_t pos0, uint32_t window, uint32_t ng, uint32_t topk,
-                                   uint32_t n_head, uint32_t head_dim, float scale, int full_block);
+                                   uint32_t n_head, uint32_t head_dim, float scale, int full_block, int ring);
+
+/* ★全局 KV 缓存的盘上尺寸(decode.md D1; 实现与所以然在 src/cuda/cuda_kv_pack.inc.cu)★
+ * 这几个常量只有这一份 —— 缓存分配端(core_v41_forward.c)与核端(解包)都引它, 两边一旦各写各的
+ * 就会"按 f32 分配、按打包写"越界踩别的层, 而且不报错。
+ *   主 KV : 512 维 FP4 + 每 16 个一个 E4M3 缩放 = 256 + 32 = 288 B/组(与官方 890 B/token 的账同源)
+ *   索引 K: 128 维 FP4 + 每 32 个一个 E8M0 缩放 =  64 +  4 =  68 B, 补 4 B 到 8 对齐 = 72 */
+#define DS4_V41_CKV_BLK    16u
+#define DS4_V41_CKV_NIB   256u
+#define DS4_V41_CKV_BYTES 288u
+#define DS4_V41_IDXK_BLK   32u
+#define DS4_V41_IDXK_NIB   64u
+#define DS4_V41_IDXK_BYTES 72u
+/* 已 rope 的 f32 行 → 量化并打包进缓存第 g0 组起(替掉原来的"act_quant 就地 + 整行拷贝"两发) */
+int ds4_gpu_v41_ckv_pack_tensor(ds4_gpu_tensor *cache, uint32_t g0, const ds4_gpu_tensor *rows, uint32_t n_rows);
+int ds4_gpu_v41_idxk_pack_tensor(ds4_gpu_tensor *cache, uint32_t g0, const ds4_gpu_tensor *rows, uint32_t n_rows);
+
+/* SWA 窗口环的维护(decode.md D1; 实现在 src/cuda/cuda_kv_ring.inc.cu, 那里写了每件事的所以然)。
+ * commit: 本批 n 行(缓冲 [window, window+n))写进环; n>window 时只提交最后 window 行(等价)。
+ * ring_snap: back=0 存下 commit 将要盖掉的格子, back=1 写回 —— 投机部分接受时只还原没被接受的那几行,
+ *   i0 给"接受了几位", n 给这一批几位。snap 按批内行号存, 所以还原区间就是 [keep, n)。 */
+int ds4_gpu_v41_win_commit_tensor(ds4_gpu_tensor *win, uint32_t pos0, uint32_t n, uint32_t window, uint32_t head_dim);
+int ds4_gpu_v41_win_ring_snap_tensor(ds4_gpu_tensor *win, ds4_gpu_tensor *snap, uint32_t pos0,
+                                     uint32_t i0, uint32_t n, uint32_t window, uint32_t head_dim, int back);
 
 /* 路由(官方 Gate, sqrtsoftplus): logits[n][E] f32 → probs=√softplus; (probs+bias) 选 topk;
  * weights = probs/Σ(+1e-20)·route_scale; selected[n][k] int32, weights[n][k] f32。 */

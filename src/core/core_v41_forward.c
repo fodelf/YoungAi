@@ -64,8 +64,10 @@ bool v41_state_alloc(ds4_v41_state *st, uint32_t cap, uint32_t ctx) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (!ratio) { fprintf(stderr, "ds4: V4.1 kv 源层 L%u 压缩比为 0\n", il); ok = false; break; }
         const uint64_t ngcap = (uint64_t)ctx / ratio + 1;
-        st->comp_kv[il] = v41_alloc(ngcap * HD * 4, &ok);
-        st->index_k[il] = v41_alloc(ngcap * IK * 4, &ok);
+        /* ★按官方打包尺寸分配★(decode.md D1): 主 KV 288 B/组、索引 K 72 B/组, 不是 512/128 个 f32。
+         * 常量在 ds4_gpu_v41.h 只有一份 —— 这里与核里的解包各写各的就会静默越界。 */
+        st->comp_kv[il] = v41_alloc(ngcap * DS4_V41_CKV_BYTES, &ok);
+        st->index_k[il] = v41_alloc(ngcap * DS4_V41_IDXK_BYTES, &ok);
         if (ratio > 1) {
             st->cpre_kv[il] = v41_alloc((ratio + (uint64_t)cap) * HD * 4, &ok);
             st->cpre_sc[il] = v41_alloc((ratio + (uint64_t)cap) * HD * 4, &ok);
@@ -215,18 +217,25 @@ bool v41_layer(ds4_engine *e, ds4_v41_state *st, uint32_t il) {
     return true;
 }
 
-/* ---- 投机验证的快照与回滚(speed.md 段 6 D1) ----
- * 为什么只备份这两处: 缓存里只有窗口(win)与压缩器余行(cpre_*)是"整体左移"的 —— 移过去就盖掉了
- * 上一轮的行, 撤不回来。comp_kv/index_k 是按绝对组号写的, ng_src/cpend 只是计数, 回退计数后
- * 下一轮从同一个组号重写就覆盖了, 不用备份。
- * 备份量: 40 层 × 128 行 × 512 × 4 B = 10.5 MB 的设备内拷贝, 约 0.09 ms —— 相对一步 60+ ms 是零头。 */
-bool v41_spec_snapshot(ds4_v41_state *st) {
+/* ---- 投机验证的快照与回滚(speed.md 段 6 D1; 窗口部分 2026-09-16 decode.md D1 改环) ----
+ * 为什么要备份: 验证批把 1+k 个位置全算进缓存, 其中没被接受的那几位必须撤销。
+ *   窗口(win): 本批的行先待在缓冲的块区, 层算完由 win_commit 写进环 —— 写进去就盖掉了
+ *     128 步之前那一格(它还在下一步的可见窗口里)。所以**只备份将被盖掉的那 n 格**:
+ *     40 层 × n(≤6) 行 × 512 × 4 B ≈ 0.5 MB。改环之前是整份 128 行 = 10.5 MB, 22 倍。
+ *   压缩器余行(cpre_*): 那是真的"整体左移", 备份点在 core_v41_attn.c 的平移之前。
+ * comp_kv/index_k 按绝对组号写、ng_src/cpend 只是计数 ⇒ 回退计数下一轮直接覆盖, 不用备份。 */
+bool v41_spec_snapshot(ds4_v41_state *st, uint32_t n) {
     const uint64_t rowb = (uint64_t)DS4_N_HEAD_DIM * 4;
+    const uint32_t nmax = DS4_MTP_MAX_BLOCK + 1u;   /* 验证批 = 1 个已确认位 + 最多 block 个草稿位 */
     bool ok = true;
+    if (!n || n > nmax) { fprintf(stderr, "ds4: V4.1 投机快照批 %u 超上限 %u\n", n, nmax); return false; }
+    /* 存的是"环里即将被本批第 i 行盖掉的那一格", 按批内行号 i 排 ⇒ 还原区间正好是 [keep, n)。 */
     for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
-        if (!st->snap_win[il]) st->snap_win[il] = v41_alloc((uint64_t)DS4_N_SWA * rowb, &ok);
-        if (ok) ok = ds4_gpu_tensor_copy(st->snap_win[il], 0, st->win[il], 0, (uint64_t)DS4_N_SWA * rowb) != 0;
+        if (!st->snap_win[il]) st->snap_win[il] = v41_alloc((uint64_t)nmax * rowb, &ok);
+        if (ok && !ds4_gpu_v41_win_ring_snap_tensor(st->win[il], st->snap_win[il], st->n_past,
+                                                    0u, n, DS4_N_SWA, DS4_N_HEAD_DIM, 0)) ok = false;
     }
+    st->snap_n = n;
     /* 压缩器余行的快照点不在这里, 而在 core_v41_attn.c 的 v41_compress_source 里"平移之前" ——
      * 那一刻缓冲里才是"旧余行 + 本批全部新行", 回滚要的正是它(平移一走就盖掉了)。 */
     st->snap_past = st->n_past;
@@ -235,21 +244,20 @@ bool v41_spec_snapshot(ds4_v41_state *st) {
 }
 
 /* keep = 这一批里被接受的位置数(含那个已确认的首位)。三件事:
- *   ①窗口: 恢复备份后再左移 keep 行 —— 块区那 n 行是本批写的, 前 keep 行正是被接受的位置;
+ *   ①窗口(环): 本批第 keep..n-1 行是没被接受的, 它们在层里已经被 commit 进环、盖掉了 128 步前的真行 ——
+ *      把快照里那几格写回去。被接受的前 keep 行本来就该留在环里, 一个字节不动。
  *   ②压缩 KV/索引键: 只把组数回退到 (pos0+keep)/ratio, 内容不用管(按绝对组号写, 下一轮覆盖);
  *   ③压缩器余行: 从"平移前"的快照里取最后 pend' 行接回头部 —— 那几行是被接受 token 的压缩器输入。
  * 出错会怎样: 漏了 ③, 下一组池化会把一个没被接受的草稿 token 混进去, 不报错, 只是那一组的
- * 全局 KV 与纯解码路对不上(温 0 逐字节门会抓)。 */
+ * 全局 KV 与纯解码路对不上(温 0 逐字节门会抓); 漏了 ①, 下一步把"未来的草稿"当历史读, 症状相同。 */
 bool v41_spec_rollback(ds4_v41_state *st, uint32_t keep) {
     if (!st->snap_on) return false;
     const uint64_t rowb = (uint64_t)DS4_N_HEAD_DIM * 4;
     const uint32_t pos0 = st->snap_past, np = pos0 + keep;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        if (!ds4_gpu_tensor_copy(st->win[il], 0, st->snap_win[il], 0, (uint64_t)DS4_N_SWA * rowb)) return false;
-        if (keep) {
-            if (!ds4_gpu_tensor_copy(st->wintmp, 0, st->win[il], (uint64_t)keep * rowb, (uint64_t)DS4_N_SWA * rowb)) return false;
-            if (!ds4_gpu_tensor_copy(st->win[il], 0, st->wintmp, 0, (uint64_t)DS4_N_SWA * rowb)) return false;
-        }
+        if (keep < st->snap_n &&
+            !ds4_gpu_v41_win_ring_snap_tensor(st->win[il], st->snap_win[il], pos0,
+                                              keep, st->snap_n, DS4_N_SWA, DS4_N_HEAD_DIM, 1)) return false;
         if (!g_ds4_v41.is_kv_source[il]) continue;
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (!ratio) continue;

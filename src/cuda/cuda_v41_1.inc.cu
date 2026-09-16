@@ -72,6 +72,31 @@ __device__ __forceinline__ static float v41_bf16r(float x) {   /* RNE 舍到 bf1
     float y; memcpy(&y, &u, 4); return y;
 }
 
+/* fast_round_scale 的指数部分: 2^ceil(log2 v)。量化缩放因子全走它(act_quant 与 KV 打包核共用一份 ——
+ * 两边各写一遍迟早漂开, 而一旦漂开, 打包存的值就不再等于原来存的 f32)。 */
+__device__ __forceinline__ static float v41_pow2_ceil_log2(float v) {
+    int e; const float m = frexpf(v, &e);      /* v = m·2^e, m∈[0.5,1) ⇒ log2 v = e + log2 m ∈ (e-1, e] */
+    return ldexpf(1.0f, (m == 0.5f) ? e - 1 : e);
+}
+
+/* ★SWA 窗口缓冲里, 绝对位置 a 住在第几行(decode.md D1, 2026-09-16)★
+ *
+ * 窗口缓冲一共 window+n 行, 分两段:
+ *   [0, window)      历史段
+ *   [window, window+n) 本批这 n 个位置(还没提交进历史段)
+ * 历史段有两种排法, 由 ring 选:
+ *   ring=1(主路, 官方 `window_kv_cache[start_pos % win]`): **环**, 位置 a 恒住在 a % window 那一格。
+ *      好处是每步不用把整段左移(原来每层两发 256 KB 的拷贝), 而且投机验证批的 n 行不在环里 ⇒
+ *      被拒的草稿位从来不会污染历史, 回滚只用还原"提交时盖掉的那几格"而不是整份 128 行。
+ *   ring=0(DSpark 草稿塔): 线性段, 按位置排好序, 由 v41_draft_push_main 整体左移维护。
+ *      草稿塔的窗口装的是主模型 main_x 的投影、且块内全可见, 与主路不是一套语义, 所以不动它。
+ * 传错不报错: 读到的是别的位置的键, 症状是输出悄悄变样(温 0 逐字节门会抓)。 */
+__device__ __forceinline__ static uint64_t v41_win_row(int64_t a, uint32_t pos0, uint32_t window, uint32_t ring) {
+    if (a >= (int64_t)pos0) return (uint64_t)((int64_t)window + a - (int64_t)pos0);
+    return ring ? (uint64_t)(a % (int64_t)window)
+                : (uint64_t)(a - ((int64_t)pos0 - (int64_t)window));
+}
+
 /* 激活已经落在 bf16 格点上(各消费核出口都舍过), 这里只是换个存法, 不改值 */
 __global__ static void v41_x_to_bf16_kernel(__nv_bfloat16 *out, const float *x, uint64_t n) {
     const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;

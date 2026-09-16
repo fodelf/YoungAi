@@ -3,7 +3,9 @@
  * 一个状态 = 一段上下文: 已处理 n_past 个位置, 每次 v41_forward 喂 n(≤ cap_tok) 个新 token, 位置 pos0=n_past 起,
  * 出这 n 个位置的 logits。prefill = 大块, 解码 = n=1, 同一条路(这是对拍能闭合的前提: 分块/逐 token 与整批逐位一致)。
  * 缓存(全 f32 行主序, 值落在官方量化格点上; 压到 fp4/fp8 字节是 P4 的事):
- *   win[il]      [(SWA+cap)][512]  每层窗口 KV: 前 SWA 行 = 位置 pos0-SWA..pos0-1, 后 n 行本 chunk; 层算完把尾 SWA 行挪到头
+ *   win[il]      [(SWA+cap)][512]  每层窗口 KV。前 SWA 行是**环**(decode.md D1, 官方 window_kv_cache[pos % win]):
+ *                位置 a 恒住在 a % SWA 那一格, 只装已提交的位置; 后 n 行是本批, 层算完由 win_commit 写进环。
+ *                本批不直接进环, 是为了让投机验证批里没被接受的那几位不污染历史(回滚只还原几格, 不是整份 128 行)。
  *   comp_kv[src] [ctx/ratio][512]  kv 源层压缩 KV(rope+fp4 后), 按组追加; index_k[src] [ctx/ratio][128] 同步的 indexer 键
  *   cpre_*[src]  [(ratio+cap)][512] ratio>1 源层的池化输入余行(跨 chunk 没凑满一组的 token 留到下块)
  * 为什么不复用 ds4_gpu_graph: 那套是 V4 Flash 的状态机(比 4/128 压缩器暂存、indexer 自带缓存、spec 快照…), V4.1 的
@@ -37,6 +39,7 @@ typedef struct {
      * 其余(comp_kv/index_k 按组号写、ng_src/cpend 是计数)回退计数后下一轮直接覆盖, 不用备份。 */
     ds4_gpu_tensor *snap_win[DS4_MAX_LAYER], *snap_cpre_kv[DS4_MAX_LAYER], *snap_cpre_sc[DS4_MAX_LAYER];
     uint32_t snap_cpend[DS4_MAX_LAYER], snap_ng[DS4_MAX_LAYER], snap_past, snap_on;
+    uint32_t snap_n;             /* 快照那一批有几位(= 验证批 1+k): 回滚只还原 [keep, snap_n) 那几格环 */
     uint32_t cpend[DS4_MAX_LAYER];   /* 源层余行数(= pos0 % ratio) */
     uint32_t ng_src[DS4_MAX_LAYER];  /* 源层缓存里的组数(含本 chunk 新完成的) */
     ds4_gpu_tensor *iq, *iw, *iscore, *cand, *idx;       /* [cap][32·128], [cap][32], [cap][ctx], u8 [cap][ctx], i32 [cap][512] */
@@ -84,6 +87,10 @@ typedef struct {
     ds4_gpu_tensor *ids, *ids_next;   /* i32 [cap]: [0]=真 token, [1..block]=草稿; argmax 的落点 */
     ds4_gpu_tensor *h;         /* [cap][E] 出口 hc_pre 的结果(confidence 也吃它) */
     uint64_t *exp_off[DS4_MTP_MAX_TOWERS];
+    /* 草稿器对齐放大器(mtp.md M6): xn += xn·(Bᵀ·A), 把草稿器的出口隐态掰到主模型的那个。
+     * 两边过同一个出口头 ⇒ 隐态对齐就是 logits 对齐。K=0 表示没挂, 整条路是恒等的。 */
+    ds4_gpu_tensor *ampA, *ampB, *ampT;
+    uint32_t ampK;
     uint32_t block, ready;
     int32_t host_ids[DS4_MTP_MAX_BLOCK + 1];
     float host_conf[DS4_MTP_MAX_BLOCK];
@@ -106,6 +113,8 @@ extern int g_ds4_v41_prof;   /* --v41-prof(core_v41_api.c) */
 extern int g_ds4_v41_dspark;         /* --no-dspark 关掉投机解码(对拍) */
 extern int g_ds4_v41_decoder_full;   /* --decoder-full: 关 CED, 每块跑满 40 层(精确路) */
 extern const char *g_ds4_v41_amp_dir;   /* --zchain <dir>(V4.1 形态: amp_Lnn.bin 目录), core_engine_open.c 转来 */
+extern const char *g_ds4_v41_draft_amp; /* --draft-amp <file>: 草稿器对齐边车(mtp.md M6), 只动草稿器 */
+extern float g_ds4_v41_draft_amp_scale;  /* --draft-amp-scale β: 装载时 A *= β(诊断幅度用) */
 extern float g_ds4_v41_amp_scale;       /* --zchain-scale β: 加载时 A *= β(默认 1.0) */
 extern const char *g_ds4_v41_pt_dir;    /* --posttrain <dir>: 三文件部署第三件(后训练增益目录), 与 ② 的表逐元素相乘 */
 extern ds4_v41_moe_hook_fn g_ds4_v41_hook;   /* 反修钩子(ds4_engine_v41_set_moe_hook), 无=NULL */
@@ -120,7 +129,7 @@ ds4_gpu_tensor *v41_alloc(uint64_t bytes, bool *ok);   /* 小工具: 分配失�
 bool v41_state_alloc(ds4_v41_state *st, uint32_t cap_tok, uint32_t ctx);
 void v41_state_free(ds4_v41_state *st);
 bool v41_forward(ds4_engine *e, ds4_v41_state *st, const int32_t *ids, uint32_t n);   /* 追加 n 个 token, st->logits[n][V] */
-bool v41_spec_snapshot(ds4_v41_state *st);                      /* 验证批前: 备份会被破坏性平移的两处缓存 */
+bool v41_spec_snapshot(ds4_v41_state *st, uint32_t n);          /* 验证批前: 备份这 n 位会盖掉的环格 + 压缩器余行 */
 bool v41_spec_rollback(ds4_v41_state *st, uint32_t keep);       /* 验证批后: 只保留前 keep 个位置, 其余撤销 */
 bool v41_layer(ds4_engine *e, ds4_v41_state *st, uint32_t il);        /* 一层(主干层或草稿塔, 看 st->draft) */
 bool v41_attention(ds4_engine *e, ds4_v41_state *st, uint32_t il);   /* core_v41_attn.c: st->xn → st->attn_out, 更新各缓存 */

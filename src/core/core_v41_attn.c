@@ -72,13 +72,14 @@ static bool v41_compress_source(ds4_engine *e, ds4_v41_state *st, uint32_t il, u
     if (!ds4_gpu_v41_round_bf16_tensor(st->ktmp, (uint64_t)ng_new * IK)) return false;
     if (!ds4_gpu_v41_rms_norm_tensor(st->ckv, st->ktmp, m->map, m->size, l->indexer_k_norm->abs_offset, IK, ng_new, DS4_RMS_EPS)) return false;
     if (!v41_rope(st->ckv, st->posg, ng_new, 1, IK, ratio, false)) return false;
-    if (!ds4_gpu_v41_act_quant_fp4_tensor(st->ckv, ng_new, IK, 32, false)) return false;
-    if (!ds4_gpu_tensor_copy(st->index_k[il], (uint64_t)g0 * IK * 4, st->ckv, 0, (uint64_t)ng_new * IK * 4)) return false;
+    /* ★量化 + 打包一发进缓存★(decode.md D1): 原来是"act_quant 就地改 f32" + "整行 f32 拷进缓存"两发,
+     * 缓存按 512 个 f32 存一个只有 16 种取值的量 —— 现在按官方的 288 B/组存(见 cuda_kv_pack.inc.cu)。
+     * 值逐位不变: 打包的 (nibble, scale) 读回来算 bf16(nibble×scale), 正是 act_quant 写回去的那个数。 */
+    if (!ds4_gpu_v41_idxk_pack_tensor(st->index_k[il], g0, st->ckv, ng_new)) return false;
     /* 压缩 KV: latent → rope(组位置) → fp4(e4m3 scale/16) → 源层缓存 */
     if (!ds4_gpu_tensor_copy(st->pooled, 0, st->latent, 0, (uint64_t)ng_new * rowb)) return false;
     if (!v41_rope(st->pooled, st->posg, ng_new, 1, HD, ratio, false)) return false;
-    if (!ds4_gpu_v41_act_quant_fp4_tensor(st->pooled, ng_new, HD, 16, true)) return false;
-    return ds4_gpu_tensor_copy(st->comp_kv[il], (uint64_t)g0 * rowb, st->pooled, 0, (uint64_t)ng_new * rowb) != 0;
+    return ds4_gpu_v41_ckv_pack_tensor(st->comp_kv[il], g0, st->pooled, ng_new) != 0;
 }
 
 /* indexer 源层: q = wq_b(qr_norm) → rope → fp4; weights = proj(x)·scale; 对源层整段键打分 → [候选块] → topk */
@@ -139,9 +140,10 @@ static bool v41_draft_attention(ds4_engine *e, ds4_v41_state *st, uint32_t il) {
     if (!v41_rope(st->kvn, st->pos, n, 1, HD, 0, false)) return false;
     if (!ds4_gpu_v41_act_quant_fp8_tensor(st->kvn, n, HD, 32)) return false;
     if (!ds4_gpu_tensor_copy(st->win[il], (uint64_t)SWA * rowb, st->kvn, 0, (uint64_t)n * rowb)) return false;
+    /* ring=0: 草稿塔的窗口是 v41_draft_push_main 用整体左移维护的线性段, 不是主路那个环 */
     if (!ds4_gpu_v41_sparse_attn_tensor(st->o, st->q, st->win[il], NULL, NULL, m->map, m->size,
                                         l->attn_sinks->abs_offset, n, st->pos0, SWA, 0, 0, NH, HD,
-                                        (float)(1.0 / sqrt((double)HD)), 1)) return false;
+                                        (float)(1.0 / sqrt((double)HD)), 1, 0)) return false;
     if (!v41_rope(st->o, st->pos, n, NH, HD, 0, true)) return false;
     const uint32_t grp = NH / DS4_N_OUT_GROUP;
     if (!ds4_gpu_v41_grouped_matmul_fp4x32_tensor(st->low, m->map, m->size, l->attn_output_a->abs_offset, DS4_N_OUT_GROUP,
@@ -204,10 +206,11 @@ bool v41_attention(ds4_engine *e, ds4_v41_state *st, uint32_t il) {
     }
     /* 稀疏注意力(窗口 128 + topk 压缩行, sink 进分母) → bf16 → 逆 rope */
     if (!ds4_gpu_v41_sparse_attn_tensor(st->o, st->q, st->win[il], (ng && topk) ? comp : NULL, (ng && topk) ? st->idx : NULL, m->map, m->size,
-                                        l->attn_sinks->abs_offset, n, st->pos0, SWA, ng, topk, NH, HD, (float)(1.0 / sqrt((double)HD)), 0)) return false;
-    /* 窗口缓冲平移: 行 [n, n+SWA) → [0, SWA)(经暂存, 免重叠) */
-    if (!ds4_gpu_tensor_copy(st->wintmp, 0, st->win[il], (uint64_t)n * rowb, (uint64_t)SWA * rowb)) return false;
-    if (!ds4_gpu_tensor_copy(st->win[il], 0, st->wintmp, 0, (uint64_t)SWA * rowb)) return false;
+                                        l->attn_sinks->abs_offset, n, st->pos0, SWA, ng, topk, NH, HD, (float)(1.0 / sqrt((double)HD)), 0, 1)) return false;
+    /* ★本批的 n 行进环★(decode.md D1; 原来是"整段左移两发 256 KB 拷贝", 每层每步白搬 512 KB):
+     * 注意力已经算完 —— 这一步之前环里装的还是历史 [pos0-SWA, pos0-1], 正是上面要读的;
+     * 算完才提交, 顺序不能倒。投机的部分接受由 v41_spec_rollback 把没接受的格子还原回去。 */
+    if (!ds4_gpu_v41_win_commit_tensor(st->win[il], st->pos0, n, SWA, HD)) return false;
     if (!v41_rope(st->o, st->pos, n, NH, HD, ratio, true)) return false;
     /* 输出投影: 分组 wo_a(块对角) → bf16 → wo_b → bf16 */
     const uint32_t grp = NH / DS4_N_OUT_GROUP;
