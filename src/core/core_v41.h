@@ -12,6 +12,9 @@
 #define DS4_CORE_V41_H
 #ifndef DS4_NO_GPU
 
+#define V41_EGATHER_THREADS 48u   /* engram 取行的常驻线程池大小(解码 n=1 时任务单元正好 2 层 × 24 行) */
+#define V41_EDIO_ALIGN 4096u      /* O_DIRECT 的对齐粒度(逻辑块); 一行只有 264 B, 所以要读对齐超集 + 落脚点 */
+
 #define DS4_V41_CHUNK 512u          /* prefill 分块(缓冲按它分配; 对拍用 --v41-chunk 改小看自洽) */
 #define DS4_V41_MAX_CTX_P2C 32768u  /* topk/候选块核用 shared 存整段组数, 48 KB ⇒ ratio-1 层 ≤ 48k 组; P4 换 radix select 再放开 */
 
@@ -91,6 +94,13 @@ void v41_draft_free(ds4_v41_draft *dr);
 /* 一轮草稿: 主前向刚推进了 rows 个已确认位置(mainh 里有它们的 main_hidden), 最后一位是 tok/pos_main。
  * 出 dr->host_ids[1..block](草稿 token)与 dr->host_conf[0..block-1](每位的条件接受概率)。 */
 bool v41_draft_step(ds4_engine *e, ds4_v41_state *main_st, ds4_v41_draft *dr, int32_t tok, uint32_t pos_main, uint32_t rows);
+
+/* engram 取行的一个工作单元(core_v41_engram.c 填, core_v41_epool.c 的池跑) */
+typedef struct { const ds4_engine *e; const ds4_v41_state *st; uint64_t u0, u1; int err; uint8_t *bounce; } v41_eworker;
+void *v41_eworker_run(void *arg);
+uint32_t v41_epool_threads(void);                       /* 池里有几个线程(懒起); 0 = 起不来, 调用方自己同步做 */
+bool v41_epool_submit(v41_eworker *w, uint32_t njob);   /* 提交一轮, 不阻塞 */
+void v41_epool_wait(void);                              /* 等这一轮干完 */
 
 extern int g_ds4_v41_prof;   /* --v41-prof(core_v41_api.c) */
 extern int g_ds4_v41_dspark;         /* --no-dspark 关掉投机解码(对拍) */

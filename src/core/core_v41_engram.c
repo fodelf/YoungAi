@@ -11,11 +11,10 @@
 #include "core_internal.h"
 #ifndef DS4_NO_GPU
 
-#define V41_EGATHER_THREADS 48u
+/* 池里的线程数与 O_DIRECT 对齐粒度的正本在 core_v41.h(epool 也要用) */
 
 static const void *v41_tensor_host(const ds4_model *m, const ds4_tensor *t) { return tensor_data(m, t); }
 
-#define V41_EDIO_ALIGN 4096u   /* O_DIRECT 的对齐粒度(逻辑块); 行只有 264 B, 所以要对齐超集 + 落脚点 */
 
 /* 从 O_DIRECT 的 fd 读任意 [off, off+len) —— 对齐到块读进 bounce 再拷出来。
  * len 最大 = HD(256) ⇒ 跨块最多 2 块, bounce 给 2×ALIGN 就够。 */
@@ -87,20 +86,18 @@ static void v41_engram_hash(const ds4_engine *e, const ds4_v41_state *st, uint32
     }
 }
 
-/* 后台取行任务: 工作单元 = (engram 层 ei, 位置 p, 列 c) 一行; 线程按单元区间切, 同 (ei,p) 的哈希只算一次 */
-typedef struct {
-    const ds4_engine *e; const ds4_v41_state *st; uint64_t u0, u1; int err;
-    uint8_t *bounce;   /* O_DIRECT 的对齐落脚点(V41_EDIO_ALIGN 对齐, 2 个块) */
-} v41_eworker;
+/* 取行任务的工作单元 = (engram 层 ei, 位置 p, 列 c) 一行; 线程按单元区间切, 同 (ei,p) 的哈希只算一次。
+ * v41_eworker 的定义在 core_v41.h(常驻线程池 core_v41_epool.c 也要用)。 */
 typedef struct {
     uint32_t n_eng, n, cols, HD, nsc;
     uint8_t *raw[DS4_V41_MAX_ENGRAM];      /* [n][cols][HD+nsc] */
     int64_t *rows[DS4_V41_MAX_ENGRAM];     /* [n][cols] */
-    pthread_t th[V41_EGATHER_THREADS]; v41_eworker w[V41_EGATHER_THREADS]; uint32_t nth;
+    v41_eworker w[V41_EGATHER_THREADS]; uint32_t nth;
+    uint8_t *fallback_bounce;   /* 没线程池时本线程用的 O_DIRECT 落脚点 */
     int started, joined, err;
 } v41_ejob;
 
-static void *v41_eworker_run(void *arg) {
+void *v41_eworker_run(void *arg) {
     v41_eworker *wk = (v41_eworker *)arg;
     const ds4_v41_state *st = wk->st; const v41_ejob *J = (const v41_ejob *)st->ejob; const ds4_v41_cfg *v = &g_ds4_v41;
     const uint32_t stride = J->HD + J->nsc;
@@ -133,8 +130,8 @@ static void *v41_eworker_run(void *arg) {
 static void v41_ejob_free(ds4_v41_state *st) {
     v41_ejob *J = (v41_ejob *)st->ejob;
     if (!J) return;
-    if (J->started && !J->joined) for (uint32_t t = 0; t < J->nth; t++) pthread_join(J->th[t], NULL);
-    for (uint32_t t = 0; t < J->nth; t++) free(J->w[t].bounce);
+    if (J->started && !J->joined) v41_epool_wait();   /* 池的线程不属于这个 job, 只等它这轮干完 */
+    free(J->fallback_bounce);
     for (uint32_t i = 0; i < DS4_V41_MAX_ENGRAM; i++) { free(J->raw[i]); free(J->rows[i]); }
     free(J); st->ejob = NULL;
 }
@@ -144,6 +141,9 @@ bool v41_engram_prefetch(ds4_engine *e, ds4_v41_state *st) {
     v41_ejob_free(st);
     if (v->n_engram == 0) return true;
     v41_ejob *J = xmalloc(sizeof *J); memset(J, 0, sizeof *J);
+    if (!v41_epool_threads() && posix_memalign((void **)&J->fallback_bounce, V41_EDIO_ALIGN, 2u * V41_EDIO_ALIGN) != 0) {
+        fprintf(stderr, "ds4: engram O_DIRECT 落脚点分配失败\n"); free(J); return false;
+    }
     J->n_eng = v->n_engram; J->n = st->n; J->cols = (v->engram_max_ngram - 1) * v->engram_heads; J->HD = v->engram_head_dim; J->nsc = J->HD / 32u;
     st->ejob = J;
     for (uint32_t ei = 0; ei < J->n_eng; ei++) {
@@ -154,16 +154,21 @@ bool v41_engram_prefetch(ds4_engine *e, ds4_v41_state *st) {
         J->rows[ei] = xmalloc((size_t)J->n * J->cols * sizeof(int64_t));
     }
     const uint64_t U = (uint64_t)J->n_eng * J->n * J->cols;
-    J->nth = U < V41_EGATHER_THREADS ? (uint32_t)U : V41_EGATHER_THREADS;
-    for (uint32_t t = 0; t < J->nth; t++) {
+    /* ★交给常驻线程池(core_v41_epool.c)★: 以前这里每步 pthread_create 48 个线程 + 48 次
+     * posix_memalign, nsys 量到每步 2.59 ms 的 GPU 空转就是这段 —— 而真正的 IO 只有 48 次 4 KB 读。
+     * 池起不来就本线程同步做完(慢但正确)。 */
+    const uint32_t pool = v41_epool_threads();
+    J->nth = pool ? (U < pool ? (uint32_t)U : pool) : 1u;
+    for (uint32_t t = 0; t < J->nth; t++)
         J->w[t] = (v41_eworker){ e, st, U * t / J->nth, U * (t + 1) / J->nth, 0, NULL };
-        if (posix_memalign((void **)&J->w[t].bounce, V41_EDIO_ALIGN, 2u * V41_EDIO_ALIGN) != 0) {
-            fprintf(stderr, "ds4: engram O_DIRECT 落脚点分配失败\n"); return false;
-        }
-        if (pthread_create(&J->th[t], NULL, v41_eworker_run, &J->w[t]) != 0) {   /* 起不来就本线程同步做 */
-            v41_eworker_run(&J->w[t]); J->th[t] = pthread_self();
-        }
+    if (!pool) {   /* 没池: 本线程一口气做完 */
+        J->w[0].bounce = J->fallback_bounce;
+        v41_eworker_run(&J->w[0]);
+        J->err = J->w[0].err;
+        J->started = 1; J->joined = 1;
+        return J->err == 0;
     }
+    if (!v41_epool_submit(J->w, J->nth)) return false;
     J->started = 1;
     return true;
 }
@@ -172,7 +177,8 @@ static bool v41_ejob_wait(ds4_v41_state *st) {
     v41_ejob *J = (v41_ejob *)st->ejob;
     if (!J || !J->started) return false;
     if (!J->joined) {
-        for (uint32_t t = 0; t < J->nth; t++) { if (!pthread_equal(J->th[t], pthread_self())) pthread_join(J->th[t], NULL); if (J->w[t].err) J->err = J->w[t].err; }
+        v41_epool_wait();
+        for (uint32_t t = 0; t < J->nth; t++) if (J->w[t].err) J->err = J->w[t].err;
         J->joined = 1;
     }
     if (J->err) fprintf(stderr, "ds4: engram 取行失败(%s)\n", J->err == 1 ? "行号越界" : "pread 短读");
