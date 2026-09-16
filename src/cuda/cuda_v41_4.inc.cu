@@ -348,8 +348,31 @@ static int v41_vq_fused_moe(float *out, const uint8_t *blob, uint32_t IN, uint32
     const uint32_t cbb = nc * 16u;
     if (!g_v41_vq_sh_gateup) {   /* 一次性, 两个核各问各的: gateup 要两本(gate+up), down 只要一本 */
         int cap = 0; (void)cudaDeviceGetAttribute(&cap, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
+        /* ★占用率是被谁卡住的, 要有实数才能判★(2026-09-16): 一个 SM 同时挂几个 block, 由"线程槽 /
+         * shared / 寄存器"里最紧的那个定。per-block 的 shared 上限(cap)只说这一个 block 能要多少,
+         * 真正决定并行度的是 **per-SM 的 shared 总量** 与 per-SM 线程上限 —— 缺这两个数就只能猜。 */
+        int sh_sm = 0, thr_sm = 0, nsm = 0, regs_sm = 0;
+        (void)cudaDeviceGetAttribute(&sh_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, 0);
+        (void)cudaDeviceGetAttribute(&thr_sm, cudaDevAttrMaxThreadsPerMultiProcessor, 0);
+        (void)cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, 0);
+        (void)cudaDeviceGetAttribute(&regs_sm, cudaDevAttrMaxRegistersPerMultiprocessor, 0);
         const bool og = cudaFuncSetAttribute(v41_vq_gateup_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)cbb) == cudaSuccess;
         const bool od = cudaFuncSetAttribute(v41_vq_down_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)cbb) == cudaSuccess;
+        /* ★占用率必须在开完 opt-in shared **之后**问★: 在 SetAttribute 之前调用, API 按默认 48 KB
+         * 的限额算, 会判"一个都挂不上"(返回 0) —— 第一版就这么打出个 0%, 差点据此下结论。 */
+        cudaFuncAttributes fa; memset(&fa, 0, sizeof fa);
+        (void)cudaFuncGetAttributes(&fa, v41_vq_gateup_kernel);
+        int blocks_sm = 0;
+        const int thr_blk = (int)(32u * 32u);
+        (void)cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_sm, v41_vq_gateup_kernel, thr_blk, (size_t)cbb);
+        fprintf(stderr, "ds4: [v41] 设备: %d SM / 每 SM shared %d KB / 每 SM 线程 %d / 每 SM 寄存器 %d\n"
+                        "ds4: [v41] VQ gateup 核: %d 线程/block, 每线程 %d 寄存器, 动态 shared %u KB"
+                        " ⇒ 每 SM 挂 %d 个 block = %d 线程, **占用率 %.0f%%**\n"
+                        "ds4: [v41]   谁卡的: shared %d 份 / 寄存器 %d 份 / 线程槽 %d 份(取最小)\n",
+                nsm, sh_sm >> 10, thr_sm, regs_sm, thr_blk, fa.numRegs, cbb >> 10,
+                blocks_sm, blocks_sm * thr_blk, thr_sm ? 100.0 * blocks_sm * thr_blk / thr_sm : 0.0,
+                cbb ? sh_sm / (int)cbb : 0,
+                fa.numRegs ? regs_sm / (fa.numRegs * thr_blk) : 0, thr_sm / thr_blk);
         (void)cudaGetLastError();
         g_v41_vq_sh_gateup = og ? 1 : -1;
         g_v41_vq_sh_down = od ? 1 : -1;
