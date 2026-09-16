@@ -140,6 +140,21 @@ static bool v41_moe(const ds4_model *m, const ds4_layer_weights *l, ds4_v41_stat
         if (!ds4_gpu_v41_mtp_moe_tensor(st->routed, m->map, il, st->tower_exp_off[il], E, FF, E, st->sel, st->rw,
                                         NE, KU, DS4_SWIGLU_CLAMP_EXP, st->xn, n)) return false;
     } else {
+    /* ★验证批的专家重合度(2026-09-16, mtp.md M3 的判决依据)★
+     * 现在的 VQ 路是 n_tok × top-8 个 (token,槽) 对, 每对独立开一份专家 —— 同一个专家被两个 token
+     * 选中就把它的权重读两遍。投机验证一次 4 行, 于是专家字节直接乘 4, 这是验证 148 ms 的大头。
+     * 去重值不值, 全看这四行的 top-8 实际重合多少: 打印"唯一专家数 / n×8"。
+     * 只在 --v41-prof + 多行时算, 因为它要把 sel 读回主机(一次同步/层)。 */
+    if (g_ds4_v41_prof && n > 1u) {
+        int32_t s[8u * DS4_N_EXPERT_USED];
+        const uint32_t ns = n * DS4_N_EXPERT_USED;
+        if (ns <= sizeof(s) / sizeof(s[0]) && ds4_gpu_synchronize() &&
+            ds4_gpu_tensor_read(st->sel, 0, s, (uint64_t)ns * 4)) {
+            uint32_t uniq = 0;
+            for (uint32_t i = 0; i < ns; i++) { uint32_t j = 0; while (j < i && s[j] != s[i]) j++; if (j == i) uniq++; }
+            fprintf(stderr, "[moe-uniq] L%02u n=%u: 唯一专家 %u / %u\n", il, n, uniq, ns);
+        }
+    }
     char nm[64]; snprintf(nm, sizeof nm, "blk.%u.ffn_exps_vq.blob", il);
     const ds4_tensor *blob = model_find_tensor(m, nm);
     if (!blob) return false;
