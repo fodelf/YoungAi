@@ -67,6 +67,7 @@
 #include "src/cuda/cuda_sparse_attn_mma.inc.cu"   /* 稀疏注意力张量核版(speed.md 段 4); 必须在 v41_1 之后(用 v41_bf16r)、v41_2 之前(被它调) */
 #include "src/cuda/cuda_v41_hc.inc.cu"   /* mHC 一族(mix/sinkhorn/hc_pre/hc_post/合一核); 在 v41_1 之后(用它的 bf16r 与暂存槽) */
 #include "src/cuda/cuda_v41_attn_split.inc.cu"   /* 解码路稀疏注意力 split-K(single.md S4); 在 v41_2 之前(被它调) */
+#include "src/cuda/cuda_v41_attn_mma_decode.inc.cu"   /* 解码路稀疏注意力上张量核(decode.md D2): 按键分段的 mma 版; 必须在 sparse_attn_mma(借它的 gather/scores)与 attn_split(借它的合并核与暂存槽)之后 */
 #include "src/cuda/cuda_kv_ring.inc.cu"   /* SWA 窗口的环维护(decode.md D1): 提交/快照/回滚; 在 v41_1 之后(用 v41_win_row 的同一套行号约定) */
 #include "src/cuda/cuda_v41_2.inc.cu"
 #include "src/cuda/cuda_v41_3.inc.cu"

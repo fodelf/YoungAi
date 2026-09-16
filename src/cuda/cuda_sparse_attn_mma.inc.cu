@@ -34,20 +34,22 @@
 /* 把 16 个键行搬进 shared 并转 bf16; 无效槽整行清零, valid[] 记状态(给后面压 -inf 用)。
  * 键序 = 窗口行(升序)后接 topk 压缩行, 与标量版一字不差。 */
 __device__ __forceinline__ static void ds4_attn_mma_gather_keys(
-        __nv_bfloat16 *ks, int *valid, const float *kvw, const float *kvc, const int32_t *idx,
+        __nv_bfloat16 *ks, int *valid, const float *kvw, const uint8_t *kvc, const int32_t *idx,
         uint32_t i, uint32_t base, uint32_t nt, uint32_t nwin, uint32_t lo, uint32_t pos0,
         uint32_t window, uint32_t ng, uint32_t topk) {
     for (uint32_t t = threadIdx.x / 32u; t < DS4_ATTN_MMA_KT; t += blockDim.x / 32u) {
         const uint32_t lane = threadIdx.x & 31u, kk = base + t;
-        const float *krow = NULL;
+        const float *krow = NULL; const uint8_t *cpk = NULL;   /* 窗口行 f32 / 压缩行打包 FP4, 见 cuda_kv_pack */
         if (t < nt) {
-            if (kk < nwin) krow = kvw + (uint64_t)((int64_t)lo + kk - ((int64_t)pos0 - (int64_t)window)) * DS4_ATTN_MMA_HD;
+            /* ring=1 恒成立: mma 版只在主路(!full_block)被调, 主路的历史段是环(见 v41_win_row) */
+            if (kk < nwin) krow = kvw + v41_win_row((int64_t)lo + kk, pos0, window, 1u) * DS4_ATTN_MMA_HD;
             else if (kvc && idx) { const int32_t g = idx[(uint64_t)i * topk + (kk - nwin)];
-                                   if (g >= 0 && (uint32_t)g < ng) krow = kvc + (uint64_t)g * DS4_ATTN_MMA_HD; }
+                                   if (g >= 0 && (uint32_t)g < ng) cpk = kvc + (uint64_t)g * DS4_V41_CKV_BYTES; }
         }
-        if (lane == 0) valid[t] = krow != NULL;
+        if (lane == 0) valid[t] = (krow || cpk) ? 1 : 0;
         for (uint32_t d = lane; d < DS4_ATTN_MMA_HD; d += 32u)
-            ks[(size_t)t * DS4_ATTN_MMA_HD + d] = krow ? __float2bfloat16(krow[d]) : (__nv_bfloat16)0.0f;
+            ks[(size_t)t * DS4_ATTN_MMA_HD + d] = krow ? __float2bfloat16(krow[d])
+                                                : (cpk ? __float2bfloat16(v41_ckv_get(cpk, d)) : (__nv_bfloat16)0.0f);
     }
 }
 
@@ -80,7 +82,7 @@ __device__ __forceinline__ static void ds4_attn_mma_scores(
     __syncthreads();
 }
 
-__global__ static void ds4_sparse_attn_mma_kernel(float *o, const float *q, const float *kvw, const float *kvc,
+__global__ static void ds4_sparse_attn_mma_kernel(float *o, const float *q, const float *kvw, const uint8_t *kvc,
                                                   const int32_t *idx, const float *sink, uint32_t pos0, uint32_t window,
                                                   uint32_t ng, uint32_t topk, uint32_t n_head, float scale) {
     namespace wmma = nvcuda::wmma;
@@ -173,7 +175,7 @@ static size_t ds4_attn_mma_smem_bytes(void) {
 
 /* 能不能用: 形状对得上(64 头 × 512 维, 头数能被 16 整除)+ 块够大(n_tok 小的时候 grid 只有 n_tok×4 个 block,
  * 填不满 48 个 SM, 标量版反而好) + shared 抬得上去。返回 0 = 调用方回标量版。 */
-static int ds4_sparse_attn_mma_launch(float *o, const float *q, const float *kvw, const float *kvc,
+static int ds4_sparse_attn_mma_launch(float *o, const float *q, const float *kvw, const uint8_t *kvc,
                                       const int32_t *idx, const float *sink, uint32_t n_tok, uint32_t pos0,
                                       uint32_t window, uint32_t ng, uint32_t topk, uint32_t n_head,
                                       uint32_t head_dim, float scale) {

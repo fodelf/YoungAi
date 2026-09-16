@@ -23,6 +23,12 @@ CHUNK="${3:-512}"
 NTOK=2048
 
 MODEL="${4:-gguf/v41/DeepSeek-V4.1-Flash-vq8x4096-fp4.gguf}"   # 第 4 个参数换模型(换新 GGUF 对尺用)
+# ★第 5 个参数: 额外旗标(2026-09-16 decode.md D2)★
+# 为什么要它: 这把尺默认按块 512 走**预填**核, 量不到解码路的核。改解码核(注意力/mHC/GEMV)要判质量,
+# 得让它一个 token 一块地走 —— `"--decoder-full" 1` 就是这个用法(分块给 1 + 关 CED)。
+# 不关 CED 会怎样: 块 1 时除最后一块外都只跑到分界层、不出 logits, NLL 直接是错的(不报错)。
+BIN="${6:-ds4}"                                                # 第 6 个参数换二进制(对照 A/B 用)
+EXTRA="${5:-}"
 AMP=gguf/v41/gr-fin-40-fp4
 IDS_SRC=gguf/v41judge/finj_n8192.ids
 OUT=/tmp/prefill-ruler
@@ -31,7 +37,7 @@ IDS="$OUT/finj_n$NTOK.ids"
 mkdir -p "$OUT"
 [ -f "$MODEL" ]   || { echo "★没有模型 $MODEL★"; exit 1; }
 [ -f "$IDS_SRC" ] || { echo "★没有判决料 $IDS_SRC★"; exit 1; }
-[ -x ./ds4 ]      || { echo "★没有 ./ds4, 先 make cuda-spark★"; exit 1; }
+[ -x ./"$BIN" ]   || { echo "★没有 ./$BIN, 先 make cuda-spark★"; exit 1; }
 
 # 判决料前 2048 个 id(空白分隔, 一行一个或一行多个都行)
 tr -s ' \t\n' '\n' < "$IDS_SRC" | grep -E '^[0-9]+$' | head -n "$NTOK" > "$IDS"
@@ -41,7 +47,7 @@ echo "== 预填尺 [$TAG] ${NTOK} token / 分块 $CHUNK / $REPS 遍"
 # ★秒数取引擎自己打的那个(「完成 S=2048 … 34.4s」), 不取 wall clock —— wall 里有 110 GB
 # 模型装载, 首跑冷页缓存能占 70 s, 把它算进预填就是自己骗自己。
 for r in $(seq 1 "$REPS"); do
-  ./ds4 -m "$MODEL" --zchain "$AMP" --ctx 32768 --v41-chunk "$CHUNK" \
+  ./"$BIN" -m "$MODEL" --zchain "$AMP" --ctx 32768 --v41-chunk "$CHUNK" $EXTRA \
         --score-ids "$IDS" --score-nll "$OUT/$TAG.nll$r.txt" --score-no-logits \
         > "$OUT/$TAG.out$r" 2> "$OUT/$TAG.err$r"
   SEC=$(grep -ao "完成 S=$NTOK[^\\n]*[0-9.]\+s" "$OUT/$TAG.err$r" | grep -o "[0-9.]*s$" | tr -d s)

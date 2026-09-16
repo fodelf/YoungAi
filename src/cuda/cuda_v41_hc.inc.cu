@@ -21,10 +21,71 @@ __global__ static void v41_scale_rows_kernel(float *y, const float *inv, uint32_
     const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] *= inv[i / cols];
 }
+/* ★Mega-mHC 第一刀(decode.md D2 #1/#11, 2026-09-16): mix 的三发合一★
+ *
+ * 原来一次 hc_mix 发三个核: ①row_rsqrt 算每个 token 的 1/rms ②f32 GEMV 出 24 列 ③scale_rows 乘回去。
+ * ①的 grid 就是 n_tok —— **解码时只有 1 个 block**, 48 个 SM 用 1 个, 读 82 KB 要 13.4 µs(合 6 GB/s),
+ * 全是启动与单块延迟; 每半层一次、40 层 = 80 发/步 ≈ 1.1 ms 纯白付。③更是为做一次乘法发一个核。
+ * 合成一发: GEMV 本来就有 24 个 block, 每个 block 的 256 个线程合起来正好把整条 hc 读一遍 ——
+ * 让每个 block 自己再算一遍 ①(82 KB 第二遍落在 L2 里), ③并进出口那一次乘法。
+ *
+ * ★这两段循环不许"优化"★: ①的累加序(线程 i 走 i, i+256, …, 再 shared 树归约)与 ②的累加序
+ * (warp 按 kpart 分 128 段、float4 取数、shfl 归约后按 kpart 升序相加)都是从
+ * v41_row_rsqrt_kernel / v41_f32_gemv_kernel **原样抄过来的**。换一种写法就是换一个和,
+ * 最后一位一变, 过一遍 sinkhorn 就放大成不同的混合系数, 整个输出就变了。
+ * 出错会怎样: 不报错, 温 0 输出与合并前逐字节对不上 —— 门就是拿这个抓它。 */
+__global__ static void v41_hc_mix_fused_kernel(float *mix, const float *w, const float *hc,
+                                               uint32_t dim, uint32_t out_dim, float eps, uint32_t ksplit) {
+    const uint32_t t = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
+    const float *x = hc + (uint64_t)t * dim;
+    __shared__ float sh[256];
+    /* ① 逐字照抄 v41_row_rsqrt_kernel */
+    {
+        float s = 0.f;
+        for (uint32_t i = threadIdx.x; i < dim; i += blockDim.x) s += x[i] * x[i];
+        sh[threadIdx.x] = s; __syncthreads();
+        for (uint32_t k = blockDim.x / 2; k > 0; k >>= 1) { if (threadIdx.x < k) sh[threadIdx.x] += sh[threadIdx.x + k]; __syncthreads(); }
+    }
+    const float inv = rsqrtf(sh[0] / (float)dim + eps);
+    __syncthreads();                       /* sh 下面要当归约槽复用, 等所有线程读完 sh[0] */
+    /* ② 逐字照抄 v41_f32_gemv_kernel 的 ksplit 分支(这里恒是 rows_per_block=1 ⇒ r = blockIdx.x) */
+    const uint32_t kpart = warp % ksplit, r = blockIdx.x;
+    float acc = 0.f;
+    if (r < out_dim) {
+        const float *wr = w + (uint64_t)r * dim;
+        for (uint32_t c = kpart * 128u + lane * 4u; c < dim; c += ksplit * 128u) {
+            const float4 wv = *(const float4 *)(wr + c);
+            const float4 xv = *(const float4 *)(x + c);
+            acc += wv.x * xv.x + wv.y * xv.y + wv.z * xv.z + wv.w * xv.w;
+        }
+        for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    }
+    if (lane == 0) sh[warp] = acc;
+    __syncthreads();
+    if (warp == 0 && lane == 0 && r < out_dim) {
+        float v = 0.f;
+        for (uint32_t k = 0; k < ksplit; k++) v += sh[k];
+        mix[(uint64_t)t * out_dim + r] = v * inv;   /* ③ 原来那一发 scale_rows 就是这一次乘法 */
+    }
+}
+
 int ds4_gpu_v41_hc_mix_tensor(ds4_gpu_tensor *mix, const ds4_gpu_tensor *hc, const void *model_map, uint64_t model_size,
                               uint64_t fn_offset, uint32_t n_embd, uint32_t n_hc, uint32_t n_tok, float eps) {
     const uint32_t dim = n_embd * n_hc, mix_hc = 2u * n_hc + n_hc * n_hc;
     if (!mix || !hc || hc->bytes < (uint64_t)n_tok * dim * 4 || mix->bytes < (uint64_t)n_tok * mix_hc * 4) return 0;
+    /* 合一核只接"原 GEMV 恰好会选 ksplit=8 / 每 block 一行"的形状 —— 也就是现役的 24 × 20480。
+     * 形状一旦不同(别的 hc 宽度/预填大批), 按原来的三发路走, 免得悄悄换一个累加序。 */
+    const uint64_t wbytes = (uint64_t)dim * mix_hc * 4;
+    const uint32_t nseg = dim / 128u;
+    if (n_tok <= V41_GEMV_MAX_TOK && (dim % 128u) == 0u && mix_hc * 8u < 32768u && nseg >= 8u &&
+        fn_offset <= model_size && wbytes <= model_size - fn_offset) {
+        const float *W = (const float *)cuda_model_range_ptr(model_map, fn_offset, wbytes, "v41 hc fn");
+        if (W) {
+            v41_hc_mix_fused_kernel<<<dim3(mix_hc, n_tok), 256, 0, g_cur_stream>>>(
+                (float *)mix->ptr, W, (const float *)hc->ptr, dim, mix_hc, eps, 8u);
+            return cuda_ok(cudaGetLastError(), "v41 hc mix fused");
+        }
+    }
     float *inv = (float *)v41_grow(&g_v41_misc, (uint64_t)n_tok * 4, "v41 hc inv");
     if (!inv) return 0;
     v41_row_rsqrt_kernel<<<n_tok, 256, 0, g_cur_stream>>>(inv, (const float *)hc->ptr, dim, eps);
