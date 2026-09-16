@@ -42,6 +42,7 @@ int run_v41_generation(ds4_engine *engine, const cli_config *cfg, const ds4_toke
     ds4_engine_v41_set_prof(cfg->gen.v41_prof);
     ds4_engine_v41_set_decoder_full(cfg->gen.decoder_full);
     ds4_engine_v41_set_dspark(!cfg->gen.no_dspark);
+    ds4_engine_v41_set_draft_amp(cfg->gen.draft_amp);
     ds4_engine_v41_set_chunk(cfg->gen.v41_chunk);
     int rc = ds4_engine_v41_generate_argmax(engine, prompt->v, (int)prompt->len, cfg->gen.n_predict, cfg->gen.ctx_size, v41_emit_print, engine);
     fputc('\n', stdout);
@@ -59,6 +60,21 @@ int run_score_ids(ds4_engine *engine, const cli_config *cfg) {
     }
     fclose(fi);
     if (n < 2) { fprintf(stderr, "ds4: score-ids 少于 2 token\n"); free(ids); return 1; }
+    /* ★取料模式(mtp.md M6)★: 同一份 ids, 改成"一位一块 + 每位跑一轮草稿器", 出 (草稿隐态, 主模型隐态) 对
+     * 与首位一致率。必须配 --decoder-full —— 块 1 时 CED 会让非末块不出 logits, 靶直接是错的(不报错)。 */
+    if (cfg->gen.dcap_path) {
+        /* ★这条路不经过 run_v41_generation, 所以那边设的几个开关这里要自己设一遍★
+         * (2026-09-16 实撞: --draft-amp 在取料路上静默没生效, 判决数一模一样, 看着像"方法没用"。) */
+        ds4_engine_v41_set_decoder_full(cfg->gen.decoder_full);
+        ds4_engine_v41_set_draft_amp(cfg->gen.draft_amp);
+        ds4_engine_v41_set_draft_amp_scale(cfg->gen.draft_amp_scale > 0.f ? cfg->gen.draft_amp_scale : 1.0f);
+        ds4_engine_v41_set_prof(cfg->gen.v41_prof);
+        if (!cfg->gen.decoder_full)
+            fprintf(stderr, "ds4: ★--dspark-capture 必须配 --decoder-full★(否则 CED 让每块不出 logits, 靶是错的)\n");
+        const int rc = ds4_engine_v41_dspark_capture(engine, ids, n, cfg->gen.dcap_path);
+        free(ids);
+        return rc;
+    }
     /* V4.1(2026-09-12): 分块增量前向出全位置 logits(同构输出, anchor_metrics 直接对表) */
     if (ds4_engine_is_v41(engine)) {
         ds4_engine_v41_set_prof(cfg->gen.v41_prof);

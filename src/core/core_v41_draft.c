@@ -48,6 +48,75 @@ static bool v41_draft_exp_off(ds4_engine *e, ds4_v41_draft *dr) {
     return true;
 }
 
+/* 挂草稿器对齐边车(mtp.md M6; gguf-tools/amp/dspark_align 的产物)。
+ * 盘上: 16 B 头 {"DSPA", D, K} + A[K][D] f32 + B[K][D] f32。
+ * ★只改草稿器★: 主模型一个字节不碰, 所以它**不可能**动五指标, 只动接受率 —— 这是它能独立发车的前提。
+ * 出错会怎样: 文件在但 D 对不上 = 不是这个模型解的, 直接停车(挂上去只会让草稿变垃圾, 而且不报错)。 */
+static bool v41_draft_amp_load(ds4_v41_draft *dr, const char *path) {
+    struct { char magic[4]; uint32_t d, k, rsv; } h;
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "ds4: [v41] --draft-amp 打不开 %s\n", path); return false; }
+    bool ok = fread(&h, sizeof h, 1, f) == 1 && !memcmp(h.magic, "DSPA", 4);
+    if (ok && h.d != DS4_N_EMBD) {
+        fprintf(stderr, "ds4: [v41] --draft-amp 维度 %u ≠ %u, 不是这个模型解的\n", h.d, (unsigned)DS4_N_EMBD);
+        ok = false;
+    }
+    if (!ok) { fclose(f); fprintf(stderr, "ds4: [v41] --draft-amp %s 不是对齐边车\n", path); return false; }
+    const uint64_t nb = (uint64_t)h.k * h.d * 4;
+    float *buf = xmalloc((size_t)nb);
+    bool alloc_ok = true;
+    dr->ampA = v41_alloc(nb, &alloc_ok);
+    dr->ampB = v41_alloc(nb, &alloc_ok);
+    dr->ampT = v41_alloc((uint64_t)(dr->st.cap_tok ? dr->st.cap_tok : 8u) * h.k * 4, &alloc_ok);
+    ok = alloc_ok && fread(buf, 1, (size_t)nb, f) == nb;
+    if (ok && g_ds4_v41_draft_amp_scale != 1.0f)
+        for (uint64_t i = 0; i < nb / 4; i++) buf[i] *= g_ds4_v41_draft_amp_scale;
+    if (ok) ok = ds4_gpu_tensor_write(dr->ampA, 0, buf, nb) != 0;
+    if (ok) ok = fread(buf, 1, (size_t)nb, f) == nb && ds4_gpu_tensor_write(dr->ampB, 0, buf, nb);
+    free(buf); fclose(f);
+    if (!ok) { fprintf(stderr, "ds4: [v41] --draft-amp 读取失败\n"); return false; }
+    dr->ampK = h.k;
+    fprintf(stderr, "ds4: [v41] 草稿器对齐边车已挂: K=%u D=%u β=%.3f (%s)\n", h.k, h.d, (double)g_ds4_v41_draft_amp_scale, path);
+    return true;
+}
+
+/* 草稿器一次前向要读多少字节(2026-09-16)。
+ *
+ * 为什么要这张表: 投机赢不赢是纯字节账 —— 一轮读的总字节 ÷ 一轮产出的 token, 要小于纯解码的
+ * 6.0 GB/token。官方那边主模型 FP8 一个 token 几十 GB, 草稿器几 GB 可以忽略不计; 我们把主模型
+ * 压到 1.5 bit 专家 + 4.25 bit 骨架 = 6.0 GB, **草稿器的相对分量就翻上来了**。实测一轮草稿 39.7 ms,
+ * 按解码路的有效带宽折算是 4.5 GB —— 跟主模型一个 token 一样贵。这张表就是查这 4.5 GB 落在哪。
+ *
+ * 怎么读: 密集部分(注意力/共享专家/main_proj)是每步必读的固定成本, 激活专家按 top-k 折算,
+ * 出口头是主模型的那一份(草稿器借用, 所以严格说不算草稿器额外付的钱, 单列)。
+ * 出错会怎样: 表里"密集"一项如果和主模型一层的量级相当, 说明三塔根本不小, 投机从根上不成立。 */
+static void v41_draft_byte_report(ds4_engine *e, const ds4_v41_draft *dr) {
+    const ds4_v41_cfg *v = &g_ds4_v41;
+    const ds4_weights *w = &e->weights;
+    uint64_t dense = 0, exp_all = 0;
+    for (uint32_t T = 0; T < v->mtp_towers; T++) {
+        const ds4_layer_weights *t = &w->mtp.tower[T];
+        const ds4_tensor *d[] = { t->hc_attn_fn, t->hc_attn_scale, t->hc_attn_base, t->attn_norm, t->attn_q_a,
+            t->attn_q_a_norm, t->attn_q_b, t->attn_kv, t->attn_kv_a_norm, t->attn_sinks, t->attn_output_a,
+            t->attn_output_b, t->hc_ffn_fn, t->hc_ffn_scale, t->hc_ffn_base, t->ffn_norm, t->ffn_gate_inp,
+            t->ffn_exp_probs_b, t->ffn_gate_shexp, t->ffn_up_shexp, t->ffn_down_shexp };
+        for (size_t i = 0; i < sizeof(d) / sizeof(d[0]); i++) if (d[i]) dense += d[i]->bytes;
+        for (uint32_t x = 0; x < v->mtp_experts; x++) {
+            const ds4_tensor *g = w->mtp.exp_gate[T][x], *u = w->mtp.exp_up[T][x], *dn = w->mtp.exp_down[T][x];
+            if (g) exp_all += g->bytes; if (u) exp_all += u->bytes; if (dn) exp_all += dn->bytes;
+        }
+    }
+    /* 激活专家: 每塔 top-k, 但一块 B 位各自选各自的 —— 最坏情况 B×k 份互不相同 */
+    const double per_exp = v->mtp_experts ? (double)exp_all / (double)(v->mtp_towers * v->mtp_experts) : 0.0;
+    const double act = per_exp * v->mtp_used * v->mtp_towers * dr->block;
+    const uint64_t head = (w->output ? w->output->bytes : 0) + (w->mtp.main_proj ? w->mtp.main_proj->bytes : 0);
+    const double G = 1024.0 * 1024.0 * 1024.0;
+    fprintf(stderr, "ds4: [v41] 草稿器字节账: 密集(三塔) %.2f GB + 激活专家(最坏 %u×%u×%u 份) %.2f GB"
+                    " + 出口头/main_proj %.2f GB = **%.2f GB/块**  [专家全量 %.2f GB]\n",
+            (double)dense / G, v->mtp_towers, v->mtp_used, dr->block, act / G, (double)head / G,
+            ((double)dense + act + (double)head) / G, (double)exp_all / G);
+}
+
 bool v41_draft_alloc(ds4_engine *e, ds4_v41_draft *dr) {
     const ds4_v41_cfg *v = &g_ds4_v41;
     memset(dr, 0, sizeof *dr);
@@ -95,11 +164,13 @@ bool v41_draft_alloc(ds4_engine *e, ds4_v41_draft *dr) {
     dr->h = v41_alloc((uint64_t)cap * E * 4, &ok);
     if (!ok || !v41_draft_exp_off(e, dr)) { v41_draft_free(dr); return false; }
     dr->block = B;
+    if (g_ds4_v41_draft_amp && !v41_draft_amp_load(dr, g_ds4_v41_draft_amp)) { v41_draft_free(dr); return false; }
     dr->ready = 1;
     fprintf(stderr, "ds4: [v41] DSpark 草稿器已武装: %u 塔 × %u 专家 top-%u, 一块 %u 位, 目标层",
             v->mtp_towers, v->mtp_experts, v->mtp_used, B);
     for (uint32_t i = 0; i < v->n_mtp_target; i++) fprintf(stderr, " L%02d", (int)v->mtp_target[i]);
     fprintf(stderr, "\n");
+    v41_draft_byte_report(e, dr);
     return true;
 }
 
@@ -108,7 +179,8 @@ void v41_draft_free(ds4_v41_draft *dr) {
     ds4_gpu_tensor **all[] = { &st->tok, &st->pos, &st->hc, &st->hc2, &st->mix, &st->pre, &st->post, &st->comb, &st->pre_mix,
         &st->x, &st->xn, &st->qr, &st->qrn, &st->q, &st->kv, &st->kvn, &st->wintmp, &st->o, &st->low, &st->attn_out,
         &st->glog, &st->sel, &st->rw, &st->routed, &st->sg, &st->su, &st->sh, &st->so, &st->y, &st->logits, &st->main_x,
-        &dr->mainx_raw, &dr->mk_embed, &dr->mk_cur, &dr->mk_bias, &dr->conf_in, &dr->conf, &dr->ids, &dr->ids_next, &dr->h };
+        &dr->mainx_raw, &dr->mk_embed, &dr->mk_cur, &dr->mk_bias, &dr->conf_in, &dr->conf, &dr->ids, &dr->ids_next, &dr->h,
+        &dr->ampA, &dr->ampB, &dr->ampT };
     for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) { if (*all[i]) ds4_gpu_tensor_free(*all[i]); *all[i] = NULL; }
     for (uint32_t T = 0; T < DS4_MTP_MAX_TOWERS; T++) {
         if (st->win[T]) { ds4_gpu_tensor_free(st->win[T]); st->win[T] = NULL; }
@@ -152,6 +224,16 @@ static bool v41_draft_block(ds4_engine *e, ds4_v41_draft *dr, uint32_t pos0) {
     /* 出口: 官方 mtp[-1] 借主模型的 head, norm 用 mtp.2.norm */
     if (!ds4_gpu_v41_hc_pre_tensor(dr->h, st->hc, st->pre_mix, E, DS4_N_HC, B)) return false;
     if (!ds4_gpu_v41_rms_norm_tensor(st->xn, dr->h, m->map, m->size, e->weights.mtp.out_norm->abs_offset, E, B, DS4_RMS_EPS)) return false;
+    /* ★对齐修正(mtp.md M6)★: xn += xn·(Bᵀ·A) —— 把草稿器喂给出口头的隐态掰到主模型喂给**同一个头**的那个。
+     * 位置就在这里: norm 之后、head 之前, 与取料时 X 的取点逐字对应(取错点解出来的映射就是错的, 且不报错)。
+     * 没挂边车时 ampK=0, 这一行整条跳过, 输出与挂之前逐位相同。 */
+    if (dr->ampK) {
+        if (!ds4_gpu_v41_amp_apply_tensor(st->xn, st->xn, dr->ampA, dr->ampB, dr->ampT, B, E, dr->ampK)) return false;
+        /* ★补回 bf16 格点★: 出口头那个 GEMV 核**假定进来的激活已经在 bf16 格点上**(它为此省掉了
+         * 内层的舍入, 见 cuda_v41_4.inc.cu 的注释)。修正是 f32 加出来的, 不补这一下就破了那个前提 ——
+         * 不报错, 只差一个舍入位, 但那条不变量一旦破了后面没人再守。 */
+        if (!ds4_gpu_v41_round_bf16_tensor(st->xn, (uint64_t)B * E)) return false;
+    }
     if (!ds4_gpu_v41_matmul_fp4x32_tensor(st->logits, m->map, m->size, e->weights.output->abs_offset, E, DS4_N_VOCAB, st->xn, B, 0)) return false;
     /* 逐位: logits[i] += markov_head(第 i 位 token) → argmax → 第 i+1 位。全程在设备上,
      * 每位一次 D2H 就是每轮 5 次停等 —— 投机省下来的时间还不够付。 */

@@ -294,6 +294,12 @@ route_alpha_set: route_alpha_set.bin
 route_alpha_set.bin: $(AMP)/route_alpha_set.c
 	$(CC) $(BARE) $(NATIVE) -o route_alpha_set $< -lm
 
+# DSpark 草稿器对齐(mtp.md M6): 闭式岭 + 秩截断, 吃引擎 --dspark-capture 的取料
+dspark_align: dspark_align.bin
+.PHONY: dspark_align.bin
+dspark_align.bin: $(AMP)/dspark_align.c $(AMP)/linalg_small.c
+	$(CC) $(BARE) $(NATIVE) -o dspark_align $(AMP)/dspark_align.c $(AMP)/linalg_small.c -lm -lpthread
+
 zrec_to_zchain: zrec_to_zchain.bin
 .PHONY: zrec_to_zchain.bin
 zrec_to_zchain.bin: $(AMP)/zrec_to_zchain.c

@@ -26,6 +26,15 @@ void ds4_engine_v41_set_posttrain_dir(const char *dir);   /* --posttrain <dir>: 
 void ds4_engine_v41_set_score_aux(const char *nll_path, const char *topk_path, int topk,
                                   const char *rms_path, int skip_logits);
 int ds4_engine_v41_score_ids(ds4_engine *e, const int *ids, int n_ids, const char *out_path, int no_engram, int chunk);
+
+/* --dspark-capture(mtp.md M6): 教师强制一位一块走完 ids, 每位出 (草稿器出口隐态, 主模型出口隐态) 一对,
+ * 并直接量出"草稿器首位 ↔ 底座 argmax"的一致率(= 投机首位接受率 p1 的判决基线)。实现见 core_v41_dcap.c。 */
+int ds4_engine_v41_dspark_capture(ds4_engine *e, const int *ids, int n_ids, const char *out_path);
+
+/* --draft-amp <file>: 挂草稿器对齐边车(gguf-tools/amp/dspark_align 的产物)。只改草稿器的出口隐态,
+ * 主模型一个字节不碰 —— 所以它**不可能**动五指标, 只动接受率。传 NULL/不传 = 不挂, 整条路恒等。 */
+void ds4_engine_v41_set_draft_amp(const char *path);
+void ds4_engine_v41_set_draft_amp_scale(float s);   /* --draft-amp-scale β: 诊断修正幅度 */
 int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_prompt, int n_predict, int ctx_size,
                                    ds4_v41_emit_fn emit, void *ud);
 

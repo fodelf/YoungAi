@@ -324,6 +324,12 @@ cli_config parse_options(int argc, char **argv) {
             c.gen.score_ids_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--score-out")) {
             c.gen.score_out_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--draft-amp")) {
+            c.gen.draft_amp = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--draft-amp-scale")) {
+            c.gen.draft_amp_scale = (float)atof(need_arg(&i, argc, argv, arg));
+        } else if (!strcmp(arg, "--dspark-capture")) {
+            c.gen.dcap_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--v41-no-engram")) {
             c.gen.v41_no_engram = 1;
         } else if (!strcmp(arg, "--v41-chunk")) {

@@ -33,6 +33,9 @@ typedef struct {
     const char *dump_logits_path;
     const char *score_ids_path;   /* --score-ids: teacher-forced 逐位打分(公开对拍) */
     const char *score_out_path;
+    float draft_amp_scale;        /* --draft-amp-scale β(默认 1.0) */
+    const char *draft_amp;        /* --draft-amp FILE: 草稿器对齐边车(mtp.md M6) */
+    const char *dcap_path;        /* --dspark-capture FILE: 草稿器对齐取料(mtp.md M6), 与 --score-ids 同用 */
     int v41_no_engram;           /* --v41-no-engram: V4.1 前向跳过 engram 层(与 Python --no-engram 同口径的对拍夹具) */
     int v41_chunk;               /* --v41-chunk N: V4.1 --score-ids 的分块大小(0=默认 512; 对拍夹具, 看分块与整批自洽) */
     int v41_prof;                /* --v41-prof: V4.1 每次前向打逐层毫秒(查速度用) */
