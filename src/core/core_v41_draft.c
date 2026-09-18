@@ -163,7 +163,8 @@ bool v41_draft_alloc(ds4_engine *e, ds4_v41_draft *dr) {
     dr->ids_next = v41_alloc(16, &ok);
     dr->h = v41_alloc((uint64_t)cap * E * 4, &ok);
     if (!ok || !v41_draft_exp_off(e, dr)) { v41_draft_free(dr); return false; }
-    dr->block = B;
+    /* --dspark-block: 诊断时钉死块长(不超过元数据给的 B, 缓冲是按 B 分配的) */
+    dr->block = (g_ds4_v41_block && g_ds4_v41_block <= B) ? g_ds4_v41_block : B;
     if (g_ds4_v41_draft_amp && !v41_draft_amp_load(dr, g_ds4_v41_draft_amp)) { v41_draft_free(dr); return false; }
     dr->ready = 1;
     fprintf(stderr, "ds4: [v41] DSpark 草稿器已武装: %u 塔 × %u 专家 top-%u, 一块 %u 位, 目标层",
@@ -193,8 +194,12 @@ void v41_draft_free(ds4_v41_draft *dr) {
 static bool v41_draft_main_x(ds4_engine *e, ds4_v41_state *main_st, ds4_v41_draft *dr, uint32_t rows) {
     const ds4_model *m = &e->model;
     const uint64_t in = (uint64_t)DS4_N_EMBD * g_ds4_v41.n_mtp_target;
-    if (!ds4_gpu_v41_matmul_fp4x32_tensor(dr->mainx_raw, m->map, m->size, e->weights.mtp.main_proj->abs_offset,
-                                          in, DS4_N_EMBD, main_st->mainh, rows, 1)) return false;
+    /* main_proj 盘上可能是 FP8(原件精度)或 fp4x32(2026-09-17 之前的老 GGUF) —— 按登记类型认 */
+    const ds4_tensor *mp = e->weights.mtp.main_proj;
+    const bool okmp = (mp->type == DS4_TENSOR_FP8_32X32)
+        ? ds4_gpu_v41_matmul_fp8blk_round_tensor(dr->mainx_raw, m->map, m->size, mp->abs_offset, in, DS4_N_EMBD, main_st->mainh, rows, 1) != 0
+        : ds4_gpu_v41_matmul_fp4x32_tensor(dr->mainx_raw, m->map, m->size, mp->abs_offset, in, DS4_N_EMBD, main_st->mainh, rows, 1) != 0;
+    if (!okmp) return false;
     return ds4_gpu_v41_rms_norm_tensor(dr->st.main_x, dr->mainx_raw, m->map, m->size,
                                        e->weights.mtp.main_norm->abs_offset, DS4_N_EMBD, rows, DS4_RMS_EPS) != 0;
 }
@@ -244,6 +249,11 @@ static bool v41_draft_block(ds4_engine *e, ds4_v41_draft *dr, uint32_t pos0) {
                                            nrow, R, eb, dr->ids, i, i)) return false;
         if (!ds4_gpu_v41_row_gather_tensor(dr->mk_cur, m->map, m->size, e->weights.mtp.markov_embd->abs_offset,
                                            nrow, R, eb, dr->ids, i, 0)) return false;
+        /* ★判负存档(2026-09-17): 这里试过"有界剪枝的精确 argmax"★ —— 用 |bias_v| ≤ ‖W_v‖·‖e‖ 把不可能
+         * 夺冠的词剪掉, 只对候选读那 512 B。实测**候选 129280/129280, 一个都没剪掉**, 草稿 13.2 → 15.9 ms。
+         * 真因: markov 表的行与 embed 近正交, C-S 的界比 logits 的整个动态范围还大(详见 ds4_gpu_v41.h 的存档)。
+         * 所以这三发保持原样: 读整张表算全词表偏置 → 加进 logits → argmax。它是带宽受限的(248 GB/s, 贴墙),
+         * 占草稿一轮的 10%、整轮的 1.5% —— 要省只剩"换更低精度存表"或"只算 logits 的 top-K(近似)"。 */
         if (!v41_small_matmul(m, dr->mk_bias, e->weights.mtp.markov_head, R, DS4_N_VOCAB, dr->mk_cur, 1)) return false;
         if (!ds4_gpu_v41_row_add_tensor(st->logits, i, dr->mk_bias, DS4_N_VOCAB)) return false;
         /* argmax 只会写自己那块的第 0 个 int, 所以先落 ids_next 再拷到 ids[i+1](官方 output_ids[:, i+1]) */

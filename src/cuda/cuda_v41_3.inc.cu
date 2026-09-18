@@ -22,7 +22,6 @@ __global__ static void v41_router_kernel(int32_t *sel, float *wts, const float *
         } else { pr[k] = 0.f; sc[k] = -INFINITY; }
     }
     uint32_t used = 0; float wsum = 0.f;
-    int chosen[16]; float chosen_p[16];
     for (uint32_t r = 0; r < topk; r++) {
         float bv = -INFINITY; int bk = -1;
         #pragma unroll
@@ -35,14 +34,13 @@ __global__ static void v41_router_kernel(int32_t *sel, float *wts, const float *
         float myp = 0.f;
         if (be >= 0 && (uint32_t)(be & 31) == lane) { const uint32_t k = (uint32_t)be >> 5; used |= 1u << k; myp = pr[k]; }
         for (int off = 16; off > 0; off >>= 1) myp += __shfl_xor_sync(0xffffffffu, myp, off);   /* 只有一个 lane 非零 */
-        chosen[r] = be; chosen_p[r] = myp; wsum += myp;
+        /* ★每轮直接落盘(2026-09-18)★: 原来先攒进 chosen[16]/chosen_p[16] 两个数组、末尾再循环写出 —— 运行期下标(topk)让
+         * 它们掉进 local memory。先存未归一的 myp, 最后一遍再除 wsum: 算式 myp/(wsum+1e-20)·route_scale 一个字没动, 逐位同。 */
+        if (lane == 0) { sel[(uint64_t)t * topk + r] = be; wts[(uint64_t)t * topk + r] = myp; }
+        wsum += myp;
     }
-    if (lane == 0) {
-        for (uint32_t r = 0; r < topk; r++) {
-            sel[(uint64_t)t * topk + r] = chosen[r];
-            wts[(uint64_t)t * topk + r] = chosen_p[r] / (wsum + 1e-20f) * route_scale;
-        }
-    }
+    if (lane == 0)
+        for (uint32_t r = 0; r < topk; r++) wts[(uint64_t)t * topk + r] = wts[(uint64_t)t * topk + r] / (wsum + 1e-20f) * route_scale;
 }
 int ds4_gpu_v41_router_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, const ds4_gpu_tensor *logits,
                               const void *model_map, uint64_t model_size, uint64_t bias_offset,
@@ -119,7 +117,8 @@ int ds4_gpu_v41_routed_moe_tensor(ds4_gpu_tensor *out, const void *model_map, ui
                                   const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
                                   uint32_t n_total_expert, uint32_t n_expert_used, float clamp,
                                   const ds4_gpu_tensor *x, uint32_t layer, uint32_t n_tok) {
-    if (!out || !selected || !weights || !x || n_tok == 0) return 0;
+    /* out == NULL(只许解码小批): 不做最后那发归约, 专家部分和留在暂存, 调用方随后用 ds4_gpu_v41_moe_tail_tensor 一发收尾 */
+    if ((!out && n_tok > V41_GEMV_MAX_TOK) || !selected || !weights || !x || n_tok == 0) return 0;
     if (blob_offset > model_size || blob_bytes > model_size - blob_offset) return 0;
     /* 引擎启动若已把整个 mmap 注册成设备可见(spark 实测: offload 模式下也注册了 103 GiB 整映射),
      * blob 就直接拿 range 指针 —— 再 cudaHostRegister 同一段会报 AlreadyRegistered(09-12 首跑即此)。
@@ -134,8 +133,8 @@ int ds4_gpu_v41_routed_moe_tensor(ds4_gpu_tensor *out, const void *model_map, ui
     if (g_model_registered || g_model_device_owned) {
         const uint8_t *blob = (const uint8_t *)cuda_model_range_ptr(model_map, blob_offset, blob_bytes, "v41 vq blob");
         if (!blob) return 0;
-        if (n_tok <= V41_GEMV_MAX_TOK)   /* 解码小批: 码本在核内查表即乘, 不落 f16(cuda_v41_4.inc.cu) */
-            return v41_vq_fused_moe((float *)out->ptr, blob, in_dim, mid_dim, out_dim, (const int32_t *)selected->ptr,
+        if (n_tok <= V41_GEMV_MAX_TOK)   /* 解码小批: 码本在核内查表即乘, 不落 f16(cuda_vq_decode.inc.cu) */
+            return v41_vq_fused_moe(out ? (float *)out->ptr : NULL, blob, in_dim, mid_dim, out_dim, (const int32_t *)selected->ptr,
                                     (const float *)weights->ptr, n_expert_used, clamp, (const float *)x->ptr, n_tok, nc,
                                     layer < 64u ? g_v41_gr[layer] : NULL);
         return cuda_vq_moe_prefill_gemm(out, blob, model_map, 0, 0, in_dim, mid_dim, out_dim, selected, weights,
@@ -160,9 +159,9 @@ int ds4_gpu_v41_routed_moe_tensor(ds4_gpu_tensor *out, const void *model_map, ui
     }
     const uint8_t *blob = (const uint8_t *)dev + delta;
     const int ok = n_tok <= V41_GEMV_MAX_TOK
-        ? v41_vq_fused_moe((float *)out->ptr, blob, in_dim, mid_dim, out_dim, (const int32_t *)selected->ptr,
-                           (const float *)weights->ptr, n_expert_used, clamp, (const float *)x->ptr, n_tok, nc,
-                           layer < 64u ? g_v41_gr[layer] : NULL)
+        ? v41_vq_fused_moe(out ? (float *)out->ptr : NULL, blob, in_dim, mid_dim, out_dim, (const int32_t *)selected->ptr,
+                       (const float *)weights->ptr, n_expert_used, clamp, (const float *)x->ptr, n_tok, nc,
+                       layer < 64u ? g_v41_gr[layer] : NULL)
         : cuda_vq_moe_prefill_gemm(out, blob, model_map, 0 /*down_offset: 影子*/, 0 /*down_expert_bytes*/,
                                    in_dim, mid_dim, out_dim, selected, weights, n_total_expert, n_expert_used,
                                    clamp, x, layer, n_tok);

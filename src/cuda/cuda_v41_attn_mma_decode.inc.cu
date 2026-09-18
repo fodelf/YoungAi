@@ -23,15 +23,18 @@
  * 这里两件都由复用的 ds4_attn_mma_gather_keys / ds4_attn_mma_scores 承担, 所以**不要在这里
  * 另写一份 gather** —— 写第二份就是迟早与预填那份漂开。 */
 
-#define V41_ATTN_MMA_DEC_TARGET_SEG 24u   /* 目标段数: 24 段 × 4 个头组 ≈ 96 个 block(每 SM 2 个) */
+/* 段长公式 v41_attn_seg_keys / 段数 v41_attn_nseg_at 的正本在 cuda_v41_attn_split.inc.cu(合并核也要用, 那片排在前面)。 */
 
 /* 一段键上的注意力, 出局部 (acc, max, sum)。结构逐段照抄 ds4_sparse_attn_mma_kernel 的两遍扫,
- * 只有三处不同: ①键范围限定在 [k0, k1) ②出口不除分母、不加 sink(留给合并核) ③写 pacc/pmax/psum。 */
+ * 只有三处不同: ①键范围限定在 [k0, k1) ②出口不除分母、不加 sink(留给合并核) ③写 pacc/pmax/psum。
+ * ★posd(graph 路, 2026-09-18)★: 位置从设备槽读, ng/topk 按它自算(ds4_gpu_v41.h "设备位置"口径); nseg 是桶上限,
+ * 超出真段数的段直接返回不写 —— 合并核按同一公式只读真段, 所以不写也不会读到残留。 */
 __global__ static void v41_attn_mma_seg_kernel(float *pacc, float *pmax, float *psum,
                                                const float *q, const float *kvw, const uint8_t *kvc,
                                                const int32_t *idx, uint32_t pos0, uint32_t window,
                                                uint32_t ng, uint32_t topk, uint32_t n_head,
-                                               float scale, uint32_t seg_keys, uint32_t nseg) {
+                                               float scale, uint32_t ratio, uint32_t nseg, const int32_t *posd) {
+    if (posd) { pos0 = (uint32_t)posd[0]; ng = ratio ? (pos0 + 1u) / ratio : 0u; if (ng < topk) topk = ng; }
     namespace wmma = nvcuda::wmma;
     extern __shared__ char ds4_attn_mma_smem[];
     __nv_bfloat16 *qs = (__nv_bfloat16 *)ds4_attn_mma_smem;
@@ -50,8 +53,12 @@ __global__ static void v41_attn_mma_seg_kernel(float *pacc, float *pmax, float *
     const uint32_t p = pos0 + i;
     const uint32_t lo = p + 1u > window ? p + 1u - window : 0u;
     const uint32_t nwin = p - lo + 1u, nkeys = nwin + topk;
+    /* ★段长按这个 query 自己的位置算★(见文件头): 靠前的 query 段长可能与末位不同, 于是它的段数
+     * 也可能少于 grid 给的 nseg —— 多出来的那些段走下面的"空段"分支, 对合并是精确中性的。 */
+    const uint32_t seg_keys = v41_attn_seg_keys(p, window, ratio, topk);
     const uint32_t k0 = seg * seg_keys;
     if (k0 >= nkeys) {   /* 空段: 写中性值就走(exp(-1e30 - m) = 0 ⇒ 对合并没有贡献) */
+        if (posd) return;   /* graph 路: 合并核只读真段, 空段不写(省 32 KB/段的白写) */
         for (uint32_t e = threadIdx.x; e < DS4_ATTN_MMA_HEADS * DS4_ATTN_MMA_HD; e += blockDim.x)
             pacc[(pbase + e / DS4_ATTN_MMA_HD) * DS4_ATTN_MMA_HD + e % DS4_ATTN_MMA_HD] = 0.f;
         if (threadIdx.x < DS4_ATTN_MMA_HEADS) { pmax[pbase + threadIdx.x] = -1e30f; psum[pbase + threadIdx.x] = 0.f; }
@@ -121,17 +128,31 @@ __global__ static void v41_attn_mma_seg_kernel(float *pacc, float *pmax, float *
 }
 
 /* 返回 1 = 这一发由解码张量核接管; 0 = 形状不合/shared 抬不上去, 调用方回标量 split 版。
- * 键少的时候不接: 段内不满一个 wmma 的 16 键就全是浪费, 而那时标量版本来就只要几微秒。 */
+ * ★n_tok 1..8 全走这一条★: 纯解码与投机验证批必须是同一个核、同一套分段, 否则同轨不成立。 */
+/* graph 路要的暂存预建(2026-09-18): v41_grow 里有 cudaMalloc + 全设备同步, 捕获态下二者都作废捕获 ——
+ * 所以开捕获之前把局部件按段数上限(V41_ATTN_SPLIT_MAX_SEG)一次长够。8 MB, 只长不缩。 */
+int ds4_gpu_v41_attn_scratch_prepare(uint32_t n_head, uint32_t head_dim) {
+    const uint64_t na = (uint64_t)V41_ATTN_SPLIT_MAX_SEG * n_head;
+    return v41_grow(&g_v41_attn_pacc, na * head_dim * 4, "v41 attn mma acc") &&
+           v41_grow(&g_v41_attn_pmax, na * 4, "v41 attn mma max") &&
+           v41_grow(&g_v41_attn_psum, na * 4, "v41 attn mma sum") ? 1 : 0;
+}
+
+/* posd / pos_cap: graph 路(见 ds4_gpu_v41.h): pos0..pos_cap 是图的有效位置区间, 段数按区间内最大值开 grid
+ * (段数随位置不单调 —— 段长跳档时段数会掉, 所以得逐个位置扫, 不能只看两端)。 */
 static int v41_attn_mma_decode(float *o, const float *q, const float *kvw, const uint8_t *kvc, const int32_t *idx,
                                const float *sink, uint32_t n_tok, uint32_t pos0, uint32_t window, uint32_t ng,
-                               uint32_t topk, uint32_t n_head, uint32_t hd, float scale) {
+                               uint32_t topk, uint32_t ratio, uint32_t n_head, uint32_t hd, float scale,
+                               const int32_t *posd, uint32_t pos_cap) {
     /* n_tok 1 = 纯解码; 2..8 = 投机验证批 —— ★两者走同一族核是"同轨"的前提★(mtp.md M1):
      * 温 0 下投机输出要与纯解码逐字节同, 而同一个 token 走两套不同累加序的核就不可能同。 */
     if (n_tok == 0u || n_tok > 8u || hd != DS4_ATTN_MMA_HD || (n_head % DS4_ATTN_MMA_HEADS)) return 0;
-    const uint32_t plast = pos0 + n_tok - 1u;        /* 键最多的那个 query 定段数 */
+    const uint32_t plast = pos0 + n_tok - 1u;        /* 段数按键最多的那个 query 算(靠前的 query 多出来的段是空段) */
     const uint32_t nwin = plast + 1u > window ? window : plast + 1u;
     const uint32_t nkeys = nwin + topk;
-    if (nkeys < 64u) return 0;                       /* 短上下文交给标量版 */
+    /* ★键少也走这里, 不再回落标量版(2026-09-16 M1′)★: 原来 nkeys < 64 就交给 split 版, 而 split 只收
+     * n_tok==1 —— 于是会话开头那几步"纯解码走 split、验证批走预填核", 连核都不是同一个, 必然不同轨。
+     * 键少时这个核只有一段, 开销就是一次 q 载入, 不值得为它留第二条路(铁律: 不留兜底路)。 */
     static int s_ok = 0;                             /* 0 未试 / 1 可用 / -1 抬不上去 */
     const size_t smem = ds4_attn_mma_smem_bytes();
     if (s_ok == 0) {
@@ -141,25 +162,39 @@ static int v41_attn_mma_decode(float *o, const float *q, const float *kvw, const
         fprintf(stderr, "ds4: [attn] 解码张量核版 shared %zu KB %s\n", smem >> 10, s_ok == 1 ? "已开" : "★抬不上去, 回标量版★");
     }
     if (s_ok != 1) return 0;
-    /* 段长 = 把键平分成 TARGET_SEG 段, 向上取到 wmma 的 16 键一块; 上下限 [16, 64]。 */
-    /* block 数 = nseg × 头组 × n_tok; token 多了就少切几段, 免得 block 爆炸、暂存也跟着涨 */
-    uint32_t tseg = V41_ATTN_MMA_DEC_TARGET_SEG / n_tok;
-    if (tseg < 1u) tseg = 1u;
-    uint32_t seg_keys = (nkeys + tseg - 1u) / tseg;
-    seg_keys = ((seg_keys + DS4_ATTN_MMA_KT - 1u) / DS4_ATTN_MMA_KT) * DS4_ATTN_MMA_KT;
-    if (seg_keys < DS4_ATTN_MMA_KT) seg_keys = DS4_ATTN_MMA_KT;
-    if (seg_keys > 64u) seg_keys = 64u;
-    uint32_t nseg = (nkeys + seg_keys - 1u) / seg_keys;
-    while (nseg > V41_ATTN_SPLIT_MAX_SEG) { seg_keys *= 2u; nseg = (nkeys + seg_keys - 1u) / seg_keys; }
+    /* grid 的段数 = 批里各 query 各自算出来的段数的**最大值**(它们的段长可能不同, 见 v41_attn_seg_keys)。
+     * 段长本身由核里按各自的位置再算一遍 —— 主机只负责把 grid 开够。 */
+    uint32_t nseg = 1u;
+    if (posd) {   /* graph: 桶内每个位置的段数取最大(核里按真位置算真段数, 多出的段空跑) */
+        if (n_tok != 1u || pos_cap < pos0) return 0;
+        for (uint32_t p = pos0; p <= pos_cap; p++) {
+            const uint32_t ns = v41_attn_nseg_at(p, window, ratio, topk);
+            if (ns > nseg) nseg = ns;
+        }
+    } else
+    for (uint32_t i = 0; i < n_tok; i++) {
+        const uint32_t p = pos0 + i;
+        const uint32_t nw = p + 1u > window ? window : p + 1u;
+        const uint32_t nk = nw + topk;
+        const uint32_t sk = v41_attn_seg_keys(p, window, ratio, topk);
+        const uint32_t ns = (nk + sk - 1u) / sk;
+        if (ns > nseg) nseg = ns;
+    }
+    if (nseg > V41_ATTN_SPLIT_MAX_SEG) {   /* 键数上限 = 窗口 + indexer top-k 上限, 到不了这里 */
+        fprintf(stderr, "ds4: ★[attn] 键 %u 需要 %u 段, 超上限 %u —— 走了另一条核, 同轨不再成立★\n",
+                nkeys, nseg, (unsigned)V41_ATTN_SPLIT_MAX_SEG);
+        return 0;
+    }
     const uint64_t na = (uint64_t)nseg * n_tok * n_head;
     float *pacc = (float *)v41_grow(&g_v41_attn_pacc, na * hd * 4, "v41 attn mma acc");
     float *pmax = (float *)v41_grow(&g_v41_attn_pmax, na * 4, "v41 attn mma max");
     float *psum = (float *)v41_grow(&g_v41_attn_psum, na * 4, "v41 attn mma sum");
     if (!pacc || !pmax || !psum) return 0;
     v41_attn_mma_seg_kernel<<<dim3(nseg, n_head / DS4_ATTN_MMA_HEADS, n_tok), DS4_ATTN_MMA_WARPS * 32u, smem, g_cur_stream>>>(
-        pacc, pmax, psum, q, kvw, kvc, idx, pos0, window, ng, topk, n_head, scale, seg_keys, nseg);
+        pacc, pmax, psum, q, kvw, kvc, idx, pos0, window, ng, topk, n_head, scale, ratio, nseg, posd);
     if (!cuda_ok(cudaGetLastError(), "v41 attn mma seg")) return 0;
     /* 合并复用标量 split 版那一发(按段号固定序 + sink 进分母 + 除 + 舍 bf16), 语义完全一样 */
-    v41_sparse_attn_merge_kernel<<<dim3(n_head, n_tok), 256, 0, g_cur_stream>>>(o, pacc, pmax, psum, sink, nseg, n_head, hd);
+    v41_sparse_attn_merge_kernel<<<dim3(n_head, n_tok), 256, 0, g_cur_stream>>>(o, pacc, pmax, psum, sink, nseg, n_head, hd,
+                                                                                posd, window, ratio, topk);
     return cuda_ok(cudaGetLastError(), "v41 attn mma merge");
 }

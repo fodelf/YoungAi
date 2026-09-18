@@ -115,6 +115,26 @@ int ds4_gpu_flush_commands(void);
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
 
+/* ★解码整步 graph 原语(2026-09-18; CUDA 实现 src/cuda/cuda_decode_graph.inc.cu, Metal 只有占位)★
+ * 用法(core_decode_graph.c): capture_begin → 照常发一整步的核/拷贝 → capture_end 得到图实例 → 每步 launch。
+ * 捕获期间核**不执行**: capture_end 返回 NULL(捕获作废)时调用方必须把这一步按直发重来一遍。
+ * host_flag_wait: 一个 1 线程小核自旋等 pinned 里的 flag ≥ want(都是 int32, ds4_gpu_host_alloc 给的映射内存), 超时约 5 s
+ *   写 err 放行 —— 用来在 engram 层前等主机把行读齐(host 节点在 GB10 上每个留 0.6~0.9 ms 的洞, 自旋核 1 µs 恢复)。
+ * write_async / read_async: 主机侧必须是 ds4_gpu_host_alloc 给的 pinned 内存, 拷贝排在流上(捕获态 = memcpy 节点,
+ *   节点记的是地址, 每次重放读那时的内容); read_async 的结果要 synchronize 之后才有效。 */
+int ds4_gpu_decode_graph_capture_begin(void);
+void *ds4_gpu_decode_graph_capture_end(void);
+int ds4_gpu_decode_graph_launch(void *exec);
+void ds4_gpu_decode_graph_free(void *exec);
+int ds4_gpu_host_flag_wait(const void *flag_pinned, const void *want_pinned, void *err_pinned);
+int ds4_gpu_tensor_write_async(ds4_gpu_tensor *t, uint64_t offset, const void *pinned, uint64_t bytes);
+int ds4_gpu_tensor_read_async(void *pinned, const ds4_gpu_tensor *t, uint64_t offset, uint64_t bytes);
+/* 零拷贝(图里 memcpy 节点每个 ~170 µs, 小核 2~3 µs): 核直接读映射的 pinned 内存写进设备张量(字节数/偏移都要 4 的倍数);
+ * host_device_ptr 给出 pinned 内存的设备侧地址, 让核把结果直接写回主机(argmax 落点)。Metal: 前者退成同步写, 后者返回原指针。 */
+int ds4_gpu_tensor_write_zerocopy(ds4_gpu_tensor *t, uint64_t offset, const void *pinned, uint64_t bytes);
+int ds4_gpu_tensor_read_zerocopy(void *pinned, const ds4_gpu_tensor *t, uint64_t offset, uint64_t bytes);
+void *ds4_gpu_host_device_ptr(void *pinned);
+
 /* Tensor-parallel rendezvous. ds4_gpu_tp_signal_after_batch encodes a shared-
  * event signal at the tail of the current batch and returns the value to wait on
  * (0 on error); the caller flushes the batch so the GPU runs and fires it.

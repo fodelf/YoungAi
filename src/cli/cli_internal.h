@@ -40,7 +40,12 @@ typedef struct {
     int v41_chunk;               /* --v41-chunk N: V4.1 --score-ids 的分块大小(0=默认 512; 对拍夹具, 看分块与整批自洽) */
     int v41_prof;                /* --v41-prof: V4.1 每次前向打逐层毫秒(查速度用) */
     int decoder_full;            /* --decoder-full: 关 CED, 提示每块跑满 40 层(精确路, 跟 CED 对质量用) */
-    int no_dspark;               /* --no-dspark: 关投机解码, 逐 token 解码(对拍用: 温 0 下两条路必须逐字节同) */
+    int no_dspark;               /* --no-dspark: 关投机解码(现在是默认行为, 老脚本一路在传, 留着当"再确认一次") */
+    int no_graph;                /* --no-graph: 关解码整步 CUDA graph(默认开; 只作 A/B 与同轨定位, 两条路输出逐字节同) */
+    int emit_trace;              /* --emit-trace: 逐 token 打 [emit] 行(同轨定位用, 不改执行路径) */
+    int dspark_block;            /* --dspark-block N: 钉死草稿块长(诊断用) */
+    int verify_k;                /* --dspark-verify N: 投机每轮验证几位(0=引擎默认) */
+    int dspark;                  /* --dspark: 开投机解码。★默认关★(2026-09-16): 同轨门不绿 + 今天比纯解码慢, 见 core_v41_api.c */
     const char *score_nll_path;  /* --score-nll FILE: 逐位 NLL f32[S](后训练判决尺, 4 B/位置) */
     const char *score_topk_path; /* --score-topk K FILE: 逐位 top-K (id,p)+目标 p+覆盖质量(后训练靶) */
     int score_topk;

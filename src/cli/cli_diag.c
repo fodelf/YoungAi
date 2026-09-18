@@ -41,7 +41,12 @@ int run_v41_generation(ds4_engine *engine, const cli_config *cfg, const ds4_toke
     if (cfg->gen.temperature > 0.0f) fprintf(stderr, "ds4: V4.1 当前只有贪心解码(temp 0), 忽略 --temp %.2f\n", (double)cfg->gen.temperature);
     ds4_engine_v41_set_prof(cfg->gen.v41_prof);
     ds4_engine_v41_set_decoder_full(cfg->gen.decoder_full);
-    ds4_engine_v41_set_dspark(!cfg->gen.no_dspark);
+    /* 两个标志同时给 = 关(显式的"关"压过显式的"开", 免得脚本里两条都留着还以为开着) */
+    ds4_engine_v41_set_dspark(cfg->gen.dspark && !cfg->gen.no_dspark);
+    ds4_engine_v41_set_graph(!cfg->gen.no_graph);
+    ds4_engine_v41_set_emit_trace(cfg->gen.emit_trace);
+    ds4_engine_v41_set_block(cfg->gen.dspark_block > 0 ? (unsigned)cfg->gen.dspark_block : 0u);
+    ds4_engine_v41_set_verify_k(cfg->gen.verify_k > 0 ? (unsigned)cfg->gen.verify_k : 0u);
     ds4_engine_v41_set_draft_amp(cfg->gen.draft_amp);
     ds4_engine_v41_set_chunk(cfg->gen.v41_chunk);
     int rc = ds4_engine_v41_generate_argmax(engine, prompt->v, (int)prompt->len, cfg->gen.n_predict, cfg->gen.ctx_size, v41_emit_print, engine);
@@ -69,6 +74,7 @@ int run_score_ids(ds4_engine *engine, const cli_config *cfg) {
         ds4_engine_v41_set_draft_amp(cfg->gen.draft_amp);
         ds4_engine_v41_set_draft_amp_scale(cfg->gen.draft_amp_scale > 0.f ? cfg->gen.draft_amp_scale : 1.0f);
         ds4_engine_v41_set_prof(cfg->gen.v41_prof);
+        ds4_engine_v41_set_block(cfg->gen.dspark_block > 0 ? (unsigned)cfg->gen.dspark_block : 0u);
         if (!cfg->gen.decoder_full)
             fprintf(stderr, "ds4: ★--dspark-capture 必须配 --decoder-full★(否则 CED 让每块不出 logits, 靶是错的)\n");
         const int rc = ds4_engine_v41_dspark_capture(engine, ids, n, cfg->gen.dcap_path);

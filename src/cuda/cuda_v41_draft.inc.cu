@@ -111,6 +111,17 @@ int ds4_gpu_v41_mtp_moe_tensor(ds4_gpu_tensor *out, const void *model_map, uint3
     float *h = (float *)v41_grow(&g_mtp_h, np * mid_dim * 4, "mtp h");
     float *part = (float *)v41_grow(&g_mtp_part, np * out_dim * 4, "mtp partial");
     if (!h || !part) return 0;
+    /* ★2026-09-17 判负存档: 草稿塔按专家并集(mtp-2.md §6 刀 1)★
+     * 依据看着很硬: `[mtp-uniq]` 实测一塔 15 个 (位,专家) 对里只有 **6.67 个唯一专家(44%)** —— 块里第 1..4 位
+     * 吃同一个 noise 嵌入, 路由几乎一样; 而这个核 0.79 GB / 4.43 ms = 178 GB/s 看着像"贴着带宽墙",
+     * 贴墙就该"省 56% 字节 = 省 56% 时间"。写了一版一 block 管一个专家、组里成员数 CNT 做模板参数
+     * (运行期下标会让 acc 掉进 local memory, 09-15 撞过), 权重读一遍、对组里每条激活各乘一遍; 逐位同
+     * (接受率直方图一字不差)。**实测草稿 13.4 → 13.1 ms(2K) / 13.6 → 13.5(12k), 0.3%, 噪声内。**
+     * ★真因: 178 GB/s 的"贴墙"是巧合, 这个核其实是波前受限★ —— 一轮 32 个 lane 取 4 B 权重字节 = 1 个波前,
+     * 取 16 B 激活 = 4 个波前, **激活占 4/5**。并集省掉的是权重那 1 个, 激活那 4 个还得按成员数乘,
+     * 于是每对从 5 个波前降到 4.33(省 13%), 再被 CNT 倍的 FFMA 与地址算术吃掉大半。
+     * ⇒ 与主干 VQ 那两次去重判负(09-16/09-17)**最终同源**: 这一族核的瓶颈都是"每个 token 各自那份激活读",
+     * 不是权重字节。别再从"省权重字节"这个方向来了(这是第 8 次)。 */
     v41_mtp_gateup_kernel<<<dim3((mid_dim + 7u) / 8u, (unsigned)np), 256, 0, g_cur_stream>>>(
         h, P->dev_g, P->dev_u, (const int32_t *)selected->ptr, (const float *)x->ptr, in_dim, mid_dim, topk, n_expert, clamp);
     if (!cuda_ok(cudaGetLastError(), "v41 mtp gateup")) return 0;

@@ -107,7 +107,10 @@ ds4_tensor *model_find_tensor(const ds4_model *m, const char *name) {
 typedef struct {
     uint64_t off;
     uint64_t end;
-    uint32_t prio;   /* 0 主干骨架(先拷) 1 主干专家/blob 2 DSpark 三塔(最后; 投机不开时一次都不读) */
+    /* 0 = 主干骨架(每步必读, 永远先拷)。后面两档谁先谁后看投机开不开:
+     * 投机关: 1 主干专家/blob, 3 DSpark 三塔(一次都不读, 排最后)
+     * 投机开: 1 DSpark 三塔(每轮都读, 只有 7.3 GiB), 2 主干专家/blob(98 GiB, 挤掉尾巴只丢 3%) */
+    uint32_t prio;
 } accelerator_tensor_span;
 
 static int accelerator_tensor_span_cmp(const void *a, const void *b) {
@@ -182,12 +185,25 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
         /* ★2026-09-15 single.md S1: 三塔排最后★ —— `mtp.*` 是 DSpark 草稿器的 7.3 GiB,
          * 它的名字里既没有 "_exps." 也没有 "_exps_vq.", 原来算 prio 0 跟骨架抢在最前面装。
          * 而投机没开(--no-dspark, 本底座默认)时这 7.3 GiB 一次都不会被读, 却把主干最后几层的
-         * 专家 blob 挤出了预算 —— 挤出去的那几层每步要多付 5~25 ms(见 single.md §2.1)。 */
+         * 专家 blob 挤出了预算 —— 挤出去的那几层每步要多付 5~25 ms(见 single.md §2.1)。
+         *
+         * ★2026-09-16 mtp-1.md M3′: 投机开着时反过来排到专家前面★
+         * 模型 109.79 GiB 装不完(装进 106.51, 余 3.28 GiB 走主机映射, 那 3.28 GiB 会被 kswapd
+         * 一直回收、每次读都要缺页), 所以问题不是"能不能全装下", 是**让谁去当那 3.28 GiB**。
+         * 一轮投机的读量: 三塔 1.41 GB, 主干专家 1.61 GB ×(1+k)。三塔总共才 7.3 GiB,
+         * 3.28 GiB 落在它身上 = 45% 的草稿读要缺页; 落在 98 GiB 的主干专家上只有 3.3%。
+         * ⇒ 投机开着就把三塔提到与专家同级(按偏移顺序混排, 谁在后面谁被挤), 盘上实测的签名是
+         *   塔核"中位 1.1 ms / 最大 21.7 ms"那条长尾。★别把它提到 0★: 骨架是每步必读的, 不能让。 */
         const bool is_mtp = t->name.len > 4 && memcmp(t->name.ptr, "mtp.", 4) == 0;
+        /* ★同级不够, 必须把三塔排到专家**前面**★(2026-09-16 实撞): 先试过"投机开着就把 mtp 从 2 降到 1",
+         * 读数一点没动 —— 因为同一优先级内是按**文件偏移**排的, 而 mtp.* 是转换器追加在文件最末尾的,
+         * 排在所有专家 blob 后面, 照样是被挤出去的那 3.28 GiB。要它进设备就得自己占一档。 */
+        const uint32_t mtp_prio = g_ds4_v41_dspark ? 1u : 3u;
+        const uint32_t exp_prio = g_ds4_v41_dspark ? 2u : 1u;
         spans[nspan++] = (accelerator_tensor_span){
             .off = t->abs_offset,
             .end = t->abs_offset + t->bytes,
-            .prio = is_mtp ? 2u : ((is_exp || is_blob) ? 1u : 0u),
+            .prio = is_mtp ? mtp_prio : ((is_exp || is_blob) ? exp_prio : 0u),
         };
     }
     /* ★骨架先拷、专家/blob 后填(2026-09-12)★: 之前纯按偏移排, V4.1 的 103 GiB 里 98 GB 是 40 层 blob, 预算(总内存-24 GiB)

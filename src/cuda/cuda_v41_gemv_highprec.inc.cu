@@ -180,9 +180,24 @@ static int v41_f32_gemv(const float *w, uint64_t in_dim, uint64_t out_dim, const
  * 布局: w[0 .. rows*cols) 是 e4m3; 紧跟 ceil(rows/32)*ceil(cols/32) 个 ue8m0, 行块 r/32、列块 c/32。
  * 一个 lane 一轮吃 16 个元素(一次 128 位读), 一个 warp 一轮走 512 —— 512 是 32 的倍数, 所以
  * lane 的 16 个元素必定落在同一个列块里, 缩放只查一次。要求 in_dim 是 512 的倍数(wkv 是 6144)。 */
-template <uint32_t NT>
+/* XB=1: 激活从 bf16 缓冲读 —— 与 cuda_v41_4.inc.cu 的骨架 GEMV 同一刀、同一笔账(见那边核头的注释)。
+ * 这里一个 lane 一轮要 16 个元素: f32 是 64 B ⇒ 32 个 lane 铺开 2048 B = 16 个波前/token;
+ * bf16 是 32 B ⇒ 1024 B = 8 个。NT=6 时省 48 个波前, 而权重侧一轮才 4 个。 */
+/* ★grid.y = 块对角的"第几组"(2026-09-17)★: DSpark 三塔的 wo_a 是 8 组块对角, 而它在原件里是
+ * FP8 —— 组 g 的行段 [g·out_dim, (g+1)·out_dim) 在权重平面里是连续的, 缩放平面同样连续
+ * (out_dim 是 32 的倍数, 所以行块也整除)。所以不用另写核, 加一个行偏移就够。
+ * 非分组调用传 n_groups=1, 一切照旧(偏移恒 0), 与改之前逐条指令相同。 */
+template <uint32_t NT, uint32_t XB>
 __global__ static void v41_fp8blk_gemv_kernel(float *out, const uint8_t *w, const uint8_t *sc, const float *x,
-                                              uint32_t in_dim, uint32_t out_dim, uint32_t sbc, uint32_t ksplit) {
+                                              const __nv_bfloat16 *x16,
+                                              uint32_t in_dim, uint32_t out_dim, uint32_t sbc, uint32_t ksplit,
+                                              uint32_t x_stride, uint32_t out_stride,
+                                              uint32_t x_gstride, uint32_t out_gstride) {
+    const uint32_t g = blockIdx.y;
+    w += (uint64_t)g * in_dim * out_dim;
+    sc += (uint64_t)g * ((out_dim + 31u) / 32u) * sbc;
+    x += (uint64_t)g * x_gstride; out += (uint64_t)g * out_gstride;
+    if (XB) x16 += (uint64_t)g * x_gstride;
     const uint32_t warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
     const uint32_t rows_per_block = 8u / ksplit, rloc = warp / ksplit, kpart = warp % ksplit;
     const uint32_t r = blockIdx.x * rows_per_block + rloc;
@@ -203,9 +218,22 @@ __global__ static void v41_fp8blk_gemv_kernel(float *out, const uint8_t *w, cons
             for (uint32_t j = 0; j < 16u; j++) wv[j] = ds4_e4m3fn_to_f32(b[j]) * s;
             #pragma unroll
             for (uint32_t t = 0; t < NT; t++) {
-                const float *xt = x + (uint64_t)t * in_dim + c;
-                #pragma unroll
-                for (uint32_t j = 0; j < 16u; j++) acc[t] += wv[j] * xt[j];
+                /* ★两条路各写各的★: 共用一个 float xv[16] 中间数组会改整只核的寄存器分配
+                 * (骨架 GEMV 那边同样的写法实测让纯解码慢 5%), XB=0 这一支逐字抄回改造前的样子。 */
+                if (XB) {   /* 16 个 bf16 = 32 B 连续, 两条 uint4; 补零还原成 f32 是恒等的 */
+                    const uint4 *xp = (const uint4 *)(x16 + (uint64_t)t * x_stride + c);
+                    const uint4 x0 = xp[0], x1 = xp[1];
+                    const uint32_t xu[8] = { x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w };
+                    #pragma unroll
+                    for (uint32_t j = 0; j < 8u; j++) {
+                        acc[t] += wv[2u * j]      * __uint_as_float(xu[j] << 16);
+                        acc[t] += wv[2u * j + 1u] * __uint_as_float(xu[j] & 0xffff0000u);
+                    }
+                } else {
+                    const float *xt = x + (uint64_t)t * x_stride + c;
+                    #pragma unroll
+                    for (uint32_t j = 0; j < 16u; j++) acc[t] += wv[j] * xt[j];
+                }
             }
         }
         #pragma unroll
@@ -226,12 +254,12 @@ __global__ static void v41_fp8blk_gemv_kernel(float *out, const uint8_t *w, cons
             for (uint32_t t = 0; t < NT; t++) {
                 float v = 0.f;
                 for (uint32_t k = 0; k < ksplit; k++) v += red[rloc * ksplit + k][t];
-                out[(uint64_t)t * out_dim + r] = v;
+                out[(uint64_t)t * out_stride + r] = v;
             }
         }
     } else if (lane == 0 && r < out_dim) {
         #pragma unroll
-        for (uint32_t t = 0; t < NT; t++) out[(uint64_t)t * out_dim + r] = acc[t];
+        for (uint32_t t = 0; t < NT; t++) out[(uint64_t)t * out_stride + r] = acc[t];
     }
 }
 /* 预填(n > 8): 先把这一张表解成 bf16 再一发 cuBLAS。
@@ -246,22 +274,39 @@ __global__ static void v41_fp8blk_to_bf16_kernel(__nv_bfloat16 *o, const uint8_t
     o[i] = __float2bfloat16(ds4_e4m3fn_to_f32(w[i]) * ds4_e8m0_to_f32(sc[(uint64_t)(r >> 5) * sbc + (c >> 5)]));
 }
 
-static int v41_fp8blk_gemv(const uint8_t *w, const uint8_t *sc, uint64_t in_dim, uint64_t out_dim,
-                           const float *x, float *out, uint32_t n_tok, const char *what) {
-    if ((in_dim % 512u) != 0u || n_tok == 0 || n_tok > V41_GEMV_MAX_TOK) return 0;
+/* ★in_dim 只要 32 的倍数就行(2026-09-17 放宽, 原来要 512)★: 一个 lane 一轮吃 16 个元素、
+ * 一个 warp 一轮走 512, 尾轮由 `c < in_dim` 自然收口 —— 512 不整除只是最后一轮有 lane 闲着,
+ * **不影响正确性**(缩放按 32 一块查, 32 整除就对齐)。放宽是为了三塔的 wq_b(in_dim 1280)。
+ * engram 那条(in_dim 6144)走的分支一个字没变。 */
+static int v41_fp8blk_gemv_g(const uint8_t *w, const uint8_t *sc, uint64_t in_dim, uint64_t out_dim,
+                             const float *x, float *out, uint32_t n_tok, uint32_t n_groups,
+                             uint32_t x_stride, uint32_t out_stride, uint32_t x_gstride, uint32_t out_gstride,
+                             const char *what) {
+    if ((in_dim % 32u) != 0u || (in_dim % 16u) != 0u || n_tok == 0 || n_tok > V41_GEMV_MAX_TOK || n_groups == 0) return 0;
     uint32_t ksplit = 1;
-    while (ksplit < 8u && out_dim * ksplit < 32768u) ksplit <<= 1;
-    const uint32_t nseg = (uint32_t)(in_dim / 512u);
+    while (ksplit < 8u && out_dim * ksplit * n_groups < 32768u) ksplit <<= 1;
+    const uint32_t nseg = (uint32_t)((in_dim + 511u) / 512u);
     while (ksplit > 1u && ksplit > nseg) ksplit >>= 1;
     const uint32_t rpb = 8u / ksplit, sbc = (uint32_t)((in_dim + 31u) / 32u);
-    const dim3 grid((unsigned)((out_dim + rpb - 1u) / rpb), 1);
-    #define V41_FP8GEMV_LAUNCH(NT) v41_fp8blk_gemv_kernel<NT><<<grid, 256, 0, g_cur_stream>>>( \
-        out, w, sc, x, (uint32_t)in_dim, (uint32_t)out_dim, sbc, ksplit)
+    const dim3 grid((unsigned)((out_dim + rpb - 1u) / rpb), n_groups);
+    /* 验证批(NT>1)的激活转 bf16, 与骨架 GEMV 同一刀; 解码(NT=1)不转(那条是字节受限的) */
+    const __nv_bfloat16 *x16 = NULL;
+    if (n_tok > 1u) {
+        const uint64_t xn = (uint64_t)n_tok * x_stride;
+        __nv_bfloat16 *xbuf = (__nv_bfloat16 *)v41_grow(&g_v41_gemv_xb, xn * sizeof(__nv_bfloat16), "v41 fp8blk x bf16");
+        if (!xbuf) return 0;
+        v41_x_to_bf16_kernel<<<(unsigned)((xn + 255) / 256), 256, 0, g_cur_stream>>>(xbuf, x, xn);
+        if (!cuda_ok(cudaGetLastError(), "v41 fp8blk x bf16")) return 0;
+        x16 = xbuf;
+    }
+    #define V41_FP8GEMV_LAUNCH(NT, XB) v41_fp8blk_gemv_kernel<NT, XB><<<grid, 256, 0, g_cur_stream>>>( \
+        out, w, sc, x, x16, (uint32_t)in_dim, (uint32_t)out_dim, sbc, ksplit, \
+        x_stride, out_stride, x_gstride, out_gstride)
     switch (n_tok) {
-        case 1: V41_FP8GEMV_LAUNCH(1u); break;  case 2: V41_FP8GEMV_LAUNCH(2u); break;
-        case 3: V41_FP8GEMV_LAUNCH(3u); break;  case 4: V41_FP8GEMV_LAUNCH(4u); break;
-        case 5: V41_FP8GEMV_LAUNCH(5u); break;  case 6: V41_FP8GEMV_LAUNCH(6u); break;
-        case 7: V41_FP8GEMV_LAUNCH(7u); break;  default: V41_FP8GEMV_LAUNCH(8u); break;
+        case 1: V41_FP8GEMV_LAUNCH(1u, 0u); break;  case 2: V41_FP8GEMV_LAUNCH(2u, 1u); break;
+        case 3: V41_FP8GEMV_LAUNCH(3u, 1u); break;  case 4: V41_FP8GEMV_LAUNCH(4u, 1u); break;
+        case 5: V41_FP8GEMV_LAUNCH(5u, 1u); break;  case 6: V41_FP8GEMV_LAUNCH(6u, 1u); break;
+        case 7: V41_FP8GEMV_LAUNCH(7u, 1u); break;  default: V41_FP8GEMV_LAUNCH(8u, 1u); break;
     }
     #undef V41_FP8GEMV_LAUNCH
     return cuda_ok(cudaGetLastError(), what);
@@ -271,4 +316,90 @@ static int v41_fp8blk_to_bf16(__nv_bfloat16 *o, const uint8_t *w, const uint8_t 
     const uint32_t sbc = (uint32_t)((in_dim + 31u) / 32u);
     v41_fp8blk_to_bf16_kernel<<<(unsigned)((n + 255) / 256), 256, 0, g_cur_stream>>>(o, w, sc, (uint32_t)in_dim, sbc, n);
     return cuda_ok(cudaGetLastError(), "v41 fp8blk→bf16");
+}
+
+/* ---- 出口头的逐列平方和(mtp-1.md M6′: 草稿器对齐改用**出口度量**) ----
+ *
+ * 为什么要它: 草稿器与主模型的 logits 由**同一个出口头** W 算(官方 forward_head 借主模型的 head),
+ * 所以"把草稿器的出口隐态掰到主模型的那个"本该按 ‖W·(h_d − h_m)‖ 来量, 而不是按 ‖h_d − h_m‖。
+ * 09-16 那次 M6 判负(留出一致率 0.4570 → 挂上反而 0.4336)的真因就在这: 纯 L2 把力气花在**方差大**的
+ * 方向上, 而 argmax 是由 head 那 12.9 万行里的细微差额定的 —— 两者根本不是一个度量。
+ *
+ * 这里出的是 G = WᵀW 的**对角线**(每一列的平方和), 即"这个隐态维度被出口头放大多少"。
+ * ★为什么只要对角线★: 整份 G 是 5120×5120(105 MB), 解算侧还要 Cholesky, 是另一档工程;
+ * 对角线是它最省的一阶近似 —— 把"头基本不看的维度"压下去, 这一条就够解释那次判负了。
+ * 真要上整份 G, 照这里的形态改成 cuBLAS syrk 即可(权重已经在设备上, 逐块解成 bf16)。
+ *
+ * W 在盘上是 fp4x32 [V][D] 行主序 ⇒ 列 d 的平方和 = Σ_v W[v][d]²。一 block 管一列,
+ * 256 个线程沿 v 方向跨步累加再树形归约。f32 累加(V=129280 项, 值域 ≤ 6×2^e, f32 够用)。 */
+__global__ static void v41_head_colnorm_kernel(float *out, const uint8_t *w, uint32_t V, uint32_t D) {
+    const uint32_t d = blockIdx.x;
+    const uint32_t nblk_row = D / 32u, blk = d >> 5, el = d & 31u;
+    __shared__ float red[256];
+    float s = 0.f;
+    for (uint32_t v = threadIdx.x; v < V; v += blockDim.x) {
+        const uint8_t *p = w + ((uint64_t)v * nblk_row + blk) * 17u;
+        const float sc = ds4_e8m0_to_f32(p[16]);
+        const uint8_t by = p[el >> 1];
+        const float wv = ds4_fp4_nibble_to_f32((el & 1u) ? (uint8_t)(by >> 4) : (uint8_t)(by & 0x0Fu)) * sc;
+        s += wv * wv;
+    }
+    red[threadIdx.x] = s;
+    __syncthreads();
+    for (uint32_t k = blockDim.x >> 1; k; k >>= 1) {
+        if (threadIdx.x < k) red[threadIdx.x] += red[threadIdx.x + k];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[d] = red[0];
+}
+int ds4_gpu_v41_head_colnorm_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+                                    uint64_t weight_offset, uint32_t n_vocab, uint32_t n_embd) {
+    if (!out || (n_embd % 32u) || out->bytes < (uint64_t)n_embd * 4) return 0;
+    const uint64_t nblk = (uint64_t)n_vocab * (n_embd / 32u);
+    const uint8_t *w = (const uint8_t *)cuda_model_range_ptr(model_map, weight_offset, nblk * 17u, "v41 head colnorm");
+    if (!w) return 0;
+    v41_head_colnorm_kernel<<<n_embd, 256, 0, g_cur_stream>>>((float *)out->ptr, w, n_vocab, n_embd);
+    return cuda_ok(cudaGetLastError(), "v41 head colnorm");
+}
+
+/* 单组入口(engram wkv 等): 与改造前同义, 组数 1、步长 = 维度。 */
+static int v41_fp8blk_gemv(const uint8_t *w, const uint8_t *sc, uint64_t in_dim, uint64_t out_dim,
+                           const float *x, float *out, uint32_t n_tok, const char *what) {
+    return v41_fp8blk_gemv_g(w, sc, in_dim, out_dim, x, out, n_tok, 1u,
+                             (uint32_t)in_dim, (uint32_t)out_dim, 0u, 0u, what);
+}
+
+/* ---- 三塔投影的 FP8 入口(mtp-1.md M6 真因修复, 2026-09-17) ----
+ * 为什么要这两个: DSpark 三塔在原件里是 FP8(E4M3 + 32×32), 我们的转换器原来跟着主干一起压成 FP4,
+ * 把草稿器的精度一并砍了(草稿器对 FP 原模型的首位一致率只剩 0.50)。现在盘上存回 FP8, 引擎按张量
+ * 类型分发到这里。out 出口补一次 bf16 舍入 —— fp4 那条路是核里 round_out 折进去的, 两条要同口径。 */
+int ds4_gpu_v41_matmul_fp8blk_round_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+                                           uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+                                           const ds4_gpu_tensor *x, uint32_t n_tok, int round_out) {
+    if (!out || !x || n_tok == 0) return 0;
+    const uint64_t sbc = (in_dim + 31u) / 32u, sbr = (out_dim + 31u) / 32u;
+    const uint64_t wbytes = in_dim * out_dim + sbr * sbc;
+    if (weight_offset > model_size || wbytes > model_size - weight_offset) return 0;
+    const uint8_t *W = (const uint8_t *)cuda_model_range_ptr(model_map, weight_offset, wbytes, "v41 mtp fp8 w");
+    if (!W) return 0;
+    if (!v41_fp8blk_gemv_g(W, W + in_dim * out_dim, in_dim, out_dim, (const float *)x->ptr, (float *)out->ptr,
+                           n_tok, 1u, (uint32_t)in_dim, (uint32_t)out_dim, 0u, 0u, "v41 mtp fp8 gemv")) return 0;
+    return round_out ? ds4_gpu_v41_round_bf16_tensor(out, (uint64_t)n_tok * out_dim) : 1;
+}
+int ds4_gpu_v41_grouped_matmul_fp8blk_tensor(ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
+                                             uint64_t weight_offset, uint32_t n_groups, uint64_t group_dim,
+                                             uint64_t rank, const ds4_gpu_tensor *heads, uint32_t n_tok, int round_out) {
+    if (!low || !heads || n_tok == 0 || n_groups == 0) return 0;
+    const uint64_t in_all = (uint64_t)n_groups * group_dim, out_all = (uint64_t)n_groups * rank;
+    const uint64_t sbc = (group_dim + 31u) / 32u, sbr = (rank + 31u) / 32u;
+    /* 盘上是整块 [n_groups·rank][group_dim] 的 e4m3 平面 + 同形状的缩放平面 —— 组 g 的行段连续,
+     * 所以核里按 grid.y 加个行偏移就够(见 v41_fp8blk_gemv_kernel 的注释)。 */
+    const uint64_t wbytes = out_all * group_dim + n_groups * sbr * sbc;
+    if (weight_offset > model_size || wbytes > model_size - weight_offset) return 0;
+    const uint8_t *W = (const uint8_t *)cuda_model_range_ptr(model_map, weight_offset, wbytes, "v41 mtp wo_a fp8");
+    if (!W) return 0;
+    if (!v41_fp8blk_gemv_g(W, W + out_all * group_dim, group_dim, rank, (const float *)heads->ptr,
+                           (float *)low->ptr, n_tok, n_groups, (uint32_t)in_all, (uint32_t)out_all,
+                           (uint32_t)group_dim, (uint32_t)rank, "v41 mtp wo_a fp8 gemv")) return 0;
+    return round_out ? ds4_gpu_v41_round_bf16_tensor(low, (uint64_t)n_tok * out_all) : 1;
 }

@@ -9,10 +9,35 @@ int g_ds4_v41_prof = 0;
 int g_ds4_v41_decoder_full = 0;
 void ds4_engine_v41_set_decoder_full(int on) { g_ds4_v41_decoder_full = on; }
 void ds4_engine_v41_set_prof(int on) { g_ds4_v41_prof = on; }
-/* ★--no-dspark★: 关掉投机解码, 回到逐 token。温 0 下两条路必须**逐字节同** ——
- * 投机的接受条件就是"主模型自己也会选这个 token", 所以它只省时间不改输出; 不同就是回滚漏了东西。 */
-int g_ds4_v41_dspark = 1;
+/* ★--dspark★: 开投机解码(默认**关**)。温 0 下两条路必须**逐字节同** ——
+ * 投机的接受条件就是"主模型自己也会选这个 token", 所以它只省时间不改输出; 不同就是回滚漏了东西。
+ *
+ * ★为什么默认是关的(2026-09-16, 用户令"速度大幅度提升才改默认开启")★: 两条理由, 缺一条都不该关。
+ * ①**同轨门今天不绿**: 同一份 2K 提示、温 0, 投机与纯解码的输出第二句就分叉(mtp-1.md §4)。
+ *   引擎默认路径必须是裸模型的真值 —— 默认开着一个会改输出的近似路, 等于每个跑分都掺了别的东西。
+ * ②**它今天还是亏的**: 一轮 188 ms 只产 1.96 个 token(96 ms/token), 而纯解码一步 52 ms。
+ * 等 mtp-1.md 的 M1′(同轨)与 M2′/M3′/M4′(核形态)过门、且真比纯解码快之后, 再把默认翻回来。
+ * `--no-dspark` 保留: 老脚本一路在传它, 现在是"再确认一次关", 不是错。 */
+int g_ds4_v41_dspark = 0;
 void ds4_engine_v41_set_dspark(int on) { g_ds4_v41_dspark = on; }
+/* --dspark-verify N: 每轮验证几位(0 = 用下面钉死的默认)。
+ * 为什么要这个旋钮: ①同轨出问题时, k=1(验证批只有 2 行)是最小的多 token 批, 拿它跟 k=3 一比就知道
+ * "病在批本身"还是"病在批大了以后"; ②字节账(mtp-1.md §3)要按 k 逐档量, 每档一个二进制是浪费。
+ * 它不是兜底开关 —— 调度器(M5′)落地后由置信度定 k, 这个旋钮只作诊断与逐档量尺用。 */
+/* --emit-trace: 逐 token 打 `[emit] <绝对位置> <token id>`(同轨定位, mtp-1.md M0′(d))。
+ * ★为什么不搭 --v41-prof 的顺风车★: prof 会让前向**逐层 flush**(core_v41_forward.c), 时序一变,
+ * 偶发的分叉可能就复现不出来了 —— 那样这把尺就在骗人。它只打这一行, 不改任何执行路径。 */
+int g_ds4_v41_emit_trace = 0;
+void ds4_engine_v41_set_emit_trace(int on) { g_ds4_v41_emit_trace = on; }
+/* --dspark-block N: 把草稿块长钉成 N(0 = 用模型元数据里的 5)。**只作诊断**。
+ * 为什么要它: 块长 5 + 4 个 noise 位 + 块内全可见, 是我们照官方 forward_embed/get_dspark_topk_idxs
+ * 自己写的一段, 从来没有单独验过。拿 N=1 跑同一把取料尺(首位一致率)一比就知道那几位 noise 是在
+ * 帮忙还是在捣乱 —— 训练时是带着它们训的, 所以 N=1 明显更准 = 我们这段写错了。
+ * ★不是速度旋钮★: 块长是模型定的, 平时别动。 */
+uint32_t g_ds4_v41_block = 0;
+void ds4_engine_v41_set_block(uint32_t b) { g_ds4_v41_block = b; }
+uint32_t g_ds4_v41_verify_k = 0;
+void ds4_engine_v41_set_verify_k(uint32_t k) { g_ds4_v41_verify_k = k; }
 const char *g_ds4_v41_draft_amp = NULL;
 void ds4_engine_v41_set_draft_amp(const char *path) { g_ds4_v41_draft_amp = path; }
 /* --draft-amp-scale β: 装载时 A *= β。用来分辨"方向错"还是"幅度过头" ——
@@ -184,28 +209,54 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
          * 以下。实测一轮 118 ms 对预算 72 ms, 超 64%, 而这 118 从来没拆过。四项分开计, 就能分清
          * "草稿器自己太贵"(那接受率再高也救不回来)还是"验证/回滚的边角料吃掉了"。 */
         double ms_draft = 0, ms_verify = 0, ms_argmax = 0, ms_snap = 0;
+        /* 调度器判"这一轮不值得投机"之后歇几轮(见下面 v41_draft_pick_k 那一段)。
+         * 16 轮是个折中: 太短就一直在亏本的文本上反复试(每试一次白付 28% 的草稿钱),
+         * 太长就错过文本变好猜的那一段。16 ⇒ 试探开销摊到 1.8%。 */
+        #define V41_SPEC_COOLDOWN 16u
+        uint32_t spec_skip = 0, spec_skipped = 0;
         for (uint32_t i = 0; i <= DS4_MTP_MAX_BLOCK; i++) spec_hist[i] = 0;
         uint32_t confirmed = st.mainh_rows;   /* 上一批新确认了几个位置(预填后 = 窗口预热的那些行) */
         while (produced < n_predict) {
             produced++;
+            /* ★同轨定位用(mtp-1.md M0′(d))★: 逐 token 打"绝对位置 + token id"。
+             * 为什么不看生成的文字: 文字把 token 边界抹掉了, 两条路差一个 token 可能只差半个词,
+             * 而且分叉处往往两句都通顺(近平局翻面), 看不出来。把两条路的这几行 diff 一下,
+             * 第一个不同的位置就是要查的那一步 —— 位置对得上、id 不同 = 那一步的 logits 不同(核);
+             * 位置本身对不上 = 回滚把状态推歪了(快照漏项)。 */
+            if (g_ds4_v41_emit_trace) fprintf(stderr, "[emit] %u %d\n", st.n_past, tok);
+            /* ★解码整步 CUDA graph(core_decode_graph.c)★: 纯解码(没开投机)且暖过一步直发之后, 一步 = 写槽 + 一发图 +
+             * 读设备 argmax。第一步仍走下面的直发(把平面副本/暂存那些懒分配全建好, 捕获态下不许分配)。
+             * ★先发图再 emit★: emit 是 fwrite+fflush 到文件, 实测 300 µs/步 —— 放在两步之间 GPU 就干等 300 µs,
+             * 放在图跑着的时候做就是白赚。eos/上下文满的判断在发图之前(它们决定还发不发), 输出顺序与原来逐字相同。 */
+            if (!spec && v41_graph_ready(&st) && tok != eos && st.n_past + 1 <= st.ctx) {
+                int32_t nt = 0;
+                if (!v41_graph_launch(e, &st, (int32_t)tok)) { ok = false; break; }
+                if (emit && emit(tok, ud) != 0) { (void)v41_graph_wait(e, &st, &nt); break; }   /* 图已发, 等完再走 */
+                if (!v41_graph_wait(e, &st, &nt)) { ok = false; break; }
+                tok = (int)nt;
+                continue;
+            }
             if (emit && emit(tok, ud) != 0) break;
             if (tok == eos) break;
             if (st.n_past + 1 > st.ctx) { fprintf(stderr, "\n[v41] 上下文满 %u\n", st.ctx); break; }
             uint32_t k = 0;
+            if (spec_skip) spec_skip--;
             int32_t batch[DS4_MTP_MAX_BLOCK + 1];
             batch[0] = (int32_t)tok;
             const double tr0 = now_sec();
-            if (spec && v41_draft_step(e, &st, &dr, (int32_t)tok, st.n_past - 1u, confirmed)) {
-                /* ★验证几位, 是一笔字节账(2026-09-16, mtp.md §5)★
-                 * 一轮读 = 骨架 4.4 GB(与 k 无关, 这正是投机的全部收益来源) + (1+k) 份专家 1.61 GB
-                 * + 草稿 ≈2 GB; 产出 = 1 + E[接受]。拿实测的接受率(首位 0.61, 均接受 1.39/5)算:
-                 *   k=5: 16.1 GB ÷ 2.39 = 6.72 GB/token —— 比纯解码的 6.0 **还多**, 轮再快也是亏的
-                 *   k=3: 12.8 GB ÷ 2.10 = 6.11 GB/token —— 打平
-                 * 官方的做法是置信头 + 调度器每轮定几位(报告 §2.4.3); 那是 mtp.md M5。
-                 * 在调度器落地之前先钉死 3 —— 第 4、5 位的边际接受概率(直方图 4:3 5:0)撑不住
-                 * 它们那份专家字节。★别往上调★: 调之前先把上面那个除法重算一遍。
-                 * 块本身仍按模型定的 5 位出(草稿器一次前向就是 5 位), 只是**验证**少验两位。 */
-                const uint32_t use = 3u;
+            if (spec && spec_skip == 0 && v41_draft_step(e, &st, &dr, (int32_t)tok, st.n_past - 1u, confirmed)) {
+                /* ★验证几位由置信度定(mtp-1.md M5′, core_draft_sched.c)★
+                 * 以前这里钉死 3。钉死的毛病在两头: 文本好猜时少赚(README 英文满打满算能接受 1.39/5),
+                 * 难猜时白读专家(金融文本 0.78/3, 每多验一位就多读一份 1.61 GB 的专家权重)。
+                 * 调度器拿草稿器自己报的 conf 算"再验一位期望多拿多少 token / 多付多少成本", 取最优。
+                 * --dspark-verify N 仍可钉死一个 k(诊断与逐档量字节账用)。 */
+                float sched_val = 0.f;
+                const uint32_t use = g_ds4_v41_verify_k ? g_ds4_v41_verify_k
+                                                       : v41_draft_pick_k(dr.host_conf, dr.block, &sched_val);
+                /* ★预测连草稿钱都赚不回来 ⇒ 接下来几轮不出草稿★: 难文本上投机是净亏的, 而"亏不亏"
+                 * 只有出过一次草稿才知道。歇 V41_SPEC_COOLDOWN 轮再试一次 —— 既不会一直亏,
+                 * 也不会错过文本变好猜的那一段。只由 token 序列决定 ⇒ 温 0 下可复现。 */
+                if (!g_ds4_v41_verify_k && sched_val < 1.0f) { spec_skip = V41_SPEC_COOLDOWN; spec_skipped++; }
                 k = dr.block < use ? dr.block : use;
                 for (uint32_t i = 0; i < k; i++) batch[i + 1u] = dr.host_ids[i + 1u];
             }
@@ -244,13 +295,16 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
             for (uint32_t i = 0; i < a; i++) {   /* 白赚的那几位: 草稿与主模型一致, 直接吐 */
                 produced++;
                 const int t = (int)batch[i + 1u];
+                /* 位置 = 回滚后的 n_past 减去还没吐的那几位(与纯解码那条打印的是同一个绝对位置口径) */
+                if (g_ds4_v41_emit_trace) fprintf(stderr, "[emit] %u %d\n", st.n_past - a + i, t);
                 if ((emit && emit(t, ud) != 0) || t == eos) { produced = n_predict; break; }
             }
             confirmed = 1u + a;
             tok = (int)want[a];
         }
         if (spec_rounds) {
-            fprintf(stderr, "\n[v41] DSpark: %u 轮, 平均接受 %.2f/%u 位; 直方图", spec_rounds, (double)spec_acc / spec_rounds, dr.block);
+            fprintf(stderr, "\n[v41] DSpark: %u 轮(调度器判亏本歇了 %u 次), 平均接受 %.2f/%u 位; 直方图",
+                    spec_rounds, spec_skipped, (double)spec_acc / spec_rounds, dr.block);
             for (uint32_t i = 0; i <= dr.block; i++) fprintf(stderr, " %u:%u", i, spec_hist[i]);
             const double R = (double)spec_rounds, ea = 1.0 + (double)spec_acc / R;
             const double per = (ms_draft + ms_snap + ms_verify + ms_argmax) / R;

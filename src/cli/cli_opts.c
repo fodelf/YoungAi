@@ -338,6 +338,16 @@ cli_config parse_options(int argc, char **argv) {
             c.gen.decoder_full = 1;
         } else if (!strcmp(arg, "--no-dspark")) {
             c.gen.no_dspark = 1;
+        } else if (!strcmp(arg, "--no-graph")) {
+            c.gen.no_graph = 1;
+        } else if (!strcmp(arg, "--dspark")) {
+            c.gen.dspark = 1;
+        } else if (!strcmp(arg, "--emit-trace")) {
+            c.gen.emit_trace = 1;
+        } else if (!strcmp(arg, "--dspark-block")) {
+            c.gen.dspark_block = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--dspark-verify")) {
+            c.gen.verify_k = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--v41-prof")) {
             c.gen.v41_prof = 1;
         } else if (!strcmp(arg, "--dump-logprobs")) {

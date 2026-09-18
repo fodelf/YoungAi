@@ -14,6 +14,7 @@
 #include "src/cuda/cuda_lifecycle.inc.cu"
 #include "src/cuda/cuda_dspark.inc.cu"
 #include "src/cuda/cuda_graphcap.inc.cu"
+#include "src/cuda/cuda_decode_graph.inc.cu"   /* 解码整步 CUDA graph 原语(2026-09-18): 捕获/实例化/发射 + host 节点 + pinned 异步拷贝 */
 #include "src/cuda/cuda_modelmap.inc.cu"
 #include "src/cuda/cuda_embed_norm_kernels_1.inc.cu"
 #include "src/cuda/cuda_embed_norm_kernels_2.inc.cu"
@@ -64,6 +65,7 @@
 #include "src/cuda/cuda_vq_prefill.inc.cu"
 #include "src/cuda/cuda_v41_1.inc.cu"   /* DeepSeek V4.1 批前向原语 ①②③(2026-09-12): 稠密/hc/norm | rope/量化/indexer/attn | 路由/MoE */
 #include "src/cuda/cuda_kv_pack.inc.cu"   /* 全局 KV 按官方格式打包(decode.md D1): 主 KV 288 B/组、索引 K 72 B/组; 在 v41_1 之后(用 bf16r/pow2_ceil_log2), 在三个注意力核之前(被它们解包) */
+#include "src/cuda/cuda_v41_indexer.inc.cu"   /* indexer 打分/候选块/topk(2026-09-18 从 v41_2 拆出); 在 kv_pack 之后(解包索引键) */
 #include "src/cuda/cuda_sparse_attn_mma.inc.cu"   /* 稀疏注意力张量核版(speed.md 段 4); 必须在 v41_1 之后(用 v41_bf16r)、v41_2 之前(被它调) */
 #include "src/cuda/cuda_v41_hc.inc.cu"   /* mHC 一族(mix/sinkhorn/hc_pre/hc_post/合一核); 在 v41_1 之后(用它的 bf16r 与暂存槽) */
 #include "src/cuda/cuda_v41_attn_split.inc.cu"   /* 解码路稀疏注意力 split-K(single.md S4); 在 v41_2 之前(被它调) */
@@ -73,6 +75,7 @@
 #include "src/cuda/cuda_v41_3.inc.cu"
 #include "src/cuda/cuda_v41_fp4_planar.inc.cu"   /* fp4x32 权重的平面副本(single.md §2.6 A 路); 在 v41_4 之前(被它的 GEMV 调) */
 #include "src/cuda/cuda_v41_4.inc.cu"   /* V4.1 解码小批融合核(fp4x32 GEMV / VQ 即乘 / 缩放舍入 / argmax) */
+#include "src/cuda/cuda_vq_probe.inc.cu"    /* VQ 解码核的两个看门狗(--v41-prof 才跑); 在 v41_4 之后、vq_decode 之前 */
 #include "src/cuda/cuda_vq_decode.inc.cu"   /* VQ 专家解码即乘(原在 v41_4 里); 在 v41_4 之后(用它的 bf16r/暂存槽), 在 draft 之前(草稿塔借本片的 reduce 核) */
 #include "src/cuda/cuda_v41_draft.inc.cu"   /* DSpark 草稿塔(speed.md 段 6 D1): 逐专家 FP4 dense MoE / hc 四路均值 / markov 行 gather; 必须在 v41_4 之后(用它的 reduce 核与暂存槽) */
 #include "src/cuda/cuda_v41_gemv_highprec.inc.cu"   /* 非 FP4 权重(BF16 gate/compressor/indexer, F32 mHC)的小批 GEMV; clear.md C1 过门后整片删 */

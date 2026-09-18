@@ -63,7 +63,9 @@ bool v41_state_alloc(ds4_v41_state *st, uint32_t cap, uint32_t ctx) {
         if (!g_ds4_v41.is_kv_source[il]) continue;
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (!ratio) { fprintf(stderr, "ds4: V4.1 kv 源层 L%u 压缩比为 0\n", il); ok = false; break; }
-        const uint64_t ngcap = (uint64_t)ctx / ratio + 1;
+        /* ★多两格★(2026-09-18): 第 ctx/ratio 格是解码整步 graph 的**垃圾槽** —— 没凑满组的那些步, 打包核照样发,
+         * 写到这一格(永远没人读; 组号上限是 ctx/ratio − 1)。core_v41_attn.c 算垃圾槽下标用的就是 ctx/ratio, 两处同源。 */
+        const uint64_t ngcap = (uint64_t)ctx / ratio + 2;
         /* ★按官方打包尺寸分配★(decode.md D1): 主 KV 288 B/组、索引 K 72 B/组, 不是 512/128 个 f32。
          * 常量在 ds4_gpu_v41.h 只有一份 —— 这里与核里的解包各写各的就会静默越界。 */
         st->comp_kv[il] = v41_alloc(ngcap * DS4_V41_CKV_BYTES, &ok);
@@ -85,6 +87,7 @@ bool v41_state_alloc(ds4_v41_state *st, uint32_t cap, uint32_t ctx) {
 }
 
 void v41_state_free(ds4_v41_state *st) {
+    v41_graph_free(st);
     v41_amp_free(st);
     v41_engram_close(st);
     ds4_gpu_tensor **all[] = { &st->tok, &st->pos, &st->posg, &st->hc, &st->hc2, &st->mix, &st->pre, &st->post, &st->comb, &st->pre_mix,
@@ -124,9 +127,28 @@ static bool v41_hc_half(ds4_engine *e, ds4_v41_state *st, const ds4_layer_weight
     return true;
 }
 
+/* ★小批的专家重合度探针(--v41-prof, n>1 才有意义)★
+ * 现役 VQ 路是 n_tok × top-k 个 (token, 槽) 对, 每对独立读一份专家权重 —— 同一个专家被两个 token 选中
+ * 就把它读两遍。投机验证批一次 1+k 行, 所以"验证多一位要多付多少专家字节"就等于这里的唯一专家数增量。
+ * 09-17 实测(12k): 唯一专家 6 / 9.96 / 13.26 / 17.38 / 21.71(n=1..5) ⇒ **每多一个 token 多 3.9 个新专家**,
+ * 这是单流投机的上限来源(mtp-2.md §2.2), 也是张量核并集核该省的那一笔。
+ * ★2026-09-17 扩到草稿塔★(mtp-2.md §6.1): 塔的 MoE 是 3 塔 × 5 位 × top-3 = 45 对, 而块里第 1..4 位吃的是
+ * 同一个 noise 嵌入(只差位置) ⇒ 路由重合应当远高于主干。它定 §6.1 那一刀的字节账, 量出来才知道值不值。
+ * 代价: 要把 sel 读回主机 = 每层一次同步, 所以只在 prof 下开。 */
+static void v41_moe_uniq_probe(ds4_v41_state *st, uint32_t il, uint32_t topk, const char *tag) {
+    int32_t s[8u * 8u];
+    const uint32_t ns = st->n * topk;
+    uint32_t uniq = 0;
+    if (!g_ds4_v41_prof || st->n < 2u || ns > sizeof(s) / sizeof(s[0])) return;
+    if (!ds4_gpu_synchronize() || !ds4_gpu_tensor_read(st->sel, 0, s, (uint64_t)ns * 4)) return;
+    for (uint32_t i = 0; i < ns; i++) { uint32_t j = 0; while (j < i && s[j] != s[i]) j++; if (j == i) uniq++; }
+    fprintf(stderr, "[%s] L%02u n=%u: 唯一专家 %u / %u\n", tag, il, st->n, uniq, ns);
+}
+
 /* MoE(官方 MoE.forward): 路由 f32 → routed(VQ) + shared(fp4) → bf16 */
 static bool v41_moe(const ds4_model *m, const ds4_layer_weights *l, ds4_v41_state *st, uint32_t il) {
     const uint32_t n = st->n, E = DS4_N_EMBD, FF = DS4_N_FF_EXP;
+    const bool tail = !st->draft && n <= DS4_V41_GEMV_MAX_TOK;   /* 解码小批走 VQ 即乘核 ⇒ MoE 尾巴可以一发收 */
     /* 草稿塔: 128 个专家 top-3, 每个专家是一个独立 fp4x32 张量(不是 VQ blob) —— 路由的形状也是塔自己的 */
     const uint32_t NE = st->draft ? g_ds4_v41.mtp_experts : DS4_N_EXPERT;
     const uint32_t KU = st->draft ? g_ds4_v41.mtp_used : DS4_N_EXPERT_USED;
@@ -137,41 +159,35 @@ static bool v41_moe(const ds4_model *m, const ds4_layer_weights *l, ds4_v41_stat
     if (!ds4_gpu_v41_router_tensor(st->sel, st->rw, st->glog, m->map, m->size, l->ffn_exp_probs_b->abs_offset, n, NE,
                                    KU, DS4_EXPERT_WEIGHT_SCALE)) return false;
     if (st->draft) {
+        v41_moe_uniq_probe(st, il, KU, "mtp-uniq");
         if (!ds4_gpu_v41_mtp_moe_tensor(st->routed, m->map, il, st->tower_exp_off[il], E, FF, E, st->sel, st->rw,
                                         NE, KU, DS4_SWIGLU_CLAMP_EXP, st->xn, n)) return false;
     } else {
-    /* ★验证批的专家重合度(2026-09-16, mtp.md M3 的判决依据)★
-     * 现在的 VQ 路是 n_tok × top-8 个 (token,槽) 对, 每对独立开一份专家 —— 同一个专家被两个 token
-     * 选中就把它的权重读两遍。投机验证一次 4 行, 于是专家字节直接乘 4, 这是验证 148 ms 的大头。
-     * 去重值不值, 全看这四行的 top-8 实际重合多少: 打印"唯一专家数 / n×8"。
-     * 只在 --v41-prof + 多行时算, 因为它要把 sel 读回主机(一次同步/层)。 */
-    if (g_ds4_v41_prof && n > 1u) {
-        int32_t s[8u * DS4_N_EXPERT_USED];
-        const uint32_t ns = n * DS4_N_EXPERT_USED;
-        if (ns <= sizeof(s) / sizeof(s[0]) && ds4_gpu_synchronize() &&
-            ds4_gpu_tensor_read(st->sel, 0, s, (uint64_t)ns * 4)) {
-            uint32_t uniq = 0;
-            for (uint32_t i = 0; i < ns; i++) { uint32_t j = 0; while (j < i && s[j] != s[i]) j++; if (j == i) uniq++; }
-            fprintf(stderr, "[moe-uniq] L%02u n=%u: 唯一专家 %u / %u\n", il, n, uniq, ns);
-        }
-    }
+    v41_moe_uniq_probe(st, il, DS4_N_EXPERT_USED, "moe-uniq");
     char nm[64]; snprintf(nm, sizeof nm, "blk.%u.ffn_exps_vq.blob", il);
     const ds4_tensor *blob = model_find_tensor(m, nm);
     if (!blob) return false;
-    if (!ds4_gpu_v41_routed_moe_tensor(st->routed, m->map, m->size, blob->abs_offset, blob->bytes, E, FF, E, st->sel, st->rw,
+    /* 解码小批: 不做归约那一发, 部分和留在核侧, 下面 shared 专家算完后一发收尾(ds4_gpu_v41.h 的 out==NULL 口径) */
+    if (!ds4_gpu_v41_routed_moe_tensor(tail ? NULL : st->routed, m->map, m->size, blob->abs_offset, blob->bytes, E, FF, E, st->sel, st->rw,
                                        DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, st->xn, il, n)) return false;
     }
     /* shared expert: w1/w3 → bf16 → swiglu(截断) → bf16 → w2 → bf16 */
     /* ★判负存档(single.md S5①, 09-16)★: gate 与 up 同形状同输入, 合成一发试过 —— 55.2 vs 55.2, 持平。
      * 小矩阵的固定开销不在"发数"上(每发才 41 µs, 启动只占几微秒), 合发省不出东西。pair 那条核路已删。 */
-    if (!ds4_gpu_v41_matmul_fp4x32_tensor(st->sg, m->map, m->size, l->ffn_gate_shexp->abs_offset, E, FF, st->xn, n, 1)) return false;
-    if (!ds4_gpu_v41_matmul_fp4x32_tensor(st->su, m->map, m->size, l->ffn_up_shexp->abs_offset, E, FF, st->xn, n, 1)) return false;
+    /* ★按盘上类型分发★: 主干的 shared 专家是 fp4x32; 三塔的在原件里是 FP8, 2026-09-17 起原样存
+     * (v41_tproj 两条路都走, 老 GGUF 仍然是 fp4x32) */
+    if (!v41_tproj(m, st->sg, l->ffn_gate_shexp, E, FF, st->xn, n, 1)) return false;
+    if (!v41_tproj(m, st->su, l->ffn_up_shexp, E, FF, st->xn, n, 1)) return false;
     if (!ds4_gpu_v41_swiglu_tensor(st->sh, st->sg, st->su, n, FF, DS4_SWIGLU_CLAMP_EXP)) return false;
-    if (!ds4_gpu_v41_matmul_fp4x32_tensor(st->so, m->map, m->size, l->ffn_down_shexp->abs_offset, FF, E, st->sh, n, 1)) return false;
+    if (!v41_tproj(m, st->so, l->ffn_down_shexp, FF, E, st->sh, n, 1)) return false;
     /* y = routed(f32 累加的 bf16 专家输出) + shared(bf16) → .type_as(x) bf16 */
-    if (!ds4_gpu_tensor_copy(st->y, 0, st->routed, 0, (uint64_t)n * E * 4)) return false;
-    if (!ds4_gpu_v41_add_tensor(st->y, st->so, (uint64_t)n * E)) return false;
-    if (!ds4_gpu_v41_round_bf16_tensor(st->y, (uint64_t)n * E)) return false;
+    if (tail) {   /* 解码: 归约 + 相加 + 舍 bf16 一发(2026-09-18 小核合并; 算式同序, 逐位同) */
+        if (!ds4_gpu_v41_moe_tail_tensor(st->y, st->so, st->rw, n, DS4_N_EXPERT_USED, E)) return false;
+    } else {
+        if (!ds4_gpu_tensor_copy(st->y, 0, st->routed, 0, (uint64_t)n * E * 4)) return false;
+        if (!ds4_gpu_v41_add_tensor(st->y, st->so, (uint64_t)n * E)) return false;
+        if (!ds4_gpu_v41_round_bf16_tensor(st->y, (uint64_t)n * E)) return false;
+    }
     if (st->draft) return true;   /* 反修/取料钩子只挂主干; 草稿塔是另一个模型, 不挂 */
     const int hk = v41_amp_hook(st, il);   /* 反修取料钩子(解算时才挂): 0 继续 / 1 取完了·本次前向到此为止 / <0 失败 */
     if (hk < 0) return false;
@@ -291,11 +307,56 @@ bool v41_spec_rollback(ds4_v41_state *st, uint32_t keep) {
     return true;
 }
 
+/* 前向主体: embed → 各层 → 出口 head。直发(v41_forward)与解码整步 graph 的捕获(core_decode_graph.c)共用 ——
+ * 里面没有任何主机等待/同步拷贝/位置推进, 那些各归调用方。CED 收工与钩子早停走 st->ced_done / st->stop_early 出去。 */
+bool v41_forward_body(ds4_engine *e, ds4_v41_state *st) {
+    const uint32_t n = st->n, E = DS4_N_EMBD;
+    st->ced_done = 0;
+    bool ok = ds4_gpu_v41_embed_fp4x32_tensor(st->x, st->tok, e->model.map, e->model.size, e->weights.token_embd->abs_offset, DS4_N_VOCAB, n, E) != 0;
+    if (ok) ok = ds4_gpu_v41_expand_hc_tensor(st->hc, st->x, E, DS4_N_HC, n) != 0;
+    const double t0 = now_sec();
+    double lt[DS4_N_LAYER + 1], tprev = t0;
+    /* ★CED 分界层 = 最后一个 kv 源层★(元数据驱动, 不写死层号: 见铁律"引擎禁版本名硬编码")。
+     * 官方 V4.1 把 40 层切成编码器/解码器两段, 解码器段所有层的全局 KV 都读分界层的那一槽,
+     * 所以提示的中间块跑到分界层、把 KV 写进缓存就可以收工, 后半段的层没有任何下游消费者。 */
+    uint32_t ced_edge = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) if (g_ds4_v41.is_kv_source[il]) ced_edge = il;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        if (st->ced_skip && il == ced_edge) {   /* 只补全局 KV, 本块到此为止 */
+            ok = v41_hc_half(e, st, &e->weights.layer[il], true) && v41_attention_kv_only(e, st, il);
+            if (ok && ds4_gpu_flush_commands() == 0) ok = false;
+            if (n >= 64u) fputc('\n', stderr);
+            st->ced_done = 1;
+            return ok;   /* 中间块不出 logits(没人读: 生成只要最后一块的末位) */
+        }
+        ok = v41_layer(e, st, il);
+        if (ok && (g_ds4_v41_prof || n >= 64u) && ds4_gpu_flush_commands() == 0) ok = false;   /* 解码不逐层同步(省 40 次停等), 查速度/大块才同步 */
+        if (g_ds4_v41_prof) { const double tn = now_sec(); lt[il] = tn - tprev; if (ok) v41_nan_scan(st, il); tprev = now_sec(); }
+        if (n >= 64u) fprintf(stderr, "[v41] pos %u+%u L%02u %s %.1fs\r", st->pos0, n, il, ok ? "ok" : "★失败★", now_sec() - t0);
+        if (ok && st->stop_early) break;   /* 反修钩子取完料: 余下层与出口不算 */
+    }
+    if (n >= 64u) fputc('\n', stderr);
+    if (!ok) { fprintf(stderr, "ds4: V4.1 前向失败(pos0 %u n %u)\n", st->pos0, n); return false; }
+    if (st->stop_early) return true;   /* 位置照常推进(调用方做), 不出 logits */
+    /* 出口: h = hc_pre(hc, pre_mix) → norm → head(fp4x32, f32 logits), 全 n 行 */
+    if (!ds4_gpu_v41_hc_pre_tensor(st->x, st->hc, st->pre_mix, E, DS4_N_HC, n)) return false;
+    if (!ds4_gpu_v41_rms_norm_tensor(st->xn, st->x, e->model.map, e->model.size, e->weights.output_norm->abs_offset, E, n, DS4_RMS_EPS)) return false;
+    if (!ds4_gpu_v41_matmul_fp4x32_tensor(st->logits, e->model.map, e->model.size, e->weights.output->abs_offset, E, DS4_N_VOCAB, st->xn, n, 0)) return false;
+    if (g_ds4_v41_prof) {   /* 逐层毫秒: 一眼看出哪层在吃时间(engram 层 L1/L14, 源层 L2/8/14/20, 候选层 L20) */
+        if (ds4_gpu_flush_commands() == 0) return false;
+        lt[DS4_N_LAYER] = now_sec() - tprev;
+        fprintf(stderr, "[v41-prof] pos %u+%u 总 %.1f ms | 层(ms):", st->pos0, n, (now_sec() - t0) * 1e3);
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) fprintf(stderr, " %.1f", lt[il] * 1e3);
+        fprintf(stderr, " | 出口 %.1f\n", lt[DS4_N_LAYER] * 1e3);
+    }
+    return true;
+}
+
 bool v41_forward(ds4_engine *e, ds4_v41_state *st, const int32_t *ids, uint32_t n) {
-    const uint32_t E = DS4_N_EMBD;
     if (n == 0 || n > st->cap_tok) { fprintf(stderr, "ds4: V4.1 前向块 %u 超 cap %u\n", n, st->cap_tok); return false; }
     if (st->n_past + n > st->ctx) { fprintf(stderr, "ds4: V4.1 上下文满(%u+%u > %u)\n", st->n_past, n, st->ctx); return false; }
-    st->n = n; st->pos0 = st->n_past; st->idx_owner = -1; st->cand_owner = -1; st->idx_topk = 0; st->stop_early = 0;
+    st->n = n; st->pos0 = st->n_past; st->idx_owner = -1; st->cand_owner = -1; st->idx_topk = 0; st->idx_ratio = 0; st->stop_early = 0;
+    st->graph = 0;
     memcpy(st->hist + st->pos0, ids, (size_t)n * 4);
     {
         int32_t *pos = xmalloc((size_t)n * 4);
@@ -311,51 +372,10 @@ bool v41_forward(ds4_engine *e, ds4_v41_state *st, const int32_t *ids, uint32_t 
     if (!okpm) return false;
     if (!st->no_engram && !v41_engram_prefetch(e, st)) return false;   /* engram 行读盘与前面几层的 GPU 算重叠 */
     if (ds4_gpu_begin_commands() == 0) return false;
-    bool ok = ds4_gpu_v41_embed_fp4x32_tensor(st->x, st->tok, e->model.map, e->model.size, e->weights.token_embd->abs_offset, DS4_N_VOCAB, n, E) != 0;
-    if (ok) ok = ds4_gpu_v41_expand_hc_tensor(st->hc, st->x, E, DS4_N_HC, n) != 0;
-    const double t0 = now_sec();
-    double lt[DS4_N_LAYER + 1], tprev = t0;
-    /* ★CED 分界层 = 最后一个 kv 源层★(元数据驱动, 不写死层号: 见铁律"引擎禁版本名硬编码")。
-     * 官方 V4.1 把 40 层切成编码器/解码器两段, 解码器段所有层的全局 KV 都读分界层的那一槽,
-     * 所以提示的中间块跑到分界层、把 KV 写进缓存就可以收工, 后半段的层没有任何下游消费者。 */
-    uint32_t ced_edge = 0;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) if (g_ds4_v41.is_kv_source[il]) ced_edge = il;
-    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
-        if (st->ced_skip && il == ced_edge) {   /* 只补全局 KV, 本块到此为止 */
-            ok = v41_hc_half(e, st, &e->weights.layer[il], true) && v41_attention_kv_only(e, st, il);
-            if (ok && ds4_gpu_flush_commands() == 0) ok = false;
-            if (!ok) break;
-            if (ds4_gpu_end_commands() == 0 || ds4_gpu_synchronize() == 0) return false;
-            st->n_past += n;
-            if (n >= 64u) fputc('\n', stderr);
-            return true;   /* 中间块不出 logits(没人读: 生成只要最后一块的末位) */
-        }
-        ok = v41_layer(e, st, il);
-        if (ok && (g_ds4_v41_prof || n >= 64u) && ds4_gpu_flush_commands() == 0) ok = false;   /* 解码不逐层同步(省 40 次停等), 查速度/大块才同步 */
-        if (g_ds4_v41_prof) { const double tn = now_sec(); lt[il] = tn - tprev; if (ok) v41_nan_scan(st, il); tprev = now_sec(); }
-        if (n >= 64u) fprintf(stderr, "[v41] pos %u+%u L%02u %s %.1fs\r", st->pos0, n, il, ok ? "ok" : "★失败★", now_sec() - t0);
-        if (ok && st->stop_early) break;   /* 反修钩子取完料: 余下层与出口不算 */
-    }
-    if (n >= 64u) fputc('\n', stderr);
-    if (!ok) { fprintf(stderr, "ds4: V4.1 前向失败(pos0 %u n %u)\n", st->pos0, n); return false; }
-    if (st->stop_early) {   /* 位置照常推进(下一块的缓存/位置接得上), 不出 logits */
-        if (ds4_gpu_end_commands() == 0 || ds4_gpu_synchronize() == 0) return false;
-        st->n_past += n;
-        return true;
-    }
-    /* 出口: h = hc_pre(hc, pre_mix) → norm → head(fp4x32, f32 logits), 全 n 行 */
-    if (!ds4_gpu_v41_hc_pre_tensor(st->x, st->hc, st->pre_mix, E, DS4_N_HC, n)) return false;
-    if (!ds4_gpu_v41_rms_norm_tensor(st->xn, st->x, e->model.map, e->model.size, e->weights.output_norm->abs_offset, E, n, DS4_RMS_EPS)) return false;
-    if (!ds4_gpu_v41_matmul_fp4x32_tensor(st->logits, e->model.map, e->model.size, e->weights.output->abs_offset, E, DS4_N_VOCAB, st->xn, n, 0)) return false;
-    if (ds4_gpu_end_commands() == 0) return false;
-    if (ds4_gpu_synchronize() == 0) return false;
-    if (g_ds4_v41_prof) {   /* 逐层毫秒: 一眼看出哪层在吃时间(engram 层 L1/L14, 源层 L2/8/14/20, 候选层 L20) */
-        lt[DS4_N_LAYER] = now_sec() - tprev;
-        fprintf(stderr, "[v41-prof] pos %u+%u 总 %.1f ms | 层(ms):", st->pos0, n, (now_sec() - t0) * 1e3);
-        for (uint32_t il = 0; il < DS4_N_LAYER; il++) fprintf(stderr, " %.1f", lt[il] * 1e3);
-        fprintf(stderr, " | 出口 %.1f\n", lt[DS4_N_LAYER] * 1e3);
-    }
+    if (!v41_forward_body(e, st)) return false;
+    if (ds4_gpu_end_commands() == 0 || ds4_gpu_synchronize() == 0) return false;
     st->n_past += n;
+    if (n == 1u && !st->draft && !st->ced_done && !st->stop_early) st->n_direct1++;   /* 解码整步 graph 的"暖过了"计数 */
     return true;
 }
 #endif /* !DS4_NO_GPU */

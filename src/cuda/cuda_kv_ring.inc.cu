@@ -19,8 +19,10 @@
 
 /* 本批第 i 行(缓冲第 window+i 行) → 环的第 (pos0+i) % window 格。
  * grid.x = 要提交的行数, 每 block 搬一行 hd 个 float。 */
-__global__ static void v41_win_commit_kernel(float *win, uint32_t pos0, uint32_t i0, uint32_t window, uint32_t hd) {
+__global__ static void v41_win_commit_kernel(float *win, uint32_t pos0, uint32_t i0, uint32_t window, uint32_t hd,
+                                             const int32_t *posd) {
     const uint32_t j = blockIdx.x, i = i0 + j;
+    if (posd) pos0 = (uint32_t)posd[0];   /* graph 路: 位置在设备槽(ds4_gpu_v41.h "设备位置"口径) */
     const float *src = win + (uint64_t)(window + i) * hd;
     float *dst = win + (uint64_t)((pos0 + i) % window) * hd;
     for (uint32_t d = threadIdx.x; d < hd; d += blockDim.x) dst[d] = src[d];
@@ -41,11 +43,14 @@ __global__ static void v41_win_ring_snap_kernel(float *win, float *snap, uint32_
  * 前面的行写进去也会被后面的盖掉 —— 直接只提交最后 window 行, 省掉白写, 结果完全一样。
  * ★只提交最后 window 行是等价的, 不是近似★: 环只有 window 格, 第 i 行与第 i+window 行落同一格,
  * 按 i 升序写的最终结果就是"最后 window 行各就各位"。 */
-int ds4_gpu_v41_win_commit_tensor(ds4_gpu_tensor *win, uint32_t pos0, uint32_t n, uint32_t window, uint32_t head_dim) {
+int ds4_gpu_v41_win_commit_tensor(ds4_gpu_tensor *win, uint32_t pos0, uint32_t n, uint32_t window, uint32_t head_dim,
+                                  const ds4_gpu_tensor *posd) {
     if (!win || !window || !n) return 0;
     if (win->bytes < (uint64_t)(window + n) * head_dim * 4) return 0;
+    if (posd && n != 1u) return 0;
     const uint32_t i0 = n > window ? n - window : 0u, rows = n - i0;
-    v41_win_commit_kernel<<<rows, 256, 0, g_cur_stream>>>((float *)win->ptr, pos0, i0, window, head_dim);
+    v41_win_commit_kernel<<<rows, 256, 0, g_cur_stream>>>((float *)win->ptr, pos0, i0, window, head_dim,
+                                                          posd ? (const int32_t *)posd->ptr : NULL);
     return cuda_ok(cudaGetLastError(), "v41 win commit");
 }
 

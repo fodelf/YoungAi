@@ -35,7 +35,7 @@ __global__ static void v41_fp4x32_to_bf16_kernel(__nv_bfloat16 *out, const uint8
 }
 __global__ static void v41_x_to_bf16_kernel(__nv_bfloat16 *out, const float *x, uint64_t n);
 /* 解码小批(n ≤ 8)走 cuda_v41_4.inc.cu 的融合核(不落 f16); 原型先声明, 定义在后面的分片(同一 TU) */
-#define V41_GEMV_MAX_TOK 8u
+#define V41_GEMV_MAX_TOK DS4_V41_GEMV_MAX_TOK   /* 正本在 ds4_gpu_v41.h(core 也按它分岔) */
 static int v41_fp4x32_gemv(const void *model_map, uint64_t model_size, uint64_t off, uint64_t in_dim, uint64_t out_dim,
                            const float *x, uint32_t x_stride, float *out, uint32_t out_stride, uint32_t n_tok,
                            uint32_t n_groups, uint32_t x_gstride, uint32_t out_gstride, int round_out, const char *what);

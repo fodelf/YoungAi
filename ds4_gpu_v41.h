@@ -98,20 +98,40 @@ int ds4_gpu_v41_compress_pool_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *
 /* 【增量口径(P2c)】下面三件都带 pos0 = 本 chunk 第 i 个 query 的绝对位置 pos0+i; k/kv_comp 是源层的整段缓存
  * (行 g = 第 g 个压缩组, 共 ng 组 = 含本 chunk 新完成的组); 可见性按绝对位置算: g < (pos0+i+1)/ratio。 */
 
+/* ★解码整步 graph 的"设备位置"口径(2026-09-18, fable5 09-18 立案; 实现 src/core/core_decode_graph.c)★
+ * 一张图捕一次、每步只改设备槽里的 {token, 位置} 重放 ⇒ 凡是随位置变的核参数都不能烤进图。
+ * 约定: 带 `posd` 参数的入口, posd 非 NULL 时**位置从 posd[0] 读**(int32, 设备; 就是 st->pos 那张表),
+ * 主机传的 pos0 / ng / topk 只当**上限**(桶封顶: grid、shared 大小按它开; 核里自算真值:
+ * ng = (pos+1)/ratio = 可见组数(n_tok=1 时与源层已完成组数相同), topk = min(topk 上限, ng))。
+ * posd == NULL = 老口径, 预填与直发解码一个字不变。只有 n_tok == 1 才许传 posd(批的位置各不同, 槽装不下)。
+ * 出错会怎样: 主机把 ng 传成真值而不是上限, 桶内位置一涨 grid 就不够, 打分核漏掉尾部的组 —— 不报错,
+ * 长上下文答非所问。所以 graph 路里 ng/topk 只许由 core_decode_graph.c 按桶上限算。 */
+
 /* indexer 打分(官方 Indexer.forward 逐式): q[n][h][dk] 与 k[ng][dk] 点积 → relu → ×weights[n][h] 求和 → score[n][ng];
  * 不可见组 -inf。cand_mask[n][ng](u8, 可 NULL) 为 0 的位置置 -inf(两级 topk 第二级)。 */
 int ds4_gpu_v41_indexer_score_tensor(ds4_gpu_tensor *score, const ds4_gpu_tensor *q, const ds4_gpu_tensor *k,
                                      const ds4_gpu_tensor *weights, const ds4_gpu_tensor *cand_mask,
-                                     uint32_t n_tok, uint32_t pos0, uint32_t ng, uint32_t n_head, uint32_t dk, uint32_t ratio);
+                                     uint32_t n_tok, uint32_t pos0, uint32_t ng, uint32_t n_head, uint32_t dk, uint32_t ratio,
+                                     const ds4_gpu_tensor *posd);
 
 /* 候选块(官方 select_candidate_blocks): score[n][ng] → mask[n][ng] u8; 块分 = 块内最大, 含本 query 最新位置
  * 的块钉为 +inf, 取 topk_blocks 个块(只要分 > -inf), 展开到位置。 */
 int ds4_gpu_v41_candidate_blocks_tensor(ds4_gpu_tensor *mask, const ds4_gpu_tensor *score, uint32_t n_tok, uint32_t pos0,
-                                        uint32_t ng, uint32_t ratio, uint32_t topk_blocks, uint32_t block_size);
+                                        uint32_t ng, uint32_t ratio, uint32_t topk_blocks, uint32_t block_size,
+                                        const ds4_gpu_tensor *posd);
 
-/* topk(官方: topk 取 min(index_topk, 可见组数) 再按位置排序; 不可见 → -1): idx[n][topk] int32 */
+/* topk(官方: topk 取 min(index_topk, 可见组数) 再按位置排序; 不可见 → -1): idx[n][topk] int32。
+ * ratio 只在 posd 非 NULL 时用(核里按位置自算 ng 与 topk)。 */
 int ds4_gpu_v41_indexer_topk_tensor(ds4_gpu_tensor *idx, const ds4_gpu_tensor *score, uint32_t n_tok, uint32_t ng,
-                                    uint32_t topk);
+                                    uint32_t topk, uint32_t ratio, const ds4_gpu_tensor *posd);
+
+/* ★压缩源层的解码一步(graph 路专用, n_tok=1)★: 把本步的 (ckv, csc) 追加到余行缓冲第 pos%ratio 格; 凑满一组
+ * (即 (pos+1)%ratio == 0)就把第 0..ratio-1 格池化(与 ds4_gpu_v41_compress_pool_tensor 同一条算式、同一累加序)写进
+ * pooled[0], 并把新组位置 g·ratio 写进 posg[0]。没凑满时 pooled/posg 不动。
+ * 取代直发路的"两次主机偏移 memcpy + 主机判断再发池化核": 那三件的形状随位置变, 进不了一次捕获的图。 */
+int ds4_gpu_v41_compress_step_tensor(ds4_gpu_tensor *pooled, ds4_gpu_tensor *posg, ds4_gpu_tensor *cpre_kv,
+                                     ds4_gpu_tensor *cpre_sc, const ds4_gpu_tensor *ckv, const ds4_gpu_tensor *csc,
+                                     const ds4_gpu_tensor *posd, uint32_t ratio, uint32_t dim);
 
 /* 稀疏注意力(官方 sparse_attn 逐式, 在线 softmax, sink 只进分母):
  * q[n][h][d]; kv_win[(window+n)][d] 窗口缓冲: 行 r ↔ 绝对位置 pos0-window+r(前 window 行是历史, 后 n 行是本 chunk),
@@ -123,11 +143,37 @@ int ds4_gpu_v41_indexer_topk_tensor(ds4_gpu_tensor *idx, const ds4_gpu_tensor *s
  * ring(decode.md D1): 窗口缓冲前 window 行怎么排 —— 1 = 环(位置 a 住 a % window, 官方
  * window_kv_cache[start_pos % win], 主路用); 0 = 线性排好序(DSpark 草稿塔用, 由 push_main 左移维护)。
  * 环的维护(提交/快照/回滚)是下面 ds4_gpu_v41_win_* 三件。 */
+/* ratio(2026-09-16, mtp-1.md M1′): 本层压缩比(0 = 没有压缩 KV, 只有窗口)。
+ * 它只有一个用途: 让解码张量核版**按每个 query 自己的绝对位置**算段长。
+ * 为什么非这样不可: 这个核把键切段做在线 softmax, 分段一变累加序就变, 近平局的 token 会翻面;
+ * 而"能见几个压缩组"是位置的函数 —— 纯解码在位置 p 算出来的, 必须与验证批里那个 p 算出来的一样。
+ * 踩过的两个坑都在这条线上: ①段数写成 24/n_tok(批一大分段就变, 2K 第 152 字节分叉);
+ * ②改成"按本批第一个 query 算"(批里第 2..k 个 query 就用错了别人的段长, 2K 第 270 字节分叉)。
+ * 核里用 min(topk, (p+1)/ratio) 当该 query 的参考槽数 —— topk 是批级的上限, 取 min 之后
+ * 与纯解码在同一位置算出来的值逐个相同(ng ≥ 任一 query 的可见组数)。 */
+/* 出口头 W[V][D](fp4x32)的逐列平方和 → out[D]。草稿器对齐要按"出口度量"解, 见实现处的注释。 */
+/* DSpark 三塔的投影: 盘上是 FP8(E4M3 + 32×32 块缩放, 原件精度) —— 引擎按张量类型分发到这里。
+ * 为什么三塔不跟主干一起压 FP4: 压了草稿器就不准, 接受率直接塌(见 gguf-tools/bench/dspark_agree)。 */
+int ds4_gpu_v41_matmul_fp8blk_round_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+                                           uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+                                           const ds4_gpu_tensor *x, uint32_t n_tok, int round_out);
+int ds4_gpu_v41_grouped_matmul_fp8blk_tensor(ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
+                                             uint64_t weight_offset, uint32_t n_groups, uint64_t group_dim,
+                                             uint64_t rank, const ds4_gpu_tensor *heads, uint32_t n_tok, int round_out);
+int ds4_gpu_v41_head_colnorm_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+                                    uint64_t weight_offset, uint32_t n_vocab, uint32_t n_embd);
+/* graph 路开捕获前调一次: 解码张量核注意力的局部件暂存按段数上限长够(捕获态下不许分配) */
+int ds4_gpu_v41_attn_scratch_prepare(uint32_t n_head, uint32_t head_dim);
+/* posd / pos_cap(graph 路, 见上面"设备位置"口径): posd 非 NULL 时 pos0 = 图有效区间的起点、pos_cap = 终点(桶上限),
+ * 解码张量核版按整个区间取段数上限开 grid(段长随位置变、段数不单调, 得扫一遍), 合并核按真位置只读真段。
+ * 这条路只许走解码张量核版: 标量 split 版的段长在主机上按真键数算, 进不了图, 所以 posd 非 NULL 时张量核版不可用 = 失败。 */
 int ds4_gpu_v41_sparse_attn_tensor(ds4_gpu_tensor *o, const ds4_gpu_tensor *q, const ds4_gpu_tensor *kv_win,
                                    const ds4_gpu_tensor *kv_comp, const ds4_gpu_tensor *idx,
                                    const void *model_map, uint64_t model_size, uint64_t sink_offset,
                                    uint32_t n_tok, uint32_t pos0, uint32_t window, uint32_t ng, uint32_t topk,
-                                   uint32_t n_head, uint32_t head_dim, float scale, int full_block, int ring);
+                                   uint32_t ratio,
+                                   uint32_t n_head, uint32_t head_dim, float scale, int full_block, int ring,
+                                   const ds4_gpu_tensor *posd, uint32_t pos_cap);
 
 /* ★全局 KV 缓存的盘上尺寸(decode.md D1; 实现与所以然在 src/cuda/cuda_kv_pack.inc.cu)★
  * 这几个常量只有这一份 —— 缓存分配端(core_v41_forward.c)与核端(解包)都引它, 两边一旦各写各的
@@ -140,15 +186,20 @@ int ds4_gpu_v41_sparse_attn_tensor(ds4_gpu_tensor *o, const ds4_gpu_tensor *q, c
 #define DS4_V41_IDXK_BLK   32u
 #define DS4_V41_IDXK_NIB   64u
 #define DS4_V41_IDXK_BYTES 72u
-/* 已 rope 的 f32 行 → 量化并打包进缓存第 g0 组起(替掉原来的"act_quant 就地 + 整行拷贝"两发) */
-int ds4_gpu_v41_ckv_pack_tensor(ds4_gpu_tensor *cache, uint32_t g0, const ds4_gpu_tensor *rows, uint32_t n_rows);
-int ds4_gpu_v41_idxk_pack_tensor(ds4_gpu_tensor *cache, uint32_t g0, const ds4_gpu_tensor *rows, uint32_t n_rows);
+/* 已 rope 的 f32 行 → 量化并打包进缓存第 g0 组起(替掉原来的"act_quant 就地 + 整行拷贝"两发)。
+ * graph 路(posd 非 NULL, n_rows=1): 组号在核里按位置算 —— 凑满一组时 g0 = (pos+1)/ratio − 1, 没凑满时写进
+ * g_trash(缓存末尾多分配的一格垃圾槽, 永远没人读) ⇒ 这一发每步无条件进图, 拓扑与相位无关。 */
+int ds4_gpu_v41_ckv_pack_tensor(ds4_gpu_tensor *cache, uint32_t g0, const ds4_gpu_tensor *rows, uint32_t n_rows,
+                                const ds4_gpu_tensor *posd, uint32_t ratio, uint32_t g_trash);
+int ds4_gpu_v41_idxk_pack_tensor(ds4_gpu_tensor *cache, uint32_t g0, const ds4_gpu_tensor *rows, uint32_t n_rows,
+                                 const ds4_gpu_tensor *posd, uint32_t ratio, uint32_t g_trash);
 
 /* SWA 窗口环的维护(decode.md D1; 实现在 src/cuda/cuda_kv_ring.inc.cu, 那里写了每件事的所以然)。
  * commit: 本批 n 行(缓冲 [window, window+n))写进环; n>window 时只提交最后 window 行(等价)。
  * ring_snap: back=0 存下 commit 将要盖掉的格子, back=1 写回 —— 投机部分接受时只还原没被接受的那几行,
  *   i0 给"接受了几位", n 给这一批几位。snap 按批内行号存, 所以还原区间就是 [keep, n)。 */
-int ds4_gpu_v41_win_commit_tensor(ds4_gpu_tensor *win, uint32_t pos0, uint32_t n, uint32_t window, uint32_t head_dim);
+int ds4_gpu_v41_win_commit_tensor(ds4_gpu_tensor *win, uint32_t pos0, uint32_t n, uint32_t window, uint32_t head_dim,
+                                  const ds4_gpu_tensor *posd);   /* posd 非 NULL: 环格按设备位置算(graph 路) */
 int ds4_gpu_v41_win_ring_snap_tensor(ds4_gpu_tensor *win, ds4_gpu_tensor *snap, uint32_t pos0,
                                      uint32_t i0, uint32_t n, uint32_t window, uint32_t head_dim, int back);
 
@@ -162,14 +213,21 @@ int ds4_gpu_v41_router_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
 int ds4_gpu_v41_swiglu_tensor(ds4_gpu_tensor *h, const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up,
                               uint32_t n_tok, uint32_t mid, float limit);
 
+/* 解码小批的上限(≤ 它走融合 GEMV/VQ 即乘核, 大于它走预填 GEMM 路)。核侧 V41_GEMV_MAX_TOK 就是它; core 按它分岔 MoE 尾巴。 */
+#define DS4_V41_GEMV_MAX_TOK 8u
 /* routed MoE(VQ blob, 384 专家): out[n][d] = Σ_k w[n][k]·Expert_{sel[n][k]}(x[n]); 走 cuda_vq_moe_prefill_gemm
- * (按专家排序 + 逐专家 dequant f16 + cuBLAS GEMM)。blob 按模型文件偏移给, 设备指针由 range 表解析。 */
+ * (按专家排序 + 逐专家 dequant f16 + cuBLAS GEMM)。blob 按模型文件偏移给, 设备指针由 range 表解析。
+ * ★out == NULL(只许 n ≤ DS4_V41_GEMV_MAX_TOK)★: 不做最后那发按路由权重的归约, 专家部分和留在核侧暂存, 调用方算完 shared
+ * 专家后用 ds4_gpu_v41_moe_tail_tensor 一发做 y = bf16(Σ_k w·part + so) —— 取代 reduce/copy/add/round 四发(逐位同)。 */
 int ds4_gpu_v41_routed_moe_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
                                   uint64_t blob_offset, uint64_t blob_bytes,
                                   uint32_t in_dim, uint32_t mid_dim, uint32_t out_dim,
                                   const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
                                   uint32_t n_total_expert, uint32_t n_expert_used, float clamp,
                                   const ds4_gpu_tensor *x, uint32_t layer, uint32_t n_tok);
+
+int ds4_gpu_v41_moe_tail_tensor(ds4_gpu_tensor *y, const ds4_gpu_tensor *so, const ds4_gpu_tensor *weights,
+                                uint32_t n_tok, uint32_t n_used, uint32_t out_dim);
 
 /* f32 权重 GEMM(hc_fn / 压缩器 / 路由 gate_inp / indexer proj,wk / engram q,k): out[n][out_dim] = x·Wᵀ, 纯 f32 */
 int ds4_gpu_v41_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
@@ -226,6 +284,12 @@ int ds4_gpu_v41_set_gr_override(uint32_t layer, const float *host, uint32_t n_ex
 
 /* ---- DSpark 草稿塔(speed.md 段 6 D1; 实现在 src/cuda/cuda_v41_draft.inc.cu) ---- */
 
+/* ★一块最多几个草稿位(官方 5)★ —— 核与主机共用这一份。
+ * 核侧要它做"一个专家最多被块里几个位选中"的上限(按专家并集的分组表按它开宽);
+ * 主机侧要它开 host_ids/host_conf 那几个小数组。★两边各写一份迟早漂开, 而漂开的症状是
+ * 分组表越界写 —— 不报错, 只是把别的组的 pair 号覆盖掉, 草稿悄悄变垃圾。★ 真值仍读 GGUF 元数据。 */
+#define DS4_MTP_MAX_BLOCK 8u
+
 /* 逐专家 FP4 的 dense MoE: out[n][out_dim] = Σ_k w[n][k]·Expert_{sel[n][k]}(x[n])。
  * 与主路 routed MoE 的差别只在权重来源: 那边是一整个 VQ blob, 这边是 n_expert 个独立 fp4x32 张量,
  * 所以要一张偏移表 exp_off[3][n_expert](gate/up/down 各一段, 主机数组, 内部解析成设备指针并按塔缓存)。 */
@@ -244,6 +308,16 @@ int ds4_gpu_v41_hc_mean_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *hc, ui
 int ds4_gpu_v41_row_gather_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
                                   uint64_t tab_offset, uint64_t n_rows, uint32_t dim, uint32_t elem_bytes,
                                   const ds4_gpu_tensor *ids, uint32_t which, uint32_t out_row);
+
+/* ★判负存档: markov 头的"有界剪枝精确 argmax"(mtp-2.md §6 刀 2, 2026-09-17)★
+ * 逐位贪心每位要读整张 [129280][256] bf16 表(66 MB)算全词表偏置, 一轮 5 位 = 0.33 GB, 实测 1.33 ms
+ * 且**已经贴着带宽墙**(248 GB/s) ⇒ 只能少读字节。想用 |bias_v| ≤ ‖W_v‖·‖e‖ 把不可能夺冠的词剪掉,
+ * 只对候选精确算(候选集必含真 argmax, 不是近似)。写完实测: **候选 = 129280 / 129280, 一个都没剪掉**,
+ * 草稿反而从 13.2 涨到 15.9 ms。
+ * 真因: markov 表的行与 embed 近正交, 实际内积 |bias_v| 远小于 ‖W_v‖·‖e‖ —— Cauchy-Schwarz 在这里松到
+ * 比 logits 的**整个动态范围**还大, 于是每个词的上界都盖过冠军的下界。
+ * ⇒ 这条路对这个矩阵不成立。要省这 66 MB 只剩两条: 把表换成更低精度存(改 GGUF), 或者只对 logits 的
+ * top-K 算偏置(那是近似, 但草稿不改模型输出 ⇒ 允许) —— 而它只值一轮的 1.5%, 优先级排在验证批后面。 */
 
 /* dst 的第 dst_row 行(长 n) += src[0..n)(markov 偏置) */
 int ds4_gpu_v41_row_add_tensor(ds4_gpu_tensor *dst, uint64_t dst_row, const ds4_gpu_tensor *src, uint64_t n);

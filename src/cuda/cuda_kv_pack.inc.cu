@@ -22,8 +22,12 @@
  * mode: 0 = 主 KV(块 16, E4M3 缩放) / 1 = 索引 K(块 32, E8M0 缩放)。 */
 __global__ static void v41_kv_pack_kernel(uint8_t *cache, const float *rows, uint32_t g0,
                                           uint32_t dim, uint32_t blk, uint32_t row_bytes,
-                                          uint32_t nib_bytes, uint32_t nb_row, int mode) {
+                                          uint32_t nib_bytes, uint32_t nb_row, int mode,
+                                          const int32_t *posd, uint32_t ratio, uint32_t g_trash) {
     const uint32_t r = blockIdx.x / nb_row, b = blockIdx.x % nb_row, lane = threadIdx.x;
+    /* graph 路(ds4_gpu_v41.h "设备位置"口径): 组号按设备位置算 —— 凑满一组写第 (pos+1)/ratio−1 组,
+     * 没凑满写垃圾槽(缓存末尾多分配的一格, 永远没人读)。于是这一发每步无条件进图, 拓扑与相位无关。 */
+    if (posd) { const uint32_t pos = (uint32_t)posd[0]; g0 = ((pos + 1u) % ratio == 0u) ? (pos + 1u) / ratio - 1u : g_trash; }
     const float *p = rows + (uint64_t)r * dim + (uint64_t)b * blk;
     const float v = lane < blk ? p[lane] : 0.0f;
     float a = fabsf(v);
@@ -62,23 +66,32 @@ __device__ __forceinline__ static float v41_idxk_get(const uint8_t *row, uint32_
 
 /* rows[n][512](已 rope 的 latent, 还没量化) → 缓存第 g0 组起的 n 组, 量化+打包一发做完。
  * 原来是"act_quant 就地改 f32 → 整行拷进缓存"两发, 现在一发, 而且缓存小 7 倍。 */
-int ds4_gpu_v41_ckv_pack_tensor(ds4_gpu_tensor *cache, uint32_t g0, const ds4_gpu_tensor *rows, uint32_t n_rows) {
+/* graph 路的形状闸: 只收一行, 且垃圾槽也得在缓存里(组号是核里算的, 主机这里按上限查一次越界) */
+static int v41_kv_pack_check(const ds4_gpu_tensor *cache, uint32_t g0, uint32_t n_rows, const ds4_gpu_tensor *posd,
+                             uint32_t ratio, uint32_t g_trash, uint32_t row_bytes) {
+    if (!posd) return cache->bytes >= (uint64_t)(g0 + n_rows) * row_bytes;
+    if (n_rows != 1u || ratio == 0u) return 0;
+    return cache->bytes >= ((uint64_t)g_trash + 1u) * row_bytes;
+}
+int ds4_gpu_v41_ckv_pack_tensor(ds4_gpu_tensor *cache, uint32_t g0, const ds4_gpu_tensor *rows, uint32_t n_rows,
+                                const ds4_gpu_tensor *posd, uint32_t ratio, uint32_t g_trash) {
     if (!cache || !rows || !n_rows) return 0;
-    if (cache->bytes < (uint64_t)(g0 + n_rows) * DS4_V41_CKV_BYTES) return 0;
+    if (!v41_kv_pack_check(cache, g0, n_rows, posd, ratio, g_trash, DS4_V41_CKV_BYTES)) return 0;
     /* 维度从打包常量推出来(一个字节两个 nibble), 不引 DS4_N_* —— 那些宏在这个翻译单元里看不见 */
     const uint32_t dim = DS4_V41_CKV_NIB * 2u, nb = dim / DS4_V41_CKV_BLK;
     v41_kv_pack_kernel<<<(unsigned)((uint64_t)n_rows * nb), 32, 0, g_cur_stream>>>(
         (uint8_t *)cache->ptr, (const float *)rows->ptr, g0, dim, DS4_V41_CKV_BLK,
-        DS4_V41_CKV_BYTES, DS4_V41_CKV_NIB, nb, 0);
+        DS4_V41_CKV_BYTES, DS4_V41_CKV_NIB, nb, 0, posd ? (const int32_t *)posd->ptr : NULL, ratio, g_trash);
     return cuda_ok(cudaGetLastError(), "v41 ckv pack");
 }
-int ds4_gpu_v41_idxk_pack_tensor(ds4_gpu_tensor *cache, uint32_t g0, const ds4_gpu_tensor *rows, uint32_t n_rows) {
+int ds4_gpu_v41_idxk_pack_tensor(ds4_gpu_tensor *cache, uint32_t g0, const ds4_gpu_tensor *rows, uint32_t n_rows,
+                                 const ds4_gpu_tensor *posd, uint32_t ratio, uint32_t g_trash) {
     if (!cache || !rows || !n_rows) return 0;
-    if (cache->bytes < (uint64_t)(g0 + n_rows) * DS4_V41_IDXK_BYTES) return 0;
+    if (!v41_kv_pack_check(cache, g0, n_rows, posd, ratio, g_trash, DS4_V41_IDXK_BYTES)) return 0;
     const uint32_t dim = DS4_V41_IDXK_NIB * 2u, nb = dim / DS4_V41_IDXK_BLK;
     v41_kv_pack_kernel<<<(unsigned)((uint64_t)n_rows * nb), 32, 0, g_cur_stream>>>(
         (uint8_t *)cache->ptr, (const float *)rows->ptr, g0, dim, DS4_V41_IDXK_BLK,
-        DS4_V41_IDXK_BYTES, DS4_V41_IDXK_NIB, nb, 1);
+        DS4_V41_IDXK_BYTES, DS4_V41_IDXK_NIB, nb, 1, posd ? (const int32_t *)posd->ptr : NULL, ratio, g_trash);
     return cuda_ok(cudaGetLastError(), "v41 idxk pack");
 }
 

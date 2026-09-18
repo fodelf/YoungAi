@@ -15,6 +15,9 @@
  * 连同平面副本只值 4% 这件事一起说明: 这个核的大矩阵**已经贴着带宽墙**(wo_b 单发 22.3 MB/~110 µs),
  * 剩下的差距在小矩阵的固定开销上, 不在激活重读。 */
 #define V41_GEMV_WARPS 8u
+/* 验证批(n>1)的激活 bf16 暂存: n_tok × x_stride 个元素, 最大 8 × 32768 × 2 B = 512 KB。
+ * 与预填那份 g_v41_xbf 分开: 两条路的尺寸/生命周期不同, 共用迟早互相改大小。 */
+static v41_scratch g_v41_gemv_xb;
 /* ---- fp4x32 GEMV ----
  * grid (ceil(out_dim/(8/ksplit)), n_groups), block 256 = 8 warp; 同一行由 ksplit 个 warp 分 K 段(块号 ≡ kpart mod ksplit),
  * 各自 lane 取块内第 l 个元素(半字节 p[l/2] + 共用 scale p[16]; x 读 128 B 连续, 权重读同扇区), 段和经 shared 按固定序相加。
@@ -29,12 +32,30 @@
 /* PLANAR=1: 权重来自平面副本(nibble 一片 16 B/块 + scale 一片 1 B/块, 见 cuda_v41_fp4_planar.inc.cu),
  * 一个 warp 一轮读的 8 个块正好是 128 B 连续。PLANAR=0: 盘上的交错布局(17 B 跨距)。
  * 两条路的字节与配对完全相同 ⇒ 数值逐位同。 */
-template <uint32_t NT, uint32_t PLANAR>
-__global__ static void v41_fp4x32_gemv_kernel(float *out, const uint8_t *w, const uint8_t *wsc, const float *x, uint32_t in_dim, uint32_t out_dim,
+/* ★XB=1: 激活从 bf16 缓冲读(2026-09-16, mtp-1.md M2′ 第一刀)★
+ *
+ * 治的病(盘上实测): 同一份 4.4 GB 骨架权重, 验证批 NT=6 要 98.8 ms, 单 token NT=1 只要 21.4 ms ——
+ * **字节一个没多**(权重就读一遍), 慢 4.6 倍。投机解码的全部收益来源就是"骨架读一遍验 k 位",
+ * 这条一破, 接受率再高也赢不了(mtp-1.md §2)。
+ * 真因是**激活读的波前数**: L1 每周期只供一个波前(128 B)。一个 warp 一轮覆盖 8 个块 = 256 个权重,
+ * 每个 lane 要取 8 个 f32 = 32 B ⇒ 一条 float4 指令里 32 个 lane 铺开 1024 B = 8 个波前, 两条 16 个,
+ * 每多一个 token 就再多 16 个; 而权重侧一轮才 ~10 个。NT=6 ⇒ 96 + 10 = 106 个波前/轮。
+ * 激活存 bf16 后 8 个元素正好 16 B **连续**, 一条 uint4 拿完 ⇒ 32 个 lane 合 512 B = **4 个波前**,
+ * NT=6 降到 24 + 10 = 34 —— 与 09-16 给专家核动的那一刀是同一件事、同一个依据。
+ *
+ * ★逐位同★: 进这个核的激活本来就在 bf16 格点上(下面那段注释写死的前提), 转成 bf16 再补零还原是
+ * 恒等变换; 取的是同样 8 个值, 乘加次序一个字没变。所以 NT=1(读 f32)与 NT=6(读 bf16)算出来的
+ * 每一行必须逐位相同 —— 这正是投机"同轨"要的。
+ * ★出错会怎样★: 哪天上游忘了把激活舍到 bf16 格点, 这条路会**静默**丢掉低 16 位, 而 NT=1 那条不丢
+ * ⇒ 投机与纯解码的输出开始分叉, 看着像回滚 bug。真要查, 先看 x 是不是格点上的数。 */
+template <uint32_t NT, uint32_t PLANAR, uint32_t XB>
+__global__ static void v41_fp4x32_gemv_kernel(float *out, const uint8_t *w, const uint8_t *wsc, const float *x,
+                                              const __nv_bfloat16 *x16, uint32_t in_dim, uint32_t out_dim,
                                               uint32_t x_stride, uint32_t out_stride, uint32_t ksplit,
                                               uint64_t w_gstride, uint32_t x_gstride, uint32_t out_gstride, int round_out) {
     const uint32_t g = blockIdx.y;   /* 块对角(wo_a)的"第几组": 权重/输入/输出各按步长偏移 */
-    x += (uint64_t)g * x_gstride; out += (uint64_t)g * out_gstride;
+    if (XB) x16 += (uint64_t)g * x_gstride; else x += (uint64_t)g * x_gstride;
+    out += (uint64_t)g * out_gstride;
     if (PLANAR) { const uint64_t nb = (uint64_t)out_dim * (in_dim / 32u); w += (uint64_t)g * nb * 16u; wsc += (uint64_t)g * nb; }
     else w += (uint64_t)g * w_gstride;
     const uint32_t warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
@@ -109,7 +130,7 @@ __global__ static void v41_fp4x32_gemv_kernel(float *out, const uint8_t *w, cons
                     wv[2u * j]      = ds4_fp4_nibble_to_f32(byte & 0x0Fu) * sc;              \
                     wv[2u * j + 1u] = ds4_fp4_nibble_to_f32(byte >> 4) * sc;                 \
                 }                                                                            \
-                const float *xb = x + b * 32u + q * 8u;                                      \
+                const uint32_t xoff = b * 32u + q * 8u;                                      \
                 /* ★这里不再舍 bf16★: 进这个核的激活**已经在 bf16 格点上** —— rms_norm / hc_fused /  \
                  * swiglu / sparse_attn / 上一发 GEMV 的 round_out, 每一条产出 x 的路都在出口舍过。  \
                  * v41_bf16r 对已在格点的值是恒等(RNE 的不动点), 所以去掉它**数值逐位同**, 省的是    \
@@ -131,16 +152,33 @@ __global__ static void v41_fp4x32_gemv_kernel(float *out, const uint8_t *w, cons
                  * 循环轮数翻倍, 慢 9%; 这里 lane 分工一个字没动, 只换读法。 */                       \
                 _Pragma("unroll")                                                            \
                 for (uint32_t t = 0; t < NT; t++) {                                          \
-                    const float *xt = xb + (uint64_t)t * x_stride;                           \
-                    const float4 xa = *(const float4 *)xt, xc = *(const float4 *)(xt + 4u);  \
+                    /* ★两条路各写各的, 不共用中间数组★(2026-09-16 实撞): 本来写成"先填 float xv[8]     \
+                     * 再统一乘加", XB=0 那条应当被编译期折掉, 可实测纯解码慢 5%(20.14 → 19.03 t/s)  \
+                     * —— 这个核已经吃满 64 个寄存器, 多一个中间数组就改了整只核的寄存器分配。        \
+                     * 所以 XB=0 这一支逐字抄回改造前的样子, 新读法只走 XB=1。                        \
+                     * 两条路取的是同样 8 个值, 乘加次序一个字不差 ⇒ 仍然逐位同。 */                  \
+                    if (XB) {                                                                \
+                        const uint4 xw = *(const uint4 *)(x16 + (uint64_t)t * x_stride + xoff); \
+                        const float x0 = __uint_as_float(xw.x << 16), x1 = __uint_as_float(xw.x & 0xffff0000u); \
+                        const float x2 = __uint_as_float(xw.y << 16), x3 = __uint_as_float(xw.y & 0xffff0000u); \
+                        const float x4 = __uint_as_float(xw.z << 16), x5 = __uint_as_float(xw.z & 0xffff0000u); \
+                        const float x6 = __uint_as_float(xw.w << 16), x7 = __uint_as_float(xw.w & 0xffff0000u); \
+                        acc[t] += wv[0] * x0; acc[t] += wv[1] * x1;                           \
+                        acc[t] += wv[2] * x2; acc[t] += wv[3] * x3;                           \
+                        acc[t] += wv[4] * x4; acc[t] += wv[5] * x5;                           \
+                        acc[t] += wv[6] * x6; acc[t] += wv[7] * x7;                           \
+                    } else {                                                                 \
+                        const float *xt = x + (uint64_t)t * x_stride + xoff;                 \
+                        const float4 xa = *(const float4 *)xt, xc = *(const float4 *)(xt + 4u); \
                     /* ★必须写成八条独立的累加, 不能合成一个表达式★(2026-09-16 实撞):            \
                      * 合成一句 `acc += w0x0 + w1x1 + ... + w7x7` 时, --use_fast_math 允许编译器    \
                      * 把右边算成一棵加法树再并进 acc —— 累加次序就变了。实测输出在第 100 个字符    \
                      * 左右开始分叉, 而且**看着完全通顺**, 只有逐字节比才抓得到。 */               \
-                    acc[t] += wv[0] * xa.x; acc[t] += wv[1] * xa.y;                           \
-                    acc[t] += wv[2] * xa.z; acc[t] += wv[3] * xa.w;                           \
-                    acc[t] += wv[4] * xc.x; acc[t] += wv[5] * xc.y;                           \
-                    acc[t] += wv[6] * xc.z; acc[t] += wv[7] * xc.w;                           \
+                        acc[t] += wv[0] * xa.x; acc[t] += wv[1] * xa.y;                       \
+                        acc[t] += wv[2] * xa.z; acc[t] += wv[3] * xa.w;                       \
+                        acc[t] += wv[4] * xc.x; acc[t] += wv[5] * xc.y;                       \
+                        acc[t] += wv[6] * xc.z; acc[t] += wv[7] * xc.w;                       \
+                    }                                                                        \
                 }                                                                            \
             }                                                                                \
         } while (0)
@@ -184,8 +222,21 @@ static int v41_fp4x32_gemv(const void *model_map, uint64_t model_size, uint64_t 
     if (!w) return 0;
     /* ★平面副本(single.md §2.6 A 路)★: 盘上 17 B 跨距让每个块都不对齐(ncu: 24.92 扇区/请求);
      * 平面版一个 warp 一轮读的 8 个块是 128 B 连续。拿不到就照旧走交错, 不是必需品。
-     * n_groups>1(wo_a 的块对角)那条路暂不建副本 —— 它的分组偏移语义要另算, 收益也小。 */
-    const v41_fp4_planar pl = (n_groups == 1u)
+     * n_groups>1(wo_a 的块对角)那条路暂不建副本 —— 它的分组偏移语义要另算, 收益也小。
+     *
+     * ★2026-09-16 曾"只给纯解码(n_tok==1)建"(mtp-1.md M3′)★: 理由是副本要 3.5 GiB 只值 GEMV 的 4%,
+     * 而投机开着时每次前向都是批 ⇒ 这条路一次都不请求副本, 3.5 GiB 留给 DSpark 三塔(它有 3.28 GiB
+     * 挤不进设备、被 kswapd 反复回收, 塔核最大耗时是中位的 20 倍)。
+     * ★2026-09-17 判负存档: 让批也读平面副本(mtp-2.md A2 的事前实账)★
+     * mtp-2.md §5.6 把"n≥2 比 n=1 多 4.36 ms"归因为"批走交错布局", 据此设计了"设备缓存里原位按平面摆"
+     * 那一刀。先用一行改动验归因(副本本来就建着 —— 调度器判亏本歇着时走的就是 n=1 —— 所以让批也读它
+     * 是零额外成本)。实测四个场景全在噪声内: 2K 纯解码 20.19 vs 20.14 / 投机 18.66 vs 18.76;
+     * 12k 19.80 vs 19.74 / 20.09 vs 20.10。
+     * ⇒ **归因是错的**: 那 4.36 ms 不是布局, 是"每多一个 token 就多一份激活读 + 16 warp 形态"本身。
+     * 平面对 n>1 一毫秒都不值 ⇒ A2 的完整重排(要所有读 17 B 跨距的核一起改)不用做了。
+     * 副本仍然只给 n=1 建: 它对 n=1 值 4%(0.77 ms), 占 3.5 GiB; 换给三塔的话纯解码要亏 1.6%, 不划算。
+     * ★数值★: 平面与交错逐位同(同一批字节换个摆法, nibble 与 scale 的配对没动)。 */
+    const v41_fp4_planar pl = (n_groups == 1u && n_tok == 1u)
         ? v41_fp4_planar_get(model_map, model_size, off, in_dim, out_dim, what)
         : (v41_fp4_planar){ NULL, NULL };
     /* ★并行度目标: 2048(段 2 前) → 32768(段 2) → 8192(single.md S5, 09-16)★
@@ -206,24 +257,41 @@ static int v41_fp4x32_gemv(const void *model_map, uint64_t model_size, uint64_t 
      * 否则多出来的 warp 一轮都跑不到(in_dim=1280 只有 5 组, ksplit=8 时 8 个 warp 里 3 个是空转)。 */
     const uint32_t ngrp = (uint32_t)((in_dim / 32u + 7u) / 8u);
     while (ksplit > 1u && ksplit > ngrp) ksplit >>= 1;
+    /* ★验证批(NT>1)先把这一段激活转成 bf16★(mtp-1.md M2′): 核里每 lane 就能一条 uint4 拿 8 个元素,
+     * 波前数减半 —— 这是验证批 4.6× 那笔账的大头, 见核头的注释。
+     * 转换本身很便宜: n_tok × x_stride ≤ 8 × 32768 个元素, 一发几微秒, 而省下的是每层几毫秒。
+     * ★为什么按 x_stride 算而不是 in_dim★: 块对角(wo_a)那条路 x 的排法是 [token][组][group_dim],
+     * 组偏移 x_gstride < x_stride, 所以整段 n_tok × x_stride 覆盖全部组, 核里的下标算术一个字不用改。
+     * 解码(NT=1)不转: 那条路是**字节受限**的(3.82 GB / 21.4 ms = 178 GB/s = 墙的 74%), 波前不是瓶颈,
+     * 多一发转换反而是净亏。 */
+    const __nv_bfloat16 *x16 = NULL;
+    if (n_tok > 1u) {
+        const uint64_t xn = (uint64_t)n_tok * x_stride;
+        __nv_bfloat16 *xbuf = (__nv_bfloat16 *)v41_grow(&g_v41_gemv_xb, xn * sizeof(__nv_bfloat16), "v41 gemv x bf16");
+        if (!xbuf) return 0;   /* 不留回落路: 回落就是两条路算出不同的累加序, 同轨当场破 */
+        v41_x_to_bf16_kernel<<<(unsigned)((xn + 255) / 256), 256, 0, g_cur_stream>>>(xbuf, x, xn);
+        if (!cuda_ok(cudaGetLastError(), "v41 gemv x bf16")) return 0;
+        x16 = xbuf;
+    }
     /* 验证批(NT>1)一 block 开 16 warp: 激活重读减半(见核里的注释); 解码恒 8(那边 16 实测持平) */
     const uint32_t warps = (n_tok > 1u) ? 16u : V41_GEMV_WARPS;
     const uint32_t rpb = warps / ksplit;
     const dim3 grid((unsigned)((out_dim + rpb - 1u) / rpb), n_groups);
-    /* NT 是模板参数 ⇒ 按实际 token 数挑一份实例(解码恒走 NT=1 那份, 内层只有一条 FFMA) */
-    #define V41_GEMV_LAUNCH(NT) do {                                                                       \
-        if (pl.nib) v41_fp4x32_gemv_kernel<NT, 1u><<<grid, warps * 32u, 0, g_cur_stream>>>(         \
-            out, pl.nib, pl.sc, x, (uint32_t)in_dim, (uint32_t)out_dim, x_stride, out_stride, ksplit, wg,    \
-            x_gstride, out_gstride, round_out);                                            \
-        else v41_fp4x32_gemv_kernel<NT, 0u><<<grid, warps * 32u, 0, g_cur_stream>>>(                \
-            out, w, NULL, x, (uint32_t)in_dim, (uint32_t)out_dim, x_stride, out_stride, ksplit, wg,          \
-            x_gstride, out_gstride, round_out);                                            \
+    /* NT 是模板参数 ⇒ 按实际 token 数挑一份实例(解码恒走 NT=1 那份, 内层只有一条 FFMA)。
+     * XB 与 NT 绑死(NT=1 读 f32, NT>1 读 bf16), 省掉一半模板实例 —— 上面保证了 NT>1 时 x16 非空。 */
+    #define V41_GEMV_LAUNCH(NT, XB) do {                                                                   \
+        if (pl.nib) v41_fp4x32_gemv_kernel<NT, 1u, XB><<<grid, warps * 32u, 0, g_cur_stream>>>(             \
+            out, pl.nib, pl.sc, x, x16, (uint32_t)in_dim, (uint32_t)out_dim, x_stride, out_stride, ksplit, wg, \
+            x_gstride, out_gstride, round_out);                                                            \
+        else v41_fp4x32_gemv_kernel<NT, 0u, XB><<<grid, warps * 32u, 0, g_cur_stream>>>(                    \
+            out, w, NULL, x, x16, (uint32_t)in_dim, (uint32_t)out_dim, x_stride, out_stride, ksplit, wg,    \
+            x_gstride, out_gstride, round_out);                                                            \
     } while (0)
     switch (n_tok) {
-        case 1: V41_GEMV_LAUNCH(1u); break;  case 2: V41_GEMV_LAUNCH(2u); break;
-        case 3: V41_GEMV_LAUNCH(3u); break;  case 4: V41_GEMV_LAUNCH(4u); break;
-        case 5: V41_GEMV_LAUNCH(5u); break;  case 6: V41_GEMV_LAUNCH(6u); break;
-        case 7: V41_GEMV_LAUNCH(7u); break;  default: V41_GEMV_LAUNCH(8u); break;
+        case 1: V41_GEMV_LAUNCH(1u, 0u); break;  case 2: V41_GEMV_LAUNCH(2u, 1u); break;
+        case 3: V41_GEMV_LAUNCH(3u, 1u); break;  case 4: V41_GEMV_LAUNCH(4u, 1u); break;
+        case 5: V41_GEMV_LAUNCH(5u, 1u); break;  case 6: V41_GEMV_LAUNCH(6u, 1u); break;
+        case 7: V41_GEMV_LAUNCH(7u, 1u); break;  default: V41_GEMV_LAUNCH(8u, 1u); break;
     }
     #undef V41_GEMV_LAUNCH
     return cuda_ok(cudaGetLastError(), what);

@@ -78,6 +78,26 @@ int ds4_engine_v41_dspark_capture(ds4_engine *e, const int *ids, int n_ids, cons
         /* ★这一行就是 M6 的判决基线★: 草稿器首位 ↔ 部署底座 argmax 的一致率。
          * 它与在线生成时 spec 账里的 p1 应当同量级 —— 差很多就说明取料与部署不同路, 先别解。 */
         fprintf(stderr, "[dcap] ★草稿器首位 ↔ 底座 argmax 一致率 = %.4f (n=%u)★\n", (double)hit / (double)(nw ? nw : 1), nw);
+        /* ★顺带把出口度量也取走(mtp-1.md M6′)★: 解算侧要按"头怎么看这个维度"加权, 而不是按隐态的
+         * 欧氏距离 —— 09-16 那次判负(留出一致率不升反降)的真因就是这个度量选错了。
+         * 落成 <out>.hdiag(D 个 f32 = 每一列的平方和)。写不出来只警告不停车: 老口径(纯 L2)还能解。 */
+        {
+            ds4_gpu_tensor *cn = ds4_gpu_tensor_alloc((uint64_t)D * 4);
+            float *hd = xmalloc((size_t)D * 4);
+            char p2[4400];
+            snprintf(p2, sizeof p2, "%s.hdiag", out_path);
+            if (cn && ds4_gpu_v41_head_colnorm_tensor(cn, e->model.map, e->model.size,
+                                                      e->weights.output->abs_offset, DS4_N_VOCAB, D) &&
+                ds4_gpu_synchronize() && ds4_gpu_tensor_read(cn, 0, hd, (uint64_t)D * 4)) {
+                FILE *f2 = fopen(p2, "wb");
+                if (f2) {
+                    if (fwrite(hd, 4, D, f2) == D) fprintf(stderr, "[dcap] 出口度量落盘 %s (%u 列平方和)\n", p2, D);
+                    fclose(f2);
+                }
+            } else fprintf(stderr, "ds4: ★出口度量没取到, 解算只能走纯 L2(那条 09-16 判过负)★\n");
+            if (cn) ds4_gpu_tensor_free(cn);
+            free(hd);
+        }
         rc = 0;
     } while (0);
     if (fo) fclose(fo);

@@ -253,7 +253,7 @@ int ds4_gpu_decode_readback_wait(void) {
 }
 void *ds4_gpu_host_alloc(uint64_t bytes) {
     void *p = NULL;
-    if (cudaHostAlloc(&p, (size_t)bytes, cudaHostAllocDefault) != cudaSuccess) { (void)cudaGetLastError(); return NULL; }
+    if (cudaHostAlloc(&p, (size_t)bytes, cudaHostAllocMapped) != cudaSuccess) { (void)cudaGetLastError(); return NULL; }
     return p;
 }
 void ds4_gpu_host_free(void *p) { if (p) (void)cudaFreeHost(p); }

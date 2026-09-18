@@ -118,15 +118,64 @@ __global__ static void v41_sparse_attn_split_kernel(float *pacc, float *pmax, fl
     }
 }
 
+/* ★解码张量核版的段长(正本; 2026-09-18 从 cuda_v41_attn_mma_decode.inc.cu 挪到这里, 合并核也要用它)★
+ * ★段长只许由"与批大小无关的参考键数"定(2026-09-16, mtp-1.md M1′)★
+ *
+ * 为什么必须是常数: 分段决定在线 softmax 的分组, 分组变 ⇒ 累加序变 ⇒ 近平局的 token 会翻面。
+ * 原来是"把键平分成 24/n_tok 段", 于是同一个位置的同一个 query, 纯解码(n=1)切 20 段、
+ * 投机验证批(n=4)切 10 段 —— **两条路算出来的 logits 不一样**, 温 0 下投机与纯解码第二句就分叉
+ * (mtp-1.md §4 的盘上证据: 同一份 2K 提示, 纯解码说 "truncated README", 投机说 "native inference engine")。
+ * 而投机的全部合法性就建立在"它只省时间、不改输出"上。
+ *
+ * ★写死一个常数不行, 三档都比改造前慢★(同机器状态纯解码 t/s, 基线 2K 20.00 / 12k 19.87):
+ *   写死 32 → 2K 19.16 / 12k 18.95; 写死 16 → 2K 18.61。
+ * 原因: 这个模型的层分两类 —— 压缩比大的层可见键只有一百多个, 要 16 才切得出足够的 block 铺满 SM;
+ * 键多的层(2K ≈588、12k 640)要 32, 段再短就是白把 16 个头的 q(32 KB/block)重载一遍 + 合并核多几段要加。
+ * 改造前那个自适应公式(平分 24 段 + 取到 16 的倍数 + 上限 64)恰好就给出这两个值, 它本身是对的;
+ * 错的只是**喂给它的键数是一个两条路不一样的量**。
+ * ⇒ 正解: 公式原样保留, 改喂"按**这个 query 自己的绝对位置**算出来的参考键数" ——
+ * 于是纯解码的分段与改造前逐个相同(对基线逐字节), 验证批里每个 query 又与纯解码在同一位置时同段。
+ * ★"按本批第一个 query 算"也不行★(实撞, 2K 第 270 字节分叉): 批里第 2..k 个 query 就用了别人的段长。
+ * ★空槽是精确中性的★: 分数压 -inf ⇒ p=0; 整段空时 max=-1e30/acc=0, 合并核里乘 exp(-1e30-m)=0,
+ * 所以"验证批多几个空槽、多一段"不影响结果 —— 只要它不去改段长。 */
+#define V41_ATTN_MMA_DEC_TARGET_SEG 24u   /* 目标段数(照抄改造前的公式; 24 段 × 4 头组 ≈ 96 block) */
+/* 某个 query 的段长: 只由它**自己的绝对位置** p 决定(外加层常量 window/ratio 与批级上限 topk)。
+ * 主机与核里都调它 —— 两处各写一份迟早漂开, 而漂开的症状是"投机偶尔与纯解码差一个 token"。
+ * topk 是批级的槽数上限: 取 min 之后, 纯解码在位置 p 算出来的与验证批里那个 p 算出来的逐个相同
+ * (ng ≥ 任何一个 query 的可见组数, 所以 min 的结果由 (p+1)/ratio 决定)。 */
+__host__ __device__ __forceinline__ static uint32_t v41_attn_seg_keys(uint32_t p, uint32_t window,
+                                                                     uint32_t ratio, uint32_t topk) {
+    const uint32_t nwin = p + 1u > window ? window : p + 1u;
+    uint32_t tref = 0;
+    if (ratio) { const uint32_t vis = (p + 1u) / ratio; tref = topk < vis ? topk : vis; }
+    uint32_t seg = (nwin + tref + V41_ATTN_MMA_DEC_TARGET_SEG - 1u) / V41_ATTN_MMA_DEC_TARGET_SEG;
+    seg = ((seg + DS4_ATTN_MMA_KT - 1u) / DS4_ATTN_MMA_KT) * DS4_ATTN_MMA_KT;
+    if (seg < DS4_ATTN_MMA_KT) seg = DS4_ATTN_MMA_KT;
+    return seg > 64u ? 64u : seg;
+}
+/* 位置 p 的解码 query 有几段(= 主机直发路给 grid 的段数; graph 路的合并核按设备位置自算同一个数)。
+ * topk 给批级上限(index_topk), 里面取 min(topk, 可见组数) —— 与直发路主机传 min(index_topk, ng) 再算逐个相同。 */
+__host__ __device__ __forceinline__ static uint32_t v41_attn_nseg_at(uint32_t p, uint32_t window, uint32_t ratio, uint32_t topk) {
+    const uint32_t nw = p + 1u > window ? window : p + 1u;
+    uint32_t tk = topk;
+    if (ratio) { const uint32_t vis = (p + 1u) / ratio; if (vis < tk) tk = vis; }
+    const uint32_t sk = v41_attn_seg_keys(p, window, ratio, topk);
+    return (nw + tk + sk - 1u) / sk;
+}
+
 /* 合并: 一 block 一个头, 按**段号固定序**做 flash 合并(不是原子加 —— 那会让同一输入两跑结果不同),
  * 再加 sink 进分母、除、舍 bf16。o[head][hd] */
 /* ★2026-09-16: 加 token 维(grid.y), 给投机验证批的张量核版用(decode.md D2 / mtp.md M2)★
  * 局部件的排法是 [(token·nseg + 段)·头 + h]; n_tok=1 时就是原来的 [段·头 + h], 一个字节没挪 ——
  * 所以 split 那条路(恒 n_tok=1)的行为完全不变, 只是多传一个 grid.y=1。 */
+/* ★posd(graph 路, 2026-09-18)★: nseg 传的是桶上限(grid 按它开), 真段数按设备位置自算 —— 只读真段。
+ * 与直发路逐位同: 直发路的段数就是 v41_attn_nseg_at(p) 那个数, 多出来的段本来就不存在, 少读它们不改任何加法。 */
 __global__ static void v41_sparse_attn_merge_kernel(float *o, const float *pacc, const float *pmax, const float *psum,
-                                                    const float *sink, uint32_t nseg, uint32_t n_head, uint32_t hd) {
+                                                    const float *sink, uint32_t nseg, uint32_t n_head, uint32_t hd,
+                                                    const int32_t *posd, uint32_t window, uint32_t ratio, uint32_t topk) {
     const uint32_t h = blockIdx.x, i = blockIdx.y;
-    const uint64_t b0 = (uint64_t)i * nseg * n_head;
+    const uint64_t b0 = (uint64_t)i * nseg * n_head;   /* 局部件的行步长按 grid 的 nseg(上限)排 */
+    if (posd) nseg = v41_attn_nseg_at((uint32_t)posd[0], window, ratio, topk);
     float m = -1e30f;
     for (uint32_t s = 0; s < nseg; s++) m = fmaxf(m, pmax[b0 + (uint64_t)s * n_head + h]);
     float den = 0.f;
@@ -166,6 +215,7 @@ static int v41_sparse_attn_split(float *o, const float *q, const float *kvw, con
     v41_sparse_attn_split_kernel<<<dim3(nseg, n_head / V41_ATTN_HEADS_PER_BLOCK), V41_ATTN_HEADS_PER_BLOCK * 16u, 0, g_cur_stream>>>(
         pacc, pmax, psum, q, kvw, kvc, idx, pos0, window, ng, topk, n_head, hd, scale, seg_keys);
     if (!cuda_ok(cudaGetLastError(), "v41 sparse attn split")) return 0;
-    v41_sparse_attn_merge_kernel<<<dim3(n_head, 1), 256, 0, g_cur_stream>>>(o, pacc, pmax, psum, sink, nseg, n_head, hd);
+    v41_sparse_attn_merge_kernel<<<dim3(n_head, 1), 256, 0, g_cur_stream>>>(o, pacc, pmax, psum, sink, nseg, n_head, hd,
+                                                                            NULL, window, 0u, topk);
     return cuda_ok(cudaGetLastError(), "v41 sparse attn merge");
 }
