@@ -32,16 +32,19 @@ cd "$(dirname "$0")/.." || exit 1
 
 NGEN="${1:-32}"
 DO_NSYS="${2:-yes}"
+# ★第 9 个参数: 换二进制★(2026-09-16) —— 判"这一刀让哪个核变快/变慢"必须同机器状态两个二进制各跑一遍,
+# 跨会话的 t/s 不可比(memory: 换 GGUF/换会话 = 换机器状态)。默认 ds4, 给 ds4.base 就是量改造前那份。
+BIN="${9:-ds4}"
 MODEL="${3:-gguf/v41/DeepSeek-V4.1-Flash-vq8x4096-fp4.gguf}"
 PSRC="${4:-}"
 PCHARS="${5:-40000}"
 AMP=gguf/v41/gr-fin-40-fp4
-OUT=/tmp/d0a-decode
+OUT=/tmp/d0a-decode-${BIN}
 PROMPT="你好世界"     # 3 token: 预填几乎不占时间, 采到的基本全是解码
 
 mkdir -p "$OUT"
 [ -f "$MODEL" ] || { echo "★没有模型 $MODEL★"; exit 1; }
-[ -x ./ds4 ]    || { echo "★没有 ./ds4, 先 make cuda-spark★"; exit 1; }
+[ -x "./$BIN" ] || { echo "★没有 ./$BIN, 先 make cuda-spark★"; exit 1; }
 
 # 提示: 默认短提示走 -p; 给了文件就截 PCHARS 字符走 --prompt-file(与 prefill_ttft_ruler.sh 同一口径)
 PARG=(-p "$PROMPT")
@@ -51,14 +54,40 @@ if [ -n "$PSRC" ]; then
   PARG=(--ctx 32768 --prompt-file "$OUT/prompt.txt")
   echo "== 长提示模式: $PSRC 前 $PCHARS 字符"
 fi
-# ★--no-dspark 必须显式传★(2026-09-16): 投机解码的默认值是**开**(cli_diag.c: set_dspark(!no_dspark)),
-# 带三塔的 GGUF 一喂进来就走投机路, 而这把尺量的是"纯单 token 解码每步多少毫秒"。不传的话换个文件
-# 就悄悄量成另一条路, 数字还长得挺像 —— 历史上 single.md §5 就把这个默认值写反了。
+# ★仍然显式传 --no-dspark★: 投机的默认值 2026-09-16 已改成**关**(见 core_v41_api.c 那段注释),
+# 但这把尺量的是"纯单 token 解码每步多少毫秒", 把它写死在命令行里, 以后默认值再变也量不错。
+# 历史上 single.md §5 就把这个默认值写反了, 换个带三塔的文件就悄悄量成另一条路, 数字还长得挺像。
+#
+# ★第二个参数给 spec = 量投机路★(2026-09-16, mtp-1.md M0′(a)): nsys 照采, 但开 --dspark。
+# 为什么要它: 投机一轮的成本得拆到核上才知道是"草稿器贵"还是"验证批的核形态贵" ——
+# 之前这张表只能手工从 nsys 的 kern_sum 里扒, 而 kern_sum 把预填的核混在一起, 判不了。
+# 读法: 表里 `<(unsigned int)6>` 这类模板实参就是验证批的 token 数, `<(unsigned int)1>` 是纯解码;
+# 同一个核两份实例的 ms/step 一比, 就是"验证 k 位比验证 1 位贵几倍"——投机赢不赢全看这个数。
+#
+# ★第二个参数给 specno = 走投机路但不采 nsys★(2026-09-17, mtp-2.md M0): 只要引擎自己的探针
+# (f16 范围看门狗 / moe-uniq / mtp-uniq / 一轮分账)时用它, 秒级出数, 不用等 nsys 采样与导出。
+# ★第 10 个参数: 钉死验证几位(2026-09-17)★ 0 = 交给置信调度器。
+# 为什么非要它: 调度器的成本常量是**编译期**量好的(core_draft_sched.c), 一旦核变快而常量还是旧的,
+# 它会一律判"投机亏本"、一轮草稿都不出 —— 于是这把尺量不到任何验证批, 表里只有 n=1 那一档,
+# 而"验证多一位多付多少"正是投机赢不赢的全部。实撞过一次: 新核落地后 40 个 token 里 0 轮草稿。
+VERIFY_K="${10:-0}"
+# ★第 12 个参数: 透传给引擎的额外参数★(2026-09-18): 例 "--no-graph" —— 解码整步 CUDA graph 的 A/B 必须是**同一个二进制**
+# 两种发法(图 vs 直发), 换二进制比的是别的东西。多个参数用空格隔开。
+EXTRA_ARGS=(${12:-})
 SPEC=(--no-dspark)
+IS_SPEC=0
+if [ "$DO_NSYS" = spec ] || [ "$DO_NSYS" = specno ]; then
+  SPEC=(--dspark); IS_SPEC=1
+  [ "$VERIFY_K" != 0 ] && SPEC+=(--dspark-verify "$VERIFY_K")
+  if [ "$DO_NSYS" = spec ]; then DO_NSYS=yes; else DO_NSYS=no; fi
+  echo "== ★投机路(--dspark)★ 读表注意两件事:"
+  echo "   ①一轮 = **两个 step**(草稿块一发 embed + 验证批一发 embed), 表里的 ms/step × 2 才是一轮;"
+  echo "   ②'步的总毫秒'那一行是每次前向, 不是每 token —— 每 token 看引擎自己打的'一轮 … ⇒ ms/token'。"
+fi
 
 echo "== ① 引擎逐层毫秒(--v41-prof, 生成 $NGEN token)"
-./ds4 -m "$MODEL" --zchain "$AMP" --v41-prof --temp 0 --seed 1 -n "$NGEN" \
-      "${SPEC[@]}" "${PARG[@]}" > "$OUT/prof.out" 2> "$OUT/prof.err"
+./"$BIN" -m "$MODEL" --zchain "$AMP" --v41-prof --temp 0 --seed 1 -n "$NGEN" \
+      "${SPEC[@]}" "${EXTRA_ARGS[@]}" "${PARG[@]}" > "$OUT/prof.out" 2> "$OUT/prof.err"
 grep -a "总 .* | 层(ms)" "$OUT/prof.err" | tail -3
 # ★为什么判决取中位不取平均★(2026-09-15 撞的): spark 上 110 GB 模型 mmap 在 121 GB 机器里,
 # kswapd/kcompactd 一直在回收页, 每轮总有几步被拖到 110 ms 以上。平均值被这些离群步拖着走,
@@ -71,6 +100,18 @@ grep -ao "总 [0-9.]* ms" "$OUT/prof.err" | grep -o "[0-9.]*" | tail -n "$NGEN" 
            printf "  步数 %d  ★中位 %.1f ms (= %.2f t/s)★  平均 %.1f  最小 %.1f  最大 %.1f\n",
                   n, md, 1000/md, s/n, mn, mx}'
 
+[ "$IS_SPEC" = 1 ] && grep -a -h "DSpark:\|一轮 " "$OUT/prof.err" | sed 's/^/  /'
+# ★引擎自带的三个探针(2026-09-17 mtp-2.md M0)★ 它们只在 --v41-prof 下出数, 都是"判下一刀该不该动"的依据:
+#   [f16-range] 激活/中间量有没有超出 f16 的指数范围 ⇒ 定专家核张量核版走 f16 还是 TF32(mtp-2 §5.3)
+#   [moe-uniq]  主干验证批的唯一专家数 ⇒ 验证多一位要多付多少专家字节(mtp-2 §2.2)
+#   [mtp-uniq]  草稿塔的唯一专家数 ⇒ 塔专家并集那一刀值不值(mtp-2 §6.1)
+grep -a -h "\[f16-range\]" "$OUT/prof.err" | tail -2 | sed 's/^/  /'
+for tag in moe-uniq mtp-uniq; do
+  grep -a -h "\[$tag\]" "$OUT/prof.err" | sed 's/.*n=\([0-9]*\).*唯一专家 \([0-9]*\) \/ \([0-9]*\).*/\1 \2 \3/' | \
+    awk -v t="$tag" '{u[$1]+=$2; s[$1]+=$3; c[$1]++}
+      END {for (n in c) printf "  [%s] n=%s: 唯一专家 %.2f / %d  (每 token %.2f 份, %d 层样本)\n",
+                               t, n, u[n]/c[n], s[n]/c[n], (u[n]/c[n])/n, c[n]}' | sort
+done
 echo
 echo "-- 生成的文本(温 0; 换核后拿它和上一版对, 变了就是数值动了)"
 tail -c 400 "$OUT/prof.out"
@@ -97,18 +138,35 @@ if [ "$DO_NSYS" = ncu ]; then
   M1=l1tex__data_pipe_lsu_wavefronts.sum,l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum,l1tex__average_t_sectors_per_request_pipe_lsu_mem_global_op_ld.ratio
   # 第二趟: warp 停在哪(long_scoreboard = 等全局访存返回; mio/lg_throttle = 访存指令发不出去 = 管道塞住)
   M2=smsp__average_warps_issue_stalled_long_scoreboard_per_issue_active.ratio,smsp__average_warps_issue_stalled_mio_throttle_per_issue_active.ratio,smsp__average_warps_issue_stalled_lg_throttle_per_issue_active.ratio
-  for pass in 1 2; do
+  # ★第三趟(2026-09-17 mtp-2.md §2.1)★: 这一发到底在忙什么 —— 发射槽用了几成、**指令总数**、各管道饱和度、
+  # shared 查表的波前与 bank 冲突。为什么非要它: 前两趟只说"warp 停在等内存", 判不了"多一个 token 多付多少";
+  # 指令数才是那个量。实测 n=5 验证批的指令数 = n=1 的 **5.00 倍(精确)**, 于是"按专家去重省字节"那条路
+  # 从机理上就走不通(省的是读几遍, 省不掉每 token 都要乘一遍) —— 这一趟就是那个判决的来源。
+  # 用法: 同一个核在 n=1(--no-dspark)与 n>1(第二参给 spec/specno)各跑一遍, 两张表一比就是边际成本的构成。
+  M3=smsp__issue_active.avg.pct_of_peak_sustained_active,smsp__inst_executed.sum,sm__inst_executed_pipe_fma.avg.pct_of_peak_sustained_active,sm__inst_executed_pipe_lsu.avg.pct_of_peak_sustained_active,l1tex__throughput.avg.pct_of_peak_sustained_active,sm__warps_active.avg.pct_of_peak_sustained_active,l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum,l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum,gpu__time_duration.sum
+  # ★第四趟(2026-09-18)★: 其余停等原因。第二趟只问 long_scoreboard/mio/lg 三种, 位流整块读落地后 long_scoreboard
+  # 仍 17~18, 可它已经解释不了时间 —— 得看 short_scoreboard(等 shared/shfl)、barrier(等 __syncthreads)、
+  # not_selected(有活但没轮到)、wait(固定延迟)、math_pipe 各占多少, 才知道下一刀砍哪。
+  # ★第 11 个参数: 跑哪几趟★(默认 "1 2 3"; 例 "2 4" 只问停等原因, 少装两次模型)。
+  M4=smsp__average_warps_issue_stalled_short_scoreboard_per_issue_active.ratio,smsp__average_warps_issue_stalled_barrier_per_issue_active.ratio,smsp__average_warps_issue_stalled_not_selected_per_issue_active.ratio,smsp__average_warps_issue_stalled_wait_per_issue_active.ratio,smsp__average_warps_issue_stalled_math_pipe_throttle_per_issue_active.ratio,smsp__average_warps_issue_stalled_no_instruction_per_issue_active.ratio,smsp__average_warps_issue_stalled_dispatch_stall_per_issue_active.ratio,smsp__average_warps_issue_stalled_selected_per_issue_active.ratio
+  # ★第五趟(2026-09-18)★: 命中率。位流整块读 + 跨块流水之后 long_scoreboard 仍 14~17, 热路上剩下的全局读只有每轮一条
+  # 激活 LDG.128(应是 L1 命中)—— 若 L1 命中率低, 就是位流流过 L1 把激活挤掉了, 激活得搬进 shared。
+  M5=l1tex__t_sector_hit_rate.pct,lts__t_sector_hit_rate.pct,lts__t_sectors_srcunit_tex_op_read.sum,l1tex__t_sectors_pipe_lsu_mem_global_op_ld_lookup_miss.sum
+  PASSES="${11:-1 2 3}"
+  for pass in $PASSES; do
     eval "MM=\$M$pass"
     echo "== ② ncu 第 $pass 趟: $MM"
-    "$NCU" --replay-mode application --target-processes all -k "$KREGEX" \
+    # ★--clock-control none★: 别锁时钟。这台板子锁不了(统一内存 + 没有 root), 不传它 ncu 每趟都先
+    # 试着锁一遍再警告, 白等; 而判决本来就是同机器状态两个二进制各两遍取中位, 不靠锁时钟。
+    "$NCU" --replay-mode application --clock-control none --target-processes all -k "$KREGEX" \
       --launch-skip "$NSKIP" --launch-count "$NLAUNCH" --metrics "$MM" --csv \
-      ./ds4 -m "$MODEL" --zchain "$AMP" --temp 0 --seed 1 -n 8 "${SPEC[@]}" "${PARG[@]}" \
+      ./"$BIN" -m "$MODEL" --zchain "$AMP" --temp 0 --seed 1 -n 8 "${SPEC[@]}" "${EXTRA_ARGS[@]}" "${PARG[@]}" \
       > "$OUT/ncu$pass.csv" 2> "$OUT/ncu$pass.err"
     grep -a "^\"" "$OUT/ncu$pass.csv" | head -40 || tail -20 "$OUT/ncu$pass.err"
   done
   echo "== ③ SASS: 内层到底发了几条访存指令(注释里那句'一条非对齐 32 位读'是假设, 这里验它)"
   CUOBJ=$(command -v cuobjdump || echo /usr/local/cuda/bin/cuobjdump)
-  "$CUOBJ" -sass ./ds4 > "$OUT/sass.txt" 2>/dev/null
+  "$CUOBJ" -sass "./$BIN" > "$OUT/sass.txt" 2>/dev/null
   for k in v41_vq_row_dot v41_vq_gateup_kernel v41_fp4x32_gemv_kernel; do
     echo "-- $k 的访存指令直方图(LDG/LDS/LD 各几条)"
     awk -v k="$k" '/^\t\tFunction : / {inf = ($0 ~ k)} inf && /LDG|LDS|LD\./ {n=$0; sub(/^ *\/\*[0-9a-f]*\*\/ */,"",n); split(n,a," "); print a[1]}' \
@@ -118,11 +176,18 @@ if [ "$DO_NSYS" = ncu ]; then
 fi
 
 [ "$DO_NSYS" = yes ] || { echo "== ② nsys: 按参数跳过"; exit 0; }
+# ★等 ① 段的进程真退干净再开 ②★(2026-09-17 实撞): 引擎有意留着单实例锁, 而 110 GB 的映射卸载要几秒 ——
+# ① 段的 shell 已经返回, 内核还在收页。不等就是 ② 段直接
+# "another ds4 process is already running; refusing to start", 而 nsys 照样采样、照样导出,
+# 只是 sqlite 里**一个 CUDA 核都没有** ⇒ 后面三张表全空, 日志里却只有一行 SKIPPED, 很容易当成"表没出来"。
+for _ in $(seq 1 60); do pgrep -f "[d]s4 -m gguf" >/dev/null || break; sleep 2; done
 echo "== ② nsys 采样"
 command -v nsys >/dev/null || { echo "★没有 nsys, ② 跳过★"; exit 0; }
 rm -f "$OUT/dec.nsys-rep" "$OUT/dec.sqlite"
-nsys profile -o "$OUT/dec" --force-overwrite true -t cuda \
-  ./ds4 -m "$MODEL" --zchain "$AMP" --temp 0 --seed 1 -n "$NGEN" "${SPEC[@]}" "${PARG[@]}" \
+# ★--cuda-graph-trace=node★(2026-09-18 实撞): 默认按整张 graph 记一行, 图里的核一个都看不见 —— 解码整步 graph 落地后
+# ③ 那张逐步表把 32 个解码步全算成一步、逐核合计里只剩预填的核。按节点记, 图里的核与直发的同名同列。
+nsys profile -o "$OUT/dec" --force-overwrite true -t cuda --cuda-graph-trace=node \
+  ./"$BIN" -m "$MODEL" --zchain "$AMP" --temp 0 --seed 1 -n "$NGEN" "${SPEC[@]}" "${EXTRA_ARGS[@]}" "${PARG[@]}" \
   > "$OUT/nsys.out" 2> "$OUT/nsys.err"
 
 # ★删 sqlite 要在**第一条 nsys stats 之前**★(2026-09-16 实撞): 原来只在 ③ 前面删, 于是 ②
@@ -193,3 +258,36 @@ END {
   s=step-1; printf "\ngateup 第 %d 步逐层(us):", s; for(g=1;g<=gi[s];g++) printf " %d", gd[s,g]/1000; printf "\n";
   printf "down   第 %d 步逐层(us):", s; for(d=1;d<=di[s];d++) printf " %d", dd[s,d]/1000; printf "\n";
 }' "$OUT/trace_cuda_gpu_trace.csv"
+
+# ④ 按"步的类型"分类的逐核表(2026-09-17 mtp-2.md §1.2)。
+# 为什么非要它: 投机一轮里有三种完全不同的步(草稿块 / 验证批 / 预填), 而 ③ 那张逐步表和 nsys 自带的
+# kern_sum 都把它们混在一起 —— 于是**判不了"验证多一位多付多少"**, 而那个数就是投机赢不赢的全部。
+# 分类办法: 每步按"出现了哪些核"认 —— 有 mtp_ 核的是草稿步; 有 nvfp4/cutlass 的是预填块;
+# 其余按骨架 GEMV 的**模板实参**(= 这一批几个 token)分成 verify_n1(纯解码) / verify_n2 / …
+# 读法: 同一个核在 verify_n1 与 verify_n3 两列的差 ÷ 2 = 每多一位的边际; 草稿步那一列是草稿器的全部账。
+echo
+echo "== ④ 按步类型分类的逐核表(草稿 / 验证 n= / 预填)"
+awk -F, '
+NR>1 { st=$1+0; du=$2+0; nm=$21; gsub(/"/,"",nm); sub(/^ *void /,"",nm);
+  if (nm ~ /v41_embed_kernel/) { step++; sstart[step]=st; }
+  if (step>0) { key=nm; base=key; sub(/[(<].*/,"",base);
+     # ★NT 要从**整行**匹配, 不能从 $21★(2026-09-17 实撞): 核名里有逗号, -F, 把它切成好几列,
+     # 列数还随核名长短变 ⇒ $21 有时不含 "<", 于是 ntstep 保留上一步的值, 把同一种 5 行验证步
+     # 标成了 n1/n2/n3/n4/n5 五档(看着像"边际随批长", 其实是同一个量的五次采样)。
+     if ($0 ~ /fp4x32_gemv_kernel<\(unsigned int\)[0-9]+/) { match($0,/fp4x32_gemv_kernel<\(unsigned int\)[0-9]+/);
+        ntstep[step]=substr($0,RSTART+34,RLENGTH-34) }
+     if (base ~ /mtp_/) mtpstep[step]=1;
+     if (base ~ /nvfp4|cutlass|Kernel/) pf[step]=1;
+     t[step,base]+=du; n[step,base]++; tot[step]+=du;
+     if (!(base in seen)) { seen[base]=1; names[++nn]=base }
+  }
+}
+END { for (s=1;s<=step;s++) { cls = mtpstep[s] ? "draft" : (pf[s] ? "prefill" : "verify_n" ntstep[s]); cnt[cls]++;
+        for (i=1;i<=nn;i++) { b=names[i]; ct[cls,b]+=t[s,b]; cn[cls,b]+=n[s,b] } ctot[cls]+=tot[s];
+        if (s<step) cwall[cls]+=(sstart[s+1]-sstart[s]) }
+  m=asorti(cnt, ord);
+  for (k=1;k<=m;k++) { c=ord[k];
+     printf "\n-- %s: %d 步, 核忙 %.1f ms/步, 壁钟 %.1f ms/步\n", c, cnt[c], ctot[c]/cnt[c]/1e6, cwall[c]/cnt[c]/1e6;
+     for (i=1;i<=nn;i++) { b=names[i]; v=ct[c,b]/cnt[c]/1e6;
+        if (v>0.05) printf "   %-44s %8.2f ms %7.1f 发\n", b, v, cn[c,b]/cnt[c] } } }' \
+  "$OUT/trace_cuda_gpu_trace.csv"

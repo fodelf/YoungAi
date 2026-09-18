@@ -41,6 +41,57 @@ __global__ void read_rows_u32(const unsigned *__restrict__ p, size_t rb_words, s
     }
     if (acc == 0x12345678u) atomicAdd(out, 1ull);
 }
+/* ⑤ 指针追逐延迟(2026-09-17): 一个 warp 顺着随机环链一跳一跳读, 每跳等上一跳回来 ⇒ 量的是**单次访存往返**。
+ * 为什么要它: VQ 专家核判成"延迟受限"之后, 下一刀该把 load 提前多少轮发, 全看这块板子 L2 命中 / DRAM 各要
+ * 多少纳秒 —— 仓里从来没量过, 全凭猜。链按 128 B 线随机排, 步长足够乱, 硬件预取器帮不上忙。 */
+__global__ void chase_lat(const unsigned *__restrict__ p, int n, unsigned long long *out, long long *cyc) {
+    unsigned idx = 0;
+    const long long t0 = clock64();
+    for (int i = 0; i < n; i++) idx = __ldg(p + idx);
+    const long long t1 = clock64();
+    if (threadIdx.x == 0) { *cyc = t1 - t0; if (idx == 0xfffffff0u) atomicAdd(out, 1ull); }
+}
+/* ⑥ VQ 位流形态的"在飞深度"尺(2026-09-17): 每 warp 私有 960 B 行, 每轮 12 个 lane 各读一个 32 位字(48 B),
+ * 同一条流里下一轮的地址**依赖**上一轮读回的值(假依赖, 值恒 0 但编译器不知道) ⇒ 一条流一次只挂一个请求;
+ * 一个 warp 同时走 D 条流 ⇒ 每 warp 恰好 D 轮在飞。48 SM × 32 warp(和专家核一样 1 block/SM, 64 KB shared 压占用率)。
+ * 读法: D=1 的 GB/s 就是专家核现在的形态上限; 从哪个 D 起贴到 240, 专家核的寄存器环就得做多深。 */
+/* 变体(同夜第二轮, 专家核加了行预取只到 133 GB/s = 这形态的上限之后): 一轮几个 lane 各读 4 B(LANES: 12 = 48 B 现役形态,
+ * 16 = 64 B, 32 = 128 B 整线); HINT 0 = 普通读, 1 = `ld.global.L2::128B`(叫 L2 顺手把整线拉进来), 2 = `L2::256B`;
+ * PF 1 = 每行开头 30 个 lane 把整行 30 个扇区 prefetch 进 L2(专家核步 0 第二版的做法)。
+ * 读法: 哪个变体到 240, 专家核的位流读法就照它写 —— 请求粒度是这个核最后一堵墙, 别再猜。 */
+template <int HINT>
+__device__ __forceinline__ unsigned chase_ld(const unsigned char *a) {
+    unsigned v;
+    if (HINT == 1) asm("ld.global.nc.L2::128B.u32 %0, [%1];" : "=r"(v) : "l"(a));
+    else if (HINT == 2) asm("ld.global.nc.L2::256B.u32 %0, [%1];" : "=r"(v) : "l"(a));
+    else v = __ldg((const unsigned *)a);
+    return v;
+}
+template <int D, int LANES, int HINT, int PF>
+__global__ void chase_rows(const unsigned char *__restrict__ p, size_t rows_per_warp, unsigned long long *out) {
+    const unsigned lane = threadIdx.x & 31u;
+    const size_t warp = (blockIdx.x * (size_t)blockDim.x + threadIdx.x) >> 5;
+    const unsigned char *rowbase = p + warp * rows_per_warp * 960u;
+    const unsigned char *base = rowbase + (lane % LANES) * 4u;
+    const int rounds = 960 / (LANES * 4);
+    unsigned acc = 0;
+    for (size_t r = 0; r + D <= rows_per_warp; r += D) {
+        unsigned dep[D];
+        #pragma unroll
+        for (int d = 0; d < D; d++) {
+            dep[d] = 0;
+            if (PF) { const unsigned char *s = rowbase + (r + d) * 960u + lane * 32u; if (lane < 30u) asm volatile("prefetch.global.L2 [%0];" :: "l"(s)); }
+        }
+        for (int k = 0; k < rounds; k++) {
+            #pragma unroll
+            for (int d = 0; d < D; d++) {
+                const unsigned v = chase_ld<HINT>(base + (r + d) * 960u + (unsigned)(LANES * 4) * k + (dep[d] & 4u));
+                dep[d] = v; acc ^= v;
+            }
+        }
+    }
+    if (acc == 0x12345678u) atomicAdd(out, 1ull);
+}
 
 int main(int argc, char **argv) {
     const double gib = argc > 1 ? atof(argv[1]) : 4.0;
@@ -103,6 +154,75 @@ int main(int argc, char **argv) {
             printf("④ 行式 u32 流(1152 B 行×16/warp, %d block×4 warp, shared %zu KB): %.3f ms/次, %.1f GB/s\n",
                    grid, shm / 1024, dt * 1e3, (double)nwarps * per_warp / dt / 1e9);
         }
+    }
+    {   /* ⑤ 指针追逐: 足迹 16 KB(L1) / 8 MB(L2) / 2 GiB(DRAM), 每档 20 万跳取 ns/跳(clock64 按最高时钟折算, 另给壁钟口径) */
+        const size_t foot[3] = { 16u << 10, 8u << 20, (size_t)2 << 30 };
+        const char *nm[3] = { "16 KB(L1)", "8 MB(L2)", "2 GiB(DRAM)" };
+        long long *cyc = NULL; CK(cudaMalloc(&cyc, 8));
+        unsigned *perm = (unsigned *)malloc(bytes);
+        for (int f = 0; f < 3; f++) {
+            if (foot[f] > bytes) break;
+            const size_t nl = foot[f] / 128;                      /* 线数; 线 i 的首字存下一线的字下标 */
+            unsigned *order = (unsigned *)malloc(nl * 4);
+            for (size_t i = 0; i < nl; i++) order[i] = (unsigned)i;
+            srand(12345);
+            for (size_t i = nl - 1; i > 0; i--) { size_t j = ((size_t)rand() * 65536u + (size_t)rand()) % (i + 1); unsigned t = order[i]; order[i] = order[j]; order[j] = t; }
+            for (size_t i = 0; i < nl; i++) perm[(size_t)order[i] * 32] = order[(i + 1) % nl] * 32u;   /* 随机环 */
+            free(order);
+            CK(cudaMemcpy(a, perm, foot[f], cudaMemcpyHostToDevice));
+            const int n = 200000;
+            chase_lat<<<1, 32>>>((const unsigned *)a, 20000, o, cyc); CK(cudaDeviceSynchronize());   /* 热身: 小足迹进缓存 */
+            t0 = now_s();
+            chase_lat<<<1, 32>>>((const unsigned *)a, n, o, cyc); CK(cudaDeviceSynchronize());
+            dt = now_s() - t0;
+            long long hc = 0; CK(cudaMemcpy(&hc, cyc, 8, cudaMemcpyDeviceToHost));
+            printf("⑤ 指针追逐 %-12s: %.0f 周期/跳 = %.0f ns/跳(按 %.2f GHz), 壁钟口径 %.0f ns/跳\n",
+                   nm[f], (double)hc / n, (double)hc / n / (clk / 1e6), clk / 1e6, dt / n * 1e9);
+        }
+        /* ⑦ 带载延迟(2026-09-18): 另一条流上用 ② 把带宽拉满(b 块), 同时在 a 上追逐 DRAM 足迹的链 ⇒ 队列排满时一跳多少 ns。
+         * 为什么要它: 专家核提前几块发位流全看这个数 —— 空载 377 ns 若带载变 2~3 µs, 提前一块(8 轮)就盖不住。 */
+        {
+            cudaStream_t sa, sb; CK(cudaStreamCreate(&sa)); CK(cudaStreamCreate(&sb));
+            const int n = 100000, grid = pr.multiProcessorCount * 4, block = 256;
+            for (int rep = 0; rep < 2; rep++) {
+                const int loaded = rep;
+                t0 = now_s();
+                if (loaded) for (int i = 0; i < 6; i++) read_reduce<<<grid, block, 0, sb>>>((const int4 *)b, n4, o);
+                chase_lat<<<1, 32, 0, sa>>>((const unsigned *)a, n, o, cyc);
+                CK(cudaStreamSynchronize(sa));
+                const double tc = now_s() - t0;
+                CK(cudaDeviceSynchronize());
+                long long hc = 0; CK(cudaMemcpy(&hc, cyc, 8, cudaMemcpyDeviceToHost));
+                printf("⑦ 2 GiB 足迹追逐, %s: %.0f 周期/跳 = %.0f ns/跳(壁钟 %.0f ns)\n", loaded ? "另一流满带宽流读中(带载)" : "空载",
+                       (double)hc / n, (double)hc / n / (clk / 1e6), tc / n * 1e9);
+            }
+            CK(cudaStreamDestroy(sa)); CK(cudaStreamDestroy(sb));
+        }
+        free(perm); CK(cudaFree(cyc));
+        CK(cudaMemset(a, 1, bytes));   /* 追逐把 a 写成了链表, ⑥ 要的是全 1 */
+    }
+    {   /* ⑥ 位流在飞深度: 48 SM × 1 block × 1024 线程, 64 KB shared 压成 1 block/SM(= 专家核实况) */
+        const int grid = pr.multiProcessorCount, block = 1024;
+        const size_t nwarps = (size_t)grid * (block / 32);
+        const size_t rpw = bytes / nwarps / 960u;
+        const size_t shm = 64u << 10;
+        #define CHASE(D, L, H, PF) do { \
+            CK(cudaFuncSetAttribute(chase_rows<D, L, H, PF>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shm)); \
+            chase_rows<D, L, H, PF><<<grid, block, shm>>>((const unsigned char *)a, rpw, o); CK(cudaDeviceSynchronize()); \
+            t0 = now_s(); \
+            for (int i = 0; i < iters; i++) chase_rows<D, L, H, PF><<<grid, block, shm>>>((const unsigned char *)a, rpw, o); \
+            CK(cudaDeviceSynchronize()); \
+            dt = (now_s() - t0) / iters; \
+            printf("⑥ 位流形态 %2d 轮在飞 × 每轮 %3d B(%s%s): %.3f ms/次, %.1f GB/s\n", \
+                   D, L * 4, H == 0 ? "普通读" : H == 1 ? "L2::128B" : "L2::256B", PF ? " + 行首扇区预取" : "", \
+                   dt * 1e3, (double)nwarps * (rpw / D * D) * (double)((960 / (L * 4)) * L * 4) / dt / 1e9); } while (0)
+        CHASE(1, 12, 0, 0); CHASE(4, 12, 0, 0); CHASE(16, 12, 0, 0);
+        CHASE(1, 12, 1, 0); CHASE(4, 12, 1, 0);
+        CHASE(1, 12, 2, 0); CHASE(4, 12, 2, 0);
+        CHASE(1, 12, 0, 1); CHASE(4, 12, 0, 1);
+        CHASE(1, 16, 0, 0); CHASE(4, 16, 0, 0);
+        CHASE(1, 32, 0, 0); CHASE(4, 32, 0, 0);
+        #undef CHASE
     }
     return 0;
 }
