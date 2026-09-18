@@ -30,22 +30,33 @@
 #include "v41_cfg.h"
 
 enum { J_F32_BF16, J_F32_COPY, J_BF16_COPY, J_FP8BLK, J_FP4X32, J_VQBLOB, J_RAW };
-typedef struct { int kind; char src[192]; int layer; const void *raw; } job_t;
+typedef struct { int kind; char src[192]; int layer; const void *raw; int s2; } job_t;
 static job_t *g_jobs; static int g_nj, g_cj;
 static v41_st S; static v41_cfg C; static ds4gw W;
+/* ★第二个源: 原始 HF 目录(2026-09-17, mtp-1.md 的 M6 真因)★
+ * DSpark 三塔在**原始 HF 里是 FP8**(E4M3 + 32×32 块缩放), 而我们吃的量化目录里它们已经被量化器
+ * 连同主干骨架一起压成了 FP4(I8 + 1×32) —— 于是"三塔 FP4 全透传"实际透传的是一份被压过的草稿器。
+ * 实撞的代价: 草稿器对**它本来就该对齐的 FP 原模型**的首位一致率只有 0.5023(gguf-tools/bench/dspark_agree),
+ * 最容易的那一档(FP 锚 top1−top2 ≥ 6)也只有 0.814, 而底座是 0.977 —— 信息就在它的输入里, 它却答不出来。
+ * 三塔骨架总共才 ~260 MB, 还原成 FP8 只多 ~240 MB, 这笔精度不该省。
+ * ★只有 mtp.* 走这个源★: 主干是有意量化的, 那是产品本身。 */
+static v41_st S2; static int g_has_s2 = 0, g_plan_s2 = 0;
 static uint64_t g_out_bytes;
 
 static void die(const char *m) { fprintf(stderr, "★%s★\n", m); exit(1); }
-static const v41_st_ent *need(const char *name) {
-    const v41_st_ent *e = v41_st_find(&S, name);
-    if (!e) { fprintf(stderr, "★缺张量 %s★\n", name); exit(1); }
+static const v41_st_ent *need_in(const char *name, int s2) {
+    const v41_st_ent *e = v41_st_find(s2 ? &S2 : &S, name);
+    if (!e) { fprintf(stderr, "★缺张量 %s(源: %s)★\n", name, s2 ? "原始 HF" : "量化目录"); exit(1); }
     return e;
 }
+static const v41_st_ent *need(const char *name) { return need_in(name, g_plan_s2); }
+static const uint8_t *sdata(const v41_st_ent *e, int s2) { return v41_st_data(s2 ? &S2 : &S, e); }
 static int add_job(int kind, const char *gname, uint32_t type, uint32_t nd, const uint64_t *ne, uint64_t nbytes, const char *src, int layer, const void *raw) {
     if (g_nj == g_cj) { g_cj = g_cj ? g_cj * 2 : 4096; g_jobs = (job_t *)realloc(g_jobs, sizeof(job_t) * g_cj); }
     job_t *j = &g_jobs[g_nj++];
     memset(j, 0, sizeof *j); j->kind = kind; j->layer = layer; j->raw = raw;
     if (src) snprintf(j->src, sizeof j->src, "%s", src);
+    j->s2 = g_plan_s2;
     return ds4gw_tensor(&W, gname, type, nd, ne, nbytes);
 }
 
@@ -177,47 +188,62 @@ static void plan_layer(int L) {
  * ★不要的★: gate.bias_vl(视觉路), 与文件头第 16 行同一条规矩。 */
 /* 塔数与每塔专家数一律从 config.json 读(C.n_mtp_layers / C.dspark_n_routed_experts) —— 写死数字
  * 就是把模型架构焊进工具, 换一版模型静默出错(铁律 2026-09-15: 禁魔数硬编码)。 */
+/* ★三塔一律从**原始 HF** 取, 按原生精度存(2026-09-17)★ —— 见 S2 那段注释的所以然。
+ * MFP8 = 原件的 F8_E4M3 + 32×32 缩放, 原样搬(attn 五投影 / shared 专家三件 / main_proj);
+ * MBF16 = 原件的 BF16, 原样搬(路由 gate / markov 两件 / confidence) —— 原来 plan_small 把它展成 f32,
+ *   字节翻倍而值没变, 草稿器每轮为此白读 130 MB。★norm 不在此列★: 引擎的 rms_norm 核把权重当 f32 读
+ *   (cuda_v41_1.inc.cu), 存成 BF16 它照样按 f32 解释 —— 不报错, 直接出垃圾(实撞: 首位一致率 0.035)。
+ *   norm 一律走 MSMALL(BF16→f32, 值无损), 只有过"按类型分发"那条路的矩阵才许存 BF16;
+ * MFP4 = 原件出厂就是 FP4 的那一类(128 个路由专家), 照旧;
+ * MSMALL = 原件就是 F32 的(sink / gate.bias / hc_*)。
+ * ★哪个张量是哪一类不许猜★: plan_* 里都按源 dtype 校验, 对不上直接停车。 */
 static void plan_mtp(int T) {
     char g[96], s[192];
+    if (!g_has_s2) die("三塔要从原始 HF 取原生精度: 第 5 个参数给 HF 目录(见 --help)");
+    g_plan_s2 = 1;
 #define MSMALL(gf, sf) do { snprintf(g, sizeof g, gf, T); snprintf(s, sizeof s, sf, T); plan_small(g, s); } while (0)
+#define MBF16(gf, sf)  do { snprintf(g, sizeof g, gf, T); snprintf(s, sizeof s, sf, T); plan_bf16(g, s); } while (0)
+#define MFP8(gf, sf)   do { snprintf(g, sizeof g, gf, T); snprintf(s, sizeof s, sf, T); plan_fp8blk(g, s); } while (0)
 #define MFP4(gf, sf)   do { snprintf(g, sizeof g, gf, T); snprintf(s, sizeof s, sf, T); plan_fp4(g, s); } while (0)
     MSMALL("mtp.%d.hc_attn_fn.weight", "mtp.%d.hc_attn_fn");
     MSMALL("mtp.%d.hc_attn_scale.weight", "mtp.%d.hc_attn_scale");
     MSMALL("mtp.%d.hc_attn_base.weight", "mtp.%d.hc_attn_base");
     MSMALL("mtp.%d.attn_norm.weight", "mtp.%d.attn_norm.weight");
-    MFP4("mtp.%d.attn_q_a.weight", "mtp.%d.attn.wq_a.weight");
+    MFP8("mtp.%d.attn_q_a.weight", "mtp.%d.attn.wq_a.weight");
     MSMALL("mtp.%d.attn_q_a_norm.weight", "mtp.%d.attn.q_norm.weight");
-    MFP4("mtp.%d.attn_q_b.weight", "mtp.%d.attn.wq_b.weight");
-    MFP4("mtp.%d.attn_kv.weight", "mtp.%d.attn.wkv.weight");
+    MFP8("mtp.%d.attn_q_b.weight", "mtp.%d.attn.wq_b.weight");
+    MFP8("mtp.%d.attn_kv.weight", "mtp.%d.attn.wkv.weight");
     MSMALL("mtp.%d.attn_kv_a_norm.weight", "mtp.%d.attn.kv_norm.weight");
     MSMALL("mtp.%d.attn_sinks.weight", "mtp.%d.attn.attn_sink");
-    MFP4("mtp.%d.attn_output_a.weight", "mtp.%d.attn.wo_a.weight");
-    MFP4("mtp.%d.attn_output_b.weight", "mtp.%d.attn.wo_b.weight");
+    MFP8("mtp.%d.attn_output_a.weight", "mtp.%d.attn.wo_a.weight");
+    MFP8("mtp.%d.attn_output_b.weight", "mtp.%d.attn.wo_b.weight");
     MSMALL("mtp.%d.hc_ffn_fn.weight", "mtp.%d.hc_ffn_fn");
     MSMALL("mtp.%d.hc_ffn_scale.weight", "mtp.%d.hc_ffn_scale");
     MSMALL("mtp.%d.hc_ffn_base.weight", "mtp.%d.hc_ffn_base");
     MSMALL("mtp.%d.ffn_norm.weight", "mtp.%d.ffn_norm.weight");
-    MSMALL("mtp.%d.ffn_gate_inp.weight", "mtp.%d.ffn.gate.weight");
+    MBF16("mtp.%d.ffn_gate_inp.weight", "mtp.%d.ffn.gate.weight");
     MSMALL("mtp.%d.exp_probs_b.bias", "mtp.%d.ffn.gate.bias");
-    MFP4("mtp.%d.ffn_gate_shexp.weight", "mtp.%d.ffn.shared_experts.w1.weight");
-    MFP4("mtp.%d.ffn_up_shexp.weight", "mtp.%d.ffn.shared_experts.w3.weight");
-    MFP4("mtp.%d.ffn_down_shexp.weight", "mtp.%d.ffn.shared_experts.w2.weight");
+    MFP8("mtp.%d.ffn_gate_shexp.weight", "mtp.%d.ffn.shared_experts.w1.weight");
+    MFP8("mtp.%d.ffn_up_shexp.weight", "mtp.%d.ffn.shared_experts.w3.weight");
+    MFP8("mtp.%d.ffn_down_shexp.weight", "mtp.%d.ffn.shared_experts.w2.weight");
     for (int e = 0; e < C.dspark_n_routed_experts; e++) {
         snprintf(g, sizeof g, "mtp.%d.ffn_exp.%d.gate.weight", T, e); snprintf(s, sizeof s, "mtp.%d.ffn.experts.%d.w1.weight", T, e); plan_fp4(g, s);
         snprintf(g, sizeof g, "mtp.%d.ffn_exp.%d.up.weight",   T, e); snprintf(s, sizeof s, "mtp.%d.ffn.experts.%d.w3.weight", T, e); plan_fp4(g, s);
         snprintf(g, sizeof g, "mtp.%d.ffn_exp.%d.down.weight", T, e); snprintf(s, sizeof s, "mtp.%d.ffn.experts.%d.w2.weight", T, e); plan_fp4(g, s);
     }
-    if (T == 0) {   /* main_proj: 原始 HF 是 FP8 32×32, 但量化目录里已经是 FP4 1×32(I8 + E8M0/32) —— 
-                     * 正是 speed.md §2 要的"三塔 FP4 全透传", 直接走 FP4 路 */
-        plan_fp4("mtp.main_proj.weight", "mtp.0.main_proj.weight");
+    if (T == 0) {
+        plan_fp8blk("mtp.main_proj.weight", "mtp.0.main_proj.weight");   /* 原件 F8_E4M3 32×32 */
         plan_small("mtp.main_norm.weight", "mtp.0.main_norm.weight");
     }
     if (T == 2) {
-        plan_small("mtp.markov_embd.weight", "mtp.2.markov_head.embed.weight");
-        plan_small("mtp.markov_head.weight", "mtp.2.markov_head.head.weight");
-        plan_small("mtp.confidence.weight", "mtp.2.confidence_head.proj.weight");
+        plan_bf16("mtp.markov_embd.weight", "mtp.2.markov_head.embed.weight");
+        plan_bf16("mtp.markov_head.weight", "mtp.2.markov_head.head.weight");
+        plan_bf16("mtp.confidence.weight", "mtp.2.confidence_head.proj.weight");
         plan_small("mtp.out_norm.weight", "mtp.2.norm.weight");
     }
+    g_plan_s2 = 0;
+#undef MBF16
+#undef MFP8
 #undef MSMALL
 #undef MFP4
 }
@@ -227,7 +253,7 @@ static uint8_t *g_buf; static uint64_t g_cap;
 static uint8_t *buf(uint64_t n) { if (n > g_cap) { g_cap = n + (n >> 3); g_buf = (uint8_t *)realloc(g_buf, g_cap); if (!g_buf) die("内存不够"); } return g_buf; }
 
 static uint64_t gen_small(const job_t *j) {
-    const v41_st_ent *e = need(j->src); const uint8_t *p = v41_st_data(&S, e); if (!p) exit(1);
+    const v41_st_ent *e = need_in(j->src, j->s2); const uint8_t *p = sdata(e, j->s2); if (!p) exit(1);
     uint64_t n = (uint64_t)v41_st_numel(e); float *o = (float *)buf(n * 4);
     if (j->kind == J_BF16_COPY) { memcpy(o, p, n * 2); return n * 2; }   /* 原样搬 2 字节, 一位都不动 */
     if (j->kind == J_F32_COPY) memcpy(o, p, n * 4);
@@ -235,9 +261,9 @@ static uint64_t gen_small(const job_t *j) {
     return n * 4;
 }
 static uint64_t gen_fp4(const job_t *j) {
-    const v41_st_ent *e = need(j->src); const uint8_t *w = v41_st_data(&S, e);
+    const v41_st_ent *e = need_in(j->src, j->s2); const uint8_t *w = sdata(e, j->s2);
     char sn[192]; snprintf(sn, sizeof sn, "%s", j->src); strcpy(strrchr(sn, '.'), ".scale");
-    const v41_st_ent *se = need(sn); const uint8_t *sc = v41_st_data(&S, se);
+    const v41_st_ent *se = need_in(sn, j->s2); const uint8_t *sc = sdata(se, j->s2);
     if (!w || !sc) exit(1);
     uint64_t rows = (uint64_t)e->shape[0], cb = (uint64_t)e->shape[1] / 16;   /* 每行块数 = cols/32 */
     if ((uint64_t)se->shape[0] != rows || (uint64_t)se->shape[1] != cb) { fprintf(stderr, "★%s scale 形状不配★\n", j->src); exit(1); }
@@ -251,9 +277,9 @@ static uint64_t gen_fp4(const job_t *j) {
     return rows * cb * 17;
 }
 static uint64_t gen_fp8blk(const job_t *j) {
-    const v41_st_ent *e = need(j->src); const uint8_t *w = v41_st_data(&S, e);
+    const v41_st_ent *e = need_in(j->src, j->s2); const uint8_t *w = sdata(e, j->s2);
     char sn[192]; snprintf(sn, sizeof sn, "%s", j->src); strcpy(strrchr(sn, '.'), ".scale");
-    const v41_st_ent *se = need(sn); const uint8_t *sc = v41_st_data(&S, se);
+    const v41_st_ent *se = need_in(sn, j->s2); const uint8_t *sc = sdata(se, j->s2);
     if (!w || !sc) exit(1);
     uint64_t rows = (uint64_t)e->shape[0], cols = (uint64_t)e->shape[1];
     uint64_t sr = (rows + 31) / 32, scn = (cols + 31) / 32, n = rows * cols + sr * scn;
@@ -318,9 +344,20 @@ static void emit_tokenizer(const char *path) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "用法: v41_to_gguf <量化目录> <engram_consts.bin> <tokenizer_consts.bin> <out.gguf>\n"); return 2; }
+    if (argc < 5) {
+        fprintf(stderr, "用法: v41_to_gguf <量化目录> <engram_consts.bin> <tokenizer_consts.bin> <out.gguf> [原始HF目录]\n"
+                        "  第 5 个参数 = 原始 HF 目录, **带 DSpark 三塔时必给**: 三塔在原件里是 FP8/BF16,\n"
+                        "  而量化目录里已经被量化器压成 FP4 —— 那是草稿器的精度, 不该跟主干一起压(见 plan_mtp 注释)。\n");
+        return 2;
+    }
     const char *qdir = argv[1], *egp = argv[2], *tkp = argv[3], *out = argv[4];
+    const char *hfdir = argc > 5 ? argv[5] : NULL;
     if (v41_st_open(&S, qdir)) return 1;
+    if (hfdir) {
+        if (v41_st_open(&S2, hfdir)) { fprintf(stderr, "★打不开原始 HF 目录 %s★\n", hfdir); return 1; }
+        g_has_s2 = 1;
+        fprintf(stderr, "[源] 主干 ← %s; ★三塔 ← %s(原生精度)★\n", qdir, hfdir);
+    }
     char cfgp[4200]; snprintf(cfgp, sizeof cfgp, "%s/inference/config.json", qdir); v41_cfg_load(&C, cfgp);
     fprintf(stderr, "[配置] %d 层 dim %d 专家 %d top-%d 路由 %s ×%.2f; 压缩比 %d 项; kv源 %d 索引源 %d engram %d 层\n",
             C.n_layers, C.dim, C.n_routed_experts, C.n_activated_experts, C.score_func, C.route_scale, C.n_compress_ratios, C.n_kv_source, C.n_index_source, C.n_engram);

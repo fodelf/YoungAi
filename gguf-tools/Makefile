@@ -122,6 +122,7 @@ endif
 
 # ---------------------------------------------------------------- 目标分组
 .PHONY: all amp legacy calib bench tools-test go-onebit-test quality-score clean everything dsq_units_gpu
+.PHONY: dspark_agree
 .PHONY: deepseek4-quantize-alias anchor_metrics compare_scores ds4quant_run zlayer \
         dql_to_zchain teacher_routed zloss_solve finetune_solve \
         calib_run calib_diag validate_fwd traj_analyze cap_raw2npy vq_blob_truesize dump_gguf_meta \
@@ -299,6 +300,12 @@ dspark_align: dspark_align.bin
 .PHONY: dspark_align.bin
 dspark_align.bin: $(AMP)/dspark_align.c $(AMP)/linalg_small.c
 	$(CC) $(BARE) $(NATIVE) -o dspark_align $(AMP)/dspark_align.c $(AMP)/linalg_small.c -lm -lpthread
+
+# 投机接受率的三个一致率(mtp-1.md M0′(c)): 草稿器↔底座 / 底座↔FP 锚 / 草稿器↔FP 锚。
+# 只量到一个数分不清该怪草稿器还是怪量化 —— 09-16 就是拿一个数当依据, 判负两次。
+dspark_agree: $(BEN)/dspark_agree
+$(BEN)/dspark_agree: $(BEN)/dspark_agree.c
+	$(CC) $(BARE) $(NATIVE) -o $@ $< -lm
 
 zrec_to_zchain: zrec_to_zchain.bin
 .PHONY: zrec_to_zchain.bin

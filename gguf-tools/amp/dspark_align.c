@@ -30,7 +30,8 @@
  * "草稿器首位 ↔ 底座 argmax"一致率(--dspark-capture 那一行)。残差降了而 p1 不涨是可能的
  * (隐态对齐 ≠ argmax 对齐), 所以别拿残差当结论。
  *
- * 用法: dspark_align <pairs.bin> <out.bin> [--k-list 64,128,256] [--lam-list 0.1,1,10] [--val 0.2]
+ * 用法: dspark_align <pairs.bin> <out.bin> [--hdiag <pairs.bin.hdiag>] [--k-list 64,128,256] [--lam-list 0.1,1,10] [--val 0.2]
+ * ★--hdiag 必给★: 不给就是纯 L2 度量, 09-16 判过负(留出一致率不升反降), 只作对照。
  * 编译: make -C gguf-tools dspark_align */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -61,7 +62,11 @@ static void mm_abt(const double *A, const double *B, double *C, int ra, int rb, 
 
 int main(int argc, char **argv) {
     if (argc < 3) { fprintf(stderr, "用法: dspark_align <pairs.bin> <out.bin> [--k-list a,b] [--lam-list a,b] [--val f]\n"); return 1; }
-    const char *inp = argv[1], *outp = argv[2];
+    const char *inp = argv[1], *outp = argv[2], *hdiag_path = NULL;
+    /* ★--rows: 只用前 N 行取料★ 这个解算器走行空间(n×n), 代价是 O(n²·D) 的 Gram + O(n²·K) 的特征分解 ——
+     * n=512 时几秒, n=8191 时 2.2e11 次乘加, 纯 C 单线程要几十分钟, 而且 n×n 的几块 double 就 1.4 GB。
+     * 实撞: 直接喂 8191 行, 进程没出一行日志就没了。默认 2048 是"够拟合 5120 维又跑得动"的折中。 */
+    int max_rows = 2048;
     int klist[8] = { 64, 128, 256, 0 }, nk = 3;
     double lamlist[8] = { 0.1, 1.0, 10.0, 0 }; int nl = 3;
     double valfrac = 0.2;
@@ -75,6 +80,8 @@ int main(int argc, char **argv) {
             while (t && nl < 8) { lamlist[nl++] = atof(t); t = strtok(NULL, ","); }
             free(s);
         } else if (!strcmp(argv[i], "--val") && i + 1 < argc) valfrac = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--hdiag") && i + 1 < argc) hdiag_path = argv[++i];
+        else if (!strcmp(argv[i], "--rows") && i + 1 < argc) max_rows = atoi(argv[++i]);
     }
 
     FILE *f = fopen(inp, "rb");
@@ -105,7 +112,40 @@ int main(int argc, char **argv) {
     }
     free(buf); fclose(f);
     if (nbad) printf("[align] ★丢掉 %d 行非有限取料(留 %d 行)★ —— 草稿器那几轮是坏的, 值得回去查\n", nbad, nok);
+    if (max_rows > 0 && nok > max_rows) {
+        printf("[align] 取料 %d 行, 只用前 %d 行(--rows 改; 行空间解是 O(n²·D), 见 max_rows 注释)\n", nok, max_rows);
+        nok = max_rows;
+    }
     if (nok <= 2) { fprintf(stderr, "可用取料太少(%d 行)\n", nok); return 1; }
+
+    /* ★出口度量白化(mtp-1.md M6′)★
+     * 09-16 那次判负: 纯 L2 解出来的边车挂上去, 留出首位一致率 0.4570 → 0.4336(β 越小越接近不挂,
+     * 但从来没超过) —— 不是幅度过头, 是**目标函数错了**。草稿器与主模型的 logits 由同一个出口头 W 算,
+     * 所以该量的是 ‖W·(h_d−h_m)‖ 而不是 ‖h_d−h_m‖: 头基本不看的那些维度, 对齐得再准也不改 argmax;
+     * 而纯 L2 恰恰会把力气花在方差大的方向上。
+     * 这里用 G = WᵀW 的**对角线**(引擎 --dspark-capture 顺带落的 <pairs>.hdiag, 每列的平方和)作一阶近似:
+     * 把 R 的第 d 列乘 w_d = sqrt(cs_d)(归一化到均值 1, 免得 λ 的量纲跟着变), 照旧解, 最后把 A 的第 d 列
+     * 除回去 —— 等价于在 diag(G) 这个度量里做同一套岭 + 秩截断。
+     * ★不给 --hdiag 就退回纯 L2★, 并大声说一句: 那条路 09-16 判过负, 只作对照用。 */
+    double *wcol = xmal((size_t)D);
+    for (int d = 0; d < D; d++) wcol[d] = 1.0;
+    if (hdiag_path) {
+        FILE *fh = fopen(hdiag_path, "rb");
+        float *cs = (float *)malloc((size_t)D * sizeof(float));
+        if (fh && cs && fread(cs, sizeof(float), (size_t)D, fh) == (size_t)D) {
+            double mean = 0;
+            for (int d = 0; d < D; d++) { wcol[d] = sqrt((double)(cs[d] > 0 ? cs[d] : 0)); mean += wcol[d]; }
+            mean /= D;
+            if (mean > 0) for (int d = 0; d < D; d++) wcol[d] /= mean;
+            double lo = 1e30, hi = 0;
+            for (int d = 0; d < D; d++) { if (wcol[d] < lo) lo = wcol[d]; if (wcol[d] > hi) hi = wcol[d]; }
+            printf("[align] 出口度量已挂: 列权重 min %.3f / max %.3f(均值 1)\n", lo, hi);
+            for (int i = 0; i < nok; i++)
+                for (int d = 0; d < D; d++) R[(size_t)i * D + d] *= wcol[d];
+        } else printf("[align] ★--hdiag 读不到 %s, 退回纯 L2(那条判过负)★\n", hdiag_path);
+        if (fh) fclose(fh);
+        free(cs);
+    } else printf("[align] ★没给 --hdiag: 走纯 L2 度量 —— 09-16 判过负, 只作对照★\n");
 
     const int nrows = nok;   /* 体检后真正可用的行数(下面一律用它, 别再碰 n —— n 是文件里写的总数) */
     const int nval = (int)((double)nrows * valfrac), nfit = nrows - nval;
@@ -205,6 +245,10 @@ int main(int argc, char **argv) {
     printf("[align] ★选中 λ=%g K=%d, 验证残差 %.6f(不修正 = 1.0)★\n", lambest, kbest, valbest / (base_val + 1e-30));
     if (valbest / (base_val + 1e-30) > 0.98)
         printf("[align] ★残差几乎没降 —— 取料太少或 λ 全压死了, 别急着上引擎★\n");
+
+    /* 把 A 的列除回去: 解是在白化空间里做的, 引擎那边吃的是原空间的 x(见上面 wcol 那段) */
+    for (int j = 0; j < kbest; j++)
+        for (int d = 0; d < D; d++) if (wcol[d] > 0) Abest[(size_t)j * D + d] /= wcol[d];
 
     FILE *fo = fopen(outp, "wb");
     if (!fo) { fprintf(stderr, "写不了 %s\n", outp); return 1; }
