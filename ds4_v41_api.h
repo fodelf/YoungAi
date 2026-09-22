@@ -41,6 +41,28 @@ void ds4_engine_v41_set_draft_amp(const char *path);
 void ds4_engine_v41_set_draft_amp_scale(float s);   /* --draft-amp-scale β: 诊断修正幅度 */
 int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_prompt, int n_predict, int ctx_size,
                                    ds4_v41_emit_fn emit, void *ud);
+/* 解码采样(2026-09-21, 113-1.md §4): 上面那条生成路的名字里的 argmax 是历史, 采样由这个设置面决定。
+ * temperature ≤ 0(默认) = 裸 argmax: 图末尾的设备 argmax, 一个字节不变(门 = 温 0 输出逐字节回归)。
+ * > 0 = 每步把末位 logits 行读回主机, 交给 V4 路**同一份**采样器 ds4_sample_logits(温度 / top-k / top-p / min-p / seed)
+ * ⇒ 两条路同分布。只按模型自己的分布抽, 不动 logits(铁律"引擎不得改模型输出"); 频率/出现/序列复读惩罚还没接。
+ * seed 0 = 按时钟(与 V4 CLI 同规则)。NULL = 回到裸 argmax。采样与投机(--dspark)不能同开: 生成路直接拒, 不静默降级。
+ * 惩罚(core_decode_penalty.c, 全部默认 0 = 不进那段代码): freq/presence = OpenAI 频率/出现惩罚(与 V4 路同式);
+ * dry_multiplier > 0 开 DRY 序列复读惩罚(base 1.75 / allowed_length 2 是 llama.cpp 默认): 这是温 0 下也能挡死循环的唯一手段。
+ * 任一惩罚非零时, 温 0 也走"读回 logits 行 → 罚 → argmax"这条路(argmax 由同一份采样器在温 0 时给出)。 */
+typedef struct {
+    float temperature, top_p, min_p; int top_k; uint64_t seed;
+    float freq_penalty, presence_penalty;
+    float dry_multiplier, dry_base; int dry_allowed_length;
+} ds4_decode_sampling;
+void ds4_engine_set_decode_sampling(const ds4_decode_sampling *sp);
+/* 服务接入(2026-09-19, src/server/server_generate_v41.c): 预填每跑完一块回调一次("prefill_chunk", 已预填 token 数, 提示总数),
+ * 与 V4 会话的 ds4_session_set_progress 同一种回调形状 —— 服务端拿它发 SSE 心跳与预填进度日志。NULL = 不回调。
+ * ★返回非 0 = 调用方要求中止这趟前向★(2026-09-22): 13 万 token 的提示光预填就要 400 秒, 客户端在这期间
+ * 挂断的话这 400 秒是纯浪费, 而本服务串行跑图 —— 后面排队的请求跟着一起超时。服务端在这里探对端还在不在。
+ * ds4_engine_v41_max_ctx: V4.1 前向的上下文硬上限(核用 shared 存整段组数), 服务端起服时把 --ctx 压到它以下。 */
+typedef int (*ds4_v41_progress_fn)(void *ud, const char *event, int current, int total);
+void ds4_engine_v41_set_progress(ds4_v41_progress_fn fn, void *ud);
+int ds4_engine_v41_max_ctx(void);
 
 /* 反修取料钩子(2026-09-13, C 反修驱动 gguf-tools/amp/v41_amp_run 用): 每层 MoE 出口、放大器应用前回调一次。
  * 全是主机内存、行主序: x[n][D] = MoE 输入(ffn_norm 出口, bf16 格点), y[n][D] = MoE 输出(bf16 格点, 还没加放大器),

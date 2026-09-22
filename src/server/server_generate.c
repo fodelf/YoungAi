@@ -15,6 +15,8 @@
  * immediately continue to the real prompt.  The live graph therefore always
  * moves forward. */
 void generate_job(server *s, job *j) {
+    /* DeepSeek V4.1(2026-09-19): 没有 ds4_session, 走 server_generate_v41.c 的回调式生成路; 下面的会话路一行不动。 */
+    if (ds4_engine_is_v41(s->engine)) { generate_job_v41(s, j); return; }
 
 /* generate_job 函数体 (原 10733-12244 行): 单函数 1512 行、含 decode_again/guided_primer
  * goto 标签与函数内 PRIMER_KA 宏, 无法在不改控制流的前提下切成 <500 行的独立

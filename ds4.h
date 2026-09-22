@@ -259,6 +259,9 @@ const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 const char *ds4_think_mode_name(ds4_think_mode mode);
 const char *ds4_think_max_prefix(void);
+const char *ds4_think_effort_prefix(ds4_think_mode mode);   /* V4.1 官方 "Reasoning Effort: N (…)\n\n": HIGH 75 / MAX 100 / 关 = "" */
+const char *ds4_chat_system_token(void);                    /* 装载的 tokenizer 有 <｜System｜> ⇒ 该文本, 否则 ""(V4) */
+void ds4_chat_set_system_token(bool present);               /* 只给离线单测用: 没有引擎时模拟 V4.1 tokenizer */
 uint32_t ds4_think_max_min_context(void);
 ds4_think_mode ds4_think_mode_for_context(ds4_think_mode mode, int ctx_size);
 /* Uses the active model shape selected by ds4_engine_open(); call after opening
@@ -296,12 +299,8 @@ bool ds4_tokens_starts_with(const ds4_tokens *tokens, const ds4_tokens *prefix);
 void ds4_tokenize_text(ds4_engine *e, const char *text, ds4_tokens *out);
 void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out);
 void ds4_chat_begin(ds4_engine *e, ds4_tokens *tokens);
-void ds4_encode_chat_prompt(
-        ds4_engine *e,
-        const char *system,
-        const char *prompt,
-        ds4_think_mode think_mode,
-        ds4_tokens *out);
+void ds4_chat_open_system(ds4_engine *e, ds4_tokens *tokens);   /* 开 system 块(<｜System｜>, 只在没开着时写; V4 无此 token = 不写) */
+void ds4_encode_chat_prompt(ds4_engine *e, const char *system, const char *prompt, ds4_think_mode think_mode, ds4_tokens *out);
 void ds4_chat_append_max_effort_prefix(ds4_engine *e, ds4_tokens *tokens);
 void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role, const char *content);
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode);

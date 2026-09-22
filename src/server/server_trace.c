@@ -215,6 +215,20 @@ void trace_piece(server *s, uint64_t id, const char *piece, size_t len) {
     pthread_mutex_unlock(&s->trace_mu);
 }
 
+/* 提示与生成的 token id 各一行(空格分隔)。为什么要它: trace 里的文本事后重新分词拼不回引擎真吃/真吐的序列
+ * (2026-09-20 实撞 79 vs 75 个 token), 而真实请求的逐位对拍(解码路 vs 预填路 / vs 教师)只认 id(bug.md §5.4 E0)。 */
+void trace_token_ids(server *s, uint64_t id, const int *prompt, int n_prompt, const int32_t *gen, int n_gen) {
+    if (!s->trace || !id) return;
+    pthread_mutex_lock(&s->trace_mu);
+    fprintf(s->trace, "\n--- token ids: prompt %d, generated %d ---\nprompt:", n_prompt, n_gen);
+    for (int i = 0; i < n_prompt && prompt; i++) fprintf(s->trace, " %d", prompt[i]);
+    fputs("\ngenerated:", s->trace);
+    for (int i = 0; i < n_gen && gen; i++) fprintf(s->trace, " %d", (int)gen[i]);
+    fputc('\n', s->trace);
+    fflush(s->trace);
+    pthread_mutex_unlock(&s->trace_mu);
+}
+
 void trace_event(server *s, uint64_t id, const char *fmt, ...) {
     if (!s->trace || !id) return;
     pthread_mutex_lock(&s->trace_mu);

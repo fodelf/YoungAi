@@ -92,10 +92,13 @@ static char *rendered_chat_system_region(const char *prompt_text) {
     const char *bos = "<｜begin▁of▁sentence｜>";
     const size_t bos_len = strlen(bos);
     if (!strncmp(p, bos, bos_len)) p += bos_len;
-    const char *max_prefix = ds4_think_max_prefix();
-    const size_t max_prefix_len = strlen(max_prefix);
-    if (max_prefix_len && !strncmp(p, max_prefix, max_prefix_len)) {
-        p += max_prefix_len;
+    /* V4.1: BOS 后可能先是 <｜System｜>, 再是 thinking 的 effort 前缀(75 或 100 那行); 都不是 system 正文, 跳过 */
+    const char *sys_tok = ds4_chat_system_token();
+    if (sys_tok[0] && !strncmp(p, sys_tok, strlen(sys_tok))) p += strlen(sys_tok);
+    const char *effort_prefixes[] = { ds4_think_effort_prefix(DS4_THINK_HIGH), ds4_think_effort_prefix(DS4_THINK_MAX) };
+    for (size_t i = 0; i < sizeof(effort_prefixes) / sizeof(effort_prefixes[0]); i++) {
+        const size_t n = strlen(effort_prefixes[i]);
+        if (n && !strncmp(p, effort_prefixes[i], n)) { p += n; break; }
     }
     while (*p && isspace((unsigned char)*p)) p++;
 

@@ -272,7 +272,7 @@ void thinking_live_remember(server *s, const char *visible_text) {
     visible_live_clear_locked(&s->thinking_live);
     s->thinking_live.visible_text = xstrdup(visible_text);
     s->thinking_live.visible_len = strlen(visible_text);
-    s->thinking_live.live_tokens = ds4_session_pos(s->session);
+    s->thinking_live.live_tokens = s->session ? ds4_session_pos(s->session) : 0;   /* V4.1 没有会话: 活绑定不带 KV 位置 */
     s->thinking_live.valid = true;
     pthread_mutex_unlock(&s->tool_mu);
 }
@@ -289,7 +289,7 @@ void responses_live_remember(server *s, const char *visible_text,
             id_list_push_unique(&s->responses_live.call_ids, calls->v[i].id);
         }
     }
-    s->responses_live.live_tokens = ds4_session_pos(s->session);
+    s->responses_live.live_tokens = s->session ? ds4_session_pos(s->session) : 0;   /* V4.1 没有会话: 活绑定不带 KV 位置 */
     s->responses_live.valid = true;
     pthread_mutex_unlock(&s->tool_mu);
 }
@@ -301,7 +301,7 @@ void anthropic_live_remember(server *s, const tool_calls *calls) {
     for (int i = 0; i < calls->len; i++) {
         id_list_push_unique(&s->anthropic_live.call_ids, calls->v[i].id);
     }
-    s->anthropic_live.live_tokens = ds4_session_pos(s->session);
+    s->anthropic_live.live_tokens = s->session ? ds4_session_pos(s->session) : 0;   /* V4.1 没有会话: 活绑定不带 KV 位置 */
     s->anthropic_live.valid = s->anthropic_live.call_ids.len > 0;
     pthread_mutex_unlock(&s->tool_mu);
 }

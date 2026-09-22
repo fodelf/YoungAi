@@ -263,3 +263,34 @@ void test_thinking_canonical_non_thinking_mode_noop(void) {
     free(prompt_text);
     chat_msgs_free(&msgs);
 }
+
+/* ★思考没闭合 = 没有正文★(2026-09-22): 官方 deepseek-reasoner 语义 —— 思考被上限截断时
+ * reasoning 放已想的部分, content 空, 调用方据此判"这份不能用"。以前这里把整段思考当 content
+ * 返回, 同一台服务的流式路(reasoning_content)与非流式路给相反的答案, 实撞让调用方把 16384 token
+ * 的英文思考当成最终报告收下(fable5 2026-09-22 上午节)。 */
+void test_thinking_unclosed_returns_reasoning_not_content(void) {
+    char *content = NULL, *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_ex("thought so far, never closed", true,
+                                           &content, &reasoning, &calls));
+    TEST_ASSERT(reasoning && !strcmp(reasoning, "thought so far, never closed"));
+    TEST_ASSERT(content && content[0] == '\0');
+    TEST_ASSERT(calls.len == 0);
+    free(content); free(reasoning); tool_calls_free(&calls);
+
+    /* 生成段以 <think> 开头(历史回放/检查点口径)时, 那对尖括号不进 reasoning 正文 */
+    content = reasoning = NULL;
+    TEST_ASSERT(parse_generated_message_ex("<think>still thinking", true,
+                                           &content, &reasoning, &calls));
+    TEST_ASSERT(reasoning && !strcmp(reasoning, "still thinking"));
+    TEST_ASSERT(content && content[0] == '\0');
+    free(content); free(reasoning); tool_calls_free(&calls);
+
+    /* 非思考请求(require_thinking_closed = false)不受影响: 整段就是正文 */
+    content = reasoning = NULL;
+    TEST_ASSERT(parse_generated_message_ex("plain answer", false,
+                                           &content, &reasoning, &calls));
+    TEST_ASSERT(content && !strcmp(content, "plain answer"));
+    TEST_ASSERT(reasoning == NULL);
+    free(content); free(reasoning); tool_calls_free(&calls);
+}

@@ -248,6 +248,7 @@ void trace_cache_capture( trace_cache_diag *d, const ds4_tokens *live, const ds4
 const char *trace_cache_miss_reason(const trace_cache_diag *d);
 uint64_t trace_begin( server *s, const job *j, int cached, int effective_prompt_tokens, const trace_cache_diag *cache_diag, const char *cache_source, int disk_cached, const char *disk_path);
 void trace_piece(server *s, uint64_t id, const char *piece, size_t len);
+void trace_token_ids(server *s, uint64_t id, const int *prompt, int n_prompt, const int32_t *gen, int n_gen);
 void trace_event(server *s, uint64_t id, const char *fmt, ...);
 void trace_finish( server *s, uint64_t id, const request *r, const char *final_finish, int completion, bool saw_tool_start, bool saw_tool_end, const char *parsed_content, const char *parsed_reasoning, const tool_calls *parsed_calls, double elapsed);
 void request_ctx_span(char *buf, size_t len, int cached, int prompt);
@@ -260,6 +261,10 @@ bool continue_after_invalid_dsml(server *s, const request *r, const thinking_sta
 bool should_remember_thinking_checkpoint(const request *r, const thinking_state *thinking, const char *finish);
 void log_tool_calls_summary(const char *ctx, const tool_calls *calls, bool responses_protocol);
 void server_progress_cb(void *ud, const char *event, int current, int total);
+/* V4.1 服务生成路(server_generate_v41.c): 没有会话, token 从引擎回调来; generate_job 入口按模型分流 */
+void generate_job_v41(server *s, job *j);
+/* 上下文大小: V4 从会话读, V4.1 没有会话(s->session == NULL)就用起服时定下的 s->ctx_size */
+static inline int server_ctx_size(const server *s) { return s->session ? ds4_session_ctx(s->session) : s->ctx_size; }
 void send_prefill_failure_response(server *s, const job *j, const server_prefill_progress *progress, const char *ctx, const char *flags, const char *err);
 char *build_tool_checkpoint_suffix(const request *r, const char *content, const char *reasoning, const tool_calls *calls);
 char *build_responses_visible_assistant_suffix(const request *r, const char *content, const char *reasoning, const tool_calls *calls);
@@ -278,6 +283,8 @@ void *client_main(void *arg);
 int listen_on(const char *host, int port);
 void configure_client_socket(int fd);
 void set_client_socket_nonblocking(int fd);
+/* 生成期间每隔几个 token 探一次对端(server_http.c): true = 客户端已经走了, 立刻停生成 */
+bool client_disconnected(int fd);
 void log_context_memory(ds4_backend backend, int ctx_size);
 void server_close_resources(server *s);
 void usage(FILE *fp);

@@ -291,6 +291,8 @@ void agent_append_system_prompt(ds4_engine *engine, ds4_tokens *tokens,
      * the model's dedicated DSML token.  Do not apply that tokenizer to user
      * supplied -sys text: arbitrary user text containing <｜User｜>, <think>, or
      * ｜DSML｜ must remain plain content, not control tokens. */
+    /* V4.1: 工具提示与 -sys 正文同住一个 system 块 —— 先开块(紧接 max 档前缀时已开着, 不重复写), 再放正文 */
+    ds4_chat_open_system(engine, tokens);
     char *tools_prompt = agent_build_tools_prompt();
     ds4_tokenize_rendered_chat(engine, tools_prompt, tokens);
     free(tools_prompt);

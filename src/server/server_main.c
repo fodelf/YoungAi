@@ -22,7 +22,28 @@ int main(int argc, char **argv) {
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
 
-    log_context_memory(cfg.engine.backend, cfg.ctx_size);
+    /* DeepSeek V4.1(2026-09-19, server_generate_v41.c): 前向没有 ds4_session —— 没有 KV 复用、没有磁盘 KV、
+     * 没有并发批, 上下文封在引擎硬上限(32768)。这里把配置压到这条路能兑现的范围, 免得起服后每条请求才失败
+     * (09-19 实撞: V4 会话挂在 V4.1 模型上, /v1/models 通, 每条 chat 都回 "cuda prefill failed")。 */
+    const bool v41 = ds4_engine_is_v41(engine) != 0;
+    if (v41) {
+        const int cap = ds4_engine_v41_max_ctx();
+        if (cfg.ctx_size > cap) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: V4.1 上下文硬上限 %d, --ctx %d 压到 %d", cap, cfg.ctx_size, cap);
+            cfg.ctx_size = cap;
+        }
+        if (cfg.kv_disk_dir) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: V4.1 没有会话 KV, 磁盘 KV 缓存(%s)不开", cfg.kv_disk_dir);
+            cfg.kv_disk_dir = NULL;
+        }
+        if (cfg.batch_max >= 2) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: V4.1 没有会话, 并发批处理(%d)关", cfg.batch_max);
+            cfg.batch_max = 0;
+        }
+        server_log(DS4_LOG_DEFAULT, "ds4-server: V4.1 服务路: 贪心解码, 每条请求整段预填, ctx %d", cfg.ctx_size);
+    } else {
+        log_context_memory(cfg.engine.backend, cfg.ctx_size);
+    }
     if (cfg.engine.distributed.role == DS4_DISTRIBUTED_COORDINATOR &&
         cfg.kv_cache.continued_interval_tokens > 0) {
         /* Mid-prefill continued checkpoints need a QUIESCENT frontier to stage
@@ -45,7 +66,7 @@ int main(int argc, char **argv) {
     }
 
     ds4_session *session = NULL;
-    if (ds4_session_create(&session, engine, cfg.ctx_size) != 0) {
+    if (!v41 && ds4_session_create(&session, engine, cfg.ctx_size) != 0) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: failed to create %s session",
                    ds4_backend_name(cfg.engine.backend));
         ds4_engine_close(engine);
@@ -58,6 +79,7 @@ int main(int argc, char **argv) {
     s.session = session;
     s.default_tokens = cfg.default_tokens;
     s.max_output_tokens = cfg.max_output_tokens;
+    s.dry_multiplier = cfg.dry_multiplier; s.dry_base = cfg.dry_base; s.dry_allowed_length = cfg.dry_allowed_length;
     s.force_nothink = cfg.force_nothink;
     s.tool_primer = cfg.tool_primer;
     g_force_nothink = cfg.force_nothink;
@@ -171,7 +193,7 @@ int main(int argc, char **argv) {
     while (s.clients > 0) pthread_cond_wait(&s.clients_cv, &s.mu);
     pthread_mutex_unlock(&s.mu);
 
-    const ds4_tokens *tokens = ds4_session_tokens(s.session);
+    const ds4_tokens *tokens = s.session ? ds4_session_tokens(s.session) : NULL;
     if (s.kv.enabled && tokens && tokens->len >= s.kv.opt.min_tokens) {
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: persisting current KV cache before shutdown tokens=%d",

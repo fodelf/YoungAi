@@ -87,23 +87,24 @@ static void tokens_remove(ds4_tokens *dst, int pos, int n) {
     dst->len -= n;
 }
 
-/* Insert/remove the Think Max prefix inside the existing transcript.  The
- * prefix lives after BOS, before any system/developer text, which mirrors the
- * API rendering path.  Changing it invalidates the session because every later
- * token position would otherwise refer to the wrong prefix. */
+/* 重建对话头(BOS 之后、第一条 user 之前): [<｜System｜>] [max 档 effort 前缀] [system 正文]。
+ * V4.1 官方(encoding.py): <｜System｜> 只写一次, effort 前缀与 system 正文同住一个 system 块 ⇒ 前缀不能像以前那样
+ * 单独插拔(插拔会留下两个或零个 <｜System｜>), 改一次就整段重建。头一变, 后面每个位置的前缀都变, 会话作废。 */
 static void repl_chat_apply_max_prefix(ds4_engine *engine, repl_chat *chat, bool enable) {
-    if (enable && chat->max_prefix_tokens == 0) {
-        ds4_tokens prefix = {0};
-        ds4_chat_append_max_effort_prefix(engine, &prefix);
-        tokens_insert(&chat->transcript, 1, &prefix);
-        chat->max_prefix_tokens = prefix.len;
-        ds4_tokens_free(&prefix);
-        if (chat->session) ds4_session_invalidate(chat->session);
-    } else if (!enable && chat->max_prefix_tokens > 0) {
-        tokens_remove(&chat->transcript, 1, chat->max_prefix_tokens);
-        chat->max_prefix_tokens = 0;
-        if (chat->session) ds4_session_invalidate(chat->session);
-    }
+    if (chat->head_built && chat->head_max == enable) return;
+    if (chat->head_tokens > 0) tokens_remove(&chat->transcript, 1, chat->head_tokens);
+    ds4_tokens head = {0};
+    ds4_chat_begin(engine, &head);   /* 临时带 BOS: core 判"system 块开没开"要看到与真实对话一样的开头 */
+    if (enable) ds4_chat_append_max_effort_prefix(engine, &head);
+    if (chat->system && chat->system[0]) ds4_chat_append_message(engine, &head, "system", chat->system);
+    ds4_tokens body = { .v = head.v + 1, .len = head.len - 1, .cap = 0 };   /* 去掉临时 BOS */
+    tokens_insert(&chat->transcript, 1, &body);
+    chat->head_tokens = body.len;
+    chat->head_max = enable;
+    const bool changed = chat->head_built;   /* 第一次建头还没有会话, 没什么可作废 */
+    chat->head_built = true;
+    ds4_tokens_free(&head);
+    if (changed && chat->session) ds4_session_invalidate(chat->session);
 }
 
 static int repl_chat_create_session(ds4_engine *engine, repl_chat *chat, int ctx_size) {
@@ -120,12 +121,10 @@ static int repl_chat_create_session(ds4_engine *engine, repl_chat *chat, int ctx
 
 static int repl_chat_init(ds4_engine *engine, repl_chat *chat, const cli_config *cfg) {
     memset(chat, 0, sizeof(*chat));
+    chat->system = cfg->gen.system;
     ds4_chat_begin(engine, &chat->transcript);
     repl_chat_apply_max_prefix(engine, chat,
-                               cli_effective_think_mode(&cfg->gen) == DS4_THINK_MAX);
-    if (cfg->gen.system && cfg->gen.system[0]) {
-        ds4_chat_append_message(engine, &chat->transcript, "system", cfg->gen.system);
-    }
+                               cli_effective_think_mode(&cfg->gen) == DS4_THINK_MAX);   /* 头(前缀 + system)整段在这里建 */
     return repl_chat_create_session(engine, chat, cfg->gen.ctx_size);
 }
 

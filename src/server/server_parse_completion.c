@@ -91,6 +91,7 @@ bool parse_completion_request(ds4_engine *e, const char *body, int def_tokens,
                 goto bad;
             }
             r->temperature = (float)v;
+            r->temperature_set = true;
         } else if (!strcmp(key, "top_p")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -184,7 +185,8 @@ bool parse_completion_request(ds4_engine *e, const char *body, int def_tokens,
     }
     buf rendered = {0};
     buf_puts(&rendered, "<｜begin▁of▁sentence｜>");
-    if (r->think_mode == DS4_THINK_MAX) buf_puts(&rendered, ds4_think_max_prefix());
+    buf_puts(&rendered, ds4_chat_system_token());   /* V4.1: 注入的 system 正文前先开 system 块(与 chat 路同一条规则) */
+    buf_puts(&rendered, ds4_think_effort_prefix(r->think_mode));
     buf_puts(&rendered, "You are a helpful assistant<｜User｜>");
     buf_puts(&rendered, prompt);
     buf_puts(&rendered, "<｜Assistant｜>");

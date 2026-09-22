@@ -142,6 +142,38 @@ bool http_error(int fd, bool enable_cors, int code, const char *msg) {
     return ok;
 }
 
+/* 对端还在不在: 非阻塞探一下, 不读走任何数据。
+ *
+ * ★为什么要它★(2026-09-22 早盘实撞): 非流式请求在生成期间一个字节都不写, 客户端超时放弃/断开时
+ * 服务端毫不知情, 会把一条 16384 token 的请求一直算到底。那天一条 132k token 的请求被客户端
+ * 重发了 4 遍(贪心 ⇒ 四次输出逐字节相同), 102 分钟 GPU 全算给了已经挂断的连接; 而本服务串行跑图,
+ * 这些僵尸请求把队列堵成"每一次重试都必然超时"的死循环。流式路本来就能靠写失败发现(见 sse_chunk),
+ * 非流式路只能自己探。
+ *
+ * 判据: POLLHUP/POLLERR/POLLNVAL, 或者可读且 recv(MSG_PEEK) 返回 0(对端发过 FIN)。
+ * ★可读且真有数据不算走★: 那是客户端在发下一个请求的字节, 本服务一条连接只服务一条请求, 不拿它当断开。
+ * 不用 POLLRDHUP: 它要 _GNU_SOURCE 且 macOS 没有, 而半关闭在两边都表现为"可读 + peek 到 0 字节"。 */
+bool client_disconnected(int fd) {
+    if (fd < 0) return false;
+    struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
+    int rc;
+    do {
+        rc = poll(&pfd, 1, 0);
+    } while (rc < 0 && errno == EINTR);
+    if (rc <= 0) return false;   /* 出错也当"还在": 探测本身绝不能成为掐生成的理由 */
+    if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) return true;
+    if (pfd.revents & POLLIN) {
+        char probe;
+        ssize_t n;
+        do {
+            n = recv(fd, &probe, 1, MSG_PEEK);
+        } while (n < 0 && errno == EINTR);
+        if (n == 0) return true;
+        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) return true;
+    }
+    return false;
+}
+
 static const char *context_length_error_param(const request *r) {
     if (!r) return "prompt";
     if (r->api == API_RESPONSES) return "input";

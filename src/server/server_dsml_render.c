@@ -373,7 +373,13 @@ char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
 
     buf out = {0};
     buf_puts(&out, "<｜begin▁of▁sentence｜>");
-    if (think_mode == DS4_THINK_MAX) buf_puts(&out, ds4_think_max_prefix());
+    /* ★V4.1 官方 encoding.py★: 有 system 正文或 thinking 的 effort 前缀 ⇒ 先写 <｜System｜>(一次), 再前缀, 再 system 正文。
+     * 2026-09-21 实撞: 这里原来是 V4 写法(BOS 后直接 system 正文, 前缀只在 max 档且是一段英文长段落), V4.1 的 tokenizer
+     * 新增了 <｜System｜>(id 128799), 漏掉它 = 每条带 system 的产品请求都跑在模型没训练过的格式上(bug.md §1)。
+     * V4 的 tokenizer 没这个 token, 那时 ds4_chat_system_token() 是空串, 渲染退回原样。金标单测: test_render_matches_official_v41_encoding。 */
+    const char *effort = ds4_think_effort_prefix(think_mode);
+    if (effort[0] || system.len) buf_puts(&out, ds4_chat_system_token());
+    buf_puts(&out, effort);
     buf_puts(&out, system.ptr ? system.ptr : "");
 
     bool pending_assistant = false;

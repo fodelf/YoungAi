@@ -124,7 +124,7 @@ static void append_model_json(buf *b, const server *s, const char *id) {
     append_model_json_values(b,
                              id,
                              ds4_engine_model_name(s->engine),
-                             ds4_session_ctx(s->session),
+                             server_ctx_size(s),
                              s->default_tokens);
 }
 
@@ -201,7 +201,7 @@ void *client_main(void *arg) {
     request req;
     char err[160];
     bool ok = false;
-    const int ctx_size = ds4_session_ctx(s->session);
+    const int ctx_size = server_ctx_size(s);
     if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
         ok = parse_anthropic_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));

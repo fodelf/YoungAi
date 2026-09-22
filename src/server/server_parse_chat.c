@@ -88,6 +88,7 @@ bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_toke
                 goto bad;
             }
             r->temperature = (float)v;
+            r->temperature_set = true;
         } else if (!strcmp(key, "frequency_penalty")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -116,6 +117,16 @@ bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_toke
                 goto bad;
             }
             r->min_p = (float)v;
+        } else if (!strcmp(key, "dry_multiplier") || !strcmp(key, "dry_base") || !strcmp(key, "dry_allowed_length")) {
+            /* DRY 三个旋钮(与 llama.cpp 同名): 只要出现 dry_multiplier 就按请求走, base/allowed 没给用默认 1.75/2 */
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            if (!strcmp(key, "dry_multiplier")) { r->dry_multiplier = (float)v; r->dry_set = true; }
+            else if (!strcmp(key, "dry_base")) r->dry_base = (float)v;
+            else r->dry_allowed_length = (int)v;
         } else if (!strcmp(key, "top_k")) {
             if (!json_int(&p, &r->top_k)) {
                 free(key);

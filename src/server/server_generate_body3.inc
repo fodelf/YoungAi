@@ -188,6 +188,19 @@
                 }
             }
 
+            /* 客户端走了就别再算(2026-09-22, 与 V4.1 路同一条判据): 非流式请求整个生成期间不写字节,
+             * 不主动探就发现不了对端挂断, 而本服务串行跑图 —— 僵尸请求会把后面排队的也拖超时。 */
+            if (completion >= next_alive_check) {
+                next_alive_check = completion + 16;
+                if (client_disconnected(j->fd)) {
+                    finish = "error";
+                    snprintf(err, sizeof(err), "client disconnected after %d generated tokens", completion);
+                    trace_event(s, trace_id, "client disconnected after %d generated tokens", completion);
+                    stop_decode = true;
+                    break;
+                }
+            }
+
             if (completion >= next_decode_log) {
                 log_decode_progress(j->req.kind, prompt_tokens, completion,
                                     responses_protocol,
@@ -268,10 +281,14 @@
     }
 
     /* --max-output-tokens truncation is SERVER policy, not the client's own
-     * limit: report a normal stop ("end_turn"/"stop") instead of "length".
-     * Claude Code treats stop_reason=max_tokens as "response exceeded my
-     * configured maximum" and aborts the whole session (measured 2026-07-07). */
+     * limit.  Anthropic path only: report a normal stop ("end_turn") instead of
+     * "length", because Claude Code treats stop_reason=max_tokens as "response
+     * exceeded my configured maximum" and aborts the whole session (measured
+     * 2026-07-07).  OpenAI/Responses keep the truthful "length" (2026-09-22):
+     * a caller that stores the answer must be able to tell a finished report
+     * from one the server cut off mid-sentence. */
     if (!strcmp(finish, "length") &&
+        j->req.api == API_ANTHROPIC &&
         s->max_output_tokens > 0 &&
         completion >= s->max_output_tokens &&
         j->req.max_tokens > s->max_output_tokens)

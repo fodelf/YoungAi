@@ -98,6 +98,9 @@ void usage(FILE *fp) {
         "  --max-output-tokens N\n"
         "      Hard server-side cap on output tokens per request, overriding larger client limits.\n"
         "      0 disables; protects a single-worker local server from runaway generations. Default: 0\n"
+        "  --dry-multiplier F [--dry-base F] [--dry-allowed-length N]\n"
+        "      DRY sequence-repetition penalty on the V4.1 decode path, applied to every request (works at temperature 0).\n"
+        "      0 disables (default: bare model output). Defaults: base 1.75, allowed length 2\n"
         "  --nothink\n"
         "      Force non-thinking mode for every request, ignoring client thinking configs.\n"
         "      For served base models without think training.\n"
@@ -112,6 +115,8 @@ void usage(FILE *fp) {
         "      DSpark speculative decoding + online scheduler (greedy-lossless).\n"
         "  --draft-gguf FILE | --draft-zchain FILE\n"
         "      Standalone DSpark drafter GGUF and its amplifier sidecar.\n"
+        "  --posttrain DIR\n"
+        "      V4.1 three-file deploy, third file: post-training gain directory multiplied into --zchain.\n"
         "  --mm-image-cmd CMD\n"
         "      External multimodal image encoder command (default: probe ./mm-ui).\n"
         "  --mem-budget-mb N\n"
@@ -248,6 +253,7 @@ server_config parse_options(int argc, char **argv) {
         .ctx_size = DS4_DEFAULT_CTX_SIZE,
         .default_tokens = SERVER_DEFAULT_MAX_TOKENS,
         .max_output_tokens = 0,
+        .dry_multiplier = 0.0f, .dry_base = 1.75f, .dry_allowed_length = 2,
         .force_nothink = false,
         .tool_primer = false,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
@@ -294,6 +300,9 @@ server_config parse_options(int argc, char **argv) {
             c.engine.corr_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--zchain")) {
             c.engine.zchain_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--posttrain")) {
+            /* 三文件部署第三件(V4.1): 与 --zchain 同构的增益目录, 装载时与 ② 逐元素相乘。与 CLI 同一个全局 setter。 */
+            ds4_engine_v41_set_posttrain_dir(need_arg(&i, argc, argv, arg));
         } else if (!strcmp(arg, "--finetune")) {
             c.engine.finetune_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--residual")) {
@@ -329,6 +338,12 @@ server_config parse_options(int argc, char **argv) {
             c.default_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--max-output-tokens")) {
             c.max_output_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--dry-multiplier")) {
+            c.dry_multiplier = (float)atof(need_arg(&i, argc, argv, arg));
+        } else if (!strcmp(arg, "--dry-base")) {
+            c.dry_base = (float)atof(need_arg(&i, argc, argv, arg));
+        } else if (!strcmp(arg, "--dry-allowed-length")) {
+            c.dry_allowed_length = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--nothink")) {
             c.force_nothink = true;
         } else if (!strcmp(arg, "--tool-primer")) {

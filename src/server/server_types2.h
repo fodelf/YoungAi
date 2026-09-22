@@ -254,6 +254,10 @@ struct server {
      * a client asking for max_tokens=32000 (e.g. Claude Code utility calls)
      * must not pin the single graph worker for hours. */
     int max_output_tokens;
+    /* --dry-multiplier/--dry-base/--dry-allowed-length(2026-09-21, 113-1.md §4): V4.1 生成路的 DRY 序列复读惩罚, 服务级开关
+     * (客户端协议里没有这个字段; qtf 这种调用方也不会传)。0 = 关 = 裸模型真值; 开了对每条请求生效, 温 0 也生效。 */
+    float dry_multiplier, dry_base;
+    int dry_allowed_length;
     /* --nothink: force non-thinking mode for every request. For served base
      * models with no think training, client-side thinking configs (Claude Code
      * sends them explicitly) would otherwise burn the whole output budget on
@@ -431,6 +435,7 @@ typedef struct {
     bool tool_primer;
     bool force_nothink;
     int max_output_tokens;
+    float dry_multiplier, dry_base; int dry_allowed_length;   /* 见 server_config 同名字段 */
     int default_tokens;
     const char *chdir_path;
     const char *trace_path;

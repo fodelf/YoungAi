@@ -16,6 +16,7 @@ decode_again:
     size_t tool_scan_from = 0;
     int next_tool_progress = 128;
     int next_decode_log = 50;
+    int next_alive_check = 16;   /* 每 16 个 token 探一次对端还在不在(与 V4.1 路同一条: server_http.c client_disconnected) */
     if (max_tokens < 0) max_tokens = 0;
     if (max_tokens > room) max_tokens = room;
     /* --max-output-tokens: server-side hard cap regardless of the client's

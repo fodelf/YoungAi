@@ -142,16 +142,21 @@ void test_render_think_max_prompt_prefix(void) {
     user.content = xstrdup("Hello");
     chat_msgs_push(&msgs, user);
 
+    ds4_chat_set_system_token(true);   /* 离线单测没有引擎: 模拟 V4.1 tokenizer(有 <｜System｜>) */
     char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_MAX, NULL);
+    ds4_chat_set_system_token(false);
     TEST_ASSERT(prompt != NULL);
-    TEST_ASSERT(!strncmp(prompt, "<｜begin▁of▁sentence｜>", strlen("<｜begin▁of▁sentence｜>")));
-    TEST_ASSERT(strstr(prompt, ds4_think_max_prefix()) != NULL);
-    TEST_ASSERT(strstr(prompt, "You are terse.<｜User｜>Hello<｜Assistant｜><think>") != NULL);
-    TEST_ASSERT(strstr(prompt, "</think>") == NULL);
+    TEST_ASSERT(prompt && !strcmp(prompt,
+        "<｜begin▁of▁sentence｜><｜System｜>"
+        "Reasoning Effort: 100 (range 1-100, the higher the value, the more thorough the reasoning)\n\n"
+        "You are terse.<｜User｜>Hello<｜Assistant｜><think>"));
+    TEST_ASSERT(prompt && strstr(prompt, ds4_think_max_prefix()) != NULL);
 
     free(prompt);
     chat_msgs_free(&msgs);
 }
+
+/* V4.1 官方渲染的金标用例在 tests/server_tests_render_v41.c(本文件已到 500 行) */
 
 void test_render_non_thinking_prompt_closes_think(void) {
     chat_msgs msgs = {0};

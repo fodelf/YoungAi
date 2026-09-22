@@ -206,7 +206,7 @@ static bool joyai_cjk_at(const char *s, uint64_t len, uint64_t pos) {
  */
 /* JoyAI/DeepSeek pre-tokenization.  The split shape matters: different pieces
  * lead to different BPE merges even when the final text bytes are identical. */
-static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_vec *out) {
+void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_vec *out) {   /* 聊天角色帧(core_chat_frame.c)也用 */
     const uint64_t len = strlen(text);
     uint64_t pos = 0;
 
@@ -285,6 +285,12 @@ static int vocab_lookup(const ds4_vocab *vocab, const char *text) {
     return token;
 }
 
+/* 可选的特殊 token: 没有就返回 -1, 不退出。<｜System｜> 只有 V4.1 的 tokenizer 有(V4 没有), 按 tokenizer 内容分版本, 不写版本名。 */
+static int vocab_lookup_opt(const ds4_vocab *vocab, const char *text) {
+    int token = -1;
+    return table_get(&vocab->token_to_id, text, strlen(text), &token) ? token : -1;
+}
+
 /* Load token strings, special token ids, and merge ranks from GGUF metadata. */
 void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
     memset(vocab, 0, sizeof(*vocab));
@@ -323,6 +329,8 @@ void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
     vocab->eos_id       = vocab_lookup(vocab, "<｜end▁of▁sentence｜>");
     vocab->user_id      = vocab_lookup(vocab, "<｜User｜>");
     vocab->assistant_id = vocab_lookup(vocab, "<｜Assistant｜>");
+    vocab->system_id    = vocab_lookup_opt(vocab, "<｜System｜>");
+    g_ds4_chat_system_token = vocab->system_id >= 0;   /* 文本渲染路(服务端)按它决定写不写 <｜System｜> */
     vocab->think_start_id = vocab_lookup(vocab, "<think>");
     vocab->think_end_id = vocab_lookup(vocab, "</think>");
     vocab->dsml_id = vocab_lookup(vocab, "｜DSML｜");
@@ -335,32 +343,7 @@ void vocab_free(ds4_vocab *vocab) {
     memset(vocab, 0, sizeof(*vocab));
 }
 
-/* Build the DS4 chat prompt: BOS, optional system text, user prompt, assistant
- * marker, and either <think> or </think> depending on the requested mode.  Max
- * thinking is only a prompt prefix: the model still enters through <think>. */
-static void encode_chat_prompt(
-        const ds4_vocab *vocab,
-        const char      *system,
-        const char      *prompt,
-        ds4_think_mode   think_mode,
-        token_vec       *out) {
-    token_vec_push(out, vocab->bos_id);
-    if (think_mode == DS4_THINK_MAX) {
-        bpe_tokenize_text(vocab, DS4_REASONING_EFFORT_MAX_PREFIX, out);
-    }
-    if (system && system[0]) {
-        bpe_tokenize_text(vocab, system, out);
-    }
-    token_vec_push(out, vocab->user_id);
-    bpe_tokenize_text(vocab, prompt, out);
-    token_vec_push(out, vocab->assistant_id);
-    if (ds4_think_mode_enabled(think_mode)) {
-        token_vec_push(out, vocab->think_start_id);
-    } else {
-        token_vec_push(out, vocab->think_end_id);
-    }
-}
-
+/* 聊天角色帧(BOS/System/User/Assistant/think 的拼法)在 core_chat_frame.c —— 这里只管 BPE 与特殊 token 的切分。 */
 void ds4_tokenize_text(ds4_engine *e, const char *text, ds4_tokens *out) {
     bpe_tokenize_text(&e->vocab, text ? text : "", out);
 }
@@ -374,12 +357,14 @@ static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, 
         {"<｜end▁of▁sentence｜>",   vocab->eos_id},
         {"<｜User｜>",              vocab->user_id},
         {"<｜Assistant｜>",         vocab->assistant_id},
+        {"<｜System｜>",            vocab->system_id},   /* V4.1 才有; -1 时下面跳过, 文本照普通字符切 */
         {"<think>",                vocab->think_start_id},
         {"</think>",               vocab->think_end_id},
         {"｜DSML｜",                vocab->dsml_id},
     };
 
     for (size_t i = 0; i < sizeof(specials) / sizeof(specials[0]); i++) {
+        if (specials[i].token < 0) continue;
         size_t n = strlen(specials[i].text);
         if (!strncmp(p, specials[i].text, n)) {
             *token = specials[i].token;
@@ -422,51 +407,6 @@ void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *text,
 
 void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out) {
     tokenize_rendered_chat_vocab(&e->vocab, text, out);
-}
-
-void ds4_chat_begin(ds4_engine *e, ds4_tokens *tokens) {
-    token_vec_push(tokens, e->vocab.bos_id);
-}
-
-void ds4_encode_chat_prompt(
-        ds4_engine *e,
-        const char *system,
-        const char *prompt,
-        ds4_think_mode think_mode,
-        ds4_tokens *out) {
-    encode_chat_prompt(&e->vocab, system, prompt ? prompt : "", think_mode, out);
-}
-
-void ds4_chat_append_max_effort_prefix(ds4_engine *e, ds4_tokens *tokens) {
-    bpe_tokenize_text(&e->vocab, DS4_REASONING_EFFORT_MAX_PREFIX, tokens);
-}
-
-void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role, const char *content) {
-    ds4_vocab *vocab = &e->vocab;
-    if (!role) role = "user";
-    if (!content) content = "";
-
-    if (!strcmp(role, "system") || !strcmp(role, "developer")) {
-        bpe_tokenize_text(vocab, content, tokens);
-    } else if (!strcmp(role, "assistant")) {
-        token_vec_push(tokens, vocab->assistant_id);
-        if (strncmp(content, "<think>", 7) != 0 && strncmp(content, "</think>", 8) != 0) {
-            token_vec_push(tokens, vocab->think_end_id);
-        }
-        bpe_tokenize_text(vocab, content, tokens);
-    } else {
-        token_vec_push(tokens, vocab->user_id);
-        if (!strcmp(role, "tool") || !strcmp(role, "function")) {
-            bpe_tokenize_text(vocab, "Tool: ", tokens);
-        }
-        bpe_tokenize_text(vocab, content, tokens);
-    }
-}
-
-void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode) {
-    token_vec_push(tokens, e->vocab.assistant_id);
-    token_vec_push(tokens, ds4_think_mode_enabled(think_mode) ?
-                   e->vocab.think_start_id : e->vocab.think_end_id);
 }
 
 void dump_tokens_fp(FILE *fp, const ds4_vocab *vocab, const token_vec *tokens) {

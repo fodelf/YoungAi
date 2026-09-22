@@ -193,7 +193,9 @@ struct ds4_session {
 };
 
 /* ---- 跨文件全局与函数声明(拆分工序新增; 定义处已去 static) ---- */
+extern const char DS4_REASONING_EFFORT_HIGH_PREFIX[];
 extern const char DS4_REASONING_EFFORT_MAX_PREFIX[];
+extern bool g_ds4_chat_system_token;   /* 装载的 tokenizer 有 <｜System｜>(core_bpe.c 装 vocab 时置); 文本渲染路(服务端)靠它决定写不写 */
 extern uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER];
 extern uint32_t g_requested_threads;
 extern const gguf_type_info gguf_types[45];   /* [43]=fp4x32(V4.1 骨架) [44]=fp8_32x32(engram wkv) */
@@ -381,6 +383,10 @@ uint32_t routed_expert_quant_type(const ds4_layer_weights *l);
 DS4_MAYBE_UNUSED uint64_t routed_expert_row_bytes(const ds4_tensor *t);
 uint64_t routed_expert_up_off(const ds4_layer_weights *l);
 int sample_top_p_min_p( const float *logits, uint32_t n_vocab, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
+/* 解码复读惩罚(core_decode_penalty.c): 只对生成段 gen[n] 算; breaker = 断点表(ds4_decode_breakers 建, 按词表大小) */
+void ds4_decode_penalize(float *logits, uint32_t n_vocab, const int32_t *gen, uint32_t n, const uint8_t *breaker,
+                         float freq, float presence, float dry_mult, float dry_base, int dry_allowed);
+uint8_t *ds4_decode_breakers(ds4_engine *e, uint32_t n_vocab);
 uint32_t session_cpu_comp_cap(const ds4_session *s);
 uint64_t session_cpu_payload_live_tensor_bytes(const ds4_session *s);
 uint32_t session_cpu_raw_live_rows(const ds4_session *s);
@@ -399,6 +405,7 @@ const gguf_type_info *tensor_type(uint32_t type);
 const char *tensor_type_name(uint32_t type);
 void token_vec_free(token_vec *tv);
 void token_vec_push(token_vec *tv, int token);
+void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_vec *out);   /* core_bpe.c; 角色帧(core_chat_frame.c)用 */
 int utf8_len_from_first_byte(uint8_t c);
 void vocab_free(ds4_vocab *vocab);
 void vocab_load(ds4_vocab *vocab, const ds4_model *model);

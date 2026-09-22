@@ -317,9 +317,18 @@ bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
     if (require_thinking_closed) {
         const char *think_end = find_last_substr(text, "</think>");
         if (!think_end) {
-            /* Model did not close thinking, ignore any DSML in reasoning */
-            fprintf(stderr, "ds4-server: thinking not closed, ignoring DSML in reasoning\n");
-            split_reasoning_content(text, strlen(text), content_out, reasoning_out);
+            /* ★思考没闭合 = 这一轮没有正文★(2026-09-22 改, 按官方 deepseek-reasoner 语义: 思考被上限截断时
+             * reasoning_content 放已想的部分, content 空, finish_reason=length)。
+             * 以前这里把整段思考当 content 返回, 于是同一台服务两种协议给相反的答案 —— 流式路
+             * (server_openai_stream.c OPENAI_STREAM_THINKING)看不到 </think> 时全部走 reasoning_content,
+             * 非流式路却把它当正文。实撞代价(2026-09-22 早盘): 大盘趋势那条 16384 token 全是英文思考,
+             * 调用方当成最终答案收下, 再用子串匹配从复述的提示模板里"解析"出涨跌结论, 据此启动了下游选股。
+             * DSML 照旧不认(思考里的工具块不可执行, 这条没变)。 */
+            fprintf(stderr, "ds4-server: thinking not closed, returning it as reasoning with empty content\n");
+            const char *body = text;
+            if (!strncmp(body, "<think>", 7)) body += 7;
+            *reasoning_out = xstrdup(body);
+            *content_out = xstrdup("");
             return true;
         }
         tool_search = think_end + 8;

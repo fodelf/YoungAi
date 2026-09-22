@@ -201,6 +201,7 @@ typedef struct {
     int max_tokens;
     int top_k;
     float temperature;
+    bool temperature_set;   /* 请求显式带了 temperature(2026-09-21): V4.1 生成路没带 = 裸 argmax(09-19 起的状态), 带了就照办, 不再静默忽略 */
     float top_p;
     float min_p;
     /* OpenAI frequency_penalty / presence_penalty (chat completions + responses;
@@ -208,6 +209,12 @@ typedef struct {
      * ((0,0) 即清除), 语义在核心采样器且只数生成区。 */
     float frequency_penalty;
     float presence_penalty;
+    /* DRY 序列复读惩罚(2026-09-22 起可按请求给; 以前只有服务启动参数 --dry-*)。
+     * dry_set = 请求里出现过 dry_multiplier ⇒ 这一条请求用请求里的三个值, 否则用服务默认。
+     * 为什么要按请求: 复读惩罚该由调用方按活儿定(长报告要, 抄数不要), 而且扫参数不必每次重启服务(一次 100 s 装载)。 */
+    float dry_multiplier, dry_base;
+    int dry_allowed_length;
+    bool dry_set;
     uint64_t seed;
     bool stream;
     bool stream_include_usage;

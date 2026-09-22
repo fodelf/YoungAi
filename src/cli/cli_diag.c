@@ -38,7 +38,15 @@ static int v41_emit_print(int token, void *ud) {
     return 0;
 }
 int run_v41_generation(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
-    if (cfg->gen.temperature > 0.0f) fprintf(stderr, "ds4: V4.1 当前只有贪心解码(temp 0), 忽略 --temp %.2f\n", (double)cfg->gen.temperature);
+    /* 解码采样(2026-09-21, 113-1.md §4): 只在显式给了 --temp 时开(不给 = 裸 argmax, 尺脚本零改动; 见 cli_internal.h temp_given)。
+     * top_k 0 = 全词表, 与 V4 CLI 的 ds4_session_sample(…, 0, …) 同口径。 */
+    const ds4_decode_sampling sp = {
+        .temperature = cfg->gen.temp_given ? cfg->gen.temperature : 0.f, .top_p = cfg->gen.top_p, .min_p = cfg->gen.min_p,
+        .top_k = 0, .seed = cfg->gen.seed, .freq_penalty = 0.f, .presence_penalty = 0.f,
+        .dry_multiplier = cfg->gen.dry_multiplier, .dry_base = cfg->gen.dry_base > 1.f ? cfg->gen.dry_base : 1.75f,
+        .dry_allowed_length = cfg->gen.dry_allowed_length > 0 ? cfg->gen.dry_allowed_length : 2,
+    };
+    ds4_engine_set_decode_sampling(&sp);
     ds4_engine_v41_set_prof(cfg->gen.v41_prof);
     ds4_engine_v41_set_decoder_full(cfg->gen.decoder_full);
     /* 两个标志同时给 = 关(显式的"关"压过显式的"开", 免得脚本里两条都留着还以为开着) */

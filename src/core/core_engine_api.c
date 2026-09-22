@@ -80,6 +80,25 @@ const char *ds4_think_max_prefix(void) {
     return DS4_REASONING_EFFORT_MAX_PREFIX;
 }
 
+const char *ds4_think_effort_prefix(ds4_think_mode mode) {
+    switch (mode) {
+    case DS4_THINK_HIGH: return DS4_REASONING_EFFORT_HIGH_PREFIX;
+    case DS4_THINK_MAX:  return DS4_REASONING_EFFORT_MAX_PREFIX;
+    case DS4_THINK_NONE: break;
+    }
+    return "";
+}
+
+/* 文本渲染路(服务端 render_chat_prompt_text 等)写 system 块的开头。V4 的 tokenizer 没有 <｜System｜>, 那时返回空串,
+ * 渲染退回"BOS 后直接 system 正文"。出错会怎样: 写了 token 文本而 tokenizer 不认 = 被当普通文本切碎进提示, 不报错。 */
+const char *ds4_chat_system_token(void) {
+    return g_ds4_chat_system_token ? "<｜System｜>" : "";
+}
+
+void ds4_chat_set_system_token(bool present) {
+    g_ds4_chat_system_token = present;
+}
+
 uint32_t ds4_think_max_min_context(void) {
     return DS4_THINK_MAX_MIN_CONTEXT;
 }

@@ -240,6 +240,9 @@ cli_config parse_options(int argc, char **argv) {
             ds4_tool_set_prefill_chunk(atoi(need_arg(&i, argc, argv, arg)));
         } else if (!strcmp(arg, "--mem-budget-mb")) {
             ds4_set_mem_budget_mb(parse_int(need_arg(&i, argc, argv, arg), arg));
+        } else if (!strcmp(arg, "--weight-cache-mb")) {
+            /* 设备权重缓存封顶(反修拟合/判决用, 见 ds4_gpu_core.h): 全局 setter(同 --mem-budget-mb), 不进 ds4_engine_opts */
+            ds4_gpu_set_model_cache_limit_mb((uint64_t)parse_int(need_arg(&i, argc, argv, arg), arg));
         } else if (!strcmp(arg, "--spec")) {
             c.engine.spec = true;
         } else if (!strcmp(arg, "--draft-gguf")) {
@@ -276,10 +279,17 @@ cli_config parse_options(int argc, char **argv) {
             c.gen.ctx_size = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--temp")) {
             c.gen.temperature = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 100.0f);
+            c.gen.temp_given = true;
         } else if (!strcmp(arg, "--top-p")) {
             c.gen.top_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
         } else if (!strcmp(arg, "--min-p")) {
             c.gen.min_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
+        } else if (!strcmp(arg, "--dry-multiplier")) {
+            c.gen.dry_multiplier = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 100.0f);
+        } else if (!strcmp(arg, "--dry-base")) {
+            c.gen.dry_base = parse_float_range(need_arg(&i, argc, argv, arg), arg, 1.0f, 100.0f);
+        } else if (!strcmp(arg, "--dry-allowed-length")) {
+            c.gen.dry_allowed_length = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--seed")) {
             c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--quality")) {

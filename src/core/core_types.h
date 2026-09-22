@@ -456,6 +456,7 @@ struct ds4_vocab {
     int eos_id;
     int user_id;
     int assistant_id;
+    int system_id;        /* <｜System｜>: V4.1 的 tokenizer 才有(id 128799), 没有 = -1, 聊天渲染就不写它(V4 的模板本来没有) */
     int think_start_id;
     int think_end_id;
     int dsml_id;
