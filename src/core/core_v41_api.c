@@ -201,6 +201,14 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
     uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : np + (uint32_t)(n_predict > 0 ? n_predict : 0) + 1;
     if (ctx < np + 1) ctx = np + 1;
     if (ctx > DS4_V41_MAX_CTX_P2C) ctx = DS4_V41_MAX_CTX_P2C;
+    /* ★只按这一趟真正用得到的位置分配★(2026-09-22): 状态里几个大块是 cap_tok × ctx 的
+     * (iscore f32 + cand u8 = ctx × 2.5 KB, 再加 kv 源层的 ctx/ratio 格), 传进来的 ctx 是服务端
+     * 配的**上限**, 不是这条请求能用到的长度。以前照上限分: --ctx 1M 时连一条 22 token 的请求
+     * 都要吃 2.5 GiB 打分矩阵, 于是"把上下文配大"被误当成"每条请求都贵"。
+     * 这一趟最多走到 np + n_predict 个位置(投机一轮会临时多推 ≤ 块长, 回滚前也要有地方放), 就分这么多。
+     * ctx 仍然是硬边界: 生成到 st->ctx 就停, 与配的上限语义一致(配得再大也不会多花一个字节)。 */
+    const uint64_t need = (uint64_t)np + (uint64_t)(n_predict > 0 ? n_predict : 0) + DS4_MTP_MAX_BLOCK + 2u;
+    if ((uint64_t)ctx > need) ctx = (uint32_t)need;
     const uint32_t ck = g_ds4_v41_chunk > 0 ? (uint32_t)g_ds4_v41_chunk : DS4_V41_CHUNK;
     const uint32_t cap = ck < np ? ck : np;
     ds4_v41_state st;
