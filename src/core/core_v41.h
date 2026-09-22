@@ -18,7 +18,17 @@
 #define V41_EDIO_ALIGN 4096u      /* O_DIRECT 的对齐粒度(逻辑块); 一行只有 264 B, 所以要读对齐超集 + 落脚点 */
 
 #define DS4_V41_CHUNK 512u          /* prefill 分块(缓冲按它分配; 对拍用 --v41-chunk 改小看自洽) */
-#define DS4_V41_MAX_CTX_P2C 32768u  /* topk/候选块核用 shared 存整段组数, 48 KB ⇒ ratio-1 层 ≤ 48k 组; P4 换 radix select 再放开 */
+/* 上下文硬上限。历史: topk 与候选块两个核都把"整段组数"放 shared(48 KB ⇒ ratio-1 层最多 ~78k 个位置),
+ * 所以这里一直写死 32768。topk 核 2026-09-16 换成固定 256 桶的 radix select, 候选块核 2026-09-21 把
+ * [nb] 两个数组挪进全局暂存 —— 两道 shared 墙都没了, 上限改由内存账定。
+ * ★开大的固定代价(按 cap_tok = DS4_V41_CHUNK = 512 算)★: iscore [512][ctx] f32 + cand [512][ctx] u8 = ctx×2.5 KB,
+ * 加 4 个 kv 源层的压缩 KV/索引键 (ctx/ratio)×360 B、候选暂存 512×(ctx/8)×5 B ⇒ 524288 时约 2.4 GiB, 建状态时一次吃掉。
+ * 速度不受它影响: 解码走图的桶按当前位置算(core_decode_graph.c), 核只扫真实组数, 短上下文还是短上下文。
+ * ★2026-09-22 抬到 1M(用户定: "上下文设置为 1m")★: 按上面的账 1048576 约 4.8 GiB, 比 524288 多吃 2.4 GiB。
+ * spark 实测容得下: 113.6 GB 模型装完 MemAvailable 约 12 GB, 一条请求的状态 + 前向缓冲在 500k 档占 5.3 GB
+ * (量到剩 6.4~6.7 GB), 1M 档多 2.4 GiB ⇒ 请求中剩约 4 GB, 在看门狗红线 2.5 GB 之上。
+ * 调用方(crewAI)本来就按 1M 报上下文窗口, 服务端报少了会在长提示上直接 400。 */
+#define DS4_V41_MAX_CTX_P2C 1048576u
 
 typedef struct {
     uint32_t cap_tok, ctx;      /* 每块最多 token 数 / 位置容量 */
@@ -42,6 +52,9 @@ typedef struct {
     uint32_t snap_n;             /* 快照那一批有几位(= 验证批 1+k): 回滚只还原 [keep, snap_n) 那几格环 */
     uint32_t cpend[DS4_MAX_LAYER];   /* 源层余行数(= pos0 % ratio) */
     uint32_t ng_src[DS4_MAX_LAYER];  /* 源层缓存里的组数(含本 chunk 新完成的) */
+    uint32_t win_from[DS4_MAX_LAYER];   /* ★本层窗口环里最早有效的绝对位置★(2026-09-21, bug.md §6.2): CED 跳过解码器段的块
+                                 * 不写 L20~L39 的环, 那些位置的槽是脏的; 注意力核把窗口下界钳到它(官方 get_window_topk_idxs
+                                 * 未填槽标 -1 屏蔽, 这是同一语义)。编码器层与 --decoder-full 恒 0。 */
     ds4_gpu_tensor *iq, *iw, *iscore, *cand, *idx;       /* [cap][32·128], [cap][32], [cap][ctx], u8 [cap][ctx], i32 [cap][512] */
     ds4_gpu_tensor *o, *low, *attn_out;                  /* [cap][64·512], [cap][8192], [cap][E] */
     ds4_gpu_tensor *glog, *sel, *rw, *routed;            /* [cap][384], i32 [cap][6], [cap][6], [cap][E] */
@@ -74,14 +87,19 @@ typedef struct {
                                  * 所以提示的中间块根本不需要跑后半 40% 的层, 它们的输出没有任何下游消费者。
                                  * 只有最后一块要跑满(它同时充当官方说的"解码器有界回放")。 */
     /* ---- DSpark(speed.md 段 6 D1) ---- */
-    ds4_gpu_tensor *mainh;      /* [mainh_cap][n_target][E] 主前向顺手取的 main_hidden(只留本 chunk 末尾几行);
+    ds4_gpu_tensor *mainh;      /* [mainh_cap][n_target][E] 主前向顺手取的 main_hidden, ★按绝对位置定格的环★(位置 p 在第 p % cap 格;
+                                 * 2026-09-18 起, 以前是"只留本 chunk 末尾几行", 歇过的位置进不了三塔窗口, 见 ds4_gpu_v41.h hc_mean 注释)。
                                  * ★取的是目标层的**注意力输入**(engram 之后、层之前的 hc 四路均值), 不是层输出 ——
                                  * 取错不报错, 只是接受率掉到 1 附近(speed.md §7)。 */
-    uint32_t mainh_cap, mainh_rows;
+    uint32_t mainh_cap, mainh_wrote;   /* mainh_wrote: 本次前向写了几行(v41_layer 置, v41_forward 收账用) */
+    int64_t mainh_end;          /* 环里最新一行的绝对位置(-1 = 还没有); 有效行 = 以它结尾、往前连续的 mainh_n 行 */
+    uint32_t mainh_n;           /* ★为什么要记连续段★: CED 跳过解码器段的预填块不写 mainh、投机回滚要作废被拒的行 ——
+                                 * 只有"以 mainh_end 结尾的连续 mainh_n 行"是真的, 草稿器补窗口只许从这段里取 */
     int draft;                  /* 1 = 这个 state 是草稿塔的: 层权重走 weights.mtp.tower[il], 无 engram/无压缩 KV,
-                                 * 注意力块内全可见, MoE 走逐专家 FP4。主状态恒 0。 */
+                                 * 注意力块内全可见, MoE 按盘上形态走逐专家 FP4 或塔 VQ blob。主状态恒 0。 */
     ds4_gpu_tensor *main_x;     /* 草稿态: [n][E] 块注意力的 KV 来源(main_norm(main_proj(main_hidden))) */
-    const uint64_t *tower_exp_off[DS4_MTP_MAX_TOWERS];   /* 每塔 [3][n_expert] 专家张量偏移表 */
+    const uint64_t *tower_exp_off[DS4_MTP_MAX_TOWERS];   /* 每塔 [3][n_expert] 专家张量偏移表(逐专家 fp4x32 形态) */
+    const ds4_tensor *tower_exps_vq[DS4_MTP_MAX_TOWERS]; /* 每塔一个 VQ blob(100 GB 配方形态); 与上面二选一, 非空即走主干融合核 */
     uint32_t idx_topk;          /* 本 chunk 最近一个 indexer 源层产出的 topk 宽度 */
     uint32_t idx_ratio;         /* 产出上面那个 topk 的那一层的压缩比。注意力拿它按**每个 query 自己的
                                  * 绝对位置**算段长 —— 段长一旦吃了批级的量, 投机与纯解码就分段不同、
@@ -108,6 +126,9 @@ typedef struct {
      * 两边过同一个出口头 ⇒ 隐态对齐就是 logits 对齐。K=0 表示没挂, 整条路是恒等的。 */
     ds4_gpu_tensor *ampA, *ampB, *ampT;
     uint32_t ampK;
+    ds4_gpu_tensor *mainh_lin; /* [SWA][n_target][E] 从主态 mainh 环里按位置顺序取出来的连续行(main_proj 的一批输入) */
+    int64_t win_end;           /* 三塔窗口里最新一行的绝对位置(-1 = 空)。每轮草稿前把 (win_end, pos_main] 补进窗口 —— 缺多少补多少,
+                                * 超过 128 就整窗重建; 这样歇过几轮、走过 graph 步都不会断档 */
     uint32_t block, ready;
     int32_t host_ids[DS4_MTP_MAX_BLOCK + 1];
     float host_conf[DS4_MTP_MAX_BLOCK];
@@ -115,9 +136,10 @@ typedef struct {
 
 bool v41_draft_alloc(ds4_engine *e, ds4_v41_draft *dr);
 void v41_draft_free(ds4_v41_draft *dr);
-/* 一轮草稿: 主前向刚推进了 rows 个已确认位置(mainh 里有它们的 main_hidden), 最后一位是 tok/pos_main。
+/* 一轮草稿: 主模型最后处理的位置是 pos_main(它的 main_hidden 已在 main_st->mainh 环里), tok 是还没进主模型的下一个 token。
+ * 先把三塔窗口补到 pos_main(按 dr->win_end 算差, 从环里取), 再出块。
  * 出 dr->host_ids[1..block](草稿 token)与 dr->host_conf[0..block-1](每位的条件接受概率)。 */
-bool v41_draft_step(ds4_engine *e, ds4_v41_state *main_st, ds4_v41_draft *dr, int32_t tok, uint32_t pos_main, uint32_t rows);
+bool v41_draft_step(ds4_engine *e, ds4_v41_state *main_st, ds4_v41_draft *dr, int32_t tok, uint32_t pos_main);
 /* 置信调度(core_draft_sched.c): 这一轮该验几位。0 = 一位都不值得验; *value_out = 预测的"产出/成本"比值,
  * < 1 表示连草稿钱都赚不回来 —— 调用方拿它决定下一轮还出不出草稿。 */
 uint32_t v41_draft_pick_k(const float *conf, uint32_t block, float *value_out);
@@ -152,7 +174,9 @@ extern ds4_v41_moe_hook_fn g_ds4_v41_hook;   /* 反修钩子(ds4_engine_v41_set_
 extern void *g_ds4_v41_hook_ud;
 extern int g_ds4_v41_hook_layer;   /* 钩子只在这一层回调(-1=每层); 见 ds4_engine_v41_set_moe_hook_layer */
 bool v41_attention_kv_only(ds4_engine *e, ds4_v41_state *st, uint32_t il);   /* CED 分界层: 只写全局 KV */
+extern const ds4_model *g_ds4_v41_model;   /* 引擎打开时指向 e->model(core_engine_open.c): 路由偏置侧车要按层找 exp_probs_b 张量(core_v41_amp.c) */
 bool v41_amp_load(ds4_v41_state *st, const char *dir, const char *pt_dir);   /* core_v41_amp.c: ②反修目录 + ③后训练目录 */
+void v41_rb_clear_all(void);   /* 全卸路由偏置侧车(设备表是进程级的); 裸底座状态开张前调 */
 void v41_amp_free(ds4_v41_state *st);
 int v41_amp_hook(ds4_v41_state *st, uint32_t il);        /* 钩子回调(挂了才动): 同步 → x/y/sel/rw 下主机 → 回调; 0 继续 / 1 提前结束(置 stop_early) / <0 失败 */
 bool v41_amp_apply(ds4_v41_state *st, uint32_t il);      /* y += x·(B·A) → bf16(挂了该层才动) */
@@ -180,11 +204,14 @@ bool v41_spec_snapshot(ds4_v41_state *st, uint32_t n);          /* 验证批前:
 bool v41_spec_rollback(ds4_v41_state *st, uint32_t keep);       /* 验证批后: 只保留前 keep 个位置, 其余撤销 */
 bool v41_layer(ds4_engine *e, ds4_v41_state *st, uint32_t il);        /* 一层(主干层或草稿塔, 看 st->draft) */
 bool v41_attention(ds4_engine *e, ds4_v41_state *st, uint32_t il);   /* core_v41_attn.c: st->xn → st->attn_out, 更新各缓存 */
-/* 三塔投影按盘上类型分发(FP8 原件精度 / fp4x32 老 GGUF) —— 实现与所以然在 core_v41_attn.c */
+/* 稠密投影按【盘上登记类型】分发(FP8 原件精度 / q4_K 100GB 配方 / fp4x32) —— 实现与所以然在 core_v41_attn.c。
+ * ★骨架的每一处矩阵乘都要走这里★: 直接调某个具体格式的核, 换配方时就是拿错解码器读对的字节, 不报错只出假数。 */
 bool v41_tproj(const ds4_model *m, ds4_gpu_tensor *out, const ds4_tensor *w, uint64_t in_dim, uint64_t out_dim,
                const ds4_gpu_tensor *x, uint32_t n, int round_out);
 bool v41_tproj_grouped(const ds4_model *m, ds4_gpu_tensor *low, const ds4_tensor *w, uint32_t n_groups,
                        uint64_t group_dim, uint64_t rank, const ds4_gpu_tensor *heads, uint32_t n, int round_out);
+bool v41_embed(const ds4_model *m, ds4_gpu_tensor *out, const ds4_gpu_tensor *tok, const ds4_tensor *w,
+               uint64_t n_vocab, uint32_t n, uint64_t dim);
 bool v41_draft_push_main(ds4_engine *e, ds4_v41_state *st, uint32_t rows);   /* core_v41_attn.c: 已确认位置的 main_x 进各塔窗口 */
 bool v41_engram(ds4_engine *e, ds4_v41_state *st, uint32_t il);      /* core_v41_engram.c: 就地改 st->hc(engram 层才调) */
 bool v41_engram_prefetch(ds4_engine *e, ds4_v41_state *st);          /* 前向开头: 所有 engram 层的行一次性后台并行 pread */
