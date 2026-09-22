@@ -36,7 +36,9 @@ __global__ static void vqn_to_nvfp4_kernel(uint8_t *nib, uint8_t *sc, const uint
     const uint64_t b = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= (uint64_t)rows * nkb) return;
     const uint32_t r = (uint32_t)(b / nkb), c = (uint32_t)(b % nkb);
-    const v41_vq_mat m = v41_vq_open(blob, e, which, rows, cols, gov);
+    /* ★这条路只认 DQVL v2★(2026-09-21): 它自 09-20 判负后没有调用者(存档在 cuda_vq_prefill_fused.inc.cu 的注释里),
+     * 所以固定 v2 实例。要重开它, 除了那笔 0.013 Σmin 的账, 还得先给 v3 补上(层码本 + E4M3 + 13 位位平面)。 */
+    const v41_vq_mat m = v41_vq_open<0>(blob, e, which, rows, cols, gov);
     if (!m.ok) return;
     __half gh; memcpy(&gh, m.gr + (size_t)r * 2u, 2);
     const float g = __half2float(gh) * (m.gov ? m.gov[r] : 1.0f);

@@ -282,7 +282,18 @@ static int v41_fp8blk_gemv_g(const uint8_t *w, const uint8_t *sc, uint64_t in_di
                              const float *x, float *out, uint32_t n_tok, uint32_t n_groups,
                              uint32_t x_stride, uint32_t out_stride, uint32_t x_gstride, uint32_t out_gstride,
                              const char *what) {
-    if ((in_dim % 32u) != 0u || (in_dim % 16u) != 0u || n_tok == 0 || n_tok > V41_GEMV_MAX_TOK || n_groups == 0) return 0;
+    if ((in_dim % 32u) != 0u || (in_dim % 16u) != 0u || n_tok == 0 || n_groups == 0) return 0;
+    if (n_tok > V41_GEMV_MAX_TOK) {
+        /* ★批大于模板上限就按 8 行一段循环★(2026-09-18 实撞): 草稿器整窗重建要把 128 个位置一次过 main_proj/wkv,
+         * 以前这里直接 return 0 且没人出声 —— 预填后第一轮草稿从来没成功过, 三塔窗口里从来没有提示的上下文。
+         * 权重多读几遍(128 行 = 16 遍)只发生在整窗重建那一次, 逐行推进仍是单发。 */
+        for (uint32_t off = 0; off < n_tok; off += V41_GEMV_MAX_TOK) {
+            const uint32_t nn = n_tok - off < V41_GEMV_MAX_TOK ? n_tok - off : V41_GEMV_MAX_TOK;
+            if (!v41_fp8blk_gemv_g(w, sc, in_dim, out_dim, x + (uint64_t)off * x_stride, out + (uint64_t)off * out_stride,
+                                   nn, n_groups, x_stride, out_stride, x_gstride, out_gstride, what)) return 0;
+        }
+        return 1;
+    }
     uint32_t ksplit = 1;
     while (ksplit < 8u && out_dim * ksplit * n_groups < 32768u) ksplit <<= 1;
     const uint32_t nseg = (uint32_t)((in_dim + 511u) / 512u);

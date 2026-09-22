@@ -15,6 +15,13 @@ def parse_args():
     ap.add_argument("--qblk", type=int, default=32, help="每几个元素一个 ue8m0 scale")
     ap.add_argument("--dump-act", default="",
                     help="把每层 MoE 输入的 E[x^2] 存成 f32[nlayer][dim](金融语料校准用)")
+    ap.add_argument("--dump-mainh", default="",
+                    help="★DSpark 夹具★: 把官方 Transformer.forward 返回的 main_hidden(目标层注意力输入的 hc 均值拼接, "
+                         "f32[S][目标层数×dim])落盘 —— 给 v41_dspark_fixture.py --fp-mainh 用, 量'FP 隐态 vs 量化隐态'对草稿器的影响")
+    ap.add_argument("--dump-mainh-variants", default="",
+                    help="★DSpark 夹具·取法验证★: 目标层的四种候选 main_hidden 各落一份 <prefix>.{inmean,inpre,outmean,outpre}.bin "
+                         "(层输入 hc 均值 = 官方 model.py 的取法 / 层输入按 pre_mix 折叠 = 注意力真正吃的那份 / 层输出的两种)。"
+                         "用途: 官方参考实现的取法在 PPL 2 的文本上也只让草稿器中 0.6, 怀疑 h.mean(dim=2) 不是训练时的口径, 逐个喂夹具判")
     ap.add_argument("--vq-nc", type=int, default=0,
                     help="VQ 码字数(0=不走 VQ); 配 --vq-dim, bpw = ceil(log2 nc)/dim + 行增益")
     ap.add_argument("--vq-dim", type=int, default=8)

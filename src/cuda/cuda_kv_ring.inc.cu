@@ -31,8 +31,9 @@ __global__ static void v41_win_commit_kernel(float *win, uint32_t pos0, uint32_t
 /* save: snap[j] ← 环的第 (pos0+i0+j) % window 格(commit 将要盖掉的那些)。
  * restore 是反过来写回去 —— 两件事共用一个核, back≠0 就是回写。 */
 __global__ static void v41_win_ring_snap_kernel(float *win, float *snap, uint32_t pos0, uint32_t i0,
-                                                uint32_t window, uint32_t hd, uint32_t back) {
+                                                uint32_t window, uint32_t hd, uint32_t back, const int32_t *posd) {
     const uint32_t j = blockIdx.x, i = i0 + j;
+    if (posd) pos0 = (uint32_t)posd[0];   /* graph 路(投机验证批进图, 2026-09-22): 存那一发在图里, 位置只在设备槽 */
     float *ring = win + (uint64_t)((pos0 + i) % window) * hd;
     float *sp = snap + (uint64_t)i * hd;   /* 按批内行号存, 回滚时按"接受几位"直接取区间 */
     if (back) { for (uint32_t d = threadIdx.x; d < hd; d += blockDim.x) ring[d] = sp[d]; }
@@ -47,7 +48,7 @@ int ds4_gpu_v41_win_commit_tensor(ds4_gpu_tensor *win, uint32_t pos0, uint32_t n
                                   const ds4_gpu_tensor *posd) {
     if (!win || !window || !n) return 0;
     if (win->bytes < (uint64_t)(window + n) * head_dim * 4) return 0;
-    if (posd && n != 1u) return 0;
+    if (posd && n > 8u) return 0;   /* graph 路: 纯解码 1 行或投机验证批 ≤ 8 行, 核里逐行按 posd[0]+i 落格 */
     const uint32_t i0 = n > window ? n - window : 0u, rows = n - i0;
     v41_win_commit_kernel<<<rows, 256, 0, g_cur_stream>>>((float *)win->ptr, pos0, i0, window, head_dim,
                                                           posd ? (const int32_t *)posd->ptr : NULL);
@@ -56,10 +57,12 @@ int ds4_gpu_v41_win_commit_tensor(ds4_gpu_tensor *win, uint32_t pos0, uint32_t n
 
 /* 投机: 存/还原环里会被本批 commit 盖掉的那几格。rows 给 n(存)或"从第 keep 行起到 n"(还原)。 */
 int ds4_gpu_v41_win_ring_snap_tensor(ds4_gpu_tensor *win, ds4_gpu_tensor *snap, uint32_t pos0,
-                                     uint32_t i0, uint32_t n, uint32_t window, uint32_t head_dim, int back) {
+                                     uint32_t i0, uint32_t n, uint32_t window, uint32_t head_dim, int back,
+                                     const ds4_gpu_tensor *posd) {
     if (!win || !snap || !window || n <= i0) return 1;   /* 没有要动的行 = 成功 */
     if (snap->bytes < (uint64_t)n * head_dim * 4) return 0;
     v41_win_ring_snap_kernel<<<n - i0, 256, 0, g_cur_stream>>>((float *)win->ptr, (float *)snap->ptr,
-                                                               pos0, i0, window, head_dim, back ? 1u : 0u);
+                                                               pos0, i0, window, head_dim, back ? 1u : 0u,
+                                                               posd ? (const int32_t *)posd->ptr : NULL);
     return cuda_ok(cudaGetLastError(), back ? "v41 win ring restore" : "v41 win ring save");
 }

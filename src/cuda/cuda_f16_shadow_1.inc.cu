@@ -93,6 +93,7 @@ static int g_model_direct_fd = -1;
 static uint64_t g_model_direct_align = 1;
 static uint64_t g_model_file_size;
 static int g_model_cache_full;
+static uint64_t g_model_cache_limit_override;   /* ds4_gpu_set_model_cache_limit_mb: 0 = 平台默认 */
 static cudaStream_t g_model_prefetch_stream;
 static cudaStream_t g_model_upload_stream;
 static cublasHandle_t g_cublas;
@@ -256,6 +257,21 @@ static const char *cuda_model_range_populate_device_copy(const void *model_map,
                 (double)g_model_range_bytes / 1073741824.0);
     }
     return (const char *)dev;
+}
+
+/* 只查设备副本, 不注册不回落(2026-09-20 缓存封顶模式用): 命中返回设备指针, 否则 NULL 让调用方自己选路。
+ * 与下面 cuda_model_range_ptr 的前两段命中逻辑同, 只是把 host_registered(UVA 懒注册段)排除在外。 */
+static const char *cuda_model_range_cached_ptr(const void *model_map, uint64_t offset, uint64_t bytes) {
+    const uint64_t end = offset + bytes;
+    auto exact = g_model_range_by_offset.find(offset);
+    if (exact != g_model_range_by_offset.end()) {
+        const cuda_model_range &r = g_model_ranges[exact->second];
+        if (r.host_base == model_map && !r.host_registered && end >= offset && bytes <= r.bytes) return r.device_ptr;
+    }
+    for (const cuda_model_range &r : g_model_ranges)
+        if (r.host_base == model_map && !r.host_registered && offset >= r.offset && end >= offset && end <= r.offset + r.bytes)
+            return r.device_ptr + (offset - r.offset);
+    return NULL;
 }
 
 static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {

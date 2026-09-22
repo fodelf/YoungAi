@@ -10,9 +10,14 @@
 # 用法: ./speed-bench/qtf_replay_probe.sh start  <tag> <决策日,逗号> [symbols,逗号]   发起(后端串行跑, 立即返回)
 #       ./speed-bench/qtf_replay_probe.sh status <tag>                                 已落库几只(轮询用)
 #       ./speed-bench/qtf_replay_probe.sh report <tag> [基准 tag]                       拉原文 + 三率 + 对比; 原文落 /tmp/qtf-replay/<tag>_<symbol>.txt
-#       ./speed-bench/qtf_replay_probe.sh direct <标签> <trace文件> <请求序号|last> [temperature] [top_p] [seed] [min_p] [dry_multiplier] [dry_allowed_length] [dry_base]
+#       ./speed-bench/qtf_replay_probe.sh direct <标签> <trace文件> <请求序号|last> [temperature] [top_p] [seed] [min_p] [dry_multiplier] [dry_allowed_length] [dry_base] [max_tokens|0=删掉上限]
 #                                                                                      ★在 spark 本机跑★: 把 trace 里捕获的**那一条真实请求**原样重放给
 #                                      ds4-server(8000), 只改采样参数(不给 = 原样, 即温 0), 出同一套三率。
+#   max_tokens(第 12 个参数, 2026-09-22 加): 空 = 请求原样; ★0 = 把请求自带的上限删掉(不设上限)★; >0 = 显式设(只在复现某个产品配置时用)。
+#   ★上下文就是 1M, 不许再编上限数★(用户 09-22: "代码上下文就是 1m, 不要瞎改"): 生成长度的唯一界是 ctx − 提示, 引擎自己钳。
+#   实撞代价: 09-22 全天 CFO 探针带 16384 上限, 每趟"顶格"被我判成"写完不停 + 整篇复读"; 不设上限一跑 23,607 位自己吐 EOS。
+#   ★请求里自带的上限同样要当可疑项★(早盘事件归并 max_tokens=8192, 216 行表 13,705 字必被切)——判模型行为要先把它删掉(传 0)。
+#   不设 socket 超时: 生成何时结束由 EOS / ctx / 客户端挂断决定(挂断服务端会停, 不会白算), 超时数字也是编的。
 #   为什么要 direct 档(2026-09-22): qtf 自己的 deepseek_llm_t0 写死 temperature=0, 走 /api/review/replay 改不了口径; 而"温 0 死循环只有采样能治"
 #   这个判决要拿**真实请求**验(铁律: 产品问题只认真实请求)。重放用的是 trace 里的 raw request json 原字节 ⇒ 与产品同一条提示、同一套模板。
 #   出错会怎样: 服务没起 = curl 空回退 2; 采样参数给错(top_p 0)= 引擎按 1.0 处理, 日志里 "解码采样" 那行会如实打出真值, 以它为准。
@@ -75,12 +80,12 @@ for r in json.load(sys.stdin)["rows"]:
     fi;;
   direct)
     TRACE="${3:?trace 文件}"; REQ="${4:-last}"; TEMP="${5:-}"; TOPP="${6:-}"; SEED="${7:-}"; MINP="${8:-}"
-    DRYM="${9:-}"; DRYA="${10:-}"; DRYB="${11:-}"
+    DRYM="${9:-}"; DRYA="${10:-}"; DRYB="${11:-}"; MAXT="${12:-}"
     [ -s "$TRACE" ] || { echo "★没有 trace $TRACE(direct 档要在 spark 本机跑)★"; exit 2; }
     TAG="${TAG:?标签}"
-    python3 - "$TRACE" "$REQ" "$OUT/direct_$TAG" "$TEMP" "$TOPP" "$SEED" "$MINP" "$DRYM" "$DRYA" "$DRYB" <<'PYEOF'
+    python3 - "$TRACE" "$REQ" "$OUT/direct_$TAG" "$TEMP" "$TOPP" "$SEED" "$MINP" "$DRYM" "$DRYA" "$DRYB" "$MAXT" <<'PYEOF'
 import json, sys, time, urllib.request
-trace, req, out, temp, topp, seed, minp, drym, drya, dryb = sys.argv[1:11]
+trace, req, out, temp, topp, seed, minp, drym, drya, dryb, maxt = sys.argv[1:12]
 t = open(trace, encoding="utf-8", errors="replace").read()
 parts = t.split("===== request ")
 k = len(parts) - 1 if req == "last" else int(req)
@@ -91,14 +96,19 @@ for key, val, cast in (("temperature", temp, float), ("top_p", topp, float), ("s
                        ("dry_multiplier", drym, float), ("dry_allowed_length", drya, int), ("dry_base", dryb, float)):
     if val != "":
         body[key] = cast(val); changed.append("%s=%s" % (key, body[key]))
+if maxt == "0":       # 0 = 删掉请求自带的上限(不设上限), 见档头
+    if body.pop("max_tokens", None) is not None: changed.append("删掉请求自带的 max_tokens")
+elif maxt != "":
+    body["max_tokens"] = int(maxt); changed.append("max_tokens=%d" % body["max_tokens"])
 body["stream"] = False
-print("重放 trace 第 %d 条请求(%d 条 message, %d 字 json); 改了: %s" %
-      (k, len(body.get("messages", [])), len(raw), ", ".join(changed) or "没改(原样口径)"), flush=True)
+print("重放 trace 第 %d 条请求(%d 条 message, %d 字 json); 改了: %s; 上限 %s" %
+      (k, len(body.get("messages", [])), len(raw), ", ".join(changed) or "没改(原样口径)",
+       body.get("max_tokens", "没有 = 界就是 ctx − 提示")), flush=True)
 t0 = time.time()
 rq = urllib.request.Request("http://127.0.0.1:8000/v1/chat/completions",
                             data=json.dumps(body, ensure_ascii=False).encode(),
                             headers={"Content-Type": "application/json"})
-r = json.loads(urllib.request.urlopen(rq, timeout=3600).read().decode())
+r = json.loads(urllib.request.urlopen(rq).read().decode())   # 不设超时: 结束由 EOS / ctx / 挂断决定
 el = time.time() - t0
 txt = r["choices"][0]["message"].get("content") or ""
 open(out + ".txt", "w", encoding="utf-8").write(txt)
@@ -129,14 +139,16 @@ PYEOF
     # 每条出一行三率 —— 判"当前模型在产品的真实输入上出不出得了活"。串行发(服务端本来就一次跑一条图)。
     # 用法: health <标签前缀> <trace文件:请求序号> [trace文件:请求序号 ...]
     #   例: health h1 /tmp/ds4-trace-cedfix3.txt:3 /tmp/ds4-trace-cedfix3.txt:2
+    # ★判模型行为时一律删掉请求自带的上限★(第 12 参数传 0): 早盘事件归并自带 max_tokens=8192, 带着它跑只能看到"顶格",
+    # 看不出模型会不会自己停。要复现产品配置另跑一趟(不传 0)。
     # 为什么不新写脚本: 单条重放的活 direct 档已经有了, 这里只是把它按列表跑一遍(尺只留一份)。
     shift 2
     [ $# -gt 0 ] || { echo "用法: $0 health <标签前缀> <trace:请求号> [...]"; exit 2; }
     for spec in "$@"; do
         tf="${spec%:*}"; rq="${spec##*:}"
         echo "=========== $tf 第 $rq 条  $(date +%H:%M:%S)"
-        "$0" direct "${TAG}_${rq}" "$tf" "$rq" || echo "★这条没跑成★"
+        "$0" direct "${TAG}_${rq}" "$tf" "$rq" "" "" "" "" "" "" "" 0 || echo "★这条没跑成★"
     done
     ;;
-  *) echo "用法: $0 start <tag> <决策日,逗号> [symbols] | status <tag> | report <tag> [基准tag] | direct <标签> <trace> <请求序号> [temp] [top_p] [seed] [min_p] | health <标签> <trace:请求号>..."; exit 2;;
+  *) echo "用法: $0 start <tag> <决策日,逗号> [symbols] | status <tag> | report <tag> [基准tag] | direct <标签> <trace> <请求序号> [temp] [top_p] [seed] [min_p] [dry×3] [max_tokens] | health <标签> <trace:请求号>..."; exit 2;;
 esac

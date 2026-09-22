@@ -2,9 +2,13 @@
 
 #include "server_internal.h"
 
-/* 服务端默认输出 token 上限(384K)。与 DS4_THINK_MAX_MIN_CONTEXT 同数是巧合
- * (一个是输出上限, 一个是 think-max 的最小 ctx), 语义独立, 别合并。 */
-#define SERVER_DEFAULT_MAX_TOKENS 393216
+/* ★客户端不给上限 = 不设上限, 界就是 ctx − 提示★(2026-09-22, 用户令"SERVER_DEFAULT_MAX_TOKENS = 393,216
+ * 不要, 这些东西都不对")。以前这里写死 393216(384K), 是一个谁也说不出依据的数: 1M 上下文下它比 ctx 小,
+ * 等于服务端替客户端定了一个没人知道的闸。生成该停在哪只有两个合法答案 —— 模型吐 EOS, 或者位置撞到 ctx;
+ * 两处 clamp(server_generate_v41.c ctx−prompt / server_generate_body2.inc room)本来就在做后者, 所以这里
+ * 给 INT_MAX 就是"不设上限"。运维要硬闸有 --max-output-tokens(默认 0 = 不武装), 调用方要短输出自己传 max_tokens。
+ * 实撞代价(09-22): 探针与服务端各自的上限把"写完第八节自己停"切成了"顶格不停", 整天按错的形态查了一遍。
+ * 常量在 server_types2.h(trace 也要认它)。 */
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
 #endif
@@ -90,11 +94,9 @@ void usage(FILE *fp) {
         "Model and runtime:\n"
         "  -m, --model FILE\n"
         "      GGUF model path. Default: ds4flash.gguf\n"
-        "  -c, --ctx N\n"
-        "      Context size allocated at startup. Default: " DS4_STRINGIFY(DS4_DEFAULT_CTX_SIZE) "\n"
         "  -n, --tokens N\n"
-        "      Default max output tokens when the client omits a limit. Default: "
-        DS4_STRINGIFY(SERVER_DEFAULT_MAX_TOKENS) " (384K)\n"
+        "      Default max output tokens when the client omits a limit.\n"
+        "      Default: no cap - generation ends at EOS or at the context edge (ctx - prompt).\n"
         "  --max-output-tokens N\n"
         "      Hard server-side cap on output tokens per request, overriding larger client limits.\n"
         "      0 disables; protects a single-worker local server from runaway generations. Default: 0\n"
@@ -174,7 +176,7 @@ void usage(FILE *fp) {
         "Thinking and sampling:\n"
         "  DeepSeek-compatible chat requests default to thinking mode with high effort.\n"
         "  Only reasoning_effort=max or output_config.effort=max requests Think Max.\n"
-        "  Think Max is applied only when --ctx is at least " DS4_STRINGIFY(DS4_THINK_MAX_MIN_CONTEXT)
+        "  Think Max is applied only when the context is at least " DS4_STRINGIFY(DS4_THINK_MAX_MIN_CONTEXT)
         " tokens; smaller contexts use high.\n"
         "  thinking={type:disabled}, think=false, or model=deepseek-chat selects non-thinking mode.\n"
         "  API defaults are temperature=1, top_p=1, min_p=0.05, and no top-k cap.\n"
@@ -216,12 +218,11 @@ void usage(FILE *fp) {
         "      shutdown   save the live conversation when the server exits cleanly\n"
         "\n"
         "Normal server command:\n"
-        "  ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192\n"
+        "  ./ds4-server --cuda -m gguf/v41/<model>.gguf --zchain <amplifier dir>   (V4.1: context comes from the model metadata, there is no --ctx)\n"
         "\n"
         "Notes:\n"
         "  Use /v1/chat/completions, /v1/responses, /v1/completions, or /v1/messages.\n"
         "  GET / serves a browser chat page from web/chat.html (same origin, no --cors needed).\n"
-        "  Larger --ctx values allocate more KV memory at startup; the startup log prints the estimate.\n"
         "  Disk KV caching is best for agents that resend long prompts with stable prefixes.\n"
         "\n"
         "  -h, --help\n"
@@ -258,7 +259,7 @@ server_config parse_options(int argc, char **argv) {
         .host = "127.0.0.1",
         .port = 8000,
         .ctx_size = DS4_DEFAULT_CTX_SIZE,
-        .default_tokens = SERVER_DEFAULT_MAX_TOKENS,
+        .default_tokens = SERVER_NO_OUTPUT_CAP,
         .max_output_tokens = 0,
         .dry_multiplier = 0.0f, .dry_base = 1.75f, .dry_allowed_length = 2,
         .force_nothink = false,
@@ -340,7 +341,10 @@ server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--primer-compact")) {
             g_primer_compact = true;
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
-            c.ctx_size = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            /* ★上下文没有参数★(用户 2026-09-22): 与 cli_opts.c 同一处理由。/v1/models 报的 context_length 与每条请求
+             * 的 max_tokens 钳位都取 ds4_engine_v41_ctx()(模型元数据, server_main.c 起服时写进 ctx_size), 没有第二个数。 */
+            fprintf(stderr, "ds4-server: 上下文由模型元数据(deepseek4.context_length)决定, 没有 %s 这个参数\n", arg);
+            exit(2);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
             c.default_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--max-output-tokens")) {

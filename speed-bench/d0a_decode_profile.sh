@@ -51,7 +51,7 @@ PARG=(-p "$PROMPT")
 if [ -n "$PSRC" ]; then
   [ -f "$PSRC" ] || { echo "★没有提示文件 $PSRC★"; exit 1; }
   head -c "$PCHARS" "$PSRC" > "$OUT/prompt.txt"
-  PARG=(--ctx 32768 --prompt-file "$OUT/prompt.txt")
+  PARG=(--prompt-file "$OUT/prompt.txt")
   echo "== 长提示模式: $PSRC 前 $PCHARS 字符"
 fi
 # ★仍然显式传 --no-dspark★: 投机的默认值 2026-09-16 已改成**关**(见 core_v41_api.c 那段注释),

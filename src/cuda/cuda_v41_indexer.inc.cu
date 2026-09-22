@@ -23,7 +23,9 @@ __global__ static void v41_indexer_score_kernel(float *score, const float *q, co
                                                 uint32_t pos0, uint32_t ng, uint32_t n_head, uint32_t dk, uint32_t ratio,
                                                 const int32_t *posd) {
     const uint32_t i = blockIdx.x, lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, nwarp = blockDim.x >> 5;
-    if (posd) { pos0 = (uint32_t)posd[0]; ng = (pos0 + 1u) / ratio; }   /* graph: 真位置在设备槽, 主机的 ng 是桶上限 */
+    /* graph: 真位置在设备槽, 主机的 ng 是桶上限。★n 行(投机验证批进图, 2026-09-22)★: 源层在本批之后的组数 = (pos0 + n)/ratio
+     * (直发路 g0 + ng_new 的闭式, n = gridDim.x), 各行的可见组数仍按各自位置算(vis) —— n=1 时与原式 (pos0+1)/ratio 相同。 */
+    if (posd) { pos0 = (uint32_t)posd[0]; ng = (pos0 + gridDim.x) / ratio; }
     const uint32_t vis = (pos0 + i + 1u) / ratio;   /* 可见组数 compress_lens(按绝对位置) */
     const uint32_t per = dk / 32u;                 /* dk=128 ⇒ 4 维/lane */
     /* grid.y 覆盖不完(ng 超过 grid.y×nwarp)时按 grid 步长兜底, 语义与原来的单 block 循环一样 */
@@ -58,7 +60,7 @@ int ds4_gpu_v41_indexer_score_tensor(ds4_gpu_tensor *score, const ds4_gpu_tensor
                                      const ds4_gpu_tensor *posd) {
     if (!score || !q || !k || !weights || (dk % 32u) || ratio == 0) return 0;
     if (dk / 32u > 4u) { fprintf(stderr, "ds4: [v41] indexer 打分核只实现 dk ≤ 128(每 lane ≤ 4 维)\n"); return 0; }
-    if (posd && n_tok != 1u) return 0;
+    if (posd && n_tok > 8u) return 0;   /* graph 路: 纯解码 1 行或投机验证批 ≤ 8 行(核里 ng 按 pos0 + n 算) */
     if (ng == 0) return 1;
     /* 一 block 8 warp = 8 个组; 组多就多开 block(上限 65535 是 CUDA 的 grid.y 硬顶, 超了核里按 grid 步长绕) */
     uint32_t gblocks = (ng + 7u) / 8u;
@@ -90,13 +92,27 @@ __device__ __forceinline__ static uint32_t v41_topk_key(float f) {
     uint32_t u; memcpy(&u, &f, 4);
     return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
 }
+/* 候选块的 [nb] 块分 + [nb] 选中标记: 住全局暂存槽(不是 shared, 原因见核里的注释)。
+ * graph 捕获期不许分配 ⇒ 开捕获前由 ds4_gpu_v41_candidate_scratch_prepare 按桶上限先长够;
+ * 真长了会 +1 暂存代号(v41_grow), core_decode_graph.c 发图前对代号, 变了就重捕获。 */
+static v41_scratch g_v41_cand_blk;
+int ds4_gpu_v41_candidate_scratch_prepare(uint32_t n_tok, uint32_t nb) {
+    if (n_tok == 0u || nb == 0u) return 1;
+    return v41_grow(&g_v41_cand_blk, (uint64_t)n_tok * nb * 5u, "v41 候选块") ? 1 : 0;
+}
 __global__ static void v41_candidate_kernel(uint8_t *mask, const float *score, uint32_t pos0, uint32_t ng, uint32_t ratio,
-                                            uint32_t topk_blocks, uint32_t bs, const int32_t *posd) {
+                                            uint32_t topk_blocks, uint32_t bs, const int32_t *posd,
+                                            float *blk, uint32_t nb_cap) {
     const uint32_t i = blockIdx.x;
-    if (posd) { pos0 = (uint32_t)posd[0]; ng = (pos0 + 1u) / ratio; }   /* graph: 见文件头; shared 按桶上限开, ng ≤ 上限 */
+    if (posd) { pos0 = (uint32_t)posd[0]; ng = (pos0 + gridDim.x) / ratio; }   /* graph: 见打分核; 暂存按桶上限开, ng ≤ 上限 */
     const uint32_t nb = (ng + bs - 1u) / bs;
-    extern __shared__ float bsc[];               /* [nb] 块分 + [nb] 选中标记 */
-    uint8_t *sel = (uint8_t *)(bsc + nb);
+    /* ★[nb] 两个数组从 shared 挪到全局暂存★(2026-09-21, 为了 500k 上下文): 静态 shared 48 KB 只装得下
+     * nb ≤ 9830 块 = ratio-1 层 78k 个位置 —— 这就是 ctx 卡死在 32768 的那道墙(GB10 动态 shared 上限 99 KB 也不够,
+     * 500k 要 312 KB)。行距用主机传的桶上限 nb_cap: 核里按真位置算出来的 nb 可能更小, 拿它当行距两行会重叠。
+     * 块内 __syncthreads() 对全局写同样是可见性屏障, 所以下面每一步的语义与 shared 版逐字相同; 代价只是
+     * radix 的 4 遍扫描从 shared 走 L2(nb 上千时几微秒, 与打分核的 O(ng) 比可忽略)。 */
+    float *bsc = blk + (uint64_t)i * nb_cap;
+    uint8_t *sel = (uint8_t *)(blk + (uint64_t)gridDim.x * nb_cap) + (uint64_t)i * nb_cap;
     __shared__ uint32_t hist[256], sh_bucket, sh_k;
     const uint32_t vis = (pos0 + i + 1u) / ratio;
     for (uint32_t b = threadIdx.x; b < nb; b += blockDim.x) {
@@ -144,13 +160,15 @@ int ds4_gpu_v41_candidate_blocks_tensor(ds4_gpu_tensor *mask, const ds4_gpu_tens
                                         uint32_t ng, uint32_t ratio, uint32_t topk_blocks, uint32_t block_size,
                                         const ds4_gpu_tensor *posd) {
     if (!mask || !score || block_size == 0 || ratio == 0) return 0;
-    if (posd && n_tok != 1u) return 0;
+    if (posd && n_tok > 8u) return 0;
     if (ng == 0) return 1;
     const uint32_t nb = (ng + block_size - 1u) / block_size;
-    const size_t shm = (size_t)nb * 4u + nb;
-    if (shm > 48u * 1024u) { fprintf(stderr, "ds4: [v41] candidate blocks %u 超 shared\n", nb); return 0; }
-    v41_candidate_kernel<<<n_tok, 256, shm, g_cur_stream>>>((uint8_t *)mask->ptr, (const float *)score->ptr, pos0, ng, ratio,
-                                                            topk_blocks, block_size, posd ? (const int32_t *)posd->ptr : NULL);
+    /* 直发路(预填 / 暖身)在这里现长; graph 路进来时 prepare 已按桶上限长够, 这一发是 no-op */
+    float *blk = (float *)v41_grow(&g_v41_cand_blk, (uint64_t)n_tok * nb * 5u, "v41 候选块");
+    if (!blk) return 0;
+    v41_candidate_kernel<<<n_tok, 256, 0, g_cur_stream>>>((uint8_t *)mask->ptr, (const float *)score->ptr, pos0, ng, ratio,
+                                                            topk_blocks, block_size, posd ? (const int32_t *)posd->ptr : NULL,
+                                                            blk, nb);
     return cuda_ok(cudaGetLastError(), "v41 candidate blocks");
 }
 
@@ -168,8 +186,8 @@ int ds4_gpu_v41_candidate_blocks_tensor(ds4_gpu_tensor *mask, const ds4_gpu_tens
 __global__ static void v41_topk_kernel(int32_t *idx, const float *score, uint32_t ng, uint32_t topk, uint32_t ratio,
                                        const int32_t *posd) {
     const uint32_t i = blockIdx.x;
-    if (posd) {   /* graph: ng 与 topk 都按设备位置自算(与主机直发路 min(index_topk, ng) 同式) */
-        ng = ((uint32_t)posd[0] + 1u) / ratio;
+    if (posd) {   /* graph: ng 与 topk 都按设备位置自算(与主机直发路 min(index_topk, ng) 同式; n 行时 ng = (pos0 + n)/ratio) */
+        ng = ((uint32_t)posd[0] + gridDim.x) / ratio;
         if (ng < topk) topk = ng;
     }
     const float *s = score + (uint64_t)i * ng;
@@ -283,7 +301,7 @@ __global__ static void v41_topk_kernel(int32_t *idx, const float *score, uint32_
 int ds4_gpu_v41_indexer_topk_tensor(ds4_gpu_tensor *idx, const ds4_gpu_tensor *score, uint32_t n_tok, uint32_t ng,
                                     uint32_t topk, uint32_t ratio, const ds4_gpu_tensor *posd) {
     if (!idx || !score || topk == 0) return 0;
-    if (posd && (n_tok != 1u || ratio == 0u)) return 0;
+    if (posd && (n_tok > 8u || ratio == 0u)) return 0;
     if (ng == 0) return 1;
     /* shared 只剩固定的 256 个桶(1 KB), 不再随 ng 走 ⇒ 原来那条 "ng > 48K 就拒" 的闸跟着作废 */
     v41_topk_kernel<<<n_tok, 256, 0, g_cur_stream>>>((int32_t *)idx->ptr, (const float *)score->ptr, ng, topk, ratio,

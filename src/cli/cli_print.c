@@ -40,8 +40,6 @@ void usage(FILE *fp) {
         "Model and runtime:\n"
         "  -m, --model FILE\n"
         "      GGUF model path. Default: ds4flash.gguf\n"
-        "  -c, --ctx N\n"
-        "      Context size allocated for the session. Default: " DS4_STRINGIFY(DS4_DEFAULT_CTX_SIZE) "\n"
         "  --metal\n"
         "      Use the Metal graph backend. This is the normal fast path on macOS.\n"
         "  --cuda\n"
@@ -141,7 +139,7 @@ void usage(FILE *fp) {
         "  --think\n"
         "      Use normal thinking mode. This is the default.\n"
         "  --think-max\n"
-        "      Use Think Max when --ctx is at least 393216 tokens; otherwise normal thinking.\n"
+        "      Use Think Max when the context is at least 393216 tokens; otherwise normal thinking.\n"
         "  --nothink\n"
         "      Start assistant turns with </think> for direct non-thinking replies.\n"
         "\n"
@@ -196,7 +194,7 @@ void usage(FILE *fp) {
         "Normal CLI commands:\n"
         "  ./ds4\n"
         "  ./ds4 -p \"Scrivi una storia su una papera scansafatiche\"\n"
-        "  ./ds4 --think-max --prompt-file prompt.txt --ctx 393216\n"
+        "  ./ds4 --think-max --prompt-file prompt.txt\n"
         "\n"
         "Notes:\n"
         "  The CLI keeps KV cache state across interactive turns on session backends.\n"
@@ -233,7 +231,7 @@ void cli_warn_think_max_downgraded(const cli_generation_options *gen, const char
     if (!cli_think_max_downgraded(gen)) return;
     ds4_log(stderr,
         DS4_LOG_WARNING,
-        "ds4: warning: %s needs --ctx >= %u; ctx=%d uses normal thinking instead\n",
+        "ds4: warning: %s needs a context of at least %u tokens; the context is %d, using normal thinking instead\n",
         name,
         ds4_think_max_min_context(),
         gen->ctx_size);

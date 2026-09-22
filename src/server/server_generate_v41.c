@@ -9,7 +9,7 @@
  * ②工具调用出错后的续写修复(continue_after_invalid_dsml 要会话); ③并发批处理; ④Responses/Anthropic 的活绑定
  * (它们指向会话 KV 位置, 这里没有 KV 可续)。
  * 有的: 采样与复读惩罚(2026-09-21, 见下面 ds4_engine_set_decode_sampling 那一段 —— 请求不带 temperature 就是裸贪心);
- * 上下文上限 ds4_engine_v41_max_ctx()(2026-09-21 起 524288, 见 core_v41.h 的内存账)。
+ * 上下文 ds4_engine_v41_ctx()(模型元数据 deepseek4.context_length; 2026-09-22 用户定"不要任何写死的上下文", 没有 --ctx)。
  * 为什么不改 generate_job 本体: 它 1500 行、全是会话位置/回滚/primer 的控制流, 往里塞第二种 token
  * 来源只会把两条路的 bug 搅在一起; 这里独立一份, V4 一行不动。 */
 #include "server_internal.h"
@@ -349,7 +349,7 @@ void generate_job_v41(server *s, job *j) {
     g.finish = "length";
     g.eos = ds4_token_eos(s->engine);
     const ds4_tokens *prompt = &j->req.prompt;
-    const int ctx = s->ctx_size;
+    const int ctx = ds4_engine_v41_ctx();   /* 与 s->ctx_size 同一个数(server_main.c 起服时从这里取), 这里直接取源头 */
     g.prompt_tokens = prompt->len;
     if (g.prompt_tokens < 1) { http_error(j->fd, s->enable_cors, 400, "empty prompt"); return; }
     if (g.prompt_tokens >= ctx) { http_error_context_length_exceeded(j->fd, s->enable_cors, &j->req, g.prompt_tokens, ctx); return; }
@@ -401,7 +401,7 @@ void generate_job_v41(server *s, job *j) {
                v41_kind(&g), g.ctx_span, g.req_flags[0] ? " " : "", g.req_flags, g.max_tokens);
 
     ds4_engine_v41_set_progress(v41_progress_cb, &g);
-    const int rc = ds4_engine_v41_generate_argmax(s->engine, prompt->v, prompt->len, g.max_tokens, ctx, v41_emit, &g);
+    const int rc = ds4_engine_v41_generate_argmax(s->engine, prompt->v, prompt->len, g.max_tokens, v41_emit, &g);
     ds4_engine_v41_set_progress(NULL, NULL);
     if (rc != 0 && !g.started) {   /* 预填没走完 */
         if (g.client_gone) {   /* 我们自己叫停的, 不是故障: 对端已经没了, 连错误响应都不用写 */

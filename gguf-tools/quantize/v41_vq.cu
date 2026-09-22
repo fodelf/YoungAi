@@ -24,8 +24,11 @@
 #include <cuda_fp16.h>
 #include <stdlib.h>
 #include "v41_dq.cuh"
+#include "v41_vq_rate.h"
 
 #define CK V41_CK
+/* 率侧探针(2026-09-21): 索引熵 / ECVQ 惩罚 / 分块定宽 / 码本 E4M3 舍入。只读索引或只动码本舍入, λ=0 时一个核不发。 */
+#include "v41_vq_rate.inc.cu"
 
 __global__ static void row_gain_kernel(const float *w, float *g, int rows, int cols) {
     int r = blockIdx.x;
@@ -58,28 +61,43 @@ __global__ static void scale_rows_kernel(float *w, const float *g, int rows, int
  * CHUNK=512 ⇒ shared = 512*dim*4 + 512*4 = 18 KB(dim=8)。 */
 #define VQ_CHUNK 512
 #define VQ_MAXDIM 16
+/* 列权(校准路, 2026-09-20 深夜; 09-11 只在最终 assign 用过, 现在训练也吃): 向量的【全局号】gi = i0 + i·stride, 第 d 分量对应
+ * 权重矩阵的列号 → 列权。前 nv13 个向量是 w1/w3(输入 x, 周期 = D), 其后是 w2(输入 h, 周期 = MID); 指针 NULL ⇒ 该段平权。
+ * 为什么按全局号算相位: 09-11 训练走平权的唯一理由是"stride 采样后列对应关系被打乱" —— 采样只是把全局号乘了 stride, 相位算得回来。 */
+typedef struct { const float *x; int px; long long nv13; const float *h; int ph; } vq_cw;
 template <int DIM>
+__device__ __forceinline__ static void vq_load_w(const vq_cw cw, long long gi, float *w) {
+    if (gi < cw.nv13) {
+        const long long b = gi * DIM;
+#pragma unroll
+        for (int d = 0; d < DIM; d++) w[d] = cw.x ? cw.x[(int)((b + d) % cw.px)] : 1.f;
+    } else {
+        const long long b = (gi - cw.nv13) * DIM;
+#pragma unroll
+        for (int d = 0; d < DIM; d++) w[d] = cw.h ? cw.h[(int)((b + d) % cw.ph)] : 1.f;
+    }
+}
+/* PEN=1: ECVQ, 距离加码长惩罚 pen[k](见 v41_vq_rate.inc.cu); PEN=0 与 09-12 起的核一字不差(nocal 产物逐字节不变)。 */
+template <int DIM, int PEN>
 __global__ static void assign_fused_kernel(const float *__restrict__ V, const float *__restrict__ C,
-                                           const float *__restrict__ cn, long long nv, int nc,
-                                           int *__restrict__ idx, const float *__restrict__ colw, int cw_period) {
+                                           const float *__restrict__ pen, long long nv, int nc,
+                                           int *__restrict__ idx, const vq_cw cw, long long i0, int stride) {
     extern __shared__ float sh[];
     float *shC = sh, *shN = sh + VQ_CHUNK * DIM;
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     float v[DIM], w[DIM];
 #pragma unroll
     for (int d = 0; d < DIM; d++) v[d] = (i < nv) ? V[i * DIM + d] : 0.f;
-    /* 列权(校准路): 向量 i 的第 d 个分量对应权重矩阵的第 (i*DIM+d) % cw_period 列; NULL ⇒ 平权 */
-#pragma unroll
-    for (int d = 0; d < DIM; d++) w[d] = colw ? colw[(int)((i * DIM + d) % cw_period)] : 1.f;
+    vq_load_w<DIM>(cw, i0 + i * stride, w);
     float bd = 3.0e38f; int best = 0;
     for (int k0 = 0; k0 < nc; k0 += VQ_CHUNK) {
         int n = nc - k0 < VQ_CHUNK ? nc - k0 : VQ_CHUNK;
         for (int t = threadIdx.x; t < n * DIM; t += blockDim.x) shC[t] = C[(long long)k0 * DIM + t];
-        for (int t = threadIdx.x; t < n; t += blockDim.x) shN[t] = cn[k0 + t];
+        if (PEN) for (int t = threadIdx.x; t < n; t += blockDim.x) shN[t] = pen[k0 + t];
         __syncthreads();
         if (i < nv) {
             for (int k = 0; k < n; k++) {
-                float dist = 0.f;
+                float dist = PEN ? shN[k] : 0.f;
 #pragma unroll
                 for (int d = 0; d < DIM; d++) { float e = v[d] - shC[k * DIM + d]; dist += w[d] * e * e; }
                 if (dist < bd) { bd = dist; best = k0 + k; }
@@ -90,24 +108,20 @@ __global__ static void assign_fused_kernel(const float *__restrict__ V, const fl
     if (i < nv) idx[i] = best;
 }
 
-static int vq_assign(const float *V, const float *C, const float *cn, long long nv, int nc, int dim,
-                     int *idx, size_t shb, const float *colw, int cwp) {
+/* pen = NULL ⇒ 纯 Lloyd 核(PEN=0); 非 NULL ⇒ ECVQ 核 */
+static int vq_assign(const float *V, const float *C, const float *pen, long long nv, int nc, int dim,
+                     int *idx, size_t shb, const vq_cw cw, long long i0, int stride) {
     unsigned g = (unsigned)((nv + 255) / 256);
+#define VQ_ASSIGN(D) (pen ? assign_fused_kernel<D, 1><<<g, 256, shb>>>(V, C, pen, nv, nc, idx, cw, i0, stride) \
+                          : assign_fused_kernel<D, 0><<<g, 256, shb>>>(V, C, pen, nv, nc, idx, cw, i0, stride))
     switch (dim) {
-        case 4:  assign_fused_kernel<4><<<g, 256, shb>>>(V, C, cn, nv, nc, idx, colw, cwp); break;
-        case 8:  assign_fused_kernel<8><<<g, 256, shb>>>(V, C, cn, nv, nc, idx, colw, cwp); break;
-        case 16: assign_fused_kernel<16><<<g, 256, shb>>>(V, C, cn, nv, nc, idx, colw, cwp); break;
+        case 4:  VQ_ASSIGN(4); break;
+        case 8:  VQ_ASSIGN(8); break;
+        case 16: VQ_ASSIGN(16); break;
         default: fprintf(stderr, "★dim=%d 未特化(只支持 4/8/16)★\n", dim); return -1;
     }
+#undef VQ_ASSIGN
     return 0;
-}
-
-__global__ static void cnorm_kernel(const float *C, float *cn, int nc, int dim) {
-    int k = blockIdx.x * blockDim.x + threadIdx.x;
-    if (k >= nc) return;
-    float s = 0.f;
-    for (int d = 0; d < dim; d++) { float v = C[k * dim + d]; s += v * v; }
-    cn[k] = s;
 }
 
 /* M 步: double 原子累加(见文件头"确定性") */
@@ -127,6 +141,49 @@ __global__ static void update_kernel(float *C, const double *sum, const int *cnt
     int n = cnt[k];
     if (n <= 0) return;
     for (int d = 0; d < dim; d++) C[k * dim + d] = (float)(sum[k * dim + d] / n);
+}
+
+/* 加权 M 步(校准路): 列权随向量相位变, 同一码字下不同向量的第 d 分量权重不同 ⇒ 质心按维算 Σw·v / Σw。
+ * 平权时数学上退化成上面的 accum/update(Σw = 计数), 但为了 nocal 产物逐字节可复现, 平权仍走老核。 */
+template <int DIM>
+__global__ static void accum_w_kernel(const float *V, const int *idx, int nv, const vq_cw cw, int stride, double *sum, double *wsum) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nv) return;
+    int k = idx[i];
+    float w[DIM]; vq_load_w<DIM>(cw, i * stride, w);
+    const float *v = V + i * (long long)DIM;
+#pragma unroll
+    for (int d = 0; d < DIM; d++) { atomicAdd(&sum[k * DIM + d], (double)(w[d] * v[d])); atomicAdd(&wsum[k * DIM + d], (double)w[d]); }
+}
+static int vq_accum_w(const float *V, const int *idx, long long nv, int dim, const vq_cw cw, int stride, double *sum, double *wsum) {
+    unsigned g = (unsigned)((nv + 255) / 256);
+    switch (dim) {
+        case 4:  accum_w_kernel<4><<<g, 256>>>(V, idx, (int)nv, cw, stride, sum, wsum); break;
+        case 8:  accum_w_kernel<8><<<g, 256>>>(V, idx, (int)nv, cw, stride, sum, wsum); break;
+        case 16: accum_w_kernel<16><<<g, 256>>>(V, idx, (int)nv, cw, stride, sum, wsum); break;
+        default: return -1;
+    }
+    return 0;
+}
+__global__ static void update_w_kernel(float *C, const double *sum, const double *wsum, int nc, int dim) {
+    int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= nc) return;
+    for (int d = 0; d < dim; d++) { const double ws = wsum[k * dim + d]; if (ws > 0) C[k * dim + d] = (float)(sum[k * dim + d] / ws); }
+}
+
+/* 加权残差账(校准路报数用): Σ w_col·(a−b)² 与 Σ w_col·a², 列权按列号取(NULL = 平权 = 与 v41_sse_kernel 同数) */
+__global__ static void wsse_kernel(const float *a, const float *b, long long n, int cols, const float *colw, double *acc) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    __shared__ double se[256], sn[256];
+    double d = 0, e = 0;
+    if (i < n) { const float wc = colw ? colw[(int)(i % cols)] : 1.f; const float x = a[i], y = b[i]; d = (double)wc * (x - y) * (x - y); e = (double)wc * x * x; }
+    se[threadIdx.x] = d; sn[threadIdx.x] = e;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o; o >>= 1) {
+        if (threadIdx.x < o) { se[threadIdx.x] += se[threadIdx.x + o]; sn[threadIdx.x] += sn[threadIdx.x + o]; }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) { atomicAdd(&acc[0], se[0]); atomicAdd(&acc[1], sn[0]); }
 }
 
 __global__ static void init_kernel(const float *V, float *C, int nv, int nc, int dim) {
@@ -189,14 +246,18 @@ __global__ static void unpack_decode_kernel(const uint8_t *packed, const uint16_
 static int vq_bits(int nc) { int b = 1; while ((1 << b) < nc) b++; return b; }
 
 /* 训练码本(采样集上 Lloyd 交替)并做全量最终 assign。V 已归一化(行增益已除)。
- * colw/cwp 只在最终 assign 的前 nv13 个向量生效(w1/w3 吃 x, w2 吃 h 平权), NULL ⇒ 全平权。 */
+ * cw = 两段列权(x 给前 nv13 个向量, h 给其后; 见 vq_load_w), 都 NULL ⇒ 全平权走老核(nocal 产物逐字节不变)。
+ * 率侧探针(2026-09-21): lam > 0 = ECVQ(每轮按本轮划分重估码长, 下一轮与最终指派带惩罚); fixed = C 已是给定码本(共享码本),
+ * 不初始化不更新, 只为算惩罚走一遍采样指派; cb_fp8 = 码本舍到 E4M3 格点; rate 非 NULL 回填最终指派的率统计。 */
 static int vq_fit_assign(float *V, long long nv, int dim, int nc, int iters, int stride,
-                         float *C, int *idx, const float *dcolw, int cwp, long long nv13, int round_cb,
-                         uint16_t *cbbits) {
-    float *cn; double *sum; int *cnt;
-    CK(cudaMalloc(&cn, sizeof(float) * nc));
+                         float *C, int *idx, const vq_cw cw, int round_cb, uint16_t *cbbits,
+                         float lam, int fixed, int cb_fp8, v41_vq_rate *rate) {
+    const int weighted = (cw.x != NULL) || (cw.h != NULL);
+    float *pen = NULL; double *sum, *wsum = NULL; int *cnt;
     CK(cudaMalloc(&sum, sizeof(double) * nc * dim));
     CK(cudaMalloc(&cnt, sizeof(int) * nc));
+    if (weighted) CK(cudaMalloc(&wsum, sizeof(double) * nc * dim));
+    if (lam > 0.f) { CK(cudaMalloc(&pen, sizeof(float) * nc)); CK(cudaMemset(pen, 0, sizeof(float) * nc)); }
     size_t SHB = (size_t)VQ_CHUNK * dim * sizeof(float) + VQ_CHUNK * sizeof(float);
     if (stride < 1) stride = 1;
     long long ntr = nv / stride;
@@ -205,27 +266,44 @@ static int vq_fit_assign(float *V, long long nv, int dim, int nc, int iters, int
         CK(cudaMalloc(&Vtr, sizeof(float) * ntr * dim));
         gather_stride_kernel<<<(unsigned)((ntr + 255) / 256), 256>>>(V, Vtr, (int)ntr, dim, stride);
     }
-    init_kernel<<<(nc + 255) / 256, 256>>>(Vtr, C, (int)ntr, nc, dim);
-    for (int it = 0; it < iters; it++) {
-        cnorm_kernel<<<(nc + 255) / 256, 256>>>(C, cn, nc, dim);
-        /* ★训练用平权★: stride 采样后列对应关系被打乱, 拿 colw 索引会错位 */
-        if (vq_assign(Vtr, C, cn, ntr, nc, dim, idx, SHB, NULL, 0)) return -1;
-        CK(cudaMemset(sum, 0, sizeof(double) * nc * dim));
-        CK(cudaMemset(cnt, 0, sizeof(int) * nc));
-        accum_kernel<<<(unsigned)((ntr + 255) / 256), 256>>>(Vtr, idx, (int)ntr, dim, sum, cnt);
-        update_kernel<<<(nc + 255) / 256, 256>>>(C, sum, cnt, nc, dim);
+    if (!fixed) init_kernel<<<(nc + 255) / 256, 256>>>(Vtr, C, (int)ntr, nc, dim);
+    const vq_cw none = {NULL, 1, 0, NULL, 1};
+    const int nit = fixed ? (pen ? 1 : 0) : iters;
+    for (int it = 0; it < nit; it++) {
+        if (weighted) {   /* 采样向量 i 的全局号 = i·stride ⇒ 列相位按全局号算, 训练与最终 assign 用同一套权 */
+            if (vq_assign(Vtr, C, pen, ntr, nc, dim, idx, SHB, cw, 0, stride)) return -1;
+            if (!fixed) {
+                CK(cudaMemset(sum, 0, sizeof(double) * nc * dim));
+                CK(cudaMemset(wsum, 0, sizeof(double) * nc * dim));
+                if (vq_accum_w(Vtr, idx, ntr, dim, cw, stride, sum, wsum)) return -1;
+                update_w_kernel<<<(nc + 255) / 256, 256>>>(C, sum, wsum, nc, dim);
+            }
+        } else {
+            if (vq_assign(Vtr, C, pen, ntr, nc, dim, idx, SHB, none, 0, 1)) return -1;
+            if (!fixed) {
+                CK(cudaMemset(sum, 0, sizeof(double) * nc * dim));
+                CK(cudaMemset(cnt, 0, sizeof(int) * nc));
+                accum_kernel<<<(unsigned)((ntr + 255) / 256), 256>>>(Vtr, idx, (int)ntr, dim, sum, cnt);
+                update_kernel<<<(nc + 255) / 256, 256>>>(C, sum, cnt, nc, dim);
+            }
+        }
+        if (pen) {   /* ECVQ: 码长按本轮划分重估 */
+            CK(cudaMemset(cnt, 0, sizeof(int) * nc));
+            vq_hist_kernel<<<(unsigned)((ntr + 255) / 256), 256>>>(idx, ntr, cnt);
+            vq_pen_kernel<<<(nc + 255) / 256, 256>>>(cnt, ntr, nc, lam, pen);
+        }
     }
-    if (round_cb) round_f16_kernel<<<(unsigned)(((long long)nc * dim + 255) / 256), 256>>>(C, cbbits, (long long)nc * dim);
-    cnorm_kernel<<<(nc + 255) / 256, 256>>>(C, cn, nc, dim);
-    if (dcolw && nv13 > 0) {
-        if (vq_assign(V, C, cn, nv13, nc, dim, idx, SHB, dcolw, cwp)) return -1;
-        if (vq_assign(V + nv13 * dim, C, cn, nv - nv13, nc, dim, idx + nv13, SHB, NULL, 0)) return -1;
-    } else {
-        if (vq_assign(V, C, cn, nv, nc, dim, idx, SHB, NULL, 0)) return -1;
+    if (round_cb && !fixed) {
+        round_f16_kernel<<<(unsigned)(((long long)nc * dim + 255) / 256), 256>>>(C, cbbits, (long long)nc * dim);
+        if (cb_fp8) vq_round_e4m3_kernel<<<(unsigned)(((long long)nc * dim + 255) / 256), 256>>>(C, cbbits, (long long)nc * dim);
     }
+    if (vq_assign(V, C, pen, nv, nc, dim, idx, SHB, weighted ? cw : none, 0, 1)) return -1;
     CK(cudaDeviceSynchronize());
+    if (rate && vq_rate_stats(idx, nv, nc, rate)) return -1;
     if (stride > 1) cudaFree(Vtr);
-    cudaFree(cn); cudaFree(sum); cudaFree(cnt);
+    cudaFree(sum); cudaFree(cnt);
+    if (wsum) cudaFree(wsum);
+    if (pen) cudaFree(pen);
     return 0;
 }
 
@@ -266,15 +344,16 @@ extern "C" int v41_vq_expert_gpu(float **w, const int *rows, const int *cols, in
     float *C; int *idx;
     CK(cudaMalloc(&C, sizeof(float) * nc * dim));
     CK(cudaMalloc(&idx, sizeof(int) * nv));
-    float *dcolw = NULL; long long nv13 = 0;
+    float *dcolw = NULL; vq_cw cw = {NULL, 1, 0, NULL, 1};
     if (colw_host && colw_len > 0) {
         if (colw_len != cols[0]) { fprintf(stderr, "★列权长度 %d != w1 列数 %d★\n", colw_len, cols[0]); return -1; }
         CK(cudaMalloc(&dcolw, sizeof(float) * colw_len));
         CK(cudaMemcpy(dcolw, colw_host, sizeof(float) * colw_len, cudaMemcpyHostToDevice));
-        /* 拼接顺序 w1,w3,w2: 前两个吃 x(带列权), w2 吃 h(平权, 欠账) */
-        if (nmat == 3) nv13 = ((long long)rows[0] * cols[0] + (long long)rows[1] * cols[1]) / dim;
+        /* 拼接顺序 w1,w3,w2: 前两个吃 x(带列权), w2 吃 h(这条 judge 路只有 x 列权, w2 平权) */
+        cw.x = dcolw; cw.px = colw_len;
+        cw.nv13 = nmat == 3 ? ((long long)rows[0] * cols[0] + (long long)rows[1] * cols[1]) / dim : nv;
     }
-    if (vq_fit_assign(V, nv, dim, nc, iters, stride, C, idx, dcolw, colw_len, nv13, 0, NULL)) return -1;
+    if (vq_fit_assign(V, nv, dim, nc, iters, stride, C, idx, cw, 0, NULL, 0.f, 0, 0, NULL)) return -1;
     decode_kernel<<<(unsigned)((nv * dim + 255) / 256), 256>>>(V, idx, C, (int)nv, dim);
     long long off = 0;
     for (int m = 0; m < nmat; m++) {
@@ -292,12 +371,23 @@ extern "C" int v41_vq_expert_gpu(float **w, const int *rows, const int *cols, in
 
 /* ---- 落盘编码: w[m] 是 device f32 矩阵(返回时被改成部署解码值); 产物落主机缓冲 ----
  * idx_out[m]: rows[m]×bytes_row 字节; cb_out: nc*dim 个 f16; gain_out[m]: rows[m] 个 f16;
- * stats[0]=Σ(w−ŵ)², stats[1]=Σw²(对打包后字节解码算的)。 */
+ * stats[0]=Σ(w−ŵ)², stats[1]=Σw²(对打包后字节解码算的), stats[2..3] = 列权加权的同两项。
+ * ef/ef_ud: 级 2 误差反馈钩子(v41_ef.h 的 v41_ef_callback), NULL = 不做。opt: 率侧探针选项(v41_vq_rate.h), NULL = 现役。 */
+typedef int (*v41_vq_ef_fn)(void *ud, int m, float *V, int rows, int cols, const float *C, int nc, int dim, const float *g, int *idx);
 extern "C" int v41_vq_expert_encode_gpu(float **w, const int *rows, const int *cols, int nmat,
-                                        int dim, int nc, int iters, int stride,
+                                        int dim, int nc, int iters, int stride, const float *cwx, const float *cwh, int cw_stats_only,
+                                        v41_vq_ef_fn ef, void *ef_ud, const v41_vq_opt *opt,
                                         uint8_t **idx_out, uint16_t *cb_out, uint16_t **gain_out, double *stats) {
     if (dim <= 0 || dim > VQ_MAXDIM || nc < 2 || nc > 65536 || nmat <= 0 || nmat > 8) { fprintf(stderr, "★VQ 参数不合法★\n"); return -1; }
+    if ((cwx || cwh) && nmat != 3) { fprintf(stderr, "★列权只支持 w1/w3/w2 三矩阵★\n"); return -1; }
+    const float lam = opt ? opt->lam : 0.f; const int fixed = opt && opt->cb_fixed;
     int bits = vq_bits(nc);
+    /* 列权上设备(主机来的, 每专家 D + MID 个 float, 拷贝可忽略); stats[2..3] = 加权残差账。
+     * cw_stats_only = 1: 指派/训练仍平权, 列权只进残差账 —— --calib-ab 机制审计的对照组(同一专家、同一把加权尺) */
+    vq_cw cw = {NULL, 1, 0, NULL, 1}; const vq_cw none = {NULL, 1, 0, NULL, 1}; float *dcwx = NULL, *dcwh = NULL;
+    if (cwx) { CK(cudaMalloc(&dcwx, sizeof(float) * cols[0])); CK(cudaMemcpy(dcwx, cwx, sizeof(float) * cols[0], cudaMemcpyHostToDevice)); cw.x = dcwx; cw.px = cols[0]; }
+    if (cwh) { CK(cudaMalloc(&dcwh, sizeof(float) * cols[2])); CK(cudaMemcpy(dcwh, cwh, sizeof(float) * cols[2], cudaMemcpyHostToDevice)); cw.h = dcwh; cw.ph = cols[2]; }
+    if (cwx || cwh) cw.nv13 = ((long long)rows[0] * cols[0] + (long long)rows[1] * cols[1]) / dim;
     long long tot = 0;
     for (int m = 0; m < nmat; m++) tot += (long long)rows[m] * cols[m];
     float *Wo; CK(cudaMalloc(&Wo, sizeof(float) * tot));            /* 原值, 算残差用 */
@@ -310,9 +400,24 @@ extern "C" int v41_vq_expert_encode_gpu(float **w, const int *rows, const int *c
     CK(cudaMalloc(&C, sizeof(float) * nc * dim));
     CK(cudaMalloc(&cbb, sizeof(uint16_t) * nc * dim));
     CK(cudaMalloc(&idx, sizeof(int) * nv));
-    if (vq_fit_assign(V, nv, dim, nc, iters, stride, C, idx, NULL, 0, 0, 1, cbb)) return -1;
-    double *acc; CK(cudaMalloc(&acc, sizeof(double) * 2));
-    CK(cudaMemset(acc, 0, sizeof(double) * 2));
+    if (fixed) {   /* 给定码本(共享码本探针): 位型直接上设备, f32 副本由位型解出 ⇒ 指派用的值与文件里的逐位同 */
+        CK(cudaMemcpy(cbb, opt->cb_fixed, sizeof(uint16_t) * nc * dim, cudaMemcpyHostToDevice));
+        vq_f16_to_f32_kernel<<<(unsigned)(((long long)nc * dim + 255) / 256), 256>>>(cbb, C, (long long)nc * dim);
+    }
+    if (vq_fit_assign(V, nv, dim, nc, iters, stride, C, idx, cw_stats_only ? none : cw, 1, cbb,
+                      lam, fixed, opt ? opt->cb_fp8 : 0, opt ? opt->rate : NULL)) return -1;
+    /* 级 2 钩子(2026-09-21): 码本与行增益已定死(C 已舍到 f16 格点, g 已舍), 钩子按矩阵重选索引(误差反馈), V 被它改写也无妨 —— 下面打包/解码只看索引 */
+    if (ef) {
+        long long o = 0;
+        for (int m = 0; m < nmat; m++) {
+            const long long n = (long long)rows[m] * cols[m];
+            const int rc = ef(ef_ud, m, V + o, rows[m], cols[m], C, nc, dim, g[m], idx + o / dim);
+            if (rc < 0) return -1;
+            o += n;
+        }
+    }
+    double *acc; CK(cudaMalloc(&acc, sizeof(double) * 4));
+    CK(cudaMemset(acc, 0, sizeof(double) * 4));
     long long off = 0;
     for (int m = 0; m < nmat; m++) {
         int nidx_row = cols[m] / dim, bytes_row = (nidx_row * bits + 7) / 8;
@@ -322,6 +427,7 @@ extern "C" int v41_vq_expert_encode_gpu(float **w, const int *rows, const int *c
         /* 部署口径解码回 w[m], 并对原值算残差 */
         unpack_decode_kernel<<<(unsigned)((n / dim + 255) / 256), 256>>>(pk, cbb, gb[m], rows[m], cols[m], dim, bits, bytes_row, w[m]);
         v41_sse_kernel<<<(unsigned)((n + 255) / 256), 256>>>(Wo + off, w[m], n, acc);
+        wsse_kernel<<<(unsigned)((n + 255) / 256), 256>>>(Wo + off, w[m], n, cols[m], m < 2 ? cw.x : cw.h, acc + 2);
         CK(cudaGetLastError());
         CK(cudaMemcpy(idx_out[m], pk, nb, cudaMemcpyDeviceToHost));
         CK(cudaMemcpy(gain_out[m], gb[m], sizeof(uint16_t) * rows[m], cudaMemcpyDeviceToHost));
@@ -329,9 +435,11 @@ extern "C" int v41_vq_expert_encode_gpu(float **w, const int *rows, const int *c
         off += n;
     }
     CK(cudaMemcpy(cb_out, cbb, sizeof(uint16_t) * nc * dim, cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(stats, acc, sizeof(double) * 2, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(stats, acc, sizeof(double) * 4, cudaMemcpyDeviceToHost));
     for (int m = 0; m < nmat; m++) { cudaFree(g[m]); cudaFree(gb[m]); }
     cudaFree(Wo); cudaFree(V); cudaFree(C); cudaFree(cbb); cudaFree(idx); cudaFree(acc);
+    if (dcwx) cudaFree(dcwx);
+    if (dcwh) cudaFree(dcwh);
     return 0;
 }
 
@@ -347,16 +455,16 @@ extern "C" int v41_vq_decode_gpu(const uint8_t *packed, const uint16_t *cb, cons
     return 0;
 }
 
-/* 量化器入口(C 驱动调用, 全主机指针): HF 出厂 FP4 的三个矩阵 → VQ 编码产物。 */
+/* 共享码本探针的两个入口 + 出厂 FP4 上设备的公共小函数(2026-09-21) */
+#include "v41_vq_pool.inc.cu"
+
+/* 量化器入口(C 驱动调用, 全主机指针): HF 出厂 FP4 的三个矩阵 → VQ 编码产物。
+ * cwx[cols0] / cwh[cols2] = 校准列权(w1/w3 的 x 侧 / w2 的 h 侧), NULL = 平权(2026-09-20 深夜加, 见 v41_calib.h)。 */
 extern "C" int v41_vq_expert_from_fp4(const uint8_t *const *w_host, const uint8_t *const *s_host,
                                       const int *rows, const int *cols, int nmat, int dim, int nc, int iters, int stride,
+                                      const float *cwx, const float *cwh, int cw_stats_only, v41_vq_ef_fn ef, void *ef_ud, const v41_vq_opt *opt,
                                       uint8_t **idx_out, uint16_t *cb_out, uint16_t **gain_out, double *stats) {
-    static v41_dbuf scratch = {NULL, 0}, dw[8] = {{NULL, 0}};
     float *w[8];
-    for (int m = 0; m < nmat; m++) {
-        if (v41_dbuf_need(&dw[m], sizeof(float) * (size_t)rows[m] * cols[m])) return -1;
-        w[m] = (float *)dw[m].p;
-        if (v41_upload_dequant(w_host[m], s_host[m], "I8", rows[m], cols[m], 1, 32, w[m], &scratch, NULL)) return -1;
-    }
-    return v41_vq_expert_encode_gpu(w, rows, cols, nmat, dim, nc, iters, stride, idx_out, cb_out, gain_out, stats);
+    if (vq_upload_fp4(w_host, s_host, rows, cols, nmat, w)) return -1;
+    return v41_vq_expert_encode_gpu(w, rows, cols, nmat, dim, nc, iters, stride, cwx, cwh, cw_stats_only, ef, ef_ud, opt, idx_out, cb_out, gain_out, stats);
 }

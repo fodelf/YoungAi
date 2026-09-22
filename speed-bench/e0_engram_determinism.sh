@@ -25,8 +25,8 @@ set -u
 cd "$(dirname "$0")/.." || exit 1
 
 RUNS="${1:-8}"
-MODEL=gguf/v41/DeepSeek-V4.1-Flash-vq8x4096-fp4.gguf
-AMP=gguf/v41/gr-fin-40-fp4
+MODEL=gguf/v41/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf
+AMP=gguf/v41/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-vqfin41_vqhalf_a_n8192-engine
 OUT=/tmp/e0-engram
 PROMPT="你好世界"          # 3 token: 短到不走任何预填融合核, 只过 embed + 40 层 + 出口
 

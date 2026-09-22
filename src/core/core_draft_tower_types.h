@@ -13,9 +13,14 @@
 
 typedef struct {
     ds4_layer_weights tower[DS4_MTP_MAX_TOWERS];
+    /* 两种在盘形态二选一(绑定时按盘上有什么决定, 见 core_bind_v41.c):
+     *   exp_* 非空 = 逐专家 fp4x32 三张量(从原件取原生精度), 草稿器走 cuda_v41_draft.inc.cu 的 dense MoE 核;
+     *   exps_vq 非空 = 一个 VQ blob(2026-09-19 的 100 GB 配方, 7.22 → 2.36 GB), 草稿器走主干的 VQ 解码即乘核
+     *   (2026-09-20 起; 之前这一档被拦成"不武装")。★两者不会同时非空★ */
     ds4_tensor *exp_gate[DS4_MTP_MAX_TOWERS][DS4_MTP_MAX_EXPERTS];
     ds4_tensor *exp_up[DS4_MTP_MAX_TOWERS][DS4_MTP_MAX_EXPERTS];
     ds4_tensor *exp_down[DS4_MTP_MAX_TOWERS][DS4_MTP_MAX_EXPERTS];
+    ds4_tensor *exps_vq[DS4_MTP_MAX_TOWERS];
     /* 五个只此一份的头(官方 mtp.0 带前两个, mtp.2 带后三个) */
     ds4_tensor *main_proj;    /* [5120][15360]: 主模型 L37/38/39 的注意力输入(hc 四路均值)拼接后投回 5120 = main_x,
                                * 它是块注意力的主 KV 来源。★取错位置不报错, 只是接受率掉到 1 附近★ */

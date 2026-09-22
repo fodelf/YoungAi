@@ -308,6 +308,10 @@ struct job {
     job *next;
 };
 
+/* 客户端没给 max_tokens 时用它 = 不设上限; 真正的界是 ctx − 提示, 两条生成路各自 clamp。
+ * 为什么不是某个具体数字: 见 server_config.c 的长注释(2026-09-22 删掉写死的 393216)。 */
+#define SERVER_NO_OUTPUT_CAP INT_MAX
+
 #define DS4_TOOL_MEMORY_DEFAULT_MAX_IDS 100000
 
 #define DS4_TOOL_MEMORY_MAX_BYTES (512u * 1024u * 1024u)

@@ -31,7 +31,7 @@ import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from v41_hf_io import FP4_TABLE, build_index, load_raw, dq_fp8, dq_fp4, has_vq, load_vq
+from v41_hf_io import FP4_TABLE, build_index, load_raw, dq_fp8, dq_fp4, has_vq, load_vq, load_q4k
 import v41_patches as P
 from v41_cli import parse_args
 
@@ -129,6 +129,7 @@ def main():
     # ---- 官方 model.py 的三处补丁(linear fp32 / sparse_attn torch 版 / engram 流式), 见 v41_patches ----
     P.patch_linear(M)
     P.patch_sparse_attn(M)
+    P.patch_indexer(M)   # 索引分数按块算(2026-09-22): 24k token 的判决料一次性物化 [s,h,t] 会吃干 121 GB
 
     # ---- 建模型: meta device, 不分配任何权重 ----
     cfg = json.loads((hf / "inference" / "config.json").read_text())
@@ -216,12 +217,17 @@ def main():
             sn = full.rsplit(".", 1)[0] + ".scale"
             is_vq = full not in ix                    # 只剩 VQ 三件 ⇒ 落盘 VQ 产物, 解码核在 C
             dt = "VQ" if is_vq else ix[full][2]
+            # q4_K 骨架(2026-09-19 的 100 GB 档): 块自带 f16 主 scale/min, 没有 sibling .scale ——
+            # 所以它进不了下面那条"有 scale 才 dequant"的路, 得单独解, 但之后与 fp4/fp8 同等对待。
+            is_q4k = dt == "Q4_K"
             if is_vq:
                 t = load_vq(ix, full, dev)            # 当作量化权重: 下面 dtype/统计口径与 fp4 专家同
+            elif is_q4k:
+                t = load_q4k(ix, full, dev)
             else:
                 t = load_raw(ix, full, dev)
-            if sn in ix or is_vq:
-                if not is_vq:
+            if sn in ix or is_vq or is_q4k:
+                if not is_vq and not is_q4k:
                     sc = load_raw(ix, sn, dev)
                     t = dq_fp4(t, sc, tbl) if dt == "I8" else dq_fp8(t, sc)
                 # ★只量化主干 routed 专家★: MTP 的 128 专家按 108 GB 配方保 FP4(草稿质量
@@ -248,10 +254,10 @@ def main():
                 # --exact-weights: 量化权重(fp4/fp8/VQ)留 f32 精确值; linear_dq 本就 f32 算, 输出 dtype 由
                 # _was_quant 决定(bf16), 所以模型其余 dtype 流不变, 只是权重不再被多舍一次 bf16
                 # wo_a 走 einsum(官方 model.py "bsgd,grd->bsgr"), 没有 linear_dq 接它, 必须留 bf16 否则 dtype 不配
-                if not (a.exact_weights and (sn in ix or is_vq) and ".wo_a." not in sn):
+                if not (a.exact_weights and (sn in ix or is_vq or is_q4k) and ".wo_a." not in sn):
                     t = t.to(old.dtype)
             par = torch.nn.Parameter(t, requires_grad=False)
-            par._was_quant = sn in ix or is_vq    # 原本是 fp4/fp8/VQ => linear 要按 kernel 口径出 bf16
+            par._was_quant = sn in ix or is_vq or is_q4k   # 原本是 fp4/fp8/VQ/q4_K => linear 按 kernel 口径出 bf16
             setattr(owner, leaf, par)
 
     def swap_ffn(ffn, li):
@@ -426,6 +432,32 @@ def main():
             ffn.register_forward_pre_hook(mk(i))
         print(f"[捕获] {len(net.layers)} 层 MoE 入口列能量 → {a.dump_act}", flush=True)
 
+    # ---- DSpark 夹具·main_hidden 取法验证(--dump-mainh-variants): 目标层的四种候选各落一份 ----
+    # 官方 model.py 取的是层输入的 hc 均值(h.mean(dim=2)); 但 hc 模型里注意力真正吃的是 hc_pre(h, pre_mix)
+    # (按上一层给的 pre_mix 折叠四路), 均值只是它的一个特例。哪一种是草稿器训练时的口径, 只能喂夹具看命中率。
+    mhv = {}
+    if a.dump_mainh_variants:
+        tl = list(args.dspark_target_layer_ids)
+        mhv = {k: [None] * len(tl) for k in ("inmean", "inpre", "outmean", "outpre")}
+
+        def mk_pre(si):
+            def h(mod, fargs):          # Block.forward(x, start_pos, pre_mix, image_mask): 位置参数
+                x, pm = fargs[0].float(), fargs[2].float()
+                mhv["inmean"][si] = x.mean(2)[0].cpu()
+                mhv["inpre"][si] = torch.sum(pm.unsqueeze(-1) * x, dim=2)[0].cpu()
+            return h
+
+        def mk_post(si):
+            def h(mod, fargs, out):     # 返回 (h_out, ffn_pre): ffn_pre 就是下一层折叠输入用的 pre_mix
+                y, fp = out[0].float(), out[1].float()
+                mhv["outmean"][si] = y.mean(2)[0].cpu()
+                mhv["outpre"][si] = torch.sum(fp.unsqueeze(-1) * y, dim=2)[0].cpu()
+            return h
+        for si, li in enumerate(tl):
+            net.layers[li].register_forward_pre_hook(mk_pre(si))
+            net.layers[li].register_forward_hook(mk_post(si))
+        print(f"[取法验证] 目标层 {tl}: 四种 main_hidden 候选 → {a.dump_mainh_variants}.*.bin", flush=True)
+
     # ★强制全位置 logits★: ParallelHead.forward 默认 full_logits=False, 只算最后一个位置
     # (生成时的优化)。五指标(PPL 比/Σmin/KLD/same-top/top1)是逐位置 teacher-forcing 的,
     # 只拿末位等于没有尺。
@@ -441,9 +473,23 @@ def main():
     x = torch.tensor([ids], device=dev)
     print(f"[前向] {len(ids)} token", flush=True)
     t1 = time.time()
-    out_ids, logits, _ = net(x)
+    out_ids, logits, mainh = net(x)
     torch.cuda.synchronize()
     print(f"[完成] {time.time()-t1:.1f}s, logits {tuple(logits.shape)}", flush=True)
+    if a.dump_mainh:
+        # DSpark 夹具的 FP 侧原料: 官方 forward 里 main_hiddens.append(h.mean(dim=2)) 在目标层拼出来的那份,
+        # 第 p 行 = 位置 p(与引擎 --dspark-capture 落的 <out>.fix 第 p 对吃的 main_hidden(p) 同一个位置)。
+        if mainh is None:
+            raise SystemExit("★--dump-mainh: 这趟没建 MTP(--layers 截了层?), 拿不到 main_hidden★")
+        arr = mainh.view(-1, mainh.shape[-1]).float().cpu().numpy()
+        arr.astype("float32").tofile(a.dump_mainh)
+        print(f"  [main_hidden] {arr.shape[0]} 位置 × {arr.shape[1]} → {a.dump_mainh}", flush=True)
+    for k, parts in mhv.items():
+        if any(p is None for p in parts):
+            raise SystemExit(f"★取法验证: {k} 有目标层没钩到(hook 没触发?)★")
+        arr = torch.cat(parts, dim=-1).numpy()          # [S][目标层数×dim], 槽序 = 目标层升序, 与引擎同
+        arr.astype("float32").tofile(f"{a.dump_mainh_variants}.{k}.bin")
+        print(f"  [取法验证] {k}: {arr.shape[0]} × {arr.shape[1]} → {a.dump_mainh_variants}.{k}.bin", flush=True)
     lg = logits.view(-1, logits.shape[-1])
     print(f"  首位 top5: {lg[0].float().topk(5).indices.tolist()}")
     print(f"  末位 top5: {lg[-1].float().topk(5).indices.tolist()}")

@@ -416,7 +416,7 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
     return cuda_pread_full(g_model_fd, stage, bytes, offset);
 }
 
-static uint64_t cuda_model_cache_limit_bytes(void) {
+static uint64_t cuda_model_cache_limit_default_bytes(void) {
     uint64_t gb = 0;
     const char *env = ((const char *)0) /* DS4_CUDA_WEIGHT_CACHE_LIMIT_GB: 路径开关已删(2026-08-22 隐形炸弹清理) */;
     if (env && env[0]) {
@@ -452,6 +452,11 @@ static uint64_t cuda_model_cache_limit_bytes(void) {
     }
 #endif
     return 24ull * 1073741824ull;
+}
+/* 显式封顶(ds4_gpu_set_model_cache_limit_mb)只能往下压, 不许越过平台默认 —— 默认那条线是"别 OOM"的最高约束。 */
+static uint64_t cuda_model_cache_limit_bytes(void) {
+    const uint64_t def = cuda_model_cache_limit_default_bytes();
+    return (g_model_cache_limit_override && g_model_cache_limit_override < def) ? g_model_cache_limit_override : def;
 }
 
 static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {

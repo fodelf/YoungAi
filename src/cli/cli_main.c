@@ -169,8 +169,13 @@ int main(int argc, char **argv) {
         free(cfg.prompt_owned);
         return rc;
     }
+    /* V4.1 的上下文来自模型元数据(用户 2026-09-22: 引擎里没有写死的上下文): 写进 cfg, 后面按 ctx 判 Think Max / 打 JSON 头
+     * 的那些 V4 时代代码看到的就是同一个数, 不会拿 V4 会话默认的 32768 去降级 Think Max。 */
+    if (ds4_engine_is_v41(engine)) cfg.gen.ctx_size = ds4_engine_v41_ctx();
     if (!cfg.inspect) {
-        log_context_memory(cfg.engine.backend, cfg.gen.ctx_size);
+        /* V4.1 不打 V4 那行"context buffer N MiB"估算: 它按 V4 会话算, 与 V4.1 无关, 09-20 就被当成真分配写进过脚本注释 */
+        if (ds4_engine_is_v41(engine)) fprintf(stderr, "ds4: V4.1 上下文 %d(模型元数据 deepseek4.context_length; 状态按本趟位置分配)\n", cfg.gen.ctx_size);
+        else log_context_memory(cfg.engine.backend, cfg.gen.ctx_size);
         cli_warn_think_max_downgraded(&cfg.gen, "--think-max");
     }
     int rc = 0;

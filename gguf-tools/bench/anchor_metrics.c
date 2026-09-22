@@ -132,6 +132,7 @@ typedef struct {
     const int *row;             /* [n] 绝对行号: 判决行集合可以不连续(见 --rows) */
     double *kld, *rms, *dtop, *smin;   /* [n] */
     uint8_t *same;              /* [n] */
+    int *ir, *iu;               /* [n] ref/stu 的 argmax: --row-out 拿它对实际 token 判"谁命中"(D1: 老师在复读位选谁) */
 } met_ctx;
 static void met_worker(void *vc, int t0, int t1) {
     met_ctx *c = (met_ctx *)vc;
@@ -152,7 +153,7 @@ static void met_worker(void *vc, int t0, int t1) {
         c->kld[t] = kl;
         { double sm = 0; for (int v = 0; v < V; v++) sm += pr[v] < ps[v] ? pr[v] : ps[v];
           c->smin[t] = sm; }   /* 分布还原率 Σmin(还原率铁律的主尺) */
-        c->same[t] = (ir == iu);
+        c->same[t] = (ir == iu); c->ir[t] = ir; c->iu[t] = iu;
         c->dtop[t] = fabs(pr[ir] - ps[ir]);
         /* top32 联合窗均方 */
         int ia[32], ib[32], u[64], nu = 0;
@@ -406,7 +407,8 @@ int main(int argc, char **argv) {
         double *kld = malloc(n * sizeof(double)), *rms = malloc(n * sizeof(double));
         double *dtop = malloc(n * sizeof(double)), *smin = malloc(n * sizeof(double));
         uint8_t *same = malloc(n);
-        met_ctx mc = {ref, stu, V, row, kld, rms, dtop, smin, same};
+        int *irx = malloc(n * sizeof(int)), *iux = malloc(n * sizeof(int));
+        met_ctx mc = {ref, stu, V, row, kld, rms, dtop, smin, same, irx, iux};
         parallel_for(n, threads, met_worker, &mc);
         pplr sp = ppl_block(stu, ids, nids, V, row, n);
         pplr rp = ppl_block(ref, ids, nids, V, row, n);
@@ -423,11 +425,16 @@ int main(int argc, char **argv) {
         printf("  RMS Δp(top32窗) = %.4f%%\n", sqrt(mr / n) * 100);
         printf("  Same top token  = %.2f%%\n", ms / n * 100);
         printf("  Δp(ref top tok) = %.4f (p95 %.4f)\n", md / n, quantile(dtop, n, 0.95));
-        if (rowout) {   /* 行=位置 kld smin same(与上面五指标同一批数, 只是不聚合) */
+        if (rowout) {   /* 行=位置 kld smin same ref命中 stu命中 ref_argmax stu_argmax(命中 = argmax == 实际下一个 token; 无 ids 时 -1)。
+                         * 末两列 2026-09-22 加: 复读入口要看"老师想选谁", 光有命中标志不够 */
             FILE *fo = fopen(rowout, si == 0 ? "w" : "a");
-            if (fo) { for (int t = 0; t < n; t++) fprintf(fo, "%d %.6f %.6f %d\n", row[t], kld[t], smin[t], same[t]); fclose(fo); }
+            if (fo) { for (int t = 0; t < n; t++) {
+                int nx = row[t] + 1 < nids ? (int)ids[row[t] + 1] : -1;
+                fprintf(fo, "%d %.6f %.6f %d %d %d %d %d\n", row[t], kld[t], smin[t], same[t],
+                        nx < 0 ? -1 : irx[t] == nx, nx < 0 ? -1 : iux[t] == nx, irx[t], iux[t]); }
+                fclose(fo); }
         }
-        free(kld); free(rms); free(dtop); free(smin); free(same);
+        free(kld); free(rms); free(dtop); free(smin); free(same); free(irx); free(iux);
     }
 
     if (tail) {

@@ -177,7 +177,9 @@ uint64_t trace_begin(
             j->req.prompt.len,
             effective_prompt_tokens,
             cached,
-            j->req.max_tokens,
+            /* 不设上限时别把 INT_MAX 抄进 trace: 重放脚本按这里的数字复现请求, 2147483647 会让人以为客户端真传了这个数。
+             * -1 = "客户端没给, 界是 ctx − 提示"(与 max_tokens: 0 = 明确要 0 个 token 区分开)。 */
+            j->req.max_tokens == SERVER_NO_OUTPUT_CAP ? -1 : j->req.max_tokens,
             j->req.temperature,
             j->req.top_k,
             j->req.top_p,

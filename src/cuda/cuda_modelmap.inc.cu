@@ -100,6 +100,15 @@ int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
         }
     }
 
+    /* 缓存封顶模式(2026-09-20, ds4_gpu_set_model_cache_limit_mb): 整映射不注册。注册了就会有两件坏事:
+     * ①装不进缓存的段静默走 UVA 映射指针(09-12 尾页脏读 / 09-15 kswapd 长尾都出在这条路上)
+     * ②cuda_v41_3.inc.cu 的逐层流式路对已注册的整映射再 cudaHostRegister 子段会报 AlreadyRegistered。
+     * 不注册 ⇒ 装进缓存的段照常命中设备副本, 装不下的专家 blob 走逐层注册→算→注销, 任何时刻最多钉住一层。 */
+    if (g_model_cache_limit_override) {
+        fprintf(stderr, "ds4: CUDA 权重缓存封顶 %.2f GiB: 整映射不注册, 装不下的专家 blob 走逐层流式\n",
+                (double)cuda_model_cache_limit_bytes() / 1073741824.0);
+        return 1;
+    }
     /* GB10 / driver 580.142 reports cudaDevAttrHostRegisterReadOnlySupported = 0,
      * so requesting cudaHostRegisterReadOnly here fails with cudaErrorNotSupported
      * and the entire model-resident fast path falls back to per-deref H2D streaming.
@@ -130,6 +139,8 @@ int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
  * no-op and report no working-set ceiling so the AUTO path falls back to the
  * explicit DS4_MEM_BUDGET_MB (or resident) without a spurious offload. */
 void ds4_gpu_set_expert_offload(int enabled) { (void)enabled; }
+/* 设备权重缓存封顶(见 ds4_gpu_core.h): 必须在 ds4_gpu_set_model_map 之前设, 它同时决定"整映射注不注册"。 */
+void ds4_gpu_set_model_cache_limit_mb(uint64_t mb) { g_model_cache_limit_override = mb * 1048576ull; }
 uint64_t ds4_gpu_recommended_max_working_set_bytes(void) { return 0; }
 
 /* Metal-only tuning setters (see ds4_gpu.h): strict-fp shader parity, Metal 4

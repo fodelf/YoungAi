@@ -41,6 +41,11 @@ void v41_load_metadata(const ds4_model *m) {
     ds4_v41_cfg *v = &g_ds4_v41;
     memset(v, 0, sizeof *v);
     v->active = 1;
+    /* ★上下文只从模型元数据来★(用户 2026-09-22 "不要任何写死的上下文, 上下文大小只有 1M 这一个选择"): 转换器把 HF config 的
+     * max_position_embeddings 写成 deepseek4.context_length, 引擎只认这个键 —— 没有默认值、没有上限常量、没有 --ctx。 */
+    const uint64_t ctx = v41_req_u64(m, "deepseek4.context_length");
+    if (ctx == 0 || ctx > UINT32_MAX) ds4_die("V4.1 deepseek4.context_length 不合法");
+    v->ctx = (uint32_t)ctx;
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
         v->kv_source_of[il] = -1; v->index_source_of[il] = -1; v->engram_index_of[il] = -1;
     }

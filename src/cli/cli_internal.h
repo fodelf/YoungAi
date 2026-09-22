@@ -48,6 +48,7 @@ typedef struct {
     int decoder_full;            /* --decoder-full: 关 CED, 提示每块跑满 40 层(精确路, 跟 CED 对质量用) */
     int no_dspark;               /* --no-dspark: 关投机解码(现在是默认行为, 老脚本一路在传, 留着当"再确认一次") */
     int no_graph;                /* --no-graph: 关解码整步 CUDA graph(默认开; 只作 A/B 与同轨定位, 两条路输出逐字节同) */
+    int no_vq_group;             /* --no-vq-group: 验证批/草稿塔的 VQ 专家核回逐对形态(默认走分组核; 只作 A/B, 输出逐字节同) */
     int emit_trace;              /* --emit-trace: 逐 token 打 [emit] 行(同轨定位用, 不改执行路径) */
     int dspark_block;            /* --dspark-block N: 钉死草稿块长(诊断用) */
     int verify_k;                /* --dspark-verify N: 投机每轮验证几位(0=引擎默认) */

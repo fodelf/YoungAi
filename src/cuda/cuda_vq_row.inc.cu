@@ -78,28 +78,39 @@ __device__ __forceinline__ static __half2 v41_e4m3x2_to_half2(uint32_t two) {
     __half2 out; memcpy(&out, &h, 4);
     return out;
 }
+/* 码字 v → 8 个 f32(2026-09-22 从 dot8 拆出): 多 token 分组核(cuda_vq_group.inc.cu)一个索引只解一次码字, 对每个 token
+ * 各做一次下面的 v41_vq_dot8_cw; 单 token 核仍走 v41_vq_dot8 = 解码 + dot8_cw, 内联后与拆分前同一棵表达式树。 */
 template <int FP8>
-__device__ __forceinline__ static float v41_vq_dot8(uint32_t v, uint4 xw, const uint8_t *cbs, int cb_shared) {
-    float c0, c1, c2, c3, c4, c5, c6, c7;
+__device__ __forceinline__ static void v41_vq_cw(uint32_t v, const uint8_t *cbs, int cb_shared, float *c) {
     if (FP8) {
         const uint2 w = *(const uint2 *)(cbs + (size_t)v * 8u);
         const __half2 p0 = v41_e4m3x2_to_half2(w.x), p1 = v41_e4m3x2_to_half2(w.x >> 16),
                       p2 = v41_e4m3x2_to_half2(w.y), p3 = v41_e4m3x2_to_half2(w.y >> 16);
         const float2 e0 = __half22float2(p0), e1 = __half22float2(p1), e2 = __half22float2(p2), e3 = __half22float2(p3);
-        c0 = e0.x; c1 = e0.y; c2 = e1.x; c3 = e1.y; c4 = e2.x; c5 = e2.y; c6 = e3.x; c7 = e3.y;
+        c[0] = e0.x; c[1] = e0.y; c[2] = e1.x; c[3] = e1.y; c[4] = e2.x; c[5] = e2.y; c[6] = e3.x; c[7] = e3.y;
     } else {
         uint2 cw0, cw1;
-        if (cb_shared) { const uint4 c = *(const uint4 *)(cbs + (size_t)v * 16u); cw0.x = c.x; cw0.y = c.y; cw1.x = c.z; cw1.y = c.w; }
+        if (cb_shared) { const uint4 q = *(const uint4 *)(cbs + (size_t)v * 16u); cw0.x = q.x; cw0.y = q.y; cw1.x = q.z; cw1.y = q.w; }
         else { cw0 = *(const uint2 *)(cbs + (size_t)v * 16u); cw1 = *(const uint2 *)(cbs + (size_t)v * 16u + 8u); }
         __half2 h0, h1, h2, h3; memcpy(&h0, &cw0.x, 4); memcpy(&h1, &cw0.y, 4); memcpy(&h2, &cw1.x, 4); memcpy(&h3, &cw1.y, 4);
         const float2 f0 = __half22float2(h0), f1 = __half22float2(h1), f2 = __half22float2(h2), f3 = __half22float2(h3);
-        c0 = f0.x; c1 = f0.y; c2 = f1.x; c3 = f1.y; c4 = f2.x; c5 = f2.y; c6 = f3.x; c7 = f3.y;
+        c[0] = f0.x; c[1] = f0.y; c[2] = f1.x; c[3] = f1.y; c[4] = f2.x; c[5] = f2.y; c[6] = f3.x; c[7] = f3.y;
     }
-    /* 一个 uint32 装两个 bf16: 低半是第 2k 个元素, 高半是第 2k+1 个。补零还原成 f32。累加次序与 09-16 定版一字不差。 */
-    return c0 * __uint_as_float(xw.x << 16) + c1 * __uint_as_float(xw.x & 0xffff0000u)
-         + c2 * __uint_as_float(xw.y << 16) + c3 * __uint_as_float(xw.y & 0xffff0000u)
-         + c4 * __uint_as_float(xw.z << 16) + c5 * __uint_as_float(xw.z & 0xffff0000u)
-         + c6 * __uint_as_float(xw.w << 16) + c7 * __uint_as_float(xw.w & 0xffff0000u);
+}
+/* 8 元素乘加。★这一个式子决定"与 09-16 定版逐位同"★: 单 token 核与分组核都只经这里, 谁也不许另抄一份
+ * (fast-math 下同一组乘加换个写法, 编译器的 FMA 合并方式就变, 累加序跟着变 —— 09-16 在 GEMV 核上实撞过)。
+ * 一个 uint32 装两个 bf16: 低半是第 2k 个元素, 高半是第 2k+1 个。补零还原成 f32。 */
+__device__ __forceinline__ static float v41_vq_dot8_cw(const float *c, uint4 xw) {
+    return c[0] * __uint_as_float(xw.x << 16) + c[1] * __uint_as_float(xw.x & 0xffff0000u)
+         + c[2] * __uint_as_float(xw.y << 16) + c[3] * __uint_as_float(xw.y & 0xffff0000u)
+         + c[4] * __uint_as_float(xw.z << 16) + c[5] * __uint_as_float(xw.z & 0xffff0000u)
+         + c[6] * __uint_as_float(xw.w << 16) + c[7] * __uint_as_float(xw.w & 0xffff0000u);
+}
+template <int FP8>
+__device__ __forceinline__ static float v41_vq_dot8(uint32_t v, uint4 xw, const uint8_t *cbs, int cb_shared) {
+    float c[8];
+    v41_vq_cw<FP8>(v, cbs, cb_shared, c);
+    return v41_vq_dot8_cw(c, xw);
 }
 /* f32(已在 bf16 格点) → 打包成 bf16。一线程一元素, 每层一次, 5120 个元素, 可忽略。 */
 __global__ static void v41_vq_xpack_kernel(uint16_t *dst, const float *src, uint64_t n) {

@@ -79,22 +79,26 @@ run_py() {
     local lf="$OUT/log_${tag}.txt"
     "$PY" "$T" "$MODEL_DIR" "$@" 2>&1 | tee "$lf" | grep --line-buffered -E "$filt"
     [ "${PIPESTATUS[0]}" = 0 ] && return 0
-    LOG "★$tag 失败 —— 全量日志 $lf, 尾部:★"; tail -20 "$lf"; return 1
+    LOG "★$tag 失败 —— 全量日志 $lf, 尾部:★"; tail -20 "$lf"; FAIL=$((${FAIL:-0}+1)); return 1
 }
 
 # 引擎学生(2026-09-13): ./ds4 --score-ids 走 V4.1 分块增量前向(部署同路), 可挂 --zchain 放大器目录。ids 截到 NTOK 行
 # 落盘再喂引擎(引擎读整个文件)。与 run_py 同一套纪律: 全量日志落盘, 过滤上屏, PIPESTATUS 判真实退出码。
-GG_DEFAULT="$ROOT/gguf/v41/DeepSeek-V4.1-Flash-vq8x4096-fp4.gguf"
+# ★默认 = 现役部署文件★(2026-09-22 改成 v3 vq8sh14-q4k; 老的 fp4 那份已删) ——
+# 默认指着一个打不开的文件, 谁漏传 gguf 字段就白等一次加载。
+GG_DEFAULT="$ROOT/gguf/v41/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf"
 run_eng() {
     local stu="$1" gg="$2" zarg="$3" tag="$4"   # zarg 里可以带 --zchain/--zchain-scale/--posttrain
     local idsn="$OUT/ids_${TAG}.txt" lf="$OUT/log_${tag}.txt"
     head -n "$NTOK" "$IDS" > "$idsn"
     [ -x "$ROOT/ds4" ] || { LOG "★$ROOT/ds4 没编(make cuda-spark)★"; return 1; }
     file "$ROOT/ds4" | grep -q "ELF.*aarch64" || { LOG "★./ds4 不是 ELF aarch64★"; return 1; }
-    "$ROOT/ds4" -m "$gg" --cuda --mem-budget-mb 40000 --score-ids "$idsn" --score-out "$stu" $zarg 2>&1 \
+    # 上下文没有参数(2026-09-22): V4.1 打分路按 ids 行数分配状态, 以前这里传 --ctx "$NTOK" 是为了躲开 CLI 打的那行
+    # V4 会话"context buffer 2416 MiB"估算(09-20 把它当成了真分配), 现在 V4.1 不打那行、也不接受 --ctx。
+    "$ROOT/ds4" -m "$gg" --cuda --mem-budget-mb 40000 --weight-cache-mb 88000 --score-ids "$idsn" --score-out "$stu" $zarg 2>&1 \
         | tee "$lf" | grep --line-buffered -E "反修|PPL|失败|error|Error|watchdog"
     [ "${PIPESTATUS[0]}" = 0 ] && [ -s "$stu" ] && return 0
-    LOG "★$tag 失败 —— 全量日志 $lf, 尾部:★"; tail -20 "$lf"; return 1
+    LOG "★$tag 失败 —— 全量日志 $lf, 尾部:★"; tail -20 "$lf"; FAIL=$((${FAIL:-0}+1)); return 1
 }
 
 # ★.so 必须比 .cu 新★: 改了解算器忘重编, 跑的还是上一版 —— 数字全废还看不出来
@@ -196,7 +200,7 @@ for NB in "$@"; do
              --ids "$IDS" --ntok "$NTOK" --vq-dim "$VD" --vq-nc "$VN" $ACTARG \
              --amp "$ARM" --out "$STU" || continue
       LOG "③ 五指标 VQ ${VD}x${VN} + amp K=$KK λ=$LAM"
-      "$AM" --ref-raw "$REF" --ids "$IDS" --student "$STU" || LOG "★判决失败★"
+      "$AM" --ref-raw "$REF" --ids "$IDS" --student "$STU" || { LOG "★判决失败★"; FAIL=$((${FAIL:-0}+1)); }
       continue;;
     scankfile:*) # 落盘学生的 K×λ 扫描: scankfile:<量化目录>:<拟合ids>:<ntok>:<跑前几层>[:<白化 0/1/2>]
       # 与 scank 同, 只是学生从文件读回, FP 靶从 --fp-dir(HF)装; held-out 按 <拟合ids>.layout 分层
@@ -271,7 +275,7 @@ for NB in "$@"; do
       MODEL_DIR="$HF"
       [ $rc = 0 ] || continue
       LOG "③ 五指标 落盘模型 + 放大器 ← $ARM"
-      "$AM" --ref-raw "$REF" --ids "$IDS" --student "$STU" || LOG "★判决失败★"
+      "$AM" --ref-raw "$REF" --ids "$IDS" --student "$STU" || { LOG "★判决失败★"; FAIL=$((${FAIL:-0}+1)); }
       continue;;
     engine|engine:*) # 引擎学生档(2026-09-13): engine[:<gguf>[:<放大器目录>]] —— 学生 = ds4 引擎 --score-ids(部署同路);
       # gguf 空 = 默认 1.5 bpw 文件; 给放大器目录则 --zchain 挂上(目录 manifest 须有 "# 完成", 半成品不判)。
@@ -295,34 +299,52 @@ for NB in "$@"; do
       LOG "② 学生 = 引擎 $(basename "$GG")${ARMD:+ + 放大器 $(basename "$ARMD")} (判决料 $(basename "$IDS") n=$NTOK)"
       run_eng "$STU" "$GG" "$ZARG" "stu_${TAG}_eng${SFX}" || continue
       LOG "③ 五指标 引擎 $(basename "$GG" .gguf)${SFX}"
-      "$AM" --ref-raw "$REF" --ids "$IDS" --student "$STU" || LOG "★判决失败★"
+      "$AM" --ref-raw "$REF" --ids "$IDS" --student "$STU" || { LOG "★判决失败★"; FAIL=$((${FAIL:-0}+1)); }
       continue;;
-    engamp:*) # 引擎反修档(2026-09-13): engamp:<拟合ids>:<拟合ntok>[:<gguf>[:<白化 0/1/2>[:<层数>]]]
+    engamp:*) # 引擎反修档(2026-09-13): engamp:<拟合ids>:<拟合ntok>[:<gguf>[:<白化 0/1/2>[:<层数>[:<模式>]]]]
       # ②a v41_amp_run 在引擎真前向上序贯解放大器(FP 靶用 HF 出厂权重当场算, 解算器与 Python 路同一份 CUDA 源)
       # ②b 学生 = 引擎 + 放大器, 判决料打分。放大器目录按 manifest "# 完成" 判完整: 完整复用, 半成品 rm -rf 重解。
-      IFS=: read -r _ FIT FN GG WH NLY <<<"$NB"; GG="${GG:-$GG_DEFAULT}"; WH="${WH:-0}"; NLY="${NLY:-40}"
+      # 第七字段 模式(09-20 加): 空 = 低秩放大器(amp_Lnn, K×λ 择优); gr = 权重侧逐专家逐通道增益(gr_Lnn, 现役 ② 那条路,
+      # = v41_amp_run --capture-ye)。★不给 gr 就是低秩路★ —— 现役 gr-fin-40-fp4 当初是手敲命令解的, 这里补成可复现的档。
+      # grrb = 路由偏置 + 增益【合并序贯】(09-20 下午): 每层先解 Δb、挂上、再取料解增益, rb_Lnn 与 gr_Lnn 同目录。
+      # FP 路由靶要拟合份的教师链态夹具(v41_teacher.py --dump-moe, 40 层 x/y 14 GB, 一份语料落一次), 缺就先落。
+      IFS=: read -r _ FIT FN GG WH NLY MODE <<<"$NB"; GG="${GG:-$GG_DEFAULT}"; WH="${WH:-0}"; NLY="${NLY:-40}"; MODE="${MODE:-}"
       [ -s "$GG" ] || { LOG "★$GG 不存在★"; continue; }
       [ -s "$FIT" ] || { LOG "★拟合料 $FIT 不存在★"; continue; }
       [ -s "$FIT.layout" ] || { LOG "★$FIT.layout 缺: 择优路要 layout 分层 held-out★"; continue; }
+      GRARG=""; KIND="amp"
+      case "$MODE" in
+        "") ;;
+        gr) GRARG="--capture-ye"; KIND="gr" ;;
+        grrb)
+          DUMP="$OUT/fpdump_$(corpus_tag "$FIT")_n${FN}"
+          if [ ! -s "$DUMP/x_L$(printf %02d $((NLY-1))).bin" ]; then
+              LOG "教师链态夹具(FP 每层 x/y) → $DUMP"
+              run_py "fpdump_$(corpus_tag "$FIT")_n${FN}" "配置|反修原料|完成|PPL|→" \
+                     --ids "$FIT" --ntok "$FN" --dump-moe "$DUMP" --out "$OUT/teacher_$(corpus_tag "$FIT")_n${FN}.bin" || continue
+          fi
+          GRARG="--capture-ye --rb $DUMP"; KIND="grrb" ;;
+        *) LOG "★engamp 第七字段只认空/gr/grrb, 收到 $MODE★"; continue ;;
+      esac
       WSFX=""; [ "$WH" != 0 ] && WSFX="_w$WH"; LSFX=""; [ "$NLY" != 40 ] && LSFX="_L$NLY"
-      ARM="$ROOT/gguf/v41/$(basename "$GG" .gguf)-amp-$(corpus_tag "$FIT")_n${FN}${WSFX}${LSFX}-engine"
+      ARM="$ROOT/gguf/v41/$(basename "$GG" .gguf)-$KIND-$(corpus_tag "$FIT")_n${FN}${WSFX}${LSFX}-engine"
       if grep -q "^# 完成" "$ARM/manifest.txt" 2>/dev/null; then
           LOG "②a 放大器已在 $ARM (manifest 完成), 复用"
       else
           rm -rf "$ARM"
           make -C "$ROOT/gguf-tools" v41_amp_run >"$OUT/log_make_v41_amp_run.txt" 2>&1 \
               || { LOG "★v41_amp_run 编译失败★"; tail -20 "$OUT/log_make_v41_amp_run.txt"; continue; }
-          LOG "②a 引擎序贯反修·择优: $(basename "$GG") × 拟合料 $(corpus_tag "$FIT") n=$FN, 前 $NLY 层, 白化 $WH → $ARM"
+          LOG "②a 引擎序贯反修·$KIND: $(basename "$GG") × 拟合料 $(corpus_tag "$FIT") n=$FN, 前 $NLY 层, 白化 $WH → $ARM"
           lf="$OUT/log_solve_$(basename "$ARM").txt"
-          "$ROOT/gguf-tools/amp/v41_amp_run" "$GG" "$HF" "$FIT" "$FN" "$ARM" --layers "$NLY" --whiten "$WH" --mem-budget-mb 40000 2>&1 \
+          "$ROOT/gguf-tools/amp/v41_amp_run" "$GG" "$HF" "$FIT" "$FN" "$ARM" --layers "$NLY" --whiten "$WH" --mem-budget-mb 40000 --weight-cache-mb 88000 $GRARG 2>&1 \
               | tee "$lf" | grep --line-buffered -E "held-out|反修|引擎\]|\[L[0-9]|择优|PPL|失败|★|error|Error|watchdog"
-          [ "${PIPESTATUS[0]}" = 0 ] || { LOG "★反修失败 —— 全量日志 $lf, 尾部:★"; tail -20 "$lf"; continue; }
+          [ "${PIPESTATUS[0]}" = 0 ] || { LOG "★反修失败 —— 全量日志 $lf, 尾部:★"; tail -20 "$lf"; FAIL=$((${FAIL:-0}+1)); continue; }
       fi
       STU="$OUT/stu_${TAG}_eng_$(basename "$GG" .gguf)_amp_$(basename "$ARM").bin"
       LOG "②b 学生 = 引擎 + 放大器 $(basename "$ARM") (判决料 $(basename "$IDS") n=$NTOK)"
       run_eng "$STU" "$GG" "--zchain $ARM" "stu_${TAG}_eng_amp_$(basename "$ARM")" || continue
       LOG "③ 五指标 引擎 + 放大器 ← $ARM"
-      "$AM" --ref-raw "$REF" --ids "$IDS" --student "$STU" || LOG "★判决失败★"
+      "$AM" --ref-raw "$REF" --ids "$IDS" --student "$STU" || { LOG "★判决失败★"; FAIL=$((${FAIL:-0}+1)); }
       continue;;
     engkl:*) # 蒸馏靶档(2026-09-13): engkl:<拟合ids>:<拟合ntok>:<eta-rel>[:<层号 默认 39>[:<gguf>]]
       # 与 engamp: 的唯一差别是【靶】: 不再是"这一层像教师"(最小二乘), 而是"让最终 logits 像教师该往哪挪"
@@ -344,20 +366,20 @@ for NB in "$@"; do
           LOG "②a 蒸馏靶解算: L$KLY, 拟合料 $(corpus_tag "$FIT") n=$FN, eta-rel $ETA, 教师锚 $(basename "$KREF") → $ARM"
           lf="$OUT/log_solve_$(basename "$ARM").txt"
           "$ROOT/gguf-tools/amp/v41_amp_run" "$GG" "$HF" "$FIT" "$FN" "$ARM" --only-layer "$KLY" \
-              --target "kl:$KREF" --eta-rel "$ETA" --mem-budget-mb 40000 2>&1 \
+              --target "kl:$KREF" --eta-rel "$ETA" --mem-budget-mb 40000 --weight-cache-mb 88000 2>&1 \
               | tee "$lf" | grep --line-buffered -E "held-out|反修|引擎\]|KL 靶|蒸馏靶|\[L[0-9]|择优|PPL|失败|★|error|Error|watchdog"
-          [ "${PIPESTATUS[0]}" = 0 ] || { LOG "★蒸馏靶解算失败 —— 全量日志 $lf, 尾部:★"; tail -20 "$lf"; continue; }
+          [ "${PIPESTATUS[0]}" = 0 ] || { LOG "★蒸馏靶解算失败 —— 全量日志 $lf, 尾部:★"; tail -20 "$lf"; FAIL=$((${FAIL:-0}+1)); continue; }
       fi
       STU="$OUT/stu_${TAG}_eng_kl_$(basename "$ARM").bin"
       LOG "②b 学生 = 引擎 + 蒸馏靶放大器 $(basename "$ARM") (判决料 $(basename "$IDS") n=$NTOK)"
       run_eng "$STU" "$GG" "--zchain $ARM" "stu_${TAG}_eng_kl_$(basename "$ARM")" || continue
       LOG "③ 五指标 引擎 + 蒸馏靶放大器 ← $ARM"
-      "$AM" --ref-raw "$REF" --ids "$IDS" --student "$STU" || LOG "★判决失败★"
+      "$AM" --ref-raw "$REF" --ids "$IDS" --student "$STU" || { LOG "★判决失败★"; FAIL=$((${FAIL:-0}+1)); }
       continue;;
     file:*) # 落盘模型档: file:<量化目录>。学生权重从文件读回(VQ 三件走 libv41vq.so 解码,
       # 骨架 FP4 与出厂专家同格式) —— 文件读回来的数才是产物的数, 不是"原地量化-反量化"的数。
       MD="${NB#file:}"
-      [ -s "$MD/model.safetensors.index.json" ] || { LOG "★$MD 缺 model.safetensors.index.json, 不是量化目录★"; continue; }
+      [ -s "$MD/model.safetensors.index.json" ] || { LOG "★$MD 缺 model.safetensors.index.json, 不是量化目录★"; FAIL=$((${FAIL:-0}+1)); continue; }
       STU="$OUT/stu_${TAG}_file_$(basename "$MD").bin"
       LOG "② 学生 = 落盘模型 $MD"
       MODEL_DIR="$MD"
@@ -366,7 +388,7 @@ for NB in "$@"; do
       MODEL_DIR="$HF"
       [ $rc = 0 ] || continue
       LOG "③ 五指标 落盘模型 $(basename "$MD")"
-      "$AM" --ref-raw "$REF" --ids "$IDS" --student "$STU" || LOG "★判决失败★"
+      "$AM" --ref-raw "$REF" --ids "$IDS" --student "$STU" || { LOG "★判决失败★"; FAIL=$((${FAIL:-0}+1)); }
       continue;;
     *:*)   # VQ 档
       VD="${NB%%:*}"; VN="${NB##*:}"
@@ -375,7 +397,7 @@ for NB in "$@"; do
       run_py "stu_${TAG}_vq${VD}x${VN}${ACTSFX}" "VQ\]|完成|PPL|路由" \
              --ids "$IDS" --ntok "$NTOK" --vq-dim "$VD" --vq-nc "$VN" $ACTARG --out "$STU" || continue
       LOG "③ 五指标 VQ ${VD}x${VN}"
-      "$AM" --ref-raw "$REF" --ids "$IDS" --student "$STU" || LOG "★判决失败★"
+      "$AM" --ref-raw "$REF" --ids "$IDS" --student "$STU" || { LOG "★判决失败★"; FAIL=$((${FAIL:-0}+1)); }
       continue;;
   esac
     STU="$OUT/stu_${TAG}_b${NB}${ACTSFX}.bin"
@@ -383,11 +405,15 @@ for NB in "$@"; do
     # ★码本必须按真实权重分布求★(2026-09-11): V4.1 专家出厂是 FP4 的 16 个离散值,
     # 拿高斯 Lloyd-Max 去套, 4.25 bpw 都能白吃 KLD 0.41。DP 求的是全局最优, 毫秒级。
     [ -s "$CB" ] || "$CBD/v41_codebook" "$HF" 20 "$NB" "$CB" 8 128 2>&1 | grep -E "\[DP\]|\[码本\]" \
-        || { LOG "★码本求解失败 $NB★"; continue; }
+        || { LOG "★码本求解失败 $NB★"; FAIL=$((${FAIL:-0}+1)); continue; }
     LOG "② 学生 ${NB}bit@blk32 = $(awk "BEGIN{printf \"%.4f\", $NB+8/32}") bpw"
     run_py "stu_${TAG}_b${NB}${ACTSFX}" "量化\]|码本\]|完成|PPL|路由" \
            --ids "$IDS" --ntok "$NTOK" --qnbit "$NB" --qblk 32 --qcb "$CB" $ACTARG --out "$STU" || continue
     LOG "③ 五指标 ${NB}bit"
-    "$AM" --ref-raw "$REF" --ids "$IDS" --student "$STU" || LOG "★判决失败★"
+    "$AM" --ref-raw "$REF" --ids "$IDS" --student "$STU" || { LOG "★判决失败★"; FAIL=$((${FAIL:-0}+1)); }
 done
 LOG "收工, 产物在 $OUT"
+# ★失败必须冒泡★(2026-09-21 实撞): 原来任一档的学生趟失败只是 continue, 循环走完照样打"收工"退 0 ——
+# 发车脚本的 `|| rc=4` 抓不到, 一条 --judge-set all 少跑一把尺没人看得出来(wt2 那趟因 libv41vq.so 被
+# --delete 删掉而失败, 整链却报收工)。现在按档计数, 有失败就退 5。
+[ "${FAIL:-0}" = 0 ] || { LOG "★$FAIL 个档失败(见上面各自的日志)★"; exit 5; }

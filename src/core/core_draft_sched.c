@@ -44,23 +44,27 @@
  * 6 → 9.96 → 13.26 → 17.38 → 21.71, n=1..5), 字节涨 0.65 份/token ⇒ 就算核贴到带宽墙也要 4 ms/位。
  * 这是 384 选 6 的路由在相邻位置上几乎不重合造成的, 任何核形态都绕不过(mtp-2.md §2.2)。
  * ⇒ 换核/换底座之后**必须回来重量这三个数**, 量法就是上面那三行(d0a 的 spec 模式 + `--dspark-verify`)。 */
-#define V41_SCHED_C_DRAFT 0.285f
-#define V41_SCHED_C_TOK   0.385f
-#define V41_SCHED_C_FIX   (1.0f - V41_SCHED_C_TOK)
+/* ★09-19 重标(解码整步 graph + 09-18 VQ 核之后; 单位 = 走图纯解码一步 38.07 ms, 金融提示在线 + 09-18 钉死 k=1/k=3 两趟)★
+ *   草稿一轮 13.5 ms ⇒ c_draft 0.355;  直发验证 1+k 行 = 42.5 + 12.95·k ms ⇒ c_v1 1.116(直发一行含同步/argmax, 比走图一步贵), c_tok 0.340。
+ * 老式子把 c_fix + c_tok 焊成 1(验 1 行 = 纯解码一步), 走图之后不成立: 歇着的步走图 38 ms, 投机轮的验证走直发 42.5。
+ * 三个数由陪审团 gguf-tools/bench/dspark_sim(教师强制取料上重放整段)定, 同一份取料上: 老常量+冷却 16 = 27.8 t/s, 新常量+冷却 4 = 28.3。 */
+#define V41_SCHED_C_DRAFT 0.355f
+#define V41_SCHED_C_V1    1.116f
+#define V41_SCHED_C_TOK   0.340f
 
 /* conf[0..block-1] = 草稿器每位的置信 logit(不是概率, sigmoid 之后才是)。
  * 返回这一轮该验几位(0 = 一位都不值得验, 本轮草稿白跑); *value_out 给出预测的"产出/成本"比值,
  * 调用方拿它决定下一轮还要不要出草稿(< 1 就是连草稿钱都赚不回来)。 */
 uint32_t v41_draft_pick_k(const float *conf, uint32_t block, float *value_out) {
     float surv = 1.0f, sum = 0.0f;
-    float best = 1.0f / (V41_SCHED_C_DRAFT + V41_SCHED_C_FIX + V41_SCHED_C_TOK);   /* k=0: 草稿白跑, 只验真 token */
+    float best = 1.0f / (V41_SCHED_C_DRAFT + V41_SCHED_C_V1);   /* k=0: 草稿白跑, 只验真 token(直发一行) */
     uint32_t bestk = 0;
     for (uint32_t j = 0; j < block; j++) {
         const float c = conf[j];
         /* 非有限的 conf(草稿器偶发坏轮, mtp.md §3.3)当"没把握": 存活率直接归零, 后面几位也就不验了 */
         surv *= isfinite(c) ? 1.0f / (1.0f + expf(-c)) : 0.0f;
         sum += surv;
-        const float cost = V41_SCHED_C_DRAFT + V41_SCHED_C_FIX + V41_SCHED_C_TOK * (2.0f + (float)j);
+        const float cost = V41_SCHED_C_DRAFT + V41_SCHED_C_V1 + V41_SCHED_C_TOK * (1.0f + (float)j);
         const float val = (1.0f + sum) / cost;
         if (val > best) { best = val; bestk = j + 1u; }
     }

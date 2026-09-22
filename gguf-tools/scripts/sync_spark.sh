@@ -37,8 +37,14 @@ rsync -az --delete \
     `# 退给 /bin/sh 当脚本读) —— 一眼看不出是二进制串了台。ELF/Mach-O 只按扩展名认不出来,` \
     `# 所以按"无扩展名的可执行文件"整类排除, 各机器自己 make。` \
     --exclude 'gguf-tools/bench/anchor_metrics' --exclude 'gguf-tools/bench/pubbench' \
-    --exclude 'gguf-tools/bench/dspark_agree' --exclude 'gguf-tools/bench/kl_forensic' \
-    --exclude 'gguf-tools/quantize/v41_to_gguf' --exclude 'gguf-tools/quantize/dump_gguf_meta' \
+    --exclude 'gguf-tools/bench/dspark_agree' --exclude 'gguf-tools/bench/kl_forensic' --exclude 'gguf-tools/bench/dspark_sim' \
+    `# ★v41_quantize 也要护住★(2026-09-21 实撞): 它是 Linux+CUDA 专属, Mac 这边根本产不出来 ⇒ --delete 每同步一次就把` \
+    `# 远端刚编好的删掉, 下一条手敲命令报"没有那个文件或目录"。走脚本的链不受影响(第①步会重编), 手跑探针会中招。` \
+    --exclude 'gguf-tools/quantize/v41_to_gguf' --exclude 'gguf-tools/quantize/dump_gguf_meta' --exclude 'gguf-tools/quantize/v41_nc_alloc' --exclude 'gguf-tools/quantize/v41_quantize' \
+    `# ★libv41vq.so 同样护住★(2026-09-21 实撞): 教师端(v41_teacher.py)用 ctypes 加载它解 VQ 产物, 也是 Linux+CUDA 专属。` \
+    `# 上午只给 v41_quantize 加了 exclude, 漏了这个 .so(它有扩展名, 不在"无扩展名可执行文件"那一类里) ——` \
+    `# 一次同步就把判决链的 wt2 那一趟弄挂了(已加载的进程不受影响, 所以只有后起的那一趟失败, 更难看出来)。` \
+    --exclude 'gguf-tools/quantize/libv41vq.so' --exclude 'gguf-tools/quantize/*.so' \
     --exclude 'gguf-tools/quantize/deepseek4-quantize' --exclude 'gguf-tools/dspark_align' \
     --exclude 'gguf-tools/amp/v41_amp_run' --exclude 'gguf-tools/amp/finetune_solve' \
     --exclude 'speed-bench' --exclude 'reports' --exclude 'notes' \
@@ -50,13 +56,15 @@ rsync -az speed-bench/*.sh "$REMOTE:$RDIR/speed-bench/" || { echo "★speed-benc
 
 if [ "$WHAT" = engine ] || [ "$WHAT" = all ]; then
     echo "[sync] make cuda-spark"
-    ssh "$REMOTE" "cd $RDIR && make cuda-spark 2>&1 | tail -5" || { echo "★引擎编译失败★"; exit 1; }
+    # ★远端必须 set -o pipefail★(2026-09-20 实撞): `make | tail` 的退出码是 tail 的, 链接失败照样打"[sync] 完成" ——
+    # v41_amp_run 缺 -lcublasLt 链不上, 这里连报了两次"完成", 到发车前才发现二进制是旧的。
+    ssh "$REMOTE" "cd $RDIR && set -o pipefail && make cuda-spark 2>&1 | tail -5" || { echo "★引擎编译失败★"; exit 1; }
 fi
 if [ "$WHAT" = tools ] || [ "$WHAT" = all ]; then
     # ★两个都要编★(2026-09-13 实撞): 只编了判决器, 解算器还是旧二进制 —— 新加的 "@行号文件"
     # 写法它不认识, 报的却是"行段不合法", 查了半天才发现是二进制没换。
     echo "[sync] make -C gguf-tools anchor_metrics v41_amp_run"
-    ssh "$REMOTE" "cd $RDIR && make -C gguf-tools anchor_metrics 2>&1 | tail -3 && make -C gguf-tools v41_amp_run 2>&1 | tail -3" \
+    ssh "$REMOTE" "cd $RDIR && set -o pipefail && make -C gguf-tools anchor_metrics 2>&1 | tail -3 && make -C gguf-tools v41_amp_run 2>&1 | tail -3" \
         || { echo "★工具编译失败★"; exit 1; }
 fi
 echo "[sync] 完成"

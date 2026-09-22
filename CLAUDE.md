@@ -62,7 +62,7 @@ make -C gguf-tools all amp legacy calib bench tools-test   # 工具链全目标(
 ```sh
 ./download_model.sh q2-imatrix   # fetch a model into ./gguf/ and point ./ds4flash.gguf at it
 ./ds4 -p "Explain Redis streams" # one-shot;  no -p => interactive REPL
-./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
+./ds4-server --cuda -m gguf/v41/<model>.gguf --zchain <反修目录>   # V4.1: 上下文只有 1M 一个取值, 没有 --ctx(spark 上用 gguf-tools/scripts/serve_1m_spark.sh)
 ./ds4-agent                      # in-process native coding agent (sessions in ~/.ds4/kvcache)
 ```
 

@@ -21,6 +21,10 @@ static v41_scratch g_v41_misc;
  * 转过去同样精确。所以这条路与 f16 老路数值完全一致(f16 对这些值也精确), 只是不再出现 f16 类型。
  * 盘上格式仍然是 FP4, bf16 只是喂张量核的那一瞬间的形状。 */
 static v41_scratch g_v41_wbf, g_v41_xbf;
+/* 预填把 fp4x32 权重摊成 bf16 的暂存上限(元素数; 2 B/元素 ⇒ 200 M 元素 = 400 MB)。
+ * 比这大的矩阵按输出维分块发(只有出口头/嵌入 129280 行会触发)。挑 400 MB 的理由: 与它替掉的
+ * NVFP4 暂存(0.35 GB)同量级, 不让"换回无损口径"这件事顺手把内存峰值抬上去。 */
+#define V41_BF16_STAGE_ELEMS (200ull * 1000000ull)
 __global__ static void v41_fp4x32_to_bf16_kernel(__nv_bfloat16 *out, const uint8_t *w, uint64_t nblk) {
     const uint64_t b = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= nblk) return;
@@ -39,9 +43,11 @@ __global__ static void v41_x_to_bf16_kernel(__nv_bfloat16 *out, const float *x, 
 static int v41_fp4x32_gemv(const void *model_map, uint64_t model_size, uint64_t off, uint64_t in_dim, uint64_t out_dim,
                            const float *x, uint32_t x_stride, float *out, uint32_t out_stride, uint32_t n_tok,
                            uint32_t n_groups, uint32_t x_gstride, uint32_t out_gstride, int round_out, const char *what);
+/* ver = 盘上 DQVL 版本(2 或 3), 由调用方从 blob 头读: v2/v3 载荷布局不同, 发射器按它挑实例(见 cuda_vq_decode_launch.inc.cu)。
+ * ★这份前向声明与定义必须同步改★ —— 少一个参数 nvcc 只说"too many arguments", 不会告诉你是哪两份不一致。 */
 static int v41_vq_fused_moe(float *out, const uint8_t *blob, uint32_t IN, uint32_t MID, uint32_t OUT,
                             const int32_t *sel, const float *w, uint32_t K, float clamp, const float *x, uint32_t n_tok, uint32_t nc,
-                            const float *gr);
+                            const float *gr, uint32_t ver);
 /* 预填稠密 GEMM 的 NVFP4 路(定义在 cuda_v41_nvfp4.inc.cu, 同一 TU) */
 static int v41_matmul_nvfp4(const void *model_map, uint64_t model_size, uint64_t off,
                             uint64_t in_dim, uint64_t out_dim, const float *x, float *out,
@@ -50,6 +56,13 @@ static int v41_matmul_nvfp4(const void *model_map, uint64_t model_size, uint64_t
  * 开关编的, 递给它的 0 是 legacy 流 —— 两者的隐式同步靠文档一句话, 实测整批路偶发脏读(同一列全 token 偏/NaN), 与 cuBLAS
  * 参与的路一一对应。显式递 cudaStreamPerThread, 让 cuBLAS 与我们的核同一条流, 不赌隐式同步。 */
 static inline cudaStream_t v41_cublas_stream(void) { return g_cur_stream ? g_cur_stream : cudaStreamPerThread; }
+/* ★暂存一换指针, 解码整步 graph 就作废★(2026-09-19 定罪: 09-18 第三版"投机歇轮走图"2K 跑 14 步就 illegal memory access)
+ * 图里的核节点烤死的是捕获那一刻的暂存指针(attn 局部件 / hc mix 段和 / VQ 的 h·partial·x 都按 n_tok 长), 而投机验证批
+ * 走直发、n 最多 1+5 行 —— 第一次比图捕获时更大的批一到, 这里 cudaFree 旧块再 cudaMalloc, 图下一次发就读到释放页。
+ * 12k 没崩只是运气: 那趟第一轮就 k=5, 暂存在捕获前已长到顶。所以每次重分配 +1, core_decode_graph.c 发图前对一下, 变了就
+ * 重捕获(几十 ms; 暂存只长不缩, 一个会话最多长几次)。 */
+static uint64_t g_v41_scratch_gen = 0;
+uint64_t ds4_gpu_v41_scratch_generation(void) { return g_v41_scratch_gen; }
 static void *v41_grow(v41_scratch *s, uint64_t bytes, const char *what) {
     if (bytes <= s->cap) return s->p;
     (void)cudaDeviceSynchronize();
@@ -61,6 +74,7 @@ static void *v41_grow(v41_scratch *s, uint64_t bytes, const char *what) {
         return NULL;
     }
     s->cap = bytes;
+    g_v41_scratch_gen++;
     return s->p;
 }
 
@@ -127,10 +141,53 @@ int ds4_gpu_v41_matmul_fp4x32_tensor(ds4_gpu_tensor *out, const void *model_map,
     if (n_tok <= V41_GEMV_MAX_TOK)
         return v41_fp4x32_gemv(model_map, model_size, weight_offset, in_dim, out_dim, (const float *)x->ptr, (uint32_t)in_dim,
                                (float *)out->ptr, (uint32_t)out_dim, n_tok, 1u, 0u, 0u, round_out, "v41 fp4x32 gemv");
-    /* 预填(n > 8): NVFP4 张量核(cuda_v41_nvfp4.inc.cu)。09-15 S0 实测比原 f16 路的 cuBLAS
-     * 快 3.5×, 且暂存字节少 3.5×; 权重在 e4m3 可表示区内逐位恒等, 激活降到 FP4 是质量门的事。 */
-    if (!v41_matmul_nvfp4(model_map, model_size, weight_offset, in_dim, out_dim,
-                          (const float *)x->ptr, (float *)out->ptr, n_tok, "v41 fp4x32 nvfp4")) return 0;
+    /* ★预填(n > 8)走 bf16 张量核, 不走 NVFP4★(2026-09-20 退回; 原是 09-15 S1 的 FP4 张量核)
+     *
+     * 【为什么退】NVFP4 的权重侧逐位恒等(e4m3 可表示区内), **激活侧是把 f32 压成 E2M1 + 每 16 个元素
+     * 一个 e4m3 缩放 —— 尾数只剩 1 位**。09-15 当天就在 wo_a 那一支量到过代价: "速度一样, 质量退 3.9% PPL"
+     * (判负存档在 cuda_v41_nvfp4.inc.cu 末尾), 于是 wo_a 退回 bf16, **其余每一支却留着没量**。
+     * 09-19 用金融/wt2 两把尺量出了那笔账: 同一份 fp4 文件、同一份 Python 学生, 只换引擎二进制 ——
+     * 09-12 的引擎 Σmin 0.7365 / KLD 0.792, 今日引擎 0.7043 / 0.898; 而 q4_K 骨架(走 bf16 GEMM, 不吃这道
+     * 激活量化)只掉 0.009。★差出来的 0.026 Σmin 就是这一处★, 金融主尺上同时值 −2.3 pp Same top。
+     * 【为什么不心疼那点速度】稠密骨架 GEMM 只占预填 0.4%(09-15 nsys) —— 拿 0.4% 的一部分换 2.3 pp, 反了。
+     * 【与解码路的关系】解码走 v41_fp4x32_gemv(f32 累加), 这条 bf16 路与它口径一致: 权重 fp4→bf16 逐位无损,
+     * 激活本来就被上游舍在 bf16 格点上。★所以预填与解码不再是两套数值★(那本身就是一类 bug 的温床)。
+     * ★要重开 NVFP4 必须先拿五指标说话★: v41_matmul_nvfp4 还在文件里, 但任何人接回去之前, 先跑
+     * v41_engine_parity_spark.sh 对同一份 Python 学生, 拿 KLD/Σmin 证明它没退。 */
+    if ((in_dim % 32u) != 0u) return 0;
+    const uint64_t nblk = out_dim * (in_dim / 32u), wbytes = nblk * 17u;
+    if (weight_offset > model_size || wbytes > model_size - weight_offset) return 0;
+    const uint8_t *w = (const uint8_t *)cuda_model_range_ptr(model_map, weight_offset, wbytes, "v41 fp4x32 prefill");
+    if (!w) return 0;
+    const uint64_t xn = (uint64_t)n_tok * in_dim;
+    __nv_bfloat16 *xb = (__nv_bfloat16 *)v41_grow(&g_v41_xbf, xn * sizeof(__nv_bfloat16), "v41 fp4x32 x bf16");
+    if (!xb) return 0;
+    v41_x_to_bf16_kernel<<<(unsigned)((xn + 255) / 256), 256, 0, g_cur_stream>>>(xb, (const float *)x->ptr, xn);
+    if (!cuda_ok(cudaGetLastError(), "v41 fp4x32 x→bf16")) return 0;
+    /* ★权重暂存按输出维分块, 上限封死★(2026-09-20 实撞): bf16 一个元素 2 B, 是 NVFP4(nibble+缩放 ≈ 0.53 B)
+     * 的 3.8 倍。出口头是 129280×5120 —— 整份摊平要 1.32 GB, 而 NVFP4 只要 0.35 GB。118 GB 模型装完
+     * MemAvailable 谷底本就只剩 9~10 GB, 这多出来的 1 GB 直接把判决趟推过看门狗线, 症状是"跑到第 5 块
+     * 被杀"而不是任何一句内存报错。分块之后峰值回到 0.4 GB 档, 与老路同量级; 代价是出口头多发 3 次
+     * cuBLAS(每次仍是几十毫秒级的大 GEMM, 分块开销可忽略)。
+     * ★为什么按输出维切★: 输出在设备上是列主序 m=out_dim、ld=out_dim, 一段行就是 D 指针加 r0、m 换成段长,
+     * 权重也正好按行连续 —— 激活一份不动, 不用重转。 */
+    const uint64_t rows_cap = V41_BF16_STAGE_ELEMS / in_dim;
+    const uint32_t tile = (uint32_t)(rows_cap < 256u ? 256u : (rows_cap > out_dim ? out_dim : rows_cap & ~255ull));
+    __nv_bfloat16 *wb = (__nv_bfloat16 *)v41_grow(&g_v41_wbf, (uint64_t)tile * in_dim * sizeof(__nv_bfloat16), "v41 fp4x32 w bf16");
+    if (!wb) return 0;
+    const float alpha = 1.0f, beta = 0.0f;
+    (void)cublasSetStream(g_cublas, v41_cublas_stream());
+    for (uint64_t r0 = 0; r0 < out_dim; r0 += tile) {
+        const uint32_t rows = (uint32_t)((out_dim - r0 < tile) ? (out_dim - r0) : tile);
+        const uint64_t tblk = (uint64_t)rows * (in_dim / 32u);
+        v41_fp4x32_to_bf16_kernel<<<(unsigned)((tblk + 255) / 256), 256, 0, g_cur_stream>>>(
+            wb, w + r0 * (in_dim / 32u) * 17u, tblk);
+        if (!cuda_ok(cudaGetLastError(), "v41 fp4x32→bf16")) return 0;
+        const cublasStatus_t st = cublasGemmEx(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)rows, (int)n_tok, (int)in_dim, &alpha,
+                                               wb, CUDA_R_16BF, (int)in_dim, xb, CUDA_R_16BF, (int)in_dim, &beta,
+                                               (float *)out->ptr + r0, CUDA_R_32F, (int)out_dim, CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+        if (!cublas_ok(st, "v41 fp4x32 bf16 gemm")) return 0;
+    }
     return round_out ? ds4_gpu_v41_round_bf16_tensor(out, (uint64_t)n_tok * out_dim) : 1;
 }
 

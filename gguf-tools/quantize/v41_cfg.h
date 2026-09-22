@@ -76,13 +76,29 @@ static void v41_cfg_str(const char *js, const char *key, char *out, size_t cap) 
     out[i] = 0;
 }
 
-static void v41_cfg_load(v41_cfg *c, const char *path) {
+static char *v41_cfg_read_file(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "★打不开 %s★\n", path); exit(1); }
     fseek(f, 0, SEEK_END); long L = ftell(f); fseek(f, 0, SEEK_SET);
     char *js = (char *)malloc((size_t)L + 1);
     if (fread(js, 1, (size_t)L, f) != (size_t)L) { fprintf(stderr, "★读不满 %s★\n", path); exit(1); }
     js[L] = 0; fclose(f);
+    return js;
+}
+/* 上下文长度 = 模型自己声明的 max_position_embeddings。它只在 HF 顶层 config.json 里(quant 目录里是软链;
+ * inference/config.json 只有 YaRN 的 original_seq_len), 转换器把它写成 GGUF 的 deepseek4.context_length, 引擎只认这个键 ——
+ * 用户令(2026-09-22)"不要任何写死的上下文", 所以转换器与引擎两边都没有一个写死的上下文数。 */
+static uint64_t v41_cfg_context_length(const char *qdir) {
+    char hp[4200]; snprintf(hp, sizeof hp, "%s/config.json", qdir);
+    char *js = v41_cfg_read_file(hp);
+    const double v = v41_cfg_num(js, "max_position_embeddings");
+    free(js);
+    if (!(v >= 1.0)) { fprintf(stderr, "★%s 的 max_position_embeddings 不合法: %g★\n", hp, v); exit(1); }
+    fprintf(stderr, "[配置] 上下文 %.0f(max_position_embeddings)\n", v);
+    return (uint64_t)v;
+}
+static void v41_cfg_load(v41_cfg *c, const char *path) {
+    char *js = v41_cfg_read_file(path);
     memset(c, 0, sizeof *c);
 #define I(k) c->k = (int)v41_cfg_num(js, #k)
 #define F(k) c->k = (float)v41_cfg_num(js, #k)

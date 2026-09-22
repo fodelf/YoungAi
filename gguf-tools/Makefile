@@ -6,7 +6,7 @@
 #   make legacy       # (2026-08-26 清仓后为空; solvers 源仅作 calib_run 链接件)
 #   make calib        # 校准/前向验证/npy 工具
 #   make bench        # 评测/取证工具(pubbench/kl_forensic/...)
-#   make tools-test   # 9 项纯 C 自测(原 go-onebit-test, 旧名保留一版别名)
+#   make tools-test   # 11 项纯 C 自测(原 go-onebit-test, 旧名保留一版别名)
 #   make quality-score# 续写评分器(要先能构建父仓引擎)
 #   make <工具名>     # 单个工具(如 make zlayer), 产物落在源文件旁(见各规则 -o)
 #
@@ -100,7 +100,9 @@ CUDA_HOME ?= /usr/local/cuda
 NVCC := $(CUDA_HOME)/bin/nvcc
 CUDA ?= $(if $(wildcard $(NVCC)),1,0)
 CUDA_LIBS := -L$(CUDA_HOME)/lib64 -L$(CUDA_HOME)/targets/sbsa-linux/lib -lcudart -lstdc++
-QUALITY_LDLIBS := -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
+# -lcublasLt: 引擎对象 ds4_cuda.o 自 2026-09-15 起走 cuBLASLt(NVFP4 预填 GEMM), 凡链引擎对象的工具(quality-score /
+# v41_amp_run)都要带上, 少了报 "undefined reference to cublasLtMatmulPreferenceCreate … DSO missing from command line"
+QUALITY_LDLIBS := -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt
 QUALITY_OBJS_CMD = find ../src/core ../src/dist -name '*.o'; \
                    echo ../src/common/ds4_quantfmt.o ../ds4_corr.o ../ds4_zchain.o \
                         ../ds4_multimodal.o ../ds4_spatial.o ../ds4_css.o ../ds4_cuda.o
@@ -122,7 +124,7 @@ endif
 
 # ---------------------------------------------------------------- 目标分组
 .PHONY: all amp legacy calib bench tools-test go-onebit-test quality-score clean everything dsq_units_gpu
-.PHONY: dspark_agree
+.PHONY: dspark_agree dspark_sim
 .PHONY: deepseek4-quantize-alias anchor_metrics compare_scores ds4quant_run zlayer \
         dql_to_zchain teacher_routed zloss_solve finetune_solve \
         calib_run calib_diag validate_fwd traj_analyze cap_raw2npy vq_blob_truesize dump_gguf_meta \
@@ -251,13 +253,16 @@ $(AMP)/v41_fp_moe.o: $(AMP)/v41_fp_moe.cu $(AMP)/v41_fp_moe.h ../src/common/ds4_
 	$(NVCC) -O3 --use_fast_math -arch=native -c $< -o $@
 $(AMP)/v41_gr_solve.o: $(AMP)/v41_gr_solve.cu $(AMP)/v41_gr_margin.inc.cu ../src/common/ds4_fp8.h
 	$(NVCC) -O3 -fmad=false -arch=native -c $< -o $@
+# 路由偏置侧车的数值件(2026-09-20): 路由重算(与引擎同式); 没有 Python 孪生路, 不需要 -fmad=false
+$(AMP)/v41_route_solve.o: $(AMP)/v41_route_solve.cu $(AMP)/v41_route_solve.h
+	$(NVCC) -O3 -arch=native -c $< -o $@
 # ★依赖必须列全所有 .inc.c 与共用头★(2026-09-13 两次实撞): 漏一项 make 就说"无需做任何事",
 # 跑的是旧二进制, 而且不会报错 —— 第一次是判决器(自检照样 PASS), 第二次是这里(新加的 @行号文件
 # 写法旧二进制不认识, 报的却是"行段不合法", 查了半天才发现是二进制没换)。
-$(AMP)/v41_amp_run.o: $(AMP)/v41_amp_run.c $(AMP)/v41_gr_run.inc.c $(AMP)/v41_amp_lowrank.inc.c $(AMP)/v41_sft_run.inc.c $(AMP)/v41_margin_solve.inc.c \
-                      $(AMP)/v41_margin_gen.inc.c $(AMP)/v41_fp_bind.inc.c \
+$(AMP)/v41_amp_run.o: $(AMP)/v41_amp_run.c $(AMP)/v41_calib_dump.inc.c $(QZ)/v41_calib.h $(AMP)/v41_gr_run.inc.c $(AMP)/v41_amp_lowrank.inc.c $(AMP)/v41_sft_run.inc.c $(AMP)/v41_margin_solve.inc.c \
+                      $(AMP)/v41_margin_gen.inc.c $(AMP)/v41_fp_bind.inc.c $(AMP)/v41_rb_run.inc.c $(AMP)/v41_route_solve.h \
                       $(AMP)/v41_fp_moe.h $(AMP)/v41_kl_target.h ../src/common/ds4_st41.h ../src/common/ds4_quantfmt.h \
-                      ../src/common/ds4_etgd.h ../src/common/ds4_gr_fnv.h ../ds4.h ../ds4_v41_api.h
+                      ../src/common/ds4_etgd.h ../src/common/ds4_gr_fnv.h ../src/common/ds4_gguf.h ../ds4.h ../ds4_v41_api.h
 	$(CC) $(BARE) $(NATIVE) -std=c99 -Wall -I.. -I$(CUDA_HOME)/include -c $< -o $@
 # 蒸馏靶: -fmad=false 与解算器同旗标(同输入两路必须出同一个数); 链 cublas 与 src/common 的 GGUF 读器/type43 解码
 $(AMP)/v41_kl_target.o: $(AMP)/v41_kl_target.cu $(AMP)/v41_kl_target.h ../src/common/ds4_gguf.h ../src/common/ds4_quantfmt.h
@@ -265,7 +270,7 @@ $(AMP)/v41_kl_target.o: $(AMP)/v41_kl_target.cu $(AMP)/v41_kl_target.h ../src/co
 # GGUF 读器: 父仓只在 ds4_unit 里直接编它, 没有现成 .o —— 这里自己编一份(同一份源, 不是抄第二份实现)
 $(AMP)/ds4_gguf.o: ../src/common/ds4_gguf.c ../src/common/ds4_gguf.h
 	$(CC) $(BARE) $(NATIVE) -std=c99 -Wall -I.. -c $< -o $@
-$(AMP)/v41_amp_run: $(AMP)/v41_amp_run.o $(AMP)/v41_amp_solve.o $(AMP)/v41_fp_moe.o $(AMP)/v41_kl_target.o $(AMP)/v41_gr_solve.o $(AMP)/ds4_gguf.o
+$(AMP)/v41_amp_run: $(AMP)/v41_amp_run.o $(AMP)/v41_amp_solve.o $(AMP)/v41_fp_moe.o $(AMP)/v41_kl_target.o $(AMP)/v41_gr_solve.o $(AMP)/v41_route_solve.o $(AMP)/ds4_gguf.o
 	@test -f ../ds4_cuda.o || { echo "★引擎对象缺: 先在仓库根 make cuda-spark★"; exit 1; }
 	$(NVCC) -O3 -o $@ $^ $$( $(V41AMP_ENGINE_OBJS_CMD) ) $(QUALITY_LDLIBS) -lcusolver
 else
@@ -305,6 +310,12 @@ dspark_align.bin: $(AMP)/dspark_align.c $(AMP)/linalg_small.c
 # 只量到一个数分不清该怪草稿器还是怪量化 —— 09-16 就是拿一个数当依据, 判负两次。
 dspark_agree: $(BEN)/dspark_agree
 $(BEN)/dspark_agree: $(BEN)/dspark_agree.c
+	$(CC) $(BARE) $(NATIVE) -o $@ $< -lm
+
+# 投机调度器的离线陪审团(2026-09-19): 取料(每位置 5 位草稿 + conf) + 真 id 序列 ⇒ 任何策略 × 成本假设的整段 ms/token。
+# 调度器常量/冷却步数改一版在 spark 上要跑 3 分钟一趟, 而且歇着的步在线量不到; 这里几毫秒出全表。
+dspark_sim: $(BEN)/dspark_sim
+$(BEN)/dspark_sim: $(BEN)/dspark_sim.c
 	$(CC) $(BARE) $(NATIVE) -o $@ $< -lm
 
 zrec_to_zchain: zrec_to_zchain.bin
@@ -433,26 +444,46 @@ endif
 V41_DQH := $(QZ)/v41_dq.cuh ../src/common/ds4_fp8.h ../src/common/ds4_float.h
 ifeq ($(UNAME_S)-$(CUDA),Linux-1)
 v41_quantize: $(QZ)/v41_quantize $(QZ)/libv41vq.so
-$(QZ)/v41_vq.o: $(QZ)/v41_vq.cu $(V41_DQH)
+$(QZ)/v41_vq.o: $(QZ)/v41_vq.cu $(V41_DQH) $(QZ)/v41_vq_rate.h $(QZ)/v41_vq_rate.inc.cu $(QZ)/v41_vq_pool.inc.cu
 	$(NVCC) -O3 -arch=native -fmad=false -Xcompiler -fPIC -c $< -o $@
 $(QZ)/v41_fp4.o: $(QZ)/v41_fp4.cu $(V41_DQH)
 	$(NVCC) -O3 -arch=native -fmad=false -Xcompiler -fPIC -c $< -o $@
-$(QZ)/libv41vq.so: $(QZ)/v41_vq.o
-	$(NVCC) -shared -o $@ $<
-$(QZ)/v41_quantize: $(QZ)/v41_quantize.c ../src/common/ds4_st41.h $(QZ)/v41_st_write.h $(QZ)/v41_vq.o $(QZ)/v41_fp4.o
-	$(CC) $(BARE) -std=c99 -Wall -o $@ $(QZ)/v41_quantize.c $(QZ)/v41_vq.o $(QZ)/v41_fp4.o $(CUDA_LIBS) -lm
+# 骨架 q4_K(2026-09-19): 编码复用 quants.c 的唯一生产实现(零语料, imatrix=NULL), 解码是本文件的 GPU 核。
+# quants 要 -fPIC 单独编一份: libv41vq.so 里带着 v41_q4k.o, 它引用 ds4q_quantize_chunk。
+$(QZ)/v41_q4k.o: $(QZ)/v41_q4k.cu $(V41_DQH) $(QZ)/quants.h
+	$(NVCC) -O3 -arch=native -fmad=false -Xcompiler -fPIC -c $< -o $@
+$(QZ)/quants_pic.o: $(QZ)/quants.c $(QUANTS_INC) $(QZ)/quants.h $(QZ)/onebit_quant.h
+	$(CC) $(BARE) -std=c99 -fPIC -c $< -o $@
+# quants.c 的 ds4q_row_size/quantize_chunk 会调 go1b_*(TQ1_0 那一族), 缺它链不上
+$(QZ)/onebit_pic.o: $(QZ)/onebit_quant.c $(QZ)/onebit_quant.h
+	$(CC) $(BARE) -std=c99 -fPIC -c $< -o $@
+# 校准列权(2026-09-20 深夜): 只进量化器, 不进 libv41vq.so —— 它引用 cuBLAS, 塞进 .so 会让教师端 ctypes 加载多一个依赖。
+$(QZ)/v41_calib.o: $(QZ)/v41_calib.cu $(V41_DQH) $(QZ)/v41_calib.h
+	$(NVCC) -O3 -arch=native -fmad=false -c $< -o $@
+# 级 2 误差反馈(2026-09-21): cuSOLVER 的 potrf/potri, 同样只进量化器
+$(QZ)/v41_ef.o: $(QZ)/v41_ef.cu $(V41_DQH) $(QZ)/v41_ef.h $(QZ)/v41_calib.h
+	$(NVCC) -O3 -arch=native -fmad=false -c $< -o $@
+V41Q_OBJS := $(QZ)/v41_vq.o $(QZ)/v41_fp4.o $(QZ)/v41_q4k.o $(QZ)/quants_pic.o $(QZ)/onebit_pic.o $(QZ)/v41_calib.o $(QZ)/v41_ef.o
+$(QZ)/libv41vq.so: $(QZ)/v41_vq.o $(QZ)/v41_q4k.o $(QZ)/quants_pic.o $(QZ)/onebit_pic.o
+	$(NVCC) -shared -o $@ $^
+$(QZ)/v41_quantize: $(QZ)/v41_quantize.c $(QZ)/v41_quantize_cli.inc.c $(QZ)/v41_shcb.inc.c ../src/common/ds4_st41.h $(QZ)/v41_st_write.h $(QZ)/v41_calib.h $(QZ)/v41_ef.h $(QZ)/v41_vq_rate.h $(V41Q_OBJS)
+	$(CC) $(BARE) -std=c99 -Wall -o $@ $(QZ)/v41_quantize.c $(V41Q_OBJS) $(CUDA_LIBS) -lcublas -lcusolver -lm -lpthread
 else
 v41_quantize:
 	@echo "v41_quantize: Linux+CUDA 专属, 本平台跳过"
 endif
+# 逐专家位宽分配表(2026-09-21): 纯 C 读 HF 原始权重算 Σw² 反注水分配, 零语料。任何平台都能编(Mac 编的二进制不同步, 见 sync_spark.sh)
+v41_nc_alloc: $(QZ)/v41_nc_alloc
+$(QZ)/v41_nc_alloc: $(QZ)/v41_nc_alloc.c ../src/common/ds4_st41.h ../src/common/ds4_fp8.h
+	$(CC) $(BARE) -std=c99 -Wall -O2 -o $@ $< -lm -lpthread
 
 # V4.1 量化目录(safetensors) → 单 GGUF 转换器(纯 C, 无 CUDA; 格式基元全走 ../src/common)
 .PHONY: v41_to_gguf
 v41_to_gguf: $(QZ)/v41_to_gguf
-$(QZ)/v41_to_gguf: $(QZ)/v41_to_gguf.c ../src/common/ds4_st41.h ../src/common/ds4_gguf_write.h ../src/common/ds4_quantfmt.c ../src/common/ds4_fp8.h ../src/common/ds4_float.h
+$(QZ)/v41_to_gguf: $(QZ)/v41_to_gguf.c $(QZ)/v41_to_gguf_vq3.inc.c $(QZ)/v41_to_gguf_mtp.inc.c $(QZ)/v41_vq3_bits.c ../src/common/ds4_st41.h ../src/common/ds4_gguf_write.h ../src/common/ds4_quantfmt.c ../src/common/ds4_fp8.h ../src/common/ds4_float.h
 	$(CC) $(BARE) -std=c99 -Wall -D_POSIX_C_SOURCE=200809L -I.. -o $@ $(QZ)/v41_to_gguf.c ../src/common/ds4_quantfmt.c -lm
 
-# ---------------------------------------------------------------- 自测(9 项, 纯 C 无模型)
+# ---------------------------------------------------------------- 自测(11 项, 纯 C 无模型)
 # ★真层单元针: 编译参数与 ds4quant_run 逐项相同★(铁律 2026-08-28 "单测和生产一套代码")
 # 手拼参数是错误之源(实撞: 漏 -DDQ_BLAS 走标量路 / 漏 BLAS_CFLAGS 报 CblasRowMajor 未定义 /
 # 漏 -lstdc++ 报 __cxa_guard_acquire)。这条规则直接复用 ds4quant_run 的那套。
@@ -475,6 +506,7 @@ tools-test:
 	$(CC) $(CFLAGS) $(NATIVE) $(INC) -DPEREXPERT_TEST $(SLV)/solve_perexpert.c $(AMP)/linalg_small.c -o $(BUILD)/perexpert_test -lm && $(BUILD)/perexpert_test
 	$(CC) $(CFLAGS) $(NATIVE) $(INC) -DCALIBDIAG_TEST $(CAL)/calib_diag.c $(AMP)/hiddenvar_solve.c $(AMP)/linalg_small.c -o $(BUILD)/calibdiag_test -lm -pthread && $(BUILD)/calibdiag_test
 	$(CC) $(CFLAGS) $(NATIVE) $(INC) -DRRR_TEST     $(AMP)/solve_rrr.c $(AMP)/hiddenvar_solve.c $(AMP)/linalg_small.c -o $(BUILD)/rrr_test -lm -pthread && $(BUILD)/rrr_test
+	$(CC) $(CFLAGS) $(NATIVE) $(INC) -DV41_VQ3_TEST $(QZ)/v41_vq3_bits.c -o $(BUILD)/vq3_bits_test -lm && $(BUILD)/vq3_bits_test
 
 # 旧名别名(保留一版, 下一轮清)
 go-onebit-test: tools-test

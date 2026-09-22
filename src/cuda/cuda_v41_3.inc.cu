@@ -42,12 +42,46 @@ __global__ static void v41_router_kernel(int32_t *sel, float *wts, const float *
     if (lane == 0)
         for (uint32_t r = 0; r < topk; r++) wts[(uint64_t)t * topk + r] = wts[(uint64_t)t * topk + r] / (wsum + 1e-20f) * route_scale;
 }
+/* 路由偏置侧车(2026-09-20): [exp_probs_b 文件偏移] → 设备上的 (盘上 bias + Δb)[E]。按偏移认层: 主干 40 层与三塔各自的
+ * exp_probs_b 偏移互不相同, 路由入口不用改签名。挂了就 100% 生效, 不做静默回退; 盘上文件一个字节不动。 */
+static struct { uint64_t off; float *dev; uint32_t n; } g_v41_rb[64];
+static uint32_t g_v41_rb_n = 0;
+int ds4_gpu_v41_set_rb_override(const void *model_map, uint64_t model_size, uint64_t bias_offset, const float *host_delta, uint32_t n_expert) {
+    if (!host_delta) {   /* 卸: offset 0 = 全卸 */
+        for (uint32_t i = 0; i < g_v41_rb_n;) {
+            if (bias_offset == 0 || g_v41_rb[i].off == bias_offset) { (void)cudaFree(g_v41_rb[i].dev); g_v41_rb[i] = g_v41_rb[--g_v41_rb_n]; }
+            else i++;
+        }
+        return 1;
+    }
+    if (!model_map || !n_expert || bias_offset > model_size || (uint64_t)n_expert * 4 > model_size - bias_offset) return 0;
+    const float *base = (const float *)cuda_model_range_ptr(model_map, bias_offset, (uint64_t)n_expert * 4, "v41 rb base");
+    if (!base) return 0;
+    float *h = (float *)malloc((size_t)n_expert * 4);
+    if (!h) return 0;
+    /* 盘上 bias 可能在设备副本也可能在主机映射: cudaMemcpyDefault 按 UVA 认指针 */
+    if (cudaMemcpy(h, base, (size_t)n_expert * 4, cudaMemcpyDefault) != cudaSuccess) { (void)cudaGetLastError(); free(h); return 0; }
+    for (uint32_t e = 0; e < n_expert; e++) h[e] += host_delta[e];
+    uint32_t i = 0;
+    for (; i < g_v41_rb_n; i++) if (g_v41_rb[i].off == bias_offset) break;
+    if (i == g_v41_rb_n) {
+        if (g_v41_rb_n >= 64u) { free(h); return 0; }
+        if (cudaMalloc((void **)&g_v41_rb[i].dev, (size_t)n_expert * 4) != cudaSuccess) { (void)cudaGetLastError(); free(h); return 0; }
+        g_v41_rb[i].off = bias_offset; g_v41_rb[i].n = n_expert; g_v41_rb_n++;
+    } else if (g_v41_rb[i].n != n_expert) { free(h); return 0; }
+    const int ok = cudaMemcpy(g_v41_rb[i].dev, h, (size_t)n_expert * 4, cudaMemcpyHostToDevice) == cudaSuccess;
+    if (!ok) (void)cudaGetLastError();
+    free(h);
+    return ok;
+}
+
 int ds4_gpu_v41_router_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, const ds4_gpu_tensor *logits,
                               const void *model_map, uint64_t model_size, uint64_t bias_offset,
                               uint32_t n_tok, uint32_t n_expert, uint32_t topk, float route_scale) {
     if (!selected || !weights || !logits || topk > 16u || n_expert > 32u * V41_ROUTER_PER_LANE) return 0;
     const float *bias = (const float *)cuda_model_range_ptr(model_map, bias_offset, (uint64_t)n_expert * 4, "v41 gate bias");
     if (!bias) return 0;
+    for (uint32_t i = 0; i < g_v41_rb_n; i++) if (g_v41_rb[i].off == bias_offset && g_v41_rb[i].n == n_expert) { bias = g_v41_rb[i].dev; break; }
     v41_router_kernel<<<(n_tok + 7u) / 8u, 256, 0, g_cur_stream>>>((int32_t *)selected->ptr, (float *)weights->ptr,
         (const float *)logits->ptr, bias, n_tok, n_expert, topk, route_scale);
     return cuda_ok(cudaGetLastError(), "v41 router");
@@ -111,6 +145,7 @@ int ds4_gpu_v41_engram_gate_tensor(ds4_gpu_tensor *hc, const ds4_gpu_tensor *kv,
  * 这里每层: cudaHostRegister(该层 2.6 GB) → 算 → 同步 → 注销 → madvise(DONTNEED) 让页缓存可回收。
  * 代价是每趟前向从盘重读专家(对拍期可接受; 常驻/流式策略是 P4 的事)。
  * down 槽在 DQVL v2 里必在(which=2), 冷 w2 回退不触发。 */
+static struct { uintptr_t reg; uint64_t bytes; void *dev; int valid; } g_v41_stream_reg;   /* 流式路当前钉住的那一层 */
 int ds4_gpu_v41_routed_moe_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
                                   uint64_t blob_offset, uint64_t blob_bytes,
                                   uint32_t in_dim, uint32_t mid_dim, uint32_t out_dim,
@@ -123,22 +158,35 @@ int ds4_gpu_v41_routed_moe_tensor(ds4_gpu_tensor *out, const void *model_map, ui
     /* 引擎启动若已把整个 mmap 注册成设备可见(spark 实测: offload 模式下也注册了 103 GiB 整映射),
      * blob 就直接拿 range 指针 —— 再 cudaHostRegister 同一段会报 AlreadyRegistered(09-12 首跑即此)。
      * 只有整映射未注册时才走下面"自己注册→算→注销→DONTNEED"的流式路。 */
-    /* 码本词数从主机侧 blob 头读(专家 0 的 w1 载荷 +6 处 u16): 融合核要按它申请 shared */
-    uint32_t nc = 0;
+    /* 码本词数与【盘上版本】都从主机侧 blob 头读: 词数在专家 0 的 w1 载荷 +6 处(u16), 版本在 blob 头 +4(u32)。
+     * ★版本必须读, 不许猜★(2026-09-21): v2 与 v3 的载荷布局不同(v3 码本一层一本、位流 12 位主流 + 位平面),
+     * 选错实例不报错、只出一整套假权重。ver 不在白名单就硬停 —— 加载期的错要在加载期炸。 */
+    uint32_t nc = 0, ver = 0;
     {
         const uint8_t *bh = (const uint8_t *)model_map + blob_offset;
+        if (!ds4vq_blob_ok(bh, (size_t)blob_bytes)) {
+            fprintf(stderr, "ds4: [v41] L%u 专家 blob 头不合法(魔数/版本/专家数); 本引擎认 DQVL v%u~v%u\n",
+                    layer, DS4VQ_BLOB_VER_MIN, DS4VQ_BLOB_VER_MAX);
+            exit(1);
+        }
+        ver = ds4vq_blob_ver(bh);
         uint64_t off0; memcpy(&off0, bh + 16, 8);
         if (off0 && off0 + 8 <= blob_bytes) { uint16_t n16; memcpy(&n16, bh + off0 + 6, 2); nc = n16; }
     }
-    if (g_model_registered || g_model_device_owned) {
-        const uint8_t *blob = (const uint8_t *)cuda_model_range_ptr(model_map, blob_offset, blob_bytes, "v41 vq blob");
+    /* 缓存命中优先(2026-09-20): 封顶模式下整映射不注册, 装进缓存的层仍从设备副本读; 未命中而整映射已注册/已拷
+     * ⇒ 旧路(UVA 映射指针, 与改前逐字节同); 两者皆无 ⇒ 下面的逐层流式路 —— 封顶模式装不下的层就靠这一条。 */
+    const uint8_t *blob = (const uint8_t *)cuda_model_range_cached_ptr(model_map, blob_offset, blob_bytes);
+    if (!blob && (g_model_registered || g_model_device_owned)) {
+        blob = (const uint8_t *)cuda_model_range_ptr(model_map, blob_offset, blob_bytes, "v41 vq blob");
         if (!blob) return 0;
+    }
+    if (blob) {
         if (n_tok <= V41_GEMV_MAX_TOK)   /* 解码小批: 码本在核内查表即乘, 不落 f16(cuda_vq_decode.inc.cu) */
             return v41_vq_fused_moe(out ? (float *)out->ptr : NULL, blob, in_dim, mid_dim, out_dim, (const int32_t *)selected->ptr,
                                     (const float *)weights->ptr, n_expert_used, clamp, (const float *)x->ptr, n_tok, nc,
-                                    layer < 64u ? g_v41_gr[layer] : NULL);
+                                    layer < 64u ? g_v41_gr[layer] : NULL, ver);
         return cuda_vq_moe_prefill_gemm(out, blob, model_map, 0, 0, in_dim, mid_dim, out_dim, selected, weights,
-                                        n_total_expert, n_expert_used, clamp, x, layer, n_tok);
+                                        n_total_expert, n_expert_used, clamp, x, layer, n_tok, ver);
     }
     const long page_l = sysconf(_SC_PAGESIZE);
     const uint64_t page = page_l > 0 ? (uint64_t)page_l : 4096u;
@@ -146,28 +194,36 @@ int ds4_gpu_v41_routed_moe_tensor(ds4_gpu_tensor *out, const void *model_map, ui
     const uintptr_t reg = host & ~(uintptr_t)(page - 1u);
     const uint64_t delta = (uint64_t)(host - reg);
     const uint64_t reg_bytes = (delta + blob_bytes + page - 1u) & ~(page - 1u);
-    void *dev = NULL;
-    if (cudaHostRegister((void *)reg, (size_t)reg_bytes, cudaHostRegisterMapped) != cudaSuccess) {
-        (void)cudaGetLastError();
-        fprintf(stderr, "ds4: [v41] L%u blob cudaHostRegister 失败 (%.2f GB)\n", layer, (double)reg_bytes / 1e9);
-        return 0;
+    /* 登记只在换层时做(2026-09-20 封顶模式): 8192 token 按 512 分块 ⇒ 同一层一趟被叫 16 次, 每次注册/注销 2.6 GB
+     * 光页表就是秒级; 只钉住"当前这一层", 换层才注销上一层。注销后不再 madvise(DONTNEED): 那些页只是普通页缓存,
+     * 内核按压力回收, 留着 = 下一趟不必从 NVMe 重读(可用内存账里它们本来就算 available)。 */
+    if (!g_v41_stream_reg.valid || g_v41_stream_reg.reg != reg || g_v41_stream_reg.bytes != reg_bytes) {
+        if (g_v41_stream_reg.valid) {
+            (void)cudaDeviceSynchronize();      /* 侧流 lane 可能还在读上一层 blob; 注销前必须全部落地 */
+            (void)cudaHostUnregister((void *)g_v41_stream_reg.reg);
+            g_v41_stream_reg.valid = 0;
+        }
+        void *dev = NULL;
+        if (cudaHostRegister((void *)reg, (size_t)reg_bytes, cudaHostRegisterMapped) != cudaSuccess) {
+            (void)cudaGetLastError();
+            fprintf(stderr, "ds4: [v41] L%u blob cudaHostRegister 失败 (%.2f GB)\n", layer, (double)reg_bytes / 1e9);
+            return 0;
+        }
+        if (cudaHostGetDevicePointer(&dev, (void *)reg, 0) != cudaSuccess || !dev) {
+            (void)cudaGetLastError(); (void)cudaHostUnregister((void *)reg);
+            fprintf(stderr, "ds4: [v41] L%u blob 设备指针失败\n", layer);
+            return 0;
+        }
+        g_v41_stream_reg.reg = reg; g_v41_stream_reg.bytes = reg_bytes; g_v41_stream_reg.dev = dev; g_v41_stream_reg.valid = 1;
     }
-    if (cudaHostGetDevicePointer(&dev, (void *)reg, 0) != cudaSuccess || !dev) {
-        (void)cudaGetLastError(); (void)cudaHostUnregister((void *)reg);
-        fprintf(stderr, "ds4: [v41] L%u blob 设备指针失败\n", layer);
-        return 0;
-    }
-    const uint8_t *blob = (const uint8_t *)dev + delta;
+    blob = (const uint8_t *)g_v41_stream_reg.dev + delta;
     const int ok = n_tok <= V41_GEMV_MAX_TOK
         ? v41_vq_fused_moe(out ? (float *)out->ptr : NULL, blob, in_dim, mid_dim, out_dim, (const int32_t *)selected->ptr,
                        (const float *)weights->ptr, n_expert_used, clamp, (const float *)x->ptr, n_tok, nc,
-                       layer < 64u ? g_v41_gr[layer] : NULL)
+                       layer < 64u ? g_v41_gr[layer] : NULL, ver)
         : cuda_vq_moe_prefill_gemm(out, blob, model_map, 0 /*down_offset: 影子*/, 0 /*down_expert_bytes*/,
                                    in_dim, mid_dim, out_dim, selected, weights, n_total_expert, n_expert_used,
-                                   clamp, x, layer, n_tok);
-    (void)cudaDeviceSynchronize();          /* 侧流 lane 可能还在读 blob; 注销前必须全部落地 */
-    (void)cudaHostUnregister((void *)reg);
-    (void)madvise((void *)reg, (size_t)reg_bytes, MADV_DONTNEED);
+                                   clamp, x, layer, n_tok, ver);
     if (g_vqp_hdr[layer]) {                 /* 头缓存按层建过一次即可(只含偏移/维度, 不含指针) */ }
     return ok;
 }

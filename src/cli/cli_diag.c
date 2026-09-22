@@ -52,12 +52,13 @@ int run_v41_generation(ds4_engine *engine, const cli_config *cfg, const ds4_toke
     /* 两个标志同时给 = 关(显式的"关"压过显式的"开", 免得脚本里两条都留着还以为开着) */
     ds4_engine_v41_set_dspark(cfg->gen.dspark && !cfg->gen.no_dspark);
     ds4_engine_v41_set_graph(!cfg->gen.no_graph);
+    ds4_engine_v41_set_vq_group(!cfg->gen.no_vq_group);
     ds4_engine_v41_set_emit_trace(cfg->gen.emit_trace);
     ds4_engine_v41_set_block(cfg->gen.dspark_block > 0 ? (unsigned)cfg->gen.dspark_block : 0u);
     ds4_engine_v41_set_verify_k(cfg->gen.verify_k > 0 ? (unsigned)cfg->gen.verify_k : 0u);
     ds4_engine_v41_set_draft_amp(cfg->gen.draft_amp);
     ds4_engine_v41_set_chunk(cfg->gen.v41_chunk);
-    int rc = ds4_engine_v41_generate_argmax(engine, prompt->v, (int)prompt->len, cfg->gen.n_predict, cfg->gen.ctx_size, v41_emit_print, engine);
+    int rc = ds4_engine_v41_generate_argmax(engine, prompt->v, (int)prompt->len, cfg->gen.n_predict, v41_emit_print, engine);
     fputc('\n', stdout);
     return rc;
 }

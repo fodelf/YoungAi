@@ -81,6 +81,46 @@ static int v41_gr_accum_layer(const char *dir, uint32_t il, float *acc, size_t n
     return 1;
 }
 
+/* 路由偏置侧车(2026-09-20, 路由反修的 V4.1 形态): rb_Lnn.bin = <i32 n_expert><i32 1=f32> + Δb[n_expert] f32(拟合侧已乘 α)。
+ * 引擎把它加进该层路由的【选择分】(exp_probs_b 那一项), 权重分不动 —— 与 V4 路由偏置侧车同语义。
+ * 设备表是进程级的: 每次加载先全卸, 没文件的层就是裸路由。返回 1 挂了 / 0 没文件 / <0 坏文件(不静默跳过)。 */
+static int v41_rb_load_layer(const char *dir, uint32_t il, double *mb) {
+    char p[4200]; snprintf(p, sizeof p, "%s/rb_L%02u.bin", dir, il);
+    FILE *f = fopen(p, "rb");
+    if (!f) return 0;
+    int32_t hd[2];
+    if (fread(hd, 4, 2, f) != 2 || hd[0] != (int32_t)DS4_N_EXPERT || hd[1] != 1) {
+        fprintf(stderr, "ds4: 路由偏置 %s 头不对(专家 %d 类型 %d; 要 %u/1=f32)\n", p, hd[0], hd[1], (unsigned)DS4_N_EXPERT);
+        fclose(f); return -1;
+    }
+    float *buf = xmalloc((size_t)DS4_N_EXPERT * 4);
+    const bool ok = fread(buf, 4, DS4_N_EXPERT, f) == DS4_N_EXPERT;
+    fclose(f);
+    if (!ok) { fprintf(stderr, "ds4: 路由偏置 %s 截断\n", p); free(buf); return -1; }
+    const ds4_model *m = g_ds4_v41_model;
+    char nm[64]; snprintf(nm, sizeof nm, "blk.%u.exp_probs_b.bias", il);
+    const ds4_tensor *t = m ? model_find_tensor(m, nm) : NULL;
+    if (!t) { fprintf(stderr, "ds4: 路由偏置 L%02u: 模型里找不到 %s\n", il, nm); free(buf); return -1; }
+    const int r = ds4_gpu_v41_set_rb_override(m->map, m->size, t->abs_offset, buf, (uint32_t)DS4_N_EXPERT);
+    free(buf);
+    if (!r) { fprintf(stderr, "ds4: 路由偏置 L%02u 挂不上\n", il); return -1; }
+    *mb += (double)DS4_N_EXPERT * 4 / 1e6;
+    return 1;
+}
+/* 目录里所有层的路由偏置; dir 为空 = 只全卸。返回挂上的层数, <0 = 有文件但读坏了。 */
+static int v41_rb_load(const char *dir) {
+    (void)ds4_gpu_v41_set_rb_override(NULL, 0, 0, NULL, 0);
+    int n = 0; double mb = 0;
+    for (uint32_t il = 0; dir && dir[0] && il < DS4_N_LAYER; il++) {
+        const int r = v41_rb_load_layer(dir, il, &mb);
+        if (r < 0) return -1;
+        n += r;
+    }
+    if (n) fprintf(stderr, "ds4: [反修·路由] %d 层挂上路由偏置侧车 (盘上 %.3f MB)\n", n, mb);
+    return n;
+}
+void v41_rb_clear_all(void) { (void)v41_rb_load(NULL); }
+
 /* 三文件部署(2026-09-13): ②反修目录与③后训练目录的增益表【逐元素相乘】后一次上设备 ——
  *     g_eff = 载荷 g_r × s₂ × s₃
  * 盘上权重一个字节不动; 任一目录不挂, 该项就是 1(数学上就是不挂)。为什么必须先乘再上传:
@@ -149,6 +189,8 @@ bool v41_amp_load(ds4_v41_state *st, const char *dir, const char *pt_dir) {
     uint32_t n_arm = 0, kmin = 0, kmax = 0; double mb = 0.0;
     const char *tyname = "";
     if (pt_dir && pt_dir[0] && !v41_pt_base_ok(pt_dir, dir)) return false;
+    const int n_rb = v41_rb_load(dir);   /* 路由偏置(先全卸再挂) */
+    if (n_rb < 0) return false;
     const int n_gr = v41_gr_load(dir, pt_dir);
     if (n_gr < 0) return false;
     for (uint32_t il = 0; dir && dir[0] && il < DS4_N_LAYER; il++) {
@@ -190,9 +232,9 @@ bool v41_amp_load(ds4_v41_state *st, const char *dir, const char *pt_dir) {
         tyname = ty == (int32_t)DS4_GGT_FP4X32 ? "fp4x32" : "f32";
     }
     if (!n_arm) {
-        /* 只有增益覆盖、没有低秩放大器也是合法的一种插件(权重侧反修与后训练的产物都长这样) */
-        if (n_gr > 0) return true;
-        fprintf(stderr, "ds4: 目录里既没有 amp_Lnn.bin 也没有 gr_Lnn.bin(反修 %s / 后训练 %s)\n",
+        /* 只有增益覆盖/路由偏置、没有低秩放大器也是合法的一种插件(权重侧反修与后训练的产物都长这样) */
+        if (n_gr > 0 || n_rb > 0) return true;
+        fprintf(stderr, "ds4: 目录里既没有 amp_Lnn.bin 也没有 gr_Lnn.bin / rb_Lnn.bin(反修 %s / 后训练 %s)\n",
                 dir && dir[0] ? dir : "(无)", pt_dir && pt_dir[0] ? pt_dir : "(无)");
         return false;
     }

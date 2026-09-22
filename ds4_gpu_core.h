@@ -180,6 +180,12 @@ int ds4_gpu_set_model_map_spans_split(const void *model_map, uint64_t model_size
  * the hot-path gather agrees (1 = stream/offload, 0 = keep resident).
  * CPU builds ignore it. */
 void ds4_gpu_set_expert_offload(int enabled);
+/* 设备权重缓存封顶(MB; 0 = 平台默认, spark 上 = 总内存 − 8 GiB, 整模型收编)。2026-09-20 加, 给反修拟合 / 判决
+ * 这类"前向之外还要 ~17 GiB 运行时"的跑法用: 105.87 GiB 的模型整个收编就把 121 GiB 吃穿, 而 --mem-budget-mb
+ * 只管 L1 闸与看门狗, 管不到这个缓存。设了以后 CUDA 侧: ①缓存装到上限即停(core 的走法是骨架先装、专家 blob
+ * 按层序装) ②不再把整映射 cudaHostRegister 成 UVA 指针 ③没装进缓存的专家 blob 走逐层"注册→算→注销"的流式路
+ * (cuda_v41_3.inc.cu)。部署路不传 = 一字不变。Metal/CPU 没有这个缓存, 空实现。 */
+void ds4_gpu_set_model_cache_limit_mb(uint64_t mb);
 /* Survival flag for oversized single-host models (--no-residency): skip
  * MTLResidencySet wiring and view warmup so wired memory cannot balloon into
  * a kernel panic (2026-07-06 on record). Set before the model map. CUDA no-op. */

@@ -21,14 +21,21 @@
 /* 上下文硬上限。历史: topk 与候选块两个核都把"整段组数"放 shared(48 KB ⇒ ratio-1 层最多 ~78k 个位置),
  * 所以这里一直写死 32768。topk 核 2026-09-16 换成固定 256 桶的 radix select, 候选块核 2026-09-21 把
  * [nb] 两个数组挪进全局暂存 —— 两道 shared 墙都没了, 上限改由内存账定。
- * ★开大的固定代价(按 cap_tok = DS4_V41_CHUNK = 512 算)★: iscore [512][ctx] f32 + cand [512][ctx] u8 = ctx×2.5 KB,
- * 加 4 个 kv 源层的压缩 KV/索引键 (ctx/ratio)×360 B、候选暂存 512×(ctx/8)×5 B ⇒ 524288 时约 2.4 GiB, 建状态时一次吃掉。
- * 速度不受它影响: 解码走图的桶按当前位置算(core_decode_graph.c), 核只扫真实组数, 短上下文还是短上下文。
- * ★2026-09-22 抬到 1M(用户定: "上下文设置为 1m")★: 按上面的账 1048576 约 4.8 GiB, 比 524288 多吃 2.4 GiB。
- * spark 实测容得下: 113.6 GB 模型装完 MemAvailable 约 12 GB, 一条请求的状态 + 前向缓冲在 500k 档占 5.3 GB
- * (量到剩 6.4~6.7 GB), 1M 档多 2.4 GiB ⇒ 请求中剩约 4 GB, 在看门狗红线 2.5 GB 之上。
- * 调用方(crewAI)本来就按 1M 报上下文窗口, 服务端报少了会在长提示上直接 400。 */
-#define DS4_V41_MAX_CTX_P2C 1048576u
+ * ★配到 1M 到底花多少(2026-09-22 逐项按 v41_state_alloc 算, 不是按 free 的差值估)★:
+ *   压缩 KV + 索引键   4 个 kv 源层 (ctx/ratio + 2) × 360 B  ⇒ 1M 档 944 MB = 0.879 GiB   ← 这才是"1M 上下文"的价钱
+ *   logits             cap_tok × 129280 × 4                  ⇒ 0.247 GiB(与 ctx 无关)
+ *   窗口环 40 层       (128 + cap_tok) × 128 × 4             ⇒ 0.012 GiB(与 ctx 无关)
+ *   iscore / cand      索引打分草稿, 见下                     ⇒ 按这一趟真正走到的位置长, 不按 ctx
+ * iscore [cap_tok][ng] f32 + cand [cap_tok][ng] u8 曾经按 ctx 一次开满(1M 档 2.0 + 0.5 GiB) —— 它不是 KV,
+ * 是每次调用都重写的草稿(核里的行距就是当次的 ng, 见 cuda_v41_indexer.inc.cu), 开成最坏情况纯属浪费,
+ * 而且正是"把上下文配大很贵"这个错觉的来源(1M 看着 3.6 GiB, 其中 2.5 GiB 是这块草稿)。
+ * 现在走 v41_index_scratch_prepare 按需要的组数翻倍长: 一条写到 4 万位的请求只用 128 MiB + 32 MiB。
+ * 速度不受影响: 核只扫真实组数, 短上下文还是短上下文。
+ * 调用方(crewAI)本来就按 1M 报上下文窗口, 服务端报少了会在长提示上直接 400。
+ * ★上下文没有常量★(用户 2026-09-22 "不要任何写死的上下文, 上下文大小只有 1M 这一个选择"): 它是模型自己声明的
+ * (GGUF deepseek4.context_length ← HF max_position_embeddings), 装载时读进 g_ds4_v41.ctx(ds4_internal.h), 引擎里没有
+ * 第二个数 —— CLI/服务端不接受 --ctx, 脚本里不许出现上下文数, V4.1 前向的位置边界一律从它取。分配仍按"这一趟真正
+ * 走到的位置"(上面的账), 所以上下文本身不花内存。 */
 
 typedef struct {
     uint32_t cap_tok, ctx;      /* 每块最多 token 数 / 位置容量 */
@@ -55,7 +62,9 @@ typedef struct {
     uint32_t win_from[DS4_MAX_LAYER];   /* ★本层窗口环里最早有效的绝对位置★(2026-09-21, bug.md §6.2): CED 跳过解码器段的块
                                  * 不写 L20~L39 的环, 那些位置的槽是脏的; 注意力核把窗口下界钳到它(官方 get_window_topk_idxs
                                  * 未填槽标 -1 屏蔽, 这是同一语义)。编码器层与 --decoder-full 恒 0。 */
-    ds4_gpu_tensor *iq, *iw, *iscore, *cand, *idx;       /* [cap][32·128], [cap][32], [cap][ctx], u8 [cap][ctx], i32 [cap][512] */
+    ds4_gpu_tensor *iq, *iw, *iscore, *cand, *idx;       /* [cap][32·128], [cap][32], [cap][iscap], u8 [cap][iscap], i32 [cap][512] */
+    uint32_t iscap;             /* iscore/cand 现在按几组分的(0 = 还没分)。按用到的组数长, 不按 ctx: v41_index_scratch_prepare */
+    uint32_t iscap_gen;         /* 长一次 +1: 指针换了, 烤在解码图里的旧地址作废(core_decode_graph.c 按它重捕获) */
     ds4_gpu_tensor *o, *low, *attn_out;                  /* [cap][64·512], [cap][8192], [cap][E] */
     ds4_gpu_tensor *glog, *sel, *rw, *routed;            /* [cap][384], i32 [cap][6], [cap][6], [cap][E] */
     ds4_gpu_tensor *sg, *su, *sh, *so, *y;               /* [cap][2304] ×3, [cap][E] ×2 */
@@ -67,7 +76,8 @@ typedef struct {
                                  * 主机不做任何按位置的分支。只有 n=1 的主路会置它。 */
     uint32_t graph_pos_lo, graph_pos_cap;   /* 图的有效位置区间 [lo, cap](桶); 捕获时按它算各核的上限 */
     uint32_t n_direct1;         /* 直发跑过几次 n=1 前向: 第一次把懒分配(平面副本/暂存/核属性)全暖了, 之后才许捕获 */
-    void *dgraph;               /* core_decode_graph.c 私有(图实例 + pinned 槽) */
+    uint32_t n_direct_n[DS4_MTP_MAX_BLOCK + 2u];   /* 同上, 按批大小 n 各记一份(投机验证批 n=1+k 各自的暂存/核属性也是懒建的) */
+    void *dgraph;               /* core_decode_graph.c 私有(图实例 + pinned 槽; n=1 纯解码图与 n=2.. 验证批图各一张) */
     int egraph_err;             /* graph 里的 host 节点等 engram 取行时发现失败(host 节点没法报错, 只能记下来事后查) */
     int egraph_uploaded;        /* 捕获中: 位掩码, 第 ei 个 engram 层的 host 节点 + 上传小核已进图 */
     double eg_job_s, eg_wait_s, eg_enter_s; uint32_t eg_n;   /* engram 取行的账(只记 n=1 的解码步; 预填块一轮几百 ms 会把平均污染):
@@ -110,6 +120,7 @@ typedef struct {
 
 /* DS4_MTP_MAX_BLOCK 定义在 ds4_gpu_v41.h —— 核侧(按专家并集的分组表)与主机侧(host_ids 等小数组)
  * 共用一份, 见那里的注释。 */
+#define DS4_V41_DRAFT_GROWS 8u   /* 草稿图按"补窗口几行"分档的上限: 1 + 块长(5)= 6 是常态, 歇过一两轮到 8; 再多走直发 */
 
 /* DSpark 草稿器(core_v41_draft.c)。ready=0 = 这份 GGUF 没带三塔或没带运行参数 ⇒ 调用方走纯单 token 解码。 */
 typedef struct {
@@ -132,6 +143,15 @@ typedef struct {
     uint32_t block, ready;
     int32_t host_ids[DS4_MTP_MAX_BLOCK + 1];
     float host_conf[DS4_MTP_MAX_BLOCK];
+    /* ★草稿一轮整段进 CUDA graph(2026-09-22)★: 按"补窗口几行"(rows = 1 + 上一轮接受数, 歇过几轮就更多)各一张图, 图里: 零拷贝灌
+     * 位置/token → 补窗口(ring_rows/main_proj/推三塔) → 块前向 → markov 逐位 → confidence → 零拷贝读回 ids/conf。一轮草稿约 200 发核,
+     * 直发时发射间隙 + 两次同步吃掉 11.6 ms 里的一大半。只在位置 ≥ 窗宽时走图(块注意力的 pos0 烤进图, 只有 lo = pos0−window 那一支
+     * 与 pos0 无关); rows 超出档、暂存换过指针、这个 rows 还没直发暖过 ⇒ 直发。输出与直发逐字节同(同一批核换个发法)。 */
+    void *gexec[DS4_V41_DRAFT_GROWS + 1u]; uint64_t ggen[DS4_V41_DRAFT_GROWS + 1u]; uint32_t gwarm[DS4_V41_DRAFT_GROWS + 1u];
+    int32_t *p_tok, *p_bpos, *p_wpos, *p_first, *p_ids; float *p_onehot, *p_conf;   /* pinned 槽(零拷贝小核直接读/写) */
+    ds4_gpu_tensor *firstd;    /* 设备 int: ring_rows 的起始行(图开头由零拷贝灌) */
+    int cap_mode, graph_off;   /* 捕获中(主机写张量改走零拷贝) / 捕获失败过(之后一律直发) */
+    uint32_t gsteps, gcaps;    /* 走图的轮数 / 捕获次数 */
 } ds4_v41_draft;
 
 bool v41_draft_alloc(ds4_engine *e, ds4_v41_draft *dr);
@@ -182,6 +202,7 @@ int v41_amp_hook(ds4_v41_state *st, uint32_t il);        /* 钩子回调(挂了�
 bool v41_amp_apply(ds4_v41_state *st, uint32_t il);      /* y += x·(B·A) → bf16(挂了该层才动) */
 ds4_gpu_tensor *v41_alloc(uint64_t bytes, bool *ok);   /* 小工具: 分配失败只置 ok=false, 调用方一路攒到最后再判 */
 bool v41_state_alloc(ds4_v41_state *st, uint32_t cap_tok, uint32_t ctx);
+bool v41_index_scratch_prepare(ds4_v41_state *st, uint32_t ng_need);   /* iscore/cand 长到够放 ng_need 组(够了就是 no-op) */
 void v41_state_free(ds4_v41_state *st);
 bool v41_forward(ds4_engine *e, ds4_v41_state *st, const int32_t *ids, uint32_t n);   /* 追加 n 个 token, st->logits[n][V] */
 /* 前向的主体(embed → 40 层 → 出口 head), 不含输入上传/engram 预取/末尾同步/位置推进 —— graph 捕获与直发共用这一段。
@@ -198,6 +219,12 @@ bool v41_graph_step(ds4_engine *e, ds4_v41_state *st, int32_t tok, int32_t *next
 /* step 的两半: launch 发出这一步的图后立刻返回(调用方趁 GPU 跑着去 emit 当前 token), wait 等它跑完取下一个 token */
 bool v41_graph_launch(ds4_engine *e, ds4_v41_state *st, int32_t tok);
 bool v41_graph_wait(ds4_engine *e, ds4_v41_state *st, int32_t *next_tok);
+/* ★投机验证批的整步图(2026-09-22)★: n = 1+k 行按 n 各一张图, 快照(窗口环按层 / 压缩器余行在追加核里)进图, 主机只记账;
+ * ready = 这个 n 直发暖过 + 图开着; launch 返回 false = 这一批走不了图(捕获失败/形状不合), 调用方按直发跑, 状态没动。
+ * wait 出 n 行的设备 argmax(next[i] = 第 i 行的贪心 token), 位置推进 n; 回滚仍是 v41_spec_rollback(host 直发)。 */
+bool v41_graph_batch_ready(const ds4_v41_state *st, uint32_t n);
+bool v41_graph_batch_launch(ds4_engine *e, ds4_v41_state *st, const int32_t *ids, uint32_t n);
+bool v41_graph_batch_wait(ds4_engine *e, ds4_v41_state *st, int32_t *next);
 void v41_graph_free(ds4_v41_state *st);
 extern int g_ds4_v41_graph;   /* --no-graph 清零(core_v41_api.c); 默认开 */
 bool v41_spec_snapshot(ds4_v41_state *st, uint32_t n);          /* 验证批前: 备份这 n 位会盖掉的环格 + 压缩器余行 */

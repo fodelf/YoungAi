@@ -25,7 +25,7 @@ static float *g_v41_gr[64];
  * 为 8 个 token 解一整份权重, 见新文件头的账)。 */
 static int vqp_fused_run(const uint8_t *blob, const uint32_t *cnt, const uint32_t *off_h, uint32_t n_total_expert,
                          uint32_t nvalid, uint32_t IN, uint32_t MID, uint32_t OUT, uint32_t nc, float clamp,
-                         const float *x, const int32_t *perm, uint32_t n_expert, uint32_t layer_index);
+                         const float *x, const int32_t *perm, uint32_t n_expert, uint32_t layer_index, uint32_t ver);
 
 static struct {
     float   *ys;   uint64_t ys_cap;    /* 排序后的 down 输出 [nvalid][OUT] f32 */
@@ -92,7 +92,7 @@ __global__ static void vqp_copy_hdr_kernel(uint32_t *dst, const uint8_t *blob, u
 }
 
 static int vqp_hdr_build(uint32_t layer, const uint8_t *blob, uint32_t n_total,
-                         uint32_t IN, uint32_t MID, uint32_t OUT) {
+                         uint32_t IN, uint32_t MID, uint32_t OUT, uint32_t ver) {
     if (layer >= 64u) return 0;
     if (g_vqp_hdr[layer]) return 1;
     const uint64_t n = (uint64_t)n_total * 3u;
@@ -114,7 +114,9 @@ static int vqp_hdr_build(uint32_t layer, const uint8_t *blob, uint32_t n_total,
         const uint32_t which = (uint32_t)(k % 3u), e = (uint32_t)(k / 3u);
         const uint32_t exp_rows = which == 2u ? OUT : MID, exp_cols = which == 2u ? MID : IN;
         const uint32_t d16 = d[3] & 0xFFFFu, n16 = d[3] >> 16;
-        if (d[2] != DS4VQ_MAT_MAGIC || d[4] != exp_rows || d[5] != exp_cols) {
+        /* 期望的载荷魔数按【盘上版本】定(2026-09-21): v3 的载荷是 'DQV3'(布局不同, 见 cuda_vq_row.inc.cu)。
+         * 写死 v2 的话 v3 文件会在这里报"头错"并 abort —— 那倒是安全的失败, 但预填就整个不可用了。 */
+        if (d[2] != (ver == 3u ? DS4VQ_MAT3_MAGIC : DS4VQ_MAT_MAGIC) || d[4] != exp_rows || d[5] != exp_cols) {
             fprintf(stderr, "ds4: [vq-prefill] L%u e=%u which=%u 头错(magic %08x %u×%u, 期 %u×%u) -- aborting\n",
                     layer, e, which, d[2], d[4], d[5], exp_rows, exp_cols);
             bad = 1; break;
@@ -140,9 +142,9 @@ static int cuda_vq_moe_prefill_gemm(
         uint32_t IN, uint32_t MID, uint32_t OUT,
         const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
         uint32_t n_total_expert, uint32_t n_expert, float clamp,
-        const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens) {
+        const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, uint32_t ver) {
     if (!g_cublas_ready) { fprintf(stderr, "ds4: [vq-prefill] cuBLAS 未就绪 (L%u)\n", layer_index); return 0; }
-    if (!vqp_hdr_build(layer_index, blob, n_total_expert, IN, MID, OUT)) return 0;
+    if (!vqp_hdr_build(layer_index, blob, n_total_expert, IN, MID, OUT, ver)) return 0;
     const vqp_slot_hdr *tab = g_vqp_hdr[layer_index];
     const uint64_t npair = (uint64_t)n_tokens * n_expert;
     int32_t *sel_h = (int32_t *)malloc(npair * sizeof(int32_t));
@@ -205,7 +207,7 @@ static int cuda_vq_moe_prefill_gemm(
         if (bad) break;
         (void)model_map; (void)down_offset; (void)down_expert_bytes;
         if (!vqp_fused_run(blob, cnt, off, n_total_expert, nvalid, IN, MID, OUT,
-                           tab[0].nc, clamp, (const float *)x->ptr, g_vqp.perm, n_expert, layer_index)) break;
+                           tab[0].nc, clamp, (const float *)x->ptr, g_vqp.perm, n_expert, layer_index, ver)) break;
         vqp_reduce_kernel<<<dim3((OUT + 255u) / 256u, n_tokens, 1), 256, 0, g_cur_stream>>>(
             (float *)out->ptr, g_vqp.ys, g_vqp.inv, (const float *)weights->ptr, n_expert, OUT);
         ok = cuda_ok(cudaGetLastError(), "vq prefill reduce launch");

@@ -18,7 +18,7 @@
 set -u
 cd "$(dirname "$0")/.." || exit 1
 
-MODEL="${1:-gguf/v41/DeepSeek-V4.1-Flash-vq8x4096-fp4-mtpnative.gguf}"
+MODEL="${1:-gguf/v41/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf}"
 NGEN="${2:-24}"
 OUT=/tmp/m0-probe
 mkdir -p "$OUT"

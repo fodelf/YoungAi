@@ -112,3 +112,50 @@ def fix_buffers(M, net, args, tok, dev):
         with torch.device(dev):
             net.engram_hash = M.NgramHashState(args, net.engram_layout, tok)
     return nfix, nfreq
+
+
+def patch_indexer(M, block=1024):
+    """⑤ 索引分数按 query 块算(2026-09-22)。官方 Indexer.forward 一次性物化 [b, s, h, t] 的 bf16 分数:
+    24400 token 的 ratio-1 层 = 24400×32×24400×2 B = 38 GB, 加 relu/乘权重的临时副本翻倍 —— 09-22 实撞
+    L20 一到就把 121 GB 吃干, 看门狗停车(8192 token 时只有 4 GB, 所以以前没撞)。
+    这里逐块做 einsum → relu → ×权重 → 按头求和, 只留 [b, s, t](24400² × 2 B = 1.2 GB); 每个元素的算式与
+    官方逐字相同(元素之间互不依赖, 分块不改值), 后面的 mask / 候选块 / topk 原样照抄官方。"""
+    def forward(self, x, qr, latent, start_pos, offset):
+        assert self.freqs_cis is not None
+        bsz, seqlen, _ = x.size()
+        ratio, rd, end_pos = self.compress_ratio, self.rope_head_dim, start_pos + seqlen
+        if self.owns_k and latent is not None:
+            freqs = (self.freqs_cis[: seqlen - seqlen % ratio : ratio] if start_pos == 0
+                     else self.freqs_cis[start_pos + 1 - ratio].unsqueeze(0))
+            k = self.k_norm(self.wk(latent))
+            M.apply_rotary_emb(k[..., -rd:], freqs)
+            M.fp4_act_quant(k, M.fp4_block_size, True)
+            self.k_cache[:bsz, start_pos // ratio : start_pos // ratio + k.size(1)] = k
+            M.shared_attn.index_k = self.k_cache
+        q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.index_head_dim))
+        M.apply_rotary_emb(q[..., -rd:], self.freqs_cis[start_pos:end_pos])
+        M.fp4_act_quant(q, M.fp4_block_size, True)
+        index_k = M.shared_attn.index_k[:bsz, : end_pos // ratio]
+        weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
+        index_score = torch.empty(bsz, seqlen, index_k.size(1), dtype=q.dtype, device=x.device)
+        for s0 in range(0, seqlen, block):
+            s1 = min(seqlen, s0 + block)
+            sc = torch.einsum("bshd,btd->bsht", q[:, s0:s1], index_k)
+            index_score[:, s0:s1] = (sc.relu_() * weights[:, s0:s1].unsqueeze(-1)).sum(dim=2)
+            del sc
+        if M.world_size > 1:
+            M.dist.all_reduce(index_score)
+        if start_pos == 0:
+            compress_lens = (torch.arange(1, seqlen + 1, device=x.device) // ratio).unsqueeze(-1)
+            index_score.masked_fill_(torch.arange(seqlen // ratio, device=x.device) >= compress_lens, -torch.inf)
+        else:
+            compress_lens = end_pos // ratio
+        if self.is_candidate_source:
+            M.shared_attn.candidates = M.select_candidate_blocks(
+                index_score, compress_lens, self.candidate_topk_blocks, self.candidate_block_size)
+        elif self.uses_candidates:
+            index_score = index_score.masked_fill(~M.shared_attn.candidates, -torch.inf)
+        topk = min(self.index_topk, end_pos // ratio)
+        idxs = index_score.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
+        return torch.where(idxs < compress_lens, idxs + offset, -1).int()
+    M.Indexer.forward = forward

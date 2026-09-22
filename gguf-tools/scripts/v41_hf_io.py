@@ -51,7 +51,11 @@ def build_index(hf: Path):
 
 
 DT = {"F8_E4M3": torch.float8_e4m3fn, "F8_E8M0": torch.uint8, "I8": torch.uint8, "U8": torch.uint8,
-      "BF16": torch.bfloat16, "F16": torch.float16, "F32": torch.float32}
+      "BF16": torch.bfloat16, "F16": torch.float16, "F32": torch.float32, "Q4_K": torch.uint8}
+
+# 每个逻辑元素占几字节。Q4_K 是块格式(144 B / 256 元素), shape 记的是【逻辑形状】——
+# 字节数必须按块算, 按 shape 算会短 4.5 倍(读出来是能跑的垃圾, 不报错)。
+ELEM_BYTES = {"BF16": 2, "F16": 2, "F32": 4}
 
 
 _MM = {}
@@ -70,13 +74,34 @@ _VIEW = {"BF16": torch.bfloat16, "F16": torch.float16, "F32": torch.float32, "F8
 
 
 def load_raw(idx, name, device):
-    """按索引把一个张量读上来(不解量化)。E8M0/I8/U8 一律当 uint8 收 —— 解释权在用它的地方。"""
+    """按索引把一个张量读上来(不解量化)。E8M0/I8/U8 一律当 uint8 收 —— 解释权在用它的地方。
+    Q4_K 按块字节读成一维 uint8(shape 是逻辑形状, 塞不进去), 解释权在 load_q4k。"""
     p, off, dt, shp = idx[name]
-    nbytes = int(np.prod(shp)) * (2 if dt in ("BF16", "F16") else 4 if dt == "F32" else 1)
+    if dt == "Q4_K":
+        rows, cols = shp
+        nbytes = rows * (cols // 256) * 144
+        return torch.from_numpy(_mm(p)[off:off + nbytes]).to(device, non_blocking=True)
+    nbytes = int(np.prod(shp)) * ELEM_BYTES.get(dt, 1)
     t = torch.from_numpy(_mm(p)[off:off + nbytes])
     if dt in _VIEW:
         t = t.view(_VIEW[dt])
     return t.view(*shp).to(device, non_blocking=True)
+
+
+def is_q4k(idx, name):
+    return name in idx and idx[name][2] == "Q4_K"
+
+
+def load_q4k(idx, name, device):
+    """q4_K 块流 → f32 [rows, cols]。数值全在 C/CUDA(libv41vq.so 的 v41_q4k_decode_gpu),
+    这里只递指针 —— 那个核与 src/common/ds4_deq_q4_K(金标)逐式同源。"""
+    rows, cols = idx[name][3]
+    blocks = load_raw(idx, name, device).contiguous()
+    out = torch.empty(rows, cols, dtype=torch.float32, device=device)
+    rc = vq_lib().v41_q4k_decode_gpu(blocks.data_ptr(), rows, cols, out.data_ptr())
+    if rc != 0:
+        raise RuntimeError(f"q4_K 解码失败 rc={rc} @{name}")
+    return out
 
 
 # ---------------- VQ 落盘产物(v41_quantize) ----------------
@@ -92,6 +117,8 @@ def vq_lib():
         _VQLIB = ctypes.CDLL(str(so))
         _VQLIB.v41_vq_decode_gpu.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_int] * 4 + [ctypes.c_void_p]
         _VQLIB.v41_vq_decode_gpu.restype = ctypes.c_int
+        _VQLIB.v41_q4k_decode_gpu.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+        _VQLIB.v41_q4k_decode_gpu.restype = ctypes.c_int
     return _VQLIB
 
 

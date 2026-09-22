@@ -23,15 +23,12 @@ int main(int argc, char **argv) {
     if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
 
     /* DeepSeek V4.1(2026-09-19, server_generate_v41.c): 前向没有 ds4_session —— 没有 KV 复用、没有磁盘 KV、
-     * 没有并发批, 上下文封在引擎硬上限(32768)。这里把配置压到这条路能兑现的范围, 免得起服后每条请求才失败
-     * (09-19 实撞: V4 会话挂在 V4.1 模型上, /v1/models 通, 每条 chat 都回 "cuda prefill failed")。 */
+     * 没有并发批。上下文 = 模型元数据 deepseek4.context_length(ds4_engine_v41_ctx(); 用户 2026-09-22 定"不要任何写死的
+     * 上下文", --ctx 在解析时就被拒): /v1/models 报它, 每条请求的 max_tokens 按它钳, 状态按本趟位置分配。这里把配置压到这条路能兑现的范围,
+     * 免得起服后每条请求才失败(09-19 实撞: V4 会话挂在 V4.1 模型上, /v1/models 通, 每条 chat 都回 "cuda prefill failed")。 */
     const bool v41 = ds4_engine_is_v41(engine) != 0;
     if (v41) {
-        const int cap = ds4_engine_v41_max_ctx();
-        if (cfg.ctx_size > cap) {
-            server_log(DS4_LOG_DEFAULT, "ds4-server: V4.1 上下文硬上限 %d, --ctx %d 压到 %d", cap, cfg.ctx_size, cap);
-            cfg.ctx_size = cap;
-        }
+        cfg.ctx_size = ds4_engine_v41_ctx();
         if (cfg.kv_disk_dir) {
             server_log(DS4_LOG_DEFAULT, "ds4-server: V4.1 没有会话 KV, 磁盘 KV 缓存(%s)不开", cfg.kv_disk_dir);
             cfg.kv_disk_dir = NULL;
@@ -40,7 +37,7 @@ int main(int argc, char **argv) {
             server_log(DS4_LOG_DEFAULT, "ds4-server: V4.1 没有会话, 并发批处理(%d)关", cfg.batch_max);
             cfg.batch_max = 0;
         }
-        server_log(DS4_LOG_DEFAULT, "ds4-server: V4.1 服务路: 贪心解码, 每条请求整段预填, ctx %d", cfg.ctx_size);
+        server_log(DS4_LOG_DEFAULT, "ds4-server: V4.1 服务路: 每条请求整段预填, 上下文 %d(模型元数据 deepseek4.context_length, 状态按本趟位置分配)", cfg.ctx_size);
     } else {
         log_context_memory(cfg.engine.backend, cfg.ctx_size);
     }

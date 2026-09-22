@@ -54,6 +54,10 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     config_validate_model(&e->model);
     weights_bind(&e->weights, &e->model);
     dspark_bind_with_draft(&e->dspark, &e->model, graph_backend);
+#ifndef DS4_NO_GPU
+    /* V4.1 的路由偏置侧车按层找 exp_probs_b 张量, 而状态分配拿不到 engine —— 模型指针挂全局(core_v41_amp.c 用) */
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_V41) g_ds4_v41_model = &e->model;
+#endif
     if (opt->inspect_only) {
         *out = e;
         return 0;

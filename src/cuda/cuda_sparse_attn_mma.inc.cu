@@ -84,7 +84,7 @@ __device__ __forceinline__ static void ds4_attn_mma_scores(
 
 __global__ static void ds4_sparse_attn_mma_kernel(float *o, const float *q, const float *kvw, const uint8_t *kvc,
                                                   const int32_t *idx, const float *sink, uint32_t pos0, uint32_t window,
-                                                  uint32_t ng, uint32_t topk, uint32_t n_head, float scale) {
+                                                  uint32_t ng, uint32_t topk, uint32_t n_head, float scale, uint32_t win_lo) {
     namespace wmma = nvcuda::wmma;
     extern __shared__ char ds4_attn_mma_smem[];
     __nv_bfloat16 *qs = (__nv_bfloat16 *)ds4_attn_mma_smem;                       /* [16][512] */
@@ -101,7 +101,8 @@ __global__ static void ds4_sparse_attn_mma_kernel(float *o, const float *q, cons
     if (threadIdx.x < DS4_ATTN_MMA_HEADS) { rmax[threadIdx.x] = -1e30f; rsum[threadIdx.x] = 0.f; }
 
     const uint32_t p = pos0 + i;
-    const uint32_t lo = p + 1u > window ? p + 1u - window : 0u;
+    uint32_t lo = p + 1u > window ? p + 1u - window : 0u;
+    if (lo < win_lo) lo = win_lo;   /* 环里 win_lo 之前的槽没写过(CED), 不读(官方 -1 屏蔽同义); 见 ds4_gpu_v41.h */
     const uint32_t nwin = p - lo + 1u, nkeys = nwin + topk;
     __syncthreads();
 
@@ -178,7 +179,7 @@ static size_t ds4_attn_mma_smem_bytes(void) {
 static int ds4_sparse_attn_mma_launch(float *o, const float *q, const float *kvw, const uint8_t *kvc,
                                       const int32_t *idx, const float *sink, uint32_t n_tok, uint32_t pos0,
                                       uint32_t window, uint32_t ng, uint32_t topk, uint32_t n_head,
-                                      uint32_t head_dim, float scale) {
+                                      uint32_t head_dim, float scale, uint32_t win_lo) {
     if (head_dim != DS4_ATTN_MMA_HD || (n_head % DS4_ATTN_MMA_HEADS) || n_tok < 64u) return 0;
     static int s_ok = 0;   /* 0 未试 / 1 可用 / -1 抬不上去 */
     const size_t smem = ds4_attn_mma_smem_bytes();
@@ -190,6 +191,6 @@ static int ds4_sparse_attn_mma_launch(float *o, const float *q, const float *kvw
     }
     if (s_ok != 1) return 0;
     ds4_sparse_attn_mma_kernel<<<dim3(n_tok, n_head / DS4_ATTN_MMA_HEADS), DS4_ATTN_MMA_WARPS * 32u, smem, g_cur_stream>>>(
-        o, q, kvw, kvc, idx, sink, pos0, window, ng, topk, n_head, scale);
+        o, q, kvw, kvc, idx, sink, pos0, window, ng, topk, n_head, scale, win_lo);
     return cuda_ok(cudaGetLastError(), "sparse attn mma");
 }

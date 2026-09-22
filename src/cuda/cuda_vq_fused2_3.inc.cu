@@ -276,7 +276,9 @@ static int cuda_vq_moe_forward(
     /* prefill / 大批(n_tokens > fuse_max): 按专家排序 + 逐专家 dequant + cuBLAS f16 GEMM
      * (cuda_vq_prefill.inc.cu)。09-06 前这里是"全层活跃专家 dequant 落 12.9 GB scratch + 逐
      * (token,pick) warp 核"的老路: 8192 token 60 万次 dequant + 44 GFLOPS 的算力, prefill 20 t/s。 */
+    /* ver = 2: 这是 V4 的合一 VQ 文件路(DQVL v2), 与 V4.1 方案 v3 的 blob 不同族 —— 写死 2 是事实陈述不是默认值,
+     * 真给它一份 v3 blob 的话 vqp_hdr_build 会在魔数上硬停(安全失败), 不会按 v2 布局解出假权重。 */
     return cuda_vq_moe_prefill_gemm(out, blob, model_map, down_offset, down_expert_bytes,
                                     expert_in_dim, expert_mid_dim, out_dim, selected, weights,
-                                    n_total_expert, n_expert, clamp, x, layer_index, n_tokens);
+                                    n_total_expert, n_expert, clamp, x, layer_index, n_tokens, 2u);
 }

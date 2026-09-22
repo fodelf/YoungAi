@@ -27,10 +27,11 @@
 #include "../../src/common/ds4_quantfmt.h"
 #include "../../src/common/ds4_fp8.h"
 #include "../../src/common/ds4_float.h"
+#include "../../vq_fmt.h"   /* DQVL/DQVQ 的魔数与 ver 白名单: 格式常量全仓只有这一份(引擎也读它) */
 #include "v41_cfg.h"
 
-enum { J_F32_BF16, J_F32_COPY, J_BF16_COPY, J_FP8BLK, J_FP4X32, J_VQBLOB, J_RAW };
-typedef struct { int kind; char src[192]; int layer; const void *raw; int s2; } job_t;
+enum { J_F32_BF16, J_F32_COPY, J_BF16_COPY, J_FP8BLK, J_FP4X32, J_Q4K, J_VQBLOB, J_VQBLOB3, J_RAW };
+typedef struct { int kind; char src[192]; int layer; const void *raw; int s2; int nexp; } job_t;
 static job_t *g_jobs; static int g_nj, g_cj;
 static v41_st S; static v41_cfg C; static ds4gw W;
 /* ★第二个源: 原始 HF 目录(2026-09-17, mtp-1.md 的 M6 真因)★
@@ -79,11 +80,24 @@ static void plan_bf16(const char *gname, const char *src) {
     uint64_t ne[4]; for (int i = 0; i < e->nd; i++) ne[i] = (uint64_t)e->shape[e->nd - 1 - i];
     add_job(J_BF16_COPY, gname, DS4_GGT_BF16, (uint32_t)e->nd, ne, (uint64_t)v41_st_numel(e) * 2, src, -1, NULL);
 }
-static void plan_fp4(const char *gname, const char *src) {             /* FP4 1×32 → fp4x32 */
+/* 骨架一张矩阵 → GGUF。★按【盘上登记的 dtype】分流, 不按配方分流★ ——
+ * 量化器 --skel fp4 出 I8+scale(FP4 1×32), --skel q4k 出 dtype "Q4_K"(144 B/256 块, 自带
+ * f16 主 scale/min, 没有 sibling .scale)。转换器不需要知道跑的是哪个配方, 也就不会出现
+ * "配方换了、转换器没跟着换"这种错配(它只会缺张量或类型不认, 两种都是硬停车, 不是假数)。 */
+static void plan_fp4(const char *gname, const char *src) {
     const v41_st_ent *e = need(src);
+    if (e->nd != 2) { fprintf(stderr, "★%s 不是二维★\n", src); exit(1); }
+    uint64_t rows = (uint64_t)e->shape[0];
+    if (!strcmp(e->dtype, "Q4_K")) {                                   /* q4_K 块流, 原样搬 */
+        uint64_t cols = (uint64_t)e->shape[1];                          /* Q4_K 的 shape 记逻辑形状 */
+        if (cols % 256) { fprintf(stderr, "★%s 列 %llu 非 256 倍★\n", src, (unsigned long long)cols); exit(1); }
+        uint64_t ne[2] = {cols, rows};
+        add_job(J_Q4K, gname, DS4_GGT_Q4_K, 2, ne, rows * (cols / 256) * 144, src, -1, NULL);
+        return;
+    }
     char sn[192]; snprintf(sn, sizeof sn, "%s", src); char *dot = strrchr(sn, '.'); strcpy(dot, ".scale"); need(sn);
-    if (e->nd != 2 || strcmp(e->dtype, "I8")) { fprintf(stderr, "★%s 不是 FP4 打包 I8 二维★\n", src); exit(1); }
-    uint64_t rows = (uint64_t)e->shape[0], cols = (uint64_t)e->shape[1] * 2;
+    if (strcmp(e->dtype, "I8")) { fprintf(stderr, "★%s dtype %s 既不是 Q4_K 也不是 FP4 打包 I8★\n", src, e->dtype); exit(1); }
+    uint64_t cols = (uint64_t)e->shape[1] * 2;
     if (cols % 32) { fprintf(stderr, "★%s 列 %llu 非 32 倍★\n", src, (unsigned long long)cols); exit(1); }
     uint64_t ne[2] = {cols, rows};
     add_job(J_FP4X32, gname, DS4_GGT_FP4X32, 2, ne, rows * cols / 32 * 17, src, -1, NULL);
@@ -104,11 +118,14 @@ static void plan_fp8blk(const char *gname, const char *src) {
     uint64_t ne[2] = {cols, rows};
     add_job(J_FP8BLK, gname, DS4_GGT_FP8_32X32, 2, ne, rows * cols + ((rows + 31) / 32) * ((cols + 31) / 32), src, -1, NULL);
 }
-static uint64_t vq_payload_bytes(int L, int e, const char *m, uint64_t *rows, uint64_t *cols) {
+/* pre = "layers.7" 或 "mtp.1" —— 主干 routed 与 DSpark 三塔的 VQ 产物格式完全相同(量化器那边也是
+ * 一份 plan_vq 吃两处), 所以这里只把前缀参数化, 不复制第二份 blob 打包逻辑。
+ * 索引位宽由码本大小定(nc=4096 ⇒ 12 bit, nc=2048 ⇒ 11): 写死位宽会在换配方时静默错位。 */
+static uint64_t vq_payload_bytes(const char *pre, int e, const char *m, uint64_t *rows, uint64_t *cols) {
     char n[192];
-    snprintf(n, sizeof n, "layers.%d.ffn.experts.%d.vq.cb", L, e); const v41_st_ent *cb = need(n);
-    snprintf(n, sizeof n, "layers.%d.ffn.experts.%d.%s.vq.idx", L, e, m); const v41_st_ent *ix = need(n);
-    snprintf(n, sizeof n, "layers.%d.ffn.experts.%d.%s.vq.gain", L, e, m); const v41_st_ent *g = need(n);
+    snprintf(n, sizeof n, "%s.ffn.experts.%d.vq.cb", pre, e); const v41_st_ent *cb = need(n);
+    snprintf(n, sizeof n, "%s.ffn.experts.%d.%s.vq.idx", pre, e, m); const v41_st_ent *ix = need(n);
+    snprintf(n, sizeof n, "%s.ffn.experts.%d.%s.vq.gain", pre, e, m); const v41_st_ent *g = need(n);
     uint64_t nc = (uint64_t)cb->shape[0], dim = (uint64_t)cb->shape[1];
     int nbit = 0; while ((1ull << nbit) < nc) nbit++;
     *rows = (uint64_t)ix->shape[0];
@@ -116,14 +133,60 @@ static uint64_t vq_payload_bytes(int L, int e, const char *m, uint64_t *rows, ui
     if ((uint64_t)g->shape[0] != *rows) die("vq.gain 行数与 idx 不符");
     return 16 + nc * dim * 2 + *rows * 2 + (uint64_t)ix->shape[0] * (uint64_t)ix->shape[1] + 8;
 }
-static void plan_vqblob(int L) {
-    const int nexp = C.n_routed_experts;
+static void plan_vqblob(const char *pre, int L, int nexp, const char *gname) {
     uint64_t total = 16 + (uint64_t)nexp * 3 * 8;
     static const char *mats[3] = {"w1", "w3", "w2"};        /* which: 0=w1 1=w3 2=w2 (vq_fmt.h) */
-    for (int e = 0; e < nexp; e++) for (int w = 0; w < 3; w++) { uint64_t r, c; total += vq_payload_bytes(L, e, mats[w], &r, &c); }
-    char gn[96]; snprintf(gn, sizeof gn, "blk.%d.ffn_exps_vq.blob", L);
+    for (int e = 0; e < nexp; e++) for (int w = 0; w < 3; w++) { uint64_t r, c; total += vq_payload_bytes(pre, e, mats[w], &r, &c); }
     uint64_t ne[1] = {total};
-    add_job(J_VQBLOB, gn, DS4_GGT_VQBLOB, 1, ne, total, NULL, L, NULL);
+    int ti = add_job(J_VQBLOB, gname, DS4_GGT_VQBLOB, 1, ne, total, pre, L, NULL);
+    (void)ti;
+    g_jobs[g_nj - 1].nexp = nexp;
+}
+/* DQVL v3(码本一层一本 + E4M3 + 13 位拆位平面)的登记器, 定义在 v41_to_gguf_vq3.inc.c;
+ * 目录里 384 份码本不逐字节同(老目录)时它自己回退到上面的 v2 —— 老目录转出来一个字节不变。 */
+/* v3 的码本探测结果(384 份是否逐字节同 / 能否无损存 E4M3), recipe KV 与登记器共用同一份探测 —— 一件事只写一处 */
+typedef struct { int shared, fp8, nc, dim; uint64_t cb_bytes; } vq3_cb;
+static vq3_cb vq3_probe(const char *pre, int nexp);
+static void plan_vqblob_v3(const char *pre, int L, int nexp, const char *gname);
+/* 三塔专家在量化目录里是 VQ 三件(--mtp-vq 配方)还是不在(出厂 FP4, 09-17 起从原件取)? 按盘上实情分流。
+ * ★探测名必须是 .vq.cb★: 码本是【每专家一份】所以名字里没有矩阵名, 而 idx/gain 是每矩阵一份, 叫
+ * `...experts.0.w1.vq.idx`。09-19 实撞: 探 `experts.0.vq.idx`(少了 w1)永远找不到 ⇒ 静默走回原件 FP4 分支,
+ * 不报错, 只是转出来的文件多 4.9 GB —— 是体积不对才暴露的。 */
+static int mtp_has_vq(int T) {
+    char n[192]; snprintf(n, sizeof n, "mtp.%d.ffn.experts.0.vq.cb", T);
+    return v41_st_find(&S, n) != NULL;
+}
+/* deepseek4.recipe 按【盘上实情】写(2026-09-20): 原来写死 "vq8x4096 skeleton=fp4x32", 对 q4_K 骨架 / 11 位那几份
+ * 就是假话, 而这个 KV 是事后辨认一份 GGUF 配方的唯一凭证。三个事实各读一张登记张量: 主干码本形状定 dim×nc,
+ * embed 的 dtype 定骨架格式(与 plan_fp4 同一判据), 三塔码本在不在定三塔格式(与 plan_mtp 同一判据)。 */
+static const char *g_qdir;   /* 量化目录(main 设): 校准来源看目录里有没有量化器落的 calib.txt */
+static void recipe_str(char *buf, size_t n) {
+    const v41_st_ent *cb = need_in("layers.0.ffn.experts.0.vq.cb", 0), *em = need_in("embed.weight", 0);
+    char mtp[32] = "fp4_native", cal[160] = "nocal";
+    if (mtp_has_vq(0)) { const v41_st_ent *mc = need_in("mtp.0.ffn.experts.0.vq.cb", 0); snprintf(mtp, sizeof mtp, "vq%dx%d", (int)mc->shape[1], (int)mc->shape[0]); }
+    /* 校准量化(2026-09-20): 量化器把取料目录写进 <目录>/calib.txt 首行 "calib_dir=…", 这里只抄目录名 —— 没有就是零语料 */
+    if (g_qdir) {
+        char p[4300], line[1024]; snprintf(p, sizeof p, "%s/calib.txt", g_qdir);
+        FILE *f = fopen(p, "r");
+        if (f) {
+            if (fgets(line, sizeof line, f) && !strncmp(line, "calib_dir=", 10)) {
+                char *s = line + 10, *e = s + strcspn(s, "\n"); *e = 0;
+                const char *b = strrchr(s, '/'); snprintf(cal, sizeof cal, "cal=%s", b ? b + 1 : s);
+            }
+            fclose(f);
+        }
+    }
+    /* ★逐层混位宽(2026-09-21 方案 v3)★: L00 与末层的码本大小不同 ⇒ 写成 "vq8x8192/4096", 不然 recipe 又是假话。
+     * 末层号从 config 的 n_layers 取(转换器本来就按它建层)。 */
+    char rt[64] = "";
+    { char n2[96]; snprintf(n2, sizeof n2, "layers.%d.ffn.experts.0.vq.cb", C.n_layers - 1);
+      const v41_st_ent *cbl = v41_st_find(&S, n2);
+      if (cbl && cbl->shape[0] != cb->shape[0]) snprintf(rt, sizeof rt, "/%d", (int)cbl->shape[0]); }
+    /* 共享码本与 E4M3 是 blob 的事(目录里码本仍每专家一份), 按盘上实情探一次 */
+    const vq3_cb ci = vq3_probe("layers.0", C.n_routed_experts);
+    snprintf(buf, n, "routed=vq%dx%d%s%s%s skeleton=%s mtp=%s engram=sidecar %s (v41_quantize)",
+             (int)cb->shape[1], (int)cb->shape[0], rt, ci.shared ? " sharedcb" : "", ci.shared && ci.fp8 ? " cbfp8" : "",
+             strcmp(em->dtype, "Q4_K") ? "fp4x32" : "q4_K", mtp, cal);
 }
 static int in_list(const int *v, int n, int x) { for (int i = 0; i < n; i++) if (v[i] == x) return 1; return 0; }
 
@@ -162,7 +225,7 @@ static void plan_layer(int L) {
     SMALL("blk.%d.ffn_norm.weight", "layers.%d.ffn_norm.weight");
     BF16("blk.%d.ffn_gate_inp.weight", "layers.%d.ffn.gate.weight");
     SMALL("blk.%d.exp_probs_b.bias", "layers.%d.ffn.gate.bias");
-    plan_vqblob(L);
+    { char gn[96], pre[64]; snprintf(gn, sizeof gn, "blk.%d.ffn_exps_vq.blob", L); snprintf(pre, sizeof pre, "layers.%d", L); plan_vqblob_v3(pre, L, C.n_routed_experts, gn); }
     FP4("blk.%d.ffn_gate_shexp.weight", "layers.%d.ffn.shared_experts.w1.weight");
     FP4("blk.%d.ffn_up_shexp.weight", "layers.%d.ffn.shared_experts.w3.weight");
     FP4("blk.%d.ffn_down_shexp.weight", "layers.%d.ffn.shared_experts.w2.weight");
@@ -176,77 +239,7 @@ static void plan_layer(int L) {
 #undef FP4
 }
 
-/* ---- DSpark 三塔(speed.md 段 6 S1, 2026-09-15) ----
- * 官方 model.py: `mtp.0/1/2` 是三个 SWA(128) 草稿块, 各 128 个专家 top-3。结构与普通层一模一样
- * (hc 六件 + attn 五投影 + ffn gate/专家/shared), 外加五个只此一份的头:
- *   mtp.0.main_proj / main_norm  —— 主模型 L37/38/39 的注意力输入(hc 四路均值)拼成 15360 维再投回 5120,
- *                                   得到 main_x, 它是块注意力的主 KV 来源。取错位置不报错, 只是接受率掉到 1 附近。
- *   mtp.2.markov_head.embed/head —— 秩 256 的 markov 头, 按块内前一个草稿 token 给 logit 加偏置。
- *   mtp.2.confidence_head.proj   —— 出每一位的条件接受概率, 调度器据此决定每轮验证几个。
- *   mtp.2.norm                   —— 三塔共用的出口 norm(官方 self.mtp[-1] 借主模型的 embed/head, GGUF 不再存一份)。
- * ★专家走 FP4 直透, 不做 VQ★(speed.md §2: "草稿质量 = 接受率 = 速度, 不省这里")。
- * ★不要的★: gate.bias_vl(视觉路), 与文件头第 16 行同一条规矩。 */
-/* 塔数与每塔专家数一律从 config.json 读(C.n_mtp_layers / C.dspark_n_routed_experts) —— 写死数字
- * 就是把模型架构焊进工具, 换一版模型静默出错(铁律 2026-09-15: 禁魔数硬编码)。 */
-/* ★三塔一律从**原始 HF** 取, 按原生精度存(2026-09-17)★ —— 见 S2 那段注释的所以然。
- * MFP8 = 原件的 F8_E4M3 + 32×32 缩放, 原样搬(attn 五投影 / shared 专家三件 / main_proj);
- * MBF16 = 原件的 BF16, 原样搬(路由 gate / markov 两件 / confidence) —— 原来 plan_small 把它展成 f32,
- *   字节翻倍而值没变, 草稿器每轮为此白读 130 MB。★norm 不在此列★: 引擎的 rms_norm 核把权重当 f32 读
- *   (cuda_v41_1.inc.cu), 存成 BF16 它照样按 f32 解释 —— 不报错, 直接出垃圾(实撞: 首位一致率 0.035)。
- *   norm 一律走 MSMALL(BF16→f32, 值无损), 只有过"按类型分发"那条路的矩阵才许存 BF16;
- * MFP4 = 原件出厂就是 FP4 的那一类(128 个路由专家), 照旧;
- * MSMALL = 原件就是 F32 的(sink / gate.bias / hc_*)。
- * ★哪个张量是哪一类不许猜★: plan_* 里都按源 dtype 校验, 对不上直接停车。 */
-static void plan_mtp(int T) {
-    char g[96], s[192];
-    if (!g_has_s2) die("三塔要从原始 HF 取原生精度: 第 5 个参数给 HF 目录(见 --help)");
-    g_plan_s2 = 1;
-#define MSMALL(gf, sf) do { snprintf(g, sizeof g, gf, T); snprintf(s, sizeof s, sf, T); plan_small(g, s); } while (0)
-#define MBF16(gf, sf)  do { snprintf(g, sizeof g, gf, T); snprintf(s, sizeof s, sf, T); plan_bf16(g, s); } while (0)
-#define MFP8(gf, sf)   do { snprintf(g, sizeof g, gf, T); snprintf(s, sizeof s, sf, T); plan_fp8blk(g, s); } while (0)
-#define MFP4(gf, sf)   do { snprintf(g, sizeof g, gf, T); snprintf(s, sizeof s, sf, T); plan_fp4(g, s); } while (0)
-    MSMALL("mtp.%d.hc_attn_fn.weight", "mtp.%d.hc_attn_fn");
-    MSMALL("mtp.%d.hc_attn_scale.weight", "mtp.%d.hc_attn_scale");
-    MSMALL("mtp.%d.hc_attn_base.weight", "mtp.%d.hc_attn_base");
-    MSMALL("mtp.%d.attn_norm.weight", "mtp.%d.attn_norm.weight");
-    MFP8("mtp.%d.attn_q_a.weight", "mtp.%d.attn.wq_a.weight");
-    MSMALL("mtp.%d.attn_q_a_norm.weight", "mtp.%d.attn.q_norm.weight");
-    MFP8("mtp.%d.attn_q_b.weight", "mtp.%d.attn.wq_b.weight");
-    MFP8("mtp.%d.attn_kv.weight", "mtp.%d.attn.wkv.weight");
-    MSMALL("mtp.%d.attn_kv_a_norm.weight", "mtp.%d.attn.kv_norm.weight");
-    MSMALL("mtp.%d.attn_sinks.weight", "mtp.%d.attn.attn_sink");
-    MFP8("mtp.%d.attn_output_a.weight", "mtp.%d.attn.wo_a.weight");
-    MFP8("mtp.%d.attn_output_b.weight", "mtp.%d.attn.wo_b.weight");
-    MSMALL("mtp.%d.hc_ffn_fn.weight", "mtp.%d.hc_ffn_fn");
-    MSMALL("mtp.%d.hc_ffn_scale.weight", "mtp.%d.hc_ffn_scale");
-    MSMALL("mtp.%d.hc_ffn_base.weight", "mtp.%d.hc_ffn_base");
-    MSMALL("mtp.%d.ffn_norm.weight", "mtp.%d.ffn_norm.weight");
-    MBF16("mtp.%d.ffn_gate_inp.weight", "mtp.%d.ffn.gate.weight");
-    MSMALL("mtp.%d.exp_probs_b.bias", "mtp.%d.ffn.gate.bias");
-    MFP8("mtp.%d.ffn_gate_shexp.weight", "mtp.%d.ffn.shared_experts.w1.weight");
-    MFP8("mtp.%d.ffn_up_shexp.weight", "mtp.%d.ffn.shared_experts.w3.weight");
-    MFP8("mtp.%d.ffn_down_shexp.weight", "mtp.%d.ffn.shared_experts.w2.weight");
-    for (int e = 0; e < C.dspark_n_routed_experts; e++) {
-        snprintf(g, sizeof g, "mtp.%d.ffn_exp.%d.gate.weight", T, e); snprintf(s, sizeof s, "mtp.%d.ffn.experts.%d.w1.weight", T, e); plan_fp4(g, s);
-        snprintf(g, sizeof g, "mtp.%d.ffn_exp.%d.up.weight",   T, e); snprintf(s, sizeof s, "mtp.%d.ffn.experts.%d.w3.weight", T, e); plan_fp4(g, s);
-        snprintf(g, sizeof g, "mtp.%d.ffn_exp.%d.down.weight", T, e); snprintf(s, sizeof s, "mtp.%d.ffn.experts.%d.w2.weight", T, e); plan_fp4(g, s);
-    }
-    if (T == 0) {
-        plan_fp8blk("mtp.main_proj.weight", "mtp.0.main_proj.weight");   /* 原件 F8_E4M3 32×32 */
-        plan_small("mtp.main_norm.weight", "mtp.0.main_norm.weight");
-    }
-    if (T == 2) {
-        plan_bf16("mtp.markov_embd.weight", "mtp.2.markov_head.embed.weight");
-        plan_bf16("mtp.markov_head.weight", "mtp.2.markov_head.head.weight");
-        plan_bf16("mtp.confidence.weight", "mtp.2.confidence_head.proj.weight");
-        plan_small("mtp.out_norm.weight", "mtp.2.norm.weight");
-    }
-    g_plan_s2 = 0;
-#undef MBF16
-#undef MFP8
-#undef MSMALL
-#undef MFP4
-}
+#include "v41_to_gguf_mtp.inc.c"   /* DSpark 三塔登记(拆出去只为守 500 行, 单 TU 语义不变) */
 
 /* ---- 生成字节 ---- */
 static uint8_t *g_buf; static uint64_t g_cap;
@@ -289,24 +282,25 @@ static uint64_t gen_fp8blk(const job_t *j) {
     return n;
 }
 static uint64_t gen_vqblob(const job_t *j) {
-    const int L = j->layer, nexp = C.n_routed_experts;
+    const int L = j->layer, nexp = j->nexp;
+    const char *pre = j->src;                       /* "layers.7" / "mtp.1", plan 期存下来的 */
     static const char *mats[3] = {"w1", "w3", "w2"};
     uint64_t total = 16 + (uint64_t)nexp * 3 * 8;
-    for (int e = 0; e < nexp; e++) for (int w = 0; w < 3; w++) { uint64_t r, c; total += vq_payload_bytes(L, e, mats[w], &r, &c); }
+    for (int e = 0; e < nexp; e++) for (int w = 0; w < 3; w++) { uint64_t r, c; total += vq_payload_bytes(pre, e, mats[w], &r, &c); }
     uint8_t *o = buf(total); memset(o, 0, 16 + (uint64_t)nexp * 3 * 8);
-    uint32_t hdr[4] = {0x4C565144u, 2u, (uint32_t)L, (uint32_t)nexp}; memcpy(o, hdr, 16);
+    uint32_t hdr[4] = {DS4VQ_BLOB_MAGIC, 2u, (uint32_t)L, (uint32_t)nexp}; memcpy(o, hdr, 16);
     uint64_t *tab = (uint64_t *)(o + 16); uint64_t off = 16 + (uint64_t)nexp * 3 * 8;
     char n[192];
     for (int e = 0; e < nexp; e++) {
-        snprintf(n, sizeof n, "layers.%d.ffn.experts.%d.vq.cb", L, e); const v41_st_ent *cb = need(n); const uint8_t *cbp = v41_st_data(&S, cb);
+        snprintf(n, sizeof n, "%s.ffn.experts.%d.vq.cb", pre, e); const v41_st_ent *cb = need(n); const uint8_t *cbp = v41_st_data(&S, cb);
         for (int w = 0; w < 3; w++) {
-            snprintf(n, sizeof n, "layers.%d.ffn.experts.%d.%s.vq.idx", L, e, mats[w]); const v41_st_ent *ix = need(n); const uint8_t *ixp = v41_st_data(&S, ix);
-            snprintf(n, sizeof n, "layers.%d.ffn.experts.%d.%s.vq.gain", L, e, mats[w]); const v41_st_ent *g = need(n); const uint8_t *gp = v41_st_data(&S, g);
+            snprintf(n, sizeof n, "%s.ffn.experts.%d.%s.vq.idx", pre, e, mats[w]); const v41_st_ent *ix = need(n); const uint8_t *ixp = v41_st_data(&S, ix);
+            snprintf(n, sizeof n, "%s.ffn.experts.%d.%s.vq.gain", pre, e, mats[w]); const v41_st_ent *g = need(n); const uint8_t *gp = v41_st_data(&S, g);
             if (!cbp || !ixp || !gp) exit(1);
-            uint64_t rows, cols; vq_payload_bytes(L, e, mats[w], &rows, &cols);
+            uint64_t rows, cols; vq_payload_bytes(pre, e, mats[w], &rows, &cols);
             uint16_t dim = (uint16_t)cb->shape[1], nc = (uint16_t)cb->shape[0];
             uint8_t *p = o + off; tab[e * 3 + w] = off;
-            memcpy(p, &(uint32_t){0x51565144u}, 4); memcpy(p + 4, &dim, 2); memcpy(p + 6, &nc, 2);
+            memcpy(p, &(uint32_t){DS4VQ_MAT_MAGIC}, 4); memcpy(p + 4, &dim, 2); memcpy(p + 6, &nc, 2);
             uint32_t r32 = (uint32_t)rows, c32 = (uint32_t)cols; memcpy(p + 8, &r32, 4); memcpy(p + 12, &c32, 4);
             p += 16; memcpy(p, cbp, (size_t)nc * dim * 2); p += (size_t)nc * dim * 2;
             memcpy(p, gp, rows * 2); p += rows * 2;
@@ -318,6 +312,8 @@ static uint64_t gen_vqblob(const job_t *j) {
     if (off != total) die("vq blob 字节账不平");
     return total;
 }
+#include "v41_to_gguf_vq3.inc.c"   /* DQVL v3 的登记与字节生成(要 buf()/add_job/need_in, 所以在它们之后) */
+
 
 /* tokenizer 常量(v41_tokenizer_consts.py 产物 TOKC) → tokenizer.ggml.tokens / merges 两个字串数组 +
  * model/pre/bos/eos。引擎 vocab_load 只吃这几个键; pre="joyai-llm" 是 core_bpe.c 写死的切分规则名。 */
@@ -351,6 +347,7 @@ int main(int argc, char **argv) {
         return 2;
     }
     const char *qdir = argv[1], *egp = argv[2], *tkp = argv[3], *out = argv[4];
+    g_qdir = qdir;
     const char *hfdir = argc > 5 ? argv[5] : NULL;
     if (v41_st_open(&S, qdir)) return 1;
     if (hfdir) {
@@ -377,10 +374,10 @@ int main(int argc, char **argv) {
     ds4gw_kv_str(&W, "general.name", "DeepSeek V4.1 Flash");
     ds4gw_kv_u32(&W, "general.alignment", 32);
     ds4gw_kv_str(&W, "deepseek4.variant", "v41_flash");
-    ds4gw_kv_str(&W, "deepseek4.recipe", "routed=vq8x4096 skeleton=fp4x32 engram=sidecar nocal (v41_quantize 2026-09-12)");
+    { char rc[128]; recipe_str(rc, sizeof rc); ds4gw_kv_str(&W, "deepseek4.recipe", rc); fprintf(stderr, "[配方] %s\n", rc); }
     emit_tokenizer(tkp);
     ds4gw_kv_u32(&W, "deepseek4.block_count", (uint32_t)C.n_layers);
-    ds4gw_kv_u64(&W, "deepseek4.context_length", 1048576);
+    ds4gw_kv_u64(&W, "deepseek4.context_length", v41_cfg_context_length(qdir));   /* 模型自己声明的, 见 v41_cfg.h */
     ds4gw_kv_u32(&W, "deepseek4.embedding_length", (uint32_t)C.dim);
     ds4gw_kv_u32(&W, "deepseek4.vocab_size", (uint32_t)C.vocab_size);
     ds4gw_kv_u32(&W, "deepseek4.attention.head_count", (uint32_t)C.n_heads);
@@ -477,13 +474,23 @@ int main(int argc, char **argv) {
         switch (j->kind) {
             case J_F32_BF16: case J_F32_COPY: case J_BF16_COPY: n = gen_small(j); d = g_buf; break;
             case J_FP4X32: n = gen_fp4(j); d = g_buf; break;
+            /* q4_K: 盘上块布局(144 B/256, 连续)与 GGUF 的 Q4_K 逐字节相同 ⇒ 原样搬, 不解不压。
+             * 字节数由 plan 期按逻辑形状算死, 这里只核对源张量的实际长度对不对得上。 */
+            case J_Q4K: {
+                const v41_st_ent *e = need_in(j->src, j->s2);
+                d = sdata(e, j->s2); if (!d) exit(1);
+                n = e->nbytes;
+                if (n != W.t[i].nbytes) die("q4_K 源字节数与登记不符");
+                break;
+            }
             case J_FP8BLK: n = gen_fp8blk(j); d = g_buf; break;
             case J_VQBLOB: n = gen_vqblob(j); d = g_buf; break;
+            case J_VQBLOB3: n = gen_vqblob_v3(j); d = g_buf; break;
             case J_RAW: n = W.t[i].nbytes; d = j->raw; break;
         }
         if (ds4gw_write(&W, i, d, n)) return 1;
         g_out_bytes += n;
-        if (j->kind == J_VQBLOB) { fprintf(stderr, "[L%02d] 专家 blob %.3f GB, 累计 %.2f GB\n", j->layer, (double)n / 1e9, (double)g_out_bytes / 1e9); fflush(stderr); }
+        if (j->kind == J_VQBLOB || j->kind == J_VQBLOB3) { fprintf(stderr, "[L%02d] 专家 blob %.3f GB, 累计 %.2f GB\n", j->layer, (double)n / 1e9, (double)g_out_bytes / 1e9); fflush(stderr); }
         if (j->layer >= 0 && j->layer != last_layer) { last_layer = j->layer; v41_st_release_idle(&S); }
     }
     if (ds4gw_end(&W)) return 1;

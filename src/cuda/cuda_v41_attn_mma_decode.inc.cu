@@ -34,7 +34,8 @@ __global__ static void v41_attn_mma_seg_kernel(float *pacc, float *pmax, float *
                                                const int32_t *idx, uint32_t pos0, uint32_t window,
                                                uint32_t ng, uint32_t topk, uint32_t n_head,
                                                float scale, uint32_t ratio, uint32_t nseg, const int32_t *posd) {
-    if (posd) { pos0 = (uint32_t)posd[0]; ng = ratio ? (pos0 + 1u) / ratio : 0u; if (ng < topk) topk = ng; }
+    /* graph: 位置在设备槽; n 行(gridDim.z, 投机验证批进图)时源层组数 = (pos0 + n)/ratio, 与直发路主机传的 ng_src 同式 */
+    if (posd) { pos0 = (uint32_t)posd[0]; ng = ratio ? (pos0 + gridDim.z) / ratio : 0u; if (ng < topk) topk = ng; }
     namespace wmma = nvcuda::wmma;
     extern __shared__ char ds4_attn_mma_smem[];
     __nv_bfloat16 *qs = (__nv_bfloat16 *)ds4_attn_mma_smem;
@@ -165,9 +166,9 @@ static int v41_attn_mma_decode(float *o, const float *q, const float *kvw, const
     /* grid 的段数 = 批里各 query 各自算出来的段数的**最大值**(它们的段长可能不同, 见 v41_attn_seg_keys)。
      * 段长本身由核里按各自的位置再算一遍 —— 主机只负责把 grid 开够。 */
     uint32_t nseg = 1u;
-    if (posd) {   /* graph: 桶内每个位置的段数取最大(核里按真位置算真段数, 多出的段空跑) */
-        if (n_tok != 1u || pos_cap < pos0) return 0;
-        for (uint32_t p = pos0; p <= pos_cap; p++) {
+    if (posd) {   /* graph: 桶内每个位置的段数取最大(核里按真位置算真段数, 多出的段空跑); n 行时末行位置到 pos_cap + n − 1 */
+        if (pos_cap < pos0) return 0;
+        for (uint32_t p = pos0; p <= pos_cap + n_tok - 1u; p++) {
             const uint32_t ns = v41_attn_nseg_at(p, window, ratio, topk);
             if (ns > nseg) nseg = ns;
         }

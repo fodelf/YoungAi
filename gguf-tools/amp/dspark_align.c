@@ -41,7 +41,9 @@
 #include <stdint.h>
 #include "linalg_small.h"
 
-typedef struct { char magic[4]; uint32_t d, n, rsv; } dcap_hdr;
+/* pos0 = 第 0 对对应的主模型位置(引擎 09-18 起写 1); 这里不用它 —— 解算只看 (X, Y) 对, 不看位置。
+ * ★pos0 == 0 的老料是错位的(core_v41_dcap.c 文件头), 拿它解出来的边车就是 09-16/09-17 判负那两份。★ */
+typedef struct { char magic[4]; uint32_t d, n, pos0; } dcap_hdr;
 
 static double *xmal(size_t n) {
     double *p = (double *)malloc(n * sizeof(double));
@@ -90,6 +92,10 @@ int main(int argc, char **argv) {
     if (fread(&h, sizeof h, 1, f) != 1 || memcmp(h.magic, "DCAP", 4)) { fprintf(stderr, "%s 不是取料文件\n", inp); return 1; }
     const int D = (int)h.d, n = (int)h.n;
     if (D <= 0 || n <= 2) { fprintf(stderr, "取料太小(D=%d n=%d)\n", D, n); return 1; }
+    if (h.pos0 == 0) {   /* 禁兜底: 错位料解出来的边车挂上去只会把草稿变差(09-16/09-17 各撞一次), 直接停 */
+        fprintf(stderr, "★%s 是 09-18 修尺之前的取料(pos0=0, 草稿首位错位), 不许拿它解边车 —— 用修过的引擎重取★\n", inp);
+        return 1;
+    }
     printf("[align] 取料 %s: %d 位置 × %d 维\n", inp, n, D);
 
     double *X = xmal((size_t)n * D), *R = xmal((size_t)n * D);

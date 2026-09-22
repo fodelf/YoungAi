@@ -16,6 +16,10 @@ int g_ds4_v41_prof = 0;
  * 默认是官方部署语义(CED 开), 见 core_v41_forward.c 的 ced_edge 注释。 */
 int g_ds4_v41_decoder_full = 0;
 void ds4_engine_v41_set_decoder_full(int on) { g_ds4_v41_decoder_full = on; }
+/* ★--no-vq-group★: 验证批/草稿塔(n≥2)的 VQ 专家核默认走多 token 分组核(cuda_vq_group.inc.cu, 一 block 一个专家 × m 个 token);
+ * 这个开关钉回"一 block 一对"的老形态, 只给同一二进制做 A/B —— 两条路输出逐字节同(乘加式同源), 差的只是时间。 */
+int g_ds4_v41_vq_group = 1;
+void ds4_engine_v41_set_vq_group(int on) { g_ds4_v41_vq_group = on; }
 void ds4_engine_v41_set_prof(int on) { g_ds4_v41_prof = on; }
 /* ★--dspark★: 开投机解码(默认**关**)。温 0 下两条路必须**逐字节同** ——
  * 投机的接受条件就是"主模型自己也会选这个 token", 所以它只省时间不改输出; 不同就是回滚漏了东西。
@@ -81,7 +85,7 @@ void ds4_engine_v41_set_moe_hook_layer(int il) { g_ds4_v41_hook_layer = il; }
 static ds4_v41_progress_fn g_v41_progress = NULL;
 static void *g_v41_progress_ud = NULL;
 void ds4_engine_v41_set_progress(ds4_v41_progress_fn fn, void *ud) { g_v41_progress = fn; g_v41_progress_ud = ud; }
-int ds4_engine_v41_max_ctx(void) { return (int)DS4_V41_MAX_CTX_P2C; }
+int ds4_engine_v41_ctx(void) { return (int)g_ds4_v41.ctx; }   /* 模型元数据 deepseek4.context_length; 开模型之前是 0 */
 
 /* --score-nll / --score-topk / --score-no-logits(2026-09-13, 后训练取梯度用):
  * 与 V4 的 --eval-nll/--eval-topk 是同一份实现(core_score_aux.c), 同一种字节。
@@ -193,22 +197,28 @@ static bool v41_next_token(ds4_v41_state *st, ds4_gpu_tensor *am, uint32_t row, 
     return true;
 }
 
-int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_prompt, int n_predict, int ctx_size,
+int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_prompt, int n_predict,
                                    ds4_v41_emit_fn emit, void *ud) {
     if (!e || !prompt || n_prompt < 1 || !ds4_engine_is_v41(e)) return 1;
     if (!e->metal_ready) { fprintf(stderr, "ds4: V4.1 前向需要 GPU 后端\n"); return 1; }
     const uint32_t np = (uint32_t)n_prompt;
-    uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : np + (uint32_t)(n_predict > 0 ? n_predict : 0) + 1;
-    if (ctx < np + 1) ctx = np + 1;
-    if (ctx > DS4_V41_MAX_CTX_P2C) ctx = DS4_V41_MAX_CTX_P2C;
+    /* ★上下文只从模型元数据来(g_ds4_v41.ctx ← GGUF deepseek4.context_length)★(用户 2026-09-22): 以前这里收调用方传的
+     * ctx_size(CLI --ctx / 服务端 --ctx, 默认 32768), 于是每个入口各配一个数(尺 32768 / 部署 1M / 判决 NTOK), 同一条请求
+     * 换个入口就换一条边界。现在引擎里没有任何写死的上下文, 也没有参数能改它; 提示装不下就是装不下, 不"放大"也不"压回"。 */
+    uint32_t ctx = g_ds4_v41.ctx;
+    if (ctx == 0) { fprintf(stderr, "ds4: 模型元数据没有 deepseek4.context_length\n"); return 1; }
+    if (np + 1u > ctx) { fprintf(stderr, "ds4: 提示 %u token 超过上下文 %u\n", np, ctx); return 1; }
     /* ★只按这一趟真正用得到的位置分配★(2026-09-22): 状态里几个大块是 cap_tok × ctx 的
-     * (iscore f32 + cand u8 = ctx × 2.5 KB, 再加 kv 源层的 ctx/ratio 格), 传进来的 ctx 是服务端
-     * 配的**上限**, 不是这条请求能用到的长度。以前照上限分: --ctx 1M 时连一条 22 token 的请求
-     * 都要吃 2.5 GiB 打分矩阵, 于是"把上下文配大"被误当成"每条请求都贵"。
+     * (iscore f32 + cand u8 = ctx × 2.5 KB, 再加 kv 源层的 ctx/ratio 格), 1M 是边界, 不是这条请求能用到
+     * 的长度。以前照边界分: 连一条 22 token 的请求都要吃 2.5 GiB 打分矩阵, 于是"上下文 1M"被误当成"每条请求都贵"。
      * 这一趟最多走到 np + n_predict 个位置(投机一轮会临时多推 ≤ 块长, 回滚前也要有地方放), 就分这么多。
-     * ctx 仍然是硬边界: 生成到 st->ctx 就停, 与配的上限语义一致(配得再大也不会多花一个字节)。 */
+     * ctx 仍然是硬边界: 生成到 st->ctx 就停(不设上限的请求 = 生成到 1M 边界或 EOS)。 */
     const uint64_t need = (uint64_t)np + (uint64_t)(n_predict > 0 ? n_predict : 0) + DS4_MTP_MAX_BLOCK + 2u;
     if ((uint64_t)ctx > need) ctx = (uint32_t)need;
+    /* 调用方可以说"不设上限"(传 INT_MAX, 见 server_types2.h SERVER_NO_OUTPUT_CAP): 那就生成到 ctx 边界。
+     * 这里把它钳成真实可用的步数, 后面按步数开的东西(hist)才不会照 INT_MAX 去要 8 GB。 */
+    const int room = ctx > np ? (int)(ctx - np) : 0;
+    if (n_predict > room) n_predict = room;
     const uint32_t ck = g_ds4_v41_chunk > 0 ? (uint32_t)g_ds4_v41_chunk : DS4_V41_CHUNK;
     const uint32_t cap = ck < np ? ck : np;
     ds4_v41_state st;
@@ -360,17 +370,24 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
             }
             const uint32_t nb = 1u + k;
             const double tr1 = now_sec();
-            if (k && !v41_spec_snapshot(&st, nb)) { ok = false; break; }
-            const double tr2 = now_sec();
-            if (!v41_forward(e, &st, batch, nb)) { ok = false; break; }
-            if (k && !ds4_gpu_synchronize()) { ok = false; break; }   /* 分账要真壁钟, 不同步量到的是发射时间 */
-            const double tr3 = now_sec();
-            /* 逐位取主模型的贪心结果, 与草稿比: 第 i 位的 logits 预测的是 batch[i] 之后那一位 */
-            int32_t want[DS4_MTP_MAX_BLOCK + 1];
-            for (uint32_t i = 0; i < nb; i++)
-                if (!ds4_gpu_v41_argmax_tensor(am, st.logits, i, DS4_N_VOCAB) || !ds4_gpu_synchronize() ||
-                    !ds4_gpu_tensor_read(am, 0, &want[i], 4)) { ok = false; break; }
-            if (!ok) break;
+            double tr2 = tr1, tr3;
+            int32_t want[DS4_MTP_MAX_BLOCK + 1];   /* 逐位主模型的贪心结果: 第 i 位的 logits 预测的是 batch[i] 之后那一位 */
+            /* ★验证批走图★(2026-09-22, core_decode_graph.c): 这个 n 直发暖过之后, 快照 + 前向 + n 发 argmax + 读回一发图搞定;
+             * 走不了(没暖/捕获失败)就按下面的直发路(快照 → 前向 → 逐位 argmax), 两条路输出逐字节同。 */
+            if (k && v41_graph_batch_ready(&st, nb) && v41_graph_batch_launch(e, &st, batch, nb)) {
+                if (!v41_graph_batch_wait(e, &st, want)) { ok = false; break; }
+                tr3 = now_sec();
+            } else {
+                if (k && !v41_spec_snapshot(&st, nb)) { ok = false; break; }
+                tr2 = now_sec();
+                if (!v41_forward(e, &st, batch, nb)) { ok = false; break; }
+                if (k && !ds4_gpu_synchronize()) { ok = false; break; }   /* 分账要真壁钟, 不同步量到的是发射时间 */
+                tr3 = now_sec();
+                for (uint32_t i = 0; i < nb; i++)
+                    if (!ds4_gpu_v41_argmax_tensor(am, st.logits, i, DS4_N_VOCAB) || !ds4_gpu_synchronize() ||
+                        !ds4_gpu_tensor_read(am, 0, &want[i], 4)) { ok = false; break; }
+                if (!ok) break;
+            }
             /* 采样开时投机已拒 ⇒ nb 恒 1, 只有 want[0]; 直发这一步(暖身步/捕获失败的重来路)也按采样取 */
             if (rowbuf && !v41_next_token(&st, am, 0, rowbuf, &rng, &hist, &want[0])) { ok = false; break; }
             if (k) { ms_draft += (tr1 - tr0) * 1e3; ms_snap += (tr2 - tr1) * 1e3;
@@ -434,8 +451,8 @@ int ds4_engine_v41_score_ids(ds4_engine *e, const int *ids, int n_ids, const cha
     (void)e; (void)ids; (void)n_ids; (void)out_path; (void)no_engram; (void)chunk;
     fprintf(stderr, "ds4: V4.1 只有 GPU 路\n"); return 1;
 }
-int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_prompt, int n_predict, int ctx_size, ds4_v41_emit_fn emit, void *ud) {
-    (void)e; (void)prompt; (void)n_prompt; (void)n_predict; (void)ctx_size; (void)emit; (void)ud;
+int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_prompt, int n_predict, ds4_v41_emit_fn emit, void *ud) {
+    (void)e; (void)prompt; (void)n_prompt; (void)n_predict; (void)emit; (void)ud;
     fprintf(stderr, "ds4: V4.1 只有 GPU 路\n"); return 1;
 }
 #endif

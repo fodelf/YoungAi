@@ -1,3 +1,5 @@
+#include <limits.h>
+
 #include "ds4.h"
 #include "ds4_distributed.h"
 #ifndef DS4_NO_GPU
@@ -143,7 +145,9 @@ cli_config parse_options(int argc, char **argv) {
             .system = "",   /* default system prompt OFF: assistant-persona system text derails
                              * base code continuation (model answers the persona instead of
                              * continuing the code). Pass -sys "..." to set one explicitly. */
-            .n_predict = 50000,
+            /* 不设上限: 生成到 EOS 或 ctx 边界(两条生成路各自钳)。以前写 50000 —— 与服务端那个 393216
+             * 同一类"谁也说不出依据"的数, 2026-09-22 一起删(用户: "这些东西都不对")。要短输出就显式 -n。 */
+            .n_predict = INT_MAX,
             .ctx_size = DS4_DEFAULT_CTX_SIZE,
             .temperature = DS4_DEFAULT_TEMPERATURE,
             .top_p = DS4_DEFAULT_TOP_P,
@@ -276,7 +280,12 @@ cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
             c.gen.n_predict = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
-            c.gen.ctx_size = parse_int(need_arg(&i, argc, argv, arg), arg);
+            /* ★上下文没有参数★(用户 2026-09-22 "不要任何写死的上下文, 上下文大小只有 1M 这一个选择"): V4.1 的边界
+             * 是模型元数据 deepseek4.context_length(装载时读进 g_ds4_v41.ctx), 状态按本趟位置分配, 没有别的档。
+             * 拒而不是忽略 —— 忽略 = 用户以为设了其实没设, 本仓"不报错只出错"的坑踩够了。
+             * V4 会话路的 ctx_size 留默认值, 只是没有入口再改它。 */
+            fprintf(stderr, "ds4: 上下文由模型元数据(deepseek4.context_length)决定, 没有 %s 这个参数\n", arg);
+            exit(2);
         } else if (!strcmp(arg, "--temp")) {
             c.gen.temperature = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 100.0f);
             c.gen.temp_given = true;
@@ -353,6 +362,8 @@ cli_config parse_options(int argc, char **argv) {
             c.gen.no_dspark = 1;
         } else if (!strcmp(arg, "--no-graph")) {
             c.gen.no_graph = 1;
+        } else if (!strcmp(arg, "--no-vq-group")) {
+            c.gen.no_vq_group = 1;
         } else if (!strcmp(arg, "--dspark")) {
             c.gen.dspark = 1;
         } else if (!strcmp(arg, "--emit-trace")) {

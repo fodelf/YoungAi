@@ -36,8 +36,10 @@ SC="$ROOT/gguf-tools/scripts"; AMP="$ROOT/gguf-tools/amp"
 #   ③ 后训练目录(同构增益, 每晚重出; 与 ② 的表逐元素相乘, 见 core_v41_amp.c)
 # V4 时代那套(ds4-fin86q8ve.gguf + zchain.bin 单文件 + --finetune 低秩拼秩)已停用, 见 back.md §1.2。
 D2="$ROOT/gguf/v41/night"
-MDL="$ROOT/gguf/v41/DeepSeek-V4.1-Flash-vq8x4096-fp4.gguf"   # ① 量化模型(不改)
-ZCH="$ROOT/gguf/v41/gr-fin-40"            # ② 反修插件目录(不改)
+# ★①② = 现役部署对★(2026-09-22 换成 v3: vq8sh14-q4k + grrb; 老的 fp4 那对已按用户令删除, 见 gguf/deleted_0922_manifest.txt)。
+# 指着旧对解出的 ③ 指纹(base.fnv)对不上现役, 挂上去引擎直接拒。改 ①② 先改这里, 与 serve_1m_spark.sh 的默认值保持一致。
+MDL="$ROOT/gguf/v41/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf"   # ① 量化模型(不改)
+ZCH="$ROOT/gguf/v41/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-vqfin41_vqhalf_a_n8192-engine"   # ② 反修(金融 j Same top 74.57%)
 FTD="$ROOT/gguf/v41/posttrain"            # ③ 后训练件版本库(pt-<日期>/)
 HFDIR="$ROOT/hf/DeepSeek-V4.1-Flash"   # HF 出厂目录(后训练只用它读形状, 不读权重)
 BEN="$ROOT/gguf-tools/bench"
@@ -184,11 +186,9 @@ stage_capture(){
         rm -rf "$dir"; mkdir -p "$dir"
         # score-out 丢 /dev/null: 本段只要逐层捕获, 那份 logits(每遍约 4 GB)没有消费者。
         LOG "② ${role} 遍捕获($(wc -l < "$ids") 行, 解码路约 20 t/s) → $dir"
-        # ★--ctx 必须给足★(2026-09-08 实撞): 会话默认 32768, 喂到第 32779 个 token 直接
-        # "cuda decode failed"(报错还不说是上下文满了), 捕获被静默截断成 32779 行 ——
-        # 解算器靠行数越界才发现。这里按 ids 行数 ×1.1 给, 至少 8192。
-        local ctx=$(( $(wc -l < "$ids") * 11 / 10 )); [ "$ctx" -lt 8192 ] && ctx=8192
-        ./ds4 --cuda -m "$MDL" --zchain "$ZCH" --mem-budget-mb 110000 --ctx "$ctx" \
+        # 上下文没有参数(2026-09-22): 以前按 ids 行数 ×1.1 传 --ctx 是 V4 会话的事(09-08 实撞: 会话默认 32768, 喂到
+        # 第 32779 行静默截断); V4.1 打分路按 ids 行数分配状态, 上下文只有 1M 一个取值, --ctx 已不存在。
+        ./ds4 --cuda -m "$MDL" --zchain "$ZCH" --mem-budget-mb 110000 \
             --score-ids "$ids" --score-out /dev/null --cap-dir "$dir" ${CAPL:+--cap-layers "$CAPL"} \
             > "$D2/cap_$role.log" 2>&1 </dev/null || { tail -5 "$D2/cap_$role.log"; DIE "${role} 遍失败"; }
         local n want; n=$(ls "$dir"/raw_ffn_out_L* 2>/dev/null | wc -l)
@@ -1033,8 +1033,8 @@ print("样本 %d 条: 材料 %d 字 / 对版 %d 字 / 错版 %d 字"
 PYEOF
     ./ds4 --cuda -m "$MDL" --dump-tokens --prompt-file "$D2/nll_all.txt" 2>/dev/null > "$D2/nll_all.dump" \
         || DIE "分词失败"
-    # ★一条样本一趟★(2026-09-13, V4.1): 引擎 V4.1 的上下文硬上限是 32768(core_v41.h
-    # DS4_V41_MAX_CTX_P2C, 候选块核用 shared 存整段组数), 而 4 条样本串起来就两万多行,
+    # ★一条样本一趟★(2026-09-13, V4.1): 当时引擎 V4.1 的上下文是 32768(今天从模型元数据
+    # deepseek4.context_length 读, 1M; 候选块核用 shared 存整段组数), 而 4 条样本串起来就两万多行,
     # 再多几条必然撞墙 —— 撞了不会明着报"上下文满", 只会给一串安静的错数。所以每条样本
     # 各写各的 ids, 各跑一趟, 最后按行数加权合并(合并在收口那段, 全是计数, 不碰数值)。
     python3 - "$D2" <<'PYEOF' || DIE "ids 组装失败"

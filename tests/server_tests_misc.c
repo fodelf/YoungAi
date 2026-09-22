@@ -216,8 +216,10 @@ void test_json_skip_has_nesting_limit(void) {
 
 void test_model_metadata_clamps_completion_to_context(void) {
     buf b = {0};
+    /* 服务端默认 = 不设上限(SERVER_NO_OUTPUT_CAP) ⇒ /v1/models 报的 max_completion_tokens 就是 ctx 本身。
+     * 09-22 之前这里传的是写死的 393216, 钉住的是"384K 比 ctx 大所以取 ctx"这一步, 现在钉的是同一步的正解。 */
     append_model_json_values(&b, "deepseek-v4-flash", "DeepSeek V4 Flash",
-                             32768, 393216);
+                             32768, SERVER_NO_OUTPUT_CAP);
     TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-flash\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Flash\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":32768") != NULL);

@@ -175,7 +175,7 @@ __global__ static void v41_sparse_attn_merge_kernel(float *o, const float *pacc,
                                                     const int32_t *posd, uint32_t window, uint32_t ratio, uint32_t topk) {
     const uint32_t h = blockIdx.x, i = blockIdx.y;
     const uint64_t b0 = (uint64_t)i * nseg * n_head;   /* 局部件的行步长按 grid 的 nseg(上限)排 */
-    if (posd) nseg = v41_attn_nseg_at((uint32_t)posd[0], window, ratio, topk);
+    if (posd) nseg = v41_attn_nseg_at((uint32_t)posd[0] + i, window, ratio, topk);   /* 第 i 行的位置 = pos0 + i(n 行批同式) */
     float m = -1e30f;
     for (uint32_t s = 0; s < nseg; s++) m = fmaxf(m, pmax[b0 + (uint64_t)s * n_head + h]);
     float den = 0.f;

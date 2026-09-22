@@ -68,43 +68,62 @@ int ds4_gpu_v41_compress_pool_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *
     return cuda_ok(cudaGetLastError(), "v41 compress pool");
 }
 
-/* ★压缩源层的解码一步(graph 路, 2026-09-18)★: 追加本步的 (ckv, csc) 到余行缓冲第 pos%ratio 格; 凑满一组就把
- * 第 0..ratio-1 格池化写 pooled[0], 并写新组位置 posg[0]。
+/* ★压缩源层的解码一步(graph 路, 2026-09-18 单行; 2026-09-22 扩成 n 行, 投机验证批进图)★
  * 为什么是一发而不是直发路那三件: 直发路的"两次主机偏移 memcpy + 主机判断再发池化核"三件的形状随位置变,
  * 一次捕获的图装不下; 这里 pos 从设备槽读, 每步同一发, 拓扑与相位无关。
- * ★与 v41_compress_pool_kernel 逐位同★: 池化那几行照抄(同 t 序、同 mx/den/acc 三步、同 bf16 舍点), 只是 g 恒为 0。
+ * ★与 v41_compress_pool_kernel 逐位同★: 池化那几行照抄(同 t 序、同 mx/den/acc 三步、同 bf16 舍点)。
  * 余行缓冲的格号 = pos % ratio 与直发路一致: 直发路预填后把 rem 行挪到头, rem = pos % ratio, 正是下一步该写的格。
- * 出错会怎样: 格号错一位 = 池化时组内 token 顺序错, softmax 逐维加权和变了 —— 不报错, 温 0 逐字节门会抓。 */
-__global__ static void v41_compress_step_kernel(float *pooled, int32_t *posg, float *ckv_c, float *csc_c,
-                                                const float *ckv, const float *csc, const int32_t *posd,
-                                                uint32_t ratio, uint32_t dim) {
-    const uint32_t pos = (uint32_t)posd[0], slot = pos % ratio;
-    for (uint32_t d = threadIdx.x; d < dim; d += blockDim.x) {
-        ckv_c[(uint64_t)slot * dim + d] = ckv[d];
-        csc_c[(uint64_t)slot * dim + d] = csc[d];
-    }
-    if (slot + 1u != ratio) return;           /* 没凑满: 只追加(整个 block 一致地返回, 下面的 __syncthreads 没人等) */
-    __syncthreads();
-    if (threadIdx.x == 0) posg[0] = (int32_t)(pos + 1u - ratio);   /* 新组位置 g·ratio, g = (pos+1)/ratio − 1 */
-    for (uint32_t d = threadIdx.x; d < dim; d += blockDim.x) {
-        float mx = -INFINITY;
-        for (uint32_t t = 0; t < ratio; t++) mx = fmaxf(mx, csc_c[(uint64_t)t * dim + d]);
-        float den = 0.f, acc = 0.f;
-        for (uint32_t t = 0; t < ratio; t++) {
-            const float e = expf(csc_c[(uint64_t)t * dim + d] - mx);
-            den += e; acc += e * ckv_c[(uint64_t)t * dim + d];
+ * 出错会怎样: 格号错一位 = 池化时组内 token 顺序错, softmax 逐维加权和变了 —— 不报错, 温 0 逐字节门会抓。
+ * 本批 n 行按批内顺序逐行追加到第 (pos0%ratio + i) % ratio 格, 每凑满一组池化一次 →
+ * pooled[j] / posg[j](j = 本批第几个完成的组, 最多 (ratio-1+n)/ratio 个; 没完成的行由打包核写进垃圾槽)。
+ * 与直发路 v41_compress_source 的"线性追加 → 整批池化 → 余行挪到头"逐位等价: 每组吃的是同样几行、同样顺序, 批后余行同样落在
+ * 0..rem−1 格; 池化那几行与单行版逐字同。同时把 [旧余行 | 本批 n 行] 线性存进 snap_*(与直发路 snap_cpre 同布局 ⇒ v41_spec_rollback
+ * 一个字不改, 按 snap_cpend + keep − pend2 取行); snap_kv==NULL(纯解码 n=1 的图)不存。
+ * 一 block 逐行走(n ≤ 8, 每行一次 __syncthreads: 上一组池化读完 0..ratio−1 格, 后面的行才许盖第 0 格)。 */
+__global__ static void v41_compress_step_n_kernel(float *pooled, int32_t *posg, float *ckv_c, float *csc_c, float *snap_kv, float *snap_sc,
+                                                  const float *ckv, const float *csc, const int32_t *posd, uint32_t ratio, uint32_t dim, uint32_t n) {
+    const uint32_t pos0 = (uint32_t)posd[0], pend = pos0 % ratio;
+    if (snap_kv)
+        for (uint32_t r = 0; r < pend; r++)
+            for (uint32_t d = threadIdx.x; d < dim; d += blockDim.x) { snap_kv[(uint64_t)r * dim + d] = ckv_c[(uint64_t)r * dim + d]; snap_sc[(uint64_t)r * dim + d] = csc_c[(uint64_t)r * dim + d]; }
+    uint32_t j = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint32_t slot = (pend + i) % ratio;
+        __syncthreads();
+        for (uint32_t d = threadIdx.x; d < dim; d += blockDim.x) {
+            const float a = ckv[(uint64_t)i * dim + d], b = csc[(uint64_t)i * dim + d];
+            ckv_c[(uint64_t)slot * dim + d] = a; csc_c[(uint64_t)slot * dim + d] = b;
+            if (snap_kv) { snap_kv[(uint64_t)(pend + i) * dim + d] = a; snap_sc[(uint64_t)(pend + i) * dim + d] = b; }
         }
-        pooled[d] = v41_bf16r(acc / den);
+        if (slot + 1u != ratio) continue;          /* 没凑满: 只追加(slot 是 block 一致的, 分支不发散) */
+        __syncthreads();
+        if (threadIdx.x == 0) posg[j] = (int32_t)(pos0 + i + 1u - ratio);
+        for (uint32_t d = threadIdx.x; d < dim; d += blockDim.x) {
+            float mx = -INFINITY;
+            for (uint32_t t = 0; t < ratio; t++) mx = fmaxf(mx, csc_c[(uint64_t)t * dim + d]);
+            float den = 0.f, acc = 0.f;
+            for (uint32_t t = 0; t < ratio; t++) {
+                const float e = expf(csc_c[(uint64_t)t * dim + d] - mx);
+                den += e; acc += e * ckv_c[(uint64_t)t * dim + d];
+            }
+            pooled[(uint64_t)j * dim + d] = v41_bf16r(acc / den);
+        }
+        j++;
     }
 }
-int ds4_gpu_v41_compress_step_tensor(ds4_gpu_tensor *pooled, ds4_gpu_tensor *posg, ds4_gpu_tensor *cpre_kv,
-                                     ds4_gpu_tensor *cpre_sc, const ds4_gpu_tensor *ckv, const ds4_gpu_tensor *csc,
-                                     const ds4_gpu_tensor *posd, uint32_t ratio, uint32_t dim) {
-    if (!pooled || !posg || !cpre_kv || !cpre_sc || !ckv || !csc || !posd || ratio < 2u) return 0;
+int ds4_gpu_v41_compress_step_n_tensor(ds4_gpu_tensor *pooled, ds4_gpu_tensor *posg, ds4_gpu_tensor *cpre_kv, ds4_gpu_tensor *cpre_sc,
+                                       ds4_gpu_tensor *snap_kv, ds4_gpu_tensor *snap_sc, const ds4_gpu_tensor *ckv, const ds4_gpu_tensor *csc,
+                                       const ds4_gpu_tensor *posd, uint32_t ratio, uint32_t dim, uint32_t n) {
+    if (!pooled || !posg || !cpre_kv || !cpre_sc || !ckv || !csc || !posd || ratio < 2u || n == 0u || n > 8u) return 0;
+    const uint32_t ngmax = (ratio - 1u + n) / ratio;
     if (cpre_kv->bytes < (uint64_t)ratio * dim * 4 || cpre_sc->bytes < (uint64_t)ratio * dim * 4) return 0;
-    v41_compress_step_kernel<<<1, 256, 0, g_cur_stream>>>((float *)pooled->ptr, (int32_t *)posg->ptr, (float *)cpre_kv->ptr,
-        (float *)cpre_sc->ptr, (const float *)ckv->ptr, (const float *)csc->ptr, (const int32_t *)posd->ptr, ratio, dim);
-    return cuda_ok(cudaGetLastError(), "v41 compress step");
+    if (pooled->bytes < (uint64_t)ngmax * dim * 4 || posg->bytes < (uint64_t)ngmax * 4 || ckv->bytes < (uint64_t)n * dim * 4) return 0;
+    if ((snap_kv != NULL) != (snap_sc != NULL)) return 0;
+    if (snap_kv && (snap_kv->bytes < (uint64_t)(ratio - 1u + n) * dim * 4 || snap_sc->bytes < (uint64_t)(ratio - 1u + n) * dim * 4)) return 0;
+    v41_compress_step_n_kernel<<<1, 256, 0, g_cur_stream>>>((float *)pooled->ptr, (int32_t *)posg->ptr, (float *)cpre_kv->ptr, (float *)cpre_sc->ptr,
+        snap_kv ? (float *)snap_kv->ptr : NULL, snap_sc ? (float *)snap_sc->ptr : NULL,
+        (const float *)ckv->ptr, (const float *)csc->ptr, (const int32_t *)posd->ptr, ratio, dim, n);
+    return cuda_ok(cudaGetLastError(), "v41 compress step(n 行)");
 }
 
 /* ---- 稀疏注意力(官方 sparse_attn_kernel 语义): 一 block 一 (query, 8 头)(128 线程 = 4 warp, 每 warp 2 头), grid (n, 8),
@@ -128,7 +147,8 @@ int ds4_gpu_v41_compress_step_tensor(ds4_gpu_tensor *pooled, ds4_gpu_tensor *pos
  * 无效 topk 槽(idx<0)不跳过而是记 -inf 分数, 让它在块内自然得到 p=0(跳过会打乱分块结构)。 */
 __global__ static void v41_sparse_attn_kernel(float *o, const float *q, const float *kvw, const uint8_t *kvc, const int32_t *idx,
                                               const float *sink, uint32_t pos0, uint32_t window, uint32_t ng, uint32_t topk,
-                                              uint32_t n_head, uint32_t hd, float scale, uint32_t full_block, uint32_t ring) {
+                                              uint32_t n_head, uint32_t hd, float scale, uint32_t full_block, uint32_t ring,
+                                              uint32_t win_lo) {
     const uint32_t i = blockIdx.x, lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
     const uint32_t per = hd / 32u;                 /* 512/32 = 16 维/lane */
     __shared__ float ks[V41_ATTN_KTILE][512];
@@ -145,8 +165,9 @@ __global__ static void v41_sparse_attn_kernel(float *o, const float *q, const fl
      * (官方 get_dspark_topk_idxs, 与 i 无关, 也不做因果截断 —— 5 个草稿位是一次出的)。
      * 主路(full_block=0)是因果的: 第 i 位只看到 [p+1-window, p]。 */
     const uint32_t last = full_block ? pos0 + full_block - 1u : p;
-    const uint32_t lo = full_block ? (pos0 > window ? pos0 - window : 0u)      /* 窗口 = 块前面那 window 个位置 */
-                                   : (p + 1u > window ? p + 1u - window : 0u); /* 因果: 含自己那一位 */
+    uint32_t lo = full_block ? (pos0 > window ? pos0 - window : 0u)            /* 窗口 = 块前面那 window 个位置 */
+                             : (p + 1u > window ? p + 1u - window : 0u);       /* 因果: 含自己那一位 */
+    if (lo < win_lo) lo = win_lo;                  /* 环里 win_lo 之前的槽没写过(CED), 不读(官方 -1 屏蔽同义) */
     const uint32_t nwin = last - lo + 1u;
     const uint32_t nkeys = nwin + topk;
     for (uint32_t base = 0; base < nkeys; base += V41_ATTN_KTILE) {
@@ -209,18 +230,27 @@ int ds4_gpu_v41_sparse_attn_tensor(ds4_gpu_tensor *o, const ds4_gpu_tensor *q, c
                                    uint32_t n_tok, uint32_t pos0, uint32_t window, uint32_t ng, uint32_t topk,
                                    uint32_t ratio,
                                    uint32_t n_head, uint32_t head_dim, float scale, int full_block, int ring,
-                                   const ds4_gpu_tensor *posd, uint32_t pos_cap) {
+                                   uint32_t win_lo, const ds4_gpu_tensor *posd, uint32_t pos_cap) {
     if (!o || !q || !kv_win || n_head != 64u || head_dim != 512u) { fprintf(stderr, "ds4: [v41] sparse attn 只实现 64 头×512\n"); return 0; }
+    /* 钳位只有预填核实现(见 ds4_gpu_v41.h): 解码核(n≤8, 含 graph 路)进来时它必须是空操作, 否则停车而不是静默读脏槽。
+     * 生成路把最后一块留够 window 个位置(core_v41_api.c), 所以解码时 p+1-window ≥ win_lo 恒成立。 */
+    const uint32_t lo_first = pos0 + 1u > window ? pos0 + 1u - window : 0u;   /* 本批第一个 query 的自然下界(后面的只会更大) */
+    const int clamp_matters = win_lo > lo_first;
+    if (clamp_matters && n_tok <= 8u && !full_block) {
+        fprintf(stderr, "ds4: ★[v41] sparse attn: 解码核不实现窗口钳位, 但 pos0 %u 的窗口下界 %u < win_lo %u —— 最后一块没留够 window 个位置?★\n",
+                pos0, lo_first, win_lo);
+        return 0;
+    }
     /* ★graph 路(posd 非 NULL)只许走解码张量核版★: 标量 split 版在主机上按真键数定段长, 进不了一次捕获的图;
      * 张量核版抬不上 shared 时这里直接失败(不静默换核 —— 换了核就与直发路不是同一累加序, 逐字节门必分叉)。 */
     if (posd) {
-        if (full_block || !ring || n_tok != 1u) { fprintf(stderr, "ds4: [v41] graph 路的注意力只收主路 n=1 的形态\n"); return 0; }
+        if (full_block || !ring || n_tok > 8u) { fprintf(stderr, "ds4: [v41] graph 路的注意力只收主路 n≤8 的形态\n"); return 0; }
         const float *sink = (const float *)cuda_model_range_ptr(model_map, sink_offset, (uint64_t)n_head * 4, "v41 sink");
         if (!sink) return 0;
         const int hasc = kv_comp && idx;   /* 纯窗口层(ratio 0)也走这里: 窗口范围同样随位置变 */
         if (!v41_attn_mma_decode((float *)o->ptr, (const float *)q->ptr, (const float *)kv_win->ptr,
                                  hasc ? (const uint8_t *)kv_comp->ptr : NULL, hasc ? (const int32_t *)idx->ptr : NULL,
-                                 sink, 1u, pos0, window, hasc ? ng : 0u, hasc ? topk : 0u, hasc ? ratio : 0u, n_head, head_dim, scale,
+                                 sink, n_tok, pos0, window, hasc ? ng : 0u, hasc ? topk : 0u, hasc ? ratio : 0u, n_head, head_dim, scale,
                                  (const int32_t *)posd->ptr, pos_cap)) {
             fprintf(stderr, "ds4: [v41] graph 路要的解码张量核注意力不可用\n"); return 0;
         }
@@ -254,11 +284,11 @@ int ds4_gpu_v41_sparse_attn_tensor(ds4_gpu_tensor *o, const ds4_gpu_tensor *q, c
     /* 草稿块(full_block)不走 mma 版: 那份是按因果窗口写的, 块内全可见的语义它没有(而且 n=5 也填不满张量核) */
     if (!full_block && ds4_sparse_attn_mma_launch((float *)o->ptr, (const float *)q->ptr, (const float *)kv_win->ptr,
                                    kv_comp ? (const uint8_t *)kv_comp->ptr : NULL, idx ? (const int32_t *)idx->ptr : NULL,
-                                   sink, n_tok, pos0, window, ng, (kv_comp && idx) ? topk : 0u, n_head, head_dim, scale))
+                                   sink, n_tok, pos0, window, ng, (kv_comp && idx) ? topk : 0u, n_head, head_dim, scale, win_lo))
         return 1;
     v41_sparse_attn_kernel<<<dim3(n_tok, n_head / V41_ATTN_HEADS_PER_BLOCK), V41_ATTN_HEADS_PER_BLOCK * 16u, 0, g_cur_stream>>>(
         (float *)o->ptr, (const float *)q->ptr, (const float *)kv_win->ptr,
         kv_comp ? (const uint8_t *)kv_comp->ptr : NULL, idx ? (const int32_t *)idx->ptr : NULL, sink, pos0, window, ng,
-        (kv_comp && idx) ? topk : 0u, n_head, head_dim, scale, full_block ? n_tok : 0u, ring ? 1u : 0u);
+        (kv_comp && idx) ? topk : 0u, n_head, head_dim, scale, full_block ? n_tok : 0u, ring ? 1u : 0u, win_lo);
     return cuda_ok(cudaGetLastError(), "v41 sparse attn");
 }

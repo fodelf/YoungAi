@@ -11,7 +11,13 @@
 #include <stdlib.h>
 
 #define DS4VQ_BLOB_MAGIC 0x4C565144u
-#define DS4VQ_MAT_MAGIC  0x51565144u
+#define DS4VQ_MAT_MAGIC  0x51565144u   /* v2 载荷: 头 + 自带码本 + 增益 + 位流 */
+/* ★v3(2026-09-21, 113.md 方案 v3)★: 码本一层一本(提到 blob 头之后, 载荷用 cb_off 指过去, 只存 E4M3)
+ * + 13 位索引拆成"12 位主流 + 1 位平面"。载荷换了魔数, 所以老二进制读 v3 会在这里认不出来而不是错位解。
+ * ★槽表位置(offset 16)两版相同★ —— 挪了它老二进制就会把码本字节当偏移用, 那是随机垃圾而不是可诊断的失败。 */
+#define DS4VQ_MAT3_MAGIC 0x33565144u   /* 'DQV3' */
+#define DS4VQ_BLOB_VER_MIN 2u
+#define DS4VQ_BLOB_VER_MAX 3u
 
 static inline float ds4vq_f16(uint16_t h) {
     uint32_t s = (uint32_t)(h & 0x8000u) << 16, e = (h >> 10) & 0x1F, m = h & 0x3FF, f;
@@ -27,10 +33,17 @@ static inline float ds4vq_f16(uint16_t h) {
 static inline uint32_t ds4vq_blob_nexp(const uint8_t *blob) {
     uint32_t n; memcpy(&n, blob + 12, 4); return n;
 }
+static inline uint32_t ds4vq_blob_ver(const uint8_t *blob) {
+    uint32_t v; memcpy(&v, blob + 4, 4); return v;
+}
+/* ★ver 白名单(2026-09-21)★: 以前这里只查魔数, 于是一个将来版本的 blob 会被判"合法"然后按本版布局解 ——
+ * 不报错, 只出假权重。加白名单之后, 读到不认识的版本是**加载期硬停**(调用方 exit), 那是能一眼定位的失败。 */
 static inline int ds4vq_blob_ok(const uint8_t *blob, size_t sz) {
     if (!blob || sz < 16) return 0;
     uint32_t mg; memcpy(&mg, blob, 4);
     if (mg != DS4VQ_BLOB_MAGIC) return 0;
+    const uint32_t ver = ds4vq_blob_ver(blob);
+    if (ver < DS4VQ_BLOB_VER_MIN || ver > DS4VQ_BLOB_VER_MAX) return 0;
     const uint32_t nexp = ds4vq_blob_nexp(blob);
     return nexp >= 1 && nexp <= 4096 && sz >= 16 + (size_t)nexp * 3 * 8;
 }

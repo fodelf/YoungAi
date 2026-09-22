@@ -4,8 +4,12 @@
  * 加几条判负存档就破了 500 行守卫。拆开之后这一片只讲一件事: **压缩态专家权重怎么直接参与乘法**。
  *
  * 盘上形态(DQVL v2 blob): 16 B 头 + 384×3 个槽表; 每槽是一份 DQVQ 载荷 =
- * 16 B 头 + 码本(4096 × 8 个 f16 = 64 KB) + 逐行增益 f16 + 位流(每 8 个元素一个 12 位码本号)。
- * 一行 640 个索引 = 960 B; 一个专家三个矩阵约 5.9 MB; 一层 8 个专家约 47 MB。
+ * 16 B 头 + 码本(nc × 8 个 f16; nc4096 = 64 KB) + 逐行增益 f16 + 位流(每 8 个元素一个码本号)。
+ * ★索引位宽由 nc 定, 现役两档★: nc4096 = 12 位(一行 640 索引 = 960 B), nc2048 = 11 位(880 B,
+ * 2026-09-19 的 100 GB 配方)。下面的 v41_vq_row_dot 整族是 NBIT 模板, 几何天然通用 ——
+ * 一块恒 8 轮 = 8×NBIT 个字(12 位 96 字 = 3 条整线; 11 位 88 字 = 2 条整线 + 24 lane 的 96 B),
+ * 每 lane 恒 3 个寄存器(没触到 09-18 那个 64 寄存器硬顶), 行起点恒整字节(nidx_row 640/288 是 8 的倍数)。
+ * ★11 位的第三条读不满整线 ⇒ 按 09-18 请求粒度账掉到 ~142 GB/s 档, 而字节少 8.3%; 净亏净赚未用 12k 尺量。★
  *
  * 09-16 体检与第一刀: 这两个核原本合计 14.23 ms/步, 离板子 240 GB/s 的墙很远。ncu 指出真凶不是权重 ——
  * 一次发射(一层 gateup)全局 load 扇区 42.0 M × 32 B = 1.34 GB, 而这一层的权重才 31.5 MB, **放大 43 倍**,
@@ -15,157 +19,9 @@
  *
  * ★必须排在 cuda_v41_4.inc.cu 之后★: 用它的 v41_bf16r / v41_grow / v41_scratch;
  * 又必须排在 cuda_v41_draft.inc.cu 之前(草稿塔借本片的 reduce 核与暂存槽)。 */
-/* ---- VQ 专家解码即乘(DQVL v2 blob: 16 B 头 + 384×3 槽表; 槽 = DQVQ 载荷: 16 B 头 + 码本 + 行增益 f16 + 位流) ---- */
-typedef struct { const uint8_t *cb, *gr, *ix; const float *gov; uint32_t nidx_row, nbit, imsk, nc; int ok; } v41_vq_mat;
-/* gov(2026-09-13): 该专家该矩阵的逐行增益【缩放因子】[rows] f32, NULL = 按载荷原样(权重侧反修没挂或不挂这个矩阵)。 */
-__device__ __forceinline__ static v41_vq_mat v41_vq_open(const uint8_t *blob, int e, int which, uint32_t rows, uint32_t cols,
-                                                         const float *gov) {
-    v41_vq_mat m; m.ok = 0; m.cb = m.gr = m.ix = NULL; m.gov = gov; m.nidx_row = m.nbit = m.imsk = m.nc = 0;
-    uint64_t off; memcpy(&off, blob + 16 + ((size_t)e * 3 + which) * 8, 8);
-    if (!off) return m;
-    const uint8_t *pay = blob + off;
-    uint32_t mg; memcpy(&mg, pay, 4);
-    if (mg != DS4VQ_MAT_MAGIC) return m;
-    uint16_t d16, n16; memcpy(&d16, pay + 4, 2); memcpy(&n16, pay + 6, 2);
-    uint32_t r32, c32; memcpy(&r32, pay + 8, 4); memcpy(&c32, pay + 12, 4);
-    if (r32 != rows || c32 != cols || d16 != 8u) return m;   /* 本核只写了 dim 8(V4.1 配方 vq8x4096) */
-    uint32_t nbit = 0; while ((1u << nbit) < (uint32_t)n16) nbit++; if (nbit < 1u) nbit = 1u;
-    m.cb = pay + 16; m.gr = m.cb + (size_t)n16 * 8u * 2u; m.ix = m.gr + (size_t)rows * 2u;
-    m.nidx_row = cols / 8u; m.nbit = nbit; m.imsk = (1u << nbit) - 1u; m.nc = n16; m.ok = 1;
-    return m;
-}
-/* ★激活以 bf16 存(2026-09-16, 本核最大的一刀)★
- *
- * 为什么: L1 每周期只供得起一个 wavefront(128 B), 所以这个核的产能单位是**wavefront 数**, 不是字节数。
- * 数一轮(32 个 lane 取 32 个索引)要付多少:
- *   激活 16 个 —— 每 lane 8 个 f32 = 32 B, 没有 32 B 的读指令, 只能拆成两条 float4;
- *                每条的 32 个 lane 地址相隔 32 B, 一条就铺开 1024 B = 8 个 wavefront, 两条 16 个
- *   码本 ~4 个(随机查表的 bank 冲突) + 位流 4 个(4 条 LDG.E.U8)
- * **激活一个人占了三分之二**, 而它本来就在 bf16 格点上(调用方 rms_norm / 上一步的 bf16r 舍过) ——
- * 存 f32 等于把每个数的低 16 位零白搬一遍。
- * 改成 bf16 后 8 个元素正好 16 B **连续**, 一条 uint4 拿完, 32 个 lane 合起来 512 B = **4 个 wavefront**。
- *
- * ★逐位同★: bf16 → f32 就是低位补 16 个零, 而值本来就在格点上(低 16 位全零), 来回一趟精确无损,
- * 乘加的次序也一个字没变。所以它的门是**输出逐字节相同**, 不是质量尺。
- * ★出错会怎样★: 哪天上游忘了舍 bf16 就喂进来, 这里会把低 16 位直接丢掉 —— 不报错, 只是悄悄少几位精度。
- * 所以打包核用的是 v41_bf16r(舍), 不是截断: 真没舍过也只差一次正确的舍入, 不会是垃圾。 */
-/* 激活那 16 B 由调用方(v41_vq_blk_rounds)装好传进来(xw), 本函数只做查表 + 乘加。 */
-__device__ __forceinline__ static float v41_vq_dot8(uint32_t v, uint4 xw, const uint8_t *cbs, int cb_shared) {
-    uint2 cw0, cw1;
-    if (cb_shared) { const uint4 c = *(const uint4 *)(cbs + (size_t)v * 16u); cw0.x = c.x; cw0.y = c.y; cw1.x = c.z; cw1.y = c.w; }
-    else { cw0 = *(const uint2 *)(cbs + (size_t)v * 16u); cw1 = *(const uint2 *)(cbs + (size_t)v * 16u + 8u); }
-    __half2 h0, h1, h2, h3; memcpy(&h0, &cw0.x, 4); memcpy(&h1, &cw0.y, 4); memcpy(&h2, &cw1.x, 4); memcpy(&h3, &cw1.y, 4);
-    const float2 f0 = __half22float2(h0), f1 = __half22float2(h1), f2 = __half22float2(h2), f3 = __half22float2(h3);
-    /* 一个 uint32 装两个 bf16: 低半是第 2k 个元素, 高半是第 2k+1 个。补零还原成 f32。 */
-    return f0.x * __uint_as_float(xw.x << 16) + f0.y * __uint_as_float(xw.x & 0xffff0000u)
-         + f1.x * __uint_as_float(xw.y << 16) + f1.y * __uint_as_float(xw.y & 0xffff0000u)
-         + f2.x * __uint_as_float(xw.z << 16) + f2.y * __uint_as_float(xw.z & 0xffff0000u)
-         + f3.x * __uint_as_float(xw.w << 16) + f3.y * __uint_as_float(xw.w & 0xffff0000u);
-}
-/* f32(已在 bf16 格点) → 打包成 bf16。一线程一元素, 每层一次, 5120 个元素, 可忽略。 */
-__global__ static void v41_vq_xpack_kernel(uint16_t *dst, const float *src, uint64_t n) {
-    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) dst[i] = (uint16_t)(__float_as_uint(v41_bf16r(src[i])) >> 16);
-}
-/* ★位流按 384 B 整块读, 再用 shfl 分发(2026-09-18, fable5 "复审立案" 步 1 定版)★
- *
- * 为什么(全是 mem_ceiling.cu ⑤⑥ 量出来的, 不是猜的): 板上 L1/L2/DRAM 单跳 18/143/377 ns; 而"每 warp 私有行、
- * 每轮 48 B"这种流, **在飞 1 轮和 16 轮都只有 135~142 GB/s**, 加 `ld.global.L2::128B/256B` 提示也一样;
- * 每条指令读满 64 B ⇒ 187~207, 读满 **128 B 整线 ⇒ 219**(墙 237~241)。⇒ 这个核的最后一堵墙是**请求粒度**:
- * DRAM 按 64 B 取, 一轮只要 48 B 就有一半白取 —— 和延迟深度、指令条数、shared bank 都无关。
- * 步 0 的两版 prefetch(按线 / 按扇区, 提前一行)都只把 gateup 从 8.25 拉到 7.1 ms/步 = 133 GB/s, 正好贴在
- * 48 B 形态自己的上限上, 已撤。09-16 那次"12 个 lane 各读一字 + shfl"判负的真因也在这: 它一轮还是 48 B。
- *
- * 怎么读: 一块 = 3 条 128 B 线 = 96 个 32 位字 = 256 个索引 = 8 轮。lane j 用三条 LDG.32 拿字 j / j+32 / j+64,
- * 每条指令 32 个 lane 正好一条整线。第 k 轮 lane j 要的索引 j+32k 在块内第 12k+⌊3j/8⌋ 个字, 位移 (12j)%32;
- * 位移 > 20 的 lane(j%8 ∈ {2,5}, 固定 8 个)跨到下一个字 ⇒ 每轮两条 shfl(低字、高字)+ funnelshift + and。
- * 持有字 W 的是 lane W%32 的第 W/32 个寄存器; 一轮的 12 个字只在 k%8 ∈ {2,5} 时跨寄存器, 那两轮供给方
- * 按"自己被问的是哪个字"选寄存器, 其余轮寄存器号是编译期常量。
- * ★lane↔索引映射、每 lane 的累加次序、跨 lane 的归约树一个字没动 ⇒ 输出逐字节同, 门 = cmp。★
- * 尾块(gateup 一行 20 轮 = 2 块 + 4 轮)只装 48 个字, 越界的字不读(谓词), 不靠载荷尾巴的 8 B 零垫。 */
-__device__ __forceinline__ static uint32_t v41_vq_sel3(uint32_t r, uint32_t w0, uint32_t w1, uint32_t w2) {
-    return r == 0u ? w0 : (r == 1u ? w1 : w2);
-}
-/* 一块位流在寄存器里的样子: lane j 持有块内第 j / j+32 / j+64 个字。 */
-typedef struct { uint32_t w0, w1, w2; } v41_vq_blk;
-template <int NBIT>
-__device__ __forceinline__ static const uint32_t *v41_vq_row_ptr(const v41_vq_mat &m, uint32_t r) {
-    return (const uint32_t *)(m.ix + (((uint64_t)r * m.nidx_row * NBIT) >> 3));
-}
-/* 装一块: 只读本块真有的字(尾块 48 个), 越界的 lane 不发读 —— 不靠载荷尾巴的 8 B 零垫。 */
-__device__ __forceinline__ static v41_vq_blk v41_vq_blk_load(const uint32_t *blk, uint32_t nw) {
-    const uint32_t lane = threadIdx.x & 31u;
-    v41_vq_blk b; b.w0 = 0u; b.w1 = 0u; b.w2 = 0u;
-    if (lane < nw) b.w0 = blk[lane];
-    if (lane + 32u < nw) b.w1 = blk[lane + 32u];
-    if (lane + 64u < nw) b.w2 = blk[lane + 64u];
-    return b;
-}
-/* ★跨块软件流水, 提前一块(2026-09-18 第三刀)★
- * 整块读落地后 ncu 说 long_scoreboard 仍 17~18 —— 每个 block 三次 __syncthreads 之后 32 个 warp **锁步**: 一起发块读、
- * 一起等 DRAM 900 周期、一起算 8 轮, SM 与 DRAM 轮流空转, 占用率再高也盖不住(大家停在同一拍上)。所以块的 3 个字在
- * 上一块开算之前就发出去(carry: 本行首块由上一行的末块顺手装好; 跨阶段时 gate 末行装 up 首行, 藏在码本搬运与同步后面)。
- * 12k 尺: gateup 7.06 → 6.72, down 4.51 → 3.76 ms/步(连同 down 4 行/warp + 码本搬运批发)。
- * ★同日两次加码都判负, 存档★(同尺, 逐字节同):
- *   ①"激活提前一轮装进寄存器": gateup 6.74 持平、down 4.07 退 —— 每轮那条激活 LDG 是 L1 命中(ncu 第五趟: L1 扇区命中 81%,
- *     未命中的 2.1 M 扇区里位流 0.83 M + 码本搬运 0.77 M 是必付的), 不是等待的来源; 多占 4 个寄存器顶到 64 硬上限反而伤。
- *   ②"两级队列, 提前两块(跨行跨阶段按块序列走)": gateup 7.40、down 3.90, 都退 —— 每块多 30~40 条簿记指令 + 6 个寄存器。
- *   ⇒ 这个核顶在 64 寄存器(1024 线程/block 的硬上限)上, **再加任何寄存器都是负的**; long_scoreboard 剩下的那份不是
- *   块读没提前够, 更像是 32 个 warp 同拍往 L1TEX 队列里塞 16 个波前/轮(码本查表 11.7 + 激活 4)的排队延迟。 */
-template <int NBIT>
-__device__ __forceinline__ static v41_vq_blk v41_vq_row_first_blk(const v41_vq_mat &m, uint32_t r) {
-    const uint32_t R = m.nidx_row >> 5;
-    return v41_vq_blk_load(v41_vq_row_ptr<NBIT>(m, r), (R < 8u ? R : 8u) * NBIT);
-}
-/* 一块的最多 8 轮: 第 k 轮 lane j 取索引 32(b+k)+j, 两条 shfl 拿字、funnelshift 取 12 位、查表乘加。乘加次序与旧核一字不差。
- * ★判负存档(2026-09-18)★ "轮数做模板参数变直线代码(1~7 轮尾块各一份实例 + switch)": 想让编译器把下一轮的 shfl/查表交错进
- * 本轮的乘加链。gateup 6.68 / down 3.92 —— 噪声内, 且 gateup 顶到 64 寄存器带 32 B spill。运行期轮数 + 每轮一条分支就够。 */
-template <int NBIT>
-__device__ __forceinline__ static void v41_vq_blk_rounds(const v41_vq_blk &cur, uint32_t rounds, uint32_t a, uint32_t sh, uint32_t imsk,
-                                                         const uint32_t *xb, const uint8_t *cbs, int cb_shared, float &acc) {
-    const uint32_t lane = threadIdx.x & 31u;
-    #pragma unroll
-    for (uint32_t k = 0; k < 8u; k++) {
-        if (k >= rounds) break;
-        const uint4 xa = *(const uint4 *)(xb + (size_t)(k * 32u + lane) * 4u);   /* 8 个 bf16 = 16 B, L1 命中 */
-        const uint32_t f = k * NBIT;                                     /* 本轮首字(编译期常量) */
-        const uint32_t lo_r = ((f & 31u) > 32u - NBIT) ? ((f + 31u - lane) >> 5) : (f >> 5);
-        const uint32_t hi_r = (((f + 1u) & 31u) > 32u - NBIT) ? ((f + 32u - lane) >> 5) : ((f + 1u) >> 5);
-        const uint32_t lo = __shfl_sync(0xffffffffu, v41_vq_sel3(lo_r, cur.w0, cur.w1, cur.w2), (int)(f + a));
-        const uint32_t hi = __shfl_sync(0xffffffffu, v41_vq_sel3(hi_r, cur.w0, cur.w1, cur.w2), (int)(f + a + 1u));
-        const uint32_t v = __funnelshift_r(lo, hi, sh) & imsk;
-        acc += v41_vq_dot8(v, xa, cbs, cb_shared);
-    }
-}
-/* 一 warp 算一行与激活 x 的点积: 索引 j 归 lane j%32, 一轮 32 个 lane 覆盖 32 个索引。
- * 返回 增益 × Σ(已 warp 规约)。NBIT = 码本号位宽(4096 词 = 12), 也是一轮的字数。
- * carry 进来是本行首块, 出去是 next 行的首块(next 为 NULL 就是空块); 每块的字在上一块开算之前就发出去。 */
-template <int NBIT>
-__device__ __forceinline__ static float v41_vq_row_dot(const v41_vq_mat &m, uint32_t r, const uint32_t *xs, const uint8_t *cbs, int cb_shared,
-                                                       v41_vq_blk *carry, const uint32_t *next) {
-    const uint32_t lane = threadIdx.x & 31u;
-    const uint32_t R = m.nidx_row >> 5;                                  /* 轮数: gateup 20, down 9 */
-    const uint32_t a = (lane * NBIT) >> 5, sh = (lane * NBIT) & 31u;    /* 本 lane 在一轮 NBIT 个字里的字号与位移 */
-    const uint32_t *row = v41_vq_row_ptr<NBIT>(m, r);
-    v41_vq_blk cur = *carry;
-    float acc = 0.f;
-    for (uint32_t b = 0; b < R; b += 8u) {
-        v41_vq_blk nxt;
-        if (b + 8u < R) { const uint32_t rem = R - b - 8u; nxt = v41_vq_blk_load(row + (size_t)(b + 8u) * NBIT, (rem < 8u ? rem : 8u) * NBIT); }
-        else if (next) nxt = v41_vq_blk_load(next, (R < 8u ? R : 8u) * NBIT);
-        else { nxt.w0 = 0u; nxt.w1 = 0u; nxt.w2 = 0u; }
-        /* ★判负存档(2026-09-18)★ "再往后一块用 prefetch.global.L2 先送进 L2(12 个 lane 各一扇区, 零寄存器)": 依据是带载 DRAM
-         * 一跳 1.2~1.4 µs(mem_ceiling ⑦; 空载 0.33), 怕寄存器提前一块(8 轮)盖不住。实测 gateup 6.93 / down 3.78, 噪声内 ⇒
-         * 位流的到达不是剩余等待的来源。 */
-        v41_vq_blk_rounds<NBIT>(cur, (R - b < 8u) ? R - b : 8u, a, sh, m.imsk, xs + (size_t)b * 32u * 4u, cbs, cb_shared, acc);
-        cur = nxt;
-    }
-    *carry = cur;
-    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
-    /* 行增益在行尾才取(试过提到行首: 多占寄存器, gateup 6.72 → 7.11, 退回) */
-    __half gh; memcpy(&gh, m.gr + (size_t)r * 2u, 2);
-    return acc * __half2float(gh) * (m.gov ? m.gov[r] : 1.0f);
-}
+/* 载荷解析 + 一行点积(v41_vq_open / v41_vq_dot8 / v41_vq_row_dot 整族)住 cuda_vq_row.inc.cu —— 拆出去为守 500 行,
+ * 也因为 v3 布局(层码本 + E4M3 + 13 位位平面)只动那一族。聚合根按序 include: 本片必须在它之后。 */
+
 /* ★2026-09-15 single.md S2 判负存档: "码本条目改 20 B 跨距消 bank conflict"★
  * 假设: 条目 16 B = 4 个 bank, 32 个 lane 拿随机码本号 v, 地址 v*16 落在 bank 组 (v*4)%32 只有 8 个值
  * ⇒ 平均 4 路冲突。改 20 B(5 bank, gcd(5,32)=1)让它铺满 32 个 bank。
@@ -241,14 +97,24 @@ __device__ __forceinline__ static uint16_t v41_vq_swiglu(float gi, float ui, flo
 /* ★寄存器是这个核的硬墙★: 1024 线程/block ⇒ 每线程最多 64 个。没写 __launch_bounds__ —— 写了 ptxas 会把 64 填满,
  * 同一份代码 gateup 6.72 → 7.11 ms/步; 让它自然落在 56/48 更快。改动后看 cuobjdump --dump-resource-usage: REG 超 64 就装不下 SM,
  * launch 直接报 too many resources(第四刀初版 72 个就撞过)。 */
-template <int NBIT>
+/* ★验证批(n≥2)按专家排序发 block(2026-09-19)★: 一个 block 仍管一个 (token, 专家) 对、内层一个字不动(每对累加序与 n=1 逐位同 ⇒ 同轨),
+ * 只改"第几个 block 算哪一对": order[] 把同一专家的对排到相邻的 blockIdx.y。块按 blockIdx 顺序派发, 原来同一专家的两个对隔着 ~36 MB 别的
+ * 专家流量, 第二次读早被 24 MB 的 L2 挤掉 ⇒ n 个 token 读 n 份 DRAM; 相邻则第二个对全是 L2 命中, DRAM 字节降到唯一专家份(09-17 实测
+ * n=1..5 唯一专家 6/9.96/13.26/17.38/21.71 ⇒ n=3 省 26%)。SORTED 是模板参数: 09-16 实撞, 同一实例里加运行期 `order ? … : …` 让 n=1 慢 21%。 */
+/* np / uniq_only(2026-09-22, 只在 SORTED=1 实例里用): uniq_only≠0 时只算"本批里只被一个 token 选中"的专家那些对 —— 同一专家被
+ * 多个 token 选中的那几段交给分组核(cuda_vq_group.inc.cu)。判据从 order 的左右邻居读(同专家的对在 order 里相邻)。SORTED=0(n=1)
+ * 那支这两个参数编译期就死了, 代码一个字不变。 */
+template <int NBIT, int V3, int EXT, int SORTED>
 __global__ static void v41_vq_gateup_kernel(uint16_t *h, const uint8_t *blob, const int32_t *sel, const uint32_t *x,
-                                            uint32_t IN, uint32_t MID, uint32_t K, float clamp, uint32_t cb_bytes) {
+                                            uint32_t IN, uint32_t MID, uint32_t K, float clamp, uint32_t cb_bytes, const int32_t *order,
+                                            uint32_t np, uint32_t uniq_only) {
     extern __shared__ __align__(16) uint8_t vqsh[];
-    const uint32_t pair = blockIdx.y, t = pair / K, rows = cb_bytes ? V41_VQ_GU_ROWS : 8u;
+    const uint32_t pair = SORTED ? (uint32_t)order[blockIdx.y] : blockIdx.y, t = pair / K, rows = cb_bytes ? V41_VQ_GU_ROWS : 8u;
     const int32_t e = sel[pair];
     if (e < 0) return;
-    const v41_vq_mat mg = v41_vq_open(blob, e, 0, MID, IN, NULL), mu = v41_vq_open(blob, e, 1, MID, IN, NULL);
+    if (SORTED && uniq_only &&
+        ((blockIdx.y > 0u && sel[order[blockIdx.y - 1u]] == e) || (blockIdx.y + 1u < np && sel[order[blockIdx.y + 1u]] == e))) return;
+    const v41_vq_mat mg = v41_vq_open<V3>(blob, e, 0, MID, IN, NULL), mu = v41_vq_open<V3>(blob, e, 1, MID, IN, NULL);
     if (!mg.ok || !mu.ok) return;
     const uint32_t r0 = blockIdx.x * rows + (threadIdx.x >> 5), nit = cb_bytes ? V41_VQ_ITERS_GU : 1u;
     const uint32_t *xs = x + (uint64_t)t * (IN / 2u);   /* 两个 bf16 一个字 */
@@ -260,17 +126,20 @@ __global__ static void v41_vq_gateup_kernel(uint16_t *h, const uint8_t *blob, co
          * 全部行, 同步后把同一块 shared 覆盖成 up 的码本再算 u: 峰值只要一本的量。
          * ★循环里不能 return★: 后面还有 __syncthreads, 少一个 warp 就死锁, 越界的行只跳过计算。
          * gate 的结果以 bf16 暂存在 h 本行的位置(它本来就在 bf16 格点上, 存取无损), 同一个 lane 写、同一个 lane 读回。 */
-        if (mg.nc * 16u != cb_bytes || mu.nc * 16u != cb_bytes) return;
-        v41_vq_blk carry; carry.w0 = 0u; carry.w1 = 0u; carry.w2 = 0u;
-        if (r0 < MID) carry = v41_vq_row_first_blk<NBIT>(mg, r0);   /* 首块先发, 藏在码本搬运后面 */
+        constexpr uint32_t CW = V3 ? 8u : 16u;   /* 一个码字的字节数: v3 是 8 个 E4M3, v2 是 8 个 f16 */
+        if (mg.nc * CW != cb_bytes || mu.nc * CW != cb_bytes) return;
+        v41_vq_blk carry; carry.w0 = 0u; carry.w1 = 0u; carry.w2 = 0u; carry.ex = 0u;
+        if (r0 < MID) carry = v41_vq_row_first_blk<NBIT, V3, EXT>(mg, r0);   /* 首块先发, 藏在码本搬运后面 */
         v41_vq_cb_to_shared(vqsh, mg.cb, cb_bytes);
         __syncthreads();
         for (uint32_t i = 0; i < nit; i++) {
             const uint32_t r = r0 + i * V41_VQ_WARPS;
             if (r >= MID) break;
             const uint32_t rn = r + V41_VQ_WARPS;   /* gate 末行时预装 up 的首行(它在码本换本之后才算) */
-            const uint32_t *next = (i + 1u < nit && rn < MID) ? v41_vq_row_ptr<NBIT>(mg, rn) : v41_vq_row_ptr<NBIT>(mu, r0);
-            const float gv = v41_bf16r(v41_vq_row_dot<NBIT>(mg, r, xs, vqsh, 1, &carry, next));
+            const int own = (i + 1u < nit && rn < MID);   /* 下一块是本矩阵的下一行, 还是换本码本之后 up 的首行 */
+            const uint32_t *next = own ? v41_vq_row_ptr<NBIT, V3>(mg, rn) : v41_vq_row_ptr<NBIT, V3>(mu, r0);
+            const uint32_t *nextex = EXT ? (own ? v41_vq_ext_ptr(mg, rn) : v41_vq_ext_ptr(mu, r0)) : NULL;
+            const float gv = v41_bf16r(v41_vq_row_dot<NBIT, V3, EXT>(mg, r, xs, vqsh, 1, &carry, next, nextex));
             if (lead) hp[r] = (uint16_t)(__float_as_uint(gv) >> 16);
         }
         __syncthreads();                            /* 等所有 warp 读完 gate 码本, 才能覆盖它 */
@@ -280,36 +149,41 @@ __global__ static void v41_vq_gateup_kernel(uint16_t *h, const uint8_t *blob, co
             const uint32_t r = r0 + i * V41_VQ_WARPS;
             if (r >= MID) break;
             const uint32_t rn = r + V41_VQ_WARPS;
-            const uint32_t *next = (i + 1u < nit && rn < MID) ? v41_vq_row_ptr<NBIT>(mu, rn) : NULL;
-            const float ui = v41_bf16r(v41_vq_row_dot<NBIT>(mu, r, xs, vqsh, 1, &carry, next));
+            const int own = (i + 1u < nit && rn < MID);
+            const uint32_t *next = own ? v41_vq_row_ptr<NBIT, V3>(mu, rn) : NULL;
+            const float ui = v41_bf16r(v41_vq_row_dot<NBIT, V3, EXT>(mu, r, xs, vqsh, 1, &carry, next, EXT && own ? v41_vq_ext_ptr(mu, rn) : NULL));
             if (lead) hp[r] = v41_vq_swiglu(__uint_as_float((uint32_t)hp[r] << 16), ui, clamp);
         }
     } else if (r0 < MID) {
-        v41_vq_blk carry = v41_vq_row_first_blk<NBIT>(mg, r0);
-        const float gv = v41_bf16r(v41_vq_row_dot<NBIT>(mg, r0, xs, mg.cb, 0, &carry, v41_vq_row_ptr<NBIT>(mu, r0)));
-        const float ui = v41_bf16r(v41_vq_row_dot<NBIT>(mu, r0, xs, mu.cb, 0, &carry, NULL));
+        v41_vq_blk carry = v41_vq_row_first_blk<NBIT, V3, EXT>(mg, r0);
+        const float gv = v41_bf16r(v41_vq_row_dot<NBIT, V3, EXT>(mg, r0, xs, mg.cb, 0, &carry,
+                                   v41_vq_row_ptr<NBIT, V3>(mu, r0), EXT ? v41_vq_ext_ptr(mu, r0) : NULL));
+        const float ui = v41_bf16r(v41_vq_row_dot<NBIT, V3, EXT>(mu, r0, xs, mu.cb, 0, &carry, NULL, NULL));
         if (lead) hp[r0] = v41_vq_swiglu(gv, ui, clamp);
     }
 }
 /* down: partial[pair][OUT] = bf16(W2·h) */
-template <int NBIT>
+template <int NBIT, int V3, int EXT, int SORTED>
 __global__ static void v41_vq_down_kernel(float *partial, const uint8_t *blob, const int32_t *sel, const uint32_t *h,
-                                          uint32_t MID, uint32_t OUT, uint32_t K, uint32_t cb_bytes, const float *gr) {
+                                          uint32_t MID, uint32_t OUT, uint32_t K, uint32_t cb_bytes, const float *gr, const int32_t *order,
+                                          uint32_t np, uint32_t uniq_only) {
     extern __shared__ __align__(16) uint8_t vqsh[];
-    const uint32_t pair = blockIdx.y, rows = cb_bytes ? V41_VQ_DN_ROWS : 8u;
+    const uint32_t pair = SORTED ? (uint32_t)order[blockIdx.y] : blockIdx.y, rows = cb_bytes ? V41_VQ_DN_ROWS : 8u;
     const int32_t e = sel[pair];
     if (e < 0) return;
-    const v41_vq_mat md = v41_vq_open(blob, e, 2, OUT, MID, gr ? gr + (size_t)e * OUT : NULL);
+    if (SORTED && uniq_only &&
+        ((blockIdx.y > 0u && sel[order[blockIdx.y - 1u]] == e) || (blockIdx.y + 1u < np && sel[order[blockIdx.y + 1u]] == e))) return;
+    const v41_vq_mat md = v41_vq_open<V3>(blob, e, 2, OUT, MID, gr ? gr + (size_t)e * OUT : NULL);
     const uint32_t r0 = blockIdx.x * rows + (threadIdx.x >> 5), nit = cb_bytes ? V41_VQ_ITERS_DN : 1u;
     if (!md.ok) {   /* 载荷不对: 这 block 负责的行全写 0(不能只写一行, 下游 reduce 会读到脏值) */
         for (uint32_t i = 0; i < nit; i++) { const uint32_t r = r0 + i * V41_VQ_WARPS; if (r < OUT && (threadIdx.x & 31u) == 0) partial[(uint64_t)pair * OUT + r] = 0.f; }
         return;
     }
     const uint8_t *cbd = md.cb;
-    v41_vq_blk carry; carry.w0 = 0u; carry.w1 = 0u; carry.w2 = 0u;
-    if (r0 < OUT) carry = v41_vq_row_first_blk<NBIT>(md, r0);       /* 首块先发, 藏在码本搬运后面 */
+    v41_vq_blk carry; carry.w0 = 0u; carry.w1 = 0u; carry.w2 = 0u; carry.ex = 0u;
+    if (r0 < OUT) carry = v41_vq_row_first_blk<NBIT, V3, EXT>(md, r0);       /* 首块先发, 藏在码本搬运后面 */
     if (cb_bytes) {
-        if (md.nc * 16u != cb_bytes) return;
+        if (md.nc * (V3 ? 8u : 16u) != cb_bytes) return;
         v41_vq_cb_to_shared(vqsh, md.cb, cb_bytes);
         __syncthreads();
         cbd = vqsh;
@@ -319,8 +193,10 @@ __global__ static void v41_vq_down_kernel(float *partial, const uint8_t *blob, c
         const uint32_t r = r0 + i * V41_VQ_WARPS;
         if (r >= OUT) break;
         const uint32_t rn = r + V41_VQ_WARPS;
-        const uint32_t *next = (i + 1u < nit && rn < OUT) ? v41_vq_row_ptr<NBIT>(md, rn) : NULL;
-        const float y = v41_bf16r(v41_vq_row_dot<NBIT>(md, r, hs, cbd, cb_bytes != 0, &carry, next));
+        const int own = (i + 1u < nit && rn < OUT);
+        const uint32_t *next = own ? v41_vq_row_ptr<NBIT, V3>(md, rn) : NULL;
+        const float y = v41_bf16r(v41_vq_row_dot<NBIT, V3, EXT>(md, r, hs, cbd, cb_bytes != 0, &carry, next,
+                                  EXT && own ? v41_vq_ext_ptr(md, rn) : NULL));
         if ((threadIdx.x & 31u) == 0) partial[(uint64_t)pair * OUT + r] = y;
     }
     (void)K;
@@ -333,13 +209,29 @@ __global__ static void v41_vq_reduce_kernel(float *out, const float *partial, co
     for (uint32_t k = 0; k < K; k++) a += w[(uint64_t)t * K + k] * partial[((uint64_t)t * K + k) * OUT + o];
     out[(uint64_t)t * OUT + o] = a;
 }
-static v41_scratch g_v41_vq_h, g_v41_vq_part, g_v41_vq_xb, g_v41_vq_ogc;
+/* 验证批的 block 顺序表: order[q] = 第 q 个 block 算的对号, 按 (专家号, 对号) 升序; 一 block np(≤48) 线程各数"排我前面的有几个"。 */
+__global__ static void v41_vq_order_kernel(int32_t *order, const int32_t *sel, uint32_t np) {
+    const uint32_t p = threadIdx.x;
+    if (p >= np) return;
+    const int32_t e = sel[p];
+    uint32_t rank = 0;
+    for (uint32_t q = 0; q < np; q++) { const int32_t eq = sel[q]; if (eq < e || (eq == e && q < p)) rank++; }
+    order[rank] = (int32_t)p;
+}
+static v41_scratch g_v41_vq_h, g_v41_vq_part, g_v41_vq_xb, g_v41_vq_ogc, g_v41_vq_ord;
+/* ★多 token 分组核(2026-09-22, cuda_vq_group.inc.cu, 本 TU 后面的分片定义)★: n≥2 且码本在 shared 时, 同一专家被 ≥2 个 token 选中的
+ * 那几段交给它(一 block 管一个专家 × m 个 token, 码字只解一次, 每 token 一次同式乘加), 只被一个 token 选中的对仍走下面的 SORTED 实例
+ * (uniq_only=1)。stage 0 = gateup, 1 = down(down 必须在两条路的 gateup 都发完之后)。返回 1 = 发完; 0 = 不适用(全走逐对核); -1 = 启动失败。
+ * --no-vq-group(g_ds4_v41_vq_group=0)钉回全逐对, 给同一二进制做 A/B。 */
+template <int NBIT, int V3, int EXT>
+static int v41_vq_grp_launch(int stage, uint32_t n_tok, uint16_t *h, float *part, const uint8_t *blob, const int32_t *sel, const uint32_t *xb,
+                             uint32_t IN, uint32_t MID, uint32_t OUT, uint32_t K, float clamp, uint32_t cbb, const float *gr,
+                             const int32_t *ord, uint32_t np);
+extern int g_ds4_v41_vq_group;
 /* ★两个核分开判定★(2026-09-14 实撞): 码本 4096×16 B = 64 KB/本。gateup 要 gate+up 两本 = 128 KB,
  * 超过 GB10 每 block 的动态 shared 上限; down 只要一本 64 KB, 本来放得下。原先一个 ok 变量把两个核
- * 绑在一起, gateup 申请失败就把 down 一起打回全局 gather —— 解码实测只有 1.60 t/s(prefill 45 t/s 正常)。
- * 0 未判定, 1 可用, -1 不可用。 */
-static int g_v41_vq_sh_gateup = 0, g_v41_vq_sh_down = 0;
-template <int NBIT>
+ * 绑在一起, gateup 申请失败就把 down 一起打回全局 gather —— 解码实测只有 1.60 t/s(prefill 45 t/s 正常)。 */
+template <int NBIT, int V3, int EXT>
 static int v41_vq_fused_moe_n(float *out, const uint8_t *blob, uint32_t IN, uint32_t MID, uint32_t OUT,
                               const int32_t *sel, const float *w, uint32_t K, float clamp, const float *x, uint32_t n_tok, uint32_t nc,
                               const float *gr) {
@@ -372,8 +264,19 @@ static int v41_vq_fused_moe_n(float *out, const uint8_t *blob, uint32_t IN, uint
             v41_f16range_probe(x, NULL, nx, 0, "激活(x)");   /* mtp-2 §5.3: 定 f16 还是 TF32 */
         }
     }
-    const uint32_t cbb = nc * 16u;
-    if (!g_v41_vq_sh_gateup) {   /* 一次性, 两个核各问各的: gateup 要两本(gate+up), down 只要一本 */
+    const uint32_t cbb = nc * (V3 ? 8u : 16u);   /* v3 码本每词 8 个 E4M3 ⇒ nc8192 也只 64 KB, 与今天 nc4096 f16 同大 */
+    /* ★opt-in 的量要按"这个核实例 + 这一层的码本"记, 不能只记"判定过没有"★(2026-09-22 实撞, 投机路挂了一整天):
+     * cudaFuncSetAttribute 批的是**某一个核函数能要多少动态 shared**, 批多少下次就只能用多少。v3 底座
+     * (vq8sh14)两档码本并存 —— 浅 14 层 13 位是 8192 词(cbb 64 KB), 深层是 4096 词(32 KB) —— 原来这里
+     * 是个文件级标志 `if (!g_v41_vq_sh_gateup)` 只跑一次: 谁先进来按谁的量批, 另一档启动时 shared 超过
+     * 已批的量, cudaLaunch 直接回 invalid argument, 前向整个失败。
+     * 症状为什么难认: 纯解码(n=1)走的是专家融合核, 根本不进这个函数, 只有投机验证批(n≥2)走这里 ⇒
+     * 表面上是"投机一开就崩", 报错还挂在 gateup 头上, 与码本大小看不出关系。
+     * 两件事一起修: ①static 局部变量在函数模板里是**每个实例一份**, 正好对上"每个 (NBIT,V3,EXT) 是不同的
+     * 核函数, 各批各的"; ②判据从"判定过没有"换成"已批的量够不够这一层用", 不够就按新的量再批一次。
+     * 批不上去(超设备上限)时 s_*_optin 不动 ⇒ 这一层自动回全局 gather, 而已经批好的小码本层不受牵连。 */
+    static uint32_t s_gu_optin = 0u, s_dn_optin = 0u;   /* 这个实例已批到的动态 shared 字节; 0 = 还没批过 */
+    if (s_gu_optin < cbb || s_dn_optin < cbb) {   /* 两个核各问各的: gateup 要两本(gate+up), down 只要一本 */
         int cap = 0; (void)cudaDeviceGetAttribute(&cap, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
         /* ★占用率是被谁卡住的, 要有实数才能判★(2026-09-16): 一个 SM 同时挂几个 block, 由"线程槽 /
          * shared / 寄存器"里最紧的那个定。per-block 的 shared 上限(cap)只说这一个 block 能要多少,
@@ -383,15 +286,17 @@ static int v41_vq_fused_moe_n(float *out, const uint8_t *blob, uint32_t IN, uint
         (void)cudaDeviceGetAttribute(&thr_sm, cudaDevAttrMaxThreadsPerMultiProcessor, 0);
         (void)cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, 0);
         (void)cudaDeviceGetAttribute(&regs_sm, cudaDevAttrMaxRegistersPerMultiprocessor, 0);
-        const bool og = cudaFuncSetAttribute(v41_vq_gateup_kernel<NBIT>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)cbb) == cudaSuccess;
-        const bool od = cudaFuncSetAttribute(v41_vq_down_kernel<NBIT>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)cbb) == cudaSuccess;
+        const bool og = cudaFuncSetAttribute(v41_vq_gateup_kernel<NBIT, V3, EXT, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)cbb) == cudaSuccess &&
+                        cudaFuncSetAttribute(v41_vq_gateup_kernel<NBIT, V3, EXT, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)cbb) == cudaSuccess;
+        const bool od = cudaFuncSetAttribute(v41_vq_down_kernel<NBIT, V3, EXT, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)cbb) == cudaSuccess &&
+                        cudaFuncSetAttribute(v41_vq_down_kernel<NBIT, V3, EXT, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)cbb) == cudaSuccess;
         /* ★占用率必须在开完 opt-in shared **之后**问★: 在 SetAttribute 之前调用, API 按默认 48 KB
          * 的限额算, 会判"一个都挂不上"(返回 0) —— 第一版就这么打出个 0%, 差点据此下结论。 */
         cudaFuncAttributes fa; memset(&fa, 0, sizeof fa);
-        (void)cudaFuncGetAttributes(&fa, v41_vq_gateup_kernel<NBIT>);
+        (void)cudaFuncGetAttributes(&fa, v41_vq_gateup_kernel<NBIT, V3, EXT, 0>);
         int blocks_sm = 0;
         const int thr_blk = (int)(V41_VQ_WARPS * 32u);
-        (void)cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_sm, v41_vq_gateup_kernel<NBIT>, thr_blk, (size_t)cbb);
+        (void)cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_sm, v41_vq_gateup_kernel<NBIT, V3, EXT, 0>, thr_blk, (size_t)cbb);
         fprintf(stderr, "ds4: [v41] 设备: %d SM / 每 SM shared %d KB / 每 SM 线程 %d / 每 SM 寄存器 %d\n"
                         "ds4: [v41] VQ gateup 核: %d 线程/block, 每线程 %d 寄存器, 动态 shared %u KB"
                         " ⇒ 每 SM 挂 %d 个 block = %d 线程, **占用率 %.0f%%**\n"
@@ -401,12 +306,12 @@ static int v41_vq_fused_moe_n(float *out, const uint8_t *blob, uint32_t IN, uint
                 cbb ? sh_sm / (int)cbb : 0,
                 fa.numRegs ? regs_sm / (fa.numRegs * thr_blk) : 0, thr_sm / thr_blk);
         (void)cudaGetLastError();
-        g_v41_vq_sh_gateup = og ? 1 : -1;
-        g_v41_vq_sh_down = od ? 1 : -1;
-        fprintf(stderr, "ds4: [v41] VQ 码本 %u×16 B(%u KB/本); 设备每 block 动态 shared 上限 %d KB ⇒ gate+up %s / down %s\n",
-                nc, cbb >> 10, cap >> 10, og ? "进 shared(一块用两遍)" : "回全局 gather", od ? "进 shared" : "回全局 gather");
+        if (og) s_gu_optin = cbb;   /* 批不上去就不动, 这一层自动回全局 gather(下一层码本小的照样走 shared) */
+        if (od) s_dn_optin = cbb;
+        fprintf(stderr, "ds4: [v41] VQ 码本 %u×16 B(%u KB/本, NBIT %d); 设备每 block 动态 shared 上限 %d KB ⇒ gate+up %s / down %s\n",
+                nc, cbb >> 10, NBIT, cap >> 10, og ? "进 shared(一块用两遍)" : "回全局 gather", od ? "进 shared" : "回全局 gather");
     }
-    const bool shg = g_v41_vq_sh_gateup == 1, shd = g_v41_vq_sh_down == 1;
+    const bool shg = cbb <= s_gu_optin, shd = cbb <= s_dn_optin;
     /* ★2026-09-16 判负存档: "多 token 小批按专家去重, 让重复的专家权重只读一份"(mtp.md M3)★
      * 依据看着很硬: 投机验证一次 4 行, 实测 4 行的 top-8 里唯一专家只有 **59%**(--v41-prof 的
      * [moe-uniq] 行), 四成的专家读是纯重复; 而专家是解码的大头。写了一版"一 block 管一个专家,
@@ -425,15 +330,53 @@ static int v41_vq_fused_moe_n(float *out, const uint8_t *blob, uint32_t IN, uint
      * ★不能写成 rows×32★: shared 版 rows 已是 256, 那会要 8192 个线程, 超过每 block 1024 的上限。 */
     const uint32_t rg = shg ? V41_VQ_GU_ROWS : 8u, rd = shd ? V41_VQ_DN_ROWS : 8u;
     const uint32_t tg = shg ? V41_VQ_WARPS * 32u : 8u * 32u, td = shd ? V41_VQ_WARPS * 32u : 8u * 32u;
-    v41_vq_gateup_kernel<NBIT><<<dim3((MID + rg - 1u) / rg, (unsigned)np), tg, shg ? cbb : 0u, g_cur_stream>>>(
-        h, blob, sel, (const uint32_t *)xb, IN, MID, K, clamp, shg ? cbb : 0u);
-    if (!cuda_ok(cudaGetLastError(), "v41 vq gateup")) return 0;
+    /* n≥2(投机验证批): 先出 block 顺序表, 两个核走 SORTED=1 的实例; n=1 走 SORTED=0, 与改前逐字相同(见 gateup 核头) */
+    int32_t *ord = NULL;
+    if (n_tok >= 2u) {
+        ord = (int32_t *)v41_grow(&g_v41_vq_ord, np * 4, "v41 vq order");
+        if (!ord) return 0;
+        v41_vq_order_kernel<<<1, (unsigned)np, 0, g_cur_stream>>>(ord, sel, (uint32_t)np);
+        if (!cuda_ok(cudaGetLastError(), "v41 vq order")) return 0;
+    }
+    /* ★发之前先把上游没检查的错误捡走★(2026-09-22 实撞): CUDA 的错误是粘的 —— 别的模块哪一发核没检查,
+     * 下面这句 cudaGetLastError 就会把它算到 gateup 头上。这次投机路挂了, 报的是 "vq gateup failed",
+     * 真凶在哪根本不知道, 白查了一轮。分开打, 就能一眼看出是"上游留的"还是"这一发自己的"。 */
+    {
+        const cudaError_t pre = cudaGetLastError();
+        if (pre != cudaSuccess)
+            fprintf(stderr, "ds4: ★[v41] 进 vq gateup 之前就有未清的 CUDA 错误: %s —— 真凶是上游某一发没检查的核★\n",
+                    cudaGetErrorString(pre));
+    }
+    int grp = 0;   /* 1 = 多 token 的组走分组核, 逐对核只算单成员的对(两条路写不相交的 pair 槽) */
+    if (ord && shg && shd && g_ds4_v41_vq_group) {   /* 分组核: 两本码本都进得了 shared 才走(它没有全局 gather 的形态) */
+        grp = v41_vq_grp_launch<NBIT, V3, EXT>(0, n_tok, h, part, blob, sel, (const uint32_t *)xb, IN, MID, OUT, K, clamp, cbb, gr, ord, (uint32_t)np);
+        if (grp < 0) return 0;
+    }
+    if (ord) v41_vq_gateup_kernel<NBIT, V3, EXT, 1><<<dim3((MID + rg - 1u) / rg, (unsigned)np), tg, shg ? cbb : 0u, g_cur_stream>>>(
+        h, blob, sel, (const uint32_t *)xb, IN, MID, K, clamp, shg ? cbb : 0u, ord, (uint32_t)np, grp > 0 ? 1u : 0u);
+    else v41_vq_gateup_kernel<NBIT, V3, EXT, 0><<<dim3((MID + rg - 1u) / rg, (unsigned)np), tg, shg ? cbb : 0u, g_cur_stream>>>(
+        h, blob, sel, (const uint32_t *)xb, IN, MID, K, clamp, shg ? cbb : 0u, NULL, 0u, 0u);
+    if (!cuda_ok(cudaGetLastError(), "v41 vq gateup")) {
+        /* ★挂了必须连启动参数一起打★: "invalid argument" 只说"某个参数不对", 不说是哪个。把
+         * grid/block/动态 shared 与模板实例(NBIT/V3/EXT/SORTED)一起打出来, 对着设备上限就能直接判:
+         * shared 超过这个实例 opt-in 过的量 / grid 某一维是 0 / 线程数超 1024, 三者都一眼可见。
+         * ★shared 那一项尤其要盯★: SetAttribute 只在第一次进这个函数时做一次, 而 cbb 是**逐层**算的
+         * (码本大小 nc 随层变) —— 后面某层 cbb 比第一层大, 就是这个报错。 */
+        fprintf(stderr, "ds4: [v41] gateup 启动参数: grid(%u,%u) block %u 动态 shared %u B; "
+                        "NBIT %d V3 %d EXT %d SORTED %d; n_tok %u K %u np %llu IN %u MID %u nc %u cbb %u B 已批 %u B\n",
+                (MID + rg - 1u) / rg, (unsigned)np, tg, shg ? cbb : 0u,
+                NBIT, V3, EXT, ord ? 1 : 0, n_tok, K, (unsigned long long)np, IN, MID, nc, cbb, s_gu_optin);
+        return 0;
+    }
     {   /* h(swiglu 出口, bf16 格点)也要过 f16 范围: 它是 down 那一发 B 片的来源 */
         extern int g_ds4_v41_prof;
         if (g_ds4_v41_prof) v41_f16range_probe(NULL, h, np * MID, 1, "中间量(h)");
     }
-    v41_vq_down_kernel<NBIT><<<dim3((OUT + rd - 1u) / rd, (unsigned)np), td, shd ? cbb : 0u, g_cur_stream>>>(
-        part, blob, sel, (const uint32_t *)h, MID, OUT, K, shd ? cbb : 0u, gr);
+    if (grp > 0 && v41_vq_grp_launch<NBIT, V3, EXT>(1, n_tok, h, part, blob, sel, (const uint32_t *)xb, IN, MID, OUT, K, clamp, cbb, gr, ord, (uint32_t)np) < 0) return 0;
+    if (ord) v41_vq_down_kernel<NBIT, V3, EXT, 1><<<dim3((OUT + rd - 1u) / rd, (unsigned)np), td, shd ? cbb : 0u, g_cur_stream>>>(
+        part, blob, sel, (const uint32_t *)h, MID, OUT, K, shd ? cbb : 0u, gr, ord, (uint32_t)np, grp > 0 ? 1u : 0u);
+    else v41_vq_down_kernel<NBIT, V3, EXT, 0><<<dim3((OUT + rd - 1u) / rd, (unsigned)np), td, shd ? cbb : 0u, g_cur_stream>>>(
+        part, blob, sel, (const uint32_t *)h, MID, OUT, K, shd ? cbb : 0u, gr, NULL, 0u, 0u);
     if (!cuda_ok(cudaGetLastError(), "v41 vq down")) return 0;
     if (!out) return 1;   /* 调用方稍后用 ds4_gpu_v41_moe_tail_tensor 把归约与 shared 专家的相加一发做完 */
     v41_vq_reduce_kernel<<<dim3((OUT + 255u) / 256u, n_tok), 256, 0, g_cur_stream>>>(out, part, w, K, OUT);
@@ -454,19 +397,4 @@ int ds4_gpu_v41_moe_tail_tensor(ds4_gpu_tensor *y, const ds4_gpu_tensor *so, con
     v41_vq_tail_kernel<<<dim3((out_dim + 255u) / 256u, n_tok), 256, 0, g_cur_stream>>>(
         (float *)y->ptr, (const float *)g_v41_vq_part.p, (const float *)weights->ptr, (const float *)so->ptr, n_used, out_dim);
     return cuda_ok(cudaGetLastError(), "v41 moe tail");
-}
-/* 按码本词数分发: 位宽 = ⌈log2(词数)⌉ 决定一轮的字数, 核按它实例化(现役配方 vq8x4096 ⇒ 12 位)。
- * 一轮 = 32 个索引 ⇒ 行的索引数(cols/8)必须是 32 的倍数(IN/MID 是 256 的倍数); 不满足就硬错, 不留慢路。 */
-static int v41_vq_fused_moe(float *out, const uint8_t *blob, uint32_t IN, uint32_t MID, uint32_t OUT,
-                            const int32_t *sel, const float *w, uint32_t K, float clamp, const float *x, uint32_t n_tok, uint32_t nc,
-                            const float *gr) {
-    uint32_t nbit = 0; while ((1u << nbit) < nc) nbit++;
-    /* 一轮 32 个索引 ⇒ IN/MID 是 256 的倍数(V4.1 Flash: 5120 → 20 轮, 2304 → 9 轮); 尾块几轮都行 */
-    if ((IN % 256u) || (MID % 256u)) {
-        fprintf(stderr, "ds4: [v41] VQ 解码核要求 IN/MID 是 256 的倍数(一轮 32 个索引), 现 %u/%u\n", IN, MID);
-        return 0;
-    }
-    if (nbit == 12u) return v41_vq_fused_moe_n<12>(out, blob, IN, MID, OUT, sel, w, K, clamp, x, n_tok, nc, gr);
-    fprintf(stderr, "ds4: [v41] VQ 码本 %u 词(%u 位)没有对应的解码核实例\n", nc, nbit);
-    return 0;
 }

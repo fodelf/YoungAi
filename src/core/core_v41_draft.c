@@ -36,6 +36,11 @@ static bool v41_small_matmul(const ds4_model *m, ds4_gpu_tensor *out, const ds4_
 static bool v41_draft_exp_off(ds4_engine *e, ds4_v41_draft *dr) {
     const ds4_v41_cfg *v = &g_ds4_v41;
     for (uint32_t T = 0; T < v->mtp_towers; T++) {
+        /* 盘上是 VQ blob 的塔(100 GB 配方): 不建偏移表, 把 blob 递给状态, MoE 走主干的融合核(core_v41_forward.c v41_moe) */
+        if (e->weights.mtp.exps_vq[T]) {
+            dr->st.tower_exps_vq[T] = e->weights.mtp.exps_vq[T]; dr->exp_off[T] = NULL; dr->st.tower_exp_off[T] = NULL;
+            continue;
+        }
         uint64_t *off = xmalloc((size_t)3u * v->mtp_experts * 8u);
         for (uint32_t i = 0; i < v->mtp_experts; i++) {
             const ds4_tensor *g = e->weights.mtp.exp_gate[T][i], *u = e->weights.mtp.exp_up[T][i], *d = e->weights.mtp.exp_down[T][i];
@@ -101,6 +106,7 @@ static void v41_draft_byte_report(ds4_engine *e, const ds4_v41_draft *dr) {
             t->attn_output_b, t->hc_ffn_fn, t->hc_ffn_scale, t->hc_ffn_base, t->ffn_norm, t->ffn_gate_inp,
             t->ffn_exp_probs_b, t->ffn_gate_shexp, t->ffn_up_shexp, t->ffn_down_shexp };
         for (size_t i = 0; i < sizeof(d) / sizeof(d[0]); i++) if (d[i]) dense += d[i]->bytes;
+        if (w->mtp.exps_vq[T]) { exp_all += w->mtp.exps_vq[T]->bytes; continue; }   /* VQ blob 形态: 一塔一张 */
         for (uint32_t x = 0; x < v->mtp_experts; x++) {
             const ds4_tensor *g = w->mtp.exp_gate[T][x], *u = w->mtp.exp_up[T][x], *dn = w->mtp.exp_down[T][x];
             if (g) exp_all += g->bytes; if (u) exp_all += u->bytes; if (dn) exp_all += dn->bytes;
@@ -122,6 +128,8 @@ bool v41_draft_alloc(ds4_engine *e, ds4_v41_draft *dr) {
     memset(dr, 0, sizeof *dr);
     if (!v->mtp_towers || !v->mtp_block || !v->n_mtp_target) return false;   /* 元数据不全 = 投机路不武装 */
     if (!e->weights.mtp.main_proj || !e->weights.mtp.markov_embd || !e->weights.mtp.confidence) return false;
+    /* 三塔专家两种盘上形态都能武装(2026-09-20): 逐专家 fp4x32 走 cuda_v41_draft.inc.cu 的 dense MoE 核, VQ blob 走主干的
+     * 解码即乘核(v41_draft_exp_off 按形态分流)。09-19~20 之间 blob 形态曾被这里拦成"不武装"(当时草稿器只有逐专家那条核)。 */
     const uint32_t E = DS4_N_EMBD, HC = DS4_N_HC, HD = DS4_N_HEAD_DIM, NH = DS4_N_HEAD, Q = DS4_N_LORA_Q, SWA = DS4_N_SWA;
     const uint32_t FF = DS4_N_FF_EXP, R = v->mtp_markov_rank;
     const uint32_t B = v->mtp_block, cap = B + 1u;   /* +1: 验证批最多 1+block 行, main_x 也按它分配 */
@@ -152,7 +160,10 @@ bool v41_draft_alloc(ds4_engine *e, ds4_v41_draft *dr) {
     st->y = v41_alloc((uint64_t)cap * E * 4, &ok);
     st->logits = v41_alloc((uint64_t)cap * DS4_N_VOCAB * 4, &ok);
     st->main_x = v41_alloc((uint64_t)pcap * E * 4, &ok);
-    for (uint32_t T = 0; T < v->mtp_towers; T++) st->win[T] = v41_alloc((uint64_t)(SWA + cap) * HD * 4, &ok);
+    /* ★窗口后面的暂存区要装得下一次补进来的最多 SWA 行★(2026-09-18 实撞): 以前只留 block+1 行, 而预填后第一轮草稿要把
+     * 提示末尾最多 128 个位置的 main_kv 一次推进窗口 —— 越界的拷贝静默失败, 第一轮草稿从来没出过, 窗口里也从来没有提示的上下文;
+     * 老口径下后面每轮只推 1 行所以还能跑, 新口径(按位置差补窗口)则每轮都要补整段, 于是整条投机路静默失效。 */
+    for (uint32_t T = 0; T < v->mtp_towers; T++) st->win[T] = v41_alloc((uint64_t)(SWA + pcap) * HD * 4, &ok);
     dr->mainx_raw = v41_alloc((uint64_t)pcap * E * 4, &ok);
     dr->mk_embed = v41_alloc((uint64_t)cap * R * 4, &ok);
     dr->mk_cur = v41_alloc((uint64_t)R * 4, &ok);
@@ -162,13 +173,23 @@ bool v41_draft_alloc(ds4_engine *e, ds4_v41_draft *dr) {
     dr->ids = v41_alloc((uint64_t)cap * 4, &ok);
     dr->ids_next = v41_alloc(16, &ok);
     dr->h = v41_alloc((uint64_t)cap * E * 4, &ok);
+    dr->mainh_lin = v41_alloc((uint64_t)SWA * v->n_mtp_target * E * 4, &ok);
+    dr->win_end = -1;
+    /* ★草稿图的槽★(2026-09-22): pinned(零拷贝小核直接读/写, 图每次重放读那一刻槽里的值) + 一个设备 int(ring_rows 的起始行) */
+    dr->p_tok = ds4_gpu_host_alloc((uint64_t)cap * 4);  dr->p_bpos = ds4_gpu_host_alloc((uint64_t)cap * 4);
+    dr->p_wpos = ds4_gpu_host_alloc((uint64_t)DS4_V41_DRAFT_GROWS * 4);  dr->p_first = ds4_gpu_host_alloc(4);
+    dr->p_ids = ds4_gpu_host_alloc((uint64_t)cap * 4);  dr->p_conf = ds4_gpu_host_alloc((uint64_t)cap * 4);
+    dr->p_onehot = ds4_gpu_host_alloc((uint64_t)cap * DS4_N_HC * 4);
+    dr->firstd = v41_alloc(16, &ok);
+    if (!dr->p_tok || !dr->p_bpos || !dr->p_wpos || !dr->p_first || !dr->p_ids || !dr->p_conf || !dr->p_onehot) ok = false;
+    if (ok) for (uint32_t i = 0; i < cap * DS4_N_HC; i++) dr->p_onehot[i] = (i % DS4_N_HC) == 0 ? 1.0f : 0.0f;
     if (!ok || !v41_draft_exp_off(e, dr)) { v41_draft_free(dr); return false; }
     /* --dspark-block: 诊断时钉死块长(不超过元数据给的 B, 缓冲是按 B 分配的) */
     dr->block = (g_ds4_v41_block && g_ds4_v41_block <= B) ? g_ds4_v41_block : B;
     if (g_ds4_v41_draft_amp && !v41_draft_amp_load(dr, g_ds4_v41_draft_amp)) { v41_draft_free(dr); return false; }
     dr->ready = 1;
-    fprintf(stderr, "ds4: [v41] DSpark 草稿器已武装: %u 塔 × %u 专家 top-%u, 一块 %u 位, 目标层",
-            v->mtp_towers, v->mtp_experts, v->mtp_used, B);
+    fprintf(stderr, "ds4: [v41] DSpark 草稿器已武装: %u 塔 × %u 专家 top-%u(%s), 一块 %u 位, 目标层",
+            v->mtp_towers, v->mtp_experts, v->mtp_used, e->weights.mtp.exps_vq[0] ? "VQ blob" : "逐专家 fp4x32", B);
     for (uint32_t i = 0; i < v->n_mtp_target; i++) fprintf(stderr, " L%02d", (int)v->mtp_target[i]);
     fprintf(stderr, "\n");
     v41_draft_byte_report(e, dr);
@@ -177,31 +198,38 @@ bool v41_draft_alloc(ds4_engine *e, ds4_v41_draft *dr) {
 
 void v41_draft_free(ds4_v41_draft *dr) {
     ds4_v41_state *st = &dr->st;
+    if (dr->gsteps || dr->gcaps) fprintf(stderr, "ds4: [graph] 草稿一轮走图 %u 次, 捕获 %u 次\n", dr->gsteps, dr->gcaps);
+    for (uint32_t r = 0; r <= DS4_V41_DRAFT_GROWS; r++) { if (dr->gexec[r]) ds4_gpu_decode_graph_free(dr->gexec[r]); dr->gexec[r] = NULL; }
+    ds4_gpu_host_free(dr->p_tok); ds4_gpu_host_free(dr->p_bpos); ds4_gpu_host_free(dr->p_wpos); ds4_gpu_host_free(dr->p_first);
+    ds4_gpu_host_free(dr->p_ids); ds4_gpu_host_free(dr->p_conf); ds4_gpu_host_free(dr->p_onehot);
+    dr->p_tok = dr->p_bpos = dr->p_wpos = dr->p_first = dr->p_ids = NULL; dr->p_conf = dr->p_onehot = NULL;
     ds4_gpu_tensor **all[] = { &st->tok, &st->pos, &st->hc, &st->hc2, &st->mix, &st->pre, &st->post, &st->comb, &st->pre_mix,
         &st->x, &st->xn, &st->qr, &st->qrn, &st->q, &st->kv, &st->kvn, &st->wintmp, &st->o, &st->low, &st->attn_out,
         &st->glog, &st->sel, &st->rw, &st->routed, &st->sg, &st->su, &st->sh, &st->so, &st->y, &st->logits, &st->main_x,
         &dr->mainx_raw, &dr->mk_embed, &dr->mk_cur, &dr->mk_bias, &dr->conf_in, &dr->conf, &dr->ids, &dr->ids_next, &dr->h,
-        &dr->ampA, &dr->ampB, &dr->ampT };
+        &dr->ampA, &dr->ampB, &dr->ampT, &dr->mainh_lin, &dr->firstd };
     for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) { if (*all[i]) ds4_gpu_tensor_free(*all[i]); *all[i] = NULL; }
     for (uint32_t T = 0; T < DS4_MTP_MAX_TOWERS; T++) {
         if (st->win[T]) { ds4_gpu_tensor_free(st->win[T]); st->win[T] = NULL; }
-        free(dr->exp_off[T]); dr->exp_off[T] = NULL; st->tower_exp_off[T] = NULL;
+        free(dr->exp_off[T]); dr->exp_off[T] = NULL; st->tower_exp_off[T] = NULL; st->tower_exps_vq[T] = NULL;
     }
     dr->ready = 0;
 }
 
-/* main_x = main_norm(main_proj(main_hidden 的 rows 行)) —— 官方 DSparkBlock.forward_embed 的前两步。 */
-static bool v41_draft_main_x(ds4_engine *e, ds4_v41_state *main_st, ds4_v41_draft *dr, uint32_t rows) {
+/* main_x = main_norm(main_proj(dr->mainh_lin 的 rows 行)) —— 官方 DSparkBlock.forward_embed 的前两步。 */
+static bool v41_draft_main_x(ds4_engine *e, ds4_v41_draft *dr, uint32_t rows) {
     const ds4_model *m = &e->model;
     const uint64_t in = (uint64_t)DS4_N_EMBD * g_ds4_v41.n_mtp_target;
-    /* main_proj 盘上可能是 FP8(原件精度)或 fp4x32(2026-09-17 之前的老 GGUF) —— 按登记类型认 */
-    const ds4_tensor *mp = e->weights.mtp.main_proj;
-    const bool okmp = (mp->type == DS4_TENSOR_FP8_32X32)
-        ? ds4_gpu_v41_matmul_fp8blk_round_tensor(dr->mainx_raw, m->map, m->size, mp->abs_offset, in, DS4_N_EMBD, main_st->mainh, rows, 1) != 0
-        : ds4_gpu_v41_matmul_fp4x32_tensor(dr->mainx_raw, m->map, m->size, mp->abs_offset, in, DS4_N_EMBD, main_st->mainh, rows, 1) != 0;
-    if (!okmp) return false;
+    /* main_proj 盘上可能是 FP8(原件精度)/ fp4x32(2026-09-17 之前的老 GGUF)/ q4_K(骨架配方跟着换) —— 一律交给
+     * 按登记类型分发的 v41_tproj, 这里不再自己二选一(09-20 wo_b 那处漏改的教训: 少一支不报错, 只出假数)。 */
+    if (!v41_tproj(m, dr->mainx_raw, e->weights.mtp.main_proj, in, DS4_N_EMBD, dr->mainh_lin, rows, 1)) return false;
     return ds4_gpu_v41_rms_norm_tensor(dr->st.main_x, dr->mainx_raw, m->map, m->size,
                                        e->weights.mtp.main_norm->abs_offset, DS4_N_EMBD, rows, DS4_RMS_EPS) != 0;
+}
+
+/* 主机 → 设备张量: 直发时同步拷; 捕获时改零拷贝小核(源必须是 pinned 槽 —— 图每次重放读那一刻槽里的值, 所以主机每轮发图前先把槽填好) */
+static bool v41_draft_put(const ds4_v41_draft *dr, ds4_gpu_tensor *t, uint64_t off, const void *pinned, uint64_t bytes) {
+    return dr->cap_mode ? ds4_gpu_tensor_write_zerocopy(t, off, pinned, bytes) != 0 : ds4_gpu_tensor_write(t, off, pinned, bytes) != 0;
 }
 
 /* 草稿块的一次前向: 三塔 → 出口 → 逐位 markov 贪心 → confidence。ids[0] 由调用方写好(= 上一个真 token)。 */
@@ -211,19 +239,12 @@ static bool v41_draft_block(ds4_engine *e, ds4_v41_draft *dr, uint32_t pos0) {
     ds4_v41_state *st = &dr->st;
     const uint32_t B = dr->block, E = DS4_N_EMBD, R = v->mtp_markov_rank;
     st->n = B; st->pos0 = pos0;
-    {   /* 块输入 = [真 token, noise × (B-1)](官方 draft_input_ids), 位置 pos0..pos0+B-1 */
-        int32_t tk[DS4_MTP_MAX_BLOCK], ps[DS4_MTP_MAX_BLOCK];
-        for (uint32_t i = 0; i < B; i++) { tk[i] = i ? (int32_t)v->mtp_noise_id : dr->host_ids[0]; ps[i] = (int32_t)(pos0 + i); }
-        if (!ds4_gpu_tensor_write(st->tok, 0, tk, (uint64_t)B * 4) || !ds4_gpu_tensor_write(st->pos, 0, ps, (uint64_t)B * 4)) return false;
-    }
-    {
-        float *pm = xmalloc((size_t)B * DS4_N_HC * 4);
-        for (uint32_t i = 0; i < B * DS4_N_HC; i++) pm[i] = (i % DS4_N_HC) == 0 ? 1.0f : 0.0f;
-        const bool okpm = ds4_gpu_tensor_write(st->pre_mix, 0, pm, (uint64_t)B * DS4_N_HC * 4) != 0;
-        free(pm);
-        if (!okpm) return false;
-    }
-    if (!ds4_gpu_v41_embed_fp4x32_tensor(st->x, st->tok, m->map, m->size, e->weights.token_embd->abs_offset, DS4_N_VOCAB, B, E)) return false;
+    /* 块输入 = [真 token, noise × (B-1)](官方 draft_input_ids), 位置 pos0..pos0+B-1; 槽是 pinned 的(进图时零拷贝读) */
+    for (uint32_t i = 0; i < B; i++) { dr->p_tok[i] = i ? (int32_t)v->mtp_noise_id : dr->host_ids[0]; dr->p_bpos[i] = (int32_t)(pos0 + i); }
+    __sync_synchronize();
+    if (!v41_draft_put(dr, st->tok, 0, dr->p_tok, (uint64_t)B * 4) || !v41_draft_put(dr, st->pos, 0, dr->p_bpos, (uint64_t)B * 4)) return false;
+    if (!v41_draft_put(dr, st->pre_mix, 0, dr->p_onehot, (uint64_t)B * DS4_N_HC * 4)) return false;
+    if (!v41_embed(m, st->x, st->tok, e->weights.token_embd, DS4_N_VOCAB, B, E)) return false;
     if (!ds4_gpu_v41_expand_hc_tensor(st->hc, st->x, E, DS4_N_HC, B)) return false;
     for (uint32_t T = 0; T < v->mtp_towers; T++) if (!v41_layer(e, st, T)) return false;
     /* 出口: 官方 mtp[-1] 借主模型的 head, norm 用 mtp.2.norm */
@@ -239,7 +260,7 @@ static bool v41_draft_block(ds4_engine *e, ds4_v41_draft *dr, uint32_t pos0) {
          * 不报错, 只差一个舍入位, 但那条不变量一旦破了后面没人再守。 */
         if (!ds4_gpu_v41_round_bf16_tensor(st->xn, (uint64_t)B * E)) return false;
     }
-    if (!ds4_gpu_v41_matmul_fp4x32_tensor(st->logits, m->map, m->size, e->weights.output->abs_offset, E, DS4_N_VOCAB, st->xn, B, 0)) return false;
+    if (!v41_tproj(m, st->logits, e->weights.output, E, DS4_N_VOCAB, st->xn, B, 0)) return false;
     /* 逐位: logits[i] += markov_head(第 i 位 token) → argmax → 第 i+1 位。全程在设备上,
      * 每位一次 D2H 就是每轮 5 次停等 —— 投机省下来的时间还不够付。 */
     const uint64_t nrow = e->weights.mtp.markov_embd->ndim > 1 ? e->weights.mtp.markov_embd->dim[1] : DS4_N_VOCAB;
@@ -268,28 +289,106 @@ static bool v41_draft_block(ds4_engine *e, ds4_v41_draft *dr, uint32_t pos0) {
     return v41_small_matmul(m, dr->conf, e->weights.mtp.confidence, (uint64_t)E + R, 1, dr->conf_in, B);
 }
 
-bool v41_draft_step(ds4_engine *e, ds4_v41_state *main_st, ds4_v41_draft *dr, int32_t tok, uint32_t pos_main, uint32_t rows) {
-    if (!dr->ready || !main_st->mainh || !main_st->mainh_rows) return false;
-    if (rows > main_st->mainh_rows) rows = main_st->mainh_rows;
-    if (!rows) return false;
-    {   /* 这 rows 个已确认位置的绝对位置(rope 要) */
-        int32_t *ps = xmalloc((size_t)rows * 4);
-        for (uint32_t i = 0; i < rows; i++) ps[i] = (int32_t)(pos_main + 1u - rows + i);
-        const bool okp = ds4_gpu_tensor_write(dr->st.pos, 0, ps, (uint64_t)rows * 4) != 0;
-        free(ps);
-        if (!okp) return false;
+/* 补窗口: 从主态 mainh 环取 [first, first+rows) 行 → main_proj/main_norm → 推进三塔窗口。位置与起始行走 pinned 槽(进图时零拷贝读)。
+ * ★这三步失败必须出声★(2026-09-18 实撞): 以前静默 return false, 调用方只当"这轮不出草稿", 于是一个缓冲区太小(窗口的块区只留了
+ * block+1 行, 补 79 行直接越界)让投机整段静默失效 —— 门上"投机 == 纯解码"还是绿的(一轮都没投机当然逐字节同), 只有 t/s 露馅。 */
+static bool v41_draft_fill(ds4_engine *e, ds4_v41_state *main_st, ds4_v41_draft *dr, int64_t first, uint32_t rows) {
+    for (uint32_t i = 0; i < rows; i++) dr->p_wpos[i] = (int32_t)(first + (int64_t)i);   /* 这 rows 个位置的绝对位置(rope 要) */
+    dr->p_first[0] = (int32_t)(first % (int64_t)main_st->mainh_cap);
+    __sync_synchronize();
+    if (!v41_draft_put(dr, dr->st.pos, 0, dr->p_wpos, (uint64_t)rows * 4)) return false;
+    if (dr->cap_mode && !ds4_gpu_tensor_write_zerocopy(dr->firstd, 0, dr->p_first, 4)) return false;
+    if (!ds4_gpu_v41_ring_rows_tensor(dr->mainh_lin, main_st->mainh, g_ds4_v41.n_mtp_target * DS4_N_EMBD, main_st->mainh_cap,
+                                      (uint32_t)dr->p_first[0], rows, dr->cap_mode ? dr->firstd : NULL)) {
+        fprintf(stderr, "ds4: [v41] 草稿器: 从 main_hidden 环取 %u 行失败\n", rows); return false;
     }
-    if (!v41_draft_main_x(e, main_st, dr, rows)) return false;
-    if (!v41_draft_push_main(e, &dr->st, rows)) return false;
+    if (!v41_draft_main_x(e, dr, rows)) { fprintf(stderr, "ds4: [v41] 草稿器: main_proj/main_norm %u 行失败\n", rows); return false; }
+    if (!v41_draft_push_main(e, &dr->st, rows)) { fprintf(stderr, "ds4: [v41] 草稿器: 推 %u 行进三塔窗口失败\n", rows); return false; }
     /* 块注意力的 main_x 只用最后一行(官方 forward_spec 的 main_hidden 是当前这一位) */
     if (rows > 1 && !ds4_gpu_tensor_copy(dr->st.main_x, 0, dr->st.main_x, (uint64_t)(rows - 1u) * DS4_N_EMBD * 4,
                                          (uint64_t)DS4_N_EMBD * 4)) return false;
-    dr->host_ids[0] = tok;
-    if (!ds4_gpu_tensor_write(dr->ids, 0, &tok, 4)) return false;
-    if (!v41_draft_block(e, dr, pos_main + 1u)) return false;
+    return true;
+}
+
+/* 一轮的 GPU 部分(补窗口 + 写 ids[0] + 块前向): 直发与捕获共用同一串调用, 差的只是主机写张量走同步拷还是零拷贝小核 */
+static bool v41_draft_gpu_round(ds4_engine *e, ds4_v41_state *main_st, ds4_v41_draft *dr, int64_t first, uint32_t rows, uint32_t pos0) {
+    if (rows && !v41_draft_fill(e, main_st, dr, first, rows)) return false;
+    if (!v41_draft_put(dr, dr->ids, 0, dr->p_tok, 4)) return false;   /* p_tok[0] = 真 token(调用方已填) */
+    return v41_draft_block(e, dr, pos0);
+}
+
+/* ★草稿一轮走图★(2026-09-22): 按 rows 各一张。捕获失败(捕获态下有分配/同步 ⇒ 作废)就永久回直发并出声; 捕获不执行任何核,
+ * 所以失败后调用方按直发重来是干净的。返回 false = 没走图(调用方走直发), 状态一个没动。 */
+static bool v41_draft_graph_round(ds4_engine *e, ds4_v41_state *main_st, ds4_v41_draft *dr, int64_t first, uint32_t rows, uint32_t pos0) {
+    const uint64_t gen = ds4_gpu_v41_scratch_generation();
+    if (dr->gexec[rows] && dr->ggen[rows] != gen) {   /* 暂存换过指针 ⇒ 所有草稿图作废(它们烤死的都是捕获那一刻的指针) */
+        for (uint32_t r = 0; r <= DS4_V41_DRAFT_GROWS; r++) { if (dr->gexec[r]) ds4_gpu_decode_graph_free(dr->gexec[r]); dr->gexec[r] = NULL; }
+        fprintf(stderr, "ds4: [graph] 草稿图: 后端暂存换过指针, 全部重捕获\n");
+    }
+    if (!dr->gexec[rows]) {
+        dr->cap_mode = 1;
+        if (!ds4_gpu_decode_graph_capture_begin()) { dr->cap_mode = 0; dr->graph_off = 1; return false; }
+        bool ok = v41_draft_gpu_round(e, main_st, dr, first, rows, pos0);
+        if (ok) ok = ds4_gpu_tensor_read_zerocopy(dr->p_ids, dr->ids, 0, (uint64_t)(dr->block + 1u) * 4) != 0 &&
+                     ds4_gpu_tensor_read_zerocopy(dr->p_conf, dr->conf, 0, (uint64_t)dr->block * 4) != 0;
+        dr->cap_mode = 0;
+        void *exec = ds4_gpu_decode_graph_capture_end();   /* 不管 ok 与否都要收捕获, 否则流一直停在捕获态 */
+        if (!ok || !exec) {
+            if (exec) ds4_gpu_decode_graph_free(exec);
+            fprintf(stderr, "ds4: ★[graph] 草稿图(补 %u 行)捕获失败, 草稿一律直发★\n", rows);
+            dr->graph_off = 1;
+            return false;
+        }
+        dr->gexec[rows] = exec; dr->ggen[rows] = gen; dr->gcaps++;
+        fprintf(stderr, "ds4: [graph] 草稿图(补 %u 行)已捕获\n", rows);
+    }
+    /* 重放: 槽里是本轮的值(捕获那一趟也填过, 值相同; 图每次重放读那一刻的槽) */
+    __sync_synchronize();
+    if (!ds4_gpu_decode_graph_launch(dr->gexec[rows])) return false;
+    if (!ds4_gpu_synchronize()) return false;
+    __sync_synchronize();
+    memcpy(dr->host_ids, dr->p_ids, (size_t)(dr->block + 1u) * 4);
+    memcpy(dr->host_conf, dr->p_conf, (size_t)dr->block * 4);
+    dr->gsteps++;
+    return true;
+}
+
+bool v41_draft_step(ds4_engine *e, ds4_v41_state *main_st, ds4_v41_draft *dr, int32_t tok, uint32_t pos_main) {
+    if (!dr->ready || !main_st->mainh) return false;
+    if (main_st->mainh_end != (int64_t)pos_main) {   /* 主前向没把这一位写进环(CED 跳过/早停)= 料不齐, 不出草稿 */
+        fprintf(stderr, "ds4: [v41] 草稿器: main_hidden 环末位 %lld ≠ pos_main %u, 本轮不出草稿\n", (long long)main_st->mainh_end, pos_main);
+        return false;
+    }
+    /* ★补窗口: (win_end, pos_main] 缺多少补多少★ —— 歇过的轮、走过 graph 的步都在这里补齐; 缺口超过窗宽就整窗重建。
+     * 以前按调用方递的"上一批确认了几行"推进, 歇轮那些步的 main_x 永远进不了窗口(实撞: 在线 p1 0.42 对教师强制 0.75)。 */
+    const uint32_t SWA = DS4_N_SWA;
+    int64_t first = dr->win_end + 1;
+    if ((int64_t)pos_main - first + 1 > (int64_t)SWA) first = (int64_t)pos_main - (int64_t)SWA + 1;
+    if (first < 0) first = 0;
+    const uint32_t rows = (uint32_t)((int64_t)pos_main - first + 1);
+    if (rows) {
+        const int64_t avail_first = main_st->mainh_end - (int64_t)main_st->mainh_n + 1;
+        if (first < avail_first) {
+            fprintf(stderr, "ds4: [v41] 草稿器: 窗口要补 %lld..%u, 环里连续段只从 %lld 起(%u 行), 本轮不出草稿\n",
+                    (long long)first, pos_main, (long long)avail_first, main_st->mainh_n);
+            return false;
+        }
+    }
+    dr->host_ids[0] = tok; dr->p_tok[0] = tok;
+    const uint32_t pos0 = pos_main + 1u;
+    /* 走图的条件: 主路允许走图、这个 rows 直发暖过(暂存/核属性全建好)、位置 ≥ 窗宽(块注意力的 pos0 烤进图, 只有 lo = pos0−window
+     * 那一支与 pos0 无关 —— 提示短于窗宽时窗口从 0 起、键数随位置变, 进不了一张图)、rows 在档里、没捕获失败过 */
+    if (v41_graph_ready(main_st) && !dr->graph_off && rows >= 1u && rows <= DS4_V41_DRAFT_GROWS && pos0 >= SWA && dr->gwarm[rows] > 0 &&
+        v41_draft_graph_round(e, main_st, dr, first, rows, pos0)) {
+        dr->win_end = pos_main;
+        return true;
+    }
+    if (!v41_draft_gpu_round(e, main_st, dr, first, rows, pos0)) return false;
+    if (rows) dr->win_end = pos_main;
     if (!ds4_gpu_synchronize()) return false;
     if (!ds4_gpu_tensor_read(dr->ids, 0, dr->host_ids, (uint64_t)(dr->block + 1u) * 4)) return false;
     if (!ds4_gpu_tensor_read(dr->conf, 0, dr->host_conf, (uint64_t)dr->block * 4)) return false;
+    if (rows >= 1u && rows <= DS4_V41_DRAFT_GROWS) dr->gwarm[rows]++;
     return true;
 }
 #endif /* !DS4_NO_GPU */

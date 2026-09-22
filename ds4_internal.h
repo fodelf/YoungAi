@@ -55,6 +55,9 @@ typedef enum {
 #define DS4_MTP_MAX_EXPERTS 256   /* 每塔专家数上限(官方 128); 真值读元数据 */
 typedef struct {
     int      active;
+    uint32_t ctx;                             /* 上下文 = GGUF deepseek4.context_length(转换器从 HF config 的 max_position_embeddings
+                                               * 写入, V4.1 Flash = 1048576)。引擎里没有第二个数(用户 2026-09-22 "不要任何写死的
+                                               * 上下文"): 生成/打分/取料的位置边界全从这里取, 缺键拒载不补默认。 */
     uint8_t  is_kv_source[DS4_MAX_LAYER];     /* 本层自己压缩并持有压缩 KV 缓存 */
     int16_t  kv_source_of[DS4_MAX_LAYER];     /* 本层读哪层的压缩 KV(源层=自己; ratio 0 层 = -1) */
     uint8_t  is_index_source[DS4_MAX_LAYER];  /* 本层自己跑 indexer 产 topk */

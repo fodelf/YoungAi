@@ -14,7 +14,9 @@
 # 出错会怎样: CED 那侧答非所问 / 复读 = 分界层的全局 KV 没写进去(v41_attention_kv_only 漏了),
 # 表现是模型只看得见最后一块的上下文, 不报错。两边 t/s 一样 = ced_skip 没生效(块数只有 1, 把提示加长)。
 #
-# 用法: ./speed-bench/prefill_ttft_ruler.sh [提示文件] [截多少字符, 默认 40000] [块, 默认 512] [模型, 默认现役]
+# 用法: ./speed-bench/prefill_ttft_ruler.sh [提示文件] [截多少字符, 默认 40000] [块, 默认 512] [模型, 默认现役] [反修目录, 默认现役对的]
+#   换配方对尺要**成对换**: 第 4 个参数给新 GGUF、第 5 个给它自己那份反修(gr_Lnn.bin 目录)。
+#   反修是按某一份量化文件的残差解出来的, 挂到别的文件上不报错但数值全错 —— 所以这里不给"只换模型"的默认。
 
 set -u
 cd "$(dirname "$0")/.." || exit 1
@@ -22,19 +24,24 @@ cd "$(dirname "$0")/.." || exit 1
 SRC="${1:-speed-bench/promessi_sposi.txt}"
 CHARS="${2:-40000}"
 CHUNK="${3:-512}"
-MODEL="${4:-gguf/v41/DeepSeek-V4.1-Flash-vq8x4096-fp4.gguf}"   # 第 4 个参数换模型
-AMP=gguf/v41/gr-fin-40-fp4
+MODEL="${4:-gguf/v41/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf}"   # 第 4 个参数换模型
+AMP="${5:-gguf/v41/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-vqfin41_vqhalf_a_n8192-engine}"                            # 第 5 个参数换反修(与第 4 个成对)
 OUT=/tmp/ttft
 P="$OUT/prompt.txt"
 
 mkdir -p "$OUT"; rm -f "$OUT"/*.out "$OUT"/*.err
 [ -f "$MODEL" ] || { echo "★没有模型 $MODEL★"; exit 1; }
+[ -d "$AMP" ]   || { echo "★没有反修目录 $AMP★"; exit 1; }
+# 配对门: 反修 manifest 记着它是在哪份 GGUF 上解的(gguf=…), 去掉 .gguf 后必须是模型名的前缀 ——
+# 同一底座的 -mtpnative/-dspark 变体只多了三塔, 反修通用; 换了底座(fp4 ↔ q4k)就是另一份残差, 拒跑。
+MF=$(grep -ao 'gguf=[^ ]*' "$AMP"/manifest* 2>/dev/null | head -1 | sed 's/^gguf=//; s/\.gguf$//')
+case "$(basename "$MODEL" .gguf)" in "$(basename "$MF")"*) ;; *) echo "★反修 $AMP 是在 $MF 上解的, 不配 $MODEL★"; exit 1;; esac
 [ -f "$SRC" ]   || { echo "★没有提示文件 $SRC★"; exit 1; }
 head -c "$CHARS" "$SRC" > "$P"
 
 run() {   # $1 = 标签, $2.. = 额外参数
   local tag="$1"; shift
-  ./ds4 -m "$MODEL" --zchain "$AMP" --ctx 32768 --v41-chunk "$CHUNK" --temp 0 --seed 1 -n 16 \
+  ./ds4 -m "$MODEL" --zchain "$AMP" --v41-chunk "$CHUNK" --temp 0 --seed 1 -n 16 \
         "$@" --prompt-file "$P" > "$OUT/$tag.out" 2> "$OUT/$tag.err"
   printf "%-14s %s\n" "$tag" "$(grep -ao 'prefill [0-9]* token [0-9.]*s ([0-9.]* t/s)' "$OUT/$tag.err" | tail -1)"
 }

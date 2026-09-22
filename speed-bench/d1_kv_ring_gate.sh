@@ -14,29 +14,46 @@
 #   纯解码同、投机分叉      ⇒ 回滚没把"没被接受的那几格"还原回去(v41_spec_rollback 的 ①)
 #   两个二进制都跑不出来    ⇒ 先看 .err, 多半是 ds4.base 不在(下面会提示怎么造)
 #
-# 用法: ./speed-bench/d1_kv_ring_gate.sh [基线二进制, 默认 ds4.base] [模型] [生成几个 token, 默认 64]
+# 用法: ./speed-bench/d1_kv_ring_gate.sh [基线二进制, 默认 ds4.base] [模型] [生成几个 token, 默认 64] [模式, 默认 gate] [反修目录]
 #   基线二进制 = 改这一刀之前的 ./ds4, 改之前先 `cp ds4 ds4.base`。没有它就只能跑"新二进制自洽"那半张表。
+#   换配方要**成对换**: 第 2 个参数给 GGUF、第 5 个给它自己那份反修目录(gr_Lnn.bin)。反修是按某一份量化文件的
+#   残差解的, 挂到别的文件上不报错但数值全错 —— 所以只换了模型没给第 5 个参数直接拒跑。
 set -u
 cd "$(dirname "$0")/.." || exit 1
 
 BASE="${1:-ds4.base}"
-MODEL="${2:-gguf/v41/DeepSeek-V4.1-Flash-vq8x4096-fp4-dspark.gguf}"
+MODEL="${2:-gguf/v41/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf}"
 NGEN="${3:-64}"
 MODE="${4:-gate}"     # gate = 全套门; bisect = 只做同轨定位(见文件末尾那一段)
-AMP=gguf/v41/gr-fin-40-fp4
+AMP="${5:-gguf/v41/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-vqfin41_vqhalf_a_n8192-engine}"
 OUT=/tmp/d1-kv-ring        # 日志可以留 /tmp, 脚本必须在仓库里(铁律)
 mkdir -p "$OUT"
+# 上下文没有参数(用户 2026-09-22 "不要任何写死的上下文, 上下文大小只有 1M 这一个选择"): 引擎从模型元数据
+# deepseek4.context_length 读, --ctx 已不存在(传了直接拒)。以前这里写死 32768 是 V4 会话时代的遗留。
 
 [ -x ./ds4 ] || { echo "★没有 ./ds4, 先 make cuda-spark★"; exit 1; }
 [ -f "$MODEL" ] || { echo "★没有模型 $MODEL★"; exit 1; }
+# 第 5 个参数给 none = 显式裸模型(不挂反修, 用来跟挂了的成对比); 忘了传仍走默认值, 配对门照样拦。
+if [ "$AMP" != none ]; then
+  [ -d "$AMP" ] || { echo "★没有反修目录 $AMP★"; exit 1; }
+  # 配对门: 反修 manifest 记着它是在哪份 GGUF 上解的(gguf=…), 去掉 .gguf 后必须是模型名的前缀 ——
+  # 同一底座的 -mtpnative/-dspark 变体只多了三塔, 反修通用; 换了底座(fp4 ↔ q4k)就是另一份残差, 拒跑。
+  MF=$(grep -ao 'gguf=[^ ]*' "$AMP"/manifest* 2>/dev/null | head -1 | sed 's/^gguf=//; s/\.gguf$//')
+  case "$(basename "$MODEL" .gguf)" in "$(basename "$MF")"*) ;; *) echo "★反修 $AMP 是在 $MF 上解的, 不配 $MODEL★"; exit 1;; esac
+fi
 # ★只用真场景提示★(用户令 2026-09-16): 3 token 的短提示退役 —— 那时可见键才几十个, 随上下文涨的
 # 那几个核(indexer 打分/top-k/注意力)一个都量不到, 而用户要的速度是真对话里的速度。
 head -c  8000 speed-bench/readme_en_x80.txt > "$OUT/p2k.txt"  || exit 1
 head -c 50000 speed-bench/readme_en_x80.txt > "$OUT/p12k.txt" || exit 1
+# p60k(≈6 万 token, 与 d0a_decode_profile.sh 的长提示同一刀): 给 online 模式的第 6 个参数用, 量长上下文档位上
+# 投机 vs 纯解码 —— 12k 尺看不到随上下文涨的那笔税(sp.md: 10k → 71k 每步 +3.8 ms), 投机在那一档赚不赚只有量了才知道。
+head -c 200000 speed-bench/readme_en_x80.txt > "$OUT/p60k.txt" || exit 1
 
 run () {   # $1=二进制 $2=标签 $3.. = 其余参数
   local bin=$1 tag=$2; shift 2
-  ./"$bin" -m "$MODEL" --zchain "$AMP" --temp 0 --seed 1 "$@" > "$OUT/$tag.out" 2> "$OUT/$tag.err"
+  local z=(); [ "$AMP" != none ] && z=(--zchain "$AMP")
+  # ${z[@]+"${z[@]}"}: set -u 下空数组直接展开在老 bash 上报 unbound, 这个写法两边都过
+  ./"$bin" -m "$MODEL" ${z[@]+"${z[@]}"} --temp 0 --seed 1 "$@" > "$OUT/$tag.out" 2> "$OUT/$tag.err"
 }
 
 # ★同轨定位(mtp-1.md M0′(d))★: 门报"分叉"之后, 下一个问题永远是"从哪一步开始的"。
@@ -49,11 +66,11 @@ run () {   # $1=二进制 $2=标签 $3.. = 其余参数
 if [ "$MODE" = bisect ] || [ "$MODE" = bisect12k ]; then
   P="$OUT/p2k.txt"; [ "$MODE" = bisect12k ] && P="$OUT/p12k.txt"
   echo "== 同轨定位: $(basename "$P") 提示, 纯解码 vs 投机(k=1 / k=3), 逐 token 比 [emit] 行"
-  run ds4 bis_plain -n "$NGEN" --emit-trace --no-dspark --ctx 32768 --prompt-file "$P"
+  run ds4 bis_plain -n "$NGEN" --emit-trace --no-dspark --prompt-file "$P"
   grep -a "^\[emit\]" "$OUT/bis_plain.err" > "$OUT/ids_plain.txt"
   echo "  纯解码 $(wc -l < "$OUT/ids_plain.txt") 个 token"
   for k in 1 3; do
-    run ds4 "bis_k$k" -n "$NGEN" --emit-trace --dspark --dspark-verify "$k" --ctx 32768 --prompt-file "$P"
+    run ds4 "bis_k$k" -n "$NGEN" --emit-trace --dspark --dspark-verify "$k" --prompt-file "$P"
     grep -a "^\[emit\]" "$OUT/bis_k$k.err" > "$OUT/ids_k$k.txt"
     echo "  投机 k=$k: $(wc -l < "$OUT/ids_k$k.txt") 个 token; $(grep -a -h 'DSpark:' "$OUT/bis_k$k.err" | tail -1)"
     # 第一处不同: 逐行比, 打印两边各三行上下文
@@ -74,10 +91,13 @@ if [ "$MODE" = graph ]; then
   for c in "ctx2k:$OUT/p2k.txt" "ctx12k:$OUT/p12k.txt"; do
     tag="${c%%:*}"; P="${c#*:}"
     echo "== $tag"
-    [ -x "./$BASE" ] && run "$BASE" "gbase_$tag" -n "$NGEN" --no-dspark --ctx 32768 --prompt-file "$P"
-    run ds4 "gdirect_$tag" -n "$NGEN" --no-dspark --no-graph --ctx 32768 --prompt-file "$P"
-    run ds4 "ggraph_$tag"  -n "$NGEN" --no-dspark --ctx 32768 --prompt-file "$P"
-    run ds4 "ggraph2_$tag" -n "$NGEN" --no-dspark --ctx 32768 --prompt-file "$P"
+    # 没基线就把上次留下的 gbase_* 删掉: 下面的三方 cmp 按"文件在不在"决定比不比, 旧文件(可能是另一个模型跑的)
+    # 会被当基线比出一个假红(2026-09-19 q4k 门实撞: 拿 09-18 的 fp4 输出当基线, 报"gbase ≠ gdirect")。
+    if [ -x "./$BASE" ]; then run "$BASE" "gbase_$tag" -n "$NGEN" --no-dspark --prompt-file "$P"
+    else rm -f "$OUT/gbase_$tag.out" "$OUT/gbase_$tag.err"; fi
+    run ds4 "gdirect_$tag" -n "$NGEN" --no-dspark --no-graph --prompt-file "$P"
+    run ds4 "ggraph_$tag"  -n "$NGEN" --no-dspark --prompt-file "$P"
+    run ds4 "ggraph2_$tag" -n "$NGEN" --no-dspark --prompt-file "$P"
     for pair in "gdirect:ggraph" "ggraph:ggraph2" "gbase:gdirect"; do
       a="${pair%%:*}"; b="${pair#*:}"
       [ -f "$OUT/${a}_$tag.out" ] || continue
@@ -95,21 +115,161 @@ fi
 # 判据仍是走图 vs --no-graph 逐字节同, 外加日志里"位置桶"要出现两次(没出现第二次 = 没跨到, 把 NGEN 加大)。
 if [ "$MODE" = graphx ]; then
   P="$OUT/p2k.txt"
-  run ds4 "gxdirect" -n "$NGEN" --no-dspark --no-graph --ctx 32768 --prompt-file "$P"
-  run ds4 "gxgraph"  -n "$NGEN" --no-dspark --ctx 32768 --prompt-file "$P"
+  run ds4 "gxdirect" -n "$NGEN" --no-dspark --no-graph --prompt-file "$P"
+  run ds4 "gxgraph"  -n "$NGEN" --no-dspark --prompt-file "$P"
   echo "  桶: $(grep -a -h '位置桶\|走图解了' "$OUT/gxgraph.err" | tr '\n' ' ')"
   echo "  $(grep -a -h 'decode .* token' "$OUT/gxdirect.err") (直发) | $(grep -a -h 'decode .* token' "$OUT/gxgraph.err") (图)"
   if cmp -s "$OUT/gxdirect.out" "$OUT/gxgraph.out"; then echo "  跨桶: 直发 == 图 逐字节同 ✓"; exit 0
   else echo "  ★跨桶分叉★ $(cmp "$OUT/gxdirect.out" "$OUT/gxgraph.out" 2>&1 | head -1)"; exit 1; fi
 fi
 
+# ★MODE=online(2026-09-19): 同一条真提示上 投机 vs 纯解码 的整段 t/s + 调度器逐轮的账★
+# 为什么单列一档: 门的 64 步只够判"同不同", 判不了"赚不赚" —— 投机是按整段文本赚钱的(歇轮、k 的分布、接受的分布都随文本走)。
+# 提示 = speed-bench/fin_chat_prompt.txt(聊天口径, 引擎套模板; 模型写白酒龙头半年报, 出 1400 token 思考文本)。
+# --emit-trace 让引擎每出一次草稿打一行 `[dspark] pos k val acc conf c0..c4`(core_v41_api.c), 这里按 conf[0] 分十档对实际
+# 首位接受率 —— 校准表: 调度器的每一个判决(选 k、歇不歇)都是拿 conf 算的, conf 不准判决就是错的; 另打 k 的分布与逐位条件接受率。
+# 用法: ./speed-bench/d1_kv_ring_gate.sh none <模型> 1400 online [反修目录] [提示文件, 默认金融提示] [nok]
+#   第 6 个参数换提示(如 $OUT/p60k.txt 量长上下文档位); 第 7 个给 nok = 不跑下面钉死 k=1/k=3 的两趟 ——
+#   那两趟只为解调度器常数(直发验 1 行 / 每多一行), 长提示上每趟预填要好几分钟, 常数又不随提示变, 不必每次付。
+if [ "$MODE" = online ]; then
+  P="${6:-speed-bench/fin_chat_prompt.txt}"; NOK="${7:-}"
+  [ -f "$P" ] || { echo "★没有 $P★"; exit 1; }
+  run ds4 onl_plain -n "$NGEN" --no-dspark --prompt-file "$P"
+  run ds4 onl_spec  -n "$NGEN" --dspark --emit-trace --prompt-file "$P"
+  echo "== 在线: $(basename "$P"), $NGEN token"
+  echo "  纯解码: $(grep -a -h 'decode .* token' "$OUT/onl_plain.err") $(grep -a -h '稳态' "$OUT/onl_plain.err" | sed 's/.*⇒ //')"
+  echo "  投机:   $(grep -a -h 'decode .* token' "$OUT/onl_spec.err") $(grep -a -h '稳态' "$OUT/onl_spec.err" | sed 's/.*⇒ //')"
+  grep -a -h "DSpark:\|一轮 \|暂存换过指针\|走图解了" "$OUT/onl_spec.err" | sed 's/^/  /'
+  A="$OUT/onl_spec.out"; B="$OUT/onl_plain.out"
+  na=$(wc -c < "$A"); nb=$(wc -c < "$B"); n=$(( (na < nb ? na : nb) - 1 ))
+  if cmp -s -n "$n" "$A" "$B"; then echo "  同轨: 前 $n 字节逐字节同 ✓ (投机 $na / 纯解码 $nb 字节)"
+  else echo "  ★同轨分叉★ $(cmp -n "$n" "$A" "$B" 2>&1 | head -1)"; fi
+  # 钉死 k=1 / k=3 各一趟: 两趟的"一轮 ms"解出 直发验 1 行 与 每多验一行 的钱(验证 1+k 行 = v1 + tok·k), 喂给陪审团与调度器常量
+  if [ "$NOK" = nok ]; then echo "  (nok: 跳过钉死 k=1/k=3 两趟)"; else
+  for k in 1 3; do
+    run ds4 "onl_k$k" -n "$NGEN" --dspark --dspark-verify "$k" --prompt-file "$P"
+    echo "  钉死 k=$k: $(grep -a -h 'decode .* token' "$OUT/onl_k$k.err") $(grep -a -h 'DSpark:\|一轮 ' "$OUT/onl_k$k.err" | tr '\n' ' ')"
+  done
+  fi
+  echo "  调度器账(conf[0] 十分位档 → k≥1 的轮里实际首位接受率; 歇 = 预测比值 <1 的轮):"
+  grep -a '^\[dspark\] pos' "$OUT/onl_spec.err" | awk '
+    { k=$5; v=$7; a=$9; c0=$11; b=int(c0*10); if (b>9) b=9;
+      n[b]++; if (k>=1) { n1[b]++; if (a>=1) hit[b]++ } sk[b]+=k; sa[b]+=a; if (v<1) rest[b]++;
+      N++; if (k==0) k0++; kh[k]++;
+      if (k>=1) { r1++; if (a>=1) h1++ } if (k>=2 && a>=1) { r2++; if (a>=2) h2++ } if (k>=3 && a>=2) { r3++; if (a>=3) h3++ } }
+    END { for (b=0;b<10;b++) if (n[b]) printf "    conf0 %.1f~%.1f: %4d 轮(k≥1 %4d) 首位接受 %.3f 均k %.2f 均接受 %.2f 歇 %d\n",
+                                       b/10, (b+1)/10, n[b], n1[b], n1[b]?hit[b]/n1[b]:0, sk[b]/n[b], sa[b]/n[b], rest[b];
+          printf "    合计 %d 轮出草稿(其中 k=0 白跑 %d); 逐位条件接受 p1 %.3f(%d 轮) p2|1 %.3f(%d) p3|2 %.3f(%d); k 分布", N, k0, r1?h1/r1:0, r1, r2?h2/r2:0, r2, r3?h3/r3:0, r3;
+          for (k=0;k<=5;k++) printf " %d:%d", k, kh[k]; printf "\n" }'
+  exit 0
+fi
+
+# ★MODE=loop(2026-09-20): 温 0 贪心"打转"尺 —— 同一条金融提示上纯解码一趟, 数文本自己重复了多少★
+# 为什么单列: 五指标是 teacher-forced(每一步都喂教师的正确前文), 看不见自由生成里"翻一个 token 之后一路错下去"
+# 的病; 09-20 凌晨在这条提示上两档都从 40% 处开始循环"营收约？…净利润约？"(模型记不住数字, 贪心锁在占位符上)。
+# 读数: "约？"次数 / 重复 4-gram 占比(按字; 全文里出现 ≥2 次的 4-gram 所占的位置比 —— 与 fable5 09-20 上午那张表同定义:
+# gr-only 73%, gr+rb 76%; 中文正常长文 ~10%) / 最常见 4-gram / 每 300 字一段的"前文已出现过"占比(100% = 整段逐字抄前文,
+# 一眼看出从哪段起进入死循环) / 解码 t/s。文本原样落 $OUT/loop_<模型>_<反修>.out, 判读一律看原文, 数字只是索引。
+# 用法: ./speed-bench/d1_kv_ring_gate.sh none <模型> 1400 loop <反修目录|none> [提示文件, 默认金融提示]
+#       (三档成对: 新+反修 / 新裸 / 现役+反修; 第 6 个参数给 $OUT/p2k.txt = 英文 readme 对照, 那条提示上正常长文不打转)
+#       第 7 个参数 = 额外引擎参数(如 "--no-graph"), 输出文件名带 _x<参数去掉空格和横线>: 同一提示直发 1400 步与走图
+#       逐字节 cmp, 就是"长程解码态有没有漂"的门(graph 模式的门只验了 128 步)。
+if [ "$MODE" = loop ]; then
+  P="${6:-speed-bench/fin_chat_prompt.txt}"; EXTRA="${7:-}"
+  [ -f "$P" ] || { echo "★没有 $P★"; exit 1; }
+  tag="loop_$(basename "$MODEL" .gguf)_$(basename "$AMP")_$(basename "$P" .txt)"
+  [ -n "$EXTRA" ] && tag="${tag}_x$(echo "$EXTRA" | tr -d ' -')"
+  # --emit-trace 只往 stderr 打 `[ptok] 位置 id`(套过模板的提示) 与 `[emit] 位置 id`(每个吐出的 token), 不改采样。
+  # 留下精确 id 序列是为了 d1 模式(把这段文本喂教师锚)。★别用 --dump-tokens 拼提示★: 它按原文分词, 生成路却是
+  # build_prompt 套了聊天模板的(09-20 实撞 75 vs 79), 铁律"捕获必须可复现·与部署同路" ⇒ id 只认引擎自己打的。
+  # shellcheck disable=SC2086  # EXTRA 就是要按空格拆成多个参数
+  run ds4 "$tag" -n "$NGEN" --no-dspark --emit-trace --prompt-file "$P" $EXTRA
+  grep -a -h '^\[ptok\] \|^\[emit\] ' "$OUT/$tag.err" | sort -n -k2 | awk '{print $3}' > "$OUT/$tag.ids"
+  NP=$(grep -ac '^\[ptok\] ' "$OUT/$tag.err"); echo "$NP" > "$OUT/$tag.np"
+  [ "$NP" -gt 0 ] || echo "  ★没有 [ptok] 行: ds4 二进制早于 09-20 夜的 --emit-trace 提示打点, ids 缺提示段★"
+  echo "== 打转尺: $(basename "$MODEL") + $AMP, $(basename "$P"), $NGEN token → $OUT/$tag.out (ids $(wc -l < "$OUT/$tag.ids") = 提示 $NP + 生成 $(grep -ac '^\[emit\] ' "$OUT/$tag.err"))"
+  echo "  $(grep -a -h 'decode .* token' "$OUT/$tag.err") $(grep -a -h '稳态' "$OUT/$tag.err" | sed 's/.*⇒ //')"
+  echo "  字节 $(wc -c < "$OUT/$tag.out"), \"约？\" $(grep -ao '约？' "$OUT/$tag.out" | wc -l) 次"
+  # 按字切(grep -o . 在 UTF-8 locale 下一行一个字, 中文不被拆成字节), 再在 awk 里拼 4-gram 计数。
+  LC_ALL=C.utf8 grep -ao . "$OUT/$tag.out" | awk '
+    { c[NR]=$0 }
+    END { n=NR-3; if (n<1) { print "  文本太短, 不算 4-gram"; exit }
+          for (i=1;i<=n;i++) { g[i]=c[i] c[i+1] c[i+2] c[i+3]; s=int((i-1)/300); tot[s]++; if (cnt[g[i]]++) seen[s]++ }
+          for (i=1;i<=n;i++) if (cnt[g[i]]>1) rep++
+          best=""; bc=0; for (k in cnt) if (cnt[k]>bc) { bc=cnt[k]; best=k }
+          printf "  重复 4-gram 占比 %.1f%% (%d/%d), 最常见 \"%s\"×%d\n", 100*rep/n, rep, n, best, bc
+          printf "  每 300 字一段, 前文已出现过的 4-gram 占比:"; for (s=0;s<=int((n-1)/300);s++) printf " %d", int(100*seen[s]/tot[s]+0.5); printf "\n" }'
+  # 英文提示按词算(字级 4-gram 在英文里天然重复过半, 没有分辨力): 09-20 上午 readme 对照的读数 9.5% 就是词级。
+  tr -s '[:space:]' '\n' < "$OUT/$tag.out" | awk '
+    { w[NR]=$0 }
+    END { n=NR-3; if (n<1) exit; for (i=1;i<=n;i++) { g[i]=w[i] " " w[i+1] " " w[i+2] " " w[i+3]; cnt[g[i]]++ }
+          for (i=1;i<=n;i++) if (cnt[g[i]]>1) rep++; printf "  词级重复 4-gram 占比 %.1f%% (%d/%d 词)\n", 100*rep/n, rep, n }'
+  # 第一个"约？"落在全文的百分之几(字节口径够用): 09-20 凌晨两档都是 40% 处起, 起点变了说明改的是"何时开始记不住", 不只是次数。
+  b=$(grep -abo '约？' "$OUT/$tag.out" | head -1 | cut -d: -f1); t=$(wc -c < "$OUT/$tag.out")
+  [ -n "$b" ] && echo "  第一个\"约？\"在 $((100 * b / t))% 处(字节 $b / $t)"
+  exit 0
+fi
+
+# ★MODE=d1(2026-09-20 夜): "老师在复读位选谁" —— 判温 0 复读是模型本性还是量化/侧车的病★
+# 前置: loop 模式落的 <tag>.ids(+ .np = 提示 token 数); 教师锚与学生 logits 由 v41_judge.sh <ids> <n> engine:<模型>:<反修目录> 产
+#   在 gguf/v41judge/(teacher_<语料tag>_n<n>.bin / stu_<语料tag>_n<n>_eng_<模型>_amp_<反修>.bin)。
+# 读法: 先在生成段 ids 里找复读周期 P(尾部 ids[i]==ids[i-P] 的最小 P), 把生成段切成 首次出现(第 1 遍)/第 2 遍/第 3 遍…;
+#   anchor_metrics --row-out 每行 = 位置 kld smin same 老师命中 学生命中("命中" = argmax == 实际吐出的下一个 token)。
+#   第 2 遍起"老师命中"高 = FP 给同样前文也会抄 ⇒ 复读是模型本性, 五指标奖励"像老师"就等于奖励复读;
+#   "老师命中"低而"学生命中"高 = 老师会写别的, 学生自己锁死 ⇒ 量化/侧车的病。
+# 用法: ./speed-bench/d1_kv_ring_gate.sh none <模型> 0 d1 none <ids> <teacher.bin> <student.bin>
+if [ "$MODE" = d1 ]; then
+  IDS="${6:?ids 文件}"; TB="${7:?教师 logits}"; SB="${8:?学生 logits}"
+  NP=$(cat "${IDS%.ids}.np" 2>/dev/null); [ -n "$NP" ] || { echo "★缺 ${IDS%.ids}.np(提示 token 数), 先跑 loop 模式★"; exit 1; }
+  [ -x ./gguf-tools/bench/anchor_metrics ] || make -C gguf-tools anchor_metrics || exit 1
+  ./gguf-tools/bench/anchor_metrics --ref-raw "$TB" --ids "$IDS" --student "$SB" --row-out "$OUT/d1_rows.txt" | grep -E "==|Σmin|KLD|Same"
+  awk -v NP="$NP" '
+    FNR==NR { ids[NR-1]=$1; N=NR; next }
+    { kld[$1]=$2; same[$1]=$4; rh[$1]=$5; sh[$1]=$6; next }
+    END {
+      NG=N-NP; for (j=0;j<NG;j++) g[j]=ids[NP+j]
+      P=0; for (p=16; p<=int(NG/2) && !P; p++) { ok=1; for (i=NG-p;i<NG;i++) if (g[i]!=g[i-p]) { ok=0; break } if (ok) P=p }
+      if (!P) { print "  尾部没有复读周期(P 16~" int(NG/2) " 内无解)"; exit }
+      s=NG-P; while (s-1>=P && g[s-1]==g[s-1-P]) s--
+      printf "  复读周期 P=%d token; 复读区 = 生成第 %d~%d token(%.1f 遍), 首次出现 = 第 %d~%d\n", P, s, NG-1, (NG-s)/P, s-P, s-1
+      k=1; for (b=s-P; b<NG; b+=P) { e=b+P; if (e>NG) e=NG; n=0; a=0; c=0; d=0; q=0
+        for (j=b;j<e;j++) { r=NP+j-1; if (r in same) { n++; a+=same[r]; c+=rh[r]; d+=sh[r]; q+=kld[r] } }
+        printf "  第 %d 遍(生成 %d~%d, n=%d): 老师命中 %.1f%%  学生命中 %.1f%%  老师=学生 %.1f%%  KLD %.4f\n", k, b, e-1, n, n?100*c/n:0, n?100*d/n:0, n?100*a/n:0, n?q/n:0; k++ }
+      printf "  第 2 遍开头 12 个 token 逐位 老师命中/学生命中/KLD:"; for (j=s; j<s+12 && j<NG; j++) { r=NP+j-1; printf " %d/%d/%.2f", rh[r], sh[r], kld[r] } printf "\n"
+    }' "$IDS" "$OUT/d1_rows.txt"
+  exit 0
+fi
+
+# ★MODE=sim(2026-09-19): 调度器的离线陪审团 —— 接在 online 之后跑★
+# ①从 online 那趟投机的 [emit] 轨迹(位置 + id)拼出整段真 id 序列(提示 token 走 --dump-tokens, 与生成同一条渲染路);
+# ②教师强制取料(--dspark-capture): 每个位置都出一块草稿 + conf, 落 <pairs>.fix; ③gguf-tools/bench/dspark_sim 在主机上重放
+# 任何调度策略 × 成本假设的整段 ms/token。为什么: 在线只看得到调度器自己走过的位置, 歇着的 58% 的步该不该歇, 只有取料能判。
+# 成本(ms)取 online 那趟的实测: 走图一步与草稿一轮从日志解析; "直发验 1 行 42.5 / 每多一行 12.95" 是 09-18 钉死 k=1/k=3 两趟
+# 解出来的(fable5 09-18 断档诊断对照表: 一轮 69.4 / 95.3 ms), 没法从混合 k 的均值里解出来, 写死在这。
+# 用法: ./speed-bench/d1_kv_ring_gate.sh none <模型> 0 sim
+if [ "$MODE" = sim ]; then
+  P=speed-bench/fin_chat_prompt.txt
+  [ -s "$OUT/onl_spec.err" ] || { echo "★先跑 online 模式★"; exit 1; }
+  [ -x ./gguf-tools/bench/dspark_sim ] || make -C gguf-tools dspark_sim || exit 1
+  ./ds4 -m "$MODEL" --zchain "$AMP" --prompt-file "$P" --dump-tokens > "$OUT/sim.tok" 2> "$OUT/sim.tok.err" || { echo "★dump-tokens 失败★"; exit 2; }
+  { head -1 "$OUT/sim.tok" | tr -d '[] ' | tr ',' '\n'; grep -a '^\[emit\] ' "$OUT/onl_spec.err" | sort -n -k2 | awk '{print $3}'; } | grep -v '^$' > "$OUT/sim.ids"
+  NP=$(head -1 "$OUT/sim.tok" | tr ',' '\n' | wc -l); NG=$(grep -ac '^\[emit\] ' "$OUT/onl_spec.err")
+  echo "== sim: ids $(wc -l < "$OUT/sim.ids") = 提示 $NP + 生成 $NG"
+  ./ds4 -m "$MODEL" --zchain "$AMP" --score-ids "$OUT/sim.ids" --dspark-capture "$OUT/sim_pairs.bin" --decoder-full \
+      > /dev/null 2> "$OUT/sim_cap.err" || { echo "★取料失败★"; tail -3 "$OUT/sim_cap.err"; exit 3; }
+  grep -a "首位 ↔ 底座" "$OUT/sim_cap.err"
+  GMS=$(grep -a -h '稳态' "$OUT/onl_plain.err" | sed 's/.*稳态 \([0-9.]*\) ms.*/\1/'); DMS=$(grep -a -h '一轮 ' "$OUT/onl_spec.err" | sed 's/.*草稿 \([0-9.]*\).*/\1/')
+  ./gguf-tools/bench/dspark_sim "$OUT/sim_pairs.bin.fix" "$OUT/sim.ids" "${GMS:-37.97}" "${DMS:-13.5}" 42.5 12.95 16 "$NP" | tee "$OUT/sim.txt"
+  exit 0
+fi
+
 # 四个场景各自要抓的病: 2K = 环绕过很多圈; 12k = 稀疏路(indexer/top-k/压缩 KV)全量到;
 # spec/spec12k = 投机路(验证批的小批核 + 部分接受的回滚)。
 # ★--dspark 要显式传★(2026-09-16): 投机默认已改成**关**(同轨没绿之前引擎默认路径必须是裸模型)。
-CASES="ctx2k:--no-dspark|--ctx|32768|--prompt-file|$OUT/p2k.txt
-ctx12k:--no-dspark|--ctx|32768|--prompt-file|$OUT/p12k.txt
-spec:--dspark|--ctx|32768|--prompt-file|$OUT/p2k.txt
-spec12k:--dspark|--ctx|32768|--prompt-file|$OUT/p12k.txt"
+CASES="ctx2k:--no-dspark|--prompt-file|$OUT/p2k.txt
+ctx12k:--no-dspark|--prompt-file|$OUT/p12k.txt
+spec:--dspark|--prompt-file|$OUT/p2k.txt
+spec12k:--dspark|--prompt-file|$OUT/p12k.txt"
 
 fail=0
 for c in $CASES; do
@@ -155,6 +315,13 @@ echo "== 同轨(投机 == 纯解码, 同一个二进制)"
 for pair in "p2k:spec:ctx2k" "p12k:spec12k:ctx12k"; do
   nm="${pair%%:*}"; rest="${pair#*:}"; sp="${rest%%:*}"; pl="${rest#*:}"
   A="$OUT/new_$sp.out"; B="$OUT/new_$pl.out"
+  # ★投机必须真跑了才算★(2026-09-18 实撞): 草稿器在线静默失效(一个缓冲区太小)时一轮投机都没有, 输出当然与纯解码
+  # 逐字节同 —— "同轨"是空真, 门照样全绿, 只有 t/s 和缺失的 DSpark 汇总行露馅。所以先看汇总行(轮数 > 0)。
+  if ! grep -aq "DSpark: [1-9]" "$OUT/new_$sp.err"; then
+    echo "  $nm ★投机一轮都没跑(没有 DSpark 汇总行), 同轨这格是空真, 判无效★"; fail=1
+  else
+    echo "  $nm $(grep -a "DSpark:" "$OUT/new_$sp.err" | tail -1 | sed 's/^\[v41\] //')"
+  fi
   na=$(wc -c < "$A"); nb=$(wc -c < "$B"); n=$(( (na < nb ? na : nb) - 1 ))
   if [ "$n" -lt 16 ]; then echo "  $nm ★两边几乎没输出($na/$nb 字节), 判不了★"; fail=1
   elif cmp -s -n "$n" "$A" "$B"; then echo "  $nm 前 $n 字节逐字节同 ✓ (投机 $na / 纯解码 $nb 字节)"

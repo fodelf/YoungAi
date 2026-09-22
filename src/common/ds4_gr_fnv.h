@@ -21,16 +21,19 @@ static uint64_t ds4_gr_dir_fnv(const char *dir, unsigned nl, unsigned *n_file) {
     uint64_t h = DS4_GR_FNV_SEED;
     unsigned cnt = 0;
     unsigned char buf[65536];
+    static const char *const kinds[2] = { "gr", "rb" };   /* 增益表 + 路由偏置(2026-09-20): ② 的任一件换版, ③ 都得重解 */
     for (unsigned il = 0; il < nl; il++) {
-        char p[4200];
-        snprintf(p, sizeof p, "%s/gr_L%02u.bin", dir, il);
-        FILE *f = fopen(p, "rb");
-        if (!f) continue;
-        size_t got;
-        while ((got = fread(buf, 1, sizeof buf, f)) > 0)
-            for (size_t t = 0; t < got; t++) { h ^= buf[t]; h *= DS4_GR_FNV_PRIME; }
-        fclose(f);
-        cnt++;
+        for (int kd = 0; kd < 2; kd++) {
+            char p[4200];
+            snprintf(p, sizeof p, "%s/%s_L%02u.bin", dir, kinds[kd], il);
+            FILE *f = fopen(p, "rb");
+            if (!f) continue;
+            size_t got;
+            while ((got = fread(buf, 1, sizeof buf, f)) > 0)
+                for (size_t t = 0; t < got; t++) { h ^= buf[t]; h *= DS4_GR_FNV_PRIME; }
+            fclose(f);
+            cnt++;
+        }
     }
     if (n_file) *n_file = cnt;
     return h;

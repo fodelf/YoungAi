@@ -18,6 +18,7 @@ void ds4_engine_v41_set_decoder_full(int on);   /* --decoder-full: 关 CED, 提�
 void ds4_engine_v41_set_chunk(int n);           /* --v41-chunk: 预填分块大小(0 = 默认) */
 void ds4_engine_v41_set_dspark(int on);         /* --dspark: 开投机解码(默认关, 见 core_v41_api.c) */
 void ds4_engine_v41_set_graph(int on);          /* --no-graph 关解码整步 CUDA graph(默认开; 只作 A/B 与定位, 输出逐字节同) */
+void ds4_engine_v41_set_vq_group(int on);       /* --no-vq-group: 验证批/草稿塔的 VQ 专家核回逐对形态(默认分组核; 只作 A/B, 输出逐字节同) */
 void ds4_engine_v41_set_emit_trace(int on);     /* --emit-trace: 逐 token 打 [emit] 位置+id(同轨定位) */
 void ds4_engine_v41_set_block(unsigned b);      /* --dspark-block N: 钉死草稿块长(0=按元数据); 只作诊断 */
 void ds4_engine_v41_set_verify_k(unsigned k);   /* --dspark-verify N: 每轮验证几位(0=默认 3); 诊断与逐档量字节账用 */
@@ -39,7 +40,9 @@ int ds4_engine_v41_dspark_capture(ds4_engine *e, const int *ids, int n_ids, cons
  * 主模型一个字节不碰 —— 所以它**不可能**动五指标, 只动接受率。传 NULL/不传 = 不挂, 整条路恒等。 */
 void ds4_engine_v41_set_draft_amp(const char *path);
 void ds4_engine_v41_set_draft_amp_scale(float s);   /* --draft-amp-scale β: 诊断修正幅度 */
-int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_prompt, int n_predict, int ctx_size,
+/* 没有 ctx 参数: V4.1 的上下文来自模型元数据(ds4_engine_v41_ctx), 调用方定不了边界, 只定生成上限 n_predict
+ * (INT_MAX = 不设上限, 生成到 EOS 或上下文边界)。 */
+int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_prompt, int n_predict,
                                    ds4_v41_emit_fn emit, void *ud);
 /* 解码采样(2026-09-21, 113-1.md §4): 上面那条生成路的名字里的 argmax 是历史, 采样由这个设置面决定。
  * temperature ≤ 0(默认) = 裸 argmax: 图末尾的设备 argmax, 一个字节不变(门 = 温 0 输出逐字节回归)。
@@ -59,10 +62,12 @@ void ds4_engine_set_decode_sampling(const ds4_decode_sampling *sp);
  * 与 V4 会话的 ds4_session_set_progress 同一种回调形状 —— 服务端拿它发 SSE 心跳与预填进度日志。NULL = 不回调。
  * ★返回非 0 = 调用方要求中止这趟前向★(2026-09-22): 13 万 token 的提示光预填就要 400 秒, 客户端在这期间
  * 挂断的话这 400 秒是纯浪费, 而本服务串行跑图 —— 后面排队的请求跟着一起超时。服务端在这里探对端还在不在。
- * ds4_engine_v41_max_ctx: V4.1 前向的上下文硬上限(核用 shared 存整段组数), 服务端起服时把 --ctx 压到它以下。 */
+ * ds4_engine_v41_ctx: V4.1 上下文 = 模型元数据 deepseek4.context_length(转换器从 HF max_position_embeddings 写入; 开模型之前
+ * 是 0)。用户 2026-09-22 定"不要任何写死的上下文": 引擎里没有常量, 服务端 /v1/models 报的就是它, 每条请求的 max_tokens 按它钳;
+ * CLI/服务端都不接受 --ctx。 */
 typedef int (*ds4_v41_progress_fn)(void *ud, const char *event, int current, int total);
 void ds4_engine_v41_set_progress(ds4_v41_progress_fn fn, void *ud);
-int ds4_engine_v41_max_ctx(void);
+int ds4_engine_v41_ctx(void);
 
 /* 反修取料钩子(2026-09-13, C 反修驱动 gguf-tools/amp/v41_amp_run 用): 每层 MoE 出口、放大器应用前回调一次。
  * 全是主机内存、行主序: x[n][D] = MoE 输入(ffn_norm 出口, bf16 格点), y[n][D] = MoE 输出(bf16 格点, 还没加放大器),

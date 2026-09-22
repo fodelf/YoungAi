@@ -8,6 +8,8 @@ void ds4_gpu_set_expert_offload(int enabled) {
     g_expert_offload_verdict = enabled ? 1 : 0;
     g_expert_offload_cached = -1;   /* re-resolve on next query with the new verdict */
 }
+/* Metal 走 mmap 无拷贝视图, 没有 CUDA 那种设备侧权重缓存, 封顶无事可做(契约见 ds4_gpu_core.h)。 */
+void ds4_gpu_set_model_cache_limit_mb(uint64_t mb) { (void)mb; }
 
 uint64_t ds4_gpu_recommended_max_working_set_bytes(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;

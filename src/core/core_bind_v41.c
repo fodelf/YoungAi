@@ -31,6 +31,13 @@ static void expect(const ds4_tensor *t, uint32_t type, uint32_t ndim, uint64_t d
     }
 }
 
+/* 骨架矩阵的类型校验: 盘上可能是 fp4x32(量化器 --skel fp4) 或 q4_K(--skel q4k, 2026-09-19 的
+ * 100 GB 配方)。★只放开这一对, 形状照旧严校★ —— 真正按类型分发计算的是 v41_tproj / 出口头那几处,
+ * 这里放开而那边忘了加分支的话, 会当成 fp4x32 去解 q4_K 的字节: 不报错, 只出一整套假数。 */
+static void expect_skel(const ds4_tensor *t, uint32_t ndim, uint64_t d0, uint64_t d1) {
+    expect(t, t && t->type == DS4_TENSOR_Q4_K ? DS4_TENSOR_Q4_K : DS4_TENSOR_FP4X32, ndim, d0, d1);
+}
+
 void weights_bind_v41(ds4_weights *w, const ds4_model *m) {
     const ds4_v41_cfg *v = &g_ds4_v41;
     if (!v->active) ds4_die("weights_bind_v41 called without V4.1 metadata");
@@ -114,11 +121,18 @@ void weights_bind_v41(ds4_weights *w, const ds4_model *m) {
         t->ffn_gate_shexp = need(m, "mtp.%u.ffn_gate_shexp.weight", T);
         t->ffn_up_shexp   = need(m, "mtp.%u.ffn_up_shexp.weight", T);
         t->ffn_down_shexp = need(m, "mtp.%u.ffn_down_shexp.weight", T);
-        for (uint32_t e = 0; e < v->mtp_experts; e++) {
-            char nm[96];
-            snprintf(nm, sizeof nm, "mtp.%u.ffn_exp.%u.gate.weight", T, e); w->mtp.exp_gate[T][e] = required_tensor_name(m, nm);
-            snprintf(nm, sizeof nm, "mtp.%u.ffn_exp.%u.up.weight", T, e);   w->mtp.exp_up[T][e]   = required_tensor_name(m, nm);
-            snprintf(nm, sizeof nm, "mtp.%u.ffn_exp.%u.down.weight", T, e); w->mtp.exp_down[T][e] = required_tensor_name(m, nm);
+        /* ★三塔专家两种在盘形态★: 逐专家 fp4x32 三张量(09-17 起从原件取), 或一个 VQ blob(2026-09-19 的 100 GB 配方,
+         * 7.22 → 2.36 GB)。blob 形态只绑这一张、exp_* 留空: 草稿器按它分流到主干的 VQ 融合核(core_v41_draft.c
+         * v41_draft_exp_off / core_v41_forward.c v41_moe, 2026-09-20 起两种形态都能武装)。主干前向不碰三塔。 */
+        char bn[96]; snprintf(bn, sizeof bn, "mtp.%u.ffn_exps_vq.blob", T);
+        w->mtp.exps_vq[T] = model_find_tensor(m, bn);
+        if (!w->mtp.exps_vq[T]) {
+            for (uint32_t e = 0; e < v->mtp_experts; e++) {
+                char nm[96];
+                snprintf(nm, sizeof nm, "mtp.%u.ffn_exp.%u.gate.weight", T, e); w->mtp.exp_gate[T][e] = required_tensor_name(m, nm);
+                snprintf(nm, sizeof nm, "mtp.%u.ffn_exp.%u.up.weight", T, e);   w->mtp.exp_up[T][e]   = required_tensor_name(m, nm);
+                snprintf(nm, sizeof nm, "mtp.%u.ffn_exp.%u.down.weight", T, e); w->mtp.exp_down[T][e] = required_tensor_name(m, nm);
+            }
         }
     }
     if (v->mtp_towers) {
@@ -135,9 +149,9 @@ void weights_bind_v41(ds4_weights *w, const ds4_model *m) {
     const uint64_t E = DS4_N_EMBD, hc_dim = (uint64_t)E * DS4_N_HC, mix = 2u * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM, out_low = (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O;
     const uint64_t grp_in = DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP);
-    expect(w->token_embd, DS4_TENSOR_FP4X32, 2, E, DS4_N_VOCAB);
+    expect_skel(w->token_embd, 2, E, DS4_N_VOCAB);
     expect(w->output_norm, DS4_TENSOR_F32, 1, E, 0);
-    expect(w->output, DS4_TENSOR_FP4X32, 2, E, DS4_N_VOCAB);
+    expect_skel(w->output, 2, E, DS4_N_VOCAB);
     if (v->n_engram) {
         expect(w->engram_token_map, DS4_TENSOR_I32, 1, DS4_N_VOCAB, 0);
         expect(w->engram_multipliers, 27u, 2, v->engram_max_ngram, v->n_engram);
@@ -152,14 +166,14 @@ void weights_bind_v41(ds4_weights *w, const ds4_model *m) {
         expect(l->hc_attn_scale, DS4_TENSOR_F32, 1, 3, 0);
         expect(l->hc_attn_base, DS4_TENSOR_F32, 1, mix, 0);
         expect(l->attn_norm, DS4_TENSOR_F32, 1, E, 0);
-        expect(l->attn_q_a, DS4_TENSOR_FP4X32, 2, E, DS4_N_LORA_Q);
+        expect_skel(l->attn_q_a, 2, E, DS4_N_LORA_Q);
         expect(l->attn_q_a_norm, DS4_TENSOR_F32, 1, DS4_N_LORA_Q, 0);
-        expect(l->attn_q_b, DS4_TENSOR_FP4X32, 2, DS4_N_LORA_Q, q_dim);
-        expect(l->attn_kv, DS4_TENSOR_FP4X32, 2, E, DS4_N_HEAD_DIM);
+        expect_skel(l->attn_q_b, 2, DS4_N_LORA_Q, q_dim);
+        expect_skel(l->attn_kv, 2, E, DS4_N_HEAD_DIM);
         expect(l->attn_kv_a_norm, DS4_TENSOR_F32, 1, DS4_N_HEAD_DIM, 0);
         expect(l->attn_sinks, DS4_TENSOR_F32, 1, DS4_N_HEAD, 0);
-        expect(l->attn_output_a, DS4_TENSOR_FP4X32, 2, grp_in, out_low);
-        expect(l->attn_output_b, DS4_TENSOR_FP4X32, 2, out_low, E);
+        expect_skel(l->attn_output_a, 2, grp_in, out_low);
+        expect_skel(l->attn_output_b, 2, out_low, E);
         if (v->is_kv_source[il]) {
             expect(l->attn_compressor_kv, DS4_TENSOR_BF16, 2, E, DS4_N_HEAD_DIM);
             if (ratio > 1) expect(l->attn_compressor_gate, DS4_TENSOR_BF16, 2, E, DS4_N_HEAD_DIM);
@@ -168,7 +182,7 @@ void weights_bind_v41(ds4_weights *w, const ds4_model *m) {
             expect(l->indexer_k_norm, DS4_TENSOR_F32, 1, DS4_N_INDEXER_HEAD_DIM, 0);
         }
         if (v->is_index_source[il]) {
-            expect(l->indexer_attn_q_b, DS4_TENSOR_FP4X32, 2, DS4_N_LORA_Q, (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM);
+            expect_skel(l->indexer_attn_q_b, 2, DS4_N_LORA_Q, (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM);
             expect(l->indexer_proj, DS4_TENSOR_BF16, 2, E, DS4_N_INDEXER_HEAD);
         }
         expect(l->hc_ffn_fn, DS4_TENSOR_F32, 2, hc_dim, mix);
@@ -177,9 +191,9 @@ void weights_bind_v41(ds4_weights *w, const ds4_model *m) {
         expect(l->ffn_norm, DS4_TENSOR_F32, 1, E, 0);
         expect(l->ffn_gate_inp, DS4_TENSOR_BF16, 2, E, DS4_N_EXPERT);
         expect(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, DS4_N_EXPERT, 0);
-        expect(l->ffn_gate_shexp, DS4_TENSOR_FP4X32, 2, E, DS4_N_FF_EXP);
-        expect(l->ffn_up_shexp, DS4_TENSOR_FP4X32, 2, E, DS4_N_FF_EXP);
-        expect(l->ffn_down_shexp, DS4_TENSOR_FP4X32, 2, DS4_N_FF_EXP, E);
+        expect_skel(l->ffn_gate_shexp, 2, E, DS4_N_FF_EXP);
+        expect_skel(l->ffn_up_shexp, 2, E, DS4_N_FF_EXP);
+        expect_skel(l->ffn_down_shexp, 2, DS4_N_FF_EXP, E);
         if (v->engram_index_of[il] >= 0) {
             expect(l->engram_wkv, DS4_TENSOR_FP8_32X32, 2, (uint64_t)(v->engram_max_ngram - 1) * v->engram_heads * v->engram_head_dim, E * (DS4_N_HC + 1));
             expect(l->engram_q, DS4_TENSOR_F32, 2, E, DS4_N_HC);

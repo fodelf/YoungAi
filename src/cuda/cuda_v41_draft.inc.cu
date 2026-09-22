@@ -137,24 +137,51 @@ int ds4_gpu_v41_mtp_moe_tensor(ds4_gpu_tensor *out, const void *model_map, uint3
  * ★取的是 engram 之后、层之前的 h★ —— 调用点在 core_v41_forward.c 的层循环里, 不是层输出。 */
 /* ★只搬最后 n_rows 行★: 预填一块有几千个 token, 而草稿器只吃"最后那几位"的 main_hidden
  * (下一轮草稿从最后一个已定 token 出发) —— 整块都搬的话 4096 × 3 × 5120 × 4 B = 251 MB 白写。 */
+/* ★落点是按绝对位置定格的环★(2026-09-18, 见 ds4_gpu_v41.h 的声明注释): 第 t 行 → ((pos + t) % cap) 格。
+ * graph 路 n=1、位置只在设备槽: pos = posd[0] + src_row0(src_row0 恒 0)。 */
 __global__ static void v41_hc_mean_kernel(float *out, const float *hc, uint32_t E, uint32_t n_hc, uint32_t n_rows,
-                                          uint32_t src_row0, uint32_t slot, uint32_t n_slot) {
+                                          uint32_t src_row0, uint32_t slot, uint32_t n_slot,
+                                          uint32_t dst_pos0, uint32_t cap, const int32_t *posd) {
     const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (uint64_t)n_rows * E) return;
     const uint32_t t = (uint32_t)(i / E), d = (uint32_t)(i % E);
     const float *h = hc + (uint64_t)(src_row0 + t) * n_hc * E + d;
     float s = 0.f;
     for (uint32_t c = 0; c < n_hc; c++) s += h[(uint64_t)c * E];
-    out[(uint64_t)t * n_slot * E + (uint64_t)slot * E + d] = s / (float)n_hc;
+    const uint32_t pos = posd ? (uint32_t)posd[0] + src_row0 : dst_pos0;
+    out[(uint64_t)((pos + t) % cap) * n_slot * E + (uint64_t)slot * E + d] = s / (float)n_hc;
 }
 int ds4_gpu_v41_hc_mean_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *hc, uint32_t n_embd, uint32_t n_hc,
-                               uint32_t n_rows, uint32_t src_row0, uint32_t slot, uint32_t n_slot) {
-    if (!out || !hc || !n_rows) return 0;
+                               uint32_t n_rows, uint32_t src_row0, uint32_t slot, uint32_t n_slot,
+                               uint32_t dst_pos0, uint32_t cap, const ds4_gpu_tensor *posd) {
+    if (!out || !hc || !n_rows || !cap || n_rows > cap) return 0;
     const uint64_t n = (uint64_t)n_rows * n_embd;
-    if (out->bytes < (uint64_t)n_rows * n_slot * n_embd * 4) return 0;
+    if (out->bytes < (uint64_t)cap * n_slot * n_embd * 4) return 0;
     v41_hc_mean_kernel<<<(unsigned)((n + 255) / 256), 256, 0, g_cur_stream>>>(
-        (float *)out->ptr, (const float *)hc->ptr, n_embd, n_hc, n_rows, src_row0, slot, n_slot);
+        (float *)out->ptr, (const float *)hc->ptr, n_embd, n_hc, n_rows, src_row0, slot, n_slot,
+        dst_pos0, cap, posd ? (const int32_t *)posd->ptr : NULL);
     return cuda_ok(cudaGetLastError(), "v41 hc mean");
+}
+
+/* 环 → 连续: dst[t] = ring[(first_row + t) % cap]。一 block 一行, 行内按 float 步进(row_floats = 目标层数 × E = 15360) */
+/* firstd(2026-09-22, 草稿一轮进图): 非 NULL 时起始行从设备 int 读(图开头由零拷贝小核灌), 主机的 first_row 不用 —— 每轮补窗口的起点
+ * 随上一轮接受数变, 烤进图就错(不报错, 只是窗口里的行错位, 接受率掉)。 */
+__global__ static void v41_ring_rows_kernel(float *dst, const float *ring, uint32_t row_floats, uint32_t cap,
+                                            uint32_t first_row, uint32_t count, const int32_t *firstd) {
+    const uint32_t t = blockIdx.x;
+    if (t >= count) return;
+    if (firstd) first_row = (uint32_t)firstd[0];
+    const float *src = ring + (uint64_t)((first_row + t) % cap) * row_floats;
+    float *d = dst + (uint64_t)t * row_floats;
+    for (uint32_t j = threadIdx.x; j < row_floats; j += blockDim.x) d[j] = src[j];
+}
+int ds4_gpu_v41_ring_rows_tensor(ds4_gpu_tensor *dst, const ds4_gpu_tensor *ring, uint32_t row_floats, uint32_t cap,
+                                 uint32_t first_row, uint32_t count, const ds4_gpu_tensor *firstd) {
+    if (!dst || !ring || !count || !cap || count > cap) return 0;
+    if (dst->bytes < (uint64_t)count * row_floats * 4 || ring->bytes < (uint64_t)cap * row_floats * 4) return 0;
+    v41_ring_rows_kernel<<<count, 256, 0, g_cur_stream>>>((float *)dst->ptr, (const float *)ring->ptr, row_floats, cap, first_row, count,
+                                                          firstd ? (const int32_t *)firstd->ptr : NULL);
+    return cuda_ok(cudaGetLastError(), "v41 ring rows");
 }
 
 /* markov 头的 embed: 按**设备上**的 token id 取 bf16 表的一行 → f32(bf16 格点)。

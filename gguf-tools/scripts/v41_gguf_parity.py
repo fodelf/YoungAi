@@ -18,7 +18,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from v41_hf_io import build_index, _mm  # noqa: E402
 
-GT = {0: ("f32", 1, 4), 1: ("f16", 1, 2), 26: ("i32", 1, 4), 27: ("i64", 1, 8), 42: ("vqblob", 1, 1), 43: ("fp4x32", 32, 17)}
+GT = {12: ("q4_K", 256, 144), 30: ("bf16", 1, 2), 0: ("f32", 1, 4), 1: ("f16", 1, 2), 26: ("i32", 1, 4), 27: ("i64", 1, 8), 42: ("vqblob", 1, 1), 43: ("fp4x32", 32, 17)}
 
 
 def read_gguf(path):
@@ -69,10 +69,20 @@ def main():
     print(f"[gguf] {len(tens)} 张量, {len(kv)} 键, 数据区起点 {data0}, 变体 {kv.get('deepseek4.variant')}, 压缩比 {kv['deepseek4.attention.compress_ratios'][:6]}…")
     bad = 0
     def raw(name):
-        p, off, dt, shp = idx[name]; nbytes = {"I8": 1, "F8_E4M3": 1, "F8_E8M0": 1, "BF16": 2, "F16": 2, "F32": 4, "U8": 1}[dt] * int(np.prod(shp))
+        p, off, dt, shp = idx[name]
+        if dt == "Q4_K":   # 块格式: shape 记逻辑形状, 字节按 144/256 算(按 shape 算会短 4.5 倍)
+            nbytes = shp[0] * (shp[1] // 256) * 144
+        else:
+            nbytes = {"I8": 1, "F8_E4M3": 1, "F8_E8M0": 1, "BF16": 2, "F16": 2, "F32": 4, "U8": 1}[dt] * int(np.prod(shp))
         return np.frombuffer(_mm(p)[off:off + nbytes], dtype=np.uint8), shp
-    # ① fp4x32
+    # ① 骨架: 按量化目录里登记的 dtype 分流(fp4x32 或 q4_K), 两者都必须逐字节搬过来
     for gn, hn in ((f"blk.{L}.attn_q_a.weight", f"layers.{L}.attn.wq_a.weight"), (f"blk.{L}.ffn_down_shexp.weight", f"layers.{L}.ffn.shared_experts.w2.weight"), ("token_embd.weight", "embed.weight")):
+        if idx[hn][2] == "Q4_K":
+            w, shp = raw(hn)
+            got = tbytes(mm, data0, tens[gn])
+            ok = np.array_equal(got, w)
+            print(f"  q4_K {gn}: {'✓ 逐字节同' if ok else '★不同★'}  ({shp[0]}×{shp[1] // 256} 块, {len(w)} B)"); bad += not ok
+            continue
         w, shp = raw(hn); sc, sshp = raw(hn[:-6] + "scale")
         rows, cb = shp[0], shp[1] // 16
         blocks = tbytes(mm, data0, tens[gn]).reshape(rows, cb, 17)

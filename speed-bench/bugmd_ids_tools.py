@@ -10,6 +10,8 @@
   cmp-emit <a.err> <b.err>                两份 --emit-trace 日志的 [emit] 序列: 同的位数 / 第一处不同的绝对位置与两边 id。
   cmp-topk <topk.bin> <ids> <n_prompt>    --score-topk 小文件(ETGD 格式)的 top-1 vs 真吐 id: 逐位一致率、第一处不同、
                                           按生成段每 1000 位的一致率。位置 i 的 top-1 预测的是 ids[i+1]。
+  eos-scan <topk.bin> <ids> <n_prompt> [tok=1]
+                                          生成段逐位找 EOS 的排名与概率: 分清"模型想停引擎没听"和"模型自己不想停"。
 """
 import struct
 import sys
@@ -104,6 +106,7 @@ def cmd_cmp_topk(topk_path, ids_path, n_prompt):
         top1[i] = (tid[j], pr[j])
     agree = 0; first = None; buckets = {}
     total = 0
+    diffs = []
     for i in range(n_prompt - 1, len(ids) - 1):   # 位置 i 预测 ids[i+1]; 只看生成段(含预测第一个生成 id 的那一位)
         if i not in top1: continue
         total += 1
@@ -111,13 +114,64 @@ def cmd_cmp_topk(topk_path, ids_path, n_prompt):
         buckets.setdefault(b, [0, 0]); buckets[b][1] += 1
         if top1[i][0] == ids[i + 1]:
             agree += 1; buckets[b][0] += 1
-        elif first is None:
-            first = (i, ids[i + 1], top1[i][0], top1[i][1])
+        else:
+            diffs.append((i, top1[i][1]))
+            if first is None: first = (i, ids[i + 1], top1[i][0], top1[i][1])
     print("预填路(全 40 层) top-1 vs 解码路真吐 id: 生成段 %d 位, 一致 %d (%.2f%%)" % (total, agree, 100.0 * agree / max(1, total)))
     if first: print("第一处不同: 位置 %d, 真吐 %d, 预填路 top-1 %d (p=%.3f)" % first)
+    # ★分歧的"底气"分布★(2026-09-22): 两条路在平局位上翻面是浮点次序的正常代价; 真病的指纹是
+    # "预填路很有把握却被解码路选了别的"。09-22 修 VQ 位平面之前 141 处分歧里这一档占 66 处(47%)。
+    if diffs:
+        bands = [("<0.35 近平局", 0.0, 0.35), ("0.35~0.70", 0.35, 0.70), ("★>0.70 预填路明确偏好★", 0.70, 1.01)]
+        print("分歧 %d 处, 按预填路 top-1 概率分档:" % len(diffs))
+        for name, lo, hi in bands:
+            sel = [d for d in diffs if lo <= d[1] < hi]
+            print("  %-24s %4d 处 (%.0f%%)%s" % (name, len(sel), 100.0 * len(sel) / len(diffs),
+                  "  位置: " + " ".join(str(d[0]) for d in sel[:12]) if sel and hi > 1.0 else ""))
     for b in sorted(buckets):
         a, t = buckets[b]
         print("  生成第 %5d~%5d 位: %.2f%% (%d/%d)" % (b * 1000, b * 1000 + 999, 100.0 * a / t, a, t))
+
+
+def cmd_eos_scan(topk_path, ids_path, n_prompt, tok="1"):
+    """--score-topk(ETGD)里逐位找"模型想不想停": 生成段每一位上 EOS 排第几、概率多少。
+
+    为什么要它(2026-09-22): "写完了却不停"有两种完全不同的病 ——
+      EOS 是 top-1 却还在往下写 ⇒ 引擎没听模型的(引擎 bug);
+      EOS 从头到尾排不进 top-10 ⇒ 模型自己就不想停(提示词/贪心的事, 改引擎没用)。
+    这一位的文本对齐很麻烦(id→文字要 tokenizer), 所以不挑位置, 整段扫: 报 EOS 进过 top-K 的
+    所有位置 + 全段 EOS 概率最高的那一位。不需要知道"报告写完是第几个 token"也能判。"""
+    ids = [int(x) for x in open(ids_path).read().split()]
+    n_prompt, tok = int(n_prompt), int(tok)
+    f = open(topk_path, "rb")
+    magic, K, S, V = struct.unpack("<4I", f.read(16))
+    assert magic == 0x44475445, "不是 ETGD 文件"
+    row = struct.Struct("<Iiff" + "%di" % K + "%df" % K)
+    hits, best = [], None
+    while True:
+        buf = f.read(row.size)
+        if len(buf) < row.size: break
+        v = row.unpack(buf)
+        i = v[0]
+        if i < n_prompt - 1: continue
+        tid, pr = v[4:4 + K], v[4 + K:4 + 2 * K]
+        order = sorted(range(K), key=lambda q: -pr[q])
+        for rank, q in enumerate(order):
+            if tid[q] == tok:
+                hits.append((i, rank + 1, pr[q], tid[order[0]], pr[order[0]]))
+                if best is None or pr[q] > best[2]: best = hits[-1]
+                break
+    print("生成段 EOS(id %d) 进过 top-%d 的位置: %d 处" % (tok, K, len(hits)))
+    for i, rank, p, t1, p1 in hits[:40]:
+        print("  生成第 %6d 位(绝对 %6d): EOS 排第 %d p=%.4f; top-1 是 %d p=%.4f%s" %
+              (i - (n_prompt - 1), i, rank, p, t1, p1, "  ★EOS 就是 top-1★" if rank == 1 else ""))
+    if len(hits) > 40: print("  …… 还有 %d 处" % (len(hits) - 40))
+    if best:
+        print("全段最想停的一位: 生成第 %d 位, EOS 排第 %d p=%.4f (top-1 %d p=%.4f)" %
+              (best[0] - (n_prompt - 1), best[1], best[2], best[3], best[4]))
+    else:
+        print("★整段生成里 EOS 一次都没进过 top-%d —— 模型自己不想停, 不是引擎压着它★" % K)
+    print("真吐序列末 id = %d (%s)" % (ids[-1], "EOS, 模型自己收的口" if ids[-1] == tok else "不是 EOS, 顶到上限"))
 
 
 def cmd_rows(rows_path, ids_path, n_prompt, entry_pos, tokenizer_json="", window="12"):
@@ -154,7 +208,8 @@ def cmd_rows(rows_path, ids_path, n_prompt, entry_pos, tokenizer_json="", window
 
 
 if __name__ == "__main__":
-    cmds = {"extract": cmd_extract, "cut": cmd_cut, "cmp-emit": cmd_cmp_emit, "cmp-topk": cmd_cmp_topk, "rows": cmd_rows}
+    cmds = {"extract": cmd_extract, "cut": cmd_cut, "cmp-emit": cmd_cmp_emit, "cmp-topk": cmd_cmp_topk,
+            "eos-scan": cmd_eos_scan, "rows": cmd_rows}
     if len(sys.argv) < 2 or sys.argv[1] not in cmds:
         sys.exit(__doc__ + "  rows <rows.txt> <ids> <n_prompt> <入口位置> [tokenizer.json] [窗口=12]   --row-out 的分桶命中率 + 入口逐行解码\n")
     cmds[sys.argv[1]](*sys.argv[2:])

@@ -1176,6 +1176,7 @@ Flags beyond the basics documented above:
 |---|---|---|
 | `--mem-budget-mb N` | all | Arms the memory guardrails: watchdog aborts at 90% of N, the L1 load gate refuses startup when planned resident bytes exceed 85% of N, and the expert resident/stream AUTO verdict compares against it. Unset = guardrails disarmed (model-loading scripts must pass it; 12000 on the 16 GB Macs). |
 | `--prefill-chunk N` | all | Prefill batch chunk cap in tokens (`0` = whole prompt as one batch). Default: backend-specific (Metal min(prompt, 4096), CUDA token-sliced 256). |
+| (context size) | ds4, ds4-server | DeepSeek V4.1's context size is the model's own declaration: GGUF `deepseek4.context_length`, written by the converter from HF `max_position_embeddings` (1,048,576 for V4.1 Flash). Nothing in the engine hard-codes it and there is no `--ctx` flag; passing one is an error. State is allocated per request from the positions actually used, so the bound costs no memory (a full 1M KV is 0.88 GiB). |
 | `--spec` | ds4, ds4-server | DSpark speculative decoding with the online speculate-vs-flat scheduler. Greedy verify is position-exact, so token output is byte-identical to flat decode; default off. |
 | `--draft-gguf FILE` / `--draft-zchain FILE` | ds4, ds4-server | Mount a standalone DSpark drafter GGUF / its amplifier sidecar (merged into chain slots 43..45). |
 | `--vq-dir DIR` | ds4, ds4-server | VQ codebook sidecar directory (takes precedence over `--residual`; both absent = embedded blob auto-load). |
