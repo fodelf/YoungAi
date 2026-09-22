@@ -6788,7 +6788,10 @@ FP 教师 + 引擎学生已发车(01:14, `v41_judge.sh gguf/go-onebit/qtfreal/60
 
 ### qtf 侧改了哪些文件(那个仓库没有 git, 原文件已备份到 `.bak-20260922-claude/`)
 `modules/deepseek.py`(GatedLLM + finish_reason tap + 不重试 + market_llm) / `crews/market/market.py`(换 market_llm, 重试 1) /
-`crews/stock_screener/config/agents.yaml`(goal 去掉 {stock_list}) / `backend/app/services/market_service.py`(只认 JSON)。
+`crews/stock_screener/config/agents.yaml`(goal 去掉 {stock_list}) / `backend/app/services/market_service.py`(只认 JSON) /
+13 个 crew 文件的 `max_retry_limit` 5 → 1(同一条理由: 贪心解码下重发是把同一道题再算一遍; 留 1 次给网络抖动)。
+**CFO 的两个 agent 保持 10 没动**(cfo.py / cfo_has.py): 5 都改了唯独它是 10, 看得出是用户特意调的, 改它要明示同意。
+提一句账: CFO 那一步撞上限一次约 11 分钟, 门现在会判它 length ⇒ 最坏 10 次重试 = 110 分钟都在重算同一份答案。
 **部署方式**: 镜像的 Dockerfile 把 `COPY src/` 放在 `uv sync` 之前, 改一行源码就会触发 800 MB 依赖重下(那台机器上常断),
 所以没有重建镜像, 而是 `docker cp` 进运行中的容器 + `docker restart`(已验证: 调度器 04:30/15:30 都在, 新模块加载正常)。
 ★下次 `docker compose up --force-recreate` 或重建镜像会回到旧代码★ —— 仓库里的源码已经是新的, 重建一次就永久生效。
