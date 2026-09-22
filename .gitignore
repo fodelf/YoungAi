@@ -48,3 +48,5 @@ route_alpha_set
 /gguf-tools/quantize/v41_to_gguf
 /gguf-tools/amp/finetune_solve
 /.playwright-mcp/
+/gguf-tools/bench/dspark_agree
+/gguf-tools/dspark_align
