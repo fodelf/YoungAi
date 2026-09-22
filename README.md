@@ -587,7 +587,11 @@ conversation. Useful commands are `/help`, `/think`, `/think-max`, `/nothink`,
 and returns to `ds4>`.
 
 The CLI defaults to thinking mode. Use `/nothink` or `--nothink` for direct
-answers. `--mtp MTP.gguf --mtp-draft 2` enables the optional MTP speculative
+answers. Prompts are rendered exactly as DeepSeek V4.1's official
+`encoding/encoding.py` does: a leading system message (and, in thinking mode,
+the `Reasoning Effort: 75|100 (...)` line) sits inside a `<｜System｜>` block
+right after BOS; the golden byte strings live in
+`tests/server_tests_render.c` (`test_render_matches_official_v41_encoding`). `--mtp MTP.gguf --mtp-draft 2` enables the optional MTP speculative
 path; it is useful only for greedy decoding, currently uses a confidence gate
 (`--mtp-margin`) to avoid slow partial accepts, and should be treated as an
 experimental slight-speedup path.
@@ -679,6 +683,30 @@ Default sampled API generation uses `temperature=1`, `top_p=1`, and
 `min_p=0.05`, so the default filter is relative probability rather than
 nucleus mass. In thinking mode DS4 uses those fixed sampling defaults and
 ignores client sampling knobs, matching DeepSeek's fixed-thinking API behavior.
+
+**The V4.1 generation path samples differently, and the difference is
+deliberate.** A request that does *not* carry `temperature` is decoded
+**greedily** (argmax), not with the `temperature=1` default above — the engine's
+default path is the bare model output, and every ruler script in this repo
+depends on that. A request that *does* carry `temperature` is honoured exactly
+as sent, in thinking mode too (the V4 path's "thinking ignores sampling knobs"
+rule does not apply here). Two traps worth knowing before you trust a sampling
+run: `min_p` still defaults to `0.05`, which in a high-confidence stretch (a
+repeat loop, for instance) filters every alternative away and silently turns
+sampling back into greedy decoding — pass `min_p: 0` for the official
+`temperature=1` / `top_p=0.95` recipe; and `top_p < 1` currently sorts the whole
+vocabulary on the host, which costs about 20% of decode throughput.
+
+A client that disconnects mid-request stops the work. The server probes the
+socket every 16 generated tokens and between prefill chunks, so an abandoned
+request no longer burns GPU time or blocks the queue behind it. Requests are
+served one at a time, so this matters: before the probe existed, one client
+timeout could snowball into every later request timing out too.
+
+When thinking mode is on and the model never emits `</think>` (it hit the token
+limit while still reasoning), the reply carries the partial reasoning in
+`reasoning_content` with **empty** `content` and `finish_reason=length`, the same
+shape the official reasoner API uses. Do not treat such a reply as an answer.
 
 The chat, Responses, and Anthropic endpoints support SSE streaming. In thinking
 mode, reasoning is streamed in the native API shape instead of being mixed into
