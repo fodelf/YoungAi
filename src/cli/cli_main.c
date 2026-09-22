@@ -185,6 +185,8 @@ int main(int argc, char **argv) {
                                         cfg.gen.imatrix_max_tokens);
     } else if (cfg.gen.perplexity_file_path) {
         rc = run_perplexity_file(engine, &cfg);
+    } else if (cfg.gen.gen_ids_path) {
+        rc = run_gen_ids(engine, &cfg);
     } else if (cfg.gen.score_ids_path) {
         /* score-ids 不需要 prompt; 放 REPL 判断之前, 否则无 -p 时被吞进交互模式 */
         rc = run_score_ids(engine, &cfg);

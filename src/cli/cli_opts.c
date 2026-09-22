@@ -330,6 +330,9 @@ cli_config parse_options(int argc, char **argv) {
             c.gen.route_daily = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-logits")) {
             c.gen.dump_logits_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--gen-ids")) {
+            /* 按 token id 续写: 真实请求的序列只有 id 是准的(文本重新分词拼不回去, 09-20 实撞 79 vs 75) */
+            c.gen.gen_ids_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--score-ids")) {
             c.gen.score_ids_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--score-out")) {

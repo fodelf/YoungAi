@@ -37,6 +37,7 @@ typedef struct {
     const char *route_daily;  /* --route-daily: full cached model (Mode G) */
     const char *dump_logits_path;
     const char *score_ids_path;   /* --score-ids: teacher-forced 逐位打分(公开对拍) */
+    const char *gen_ids_path;     /* --gen-ids: 把文件里的 token id 当提示续写(真实请求复现: 文本重新分词拼不回原序列) */
     const char *score_out_path;
     float draft_amp_scale;        /* --draft-amp-scale β(默认 1.0) */
     const char *draft_amp;        /* --draft-amp FILE: 草稿器对齐边车(mtp.md M6) */
@@ -149,6 +150,7 @@ int  run_generation(ds4_engine *engine, const cli_config *cfg);
 
 /* cli_diag.c */
 int run_score_ids(ds4_engine *engine, const cli_config *cfg);
+int run_gen_ids(ds4_engine *engine, const cli_config *cfg);
 int run_v41_generation(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt);   /* V4.1 贪心生成(cli_diag.c) */
 int run_logits_dump(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt);
 int run_logprob_dump(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt);

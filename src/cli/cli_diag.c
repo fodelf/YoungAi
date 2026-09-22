@@ -62,6 +62,26 @@ int run_v41_generation(ds4_engine *engine, const cli_config *cfg, const ds4_toke
     return rc;
 }
 
+/* --gen-ids FILE: 文件里的 token id 当提示(整段预填), 之后照常解码续写。
+ * ★为什么要它★(2026-09-22): 要判"解码路写的状态跟预填写的状态一不一样", 就得拿同一段上下文跑两次 ——
+ * 一次让解码路自己写出来, 一次整段重新预填再续写。而真实请求的序列只有 token id 是准的:
+ * 把文本重新分词拼不回引擎当时真吃的那一串(09-20 实撞 79 vs 75 个 token)。--score-ids 只出 logits 不续写,
+ * 所以单独开这个口子。它不改任何执行路径, 与 -p 走的是同一个 run_v41_generation。 */
+int run_gen_ids(ds4_engine *engine, const cli_config *cfg) {
+    FILE *fi = fopen(cfg->gen.gen_ids_path, "r");
+    if (!fi) { fprintf(stderr, "ds4: --gen-ids 打不开 %s\n", cfg->gen.gen_ids_path); return 1; }
+    ds4_tokens prompt = {0};
+    int t;
+    while (fscanf(fi, "%d", &t) == 1) ds4_tokens_push(&prompt, t);
+    fclose(fi);
+    if (prompt.len < 1) { fprintf(stderr, "ds4: --gen-ids 文件里没有 token id\n"); ds4_tokens_free(&prompt); return 1; }
+    if (!ds4_engine_is_v41(engine)) { fprintf(stderr, "ds4: --gen-ids 只接 V4.1 路\n"); ds4_tokens_free(&prompt); return 1; }
+    fprintf(stderr, "ds4: --gen-ids 提示 %d token(按 id 原样喂, 不重新分词)\n", prompt.len);
+    const int rc = run_v41_generation(engine, cfg, &prompt);
+    ds4_tokens_free(&prompt);
+    return rc;
+}
+
 int run_score_ids(ds4_engine *engine, const cli_config *cfg) {
     FILE *fi = fopen(cfg->gen.score_ids_path, "r");
     if (!fi) { fprintf(stderr, "ds4: --score-ids 打不开 %s\n", cfg->gen.score_ids_path); return 1; }
