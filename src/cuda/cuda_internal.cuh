@@ -173,3 +173,25 @@ static int q4k_hc_expand_launch(float *out_hc, float *block_out, const float *re
                                 const char *w, const int8_t *xq, const float *xs, uint32_t kblocks, uint32_t out_dim,
                                 uint32_t n_embd, uint32_t n_hc);
 
+
+/* ==== PDL(programmatic dependent launch, 2026-09-23): 解码图里让下一个核在上一个核还没跑完时就发射 ====
+ * 为什么: 走图之后核间空隙只剩 0.1 µs, 真正的浪费是①单 block 小核(hc_fused/rms/router 各 4~9 µs)跑的时候另外 47 个 SM 干等,
+ * ②每个 GEMV 起步要先等第一批权重从 DRAM 回来。权重是常量, 与上一步无关 ⇒ 下一个核可以先把权重读进 shared, 再等上一步的激活。
+ * 怎么接: 捕获收尾时(cuda_decode_graph.inc.cu)把"核 → 已登记核"的边改成程序化边(出口 = 上游所有 block 已开跑);
+ * 已登记的核必须在读任何"前面的核产出的东西"之前调 v41_pdl_wait() —— 它等上游**完成且内存可见**。
+ * 不经 PDL 发射(直发路/没被改边)时 griddepcontrol.wait 立即返回, 所以同一个核两条路都能用。
+ * ★出错会怎样★: 登记了却漏了 wait(或 wait 之前就读了激活/写了全局)⇒ 读到上一步的半成品, 不报错, 输出悄悄变。
+ * 门 = 走图 vs 直发逐字节同(d0a 的 prof.out 与 nsys.out)。 */
+__device__ __forceinline__ static void v41_pdl_wait(void) { asm volatile("griddepcontrol.wait;" ::: "memory"); }
+#define V41_PDL_MAX 64
+static const void *g_v41_pdl_ready[V41_PDL_MAX];
+static int g_v41_pdl_n = 0;
+/* 发射端调: 声明"这个核函数已在读上游产出之前调了 v41_pdl_wait"。重复登记无害。 */
+static void v41_pdl_register(const void *fn) {
+    for (int i = 0; i < g_v41_pdl_n; i++) if (g_v41_pdl_ready[i] == fn) return;
+    if (g_v41_pdl_n < V41_PDL_MAX) g_v41_pdl_ready[g_v41_pdl_n++] = fn;
+}
+static int v41_pdl_is_ready(const void *fn) {
+    for (int i = 0; i < g_v41_pdl_n; i++) if (g_v41_pdl_ready[i] == fn) return 1;
+    return 0;
+}
