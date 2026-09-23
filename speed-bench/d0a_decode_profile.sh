@@ -35,11 +35,18 @@ DO_NSYS="${2:-yes}"
 # ★第 9 个参数: 换二进制★(2026-09-16) —— 判"这一刀让哪个核变快/变慢"必须同机器状态两个二进制各跑一遍,
 # 跨会话的 t/s 不可比(memory: 换 GGUF/换会话 = 换机器状态)。默认 ds4, 给 ds4.base 就是量改造前那份。
 BIN="${9:-ds4}"
-MODEL="${3:-gguf/v41/DeepSeek-V4.1-Flash-vq8x4096-fp4.gguf}"
+MODEL="${3:-gguf/v41/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf}"
 PSRC="${4:-}"
 PCHARS="${5:-40000}"
-AMP=gguf/v41/gr-fin-40-fp4
+# ★第 13 个参数: 反修目录, none = 裸模型★(2026-09-23): 以前写死 gr-fin-40-fp4, 那是 fp4 底座的残差;
+# 09-22 fp4 模型已删、现役换 v3 之后再拿它挂 v3 不报错但增益全错(反修按某一份量化文件解, 不通用)。
+# 默认 = 现役对(v3 + grrb)。换模型就成对换第 3 与第 13 个参数。
+AMP="${13:-gguf/v41/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-vqfin41_vqhalf_a_n8192-engine}"
+ZARG=(--zchain "$AMP"); [ "$AMP" = none ] && ZARG=()
 OUT=/tmp/d0a-decode-${BIN}
+# ★第二个参数给 table = 不跑模型, 拿现成的 dec.nsys-rep 重出 ③④ 两张表★(2026-09-23): 第 14 个参数 = 那份 rep 所在目录。
+# 为什么要它: 两档上下文串着采时共用 $OUT, 后一趟会把前一趟的 trace 覆盖掉; 表的正则修了也不该为重出一张表再跑一趟模型。
+[ "$DO_NSYS" = table ] && OUT="${14:-$OUT}"
 PROMPT="你好世界"     # 3 token: 预填几乎不占时间, 采到的基本全是解码
 
 mkdir -p "$OUT"
@@ -85,8 +92,18 @@ if [ "$DO_NSYS" = spec ] || [ "$DO_NSYS" = specno ]; then
   echo "   ②'步的总毫秒'那一行是每次前向, 不是每 token —— 每 token 看引擎自己打的'一轮 … ⇒ ms/token'。"
 fi
 
+# ★第二个参数给 wall = 纯墙钟尺(2026-09-23)★: 不开 --v41-prof(它强制直发)、不开 nsys, 照产品那样走图解 NGEN 步, 只报引擎自己的
+# "[graph] 稳态 ms/步"。为什么要它: PDL(核提前发射)那一刀在 nsys 下两个读数打架(按步切的墙钟变快、引擎稳态变慢),
+# 采样器本身会改变核的重叠方式 ⇒ 判"整步到底快没快"只认这把尺; 两个二进制交替各跑两趟取中。
+if [ "$DO_NSYS" = wall ]; then
+  ./"$BIN" -m "$MODEL" "${ZARG[@]}" --temp 0 --seed 1 -n "$NGEN" "${SPEC[@]}" "${EXTRA_ARGS[@]}" "${PARG[@]}" \
+    > "$OUT/wall.out" 2> "$OUT/wall.err"
+  echo "  $BIN: $(grep -a -o '稳态 [0-9.]* ms/步 = [0-9.]* t/s' "$OUT/wall.err" | tail -1)  (输出 $(wc -c < "$OUT/wall.out") 字节, md5 $(md5sum < "$OUT/wall.out" | cut -c1-8))"
+  exit 0
+fi
+if [ "$DO_NSYS" != table ]; then
 echo "== ① 引擎逐层毫秒(--v41-prof, 生成 $NGEN token)"
-./"$BIN" -m "$MODEL" --zchain "$AMP" --v41-prof --temp 0 --seed 1 -n "$NGEN" \
+./"$BIN" -m "$MODEL" "${ZARG[@]}" --v41-prof --temp 0 --seed 1 -n "$NGEN" \
       "${SPEC[@]}" "${EXTRA_ARGS[@]}" "${PARG[@]}" > "$OUT/prof.out" 2> "$OUT/prof.err"
 grep -a "总 .* | 层(ms)" "$OUT/prof.err" | tail -3
 # ★为什么判决取中位不取平均★(2026-09-15 撞的): spark 上 110 GB 模型 mmap 在 121 GB 机器里,
@@ -154,13 +171,25 @@ if [ "$DO_NSYS" = ncu ]; then
   M5=l1tex__t_sector_hit_rate.pct,lts__t_sector_hit_rate.pct,lts__t_sectors_srcunit_tex_op_read.sum,l1tex__t_sectors_pipe_lsu_mem_global_op_ld_lookup_miss.sum
   PASSES="${11:-1 2 3}"
   for pass in $PASSES; do
+    # ★第 6 趟 = 逐条 SASS 的停等采样(2026-09-23)★: 前五趟只说"warp 在等什么类型", 说不出"在哪条指令上等"。
+    # 专家常驻核排除了激活与位流两个嫌疑之后 long_scoreboard 仍 ≈ 9, 只能看是哪几条 SASS 背着停等样本。
+    # 输出 = 按样本数降序的前 40 条 SASS(地址/指令/样本数), 全表在 $OUT/ncu6.csv。只采 1 发(第 7 参数给 1)。
+    if [ "$pass" = 6 ]; then
+      echo "== ② ncu 第 6 趟: SourceCounters(逐条 SASS 停等采样)"
+      "$NCU" --replay-mode application --clock-control none --target-processes all -k "$KREGEX" \
+        --launch-skip "$NSKIP" --launch-count "$NLAUNCH" --section SourceCounters --page source --print-source sass --csv \
+        ./"$BIN" -m "$MODEL" "${ZARG[@]}" --temp 0 --seed 1 -n 8 "${SPEC[@]}" "${EXTRA_ARGS[@]}" "${PARG[@]}" \
+        > "$OUT/ncu6.csv" 2> "$OUT/ncu6.err"
+      head -2 "$OUT/ncu6.csv"
+      continue
+    fi
     eval "MM=\$M$pass"
     echo "== ② ncu 第 $pass 趟: $MM"
     # ★--clock-control none★: 别锁时钟。这台板子锁不了(统一内存 + 没有 root), 不传它 ncu 每趟都先
     # 试着锁一遍再警告, 白等; 而判决本来就是同机器状态两个二进制各两遍取中位, 不靠锁时钟。
     "$NCU" --replay-mode application --clock-control none --target-processes all -k "$KREGEX" \
       --launch-skip "$NSKIP" --launch-count "$NLAUNCH" --metrics "$MM" --csv \
-      ./"$BIN" -m "$MODEL" --zchain "$AMP" --temp 0 --seed 1 -n 8 "${SPEC[@]}" "${EXTRA_ARGS[@]}" "${PARG[@]}" \
+      ./"$BIN" -m "$MODEL" "${ZARG[@]}" --temp 0 --seed 1 -n 8 "${SPEC[@]}" "${EXTRA_ARGS[@]}" "${PARG[@]}" \
       > "$OUT/ncu$pass.csv" 2> "$OUT/ncu$pass.err"
     grep -a "^\"" "$OUT/ncu$pass.csv" | head -40 || tail -20 "$OUT/ncu$pass.err"
   done
@@ -187,7 +216,7 @@ rm -f "$OUT/dec.nsys-rep" "$OUT/dec.sqlite"
 # ★--cuda-graph-trace=node★(2026-09-18 实撞): 默认按整张 graph 记一行, 图里的核一个都看不见 —— 解码整步 graph 落地后
 # ③ 那张逐步表把 32 个解码步全算成一步、逐核合计里只剩预填的核。按节点记, 图里的核与直发的同名同列。
 nsys profile -o "$OUT/dec" --force-overwrite true -t cuda --cuda-graph-trace=node \
-  ./"$BIN" -m "$MODEL" --zchain "$AMP" --temp 0 --seed 1 -n "$NGEN" "${SPEC[@]}" "${EXTRA_ARGS[@]}" "${PARG[@]}" \
+  ./"$BIN" -m "$MODEL" "${ZARG[@]}" --temp 0 --seed 1 -n "$NGEN" "${SPEC[@]}" "${EXTRA_ARGS[@]}" "${PARG[@]}" \
   > "$OUT/nsys.out" 2> "$OUT/nsys.err"
 
 # ★删 sqlite 要在**第一条 nsys stats 之前**★(2026-09-16 实撞): 原来只在 ③ 前面删, 于是 ②
@@ -199,6 +228,7 @@ nsys stats --report cuda_gpu_kern_sum "$OUT/dec.nsys-rep" 2>/dev/null | head -25
 echo "-- CUDA API(前 12): 这里出现 Synchronize/Memcpy 大头 = 主机往返"
 nsys stats --report cuda_api_sum "$OUT/dec.nsys-rep" 2>/dev/null | head -20
 
+fi   # table 模式从这里接上
 # ③ 逐核时间线分账(2026-09-15 single.md §1 的尺): 按 v41_embed_kernel 切步, 每步求 墙钟/核忙/间隙/发射数,
 #    再把骨架 GEMV / 专家 gateup·down / 注意力 / engram 各自的毫秒列出来, 末尾给专家核逐层 µs(长尾一眼看见)。
 #    怎么读: 核忙 ≈ 墙钟 ⇒ 瓶颈在核内; 间隙大 ⇒ 发射/主机; 专家逐层里某几层 10 倍 ⇒ 那几层的 blob 没进设备缓存。
@@ -213,15 +243,17 @@ awk -F, -v ngen="$NGEN" '
 # 全落进看不见的余项里。加 indexer 打分 / topk / mHC / D2D 拷贝四列, 再加一张**只统计解码步**的
 # 逐核名次表 —— 长提示时 nsys 自带的 kern_sum 把预填的核混在一起, 那张表判不了解码。
 NR>1 { st=$1+0; du=$2+0; line=$0;
-  if (line ~ /v41_embed_kernel/) { step++; sstart[step]=st; lastend=st; }
+  # ★核名跟着骨架格式走★(2026-09-23 实撞): v3 换 q4_K 骨架后嵌入核叫 v41_q4k_embed_kernel、骨架 GEMV 叫 v41_q4k_gemv_kernel,
+  # 注意力拆成 attn_mma_seg + sparse_attn_merge 两发; 旧正则一个都对不上, 这张表整张是空的却不报错。
+  if (line ~ /v41_(q4k_)?embed_kernel/) { step++; sstart[step]=st; lastend=st; }
   if (step>0) {
     nk[step]++; busy[step]+=du;
     if (st>lastend) gaps[step]+=(st-lastend);
     if (st+du>lastend) lastend=st+du;
     if (line ~ /vq_gateup/) { gi[step]++; gd[step,gi[step]]=du; }
     if (line ~ /vq_down/)   { di[step]++; dd[step,di[step]]=du; }
-    if (line ~ /fp4x32_gemv_kernel<\(unsigned int\)1>/) { gemvsum[step]+=du; gemvn[step]++; }
-    if (line ~ /sparse_attn/) att[step]+=du;
+    if (line ~ /(fp4x32|q4k)_gemv_kernel<\(unsigned int\)1>|q4k_gemv1_/) { gemvsum[step]+=du; gemvn[step]++; }
+    if (line ~ /sparse_attn|attn_mma_seg/) att[step]+=du;
     if (line ~ /fp8blk_gemv/) eng[step]+=du;
     if (line ~ /indexer_score/) { idx[step]+=du; idxn[step]++; }
     if (line ~ /v41_topk_kernel|candidate_kernel/) tk[step]+=du;
@@ -269,13 +301,12 @@ echo
 echo "== ④ 按步类型分类的逐核表(草稿 / 验证 n= / 预填)"
 awk -F, '
 NR>1 { st=$1+0; du=$2+0; nm=$21; gsub(/"/,"",nm); sub(/^ *void /,"",nm);
-  if (nm ~ /v41_embed_kernel/) { step++; sstart[step]=st; }
+  if (nm ~ /v41_(q4k_)?embed_kernel/) { step++; sstart[step]=st; }
   if (step>0) { key=nm; base=key; sub(/[(<].*/,"",base);
      # ★NT 要从**整行**匹配, 不能从 $21★(2026-09-17 实撞): 核名里有逗号, -F, 把它切成好几列,
      # 列数还随核名长短变 ⇒ $21 有时不含 "<", 于是 ntstep 保留上一步的值, 把同一种 5 行验证步
      # 标成了 n1/n2/n3/n4/n5 五档(看着像"边际随批长", 其实是同一个量的五次采样)。
-     if ($0 ~ /fp4x32_gemv_kernel<\(unsigned int\)[0-9]+/) { match($0,/fp4x32_gemv_kernel<\(unsigned int\)[0-9]+/);
-        ntstep[step]=substr($0,RSTART+34,RLENGTH-34) }
+     if (match($0,/(fp4x32|q4k)_gemv_kernel<\(unsigned int\)[0-9]+/)) { ntv=substr($0,RSTART,RLENGTH); sub(/.*\)/,"",ntv); ntstep[step]=ntv }
      if (base ~ /mtp_/) mtpstep[step]=1;
      if (base ~ /nvfp4|cutlass|Kernel/) pf[step]=1;
      t[step,base]+=du; n[step,base]++; tot[step]+=du;
