@@ -34,6 +34,7 @@ __global__ static void v41_attn_mma_seg_kernel(float *pacc, float *pmax, float *
                                                const int32_t *idx, uint32_t pos0, uint32_t window,
                                                uint32_t ng, uint32_t topk, uint32_t n_head,
                                                float scale, uint32_t ratio, uint32_t nseg, const int32_t *posd) {
+    v41_pdl_wait();   /* PDL: 第一句就等上游(见 cuda_internal.cuh); 不经 PDL 发射时立即返回 */
     /* graph: 位置在设备槽; n 行(gridDim.z, 投机验证批进图)时源层组数 = (pos0 + n)/ratio, 与直发路主机传的 ng_src 同式 */
     if (posd) { pos0 = (uint32_t)posd[0]; ng = ratio ? (pos0 + gridDim.z) / ratio : 0u; if (ng < topk) topk = ng; }
     namespace wmma = nvcuda::wmma;

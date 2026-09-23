@@ -117,6 +117,7 @@ __global__ static void v41_x_to_bf16_kernel(__nv_bfloat16 *out, const float *x, 
     if (i < n) out[i] = __float2bfloat16(x[i]);
 }
 __global__ static void v41_round_bf16_kernel(float *x, uint64_t n) {
+    v41_pdl_wait();   /* PDL: 第一句就等上游(见 cuda_internal.cuh); 不经 PDL 发射时立即返回 */
     const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] = v41_bf16r(x[i]);
 }
@@ -343,6 +344,7 @@ int ds4_gpu_v41_embed_fp4x32_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *t
 
 /* RMSNorm 带权 → bf16(官方 RMSNorm: f32 算, weight 是 bf16 值, 结果 .to(bf16)) */
 __global__ static void v41_rms_norm_kernel(float *out, const float *x, const float *w, uint32_t dim, float eps) {
+    v41_pdl_wait();   /* PDL: 第一句就等上游(见 cuda_internal.cuh); 不经 PDL 发射时立即返回 */
     const uint32_t r = blockIdx.x; const float *xr = x + (uint64_t)r * dim; float *o = out + (uint64_t)r * dim;
     float s = 0.f;
     for (uint32_t i = threadIdx.x; i < dim; i += blockDim.x) s += xr[i] * xr[i];

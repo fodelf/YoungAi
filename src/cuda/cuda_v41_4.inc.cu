@@ -334,6 +334,7 @@ int ds4_gpu_v41_amp_apply_tensor(ds4_gpu_tensor *y, const ds4_gpu_tensor *x, con
 
 /* ---- 小件: 就地 x = bf16(x·s)(indexer weights 缩放, 原先主机往返) / argmax(原先读回 517 KB 主机扫) ---- */
 __global__ static void v41_scale_round_kernel(float *x, uint64_t n, float s) {
+    v41_pdl_wait();   /* PDL: 第一句就等上游(见 cuda_internal.cuh); 不经 PDL 发射时立即返回 */
     const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] = v41_bf16r(x[i] * s);
 }

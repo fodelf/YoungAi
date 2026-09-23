@@ -95,3 +95,19 @@
 #include "src/cuda/cuda_hc.inc.cu"
 #include "src/cuda/cuda_zchain_1.inc.cu"
 #include "src/cuda/cuda_zchain_2.inc.cu"
+
+/* ★PDL 小核集中登记(2026-09-23)★: 这些核第一句就是 v41_pdl_wait()(见 cuda_internal.cuh 的 PDL 段), 所以前面的边可以改成程序化边 ——
+ * 它们本身没有可预读的常量, 省的是发射与上线开销(与上一个核的收尾重叠)。放在聚合根末尾: 所有核都已定义, 这里才拿得到函数地址。
+ * 新增一个小核想进来: 先在它第一句加 v41_pdl_wait(), 再加到这张表; 只加表不加 wait = 读到上一步的半成品。 */
+static void v41_pdl_register_small(void) {
+    const void *fns[] = {
+        (const void *)v41_rms_norm_kernel, (const void *)v41_round_bf16_kernel, (const void *)v41_rope_kernel,
+        (const void *)v41_compress_step_n_kernel, (const void *)v41_act_quant_kernel, (const void *)v41_kv_pack_kernel,
+        (const void *)v41_hc_post_kernel, (const void *)v41_hc_fused_kernel, (const void *)v41_router_kernel,
+        (const void *)v41_swiglu_kernel, (const void *)v41_engram_gate_kernel, (const void *)v41_vq_xpack_kernel,
+        (const void *)v41_vq_tail_kernel, (const void *)v41_win_commit_kernel, (const void *)v41_attn_mma_seg_kernel,
+        (const void *)v41_sparse_attn_merge_kernel, (const void *)v41_indexer_score_kernel, (const void *)v41_topk_kernel,
+        (const void *)v41_candidate_kernel, (const void *)v41_scale_round_kernel, (const void *)v41_fp8blk_gemv_kernel<1u, 0u>,
+    };
+    for (size_t i = 0; i < sizeof fns / sizeof fns[0]; i++) v41_pdl_register(fns[i]);
+}

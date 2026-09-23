@@ -393,6 +393,7 @@ static int v41_vq_fused_moe_n(float *out, const uint8_t *blob, uint32_t IN, uint
 /* ★MoE 尾巴四发合一(2026-09-18, 小核合并)★: y = bf16(Σ_k w·partial + so)。原来是 reduce → copy(y←routed) → add(y+=so) → round 四发;
  * 算式一个字没动(同 k 序累加得 a, 再 a + so, 再舍 bf16) ⇒ 逐位同。partial 就是上面 down 核留在暂存里的那份。 */
 __global__ static void v41_vq_tail_kernel(float *y, const float *partial, const float *w, const float *so, uint32_t K, uint32_t OUT) {
+    v41_pdl_wait();   /* PDL: 第一句就等上游(见 cuda_internal.cuh); 不经 PDL 发射时立即返回 */
     const uint32_t t = blockIdx.y, o = blockIdx.x * 256u + threadIdx.x;
     if (o >= OUT) return;
     float a = 0.f;

@@ -22,6 +22,7 @@ __device__ __forceinline__ static float v41_rope_freq(uint32_t i, uint32_t dim, 
 }
 __global__ static void v41_rope_kernel(float *x, const int32_t *pos, uint32_t n_head, uint32_t head_dim, uint32_t n_rot,
                                        float theta, uint32_t osl, float factor, float bf, float bs, int inverse) {
+    v41_pdl_wait();   /* PDL: 第一句就等上游(见 cuda_internal.cuh); 不经 PDL 发射时立即返回 */
     const uint32_t t = blockIdx.y, h = blockIdx.x;
     const uint32_t i = threadIdx.x;                 /* 复数下标 i < n_rot/2 */
     if (i >= n_rot / 2u) return;
@@ -82,6 +83,7 @@ int ds4_gpu_v41_compress_pool_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *
  * 一 block 逐行走(n ≤ 8, 每行一次 __syncthreads: 上一组池化读完 0..ratio−1 格, 后面的行才许盖第 0 格)。 */
 __global__ static void v41_compress_step_n_kernel(float *pooled, int32_t *posg, float *ckv_c, float *csc_c, float *snap_kv, float *snap_sc,
                                                   const float *ckv, const float *csc, const int32_t *posd, uint32_t ratio, uint32_t dim, uint32_t n) {
+    v41_pdl_wait();   /* PDL: 第一句就等上游(见 cuda_internal.cuh); 不经 PDL 发射时立即返回 */
     const uint32_t pos0 = (uint32_t)posd[0], pend = pos0 % ratio;
     if (snap_kv)
         for (uint32_t r = 0; r < pend; r++)

@@ -24,6 +24,7 @@ __global__ static void v41_kv_pack_kernel(uint8_t *cache, const float *rows, uin
                                           uint32_t dim, uint32_t blk, uint32_t row_bytes,
                                           uint32_t nib_bytes, uint32_t nb_row, int mode,
                                           const int32_t *posd, uint32_t ratio, uint32_t g_trash, uint32_t nbatch) {
+    v41_pdl_wait();   /* PDL: 第一句就等上游(见 cuda_internal.cuh); 不经 PDL 发射时立即返回 */
     const uint32_t r = blockIdx.x / nb_row, b = blockIdx.x % nb_row, lane = threadIdx.x;
     /* graph 路(ds4_gpu_v41.h "设备位置"口径): 组号按设备位置算 —— 本批(nbatch 行, 起点 pos0)凑满了 ng_new 组, 第 r 个池化行是
      * 第 pos0/ratio + r 组; r ≥ ng_new 的行写垃圾槽(缓存末尾多分配的一格, 永远没人读)。于是这一发每步无条件进图, 拓扑与相位无关。
@@ -110,6 +111,7 @@ int ds4_gpu_v41_idxk_pack_tensor(ds4_gpu_tensor *cache, uint32_t g0, const ds4_g
  * 报的是 invalid argument, 不是"超上限", 看着像参数写错, 实际是网格形状。展平成一维后上限变成 2^31-1,
  * 块开到 4096(段 5 要的)也够。 */
 __global__ static void v41_act_quant_kernel(float *x, uint32_t dim, uint32_t block, int mode, uint32_t nb_row) {
+    v41_pdl_wait();   /* PDL: 第一句就等上游(见 cuda_internal.cuh); 不经 PDL 发射时立即返回 */
     /* mode 0: fp8 e4m3 值 + ue8m0 scale(max 448); 1: fp4 + ue8m0(max 6); 2: fp4 + e4m3 scale(max 6) */
     const uint32_t row = blockIdx.x / nb_row, b = blockIdx.x % nb_row;
     const uint32_t lane = threadIdx.x;

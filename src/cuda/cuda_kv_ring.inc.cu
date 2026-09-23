@@ -21,6 +21,7 @@
  * grid.x = 要提交的行数, 每 block 搬一行 hd 个 float。 */
 __global__ static void v41_win_commit_kernel(float *win, uint32_t pos0, uint32_t i0, uint32_t window, uint32_t hd,
                                              const int32_t *posd) {
+    v41_pdl_wait();   /* PDL: 第一句就等上游(见 cuda_internal.cuh); 不经 PDL 发射时立即返回 */
     const uint32_t j = blockIdx.x, i = i0 + j;
     if (posd) pos0 = (uint32_t)posd[0];   /* graph 路: 位置在设备槽(ds4_gpu_v41.h "设备位置"口径) */
     const float *src = win + (uint64_t)(window + i) * hd;

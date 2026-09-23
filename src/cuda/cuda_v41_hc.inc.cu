@@ -240,6 +240,7 @@ __global__ static void v41_hc_fused_kernel(float *pre, float *post, float *comb,
                                            const float *scale, const float *base,
                                            const float *nw, uint32_t n_embd, uint32_t n_hc, uint32_t iters,
                                            float hc_eps, float norm_eps) {
+    v41_pdl_wait();   /* PDL: 第一句就等上游(见 cuda_internal.cuh); 不经 PDL 发射时立即返回 */
     const uint32_t n = blockIdx.x, mix_hc = 2u * n_hc + n_hc * n_hc;
     const float *m = mix + (uint64_t)n * mix_hc;
     __shared__ float c[64], sh[1024];   /* sh 的槽数 = blockDim(见发射端那段 ncu 账) */
@@ -387,6 +388,7 @@ int ds4_gpu_v41_hc_fused_tensor(ds4_gpu_tensor *pre, ds4_gpu_tensor *post, ds4_g
 /* hc_post(官方 hc_post 逐式): out[k][d] = post[k]·y[d] + Σ_j comb[j][k]·res[j][d] → bf16 */
 __global__ static void v41_hc_post_kernel(float *out, const float *y, const float *res, const float *post, const float *comb,
                                           uint32_t n_embd, uint32_t n_hc) {
+    v41_pdl_wait();   /* PDL: 第一句就等上游(见 cuda_internal.cuh); 不经 PDL 发射时立即返回 */
     const uint32_t n = blockIdx.y;
     const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d >= n_embd) return;

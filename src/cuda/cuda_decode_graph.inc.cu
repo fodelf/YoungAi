@@ -9,7 +9,9 @@
  * Relaxed 放过去, 它会**立刻执行**而不进图, 重放时那一步就少了(同步 memcpy 尤其致命: 图里没有它, 每步都读旧值)。
  * 出错会怎样: capture_end 返回 NULL 时这一步的核一个都没跑, 调用方必须直发重来, 否则状态少推进一步。
  * 全部走 cudaStreamPerThread: 引擎按 -default-stream per-thread 编译, 无流参数的发射都落在它上面(捕获态照样进图)。 */
+static void v41_pdl_register_small(void);   /* 定义在聚合根 ds4_cuda.cu 末尾(那里所有核都已定义) */
 int ds4_gpu_decode_graph_capture_begin(void) {
+    v41_pdl_register_small();
     cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
     if (cudaStreamIsCapturing(cudaStreamPerThread, &cs) != cudaSuccess || cs != cudaStreamCaptureStatusNone) {
         (void)cudaGetLastError();
@@ -20,6 +22,38 @@ int ds4_gpu_decode_graph_capture_begin(void) {
         return 0;
     }
     return 1;
+}
+
+/* 把"核 → 已登记核(v41_pdl_register)"的普通边改成程序化边(见 cuda_internal.cuh 的 PDL 段)。
+ * 出口用 LaunchCompletion(上游所有 block 都已开跑就放下游发射): 上游核一行不用改(不必调 trigger);
+ * 上游那时已全部驻留, 下游 block 只占空位, 不会把上游饿死。下游完成与内存可见由它自己的 v41_pdl_wait 保证。
+ * 返回改了几条; -1 = API 失败(调用方丢掉这张图, 不带着半改的边去实例化)。 */
+static int decode_graph_pdl_edges(cudaGraph_t graph) {
+    if (g_v41_pdl_n == 0) return 0;
+    size_t ne = 0;
+    if (cudaGraphGetEdges(graph, NULL, NULL, NULL, &ne) != cudaSuccess) { (void)cudaGetLastError(); return -1; }
+    if (ne == 0) return 0;
+    cudaGraphNode_t *from = (cudaGraphNode_t *)malloc(ne * sizeof *from), *to = (cudaGraphNode_t *)malloc(ne * sizeof *to);
+    cudaGraphEdgeData *ed = (cudaGraphEdgeData *)malloc(ne * sizeof *ed);
+    int n = 0, bad = 0;
+    if (!from || !to || !ed || cudaGraphGetEdges(graph, from, to, ed, &ne) != cudaSuccess) bad = 1;
+    for (size_t i = 0; !bad && i < ne; i++) {
+        if (ed[i].type != cudaGraphDependencyTypeDefault || ed[i].from_port != cudaGraphKernelNodePortDefault) continue;
+        cudaGraphNodeType tf, tt;
+        if (cudaGraphNodeGetType(from[i], &tf) != cudaSuccess || cudaGraphNodeGetType(to[i], &tt) != cudaSuccess) { bad = 1; break; }
+        if (tf != cudaGraphNodeTypeKernel || tt != cudaGraphNodeTypeKernel) continue;
+        cudaKernelNodeParams kp; memset(&kp, 0, sizeof kp);
+        if (cudaGraphKernelNodeGetParams(to[i], &kp) != cudaSuccess) { bad = 1; break; }
+        if (!v41_pdl_is_ready(kp.func)) continue;
+        cudaGraphEdgeData pe; memset(&pe, 0, sizeof pe);
+        pe.from_port = cudaGraphKernelNodePortLaunchCompletion; pe.type = cudaGraphDependencyTypeProgrammatic;
+        if (cudaGraphRemoveDependencies(graph, &from[i], &to[i], &ed[i], 1) != cudaSuccess ||
+            cudaGraphAddDependencies(graph, &from[i], &to[i], &pe, 1) != cudaSuccess) { bad = 1; break; }
+        n++;
+    }
+    free(from); free(to); free(ed);
+    if (bad) { fprintf(stderr, "ds4: [graph] PDL 改边失败: %s\n", cudaGetErrorString(cudaGetLastError())); return -1; }
+    return n;
 }
 
 void *ds4_gpu_decode_graph_capture_end(void) {
@@ -33,6 +67,8 @@ void *ds4_gpu_decode_graph_capture_end(void) {
     }
     size_t n_nodes = 0;
     (void)cudaGraphGetNodes(graph, NULL, &n_nodes);
+    const int n_pdl = decode_graph_pdl_edges(graph);
+    if (n_pdl < 0) { (void)cudaGraphDestroy(graph); return NULL; }
     cudaGraphExec_t exec = NULL;
     const cudaError_t ei = cudaGraphInstantiate(&exec, graph, 0);
     (void)cudaGraphDestroy(graph);
@@ -41,7 +77,7 @@ void *ds4_gpu_decode_graph_capture_end(void) {
         (void)cudaGetLastError();
         return NULL;
     }
-    fprintf(stderr, "ds4: [graph] 解码整步已捕获: %zu 个节点\n", n_nodes);
+    fprintf(stderr, "ds4: [graph] 解码整步已捕获: %zu 个节点(其中 %d 条边改成 PDL 程序化边)\n", n_nodes, n_pdl);
     return (void *)exec;
 }
 

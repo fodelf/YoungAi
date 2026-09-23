@@ -173,6 +173,7 @@ __host__ __device__ __forceinline__ static uint32_t v41_attn_nseg_at(uint32_t p,
 __global__ static void v41_sparse_attn_merge_kernel(float *o, const float *pacc, const float *pmax, const float *psum,
                                                     const float *sink, uint32_t nseg, uint32_t n_head, uint32_t hd,
                                                     const int32_t *posd, uint32_t window, uint32_t ratio, uint32_t topk) {
+    v41_pdl_wait();   /* PDL: 第一句就等上游(见 cuda_internal.cuh); 不经 PDL 发射时立即返回 */
     const uint32_t h = blockIdx.x, i = blockIdx.y;
     const uint64_t b0 = (uint64_t)i * nseg * n_head;   /* 局部件的行步长按 grid 的 nseg(上限)排 */
     if (posd) nseg = v41_attn_nseg_at((uint32_t)posd[0] + i, window, ratio, topk);   /* 第 i 行的位置 = pos0 + i(n 行批同式) */

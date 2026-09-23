@@ -207,6 +207,7 @@ __global__ static void v41_fp8blk_gemv_kernel(float *out, const uint8_t *w, cons
                                               uint32_t in_dim, uint32_t out_dim, uint32_t sbc, uint32_t ksplit,
                                               uint32_t x_stride, uint32_t out_stride,
                                               uint32_t x_gstride, uint32_t out_gstride) {
+    v41_pdl_wait();   /* PDL: 第一句就等上游(见 cuda_internal.cuh); 不经 PDL 发射时立即返回 */
     const uint32_t g = blockIdx.y;
     w += (uint64_t)g * in_dim * out_dim;
     sc += (uint64_t)g * ((out_dim + 31u) / 32u) * sbc;

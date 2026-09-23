@@ -8,6 +8,7 @@
 #define V41_ROUTER_PER_LANE 12u
 __global__ static void v41_router_kernel(int32_t *sel, float *wts, const float *logits, const float *bias,
                                          uint32_t n_tok, uint32_t n_expert, uint32_t topk, float route_scale) {
+    v41_pdl_wait();   /* PDL: 第一句就等上游(见 cuda_internal.cuh); 不经 PDL 发射时立即返回 */
     const uint32_t t = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), lane = threadIdx.x & 31u;
     if (t >= n_tok) return;
     const float *lg = logits + (uint64_t)t * n_expert;
@@ -90,6 +91,7 @@ int ds4_gpu_v41_router_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
 /* 官方 Expert.forward: gate=w1(x).float(); up=w3(x).float(); up=clamp(±limit); gate=clamp(max=limit);
  * h = silu(gate)·up → (×路由权重在外面) → .to(bf16)。这里 gate/up 是 fp4 线性的 bf16 输出(调用方已舍)。 */
 __global__ static void v41_swiglu_kernel(float *h, const float *g, const float *u, uint64_t n, float limit) {
+    v41_pdl_wait();   /* PDL: 第一句就等上游(见 cuda_internal.cuh); 不经 PDL 发射时立即返回 */
     const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     float gv = g[i], uv = u[i];
@@ -107,6 +109,7 @@ int ds4_gpu_v41_swiglu_tensor(ds4_gpu_tensor *h, const ds4_gpu_tensor *gate, con
 /* engram 门(官方 Engram.forward): 一 block 一 (token, 路); 256 线程归约 h², key², h·w·key 三个和 */
 __global__ static void v41_engram_gate_kernel(float *hc, const float *kv, const float *qw, const float *kw,
                                               uint32_t E, uint32_t n_hc, float eps) {
+    v41_pdl_wait();   /* PDL: 第一句就等上游(见 cuda_internal.cuh); 不经 PDL 发射时立即返回 */
     const uint32_t t = blockIdx.y, c = blockIdx.x;
     float *h = hc + ((uint64_t)t * n_hc + c) * E;
     const float *key = kv + (uint64_t)t * (n_hc + 1u) * E + (uint64_t)c * E;

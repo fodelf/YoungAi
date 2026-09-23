@@ -114,6 +114,7 @@ __device__ __forceinline__ static float v41_vq_dot8(uint32_t v, uint4 xw, const 
 }
 /* f32(已在 bf16 格点) → 打包成 bf16。一线程一元素, 每层一次, 5120 个元素, 可忽略。 */
 __global__ static void v41_vq_xpack_kernel(uint16_t *dst, const float *src, uint64_t n) {
+    v41_pdl_wait();   /* PDL: 第一句就等上游(见 cuda_internal.cuh); 不经 PDL 发射时立即返回 */
     const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = (uint16_t)(__float_as_uint(v41_bf16r(src[i])) >> 16);
 }
