@@ -88,10 +88,20 @@ __global__ static void v41_bf16_gemv_kernel(float *out, const __nv_bfloat16 *w, 
     float acc[NT];
     #pragma unroll
     for (uint32_t t = 0; t < NT; t++) acc[t] = 0.f;
+    /* ★权重先读、再等上游(PDL, 2026-09-23)★: 本 lane 的前 PF 段权重(常量)进寄存器之后才 v41_pdl_wait, 之后才碰 x。
+     * 路由门(384×5120)ksplit 8 ⇒ 每 lane 2~3 段 ≤ PF。段序、乘加式不变 ⇒ 逐位同。 */
+    constexpr uint32_t PF = 4u;
+    const __nv_bfloat16 *wr = w + (uint64_t)r * in_dim;
+    const uint32_t c0 = kpart * 256u + lane * 8u, cst = ksplit * 256u;
+    uint4 wpre[PF];
+    #pragma unroll
+    for (uint32_t j = 0; j < PF; j++) {
+        wpre[j] = make_uint4(0u, 0u, 0u, 0u);
+        if (r < out_dim && c0 + j * cst < in_dim) wpre[j] = *(const uint4 *)(wr + c0 + j * cst);
+    }
+    v41_pdl_wait();
     if (r < out_dim) {
-        const __nv_bfloat16 *wr = w + (uint64_t)r * in_dim;
-        for (uint32_t c = kpart * 256u + lane * 8u; c < in_dim; c += ksplit * 256u) {
-            const uint4 raw = *(const uint4 *)(wr + c);
+        auto seg = [&](const uint4 raw, uint32_t c) {   /* 一段 8 个元素: 原循环体一字未改 */
             __nv_bfloat162 wb[4];
             memcpy(wb, &raw, 16);
             #pragma unroll
@@ -103,7 +113,10 @@ __global__ static void v41_bf16_gemv_kernel(float *out, const __nv_bfloat16 *w, 
                 acc[t] += w0.x * x0.x + w0.y * x0.y + w1.x * x0.z + w1.y * x0.w
                         + w2.x * x1.x + w2.y * x1.y + w3.x * x1.z + w3.y * x1.w;
             }
-        }
+        };
+        #pragma unroll
+        for (uint32_t k = 0; k < PF; k++) if (c0 + k * cst < in_dim) seg(wpre[k], c0 + k * cst);   /* 先读的段 */
+        for (uint32_t c = c0 + PF * cst; c < in_dim; c += cst) seg(*(const uint4 *)(wr + c), c);    /* 剩余段(现役没有) */
         #pragma unroll
         for (uint32_t t = 0; t < NT; t++) {
             float v = acc[t];
@@ -139,6 +152,7 @@ static int v41_bf16_gemv(const __nv_bfloat16 *w, uint64_t in_dim, uint64_t out_d
     while (ksplit > 1u && ksplit > nseg) ksplit >>= 1;
     const uint32_t rpb = 8u / ksplit;
     const dim3 grid((unsigned)((out_dim + rpb - 1u) / rpb), 1);
+    v41_pdl_register((const void *)v41_bf16_gemv_kernel<1u>);   /* 核在读 x 之前 v41_pdl_wait(见核头) */
     #define V41_BFGEMV_LAUNCH(NT) v41_bf16_gemv_kernel<NT><<<grid, 256, 0, g_cur_stream>>>( \
         out, w, x, (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)in_dim, (uint32_t)out_dim, ksplit)
     switch (n_tok) {
