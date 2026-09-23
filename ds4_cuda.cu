@@ -80,6 +80,7 @@
 #include "src/cuda/cuda_vq_row.inc.cu"   /* VQ 载荷解析 + 一行点积(v2/v3 两版布局都在这一族); 必须在 cuda_vq_decode 之前 */
 #include "src/cuda/cuda_vq_decode.inc.cu"   /* VQ 专家解码即乘(原在 v41_4 里); 在 v41_4 之后(用它的 bf16r/暂存槽), 在 draft 之前(草稿塔借本片的 reduce 核) */
 #include "src/cuda/cuda_vq_group.inc.cu"   /* 多 token 分组解码即乘核(2026-09-22): 验证批/草稿塔 n≥2 时一 block 一个专家 × m 个 token; 在 decode 之后(用它的 shared 搬运/swiglu)、launch 之前(那里实例化 fused_moe_n) */
+#include "src/cuda/cuda_vq_persist.inc.cu"   /* v3 纯解码常驻核(2026-09-23): 在 decode 之后(用它的码本搬运/swiglu/V41_VQ_WARPS)、launch 之前 */
 #include "src/cuda/cuda_vq_decode_launch.inc.cu"   /* 上一片的发射器(按码本词数挑实例); 拆出去只为守 500 行 */
 #include "src/cuda/cuda_v41_draft.inc.cu"   /* DSpark 草稿塔(speed.md 段 6 D1): 逐专家 FP4 dense MoE / hc 四路均值 / markov 行 gather; 必须在 v41_4 之后(用它的 reduce 核与暂存槽) */
 #include "src/cuda/cuda_v41_gemv_highprec.inc.cu"   /* 非 FP4 权重(BF16 gate/compressor/indexer, F32 mHC)的小批 GEMV; clear.md C1 过门后整片删 */

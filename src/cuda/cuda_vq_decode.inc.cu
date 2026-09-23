@@ -228,6 +228,11 @@ static int v41_vq_grp_launch(int stage, uint32_t n_tok, uint16_t *h, float *part
                              uint32_t IN, uint32_t MID, uint32_t OUT, uint32_t K, float clamp, uint32_t cbb, const float *gr,
                              const int32_t *ord, uint32_t np);
 extern int g_ds4_v41_vq_group;
+/* ★v3 纯解码的常驻核(2026-09-23, cuda_vq_persist.inc.cu, 本 TU 后面的分片定义)★: 码本一层一本 ⇒ 每 SM 一个常驻 block 只搬一次码本,
+ * 不再每个 block 搬一两遍、过三次全体屏障。n=1 且 v3 且码本进得了 shared 时代替下面两个核; 数值逐字节同(每行同一个 row_dot)。 */
+template <int NBIT, int EXT>
+static int v41_vq_persist_launch(int stage, uint16_t *h, float *part, const uint8_t *blob, const int32_t *sel, const uint32_t *xb,
+                                 uint32_t IN, uint32_t MID, uint32_t OUT, uint32_t np, float clamp, uint32_t cbb, const float *gr);
 /* ★两个核分开判定★(2026-09-14 实撞): 码本 4096×16 B = 64 KB/本。gateup 要 gate+up 两本 = 128 KB,
  * 超过 GB10 每 block 的动态 shared 上限; down 只要一本 64 KB, 本来放得下。原先一个 ok 变量把两个核
  * 绑在一起, gateup 申请失败就把 down 一起打回全局 gather —— 解码实测只有 1.60 t/s(prefill 45 t/s 正常)。 */
@@ -352,11 +357,13 @@ static int v41_vq_fused_moe_n(float *out, const uint8_t *blob, uint32_t IN, uint
         grp = v41_vq_grp_launch<NBIT, V3, EXT>(0, n_tok, h, part, blob, sel, (const uint32_t *)xb, IN, MID, OUT, K, clamp, cbb, gr, ord, (uint32_t)np);
         if (grp < 0) return 0;
     }
-    if (ord) v41_vq_gateup_kernel<NBIT, V3, EXT, 1><<<dim3((MID + rg - 1u) / rg, (unsigned)np), tg, shg ? cbb : 0u, g_cur_stream>>>(
+    const bool per = n_tok == 1u && V3 && shg && shd;
+    if (per) { if (!v41_vq_persist_launch<NBIT, EXT>(0, h, part, blob, sel, (const uint32_t *)xb, IN, MID, OUT, (uint32_t)np, clamp, cbb, gr)) return 0; }
+    else if (ord) v41_vq_gateup_kernel<NBIT, V3, EXT, 1><<<dim3((MID + rg - 1u) / rg, (unsigned)np), tg, shg ? cbb : 0u, g_cur_stream>>>(
         h, blob, sel, (const uint32_t *)xb, IN, MID, K, clamp, shg ? cbb : 0u, ord, (uint32_t)np, grp > 0 ? 1u : 0u);
     else v41_vq_gateup_kernel<NBIT, V3, EXT, 0><<<dim3((MID + rg - 1u) / rg, (unsigned)np), tg, shg ? cbb : 0u, g_cur_stream>>>(
         h, blob, sel, (const uint32_t *)xb, IN, MID, K, clamp, shg ? cbb : 0u, NULL, 0u, 0u);
-    if (!cuda_ok(cudaGetLastError(), "v41 vq gateup")) {
+    if (!per && !cuda_ok(cudaGetLastError(), "v41 vq gateup")) {
         /* ★挂了必须连启动参数一起打★: "invalid argument" 只说"某个参数不对", 不说是哪个。把
          * grid/block/动态 shared 与模板实例(NBIT/V3/EXT/SORTED)一起打出来, 对着设备上限就能直接判:
          * shared 超过这个实例 opt-in 过的量 / grid 某一维是 0 / 线程数超 1024, 三者都一眼可见。
@@ -373,11 +380,12 @@ static int v41_vq_fused_moe_n(float *out, const uint8_t *blob, uint32_t IN, uint
         if (g_ds4_v41_prof) v41_f16range_probe(NULL, h, np * MID, 1, "中间量(h)");
     }
     if (grp > 0 && v41_vq_grp_launch<NBIT, V3, EXT>(1, n_tok, h, part, blob, sel, (const uint32_t *)xb, IN, MID, OUT, K, clamp, cbb, gr, ord, (uint32_t)np) < 0) return 0;
-    if (ord) v41_vq_down_kernel<NBIT, V3, EXT, 1><<<dim3((OUT + rd - 1u) / rd, (unsigned)np), td, shd ? cbb : 0u, g_cur_stream>>>(
+    if (per) { if (!v41_vq_persist_launch<NBIT, EXT>(1, h, part, blob, sel, (const uint32_t *)xb, IN, MID, OUT, (uint32_t)np, clamp, cbb, gr)) return 0; }
+    else if (ord) v41_vq_down_kernel<NBIT, V3, EXT, 1><<<dim3((OUT + rd - 1u) / rd, (unsigned)np), td, shd ? cbb : 0u, g_cur_stream>>>(
         part, blob, sel, (const uint32_t *)h, MID, OUT, K, shd ? cbb : 0u, gr, ord, (uint32_t)np, grp > 0 ? 1u : 0u);
     else v41_vq_down_kernel<NBIT, V3, EXT, 0><<<dim3((OUT + rd - 1u) / rd, (unsigned)np), td, shd ? cbb : 0u, g_cur_stream>>>(
         part, blob, sel, (const uint32_t *)h, MID, OUT, K, shd ? cbb : 0u, gr, NULL, 0u, 0u);
-    if (!cuda_ok(cudaGetLastError(), "v41 vq down")) return 0;
+    if (!per && !cuda_ok(cudaGetLastError(), "v41 vq down")) return 0;
     if (!out) return 1;   /* 调用方稍后用 ds4_gpu_v41_moe_tail_tensor 把归约与 shared 专家的相加一发做完 */
     v41_vq_reduce_kernel<<<dim3((OUT + 255u) / 256u, n_tok), 256, 0, g_cur_stream>>>(out, part, w, K, OUT);
     return cuda_ok(cudaGetLastError(), "v41 vq reduce");
