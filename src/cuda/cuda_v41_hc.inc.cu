@@ -60,20 +60,50 @@ __global__ static void v41_hc_mix_fused_kernel(float *mix, float *part, uint32_t
     const float *x = hc + (uint64_t)t * dim;
     __shared__ float sh[1024];
     __shared__ uint32_t s_last;
-    /* ① 逐字照抄 v41_row_rsqrt_kernel */
+    /* ★W 先发, 再做 ①(2026-09-23)★: 原来 ① 整段(读 82 KB hc + 1024 槽树归约 + 十几次全体屏障)做完才开始读 W, 每发 16.5 µs
+     * 读 1.97 MB = 119 GB/s。W 与 ① 无依赖 ⇒ 进核就把本 warp 的 W 段读进寄存器, DRAM 延迟藏在 ① 后面。
+     * ★逐位同★: ② 每一项仍是同一个 float4 点积、按 c 升序进 acc; 只是 W 早读了。现役 dim 20480 / 段跨 4096 ⇒ 每 lane 恰 5 段 = PF
+     * (1024 线程 ⇒ 寄存器上限 64, PF 取 8 会和 ① 的一批 10 个抢寄存器)。 */
+    constexpr uint32_t PF = 5u;
+    const uint32_t kpart = sp * kper + warp;
+    const bool act = r < out_dim && warp < kper;
+    const float *wr = w + (uint64_t)r * dim;
+    const uint32_t c0 = kpart * 128u + lane * 4u, cst = ksplit * 128u;
+    float4 wpre[PF];
+    #pragma unroll
+    for (uint32_t i = 0; i < PF; i++) {
+        wpre[i] = make_float4(0.f, 0.f, 0.f, 0.f);
+        if (act && c0 + i * cst < dim) wpre[i] = *(const float4 *)(wr + c0 + i * cst);
+    }
+    v41_pdl_wait();   /* PDL: W(常量)已在飞, 这里才等上游的 hc(见 cuda_internal.cuh) */
+    /* ① 逐字照抄 v41_row_rsqrt_kernel 的累加形状; ★读法改成 10 个一批先发(2026-09-23)★: 原循环边界是运行期值, 编译器
+     * 不展开, 每线程 20 次 L2 读一次一个往返串行排队(~6 µs)。现在一批 10 个一起发、再按 i 升序加 ⇒ 累加序不变, 逐位同。 */
     {
         float s = 0.f;
-        for (uint32_t i = threadIdx.x; i < dim; i += blockDim.x) s += x[i] * x[i];
+        for (uint32_t i0 = threadIdx.x; i0 < dim; i0 += 10u * blockDim.x) {
+            float xv[10];
+            #pragma unroll
+            for (uint32_t j = 0; j < 10u; j++) { const uint32_t i = i0 + j * blockDim.x; xv[j] = i < dim ? x[i] : 0.f; }
+            #pragma unroll
+            for (uint32_t j = 0; j < 10u; j++) if (i0 + j * blockDim.x < dim) s += xv[j] * xv[j];
+        }
         sh[threadIdx.x] = s; __syncthreads();
         for (uint32_t k = blockDim.x / 2; k > 0; k >>= 1) { if (threadIdx.x < k) sh[threadIdx.x] += sh[threadIdx.x + k]; __syncthreads(); }
     }
     const float inv = rsqrtf(sh[0] / (float)dim + eps);
     /* ② 逐字照抄 v41_f32_gemv_kernel 的 ksplit 分支(这里恒是 rows_per_block=1); 本 block 只管 kpart ∈ [sp·kper, sp·kper+kper) */
-    const uint32_t kpart = sp * kper + warp;
     float acc = 0.f;
-    if (r < out_dim && warp < kper) {   /* warp 内一致的分支, shfl 全 mask 安全 */
-        const float *wr = w + (uint64_t)r * dim;
-        for (uint32_t c = kpart * 128u + lane * 4u; c < dim; c += ksplit * 128u) {
+    if (act) {   /* warp 内一致的分支, shfl 全 mask 安全 */
+        #pragma unroll
+        for (uint32_t i = 0; i < PF; i++) {   /* 前 PF 段用先发的 W, 次序与原循环相同 */
+            const uint32_t c = c0 + i * cst;
+            if (c < dim) {
+                const float4 wv = wpre[i];
+                const float4 xv = *(const float4 *)(x + c);
+                acc += wv.x * xv.x + wv.y * xv.y + wv.z * xv.z + wv.w * xv.w;
+            }
+        }
+        for (uint32_t c = c0 + PF * cst; c < dim; c += cst) {   /* dim 更大时的剩余段(现役没有) */
             const float4 wv = *(const float4 *)(wr + c);
             const float4 xv = *(const float4 *)(x + c);
             acc += wv.x * xv.x + wv.y * xv.y + wv.z * xv.z + wv.w * xv.w;
@@ -118,6 +148,7 @@ int ds4_gpu_v41_hc_mix_tensor(ds4_gpu_tensor *mix, const ds4_gpu_tensor *hc, con
             uint32_t *ctr = (uint32_t *)v41_grow(&g_v41_hc_ctr, npart * 4, "v41 hc mix ctr");
             if (!part || !ctr) return 0;
             if (fresh && !cuda_ok(cudaMemsetAsync(ctr, 0, (size_t)npart * 4, g_cur_stream ? g_cur_stream : cudaStreamPerThread), "v41 hc mix ctr zero")) return 0;
+            v41_pdl_register((const void *)v41_hc_mix_fused_kernel);   /* 核在碰 hc/part/ctr 之前 v41_pdl_wait */
             v41_hc_mix_fused_kernel<<<dim3(mix_hc * V41_HC_MIX_SPLIT, n_tok), 1024, 0, g_cur_stream>>>(
                 (float *)mix->ptr, part, ctr, W, (const float *)hc->ptr, dim, mix_hc, eps, 32u, V41_HC_MIX_SPLIT);
             return cuda_ok(cudaGetLastError(), "v41 hc mix fused");
@@ -211,7 +242,7 @@ __global__ static void v41_hc_fused_kernel(float *pre, float *post, float *comb,
                                            float hc_eps, float norm_eps) {
     const uint32_t n = blockIdx.x, mix_hc = 2u * n_hc + n_hc * n_hc;
     const float *m = mix + (uint64_t)n * mix_hc;
-    __shared__ float c[64], shp[8], sh[1024];   /* sh 的槽数 = blockDim(见发射端那段 ncu 账) */
+    __shared__ float c[64], sh[1024];   /* sh 的槽数 = blockDim(见发射端那段 ncu 账) */
     /* ★sinkhorn 整段只在 warp 0 里做(2026-09-18, 小核合并)★
      * 病: 它算的是一个 4×4 矩阵(16 个线程), 却让 1024 个线程陪着过 20 轮 × 4 次 __syncthreads = 80 多个全 block 屏障,
      * 一发 14.5 µs 里大半是屏障; 一步 80 发 = 1.16 ms。
@@ -222,7 +253,6 @@ __global__ static void v41_hc_fused_kernel(float *pre, float *post, float *comb,
     if (warp == 0) {
         if (threadIdx.x < n_hc) {
             pre[n * n_hc + threadIdx.x] = 1.f / (1.f + expf(-(m[threadIdx.x] * scale[0] + base[threadIdx.x]))) + hc_eps;
-            shp[threadIdx.x] = pre_in[n * n_hc + threadIdx.x];   /* hc_pre 用上一层的 */
             post[n * n_hc + threadIdx.x] = 2.f / (1.f + expf(-(m[n_hc + threadIdx.x] * scale[1] + base[n_hc + threadIdx.x])));
         }
         if (threadIdx.x < n_hc * n_hc) c[threadIdx.x] = m[2u * n_hc + threadIdx.x] * scale[2] + base[2u * n_hc + threadIdx.x];
@@ -272,14 +302,51 @@ __global__ static void v41_hc_fused_kernel(float *pre, float *post, float *comb,
         }
         if (act) comb[(uint64_t)n * n_hc * n_hc + threadIdx.x] = c[threadIdx.x];
     }
-    __syncthreads();   /* shp 写完(warp 0)其余 warp 才能进 hc_pre */
+    /* ★hc_pre 不等 sinkhorn(2026-09-23)★: 它用的是**上一层**传下来的 pre_in, 与本层 warp 0 的 sinkhorn 无依赖 ——
+     * 原来 warp 0 把 pre_in 抄进 shared 再全体屏障, 其余 31 个 warp 白等 20 轮 sinkhorn。现在各线程直接读 pre_in(同一个值,
+     * 广播读), 屏障去掉; warp 0 算完 sinkhorn 再做自己那份 hc_pre, 下面 rms 归约前的屏障照样把大家对齐。★逐位同★: 值与次序都没变。 */
     /* hc_pre → x, 顺手攒 x² 给 rms(与 v41_rms_norm_kernel 同一归约形状 ⇒ 逐位同) */
     float acc = 0.f;
     const float *hcn = hc + (uint64_t)n * n_hc * n_embd;
+    const float *pin = pre_in + (uint64_t)n * n_hc;
     float *xr = x + (uint64_t)n * n_embd;
+    /* ★读法: 本线程的 5 个 d(n_embd 5120 / 1024)× n_hc 路一次全发, 再按 d 升序算(2026-09-23)★: 原循环运行期边界不展开,
+     * 5 轮各等一次 L2 往返。算式与次序不变(v 按 k 升序、acc 按 d 升序), x 值留在寄存器给出口那段复用(与读回 xr[d] 同值)。
+     * 只接 n_hc == 4 且 n_embd ≤ 5 × blockDim 的现役形状; 其余形状走原循环(同一算式)。 */
+    constexpr uint32_t DP = 5u;
+    float *on = xn + (uint64_t)n * n_embd;
+    if (n_hc == 4u && n_embd <= DP * blockDim.x) {
+        float hv[DP][4], vv[DP], wv[DP];
+        #pragma unroll
+        for (uint32_t j = 0; j < DP; j++) {
+            const uint32_t d = threadIdx.x + j * blockDim.x;
+            #pragma unroll
+            for (uint32_t k = 0; k < 4u; k++) hv[j][k] = d < n_embd ? hcn[(uint64_t)k * n_embd + d] : 0.f;
+            wv[j] = d < n_embd ? nw[d] : 0.f;
+        }
+        const float p0 = pin[0], p1 = pin[1], p2 = pin[2], p3 = pin[3];
+        #pragma unroll
+        for (uint32_t j = 0; j < DP; j++) {
+            const uint32_t d = threadIdx.x + j * blockDim.x;
+            if (d < n_embd) {
+                float v = 0.f;
+                v += p0 * hv[j][0]; v += p1 * hv[j][1]; v += p2 * hv[j][2]; v += p3 * hv[j][3];
+                v = v41_bf16r(v);
+                xr[d] = v; vv[j] = v;
+                acc += v * v;
+            }
+        }
+        sh[threadIdx.x] = acc;
+        __syncthreads();
+        for (uint32_t k = blockDim.x / 2; k > 0; k >>= 1) { if (threadIdx.x < k) sh[threadIdx.x] += sh[threadIdx.x + k]; __syncthreads(); }
+        const float inv = rsqrtf(sh[0] / (float)n_embd + norm_eps);
+        #pragma unroll
+        for (uint32_t j = 0; j < DP; j++) { const uint32_t d = threadIdx.x + j * blockDim.x; if (d < n_embd) on[d] = v41_bf16r(wv[j] * (vv[j] * inv)); }
+        return;
+    }
     for (uint32_t d = threadIdx.x; d < n_embd; d += blockDim.x) {
         float v = 0.f;
-        for (uint32_t k = 0; k < n_hc; k++) v += shp[k] * hcn[(uint64_t)k * n_embd + d];
+        for (uint32_t k = 0; k < n_hc; k++) v += pin[k] * hcn[(uint64_t)k * n_embd + d];
         v = v41_bf16r(v);
         xr[d] = v;
         acc += v * v;
@@ -288,7 +355,6 @@ __global__ static void v41_hc_fused_kernel(float *pre, float *post, float *comb,
     __syncthreads();
     for (uint32_t k = blockDim.x / 2; k > 0; k >>= 1) { if (threadIdx.x < k) sh[threadIdx.x] += sh[threadIdx.x + k]; __syncthreads(); }
     const float inv = rsqrtf(sh[0] / (float)n_embd + norm_eps);
-    float *on = xn + (uint64_t)n * n_embd;
     for (uint32_t d = threadIdx.x; d < n_embd; d += blockDim.x) on[d] = v41_bf16r(nw[d] * (xr[d] * inv));
 }
 int ds4_gpu_v41_hc_fused_tensor(ds4_gpu_tensor *pre, ds4_gpu_tensor *post, ds4_gpu_tensor *comb,
