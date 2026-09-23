@@ -193,6 +193,17 @@ static bool v41_moe(const ds4_model *m, const ds4_layer_weights *l, ds4_v41_stat
     /* 草稿塔: 128 个专家 top-3, 盘上是逐专家 fp4x32 张量或一个 VQ blob(按绑定时看到的形态) —— 路由的形状也是塔自己的 */
     const uint32_t NE = st->draft ? g_ds4_v41.mtp_experts : DS4_N_EXPERT;
     const uint32_t KU = st->draft ? g_ds4_v41.mtp_used : DS4_N_EXPERT_USED;
+    /* ★shared 专家挂侧流, 与路由 + routed 专家并行(2026-09-23, 纯解码 n=1)★: 两支只共读 xn, 写 sg/su/sh/so 对 glog/sel/rw/专家暂存,
+     * 原来串行。路由那一段(router GEMV + 单 block 的 router 核 + xpack)的延迟藏到 shared 三发 GEMV 后面。算式不变 ⇒ 逐字节同。
+     * 只开主干 n=1(草稿塔与预填/验证批另有暂存共用, 不动)。 */
+    const int fork = !st->draft && n == 1u && ds4_gpu_side_mark() && ds4_gpu_side_begin();
+    if (fork) {
+        if (!v41_tproj(m, st->sg, l->ffn_gate_shexp, E, FF, st->xn, n, 1) ||
+            !v41_tproj(m, st->su, l->ffn_up_shexp, E, FF, st->xn, n, 1) ||
+            !ds4_gpu_v41_swiglu_tensor(st->sh, st->sg, st->su, n, FF, DS4_SWIGLU_CLAMP_EXP) ||
+            !v41_tproj(m, st->so, l->ffn_down_shexp, FF, E, st->sh, n, 1)) { (void)ds4_gpu_side_join(); return false; }
+        (void)ds4_gpu_side_main();
+    }
     /* 路由 gate: 主干层盘上是 bf16, 草稿塔是 f32(转换器两条 plan 不同) —— 按登记类型认 */
     if (l->ffn_gate_inp->type == DS4_GGT_F32) {
         if (!ds4_gpu_v41_matmul_f32_tensor(st->glog, m->map, m->size, l->ffn_gate_inp->abs_offset, E, NE, st->xn, n)) return false;
@@ -225,10 +236,11 @@ static bool v41_moe(const ds4_model *m, const ds4_layer_weights *l, ds4_v41_stat
      * 小矩阵的固定开销不在"发数"上(每发才 41 µs, 启动只占几微秒), 合发省不出东西。pair 那条核路已删。 */
     /* ★按盘上类型分发★: 主干的 shared 专家是 fp4x32; 三塔的在原件里是 FP8, 2026-09-17 起原样存
      * (v41_tproj 两条路都走, 老 GGUF 仍然是 fp4x32) */
-    if (!v41_tproj(m, st->sg, l->ffn_gate_shexp, E, FF, st->xn, n, 1)) return false;
-    if (!v41_tproj(m, st->su, l->ffn_up_shexp, E, FF, st->xn, n, 1)) return false;
-    if (!ds4_gpu_v41_swiglu_tensor(st->sh, st->sg, st->su, n, FF, DS4_SWIGLU_CLAMP_EXP)) return false;
-    if (!v41_tproj(m, st->so, l->ffn_down_shexp, FF, E, st->sh, n, 1)) return false;
+    if (fork) { if (!ds4_gpu_side_join()) return false; }
+    else if (!v41_tproj(m, st->sg, l->ffn_gate_shexp, E, FF, st->xn, n, 1) ||
+             !v41_tproj(m, st->su, l->ffn_up_shexp, E, FF, st->xn, n, 1) ||
+             !ds4_gpu_v41_swiglu_tensor(st->sh, st->sg, st->su, n, FF, DS4_SWIGLU_CLAMP_EXP) ||
+             !v41_tproj(m, st->so, l->ffn_down_shexp, FF, E, st->sh, n, 1)) return false;
     /* y = routed(f32 累加的 bf16 专家输出) + shared(bf16) → .type_as(x) bf16 */
     if (tail) {   /* 解码: 归约 + 相加 + 舍 bf16 一发(2026-09-18 小核合并; 算式同序, 逐位同) */
         if (!ds4_gpu_v41_moe_tail_tensor(st->y, st->so, st->rw, n, DS4_N_EXPERT_USED, E)) return false;

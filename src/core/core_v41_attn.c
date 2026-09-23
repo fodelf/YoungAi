@@ -253,16 +253,22 @@ bool v41_attention(ds4_engine *e, ds4_v41_state *st, uint32_t il) {
     const uint32_t n = st->n, E = DS4_N_EMBD, HD = DS4_N_HEAD_DIM, NH = DS4_N_HEAD, Q = DS4_N_LORA_Q, SWA = DS4_N_SWA;
     const uint32_t ratio = ds4_layer_compress_ratio(il);
     const uint64_t rowb = (uint64_t)HD * 4;
-    /* q 路: q_a → bf16 → q_norm → q_b → bf16 → rope(绝对位置) */
-    if (!v41_tproj(m, st->qr, l->attn_q_a, E, Q, st->xn, n, 1)) return false;
-    if (!ds4_gpu_v41_rms_norm_tensor(st->qrn, st->qr, m->map, m->size, l->attn_q_a_norm->abs_offset, Q, n, DS4_RMS_EPS)) return false;
-    if (!v41_tproj(m, st->q, l->attn_q_b, Q, (uint64_t)NH * HD, st->qrn, n, 1)) return false;
-    if (!v41_rope(st->q, st->pos, n, NH, HD, ratio, false)) return false;
+    /* ★kv 支挂侧流, 与 q 支并行(2026-09-23, 纯解码 n=1)★: 两支只共读 xn/pos, 各写各的(kv/kvn 对 qr/qrn/q), 原来串行 ——
+     * kv 支 ~18 µs(kv GEMV + rms + rope + act_quant, 后三个是单/小 block 核)藏到 q_b(~107 µs)后面。算式与次序不变 ⇒ 逐字节同。
+     * 只开 n=1: 预填/验证批的 GEMM 路要用共享暂存, 两支同时跑会互相踩。进窗口环的那发拷贝没有流参数(落主流), 放到汇合之后。 */
+    const int fork = n == 1u && ds4_gpu_side_mark() && ds4_gpu_side_begin();
     /* 窗口 kv: wkv → bf16 → kv_norm → rope(末 64 维) → fp8 act_quant(按 32 块) → 进窗口缓冲的后 n 行 */
-    if (!v41_tproj(m, st->kv, l->attn_kv, E, HD, st->xn, n, 1)) return false;
-    if (!ds4_gpu_v41_rms_norm_tensor(st->kvn, st->kv, m->map, m->size, l->attn_kv_a_norm->abs_offset, HD, n, DS4_RMS_EPS)) return false;
-    if (!v41_rope(st->kvn, st->pos, n, 1, HD, ratio, false)) return false;
-    if (!ds4_gpu_v41_act_quant_fp8_tensor(st->kvn, n, HD, 32)) return false;
+    if (!v41_tproj(m, st->kv, l->attn_kv, E, HD, st->xn, n, 1) ||
+        !ds4_gpu_v41_rms_norm_tensor(st->kvn, st->kv, m->map, m->size, l->attn_kv_a_norm->abs_offset, HD, n, DS4_RMS_EPS) ||
+        !v41_rope(st->kvn, st->pos, n, 1, HD, ratio, false) ||
+        !ds4_gpu_v41_act_quant_fp8_tensor(st->kvn, n, HD, 32)) { if (fork) (void)ds4_gpu_side_join(); return false; }
+    if (fork) (void)ds4_gpu_side_main();
+    /* q 路: q_a → bf16 → q_norm → q_b → bf16 → rope(绝对位置) */
+    if (!v41_tproj(m, st->qr, l->attn_q_a, E, Q, st->xn, n, 1) ||
+        !ds4_gpu_v41_rms_norm_tensor(st->qrn, st->qr, m->map, m->size, l->attn_q_a_norm->abs_offset, Q, n, DS4_RMS_EPS) ||
+        !v41_tproj(m, st->q, l->attn_q_b, Q, (uint64_t)NH * HD, st->qrn, n, 1) ||
+        !v41_rope(st->q, st->pos, n, NH, HD, ratio, false)) { if (fork) (void)ds4_gpu_side_join(); return false; }
+    if (fork && !ds4_gpu_side_join()) return false;
     if (!ds4_gpu_tensor_copy(st->win[il], (uint64_t)SWA * rowb, st->kvn, 0, (uint64_t)n * rowb)) return false;
     /* 压缩侧: 源层先产出, 消费层读最近源层的缓存 + 本 chunk 最近 indexer 源层的 topk */
     uint32_t ng = 0, topk = 0, iratio = 0; const ds4_gpu_tensor *comp = NULL;
