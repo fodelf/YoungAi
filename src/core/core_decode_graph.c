@@ -18,7 +18,7 @@
  * 门 = 温 0 输出与直发路逐字节同(speed-bench/d1_kv_ring_gate.sh 那套 cmp; 投机路 = 投机 == 纯解码 逐字节同)。
  *
  * 出错会怎样: 捕获期间任何同步调用都让捕获作废(ThreadLocal 模式), capture_end 报 NULL —— 那一步的核一个都没跑。
- * n=1 时把 graph 关掉、按直发重来这一步(捕获不推进任何主机状态, 重来是干净的), 之后整个会话直发; 验证批捕获失败则
+ * n=1 时把 graph 关掉、按直发重来这一步(捕获不推进任何主机状态, 重来是干净的), 之后这条请求(本状态)直发 —— 不关进程级开关, 否则服务端一次失败会拖累之后所有请求; 验证批捕获失败则
  * 这一批与之后的批都走直发(纯解码图照走)。日志里有一行"[graph] 捕获失败/作废"。它不是兜底: 直发就是引擎的原路, 图只是同一条路的另一种发法。 */
 #include "core_internal.h"
 #ifndef DS4_NO_GPU
@@ -45,6 +45,8 @@ typedef struct {
     int direct_pending; int32_t pending_tok;   /* n=1 捕获失败那一步: launch 没发出去, wait 里按直发补跑 */
     uint32_t cur_n;            /* 本步发的是几行(wait 按它读回/推进) */
     int batch_off;             /* 验证批的图捕获失败过: 之后的批一律直发(只打一次日志) */
+    int n1_off;                /* n=1 的图捕获失败过: 本状态(= 这一条请求)之后直发。★只关本状态★, 不碰进程级 g_ds4_v41_graph ——
+                                * 服务端是常驻进程, 09-22 夜一次失败写了全局开关, 之后整夜所有请求都直发 */
 } decode_graph;
 
 int g_ds4_v41_graph = 1;
@@ -90,7 +92,9 @@ static bool dg_alloc(ds4_v41_state *st) {
 
 /* 能走图的条件: 标志开、主路(不是草稿塔)、暖过一步直发(懒分配全建好了)、没有要读回主机的探针/钩子/夹具。 */
 bool v41_graph_ready(const ds4_v41_state *st) {
-    return g_ds4_v41_graph && !st->draft && st->n_direct1 > 0 && !g_ds4_v41_prof && !g_ds4_v41_hook && !st->dump_prefix;
+    const decode_graph *g = (const decode_graph *)st->dgraph;
+    return g_ds4_v41_graph && !st->draft && st->n_direct1 > 0 && !g_ds4_v41_prof && !g_ds4_v41_hook && !st->dump_prefix &&
+           !(g && g->n1_off);
 }
 /* 验证批同上, 且这个 n 直发暖过(每个 n 的暂存/核属性各自懒建)、这个批的快照缓冲建过(直发那一轮 v41_spec_snapshot 建) */
 bool v41_graph_batch_ready(const ds4_v41_state *st, uint32_t n) {
@@ -138,24 +142,29 @@ static bool dg_capture(ds4_engine *e, ds4_v41_state *st, uint32_t n) {
     uint32_t cap = (st->n_past / DGRAPH_BUCKET + 1u) * DGRAPH_BUCKET - 1u;   /* 桶上限 = 本批首行位置的上限, 末行到 cap+n−1 */
     if (cap > st->ctx - n) cap = st->ctx - n;
     in->cap = cap;
-    st->graph = 1; st->graph_pos_lo = in->lo; st->graph_pos_cap = cap; st->egraph_uploaded = 0;
-    /* 捕获态下不许分配: 注意力的局部件暂存先按段数上限长够(其余暂存在暖身那一步已按这个 n 的尺寸建好) */
-    if (!ds4_gpu_v41_attn_scratch_prepare(DS4_N_HEAD, DS4_N_HEAD_DIM)) { st->graph = 0; return false; }
-    /* 索引打分草稿同理: 桶里最靠后那一批、压缩比最小那个源层的组数最多, 捕获前按它长够(捕获态不许分配) */
+    /* ★三个暂存先长够, 之后才置 st->graph★(2026-09-23 实撞): 以前先置 st->graph=1 再长索引草稿, 而
+     * v41_index_scratch_prepare 见 st->graph 就当"捕获态分配"拒掉 ⇒ 只要新桶要扩草稿捕获必失败。服务端第一条 22 token
+     * 冒烟就撞上, 整夜直发(每步 +3 ms)。CLI 门的长提示预填翻倍长出的余量碰巧够, 所以没暴露。 */
+    /* 注意力的局部件暂存按段数上限长够(其余暂存在暖身那一步已按这个 n 的尺寸建好) */
+    if (!ds4_gpu_v41_attn_scratch_prepare(DS4_N_HEAD, DS4_N_HEAD_DIM)) return false;
+    /* 索引打分草稿: 桶里最靠后那一批、压缩比最小那个 indexer 源层的组数最多, 按它长够。
+     * 遍历口径必须与消费方 v41_index_source(core_v41_attn.c, 按 is_index_source 层自己的压缩比)同源 ——
+     * 只看 kv 源层会漏掉压缩比更小的纯 indexer 源层, 捕获时照样要扩容。 */
     uint32_t ng_max = 0;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        if (!g_ds4_v41.is_kv_source[il]) continue;
+        if (!g_ds4_v41.is_index_source[il]) continue;
         const uint32_t r = ds4_layer_compress_ratio(il);
         if (r && (cap + n) / r > ng_max) ng_max = (cap + n) / r;
     }
-    if (ng_max && !v41_index_scratch_prepare(st, ng_max)) { st->graph = 0; return false; }
-    /* 候选块暂存同理: 按**桶上限**那一批的组数算块数(桶里位置越靠后组越多, 捕获时就得按最大的开), n 行各一份 */
+    if (ng_max && !v41_index_scratch_prepare(st, ng_max)) return false;
+    /* 候选块暂存: 按**桶上限**那一批的组数算块数(桶里位置越靠后组越多, 捕获时就得按最大的开), n 行各一份 */
     if (g_ds4_v41.candidate_source_layer >= 0 && g_ds4_v41.candidate_block_size > 0) {
         const uint32_t cr = ds4_layer_compress_ratio((uint32_t)g_ds4_v41.candidate_source_layer);
         const uint32_t cbs = (uint32_t)g_ds4_v41.candidate_block_size;
         const uint32_t cng = cr ? (cap + n) / cr : 0u;
-        if (cng && !ds4_gpu_v41_candidate_scratch_prepare(n, (cng + cbs - 1u) / cbs)) { st->graph = 0; return false; }
+        if (cng && !ds4_gpu_v41_candidate_scratch_prepare(n, (cng + cbs - 1u) / cbs)) return false;
     }
+    st->graph = 1; st->graph_pos_lo = in->lo; st->graph_pos_cap = cap; st->egraph_uploaded = 0;
     if (!ds4_gpu_decode_graph_capture_begin()) { st->graph = 0; return false; }
     /* ★槽走零拷贝小核, 不走 memcpy 节点★(nsys 实撞: GB10 上图里每个 memcpy 节点 ~170 µs, 四个就是 0.69 ms/步) */
     bool ok = ds4_gpu_tensor_write_zerocopy(st->tok, 0, g->tokv, (uint64_t)n * sizeof(int32_t)) &&
@@ -214,8 +223,8 @@ static bool dg_launch(ds4_engine *e, ds4_v41_state *st, const int32_t *ids, uint
     if (!in->exec || st->pos0 < in->lo || st->pos0 + n - 1u > in->cap) {
         if (!dg_capture(e, st, n)) {
             if (n == 1u) {
-                fprintf(stderr, "ds4: ★[graph] 捕获失败, 这一步与之后全部改走直发★\n");
-                g_ds4_v41_graph = 0;
+                fprintf(stderr, "ds4: ★[graph] 捕获失败, 本条请求这一步与之后改走直发★\n");
+                g->n1_off = 1;
                 g->direct_pending = 1;   /* wait 里按直发把这一步跑完 */
                 g->pending_tok = ids[0]; g->cur_n = 1u;
                 return true;

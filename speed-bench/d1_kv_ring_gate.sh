@@ -113,12 +113,17 @@ if [ "$MODE" = graph ]; then
 fi
 # ★MODE=graphx: 跨桶重捕获的门★ —— 2K 提示(≈1846 token)生成 NGEN(给 ≥256)步, 位置越过 2048 那个桶边界时图要重捕获;
 # 判据仍是走图 vs --no-graph 逐字节同, 外加日志里"位置桶"要出现两次(没出现第二次 = 没跨到, 把 NGEN 加大)。
+# 第 6 个参数 = 换提示文件。★短提示那格必跑★(2026-09-23 实撞): 给 speed-bench/fin_chat_prompt.txt(105 token)+ NGEN 1200 ——
+# 短提示预填几乎不长索引草稿, 捕获时要按桶上限扩容; 09-22 夜捕获先置了"捕获态"再扩容, 自己把自己拒掉, 服务端第一条
+# 22 token 冒烟就撞上、整夜直发(每步 +3 ms)。2K 提示预填长出的余量碰巧够, 这格门一直绿, 所以它单独要一格。
+# 日志里出现"捕获失败"直接判红: 那说明走图那趟其实在直发, 两边逐字节同也不代表图路是好的。
 if [ "$MODE" = graphx ]; then
-  P="$OUT/p2k.txt"
+  P="${6:-$OUT/p2k.txt}"
   run ds4 "gxdirect" -n "$NGEN" --no-dspark --no-graph --prompt-file "$P"
   run ds4 "gxgraph"  -n "$NGEN" --no-dspark --prompt-file "$P"
   echo "  桶: $(grep -a -h '位置桶\|走图解了' "$OUT/gxgraph.err" | tr '\n' ' ')"
   echo "  $(grep -a -h 'decode .* token' "$OUT/gxdirect.err") (直发) | $(grep -a -h 'decode .* token' "$OUT/gxgraph.err") (图)"
+  if grep -a -q '捕获失败' "$OUT/gxgraph.err"; then echo "  ★图路捕获失败, 实际走了直发★ $(grep -a -h '捕获' "$OUT/gxgraph.err" | head -2 | tr '\n' ' ')"; exit 1; fi
   if cmp -s "$OUT/gxdirect.out" "$OUT/gxgraph.out"; then echo "  跨桶: 直发 == 图 逐字节同 ✓"; exit 0
   else echo "  ★跨桶分叉★ $(cmp "$OUT/gxdirect.out" "$OUT/gxgraph.out" 2>&1 | head -1)"; exit 1; fi
 fi
