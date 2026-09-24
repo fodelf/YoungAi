@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-**DwarfStar** (`ds4`) is a self-contained native inference engine **purpose-built for DeepSeek V4 Flash** (and, on very high-memory machines, DeepSeek V4 PRO). It is *not* a generic GGUF runner and does **not** link against GGML — it reimplements the loading, tokenizer, prompt/DSML rendering, KV cache, graph scheduling, server API, and a native coding agent for this one model family. It only runs the DeepSeek V4 GGUFs published for this project (asymmetric quant: routed MoE experts at `IQ2_XXS`/`Q2_K`, everything else left high-precision). See `README.md` for the full feature tour and `MODEL_CARD.md` for the model.
+**DwarfStar** (`ds4`) is a self-contained native inference engine **purpose-built for DeepSeek V4 Flash** (and, on very high-memory machines, DeepSeek V4 PRO). It is *not* a generic GGUF runner and does **not** link against GGML — it reimplements the loading, tokenizer, prompt/DSML rendering, KV cache, graph scheduling, server API, and a native coding agent for this one model family. It only runs the DeepSeek V4 GGUFs published for this project (asymmetric quant: routed MoE experts at `IQ2_XXS`/`Q2_K`, everything else left high-precision). `README.md`(英文主版) / `README.zh-CN.md` 是 V4.1 三文件架构与现役读数的对外介绍; V4 时代的完整功能说明(服务端 API、磁盘 KV、运行时参数、Capability Evaluation)归档在 `docs/archive/README_v4_upstream.md`; 模型见 `MODEL_CARD.md`。
 
 Primary backend is **Metal on macOS**; **CUDA on Linux** is the second production path; the **CPU path is reference/debug only**.
 
@@ -89,7 +89,7 @@ make -C gguf-tools tools-test  # 工具链 9 项 -D*_TEST 自测
 
 Override test inputs with `ds4_test` flags: `--model FILE`, `--vector-file FILE`, `--long-prompt FILE`, `--local-golden FILE`, `--mpp-case NAME`, `--keep-metal4`.
 
-For generation-drift-sensitive changes, also run the deterministic q1..q4 eval gate (expected token counts are in `README.md` → Capability Evaluation):
+For generation-drift-sensitive changes, also run the deterministic q1..q4 eval gate (expected token counts are in `docs/archive/README_v4_upstream.md` → Capability Evaluation):
 
 ```sh
 ./ds4-eval -m ds4flash.gguf --plain --questions 4 --tokens 2048 --temp 0 --seed 1
@@ -112,7 +112,7 @@ Quantization/GGUF changes are scored with `gguf-tools/bench/quality-testing` (`m
   **mmap-backed and never eagerly copied** — Metal wraps mmap regions as no-copy
   `MTLBuffer` views and uses an `MTLResidencySet` to budget GPU VM.
 
-- **Compressed KV cache is a first-class *disk* citizen.** DeepSeek V4's KV is heavily compressed (raw sliding window + ratio-4 indexer-selected + ratio-128 compressed layers). `src/core/core_payload*.c`/`core_snapshot_*.c` serialize the `DSV4` session payload; `src/kv/` manages the on-disk KV cache (`<sha1>.kv`, plain read/write — *not* mmap). The server keeps exactly **one live in-memory checkpoint**; the disk cache is the resume mechanism. File format (48-byte `KVC` header, rendered text, `DSV4` payload, optional `KTM` tool-id map) documented in `README.md` → Disk KV Cache.
+- **Compressed KV cache is a first-class *disk* citizen.** DeepSeek V4's KV is heavily compressed (raw sliding window + ratio-4 indexer-selected + ratio-128 compressed layers). `src/core/core_payload*.c`/`core_snapshot_*.c` serialize the `DSV4` session payload; `src/kv/` manages the on-disk KV cache (`<sha1>.kv`, plain read/write — *not* mmap). The server keeps exactly **one live in-memory checkpoint**; the disk cache is the resume mechanism. File format (48-byte `KVC` header, rendered text, `DSV4` payload, optional `KTM` tool-id map) documented in `docs/archive/README_v4_upstream.md` → Disk KV Cache.
 
 - **Server (`src/server/`).** OpenAI/Anthropic/Responses-compatible HTTP. Inference serialized through one graph worker. Key subtlety: stateless clients resend JSON tool calls, so the server keeps an **exact-DSML replay map** (tool id -> exact sampled DSML bytes, radix-tree via `rax.c`) so re-rendered prompts byte-match the live KV checkpoint. During tool-call *syntax* the server forces `temperature=0`.
 
@@ -124,7 +124,7 @@ Quantization/GGUF changes are scored with `gguf-tools/bench/quality-testing` (`m
   五指标, 见 memory 铁律); 迁移金标账本在 `gguf-tools/migrate/golden.txt`。格式基元
   一律走 `src/common`——工具侧禁止再抄第二份 dequant/GGUF/safetensors 实现。
 
-**全仓零 env 配置**(2026-08-31 大扫除收口): 引擎与工具链不读任何 `DS4_*` 环境变量——行为写死进代码(命名常量+why 注释), 取料/运维入口全走 CLI 参数(`--cap-dir`/`--eval-ids`/`--mem-budget-mb`/`--spec` 等, 见 README → Runtime Configuration)。**禁止新增 env 配置**(铁律 2026-08-22), 脚本 `${VAR:-默认}` 直喂二进制同样算。
+**全仓零 env 配置**(2026-08-31 大扫除收口): 引擎与工具链不读任何 `DS4_*` 环境变量——行为写死进代码(命名常量+why 注释), 取料/运维入口全走 CLI 参数(`--cap-dir`/`--eval-ids`/`--mem-budget-mb`/`--spec` 等, 见 `docs/archive/README_v4_upstream.md` → Runtime Configuration)。**禁止新增 env 配置**(铁律 2026-08-22), 脚本 `${VAR:-默认}` 直喂二进制同样算。
 
 ## 当前主记录
 
