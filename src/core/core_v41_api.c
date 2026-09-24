@@ -309,8 +309,10 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
         /* 调度器判"这一轮不值得投机"之后歇几轮(见下面 v41_draft_pick_k 那一段)。
          * 09-16 定 16(太短就一直在亏本的文本上反复试, 太长就错过文本变好猜的那一段)。
          * ★09-19 改 4★: 陪审团 gguf-tools/bench/dspark_sim 在金融提示的取料上重放整段: 冷却 16 = 27.86 t/s, 8 = 28.12, 4 = 28.29,
-         * 0 = 28.03 —— 文本好不好猜是逐 token 变的, 歇 16 步错过的好轮比省下的草稿钱多; 验证批再便宜一档(投机轮进图/专家按序)后 0 最优。 */
-        #define V41_SPEC_COOLDOWN 4u
+         * 0 = 28.03 —— 文本好不好猜是逐 token 变的, 歇 16 步错过的好轮比省下的草稿钱多; 验证批再便宜一档(投机轮进图/专家按序)后 0 最优。
+         * ★09-24 改 0★: 验证批换 stage/pipe 核、草稿 13.5 → 9.9 ms 之后, 真实 CFO 请求取料重放: 冷却 4 = 36.21 t/s, 0 = 37.31, 8 = 34.71
+         * —— 草稿便宜了, 判一次亏本就连歇几步反而错过好轮。成本再变(核/底座/草稿器)就回 dspark_sim 重扫这个数。 */
+        #define V41_SPEC_COOLDOWN 0u
         uint32_t spec_skip = 0, spec_skipped = 0;
         for (uint32_t i = 0; i <= DS4_MTP_MAX_BLOCK; i++) spec_hist[i] = 0;
         while (produced < n_predict) {
