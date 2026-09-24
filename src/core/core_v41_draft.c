@@ -177,7 +177,9 @@ bool v41_draft_alloc(ds4_engine *e, ds4_v41_draft *dr) {
     dr->win_end = -1;
     /* ★草稿图的槽★(2026-09-22): pinned(零拷贝小核直接读/写, 图每次重放读那一刻槽里的值) + 一个设备 int(ring_rows 的起始行) */
     dr->p_tok = ds4_gpu_host_alloc((uint64_t)cap * 4);  dr->p_bpos = ds4_gpu_host_alloc((uint64_t)cap * 4);
-    dr->p_wpos = ds4_gpu_host_alloc((uint64_t)DS4_V41_DRAFT_GROWS * 4);  dr->p_first = ds4_gpu_host_alloc(4);
+    /* p_wpos 按窗宽分: 预填后第一轮补窗口一次最多 SWA 行(v41_draft_step 钳的), 不是图分档上限 DS4_V41_DRAFT_GROWS ——
+     * 09-22 按 8 分配, 第一轮就越界写主机槽, 随后 512 B 的 cudaMemcpy 读 32 B 的锁页区报 invalid argument(09-24 实撞)。 */
+    dr->p_wpos = ds4_gpu_host_alloc((uint64_t)SWA * 4);  dr->p_first = ds4_gpu_host_alloc(4);
     dr->p_ids = ds4_gpu_host_alloc((uint64_t)cap * 4);  dr->p_conf = ds4_gpu_host_alloc((uint64_t)cap * 4);
     dr->p_onehot = ds4_gpu_host_alloc((uint64_t)cap * DS4_N_HC * 4);
     dr->firstd = v41_alloc(16, &ok);
@@ -232,16 +234,27 @@ static bool v41_draft_put(const ds4_v41_draft *dr, ds4_gpu_tensor *t, uint64_t o
     return dr->cap_mode ? ds4_gpu_tensor_write_zerocopy(t, off, pinned, bytes) != 0 : ds4_gpu_tensor_write(t, off, pinned, bytes) != 0;
 }
 
-/* 草稿块的一次前向: 三塔 → 出口 → 逐位 markov 贪心 → confidence。ids[0] 由调用方写好(= 上一个真 token)。 */
+/* 本轮的主机槽: 补窗口的位置/环起始行 + 块输入 [真 token, noise × (B-1)](官方 draft_input_ids) 与块位置 pos0..pos0+B-1。
+ * ★直发、捕获、重放三条路都必须先调它★: 草稿图只烤了槽的地址, 值是重放那一刻从槽里读的。09-22 版只在直发/捕获那趟
+ * 顺手填(写在 fill/block 里), 重放时位置和环起始行全是捕获那一刻的旧值 ⇒ rope 用旧位置、从 main_hidden 环取旧行,
+ * 窗口一路写坏, 在线接受率 40 轮后从 0.47 掉到 0.03, 不报错(09-24 实撞)。 */
+static void v41_draft_slots(const ds4_v41_state *main_st, ds4_v41_draft *dr, int64_t first, uint32_t rows, uint32_t pos0) {
+    for (uint32_t i = 0; i < rows; i++) dr->p_wpos[i] = (int32_t)(first + (int64_t)i);   /* 这 rows 个位置的绝对位置(rope 要) */
+    if (rows) dr->p_first[0] = (int32_t)(first % (int64_t)main_st->mainh_cap);
+    for (uint32_t i = 0; i < dr->block; i++) {
+        dr->p_tok[i] = i ? (int32_t)g_ds4_v41.mtp_noise_id : dr->host_ids[0];
+        dr->p_bpos[i] = (int32_t)(pos0 + i);
+    }
+    __sync_synchronize();
+}
+
+/* 草稿块的一次前向: 三塔 → 出口 → 逐位 markov 贪心 → confidence。槽由 v41_draft_slots 填好(ids[0] = 上一个真 token)。 */
 static bool v41_draft_block(ds4_engine *e, ds4_v41_draft *dr, uint32_t pos0) {
     const ds4_v41_cfg *v = &g_ds4_v41;
     const ds4_model *m = &e->model;
     ds4_v41_state *st = &dr->st;
     const uint32_t B = dr->block, E = DS4_N_EMBD, R = v->mtp_markov_rank;
     st->n = B; st->pos0 = pos0;
-    /* 块输入 = [真 token, noise × (B-1)](官方 draft_input_ids), 位置 pos0..pos0+B-1; 槽是 pinned 的(进图时零拷贝读) */
-    for (uint32_t i = 0; i < B; i++) { dr->p_tok[i] = i ? (int32_t)v->mtp_noise_id : dr->host_ids[0]; dr->p_bpos[i] = (int32_t)(pos0 + i); }
-    __sync_synchronize();
     if (!v41_draft_put(dr, st->tok, 0, dr->p_tok, (uint64_t)B * 4) || !v41_draft_put(dr, st->pos, 0, dr->p_bpos, (uint64_t)B * 4)) return false;
     if (!v41_draft_put(dr, st->pre_mix, 0, dr->p_onehot, (uint64_t)B * DS4_N_HC * 4)) return false;
     if (!v41_embed(m, st->x, st->tok, e->weights.token_embd, DS4_N_VOCAB, B, E)) return false;
@@ -292,12 +305,9 @@ static bool v41_draft_block(ds4_engine *e, ds4_v41_draft *dr, uint32_t pos0) {
 /* 补窗口: 从主态 mainh 环取 [first, first+rows) 行 → main_proj/main_norm → 推进三塔窗口。位置与起始行走 pinned 槽(进图时零拷贝读)。
  * ★这三步失败必须出声★(2026-09-18 实撞): 以前静默 return false, 调用方只当"这轮不出草稿", 于是一个缓冲区太小(窗口的块区只留了
  * block+1 行, 补 79 行直接越界)让投机整段静默失效 —— 门上"投机 == 纯解码"还是绿的(一轮都没投机当然逐字节同), 只有 t/s 露馅。 */
-static bool v41_draft_fill(ds4_engine *e, ds4_v41_state *main_st, ds4_v41_draft *dr, int64_t first, uint32_t rows) {
-    for (uint32_t i = 0; i < rows; i++) dr->p_wpos[i] = (int32_t)(first + (int64_t)i);   /* 这 rows 个位置的绝对位置(rope 要) */
-    dr->p_first[0] = (int32_t)(first % (int64_t)main_st->mainh_cap);
-    __sync_synchronize();
-    if (!v41_draft_put(dr, dr->st.pos, 0, dr->p_wpos, (uint64_t)rows * 4)) return false;
-    if (dr->cap_mode && !ds4_gpu_tensor_write_zerocopy(dr->firstd, 0, dr->p_first, 4)) return false;
+static bool v41_draft_fill(ds4_engine *e, ds4_v41_state *main_st, ds4_v41_draft *dr, uint32_t rows) {
+    if (!v41_draft_put(dr, dr->st.pos, 0, dr->p_wpos, (uint64_t)rows * 4)) { fprintf(stderr, "ds4: [v41] 草稿器: 写 %u 行窗口位置失败\n", rows); return false; }
+    if (dr->cap_mode && !ds4_gpu_tensor_write_zerocopy(dr->firstd, 0, dr->p_first, 4)) { fprintf(stderr, "ds4: [v41] 草稿器: 写起始行失败\n"); return false; }
     if (!ds4_gpu_v41_ring_rows_tensor(dr->mainh_lin, main_st->mainh, g_ds4_v41.n_mtp_target * DS4_N_EMBD, main_st->mainh_cap,
                                       (uint32_t)dr->p_first[0], rows, dr->cap_mode ? dr->firstd : NULL)) {
         fprintf(stderr, "ds4: [v41] 草稿器: 从 main_hidden 环取 %u 行失败\n", rows); return false;
@@ -312,7 +322,8 @@ static bool v41_draft_fill(ds4_engine *e, ds4_v41_state *main_st, ds4_v41_draft 
 
 /* 一轮的 GPU 部分(补窗口 + 写 ids[0] + 块前向): 直发与捕获共用同一串调用, 差的只是主机写张量走同步拷还是零拷贝小核 */
 static bool v41_draft_gpu_round(ds4_engine *e, ds4_v41_state *main_st, ds4_v41_draft *dr, int64_t first, uint32_t rows, uint32_t pos0) {
-    if (rows && !v41_draft_fill(e, main_st, dr, first, rows)) return false;
+    v41_draft_slots(main_st, dr, first, rows, pos0);
+    if (rows && !v41_draft_fill(e, main_st, dr, rows)) return false;
     if (!v41_draft_put(dr, dr->ids, 0, dr->p_tok, 4)) return false;   /* p_tok[0] = 真 token(调用方已填) */
     return v41_draft_block(e, dr, pos0);
 }
@@ -342,8 +353,8 @@ static bool v41_draft_graph_round(ds4_engine *e, ds4_v41_state *main_st, ds4_v41
         dr->gexec[rows] = exec; dr->ggen[rows] = gen; dr->gcaps++;
         fprintf(stderr, "ds4: [graph] 草稿图(补 %u 行)已捕获\n", rows);
     }
-    /* 重放: 槽里是本轮的值(捕获那一趟也填过, 值相同; 图每次重放读那一刻的槽) */
-    __sync_synchronize();
+    /* 重放: 图读的是重放那一刻槽里的值 ⇒ 先按本轮填(捕获那趟 gpu_round 已填过, 重填同值无害) */
+    v41_draft_slots(main_st, dr, first, rows, pos0);
     if (!ds4_gpu_decode_graph_launch(dr->gexec[rows])) return false;
     if (!ds4_gpu_synchronize()) return false;
     __sync_synchronize();
