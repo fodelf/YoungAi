@@ -245,6 +245,31 @@ if [ "$MODE" = d1 ]; then
   exit 0
 fi
 
+# ★MODE=dflt(2026-09-24): 投机翻成默认开之后的三格门★ —— 同一条真实请求(第 6 参数 = 提示 ids, 按 id 喂):
+#   ①什么都不传(默认开): 输出 == 基线纯解码逐字节(第 7 参数 = 基线 .out, 例 base0924_plain.out), 且吐的 token 数恰好 = NGEN
+#     (一轮接受多位时以前会越过上限, 服务端 max_tokens 是硬上限);
+#   ②默认 + --temp 0.6: 不报错、走纯解码、日志有"投机只在贪心下成立"那一行(服务端温 1.0 的请求不能因默认值被拒);
+#   ③显式 --dspark + --temp 0.6: 照旧硬拒(rc ≠ 0)。
+# 用法: ./speed-bench/d1_kv_ring_gate.sh none <模型> 2048 dflt <反修目录> <提示 ids> <基线纯解码 .out>
+if [ "$MODE" = dflt ]; then
+  PIDS="${6:?提示 ids}"; BOUT="${7:?基线纯解码 .out}"
+  fail=0
+  run ds4 dflt_greedy -n "$NGEN" --emit-trace --gen-ids "$PIDS"
+  ne=$(grep -ac '^\[emit\] ' "$OUT/dflt_greedy.err")
+  echo "  ①默认: $(grep -a -h 'decode .* token\|DSpark:' "$OUT/dflt_greedy.err" | tr '\n' ' ')"
+  grep -aq "DSpark: [1-9]" "$OUT/dflt_greedy.err" || { echo "  ★默认没走投机(没有 DSpark 汇总行)★"; fail=1; }
+  [ "$ne" = "$NGEN" ] && echo "  吐 $ne token = 上限 ✓" || { echo "  ★吐 $ne token ≠ 上限 $NGEN★"; fail=1; }
+  if cmp -s "$OUT/dflt_greedy.out" "$BOUT"; then echo "  == 基线纯解码逐字节同 ✓"; else echo "  ★与基线不同★ $(cmp "$OUT/dflt_greedy.out" "$BOUT" 2>&1 | head -1)"; fail=1; fi
+  run ds4 dflt_temp -n 64 --temp 0.6 --gen-ids "$PIDS"; rc=$?
+  if [ "$rc" = 0 ] && grep -aq "投机只在贪心下成立" "$OUT/dflt_temp.err"; then echo "  ②默认 + 采样: 走纯解码, 有日志 ✓"
+  else echo "  ★默认 + 采样: rc=$rc, 日志: $(grep -a '投机\|dspark' "$OUT/dflt_temp.err" | head -2)★"; fail=1; fi
+  run ds4 dflt_explicit -n 64 --dspark --temp 0.6 --gen-ids "$PIDS"; rc=$?
+  if [ "$rc" != 0 ] && grep -aq "不能同开" "$OUT/dflt_explicit.err"; then echo "  ③显式 --dspark + 采样: 拒 ✓"
+  else echo "  ★显式 --dspark + 采样没拒(rc=$rc)★"; fail=1; fi
+  [ "$fail" = 0 ] && echo "门: 全绿" || echo "门: ★有红★"
+  exit "$fail"
+fi
+
 # ★MODE=sim(2026-09-19): 调度器的离线陪审团 —— 接在 online 之后跑★
 # ①从 online 那趟投机的 [emit] 轨迹(位置 + id)拼出整段真 id 序列(提示 token 走 --dump-tokens, 与生成同一条渲染路);
 # ②教师强制取料(--dspark-capture): 每个位置都出一块草稿 + conf, 落 <pairs>.fix; ③gguf-tools/bench/dspark_sim 在主机上重放
@@ -252,6 +277,59 @@ fi
 # 成本(ms)取 online 那趟的实测: 走图一步与草稿一轮从日志解析; "直发验 1 行 42.5 / 每多一行 12.95" 是 09-18 钉死 k=1/k=3 两趟
 # 解出来的(fable5 09-18 断档诊断对照表: 一轮 69.4 / 95.3 ms), 没法从混合 k 的均值里解出来, 写死在这。
 # 用法: ./speed-bench/d1_kv_ring_gate.sh none <模型> 0 sim
+#
+# ★真实请求档(2026-09-24): 第 6 个参数给提示 ids 文件 ⇒ 在线四趟 + 取料 + 重放全在这条请求上做★
+# 为什么: fin_chat_prompt 是测速基准(凭记忆写的数), 不是产品场景(铁律 09-21); 投机赚不赚全看接受率, 接受率随文本走,
+# 所以只认真实请求。真实请求只有 id 是准的(文本重新分词拼不回去), 一律 --gen-ids 喂, 生成段 id 取纯解码那趟的 [emit]。
+# 验证批的钱不再用 09-18 写死的 42.5/12.95: 钉死 k=1/k=3 两趟的"验证"项 V1/V3 解出(验证 1+k 行 = v1 + tok·k)
+#   tok = (V3 − V1)/2, v1 = V1 − tok。09-23 的提速全是 n=1 核, 验证批核没动, 旧常数早过期。
+# 第 7 个参数(可选) = 假设"验证批核补齐到 n=1 水平"时每多验一行的 ms(= 一行的专家账), 再重放一遍: 验 1 行 = 走图一步。
+#   这一档回答的是"把验证批核做好以后投机能到多少", 不是现状。
+# 第 8 个参数给 nocap = 只跑在线四趟(速度 + 同轨 + 验证批成本)就停: 改核后复测用, 取料(逐位 ~15 min)只在要重放时才付。
+# 用法: ./speed-bench/d1_kv_ring_gate.sh none <模型> <生成几个 token> sim <反修目录> <提示 ids> [理想每行 ms] [nocap]
+if [ "$MODE" = sim ] && [ -n "${6:-}" ]; then
+  PIDS="$6"; TOKI="${7:-}"; NOCAP="${8:-}"
+  [ -s "$PIDS" ] || { echo "★没有 $PIDS★"; exit 1; }
+  [ "$NGEN" -gt 0 ] || { echo "★生成 token 数要 > 0★"; exit 1; }
+  [ -x ./gguf-tools/bench/dspark_sim ] || make -C gguf-tools dspark_sim || exit 1
+  t=rq_$(basename "$PIDS" .ids)
+  run ds4 "${t}_plain" -n "$NGEN" --no-dspark --emit-trace --gen-ids "$PIDS"
+  run ds4 "${t}_spec"  -n "$NGEN" --dspark --emit-trace --gen-ids "$PIDS"
+  for k in 1 3; do run ds4 "${t}_k$k" -n "$NGEN" --dspark --dspark-verify "$k" --gen-ids "$PIDS"; done
+  echo "== 真实请求 $(basename "$PIDS"), 生成 $NGEN token"
+  for x in plain spec k1 k3; do
+    echo "  $x: $(grep -a -h 'decode .* token' "$OUT/${t}_$x.err") $(grep -a -h '稳态' "$OUT/${t}_$x.err" | sed 's/.*⇒ //') $(grep -a -h 'DSpark:\|一轮 ' "$OUT/${t}_$x.err" | tr '\n' ' ')"
+  done
+  A="$OUT/${t}_spec.out"; B="$OUT/${t}_plain.out"
+  na=$(wc -c < "$A"); nb=$(wc -c < "$B"); n=$(( (na < nb ? na : nb) - 1 ))
+  if cmp -s -n "$n" "$A" "$B"; then echo "  同轨: 前 $n 字节逐字节同 ✓"; else echo "  ★同轨分叉, 下面的重放不作数★ $(cmp -n "$n" "$A" "$B" 2>&1 | head -1)"; fi
+  for k in 1 3; do
+    echo "  k=$k 验证项: $(grep -a -h '一轮 ' "$OUT/${t}_k$k.err" | sed 's/.*验证 \([0-9.]*\).*/\1/') ms"
+  done
+  [ "$NOCAP" = nocap ] && { echo "  (nocap: 不取料不重放)"; exit 0; }
+  # 整段 id = 提示(原样) + 纯解码那趟吐的; 取料每个位置出一块草稿, 与这一串逐位比
+  { tr -s ' \t' '\n\n' < "$PIDS" | grep -v '^$'; grep -a '^\[emit\] ' "$OUT/${t}_plain.err" | sort -n -k2 | awk '{print $3}'; } > "$OUT/$t.sim.ids"
+  NP=$(tr -s ' \t' '\n\n' < "$PIDS" | grep -c .)
+  echo "  取料: ids $(wc -l < "$OUT/$t.sim.ids") = 提示 $NP + 生成 $(( $(wc -l < "$OUT/$t.sim.ids") - NP ))"
+  z=(); [ "$AMP" != none ] && z=(--zchain "$AMP")
+  ./ds4 -m "$MODEL" ${z[@]+"${z[@]}"} --score-ids "$OUT/$t.sim.ids" --dspark-capture "$OUT/$t.pairs.bin" --decoder-full \
+      > /dev/null 2> "$OUT/$t.cap.err" || { echo "★取料失败★"; tail -3 "$OUT/$t.cap.err"; exit 3; }
+  grep -a "首位 ↔ 底座" "$OUT/$t.cap.err"
+  GMS=$(grep -a -h '稳态' "$OUT/${t}_plain.err" | sed 's/.*稳态 \([0-9.]*\) ms.*/\1/')
+  DMS=$(grep -a -h '一轮 ' "$OUT/${t}_spec.err" | sed 's/.*草稿 \([0-9.]*\).*/\1/')
+  V1=$(grep -a -h '一轮 ' "$OUT/${t}_k1.err" | sed 's/.*验证 \([0-9.]*\).*/\1/')
+  V3=$(grep -a -h '一轮 ' "$OUT/${t}_k3.err" | sed 's/.*验证 \([0-9.]*\).*/\1/')
+  [ -n "$GMS" ] && [ -n "$DMS" ] && [ -n "$V1" ] && [ -n "$V3" ] || { echo "★成本没解析出来(GMS=$GMS DMS=$DMS V1=$V1 V3=$V3), 看 .err★"; exit 4; }
+  TOK=$(awk -v a="$V1" -v b="$V3" 'BEGIN{printf "%.2f", (b-a)/2}'); VV1=$(awk -v a="$V1" -v t="$TOK" 'BEGIN{printf "%.2f", a-t}')
+  echo "  成本(实测): 走图一步 $GMS / 草稿一轮 $DMS / 验 1 行 $VV1 / 每多一行 $TOK ms"
+  echo "== 重放: 现状成本"
+  ./gguf-tools/bench/dspark_sim "$OUT/$t.pairs.bin.fix" "$OUT/$t.sim.ids" "$GMS" "$DMS" "$VV1" "$TOK" 4 "$NP" | tee "$OUT/$t.sim.txt"
+  if [ -n "$TOKI" ]; then
+    echo "== 重放: 假设验证批核补齐(验 1 行 = 走图一步 $GMS, 每多一行 $TOKI)"
+    ./gguf-tools/bench/dspark_sim "$OUT/$t.pairs.bin.fix" "$OUT/$t.sim.ids" "$GMS" "$DMS" "$GMS" "$TOKI" 4 "$NP" | tee "$OUT/$t.sim_ideal.txt"
+  fi
+  exit 0
+fi
 if [ "$MODE" = sim ]; then
   P=speed-bench/fin_chat_prompt.txt
   [ -s "$OUT/onl_spec.err" ] || { echo "★先跑 online 模式★"; exit 1; }

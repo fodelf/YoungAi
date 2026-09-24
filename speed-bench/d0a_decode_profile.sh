@@ -306,7 +306,9 @@ NR>1 { st=$1+0; du=$2+0; nm=$21; gsub(/"/,"",nm); sub(/^ *void /,"",nm);
      # ★NT 要从**整行**匹配, 不能从 $21★(2026-09-17 实撞): 核名里有逗号, -F, 把它切成好几列,
      # 列数还随核名长短变 ⇒ $21 有时不含 "<", 于是 ntstep 保留上一步的值, 把同一种 5 行验证步
      # 标成了 n1/n2/n3/n4/n5 五档(看着像"边际随批长", 其实是同一个量的五次采样)。
-     if (match($0,/(fp4x32|q4k)_gemv_kernel<\(unsigned int\)[0-9]+/)) { ntv=substr($0,RSTART,RLENGTH); sub(/.*\)/,"",ntv); ntstep[step]=ntv }
+     # 09-24: q4_K 骨架 GEMV 换成 q4k_gemv1_stage/pipe_kernel<NT>(纯解码与验证批同一对核), 旧名 q4k_gemv_kernel 已删; 两种都认。
+     # 草稿步现在没有 mtp_ 核(三塔走主干的 VQ 常驻核), 它的出口头是 NT=块长(5) 的 GEMV ⇒ 钉死 k 的趟里 verify_n5 那列就是草稿步。
+     if (match($0,/(fp4x32|q4k)_gemv(1_stage|1_pipe)?_kernel<\(unsigned int\)[0-9]+/)) { ntv=substr($0,RSTART,RLENGTH); sub(/.*\)/,"",ntv); ntstep[step]=ntv }
      if (base ~ /mtp_/) mtpstep[step]=1;
      if (base ~ /nvfp4|cutlass|Kernel/) pf[step]=1;
      t[step,base]+=du; n[step,base]++; tot[step]+=du;
