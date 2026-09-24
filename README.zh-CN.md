@@ -518,6 +518,12 @@ gguf-tools/scripts/v41_judge.sh <判决.ids> 8192 engamp:<拟合.ids>:8192:<基�
 
 ---
 
+## 作者与联系方式
+
+吴文周 · 310066827@qq.com
+
+欢迎来信交流问题、复现结果或合作。
+
 ## 致谢
 
 本项目起步于 [antirez/ds4](https://github.com/antirez/ds4)（DwarfStar）的一个分叉，那是 Salvatore Sanfilippo

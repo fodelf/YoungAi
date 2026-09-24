@@ -614,6 +614,12 @@ The full engineering log — every verdict, table and retraction — is in `fabl
 
 ---
 
+## Author and contact
+
+Wenzhou Wu (吴文周) · 310066827@qq.com
+
+Questions, reproduction reports and collaboration offers are welcome.
+
 ## Acknowledgements
 
 This project started as a fork of [antirez/ds4](https://github.com/antirez/ds4) (DwarfStar), the
