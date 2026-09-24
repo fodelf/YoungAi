@@ -124,7 +124,7 @@ CFO 决策报告，提示长度 9k 到 132k token。日志里，模型定的目�
   不做这道检查的话，过期的 ③ 照样能跑，只会悄悄给出错的结果。
 
 ```sh
-./ds4-server --cuda -m base.gguf --zchain 侧车目录/ [--posttrain 后训练目录/] --mem-budget-mb 110000
+./bin/ds4-server --cuda -m base.gguf --zchain 侧车目录/ [--posttrain 后训练目录/] --mem-budget-mb 110000
 ```
 
 ---
@@ -439,64 +439,83 @@ E2M1 只有 8 个幅值格点。所以把 Gauss–Seidel 的每一步拆成三�
 
 ## 七、怎么跑
 
-**硬件。** 实测平台 NVIDIA DGX Spark（GB10，sm_121，128 GB）。E4M3 路径需要 sm_89 及以上。
-V4.1 只支持 CUDA；仓库里的 Metal 代码服务的是更早的 V4 路径。
+**需要什么。**
 
-**编译。**
+- NVIDIA DGX Spark（GB10，sm_121，128 GB）——唯一实测过的机器。FP8 码本路径需要 sm_89 及以上。
+  V4.1 只支持 CUDA。
+- Linux aarch64，装有 CUDA 13 运行库（`libcudart.so.13`、`libcublas.so.13`、`libcublasLt.so.13`；DGX OS 自带）。
+  缺库时的报错是 `error while loading shared libraries: libcudart.so.13`。
+- 本地 SSD 约 320 GB：本仓库 113.6 GB + 官方两个分片 203 GB（见下）。
+- 机器上别跑其他大任务：放不进 110 GB 内存预算时，引擎会拒绝启动。
 
-```sh
-make cuda-spark                  # 引擎: ds4、ds4-server（DGX Spark / GB10）
-make -C gguf-tools v41_quantize v41_to_gguf v41_amp_run anchor_metrics   # 量化器、转换器、侧车解算器、比较器
-```
+**本仓库里有什么。**
 
-**文件。**
-
-| 文件 | 是什么 |
+| 路径 | 是什么 |
 |---|---|
 | `DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf` | ① 基座，113,556,639,424 字节 |
-| `…-grrb-vqfin41_vqhalf_a_n8192-engine/` | ② 金融侧车：`gr_Lnn.bin`（增益）+ `rb_Lnn.bin`（路由偏置）+ `manifest.txt` |
-| 官方 `DeepSeek-V4.1-Flash/` 权重目录 | n-gram 记忆表从其中两个分片里读 |
+| `DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-vqfin41_vqhalf_a_n8192-engine/` | ② 金融侧车：`gr_Lnn.bin`（增益，39 层）+ `rb_Lnn.bin`（路由偏置，27 层）+ `manifest.txt`（逐层 λ 与留出集收益） |
+| `posttrain-experimental-20260924/` | ③ 一份实验性的后训练文件：`gr_L39.bin` + `base.fnv`（见下） |
+| `bin/ds4`、`bin/ds4-server` | 引擎二进制，在 Spark 上用 `make cuda-spark` 编出来的 |
+| `LICENSE`、`LICENSE-DeepSeek` | 引擎（含 GGML）与模型权重各自的 MIT 声明 |
 
-转换器会把这两个分片的**绝对路径**写进 GGUF（`deepseek4.engram.N.table_path`）。分片要留在转换时的位置，
-挪了就重跑一次转换器——否则引擎加载时会停在"engram 表打不开"。
-
-**起服务。**
+**第一步：下载。**
 
 ```sh
-./ds4-server --cuda -m DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf \
-    --zchain <侧车目录> [--posttrain <后训练目录>] \
-    --mem-budget-mb 110000 --host 0.0.0.0 --port 8000
-# 或者用带起跑清单、冒烟测试和内存看门狗的脚本:
-gguf-tools/scripts/serve_1m_spark.sh start
+hf download wenzhouwu/DwarfStar-DeepSeek-V4.1-Flash --local-dir ds4-v41
+chmod +x ds4-v41/bin/ds4 ds4-v41/bin/ds4-server
 ```
 
-接口：`/v1/chat/completions`、`/v1/completions`、`/v1/responses`（OpenAI 风格）和 `/v1/messages`
-（Anthropic 风格）。请求里不带 `temperature` 就走贪心（并且走投机）；带了 `temperature` 就采样，走纯解码。
+**第二步：n-gram 记忆表。** 它不在本仓库里：引擎直接从官方权重的两个分片里原样读取（每个约 101.5 GB）。
+
+```sh
+hf download deepseek-ai/DeepSeek-V4.1-Flash \
+    model-00047-of-00048.safetensors model-00048-of-00048.safetensors --local-dir /data/DeepSeek-V4.1-Flash
+```
+
+GGUF 里按**绝对路径**记着这两个分片——
+`/home/fodelf/ds4-main/hf/DeepSeek-V4.1-Flash/model-0004{7,8}-of-00048.safetensors`——引擎没有参数能改它。
+所以要让这个路径指向你下载的那份：
+
+```sh
+sudo mkdir -p /home/fodelf/ds4-main/hf
+sudo ln -s /data/DeepSeek-V4.1-Flash /home/fodelf/ds4-main/hf/DeepSeek-V4.1-Flash
+```
+
+漏了这一步，引擎加载时会停在 `ds4: engram 表打不开 /home/fodelf/…`。
+
+**第三步：起服务。**
+
+```sh
+cd ds4-v41
+./bin/ds4-server --cuda -m DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf \
+    --zchain DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-vqfin41_vqhalf_a_n8192-engine \
+    --mem-budget-mb 110000 --host 0.0.0.0 --port 8000
+```
+
+加载大约两分钟。接口：`/v1/chat/completions`、`/v1/completions`、`/v1/responses`（OpenAI 风格）和
+`/v1/messages`（Anthropic 风格）。请求里不带 `temperature` 就走贪心（并且走投机）；带了 `temperature` 就采样，
+走纯解码。
 
 **命令行。**
 
 ```sh
-./ds4 --cuda -m <基座.gguf> --zchain <侧车目录> -p "解释一下什么是市盈率。"
-./ds4 --cuda -m <基座.gguf> --zchain <侧车目录> --no-dspark -p "…"   # 纯解码，比如测速度基线时
+./bin/ds4 --cuda -m DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf \
+    --zchain DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-vqfin41_vqhalf_a_n8192-engine \
+    -p "解释一下什么是市盈率。"
+# 加 --no-dspark 走纯解码（测速度基线时用）；去掉 --zchain 就是裸基座
 ```
 
-**从官方权重全部重建**（在 Spark 上；路径用脚本默认值）。
+**后训练文件是一次实验，不是升级包。** `posttrain-experimental-20260924/` 是在我们交易 Agent 的一条大盘研判
+请求（2026-09-22）上解出来的，只动末层、只撬一个决策 token。放在这里是为了展示格式和加载方式：
 
 ```sh
-# ① 量化: E4M3 共享码本、浅 14 层 13 bit、零语料, 然后在三把尺上判
-gguf-tools/scripts/v41_quantize_spark.sh --out gguf/v41/<目录> --skel q4k --vq-nc 4096 \
-    --vq-nc-layers 0:14=8192 --vq-shared-cb --vq-cb-fp8 --judge-set all
-# 哈希常量与分词常量, 从官方分词器算一次(夹具生成器, 不参与数值)
-python3 gguf-tools/scripts/v41_engram_consts.py    <官方目录> engram_consts.bin
-python3 gguf-tools/scripts/v41_tokenizer_consts.py <官方目录> tokenizer_consts.bin
-gguf-tools/quantize/v41_to_gguf gguf/v41/<目录> engram_consts.bin tokenizer_consts.bin <基座.gguf> <官方目录>
-
-# ② 在拟合切片上解侧车, 在不重叠的判决切片上判
-gguf-tools/scripts/v41_judge.sh <判决.ids> 8192 engamp:<拟合.ids>:8192:<基座.gguf>:0:40:grrb
+./bin/ds4-server … --zchain <上面的侧车目录> --posttrain posttrain-experimental-20260924
 ```
 
-**测试。** `make test`（离线单测、104 项服务端测试、单文件行数守卫）和 `make -C gguf-tools tools-test`
-（工具链自测，其中包括 "12 + 1" 格式的 97 个位布局金标用例）。
+它只能叠在本仓库这份侧车上——`base.fnv` 就是这份侧车的指纹，配别的侧车引擎直接拒绝加载。别指望它提升
+别的任何东西。
+
+**源码**（引擎、量化器、解算器）暂未公开。
 
 ---
 
@@ -512,9 +531,7 @@ gguf-tools/scripts/v41_judge.sh <判决.ids> 8192 engamp:<拟合.ids>:8192:<基�
 - **有两个速度数字包含尚未合入主线的核改动**（专家载荷 128 字节对齐、验证批侧流）。已合入的代码实测：
   短上下文纯解码约 30.0 t/s，14k 请求投机 39.3 t/s。
 - **张量核预填与老的融合路径不是逐位相同**，差距在舍入噪声量级（见 4.4）。
-- **n-gram 记忆表分片按绝对路径绑定**（见第七章）。
-
-完整的工程日志——每一条判决、每一张表、每一次撤回——都在 `fable5.md` 里。
+- **n-gram 记忆表分片按绝对路径绑定**（见第七章第二步）。
 
 ---
 
@@ -527,12 +544,12 @@ gguf-tools/scripts/v41_judge.sh <判决.ids> 8192 engamp:<拟合.ids>:8192:<基�
 ## 致谢
 
 本项目起步于 [antirez/ds4](https://github.com/antirez/ds4)（DwarfStar）的一个分叉，那是 Salvatore Sanfilippo
-与贡献者们为 DeepSeek V4 专门写的推理引擎；它原来针对 V4 / Metal 路径的文档保存在
-[`docs/archive/README_v4_upstream.md`](docs/archive/README_v4_upstream.md)。和上游一样，我们受惠于
+与贡献者们为 DeepSeek V4 专门写的推理引擎，V4 / Metal 路径的文档在那里。和上游一样，我们受惠于
 [llama.cpp 与 GGML](https://github.com/ggml-org/llama.cpp)：GGUF、q4_K 这样的量化布局，以及大量来之不易的
 核经验都来自那里，GGML 作者的版权声明保留在 `LICENSE` 中。模型属于 DeepSeek；感谢 DeepSeek 公开权重，
 以及充当我们尺子的官方参考推理代码。
 
 ## 许可证
 
-MIT，见 [`LICENSE`](LICENSE)。模型权重遵循 DeepSeek 的许可。
+引擎：MIT，见 [`LICENSE`](LICENSE)。量化权重派生自 DeepSeek V4.1 Flash，同为 MIT，见
+[`LICENSE-DeepSeek`](LICENSE-DeepSeek)。

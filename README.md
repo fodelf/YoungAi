@@ -1,5 +1,7 @@
 ---
 license: mit
+base_model: deepseek-ai/DeepSeek-V4.1-Flash
+base_model_relation: quantized
 language:
 - en
 - zh
@@ -158,7 +160,7 @@ generalize across days — see [§8](#8-honest-status-and-limits).
   numbers.
 
 ```sh
-./ds4-server --cuda -m base.gguf --zchain sidecar_dir/ [--posttrain posttrain_dir/] --mem-budget-mb 110000
+./bin/ds4-server --cuda -m base.gguf --zchain sidecar_dir/ [--posttrain posttrain_dir/] --mem-budget-mb 110000
 ```
 
 ---
@@ -528,67 +530,86 @@ Negative results carry as much of the design as positive ones. Each row was meas
 
 ## 7. Run it
 
-**Hardware.** Tested on NVIDIA DGX Spark (GB10, sm_121, 128 GB). The E4M3 path needs sm_89 or newer.
-V4.1 runs on CUDA only; the Metal code in this repo serves the older V4 path.
+**What you need.**
 
-**Build.**
+- NVIDIA DGX Spark (GB10, sm_121, 128 GB) — the only machine tested. The FP8 codebook path needs sm_89
+  or newer. V4.1 runs on CUDA only.
+- Linux aarch64 with the CUDA 13 runtime (`libcudart.so.13`, `libcublas.so.13`, `libcublasLt.so.13`;
+  DGX OS ships them). Missing libraries show up as `error while loading shared libraries: libcudart.so.13`.
+- ~320 GB of local SSD: 113.6 GB for this repository + 203 GB for two official shards (below).
+- Nothing else heavy running: the engine refuses to start if it cannot fit the 110 GB budget.
 
-```sh
-make cuda-spark                  # engine: ds4, ds4-server (DGX Spark / GB10)
-make -C gguf-tools v41_quantize v41_to_gguf v41_amp_run anchor_metrics   # quantizer, converter, sidecar solver, comparator
-```
+**Files in this repository.**
 
-**Files.**
-
-| File | What |
+| Path | What |
 |---|---|
 | `DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf` | ① base, 113,556,639,424 bytes |
-| `…-grrb-vqfin41_vqhalf_a_n8192-engine/` | ② finance sidecar: `gr_Lnn.bin` (gains) + `rb_Lnn.bin` (router bias) + `manifest.txt` |
-| official `DeepSeek-V4.1-Flash/` checkpoint | the n-gram tables are read from two of its shards |
+| `DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-vqfin41_vqhalf_a_n8192-engine/` | ② finance sidecar: `gr_Lnn.bin` (gains, 39 layers) + `rb_Lnn.bin` (router bias, 27 layers) + `manifest.txt` (per-layer λ and held-out gain) |
+| `posttrain-experimental-20260924/` | ③ an experimental post-training file: `gr_L39.bin` + `base.fnv` (see below) |
+| `bin/ds4`, `bin/ds4-server` | engine binaries, built on the Spark with `make cuda-spark` |
+| `LICENSE`, `LICENSE-DeepSeek` | MIT notices for the engine (incl. GGML) and for the model weights |
 
-The converter writes the *absolute* path of those two shards into the GGUF
-(`deepseek4.engram.N.table_path`). Keep them where they were, or re-run the converter after moving them —
-otherwise the engine stops at load with "engram 表打不开".
-
-**Serve.**
+**Step 1 — download.**
 
 ```sh
-./ds4-server --cuda -m DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf \
-    --zchain <sidecar_dir> [--posttrain <posttrain_dir>] \
-    --mem-budget-mb 110000 --host 0.0.0.0 --port 8000
-# or, with a start-up checklist, smoke test and memory watchdog:
-gguf-tools/scripts/serve_1m_spark.sh start
+hf download wenzhouwu/DwarfStar-DeepSeek-V4.1-Flash --local-dir ds4-v41
+chmod +x ds4-v41/bin/ds4 ds4-v41/bin/ds4-server
 ```
 
-Endpoints: `/v1/chat/completions`, `/v1/completions`, `/v1/responses` (OpenAI style) and
-`/v1/messages` (Anthropic style). A request without `temperature` is decoded greedily (and
-speculatively); a request with `temperature` is sampled and runs plain decode.
+**Step 2 — the n-gram memory tables.** They are not in this repository: the engine reads them, untouched,
+from two shards of the official checkpoint (≈ 101.5 GB each).
+
+```sh
+hf download deepseek-ai/DeepSeek-V4.1-Flash \
+    model-00047-of-00048.safetensors model-00048-of-00048.safetensors --local-dir /data/DeepSeek-V4.1-Flash
+```
+
+The GGUF records these two shards by **absolute path** —
+`/home/fodelf/ds4-main/hf/DeepSeek-V4.1-Flash/model-0004{7,8}-of-00048.safetensors` — and the engine has no
+option to change it. Make that path point at your copy:
+
+```sh
+sudo mkdir -p /home/fodelf/ds4-main/hf
+sudo ln -s /data/DeepSeek-V4.1-Flash /home/fodelf/ds4-main/hf/DeepSeek-V4.1-Flash
+```
+
+Skip this and the engine stops at load with `ds4: engram 表打不开 /home/fodelf/…` ("cannot open engram
+table").
+
+**Step 3 — serve.**
+
+```sh
+cd ds4-v41
+./bin/ds4-server --cuda -m DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf \
+    --zchain DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-vqfin41_vqhalf_a_n8192-engine \
+    --mem-budget-mb 110000 --host 0.0.0.0 --port 8000
+```
+
+Loading takes about two minutes. Endpoints: `/v1/chat/completions`, `/v1/completions`, `/v1/responses`
+(OpenAI style) and `/v1/messages` (Anthropic style). A request without `temperature` is decoded greedily
+(and speculatively); a request with `temperature` is sampled and runs plain decode.
 
 **Command line.**
 
 ```sh
-./ds4 --cuda -m <base.gguf> --zchain <sidecar_dir> -p "Explain the price-to-earnings ratio."
-./ds4 --cuda -m <base.gguf> --zchain <sidecar_dir> --no-dspark -p "…"   # plain decode, e.g. for speed baselines
+./bin/ds4 --cuda -m DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf \
+    --zchain DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-vqfin41_vqhalf_a_n8192-engine \
+    -p "Explain the price-to-earnings ratio."
+# add --no-dspark for plain decoding (speed baselines); drop --zchain to run the bare base
 ```
 
-**Rebuild everything from the official weights** (on the Spark; paths are the scripts' defaults).
+**The post-training file is an experiment, not an upgrade.** `posttrain-experimental-20260924/` was solved
+on a single market-outlook request from our trading agent (2026-09-22) and moves one decision token, only on
+the last layer. It is here to show the format and the loading path:
 
 ```sh
-# ① quantize: shared E4M3 codebooks, 14 shallow layers at 13 bits, zero corpus, then judge on three rulers
-gguf-tools/scripts/v41_quantize_spark.sh --out gguf/v41/<dir> --skel q4k --vq-nc 4096 \
-    --vq-nc-layers 0:14=8192 --vq-shared-cb --vq-cb-fp8 --judge-set all
-# hashing and tokenizer constants, computed once from the official tokenizer (fixture generators, not numerics)
-python3 gguf-tools/scripts/v41_engram_consts.py    <official_dir> engram_consts.bin
-python3 gguf-tools/scripts/v41_tokenizer_consts.py <official_dir> tokenizer_consts.bin
-gguf-tools/quantize/v41_to_gguf gguf/v41/<dir> engram_consts.bin tokenizer_consts.bin <base.gguf> <official_dir>
-
-# ② solve the sidecar on a fitting slice, judge it on a disjoint slice
-gguf-tools/scripts/v41_judge.sh <judge.ids> 8192 engamp:<fit.ids>:8192:<base.gguf>:0:40:grrb
+./bin/ds4-server … --zchain <sidecar dir above> --posttrain posttrain-experimental-20260924
 ```
 
-**Tests.** `make test` (offline units, 104 server tests, file-size guard) and
-`make -C gguf-tools tools-test` (toolchain self-tests, including 97 bit-layout golden cases for the
-12 + 1 format).
+It loads only on top of the sidecar in this repository — `base.fnv` is that sidecar's fingerprint, and the
+engine refuses any other pairing. Do not expect it to improve anything else.
+
+**Source code** of the engine, the quantizer and the solvers is not public yet.
 
 ---
 
@@ -608,9 +629,7 @@ gguf-tools/scripts/v41_judge.sh <judge.ids> 8192 engamp:<fit.ids>:8192:<base.ggu
   speculative on the 14k request.
 - **Prefill on tensor cores is not bit-identical** to the older fused path; the difference is at the
   rounding-noise level (§4.4).
-- **Engram shards are pinned by absolute path** (§7).
-
-The full engineering log — every verdict, table and retraction — is in `fable5.md` (Chinese).
+- **The n-gram shards are pinned by absolute path** (§7, step 2).
 
 ---
 
@@ -623,8 +642,8 @@ Questions, reproduction reports and collaboration offers are welcome.
 ## Acknowledgements
 
 This project started as a fork of [antirez/ds4](https://github.com/antirez/ds4) (DwarfStar), the
-DeepSeek-V4-specific engine by Salvatore Sanfilippo and contributors; its original documentation for the
-V4 / Metal paths is kept in [`docs/archive/README_v4_upstream.md`](docs/archive/README_v4_upstream.md).
+DeepSeek-V4-specific engine by Salvatore Sanfilippo and contributors, where the documentation for the
+V4 / Metal paths lives.
 Like upstream, we are indebted to [llama.cpp and GGML](https://github.com/ggml-org/llama.cpp): GGUF,
 quantization layouts such as q4_K, and much hard-won kernel knowledge come from there, and the GGML
 authors' copyright notice stays in `LICENSE`. The model is DeepSeek's; thanks to DeepSeek for releasing
@@ -632,4 +651,5 @@ the weights and the reference inference code that serves as our ruler.
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE). Model weights are subject to DeepSeek's license.
+Engine: MIT — see [`LICENSE`](LICENSE). Quantized weights derive from DeepSeek V4.1 Flash, MIT — see
+[`LICENSE-DeepSeek`](LICENSE-DeepSeek).
