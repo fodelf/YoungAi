@@ -16,7 +16,7 @@ int ds4_engine_is_v41(ds4_engine *e);
 void ds4_engine_v41_set_prof(int on);   /* --v41-prof: 每次前向打逐层毫秒(每层同步一次, 只在查速度时开) */
 void ds4_engine_v41_set_decoder_full(int on);   /* --decoder-full: 关 CED, 提示每块跑满全部层(精确路) */
 void ds4_engine_v41_set_chunk(int n);           /* --v41-chunk: 预填分块大小(0 = 默认) */
-void ds4_engine_v41_set_dspark(int on);         /* --dspark: 开投机解码(默认关, 见 core_v41_api.c) */
+void ds4_engine_v41_set_dspark(int mode);       /* 投机: 0 关 / 1 默认开(采样请求自动走纯解码) / 2 显式 --dspark(与采样同开硬拒); 见 core_v41_api.c */
 void ds4_engine_v41_set_graph(int on);          /* --no-graph 关解码整步 CUDA graph(默认开; 只作 A/B 与定位, 输出逐字节同) */
 void ds4_engine_v41_set_vq_group(int on);       /* --no-vq-group: 验证批/草稿塔的 VQ 专家核回逐对形态(默认分组核; 只作 A/B, 输出逐字节同) */
 void ds4_engine_v41_set_emit_trace(int on);     /* --emit-trace: 逐 token 打 [emit] 位置+id(同轨定位) */
@@ -48,7 +48,7 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
  * temperature ≤ 0(默认) = 裸 argmax: 图末尾的设备 argmax, 一个字节不变(门 = 温 0 输出逐字节回归)。
  * > 0 = 每步把末位 logits 行读回主机, 交给 V4 路**同一份**采样器 ds4_sample_logits(温度 / top-k / top-p / min-p / seed)
  * ⇒ 两条路同分布。只按模型自己的分布抽, 不动 logits(铁律"引擎不得改模型输出"); 频率/出现/序列复读惩罚还没接。
- * seed 0 = 按时钟(与 V4 CLI 同规则)。NULL = 回到裸 argmax。采样与投机(--dspark)不能同开: 生成路直接拒, 不静默降级。
+ * seed 0 = 按时钟(与 V4 CLI 同规则)。NULL = 回到裸 argmax。采样与显式 --dspark 不能同开: 生成路直接拒; 投机只是默认开着时, 采样请求走纯解码并打日志。
  * 惩罚(core_decode_penalty.c, 全部默认 0 = 不进那段代码): freq/presence = OpenAI 频率/出现惩罚(与 V4 路同式);
  * dry_multiplier > 0 开 DRY 序列复读惩罚(base 1.75 / allowed_length 2 是 llama.cpp 默认): 这是温 0 下也能挡死循环的唯一手段。
  * 任一惩罚非零时, 温 0 也走"读回 logits 行 → 罚 → argmax"这条路(argmax 由同一份采样器在温 0 时给出)。 */

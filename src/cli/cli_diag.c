@@ -49,8 +49,8 @@ int run_v41_generation(ds4_engine *engine, const cli_config *cfg, const ds4_toke
     ds4_engine_set_decode_sampling(&sp);
     ds4_engine_v41_set_prof(cfg->gen.v41_prof);
     ds4_engine_v41_set_decoder_full(cfg->gen.decoder_full);
-    /* 两个标志同时给 = 关(显式的"关"压过显式的"开", 免得脚本里两条都留着还以为开着) */
-    ds4_engine_v41_set_dspark(cfg->gen.dspark && !cfg->gen.no_dspark);
+    /* 两个标志同时给 = 关(显式的"关"压过显式的"开", 免得脚本里两条都留着还以为开着); 都不给 = 默认开(1), 见 core_v41_api.c */
+    ds4_engine_v41_set_dspark(cfg->gen.no_dspark ? 0 : (cfg->gen.dspark ? 2 : 1));
     ds4_engine_v41_set_graph(!cfg->gen.no_graph);
     ds4_engine_v41_set_vq_group(!cfg->gen.no_vq_group);
     ds4_engine_v41_set_emit_trace(cfg->gen.emit_trace);

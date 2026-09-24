@@ -141,7 +141,7 @@ int main(int argc, char **argv) {
      * 那 7.3 GiB 在装载时排第几优先级 —— 投机不开时三塔一次都不读, 排最后; 投机开着时它每轮都读,
      * 就不能再排在主干专家后面。run_v41_generation 里那句 set_dspark 是开完模型才执行的, 太晚了。
      * (这里设一次、那里再设一次不冲突: 同一个值。) */
-    ds4_engine_v41_set_dspark(cfg.gen.dspark && !cfg.gen.no_dspark);
+    ds4_engine_v41_set_dspark(cfg.gen.no_dspark ? 0 : (cfg.gen.dspark ? 2 : 1));   /* 三档含义见 core_v41_api.c g_ds4_v41_dspark */
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &cfg.engine) != 0) {
         ds4_dist_options_free(cfg.dist);

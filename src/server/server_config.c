@@ -115,6 +115,9 @@ void usage(FILE *fp) {
         "      VQ codebook sidecar directory (takes precedence over --residual).\n"
         "  --spec\n"
         "      DSpark speculative decoding + online scheduler (greedy-lossless).\n"
+        "  --no-dspark\n"
+        "      V4.1: turn off speculative decoding (on by default; greedy requests only,\n"
+        "      output byte-identical to plain decoding; sampled requests always decode plainly).\n"
         "  --draft-gguf FILE | --draft-zchain FILE\n"
         "      Standalone DSpark drafter GGUF and its amplifier sidecar.\n"
         "  --posttrain DIR\n"
@@ -319,6 +322,10 @@ server_config parse_options(int argc, char **argv) {
             c.engine.vq_dir_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--spec")) {
             c.engine.spec = true;
+        } else if (!strcmp(arg, "--no-dspark")) {
+            /* V4.1 投机 09-24 起默认开(温 0 请求走投机、输出与纯解码逐字节同; 带采样的请求自动走纯解码)。线上要关不必重编。
+             * 解析期就设: 它还决定开模型时三塔的装载优先级。 */
+            ds4_engine_v41_set_dspark(0);
         } else if (!strcmp(arg, "--draft-gguf")) {
             c.engine.draft_gguf_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--draft-zchain")) {

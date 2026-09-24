@@ -21,7 +21,7 @@ void ds4_engine_v41_set_decoder_full(int on) { g_ds4_v41_decoder_full = on; }
 int g_ds4_v41_vq_group = 1;
 void ds4_engine_v41_set_vq_group(int on) { g_ds4_v41_vq_group = on; }
 void ds4_engine_v41_set_prof(int on) { g_ds4_v41_prof = on; }
-/* ★--dspark★: 开投机解码(默认**关**)。温 0 下两条路必须**逐字节同** ——
+/* ★--dspark★: 投机解码(09-16 起默认关, 09-24 翻回默认开, 见下)。温 0 下两条路必须**逐字节同** ——
  * 投机的接受条件就是"主模型自己也会选这个 token", 所以它只省时间不改输出; 不同就是回滚漏了东西。
  *
  * ★为什么默认是关的(2026-09-16, 用户令"速度大幅度提升才改默认开启")★: 两条理由, 缺一条都不该关。
@@ -30,8 +30,12 @@ void ds4_engine_v41_set_prof(int on) { g_ds4_v41_prof = on; }
  * ②**它今天还是亏的**: 一轮 188 ms 只产 1.96 个 token(96 ms/token), 而纯解码一步 52 ms。
  * 等 mtp-1.md 的 M1′(同轨)与 M2′/M3′/M4′(核形态)过门、且真比纯解码快之后, 再把默认翻回来。
  * `--no-dspark` 保留: 老脚本一路在传它, 现在是"再确认一次关", 不是错。 */
-int g_ds4_v41_dspark = 0;
-void ds4_engine_v41_set_dspark(int on) { g_ds4_v41_dspark = on; }
+/* ★09-24 默认翻成开(用户令)★: 上面两条都已满足 —— ①真实 CFO 请求(14k 提示, 温 0, 2048 token)投机与纯解码逐字节同,
+ * 每一刀都验; ②投机 39.27 t/s 对纯解码 28.5(fable5 09-24 两节)。
+ * 三档: 0 = 关(--no-dspark); 1 = 默认开 —— 请求开了采样/惩罚时这一条自动走纯解码并打一行日志(服务端温 1.0 的请求不能因为
+ * 默认值被拒); 2 = 显式 --dspark —— 与采样同开仍硬拒(用户两样都点名要, 给不了就得说, 不能悄悄只给一样)。 */
+int g_ds4_v41_dspark = 1;
+void ds4_engine_v41_set_dspark(int mode) { g_ds4_v41_dspark = mode; }
 /* --dspark-verify N: 每轮验证几位(0 = 用下面钉死的默认)。
  * 为什么要这个旋钮: ①同轨出问题时, k=1(验证批只有 2 行)是最小的多 token 批, 拿它跟 k=3 一比就知道
  * "病在批本身"还是"病在批大了以后"; ②字节账(mtp-1.md §3)要按 k 逐档量, 每档一个二进制是浪费。
@@ -230,7 +234,8 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
      * 硬拒而不是静默改走纯解码 —— 用户以为开着投机, 其实没开, 这种"不报错只出错"的坑本仓踩够了。 */
     const bool penal = g_decode_sampling.dry_multiplier > 0.f || g_decode_sampling.freq_penalty != 0.f || g_decode_sampling.presence_penalty != 0.f;
     const bool sampling = g_decode_sampling.temperature > 0.f || penal;   /* 惩罚开着时温 0 也要读回 logits 行(罚完再 argmax) */
-    if (sampling && g_ds4_v41_dspark) {
+    int dspark = g_ds4_v41_dspark;
+    if (sampling && dspark == 2) {
         fprintf(stderr, "ds4: ★解码采样/惩罚(temp %.2f dry %.2f)与 --dspark 投机不能同开★(采样下的投机验证还没接; 去掉 --dspark 或关采样)\n",
                 (double)g_decode_sampling.temperature, (double)g_decode_sampling.dry_multiplier);
         if (am) ds4_gpu_tensor_free(am);
@@ -259,6 +264,11 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
              * 跑满解码器; 这里最后一块就是那段回放, 以前它 = 提示长 mod 512(1~512), 不足 128 时首批生成 token 的窗口直接
              * 缺位。余下不足 window 就从这一块匀过去(这一块缩短, 最后一块正好 window 个)。 */
             const uint32_t rest = np - c0 - nc;
+    if (sampling && dspark) {   /* 默认开(1): 这一条走纯解码, 出声 */
+        fprintf(stderr, "ds4: [v41] 本请求开了采样/惩罚(temp %.2f dry %.2f), 投机只在贪心下成立 ⇒ 这一条走纯解码\n",
+                (double)g_decode_sampling.temperature, (double)g_decode_sampling.dry_multiplier);
+        dspark = 0;
+    }
             if (rest > 0u && rest < DS4_N_SWA && nc > DS4_N_SWA) nc -= DS4_N_SWA - rest;
             /* CED: 除最后一块外, 只跑编码器段 + 分界层 KV(最后一块同时充当官方说的"解码器有界回放") */
             st.ced_skip = (!g_ds4_v41_decoder_full && c0 + nc < np) ? 1 : 0;
@@ -300,7 +310,7 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
          * ★温 0 下这与纯解码逐 token 是同一串输出★: 接受的条件就是"主模型自己也会选这个 token",
          * 不接受的位置全部回滚。所以它是纯粹的省时间, 不是近似 —— 门也就是逐字节同。 */
         ds4_v41_draft dr;
-        const bool spec = g_ds4_v41_dspark && v41_draft_alloc(e, &dr);
+        const bool spec = dspark && v41_draft_alloc(e, &dr);
         uint32_t spec_rounds = 0, spec_acc = 0, spec_hist[DS4_MTP_MAX_BLOCK + 1];
         /* 一轮的壁钟分账(2026-09-16): 投机赢不赢是个除法 —— 一轮的耗时要压到 E[接受+1] × 纯解码一步
          * 以下。实测一轮 118 ms 对预算 72 ms, 超 64%, 而这 118 从来没拆过。四项分开计, 就能分清
@@ -442,6 +452,9 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
         const double t2 = now_sec();
         if (produced > 1) fprintf(stderr, "\n[v41] decode %d token %.1fs (%.2f t/s)\n", produced - 1, t2 - t1, (double)(produced - 1) / (t2 - t1 + 1e-9));
         rc = ok ? 0 : 1;
+                /* ★到上限就停★(09-24): 一轮接受多位时以前会越过 n_predict 多吐几个(-n 2048 吐 2050)。温 0 下多出来的也是对的 token,
+                 * 但服务端 max_tokens 是硬上限, 纯解码路恰好停在上限 —— 投机默认开之后两条路必须同一个上限语义。 */
+                if (produced >= n_predict) break;
     } while (0);
     free(rowbuf); free(hist.tok); free((void *)hist.brk);
     if (am) ds4_gpu_tensor_free(am);

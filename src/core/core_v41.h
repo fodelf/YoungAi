@@ -180,7 +180,7 @@ bool v41_epool_submit(v41_eworker *w, uint32_t njob);   /* 提交一轮, 不阻�
 void v41_epool_wait(void);                              /* 等这一轮干完 */
 
 extern int g_ds4_v41_prof;   /* --v41-prof(core_v41_api.c) */
-extern int g_ds4_v41_dspark;         /* --dspark 开投机解码(默认关); 装载期也读它定三塔的优先级 */
+extern int g_ds4_v41_dspark;         /* 投机: 0 关 / 1 默认开 / 2 显式 --dspark(见 core_v41_api.c); 装载期也读它定三塔的优先级 */
 extern int g_ds4_v41_emit_trace;     /* --emit-trace: 逐 token 打 [emit] 位置+id(同轨定位) */
 extern uint32_t g_ds4_v41_block;     /* --dspark-block N: 钉死草稿块长(0=按元数据); 只作诊断 */
 extern uint32_t g_ds4_v41_verify_k;  /* --dspark-verify N: 每轮验证几位(0 = 引擎默认) */
