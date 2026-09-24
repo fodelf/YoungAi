@@ -88,14 +88,14 @@ run_py() {
 # 默认指着一个打不开的文件, 谁漏传 gguf 字段就白等一次加载。
 GG_DEFAULT="$ROOT/gguf/v41/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf"
 run_eng() {
-    local stu="$1" gg="$2" zarg="$3" tag="$4"   # zarg 里可以带 --zchain/--zchain-scale/--posttrain
+    local stu="$1" gg="$2" zarg="$3" tag="$4" bin="${5:-$ROOT/ds4}"   # zarg 里可以带 --zchain/--zchain-scale/--posttrain
     local idsn="$OUT/ids_${TAG}.txt" lf="$OUT/log_${tag}.txt"
     head -n "$NTOK" "$IDS" > "$idsn"
-    [ -x "$ROOT/ds4" ] || { LOG "★$ROOT/ds4 没编(make cuda-spark)★"; return 1; }
-    file "$ROOT/ds4" | grep -q "ELF.*aarch64" || { LOG "★./ds4 不是 ELF aarch64★"; return 1; }
+    [ -x "$bin" ] || { LOG "★$bin 没编(make cuda-spark)★"; return 1; }
+    file "$bin" | grep -q "ELF.*aarch64" || { LOG "★$bin 不是 ELF aarch64★"; return 1; }
     # 上下文没有参数(2026-09-22): V4.1 打分路按 ids 行数分配状态, 以前这里传 --ctx "$NTOK" 是为了躲开 CLI 打的那行
     # V4 会话"context buffer 2416 MiB"估算(09-20 把它当成了真分配), 现在 V4.1 不打那行、也不接受 --ctx。
-    "$ROOT/ds4" -m "$gg" --cuda --mem-budget-mb 40000 --weight-cache-mb 88000 --score-ids "$idsn" --score-out "$stu" $zarg 2>&1 \
+    "$bin" -m "$gg" --cuda --mem-budget-mb 40000 --weight-cache-mb 88000 --score-ids "$idsn" --score-out "$stu" $zarg 2>&1 \
         | tee "$lf" | grep --line-buffered -E "反修|PPL|失败|error|Error|watchdog"
     [ "${PIPESTATUS[0]}" = 0 ] && [ -s "$stu" ] && return 0
     LOG "★$tag 失败 —— 全量日志 $lf, 尾部:★"; tail -20 "$lf"; FAIL=$((${FAIL:-0}+1)); return 1
@@ -280,7 +280,9 @@ for NB in "$@"; do
     engine|engine:*) # 引擎学生档(2026-09-13): engine[:<gguf>[:<放大器目录>]] —— 学生 = ds4 引擎 --score-ids(部署同路);
       # gguf 空 = 默认 1.5 bpw 文件; 给放大器目录则 --zchain 挂上(目录 manifest 须有 "# 完成", 半成品不判)。
       # 教师锚照旧(FP 教师与学生走哪条路无关); 判决器同一份 anchor_metrics。
-      IFS=: read -r _ GG ARMD BETA PTD <<<"$NB"; GG="${GG:-$GG_DEFAULT}"
+      # 第六字段 = 二进制(2026-09-24): 同一判决料对比新旧引擎用, 例 engine:<gguf>:<放大器>:::ds4.base_xxx。
+      # 给了就在学生文件名后缀带上二进制名 —— 不带的话两个二进制写同一个 stu_*.bin, 后一趟把前一趟盖掉还看不出来。
+      IFS=: read -r _ GG ARMD BETA PTD EBIN <<<"$NB"; GG="${GG:-$GG_DEFAULT}"
       [ -s "$GG" ] || { LOG "★$GG 不存在★"; continue; }
       ZARG=""; SFX=""
       if [ -n "${ARMD:-}" ]; then
@@ -295,9 +297,10 @@ for NB in "$@"; do
           [ -s "$PTD/gr_L39.bin" ] || { LOG "★后训练目录 $PTD 里没有 gr_L39.bin, 不判★"; continue; }
           ZARG="$ZARG --posttrain $PTD"; SFX="${SFX}_pt_$(basename "$PTD")"
       fi
+      [ -n "${EBIN:-}" ] && SFX="${SFX}_bin_$(basename "$EBIN")"
       STU="$OUT/stu_${TAG}_eng_$(basename "$GG" .gguf)${SFX}.bin"
-      LOG "② 学生 = 引擎 $(basename "$GG")${ARMD:+ + 放大器 $(basename "$ARMD")} (判决料 $(basename "$IDS") n=$NTOK)"
-      run_eng "$STU" "$GG" "$ZARG" "stu_${TAG}_eng${SFX}" || continue
+      LOG "② 学生 = 引擎 $(basename "$GG")${ARMD:+ + 放大器 $(basename "$ARMD")}${EBIN:+ 二进制 $EBIN} (判决料 $(basename "$IDS") n=$NTOK)"
+      run_eng "$STU" "$GG" "$ZARG" "stu_${TAG}_eng${SFX}" "${EBIN:+$ROOT/$EBIN}" || continue
       LOG "③ 五指标 引擎 $(basename "$GG" .gguf)${SFX}"
       "$AM" --ref-raw "$REF" --ids "$IDS" --student "$STU" || { LOG "★判决失败★"; FAIL=$((${FAIL:-0}+1)); }
       continue;;
