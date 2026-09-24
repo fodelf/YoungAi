@@ -42,7 +42,7 @@ __device__ __forceinline__ static void v41_q4k_sm_reg(const uint4 &h, uint32_t j
            b = (v41_q4k_scb(h, j + 4u) >> 4)   | ((v41_q4k_scb(h, j) >> 6) << 4); }
     *s = (float)a; *m = (float)b;
 }
-/* 一个 warp 对一个 q4_K 块与 NT 条激活做点积, 结果累加进 acc[NT]; 块头与 qs 由调用方提前读进寄存器(见 GEMV 核的预取)。
+/* 一个 warp 对一个 q4_K 块与 NT 条激活做点积, 结果累加进 acc[NT]; 块头与 qs 由调用方从 shared 里的整段权重取(见下面 stage/pipe)。
  * lane l: gidx = l>>3 选 64 元素组, q0 = (l&7)*4 选组内 4 个连续元素。
  * 低半 → 元素 gidx*64 + q0 + i(子块 2·gidx); 高半 → 再 +32(子块 2·gidx+1)。 */
 template <uint32_t NT>
@@ -72,77 +72,10 @@ __device__ __forceinline__ static void v41_q4k_blk_acc_reg(const uint4 &h, uint3
     }
 }
 
-/* 解码 GEMV: 一 block nwarp 个 warp, ksplit 段分 K, 每 warp 管 nwarp/ksplit 行中的一行一段。
- * 结构与 fp4x32 那支同(cuda_v41_4.inc.cu), 所以那边判负过的几条(激活进 shared / 一 warp 多行 /
- * 整段搬 shared)在这里同样不用再试 —— 病因是 L1 本来就接住了激活, 与格式无关。 */
-/* ★现在只给验证批(NT ≥ 2)用★: 纯解码(NT=1)走下面 stage/pipe 两个核(2026-09-23)。 */
-template <uint32_t NT>
-__global__ static void v41_q4k_gemv_kernel(float *out, const uint8_t *w, const float *x,
-                                           uint32_t in_dim, uint32_t out_dim, uint32_t x_stride,
-                                           uint32_t out_stride, uint32_t ksplit, uint64_t w_gstride,
-                                           uint32_t x_gstride, uint32_t out_gstride, int round_out) {
-    const uint32_t g = blockIdx.y;
-    x += (uint64_t)g * x_gstride; out += (uint64_t)g * out_gstride; w += (uint64_t)g * w_gstride;
-    const uint32_t warp = threadIdx.x >> 5, lane = threadIdx.x & 31u, nwarp = blockDim.x >> 5;
-    const uint32_t rows_per_block = nwarp / ksplit, rloc = warp / ksplit, kpart = warp % ksplit;
-    const uint32_t r = blockIdx.x * rows_per_block + rloc;
-    __shared__ float red[16][NT];
-    float acc[NT];
-    #pragma unroll
-    for (uint32_t t = 0; t < NT; t++) acc[t] = 0.f;
-    if (r < out_dim) {
-        const uint32_t nblk = in_dim / V41_Q4K_BLK;
-        const uint8_t *wr = w + (uint64_t)r * nblk * V41_Q4K_BYTES;
-        /* ★一轮先把 V41_Q4K_PF 个块的 load 全发出去, 再按块号升序算★(2026-09-23, d0a 12k 逐核表)
-         * 病: 原来一轮一个块、读完立刻用 ⇒ 每个 warp 同时只有 144 B 在飞, 这个核 329 发/步吃 23.3 ms
-         * = 172 GB/s(墙 242), 占整步 54%。块头 16 B 还是 ~10 条逐字节 load。fp4x32 那支早在 09-15
-         * 就做了同一刀(cuda_v41_4.inc.cu "两组一轮"), 这一支照它的结构写时漏了。
-         * ★逐字节同★: 块头改成一条 uint4 读、字节从寄存器里取(值不变); 累加仍按 b 升序一个一个进 acc,
-         * 加法次序一个字没变。改了之后输出变了 = 块头字节取错了, 不是"噪声"。 */
-        #define V41_Q4K_PF 4u
-        for (uint32_t b0 = kpart; b0 < nblk; b0 += V41_Q4K_PF * ksplit) {
-            uint4 hv[V41_Q4K_PF]; uint32_t qv[V41_Q4K_PF];
-            #pragma unroll
-            for (uint32_t u = 0; u < V41_Q4K_PF; u++) {
-                const uint32_t b = b0 + u * ksplit;
-                hv[u] = make_uint4(0u, 0u, 0u, 0u); qv[u] = 0u;
-                if (b < nblk) {
-                    const uint8_t *blk = wr + (uint64_t)b * V41_Q4K_BYTES;
-                    hv[u] = *(const uint4 *)blk;                       /* 发射器已校 16 B 对齐 */
-                    qv[u] = *(const uint32_t *)(blk + 16u + 4u * lane);
-                }
-            }
-            #pragma unroll
-            for (uint32_t u = 0; u < V41_Q4K_PF; u++) {
-                const uint32_t b = b0 + u * ksplit;
-                if (b < nblk) v41_q4k_blk_acc_reg<NT>(hv[u], qv[u], x, x_stride, b * V41_Q4K_BLK, acc);
-            }
-        }
-        #undef V41_Q4K_PF
-    }
-    /* warp 内规约 → 段间规约(段和按 red[] 的固定序相加 ⇒ 同 ksplit 下确定) */
-    #pragma unroll
-    for (uint32_t t = 0; t < NT; t++)
-        for (int o = 16; o; o >>= 1) acc[t] += __shfl_xor_sync(0xffffffffu, acc[t], o);
-    if (lane == 0) {
-        #pragma unroll
-        for (uint32_t t = 0; t < NT; t++) red[warp][t] = acc[t];
-    }
-    __syncthreads();
-    if (r < out_dim && kpart == 0 && lane == 0) {
-        #pragma unroll
-        for (uint32_t t = 0; t < NT; t++) {
-            float sum = 0.f;
-            for (uint32_t k = 0; k < ksplit; k++) sum += red[rloc * ksplit + k][t];
-            /* round_out: 与 fp4x32 路同口径 —— 官方在这几处把激活舍到 bf16 格点 */
-            out[(uint64_t)t * out_stride + r] = round_out ? v41_bf16r(sum) : sum;
-        }
-    }
-}
-
-/* ==== 纯解码(NT=1)的两个核(2026-09-23, 微基准 gguf-tools/bench/v41_q4k_gemv_bench.cu) ====
+/* ==== 解码 GEMV 的两个核(2026-09-23 纯解码, 09-24 扩到验证批; 微基准 gguf-tools/bench/v41_q4k_gemv_bench.cu) ====
  *
- * 为什么换结构: 上面那个核(预取 4 块)在 spark 上各形状只到 175~227 GB/s, 329 发/步合计 ~19.6 ms。病在读法:
+ * 为什么换结构: 原核(每 warp 预取 4 块各读各的, 09-24 删除; 微基准里仍有逐字抄本当对照)在 spark 上各形状只到
+ * 175~227 GB/s, 329 发/步合计 ~19.6 ms。病在读法:
  * 144 B 的块不对齐 128 B 线, 每个 warp 各读各的几段, 同一时刻在飞的字节少。一个 CTA 负责的 rpb 行在内存里
  * 本来就是**连续一段**(rpb × nblk × 144 B), 所以让全 CTA 先按 16 B 整线把这一段搬进 shared, 再按原分工算。
  * ★逐字节同★: 每个 warp 仍管同一行同一段(kpart), 块按同样升序进 acc, 规约序同 ⇒ 输出与原核逐位相同
@@ -154,31 +87,45 @@ __global__ static void v41_q4k_gemv_kernel(float *out, const uint8_t *w, const f
  *          组大时它两份缓冲把占用率压到 2 CTA/SM, 反而慢(输出头 239) —— 所以不是一律 pipe。 */
 #define V41_Q4K_PIPE_MIN 4096u     /* 每组行字节 > 这个且 ≤ MAX 时走 pipe */
 #define V41_Q4K_PIPE_MAX 12288u    /* 2 份 ≤ 24 KB ⇒ 每 SM 仍挂得下 4 个 256 线程 CTA */
-__device__ __forceinline__ static void v41_q4k_row1_smem(const uint8_t *wr, uint32_t nblk, uint32_t ksplit, uint32_t kpart,
-                                                         const float *x, float *acc) {
+/* ★NT = 本发几行激活(2026-09-24)★: 纯解码 NT=1; 投机验证批 NT=1+k 行共用同一份搬进 shared 的权重, 每行各乘一遍。
+ * 以前验证批落回原核(09-24 真实请求实测: 验 1 行 41.75 ms 对走图一步 35.11、每多一行 14.85 对专家账 9.61),
+ * 09-23 的换结构只进了 NT=1。★逐字节同★: 每行的块序/规约序与 NT=1 完全相同(acc[t] 只是多一个下标), 所以
+ * 验证批第 t 行 == 纯解码在那个位置算出来的值 —— 投机同轨门(投机 == 纯解码逐字节)就靠这一条。 */
+template <uint32_t NT>
+__device__ __forceinline__ static void v41_q4k_rown_smem(const uint8_t *wr, uint32_t nblk, uint32_t ksplit, uint32_t kpart,
+                                                         const float *x, uint32_t x_stride, float *acc) {
     const uint32_t lane = threadIdx.x & 31u;
     for (uint32_t b = kpart; b < nblk; b += ksplit) {
         const uint8_t *blk = wr + b * V41_Q4K_BYTES;
-        v41_q4k_blk_acc_reg<1u>(*(const uint4 *)blk, *(const uint32_t *)(blk + 16u + 4u * lane), x, 0u, b * V41_Q4K_BLK, acc);
+        v41_q4k_blk_acc_reg<NT>(*(const uint4 *)blk, *(const uint32_t *)(blk + 16u + 4u * lane), x, x_stride, b * V41_Q4K_BLK, acc);
     }
 }
-/* 规约与写出: 与 v41_q4k_gemv_kernel 的 NT=1 情形逐式同(warp xor 规约 → red[] 按 k 升序相加 → 可选 bf16 舍入) */
-__device__ __forceinline__ static void v41_q4k_finish1(float acc, float *out, uint32_t r, uint32_t out_dim, uint32_t ksplit,
-                                                       uint32_t rloc, uint32_t kpart, int round_out, float *red) {
+/* 规约与写出: 与原核逐式同(warp xor 规约 → red[] 按 k 升序相加 → 可选 bf16 舍入) */
+template <uint32_t NT>
+__device__ __forceinline__ static void v41_q4k_finishn(float *acc, float *out, uint32_t out_stride, uint32_t r, uint32_t out_dim,
+                                                       uint32_t ksplit, uint32_t rloc, uint32_t kpart, int round_out, float *red) {
     const uint32_t warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
-    for (int o = 16; o; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
-    if (lane == 0) red[warp] = acc;
+    #pragma unroll
+    for (uint32_t t = 0; t < NT; t++) {
+        for (int o = 16; o; o >>= 1) acc[t] += __shfl_xor_sync(0xffffffffu, acc[t], o);
+        if (lane == 0) red[warp * NT + t] = acc[t];
+    }
     __syncthreads();
     if (r < out_dim && kpart == 0 && lane == 0) {
-        float sum = 0.f;
-        for (uint32_t k = 0; k < ksplit; k++) sum += red[rloc * ksplit + k];
-        out[r] = round_out ? v41_bf16r(sum) : sum;
+        #pragma unroll
+        for (uint32_t t = 0; t < NT; t++) {
+            float sum = 0.f;
+            for (uint32_t k = 0; k < ksplit; k++) sum += red[(rloc * ksplit + k) * NT + t];
+            out[(uint64_t)t * out_stride + r] = round_out ? v41_bf16r(sum) : sum;
+        }
     }
 }
+template <uint32_t NT>
 __global__ static void __launch_bounds__(256, 4) v41_q4k_gemv1_stage_kernel(float *out, const uint8_t *w, const float *x,
-        uint32_t in_dim, uint32_t out_dim, uint32_t ksplit, uint64_t w_gstride, uint32_t x_gstride, uint32_t out_gstride, int round_out) {
+        uint32_t in_dim, uint32_t out_dim, uint32_t ksplit, uint64_t w_gstride, uint32_t x_gstride, uint32_t out_gstride, int round_out,
+        uint32_t x_stride, uint32_t out_stride) {
     extern __shared__ uint4 v41_q4k_st[];
-    __shared__ float red[V41_GEMV_WARPS];
+    __shared__ float red[V41_GEMV_WARPS * NT];
     const uint32_t g = blockIdx.y;
     x += (uint64_t)g * x_gstride; out += (uint64_t)g * out_gstride; w += (uint64_t)g * w_gstride;
     const uint32_t warp = threadIdx.x >> 5, rpb = V41_GEMV_WARPS / ksplit, rloc = warp / ksplit, kpart = warp % ksplit;
@@ -188,14 +135,18 @@ __global__ static void __launch_bounds__(256, 4) v41_q4k_gemv1_stage_kernel(floa
     for (uint32_t i = threadIdx.x; i < n16; i += blockDim.x) v41_q4k_st[i] = __ldcs(src + i);   /* 流式读: 权重每步只读一遍 */
     v41_pdl_wait();   /* PDL: 权重(常量)先搬, 这里才等上一个核的激活(见 cuda_internal.cuh) */
     __syncthreads();
-    float acc = 0.f;
-    if (r < out_dim) v41_q4k_row1_smem((const uint8_t *)v41_q4k_st + (uint64_t)rloc * nblk * V41_Q4K_BYTES, nblk, ksplit, kpart, x, &acc);
-    v41_q4k_finish1(acc, out, r, out_dim, ksplit, rloc, kpart, round_out, red);
+    float acc[NT];
+    #pragma unroll
+    for (uint32_t t = 0; t < NT; t++) acc[t] = 0.f;
+    if (r < out_dim) v41_q4k_rown_smem<NT>((const uint8_t *)v41_q4k_st + (uint64_t)rloc * nblk * V41_Q4K_BYTES, nblk, ksplit, kpart, x, x_stride, acc);
+    v41_q4k_finishn<NT>(acc, out, out_stride, r, out_dim, ksplit, rloc, kpart, round_out, red);
 }
+template <uint32_t NT>
 __global__ static void __launch_bounds__(256, 4) v41_q4k_gemv1_pipe_kernel(float *out, const uint8_t *w, const float *x,
-        uint32_t in_dim, uint32_t out_dim, uint32_t ksplit, uint64_t w_gstride, uint32_t x_gstride, uint32_t out_gstride, int round_out) {
+        uint32_t in_dim, uint32_t out_dim, uint32_t ksplit, uint64_t w_gstride, uint32_t x_gstride, uint32_t out_gstride, int round_out,
+        uint32_t x_stride, uint32_t out_stride) {
     extern __shared__ uint4 v41_q4k_st[];
-    __shared__ float red[V41_GEMV_WARPS];
+    __shared__ float red[V41_GEMV_WARPS * NT];
     const uint32_t g = blockIdx.y;
     x += (uint64_t)g * x_gstride; out += (uint64_t)g * out_gstride; w += (uint64_t)g * w_gstride;
     const uint32_t warp = threadIdx.x >> 5, rpb = V41_GEMV_WARPS / ksplit, rloc = warp / ksplit, kpart = warp % ksplit;
@@ -217,10 +168,12 @@ __global__ static void __launch_bounds__(256, 4) v41_q4k_gemv1_pipe_kernel(float
         __pipeline_wait_prior(1);     /* 本组那一半到齐(下一组那一半还在飞) */
         __syncthreads();
         const uint32_t r = rg * rpb + rloc;
-        float acc = 0.f;
-        if (r < out_dim) v41_q4k_row1_smem((const uint8_t *)(v41_q4k_st + (uint64_t)buf * grp16) + (uint64_t)rloc * nblk * V41_Q4K_BYTES,
-                                       nblk, ksplit, kpart, x, &acc);
-        v41_q4k_finish1(acc, out, r, out_dim, ksplit, rloc, kpart, round_out, red);
+        float acc[NT];
+        #pragma unroll
+        for (uint32_t t = 0; t < NT; t++) acc[t] = 0.f;
+        if (r < out_dim) v41_q4k_rown_smem<NT>((const uint8_t *)(v41_q4k_st + (uint64_t)buf * grp16) + (uint64_t)rloc * nblk * V41_Q4K_BYTES,
+                                           nblk, ksplit, kpart, x, x_stride, acc);
+        v41_q4k_finishn<NT>(acc, out, out_stride, r, out_dim, ksplit, rloc, kpart, round_out, red);
         __syncthreads();              /* 这一半下一轮要被覆盖: 全 CTA 读完才许发下一次搬运 */
     }
     #undef V41_Q4K_ISSUE
@@ -294,33 +247,28 @@ static int v41_q4k_gemv(const void *model_map, uint64_t model_size, uint64_t off
     while (ksplit < V41_GEMV_WARPS && out_dim * ksplit * n_groups < 8192u) ksplit <<= 1;
     const uint32_t nb = (uint32_t)(in_dim / V41_Q4K_BLK);
     while (ksplit > 1u && ksplit > nb) ksplit >>= 1;
-    if (n_tok == 1u) {   /* 纯解码: stage / pipe(选法见两核上方的注释) */
-        v41_pdl_register((const void *)v41_q4k_gemv1_stage_kernel);   /* 两核都在读 x / 写 out 之前 v41_pdl_wait */
-        v41_pdl_register((const void *)v41_q4k_gemv1_pipe_kernel);
-        const uint32_t rpb1 = V41_GEMV_WARPS / ksplit, ngrp = (uint32_t)((out_dim + rpb1 - 1u) / rpb1);
-        const uint32_t grp = rpb1 * nb * V41_Q4K_BYTES;
-        if (grp > V41_Q4K_PIPE_MIN && grp <= V41_Q4K_PIPE_MAX) {
-            static int s_sm = 0;
-            if (!s_sm && cudaDeviceGetAttribute(&s_sm, cudaDevAttrMultiProcessorCount, 0) != cudaSuccess) return cuda_ok(cudaGetLastError(), what);
-            uint32_t gx = (uint32_t)s_sm * 4u / n_groups;   /* 4 = __launch_bounds__ 钉的每 SM CTA 数 */
-            if (gx == 0u) gx = 1u;
-            if (gx > ngrp) gx = ngrp;
-            v41_q4k_gemv1_pipe_kernel<<<dim3(gx, n_groups), 256, 2u * grp, g_cur_stream>>>(
-                out, w, x, (uint32_t)in_dim, (uint32_t)out_dim, ksplit, wg, x_gstride, out_gstride, round_out);
-        } else {
-            /* grp 最大是输出头/wo_b 那种 8 行 × 20 块或 4 行 × 32 块 = 23 KB, 在默认 48 KB 动态 shared 之内 */
-            v41_q4k_gemv1_stage_kernel<<<dim3(ngrp, n_groups), 256, grp, g_cur_stream>>>(
-                out, w, x, (uint32_t)in_dim, (uint32_t)out_dim, ksplit, wg, x_gstride, out_gstride, round_out);
-        }
-        return cuda_ok(cudaGetLastError(), what);
+    /* 纯解码与验证批同一对核(stage / pipe, 选法见两核上方的注释), 只差激活行数 NT */
+    const uint32_t rpb1 = V41_GEMV_WARPS / ksplit, ngrp = (uint32_t)((out_dim + rpb1 - 1u) / rpb1);
+    const uint32_t grp = rpb1 * nb * V41_Q4K_BYTES;
+    uint32_t gx = 0;
+    if (grp > V41_Q4K_PIPE_MIN && grp <= V41_Q4K_PIPE_MAX) {
+        static int s_sm = 0;
+        if (!s_sm && cudaDeviceGetAttribute(&s_sm, cudaDevAttrMultiProcessorCount, 0) != cudaSuccess) return cuda_ok(cudaGetLastError(), what);
+        gx = (uint32_t)s_sm * 4u / n_groups;   /* 4 = __launch_bounds__ 钉的每 SM CTA 数 */
+        if (gx == 0u) gx = 1u;
+        if (gx > ngrp) gx = ngrp;
     }
-    const uint32_t warps = 16u;   /* 验证批(NT ≥ 2) */
-    const uint32_t rpb = warps / ksplit;
-    const dim3 grid((unsigned)((out_dim + rpb - 1u) / rpb), n_groups);
-    #define V41_Q4K_LAUNCH(NT) v41_q4k_gemv_kernel<NT><<<grid, warps * 32u, 0, g_cur_stream>>>( \
-        out, w, x, (uint32_t)in_dim, (uint32_t)out_dim, x_stride, out_stride, ksplit, wg, x_gstride, out_gstride, round_out)
+    /* grp 最大是输出头/wo_b 那种 8 行 × 20 块或 4 行 × 32 块 = 23 KB, 在默认 48 KB 动态 shared 之内 */
+    #define V41_Q4K_LAUNCH(NT) do {                                                                                   \
+        v41_pdl_register((const void *)v41_q4k_gemv1_stage_kernel<NT>);   /* 两核都在读 x / 写 out 之前 v41_pdl_wait */ \
+        v41_pdl_register((const void *)v41_q4k_gemv1_pipe_kernel<NT>);                                              \
+        if (gx) v41_q4k_gemv1_pipe_kernel<NT><<<dim3(gx, n_groups), 256, 2u * grp, g_cur_stream>>>(                 \
+                    out, w, x, (uint32_t)in_dim, (uint32_t)out_dim, ksplit, wg, x_gstride, out_gstride, round_out, x_stride, out_stride); \
+        else v41_q4k_gemv1_stage_kernel<NT><<<dim3(ngrp, n_groups), 256, grp, g_cur_stream>>>(                      \
+                    out, w, x, (uint32_t)in_dim, (uint32_t)out_dim, ksplit, wg, x_gstride, out_gstride, round_out, x_stride, out_stride); \
+    } while (0)
     switch (n_tok) {
-        case 2: V41_Q4K_LAUNCH(2u); break;
+        case 1: V41_Q4K_LAUNCH(1u); break;  case 2: V41_Q4K_LAUNCH(2u); break;
         case 3: V41_Q4K_LAUNCH(3u); break;  case 4: V41_Q4K_LAUNCH(4u); break;
         case 5: V41_Q4K_LAUNCH(5u); break;  case 6: V41_Q4K_LAUNCH(6u); break;
         case 7: V41_Q4K_LAUNCH(7u); break;  default: V41_Q4K_LAUNCH(8u); break;
