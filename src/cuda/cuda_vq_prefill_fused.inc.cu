@@ -161,9 +161,17 @@ static struct { vqp_item *d; uint64_t cap; float *h32, *g32, *xs32; uint64_t h32
 static int g_vqpf_sh = 0;   /* 0 未判定 / 1 码本进 shared / -1 放不下(那就没有本路, 硬失败) */
 
 /* 返回 0 = 本路不可用(调用方硬失败, 不静默退回老路: 退回去就永远不知道哪条路在跑) */
+static int vqm_run(const uint8_t *blob, const uint32_t *cnt, const uint32_t *off_h, uint32_t n_total_expert, uint32_t nvalid,
+                   uint32_t IN, uint32_t MID, uint32_t OUT, uint32_t nc, float clamp, const float *x, const int32_t *perm,
+                   uint32_t n_expert, uint32_t layer_index, float *ys, const float *gr);   /* cuda_vq_prefill_mma.inc.cu */
 static int vqp_fused_run(const uint8_t *blob, const uint32_t *cnt, const uint32_t *off_h, uint32_t n_total_expert,
                          uint32_t nvalid, uint32_t IN, uint32_t MID, uint32_t OUT, uint32_t nc, float clamp,
                          const float *x, const int32_t *perm, uint32_t n_expert, uint32_t layer_index, uint32_t ver) {
+    /* v3(E4M3 码本)走 bf16 张量核(2026-09-24): 与本文件同一组乘积、同一个舍入点, 只换累加顺序, 专家段快几倍。
+     * v2 的 f16 码本转 bf16 会丢 3 位尾数, 所以 v2 仍走下面的融合核。 */
+    if (ver == 3u)
+        return vqm_run(blob, cnt, off_h, n_total_expert, nvalid, IN, MID, OUT, nc, clamp, x, perm, n_expert, layer_index,
+                       g_vqp.ys, g_v41_gr[layer_index < 64u ? layer_index : 0]);
     uint32_t nbit = 0; while ((1u << nbit) < nc) nbit++;
     /* v3 的码本每词 8 个 E4M3(nc8192 = 64 KB, 与今天 nc4096 f16 同大); v2 每词 8 个 f16 */
     const uint32_t cbb = nc * (ver == 3u ? 8u : 16u);

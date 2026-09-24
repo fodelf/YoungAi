@@ -87,6 +87,7 @@
 #include "src/cuda/cuda_v41_nvfp4.inc.cu"   /* V4.1 预填稠密 GEMM 走 NVFP4 张量核(2026-09-15 speed.md S1) */
 #include "src/cuda/cuda_vq_prefill_nvfp4.inc.cu"   /* 预填专家: VQ 解到 NVFP4 暂存 + 板子原生 FP4 张量核(speed.md 段 5); 在融合路之前, 被它调 */
 #include "src/cuda/cuda_vq_prefill_fused.inc.cu"   /* 预填专家: VQ 解码即乘, 不落 f16 暂存(2026-09-15 第三轮) */
+#include "src/cuda/cuda_vq_prefill_mma.inc.cu"   /* 预填专家 v3: VQ 解成 bf16 瓦片 + 张量核(2026-09-24); 在融合路之后(用它的 vqp_item, 被它的 vqp_fused_run 调) */
 #include "src/cuda/cuda_vq_fused2_0.inc.cu"
 #include "src/cuda/cuda_vq_fused2_1.inc.cu"
 #include "src/cuda/cuda_vq_fused2_2.inc.cu"
