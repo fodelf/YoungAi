@@ -16,7 +16,7 @@ tags:
 pipeline_tag: text-generation
 ---
 
-# DwarfStar (ds4) — DeepSeek V4.1 Flash on one DGX Spark
+# YoungAi — DeepSeek V4.1 Flash on one DGX Spark
 
 **English** · [中文](README.zh-CN.md)
 
@@ -552,7 +552,7 @@ Negative results carry as much of the design as positive ones. Each row was meas
 **Step 1 — download.**
 
 ```sh
-hf download wenzhouwu/DwarfStar-DeepSeek-V4.1-Flash --local-dir ds4-v41
+hf download wenzhouwu/YoungAi-DeepSeek-V4.1-Flash --local-dir ds4-v41
 chmod +x ds4-v41/bin/ds4 ds4-v41/bin/ds4-server
 ```
 

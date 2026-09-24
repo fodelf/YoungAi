@@ -1,4 +1,4 @@
-# DwarfStar（ds4）—— 一台 DGX Spark 跑 DeepSeek V4.1 Flash
+# YoungAi —— 一台 DGX Spark 跑 DeepSeek V4.1 Flash
 
 [English](README.md) · **中文**
 
@@ -461,7 +461,7 @@ E2M1 只有 8 个幅值格点。所以把 Gauss–Seidel 的每一步拆成三�
 **第一步：下载。**
 
 ```sh
-hf download wenzhouwu/DwarfStar-DeepSeek-V4.1-Flash --local-dir ds4-v41
+hf download wenzhouwu/YoungAi-DeepSeek-V4.1-Flash --local-dir ds4-v41
 chmod +x ds4-v41/bin/ds4 ds4-v41/bin/ds4-server
 ```
 
