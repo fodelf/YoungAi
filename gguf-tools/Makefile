@@ -64,6 +64,11 @@ DSQRUN_INC := $(wildcard $(AMP)/ds4quant_run_p*.inc.c) $(AMP)/ds4quant_anchor.in
 # 仓库根同源实现+116 契约头: wildcard 罩不到 gguf-tools 外, 漏列=改完静默不重编
 # (2026-08-31 实撞: ds4_amp_fmt.h 收 tr 单一定义源后 Linux 侧 make 说"无需做任何事")
 AMP_ROOT_SRC := ../ds4_z.c ../ds4_z.h ../ds4_loss.c ../ds4_loss.h ../src/common/ds4_amp_fmt.h
+# 引擎对象用 shell find 收(见下面三个 *_OBJS_CMD), find 只看盘上有什么 .o —— 源文件删了、.o 还在, 就会被捡进链接。
+# 2026-09-26 实撞: 已删的 core_v41_dvocab.c 留下 09-24 的 .o, 引用早没了的 ds4_gpu_v41_rows_copy_tensor,
+# v41_amp_run 链接报 undefined reference, 编程侧车那趟解算直接跳过。只留有同名 .c/.m 源文件的对象;
+# 顺带滤掉 *_cpu.o(源是 x.c 不是 x_cpu.c), 它们和 GPU 版同名符号, 本来就不该一起链。
+LIVE_OBJS = while read o; do s="$${o%.o}"; if [ -f "$$s.c" ] || [ -f "$$s.m" ]; then echo "$$o"; fi; done
 
 ifeq ($(UNAME_S),Darwin)
 NATIVE ?= -mcpu=native
@@ -74,7 +79,7 @@ CUDA := 0
 QUALITY_LDLIBS := -lm -pthread -framework Foundation -framework Metal -framework Accelerate
 # 父仓 Darwin 引擎对象集合(重构后 ds4.o/ds4_metal.o 已裂成对象群): 解析期不 wildcard
 # (对象可能还没生成), quality-score 配方里先 make -C .. 再 shell find。
-QUALITY_OBJS_CMD = find ../src/core ../src/dist ../src/metal -name '*.o'; \
+QUALITY_OBJS_CMD = find ../src/core ../src/dist ../src/metal -name '*.o' | $(LIVE_OBJS); \
                    echo ../src/common/ds4_quantfmt.o ../ds4_corr.o ../ds4_zchain.o \
                         ../ds4_multimodal.o ../ds4_spatial.o ../ds4_css.o
 QUALITY_LINK = $(CC) -O3 $(NATIVE) -I..
@@ -103,7 +108,7 @@ CUDA_LIBS := -L$(CUDA_HOME)/lib64 -L$(CUDA_HOME)/targets/sbsa-linux/lib -lcudart
 # -lcublasLt: 引擎对象 ds4_cuda.o 自 2026-09-15 起走 cuBLASLt(NVFP4 预填 GEMM), 凡链引擎对象的工具(quality-score /
 # v41_amp_run)都要带上, 少了报 "undefined reference to cublasLtMatmulPreferenceCreate … DSO missing from command line"
 QUALITY_LDLIBS := -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt
-QUALITY_OBJS_CMD = find ../src/core ../src/dist -name '*.o'; \
+QUALITY_OBJS_CMD = find ../src/core ../src/dist -name '*.o' | $(LIVE_OBJS); \
                    echo ../src/common/ds4_quantfmt.o ../ds4_corr.o ../ds4_zchain.o \
                         ../ds4_multimodal.o ../ds4_spatial.o ../ds4_css.o ../ds4_cuda.o
 QUALITY_LINK = $(NVCC) -O3 -I..
@@ -243,7 +248,7 @@ endif
 # v41_amp_solve.cu 以 -DV41_AMP_NOMAIN 当对象链进来 —— 与 libv41amp.so(Python 路)同一份源, 不许再抄; -fmad=false
 # 与 .so 同旗标, 否则同输入两路出不同数。v41_fp_moe.cu 用 --use_fast_math: 它抄的是引擎核, 引擎就是这么编的。
 ifeq ($(CUDA),1)
-V41AMP_ENGINE_OBJS_CMD = find ../src/core ../src/dist -name '*.o' ! -name '*_cpu.o' ! -name '*_test.o'; \
+V41AMP_ENGINE_OBJS_CMD = find ../src/core ../src/dist -name '*.o' ! -name '*_cpu.o' ! -name '*_test.o' | $(LIVE_OBJS); \
     echo ../src/common/ds4_quantfmt.o ../ds4_corr.o ../ds4_zchain.o ../ds4_zfinetune.o ../ds4_z.o ../ds4_loss.o \
          ../ds4_multimodal.o ../ds4_spatial.o ../ds4_css.o ../ds4_cuda.o
 v41_amp_run: $(AMP)/v41_amp_run
