@@ -146,7 +146,8 @@ statecmp)
   [ -s "$IDS" ] && [ -s "$IDS.truth" ] || { LOG "★缺 $IDS 或 $IDS.truth★"; exit 2; }
   tag=$(basename "$IDS" .ids)
   LOG "statecmp $tag: 重新预填 $(wc -w < "$IDS") token, 续写 $N"
-  ./ds4 --cuda -m "$MODEL" --zchain "$AMP" --gen-ids "$IDS" -n "$N" --emit-trace \
+  # --temp 0 必须显式: 引擎不给 --temp 是官方默认温 1.0(09-28 起), 这里要跟 .truth 那条贪心轨迹逐位比
+  ./ds4 --cuda -m "$MODEL" --zchain "$AMP" --temp 0 --seed 1 --no-dspark --gen-ids "$IDS" -n "$N" --emit-trace \
         > "$OUT/${tag}_refill.out" 2> "$OUT/${tag}_refill.err"
   python3 - "$OUT/${tag}_refill.err" "$IDS.truth" <<'PYEOF'
 import re, sys

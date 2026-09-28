@@ -192,7 +192,7 @@ fi
 # 读数: "约？"次数 / 重复 4-gram 占比(按字; 全文里出现 ≥2 次的 4-gram 所占的位置比 —— 与 fable5 09-20 上午那张表同定义:
 # gr-only 73%, gr+rb 76%; 中文正常长文 ~10%) / 最常见 4-gram / 每 300 字一段的"前文已出现过"占比(100% = 整段逐字抄前文,
 # 一眼看出从哪段起进入死循环) / 解码 t/s。文本原样落 $OUT/loop_<模型>_<反修>.out, 判读一律看原文, 数字只是索引。
-# 用法: ./speed-bench/d1_kv_ring_gate.sh none <模型> 1400 loop <反修目录|none> [提示文件, 默认金融提示]
+# 用法: ./speed-bench/d1_kv_ring_gate.sh none <模型> <生成上限, 0 = 不设上限> loop <反修目录|none> [提示文件, 默认金融提示]
 #       (三档成对: 新+反修 / 新裸 / 现役+反修; 第 6 个参数给 $OUT/p2k.txt = 英文 readme 对照, 那条提示上正常长文不打转)
 #       第 7 个参数 = 额外引擎参数(如 "--no-graph"), 输出文件名带 _x<参数去掉空格和横线>: 同一提示直发 1400 步与走图
 #       逐字节 cmp, 就是"长程解码态有没有漂"的门(graph 模式的门只验了 128 步)。
@@ -205,7 +205,9 @@ if [ "$MODE" = loop ]; then
   # 留下精确 id 序列是为了 d1 模式(把这段文本喂教师锚)。★别用 --dump-tokens 拼提示★: 它按原文分词, 生成路却是
   # build_prompt 套了聊天模板的(09-20 实撞 75 vs 79), 铁律"捕获必须可复现·与部署同路" ⇒ id 只认引擎自己打的。
   # shellcheck disable=SC2086  # EXTRA 就是要按空格拆成多个参数
-  run ds4 "$tag" -n "$NGEN" --no-dspark --emit-trace --prompt-file "$P" $EXTRA
+  # 生成数给 0 = 不传 -n = 生成到 EOS(判"停不停/复读"必须这么跑, 带上限只能说"到上限没停")
+  NCAP=(); [ "$NGEN" -gt 0 ] && NCAP=(-n "$NGEN")
+  run ds4 "$tag" ${NCAP[@]+"${NCAP[@]}"} --no-dspark --emit-trace --prompt-file "$P" $EXTRA
   grep -a -h '^\[ptok\] \|^\[emit\] ' "$OUT/$tag.err" | sort -n -k2 | awk '{print $3}' > "$OUT/$tag.ids"
   NP=$(grep -ac '^\[ptok\] ' "$OUT/$tag.err"); echo "$NP" > "$OUT/$tag.np"
   [ "$NP" -gt 0 ] || echo "  ★没有 [ptok] 行: ds4 二进制早于 09-20 夜的 --emit-trace 提示打点, ids 缺提示段★"

@@ -100,26 +100,40 @@ if maxt == "0":       # 0 = 删掉请求自带的上限(不设上限), 见档头
     if body.pop("max_tokens", None) is not None: changed.append("删掉请求自带的 max_tokens")
 elif maxt != "":
     body["max_tokens"] = int(maxt); changed.append("max_tokens=%d" % body["max_tokens"])
-body["stream"] = False
-print("重放 trace 第 %d 条请求(%d 条 message, %d 字 json); 改了: %s; 上限 %s" %
+# 流式收、边收边落盘(09-28): 不设上限的请求可能思考几万位, 非流式在结束前什么都看不到, 判不了"翻找"还是"复读";
+# 跑着的时候 tail -f <out>.think.txt 就能看原文。思考段也算复读: "以五结尾"类请求是在思考段里逐字死循环, 只看正文会漏。
+body["stream"] = True; body["stream_options"] = {"include_usage": True}
+print("重放 trace 第 %d 条请求(%d 条 message, %d 字 json); 改了: %s; 上限 %s; 原文边跑边写 %s.think.txt / .txt" %
       (k, len(body.get("messages", [])), len(raw), ", ".join(changed) or "没改(原样口径)",
-       body.get("max_tokens", "没有 = 界就是 ctx − 提示")), flush=True)
+       body.get("max_tokens", "没有 = 界就是 ctx − 提示"), out), flush=True)
 t0 = time.time()
 rq = urllib.request.Request("http://127.0.0.1:8000/v1/chat/completions",
                             data=json.dumps(body, ensure_ascii=False).encode(),
                             headers={"Content-Type": "application/json"})
-r = json.loads(urllib.request.urlopen(rq).read().decode())   # 不设超时: 结束由 EOS / ctx / 挂断决定
+txt = think = ""; fin = None; usage = {}
+with urllib.request.urlopen(rq) as resp, open(out + ".txt", "w", encoding="utf-8") as ft, \
+     open(out + ".think.txt", "w", encoding="utf-8") as fk:   # 不设超时: 结束由 EOS / ctx / 挂断决定
+    for ln in resp:
+        ln = ln.decode("utf-8", "replace")
+        if not ln.startswith("data: {"): continue
+        ev = json.loads(ln[6:]); usage = ev.get("usage") or usage
+        for ch in ev.get("choices") or []:
+            d = ch.get("delta", {}); fin = ch.get("finish_reason") or fin
+            if d.get("reasoning_content"): think += d["reasoning_content"]; fk.write(d["reasoning_content"]); fk.flush()
+            if d.get("content"): txt += d["content"]; ft.write(d["content"]); ft.flush()
 el = time.time() - t0
-txt = r["choices"][0]["message"].get("content") or ""
-open(out + ".txt", "w", encoding="utf-8").write(txt)
-c = [ch for ch in txt if not ch.isspace()]
-seen, cnt, tot, seg = set(), 0, 0, []
-for i in range(max(len(c) - 3, 0)):
-    g = "".join(c[i:i + 4]); tot += 1
-    if g in seen: cnt += 1
-    seen.add(g)
-    if tot == 300: seg.append(int(100 * cnt / 300 + 0.5)); cnt = tot = 0
-if tot: seg.append(int(100 * cnt / tot + 0.5))
+r = {"choices": [{"finish_reason": fin}], "usage": {"completion_tokens": usage.get("completion_tokens", -1)}}
+def segs(s):   # 每 300 个 4-gram 一段"前文已出现过"的占比, 与 d1_kv_ring_gate.sh loop 模式同定义
+    c = [ch for ch in s if not ch.isspace()]
+    seen, cnt, tot, seg = set(), 0, 0, []
+    for i in range(max(len(c) - 3, 0)):
+        g = "".join(c[i:i + 4]); tot += 1
+        if g in seen: cnt += 1
+        seen.add(g)
+        if tot == 300: seg.append(int(100 * cnt / 300 + 0.5)); cnt = tot = 0
+    if tot: seg.append(int(100 * cnt / tot + 0.5))
+    return seg
+seg, tseg = segs(txt), segs(think)
 nums = {}
 j = txt.rfind("{")
 if j >= 0:
@@ -132,6 +146,8 @@ print("%s: finish=%s %d token %.0fs %d 字  约？%d  JSON %s  死循环段 %s\n
     txt.count("约？") + txt.count("约?"),
     "齐 " + str({w: nums.get(w) for w in want}) if not miss else "★缺 " + ",".join(miss),
     "★有★" if any(s >= 95 for s in seg) else "无", " ".join(map(str, seg))), flush=True)
+print("  思考段 %d 字, 死循环段 %s\n  思考分段: %s" % (len(think), "★有★" if any(s >= 95 for s in tseg) else "无",
+      " ".join(map(str, tseg))), flush=True)
 PYEOF
     ;;
   health)

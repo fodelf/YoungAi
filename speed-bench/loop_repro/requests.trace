@@ -1,0 +1,10 @@
+# 09-28 bug.jpeg 复现用的两条请求, 按 ds4-server --trace 的格式写, 给 qtf_replay_probe.sh direct/health 按原字节重放。
+# 照聊天前端的样子只带 messages: 不带 temperature / max_tokens(产品默认口径)。温 0 下两条都在思考段逐字死循环。
+===== request 1
+--- raw request json ---
+{"model":"ds4","messages":[{"role":"user","content":"写5个句子，每个句子都必须以“五”字结尾。"}]}
+--- rendered prompt ---
+===== request 2
+--- raw request json ---
+{"model":"ds4","messages":[{"role":"user","content":"请写出5个以“五”字结尾的成语。"}]}
+--- rendered prompt ---

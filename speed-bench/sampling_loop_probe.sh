@@ -6,17 +6,21 @@
 # 为什么要多个 seed: 温 0 是单轨迹(一次 argmax 翻面定整篇), 采样更是; 一条提示三个 seed 才看得出
 # "偶尔打转"还是"总打转"。判读一律看原文($OUT/loop_*.out), 数字只是索引。
 #
-# 用法: ./speed-bench/sampling_loop_probe.sh <模型.gguf> <反修目录|none> [温度, 默认 0.6] [seed 列表, 默认 "1 2 3"] [提示文件] [温 0 参照 .out|none] [附加采样参数]
+# 用法: ./speed-bench/sampling_loop_probe.sh <模型.gguf> <反修目录|none> <温度> [seed 列表, 默认 "1 2 3"] [提示文件] [温 0 参照 .out|none] [附加采样参数] [生成 token 上限]
+#   温度必填: 引擎不给 --temp 就是 ds4.h 的官方默认, 但打转尺的 run() 先塞了 --temp 0, 这里不写死第二份数。
+#   生成 token 上限: 不给 = 不设上限, 生成到 EOS 为止。带上限的趟只能说"到上限还没停", 判不了"不停"或"复读"
+#   (09-28: 以前写死 1400, "每句以五结尾"那条温 0 到第 1868 个 token 才进复读, 1400 截出来是假阴性)。
+#   ★温 0 趟不设上限 + 真死循环 = 一直跑到上下文尽头(1M)★, 要看复读就盯 $OUT/<tag>.out, 确认逐字周期后手动杀。
 #   温 0 参照 .out = 改采样之前同提示同模型跑出的 loop_*.out; 给了就 cmp, 不同 = 采样接线碰了裸路, 直接停; none = 跳过温 0 那趟。
-#   附加采样参数 = 原样传给 ds4 的其余采样开关, 如 "--top-p 0.95 --min-p 0"(DeepSeek 对推理模型的官方口径是温 0.6 + top-p 0.95;
-#   本引擎默认 top_p 1 + min_p 0.05 是相对概率过滤, 在复读区(冠军 token 90% 以上)会把所有备选都滤掉 = 事实上退回贪心, 出不来)。
+#   附加采样参数 = 原样传给 ds4 的其余采样开关, 如 "--top-p 0.95"(模型卡推荐温 1.0 + top_p 0.95 或 1.0, 没有 min_p)。
+#   别传非 0 的 --min-p: 它按冠军概率的比例砍备选, 复读区冠军 >95% 时备选全被砍 = 退回贪心(09-28 温 1 + min_p 0.05 照样逐字死循环)。
 # 出错会怎样: 任一趟 ds4 非 0 退出就停在那一趟(看 $OUT/<tag>.err); 温 0 cmp 不同退 3。
 set -u
 cd "$(dirname "$0")/.." || exit 1
-MODEL="${1:?模型}"; AMP="${2:?反修目录或 none}"; TEMP="${3:-0.6}"; SEEDS="${4:-1 2 3}"
+MODEL="${1:?模型}"; AMP="${2:?反修目录或 none}"; TEMP="${3:?温度}"; SEEDS="${4:-1 2 3}"
 P="${5:-speed-bench/fin_chat_prompt.txt}"; REF="${6:-}"; XS="${7:-}"
 OUT=/tmp/d1-kv-ring
-NGEN=1400
+NGEN="${8:-0}"   # 0 = 不设上限(d1_kv_ring_gate.sh loop 模式见 0 就不传 -n)
 base="loop_$(basename "$MODEL" .gguf)_$(basename "$AMP")_$(basename "$P" .txt)"
 
 if [ "$REF" != none ]; then
