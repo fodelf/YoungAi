@@ -43,6 +43,10 @@ data/corpus/method/
 data/corpus/skills/
 data/corpus/dsml/
 data/corpus/code/
+# 法律/医疗/科研侧车语料: 由 sidecar_corpus_build.sh 重建, 且含 NC 许可证数据集, 不进仓库
+data/corpus/law/
+data/corpus/med/
+data/corpus/sci/
 data/corpus/calib_v2*.txt
 data/corpus/hot_*.txt
 data/corpus/*.dat

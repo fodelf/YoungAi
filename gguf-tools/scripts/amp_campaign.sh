@@ -23,8 +23,9 @@
 #   方案B: pv_c(x) = tanh(V_c·x/s) · tanh(A_c·x/s), 两个 tanh 的乘积 = 真二阶门,
 #   对 U 仍线性 ⇒ 闭式 ridge 不变、零训练不变。落地 type9 `zl.AMPD`, 载荷 A|U|V。
 #
-# 用法: bash amp_campaign.sh [--profile general|fin] [段|all]
+# 用法: bash amp_campaign.sh [--profile general|fin|fin41|code|law|med|sci] [段|all]
 # 段: preflight ids anchor capture solve chain judge   (probe = 可选诊断, 不在 all 链里)
+#     V4.1 领域 profile(code/law/med/sci)只认 idshalf 与 sidecar 两段
 #
 # ★本脚本不接受任何环境变量(2026-08-22 铁律: 本项目不得新增 env 配置)★
 #   语料/尺寸/路径全部写死在下面。要换一轮就改这里并记录, 不靠发车姿势决定行为。
@@ -44,8 +45,13 @@ R30="$ROOT/gguf/go-onebit/r30"
 G7="$ROOT/gguf/go-onebit/g7"
 
 PROFILE=general
-if [ "${1:-}" = "--profile" ]; then PROFILE="${2:?--profile 要值 general|fin|fin41}"; shift 2; fi
+if [ "${1:-}" = "--profile" ]; then PROFILE="${2:?--profile 要值 general|fin|fin41|code|law|med|sci}"; shift 2; fi
 HF_SET=""
+# idshalf 切几份、每份叫什么(<中文标签>:<文件名去 .ids>)。默认三份 = 历史所有工作区的落盘名, 改了就对不上已有锚。
+SPLITS=("量化份:vqhalf_q" "反修份:vqhalf_a" "判决份:vqhalf_j")
+# 每份 token 数。下限由域数定: v41_amp_run 择优的 held-out = 每域窗号 k%4==3 的窗(窗宽 128), 每域不足 4 窗 = 没有
+# val 行, λ 无从择优 ⇒ 每份至少 域数×512。八域/五域 8192 够; code 三十域取 15360。
+SPLIT_N=8192
 case "$PROFILE" in
   general) NAME="v5full"
            CORPUS="$ROOT/gguf-tools/data/corpus/calibration_datav5.txt"   # 开源全场景, 22.4% 字符在代码围栏内
@@ -61,7 +67,24 @@ case "$PROFILE" in
            CORPUS="$ROOT/gguf-tools/data/corpus/fin"
            VQD="$ROOT/gguf/go-onebit/vqfin41"
            HF_SET="$ROOT/hf/DeepSeek-V4.1-Flash";;
-  *) echo "未知 profile: $PROFILE(general|fin|fin41)" >&2; exit 2;;
+  # code(2026-09-26 用户令"编程侧车, 开源数据集切两份: 一份路由反修+增益反修, 一份验证五指标"):
+  # 语料 = code_corpus_build.sh 产的 30 个语言域(数据集全部语言)。只有 idshalf / sidecar 两段有效(其余是 V4 结构写死的)。
+  # ★只切两份, 不切量化份★: 侧车挂在现役通用基座上, 基座不为编程重量化, 没有量化份的用处。
+  # ★每份 15360 = 30 域 × 512★: 每域 4 窗(3 拟合 + 1 held-out); 8192 只有 2 窗 → val 为空(见 SPLIT_N 注释)。
+  # 不取整到 16384: 多出的 1024 会按"剩余池最大"整段回补给一个域(09-26 实撞: Assembly 拿 1536, 其余 512), 不等权。
+  # 命名: 工作区 gguf/go-onebit/code, 两份叫 fit / judge —— 不带版本号(以后只有 V4.1), 不沿用 vqhalf 这个
+  # V4 战役旧名; v41_judge.sh 按"目录_文件名"拼侧车名, 于是侧车目录 = <基座>-grrb-code_fit_n15360-engine。
+  # law / med / sci(2026-09-27 用户令"再加入法律、医疗、科研这三个场景的侧车以及五指标"): 与 code 逐字同一套切法,
+  # 语料 = sidecar_corpus_build.sh 产的 6 个子域(3 中 3 英)。15360 = 6 × 2560, 每子域 20 窗(15 拟合 + 5 held-out);
+  # 与编程侧车同一个 token 数, 四个领域的五指标才是在同样长的尺子上量的。
+  code|law|med|sci)
+           NAME="$PROFILE"
+           CORPUS="$ROOT/gguf-tools/data/corpus/$PROFILE"
+           VQD="$ROOT/gguf/go-onebit/$PROFILE"
+           SPLITS=("反修份:fit" "判决份:judge")
+           SPLIT_N=15360
+           HF_SET="$ROOT/hf/DeepSeek-V4.1-Flash";;
+  *) echo "未知 profile: $PROFILE(general|fin|fin41|code|law|med|sci)" >&2; exit 2;;
 esac
 S=8192                       # 锚 token 数(整份语料等距窗抽样)
 IDS_WIN=64                   # 等距窗数, 跨度铺满全文
@@ -271,20 +294,22 @@ stage_dilute(){
 # 产出: vqhalf_q.ids(量化半) / vqhalf_a.ids(放大器半)。
 stage_idshalf(){
     local D2="$VQD"; mkdir -p "$D2"
-    local QI="$D2/vqhalf_q.ids" AI="$D2/vqhalf_a.ids" JI="$D2/vqhalf_j.ids"
+    # 份数与文件名来自 profile 的 SPLITS(默认三份 vqhalf_q/a/j; code 两份 fit/judge)
+    local FIN=() WR=() PYARGS=() sp HAVE=1 LAY=1 T=""
+    for sp in "${SPLITS[@]}"; do FIN+=("$D2/${sp#*:}.ids"); done
     # ★布局是产物的一部分(2026-08-29)★: ids 在但 .layout 缺 = 补布局机制之前切的。
     # 切分是确定性的(无随机源), 所以同一段代码重跑到 tmp、逐字节比对 ids 一致后, 只把
     # .layout 装回去 —— ids 一个字节不动 ⇒ 三个锚(各 30.8G/57 分钟)不作废。
     # 比对不过就硬停: 宁可没布局, 也不许拿一份【算出来的】布局去配一份【对不上的】ids。
-    local HAVE=0 T=""
-    [ -s "$QI" ] && [ -s "$AI" ] && [ -s "$JI" ] && HAVE=1
-    if [ "$HAVE" = 1 ] && [ -s "$QI.layout" ] && [ -s "$AI.layout" ] && [ -s "$JI.layout" ]; then
-        LOG "①ids 三份 + 行布局已在, 跳过(要重切先 mv 走)"; return 0; fi
-    local OQ="$QI" OA="$AI" OJ="$JI"
+    for sp in "${FIN[@]}"; do [ -s "$sp" ] || HAVE=0; [ -s "$sp.layout" ] || LAY=0; done
+    if [ "$HAVE" = 1 ] && [ "$LAY" = 1 ]; then
+        LOG "①ids ${#FIN[@]} 份 + 行布局已在, 跳过(要重切先 mv 走)"; return 0; fi
+    WR=("${FIN[@]}")
     if [ "$HAVE" = 1 ]; then
-        T="$(mktemp -d)"; OQ="$T/q.ids"; OA="$T/a.ids"; OJ="$T/j.ids"
+        T="$(mktemp -d)"; WR=(); for sp in "${FIN[@]}"; do WR+=("$T/$(basename "$sp")"); done
         LOG "①ids 已在但行布局缺 → 确定性重算 + 逐字节校验, 只补布局(不动 ids)"
     fi
+    local i; for i in "${!SPLITS[@]}"; do PYARGS+=("${SPLITS[$i]%%:*}=${WR[$i]}"); done
     # ★域分层整簇切半(2026-08-28 用户令"不要相似的, 全域都要有")★
     # 旧切法(B=256 token 定长块偶奇交替)的病: 同一篇文档的【相邻段落】被分进两半 —— 实测
     # 两半各自取到的是同一篇小鼠肠道菌群论文的相邻段, 两半几乎是复制品。校准半见过的东西
@@ -298,24 +323,29 @@ stage_idshalf(){
     #      且每域 token 量接近
     # 抽样也按域分层: 每半每域按其全局占比取配额, 域内等距铺窗, 保证抽出来的 8192 token
     # 仍然全域齐全(旧切法 64 窗盲抽, 小域可能一个 token 都抽不到)。
-    LOG "①域分层整簇三切 → 量化/反修/判决 各 S=8192(全域齐全, 整簇不拆, 三份零重叠)"
-    python3 - "$CORPUS" "$OQ" "$OA" "$OJ" 8192 "$DS4_HF" "$ROOT/gguf/go-onebit/g7/wt2.ids" <<'PY' || DIE "三切失败"
-import re, sys, collections
+    LOG "①域分层整簇 ${#SPLITS[@]} 切 → ${SPLITS[*]} 各 S=$SPLIT_N(全域齐全, 整簇不拆, 各份零重叠)"
+    python3 - "$CORPUS" "$SPLIT_N" "$DS4_HF" "$ROOT/gguf/go-onebit/g7/wt2.ids" "${PYARGS[@]}" <<'PY' || DIE "切分失败"
+import re, sys, collections, json
 from tokenizers import Tokenizer
-src, oq, oa, oj, N, hf, wt2 = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5]), sys.argv[6], sys.argv[7]
-OUTS = [("量化份", oq), ("反修份", oa), ("判决份", oj)]
+src, N, hf, wt2 = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+OUTS = [tuple(a.split("=", 1)) for a in sys.argv[5:]]   # [(中文标签, 输出路径)], 顺序 = 贪心投放顺序
 tok = Tokenizer.from_file(f"{hf}/tokenizer.json")
-# ★目录模式(2026-09-08 fin profile)★: 语料是目录时, 一文件 = 一域(域名 = 文件名去 .txt), 一行 = 一篇文档 = 一个簇。
+# ★目录模式(2026-09-08 fin profile)★: 语料是目录时, 一文件 = 一域(域名 = 文件名去扩展名), 一行 = 一篇文档 = 一个簇。
 # 为什么不走下面的 dom() 正则: 金融语料全是中文, 正则只会判成一个 cjk 域 → 全语料一个簇 → 整簇进一份, 另两份空。
 # 每篇独立成簇: 同一篇公告只进量化/反修/判决之一(独立性同"整簇不拆"的初衷), 域内三路贪心仍按 token 平衡。
+# .txt 整行即原文(金融: 文内换行已折成空格); .jsonl 取 "text" 字段(代码: 换行/缩进是语法, 必须原样进分词器,
+# 2026-09-26 code profile 加)。两种扩展名之外的文件一律不读。
 import os
 pre_clusters = None
 if os.path.isdir(src):
     lines, pre_clusters = [], []
     for fn in sorted(os.listdir(src)):
-        if not fn.endswith(".txt"): continue
+        stem, ext = os.path.splitext(fn)
+        if ext not in (".txt", ".jsonl"): continue
         for ln in open(os.path.join(src, fn), encoding="utf-8").read().split("\n"):
-            if ln.strip(): lines.append(ln); pre_clusters.append([fn[:-4], [ln]])
+            if not ln.strip(): continue
+            doc = json.loads(ln)["text"] if ext == ".jsonl" else ln
+            lines.append(doc); pre_clusters.append([stem, [doc]])
 else:
     lines = [ln for ln in open(src, encoding="utf-8").read().split("\n") if ln.strip()]
 
@@ -369,7 +399,7 @@ for c in clusters: byd[c[0]].append(c)
 # ★三路贪心(2026-08-28 用户令"切三份: 量化/反修/判决")★ 每域各自把文档簇按 token 降序
 # 依次投给当前最轻的一份 ⇒ 三份都拿到全部域, 且每域 token 量近乎相等; 整簇不拆 ⇒ 同源
 # 文档绝不跨份(这正是两份时代"两半是同篇论文相邻段"的根治法)。
-K = 3
+K = len(OUTS)
 pools = [collections.defaultdict(list) for _ in range(K)]
 for d, cs in byd.items():
     cs.sort(key=lambda c: -len(c[2]))
@@ -379,11 +409,10 @@ for d, cs in byd.items():
 
 alld = sorted(byd, key=lambda d: -sum(len(c[2]) for c in byd[d]))
 tot = sum(len(c[2]) for cs in byd.values() for c in cs)
-print("  语料 %d token / %d 行 / %d 文档簇, %d 个域 → 三份" % (tot, len(lines), len(clusters), len(byd)))
-print("  %-10s %8s | %8s %8s %8s" % ("域", "全语料", "量化池", "反修池", "判决池"))
+print("  语料 %d token / %d 行 / %d 文档簇, %d 个域 → %d 份" % (tot, len(lines), len(clusters), len(byd), K))
+print("  %-16s %8s |" % ("域", "全语料") + "".join(" %8s" % (nm[:2] + "池") for nm, _ in OUTS))
 for d in alld:
-    print("  %-10s %8d | %8d %8d %8d" % (d, sum(len(c[2]) for c in byd[d]),
-          len(pools[0][d]), len(pools[1][d]), len(pools[2][d])))
+    print("  %-16s %8d |" % (d, sum(len(c[2]) for c in byd[d])) + "".join(" %8d" % len(p[d]) for p in pools))
 
 def sample(pool, N, path):
     """按域配额分层抽, 域内等距铺窗(窗宽 128)。
@@ -438,8 +467,8 @@ for i, (nm, path) in enumerate(OUTS):
     sel, got = sample(pools[i], N, path); sels.append(sel); gots.append(got)
 print()
 print("  抽样后每域 token(★全域都要有★):")
-print("  %-10s %8s %8s %8s" % ("域", "量化份", "反修份", "判决份"))
-for d in alld: print("  %-10s %8d %8d %8d" % (d, *[g.get(d,0) for g in gots]))
+print("  %-16s" % "域" + "".join(" %8s" % nm for nm, _ in OUTS))
+for d in alld: print("  %-16s" % d + "".join(" %8d" % g.get(d, 0) for g in gots))
 miss = [d for d in byd if any(g.get(d,0)==0 for g in gots)]
 assert not miss, "★有域没被抽到: %s★" % miss
 
@@ -448,19 +477,56 @@ def ov(a, b):
     return sum(min(ca[t]/na, cb[t]/nb) for t in set(a)|set(b))
 w = [int(x) for x in open(wt2) if x.strip()]
 print()
-print("  三份两两 token 分布重合(越低越不像):")
+print("  各份两两 token 分布重合(越低越不像):")
 for i in range(K):
     for j in range(i+1, K):
         print("    %s ↔ %s  %.3f" % (OUTS[i][0], OUTS[j][0], ov(sels[i], sels[j])))
-print("  三份对 wt2 词表覆盖: " + " / ".join(
+print("  各份对 wt2 词表覆盖: " + " / ".join(
     "%s %.1f%%" % (OUTS[i][0], 100*len(set(w)&set(sels[i]))/len(set(w))) for i in range(K)))
 PY
     if [ -n "$T" ]; then
-        cmp -s "$OQ" "$QI" && cmp -s "$OA" "$AI" && cmp -s "$OJ" "$JI" \
-            || DIE "★重算 ids 与盘上不一致(切分不确定 或 语料变过) — 停, 不许拿算出来的布局配对不上的 ids★"
-        cp "$OQ.layout" "$QI.layout"; cp "$OA.layout" "$AI.layout"; cp "$OJ.layout" "$JI.layout"
-        rm -rf "$T"; LOG "①行布局补齐 ✓ (三份 ids 逐字节复现, 锚全部继续有效)"
+        for i in "${!FIN[@]}"; do cmp -s "${WR[$i]}" "${FIN[$i]}" \
+            || DIE "★重算 ids 与盘上不一致(切分不确定 或 语料变过) — 停, 不许拿算出来的布局配对不上的 ids★"; done
+        for i in "${!FIN[@]}"; do cp "${WR[$i]}.layout" "${FIN[$i]}.layout"; done
+        rm -rf "$T"; LOG "①行布局补齐 ✓ (${#FIN[@]} 份 ids 逐字节复现, 锚全部继续有效)"
     fi
+}
+
+# ★领域侧车一条龙(2026-09-27 用户令"加入法律、医疗、科研侧车以及五指标")★ —— 只给 V4.1 领域 profile(code/law/med/sci)。
+# 把编程侧车 09-26 手敲的三步收成一段, 四个领域走同一条链、同一组尺子:
+#   ① 解侧车 + 本域判决份五指标: v41_judge.sh <judge> 15360 engamp:<fit>:15360:<基座>:0:40:grrb
+#      (教师锚 / 拟合份教师链态夹具缺了会先落; manifest 有 "# 完成" 的侧车目录直接复用, 半成品 rm -rf 重解)
+#   ② 同一判决份上的对照: 裸基座 + 盘上其他已完成的领域侧车 —— 回答"涨的是不是领域对口给的"(编程那趟: 金融侧车
+#      放到编程料上只 +0.97 pp, 编程侧车 +3.65 pp)
+#   ③ wt2 512 守门: 裸基座 / 挂本域侧车 同趟, 看通用能力退没退。裸基座也重跑(512 位只要 8 s): 引擎二进制一换,
+#      旧的裸读数就不是同一个二进制出的, 拿它当对照是两个变量混在一起
+# 出错会怎样: 任一步 v41_judge.sh 非 0 就停在那一步(DIE)。不停的话 ② 会少几格对照, 表上看不出是缺了还是本来没有。
+# 耗时(09-26 编程实测): 判决份教师 29 min + 拟合份夹具 31 min + 解算 124 min + 每个学生 ~2.5 min。
+# 用法: amp_campaign.sh --profile law sidecar   (idshalf 没切会先切; 三个域串行跑就在外面一个 for 循环)
+stage_sidecar(){
+    case "$PROFILE" in code|law|med|sci) ;; *) DIE "sidecar 段只给 code/law/med/sci, 收到 $PROFILE";; esac
+    stage_idshalf
+    local J="$SC/v41_judge.sh"
+    local GG="$ROOT/gguf/v41/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf"   # 现役部署基座(09-22 起), 同 v41_judge.sh 默认
+    local FIT="$VQD/fit.ids" JUD="$VQD/judge.ids" WT2="$G7/wt2.ids" f d
+    for f in "$GG" "$FIT" "$FIT.layout" "$JUD" "$WT2"; do [ -s "$f" ] || DIE "缺 $f"; done
+    # 与 v41_judge.sh engamp 档的命名逐字同(<基座>-<模式>-<目录>_<文件名>_n<N>-engine), 对不上 ② 就会把自己当成"别的侧车"
+    local ARM="$ROOT/gguf/v41/$(basename "$GG" .gguf)-grrb-${NAME}_fit_n${SPLIT_N}-engine"
+    LOG "① 解 $NAME 侧车 + $NAME 判决份五指标 → $ARM"
+    # 基座与拟合料传仓库相对路径(v41_judge.sh 先 cd 到仓库根): 解算器把这两个参数原样写进侧车 manifest.txt, 传绝对路径
+    # 就是把 /home/<本机用户>/ 写进要公开发布的文件, hf_publish_spark.sh 的 stage 会因此拒发(09-28 实撞, 三份 manifest 手工改回)
+    "$J" "$JUD" "$SPLIT_N" "engamp:${FIT#$ROOT/}:$SPLIT_N:${GG#$ROOT/}:0:40:grrb" || DIE "① 解侧车/判决失败"
+    grep -q "^# 完成" "$ARM/manifest.txt" 2>/dev/null || DIE "侧车目录没有完成标记: $ARM"
+    local CMP=("engine:$GG")
+    for d in "$ROOT/gguf/v41/$(basename "$GG" .gguf)"-grrb-*-engine; do
+        [ "$d" = "$ARM" ] && continue
+        case "$d" in *-probe-engine) continue;; esac       # 消融探针(如 norb-probe)不是交付的侧车
+        grep -q "^# 完成" "$d/manifest.txt" 2>/dev/null && CMP+=("engine:$GG:$d")
+    done
+    LOG "② 对照 ${#CMP[@]} 档(裸基座 + 其他领域侧车), 同一判决份"
+    "$J" "$JUD" "$SPLIT_N" "${CMP[@]}" || DIE "② 对照失败"
+    LOG "③ wt2 512 守门: 裸基座 / +$NAME 侧车"
+    "$J" "$WT2" 512 "engine:$GG" "engine:$GG:$ARM" || DIE "③ wt2 守门失败"
 }
 
 # ★放大器半扩样(2026-08-26 zloss90 战役, 用户令: 体积≤2GB 换 Σmin→0.90)★
@@ -1296,7 +1362,7 @@ ST="${1:-all}"
 case "$ST" in
   preflight) stage_preflight;; ids) stage_ids;; anchor) stage_anchor;;
   capture) stage_capture;; probe) stage_probe;; solve) stage_solve;; pass2) stage_pass2;;
-  chain) stage_chain;; judge) stage_judge;; dilute) stage_dilute;; idshalf) stage_idshalf;; idshalf_ext) shift; stage_idshalf_ext "$@";; vqmerge) stage_vqmerge;; vqcap) stage_vqcap;; vqsolve) stage_vqsolve;; dynladder) stage_dynladder;; dynquant) shift; stage_dynquant "$@";; dynjudge) stage_dynjudge;; champbf) shift; stage_champbf "$@";; champ86) stage_champ86;; champreset) stage_champ_reset;; champ3rd) stage_champ3rd;; corpdiff) stage_corpdiff;; anchors3) stage_anchors3;; anchorwt2) stage_anchor_wt2;; champ3) stage_champ3;; elmprobe) stage_elmprobe;; probe3) stage_probe3;; judge3) shift; stage_judge3 "$@";; champrb) stage_champ_rbsweep;; chainx) stage_chainx;; full) shift; stage_full "$@";;
+  chain) stage_chain;; judge) stage_judge;; dilute) stage_dilute;; idshalf) stage_idshalf;; sidecar) stage_sidecar;; idshalf_ext) shift; stage_idshalf_ext "$@";; vqmerge) stage_vqmerge;; vqcap) stage_vqcap;; vqsolve) stage_vqsolve;; dynladder) stage_dynladder;; dynquant) shift; stage_dynquant "$@";; dynjudge) stage_dynjudge;; champbf) shift; stage_champbf "$@";; champ86) stage_champ86;; champreset) stage_champ_reset;; champ3rd) stage_champ3rd;; corpdiff) stage_corpdiff;; anchors3) stage_anchors3;; anchorwt2) stage_anchor_wt2;; champ3) stage_champ3;; elmprobe) stage_elmprobe;; probe3) stage_probe3;; judge3) shift; stage_judge3 "$@";; champrb) stage_champ_rbsweep;; chainx) stage_chainx;; full) shift; stage_full "$@";;
   all) stage_preflight; stage_ids; stage_anchor; stage_capture
        stage_solve; stage_chain; stage_judge;;
   *) echo "未知段: $ST"; echo "段: preflight ids anchor capture solve pass2 chain judge dilute all (probe/dilute=诊断)"; exit 2;;
