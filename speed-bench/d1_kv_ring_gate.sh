@@ -49,11 +49,28 @@ head -c 50000 speed-bench/readme_en_x80.txt > "$OUT/p12k.txt" || exit 1
 # 投机 vs 纯解码 —— 12k 尺看不到随上下文涨的那笔税(sp.md: 10k → 71k 每步 +3.8 ms), 投机在那一档赚不赚只有量了才知道。
 head -c 200000 speed-bench/readme_en_x80.txt > "$OUT/p60k.txt" || exit 1
 
+# ★看门狗(2026-09-24 补)★: 这把尺每趟都装 113 GB 模型进 121 GB 的 spark, 以前一道闸都没有 —— 真挤到 MemAvailable → 0
+# 不是报错, 是整机假死(08-24 实撞)。红线与 serve_1m_spark.sh 同一个数: 每 2 s 看一次, 连续两次 < 2500 MB 就杀本趟,
+# .err 末尾留一行"★看门狗★"。杀了的那趟读数作废(输出不完整, 门会报分叉/缺数), 不许拿它判核。没有 /proc(Mac)就不看。
+WD_KILL_MB=2500
 run () {   # $1=二进制 $2=标签 $3.. = 其余参数
   local bin=$1 tag=$2; shift 2
   local z=(); [ "$AMP" != none ] && z=(--zchain "$AMP")
   # ${z[@]+"${z[@]}"}: set -u 下空数组直接展开在老 bash 上报 unbound, 这个写法两边都过
-  ./"$bin" -m "$MODEL" ${z[@]+"${z[@]}"} --temp 0 --seed 1 "$@" > "$OUT/$tag.out" 2> "$OUT/$tag.err"
+  ./"$bin" -m "$MODEL" ${z[@]+"${z[@]}"} --temp 0 --seed 1 "$@" > "$OUT/$tag.out" 2> "$OUT/$tag.err" &
+  local pid=$! bad=0 a
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ -r /proc/meminfo ]; then
+      a=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
+      if [ "$a" -lt "$WD_KILL_MB" ]; then bad=$((bad+1)); else bad=0; fi
+      if [ "$bad" -ge 2 ]; then
+        echo "★看门狗: MemAvailable ${a} MB < ${WD_KILL_MB} 连续两次, 杀 $bin($tag)★" | tee -a "$OUT/$tag.err"
+        kill "$pid" 2>/dev/null; sleep 3; kill -9 "$pid" 2>/dev/null; break
+      fi
+    fi
+    sleep 2
+  done
+  wait "$pid"
 }
 
 # ★同轨定位(mtp-1.md M0′(d))★: 门报"分叉"之后, 下一个问题永远是"从哪一步开始的"。
@@ -286,17 +303,44 @@ fi
 # 第 7 个参数(可选) = 假设"验证批核补齐到 n=1 水平"时每多验一行的 ms(= 一行的专家账), 再重放一遍: 验 1 行 = 走图一步。
 #   这一档回答的是"把验证批核做好以后投机能到多少", 不是现状。
 # 第 8 个参数给 nocap = 只跑在线四趟(速度 + 同轨 + 验证批成本)就停: 改核后复测用, 取料(逐位 ~15 min)只在要重放时才付。
-# 用法: ./speed-bench/d1_kv_ring_gate.sh none <模型> <生成几个 token> sim <反修目录> <提示 ids> [理想每行 ms] [nocap]
+# 第 9 个参数(2026-09-24) = 跑哪个二进制(默认 ds4): 改核前后成对比必须同一机器状态两个二进制各跑一遍, 跨会话的 t/s 不可比。
+# 用法: ./speed-bench/d1_kv_ring_gate.sh none <模型> <生成几个 token> sim <反修目录> <提示 ids> [理想每行 ms] [nocap] [二进制] [额外引擎参数]
+# ★head 档(2026-09-24)★: 一条真实请求(id 文件)纯解码生成 NGEN 个 token, 把正文开头打出来 —— 看"模型开口说什么"(思考用什么语言、
+# 电报体还是完整句)用的, 分钟级。第 7 个参数 = 追加的引擎参数(例 "--decoder-full" 做预填路 A/B), 第 8 个 = 输出标签。
+# 用法: ./speed-bench/d1_kv_ring_gate.sh none <模型> <生成几个 token> head <反修目录> <提示 ids> [引擎参数] [标签]
+if [ "$MODE" = head ] && [ -n "${6:-}" ]; then
+  HX=(${7:-}); HT="head_${8:-$(basename "$6" .ids)}"
+  [ -s "$6" ] || { echo "★没有 $6★"; exit 1; }
+  run ds4 "$HT" -n "$NGEN" --no-dspark --gen-ids "$6" ${HX[@]+"${HX[@]}"}
+  echo "== $HT($(basename "$6"), ${7:-默认}): $(grep -a -h 'prefill .* token' "$OUT/$HT.err" | tail -1)"
+  head -c 600 "$OUT/$HT.out"; echo
+  exit 0
+fi
 if [ "$MODE" = sim ] && [ -n "${6:-}" ]; then
-  PIDS="$6"; TOKI="${7:-}"; NOCAP="${8:-}"
+  PIDS="$6"; TOKI="${7:-}"; NOCAP="${8:-}"; SBIN="${9:-ds4}"
+  # 第 10 个参数(2026-09-24) = 四趟在线都追加的引擎参数(空格隔开), 例 "--no-graph"(同一二进制换一种发法做 A/B)
+  SEXTRA=(${10:-})
+  [ -x "./$SBIN" ] || { echo "★没有 ./$SBIN★"; exit 1; }
   [ -s "$PIDS" ] || { echo "★没有 $PIDS★"; exit 1; }
   [ "$NGEN" -gt 0 ] || { echo "★生成 token 数要 > 0★"; exit 1; }
   [ -x ./gguf-tools/bench/dspark_sim ] || make -C gguf-tools dspark_sim || exit 1
   t=rq_$(basename "$PIDS" .ids)
-  run ds4 "${t}_plain" -n "$NGEN" --no-dspark --emit-trace --gen-ids "$PIDS"
-  run ds4 "${t}_spec"  -n "$NGEN" --dspark --emit-trace --gen-ids "$PIDS"
-  for k in 1 3; do run ds4 "${t}_k$k" -n "$NGEN" --dspark --dspark-verify "$k" --gen-ids "$PIDS"; done
-  echo "== 真实请求 $(basename "$PIDS"), 生成 $NGEN token"
+  # 第 8 个参数给 speconly(2026-09-24) = 只跑投机一趟: 同一条请求上比几种只影响投机的开关时用, 每种省下纯解码/k1/k3 三趟;
+  # 同轨对上一次 nocap 留下的纯解码输出比(那些开关不改纯解码, 不用重跑它)。
+  if [ "$NOCAP" = speconly ]; then
+    [ -s "$OUT/${t}_plain.out" ] || { echo "★speconly 要先有 $OUT/${t}_plain.out(先对这条请求跑一次 nocap)★"; exit 1; }
+    run "$SBIN" "${t}_spec" -n "$NGEN" --dspark --emit-trace --gen-ids "$PIDS" ${SEXTRA[@]+"${SEXTRA[@]}"}
+    echo "== 真实请求 $(basename "$PIDS"), 只跑投机, 二进制 $SBIN ${SEXTRA[*]:-}"
+    echo "  spec: $(grep -a -h 'decode .* token' "$OUT/${t}_spec.err") $(grep -a -h 'DSpark:\|一轮 \|子词表' "$OUT/${t}_spec.err" | tr '\n' ' ')"
+    A="$OUT/${t}_spec.out"; B="$OUT/${t}_plain.out"
+    na=$(wc -c < "$A"); nb=$(wc -c < "$B"); n=$(( (na < nb ? na : nb) - 1 ))
+    if cmp -s -n "$n" "$A" "$B"; then echo "  同轨: 前 $n 字节逐字节同 ✓"; else echo "  ★同轨分叉★ $(cmp -n "$n" "$A" "$B" 2>&1 | head -1)"; fi
+    exit 0
+  fi
+  run "$SBIN" "${t}_plain" -n "$NGEN" --no-dspark --emit-trace --gen-ids "$PIDS" ${SEXTRA[@]+"${SEXTRA[@]}"}
+  run "$SBIN" "${t}_spec"  -n "$NGEN" --dspark --emit-trace --gen-ids "$PIDS" ${SEXTRA[@]+"${SEXTRA[@]}"}
+  for k in 1 3; do run "$SBIN" "${t}_k$k" -n "$NGEN" --dspark --dspark-verify "$k" --gen-ids "$PIDS" ${SEXTRA[@]+"${SEXTRA[@]}"}; done
+  echo "== 真实请求 $(basename "$PIDS"), 生成 $NGEN token, 二进制 $SBIN"
   for x in plain spec k1 k3; do
     echo "  $x: $(grep -a -h 'decode .* token' "$OUT/${t}_$x.err") $(grep -a -h '稳态' "$OUT/${t}_$x.err" | sed 's/.*⇒ //') $(grep -a -h 'DSpark:\|一轮 ' "$OUT/${t}_$x.err" | tr '\n' ' ')"
   done
@@ -312,7 +356,7 @@ if [ "$MODE" = sim ] && [ -n "${6:-}" ]; then
   NP=$(tr -s ' \t' '\n\n' < "$PIDS" | grep -c .)
   echo "  取料: ids $(wc -l < "$OUT/$t.sim.ids") = 提示 $NP + 生成 $(( $(wc -l < "$OUT/$t.sim.ids") - NP ))"
   z=(); [ "$AMP" != none ] && z=(--zchain "$AMP")
-  ./ds4 -m "$MODEL" ${z[@]+"${z[@]}"} --score-ids "$OUT/$t.sim.ids" --dspark-capture "$OUT/$t.pairs.bin" --decoder-full \
+  ./"$SBIN" -m "$MODEL" ${z[@]+"${z[@]}"} --score-ids "$OUT/$t.sim.ids" --dspark-capture "$OUT/$t.pairs.bin" --decoder-full \
       > /dev/null 2> "$OUT/$t.cap.err" || { echo "★取料失败★"; tail -3 "$OUT/$t.cap.err"; exit 3; }
   grep -a "首位 ↔ 底座" "$OUT/$t.cap.err"
   GMS=$(grep -a -h '稳态' "$OUT/${t}_plain.err" | sed 's/.*稳态 \([0-9.]*\) ms.*/\1/')
