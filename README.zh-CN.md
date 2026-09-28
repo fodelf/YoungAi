@@ -560,15 +560,17 @@ SIDECAR=DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-vqfin41_vqhalf_a_n8192-en
 ```
 
 加载大约两分钟。接口：`/v1/chat/completions`、`/v1/completions`、`/v1/responses`（OpenAI 风格）和
-`/v1/messages`（Anthropic 风格）。请求里不带 `temperature` 就走贪心（并且走投机）；带了 `temperature` 就采样，
-走纯解码。
+`/v1/messages`（Anthropic 风格）。请求里没带的采样参数按模型卡的推荐配方：`temperature` 1.0、`top_p` 1.0、
+不设 `min_p`，采样、走纯解码。要贪心（也就是要投机解码、要输出逐字节可复现）就显式传 `"temperature": 0`。
+别把贪心当聊天默认：在"合格答案很少"的题上，贪心会在思考段逐字打转停不下来（例：让它写 5 个以"五"字结尾的成语）。
 
 **命令行。**
 
 ```sh
 ./bin/ds4 --cuda -m DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf --zchain $SIDECAR \
     --engram-dir /data/DeepSeek-V4.1-Flash -p "解释一下什么是市盈率。"
-# 加 --no-dspark 走纯解码（测速度基线时用）；去掉 --zchain 就是裸基座
+# 默认按模型卡配方采样（纯解码）；加 --temp 0 走贪心 + 投机，再加 --no-dspark 是纯贪心（测速度基线时用）；
+# 去掉 --zchain 就是裸基座
 ```
 
 **后训练文件是一次实验，不是升级包。** `posttrain-experimental-20260924/` 是在一条大盘研判请求的决策点上
