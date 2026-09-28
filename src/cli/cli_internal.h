@@ -58,6 +58,7 @@ typedef struct {
     int score_topk;
     const char *score_rms_path;  /* --score-rms FILE: 逐位 inv=rsqrt(mean(x²)+eps) f32[S](后训练靶的单位) */
     int score_no_logits;         /* --score-no-logits: 不写全词表 logits(统一内存机器上那是 517 KB/位置) */
+    int score_split;             /* --score-split P: [0,P) 照生成路 CED 预填, [P,n) 跑满解码器(部署同路; 0 = 老口径) */
     const char *dump_logprobs_path;
     int dump_logprobs_top_k;
     const char *perplexity_file_path;

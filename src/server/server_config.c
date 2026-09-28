@@ -122,6 +122,8 @@ void usage(FILE *fp) {
         "      Standalone DSpark drafter GGUF and its amplifier sidecar.\n"
         "  --posttrain DIR\n"
         "      V4.1 three-file deploy, third file: post-training gain directory multiplied into --zchain.\n"
+        "  --engram-dir DIR\n"
+        "      V4.1: folder holding the official n-gram table shards (else the path baked into the GGUF).\n"
         "  --mm-image-cmd CMD\n"
         "      External multimodal image encoder command (default: probe ./mm-ui).\n"
         "  --mem-budget-mb N\n"
@@ -314,6 +316,8 @@ server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--posttrain")) {
             /* 三文件部署第三件(V4.1): 与 --zchain 同构的增益目录, 装载时与 ② 逐元素相乘。与 CLI 同一个全局 setter。 */
             ds4_engine_v41_set_posttrain_dir(need_arg(&i, argc, argv, arg));
+        } else if (!strcmp(arg, "--engram-dir")) {
+            ds4_engine_v41_set_engram_dir(need_arg(&i, argc, argv, arg));
         } else if (!strcmp(arg, "--finetune")) {
             c.engine.finetune_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--residual")) {

@@ -25,11 +25,14 @@ void ds4_engine_v41_set_verify_k(unsigned k);   /* --dspark-verify N: 每轮验�
 void ds4_engine_v41_set_amp_dir(const char *dir);   /* --zchain <dir>: V4.1 反修放大器目录(amp_Lnn.bin), 每层 MoE 出口 y += x·(B·A) */
 void ds4_engine_v41_set_amp_scale(float s);         /* --zchain-scale β: 加载时把 A 乘 β(修正整体缩到 β 倍); ≤0 = 1.0 */
 void ds4_engine_v41_set_posttrain_dir(const char *dir);   /* --posttrain <dir>: 三文件部署的第三件(后训练增益), 与 --zchain 的表逐元素相乘 */
+void ds4_engine_v41_set_engram_dir(const char *dir);      /* --engram-dir <dir>: n-gram 表分片所在目录, 顶替 GGUF 里记的转换机绝对路径 */
 /* --score-nll FILE / --score-topk K FILE / --score-no-logits: --score-ids 的三个小出口。
  * 与 V4 的 --eval-nll/--eval-topk 同一份实现(core_score_aux.c)、同一种字节。
  * 后训练一趟 5.8 万行, 全词表 logits 就是 30 GB —— 统一内存机器上写它 = 掏 GPU 内存(09-08 崩机)。 */
 void ds4_engine_v41_set_score_aux(const char *nll_path, const char *topk_path, int topk,
                                   const char *rms_path, int skip_logits);
+/* --score-ids 部署同路切分点 P(0 = 老口径): [0,P) 照生成路 CED 预填, [P,n) 跑满解码器。后训练取料用, 见 core_v41_api.c。 */
+void ds4_engine_v41_set_score_split(int p);
 int ds4_engine_v41_score_ids(ds4_engine *e, const int *ids, int n_ids, const char *out_path, int no_engram, int chunk);
 
 /* --dspark-capture(mtp.md M6): 教师强制一位一块走完 ids, 每位出 (草稿器出口隐态, 主模型出口隐态) 一对,

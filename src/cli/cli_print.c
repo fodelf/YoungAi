@@ -106,6 +106,8 @@ void usage(FILE *fp) {
         "      External amplifier chain sidecar (else embedded blk.L.opt_* auto-load).\n"
         "  --zchain-scale B\n"
         "      V4.1 amplifier step size: scale every layer's correction to B (default 1.0).\n"
+        "  --engram-dir DIR\n"
+        "      V4.1: folder holding the official n-gram table shards (else the path baked into the GGUF).\n"
         "  --cap-dir DIR | --cap-layers LO-HI | --eval-ids FILE | --eval-logits FILE |\n"
         "  --eval-nll FILE (逐位 NLL, f32[S], 判决用; 比 --eval-logits 小 5 个数量级) |\n"
         "  --eval-topk K FILE (每行 top-K 的 id/p + 目标 p + 覆盖质量, 后训练靶) |\n"

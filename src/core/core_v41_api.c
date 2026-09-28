@@ -104,6 +104,12 @@ void ds4_engine_v41_set_score_aux(const char *nll_path, const char *topk_path, i
     g_v41_score_rms = (rms_path && rms_path[0]) ? rms_path : NULL;
     g_v41_score_skip_logits = skip_logits;
 }
+/* --score-ids 的部署同路切分点(2026-09-23, 后训练 ③ 实撞): 0 = 老口径(整条按块跑满解码器)。P > 0 = [0,P) 照生成路预填
+ * (同分块、末块至少留一个窗口、非末块 CED 只跑编码器段), [P,n) 按块跑满解码器 —— 与"提示预填 + 逐 token 解码"同一种状态。
+ * 为什么要它: 生成时提示走 CED, 老口径把提示也跑满解码器, 两边在同一位置的状态不是一回事。09-23 实撞: ③ 按老口径的表
+ * 解出来, 老口径下决策点翻了(−7.03 → +5.5), 服务端端到端一个字没翻。CED 块没有 logits/钩子行, 这些行在表里留空。 */
+static uint32_t g_v41_score_split = 0;
+void ds4_engine_v41_set_score_split(int p) { g_v41_score_split = p > 0 ? (uint32_t)p : 0u; }
 
 #ifndef DS4_NO_GPU
 int ds4_engine_v41_score_ids(ds4_engine *e, const int *ids, int n_ids, const char *out_path, int no_engram, int chunk) {
@@ -138,9 +144,25 @@ int ds4_engine_v41_score_ids(ds4_engine *e, const int *ids, int n_ids, const cha
     float *hx = g_v41_score_rms ? xmalloc((size_t)cap * DS4_N_EMBD * 4) : NULL;
     double nll = 0.0; const double t0 = now_sec();
     bool ok = true; int stopped = 0;
-    for (uint32_t c0 = 0; ok && c0 < n; c0 += cap) {
-        const uint32_t nc = n - c0 < cap ? n - c0 : cap;
+    const uint32_t split = g_v41_score_split < n ? g_v41_score_split : 0u;
+    if (split && fo) { fprintf(stderr, "ds4: 部署同路切分(P=%u)下 CED 块没有 logits, 全词表文件写不完整 —— 要配 --score-no-logits\n", split); ok = false; }
+    if (split) fprintf(stderr, "[v41] ★部署同路★ [0,%u) 照生成路预填(CED), [%u,%u) 跑满解码器\n", split, split, n);
+    for (uint32_t c0 = 0, nc = 0; ok && c0 < n; c0 += nc) {
+        nc = n - c0 < cap ? n - c0 : cap;
+        st.ced_skip = 0;
+        if (c0 < split) {   /* 提示段: 与 ds4_engine_v41_generate_argmax 的预填循环同一套切法 */
+            if (c0 + nc > split) nc = split - c0;
+            const uint32_t rest = split - c0 - nc;
+            if (rest > 0u && rest < DS4_N_SWA && nc > DS4_N_SWA) nc -= DS4_N_SWA - rest;
+            st.ced_skip = (!g_ds4_v41_decoder_full && c0 + nc < split) ? 1 : 0;
+        } else if (split) {
+            /* 报告段的尾块不许 ≤ DS4_V41_GEMV_MAX_TOK: 那么小的块走解码 GEMV 路, 不物化逐专家输出, 后训练取料的钩子拿不到 ye
+             * 就停车(09-24 实撞: 报告段 2562 = 5×512 + 2)。从这一块匀出几个位置给尾块, 结果只差累加序, 不改语义。 */
+            const uint32_t rest = n - c0 - nc;
+            if (rest > 0u && rest <= DS4_V41_GEMV_MAX_TOK && nc > 2u * (DS4_V41_GEMV_MAX_TOK + 1u)) nc -= DS4_V41_GEMV_MAX_TOK + 1u - rest;
+        }
         ok = v41_forward(e, &st, ids + c0, nc);
+        if (ok && st.ced_skip) { ds4_score_aux_skip_rows(aux, c0, nc); continue; }   /* CED 块: 没有 logits, 表里写占位行 */
         if (ok && st.stop_early) { stopped = 1; continue; }   /* 反修钩子提前结束: 本块没有 logits, 文件不完整, 不算 PPL */
         if (ok) ok = ds4_gpu_tensor_read(st.logits, 0, lg, (uint64_t)nc * DS4_N_VOCAB * 4) != 0;
         if (ok && hx) {
@@ -242,6 +264,11 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
         v41_state_free(&st);
         return 1;
     }
+    if (sampling && dspark) {   /* 默认开(1): 这一条走纯解码, 出声 */
+        fprintf(stderr, "ds4: [v41] 本请求开了采样/惩罚(temp %.2f dry %.2f), 投机只在贪心下成立 ⇒ 这一条走纯解码\n",
+                (double)g_decode_sampling.temperature, (double)g_decode_sampling.dry_multiplier);
+        dspark = 0;
+    }
     float *rowbuf = sampling ? xmalloc((size_t)DS4_N_VOCAB * 4u) : NULL;
     v41_hist hist = {NULL, 0, 0, NULL};
     if (penal) {
@@ -264,11 +291,6 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
              * 跑满解码器; 这里最后一块就是那段回放, 以前它 = 提示长 mod 512(1~512), 不足 128 时首批生成 token 的窗口直接
              * 缺位。余下不足 window 就从这一块匀过去(这一块缩短, 最后一块正好 window 个)。 */
             const uint32_t rest = np - c0 - nc;
-    if (sampling && dspark) {   /* 默认开(1): 这一条走纯解码, 出声 */
-        fprintf(stderr, "ds4: [v41] 本请求开了采样/惩罚(temp %.2f dry %.2f), 投机只在贪心下成立 ⇒ 这一条走纯解码\n",
-                (double)g_decode_sampling.temperature, (double)g_decode_sampling.dry_multiplier);
-        dspark = 0;
-    }
             if (rest > 0u && rest < DS4_N_SWA && nc > DS4_N_SWA) nc -= DS4_N_SWA - rest;
             /* CED: 除最后一块外, 只跑编码器段 + 分界层 KV(最后一块同时充当官方说的"解码器有界回放") */
             st.ced_skip = (!g_ds4_v41_decoder_full && c0 + nc < np) ? 1 : 0;
@@ -430,6 +452,9 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
                 ms_snap += (now_sec() - tb0) * 1e3;
             }
             for (uint32_t i = 0; i < a; i++) {   /* 白赚的那几位: 草稿与主模型一致, 直接吐 */
+                /* ★到上限就停★(09-24): 一轮接受多位时以前会越过 n_predict 多吐几个(-n 2048 吐 2050)。温 0 下多出来的也是对的 token,
+                 * 但服务端 max_tokens 是硬上限, 纯解码路恰好停在上限 —— 投机默认开之后两条路必须同一个上限语义。 */
+                if (produced >= n_predict) break;
                 produced++;
                 const int t = (int)batch[i + 1u];
                 /* 位置 = 回滚后的 n_past 减去还没吐的那几位(与纯解码那条打印的是同一个绝对位置口径) */
@@ -452,9 +477,6 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
         const double t2 = now_sec();
         if (produced > 1) fprintf(stderr, "\n[v41] decode %d token %.1fs (%.2f t/s)\n", produced - 1, t2 - t1, (double)(produced - 1) / (t2 - t1 + 1e-9));
         rc = ok ? 0 : 1;
-                /* ★到上限就停★(09-24): 一轮接受多位时以前会越过 n_predict 多吐几个(-n 2048 吐 2050)。温 0 下多出来的也是对的 token,
-                 * 但服务端 max_tokens 是硬上限, 纯解码路恰好停在上限 —— 投机默认开之后两条路必须同一个上限语义。 */
-                if (produced >= n_predict) break;
     } while (0);
     free(rowbuf); free(hist.tok); free((void *)hist.brk);
     if (am) ds4_gpu_tensor_free(am);

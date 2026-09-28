@@ -40,7 +40,10 @@ static bool v41_engram_open_shard(ds4_v41_state *st, uint32_t ei) {
     fd = open(path, O_RDONLY | O_DIRECT);
 #endif
     if (fd < 0) { dio = 0; fd = open(path, O_RDONLY); }
-    if (fd < 0) { fprintf(stderr, "ds4: engram 表打不开 %s\n", path); return false; }
+    if (fd < 0) {   /* 最常见的原因: GGUF 里记的是转换那台机器的绝对路径, 换了机器就不在 */
+        fprintf(stderr, "ds4: engram 表打不开 %s —— 用 --engram-dir 指向放官方分片(model-0004{7,8}-of-00048.safetensors)的目录\n", path);
+        return false;
+    }
     struct stat sb; if (fstat(fd, &sb) != 0) { close(fd); return false; }
     /* ★关预读(2026-09-15)★: 表是 203 GB 的 HF 分片, 每行只读 264 B 且行号随机, 而内核默认预读会把每次
      * 读放大成 128 KB 灌进页缓存 —— 512 token 一块、两层、24 行就是 GB 级的churn, 把模型的 103 GiB 映射页

@@ -266,6 +266,8 @@ cli_config parse_options(int argc, char **argv) {
             /* 三文件部署的第三件(V4.1 形态): 与 --zchain 同构的增益目录, 表逐元素相乘。
              * 走全局 setter(同 --zchain-scale): ds4.h 已 500 行顶格, 不进 ds4_engine_opts。 */
             ds4_engine_v41_set_posttrain_dir(need_arg(&i, argc, argv, arg));
+        } else if (!strcmp(arg, "--engram-dir")) {
+            ds4_engine_v41_set_engram_dir(need_arg(&i, argc, argv, arg));
         } else if (!strcmp(arg, "--score-nll")) {
             c.gen.score_nll_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--score-topk")) {
@@ -277,6 +279,8 @@ cli_config parse_options(int argc, char **argv) {
             c.gen.score_rms_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--score-no-logits")) {
             c.gen.score_no_logits = 1;
+        } else if (!strcmp(arg, "--score-split")) {
+            c.gen.score_split = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
             c.gen.n_predict = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {

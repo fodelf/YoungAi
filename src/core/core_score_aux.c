@@ -121,6 +121,27 @@ void ds4_score_aux_rms_rows(ds4_score_aux *a, uint32_t i0, const float *x,
     }
 }
 
+/* 占位行(2026-09-23, 部署同路打分): CED 块只跑编码器段, 没有 logits/出口隐态, 但三份表都是按行顺序写、下游按行号读 ——
+ * 跳过不写 = 后面整体错位(读侧会拦: "第 0 条记的行号是 9119")。占位行: NLL = NaN, top-K 行号照写、tgt = −1、概率全 0、
+ * id 全 −1(读侧 p>0 才认), rms = 0。不计入平均值, 冒烟读数只反映真算过的行。 */
+void ds4_score_aux_skip_rows(ds4_score_aux *a, uint32_t i0, uint32_t nrow) {
+    if (!a) return;
+    const float nanv = NAN, zero = 0.0f;
+    const int neg = -1;
+    for (uint32_t r = 0; r < nrow; r++) {
+        const uint32_t i = i0 + r;
+        if (a->nf && fwrite(&nanv, sizeof(float), 1, a->nf) != 1) { fprintf(stderr, "ds4: [%s] nll 短写 @pos %u -- aborting\n", a->tag, i); exit(1); }
+        if (a->rf && fwrite(&zero, sizeof(float), 1, a->rf) != 1) { fprintf(stderr, "ds4: [%s] rms 短写 @pos %u -- aborting\n", a->tag, i); exit(1); }
+        if (a->tf) {
+            bool ok = fwrite(&i, sizeof(uint32_t), 1, a->tf) == 1 && fwrite(&neg, sizeof(int), 1, a->tf) == 1 &&
+                      fwrite(&zero, sizeof(float), 1, a->tf) == 1 && fwrite(&zero, sizeof(float), 1, a->tf) == 1;
+            for (int q = 0; ok && q < a->topk; q++) ok = fwrite(&neg, sizeof(int), 1, a->tf) == 1;
+            for (int q = 0; ok && q < a->topk; q++) ok = fwrite(&zero, sizeof(float), 1, a->tf) == 1;
+            if (!ok) { fprintf(stderr, "ds4: [%s] topk 短写 @pos %u -- aborting\n", a->tag, i); exit(1); }
+        }
+    }
+}
+
 void ds4_score_aux_close(ds4_score_aux *a) {
     if (!a) return;
     if (a->nf) {

@@ -46,6 +46,8 @@ void ds4_score_aux_rms_rows(ds4_score_aux *a, uint32_t i0, const float *x,
 void ds4_score_aux_row(ds4_score_aux *a, uint32_t i, const float *lg, int tgt);
 
 /* 关文件并打印统计(平均 NLL/PPL、topK 平均覆盖质量)。a 可以是 NULL。 */
+/* CED 块(没有 logits)的占位行: 行号不错位, 不计入平均。见 core_score_aux.c。 */
+void ds4_score_aux_skip_rows(ds4_score_aux *a, uint32_t i0, uint32_t nrow);
 void ds4_score_aux_close(ds4_score_aux *a);
 
 #endif /* DS4_CORE_SCORE_AUX_H */

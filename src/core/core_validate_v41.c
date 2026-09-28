@@ -7,6 +7,12 @@
  * g_ds4_v41 供热路径按层查表。缺键 = 硬停, 不给默认值。 */
 #include "core_internal.h"
 
+/* --engram-dir: table_path 是转换器 realpath 出来的绝对路径(v41_to_gguf.c), 只在转换那台机器上成立。
+ * 发布出去的 GGUF 不能为此重写(改一个字符串长度 = 数据区整体挪位 = 40 个分块全部重传), 所以在装载时换目录:
+ * 只留 GGUF 里的文件名, 拼到这个目录下。不传 = 原样用 GGUF 里的路径(转换机本机)。 */
+static const char *g_v41_engram_dir = NULL;
+void ds4_engine_v41_set_engram_dir(const char *dir) { g_v41_engram_dir = (dir && dir[0]) ? dir : NULL; }
+
 static uint32_t v41_arr_i32(const ds4_model *m, const char *key, int32_t *out, uint32_t cap) {
     ds4_array_ref arr;
     if (!model_get_array(m, key, &arr) || (arr.type != GGUF_VALUE_INT32 && arr.type != GGUF_VALUE_UINT32)) {
@@ -125,6 +131,18 @@ void v41_load_metadata(const ds4_model *m) {
             fprintf(stderr, "ds4: V4.1 required key is missing: %s\n", key); exit(1);
         }
         memcpy(v->engram_table_path[i], s.ptr, s.len); v->engram_table_path[i][s.len] = 0;
+        if (g_v41_engram_dir) {
+            char name[sizeof v->engram_table_path[i]];
+            const char *slash = strrchr(v->engram_table_path[i], '/');
+            snprintf(name, sizeof name, "%s", slash ? slash + 1 : v->engram_table_path[i]);
+            const int w = snprintf(v->engram_table_path[i], sizeof v->engram_table_path[i], "%s/%s", g_v41_engram_dir, name);
+            if (w < 0 || (size_t)w >= sizeof v->engram_table_path[i]) ds4_die("--engram-dir path too long");
+            fprintf(stderr, "ds4: engram 表 %u 用 %s(--engram-dir)\n", i, v->engram_table_path[i]);
+        }
+        /* 表到第一次前向才打开; 加载要 2 分钟, 不在这里先说一声, 人要等到第一个请求失败才知道。
+         * 只警告不停: --score-ids 的 no-engram 对拍口径本来就不读表。 */
+        if (access(v->engram_table_path[i], R_OK) != 0)
+            fprintf(stderr, "ds4: ★engram 表打不开 %s, 第一个请求会失败 —— 用 --engram-dir 指向放官方分片的目录★\n", v->engram_table_path[i]);
         snprintf(key, sizeof key, "deepseek4.engram.%u.weight_offset", i); v->engram_weight_off[i] = v41_req_u64(m, key);
         snprintf(key, sizeof key, "deepseek4.engram.%u.scale_offset", i);  v->engram_scale_off[i]  = v41_req_u64(m, key);
     }
