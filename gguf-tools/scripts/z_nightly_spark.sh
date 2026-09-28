@@ -162,9 +162,10 @@ PY
 # 要它把"增益改动"换算成"logit 差改动"(back.md §4.1); 判决路用不上, 传空就不写。
 #   $1 ids 文件  $2 nll 输出  $3 topk 输出  $4 日志  $5 后训练目录(空=只挂 ①+②)  $6 rms 输出(空=不写)
 score_pass(){
-    local ids="$1" nll="$2" top="$3" log="$4" pt="${5:-}" rms="${6:-}"
+    # $7 = 部署同路切分点(提示长度; 空 = 老口径)。后训练的训练表与验证表必须同一口径(v41_sft_run.inc.c 取料按它切)
+    local ids="$1" nll="$2" top="$3" log="$4" pt="${5:-}" rms="${6:-}" split="${7:-}"
     ./ds4 --cuda -m "$MDL" --zchain "$ZCH" ${pt:+--posttrain "$pt"} --mem-budget-mb 110000 \
-        --score-ids "$ids" --score-no-logits --score-nll "$nll" --score-topk 64 "$top" \
+        --score-ids "$ids" --score-no-logits --score-nll "$nll" --score-topk 64 "$top" ${split:+--score-split "$split"} \
         ${rms:+--score-rms "$rms"} > "$log" 2>&1 </dev/null || { tail -8 "$log"; DIE "打分失败(见 $log)"; }
     # ★查产出, 不只查退出码★: 实例锁拒启动那次进程也"正常"返回, 产物却是空的(09-10 实撞)
     [ -s "$nll" ] && [ -s "$top" ] || DIE "打分没产出($nll / $top)"
@@ -695,7 +696,9 @@ stage_gatea(){
         # ★改判决口径不必重烧前向★: 挂候选那一趟的 top-K 表在盘上, 第 2 参数传 1 就直接用它
         if [ "$SKIP" = 1 ]; then LOG "尺A 样本 $i 用盘上已有的候选态表"
         else LOG "尺A 样本 $i 挂候选重打分"
-             score_pass "$W/ids_right_$i.txt" "$W/g_nll_$i.bin" "$W/g_top_$i.bin" "$W/g_score_$i.log" "$CAND"; fi
+             # 切分点 = 最小约束/决策行 + 1(= 提示长度), 与解算器取料同一口径
+             local sp; sp=$(cat "$W/rows_ctr_$i.txt" "$W/rows_dec_$i.txt" | sort -n | head -1); sp=$((sp + 1))
+             score_pass "$W/ids_right_$i.txt" "$W/g_nll_$i.bin" "$W/g_top_$i.bin" "$W/g_score_$i.log" "$CAND" "" "$sp"; fi
         # ★判决器失败必须停车★(09-13 实撞): 原来这三行都带 `|| true`, 于是 --rows 不认 "@文件"
         # 那次报的是"尺A 0/0 = 0.00%" —— 看着像"一个决策点都没有", 其实是参数根本没被接受。
         # 判决器出错和判决为零是两回事, 不许混成一个读数。
@@ -1309,7 +1312,154 @@ for ln in open(os.path.join(d, "nll_verdict.txt"), encoding="utf-8", errors="rep
 PY
 }
 
+# ---------------- 当天复盘 → ③ 的训练语料(2026-09-23, 用户令"拿复盘的语料再训练, 再跑早上的看结论能不能反转") ----------------
+# 大盘复盘只给一个事实: 早盘预测方向 vs 实际方向。错版 = 早上那条请求的模型原输出(思考 + 正文),
+# 对版 = 同一份输出里把预测方向换成复盘真值(其余一字不动 ⇒ 两版逐 token 对齐, 决策点就是被换掉的那几个 token)。
+# 写成 sft 段现成认的 samples.json(body_prompt / body_report / orig_report), 之后直接 `sft`。
+#   $1 = 请求 JSON(qtf_capture_request.py 的输出, 带 _note)  $2 = 模型输出(流式 SSE 原文或非流式 JSON)
+#   $3 = 复盘真值 上涨|下跌
+# 提示按服务端 render_chat_prompt_text 的字节拼(思考档 high): BOS <｜System｜> effort 前缀 system <｜User｜> user
+# <｜Assistant｜><think>。拼错 = 训练的不是产品那条请求(模板漏 <｜System｜> 的旧坑, bug.md §1)。
+stage_review(){
+    # $4 = add: 追加到已有 samples.json(迭代轮用: 挂 ③ 的新轨迹上又拍回错方向的那一处, 作为新决策点)。
+    # 退出码: 0 = 拼好; 1 = 这条输出里没有错方向的拍板(没东西可学); 3 = 与已有样本重复(同一处, 再解也不会多学)。
+    local REQ="${1:?请求 JSON}" OUTF="${2:?模型输出}" TRUTH="${3:?复盘真值 上涨|下跌}" MODE="${4:-new}"
+    [ -s "$D2/samples.json" ] && cp -n "$D2/samples.json" "$D2/samples.json.bak-$(date +%Y%m%d%H%M%S)"
+    python3 - "$REQ" "$OUTF" "$TRUTH" "$D2/samples.json" "$MODE" <<'PYEOF'
+import json, os, sys
+req, outf, truth, dst, mode = sys.argv[1:6]
+wrong_dir = {"上涨": "下跌", "下跌": "上涨"}[truth]
+r = json.load(open(req, encoding="utf-8"))
+sysm = "\n\n".join(m["content"] for m in r["messages"] if m["role"] == "system")
+user = [m["content"] for m in r["messages"] if m["role"] == "user"][-1]
+effort = "Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n"
+prompt = "<｜begin▁of▁sentence｜><｜System｜>" + effort + sysm + "<｜User｜>" + user + "<｜Assistant｜><think>"
+raw = open(outf, encoding="utf-8", errors="replace").read()
+think = text = ""
+if raw.lstrip().startswith("{"):
+    m = json.loads(raw)["choices"][0]["message"]; think, text = m.get("reasoning_content") or "", m.get("content") or ""
+else:
+    for ln in raw.splitlines():
+        if not ln.startswith("data: {"): continue
+        ch = json.loads(ln[6:]).get("choices") or []
+        if ch:
+            de = ch[0].get("delta", {}); think += de.get("reasoning_content") or ""; text += de.get("content") or ""
+import re
+# ★决策点 = 思考段里第一次拍板的那个方向词★(思考档的结论在思考里就定了, 正文只是誊写)。
+# 跳过"是 "大盘上涨" 还是 "大盘下跌""这种列选项的句子(后面紧跟 or / 或 / /)。
+# 序列截在这个词后面: 之后的思考(09-23 实测贪心在这里掉进 2000 字周期复读 24 遍)与正文都不进训练 ——
+# 对版只许改结论, 论证一字不动, 截断后两版逐 token 对齐, 决策行就是被换的那一两个 token。
+wd, td = "大盘" + wrong_dir, "大盘" + truth
+cut = None
+# 列选项的两种写法都跳过: `"大盘上涨" or …`(看后面) 与 `… or "大盘上涨"?`(看前面, 09-24 挂 ③ 的轨迹里实撞)
+def listing(t, m):
+    return (re.match(r'["”」]?\s*(or|或|/|还是)', t[m.end():m.end() + 8]) is not None or
+            re.search(r'(or|或|/|还是)\s*["“「]?$', t[max(0, m.start() - 8):m.start()]) is not None)
+for m in re.finditer(re.escape(wd), think):
+    if listing(think, m): continue
+    cut = m; break
+if cut is not None:
+    orig = think[:cut.end()]
+    fixed = think[:cut.start()] + td
+    where = "思考段第 %d 字: …%s" % (cut.start(), think[max(0, cut.start() - 60):cut.end()].replace("\n", "⏎"))
+elif wd in text:
+    orig = think + "</think>" + text
+    fixed = orig.replace(wd, td)
+    where = "正文(思考段没拍板), 全部 %d 处" % text.count(wd)
+else:
+    print("模型原输出里没有 '%s' —— 早上本来就没判错, 没有可学的" % wd); sys.exit(1)
+print("决策点: " + where)
+items = []
+if mode == "add" and os.path.exists(dst):
+    items = json.load(open(dst, encoding="utf-8"))["items"]
+    if any(it["orig_report"] == orig for it in items):
+        print("这一处已在语料里(同一段前文同一个拍板), 不重复加"); sys.exit(3)
+items.append({"body_prompt": prompt, "body_report": fixed, "orig_report": orig, "date": r["_note"]["date"], "symbol": "大盘"})
+json.dump({"items": items}, open(dst, "w", encoding="utf-8"), ensure_ascii=False)
+print("复盘语料: 提示 %d 字 / 训练段 %d 字 (%s → %s) | 语料共 %d 条" % (len(prompt), len(orig), wd, td, len(items)))
+PYEOF
+}
+
+# 挂上 ③ 重跑早上那条请求, 看结论翻没翻。部署同路: ds4-server(现役 ①②) + --posttrain, 请求字节 = 早上那条。
+#   $1 = 请求 JSON  $2 = ③ 目录(传 - = 不挂, 当对照)  $3 = 输出 SSE 落盘路径
+# 读数: 思考段第一次拍板的方向 + 正文里的"大盘上涨/下跌"。★复读判据★: 思考尾部 2000 字在全文出现 ≥3 次 =
+# 贪心掉进周期(09-23 基座这条请求实测在 6k 字处拍板后 2000 字周期 24 遍) —— 这时停流, 如实记"复读", 不当结论。
+stage_reviewrun(){
+    local REQ="${1:?请求 JSON}" PT="${2:?③目录或 -}" OUTF="${3:?输出路径}"
+    bash "$SC/serve_1m_spark.sh" stop >>"$LOGF" 2>&1; sleep 3; need_idle
+    local extra=(); [ "$PT" = - ] || extra=(--posttrain "$PT")
+    bash "$SC/serve_1m_spark.sh" start "" "" ${extra[@]+"${extra[@]}"} >>"$LOGF" 2>&1 || DIE "服务没起来(看 $LOGF)"
+    LOG "重跑 $(basename "$REQ") 挂 ③=$PT"
+    python3 - "$REQ" "$OUTF" <<'PYEOF' 2>&1 | tee -a "$LOGF"
+import json, re, sys, urllib.request
+req, outf = sys.argv[1], sys.argv[2]
+b = json.load(open(req, encoding="utf-8")); b.pop("_note", None); b["stream"] = True
+op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+rq = urllib.request.Request("http://127.0.0.1:8000/v1/chat/completions", json.dumps(b, ensure_ascii=False).encode(),
+                            {"Content-Type": "application/json"})
+think = text = ""; loop = False; n = 0
+with op.open(rq, timeout=7200) as r, open(outf, "w", encoding="utf-8") as fo:
+    for ln in r:
+        ln = ln.decode("utf-8", "replace"); fo.write(ln)
+        if not ln.startswith("data: {"): continue
+        ch = json.loads(ln[6:]).get("choices") or []
+        if not ch: continue
+        de = ch[0].get("delta", {}); think += de.get("reasoning_content") or ""; text += de.get("content") or ""; n += 1
+        if n % 500 == 0 and not text and len(think) > 8000 and think.count(think[-2000:]) >= 3:
+            loop = True; break
+def first(t):
+    for m in re.finditer(r"大盘(上涨|下跌)", t):
+        if re.match(r'["”」]?\s*(or|或|/|还是)', t[m.end():m.end() + 8]): continue
+        if re.search(r'(or|或|/|还是)\s*["“「]?$', t[max(0, m.start() - 8):m.start()]): continue
+        return m.group(0), m.start(), t[max(0, m.start() - 80):m.end()].replace("\n", "⏎")
+    return None
+f = first(think)
+print("思考 %d 字 / 正文 %d 字%s" % (len(think), len(text), " / ★复读(尾部 2000 字周期 ≥3 遍), 已停流★" if loop else ""))
+print("思考段第一次拍板: %s" % ("%s @%d …%s" % f if f else "无"))
+c = re.findall(r"大盘(?:上涨|下跌)", text)
+print("正文结论: %s" % (c[0] if c else "(正文没写到结论)"))
+print("REVIEW_VERDICT content=%s loop=%d" % (c[0][2:] if c else "none", int(loop)))   # 迭代段按这一行判停
+PYEOF
+    bash "$SC/serve_1m_spark.sh" stop >>"$LOGF" 2>&1
+}
+
+# 自我迭代(2026-09-24, 用户令"继续"): 单点 ③ 能翻第一次拍板, 但模型会在训练没见过的新位置拍回去(fable5 09-24)。
+# 每轮: 在上一轮挂 ③ 的轨迹上找第一个错方向的拍板 → 追加为新决策点 → 全部样本从 ② 起按部署同路重解 ③ → 挂上重跑。
+# 停: 正文结论 = 真值(翻了) / 新轨迹里没有错方向拍板 / 与已有样本重复 / 到轮数上限。结束(含中途 DIE)一律把现役服务起回来。
+#   $1 = 请求 JSON  $2 = 复盘真值  $3 = 轮数上限  $4.. = 种子输出(第一条是基座输出, 其余是已有的挂 ③ 轨迹)
+stage_reviewiter(){
+    local REQ="${1:?请求 JSON}" TRUTH="${2:?真值}" MAXR="${3:?轮数上限}"; shift 3
+    local IT="$D2/review_iter_$(date +%Y%m%d_%H%M)"; mkdir -p "$IT"
+    local TAG="pt-$(date +%Y%m%d)"
+    trap 'bash "$SC/serve_1m_spark.sh" start >>"$LOGF" 2>&1' EXIT
+    [ -e "$FTD/$TAG" ] && mv "$FTD/$TAG" "$IT/prev_$TAG"
+    local first=1 src rc
+    for src in "$@"; do
+        if [ $first = 1 ]; then stage_review "$REQ" "$src" "$TRUTH" || DIE "种子 $src 拼不出样本"; first=0
+        else stage_review "$REQ" "$src" "$TRUTH" add; rc=$?; [ $rc = 0 ] || [ $rc = 3 ] || DIE "种子 $src 拼装失败"; fi
+    done
+    local r OUT CAND V
+    for r in $(seq 1 "$MAXR"); do
+        LOG "★迭代第 $r 轮★ 语料 $(python3 -c 'import json,sys;print(len(json.load(open(sys.argv[1]))["items"]))' "$D2/samples.json") 条"
+        OUT="$(stage_sft 6 1,10 "" 0 1,10 | tail -1)"
+        [ -d "$OUT" ] || DIE "第 $r 轮解算没出候选"
+        # 候选固定取 τ=6 ρ=10 λ=1: τ 按部署同路的余量定(09-24 实测 τ=6 翻得动), ρ=10 = 约束行权重高档(别处少动)
+        CAND=$(ls -d "$OUT"/cand_g1_t6_r10_l1_* 2>/dev/null | head -1); [ -n "$CAND" ] || DIE "第 $r 轮没有 τ6/ρ10/λ1 候选"
+        mv "$OUT" "$IT/r${r}_pt"; CAND="$IT/r${r}_pt/$(basename "$CAND")"
+        stage_reviewrun "$REQ" "$CAND" "$IT/r${r}.sse"
+        V=$(grep "REVIEW_VERDICT" "$LOGF" | tail -1)
+        LOG "第 $r 轮: $V"
+        case "$V" in *"content=$TRUTH "*) LOG "★第 $r 轮正文结论翻成 $TRUTH, 停★ ③ = $CAND"; break;; esac
+        stage_review "$REQ" "$IT/r${r}.sse" "$TRUTH" add; rc=$?
+        [ $rc = 0 ] || { LOG "第 $r 轮轨迹里没有新的错方向拍板(rc=$rc), 停"; break; }
+    done
+    LOG "REVIEWITER_DONE 产物 $IT"
+}
+
 case "${1:-all}" in
+  reviewiter) shift; stage_reviewiter "$@";;
+  review)  stage_review "${2:-}" "${3:-}" "${4:-}" "${5:-}";;
+  reviewrun) stage_reviewrun "${2:-}" "${3:-}" "${4:-}";;
   samples) stage_samples "${2:-}";;
   split)   stage_split;;
   capture) stage_capture "${2:-}";;

@@ -250,6 +250,19 @@ static int sft_run(ctx_t *c, ds4_engine *e, const char *list_path, const char *o
         if (!ids) { rc = -1; break; }
         if (nids > ntok_cap) { fprintf(stderr, "★第 %d 条 %d 行 > 取料缓冲 %d 行★\n", m + 1, nids, ntok_cap); free(ids); rc = -1; break; }
         c->layer = il; c->got = 0; c->n = nids;
+        /* ★部署同路取料★(2026-09-23): 最小的约束/决策行 = 提示最后一位(约束行从报告段前一行起取), 切分点 P = 它 + 1。
+         * 提示照生成路 CED 预填, 报告跑满解码器 —— 否则表量的是"提示也跑满解码器"那种部署里不存在的状态,
+         * 09-23 实撞: 按那种表解出的 ③ 在服务端一个字没翻(fable5 09-23 夜)。 */
+        int split = 0;
+        {
+            int nc0 = 0, nd0 = 0, mn = nids;
+            int *cr0 = rows_spec_parse(it[m].ctr, nids, &nc0), *dr0 = rows_spec_parse(it[m].dec, nids, &nd0);
+            for (int q = 0; cr0 && q < nc0; q++) if (cr0[q] < mn) mn = cr0[q];
+            for (int q = 0; dr0 && q < nd0; q++) if (dr0[q] < mn) mn = dr0[q];
+            free(cr0); free(dr0);
+            split = mn < nids ? mn + 1 : 0;
+        }
+        ds4_engine_v41_set_score_split(split);
         ds4_engine_v41_set_amp_dir(c->base_amp);
         ds4_engine_v41_set_posttrain_dir(c->base_pt);
         ds4_engine_v41_set_moe_hook(hook, c);
@@ -270,6 +283,7 @@ static int sft_run(ctx_t *c, ds4_engine *e, const char *list_path, const char *o
         }
         const double tf = now_s();
         const int frc = ds4_engine_v41_score_ids(e, ids, nids, "/dev/null", no_engram, 0);
+        ds4_engine_v41_set_score_split(0);
         ds4_engine_v41_set_moe_hook(NULL, NULL);
         ds4_engine_v41_set_score_aux(NULL, NULL, 0, NULL, 0);
         if (c->verify_pref) {   /* 验证模式: 出完表就下一条, 不累积不解算 */
@@ -281,7 +295,9 @@ static int sft_run(ctx_t *c, ds4_engine *e, const char *list_path, const char *o
         }
         c->t_fwd += now_s() - tf;
         free(ids);
-        if (frc != 0 || c->got != nids) { fprintf(stderr, "★第 %d 条取料失败(rc=%d, %d/%d 行)★\n", m + 1, frc, c->got, nids); rc = -1; break; }
+        /* CED 块不过 L39(没有钩子行), 所以只要求"提示最后一位起"全部取到; 末个提示块跑满解码器, 会多给几行, 不少就行 */
+        const int need_rows = split ? nids - (split - 1) : nids;
+        if (frc != 0 || c->got < need_rows) { fprintf(stderr, "★第 %d 条取料失败(rc=%d, %d 行 < 需要 %d)★\n", m + 1, frc, c->got, need_rows); rc = -1; break; }
         ds4_etgd tk;
         if (ds4_etgd_read(it[m].top, &tk)) { rc = -1; break; }
         if (tk.n < nids) { fprintf(stderr, "★第 %d 条 top-K 表 %d 行 < ids %d 行 —— 不是同一条序列的产物★\n", m + 1, tk.n, nids); ds4_etgd_free(&tk); rc = -1; break; }
@@ -345,7 +361,10 @@ static int sft_run(ctx_t *c, ds4_engine *e, const char *list_path, const char *o
     /* 槽位没写满是正常的(有些行取不到可比的两个 token), 但要把"没写过的槽"剔掉: 决策拟合段
      * [wf, ndec_fit) 与 val 段 [wv, tot_dec) 里面是垃圾, 解算照样跑得出一个数。做法是把三段
      * 压实成连续的 [0, wf) + [ndec_fit, wv) + [tot_dec, wc) → 重排到 [0, nfit+nval+nctr)。 */
-    if (rc == 0 && (!inited || wf < 4)) { fprintf(stderr, "★可用决策点太少(%d), 不解★\n", wf); rc = -1; }
+    /* 门槛是 1 不是 4(2026-09-23 改): 当天复盘只有一条事实(大盘方向)时决策点就 1 个, 解它正是"拿当天复盘训练"
+     * 的本意。代价如实: val 段为空、尺 L 单折无决策方程(零解, 读数 = 基线), 这时候选只能看拟合与约束行保住率,
+     * 结论以挂 ③ 重跑原请求(reviewrun 段)为准。 */
+    if (rc == 0 && (!inited || wf < 1)) { fprintf(stderr, "★可用决策点 %d 个, 不解★\n", wf); rc = -1; }
     if (rc) { if (inited) mg_acc_free(&ab); return -1; }
     {
         const int nu = ab.nu, D = ab.D;

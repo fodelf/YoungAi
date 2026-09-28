@@ -37,18 +37,21 @@ struct v41_klt {
 
 #define CKC(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { fprintf(stderr, "★CUDA %s @%d: %s★\n", #x, __LINE__, cudaGetErrorString(e_)); return -1; } } while (0)
 
-/* fp4x32: 17 B/32 元素(ds4_quantfmt 的 type 43)。整份 [V][D] 在主机解到 f16 再一次上设备 ——
+/* 出口头按类型反量化(走 src/common 的 ds4_deq_bytes, 不在工具侧另抄一份): 09-22 现役换 v3 后 output.weight 是
+ * q4_K(type 12), 之前只认 fp4x32(type 43), 后训练解算在出口初始化就停车(09-23 实撞)。行跨度 = 总字节 / 行数,
+ * 除不尽 = 不是按行连续存的格式, 直接拒。整份 [V][D] 在主机解到 f16 再一次上设备 ——
  * 逐行上传 129280 次小拷贝比一次 1.3 GB 慢得多。 */
 static int klt_load_head(v41_klt *k, const ds4_gguf_tensor *t) {
-    const size_t V = (size_t)k->V, D = (size_t)k->D, nb = D / 32;
+    const size_t V = (size_t)k->V, D = (size_t)k->D;
     uint64_t nby = 0;
     const uint8_t *src = ds4_gguf_tensor_data(&k->g, t, &nby);
-    if (!src || nby != (uint64_t)V * nb * 17) { fprintf(stderr, "★output.weight 数据取不到或字节数 %llu ≠ %llu★\n", (unsigned long long)nby, (unsigned long long)((uint64_t)V * nb * 17)); return -1; }
+    if (!src || nby == 0 || nby % V) { fprintf(stderr, "★output.weight 数据取不到或字节数 %llu 不能按 %zu 行均分★\n", (unsigned long long)nby, V); return -1; }
+    const size_t rb = (size_t)(nby / V);
     __half *h = (__half *)malloc(V * D * sizeof(__half));
     float *row = (float *)malloc(D * 4);
     if (!h || !row) { fprintf(stderr, "★head 主机缓冲 %.1f GB 分配失败★\n", V * D * 2.0 / 1e9); return -1; }
     for (size_t v = 0; v < V; v++) {
-        ds4_deq_fp4x32(src + v * nb * 17, nb, row);
+        if (ds4_deq_bytes(t->type, src + v * rb, D, row)) { fprintf(stderr, "★output.weight type %u 反量化不支持★\n", t->type); free(row); free(h); return -1; }
         for (size_t d = 0; d < D; d++) h[v * D + d] = __float2half(row[d]);
     }
     free(row);
@@ -66,9 +69,9 @@ int v41_klt_open(v41_klt **out, const char *gguf_path, int D) {
     if (ds4_gguf_open(&k->g, gguf_path, err, sizeof err)) { fprintf(stderr, "★打不开 %s: %s★\n", gguf_path, err); free(k); return -1; }
     const ds4_gguf_tensor *W = ds4_gguf_find(&k->g, "output.weight"), *N = ds4_gguf_find(&k->g, "output_norm.weight");
     if (!W || !N) { fprintf(stderr, "★GGUF 缺 output.weight / output_norm.weight★\n"); return -1; }
-    if (W->nd != 2 || (int)W->ne[0] != D || W->type != DS4_GGT_FP4X32) {
-        fprintf(stderr, "★output.weight 形状/类型不对: nd %u ne0 %llu type %u(期 D=%d type=%d)★\n",
-                W->nd, (unsigned long long)W->ne[0], W->type, D, (int)DS4_GGT_FP4X32);
+    if (W->nd != 2 || (int)W->ne[0] != D) {
+        fprintf(stderr, "★output.weight 形状不对: nd %u ne0 %llu(期 D=%d)★\n",
+                W->nd, (unsigned long long)W->ne[0], D);
         return -1;
     }
     if (N->type != DS4_GGT_F32 || (int)N->ne[0] != D) { fprintf(stderr, "★output_norm.weight 不是 f32[%d]★\n", D); return -1; }
@@ -84,7 +87,7 @@ int v41_klt_open(v41_klt **out, const char *gguf_path, int D) {
         cudaMalloc((void **)&k->dDP, (size_t)KLT_BLK * k->V * sizeof(__half)) != cudaSuccess ||
         cudaMalloc((void **)&k->dG, (size_t)KLT_BLK * D * 4) != cudaSuccess) { fprintf(stderr, "★KL 靶设备缓冲分配失败★\n"); return -1; }
     if (cublasCreate(&k->cb) != CUBLAS_STATUS_SUCCESS) { fprintf(stderr, "★cublas 建不了★\n"); return -1; }
-    printf("[KL 靶] 出口头 %d×%d(fp4x32→f16 %.2f GB 常驻) + output_norm f32[%d]\n", k->V, D, (double)k->V * D * 2 / 1e9, D);
+    printf("[KL 靶] 出口头 %d×%d(type %u→f16 %.2f GB 常驻) + output_norm f32[%d]\n", k->V, D, W->type, (double)k->V * D * 2 / 1e9, D);
     *out = k;
     return 0;
 }
