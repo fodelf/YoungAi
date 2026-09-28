@@ -195,8 +195,9 @@ static bool v41_moe(const ds4_model *m, const ds4_layer_weights *l, ds4_v41_stat
     const uint32_t KU = st->draft ? g_ds4_v41.mtp_used : DS4_N_EXPERT_USED;
     /* ★shared 专家挂侧流, 与路由 + routed 专家并行(2026-09-23, 纯解码 n=1)★: 两支只共读 xn, 写 sg/su/sh/so 对 glog/sel/rw/专家暂存,
      * 原来串行。路由那一段(router GEMV + 单 block 的 router 核 + xpack)的延迟藏到 shared 三发 GEMV 后面。算式不变 ⇒ 逐字节同。
-     * 只开主干 n=1(草稿塔与预填/验证批另有暂存共用, 不动)。 */
-    const int fork = !st->draft && n == 1u && ds4_gpu_side_mark() && ds4_gpu_side_begin();
+     * 只开主干(草稿塔另有暂存共用, 不动)。★n ≤ DS4_V41_GEMV_MAX_TOK 都开(2026-09-24)★: 验证批两支同样只走 GEMV/逐元素核,
+     * routed 的 VQ 小批核用自己的暂存, 与 shared 三发不相交; n > 8 的预填 GEMM 路共用 bf16 暂存, 不分叉。 */
+    const int fork = !st->draft && n <= DS4_V41_GEMV_MAX_TOK && ds4_gpu_side_mark() && ds4_gpu_side_begin();
     if (fork) {
         if (!v41_tproj(m, st->sg, l->ffn_gate_shexp, E, FF, st->xn, n, 1) ||
             !v41_tproj(m, st->su, l->ffn_up_shexp, E, FF, st->xn, n, 1) ||

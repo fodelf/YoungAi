@@ -255,8 +255,11 @@ bool v41_attention(ds4_engine *e, ds4_v41_state *st, uint32_t il) {
     const uint64_t rowb = (uint64_t)HD * 4;
     /* ★kv 支挂侧流, 与 q 支并行(2026-09-23, 纯解码 n=1)★: 两支只共读 xn/pos, 各写各的(kv/kvn 对 qr/qrn/q), 原来串行 ——
      * kv 支 ~18 µs(kv GEMV + rms + rope + act_quant, 后三个是单/小 block 核)藏到 q_b(~107 µs)后面。算式与次序不变 ⇒ 逐字节同。
-     * 只开 n=1: 预填/验证批的 GEMM 路要用共享暂存, 两支同时跑会互相踩。进窗口环的那发拷贝没有流参数(落主流), 放到汇合之后。 */
-    const int fork = n == 1u && ds4_gpu_side_mark() && ds4_gpu_side_begin();
+     * 进窗口环的那发拷贝没有流参数(落主流), 放到汇合之后。
+     * ★放宽到 n ≤ DS4_V41_GEMV_MAX_TOK(2026-09-24, 投机验证批)★: 原来只开 n=1, 理由是"预填/验证批的 GEMM 路要用共享暂存"。
+     * 可 n ≤ 8 两支走的全是 GEMV(q4k/fp4/fp8 即乘)+ rms/rope/act_quant, 没有一个碰 g_v41_xbf 这类共享暂存 —— 只有 n > 8 的预填
+     * GEMM 路才转 bf16 进共享缓冲。验证批(1+k ≤ 6 行)因此一直串行, 比纯解码多付 ~3 ms 截距。n > 8 仍不分叉。 */
+    const int fork = n <= DS4_V41_GEMV_MAX_TOK && ds4_gpu_side_mark() && ds4_gpu_side_begin();
     /* 窗口 kv: wkv → bf16 → kv_norm → rope(末 64 维) → fp8 act_quant(按 32 块) → 进窗口缓冲的后 n 行 */
     if (!v41_tproj(m, st->kv, l->attn_kv, E, HD, st->xn, n, 1) ||
         !ds4_gpu_v41_rms_norm_tensor(st->kvn, st->kv, m->map, m->size, l->attn_kv_a_norm->abs_offset, HD, n, DS4_RMS_EPS) ||

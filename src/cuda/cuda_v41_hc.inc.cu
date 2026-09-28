@@ -52,12 +52,17 @@ __global__ static void v41_scale_rows_kernel(float *y, const float *inv, uint32_
  * ★逐位同★: 每个 warp 算的段一个字没变(同 kpart 同顺序), 最后那 32 项还是按 0..31 升序加; rms 前奏每个 block 各算一遍,
  * 形状与原来一样(1024 线程走 i, i+1024, … 再 1024 槽树归约), 所以 inv 逐位同。
  * 计数器由最后那个 block 归零, 首次分配时清零一次(发射端)。 */
+/* ★验证批: token 循环挪进 block(2026-09-24)★
+ * 病: 原来 grid = (48, n_tok), 1024 线程的 block 每 SM 只挂一个 ⇒ 验 4 行就是 4 波串行, 同一行 W 每个 token 各读一遍;
+ * 直发实测一发 n=1 26 µs / n=4 32 µs, 验证批 80 发 2.57 ms 对纯解码 1.16。
+ * 改: grid 只按行 × 段(48 个 block), 每个 block 把 W 段读进寄存器一次, 再按 t 升序对每个 token 做同一套 ①②③。
+ * ★逐位同★: 每个 token 的 rms 归约形状、段点积次序、32 项段和升序相加都与原来一字不差, 只是换了哪个 block 在什么时候算;
+ * n=1 就是原核。门 = 投机 == 纯解码逐字节(同轨)与纯解码输出 cmp。 */
 #define V41_HC_MIX_SPLIT 2u
 __global__ static void v41_hc_mix_fused_kernel(float *mix, float *part, uint32_t *ctr, const float *w, const float *hc,
-                                               uint32_t dim, uint32_t out_dim, float eps, uint32_t ksplit, uint32_t nsplit) {
-    const uint32_t t = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
+                                               uint32_t dim, uint32_t out_dim, float eps, uint32_t ksplit, uint32_t nsplit, uint32_t n_tok) {
+    const uint32_t warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
     const uint32_t r = blockIdx.x / nsplit, sp = blockIdx.x % nsplit, kper = ksplit / nsplit;
-    const float *x = hc + (uint64_t)t * dim;
     __shared__ float sh[1024];
     __shared__ uint32_t s_last;
     /* ★W 先发, 再做 ①(2026-09-23)★: 原来 ① 整段(读 82 KB hc + 1024 槽树归约 + 十几次全体屏障)做完才开始读 W, 每发 16.5 µs
@@ -76,6 +81,8 @@ __global__ static void v41_hc_mix_fused_kernel(float *mix, float *part, uint32_t
         if (act && c0 + i * cst < dim) wpre[i] = *(const float4 *)(wr + c0 + i * cst);
     }
     v41_pdl_wait();   /* PDL: W(常量)已在飞, 这里才等上游的 hc(见 cuda_internal.cuh) */
+    for (uint32_t t = 0; t < n_tok; t++) {   /* 块内按 token 升序; 下面整段与单 token 版逐字同, 只多一层缩进的循环 */
+    const float *x = hc + (uint64_t)t * dim;
     /* ① 逐字照抄 v41_row_rsqrt_kernel 的累加形状; ★读法改成 10 个一批先发(2026-09-23)★: 原循环边界是运行期值, 编译器
      * 不展开, 每线程 20 次 L2 读一次一个往返串行排队(~6 µs)。现在一批 10 个一起发、再按 i 升序加 ⇒ 累加序不变, 逐位同。 */
     {
@@ -123,6 +130,9 @@ __global__ static void v41_hc_mix_fused_kernel(float *mix, float *part, uint32_t
         mix[(uint64_t)t * out_dim + r] = v * inv;   /* ③ 原来那一发 scale_rows 就是这一次乘法 */
         ctr[(uint64_t)t * out_dim + r] = 0u;
     }
+    /* 下一个 t 改写 sh/s_last 之前不用再加屏障: 本轮所有线程读 sh[0](inv)与 s_last 都在上面两道 __syncthreads 之前或之间,
+     * 而下一轮第一次写 sh 在它自己的 ① 里、s_last 在 fence 后那道屏障之后 —— 谁也追不上谁。 */
+    }
 }
 static v41_scratch g_v41_hc_part, g_v41_hc_ctr;
 
@@ -149,8 +159,8 @@ int ds4_gpu_v41_hc_mix_tensor(ds4_gpu_tensor *mix, const ds4_gpu_tensor *hc, con
             if (!part || !ctr) return 0;
             if (fresh && !cuda_ok(cudaMemsetAsync(ctr, 0, (size_t)npart * 4, g_cur_stream ? g_cur_stream : cudaStreamPerThread), "v41 hc mix ctr zero")) return 0;
             v41_pdl_register((const void *)v41_hc_mix_fused_kernel);   /* 核在碰 hc/part/ctr 之前 v41_pdl_wait */
-            v41_hc_mix_fused_kernel<<<dim3(mix_hc * V41_HC_MIX_SPLIT, n_tok), 1024, 0, g_cur_stream>>>(
-                (float *)mix->ptr, part, ctr, W, (const float *)hc->ptr, dim, mix_hc, eps, 32u, V41_HC_MIX_SPLIT);
+            v41_hc_mix_fused_kernel<<<mix_hc * V41_HC_MIX_SPLIT, 1024, 0, g_cur_stream>>>(
+                (float *)mix->ptr, part, ctr, W, (const float *)hc->ptr, dim, mix_hc, eps, 32u, V41_HC_MIX_SPLIT, n_tok);
             return cuda_ok(cudaGetLastError(), "v41 hc mix fused");
         }
     }
