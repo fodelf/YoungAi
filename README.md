@@ -42,14 +42,15 @@ is not re-explained here — read the official release for that.
 
 ## 1. The numbers
 
-Measured on one DGX Spark with the deployed pair ① base + ② finance sidecar, 2026-09-21 → 09-24.
+One DGX Spark, ① base + ② the sidecar of the domain being measured.
 
 | | |
 |---|---|
 | Resident in memory | 113.6 GB model + ~40 MB sidecar (≈ 1.6 bits per weight over the whole file) |
 | Left on SSD, untouched | the model's 203 GB n-gram memory tables, original FP8, ~6 KB read per token |
-| **Restore rate Σmin** — finance / general English | **0.745 / 0.790** |
-| **Same top-1 as the original** — finance / general English | **74.6% / 81.1%** |
+| **Restore rate Σmin** — finance / code / law / medicine / science | **0.745 / 0.803 / 0.760 / 0.739 / 0.753** |
+| **Same top-1 as the original** — finance / code / law / medicine / science | **74.6% / 82.3% / 76.4% / 72.8% / 74.9%** |
+| General English (WikiText-2) with any one of the five sidecars | Σmin **0.787–0.801**, Same top-1 **80.7–82.8%** (bare base 0.769 / 78.5%) |
 | **Prefill**, 12.5k-token prompt | **489 tokens/s** |
 | **Decode**, plain greedy | **30.7 tokens/s** at short context · 29 tokens/s at 14k context |
 | **Decode**, speculative (on by default at temperature 0) | **43.0 tokens/s** on a real 14k-token agent request · **37.1 tokens/s** on a request never used for tuning |
@@ -68,21 +69,19 @@ Each conviction below is stated first, then backed by what we measured, then tie
 ### 2.1 Every domain hides a strongly correlated regularity — find it, and a few megabytes restore a lot
 
 **Claim.** From the point of view of one domain, quantization damage is not uniform noise. Text from
-one domain (Chinese finance, in our case) exercises a narrow set of directions, and the error along
-those directions can be learned from a few thousand tokens. Fixing it restores more capability per
-byte than adding bits to the weights ever could.
+one domain exercises a narrow set of directions, and the error along those directions can be learned
+from a few thousand tokens. Fixing it restores more capability per byte than adding bits to the
+weights ever could.
 
 **What we measured.**
 
-- **Same-domain vs mixed-domain.** A correction fitted and judged on finance removed **15.8%** of the
-  held-out layer error; the identical procedure on an eight-domain mix removed **2.3%** — seven times
-  less. Our earlier DeepSeek V4 work showed the same diagonal: a domain's own correction recovered
-  28.5–51.6% on its own text versus 10–12% for a Wikipedia proxy.
-- **Transfer without harm.** The first full sidecar, fitted on 8,192 finance tokens, lifted Same top-1
-  by **+3.1 pp on finance, +2.3 pp on the eight-domain mix, +1.6 pp on English Wikipedia**. It helps
-  its own domain most and does not hurt general text.
-- **Leverage.** +3.1 pp is what roughly 0.15 extra bits per weight would buy on our bit-width curve —
-  about 11 GB of extra expert storage. The sidecar that delivered it is **38.6 MB**.
+- **Five domains, one recipe.** Finance, code, law, medicine and science each get a sidecar from the
+  same solver. On its own held-out text each sidecar lifts Same top-1 by **+2.8 to +3.7 pp** and cuts
+  mean KL by **16–28%** (tables in [§5.1](#51-quality)).
+- **No harm to general text.** On English Wikipedia every one of the five sidecars raises Same top-1
+  from 78.5% to **80.7–82.8%** and Σmin from 0.769 to **0.787–0.801**.
+- **Leverage.** +3 pp is what roughly 0.15 extra bits per weight would buy on the bit-width curve —
+  about 11 GB of extra expert storage. The sidecar that delivers it is about **40 MB**.
 
 **What we built.** A base that never sees domain data, plus a small per-domain sidecar
 ([§4.2](#42-the-domain-sidecar-反修)).
@@ -101,8 +100,8 @@ it costs.
   differ by **3%** in Σw²; the three matrices of an expert split **33.5 / 33.3 / 33.2**. Moving one bit
   from group B to group A pays only when A is at least **1.189×** more important, because each extra
   bit per 8 weights multiplies the error by 1/1.189 (measured 0.201 / 0.171 / 0.143 at 11 / 12 / 13 bits).
-  Nothing crosses that line, so the optimal "dynamic" allocation is simply uniform. We had built
-  dynamic per-layer and per-expert allocation earlier; it bought nothing.
+  Nothing crosses that line, so the optimal "dynamic" allocation is simply uniform; implemented
+  per-layer and per-expert allocation measures no gain.
 - **Routing is hash-like.** After quantization, the share of tokens whose 6 chosen experts exactly match
   the original drops to 1.6–28% in the middle and deep layers, and a per-expert systematic bias explains
   only 3–22% of the flips — the rest is per token. Consecutive tokens barely share experts: 1, 2, 3, 4,
@@ -128,10 +127,10 @@ enough out of the box, and quantization fidelity cannot fix that: a perfect copy
 inherits the original's mistakes. The model has to learn from its own deployment, and that data
 (positions, reviews, source code) should never leave the machine.
 
-**What we saw.** Our test bed is a trading-agent pipeline served by ds4: market outlook, news merging,
-stock picking and CFO decision reports, with prompts from 9k to 132k tokens. In its logs, **12 of 12**
-target prices the model set were above the next day's actual high. On one market-outlook request the
-model reasoned its way to "market up"; that day 1,891 stocks rose and 3,563 fell.
+**What we measured.** Test bed: a trading-agent pipeline served by ds4 (market outlook, news merging,
+stock picking, CFO decision reports; prompts of 9k–132k tokens). **12 of 12** target prices the model set
+were above the next day's actual high. On one market-outlook request the model concluded "market up";
+that day 1,891 stocks rose and 3,563 fell.
 
 **What we built.** A third file, solved on the machine from the day's own requests and stacked on top
 without touching ① or ② ([§4.3](#43-the-post-training-file)). The mechanism works; it does not yet
@@ -204,8 +203,8 @@ codebook per expert (slightly *better*), layer 39 +0.33%, +0.15% on average. It 
 codebooks — **3.09 GB**. The pool size matters: a pool 4× thinner lost 0.96% on 13-bit layers.
 
 **FP8 (E4M3) codewords.** Storing codewords as E4M3 costs +0.12% error and halves lookup bytes. The
-decoder must use the hardware conversion (`cvt.rn.f16x2.e4m3x2`, sm_89+). Our first version called a
-scalar converter — bit-exact, but decoding got 26% slower and prefill 20% slower.
+decoder must use the hardware conversion (`cvt.rn.f16x2.e4m3x2`, sm_89+); a scalar converter is
+bit-exact but 26% slower in decode and 20% slower in prefill.
 
 **Where the saved 3.09 GB goes: the 14 shallowest layers move from 12 to 13 bits** (error −16.1%).
 The error curve is convex (removing a bit costs 5.3 pp, adding one gains 2.6–3.7 pp), so extra bytes
@@ -222,8 +221,8 @@ plane: one extra 32-bit load per block and one warp shuffle per round.
 versions. An engine that does not know a format refuses the file at load; one that predates the
 whitelist outputs all-zero experts from the first sentence. Neither can produce plausible garbage.
 
-**Zero corpus.** The base is quantized from the weights alone. We tried finance-weighted calibration:
-finance flat, general text −2.4 pp. Domain knowledge belongs in ②, not in ①.
+**Zero corpus.** The base is quantized from the weights alone. Finance-weighted calibration leaves
+finance flat and costs general text 2.4 pp: domain knowledge belongs in ②, not in ①.
 
 **What the 113.56 GB is made of.**
 
@@ -236,10 +235,9 @@ finance flat, general text −2.4 pp. Domain knowledge belongs in ②, not in �
 | Speculative draft towers | VQ-8, 12 bit | 2.56 |
 | Everything else | as shipped | 0.85 |
 
-**Evidence.** Against our previous base of the same size (one codebook per expert, all layers 12-bit):
-Same top-1 **+1.9 pp** (finance), **+1.8–2.0 pp** (eight domains), **+2.5 pp** (English); the worst 5% of
-positions improved most (Σmin p5 +22% / +27% / +83%). The base alone now beats the previous base *with*
-its sidecar on English text.
+**Evidence.** Against a same-size baseline (one codebook per expert, all layers 12-bit): Same top-1
+**+1.9 pp** (finance) and **+2.5 pp** (English); the worst 5% of positions gain most (Σmin p5 +22% /
++83%). On English, the base alone beats that baseline *with* its sidecar.
 
 ### 4.2 The domain sidecar (反修)
 
@@ -250,13 +248,11 @@ sidecar is a directory of amplifier files.
 projection, plus one router bias per expert, so that each quantized MoE block reproduces the original
 block's output on domain text.
 
-**Intuition, starting from the dead end.** Our first sidecars added a low-rank correction at the block
-output, `y += B·A·x`. It removed 9% of held-out layer error on average — and made end-to-end metrics
-*worse*. A step-size scan settled why: any correction that is a linear function of the block input has
-≈ 0 first-order effect at the model's output. A per-expert gain escapes this. The correction it injects,
-`Δ = Σ_e rw_e · (s_e − 1) ⊙ y_e`, depends on which experts the router picked and on each expert's own
-hidden state, so it is *not* a linear function of x. The first three layers solved this way gave the
-first positive end-to-end result of the whole project.
+**Why gains, not an additive correction.** A correction that is a linear function of the block input,
+such as a low-rank `y += B·A·x`, has ≈ 0 first-order effect at the model's output: it removes 9% of
+held-out layer error and still makes end-to-end metrics worse (confirmed by a step-size scan). A
+per-expert gain injects `Δ = Σ_e rw_e · (s_e − 1) ⊙ y_e`, which depends on which experts the router
+picked and on each expert's own hidden state — *not* a linear function of x — and it does move the output.
 
 **The objective, per layer.**
 
@@ -268,7 +264,8 @@ min_s   Σ_i ‖ y_i − y_i^orig ‖²   +   λ · Σ_d  d̄_d · Σ_e ( s_e[d]
 ```
 
 - `y^orig` is the original model's output of the same block at the same token, from a teacher fixture:
-  DeepSeek's code at full precision, 40 layers × 8,192 tokens, 14 GB, written once per fitting corpus.
+  DeepSeek's code at full precision, 40 layers × every fitting token, written once per fitting corpus
+  (14 GB for 8,192 tokens).
 - The gains are diagonal, so the 5,120 output channels are independent; each is a least-squares problem
   with 384 unknowns.
 - It is solved by per-expert **Gauss–Seidel** (3 sweeps). Each expert touches only the ~128 rows routed
@@ -286,11 +283,11 @@ min_s   Σ_i ‖ y_i − y_i^orig ‖²   +   λ · Σ_d  d̄_d · Σ_e ( s_e[d]
   sees exactly the upstream it will see in deployment.
 - Per layer: solve the router bias Δb, mount it, recapture, then solve the gains.
 - `λ ∈ {0.01, 0.1, 1, 10, 100, 1000}` is chosen on held-out rows only. Held-out is stratified by source
-  window (every 4th 128-token window, 2,048 of 8,192 tokens), so every sub-source appears on both sides.
+  window (every 4th 128-token window, a quarter of the tokens), so every sub-source appears on both sides.
 - **A layer is mounted only if its held-out gain exceeds 0.5%.** This is a significance gate, not a size
   limit: picking the best of six λ values produces a small positive number even on pure noise, and in a
-  sequential chain one noise layer corrupts every layer after it. We verified it end to end: mounting
-  every layer with a positive gain was worse on all four metrics.
+  sequential chain one noise layer corrupts every layer after it. End to end, mounting every layer with a
+  positive gain is worse on all four metrics.
 
 **FP4 lattice-direct solve.** Gains are stored in FP4 (E2M1, one scale per 32). Solving in float and
 rounding afterwards would throw away 11% of the correction, because E2M1 has only 8 magnitudes. So each
@@ -309,12 +306,19 @@ write the layer only if held-out strictly improves. Δb is added to the selectio
 weights are untouched. The original routing is recomputed from the fixture's full-precision inputs with
 the model's own bf16 router; the recomputation must match the engine's choice on ≥ 99% of rows.
 
-**Cost.** Current finance sidecar: gains on 39 layers + router bias on 27 layers, ≈ 40 MB. Fitting on
-the Spark: 27 min for the teacher fixture (once per corpus) + 73 min for the 40-layer solve.
+**Cost.** Same solver, same gates, one run per domain on the Spark:
 
-**Evidence** (paired, same binary, same run; full tables in [§5.1](#51-quality)). Gains: finance
-71.7 → 73.9%. Router bias on top, gains held fixed: finance +0.24 pp and KLD −2.5%, English +0.78 pp and
-KLD −3.8%.
+| Sidecar | Fitting corpus | Gains / router bias | Size | Teacher fixture + 40-layer solve |
+|---|---|---|---:|---|
+| finance | 8,192 tokens, five Chinese-finance sources | 39 / 27 layers | 40.8 MB | 27 + 73 min |
+| code | 15,360 tokens, 30 programming languages × 512 | 39 / 29 layers | 40.8 MB | 31 + 124 min |
+| law | 15,360 tokens, 6 sources × 2,560 (3 Chinese, 3 English) | 40 / 24 layers | 41.8 MB | 31 + 104 min |
+| medicine | 15,360 tokens, 6 sources × 2,560 (3 Chinese, 3 English) | 40 / 29 layers | 41.8 MB | 32 + 115 min |
+| science | 15,360 tokens, 6 sources × 2,560 (3 Chinese, 3 English) | 40 / 29 layers | 41.8 MB | 32 + 104 min |
+
+**Evidence** (Same top-1, paired runs; full tables in [§5.1](#51-quality)). Finance: gains 71.7 → 73.9%;
+router bias on top, gains held fixed, +0.24 pp and KLD −2.5% (English +0.78 pp, KLD −3.8%). With each
+domain's own sidecar: code 78.6 → 82.3%, law 72.9 → 76.4%, medicine 69.1 → 72.8%, science 71.7 → 74.9%.
 
 ### 4.3 The post-training file
 
@@ -322,17 +326,17 @@ KLD −3.8%.
 equation on last-layer expert gains, solve all such equations together while pinning everything else,
 and store the result as a third gain table.
 
-**Why not ordinary fine-tuning gradients.** Our first version used the SFT loss gradient as the target
-and moved nothing (held-out +0.04%). The loss gradient is a dense direction set by the target token's
-embedding, while per-expert gains can only reweight expert outputs channel by channel: the two are
-nearly orthogonal. What decides whether a decision flips is one scalar — the margin between two logits —
+**Why not ordinary fine-tuning gradients.** With the SFT loss gradient as the target the gains do not
+move (held-out +0.04%). The loss gradient is a dense direction set by the target token's embedding,
+while per-expert gains can only reweight expert outputs channel by channel: the two are nearly
+orthogonal. What decides whether a decision flips is one scalar — the margin between two logits —
 and that is exactly linear in the last MoE layer's output.
 
 **The formulation.**
 
 - **Decision point i:** a position where the right token `a` should beat the strongest *other* token `b`.
-  (Not "the token the wrong version wrote": 81% of those were already beaten, and the argmax went to a
-  third token.)
+  (Not "the token the wrong answer wrote": in 81% of cases that token is already beaten and the argmax
+  is a third token.)
 - **Margin** `m_i = ℓ_a − ℓ_b`. Holding the output RMSNorm factor `inv_i` fixed, a change `Δ` of the last
   layer's output moves the margin by `α_i · inv_i · Σ_d γ_d (W_a − W_b)_d · Δ_d` (γ = norm weight,
   W = output head), and `Δ` is linear in the gain table.
@@ -343,17 +347,16 @@ and that is exactly linear in the last MoE layer's output.
 - **FP4-aware:** quantize the solution to the lattice, re-predict with the stored values, put decision
   points that fell back below τ into an active set, solve again.
 - **Capture on the deployment path.** Margins must be measured where the decision is actually made:
-  prompt through prefill, generated text through the decode path (`--score-split P`). Captured on the
-  prefill path alone, a solve flipped the decision when scoring but not in real generation.
+  prompt through prefill, generated text through the decode path (`--score-split P`). A solve captured on
+  the prefill path alone flips the decision when scoring but not in generation.
 - **Safety:** ③ is its own directory, multiplied with ② at load, fingerprinted against ②; candidates
   that fail a gate are moved to `rejected/`, never deleted.
 
-**Evidence and status** — this is the least finished part; see [§8](#8-honest-status-and-limits).
-On the training day, decision points flipped **55% → 88%** (64 / 73) while **99.66%** of 3,268 other
-positions kept the same top-1; the solver's predicted margins correlate **0.9995** with a real forward.
-On a real market-outlook request, the trained decision token flips in actual generation
-("I lean towards predicting 'market down' … let me reconsider") — and ~6,000 characters later the model
-argues its way back to "up".
+**Evidence and status** — the least finished part; see [§8](#8-honest-status-and-limits). On the
+training requests, decision points flip **55% → 88%** (64 / 73) while **99.66%** of 3,268 other
+positions keep the same top-1; predicted margins correlate **0.9995** with a real forward. In free
+generation the trained decision token flips, but the model can reason its way back to the original
+conclusion ~6,000 characters later: one token moves one sentence, not a chain of reasoning.
 
 ### 4.4 The engine
 
@@ -382,8 +385,8 @@ speed-up must leave temperature-0 output byte-identical.
   memory before computing) and *pipe* (persistent, cp.async double buffering, for 4–12 KB groups).
   22.9 → 18.8 ms per token.
 - **Whole-step CUDA graph.** One capture per position bucket; the token position lives in a device slot,
-  so replay never re-captures. Scratch buffers are grown *before* capture — a growth attempt during
-  capture once made the server run a whole night without graphs (43.9 ms/token).
+  so replay never re-captures. Scratch buffers are grown *before* capture: an allocation inside capture
+  invalidates it, and without graphs a token costs 43.9 ms.
 - **Programmatic dependent launch.** 1,391 kernel edges: each kernel prefetches its constant weights,
   then waits for its producer.
 - **Side stream.** The attention KV branch and the shared expert run in parallel with the main chain.
@@ -419,8 +422,8 @@ The quality change (Σmin 0.7447 → 0.7430) is the same size as merely reorderi
   far more than verifying one. The verify batch runs at 57% of its own byte wall; that is the next lever.
 
 **Memory.** Weights are mmap-backed. Per-request state grows with the positions actually used: the 1M
-KV itself is 0.89 GB, and the per-forward scratch that used to be sized for 1M up front (2.5 GB) now
-grows by doubling (a 40k-token request uses 160 MB). There is no context knob — the bound comes from the
+KV itself is 0.89 GB, and the per-forward scratch grows by doubling instead of being sized for 1M up
+front (2.5 GB → 160 MB for a 40k-token request). There is no context knob — the bound comes from the
 GGUF metadata and `--ctx` is rejected.
 
 ### 4.5 How we measure
@@ -433,22 +436,27 @@ judge, and our engine is scored on the same path it serves.
 - **Student.** The engine's scoring path (`--score-ids`), same file format, one comparator
   (`anchor_metrics`) for everything.
 - **Five numbers.** Same top-1; Σmin (mean, median, p5); mean KL(original ‖ ours); PPL ratio. Σmin and KL
-  are primary. Same top-1 alone is lenient — easy text hides damage (one early recipe read 0.90 on easy
+  are primary. Same top-1 alone is lenient — easy text hides damage (the same file can read 0.90 on easy
   code and 0.52 on hard text).
-- **Disjoint slices.** `a` (8,192 tokens) fits sidecars, `j` (8,192 tokens) judges them; they never mix.
-  Rulers: finance `j` (five Chinese-finance sources), eight-domain `j` (academic, prose, code, European,
-  Cyrillic, math, Arabic, CJK), WikiText-2 512 tokens (English).
-- **Paired, one variable at a time.** Comparisons use the same binary in the same run. An earlier verdict
-  that "routing bias taxes general text" was retracted when a single-variable pair showed the opposite.
-- **Gates that exist because we got burned.**
+- **Disjoint slices.** Each domain's text is split into a fitting slice and a judging slice that never mix;
+  a source (a document, a code repository) lands on one side only.
+
+  | Ruler | Judging slice | Original model PPL |
+  |---|---|---:|
+  | finance | 8,192 tokens, five Chinese-finance sources | 6.978 |
+  | code | 15,360 tokens: 30 languages × 512 from GitHub (`codeparrot/github-code-clean`), license headers stripped | 4.766 |
+  | law | 15,360 tokens, 6 × 2,560: Chinese statutes, criminal-case facts (CAIL2018), bar-exam questions (JEC-QA); US Supreme Court opinions, EU legislation, contract clauses (LexGLUE) | 4.865 |
+  | medicine | 15,360 tokens, 6 × 2,560: Chinese medical encyclopedia Q&A, real doctor consultations (cMedQA2), licensing-exam questions with explanations (CMExam); PubMed abstracts, PMC case reports, USMLE questions (MedQA) | 8.625 |
+  | science | 15,360 tokens, 6 × 2,560: Chinese journal abstracts, STEM and humanities / social science (CSL), college STEM questions (C-Eval); arXiv LaTeX source, S2ORC full papers (peS2o), MMLU-Pro STEM questions | 8.770 |
+  | English | WikiText-2, 512 tokens | 1.657 |
+
+- **Paired, one variable at a time.** Comparisons use the same binary in the same run.
+- **Gates beyond the five numbers.**
   - Temperature-0 byte identity: direct launch == CUDA graph == replay, and speculative == plain.
-  - A format change must also pass decode-path checks. A 13-bit decode kernel once advanced its
-    bit-plane pointer by block index instead of group index: every generated token used wrong weights in
-    14 layers, while all five metrics — computed on the prefill path — stayed green. It looked exactly
-    like "the model repeats itself". After the fix, decode-path PPL went 8.19 → 5.80 and prefill/decode
-    disagreements 22 → 1.
-  - Never judge "it doesn't stop" under an output cap: a 16k cap once turned a normal 23,607-token
-    answer into an apparent loop.
+  - Format changes are also checked on the decode path. The five numbers are computed on the prefill path
+    and cannot see a decode-kernel fault: a 13-bit kernel advancing its bit-plane pointer by block instead
+    of group index leaves them green while decode-path PPL reads 8.19 instead of 5.80.
+  - Termination is judged without an output cap; a capped run can only show "not stopped yet".
 
 ---
 
@@ -456,27 +464,63 @@ judge, and our engine is scored on the same path it serves.
 
 ### 5.1 Quality
 
-Finance ruler (judge slice, 8,192 tokens; original model PPL 6.978):
+Each domain is judged on its own judging slice ([§4.5](#45-how-we-measure)): bare base vs the base with
+that domain's sidecar. Within a table all rows come from the same engine binary in one run, except rows
+marked ¹.
+
+**Finance** (judge slice, 8,192 tokens; original model PPL 6.978):
 
 | | Same top-1 | Σmin (median / p5) | Mean KL | PPL ratio |
 |---|---:|---|---:|---:|
 | ① base alone ¹ | 71.73% | 0.703 (0.751 / 0.231) | 0.612 | 1.339 |
-| ① + ② gains | 73.94% | 0.742 (0.810 / 0.276) | 0.522 | 1.282 |
-| **① + ② gains + router bias (deployed)** | **74.57%** | **0.745 (0.810 / 0.283)** | **0.512** | **1.267** |
+| ① + finance sidecar, gains only | 73.94% | 0.742 (0.810 / 0.276) | 0.522 | 1.282 |
+| **① + finance sidecar** | **74.57%** | **0.745 (0.810 / 0.283)** | **0.512** | **1.267** |
 
-English, WikiText-2 (512 tokens; original PPL 1.657):
+¹ Reference forward on the same file; engine vs reference on the same file differ by KL 0.013.
+Tensor-core prefill ([§4.4](#44-the-engine)) moves the finance-sidecar row to 74.48% / 0.743 / 0.516
+(rounding noise).
+
+**Code** (judge slice, 15,360 tokens = 30 languages × 512; original model PPL 4.766):
 
 | | Same top-1 | Σmin (median / p5) | Mean KL | PPL ratio |
 |---|---:|---|---:|---:|
-| ① base alone ¹ | 79.49% | 0.769 (0.952 / 0.067) | 0.692 | 1.797 |
-| ① + ② gains | 79.88% | 0.789 (0.967 / 0.096) | 0.612 | 1.645 |
-| **① + ② deployed** | **81.05%** | **0.790 (0.966 / 0.091)** | **0.604** | **1.649** |
+| ① base alone | 78.61% | 0.754 (0.809 / 0.318) | 0.421 | 1.367 |
+| **① + coding sidecar** | **82.26%** | **0.803 (0.872 / 0.402)** | **0.303** | **1.229** |
 
-Eight-domain mix, ① base alone ¹: Same top-1 67.91%, Σmin 0.690 (p5 0.259), KL 0.602, PPL ratio 1.359.
+**Law** (judge slice, 15,360 tokens = 6 sources × 2,560; original model PPL 4.865):
 
-¹ Reference forward on the same file; engine vs reference on the same file differ by KL 0.013.
-The 09-24 tensor-core prefill moves the deployed finance row to 74.48% / 0.743 / 0.516 (rounding noise,
-[§4.4](#44-the-engine)).
+| | Same top-1 | Σmin (median / p5) | Mean KL | PPL ratio |
+|---|---:|---|---:|---:|
+| ① base alone | 72.90% | 0.713 (0.773 / 0.206) | 0.578 | 1.358 |
+| **① + law sidecar** | **76.36%** | **0.760 (0.834 / 0.272)** | **0.454** | **1.251** |
+
+**Medicine** (judge slice, 15,360 tokens = 6 sources × 2,560; original model PPL 8.625):
+
+| | Same top-1 | Σmin (median / p5) | Mean KL | PPL ratio |
+|---|---:|---|---:|---:|
+| ① base alone | 69.08% | 0.683 (0.692 / 0.259) | 0.602 | 1.378 |
+| **① + medicine sidecar** | **72.82%** | **0.739 (0.767 / 0.325)** | **0.465** | **1.280** |
+
+**Science** (judge slice, 15,360 tokens = 6 sources × 2,560; original model PPL 8.770):
+
+| | Same top-1 | Σmin (median / p5) | Mean KL | PPL ratio |
+|---|---:|---|---:|---:|
+| ① base alone | 71.65% | 0.707 (0.726 / 0.282) | 0.537 | 1.259 |
+| **① + science sidecar** | **74.93%** | **0.753 (0.788 / 0.347)** | **0.422** | **1.173** |
+
+**General English** (WikiText-2, 512 tokens; original model PPL 1.657): the check that a domain sidecar
+does not cost general capability. The bare-base row reads identically in every run.
+
+| | Same top-1 | Σmin (median / p5) | Mean KL | PPL ratio |
+|---|---:|---|---:|---:|
+| ① base alone | 78.52% | 0.769 (0.950 / 0.065) | 0.694 | 1.797 |
+| ① + finance sidecar | 80.66% | 0.787 (0.965 / 0.083) | 0.619 | 1.658 |
+| ① + coding sidecar | 82.23% | 0.797 (0.972 / 0.103) | 0.584 | 1.644 |
+| ① + law sidecar | 82.81% | 0.800 (0.973 / 0.085) | 0.580 | 1.590 |
+| ① + medicine sidecar | 82.81% | 0.801 (0.976 / 0.102) | 0.599 | 1.592 |
+| ① + science sidecar | 82.62% | 0.800 (0.975 / 0.126) | 0.566 | 1.564 |
+
+At 512 positions one position is 0.2 pp: these rows read as "no regression", not as a gain.
 
 ### 5.2 Speed (one DGX Spark)
 
@@ -487,23 +531,7 @@ The 09-24 tensor-core prefill moves the deployed finance row to 74.48% / 0.743 /
 | Real agent request, 14.1k-token prompt, plain | — | 28.9–29.4 t/s |
 | Same request, speculative (default) | — | **43.0 t/s** (3.04 tokens per round) |
 | Request never used for tuning, 9.2k prompt, speculative | — | **37.1 t/s** |
-| 51k context, plain (09-23 build) | — | 27.5 t/s |
-
-### 5.3 How we got here
-
-| Date (2026) | Step | Result |
-|---|---|---|
-| 09-11 | First VQ file, experts at 1.5 bits/weight | Σmin 0.746 on English (experts only) |
-| 09-12 | Engine runs V4.1 end to end | first token; decode 6.8 t/s |
-| 09-13 | Sidecar switches to per-expert gains | finance 68.95 → 72.08% |
-| 09-14 | FP4 lattice-direct sidecar | 291 MB → 38.6 MB, 72.18% |
-| 09-15 | Prefill rewrite | 58.9 → 348.5 t/s (later traded to ~209 when a 4-bit activation path was retired for quality) |
-| 09-18 | Whole-step CUDA graph | 12k-context decode 21.9 → 25.4 t/s |
-| 09-20 | q4_K projections, 12-bit experts, gains | finance 73.19% |
-| 09-21 | Shared E4M3 codebooks, 13-bit shallow layers, router bias | finance 74.57%, English 81.05%, file 0.12 GB smaller |
-| 09-22 | 13-bit decode-kernel bug fixed | the "repetition" disappears |
-| 09-23 | GEMV rewrite, PDL, side stream | server decode 22.8 → 30.0 t/s |
-| 09-24 | Tensor-core prefill, verify-batch kernels, speculative on by default | prefill 489 t/s, decode 43.0 t/s |
+| 51k context, plain | — | 27.5 t/s |
 
 ---
 
@@ -523,7 +551,7 @@ Negative results carry as much of the design as positive ones. Each row was meas
 | Entropy-constrained VQ + variable-length streams | ≈ +0.1 bit net after stream overhead | Not worth it |
 | Finance-calibrated base | Finance flat, general text −2.4 pp | Base stays zero-corpus |
 | Draft vocabulary cut to finance terms | +0.2% to −54% on an unseen request | Rejected |
-| Grouped multi-token expert kernel for verification | Halves codebook lookups, 0 ms saved | Rejected (fourth time) |
+| Grouped multi-token expert kernel for verification | Halves codebook lookups, 0 ms saved | Rejected |
 | Second machine for decoding | Layer split −19% (upstream); tensor parallel 1.25× | One box |
 
 ---
@@ -539,21 +567,64 @@ Negative results carry as much of the design as positive ones. Each row was meas
 - ~320 GB of local SSD: 113.6 GB for this repository + 203 GB for two official shards (below).
 - Nothing else heavy running: the engine refuses to start if it cannot fit the 110 GB budget.
 
+**One command.** On the Spark:
+
+```sh
+curl -fsSLO https://huggingface.co/wenzhouwu/YoungAi-DeepSeek-V4.1-Flash/resolve/main/install.sh
+bash install.sh
+```
+
+It checks the machine (GPU, CUDA 13 libraries, memory, disk), downloads this repository and the two official
+shards (~317 GB), assembles the base model, starts the server on `127.0.0.1:8000` with the finance sidecar
+under a memory watchdog, and prints the answer to a one-line test question. Everything goes under `--dir`;
+no `sudo`. Interrupted? Run the same command again: finished files are skipped and the assembly resumes
+where it stopped.
+
+```sh
+bash install.sh --domain code                             # install and serve with the coding sidecar
+bash install.sh stop && bash install.sh start --domain finance   # switch domains (all sidecars are already local)
+```
+
+| Option | Effect |
+|---|---|
+| `--domain finance \| code \| law \| medicine \| science \| none` | which ② sidecar the server loads (default `finance`; `none` = bare base) |
+| `--dir DIR` | install directory (default `~/youngai`) |
+| `--engram-dir DIR` | you already have `model-00047-of-00048.safetensors` and `model-00048-of-00048.safetensors` from the official checkpoint in DIR: use them in place, skip the 203 GB download |
+| `--host 0.0.0.0` / `--port N` | serve your LAN / another port |
+| `--endpoint https://hf-mirror.com` | download through a mirror |
+| `--no-xet` | download over the plain LFS channel (if transfers keep failing with "peer closed connection") |
+| `--posttrain` | also load the experimental post-training file (finance only) |
+| `--no-start` | install only; later `bash install.sh start`, `stop`, `status` |
+
+The steps below are what the script does, for doing it by hand.
+
 **Files in this repository.**
 
 | Path | What |
 |---|---|
-| `DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf` | ① base, 113,556,639,424 bytes |
+| `DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part01-of-40` … `part40-of-40` | ① base, 113,556,639,424 bytes, split into 40 parts |
+| `SHA256SUMS` | sha256 of the assembled base and of every part |
+| `install.sh` | the one-command installer above |
 | `DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-vqfin41_vqhalf_a_n8192-engine/` | ② finance sidecar: `gr_Lnn.bin` (gains, 39 layers) + `rb_Lnn.bin` (router bias, 27 layers) + `manifest.txt` (per-layer λ and held-out gain) |
+| `DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-code_fit_n15360-engine/` | ② coding sidecar, same layout: gains on 39 layers, router bias on 29 layers |
+| `DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-law_fit_n15360-engine/` | ② law sidecar: gains on 40 layers, router bias on 24 layers |
+| `DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-med_fit_n15360-engine/` | ② medicine sidecar: gains on 40 layers, router bias on 29 layers |
+| `DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-sci_fit_n15360-engine/` | ② science sidecar: gains on 40 layers, router bias on 29 layers |
 | `posttrain-experimental-20260924/` | ③ an experimental post-training file: `gr_L39.bin` + `base.fnv` (see below) |
 | `bin/ds4`, `bin/ds4-server` | engine binaries, built on the Spark with `make cuda-spark` |
 | `LICENSE`, `LICENSE-DeepSeek` | MIT notices for the engine (incl. GGML) and for the model weights |
 
-**Step 1 — download.**
+**Step 1 — download and assemble.** By hand this needs 227 GB free during assembly (the installer needs one
+part's worth, because it appends and deletes one part at a time).
 
 ```sh
 hf download wenzhouwu/YoungAi-DeepSeek-V4.1-Flash --local-dir ds4-v41
-chmod +x ds4-v41/bin/ds4 ds4-v41/bin/ds4-server
+cd ds4-v41
+sha256sum -c --ignore-missing SHA256SUMS            # every part must report OK
+cat DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part{01..40}-of-40 > DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf
+sha256sum -c --ignore-missing SHA256SUMS            # now the assembled .gguf reports OK too
+rm DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.part*-of-40
+chmod +x bin/ds4 bin/ds4-server                      # downloads do not keep the executable bit
 ```
 
 **Step 2 — the n-gram memory tables.** They are not in this repository: the engine reads them, untouched,
@@ -564,25 +635,21 @@ hf download deepseek-ai/DeepSeek-V4.1-Flash \
     model-00047-of-00048.safetensors model-00048-of-00048.safetensors --local-dir /data/DeepSeek-V4.1-Flash
 ```
 
-The GGUF records these two shards by **absolute path** —
-`/home/fodelf/ds4-main/hf/DeepSeek-V4.1-Flash/model-0004{7,8}-of-00048.safetensors` — and the engine has no
-option to change it. Make that path point at your copy:
-
-```sh
-sudo mkdir -p /home/fodelf/ds4-main/hf
-sudo ln -s /data/DeepSeek-V4.1-Flash /home/fodelf/ds4-main/hf/DeepSeek-V4.1-Flash
-```
-
-Skip this and the engine stops at load with `ds4: engram 表打不开 /home/fodelf/…` ("cannot open engram
-table").
+Any folder works; tell the engine where it is with `--engram-dir` (next step). The GGUF itself only records the
+path these shards had on the machine that built it, which does not exist on yours — without `--engram-dir` the
+engine warns at load and stops at the first request with `ds4: engram 表打不开 …` ("cannot open engram table").
 
 **Step 3 — serve.**
 
 ```sh
 cd ds4-v41
-./bin/ds4-server --cuda -m DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf \
-    --zchain DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-vqfin41_vqhalf_a_n8192-engine \
-    --mem-budget-mb 110000 --host 0.0.0.0 --port 8000
+SIDECAR=DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-vqfin41_vqhalf_a_n8192-engine    # finance
+# SIDECAR=DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-code_fit_n15360-engine         # code
+# SIDECAR=DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-law_fit_n15360-engine          # law
+# SIDECAR=DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-med_fit_n15360-engine          # medicine
+# SIDECAR=DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-sci_fit_n15360-engine          # science
+./bin/ds4-server --cuda -m DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf --zchain $SIDECAR \
+    --engram-dir /data/DeepSeek-V4.1-Flash --mem-budget-mb 110000 --host 0.0.0.0 --port 8000
 ```
 
 Loading takes about two minutes. Endpoints: `/v1/chat/completions`, `/v1/completions`, `/v1/responses`
@@ -592,22 +659,20 @@ Loading takes about two minutes. Endpoints: `/v1/chat/completions`, `/v1/complet
 **Command line.**
 
 ```sh
-./bin/ds4 --cuda -m DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf \
-    --zchain DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-vqfin41_vqhalf_a_n8192-engine \
-    -p "Explain the price-to-earnings ratio."
+./bin/ds4 --cuda -m DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf --zchain $SIDECAR \
+    --engram-dir /data/DeepSeek-V4.1-Flash -p "Explain the price-to-earnings ratio."
 # add --no-dspark for plain decoding (speed baselines); drop --zchain to run the bare base
 ```
 
-**The post-training file is an experiment, not an upgrade.** `posttrain-experimental-20260924/` was solved
-on a single market-outlook request from our trading agent (2026-09-22) and moves one decision token, only on
-the last layer. It is here to show the format and the loading path:
+**The post-training file is an experiment, not an upgrade.** `posttrain-experimental-20260924/` holds
+last-layer gains solved on the decision points of one market-outlook request; it demonstrates the format
+and the loading path. `base.fnv` is the finance sidecar's fingerprint, so it stacks only on that sidecar
+and the engine refuses any other pairing:
 
 ```sh
-./bin/ds4-server … --zchain <sidecar dir above> --posttrain posttrain-experimental-20260924
+./bin/ds4-server … --zchain DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-vqfin41_vqhalf_a_n8192-engine \
+    --posttrain posttrain-experimental-20260924
 ```
-
-It loads only on top of the sidecar in this repository — `base.fnv` is that sidecar's fingerprint, and the
-engine refuses any other pairing. Do not expect it to improve anything else.
 
 **Source code** of the engine, the quantizer and the solvers is not public yet.
 
@@ -616,20 +681,14 @@ engine refuses any other pairing. Do not expect it to improve anything else.
 ## 8. Honest status and limits
 
 - **Post-training (③) is a working mechanism, not yet a working product.** It flips targeted decisions on
-  the day it was trained without disturbing other tokens, but it does not transfer to new days: with two
-  trading days of reviews, held-out decision points stayed at 55% → 55%. And one flipped token changes
-  one sentence, not a chain of reasoning. The next design — sample N answers per real request, score each
-  with the next day's actual market data, solve ③ on group-relative advantage — is written down, not yet
-  run.
-- **One domain so far.** Only a Chinese-finance sidecar exists.
+  the requests it was solved on without disturbing other tokens, but does not transfer: on held-out days,
+  decision points stay at 55% → 55%. One flipped token changes one sentence, not a chain of reasoning.
+- **Five domains.** Finance, code, law, medicine and science (§5.1), all five sidecars in this repository.
+  All are judged teacher-forced on held-out text; none has been evaluated on end-to-end tasks (agentic coding, legal or clinical question answering).
 - **CUDA only, one machine type tested.** V4.1 does not run on Metal.
 - **Speculative decoding is greedy-only.** Sampling requests fall back to plain decode.
-- **Two of the speed numbers include kernel changes not yet merged** (128-byte payload alignment and the
-  side stream for verify batches). Merged code measures ~30.0 t/s plain (short context) and 39.3 t/s
-  speculative on the 14k request.
-- **Prefill on tensor cores is not bit-identical** to the older fused path; the difference is at the
+- **Prefill on tensor cores is not bit-identical** to the fused scalar path; the difference is at the
   rounding-noise level (§4.4).
-- **The n-gram shards are pinned by absolute path** (§7, step 2).
 
 ---
 
