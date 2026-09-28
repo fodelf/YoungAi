@@ -132,9 +132,12 @@ __global__ static void v41_attn_mma_seg_kernel(float *pacc, float *pmax, float *
 /* 返回 1 = 这一发由解码张量核接管; 0 = 形状不合/shared 抬不上去, 调用方回标量 split 版。
  * ★n_tok 1..8 全走这一条★: 纯解码与投机验证批必须是同一个核、同一套分段, 否则同轨不成立。 */
 /* graph 路要的暂存预建(2026-09-18): v41_grow 里有 cudaMalloc + 全设备同步, 捕获态下二者都作废捕获 ——
- * 所以开捕获之前把局部件按段数上限(V41_ATTN_SPLIT_MAX_SEG)一次长够。8 MB, 只长不缩。 */
-int ds4_gpu_v41_attn_scratch_prepare(uint32_t n_head, uint32_t head_dim) {
-    const uint64_t na = (uint64_t)V41_ATTN_SPLIT_MAX_SEG * n_head;
+ * 所以开捕获之前把局部件按 段数上限(V41_ATTN_SPLIT_MAX_SEG) × 这张图的行数 一次长够, 只长不缩。
+ * ★要乘行数★(2026-09-28 实撞): 核按 nseg × n_tok × n_head 取暂存, 以前只按 1 行预留(8 MB), 投机验证批
+ * 14 段 × 5 行就要 8.8 MB ⇒ 在捕获里扩容 ⇒ 捕获作废, 这一批与之后的验证批全走直发(输出不变, 只是慢)。
+ * 法律侧车 + 一条短问答就能复现: 侧车改了草稿接受情况, 调度器才选到这个批大小。n_tok ≤ 8 ⇒ 最多 64 MB。 */
+int ds4_gpu_v41_attn_scratch_prepare(uint32_t n_tok, uint32_t n_head, uint32_t head_dim) {
+    const uint64_t na = (uint64_t)V41_ATTN_SPLIT_MAX_SEG * n_tok * n_head;
     return v41_grow(&g_v41_attn_pacc, na * head_dim * 4, "v41 attn mma acc") &&
            v41_grow(&g_v41_attn_pmax, na * 4, "v41 attn mma max") &&
            v41_grow(&g_v41_attn_psum, na * 4, "v41 attn mma sum") ? 1 : 0;

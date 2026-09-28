@@ -63,7 +63,7 @@ V41_STUB(ds4_gpu_v41_ring_rows_tensor, ds4_gpu_tensor *dst, const ds4_gpu_tensor
 V41_STUB(ds4_gpu_v41_row_gather_tensor, ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t tab_offset, uint64_t n_rows, uint32_t dim, uint32_t elem_bytes, const ds4_gpu_tensor *ids, uint32_t which, uint32_t out_row)
 V41_STUB(ds4_gpu_v41_row_add_tensor, ds4_gpu_tensor *dst, uint64_t dst_row, const ds4_gpu_tensor *src, uint64_t n)
 V41_STUB(ds4_gpu_v41_compress_step_n_tensor, ds4_gpu_tensor *pooled, ds4_gpu_tensor *posg, ds4_gpu_tensor *cpre_kv, ds4_gpu_tensor *cpre_sc, ds4_gpu_tensor *snap_kv, ds4_gpu_tensor *snap_sc, const ds4_gpu_tensor *ckv, const ds4_gpu_tensor *csc, const ds4_gpu_tensor *posd, uint32_t ratio, uint32_t dim, uint32_t n)
-V41_STUB(ds4_gpu_v41_attn_scratch_prepare, uint32_t n_head, uint32_t head_dim)
+V41_STUB(ds4_gpu_v41_attn_scratch_prepare, uint32_t n_tok, uint32_t n_head, uint32_t head_dim)
 V41_STUB(ds4_gpu_v41_candidate_scratch_prepare, uint32_t n_tok, uint32_t nb)
 uint64_t ds4_gpu_v41_scratch_generation(void) { return 0; }   /* Metal 没有解码 graph, 暂存代号恒 0 */
 

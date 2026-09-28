@@ -182,8 +182,9 @@ int ds4_gpu_v41_head_colnorm_tensor(ds4_gpu_tensor *out, const void *model_map, 
 /* 同上, 出口头是 q4_K 骨架时用(调用方按登记类型挑; 实现在 cuda_v41_q4k.inc.cu) */
 int ds4_gpu_v41_head_colnorm_q4k_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
                                         uint64_t weight_offset, uint32_t n_vocab, uint32_t n_embd);
-/* graph 路开捕获前调一次: 解码张量核注意力的局部件暂存按段数上限长够(捕获态下不许分配) */
-int ds4_gpu_v41_attn_scratch_prepare(uint32_t n_head, uint32_t head_dim);
+/* graph 路开捕获前调一次: 解码张量核注意力的局部件暂存按 段数上限 × n_tok 行 长够(捕获态下不许分配)。
+ * n_tok 传这张图的行数(纯解码 1, 投机验证批 1+k), 少传一行, 验证批就会在捕获里扩容而作废整张图。 */
+int ds4_gpu_v41_attn_scratch_prepare(uint32_t n_tok, uint32_t n_head, uint32_t head_dim);
 /* 同上, 候选块核的 [nb] 块分 + 选中标记暂存(n_tok 行, 每行 nb 个): 捕获前按桶上限的块数长够。
  * 这两个数组 2026-09-21 从 shared 挪进了全局暂存 —— shared 那 48 KB 正是 ctx 曾经卡在 32768 的原因。 */
 int ds4_gpu_v41_candidate_scratch_prepare(uint32_t n_tok, uint32_t nb);

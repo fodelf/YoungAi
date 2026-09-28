@@ -145,8 +145,8 @@ static bool dg_capture(ds4_engine *e, ds4_v41_state *st, uint32_t n) {
     /* ★三个暂存先长够, 之后才置 st->graph★(2026-09-23 实撞): 以前先置 st->graph=1 再长索引草稿, 而
      * v41_index_scratch_prepare 见 st->graph 就当"捕获态分配"拒掉 ⇒ 只要新桶要扩草稿捕获必失败。服务端第一条 22 token
      * 冒烟就撞上, 整夜直发(每步 +3 ms)。CLI 门的长提示预填翻倍长出的余量碰巧够, 所以没暴露。 */
-    /* 注意力的局部件暂存按段数上限长够(其余暂存在暖身那一步已按这个 n 的尺寸建好) */
-    if (!ds4_gpu_v41_attn_scratch_prepare(DS4_N_HEAD, DS4_N_HEAD_DIM)) return false;
+    /* 注意力的局部件暂存按 段数上限 × n 行 长够(其余暂存在暖身那一步已按这个 n 的尺寸建好) */
+    if (!ds4_gpu_v41_attn_scratch_prepare(n, DS4_N_HEAD, DS4_N_HEAD_DIM)) return false;
     /* 索引打分草稿: 桶里最靠后那一批、压缩比最小那个 indexer 源层的组数最多, 按它长够。
      * 遍历口径必须与消费方 v41_index_source(core_v41_attn.c, 按 is_index_source 层自己的压缩比)同源 ——
      * 只看 kv 源层会漏掉压缩比更小的纯 indexer 源层, 捕获时照样要扩容。 */
