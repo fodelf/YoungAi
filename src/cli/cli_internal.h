@@ -25,8 +25,6 @@ typedef struct {
     float top_p;
     float min_p;
     uint64_t seed;
-    bool temp_given;      /* --temp 显式给过。V4.1 生成路只在显式给了 --temp 时采样: V4 的默认温度是 1.0,
-                           * 但 V4.1 生成路一直是裸 argmax、所有尺脚本都靠它 ⇒ 不给 --temp 仍是 argmax(零改动) */
     float dry_multiplier; /* --dry-multiplier F: DRY 序列复读惩罚强度(0 = 关, llama.cpp 推荐 0.8); 温 0 也生效 */
     float dry_base;       /* --dry-base F: 惩罚随匹配长度指数增长的底(默认 1.75) */
     int dry_allowed_length;   /* --dry-allowed-length N: 匹配到这么长才开始罚(默认 2) */

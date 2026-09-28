@@ -50,9 +50,10 @@ typedef struct {
     float logprob;
 } ds4_token_score;
 
+/* 采样默认=模型卡官方配方(温 1.0/top_p 1.0/无 min_p), 各入口不带参数都落这里; min_p 非 0 在复读区砍光备选=退回贪心(09-28 实测死循环) */
 #define DS4_DEFAULT_TEMPERATURE 1.0f
 #define DS4_DEFAULT_TOP_P 1.0f
-#define DS4_DEFAULT_MIN_P 0.05f
+#define DS4_DEFAULT_MIN_P 0.0f
 /* session 默认 ctx: CLI 与 server 共用, help 文本经 DS4_STRINGIFY 同源(改此处代码与文档一起变) */
 #define DS4_DEFAULT_CTX_SIZE 32768
 #define DS4_STRINGIFY_(x) #x

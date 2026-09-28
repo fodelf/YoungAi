@@ -201,7 +201,6 @@ typedef struct {
     int max_tokens;
     int top_k;
     float temperature;
-    bool temperature_set;   /* 请求显式带了 temperature(2026-09-21): V4.1 生成路没带 = 裸 argmax(09-19 起的状态), 带了就照办, 不再静默忽略 */
     float top_p;
     float min_p;
     /* OpenAI frequency_penalty / presence_penalty (chat completions + responses;

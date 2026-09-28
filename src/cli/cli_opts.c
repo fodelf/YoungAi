@@ -292,7 +292,6 @@ cli_config parse_options(int argc, char **argv) {
             exit(2);
         } else if (!strcmp(arg, "--temp")) {
             c.gen.temperature = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 100.0f);
-            c.gen.temp_given = true;
         } else if (!strcmp(arg, "--top-p")) {
             c.gen.top_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
         } else if (!strcmp(arg, "--min-p")) {

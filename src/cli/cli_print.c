@@ -125,15 +125,19 @@ void usage(FILE *fp) {
         "  --prompt-file FILE\n"
         "      Read the prompt text from FILE.\n"
         "  -sys, --system TEXT\n"
-        "      System prompt. Empty string disables the default. Default: You are a helpful assistant\n"
+        "      System prompt. Default: none\n"
         "  -n, --tokens N\n"
-        "      Maximum tokens to generate. Default: 50000\n"
+        "      Maximum tokens to generate. Default: no limit (until EOS or the model's context end)\n");
+    /* 默认值直接打 ds4.h 的常量: 以前手写 "Default: 1 / 0.05", 常量一改帮助就过期(09-28 min_p 就是这么对不上的) */
+    fprintf(fp,
         "  --temp F\n"
-        "      Sampling temperature. 0 is greedy/deterministic. Default: 1\n"
+        "      Sampling temperature. 0 is greedy/deterministic. Default: %g (model card)\n"
         "  --top-p F\n"
-        "      Nucleus sampling probability. Default: 1\n"
+        "      Nucleus sampling probability. Default: %g (model card)\n"
         "  --min-p F\n"
-        "      Keep tokens scoring at least F times the top token. Default: 0.05\n"
+        "      Keep tokens scoring at least F times the top token. Default: %g (0 = off, model card has none)\n",
+        (double)DS4_DEFAULT_TEMPERATURE, (double)DS4_DEFAULT_TOP_P, (double)DS4_DEFAULT_MIN_P);
+    fprintf(fp,
         "  --seed N\n"
         "      Sampling seed for reproducible non-greedy runs. Default: time-based\n"
         "  --dry-multiplier F [--dry-base F] [--dry-allowed-length N]\n"

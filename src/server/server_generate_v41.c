@@ -8,7 +8,7 @@
  * 没有的东西(如实, 别猜): ①KV 复用与磁盘 KV —— 每条请求整段预填(15k token 的提示约 40 s @334 t/s);
  * ②工具调用出错后的续写修复(continue_after_invalid_dsml 要会话); ③并发批处理; ④Responses/Anthropic 的活绑定
  * (它们指向会话 KV 位置, 这里没有 KV 可续)。
- * 有的: 采样与复读惩罚(2026-09-21, 见下面 ds4_engine_set_decode_sampling 那一段 —— 请求不带 temperature 就是裸贪心);
+ * 有的: 采样与复读惩罚(见下面 ds4_engine_set_decode_sampling 那一段 —— 请求没带的采样参数落到 ds4.h 的官方默认);
  * 上下文 ds4_engine_v41_ctx()(模型元数据 deepseek4.context_length; 2026-09-22 用户定"不要任何写死的上下文", 没有 --ctx)。
  * 为什么不改 generate_job 本体: 它 1500 行、全是会话位置/回滚/primer 的控制流, 往里塞第二种 token
  * 来源只会把两条路的 bug 搅在一起; 这里独立一份, V4 一行不动。 */
@@ -382,11 +382,13 @@ void generate_job_v41(server *s, job *j) {
     g.openai_live_chat = request_uses_openai_live_stream(&j->req);
     g.responses_live_chat = request_uses_responses_live_stream(&j->req);
     g.responses_created_at = (long)time(NULL);
-    /* 解码采样(2026-09-21, 113-1.md §4): 请求显式带 temperature 就照办(以前静默忽略 = 违反"客户端采样参数不得被静默覆盖");
-     * 没带 = 裸 argmax(09-19 起的服务行为, 不变)。频率/出现惩罚按请求; DRY 按服务启动参数(客户端协议没有它)。单 worker ⇒ 全局设置面按请求覆写即可。 */
+    /* 解码采样: 请求带什么就用什么, 没带的落到 ds4.h 的官方默认(温 1.0), 与官方 API 同。
+     * 以前"没带 temperature = 裸 argmax": 聊天前端大多不发 temperature ⇒ 产品请求全走贪心, 09-28 "每句以五结尾"
+     * 类请求在思考段逐字死循环(FP 老师在复读位也有 86~96% 选抄, 贪心出不来)。尺脚本要贪心就显式发 temperature:0。
+     * 频率/出现惩罚按请求; DRY 按服务启动参数(客户端协议没有它)。单 worker ⇒ 全局设置面按请求覆写即可。 */
     /* DRY: 请求里带了 dry_multiplier 就按请求(base/allowed 没给用 llama.cpp 默认), 否则用服务启动参数 */
     const ds4_decode_sampling sp = {
-        .temperature = j->req.temperature_set ? j->req.temperature : 0.f, .top_p = j->req.top_p, .min_p = j->req.min_p,
+        .temperature = j->req.temperature, .top_p = j->req.top_p, .min_p = j->req.min_p,
         .top_k = j->req.top_k, .seed = j->req.seed, .freq_penalty = j->req.frequency_penalty, .presence_penalty = j->req.presence_penalty,
         .dry_multiplier = j->req.dry_set ? j->req.dry_multiplier : s->dry_multiplier,
         .dry_base = j->req.dry_set ? (j->req.dry_base > 1.f ? j->req.dry_base : 1.75f) : s->dry_base,

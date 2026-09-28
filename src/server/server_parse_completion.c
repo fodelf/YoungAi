@@ -91,7 +91,6 @@ bool parse_completion_request(ds4_engine *e, const char *body, int def_tokens,
                 goto bad;
             }
             r->temperature = (float)v;
-            r->temperature_set = true;
         } else if (!strcmp(key, "top_p")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {

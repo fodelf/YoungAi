@@ -38,10 +38,11 @@ static int v41_emit_print(int token, void *ud) {
     return 0;
 }
 int run_v41_generation(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
-    /* 解码采样(2026-09-21, 113-1.md §4): 只在显式给了 --temp 时开(不给 = 裸 argmax, 尺脚本零改动; 见 cli_internal.h temp_given)。
+    /* 解码采样: 不给 --temp 就是 ds4.h 的官方默认(温 1.0), 与服务端、V4 CLI 同一份数。以前 V4.1 路不给 --temp = 裸 argmax,
+     * 帮助里写着 "Default: 1" 实际却是 0, 09-28 撞在"以五结尾"类请求的死循环上。尺脚本要贪心就显式 --temp 0。
      * top_k 0 = 全词表, 与 V4 CLI 的 ds4_session_sample(…, 0, …) 同口径。 */
     const ds4_decode_sampling sp = {
-        .temperature = cfg->gen.temp_given ? cfg->gen.temperature : 0.f, .top_p = cfg->gen.top_p, .min_p = cfg->gen.min_p,
+        .temperature = cfg->gen.temperature, .top_p = cfg->gen.top_p, .min_p = cfg->gen.min_p,
         .top_k = 0, .seed = cfg->gen.seed, .freq_penalty = 0.f, .presence_penalty = 0.f,
         .dry_multiplier = cfg->gen.dry_multiplier, .dry_base = cfg->gen.dry_base > 1.f ? cfg->gen.dry_base : 1.75f,
         .dry_allowed_length = cfg->gen.dry_allowed_length > 0 ? cfg->gen.dry_allowed_length : 2,

@@ -325,7 +325,6 @@ bool parse_responses_request(ds4_engine *e, server *s, const char *body, int def
                 goto bad;
             }
             r->temperature = (float)v;
-            r->temperature_set = true;
         } else if (!strcmp(key, "frequency_penalty")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
