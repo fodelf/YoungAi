@@ -50,3 +50,6 @@ route_alpha_set
 /.playwright-mcp/
 /gguf-tools/bench/dspark_agree
 /gguf-tools/dspark_align
+
+# YoungAi 介绍片(网站+录制工具+配音)是独立的视频项目, 不进引擎仓库; 本地保留, 别 git add 进来
+/site/
