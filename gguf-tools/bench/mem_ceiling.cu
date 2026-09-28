@@ -7,6 +7,7 @@
  * 用法: mem_ceiling [GiB=4] [iters=10]   (nvcc -O3 -o mem_ceiling mem_ceiling.cu) */
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <cuda_runtime.h>
 #include <time.h>
 
@@ -93,9 +94,84 @@ __global__ void chase_rows(const unsigned char *__restrict__ p, size_t rows_per_
     if (acc == 0x12345678u) atomicAdd(out, 1ull);
 }
 
+/* ⑧ 专家常驻核的"谁读哪一行"(2026-09-24): 48 CTA × 32 warp, 一行 960 B = 20 轮 × 48 B, 位流按 384 B 整块(3 条整线 LDG.32)
+ * 进寄存器、提前一块发(= v41_vq_stream 的读法); 每轮 SPIN 条相依 FMA 模拟解码 + 点积的算力。只换行分配:
+ *   MODE 0 = 现役: warp 管连续 per 行, 整段当一条位流(块跨行不断) ⇒ 同一时刻 1536 个 warp 散在 1536 处
+ *   MODE 1 = CTA 内行交错: warp w 管 CTA 段里的第 w, w+32, … 行(每行一条流, 块 8+8+4 轮) ⇒ 同一时刻 32 个 warp 读相邻 32 行
+ *   MODE 2 = CTA 内块交错: warp w 管 CTA 段里的第 w, w+32, … 块 ⇒ 同一时刻全 CTA 读一片连续 12 KB(做不成逐字节同, 只当天花板)
+ * 为什么要它: 专家核只到 ~152 GB/s(同批 GEMV 213), ncu 说等的是位流, 可"提前 2~4 块发"判过负 ⇒ 不是延迟, 怀疑是
+ * DRAM 行局部性(每 warp 每 ~3 µs 才来一口 384 B)。MODE 1 若明显快过 MODE 0, 专家核只改行分配就能吃到, 输出逐字节同。
+ * 层循环: 每层 48×32×per 行(8 行 ≈ 11.8 MB, 与 gateup 一个矩阵同量级), 层与层在 4 GiB 里往后挪, 不让 L2 命中。 */
+template <int MODE, int SPIN>
+__global__ void vq_rows(const unsigned *__restrict__ p, unsigned per, unsigned layers, size_t layer_words, unsigned long long *out) {
+    /* p 可以故意不按 128 B 对齐(调用方传 a + skew 字): 真核的位流起点只保证 8 B 对齐、行长 960 B = 7.5 线 */
+    const unsigned lane = threadIdx.x & 31u, w = threadIdx.x >> 5;
+    const unsigned rows_cta = 32u * per;
+    float acc = 0.f;
+    for (unsigned L = 0; L < layers; L++) {
+        const unsigned *lb = p + (size_t)L * layer_words + (size_t)blockIdx.x * rows_cta * 240u;
+        /* 本 warp 的块序列: 块 i 的起字与字数(整块 96 字, 行尾块 48 字) */
+        const unsigned nblk = MODE == 0 ? (per * 240u) / 96u + ((per * 240u) % 96u ? 1u : 0u) : (MODE == 1 ? per * 3u : rows_cta * 240u / 96u / 32u);
+        #define BLK(I, OFF, NW) do { const unsigned i_ = (I);                                                         \
+            if (MODE == 0) { OFF = w * per * 240u + i_ * 96u; NW = per * 240u - i_ * 96u; if (NW > 96u) NW = 96u; }       \
+            else if (MODE == 1) { const unsigned r_ = w + 32u * (i_ / 3u), k_ = i_ % 3u; OFF = r_ * 240u + k_ * 96u; NW = k_ == 2u ? 48u : 96u; } \
+            else { OFF = (w + 32u * i_) * 96u; NW = 96u; } } while (0)
+        unsigned off, nw; BLK(0u, off, nw);
+        unsigned c0 = __ldg(lb + off + lane), c1 = nw > 32u + lane ? __ldg(lb + off + 32u + lane) : 0u, c2 = nw > 64u + lane ? __ldg(lb + off + 64u + lane) : 0u;
+        for (unsigned i = 0; i < nblk; i++) {
+            unsigned n0 = 0, n1 = 0, n2 = 0, rounds = nw / 12u;
+            if (i + 1u < nblk) { unsigned o2, w2; BLK(i + 1u, o2, w2);
+                n0 = __ldg(lb + o2 + lane); n1 = w2 > 32u + lane ? __ldg(lb + o2 + 32u + lane) : 0u; n2 = w2 > 64u + lane ? __ldg(lb + o2 + 64u + lane) : 0u; nw = w2; }
+            for (unsigned k = 0; k < rounds; k++) {
+                const unsigned v = __shfl_sync(0xffffffffu, k < 3u ? c0 : (k < 6u ? c1 : c2), (int)((k * 12u + lane) & 31u));
+                float x = __uint_as_float((v & 0x007FFFFFu) | 0x3F800000u);
+                #pragma unroll
+                for (int s = 0; s <= SPIN; s++) acc = fmaf(acc, 0.999f, x);   /* ≥1 条: 否则读回的值没人用, 读被编译器删掉 */
+            }
+            c0 = n0; c1 = n1; c2 = n2;
+        }
+        #undef BLK
+    }
+    if (acc == 12345.678f) atomicAdd(out, 1ull);
+}
+
+static void vq_rows_suite(const char *a, size_t bytes, unsigned long long *o, int iters, const cudaDeviceProp &pr) {
+    const int grid = pr.multiProcessorCount, block = 1024;
+    const unsigned per = 8u;   /* gateup 实况 6 专家 × 2304 行 ÷ 1536 warp = 9 行; 取 8 让 MODE 2 的块数整除(每 CTA 80·per 块分给 32 warp) */
+    const size_t layer_words = (size_t)grid * 32u * per * 240u;
+    const unsigned layers = (unsigned)(bytes / 4u / layer_words) - 1u;
+    const double tot = (double)layers * layer_words * 4.0;
+    const size_t shm = 64u << 10;                              /* 压成 1 block/SM(= 专家核实况) */
+    float ms = 0.f; cudaEvent_t e0, e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
+    printf("⑧ 专家核行分配: %d CTA × 32 warp, 每 warp %u 行 × 960 B, %u 层 × %.1f MB\n", grid, per, layers, layer_words * 4.0 / 1e6);
+    #define VQR(M, S) do { \
+        CK(cudaFuncSetAttribute(vq_rows<M, S>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shm)); \
+        vq_rows<M, S><<<grid, block, shm>>>((const unsigned *)a, per, layers, layer_words, o); CK(cudaDeviceSynchronize()); \
+        CK(cudaEventRecord(e0)); \
+        for (int i = 0; i < iters; i++) vq_rows<M, S><<<grid, block, shm>>>((const unsigned *)a, per, layers, layer_words, o); \
+        CK(cudaEventRecord(e1)); CK(cudaEventSynchronize(e1)); CK(cudaEventElapsedTime(&ms, e0, e1)); \
+        printf("  MODE %d(%s) 每轮 %2d FMA: %.1f GB/s\n", M, M == 0 ? "现役 warp 连续段" : M == 1 ? "CTA 内行交错  " : "CTA 内块交错  ", S, \
+               tot * iters / (ms / 1e3) / 1e9); } while (0)
+    VQR(0, 0); VQR(1, 0); VQR(2, 0);
+    VQR(0, 16); VQR(1, 16); VQR(2, 16);
+    VQR(0, 64); VQR(1, 64); VQR(2, 64);
+    VQR(0, 128); VQR(0, 256);
+    /* 起点错开 8 B / 64 B(真核的对齐状况): 每条 128 B 的 warp 读跨两条线 */
+    const char *a0 = a;
+    for (int skew = 2; skew <= 16; skew *= 8) {
+        a = a0 + skew * 4;
+        printf("  -- 起点错开 %d B\n", skew * 4);
+        VQR(0, 0); VQR(0, 64); VQR(0, 128);
+    }
+    a = a0;
+    #undef VQR
+}
+
 int main(int argc, char **argv) {
     const double gib = argc > 1 ? atof(argv[1]) : 4.0;
     const int iters = argc > 2 ? atoi(argv[2]) : 10;
+    /* 第三个参数 vq = 只跑 ⑧(专家核行分配), 其余几项要几分钟, 判这一刀用不着 */
+    const bool only_vq = argc > 3 && !strcmp(argv[3], "vq");
     const size_t bytes = (size_t)(gib * 1024.0 * 1024.0 * 1024.0) & ~(size_t)4095;
     char *a = NULL, *b = NULL; unsigned long long *o = NULL;
     CK(cudaMalloc(&a, bytes)); CK(cudaMalloc(&b, bytes)); CK(cudaMalloc(&o, 8));
@@ -110,6 +186,7 @@ int main(int argc, char **argv) {
     printf("  shared/SM=%zu KB  shared/block(opt-in)=%zu KB  regs/SM=%d  threads/SM=%d  blocks/SM=%d  L2=%d MB\n",
            pr.sharedMemPerMultiprocessor / 1024, pr.sharedMemPerBlockOptin / 1024, pr.regsPerMultiprocessor,
            pr.maxThreadsPerMultiProcessor, pr.maxBlocksPerMultiProcessor, pr.l2CacheSize / (1024 * 1024));
+    if (only_vq) { vq_rows_suite(a, bytes, o, iters, pr); return 0; }
     /* ① D2D 拷贝 */
     CK(cudaMemcpy(b, a, bytes, cudaMemcpyDeviceToDevice)); CK(cudaDeviceSynchronize());
     double t0 = now_s();
@@ -224,5 +301,6 @@ int main(int argc, char **argv) {
         CHASE(1, 32, 0, 0); CHASE(4, 32, 0, 0);
         #undef CHASE
     }
+    vq_rows_suite(a, bytes, o, iters, pr);
     return 0;
 }

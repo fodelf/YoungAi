@@ -15,6 +15,7 @@
 #include "src/cuda/cuda_dspark.inc.cu"
 #include "src/cuda/cuda_graphcap.inc.cu"
 #include "src/cuda/cuda_decode_graph.inc.cu"   /* 解码整步 CUDA graph 原语(2026-09-18): 捕获/实例化/发射 + host 节点 + pinned 异步拷贝 */
+#include "src/cuda/cuda_vq_align.inc.cu"   /* 启动缓存拷专家 blob 时把载荷挪到位流 128 B 对齐(2026-09-24); 在 modelmap 之前(被它调) */
 #include "src/cuda/cuda_modelmap.inc.cu"
 #include "src/cuda/cuda_embed_norm_kernels_1.inc.cu"
 #include "src/cuda/cuda_embed_norm_kernels_2.inc.cu"

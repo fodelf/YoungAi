@@ -209,6 +209,9 @@ __global__ static void __launch_bounds__(1024, 1) v41_vq_dn_persist_kernel(float
  * 全赔回去。所以一律 32 warp、M=2: 被 m 个 token 选中的专家读 ⌈m/2⌉ 遍位流(4 行里 m ≥ 3 的专家很少)。 */
 #define V41_VQPN_M 2u
 /* 块头: 按 order 把同一专家的对归组(q = 组在 order 里的起点, m = 组里几对, ≤ V41_VQPN_M); 线程 0 做, 其余等屏障 */
+/* ★判负存档(2026-09-24)★ "组表挪进 v41_vq_order_kernel 一层算一次, 两个常驻核直接读": 线程 0 这段串行(每对两次前后依赖的全局读)
+ * 看着像每发白等十几 µs。真实 CFO 请求成对: 投机 43.01 → 43.03 t/s, 一轮 70.3 → 70.3 ms, 验证 k1 46.1 → 45.8 / k3 65.3 → 65.2(噪声内),
+ * 输出逐字节同 ⇒ 走图 + PDL 下这段已被藏住, 不是钱。代码已回退。 */
 __device__ __forceinline__ static void v41_vqpn_groups(const int32_t *sel, const int32_t *order, uint32_t np,
                                                        uint32_t *gq, uint32_t *gm, uint32_t *ng) {
     if (threadIdx.x == 0) {

@@ -334,13 +334,16 @@ int ds4_gpu_set_model_fd(int fd) {
     return 1;
 }
 
-int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
+/* vq_blob = 1: 这一段恰好是一个 VQ 专家 blob, 先试"载荷挪对齐"的拷法(cuda_vq_align.inc.cu), 不适用再平拷 */
+static int cuda_cache_model_range_impl(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label,
+                                       int vq_blob) {
 #ifndef DS4_CUDA_SPARK_HBM_CACHE
     (void)model_map;
     (void)model_size;
     (void)offset;
     (void)bytes;
     (void)label;
+    (void)vq_blob;
     return 1;
 #else
     if (!model_map || bytes == 0) return 1;
@@ -360,7 +363,11 @@ int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64
         const cuda_model_range &r = g_model_ranges[exact->second];
         if (r.host_base == model_map && bytes <= r.bytes && !r.host_registered) return 1;
     }
-    if (cuda_model_range_populate_device_copy(model_map, offset, bytes, what) == NULL) return 0;
+    int flat = 1;
+    if (vq_blob) {
+        if (cuda_vq_blob_populate_aligned(model_map, offset, bytes, what, &flat) == NULL && !flat) return 0;
+    }
+    if (flat && cuda_model_range_populate_device_copy(model_map, offset, bytes, what) == NULL) return 0;
     /* ★拷进设备后立刻丢掉这段的 page cache★
      * 统一内存机器上 mmap 的 page cache 与设备副本是同一块物理内存的两份占用:
      * 89.77GiB 模型 + 89.77GiB 副本 = 179GiB 远超 121GiB, 实测 free 掉到 7GiB 后
@@ -376,6 +383,13 @@ int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64
     }
     return 1;
 #endif
+}
+
+int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
+    return cuda_cache_model_range_impl(model_map, model_size, offset, bytes, label, 0);
+}
+int ds4_gpu_cache_vq_blob(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
+    return cuda_cache_model_range_impl(model_map, model_size, offset, bytes, label, 1);
 }
 
 /* 装进设备副本的总字节(single.md S1 的对账): core 侧拿它和"请求装的字节"比, 差值就是走主机映射的量。

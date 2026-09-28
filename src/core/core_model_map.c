@@ -111,6 +111,9 @@ typedef struct {
      * 投机关: 1 主干专家/blob, 3 DSpark 三塔(一次都不读, 排最后)
      * 投机开: 1 DSpark 三塔(每轮都读, 只有 7.3 GiB), 2 主干专家/blob(98 GiB, 挤掉尾巴只丢 3%) */
     uint32_t prio;
+    /* 1 = VQ 专家 blob: 自成一段(不与邻居合并), 走 ds4_gpu_cache_vq_blob —— 它装载时把载荷挪到位流 128 B 对齐的位置,
+     * 重写的是 blob 自己的槽表, 段里要是混进别的张量, 它们的设备地址就跟着错位(见 cuda_vq_align.inc.cu)。 */
+    uint32_t blob;
 } accelerator_tensor_span;
 
 static int accelerator_tensor_span_cmp(const void *a, const void *b) {
@@ -204,6 +207,7 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
             .off = t->abs_offset,
             .end = t->abs_offset + t->bytes,
             .prio = is_mtp ? mtp_prio : ((is_exp || is_blob) ? exp_prio : 0u),
+            .blob = is_blob ? 1u : 0u,
         };
     }
     /* ★骨架先拷、专家/blob 后填(2026-09-12)★: 之前纯按偏移排, V4.1 的 103 GiB 里 98 GB 是 40 层 blob, 预算(总内存-24 GiB)
@@ -222,7 +226,7 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
         const uint64_t g0 = i;
         uint64_t end = spans[i].end;
         i++;
-        while (i < nspan && spans[i].off <= end + 65536u) {
+        while (i < nspan && !spans[g0].blob && !spans[i].blob && spans[i].off <= end + 65536u) {
             if (spans[i].end > end) end = spans[i].end;
             i++;
         }
@@ -253,7 +257,9 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
                 if (want_out) *want_out = total_bytes;
                 return true;
             }
-            if (ds4_gpu_cache_model_range(m->map, m->size, off, chunk_end - off, label) == 0) {
+            const int ok = spans[g0].blob ? ds4_gpu_cache_vq_blob(m->map, m->size, off, chunk_end - off, label)
+                                          : ds4_gpu_cache_model_range(m->map, m->size, off, chunk_end - off, label);
+            if (ok == 0) {
                 fprintf(stderr,
                         "ds4: accelerator failed to cache model tensor span %" PRIu64
                         " at offset %" PRIu64 "\n",

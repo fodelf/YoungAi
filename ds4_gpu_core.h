@@ -230,6 +230,10 @@ uint64_t ds4_gpu_current_allocated_bytes(void);
  * as the token is known.  hash_table_offset == UINT64_MAX for score routing. */
 int ds4_gpu_register_layer_router(const void *model_map, uint32_t layer, uint64_t gate_inp_offset, int gate_inp_is_f32, uint64_t probs_bias_offset, uint64_t gate_exps_offset, uint64_t up_exps_offset, uint64_t down_exps_offset, uint64_t gate_expert_bytes, uint64_t down_expert_bytes, uint32_t n_embd, uint32_t n_expert, uint64_t hash_table_offset, uint32_t hash_k, uint32_t hash_rows);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
+/* 同上, 但 [offset, offset+bytes) 恰好是一个 VQ 专家 blob(blk.L / mtp.T 的 ffn_exps_vq.blob): v3 blob 在设备副本里把每个载荷
+ * 挪到"位流起点 128 B 对齐"的位置并重写槽表(盘上文件与主机映射不动), 专家核的位流整线读不再跨线。不是 v3 就平拷。
+ * 只有 CUDA spark 的启动缓存(DS4_CUDA_SPARK_HBM_CACHE)调它; 其它后端没有这条路。 */
+int ds4_gpu_cache_vq_blob(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 /* 已装进设备副本的总字节。超预算的段是静默走主机映射的(每步 5~25 ms 长尾, 见 single.md S1),
  * 所以起跑时必须拿它跟"请求装的字节"对账并打印。CUDA 以外的后端返回 0。 */
 uint64_t ds4_gpu_model_cache_bytes(void);
