@@ -120,7 +120,15 @@ for f in HfApi().list_repo_tree(sys.argv[1], recursive=True):
     if getattr(f, 'size', None) is not None: print(f.path, f.size)" "$REPO"
 }
 
-need_login() { "$HF" auth whoami >/dev/null 2>&1 || die "spark 上 HF 没登录: ssh spark 后执行 $HF auth login(要 Write 令牌)"; }
+# 连不上 HF 时 whoami 也失败, 以前一律报"没登录", 让人去重登 —— 09-28 实撞真因是 Mihomo 当前节点对 HF 握手就断(SSL EOF),
+# 令牌好好的。连接错误单独报, 并给出绕路: Mac 上 ssh -f -N -R 17897:127.0.0.1:7897 spark, 再带 HTTPS_PROXY=http://127.0.0.1:17897 跑本脚本。
+need_login() {
+    local out; out=$("$HF" auth whoami 2>&1) && return 0
+    case "$out" in
+        *ConnectError*|*SSL*|*timed\ out*|*Connection*) die "spark 连不上 HF(网络, 不是登录): 换 Mihomo 节点, 或走 Mac 隧道(见 need_login 上方注释)";;
+        *) die "spark 上 HF 没登录: ssh spark 后执行 $HF auth login(要 Write 令牌)";;
+    esac
+}
 
 NPART=40
 PARTS_DIR="$V41/${GGUF_NAME%.gguf}-parts$NPART"
