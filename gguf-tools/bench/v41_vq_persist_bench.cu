@@ -108,36 +108,45 @@ __device__ __forceinline__ static void stream(const mat_t &m, uint32_t r0, uint3
 /* = v41_vq_gu_persist_kernel<12, 0>(去掉 PDL 与格式校验; gate/up 的专家 p 的矩阵直接按层内偏移给) */
 /* 这一层 6 个专家的 gate/up 矩阵起点表(专家 k 的 gate = mt[2k], up = mt[2k+1]), 放全局内存 —— 引擎也是读 blob 槽表找载荷。
  * ★别按值传一个指针数组再用变量下标取★(2026-09-24 实撞): 编译器把参数表搬进本地内存, 整核慢 25%(124 → 155 µs/层), 量的就不是真核了。 */
+/* ★R = 一个 warp 一段连续几行(2026-09-29)★: 引擎 = 每 warp 一段 per(≈8)行连续(u = gw·per), 同一 CTA 的 32 个 warp 各流自己那
+ * 7.7 KB, 整核 1536 条私有地址流。09-23 SASS 采样说停等在位流供数(整核只供到 ~166 GB/s, GEMV 整块连续能到 230)。
+ * 这里把 CTA 的连续区按 R 行一段在 32 个 warp 间交错: R = per 就是引擎; R 小 ⇒ 同一时刻 CTA 的 32 个 warp 读相邻的 32×R 行
+ * (R=1 时 30 KB 一片), DRAM 同时打开的页少; 代价是每段起点重起位流流水(每行末块只有 4 轮盖不住首块延迟, 09-23 第二刀就是为它连的)。
+ * 累加式/规约树不变(每行仍从 0 起按轮序做), 只是谁算哪行 —— 引擎里换法同样逐字节同。 */
 typedef struct { const uint8_t *p[2u * NP]; } mats_t;
+template <uint32_t R>
 __global__ static void __launch_bounds__(1024, 1) gu_persist(uint16_t *h, const mats_t *__restrict__ mt, const uint8_t *cb, const uint32_t *xg) {
     extern __shared__ __align__(16) uint8_t vqsh[];
-    const uint32_t gw = blockIdx.x * WARPS + (threadIdx.x >> 5), nw = gridDim.x * WARPS;
+    const uint32_t w = threadIdx.x >> 5, nw = gridDim.x * WARPS;
     const uint32_t total = NP * MID, per = (total + nw - 1u) / nw, lane = threadIdx.x & 31u;
-    uint32_t u = gw * per;
-    const uint32_t uend = (u + per < total) ? u + per : total;
+    const uint32_t cta0 = blockIdx.x * WARPS * per;                  /* 本 CTA 的连续区 [cta0, cta0 + 32·per) */
+    const uint32_t RR = R ? R : per;                                 /* R=0: 每 warp 一整段 per 行 = 引擎写法 */
     for (uint32_t i = threadIdx.x; i < CBB / 16u; i += blockDim.x) ((uint4 *)vqsh)[i] = ((const uint4 *)cb)[i];
     /* 每个矩阵 = [行增益 MID×2 B][位流 MID×960 B]; 起点由主机按摆法给(紧凑 = 一层 12 个首尾相接; 散布 = 大块里随机挑专家) */
     #define MAT(P, W) ({ mat_t m_; m_.gr = mt->p[2u * (P) + (W)]; m_.ix = m_.gr + MID * 2u; m_; })
-    blk_t carry; carry.w0 = 0u; carry.w1 = 0u; carry.w2 = 0u;
-    if (u < uend) { const mat_t mg = MAT(u / MID, 0u); carry = row_first_blk(mg, u % MID); }
     for (uint32_t i = threadIdx.x; i < IN * 2u / 16u; i += blockDim.x) ((uint4 *)(vqsh + CBB))[i] = ((const uint4 *)xg)[i];
     __syncthreads();
     const uint32_t *x = (const uint32_t *)(vqsh + CBB);
-    bool first = true;
-    while (u < uend) {
-        SEG(u, uend, MID, p, r0, n);
-        u += n;
-        const mat_t mg = MAT(p, 0u), mu = MAT(p, 1u);
-        if (!first) carry = row_first_blk(mg, r0);
-        first = false;
-        float gs, us;
-        stream(mg, r0, n, x, vqsh, &carry, row_ptr(mu, r0), &gs);
-        stream(mu, r0, n, x, vqsh, &carry, NULL, &us);
-        if (lane < n) { const float gv = bf16r(gs), uv = bf16r(us); h[(uint64_t)p * MID + r0 + lane] = (uint16_t)(__float_as_uint(bf16r(gv / (1.f + __expf(-gv)) * uv)) >> 16); }
+    for (uint32_t q = 0; q * RR < per; q++) {                        /* 第 q 段: warp w 拿 [cta0 + (q·32 + w)·RR, +RR) */
+        uint32_t u = cta0 + (q * WARPS + w) * RR;
+        if (u >= total || u >= cta0 + WARPS * per) break;
+        uint32_t uend = u + RR; if (uend > total) uend = total; if (uend > cta0 + WARPS * per) uend = cta0 + WARPS * per;
+        blk_t carry; carry.w0 = 0u; carry.w1 = 0u; carry.w2 = 0u;
+        bool first = true;
+        while (u < uend) {
+            SEG(u, uend, MID, p, r0, n);
+            u += n;
+            const mat_t mg = MAT(p, 0u), mu = MAT(p, 1u);
+            if (first) carry = row_first_blk(mg, r0); else carry = row_first_blk(mg, r0);
+            first = false;
+            float gs, us;
+            stream(mg, r0, n, x, vqsh, &carry, row_ptr(mu, r0), &gs);
+            stream(mu, r0, n, x, vqsh, &carry, NULL, &us);
+            if (lane < n) { const float gv = bf16r(gs), uv = bf16r(us); h[(uint64_t)p * MID + r0 + lane] = (uint16_t)(__float_as_uint(bf16r(gv / (1.f + __expf(-gv)) * uv)) >> 16); }
+        }
     }
     #undef MAT
 }
-
 /* 大块随机填充(散布档用): 每个字一个整数散列, 只要"像随机位流"不要统计质量 */
 __global__ static void fill_rand(uint32_t *p, uint64_t n, uint32_t seed) {
     for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (uint64_t)gridDim.x * blockDim.x) {
@@ -179,7 +188,14 @@ int main(int argc, char **argv) {
         free(hb);
     }
     const uint32_t shm = CBB + IN * 2u;
-    CK(cudaFuncSetAttribute(gu_persist, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shm));
+    CK(cudaFuncSetAttribute(gu_persist<0u>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shm));
+    CK(cudaFuncSetAttribute(gu_persist<4u>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shm));
+    CK(cudaFuncSetAttribute(gu_persist<2u>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shm));
+    CK(cudaFuncSetAttribute(gu_persist<1u>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shm));
+    typedef void (*gu_fn)(uint16_t *, const mats_t *, const uint8_t *, const uint32_t *);
+    const gu_fn gu_var[4] = { gu_persist<0u>, gu_persist<4u>, gu_persist<2u>, gu_persist<1u> };
+    const char *gu_name[4] = { "每 warp 连续 per 行(引擎)", "4 行交错", "2 行交错", "1 行交错" };
+    int cur_var = 0;
     printf("v3 gateup 常驻核抄本: %d SM × 1024 线程, 一层 %u 专家 × 2 × %u 行 × %u B 位流 = %.2f MB, %d 层\n",
            nsm, NP, MID, ROWB, 2.0 * NP * MID * ROWB / 1e6, layers);
     printf("  (引擎直发实测: gateup 7.10 ms / 40 层 = 177 µs/层)\n");
@@ -187,19 +203,20 @@ int main(int argc, char **argv) {
     /* 按一张指针表发 n 层(热身 4 层不计), 返回 µs/层 */
     mats_t *dtab = NULL; CK(cudaMalloc(&dtab, sizeof(mats_t) * (size_t)layers));
     #define TIMED(TAB, N) ({ CK(cudaMemcpy(dtab, (TAB), sizeof(mats_t) * (size_t)(N), cudaMemcpyHostToDevice)); \
-        for (int L_ = 0; L_ < 4; L_++) gu_persist<<<nsm, 1024, shm>>>(h, dtab + L_, cb, x); CK(cudaDeviceSynchronize()); \
-        CK(cudaEventRecord(e0)); for (int L_ = 0; L_ < (N); L_++) gu_persist<<<nsm, 1024, shm>>>(h, dtab + L_, cb, x); \
+        for (int L_ = 0; L_ < 4; L_++) gu_var[cur_var]<<<nsm, 1024, shm>>>(h, dtab + L_, cb, x); CK(cudaDeviceSynchronize()); \
+        CK(cudaEventRecord(e0)); for (int L_ = 0; L_ < (N); L_++) gu_var[cur_var]<<<nsm, 1024, shm>>>(h, dtab + L_, cb, x); \
         CK(cudaEventRecord(e1)); CK(cudaEventSynchronize(e1)); float ms_ = 0.f; CK(cudaEventElapsedTime(&ms_, e0, e1)); (double)ms_ * 1e3 / (N); })
     const double lay_mb = 2.0 * NP * MID * ROWB / 1e6;
     mats_t *tab = (mats_t *)malloc(sizeof(mats_t) * (size_t)layers);
-    const uint32_t skews[] = { 0u, 8u, 16u, 24u, 64u, 72u };
+    const uint32_t skews[] = { 0u, 8u };
     for (int rep = 0; rep < reps; rep++)
+        for (cur_var = 0; cur_var < 4; cur_var++)
         for (size_t s = 0; s < sizeof skews / sizeof skews[0]; s++) {
             /* 位流起点 = 层基 + skew + m·stride + MID×2; MID×2 = 4608 ≡ 0 mod 128 ⇒ 错开量就是 skew */
             for (int L = 0; L < layers; L++) for (uint32_t m = 0; m < 2u * NP; m++)
                 tab[L].p[m] = buf + skews[s] + (uint64_t)L * layer_bytes + m * mat_stride;
             const double us = TIMED(tab, layers);
-            printf("  第 %d 遍 位流错开 %2u B: %6.1f µs/层  %6.1f GB/s  (40 层 %.2f ms)\n", rep + 1, skews[s], us, lay_mb / us * 1e3, us * 40 / 1e3);   /* MB/µs × 1000 = GB/s */
+            printf("  第 %d 遍 %-22s 位流错开 %2u B: %6.1f µs/层  %6.1f GB/s  (40 层 %.2f ms)\n", rep + 1, gu_name[cur_var], skews[s], us, lay_mb / us * 1e3, us * 40 / 1e3);
         }
     /* ★散布档(2026-09-24)★: 引擎里一层的专家 blob 是 384 个专家 × 3 矩阵 ≈ 2.5 GB, 40 层铺满 ~98 GB; 每层按路由随机挑 6 个 ——
      * 而上面的紧凑档把 6 个专家首尾相接摆在 26.5 MB 里, 40 层才 1 GB。引擎 12 位层实测 170 µs/层, 比紧凑档同错位慢 ~15%。
@@ -214,8 +231,9 @@ int main(int argc, char **argv) {
         CK(cudaMalloc(&big, blob * nblob_max));
         fill_rand<<<nsm * 8, 256>>>((uint32_t *)big, blob * nblob_max / 4u, 0x9e3779b9u); CK(cudaDeviceSynchronize());
         printf("  -- 散布档: 一层 blob %.2f GB(384 专家 gate/up), 每层随机挑 %u 个专家, 位流错开 0\n", blob / 1e9, NP);
-        uint32_t fp[] = { 1u, 4u, nblob_max };
+        uint32_t fp[] = { nblob_max };
         for (int rep = 0; rep < reps; rep++)
+            for (cur_var = 0; cur_var < 4; cur_var++)
             for (size_t f = 0; f < sizeof fp / sizeof fp[0]; f++) {
                 const uint32_t nb = fp[f] < nblob_max ? fp[f] : nblob_max;
                 for (int L = 0; L < layers; L++) {
@@ -225,7 +243,7 @@ int main(int argc, char **argv) {
                     for (uint32_t k = 0; k < NP; k++) { tab[L].p[2u * k] = lb + (uint64_t)(2u * e[k]) * mat_stride; tab[L].p[2u * k + 1u] = lb + (uint64_t)(2u * e[k] + 1u) * mat_stride; }
                 }
                 const double us = TIMED(tab, layers);
-                printf("  第 %d 遍 占地 %2u 层 blob(%5.1f GB): %6.1f µs/层  %6.1f GB/s\n", rep + 1, nb, nb * blob / 1e9, us, lay_mb / us * 1e3);
+                printf("  第 %d 遍 %-22s 占地 %2u 层 blob(%5.1f GB): %6.1f µs/层  %6.1f GB/s\n", rep + 1, gu_name[cur_var], nb, nb * blob / 1e9, us, lay_mb / us * 1e3);
             }
         CK(cudaFree(big));
     }

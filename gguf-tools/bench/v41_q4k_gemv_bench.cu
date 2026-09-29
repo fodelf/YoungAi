@@ -12,6 +12,9 @@
  * 判据(两条都要): ①各 R 输出与 R=1 逐位同 ②NT 行里第 t 行 == 只拿第 t 行激活跑 NT=1 的结果, 逐位同 ——
  *   这就是引擎"投机 == 纯解码逐字节"那条门在核层面的样子。不同 = 块序/段序被改了, 不许进引擎。
  * 形状 = v3 GGUF 的真实张量(09-23 从 GGUF 头读出), 见 main() 的 shapes 表。
+ * 09-29: 改成比"发法"(引擎规则 / 一律 pipe×4 / 一律 pipe×8 / 一律 stage), R 固定 1(R>1 已判负)。逐形状 NT=1: q_b pipe 173 → stage 225 GB/s,
+ *   共享专家 153 → 188, kv 124 → 160; 每步合计 引擎规则 24.35 → 全 stage 21.10 ms; NT=4 时 q_b 反而 pipe×4 快(199 vs 185)。
+ *   ⇒ 引擎不再按 4~12 KB 档位定发法, 改成每 (形状, 行数) 第一次直发时自己量两种取快的(cuda_v41_q4k.inc.cu v41_q4k_pick)。
  * 用法: nvcc -O3 -arch=native -o v41_q4k_gemv_bench v41_q4k_gemv_bench.cu && ./v41_q4k_gemv_bench [iters=50] [NT=4] */
 #include <cstdio>
 #include <cstdlib>
@@ -135,8 +138,8 @@ __global__ static void __launch_bounds__(256 / R, 4 * R) k_stage(float *out, con
     rows_finish<NT, R>(acc, out, out_stride, r0, row0, nrows, ksplit, kpart, red);
 }
 /* pipe: CTA 常驻, 按 rg += gridDim.x 循环行组, cp.async 双缓冲(算第 k 组时搬第 k+1 组) */
-template <uint32_t NT, uint32_t R>
-__global__ static void __launch_bounds__(256 / R, 4 * R) k_pipe(float *out, const uint8_t *w, const float *x, uint32_t in_dim,
+template <uint32_t NT, uint32_t R, uint32_t OCC>
+__global__ static void __launch_bounds__(256 / R, OCC * R) k_pipe(float *out, const uint8_t *w, const float *x, uint32_t in_dim,
                                                                 uint32_t out_dim, uint32_t ksplit, uint32_t x_stride, uint32_t out_stride) {
     extern __shared__ uint4 st[];
     __shared__ float red[WARPS * NT];
@@ -179,17 +182,22 @@ static uint32_t pick_ksplit(uint32_t out_dim, uint32_t groups, uint32_t nb) {   
 }
 
 static int g_sm = 0;
-/* 发一次: 选 stage/pipe 与引擎同规则; R 不可用(CTA 行数 < R)时退回 R=1 */
+/* 发一次. mode: 0 = 引擎规则(组 4~12 KB 走 pipe, 每 SM 4 CTA; 其余 stage); 1 = 一律 pipe, 每 SM 4 CTA; 2 = 一律 pipe, 每 SM 8 CTA;
+ * 3 = 一律 stage. ★09-29★: 逐形状表说 pipe 那几个形状(q_b 172 / 共享专家 152 GB/s)与小形状 stage(kv 64 / q_a 175)离墙最远,
+ * 而 ksplit 不能动(改了累加序), 能动的只有"谁常驻、驻几个、搬多深" —— 这些都不改任何一行的加法序。 */
 template <uint32_t NT, uint32_t R>
-static float launch(float *o, const uint8_t *w, const float *x, uint32_t in_dim, uint32_t out_dim, uint32_t ks) {
+static void launch(float *o, const uint8_t *w, const float *x, uint32_t in_dim, uint32_t out_dim, uint32_t ks, int mode) {
     const uint32_t nb = in_dim / BLK, rpb = WARPS / ks, ngrp = (out_dim + rpb - 1u) / rpb, grp = rpb * nb * BYTES;
-    if (grp > PIPE_MIN && grp <= PIPE_MAX) {
-        uint32_t gx = (uint32_t)g_sm * 4u; if (gx > ngrp) gx = ngrp;
-        k_pipe<NT, R><<<gx, 256 / R, 2u * grp>>>(o, w, x, in_dim, out_dim, ks, in_dim, out_dim);
+    const bool eng_pipe = grp > PIPE_MIN && grp <= PIPE_MAX;
+    const bool pipe = mode == 1 || mode == 2 || (mode == 0 && eng_pipe);
+    if (pipe) {
+        const uint32_t occ = mode == 2 ? 8u : 4u;
+        uint32_t gx = (uint32_t)g_sm * occ; if (gx > ngrp) gx = ngrp;
+        if (mode == 2) k_pipe<NT, R, 8u><<<gx, 256 / R, 2u * grp>>>(o, w, x, in_dim, out_dim, ks, in_dim, out_dim);
+        else           k_pipe<NT, R, 4u><<<gx, 256 / R, 2u * grp>>>(o, w, x, in_dim, out_dim, ks, in_dim, out_dim);
     } else {
         k_stage<NT, R><<<ngrp, 256 / R, grp>>>(o, w, x, in_dim, out_dim, ks, in_dim, out_dim);
     }
-    return 0.f;
 }
 
 template <uint32_t NT>
@@ -200,8 +208,9 @@ static void run_nt(int iters) {
         {"shexp_gate/up 2304x5120", 2304, 5120, 80, 1}, {"shexp_down 5120x2304", 5120, 2304, 40, 1},
         {"kv 512x5120", 512, 5120, 40, 1}, {"idx_q_b 4096x1280", 4096, 1280, 8, 1},
         {"output 129280x5120", 129280, 5120, 1, 1} };
-    double tot[3] = {0, 0, 0}, tot_bytes = 0;
-    printf("== NT=%u 行激活\n", NT);
+    const int NM = 4; const char *mname[NM] = { "引擎规则", "pipe×4", "pipe×8", "stage" };
+    double tot[NM] = {0, 0, 0, 0}, best_tot = 0, tot_bytes = 0;
+    printf("== NT=%u 行激活(µs / GB/s; 四种发法, ksplit 不变 ⇒ 全部逐位同)\n", NT);
     for (const shape_t &sh : shapes) {
         const uint32_t nb = sh.in_dim / BLK, ks = pick_ksplit(sh.out_dim, sh.groups, nb), rpb = WARPS / ks;
         const uint64_t mbytes = (uint64_t)sh.out_dim * nb * BYTES;
@@ -218,47 +227,42 @@ static void run_nt(int iters) {
         for (uint64_t i = 0; i < xn; i++) hx[i] = (float)((int)((i * 7 + i / sh.in_dim * 3) % 17) - 8) * 0.0625f;   /* 各行不同 */
         uint8_t **dw = (uint8_t **)malloc(sizeof(uint8_t *) * ncopy);
         for (int c = 0; c < ncopy; c++) { CK(cudaMalloc(&dw[c], mbytes)); CK(cudaMemcpy(dw[c], h, mbytes, cudaMemcpyHostToDevice)); }
-        float *dx, *o[3], *o1; CK(cudaMalloc(&dx, xn * 4)); CK(cudaMemcpy(dx, hx, xn * 4, cudaMemcpyHostToDevice));
-        for (int v = 0; v < 3; v++) CK(cudaMalloc(&o[v], on * 4));
+        float *dx, *o[NM], *o1; CK(cudaMalloc(&dx, xn * 4)); CK(cudaMemcpy(dx, hx, xn * 4, cudaMemcpyHostToDevice));
+        for (int v = 0; v < NM; v++) CK(cudaMalloc(&o[v], on * 4));
         CK(cudaMalloc(&o1, on * 4));
         cudaEvent_t e0, e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
-        const bool r2 = rpb >= 2u, r4 = rpb >= 4u;
-        auto go = [&](int v, const uint8_t *wp, float *dst) {
-            if (v == 1 && r2) launch<NT, 2>(dst, wp, dx, sh.in_dim, sh.out_dim, ks);
-            else if (v == 2 && r4) launch<NT, 4>(dst, wp, dx, sh.in_dim, sh.out_dim, ks);
-            else launch<NT, 1>(dst, wp, dx, sh.in_dim, sh.out_dim, ks);
-        };
-        float us[3];
-        for (int v = 0; v < 3; v++) {
-            for (int i = 0; i < 5; i++) go(v, dw[i % ncopy], o[v]);
+        float us[NM];
+        for (int v = 0; v < NM; v++) {
+            for (int i = 0; i < 5; i++) launch<NT, 1>(o[v], dw[i % ncopy], dx, sh.in_dim, sh.out_dim, ks, v);
             CK(cudaEventRecord(e0));
-            for (int i = 0; i < iters; i++) go(v, dw[i % ncopy], o[v]);
+            for (int i = 0; i < iters; i++) launch<NT, 1>(o[v], dw[i % ncopy], dx, sh.in_dim, sh.out_dim, ks, v);
             CK(cudaEventRecord(e1)); CK(cudaEventSynchronize(e1)); CK(cudaGetLastError());
             float ms; CK(cudaEventElapsedTime(&ms, e0, e1)); us[v] = ms * 1000.f / iters;
-            go(v, dw[0], o[v]);
+            launch<NT, 1>(o[v], dw[0], dx, sh.in_dim, sh.out_dim, ks, v);
         }
-        /* 判据②: 第 t 行单独跑 NT=1(引擎纯解码那条路) */
+        /* 判据②: 第 t 行单独跑 NT=1(引擎纯解码那条路, 引擎规则) */
         for (uint32_t t = 0; t < NT; t++)
-            launch<1, 1>(o1 + (uint64_t)t * sh.out_dim, dw[0], dx + (uint64_t)t * sh.in_dim, sh.in_dim, sh.out_dim, ks);
+            launch<1, 1>(o1 + (uint64_t)t * sh.out_dim, dw[0], dx + (uint64_t)t * sh.in_dim, sh.in_dim, sh.out_dim, ks, 0);
         CK(cudaDeviceSynchronize());
-        float *r[3], *r1 = (float *)malloc(on * 4);
-        for (int v = 0; v < 3; v++) { r[v] = (float *)malloc(on * 4); CK(cudaMemcpy(r[v], o[v], on * 4, cudaMemcpyDeviceToHost)); }
+        float *r[NM], *r1 = (float *)malloc(on * 4);
+        for (int v = 0; v < NM; v++) { r[v] = (float *)malloc(on * 4); CK(cudaMemcpy(r[v], o[v], on * 4, cudaMemcpyDeviceToHost)); }
         CK(cudaMemcpy(r1, o1, on * 4, cudaMemcpyDeviceToHost));
-        uint64_t bad_r = 0, bad_1 = 0;
-        for (uint64_t i = 0; i < on; i++) { if (memcmp(&r[0][i], &r[1][i], 4) || memcmp(&r[0][i], &r[2][i], 4)) bad_r++; if (memcmp(&r[0][i], &r1[i], 4)) bad_1++; }
-        printf("%-24s %6.1f MB ks=%u rpb=%u | R1 %7.1f us %4.0f GB/s | R2 %7.1f us %4.0f%s | R4 %7.1f us %4.0f%s | %s / %s\n",
-               sh.name, mbytes / 1e6, ks, rpb, us[0], mbytes / (us[0] * 1e3), us[1], mbytes / (us[1] * 1e3), r2 ? "" : "(=R1)",
-               us[2], mbytes / (us[2] * 1e3), r4 ? "" : "(=R1)",
-               bad_r ? "★R 间不同★" : "R 间逐位同", bad_1 ? "★≠单行★" : "== 单行逐位");
-        for (int v = 0; v < 3; v++) tot[v] += us[v] * sh.per_step;
+        uint64_t bad_m = 0, bad_1 = 0;
+        for (uint64_t i = 0; i < on; i++) { for (int v = 1; v < NM; v++) if (memcmp(&r[0][i], &r[v][i], 4)) bad_m++; if (memcmp(&r[0][i], &r1[i], 4)) bad_1++; }
+        int best = 0; for (int v = 1; v < NM; v++) if (us[v] < us[best]) best = v;
+        printf("%-24s %6.1f MB ks=%u rpb=%u 组 %5.1f KB |", sh.name, mbytes / 1e6, ks, rpb, (double)rpb * nb * BYTES / 1024.0);
+        for (int v = 0; v < NM; v++) printf(" %s %6.1f us %3.0f |", mname[v], us[v], mbytes / (us[v] * 1e3));
+        printf(" 最快 %s | %s / %s\n", mname[best], bad_m ? "★发法间不同★" : "发法间逐位同", bad_1 ? "★≠单行★" : "== 单行逐位");
+        for (int v = 0; v < NM; v++) tot[v] += us[v] * sh.per_step;
+        best_tot += us[best] * sh.per_step;
         tot_bytes += (double)mbytes * sh.per_step;
         for (int c = 0; c < ncopy; c++) cudaFree(dw[c]);
-        for (int v = 0; v < 3; v++) { cudaFree(o[v]); free(r[v]); }
+        for (int v = 0; v < NM; v++) { cudaFree(o[v]); free(r[v]); }
         free(dw); cudaFree(dx); cudaFree(o1); free(h); free(hx); free(r1);
         cudaEventDestroy(e0); cudaEventDestroy(e1);
     }
-    printf("== NT=%u 每步合计(按发射次数加权): R1 %.2f / R2 %.2f / R4 %.2f ms, 字节 %.2f GB ⇒ 墙(242 GB/s) %.2f ms\n",
-           NT, tot[0] / 1e3, tot[1] / 1e3, tot[2] / 1e3, tot_bytes / 1e9, tot_bytes / 242e9 * 1e3);
+    printf("== NT=%u 每步合计(按发射次数加权): 引擎规则 %.2f / pipe×4 %.2f / pipe×8 %.2f / stage %.2f / 逐形状取最快 %.2f ms, 字节 %.2f GB ⇒ 墙(242 GB/s) %.2f ms\n",
+           NT, tot[0] / 1e3, tot[1] / 1e3, tot[2] / 1e3, tot[3] / 1e3, best_tot / 1e3, tot_bytes / 1e9, tot_bytes / 242e9 * 1e3);
 }
 
 int main(int argc, char **argv) {
