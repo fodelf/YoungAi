@@ -81,7 +81,7 @@ int ds4_engine_v41_dspark_capture(ds4_engine *e, const int *ids, int n_ids, cons
     if (n_prompt < 1 || n_prompt > n_ids - 2) n_prompt = 1;   /* 0/越界 = 老口径: 位置 0 暖主模型, 从 1 起逐位 */
     ds4_v41_state st;
     const uint32_t cap = n_prompt > 1 ? (DS4_V41_CHUNK < (uint32_t)n_prompt ? DS4_V41_CHUNK : (uint32_t)n_prompt) : 1u;
-    if (!v41_state_alloc(&st, cap, ctx)) return 1;   /* cap=1: 一位一块, 见文件头; 提示段按块预填时 cap = 块 */
+    if (!v41_state_alloc(&st, cap, ctx, 0)) return 1;   /* cap=1: 一位一块, 见文件头; 提示段按块预填时 cap = 块; logits 按 cap 开(取料路不走末位捷径) */
     ds4_v41_draft dr;
     if (!v41_draft_alloc(e, &dr)) { fprintf(stderr, "ds4: 这份 GGUF 没带 DSpark 三塔, 取不了料\n"); v41_state_free(&st); return 1; }
     FILE *fo = fopen(out_path, "wb");

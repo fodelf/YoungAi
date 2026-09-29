@@ -17,7 +17,12 @@
 #define V41_EGATHER_THREADS 48u   /* engram 取行的常驻线程池大小(解码 n=1 时任务单元正好 2 层 × 24 行) */
 #define V41_EDIO_ALIGN 4096u      /* O_DIRECT 的对齐粒度(逻辑块); 一行只有 264 B, 所以要读对齐超集 + 落脚点 */
 
-#define DS4_V41_CHUNK 512u          /* prefill 分块(缓冲按它分配; 对拍用 --v41-chunk 改小看自洽) */
+/* prefill 分块(缓冲按它分配; 对拍用 --v41-chunk 改小看自洽)。
+ * ★512 → 2048(2026-09-29)★: 一块要把本层 384 个专家的位流全解一遍(每层 2.55 GB), 块里每个专家平均只摊到 n/64 个 token ——
+ * 块 512 时 8 个, 解码成本摊不开。12k 真实提示同机同趟(speed-bench/prefill_ttft_ruler.sh, 生成文本四档逐字节同):
+ * 512 = 565 t/s / 1024 = 655 / 2048 = 715 / 4096 = 753; 内存(MemAvailable 最低)9193 / 7111 / 6580 / 3029 MB —— 4096 贴到看门狗
+ * 红线(2500), 2048 是速度与内存的拐点。随块长的缓冲(hc/q/o/logits)见下面的内存账; logits 与出口头暂存已不随块长(head_last_only)。 */
+#define DS4_V41_CHUNK 2048u
 /* 上下文硬上限。历史: topk 与候选块两个核都把"整段组数"放 shared(48 KB ⇒ ratio-1 层最多 ~78k 个位置),
  * 所以这里一直写死 32768。topk 核 2026-09-16 换成固定 256 桶的 radix select, 候选块核 2026-09-21 把
  * [nb] 两个数组挪进全局暂存 —— 两道 shared 墙都没了, 上限改由内存账定。
@@ -68,7 +73,15 @@ typedef struct {
     ds4_gpu_tensor *o, *low, *attn_out;                  /* [cap][64·512], [cap][8192], [cap][E] */
     ds4_gpu_tensor *glog, *sel, *rw, *routed;            /* [cap][384], i32 [cap][6], [cap][6], [cap][E] */
     ds4_gpu_tensor *sg, *su, *sh, *so, *y;               /* [cap][2304] ×3, [cap][E] ×2 */
-    ds4_gpu_tensor *logits;     /* [cap][V] 本 chunk 全位置 */
+    ds4_gpu_tensor *logits;     /* [logits_rows][V]: 打分路 = cap 行(全位置); 生成路只开 DS4_MTP_MAX_BLOCK+2 行(见 head_last_only) */
+    uint32_t logits_rows;
+    /* ★生成路的预填块只算末位的 logits★(2026-09-29): 生成只读最后一位, 而出口头对整块走"q4_K 解成 bf16 暂存(1.3 GB) + cuBLAS"是
+     * 白算 + 白占(块 2048 时 logits 1.06 GB + 暂存 1.3 GB)。置 1 时 v41_forward_body 对 n > DS4_V41_GEMV_MAX_TOK 的块只把末位
+     * 归一化后的行拷进 xlast, 走解码同款的 q4_K GEMV 出 logits 第 0 行; last_logit_row 告诉调用方末位的 logits 在哪一行。
+     * 解码/验证批(n ≤ 8)不受影响, 每行照算。打分路(--score-ids)每个位置都要 logits, 不置。 */
+    int head_last_only;
+    uint32_t last_logit_row;
+    ds4_gpu_tensor *xlast;      /* [1][E] 末位归一化后的出口输入 */
     ds4_gpu_tensor *eraw[DS4_V41_MAX_ENGRAM], *erows, *ekv;   /* engram: u8 [cap][24][264] 原始行字节(每个 engram 层一份: graph 路
                                  * 两层的行在同一处一起上传, 不能共用一块), [cap][24·256] 解码行, [cap][(hc+1)·E] wkv 输出 */
     /* ---- 解码整步 CUDA graph(2026-09-18, core_decode_graph.c) ---- */
@@ -201,11 +214,13 @@ typedef struct { int32_t *tok; uint32_t n, cap; const uint8_t *brk; } v41_hist;
 bool v41_next_token(ds4_v41_state *st, ds4_gpu_tensor *am, uint32_t row, float *rowbuf, uint64_t *rng, v41_hist *h, int32_t *out);
 
 /* engram 取行的 io_uring 通道(core_v41_ering.c; Linux 才有, open 返回 NULL 就退回线程池)。
- * 一轮 = submit 一批请求(不等) → wait 收齐; 队列装不下的请求 wait 里分批续发。direct = fd 是 O_DIRECT 的(对齐超集进落脚点再拷)。 */
+ * 一轮 = submit 先灌满队列(不等) → wait 边收边续发直到收齐(队列常满, 落脚点走空闲栈)。direct = fd 是 O_DIRECT 的(对齐超集进落脚点再拷)。
+ * ★一轮的请求数 > cap 时 wait 里有真正的等盘★: 那样的轮不许在主线程上收(GPU 会跟着空转), 见 core_v41_engram.c 的取行线程。 */
 typedef struct { int fd; int direct; uint32_t len; uint64_t off; uint8_t *dst; } v41_ering_req;
 typedef struct v41_ering v41_ering;
 v41_ering *v41_ering_open(uint32_t cap);
 void v41_ering_close(v41_ering *r);
+uint32_t v41_ering_cap(const v41_ering *r);   /* 队列深度 = 一次能在飞的请求数(落脚点数) */
 bool v41_ering_submit(v41_ering *r, const v41_ering_req *reqs, uint32_t n);
 bool v41_ering_wait(v41_ering *r);
 /* engram 取行的一个工作单元(core_v41_engram.c 填, core_v41_epool.c 的池跑) */
@@ -237,7 +252,8 @@ void v41_amp_free(ds4_v41_state *st);
 int v41_amp_hook(ds4_v41_state *st, uint32_t il);        /* 钩子回调(挂了才动): 同步 → x/y/sel/rw 下主机 → 回调; 0 继续 / 1 提前结束(置 stop_early) / <0 失败 */
 bool v41_amp_apply(ds4_v41_state *st, uint32_t il);      /* y += x·(B·A) → bf16(挂了该层才动) */
 ds4_gpu_tensor *v41_alloc(uint64_t bytes, bool *ok);   /* 小工具: 分配失败只置 ok=false, 调用方一路攒到最后再判 */
-bool v41_state_alloc(ds4_v41_state *st, uint32_t cap_tok, uint32_t ctx);
+/* logits_rows: 0 = 按 cap 开(打分路, 每个位置都要); 生成路给 DS4_MTP_MAX_BLOCK+2(解码 1 行 / 验证批 ≤ block+1 行 / 预填块末位 1 行) */
+bool v41_state_alloc(ds4_v41_state *st, uint32_t cap_tok, uint32_t ctx, uint32_t logits_rows);
 bool v41_index_scratch_prepare(ds4_v41_state *st, uint32_t ng_need);   /* iscore/cand 长到够放 ng_need 组(够了就是 no-op) */
 void v41_state_free(ds4_v41_state *st);
 bool v41_forward(ds4_engine *e, ds4_v41_state *st, const int32_t *ids, uint32_t n);   /* 追加 n 个 token, st->logits[n][V] */

@@ -119,7 +119,7 @@ int ds4_engine_v41_score_ids(ds4_engine *e, const int *ids, int n_ids, const cha
     const uint32_t ck = chunk > 0 ? (uint32_t)chunk : DS4_V41_CHUNK;
     const uint32_t cap = ck < n ? ck : n;
     ds4_v41_state st;
-    if (!v41_state_alloc(&st, cap, n)) return 1;
+    if (!v41_state_alloc(&st, cap, n, 0)) return 1;   /* 打分路: 每个位置都要 logits, 按 cap 开 */
     st.dump_prefix = (n <= 64u && cap == n) ? out_path : NULL;   /* 单块小样本自动落逐层 x/y, 对拍定位用 */
     st.no_engram = no_engram;
     if (no_engram) fprintf(stderr, "[v41] ★no-engram★ 对拍口径, 跳过 engram 层\n");
@@ -196,9 +196,7 @@ int ds4_engine_v41_score_ids(ds4_engine *e, const int *ids, int n_ids, const cha
     return ok ? 0 : 1;
 }
 
-/* --v41-chunk 也管生成路的预填分块(以前只管 --score-ids, 生成路写死 DS4_V41_CHUNK=512)。
- * 为什么要管: 段 5 的专家路每层要把 384 个专家全解一遍成 NVFP4, 这个代价**与块里有几个 token 无关** ——
- * 块 512 时它摊不开(实测 TTFT 193 t/s, 还不如融合路的 206), 块开大才反超。 */
+/* --v41-chunk 也管生成路的预填分块(以前只管 --score-ids): 专家路每层要把 384 个专家全解一遍, 代价与块里有几个 token 无关, 块小就摊不开(实测账在 core_v41.h) */
 int g_ds4_v41_chunk = 0;
 void ds4_engine_v41_set_chunk(int n) { g_ds4_v41_chunk = n > 0 ? n : 0; }
 
@@ -230,7 +228,8 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
     const uint32_t ck = g_ds4_v41_chunk > 0 ? (uint32_t)g_ds4_v41_chunk : DS4_V41_CHUNK;
     const uint32_t cap = ck < np ? ck : np;
     ds4_v41_state st;
-    if (!v41_state_alloc(&st, cap, ctx)) return 1;
+    if (!v41_state_alloc(&st, cap, ctx, DS4_MTP_MAX_BLOCK + 2u)) return 1;   /* 生成路: logits 只要解码/验证批那几行 + 预填末位 */
+    st.head_last_only = 1;   /* 预填块只算末位 logits(core_v41.h) */
     ds4_gpu_tensor *am = ds4_gpu_tensor_alloc((uint64_t)(DS4_MTP_MAX_BLOCK + 2u) * 16u);   /* 设备槽: 每行 16 B(采样核 4 个 int; argmax 只用第 0 个) */
     const int eos = ds4_token_eos(e);
     int rc = 1;
@@ -275,7 +274,9 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
             uint32_t nc = np - c0 < cap ? np - c0 : cap;
             /* ★最后一块至少留 window 个位置★(2026-09-21, bug.md §6.1): 官方 Decoder SWA Bounded Replay = 最后 n_win 个 token
              * 跑满解码器; 这里最后一块就是那段回放, 以前它 = 提示长 mod 512(1~512), 不足 128 时首批生成 token 的窗口直接
-             * 缺位。余下不足 window 就从这一块匀过去(这一块缩短, 最后一块正好 window 个)。 */
+             * 缺位。余下不足 window 就从这一块匀过去(这一块缩短, 最后一块正好 window 个)。
+             * ★判负存档(2026-09-29)★: 试过"最后一块只留正好 window 个"(= 官方回放的最小长度, CFO 14103 token 预填 15.1 → 13.8 s) —— 最后 window 位的
+             * 解码器窗口被截到块头, 隐态变差: 同一 CFO 请求投机接受 1.87 → 1.41/5 位、解码 43.5 → 38.3 t/s, 文本第 1 字就变。质量不为速度让步, 回退。 */
             const uint32_t rest = np - c0 - nc;
             if (rest > 0u && rest < DS4_N_SWA && nc > DS4_N_SWA) nc -= DS4_N_SWA - rest;
             /* CED: 除最后一块外, 只跑编码器段 + 分界层 KV(最后一块同时充当官方说的"解码器有界回放") */
@@ -302,10 +303,10 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
                               (double)g_decode_sampling.freq_penalty, (double)g_decode_sampling.presence_penalty);
         /* 末位 logits → argmax(或采样) → 逐 token 解码(n=1 前向) */
         int32_t tok32 = 0;
-        if (!v41_next_token(&st, am, st.n - 1, rowbuf, &rng, &hist, &tok32)) break;
+        if (!v41_next_token(&st, am, st.last_logit_row, rowbuf, &rng, &hist, &tok32)) break;   /* 末位的 logits 在哪一行由出口定(head_last_only ⇒ 第 0 行) */
         if (!rowbuf && !dev_sample) {   /* 设备 argmax 自检(一次): 与主机顺序扫对一下, 不同就报 —— 核错会静默吐错 token */
             float *row = xmalloc((size_t)DS4_N_VOCAB * 4);
-            if (ds4_gpu_tensor_read(st.logits, (uint64_t)(st.n - 1) * DS4_N_VOCAB * 4, row, (uint64_t)DS4_N_VOCAB * 4)) {
+            if (ds4_gpu_tensor_read(st.logits, (uint64_t)st.last_logit_row * DS4_N_VOCAB * 4, row, (uint64_t)DS4_N_VOCAB * 4)) {
                 uint32_t best = 0; for (uint32_t v = 1; v < DS4_N_VOCAB; v++) if (row[v] > row[best]) best = v;
                 if ((int32_t)best != tok32) fprintf(stderr, "ds4: ★V4.1 argmax 核 %d ≠ 主机 %u (logit %.4f vs %.4f)★\n", tok32, best, (double)row[tok32], (double)row[best]);
             }

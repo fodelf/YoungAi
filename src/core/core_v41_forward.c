@@ -16,7 +16,7 @@ ds4_gpu_tensor *v41_alloc(uint64_t bytes, bool *ok) {
     return t;
 }
 
-bool v41_state_alloc(ds4_v41_state *st, uint32_t cap, uint32_t ctx) {
+bool v41_state_alloc(ds4_v41_state *st, uint32_t cap, uint32_t ctx, uint32_t logits_rows) {
     memset(st, 0, sizeof *st);
     st->cap_tok = cap; st->ctx = ctx; st->idx_owner = -1; st->cand_owner = -1;
     for (uint32_t i = 0; i < DS4_V41_MAX_ENGRAM; i++) st->eshard[i].fd = -1;
@@ -51,7 +51,10 @@ bool v41_state_alloc(ds4_v41_state *st, uint32_t cap, uint32_t ctx) {
     st->sg = v41_alloc((uint64_t)cap * FF * 4, &ok);      st->su = v41_alloc((uint64_t)cap * FF * 4, &ok);
     st->sh = v41_alloc((uint64_t)cap * FF * 4, &ok);      st->so = v41_alloc((uint64_t)cap * E * 4, &ok);
     st->y = v41_alloc((uint64_t)cap * E * 4, &ok);
-    st->logits = v41_alloc((uint64_t)cap * DS4_N_VOCAB * 4, &ok);
+    /* logits 只按真要读的行数开(2026-09-29, 见 core_v41.h head_last_only): 生成路给 DS4_MTP_MAX_BLOCK+2 行, 打分路 0 = cap 行 */
+    st->logits_rows = (logits_rows && logits_rows < cap) ? logits_rows : cap;
+    st->logits = v41_alloc((uint64_t)st->logits_rows * DS4_N_VOCAB * 4, &ok);
+    st->xlast = v41_alloc((uint64_t)E * 4, &ok);
     /* DSpark 的 main_hidden: 留最后 SWA 行 —— 预填完要用它把三塔的 128 行窗口一次填满
      * (官方 DSparkBlock.forward(start_pos=0) 就是拿整段 main_kv 灌窗口), 之后每轮只进几行。 */
     if (g_ds4_v41.mtp_block && g_ds4_v41.n_mtp_target) {
@@ -134,7 +137,7 @@ void v41_state_free(ds4_v41_state *st) {
     ds4_gpu_tensor **all[] = { &st->tok, &st->pos, &st->posg, &st->hc, &st->hc2, &st->mix, &st->pre, &st->post, &st->comb, &st->pre_mix,
         &st->x, &st->xn, &st->qr, &st->qrn, &st->q, &st->kv, &st->kvn, &st->ckv, &st->csc, &st->pooled, &st->latent, &st->ktmp, &st->wintmp,
         &st->iq, &st->iw, &st->iscore, &st->cand, &st->idx, &st->o, &st->low, &st->attn_out, &st->glog, &st->sel, &st->rw,
-        &st->routed, &st->sg, &st->su, &st->sh, &st->so, &st->y, &st->logits, &st->mainh };
+        &st->routed, &st->sg, &st->su, &st->sh, &st->so, &st->y, &st->logits, &st->xlast, &st->mainh };
     for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) { if (*all[i]) ds4_gpu_tensor_free(*all[i]); *all[i] = NULL; }
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
         ds4_gpu_tensor **per[] = { &st->win[il], &st->comp_kv[il], &st->index_k[il], &st->cpre_kv[il], &st->cpre_sc[il],
@@ -180,7 +183,26 @@ static void v41_moe_uniq_probe(ds4_v41_state *st, uint32_t il, uint32_t topk, co
     int32_t s[8u * 8u];
     const uint32_t ns = st->n * topk;
     uint32_t uniq = 0;
-    if (!g_ds4_v41_prof || st->n < 2u || ns > sizeof(s) / sizeof(s[0])) return;
+    if (!g_ds4_v41_prof || st->n < 2u) return;
+    if (ns > sizeof(s) / sizeof(s[0])) {
+        /* ★预填块的路由分布(2026-09-29)★: 预填专家核按专家开工作项(≤ BN 个 token 一项, 超了再开一项 = 位流再解一遍), 所以每层"有 token 的专家数 /
+         * 最大专家的 token 数 / 项数"决定它的成本; 微基准按均匀哈希路由(384 个专家各 n/64 个)算, 真路由偏斜多少只有量了才知道。 */
+        int32_t *sb = xmalloc((size_t)ns * 4); uint32_t cnt[1024]; memset(cnt, 0, sizeof cnt);
+        if (ds4_gpu_synchronize() && ds4_gpu_tensor_read(st->sel, 0, sb, (uint64_t)ns * 4)) {
+            uint32_t ne = 0, mx = 0, items32 = 0, items64 = 0, items128 = 0;
+            for (uint32_t i = 0; i < ns; i++) if (sb[i] >= 0 && sb[i] < 1024) cnt[sb[i]]++;
+            for (uint32_t e = 0; e < 1024u; e++) if (cnt[e]) { ne++; if (cnt[e] > mx) mx = cnt[e]; items32 += (cnt[e] + 31u) / 32u; items64 += (cnt[e] + 63u) / 64u; items128 += (cnt[e] + 127u) / 128u; }
+            fprintf(stderr, "[%s] L%02u n=%u: 有 token 的专家 %u, 最大 %u 个 token, 工作项 BN32 %u / BN64 %u / BN128 %u\n", tag, il, st->n, ne, mx, items32, items64, items128);
+            /* 首块的逐专家计数落盘(/tmp/v41_route_Lnn_nNNNN.txt, 一行一个专家): 给 gguf-tools/bench/v41_vq_prefill_mma_bench.cu 当真路由用 */
+            if (st->pos0 == 0u) {
+                char p[96]; snprintf(p, sizeof p, "/tmp/v41_route_L%02u_n%u.txt", il, st->n);
+                FILE *f = fopen(p, "w");
+                if (f) { for (uint32_t e = 0; e < DS4_N_EXPERT; e++) fprintf(f, "%u\n", cnt[e]); fclose(f); }
+            }
+        }
+        free(sb);
+        return;
+    }
     if (!ds4_gpu_synchronize() || !ds4_gpu_tensor_read(st->sel, 0, s, (uint64_t)ns * 4)) return;
     for (uint32_t i = 0; i < ns; i++) { uint32_t j = 0; while (j < i && s[j] != s[i]) j++; if (j == i) uniq++; }
     fprintf(stderr, "[%s] L%02u n=%u: 唯一专家 %u / %u\n", tag, il, st->n, uniq, ns);
@@ -409,10 +431,21 @@ bool v41_forward_body(ds4_engine *e, ds4_v41_state *st) {
     if (n >= 64u) fputc('\n', stderr);
     if (!ok) { fprintf(stderr, "ds4: V4.1 前向失败(pos0 %u n %u)\n", st->pos0, n); return false; }
     if (st->stop_early) return true;   /* 位置照常推进(调用方做), 不出 logits */
-    /* 出口: h = hc_pre(hc, pre_mix) → norm → head(fp4x32, f32 logits), 全 n 行 */
+    /* 出口: h = hc_pre(hc, pre_mix) → norm → head(f32 logits) */
     if (!ds4_gpu_v41_hc_pre_tensor(st->x, st->hc, st->pre_mix, E, DS4_N_HC, n)) return false;
     if (!ds4_gpu_v41_rms_norm_tensor(st->xn, st->x, e->model.map, e->model.size, e->weights.output_norm->abs_offset, E, n, DS4_RMS_EPS)) return false;
-    if (!v41_tproj(&e->model, st->logits, e->weights.output, E, DS4_N_VOCAB, st->xn, n, 0)) return false;
+    if (st->head_last_only && n > DS4_V41_GEMV_MAX_TOK) {
+        /* ★生成路的预填块只算末位, 走解码同款 GEMV★(2026-09-29, 见 core_v41.h head_last_only): 整块走 GEMM 路 = 出口头 1.3 GB bf16 暂存 +
+         * 2048 行 × 129280 列的白算, 而生成只读末位。★与整块 GEMM 路不逐字节同★: GEMM 路先把 q4_K 头权重舍成 bf16 再乘, GEMV 用 q4_K 原值
+         * (与之后每一步解码同一条核路) —— 首个生成 token 的 logits 从"预填精度"变成"解码精度", 判据是文本/五指标, 不是 cmp。 */
+        if (!ds4_gpu_tensor_copy(st->xlast, 0, st->xn, (uint64_t)(n - 1u) * E * 4, (uint64_t)E * 4)) return false;
+        if (!v41_tproj(&e->model, st->logits, e->weights.output, E, DS4_N_VOCAB, st->xlast, 1, 0)) return false;
+        st->last_logit_row = 0;
+    } else {
+        if (n > st->logits_rows) { fprintf(stderr, "ds4: V4.1 出口要 %u 行 logits, 缓冲只开了 %u 行\n", n, st->logits_rows); return false; }
+        if (!v41_tproj(&e->model, st->logits, e->weights.output, E, DS4_N_VOCAB, st->xn, n, 0)) return false;
+        st->last_logit_row = n - 1u;
+    }
     if (g_ds4_v41_prof) {   /* 逐层毫秒: 一眼看出哪层在吃时间(engram 层 L1/L14, 源层 L2/8/14/20, 候选层 L20) */
         if (ds4_gpu_flush_commands() == 0) return false;
         lt[DS4_N_LAYER] = now_sec() - tprev;
