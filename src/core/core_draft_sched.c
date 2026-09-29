@@ -1,77 +1,96 @@
-/* core_draft_sched.c — 投机解码的置信调度器(mtp-1.md M5′, 2026-09-16): 每一轮验证几位, 由草稿器
- * 自己报的置信度决定, 而不是钉死一个 k。
+/* core_draft_sched.c — 投机解码的置信调度器(mtp-1.md M5′, 2026-09-16; 2026-09-28 成本改为引擎自量): 每一轮验证几位,
+ * 由草稿器自己报的置信度与**本请求实测的成本**决定, 而不是钉死一个 k, 也不是钉死三个成本常量。
  *
  * 为什么需要它: 验证第 j 位要多付一份专家字节, 而它只有在"前 j−1 位全中"时才可能兑现。
  * 草稿器的 confidence 头出的就是这个条件概率(官方报告 §2.4.3 原话: per-position conditional
- * acceptance probabilities, 用来估前缀存活率)。文本好猜时多验几位白赚, 文本难猜时多验就是白读专家 ——
- * 09-16 盘上实测: 同一个二进制, README 英文均接受 1.39/5, 金融难文本只有 0.78/3。
+ * acceptance probabilities, 用来估前缀存活率)。09-16 盘上实测: 同一个二进制, README 英文均接受 1.39/5, 金融难文本只有 0.78/3。
  *
  * 判据(纯粹的除法, 不玄):
- *   一轮产出 = 1 + Σ_{j≤k} a_j,  其中 a_j = ∏_{i≤j} sigmoid(conf_i) = 第 j 位被验到时的前缀存活率
- *   一轮成本 = 草稿 + 验证(1+k 行)
- *   选 k = argmax 产出/成本; 与"纯解码一步产 1 个"比, 比值 > 1 才值得投机。
+ *   一轮产出 = 1 + Σ_{j≤k} a_j,  其中 a_j = ∏_{i≤j} ρ·σ(conf_i) = 第 j 位被验到时的前缀存活率
+ *   一轮成本 = 草稿 + 验证(1+k 行)   (毫秒, 本请求实测)
+ *   选 k = argmax 产出/成本; 与"纯解码一步产 1 个"(1/走图一步 ms)比, 比值 > 1 才值得投机。
  *
- * ★成本为什么用"以纯解码一步为 1"的比值★: 毫秒是跟机器走的, 比值不是; 而且选 k 只要比值。
- * 三个常量是盘上量的(2K 英文真提示, GB10, 见 fable5 09-16 的逐核表), 换底座要重量:
- *   c_draft = 草稿一轮 ÷ 纯解码一步
- *   c_fix + c_tok × n = 验证 n 行 ÷ 纯解码一步  (n=1 时就是纯解码那一步, 所以 c_fix + c_tok = 1)
- * c_tok 是"每多一个 token 多付多少" —— 主要是专家字节(骨架那 4.4 GB 是读一遍的, 落在 c_fix 里)。
+ * ★成本为什么改成引擎自量(2026-09-28, 用户铁律"不得为了速度写死任何硬编码")★: 以前三个数(草稿/验 1 行/每多一行, 以纯解码一步为 1)是
+ * 盘上量的编译期常量, 核一变快常量还是旧的, 调度器就拿旧账把投机整个挡死 —— 09-17 实撞(新核落地后 40 个 token 里 0 轮草稿),
+ * 之后 09-19、09-24 各重标了两次。现在每请求自己记: 走图一步 / 草稿一轮 / 验证 n 行 各自的墙钟均值, 验证成本按 n 做加权最小二乘
+ * (验 n 行 = v1 + tok·(n−1); 验 1 行就是一个单 token 步, 所以 n=1 那个点 = 纯解码步的均值), 没量到的 n 用拟合线。
+ * 起步没有样本时先验最长的一块(k = block)量一次, 再补一个 n=2 的点, 之后就全按实测走。
  *
- * ★为什么不在线学墙钟★: 温 0 下引擎的输出不许随时钟变。这里 k 只由 conf 与三个编译期常量决定,
- * 同一份输入必然选同一个 k。(而且 k 变不改输出 —— 投机是同轨的, k 只影响快慢。)
- * V4 08-21 撞过反例: 那版用墙钟仲裁, 温 0 的输出会随机器忙闲变, 09-07 删掉了。 */
+ * ★为什么以前不接墙钟, 现在可以★: 09-16 的顾虑是"温 0 下输出不许随时钟变"(V4 08-21 撞过: 那版的批路不逐字节, 用墙钟仲裁 k 就等于用
+ * 时钟改输出)。V4.1 的投机 == 纯解码 逐字节(d1 门每改必验), k 只影响快慢不影响输出, 所以 k 随墙钟变是安全的; 变的只是速度的可复现性。
+ * ρ(接受率校准)仍只由 token 史定。 */
 #include "core_internal.h"
 #ifndef DS4_NO_GPU
 #include <math.h>
 
-/* ★三个数必须跟着核走(2026-09-17 重标, mtp-2.md C 段)★
- *
- * 它们是编译期常量, 所以**核一变快、常量不改, 调度器就会拿旧账把投机整个挡死** —— 实撞过:
- * 专家核上了张量核之后, 40 个 token 里**一轮草稿都没出**(调度器每次都判"连草稿钱都赚不回来"),
- * 于是新核的收益一分都兑现不了, 而日志里只有一行"调度器判亏本歇了 N 次", 很容易当成"投机就是不划算"。
- *
- * 现役这一版的来路(09-16/09-17 同机器状态, 2K 英文真提示, --v41-prof 口径, VQ 专家走标量核):
- *   纯解码一步 47.8~48.3 ms(中位) / 草稿一轮 13.3~13.6 ms / 验证 5 行 117.2 ms
- *   ⇒ c_draft = 0.285; 117.2/48.3 = 2.43 = c_fix + 5·c_tok, 且 c_fix + c_tok = 1 ⇒ c_tok = 0.385, c_fix = 0.615
- *   ⇒ 盈亏点: 接受率 p₁ > 0.67(k=1 时 成本 = c_draft + c_fix + 2·c_tok), 而实测 p₁ 只有 0.50~0.60。
- *
- * ★09-17 量过一版更低的(c_draft 0.275 / c_tok 0.262, 盈亏点 0.537)★: 那是 VQ 专家上张量核 + 按专家并集
- * 之后的实测(验证 5 行 117.2 → 98.8 ms, 边际降 32%), 调度器也确实开始出草稿了(2K 从慢 6.6% 收到慢 1.5%)。
- * 但那把核在 **n=1 上退 3.5%**(mma 的 N=8 固定, 纯解码 8 列里 7 列是零), 而纯解码是现役路径 ⇒ 整体回退,
- * 常量跟着回来。★常量必须与核匹配★: 核换了不改常量, 调度器会按错的账选 k —— 这两件事是一体的。
- *
- * ★c_tok 为什么还是 0.26 而不是 0★: 每多一个 token 就多选中约 3.9 个**新**专家(09-17 实测唯一专家
- * 6 → 9.96 → 13.26 → 17.38 → 21.71, n=1..5), 字节涨 0.65 份/token ⇒ 就算核贴到带宽墙也要 4 ms/位。
- * 这是 384 选 6 的路由在相邻位置上几乎不重合造成的, 任何核形态都绕不过(mtp-2.md §2.2)。
- * ⇒ 换核/换底座之后**必须回来重量这三个数**, 量法就是上面那三行(d0a 的 spec 模式 + `--dspark-verify`)。 */
-/* ★09-19 重标(解码整步 graph + 09-18 VQ 核之后; 单位 = 走图纯解码一步 38.07 ms, 金融提示在线 + 09-18 钉死 k=1/k=3 两趟)★
- *   草稿一轮 13.5 ms ⇒ c_draft 0.355;  直发验证 1+k 行 = 42.5 + 12.95·k ms ⇒ c_v1 1.116(直发一行含同步/argmax, 比走图一步贵), c_tok 0.340。
- * 老式子把 c_fix + c_tok 焊成 1(验 1 行 = 纯解码一步), 走图之后不成立: 歇着的步走图 38 ms, 投机轮的验证走直发 42.5。
- * 三个数由陪审团 gguf-tools/bench/dspark_sim(教师强制取料上重放整段)定, 同一份取料上: 老常量+冷却 16 = 27.8 t/s, 新常量+冷却 4 = 28.3。 */
-/* ★09-24 重标两次(真实 CFO 请求在线, 钉死 k=1/k=3 两趟; 单位 = 走图纯解码一步)★
- *   ①验证批换 stage/pipe 核后(一步 35.16): 草稿 9.9 / 验证 37.95 + 12.45·k ms ⇒ 0.282 / 1.079 / 0.354; 陪审团冷却 4 = 36.21, 0 = 37.31。
- *   ②专家换验证批常驻核后(一步 34.83): 草稿 9.5 / 验证 37.15 + 10.55·k ms ⇒ 下面三个数; 陪审团冷却 0 = 40.15(①组常量 39.96), 冷却 2/4 = 39.20/39.18。 */
-#define V41_SCHED_C_DRAFT 0.273f
-#define V41_SCHED_C_V1    1.067f
-#define V41_SCHED_C_TOK   0.303f
+static float v41_sched_sigmoid(float c) { return isfinite(c) ? 1.0f / (1.0f + expf(-c)) : 0.0f; }   /* 非有限 conf = 没把握 */
+
+/* ★采样下的在线校准(2026-09-28, 声明见 core_v41.h)★: conf 头学的是"贪心会不会同选", 采样下接受概率 = 目标分布给草稿的概率, 系统性偏低。
+ * ρ = 本请求出过草稿的轮里 首位命中数 / 首位 σ(conf) 之和, 乘到每位 σ 上(封顶 1)。贪心下 ρ 在 1 附近, 是对 conf 头本身的校正。
+ * 每一轮都观测(k=0 的轮看吐出的 token 是否就是草稿首位), 否则首轮被拒就死锁在 ρ=0。 */
+void v41_sched_observe(v41_sched *s, const float *conf, int hit) {
+    if (!s) return;
+    s->pred1 += (double)v41_sched_sigmoid(conf[0]);
+    s->real1 += hit ? 1.0 : 0.0;
+}
+
+/* 成本样本: n_rows = 1 是一个单 token 步(纯解码步或 k=0 轮的图步), ≥ 2 是验证 1+k 行; ms = 这一发的墙钟(发到等完) */
+void v41_sched_cost(v41_sched *s, uint32_t n_rows, double ms) {
+    if (!s || n_rows == 0u || n_rows > DS4_MTP_MAX_BLOCK + 1u || !(ms > 0.0)) return;
+    s->ms[n_rows] += ms; s->cnt[n_rows]++;
+}
+void v41_sched_draft_cost(v41_sched *s, double ms) { if (s && ms > 0.0) { s->draft_ms += ms; s->draft_n++; } }
+
+/* 验证 n 行的毫秒: 按已有样本(每个 n 一个均值, 计数为权)做加权最小二乘 ms(n) = v1 + tok·(n−1); 只有一个 x 时退化成常数。
+ * 返回 false = 一个样本都没有。 */
+static bool v41_sched_fit(const v41_sched *s, double *v1, double *tok) {
+    double W = 0, Sx = 0, Sy = 0, Sxx = 0, Sxy = 0;
+    uint32_t nx = 0; double x0 = 0;
+    for (uint32_t n = 1; n <= DS4_MTP_MAX_BLOCK + 1u; n++) {
+        if (!s->cnt[n]) continue;
+        const double w = (double)s->cnt[n], x = (double)(n - 1u), y = s->ms[n] / w;
+        if (nx == 0) x0 = x;
+        if (nx == 0 || x != x0) nx++;
+        W += w; Sx += w * x; Sy += w * y; Sxx += w * x * x; Sxy += w * x * y;
+    }
+    if (W <= 0.0) return false;
+    const double den = W * Sxx - Sx * Sx;
+    if (nx < 2u || den <= 0.0) { *v1 = Sy / W; *tok = 0.0; return true; }   /* 一种 n: 只能当常数 */
+    *tok = (W * Sxy - Sx * Sy) / den;
+    *v1 = (Sy - *tok * Sx) / W;
+    return true;
+}
 
 /* conf[0..block-1] = 草稿器每位的置信 logit(不是概率, sigmoid 之后才是)。
- * 返回这一轮该验几位(0 = 一位都不值得验, 本轮草稿白跑); *value_out 给出预测的"产出/成本"比值,
- * 调用方拿它决定下一轮还要不要出草稿(< 1 就是连草稿钱都赚不回来)。 */
-uint32_t v41_draft_pick_k(const float *conf, uint32_t block, float *value_out) {
+ * 返回这一轮该验几位(0 = 一位都不值得验, 本轮草稿白跑); *value_out 给出预测的"产出/成本"比值(以纯解码一步的产出率为 1),
+ * 调用方拿它计数"判亏本"的轮。 */
+uint32_t v41_draft_pick_k(const float *conf, uint32_t block, float *value_out, const v41_sched *s) {
+    if (value_out) *value_out = 1.0f;
+    if (!s || block == 0u) return block;
+    /* 起步: 还没有验证样本 ⇒ 先验最长的一块量一次; 只有一个 n≥2 的点 ⇒ 补一个 n=2(或最长)的点, 拟合线才有斜率 */
+    uint32_t nmeas = 0, first = 0;
+    for (uint32_t n = 2; n <= block + 1u; n++) if (s->cnt[n]) { if (!nmeas) first = n; nmeas++; }
+    if (nmeas == 0u) return block;
+    if (nmeas == 1u && !s->cnt[1]) return first == 2u ? block : 1u;
+    double v1, tok;
+    if (!v41_sched_fit(s, &v1, &tok)) return block;
+    /* 纯解码一步的毫秒: 有真实的单 token 步就用它(k=0 轮走图的步也算), 否则用拟合线在 n=1 的值(验 1 行 ≈ 一步) */
+    const double step = s->cnt[1] ? s->ms[1] / (double)s->cnt[1] : v1;
+    const double draft = s->draft_n ? s->draft_ms / (double)s->draft_n : 0.0;
+    if (!(step > 0.0)) return block;
+    const float rho = s->pred1 > 0.0 ? (float)(s->real1 / s->pred1) : 1.0f;
     float surv = 1.0f, sum = 0.0f;
-    float best = 1.0f / (V41_SCHED_C_DRAFT + V41_SCHED_C_V1);   /* k=0: 草稿白跑, 只验真 token(直发一行) */
+    double best = 1.0 / (draft + v1);   /* k=0: 草稿白跑, 只走一个单 token 步 */
     uint32_t bestk = 0;
     for (uint32_t j = 0; j < block; j++) {
-        const float c = conf[j];
-        /* 非有限的 conf(草稿器偶发坏轮, mtp.md §3.3)当"没把握": 存活率直接归零, 后面几位也就不验了 */
-        surv *= isfinite(c) ? 1.0f / (1.0f + expf(-c)) : 0.0f;
+        const float pj = rho * v41_sched_sigmoid(conf[j]);
+        surv *= pj < 1.0f ? pj : 1.0f;
         sum += surv;
-        const float cost = V41_SCHED_C_DRAFT + V41_SCHED_C_V1 + V41_SCHED_C_TOK * (1.0f + (float)j);
-        const float val = (1.0f + sum) / cost;
+        const double cost = draft + v1 + tok * (double)(j + 1u);   /* 验 1+(j+1) 行 */
+        const double val = (1.0 + (double)sum) / (cost > 0.0 ? cost : step);
         if (val > best) { best = val; bestk = j + 1u; }
     }
-    if (value_out) *value_out = best;
+    if (value_out) *value_out = (float)(best * step);   /* 1.0 = 与纯解码一步持平 */
     return bestk;
 }
 #endif /* !DS4_NO_GPU */
