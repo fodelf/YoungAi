@@ -51,7 +51,7 @@ One DGX Spark, ① base + ② the sidecar of the domain being measured.
 | **Restore rate Σmin** — finance / code / law / medicine / science | **0.745 / 0.803 / 0.760 / 0.739 / 0.753** |
 | **Same top-1 as the original** — finance / code / law / medicine / science | **74.6% / 82.3% / 76.4% / 72.8% / 74.9%** |
 | General English (WikiText-2) with any one of the five sidecars | Σmin **0.787–0.801**, Same top-1 **80.7–82.8%** (bare base 0.769 / 78.5%) |
-| **Prefill**, 12.5k-token prompt | **489 tokens/s** |
+| **Prefill**, 12.5k-token prompt | **1,055 tokens/s** · 940 tokens/s on a real 14.1k-token agent request · 671 tokens/s on a 106.7k-token prompt through the server |
 | **Decode**, plain greedy | **30.7 tokens/s** at short context · 30 tokens/s at 14k context |
 | **Decode**, speculative, greedy (on by default) | **45.5 tokens/s** on a real 14k-token agent request · **42.4 tokens/s** on a request never used for tuning |
 | **Decode**, speculative, sampled at the model card's `temperature` 1.0 (the chat default) | **34–37 tokens/s** on the same agent request (four runs) · **33–42 tokens/s** on the never-tuned request (three runs); plain sampled decode is 30. Each sampled run is a different text, so acceptance and speed vary run to run; rejection sampling keeps the distribution exactly |
@@ -397,9 +397,18 @@ speed-up must leave temperature-0 output byte-identical.
 **Prefill.** Experts run on bf16 tensor cores (`mma.m16n8k16`). E4M3 codewords convert to bf16
 exactly and activations already sit on the bf16 grid, so every product equals the scalar path's. Long
 accumulation inside the tensor core drops low bits (3.5% of outputs off by one ulp), so each k16 slice is
-accumulated from zero and added with a separate FADD (0.5%). 12.5k-token prompt: **216.5 → 489 tokens/s**.
-The quality change (Σmin 0.7447 → 0.7430) is the same size as merely reordering the float reduction
-(0.7439): rounding noise.
+accumulated from zero and added with a separate FADD (0.5%). A prompt is processed in 2,048-token blocks:
+every block has to decode the whole layer's expert bit-stream once (2.55 GB per layer), so the block size
+sets how many tokens amortise that decode. Real routing is skewed (a 2,048-token block touches 200–350 of
+the 384 experts, the hottest one taking 8–16% of all picks), so one work item covers up to 128 tokens of an
+expert with 16 warps, and 12-bit layers keep their codebook in shared memory already converted to bf16.
+Sparse attention is a single-pass flash kernel: the query's fragments stay in registers, scores come from
+`mma.sync`, the running softmax rescales the output accumulator in place (the accumulator layout of
+`mma.m16n8k16` is documented, which `wmma` fragments are not), and each key is gathered once. The n-gram
+memory rows for a block are fetched on an I/O thread while the GPU computes, and only the last position of
+the last block goes through the output head. 12.5k-token prompt: **216.5 → 1,055 tokens/s**. Quality is
+unchanged within rounding noise: the finance judgement set reads Σmin 0.7436 → 0.7441, KL 0.5149 → 0.5131,
+same top-1 74.56% → 74.77%, and everything except the attention kernel is byte-identical to the scalar path.
 
 **Speculative decoding.**
 
@@ -438,8 +447,10 @@ The quality change (Σmin 0.7447 → 0.7430) is the same size as merely reorderi
 
 **Memory.** Weights are mmap-backed. Per-request state grows with the positions actually used: the 1M
 KV itself is 0.89 GB, and the per-forward scratch grows by doubling instead of being sized for 1M up
-front (2.5 GB → 160 MB for a 40k-token request). There is no context knob — the bound comes from the
-GGUF metadata and `--ctx` is rejected.
+front (2.5 GB → 160 MB for a 40k-token request). Logits and the output-head scratch no longer scale with
+the prefill block (a generation request keeps 10 rows of logits, not 2,048). A 106.7k-token request
+through the server leaves 6.7 GB free on the 121 GB machine. There is no context knob — the bound comes
+from the GGUF metadata and `--ctx` is rejected.
 
 ### 4.5 How we measure
 
@@ -492,7 +503,7 @@ marked ¹.
 | **① + finance sidecar** | **74.57%** | **0.745 (0.810 / 0.283)** | **0.512** | **1.267** |
 
 ¹ Reference forward on the same file; engine vs reference on the same file differ by KL 0.013.
-Tensor-core prefill ([§4.4](#44-the-engine)) moves the finance-sidecar row to 74.48% / 0.743 / 0.516
+Tensor-core prefill ([§4.4](#44-the-engine)) moves the finance-sidecar row to 74.77% / 0.744 / 0.513
 (rounding noise).
 
 **Code** (judge slice, 15,360 tokens = 30 languages × 512; original model PPL 4.766):
@@ -541,7 +552,9 @@ At 512 positions one position is 0.2 pp: these rows read as "no regression", not
 
 | Workload | Prefill | Decode |
 |---|---:|---:|
-| 12.5k-token prompt | **489 t/s** (253 with `--decoder-full`) | — |
+| 12.5k-token prompt | **1,055 t/s** (539 with `--decoder-full`) | — |
+| Real agent request, 14.1k-token prompt | **940 t/s** | — |
+| 106.7k-token prompt through the server | **671 t/s** (159 s to the first token) | — |
 | Short prompt, plain greedy | — | **30.5–30.7 t/s** |
 | Real agent request, 14.1k-token prompt, plain | — | 28.9–29.4 t/s |
 | Same request, speculative (default) | — | **43.0 t/s** (3.04 tokens per round) |
@@ -707,8 +720,8 @@ and the engine refuses any other pairing:
   All are judged teacher-forced on held-out text; none has been evaluated on end-to-end tasks (agentic coding, legal or clinical question answering).
 - **CUDA only, one machine type tested.** V4.1 does not run on Metal.
 - **Speculative decoding is greedy-only.** Sampling requests fall back to plain decode.
-- **Prefill on tensor cores is not bit-identical** to the fused scalar path; the difference is at the
-  rounding-noise level (§4.4).
+- **Prefill on tensor cores is not bit-identical** to the fused scalar path (experts) or to the two-pass
+  attention kernel (single-pass flash attention); both differences are at the rounding-noise level (§4.4).
 
 ---
 
