@@ -52,8 +52,9 @@ One DGX Spark, ① base + ② the sidecar of the domain being measured.
 | **Same top-1 as the original** — finance / code / law / medicine / science | **74.6% / 82.3% / 76.4% / 72.8% / 74.9%** |
 | General English (WikiText-2) with any one of the five sidecars | Σmin **0.787–0.801**, Same top-1 **80.7–82.8%** (bare base 0.769 / 78.5%) |
 | **Prefill**, 12.5k-token prompt | **489 tokens/s** |
-| **Decode**, plain greedy | **30.7 tokens/s** at short context · 29 tokens/s at 14k context |
-| **Decode**, speculative (on by default at temperature 0) | **43.0 tokens/s** on a real 14k-token agent request · **37.1 tokens/s** on a request never used for tuning |
+| **Decode**, plain greedy | **30.7 tokens/s** at short context · 30 tokens/s at 14k context |
+| **Decode**, speculative, greedy (on by default) | **45.5 tokens/s** on a real 14k-token agent request · **42.4 tokens/s** on a request never used for tuning |
+| **Decode**, speculative, sampled at the model card's `temperature` 1.0 (the chat default) | **34–37 tokens/s** on the same agent request (four runs) · **33–42 tokens/s** on the never-tuned request (three runs); plain sampled decode is 30. Each sampled run is a different text, so acceptance and speed vary run to run; rejection sampling keeps the distribution exactly |
 | Context | 1M tokens, taken from the model's own metadata; the full 1M KV cache is 0.89 GB |
 
 **Restore rate** = Σ_v min(p_original(v), p_ours(v)), averaged over positions: the share of next-token
@@ -115,7 +116,7 @@ it costs.
   across machines adds a network hop to every token (upstream ds4 measured −19% on two Macs); tensor
   parallelism halves the bytes, but our two-machine test reached only 1.25× because the all-reduce ate
   half the gain. For scale: a community two-Spark setup runs the smaller V4 Flash (284B) in FP8 with
-  TP=2 and speculative decoding at ~41 tokens/s; one Spark here runs V4.1 at 37–43.
+  TP=2 and speculative decoding at ~41 tokens/s; one Spark here runs V4.1 at 42–46.
 
 **What we built.** One box. Every byte spent uniformly. Everything else comes from the sidecar and
 from post-training, not from topology.
@@ -412,11 +413,25 @@ The quality change (Σmin 0.7447 → 0.7430) is the same size as merely reorderi
   k* = argmax_k  (1 + Σ_{j≤k} a_j) / (c_draft + c_v1 + c_tok · (1 + k))
   ```
 
-  with costs in units of one plain decode step (0.273, 1.067, 0.303 — re-measured whenever a kernel
-  changes). If no k beats plain decoding, the round skips drafting. The scheduler takes no wall-clock
-  input: at temperature 0, output must not depend on how busy the machine is.
-- **Guarantee:** speculative output is byte-identical to plain greedy output, checked on every change.
-  On by default at temperature 0; a request that asks for sampling runs plain decode automatically.
+  with the three costs measured by the engine itself, per request: the wall clock of a plain graph step,
+  of a draft round, and of verifying `1 + k` rows (a weighted least-squares line over the row counts seen so
+  far; warm-up rounds that pay lazy allocation are excluded). The first rounds verify the longest block and
+  then one row to get the two points the line needs. There are no compile-time cost constants. The
+  survival probabilities are calibrated online too: `ρ` = first-position hits / Σ σ(c_0) over the
+  request, multiplied into every `σ(c_i)`. Timing only ever changes `k`, never a token: speculative
+  output is byte-identical to plain decode for every `k`, so a wall-clock-driven `k` is safe.
+- **Guarantee:** at temperature 0, speculative output is byte-identical to plain greedy output, checked on
+  every change. On by default for greedy and sampled requests alike. A sampled request draws its drafts
+  from the draft towers' own distribution (same temperature and truncation) and verifies them by rejection
+  sampling on the GPU (accept a draft token with probability `min(1, p_target/p_draft)`, otherwise draw
+  from the residual `max(0, p_target − p_draft)`), so the token distribution is exactly plain sampled
+  decode's. Drafting from the distribution rather than the towers' argmax was decided by an analytic jury on
+  fixed texts (expected first-position acceptance at temperature 1.0: 0.69 → 0.74 and 0.63 → 0.76), not by
+  timing runs, because every sampled run is a different text. The scheduler's acceptance-rate calibration
+  is learned online per request, no constants.
+  Sampling itself runs on the GPU inside the decode graph (Gumbel-max with exact `top_k`/`top_p`/`min_p`
+  truncation by radix select; the host reads back 16 bytes per row), checked by a distribution gate
+  (`make cuda-regression`).
 - **Why it isn't higher:** each extra verified token touches ~3.9 new experts (hash-like routing,
   [§2.2](#22-scaling-laws-are-real-and-knowledge-is-spread-like-a-hash)), so verifying k + 1 tokens costs
   far more than verifying one. The verify batch runs at 57% of its own byte wall; that is the next lever.
@@ -530,7 +545,7 @@ At 512 positions one position is 0.2 pp: these rows read as "no regression", not
 | Short prompt, plain greedy | — | **30.5–30.7 t/s** |
 | Real agent request, 14.1k-token prompt, plain | — | 28.9–29.4 t/s |
 | Same request, speculative (default) | — | **43.0 t/s** (3.04 tokens per round) |
-| Request never used for tuning, 9.2k prompt, speculative | — | **37.1 t/s** |
+| Request never used for tuning, 9.2k prompt, speculative | — | **40.0 t/s** |
 | 51k context, plain | — | 27.5 t/s |
 
 ---
@@ -654,8 +669,9 @@ SIDECAR=DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-vqfin41_vqhalf_a_n8192-en
 
 Loading takes about two minutes. Endpoints: `/v1/chat/completions`, `/v1/completions`, `/v1/responses`
 (OpenAI style) and `/v1/messages` (Anthropic style). Sampling knobs a request leaves out follow the model
-card's recipe: `temperature` 1.0, `top_p` 1.0, no `min_p` — sampled, plain decode. For greedy decoding (which
-is what enables speculative decoding and byte-reproducible output) send `"temperature": 0` explicitly.
+card's recipe: `temperature` 1.0, `top_p` 1.0, no `min_p` — sampled on the GPU, speculative decoding kept on
+(34–37 tokens/s across runs on the 14k-token agent request vs 45.5 greedy). For byte-reproducible output send
+`"temperature": 0` explicitly.
 Don't make greedy the chat default: on questions with very few valid answers it can loop verbatim inside
 the thinking section and never stop (e.g. "list 5 Chinese idioms ending in 五").
 
