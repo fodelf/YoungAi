@@ -119,85 +119,177 @@ __device__ __forceinline__ static void ds4_attn_mma_stats(const float *stile, fl
     if (k == 0u) { rmax[h] = tm; rsum[h] = sm; }
 }
 
-__global__ static void ds4_sparse_attn_mma_kernel(float *o, const float *q, const float *kvw, const uint8_t *kvc,
+/* ★预填核换单遍 flash 形态(2026-09-29; 微基准 gguf-tools/bench/v41_attn_prefill_bench.cu 定形, 12k 形状 2048 查询: 33.6 → 12.5 ms/层块)★
+ * 与两遍扫键的旧核(上面三个积木仍给解码 seg 核用)差在四处:
+ *   ①q 不进 shared: 每个 warp 把自己 K 段(64 维 = 4 个 k16)的 A 片段常驻寄存器(16 个), 省 16 KB shared;
+ *   ②S 用 mma.m16n8k16 直算(不走 wmma), 8 个 warp 分 K, partial 落 shared 按固定序相加(同一分工, 只换指令);
+ *   ③单遍: 每个键块算完 S 就更新 max/sum, O 累加器按 alpha = exp(m_old − m_new) 缩放后加 P·V —— mma 的累加器布局是文档定死的
+ *     (c0,c1 = 行 lane/4, c2,c3 = 行 +8), 按头缩放拿得到那个映射(旧核注释说 wmma 的 fragment 不透明, 这正是换 mma 的理由);
+ *     键只 gather 一次、S 只算一次(旧核各两次);
+ *   ④键片行距 520 个 bf16(1040 B): 行距 1024 B 时 ldmatrix/wmma 取 8 行同一列全落同一组 bank(8 路冲突)。
+ * ★数值★: 与旧核不逐位同(P 的 bf16 舍入点同, 但 O 多了 alpha 缩放的 f32 乘法, 累加序也变); 微基准五个核对 f64 参考同为 3.48e-3(= bf16 出口舍入)。
+ * 门 = 五指标/PPL(与 09-15 mma 版落地同一规矩)。解码 seg 核(cuda_v41_attn_mma_decode.inc.cu)一个字没动, 投机 == 纯解码逐字节门照旧。 */
+#define DS4_ATTN_FA_LD 520u   /* 键片行距(bf16 元素) */
+__device__ __forceinline__ static void ds4_fa_ldsm4(uint32_t *r, const void *p) {
+    const uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+__device__ __forceinline__ static void ds4_fa_ldsm4t(uint32_t *r, const void *p) {
+    const uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+__device__ __forceinline__ static void ds4_fa_mma(float *c, const uint32_t *a, uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ static uint32_t ds4_fa_bf16x2(float lo, float hi) {
+    return (__float_as_uint(v41_bf16r(lo)) >> 16) | (__float_as_uint(v41_bf16r(hi)) & 0xffff0000u);
+}
+/* gather: 与 ds4_attn_mma_gather_keys 同一解码式(值逐位同), 只是行距 DS4_ATTN_FA_LD */
+__device__ __forceinline__ static void ds4_fa_gather(__nv_bfloat16 *ks, int *valid, const float *kvw, const uint8_t *kvc, const int32_t *idx,
+                                                     uint32_t i, uint32_t base, uint32_t nt, uint32_t nwin, uint32_t lo, uint32_t pos0,
+                                                     uint32_t window, uint32_t ng, uint32_t topk) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const float tv = ds4_fp4_nibble_to_f32((uint8_t)(lane & 15u));
+    for (uint32_t t = threadIdx.x / 32u; t < DS4_ATTN_MMA_KT; t += blockDim.x / 32u) {
+        const uint32_t kk = base + t;
+        const float *krow = NULL; const uint8_t *cpk = NULL;
+        if (t < nt) {
+            if (kk < nwin) krow = kvw + v41_win_row((int64_t)lo + kk, pos0, window, 1u) * DS4_ATTN_MMA_HD;
+            else if (kvc && idx) { const int32_t g = idx[(uint64_t)i * topk + (kk - nwin)];
+                                   if (g >= 0 && (uint32_t)g < ng) cpk = kvc + (uint64_t)g * DS4_V41_CKV_BYTES; }
+        }
+        if (lane == 0) valid[t] = (krow || cpk) ? 1 : 0;
+        __nv_bfloat16 *kt = ks + (size_t)t * DS4_ATTN_FA_LD;
+        if (krow) { for (uint32_t d = lane; d < DS4_ATTN_MMA_HD; d += 32u) kt[d] = __float2bfloat16(krow[d]); }
+        else if (cpk) {
+            const float sc = ds4_e4m3fn_to_f32(cpk[DS4_V41_CKV_NIB + lane]);
+            #pragma unroll
+            for (uint32_t j = 0; j < DS4_ATTN_MMA_HD / 32u; j++) {
+                const uint32_t d = lane + 32u * j;
+                const uint8_t by = cpk[d >> 1];
+                const uint8_t nib = (d & 1u) ? (uint8_t)(by >> 4) : (uint8_t)(by & 0x0Fu);
+                const float s = __shfl_sync(0xffffffffu, sc, (int)(d >> 4));
+                kt[d] = __float2bfloat16(__shfl_sync(0xffffffffu, tv, (int)nib) * s);
+            }
+        } else { for (uint32_t d = lane; d < DS4_ATTN_MMA_HD; d += 32u) kt[d] = (__nv_bfloat16)0.0f; }
+    }
+}
+/* shared: ks 16×520×2 + spart 8×16×16×4 + stile 16×16×4 + ptile 16×16×2 + rmax/rsum/alpha 3×16×4 + valid 16×4 ≈ 26 KB ⇒ 每 SM 挂 3 个 block */
+__global__ __launch_bounds__(256) static void ds4_sparse_attn_mma_kernel(float *o, const float *q, const float *kvw, const uint8_t *kvc,
                                                   const int32_t *idx, const float *sink, uint32_t pos0, uint32_t window,
                                                   uint32_t ng, uint32_t topk, uint32_t n_head, float scale, uint32_t win_lo) {
-    namespace wmma = nvcuda::wmma;
-    extern __shared__ char ds4_attn_mma_smem[];
-    __nv_bfloat16 *qs = (__nv_bfloat16 *)ds4_attn_mma_smem;                       /* [16][512] */
-    __nv_bfloat16 *ks = qs + DS4_ATTN_MMA_HEADS * DS4_ATTN_MMA_HD;                /* [16][512] */
-    float *spart = (float *)(ks + DS4_ATTN_MMA_KT * DS4_ATTN_MMA_HD);             /* [8][16][16] */
-    float *stile = spart + DS4_ATTN_MMA_WARPS * 256u;                             /* [16][16] */
-    __nv_bfloat16 *ptile = (__nv_bfloat16 *)(stile + 256u);                       /* [16][16] */
-    float *rmax = (float *)(ptile + 256u), *rsum = rmax + DS4_ATTN_MMA_HEADS;      /* 每头的 max / 分母 */
-    int *valid = (int *)(rsum + DS4_ATTN_MMA_HEADS);                              /* [16] */
-
-    const uint32_t i = blockIdx.x, h0 = blockIdx.y * DS4_ATTN_MMA_HEADS;
-    for (uint32_t e = threadIdx.x; e < DS4_ATTN_MMA_HEADS * DS4_ATTN_MMA_HD; e += blockDim.x)
-        qs[e] = __float2bfloat16(q[((uint64_t)i * n_head + h0 + e / DS4_ATTN_MMA_HD) * DS4_ATTN_MMA_HD + e % DS4_ATTN_MMA_HD]);
-    if (threadIdx.x < DS4_ATTN_MMA_HEADS) { rmax[threadIdx.x] = -1e30f; rsum[threadIdx.x] = 0.f; }
-
+    constexpr uint32_t KT = DS4_ATTN_MMA_KT, HB = DS4_ATTN_MMA_HEADS;
+    extern __shared__ __align__(16) char ds4_attn_fa_smem[];   /* 另起一个名: 解码 seg 核的 ds4_attn_mma_smem 是 char[], 同名不同型编不过 */
+    __nv_bfloat16 *ks = (__nv_bfloat16 *)ds4_attn_fa_smem;                        /* [16][520] */
+    float *spart = (float *)(ks + (size_t)KT * DS4_ATTN_FA_LD);                     /* [8 warp][16][16] */
+    float *stile = spart + 8u * HB * KT;                                            /* [16][16] */
+    __nv_bfloat16 *ptile = (__nv_bfloat16 *)(stile + HB * KT);                      /* [16][16] */
+    float *rmax = (float *)(ptile + HB * KT), *rsum = rmax + HB, *alpha = rsum + HB;
+    int *valid = (int *)(alpha + HB);
+    const uint32_t i = blockIdx.x, h0 = blockIdx.y * HB, lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
     const uint32_t p = pos0 + i;
     uint32_t lo = p + 1u > window ? p + 1u - window : 0u;
     if (lo < win_lo) lo = win_lo;   /* 环里 win_lo 之前的槽没写过(CED), 不读(官方 -1 屏蔽同义); 见 ds4_gpu_v41.h */
     const uint32_t nwin = p - lo + 1u, nkeys = nwin + topk;
-    __syncthreads();
-
-    /* 第一遍: 只为拿每头的 max 与 exp 和 */
-    for (uint32_t base = 0; base < nkeys; base += DS4_ATTN_MMA_KT) {
-        const uint32_t nt = (nkeys - base) < DS4_ATTN_MMA_KT ? (nkeys - base) : DS4_ATTN_MMA_KT;
-        __syncthreads();
-        ds4_attn_mma_gather_keys(ks, valid, kvw, kvc, idx, i, base, nt, nwin, lo, pos0, window, ng, topk, 1u);
-        __syncthreads();
-        ds4_attn_mma_scores(stile, spart, qs, ks, valid, nt, scale);
-        ds4_attn_mma_stats(stile, rmax, rsum);   /* 在线 max/sum(并行版, 逐位同串行版) */
-    }
-    __syncthreads();
-
-    /* 第二遍: 重算 S → P(bf16) → O 累加。warp w 负责输出维 [w·64, w·64+64) 的 4 个 n 块。 */
-    const uint32_t warp = threadIdx.x >> 5;
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> oacc[4];
-    for (int j = 0; j < 4; j++) wmma::fill_fragment(oacc[j], 0.0f);
-    for (uint32_t base = 0; base < nkeys; base += DS4_ATTN_MMA_KT) {
-        const uint32_t nt = (nkeys - base) < DS4_ATTN_MMA_KT ? (nkeys - base) : DS4_ATTN_MMA_KT;
-        __syncthreads();
-        ds4_attn_mma_gather_keys(ks, valid, kvw, kvc, idx, i, base, nt, nwin, lo, pos0, window, ng, topk, 1u);
-        __syncthreads();
-        ds4_attn_mma_scores(stile, spart, qs, ks, valid, nt, scale);
-        for (uint32_t e = threadIdx.x; e < 256u; e += blockDim.x)   /* 官方 acc_s_cast: P 先舍 bf16 再乘 V */
-            ptile[e] = __float2bfloat16(expf(stile[e] - rmax[e >> 4]));
-        __syncthreads();
-        wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> pa;
-        wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> vb;   /* B[key][dim] = ks 行主序 */
-        wmma::load_matrix_sync(pa, ptile, 16);
-        for (int j = 0; j < 4; j++) {
-            wmma::load_matrix_sync(vb, ks + warp * 64u + (uint32_t)j * 16u, DS4_ATTN_MMA_HD);
-            wmma::mma_sync(oacc[j], pa, vb, oacc[j]);
+    /* q 的 A 片段常驻寄存器: warp w 管维 [64w, 64w+64) 的 4 个 k16(a0: 行 r 列 c..c+1; a1: 行 r+8; a2: 列 +8; a3: 行 +8 列 +8) */
+    uint32_t qa[4][4];
+    {
+        const uint32_t r = lane >> 2, c = (lane & 3u) * 2u;
+        #pragma unroll
+        for (uint32_t s = 0; s < 4u; s++) {
+            const float *q0 = q + ((uint64_t)i * n_head + h0 + r) * DS4_ATTN_MMA_HD + warp * 64u + s * 16u + c;
+            const float *q1 = q0 + 8u * DS4_ATTN_MMA_HD;
+            qa[s][0] = ds4_fa_bf16x2(q0[0], q0[1]); qa[s][1] = ds4_fa_bf16x2(q1[0], q1[1]);
+            qa[s][2] = ds4_fa_bf16x2(q0[8], q0[9]); qa[s][3] = ds4_fa_bf16x2(q1[8], q1[9]);
         }
     }
-
-    /* 出口: 除以分母(sink 只进分母, 与标量版同), 舍 bf16 写回。
-     * ★这里踩过一次坑(09-15)★: 一开始 8 个 warp 各把自己的 4 个累加器存到 `otile + j*256` ——
-     * **没带 warp 偏移, 八个 warp 写同一块 shared 互相踩**。后果不是报错, 是 PPL 从 15.46 变成 28 万
-     * 而且两跑不同(谁最后写赢由调度决定)。存放整 8 个 warp × 4 个片要 32 KB, shared 里没有;
-     * 所以按 j 分四轮, 每轮只存 8 个 warp 各一片(8 KB, 正好借 spart), 存完写出去再进下一轮。 */
-    float *otile = spart;   /* [8 warp][16 头 × 16 维] f32 = 8 KB */
-    for (int j = 0; j < 4; j++) {
+    if (threadIdx.x < HB) { rmax[threadIdx.x] = -1e30f; rsum[threadIdx.x] = 0.f; }
+    float oacc[8][4];   /* O[16 头][本 warp 64 维] = 8 个 n8 片 */
+    #pragma unroll
+    for (uint32_t j = 0; j < 8u; j++) { oacc[j][0] = oacc[j][1] = oacc[j][2] = oacc[j][3] = 0.f; }
+    __syncthreads();
+    for (uint32_t base = 0; base < nkeys; base += KT) {
+        const uint32_t nt = (nkeys - base) < KT ? (nkeys - base) : KT;
+        __syncthreads();   /* 上一块的 ks/ptile 用完 */
+        ds4_fa_gather(ks, valid, kvw, kvc, idx, i, base, nt, nwin, lo, pos0, window, ng, topk);
         __syncthreads();
-        wmma::store_matrix_sync(otile + (size_t)warp * 256u, oacc[j], 16, wmma::mem_row_major);
+        {   /* ① S 部分和: 本 warp 的 64 维 × 16 头 × 16 键(两个 n8 片) */
+            float sp[2][4] = { {0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f} };
+            #pragma unroll
+            for (uint32_t s = 0; s < 4u; s++) {
+                uint32_t b[4];
+                const uint32_t mt = lane >> 3, key = (mt >> 1) * 8u + (lane & 7u), col = warp * 64u + s * 16u + (mt & 1u) * 8u;
+                ds4_fa_ldsm4(b, ks + (size_t)key * DS4_ATTN_FA_LD + col);
+                ds4_fa_mma(sp[0], qa[s], b[0], b[1]); ds4_fa_mma(sp[1], qa[s], b[2], b[3]);
+            }
+            #pragma unroll
+            for (uint32_t nb = 0; nb < 2u; nb++) {   /* c0,c1 = 行 lane/4 列 (lane&3)*2+{0,1}; c2,c3 = 行 +8 */
+                float *sw = spart + (size_t)warp * HB * KT + (lane >> 2) * KT + nb * 8u + (lane & 3u) * 2u;
+                sw[0] = sp[nb][0]; sw[1] = sp[nb][1]; sw[8u * KT] = sp[nb][2]; sw[8u * KT + 1u] = sp[nb][3];
+            }
+        }
         __syncthreads();
-        for (uint32_t e = threadIdx.x; e < DS4_ATTN_MMA_WARPS * 256u; e += blockDim.x) {
-            const uint32_t w = e >> 8, r = e & 255u, h = r >> 4, d16 = r & 15u;
-            const float den = rsum[h] + expf(sink[h0 + h] - rmax[h]);
-            o[((uint64_t)i * n_head + h0 + h) * DS4_ATTN_MMA_HD + w * 64u + (uint32_t)j * 16u + d16] =
-                v41_bf16r(otile[e] / den);
+        /* ② 固定序求和 + 缩放 + 屏蔽(无效槽 -1e30 ⇒ exp 为 0) */
+        {
+            const uint32_t e = threadIdx.x, k = e % KT;
+            float v = 0.f;
+            #pragma unroll
+            for (uint32_t w = 0; w < 8u; w++) v += spart[(size_t)w * HB * KT + e];
+            stile[e] = (k < nt && valid[k]) ? v * scale : -1e30f;
+        }
+        __syncthreads();
+        /* ③ 在线 max/sum + P 片(bf16, 官方 acc_s_cast) + alpha: 一线程一头, 键序串行(与旧核串行版同序) */
+        if (threadIdx.x < HB) {
+            const uint32_t h = threadIdx.x; const float *sr = stile + h * KT; const float m = rmax[h];
+            float tm = m;
+            for (uint32_t k = 0; k < KT; k++) tm = fmaxf(tm, sr[k]);
+            const float al = expf(m - tm);
+            float sm = rsum[h] * al;
+            for (uint32_t k = 0; k < KT; k++) { const float pv = expf(sr[k] - tm); sm += pv; ptile[h * KT + k] = __float2bfloat16(pv); }
+            rmax[h] = tm; rsum[h] = sm; alpha[h] = al;
+        }
+        __syncthreads();
+        /* ④ O = O·alpha + P·V: A = ptile [16 头][16 键], B = ks [键][维] 经 .trans 取; 本 warp 管维 [64w, 64w+64) 的 8 个 n8 片 */
+        {
+            const float a0 = alpha[lane >> 2], a1 = alpha[(lane >> 2) + 8u];
+            #pragma unroll
+            for (uint32_t j = 0; j < 8u; j++) { oacc[j][0] *= a0; oacc[j][1] *= a0; oacc[j][2] *= a1; oacc[j][3] *= a1; }
+            uint32_t pa[4];
+            {   const uint32_t mt = lane >> 3, row = (lane & 7u) + (mt & 1u) * 8u, col = (mt >> 1) * 8u;
+                ds4_fa_ldsm4(pa, ptile + (size_t)row * KT + col); }
+            #pragma unroll
+            for (uint32_t j = 0; j < 8u; j += 2u) {
+                uint32_t b[4];
+                const uint32_t mt = lane >> 3, key = (mt & 1u) * 8u + (lane & 7u), col = warp * 64u + j * 8u + (mt >> 1) * 8u;
+                ds4_fa_ldsm4t(b, ks + (size_t)key * DS4_ATTN_FA_LD + col);
+                ds4_fa_mma(oacc[j], pa, b[0], b[1]); ds4_fa_mma(oacc[j + 1], pa, b[2], b[3]);
+            }
+        }
+    }
+    __syncthreads();
+    /* 出口: 除以 (sum + exp(sink − max))(sink 只进分母, 与标量版同), 舍 bf16 写回 */
+    {
+        const uint32_t hA = lane >> 2, hB = hA + 8u;
+        const float dA = rsum[hA] + expf(sink[h0 + hA] - rmax[hA]), dB = rsum[hB] + expf(sink[h0 + hB] - rmax[hB]);
+        #pragma unroll
+        for (uint32_t j = 0; j < 8u; j++) {
+            const uint32_t d = warp * 64u + j * 8u + (lane & 3u) * 2u;
+            float *oA = o + ((uint64_t)i * n_head + h0 + hA) * DS4_ATTN_MMA_HD + d, *oB = o + ((uint64_t)i * n_head + h0 + hB) * DS4_ATTN_MMA_HD + d;
+            oA[0] = v41_bf16r(oacc[j][0] / dA); oA[1] = v41_bf16r(oacc[j][1] / dA);
+            oB[0] = v41_bf16r(oacc[j][2] / dB); oB[1] = v41_bf16r(oacc[j][3] / dB);
         }
     }
 }
 
-/* shared 用量: qs 16 KB + ks 16 KB + spart 8 KB + stile 1 KB + ptile 0.5 KB + rmax/rsum/valid < 0.2 KB ≈ 42 KB。
- * 超 48 KB 静态上限, 所以走动态 shared + opt-in(GB10 上限 99 KB)。 */
+/* 预填 flash 核的 shared 用量(≈ 26 KB); 解码 seg 核仍用 ds4_attn_mma_seg_smem_bytes(旧布局: qs + ks + spart + …) */
 static size_t ds4_attn_mma_smem_bytes(void) {
+    return (size_t)DS4_ATTN_MMA_KT * DS4_ATTN_FA_LD * sizeof(__nv_bfloat16)
+         + (size_t)DS4_ATTN_MMA_WARPS * DS4_ATTN_MMA_HEADS * DS4_ATTN_MMA_KT * sizeof(float)
+         + (size_t)DS4_ATTN_MMA_HEADS * DS4_ATTN_MMA_KT * (sizeof(float) + sizeof(__nv_bfloat16))
+         + 3u * DS4_ATTN_MMA_HEADS * sizeof(float) + DS4_ATTN_MMA_KT * sizeof(int);
+}
+static size_t ds4_attn_mma_seg_smem_bytes(void) {
     return (size_t)(DS4_ATTN_MMA_HEADS + DS4_ATTN_MMA_KT) * DS4_ATTN_MMA_HD * sizeof(__nv_bfloat16)
          + (size_t)DS4_ATTN_MMA_WARPS * 256u * sizeof(float) + 256u * sizeof(float)
          + 256u * sizeof(__nv_bfloat16) + 2u * DS4_ATTN_MMA_HEADS * sizeof(float)

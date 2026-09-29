@@ -158,7 +158,7 @@ static int v41_attn_mma_decode(float *o, const float *q, const float *kvw, const
      * n_tok==1 —— 于是会话开头那几步"纯解码走 split、验证批走预填核", 连核都不是同一个, 必然不同轨。
      * 键少时这个核只有一段, 开销就是一次 q 载入, 不值得为它留第二条路(铁律: 不留兜底路)。 */
     static int s_ok = 0;                             /* 0 未试 / 1 可用 / -1 抬不上去 */
-    const size_t smem = ds4_attn_mma_smem_bytes();
+    const size_t smem = ds4_attn_mma_seg_smem_bytes();   /* seg 核仍是 qs+ks 两片的旧布局; 预填核 09-29 换了单遍形态, 两者 shared 账不同 */
     if (s_ok == 0) {
         s_ok = cudaFuncSetAttribute(v41_attn_mma_seg_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                     (int)smem) == cudaSuccess ? 1 : -1;
