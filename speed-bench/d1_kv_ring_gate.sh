@@ -267,8 +267,9 @@ fi
 # ★MODE=dflt(2026-09-24): 投机翻成默认开之后的三格门★ —— 同一条真实请求(第 6 参数 = 提示 ids, 按 id 喂):
 #   ①什么都不传(默认开): 输出 == 基线纯解码逐字节(第 7 参数 = 基线 .out, 例 base0924_plain.out), 且吐的 token 数恰好 = NGEN
 #     (一轮接受多位时以前会越过上限, 服务端 max_tokens 是硬上限);
-#   ②默认 + --temp 0.6: 不报错、走纯解码、日志有"投机只在贪心下成立"那一行(服务端温 1.0 的请求不能因默认值被拒);
-#   ③显式 --dspark + --temp 0.6: 照旧硬拒(rc ≠ 0)。
+#   ②默认 + --temp 0.6(2026-09-28 起): 采样走设备核("解码采样(设备核)"那一行), 投机照走(有 DSpark 汇总行且轮数 > 0);
+#   ③显式 --dspark + 复读惩罚(--dry-multiplier 0.8): 硬拒(rc ≠ 0) —— 惩罚路仍是主机路, 投机不接;
+#   ④默认 + 惩罚: 不报错、走纯解码、日志有"投机不接惩罚"那一行。
 # 用法: ./speed-bench/d1_kv_ring_gate.sh none <模型> 2048 dflt <反修目录> <提示 ids> <基线纯解码 .out>
 if [ "$MODE" = dflt ]; then
   PIDS="${6:?提示 ids}"; BOUT="${7:?基线纯解码 .out}"
@@ -279,12 +280,16 @@ if [ "$MODE" = dflt ]; then
   grep -aq "DSpark: [1-9]" "$OUT/dflt_greedy.err" || { echo "  ★默认没走投机(没有 DSpark 汇总行)★"; fail=1; }
   [ "$ne" = "$NGEN" ] && echo "  吐 $ne token = 上限 ✓" || { echo "  ★吐 $ne token ≠ 上限 $NGEN★"; fail=1; }
   if cmp -s "$OUT/dflt_greedy.out" "$BOUT"; then echo "  == 基线纯解码逐字节同 ✓"; else echo "  ★与基线不同★ $(cmp "$OUT/dflt_greedy.out" "$BOUT" 2>&1 | head -1)"; fail=1; fi
-  run ds4 dflt_temp -n 64 --temp 0.6 --gen-ids "$PIDS"; rc=$?
-  if [ "$rc" = 0 ] && grep -aq "投机只在贪心下成立" "$OUT/dflt_temp.err"; then echo "  ②默认 + 采样: 走纯解码, 有日志 ✓"
-  else echo "  ★默认 + 采样: rc=$rc, 日志: $(grep -a '投机\|dspark' "$OUT/dflt_temp.err" | head -2)★"; fail=1; fi
-  run ds4 dflt_explicit -n 64 --dspark --temp 0.6 --gen-ids "$PIDS"; rc=$?
-  if [ "$rc" != 0 ] && grep -aq "不能同开" "$OUT/dflt_explicit.err"; then echo "  ③显式 --dspark + 采样: 拒 ✓"
-  else echo "  ★显式 --dspark + 采样没拒(rc=$rc)★"; fail=1; fi
+  run ds4 dflt_temp -n 256 --temp 0.6 --gen-ids "$PIDS"; rc=$?
+  if [ "$rc" = 0 ] && grep -aq "解码采样(设备核)" "$OUT/dflt_temp.err" && grep -aq "DSpark: [1-9]" "$OUT/dflt_temp.err"; then
+    echo "  ②默认 + 采样: 设备核 + 投机照走 ✓ $(grep -a -h 'decode .* token\|DSpark:' "$OUT/dflt_temp.err" | tr '\n' ' ')"
+  else echo "  ★默认 + 采样: rc=$rc, 日志: $(grep -a '解码采样\|投机\|DSpark' "$OUT/dflt_temp.err" | head -3 | tr '\n' ' ')★"; fail=1; fi
+  run ds4 dflt_explicit -n 64 --dspark --dry-multiplier 0.8 --gen-ids "$PIDS"; rc=$?
+  if [ "$rc" != 0 ] && grep -aq "不能同开" "$OUT/dflt_explicit.err"; then echo "  ③显式 --dspark + 惩罚: 拒 ✓"
+  else echo "  ★显式 --dspark + 惩罚没拒(rc=$rc)★"; fail=1; fi
+  run ds4 dflt_penal -n 64 --dry-multiplier 0.8 --gen-ids "$PIDS"; rc=$?
+  if [ "$rc" = 0 ] && grep -aq "投机不接惩罚" "$OUT/dflt_penal.err"; then echo "  ④默认 + 惩罚: 走纯解码, 有日志 ✓"
+  else echo "  ★默认 + 惩罚: rc=$rc, 日志: $(grep -a '投机\|惩罚' "$OUT/dflt_penal.err" | head -2 | tr '\n' ' ')★"; fail=1; fi
   [ "$fail" = 0 ] && echo "门: 全绿" || echo "门: ★有红★"
   exit "$fail"
 fi
@@ -316,6 +321,71 @@ if [ "$MODE" = head ] && [ -n "${6:-}" ]; then
   run ds4 "$HT" -n "$NGEN" --no-dspark --gen-ids "$6" ${HX[@]+"${HX[@]}"}
   echo "== $HT($(basename "$6"), ${7:-默认}): $(grep -a -h 'prefill .* token' "$OUT/$HT.err" | tail -1)"
   head -c 600 "$OUT/$HT.out"; echo
+  exit 0
+fi
+# ★MODE=accjury(2026-09-29): 采样下两种草稿方案的期望首位接受率, 不吃采样噪声★
+# 为什么: 采样路在线 t/s 每趟是另一篇文本(k 变 ⇒ 硬币变), seed 间 ±3 t/s, 比"点质量草稿 vs 草稿按分布抽"的差还大, 单趟判不了。
+# 这里先用采样纯解码生成 NGEN token 固定一篇文本(--emit-trace 记 id), 再教师强制走同一段: 每个位置按同一温度算 主模型 p 与 塔首位 q,
+# 报 E[p(argmax q)](点质量)与 E[Σmin(p,q)](按分布抽) —— 解析量, 同文本上两方案直接比。提示段按块预填不逐位(14k 逐位要十几分钟)。
+# 用法: ./speed-bench/d1_kv_ring_gate.sh none <模型> <生成几个 token> accjury <反修目录> <提示 ids> [温度, 默认 1.0] [seed, 默认 1]
+if [ "$MODE" = accjury ] && [ -n "${6:-}" ]; then
+  PIDS="$6"; T="${7:-1.0}"; SEED="${8:-1}"
+  [ -s "$PIDS" ] || { echo "★没有 $PIDS★"; exit 1; }
+  t=aj_$(basename "$PIDS" .ids)_t${T}_s${SEED}
+  run ds4 "${t}_gen" -n "$NGEN" --no-dspark --emit-trace --gen-ids "$PIDS" --temp "$T" --seed "$SEED"
+  grep -a -h '^\[ptok\] \|^\[emit\] ' "$OUT/${t}_gen.err" | sort -n -k2 | awk '{print $3}' > "$OUT/$t.ids"
+  NP=$(grep -ac '^\[ptok\] ' "$OUT/${t}_gen.err"); NG=$(grep -ac '^\[emit\] ' "$OUT/${t}_gen.err")
+  [ "$NP" -gt 0 ] && [ "$NG" -gt 8 ] || { echo "★生成段太短或没有 [ptok](NP=$NP NG=$NG), 看 $OUT/${t}_gen.err★"; exit 2; }
+  echo "== 接受率陪审团: $(basename "$PIDS") 温 $T seed $SEED, 文本 = 提示 $NP + 采样生成 $NG token ($(grep -a -h 'decode .* token' "$OUT/${t}_gen.err"))"
+  z=(); [ "$AMP" != none ] && z=(--zchain "$AMP")
+  ./ds4 -m "$MODEL" ${z[@]+"${z[@]}"} --score-ids "$OUT/$t.ids" --dspark-capture "$OUT/$t.dcap" --decoder-full --temp "$T" \
+      --dspark-capture-prompt "$NP" > /dev/null 2> "$OUT/$t.cap.err" || { echo "★取料失败★"; tail -3 "$OUT/$t.cap.err"; exit 3; }
+  grep -a -h "一致率\|陪审团" "$OUT/$t.cap.err" | sed 's/^/  /'
+  exit 0
+fi
+
+# ★MODE=ab(2026-09-29): 调优循环用的快 A/B —— 两个二进制各跑一趟"贪心 + 投机", 比逐字节 + t/s + 接受直方图★
+# 为什么单列: samp/dflt 是提交前的门(四趟 × 1024 token, 一趟一次 113 GB 装载), 一次 A/B 要 16 次装载, 调优循环等不起(用户 09-29:
+# "跑那么长时间干嘛, 我们是调优"). 核改动先过微基准(秒级, 自带逐位门), 进引擎只做这一次 2 次装载的 A/B. 逐字节判据: 两个二进制
+# 都保证"投机 == 纯解码", 所以 旧投机 == 新投机 就等价于 纯解码没被改动; 不同 = 核改了数值, 停下查.
+# 用法: ./speed-bench/d1_kv_ring_gate.sh none <模型> <生成几个 token, 建议 512> ab <反修目录> <提示 ids> <旧二进制> [新二进制=ds4] [额外引擎参数]
+#   额外引擎参数例 "--dspark-verify 1": 钉死 k, 两个二进制各报"一轮 = 草稿 + 验证(n=1+k 行)"的墙钟 —— 量单个 n 档的验证批成本。
+if [ "$MODE" = ab ] && [ -n "${6:-}" ]; then
+  PIDS="$6"; OLD="${7:?旧二进制}"; NEW="${8:-ds4}"; ABX=(${9:-})
+  [ -x "./$OLD" ] && [ -x "./$NEW" ] || { echo "★没有 ./$OLD 或 ./$NEW★"; exit 1; }
+  [ -s "$PIDS" ] || { echo "★没有 $PIDS★"; exit 1; }
+  t=ab_$(basename "$PIDS" .ids)$(echo "${9:-}" | tr -d ' -')
+  for b in "$OLD" "$NEW"; do
+    run "$b" "${t}_$b" -n "$NGEN" --gen-ids "$PIDS" ${ABX[@]+"${ABX[@]}"}
+    echo "  $b: $(grep -a -h 'decode .* token' "$OUT/${t}_$b.err") $(grep -a -h 'DSpark:\|一轮 ' "$OUT/${t}_$b.err" | tr '\n' ' ' | cut -c1-200)"
+  done
+  if cmp -s "$OUT/${t}_$OLD.out" "$OUT/${t}_$NEW.out"; then echo "  旧 == 新 逐字节同 ✓ ($(wc -c < "$OUT/${t}_$NEW.out") 字节)"; exit 0
+  else echo "  ★旧 ≠ 新★ $(cmp "$OUT/${t}_$OLD.out" "$OUT/${t}_$NEW.out" 2>&1 | head -1)"; exit 1; fi
+fi
+
+# ★MODE=samp(2026-09-28): 采样默认改成模型卡配方(温 1.0)之后, 产品默认路(请求不带 temperature)到底多快★
+# 三趟同一条真实请求、同一个二进制: ①贪心纯解码(--temp 0 --no-dspark) ②采样纯解码(温 1.0/top_p 1.0/min_p 0 = 09-28 默认,
+# 显式传是为了让 run() 里的 --temp 0 被后面的值盖掉) ③贪心 + 投机(qtf 显式发 temperature:0 走的路)。
+# 读法: 走图的账那一行"上步 sync→本步进来 N us"在采样趟里就是 读回 517 KB + 主机采样 的钱(贪心趟这一项只有几十 us);
+# ②对①的差 = 采样税/步, ③对①的差 = 投机的钱 —— 请求不带 temperature 就把这两笔都丢了。
+# 用法: ./speed-bench/d1_kv_ring_gate.sh none <模型> <生成几个 token> samp <反修目录> <提示 ids> [二进制] [额外引擎参数]
+if [ "$MODE" = samp ] && [ -n "${6:-}" ]; then
+  PIDS="$6"; SBIN="${7:-ds4}"; SEXTRA=(${8:-})
+  [ -x "./$SBIN" ] || { echo "★没有 ./$SBIN★"; exit 1; }
+  [ -s "$PIDS" ] || { echo "★没有 $PIDS★"; exit 1; }
+  t=sp_$(basename "$PIDS" .ids)_$SBIN
+  run "$SBIN" "${t}_greedy" -n "$NGEN" --no-dspark --gen-ids "$PIDS" ${SEXTRA[@]+"${SEXTRA[@]}"}
+  run "$SBIN" "${t}_samp"   -n "$NGEN" --no-dspark --gen-ids "$PIDS" --temp 1.0 --top-p 1.0 --min-p 0 ${SEXTRA[@]+"${SEXTRA[@]}"}
+  run "$SBIN" "${t}_spec"   -n "$NGEN" --gen-ids "$PIDS" ${SEXTRA[@]+"${SEXTRA[@]}"}
+  # 第四趟(2026-09-28 设备采样核之后): 采样 + 投机(拒绝采样) = 请求不带 temperature 时产品默认路真正走的
+  run "$SBIN" "${t}_sampspec" -n "$NGEN" --gen-ids "$PIDS" --temp 1.0 --top-p 1.0 --min-p 0 ${SEXTRA[@]+"${SEXTRA[@]}"}
+  echo "== 采样税尺: $(basename "$PIDS"), 生成 $NGEN token, 二进制 $SBIN ${SEXTRA[*]:-}"
+  for x in greedy samp spec sampspec; do
+    echo "  $x: $(grep -a -h 'decode .* token' "$OUT/${t}_$x.err") $(grep -a -h '解码采样\|投机不接惩罚' "$OUT/${t}_$x.err" | head -1)"
+    # 走图的"稳态"账只在纯解码趟有意义(投机趟里 n=1 的图步只剩 k=0 的轮, 不进那本账); 投机趟看轮账
+    case $x in greedy|samp) echo "     $(grep -a -h '走图解了' "$OUT/${t}_$x.err" | sed 's/.*每步主机: //')" ;;
+                *) echo "     $(grep -a -h 'DSpark:\|一轮 \|验证批走图' "$OUT/${t}_$x.err" | tr '\n' ' ')" ;; esac
+  done
   exit 0
 fi
 if [ "$MODE" = sim ] && [ -n "${6:-}" ]; then

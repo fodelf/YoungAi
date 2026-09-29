@@ -151,6 +151,9 @@ if [ "$DO_NSYS" = ncu ]; then
   KREGEX="${6:-regex:v41_vq_gateup_kernel}"
   NLAUNCH="${7:-6}"
   NSKIP="${8:-200}"
+  # ★验证批里的核(2026-09-29)★: 第 10 参数钉 k ≠ 0 ⇒ 走投机路问 n = 1+k 行的那一发(注意力 seg 核 / 专家 n 核只在这条路上发);
+  # 不钉(0)= 纯解码 n=1。以前 ncu 只会带 --no-dspark, "n=1 与 n>1 各跑一遍"根本跑不出 n>1 那遍。
+  [ "$VERIFY_K" != 0 ] && SPEC=(--dspark --dspark-verify "$VERIFY_K")
   # 第一趟: 访存管道的量(波前数 = LSU 真正付的访存次数; 扇区/请求 = 合并得好不好)
   M1=l1tex__data_pipe_lsu_wavefronts.sum,l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum,l1tex__average_t_sectors_per_request_pipe_lsu_mem_global_op_ld.ratio
   # 第二趟: warp 停在哪(long_scoreboard = 等全局访存返回; mio/lg_throttle = 访存指令发不出去 = 管道塞住)

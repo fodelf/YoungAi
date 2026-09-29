@@ -38,6 +38,8 @@ rsync -az --delete \
     `# 所以按"无扩展名的可执行文件"整类排除, 各机器自己 make。` \
     --exclude 'gguf-tools/bench/anchor_metrics' --exclude 'gguf-tools/bench/pubbench' \
     --exclude 'gguf-tools/bench/dspark_agree' --exclude 'gguf-tools/bench/kl_forensic' --exclude 'gguf-tools/bench/dspark_sim' \
+    `# 核形态微基准(v41_*_bench.cu 在 spark 上 nvcc 编, Mac 没有)同样护住(2026-09-29 实撞: 一次同步就把刚编好的删了, 下一条命令报"没有那个文件")` \
+    --exclude 'gguf-tools/bench/v41_*_bench' \
     `# ★v41_quantize 也要护住★(2026-09-21 实撞): 它是 Linux+CUDA 专属, Mac 这边根本产不出来 ⇒ --delete 每同步一次就把` \
     `# 远端刚编好的删掉, 下一条手敲命令报"没有那个文件或目录"。走脚本的链不受影响(第①步会重编), 手跑探针会中招。` \
     --exclude 'gguf-tools/quantize/v41_to_gguf' --exclude 'gguf-tools/quantize/dump_gguf_meta' --exclude 'gguf-tools/quantize/v41_nc_alloc' --exclude 'gguf-tools/quantize/v41_quantize' \
