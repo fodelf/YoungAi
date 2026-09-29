@@ -114,7 +114,47 @@ typedef struct {
     int32_t *flags; uint32_t seq;
     /* io_uring 通道(core_v41_ering.c): 有它就不走线程池 —— 主线程算哈希、一次提交整轮的读, 没有惊群(一轮 2.1 → ~0.3 ms) */
     v41_ering *ring; v41_ering_req *reqs;
+    /* ★大轮交给取行线程★(2026-09-29): 预填一块 512 token 一层 = 24576 次读, 队列(512)装不下的部分只能在 v41_ering_wait 里
+     * 边收边续发 —— 以前那是主线程在 engram 层前干的事, GPU 那 ~40 ms 没活(d0a ⑤ 表: hc_post → H2D 空档, 12k 预填每块两层
+     * 各 ~40 ms, 合计 1.9 s = 8.5%); 而第二层的轮又要等第一层收完才发, 于是两层都空转。现在一轮装不下队列就整个交给这条线程:
+     * 它按层序做"算哈希 → 提交 → 收齐 → 置位", 主线程到 engram 层只等本层的位。解码(n ≤ 8, 一轮 ≤ 384 次 < 队列)不走它 ——
+     * 那条路的时序(提交在 L0 前、L1 前只剩收)09-18 已量过, 不动。字节逐个相同: 请求/目的地一个没改, 只是谁去等。 */
+    pthread_t io_th; pthread_mutex_t io_mu; pthread_cond_t io_cv;
+    int io_th_on, io_go, io_stop, io_mode; uint32_t io_done;   /* io_mode: 本次前向的轮是不是线程在做; io_done: 位掩码, 第 ei 轮已收齐 */
+    ds4_v41_state *io_st;
 } v41_ejob;
+
+static bool v41_ejob_submit_ring(ds4_v41_state *st, uint32_t ei);
+static void *v41_ejob_io_thread(void *arg) {
+    ds4_v41_state *st = (ds4_v41_state *)arg; v41_ejob *J = (v41_ejob *)st->ejob;
+    pthread_mutex_lock(&J->io_mu);
+    for (;;) {
+        while (!J->io_go && !J->io_stop) pthread_cond_wait(&J->io_cv, &J->io_mu);
+        if (J->io_stop) break;
+        pthread_mutex_unlock(&J->io_mu);
+        for (uint32_t ei = 0; ei < J->n_eng; ei++) {
+            const bool ok = v41_ejob_submit_ring(st, ei) && v41_ering_wait(J->ring);
+            pthread_mutex_lock(&J->io_mu);
+            if (!ok) { if (!J->err) J->err = 2; J->io_done = (1u << J->n_eng) - 1u; }   /* 失败: 全部置位, 等待方看 err 停车 */
+            else J->io_done |= 1u << ei;
+            pthread_cond_broadcast(&J->io_cv);
+            pthread_mutex_unlock(&J->io_mu);
+            if (!ok) break;
+        }
+        pthread_mutex_lock(&J->io_mu);
+        J->io_go = 0;
+        pthread_cond_broadcast(&J->io_cv);
+    }
+    pthread_mutex_unlock(&J->io_mu);
+    return NULL;
+}
+/* 等线程把本次前向的轮全做完(下一次前向要改 hist/n 之前、销毁之前都要等) */
+static void v41_ejob_io_idle(v41_ejob *J) {
+    if (!J->io_th_on) return;
+    pthread_mutex_lock(&J->io_mu);
+    while (J->io_go) pthread_cond_wait(&J->io_cv, &J->io_mu);
+    pthread_mutex_unlock(&J->io_mu);
+}
 
 void *v41_eworker_run(void *arg) {
     v41_eworker *wk = (v41_eworker *)arg;
@@ -147,8 +187,15 @@ void *v41_eworker_run(void *arg) {
 static void v41_ejob_free(ds4_v41_state *st) {
     v41_ejob *J = (v41_ejob *)st->ejob;
     if (!J) return;
+    if (J->io_th_on) {   /* 线程做的轮先收完, 再让它退出 */
+        v41_ejob_io_idle(J);
+        pthread_mutex_lock(&J->io_mu); J->io_stop = 1; pthread_cond_broadcast(&J->io_cv); pthread_mutex_unlock(&J->io_mu);
+        pthread_join(J->io_th, NULL);
+        J->io_th_on = 0;
+    } else
     for (uint32_t ei = 0; ei < J->n_eng; ei++)
         if (J->started[ei] && !J->joined[ei]) { if (J->ring) (void)v41_ering_wait(J->ring); else v41_epool_wait(); }   /* 收完在飞的那轮再走 */
+    pthread_mutex_destroy(&J->io_mu); pthread_cond_destroy(&J->io_cv);
     v41_ering_close(J->ring); free(J->reqs);
     free(J->fallback_bounce);
     for (uint32_t i = 0; i < DS4_V41_MAX_ENGRAM; i++) { ds4_gpu_host_free(J->raw[i]); free(J->rows[i]); }
@@ -165,6 +212,7 @@ static v41_ejob *v41_ejob_create(ds4_v41_state *st) {
     }
     J->n_eng = v->n_engram; J->cap = st->cap_tok; J->cols = (v->engram_max_ngram - 1) * v->engram_heads;
     J->HD = v->engram_head_dim; J->nsc = J->HD / 32u;
+    pthread_mutex_init(&J->io_mu, NULL); pthread_cond_init(&J->io_cv, NULL);
     st->ejob = J;
     for (uint32_t ei = 0; ei < J->n_eng; ei++) {
         if (!v41_engram_open_shard(st, ei)) return NULL;
@@ -177,7 +225,9 @@ static v41_ejob *v41_ejob_create(ds4_v41_state *st) {
     J->flags = ds4_gpu_host_alloc((uint64_t)(DS4_V41_MAX_ENGRAM + 2) * sizeof(int32_t));
     if (!J->flags) { fprintf(stderr, "ds4: engram 标志槽(pinned)分配失败\n"); return NULL; }
     memset(J->flags, 0, (DS4_V41_MAX_ENGRAM + 2) * sizeof(int32_t));
-    /* io_uring: 队列 512(预填一轮 24576 次读分批续发; 解码一轮 48 次一批就走)。开不了就退线程池, 话说在日志里。 */
+    /* io_uring 队列深度 = 一次能在飞的读数(落脚点 8 KB 一个)。09-18 定 512(解码一轮 48 次一批就走)。
+     * ★判负存档(2026-09-29)★: 抬到 4096 想让盘吃满队列 —— 块 2048 一轮 98304 次读, L0 那 ~150 ms 算不完, 第一个 engram 层前每块空转 60~70 ms;
+     * 4096 深时空转一样(6 块 349 ms 对 286 ms), 瓶颈不在队列深度而在单线程收发 + 盘的 IOPS ⇒ 解法是提前一块发(见 v41_engram_prefetch_next)。 */
     J->ring = v41_ering_open(512u);
     if (J->ring) J->reqs = xmalloc((size_t)J->cap * J->cols * 2u * sizeof(v41_ering_req));
     fprintf(stderr, "ds4: [engram] 取行走 %s\n", J->ring ? "io_uring(主线程一次提交整轮)" : "线程池(io_uring 不可用)");
@@ -262,12 +312,34 @@ bool v41_engram_prefetch(ds4_engine *e, ds4_v41_state *st) {
     const ds4_v41_cfg *v = &g_ds4_v41;
     if (v->n_engram == 0) return true;
     v41_ejob *J = (v41_ejob *)st->ejob;
-    if (J) for (uint32_t ei = 0; ei < J->n_eng; ei++)   /* 上一步的轮还在跑(不该发生: 每层都收过) */
-        if (J->started[ei] && !J->joined[ei]) { if (J->ring) (void)v41_ering_wait(J->ring); else v41_epool_wait(); J->joined[ei] = 1; }
+    if (J) {
+        if (J->io_mode) v41_ejob_io_idle(J);   /* 上一次前向线程做的轮(不该还在跑: 每层都收过; 但 hist/n 要改了, 必须等) */
+        else for (uint32_t ei = 0; ei < J->n_eng; ei++)   /* 上一步的轮还在跑(不该发生: 每层都收过) */
+            if (J->started[ei] && !J->joined[ei]) { if (J->ring) (void)v41_ering_wait(J->ring); else v41_epool_wait(); J->joined[ei] = 1; }
+    }
     if (!J && !(J = v41_ejob_create(st))) return false;
     if (st->n > J->cap) { fprintf(stderr, "ds4: engram 行缓冲 %u 行装不下本块 %u 行\n", J->cap, st->n); return false; }
     J->n = st->n; J->e = e; J->err = 0;
     for (uint32_t ei = 0; ei < J->n_eng; ei++) { J->started[ei] = 0; J->joined[ei] = 0; }
+    /* 一轮装不下队列(预填块)⇒ 交给取行线程做全部轮; 装得下(解码 n ≤ 8)⇒ 老路(主线程提交, 到层只收) */
+    J->io_mode = (J->ring && (uint64_t)J->n * J->cols * 2u > v41_ering_cap(J->ring)) ? 1 : 0;
+    if (J->io_mode) {
+        if (!J->io_th_on) {
+            J->io_st = st; J->io_go = 0; J->io_stop = 0;
+            if (pthread_create(&J->io_th, NULL, v41_ejob_io_thread, st) != 0) {
+                fprintf(stderr, "ds4: [engram] 取行线程起不来, 退回主线程收盘(慢但正确)\n");
+                J->io_mode = 0;
+            } else J->io_th_on = 1;
+        }
+        if (J->io_mode) {
+            pthread_mutex_lock(&J->io_mu);
+            J->io_done = 0; J->io_go = 1;
+            pthread_cond_broadcast(&J->io_cv);
+            pthread_mutex_unlock(&J->io_mu);
+            for (uint32_t ei = 0; ei < J->n_eng; ei++) J->started[ei] = 1;
+            return true;
+        }
+    }
     return v41_ejob_submit_round(st, 0);   /* 只发第一层的; 后面的轮由收上一轮的人接着发 */
 }
 
@@ -275,6 +347,16 @@ bool v41_engram_prefetch(ds4_engine *e, ds4_v41_state *st) {
 static bool v41_ejob_wait(ds4_v41_state *st, uint32_t ei) {
     v41_ejob *J = (v41_ejob *)st->ejob;
     if (!J || ei >= J->n_eng) return false;
+    if (J->io_mode) {   /* 线程做的轮: 只等本层的位 */
+        if (!J->joined[ei]) {
+            pthread_mutex_lock(&J->io_mu);
+            while (!(J->io_done & (1u << ei))) pthread_cond_wait(&J->io_cv, &J->io_mu);
+            pthread_mutex_unlock(&J->io_mu);
+            J->joined[ei] = 1;
+        }
+        if (J->err) fprintf(stderr, "ds4: engram 取行失败(%s)\n", J->err == 1 ? "行号越界" : "pread 短读");
+        return J->err == 0;
+    }
     if (!J->started[ei]) {
         for (uint32_t k = 0; k < ei; k++)
             if (J->started[k] && !J->joined[k]) { if (J->ring) (void)v41_ering_wait(J->ring); else v41_epool_wait(); J->joined[k] = 1; }
