@@ -43,9 +43,9 @@
  * 头里写 D 与 n, 解算器按它读 —— 两边各写各的尺寸迟早对不上, 而错位不会报错。
  * pos0 = 第 0 对对应的**主模型位置**(它的 argmax 预测 pos0+1): 位置 0 没有可配的草稿(草稿要从
  * main_hidden(0) 出, 首位预测的是位置 2), 所以第 0 对是位置 1, pos0 = 1。锚(FP logits)的行号
- * = pos0 + 对号, 一致率工具按它对行; 旧文件这一格是 0(那批料本身就是错位的, 不再用)。 */
+ * = pos0 + 对号, 一致率工具按它对行; 旧文件这一格是 0(那批料本身就是错位的, 不再用)。
+ * 2026-09-29 起 pos0 = n_prompt(提示段按块预填时第 0 对是位置 n_prompt; 老口径 n_prompt=1 不变)。 */
 typedef struct { char magic[4]; uint32_t d, n, pos0; } v41_dcap_hdr;
-#define V41_DCAP_POS0 1u
 
 /* ★金标夹具的料(2026-09-18)★ <out>.fix: 20 B 头 {"DFIX", n_target, D, block, n} + 每对
  * [草稿器吃的 main_hidden f32 n_target×D][块首位 token i32][它出的 block 位草稿 i32][block 个 conf f32]。
@@ -54,14 +54,34 @@ typedef struct { char magic[4]; uint32_t d, n, pos0; } v41_dcap_hdr;
  * "我们的塔算错了"与"量化隐态把塔带偏了"两种病在 p1 上长得一模一样, 只有同一份输入喂两套实现才分得开。 */
 typedef struct { char magic[4]; uint32_t n_target, d, block, n; } v41_dfix_hdr;
 
-int ds4_engine_v41_dspark_capture(ds4_engine *e, const int *ids, int n_ids, const char *out_path) {
+/* 接受率陪审团(2026-09-29): 同一位置上 主模型分布 p = softmax(lm/T) 与 草稿塔首位分布 q = softmax(ld/T)(全词表, 与部署默认 top_p 1 / min_p 0 同),
+ * 点质量草稿的期望接受率 = p(argmax q), 草稿按分布抽的期望接受率 = Σmin(p,q)。主机 double 算, 是判官不是生产路。 */
+static void v41_dcap_jury(const float *lm, const float *ld, uint32_t V, double T, double *pm, double *qm, double *acc_pm, double *acc_dist) {
+    double Mm = -INFINITY, Md = -INFINITY; uint32_t qi = 0;
+    for (uint32_t i = 0; i < V; i++) {
+        if (lm[i] > Mm) Mm = lm[i];
+        if (ld[i] > Md) { Md = ld[i]; qi = i; }
+    }
+    double Zm = 0.0, Zd = 0.0;
+    for (uint32_t i = 0; i < V; i++) {
+        pm[i] = isfinite(lm[i]) ? exp(((double)lm[i] - Mm) / T) : 0.0; Zm += pm[i];
+        qm[i] = isfinite(ld[i]) ? exp(((double)ld[i] - Md) / T) : 0.0; Zd += qm[i];
+    }
+    double smin = 0.0;
+    for (uint32_t i = 0; i < V; i++) { const double p = pm[i] / Zm, q = qm[i] / Zd; smin += p < q ? p : q; }
+    *acc_pm = pm[qi] / Zm; *acc_dist = smin;
+}
+
+int ds4_engine_v41_dspark_capture(ds4_engine *e, const int *ids, int n_ids, const char *out_path, int n_prompt) {
     if (!e || !ids || n_ids < 3 || !ds4_engine_is_v41(e)) return 1;   /* 位置 0 只暖主模型, 至少要 1 对 */
     if (!e->metal_ready) { fprintf(stderr, "ds4: V4.1 取料需要 GPU 后端\n"); return 1; }
     const uint32_t D = DS4_N_EMBD;
     uint32_t ctx = (uint32_t)n_ids + 1;
     if (ctx > g_ds4_v41.ctx) { fprintf(stderr, "ds4: 取料序列 %d 超过上下文 %u(模型元数据)\n", n_ids, g_ds4_v41.ctx); return 1; }
+    if (n_prompt < 1 || n_prompt > n_ids - 2) n_prompt = 1;   /* 0/越界 = 老口径: 位置 0 暖主模型, 从 1 起逐位 */
     ds4_v41_state st;
-    if (!v41_state_alloc(&st, 1u, ctx)) return 1;   /* cap=1: 一位一块, 见文件头 */
+    const uint32_t cap = n_prompt > 1 ? (DS4_V41_CHUNK < (uint32_t)n_prompt ? DS4_V41_CHUNK : (uint32_t)n_prompt) : 1u;
+    if (!v41_state_alloc(&st, cap, ctx)) return 1;   /* cap=1: 一位一块, 见文件头; 提示段按块预填时 cap = 块 */
     ds4_v41_draft dr;
     if (!v41_draft_alloc(e, &dr)) { fprintf(stderr, "ds4: 这份 GGUF 没带 DSpark 三塔, 取不了料\n"); v41_state_free(&st); return 1; }
     FILE *fo = fopen(out_path, "wb");
@@ -70,6 +90,10 @@ int ds4_engine_v41_dspark_capture(ds4_engine *e, const int *ids, int n_ids, cons
     int32_t *mtok = xmalloc((size_t)n_ids * 4), *dtok = xmalloc((size_t)n_ids * 4);
     const uint32_t NT = g_ds4_v41.n_mtp_target, B = dr.block;
     float *mh = xmalloc((size_t)NT * D * 4);
+    const double T = g_decode_sampling.temperature > 0.f ? (double)g_decode_sampling.temperature : 0.0;   /* > 0 才出陪审团 */
+    float *lm = T > 0.0 ? xmalloc((size_t)DS4_N_VOCAB * 4) : NULL, *ld = T > 0.0 ? xmalloc((size_t)DS4_N_VOCAB * 4) : NULL;
+    double *pm = T > 0.0 ? xmalloc((size_t)DS4_N_VOCAB * 8) : NULL, *qm = T > 0.0 ? xmalloc((size_t)DS4_N_VOCAB * 8) : NULL;
+    double sum_pm = 0.0, sum_dist = 0.0;
     char pfix[4400];
     snprintf(pfix, sizeof pfix, "%s.fix", out_path);
     FILE *ff = fopen(pfix, "wb");
@@ -77,21 +101,30 @@ int ds4_engine_v41_dspark_capture(ds4_engine *e, const int *ids, int n_ids, cons
     uint32_t nw = 0, hit = 0;
     do {
         if (!fo || !am || !ff) { fprintf(stderr, "ds4: 取料落盘/暂存分配失败\n"); break; }
-        v41_dcap_hdr h = { { 'D','C','A','P' }, D, 0, V41_DCAP_POS0 };
+        v41_dcap_hdr h = { { 'D','C','A','P' }, D, 0, (uint32_t)n_prompt };
         if (fwrite(&h, sizeof h, 1, fo) != 1) break;
         v41_dfix_hdr hf = { { 'D','F','I','X' }, NT, D, B, 0 };
         if (fwrite(&hf, sizeof hf, 1, ff) != 1) break;
         bool ok = true;
-        {   /* 位置 0: 只让主模型吃 ids[0], 好让 main_hidden(0) 就位; 这一位没有可配的草稿 */
-            const int32_t tok0 = (int32_t)ids[0];
-            if (!v41_forward(e, &st, &tok0, 1u)) break;
+        /* 位置 0..n_prompt-1: 主模型按块预填(n_prompt=1 就是老口径的"位置 0 只暖主模型"), 让 main_hidden 环就位; 这一段没有可配的草稿。
+         * 末块至少留 window 个位置(与生成路的预填同规则, core_v41_api.c), 草稿器第一轮补窗口才补得齐。 */
+        for (int c0 = 0; ok && c0 < n_prompt; ) {
+            uint32_t nc = (uint32_t)(n_prompt - c0) < cap ? (uint32_t)(n_prompt - c0) : cap;
+            const uint32_t rest = (uint32_t)(n_prompt - c0) - nc;
+            if (rest > 0u && rest < DS4_N_SWA && nc > DS4_N_SWA) nc -= DS4_N_SWA - rest;
+            int32_t chunk[DS4_V41_CHUNK];
+            for (uint32_t j = 0; j < nc; j++) chunk[j] = (int32_t)ids[c0 + (int)j];
+            ok = v41_forward(e, &st, chunk, nc);
+            c0 += (int)nc;
         }
-        for (int i = 1; i < n_ids - 1 && ok; i++) {
+        if (!ok) break;
+        for (int i = n_prompt; i < n_ids - 1 && ok; i++) {
             const int32_t tok = (int32_t)ids[i];
             /* ①草稿(在线同一口径): tok = 还没进主模型的下一个 token, main_hidden = 主模型最后处理的位置 i-1。
              * 块首位坐在位置 i, 首位草稿预测位置 i+1; 出口隐态第 0 行就是喂给出口头出这一位的那行。 */
             if (!v41_draft_step(e, &st, &dr, tok, (uint32_t)(i - 1))) { ok = false; break; }
             if (!ds4_gpu_synchronize() || !ds4_gpu_tensor_read(dr.st.xn, 0, xrow, (uint64_t)D * 4)) { ok = false; break; }
+            if (ld && !ds4_gpu_tensor_read(dr.st.logits, 0, ld, (uint64_t)DS4_N_VOCAB * 4)) { ok = false; break; }   /* 塔首位 logits(+markov 偏置) = q */
             const int32_t guess = dr.host_ids[1];
             /* 夹具料: 这一轮草稿吃的 main_hidden(= st.mainh 第 0 行, 主模型位置 i-1 的三层拼接)+ 首位 token + 全部草稿/conf */
             if (!ds4_gpu_tensor_read(st.mainh, 0, mh, (uint64_t)NT * D * 4) ||
@@ -103,13 +136,19 @@ int ds4_engine_v41_dspark_capture(ds4_engine *e, const int *ids, int n_ids, cons
             if (!ds4_gpu_v41_argmax_tensor(am, st.logits, 0u, DS4_N_VOCAB) || !ds4_gpu_synchronize() ||
                 !ds4_gpu_tensor_read(am, 0, &want, 4) ||
                 !ds4_gpu_tensor_read(st.xn, 0, yrow, (uint64_t)D * 4)) { ok = false; break; }
+            if (lm) {   /* 陪审团: 同一位置的 p(主模型) 与 q(塔首位), 两种草稿方案的期望首位接受率 */
+                double apm, adist;
+                if (!ds4_gpu_tensor_read(st.logits, 0, lm, (uint64_t)DS4_N_VOCAB * 4)) { ok = false; break; }
+                v41_dcap_jury(lm, ld, DS4_N_VOCAB, T, pm, qm, &apm, &adist);
+                sum_pm += apm; sum_dist += adist;
+            }
             /* ③同一个目标位置(i+1)的两份, 配对落盘: 第 nw 对 = 主模型位置 i = pos0 + nw */
             if (fwrite(xrow, 4, D, fo) != D || fwrite(yrow, 4, D, fo) != D) { ok = false; break; }
             mtok[nw] = want; dtok[nw] = guess;
             if (want == guess) hit++;
             nw++;
             if ((nw % 64u) == 0u)
-                fprintf(stderr, "[dcap] %u/%d 位置, 首位一致 %.3f\r", nw, n_ids - 2, (double)hit / (double)nw);
+                fprintf(stderr, "[dcap] %u/%d 位置, 首位一致 %.3f\r", nw, n_ids - 1 - n_prompt, (double)hit / (double)nw);
         }
         if (!ok) { fprintf(stderr, "\nds4: 取料在第 %u 位失败\n", nw); break; }
         if (fwrite(mtok, 4, nw, fo) != nw || fwrite(dtok, 4, nw, fo) != nw) break;
@@ -118,10 +157,13 @@ int ds4_engine_v41_dspark_capture(ds4_engine *e, const int *ids, int n_ids, cons
         hf.n = nw;
         if (fseek(ff, 0, SEEK_SET) != 0 || fwrite(&hf, sizeof hf, 1, ff) != 1) break;
         fprintf(stderr, "\n[dcap] 落盘 %s: %u 位置 × 2 × %u f32(第 0 对 = 主模型位置 %u); 夹具料 %s(%u 对 × main_hidden %u×%u + %u 位草稿)\n",
-                out_path, nw, D, V41_DCAP_POS0, pfix, nw, NT, D, B);
+                out_path, nw, D, (unsigned)n_prompt, pfix, nw, NT, D, B);
         /* ★这一行就是 M6 的判决基线★: 草稿器首位 ↔ 部署底座 argmax 的一致率。
          * 它与在线生成时 spec 账里的 p1 应当同量级 —— 差很多就说明取料与部署不同路, 先别解。 */
         fprintf(stderr, "[dcap] ★草稿器首位 ↔ 底座 argmax 一致率 = %.4f (n=%u)★\n", (double)hit / (double)(nw ? nw : 1), nw);
+        if (lm && nw)
+            fprintf(stderr, "[dcap] ★接受率陪审团 温 %.2f: 点质量草稿 E[p(argmax q)] = %.4f, 分布草稿 E[Σmin(p,q)] = %.4f (n=%u, 提示段 %d 个位置不计)★\n",
+                    T, sum_pm / (double)nw, sum_dist / (double)nw, nw, n_prompt);
         /* ★顺带把出口度量也取走(mtp-1.md M6′)★: 解算侧要按"头怎么看这个维度"加权, 而不是按隐态的
          * 欧氏距离 —— 09-16 那次判负(留出一致率不升反降)的真因就是这个度量选错了。
          * 落成 <out>.hdiag(D 个 f32 = 每一列的平方和)。写不出来只警告不停车: 老口径(纯 L2)还能解。 */
@@ -150,14 +192,14 @@ int ds4_engine_v41_dspark_capture(ds4_engine *e, const int *ids, int n_ids, cons
     if (fo) fclose(fo);
     if (ff) fclose(ff);
     if (am) ds4_gpu_tensor_free(am);
-    free(xrow); free(yrow); free(mtok); free(dtok); free(mh);
+    free(xrow); free(yrow); free(mtok); free(dtok); free(mh); free(lm); free(ld); free(pm); free(qm);
     v41_draft_free(&dr);
     v41_state_free(&st);
     return rc;
 }
 #else
-int ds4_engine_v41_dspark_capture(ds4_engine *e, const int *ids, int n_ids, const char *out_path) {
-    (void)e; (void)ids; (void)n_ids; (void)out_path;
+int ds4_engine_v41_dspark_capture(ds4_engine *e, const int *ids, int n_ids, const char *out_path, int n_prompt) {
+    (void)e; (void)ids; (void)n_ids; (void)out_path; (void)n_prompt;
     fprintf(stderr, "ds4: V4.1 只有 GPU 路\n"); return 1;
 }
 #endif

@@ -37,7 +37,10 @@ int ds4_engine_v41_score_ids(ds4_engine *e, const int *ids, int n_ids, const cha
 
 /* --dspark-capture(mtp.md M6): 教师强制一位一块走完 ids, 每位出 (草稿器出口隐态, 主模型出口隐态) 一对,
  * 并直接量出"草稿器首位 ↔ 底座 argmax"的一致率(= 投机首位接受率 p1 的判决基线)。实现见 core_v41_dcap.c。 */
-int ds4_engine_v41_dspark_capture(ds4_engine *e, const int *ids, int n_ids, const char *out_path);
+/* n_prompt(2026-09-29): 前 n_prompt 个 id 按分块预填(提示段不逐位取料, 14k 提示逐位要十几分钟), 从第 n_prompt 个起一位一块; 0 = 从头逐位。
+ * 顺带出★接受率陪审团★: 采样面温度 > 0 时, 逐位置按同一套温度算 主模型分布 p 与 草稿塔首位分布 q, 报 平均 p(argmax q)(点质量草稿的期望
+ * 首位接受率)与 平均 Σmin(p,q)(草稿按分布抽的期望首位接受率) —— 同一段文本上的解析量, 不吃采样噪声(在线 t/s 每趟是另一篇文本, seed 间 ±3 t/s)。 */
+int ds4_engine_v41_dspark_capture(ds4_engine *e, const int *ids, int n_ids, const char *out_path, int n_prompt);
 
 /* --draft-amp <file>: 挂草稿器对齐边车(gguf-tools/amp/dspark_align 的产物)。只改草稿器的出口隐态,
  * 主模型一个字节不碰 —— 所以它**不可能**动五指标, 只动接受率。传 NULL/不传 = 不挂, 整条路恒等。 */
@@ -49,12 +52,14 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
                                    ds4_v41_emit_fn emit, void *ud);
 /* 解码采样(2026-09-21, 113-1.md §4): 上面那条生成路的名字里的 argmax 是历史, 采样由这个设置面决定。
  * temperature ≤ 0(默认) = 裸 argmax: 图末尾的设备 argmax, 一个字节不变(门 = 温 0 输出逐字节回归)。
- * > 0 = 每步把末位 logits 行读回主机, 交给 V4 路**同一份**采样器 ds4_sample_logits(温度 / top-k / top-p / min-p / seed)
- * ⇒ 两条路同分布。只按模型自己的分布抽, 不动 logits(铁律"引擎不得改模型输出"); 频率/出现/序列复读惩罚还没接。
- * seed 0 = 按时钟(与 V4 CLI 同规则)。NULL = 回到裸 argmax。采样与显式 --dspark 不能同开: 生成路直接拒; 投机只是默认开着时, 采样请求走纯解码并打日志。
+ * > 0 = ★设备采样核★(2026-09-28, src/cuda/cuda_v41_sample.inc.cu): 温度 / top-k / top-p / min-p 与 V4 路采样器 ds4_sample_logits
+ * 同一套语义, 在图末尾替掉 argmax, 主机只读 16 B; 投机照走(核里做拒绝采样: 接受 ⇔ 均匀数 < 目标分布给草稿的概率, 拒绝从残差抽,
+ * 吐出 token 的边缘分布 = 纯解码采样的分布)。只按模型自己的分布抽, 不动 logits(铁律"引擎不得改模型输出")。
+ * seed 0 = 按时钟(与 V4 CLI 同规则)。NULL = 回到裸 argmax。同 seed 下投机与纯解码吐的具体 token 不同(硬币不同), 分布相同。
  * 惩罚(core_decode_penalty.c, 全部默认 0 = 不进那段代码): freq/presence = OpenAI 频率/出现惩罚(与 V4 路同式);
  * dry_multiplier > 0 开 DRY 序列复读惩罚(base 1.75 / allowed_length 2 是 llama.cpp 默认): 这是温 0 下也能挡死循环的唯一手段。
- * 任一惩罚非零时, 温 0 也走"读回 logits 行 → 罚 → argmax"这条路(argmax 由同一份采样器在温 0 时给出)。 */
+ * 任一惩罚非零时, 温 0 也走"读回 logits 行 → 罚 → argmax"这条路(argmax 由同一份采样器在温 0 时给出); 惩罚要按 token 史改 logits,
+ * 投机不接它: 显式 --dspark + 惩罚 直接拒, 投机只是默认开着时该请求走纯解码并打日志。 */
 typedef struct {
     float temperature, top_p, min_p; int top_k; uint64_t seed;
     float freq_penalty, presence_penalty;

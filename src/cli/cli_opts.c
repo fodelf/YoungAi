@@ -355,6 +355,8 @@ cli_config parse_options(int argc, char **argv) {
             c.gen.draft_amp_scale = (float)atof(need_arg(&i, argc, argv, arg));
         } else if (!strcmp(arg, "--dspark-capture")) {
             c.gen.dcap_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dspark-capture-prompt")) {
+            c.gen.dcap_prompt = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--v41-no-engram")) {
             c.gen.v41_no_engram = 1;
         } else if (!strcmp(arg, "--v41-chunk")) {

@@ -37,10 +37,10 @@ static int v41_emit_print(int token, void *ud) {
     if (txt) { fwrite(txt, 1, len, stdout); fflush(stdout); }
     return 0;
 }
-int run_v41_generation(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
-    /* 解码采样: 不给 --temp 就是 ds4.h 的官方默认(温 1.0), 与服务端、V4 CLI 同一份数。以前 V4.1 路不给 --temp = 裸 argmax,
-     * 帮助里写着 "Default: 1" 实际却是 0, 09-28 撞在"以五结尾"类请求的死循环上。尺脚本要贪心就显式 --temp 0。
-     * top_k 0 = 全词表, 与 V4 CLI 的 ds4_session_sample(…, 0, …) 同口径。 */
+/* 解码采样面: 不给 --temp 就是 ds4.h 的官方默认(温 1.0), 与服务端、V4 CLI 同一份数。以前 V4.1 路不给 --temp = 裸 argmax,
+ * 帮助里写着 "Default: 1" 实际却是 0, 09-28 撞在"以五结尾"类请求的死循环上。尺脚本要贪心就显式 --temp 0。
+ * top_k 0 = 全词表, 与 V4 CLI 的 ds4_session_sample(…, 0, …) 同口径。生成路与取料路(接受率陪审团要温度)都从这里设。 */
+static void cli_v41_set_sampling(const cli_config *cfg) {
     const ds4_decode_sampling sp = {
         .temperature = cfg->gen.temperature, .top_p = cfg->gen.top_p, .min_p = cfg->gen.min_p,
         .top_k = 0, .seed = cfg->gen.seed, .freq_penalty = 0.f, .presence_penalty = 0.f,
@@ -48,6 +48,9 @@ int run_v41_generation(ds4_engine *engine, const cli_config *cfg, const ds4_toke
         .dry_allowed_length = cfg->gen.dry_allowed_length > 0 ? cfg->gen.dry_allowed_length : 2,
     };
     ds4_engine_set_decode_sampling(&sp);
+}
+int run_v41_generation(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
+    cli_v41_set_sampling(cfg);
     ds4_engine_v41_set_prof(cfg->gen.v41_prof);
     ds4_engine_v41_set_decoder_full(cfg->gen.decoder_full);
     /* 两个标志同时给 = 关(显式的"关"压过显式的"开", 免得脚本里两条都留着还以为开着); 都不给 = 默认开(1), 见 core_v41_api.c */
@@ -107,7 +110,8 @@ int run_score_ids(ds4_engine *engine, const cli_config *cfg) {
         ds4_engine_v41_set_block(cfg->gen.dspark_block > 0 ? (unsigned)cfg->gen.dspark_block : 0u);
         if (!cfg->gen.decoder_full)
             fprintf(stderr, "ds4: ★--dspark-capture 必须配 --decoder-full★(否则 CED 让每块不出 logits, 靶是错的)\n");
-        const int rc = ds4_engine_v41_dspark_capture(engine, ids, n, cfg->gen.dcap_path);
+        cli_v41_set_sampling(cfg);   /* 温度给接受率陪审团(温 0 = 只出贪心一致率) */
+        const int rc = ds4_engine_v41_dspark_capture(engine, ids, n, cfg->gen.dcap_path, cfg->gen.dcap_prompt);
         free(ids);
         return rc;
     }
