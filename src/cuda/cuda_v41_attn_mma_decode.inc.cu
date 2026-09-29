@@ -33,7 +33,8 @@ __global__ static void v41_attn_mma_seg_kernel(float *pacc, float *pmax, float *
                                                const float *q, const float *kvw, const uint8_t *kvc,
                                                const int32_t *idx, uint32_t pos0, uint32_t window,
                                                uint32_t ng, uint32_t topk, uint32_t n_head,
-                                               float scale, uint32_t ratio, uint32_t nseg, const int32_t *posd) {
+                                               float scale, uint32_t ratio, uint32_t nseg, const int32_t *posd,
+                                               uint32_t full_block, uint32_t ring) {
     v41_pdl_wait();   /* PDL: 第一句就等上游(见 cuda_internal.cuh); 不经 PDL 发射时立即返回 */
     /* graph: 位置在设备槽; n 行(gridDim.z, 投机验证批进图)时源层组数 = (pos0 + n)/ratio, 与直发路主机传的 ng_src 同式 */
     if (posd) { pos0 = (uint32_t)posd[0]; ng = ratio ? (pos0 + gridDim.z) / ratio : 0u; if (ng < topk) topk = ng; }
@@ -53,11 +54,14 @@ __global__ static void v41_attn_mma_seg_kernel(float *pacc, float *pmax, float *
     const uint32_t seg = blockIdx.x, h0 = blockIdx.y * DS4_ATTN_MMA_HEADS, i = blockIdx.z;
     const uint64_t pbase = ((uint64_t)i * nseg + seg) * n_head + h0;
     const uint32_t p = pos0 + i;
-    const uint32_t lo = p + 1u > window ? p + 1u - window : 0u;
-    const uint32_t nwin = p - lo + 1u, nkeys = nwin + topk;
+    /* ★full_block(DSpark 草稿块, 2026-09-29 起也走这里)★: 块内每一位看同一个键集合 = 块前面整个窗口 + 块内全部 n 位, 不做因果截断
+     * (官方 get_dspark_topk_idxs); 主路(0)是因果的: 第 i 位只看到 [p+1-window, p]。窗口排法由 ring 定(塔是线性段)。 */
+    const uint32_t last = full_block ? pos0 + full_block - 1u : p;
+    const uint32_t lo = full_block ? (pos0 > window ? pos0 - window : 0u) : (p + 1u > window ? p + 1u - window : 0u);
+    const uint32_t nwin = last - lo + 1u, nkeys = nwin + topk;
     /* ★段长按这个 query 自己的位置算★(见文件头): 靠前的 query 段长可能与末位不同, 于是它的段数
      * 也可能少于 grid 给的 nseg —— 多出来的那些段走下面的"空段"分支, 对合并是精确中性的。 */
-    const uint32_t seg_keys = v41_attn_seg_keys(p, window, ratio, topk);
+    const uint32_t seg_keys = full_block ? v41_attn_fb_seg_keys(nkeys) : v41_attn_seg_keys(p, window, ratio, topk);
     const uint32_t k0 = seg * seg_keys;
     if (k0 >= nkeys) {   /* 空段: 写中性值就走(exp(-1e30 - m) = 0 ⇒ 对合并没有贡献) */
         if (posd) return;   /* graph 路: 合并核只读真段, 空段不写(省 32 KB/段的白写) */
@@ -75,17 +79,10 @@ __global__ static void v41_attn_mma_seg_kernel(float *pacc, float *pmax, float *
     for (uint32_t base = k0; base < k1; base += DS4_ATTN_MMA_KT) {   /* 第一遍: 本段的 max 与 exp 和 */
         const uint32_t nt = (k1 - base) < DS4_ATTN_MMA_KT ? (k1 - base) : DS4_ATTN_MMA_KT;
         __syncthreads();
-        ds4_attn_mma_gather_keys(ks, valid, kvw, kvc, idx, i, base, nt, nwin, lo, pos0, window, ng, topk);
+        ds4_attn_mma_gather_keys(ks, valid, kvw, kvc, idx, i, base, nt, nwin, lo, pos0, window, ng, topk, ring);
         __syncthreads();
         ds4_attn_mma_scores(stile, spart, qs, ks, valid, nt, scale);
-        if (threadIdx.x < DS4_ATTN_MMA_HEADS) {
-            const uint32_t h = threadIdx.x;
-            float m = rmax[h], sm = rsum[h], tm = m;
-            for (uint32_t k = 0; k < DS4_ATTN_MMA_KT; k++) tm = fmaxf(tm, stile[h * 16u + k]);
-            sm *= expf(m - tm);
-            for (uint32_t k = 0; k < DS4_ATTN_MMA_KT; k++) sm += expf(stile[h * 16u + k] - tm);
-            rmax[h] = tm; rsum[h] = sm;
-        }
+        ds4_attn_mma_stats(stile, rmax, rsum);   /* 在线 max/sum(并行版, 逐位同串行版; cuda_sparse_attn_mma.inc.cu) */
     }
     __syncthreads();
 
@@ -95,7 +92,7 @@ __global__ static void v41_attn_mma_seg_kernel(float *pacc, float *pmax, float *
     for (uint32_t base = k0; base < k1; base += DS4_ATTN_MMA_KT) {   /* 第二遍: 重算 S → P(bf16) → O */
         const uint32_t nt = (k1 - base) < DS4_ATTN_MMA_KT ? (k1 - base) : DS4_ATTN_MMA_KT;
         __syncthreads();
-        ds4_attn_mma_gather_keys(ks, valid, kvw, kvc, idx, i, base, nt, nwin, lo, pos0, window, ng, topk);
+        ds4_attn_mma_gather_keys(ks, valid, kvw, kvc, idx, i, base, nt, nwin, lo, pos0, window, ng, topk, ring);
         __syncthreads();
         ds4_attn_mma_scores(stile, spart, qs, ks, valid, nt, scale);
         for (uint32_t e = threadIdx.x; e < 256u; e += blockDim.x)
@@ -110,16 +107,18 @@ __global__ static void v41_attn_mma_seg_kernel(float *pacc, float *pmax, float *
         }
     }
 
-    /* 出口: 只落局部 acc/max/sum。★按 j 分四轮存★ —— 8 个 warp × 4 片一次要 32 KB, shared 装不下,
-     * 而且不带 warp 偏移地共用一块就是 09-15 踩过的那个"互相踩、PPL 变 28 万"的坑。 */
-    float *otile = spart;
-    for (int j = 0; j < 4; j++) {
+    /* 出口: 只落局部 acc/max/sum。★两轮各存两片★(2026-09-29, 微基准 V7; 原来按 j 分四轮各一片借 8 KB 的 spart) ——
+     * 8 个 warp × 4 片一次要 32 KB, shared 装不下; 最后一次 P·V 之后 ks 那 16 KB 空了, 正好放 8 warp × 2 片。
+     * 每片仍带 warp 偏移(不带偏移共用一块就是 09-15 踩过的那个"互相踩、PPL 变 28 万"的坑)。 */
+    float *otile = (float *)ks;
+    for (int r = 0; r < 2; r++) {
         __syncthreads();
-        wmma::store_matrix_sync(otile + (size_t)warp * 256u, oacc[j], 16, wmma::mem_row_major);
+        wmma::store_matrix_sync(otile + (size_t)warp * 512u, oacc[2 * r], 16, wmma::mem_row_major);
+        wmma::store_matrix_sync(otile + (size_t)warp * 512u + 256u, oacc[2 * r + 1], 16, wmma::mem_row_major);
         __syncthreads();
-        for (uint32_t e = threadIdx.x; e < DS4_ATTN_MMA_WARPS * 256u; e += blockDim.x) {
-            const uint32_t w = e >> 8, r = e & 255u, h = r >> 4, d16 = r & 15u;
-            pacc[(pbase + h) * DS4_ATTN_MMA_HD + w * 64u + (uint32_t)j * 16u + d16] = otile[e];
+        for (uint32_t e = threadIdx.x; e < DS4_ATTN_MMA_WARPS * 512u; e += blockDim.x) {
+            const uint32_t w = e >> 9, rr = e & 511u, jj = rr >> 8, t = rr & 255u, h = t >> 4, d16 = t & 15u;
+            pacc[(pbase + h) * DS4_ATTN_MMA_HD + w * 64u + (uint32_t)(2 * r) * 16u + jj * 16u + d16] = otile[e];
         }
     }
     __syncthreads();
@@ -148,7 +147,7 @@ int ds4_gpu_v41_attn_scratch_prepare(uint32_t n_tok, uint32_t n_head, uint32_t h
 static int v41_attn_mma_decode(float *o, const float *q, const float *kvw, const uint8_t *kvc, const int32_t *idx,
                                const float *sink, uint32_t n_tok, uint32_t pos0, uint32_t window, uint32_t ng,
                                uint32_t topk, uint32_t ratio, uint32_t n_head, uint32_t hd, float scale,
-                               const int32_t *posd, uint32_t pos_cap) {
+                               const int32_t *posd, uint32_t pos_cap, uint32_t full_block, uint32_t ring) {
     /* n_tok 1 = 纯解码; 2..8 = 投机验证批 —— ★两者走同一族核是"同轨"的前提★(mtp.md M1):
      * 温 0 下投机输出要与纯解码逐字节同, 而同一个 token 走两套不同累加序的核就不可能同。 */
     if (n_tok == 0u || n_tok > 8u || hd != DS4_ATTN_MMA_HD || (n_head % DS4_ATTN_MMA_HEADS)) return 0;
@@ -170,7 +169,10 @@ static int v41_attn_mma_decode(float *o, const float *q, const float *kvw, const
     /* grid 的段数 = 批里各 query 各自算出来的段数的**最大值**(它们的段长可能不同, 见 v41_attn_seg_keys)。
      * 段长本身由核里按各自的位置再算一遍 —— 主机只负责把 grid 开够。 */
     uint32_t nseg = 1u;
-    if (posd) {   /* graph: 桶内每个位置的段数取最大(核里按真位置算真段数, 多出的段空跑); n 行时末行位置到 pos_cap + n − 1 */
+    if (full_block) {   /* 草稿块: n 位同一个键集合(窗口 + 块内 n 位), 段长只看键数 */
+        const uint32_t lo = pos0 > window ? pos0 - window : 0u, nk = pos0 + n_tok - lo;
+        nseg = (nk + v41_attn_fb_seg_keys(nk) - 1u) / v41_attn_fb_seg_keys(nk);
+    } else if (posd) {   /* graph: 桶内每个位置的段数取最大(核里按真位置算真段数, 多出的段空跑); n 行时末行位置到 pos_cap + n − 1 */
         if (pos_cap < pos0) return 0;
         for (uint32_t p = pos0; p <= pos_cap + n_tok - 1u; p++) {
             const uint32_t ns = v41_attn_nseg_at(p, window, ratio, topk);
@@ -196,7 +198,7 @@ static int v41_attn_mma_decode(float *o, const float *q, const float *kvw, const
     float *psum = (float *)v41_grow(&g_v41_attn_psum, na * 4, "v41 attn mma sum");
     if (!pacc || !pmax || !psum) return 0;
     v41_attn_mma_seg_kernel<<<dim3(nseg, n_head / DS4_ATTN_MMA_HEADS, n_tok), DS4_ATTN_MMA_WARPS * 32u, smem, g_cur_stream>>>(
-        pacc, pmax, psum, q, kvw, kvc, idx, pos0, window, ng, topk, n_head, scale, ratio, nseg, posd);
+        pacc, pmax, psum, q, kvw, kvc, idx, pos0, window, ng, topk, n_head, scale, ratio, nseg, posd, full_block, ring);
     if (!cuda_ok(cudaGetLastError(), "v41 attn mma seg")) return 0;
     /* 合并复用标量 split 版那一发(按段号固定序 + sink 进分母 + 除 + 舍 bf16), 语义完全一样 */
     v41_sparse_attn_merge_kernel<<<dim3(n_head, n_tok), 256, 0, g_cur_stream>>>(o, pacc, pmax, psum, sink, nseg, n_head, hd,

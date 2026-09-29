@@ -32,24 +32,42 @@
 #define DS4_ATTN_MMA_HD    512u  /* 头维, 与 v41 形状绑死(调用方已校验) */
 
 /* 把 16 个键行搬进 shared 并转 bf16; 无效槽整行清零, valid[] 记状态(给后面压 -inf 用)。
- * 键序 = 窗口行(升序)后接 topk 压缩行, 与标量版一字不差。 */
+ * 键序 = 窗口行(升序)后接 topk 压缩行, 与标量版一字不差。
+ * ★压缩行的解包(2026-09-29, gguf-tools/bench/v41_attn_seg_bench.cu 定形)★: 原来每个元素都走一次 v41_ckv_get =
+ * 一次 e4m3 缩放解码(带分支 + ldexpf)+ 一次 fp4 查表(static const 表 = LDC 按 lane 下标重放)+ 一次手写 RNE 舍入,
+ * 一行 512 个元素解 512 次缩放而这行只有 32 个缩放。12k 真形状微基准: 这一发 n=1 2.4 → 1.4 ms/步, 验证批 n=4 7.9 → 5.0 ——
+ * 慢的是解码指令, 不是字节。改: 32 个缩放 lane i 解第 i 个、元素循环 shfl 取; fp4 的 16 个值 lane l 各持一个, 查表 = 一条 shfl;
+ * 乘完直接 cvt.rn(它本身就是 RNE, 与 v41_bf16r 同值)。同一个 scale 同一个 nibble 同一次乘法 ⇒ 逐位同(微基准两道逐位门 +
+ * 引擎 d1 门), 预填 mma 版与解码 seg 版共用这一个 gather, 两条路一起换。 */
 __device__ __forceinline__ static void ds4_attn_mma_gather_keys(
         __nv_bfloat16 *ks, int *valid, const float *kvw, const uint8_t *kvc, const int32_t *idx,
         uint32_t i, uint32_t base, uint32_t nt, uint32_t nwin, uint32_t lo, uint32_t pos0,
-        uint32_t window, uint32_t ng, uint32_t topk) {
+        uint32_t window, uint32_t ng, uint32_t topk, uint32_t ring) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const float tv = ds4_fp4_nibble_to_f32((uint8_t)(lane & 15u));   /* fp4 值表: lane l 持第 l&15 个 */
     for (uint32_t t = threadIdx.x / 32u; t < DS4_ATTN_MMA_KT; t += blockDim.x / 32u) {
-        const uint32_t lane = threadIdx.x & 31u, kk = base + t;
+        const uint32_t kk = base + t;
         const float *krow = NULL; const uint8_t *cpk = NULL;   /* 窗口行 f32 / 压缩行打包 FP4, 见 cuda_kv_pack */
         if (t < nt) {
-            /* ring=1 恒成立: mma 版只在主路(!full_block)被调, 主路的历史段是环(见 v41_win_row) */
-            if (kk < nwin) krow = kvw + v41_win_row((int64_t)lo + kk, pos0, window, 1u) * DS4_ATTN_MMA_HD;
+            /* ring: 主路历史段是环(1); DSpark 草稿塔的窗口是线性段(0, 2026-09-29 起塔也走 mma 版), 见 v41_win_row */
+            if (kk < nwin) krow = kvw + v41_win_row((int64_t)lo + kk, pos0, window, ring) * DS4_ATTN_MMA_HD;
             else if (kvc && idx) { const int32_t g = idx[(uint64_t)i * topk + (kk - nwin)];
                                    if (g >= 0 && (uint32_t)g < ng) cpk = kvc + (uint64_t)g * DS4_V41_CKV_BYTES; }
         }
         if (lane == 0) valid[t] = (krow || cpk) ? 1 : 0;
-        for (uint32_t d = lane; d < DS4_ATTN_MMA_HD; d += 32u)
-            ks[(size_t)t * DS4_ATTN_MMA_HD + d] = krow ? __float2bfloat16(krow[d])
-                                                : (cpk ? __float2bfloat16(v41_ckv_get(cpk, d)) : (__nv_bfloat16)0.0f);
+        __nv_bfloat16 *kt = ks + (size_t)t * DS4_ATTN_MMA_HD;
+        if (krow) { for (uint32_t d = lane; d < DS4_ATTN_MMA_HD; d += 32u) kt[d] = __float2bfloat16(krow[d]); }
+        else if (cpk) {
+            const float sc = ds4_e4m3fn_to_f32(cpk[DS4_V41_CKV_NIB + lane]);   /* 一行 32 个缩放 = 32 个 lane 各解一个 */
+            #pragma unroll
+            for (uint32_t j = 0; j < DS4_ATTN_MMA_HD / 32u; j++) {
+                const uint32_t d = lane + 32u * j;
+                const uint8_t by = cpk[d >> 1];
+                const uint8_t nib = (d & 1u) ? (uint8_t)(by >> 4) : (uint8_t)(by & 0x0Fu);   /* 与 v41_ckv_get 同一取法 */
+                const float s = __shfl_sync(0xffffffffu, sc, (int)(d >> 4));
+                kt[d] = __float2bfloat16(__shfl_sync(0xffffffffu, tv, (int)nib) * s);
+            }
+        } else { for (uint32_t d = lane; d < DS4_ATTN_MMA_HD; d += 32u) kt[d] = (__nv_bfloat16)0.0f; }
     }
 }
 
@@ -82,6 +100,25 @@ __device__ __forceinline__ static void ds4_attn_mma_scores(
     __syncthreads();
 }
 
+/* 一个键块的在线 max/sum, 并行版(2026-09-29, 微基准 V7): warp w 管头 2w(lane 0..15)与 2w+1(lane 16..31), 每 lane 一个键。
+ * 原来 16 个线程各自串行做 16 次 fmaxf + 16 次 expf, 其余 240 个线程干等。
+ * ★逐位同★: max 是精确运算(序无关); 和 = 先 rsum·expf(m−tm), 再按 k = 0..15 顺序加 expf(s_k−tm) —— 与串行版同一序同一值。
+ * 全 block 的线程都要调(warp 内 shfl 是集体操作), 不能再包在 threadIdx.x < 16 里。 */
+__device__ __forceinline__ static void ds4_attn_mma_stats(const float *stile, float *rmax, float *rsum) {
+    const uint32_t lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, k = lane & 15u;
+    const uint32_t h = warp * 2u + (lane >> 4);
+    const float s = stile[h * 16u + k], m = rmax[h];
+    float tm = fmaxf(m, s);
+    tm = fmaxf(tm, __shfl_xor_sync(0xffffffffu, tm, 8)); tm = fmaxf(tm, __shfl_xor_sync(0xffffffffu, tm, 4));
+    tm = fmaxf(tm, __shfl_xor_sync(0xffffffffu, tm, 2)); tm = fmaxf(tm, __shfl_xor_sync(0xffffffffu, tm, 1));
+    const float e = expf(s - tm);
+    float sm = rsum[h] * expf(m - tm);
+    const int b = (int)(lane & 16u);
+    #pragma unroll
+    for (int kk = 0; kk < 16; kk++) sm += __shfl_sync(0xffffffffu, e, b + kk);
+    if (k == 0u) { rmax[h] = tm; rsum[h] = sm; }
+}
+
 __global__ static void ds4_sparse_attn_mma_kernel(float *o, const float *q, const float *kvw, const uint8_t *kvc,
                                                   const int32_t *idx, const float *sink, uint32_t pos0, uint32_t window,
                                                   uint32_t ng, uint32_t topk, uint32_t n_head, float scale, uint32_t win_lo) {
@@ -110,17 +147,10 @@ __global__ static void ds4_sparse_attn_mma_kernel(float *o, const float *q, cons
     for (uint32_t base = 0; base < nkeys; base += DS4_ATTN_MMA_KT) {
         const uint32_t nt = (nkeys - base) < DS4_ATTN_MMA_KT ? (nkeys - base) : DS4_ATTN_MMA_KT;
         __syncthreads();
-        ds4_attn_mma_gather_keys(ks, valid, kvw, kvc, idx, i, base, nt, nwin, lo, pos0, window, ng, topk);
+        ds4_attn_mma_gather_keys(ks, valid, kvw, kvc, idx, i, base, nt, nwin, lo, pos0, window, ng, topk, 1u);
         __syncthreads();
         ds4_attn_mma_scores(stile, spart, qs, ks, valid, nt, scale);
-        if (threadIdx.x < DS4_ATTN_MMA_HEADS) {   /* 一线程一头: 在线 max/sum */
-            const uint32_t h = threadIdx.x;
-            float m = rmax[h], sm = rsum[h], tm = m;
-            for (uint32_t k = 0; k < DS4_ATTN_MMA_KT; k++) tm = fmaxf(tm, stile[h * 16u + k]);
-            sm *= expf(m - tm);
-            for (uint32_t k = 0; k < DS4_ATTN_MMA_KT; k++) sm += expf(stile[h * 16u + k] - tm);
-            rmax[h] = tm; rsum[h] = sm;
-        }
+        ds4_attn_mma_stats(stile, rmax, rsum);   /* 在线 max/sum(并行版, 逐位同串行版) */
     }
     __syncthreads();
 
@@ -131,7 +161,7 @@ __global__ static void ds4_sparse_attn_mma_kernel(float *o, const float *q, cons
     for (uint32_t base = 0; base < nkeys; base += DS4_ATTN_MMA_KT) {
         const uint32_t nt = (nkeys - base) < DS4_ATTN_MMA_KT ? (nkeys - base) : DS4_ATTN_MMA_KT;
         __syncthreads();
-        ds4_attn_mma_gather_keys(ks, valid, kvw, kvc, idx, i, base, nt, nwin, lo, pos0, window, ng, topk);
+        ds4_attn_mma_gather_keys(ks, valid, kvw, kvc, idx, i, base, nt, nwin, lo, pos0, window, ng, topk, 1u);
         __syncthreads();
         ds4_attn_mma_scores(stile, spart, qs, ks, valid, nt, scale);
         for (uint32_t e = threadIdx.x; e < 256u; e += blockDim.x)   /* 官方 acc_s_cast: P 先舍 bf16 再乘 V */
