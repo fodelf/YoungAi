@@ -253,7 +253,7 @@ int ds4_gpu_v41_sparse_attn_tensor(ds4_gpu_tensor *o, const ds4_gpu_tensor *q, c
         if (!v41_attn_mma_decode((float *)o->ptr, (const float *)q->ptr, (const float *)kv_win->ptr,
                                  hasc ? (const uint8_t *)kv_comp->ptr : NULL, hasc ? (const int32_t *)idx->ptr : NULL,
                                  sink, n_tok, pos0, window, hasc ? ng : 0u, hasc ? topk : 0u, hasc ? ratio : 0u, n_head, head_dim, scale,
-                                 (const int32_t *)posd->ptr, pos_cap)) {
+                                 (const int32_t *)posd->ptr, pos_cap, 0u, 1u)) {
             fprintf(stderr, "ds4: [v41] graph 路要的解码张量核注意力不可用\n"); return 0;
         }
         return 1;
@@ -276,7 +276,14 @@ int ds4_gpu_v41_sparse_attn_tensor(ds4_gpu_tensor *o, const ds4_gpu_tensor *q, c
         v41_attn_mma_decode((float *)o->ptr, (const float *)q->ptr, (const float *)kv_win->ptr,
                             kv_comp ? (const uint8_t *)kv_comp->ptr : NULL, idx ? (const int32_t *)idx->ptr : NULL,
                             sink, n_tok, pos0, window, ng, (kv_comp && idx) ? topk : 0u,
-                            (kv_comp && idx) ? ratio : 0u, n_head, head_dim, scale, NULL, 0u))
+                            (kv_comp && idx) ? ratio : 0u, n_head, head_dim, scale, NULL, 0u, 0u, 1u))
+        return 1;
+    /* ★DSpark 草稿块也走张量核版(2026-09-29)★: 塔的注意力只有窗口(无压缩键)、块内全可见、窗口是线性段(ring=0)。
+     * 原来落到下面的标量核: 一轮 3 塔 1.6 ms(每发 0.5 ms 算 5 位 × 133 键), 逐核表里草稿步的第三大项。草稿只提议、验证定输出,
+     * 换核不改最终文本, 门 = 接受率直方图不退(d1 samp/dflt 的 DSpark 汇总行) + 陪审团。键太少/形状不合它自己返回 0 回标量核。 */
+    if (full_block && !ring && !kv_comp && n_tok <= 8u &&
+        v41_attn_mma_decode((float *)o->ptr, (const float *)q->ptr, (const float *)kv_win->ptr, NULL, NULL,
+                            sink, n_tok, pos0, window, 0u, 0u, 0u, n_head, head_dim, scale, NULL, 0u, n_tok, 0u))
         return 1;
     if (!full_block &&
         v41_sparse_attn_split((float *)o->ptr, (const float *)q->ptr, (const float *)kv_win->ptr,

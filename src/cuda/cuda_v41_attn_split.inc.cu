@@ -153,6 +153,14 @@ __host__ __device__ __forceinline__ static uint32_t v41_attn_seg_keys(uint32_t p
     if (seg < DS4_ATTN_MMA_KT) seg = DS4_ATTN_MMA_KT;
     return seg > 64u ? 64u : seg;
 }
+/* ★全可见块(DSpark 草稿塔, 2026-09-29)★: 块内 n 位看同一个键集合(整个窗口 + 块内 n 位, 没有压缩键), 段长只由键数定, 与位置无关;
+ * 草稿只提议、验证定输出, 所以这条路不受"投机 == 纯解码逐字节"约束, 只要确定(同输入两跑同值)。 */
+__host__ __device__ __forceinline__ static uint32_t v41_attn_fb_seg_keys(uint32_t nkeys) {
+    uint32_t seg = (nkeys + V41_ATTN_MMA_DEC_TARGET_SEG - 1u) / V41_ATTN_MMA_DEC_TARGET_SEG;
+    seg = ((seg + DS4_ATTN_MMA_KT - 1u) / DS4_ATTN_MMA_KT) * DS4_ATTN_MMA_KT;
+    if (seg < DS4_ATTN_MMA_KT) seg = DS4_ATTN_MMA_KT;
+    return seg > 64u ? 64u : seg;
+}
 /* 位置 p 的解码 query 有几段(= 主机直发路给 grid 的段数; graph 路的合并核按设备位置自算同一个数)。
  * topk 给批级上限(index_topk), 里面取 min(topk, 可见组数) —— 与直发路主机传 min(index_topk, ng) 再算逐个相同。 */
 __host__ __device__ __forceinline__ static uint32_t v41_attn_nseg_at(uint32_t p, uint32_t window, uint32_t ratio, uint32_t topk) {
