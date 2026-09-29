@@ -78,6 +78,10 @@ typedef struct {
     uint32_t n_direct1;         /* 直发跑过几次 n=1 前向: 第一次把懒分配(平面副本/暂存/核属性)全暖了, 之后才许捕获 */
     uint32_t n_direct_n[DS4_MTP_MAX_BLOCK + 2u];   /* 同上, 按批大小 n 各记一份(投机验证批 n=1+k 各自的暂存/核属性也是懒建的) */
     void *dgraph;               /* core_decode_graph.c 私有(图实例 + pinned 槽; n=1 纯解码图与 n=2.. 验证批图各一张) */
+    int dev_sample;             /* ★设备采样(2026-09-28, core_v41_sample.c)★ 1 = 图/直发末尾用采样核替掉 argmax(温度 > 0 且无惩罚);
+                                 * 投机在这条路上照走(核里做拒绝采样)。惩罚路仍读回整行在主机做, 恒 0。 */
+    ds4_gpu_sample_params samp; /* 采样参数(每请求常量, 捕获进图: 温度 / top_k / top_p / min_p / seed) */
+    const ds4_gpu_tensor *spec_q;   /* 投机 + 采样时: 草稿塔的 logits [block][V](第 i 行 = 验证第 i 行的草稿分布 q), 验证核按它做拒绝采样; NULL = 点质量草稿 */
     int egraph_err;             /* graph 里的 host 节点等 engram 取行时发现失败(host 节点没法报错, 只能记下来事后查) */
     int egraph_uploaded;        /* 捕获中: 位掩码, 第 ei 个 engram 层的 host 节点 + 上传小核已进图 */
     double eg_job_s, eg_wait_s, eg_enter_s; uint32_t eg_n;   /* engram 取行的账(只记 n=1 的解码步; 预填块一轮几百 ms 会把平均污染):
@@ -152,6 +156,10 @@ typedef struct {
     ds4_gpu_tensor *firstd;    /* 设备 int: ring_rows 的起始行(图开头由零拷贝灌) */
     int cap_mode, graph_off;   /* 捕获中(主机写张量改走零拷贝) / 捕获失败过(之后一律直发) */
     uint32_t gsteps, gcaps;    /* 走图的轮数 / 捕获次数 */
+    uint32_t rounds;           /* 出过几轮草稿(直发 + 走图) */
+    int dev_sample;            /* 主路在采样(2026-09-29): 草稿逐位不取 argmax 而按同一套温度/截断从塔的分布抽(硬币流 1), 验证核读塔 logits 做拒绝采样 */
+    ds4_gpu_sample_params samp;
+    int last_warm;             /* 上一轮是暖身轮(本请求第一轮 / 这个 rows 档第一次直发, 付了懒分配与首次触碰): 调度器不把它的墙钟记进稳态成本 */
 } ds4_v41_draft;
 
 bool v41_draft_alloc(ds4_engine *e, ds4_v41_draft *dr);
@@ -162,7 +170,35 @@ void v41_draft_free(ds4_v41_draft *dr);
 bool v41_draft_step(ds4_engine *e, ds4_v41_state *main_st, ds4_v41_draft *dr, int32_t tok, uint32_t pos_main);
 /* 置信调度(core_draft_sched.c): 这一轮该验几位。0 = 一位都不值得验; *value_out = 预测的"产出/成本"比值,
  * < 1 表示连草稿钱都赚不回来 —— 调用方拿它决定下一轮还出不出草稿。 */
-uint32_t v41_draft_pick_k(const float *conf, uint32_t block, float *value_out);
+/* ★在线校准(2026-09-28)★: 采样下第 j 位被接受的概率 = 目标分布给草稿 token 的概率, 比 conf 头学的"贪心是否同选"低。
+ * 不写死折扣: 本请求出过草稿的轮里 首位命中数 / 首位预测概率之和 = ρ, 乘到每位 σ(conf) 上(贪心下 ρ≈1 自动退回原式)。
+ * ★每一轮都要观测, 包括 k=0 的轮★(09-28 实撞: 只在 k≥1 时观测, 第一轮首位被拒 ⇒ ρ=0 ⇒ 之后永远 k=0 ⇒ 再没有观测, 死锁在 21 t/s):
+ * k≥1 看首位是否接受, k=0 看真实吐出的 token 是否等于草稿首位 —— 两者期望都是 p(草稿首位), 同一枚硬币。
+ * 只由 token 史决定 ⇒ 温 0 可复现(与不接墙钟的理由同)。没有样本时 ρ = 1。 */
+/* ★成本也是本请求自量的(2026-09-28)★: ms[n]/cnt[n] = 单 token 步(n=1)与验证 1+k 行(n=2..)的墙钟, draft_ms/draft_n = 草稿一轮;
+ * 调度器按它们做加权最小二乘, 没有编译期常量(以前的 0.273/1.067/0.303 过期过三次)。 */
+typedef struct {
+    double pred1, real1;
+    double ms[DS4_MTP_MAX_BLOCK + 2u]; uint32_t cnt[DS4_MTP_MAX_BLOCK + 2u];
+    double draft_ms; uint32_t draft_n;
+} v41_sched;
+uint32_t v41_draft_pick_k(const float *conf, uint32_t block, float *value_out, const v41_sched *s);
+void v41_sched_observe(v41_sched *s, const float *conf, int hit);   /* 一轮完: 记首位的预测 σ(conf[0]) 与命中(接受 / 吐出 == 草稿) */
+void v41_sched_cost(v41_sched *s, uint32_t n_rows, double ms);      /* 一发的墙钟: n_rows=1 单 token 步, ≥2 验证批 */
+void v41_sched_draft_cost(v41_sched *s, double ms);                 /* 草稿一轮的墙钟 */
+
+/* ---- 取下一个 token(core_v41_sample.c, 2026-09-28) ----
+ * 设备槽每行 4 个 int32(ds4_gpu_v41_sample_tensor 的口径; argmax 路只用 [0]): pick 把 n 行槽拼成 want[i] =
+ * "第 i 行之后该是哪个 token" —— 采样 + 有草稿: 接受 ⇒ 草稿 token, 拒绝 ⇒ 残差样本(必 ≠ 草稿); 否则 = [0]。
+ * 于是投机的"接受最长前缀 = want[a] == batch[a+1]"那一行对贪心与采样是同一句。 */
+void v41_sample_pick(const int32_t *slot, const int32_t *batch, uint32_t n, int dev_sample, int32_t *want);
+/* 直发: 对 logits 第 row0..row0+n-1 行发采样核(dev_sample)或逐行 argmax, 同步, 读回, 拼 want[n]。batch = 这 n 行的输入 token(草稿判据), 单行给 NULL */
+bool v41_device_next(ds4_v41_state *st, ds4_gpu_tensor *am, uint32_t row0, uint32_t n, const int32_t *batch, int32_t *want);
+extern ds4_decode_sampling g_decode_sampling;   /* ds4_engine_set_decode_sampling 设的每请求采样面(core_v41_api.c) */
+/* 生成段 token 史(只在读回 logits 的惩罚路上记): 复读惩罚只看它, 不看提示。brk = 断点表(DRY 开时才建)。 */
+typedef struct { int32_t *tok; uint32_t n, cap; const uint8_t *brk; } v41_hist;
+/* rowbuf == NULL: 设备路(采样核 / argmax), 只读回 16 B; 非 NULL: 惩罚路, 把第 row 行读回主机, 罚完交给 V4 路同一份采样器 */
+bool v41_next_token(ds4_v41_state *st, ds4_gpu_tensor *am, uint32_t row, float *rowbuf, uint64_t *rng, v41_hist *h, int32_t *out);
 
 /* engram 取行的 io_uring 通道(core_v41_ering.c; Linux 才有, open 返回 NULL 就退回线程池)。
  * 一轮 = submit 一批请求(不等) → wait 收齐; 队列装不下的请求 wait 里分批续发。direct = fd 是 O_DIRECT 的(对齐超集进落脚点再拷)。 */
@@ -216,8 +252,9 @@ bool v41_engram_graph_serve(ds4_v41_state *st);
 int v41_engram_graph_err(const ds4_v41_state *st);
 bool v41_graph_ready(const ds4_v41_state *st);
 bool v41_graph_step(ds4_engine *e, ds4_v41_state *st, int32_t tok, int32_t *next_tok);
-/* step 的两半: launch 发出这一步的图后立刻返回(调用方趁 GPU 跑着去 emit 当前 token), wait 等它跑完取下一个 token */
-bool v41_graph_launch(ds4_engine *e, ds4_v41_state *st, int32_t tok);
+/* step 的两半: launch 发出这一步的图后立刻返回(调用方趁 GPU 跑着去 emit 当前 token), wait 等它跑完取下一个 token。
+ * after_draft = 这一步前面刚跑过一轮草稿(调度器判 k=0): 照样走图, 但不进"稳态 ms/步"的账(那本账只认纯解码步)。 */
+bool v41_graph_launch(ds4_engine *e, ds4_v41_state *st, int32_t tok, int after_draft);
 bool v41_graph_wait(ds4_engine *e, ds4_v41_state *st, int32_t *next_tok);
 /* ★投机验证批的整步图(2026-09-22)★: n = 1+k 行按 n 各一张图, 快照(窗口环按层 / 压缩器余行在追加核里)进图, 主机只记账;
  * ready = 这个 n 直发暖过 + 图开着; launch 返回 false = 这一批走不了图(捕获失败/形状不合), 调用方按直发跑, 状态没动。

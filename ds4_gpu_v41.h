@@ -298,6 +298,22 @@ int ds4_gpu_v41_scale_round_tensor(ds4_gpu_tensor *x, uint64_t n, float s);
 /* argmax(logits 第 row 行, n_vocab) → idx[0] int32(同值取小下标) */
 int ds4_gpu_v41_argmax_tensor(ds4_gpu_tensor *idx, const ds4_gpu_tensor *logits, uint32_t row, uint32_t n_vocab);
 
+/* ★设备采样(2026-09-28, src/cuda/cuda_v41_sample.inc.cu)★: 温度 > 0 时替掉上面的 argmax, 图与直发同一个节点位。
+ * 按模型自己的分布抽(温度 / top_k / top_p / min_p 语义与主机 ds4_sample_logits 同; 不动 logits), 一行一个 block,
+ * 第 i 行(i < n_rows)的结果 4 个 int32 落 out[4i..4i+3]:
+ *   [0] 全分布样本   [1] 草稿是否接受(0/1)   [2] 拒绝时的残差样本(保留集去掉草稿再抽, 必 ≠ 草稿)   [3] 保留集大小(诊断)
+ * 草稿 = tok[row0+i+1](验证批里下一行的输入 token), 末行没有草稿 ⇒ [1] = 0。位置从 pos[row0+i] 读(设备槽, 图路零拷贝灌进来的),
+ * 随机数 = (seed, 位置, 词) 的哈希 ⇒ 不依赖线程编排、不依赖发法, 同 seed 同输入必同结果。
+ * 投机: qlogits == NULL 时草稿当点质量: 接受 ⇔ 均匀数 < p(草稿), 拒绝取 [2](p 去掉草稿再归一) —— 吐出 token 的边缘分布恰是 p。
+ * ★qlogits 非 NULL(2026-09-29, 草稿按分布采样)★: 第 i 行的草稿是从 qlogits 第 i 行(草稿塔 logits + markov 偏置, 同一套温度/截断)抽的,
+ * 接受 ⇔ 均匀数 < min(1, p(草稿)/q(草稿)), 拒绝从残差 max(0, p − q) 归一后抽(Leviathan 2023 定理: 边缘仍恰是 p)。
+ * 接受率上限从 p(argmax q) 变成 Σmin(p,q): 分布平(温 1 的英文思考段)时差得最多。qlogits 只在 row0 == 0 时给, 行数 = n_rows − 1。
+ * stream: 硬币流号(0 = 目标/验证, 1 = 草稿抽样) —— 草稿与验证必须用不同的噪声, 共用会让残差与草稿相关, 分布不再精确。 */
+typedef struct { float temperature, top_p, min_p; int top_k; uint64_t seed; uint32_t stream; } ds4_gpu_sample_params;
+int ds4_gpu_v41_sample_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *logits, uint32_t row0, uint32_t n_rows, uint32_t n_vocab,
+                              const ds4_gpu_tensor *pos, const ds4_gpu_tensor *tok, const ds4_gpu_sample_params *sp,
+                              const ds4_gpu_tensor *qlogits);
+
 /* 行复制/展开: hc[n][n_hc][d] = x[n][d] 每份一样 */
 int ds4_gpu_v41_expand_hc_tensor(ds4_gpu_tensor *hc, const ds4_gpu_tensor *x, uint32_t n_embd, uint32_t n_hc, uint32_t n_tok);
 

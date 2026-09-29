@@ -76,6 +76,7 @@
 #include "src/cuda/cuda_v41_3.inc.cu"
 #include "src/cuda/cuda_v41_fp4_planar.inc.cu"   /* fp4x32 权重的平面副本(single.md §2.6 A 路); 在 v41_4 之前(被它的 GEMV 调) */
 #include "src/cuda/cuda_v41_4.inc.cu"   /* V4.1 解码小批融合核(fp4x32 GEMV / VQ 即乘 / 缩放舍入 / argmax) */
+#include "src/cuda/cuda_v41_sample.inc.cu"   /* 设备采样核(2026-09-28): 温度/top-k/top-p/min-p + 投机拒绝采样, 替掉图末尾的 argmax */
 #include "src/cuda/cuda_v41_q4k.inc.cu"   /* 骨架 q4_K(2026-09-19 的 100 GB 配方): 解码 GEMV / 预填解量化 / 嵌入取行; 在 v41_4 之后(用它的 v41_bf16r 与 V41_GEMV_* 常量) */
 #include "src/cuda/cuda_vq_probe.inc.cu"    /* VQ 解码核的两个看门狗(--v41-prof 才跑); 在 v41_4 之后、vq_decode 之前 */
 #include "src/cuda/cuda_vq_row.inc.cu"   /* VQ 载荷解析 + 一行点积(v2/v3 两版布局都在这一族); 必须在 cuda_vq_decode 之前 */

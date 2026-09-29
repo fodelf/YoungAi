@@ -203,8 +203,9 @@ cpu: $(CLI_CPU_OBJS) $(SERVER_CPU_OBJS) $(BENCH_CPU_OBJS) $(EVAL_CPU_OBJS) $(AGE
 	$(CC) $(CFLAGS) -o ds4-eval $(EVAL_CPU_OBJS) $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-agent $(AGENT_CPU_OBJS) $(WEB_OBJS) $(KV_OBJS) linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
 
-cuda-regression: tests/cuda_long_context_smoke
+cuda-regression: tests/cuda_long_context_smoke tests/cuda_sample_selftest
 	./tests/cuda_long_context_smoke
+	./tests/cuda_sample_selftest
 endif
 
 src/core/%.o: src/core/%.c $(wildcard src/core/*.h) ds4.h ds4_internal.h ds4_distributed.h ds4_gpu.h ds4_multimodal.h ds4_spatial.h ds4_css.h ds4_zchain.h
@@ -321,6 +322,8 @@ tests/t_%.o: tests/t_%.c tests/test_internal.h tests/server_tests_internal.h $(S
 
 tests/cuda_long_context_smoke.o: tests/cuda_long_context_smoke.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -c -o $@ tests/cuda_long_context_smoke.c
+tests/cuda_sample_selftest.o: tests/cuda_sample_selftest.c ds4_gpu.h ds4_gpu_v41.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/cuda_sample_selftest.c
 
 rax.o: rax.c rax.h rax_malloc.h
 	$(CC) $(CFLAGS) -c -o $@ rax.c
@@ -355,7 +358,11 @@ CUDA_INC_SRCS := $(wildcard src/cuda/*.inc.cu) src/cuda/cuda_internal.cuh
 ds4_cuda.o: ds4_cuda.cu $(CUDA_INC_SRCS) ds4_gpu.h ds4_iq2_tables_cuda.inc
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
 
-tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o
+# 两个 CUDA 测试都链整套引擎对象: ds4_cuda.o 引用 core 的全局(g_ds4_v41_prof / g_ds4_v41_vq_group 等), 只链 ds4_cuda.o 会 undefined reference
+tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+# 设备采样核的分布门(2026-09-28): 不要模型, 只要 CUDA 设备; 采样路没有逐字节金标, 门 = 频率等于目标分布 + 投机边缘分布不变 + 确定性
+tests/cuda_sample_selftest: tests/cuda_sample_selftest.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 ds4_test: $(TESTS_OBJS) $(SERVER_TEST_OBJS) $(SERVER_TESTS_OBJS) $(KV_OBJS) rax.o $(CORE_OBJS)

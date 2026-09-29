@@ -290,8 +290,11 @@ static bool v41_draft_block(ds4_engine *e, ds4_v41_draft *dr, uint32_t pos0) {
          * 占草稿一轮的 10%、整轮的 1.5% —— 要省只剩"换更低精度存表"或"只算 logits 的 top-K(近似)"。 */
         if (!v41_small_matmul(m, dr->mk_bias, e->weights.mtp.markov_head, R, DS4_N_VOCAB, dr->mk_cur, 1)) return false;
         if (!ds4_gpu_v41_row_add_tensor(st->logits, i, dr->mk_bias, DS4_N_VOCAB)) return false;
-        /* argmax 只会写自己那块的第 0 个 int, 所以先落 ids_next 再拷到 ids[i+1](官方 output_ids[:, i+1]) */
-        if (!ds4_gpu_v41_argmax_tensor(dr->ids_next, st->logits, i, DS4_N_VOCAB)) return false;
+        /* argmax 只会写自己那块的第 0 个 int, 所以先落 ids_next 再拷到 ids[i+1](官方 output_ids[:, i+1])。
+         * 主路在采样时草稿也按塔的分布抽(2026-09-29): 接受率上限从 p(argmax q) 变成 Σmin(p,q); 样本落同一个槽的第 0 个 int。 */
+        if (dr->dev_sample) {
+            if (!ds4_gpu_v41_sample_tensor(dr->ids_next, st->logits, i, 1u, DS4_N_VOCAB, st->pos, st->tok, &dr->samp, NULL)) return false;
+        } else if (!ds4_gpu_v41_argmax_tensor(dr->ids_next, st->logits, i, DS4_N_VOCAB)) return false;
         if (!ds4_gpu_tensor_copy(dr->ids, (uint64_t)(i + 1u) * 4, dr->ids_next, 0, 4)) return false;
     }
     /* confidence = proj([h_i ; markov_embed_i]) */
@@ -392,14 +395,20 @@ bool v41_draft_step(ds4_engine *e, ds4_v41_state *main_st, ds4_v41_draft *dr, in
     if (v41_graph_ready(main_st) && !dr->graph_off && rows >= 1u && rows <= DS4_V41_DRAFT_GROWS && pos0 >= SWA && dr->gwarm[rows] > 0 &&
         v41_draft_graph_round(e, main_st, dr, first, rows, pos0)) {
         dr->win_end = pos_main;
+        dr->rounds++; dr->last_warm = 0;
         return true;
     }
+    /* 暖身轮 = 本请求第一轮(草稿态的懒分配/首次触碰全在这一轮付), 或这个 rows 档第一次直发且下次能走图(这一轮在暖它的图档);
+     * 位置 < 窗宽 / rows 超档 / 草稿图已关 的直发不是暖身, 那就是它的真实成本(调度器按 last_warm 决定记不记账) */
+    const bool in_grows = rows >= 1u && rows <= DS4_V41_DRAFT_GROWS;
+    dr->last_warm = dr->rounds == 0u || (in_grows && dr->gwarm[rows] == 0u && pos0 >= SWA && !dr->graph_off);
     if (!v41_draft_gpu_round(e, main_st, dr, first, rows, pos0)) return false;
     if (rows) dr->win_end = pos_main;
     if (!ds4_gpu_synchronize()) return false;
     if (!ds4_gpu_tensor_read(dr->ids, 0, dr->host_ids, (uint64_t)(dr->block + 1u) * 4)) return false;
     if (!ds4_gpu_tensor_read(dr->conf, 0, dr->host_conf, (uint64_t)dr->block * 4)) return false;
-    if (rows >= 1u && rows <= DS4_V41_DRAFT_GROWS) dr->gwarm[rows]++;
+    if (in_grows) dr->gwarm[rows]++;
+    dr->rounds++;
     return true;
 }
 #endif /* !DS4_NO_GPU */

@@ -6,7 +6,7 @@
 
 int ds4_engine_is_v41(ds4_engine *e) { (void)e; return DS4_MODEL_VARIANT == DS4_VARIANT_V41; }
 /* 解码采样设置面(2026-09-21, 113-1.md §4; 语义见 ds4_v41_api.h)。全零 = 裸 argmax = 今天的路。 */
-static ds4_decode_sampling g_decode_sampling;
+ds4_decode_sampling g_decode_sampling;   /* core_v41_sample.c 的惩罚路也读它 */
 void ds4_engine_set_decode_sampling(const ds4_decode_sampling *sp) {
     if (sp) g_decode_sampling = *sp;
     else memset(&g_decode_sampling, 0, sizeof g_decode_sampling);
@@ -202,26 +202,8 @@ int ds4_engine_v41_score_ids(ds4_engine *e, const int *ids, int n_ids, const cha
 int g_ds4_v41_chunk = 0;
 void ds4_engine_v41_set_chunk(int n) { g_ds4_v41_chunk = n > 0 ? n : 0; }
 
-/* 取下一个 token。rowbuf == NULL(采样关): 设备 argmax, 只读回 4 B —— 老路一字不动。
- * rowbuf 非 NULL(采样开): 把第 row 行 logits 读回主机(129280 × 4 B; 统一内存上一次 cudaMemcpy), 交给 V4 路同一份采样器。
- * 为什么不把采样做进图: 图的输入是主机给的 token id, 采样夹在 wait 与下一次 launch 之间, 图一个节点不动;
- * 每步多付一次 517 KB 读回 + 一遍主机采样, 代价按 2K 尺量(113-1.md §4.3 门 4: ≤ +0.3 ms/步), 超了再做设备预筛核。 */
-/* 生成段 token 史(只在读回 logits 的路上记): 复读惩罚只看它, 不看提示。brk = 断点表(DRY 开时才建)。 */
-typedef struct { int32_t *tok; uint32_t n, cap; const uint8_t *brk; } v41_hist;
-static bool v41_next_token(ds4_v41_state *st, ds4_gpu_tensor *am, uint32_t row, float *rowbuf, uint64_t *rng, v41_hist *h, int32_t *out) {
-    if (!rowbuf)
-        return ds4_gpu_v41_argmax_tensor(am, st->logits, row, DS4_N_VOCAB) && ds4_gpu_synchronize() &&
-               ds4_gpu_tensor_read(am, 0, out, 4) != 0;
-    const ds4_decode_sampling *sp = &g_decode_sampling;
-    if (!ds4_gpu_synchronize() ||
-        !ds4_gpu_tensor_read(st->logits, (uint64_t)row * DS4_N_VOCAB * 4u, rowbuf, (uint64_t)DS4_N_VOCAB * 4u)) return false;
-    if (h && h->n && (sp->dry_multiplier > 0.f || sp->freq_penalty != 0.f || sp->presence_penalty != 0.f))
-        ds4_decode_penalize(rowbuf, DS4_N_VOCAB, h->tok, h->n, h->brk, sp->freq_penalty, sp->presence_penalty,
-                            sp->dry_multiplier, sp->dry_base, sp->dry_allowed_length);
-    *out = (int32_t)ds4_sample_logits(rowbuf, (int)DS4_N_VOCAB, sp->temperature, sp->top_k, sp->top_p, sp->min_p, rng);
-    if (h && h->n < h->cap) h->tok[h->n++] = *out;
-    return true;
-}
+/* 取下一个 token 的三条路(设备 argmax / 设备采样核 / 主机惩罚路)在 core_v41_sample.c(2026-09-28); 以前"采样 = 读回 517 KB 主机采样"
+ * 的那版量过每步只贵 0.32 ms, 真正丢的是投机(采样下关掉, −32%), 所以采样进了设备核, 投机在采样下按拒绝采样走。 */
 
 int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_prompt, int n_predict,
                                    ds4_v41_emit_fn emit, void *ud) {
@@ -249,27 +231,27 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
     const uint32_t cap = ck < np ? ck : np;
     ds4_v41_state st;
     if (!v41_state_alloc(&st, cap, ctx)) return 1;
-    ds4_gpu_tensor *am = ds4_gpu_tensor_alloc(16);   /* argmax 在设备上做, 只读回 4 B */
+    ds4_gpu_tensor *am = ds4_gpu_tensor_alloc((uint64_t)(DS4_MTP_MAX_BLOCK + 2u) * 16u);   /* 设备槽: 每行 16 B(采样核 4 个 int; argmax 只用第 0 个) */
     const int eos = ds4_token_eos(e);
     int rc = 1;
-    /* 采样(温度 > 0)与投机不能同开: 投机的接受条件是"主模型的 argmax 也是这个 token", 采样下要换成拒绝采样式验证, 还没接。
-     * 硬拒而不是静默改走纯解码 —— 用户以为开着投机, 其实没开, 这种"不报错只出错"的坑本仓踩够了。 */
+    /* 三条路(core_v41_sample.c): 温度 > 0 且无惩罚 = 设备采样核(投机照走, 核里做拒绝采样); 任一惩罚非零 = 读回整行主机罚完采样
+     * (惩罚看 token 史, 投机不接: 显式 --dspark 硬拒, 默认开则这一条走纯解码并出声 —— 静默改路 = 用户以为开着其实没开); 否则设备 argmax。 */
     const bool penal = g_decode_sampling.dry_multiplier > 0.f || g_decode_sampling.freq_penalty != 0.f || g_decode_sampling.presence_penalty != 0.f;
-    const bool sampling = g_decode_sampling.temperature > 0.f || penal;   /* 惩罚开着时温 0 也要读回 logits 行(罚完再 argmax) */
+    const bool dev_sample = g_decode_sampling.temperature > 0.f && !penal;
     int dspark = g_ds4_v41_dspark;
-    if (sampling && dspark == 2) {
-        fprintf(stderr, "ds4: ★解码采样/惩罚(temp %.2f dry %.2f)与 --dspark 投机不能同开★(采样下的投机验证还没接; 去掉 --dspark 或关采样)\n",
-                (double)g_decode_sampling.temperature, (double)g_decode_sampling.dry_multiplier);
+    if (penal && dspark == 2) {
+        fprintf(stderr, "ds4: ★复读惩罚(dry %.2f freq %.2f presence %.2f)与 --dspark 投机不能同开★(惩罚要按 token 史改 logits, 投机验证不接; 去掉 --dspark 或关惩罚)\n",
+                (double)g_decode_sampling.dry_multiplier, (double)g_decode_sampling.freq_penalty, (double)g_decode_sampling.presence_penalty);
         if (am) ds4_gpu_tensor_free(am);
         v41_state_free(&st);
         return 1;
     }
-    if (sampling && dspark) {   /* 默认开(1): 这一条走纯解码, 出声 */
-        fprintf(stderr, "ds4: [v41] 本请求开了采样/惩罚(temp %.2f dry %.2f), 投机只在贪心下成立 ⇒ 这一条走纯解码\n",
-                (double)g_decode_sampling.temperature, (double)g_decode_sampling.dry_multiplier);
+    if (penal && dspark) {
+        fprintf(stderr, "ds4: [v41] 本请求开了复读惩罚(dry %.2f freq %.2f presence %.2f), 投机不接惩罚 ⇒ 这一条走纯解码\n",
+                (double)g_decode_sampling.dry_multiplier, (double)g_decode_sampling.freq_penalty, (double)g_decode_sampling.presence_penalty);
         dspark = 0;
     }
-    float *rowbuf = sampling ? xmalloc((size_t)DS4_N_VOCAB * 4u) : NULL;
+    float *rowbuf = penal ? xmalloc((size_t)DS4_N_VOCAB * 4u) : NULL;
     v41_hist hist = {NULL, 0, 0, NULL};
     if (penal) {
         hist.cap = (uint32_t)(n_predict > 0 ? n_predict : 0) + 2u;
@@ -278,6 +260,10 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
     }
     uint64_t rng = g_decode_sampling.seed ? g_decode_sampling.seed :
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());   /* 与 V4 CLI(cli_gen.c)同一条规则 */
+    const bool sampling = dev_sample || penal;   /* 日志用: 这条请求不是裸 argmax */
+    st.dev_sample = dev_sample ? 1 : 0;
+    st.samp = (ds4_gpu_sample_params){ .temperature = g_decode_sampling.temperature, .top_p = g_decode_sampling.top_p,
+                                       .min_p = g_decode_sampling.min_p, .top_k = g_decode_sampling.top_k, .seed = rng };
     do {
         if (!am) break;
         /* --emit-trace 连提示也打(`[ptok] 位置 id`): 提示是 build_prompt 套过聊天模板的(比 --dump-tokens 的原文分词多
@@ -308,7 +294,8 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
         if (!ok || aborted) break;
         const double t1 = now_sec();
         fprintf(stderr, "[v41] prefill %u token %.1fs (%.1f t/s)\n", np, t1 - t0, (double)np / (t1 - t0 + 1e-9));
-        if (sampling) fprintf(stderr, "[v41] 解码采样 temp %.2f top_p %.2f min_p %.2f top_k %d seed %llu%s dry %.2f/%.2f/%d freq %.2f presence %.2f\n",
+        if (sampling) fprintf(stderr, "[v41] 解码采样(%s) temp %.2f top_p %.2f min_p %.2f top_k %d seed %llu%s dry %.2f/%.2f/%d freq %.2f presence %.2f\n",
+                              dev_sample ? "设备核" : "主机惩罚路",
                               (double)g_decode_sampling.temperature, (double)g_decode_sampling.top_p, (double)g_decode_sampling.min_p,
                               g_decode_sampling.top_k, (unsigned long long)rng, penal ? " 惩罚" : "", (double)g_decode_sampling.dry_multiplier,
                               (double)g_decode_sampling.dry_base, g_decode_sampling.dry_allowed_length,
@@ -316,7 +303,7 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
         /* 末位 logits → argmax(或采样) → 逐 token 解码(n=1 前向) */
         int32_t tok32 = 0;
         if (!v41_next_token(&st, am, st.n - 1, rowbuf, &rng, &hist, &tok32)) break;
-        if (!rowbuf) {   /* 设备 argmax 自检(一次): 与主机顺序扫对一下, 不同就报 —— 核错会静默吐错 token */
+        if (!rowbuf && !dev_sample) {   /* 设备 argmax 自检(一次): 与主机顺序扫对一下, 不同就报 —— 核错会静默吐错 token */
             float *row = xmalloc((size_t)DS4_N_VOCAB * 4);
             if (ds4_gpu_tensor_read(st.logits, (uint64_t)(st.n - 1) * DS4_N_VOCAB * 4, row, (uint64_t)DS4_N_VOCAB * 4)) {
                 uint32_t best = 0; for (uint32_t v = 1; v < DS4_N_VOCAB; v++) if (row[v] > row[best]) best = v;
@@ -330,22 +317,26 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
          * 没带三塔/没带运行参数的 GGUF: dr.ready=0, 下面整段跳过, 走原来的单 token 环。
          * 一轮 = 草稿器出 block 位 → 主模型一次验证 1+k 位 → 逐位比贪心结果, 接受最长前缀。
          * ★温 0 下这与纯解码逐 token 是同一串输出★: 接受的条件就是"主模型自己也会选这个 token",
-         * 不接受的位置全部回滚。所以它是纯粹的省时间, 不是近似 —— 门也就是逐字节同。 */
+         * 不接受的位置全部回滚。所以它是纯粹的省时间, 不是近似 —— 门也就是逐字节同。
+         * ★采样下(2026-09-28)★: 接受 ⇔ 均匀数 < 目标分布给草稿的概率, 拒绝从残差抽(设备核里做); 吐出 token 的边缘分布 = 纯解码采样的分布,
+         * 但同 seed 下两条路的具体 token 不同(用了不同的硬币) —— 门是分布级(tests/cuda_sample_selftest.c), 不是逐字节。 */
         ds4_v41_draft dr;
         const bool spec = dspark && v41_draft_alloc(e, &dr);
+        /* ★采样 + 投机: 草稿按塔的分布抽(硬币流 1), 验证核读塔 logits 做拒绝采样(接受 ⇔ u < min(1,p/q), 拒绝从 max(0,p−q) 抽)★(2026-09-29)
+         * 判据不是在线 t/s(采样每趟另一篇文本, 同 seed 也不同, ±3 t/s 噪声比两方案的差大, 曾被它骗成"点质量占优"), 是取料路的接受率陪审团
+         * (同一篇文本逐位置解析算, d1 accjury 档): 首位期望接受率 温 1.0 CFO 0.693 → 0.744, 大盘 0.634 → 0.757, 温 0.6 CFO 0.834 → 0.842
+         * (点质量 E[p(argmax q)] → 分布草稿 E[Σmin(p,q)])。贪心不碰(温 0 仍 argmax, 逐字节门)。 */
+        if (spec && dev_sample) { dr.dev_sample = 1; dr.samp = st.samp; dr.samp.stream = 1u; st.spec_q = dr.st.logits; }
+        v41_sched cal; memset(&cal, 0, sizeof cal);   /* 调度器的本请求账: 接受率校准 ρ + 走图一步/草稿/验证 n 行的墙钟(core_draft_sched.c) */
         uint32_t spec_rounds = 0, spec_acc = 0, spec_hist[DS4_MTP_MAX_BLOCK + 1];
         /* 一轮的壁钟分账(2026-09-16): 投机赢不赢是个除法 —— 一轮的耗时要压到 E[接受+1] × 纯解码一步
          * 以下。实测一轮 118 ms 对预算 72 ms, 超 64%, 而这 118 从来没拆过。四项分开计, 就能分清
          * "草稿器自己太贵"(那接受率再高也救不回来)还是"验证/回滚的边角料吃掉了"。 */
         double ms_draft = 0, ms_verify = 0, ms_argmax = 0, ms_snap = 0;
-        /* 调度器判"这一轮不值得投机"之后歇几轮(见下面 v41_draft_pick_k 那一段)。
-         * 09-16 定 16(太短就一直在亏本的文本上反复试, 太长就错过文本变好猜的那一段)。
-         * ★09-19 改 4★: 陪审团 gguf-tools/bench/dspark_sim 在金融提示的取料上重放整段: 冷却 16 = 27.86 t/s, 8 = 28.12, 4 = 28.29,
-         * 0 = 28.03 —— 文本好不好猜是逐 token 变的, 歇 16 步错过的好轮比省下的草稿钱多; 验证批再便宜一档(投机轮进图/专家按序)后 0 最优。
-         * ★09-24 改 0★: 验证批换 stage/pipe 核、草稿 13.5 → 9.9 ms 之后, 真实 CFO 请求取料重放: 冷却 4 = 36.21 t/s, 0 = 37.31, 8 = 34.71
-         * —— 草稿便宜了, 判一次亏本就连歇几步反而错过好轮。成本再变(核/底座/草稿器)就回 dspark_sim 重扫这个数。 */
-        #define V41_SPEC_COOLDOWN 0u
-        uint32_t spec_skip = 0, spec_skipped = 0;
+        /* 没有"判亏本就歇几轮"的旋钮(2026-09-28 删): 它是个盘上扫出来的常量(09-16 定 16 → 09-19 陪审团 4 → 09-24 陪审团 0, 每次核变快
+         * 就得回 dspark_sim 重扫), 而 0 = 机制关. 现在每一步都出草稿, 亏不亏由调度器按当轮 conf 判(k=0 的轮只白跑一次草稿 ~9.5 ms,
+         * 那一步照走 n=1 的图). spec_skipped 只计数(日志), 不再让任何步跳过草稿。 */
+        uint32_t spec_skipped = 0;
         for (uint32_t i = 0; i <= DS4_MTP_MAX_BLOCK; i++) spec_hist[i] = 0;
         while (produced < n_predict) {
             produced++;
@@ -355,8 +346,7 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
              * 第一个不同的位置就是要查的那一步 —— 位置对得上、id 不同 = 那一步的 logits 不同(核);
              * 位置本身对不上 = 回滚把状态推歪了(快照漏项)。 */
             if (g_ds4_v41_emit_trace) fprintf(stderr, "[emit] %u %d\n", st.n_past, tok);
-            if (spec_skip) spec_skip--;
-            const bool draft_now = spec && spec_skip == 0;   /* 这一步出不出草稿; 不出的步就是一个普通的单 token 步 */
+            const bool draft_now = spec;   /* 投机开着就每步出草稿(k 由调度器定, 可为 0) */
             /* ★解码整步 CUDA graph(core_decode_graph.c)★: 单 token 步(没开投机, 或投机这一步歇着)且暖过一步直发之后,
              * 一步 = 写槽 + 一发图 + 读设备 argmax。第一步仍走下面的直发(把平面副本/暂存那些懒分配全建好, 捕获态下不许分配)。
              * ★投机歇轮的步也走图★(2026-09-18): 图里的 hc_mean 核按设备位置把 main_hidden 落进环, 下次出草稿时按位置差补窗口,
@@ -368,10 +358,12 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
              * 变了就重捕获(见 ds4_gpu_v41_scratch_generation)。fix4 那趟 58% 的步在歇, 每步直发比走图多付 3 ms。 */
             if (!draft_now && v41_graph_ready(&st) && tok != eos && st.n_past + 1 <= st.ctx) {
                 int32_t nt = 0;
-                if (!v41_graph_launch(e, &st, (int32_t)tok)) { ok = false; break; }
+                const double ts0 = now_sec();
+                if (!v41_graph_launch(e, &st, (int32_t)tok, 0)) { ok = false; break; }
                 if (emit && emit(tok, ud) != 0) { (void)v41_graph_wait(e, &st, &nt); break; }   /* 图已发, 等完再走 */
                 if (!v41_graph_wait(e, &st, &nt)) { ok = false; break; }
-                /* 采样开: 图末尾算的 argmax 不用, 从这一步的 logits 行(row 0, n=1)采; 关: nt 就是设备 argmax */
+                if (spec) v41_sched_cost(&cal, 1u, (now_sec() - ts0) * 1e3);   /* 纯解码一步的墙钟 = 调度器的比价基准 */
+                /* 惩罚路: 图末尾槽里的 token 不用, 读回这一步的 logits 行(row 0, n=1)在主机罚完采; 设备采样/argmax: nt 就是槽里的 token */
                 if (rowbuf && !v41_next_token(&st, am, 0, rowbuf, &rng, &hist, &nt)) { ok = false; break; }
                 tok = (int)nt;
                 continue;
@@ -394,11 +386,8 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
                  * --dspark-verify N 仍可钉死一个 k(诊断与逐档量字节账用)。 */
                 drafted = true;
                 const uint32_t use = g_ds4_v41_verify_k ? g_ds4_v41_verify_k
-                                                       : v41_draft_pick_k(dr.host_conf, dr.block, &sched_val);
-                /* ★预测连草稿钱都赚不回来 ⇒ 接下来几轮不出草稿★: 难文本上投机是净亏的, 而"亏不亏"
-                 * 只有出过一次草稿才知道。歇 V41_SPEC_COOLDOWN 轮再试一次 —— 既不会一直亏,
-                 * 也不会错过文本变好猜的那一段。只由 token 序列决定 ⇒ 温 0 下可复现。 */
-                if (!g_ds4_v41_verify_k && sched_val < 1.0f) { spec_skip = V41_SPEC_COOLDOWN; spec_skipped++; }
+                                                       : v41_draft_pick_k(dr.host_conf, dr.block, &sched_val, &cal);
+                if (!g_ds4_v41_verify_k && sched_val < 1.0f) spec_skipped++;   /* 预测连草稿钱都赚不回来: 只计数, 本轮 k=0 */
                 k = dr.block < use ? dr.block : use;
                 for (uint32_t i = 0; i < k; i++) batch[i + 1u] = dr.host_ids[i + 1u];
             }
@@ -406,28 +395,43 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
             const double tr1 = now_sec();
             double tr2 = tr1, tr3;
             int32_t want[DS4_MTP_MAX_BLOCK + 1];   /* 逐位主模型的贪心结果: 第 i 位的 logits 预测的是 batch[i] 之后那一位 */
+            bool walked_graph = false;             /* 这一发走了图(稳态成本)还是直发(暖身/捕获失败) */
             /* ★验证批走图★(2026-09-22, core_decode_graph.c): 这个 n 直发暖过之后, 快照 + 前向 + n 发 argmax + 读回一发图搞定;
              * 走不了(没暖/捕获失败)就按下面的直发路(快照 → 前向 → 逐位 argmax), 两条路输出逐字节同。 */
             if (k && v41_graph_batch_ready(&st, nb) && v41_graph_batch_launch(e, &st, batch, nb)) {
                 if (!v41_graph_batch_wait(e, &st, want)) { ok = false; break; }
-                tr3 = now_sec();
+                tr3 = now_sec(); walked_graph = true;
+            } else if (!k && v41_graph_ready(&st)) {
+                /* 草稿白跑的轮(调度器判 k=0): 这一步就是普通单 token 步, 走 n=1 的图(2026-09-28; 以前落到下面的直发, 每轮多付 ~4 ms
+                 * 发射间隙 —— 贪心那条真实请求上 63/399 轮是 k=0)。eos/上下文满在上面已判过, 与纯解码分支同一条件。 */
+                int32_t nt = 0;
+                if (!v41_graph_launch(e, &st, (int32_t)tok, 1) || !v41_graph_wait(e, &st, &nt)) { ok = false; break; }
+                want[0] = nt;
+                tr3 = now_sec(); walked_graph = true;
             } else {
                 if (k && !v41_spec_snapshot(&st, nb)) { ok = false; break; }
                 tr2 = now_sec();
                 if (!v41_forward(e, &st, batch, nb)) { ok = false; break; }
                 if (k && !ds4_gpu_synchronize()) { ok = false; break; }   /* 分账要真壁钟, 不同步量到的是发射时间 */
                 tr3 = now_sec();
-                for (uint32_t i = 0; i < nb; i++)
-                    if (!ds4_gpu_v41_argmax_tensor(am, st.logits, i, DS4_N_VOCAB) || !ds4_gpu_synchronize() ||
-                        !ds4_gpu_tensor_read(am, 0, &want[i], 4)) { ok = false; break; }
-                if (!ok) break;
+                if (!v41_device_next(&st, am, 0u, nb, batch, want)) { ok = false; break; }   /* 采样核 / 逐行 argmax, 拼成 want[] */
             }
-            /* 采样开时投机已拒 ⇒ nb 恒 1, 只有 want[0]; 直发这一步(暖身步/捕获失败的重来路)也按采样取 */
+            /* 惩罚路: 投机已拒 ⇒ nb 恒 1, 只有 want[0]; 直发这一步(暖身步/捕获失败的重来路)也按主机路取 */
             if (rowbuf && !v41_next_token(&st, am, 0, rowbuf, &rng, &hist, &want[0])) { ok = false; break; }
             if (k) { ms_draft += (tr1 - tr0) * 1e3; ms_snap += (tr2 - tr1) * 1e3;
                      ms_verify += (tr3 - tr2) * 1e3; ms_argmax += (now_sec() - tr3) * 1e3; }
+            if (drafted) {
+                /* 调度器的账只记★稳态★成本: 每个 n 第一次直发是暖身(懒分配 + 首次触碰, 可能比走图慢几倍), 记进均值就会让那个 n 显得贵、
+                 * 调度器躲着它、它永远攒不到走图的样本 —— 自证的陷阱。规则: 走了图就记; 直发但这个 n 下次仍走不了图(图关/捕获失败)也记
+                 * (直发就是它的真实成本); 直发而下次能走图 = 暖身, 不记。草稿同理(core_v41_draft.c 的 last_warm)。 */
+                const bool steady = walked_graph || !(k ? v41_graph_batch_ready(&st, nb) : v41_graph_ready(&st));
+                if (!dr.last_warm) v41_sched_draft_cost(&cal, (tr1 - tr0) * 1e3);
+                if (steady) v41_sched_cost(&cal, nb, (tr3 - tr2) * 1e3);
+            }
             uint32_t a = 0;
-            while (a < k && want[a] == batch[a + 1u]) a++;   /* 接受最长前缀 */
+            while (a < k && want[a] == batch[a + 1u]) a++;   /* 接受最长前缀(采样下 want 已按"接受 ⇒ 草稿 / 拒绝 ⇒ 残差"拼好, 同一句) */
+            /* 每个出过草稿的轮都观测首位(k=0 的轮看吐出的 token 是否就是草稿首位), 否则校准会死锁在 ρ=0(见 core_v41.h) */
+            if (drafted && !g_ds4_v41_verify_k) v41_sched_observe(&cal, dr.host_conf, k ? (a >= 1u) : (want[0] == dr.host_ids[1]));
             /* ★每出一次草稿打一行账(2026-09-19, --emit-trace 或 --v41-prof)★: 位置 / 调度器选的 k 与预测比值 / 实际接受 /
              * 五位的 sigmoid(conf)。k=0 的轮(草稿白跑、要歇 16 步)也打 —— 调度器"该不该歇"的判决只能拿这张表复核:
              * 每格 conf 对上实际接受率才算校准, 对不上就是调度器在按错的概率算账。 */

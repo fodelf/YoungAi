@@ -6,7 +6,7 @@
  *
  * ★投机验证批也进图(2026-09-22)★: 一轮验证 n = 1+k 行(k ≤ 块长 5), 以前恒走直发 —— 一轮里验证批那一发比走图贵 4 ms
  * (09-19 实测直发验 1 行 42.5 ms 对走图一步 38.5), 加上一轮两次同步。现在按批大小 n 各捕一张图(形状随 n 变, 每个 n 一次),
- * 图里: 零拷贝灌 n 个 token/位置 → 整步前向(核按"设备位置"口径逐行算位置 pos0+i) → n 行各一发 argmax → 零拷贝读回。
+ * 图里: 零拷贝灌 n 个 token/位置 → 整步前向(核按"设备位置"口径逐行算位置 pos0+i) → n 行各一发 argmax(采样开: 一发采样核, 2026-09-28) → 零拷贝读回。
  * 回滚要的快照也在图里(窗口环: 每层 commit 前存那 n 格; 压缩器余行: 追加核顺手存), 主机只在发图时记账(snap_n/snap_past/snap_cpend),
  * 部分接受之后的还原仍是 v41_spec_rollback 那几发直发(形状随接受数变, 不进图)。
  *
@@ -39,7 +39,9 @@ typedef struct {
     int32_t *next;             /* pinned [NMAX·4]: 第 i 行 argmax 的落点在 next[4i](设备落点每行 16 B, 整块零拷贝读回) */
     ds4_gpu_tensor *am;        /* 设备 argmax 落点 [NMAX][16 B] */
     ds4_gpu_tensor *amv[DGRAPH_NMAX];   /* 逐行视图(argmax 核只写自己那块的第 0 个 int) */
-    uint32_t steps, bsteps, captures, regrow;   /* 走图解了几步(n=1) / 验证批走图几轮 / 捕获几次 / 因暂存换指针而重捕获几次 */
+    uint32_t steps, bsteps, captures, regrow;   /* 走图解了几步(n=1 纯解码步) / 验证批走图几轮 / 捕获几次 / 因暂存换指针而重捕获几次 */
+    uint32_t k0steps;          /* 草稿白跑(k=0)后走 n=1 图的步(2026-09-28): 不进"稳态"账 —— 它前面挂着一轮草稿, 不是纯解码步 */
+    int cur_pure;              /* 本步是纯解码步(进账)还是 k=0 轮的步(只计数) */
     double t_prep, t_launch, t_sync, t_gap;   /* 步边界的账(秒, 累计; 只记 n=1): 起手+取行提交 / cudaGraphLaunch 主机耗时 / 等图 / 上一步 sync 返回→本步进来 */
     double t_last_sync, t_launched;   /* 上一步 sync 返回的时刻 / 本步 launch 返回的时刻 */
     int direct_pending; int32_t pending_tok;   /* n=1 捕获失败那一步: launch 没发出去, wait 里按直发补跑 */
@@ -68,7 +70,7 @@ void v41_graph_free(ds4_v41_state *st) {
                 g->t_gap / g->steps * 1e6, g->t_prep / g->steps * 1e6, g->t_launch / g->steps * 1e6, g->t_sync / g->steps * 1e3,
                 wall * 1e3, 1.0 / wall);
     }
-    if (g->bsteps) fprintf(stderr, "ds4: [graph] 投机验证批走图 %u 轮\n", g->bsteps);
+    if (g->bsteps || g->k0steps) fprintf(stderr, "ds4: [graph] 投机验证批走图 %u 轮, 草稿白跑(k=0)后走 n=1 图 %u 步(不进稳态账)\n", g->bsteps, g->k0steps);
     free(g); st->dgraph = NULL;
 }
 
@@ -171,7 +173,11 @@ static bool dg_capture(ds4_engine *e, ds4_v41_state *st, uint32_t n) {
               ds4_gpu_tensor_write_zerocopy(st->pos, 0, g->posv, (uint64_t)n * sizeof(int32_t)) &&
               ds4_gpu_tensor_write_zerocopy(st->pre_mix, 0, g->onehot, (uint64_t)n * DS4_N_HC * sizeof(float));
     if (ok) ok = v41_forward_body(e, st);
-    for (uint32_t i = 0; ok && i < n; i++) ok = ds4_gpu_v41_argmax_tensor(g->amv[i], st->logits, i, DS4_N_VOCAB) != 0;
+    /* 末尾: 采样开 ⇒ 一发采样核出 n 行(全分布样本 / 草稿接受位 / 残差样本, 每行 16 B; 参数烤进图 = 每请求常量);
+     * 否则逐行 argmax(只写槽的第 0 个 int)。两种都落同一块 g->am, 零拷贝整块读回。 */
+    if (ok && st->dev_sample) ok = ds4_gpu_v41_sample_tensor(g->am, st->logits, 0u, n, DS4_N_VOCAB, st->pos, st->tok, &st->samp,
+                                                             n > 1u ? st->spec_q : NULL) != 0;
+    else for (uint32_t i = 0; ok && i < n; i++) ok = ds4_gpu_v41_argmax_tensor(g->amv[i], st->logits, i, DS4_N_VOCAB) != 0;
     if (ok) ok = ds4_gpu_tensor_read_zerocopy(g->next, g->am, 0, (uint64_t)n * 16u) != 0;
     st->graph = 0;
     void *exec = ds4_gpu_decode_graph_capture_end();   /* 不管 ok 与否都要收捕获, 否则流一直停在捕获态 */
@@ -188,8 +194,7 @@ static bool dg_capture(ds4_engine *e, ds4_v41_state *st, uint32_t n) {
 static bool dg_direct_step(ds4_engine *e, ds4_v41_state *st, int32_t tok, int32_t *next_tok) {
     decode_graph *g = (decode_graph *)st->dgraph;
     if (!v41_forward(e, st, &tok, 1u)) return false;
-    return ds4_gpu_v41_argmax_tensor(g->amv[0], st->logits, 0, DS4_N_VOCAB) && ds4_gpu_synchronize() &&
-           ds4_gpu_tensor_read(g->amv[0], 0, next_tok, sizeof(int32_t));
+    return v41_device_next(st, g->am, 0u, 1u, NULL, next_tok);
 }
 
 /* 暂存换过指针 ⇒ 所有图作废(它们烤死的都是捕获那一刻的指针) */
@@ -202,13 +207,15 @@ static void dg_invalidate(decode_graph *g, const char *why) {
 /* 一步拆成"发"与"等"两半(2026-09-18 主机侧分账): 调用方在 launch 与 wait 之间去 emit 当前 token ——
  * emit(文本 fwrite+fflush 到文件)实测 300 µs, 夹在两步之间就是 GPU 干等 300 µs; 放到图跑着的时候做, 白赚。
  * launch 之后、wait 之前**不许**碰 st 的位置状态(图在读槽); 取下一个 token 只能在 wait 之后。 */
-static bool dg_launch(ds4_engine *e, ds4_v41_state *st, const int32_t *ids, uint32_t n) {
+static bool dg_launch(ds4_engine *e, ds4_v41_state *st, const int32_t *ids, uint32_t n, int pure) {
     if (!dg_alloc(st)) return false;
     decode_graph *g = (decode_graph *)st->dgraph;
     dg_inst *in = &g->g[n];
     if (st->n_past + n > st->ctx) { fprintf(stderr, "ds4: V4.1 上下文满(%u+%u > %u)\n", st->n_past, n, st->ctx); return false; }
     const double t0 = now_sec();
-    if (n == 1u && g->t_last_sync > 0.0) g->t_gap += t0 - g->t_last_sync;
+    g->cur_pure = n == 1u && pure;
+    /* 步边界的账只记"上一步也是纯解码步"的间隔: 中间隔着验证批或草稿的, 上一步 sync 时已把 t_last_sync 清零 */
+    if (g->cur_pure && g->t_last_sync > 0.0) g->t_gap += t0 - g->t_last_sync;
     dg_begin_step(st, ids, n);
     for (uint32_t i = 0; i < n; i++) { g->tokv[i] = ids[i]; g->posv[i] = (int32_t)(st->pos0 + i); }
     __sync_synchronize();   /* 槽先落内存再发图: 图开头的零拷贝小核读的是内存里的值 */
@@ -239,7 +246,7 @@ static bool dg_launch(ds4_engine *e, ds4_v41_state *st, const int32_t *ids, uint
     if (!st->no_engram && !v41_engram_graph_arm(st)) return false;   /* 本步序号进 want 槽, 图里的自旋核等它 */
     if (!ds4_gpu_decode_graph_launch(in->exec)) return false;
     g->t_launched = now_sec();
-    if (n == 1u) { g->t_prep += t1 - t0; g->t_launch += g->t_launched - t1; }
+    if (g->cur_pure) { g->t_prep += t1 - t0; g->t_launch += g->t_launched - t1; }
     g->cur_n = n;
     return true;
 }
@@ -253,26 +260,28 @@ static bool dg_wait(ds4_engine *e, ds4_v41_state *st, int32_t *next) {
     if (!st->no_engram && !v41_engram_graph_serve(st)) st->egraph_err = 1;
     if (!ds4_gpu_synchronize()) return false;
     const double t3 = now_sec();
-    if (n == 1u) { g->t_sync += t3 - g->t_launched; g->t_last_sync = t3; }
+    if (g->cur_pure) { g->t_sync += t3 - g->t_launched; g->t_last_sync = t3; }
+    else g->t_last_sync = 0.0;   /* 验证批 / k=0 轮的步之后, 下一个纯解码步的"上步→本步"间隔不算(中间不是纯解码) */
     __sync_synchronize();
     if (st->egraph_err || (!st->no_engram && v41_engram_graph_err(st))) { fprintf(stderr, "ds4: [graph] engram 取行失败(位置 %u)\n", st->pos0); return false; }
-    for (uint32_t i = 0; i < n; i++) next[i] = g->next[4u * i];
+    /* 每行 4 个 int: 采样路按"接受 ⇒ 草稿 / 拒绝 ⇒ 残差"拼, argmax 路取第 0 个(core_v41_sample.c) */
+    v41_sample_pick(g->next, g->tokv, n, st->dev_sample, next);
     dg_advance(st, n);
-    if (n == 1u) g->steps++; else g->bsteps++;
+    if (n != 1u) g->bsteps++; else if (g->cur_pure) g->steps++; else g->k0steps++;
     return true;
 }
 
-bool v41_graph_launch(ds4_engine *e, ds4_v41_state *st, int32_t tok) { return dg_launch(e, st, &tok, 1u); }
+bool v41_graph_launch(ds4_engine *e, ds4_v41_state *st, int32_t tok, int after_draft) { return dg_launch(e, st, &tok, 1u, !after_draft); }
 bool v41_graph_wait(ds4_engine *e, ds4_v41_state *st, int32_t *next_tok) { return dg_wait(e, st, next_tok); }
 bool v41_graph_step(ds4_engine *e, ds4_v41_state *st, int32_t tok, int32_t *next_tok) {
-    return v41_graph_launch(e, st, tok) && v41_graph_wait(e, st, next_tok);
+    return v41_graph_launch(e, st, tok, 0) && v41_graph_wait(e, st, next_tok);
 }
 
 /* 验证批: 发图 + 快照记账。快照的字节在图里(窗口环按层 / 压缩器余行在追加核里), 这里只记"这一批从哪起、几行、各源层当时的余行数",
  * 与直发路 v41_spec_snapshot + v41_compress_source 记的同一套字段 ⇒ v41_spec_rollback 一个字不改。 */
 bool v41_graph_batch_launch(ds4_engine *e, ds4_v41_state *st, const int32_t *ids, uint32_t n) {
     if (n < 2u || n >= DGRAPH_NMAX) return false;
-    if (!dg_launch(e, st, ids, n)) return false;
+    if (!dg_launch(e, st, ids, n, 0)) return false;
     st->snap_n = n; st->snap_past = st->pos0; st->snap_on = 1u;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         if (!g_ds4_v41.is_kv_source[il]) continue;
