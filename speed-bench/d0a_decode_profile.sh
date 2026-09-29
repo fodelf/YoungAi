@@ -102,6 +102,9 @@ if [ "$DO_NSYS" = wall ]; then
   exit 0
 fi
 if [ "$DO_NSYS" != table ]; then
+# ★第二个参数给 nsysonly = 跳过 ①, 只采 nsys★(2026-09-29): ① 的 --v41-prof 在预填块上逐层同步 + 逐层 NaN 扫描(12k 提示 144 s 对
+# 正常 22 s), 量预填逐核表时它只是白装一次 113 GB 模型; 预填的核账全在 ②③④⑤。
+if [ "$DO_NSYS" != nsysonly ]; then
 echo "== ① 引擎逐层毫秒(--v41-prof, 生成 $NGEN token)"
 ./"$BIN" -m "$MODEL" "${ZARG[@]}" --v41-prof --temp 0 --seed 1 -n "$NGEN" \
       "${SPEC[@]}" "${EXTRA_ARGS[@]}" "${PARG[@]}" > "$OUT/prof.out" 2> "$OUT/prof.err"
@@ -206,8 +209,9 @@ if [ "$DO_NSYS" = ncu ]; then
   done
   exit 0
 fi
+fi   # nsysonly 从这里接上
 
-[ "$DO_NSYS" = yes ] || { echo "== ② nsys: 按参数跳过"; exit 0; }
+[ "$DO_NSYS" = yes ] || [ "$DO_NSYS" = nsysonly ] || { echo "== ② nsys: 按参数跳过"; exit 0; }
 # ★等 ① 段的进程真退干净再开 ②★(2026-09-17 实撞): 引擎有意留着单实例锁, 而 110 GB 的映射卸载要几秒 ——
 # ① 段的 shell 已经返回, 内核还在收页。不等就是 ② 段直接
 # "another ds4 process is already running; refusing to start", 而 nsys 照样采样、照样导出,
@@ -313,7 +317,9 @@ NR>1 { st=$1+0; du=$2+0; nm=$21; gsub(/"/,"",nm); sub(/^ *void /,"",nm);
      # 草稿步现在没有 mtp_ 核(三塔走主干的 VQ 常驻核), 它的出口头是 NT=块长(5) 的 GEMV ⇒ 钉死 k 的趟里 verify_n5 那列就是草稿步。
      if (match($0,/(fp4x32|q4k)_gemv(1_stage|1_pipe)?_kernel<\(unsigned int\)[0-9]+/)) { ntv=substr($0,RSTART,RLENGTH); sub(/.*\)/,"",ntv); ntstep[step]=ntv }
      if (base ~ /mtp_/) mtpstep[step]=1;
-     if (base ~ /nvfp4|cutlass|Kernel/) pf[step]=1;
+     # ★预填块的核名跟着预填路走★(2026-09-29): 09-24 起 v3 的预填专家是 vqm_kernel(bf16 张量核), 骨架是 q4k_to_bf16 + cuBLAS,
+     # 旧正则(nvfp4/cutlass)一个都对不上 ⇒ 预填块被标成 verify_n<空>, 预填的账混进验证批那一列, 表看着像"验证批 900 ms/步"。
+     if (base ~ /nvfp4|cutlass|Kernel|vqm_kernel|vqm_gather16|vqp_fused|q4k_to_bf16/) pf[step]=1;
      t[step,base]+=du; n[step,base]++; tot[step]+=du;
      if (!(base in seen)) { seen[base]=1; names[++nn]=base }
   }
@@ -327,3 +333,23 @@ END { for (s=1;s<=step;s++) { cls = mtpstep[s] ? "draft" : (pf[s] ? "prefill" : 
      for (i=1;i<=nn;i++) { b=names[i]; v=ct[c,b]/cnt[c]/1e6;
         if (v>0.05) printf "   %-44s %8.2f ms %7.1f 发\n", b, v, cn[c,b]/cnt[c] } } }' \
   "$OUT/trace_cuda_gpu_trace.csv"
+
+# ⑤ 空转间隙归属(2026-09-29): ④ 说预填块"壁钟 899 / 核忙 801 ms" —— 每块 98 ms GPU 在等主机, 可 ③④ 只说"有空转"不说"空在谁后面"。
+# 这张表把 GPU 时间线上 > 1 ms 的空档按长短排, 各报"前一发 → 后一发"与步号: 空档总落在同一发核后面 = 那一发之后主机在干活
+# (同步拷贝 / 排序 / 读盘 / 分配), 去那一处改; 落点散乱 = 发射间隙, 那是另一种病(上图或合核)。
+echo
+echo "== ⑤ 空转间隙归属(GPU 空转 > 1 ms 的前 12 段: 前一发 → 后一发; 步号按 embed 切)"
+awk -F, '
+NR>1 { st=$1+0; du=$2+0; nm=$21; gsub(/"/,"",nm); sub(/^ *void /,"",nm); sub(/[(<].*/,"",nm); if (nm == "") nm = "[memcpy/memset]";
+  if (nm ~ /v41_(q4k_)?embed_kernel/) step++;
+  # 只看第 1 步起(第 0 步 = 装模型: 拷 105 GB 的 H2D 空档几十秒, 与前向无关); 门槛 0.2 ms(预填一块里 5 ms 的空档也算大)
+  if (step>=1 && NR>2 && st > lastend + 200000) { g[++ng]=st-lastend; gp[ng]=prev; gn[ng]=nm; gs[ng]=step; }
+  if (st+du > lastend) { lastend=st+du; prev=nm; }
+}
+END { tot=0; for (i=1;i<=ng;i++) { tot+=g[i]; by[gp[i]" → "gn[i]]+=g[i]; cnt[gp[i]" → "gn[i]]++; }
+      printf "  第 1 步起 空转>0.2ms 共 %d 段, 合计 %.1f ms\n", ng, tot/1e6;
+      n=asorti(g, o, "@val_num_desc");
+      for (i=1;i<=n && i<=8;i++) { k=o[i]; printf "  %7.1f ms  步 %-3d %s → %s\n", g[k]/1e6, gs[k], gp[k], gn[k]; }
+      printf "  -- 按(前一发 → 后一发)合计(前 10):\n";
+      m=asorti(by, ob, "@val_num_desc");
+      for (i=1;i<=m && i<=10;i++) printf "   %-78s %8.1f ms  %4d 段\n", ob[i], by[ob[i]]/1e6, cnt[ob[i]]; }' "$OUT/trace_cuda_gpu_trace.csv"

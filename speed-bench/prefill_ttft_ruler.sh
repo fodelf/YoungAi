@@ -15,8 +15,15 @@
 # 表现是模型只看得见最后一块的上下文, 不报错。两边 t/s 一样 = ced_skip 没生效(块数只有 1, 把提示加长)。
 #
 # 用法: ./speed-bench/prefill_ttft_ruler.sh [提示文件] [截多少字符, 默认 40000] [块, 默认 512] [模型, 默认现役] [反修目录, 默认现役对的]
+#                                          [跑哪些: both(默认)/ced/full] [二进制, 默认 ds4]
 #   换配方对尺要**成对换**: 第 4 个参数给新 GGUF、第 5 个给它自己那份反修(gr_Lnn.bin 目录)。
 #   反修是按某一份量化文件的残差解出来的, 挂到别的文件上不报错但数值全错 —— 所以这里不给"只换模型"的默认。
+#   ★第 6 个参数(2026-09-29)★: 扫块大小/对二进制时只要 CED 档(部署语义), full 那趟纯是多装一次 113 GB 模型;
+#   给 ced 就只跑一趟。第 7 个参数换二进制(旧新 A/B 同一趟脚本里各跑一遍)。
+#   ★看门狗(2026-09-29 补)★: 块开到 2048/4096 时预填暂存(logits/专家暂存/bf16 权重)随块长, 以前这把尺一道闸都没有;
+#   照 d1_kv_ring_gate.sh 的口径: MemAvailable 连续两次 < 2500 MB 就杀本趟, 并报这一趟的 MemAvailable 最低值(判块大小的内存账)。
+#   ★第 3 个参数可以给一串块大小("512 2048 4096")★(2026-09-29): 逐个跑, 输出按块留档(ced_<块>.out), 末尾比各块生成文本
+#   是否相同 —— 块大小只该改快慢不该改答案(块间语义按绝对位置, 见 core_v41_attn.c 头注); 变了就是块边界上有 bug。
 
 set -u
 cd "$(dirname "$0")/.." || exit 1
@@ -26,12 +33,16 @@ CHARS="${2:-40000}"
 CHUNK="${3:-512}"
 MODEL="${4:-gguf/v41/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf}"   # 第 4 个参数换模型
 AMP="${5:-gguf/v41/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-vqfin41_vqhalf_a_n8192-engine}"                            # 第 5 个参数换反修(与第 4 个成对)
+WHICH="${6:-both}"
+BIN="${7:-ds4}"
 OUT=/tmp/ttft
 P="$OUT/prompt.txt"
+WD_KILL_MB=2500
 
 mkdir -p "$OUT"; rm -f "$OUT"/*.out "$OUT"/*.err
 [ -f "$MODEL" ] || { echo "★没有模型 $MODEL★"; exit 1; }
 [ -d "$AMP" ]   || { echo "★没有反修目录 $AMP★"; exit 1; }
+[ -x "./$BIN" ] || { echo "★没有 ./$BIN★"; exit 1; }
 # 配对门: 反修 manifest 记着它是在哪份 GGUF 上解的(gguf=…), 去掉 .gguf 后必须是模型名的前缀 ——
 # 同一底座的 -mtpnative/-dspark 变体只多了三塔, 反修通用; 换了底座(fp4 ↔ q4k)就是另一份残差, 拒跑。
 MF=$(grep -ao 'gguf=[^ ]*' "$AMP"/manifest* 2>/dev/null | head -1 | sed 's/^gguf=//; s/\.gguf$//')
@@ -39,17 +50,41 @@ case "$(basename "$MODEL" .gguf)" in "$(basename "$MF")"*) ;; *) echo "★反修
 [ -f "$SRC" ]   || { echo "★没有提示文件 $SRC★"; exit 1; }
 head -c "$CHARS" "$SRC" > "$P"
 
-run() {   # $1 = 标签, $2.. = 额外参数
-  local tag="$1"; shift
-  ./ds4 -m "$MODEL" --zchain "$AMP" --v41-chunk "$CHUNK" --temp 0 --seed 1 -n 16 \
-        "$@" --prompt-file "$P" > "$OUT/$tag.out" 2> "$OUT/$tag.err"
-  printf "%-14s %s\n" "$tag" "$(grep -ao 'prefill [0-9]* token [0-9.]*s ([0-9.]* t/s)' "$OUT/$tag.err" | tail -1)"
+run() {   # $1 = 标签, $2 = 块, $3.. = 额外参数
+  local tag="$1" ck="$2"; shift 2
+  ./"$BIN" -m "$MODEL" --zchain "$AMP" --v41-chunk "$ck" --temp 0 --seed 1 -n 16 \
+        "$@" --prompt-file "$P" > "$OUT/$tag.out" 2> "$OUT/$tag.err" &
+  local pid=$! bad=0 a lo=999999
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ -r /proc/meminfo ]; then
+      a=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
+      [ "$a" -lt "$lo" ] && lo=$a
+      if [ "$a" -lt "$WD_KILL_MB" ]; then bad=$((bad+1)); else bad=0; fi
+      if [ "$bad" -ge 2 ]; then
+        echo "★看门狗: MemAvailable ${a} MB < ${WD_KILL_MB} 连续两次, 杀 $BIN($tag)★" | tee -a "$OUT/$tag.err"
+        kill "$pid" 2>/dev/null; sleep 3; kill -9 "$pid" 2>/dev/null; break
+      fi
+    fi
+    sleep 2
+  done
+  wait "$pid"
+  printf "%-14s %s   (MemAvailable 最低 %s MB, 二进制 %s)\n" "$tag" \
+         "$(grep -ao 'prefill [0-9]* token [0-9.]*s ([0-9.]* t/s)' "$OUT/$tag.err" | tail -1)" "$lo" "$BIN"
 }
 
-echo "== 真实预填尺: $(wc -c < "$P") 字符 / 块 $CHUNK"
-run ced                       # 默认 = CED 开(官方部署语义)
-run full --decoder-full       # 对照 = 每块跑满 40 层
+echo "== 真实预填尺: $(wc -c < "$P") 字符 / 块 $CHUNK / 跑 $WHICH / 二进制 $BIN"
+for ck in $CHUNK; do
+  case "$WHICH" in
+    both) run "ced_$ck" "$ck"; run "full_$ck" "$ck" --decoder-full ;;   # 默认 = CED 开(官方部署语义) + 对照(每块跑满 40 层)
+    ced)  run "ced_$ck" "$ck" ;;
+    full) run "full_$ck" "$ck" --decoder-full ;;
+    *) echo "★第 6 个参数只认 both/ced/full★"; exit 1 ;;
+  esac
+done
 
 echo "== 生成文本(CED 是近似, 判据是答案还对不对, 不是逐字节同)"
-echo "-- CED :"; head -c 300 "$OUT/ced.out";  echo
-echo "-- FULL:"; head -c 300 "$OUT/full.out"; echo
+for f in "$OUT"/ced_*.out "$OUT"/full_*.out; do
+  [ -f "$f" ] || continue
+  printf -- "-- %-10s %5s 字节 md5 %s : " "$(basename "$f" .out)" "$(wc -c < "$f")" "$(md5sum < "$f" | cut -c1-8)"
+  head -c 200 "$f" | tr '\n' ' '; echo
+done
