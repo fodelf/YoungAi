@@ -8,7 +8,11 @@
  *      接受率必须 ≈ p(d)。
  *   ③ 确定性: 同参数同位置再抽一遍, 四个字逐位相同(图路与直发路同一个核 ⇒ 这就是"同一条请求两种发法出同一串 token")。
  * 出错会怎样: 保留集外出现样本 = 门槛键算错(基数选择/键变换); 前 32 项某项超 5σ = Gumbel 键或随机数偏; 投机边缘不等于 p =
- * 接受硬币或残差抽错(投机路会悄悄改分布, 采样下从文本上看不出来 —— 这就是为什么要这道门)。 */
+ * 接受硬币或残差抽错(投机路会悄悄改分布, 采样下从文本上看不出来 —— 这就是为什么要这道门)。
+ * ★极低概率词计数★(2026-09-29 实撞): 随机数撞到 u == 1.0f 时 Gumbel 键 = +∞, 该词无条件胜出 = 往文本里塞均匀随机的词,
+ * 每位 |K|/2^24 的概率(全表 0.77%)。前 32 项 5σ 与总变差 0.05 都吸收得了这点均匀漏(前 32 项各偏 ~3σ, 总变差 +0.008),
+ * 门全绿, 生产上 20 万 token 的报告里塞了 1,880 个随机词。所以再数一项: p < 1e-7 的词一共被抽到多少次 —— 期望 N·Σp(几百),
+ * 均匀漏会多出 N·0.0077·|低 p 集|/V(上千), 按泊松 5σ 判。 */
 #include "ds4_gpu.h"
 #include <math.h>
 #include <stdint.h>
@@ -72,10 +76,15 @@ static int check_freq(const char *what, const uint32_t *cnt, const double *p, ui
         const double z = sd > 0.0 ? fabs(f - p[i]) / sd : 0.0;
         if (z > worst) { worst = z; worst_i = i; }
     }
+    /* 极低概率词(p < 1e-7, 只在全表配方里非空)的采样总数 vs 期望: 均匀随机塞词在这一项上是几十 σ, 在前 32 项上只有 ~3σ */
+    double elow = 0.0; uint32_t low = 0;
+    for (uint32_t i = 0; i < V; i++) if (p[i] > 0.0 && p[i] < 1e-7) { elow += p[i]; low += cnt[i]; }
+    elow *= n_samples;
+    const double zlow = fabs((double)low - elow) / (sqrt(elow) + 1.0);
     /* 总变差的期望 ≈ Σ√(p(1−p)/N)/2 之类, 对 12 万项的长尾偏大; 用 0.05 作粗界(核对不上时它会是 0.3~1) */
-    if (outside || worst > 5.0 || tv > 0.05) bad = 1;
-    printf("  %-14s 保留集外 %u 个样本, 前 %u 项最差 %.2fσ(词 %u: 频率 %.5f vs p %.5f), 总变差 %.4f %s\n", what, outside, nt, worst, worst_i,
-           (double)cnt[worst_i] / n_samples, p[worst_i], tv, bad ? "★红★" : "✓");
+    if (outside || worst > 5.0 || tv > 0.05 || zlow > 5.0) bad = 1;
+    printf("  %-14s 保留集外 %u 个样本, 前 %u 项最差 %.2fσ(词 %u: 频率 %.5f vs p %.5f), 总变差 %.4f, 低p词 %u vs 期望 %.0f(%.1fσ) %s\n",
+           what, outside, nt, worst, worst_i, (double)cnt[worst_i] / n_samples, p[worst_i], tv, low, elow, zlow, bad ? "★红★" : "✓");
     return bad;
 }
 

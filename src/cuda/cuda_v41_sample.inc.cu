@@ -30,11 +30,24 @@
 __device__ __forceinline__ static uint64_t v41_mix64(uint64_t x) {
     x ^= x >> 30; x *= 0xBF58476D1CE4E5B9ull; x ^= x >> 27; x *= 0x94D049BB133111EBull; x ^= x >> 31; return x;
 }
-/* (0,1) 开区间: 24 位 + 半格偏移 ⇒ 不取 0 也不取 1(ln 0 = −∞ 会让某一项恒胜) */
+/* (0,1) 上的全精度均匀数: 二进制档号 n 取余下 41 位的前导零个数(几何分布, P(n)=2^-(n+1)), 尾数取高 23 位 ⇒ 值 = (1+m·2^-23)·2^-(n+1),
+ * 每个二进制档都有 24 位分辨率, 越靠近 0 越细(到 2^-42), 与 float 自身的分辨率结构一致; 上界 1−2^-24, 永不为 0 或 1。
+ * ★为什么要这么讲究★(2026-09-29 三连撞, 判官 = tests/cuda_sample_selftest.c 的低 p 词计数):
+ *   ① 原来是 24 位整数 + 0.5f 再乘 2^-24: k ≥ 2^23 时 k+0.5 超出 fp32 的 24 位有效数字, 舍入到偶数, k = 2^24−1 舍成 2^24 ⇒ u = 1.0f
+ *      ⇒ −ln(−ln 1) = +∞ ⇒ 该 token 无条件赢下 argmax。保留集里每个候选各抽一次 u, top_p=1 时保留集 = 整个词表, 每位撞上的概率
+ *      1−(1−2^-24)^129280 = 0.77%/流 —— 每一百多个 token 塞进一个均匀随机的词。20 万 token 的 CFO 报告里逐位复算出 1,880 个
+ *      (验证流 846 + 草稿流 1,034), 正文烂成多语言乱码, 模型写不出结尾。门读数 1,720 vs 期望 558。
+ *   ② 改成 23 位 + 半格(精确, 不到 1)后门仍 1,363: fast-math 的 __logf 在 1 附近绝对误差 3.6e-7, 把 |ln u| 只有 1e-7 级的上尾打乱
+ *      —— 已改走 log1pf(见核里那一行)。
+ *   ③ 之后门 347, 反过来少了: 均匀数在 0 附近只有 2^-23 的绝对分辨率, Gumbel 上尾被截平, 概率 1e-7 量级的词被少采 ~40%。
+ *      这一版就是解 ③ 的: 均匀数按 float 的方式分档, 上尾一直细到 2^-42。 */
 __device__ __forceinline__ static float v41_u01(uint64_t seed, int32_t pos, uint32_t i, uint32_t salt) {
     const uint64_t x = v41_mix64(seed ^ (0x9E3779B97F4A7C15ull * (uint64_t)(uint32_t)pos + 0xD1B54A32D192ED03ull * (uint64_t)i +
                                           0x8CB92BA72F3D8DD7ull * (uint64_t)(salt + 1u)));
-    return ((float)(uint32_t)(x >> 40) + 0.5f) * (1.0f / 16777216.0f);
+    const uint32_t m = (uint32_t)(x >> 41);                       /* 23 位尾数 */
+    const uint64_t r = x << 23;                                   /* 余下 41 位挪到高位, 数前导零 */
+    const int n = r ? __clzll((long long)r) : 41;                 /* 全零封顶 41 ⇒ 最小档 2^-42, 仍是正规 float */
+    return __uint_as_float(((uint32_t)(126 - n) << 23) | m);     /* 指数域 127−(n+1), 尾数域 m */
 }
 /* float ↔ 单调 u32 键(键升序 = float 升序), 只对有限值 */
 __device__ __forceinline__ static uint32_t v41_fkey(float f) { const uint32_t u = __float_as_uint(f); return (u & 0x80000000u) ? ~u : (u | 0x80000000u); }
@@ -176,7 +189,13 @@ __global__ static void v41_sample_kernel(int32_t *out, const float *logits, cons
         const float m = expf((v - M) * inv_T);
         zk += m;
         if ((int32_t)i == d) md = m;
-        const float g = -logf(-logf(v41_u01(seed, p, i, salt_g)));
+        /* Gumbel g = −ln E, E = −ln(1−u) ~ Exp(1)(u 均匀 ⇒ 1−u 均匀)。★为什么是 log1pf(−u) 不是 logf(u)★(2026-09-29 分布门实撞):
+         * nvcc --use_fast_math 把 logf 换成 __logf, 它在 [0.5, 2] 上是绝对误差 2^-21.4 ≈ 3.6e-7, 而 u 最靠近 1 的几个值 |ln u| 只有
+         * 0.6~3e-7 —— 算出的 E 可能是 0(⇒ g = +∞ 必胜)、负数(⇒ NaN 永不胜)或差几倍, 而这正是决定极低概率词赢不赢的那段上尾。
+         * u == 1.0f 修掉后门仍红(低 p 词 1,363 vs 期望 558, 32.7σ)就是它。log1pf 没有 fast-math 替身, 小自变量下相对精度全程在;
+         * 外层 −logf(E) 的自变量 E ∈ [2^-24, 16.7], __logf 在那里的误差是 ulp 级, 对 g 只有 1e-5 量级, 无碍。 */
+        const float u = v41_u01(seed, p, i, salt_g);
+        const float g = -logf(-log1pf(-u));
         const float key = v * inv_T + g;
         if (key > gb) { gb = key; gi = (int32_t)i; }
         if (lq) {
