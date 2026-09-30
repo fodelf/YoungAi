@@ -273,6 +273,55 @@ int v41_klt_margin_dirs(v41_klt *k, const int *a, const int *b, const float *alp
     return rc;
 }
 
+/* ★第七版的方向表(2026-09-29, back.md §14.4)★: 自 token 减该位期望 ——
+ *     C[i][d] = sc_i · γ[d] · (W[y_i][d] − Σ_q p_iq · W[ids_iq][d]),  sc_i = α_i·inv_i
+ * 它就是 ∂log p(y_i)/∂(本层输出) 穿过出口 norm→head 的精确线性化(softmax 的梯度 = onehot − p, p 只取榜上
+ * K 项, 榜外尾巴 1−mass 丢掉; K=64 实测覆盖 97.3%)。解算器拿它做行方向, 右端给 η·优势, 于是
+ * (Σ c cᵀ + 岭) Δ = η Σ A·c 正是"Fisher 预条件的策略梯度一步"。一行一个 blockIdx.y, 线程管 d, 榜上 K 行 W 顺序读。 */
+__global__ static void klt_owndirs_kernel(float *C, const __half *W, const float *on, const int *a, const int *ids,
+                                          const float *ps, const float *sc, int K, int D, int V) {
+    const int d = blockIdx.x * blockDim.x + threadIdx.x, i = blockIdx.y;
+    if (d >= D) return;
+    const int ai = a[i];
+    float v = 0.f;
+    if (ai >= 0 && ai < V && sc[i] != 0.f) {
+        float ex = 0.f;
+        for (int q = 0; q < K; q++) {
+            const int t = ids[(size_t)i * K + q];
+            const float p = ps[(size_t)i * K + q];
+            if (t < 0 || t >= V || !(p > 0.f)) continue;
+            ex += p * __half2float(W[(size_t)t * D + d]);
+        }
+        v = sc[i] * on[d] * (__half2float(W[(size_t)ai * D + d]) - ex);
+    }
+    C[(size_t)i * D + d] = v;
+}
+
+int v41_klt_own_dirs(v41_klt *k, const int *a, const int *dIds, const float *dPs, const float *alpha, const float *inv,
+                     int n, int K, int D, float *dC) {
+    if (D != k->D) { fprintf(stderr, "★自 token 方向表 D %d ≠ %d★\n", D, k->D); return -1; }
+    float *hsc = (float *)malloc((size_t)n * 4); int *ha = (int *)malloc((size_t)n * 4);
+    if (!hsc || !ha) { free(hsc); free(ha); return -1; }
+    int nbad = 0;
+    for (int i = 0; i < n; i++) {
+        if (!(inv[i] > 0.f)) { nbad++; hsc[i] = 0.f; } else hsc[i] = alpha[i] * inv[i];
+        ha[i] = (a[i] >= 0 && a[i] < k->V) ? a[i] : -1;
+    }
+    if (nbad) fprintf(stderr, "★自 token 方向表: %d/%d 行的 inv 不是正数(整行按 0 处理)★\n", nbad, n);
+    float *dsc = NULL; int *da = NULL; int rc = -1;
+    if (cudaMalloc((void **)&dsc, (size_t)n * 4) == cudaSuccess && cudaMalloc((void **)&da, (size_t)n * 4) == cudaSuccess &&
+        cudaMemcpy(dsc, hsc, (size_t)n * 4, cudaMemcpyHostToDevice) == cudaSuccess &&
+        cudaMemcpy(da, ha, (size_t)n * 4, cudaMemcpyHostToDevice) == cudaSuccess) {
+        klt_owndirs_kernel<<<dim3((D + 255) / 256, n), 256>>>(dC, k->dW, k->dOn, da, dIds, dPs, dsc, K, D, k->V);
+        rc = (int)cudaDeviceSynchronize();
+        if (rc) fprintf(stderr, "★自 token 方向表核失败: %s★\n", cudaGetErrorString((cudaError_t)rc));
+    } else fprintf(stderr, "★自 token 方向表缓冲/上传失败★\n");
+    free(hsc); free(ha);
+    if (dsc) cudaFree(dsc);
+    if (da) cudaFree(da);
+    return rc;
+}
+
 /* ★主动集扫榜★(2026-09-13 夜第三针): 修正把 Δy 挪出去之后, 榜上【每个】token 的 logit 各动了多少。
  *   Δℓ[i][q] = α_i·inv_i · Σ_d γ[d]·W[ids[i][q]][d] · Δy[i][d]
  * 为什么必须扫整张榜: 每行只钉一对时, 钉住的那一对分毫不差(自检 2 相关 1.0000), 而 37% 的位置

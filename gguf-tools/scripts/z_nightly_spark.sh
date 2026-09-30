@@ -1456,7 +1456,228 @@ stage_reviewiter(){
     LOG "REVIEWITER_DONE 产物 $IT"
 }
 
+# ================= ★第七版(2026-09-29, back.md §14)★: 真实请求 → 模型卡采样 N 份 → 次日行情打分 =================
+# 料在 $D2/req/<kind>_<日期>[_<代码>].json(Mac 侧 qtf_requests_mac.sh 重建后推过来, _note 里带次日 OHLC / 大盘真值)。
+# 一份样本一个目录 $D2/samp/<请求名>/<③标签>/: s<k>.sse(原始流) s<k>.think.txt s<k>.content.txt
+#   s<k>.prompt.ids / s<k>.gen.ids(引擎真吃/真吐的 id, 从服务端 --trace 取, 不重新分词) s<k>.meta reward.txt
+TRACE_CUR="$D2/trace/current"      # serve_1m_spark.sh 起服时写的本趟 --trace 路径
+REWARD="$BEN/posttrain_reward"
+
+# sample <req.json> <N> [③目录|-] [标签] [temperature] [top_p] [②反修目录]: 停服 → 按参数重起(挂/不挂 ③, 换/不换 ②) → N 条请求(seed 1..N) → 打分。
+# 为什么每次重起服务: 现役服务不知道挂的是哪份 ③, 采样必须与判决同一个"服务态"; 实例锁只许一个大模型进程。
+# 第 7 参数换 ②(2026-09-30, 用户令"编程域语料带英文, 试一试有没有同样的问题"): 同一条真实请求挂另一份侧车再采 N 份, 与 base 并排;
+#   不给 = serve_1m_spark.sh 的现役默认(金融 grrb)。挂的哪份写进样本目录 zchain.txt, 事后能对上。
+# 为什么 seed 显式给: 模型卡采样默认路下服务端不带 seed 是随机的, N 份要可复现且互不相同。
+# ★采样参数显式写进请求, 值 = 服务端默认(模型卡配方 温 1.0 / top_p 1.0 / min_p 0)★: 采样必须与产品路同一条分布, 显式写只是
+#   为了 seed 可复现与日志自说明。09-29 实撞: 这条 CFO 请求两份样本全烂(一份 20 万 token 才停, 一份 5.1 万 token 被看门狗杀),
+#   当晚误判为"纯采样尾巴脏"改走 top_p 0.95 —— 真因是设备采样核随机数撞 u == 1.0f 时 Gumbel 键 +∞, 每位以 0.77%/流的概率
+#   硬塞一个均匀随机的词(逐位复算 200,119 个 token 里 1,880 个), top_p 0.95 只是把保留集缩小到撞不到, 是遮丑不是修。
+#   核已修(cuda_v41_sample.inc.cu v41_u01), 这里退回服务端默认; 再改 top_p 是产品决定, 不在这个脚本里替用户定。
+# 单条总时长上限 1700 s = qtf 里 LLM 的 timeout(modules/deepseek.py _LOCAL_TIMEOUT): 产品在那一刻挂断, 采样照抄
+#   (挂断 = 关连接, 服务端每 16 token 探一次对端就停; 这种样本没有 JSON, 奖励器判 INVALID, 与产品里"这次 CFO 失败"同义)。
+stage_sample(){
+    local REQ="${1:?请求 JSON}" N="${2:?份数}" PT="${3:--}" TAG="${4:-}" TEMP="${5:-1.0}" TOPP="${6:-1.0}" ZC2="${7:-}"
+    [ -s "$REQ" ] || DIE "没有 $REQ"
+    [ -x "$REWARD" ] || make -C "$ROOT/gguf-tools" posttrain_reward >>"$LOGF" 2>&1 || DIE "奖励器编译失败"
+    [ -z "$ZC2" ] || ls "$ZC2"/gr_L*.bin >/dev/null 2>&1 || DIE "② 目录缺或没有 gr_L*.bin: $ZC2"
+    [ -n "$TAG" ] || { if [ "$PT" = - ]; then TAG=base; else TAG="$(basename "$PT")"; fi; }
+    local NAME; NAME="$(basename "$REQ" .json)"
+    local OUT="$D2/samp/$NAME/$TAG"; mkdir -p "$OUT"
+    cp -n "$REQ" "$OUT/req.json" 2>/dev/null || cp "$REQ" "$OUT/req.json"
+    echo "$PT" > "$OUT/posttrain.txt"
+    echo "${ZC2:-$ZCH}" > "$OUT/zchain.txt"
+    local need=0 k
+    for k in $(seq 1 "$N"); do [ -s "$OUT/s$k.gen.ids" ] || need=1; done
+    if [ "$need" = 1 ]; then
+        local extra=(); [ "$PT" = - ] || extra=(--posttrain "$PT")
+        bash "$SC/serve_1m_spark.sh" stop >>"$LOGF" 2>&1; sleep 3; need_idle
+        bash "$SC/serve_1m_spark.sh" start "" "$ZC2" ${extra[@]+"${extra[@]}"} >>"$LOGF" 2>&1 || DIE "服务没起来(看 $LOGF)"
+        local TR; TR=$(cat "$TRACE_CUR" 2>/dev/null); [ -n "$TR" ] && [ -e "$TR" ] || DIE "服务没开 --trace($TRACE_CUR 空)"
+        LOG "采样 $NAME ×$N 挂 ③=$PT ②=${ZC2:-现役默认} 温 $TEMP top_p $TOPP → $OUT (trace $TR)"
+        for k in $(seq 1 "$N"); do
+            [ -s "$OUT/s$k.gen.ids" ] && { LOG "  s$k 已有, 跳过"; continue; }
+            python3 - "$OUT" "$k" "$TR" "$TEMP" "$TOPP" <<'PYEOF' 2>&1 | tee -a "$LOGF"
+import json, os, re, sys, time, urllib.request
+out, k, tr = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+b = json.load(open(os.path.join(out, "req.json"), encoding="utf-8")); note = b.pop("_note", {})
+b["stream"] = True; b["seed"] = k
+b["temperature"] = float(sys.argv[4]); b["top_p"] = float(sys.argv[5]); b["min_p"] = 0.0   # 其余字段原样(stop 词照旧)
+op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+rq = urllib.request.Request("http://127.0.0.1:8000/v1/chat/completions", json.dumps(b, ensure_ascii=False).encode(),
+                            {"Content-Type": "application/json"})
+think = text = ""; finish = "?"; usage = None; t0 = time.time(); ntok = 0
+WALL = 1700.0                                # qtf 的 LLM timeout: 总时长, 不是单次读的间隔
+tr_pos = os.path.getsize(tr)                 # 只看本条请求之后新写的 trace
+with op.open(rq, timeout=600) as r, open(os.path.join(out, "s%d.sse" % k), "w", encoding="utf-8") as fo:
+    try:
+        for ln in r:
+            ln = ln.decode("utf-8", "replace"); fo.write(ln)
+            if time.time() - t0 > WALL: finish = "client_abort:wall%.0fs" % WALL; break   # 关连接 = 产品那一刻的挂断
+            if not ln.startswith("data: {"): continue
+            j = json.loads(ln[6:]); usage = j.get("usage") or usage
+            for ch in j.get("choices") or []:
+                de = ch.get("delta", {}); think += de.get("reasoning_content") or ""; text += de.get("content") or ""; ntok += 1
+                if ch.get("finish_reason"): finish = ch["finish_reason"]
+    except Exception as e:                   # 断流: 如实记, 不重试
+        finish = "client_abort:%s" % type(e).__name__
+el = time.time() - t0
+try: avail = [int(l.split()[1]) // 1024 for l in open("/proc/meminfo") if l.startswith("MemAvailable")][0]
+except Exception: avail = -1
+open(os.path.join(out, "s%d.think.txt" % k), "w", encoding="utf-8").write(think)
+open(os.path.join(out, "s%d.content.txt" % k), "w", encoding="utf-8").write(text)
+# 引擎真吃/真吐的 id: 本条请求结束后 trace 里最后一块 "--- token ids: prompt P, generated G ---"。
+# 服务端在发完 [DONE] 之后才写这一块, 所以要等它落盘(最多 30 s), 不能一读到流尾就去翻。
+# ★按字节切, 再解码★(09-29 实撞): tr_pos 是 getsize 的字节数, 而 trace 里有整段中文提示(一字 3 字节), 拿字节偏移去切
+#   .read() 出来的字符串, 四条请求之后差了十几万个位置, 第 4 份的整块被切掉 —— 报"trace 里没有本条的 token id 块",
+#   其实块 22:25:38 就写好了。前三份只是差得还不够多。
+m = None
+for _ in range(60):
+    tail = open(tr, "rb").read()[tr_pos:].decode("utf-8", "replace")
+    for m in re.finditer(r"--- token ids: prompt (\d+), generated (\d+) ---\nprompt:([ \d]*)\ngenerated:([ \d]*)\n", tail): pass
+    if m is not None: break
+    time.sleep(0.5)
+if m is None:
+    print("  ★s%d: trace 里没有本条的 token id 块(finish=%s), 这份不可取料★" % (k, finish)); sys.exit(1)
+P, G = int(m.group(1)), int(m.group(2))
+pids = m.group(3).split(); gids = m.group(4).split()
+if len(pids) != P or len(gids) != G:
+    print("  ★s%d: trace id 块计数不符 P %d/%d G %d/%d★" % (k, len(pids), P, len(gids), G)); sys.exit(1)
+open(os.path.join(out, "s%d.prompt.ids" % k), "w").write("\n".join(pids) + "\n")
+open(os.path.join(out, "s%d.gen.ids" % k), "w").write("\n".join(gids) + "\n")
+open(os.path.join(out, "s%d.meta" % k), "w").write("seed=%d temperature=%s top_p=%s min_p=0 finish=%s prompt=%d generated=%d think_chars=%d content_chars=%d elapsed_s=%.0f mem_avail_mb=%d usage=%s\n"
+                                                    % (k, sys.argv[4], sys.argv[5], finish, P, G, len(think), len(text), el, avail, json.dumps(usage)))
+print("  s%d: finish=%s 提示 %d / 生成 %d token, 思考 %d 字 / 正文 %d 字, %.0fs, 采完 MemAvailable %d MB" % (k, finish, P, G, len(think), len(text), el, avail))
+PYEOF
+            pgrep -x ds4-server >/dev/null || { LOG "★服务在第 $k 份中途没了(看门狗/崩溃, 看 $HOME/ds4-server-watchdog.log), 停采★"; break; }
+        done
+        bash "$SC/serve_1m_spark.sh" stop >>"$LOGF" 2>&1
+    fi
+    stage_reward "$OUT"
+}
+
+# reward <样本目录>: 每份正文 → 奖励器 → reward.txt(一行一份: k rc 奖励行)。个股: 次日 OHLC 来自 req.json 的 _note;
+# 大盘: 真值来自 _note.truth。早盘真跑那份(个股 _note.live_report)也打一行 "live"(只报; 它是另一台模型写的, 不进组)。
+stage_reward(){
+    local OUT="${1:?样本目录}"
+    python3 - "$OUT" "$REWARD" <<'PYEOF' 2>&1 | tee -a "$LOGF"
+import glob, json, os, subprocess, sys
+out, tool = sys.argv[1], sys.argv[2]
+note = json.load(open(os.path.join(out, "req.json"), encoding="utf-8")).get("_note", {})
+kind, date = note.get("kind"), note.get("date")
+rows = []
+def score(path):
+    if kind == "cfo":
+        ohlc = os.path.join(out, "ohlc.txt")
+        open(ohlc, "w").write("".join("%s %s %s %s %s\n" % (b["date"], b["open"], b["high"], b["low"], b["close"]) for b in note.get("ohlc") or []))
+        r = subprocess.run([tool, "stock", path, ohlc, date], capture_output=True, text=True)
+    else:
+        r = subprocess.run([tool, "market", path, note.get("truth") or "?"], capture_output=True, text=True)
+    return r.returncode, (r.stdout.strip() or r.stderr.strip())
+files = sorted(glob.glob(os.path.join(out, "s*.content.txt")), key=lambda p: int(os.path.basename(p)[1:].split(".")[0]))
+for p in files:
+    k = int(os.path.basename(p)[1:].split(".")[0]); rc, line = score(p); rows.append((str(k), rc, line))
+if kind == "cfo" and note.get("live_report"):
+    lp = os.path.join(out, "live.content.txt"); open(lp, "w", encoding="utf-8").write(note["live_report"])
+    rc, line = score(lp); rows.append(("live", rc, line))
+with open(os.path.join(out, "reward.txt"), "w") as f:
+    f.write("# k rc " + ("R_pnl R_bin trade entry target stop rr next_date hit R_pnl_t1 R_bin_t1" if kind == "cfo" else "R_bin pred") + "  (rc 0=打出分 2=INVALID 3=还没次日行情)\n")
+    for k, rc, line in rows: f.write("%s %d %s\n" % (k, rc, line))
+valid = [(k, l) for k, rc, l in rows if rc == 0 and k != "live"]
+print("[奖励] %s %s %s: %d 份可判 / %d 份; %s" % (kind, date, note.get("symbol", ""), len(valid), len([r for r in rows if r[0] != "live"]),
+      " | ".join("s%s→%s" % (k, " ".join(l.split()[:2])) for k, l in valid) or "无可判样本"))
+for k, rc, line in rows:
+    if rc != 0 or k == "live": print("   %s: rc=%d %s" % (k, rc, line[:120]))
+PYEOF
+}
+
+# solve3 <样本目录> [η列表] [λ列表]: reward.txt → 组内减均值得优势 → 清单 → v41_amp_run --adv-list(部署同路取料 + 解) → 候选;
+# 最后一行打印 J_out(留一预测)最好的候选目录。个股奖励取带幅度列(R_pnl), 大盘取 R_bin; 只用 rc=0 的样本; 早盘那份(live)不进组。
+# ★行预算 ROWS_CAP(09-29 内存账, 详见 v41_adv_run.inc.c 头注释)★: 113.6 GB 模型驻留后整机余 ~10 GB, 再扣出口头 1.3 GB 与
+#   取料窗(一份生成段 2.1 万行 bf16 = 1.3 GB); 设备 ye 缓冲 = 行数 × 6 × 5120 × 4 B: 12000 行 = 1.47 GB + 方向表 0.25 GB,
+#   合计 ~4.4 GB 落在余量里, 看门狗红线 2.5 GB 之上还留 3 GB。行按每份样本系统抽样(等距), 不是截头。
+# ★折号 = 样本序号★: demo 只有一个请求, 留一只能按样本分折(同请求另一条轨迹算"没解过的"); 多请求夜跑时这里改按请求分折。
+ROWS_CAP=12000
+# 解算趟自带看门狗(铁律: 大内存运行必须有 RSS 预算 + 看门狗): 与 serve_1m_spark.sh 同口径, MemAvailable 连续两次 < 红线就杀解算器。
+solve_guard(){
+    local a bad=0
+    while pgrep -x v41_amp_run >/dev/null; do
+        a=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
+        if [ "$a" -lt 2500 ]; then bad=$((bad+1)); else bad=0; fi
+        if [ "$bad" -ge 2 ]; then LOG "★解算看门狗: MemAvailable ${a} MB < 2500 连续两次, 杀 v41_amp_run★"; pkill -x v41_amp_run; sleep 3; pkill -9 -x v41_amp_run 2>/dev/null; return 1; fi
+        sleep 5
+    done
+}
+stage_solve3(){
+    local SD="${1:?样本目录}" ETA="${2:-0.1,0.3,1}" LAM="${3:-0.3,1,3,10}"
+    [ -s "$SD/reward.txt" ] || DIE "没有 $SD/reward.txt(先跑 sample)"
+    [ -x "$AMP/v41_amp_run" ] || make -C "$ROOT/gguf-tools" v41_amp_run >>"$LOGF" 2>&1 || DIE "解算器编译失败"
+    local W="$SD/solve"; mkdir -p "$W"
+    python3 - "$SD" "$W" <<'PYEOF' 2>&1 | tee -a "$LOGF" || DIE "清单拼装失败"
+import json, os, sys
+sd, w = sys.argv[1], sys.argv[2]
+rows = []
+for ln in open(os.path.join(sd, "reward.txt"), encoding="utf-8"):
+    f = ln.split()
+    if not f or f[0].startswith("#") or f[0] == "live" or len(f) < 3 or f[1] != "0": continue
+    k = int(f[0])
+    if not (os.path.exists(os.path.join(sd, "s%d.prompt.ids" % k)) and os.path.exists(os.path.join(sd, "s%d.gen.ids" % k))):
+        print("  s%d 有分没有 id(trace 没截到), 不进组" % k); continue
+    rows.append((k, float(f[2])))                   # cfo: R_pnl(带幅度) / market: R_bin —— 都在第 3 列
+if len(rows) < 2: print("可判样本 %d 份 < 2, 组内比不出高低" % len(rows)); sys.exit(1)
+mean = sum(r for _, r in rows) / len(rows)
+adv = [(k, R - mean) for k, R in rows]
+if all(abs(a) < 1e-12 for _, a in adv): print("N 份奖励全同(%.5f): 这份请求没有裁量, 无可重分" % mean); sys.exit(1)
+lines, maxlen = [], 0
+for fold, (k, a) in enumerate(adv):
+    pids = open(os.path.join(sd, "s%d.prompt.ids" % k)).read().split()
+    gids = open(os.path.join(sd, "s%d.gen.ids" % k)).read().split()
+    ids = os.path.join(w, "ids_%d.txt" % k)
+    open(ids, "w").write("\n".join(pids + gids) + "\n")
+    maxlen = max(maxlen, len(pids) + len(gids))
+    lines.append("%s %s/top_%d.bin %s/rms_%d.bin %.6f %d %d" % (ids, w, k, w, k, a, len(pids), fold))   # 末列 = 留一折号(按样本)
+open(os.path.join(w, "list.txt"), "w").write("\n".join(lines) + "\n")
+open(os.path.join(w, "meta.env"), "w").write('MAXLEN="%d"\nFIRST="%s"\n' % (maxlen + 8, lines[0].split()[0]))
+print("[优势] " + " ".join("s%d=%+.5f" % (k, a) for k, a in adv) + "  (组均值 %.5f; 1 组 %d 份; 留一按样本 %d 折)" % (mean, len(adv), len(adv)))
+PYEOF
+    [ "${PIPESTATUS[0]}" = 0 ] || return 1
+    . "$W/meta.env"
+    local OUT="$W/pt"; rm -rf "$OUT"; mkdir -p "$OUT"
+    bash "$SC/serve_1m_spark.sh" stop >>"$LOGF" 2>&1; sleep 3; need_idle
+    LOG "③ 解算(第七版, η=$ETA λ=$LAM, L39, 行预算 $ROWS_CAP) → $OUT; MemAvailable $(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo) MB"
+    ( sleep 20; solve_guard ) &
+    local GUARD=$!
+    # --score-chunk 512(09-30 实撞): 引擎默认分块 2048 的打分状态(logits 主机+设备各 1.06 GB, hc/q/o 按 2048 行)在模型驻留后的 9 GB 里
+    #   装不下第七版的料, 30 s 就被解算看门狗杀; 分块不改输出(预填尺四档逐字节同), 09-24 那次取料也是 512。
+    "$AMP/v41_amp_run" "$MDL" "$HFDIR" "$FIRST" "$MAXLEN" "$OUT" --only-layer 39 --capture-ye --adv-list "$W/list.txt" \
+        --eta-list "$ETA" --lam-list "$LAM" --base-amp "$ZCH" --mem-budget-mb 110000 --rows-cap "$ROWS_CAP" --score-chunk 512 2>&1 | tee -a "$LOGF" | grep -v "^ds4:" | tail -30
+    local SRC="${PIPESTATUS[0]}"
+    kill "$GUARD" 2>/dev/null; wait "$GUARD" 2>/dev/null
+    [ "$SRC" = 0 ] || DIE "解算失败(rc=$SRC)"
+    local BEST; BEST=$(grep -v '^#' "$OUT/candidates.txt" | sort -k4 -gr | head -1 | cut -d' ' -f1)
+    [ -n "$BEST" ] || DIE "没有候选"
+    LOG "★J_out 最好的候选: $OUT/$BEST★"
+    echo "$OUT/$BEST"
+}
+
+# demo <req.json> [N]: ★最小端到端★(用户 09-29: "最小 demo 跑通即可") —— 采 N 份 → 打分 → 解 ③ → 挂 ③ 再采 N 份 → 两份 reward.txt 并排。
+stage_demo(){
+    local REQ="${1:?请求 JSON}" N="${2:-4}"
+    local NAME; NAME="$(basename "$REQ" .json)"
+    stage_sample "$REQ" "$N" - base || DIE "基线采样失败"
+    local CAND; CAND=$(stage_solve3 "$D2/samp/$NAME/base" | tail -1)
+    [ -d "$CAND" ] || DIE "没有 ③ 候选($CAND)"
+    stage_sample "$REQ" "$N" "$CAND" pt3 || DIE "挂 ③ 采样失败"
+    LOG "★demo 读数 $NAME★"
+    echo "--- 基线(无 ③) ---"; cat "$D2/samp/$NAME/base/reward.txt"
+    echo "--- 挂 ③ ($CAND) ---"; cat "$D2/samp/$NAME/pt3/reward.txt"
+    LOG "DEMO_DONE $NAME"
+}
+
 case "${1:-all}" in
+  sample)  stage_sample "${2:-}" "${3:-4}" "${4:--}" "${5:-}" "${6:-1.0}" "${7:-1.0}" "${8:-}";;
+  reward)  stage_reward "${2:-}";;
+  solve3)  stage_solve3 "${2:-}" "${3:-}" "${4:-}";;
+  demo)    stage_demo "${2:-}" "${3:-4}";;
   reviewiter) shift; stage_reviewiter "$@";;
   review)  stage_review "${2:-}" "${3:-}" "${4:-}" "${5:-}";;
   reviewrun) stage_reviewrun "${2:-}" "${3:-}" "${4:-}";;

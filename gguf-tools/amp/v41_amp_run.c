@@ -51,6 +51,8 @@ int v41_gr_solve_layer_gpu(const float *dye, const float *drw, const int *dsel, 
               "            [--reuse-tables] [--tau-list 1] [--rho-list 0.1,1,10] [--lam-list 0.3,1,3,10]\n" \
               "            [--kappa-list 1e9](专家频率岭) [--nu-list 0](词对重复度权重) [--gates R](x 键控, 1=旧形态)\n" \
               "  验证表:   --sft-list <清单> --verify-tabs g_ --base-pt <候选>(一次加载跑完所有样本)\n" \
+              "  第七版:   --adv-list <清单: ids topk rms A_i nprompt 组号> --only-layer 39 --capture-ye --base-amp <②>\n" \
+              "            [--eta-list 0.1,0.3,1] [--lam-list 0.3,1,3,10] [--own-pmax 0.95] [--rows-cap N] [--score-chunk 512](见 v41_adv_run.inc.c)\n" \
               "  校准取料: --dump-calib  (裸 ① 上一趟, 40 层同趟落 <出目录>/calib_Lnn.bin, 给 v41_quantize --calib; 见 v41_calib_dump.inc.c)\n"
 
 #define NK 4
@@ -70,6 +72,15 @@ typedef struct {
     float clamp;
     float *rx, *ry, *rrw, *ralpha; int *rsel; int got;   /* 本遍原序取料 [n][D] / [n][n_used] / [n], got = 已收到的行数 */
     float *rye, *rysh; int want_ye;        /* --capture-ye: 逐专家 down 输出 [n][n_used][D](未乘 rw) + shared 输出 [n][D] */
+    /* ★第七版取料槽★(2026-09-29/30, v41_adv_run.inc.c): rye_map[绝对行] = 槽号或 −1, 钩子只把有槽的行搬进 rye(f32, 槽 × n_used × D),
+     * 首次到达时按真实 n_used 分配。为什么: 通用路按 ntok×MAXU(16) 全序列 f32 分配, 一条 CFO 样本 35k 行 = rye/hye/dye 各 11.5 GB,
+     * 而 113.6 GB 的模型驻留后整机只剩 ~10 GB —— 不是"省一点", 是根本装不下。中间版本试过"只存生成段 bf16 取料窗"(一份 1.7~2.1 GB),
+     * 与打分路状态 + 解码层懒分配叠在一起 30 s 内把 9 GB 吃到 2.2 GB 被看门狗杀(09-30 00:02) ⇒ 改成两遍: 第一遍只出榜单表定行集,
+     * 第二遍只存选中的 ≤ rows_cap/N 行(4000 行 = 0.49 GB)。 */
+    int *rye_map; int rye_slots, rye_nu;
+    int rows_cap;                          /* --rows-cap: 第七版累积行数封顶(0 = 不封); 设备 ye 缓冲 = 它 × n_used × D × 4 */
+    int score_chunk;                       /* --score-chunk: 取料趟的分块(0 = 引擎默认 DS4_V41_CHUNK)。分块不改输出(预填尺四档逐字节同), 只改状态内存:
+                                            * 2048 行的打分状态(logits 主机+设备各 1.06 GB, hc/q/o…)在模型驻留后的 9 GB 余量里装不下第七版的料 */
     float *hye, *hysh, *hgr;               /* 置换后副本 + 增益缩放因子下载 [n_expert][D] */
     float *dye, *dysh, *drw, *dgr; int *dsel;   /* 权重侧解算的设备缓冲 */
     uint8_t *dgrpk, *hgrpk;                /* ★解算器直接产出的 fp4x32 码字★ [n_expert][D/32][17]: 落盘写的就是它 */
@@ -82,6 +93,7 @@ typedef struct {
     v41_klt *klt; const char *kl_ref, *kl_stu; float eta_rel;
     /* 后训练第三件(2026-09-13 夜第二版): 靶 = 决策点上两个 token 的 logit 差(第一版拟合损失梯度已判死) */
     const char *sft_list, *base_amp, *base_pt;
+    const char *adv_list, *eta_s; float own_pmax;   /* 第七版(09-29): 优势加权自 token 靶的清单 / η 网格 / 行筛阈值(v41_adv_run.inc.c) */
     const char *tau_s, *rho_s, *lam_s;     /* 决策差网格: τ=目标 logit 差 / ρ=约束行权重 / λ=岭 */
     const char *kap_s, *nu_s; float kappa;  /* 泛化先验(back.md §4.7): κ=专家频率岭 / ν=词对重复度权重 */
     int nsmp;                              /* 样本条数: 尺 L 按条留一, 折数 = 它 */
@@ -157,15 +169,33 @@ static int hook(void *ud, int il, int pos0, int n, int D, int n_used, float clam
     if (il != c->layer) return 0;
     if (D != c->D || n_used > MAXU || pos0 < 0 || pos0 + n > c->n) { fprintf(stderr, "★钩子 pos0=%d n=%d D=%d n_used=%d 与拟合 %d/%d 不符★\n", pos0, n, D, n_used, c->n, c->D); return -1; }
     c->n_used = n_used; c->clamp = clamp;
-    memcpy(c->rx + (size_t)pos0 * D, x, (size_t)n * D * 4); memcpy(c->ry + (size_t)pos0 * D, y, (size_t)n * D * 4);
+    /* rx/ry 为空 = 这条路不要它们(第七版只用 ye/rw/sel/alpha, 两份 [n][D] f32 在 35k 行上是 1.4 GB 白占) */
+    if (c->rx) memcpy(c->rx + (size_t)pos0 * D, x, (size_t)n * D * 4);
+    if (c->ry) memcpy(c->ry + (size_t)pos0 * D, y, (size_t)n * D * 4);
     memcpy(c->rsel + (size_t)pos0 * n_used, sel, (size_t)n * n_used * 4); memcpy(c->rrw + (size_t)pos0 * n_used, rw, (size_t)n * n_used * 4);
     memcpy(c->ralpha + (size_t)pos0, alpha, (size_t)n * 4);
     if (c->want_ye) {
         /* 取不到就硬停: 逐专家输出只有 prefill GEMM 路物化, 拿不到说明走了解码路或形状对不上 ——
          * 这时候继续跑会解出一个没有料支撑的东西, 比报错难查得多。 */
         if (!ye || !ysh) { fprintf(stderr, "★L%02d 拿不到逐专家 down 输出/shared(ye=%p ysh=%p): 块 n=%d 可能走了解码 gemv 路★\n", il, (const void *)ye, (const void *)ysh, n); return -1; }
-        memcpy(c->rye + (size_t)pos0 * n_used * D, ye, (size_t)n * n_used * D * 4);
-        memcpy(c->rysh + (size_t)pos0 * D, ysh, (size_t)n * D * 4);
+        if (c->rye_map) {
+            /* 第七版取料槽: 只搬 rye_map 里有槽号的行(第一遍榜单表定的行集), f32 原值。 */
+            if (!c->rye) {
+                c->rye_nu = n_used;
+                c->rye = malloc((size_t)c->rye_slots * n_used * D * 4);
+                if (!c->rye) { fprintf(stderr, "★取料槽 %d × %d × %d f32(%.2f GB)分配失败★\n", c->rye_slots, n_used, D, (double)c->rye_slots * n_used * D * 4 / 1e9); return -1; }
+            }
+            if (c->rye_nu != n_used) { fprintf(stderr, "★取料槽 n_used 变了: %d → %d★\n", c->rye_nu, n_used); return -1; }
+            for (int i = 0; i < n; i++) {
+                const int s = c->rye_map[pos0 + i];
+                if (s < 0) continue;
+                if (s >= c->rye_slots) { fprintf(stderr, "★取料槽号 %d ≥ 槽数 %d★\n", s, c->rye_slots); return -1; }
+                memcpy(c->rye + (size_t)s * n_used * D, ye + (size_t)i * n_used * D, (size_t)n_used * D * 4);
+            }
+        } else {
+            memcpy(c->rye + (size_t)pos0 * n_used * D, ye, (size_t)n * n_used * D * 4);
+            memcpy(c->rysh + (size_t)pos0 * D, ysh, (size_t)n * D * 4);
+        }
     }
     c->got += n;
     /* ★取完本层要不要继续跑到出口★
@@ -188,6 +218,7 @@ static void rb_seq_free(void);
 static int rbgr_hook(void *ud, int il, int pos0, int n, int D, int n_used, float clamp, const float *x, const float *y, const int *sel,
                      const float *rw, const float *alpha, const float *ye, const float *ysh);
 static int sft_run(ctx_t *c, ds4_engine *e, const char *list_path, const char *out, int il, int ntok_cap, int no_engram);  /* v41_sft_run.inc.c */
+static int adv_run(ctx_t *c, ds4_engine *e, const char *list_path, const char *out, int il, int ntok_cap, int no_engram);  /* v41_adv_run.inc.c(第七版) */
 static int *rows_spec_parse(const char *spec, int ntok, int *out_n); /* v41_sft_run.inc.c(行子集) */
 static int calib_dump(ds4_engine *e, const int *ids, int ntok, const char *dir, int nl, int no_engram, int D, int n_expert,
                       const char *gguf, const char *ids_path);   /* v41_calib_dump.inc.c(量化校准取料, --dump-calib) */
@@ -207,6 +238,7 @@ int main(int argc, char **argv) {
     c.tau_s = "1"; c.rho_s = "0.1,1,10"; c.lam_s = "0.3,1,3,10";
     /* κ=1e9 等于"不加频率岭"(退化成第二版), 留着当对照组; ν=0 同理 = 不看词对重复度。 */
     c.kap_s = "1e9"; c.nu_s = "0"; c.gate_s = "1";
+    c.eta_s = "0.1,0.3,1"; c.own_pmax = 0.95f;   /* η = 赢家每个 token 想抬多少 nat(|A| 归一到 1); 0.95 以上的位置自 token≈期望, 方向≈0 */
     for (int i = 6; i < argc; i++) {
         if (!strcmp(argv[i], "--layers") && i + 1 < argc) nlayers = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--whiten") && i + 1 < argc) c.whiten = atoi(argv[++i]);
@@ -219,6 +251,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--rb") && i + 1 < argc) c.rb_dump = argv[++i];
         else if (!strcmp(argv[i], "--eta-rel") && i + 1 < argc) c.eta_rel = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--sft-list") && i + 1 < argc) c.sft_list = argv[++i];
+        else if (!strcmp(argv[i], "--adv-list") && i + 1 < argc) c.adv_list = argv[++i];
+        else if (!strcmp(argv[i], "--eta-list") && i + 1 < argc) c.eta_s = argv[++i];
+        else if (!strcmp(argv[i], "--own-pmax") && i + 1 < argc) c.own_pmax = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--rows-cap") && i + 1 < argc) c.rows_cap = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--score-chunk") && i + 1 < argc) c.score_chunk = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--reuse-tables")) c.reuse_tab = 1;
         else if (!strcmp(argv[i], "--share")) c.share = 1;
         else if (!strcmp(argv[i], "--verify-tabs") && i + 1 < argc) c.verify_pref = argv[++i];
@@ -239,6 +276,12 @@ int main(int argc, char **argv) {
         } else { fprintf(stderr, "★不认识的参数 %s★\n", argv[i]); return 2; }
     }
     if (c.kl_ref && only_layer < 0) { fprintf(stderr, "★蒸馏靶只对末层成立(梯度链止于出口), 必须配 --only-layer <末层号>★\n"); return 2; }
+    if (c.adv_list) {   /* 第七版靶与决策差靶同一条闭式链: 只对末层精确, 要逐专家输出, 与别的靶互斥 */
+        if (c.sft_list || c.kl_ref || c.rb_dump) { fprintf(stderr, "★--adv-list 不与 --sft-list/--target/--rb 同给★\n"); return 2; }
+        if (only_layer < 0 || !c.want_ye) { fprintf(stderr, "★--adv-list 必须配 --only-layer <末层号> --capture-ye★\n"); return 2; }
+        if (!(c.own_pmax > 0.f && c.own_pmax <= 1.f)) { fprintf(stderr, "★--own-pmax %g 要在 (0,1]★\n", c.own_pmax); return 2; }
+        c.sft_list = c.adv_list;   /* 下面按清单模式走(ids 占位、行分层、出口头), 分流点在 sft_run 之前 */
+    }
     if (c.sft_list) {
         /* 后训练靶与蒸馏靶同一条闭式链, 同样只对末层精确 —— 往前的层要穿过后面各层的雅可比,
          * 那是 back.md §3.3 的级 2/级 3, 不在这条路上偷偷做。 */
@@ -293,13 +336,25 @@ int main(int argc, char **argv) {
     else printf("[反修·引擎路] HF %d 专家 × [%d×%d], 拟合料 %s n=%d, 前 %d 层, 白化 %d → %s\n", c.n_expert, c.MID, c.D, ids_path, ntok, nlayers, c.whiten, out);
     c.ex = calloc((size_t)c.n_expert, sizeof(v41_fp_ffn));
     const size_t nD = (size_t)ntok * c.D, nU = (size_t)ntok * MAXU;
-    c.rx = malloc(nD * 4); c.ry = malloc(nD * 4); c.rrw = malloc(nU * 4); c.rsel = malloc(nU * 4); c.ralpha = malloc((size_t)ntok * 4);
-    c.hx = malloc(nD * 4); c.hy = malloc(nD * 4); c.hrw = malloc(nU * 4); c.hsel = malloc(nU * 4); c.halpha = malloc((size_t)ntok * 4);
+    /* ★第七版(--adv-list)只分配它真用的★: 钩子要 rsel/rrw/ralpha(每行几十字节), ye 走取料窗(钩子里按真实 n_used 分配,
+     * 只存生成段, bf16), 设备缓冲在 adv_run 里按封顶行数分配。通用路那套 [ntok][MAXU][D] f32 × 3 + [ntok][D] × 8
+     * 在 35k 行上是 40 GB, 模型驻留后整机只剩 ~10 GB(core_model_map.c 内存地板), 分了就把权重挤出缓存或直接 OOM。 */
+    const int adv = c.adv_list != NULL;
+    c.rrw = malloc(nU * 4); c.rsel = malloc(nU * 4); c.ralpha = malloc((size_t)ntok * 4);
+    if (!c.rrw || !c.rsel || !c.ralpha) { fprintf(stderr, "★取料元数据缓冲分配失败★\n"); return 1; }
+    if (!adv) {
+        c.rx = malloc(nD * 4); c.ry = malloc(nD * 4);
+        c.hx = malloc(nD * 4); c.hy = malloc(nD * 4); c.hrw = malloc(nU * 4); c.hsel = malloc(nU * 4); c.halpha = malloc((size_t)ntok * 4);
+        if (!c.rx || !c.ry || !c.hx || !c.hy || !c.hrw || !c.hsel || !c.halpha) { fprintf(stderr, "★取料缓冲(%.1f GB)分配失败★\n", (double)nD * 16 / 1e9); return 1; }
+    }
     c.hA = malloc((size_t)MAXK * c.D * 4); c.hB = malloc((size_t)MAXK * c.D * 4);
     c.pkA = malloc((size_t)MAXK * c.D / 32u * 17u); c.pkB = malloc((size_t)MAXK * c.D / 32u * 17u);
     c.hvf = malloc((size_t)(ntok - c.nfit + 1) * c.D * 4); c.hvt = malloc((size_t)(ntok - c.nfit + 1) * c.D * 4);
     if (!c.pkA || !c.pkB || !c.hvf || !c.hvt) { fprintf(stderr, "★fp4/val 缓冲分配失败★\n"); return 1; }
-    if (c.want_ye) {   /* [n][n_used][D] f32: 8192×6×5120×4 = 1.0 GB */
+    if (c.want_ye && adv) {
+        c.hgr = malloc((size_t)c.n_expert * c.D * 4);
+        if (!c.hgr) { fprintf(stderr, "★增益缓冲分配失败★\n"); return 1; }
+    } else if (c.want_ye) {   /* [n][n_used][D] f32: 8192×6×5120×4 = 1.0 GB */
         const size_t nyD = nU * (size_t)c.D, nsD = (size_t)c.n_expert * c.D;
         c.rye = malloc(nyD * 4); c.rysh = malloc(nD * 4);
         c.hye = malloc(nyD * 4); c.hysh = malloc(nD * 4); c.hgr = malloc(nsD * 4);
@@ -311,8 +366,8 @@ int main(int argc, char **argv) {
             cudaMalloc((void **)&c.dgr, nsD * 4) ||
             cudaMalloc((void **)&c.dgrpk, nsD / 32u * 17u)) { fprintf(stderr, "★权重侧解算设备缓冲分配失败★\n"); return 1; }
     }
-    if (cudaMalloc((void **)&c.dX, nD * 4) || cudaMalloc((void **)&c.dYq, nD * 4) || cudaMalloc((void **)&c.dYfp, nD * 4) ||
-        cudaMalloc((void **)&c.dYtmp, nD * 4) || cudaMalloc((void **)&c.dA, (size_t)MAXK * c.D * 4) || cudaMalloc((void **)&c.dB, (size_t)MAXK * c.D * 4)) {
+    if (!adv && (cudaMalloc((void **)&c.dX, nD * 4) || cudaMalloc((void **)&c.dYq, nD * 4) || cudaMalloc((void **)&c.dYfp, nD * 4) ||
+        cudaMalloc((void **)&c.dYtmp, nD * 4) || cudaMalloc((void **)&c.dA, (size_t)MAXK * c.D * 4) || cudaMalloc((void **)&c.dB, (size_t)MAXK * c.D * 4))) {
         fprintf(stderr, "★设备缓冲分配失败★\n"); return 1;
     }
     char mp[4300]; snprintf(mp, sizeof mp, "%s/manifest.txt", out);
@@ -361,8 +416,9 @@ int main(int argc, char **argv) {
                                c.sft_list, c.tau_s, c.rho_s, c.lam_s, c.base_amp ? c.base_amp : "(无)", c.base_pt ? c.base_pt : "(无)");
         else printf("[蒸馏靶] 教师锚 %s; 学生 logits = 本趟前向落盘 %s; --eta-rel %.3f\n", c.kl_ref, lp, c.eta_rel);
     }
-    if (c.sft_list) {   /* 后训练: 多条样本各取一趟料, 累积后一次解(v41_sft_run.inc.c) */
-        const int src = sft_run(&c, e, c.sft_list, out, only_layer, ntok, no_engram);
+    if (c.sft_list) {   /* 后训练: 多条样本各取一趟料, 累积后一次解(v41_sft_run.inc.c / 第七版 v41_adv_run.inc.c) */
+        const int src = c.adv_list ? adv_run(&c, e, c.adv_list, out, only_layer, ntok, no_engram)
+                                   : sft_run(&c, e, c.sft_list, out, only_layer, ntok, no_engram);
         fprintf(c.mf, "# 后训练 %s\n", src == 0 ? "完成" : "失败");
         fclose(c.mf);
         if (c.klt) v41_klt_close(c.klt);
@@ -434,4 +490,5 @@ int main(int argc, char **argv) {
 #include "v41_sft_run.inc.c"  /* 后训练第三件: 取料、清单、行表(同上) */
 #include "v41_margin_solve.inc.c" /* 后训练第三件: 决策差解算 + 主动集(用上面的 mg_acc) */
 #include "v41_margin_gen.inc.c"   /* 后训练第三件: 留一泛化尺 + 诊断(用上面的 mg_candidate) */
+#include "v41_adv_run.inc.c"      /* 后训练第七版(09-29): 优势加权自 token 靶(用上面的 mg_acc / mg_read_gr / sft_write_base) */
 #include "v41_calib_dump.inc.c"   /* 量化校准取料(--dump-calib; 单 TU 同上) */

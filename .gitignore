@@ -53,3 +53,4 @@ route_alpha_set
 
 # YoungAi 介绍片(网站+录制工具+配音)是独立的视频项目, 不进引擎仓库; 本地保留, 别 git add 进来
 /site/
+/gguf-tools/bench/posttrain_reward

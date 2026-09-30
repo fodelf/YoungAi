@@ -100,8 +100,15 @@ LOG "起服务(V4.1 纯解码)"
 # 在调用方超时那一刻就结束, 不再占着 worker。而这个上限的真实代价是它一直在**悄悄剪断正常的长报告**
 # (09-22 早盘: 事件归并写到 8192 被切, 后半张表没了, 调用方拿到半截还当成写完了)。
 # 模型要写多长由调用方的 max_tokens 和上下文说了算, 服务端不替它定。
+# ★每次起服都开 --trace★(2026-09-29, back.md §14.6 段 5): 后训练 ③ 的料是真实请求的原字节 + 引擎真吐的 token id,
+# 服务端只在 --trace 开着时才把它们落盘(server_trace.c trace_token_ids)。以前起服不带它 ⇒ 每天早盘的真实请求
+# 一个都没留下(09-23 只能事后重建)。文件按起服时刻命名(服务端 "w" 模式打开, 同名会覆盖上一趟), 路径写进
+# trace/current 给采样段读。产物进项目目录(铁律), 不进 /tmp。
+TRACE_DIR="$ROOT/gguf/v41/night/trace"; mkdir -p "$TRACE_DIR"
+TRACE_FILE="$TRACE_DIR/serve_$(date +%Y%m%d_%H%M%S).txt"
+echo "$TRACE_FILE" > "$TRACE_DIR/current"
 nohup ./ds4-server --cuda -m "$MDL" --zchain "$ZCH" --mem-budget-mb "$BUDGET_MB" \
-    --host 0.0.0.0 --port "$PORT" ${EXTRA[@]+"${EXTRA[@]}"} > "$LOGF" 2>&1 </dev/null &
+    --host 0.0.0.0 --port "$PORT" --trace "$TRACE_FILE" ${EXTRA[@]+"${EXTRA[@]}"} > "$LOGF" 2>&1 </dev/null &
 if ! wait_up 120; then
     LOG "★没起来, 日志尾:★"; tail -6 "$LOGF" | cut -c1-200
     alive && pkill -x ds4-server; exit 4

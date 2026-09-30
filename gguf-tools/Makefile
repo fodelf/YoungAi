@@ -165,6 +165,11 @@ endif
 deepseek4-quantize-cpu: $(DSQ_SRC) $(QUANTS_INC) $(DSQMAIN_INC)
 	$(CC) $(CFLAGS) $(NATIVE) $(CPPFLAGS) $(INC) -o $@ $(DSQ_SRC) -lm -pthread
 
+# posttrain_reward: 后训练 ③ 的奖励器(2026-09-29, back.md §14.5): 报告尾 JSON + 次日 OHLC → 奖励; 大盘方向对错。纯 C, 无依赖。
+posttrain_reward: $(BEN)/posttrain_reward
+$(BEN)/posttrain_reward: $(BEN)/posttrain_reward.c
+	$(CC) $(BARE) $(NATIVE) -o $@ $< -lm
+
 anchor_metrics: $(BEN)/anchor_metrics
 # 依赖里必须列上 .inc.c 与共用头: 少列一项就会"编译成功但跑的是旧二进制", 而自检照样 PASS
 # (2026-09-13 实撞: 改了 --ref-topk 的读取, make 说"无需做任何事", 自检过的是上一版)
@@ -264,7 +269,7 @@ $(AMP)/v41_route_solve.o: $(AMP)/v41_route_solve.cu $(AMP)/v41_route_solve.h
 # ★依赖必须列全所有 .inc.c 与共用头★(2026-09-13 两次实撞): 漏一项 make 就说"无需做任何事",
 # 跑的是旧二进制, 而且不会报错 —— 第一次是判决器(自检照样 PASS), 第二次是这里(新加的 @行号文件
 # 写法旧二进制不认识, 报的却是"行段不合法", 查了半天才发现是二进制没换)。
-$(AMP)/v41_amp_run.o: $(AMP)/v41_amp_run.c $(AMP)/v41_calib_dump.inc.c $(QZ)/v41_calib.h $(AMP)/v41_gr_run.inc.c $(AMP)/v41_amp_lowrank.inc.c $(AMP)/v41_sft_run.inc.c $(AMP)/v41_margin_solve.inc.c \
+$(AMP)/v41_amp_run.o: $(AMP)/v41_amp_run.c $(AMP)/v41_calib_dump.inc.c $(QZ)/v41_calib.h $(AMP)/v41_gr_run.inc.c $(AMP)/v41_amp_lowrank.inc.c $(AMP)/v41_sft_run.inc.c $(AMP)/v41_margin_solve.inc.c $(AMP)/v41_adv_run.inc.c \
                       $(AMP)/v41_margin_gen.inc.c $(AMP)/v41_fp_bind.inc.c $(AMP)/v41_rb_run.inc.c $(AMP)/v41_route_solve.h \
                       $(AMP)/v41_fp_moe.h $(AMP)/v41_kl_target.h ../src/common/ds4_st41.h ../src/common/ds4_quantfmt.h \
                       ../src/common/ds4_etgd.h ../src/common/ds4_gr_fnv.h ../src/common/ds4_gguf.h ../ds4.h ../ds4_v41_api.h
@@ -512,6 +517,7 @@ tools-test:
 	$(CC) $(CFLAGS) $(NATIVE) $(INC) -DCALIBDIAG_TEST $(CAL)/calib_diag.c $(AMP)/hiddenvar_solve.c $(AMP)/linalg_small.c -o $(BUILD)/calibdiag_test -lm -pthread && $(BUILD)/calibdiag_test
 	$(CC) $(CFLAGS) $(NATIVE) $(INC) -DRRR_TEST     $(AMP)/solve_rrr.c $(AMP)/hiddenvar_solve.c $(AMP)/linalg_small.c -o $(BUILD)/rrr_test -lm -pthread && $(BUILD)/rrr_test
 	$(CC) $(CFLAGS) $(NATIVE) $(INC) -DV41_VQ3_TEST $(QZ)/v41_vq3_bits.c -o $(BUILD)/vq3_bits_test -lm && $(BUILD)/vq3_bits_test
+	$(CC) $(CFLAGS) $(NATIVE) $(INC) -DPOSTTRAIN_REWARD_TEST $(BEN)/posttrain_reward.c -o $(BUILD)/posttrain_reward_test -lm && $(BUILD)/posttrain_reward_test
 
 # 旧名别名(保留一版, 下一轮清)
 go-onebit-test: tools-test

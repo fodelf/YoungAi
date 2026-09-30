@@ -51,6 +51,11 @@ int v41_klt_target(v41_klt *k, const char *ref_path, const char *stu_path, const
 int v41_klt_margin_dirs(v41_klt *k, const int *a, const int *b, const float *alpha, const float *inv,
                         int n, int D, float *dC);
 
+/* ★第七版(2026-09-29)的方向表★: 自 token 减该位榜上期望 —— C[i][d] = α_i·inv_i·γ[d]·(W[a_i][d] − Σ_q p_iq W[ids_iq][d]),
+ * 即 log p(a_i) 对本层输出的精确线性化。dIds/dPs = top-K 表的 id 与概率列(设备 [n][K])。a_i<0 整行写 0。返回 0 成功。 */
+int v41_klt_own_dirs(v41_klt *k, const int *a, const int *dIds, const float *dPs, const float *alpha, const float *inv,
+                     int n, int K, int D, float *dC);
+
 /* ★主动集扫榜★: 给定这一版修正让本层输出挪了多少(dY[n][D], 设备), 算出榜上每个 token 的
  * logit 各动了多少 dLogit[n][K](设备)。dIds[n][K] 是 top-K 表的 id 列(设备)。
  * 用途: 每行只钉一对不够 —— 钉住的那对分毫不差, 冒头的却是第三个 token(09-13 实测 37% 的位置

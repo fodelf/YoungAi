@@ -48,7 +48,7 @@ rsync -az --delete \
     `# 一次同步就把判决链的 wt2 那一趟弄挂了(已加载的进程不受影响, 所以只有后起的那一趟失败, 更难看出来)。` \
     --exclude 'gguf-tools/quantize/libv41vq.so' --exclude 'gguf-tools/quantize/*.so' \
     --exclude 'gguf-tools/quantize/deepseek4-quantize' --exclude 'gguf-tools/dspark_align' \
-    --exclude 'gguf-tools/amp/v41_amp_run' --exclude 'gguf-tools/amp/finetune_solve' \
+    --exclude 'gguf-tools/amp/v41_amp_run' --exclude 'gguf-tools/amp/finetune_solve' --exclude 'gguf-tools/bench/posttrain_reward' \
     --exclude 'speed-bench' --exclude 'reports' --exclude 'notes' \
     ./ "$REMOTE:$RDIR/" || { echo "★rsync 失败★"; exit 1; }
 # ★speed-bench 的脚本要单独推一遍★(2026-09-16): 上面整目录排除了 speed-bench —— 因为那边放着几份
@@ -65,8 +65,8 @@ fi
 if [ "$WHAT" = tools ] || [ "$WHAT" = all ]; then
     # ★两个都要编★(2026-09-13 实撞): 只编了判决器, 解算器还是旧二进制 —— 新加的 "@行号文件"
     # 写法它不认识, 报的却是"行段不合法", 查了半天才发现是二进制没换。
-    echo "[sync] make -C gguf-tools anchor_metrics v41_amp_run"
-    ssh "$REMOTE" "cd $RDIR && set -o pipefail && make -C gguf-tools anchor_metrics 2>&1 | tail -3 && make -C gguf-tools v41_amp_run 2>&1 | tail -3" \
+    echo "[sync] make -C gguf-tools anchor_metrics v41_amp_run posttrain_reward"
+    ssh "$REMOTE" "cd $RDIR && set -o pipefail && make -C gguf-tools anchor_metrics 2>&1 | tail -3 && make -C gguf-tools v41_amp_run 2>&1 | tail -3 && make -C gguf-tools posttrain_reward 2>&1 | tail -2" \
         || { echo "★工具编译失败★"; exit 1; }
 fi
 echo "[sync] 完成"
