@@ -8676,3 +8676,9 @@ FP 在这条轨迹上的一般保真与学生逐桶相当(p(真吐) 逐桶差 <0
 4. **根治**: 量化与反修的加权从激活能量换成对输出分布的敏感度(KL/Fisher 权), 让低能量决策方向不被抹平 —— 算法层, 比换料重。
 5. **默认思考关闭后的欠账**: 非思考模式的长生成(CFO 报告直接写)一次没量过停不停; 官方 API 对裸请求的默认思考档没核对; 关默认只是把入口关掉。
 尺与料都在: `v41_judge.sh <ids> N engine:<gguf>[:<反修>]` / `file:<量化目录>`, `bugmd_ids_tools.py anchor-faith|tokprobe|faith|loopstat`, `bugmd_gates_spark.sh scoreids|engref`, `docend_corpus_build.sh`; 锚在 spark `gguf/v41judge/`(s1 47.5k 四份 + docend 三份)。
+
+**构建 / 发布 / 提交(13:18~13:34)**: Mac `make` + `make test` 全绿(linecount ok / ds4_unit ok / ds4 tests ok, 真模型套件 SKIP); `sync_spark.sh engine` 全量重编;
+起服冒烟: 裸请求(model=ds4, 无思考字段)trace `think_mode: none`、直接出正文; 显式 `reasoning_effort: high` → `think_mode: high`、出 reasoning_content。
+HF: spark 直连 HF 又握手断(脚本仍报成"没登录", 真因同 09-28), 走 Mac 反向隧道 17897(本机代理 7897)推: `small` 30 s SMALL_DONE, `verify` 391 个文件逐个同大小, HF 提交 fcd0768a;
+线上 bin/ds4 13,946,728 B(sha256 c03be9b4…) / bin/ds4-server 14,907,816 B(21ba59da…), README 双语带"默认不思考"段。
+本地提交六个(restructure 分支): 9b3d2d9 core 索引草稿按行 / 6c6f174 默认不思考 / 57b0b31 尺与工具 / 7ebb6e5 后训练 demo 链 / edd43a7 speed-bench / 3781107 fable5; 工作区只剩用户的 img.jpeg。
