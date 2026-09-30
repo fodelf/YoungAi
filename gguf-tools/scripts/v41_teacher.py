@@ -21,6 +21,7 @@ memmap 按行取。取到的行与 C 读器逐位对拍过(v41_dequant_parity.py
       ids 文件: 一行一个 token id(与本仓 wt2.ids 同格式)
 """
 import json
+import math
 import struct
 import sys
 import time
@@ -65,6 +66,11 @@ def main():
         raise SystemExit("★量化目录上反修必须给 --fp-dir: 靶 y_fp(x_q) 的 FP 权重不在量化目录里★")
 
     import model as M
+    # ★出口只要 logits, 不要官方 sample()★(2026-09-30 实撞): 官方 forward 末尾 `sample(logits, temperature)` 在温度 > 0 时做
+    # `logits / t` 与 `softmax(dtype=float32)` 两份全词表副本 —— 47,500 位的判决料 logits 本身 24.6 GB, 三份 74 GB, 40 层刚跑完
+    # 就把 121 GB 机器压到 available 5 GB, 看门狗把 31 分钟的教师前向杀在出口(24,400 位时三份 38 GB 才没撞)。
+    # 这里把它换成 argmax(零副本): output_ids 教师端从不使用, logits 一个字节不变。
+    M.sample = lambda logits, temperature=1.0: logits.argmax(dim=-1)
 
     dev = "cuda"
     tbl = torch.tensor(FP4_TABLE, dtype=torch.float32, device=dev)
@@ -495,7 +501,14 @@ def main():
     print(f"  末位 top5: {lg[-1].float().topk(5).indices.tolist()}")
     # teacher-forcing 的 PPL: 第 i 位的 logits 预测第 i+1 个 token
     tgt = torch.tensor(ids[1:], device=lg.device)
-    ppl = F.cross_entropy(lg[:-1].float(), tgt).exp().item()
+    # 分块算 CE(2026-09-30): 整段一次 cross_entropy 内部再开一份 [S][V] 的 log_softmax 临时张量(47,500 位 = 24.6 GB); 分块求和
+    # 再除以位数, 数值同一个公式(reduction="sum" 逐块加), 峰值只多一块。
+    CHUNK = 2048
+    ce_sum = 0.0
+    for i0 in range(0, lg.shape[0] - 1, CHUNK):
+        i1 = min(lg.shape[0] - 1, i0 + CHUNK)
+        ce_sum += F.cross_entropy(lg[i0:i1].float(), tgt[i0:i1], reduction="sum").item()
+    ppl = math.exp(ce_sum / (lg.shape[0] - 1))
     print(f"  ★PPL(本段 {len(ids)} token) = {ppl:.4f}★")
     if a.dump_act and act:
         ks = sorted(act)
@@ -529,7 +542,10 @@ def main():
         # 逐式同源 —— 判决器只许有一份。
         with open(a.out, "wb") as f:
             f.write(struct.pack("<ii", lg.shape[0], lg.shape[1]))
-            lg.float().cpu().numpy().tofile(f)
+            # 分块落盘(2026-09-30): `lg.float().cpu().numpy()` 是整份 [S][V] 的主机副本(47,500 位 = 24.6 GB), 与出口那份加起来正是
+            # 看门狗停车的那一下; 按 2048 行一块搬, 文件字节逐位同(同一份 float32, 同一个顺序)。
+            for i0 in range(0, lg.shape[0], 2048):
+                lg[i0:i0 + 2048].float().cpu().numpy().tofile(f)
         print(f"  → {a.out} (S={lg.shape[0]} V={lg.shape[1]})")
 
 

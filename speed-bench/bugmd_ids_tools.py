@@ -12,6 +12,10 @@
                                           按生成段每 1000 位的一致率。位置 i 的 top-1 预测的是 ids[i+1]。
   eos-scan <topk.bin> <ids> <n_prompt> [tok=1]
                                           生成段逐位找 EOS 的排名与概率: 分清"模型想停引擎没听"和"模型自己不想停"。
+  loopstat <gen.ids> [think.txt]          采样样本的复读环形态(按 token id, 不按字): 入环位 / 周期 / 逃出窗数 / 末段去重 / 挣扎收尾短语数。
+  faith <topk.bin> <ids> <n_prompt> [入环位=0]
+                                          采样序列上判"采样器忠不忠"(Σp(top-1) vs 真吐==top-1 次数, 每 4096 位一桶)与
+                                          "模型想不想收口"(</think>·EOS 的 Σp 对观测抽到次数); 采样路没有逐字节门, 这是它的门。
 """
 import struct
 import sys
@@ -207,9 +211,165 @@ def cmd_rows(rows_path, ids_path, n_prompt, entry_pos, tokenizer_json="", window
         print("  %6d | %-22s | %-22s | %-22s | %.3f %s" % (p, txt(nx), txt(r[5]), txt(r[6]), r[0], "" if r[5] == nx else "★老师不同"))
 
 
+def cmd_loopstat(gen_ids_path, think_txt=""):
+    """采样样本的复读环形态(2026-09-30, 601069 seed 1): 每 256 位窗口取最佳周期(1~64)的逐位复读率 mean(ids[i]==ids[i-p]) →
+    入环位 = 首个 ≥0.9 的窗, 逃出 = 入环后复读率 <0.5 的窗数; 再报末 8192 位去重数与前三 id 占比、每 2048 位桶的复读率曲线与桶首 512 位去重数。
+    为什么按 id 不按字: 环是 3~9 个 token 的且有变体([e]/[E]/[Produce] 轮着出), 字级 4-gram 尺(loop_start_segments)判它是"无死循环"。
+    给 think.txt 时再数"挣扎收尾"短语(Now finish / Halt. / Produce final answer …): 这是模型知道该停却闭合不了思考块的指纹。"""
+    import re
+    from collections import Counter
+    ids = [int(x) for x in open(gen_ids_path).read().split()]
+    W, PMAX = 256, 64
+    prof = []
+    for lo in range(0, len(ids) - W + 1, W):
+        best = (0.0, 0)
+        for p in range(1, min(PMAX, lo) + 1):
+            fr = sum(1 for i in range(lo, lo + W) if ids[i] == ids[i - p]) / W
+            if fr > best[0]: best = (fr, p)
+        prof.append((lo, best[0], best[1]))
+    locked = [w for w in prof if w[1] >= 0.9]
+    entry = locked[0][0] if locked else None
+    escapes = sum(1 for w in prof if entry is not None and w[0] > entry and w[1] < 0.5)
+    tail = Counter(ids[-8192:]); top3 = tail.most_common(3)
+    print("生成 %d 位, 特殊 token(≥128000) %d 个, 末 id %d; 锁死窗(复读率≥0.9) %d/%d, 入环位 %s, 入环后逃出窗 %d; 末 8192 位去重 %d, 前三 id 占 %.0f%%" % (
+        len(ids), sum(1 for t in ids if t >= 128000), ids[-1] if ids else -1, len(locked), len(prof), entry, escapes, len(tail),
+        100.0 * sum(n for _, n in top3) / max(1, min(8192, len(ids)))))
+    for b0 in range(0, len(ids), 2048):
+        ws = [w for w in prof if b0 <= w[0] < b0 + 2048]
+        if not ws: continue
+        mx = max(ws, key=lambda w: w[1])
+        print("  %6d~%6d  复读率 max %.2f(周期 %2d) min %.2f  桶首 512 位去重 %d" % (b0, b0 + 2047, mx[1], mx[2], min(w[1] for w in ws), len(set(ids[b0:b0 + 512]))))
+    if think_txt:
+        t = open(think_txt, encoding="utf-8", errors="replace").read()
+        pat = re.compile(r"(Now finish|Let's finish|must finish|I must stop|Stop\.|Halt\.|[Pp]roduce final answer|Enough[.!]|stuck in a loop|trapped|runaway)")
+        ms = list(pat.finditer(t))
+        print("  思考 %d 字, 挣扎收尾短语 %d 句, 首现字符 %s" % (len(t), len(ms), ms[0].start() if ms else "无"))
+
+
+def cmd_faith(topk_path, ids_path, n_prompt, entry="0"):
+    """采样序列上判"采样器忠不忠 / 模型想不想收口"(2026-09-30, 601069 seed 1 思考段复读环; 采样路没有逐字节门):
+      ① 每 4096 生成位: Σp(top-1) vs 真吐==top-1 次数 —— 忠实采样只差二项噪声 σ=√Σp(1−p), 超 3σ 就是采样器没按分布抽;
+      ② </think>(128822) 与 EOS(1) 在生成段的 进 top-K 次数 / Σp / 单位最大 p, 对观测抽到次数 —— 观测 0 次时忠实采样下的概率 = exp(−Σp);
+      ③ 入环位(生成段序号)前后 p(真吐)/p(top-1) 的分位数与 ≥1e-4 候选数 —— 锁死的是不是模型自己的分布。
+    只算进 top-K 的质量(K=32 平均覆盖 0.985): Σp 是下界, "K 外"是没算进去的位数。位置 i 的行预测 ids[i+1]。"""
+    import math
+    ids = [int(x) for x in open(ids_path).read().split()]
+    n_prompt, entry = int(n_prompt), int(entry)
+    f = open(topk_path, "rb")
+    magic, K, S, V = struct.unpack("<4I", f.read(16))
+    assert magic == 0x44475445, "不是 ETGD 文件"
+    row = struct.Struct("<Iiff" + "%di" % K + "%df" % K)
+    g0 = n_prompt - 1
+    buckets = {}; close = {128822: [0, 0.0, 0.0, -1], 1: [0, 0.0, 0.0, -1]}   # 进 top-K 次数, Σp, 最大 p, 最大 p 的生成位
+    after, pre = [], []
+    while True:
+        buf = f.read(row.size)
+        if len(buf) < row.size: break
+        v = row.unpack(buf); i = v[0]
+        if i < g0 or i + 1 >= len(ids): continue
+        tid, pr = v[4:4 + K], v[4 + K:4 + 2 * K]
+        j = max(range(K), key=lambda q: pr[q]); p1 = pr[j]; y = ids[i + 1]
+        py = next((pr[q] for q in range(K) if tid[q] == y), None)
+        gpos = i - g0
+        b = buckets.setdefault(gpos // 4096, [0.0, 0, 0, 0, 0.0])   # Σp1, hit1, n, K外, Σp1(1−p1)
+        b[0] += p1; b[2] += 1; b[1] += tid[j] == y; b[3] += py is None; b[4] += p1 * (1.0 - p1)
+        for t, c in close.items():
+            for q in range(K):
+                if tid[q] == t:
+                    c[0] += 1; c[1] += pr[q]
+                    if pr[q] > c[2]: c[2], c[3] = pr[q], gpos
+        nk = sum(1 for q in range(K) if pr[q] >= 1e-4)
+        (after if gpos >= entry else pre).append((py if py is not None else 0.0, p1, nk))
+    print("ETGD K=%d; 生成 %d 位(提示 %d), 入环位 %d" % (K, len(ids) - n_prompt, n_prompt, entry))
+    print("① 每 4096 生成位: Σp(top-1) | 真吐==top-1 | σ=√Σp(1−p) | 真吐落 top-K 外")
+    for b in sorted(buckets):
+        s, h, n, out, var = buckets[b]
+        sigma = math.sqrt(max(var, 1e-9))
+        print("  %6d~%6d  Σp1=%8.1f  hit1=%6d  σ=%5.1f  偏 %+5.1fσ  K外=%4d%s" % (b * 4096, b * 4096 + 4095, s, h, sigma, (h - s) / max(sigma, 1.0), out,
+              "  ★超 3σ★" if abs(h - s) > 3 * max(sigma, 1.0) else ""))
+    for t, name in ((128822, "</think>"), (1, "EOS")):
+        c = close[t]
+        print("② %-9s 进 top-K %4d 位, Σp=%.4f, 最大 p=%.5f(生成第 %d 位); 观测抽到 %d 次; 忠实采样下抽到 0 次的概率 exp(−Σp)=%.3f" % (
+            name, c[0], c[1], c[2], c[3], sum(1 for x in ids[n_prompt:] if x == t), math.exp(-c[1])))
+    def q(xs, k, fr):
+        xs = sorted(x[k] for x in xs); return xs[min(len(xs) - 1, int(fr * len(xs)))] if xs else float("nan")
+    for name, xs in (("入环后", after), ("入环前", pre)):
+        if xs: print("③ %s %d 位: p(真吐) 分位 10/50/90 = %.3f/%.3f/%.3f; p(top-1) = %.3f/%.3f/%.3f; ≥1e-4 候选数中位 %d" % (
+            name, len(xs), q(xs, 0, .1), q(xs, 0, .5), q(xs, 0, .9), q(xs, 1, .1), q(xs, 1, .5), q(xs, 1, .9), q(xs, 2, .5)))
+
+
+def cmd_anchor_faith(anchor_path, ids_path, n_prompt, entry="0", tok="128822"):
+    """FP 教师锚(anchor_metrics 的 <i32 S><i32 V><f32 logits[S][V]>)上做与 faith 同一张表(2026-09-30):
+    每 4096 生成位: FP argmax == 真吐 的命中率 / mean p_FP(真吐) / Σp_FP(收口 token) / 最大 p; 全段 Σp、最大 p 与位置。
+    为什么要它: 学生(引擎 top-32)上 </think> 全程 Σp 只有 0.39, 要分清"量化压没了"还是"FP 也不给", 只能读 FP 在同一条序列同一批位置的概率。
+    逐行 seek 读, 不把 24 GB 锚整份装进内存。位置 i 的行预测 ids[i+1]。"""
+    import math
+    import numpy as np
+    ids = [int(x) for x in open(ids_path).read().split()]
+    n_prompt, entry, tok = int(n_prompt), int(entry), int(tok)
+    f = open(anchor_path, "rb")
+    S, V = struct.unpack("<ii", f.read(8))
+    g0 = n_prompt - 1
+    print("锚 S=%d V=%d; 生成段可比 %d 位(提示 %d), 入环位 %d, 收口 token %d" % (S, V, min(S, len(ids) - 1) - g0, n_prompt, entry, tok))
+    buckets = {}; tot = [0.0, 0.0, -1]; after_p1 = []; pre_p1 = []
+    for i in range(g0, min(S, len(ids) - 1)):
+        f.seek(8 + i * V * 4)
+        row = np.frombuffer(f.read(V * 4), dtype=np.float32).astype(np.float64)
+        m = row.max(); ex = np.exp(row - m); Z = ex.sum()
+        p = ex / Z
+        y = ids[i + 1]; a = int(row.argmax()); gpos = i - g0
+        b = buckets.setdefault(gpos // 4096, [0, 0, 0.0, 0.0, 0.0, 0.0])   # n, hit, Σp(y), Σp(tok), max p(tok), Σp(argmax)
+        b[0] += 1; b[1] += a == y; b[2] += p[y]; b[3] += p[tok]; b[4] = max(b[4], p[tok]); b[5] += p[a]
+        tot[0] += p[tok]
+        if p[tok] > tot[1]: tot[1], tot[2] = p[tok], gpos
+        (after_p1 if gpos >= entry else pre_p1).append(p[a])
+    print("每 4096 生成位: FP argmax==真吐 | mean p_FP(真吐) | mean p_FP(argmax) | Σp_FP(收口) | 最大 p_FP(收口)")
+    for k in sorted(buckets):
+        n, h, sy, st, mx, sa = buckets[k]
+        print("  %6d~%6d  命中 %5.1f%%  p(y) %.3f  p(top1) %.3f  Σp(收口) %.4f  max %.5f" % (k * 4096, k * 4096 + 4095, 100.0 * h / n, sy / n, sa / n, st, mx))
+    print("全段 Σp_FP(收口 %d) = %.4f, 最大 %.5f(生成第 %d 位); 忠实采样下抽到 0 次的概率 exp(−Σp)=%.3f" % (tok, tot[0], tot[1], tot[2], math.exp(-tot[0])))
+    def q(xs, fr):
+        xs = sorted(xs); return xs[min(len(xs) - 1, int(fr * len(xs)))] if xs else float("nan")
+    for name, xs in (("入环后", after_p1), ("入环前", pre_p1)):
+        if xs: print("  %s %d 位: FP p(top-1) 分位 10/50/90 = %.3f/%.3f/%.3f" % (name, len(xs), q(xs, .1), q(xs, .5), q(xs, .9)))
+
+
+def cmd_tokprobe(anchor_path, ids_path, tok="1", n_prompt="0"):
+    """决策 token 的定向压制尺(2026-09-30, 用户"先 1": 证明'决策 token 被量化压掉'不是思考专属):
+    在 anchor 格式(<i32 S><i32 V><f32 logits>)上, 对【真值下一个 token 就是 tok】的每个位置(如整篇文档末尾的 EOS、思考段末尾的 </think>)
+    打印 p(tok) 与名次; 汇总几何均值 / 中位; 再报其余位置(真值不是 tok)上 p(tok) 的均值 = 假停质量。
+    同一份 ids 对 FP 锚与学生锚各跑一遍, 两份几何均值之比 = 该决策 token 被压了几倍(FP/学生)。"""
+    import math
+    import numpy as np
+    ids = [int(x) for x in open(ids_path).read().split()]
+    tok, n_prompt = int(tok), int(n_prompt)
+    f = open(anchor_path, "rb")
+    S, V = struct.unpack("<ii", f.read(8))
+    hits, other_sum, other_n = [], 0.0, 0
+    for i in range(max(0, n_prompt - 1), min(S, len(ids) - 1)):
+        y = ids[i + 1]
+        if y != tok and (i % 8) != 0: continue        # 非命中位每 8 位抽一个算假停质量, 省读盘
+        f.seek(8 + i * V * 4)
+        row = np.frombuffer(f.read(V * 4), dtype=np.float32).astype(np.float64)
+        m = row.max(); ex = np.exp(row - m); p = ex / ex.sum()
+        if y == tok:
+            rank = int((p > p[tok]).sum()) + 1
+            hits.append((i, float(p[tok]), rank, int(row.argmax()), float(p[row.argmax()])))
+        else:
+            other_sum += p[tok]; other_n += 1
+    print("锚 %s: S=%d; 真值==%d 的位置 %d 处; 其余位置(抽样 %d)上 p(%d) 均值 %.2e" % (anchor_path.split("/")[-1], S, tok, len(hits), other_n, tok, other_sum / max(other_n, 1)))
+    for i, pt, rank, a, pa in hits:
+        print("  位置 %6d  p(tok)=%.4f  名次 %3d  argmax=%d(p=%.3f)%s" % (i, pt, rank, a, pa, "  ★tok 就是 argmax★" if a == tok else ""))
+    if hits:
+        ps = [h[1] for h in hits]
+        gm = math.exp(sum(math.log(max(x, 1e-12)) for x in ps) / len(ps))
+        print("  几何均值 p(tok) = %.4f; 中位 %.4f; tok 是 argmax 的位置 %d/%d" % (gm, sorted(ps)[len(ps) // 2], sum(1 for h in hits if h[3] == tok), len(hits)))
+
+
 if __name__ == "__main__":
     cmds = {"extract": cmd_extract, "cut": cmd_cut, "cmp-emit": cmd_cmp_emit, "cmp-topk": cmd_cmp_topk,
-            "eos-scan": cmd_eos_scan, "rows": cmd_rows}
+            "eos-scan": cmd_eos_scan, "rows": cmd_rows, "loopstat": cmd_loopstat, "faith": cmd_faith,
+            "anchor-faith": cmd_anchor_faith, "tokprobe": cmd_tokprobe}
     if len(sys.argv) < 2 or sys.argv[1] not in cmds:
         sys.exit(__doc__ + "  rows <rows.txt> <ids> <n_prompt> <入口位置> [tokenizer.json] [窗口=12]   --row-out 的分桶命中率 + 入口逐行解码\n")
     cmds[sys.argv[1]](*sys.argv[2:])

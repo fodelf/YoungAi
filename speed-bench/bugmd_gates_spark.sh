@@ -17,7 +17,7 @@
 # 出错会怎样: 二进制不在 = 直接退; 看门狗 available < 8 GB 杀 ds4(与 v41_engine_parity_spark.sh 同一条线)。
 set -uo pipefail
 ROOT="$HOME/ds4-main"; cd "$ROOT" || exit 1
-STAGE="${1:?prep|ced|fast|parity|full|nograph|statecmp|stopgate}"
+STAGE="${1:?prep|ced|fast|parity|full|nograph|statecmp|stopgate|scoreids|engref}"
 MODEL="$ROOT/gguf/v41/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf"
 AMP="$ROOT/gguf/v41/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-vqfin41_vqhalf_a_n8192-engine"
 OUT=/tmp/bugmd; mkdir -p "$OUT"
@@ -29,7 +29,11 @@ OUT=/tmp/bugmd; mkdir -p "$OUT"
 TOOLS="$ROOT/speed-bench/bugmd_ids_tools.py"
 TRACE=/tmp/ds4-trace-e0.txt
 LOG(){ echo "[bugmd $(date '+%H:%M:%S')] $*"; }
-watchdog(){ while sleep 10; do av=$(free -g | awk '/^内存|^Mem/{print $7}'); if [ "${av:-99}" -lt 8 ]; then echo "★看门狗: available ${av}G < 8G, 停车★" | tee -a "$OUT/mem.log"; pkill -f "ds4[.a-z]* -m .*gguf/v41[/]"; return 1; fi; done; }
+# 红线与 serve_1m_spark.sh 的 WD_KILL_MB 同口径(2500 MB, 连续两次): 09-30 实撞 —— 原来的 8 GB 线是 09-21 写的, 而 113.6 GB 的 v3
+# 装完后 CLI 打分的稳态余量本来就只有 ~7 GB(服务端生成中 6.0~6.3 GB 也是这个量级), 79k token 的重打分跑到第 7 块就被自己的线误杀。
+watchdog(){ local low=0; while sleep 5; do av=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
+  if [ "${av:-99999}" -lt 2500 ]; then low=$((low + 1)); else low=0; fi
+  if [ $low -ge 2 ]; then echo "★看门狗: MemAvailable ${av} MB < 2500, 连续两次, 停车★" | tee -a "$OUT/mem.log"; pkill -f "ds4[.a-z]* -m .*gguf/v41[/]"; return 1; fi; done; }
 watchdog & WD=$!; trap 'kill $WD 2>/dev/null' EXIT
 pgrep -x ds4-server >/dev/null && { LOG "★ds4-server 还在跑, 先停★"; exit 1; }
 
@@ -195,5 +199,39 @@ stopgate)
   LOG "打分 rc=$? $(grep -a -h '完成\|PPL\|★' "$OUT/$tag.score.log" | tail -2 | tr '\n' ' ')"
   python3 "$TOOLS" cmp-topk  "$OUT/$tag.top10.bin" "$OUT/$tag.full.ids" "$NP" | tee "$OUT/$tag.parity"
   python3 "$TOOLS" eos-scan  "$OUT/$tag.top10.bin" "$OUT/$tag.full.ids" "$NP" | tee "$OUT/$tag.eos" ;;
-*) echo "用法: $0 prep|ced|fast|parity|full <提示文件> [上限]|nograph <提示文件> [上限]|statecmp <ids> [N]|stopgate <提示ids> [上限]"; exit 2;;
+scoreids)
+  # ★对一条已经吐出来的真实序列(提示 + 生成 id)整段重打分 top-K, 不再生成★(2026-09-30, 601069 seed 1 思考段复读环):
+  # 采样路没有逐字节门, "复读环是采样器 bug 还是模型自己锁死"只能这样判 —— 每一位上模型给 </think>(128822)/EOS(1) 多少概率,
+  # 与真吐序列里"一次也没抽到"对账: Σp 大而观测 0 = 采样器没按分布抽(引擎 bug); Σp ≈ 0 = 模型自己不想收口。
+  # 同一份 top-K 还能对 Σp(top-1) vs 真吐==top-1 的次数(忠实采样两者只差二项噪声)。
+  # --v41-chunk 512: 只省内存不改数值(09-29 预填尺四档逐字节同); 79k token 的序列按 2048 块开 logits/索引草稿会把余量压到看门狗线。
+  IDS="${2:?完整 ids(提示+生成, 每行一个)}"; NP="${3:?提示 token 数}"; K="${4:-32}"; ENTRY="${5:-0}"   # 入环位(生成段序号, loopstat 报的), 只影响 faith 的 ③ 分段
+  # 第 6 参数 = 换哪份反修目录重打分(none = 不挂): 09-30 用户令"编程域语料带英文, 试一试有没有同样的问题" —— 同一条序列
+  # 挂金融 / 编程 / 不挂三份各打一趟, 比 </think> 的概率总和与环里的锁死程度。输出按反修目录名分文件, 三份不互相覆盖。
+  AMPDIR="${6:-$AMP}"; ZC=(); [ "$AMPDIR" != none ] && ZC=(--zchain "$AMPDIR")
+  [ -s "$IDS" ] || { LOG "★没有 $IDS★"; exit 1; }
+  tag=$(basename "$IDS" .ids)_top${K}_$([ "$AMPDIR" = none ] && echo bare || basename "$AMPDIR" | sed 's/^DeepSeek-V4.1-Flash-//; s/-engine$//')
+  LOG "== scoreids $tag: $(wc -l < "$IDS") token(提示 $NP), top-$K, 块 512, 反修 ${AMPDIR}"
+  ./ds4 -m "$MODEL" "${ZC[@]}" --cuda --v41-chunk 512 \
+      --score-ids "$IDS" --score-topk "$K" "$OUT/$tag.bin" --score-no-logits > "$OUT/$tag.log" 2>&1
+  LOG "打分 rc=$? $(grep -a -h '完成\|PPL\|★\|token' "$OUT/$tag.log" | tail -2 | tr '\n' ' ')"
+  python3 "$TOOLS" cmp-topk  "$OUT/$tag.bin" "$IDS" "$NP" | tee "$OUT/$tag.parity"
+  python3 "$TOOLS" eos-scan  "$OUT/$tag.bin" "$IDS" "$NP" 1      | tee "$OUT/$tag.eos"
+  python3 "$TOOLS" eos-scan  "$OUT/$tag.bin" "$IDS" "$NP" 128822 | tee "$OUT/$tag.thinkend"
+  python3 "$TOOLS" faith     "$OUT/$tag.bin" "$IDS" "$NP" "$ENTRY" | tee "$OUT/$tag.faith" ;;
+engref)
+  # ★引擎 vs 参考实现, 同一份量化权重, 逐位对拍★(2026-09-30): 学生 = 裸引擎 --score-ids 全 logits(anchor_metrics 的 <S><V><f32> 格式);
+  # 参考 = v41_judge.sh file: 档产的落盘学生(官方 model.py 读同一份量化权重)。同权重只差实现 ⇒ KLD / same-top 按位置分桶掉下来 = 引擎在
+  # 那一段走样, 不掉 = 引擎干净。为什么要它: 引擎对参考实现的对拍以前只做到 24,400 位, 而两次思考段崩塌都在 46.9k~47.6k 位。
+  IDS="${2:?ids(行数 = 参考文件的 S)}"; REFBIN="${3:?参考实现学生 .bin}"; TAG="${4:-$(basename "$IDS" .ids)}"; NP="${5:-1}"; ENTRY="${6:-0}"
+  [ -s "$IDS" ] && [ -s "$REFBIN" ] || { LOG "★缺 $IDS 或 $REFBIN★"; exit 1; }
+  STU="$ROOT/gguf/v41judge/stu_${TAG}_eng_bare.bin"
+  LOG "== engref $TAG: 裸引擎全 logits $(wc -l < "$IDS") 位(块 512) → $STU"
+  ./ds4 -m "$MODEL" --cuda --v41-chunk 512 --score-ids "$IDS" --score-out "$STU" > "$OUT/$TAG.engbare.log" 2>&1
+  LOG "打分 rc=$? $(grep -a -h 'PPL\|★' "$OUT/$TAG.engbare.log" | tail -1)"
+  [ -s "$STU" ] || exit 1
+  LOG "== anchor_metrics: 参考 $(basename "$REFBIN") vs 引擎裸"
+  ./gguf-tools/bench/anchor_metrics --ref-raw "$REFBIN" --ids "$IDS" --student "$STU" --row-out "$OUT/$TAG.engref.rows" | tee "$OUT/$TAG.engref.metrics"
+  python3 "$TOOLS" rows "$OUT/$TAG.engref.rows" "$IDS" "$NP" "$ENTRY" | tee "$OUT/$TAG.engref.buckets" ;;
+*) echo "用法: $0 prep|ced|fast|parity|full <提示文件> [上限]|nograph <提示文件> [上限]|statecmp <ids> [N]|stopgate <提示ids> [上限]|scoreids <完整ids> <提示数> [K] [入环位] [反修目录|none]|engref <ids> <参考.bin> [标签] [提示数] [入环绝对位]"; exit 2;;
 esac
