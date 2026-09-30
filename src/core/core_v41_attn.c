@@ -136,7 +136,7 @@ static bool v41_index_source(ds4_engine *e, ds4_v41_state *st, uint32_t il, uint
     st->idx_owner = (int16_t)il;
     if (!ng) { st->idx_topk = 0; st->idx_ratio = 0; return true; }   /* 还没有任何完成的组: 本层只看窗口 */
     /* 打分草稿按本层要用的组数长(走图那条已在 capture 前按桶上限长够, 这里恒真; 见 core_v41_forward.c) */
-    if (!v41_index_scratch_prepare(st, ng)) return false;
+    if (!v41_index_scratch_prepare(st, ng, n)) return false;
     if (!v41_tproj(m, st->iq, l->indexer_attn_q_b, DS4_N_LORA_Q, (uint64_t)IH * IK, st->qrn, n, 1)) return false;
     if (!v41_rope(st->iq, st->pos, n, IH, IK, ratio, false)) return false;
     if (!ds4_gpu_v41_act_quant_fp4_tensor(st->iq, (uint64_t)n * IH, IK, 32, false)) return false;

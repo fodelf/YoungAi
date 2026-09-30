@@ -105,28 +105,31 @@ bool v41_state_alloc(ds4_v41_state *st, uint32_t cap, uint32_t ctx, uint32_t log
  * 翻倍长: 1M 一趟最多长 11 次, 每次几十毫秒的 cudaMalloc, 摊到几万步里看不见。
  * ★捕获态下不许分配★(CUDA graph 捕获期间任何 cudaMalloc 都让捕获作废): 走图那条在 capture_begin 之前
  * 按桶上限先长够(core_decode_graph.c dg_capture), 与 attn/候选块暂存同一套做法; 这里撞见 st->graph 就是 bug, 直接喊。 */
-bool v41_index_scratch_prepare(ds4_v41_state *st, uint32_t ng_need) {
-    if (ng_need <= st->iscap && st->iscore && st->cand) return true;
-    if (st->graph) {
-        fprintf(stderr, "ds4: ★捕获态下要长索引草稿(要 %u 组, 现有 %u) —— 图那条应当在 capture 前长够, 这是 bug★\n",
-                ng_need, st->iscap);
-        return false;
-    }
+bool v41_index_scratch_prepare(ds4_v41_state *st, uint32_t ng_need, uint32_t rows_need) {
+    if (ng_need <= st->iscap && rows_need <= st->isrows && st->iscore && st->cand) return true;
+    if (st->graph) {   /* 图那条应当在 capture 前长够(core_decode_graph.c), 这里撞见就是 bug */
+        fprintf(stderr, "ds4: ★捕获态下要长索引草稿(要 %u 行 × %u 组, 现有 %u × %u)★\n", rows_need, ng_need, st->isrows, st->iscap); return false; }
     uint32_t want = st->iscap ? st->iscap * 2u : ng_need;
     if (want < ng_need) want = ng_need;
     if (want > st->ctx) want = st->ctx;
+    /* ★行数按这一趟真要写的行开, 不按 cap_tok★(2026-09-29 实撞, fable5 09-29 深夜): 以前恒按 2048 行分而解码每步只写 1~7 行, 这台机器
+     * cudaMalloc 分了就占(cuda_commit_probe.cu), 一条长请求每过一个 2 的幂多占一大块(65536→131072 组要一次 1.34 GB), 64.7k/79k 上下文两次被看门狗杀。
+     * 解码档一次开到验证批上限(1+block+1 行, 与 logits_rows 同源): 1→7 行之间不反复重分(重分会作废解码图)。 */
+    const uint32_t dec_rows = DS4_MTP_MAX_BLOCK + 2u;
+    uint32_t rows = rows_need <= dec_rows ? dec_rows : rows_need;
+    if (rows > st->cap_tok) rows = st->cap_tok < rows_need ? rows_need : st->cap_tok;
     bool ok = true;
-    ds4_gpu_tensor *is = v41_alloc((uint64_t)st->cap_tok * want * 4, &ok);
-    ds4_gpu_tensor *cd = v41_alloc((uint64_t)st->cap_tok * want, &ok);
+    ds4_gpu_tensor *is = v41_alloc((uint64_t)rows * want * 4, &ok);
+    ds4_gpu_tensor *cd = v41_alloc((uint64_t)rows * want, &ok);
     if (!ok) {
         if (is) ds4_gpu_tensor_free(is);
         if (cd) ds4_gpu_tensor_free(cd);
-        fprintf(stderr, "ds4: V4.1 索引草稿长不动(%u 组 × %u token)\n", want, st->cap_tok);
+        fprintf(stderr, "ds4: V4.1 索引草稿长不动(%u 组 × %u 行)\n", want, rows);
         return false;
     }
     if (st->iscore) ds4_gpu_tensor_free(st->iscore);
     if (st->cand) ds4_gpu_tensor_free(st->cand);
-    st->iscore = is; st->cand = cd; st->iscap = want; st->iscap_gen++;
+    st->iscore = is; st->cand = cd; st->iscap = want; st->isrows = rows; st->iscap_gen++;
     return true;
 }
 

@@ -158,7 +158,7 @@ static bool dg_capture(ds4_engine *e, ds4_v41_state *st, uint32_t n) {
         const uint32_t r = ds4_layer_compress_ratio(il);
         if (r && (cap + n) / r > ng_max) ng_max = (cap + n) / r;
     }
-    if (ng_max && !v41_index_scratch_prepare(st, ng_max)) return false;
+    if (ng_max && !v41_index_scratch_prepare(st, ng_max, n)) return false;
     /* 候选块暂存: 按**桶上限**那一批的组数算块数(桶里位置越靠后组越多, 捕获时就得按最大的开), n 行各一份 */
     if (g_ds4_v41.candidate_source_layer >= 0 && g_ds4_v41.candidate_block_size > 0) {
         const uint32_t cr = ds4_layer_compress_ratio((uint32_t)g_ds4_v41.candidate_source_layer);

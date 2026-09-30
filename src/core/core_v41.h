@@ -69,6 +69,7 @@ typedef struct {
                                  * 未填槽标 -1 屏蔽, 这是同一语义)。编码器层与 --decoder-full 恒 0。 */
     ds4_gpu_tensor *iq, *iw, *iscore, *cand, *idx;       /* [cap][32·128], [cap][32], [cap][iscap], u8 [cap][iscap], i32 [cap][512] */
     uint32_t iscap;             /* iscore/cand 现在按几组分的(0 = 还没分)。按用到的组数长, 不按 ctx: v41_index_scratch_prepare */
+    uint32_t isrows;            /* iscore/cand 现在按几行分的: 预填块 = cap_tok 行, 解码 = 验证批那几行(2026-09-29, 见 v41_index_scratch_prepare) */
     uint32_t iscap_gen;         /* 长一次 +1: 指针换了, 烤在解码图里的旧地址作废(core_decode_graph.c 按它重捕获) */
     ds4_gpu_tensor *o, *low, *attn_out;                  /* [cap][64·512], [cap][8192], [cap][E] */
     ds4_gpu_tensor *glog, *sel, *rw, *routed;            /* [cap][384], i32 [cap][6], [cap][6], [cap][E] */
@@ -254,7 +255,7 @@ bool v41_amp_apply(ds4_v41_state *st, uint32_t il);      /* y += x·(B·A) → b
 ds4_gpu_tensor *v41_alloc(uint64_t bytes, bool *ok);   /* 小工具: 分配失败只置 ok=false, 调用方一路攒到最后再判 */
 /* logits_rows: 0 = 按 cap 开(打分路, 每个位置都要); 生成路给 DS4_MTP_MAX_BLOCK+2(解码 1 行 / 验证批 ≤ block+1 行 / 预填块末位 1 行) */
 bool v41_state_alloc(ds4_v41_state *st, uint32_t cap_tok, uint32_t ctx, uint32_t logits_rows);
-bool v41_index_scratch_prepare(ds4_v41_state *st, uint32_t ng_need);   /* iscore/cand 长到够放 ng_need 组(够了就是 no-op) */
+bool v41_index_scratch_prepare(ds4_v41_state *st, uint32_t ng_need, uint32_t rows_need);   /* iscore/cand 长到够放 rows_need 行 × ng_need 组(够了就是 no-op) */
 void v41_state_free(ds4_v41_state *st);
 bool v41_forward(ds4_engine *e, ds4_v41_state *st, const int32_t *ids, uint32_t n);   /* 追加 n 个 token, st->logits[n][V] */
 /* 前向的主体(embed → 40 层 → 出口 head), 不含输入上传/engram 预取/末尾同步/位置推进 —— graph 捕获与直发共用这一段。
