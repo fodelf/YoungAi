@@ -15,7 +15,9 @@
  * 09-29: 改成比"发法"(引擎规则 / 一律 pipe×4 / 一律 pipe×8 / 一律 stage), R 固定 1(R>1 已判负)。逐形状 NT=1: q_b pipe 173 → stage 225 GB/s,
  *   共享专家 153 → 188, kv 124 → 160; 每步合计 引擎规则 24.35 → 全 stage 21.10 ms; NT=4 时 q_b 反而 pipe×4 快(199 vs 185)。
  *   ⇒ 引擎不再按 4~12 KB 档位定发法, 改成每 (形状, 行数) 第一次直发时自己量两种取快的(cuda_v41_q4k.inc.cu v41_q4k_pick)。
- * 用法: nvcc -O3 -arch=native -o v41_q4k_gemv_bench v41_q4k_gemv_bench.cu && ./v41_q4k_gemv_bench [iters=50] [NT=4] */
+ * 用法: nvcc -O3 -arch=native -o v41_q4k_gemv_bench v41_q4k_gemv_bench.cu && ./v41_q4k_gemv_bench [iters=50] [NT=4] [只跑第几个形状=-1 全部] [只跑第几种发法=-1 全部] [PDL 发射=0] [L2 预取试验=0]
+ *   ★后两个参数给 ncu 用(09-29 晚)★: 全跑时每个形状还会为判据②多发 NT 次单行核, k_stage/k_pipe 的发射序号随 NT 变,
+ *   靠 --launch-skip 数序号会数错核(实撞: 想量 wo_b NT=4 量到的是 wo_a 的单行核)。钉住形状与发法后 skip 5(暖身) count 1 就是那一发。 */
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -117,10 +119,21 @@ __device__ __forceinline__ static void rows_finish(float (*acc)[NT], float *out,
         }
 }
 
-/* stage: 一个 CTA 一组行(rpb = WARPS/ksplit 行, 连续一段), 整段搬进 shared 再算。blockDim = 32·WARPS/R。 */
-template <uint32_t NT, uint32_t R>
-__global__ static void __launch_bounds__(256 / R, 4 * R) k_stage(float *out, const uint8_t *w, const float *x, uint32_t in_dim,
-                                                                 uint32_t out_dim, uint32_t ksplit, uint32_t x_stride, uint32_t out_stride) {
+/* ★PDL(09-29 晚)★: 引擎里这对核是编程式发射的(权重先搬进 shared, 再 griddepcontrol.wait 等上游, 见 cuda_internal.cuh);
+ * 微基准以前是普通发射, 于是"下一发能不能趁上一发收尾时提前上车"这件事根本量不到 —— 09-29 中午发法 A/B 在引擎里翻车就是这个盲区。
+ * 这里照引擎放 wait, 之后紧跟 launch_dependents(引擎走图用的是 LaunchCompletion 端口 = 上游所有 block 都已开跑, 这里用触发来等价它)。
+ * 普通发射时两句都是空转, 老读数不变。 */
+__device__ __forceinline__ static void pdl_wait_trigger() {
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;");
+}
+/* stage: 一个 CTA 一组行(rpb = WARPS/ksplit 行, 连续一段), 整段搬进 shared 再算。blockDim = 32·WARPS/R。
+ * MINB = __launch_bounds__ 的每 SM 最少 CTA 数 = 编译器的寄存器上限(65536 / (256·MINB)): 4 ⇒ 64 个, 5 ⇒ 51(按 8 取整 48)。
+ * ★为什么要比 4 与 5★: 引擎 NT=1 只用 43 个寄存器, 每 SM 实际放得下 5 个 CTA —— 上一发还剩尾波时下一发已能占第 5 个空位预搬权重;
+ * NT≥3 编译器把 64 个用满, 空位归零, PDL 的预搬无处可放。这个假设只有带 PDL 的链式发射量得出来。 */
+template <uint32_t NT, uint32_t R, uint32_t MINB>
+__global__ static void __launch_bounds__(256 / R, MINB * R) k_stage(float *out, const uint8_t *w, const float *x, uint32_t in_dim,
+                                                                    uint32_t out_dim, uint32_t ksplit, uint32_t x_stride, uint32_t out_stride) {
     extern __shared__ uint4 st[];
     __shared__ float red[WARPS * NT];
     const uint32_t warp = threadIdx.x >> 5, rpb = WARPS / ksplit, nblk = in_dim / BLK;
@@ -128,6 +141,7 @@ __global__ static void __launch_bounds__(256 / R, 4 * R) k_stage(float *out, con
     const uint32_t r0 = blockIdx.x * rpb, nrows = out_dim - r0 < rpb ? out_dim - r0 : rpb, n16 = nrows * nblk * (BYTES / 16u);
     const uint4 *src = (const uint4 *)(w + (uint64_t)r0 * nblk * BYTES);
     for (uint32_t i = threadIdx.x; i < n16; i += blockDim.x) st[i] = __ldcs(src + i);
+    pdl_wait_trigger();
     __syncthreads();
     float acc[R][NT];
     #pragma unroll
@@ -155,6 +169,7 @@ __global__ static void __launch_bounds__(256 / R, OCC * R) k_pipe(float *out, co
     uint32_t rg = blockIdx.x, buf = 0;
     if (rg < ngrp) issue(rg, 0);
     __pipeline_commit();
+    pdl_wait_trigger();   /* 引擎同位置: 第一组权重已在飞, 这里才等上游的激活 */
     for (; rg < ngrp; rg += gridDim.x, buf ^= 1u) {
         if (rg + gridDim.x < ngrp) issue(rg + gridDim.x, buf ^ 1u);
         __pipeline_commit();
@@ -174,6 +189,34 @@ __global__ static void __launch_bounds__(256 / R, OCC * R) k_pipe(float *out, co
 
 typedef struct { const char *name; uint32_t out_dim, in_dim, per_step, groups; } shape_t;   /* groups 只用于按引擎口径算 ksplit */
 
+/* ★L2 预取存活试验(09-29 晚)★: 引擎 n=4 验证步里注意力核每层独占 ~104 µs, 零 DRAM 字节, 期间 DRAM 空转; 紧接着的 wo_a(19 MB)
+ * 要读 ~100 µs。想法 = 注意力跑的时候把 wo_a 预取进 L2(24 MB), 之后 GEMV 命中 L2。09-23 在引擎里试过一版判负(慢 1.7 ms/步):
+ * 每步多 271 个预取节点, 且消费方 __ldcs(evict-first)流式读把 L2 冲掉, 预取行等不到被用。这里先在孤立尺上回答两个问题:
+ * ①预取带 evict_last 策略、中间夹一个只算不读的核(假注意力)之后, GEMV 还命中 L2 吗(GEMV 时间掉多少) ②预取核自己要多久。
+ * 都过了才值得改引擎(预取指令放进注意力核的 block 里, 零额外节点)。 */
+__global__ static void k_prefetch(const uint8_t *p, uint64_t bytes, int how) {
+    const uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x, nth = (uint64_t)gridDim.x * blockDim.x;
+    if (how == 1) {   /* TMA 批量预取, 每线程 4 KB 一条, 带 evict_last 缓存策略 */
+        uint64_t pol; asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(pol));
+        for (uint64_t off = tid * 4096u; off < bytes; off += nth * 4096u) {
+            const uint32_t sz = (uint32_t)((bytes - off < 4096u) ? ((bytes - off) & ~15ull) : 4096u);
+            if (sz) asm volatile("cp.async.bulk.prefetch.L2.global.L2::cache_hint [%0], %1, %2;" :: "l"(p + off), "r"(sz), "l"(pol) : "memory");
+        }
+    } else {          /* 逐 128 B 线 prefetch.global.L2::evict_last */
+        for (uint64_t off = tid * 128u; off < bytes; off += nth * 128u) asm volatile("prefetch.global.L2::evict_last [%0];" :: "l"(p + off));
+    }
+}
+/* 假注意力: 先流式读一遍 scratch(模拟 KV 读 ~2 MB), 再纯算到 cycles 个时钟(模拟 ~100 µs 的零字节段) */
+__global__ static void k_dummy(const float *scratch, uint64_t n, float *sink, long long cycles) {
+    float a = 0.f;
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (uint64_t)gridDim.x * blockDim.x) a += scratch[i];
+    const long long t0 = clock64();
+    float b = a;
+    while (clock64() - t0 < cycles) { for (int k = 0; k < 64; k++) b = b * 1.000001f + 0.5f; }
+    if (b == 12345.f) *sink = b;
+}
+static int g_l2pf = 0;   /* 第 6 个参数: 0 关; 1 = TMA 批量预取; 2 = 逐线 prefetch 指令(都带 evict_last) */
+
 static uint32_t pick_ksplit(uint32_t out_dim, uint32_t groups, uint32_t nb) {   /* 引擎 v41_q4k_gemv 同式 */
     uint32_t k = 1;
     while (k < WARPS && out_dim * k * groups < 8192u) k <<= 1;
@@ -182,36 +225,59 @@ static uint32_t pick_ksplit(uint32_t out_dim, uint32_t groups, uint32_t nb) {   
 }
 
 static int g_sm = 0;
+static bool g_pdl = false;   /* 第 5 个参数: 1 = 编程式依赖发射(引擎走图的样子), 0 = 普通发射(老读数) */
+/* 发一次: 普通 <<<>>> 或带 programmaticStreamSerialization 属性(与引擎 ds4_launch_pdl 同一写法) */
+template <typename... KArgs, typename... Args>
+static void launch_k(void (*kern)(KArgs...), dim3 grid, dim3 block, size_t shm, Args... args) {
+    if (!g_pdl) { kern<<<grid, block, shm>>>(args...); return; }
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = grid; cfg.blockDim = block; cfg.dynamicSmemBytes = shm; cfg.stream = 0;
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = attr; cfg.numAttrs = 1;
+    CK(cudaLaunchKernelEx(&cfg, kern, args...));
+}
 /* 发一次. mode: 0 = 引擎规则(组 4~12 KB 走 pipe, 每 SM 4 CTA; 其余 stage); 1 = 一律 pipe, 每 SM 4 CTA; 2 = 一律 pipe, 每 SM 8 CTA;
- * 3 = 一律 stage. ★09-29★: 逐形状表说 pipe 那几个形状(q_b 172 / 共享专家 152 GB/s)与小形状 stage(kv 64 / q_a 175)离墙最远,
- * 而 ksplit 不能动(改了累加序), 能动的只有"谁常驻、驻几个、搬多深" —— 这些都不改任何一行的加法序。 */
+ * 3 = 一律 stage; 4 = 一律 stage 但 __launch_bounds__ 钉 5 CTA/SM(寄存器 ≤48); 5 = 一律 pipe 5 CTA/SM.
+ * ★09-29★: 逐形状表说 pipe 那几个形状(q_b 172 / 共享专家 152 GB/s)与小形状 stage(kv 64 / q_a 175)离墙最远,
+ * 而 ksplit 不能动(改了累加序), 能动的只有"谁常驻、驻几个、搬多深、寄存器上限" —— 这些都不改任何一行的加法序。 */
+#define NM 6
+static const char *g_mname[NM] = { "引擎规则", "pipe×4", "pipe×8", "stage", "stage×5", "pipe×5" };
 template <uint32_t NT, uint32_t R>
 static void launch(float *o, const uint8_t *w, const float *x, uint32_t in_dim, uint32_t out_dim, uint32_t ks, int mode) {
     const uint32_t nb = in_dim / BLK, rpb = WARPS / ks, ngrp = (out_dim + rpb - 1u) / rpb, grp = rpb * nb * BYTES;
     const bool eng_pipe = grp > PIPE_MIN && grp <= PIPE_MAX;
-    const bool pipe = mode == 1 || mode == 2 || (mode == 0 && eng_pipe);
+    const bool pipe = mode == 1 || mode == 2 || mode == 5 || (mode == 0 && eng_pipe);
+    const dim3 blk(256 / R);
     if (pipe) {
-        const uint32_t occ = mode == 2 ? 8u : 4u;
+        const uint32_t occ = mode == 2 ? 8u : (mode == 5 ? 5u : 4u);
         uint32_t gx = (uint32_t)g_sm * occ; if (gx > ngrp) gx = ngrp;
-        if (mode == 2) k_pipe<NT, R, 8u><<<gx, 256 / R, 2u * grp>>>(o, w, x, in_dim, out_dim, ks, in_dim, out_dim);
-        else           k_pipe<NT, R, 4u><<<gx, 256 / R, 2u * grp>>>(o, w, x, in_dim, out_dim, ks, in_dim, out_dim);
+        if (mode == 2)      launch_k(k_pipe<NT, R, 8u>, dim3(gx), blk, 2u * grp, o, w, x, in_dim, out_dim, ks, in_dim, out_dim);
+        else if (mode == 5) launch_k(k_pipe<NT, R, 5u>, dim3(gx), blk, 2u * grp, o, w, x, in_dim, out_dim, ks, in_dim, out_dim);
+        else                launch_k(k_pipe<NT, R, 4u>, dim3(gx), blk, 2u * grp, o, w, x, in_dim, out_dim, ks, in_dim, out_dim);
+    } else if (mode == 4) {
+        launch_k(k_stage<NT, R, 5u>, dim3(ngrp), blk, grp, o, w, x, in_dim, out_dim, ks, in_dim, out_dim);
     } else {
-        k_stage<NT, R><<<ngrp, 256 / R, grp>>>(o, w, x, in_dim, out_dim, ks, in_dim, out_dim);
+        launch_k(k_stage<NT, R, 4u>, dim3(ngrp), blk, grp, o, w, x, in_dim, out_dim, ks, in_dim, out_dim);
     }
 }
 
 template <uint32_t NT>
-static void run_nt(int iters) {
+static void run_nt(int iters, int only_shape, int only_mode) {
     const shape_t shapes[] = {
         {"q_b 32768x1280", 32768, 1280, 40, 1}, {"wo_a(8组之1) 1024x4096", 1024, 4096, 320, 8},
         {"wo_b 5120x8192", 5120, 8192, 40, 1}, {"q_a 1280x5120", 1280, 5120, 40, 1},
         {"shexp_gate/up 2304x5120", 2304, 5120, 80, 1}, {"shexp_down 5120x2304", 5120, 2304, 40, 1},
         {"kv 512x5120", 512, 5120, 40, 1}, {"idx_q_b 4096x1280", 4096, 1280, 8, 1},
-        {"output 129280x5120", 129280, 5120, 1, 1} };
-    const int NM = 4; const char *mname[NM] = { "引擎规则", "pipe×4", "pipe×8", "stage" };
-    double tot[NM] = {0, 0, 0, 0}, best_tot = 0, tot_bytes = 0;
-    printf("== NT=%u 行激活(µs / GB/s; 四种发法, ksplit 不变 ⇒ 全部逐位同)\n", NT);
+        {"output 129280x5120", 129280, 5120, 1, 1},
+        {"wo_a 全8组 8192x4096", 8192, 4096, 40, 1} };   /* 引擎一发 grid.y=8 组连续 19 MB, 与单矩阵 8192 行同一几何(ksplit 1, rpb 8) */
+    const char **mname = g_mname;
+    double tot[NM] = {0}, best_tot = 0, tot_bytes = 0;
+    printf("== NT=%u 行激活(µs / GB/s; %d 种发法, ksplit 不变 ⇒ 全部逐位同; %s发射)\n", NT, NM, g_pdl ? "PDL 链式" : "普通");
+    int si = -1;
     for (const shape_t &sh : shapes) {
+        if (++si != only_shape && only_shape >= 0) continue;
         const uint32_t nb = sh.in_dim / BLK, ks = pick_ksplit(sh.out_dim, sh.groups, nb), rpb = WARPS / ks;
         const uint64_t mbytes = (uint64_t)sh.out_dim * nb * BYTES;
         int ncopy = (int)((256ull << 20) / mbytes) + 1; if (ncopy > 64) ncopy = 64;   /* 轮换多份拷贝压过 L2 */
@@ -233,6 +299,7 @@ static void run_nt(int iters) {
         cudaEvent_t e0, e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
         float us[NM];
         for (int v = 0; v < NM; v++) {
+            if (only_mode >= 0 && v != only_mode) { us[v] = 1e9f; continue; }   /* 没跑的发法: 时间记成无穷, 不参与"最快" */
             for (int i = 0; i < 5; i++) launch<NT, 1>(o[v], dw[i % ncopy], dx, sh.in_dim, sh.out_dim, ks, v);
             CK(cudaEventRecord(e0));
             for (int i = 0; i < iters; i++) launch<NT, 1>(o[v], dw[i % ncopy], dx, sh.in_dim, sh.out_dim, ks, v);
@@ -248,12 +315,39 @@ static void run_nt(int iters) {
         for (int v = 0; v < NM; v++) { r[v] = (float *)malloc(on * 4); CK(cudaMemcpy(r[v], o[v], on * 4, cudaMemcpyDeviceToHost)); }
         CK(cudaMemcpy(r1, o1, on * 4, cudaMemcpyDeviceToHost));
         uint64_t bad_m = 0, bad_1 = 0;
-        for (uint64_t i = 0; i < on; i++) { for (int v = 1; v < NM; v++) if (memcmp(&r[0][i], &r[v][i], 4)) bad_m++; if (memcmp(&r[0][i], &r1[i], 4)) bad_1++; }
-        int best = 0; for (int v = 1; v < NM; v++) if (us[v] < us[best]) best = v;
+        const int ref = only_mode >= 0 ? only_mode : 0;   /* 逐位判据的参照 = 跑过的第一种发法 */
+        for (uint64_t i = 0; i < on; i++) {
+            for (int v = 0; v < NM; v++) if (v != ref && us[v] < 1e9f && memcmp(&r[ref][i], &r[v][i], 4)) bad_m++;
+            if (memcmp(&r[ref][i], &r1[i], 4)) bad_1++;
+        }
+        int best = ref; for (int v = 0; v < NM; v++) if (us[v] < us[best]) best = v;
         printf("%-24s %6.1f MB ks=%u rpb=%u 组 %5.1f KB |", sh.name, mbytes / 1e6, ks, rpb, (double)rpb * nb * BYTES / 1024.0);
-        for (int v = 0; v < NM; v++) printf(" %s %6.1f us %3.0f |", mname[v], us[v], mbytes / (us[v] * 1e3));
+        for (int v = 0; v < NM; v++) { if (us[v] >= 1e9f) continue; printf(" %s %6.1f us %3.0f |", mname[v], us[v], mbytes / (us[v] * 1e3)); }
         printf(" 最快 %s | %s / %s\n", mname[best], bad_m ? "★发法间不同★" : "发法间逐位同", bad_1 ? "★≠单行★" : "== 单行逐位");
-        for (int v = 0; v < NM; v++) tot[v] += us[v] * sh.per_step;
+        if (g_l2pf && only_mode >= 0) {   /* L2 预取存活试验: 同一发法, 冷读 vs (预取 → 假注意力 → GEMV) */
+            float *scr, *sink; const uint64_t sn = (2u << 20) / 4u;
+            CK(cudaMalloc(&scr, sn * 4)); CK(cudaMemset(scr, 0, sn * 4)); CK(cudaMalloc(&sink, 4));
+            const long long cyc = 242000;   /* ≈100 µs @2.42 GHz, 引擎 n=4 注意力独占段的量级 */
+            double t_cold = 0, t_pf = 0, t_pfk = 0, t_dm = 0;
+            for (int variant = 0; variant < 2; variant++) {
+                for (int i = 0; i < iters + 3; i++) {
+                    const uint8_t *wc = dw[i % ncopy];
+                    if (variant) { CK(cudaEventRecord(e0)); k_prefetch<<<96, 256>>>(wc, mbytes, g_l2pf); CK(cudaEventRecord(e1)); }
+                    if (variant) { CK(cudaEventSynchronize(e1)); float ms; CK(cudaEventElapsedTime(&ms, e0, e1)); if (i >= 3) t_pfk += ms; }
+                    CK(cudaEventRecord(e0)); k_dummy<<<96, 256>>>(scr, sn, sink, cyc); CK(cudaEventRecord(e1));
+                    CK(cudaEventSynchronize(e1)); { float ms; CK(cudaEventElapsedTime(&ms, e0, e1)); if (i >= 3 && variant) t_dm += ms; }
+                    CK(cudaEventRecord(e0)); launch<NT, 1>(o[only_mode], wc, dx, sh.in_dim, sh.out_dim, ks, only_mode); CK(cudaEventRecord(e1));
+                    CK(cudaEventSynchronize(e1)); { float ms; CK(cudaEventElapsedTime(&ms, e0, e1)); if (i >= 3) { if (variant) t_pf += ms; else t_cold += ms; } }
+                }
+            }
+            CK(cudaGetLastError());
+            printf("   L2 预取试验(%s, %s): 假注意力后 GEMV 冷读 %.1f us(%.0f GB/s) → 预取后 %.1f us(%.0f GB/s); 预取核 %.1f us, 假注意力 %.1f us\n",
+                   mname[only_mode], g_l2pf == 1 ? "TMA 批量 evict_last" : "逐线 prefetch evict_last",
+                   t_cold * 1e3 / iters, mbytes / (t_cold * 1e6 / iters), t_pf * 1e3 / iters, mbytes / (t_pf * 1e6 / iters),
+                   t_pfk * 1e3 / iters, t_dm * 1e3 / iters);
+            cudaFree(scr); cudaFree(sink);
+        }
+        for (int v = 0; v < NM; v++) if (us[v] < 1e9f) tot[v] += us[v] * sh.per_step;
         best_tot += us[best] * sh.per_step;
         tot_bytes += (double)mbytes * sh.per_step;
         for (int c = 0; c < ncopy; c++) cudaFree(dw[c]);
@@ -261,19 +355,23 @@ static void run_nt(int iters) {
         free(dw); cudaFree(dx); cudaFree(o1); free(h); free(hx); free(r1);
         cudaEventDestroy(e0); cudaEventDestroy(e1);
     }
-    printf("== NT=%u 每步合计(按发射次数加权): 引擎规则 %.2f / pipe×4 %.2f / pipe×8 %.2f / stage %.2f / 逐形状取最快 %.2f ms, 字节 %.2f GB ⇒ 墙(242 GB/s) %.2f ms\n",
-           NT, tot[0] / 1e3, tot[1] / 1e3, tot[2] / 1e3, tot[3] / 1e3, best_tot / 1e3, tot_bytes / 1e9, tot_bytes / 242e9 * 1e3);
+    printf("== NT=%u 每步合计(按发射次数加权):", NT);
+    for (int v = 0; v < NM; v++) if (tot[v] > 0) printf(" %s %.2f /", mname[v], tot[v] / 1e3);
+    printf(" 逐形状取最快 %.2f ms, 字节 %.2f GB ⇒ 墙(242 GB/s) %.2f ms\n", best_tot / 1e3, tot_bytes / 1e9, tot_bytes / 242e9 * 1e3);
 }
 
 int main(int argc, char **argv) {
     const int iters = argc > 1 ? atoi(argv[1]) : 50;
     const int nt = argc > 2 ? atoi(argv[2]) : 4;
+    const int os = argc > 3 ? atoi(argv[3]) : -1, om = argc > 4 ? atoi(argv[4]) : -1;
+    g_pdl = argc > 5 && atoi(argv[5]) != 0;
+    g_l2pf = argc > 6 ? atoi(argv[6]) : 0;
     cudaDeviceProp pr; CK(cudaGetDeviceProperties(&pr, 0));
     g_sm = pr.multiProcessorCount;
     printf("%s SMs=%d L2=%d MB\n", pr.name, pr.multiProcessorCount, pr.l2CacheSize >> 20);
     switch (nt) {
-        case 1: run_nt<1>(iters); break; case 2: run_nt<2>(iters); break; case 3: run_nt<3>(iters); break;
-        case 4: run_nt<4>(iters); break; case 5: run_nt<5>(iters); break; case 6: run_nt<6>(iters); break;
+        case 1: run_nt<1>(iters, os, om); break; case 2: run_nt<2>(iters, os, om); break; case 3: run_nt<3>(iters, os, om); break;
+        case 4: run_nt<4>(iters, os, om); break; case 5: run_nt<5>(iters, os, om); break; case 6: run_nt<6>(iters, os, om); break;
         default: printf("NT 只支持 1..6\n"); return 1;
     }
     return 0;

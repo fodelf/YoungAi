@@ -353,3 +353,10 @@ END { tot=0; for (i=1;i<=ng;i++) { tot+=g[i]; by[gp[i]" → "gn[i]]+=g[i]; cnt[g
       printf "  -- 按(前一发 → 后一发)合计(前 10):\n";
       m=asorti(by, ob, "@val_num_desc");
       for (i=1;i<=m && i<=10;i++) printf "   %-78s %8.1f ms  %4d 段\n", ob[i], by[ob[i]]/1e6, cnt[ob[i]]; }' "$OUT/trace_cuda_gpu_trace.csv"
+
+# ⑥ 独占时间分账(2026-09-29 晚, 逻辑在 speed-bench/d0a_excl_timeline.awk): ③④ 把核时长相加, 侧流并行下是虚的(n=4 验证步核忙 85 对壁钟 64)。
+# 这张表沿 GPU 时间线扫: 某一刻只有一类核在跑 ⇒ 记给它(独占), 两类以上 ⇒ 记"重叠", 没核 ⇒ 空转。
+# 读法: "独占"才是砍掉这一类能省的上界; "时长和"比"独占"高得多的类, 别拿时长和估收益(GEMV NT>1 那 3~4 ms 就是这么估错的)。
+echo
+echo "== ⑥ 独占时间分账(按步类型; 独占 vs 时长和)"
+gawk -f speed-bench/d0a_excl_timeline.awk "$OUT/trace_cuda_gpu_trace.csv"
