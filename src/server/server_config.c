@@ -179,7 +179,8 @@ void usage(FILE *fp) {
         "      Write a human-readable session trace: prompts, cache decisions, output, tool calls.\n"
         "\n"
         "Thinking and sampling:\n"
-        "  DeepSeek-compatible chat requests default to thinking mode with high effort.\n"
+        "  Requests default to non-thinking mode. thinking={type:enabled}, think=true,\n"
+        "  reasoning_effort=high|max, or model=deepseek-reasoner turns thinking on.\n"
         "  Only reasoning_effort=max or output_config.effort=max requests Think Max.\n"
         "  Think Max is applied only when the context is at least " DS4_STRINGIFY(DS4_THINK_MAX_MIN_CONTEXT)
         " tokens; smaller contexts use high.\n"

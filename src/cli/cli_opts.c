@@ -153,7 +153,7 @@ cli_config parse_options(int argc, char **argv) {
             .top_p = DS4_DEFAULT_TOP_P,
             .min_p = DS4_DEFAULT_MIN_P,
             .dump_logprobs_top_k = 20,
-            .think_mode = DS4_THINK_HIGH,
+            .think_mode = DS4_THINK_NONE,   /* 默认不思考(2026-09-30 用户定, 与服务端同; --think/--think-max 才开), why 见 server_msgs.c request_init */
         },
     };
 

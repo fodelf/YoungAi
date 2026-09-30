@@ -581,6 +581,9 @@ SIDECAR=DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-vqfin41_vqhalf_a_n8192-en
 `/v1/messages`（Anthropic 风格）。请求里没带的采样参数按模型卡的推荐配方：`temperature` 1.0、`top_p` 1.0、
 不设 `min_p`，在 GPU 上采样，投机解码照开（真实 14k token Agent 请求几趟 34–37 token/s，贪心 45.5）。要输出逐字节
 可复现就显式传 `"temperature": 0`。
+请求默认**不思考**。要思考按请求显式打开：`"reasoning_effort": "high"`（或 `"max"`）、`"thinking": {"type": "enabled"}`、
+`"think": true`，或 `"model": "deepseek-reasoner"`。量化后的权重对"停"类决策（`</think>`、EOS）给的概率比 FP 模型低，
+长思考段可能收不了口；在权重侧修好之前，不思考是安全的默认。
 别把贪心当聊天默认：在"合格答案很少"的题上，贪心会在思考段逐字打转停不下来（例：让它写 5 个以"五"字结尾的成语）。
 
 **命令行。**

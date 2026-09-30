@@ -90,7 +90,7 @@ void test_streaming_holds_partial_utf8(void) {
 void test_request_defaults_use_min_p_filtering(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
-    TEST_ASSERT(r.think_mode == DS4_THINK_HIGH);
+    TEST_ASSERT(r.think_mode == DS4_THINK_NONE);   /* 2026-09-30: 默认不思考 */
     TEST_ASSERT(r.temperature == DS4_DEFAULT_TEMPERATURE);
     TEST_ASSERT(r.top_p == DS4_DEFAULT_TOP_P);
     TEST_ASSERT(r.top_k == 0);

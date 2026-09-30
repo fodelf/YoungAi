@@ -38,7 +38,7 @@ bool parse_completion_request(ds4_engine *e, const char *body, int def_tokens,
     const char *p = body;
     char *prompt = NULL;
     bool got_thinking = false;
-    bool thinking_enabled = true;
+    bool thinking_enabled = false;   /* 默认不思考(2026-09-30, 见 request_init 的注释); think=true 才开 */
     bool raw = false; /* "raw":true => bare continuation: prompt is the exact rendered
                          text (caller supplies BOS); no chat frame. Base-model probe path. */
     ds4_think_mode reasoning_effort = DS4_THINK_HIGH;

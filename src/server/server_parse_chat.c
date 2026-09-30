@@ -13,7 +13,7 @@ bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_toke
     bool got_messages = false;
     bool tool_choice_none = false;
     bool got_thinking = false;
-    bool thinking_enabled = true;
+    bool thinking_enabled = false;   /* 默认不思考(2026-09-30, 见 request_init 的注释); 显式 thinking/think/reasoning_effort/别名才开 */
     ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
     chat_msgs msgs = {0};
     char *tool_schemas = NULL;
@@ -159,6 +159,9 @@ bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_toke
                 free(key);
                 goto bad;
             }
+            /* 默认不思考之后, 客户端只给 reasoning_effort(OpenAI 风格开推理的唯一字段)就是在要思考: high/max 开, none 关 */
+            got_thinking = true;
+            thinking_enabled = reasoning_effort != DS4_THINK_NONE;
         } else if (!strcmp(key, "think")) {
             if (!json_bool(&p, &thinking_enabled)) {
                 free(key);

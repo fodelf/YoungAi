@@ -174,9 +174,9 @@ static void usage(FILE *fp) {
         "  --top-p F              Nucleus sampling probability. Default: 1\n"
         "  --min-p F              Min-p sampling threshold. Default: 0.05\n"
         "  --seed N               Sampling seed.\n"
-        "  --think                Use normal thinking mode. Default.\n"
+        "  --think                Use normal thinking mode.\n"
         "  --think-max            Use Think Max when context is large enough.\n"
-        "  --nothink              Disable thinking.\n"
+        "  --nothink              Disable thinking. Default.\n"
         "  --backend NAME         metal, cuda, or cpu.\n"
         "  --metal, --cuda, --cpu Select backend explicitly.\n"
         "  -t, --threads N        CPU helper threads.\n"
@@ -230,7 +230,7 @@ agent_config parse_options(int argc, char **argv) {
             .temperature = DS4_DEFAULT_TEMPERATURE,
             .top_p = DS4_DEFAULT_TOP_P,
             .min_p = DS4_DEFAULT_MIN_P,
-            .think_mode = DS4_THINK_HIGH,
+            .think_mode = DS4_THINK_NONE,   /* 默认不思考(2026-09-30 用户定, 与服务端/CLI 同; --think 才开) */
         },
     };
 

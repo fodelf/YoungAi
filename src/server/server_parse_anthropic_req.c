@@ -10,7 +10,7 @@ bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, int def
     bool got_messages = false;
     bool tool_choice_none = false;
     bool got_thinking = false;
-    bool thinking_enabled = true;
+    bool thinking_enabled = false;   /* 默认不思考(2026-09-30, 见 request_init 的注释); thinking={type:enabled} 才开 */
     ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
     chat_msgs msgs = {0};
     char *system = NULL;
@@ -179,11 +179,14 @@ bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, int def
                 free(key);
                 goto bad;
             }
+            /* 默认不思考之后, 只给 effort 也是在要思考(与 chat 路同): high/max 开, none 关; 显式 thinking 字段仍以它为准(它在后面覆盖) */
+            if (!got_thinking) thinking_enabled = reasoning_effort != DS4_THINK_NONE;
         } else if (!strcmp(key, "reasoning_effort")) {
             if (!parse_reasoning_effort_value(&p, &reasoning_effort)) {
                 free(key);
                 goto bad;
             }
+            if (!got_thinking) thinking_enabled = reasoning_effort != DS4_THINK_NONE;
         } else if (!json_skip_value(&p)) {
             free(key);
             goto bad;

@@ -199,7 +199,7 @@ bool parse_responses_request(ds4_engine *e, server *s, const char *body, int def
     bool got_input = false;
     bool tool_choice_none = false;
     bool got_thinking = false;
-    bool thinking_enabled = true;
+    bool thinking_enabled = false;   /* 默认不思考(2026-09-30, 见 request_init 的注释); reasoning.effort 显式给了才开 */
     ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
     chat_msgs msgs = {0};
     buf loaded_tool_schemas = {0};
@@ -365,8 +365,8 @@ bool parse_responses_request(ds4_engine *e, server *s, const char *body, int def
             if (effort_seen) {
                 got_thinking = true;
                 /* Responses-API effort of "minimal" / "none" maps to disabled
-                 * thinking. Other effort values choose between HIGH and MAX. */
-                if (reasoning_effort == DS4_THINK_NONE) thinking_enabled = false;
+                 * thinking. Other effort values turn thinking on (default is off) and choose HIGH or MAX. */
+                thinking_enabled = reasoning_effort != DS4_THINK_NONE;
             }
         } else if (!strcmp(key, "previous_response_id") ||
                    !strcmp(key, "conversation"))

@@ -685,6 +685,10 @@ Loading takes about two minutes. Endpoints: `/v1/chat/completions`, `/v1/complet
 card's recipe: `temperature` 1.0, `top_p` 1.0, no `min_p` — sampled on the GPU, speculative decoding kept on
 (34–37 tokens/s across runs on the 14k-token agent request vs 45.5 greedy). For byte-reproducible output send
 `"temperature": 0` explicitly.
+Requests default to **non-thinking** mode. Turn thinking on per request with `"reasoning_effort": "high"` (or
+`"max"`), `"thinking": {"type": "enabled"}`, `"think": true`, or `"model": "deepseek-reasoner"`. The quantized
+weights under-weight the "stop" decisions (`</think>`, EOS) relative to the FP model, so a long thinking
+segment can fail to close; non-thinking is the safe default until that is restored on the weight side.
 Don't make greedy the chat default: on questions with very few valid answers it can loop verbatim inside
 the thinking section and never stop (e.g. "list 5 Chinese idioms ending in 五").
 

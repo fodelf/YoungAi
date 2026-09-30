@@ -162,7 +162,10 @@ void request_init(request *r, req_kind kind, int max_tokens) {
     r->temperature = DS4_DEFAULT_TEMPERATURE;
     r->top_p = DS4_DEFAULT_TOP_P;
     r->min_p = DS4_DEFAULT_MIN_P;
-    r->think_mode = DS4_THINK_HIGH;
+    /* ★默认不思考★(2026-09-30 用户定): 量化权重把"结束思考"这个决策 token 压掉 4~22 倍(FP 在该收口处给 </think> 22%~49%,
+     * 学生 1%~6%, 引擎与官方代码同权重同数), 长推演 1/12 收不了口; 关掉默认思考是绕开入口, 不是修(修在权重侧, 见 fable5 待办)。
+     * 客户端要思考就明说: thinking={type:enabled} / think=true / reasoning_effort=high|max / model=deepseek-reasoner。 */
+    r->think_mode = DS4_THINK_NONE;
 }
 
 void request_free(request *r) {
