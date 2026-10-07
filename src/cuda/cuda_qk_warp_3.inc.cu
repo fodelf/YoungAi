@@ -34,13 +34,6 @@ int ds4_gpu_attention_output_q2k_batch_tensor(
     }
     ds4_launch_pdl(q8_K_quantize_kernel, dim3(blocks, (unsigned)xrows, 1), 256, 0, g_cur_stream, 
         (cuda_block_q8_K *)g_q4k_xq_sc, (const float *)heads->ptr, (uint32_t)group_dim, (uint32_t)xrows);
-    if (((const char *)0) /* DS4_F16_DIMS: 路径开关已删(2026-08-22 隐形炸弹清理) */) {   /* 诊断: grouped 形状一次性打印 */
-        static int gseen = 0;
-        if (!gseen) { gseen = 1;
-            fprintf(stderr, "ds4: [grouped-q2k-dims] group_dim=%llu rank=%llu n_groups=%u low_dim=%llu blocks=%u\n",
-                    (unsigned long long)group_dim, (unsigned long long)rank, n_groups,
-                    (unsigned long long)low_dim, blocks); }
-    }
     if (blocks <= 4u) {   /* 小块: 一 lane 一行(warp 模板空转病, 见 kernel 注释) */
         grouped_q2_K_rowlane_kernel<<<dim3((unsigned)((low_dim + 255u) / 256u), (unsigned)n_tokens, 1),
                                       256, 0, g_cur_stream>>>(
@@ -51,10 +44,8 @@ int ds4_gpu_attention_output_q2k_batch_tensor(
         if (gx > ds4_grid_cap()) gx = ds4_grid_cap();   /* 08-20 阶梯审判: 384 比 192 +4-8GB/s(V1 222→229/V2 226→230) */
         const size_t gsh = (blocks <= 32u && (blocks & 3u) == 0u)
                            ? (size_t)8u * (blocks * 84u / 16u) * sizeof(uint4) : 0u;
-        static uint32_t gtmin = 0u;
-        if (gtmin == 0u) { const char *e = ((const char *)0) /* DS4_Q2K_TILED_MIN: 路径开关已删(2026-08-22 隐形炸弹清理) */; gtmin = e ? (uint32_t)atoi(e) : 16u; }
-        if (n_tokens >= gtmin && blocks <= 32u && (blocks & 3u) == 0u && rank >= 8u &&
-            1) {
+        const uint32_t gtmin = 16u;   /* 分片核门限(与 dense 同 16 token) */
+        if (n_tokens >= gtmin && blocks <= 32u && (blocks & 3u) == 0u && rank >= 8u) {
             const size_t wsh_bytes = (size_t)8u * (blocks * 84u / 16u) * sizeof(uint4);
             const size_t budget = 96u * 1024u;
             uint32_t tile = (uint32_t)((budget - wsh_bytes) / ((size_t)blocks * sizeof(cuda_block_q8_K)));
@@ -64,9 +55,7 @@ int ds4_gpu_attention_output_q2k_batch_tensor(
                 const size_t sh = wsh_bytes + (size_t)tile * blocks * sizeof(cuda_block_q8_K);
                 if (grouped_q2k_tiled_set_smem(blocks, (int)sh)) {
                     unsigned ggx = (unsigned)((low_dim + 7u) / 8u);
-                    static uint32_t gtgx = 0u;
-                    if (gtgx == 0u) { const char *e = ((const char *)0) /* DS4_Q2K_TILED_BLOCKS: 路径开关已删(2026-08-22 隐形炸弹清理) */; gtgx = e ? (uint32_t)atoi(e) : 512u; }
-                    if (ggx > gtgx) ggx = gtgx;
+                    if (ggx > 512u) ggx = 512u;   /* 分片核网格封顶(与 dense 同 512) */
                     grouped_q2k_tiled_launch(ggx, sh, (float *)low->ptr, wa,
                                              (const cuda_block_q8_K *)g_q4k_xq_sc,
                                              row_bytes, blocks, (uint32_t)low_dim,
@@ -77,8 +66,8 @@ int ds4_gpu_attention_output_q2k_batch_tensor(
                 }
             }
         }
-        const uint32_t gwstat = (n_tokens > 1u && ((const char *)0) /* DS4_Q2K_NO_WSTAT: 诊断开关已删(2026-08-22) */ == NULL) ? (uint32_t)n_tokens : 1u;
-        if (gwstat > 1u && 1) gx = (unsigned)((low_dim + 7u) / 8u);
+        const uint32_t gwstat = (n_tokens > 1u) ? (uint32_t)n_tokens : 1u;
+        if (gwstat > 1u) gx = (unsigned)((low_dim + 7u) / 8u);
         grouped_q2_K_warp_kernel<<<dim3(gx, gwstat > 1u ? 1u : (unsigned)n_tokens, 1), 256, gsh, g_cur_stream>>>(
             (float *)low->ptr, wa, (const cuda_block_q8_K *)g_q4k_xq_sc,
             row_bytes, blocks, (uint32_t)low_dim, (uint32_t)rank, n_groups, gwstat);
@@ -266,17 +255,13 @@ int ds4_gpu_matmul_q2_K_pair_batch_tensor(
     }
     ds4_launch_pdl(q8_K_quantize_kernel, dim3(blocks, (unsigned)n_tok, 1), 256, 0, g_cur_stream, 
         (cuda_block_q8_K *)g_q4k_xq_sc, (const float *)x->ptr, (uint32_t)in_dim, (uint32_t)n_tok);
-    static uint32_t plv = 99u, pmb = 999u;
-    if (plv == 99u) { const char *e = ((const char *)0) /* DS4_Q2K_STAGE: 路径开关已删(2026-08-22 隐形炸弹清理) */; plv = e ? (uint32_t)atoi(e) : 2u; }
-    if (pmb == 999u) { const char *e = ((const char *)0) /* DS4_Q2K_SPLIT_MAXBLK: 路径开关已删(2026-08-22 隐形炸弹清理) */; pmb = e ? (uint32_t)atoi(e) : 16u; }
+    const uint32_t plv = 2u, pmb = 16u;   /* staging 档 / 半块整块分界, 与 dense 入口同 */
     const unsigned gx = (unsigned)((out0_dim + out1_dim + 7u) / 8u);
     const size_t sh = (size_t)8u * (blocks * 84u / 16u) * sizeof(uint4);
     const cuda_block_q8_K *xq = (const cuda_block_q8_K *)g_q4k_xq_sc;
     {   /* 大批: 激活分片进 shared(与 dense/grouped 同一修法) */
-        static uint32_t ptmin = 0u;
-        if (ptmin == 0u) { const char *e = ((const char *)0) /* DS4_Q2K_TILED_MIN: 路径开关已删(2026-08-22 隐形炸弹清理) */; ptmin = e ? (uint32_t)atoi(e) : 16u; }
-        if (n_tok >= ptmin &&
-            1) {
+        const uint32_t ptmin = 16u;
+        if (n_tok >= ptmin) {
             const size_t budget = 96u * 1024u;
             uint32_t tile = (uint32_t)((budget - sh) / ((size_t)blocks * sizeof(cuda_block_q8_K)));
             if (tile > n_tok) tile = (uint32_t)n_tok;
@@ -284,9 +269,7 @@ int ds4_gpu_matmul_q2_K_pair_batch_tensor(
             if (tile >= 2u) {
                 const size_t psh = sh + (size_t)tile * blocks * sizeof(cuda_block_q8_K);
                 if (pair_q2k_tiled_set_smem(blocks, (int)psh)) {
-                    static uint32_t ptgx = 0u;
-                    if (ptgx == 0u) { const char *e = ((const char *)0) /* DS4_Q2K_TILED_BLOCKS: 路径开关已删(2026-08-22 隐形炸弹清理) */; ptgx = e ? (uint32_t)atoi(e) : 512u; }
-                    unsigned pgx = gx > ptgx ? ptgx : gx;
+                    unsigned pgx = gx > 512u ? 512u : gx;   /* 分片核网格封顶 */
                     pair_q2k_tiled_launch(pgx, psh, (float *)out0->ptr, (float *)out1->ptr, w0, w1,
                                           xq, row_bytes, blocks, (uint32_t)out0_dim, (uint32_t)out1_dim,
                                           (uint32_t)n_tok, tile, plv, pmb);

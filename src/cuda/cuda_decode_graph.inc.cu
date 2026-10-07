@@ -28,6 +28,7 @@ int ds4_gpu_decode_graph_capture_begin(void) {
  * 出口用 LaunchCompletion(上游所有 block 都已开跑就放下游发射): 上游核一行不用改(不必调 trigger);
  * 上游那时已全部驻留, 下游 block 只占空位, 不会把上游饿死。下游完成与内存可见由它自己的 v41_pdl_wait 保证。
  * 返回改了几条; -1 = API 失败(调用方丢掉这张图, 不带着半改的边去实例化)。 */
+static uint64_t g_v41_pdl_skipped = 0;   /* 改不成程序化边、保持普通边的边数(累计, 只进捕获日志) */
 static int decode_graph_pdl_edges(cudaGraph_t graph) {
     if (g_v41_pdl_n == 0) return 0;
     size_t ne = 0;
@@ -35,7 +36,7 @@ static int decode_graph_pdl_edges(cudaGraph_t graph) {
     if (ne == 0) return 0;
     cudaGraphNode_t *from = (cudaGraphNode_t *)malloc(ne * sizeof *from), *to = (cudaGraphNode_t *)malloc(ne * sizeof *to);
     cudaGraphEdgeData *ed = (cudaGraphEdgeData *)malloc(ne * sizeof *ed);
-    int n = 0, bad = 0;
+    int n = 0, bad = 0, skipped = 0;
     if (!from || !to || !ed || cudaGraphGetEdges(graph, from, to, ed, &ne) != cudaSuccess) bad = 1;
     for (size_t i = 0; !bad && i < ne; i++) {
         if (ed[i].type != cudaGraphDependencyTypeDefault || ed[i].from_port != cudaGraphKernelNodePortDefault) continue;
@@ -43,16 +44,31 @@ static int decode_graph_pdl_edges(cudaGraph_t graph) {
         if (cudaGraphNodeGetType(from[i], &tf) != cudaSuccess || cudaGraphNodeGetType(to[i], &tt) != cudaSuccess) { bad = 1; break; }
         if (tf != cudaGraphNodeTypeKernel || tt != cudaGraphNodeTypeKernel) continue;
         cudaKernelNodeParams kp; memset(&kp, 0, sizeof kp);
-        if (cudaGraphKernelNodeGetParams(to[i], &kp) != cudaSuccess) { bad = 1; break; }
+        /* ★取不到参数的核节点 = 别的库发的核(cuBLAS), 跳过、边保持普通★(2026-10-01 实撞): 挂 ③ 后放大器的两发 Sgemm 进了图,
+         * 运行时 API 认不出 cuBLAS 的核函数, 这里报 invalid device function —— 原来当成整张图失败, 每步退回直发(多付几 ms/步)。
+         * 它不可能在 PDL 登记表里(登记的全是本仓的核), 本来就不该改它的入边。 */
+        if (cudaGraphKernelNodeGetParams(to[i], &kp) != cudaSuccess) { (void)cudaGetLastError(); continue; }
         if (!v41_pdl_is_ready(kp.func)) continue;
         cudaGraphEdgeData pe; memset(&pe, 0, sizeof pe);
         pe.from_port = cudaGraphKernelNodePortLaunchCompletion; pe.type = cudaGraphDependencyTypeProgrammatic;
-        if (cudaGraphRemoveDependencies(graph, &from[i], &to[i], &ed[i], 1) != cudaSuccess ||
-            cudaGraphAddDependencies(graph, &from[i], &to[i], &pe, 1) != cudaSuccess) { bad = 1; break; }
+        /* ★改不成程序化的边保持普通边, 整张图照用★(2026-10-06 实撞): 合批整步图里缓存段按路分流(ds4_gpu_lanes_fork, 各路一条流), 道间 fork/join
+         * 捕进图是跨流的依赖边, 驱动对这种边加程序化边报 operation not supported —— 原来当成整张图失败, 训练器合批采样 3445 步全退回直发(不走图的
+         * 一步多付发射间隙, 160 份只从 839 s 省到 606 s)。跨流那几条边本来也不在 PDL 的收益里(它们是道间汇合, 不是同流核接核), 跳过就是。 */
+        cudaError_t er = cudaGraphRemoveDependencies(graph, &from[i], &to[i], &ed[i], 1);
+        if (er == cudaErrorNotSupported) { (void)cudaGetLastError(); skipped++; continue; }
+        if (er != cudaSuccess) { bad = 1; break; }
+        const cudaError_t ea = cudaGraphAddDependencies(graph, &from[i], &to[i], &pe, 1);
+        if (ea == cudaErrorNotSupported) {
+            (void)cudaGetLastError();
+            if (cudaGraphAddDependencies(graph, &from[i], &to[i], &ed[i], 1) != cudaSuccess) { bad = 1; break; }   /* 原边放回去 */
+            skipped++; continue;
+        }
+        if (ea != cudaSuccess) { bad = 1; break; }
         n++;
     }
     free(from); free(to); free(ed);
     if (bad) { fprintf(stderr, "ds4: [graph] PDL 改边失败: %s\n", cudaGetErrorString(cudaGetLastError())); return -1; }
+    if (skipped) g_v41_pdl_skipped += skipped;
     return n;
 }
 
@@ -77,7 +93,7 @@ void *ds4_gpu_decode_graph_capture_end(void) {
         (void)cudaGetLastError();
         return NULL;
     }
-    fprintf(stderr, "ds4: [graph] 解码整步已捕获: %zu 个节点(其中 %d 条边改成 PDL 程序化边)\n", n_nodes, n_pdl);
+    fprintf(stderr, "ds4: [graph] 解码整步已捕获: %zu 个节点(其中 %d 条边改成 PDL 程序化边, 累计 %llu 条不支持的保持普通)\n", n_nodes, n_pdl, (unsigned long long)g_v41_pdl_skipped);
     return (void *)exec;
 }
 
@@ -148,8 +164,9 @@ int ds4_gpu_tensor_write_zerocopy(ds4_gpu_tensor *t, uint64_t offset, const void
         return 0;
     }
     const uint32_t nw = (uint32_t)(bytes / 4u);
-    decode_hostcopy_kernel<<<(nw + 255u) / 256u, 256, 0, cudaStreamPerThread>>>((uint32_t *)((char *)t->ptr + offset),
-                                                                                (const uint32_t *)dev, nw);
+    /* 流 = g_cur_stream(0 = PTDS, 与以前同): 并发道上发时跟着道走, 否则灌位置的小核落主流、道上的 rope 核读到旧值(2026-09-30) */
+    decode_hostcopy_kernel<<<(nw + 255u) / 256u, 256, 0, g_cur_stream>>>((uint32_t *)((char *)t->ptr + offset),
+                                                                          (const uint32_t *)dev, nw);
     return cuda_ok(cudaGetLastError(), "tensor write zerocopy");
 }
 /* 反向: 核把设备张量的几个字写进映射的主机内存(argmax 落点), 省掉那个 170 µs 的 D2H 节点; synchronize 之后主机就能读 */

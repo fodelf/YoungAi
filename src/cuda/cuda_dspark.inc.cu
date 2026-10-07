@@ -347,11 +347,8 @@ static int tok_graph_finalize_slot(cudaGraph_t graph, int slot) {
         /* 910 竞争根修(08-18 sanitizer 实锤)修订(08-20): 原修=全设备同步再销毁, 但该同步
          * 等的是"刚发射的当前图"(27.5ms 隔拍阻塞实测) — 而被销毁的 exec 在两处调用点都
          * 满足"上次发射 ≥1 个 end_commands 全同步之前"不变量(每 token 末尾必 DeviceSync),
-         * 恒已静默。撤同步; DS4_TOK_GRAPH_SAFE_SYNC=1 可恢复旧行为(sanitizer 排查用)。 */
-        if (((const char *)0) /* DS4_TOK_GRAPH_DEBUG: 诊断开关已删(2026-08-22) */)
-            fprintf(stderr, "[tokdbg] update REJECT ur=%d\n", (int)ur);
+         * 恒已静默。撤同步(旧的 DS4_TOK_GRAPH_SAFE_SYNC 逃生口已删)。 */
         (void)cudaGetLastError();
-        if (((const char *)0) /* DS4_TOK_GRAPH_SAFE_SYNC: 路径开关已删(2026-08-22 隐形炸弹清理) */) (void)cudaDeviceSynchronize();
         (void)cudaGraphExecDestroy(g_tok_execs[slot]);
         g_tok_execs[slot] = NULL;
         if (cudaGraphInstantiate(&g_tok_execs[slot], graph, NULL, NULL, 0) != cudaSuccess) {

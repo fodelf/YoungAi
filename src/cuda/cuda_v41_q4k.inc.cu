@@ -16,7 +16,6 @@
 
 #define V41_Q4K_BLK 256u          /* 每块元素数 */
 #define V41_Q4K_BYTES 144u        /* 每块字节数: 2(d) + 2(dmin) + 12(scales) + 128(qs) */
-static v41_scratch g_v41_q4k_wb;  /* 预填: 解出来的 bf16 权重暂存(与 fp4x32 的 g_v41_wbf 同角色) */
 
 /* 块头解出 8 组 (scale, min) 的第 j 组。与 ds4_quantfmt.c 的 q4k_scale_min 逐式同。 */
 __device__ __forceinline__ static void v41_q4k_sm(const uint8_t *sc, int j, float *s, float *m) {
@@ -277,35 +276,112 @@ static int v41_q4k_gemv(const void *model_map, uint64_t model_size, uint64_t off
     return cuda_ok(cudaGetLastError(), what);
 }
 
+/* ---- 后训练一层内的 bf16 权重缓存(10-03) ----
+ * 为什么: 训练的每层反传是"重算本层 → 本层反传", 重算里每个 q4_K 稠密矩阵解一遍 bf16 做前向 GEMM, 紧接着反传的转置乘又把同一批矩阵再解一遍
+ * (10-03 逐核表: q4_K→bf16 占 GPU 时间 7.5%, 前向/重算/反传各三分之一)。开着时重算解出的整块矩阵按权重偏移留在一块环形暂存里, 反传直接拿。
+ * 只有训练器在"重算 + 反传"那一层开(ds4_gpu_bwd_wcache), 推理与训练前向都关着 —— 关着时行为与原来一字不差。
+ * 容量: 一层的稠密权重(wq_a/wq_b/wkv/wo_a/wo_b/共享专家/压缩器/indexer)解成 bf16 实测 8 块 309 MB(10-03 全层训练); 环满了就从头覆盖(先进先出),
+ * 只收能整块解的矩阵(出口头那种分块解的不收)。值与原来同一个解码核同一份 ⇒ 反传读到的权重逐位不变。 */
+#define V41_WCACHE_BYTES (384ull << 20)
+#define V41_WCACHE_SLOTS 32u
+static struct { int on; uint8_t *buf; uint64_t cap, head; uint32_t n; uint64_t key[V41_WCACHE_SLOTS], at[V41_WCACHE_SLOTS], bytes[V41_WCACHE_SLOTS]; } g_v41_wc;
+int ds4_gpu_bwd_wcache(int mode) {   /* 契约见 ds4_gpu_bwd.h: 1 = 开新一层(清表), 0 = 关 */
+    static uint64_t said;
+    if (!mode && g_v41_wc.on && g_v41_wc.head > said) {   /* 一层实际占了多少(只在创新高时说一句): 定 V41_WCACHE_BYTES 的依据 */
+        said = g_v41_wc.head;
+        fprintf(stderr, "ds4: [bwd] 层内 bf16 权重缓存: 一层 %u 块 %.0f MB(池 %.0f MB)\n", g_v41_wc.n, (double)said / 1048576.0, (double)V41_WCACHE_BYTES / 1048576.0);
+    }
+    g_v41_wc.on = mode ? 1 : 0;
+    if (mode) { g_v41_wc.n = 0; g_v41_wc.head = 0; }
+    return 1;
+}
+/* 查: 开着且这块矩阵(权重偏移 off)在表里 ⇒ 它的 bf16 */
+static const __nv_bfloat16 *v41_wc_find(uint64_t off) {
+    if (!g_v41_wc.on) return NULL;
+    for (uint32_t i = 0; i < g_v41_wc.n; i++) if (g_v41_wc.key[i] == off) return (const __nv_bfloat16 *)(g_v41_wc.buf + g_v41_wc.at[i]);
+    return NULL;
+}
+/* 占: 开着时给 off 这块矩阵(elems 个 bf16)要一段地方, 返回 NULL = 不收(关着 / 太大 / 分不出暂存), 调用方照旧解进 g_v41_wbf */
+static __nv_bfloat16 *v41_wc_alloc(uint64_t off, uint64_t elems) {
+    if (!g_v41_wc.on) return NULL;
+    const uint64_t bytes = (elems * 2u + 255u) & ~255ull;
+    if (bytes > V41_WCACHE_BYTES / 2u) return NULL;
+    if (!g_v41_wc.buf) {
+        if (cudaMalloc((void **)&g_v41_wc.buf, V41_WCACHE_BYTES) != cudaSuccess) { (void)cudaGetLastError(); g_v41_wc.on = 0; return NULL; }
+        g_v41_wc.cap = V41_WCACHE_BYTES;
+    }
+    if (g_v41_wc.head + bytes > g_v41_wc.cap) g_v41_wc.head = 0;   /* 绕回: 下面把与新段重叠的旧项清掉 */
+    const uint64_t a = g_v41_wc.head, b = a + bytes;
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < g_v41_wc.n; i++) {
+        const uint64_t x = g_v41_wc.at[i], y = x + g_v41_wc.bytes[i];
+        if (y <= a || x >= b) { g_v41_wc.key[k] = g_v41_wc.key[i]; g_v41_wc.at[k] = x; g_v41_wc.bytes[k] = g_v41_wc.bytes[i]; k++; }
+    }
+    g_v41_wc.n = k;
+    if (g_v41_wc.n == V41_WCACHE_SLOTS) return NULL;
+    g_v41_wc.key[g_v41_wc.n] = off; g_v41_wc.at[g_v41_wc.n] = a; g_v41_wc.bytes[g_v41_wc.n] = bytes; g_v41_wc.n++;
+    g_v41_wc.head = b;
+    return (__nv_bfloat16 *)(g_v41_wc.buf + a);
+}
+
 /* 预填(n_tok > V41_GEMV_MAX_TOK): 权重解成 bf16 暂存, 激活转 bf16, 每组一发 cuBLAS。
  * 与 fp4x32 的 wo_a 预填路同一形态(见 cuda_v41_1.inc.cu 里那段"为什么是 bf16 不是 f16")。
  * ★不走 NVFP4 张量核★: 那条路要把权重摆成 e2m1 nibble, q4_K 的值不在 FP4 格点上, 转过去是二次量化。 */
 static int v41_q4k_gemm(const void *model_map, uint64_t model_size, uint64_t off, uint64_t in_dim,
                         uint64_t out_dim, const float *x, float *out, uint32_t n_tok, uint32_t n_groups,
                         uint32_t x_stride, uint32_t out_stride, int round_out, const char *what) {
-    const uint64_t nblk_g = out_dim * (in_dim / V41_Q4K_BLK), nblk = nblk_g * n_groups;
+    (void)round_out;   /* 舍入在调用方(round_out 时整块一发) */
+    const uint64_t bpr = in_dim / V41_Q4K_BLK, nblk_g = out_dim * bpr, nblk = nblk_g * n_groups;
     if (off > model_size || nblk * V41_Q4K_BYTES > model_size - off) return 0;
     const uint8_t *w = (const uint8_t *)cuda_model_range_ptr(model_map, off, nblk * V41_Q4K_BYTES, what);
     if (!w) return 0;
     if (((uintptr_t)w & 3u) != 0u) { fprintf(stderr, "ds4: %s q4_K 张量起点未 4 字节对齐\n", what); return 0; }
-    __nv_bfloat16 *wb = (__nv_bfloat16 *)v41_grow(&g_v41_q4k_wb, nblk * V41_Q4K_BLK * sizeof(__nv_bfloat16), "v41 q4k w bf16");
+    /* ★权重暂存按输出维分块, 与 fp4x32 预填路 / 反传转置乘同用 g_v41_wbf、同一个上限 V41_BF16_STAGE_ELEMS★(10-02 夜):
+     * 原来整块解进自己的一块暂存 —— 出口头 129280×4096 一解 1.06 GB, 是后训练暂存峰值(2.0 GB)的一半, 而 fp4x32 那条早就分块封顶了(见
+     * ds4_gpu_v41_matmul_fp4x32_tensor 的 09-20 实撞)。超上限的只有出口头(分 3 块, 每块的贡献写进输出的不同行, 不累加); 其余矩阵整块一发,
+     * 与原来同一发 cuBLAS。分组(wo_a)总量 67 MB, 整块解一次再逐组乘。三处共用一块暂存是安全的: 都在当前流上先后发, n ≤ 8 的侧流分叉不走 GEMM 路。 */
+    const uint64_t rows_cap = V41_BF16_STAGE_ELEMS / in_dim;
+    const uint64_t tile = n_groups > 1u ? out_dim : (rows_cap < 256u ? 256u : (rows_cap >= out_dim ? out_dim : (rows_cap & ~255ull)));
+    const uint64_t stage = n_groups > 1u ? nblk * V41_Q4K_BLK : tile * in_dim;
+    /* 层内缓存开着且整块能一次解: 已在表里就跳过解码, 不在就解进缓存(之后反传的转置乘直接拿) */
+    const bool whole = n_groups > 1u || tile == out_dim;
+    const __nv_bfloat16 *hit = whole ? v41_wc_find(off) : NULL;
+    __nv_bfloat16 *wcs = (whole && !hit) ? v41_wc_alloc(off, nblk * V41_Q4K_BLK) : NULL;
+    __nv_bfloat16 *wb = wcs ? wcs : (__nv_bfloat16 *)v41_grow(&g_v41_wbf, stage * sizeof(__nv_bfloat16), "v41 q4k w bf16");
     if (!wb) return 0;
-    const dim3 dblk(32, 8);
-    v41_q4k_to_bf16_kernel<<<(unsigned)((nblk + 7) / 8), dblk, 0, g_cur_stream>>>(wb, w, nblk);
-    if (!cuda_ok(cudaGetLastError(), "v41 q4k→bf16")) return 0;
     const uint64_t xn = (uint64_t)n_tok * x_stride;
     __nv_bfloat16 *xb = (__nv_bfloat16 *)v41_grow(&g_v41_xbf, xn * sizeof(__nv_bfloat16), "v41 q4k x bf16");
     if (!xb) return 0;
     v41_x_to_bf16_kernel<<<(unsigned)((xn + 255) / 256), 256, 0, g_cur_stream>>>(xb, x, xn);
     if (!cuda_ok(cudaGetLastError(), "v41 q4k x→bf16")) return 0;
     const float alpha = 1.0f, beta = 0.0f;
+    const dim3 dblk(32, 8);
     (void)cublasSetStream(g_cublas, v41_cublas_stream());
-    for (uint32_t g = 0; g < n_groups; g++) {
-        cublasStatus_t st = cublasGemmEx(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)out_dim, (int)n_tok, (int)in_dim, &alpha,
-                                         wb + (uint64_t)g * nblk_g * V41_Q4K_BLK, CUDA_R_16BF, (int)in_dim,
-                                         xb + (uint64_t)g * in_dim, CUDA_R_16BF, (int)x_stride, &beta,
-                                         out + (uint64_t)g * out_dim, CUDA_R_32F, (int)out_stride,
-                                         CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+    if (n_groups > 1u) {
+        if (!hit) {
+            v41_q4k_to_bf16_kernel<<<(unsigned)((nblk + 7) / 8), dblk, 0, g_cur_stream>>>(wb, w, nblk);
+            if (!cuda_ok(cudaGetLastError(), "v41 q4k→bf16")) return 0;
+        }
+        const __nv_bfloat16 *wu = hit ? hit : wb;
+        for (uint32_t g = 0; g < n_groups; g++) {
+            cublasStatus_t st = cublasGemmEx(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)out_dim, (int)n_tok, (int)in_dim, &alpha,
+                                             wu + (uint64_t)g * nblk_g * V41_Q4K_BLK, CUDA_R_16BF, (int)in_dim,
+                                             xb + (uint64_t)g * in_dim, CUDA_R_16BF, (int)x_stride, &beta,
+                                             out + (uint64_t)g * out_dim, CUDA_R_32F, (int)out_stride,
+                                             CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+            if (!cublas_ok(st, what)) return 0;
+        }
+        return 1;
+    }
+    for (uint64_t r0 = 0; r0 < out_dim; r0 += tile) {
+        const uint64_t rows = out_dim - r0 < tile ? out_dim - r0 : tile, tb = rows * bpr;
+        if (!hit) {   /* 命中缓存时 tile == out_dim, 只有这一块 */
+            v41_q4k_to_bf16_kernel<<<(unsigned)((tb + 7) / 8), dblk, 0, g_cur_stream>>>(wb, w + r0 * bpr * V41_Q4K_BYTES, tb);
+            if (!cuda_ok(cudaGetLastError(), "v41 q4k→bf16")) return 0;
+        }
+        cublasStatus_t st = cublasGemmEx(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)rows, (int)n_tok, (int)in_dim, &alpha,
+                                         hit ? hit : wb, CUDA_R_16BF, (int)in_dim, xb, CUDA_R_16BF, (int)x_stride, &beta,
+                                         out + r0, CUDA_R_32F, (int)out_stride, CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
         if (!cublas_ok(st, what)) return 0;
     }
     return 1;

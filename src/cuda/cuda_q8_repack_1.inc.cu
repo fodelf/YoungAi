@@ -108,11 +108,6 @@ static float *cuda_q8_f32_ptr(
     g_q8_f32_ranges.push_back({model_map, offset, weight_bytes, in_dim, out_dim, dev});
     g_q8_f32_by_offset[offset] = g_q8_f32_ranges.size() - 1u;
     g_q8_f32_bytes += out_bytes;
-    if (((const char *)0) /* DS4_CUDA_WEIGHT_CACHE_VERBOSE: 诊断开关已删(2026-08-22) */) {
-        fprintf(stderr, "ds4: CUDA cached q8 fp32 %.2f MiB (total %.2f GiB)\n",
-                (double)out_bytes / 1048576.0,
-                (double)g_q8_f32_bytes / 1073741824.0);
-    }
     return dev;
 }
 
@@ -128,10 +123,7 @@ static double cuda_wall_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
 }
 
-static int cuda_model_load_progress_enabled(void) {
-    if (((const char *)0) /* DS4_CUDA_WEIGHT_CACHE_VERBOSE: 诊断开关已删(2026-08-22) */ != NULL) return 0;
-    return 1;
-}
+static int cuda_model_load_progress_enabled(void) { return 1; }
 
 static void cuda_model_load_progress_reset(void) {
     g_model_load_progress_next = 0;
@@ -263,18 +255,8 @@ static int cuda_model_prefetch_range(const void *model_map, uint64_t model_size,
     return 1;
 }
 
-static uint64_t cuda_model_copy_chunk_bytes(void) {
-    uint64_t mb = 64;
-    const char *env = ((const char *)0) /* DS4_CUDA_MODEL_COPY_CHUNK_MB: 路径开关已删(2026-08-22 隐形炸弹清理) */;
-    if (env && env[0]) {
-        char *end = NULL;
-        unsigned long long v = strtoull(env, &end, 10);
-        if (end != env && v > 0) mb = (uint64_t)v;
-    }
-    if (mb < 16) mb = 16;
-    if (mb > 4096) mb = 4096;
-    return mb * 1048576ull;
-}
+/* 整模型拷贝的 staging 块 64 MB(原 DS4_CUDA_MODEL_COPY_CHUNK_MB 旋钮, 定死) */
+static uint64_t cuda_model_copy_chunk_bytes(void) { return 64ull * 1048576ull; }
 
 static void cuda_model_discard_source_pages(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes) {
 #if defined(POSIX_MADV_DONTNEED)
@@ -400,9 +382,6 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
             }
             const int direct_errno = errno;
             if (direct_errno == EINVAL || direct_errno == EFAULT || direct_errno == ENOTSUP || direct_errno == EOPNOTSUPP) {
-                if (((const char *)0) /* DS4_CUDA_WEIGHT_CACHE_VERBOSE: 诊断开关已删(2026-08-22) */) {
-                    fprintf(stderr, "ds4: CUDA direct model read disabled: %s\n", strerror(direct_errno));
-                }
                 (void)close(g_model_direct_fd);
                 g_model_direct_fd = -1;
                 g_model_direct_align = 1;
@@ -416,42 +395,39 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
     return cuda_pread_full(g_model_fd, stage, bytes, offset);
 }
 
+/* 设备权重缓存的平台默认预算。2026-10-07 前由编译宏 DS4_CUDA_SPARK_HBM_CACHE 二选一(make cuda-spark 才走统一内存公式,
+ * cuda-generic 编出来的二进制放到 GB10 上只会缓 24 GiB), 现在按设备属性运行时判(cuda_unified_memory_host)。 */
 static uint64_t cuda_model_cache_limit_default_bytes(void) {
-    uint64_t gb = 0;
-    const char *env = ((const char *)0) /* DS4_CUDA_WEIGHT_CACHE_LIMIT_GB: 路径开关已删(2026-08-22 隐形炸弹清理) */;
-    if (env && env[0]) {
-        char *end = NULL;
-        unsigned long long v = strtoull(env, &end, 10);
-        if (end != env) gb = (uint64_t)v;
-        return gb * 1073741824ull;
-    }
-    /* Default cap protects against OOM on UMA systems where a full ~80 GiB
-     * model would otherwise duplicate the mmap'd host pages into HBM-backed
-     * cudaMalloc allocations and exhaust the 121 GiB UMA pool.  24 GiB
-     * comfortably covers attn projections + embedding + output head +
-     * shared FFN; routed MoE experts (~65 GiB, only top-K active per token)
-     * fall back to the UVA-mapped pointer for cold lookups.  Tune up via
-     * DS4_CUDA_WEIGHT_CACHE_LIMIT_GB on hosts with more memory budget. */
-#ifdef DS4_CUDA_SPARK_HBM_CACHE
-    /* Spark/GB10 统一内存: 实测 registered-host 页表读被钉在 ~185 GB/s, 设备拷贝 255
-     * (2026-08-17)。默认预算=总内存-余量, 整模型尽量收编; 拷贝后源 mmap 页
-     * madvise(DONTNEED), 净占用不翻倍。
-     * ★2026-09-15 single.md S1: 余量 24 → 8 GiB★
-     * 24 GiB 是 V4 时代按"给 page cache 留活路"定的, 而拷进设备的段立刻 MADV_DONTNEED,
-     * page cache 根本不承重。代价是实打实的: 117.9 GB 的模型有约 12 GiB(最后 4~5 层的专家 blob)
-     * 装不进预算, 只能走 cudaHostRegister 的主机映射 —— 那些页在 130 GB 机器上被 kswapd 一直回收,
-     * 每步都有几层缺页从 NVMe 重读。**实测这几层的专家核 235 µs → 1100~4500 µs**(逐核时间线,
-     * gateup 第 10 步 L35/L37/L38/L39), 一步 66 ms 里 5~25 ms 是这个长尾, 首步更是 95 ms。
-     * 8 GiB 盖得住实际的非模型占用: KV@32k 2.4 + 中间张量暂存 ≈2 + CUDA 上下文/cuBLASLt ≈1.5, 留 2 兜底。
-     * ★别 OOM 是最高约束★: 起跑后由 core_model_map.c 的对账打印 + available 检查兜底(见那里的注释)。 */
-    {
+    if (cuda_unified_memory_host()) {
+        /* 统一内存(GB10/Grace): 实测 registered-host 页表读被钉在 ~185 GB/s, 设备拷贝 255
+         * (2026-08-17)。预算=整机内存-余量, 整模型尽量收编; 拷贝后源 mmap 页
+         * madvise(DONTNEED), 净占用不翻倍。
+         * ★2026-09-15 single.md S1: 余量 24 → 8 GiB★
+         * 24 GiB 是 V4 时代按"给 page cache 留活路"定的, 而拷进设备的段立刻 MADV_DONTNEED,
+         * page cache 根本不承重。代价是实打实的: 117.9 GB 的模型有约 12 GiB(最后 4~5 层的专家 blob)
+         * 装不进预算, 只能走 cudaHostRegister 的主机映射 —— 那些页在 130 GB 机器上被 kswapd 一直回收,
+         * 每步都有几层缺页从 NVMe 重读。**实测这几层的专家核 235 µs → 1100~4500 µs**(逐核时间线,
+         * gateup 第 10 步 L35/L37/L38/L39), 一步 66 ms 里 5~25 ms 是这个长尾, 首步更是 95 ms。
+         * 8 GiB 盖得住实际的非模型占用: KV@32k 2.4 + 中间张量暂存 ≈2 + CUDA 上下文/cuBLASLt ≈1.5, 留 2 兜底。
+         * ★别 OOM 是最高约束★: 起跑后由 core_model_map.c 的对账打印 + available 检查兜底(见那里的注释)。 */
         const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
         const uint64_t total = (uint64_t)sysconf(_SC_PHYS_PAGES) * page;
         const uint64_t headroom = 8ull * 1073741824ull;
         if (total > headroom * 2) return total - headroom;
     }
-#endif
-    return 24ull * 1073741824ull;
+    /* 独显: 显存是独立池。V4 时代定的 24 GiB(够装 attn 投影 + 嵌入 + 输出头 + 共享 FFN; 路由专家走映射指针)
+     * 对 80 GB 卡合适, 对 24 GB 卡就是把显存吃光 —— 再按本卡显存封顶: 留 max(4 GiB, 20%) 给 KV/scratch/cuBLAS。
+     * ★这条分支 2026-10-07 没有独显机器验证★(cuda-generic 以前根本不走缓存), 只保证不比"固定 24 GiB"更激进。 */
+    uint64_t cap = 24ull * 1073741824ull;
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) { (void)cudaGetLastError(); total_b = 0; }
+    if (total_b) {
+        uint64_t reserve = (uint64_t)total_b / 5u;
+        if (reserve < 4ull * 1073741824ull) reserve = 4ull * 1073741824ull;
+        const uint64_t avail = (uint64_t)total_b > reserve ? (uint64_t)total_b - reserve : 0;
+        if (avail < cap) cap = avail;
+    }
+    return cap;
 }
 /* 显式封顶(ds4_gpu_set_model_cache_limit_mb)只能往下压, 不许越过平台默认 —— 默认那条线是"别 OOM"的最高约束。 */
 static uint64_t cuda_model_cache_limit_bytes(void) {
@@ -460,16 +436,8 @@ static uint64_t cuda_model_cache_limit_bytes(void) {
 }
 
 static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
-    uint64_t mb = 1792;
-    const char *env = ((const char *)0) /* DS4_CUDA_WEIGHT_ARENA_CHUNK_MB: 路径开关已删(2026-08-22 隐形炸弹清理) */;
-    if (env && env[0]) {
-        char *end = NULL;
-        unsigned long long v = strtoull(env, &end, 10);
-        if (end != env && v > 0) mb = (uint64_t)v;
-    }
-    if (mb < 256) mb = 256;
-    if (mb > 8192) mb = 8192;
-    uint64_t bytes = mb * 1048576ull;
+    /* arena 块 1792 MB(原 DS4_CUDA_WEIGHT_ARENA_CHUNK_MB 旋钮, 定死): 单块够摊薄 cudaMalloc 次数, 尾块浪费又不至于太大 */
+    uint64_t bytes = 1792ull * 1048576ull;
     if (bytes < need) {
         const uint64_t align = 256ull * 1048576ull;
         bytes = (need + align - 1u) & ~(align - 1u);

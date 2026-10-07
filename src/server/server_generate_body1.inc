@@ -165,6 +165,7 @@
      * the live KV cache and can be reused by the next request. */
     j->req.cache_read_tokens = cached;
     j->req.cache_write_tokens = prompt_tokens > cached ? prompt_tokens - cached : 0;
+    mon_prefill(s, j->mon, prompt_tokens, cached, j->req.max_tokens);   /* 监控: 排队结束, 开始读提示 */
 
     const double t0 = now_sec();
     uint64_t trace_id = trace_begin(s, j, cached, prompt_tokens, &cache_diag,
@@ -182,6 +183,8 @@
         .fd = j->fd,
         .stream = j->req.stream,
         .enable_cors = s->enable_cors,
+        .mon_srv = s,
+        .mon = j->mon,
     };
     snprintf(progress.ctx, sizeof(progress.ctx), "%s", ctx_span);
     char req_flags[64];

@@ -95,7 +95,18 @@ __global__ static void v41_hc_mix_fused_kernel(float *mix, float *part, uint32_t
             for (uint32_t j = 0; j < 10u; j++) if (i0 + j * blockDim.x < dim) s += xv[j] * xv[j];
         }
         sh[threadIdx.x] = s; __syncthreads();
-        for (uint32_t k = blockDim.x / 2; k > 0; k >>= 1) { if (threadIdx.x < k) sh[threadIdx.x] += sh[threadIdx.x + k]; __syncthreads(); }
+        /* ★树的尾巴进 warp 0(2026-10-07)★: 原来 10 级每级一次全体屏障(1024 线程一次 ~0.5 µs), 一发 4 个 token 串行就是 40 次屏障, 占这发 36.9 µs 的大头
+         * (验证步 80 发 = 1.43 ms 独占)。k ≥ 64 的四级照旧(跨 warp 要屏障); k=32 起只剩 warp 0 的 32 个槽: 它自己从 shared 取 sh[i+32] 加到 sh[i],
+         * 再用 shfl_down 做 k=16..1 —— **每一级加的仍是 sh[i] + sh[i+k] 这两个数、同一个左右次序**, 只是不再写回 shared, 所以和逐位同;
+         * 上半 lane 的值没人用。屏障 11 → 6 次/token。门 = 温 0 输出 cmp(同轨 + 纯解码)。 */
+        for (uint32_t k = blockDim.x / 2; k > 32u; k >>= 1) { if (threadIdx.x < k) sh[threadIdx.x] += sh[threadIdx.x + k]; __syncthreads(); }
+        if (threadIdx.x < 32u) {
+            float v = sh[threadIdx.x] + sh[threadIdx.x + 32u];              /* k=32 */
+            #pragma unroll
+            for (int k = 16; k > 0; k >>= 1) v += __shfl_down_sync(0xffffffffu, v, k);   /* k=16..1: lane i 得 sh[i] + sh[i+k] */
+            if (threadIdx.x == 0) sh[0] = v;
+        }
+        __syncthreads();
     }
     const float inv = rsqrtf(sh[0] / (float)dim + eps);
     /* ② 逐字照抄 v41_f32_gemv_kernel 的 ksplit 分支(这里恒是 rows_per_block=1); 本 block 只管 kpart ∈ [sp·kper, sp·kper+kper) */

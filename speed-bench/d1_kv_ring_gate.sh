@@ -103,18 +103,25 @@ fi
 # 为什么门是逐字节: 图只是同一批核的另一种发法, 位置从设备槽读、组号/段数核里自算 —— 一个字节不同就是
 # 某个核把位置读错了(桶上限当真值、垃圾槽被读、段数算岔), 不是噪声。t/s 一并打出(同机器状态三条路各一份)。
 # 用法: ./speed-bench/d1_kv_ring_gate.sh ds4.base_pf <模型> 64 graph   (NGEN 给 128 可让 2K 提示跨 2048 那个桶边界)
+# 第 6 个参数(2026-10-01) = 每趟都追加的引擎参数, 例 "--posttrain <③目录>": 挂 ③ 时放大器的 cuBLAS 核进了整步图,
+#   改 PDL 边时对这种核取参数报 invalid device function, 以前整张图因此作废、静默退回直发(每步慢 ~3 ms 而输出照样对)。
+#   所以这格除了逐字节同, 还要看走图那趟日志里没有"捕获失败/PDL 改边失败"—— 有就判红。
 if [ "$MODE" = graph ]; then
   fail=0
+  read -r -a GX <<< "${6:-}"
   for c in "ctx2k:$OUT/p2k.txt" "ctx12k:$OUT/p12k.txt"; do
     tag="${c%%:*}"; P="${c#*:}"
     echo "== $tag"
     # 没基线就把上次留下的 gbase_* 删掉: 下面的三方 cmp 按"文件在不在"决定比不比, 旧文件(可能是另一个模型跑的)
     # 会被当基线比出一个假红(2026-09-19 q4k 门实撞: 拿 09-18 的 fp4 输出当基线, 报"gbase ≠ gdirect")。
-    if [ -x "./$BASE" ]; then run "$BASE" "gbase_$tag" -n "$NGEN" --no-dspark --prompt-file "$P"
+    if [ -x "./$BASE" ]; then run "$BASE" "gbase_$tag" -n "$NGEN" --no-dspark --prompt-file "$P" ${GX[@]+"${GX[@]}"}
     else rm -f "$OUT/gbase_$tag.out" "$OUT/gbase_$tag.err"; fi
-    run ds4 "gdirect_$tag" -n "$NGEN" --no-dspark --no-graph --prompt-file "$P"
-    run ds4 "ggraph_$tag"  -n "$NGEN" --no-dspark --prompt-file "$P"
-    run ds4 "ggraph2_$tag" -n "$NGEN" --no-dspark --prompt-file "$P"
+    run ds4 "gdirect_$tag" -n "$NGEN" --no-dspark --no-graph --prompt-file "$P" ${GX[@]+"${GX[@]}"}
+    run ds4 "ggraph_$tag"  -n "$NGEN" --no-dspark --prompt-file "$P" ${GX[@]+"${GX[@]}"}
+    run ds4 "ggraph2_$tag" -n "$NGEN" --no-dspark --prompt-file "$P" ${GX[@]+"${GX[@]}"}
+    for t in ggraph ggraph2; do
+      if grep -a -q "捕获失败\|PDL 改边失败" "$OUT/${t}_$tag.err"; then echo "  ★$t 走图失败(日志: $(grep -a -h '捕获失败\|PDL 改边失败' "$OUT/${t}_$tag.err" | head -1))★"; fail=1; fi
+    done
     for pair in "gdirect:ggraph" "ggraph:ggraph2" "gbase:gdirect"; do
       a="${pair%%:*}"; b="${pair#*:}"
       [ -f "$OUT/${a}_$tag.out" ] || continue

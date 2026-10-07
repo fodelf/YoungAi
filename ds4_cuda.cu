@@ -67,6 +67,7 @@
 #include "src/cuda/cuda_v41_1.inc.cu"   /* DeepSeek V4.1 批前向原语 ①②③(2026-09-12): 稠密/hc/norm | rope/量化/indexer/attn | 路由/MoE */
 #include "src/cuda/cuda_kv_pack.inc.cu"   /* 全局 KV 按官方格式打包(decode.md D1): 主 KV 288 B/组、索引 K 72 B/组; 在 v41_1 之后(用 bf16r/pow2_ceil_log2), 在三个注意力核之前(被它们解包) */
 #include "src/cuda/cuda_v41_indexer.inc.cu"   /* indexer 打分/候选块/topk(2026-09-18 从 v41_2 拆出); 在 kv_pack 之后(解包索引键) */
+#include "src/cuda/cuda_v41_indexer_mma.inc.cu"   /* 打分核的张量核版(2026-09-30, --idx-mma); 在 indexer 之后(用它的 v41_cand_ns, 被它的入口分发) */
 #include "src/cuda/cuda_sparse_attn_mma.inc.cu"   /* 稀疏注意力张量核版(speed.md 段 4); 必须在 v41_1 之后(用 v41_bf16r)、v41_2 之前(被它调) */
 #include "src/cuda/cuda_v41_hc.inc.cu"   /* mHC 一族(mix/sinkhorn/hc_pre/hc_post/合一核); 在 v41_1 之后(用它的 bf16r 与暂存槽) */
 #include "src/cuda/cuda_v41_attn_split.inc.cu"   /* 解码路稀疏注意力 split-K(single.md S4); 在 v41_2 之前(被它调) */
@@ -90,6 +91,7 @@
 #include "src/cuda/cuda_vq_prefill_nvfp4.inc.cu"   /* 预填专家: VQ 解到 NVFP4 暂存 + 板子原生 FP4 张量核(speed.md 段 5); 在融合路之前, 被它调 */
 #include "src/cuda/cuda_vq_prefill_fused.inc.cu"   /* 预填专家: VQ 解码即乘, 不落 f16 暂存(2026-09-15 第三轮) */
 #include "src/cuda/cuda_vq_prefill_mma.inc.cu"   /* 预填专家 v3: VQ 解成 bf16 瓦片 + 张量核(2026-09-24); 在融合路之后(用它的 vqp_item, 被它的 vqp_fused_run 调) */
+#include "src/cuda/cuda_vq_reg_mma.inc.cu"       /* 上一片的寄存器直解形态 vqs(2026-10-03, 逐位同、快 1.4~1.6 倍); 在它之后(用它的 g_vqm 暂存, 被它的 vqm_run_impl 调) */
 #include "src/cuda/cuda_vq_fused2_0.inc.cu"
 #include "src/cuda/cuda_vq_fused2_1.inc.cu"
 #include "src/cuda/cuda_vq_fused2_2.inc.cu"
@@ -98,6 +100,13 @@
 #include "src/cuda/cuda_hc.inc.cu"
 #include "src/cuda/cuda_zchain_1.inc.cu"
 #include "src/cuda/cuda_zchain_2.inc.cu"
+#include "src/cuda/cuda_bwd_dense.inc.cu"   /* 后训练反传的稠密原语(2026-10-01): 借 q4k/fp4/fp8 → bf16 解码核, 必须在 v41_q4k / gemv_highprec 之后 */
+#include "src/cuda/cuda_bwd_comp.inc.cu"    /* 后训练反传: 压缩行梯度 / 压缩器池化 / engram 门(分界层以下用; 借 v41_ckv_get), 必须在 bwd_attn 之前 */
+#include "src/cuda/cuda_bwd_attn.inc.cu"    /* 后训练反传: 稀疏注意力 + RoPE(借 v41_rope_freq / KV 打包常量) */
+#include "src/cuda/cuda_bwd_hc.inc.cu"      /* 后训练反传: mHC 混合系数(sinkhorn 重算倒推) */
+#include "src/cuda/cuda_bwd_vq.inc.cu"      /* 后训练反传: routed 专家的 VQ 直读两种核(行点积 / 转置累加), 不落稠密阵 */
+#include "src/cuda/cuda_bwd_moe.inc.cu"     /* 后训练反传: SwiGLU / 路由 / routed 专家(借 v41_vq_open·v41_vq_cw 解码与 g_v41_gr 增益覆盖) */
+#include "src/cuda/cuda_draft_attn.inc.cu"  /* 草稿器蒸馏(2026-10-07): 批量全可见块注意力前向(借 sparse_attn_mma 的打分/统计积木与 attn_split 的分段公式)/反向、陪审团、批量取行 */
 
 /* ★PDL 小核集中登记(2026-09-23)★: 这些核第一句就是 v41_pdl_wait()(见 cuda_internal.cuh 的 PDL 段), 所以前面的边可以改成程序化边 ——
  * 它们本身没有可预读的常量, 省的是发射与上线开销(与上一个核的收尾重叠)。放在聚合根末尾: 所有核都已定义, 这里才拿得到函数地址。

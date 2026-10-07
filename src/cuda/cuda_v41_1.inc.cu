@@ -63,6 +63,11 @@ static inline cudaStream_t v41_cublas_stream(void) { return g_cur_stream ? g_cur
  * 重捕获(几十 ms; 暂存只长不缩, 一个会话最多长几次)。 */
 static uint64_t g_v41_scratch_gen = 0;
 uint64_t ds4_gpu_v41_scratch_generation(void) { return g_v41_scratch_gen; }
+/* 长过的暂存槽登记在这里, 好让 ds4_gpu_v41_scratch_release 一把放掉(槽是散在各分片里的 static, 没有别的办法找全) */
+#define V41_SCRATCH_REG_MAX 512u
+static v41_scratch *g_v41_scratch_reg[V41_SCRATCH_REG_MAX];
+static const char *g_v41_scratch_what[V41_SCRATCH_REG_MAX];   /* 登记时的用途名(字面量), 放掉时按大小打出前几名 */
+static uint32_t g_v41_scratch_nreg = 0;
 static void *v41_grow(v41_scratch *s, uint64_t bytes, const char *what) {
     if (bytes <= s->cap) return s->p;
     (void)cudaDeviceSynchronize();
@@ -75,7 +80,41 @@ static void *v41_grow(v41_scratch *s, uint64_t bytes, const char *what) {
     }
     s->cap = bytes;
     g_v41_scratch_gen++;
+    uint32_t i = 0;
+    while (i < g_v41_scratch_nreg && g_v41_scratch_reg[i] != s) i++;
+    if (i == g_v41_scratch_nreg && g_v41_scratch_nreg < V41_SCRATCH_REG_MAX) { g_v41_scratch_what[g_v41_scratch_nreg] = what; g_v41_scratch_reg[g_v41_scratch_nreg++] = s; }
     return s->p;
+}
+/* 放掉全部暂存槽(下次用到再按需长)。暂存只长不缩是为了解码路少分配; 而后训练里"教师预填 2048 行"与"训练 ≤1024 行反传"
+ * 是先后两段, 前一段长出来的大槽在后一段一直占着 —— 10-02 全量全层训练就因此把可用内存压到 2.4 GB 被看门狗杀。
+ * 换指针 ⇒ 代号 +1, 解码整步图下次自动重捕获。返回放掉的字节数。 */
+uint64_t ds4_gpu_v41_scratch_bytes(void) {   /* 当前全部暂存槽合计(日志用) */
+    uint64_t b = 0;
+    for (uint32_t i = 0; i < g_v41_scratch_nreg; i++) b += g_v41_scratch_reg[i]->cap;
+    return b;
+}
+uint64_t ds4_gpu_v41_scratch_release(void) {
+    (void)cudaDeviceSynchronize();
+    uint64_t freed = 0;
+    uint32_t top[5] = { 0, 0, 0, 0, 0 }, nt = 0;   /* 最大的五个槽(按大小插入), 放之前记下来打日志: 内存吃紧时一眼看出是谁 */
+    for (uint32_t i = 0; i < g_v41_scratch_nreg; i++) {
+        const uint64_t c = g_v41_scratch_reg[i]->cap;
+        uint32_t k = nt < 5u ? nt++ : 5u;
+        while (k > 0 && g_v41_scratch_reg[top[k - 1]]->cap < c) { if (k < 5u) top[k] = top[k - 1]; k--; }
+        if (k < 5u) top[k] = i;
+    }
+    if (nt) {
+        fprintf(stderr, "ds4: [v41] 暂存最大的几块:");
+        for (uint32_t k = 0; k < nt; k++) fprintf(stderr, " %s %.0f MB;", g_v41_scratch_what[top[k]], (double)g_v41_scratch_reg[top[k]]->cap / 1048576.0);
+        fprintf(stderr, "\n");
+    }
+    for (uint32_t i = 0; i < g_v41_scratch_nreg; i++) {
+        v41_scratch *s = g_v41_scratch_reg[i];
+        if (s->p) { (void)cudaFree(s->p); freed += s->cap; }
+        s->p = NULL; s->cap = 0;
+    }
+    g_v41_scratch_gen++;
+    return freed;
 }
 
 __device__ __forceinline__ static float v41_bf16r(float x) {   /* RNE 舍到 bf16 再回 f32 */
@@ -233,7 +272,7 @@ int ds4_gpu_v41_grouped_matmul_fp4x32_tensor(ds4_gpu_tensor *low, const void *mo
 static int v41_f32_gemv(const float *w, uint64_t in_dim, uint64_t out_dim, const float *x, float *out,
                         uint32_t n_tok, const char *what);
 static int v41_bf16_gemv(const __nv_bfloat16 *w, uint64_t in_dim, uint64_t out_dim, const float *x, float *out,
-                         uint32_t n_tok, const char *what);
+                         uint32_t n_tok, const char *what, const int32_t *skip);   /* skip: markov 偏置缓存命中标志(设备), NULL = 无 */
 static int v41_fp8blk_gemv(const uint8_t *w, const uint8_t *sc, uint64_t in_dim, uint64_t out_dim,
                            const float *x, float *out, uint32_t n_tok, const char *what);
 static int v41_fp8blk_to_bf16(__nv_bfloat16 *o, const uint8_t *w, const uint8_t *sc, uint64_t in_dim, uint64_t rows);
@@ -268,7 +307,7 @@ int ds4_gpu_v41_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model_map, u
     const __nv_bfloat16 *W = (const __nv_bfloat16 *)cuda_model_range_ptr(model_map, weight_offset, wbytes, "v41 bf16 w");
     if (!W) return 0;
     if (n_tok <= V41_GEMV_MAX_TOK && (in_dim % 256u) == 0u)
-        return v41_bf16_gemv(W, in_dim, out_dim, (const float *)x->ptr, (float *)out->ptr, n_tok, "v41 bf16 gemv");
+        return v41_bf16_gemv(W, in_dim, out_dim, (const float *)x->ptr, (float *)out->ptr, n_tok, "v41 bf16 gemv", NULL);
     /* 预填: 激活转 bf16 一发 GEMM(激活本来就落在 bf16 格点上, 转过去不改值) */
     const uint64_t xn = (uint64_t)n_tok * in_dim;
     __nv_bfloat16 *xb = (__nv_bfloat16 *)v41_grow(&g_v41_xbf, xn * sizeof(__nv_bfloat16), "v41 bf16 x");
@@ -283,6 +322,16 @@ int ds4_gpu_v41_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model_map, u
     return cublas_ok(st, "v41 bf16 gemm");
 }
 
+/* 同上的解码 GEMV, 多一个设备侧 skip 标志(markov 偏置缓存命中 ⇒ 整网格直接退; 见 ds4_gpu_v41.h)。只收解码小批(n ≤ 8), 预填不走这条。 */
+int ds4_gpu_v41_matmul_bf16_skip_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset,
+                                        uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint32_t n_tok, const ds4_gpu_tensor *skip) {
+    if (!out || !x || !skip || n_tok == 0 || n_tok > V41_GEMV_MAX_TOK || (in_dim % 256u) != 0u) return 0;
+    const uint64_t wbytes = in_dim * out_dim * 2;
+    if (weight_offset > model_size || wbytes > model_size - weight_offset) return 0;
+    const __nv_bfloat16 *W = (const __nv_bfloat16 *)cuda_model_range_ptr(model_map, weight_offset, wbytes, "v41 bf16 w(skip)");
+    if (!W) return 0;
+    return v41_bf16_gemv(W, in_dim, out_dim, (const float *)x->ptr, (float *)out->ptr, n_tok, "v41 bf16 gemv(skip)", (const int32_t *)skip->ptr);
+}
 /* engram wkv: FP8(e4m3 + 32×32 块 ue8m0)权重 × f32 行 → f32。clear.md C1 起盘上就是官方格式,
  * 不再展开成 f16(字节减半, 值更准 —— 见 cuda_v41_gemv_highprec.inc.cu 的账)。
  * 这同时把 engram 从 V4 的 ds4_gpu_matmul_f16_tensor 上摘了下来, V4.1 前向不再借 V4 的核。 */

@@ -16,25 +16,8 @@ int ds4_gpu_zchain_zl_set(
     }
     if (!cuda_ok(cudaMalloc(&g_zc_zlm, total_halves * sizeof(__half)), "zchain zlm")) return 0;
     if (!cuda_ok(cudaMemcpy(g_zc_zlm, zlm, total_halves * sizeof(__half), cudaMemcpyHostToDevice), "zchain zlm up")) return 0;
-    {   /* fp8(e4m3) 影子(2026-08-20 ②刀): U/V 半字节读省 168MB/tok; z 仍读 fp16 正本。
-         * DS4_ZC_FP8=0 关(逃生口)。e4m3 单元素相对误差~6%, U·pv 求和 k≤1024 项均化后
-         * ~0.3% 量级(数值闸另验)。 */
-        /* 默认关(2026-08-20 终判): 净+0.35 t/s 但 e4m3=真数值扰动(KL 3.8e-2 ≈ 放大器
-         * 收益1/4), 质量门不换。DS4_ZC_FP8=1 显式开(批解码时代备用杠杆)。 */
-        const char *e8 = ((const char *)0) /* DS4_ZC_FP8: 路径开关已删(2026-08-22 隐形炸弹清理) */;
-        if (e8 && atoi(e8) != 0) {
-            if (cudaMalloc(&g_zc_zlm8, total_halves) == cudaSuccess) {
-                zc_h2fp8_kernel<<<(unsigned)((total_halves + 255u) / 256u), 256u>>>(
-                    g_zc_zlm8, (const __half *)g_zc_zlm, total_halves);
-                if (cudaGetLastError() != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) {
-                    (void)cudaFree(g_zc_zlm8); g_zc_zlm8 = NULL; (void)cudaGetLastError();
-                } else {
-                    fprintf(stderr, "ds4: zchain fp8(e4m3) U/V shadow armed (%.1f MB)\n",
-                            (double)total_halves / 1e6);
-                }
-            } else { g_zc_zlm8 = NULL; (void)cudaGetLastError(); }
-        }
-    }
+    /* fp8(e4m3) U/V 影子判负存档(2026-08-20 终判, 旋钮 DS4_ZC_FP8 已删): 净 +0.35 t/s 但 e4m3 是真数值扰动
+     * (KL 3.8e-2 ≈ 放大器收益 1/4), 质量门不换。g_zc_zlm8 恒 NULL, 核走 fp16 正本(zc_h2fp8_kernel 留作存档)。 */
     g_zc_zl_off = (uint32_t *)malloc(n_layer * sizeof(uint32_t));
     g_zc_zl_k   = (uint32_t *)malloc(n_layer * sizeof(uint32_t));
     g_zc_zl_din = (uint32_t *)malloc(n_layer * sizeof(uint32_t));

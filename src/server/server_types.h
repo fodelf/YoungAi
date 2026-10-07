@@ -310,5 +310,7 @@ typedef struct {
  * The file is re-read per request: it is tens of KB, and editing the page
  * then refreshing the browser must not require a server restart. */
 #define DS4_CHAT_PAGE_FILE "web/chat.html"
+/* GET /monitor 的监控页(2026-10-07): 同一套 cwd 契约, 零依赖单文件, 每秒拉一次同源 GET /metrics。 */
+#define DS4_MONITOR_PAGE_FILE "web/monitor.html"
 
 #endif /* DS4_SERVER_TYPES_H */

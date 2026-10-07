@@ -29,6 +29,9 @@
  * 只有三处不同: ①键范围限定在 [k0, k1) ②出口不除分母、不加 sink(留给合并核) ③写 pacc/pmax/psum。
  * ★posd(graph 路, 2026-09-18)★: 位置从设备槽读, ng/topk 按它自算(ds4_gpu_v41.h "设备位置"口径); nseg 是桶上限,
  * 超出真段数的段直接返回不写 —— 合并核按同一公式只读真段, 所以不写也不会读到残留。 */
+/* ★判负存档(2026-10-07)★ "合并并进 seg 核(threadfence 归约: 每个 (行, 头组) 最后到的 block 按段号固定序做合并, 省掉每层那一发
+ * v41_sparse_attn_merge_kernel)": 逐字节同, 但同请求 A/B 46.33 → 45.66 t/s(验证 59.0 → 60.0 ms) —— 合并尾巴压在 n_tok × 4 = 16 个 block
+ * 里串行做(16 个 SM 干活), 原来独立那发是 n_head × n_tok = 256 个 block 并行, 虽多一发核却更快。已回退到两发。 */
 __global__ static void v41_attn_mma_seg_kernel(float *pacc, float *pmax, float *psum,
                                                const float *q, const float *kvw, const uint8_t *kvc,
                                                const int32_t *idx, uint32_t pos0, uint32_t window,
@@ -137,9 +140,9 @@ __global__ static void v41_attn_mma_seg_kernel(float *pacc, float *pmax, float *
  * 法律侧车 + 一条短问答就能复现: 侧车改了草稿接受情况, 调度器才选到这个批大小。n_tok ≤ 8 ⇒ 最多 64 MB。 */
 int ds4_gpu_v41_attn_scratch_prepare(uint32_t n_tok, uint32_t n_head, uint32_t head_dim) {
     const uint64_t na = (uint64_t)V41_ATTN_SPLIT_MAX_SEG * n_tok * n_head;
-    return v41_grow(&g_v41_attn_pacc, na * head_dim * 4, "v41 attn mma acc") &&
-           v41_grow(&g_v41_attn_pmax, na * 4, "v41 attn mma max") &&
-           v41_grow(&g_v41_attn_psum, na * 4, "v41 attn mma sum") ? 1 : 0;
+    return v41_grow(&g_v41_attn_pacc[g_cur_lane], na * head_dim * 4, "v41 attn mma acc") &&
+           v41_grow(&g_v41_attn_pmax[g_cur_lane], na * 4, "v41 attn mma max") &&
+           v41_grow(&g_v41_attn_psum[g_cur_lane], na * 4, "v41 attn mma sum") ? 1 : 0;
 }
 
 /* posd / pos_cap: graph 路(见 ds4_gpu_v41.h): pos0..pos_cap 是图的有效位置区间, 段数按区间内最大值开 grid
@@ -193,9 +196,9 @@ static int v41_attn_mma_decode(float *o, const float *q, const float *kvw, const
         return 0;
     }
     const uint64_t na = (uint64_t)nseg * n_tok * n_head;
-    float *pacc = (float *)v41_grow(&g_v41_attn_pacc, na * hd * 4, "v41 attn mma acc");
-    float *pmax = (float *)v41_grow(&g_v41_attn_pmax, na * 4, "v41 attn mma max");
-    float *psum = (float *)v41_grow(&g_v41_attn_psum, na * 4, "v41 attn mma sum");
+    float *pacc = (float *)v41_grow(&g_v41_attn_pacc[g_cur_lane], na * hd * 4, "v41 attn mma acc");
+    float *pmax = (float *)v41_grow(&g_v41_attn_pmax[g_cur_lane], na * 4, "v41 attn mma max");
+    float *psum = (float *)v41_grow(&g_v41_attn_psum[g_cur_lane], na * 4, "v41 attn mma sum");
     if (!pacc || !pmax || !psum) return 0;
     v41_attn_mma_seg_kernel<<<dim3(nseg, n_head / DS4_ATTN_MMA_HEADS, n_tok), DS4_ATTN_MMA_WARPS * 32u, smem, g_cur_stream>>>(
         pacc, pmax, psum, q, kvw, kvc, idx, pos0, window, ng, topk, n_head, scale, ratio, nseg, posd, full_block, ring);

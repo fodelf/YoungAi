@@ -1,6 +1,9 @@
 /* cuda_lifecycle.inc.cu — ds4_cuda.cu 机械拆分分片(聚合根按序 #include, 单 TU 语义不变)。
  * init/cleanup, tensor 生命周期, side stream。
  */
+static char g_cuda_device_name[256];   /* ds4_gpu_device_name: 服务端监控页报设备名 */
+const char *ds4_gpu_device_name(void) { return g_cuda_device_name; }
+
 int ds4_gpu_init(void) {
     int dev = 0;
     if (!cuda_ok(cudaSetDevice(dev), "set device")) return 0;
@@ -8,6 +11,7 @@ int ds4_gpu_init(void) {
     if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
         fprintf(stderr, "ds4: CUDA backend initialized on %s (sm_%d%d)\n",
                 prop.name, prop.major, prop.minor);
+        snprintf(g_cuda_device_name, sizeof g_cuda_device_name, "%s", prop.name);
     }
     if (!g_cublas_ready) {
         if (!cublas_ok(cublasCreate(&g_cublas), "create handle")) return 0;
@@ -204,8 +208,21 @@ int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count)
     return cuda_ok(cudaGetLastError(), "tensor fill f32 launch");
 }
 
+static cudaStream_t g_cur_stream = 0;     /* 当前发射流: 0 == PTDS(-default-stream per-thread); 侧流/并发道切换它(见文件后半) */
+/* ★并发道(2026-09-30)★: 各路的缓存段同时跑在不同流上时, 核包装里按 v41_grow 拿的"全局暂存"(注意力分段 partial / 候选块)会互相踩 ——
+ * 同提示的探针门看不出来(各路写的值相同), 不同提示就是假注意力。所以这几块暂存按道分: 数组 [DS4_GPU_MAX_LANES], 下标 = 当前道
+ * (lane_begin 置, lane_end/join 回 0; 不分道时恒 0 = 与以前同一块)。 */
+#define DS4_GPU_MAX_LANES 8
+static int g_cur_lane = 0;
+
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
+    /* 挂在并发道/侧流上时(g_cur_stream ≠ 0): 同步 cudaMemcpy 只与 PTDS 有序, 道上还没跑到的核会读到被这次覆盖的旧值(压缩源层的
+     * posg 每层重写, 2026-09-30 并发道)。改成按当前流排队再等这条流 —— 与主流上的老行为(同步、有序)一样, 只是有序的对象换成当前流。 */
+    if (g_cur_stream) {
+        if (!cuda_ok(cudaMemcpyAsync((char *)tensor->ptr + offset, data, (size_t)bytes, cudaMemcpyHostToDevice, g_cur_stream), "tensor write(lane)")) return 0;
+        return cuda_ok(cudaStreamSynchronize(g_cur_stream), "tensor write(lane) sync");
+    }
     return cuda_ok(cudaMemcpy((char *)tensor->ptr + offset, data, (size_t)bytes, cudaMemcpyHostToDevice), "tensor write");
 }
 
@@ -224,10 +241,11 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
     if (bytes == 0) return 1;
     /* DtoD 走异步(ptds 同流有序): 同步版每次吸收整条 GPU 队列等待, spec 捕获
      * 172 次/轮时是 verify 空隙主因(2026-08-21 nsys cudaMemcpy 54%)。 */
+    /* 流 = g_cur_stream(0 = PTDS, 与以前一模一样); 挂在并发道/侧流上发时跟着那条流走, 否则拷贝落主流与道上的核乱序(2026-09-30 并发道) */
     return cuda_ok(cudaMemcpyAsync((char *)dst->ptr + dst_offset,
                               (const char *)src->ptr + src_offset,
                               (size_t)bytes,
-                              cudaMemcpyDeviceToDevice),
+                              cudaMemcpyDeviceToDevice, g_cur_stream),
                    "tensor copy");
 }
 
@@ -294,7 +312,7 @@ static int32_t *g_tok_id_dev = NULL;      /* device 侧 token id */
  * capture 中 event record/wait 构建图依赖边; 资源须 capture 外创建。 */
 static cudaStream_t g_side_stream = NULL;
 static cudaEvent_t g_side_fork_ev = NULL, g_side_join_ev = NULL;
-static cudaStream_t g_cur_stream = 0;     /* 0 == PTDS(-default-stream per-thread) */
+/* g_cur_stream(0 == PTDS)定义提前到本文件 tensor_write/copy 之前(2026-09-30 并发道: 拷贝/写入也按当前流) */
 static int g_side_active = 0;
 static int32_t *g_tok_id_host = NULL;     /* pinned host 参数槽(直发路写 token 用) */
 static int32_t g_tok_id_want = 0;         /* capture 期暂存的 token */
@@ -325,8 +343,10 @@ static void side_stream_ensure(void) {
     }
 }
 
+static int g_no_side_stream = 0;   /* --no-side-stream(2026-10-07 诊断, CLI 旗不是 env): 关共享专家侧流, 成对量"两类核抢带宽"的重叠段值多少 */
+void ds4_gpu_set_side_stream(int on) { g_no_side_stream = on ? 0 : 1; }
 int ds4_gpu_side_mark(void) {
-    if (((const char *)0) /* DS4_NO_SIDE_STREAM: 路径开关已删(2026-08-22 隐形炸弹清理) */) return 0;   /* 二分诊断: 关闭双流并发 */
+    if (g_no_side_stream) return 0;   /* 二分诊断: 关闭双流并发(输出逐字节同, 只换发法) */
     if (!g_side_stream || !g_side_fork_ev) {
         cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
         (void)cudaStreamIsCapturing(cudaStreamPerThread, &cs);
@@ -364,6 +384,51 @@ int ds4_gpu_side_join(void) {
         cudaStreamWaitEvent(cudaStreamPerThread, g_side_join_ev, 0) != cudaSuccess) {
         (void)cudaGetLastError(); return 0;
     }
+    return 1;
+}
+
+/* ★N 条并发道(2026-09-30, 并发 batch.md; 契约在 ds4_gpu_core.h)★: 与侧流同一套事件姿势, 只是道数 ≤ 8 且各道之间没有先后。
+ * 资源懒建、捕获中不建(返回 0, 调用方串行发); 建好之后捕获态里 record/wait 变成图的依赖边, 图执行器会把各道的分支并行跑。 */
+static cudaStream_t g_lane_stream[DS4_GPU_MAX_LANES];
+static cudaEvent_t g_lane_join_ev[DS4_GPU_MAX_LANES], g_lane_fork_ev = NULL;
+static int g_lanes_n = 0, g_lanes_active = 0;
+
+int ds4_gpu_lanes_fork(int n) {
+    if (n < 1 || g_lanes_active) return 0;
+    if (n > DS4_GPU_MAX_LANES) n = DS4_GPU_MAX_LANES;
+    if (n > g_lanes_n) {
+        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+        (void)cudaStreamIsCapturing(cudaStreamPerThread, &cs);
+        if (cs != cudaStreamCaptureStatusNone) return 0;   /* 捕获中不许建资源 */
+        if (!g_lane_fork_ev && cudaEventCreateWithFlags(&g_lane_fork_ev, cudaEventDisableTiming) != cudaSuccess) { g_lane_fork_ev = NULL; (void)cudaGetLastError(); return 0; }
+        for (int i = g_lanes_n; i < n; i++) {
+            if (cudaStreamCreateWithFlags(&g_lane_stream[i], cudaStreamNonBlocking) != cudaSuccess ||
+                cudaEventCreateWithFlags(&g_lane_join_ev[i], cudaEventDisableTiming) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
+            g_lanes_n = i + 1;
+        }
+    }
+    if (cudaEventRecord(g_lane_fork_ev, cudaStreamPerThread) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
+    g_lanes_active = n;
+    return n;
+}
+
+int ds4_gpu_lane_begin(int i) {
+    if (!g_lanes_active || i < 0 || i >= g_lanes_active) return 0;
+    if (cudaStreamWaitEvent(g_lane_stream[i], g_lane_fork_ev, 0) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
+    g_cur_stream = g_lane_stream[i];
+    g_cur_lane = i;
+    return 1;
+}
+
+int ds4_gpu_lane_end(void) { g_cur_stream = 0; g_cur_lane = 0; return 1; }
+
+int ds4_gpu_lanes_join(void) {
+    g_cur_stream = 0; g_cur_lane = 0;
+    const int n = g_lanes_active;
+    g_lanes_active = 0;
+    for (int i = 0; i < n; i++)
+        if (cudaEventRecord(g_lane_join_ev[i], g_lane_stream[i]) != cudaSuccess ||
+            cudaStreamWaitEvent(cudaStreamPerThread, g_lane_join_ev[i], 0) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
     return 1;
 }
 

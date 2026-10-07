@@ -15,7 +15,7 @@
  * 09-29: 改成比"发法"(引擎规则 / 一律 pipe×4 / 一律 pipe×8 / 一律 stage), R 固定 1(R>1 已判负)。逐形状 NT=1: q_b pipe 173 → stage 225 GB/s,
  *   共享专家 153 → 188, kv 124 → 160; 每步合计 引擎规则 24.35 → 全 stage 21.10 ms; NT=4 时 q_b 反而 pipe×4 快(199 vs 185)。
  *   ⇒ 引擎不再按 4~12 KB 档位定发法, 改成每 (形状, 行数) 第一次直发时自己量两种取快的(cuda_v41_q4k.inc.cu v41_q4k_pick)。
- * 用法: nvcc -O3 -arch=native -o v41_q4k_gemv_bench v41_q4k_gemv_bench.cu && ./v41_q4k_gemv_bench [iters=50] [NT=4] [只跑第几个形状=-1 全部] [只跑第几种发法=-1 全部] [PDL 发射=0] [L2 预取试验=0]
+ * 用法: nvcc -O3 -arch=native -o v41_q4k_gemv_bench v41_q4k_gemv_bench.cu && ./v41_q4k_gemv_bench [iters=50] [NT=4] [只跑第几个形状=-1 全部] [只跑第几种发法=-1 全部] [PDL 发射=0] [L2 预取试验=0] [激活 0=f32 1=bf16 2=bf16块排布] [R=1]
  *   ★后两个参数给 ncu 用(09-29 晚)★: 全跑时每个形状还会为判据②多发 NT 次单行核, k_stage/k_pipe 的发射序号随 NT 变,
  *   靠 --launch-skip 数序号会数错核(实撞: 想量 wo_b NT=4 量到的是 wo_a 的单行核)。钉住形状与发法后 skip 5(暖身) count 1 就是那一发。 */
 #include <cstdio>
@@ -69,9 +69,18 @@ __device__ __forceinline__ static float dot8(const float *wl, const float *wh, c
 
 /* 一个 warp: R 行(shared 里第 row0..row0+R-1 行) × 本 K 段 × NT 条激活。块按 b 升序、每行 acc[j][t] 逐块累加 ⇒ 与 R=1 同序。
  * 激活按 t 外层读一次(8 个 float), 给 R 行各乘一遍 —— 这就是省 L1 流量的地方。 */
-template <uint32_t NT, uint32_t R>
+/* ★XB=1: 激活按 bf16 读(2026-10-01)★: NT 行里每 lane 每块要读 NT×(4+4) 个激活, f32 是两条 float4 = 32 B/行, 32 lane 铺开 1 KB = 8 个 L1 波前;
+ * 激活本来就在 bf16 格点上(调用方 rms_norm/bf16r 舍过, 与 fp4x32 骨架 NT>1 那条路同一前提), 存成 bf16 后两条 uint2 = 16 B/行 = 4 个波前 —— 这是
+ * NT>1 多行税的大头(微基准 NT=6 +11.7 ms/步 ≈ 224M 块 × 8 波前 × 6 行 ÷ (48 SM × 2.42 GHz)), 对半砍。bf16→f32 补零精确, dot8 同一棵树 ⇒ 逐位同。 */
+__device__ __forceinline__ static float4 bf16x4_to_f4(uint2 v) {
+    float4 r;
+    r.x = __uint_as_float(v.x << 16); r.y = __uint_as_float(v.x & 0xffff0000u);
+    r.z = __uint_as_float(v.y << 16); r.w = __uint_as_float(v.y & 0xffff0000u);
+    return r;
+}
+template <uint32_t NT, uint32_t R, uint32_t XB>
 __device__ __forceinline__ static void rows_acc(const uint8_t *sw, uint32_t row0, uint32_t nrows_here, uint32_t nblk, uint32_t ksplit,
-                                                uint32_t kpart, const float *x, uint32_t x_stride, float (*acc)[NT]) {
+                                                uint32_t kpart, const void *x, uint32_t x_stride, float (*acc)[NT]) {
     const uint32_t lane = threadIdx.x & 31u, gidx = lane >> 3, q0 = (lane & 7u) * 4u;
     for (uint32_t b = kpart; b < nblk; b += ksplit) {
         float wl[R][4], wh[R][4];
@@ -85,8 +94,16 @@ __device__ __forceinline__ static void rows_acc(const uint8_t *sw, uint32_t row0
         const uint32_t e_lo = b * BLK + gidx * 64u + q0, e_hi = e_lo + 32u;
         #pragma unroll
         for (uint32_t t = 0; t < NT; t++) {
-            const float *xt = x + (uint64_t)t * x_stride;
-            const float4 xl = *(const float4 *)(xt + e_lo), xh = *(const float4 *)(xt + e_hi);
+            float4 xl, xh;
+            if (XB == 2) {   /* 块友好排布: 第 b 块里 lane l 的 8 个 bf16 连续放在 b*256 + l*8 ⇒ 一条 16 B 读(指令数再砍半, 波前数与 XB=1 同) */
+                const uint16_t *xt = (const uint16_t *)x + (uint64_t)t * x_stride;
+                const uint4 v = *(const uint4 *)(xt + b * BLK + lane * 8u);
+                uint2 lo, hi; lo.x = v.x; lo.y = v.y; hi.x = v.z; hi.y = v.w;
+                xl = bf16x4_to_f4(lo); xh = bf16x4_to_f4(hi);
+            } else if (XB) { const uint16_t *xt = (const uint16_t *)x + (uint64_t)t * x_stride;
+                      xl = bf16x4_to_f4(*(const uint2 *)(xt + e_lo)); xh = bf16x4_to_f4(*(const uint2 *)(xt + e_hi)); }
+            else { const float *xt = (const float *)x + (uint64_t)t * x_stride;
+                   xl = *(const float4 *)(xt + e_lo); xh = *(const float4 *)(xt + e_hi); }
             #pragma unroll
             for (uint32_t j = 0; j < R; j++) if (row0 + j < nrows_here) acc[j][t] += dot8(wl[j], wh[j], xl, xh);
         }
@@ -131,8 +148,8 @@ __device__ __forceinline__ static void pdl_wait_trigger() {
  * MINB = __launch_bounds__ 的每 SM 最少 CTA 数 = 编译器的寄存器上限(65536 / (256·MINB)): 4 ⇒ 64 个, 5 ⇒ 51(按 8 取整 48)。
  * ★为什么要比 4 与 5★: 引擎 NT=1 只用 43 个寄存器, 每 SM 实际放得下 5 个 CTA —— 上一发还剩尾波时下一发已能占第 5 个空位预搬权重;
  * NT≥3 编译器把 64 个用满, 空位归零, PDL 的预搬无处可放。这个假设只有带 PDL 的链式发射量得出来。 */
-template <uint32_t NT, uint32_t R, uint32_t MINB>
-__global__ static void __launch_bounds__(256 / R, MINB * R) k_stage(float *out, const uint8_t *w, const float *x, uint32_t in_dim,
+template <uint32_t NT, uint32_t R, uint32_t MINB, uint32_t XB>
+__global__ static void __launch_bounds__(256 / R, MINB * R) k_stage(float *out, const uint8_t *w, const void *x, uint32_t in_dim,
                                                                     uint32_t out_dim, uint32_t ksplit, uint32_t x_stride, uint32_t out_stride) {
     extern __shared__ uint4 st[];
     __shared__ float red[WARPS * NT];
@@ -148,12 +165,12 @@ __global__ static void __launch_bounds__(256 / R, MINB * R) k_stage(float *out, 
     for (uint32_t j = 0; j < R; j++)
         #pragma unroll
         for (uint32_t t = 0; t < NT; t++) acc[j][t] = 0.f;
-    rows_acc<NT, R>((const uint8_t *)st, row0, nrows, nblk, ksplit, kpart, x, x_stride, acc);
+    rows_acc<NT, R, XB>((const uint8_t *)st, row0, nrows, nblk, ksplit, kpart, x, x_stride, acc);
     rows_finish<NT, R>(acc, out, out_stride, r0, row0, nrows, ksplit, kpart, red);
 }
 /* pipe: CTA 常驻, 按 rg += gridDim.x 循环行组, cp.async 双缓冲(算第 k 组时搬第 k+1 组) */
-template <uint32_t NT, uint32_t R, uint32_t OCC>
-__global__ static void __launch_bounds__(256 / R, OCC * R) k_pipe(float *out, const uint8_t *w, const float *x, uint32_t in_dim,
+template <uint32_t NT, uint32_t R, uint32_t OCC, uint32_t XB>
+__global__ static void __launch_bounds__(256 / R, OCC * R) k_pipe(float *out, const uint8_t *w, const void *x, uint32_t in_dim,
                                                                 uint32_t out_dim, uint32_t ksplit, uint32_t x_stride, uint32_t out_stride) {
     extern __shared__ uint4 st[];
     __shared__ float red[WARPS * NT];
@@ -181,7 +198,7 @@ __global__ static void __launch_bounds__(256 / R, OCC * R) k_pipe(float *out, co
         for (uint32_t j = 0; j < R; j++)
             #pragma unroll
             for (uint32_t t = 0; t < NT; t++) acc[j][t] = 0.f;
-        rows_acc<NT, R>((const uint8_t *)(st + (uint64_t)buf * grp16), row0, nrows, nblk, ksplit, kpart, x, x_stride, acc);
+        rows_acc<NT, R, XB>((const uint8_t *)(st + (uint64_t)buf * grp16), row0, nrows, nblk, ksplit, kpart, x, x_stride, acc);
         rows_finish<NT, R>(acc, out, out_stride, r0, row0, nrows, ksplit, kpart, red);
         __syncthreads();
     }
@@ -215,7 +232,8 @@ __global__ static void k_dummy(const float *scratch, uint64_t n, float *sink, lo
     while (clock64() - t0 < cycles) { for (int k = 0; k < 64; k++) b = b * 1.000001f + 0.5f; }
     if (b == 12345.f) *sink = b;
 }
-static int g_l2pf = 0;   /* 第 6 个参数: 0 关; 1 = TMA 批量预取; 2 = 逐线 prefetch 指令(都带 evict_last) */
+static int g_l2pf = 0;
+static int g_xb = 0, g_r = 1;   /* 第 8 个参数: R = 一个 warp 管几行(激活每块读一次给 R 行用; CTA 行数 ≥ R 才用) */     /* 第 7 个参数: 1 = NT>1 的核按 bf16 读激活(XB=1), 判据②仍是 f32 单行 ⇒ 过了就是"投机 == 纯解码"在核层面成立 */   /* 第 6 个参数: 0 关; 1 = TMA 批量预取; 2 = 逐线 prefetch 指令(都带 evict_last) */
 
 static uint32_t pick_ksplit(uint32_t out_dim, uint32_t groups, uint32_t nb) {   /* 引擎 v41_q4k_gemv 同式 */
     uint32_t k = 1;
@@ -244,8 +262,8 @@ static void launch_k(void (*kern)(KArgs...), dim3 grid, dim3 block, size_t shm, 
  * 而 ksplit 不能动(改了累加序), 能动的只有"谁常驻、驻几个、搬多深、寄存器上限" —— 这些都不改任何一行的加法序。 */
 #define NM 6
 static const char *g_mname[NM] = { "引擎规则", "pipe×4", "pipe×8", "stage", "stage×5", "pipe×5" };
-template <uint32_t NT, uint32_t R>
-static void launch(float *o, const uint8_t *w, const float *x, uint32_t in_dim, uint32_t out_dim, uint32_t ks, int mode) {
+template <uint32_t NT, uint32_t R, uint32_t XB>
+static void launch(float *o, const uint8_t *w, const void *x, uint32_t in_dim, uint32_t out_dim, uint32_t ks, int mode) {
     const uint32_t nb = in_dim / BLK, rpb = WARPS / ks, ngrp = (out_dim + rpb - 1u) / rpb, grp = rpb * nb * BYTES;
     const bool eng_pipe = grp > PIPE_MIN && grp <= PIPE_MAX;
     const bool pipe = mode == 1 || mode == 2 || mode == 5 || (mode == 0 && eng_pipe);
@@ -253,13 +271,13 @@ static void launch(float *o, const uint8_t *w, const float *x, uint32_t in_dim, 
     if (pipe) {
         const uint32_t occ = mode == 2 ? 8u : (mode == 5 ? 5u : 4u);
         uint32_t gx = (uint32_t)g_sm * occ; if (gx > ngrp) gx = ngrp;
-        if (mode == 2)      launch_k(k_pipe<NT, R, 8u>, dim3(gx), blk, 2u * grp, o, w, x, in_dim, out_dim, ks, in_dim, out_dim);
-        else if (mode == 5) launch_k(k_pipe<NT, R, 5u>, dim3(gx), blk, 2u * grp, o, w, x, in_dim, out_dim, ks, in_dim, out_dim);
-        else                launch_k(k_pipe<NT, R, 4u>, dim3(gx), blk, 2u * grp, o, w, x, in_dim, out_dim, ks, in_dim, out_dim);
+        if (mode == 2)      launch_k(k_pipe<NT, R, 8u, XB>, dim3(gx), blk, 2u * grp, o, w, x, in_dim, out_dim, ks, in_dim, out_dim);
+        else if (mode == 5) launch_k(k_pipe<NT, R, 5u, XB>, dim3(gx), blk, 2u * grp, o, w, x, in_dim, out_dim, ks, in_dim, out_dim);
+        else                launch_k(k_pipe<NT, R, 4u, XB>, dim3(gx), blk, 2u * grp, o, w, x, in_dim, out_dim, ks, in_dim, out_dim);
     } else if (mode == 4) {
-        launch_k(k_stage<NT, R, 5u>, dim3(ngrp), blk, grp, o, w, x, in_dim, out_dim, ks, in_dim, out_dim);
+        launch_k(k_stage<NT, R, 5u, XB>, dim3(ngrp), blk, grp, o, w, x, in_dim, out_dim, ks, in_dim, out_dim);
     } else {
-        launch_k(k_stage<NT, R, 4u>, dim3(ngrp), blk, grp, o, w, x, in_dim, out_dim, ks, in_dim, out_dim);
+        launch_k(k_stage<NT, R, 4u, XB>, dim3(ngrp), blk, grp, o, w, x, in_dim, out_dim, ks, in_dim, out_dim);
     }
 }
 
@@ -274,7 +292,8 @@ static void run_nt(int iters, int only_shape, int only_mode) {
         {"wo_a 全8组 8192x4096", 8192, 4096, 40, 1} };   /* 引擎一发 grid.y=8 组连续 19 MB, 与单矩阵 8192 行同一几何(ksplit 1, rpb 8) */
     const char **mname = g_mname;
     double tot[NM] = {0}, best_tot = 0, tot_bytes = 0;
-    printf("== NT=%u 行激活(µs / GB/s; %d 种发法, ksplit 不变 ⇒ 全部逐位同; %s发射)\n", NT, NM, g_pdl ? "PDL 链式" : "普通");
+    printf("== NT=%u 行激活(µs / GB/s; %d 种发法, ksplit 不变 ⇒ 全部逐位同; %s发射; 激活 %s)\n", NT, NM, g_pdl ? "PDL 链式" : "普通", g_xb == 2 ? "bf16 块排布(XB=2)" : (g_xb ? "bf16(XB=1)" : "f32"));
+    if (g_r != 1) printf("== R=%d: 一个 warp 管 %d 行(CTA 行数 < R 的形状退回 R=1)\n", g_r, g_r);
     int si = -1;
     for (const shape_t &sh : shapes) {
         if (++si != only_shape && only_shape >= 0) continue;
@@ -294,22 +313,43 @@ static void run_nt(int iters, int only_shape, int only_mode) {
         uint8_t **dw = (uint8_t **)malloc(sizeof(uint8_t *) * ncopy);
         for (int c = 0; c < ncopy; c++) { CK(cudaMalloc(&dw[c], mbytes)); CK(cudaMemcpy(dw[c], h, mbytes, cudaMemcpyHostToDevice)); }
         float *dx, *o[NM], *o1; CK(cudaMalloc(&dx, xn * 4)); CK(cudaMemcpy(dx, hx, xn * 4, cudaMemcpyHostToDevice));
+        uint16_t *hx16 = (uint16_t *)malloc(xn * 2), *dx16;   /* bf16 副本: hx 的值是 1/16 的整数倍, bf16 精确 */
+        for (uint64_t i = 0; i < xn; i++) { uint32_t u; memcpy(&u, &hx[i], 4); hx16[i] = (uint16_t)(u >> 16); }
+        CK(cudaMalloc(&dx16, xn * 2)); CK(cudaMemcpy(dx16, hx16, xn * 2, cudaMemcpyHostToDevice));
+        uint16_t *hx16p = (uint16_t *)malloc(xn * 2), *dx16p;   /* XB=2 排布: 每块内 lane l 的 [lo4, hi4] 连续 */
+        for (uint32_t t = 0; t < NT; t++)
+            for (uint32_t b = 0; b < sh.in_dim / BLK; b++)
+                for (uint32_t l = 0; l < 32; l++) {
+                    const uint32_t gidx = l >> 3, q0 = (l & 7u) * 4u, e_lo = b * BLK + gidx * 64u + q0;
+                    for (uint32_t i = 0; i < 4; i++) {
+                        hx16p[(uint64_t)t * sh.in_dim + b * BLK + l * 8u + i] = hx16[(uint64_t)t * sh.in_dim + e_lo + i];
+                        hx16p[(uint64_t)t * sh.in_dim + b * BLK + l * 8u + 4u + i] = hx16[(uint64_t)t * sh.in_dim + e_lo + 32u + i];
+                    }
+                }
+        CK(cudaMalloc(&dx16p, xn * 2)); CK(cudaMemcpy(dx16p, hx16p, xn * 2, cudaMemcpyHostToDevice));
+        const void *xin = g_xb == 2 ? (const void *)dx16p : (g_xb ? (const void *)dx16 : (const void *)dx);
         for (int v = 0; v < NM; v++) CK(cudaMalloc(&o[v], on * 4));
         CK(cudaMalloc(&o1, on * 4));
         cudaEvent_t e0, e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
         float us[NM];
         for (int v = 0; v < NM; v++) {
             if (only_mode >= 0 && v != only_mode) { us[v] = 1e9f; continue; }   /* 没跑的发法: 时间记成无穷, 不参与"最快" */
-            for (int i = 0; i < 5; i++) launch<NT, 1>(o[v], dw[i % ncopy], dx, sh.in_dim, sh.out_dim, ks, v);
+            #define LAUNCH_XR(R_) do { if (g_xb == 2) launch<NT, R_, 2>(o[v], W_, xin, sh.in_dim, sh.out_dim, ks, v); \
+                                      else if (g_xb) launch<NT, R_, 1>(o[v], W_, xin, sh.in_dim, sh.out_dim, ks, v); \
+                                      else launch<NT, R_, 0>(o[v], W_, xin, sh.in_dim, sh.out_dim, ks, v); } while (0)
+            #define LAUNCH_X(O, W) do { const uint8_t *W_ = (W); if (g_r == 2 && (WARPS / ks) >= 2u) LAUNCH_XR(2); else LAUNCH_XR(1); } while (0)
+            for (int i = 0; i < 5; i++) LAUNCH_X(o[v], dw[i % ncopy]);
             CK(cudaEventRecord(e0));
-            for (int i = 0; i < iters; i++) launch<NT, 1>(o[v], dw[i % ncopy], dx, sh.in_dim, sh.out_dim, ks, v);
+            for (int i = 0; i < iters; i++) LAUNCH_X(o[v], dw[i % ncopy]);
             CK(cudaEventRecord(e1)); CK(cudaEventSynchronize(e1)); CK(cudaGetLastError());
             float ms; CK(cudaEventElapsedTime(&ms, e0, e1)); us[v] = ms * 1000.f / iters;
-            launch<NT, 1>(o[v], dw[0], dx, sh.in_dim, sh.out_dim, ks, v);
+            LAUNCH_X(o[v], dw[0]);
+            #undef LAUNCH_X
+            #undef LAUNCH_XR
         }
         /* 判据②: 第 t 行单独跑 NT=1(引擎纯解码那条路, 引擎规则) */
         for (uint32_t t = 0; t < NT; t++)
-            launch<1, 1>(o1 + (uint64_t)t * sh.out_dim, dw[0], dx + (uint64_t)t * sh.in_dim, sh.in_dim, sh.out_dim, ks, 0);
+            launch<1, 1, 0>(o1 + (uint64_t)t * sh.out_dim, dw[0], dx + (uint64_t)t * sh.in_dim, sh.in_dim, sh.out_dim, ks, 0);
         CK(cudaDeviceSynchronize());
         float *r[NM], *r1 = (float *)malloc(on * 4);
         for (int v = 0; v < NM; v++) { r[v] = (float *)malloc(on * 4); CK(cudaMemcpy(r[v], o[v], on * 4, cudaMemcpyDeviceToHost)); }
@@ -336,7 +376,7 @@ static void run_nt(int iters, int only_shape, int only_mode) {
                     if (variant) { CK(cudaEventSynchronize(e1)); float ms; CK(cudaEventElapsedTime(&ms, e0, e1)); if (i >= 3) t_pfk += ms; }
                     CK(cudaEventRecord(e0)); k_dummy<<<96, 256>>>(scr, sn, sink, cyc); CK(cudaEventRecord(e1));
                     CK(cudaEventSynchronize(e1)); { float ms; CK(cudaEventElapsedTime(&ms, e0, e1)); if (i >= 3 && variant) t_dm += ms; }
-                    CK(cudaEventRecord(e0)); launch<NT, 1>(o[only_mode], wc, dx, sh.in_dim, sh.out_dim, ks, only_mode); CK(cudaEventRecord(e1));
+                    CK(cudaEventRecord(e0)); launch<NT, 1, 0>(o[only_mode], wc, dx, sh.in_dim, sh.out_dim, ks, only_mode); CK(cudaEventRecord(e1));
                     CK(cudaEventSynchronize(e1)); { float ms; CK(cudaEventElapsedTime(&ms, e0, e1)); if (i >= 3) { if (variant) t_pf += ms; else t_cold += ms; } }
                 }
             }
@@ -352,7 +392,7 @@ static void run_nt(int iters, int only_shape, int only_mode) {
         tot_bytes += (double)mbytes * sh.per_step;
         for (int c = 0; c < ncopy; c++) cudaFree(dw[c]);
         for (int v = 0; v < NM; v++) { cudaFree(o[v]); free(r[v]); }
-        free(dw); cudaFree(dx); cudaFree(o1); free(h); free(hx); free(r1);
+        free(dw); cudaFree(dx); cudaFree(dx16); free(hx16); cudaFree(dx16p); free(hx16p); cudaFree(o1); free(h); free(hx); free(r1);
         cudaEventDestroy(e0); cudaEventDestroy(e1);
     }
     printf("== NT=%u 每步合计(按发射次数加权):", NT);
@@ -366,6 +406,8 @@ int main(int argc, char **argv) {
     const int os = argc > 3 ? atoi(argv[3]) : -1, om = argc > 4 ? atoi(argv[4]) : -1;
     g_pdl = argc > 5 && atoi(argv[5]) != 0;
     g_l2pf = argc > 6 ? atoi(argv[6]) : 0;
+    g_xb = argc > 7 ? atoi(argv[7]) : 0;
+    g_r = argc > 8 ? atoi(argv[8]) : 1;
     cudaDeviceProp pr; CK(cudaGetDeviceProperties(&pr, 0));
     g_sm = pr.multiProcessorCount;
     printf("%s SMs=%d L2=%d MB\n", pr.name, pr.multiProcessorCount, pr.l2CacheSize >> 20);

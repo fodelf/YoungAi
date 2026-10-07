@@ -248,6 +248,19 @@ bool serve_chat_page(int fd, bool enable_cors, const char *path) {
     return ok;
 }
 
+/* 监控页等其它静态页: 与 serve_chat_page 同一套 cwd 契约, 404 文案报的是传入的路径(chat 页那条为了老测试文案不动)。 */
+bool serve_page_file(int fd, bool enable_cors, const char *path) {
+    char *html = read_text_file_dup(path);
+    if (!html) {
+        char msg[400];
+        snprintf(msg, sizeof msg, "page file %s not found; start ds4-server from the repo root or pass --chdir", path);
+        return http_error(fd, enable_cors, 404, msg);
+    }
+    bool ok = http_response(fd, enable_cors, 200, "text/html; charset=utf-8", html);
+    free(html);
+    return ok;
+}
+
 /* Route match that tolerates a query string ("/?from=x" is still "/"). */
 bool path_route_is(const char *path, const char *route) {
     size_t n = strlen(route);

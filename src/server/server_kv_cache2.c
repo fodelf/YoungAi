@@ -118,6 +118,13 @@ static ds4_kvstore_trailer_hooks kv_cache_tool_map_hooks(server *s,
     };
 }
 
+/* 监控页"磁盘 KV 缓存"卡要的两个数: 盘上条目数与总字节。只在 worker 线程调(kv 表归它一个线程管) */
+static uint64_t kv_entries_bytes(const kv_disk_cache *kc) {
+    uint64_t total = 0;
+    for (int i = 0; i < kc->len; i++) total += kc->entry[i].payload_bytes + kc->entry[i].text_bytes;
+    return total;
+}
+
 static bool kv_cache_store_live_prefix_text(server *s, const ds4_tokens *tokens,
                                             int store_len, const char *reason,
                                             const char *cache_text_override,
@@ -125,12 +132,16 @@ static bool kv_cache_store_live_prefix_text(server *s, const ds4_tokens *tokens,
                                             const char *cache_text_key) {
     char err[160] = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
-    return ds4_kvstore_store_live_prefix_text(&s->kv, s->engine, s->session,
-                                              tokens, store_len, reason,
-                                              cache_text_override,
-                                              cache_text_ext,
-                                              cache_text_key,
-                                              &hooks, err, sizeof(err));
+    const int before = s->kv.len;
+    const bool ok = ds4_kvstore_store_live_prefix_text(&s->kv, s->engine, s->session,
+                                                       tokens, store_len, reason,
+                                                       cache_text_override,
+                                                       cache_text_ext,
+                                                       cache_text_key,
+                                                       &hooks, err, sizeof(err));
+    /* 逐出发生在 kvstore 内部(腾预算), 这里按条目数差推: 存了 1 条却没多 1 条 = 挤掉了几条 */
+    if (ok) mon_kv_event(s, "parked", store_len, s->kv.len, kv_entries_bytes(&s->kv), before + 1 - s->kv.len);
+    return ok;
 }
 
 bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
@@ -242,6 +253,7 @@ int kv_cache_try_load_text(server *s, const char *prompt_text,
     if (loaded > 0) {
         if (loaded_path_out && lr.path) *loaded_path_out = xstrdup(lr.path);
         if (loaded_ext_flags_out) *loaded_ext_flags_out = lr.ext_flags;
+        mon_kv_event(s, "restored", loaded, s->kv.len, kv_entries_bytes(&s->kv), 0);
     }
     ds4_kvstore_load_result_free(&lr);
     return loaded;

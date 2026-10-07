@@ -59,6 +59,14 @@ __device__ __forceinline__ static void vqm_mma(float *c, const uint32_t *a, uint
 }
 /* 瓦片一行 = 64 个 bf16 = 8 个 16 B 块; 块号与行号低 3 位异或, ldmatrix 一次取 8 行同一列块时落在 8 个不同 bank 组 */
 __device__ __forceinline__ static uint32_t vqm_swz(uint32_t row, uint32_t chunk) { return row * 128u + ((chunk ^ (row & 7u)) << 4); }
+/* 反传用(cuda_bwd_vq / cuda_bwd_attn): 转置取片 + 一行 128 个 bf16(16 个块)的交织。A 片存成 [K 行][M 列] 时用 .trans 取出 [M][K] 片段;
+ * 交织同上(块号低 3 位与行号低 3 位异或), 写入与取址必须同一个式子, 写错不报错只出垃圾梯度。 */
+__device__ __forceinline__ static void vqm_ldsm4t(uint32_t *r, const uint8_t *p) {
+    const uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+__device__ __forceinline__ static uint32_t vqm_swz256(uint32_t row, uint32_t chunk) { return row * 256u + ((chunk ^ (row & 7u)) << 4); }
 /* 一个码字 → 8 个 bf16(16 B): CB=0 码本是 E4M3(8 B/词)现场转; CB=1 码本进 shared 时已转成 bf16(16 B/词), 直接取 */
 template <int CB>
 __device__ __forceinline__ static uint4 vqm_cw(const uint8_t *cbs, uint32_t v) {
@@ -79,6 +87,7 @@ __global__ static void vqm_gather16_kernel(uint16_t *xs, const float *x, const i
 }
 
 /* MODE 0 = gate: g32 = bf16(W1·x·g) | 1 = up: 读 g32 做 clamp+SwiGLU 写 h16 | 2 = down: ys = bf16(W2·h·g)。
+ * MODE 1 的 ys 非空 = 顺手把 up 的输出 H_u(bf16r 后, SwiGLU 之前)也写进去 —— 后训练反传要它求 SwiGLU 的导数(推理路传 NULL, 行为不变)。
  * 出口舍入点与融合路 vqp_fused_gu/down 逐式相同(求和 → 乘行增益 → bf16r)。cb_bytes = 码本在 shared 里的字节(CB=1 是 nc×16)。 */
 template <int EXT, int MODE, int CB>
 __global__ __launch_bounds__(VQM_THREADS, 1) static void vqm_kernel(
@@ -192,7 +201,7 @@ __global__ __launch_bounds__(VQM_THREADS, 1) static void vqm_kernel(
                     const uint64_t o = (uint64_t)(base + t) * M + r;
                     const float val = v41_bf16r(acc[f][h * 2u + e] * g);
                     if (MODE == 0) g32[o] = val;
-                    else if (MODE == 1) h16[o] = v41_vq_swiglu(g32[o], val, clamp);
+                    else if (MODE == 1) { h16[o] = v41_vq_swiglu(g32[o], val, clamp); if (ys) ys[o] = val; }
                     else ys[o] = val;
                 }
             }
@@ -218,10 +227,20 @@ static int vqm_grid_of(size_t shb, uint32_t nwork) {
     return (int)(g < nwork ? g : nwork);
 }
 
-/* 返回 0 = 失败(调用方硬失败)。ys = 排序后的 down 输出 [nvalid][OUT], 与融合路写的是同一个缓冲, reduce 一字不改。 */
-static int vqm_run(const uint8_t *blob, const uint32_t *cnt, const uint32_t *off_h, uint32_t n_total_expert, uint32_t nvalid,
-                   uint32_t IN, uint32_t MID, uint32_t OUT, uint32_t nc, float clamp, const float *x, const int32_t *perm,
-                   uint32_t n_expert, uint32_t layer_index, float *ys, const float *gr) {
+/* 寄存器直解形态 vqs(cuda_vq_reg_mma.inc.cu, 本片之后 include): 形状认得就走它, 与本片 vqm_kernel 逐位同、训练包快 1.6 倍 */
+static bool vqs_shape_ok(uint32_t IN, uint32_t MID, uint32_t OUT, uint32_t nbit);
+static int vqs_blob_fits(uint32_t layer, const uint8_t *blob, uint32_t n_total, uint32_t IN, uint32_t MID, uint32_t OUT);
+static uint32_t vqs_item_tokens(void);
+static int vqs_launch3(float *g32, uint16_t *h16, float *hu, float *ys, const uint8_t *blob, const vqp_item *items, uint32_t nitems,
+                       const uint16_t *xs, const uint32_t *doff, uint32_t IN, uint32_t MID, uint32_t OUT, uint32_t nc, uint32_t nbit,
+                       float clamp, const float *gr, uint32_t layer_index);
+
+/* 返回 0 = 失败(调用方硬失败)。ys = 排序后的 down 输出 [nvalid][OUT], 与融合路写的是同一个缓冲, reduce 一字不改。
+ * hg/ha/hu 非空 = 逐对中间量写进调用方的缓冲(排序序, [nvalid][MID]): hg = H_g(f32, 值在 bf16 格点), ha = A = SwiGLU 出口(bf16 位),
+ * hu = H_u(f32, bf16 格点)—— 后训练反传要它们(vqm_run_parts); 空 = 用本文件的暂存, 只出 ys(推理路)。 */
+static int vqm_run_impl(const uint8_t *blob, const uint32_t *cnt, const uint32_t *off_h, uint32_t n_total_expert, uint32_t nvalid,
+                        uint32_t IN, uint32_t MID, uint32_t OUT, uint32_t nc, float clamp, const float *x, const int32_t *perm,
+                        uint32_t n_expert, uint32_t layer_index, float *ys, const float *gr, float *hg, uint16_t *ha, float *hu) {
     uint32_t nbit = 0; while ((1u << nbit) < nc) nbit++;
     if ((nbit != 12u && nbit != 13u) || IN % VQM_BK || MID % VQM_BK) {
         fprintf(stderr, "ds4: [vq-prefill] L%u 张量核路不认这个形状(码本 %u 词, IN %u MID %u)\n", layer_index, nc, IN, MID);
@@ -239,21 +258,25 @@ static int vqm_run(const uint8_t *blob, const uint32_t *cnt, const uint32_t *off
                 VQM_BN, VQM_THREADS, ok ? "就绪" : "★不可用★", nsm);
     }
     if (g_vqm.ready != 1) return 0;
+    const bool rs = vqs_shape_ok(IN, MID, OUT, nbit) && vqs_blob_fits(layer_index, blob, n_total_expert, IN, MID, OUT);
+    const uint32_t bn = rs ? vqs_item_tokens() : VQM_BN;   /* 一个工作项最多几个 token: 两种核切法不同 */
     uint32_t nit = 0;
-    for (uint32_t e = 0; e < n_total_expert; e++) nit += (cnt[e] + VQM_BN - 1u) / VQM_BN;
+    for (uint32_t e = 0; e < n_total_expert; e++) nit += (cnt[e] + bn - 1u) / bn;
     if (!nit) return 0;
     vqp_item *ih = (vqp_item *)malloc((size_t)nit * sizeof(vqp_item));
     if (!ih) return 0;
     uint32_t k = 0;
     for (uint32_t e = 0; e < n_total_expert; e++)
-        for (uint32_t t0 = 0; t0 < cnt[e]; t0 += VQM_BN) {
-            ih[k].e = (int32_t)e; ih[k].t0 = (int32_t)t0; ih[k].nt = (int32_t)(cnt[e] - t0 < VQM_BN ? cnt[e] - t0 : VQM_BN); k++;
+        for (uint32_t t0 = 0; t0 < cnt[e]; t0 += bn) {
+            ih[k].e = (int32_t)e; ih[k].t0 = (int32_t)t0; ih[k].nt = (int32_t)(cnt[e] - t0 < bn ? cnt[e] - t0 : bn); k++;
         }
     int ok = vqp_grow((void **)&g_vqm.d, &g_vqm.cap, nit, sizeof(vqp_item), "mma items") &&
              vqp_grow((void **)&g_vqm.doff, &g_vqm.doff_cap, n_total_expert + 1u, sizeof(uint32_t), "mma off") &&
              vqp_grow((void **)&g_vqm.xs16, &g_vqm.xs16_cap, (uint64_t)nvalid * IN, sizeof(uint16_t), "mma xs16") &&
-             vqp_grow((void **)&g_vqm.h16, &g_vqm.h16_cap, (uint64_t)nvalid * MID, sizeof(uint16_t), "mma h16") &&
-             vqp_grow((void **)&g_vqm.g32, &g_vqm.g32_cap, (uint64_t)nvalid * MID, sizeof(float), "mma g32");
+             (ha || vqp_grow((void **)&g_vqm.h16, &g_vqm.h16_cap, (uint64_t)nvalid * MID, sizeof(uint16_t), "mma h16")) &&
+             (hg || vqp_grow((void **)&g_vqm.g32, &g_vqm.g32_cap, (uint64_t)nvalid * MID, sizeof(float), "mma g32"));
+    float *g32 = hg ? hg : g_vqm.g32;
+    uint16_t *h16 = ha ? ha : g_vqm.h16;
     if (ok) ok = cudaMemcpyAsync(g_vqm.d, ih, (size_t)nit * sizeof(vqp_item), cudaMemcpyHostToDevice, g_cur_stream) == cudaSuccess &&
                  cudaMemcpyAsync(g_vqm.doff, off_h, (size_t)(n_total_expert + 1u) * sizeof(uint32_t), cudaMemcpyHostToDevice, g_cur_stream) == cudaSuccess;
     /* ih 是异步 H2D 的源, 主机内存可分页 ⇒ cudaMemcpyAsync 在返回前已拷进暂存, 这里释放是安全的(融合路同款) */
@@ -261,18 +284,49 @@ static int vqm_run(const uint8_t *blob, const uint32_t *cnt, const uint32_t *off
     if (!ok) { (void)cudaGetLastError(); fprintf(stderr, "ds4: [vq-prefill] L%u 张量核路暂存/拷贝失败\n", layer_index); return 0; }
     vqm_gather16_kernel<<<nvalid, 256, 0, g_cur_stream>>>(g_vqm.xs16, x, perm, n_expert, IN);
     if (!cuda_ok(cudaGetLastError(), "vq prefill mma gather16")) return 0;
+    if (rs) return vqs_launch3(g32, h16, hu, ys, blob, g_vqm.d, nit, g_vqm.xs16, g_vqm.doff, IN, MID, OUT, nc, nbit, clamp, gr, layer_index);
     const uint32_t tg = (MID + VQM_BM - 1u) / VQM_BM, td = (OUT + VQM_BM - 1u) / VQM_BM;
 #define VQM_LAUNCH(E, CB) do { \
         const int bg = vqm_grid_of<E, 0, CB>(shb, nit * tg), bu = vqm_grid_of<E, 1, CB>(shb, nit * tg), bd = vqm_grid_of<E, 2, CB>(shb, nit * td); \
         if (bg <= 0 || bu <= 0 || bd <= 0) { fprintf(stderr, "ds4: [vq-prefill] L%u 张量核实例开不出 %u KB shared\n", layer_index, shb >> 10); return 0; } \
-        vqm_kernel<E, 0, CB><<<bg, VQM_THREADS, shb, g_cur_stream>>>(g_vqm.g32, NULL, NULL, blob, g_vqm.d, nit, g_vqm.xs16, g_vqm.doff, MID, IN, clamp, cbb, NULL); \
+        vqm_kernel<E, 0, CB><<<bg, VQM_THREADS, shb, g_cur_stream>>>(g32, NULL, NULL, blob, g_vqm.d, nit, g_vqm.xs16, g_vqm.doff, MID, IN, clamp, cbb, NULL); \
         if (!cuda_ok(cudaGetLastError(), "vq prefill mma gate")) return 0; \
-        vqm_kernel<E, 1, CB><<<bu, VQM_THREADS, shb, g_cur_stream>>>(g_vqm.g32, g_vqm.h16, NULL, blob, g_vqm.d, nit, g_vqm.xs16, g_vqm.doff, MID, IN, clamp, cbb, NULL); \
+        vqm_kernel<E, 1, CB><<<bu, VQM_THREADS, shb, g_cur_stream>>>(g32, h16, hu, blob, g_vqm.d, nit, g_vqm.xs16, g_vqm.doff, MID, IN, clamp, cbb, NULL); \
         if (!cuda_ok(cudaGetLastError(), "vq prefill mma up")) return 0; \
-        vqm_kernel<E, 2, CB><<<bd, VQM_THREADS, shb, g_cur_stream>>>(NULL, NULL, ys, blob, g_vqm.d, nit, g_vqm.h16, g_vqm.doff, OUT, MID, clamp, cbb, gr); \
+        vqm_kernel<E, 2, CB><<<bd, VQM_THREADS, shb, g_cur_stream>>>(NULL, NULL, ys, blob, g_vqm.d, nit, h16, g_vqm.doff, OUT, MID, clamp, cbb, gr); \
         return cuda_ok(cudaGetLastError(), "vq prefill mma down"); \
     } while (0)
     if (nbit == 13u) VQM_LAUNCH(1, 0);
     VQM_LAUNCH(0, 1);
 #undef VQM_LAUNCH
+}
+
+/* 后训练重算截留(10-02): 反传要逐对 H_g/A/H_u/O —— H_g/A 本来就留在本文件暂存(g_vqm.g32/h16), O 在 g_vqp.ys, 重算刚算完、反传紧接着就用;
+ * 只有 H_u(up 出口)推理路用完即丢。截留开着时 up 档顺手写进 hu, 反传拿四样直接用, 不再把本层专家前向算第二遍
+ * (10-02 逐核表: 前向 / 重算 / 反传三遍专家前向合计占 37%)。只有训练器重算那一刻开(ds4_gpu_bwd_moe_capture), 推理路关着, 行为不变。
+ * layer/nvalid 记下来给反传核对"是不是同一层同一批配对", 反传用一次就把 valid 清掉。 */
+static struct { int on, valid; uint32_t layer, nvalid; float *hu; uint64_t cap; } g_vqm_cap;
+
+/* 推理路入口(预填 / 打分): 只要 ys; 截留开着时多存一份 H_u */
+static int vqm_run(const uint8_t *blob, const uint32_t *cnt, const uint32_t *off_h, uint32_t n_total_expert, uint32_t nvalid,
+                   uint32_t IN, uint32_t MID, uint32_t OUT, uint32_t nc, float clamp, const float *x, const int32_t *perm,
+                   uint32_t n_expert, uint32_t layer_index, float *ys, const float *gr) {
+    if (!g_vqm_cap.on)
+        return vqm_run_impl(blob, cnt, off_h, n_total_expert, nvalid, IN, MID, OUT, nc, clamp, x, perm, n_expert, layer_index, ys, gr, NULL, NULL, NULL);
+    g_vqm_cap.valid = 0;
+    if (!vqp_grow((void **)&g_vqm_cap.hu, &g_vqm_cap.cap, (uint64_t)nvalid * MID, sizeof(float), "mma hu capture") ||
+        !vqm_run_impl(blob, cnt, off_h, n_total_expert, nvalid, IN, MID, OUT, nc, clamp, x, perm, n_expert, layer_index, ys, gr, NULL, NULL, g_vqm_cap.hu))
+        return 0;
+    g_vqm_cap.valid = 1; g_vqm_cap.layer = layer_index; g_vqm_cap.nvalid = nvalid;
+    return 1;
+}
+
+/* 后训练反传入口(cuda_bwd_moe.inc.cu): 同一组张量核、同一个舍入点, 外加逐对 H_g / A / H_u ⇒ 反传对着的就是前向真算的那个函数。
+ * 为什么不再用 VQ 直读行点积(cuda_bwd_vq.inc.cu)重算这三块: 那是 CUDA 核标量乘加, 一题两三百 token 摊到 ~365 个专家每个只 ~4 个 token,
+ * 解码一遍位流只喂 4 个 token, 10-02 逐核表 rowdot 占整题 GPU 时间 33.4%(3.23 s/题), 同样三块矩阵这里每层 ~33 ms 对 rowdot ~81 ms。 */
+static int vqm_run_parts(const uint8_t *blob, const uint32_t *cnt, const uint32_t *off_h, uint32_t n_total_expert, uint32_t nvalid,
+                         uint32_t IN, uint32_t MID, uint32_t OUT, uint32_t nc, float clamp, const float *x, const int32_t *perm,
+                         uint32_t n_expert, uint32_t layer_index, float *ys, const float *gr, float *hg, uint16_t *ha, float *hu) {
+    if (!hg || !ha || !hu || !ys) return 0;
+    return vqm_run_impl(blob, cnt, off_h, n_total_expert, nvalid, IN, MID, OUT, nc, clamp, x, perm, n_expert, layer_index, ys, gr, hg, ha, hu);
 }

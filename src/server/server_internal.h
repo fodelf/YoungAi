@@ -119,7 +119,24 @@ bool http_error(int fd, bool enable_cors, int code, const char *msg);
 bool request_exceeds_context(const request *r, int ctx_size);
 bool http_error_context_length_exceeded(int fd, bool enable_cors, const request *r, int n_prompt_tokens, int ctx_size);
 bool serve_chat_page(int fd, bool enable_cors, const char *path);
+bool serve_page_file(int fd, bool enable_cors, const char *path);   /* 同 serve_chat_page, 404 文案报传入的路径(监控页用) */
 bool path_route_is(const char *path, const char *route);
+/* 监控(server_monitor*.c, 2026-10-07): GET /monitor 页 + GET /metrics(JSON / Prometheus 文本)。
+ * 生命周期钩子: 客户端线程 mon_begin(入队前) → worker mon_prefill(开始预填) → mon_prefill_progress(每块) → mon_first_token(预填完)
+ * → mon_token(每个 token) → mon_end(收尾; 幂等, 记录不在就不动)。id = 0 时全部钩子是空操作。 */
+struct server_monitor *mon_open(server *s);
+void mon_close(struct server_monitor *m);
+uint64_t mon_begin(server *s, const request *r, const char *path);
+void mon_prefill(server *s, uint64_t id, int prompt_tokens, int cached, int max_tokens);
+void mon_prefill_progress(server *s, uint64_t id, int current, int total);
+void mon_first_token(server *s, uint64_t id);
+void mon_token(server *s, uint64_t id, int generated);
+void mon_end(server *s, uint64_t id, const char *finish, int generated, int drafts_offered, int drafts_accepted);
+/* 磁盘 KV 缓存事件(event = "parked" 存盘 / "restored" 命中装回); parked/bytes = 事后的条目数与总字节; evicted = 这次存盘挤掉几条 */
+void mon_kv_event(server *s, const char *event, int tokens, int parked, uint64_t bytes, int evicted);
+void mon_metrics_json(server *s, buf *b, bool all_requests);
+void mon_prometheus_text(server *s, buf *b);
+bool http_accepts_text(const char *headers, size_t n);   /* Accept 带 text/plain 或 openmetrics(server_httpd.c; /metrics 给 Prometheus 文本的判据) */
 bool sse_headers(int fd, bool enable_cors);
 bool sse_error_event(int fd, const request *r, const char *msg);
 bool sse_chunk(int fd, const request *r, const char *id, const char *text, const char *finish);
@@ -263,6 +280,54 @@ void log_tool_calls_summary(const char *ctx, const tool_calls *calls, bool respo
 void server_progress_cb(void *ud, const char *event, int current, int total);
 /* V4.1 服务生成路(server_generate_v41.c): 没有会话, token 从引擎回调来; generate_job 入口按模型分流 */
 void generate_job_v41(server *s, job *j);
+/* 一条 V4.1 请求的生成期状态(2026-09-30 从 server_generate_v41.c 搬到头文件: 并发调度器 server_sched_v41.c 也要用)。
+ * 三段: v41_gen_begin(校验/id/trace/采样面; 失败已回响应) → 引擎每出一个 token 调 v41_emit(文本累积/思考段/DSML/停止串/流式/挂断探测)
+ * → v41_gen_end(收尾响应/trace/释放)。单请求路(generate_job_v41)与并发路走同一套, 客户端看到的字节一样。 */
+typedef struct {
+    server *s;
+    job *j;
+    char id[96];
+    uint64_t trace_id;
+    char ctx_span[48];
+    char req_flags[64];
+    server_prefill_progress progress;
+    int prompt_tokens, max_tokens, completion, eos;
+    buf text;
+    size_t plain_stream_pos, stop_scan_from, tool_scan_from;
+    const char *finish;
+    char err[256];
+    bool started;             /* 第一个 token 到了 = 预填结束; 流式头/角色块/live 流在这一刻起 */
+    bool stream_dead;         /* 客户端流写失败: 后面的 token 只累积不再写 */
+    thinking_state thinking;
+    bool thinking_gates_tool_markers, tool_scan_waiting_for_think_close;
+    dsml_decode_tracker dsml_tracker;
+    bool saw_tool_start, saw_tool_end, saw_orphan_tool_end;
+    int next_tool_progress, next_decode_log;
+    double t0, decode_t0, last_decode_log_t;
+    int last_decode_log_completion;
+    int next_alive_check;     /* 下一次探"客户端还在不在"的生成位(见 V41_ALIVE_CHECK_TOKENS) */
+    bool client_gone;         /* 探到对端已挂断: 预填/解码都立刻停, 收尾不再当成引擎故障 */
+    bool responses_protocol, structured_stream, openai_live_chat, responses_live_chat;
+    anthropic_stream anthropic_live;
+    openai_stream openai_live;
+    responses_stream responses_live;
+    long responses_created_at;
+    int32_t *ids; int n_ids, cap_ids;   /* 引擎真吐的 token id(含 EOS): 收尾写进 --trace, 真实请求才能逐位重放对拍(bug.md §5.4 E0) */
+    ds4_decode_sampling sp;   /* 本请求的采样面(请求没带的落到 ds4.h 的官方默认); 单 worker 路覆写全局, 并发路按请求传给引擎 */
+    int spec_rounds, spec_offered, spec_accepted;   /* 投机账(调用方在 v41_gen_end 前从引擎取): 监控页的草稿接受率; rounds=0 = 没投机 */
+} v41_gen;
+/* 每多少个 token 探一次对端: 一次 poll 约 1 µs, 一步解码 40 ms ⇒ 开销在噪声里; 最坏多算 16 个 token。 */
+enum { V41_ALIVE_CHECK_TOKENS = 16 };
+bool v41_gen_begin(server *s, job *j, v41_gen *g);   /* false = 请求不合法, 错误响应已发 */
+int v41_emit(int token, void *ud);                    /* 引擎逐 token 回调; 非 0 = 停 */
+int v41_progress_cb(void *ud, const char *event, int current, int total);   /* 预填块间: 心跳 + 探客户端; 非 0 = 中止 */
+void v41_gen_end(v41_gen *g, int rc);                 /* rc = 引擎返回码(非 0 且没出过 token = 预填失败) */
+/* V4.1 并发调度器(server_sched_v41.c, batch.md §3.2): --batch N ≥ 2 时 worker 线程整个交给它 */
+void v41_sched_run(server *s);
+/* 任务队列(server_batch.c): dequeue 阻塞到有 job 或服务在停(NULL); dequeue_try 不阻塞; job_finish 唤醒等着的客户端线程 */
+job *dequeue(server *s);
+job *dequeue_try(server *s);
+void job_finish(job *j);
 /* 上下文大小: V4 从会话读, V4.1 没有会话(s->session == NULL)就用起服时定下的 s->ctx_size */
 static inline int server_ctx_size(const server *s) { return s->session ? ds4_session_ctx(s->session) : s->ctx_size; }
 void send_prefill_failure_response(server *s, const job *j, const server_prefill_progress *progress, const char *ctx, const char *flags, const char *err);

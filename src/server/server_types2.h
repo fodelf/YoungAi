@@ -294,6 +294,9 @@ struct server {
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
+    /* 监控(server_monitor.c, 2026-10-07): GET /monitor 页与 GET /metrics 的数据面; 起服时 mon_open, 停服 mon_close。 */
+    struct server_monitor *mon;
+    const char *backend_name;   /* ds4_backend_name(cfg.engine.backend), /metrics 的 engine.backend */
 };
 
 /* Jobs are stack-owned by the client thread.  The worker signals completion
@@ -306,6 +309,7 @@ struct job {
     pthread_mutex_t mu;
     pthread_cond_t cv;
     job *next;
+    uint64_t mon;   /* 监控记录 id(mon_begin; 0 = 没记): 生成路的 mon_prefill/mon_token/mon_end 都靠它找到这条请求 */
 };
 
 /* 客户端没给 max_tokens 时用它 = 不设上限; 真正的界是 ctx − 提示, 两条生成路各自 clamp。
@@ -384,6 +388,9 @@ typedef struct {
     bool headers_sent;
     bool stream_failed;
     double last_keepalive;
+    /* 监控的预填进度(V4 会话路用; V4.1 路在 v41_progress_cb 里直接报, 这两项留 0 免得报两遍) */
+    server *mon_srv;
+    uint64_t mon;
 } server_prefill_progress;
 
 typedef struct {
@@ -421,6 +428,8 @@ typedef struct {
 typedef struct {
     char method[8];
     char path[256];
+    char query[256];      /* '?' 后面的原文(不含 '?'); 没有就是空串。/metrics 看 requests=all / format=prometheus */
+    bool accept_text;     /* 请求头 Accept 带 text/plain 或 application/openmetrics-text: Prometheus 抓取 /metrics 的问法 */
     char *body;
     size_t body_len;
 } http_request;

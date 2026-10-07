@@ -692,6 +692,19 @@ segment can fail to close; non-thinking is the safe default until that is restor
 Don't make greedy the chat default: on questions with very few valid answers it can loop verbatim inside
 the thinking section and never stop (e.g. "list 5 Chinese idioms ending in 五").
 
+**Monitor.** `http://host:8000/monitor` is a browser page served by the engine itself (no dependencies, same
+origin as the API): model state with a prompt-reading / generation progress bar, decode and prefill tokens/s
+with one-minute sparklines, GPU load / memory / temperature / power / PCIe, CPU, RAM, disk read, context fill,
+the last requests (prompt, reused, output tokens, tokens/s, draft acceptance, first-token latency, duration)
+and totals since start. Its data is `GET /metrics` — JSON by default (`?requests=all` for every kept request),
+and the Prometheus text format with vLLM's metric names when asked with `Accept: text/plain` or
+`?format=prometheus`, so a vLLM Grafana dashboard reads this server unchanged. Readings the platform cannot
+provide (GPU temperature on macOS) are `null`, not guessed. On a unified-memory machine (GB10) the VRAM card is
+the physical memory (128 GB, from the kernel's online memory blocks), with the kernel-allocatable total
+(121.7 GB, `MemTotal`) in its subtitle. The page is bilingual (Chinese / English, follows the browser,
+switchable, `?lang=en`). Its layout and the metric keys follow Strata's Monitor tab
+(github.com/Niko1221/Strata), so the two can be compared side by side.
+
 **Command line.**
 
 ```sh

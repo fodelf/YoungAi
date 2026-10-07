@@ -45,7 +45,7 @@ The build is a single hand-written `Makefile` (no CMake/configure). Output binar
 
 ```sh
 make              # macOS: builds Metal ds4, ds4-server, ds4-bench, ds4-eval, ds4-agent (default target)
-make cuda-spark   # Linux: CUDA for DGX Spark / GB10 (HBM weight cache, no explicit -arch)
+make cuda-spark   # Linux: = cuda-generic 的别名(2026-10-07 起无 Spark 专属旗; 统一内存/独显由引擎运行时按设备属性判)
 make cuda-generic # Linux: CUDA for a generic local GPU (CUDA_ARCH=native)
 make cuda CUDA_ARCH=sm_120   # Linux: CUDA with an explicit nvcc arch
 make cpu          # CPU-only reference/debug build (adds -DDS4_NO_GPU)
@@ -63,6 +63,7 @@ make -C gguf-tools all amp legacy calib bench tools-test   # 工具链全目标(
 ./download_model.sh q2-imatrix   # fetch a model into ./gguf/ and point ./ds4flash.gguf at it
 ./ds4 -p "Explain Redis streams" # one-shot;  no -p => interactive REPL
 ./ds4-server --cuda -m gguf/v41/<model>.gguf --zchain <反修目录>   # V4.1: 上下文只有 1M 一个取值, 没有 --ctx(spark 上用 gguf-tools/scripts/serve_1m_spark.sh)
+#   起服后 GET /monitor = 监控页(web/monitor.html, 指标照 Strata Monitor), GET /metrics = 数据(JSON; Accept: text/plain 给 Prometheus 文本)
 ./ds4-agent                      # in-process native coding agent (sessions in ~/.ds4/kvcache)
 ```
 

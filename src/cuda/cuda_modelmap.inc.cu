@@ -75,31 +75,6 @@ int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
         g_model_fd_host_base = model_map;
     }
 
-    const char *copy_env = ((const char *)0) /* DS4_CUDA_COPY_MODEL: 路径开关已删(2026-08-22 隐形炸弹清理) */;
-    if (copy_env && copy_env[0]) {
-        void *dev = NULL;
-        const double t0 = clock() / (double)CLOCKS_PER_SEC;
-        cudaError_t err = cudaMalloc(&dev, (size_t)model_size);
-        if (err == cudaSuccess) {
-            fprintf(stderr, "ds4: CUDA copying %.2f GiB model to device memory\n",
-                    (double)model_size / 1073741824.0);
-            err = cudaMemcpy(dev, model_map, (size_t)model_size, cudaMemcpyHostToDevice);
-            if (err == cudaSuccess) {
-                g_model_device_base = (const char *)dev;
-                g_model_device_owned = 1;
-                const double t1 = clock() / (double)CLOCKS_PER_SEC;
-                fprintf(stderr, "ds4: CUDA model copy complete in %.3fs\n", t1 - t0);
-                return 1;
-            }
-            fprintf(stderr, "ds4: CUDA model copy failed: %s\n", cudaGetErrorString(err));
-            (void)cudaFree(dev);
-            (void)cudaGetLastError();
-        } else {
-            fprintf(stderr, "ds4: CUDA model allocation skipped: %s\n", cudaGetErrorString(err));
-            (void)cudaGetLastError();
-        }
-    }
-
     /* 缓存封顶模式(2026-09-20, ds4_gpu_set_model_cache_limit_mb): 整映射不注册。注册了就会有两件坏事:
      * ①装不进缓存的段静默走 UVA 映射指针(09-12 尾页脏读 / 09-15 kswapd 长尾都出在这条路上)
      * ②cuda_v41_3.inc.cu 的逐层流式路对已注册的整映射再 cudaHostRegister 子段会报 AlreadyRegistered。
@@ -321,12 +296,6 @@ int ds4_gpu_set_model_fd(int fd) {
             if (direct_fd >= 0) {
                 g_model_direct_fd = direct_fd;
                 if (g_model_direct_align < 512) g_model_direct_align = 512;
-                if (((const char *)0) /* DS4_CUDA_WEIGHT_CACHE_VERBOSE: 诊断开关已删(2026-08-22) */) {
-                    fprintf(stderr, "ds4: CUDA model direct I/O enabled (align=%llu)\n",
-                            (unsigned long long)g_model_direct_align);
-                }
-            } else if (((const char *)0) /* DS4_CUDA_WEIGHT_CACHE_VERBOSE: 诊断开关已删(2026-08-22) */) {
-                fprintf(stderr, "ds4: CUDA model direct I/O unavailable: %s\n", strerror(errno));
             }
         }
 #endif
@@ -337,22 +306,12 @@ int ds4_gpu_set_model_fd(int fd) {
 /* vq_blob = 1: 这一段恰好是一个 VQ 专家 blob, 先试"载荷挪对齐"的拷法(cuda_vq_align.inc.cu), 不适用再平拷 */
 static int cuda_cache_model_range_impl(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label,
                                        int vq_blob) {
-#ifndef DS4_CUDA_SPARK_HBM_CACHE
-    (void)model_map;
-    (void)model_size;
-    (void)offset;
-    (void)bytes;
-    (void)label;
-    (void)vq_blob;
-    return 1;
-#else
     if (!model_map || bytes == 0) return 1;
     if (offset > model_size || bytes > model_size - offset) return 0;
     /* Startup walk: force-populate the device-resident HBM cache so hot
      * tensors hit cudaMalloc copies rather than the UVA-mapped fallback.
      * Skip silently if over budget or opted out — the mapped pointer still
      * works for any tensor we don't pre-cache. */
-    if (0) return 1;
     if (g_model_device_owned) return 1;
     const uint64_t limit = cuda_model_cache_limit_bytes();
     if (g_model_range_bytes >= limit || bytes > limit - g_model_range_bytes) return 1;
@@ -382,7 +341,6 @@ static int cuda_cache_model_range_impl(const void *model_map, uint64_t model_siz
         if (b > a) (void)madvise((void *)a, (size_t)(b - a), MADV_DONTNEED);
     }
     return 1;
-#endif
 }
 
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
@@ -395,13 +353,8 @@ int ds4_gpu_cache_vq_blob(const void *model_map, uint64_t model_size, uint64_t o
 /* 装进设备副本的总字节(single.md S1 的对账): core 侧拿它和"请求装的字节"比, 差值就是走主机映射的量。
  * 为什么要报: 超预算时 ds4_gpu_cache_model_range 是**静默**返回 1 的(映射指针照样能读), 那几 GiB
  * 就成了每步 5~25 ms 的长尾, 而启动日志上一个字都看不见。 */
-uint64_t ds4_gpu_model_cache_bytes(void) {
-#ifdef DS4_CUDA_SPARK_HBM_CACHE
-    return g_model_range_bytes;
-#else
-    return 0;
-#endif
-}
+uint64_t ds4_gpu_model_cache_bytes(void) { return g_model_range_bytes; }
+int ds4_gpu_unified_memory_host(void) { return cuda_unified_memory_host(); }
 
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label) {
     if (!model_map || bytes == 0) return 1;

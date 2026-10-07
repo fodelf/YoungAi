@@ -103,7 +103,6 @@ ds4_tensor *model_find_tensor(const ds4_model *m, const char *name) {
 
 #ifndef DS4_NO_GPU
 #ifndef __APPLE__
-#ifdef DS4_CUDA_SPARK_HBM_CACHE
 typedef struct {
     uint64_t off;
     uint64_t end;
@@ -167,18 +166,17 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
          * ★收编专家★: 上面"缓存冷专家浪费预算"的前提是显存远小于模型
          * (独显 24-80GB vs 89GB)。统一内存机器(GB10 121GiB)整模型装得下,
          * 此时跳过反而让每次专家读都跨 C2C 去 host 内存 —— 实测 GPU 利用率
-         * 被按在 6%, CPU 同时也闲着。 */
+         * 被按在 6%, CPU 同时也闲着。
+         * 2026-10-07 前这是编译宏 DS4_CUDA_SPARK_HBM_CACHE(make cuda-spark 才开): 同一份源码用
+         * cuda-generic 编出来放到 GB10 上就退化成"只缓骨架"。现在按设备属性运行时判
+         * (ds4_gpu_unified_memory_host: GPU 经主机页表访问整机内存), 独显仍只缓骨架。 */
         static int cache_exps = -1;
         if (cache_exps < 0) {
-#ifdef DS4_CUDA_SPARK_HBM_CACHE
-            /* GB10 默认收编专家(实测 decode 26.8→28.7): 内存账=模型+20GiB 余量
+            /* 统一内存机器默认收编专家(实测 decode 26.8→28.7): 内存账=模型+20GiB 余量
              * 装得下才开, 装不下回退老策略(只缓 backbone) */
             const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
             const uint64_t total = (uint64_t)sysconf(_SC_PHYS_PAGES) * page;
-            cache_exps = (m->size + 20ull * 1073741824ull <= total) ? 1 : 0;
-#else
-            cache_exps = 0;
-#endif
+            cache_exps = (ds4_gpu_unified_memory_host() && m->size + 20ull * 1073741824ull <= total) ? 1 : 0;
         }
         const bool is_exp = memmem(t->name.ptr, t->name.len, "_exps.", 6) != NULL;
         const bool is_blob = memmem(t->name.ptr, t->name.len, "_exps_vq.", 9) != NULL;   /* 合一 VQ blob(V4/V4.1 专家字节) */
@@ -210,7 +208,7 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
             .blob = is_blob ? 1u : 0u,
         };
     }
-    /* ★骨架先拷、专家/blob 后填(2026-09-12)★: 之前纯按偏移排, V4.1 的 103 GiB 里 98 GB 是 40 层 blob, 预算(总内存-24 GiB)
+    /* ★骨架先拷、专家/blob 后填(2026-09-12)★: 之前纯按偏移排, V4.1 的 103 GiB 里 98 GB 是 40 层 blob, 预算(当时是总内存-24 GiB, 现为 -8 GiB)
      * 被前面的 blob 吃光, 排在文件最末的 output.weight(350 MB)没拷进设备, 只能经 cudaHostRegister 的文件映射读 ——
      * 实测该映射尾页首次被 GPU 读偶发返回垃圾(e8m0 垃圾 → 2^128 → f16 inf → 整列 logits NaN, 重读即对)。
      * 骨架(每 token 都读、含 head)必须常驻; blob 再按偏移顺序填到预算为止, 余下走映射。 */
@@ -276,20 +274,14 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
     if (want_out) *want_out = total_bytes;
     return true;
 }
-#endif
 
 bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m) {
     if (backend != DS4_BACKEND_CUDA) return true;
     if (!m || !m->map || m->size == 0) return false;
 
-#ifdef DS4_CUDA_SPARK_HBM_CACHE
     const double t0 = now_sec();
     uint64_t cached = 0, want = 0;
     if (!accelerator_cache_model_tensor_spans(m, &cached, &want)) return false;
-#else
-    uint64_t cached = 0;
-#endif
-#ifdef DS4_CUDA_SPARK_HBM_CACHE
     {   /* q8 repack 预建(decode gemv 快路): 必须先于 token graph capture */
         uint64_t q8r_bytes = 0;
         for (uint64_t i = 0; i < m->n_tensors; i++) {
@@ -326,9 +318,6 @@ bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m) {
                     "     主干骨架 > 主干专家 blob > DSpark 三塔), 所以三塔被挤出时解码不受影响(它一次都不读)。★\n",
                     (double)mapped / 1073741824.0);
     }
-#else
-    (void)cached;
-#endif
     return true;
 }
 #else

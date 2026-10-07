@@ -5,15 +5,19 @@
 # 手敲 rsync 排除列表迟早漏一项 —— 漏了 gguf/ 就是几百 GB 白传, 漏了 *.o 就是拿 Mac 的
 # Mach-O 目标文件去污染 Linux 编译(实撞过: bench 下一串工具变成 Mach-O, 在 spark 上跑不了)。
 #
-# 用法: sync_spark.sh [engine|tools|all]   默认 all
+# 用法: sync_spark.sh [engine|tools|all|dry]   默认 all
 #   engine = make cuda-spark(引擎二进制 ds4 等)
 #   tools  = make -C gguf-tools anchor_metrics v41_amp_run
+#   dry    = 只空跑 rsync, 逐行列出会传/会删的文件(*deleting 行 = 对面会被删的), 不传不编
+#   files  = 只同步不编(只改了脚本/料时用)
 # 不传目标就两样都编。★只同步源码与脚本, 不碰对方的 gguf/ 与产物目录★。
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 WHAT="${1:-all}"
 REMOTE="spark"
 RDIR="ds4-main"
+# 空跑旗用字符串不用数组: Mac 的 bash 3.2 在 set -u 下展开空数组直接报 unbound variable
+DRYF=""; [ "$WHAT" = dry ] && DRYF="-n --itemize-changes"
 
 cd "$ROOT" || exit 1
 # ★不覆盖正在跑的脚本★(2026-09-13 实撞): rsync 把 spark 上正在执行的 z_nightly_spark.sh 换掉了 ——
@@ -25,7 +29,7 @@ if ssh "$REMOTE" 'pgrep -f "z_nightly_spar[k]|v41_amp_ru[n]|ds[4] --cuda|speed-b
     exit 1
 fi
 echo "[sync] $ROOT → $REMOTE:$RDIR"
-rsync -az --delete \
+rsync -az --delete $DRYF \
     --exclude '.git' --exclude 'gguf' --exclude 'hf' --exclude '*.o' --exclude '*.dSYM' \
     --exclude 'ds4' --exclude 'ds4-server' --exclude 'ds4-bench' --exclude 'ds4-eval' \
     `# ★护住基线二进制★(2026-09-16 实撞): 判决前会 cp ds4 ds4.base 留一份改造前的, 而它只在 spark 上、` \
@@ -49,12 +53,27 @@ rsync -az --delete \
     --exclude 'gguf-tools/quantize/libv41vq.so' --exclude 'gguf-tools/quantize/*.so' \
     --exclude 'gguf-tools/quantize/deepseek4-quantize' --exclude 'gguf-tools/dspark_align' \
     --exclude 'gguf-tools/amp/v41_amp_run' --exclude 'gguf-tools/amp/finetune_solve' --exclude 'gguf-tools/bench/posttrain_reward' \
+    --exclude 'gguf-tools/quantize/v41_codebook' --exclude 'gguf-tools/go-onebit' \
+    `# ★后训练料目录不走 --delete★(2026-10-02 空跑查出): kdgen 在 spark 上把模型自出的问答写进 data/posttrain/<料>/gen、qa` \
+    `# 和空块 chunks/hold_general.txt, Mac 这边没有 ⇒ 带 --delete 一同步就把训练料删光(空跑: review_v2 的 432 个、onefact_kd 的 60 个)。` \
+    `# 这个目录在下面单独推一遍, 只增改不删。` \
+    --exclude 'gguf-tools/data/posttrain' \
     --exclude 'speed-bench' --exclude 'reports' --exclude 'notes' \
-    ./ "$REMOTE:$RDIR/" || { echo "★rsync 失败★"; exit 1; }
+    --itemize-changes ./ "$REMOTE:$RDIR/" | tee /tmp/sync_spark_items.txt; [ "${PIPESTATUS[0]}" = 0 ] || { echo "★rsync 失败★"; exit 1; }
+# ★传过去的源文件在对面 touch 一下★(2026-10-03 实撞): rsync -a 保留 Mac 的修改时间; 对面刚编完一趟, .o 比这边"编译期间改的 .c"还新,
+# make 就认为不用重编 —— 第二次 sync 报"完成", 二进制里却没有这次的改动(core_ptrain_teacher.c 那条分支就这样漏了一版)。
+# 两台机器时钟有偏差时同样会撞。只 touch 这次真传了的文件(">f" 行), 没传的不动。
+if [ -z "$DRYF" ]; then
+    TOUCHED=$(awk '$1 ~ /^>f/ {print $2}' /tmp/sync_spark_items.txt | grep -E '\.(c|h|cu|cuh|inc|m|metal|mk)$|Makefile' | tr '\n' ' ')
+    [ -z "$TOUCHED" ] || ssh "$REMOTE" "cd $RDIR && touch $TOUCHED" || { echo "★对面 touch 失败★"; exit 1; }
+fi
+# 后训练料: Mac 写的块/出题提示/探针题推过去, spark 生成的 gen/qa 不动(不带 --delete)
+rsync -az $DRYF gguf-tools/data/posttrain/ "$REMOTE:$RDIR/gguf-tools/data/posttrain/" || { echo "★后训练料同步失败★"; exit 1; }
 # ★speed-bench 的脚本要单独推一遍★(2026-09-16): 上面整目录排除了 speed-bench —— 因为那边放着几份
 # 大语料, 而且 spark 上还有本机生成的长提示文件, 带 --delete 的整目录同步会把它们删掉。
 # 但尺子脚本(*.sh)必须跟着代码走, 不然改了门这边看不见, 判决还是按旧尺出的。只推 .sh, 不删任何东西。
-rsync -az speed-bench/*.sh "$REMOTE:$RDIR/speed-bench/" || { echo "★speed-bench 脚本同步失败★"; exit 1; }
+rsync -az $DRYF speed-bench/*.sh "$REMOTE:$RDIR/speed-bench/" || { echo "★speed-bench 脚本同步失败★"; exit 1; }
+[ "$WHAT" = dry ] && { echo "[sync] 空跑完成: 上面 *deleting 行 = 真同步时对面会被删的文件, 一个都不该有"; exit 0; }
 
 if [ "$WHAT" = engine ] || [ "$WHAT" = all ]; then
     echo "[sync] make cuda-spark"

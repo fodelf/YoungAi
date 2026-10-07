@@ -185,6 +185,41 @@ static bool v41_pt_base_ok(const char *pt_dir, const char *amp_dir) {
     return true;
 }
 
+/* 读一个目录里第 il 层的放大器 amp_Lnn.bin 到主机 f32(A 与 B 各 [K][D], 本函数分配, 调用方 free)。
+ * 返回 K(>0) / 0 = 没这个文件 / <0 = 有文件但坏了(显式给的目录里有坏文件, 跳过就是拿半份插件出假账)。
+ * scale 乘进 A: y += x·(B·(βA)) = β·(x·B·A) ⇒ 整层修正缩到 β 倍; 乘 A 不乘 B 是因为两发 GEMM 里 A 是第二发的权重, 缩它不改第一发 T = x·B 的数值范围。
+ * mb 累加【盘上真实字节】(旧版固定按 f16 估, 盘上落的却是 f32, 报了一半的假账)。 */
+static int amp_read_layer(const char *dir, uint32_t il, float **A, float **B, float scale, double *mb, const char **tyname) {
+    *A = *B = NULL;
+    if (!dir || !dir[0]) return 0;
+    char p[4200]; snprintf(p, sizeof p, "%s/amp_L%02u.bin", dir, il);
+    FILE *f = fopen(p, "rb");
+    if (!f) return 0;
+    int32_t hd[3];
+    if (fread(hd, 4, 3, f) != 3 || hd[0] != (int32_t)DS4_N_EMBD || hd[1] <= 0 || hd[1] > 8192) {
+        fprintf(stderr, "ds4: 放大器 %s 头不对(D %d K %d)\n", p, hd[0], hd[1]); fclose(f); return -1;
+    }
+    const uint32_t D = (uint32_t)hd[0], K = (uint32_t)hd[1];
+    const int32_t ty = hd[2];
+    if (ty != 1 && ty != (int32_t)DS4_GGT_FP4X32) {
+        fprintf(stderr, "ds4: 放大器 %s 存储类型 %d 不认(1=f32 / 43=fp4x32)\n", p, ty); fclose(f); return -1;
+    }
+    const size_t nel = (size_t)K * D;
+    if (ty == (int32_t)DS4_GGT_FP4X32 && nel % 32u) {
+        fprintf(stderr, "ds4: 放大器 %s K×D=%zu 不是 32 的整数倍, fp4x32 装不下\n", p, nel); fclose(f); return -1;
+    }
+    float *a = xmalloc(nel * 4), *b = xmalloc(nel * 4);
+    uint8_t *pk = ty == (int32_t)DS4_GGT_FP4X32 ? xmalloc(nel / 32u * 17u) : NULL;
+    const bool ok = amp_read_mat(f, ty, nel, a, pk) && amp_read_mat(f, ty, nel, b, pk);
+    free(pk); fclose(f);
+    if (!ok) { fprintf(stderr, "ds4: 放大器 %s 读失败(截断)\n", p); free(a); free(b); return -1; }
+    if (scale != 1.0f) for (size_t t = 0; t < nel; t++) a[t] *= scale;
+    *mb += ty == (int32_t)DS4_GGT_FP4X32 ? 2.0 * nel / 32.0 * 17.0 / 1e6 : 2.0 * nel * 4.0 / 1e6;
+    *tyname = ty == (int32_t)DS4_GGT_FP4X32 ? "fp4x32" : "f32";
+    *A = a; *B = b;
+    return (int)K;
+}
+
 bool v41_amp_load(ds4_v41_state *st, const char *dir, const char *pt_dir) {
     uint32_t n_arm = 0, kmin = 0, kmax = 0; double mb = 0.0;
     const char *tyname = "";
@@ -193,43 +228,31 @@ bool v41_amp_load(ds4_v41_state *st, const char *dir, const char *pt_dir) {
     if (n_rb < 0) return false;
     const int n_gr = v41_gr_load(dir, pt_dir);
     if (n_gr < 0) return false;
-    for (uint32_t il = 0; dir && dir[0] && il < DS4_N_LAYER; il++) {
-        char p[4200]; snprintf(p, sizeof p, "%s/amp_L%02u.bin", dir, il);
-        FILE *f = fopen(p, "rb");
-        if (!f) continue;
-        int32_t hd[3];
-        if (fread(hd, 4, 3, f) != 3 || hd[0] != (int32_t)DS4_N_EMBD || hd[1] <= 0 || hd[1] > 8192) {
-            fprintf(stderr, "ds4: 放大器 %s 头不对(D %d K %d)\n", p, hd[0], hd[1]); fclose(f); return false;
-        }
-        const uint32_t D = (uint32_t)hd[0], K = (uint32_t)hd[1];
-        const int32_t ty = hd[2];
-        if (ty != 1 && ty != (int32_t)DS4_GGT_FP4X32) {
-            fprintf(stderr, "ds4: 放大器 %s 存储类型 %d 不认(1=f32 / 43=fp4x32)\n", p, ty); fclose(f); return false;
-        }
-        const size_t nel = (size_t)K * D;
-        if (ty == (int32_t)DS4_GGT_FP4X32 && nel % 32u) {
-            fprintf(stderr, "ds4: 放大器 %s K×D=%zu 不是 32 的整数倍, fp4x32 装不下\n", p, nel); fclose(f); return false;
-        }
-        float *buf = xmalloc(nel * 4);
-        uint8_t *pk = ty == (int32_t)DS4_GGT_FP4X32 ? xmalloc(nel / 32u * 17u) : NULL;
+    /* ★②③ 按秩拼接★(2026-10-01, 09-08 三文件设计的落地): 两个目录同一层各有 amp_Lnn.bin 时
+     *   y += x·B₂·A₂ + x·B₃·A₃ = x·[B₂|B₃]·[A₂;A₃] —— A/B 内存都是 [K][D] 行主序, 拼接 = 两段顺序摆放, 核与应用零改动。
+     * β(--zchain-scale)只缩 ②: 它是反修的步长旋钮, ③ 是另一件事。以前 ③ 目录只认增益表, 低秩候选只能靠"配对目录"
+     * (② 软链 + 候选 amp 当 ② 挂); 门 = 同一候选两种挂法输出逐字节同(fable5 10-01)。 */
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        float *A2 = NULL, *B2 = NULL, *A3 = NULL, *B3 = NULL;
+        const int k2 = amp_read_layer(dir, il, &A2, &B2, g_ds4_v41_amp_scale, &mb, &tyname);
+        const int k3 = k2 < 0 ? 0 : amp_read_layer(pt_dir, il, &A3, &B3, 1.0f, &mb, &tyname);
+        if (k2 < 0 || k3 < 0) { free(A2); free(B2); return false; }
+        const uint32_t K = (uint32_t)k2 + (uint32_t)k3, D = DS4_N_EMBD;
+        if (!K) continue;
+        if (K > 8192u) { fprintf(stderr, "ds4: L%02u 放大器 ②(K %d)+③(K %d) 拼接超 8192\n", il, k2, k3); free(A2); free(B2); free(A3); free(B3); return false; }
+        const uint64_t nel = (uint64_t)K * D, o3 = (uint64_t)k2 * D * 4u;
         bool ok = true;
         st->ampA[il] = ds4_gpu_tensor_alloc(nel * 4); st->ampB[il] = ds4_gpu_tensor_alloc(nel * 4);
         if (!st->ampA[il] || !st->ampB[il]) ok = false;
-        /* A 乘 β(--zchain-scale): y += x·(B·(βA)) = β·(x·B·A) ⇒ 整层修正缩到 β 倍。乘在 A 这一边而不是 B,
-         * 是因为两发 GEMM 里 A 是第二发的权重, 缩它不改第一发 T = x·B 的数值范围。 */
-        if (ok && (!amp_read_mat(f, ty, nel, buf, pk))) ok = false;
-        if (ok && g_ds4_v41_amp_scale != 1.0f) for (size_t t = 0; t < nel; t++) buf[t] *= g_ds4_v41_amp_scale;
-        if (ok && !ds4_gpu_tensor_write(st->ampA[il], 0, buf, nel * 4)) ok = false;
-        if (ok && (!amp_read_mat(f, ty, nel, buf, pk) || !ds4_gpu_tensor_write(st->ampB[il], 0, buf, nel * 4))) ok = false;
-        free(buf); free(pk); fclose(f);
-        if (!ok) { fprintf(stderr, "ds4: 放大器 %s 读/上传失败\n", p); return false; }
+        if (ok && k2 > 0 && (!ds4_gpu_tensor_write(st->ampA[il], 0, A2, o3) || !ds4_gpu_tensor_write(st->ampB[il], 0, B2, o3))) ok = false;
+        if (ok && k3 > 0 && (!ds4_gpu_tensor_write(st->ampA[il], o3, A3, (uint64_t)k3 * D * 4u) ||
+                             !ds4_gpu_tensor_write(st->ampB[il], o3, B3, (uint64_t)k3 * D * 4u))) ok = false;
+        free(A2); free(B2); free(A3); free(B3);
+        if (!ok) { fprintf(stderr, "ds4: L%02u 放大器上传失败\n", il); return false; }
         st->ampK[il] = K;
         if (!n_arm || K < kmin) kmin = K;
         if (K > kmax) kmax = K;
         n_arm++;
-        /* 体积按【盘上真实字节】算, 不按"部署时打算存成什么"估 —— 旧版这里固定按 f16 估, 而盘上落的是 f32, 报了一半的假账 */
-        mb += ty == (int32_t)DS4_GGT_FP4X32 ? 2.0 * nel / 32.0 * 17.0 / 1e6 : 2.0 * nel * 4.0 / 1e6;
-        tyname = ty == (int32_t)DS4_GGT_FP4X32 ? "fp4x32" : "f32";
     }
     if (!n_arm) {
         /* 只有增益覆盖/路由偏置、没有低秩放大器也是合法的一种插件(权重侧反修与后训练的产物都长这样) */
@@ -240,8 +263,9 @@ bool v41_amp_load(ds4_v41_state *st, const char *dir, const char *pt_dir) {
     }
     st->ampT = ds4_gpu_tensor_alloc((uint64_t)st->cap_tok * kmax * 4);
     if (!st->ampT) return false;
-    fprintf(stderr, "ds4: [反修] 挂上 %u 层放大器 (K %u~%u, %s 盘上合计 %.1f MB, 步长 β=%.4g) ← %s\n",
-            n_arm, kmin, kmax, tyname, mb, (double)g_ds4_v41_amp_scale, dir);
+    fprintf(stderr, "ds4: [反修] 挂上 %u 层放大器 (K %u~%u, %s 盘上合计 %.1f MB, 步长 β=%.4g) ← ② %s%s%s\n",
+            n_arm, kmin, kmax, tyname, mb, (double)g_ds4_v41_amp_scale, dir && dir[0] ? dir : "(无)",
+            pt_dir && pt_dir[0] ? " + ③ " : "", pt_dir && pt_dir[0] ? pt_dir : "");
     return true;
 }
 
@@ -298,7 +322,9 @@ void v41_amp_free(ds4_v41_state *st) {
 /* y[n][D](bf16 格点) += x[n][D]·(B·A) → 舍 bf16 */
 bool v41_amp_apply(ds4_v41_state *st, uint32_t il) {
     if (!st->ampA[il]) return true;
-    if (!ds4_gpu_v41_amp_apply_tensor(st->y, st->xn, st->ampA[il], st->ampB[il], st->ampT, st->n, DS4_N_EMBD, st->ampK[il])) return false;
+    /* 草稿态(塔件)走小批两发小核(cuda_draft_attn.inc.cu): cuBLAS 小 n 一发 ~0.2 ms, 草稿一轮 8 发把接受率的收益吃光(10-07 dkspeed 分账); 主干照旧 */
+    if (st->draft ? !ds4_gpu_draft_amp_apply_tensor(st->y, st->xn, st->ampA[il], st->ampB[il], st->ampT, st->n, DS4_N_EMBD, st->ampK[il])
+                  : !ds4_gpu_v41_amp_apply_tensor(st->y, st->xn, st->ampA[il], st->ampB[il], st->ampT, st->n, DS4_N_EMBD, st->ampK[il])) return false;
     return ds4_gpu_v41_round_bf16_tensor(st->y, (uint64_t)st->n * DS4_N_EMBD) != 0;
 }
 #endif /* !DS4_NO_GPU */

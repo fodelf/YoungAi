@@ -99,3 +99,45 @@ static void channel_sigma(int whiten, const float *dY0f, const float *dYfpf, int
     rms_from_colnorm_kernel<<<cb, 256>>>(dInv, D, 1.f / sqrtf((float)NFIT), 1);
 }
 
+
+/* ---------------- 第七版低秩形态(2026-10-01)要的两个行级小核 ----------------
+ * rowdot:   out[i] = A[i]·B[i](一行一个 block, 共享内存归约, 与 rownorm_kernel 同构)。用途: ‖c_i‖² 与预测 Δlog p_i = c_i·Δ_i。
+ * rowscale: dst[i][:] = src[i][:] × s[i] —— 把方向表 c_i 缩成靶向量 R_i = η·A_i·c_i/‖c_i‖²(于是 c_i·R_i = η·A_i 严格成立)。
+ * 为什么不在主机做: 行数到 1.2 万、D=5120 时是 6e7 个元素, 来回搬一次 0.25 GB; 且本仓铁律新代码只走 GPU。 */
+__global__ static void rowdot_kernel(const float *A, const float *B, int N, int D, float *out) {
+    __shared__ float sh[256];
+    int r = blockIdx.x;
+    if (r >= N) return;
+    const float *a = A + (long long)r * D, *b = B + (long long)r * D;
+    float s = 0.f;
+    for (int j = threadIdx.x; j < D; j += blockDim.x) s += a[j] * b[j];
+    sh[threadIdx.x] = s;
+    __syncthreads();
+    for (int k = blockDim.x / 2; k > 0; k >>= 1) {
+        if (threadIdx.x < k) sh[threadIdx.x] += sh[threadIdx.x + k];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[r] = sh[0];
+}
+__global__ static void rowscale_kernel(float *dst, const float *src, const float *s, int N, int D) {
+    long long t = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= (long long)N * D) return;
+    dst[t] = src[t] * s[t / D];
+}
+extern "C" int v41_amp_rowdot_gpu(const void *dAv, const void *dBv, int N, int D, float *out_host) {
+    float *dO;
+    CK(cudaMalloc(&dO, sizeof(float) * (size_t)N));
+    rowdot_kernel<<<N, 256>>>((const float *)dAv, (const float *)dBv, N, D, dO);
+    CK(cudaMemcpy(out_host, dO, sizeof(float) * (size_t)N, cudaMemcpyDeviceToHost));
+    cudaFree(dO);
+    return 0;
+}
+extern "C" int v41_amp_rowscale_gpu(void *dDst, const void *dSrc, const float *scale_host, int N, int D) {
+    float *dS;
+    CK(cudaMalloc(&dS, sizeof(float) * (size_t)N));
+    CK(cudaMemcpy(dS, scale_host, sizeof(float) * (size_t)N, cudaMemcpyHostToDevice));
+    rowscale_kernel<<<(unsigned)(((size_t)N * D + 255) / 256), 256>>>((float *)dDst, (const float *)dSrc, dS, N, D);
+    CK(cudaDeviceSynchronize());
+    cudaFree(dS);
+    return 0;
+}

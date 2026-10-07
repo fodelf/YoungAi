@@ -14,48 +14,16 @@
  * 来源只会把两条路的 bug 搅在一起; 这里独立一份, V4 一行不动。 */
 #include "server_internal.h"
 
-typedef struct {
-    server *s;
-    job *j;
-    char id[96];
-    uint64_t trace_id;
-    char ctx_span[48];
-    char req_flags[64];
-    server_prefill_progress progress;
-    int prompt_tokens, max_tokens, completion, eos;
-    buf text;
-    size_t plain_stream_pos, stop_scan_from, tool_scan_from;
-    const char *finish;
-    char err[256];
-    bool started;             /* 第一个 token 到了 = 预填结束; 流式头/角色块/live 流在这一刻起 */
-    bool stream_dead;         /* 客户端流写失败: 后面的 token 只累积不再写 */
-    thinking_state thinking;
-    bool thinking_gates_tool_markers, tool_scan_waiting_for_think_close;
-    dsml_decode_tracker dsml_tracker;
-    bool saw_tool_start, saw_tool_end, saw_orphan_tool_end;
-    int next_tool_progress, next_decode_log;
-    double t0, decode_t0, last_decode_log_t;
-    int last_decode_log_completion;
-    int next_alive_check;     /* 下一次探"客户端还在不在"的生成位(见 V41_ALIVE_CHECK_TOKENS) */
-    bool client_gone;         /* 探到对端已挂断: 预填/解码都立刻停, 收尾不再当成引擎故障 */
-    bool responses_protocol, structured_stream, openai_live_chat, responses_live_chat;
-    anthropic_stream anthropic_live;
-    openai_stream openai_live;
-    responses_stream responses_live;
-    long responses_created_at;
-    int32_t *ids; int n_ids, cap_ids;   /* 引擎真吐的 token id(含 EOS): 收尾写进 --trace, 真实请求才能逐位重放对拍(bug.md §5.4 E0) */
-} v41_gen;
 
 static const char *v41_kind(const v41_gen *g) { return g->j->req.kind == REQ_CHAT ? "chat" : "completion"; }
 
-/* 每多少个 token 探一次对端: 一次 poll 约 1 µs, 一步解码 40 ms ⇒ 开销在噪声里; 最坏多算 16 个 token。 */
-enum { V41_ALIVE_CHECK_TOKENS = 16 };
-
 /* 预填块间: 照旧发 SSE 心跳与进度日志, 再探一次客户端还在不在。返回非 0 ⇒ 引擎停止预填(ds4_v41_api.h)。
- * 13 万 token 的提示预填 400 秒, 期间客户端挂断的话这 400 秒纯浪费, 后面排队的请求还要跟着一起超时。 */
-static int v41_progress_cb(void *ud, const char *event, int current, int total) {
+ * 13 万 token 的提示预填 400 秒, 期间客户端挂断的话这 400 秒纯浪费, 后面排队的请求还要跟着一起超时。
+ * (v41_gen 与 V41_ALIVE_CHECK_TOKENS 在 server_internal.h: 并发调度器 server_sched_v41.c 同用这三段) */
+int v41_progress_cb(void *ud, const char *event, int current, int total) {
     v41_gen *g = ud;
     server_progress_cb(&g->progress, event, current, total);
+    if (!strcmp(event, "prefill_chunk")) mon_prefill_progress(g->s, g->j->mon, current, total);   /* 监控页的读提示进度条 */
     if (!client_disconnected(g->j->fd)) return 0;
     g->client_gone = true;
     server_log(DS4_LOG_GENERATION, "ds4-server: %s ctx=%s client disconnected during prefill %d/%d, aborting",
@@ -105,6 +73,7 @@ static bool v41_stream_begin(v41_gen *g) {
 static void v41_prefill_done(v41_gen *g) {
     g->started = true;
     g->decode_t0 = g->last_decode_log_t = now_sec();
+    mon_first_token(g->s, g->j->mon);
     server_log(DS4_LOG_PREFILL, "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
                v41_kind(g), g->ctx_span, g->req_flags[0] ? " " : "", g->req_flags, now_sec() - g->t0);
     trace_event(g->s, g->trace_id, "prefill done; decode_max=%d", g->max_tokens);
@@ -113,7 +82,7 @@ static void v41_prefill_done(v41_gen *g) {
 /* 引擎每出一个 token 回调一次。返回非 0 = 停止生成。逐 token 的处理与 server_generate_body3.inc 的
  * 解码圈同一套(文本累积 → 思考段 → DSML 跟踪 → 停止串 → 流式增量 → 工具标记), 只去掉了会话相关的
  * 三处(kv 续存、ds4_session_invalidate、primer)。 */
-static int v41_emit(int token, void *ud) {
+int v41_emit(int token, void *ud) {
     v41_gen *g = ud; server *s = g->s; job *j = g->j;
     if (!g->started) {
         v41_prefill_done(g);
@@ -148,6 +117,7 @@ static int v41_emit(int token, void *ud) {
     size_t piece_len = 0;
     char *piece = ds4_token_text(s->engine, token, &piece_len);
     g->completion++;
+    mon_token(s, j->mon, g->completion);
     trace_piece(s, g->trace_id, piece, piece_len);
     buf_append(&g->text, piece, piece_len);
     thinking_state_feed(&g->thinking, piece, piece_len);
@@ -236,8 +206,9 @@ static int v41_emit(int token, void *ud) {
     return 0;
 }
 
-/* 生成结束后的收尾: 与 server_generate_body3.inc 尾段 + body4.inc 同一套, 去掉会话相关的检查点/活绑定/续写修复。 */
-static void v41_finish(v41_gen *g) {
+/* 生成结束后的收尾: 与 server_generate_body3.inc 尾段 + body4.inc 同一套, 去掉会话相关的检查点/活绑定/续写修复。
+ * 返回对外报的 finish(静态串), 监控记录用。 */
+static const char *v41_finish(v41_gen *g) {
     server *s = g->s; job *j = g->j;
     const char *finish = g->finish;
     char *err = g->err;
@@ -340,93 +311,109 @@ static void v41_finish(v41_gen *g) {
                    v41_kind(g), g->ctx_span, completion, flags[0] ? " " : "", flags, final_finish, now_sec() - g->t0);
     free(parsed_content); free(parsed_reasoning);
     tool_calls_free(&parsed_calls);
+    return final_finish;
 }
 
-void generate_job_v41(server *s, job *j) {
-    v41_gen g;
-    memset(&g, 0, sizeof(g));
-    g.s = s; g.j = j;
-    g.finish = "length";
-    g.eos = ds4_token_eos(s->engine);
+bool v41_gen_begin(server *s, job *j, v41_gen *g) {
+    memset(g, 0, sizeof *g);
+    g->s = s; g->j = j;
+    g->finish = "length";
+    g->eos = ds4_token_eos(s->engine);
     const ds4_tokens *prompt = &j->req.prompt;
     const int ctx = ds4_engine_v41_ctx();   /* 与 s->ctx_size 同一个数(server_main.c 起服时从这里取), 这里直接取源头 */
-    g.prompt_tokens = prompt->len;
-    if (g.prompt_tokens < 1) { http_error(j->fd, s->enable_cors, 400, "empty prompt"); return; }
-    if (g.prompt_tokens >= ctx) { http_error_context_length_exceeded(j->fd, s->enable_cors, &j->req, g.prompt_tokens, ctx); return; }
+    g->prompt_tokens = prompt->len;
+    if (g->prompt_tokens < 1) { http_error(j->fd, s->enable_cors, 400, "empty prompt"); return false; }
+    if (g->prompt_tokens >= ctx) { http_error_context_length_exceeded(j->fd, s->enable_cors, &j->req, g->prompt_tokens, ctx); return false; }
     /* 没有前缀缓存: 全部算写入(usage 里 cache_read=0), 与事实一致 */
     j->req.cache_read_tokens = 0;
-    j->req.cache_write_tokens = g.prompt_tokens;
-    g.responses_protocol = j->req.api == API_RESPONSES;
-    g.t0 = now_sec();
+    j->req.cache_write_tokens = g->prompt_tokens;
+    g->responses_protocol = j->req.api == API_RESPONSES;
+    g->t0 = now_sec();
     trace_cache_diag cache_diag = {0};
-    g.trace_id = trace_begin(s, j, 0, g.prompt_tokens, &cache_diag, "v41-cold", 0, NULL);
-    request_ctx_span(g.ctx_span, sizeof(g.ctx_span), 0, g.prompt_tokens);
-    log_flags(g.req_flags, sizeof(g.req_flags), g.responses_protocol, j->req.has_tools, false, false, false);
-    g.progress = (server_prefill_progress){
+    g->trace_id = trace_begin(s, j, 0, g->prompt_tokens, &cache_diag, "v41-cold", 0, NULL);
+    request_ctx_span(g->ctx_span, sizeof(g->ctx_span), 0, g->prompt_tokens);
+    log_flags(g->req_flags, sizeof(g->req_flags), g->responses_protocol, j->req.has_tools, false, false, false);
+    g->progress = (server_prefill_progress){
         .srv = NULL,   /* 没有会话 KV 可续存, 进度回调只发心跳与日志 */
-        .kind = j->req.kind, .prompt_tokens = g.prompt_tokens, .cached_tokens = 0,
-        .has_tools = j->req.has_tools, .responses_protocol = g.responses_protocol,
-        .t0 = g.t0, .fd = j->fd, .stream = j->req.stream, .enable_cors = s->enable_cors,
+        .kind = j->req.kind, .prompt_tokens = g->prompt_tokens, .cached_tokens = 0,
+        .has_tools = j->req.has_tools, .responses_protocol = g->responses_protocol,
+        .t0 = g->t0, .fd = j->fd, .stream = j->req.stream, .enable_cors = s->enable_cors,
     };
-    snprintf(g.progress.ctx, sizeof(g.progress.ctx), "%s", g.ctx_span);
-    g.max_tokens = j->req.max_tokens < 0 ? 0 : j->req.max_tokens;
-    if (g.max_tokens > ctx - g.prompt_tokens) g.max_tokens = ctx - g.prompt_tokens;
-    if (s->max_output_tokens > 0 && g.max_tokens > s->max_output_tokens) g.max_tokens = s->max_output_tokens;
-    g.thinking = thinking_state_from_prompt(&j->req);
-    g.thinking_gates_tool_markers = ds4_think_mode_enabled(j->req.think_mode);
-    g.tool_scan_waiting_for_think_close = g.thinking_gates_tool_markers && g.thinking.inside;
-    dsml_decode_tracker_init(&g.dsml_tracker);
-    g.next_tool_progress = 128; g.next_decode_log = 50; g.next_alive_check = V41_ALIVE_CHECK_TOKENS;
-    snprintf(g.id, sizeof(g.id), "%s-%llu", j->req.kind == REQ_CHAT ? "chatcmpl" : "cmpl", (unsigned long long)++s->seq);
-    g.structured_stream = request_uses_structured_stream(&j->req);
-    g.openai_live_chat = request_uses_openai_live_stream(&j->req);
-    g.responses_live_chat = request_uses_responses_live_stream(&j->req);
-    g.responses_created_at = (long)time(NULL);
+    snprintf(g->progress.ctx, sizeof(g->progress.ctx), "%s", g->ctx_span);
+    g->max_tokens = j->req.max_tokens < 0 ? 0 : j->req.max_tokens;
+    if (g->max_tokens > ctx - g->prompt_tokens) g->max_tokens = ctx - g->prompt_tokens;
+    if (s->max_output_tokens > 0 && g->max_tokens > s->max_output_tokens) g->max_tokens = s->max_output_tokens;
+    g->thinking = thinking_state_from_prompt(&j->req);
+    g->thinking_gates_tool_markers = ds4_think_mode_enabled(j->req.think_mode);
+    g->tool_scan_waiting_for_think_close = g->thinking_gates_tool_markers && g->thinking.inside;
+    dsml_decode_tracker_init(&g->dsml_tracker);
+    g->next_tool_progress = 128; g->next_decode_log = 50; g->next_alive_check = V41_ALIVE_CHECK_TOKENS;
+    snprintf(g->id, sizeof(g->id), "%s-%llu", j->req.kind == REQ_CHAT ? "chatcmpl" : "cmpl", (unsigned long long)++s->seq);
+    g->structured_stream = request_uses_structured_stream(&j->req);
+    g->openai_live_chat = request_uses_openai_live_stream(&j->req);
+    g->responses_live_chat = request_uses_responses_live_stream(&j->req);
+    g->responses_created_at = (long)time(NULL);
     /* 解码采样: 请求带什么就用什么, 没带的落到 ds4.h 的官方默认(温 1.0), 与官方 API 同。
      * 以前"没带 temperature = 裸 argmax": 聊天前端大多不发 temperature ⇒ 产品请求全走贪心, 09-28 "每句以五结尾"
      * 类请求在思考段逐字死循环(FP 老师在复读位也有 86~96% 选抄, 贪心出不来)。尺脚本要贪心就显式发 temperature:0。
-     * 频率/出现惩罚按请求; DRY 按服务启动参数(客户端协议没有它)。单 worker ⇒ 全局设置面按请求覆写即可。 */
-    /* DRY: 请求里带了 dry_multiplier 就按请求(base/allowed 没给用 llama.cpp 默认), 否则用服务启动参数 */
-    const ds4_decode_sampling sp = {
+     * 频率/出现惩罚按请求; DRY 按服务启动参数(客户端协议没有它), 请求里带了 dry_multiplier 就按请求(base/allowed 没给用 llama.cpp 默认)。 */
+    g->sp = (ds4_decode_sampling){
         .temperature = j->req.temperature, .top_p = j->req.top_p, .min_p = j->req.min_p,
         .top_k = j->req.top_k, .seed = j->req.seed, .freq_penalty = j->req.frequency_penalty, .presence_penalty = j->req.presence_penalty,
         .dry_multiplier = j->req.dry_set ? j->req.dry_multiplier : s->dry_multiplier,
         .dry_base = j->req.dry_set ? (j->req.dry_base > 1.f ? j->req.dry_base : 1.75f) : s->dry_base,
         .dry_allowed_length = j->req.dry_set ? (j->req.dry_allowed_length > 0 ? j->req.dry_allowed_length : 2) : s->dry_allowed_length,
     };
-    ds4_engine_set_decode_sampling(&sp);
-    if (sp.temperature > 0.f || sp.dry_multiplier > 0.f || sp.freq_penalty != 0.f || sp.presence_penalty != 0.f)
+    const ds4_decode_sampling *sp = &g->sp;
+    if (sp->temperature > 0.f || sp->dry_multiplier > 0.f || sp->freq_penalty != 0.f || sp->presence_penalty != 0.f)
         server_log(DS4_LOG_GENERATION, "ds4-server: %s ctx=%s V4.1 解码采样 temp=%.2f top_p=%.2f min_p=%.2f top_k=%d seed=%llu dry=%.2f/%.2f/%d freq=%.2f presence=%.2f",
-                   v41_kind(&g), g.ctx_span, (double)sp.temperature, (double)sp.top_p, (double)sp.min_p, sp.top_k, (unsigned long long)sp.seed,
-                   (double)sp.dry_multiplier, (double)sp.dry_base, sp.dry_allowed_length, (double)sp.freq_penalty, (double)sp.presence_penalty);
-    server_log(DS4_LOG_PREFILL, "ds4-server: %s ctx=%s%s%s prompt start (V4.1 整段预填, decode_max=%d)",
-               v41_kind(&g), g.ctx_span, g.req_flags[0] ? " " : "", g.req_flags, g.max_tokens);
+                   v41_kind(g), g->ctx_span, (double)sp->temperature, (double)sp->top_p, (double)sp->min_p, sp->top_k, (unsigned long long)sp->seed,
+                   (double)sp->dry_multiplier, (double)sp->dry_base, sp->dry_allowed_length, (double)sp->freq_penalty, (double)sp->presence_penalty);
+    return true;
+}
 
-    ds4_engine_v41_set_progress(v41_progress_cb, &g);
-    const int rc = ds4_engine_v41_generate_argmax(s->engine, prompt->v, prompt->len, g.max_tokens, v41_emit, &g);
-    ds4_engine_v41_set_progress(NULL, NULL);
-    if (rc != 0 && !g.started) {   /* 预填没走完 */
-        if (g.client_gone) {   /* 我们自己叫停的, 不是故障: 对端已经没了, 连错误响应都不用写 */
-            trace_event(s, g.trace_id, "prefill aborted: client disconnected");
-            free(g.ids);
-            buf_free(&g.text);
-            return;
+void v41_gen_end(v41_gen *g, int rc) {
+    server *s = g->s; job *j = g->j;
+    if (rc != 0 && !g->started) {   /* 预填没走完 */
+        if (g->client_gone) {   /* 我们自己叫停的, 不是故障: 对端已经没了, 连错误响应都不用写 */
+            trace_event(s, g->trace_id, "prefill aborted: client disconnected");
+        } else {
+            trace_event(s, g->trace_id, "prefill failed: V4.1 forward failed");
+            send_prefill_failure_response(s, j, &g->progress, g->ctx_span, g->req_flags, "V4.1 prefill failed");
         }
-        trace_event(s, g.trace_id, "prefill failed: V4.1 forward failed");
-        send_prefill_failure_response(s, j, &g.progress, g.ctx_span, g.req_flags, "V4.1 prefill failed");
-        buf_free(&g.text);
+        mon_end(s, j->mon, g->client_gone ? "disconnect" : "error", 0, -1, -1);
+        free(g->ids); buf_free(&g->text);
         return;
     }
-    if (!g.started) {   /* max_tokens == 0: 预填成了但一个 token 都不要 */
-        v41_prefill_done(&g);
-        if (!v41_stream_begin(&g)) { buf_free(&g.text); return; }
+    if (!g->started) {   /* max_tokens == 0: 预填成了但一个 token 都不要 */
+        v41_prefill_done(g);
+        if (!v41_stream_begin(g)) { mon_end(s, j->mon, "disconnect", 0, -1, -1); free(g->ids); buf_free(&g->text); return; }
     }
-    if (rc != 0 && strcmp(g.finish, "error") != 0) { g.finish = "error"; snprintf(g.err, sizeof(g.err), "V4.1 decode failed"); }
-    v41_finish(&g);
-    trace_token_ids(s, g.trace_id, prompt->v, prompt->len, g.ids, g.n_ids);   /* 提示 + 生成的 id 全落 trace(只在 --trace 开时) */
-    free(g.ids);
-    anthropic_stream_free(&g.anthropic_live);
-    openai_stream_free(&g.openai_live);
-    responses_stream_free(&g.responses_live);
-    buf_free(&g.text);
+    if (rc != 0 && strcmp(g->finish, "error") != 0) { g->finish = "error"; snprintf(g->err, sizeof(g->err), "V4.1 decode failed"); }
+    const char *final_finish = v41_finish(g);
+    /* 监控: 客户端挂断单独算一类(Strata 的 disconnect), 别混进 error; 草稿两项只在真投机过时报 */
+    mon_end(s, j->mon, g->client_gone ? "disconnect" : final_finish, g->completion,
+            g->spec_rounds > 0 ? g->spec_offered : -1, g->spec_rounds > 0 ? g->spec_accepted : -1);
+    trace_token_ids(s, g->trace_id, j->req.prompt.v, j->req.prompt.len, g->ids, g->n_ids);   /* 提示 + 生成的 id 全落 trace(只在 --trace 开时) */
+    free(g->ids);
+    anthropic_stream_free(&g->anthropic_live);
+    openai_stream_free(&g->openai_live);
+    responses_stream_free(&g->responses_live);
+    buf_free(&g->text);
 }
+
+/* 单 worker 路(不带 --batch): 引擎整段跑(预填 → 逐 token, 带投机), token 从回调来 */
+void generate_job_v41(server *s, job *j) {
+    v41_gen g;
+    if (!v41_gen_begin(s, j, &g)) return;
+    ds4_engine_set_decode_sampling(&g.sp);   /* 单 worker ⇒ 全局设置面按请求覆写即可 */
+    server_log(DS4_LOG_PREFILL, "ds4-server: %s ctx=%s%s%s prompt start (V4.1 整段预填, decode_max=%d)",
+               v41_kind(&g), g.ctx_span, g.req_flags[0] ? " " : "", g.req_flags, g.max_tokens);
+    ds4_engine_v41_set_progress(v41_progress_cb, &g);
+    mon_prefill(s, j->mon, g.prompt_tokens, 0, g.max_tokens);   /* 监控: 排队结束, 开始读提示 */
+    const int rc = ds4_engine_v41_generate_argmax(s->engine, j->req.prompt.v, j->req.prompt.len, g.max_tokens, v41_emit, &g);
+    ds4_engine_v41_set_progress(NULL, NULL);
+    ds4_engine_v41_last_spec_stats(&g.spec_rounds, &g.spec_offered, &g.spec_accepted);
+    v41_gen_end(&g, rc);
+}
+

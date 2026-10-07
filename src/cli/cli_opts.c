@@ -347,6 +347,17 @@ cli_config parse_options(int argc, char **argv) {
             c.gen.gen_ids_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--score-ids")) {
             c.gen.score_ids_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--ptrain")) {
+            c.gen.ptrain_spec = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--draft-train")) {
+            c.gen.draft_train_spec = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--multi-probe")) {
+            c.gen.multi_probe = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--no-lanes")) {
+            c.gen.no_lanes = 1;
+        } else if (!strcmp(arg, "--idx-mma")) {
+            /* indexer 打分走张量核(2026-09-30 判决用开关, 见 ds4_gpu_v41.h): 全局 setter, 同 --weight-cache-mb 的做法 */
+            ds4_gpu_v41_set_indexer_mma(1);
         } else if (!strcmp(arg, "--score-out")) {
             c.gen.score_out_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--draft-amp")) {
@@ -421,6 +432,8 @@ cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--inspect")) {
             c.inspect = true;
 #ifndef DS4_NO_GPU
+        } else if (!strcmp(arg, "--no-side-stream")) {
+            ds4_gpu_set_side_stream(0);   /* 诊断 A/B: 关共享专家侧流(输出逐字节同, 只换发法) */
         } else if (!strcmp(arg, "--no-residency")) {
             ds4_gpu_set_no_residency(1);
         } else if (!strcmp(arg, "--strict-fp")) {

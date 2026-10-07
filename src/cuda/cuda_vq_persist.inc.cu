@@ -346,6 +346,9 @@ static int v41_vq_persist_n_launch(int stage, uint32_t n_tok, uint16_t *h, float
     static int s_nsm = 0;
     if (np > V41_VQPN_MAXP || n_tok < 2u) return 0;
     if (!s_nsm && cudaDeviceGetAttribute(&s_nsm, cudaDevAttrMultiProcessorCount, 0) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
+    /* ★判负存档(2026-10-07)★ "13 位层(EXT=1)实例改 24 warp/块去掉 16 B 栈溢出": gu<13> 1024 线程下 REG 64 STACK 16(12 位实例 0),
+     * 怀疑溢出是 gu<13> 比 gu<12> 慢 17~32% 的来源。768 线程 REG 72 不溢, 但同请求 A/B(0908 512 token)46.08 → 45.09 t/s, 验证 58.6 → 60.0 ms:
+     * 少一档 warp 在飞的请求就少一档, 比溢出贵(09-24 同一句话)。输出逐字节同, 已回退。 */
     return v41_vq_persist_n_go<NBIT, EXT, (int)V41_VQPN_M, 32>(stage, h, part, blob, sel, ord, xb, IN, MID, OUT, K, np, clamp, cbb, gr, s_nsm);
 }
 #undef V41_VQ_SEG

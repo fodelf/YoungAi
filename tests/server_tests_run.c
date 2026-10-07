@@ -116,6 +116,12 @@ void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_score_decays_stale_hits();
     test_kv_cache_eviction_decayed_hits_tie_break_by_age();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
+    test_monitor_request_lifecycle_reaches_metrics();
+    test_monitor_recent_requests_default_twelve_or_all();
+    test_monitor_prometheus_text_uses_vllm_names();
+    test_monitor_accept_header_selects_prometheus();
+    test_monitor_http_route_selects_json_or_prometheus();
+    test_monitor_page_route_serves_html();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN

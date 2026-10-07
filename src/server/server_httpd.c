@@ -34,6 +34,25 @@ static long content_length(const char *h, size_t n) {
     return 0;
 }
 
+/* Accept 头里有没有 text/plain 或 openmetrics: Prometheus 抓 /metrics 就是这么问的(照 Strata wants_prometheus 的判法) */
+bool http_accepts_text(const char *h, size_t n) {
+    const char *p = h, *end = h + n;
+    while (p < end) {
+        const char *line = p;
+        while (p < end && *p != '\n') p++;
+        size_t len = (size_t)(p - line);
+        if (len && line[len - 1] == '\r') len--;
+        if (len >= 7 && strncasecmp(line, "Accept:", 7) == 0) {
+            char v[512];
+            snprintf(v, sizeof v, "%.*s", (int)(len - 7 < sizeof v - 1 ? len - 7 : sizeof v - 1), line + 7);
+            for (char *c = v; *c; c++) *c = (char)tolower((unsigned char)*c);
+            return strstr(v, "text/plain") != NULL || strstr(v, "openmetrics") != NULL;
+        }
+        if (p < end) p++;
+    }
+    return false;
+}
+
 static bool read_http_request(int fd, http_request *r) {
     buf b = {0};
     ssize_t hend = -1;
@@ -59,7 +78,9 @@ static bool read_http_request(int fd, http_request *r) {
     line[i] = '\0';
     if (sscanf(line, "%7s %255s", r->method, r->path) != 2) goto fail;
     char *q = strchr(r->path, '?');
-    if (q) *q = '\0';
+    r->query[0] = '\0';
+    if (q) { *q = '\0'; snprintf(r->query, sizeof r->query, "%s", q + 1); }
+    r->accept_text = http_accepts_text(b.ptr, (size_t)hend);
 
     long clen = content_length(b.ptr, (size_t)hend);
     if (clen < 0 || (size_t)clen > max_body) goto fail;
@@ -182,6 +203,26 @@ void *client_main(void *arg) {
         goto done;
     }
 
+    if (!strcmp(hr.method, "GET") && (!strcmp(hr.path, "/monitor") || !strcmp(hr.path, "/monitor.html"))) {
+        serve_page_file(fd, s->enable_cors, DS4_MONITOR_PAGE_FILE);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/metrics")) {
+        /* 监控数据面(server_monitor.c): 默认 JSON(监控页每秒拉一次; ?requests=all 给全部保留的请求), Prometheus 问法给文本 */
+        buf b = {0};
+        if (hr.accept_text || strstr(hr.query, "format=prometheus")) {
+            mon_prometheus_text(s, &b);
+            http_response(fd, s->enable_cors, 200, "text/plain; version=0.0.4; charset=utf-8", b.ptr ? b.ptr : "");
+        } else {
+            mon_metrics_json(s, &b, strstr(hr.query, "requests=all") != NULL);
+            http_response(fd, s->enable_cors, 200, "application/json", b.ptr ? b.ptr : "{}");
+        }
+        buf_free(&b);
+        http_request_free(&hr);
+        goto done;
+    }
+
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
         send_models(s, fd);
         http_request_free(&hr);
@@ -238,6 +279,8 @@ void *client_main(void *arg) {
         goto done;
     }
     if (ok) req.raw_body = xstrndup(hr.body, hr.body_len);
+    char route_path[256];
+    snprintf(route_path, sizeof route_path, "%s", hr.path);
     http_request_free(&hr);
     if (!ok) {
         http_error(fd, s->enable_cors, 400, err);
@@ -259,6 +302,7 @@ void *client_main(void *arg) {
     memset(&j, 0, sizeof(j));
     j.fd = fd;
     j.req = req;
+    j.mon = mon_begin(s, &j.req, route_path);   /* 监控: 从这一刻起算排队 */
     pthread_mutex_init(&j.mu, NULL);
     pthread_cond_init(&j.cv, NULL);
 
@@ -266,6 +310,7 @@ void *client_main(void *arg) {
     if (!enqueue(s, &j)) {
         pthread_mutex_unlock(&j.mu);
         http_error(fd, s->enable_cors, 503, "server shutting down");
+        mon_end(s, j.mon, "error", 0, -1, -1);
         pthread_cond_destroy(&j.cv);
         pthread_mutex_destroy(&j.mu);
         request_free(&j.req);
@@ -273,6 +318,8 @@ void *client_main(void *arg) {
     }
     while (!j.done) pthread_cond_wait(&j.cv, &j.mu);
     pthread_mutex_unlock(&j.mu);
+    /* worker 没走到收尾的失败路(请求不合法 / 预填准入拒绝)在这里补记 error; 正常路 worker 已收, 这次是空操作 */
+    mon_end(s, j.mon, "error", 0, -1, -1);
 
     pthread_cond_destroy(&j.cv);
     pthread_mutex_destroy(&j.mu);

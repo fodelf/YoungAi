@@ -43,29 +43,6 @@ static int routed_moe_launch(
         out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float)) {
         return 0;
     }
-    { static int dbg_n = 0;
-      if (dbg_n < 2000 && ((const char *)0) /* DS4_MOE_CALL_DBG: 路径开关已删(2026-08-22 隐形炸弹清理) */) { dbg_n++;
-          fprintf(stderr, "ds4: [moe-call] ntok=%u gate_t=%u down_t=%u\n", n_tokens, gate_type, down_type); } }
-    /* 专家并集实测(2026-08-21 物理地板对账): 每层把 selected 拉回主机数一次唯一专家。 */
-    if (((const char *)0) /* DS4_MOE_UNION_DBG: 路径开关已删(2026-08-22 隐形炸弹清理) */ && n_tokens >= 2u && n_tokens <= 16u) {
-        static uint64_t u_sum = 0, u_n = 0, p_sum = 0;
-        int32_t sel_h[16 * 8];
-        const size_t nb = (size_t)n_tokens * n_expert * sizeof(int32_t);
-        if (nb <= sizeof(sel_h) &&
-            cudaMemcpy(sel_h, selected->ptr, nb, cudaMemcpyDeviceToHost) == cudaSuccess) {
-            bool seen[512] = {false};
-            uint32_t uniq = 0;
-            for (uint32_t i = 0; i < n_tokens * n_expert; i++) {
-                const int32_t e = sel_h[i];
-                if (e >= 0 && e < 512 && !seen[e]) { seen[e] = true; uniq++; }
-            }
-            u_sum += uniq; p_sum += (uint64_t)n_tokens * n_expert; u_n++;
-            if ((u_n % 43u) == 0)
-                fprintf(stderr, "ds4: [moe-union] ntok=%u picks=%u uniq_avg=%.1f (n=%llu)\n",
-                        n_tokens, n_tokens * n_expert, (double)u_sum / (double)u_n,
-                        (unsigned long long)u_n);
-        }
-    }
     const int q4k_path = (gate_type == 12u && down_type == 12u);
     const int q2k_path = (gate_type == 10u && down_type == 10u);   /* 全 Q2_K 专家 */
     {   static int once = 0;
@@ -104,22 +81,10 @@ static int routed_moe_launch(
     if (down->bytes >= xq_bytes && gate->bytes >= midq_bytes) {
         cuda_block_q8_K *xq = (cuda_block_q8_K *)down->ptr;
         cuda_block_q8_K *midq = (cuda_block_q8_K *)gate->ptr;
-        const uint32_t profile_moe = ((const char *)0) /* DS4_CUDA_MOE_PROFILE: 诊断开关已删(2026-08-22) */ != NULL;
-        cudaEvent_t prof_ev[7] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL};
-        if (profile_moe) {
-            for (uint32_t i = 0; i < 7u; i++) {
-                if (cudaEventCreate(&prof_ev[i]) != cudaSuccess) {
-                    for (uint32_t j = 0; j < i; j++) (void)cudaEventDestroy(prof_ev[j]);
-                    memset(prof_ev, 0, sizeof(prof_ev));
-                    break;
-                }
-            }
-            if (prof_ev[0]) (void)cudaEventRecord(prof_ev[0], 0);
-        }
         const uint32_t pair_count = n_tokens * n_expert;
         const uint32_t use_sorted_pairs = n_tokens > 1u;
         const uint32_t use_expert_tiles = use_sorted_pairs;
-        const uint32_t expert_tile_m = ((const char *)0) /* DS4_CUDA_MOE_TILE4: 路径开关已删(2026-08-22 隐形炸弹清理) */ ? 4u : 8u;
+        const uint32_t expert_tile_m = 8u;   /* 专家瓦片 M(原 DS4_CUDA_MOE_TILE4 旋钮, 定死 8) */
         const uint32_t write_gate_up = 0;
         const uint32_t use_p2_sorted = use_sorted_pairs;
         /* ★MoE down 原子累加整族删除(2026-08-22)★ —— 连同它的两个 env 开关一起删, 不留旋钮。
@@ -179,7 +144,6 @@ static int routed_moe_launch(
         dim3 xq_grid(xq_blocks, n_tokens, 1);
         ds4_launch_pdl(q8_K_quantize_kernel, xq_grid, 256, 0, 0, xq, (const float *)x->ptr, expert_in_dim, n_tokens);
         ok = cuda_ok(cudaGetLastError(), "routed_moe x quantize launch");
-        if (prof_ev[1]) (void)cudaEventRecord(prof_ev[1], 0);
         if (ok && use_sorted_pairs) {
             const uint64_t counts_bytes = 256ull * sizeof(uint32_t);
             const uint64_t offsets_bytes = 257ull * sizeof(uint32_t);
@@ -261,7 +225,6 @@ static int routed_moe_launch(
                 }
             }
         }
-        if (prof_ev[2]) (void)cudaEventRecord(prof_ev[2], 0);
         if (ok) {
             dim3 mgrid((expert_mid_dim + 31u) / 32u, n_tokens * n_expert, 1);
             /* tiles 版 gate/up kernel 全部硬编码 cuda_block_iq2_xxs, Q2_K 走下面的
@@ -447,42 +410,6 @@ static int routed_moe_launch(
                         expert_mid_dim,
                         n_expert,
                         clamp);
-                    /* 数值探针(DS4_Q2K_PROBE=1, 只跑一次): kernel 的 gate[row0] vs
-                     * 从 host mmap 直接读同一专家行做的 f32 参考 dot。差得远=kernel/
-                     * 数据错位; 接近=gate/up 无辜, bug 在下游。 */
-                    static int q2k_probed = 0;
-                    if (!q2k_probed && ((const char *)0) /* DS4_Q2K_PROBE: 诊断开关已删(2026-08-22) */) {
-                        q2k_probed = 1;
-                        (void)cudaDeviceSynchronize();
-                        int32_t e0 = -1;
-                        float gk[4], xh[4096];
-                        (void)cudaMemcpy(&e0, selected->ptr, 4, cudaMemcpyDeviceToHost);
-                        (void)cudaMemcpy(gk, gate->ptr, sizeof(gk), cudaMemcpyDeviceToHost);
-                        (void)cudaMemcpy(xh, x->ptr, sizeof(float) * expert_in_dim, cudaMemcpyDeviceToHost);
-                        const uint8_t *row = (const uint8_t *)model_map + gate_offset
-                                           + (uint64_t)e0 * gate_expert_bytes;
-                        double ref = 0.0;
-                        for (uint32_t b = 0; b < expert_in_dim / 256u; b++) {
-                            const uint8_t *blk = row + (size_t)b * 84u;
-                            const uint8_t *sc = blk, *qs = blk + 16;
-                            uint16_t hd, hm; memcpy(&hd, blk + 80, 2); memcpy(&hm, blk + 82, 2);
-                            const float d = dev_host_f16(hd), dm = dev_host_f16(hm);
-                            for (int j = 0; j < 16; j++) {
-                                const float dj = d * (sc[j] & 0xF), mj = dm * (sc[j] >> 4);
-                                for (int ii = 0; ii < 16; ii++) {
-                                    const int idx = j * 16 + ii;
-                                    const int shift = (idx / 32) % 4 * 2;   /* 128 组内布局 */
-                                    const int qpos = (idx / 128) * 32 + (idx % 32);
-                                    const int q = (qs[qpos] >> ((idx % 128) / 32 * 2)) & 3;
-                                    ref += (double)(dj * q - mj) * xh[b * 256u + idx];
-                                }
-                            }
-                        }
-                        fprintf(stderr, "ds4: [q2k-probe] e0=%d kernel_gate0=%.4f host_ref=%.4f x0..3=%.3f %.3f %.3f %.3f\n",
-                                e0, gk[0], ref, xh[0], xh[1], xh[2], xh[3]);
-                        fflush(stderr);
-                        g_q2k_probe_out = 1;
-                    }
                 } else if (q2k_path) {
                     /* q2k 泛化配方(xq_blocks != 16): 原合体 kernel */
                     dim3 q2grid(n_tokens, (expert_mid_dim + 7u) / 8u, n_expert);
@@ -521,13 +448,11 @@ static int routed_moe_launch(
             }
             ok = cuda_ok(cudaGetLastError(), "routed_moe gate/up launch");
         }
-        if (prof_ev[3]) (void)cudaEventRecord(prof_ev[3], 0);
         if (ok) {
             dim3 midq_grid(midq_blocks, n_tokens * n_expert, 1);
             ds4_launch_pdl(q8_K_quantize_kernel, midq_grid, 256, 0, 0, midq, (const float *)mid->ptr, expert_mid_dim, n_tokens * n_expert);
             ok = cuda_ok(cudaGetLastError(), "routed_moe mid quantize launch");
         }
-        if (prof_ev[4]) (void)cudaEventRecord(prof_ev[4], 0);
         if (ok) {
             dim3 dgrid((out_dim + 31u) / 32u, n_tokens * n_expert, 1);
             uint32_t *down_tile_total = tile_total;
@@ -711,144 +636,11 @@ static int routed_moe_launch(
             }
             ok = cuda_ok(cudaGetLastError(), "routed_moe down launch");
         }
-        if (ok && q4k_path && n_tokens > 1u && ((const char *)0) /* DS4_Q4K_BATCH_PROBE: 诊断开关已删(2026-08-22) */) {
-            (void)cudaDeviceSynchronize();
-            float xv[4] = {0}, mv[4] = {0}, dv[4] = {0};
-            (void)cudaMemcpy(xv, x->ptr, sizeof(xv), cudaMemcpyDeviceToHost);
-            (void)cudaMemcpy(mv, mid->ptr, sizeof(mv), cudaMemcpyDeviceToHost);
-            (void)cudaMemcpy(dv, down->ptr, sizeof(dv), cudaMemcpyDeviceToHost);
-            int32_t sh[8] = {0}; float wh[8] = {0};
-            (void)cudaMemcpy(sh, selected->ptr, sizeof(sh), cudaMemcpyDeviceToHost);
-            (void)cudaMemcpy(wh, weights->ptr, sizeof(wh), cudaMemcpyDeviceToHost);
-            fprintf(stderr, "ds4: [q4kbatch] ntok=%u x=%.3g %.3g mid=%.3g %.3g down=%.3g %.3g sel=%d %d %d w=%.3g %.3g\n",
-                    n_tokens, xv[0], xv[1], mv[0], mv[1], dv[0], dv[1], sh[0], sh[1], sh[2], wh[0], wh[1]);
-            {
-                cuda_block_q8_K mb;
-                (void)cudaMemcpy(&mb, midq, sizeof(mb), cudaMemcpyDeviceToHost);
-                int bs0 = mb.bsums[0], bs1 = mb.bsums[1];
-                fprintf(stderr, "ds4: [q4kbatch] midq0 d=%.4g qs=%d %d %d %d bsums=%d %d\n",
-                        mb.d, (int)mb.qs[0], (int)mb.qs[1], (int)mb.qs[2], (int)mb.qs[3], bs0, bs1);
-                cuda_block_q4_K wb;
-                (void)cudaMemcpy(&wb, down_w + (uint64_t)(uint32_t)sh[0] * down_expert_bytes, sizeof(wb), cudaMemcpyDeviceToHost);
-                fprintf(stderr, "ds4: [q4kbatch] downblk e%d d=%.4g dmin=%.4g sc=%u %u qs=%u %u | ebytes=%llu rbytes=%llu odim=%u mblk=%u\n",
-                        sh[0], dev_host_f16(wb.d), dev_host_f16(wb.dmin), (unsigned)wb.scales[0], (unsigned)wb.scales[1],
-                        (unsigned)wb.qs[0], (unsigned)wb.qs[1],
-                        (unsigned long long)down_expert_bytes, (unsigned long long)down_row_bytes, out_dim, midq_blocks);
-            }
-        }
-        if (prof_ev[5]) (void)cudaEventRecord(prof_ev[5], 0);
         if (ok && !use_atomic_down && !use_direct_down_sum6) {
             uint64_t n = (uint64_t)n_tokens * out_dim;
             moe_sum_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
             ok = cuda_ok(cudaGetLastError(), "routed_moe sum launch");
         }
-        if (prof_ev[6]) {
-            (void)cudaEventRecord(prof_ev[6], 0);
-            if (cudaEventSynchronize(prof_ev[6]) == cudaSuccess) {
-                float ms_xq = 0.0f, ms_sort = 0.0f, ms_gate = 0.0f, ms_midq = 0.0f, ms_down = 0.0f, ms_sum = 0.0f, ms_total = 0.0f;
-                (void)cudaEventElapsedTime(&ms_xq, prof_ev[0], prof_ev[1]);
-                (void)cudaEventElapsedTime(&ms_sort, prof_ev[1], prof_ev[2]);
-                (void)cudaEventElapsedTime(&ms_gate, prof_ev[2], prof_ev[3]);
-                (void)cudaEventElapsedTime(&ms_midq, prof_ev[3], prof_ev[4]);
-                (void)cudaEventElapsedTime(&ms_down, prof_ev[4], prof_ev[5]);
-                (void)cudaEventElapsedTime(&ms_sum, prof_ev[5], prof_ev[6]);
-                (void)cudaEventElapsedTime(&ms_total, prof_ev[0], prof_ev[6]);
-                fprintf(stderr,
-                        "ds4: CUDA MoE profile tokens=%u pairs=%u xq=%.3f sort=%.3f gateup=%.3f midq=%.3f down=%.3f sum=%.3f total=%.3f ms\n",
-                        n_tokens, pair_count, ms_xq, ms_sort, ms_gate, ms_midq, ms_down, ms_sum, ms_total);
-            }
-            for (uint32_t i = 0; i < 7u; i++) (void)cudaEventDestroy(prof_ev[i]);
-        }
-    if (ok && g_q2k_probe_out >= 1 && g_q2k_probe_out < 90) {
-        g_q2k_probe_out++;
-        (void)cudaDeviceSynchronize();
-        /* host 全链参考: tok0 的 6 个专家, gate/up→clamp→silu→×router→down, 与 out[0..3] 比 */
-        float xh[8192]; int32_t selh[64]; float wh[64]; float oh[4];
-        (void)cudaMemcpy(xh, x->ptr, sizeof(float) * expert_in_dim, cudaMemcpyDeviceToHost);
-        (void)cudaMemcpy(selh, selected->ptr, sizeof(int32_t) * n_expert, cudaMemcpyDeviceToHost);
-        (void)cudaMemcpy(wh, weights->ptr, sizeof(float) * n_expert, cudaMemcpyDeviceToHost);
-        (void)cudaMemcpy(oh, out->ptr, sizeof(oh), cudaMemcpyDeviceToHost);
-        double oref[4] = {0, 0, 0, 0};
-        float deq[256];
-        float *mid_h = (float *)malloc(sizeof(float) * expert_mid_dim);
-        for (uint32_t s = 0; s < n_expert; s++) {
-            const int e = selh[s];
-            if (e < 0) continue;
-            const uint8_t *gbase = (const uint8_t *)model_map + gate_offset + (uint64_t)e * gate_expert_bytes;
-            const uint8_t *ubase = (const uint8_t *)model_map + up_offset + (uint64_t)e * gate_expert_bytes;
-            const uint8_t *dbase = (const uint8_t *)model_map + down_offset + (uint64_t)e * down_expert_bytes;
-            for (uint32_t r = 0; r < expert_mid_dim; r++) {
-                double gacc = 0, uacc = 0;
-                for (uint32_t b = 0; b < expert_in_dim / 256u; b++) {
-                    host_deq_q2k_block(gbase + (size_t)r * gate_row_bytes + (size_t)b * 84u, deq);
-                    for (int i = 0; i < 256; i++) gacc += (double)deq[i] * xh[b * 256u + i];
-                    host_deq_q2k_block(ubase + (size_t)r * gate_row_bytes + (size_t)b * 84u, deq);
-                    for (int i = 0; i < 256; i++) uacc += (double)deq[i] * xh[b * 256u + i];
-                }
-                float gv = (float)gacc, uv = (float)uacc;
-                if (clamp > 1.0e-6f) {
-                    if (gv > clamp) gv = clamp;
-                    if (uv > clamp) uv = clamp;
-                    if (uv < -clamp) uv = -clamp;
-                }
-                mid_h[r] = (gv / (1.0f + expf(-gv))) * uv * wh[s];
-            }
-            for (int o = 0; o < 4; o++) {
-                double acc = 0;
-                for (uint32_t b = 0; b < expert_mid_dim / 256u; b++) {
-                    host_deq_q2k_block(dbase + (size_t)o * down_row_bytes + (size_t)b * 84u, deq);
-                    for (int i = 0; i < 256; i++) acc += (double)deq[i] * mid_h[b * 256u + i];
-                }
-                oref[o] += acc;
-            }
-        }
-        free(mid_h);
-        {
-            /* 全量扫 MoE 输出: NaN 到底是不是 MoE 自己产的 */
-            const uint64_t on = (uint64_t)n_tokens * out_dim;
-            float *ofull = (float *)malloc(on * sizeof(float));
-            int o_nan = 0; float o_max = 0; int64_t first_nan = -1;
-            if (ofull && cudaMemcpy(ofull, out->ptr, on * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess) {
-                for (uint64_t i = 0; i < on; i++) {
-                    if (ofull[i] != ofull[i]) { if (first_nan < 0) first_nan = (int64_t)i; o_nan++; }
-                    else if (fabsf(ofull[i]) > o_max) o_max = fabsf(ofull[i]);
-                }
-            }
-            free(ofull);
-            /* mid 扫描 + 全部 selected: 区分"mid 就坏"vs"down/sum 读错" */
-            {
-                const uint64_t mn = (uint64_t)n_tokens * n_expert * expert_mid_dim;
-                float *mfull = (float *)malloc(mn * sizeof(float));
-                int m_nan = 0; float m_max = 0;
-                if (mfull && cudaMemcpy(mfull, mid->ptr, mn * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess)
-                    for (uint64_t i = 0; i < mn; i++) {
-                        if (mfull[i] != mfull[i]) m_nan++;
-                        else if (fabsf(mfull[i]) > m_max) m_max = fabsf(mfull[i]);
-                    }
-                free(mfull);
-                int32_t sall[64];
-                (void)cudaMemcpy(sall, selected->ptr, sizeof(int32_t) * n_tokens * n_expert, cudaMemcpyDeviceToHost);
-                int s_neg = 0;
-                for (uint32_t i = 0; i < n_tokens * n_expert; i++) if (sall[i] < 0) s_neg++;
-                fprintf(stderr, "ds4: [q2k-m] mid_nan=%d mid_max=%.1f sel_neg=%d sel=[", m_nan, m_max, s_neg);
-                for (uint32_t i = 0; i < n_tokens * n_expert && i < 30u; i++) fprintf(stderr, "%d ", sall[i]);
-                fprintf(stderr, "]\n");
-            }
-            fprintf(stderr, "ds4: [q2k-o] out_nan=%d/%llu first=%lld out_max=%.1f\n",
-                    o_nan, (unsigned long long)on, (long long)first_nan, o_max);
-            int x_nan = 0; float x_max = 0;
-            for (uint32_t i = 0; i < expert_in_dim; i++) {
-                if (xh[i] != xh[i]) x_nan++;
-                else if (fabsf(xh[i]) > x_max) x_max = fabsf(xh[i]);
-            }
-            fprintf(stderr, "ds4: [q2k-x] x_nan=%d x_max=%.1f sel0=%d w0=%.4f\n", x_nan, x_max, selh[0], wh[0]);
-            const double diff = fabs(oh[0] - oref[0]) + fabs(oh[1] - oref[1]);
-            fprintf(stderr, "ds4: [q2k#%02d] ntok=%u gpu0=%.3f host0=%.3f %s\n",
-                    g_q2k_probe_out - 1, n_tokens, oh[0], oref[0],
-                    diff > 0.5 * (fabs(oref[0]) + fabs(oref[1]) + 0.1) ? "★发散★" : "ok");
-            fflush(stderr);
-        }
-    }
         return ok;
     }
 

@@ -225,3 +225,44 @@ int ds4_gpu_v41_row_add_tensor(ds4_gpu_tensor *dst, uint64_t dst_row, const ds4_
         (float *)dst->ptr + dst_row * n, (const float *)src->ptr, n);
     return cuda_ok(cudaGetLastError(), "v41 row add");
 }
+
+/* ---- markov 偏置缓存(2026-10-07; 接口语义见 ds4_gpu_v41.h) ----
+ * lookup: 一 block, 槽号 = 线程号; 同一 id 最多住一槽(领槽时记 id, 命中就不领), 所以至多一个线程命中。未命中轮换淘汰: 老槽的 id 当场改成新 id,
+ * 偏置要到 add 那发才存进去 —— 中间没人读那一槽(同流顺序: lookup → gather → GEMV → add → 下一位的 lookup)。 */
+__global__ static void v41_mkcache_lookup_kernel(int32_t *hit, int32_t *cache_ids, uint32_t *next, const int32_t *ids, uint32_t which, uint32_t n_slots) {
+    __shared__ int found;
+    if (threadIdx.x == 0) found = -1;
+    __syncthreads();
+    const int32_t id = ids[which];
+    if (threadIdx.x < n_slots && cache_ids[threadIdx.x] == id) found = (int)threadIdx.x;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        if (found >= 0) { hit[0] = found; return; }
+        const uint32_t s = *next % n_slots;
+        *next = s + 1u;
+        cache_ids[s] = id;
+        hit[0] = -(int32_t)s - 2;
+    }
+}
+int ds4_gpu_v41_mkcache_lookup_tensor(ds4_gpu_tensor *hit, ds4_gpu_tensor *cache_ids, ds4_gpu_tensor *next, const ds4_gpu_tensor *ids,
+                                      uint32_t which, uint32_t n_slots) {
+    if (!hit || !cache_ids || !next || !ids || n_slots == 0u || n_slots > 1024u) return 0;
+    v41_mkcache_lookup_kernel<<<1, (unsigned)n_slots, 0, g_cur_stream>>>(
+        (int32_t *)hit->ptr, (int32_t *)cache_ids->ptr, (uint32_t *)next->ptr, (const int32_t *)ids->ptr, which, n_slots);
+    return cuda_ok(cudaGetLastError(), "v41 mkcache lookup");
+}
+/* add: 命中 ⇒ += cache[槽]; 未命中 ⇒ += bias 并存槽。与 v41_row_add_kernel 同一个加法(dst += 同一个 f32) ⇒ 逐位同。 */
+__global__ static void v41_mkcache_add_kernel(float *dst, const float *bias, float *cache, const int32_t *hit, uint64_t n) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int32_t h = hit[0];
+    if (h >= 0) dst[i] += cache[(uint64_t)h * n + i];
+    else { const float b = bias[i]; dst[i] += b; cache[(uint64_t)(-h - 2) * n + i] = b; }
+}
+int ds4_gpu_v41_mkcache_add_tensor(ds4_gpu_tensor *logits, uint64_t row, const ds4_gpu_tensor *bias, ds4_gpu_tensor *cache,
+                                   const ds4_gpu_tensor *hit, uint64_t n) {
+    if (!logits || !bias || !cache || !hit) return 0;
+    v41_mkcache_add_kernel<<<(unsigned)((n + 255) / 256), 256, 0, g_cur_stream>>>(
+        (float *)logits->ptr + row * n, (const float *)bias->ptr, (float *)cache->ptr, (const int32_t *)hit->ptr, n);
+    return cuda_ok(cudaGetLastError(), "v41 mkcache add");
+}

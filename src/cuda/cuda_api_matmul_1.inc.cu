@@ -265,18 +265,6 @@ int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64
                                          CUBLAS_GEMM_DEFAULT);
         return cublas_ok(st, "f16 matmul");
     }
-    /* 诊断探针(DS4_F16_DIMS=1): 打印每个唯一 (in,out,路径), 用后即弃 */
-    if (((const char *)0) /* DS4_F16_DIMS: 路径开关已删(2026-08-22 隐形炸弹清理) */) {
-        static uint64_t seen[64][2]; static int nseen = 0;
-        int hit = 0;
-        for (int i = 0; i < nseen; i++) if (seen[i][0] == in_dim && seen[i][1] == out_dim) { hit = 1; break; }
-        if (!hit && nseen < 64) {
-            seen[nseen][0] = in_dim; seen[nseen][1] = out_dim; nseen++;
-            fprintf(stderr, "ds4: [f16-dims] in=%llu out=%llu serial=%d ord=%d ntok=%llu\n",
-                    (unsigned long long)in_dim, (unsigned long long)out_dim,
-                    (int)(serial_f16 || serial_router), (int)ordered_router, (unsigned long long)n_tok);
-        }
-    }
     /* split-K 缓冲预分配(必须在非 capture 调用里做, 见 down partial 同款注释) */
     if (!g_f16sk_partial) {
         cudaStreamCaptureStatus fcs = cudaStreamCaptureStatusNone;
@@ -373,19 +361,9 @@ int ds4_gpu_matmul_f16_pair_tensor(
     const __half *w0 = (const __half *)cuda_model_range_ptr(model_map, weight0_offset, weight_bytes, "f16_pair0");
     const __half *w1 = (const __half *)cuda_model_range_ptr(model_map, weight1_offset, weight_bytes, "f16_pair1");
     if (!w0 || !w1) return 0;
-    if (((const char *)0) /* DS4_F16_DIMS: 路径开关已删(2026-08-22 隐形炸弹清理) */) {   /* 诊断探针: pair 形状(与单矩阵入口同款) */
-        static uint64_t pseen[64][2]; static int pn = 0;
-        int hit = 0;
-        for (int i = 0; i < pn; i++) if (pseen[i][0] == in_dim && pseen[i][1] == out_dim) { hit = 1; break; }
-        if (!hit && pn < 64) {
-            pseen[pn][0] = in_dim; pseen[pn][1] = out_dim; pn++;
-            fprintf(stderr, "ds4: [f16-pair-dims] in=%llu out=%llu (grid=%u blk=256)\n",
-                    (unsigned long long)in_dim, (unsigned long long)out_dim, (unsigned)(2u * out_dim));
-        }
-    }
-    static uint32_t fp2 = 99u;
-    if (fp2 == 99u) { const char *e = ((const char *)0) /* DS4_F16_PAIR2: 路径开关已删(2026-08-22 隐形炸弹清理) */; fp2 = e ? (uint32_t)atoi(e) : 0u; }   /* 默认关: 2行版实测2778→2866反向(多行族二败) */
-    unsigned pgrid = fp2 ? (unsigned)out_dim : (unsigned)(2u * out_dim);
+    /* 2 行/块版判负存档(原 DS4_F16_PAIR2 旋钮, 定死关): 实测 2778→2866 反向(多行族二败); 核末参 0 = 1 行/块, 网格 2 × out_dim */
+    const uint32_t fp2 = 0u;
+    unsigned pgrid = (unsigned)(2u * out_dim);
     if (pgrid > ds4_grid_cap()) pgrid = ds4_grid_cap();   /* pair3(施工日2): 常驻块行循环, 灭块级碎片 */
     matmul_f16_pair_rowblock_kernel<<<pgrid,
                                       256, 0, g_cur_stream>>>(

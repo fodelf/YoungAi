@@ -320,11 +320,6 @@ int ds4_gpu_token_graph_end_launch(void) {
 
 /* 命中预编码: 写参数槽后直接发射, encode 零成本。返回 1=已发射。 */
 int ds4_gpu_token_graph_try_pending(int token, uint32_t pos, int need_logits) {
-    if (((const char *)0) /* DS4_TOK_GRAPH_DEBUG: 诊断开关已删(2026-08-22) */ && (g_tok_graph_on <= 0 || g_tok_pending < 0 ||
-        g_tok_pending_pos != pos || g_tok_pending_logits != need_logits ||
-        !g_tok_execs[g_tok_pending < 0 ? 0 : g_tok_pending]))
-        fprintf(stderr, "[tokdbg] miss pos=%u: on=%d pending=%d ppos=%u plog=%d\n",
-                pos, g_tok_graph_on, g_tok_pending, g_tok_pending_pos, g_tok_pending_logits);
     if (g_tok_graph_on <= 0 || g_tok_pending < 0 ||
         g_tok_pending_pos != pos || g_tok_pending_logits != need_logits ||
         !g_tok_execs[g_tok_pending])
@@ -346,28 +341,15 @@ int ds4_gpu_token_graph_try_pending(int token, uint32_t pos, int need_logits) {
 int ds4_gpu_token_graph_pending_discard(void) { g_tok_pending = -1; return 1; }
 
 int ds4_gpu_token_graph_precapture_begin(void) {
-    if (g_tok_graph_on <= 0 || !g_tok_id_dev || !g_tok_id_host) {
-        if (((const char *)0) /* DS4_TOK_GRAPH_DEBUG: 诊断开关已删(2026-08-22) */)
-            fprintf(stderr, "[tokdbg] precap-skip: on=%d id_dev=%d id_host=%d\n",
-                    g_tok_graph_on, g_tok_id_dev != NULL, g_tok_id_host != NULL);
-        return 0;
-    }
+    if (g_tok_graph_on <= 0 || !g_tok_id_dev || !g_tok_id_host) return 0;
     if (cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
-        if (((const char *)0) /* DS4_TOK_GRAPH_DEBUG: 诊断开关已删(2026-08-22) */)
-            fprintf(stderr, "[tokdbg] precap BeginCapture FAIL\n");
         (void)cudaGetLastError();
         return 0;
     }
     return 1;
 }
 
-static double tokdbg_now(void) {
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6;
-}
 int ds4_gpu_token_graph_precapture_end(uint32_t pos, int need_logits, int encode_ok) {
-    const int dbg = ((const char *)0) /* DS4_TOK_GRAPH_DEBUG: 诊断开关已删(2026-08-22) */ != NULL;
-    const double td0 = dbg ? tokdbg_now() : 0.0;
     cudaGraph_t graph = NULL;
     if (cudaStreamEndCapture(cudaStreamPerThread, &graph) != cudaSuccess) {
         (void)cudaGetLastError();
@@ -376,25 +358,13 @@ int ds4_gpu_token_graph_precapture_end(uint32_t pos, int need_logits, int encode
         return 0;
     }
     if (!encode_ok || !graph) {
-        if (((const char *)0) /* DS4_TOK_GRAPH_DEBUG: 诊断开关已删(2026-08-22) */)
-            fprintf(stderr, "[tokdbg] precap-end reject: encode_ok=%d graph=%d\n", encode_ok, graph != NULL);
         if (graph) (void)cudaGraphDestroy(graph);
         g_tok_pending = -1;
         return 0;
     }
-    const double td1 = dbg ? tokdbg_now() : 0.0;
-    if (((const char *)0) /* DS4_TOK_GRAPH_DOT: 路径开关已删(2026-08-22 隐形炸弹清理) */) {   /* 奇偶图导出 diff 用: pos 8/9 各一张 */
-        if (pos == 7u || pos == 9u) {
-            char fp[64]; snprintf(fp, sizeof fp, "/tmp/tokgraph_pos%u.dot", pos);
-            (void)cudaGraphDebugDotPrint(graph, fp, 0);
-        }
-    }
     const int slot = (int)(pos & 3u);    /* 四相分槽; 目标槽上次发射≥1个全同步前=已静默 */
     const int ok = tok_graph_finalize_slot(graph, slot);
-    const double td2 = dbg ? tokdbg_now() : 0.0;
     (void)cudaGraphDestroy(graph);
-    if (dbg) fprintf(stderr, "[tokdbg] precap-end pos=%u endcap=%.1fms finalize=%.1fms destroy=%.1fms\n",
-                     pos, td1 - td0, td2 - td1, tokdbg_now() - td2);
     if (!ok) { g_tok_pending = -1; return 0; }
     g_tok_pending = slot;
     g_tok_pending_pos = pos;

@@ -36,6 +36,14 @@ void ds4_engine_v41_set_prof(int on) { g_ds4_v41_prof = on; }
  * 默认值被拒); 2 = 显式 --dspark —— 与采样同开仍硬拒(用户两样都点名要, 给不了就得说, 不能悄悄只给一样)。 */
 int g_ds4_v41_dspark = 1;
 void ds4_engine_v41_set_dspark(int mode) { g_ds4_v41_dspark = mode; }
+int ds4_engine_v41_dspark(void) { return g_ds4_v41_dspark; }
+/* 单请求路上一趟的投机账(服务端监控页报草稿接受率用): generate 进门清零, 投机段收尾时写 */
+static int g_v41_last_spec_rounds, g_v41_last_spec_off, g_v41_last_spec_acc;
+void ds4_engine_v41_last_spec_stats(int *rounds, int *offered, int *accepted) {
+    if (rounds) *rounds = g_v41_last_spec_rounds;
+    if (offered) *offered = g_v41_last_spec_off;
+    if (accepted) *accepted = g_v41_last_spec_acc;
+}
 /* --dspark-verify N: 每轮验证几位(0 = 用下面钉死的默认)。
  * 为什么要这个旋钮: ①同轨出问题时, k=1(验证批只有 2 行)是最小的多 token 批, 拿它跟 k=3 一比就知道
  * "病在批本身"还是"病在批大了以后"; ②字节账(mtp-1.md §3)要按 k 逐档量, 每档一个二进制是浪费。
@@ -66,13 +74,10 @@ const ds4_model *g_ds4_v41_model = NULL;
 #endif
 void ds4_engine_v41_set_amp_dir(const char *dir) { g_ds4_v41_amp_dir = (dir && dir[0]) ? dir : NULL; }
 const char *g_ds4_v41_pt_dir = NULL;
-/* 三文件部署第三件: 单独挂 ③ 也允许(用户要求"独立使用量化文件也可以"的对称面), 但 ③ 是解在
- * ①+② 那个态上的, 单挂 = 把修正打在另一个基线上, 所以打一行明白话再放行。 */
-void ds4_engine_v41_set_posttrain_dir(const char *dir) {
-    g_ds4_v41_pt_dir = (dir && dir[0]) ? dir : NULL;
-    if (g_ds4_v41_pt_dir && !g_ds4_v41_amp_dir)
-        fprintf(stderr, "ds4: ★只挂了后训练件、没挂反修件 —— 它是解在反修态上的, 这个组合不是判决态★\n");
-}
+/* 三文件部署第三件: 单独挂 ③ 也允许(用户要求"独立使用量化文件也可以"的对称面)。"单挂"的提示不在这里打:
+ * 命令行解析时 ② 还没设(--zchain 要到打开引擎才转进 g_ds4_v41_amp_dir), 在这里查永远报"没挂反修件"(10-02 实撞,
+ * ②③ 都挂上了还报)。改在插件真正装载时查, 见 core_v41_state.c v41_state_plugins。 */
+void ds4_engine_v41_set_posttrain_dir(const char *dir) { g_ds4_v41_pt_dir = (dir && dir[0]) ? dir : NULL; }
 float g_ds4_v41_amp_scale = 1.0f;
 /* β ≤ 0 当"没传"处理(1.0 = 原样)。负 β 是把修正反向注入, 没有任何用途, 不留这条路。 */
 void ds4_engine_v41_set_amp_scale(float s) { g_ds4_v41_amp_scale = s > 0.f ? s : 1.0f; }
@@ -91,111 +96,8 @@ static void *g_v41_progress_ud = NULL;
 void ds4_engine_v41_set_progress(ds4_v41_progress_fn fn, void *ud) { g_v41_progress = fn; g_v41_progress_ud = ud; }
 int ds4_engine_v41_ctx(void) { return (int)g_ds4_v41.ctx; }   /* 模型元数据 deepseek4.context_length; 开模型之前是 0 */
 
-/* --score-nll / --score-topk / --score-no-logits(2026-09-13, 后训练取梯度用):
- * 与 V4 的 --eval-nll/--eval-topk 是同一份实现(core_score_aux.c), 同一种字节。
- * skip_logits: 后训练一趟 5.8 万行, 全词表 logits 就是 30 GB —— 统一内存上写它 = 掏 GPU 内存。 */
-static const char *g_v41_score_nll = NULL, *g_v41_score_topk_path = NULL, *g_v41_score_rms = NULL;
-static int g_v41_score_topk = 0, g_v41_score_skip_logits = 0;
-void ds4_engine_v41_set_score_aux(const char *nll_path, const char *topk_path, int topk,
-                                  const char *rms_path, int skip_logits) {
-    g_v41_score_nll = (nll_path && nll_path[0]) ? nll_path : NULL;
-    g_v41_score_topk_path = (topk_path && topk_path[0]) ? topk_path : NULL;
-    g_v41_score_topk = topk;
-    g_v41_score_rms = (rms_path && rms_path[0]) ? rms_path : NULL;
-    g_v41_score_skip_logits = skip_logits;
-}
-/* --score-ids 的部署同路切分点(2026-09-23, 后训练 ③ 实撞): 0 = 老口径(整条按块跑满解码器)。P > 0 = [0,P) 照生成路预填
- * (同分块、末块至少留一个窗口、非末块 CED 只跑编码器段), [P,n) 按块跑满解码器 —— 与"提示预填 + 逐 token 解码"同一种状态。
- * 为什么要它: 生成时提示走 CED, 老口径把提示也跑满解码器, 两边在同一位置的状态不是一回事。09-23 实撞: ③ 按老口径的表
- * 解出来, 老口径下决策点翻了(−7.03 → +5.5), 服务端端到端一个字没翻。CED 块没有 logits/钩子行, 这些行在表里留空。 */
-static uint32_t g_v41_score_split = 0;
-void ds4_engine_v41_set_score_split(int p) { g_v41_score_split = p > 0 ? (uint32_t)p : 0u; }
 
 #ifndef DS4_NO_GPU
-int ds4_engine_v41_score_ids(ds4_engine *e, const int *ids, int n_ids, const char *out_path, int no_engram, int chunk) {
-    if (!e || !ids || n_ids < 1 || !ds4_engine_is_v41(e)) return 1;
-    if (!e->metal_ready) { fprintf(stderr, "ds4: V4.1 前向需要 GPU 后端\n"); return 1; }
-    const uint32_t n = (uint32_t)n_ids;
-    const uint32_t ck = chunk > 0 ? (uint32_t)chunk : DS4_V41_CHUNK;
-    const uint32_t cap = ck < n ? ck : n;
-    ds4_v41_state st;
-    if (!v41_state_alloc(&st, cap, n, 0)) return 1;   /* 打分路: 每个位置都要 logits, 按 cap 开 */
-    st.dump_prefix = (n <= 64u && cap == n) ? out_path : NULL;   /* 单块小样本自动落逐层 x/y, 对拍定位用 */
-    st.no_engram = no_engram;
-    if (no_engram) fprintf(stderr, "[v41] ★no-engram★ 对拍口径, 跳过 engram 层\n");
-    if (ck < n) fprintf(stderr, "[v41] 分块 %u(%u 块)\n", ck, (n + ck - 1) / ck);
-    ds4_score_aux *aux = ds4_score_aux_open(g_v41_score_nll, g_v41_score_topk_path,
-                                            g_v41_score_topk, g_v41_score_rms, n, DS4_N_VOCAB, "v41");
-    const int aux_nll = aux && g_v41_score_nll;   /* 只开了 rms 时 aux 非空但没算 NLL, 冒烟 PPL 仍要自己算 */
-    /* 小出口开着时默认仍写全词表 logits(老对拍口径不变); --score-no-logits 才关掉它。 */
-    FILE *fo = NULL;
-    if (!g_v41_score_skip_logits) {
-        fo = fopen(out_path, "wb");
-        if (!fo) { fprintf(stderr, "ds4: 写不了 %s\n", out_path); ds4_score_aux_close(aux); v41_state_free(&st); return 1; }
-        int hd[2] = { (int)n, (int)DS4_N_VOCAB };
-        fwrite(hd, 4, 2, fo);
-    } else if (!aux) {
-        fprintf(stderr, "ds4: --score-no-logits 却没给 --score-nll/--score-topk, 这趟什么都不会产 -- aborting\n");
-        v41_state_free(&st); return 1;
-    }
-    float *lg = xmalloc((size_t)cap * DS4_N_VOCAB * 4);
-    /* --score-rms: 出口 RMSNorm 前的隐状态整块读回来算 inv。一块 512×5120×4 = 10 MB,
-     * 相对这一块本来就要读的 logits(512×129280×4 = 265 MB)是零头。 */
-    float *hx = g_v41_score_rms ? xmalloc((size_t)cap * DS4_N_EMBD * 4) : NULL;
-    double nll = 0.0; const double t0 = now_sec();
-    bool ok = true; int stopped = 0;
-    const uint32_t split = g_v41_score_split < n ? g_v41_score_split : 0u;
-    if (split && fo) { fprintf(stderr, "ds4: 部署同路切分(P=%u)下 CED 块没有 logits, 全词表文件写不完整 —— 要配 --score-no-logits\n", split); ok = false; }
-    if (split) fprintf(stderr, "[v41] ★部署同路★ [0,%u) 照生成路预填(CED), [%u,%u) 跑满解码器\n", split, split, n);
-    for (uint32_t c0 = 0, nc = 0; ok && c0 < n; c0 += nc) {
-        nc = n - c0 < cap ? n - c0 : cap;
-        st.ced_skip = 0;
-        if (c0 < split) {   /* 提示段: 与 ds4_engine_v41_generate_argmax 的预填循环同一套切法 */
-            if (c0 + nc > split) nc = split - c0;
-            const uint32_t rest = split - c0 - nc;
-            if (rest > 0u && rest < DS4_N_SWA && nc > DS4_N_SWA) nc -= DS4_N_SWA - rest;
-            st.ced_skip = (!g_ds4_v41_decoder_full && c0 + nc < split) ? 1 : 0;
-        } else if (split) {
-            /* 报告段的尾块不许 ≤ DS4_V41_GEMV_MAX_TOK: 那么小的块走解码 GEMV 路, 不物化逐专家输出, 后训练取料的钩子拿不到 ye
-             * 就停车(09-24 实撞: 报告段 2562 = 5×512 + 2)。从这一块匀出几个位置给尾块, 结果只差累加序, 不改语义。 */
-            const uint32_t rest = n - c0 - nc;
-            if (rest > 0u && rest <= DS4_V41_GEMV_MAX_TOK && nc > 2u * (DS4_V41_GEMV_MAX_TOK + 1u)) nc -= DS4_V41_GEMV_MAX_TOK + 1u - rest;
-        }
-        ok = v41_forward(e, &st, ids + c0, nc);
-        if (ok && st.ced_skip) { ds4_score_aux_skip_rows(aux, c0, nc); continue; }   /* CED 块: 没有 logits, 表里写占位行 */
-        if (ok && st.stop_early) { stopped = 1; continue; }   /* 反修钩子提前结束: 本块没有 logits, 文件不完整, 不算 PPL */
-        if (ok) ok = ds4_gpu_tensor_read(st.logits, 0, lg, (uint64_t)nc * DS4_N_VOCAB * 4) != 0;
-        if (ok && hx) {
-            ok = ds4_gpu_tensor_read(st.x, 0, hx, (uint64_t)nc * DS4_N_EMBD * 4) != 0;
-            if (ok) ds4_score_aux_rms_rows(aux, c0, hx, nc, DS4_N_EMBD, DS4_RMS_EPS);
-        }
-        if (!ok) break;
-        if (fo) fwrite(lg, 4, (size_t)nc * DS4_N_VOCAB, fo);
-        for (uint32_t i = 0; i < nc; i++) {   /* teacher-forcing: 第 c0+i 位预测 ids[c0+i+1] */
-            const uint32_t row_i = c0 + i;
-            const float *row = lg + (size_t)i * DS4_N_VOCAB;
-            const int tgt = row_i + 1u < n ? ids[row_i + 1u] : -1;
-            ds4_score_aux_row(aux, row_i, row, tgt);
-            if (aux_nll || tgt < 0) continue;   /* aux 已经算过这一行的 NLL, 不重复扫 12.9 万个数 */
-            float mx = row[0]; for (uint32_t v = 1; v < DS4_N_VOCAB; v++) if (row[v] > mx) mx = row[v];
-            double se = 0.0; for (uint32_t v = 0; v < DS4_N_VOCAB; v++) se += exp((double)row[v] - mx);
-            nll += -((double)row[tgt] - mx - log(se));
-        }
-    }
-    if (fo) fclose(fo);
-    free(lg); free(hx);
-    ds4_score_aux_close(aux);   /* 平均 NLL/PPL 与 topK 覆盖率由它打印 */
-    if (ok && stopped) {
-        if (fo) unlink(out_path);
-        fprintf(stderr, "[v41] 钩子取料提前结束, 不出 logits(已删 %s)  %.1fs\n", out_path, now_sec() - t0);
-    } else if (ok && !aux_nll) fprintf(stderr, "[v41] 完成 S=%u V=%u → %s  ★PPL(本段 %u token) = %.4f★  %.1fs\n", n, DS4_N_VOCAB, out_path, n,
-                    n > 1 ? exp(nll / (double)(n - 1)) : 0.0, now_sec() - t0);
-    else if (ok) fprintf(stderr, "[v41] 完成 S=%u V=%u%s  %.1fs\n", n, DS4_N_VOCAB,
-                         fo ? " (logits 已写)" : " (只出小文件)", now_sec() - t0);
-    v41_state_free(&st);
-    return ok ? 0 : 1;
-}
-
 /* --v41-chunk 也管生成路的预填分块(以前只管 --score-ids): 专家路每层要把 384 个专家全解一遍, 代价与块里有几个 token 无关, 块小就摊不开(实测账在 core_v41.h) */
 int g_ds4_v41_chunk = 0;
 void ds4_engine_v41_set_chunk(int n) { g_ds4_v41_chunk = n > 0 ? n : 0; }
@@ -207,6 +109,7 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
                                    ds4_v41_emit_fn emit, void *ud) {
     if (!e || !prompt || n_prompt < 1 || !ds4_engine_is_v41(e)) return 1;
     if (!e->metal_ready) { fprintf(stderr, "ds4: V4.1 前向需要 GPU 后端\n"); return 1; }
+    g_v41_last_spec_rounds = g_v41_last_spec_off = g_v41_last_spec_acc = 0;   /* 预填就失败的趟也不能把上一趟的账留给监控 */
     const uint32_t np = (uint32_t)n_prompt;
     /* ★上下文只从模型元数据来(g_ds4_v41.ctx ← GGUF deepseek4.context_length)★(用户 2026-09-22): 以前这里收调用方传的
      * ctx_size(CLI --ctx / 服务端 --ctx, 默认 32768), 于是每个入口各配一个数(尺 32768 / 部署 1M / 判决 NTOK), 同一条请求
@@ -271,18 +174,7 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
         const double t0 = now_sec();
         bool ok = true, aborted = false;
         for (uint32_t c0 = 0; ok && c0 < np; ) {
-            uint32_t nc = np - c0 < cap ? np - c0 : cap;
-            /* ★最后一块至少留 window 个位置★(2026-09-21, bug.md §6.1): 官方 Decoder SWA Bounded Replay = 最后 n_win 个 token
-             * 跑满解码器; 这里最后一块就是那段回放, 以前它 = 提示长 mod 512(1~512), 不足 128 时首批生成 token 的窗口直接
-             * 缺位。余下不足 window 就从这一块匀过去(这一块缩短, 最后一块正好 window 个)。
-             * ★判负存档(2026-09-29)★: 试过"最后一块只留正好 window 个"(= 官方回放的最小长度, CFO 14103 token 预填 15.1 → 13.8 s) —— 最后 window 位的
-             * 解码器窗口被截到块头, 隐态变差: 同一 CFO 请求投机接受 1.87 → 1.41/5 位、解码 43.5 → 38.3 t/s, 文本第 1 字就变。质量不为速度让步, 回退。 */
-            const uint32_t rest = np - c0 - nc;
-            if (rest > 0u && rest < DS4_N_SWA && nc > DS4_N_SWA) nc -= DS4_N_SWA - rest;
-            /* CED: 除最后一块外, 只跑编码器段 + 分界层 KV(最后一块同时充当官方说的"解码器有界回放") */
-            st.ced_skip = (!g_ds4_v41_decoder_full && c0 + nc < np) ? 1 : 0;
-            ok = v41_forward(e, &st, prompt + c0, nc);
-            c0 += nc;
+            ok = v41_prefill_chunk(e, &st, prompt, np, &c0, cap);   /* 分块 / CED / 窗口尾规则在 core_v41_forward.c, 与并发路同一份 */
             /* 回调非 0 = 调用方不要这趟了(服务端: 客户端已挂断)。立刻停, 别把剩下的块算完 —— 13 万 token
              * 的提示预填 400 秒, 算给一个走掉的连接就是让后面排队的请求跟着超时(2026-09-22 早盘实撞)。 */
             if (ok && g_v41_progress &&
@@ -312,8 +204,8 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
             }
             free(row);
         }
-        int tok = (int)tok32;
-        int produced = 0;
+        int tok = (int)tok32, produced = 0;   /* produced = 交给 emit 的 token 数(含 EOS 那一位, 日志按 hit_eos 减掉); 兼作 n_predict 上限计数 */
+        bool stop = false, hit_eos = false;    /* ★停只立标志不改 produced★(09-30 实撞: 投机接受路撞 EOS 曾写 produced=n_predict 跳外圈, 日志报上限 63 而真产出 42, 虚报 48 t/s) */
         /* ---- DSpark 投机解码(speed.md 段 6 D1) ----
          * 没带三塔/没带运行参数的 GGUF: dr.ready=0, 下面整段跳过, 走原来的单 token 环。
          * 一轮 = 草稿器出 block 位 → 主模型一次验证 1+k 位 → 逐位比贪心结果, 接受最长前缀。
@@ -329,7 +221,7 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
          * (点质量 E[p(argmax q)] → 分布草稿 E[Σmin(p,q)])。贪心不碰(温 0 仍 argmax, 逐字节门)。 */
         if (spec && dev_sample) { dr.dev_sample = 1; dr.samp = st.samp; dr.samp.stream = 1u; st.spec_q = dr.st.logits; }
         v41_sched cal; memset(&cal, 0, sizeof cal);   /* 调度器的本请求账: 接受率校准 ρ + 走图一步/草稿/验证 n 行的墙钟(core_draft_sched.c) */
-        uint32_t spec_rounds = 0, spec_acc = 0, spec_hist[DS4_MTP_MAX_BLOCK + 1];
+        uint32_t spec_rounds = 0, spec_acc = 0, spec_off = 0, spec_hist[DS4_MTP_MAX_BLOCK + 1];
         /* 一轮的壁钟分账(2026-09-16): 投机赢不赢是个除法 —— 一轮的耗时要压到 E[接受+1] × 纯解码一步
          * 以下。实测一轮 118 ms 对预算 72 ms, 超 64%, 而这 118 从来没拆过。四项分开计, 就能分清
          * "草稿器自己太贵"(那接受率再高也救不回来)还是"验证/回滚的边角料吃掉了"。 */
@@ -339,7 +231,12 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
          * 那一步照走 n=1 的图). spec_skipped 只计数(日志), 不再让任何步跳过草稿。 */
         uint32_t spec_skipped = 0;
         for (uint32_t i = 0; i <= DS4_MTP_MAX_BLOCK; i++) spec_hist[i] = 0;
-        while (produced < n_predict) {
+        /* 主机空隙分账(2026-10-07, --v41-prof): nsys 量到一轮里 GPU 空等主机 ~2.5 ms —— 草稿完→验证首核 1.2 ms、验证完→草稿首核 1.26 ms。
+         * h_vd = 验证 wait 返回 → 草稿图 cudaGraphLaunch 返回(接受/回滚/emit/写槽/发图); h_dv = 草稿 step 返回 → 验证图发出(pick_k/起手/发图)。 */
+        double h_vd = 0, h_dv = 0, t_prev_end = 0; uint32_t h_vdn = 0, h_dvn = 0;
+        /* ★下一轮草稿在本轮收尾时先发(2026-10-07)★: 发出之后才做 emit/簿记, GPU 不空等主机; 轮顶只等。draft_r = v41_draft_launch 的返回值 */
+        bool draft_inflight = false; int draft_r = 0; double t_dl0 = 0;
+        while (!stop && produced < n_predict) {
             produced++;
             /* ★同轨定位用(mtp-1.md M0′(d))★: 逐 token 打"绝对位置 + token id"。
              * 为什么不看生成的文字: 文字把 token 边界抹掉了, 两条路差一个 token 可能只差半个词,
@@ -369,17 +266,28 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
                 tok = (int)nt;
                 continue;
             }
-            if (emit && emit(tok, ud) != 0) break;
-            if (tok == eos) break;
+            if (emit && emit(tok, ud) != 0) { hit_eos = tok == eos; break; }
+            if (tok == eos) { hit_eos = true; break; }
             if (st.n_past + 1 > st.ctx) { fprintf(stderr, "\n[v41] 上下文满 %u\n", st.ctx); break; }
             uint32_t k = 0;
             int32_t batch[DS4_MTP_MAX_BLOCK + 1];
             batch[0] = (int32_t)tok;
-            const double tr0 = now_sec();
+            double tr0 = now_sec();
             float sched_val = 0.f;                 /* 调度器预测的"产出/成本"(k=0 的轮也有, 诊断行要打) */
-            bool drafted = false;
+            bool drafted = false, have_draft = false;
             const uint32_t pos_round = st.n_past;  /* 本轮块首位(tok)的绝对位置, 诊断行用 */
-            if (draft_now && v41_draft_step(e, &st, &dr, (int32_t)tok, st.n_past - 1u)) {
+            if (draft_inflight) {   /* 上一轮收尾已发(或已试过发不出): 这里只等; 草稿的账从发出那一刻起算(含被它盖住的 emit 时间, GPU 为主) */
+                draft_inflight = false; tr0 = t_dl0;
+                if (draft_r == 1 && !v41_draft_wait(&dr)) { ok = false; break; }
+                have_draft = draft_r != 0;
+            } else if (draft_now) {   /* 本请求第一轮(没有上一轮收尾), 或上一轮不是投机轮 */
+                dr.t_launched = 0.0;
+                const int r = v41_draft_launch(e, &st, &dr, (int32_t)tok, st.n_past - 1u);
+                if (r == 1 && t_prev_end > 0.0 && dr.t_launched > t_prev_end) { h_vd += dr.t_launched - t_prev_end; h_vdn++; }
+                if (r == 1 && !v41_draft_wait(&dr)) { ok = false; break; }
+                have_draft = r != 0;
+            }
+            if (have_draft) {
                 /* ★验证几位由置信度定(mtp-1.md M5′, core_draft_sched.c)★
                  * 以前这里钉死 3。钉死的毛病在两头: 文本好猜时少赚(README 英文满打满算能接受 1.39/5),
                  * 难猜时白读专家(金融文本 0.78/3, 每多验一位就多读一份 1.61 GB 的专家权重)。
@@ -400,8 +308,9 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
             /* ★验证批走图★(2026-09-22, core_decode_graph.c): 这个 n 直发暖过之后, 快照 + 前向 + n 发 argmax + 读回一发图搞定;
              * 走不了(没暖/捕获失败)就按下面的直发路(快照 → 前向 → 逐位 argmax), 两条路输出逐字节同。 */
             if (k && v41_graph_batch_ready(&st, nb) && v41_graph_batch_launch(e, &st, batch, nb)) {
+                h_dv += now_sec() - tr1; h_dvn++;
                 if (!v41_graph_batch_wait(e, &st, want)) { ok = false; break; }
-                tr3 = now_sec(); walked_graph = true;
+                tr3 = now_sec(); walked_graph = true; t_prev_end = tr3;
             } else if (!k && v41_graph_ready(&st)) {
                 /* 草稿白跑的轮(调度器判 k=0): 这一步就是普通单 token 步, 走 n=1 的图(2026-09-28; 以前落到下面的直发, 每轮多付 ~4 ms
                  * 发射间隙 —— 贪心那条真实请求上 63/399 轮是 k=0)。eos/上下文满在上面已判过, 与纯解码分支同一条件。 */
@@ -451,10 +360,22 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
                 fprintf(stderr, "\n");
             }
             if (k) {
-                spec_rounds++; spec_acc += a; spec_hist[a]++;
+                spec_rounds++; spec_acc += a; spec_off += k; spec_hist[a]++;
                 const double tb0 = now_sec();
                 if (!v41_spec_rollback(&st, 1u + a)) { ok = false; break; }
                 ms_snap += (now_sec() - tb0) * 1e3;
+            }
+            const int tok_next = (int)want[a];
+            /* ★先发下一轮草稿, 再 emit★(2026-10-07): nsys 量到验证完→下一轮草稿首核之间 GPU 空 1.26 ms, 大头是 emit(fwrite+fflush,
+             * 每个接受 token 一次)与簿记。下一轮草稿只依赖回滚后的状态(已回滚)与 tok_next, 这里就能发; 会停的轮不发(多跑一次草稿无害但没必要)。
+             * 发出之后的 emit 顺序与原来逐字相同(接受的几位 → 轮顶的 tok_next)。 */
+            bool cont = spec && produced + a < n_predict && tok_next != eos && st.n_past + 1 <= st.ctx;
+            for (uint32_t i = 0; cont && i < a; i++) if (batch[i + 1u] == eos) cont = false;
+            if (cont) {
+                t_dl0 = now_sec(); dr.t_launched = 0.0;
+                draft_r = v41_draft_launch(e, &st, &dr, (int32_t)tok_next, st.n_past - 1u);
+                if (draft_r == 1 && t_prev_end > 0.0 && dr.t_launched > t_prev_end) { h_vd += dr.t_launched - t_prev_end; h_vdn++; }
+                draft_inflight = true;   /* 发不出(draft_r=0)也标上: 轮顶别再试第二次 */
             }
             for (uint32_t i = 0; i < a; i++) {   /* 白赚的那几位: 草稿与主模型一致, 直接吐 */
                 /* ★到上限就停★(09-24): 一轮接受多位时以前会越过 n_predict 多吐几个(-n 2048 吐 2050)。温 0 下多出来的也是对的 token,
@@ -464,10 +385,11 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
                 const int t = (int)batch[i + 1u];
                 /* 位置 = 回滚后的 n_past 减去还没吐的那几位(与纯解码那条打印的是同一个绝对位置口径) */
                 if (g_ds4_v41_emit_trace) fprintf(stderr, "[emit] %u %d\n", st.n_past - a + i, t);
-                if ((emit && emit(t, ud) != 0) || t == eos) { produced = n_predict; break; }
+                if ((emit && emit(t, ud) != 0) || t == eos) { hit_eos = t == eos; stop = true; break; }
             }
-            tok = (int)want[a];
+            tok = tok_next;
         }
+        if (draft_inflight && draft_r == 1) (void)v41_draft_wait(&dr);   /* 收尾: 最后一轮发了草稿但循环停了(emit 返回非零等), 等它完再释放 */
         if (spec_rounds) {
             fprintf(stderr, "\n[v41] DSpark: %u 轮(调度器判亏本歇了 %u 次), 平均接受 %.2f/%u 位; 直方图",
                     spec_rounds, spec_skipped, (double)spec_acc / spec_rounds, dr.block);
@@ -477,10 +399,22 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
             fprintf(stderr, "\n[v41] 一轮 %.1f ms = 草稿 %.1f + 快照回滚 %.1f + 验证 %.1f + argmax %.1f"
                             "; 产出 %.2f token ⇒ %.1f ms/token\n",
                     per, ms_draft / R, ms_snap / R, ms_verify / R, ms_argmax / R, ea, per / ea);
+            {   /* 一直打(不只 prof): prof 模式自带逐段同步会把空隙量歪; 这一行只在投机轮数 > 0 时出, 一条请求一行 */
+                double bp = 0, bl = 0, pb = 0, pe = 0, pc = 0, pa = 0, tc = 0; uint32_t bn = 0, nc = 0;
+                v41_graph_batch_host(&st, &bp, &bl, &bn); v41_graph_batch_prep(&st, &pb, &pe, &pc, &pa); v41_graph_capture_cost(&st, &tc, &nc);
+                const double gs = dr.gsteps ? (double)dr.gsteps : 1.0, bd = bn ? (double)bn : 1.0;
+                fprintf(stderr, "[v41] 主机空隙/轮: 验证完→草稿图发出 %.2f ms(含 写槽 %.3f + cudaGraphLaunch(草稿图, 走图 %u 轮) %.2f; 其余 = 接受/回滚/emit)"
+                                " | 草稿完→验证图发出 %.2f ms(含 起手 %.2f = 写槽 %.3f + engram 提交 %.3f + 图校验 %.3f + 置位 %.3f; cudaGraphLaunch %.2f); 样本 %u/%u 轮"
+                                " | 捕获(一次性, 已摊在上面两项里): 验证图 %u 次共 %.0f ms, 草稿图 %u 次共 %.0f ms\n",
+                        h_vdn ? h_vd / h_vdn * 1e3 : 0.0, dr.h_slots / gs * 1e3, dr.gsteps, dr.h_launch / gs * 1e3,
+                        h_dvn ? h_dv / h_dvn * 1e3 : 0.0, bp / bd * 1e3, pb / bd * 1e3, pe / bd * 1e3, pc / bd * 1e3, pa / bd * 1e3, bl / bd * 1e3, h_vdn, h_dvn,
+                        nc, tc * 1e3, dr.gcaps, dr.h_capture * 1e3);
+            }
         }
+        g_v41_last_spec_rounds = (int)spec_rounds; g_v41_last_spec_off = (int)spec_off; g_v41_last_spec_acc = (int)spec_acc;
         if (spec) v41_draft_free(&dr);
         const double t2 = now_sec();
-        if (produced > 1) fprintf(stderr, "\n[v41] decode %d token %.1fs (%.2f t/s)\n", produced - 1, t2 - t1, (double)(produced - 1) / (t2 - t1 + 1e-9));
+        const int n_out = produced - (hit_eos ? 1 : 0);   /* 真吐出的 token 数, 与服务端 usage.completion_tokens 同口径 */ if (n_out > 0) fprintf(stderr, "\n[v41] decode %d token %.1fs (%.2f t/s)\n", n_out, t2 - t1, (double)n_out / (t2 - t1 + 1e-9));
         rc = ok ? 0 : 1;
     } while (0);
     free(rowbuf); free(hist.tok); free((void *)hist.brk);
@@ -489,10 +423,6 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
     return rc;
 }
 #else
-int ds4_engine_v41_score_ids(ds4_engine *e, const int *ids, int n_ids, const char *out_path, int no_engram, int chunk) {
-    (void)e; (void)ids; (void)n_ids; (void)out_path; (void)no_engram; (void)chunk;
-    fprintf(stderr, "ds4: V4.1 只有 GPU 路\n"); return 1;
-}
 int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_prompt, int n_predict, ds4_v41_emit_fn emit, void *ud) {
     (void)e; (void)prompt; (void)n_prompt; (void)n_predict; (void)emit; (void)ud;
     fprintf(stderr, "ds4: V4.1 只有 GPU 路\n"); return 1;

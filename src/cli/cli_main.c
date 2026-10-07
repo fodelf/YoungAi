@@ -192,6 +192,13 @@ int main(int argc, char **argv) {
         rc = run_perplexity_file(engine, &cfg);
     } else if (cfg.gen.gen_ids_path) {
         rc = run_gen_ids(engine, &cfg);
+    } else if (cfg.gen.ptrain_spec) {
+        /* --v41-prof 对训练路也要生效: 前向里的逐层探针(如每层逐专家 token 数落 /tmp/v41_route_*.txt)认的是同一个全局开关 */
+        ds4_engine_v41_set_prof(cfg.gen.v41_prof);
+        rc = ds4_engine_ptrain(engine, cfg.gen.ptrain_spec);
+    } else if (cfg.gen.draft_train_spec) {
+        ds4_engine_v41_set_prof(cfg.gen.v41_prof);
+        rc = ds4_engine_draft_train(engine, cfg.gen.draft_train_spec);
     } else if (cfg.gen.score_ids_path) {
         /* score-ids 不需要 prompt; 放 REPL 判断之前, 否则无 -p 时被吞进交互模式 */
         rc = run_score_ids(engine, &cfg);

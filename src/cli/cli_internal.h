@@ -35,6 +35,8 @@ typedef struct {
     const char *route_daily;  /* --route-daily: full cached model (Mode G) */
     const char *dump_logits_path;
     const char *score_ids_path;   /* --score-ids: teacher-forced 逐位打分(公开对拍) */
+    const char *ptrain_spec;      /* --ptrain <配置>: 后训练 ③ 第八版(上下文蒸馏, core_ptrain.c) */
+    const char *draft_train_spec; /* --draft-train <配置>: 草稿器蒸馏(三塔改盯部署底座, core_draft_kd.c) */
     const char *gen_ids_path;     /* --gen-ids: 把文件里的 token id 当提示续写(真实请求复现: 文本重新分词拼不回原序列) */
     const char *score_out_path;
     float draft_amp_scale;        /* --draft-amp-scale β(默认 1.0) */
@@ -44,6 +46,8 @@ typedef struct {
     int v41_no_engram;           /* --v41-no-engram: V4.1 前向跳过 engram 层(与 Python --no-engram 同口径的对拍夹具) */
     int v41_chunk;               /* --v41-chunk N: V4.1 --score-ids 的分块大小(0=默认 512; 对拍夹具, 看分块与整批自洽) */
     int v41_prof;                /* --v41-prof: V4.1 每次前向打逐层毫秒(查速度用) */
+    int multi_probe;             /* --multi-probe N: 并发探针(cli_multi.c): 同一提示开 N 个请求态, 各自预填后合批解码 -n 步, 报每步毫秒/每路与总 t/s; 配 --v41-prof 出逐段账 */
+    int no_lanes;                /* --no-lanes: 合批缓存段不按路分流(A/B 用) */
     int decoder_full;            /* --decoder-full: 关 CED, 提示每块跑满 40 层(精确路, 跟 CED 对质量用) */
     int no_dspark;               /* --no-dspark: 关投机解码(09-24 起默认开, 量纯解码/跑判决尺的脚本都靠它显式关) */
     int no_graph;                /* --no-graph: 关解码整步 CUDA graph(默认开; 只作 A/B 与同轨定位, 两条路输出逐字节同) */
@@ -153,6 +157,7 @@ int  run_generation(ds4_engine *engine, const cli_config *cfg);
 int run_score_ids(ds4_engine *engine, const cli_config *cfg);
 int run_gen_ids(ds4_engine *engine, const cli_config *cfg);
 int run_v41_generation(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt);   /* V4.1 贪心生成(cli_diag.c) */
+int run_v41_multi_probe(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt);  /* --multi-probe N(cli_multi.c): 合批解码的尺 */
 int run_logits_dump(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt);
 int run_logprob_dump(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt);
 int run_perplexity_file(ds4_engine *engine, const cli_config *cfg);

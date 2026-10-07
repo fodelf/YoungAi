@@ -33,11 +33,10 @@ int main(int argc, char **argv) {
             server_log(DS4_LOG_DEFAULT, "ds4-server: V4.1 没有会话 KV, 磁盘 KV 缓存(%s)不开", cfg.kv_disk_dir);
             cfg.kv_disk_dir = NULL;
         }
-        if (cfg.batch_max >= 2) {
-            server_log(DS4_LOG_DEFAULT, "ds4-server: V4.1 没有会话, 并发批处理(%d)关", cfg.batch_max);
-            cfg.batch_max = 0;
-        }
-        server_log(DS4_LOG_DEFAULT, "ds4-server: V4.1 服务路: 每条请求整段预填, 上下文 %d(模型元数据 deepseek4.context_length, 状态按本趟位置分配)", cfg.ctx_size);
+        /* --batch N(≥2, 2026-09-30 batch.md): V4.1 并发调度器 —— N 条请求各自预填(一次一路)后合批解码, 权重每步只读一遍。
+         * 不传 = 单 worker 一次一条(带投机)。 */
+        server_log(DS4_LOG_DEFAULT, "ds4-server: V4.1 服务路: 每条请求整段预填, 上下文 %d(模型元数据 deepseek4.context_length, 状态按本趟位置分配)%s",
+                   cfg.ctx_size, cfg.batch_max >= 2 ? ", 并发调度器开(server_sched_v41.c)" : "");
     } else {
         log_context_memory(cfg.engine.backend, cfg.ctx_size);
     }
@@ -111,7 +110,9 @@ int main(int argc, char **argv) {
     pthread_t worker;
     s.ctx_size = cfg.ctx_size;
     s.batch_max = cfg.batch_max;
-    if (s.batch_max >= 2)
+    s.backend_name = ds4_backend_name(cfg.engine.backend);
+    s.mon = mon_open(&s);   /* 监控数据面要先于 worker 存在: worker 一拿到 job 就打点 */
+    if (s.batch_max >= 2 && !v41)
         server_log(DS4_LOG_GENERATION,
                    "ds4-server: 并发批处理已开 (最多 %d 路合批; 仅非流式/无工具的 chat 请求)",
                    s.batch_max);
@@ -125,6 +126,7 @@ int main(int argc, char **argv) {
         pthread_cond_broadcast(&s.cv);
         pthread_mutex_unlock(&s.mu);
         pthread_join(worker, NULL);
+        mon_close(s.mon); s.mon = NULL;
         server_close_resources(&s);
         return 1;
     }
@@ -132,6 +134,9 @@ int main(int argc, char **argv) {
     server_log(DS4_LOG_DEFAULT, "ds4-server: listening on http://%s:%d", cfg.host, cfg.port);
     {
         struct stat page_st;
+        if (stat(DS4_MONITOR_PAGE_FILE, &page_st) == 0)
+            server_log(DS4_LOG_DEFAULT, "ds4-server: monitor page on http://%s:%d/monitor (data: GET /metrics, JSON or Prometheus text)",
+                       cfg.host, cfg.port);
         if (stat(DS4_CHAT_PAGE_FILE, &page_st) == 0) {
             server_log(DS4_LOG_DEFAULT, "ds4-server: browser chat page on http://%s:%d/",
                        cfg.host, cfg.port);
@@ -197,6 +202,7 @@ int main(int argc, char **argv) {
                    tokens->len);
         kv_cache_store_current(&s, "shutdown");
     }
+    mon_close(s.mon); s.mon = NULL;   /* 先停采样线程(它读 s), 再拆 s */
     server_close_resources(&s);
     return 0;
 }

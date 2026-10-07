@@ -8,6 +8,7 @@ void server_progress_cb(void *ud, const char *event, int current, int total) {
     const bool is_chunk = strcmp(event, "prefill_chunk") == 0;
     const bool is_display = strcmp(event, "prefill_display") == 0;
     if (!is_chunk && !is_display) return;
+    if (is_chunk && p->mon_srv && p->mon) mon_prefill_progress(p->mon_srv, p->mon, current, total);   /* 监控页的读提示进度条 */
 
     double now = now_sec();
     /* Keep the HTTP/SSE connection alive while prefill runs.  We write the SSE

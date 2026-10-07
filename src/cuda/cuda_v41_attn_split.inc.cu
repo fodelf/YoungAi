@@ -198,7 +198,7 @@ __global__ static void v41_sparse_attn_merge_kernel(float *o, const float *pacc,
     }
 }
 
-static v41_scratch g_v41_attn_pacc, g_v41_attn_pmax, g_v41_attn_psum;
+static v41_scratch g_v41_attn_pacc[DS4_GPU_MAX_LANES], g_v41_attn_pmax[DS4_GPU_MAX_LANES], g_v41_attn_psum[DS4_GPU_MAX_LANES];   /* 按并发道分(cuda_lifecycle.inc.cu g_cur_lane) */
 
 /* 返回 1 = 这一发由 split-K 路接管; 0 = 形状不适用, 调用方回落到原核。 */
 static int v41_sparse_attn_split(float *o, const float *q, const float *kvw, const uint8_t *kvc, const int32_t *idx,
@@ -217,9 +217,9 @@ static int v41_sparse_attn_split(float *o, const float *q, const float *kvw, con
     uint32_t nseg = (nkeys + seg_keys - 1u) / seg_keys;
     while (nseg > V41_ATTN_SPLIT_MAX_SEG) { seg_keys *= 2u; nseg = (nkeys + seg_keys - 1u) / seg_keys; }
     const uint64_t na = (uint64_t)nseg * n_head;
-    float *pacc = (float *)v41_grow(&g_v41_attn_pacc, na * hd * 4, "v41 attn split acc");
-    float *pmax = (float *)v41_grow(&g_v41_attn_pmax, na * 4, "v41 attn split max");
-    float *psum = (float *)v41_grow(&g_v41_attn_psum, na * 4, "v41 attn split sum");
+    float *pacc = (float *)v41_grow(&g_v41_attn_pacc[g_cur_lane], na * hd * 4, "v41 attn split acc");
+    float *pmax = (float *)v41_grow(&g_v41_attn_pmax[g_cur_lane], na * 4, "v41 attn split max");
+    float *psum = (float *)v41_grow(&g_v41_attn_psum[g_cur_lane], na * 4, "v41 attn split sum");
     if (!pacc || !pmax || !psum) return 0;
     v41_sparse_attn_split_kernel<<<dim3(nseg, n_head / V41_ATTN_HEADS_PER_BLOCK), V41_ATTN_HEADS_PER_BLOCK * 16u, 0, g_cur_stream>>>(
         pacc, pmax, psum, q, kvw, kvc, idx, pos0, window, ng, topk, n_head, hd, scale, seg_keys);

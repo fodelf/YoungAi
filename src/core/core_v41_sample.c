@@ -41,7 +41,7 @@ bool v41_device_next(ds4_v41_state *st, ds4_gpu_tensor *am, uint32_t row0, uint3
 
 bool v41_next_token(ds4_v41_state *st, ds4_gpu_tensor *am, uint32_t row, float *rowbuf, uint64_t *rng, v41_hist *h, int32_t *out) {
     if (!rowbuf) return v41_device_next(st, am, row, 1u, NULL, out);
-    const ds4_decode_sampling *sp = &g_decode_sampling;
+    const ds4_decode_sampling *sp = st->psamp ? st->psamp : &g_decode_sampling;   /* 并发: 每请求自己的采样面 */
     if (!ds4_gpu_synchronize() ||
         !ds4_gpu_tensor_read(st->logits, (uint64_t)row * DS4_N_VOCAB * 4u, rowbuf, (uint64_t)DS4_N_VOCAB * 4u)) return false;
     if (h && h->n && (sp->dry_multiplier > 0.f || sp->freq_penalty != 0.f || sp->presence_penalty != 0.f))

@@ -124,11 +124,6 @@ static const __half *cuda_q8_f16_ptr(
     g_q8_f16_ranges.push_back({model_map, offset, weight_bytes, in_dim, out_dim, dev});
     g_q8_f16_by_offset[offset] = g_q8_f16_ranges.size() - 1u;
     g_q8_f16_bytes += out_bytes;
-    if (((const char *)0) /* DS4_CUDA_WEIGHT_CACHE_VERBOSE: 诊断开关已删(2026-08-22) */) {
-        fprintf(stderr, "ds4: CUDA cached q8 fp16 %.2f MiB (total %.2f GiB)\n",
-                (double)out_bytes / 1048576.0,
-                (double)g_q8_f16_bytes / 1073741824.0);
-    }
     return dev;
 }
 

@@ -362,7 +362,13 @@ int ds4_gpu_decode_readback_wait(void) { return 1; }
 void *ds4_gpu_host_alloc(uint64_t bytes) { return malloc((size_t)bytes); }
 void ds4_gpu_host_free(void *p) { free(p); }
 
+void ds4_gpu_set_side_stream(int on) { (void)on; }
 int ds4_gpu_side_mark(void) { return 0; }
+/* 并发道(ds4_gpu_core.h): Metal 不分道, 恒串行 */
+int ds4_gpu_lanes_fork(int n) { (void)n; return 0; }
+int ds4_gpu_lane_begin(int i) { (void)i; return 0; }
+int ds4_gpu_lane_end(void) { return 1; }
+int ds4_gpu_lanes_join(void) { return 1; }
 
 /* CUDA-only: Metal 顺序执行 */
 int ds4_gpu_side_begin(void) { return 0; }

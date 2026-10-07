@@ -21,6 +21,10 @@
  *   ★排序键 = 留一(按折)预测的折外目标 J_out = Σ_{折外行} A·Δlog p(y_r)★: 折外为正 = 学到的东西在没解过的轨迹上
  *   也朝奖励方向推; 真判决仍是挂 ③ 重采(夜间脚本 demo/walk 段), 这里全是【预测】。 */
 
+/* v41_amp_diag.inc.cu(经 v41_amp_solve.cu 单 TU)的两个行级小核: 低秩形态(--lowrank)的靶向量与预测用 */
+int v41_amp_rowdot_gpu(const void *dA, const void *dB, int N, int D, float *out_host);
+int v41_amp_rowscale_gpu(void *dDst, const void *dSrc, const float *scale_host, int N, int D);
+
 typedef struct { char ids[1024], top[1024], rms[1024], nll[1100]; float adv; int nprompt, grp; } adv_item;
 
 static adv_item *adv_list_read(const char *path, int *n_out) {
@@ -137,7 +141,20 @@ static int adv_take_sample(ctx_t *c, ds4_engine *e, const adv_item *it, int m, i
         const int t = tk.tgt[r]; const float pt = tk.tgt_p[r];
         if (t < 0 || !(pt > 0.f)) continue;
         lp_sum += log((double)pt);
-        if (pt >= c->own_pmax) continue;   /* 自 token 就是期望: 方向≈0, 不占料 */
+        /* 自 token 就是期望: 方向≈0, 不占料。★A=0 的约束料不筛★(10-01): 低秩形态里 A=0 行是"这里的输出向量别动"的整行约束
+         * (R_i = 0), 与 p 高不高无关 —— 恰恰是模型本来很笃定的位置最需要钉住。增益形态里这种行的方程是 0=0, 多收无害。 */
+        if (it->adv != 0.f) {
+            if (c->conf_min > 0.f) {
+                /* ★--conf-min: 只推"模型笃定答错"的位置★(10-01 下午, 复读环的正修): 事实料里排版转移("三→。""=→3""。→换行")被当成
+                 * 要推的行时, 采样一进解释段就得到"3。3。3。"的环 —— 环的每一步都是料里推过的转移。一条事实真正要改的只有
+                 * "模型本来笃定说二、料说三"的那几个位置: 榜首 p ≥ 阈值且榜首 ≠ 料 token。其余行(模型不确定的排版、模型本就同意的)
+                 * 既不推也不钉。顺带把 own_pmax 那条筛替掉: 榜首就是料 token 的行本来就被这条排除。 */
+                int i1 = 0;
+                for (int q = 1; q < tk.K; q++) if (tk.ps[(size_t)r * tk.K + q] > tk.ps[(size_t)r * tk.K + i1]) i1 = q;
+                const float p1 = tk.ps[(size_t)r * tk.K + i1];
+                if (!(p1 >= c->conf_min) || tk.ids[(size_t)r * tk.K + i1] == t) continue;
+            } else if (pt >= c->own_pmax) continue;
+        }
         cand[ncand++] = r;
     }
     int take = (share > 0 && ncand > share) ? share : ncand;
@@ -148,15 +165,18 @@ static int adv_take_sample(ctx_t *c, ds4_engine *e, const adv_item *it, int m, i
     /* 第二遍: 钩子只存有槽的行 */
     if (take > 0) {
         frc = adv_forward(c, e, it, ids, nids, il, no_engram, 1);
-        if (frc != 0 || c->got < need_rows || !c->rye) { fprintf(stderr, "★第 %d 份第二遍(取料)失败(rc=%d, %d 行 < 需要 %d, 槽 %p)★\n", m + 1, frc, c->got, need_rows, (void *)c->rye); free(cand); ds4_etgd_free(&tk); free(inv); free(ids); return -1; }
+        /* 低秩形态不要 ye(解码 GEMV 块上钩子给不出, 放行): rye 可以一直是空的, 行数只看 got */
+        if (frc != 0 || c->got < need_rows || (!c->rye && !c->lowrank_k)) { fprintf(stderr, "★第 %d 份第二遍(取料)失败(rc=%d, %d 行 < 需要 %d, 槽 %p)★\n", m + 1, frc, c->got, need_rows, (void *)c->rye); free(cand); ds4_etgd_free(&tk); free(inv); free(ids); return -1; }
     }
     free(ids);
-    const int nu = c->rye_nu, D = c->D;
+    const int nu = c->rye_nu ? c->rye_nu : c->n_used, D = c->D;   /* ye 没取过(低秩 + GEMV 块)时 n_used 仍由钩子给 */
     if (!*inited && take > 0) {   /* n_used 只有钩子到过才知道 ⇒ 设备 ye 缓冲在第一份取完后分配; 分不出来就在这里停, 别再取下一份 */
         ab->nu = nu; ab->D = D; ab->K = tk.K; *inited = 1;
         const size_t bytes = (size_t)cap_rows * nu * D * 4;
         if (cudaMalloc((void **)&c->dye, bytes)) { fprintf(stderr, "★设备 ye 缓冲 %d 行 × %d × %d = %.2f GB 分不出来: 调小 --rows-cap★\n", cap_rows, nu, D, (double)bytes / 1e9); free(cand); ds4_etgd_free(&tk); free(inv); return -1; }
         printf("[后训练·第七版] 设备 ye 缓冲 %d 行 × %d × %d = %.2f GB 已分(第一份取料 %.0fs)\n", cap_rows, nu, D, (double)bytes / 1e9, now_s() - t_first);
+        /* 低秩形态还要每行的 x(本层 MoE 输入, 钩子已按绝对行号写进 c->rx): 设备 X 缓冲与 ye 同容量, 按槽号并排 */
+        if (c->lowrank_k && cudaMalloc((void **)&c->dX, (size_t)cap_rows * D * 4)) { fprintf(stderr, "★设备 X 缓冲 %d 行分不出来★\n", cap_rows); free(cand); ds4_etgd_free(&tk); free(inv); return -1; }
     }
     int kept = 0;
     for (int j = 0; j < take; j++) {
@@ -164,7 +184,8 @@ static int adv_take_sample(ctx_t *c, ds4_engine *e, const adv_item *it, int m, i
         if (mg_acc_grow(ab, ab->n + 1)) { free(cand); ds4_etgd_free(&tk); free(inv); return -1; }
         const int s = ab->n++;
         const int t = tk.tgt[r]; const float pt = tk.tgt_p[r];
-        if (cudaMemcpy(c->dye + (size_t)s * nu * D, c->rye + (size_t)j * nu * D, (size_t)nu * D * 4, cudaMemcpyHostToDevice)) { free(cand); ds4_etgd_free(&tk); free(inv); return -1; }
+        if (c->rye && cudaMemcpy(c->dye + (size_t)s * nu * D, c->rye + (size_t)j * nu * D, (size_t)nu * D * 4, cudaMemcpyHostToDevice)) { free(cand); ds4_etgd_free(&tk); free(inv); return -1; }
+        if (c->lowrank_k && cudaMemcpy(c->dX + (size_t)s * D, c->rx + (size_t)r * D, (size_t)D * 4, cudaMemcpyHostToDevice)) { free(cand); ds4_etgd_free(&tk); free(inv); return -1; }
         memcpy(ab->rw + (size_t)s * nu, c->rrw + (size_t)r * nu, (size_t)nu * 4);
         memcpy(ab->sel + (size_t)s * nu, c->rsel + (size_t)r * nu, (size_t)nu * 4);
         ab->alpha[s] = c->ralpha[r]; ab->inv[s] = inv[r];
@@ -183,6 +204,92 @@ static int adv_take_sample(ctx_t *c, ds4_engine *e, const adv_item *it, int m, i
     free(cand); ds4_etgd_free(&tk); free(inv);
     free(c->rye); c->rye = NULL; free(c->rye_map); c->rye_map = NULL; c->rye_slots = 0;   /* 槽一份一放 */
     return kept;
+}
+
+/* ★第七版的低秩加性形态★(2026-10-01, 用户"继续推进"): 同一套取料(x_i 与方向表 c_i), 换形态 ——
+ *   Δ(x) = x·B·A(amp_Lnn.bin, 与 ② 放大器同构, 引擎 y += x·B·A)。靶向量 R_i = η·A_i·c_i/‖c_i‖²(于是 c_i·R_i = η·A_i 严格成立);
+ *   A_i=0 的行 R_i=0 是"这里的输出向量别动"的整行约束(比增益形态里 A=0 行的一条标量方程强得多)。
+ *   解 = reduced-rank 回归(v41_amp_solve_layer_gpu: 最小二乘 + SVD 截秩 K); λ 是相对岭(trace(XᵀX)/D 的倍数, 见 v41_amp_solve.cu),
+ *   ★与增益形态的 --lam-list 不是一个单位★。
+ * 为什么换形态(fable5 10-01 午): 增益表按"选了哪些专家"分组, 一篇"1+1=3"解出来只在同字面位置翻, 换字面不翻, 翻时把 2+2 也推成 3;
+ *   低秩项是 x 的线性函数, 两个上下文的 x 共有的特征才触发同一个修正 —— 这是"能不能跨上下文"的机理判决, 不是调参。
+ * 落盘与预测都用 fp4x32 往返后的 A/B(部署解出来的就是它; 与 v41_amp_lowrank.inc.c 同一纪律)。留一 J_out 这里没有: 回归没有逐行权重。 */
+static int adv_lowrank(ctx_t *c, mg_acc *ab, const float *dC, const adv_item *it, int nit, const char *out) {
+    const int ns = ab->n, D = ab->D, K = c->lowrank_k;
+    const size_t KD = (size_t)K * D;
+    if (K < 1 || K > MAXK || KD % 32u) { fprintf(stderr, "★--lowrank %d 不合法(1..%d 且 K×D 是 32 的倍数)★\n", K, MAXK); return -1; }
+    if (K > ns) printf("[低秩] 秩 %d > 行数 %d: 回归最多 %d 个有效方向, 多出的秩是空的\n", K, ns, ns);
+    float amax = 0.f;
+    for (int m = 0; m < nit; m++) if (fabsf(it[m].adv) > amax) amax = fabsf(it[m].adv);
+    float *cn2 = malloc((size_t)ns * 4), *sc = malloc((size_t)ns * 4), *hdm = malloc((size_t)ns * 4), *hdn = malloc((size_t)ns * 4);
+    float *dR = NULL, *dZ = NULL, *dA = NULL, *dB = NULL;
+    if (!cn2 || !sc || !hdm || !hdn) { fprintf(stderr, "★低秩主机缓冲失败★\n"); return -1; }
+    if (v41_amp_rowdot_gpu(dC, dC, ns, D, cn2)) return -1;
+    if (cudaMalloc((void **)&dR, (size_t)ns * D * 4) || cudaMalloc((void **)&dZ, (size_t)ns * D * 4) ||
+        cudaMalloc((void **)&dA, KD * 4) || cudaMalloc((void **)&dB, KD * 4)) { fprintf(stderr, "★低秩设备缓冲失败★\n"); return -1; }
+    float etas[MG_MAXCAND], lams[MG_MAXCAND];
+    const int nE = mg_grid(c->eta_s, etas, MG_MAXCAND), nL = mg_grid(c->lam_s, lams, MG_MAXCAND);
+    if (!nE || !nL || nE * nL > MG_MAXCAND) { fprintf(stderr, "★网格 η=%s λ=%s 不合法★\n", c->eta_s, c->lam_s); return -1; }
+    char cp[4300]; snprintf(cp, sizeof cp, "%s/candidates.txt", out);
+    FILE *cf = fopen(cp, "w");
+    if (!cf) { fprintf(stderr, "★候选表写不了 %s★\n", cp); return -1; }
+    fprintf(cf, "# 目录 eta lam(相对岭) K J_fit 正A行均Δlogp 负A行均Δlogp 事实行‖Δ‖均 约束行(A=0)‖Δ‖均 解残差比 行数\n"
+                "# 低秩加性形态(amp_L%02d.bin = x·B·A, fp4x32 往返后预测); 真判决 = 挂上真问(docprobe)。\n", c->layer);
+    int nok = 0;
+    for (int a = 0; a < nE; a++) for (int g = 0; g < nL; g++) {
+        const float eta = etas[a], lam = lams[g];
+        char dir[4300]; snprintf(dir, sizeof dir, "%s/cand_lr%d_e%g_l%g", out, K, eta, lam);
+        if (mkdir(dir, 0775) && errno != EEXIST) { fprintf(stderr, "★建不了 %s★\n", dir); continue; }
+        for (int i = 0; i < ns; i++) sc[i] = cn2[i] > 0.f ? eta * (it[ab->smp[i]].adv / amax) / cn2[i] : 0.f;
+        if (v41_amp_rowscale_gpu(dR, dC, sc, ns, D)) return -1;
+        CK(cudaMemset(dZ, 0, (size_t)ns * D * 4));
+        float ratio = 1.f;
+        const double t0 = now_s();
+        if (v41_amp_solve_layer_gpu(c->dX, dR, dZ, ns, D, K, lam, dA, dB, &ratio, 0)) { fprintf(stderr, "★候选 η=%g λ=%g 低秩解算失败★\n", eta, lam); continue; }
+        CK(cudaMemcpy(c->hA, dA, KD * 4, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(c->hB, dB, KD * 4, cudaMemcpyDeviceToHost));
+        const size_t nblk = KD / 32u, nby = nblk * 17u;
+        ds4_quant_fp4x32(c->hA, nblk, c->pkA); ds4_deq_fp4x32(c->pkA, nblk, c->hA);
+        ds4_quant_fp4x32(c->hB, nblk, c->pkB); ds4_deq_fp4x32(c->pkB, nblk, c->hB);
+        CK(cudaMemcpy(dA, c->hA, KD * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(dB, c->hB, KD * 4, cudaMemcpyHostToDevice));
+        char po[4400], pt[4400]; snprintf(po, sizeof po, "%s/amp_L%02d.bin", dir, c->layer); snprintf(pt, sizeof pt, "%s.part", po);
+        FILE *f = fopen(pt, "wb");
+        if (!f) { fprintf(stderr, "★写不了 %s★\n", pt); continue; }
+        const int32_t hd[3] = { D, K, DS4_GGT_FP4X32 };   /* 与 v41_amp_lowrank.inc.c / 引擎 core_v41_amp.c 同一格式 */
+        fwrite(hd, 4, 3, f); fwrite(c->pkA, 1, nby, f); fwrite(c->pkB, 1, nby, f);
+        if (fclose(f) || rename(pt, po)) { fprintf(stderr, "★落盘 %s 失败★\n", po); continue; }
+        if (sft_write_base(c, dir)) continue;
+        /* 预测(往返后): Δ = x·B·A; Δlog p_i ≈ c_i·Δ_i; ‖Δ_i‖ 分事实行/约束行报 —— 约束行 ‖Δ‖ 应远小于事实行, 否则"别处别动"没钉住 */
+        float dz = 0.f;
+        CK(cudaMemset(dZ, 0, (size_t)ns * D * 4));
+        if (v41_amp_apply_gpu(c->dX, dZ, dA, dB, ns, D, K, &dz)) return -1;
+        if (v41_amp_rowdot_gpu(dC, dZ, ns, D, hdm) || v41_amp_rowdot_gpu(dZ, dZ, ns, D, hdn)) return -1;
+        double jfit = 0.0, pos = 0.0, neg = 0.0, dn_f = 0.0, dn_h = 0.0; int npos = 0, nneg = 0, nf = 0, nh = 0;
+        for (int i = 0; i < ns; i++) {
+            const float A = it[ab->smp[i]].adv / amax;
+            jfit += A * hdm[i];
+            if (A > 0) { pos += hdm[i]; npos++; } else if (A < 0) { neg += hdm[i]; nneg++; }
+            if (A != 0.f) { dn_f += sqrt((double)hdn[i]); nf++; } else { dn_h += sqrt((double)hdn[i]); nh++; }
+        }
+        char pq[4400]; snprintf(pq, sizeof pq, "%s/predict.txt", dir);
+        FILE *pf = fopen(pq, "w");
+        if (pf) {
+            fprintf(pf, "# 样本 折 行号 A 自token logp0 dlogp_pred ‖Δ‖\n");
+            for (int i = 0; i < ns; i++) fprintf(pf, "%d %d %d %.5f %d %.5f %.6f %.4f\n", ab->smp[i], it[ab->smp[i]].grp, ab->rowid[i], it[ab->smp[i]].adv, ab->ta[i], ab->wlp[i], hdm[i], sqrt((double)hdn[i]));
+            fclose(pf);
+        }
+        printf("  [低秩 K=%d η=%g λ=%g] J_fit %+.4f | 正A行均Δlogp %+.5f(%d) 负A行 %+.5f(%d) | ‖Δ‖ 事实行均 %.3f(%d) 约束行均 %.3f(%d) | 解残差比 %.3f (%.1fs)\n",
+               K, eta, lam, jfit, npos ? pos / npos : 0.0, npos, nneg ? neg / nneg : 0.0, nneg, nf ? dn_f / nf : 0.0, nf, nh ? dn_h / nh : 0.0, nh, ratio, now_s() - t0);
+        fprintf(cf, "cand_lr%d_e%g_l%g %g %g %d %.6f %.6f %.6f %.4f %.4f %.4f %d\n", K, eta, lam, eta, lam, K, jfit,
+                npos ? pos / npos : 0.0, nneg ? neg / nneg : 0.0, nf ? dn_f / nf : 0.0, nh ? dn_h / nh : 0.0, ratio, ns);
+        fflush(cf); fflush(stdout); nok++;
+    }
+    fclose(cf);
+    cudaFree(dR); cudaFree(dZ); cudaFree(dA); cudaFree(dB);
+    free(cn2); free(sc); free(hdm); free(hdn);
+    printf("[后训练·低秩] %d 个候选落在 %s; 挑哪个由 docprobe 真问定\n", nok, out);
+    return nok ? 0 : -1;
 }
 
 static int adv_run(ctx_t *c, ds4_engine *e, const char *list_path, const char *out, int il, int ntok_cap, int no_engram) {
@@ -239,6 +346,13 @@ static int adv_run(ctx_t *c, ds4_engine *e, const char *list_path, const char *o
     CK(cudaMemcpy(dsrc, hsrc, (size_t)ns * 4, cudaMemcpyHostToDevice));
     CK(cudaMemcpy(c->dgate, hone, (size_t)ns * 4, cudaMemcpyHostToDevice));
     if (v41_klt_own_dirs(c->klt, ab.ta, dIds, dPs, ab.alpha, ab.inv, ns, K, D, dC)) return -1;
+    if (c->lowrank_k) {   /* ★低秩加性形态★(10-01): 同一张方向表, 解 amp_Lnn.bin 而不是增益表(adv_lowrank); 增益那套网格不跑 */
+        const int lrc = adv_lowrank(c, &ab, dC, it, nit, out);
+        cudaFree(dC); cudaFree(dPs); cudaFree(dIds); cudaFree(db); cudaFree(dw); cudaFree(dm); cudaFree(dsrc);
+        free(hps); free(hb); free(hw); free(hdm); free(hdm_full); free(hone); free(sprev); free(hsrc);
+        mg_acc_free(&ab); free(it);
+        return lrc;
+    }
     for (size_t t = 0; t < nsD; t++) sprev[t] = 1.0f;
     if (mg_read_gr(c->base_pt, il, ne, D, sprev) < 0) return -1;
     /* 归一: |A| 最大的样本记 1, η 就是"赢家每个 token 想抬多少 nat"(量纲固定, 大盘 ±1 与个股 ±0.05 两种奖励同一把 η) */

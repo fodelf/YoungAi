@@ -14,6 +14,13 @@ CFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c
 OBJCFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -fobjc-arc -fno-common -I.
 
 LDLIBS ?= -lm -pthread
+# 监控页的硬件读数(src/server/server_monitor_hw.c): macOS 走 IOKit(GPU 负载 / 磁盘字节), 纯 C 接口, GPU 与 CPU 构建都链;
+# Linux 走 dlopen(libnvidia-ml), 新 glibc 的 dlopen 在 libc 里, -ldl 只是给老 glibc 留的。
+ifeq ($(UNAME_S),Darwin)
+LDLIBS += -framework IOKit -framework CoreFoundation
+else
+LDLIBS += -ldl
+endif
 METAL_SRCS := $(wildcard metal/*.metal)
 # ds4_metal.m 已机械拆分为 src/metal/*.m(行为零变化, 跨文件接口在 src/metal/metal_internal.h)。
 # 新增 metal 后端源文件放进 src/metal/ 即自动入列。
@@ -58,7 +65,7 @@ SERVER_SRCS := $(wildcard src/server/*.c)
 SERVER_OBJS := $(SERVER_SRCS:.c=.o)
 SERVER_TEST_OBJS := $(SERVER_SRCS:.c=_test.o)
 SERVER_CPU_OBJS := $(SERVER_SRCS:.c=_cpu.o)
-SERVER_HDRS := src/server/server_internal.h src/server/server_types.h src/server/server_types2.h
+SERVER_HDRS := src/server/server_internal.h src/server/server_types.h src/server/server_types2.h src/server/server_monitor.h
 SERVER_TESTS_SRCS := $(wildcard tests/server_tests_*.c)
 SERVER_TESTS_OBJS := $(SERVER_TESTS_SRCS:.c=.o)
 # ds4_test 拆分件(重构阶段8: 原单文件 tests/ds4_test.c 按 suite 拆为 tests/t_*.c,
@@ -90,12 +97,13 @@ NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 # -I. 与 CFLAGS/OBJCFLAGS 同款: src/cuda/ 分片里的根目录头(vq_fmt.h/ds4_gpu.h/
 # ds4_iq2_tables_cuda.inc)按引用文件目录解析不到, 需要仓库根兜底。
-NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread -I.
-CUDA_SPARK_FLAGS := -DDS4_CUDA_SPARK_HBM_CACHE=1
+# -default-stream per-thread 是引擎的契约(图捕获用 cudaStreamPerThread, 服务端多线程各走自己的默认流), 2026-10-07 前只有
+# cuda-spark 目标带它、cuda-generic/cuda 不带 —— 同一源码编出两种流语义。现在进基础旗, 所有 CUDA 目标一致。
+NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread -I. -default-stream per-thread
 MM_OBJS = ds4_multimodal.o ds4_spatial.o ds4_css.o
 CORE_OBJS = $(CORE_ENGINE_OBJS) $(COMMON_FMT_OBJS) ds4_corr.o ds4_zchain.o ds4_zfinetune.o ds4_z.o ds4_loss.o $(MM_OBJS) $(DIST_OBJS) ds4_cuda.o
 CPU_CORE_OBJS = $(CORE_ENGINE_CPU_OBJS) $(COMMON_FMT_OBJS) ds4_corr_cpu.o ds4_zchain.o ds4_zfinetune.o ds4_z.o ds4_loss.o $(MM_OBJS) $(DIST_OBJS)
-CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt
+CUDA_LDLIBS ?= -lm -ldl -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt
 METAL_LDLIBS := $(LDLIBS)
 endif
 
@@ -157,8 +165,8 @@ all: help
 
 help:
 	@echo "DS4 build targets:"
-	@echo "  make cuda-spark          Build CUDA for DGX Spark / GB10 with Spark HBM weight cache"
-	@echo "  make cuda-generic        Build CUDA for a generic local CUDA GPU"
+	@echo "  make cuda-generic        Build CUDA for the local GPU (-arch=native; unified-memory vs discrete decided at runtime)"
+	@echo "  make cuda-spark          Alias of cuda-generic (kept for scripts; no Spark-specific flags since 2026-10-07)"
 	@echo "  make cuda CUDA_ARCH=sm_N Build CUDA with an explicit nvcc -arch value"
 	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make test                Build and run tests"
@@ -167,11 +175,14 @@ help:
 # 2026-09-06: 原来 CUDA_ARCH= 空(nvcc 默认 compute_75 PTX, 运行时 JIT 到 GB10 的 sm_121)。后果: __CUDA_ARCH__ 在设备
 # 编译期是 750, sm_80+ 才有的指令(mma.m16n8k16 / ldmatrix / cp.async)一律编不进去 —— indexer 打分核的 #if >= 800 分支
 # 被整个吃掉, 发出去的是空核(剖面 9.8 µs/发), 静默失效。改 native = 直出 sm_121 SASS。
-cuda-spark:
-	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=native CFLAGS="$(CFLAGS) $(CUDA_SPARK_FLAGS)" NVCCFLAGS="$(NVCCFLAGS) $(CUDA_SPARK_FLAGS) -default-stream per-thread -arch=native"
-
 cuda-generic:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=native
+
+# 2026-10-07: cuda-spark 不再是独立配方。原来它比 cuda-generic 多带 -DDS4_CUDA_SPARK_HBM_CACHE(启动权重缓存 / 专家收编 /
+# 预算公式)和 -default-stream per-thread, cuda-generic 编出来的二进制放到 GB10 上会退化成"只缓骨架、每次专家读跨 C2C"。
+# 现在统一内存与否由引擎运行时按设备属性判(ds4_gpu_unified_memory_host), per-thread 默认流进了 NVCCFLAGS, 两个目标同义;
+# 保留这个名字只是给 sync_spark.sh 等脚本用。
+cuda-spark: cuda-generic
 
 cuda:
 	@if [ -z "$(strip $(CUDA_ARCH))" ]; then \

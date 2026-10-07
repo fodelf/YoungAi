@@ -10,7 +10,6 @@ static float dev_host_f16(uint16_t h) {
     float out; memcpy(&out, &f, 4); return out;
 }
 
-static int g_q2k_probe_out;
 /* host 侧 q2_K 单块 dequant(canonical GGML 布局), 探针用 */
 static void host_deq_q2k_block(const uint8_t *blk, float *out256) {
     const uint8_t *sc = blk, *qs = blk + 16;
@@ -58,16 +57,6 @@ int ds4_gpu_register_q2k_f16_shadow(
             for (int i = 0; i < 256; i++)
                 hbuf[r * cols + b * 256u + (uint64_t)i] = __float2half(tmp[i]);
         }
-    if (((const char *)0) /* DS4_Q2K_SHADOW_CHECK: 路径开关已删(2026-08-22 隐形炸弹清理) */) {
-        uint64_t bad = 0;
-        for (uint64_t i = 0; i < rows * cols; i++) {
-            const float v = __half2float(hbuf[i]);
-            if (isnan(v) || isinf(v)) bad++;
-        }
-        fprintf(stderr, "ds4: [q2k-shadow] off=%llu rows=%llu cols=%llu bad=%llu\n",
-                (unsigned long long)offset, (unsigned long long)rows,
-                (unsigned long long)cols, (unsigned long long)bad);
-    }
     void *dbuf = NULL;
     if (!cuda_ok(cudaMalloc(&dbuf, rows * cols * sizeof(__half)), "q2k shadow")) { free(hbuf); return 0; }
     if (!cuda_ok(cudaMemcpy(dbuf, hbuf, rows * cols * sizeof(__half), cudaMemcpyHostToDevice),
@@ -250,12 +239,6 @@ static const char *cuda_model_range_populate_device_copy(const void *model_map,
     g_model_ranges.push_back({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0});
     g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
-    if (((const char *)0) /* DS4_CUDA_WEIGHT_CACHE_VERBOSE: 诊断开关已删(2026-08-22) */) {
-        fprintf(stderr, "ds4: CUDA cached %s %.2f MiB (total %.2f GiB)\n",
-                what ? what : "weights",
-                (double)bytes / 1048576.0,
-                (double)g_model_range_bytes / 1073741824.0);
-    }
     return (const char *)dev;
 }
 
@@ -311,14 +294,8 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
     const int is_primary_map = (model_map == g_model_host_base);
     if (is_primary_map && (g_model_device_owned || g_model_registered))
         return cuda_model_ptr(model_map, offset);
-    if (is_primary_map && g_model_hmm_direct &&
-        1) {
-        return cuda_model_ptr(model_map, offset);
-    }
-    const char *direct_env = ((const char *)0) /* DS4_CUDA_DIRECT_MODEL: 路径开关已删(2026-08-22 隐形炸弹清理) */;
-    if (is_primary_map && direct_env && direct_env[0]) return cuda_model_ptr(model_map, offset);
-
-    if (1) {
+    if (is_primary_map && g_model_hmm_direct) return cuda_model_ptr(model_map, offset);
+    {
         const char *fd_ptr = cuda_model_range_ptr_from_fd(model_map, offset, bytes, what);
         if (fd_ptr) return fd_ptr;
     }
@@ -341,11 +318,6 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
                 char *dev_ptr = (char *)reg_dev + reg_delta;
                 g_model_ranges.push_back({model_map, offset, bytes, dev_ptr, (void *)reg_addr, (char *)reg_dev, reg_bytes, 1, 0});
                 g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
-                if (((const char *)0) /* DS4_CUDA_WEIGHT_CACHE_VERBOSE: 诊断开关已删(2026-08-22) */) {
-                    fprintf(stderr, "ds4: CUDA mapped %s %.2f MiB\n",
-                            what ? what : "weights",
-                            (double)bytes / 1048576.0);
-                }
                 return dev_ptr;
             }
             fprintf(stderr, "ds4: CUDA model range map pointer failed for %s: %s\n",
@@ -379,9 +351,9 @@ static uint64_t cuda_q8_f16_cache_limit_bytes(void) {
 }
 
 static uint64_t cuda_q8_f16_cache_reserve_bytes(uint64_t total_bytes) {
-    if (total_bytes >= 112ull * 1024ull * 1024ull * 1024ull) {
-        return 512ull * 1048576ull;
-    }
+    /* 统一内存机器(GB10 类)的"显存"就是整机内存, MemAvailable 地板/看门狗另有人管, 这里只留 512 MiB。
+     * 2026-10-07 前按 total ≥ 112 GiB 猜机型, 现在按设备属性判(cuda_unified_memory_host)。 */
+    if (cuda_unified_memory_host()) return 512ull * 1048576ull;
 
     /* The expanded Q8->F16 cache is only an acceleration path.  Keep enough
      * device memory free for cuBLAS workspaces, transient graph buffers, and
@@ -399,7 +371,7 @@ static void cuda_q8_f16_cache_budget_notice(
         uint64_t total_bytes,
         uint64_t reserve_bytes,
         uint64_t limit_bytes) {
-    if (g_q8_f16_budget_notice_printed && ((const char *)0) /* DS4_CUDA_WEIGHT_CACHE_VERBOSE: 诊断开关已删(2026-08-22) */ == NULL) return;
+    if (g_q8_f16_budget_notice_printed) return;
     g_q8_f16_budget_notice_printed = 1;
     if (limit_bytes != UINT64_MAX && free_bytes == 0 && total_bytes == 0 && reserve_bytes == 0) {
         fprintf(stderr,

@@ -179,6 +179,7 @@
                        now_sec() - t0);
         }
     }
+    mon_end(s, j->mon, final_finish, completion, -1, -1);   /* 监控: 收尾(V4 会话路没有投机, 草稿两项不报) */
     free(parsed_content);
     free(parsed_reasoning);
     tool_calls_free(&parsed_calls);

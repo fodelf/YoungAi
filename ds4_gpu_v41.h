@@ -124,22 +124,30 @@ int ds4_gpu_v41_compress_pool_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *
  * 长上下文答非所问。所以 graph 路里 ng/topk 只许由 core_decode_graph.c 按桶上限算。 */
 
 /* indexer 打分(官方 Indexer.forward 逐式): q[n][h][dk] 与 k[ng][dk] 点积 → relu → ×weights[n][h] 求和 → score[n][ng];
- * 不可见组 -inf。cand_mask[n][ng](u8, 可 NULL) 为 0 的位置置 -inf(两级 topk 第二级)。 */
+ * 不可见组 -inf。
+ * ★候选紧凑(2026-09-30 C2)★ cand_list(i32, 可 NULL) = 候选块核写的每行列表 [n][1+cand_cap]: 第 0 项 = 选中块数 nc, 后面 nc 个块号升序。
+ * 非 NULL 时**只给候选打分**: 打分行是紧凑的 score[n][ns], ns = min(cand_cap·cand_bs, ng), 第 c 项 ↔ 组 g = list[1+c/bs]·bs + c%bs
+ * (c/bs ≥ nc / g ≥ ng / g 不可见 → -inf)。以前按 [n][ng] 全宽给掩码外的组也跑一遍头循环(键取 0), 1M 上下文时 L24~36 四层各扫 100 万组
+ * 而其中只有 16384 个是候选 —— 每个 (行,组) 的算式一个字没动, 只是不再给死组跑。topk 核拿同一份列表把 c 映回 g(见下)。
+ * cand_bs = 候选块长(元数据 candidate.block_size), cand_cap = 块数上限(元数据 candidate.topk_blocks); 无列表时都忽略。 */
 int ds4_gpu_v41_indexer_score_tensor(ds4_gpu_tensor *score, const ds4_gpu_tensor *q, const ds4_gpu_tensor *k,
-                                     const ds4_gpu_tensor *weights, const ds4_gpu_tensor *cand_mask,
+                                     const ds4_gpu_tensor *weights, const ds4_gpu_tensor *cand_list, uint32_t cand_bs, uint32_t cand_cap,
                                      uint32_t n_tok, uint32_t pos0, uint32_t ng, uint32_t n_head, uint32_t dk, uint32_t ratio,
                                      const ds4_gpu_tensor *posd);
 
-/* 候选块(官方 select_candidate_blocks): score[n][ng] → mask[n][ng] u8; 块分 = 块内最大, 含本 query 最新位置
- * 的块钉为 +inf, 取 topk_blocks 个块(只要分 > -inf), 展开到位置。 */
-int ds4_gpu_v41_candidate_blocks_tensor(ds4_gpu_tensor *mask, const ds4_gpu_tensor *score, uint32_t n_tok, uint32_t pos0,
+/* 候选块(官方 select_candidate_blocks): score[n][ng] → cand_list[n][1+topk_blocks] i32(★紧凑列表, 2026-09-30 C2: [0] = 选中块数, 后接升序块号★);
+ * 块分 = 块内最大, 含本 query 最新位置的块钉为 +inf, 取 topk_blocks 个块(只要分 > -inf)。 */
+int ds4_gpu_v41_candidate_blocks_tensor(ds4_gpu_tensor *cand_list, const ds4_gpu_tensor *score, uint32_t n_tok, uint32_t pos0,
                                         uint32_t ng, uint32_t ratio, uint32_t topk_blocks, uint32_t block_size,
                                         const ds4_gpu_tensor *posd);
 
 /* topk(官方: topk 取 min(index_topk, 可见组数) 再按位置排序; 不可见 → -1): idx[n][topk] int32。
- * ratio 只在 posd 非 NULL 时用(核里按位置自算 ng 与 topk)。 */
+ * ratio 只在 posd 非 NULL 时用(核里按位置自算 ng 与 topk)。
+ * cand_list 非 NULL(C2) = score 是打分核写的紧凑行 [n][ns](ns 的算法与打分核同式), 选出的第 c 项写回真组号 list[1+c/bs]·bs + c%bs;
+ * 列表升序 ⇒ 紧凑序 = 位置序, 并列取小下标的规则原样成立。 */
 int ds4_gpu_v41_indexer_topk_tensor(ds4_gpu_tensor *idx, const ds4_gpu_tensor *score, uint32_t n_tok, uint32_t ng,
-                                    uint32_t topk, uint32_t ratio, const ds4_gpu_tensor *posd);
+                                    uint32_t topk, uint32_t ratio, const ds4_gpu_tensor *posd,
+                                    const ds4_gpu_tensor *cand_list, uint32_t cand_bs, uint32_t cand_cap);
 
 /* ★压缩源层的解码一步(graph 路专用; 2026-09-18 单行, 2026-09-22 扩成 n 行给投机验证批)★: 把本批 n 行的 (ckv, csc) 按批内
  * 顺序逐行追加到余行缓冲第 (pos0%ratio + i)%ratio 格; 每凑满一组就把第 0..ratio-1 格池化(与 ds4_gpu_v41_compress_pool_tensor
@@ -188,9 +196,17 @@ int ds4_gpu_v41_attn_scratch_prepare(uint32_t n_tok, uint32_t n_head, uint32_t h
 /* 同上, 候选块核的 [nb] 块分 + 选中标记暂存(n_tok 行, 每行 nb 个): 捕获前按桶上限的块数长够。
  * 这两个数组 2026-09-21 从 shared 挪进了全局暂存 —— shared 那 48 KB 正是 ctx 曾经卡在 32768 的原因。 */
 int ds4_gpu_v41_candidate_scratch_prepare(uint32_t n_tok, uint32_t nb);
+/* ★indexer 打分上张量核(2026-09-30, cuda_v41_indexer_mma.inc.cu)★: --idx-mma 打开后 ds4_gpu_v41_indexer_score_tensor 走 s8 mma 版
+ * (每块 32 维的点积精确, 只有四块相加的顺序与 CUDA 核的蝶形树不同, 详见该文件头); 默认关。它要一份每路的 q 整数尾数暂存, graph 路捕获前
+ * 由 ds4_gpu_v41_indexer_scratch_prepare 按验证批行数长够(开关关着时是 no-op)。 */
+void ds4_gpu_v41_set_indexer_mma(int on);
+int ds4_gpu_v41_indexer_scratch_prepare(uint32_t n_tok, uint32_t n_head);
 /* 后端暂存的"代号": 任何一块暂存重分配(换了指针)就 +1。解码整步 graph 烤死的是捕获时的指针, 所以发图前要对一下,
  * 代号变了必须重捕获 —— 否则图读的是已释放的页(2026-09-19 定罪的 illegal memory access, 见 cuda_v41_1.inc.cu v41_grow)。 */
 uint64_t ds4_gpu_v41_scratch_generation(void);
+/* 放掉全部按需长的暂存槽(返回字节数), 下次用到再长; 代号随之 +1(解码整步图会重捕获)。后训练在阶段之间调: 教师预填长出来的大槽别占着训练段 */
+uint64_t ds4_gpu_v41_scratch_release(void);
+uint64_t ds4_gpu_v41_scratch_bytes(void);   /* 当前暂存槽合计字节(日志用) */
 /* posd / pos_cap(graph 路, 见上面"设备位置"口径): posd 非 NULL 时 pos0 = 图有效区间的起点、pos_cap = 终点(桶上限),
  * 解码张量核版按整个区间取段数上限开 grid(段长随位置变、段数不单调, 得扫一遍), 合并核按真位置只读真段。
  * 这条路只许走解码张量核版: 标量 split 版的段长在主机上按真键数算, 进不了图, 所以 posd 非 NULL 时张量核版不可用 = 失败。
@@ -383,6 +399,16 @@ int ds4_gpu_v41_row_gather_tensor(ds4_gpu_tensor *out, const void *model_map, ui
 
 /* dst 的第 dst_row 行(长 n) += src[0..n)(markov 偏置) */
 int ds4_gpu_v41_row_add_tensor(ds4_gpu_tensor *dst, uint64_t dst_row, const ds4_gpu_tensor *src, uint64_t n);
+/* ★markov 偏置缓存(2026-10-07, 草稿块)★: 第 i 位的偏置向量 bias = markov_head·embd[ids[i]](V 个 f32, 66 MB 的表读一遍 = 269 µs)只由 token id 决定,
+ * 生成序列里同一 id 在 256 个 token 内复现 ~59%(0908 请求实测) ⇒ 按 id 缓存 N 槽(轮换淘汰)。三发都在设备上做决定(进图):
+ *   lookup: hit[0] = 命中的槽号; 未命中 ⇒ 轮换领一槽记下 id, hit[0] = −(槽号+2)。  skip 版 GEMV: hit ≥ 0 就整网格直接退, 不读表。
+ *   add:    命中 ⇒ logits[row] += cache[槽]; 否则 += bias 并把 bias 存进领的槽。加的是同一个向量 ⇒ 与原路(算完再 row_add)逐位同。 */
+int ds4_gpu_v41_mkcache_lookup_tensor(ds4_gpu_tensor *hit, ds4_gpu_tensor *cache_ids, ds4_gpu_tensor *next, const ds4_gpu_tensor *ids,
+                                      uint32_t which, uint32_t n_slots);
+int ds4_gpu_v41_mkcache_add_tensor(ds4_gpu_tensor *logits, uint64_t row, const ds4_gpu_tensor *bias, ds4_gpu_tensor *cache,
+                                   const ds4_gpu_tensor *hit, uint64_t n);
+int ds4_gpu_v41_matmul_bf16_skip_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset,
+                                        uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint32_t n_tok, const ds4_gpu_tensor *skip);
 
 #ifdef __cplusplus
 }

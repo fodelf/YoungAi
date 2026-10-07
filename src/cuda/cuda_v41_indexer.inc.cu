@@ -19,10 +19,16 @@
  * ★数值逐位同★: 每个 (i,g) 的算法一个字没动(同样的逐头顺序、同样的 warp 归约、同样的 bf16 舍点),
  * 只是换了谁去算它; 组与组之间本来就互不依赖。
  * q 的重复读没变多: 原来一个 warp 顺着 g 循环, 每个 g 都要把 64 个头的 q 读一遍, 总量与现在一样。 */
-#define V41_IDX_G 4u   /* 打分核一个 warp 同时推进几个组(见核里) */
-__global__ static void v41_indexer_score_kernel(float *score, const float *q, const uint8_t *k, const float *w, const uint8_t *cand,
+#define V41_IDX_G 4u   /* 打分核一个 warp 同时推进几个组(见核里)。★判负存档(2026-10-07)★ 8 组: 寄存器 64 → 96(每 SM 少挂一半 block), 同请求 A/B 46.68 → 46.48 t/s(噪声内偏负), 逐位同, 回 4。 */
+/* ★候选紧凑(2026-09-30 C2, 契约见 ds4_gpu_v41.h)★: 紧凑宽度 ns = min(cap·bs, ng) —— 块数 ≤ cap 时列表就是可见块的前缀(第 c 项 ↔ 组 c),
+ * 块数 > cap 时最多 cap·bs 项; 两种情况 ns ≤ ng, 所以紧凑行永远装得进按 ng 开的草稿。打分核与 topk 核各自用同一式算, 行距才对得上。 */
+__host__ __device__ __forceinline__ static uint32_t v41_cand_ns(uint32_t ng, uint32_t cand_bs, uint32_t cand_cap) {
+    const uint64_t full = (uint64_t)cand_cap * cand_bs;
+    return full < ng ? (uint32_t)full : ng;
+}
+__global__ static void v41_indexer_score_kernel(float *score, const float *q, const uint8_t *k, const float *w, const int32_t *cand,
                                                 uint32_t pos0, uint32_t ng, uint32_t n_head, uint32_t dk, uint32_t ratio,
-                                                const int32_t *posd) {
+                                                const int32_t *posd, uint32_t cand_bs, uint32_t cand_cap) {
     v41_pdl_wait();   /* PDL: 第一句就等上游(见 cuda_internal.cuh); 不经 PDL 发射时立即返回 */
     const uint32_t i = blockIdx.x, lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, nwarp = blockDim.x >> 5;
     /* graph: 真位置在设备槽, 主机的 ng 是桶上限。★n 行(投机验证批进图, 2026-09-22)★: 源层在本批之后的组数 = (pos0 + n)/ratio
@@ -30,18 +36,24 @@ __global__ static void v41_indexer_score_kernel(float *score, const float *q, co
     if (posd) { pos0 = (uint32_t)posd[0]; ng = (pos0 + gridDim.x) / ratio; }
     const uint32_t vis = (pos0 + i + 1u) / ratio;   /* 可见组数 compress_lens(按绝对位置) */
     const uint32_t per = dk / 32u;                 /* dk=128 ⇒ 4 维/lane */
+    /* C2: 有列表时只走紧凑行 [ns], 第 c 项映到组 g; 没有列表时 c 就是 g */
+    const int32_t *cl = cand ? cand + (uint64_t)i * (1u + cand_cap) : NULL;
+    const uint32_t nc = cl ? (uint32_t)cl[0] : 0u;
+    const uint32_t ns = cl ? v41_cand_ns(ng, cand_bs, cand_cap) : ng;
     /* ★一个 warp 同时推进 V41_IDX_G 个组(2026-09-23, 长上下文)★: 原来一个 warp 一个组, 64 个头逐个"4 次乘加 → 5 级 shfl 规约
      * → 舍入"是一条串行依赖链, 发射槽大半空着(51k 上下文每发 ~200 µs)。现在 G 条链交错, 每个头的 q 也只读一次给 G 组共用。
      * ★逐位同★: 每个 (组, 头) 的乘加次序(e 升序)、xor 规约树、bf16 舍点、头的累加次序一个没动; 不可见的组照旧直接给 −inf。
      * grid.y 覆盖不完(ng 超过 grid.y×nwarp×G)时按 grid 步长兜底, 语义与原来的单 block 循环一样。 */
     const uint32_t gstride = nwarp * gridDim.y * V41_IDX_G;
-    for (uint32_t gb = (blockIdx.y * nwarp + warp) * V41_IDX_G; gb < ng; gb += gstride) {
+    for (uint32_t gb = (blockIdx.y * nwarp + warp) * V41_IDX_G; gb < ns; gb += gstride) {
         float kv[V41_IDX_G][4], acc[V41_IDX_G];
         bool live[V41_IDX_G];
         #pragma unroll
         for (uint32_t j = 0; j < V41_IDX_G; j++) {
-            const uint32_t g = gb + j;
-            live[j] = g < ng && !(g >= vis || (cand && !cand[(uint64_t)i * ng + g]));
+            const uint32_t c = gb + j;
+            uint32_t g = c;
+            if (cl) { const uint32_t b = c / cand_bs; g = b < nc ? (uint32_t)cl[1u + b] * cand_bs + c % cand_bs : ng; }   /* 列表外的项 = 死组 */
+            live[j] = c < ns && g < ng && g < vis;
             acc[j] = 0.f;
             /* ★键先解包进寄存器再进头循环★: 索引键在缓存里是打包的 MXFP4(cuda_kv_pack), 解一次用 64 次 */
             const uint8_t *kg = k + (uint64_t)(live[j] ? g : 0u) * DS4_V41_IDXK_BYTES;
@@ -75,24 +87,34 @@ __global__ static void v41_indexer_score_kernel(float *score, const float *q, co
         }
         if (lane == 0) {
             #pragma unroll
-            for (uint32_t j = 0; j < V41_IDX_G; j++) if (gb + j < ng) score[(uint64_t)i * ng + gb + j] = live[j] ? v41_bf16r(acc[j]) : -INFINITY;
+            for (uint32_t j = 0; j < V41_IDX_G; j++) if (gb + j < ns) score[(uint64_t)i * ns + gb + j] = live[j] ? v41_bf16r(acc[j]) : -INFINITY;
         }
     }
 }
+/* 张量核版(cuda_v41_indexer_mma.inc.cu, 在本片之后 include; --idx-mma 打开时由下面的入口分发) */
+static int v41_indexer_score_mma_launch(ds4_gpu_tensor *score, const ds4_gpu_tensor *q, const ds4_gpu_tensor *k, const ds4_gpu_tensor *weights,
+                                        const ds4_gpu_tensor *cand_list, uint32_t cand_bs, uint32_t cand_cap, uint32_t n_tok, uint32_t pos0,
+                                        uint32_t ng, uint32_t n_head, uint32_t dk, uint32_t ratio, const ds4_gpu_tensor *posd);
+static int g_v41_idx_mma = 0;   /* --idx-mma: 打分走张量核(默认关; 数值顺序见 cuda_v41_indexer_mma.inc.cu 文件头, 开关只作判决用) */
+void ds4_gpu_v41_set_indexer_mma(int on) { g_v41_idx_mma = on ? 1 : 0; }
 int ds4_gpu_v41_indexer_score_tensor(ds4_gpu_tensor *score, const ds4_gpu_tensor *q, const ds4_gpu_tensor *k,
-                                     const ds4_gpu_tensor *weights, const ds4_gpu_tensor *cand_mask,
+                                     const ds4_gpu_tensor *weights, const ds4_gpu_tensor *cand_list, uint32_t cand_bs, uint32_t cand_cap,
                                      uint32_t n_tok, uint32_t pos0, uint32_t ng, uint32_t n_head, uint32_t dk, uint32_t ratio,
                                      const ds4_gpu_tensor *posd) {
     if (!score || !q || !k || !weights || (dk % 32u) || ratio == 0) return 0;
     if (dk / 32u > 4u) { fprintf(stderr, "ds4: [v41] indexer 打分核只实现 dk ≤ 128(每 lane ≤ 4 维)\n"); return 0; }
     if (posd && n_tok > 8u) return 0;   /* graph 路: 纯解码 1 行或投机验证批 ≤ 8 行(核里 ng 按 pos0 + n 算) */
     if (ng == 0) return 1;
-    /* 一 block 8 warp × V41_IDX_G 组; 组多就多开 block(上限 65535 是 CUDA 的 grid.y 硬顶, 超了核里按 grid 步长绕) */
-    uint32_t gblocks = (ng + 8u * V41_IDX_G - 1u) / (8u * V41_IDX_G);
+    if (cand_list && (cand_bs == 0u || cand_cap == 0u)) return 0;
+    if (g_v41_idx_mma) return v41_indexer_score_mma_launch(score, q, k, weights, cand_list, cand_bs, cand_cap, n_tok, pos0, ng, n_head, dk, ratio, posd);
+    /* 一 block 8 warp × V41_IDX_G 组; 组多就多开 block(上限 65535 是 CUDA 的 grid.y 硬顶, 超了核里按 grid 步长绕)。
+     * C2: 有列表时 grid 只按紧凑宽度开(graph 路的 ng 是桶上限 ⇒ 这里的 ns 也是上限, 核里按真位置算的 ns 不会更大) */
+    const uint32_t ns = cand_list ? v41_cand_ns(ng, cand_bs, cand_cap) : ng;
+    uint32_t gblocks = (ns + 8u * V41_IDX_G - 1u) / (8u * V41_IDX_G);
     if (gblocks > 65535u) gblocks = 65535u;
     v41_indexer_score_kernel<<<dim3(n_tok, gblocks), 256, 0, g_cur_stream>>>((float *)score->ptr, (const float *)q->ptr, (const uint8_t *)k->ptr,
-        (const float *)weights->ptr, cand_mask ? (const uint8_t *)cand_mask->ptr : NULL, pos0, ng, n_head, dk, ratio,
-        posd ? (const int32_t *)posd->ptr : NULL);
+        (const float *)weights->ptr, cand_list ? (const int32_t *)cand_list->ptr : NULL, pos0, ng, n_head, dk, ratio,
+        posd ? (const int32_t *)posd->ptr : NULL, cand_bs, cand_cap);
     return cuda_ok(cudaGetLastError(), "v41 indexer score");
 }
 
@@ -120,12 +142,12 @@ __device__ __forceinline__ static uint32_t v41_topk_key(float f) {
 /* 候选块的 [nb] 块分 + [nb] 选中标记: 住全局暂存槽(不是 shared, 原因见核里的注释)。
  * graph 捕获期不许分配 ⇒ 开捕获前由 ds4_gpu_v41_candidate_scratch_prepare 按桶上限先长够;
  * 真长了会 +1 暂存代号(v41_grow), core_decode_graph.c 发图前对代号, 变了就重捕获。 */
-static v41_scratch g_v41_cand_blk;
+static v41_scratch g_v41_cand_blk[DS4_GPU_MAX_LANES];   /* 按并发道分(cuda_lifecycle.inc.cu g_cur_lane): 各路的候选块暂存不互踩 */
 int ds4_gpu_v41_candidate_scratch_prepare(uint32_t n_tok, uint32_t nb) {
     if (n_tok == 0u || nb == 0u) return 1;
-    return v41_grow(&g_v41_cand_blk, (uint64_t)n_tok * nb * 5u, "v41 候选块") ? 1 : 0;
+    return v41_grow(&g_v41_cand_blk[g_cur_lane], (uint64_t)n_tok * nb * 5u, "v41 候选块") ? 1 : 0;
 }
-__global__ static void v41_candidate_kernel(uint8_t *mask, const float *score, uint32_t pos0, uint32_t ng, uint32_t ratio,
+__global__ static void v41_candidate_kernel(int32_t *list, const float *score, uint32_t pos0, uint32_t ng, uint32_t ratio,
                                             uint32_t topk_blocks, uint32_t bs, const int32_t *posd,
                                             float *blk, uint32_t nb_cap) {
     v41_pdl_wait();   /* PDL: 第一句就等上游(见 cuda_internal.cuh); 不经 PDL 发射时立即返回 */
@@ -180,19 +202,37 @@ __global__ static void v41_candidate_kernel(uint8_t *mask, const float *score, u
         }
     }
     __syncthreads();
-    for (uint32_t j = threadIdx.x; j < ng; j += blockDim.x) mask[(uint64_t)i * ng + j] = sel[j / bs];
+    /* ★选中的块压成升序列表★(2026-09-30 C2, 契约见 ds4_gpu_v41.h): list[i][0] = 块数, list[i][1..] = 块号升序。
+     * 以前写 [n][nb] 的字节掩码(1M 上下文 2048 行的预填块 268 MB), 下游打分核还要对掩码外的 100 万组照跑一遍头循环;
+     * 列表最多 topk_blocks 项(2048 ⇒ 每行 8 KB), 打分/topk 只走候选。每线程管一段连续块(段内升序), 段计数 → 排他前缀 → 各段按序写,
+     * 所以列表顺序 = 块号升序, 与掩码扫描的位置序相同。 */
+    __shared__ uint32_t cnt[256];   /* 与发射的 blockDim(256) 同源 */
+    const uint32_t chunk = (nb + blockDim.x - 1u) / blockDim.x;
+    const uint32_t c0 = threadIdx.x * chunk, c1 = (c0 + chunk) < nb ? (c0 + chunk) : nb;
+    uint32_t mine = 0;
+    for (uint32_t b = c0; b < c1; b++) mine += sel[b];
+    cnt[threadIdx.x] = mine;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        uint32_t run = 0;
+        for (uint32_t t = 0; t < blockDim.x; t++) { const uint32_t v = cnt[t]; cnt[t] = run; run += v; }
+        list[(uint64_t)i * (1u + topk_blocks)] = (int32_t)run;   /* ≤ kk ≤ topk_blocks: 列表永远装得下 */
+    }
+    __syncthreads();
+    uint32_t wr = cnt[threadIdx.x];
+    for (uint32_t b = c0; b < c1; b++) if (sel[b]) list[(uint64_t)i * (1u + topk_blocks) + 1u + wr++] = (int32_t)b;
 }
-int ds4_gpu_v41_candidate_blocks_tensor(ds4_gpu_tensor *mask, const ds4_gpu_tensor *score, uint32_t n_tok, uint32_t pos0,
+int ds4_gpu_v41_candidate_blocks_tensor(ds4_gpu_tensor *cand_list, const ds4_gpu_tensor *score, uint32_t n_tok, uint32_t pos0,
                                         uint32_t ng, uint32_t ratio, uint32_t topk_blocks, uint32_t block_size,
                                         const ds4_gpu_tensor *posd) {
-    if (!mask || !score || block_size == 0 || ratio == 0) return 0;
+    if (!cand_list || !score || block_size == 0 || ratio == 0 || topk_blocks == 0) return 0;
     if (posd && n_tok > 8u) return 0;
     if (ng == 0) return 1;
     const uint32_t nb = (ng + block_size - 1u) / block_size;
     /* 直发路(预填 / 暖身)在这里现长; graph 路进来时 prepare 已按桶上限长够, 这一发是 no-op */
-    float *blk = (float *)v41_grow(&g_v41_cand_blk, (uint64_t)n_tok * nb * 5u, "v41 候选块");
+    float *blk = (float *)v41_grow(&g_v41_cand_blk[g_cur_lane], (uint64_t)n_tok * nb * 5u, "v41 候选块");
     if (!blk) return 0;
-    v41_candidate_kernel<<<n_tok, 256, 0, g_cur_stream>>>((uint8_t *)mask->ptr, (const float *)score->ptr, pos0, ng, ratio,
+    v41_candidate_kernel<<<n_tok, 256, 0, g_cur_stream>>>((int32_t *)cand_list->ptr, (const float *)score->ptr, pos0, ng, ratio,
                                                             topk_blocks, block_size, posd ? (const int32_t *)posd->ptr : NULL,
                                                             blk, nb);
     return cuda_ok(cudaGetLastError(), "v41 candidate blocks");
@@ -219,15 +259,23 @@ int ds4_gpu_v41_candidate_blocks_tensor(ds4_gpu_tensor *mask, const ds4_gpu_tens
  *     b* = max{b ≥ 1 : suf[b] ≥ kk}(没有就 0), 落桶余量 = kk − suf[b*+1], suf 是后缀和 —— 后缀和并行求, b* 用 atomicMax 求。 */
 #define V41_TOPK_THREADS 1024u
 #define V41_TOPK_B 8u
+/* C2: 紧凑行的第 c 项 ↔ 真组号(列表升序 ⇒ 单调); 无列表时 c 就是组号 */
+__device__ __forceinline__ static int32_t v41_cand_map(const int32_t *cl, uint32_t c, uint32_t bs) {
+    return cl ? cl[1u + c / bs] * (int32_t)bs + (int32_t)(c % bs) : (int32_t)c;
+}
 __global__ static void __launch_bounds__(V41_TOPK_THREADS) v41_topk_kernel(int32_t *idx, const float *score, uint32_t ng, uint32_t topk,
-                                                                          uint32_t ratio, const int32_t *posd) {
+                                                                          uint32_t ratio, const int32_t *posd,
+                                                                          const int32_t *cand, uint32_t cand_bs, uint32_t cand_cap) {
     v41_pdl_wait();   /* PDL: 第一句就等上游(见 cuda_internal.cuh); 不经 PDL 发射时立即返回 */
     const uint32_t i = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;
     if (posd) {   /* graph: ng 与 topk 都按设备位置自算(与主机直发路 min(index_topk, ng) 同式; n 行时 ng = (pos0 + n)/ratio) */
         ng = ((uint32_t)posd[0] + gridDim.x) / ratio;
         if (ng < topk) topk = ng;
     }
-    const float *s = score + (uint64_t)i * ng;
+    /* C2(2026-09-30): 有候选列表时 score 是打分核写的紧凑行 [ns], 扫描只走 ns 项, 写出时映回真组号; topk 的封顶仍按 ng(官方 min(index_topk, ng)) */
+    const int32_t *cl = cand ? cand + (uint64_t)i * (1u + cand_cap) : NULL;
+    const uint32_t ns = cl ? v41_cand_ns(ng, cand_bs, cand_cap) : ng;
+    const float *s = score + (uint64_t)i * ns;
     /* ★2026-09-16 判负存档: "直方图按 warp 各记各的"(hist[8][256], 消 shared 原子争用)★ 实测 5.91 → 7.15 ms(慢 21%), 回退 ——
      * 争用不是这个核的瓶颈, 多出来的 8 份清零与扫桶时每桶 8 次加反而更贵。 */
     __shared__ uint32_t hist[256], suf[257], sh_bucket;
@@ -235,10 +283,10 @@ __global__ static void __launch_bounds__(V41_TOPK_THREADS) v41_topk_kernel(int32
     for (int shift = 24; shift >= 0; shift -= 8) {
         for (uint32_t b = tid; b < 256u; b += nt) hist[b] = 0;
         __syncthreads();
-        for (uint32_t gb = tid; gb < ng; gb += V41_TOPK_B * nt) {
+        for (uint32_t gb = tid; gb < ns; gb += V41_TOPK_B * nt) {
             float v[V41_TOPK_B];
             #pragma unroll
-            for (uint32_t j = 0; j < V41_TOPK_B; j++) { const uint32_t g = gb + j * nt; v[j] = g < ng ? s[g] : -INFINITY; }
+            for (uint32_t j = 0; j < V41_TOPK_B; j++) { const uint32_t g = gb + j * nt; v[j] = g < ns ? s[g] : -INFINITY; }
             #pragma unroll
             for (uint32_t j = 0; j < V41_TOPK_B; j++) {
                 const uint32_t key = v41_topk_key(v[j]);   /* 越界补的 −inf ⇒ 键 0, 与"不计入"同义 */
@@ -275,8 +323,8 @@ __global__ static void __launch_bounds__(V41_TOPK_THREADS) v41_topk_kernel(int32
     __shared__ uint32_t cgt[V41_TOPK_THREADS], ceq[V41_TOPK_THREADS], sh_tgt, sh_teq;
     if (tid == 0) { sh_tgt = 0; sh_teq = 0; }
     __syncthreads();
-    const uint32_t chunk = (ng + nt - 1u) / nt;
-    const uint32_t g0 = tid * chunk, g1 = (g0 + chunk) < ng ? (g0 + chunk) : ng;
+    const uint32_t chunk = (ns + nt - 1u) / nt;
+    const uint32_t g0 = tid * chunk, g1 = (g0 + chunk) < ns ? (g0 + chunk) : ns;
     {   /* ① 各段自己数: 本段里 > 阈值 / == 阈值 各几个(读一批先发) */
         uint32_t ngt = 0, neq = 0;
         for (uint32_t gb = g0; gb < g1; gb += V41_TOPK_B) {
@@ -324,12 +372,12 @@ __global__ static void __launch_bounds__(V41_TOPK_THREADS) v41_topk_kernel(int32
                 if (key == 0u) continue;
                 if (key > prefix) {
                     const uint32_t pos = wgt + (weq < eq ? weq : eq);
-                    if (pos < topk) idx[(uint64_t)i * topk + pos] = (int32_t)g;
+                    if (pos < topk) idx[(uint64_t)i * topk + pos] = v41_cand_map(cl, g, cand_bs);
                     wgt++;
                 } else if (key == prefix) {
                     if (weq < eq) {
                         const uint32_t pos = wgt + weq;
-                        if (pos < topk) idx[(uint64_t)i * topk + pos] = (int32_t)g;
+                        if (pos < topk) idx[(uint64_t)i * topk + pos] = v41_cand_map(cl, g, cand_bs);
                     }
                     weq++;
                 }
@@ -344,12 +392,15 @@ __global__ static void __launch_bounds__(V41_TOPK_THREADS) v41_topk_kernel(int32
     }
 }
 int ds4_gpu_v41_indexer_topk_tensor(ds4_gpu_tensor *idx, const ds4_gpu_tensor *score, uint32_t n_tok, uint32_t ng,
-                                    uint32_t topk, uint32_t ratio, const ds4_gpu_tensor *posd) {
+                                    uint32_t topk, uint32_t ratio, const ds4_gpu_tensor *posd,
+                                    const ds4_gpu_tensor *cand_list, uint32_t cand_bs, uint32_t cand_cap) {
     if (!idx || !score || topk == 0) return 0;
     if (posd && (n_tok > 8u || ratio == 0u)) return 0;
+    if (cand_list && (cand_bs == 0u || cand_cap == 0u)) return 0;
     if (ng == 0) return 1;
     /* shared 只剩固定的 256 个桶(1 KB), 不再随 ng 走 ⇒ 原来那条 "ng > 48K 就拒" 的闸跟着作废 */
     v41_topk_kernel<<<n_tok, V41_TOPK_THREADS, 0, g_cur_stream>>>((int32_t *)idx->ptr, (const float *)score->ptr, ng, topk, ratio,
-                                                     posd ? (const int32_t *)posd->ptr : NULL);
+                                                     posd ? (const int32_t *)posd->ptr : NULL,
+                                                     cand_list ? (const int32_t *)cand_list->ptr : NULL, cand_bs, cand_cap);
     return cuda_ok(cudaGetLastError(), "v41 topk");
 }

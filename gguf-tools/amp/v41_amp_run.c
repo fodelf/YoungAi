@@ -53,6 +53,7 @@ int v41_gr_solve_layer_gpu(const float *dye, const float *drw, const int *dsel, 
               "  验证表:   --sft-list <清单> --verify-tabs g_ --base-pt <候选>(一次加载跑完所有样本)\n" \
               "  第七版:   --adv-list <清单: ids topk rms A_i nprompt 组号> --only-layer 39 --capture-ye --base-amp <②>\n" \
               "            [--eta-list 0.1,0.3,1] [--lam-list 0.3,1,3,10] [--own-pmax 0.95] [--rows-cap N] [--score-chunk 512](见 v41_adv_run.inc.c)\n" \
+              "            [--lowrank K]: ③ 解成低秩加性项 amp_Lnn.bin(x·B·A, 与 ② 放大器同构), --lam-list 此时是相对岭(10-01)\n" \
               "  校准取料: --dump-calib  (裸 ① 上一趟, 40 层同趟落 <出目录>/calib_Lnn.bin, 给 v41_quantize --calib; 见 v41_calib_dump.inc.c)\n"
 
 #define NK 4
@@ -99,6 +100,8 @@ typedef struct {
     int nsmp;                              /* 样本条数: 尺 L 按条留一, 折数 = 它 */
     int reuse_tab; const char *verify_pref;   /* 榜单已在盘上就取完料停车 / 挂候选只出表不解算(gatea 用) */
     int share; float *dgrf;                /* --share: 全体专家共用一组通道增益(未知数 D 个); dgrf = 广播+量化后的落地态 */
+    int lowrank_k; float conf_min;         /* --lowrank K(10-01, 只配 --adv-list): ③ 解成低秩加性项 amp_Lnn.bin 而不是增益表; 钩子多存 x 行(rx), 见 v41_adv_run.inc.c adv_lowrank
+                                            * --conf-min p: 事实行只推"榜首 p ≥ 阈值且榜首 ≠ 料 token"的位置(复读环正修, 见 adv_take_sample) */
     const char *gate_s; int gates; float *dgate;   /* --gates 列表: x 键控(R=1 = 旧形态; 一次取料跑多个 R);
                                                     * gates = 当前这一档 R; dgate[n][R] = 每行每门的 σ 标量 */
     int nsel;                              /* 解算真正用的行数(fit+val); 取料仍是全部 n 行 */
@@ -174,7 +177,7 @@ static int hook(void *ud, int il, int pos0, int n, int D, int n_used, float clam
     if (c->ry) memcpy(c->ry + (size_t)pos0 * D, y, (size_t)n * D * 4);
     memcpy(c->rsel + (size_t)pos0 * n_used, sel, (size_t)n * n_used * 4); memcpy(c->rrw + (size_t)pos0 * n_used, rw, (size_t)n * n_used * 4);
     memcpy(c->ralpha + (size_t)pos0, alpha, (size_t)n * 4);
-    if (c->want_ye) {
+    if (c->want_ye && !(c->lowrank_k && !ye)) {   /* 低秩形态只要 x(上面已存), 解码 GEMV 路没有逐专家输出也放行(10-01: 按行拆的事实料一行 7 token) */
         /* 取不到就硬停: 逐专家输出只有 prefill GEMM 路物化, 拿不到说明走了解码路或形状对不上 ——
          * 这时候继续跑会解出一个没有料支撑的东西, 比报错难查得多。 */
         if (!ye || !ysh) { fprintf(stderr, "★L%02d 拿不到逐专家 down 输出/shared(ye=%p ysh=%p): 块 n=%d 可能走了解码 gemv 路★\n", il, (const void *)ye, (const void *)ysh, n); return -1; }
@@ -255,6 +258,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--eta-list") && i + 1 < argc) c.eta_s = argv[++i];
         else if (!strcmp(argv[i], "--own-pmax") && i + 1 < argc) c.own_pmax = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--rows-cap") && i + 1 < argc) c.rows_cap = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--lowrank") && i + 1 < argc) c.lowrank_k = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--conf-min") && i + 1 < argc) c.conf_min = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--score-chunk") && i + 1 < argc) c.score_chunk = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--reuse-tables")) c.reuse_tab = 1;
         else if (!strcmp(argv[i], "--share")) c.share = 1;
@@ -342,6 +347,7 @@ int main(int argc, char **argv) {
     const int adv = c.adv_list != NULL;
     c.rrw = malloc(nU * 4); c.rsel = malloc(nU * 4); c.ralpha = malloc((size_t)ntok * 4);
     if (!c.rrw || !c.rsel || !c.ralpha) { fprintf(stderr, "★取料元数据缓冲分配失败★\n"); return 1; }
+    if (adv && c.lowrank_k && !(c.rx = malloc(nD * 4))) { fprintf(stderr, "★低秩形态的 x 行缓冲(%.2f GB)分配失败★\n", (double)nD * 4 / 1e9); return 1; }
     if (!adv) {
         c.rx = malloc(nD * 4); c.ry = malloc(nD * 4);
         c.hx = malloc(nD * 4); c.hy = malloc(nD * 4); c.hrw = malloc(nU * 4); c.hsel = malloc(nU * 4); c.halpha = malloc((size_t)ntok * 4);

@@ -50,6 +50,14 @@ void ds4_engine_v41_set_draft_amp_scale(float s);   /* --draft-amp-scale β: 诊
  * (INT_MAX = 不设上限, 生成到 EOS 或上下文边界)。 */
 int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_prompt, int n_predict,
                                    ds4_v41_emit_fn emit, void *ud);
+/* --ptrain <配置>(2026-10-01, 后训练 ③ 第八版 = 上下文蒸馏; src/core/core_ptrain*.c): 读复盘块 + 自出问答 → 教师 top-K →
+ * 反传训练 ③ 的低秩放大器 → 落 amp_Lnn.bin + base.fnv(引擎 --posttrain 直接挂)。配置是 key=value 文本, 字段见 core_ptrain_data.c。
+ * 只接 --zchain ②, 不接 --posttrain(起点恒为 ①+②)。返回 0 = 落盘成功。 */
+int ds4_engine_ptrain(ds4_engine *e, const char *spec);
+/* --draft-train <配置>(2026-10-07, 草稿器蒸馏; src/core/core_draft_kd*.c): 让 DSpark 三塔改盯部署底座 —— 教师强制走底座自己采样的真实请求续写,
+ * 块内各位对底座同位置分布做 KL, 反传训三塔 MoE 出口的低秩件 + 出口对齐件; 落 tower_Tn.bin + exit.dspa + base.fnv, 引擎 --draft-amp <目录> 直接挂。
+ * 底座/塔原权重/头全冻结, 验证侧不动 ⇒ 只动接受率。配置是 key=value 文本(字段见 core_draft_kd.c)。返回 0 = 落盘成功。 */
+int ds4_engine_draft_train(ds4_engine *e, const char *spec);
 /* 解码采样(2026-09-21, 113-1.md §4): 上面那条生成路的名字里的 argmax 是历史, 采样由这个设置面决定。
  * temperature ≤ 0(默认) = 裸 argmax: 图末尾的设备 argmax, 一个字节不变(门 = 温 0 输出逐字节回归)。
  * > 0 = ★设备采样核★(2026-09-28, src/cuda/cuda_v41_sample.inc.cu): 温度 / top-k / top-p / min-p 与 V4 路采样器 ds4_sample_logits
@@ -76,6 +84,35 @@ void ds4_engine_set_decode_sampling(const ds4_decode_sampling *sp);
 typedef int (*ds4_v41_progress_fn)(void *ud, const char *event, int current, int total);
 void ds4_engine_v41_set_progress(ds4_v41_progress_fn fn, void *ud);
 int ds4_engine_v41_ctx(void);
+
+/* ---- 并发(2026-09-30, batch.md; 实现 src/core/core_v41_req.c): 请求态 + 批态 + 多状态一步 ----
+ * 服务端调度器(server_sched_v41.c)拿这几个出口把 N 条请求合成一次前向: 每条请求 open 后一块一块 prefill_step(块间调度器去发心跳、
+ * 探客户端、让别的请求解码), 预填完的请求每步与其他请求一起 multi_step(各喂 1 个 token, 稠密段拼行一次发, 权重每步只读一遍)。
+ * 没有会话 / KV 复用 / 投机(第二期)。温 0 下每路输出与单请求路逐字节同(同一份预填与取 token 代码)。
+ * 出错会怎样: multi_step 非 0 = 这一步的所有请求都没推进(状态没动), 调用方按错误收尾, 不重试。 */
+struct ds4_v41_req;
+struct ds4_v41_batch;
+struct ds4_v41_batch *ds4_v41_batch_open(ds4_engine *e, int cap);   /* cap = 一步最多合几行(解码小批核路上限 8) */
+void ds4_v41_batch_close(struct ds4_v41_batch *b);
+struct ds4_v41_req *ds4_v41_req_open(ds4_engine *e, const int *prompt, int n_prompt, int n_predict, const ds4_decode_sampling *sp);
+int ds4_v41_req_prefill_step(struct ds4_v41_req *r);   /* 跑一块预填: 1 = 预填完(首个 token 在 req_next), 0 = 还有块, -1 = 失败 */
+void ds4_v41_req_progress(const struct ds4_v41_req *r, int *c0, int *np);
+int ds4_v41_req_next(const struct ds4_v41_req *r);    /* 还没进模型的下一个 token(= 刚生成的那个) */
+int ds4_v41_req_pos(const struct ds4_v41_req *r);     /* 已进缓存的位置数 */
+int ds4_v41_req_room(const struct ds4_v41_req *r);    /* 还能再进几个位置(0 = 上下文满, 别再喂) */
+int ds4_v41_multi_step(struct ds4_v41_batch *b, struct ds4_v41_req **r, int n);   /* 纯解码一步: 各请求喂自己的 next, 出各自的新 next(outq 1 个); 非 0 失败 */
+/* 投机一轮(2026-09-30 傍晚): 各请求各出草稿, 验证行拼进一次前向, 各自接受/回滚; 之后 req_take 拿这一轮吐出的 token(接受的草稿 + 新 next, 按序 emit)。
+ * 没三塔 / 惩罚路 / 引擎投机关 = 退成纯解码一步(outq 1 个)。上下文不够放一个验证批的请求这一轮也只走 1 行。 */
+int ds4_v41_multi_round(struct ds4_v41_batch *b, struct ds4_v41_req **r, int n);
+int ds4_v41_req_take(struct ds4_v41_req *r, int *out, int max);   /* 取这一轮吐出的 token(最后一个 = 新 next), 取过即清; 返回个数 */
+void ds4_v41_req_spec_stats(const struct ds4_v41_req *r, int *rounds, int *offered, int *accepted);   /* 投机轮数 / 出过的草稿位 / 接受的草稿位 */
+/* 单请求路(ds4_engine_v41_generate_argmax)上一趟的同一组投机账(服务监控页用); 每次 generate 进门清零, 没投机全 0 */
+void ds4_engine_v41_last_spec_stats(int *rounds, int *offered, int *accepted);
+int ds4_engine_v41_dspark(void);   /* 投机开关现值(ds4_engine_v41_set_dspark 设的那个): 0 关 / 1 默认开 / 2 显式开 */
+void ds4_v41_req_close(struct ds4_v41_req *r);
+void ds4_engine_v41_set_lanes(int on);              /* --no-lanes: 合批的缓存段不按路分流(默认分; 只作 A/B, 输出逐字节同) */
+uint64_t ds4_v41_req_prefill_bytes(int n_prompt);   /* 预填期设备峰值字节(行缓冲 + KV + 索引草稿), 服务端准入用 */
+uint64_t ds4_v41_req_resident_bytes(void);          /* 预填完收缩后的常驻字节(KV 按模型上下文) */
 
 /* 反修取料钩子(2026-09-13, C 反修驱动 gguf-tools/amp/v41_amp_run 用): 每层 MoE 出口、放大器应用前回调一次。
  * 全是主机内存、行主序: x[n][D] = MoE 输入(ffn_norm 出口, bf16 格点), y[n][D] = MoE 输出(bf16 格点, 还没加放大器),

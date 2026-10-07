@@ -78,9 +78,13 @@ __global__ static void v41_f32_gemv_kernel(float *out, const float *w, const flo
  * 所以一个 warp 一轮走 256 个元素。要求 in_dim 是 256 的倍数 —— 现有调用点是 5120 / 512。
  * ★数值★: bf16 权重升 f32 再乘 f32 激活, f32 累加。与"f32 存的同一份权重"逐值相同
  * (存 BF16 是把原件原样搬过来, 不是压缩), 只差累加序 ⇒ 门是主尺 NLL/PPL。 */
+/* skip(2026-10-07, markov 偏置缓存): 非空且 *skip ≥ 0 ⇒ 整网格第一句就退, 一个字节的表都不读。放在权重预读之前 —— 预读在 pdl_wait 之前,
+ * 退晚了 66 MB 就白读了。能在 pdl_wait 之前读 skip: 本仓 PDL 只用 griddepcontrol.wait, 不显式提前触发, 后继核要等前驱整网格退出才发,
+ * 所以写 skip 的那发(隔着两发 row_gather)早已完成。 */
 template <uint32_t NT>
 __global__ static void v41_bf16_gemv_kernel(float *out, const __nv_bfloat16 *w, const float *x, uint32_t in_dim,
-                                            uint32_t out_dim, uint32_t x_stride, uint32_t out_stride, uint32_t ksplit) {
+                                            uint32_t out_dim, uint32_t x_stride, uint32_t out_stride, uint32_t ksplit, const int32_t *skip) {
+    if (skip && *skip >= 0) return;
     const uint32_t warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
     const uint32_t rows_per_block = 8u / ksplit, rloc = warp / ksplit, kpart = warp % ksplit;
     const uint32_t r = blockIdx.x * rows_per_block + rloc;
@@ -144,7 +148,7 @@ __global__ static void v41_bf16_gemv_kernel(float *out, const __nv_bfloat16 *w, 
     }
 }
 static int v41_bf16_gemv(const __nv_bfloat16 *w, uint64_t in_dim, uint64_t out_dim, const float *x, float *out,
-                         uint32_t n_tok, const char *what) {
+                         uint32_t n_tok, const char *what, const int32_t *skip) {
     if ((in_dim % 256u) != 0u || n_tok == 0 || n_tok > V41_GEMV_MAX_TOK) return 0;
     uint32_t ksplit = 1;
     while (ksplit < 8u && out_dim * ksplit < 32768u) ksplit <<= 1;
@@ -154,7 +158,7 @@ static int v41_bf16_gemv(const __nv_bfloat16 *w, uint64_t in_dim, uint64_t out_d
     const dim3 grid((unsigned)((out_dim + rpb - 1u) / rpb), 1);
     v41_pdl_register((const void *)v41_bf16_gemv_kernel<1u>);   /* 核在读 x 之前 v41_pdl_wait(见核头) */
     #define V41_BFGEMV_LAUNCH(NT) v41_bf16_gemv_kernel<NT><<<grid, 256, 0, g_cur_stream>>>( \
-        out, w, x, (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)in_dim, (uint32_t)out_dim, ksplit)
+        out, w, x, (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)in_dim, (uint32_t)out_dim, ksplit, skip)
     switch (n_tok) {
         case 1: V41_BFGEMV_LAUNCH(1u); break;  case 2: V41_BFGEMV_LAUNCH(2u); break;
         case 3: V41_BFGEMV_LAUNCH(3u); break;  case 4: V41_BFGEMV_LAUNCH(4u); break;

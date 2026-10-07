@@ -414,22 +414,23 @@ static void v41_engram_fingerprint(const ds4_v41_state *st, const v41_ejob *J, u
             (unsigned long long)hhc);
 }
 
-bool v41_engram(ds4_engine *e, ds4_v41_state *st, uint32_t il) {
+/* 两段(2026-09-30 并发拆开): rows = 收本请求的行 → 上传 → 解码行进 st->erows; apply = erows → wkv → 门 → 就地改 st->hc。
+ * 合批时 rows 逐请求发(各请求自己的 hist/取行任务, erows 是批态里自己那一行的视图), apply 在批态上一次发 R 行(wkv 315 MB 每层只读一遍)。 */
+bool v41_engram_rows(ds4_engine *e, ds4_v41_state *st, uint32_t il) {
     const ds4_v41_cfg *v = &g_ds4_v41;
     const int16_t ei = v->engram_index_of[il];
     if (ei < 0) return true;
     if (!st->ejob && !v41_engram_prefetch(e, st)) return false;   /* 没预取(不该发生)就现取 */
     const v41_ejob *J = (const v41_ejob *)st->ejob;
-    const ds4_model *m = &e->model; const ds4_layer_weights *l = &e->weights.layer[il];
-    const uint32_t n = st->n, E = DS4_N_EMBD, HC = DS4_N_HC, HD = J->HD, cols = J->cols, stride = J->HD + J->nsc;
-    const uint64_t in_dim = (uint64_t)cols * HD, out_dim = (uint64_t)(HC + 1) * E;
-    if (!st->erows) {
+    const uint32_t n = st->n, HC = DS4_N_HC, HD = J->HD, cols = J->cols, stride = J->HD + J->nsc;
+    const uint64_t in_dim = (uint64_t)cols * HD, out_dim = (uint64_t)(HC + 1) * DS4_N_EMBD;
+    if (!st->erows) {   /* 单请求路: 三块按 cap 懒建; 并发的请求态 erows 是视图、eraw 在收缩时建, 不进这里 */
         for (uint32_t k = 0; k < J->n_eng; k++) st->eraw[k] = ds4_gpu_tensor_alloc((uint64_t)st->cap_tok * cols * stride);
         st->erows = ds4_gpu_tensor_alloc((uint64_t)st->cap_tok * in_dim * 4);
         st->ekv = ds4_gpu_tensor_alloc((uint64_t)st->cap_tok * out_dim * 4);
     }
     for (uint32_t k = 0; k < J->n_eng; k++) if (!st->eraw[k]) return false;
-    if (!st->erows || !st->ekv) return false;
+    if (!st->erows) return false;
     if (st->graph) {
         /* ★捕获中★: 不在主机上等、不做同步拷贝(二者都会作废捕获)。每个 engram 层前放一个自旋小核等主机置位本层的标志
          * (主机在 v41_engram_graph_serve 里收完这一层的 pread 就置位) + 零拷贝小核把本层的行搬进设备。
@@ -440,15 +441,29 @@ bool v41_engram(ds4_engine *e, ds4_v41_state *st, uint32_t il) {
             st->egraph_uploaded |= 1 << ei;
         }
     } else {
-        if (!v41_ejob_wait(st, (uint32_t)ei)) return false;
-        if (!ds4_gpu_tensor_write(st->eraw[ei], 0, J->raw[ei], (uint64_t)n * cols * stride)) return false;
+        if (!v41_ejob_wait(st, (uint32_t)ei)) return false;   /* 等的是盘(io_uring), 不是 GPU */
+        /* 零拷贝小核从 pinned 行缓冲搬(与 graph 路同一发), 不用同步 memcpy: 同步 memcpy 每次都把 GPU 队列等空, 合批时每步 2 层 × N 路
+         * 就是 2N 个泡(2026-09-30); raw 行到下一步 prefetch 才会被改, 而两步之间有整步同步 */
+        if (!ds4_gpu_tensor_write_zerocopy(st->eraw[ei], 0, J->raw[ei], (uint64_t)n * cols * stride)) return false;
     }
     if (st->dump_prefix) {   /* 对拍夹具: 行号落 <prefix>.erows_Lnn.txt(每行一个位置, 24 个全局行号), 与 Python hash_ids 直接 diff */
         char p[4400]; snprintf(p, sizeof p, "%s.erows_L%02u.txt", st->dump_prefix, il);
         FILE *df = fopen(p, "w");
         if (df) { for (uint32_t q = 0; q < n; q++) for (uint32_t c = 0; c < cols; c++) fprintf(df, "%lld%c", (long long)J->rows[ei][(size_t)q * cols + c], c + 1 == cols ? '\n' : ' '); fclose(df); }
     }
-    if (!ds4_gpu_v41_engram_rows_tensor(st->erows, st->eraw[ei], n * cols, HD)) return false;
+    return ds4_gpu_v41_engram_rows_tensor(st->erows, st->eraw[ei], n * cols, HD) != 0;
+}
+
+bool v41_engram_apply(ds4_engine *e, ds4_v41_state *st, uint32_t il) {
+    const ds4_v41_cfg *v = &g_ds4_v41;
+    const int16_t ei = v->engram_index_of[il];
+    if (ei < 0) return true;
+    const v41_ejob *J = (const v41_ejob *)st->ejob;   /* 批态没有取行任务(J == NULL): 形状从元数据取, 指纹探针跳过 */
+    const ds4_model *m = &e->model; const ds4_layer_weights *l = &e->weights.layer[il];
+    const uint32_t n = st->n, E = DS4_N_EMBD, HC = DS4_N_HC;
+    const uint64_t in_dim = (uint64_t)(v->engram_max_ngram - 1) * v->engram_heads * v->engram_head_dim, out_dim = (uint64_t)(HC + 1) * E;
+    if (!st->ekv) st->ekv = ds4_gpu_tensor_alloc((uint64_t)st->cap_tok * out_dim * 4);
+    if (!st->erows || !st->ekv) return false;
     /* wkv(盘上就是官方 FP8: e4m3 + 32×32 块缩放, clear.md C1) → 门 → hc 就地 */
     if (!ds4_gpu_v41_matmul_fp8blk_tensor(st->ekv, m->map, m->size, l->engram_wkv->abs_offset, in_dim, out_dim, st->erows, n)) return false;
     if (!ds4_gpu_v41_round_bf16_tensor(st->ekv, (uint64_t)n * out_dim)) return false;
@@ -459,8 +474,12 @@ bool v41_engram(ds4_engine *e, ds4_v41_state *st, uint32_t il) {
         if (ds4_gpu_tensor_read(st->hc, 0, buf, (uint64_t)n * HC * E * 4)) { FILE *f = fopen(p, "wb"); if (f) { fwrite(buf, 4, (size_t)n * HC * E, f); fclose(f); } }
         free(buf);
     }
-    if (g_ds4_v41_prof) v41_engram_fingerprint(st, J, il, (uint32_t)ei);
+    if (g_ds4_v41_prof && J) v41_engram_fingerprint(st, J, il, (uint32_t)ei);
     return true;
+}
+
+bool v41_engram(ds4_engine *e, ds4_v41_state *st, uint32_t il) {
+    return v41_engram_rows(e, st, il) && v41_engram_apply(e, st, il);
 }
 #endif /* !DS4_NO_GPU */
 typedef int ds4_core_v41_engram_nonempty_tu;

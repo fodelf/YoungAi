@@ -15,18 +15,27 @@ bool enqueue(server *s, job *j) {
     return true;
 }
 
-static job *dequeue(server *s) {
-    pthread_mutex_lock(&s->mu);
-    while (!s->head && !s->stopping) pthread_cond_wait(&s->cv, &s->mu);
-    if (!s->head) {
-        pthread_mutex_unlock(&s->mu);
-        return NULL;
-    }
+static job *dequeue_locked(server *s) {   /* 调用方持锁 */
     job *j = s->head;
+    if (!j) return NULL;
     s->head = j->next;
     if (!s->head) s->tail = NULL;
-    pthread_mutex_unlock(&s->mu);
     j->next = NULL;
+    return j;
+}
+
+job *dequeue(server *s) {
+    pthread_mutex_lock(&s->mu);
+    while (!s->head && !s->stopping) pthread_cond_wait(&s->cv, &s->mu);
+    job *j = dequeue_locked(s);
+    pthread_mutex_unlock(&s->mu);
+    return j;
+}
+
+job *dequeue_try(server *s) {   /* 不阻塞: V4.1 并发调度器在道没满时看一眼队列(server_sched_v41.c) */
+    pthread_mutex_lock(&s->mu);
+    job *j = dequeue_locked(s);
+    pthread_mutex_unlock(&s->mu);
     return j;
 }
 
@@ -70,7 +79,7 @@ static uint32_t dequeue_batchable(server *s, job **out, uint32_t max) {
     return n;
 }
 
-static void job_finish(job *j) {
+void job_finish(job *j) {
     pthread_mutex_lock(&j->mu);
     j->done = true;
     pthread_cond_signal(&j->cv);
@@ -96,6 +105,7 @@ static void generate_jobs_batched(server *s, job **jobs, uint32_t n) {
         rng[i] = jobs[i]->req.seed ? jobs[i]->req.seed
                                    : (((uint64_t)time(NULL) << 32) ^ ((uint64_t)s->seq << 1) ^ (uint64_t)i);
         err[0] = 0;
+        mon_prefill(s, jobs[i]->mon, jobs[i]->req.prompt.len, 0, jobs[i]->req.max_tokens);   /* 监控: 临时会话 sync = 整段预填 */
         if (ds4_session_create(&sess[i], s->engine, s->ctx_size) != 0 || !sess[i] ||
             ds4_session_sync(sess[i], &jobs[i]->req.prompt, err, sizeof err) != 0) {
             server_log(DS4_LOG_WARNING, "ds4-server: 批处理会话 %u 建立失败: %s", i, err);
@@ -103,6 +113,7 @@ static void generate_jobs_batched(server *s, job **jobs, uint32_t n) {
             continue;
         }
         prompt_tokens[i] = jobs[i]->req.prompt.len;
+        mon_first_token(s, jobs[i]->mon);
         /* 请求级惩罚(frequency/presence): 原路 generate_job 有, 批路一开始漏了 ⇒ 客户端
          * 传的 frequency_penalty 被静默丢弃(实测: 开 0.25 与不开 18/20 逐字相同)。
          * 生成区边界 = 此刻的 checkpoint(prompt 到此为止), 与原路口径一致。 */
@@ -131,6 +142,7 @@ static void generate_jobs_batched(server *s, job **jobs, uint32_t n) {
             char *piece = ds4_token_text(s->engine, t, &plen);
             if (piece && plen) buf_append(&text[i], piece, plen);
             completion[i]++;
+            mon_token(s, jobs[i]->mon, completion[i]);
             act[na] = sess[i]; tok[na] = t; idx[na] = i; na++;
         }
         if (!na) break;
@@ -176,12 +188,15 @@ static void generate_jobs_batched(server *s, job **jobs, uint32_t n) {
         free(content); free(reasoning); tool_calls_free(&calls);
         buf_free(&text[i]);
         if (sess[i]) ds4_session_free(sess[i]);
+        mon_end(s, jobs[i]->mon, fin, completion[i], -1, -1);
         job_finish(jobs[i]);
     }
 }
 
 void *worker_main(void *arg) {
     server *s = arg;
+    /* V4.1 + --batch N(≥2): 整个 worker 交给并发调度器(server_sched_v41.c); 下面的 V4 合批快路与单 job 圈不再走 */
+    if (ds4_engine_is_v41(s->engine) && s->batch_max >= 2) { v41_sched_run(s); return NULL; }
     for (;;) {
         job *j = dequeue(s);
         if (!j) break;

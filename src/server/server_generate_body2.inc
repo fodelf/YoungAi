@@ -25,6 +25,7 @@ decode_again:
         max_tokens = s->max_output_tokens;
     trace_event(s, trace_id, "prefill done; decode_max=%d ctx_room=%d", max_tokens, room);
     const double decode_t0 = now_sec();
+    mon_first_token(s, j->mon);   /* 监控: 预填完, 进入生成 */
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
     thinking_state thinking = thinking_state_from_prompt(&j->req);

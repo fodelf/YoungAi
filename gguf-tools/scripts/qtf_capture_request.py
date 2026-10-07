@@ -10,6 +10,7 @@
     market   <日期> [end_date] 重建大盘请求(end_date 不给就从当天大盘报告的日期行取); _note 带大盘真值
     cfo      <日期> <代码>     重建该股 CFO 请求(库里存的四份上游材料 + 与早盘同一套 CfoCrew 提示词); _note 带次日 OHLC
     ohlc     <代码> <日期>     打印 [日期, 日期+14 天] 的日线: date open high low close(一行一根)
+    corpus                    复盘全文 JSON {"docs":[{name,kind,text}]}: 大盘逐日汇总一篇 + 个股每条复盘一篇(后训练 ③ 第八版的料)
 
 为什么要它: 后训练 ③ 的料必须是产品真实请求(铁律: 产品问题只认真实请求)。09-23 起大盘请求已能逐字重建;
 2026-09-29 起 CFO 请求也能重建 —— 库里 recommendations.agent_outputs 存了早盘那一趟的四份上游报告
@@ -99,6 +100,78 @@ if CMD == "symbols":
 if CMD == "ohlc":
     for b in _bars(sys.argv[2], _date(sys.argv[3])):
         print("%s %s %s %s %s" % (b["date"], b["open"], b["high"], b["low"], b["close"]))
+    sys.exit(0)
+
+def _pct(x):
+    return "%+.2f%%" % (float(x or 0) * 100)
+
+
+def _corpus():
+    """★复盘全文(2026-10-01, 后训练 ③ 第八版 = 上下文蒸馏的料)★: 库里所有复盘按"人读的复盘记录"文体落成文档 ——
+    大盘逐日一篇汇总 + 个股每条复盘一篇(事实块 / 逐条修正与原因 / 修正后要点 / 当日材料节选 / 修正后报告全文)。
+    只读库。为什么不只取结论: 用户 10-01 纠正"我的前置文本很多的, 光一个时间判断什么" —— 要进权重的是整份复盘材料,
+    不是一条二元结论; 后训练让模型不看这些文本也能像看过一样回答(教师 = 同一部署模型把文档放进上下文)。"""
+    docs = []
+    rows = []
+    for d in db.market_reviews.find({}, {"_id": 0}).sort("date", 1):
+        dd = _date(d["date"])
+        pred = d.get("predicted_direction") or ""
+        ok = d.get("is_prediction_correct")
+        verdict = "当天没有早盘预测" if not pred else ("预测正确" if ok else ("预测错误" if ok is False else "涨跌家数持平, 不计对错"))
+        match = "与指数方向一致" if d.get("is_true_match") else "与指数方向不一致"
+        rows.append(
+            "%d年%d月%d日（%s）：上涨 %d 家，下跌 %d 家，平盘 %d 家，共 %d 只；涨跌比 %.2f；涨停 %d 家，跌停 %d 家；"
+            "%s %+.2f%%（指数方向：%s）。按涨跌家数口径，当日大盘真实方向为%s，%s。早盘预测：%s；%s。" % (
+                dd.year, dd.month, dd.day, d["date"], d["advancing_count"], d["declining_count"], d["flat_count"],
+                d["total_stocks"], float(d.get("advance_decline_ratio") or 0), d.get("limit_up_count", 0),
+                d.get("limit_down_count", 0), d.get("index_name", "上证指数"), float(d.get("index_change_pct") or 0),
+                d.get("index_direction", ""), d.get("true_direction", ""), match, pred or "无", verdict))
+    if rows:
+        docs.append({"name": "market_all", "kind": "market",
+                     "text": "【A股大盘每日复盘记录】判断口径：按上涨与下跌家数判断大盘真实涨跌，而不是只看指数。\n" + "\n".join(rows) + "\n"})
+    samples = {(s["symbol"], s["date"]): s for s in db.finetune_samples.find({}, {"_id": 0})}
+    seen = set()
+    for ls in db.lessons.find({}, {"_id": 0}).sort([("date", 1), ("symbol", 1)]):
+        key = (ls["symbol"], ls["date"])
+        seen.add(key)
+        s = samples.get(key, {})
+        name = ls.get("symbol_code") or s.get("symbol_code") or ""
+        rd = _date(ls["date"])
+        head = "【个股复盘】%s %s，复盘日 %d年%d月%d日（%s）" % (ls["symbol"], name, rd.year, rd.month, rd.day, ls["date"])
+        if s.get("added_date"):
+            ad = _date(s["added_date"])
+            head += "，决策日 %d年%d月%d日（%s）" % (ad.year, ad.month, ad.day, s["added_date"])
+        parts = [head, "一、复盘结论"]
+        if s.get("context"):
+            parts.append(s["context"])
+        parts.append("错误类型：%s；收盘相对目标价偏差 %s；预测目标价 %.2f，实际收盘 %.2f；是否由当日消息驱动：%s；信号标签：%s。" % (
+            ls.get("error_type", ""), _pct(ls.get("deviation_pct")), float(ls.get("predicted_target") or 0),
+            float(ls.get("actual_close") or 0), "是" if ls.get("news_attributable") else "否", "、".join(ls.get("signal_tags") or [])))
+        parts.append("教训：%s" % (ls.get("lesson") or ""))
+        parts.append("下次调整：%s" % (ls.get("action_for_next_time") or ""))
+        if s.get("edits"):
+            parts.append("二、对当日交易报告的逐条修正（原文 → 修正，及原因）")
+            for i, e in enumerate(s["edits"], 1):
+                parts.append("%d. 原文：%s\n   修正：%s\n   原因：%s" % (i, (e.get("old") or "").strip(), (e.get("new") or "").strip(), (e.get("why") or "").strip()))
+        hj = s.get("hindsight_json") or {}
+        if hj:
+            parts.append("三、修正后的决策要点：入场价 %s，目标价 %s，止损位 %s，风险回报比 %s，预期收益 %s。" % (
+                hj.get("entry_price"), hj.get("target_price"), hj.get("stop_loss"), hj.get("risk_return_ratio"), hj.get("expected_return")))
+        if s.get("body_prompt"):
+            parts.append("四、决策当日的输入材料（节选）\n" + s["body_prompt"].strip())
+        if s.get("body_report"):
+            parts.append("五、修正后的交易报告全文\n" + s["body_report"].strip())
+        docs.append({"name": "stock_%s_%s" % (ls["date"], ls["symbol"]), "kind": "stock", "text": "\n".join(parts) + "\n"})
+    for key, s in samples.items():   # 有样本没 lesson 的(按理不会有): 只放样本自己的字段, 不丢
+        if key in seen:
+            continue
+        docs.append({"name": "stock_%s_%s" % (key[1], key[0]), "kind": "stock",
+                     "text": "【个股复盘】%s %s\n%s\n%s\n" % (key[0], s.get("symbol_code", ""), s.get("context", ""), s.get("body_report", ""))})
+    print(json.dumps({"docs": docs}, ensure_ascii=False))
+
+
+if CMD == "corpus":
+    _corpus()
     sys.exit(0)
 
 if CMD not in ("market", "cfo"):

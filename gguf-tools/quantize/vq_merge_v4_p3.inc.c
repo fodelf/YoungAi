@@ -220,7 +220,8 @@ static int arg_is(const char *a, const char *name, const char **val) {
 
 int main(int argc, char **argv) {
     A.out_dir = "."; A.route_alpha = 2.5; A.blob_layers = "";
-    A.dql_host = "192.168.1.2"; A.dql_dir = "/Users/fodelf/ds4-main/gguf/go-onebit/layers";
+    /* 层件主机/目录没有默认值(2026-10-07 前写死了一台 Mac 的局域网 IP 和家目录): --merge 必须显式给, 见下方检查 */
+    A.dql_host = NULL; A.dql_dir = NULL;
 
     for (int i = 1; i < argc; i++) {
         const char *s = argv[i], *v = NULL;
@@ -257,6 +258,7 @@ int main(int argc, char **argv) {
     if (A.extract_blobs) { extract_blobs(); return 0; }
     if (A.extract_skeleton) extract_skeleton();
     else if (A.merge) {
+        if (!A.dql_host || !A.dql_dir) die("AssertionError: --merge 需 --dql-host 与 --dql-dir(本机用 --dql-host localhost)");
         if (!A.blob_sizes) die("AssertionError: --merge 需 --blob-sizes");
         if (!(A.down_offsets || A.no_down)) die("AssertionError: --merge 需 --down-offsets(或 --no-down)");
         merge();

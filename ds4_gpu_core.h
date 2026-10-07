@@ -71,9 +71,17 @@ int ds4_gpu_decode_readback_wait(void);
 void *ds4_gpu_host_alloc(uint64_t bytes);   /* pinned(CUDA)/普通 malloc(Metal) 主机内存 */
 void ds4_gpu_host_free(void *p);
 /* decode 双流并发: mark(主流,MoE 前) → begin(shared 段切侧流) → join(汇合) */
+void ds4_gpu_set_side_stream(int on);   /* 0 = 关侧流(--no-side-stream, 诊断 A/B: 输出逐字节同, 只换发法); 缺省开 */
 int ds4_gpu_side_mark(void);
 int ds4_gpu_side_begin(void);
 int ds4_gpu_side_main(void);
+/* ★N 条并发道(2026-09-30, 并发 batch.md)★: 合批解码里各请求的注意力缓存段互不相干(各读各的 KV), 串着发时每路那串小核填不满 48 个 SM。
+ * lanes_fork(n): 主流记 fork 事件、返回可用道数(0 = 不可用/捕获中, 调用方串行发) → lane_begin(i): 第 i 道等 fork, 之后的核落该道
+ * → lane_end(): 回主流(不汇合) → lanes_join(): 各道记 join 事件, 主流等全部。Metal 恒 0(串行)。 */
+int ds4_gpu_lanes_fork(int n);
+int ds4_gpu_lane_begin(int i);
+int ds4_gpu_lane_end(void);
+int ds4_gpu_lanes_join(void);
 int ds4_gpu_dspark_hc_mean_tensor(ds4_gpu_tensor *dst, const ds4_gpu_tensor *hc,
                                   uint32_t n_embd, uint32_t n_hc, uint32_t slot, uint32_t n_tokens);
 int ds4_gpu_dspark_attn_tensor(ds4_gpu_tensor *heads,
@@ -217,6 +225,8 @@ void ds4_gpu_set_expert_stage(int on);
 uint64_t ds4_gpu_recommended_max_working_set_bytes(void);
 /* Live GPU working-set (model wired + scratch). 0 on CPU build. */
 uint64_t ds4_gpu_current_allocated_bytes(void);
+/* 设备名(Metal: MTLDevice.name; CUDA: cudaDeviceProp.name), 初始化前是空串。服务端监控页(/metrics hardware_static.gpu_name)用。 */
+const char *ds4_gpu_device_name(void);
 /* P2.1 cross-layer router prediction prefetch (project.md): register one routed
  * MoE layer's router metadata so the backend can re-evaluate the next layer's
  * router on the CPU during decode and issue async read-ahead for the predicted
@@ -232,8 +242,12 @@ int ds4_gpu_register_layer_router(const void *model_map, uint32_t layer, uint64_
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 /* 同上, 但 [offset, offset+bytes) 恰好是一个 VQ 专家 blob(blk.L / mtp.T 的 ffn_exps_vq.blob): v3 blob 在设备副本里把每个载荷
  * 挪到"位流起点 128 B 对齐"的位置并重写槽表(盘上文件与主机映射不动), 专家核的位流整线读不再跨线。不是 v3 就平拷。
- * 只有 CUDA spark 的启动缓存(DS4_CUDA_SPARK_HBM_CACHE)调它; 其它后端没有这条路。 */
+ * 只有 CUDA 的启动缓存(core_model_map.c)调它; 其它后端没有这条路。 */
 int ds4_gpu_cache_vq_blob(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
+/* 1 = GPU 经主机页表访问整机内存的统一内存机器(GB10/Grace 类 ATS, 或 iGPU): 启动缓存按"整机内存 − 余量"收编全部
+ * 权重含专家; 0 = 独显: 显存是独立池, 只缓骨架、预算按显存算。2026-10-07 前这是编译宏 DS4_CUDA_SPARK_HBM_CACHE
+ * (make cuda-spark 才开), 同一源码 cuda-generic 编出来放到 GB10 上退化成只缓骨架; 改运行时判后两个 make 目标同义。 */
+int ds4_gpu_unified_memory_host(void);
 /* 已装进设备副本的总字节。超预算的段是静默走主机映射的(每步 5~25 ms 长尾, 见 single.md S1),
  * 所以起跑时必须拿它跟"请求装的字节"对账并打印。CUDA 以外的后端返回 0。 */
 uint64_t ds4_gpu_model_cache_bytes(void);

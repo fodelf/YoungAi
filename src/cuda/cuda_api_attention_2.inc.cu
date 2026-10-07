@@ -298,17 +298,8 @@ int ds4_gpu_attention_output_q8_batch_tensor(
     if (!out_a || !out_b) return 0;
 
     const __half *out_a_f16 = NULL;
-    uint32_t out_a_cublas_min_tokens = 2u;
-    const char *out_a_min_env = ((const char *)0) /* DS4_CUDA_ATTENTION_OUTPUT_A_CUBLAS_MIN: 路径开关已删(2026-08-22 隐形炸弹清理) */;
-    if (out_a_min_env && out_a_min_env[0]) {
-        char *endp = NULL;
-        long v = strtol(out_a_min_env, &endp, 10);
-        if (endp != out_a_min_env && v > 1 && v < 4096) out_a_cublas_min_tokens = (uint32_t)v;
-    }
-    if (!g_quality_mode &&
-        g_cublas_ready &&
-        n_tokens >= out_a_cublas_min_tokens &&
-        1) {
+    const uint32_t out_a_cublas_min_tokens = 2u;   /* ≥2 token 走 cuBLAS f16 影子(原 DS4_CUDA_ATTENTION_OUTPUT_A_CUBLAS_MIN 旋钮, 定死) */
+    if (!g_quality_mode && g_cublas_ready && n_tokens >= out_a_cublas_min_tokens) {
         out_a_f16 = cuda_q8_f16_ptr(model_map, out_a_offset, out_a_bytes, group_dim, low_dim, "attn_output_a");
     }
     if (out_a_f16) {

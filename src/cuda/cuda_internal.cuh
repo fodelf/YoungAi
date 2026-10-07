@@ -3,15 +3,36 @@
  * 单 TU: 所有 .inc.cu 分片由 ds4_cuda.cu 按原文件顺序纹理包含, 行为零改动。 */
 #include <cuda_runtime.h>
 
-/* 网格封顶(2026-08-21 复查): 这些 384 是 08-20 在 decode 形状上标定的"48SM×4驻留块",
- * 属于写死的调优常量。做成可调以便复测(DS4_CUDA_GRID_CAP), 默认仍 384。 */
 /* decode 期只能在非 capture 时机分配的 scratch(split-K f16 partial 等)统一预建入口(定义在
  * cuda_api_matmul_1); token graph 开捕获前必须调一次 —— 否则第一次解码就在 capture 里,
  * 惰性分配被闸掉, kernel 走另一条归约序(09-05 定罪: 图/直发逐位分叉的根因)。 */
 static void cuda_decode_scratch_prepare(void);
-static unsigned ds4_grid_cap(void) {
+/* 本卡 SM 数(查一次缓存)。属性查不到就按 48 走(GB10 的数): 查不到只会发生在设备根本没起来的情况, 那时后面每一发核都会报错。 */
+static unsigned ds4_sm_count(void) {
     static unsigned v = 0u;
-    if (v == 0u) { const char *e = ((const char *)0) /* DS4_CUDA_GRID_CAP: 路径开关已删(2026-08-22 隐形炸弹清理) */; v = e ? (unsigned)atoi(e) : 384u; }
+    if (v == 0u) {
+        int dev = 0, n = 0;
+        (void)cudaGetDevice(&dev);
+        if (cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess || n <= 0) { (void)cudaGetLastError(); n = 48; }
+        v = (unsigned)n;
+    }
+    return v;
+}
+/* 网格封顶 = SM 数 × 8。08-20 阶梯审判在 decode 形状上定的 384(384 比 192 +4~8 GB/s)就是 48 SM × 8;
+ * 2026-10-07 前写死 384(DS4_CUDA_GRID_CAP 旋钮删后的残值), 换一块卡就按 GB10 的 SM 数封顶 —— 改按本卡 SM 数自量, GB10 上仍 384。 */
+static unsigned ds4_grid_cap(void) { return ds4_sm_count() * 8u; }
+/* 统一内存判据(运行时; 2026-10-07 前是编译宏 DS4_CUDA_SPARK_HBM_CACHE, make cuda-spark 才开): GPU 经主机页表访问整机内存
+ * (GB10/Grace 的 ATS)或 iGPU 共享内存(Jetson)时, "显存"就是整机内存 —— 启动缓存按整机内存减余量收编全部权重含专家;
+ * 独显(含开了 HMM 的: pageable access 可为 1 但 ATS 为 0)显存是独立池, 只缓骨架、预算按显存算。 */
+static int cuda_unified_memory_host(void) {
+    static int v = -1;
+    if (v < 0) {
+        int dev = 0, ats = 0, integ = 0;
+        (void)cudaGetDevice(&dev);
+        if (cudaDeviceGetAttribute(&ats, cudaDevAttrPageableMemoryAccessUsesHostPageTables, dev) != cudaSuccess) { (void)cudaGetLastError(); ats = 0; }
+        if (cudaDeviceGetAttribute(&integ, cudaDevAttrIntegrated, dev) != cudaSuccess) { (void)cudaGetLastError(); integ = 0; }
+        v = (ats || integ) ? 1 : 0;
+    }
     return v;
 }
 

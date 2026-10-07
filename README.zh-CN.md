@@ -586,6 +586,15 @@ SIDECAR=DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-vqfin41_vqhalf_a_n8192-en
 长思考段可能收不了口；在权重侧修好之前，不思考是安全的默认。
 别把贪心当聊天默认：在"合格答案很少"的题上，贪心会在思考段逐字打转停不下来（例：让它写 5 个以"五"字结尾的成语）。
 
+**监控页。** `http://主机:8000/monitor` 是引擎自己提供的浏览器页面（零依赖，与 API 同源）：模型状态（读提示 / 生成进度条）、
+解码与预填的 token/s 及一分钟火花线、GPU 负载 / 显存 / 温度 / 功耗 / PCIe、CPU、内存、磁盘读、上下文占用、最近请求
+（提示 / 复用 / 输出 token、t/s、草稿接受、首 token 延迟、用时）和开服以来的累计。数据来自 `GET /metrics`：默认 JSON
+（`?requests=all` 给全部保留的请求）；用 `Accept: text/plain` 或 `?format=prometheus` 请求就给 Prometheus 文本，
+指标名用 vLLM 的，给 vLLM 写的 Grafana 看板不改一行就能读这台服务。平台读不到的量（macOS 的 GPU 温度）给 `null`，不编数。
+统一内存机器（GB10）上"显存"卡显示的是物理内存（128 GB，取自内核的在线内存块），副标题带上内核自己能分配的量
+（121.7 GB，`MemTotal`）。页面中英双语（跟浏览器语言，可切换，`?lang=en`）。板块与指标键照 Strata 的 Monitor 页
+（github.com/Niko1221/Strata）对齐，两边可以并排对照。
+
 **命令行。**
 
 ```sh

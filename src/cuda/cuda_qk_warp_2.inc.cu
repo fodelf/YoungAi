@@ -264,16 +264,6 @@ int ds4_gpu_matmul_q4_K_tensor(
         (cuda_block_q8_K *)g_q4k_xq_sc, (const float *)x->ptr, (uint32_t)in_dim, (uint32_t)n_tok);
     /* A/B 三连档案: 16-lane 变体在小矩阵上仍输(18.84 vs 19.13) — dense 场景 32-lane
      * 恒胜, dev_dot 每块开销决定一切, lane 空转无关紧要。变体保留但不启用。 */
-    if (((const char *)0) /* DS4_Q4K_DIMS: 路径开关已删(2026-08-22 隐形炸弹清理) */) {
-        static uint64_t seen[64][2]; static int nseen = 0;
-        int hit = 0;
-        for (int i = 0; i < nseen; i++) if (seen[i][0] == in_dim && seen[i][1] == out_dim) { hit = 1; break; }
-        if (!hit && nseen < 64) {
-            seen[nseen][0] = in_dim; seen[nseen][1] = out_dim; nseen++;
-            fprintf(stderr, "ds4: [q4k-dims] in=%llu out=%llu ntok=%llu\n",
-                    (unsigned long long)in_dim, (unsigned long long)out_dim, (unsigned long long)n_tok);
-        }
-    }
     /* 09-07: 4/8/16 块的行(q_b/shexp_down/输出头等)走 tile 核: 整块/lane + 一 warp 多行, 微基准
      * 225→229~276 GB/s(cuda_q4k_tile.inc.cu 头注)。批量 n_tok 由 grid.y 承担。 */
     if (q4k_tile_supported(blocks, (uint32_t)out_dim))
@@ -287,7 +277,7 @@ int ds4_gpu_matmul_q4_K_tensor(
     /* 动态 shared: blocks≤32 时 kernel staging 需 8 warps×blocks×144B */
     const size_t q4k_shmem = (blocks <= 32u) ? (size_t)8u * blocks * 9u * sizeof(uint4) : 0;
     unsigned q4k_gx = (unsigned)((out_dim + 7u) / 8u);
-    if (q4k_gx > ds4_grid_cap()) q4k_gx = ds4_grid_cap();   /* 48 SM × 4 驻留块: 单 wave 满载, 行循环吃尾 */
+    if (q4k_gx > ds4_grid_cap()) q4k_gx = ds4_grid_cap();   /* SM 数 × 8 驻留块(本卡自量): 单 wave 满载, 行循环吃尾 */
     ds4_launch_pdl(matmul_q4_K_warp_kernel, dim3(q4k_gx, (unsigned)n_tok, 1), 256, q4k_shmem, g_cur_stream, 
         (float *)out->ptr, w, (const cuda_block_q8_K *)g_q4k_xq_sc,
         row_bytes, blocks, (uint32_t)out_dim);

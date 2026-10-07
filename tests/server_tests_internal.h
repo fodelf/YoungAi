@@ -119,5 +119,12 @@ void test_thinking_canonical_empty_content(void);
 void test_thinking_canonical_multi_turn(void);
 void test_thinking_canonical_with_tools_preserves_reasoning(void);
 void test_thinking_canonical_non_thinking_mode_noop(void);
+/* 监控(tests/server_tests_monitor.c) */
+void test_monitor_request_lifecycle_reaches_metrics(void);
+void test_monitor_recent_requests_default_twelve_or_all(void);
+void test_monitor_prometheus_text_uses_vllm_names(void);
+void test_monitor_accept_header_selects_prometheus(void);
+void test_monitor_http_route_selects_json_or_prometheus(void);
+void test_monitor_page_route_serves_html(void);
 void ds4_server_unit_tests_run(void);
 #endif /* DS4_SERVER_TESTS_INTERNAL_H */

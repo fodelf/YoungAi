@@ -32,13 +32,6 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
         return NULL;
     }
     g_model_arenas.push_back({(char *)dev, chunk, aligned});
-    if (((const char *)0) /* DS4_CUDA_WEIGHT_CACHE_VERBOSE: 诊断开关已删(2026-08-22) */) {
-        uint64_t arena_bytes = 0;
-        for (const cuda_model_arena &a : g_model_arenas) arena_bytes += a.bytes;
-        fprintf(stderr, "ds4: CUDA model arena allocated %.2f MiB (arenas %.2f GiB)\n",
-                (double)chunk / 1048576.0,
-                (double)arena_bytes / 1073741824.0);
-    }
     return (char *)dev;
 }
 
@@ -61,15 +54,8 @@ static const char *cuda_model_range_ptr_from_fd(
     if (g_model_fd < 0 || bytes == 0) return NULL;
     if (g_model_fd_host_base != NULL && model_map != g_model_fd_host_base) return NULL;
     const uint64_t limit = cuda_model_cache_limit_bytes();
-    if (g_model_range_bytes > limit || bytes > limit - g_model_range_bytes) {
-        if (((const char *)0) /* DS4_CUDA_WEIGHT_CACHE_VERBOSE: 诊断开关已删(2026-08-22) */) {
-            fprintf(stderr, "ds4: CUDA direct %s %.2f MiB (cache budget %.2f GiB exhausted)\n",
-                    what ? what : "weights",
-                    (double)bytes / 1048576.0,
-                    (double)limit / 1073741824.0);
-        }
+    if (g_model_range_bytes > limit || bytes > limit - g_model_range_bytes)
         return cuda_model_direct_fallback_ptr(model_map, offset);
-    }
 
     char *dev = cuda_model_arena_alloc(bytes, what);
     if (!dev) {
@@ -140,12 +126,6 @@ static const char *cuda_model_range_ptr_from_fd(
     g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
     cuda_model_load_progress_note(g_model_range_bytes);
-    if (((const char *)0) /* DS4_CUDA_WEIGHT_CACHE_VERBOSE: 诊断开关已删(2026-08-22) */) {
-        fprintf(stderr, "ds4: CUDA fd-cached %s %.2f MiB (total %.2f GiB)\n",
-                what ? what : "weights",
-                (double)bytes / 1048576.0,
-                (double)g_model_range_bytes / 1073741824.0);
-    }
     return (const char *)dev;
 }
 
@@ -199,7 +179,6 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
     }
 
     uint64_t copied = 0;
-    double last_report = t0;
     while (copied < map_size) {
         const uint64_t n = (map_size - copied < chunk) ? (map_size - copied) : chunk;
         const uint64_t off = map_offset + copied;
@@ -215,13 +194,6 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
         }
         cuda_model_discard_source_pages(model_map, model_size, off, n);
         copied += n;
-        const double now = cuda_wall_sec();
-        if (((const char *)0) /* DS4_CUDA_MODEL_COPY_VERBOSE: 诊断开关已删(2026-08-22) */ != NULL && now - last_report >= 2.0) {
-            fprintf(stderr, "ds4: CUDA model chunk copy %.2f/%.2f GiB\n",
-                    (double)copied / 1073741824.0,
-                    (double)map_size / 1073741824.0);
-            last_report = now;
-        }
     }
 
     (void)cudaFreeHost(stage);

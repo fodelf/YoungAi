@@ -45,22 +45,6 @@ static int cuda_vq_moe_forward(
                     }
                 }
             }
-            if (((const char *)0) /* DS4_VQ_DEBUG: 诊断开关已删(2026-08-22) */) {
-                fprintf(stderr, "ds4: [vq-reloc] L%u blob %s arena\n", layer_index,
-                        reloc[layer_index] ? "->" : "NOT in");
-                if (!reloc[layer_index] && (const char *)blob >= (const char *)model_map) {
-                    const uint64_t off_ = (uint64_t)((const char *)blob - (const char *)model_map);
-                    fprintf(stderr, "ds4: [vq-reloc]   off=%llu bytes=%llu nranges=%zu\n",
-                            (unsigned long long)off_, (unsigned long long)residual->vq_bytes,
-                            g_model_ranges.size());
-                    for (const cuda_model_range &r : g_model_ranges) {
-                        if (r.host_base == model_map && off_ >= r.offset && off_ < r.offset + r.bytes)
-                            fprintf(stderr, "ds4: [vq-reloc]   in-range off=%llu bytes=%llu (blob end %s)\n",
-                                    (unsigned long long)r.offset, (unsigned long long)r.bytes,
-                                    (off_ + residual->vq_bytes <= r.offset + r.bytes) ? "inside" : "OVERFLOWS");
-                    }
-                }
-            }
         }
         if (reloc[layer_index]) blob = reloc[layer_index];
     }
@@ -77,15 +61,6 @@ static int cuda_vq_moe_forward(
                     (unsigned long long)selected->bytes, (unsigned long long)weights->bytes,
                     (unsigned long long)x->bytes, (unsigned long long)out->bytes,
                     (unsigned long long)down_offset, (unsigned long long)down_expert_bytes);
-            if (((const char *)0) /* DS4_VQ_ROUTE_DIAG: 路径开关已删(2026-08-22 隐形炸弹清理) */) {
-                int32_t sel[8] = {0}; float wt[8] = {0};
-                uint32_t ns = n_expert < 8u ? n_expert : 8u;
-                (void)ds4_gpu_tensor_read((ds4_gpu_tensor *)selected, 0, sel, ns * sizeof(int32_t));
-                (void)ds4_gpu_tensor_read((ds4_gpu_tensor *)weights, 0, wt, ns * sizeof(float));
-                fprintf(stderr, "ds4: [vq-route] t0 sel=%d %d %d %d %d %d w=%.3f %.3f %.3f %.3f %.3f %.3f\n",
-                        sel[0], sel[1], sel[2], sel[3], sel[4], sel[5],
-                        wt[0], wt[1], wt[2], wt[3], wt[4], wt[5]);
-            }
             fflush(stderr);
         }
     }
@@ -115,24 +90,12 @@ static int cuda_vq_moe_forward(
     /* ---- decode 快路: 零 host 往返 ----
      * pair 数少时不去重, 每个 (token,pick) 各占一段 scratch, kernel 自己从 blob 读偏移。
      * selected 直接当 slot 用(第 k 个 pair 的权重就在第 k 段), 省掉 D2H + 去重 + H2D。 */
-    {   /* 诊断: DS4_VQ_EXP=1 只解位流(跳过码本+乘加), 用来二分定位耗时段 */
-        static int exp_set = 0;
-        if (!exp_set) {
-            exp_set = 1;
-            const char *ev = ((const char *)0) /* DS4_VQ_EXP: 路径开关已删(2026-08-22 隐形炸弹清理) */;
-            const int mode = ev ? atoi(ev) : 0;
-            if (mode) (void)cudaMemcpyToSymbol(g_vq_exp_mode, &mode, sizeof(int));
-            const int cyc_on = 0;
-            if (cyc_on) (void)cudaMemcpyToSymbol(g_vq_cyc_on, &cyc_on, sizeof(int));
-        }
-    }
     /* decode 直通链常驻缓冲: 非 capture 时机预分配(prefill/首调都行) */
     /* 融合路上限 8 token(09-07; 此前 4): 投机 verify 批 2..8 token 走逐 (token,专家) 的 fused2(grid.x=token),
      * 更大批(prefill)走 dequant+cuBLAS。并集去重两版(shared 装 n 份激活 / L2 去重)实测都不比逐 token 快 —— 逐 token 核
      * 24 对 406 µs = 278 GB/s 已超 DRAM 墙, 说明相邻 token 同专家的位流本就在 L2 命中; 并集代码已删(fable5 09-07)。 */
     const uint32_t fuse_max = 8u;
     if (n_tokens <= fuse_max && n_tokens > 0) {
-        const double prof_t0 = ((const char *)0) /* DS4_VQ_PROF: 路径开关已删(2026-08-22 隐形炸弹清理) */ ? cuda_wall_sec() : 0.0;
         /* 融合路: 不需要任何 dequant scratch, 只要 h 的中间缓冲 */
         const uint64_t hneed = npair * expert_mid_dim * sizeof(float);
         if (!mid_scratch || mid_scratch->bytes < hneed) {
@@ -198,8 +161,6 @@ static int cuda_vq_moe_forward(
             ds4_launch_pdl(vq2_down_reduce_kernel, dim3((out_dim + 255u) / 256u, n_tokens, 1), 256, 0, 0, 
                 (float *)out->ptr, g_vq_partial, (const int32_t *)selected->ptr,
                 (const float *)weights->ptr, n_expert, out_dim);
-            if (((const char *)0) /* DS4_VQ_DEBUG: 诊断开关已删(2026-08-22) */)
-                fprintf(stderr, "ds4: [cuda-vq-fuse2] L%u ntok=%u\n", layer_index, n_tokens);
             return cuda_ok(cudaGetLastError(), "vq fused2 launch");
         }
         vq2_skip:;
@@ -211,23 +172,6 @@ static int cuda_vq_moe_forward(
             (float *)mid_scratch->ptr, blob, (const int32_t *)selected->ptr,
             (const float *)weights->ptr, (const float *)x->ptr,
             n_expert, expert_in_dim, expert_mid_dim, clamp);
-        if (((const char *)0) /* DS4_VQ_ROUTE_DIAG: 路径开关已删(2026-08-22 隐形炸弹清理) */ && layer_index == (uint32_t)atoi(((const char *)0) /* DS4_VQ_ROUTE_DIAG: 路径开关已删(2026-08-22 隐形炸弹清理) */)) {
-            (void)cudaDeviceSynchronize();
-            float xm[8] = {0}, hm[8] = {0};
-            (void)cudaMemcpy(xm, x->ptr, sizeof(xm), cudaMemcpyDeviceToHost);
-            (void)cudaMemcpy(hm, mid_scratch->ptr, sizeof(hm), cudaMemcpyDeviceToHost);
-            fprintf(stderr, "ds4: [vq-mid] x=%.4g %.4g %.4g %.4g h=%.4g %.4g %.4g %.4g\n",
-                    xm[0], xm[1], xm[2], xm[3], hm[0], hm[1], hm[2], hm[3]);
-            FILE *fx = fopen("/tmp/vq_x.bin", "wb");
-            if (fx) { float *xb = (float *)malloc(4096 * 4); cudaMemcpy(xb, x->ptr, 4096 * 4, cudaMemcpyDeviceToHost); fwrite(xb, 4, 4096, fx); fclose(fx); free(xb); }
-            FILE *fh = fopen("/tmp/vq_h.bin", "wb");
-            if (fh) { float *hb = (float *)malloc(6 * 2048 * 4); cudaMemcpy(hb, mid_scratch->ptr, 6 * 2048 * 4, cudaMemcpyDeviceToHost); fwrite(hb, 4, 6 * 2048, fh); fclose(fh); }
-            FILE *fs = fopen("/tmp/vq_sel.bin", "wb");
-            if (fs) { int32_t sb[8] = {0}; float wb[8] = {0};
-                cudaMemcpy(sb, selected->ptr, 6 * 4, cudaMemcpyDeviceToHost);
-                cudaMemcpy(wb, weights->ptr, 6 * 4, cudaMemcpyDeviceToHost);
-                fwrite(sb, 4, 6, fs); fwrite(wb, 4, 6, fs); fclose(fs); }
-        }
         if (!g_vq_partial) { (void)cudaGetLastError(); return 0; }
         vq_moe_down_fused_kernel<<<dim3(n_tokens, zd, n_expert), 32 * DS4_VQ_WARPS_PER_BLOCK,
             (size_t)DS4_VQ_WARPS_PER_BLOCK * DS4_VQ_BITWORDS * sizeof(uint32_t)
@@ -238,37 +182,6 @@ static int cuda_vq_moe_forward(
         ds4_launch_pdl(vq2_down_reduce_kernel, dim3((out_dim + 255u) / 256u, n_tokens, 1), 256, 0, 0, 
             (float *)out->ptr, g_vq_partial, (const int32_t *)selected->ptr,
             (const float *)weights->ptr, n_expert, out_dim);
-        if (((const char *)0) /* DS4_VQ_ROUTE_DIAG: 路径开关已删(2026-08-22 隐形炸弹清理) */ && layer_index == (uint32_t)atoi(((const char *)0) /* DS4_VQ_ROUTE_DIAG: 路径开关已删(2026-08-22 隐形炸弹清理) */)) {
-            (void)cudaDeviceSynchronize();
-            FILE *fo = fopen("/tmp/vq_out.bin", "wb");
-            if (fo) { float *ob = (float *)malloc(4096 * 4); cudaMemcpy(ob, out->ptr, 4096 * 4, cudaMemcpyDeviceToHost); fwrite(ob, 4, 4096, fo); fclose(fo); free(ob); }
-        }
-        /* DS4_VQ_PROF=1: 逐层实测两个 kernel 的墙钟耗时。nsys 显示 gateup 的
-         * Max/Med = 10x、StdDev≈均值 —— 正常算力负载不会这样, 需要定位是哪些层/
-         * 哪种输入触发了长尾。计时本身要同步, 只在开关打开时付这个代价。 */
-        if (((const char *)0) /* DS4_VQ_PROF: 路径开关已删(2026-08-22 隐形炸弹清理) */) {
-            (void)cudaDeviceSynchronize();
-            const double t1 = cuda_wall_sec();
-            static double acc_ms = 0.0; static uint64_t nfwd = 0;
-            acc_ms += (t1 - prof_t0) * 1000.0; nfwd++;
-            fprintf(stderr, "[vqprof] L%-2u ntok=%u npair=%llu  %.3f ms  (累计 %.1f ms / %llu 次)\n",
-                    layer_index, n_tokens, (unsigned long long)npair,
-                    (t1 - prof_t0) * 1000.0, acc_ms, (unsigned long long)nfwd);
-        }
-        if (((const char *)0) /* DS4_VQ_CYC: 路径开关已删(2026-08-22 隐形炸弹清理) */ && layer_index == 42u) {
-            (void)cudaDeviceSynchronize();
-            unsigned long long c[3] = {0, 0, 0};
-            (void)cudaMemcpyFromSymbol(c, g_vq_cyc, sizeof(c));
-            if (c[2]) {
-                const double tot = (double)(c[0] + c[1]);
-                fprintf(stderr, "[vqcyc] 样本 %llu | 位流预取 %.0f cy/行 (%.1f%%) | 解码+乘加 %.0f cy/行 (%.1f%%)\n",
-                        c[2], (double)c[0] / c[2], 100.0 * c[0] / tot,
-                        (double)c[1] / c[2], 100.0 * c[1] / tot);
-            }
-        }
-        if (((const char *)0) /* DS4_VQ_DEBUG: 诊断开关已删(2026-08-22) */)
-            fprintf(stderr, "ds4: [cuda-vq-fuse] L%u ntok=%u npair=%llu (零 dequant scratch)\n",
-                    layer_index, n_tokens, (unsigned long long)npair);
         return cuda_ok(cudaGetLastError(), "vq fused launch");
     }
 

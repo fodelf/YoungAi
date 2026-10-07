@@ -50,6 +50,7 @@ static void cli_v41_set_sampling(const cli_config *cfg) {
     ds4_engine_set_decode_sampling(&sp);
 }
 int run_v41_generation(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
+    if (cfg->gen.multi_probe > 0) return run_v41_multi_probe(engine, cfg, prompt);   /* 并发探针(cli_multi.c): 提示已按模板渲染好 */
     cli_v41_set_sampling(cfg);
     ds4_engine_v41_set_prof(cfg->gen.v41_prof);
     ds4_engine_v41_set_decoder_full(cfg->gen.decoder_full);

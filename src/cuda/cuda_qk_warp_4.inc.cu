@@ -26,9 +26,7 @@ int ds4_gpu_matmul_q2_K_tensor(
         if (cudaMalloc(&g_q4k_xq_sc, xq_need) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
         g_q4k_xq_bytes = xq_need;
     }
-    static uint32_t q2fu = 99u;
-    if (q2fu == 99u) { const char *e = ((const char *)0) /* DS4_Q2K_FUSEQ: 路径开关已删(2026-08-22 隐形炸弹清理) */; q2fu = e ? (uint32_t)atoi(e) : 1u; }
-    const int fused = (q2fu && n_tok == 1);   /* 碎片税刀①: decode 融合量化免独立发射 */
+    const int fused = (n_tok == 1);   /* 碎片税刀①: decode 融合量化免独立发射(原 DS4_Q2K_FUSEQ 旋钮, 定死开) */
     if (!fused)
         ds4_launch_pdl(q8_K_quantize_kernel, dim3(blocks, (unsigned)n_tok, 1), 256, 0, g_cur_stream, 
             (cuda_block_q8_K *)g_q4k_xq_sc, (const float *)x->ptr, (uint32_t)in_dim, (uint32_t)n_tok);
@@ -37,23 +35,11 @@ int ds4_gpu_matmul_q2_K_tensor(
     size_t q2sh = (blocks <= 32u && (blocks & 3u) == 0u)
                         ? (size_t)8u * (blocks * 84u / 16u) * sizeof(uint4) : 0u;
     if (fused) q2sh += (size_t)blocks * sizeof(cuda_block_q8_K);
-    static uint32_t q2lv = 99u;
-    if (q2lv == 99u) { const char *e = ((const char *)0) /* DS4_Q2K_STAGE: 路径开关已删(2026-08-22 隐形炸弹清理) */; q2lv = e ? (uint32_t)atoi(e) : 2u; }
-    if (((const char *)0) /* DS4_F16_DIMS: 路径开关已删(2026-08-22 隐形炸弹清理) */) {   /* 诊断: dense q2 形状(与 q4k 同款) */
-        static uint64_t q2seen[64][2]; static int q2n = 0;
-        int hit = 0;
-        for (int i = 0; i < q2n; i++) if (q2seen[i][0] == in_dim && q2seen[i][1] == out_dim) { hit = 1; break; }
-        if (!hit && q2n < 64) {
-            q2seen[q2n][0] = in_dim; q2seen[q2n][1] = out_dim; q2n++;
-            fprintf(stderr, "ds4: [q2k-dims] in=%llu out=%llu blocks=%u ntok=%llu\n",
-                    (unsigned long long)in_dim, (unsigned long long)out_dim, blocks, (unsigned long long)n_tok);
-        }
-    }
+    const uint32_t q2lv = 2u;    /* staging 档(原 DS4_Q2K_STAGE 旋钮, 定死 2) */
     /* 刀⑤已回滚(2026-08-20): blocks≤4 rowlane 实测 33.52→30.45 且行为复读(疑数值), 撤。 */
-    static uint32_t q2mb = 999u;
-    if (q2mb == 999u) { const char *e = ((const char *)0) /* DS4_Q2K_SPLIT_MAXBLK: 路径开关已删(2026-08-22 隐形炸弹清理) */; q2mb = e ? (uint32_t)atoi(e) : 16u; }
-    static uint32_t q2ca = 99u;
-    if (q2ca == 99u) { const char *e = ((const char *)0) /* DS4_Q2K_CPASYNC: 路径开关已删(2026-08-22 隐形炸弹清理) */; q2ca = e ? (uint32_t)atoi(e) : 0u; }   /* 默认关: 实测7192→7646µs反向(混合访问实际墙~190, 非延迟问题) */
+    const uint32_t q2mb = 16u;   /* 半块/整块分界(原 DS4_Q2K_SPLIT_MAXBLK) */
+    /* cp.async 双缓冲判负存档(原 DS4_Q2K_CPASYNC, 定死关): 实测 7192→7646 µs 反向(混合访问实际墙 ~190, 非延迟问题) */
+    const uint32_t q2ca = 0u;
     if (q2ca && !fused && q2lv >= 2u && blocks <= 32u && (blocks & 3u) == 0u) {
         /* dot微架构刀①: cp.async 双缓冲(shared ×2), 数学与 staged 路逐位一致 */
         const size_t cash = (size_t)16u * (blocks * 84u / 16u) * sizeof(uint4);
@@ -63,12 +49,10 @@ int ds4_gpu_matmul_q2_K_tensor(
         return cuda_ok(cudaGetLastError(), "dense q2_K cpasync matmul launch");
     }
     /* 大批走分片 GEMM(2026-08-21): 激活按 tile 进 shared, 块内 8 warp 共用。
-     * 门限 DS4_Q2K_TILED_MIN(默认 16): 小批(decode/verify)继续走老路 —— 那条已与 decode
+     * 门限 16 token: 小批(decode/verify)继续走老路 —— 那条已与 decode
      * 逐位对齐, 不动。fused(n_tok==1 融合量化)与非 staging 档也不走。 */
-    static uint32_t tmin = 0u;
-    if (tmin == 0u) { const char *e = ((const char *)0) /* DS4_Q2K_TILED_MIN: 路径开关已删(2026-08-22 隐形炸弹清理) */; tmin = e ? (uint32_t)atoi(e) : 16u; }
-    if (!fused && q2lv && n_tok >= tmin && blocks <= 32u && (blocks & 3u) == 0u &&
-        1) {
+    const uint32_t tmin = 16u;
+    if (!fused && q2lv && n_tok >= tmin && blocks <= 32u && (blocks & 3u) == 0u) {
         const size_t wsh_bytes = (size_t)8u * (blocks * 84u / 16u) * sizeof(uint4);
         const size_t budget = 96u * 1024u;
         uint32_t tile = (uint32_t)((budget - wsh_bytes) / ((size_t)blocks * sizeof(cuda_block_q8_K)));
@@ -78,29 +62,24 @@ int ds4_gpu_matmul_q2_K_tensor(
             const size_t sh = wsh_bytes + (size_t)tile * blocks * sizeof(cuda_block_q8_K);
             if (q2k_tiled_set_smem(blocks, (int)sh)) {
                 unsigned gx = (unsigned)((out_dim + 7u) / 8u);
-                static uint32_t tgx = 0u;
-                if (tgx == 0u) { const char *e = ((const char *)0) /* DS4_Q2K_TILED_BLOCKS: 路径开关已删(2026-08-22 隐形炸弹清理) */; tgx = e ? (uint32_t)atoi(e) : 512u; }
-                if (gx > tgx) gx = tgx;
+                if (gx > 512u) gx = 512u;   /* 分片核网格封顶(原 DS4_Q2K_TILED_BLOCKS 旋钮) */
                 q2k_tiled_launch(gx, sh, (float *)out->ptr, w, (const cuda_block_q8_K *)g_q4k_xq_sc,
                                  row_bytes, blocks, (uint32_t)out_dim, (uint32_t)n_tok, tile, q2lv, q2mb);
                 return cuda_ok(cudaGetLastError(), "dense q2_K tiled matmul launch");
             }
         }
     }
-    /* 权重驻留批: 多 token 时 grid.y=1, 块内循环 token(权重只读一遍)。
-     * DS4_Q2K_NO_WSTAT=1 回旧 grid.y=n_tok 路。 */
+    /* 权重驻留批: 多 token 时 grid.y=1, 块内循环 token(权重只读一遍)。 */
     /* 门限(2026-08-21): 权重驻留省带宽但把 grid.y 折成 1 ⇒ 小矩阵并行度不足
-     * (out=512 只剩 64 block / 48 SM)。仅当行块数够铺满设备时才驻留。 */
-    static uint32_t wsmin = 0u;
-    if (wsmin == 0u) { const char *e = ((const char *)0) /* DS4_Q2K_WSTAT_MINGX: 诊断开关已删(2026-08-22) */; wsmin = e ? (uint32_t)atoi(e) : 192u; }
-    const uint32_t wstat = (n_tok > 1u && gx >= wsmin && ((const char *)0) /* DS4_Q2K_NO_WSTAT: 诊断开关已删(2026-08-22) */ == NULL) ? (uint32_t)n_tok : 1u;
+     * (out=512 只剩 64 block / 48 SM)。仅当行块数够铺满设备(SM 数 × 4 驻留块, 48 SM 上 = 192)时才驻留。 */
+    const uint32_t wsmin = ds4_sm_count() * 4u;
+    const uint32_t wstat = (n_tok > 1u && gx >= wsmin) ? (uint32_t)n_tok : 1u;
     /* 驻留批解除 384 封顶(2026-08-21): 该上限是 decode(grid.y=n_tok 已铺满)的在飞调优;
      * 驻留批 grid.y=1 时封顶 ⇒ 每 warp 1.33 行的尾波(x16 kernel 精确覆盖零尾波是其
      * 126 vs 52 GB/s 的差之一)。 */
-    if (wstat > 1u && 1) gx = (unsigned)((out_dim + 7u) / 8u);
-    /* 分组数: 让 gx×组数 ≥ 目标块数(默认 1024 ≈ 48SM×4块×5波), 组内仍权重驻留。 */
-    static uint32_t wsblk = 0u;
-    if (wsblk == 0u) { const char *e = ((const char *)0) /* DS4_Q2K_WSTAT_BLOCKS: 诊断开关已删(2026-08-22) */; wsblk = e ? (uint32_t)atoi(e) : 1024u; }
+    if (wstat > 1u) gx = (unsigned)((out_dim + 7u) / 8u);
+    /* 分组数: 让 gx×组数 ≥ 目标块数(SM 数 × 4 块 × 5 波, 48 SM 上 = 1024), 组内仍权重驻留。 */
+    const uint32_t wsblk = ds4_sm_count() * 20u;
     uint32_t ygroups = 1u, tpg = wstat;
     if (wstat > 1u && gx < wsblk) {
         ygroups = (wsblk + gx - 1u) / gx;
@@ -108,10 +87,8 @@ int ds4_gpu_matmul_q2_K_tensor(
         tpg = (wstat + ygroups - 1u) / ygroups;
         ygroups = (wstat + tpg - 1u) / tpg;
     }
-    /* K 切分: 仅在块数不足(小 out_dim)且 blocks 够分时启用; 默认阈值 1024 块。 */
-    static uint32_t ksp_max = 99u, ksp_min_blocks = 0u;
-    if (ksp_max == 99u) { const char *e = ((const char *)0) /* DS4_Q2K_KSPLIT: 路径开关已删(2026-08-22 隐形炸弹清理) */; ksp_max = e ? (uint32_t)atoi(e) : 1u; }
-    if (ksp_min_blocks == 0u) { const char *e = ((const char *)0) /* DS4_Q2K_KSPLIT_BLOCKS: 路径开关已删(2026-08-22 隐形炸弹清理) */; ksp_min_blocks = e ? (uint32_t)atoi(e) : 1024u; }
+    /* K 切分(原 DS4_Q2K_KSPLIT 旋钮, 定死 1 = 不切): 仅在块数不足(小 out_dim)且 blocks 够分时启用; 阈值 1024 块。 */
+    const uint32_t ksp_max = 1u, ksp_min_blocks = 1024u;
     uint32_t ks = 1u;
     float *part = NULL;
     /* 只对走"整块 else 分支"的矩阵切 K(blocks > split_maxblk, 即 o_b 的 32 块):
@@ -175,9 +152,7 @@ static int q2k_matmul_from_xq(ds4_gpu_tensor *out, const void *model_map, uint64
     if (!w) return 0;
     unsigned gx = (unsigned)((out_dim + 7u) / 8u);
     if (gx > ds4_grid_cap()) gx = ds4_grid_cap();   /* 08-20 阶梯审判: 384 比 192 +4-8GB/s(V1 222→229/V2 226→230) */
-    static uint32_t q2lv = 99u, q2mb = 999u;
-    if (q2lv == 99u) { const char *e = ((const char *)0) /* DS4_Q2K_STAGE: 路径开关已删(2026-08-22 隐形炸弹清理) */; q2lv = e ? (uint32_t)atoi(e) : 2u; }
-    if (q2mb == 999u) { const char *e = ((const char *)0) /* DS4_Q2K_SPLIT_MAXBLK: 路径开关已删(2026-08-22 隐形炸弹清理) */; q2mb = e ? (uint32_t)atoi(e) : 16u; }
+    const uint32_t q2lv = 2u, q2mb = 16u;   /* 与单矩阵入口同一档(staging 2 / 半块整块分界 16) */
     size_t q2sh = (blocks <= 32u && (blocks & 3u) == 0u)
                         ? (size_t)8u * (blocks * 84u / 16u) * sizeof(uint4) : 0u;
     if (xraw) q2sh += (size_t)blocks * sizeof(cuda_block_q8_K);
@@ -208,12 +183,8 @@ int ds4_gpu_matmul_q2_K_pair_tensor(
         if (cudaMalloc(&g_q4k_xq_sc, xq_need) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
         g_q4k_xq_bytes = xq_need;
     }
-    static uint32_t pfu = 99u;
-    if (pfu == 99u) { const char *e = ((const char *)0) /* DS4_Q2K_FUSEQ: 路径开关已删(2026-08-22 隐形炸弹清理) */; pfu = e ? (uint32_t)atoi(e) : 1u; }
-    if (!pfu)
-        ds4_launch_pdl(q8_K_quantize_kernel, dim3(blocks, 1, 1), 256, 0, g_cur_stream, 
-            (cuda_block_q8_K *)g_q4k_xq_sc, (const float *)x->ptr, (uint32_t)in_dim, 1u);
-    const float *xr = pfu ? (const float *)x->ptr : NULL;
+    /* 融合量化定死开(原 DS4_Q2K_FUSEQ 旋钮): 两矩阵各自在核内量化 x, 不发独立的 q8_K_quantize_kernel */
+    const float *xr = (const float *)x->ptr;
     return q2k_matmul_from_xq(out0, model_map, model_size, off0, blocks, out0_dim, xr) &&
            q2k_matmul_from_xq(out1, model_map, model_size, off1, blocks, out1_dim, xr);
 }

@@ -294,7 +294,9 @@ for NB in "$@"; do
       # 第五字段 = ③ 后训练目录(三文件部署的第三件, 2026-09-13 夜)。守门尺"不忘老本事"就靠这个档:
       # 同一把判决料, ②态 vs ②+③态, 比 Same top / KLD 退了多少。
       if [ -n "${PTD:-}" ]; then
-          [ -s "$PTD/gr_L39.bin" ] || { LOG "★后训练目录 $PTD 里没有 gr_L39.bin, 不判★"; continue; }
+          # ③ 两种形态(10-01): 增益表 gr_Lnn.bin 或低秩放大器 amp_Lnn.bin(引擎 --posttrain 两种都读, 与 ② 按秩拼接), 有其一就判
+          # 两个 glob 分开查: ls 对多个参数只要有一个不存在就非零退出, 合在一起查等于要求两种文件都在
+          ls "$PTD"/gr_L*.bin >/dev/null 2>&1 || ls "$PTD"/amp_L*.bin >/dev/null 2>&1 || { LOG "★后训练目录 $PTD 里既没有 gr_Lnn.bin 也没有 amp_Lnn.bin, 不判★"; continue; }
           ZARG="$ZARG --posttrain $PTD"; SFX="${SFX}_pt_$(basename "$PTD")"
       fi
       [ -n "${EBIN:-}" ] && SFX="${SFX}_bin_$(basename "$EBIN")"
@@ -302,7 +304,10 @@ for NB in "$@"; do
       LOG "② 学生 = 引擎 $(basename "$GG")${ARMD:+ + 放大器 $(basename "$ARMD")}${EBIN:+ 二进制 $EBIN} (判决料 $(basename "$IDS") n=$NTOK)"
       run_eng "$STU" "$GG" "$ZARG" "stu_${TAG}_eng${SFX}" "${EBIN:+$ROOT/$EBIN}" || continue
       LOG "③ 五指标 引擎 $(basename "$GG" .gguf)${SFX}"
-      "$AM" --ref-raw "$REF" --ids "$IDS" --student "$STU" || { LOG "★判决失败★"; FAIL=$((${FAIL:-0}+1)); }
+      # 逐位行(位置 kld Σmin same …)落在学生文件旁: 两臂配对算标准误用(z_nightly kd_wt2_se, 10-03) —— 五指标是 512 个位置的平均,
+      #   相邻两份 ③ 的 Σmin 差 1pp 在不在噪声里, 只有逐位配对才答得出
+      "$AM" --ref-raw "$REF" --ids "$IDS" --student "$STU" --row-out "${STU%.bin}.rows" || { LOG "★判决失败★"; FAIL=$((${FAIL:-0}+1)); }
+      LOG "逐位行 → ${STU%.bin}.rows"
       continue;;
     engamp:*) # 引擎反修档(2026-09-13): engamp:<拟合ids>:<拟合ntok>[:<gguf>[:<白化 0/1/2>[:<层数>[:<模式>]]]]
       # ②a v41_amp_run 在引擎真前向上序贯解放大器(FP 靶用 HF 出厂权重当场算, 解算器与 Python 路同一份 CUDA 源)

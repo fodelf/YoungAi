@@ -8,6 +8,7 @@
 /cap_raw2npy
 /dump_gguf_meta
 /vq_em
+/rplan_solve
 /.build/
 quantize/quantize_gpu.o
 quantize/vq_gpu.o
@@ -50,5 +51,7 @@ data/corpus/sci/
 data/corpus/calib_v2*.txt
 data/corpus/hot_*.txt
 data/corpus/*.dat
+# 后训练③的料: 交易产品的每日复盘/行情问答(review_*/), 是用户产品的业务数据, 由 kd 链按日重建, 不进仓库
+data/posttrain/
 migrate/zlayer_fixtures/
 migrate/pubbench_extract_test

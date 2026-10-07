@@ -29,9 +29,9 @@ V41_STUB(ds4_gpu_v41_rope_tensor, ds4_gpu_tensor *x, const ds4_gpu_tensor *pos, 
 V41_STUB(ds4_gpu_v41_act_quant_fp8_tensor, ds4_gpu_tensor *x, uint32_t n_rows, uint32_t dim, uint32_t block)
 V41_STUB(ds4_gpu_v41_act_quant_fp4_tensor, ds4_gpu_tensor *x, uint32_t n_rows, uint32_t dim, uint32_t block, bool e4m3_scale)
 V41_STUB(ds4_gpu_v41_compress_pool_tensor, ds4_gpu_tensor *out, const ds4_gpu_tensor *kv, const ds4_gpu_tensor *score, uint32_t n_tok, uint32_t ratio, uint32_t dim)
-V41_STUB(ds4_gpu_v41_indexer_score_tensor, ds4_gpu_tensor *score, const ds4_gpu_tensor *q, const ds4_gpu_tensor *k, const ds4_gpu_tensor *weights, const ds4_gpu_tensor *cand_mask, uint32_t n_tok, uint32_t pos0, uint32_t ng, uint32_t n_head, uint32_t dk, uint32_t ratio, const ds4_gpu_tensor *posd)
-V41_STUB(ds4_gpu_v41_candidate_blocks_tensor, ds4_gpu_tensor *mask, const ds4_gpu_tensor *score, uint32_t n_tok, uint32_t pos0, uint32_t ng, uint32_t ratio, uint32_t topk_blocks, uint32_t block_size, const ds4_gpu_tensor *posd)
-V41_STUB(ds4_gpu_v41_indexer_topk_tensor, ds4_gpu_tensor *idx, const ds4_gpu_tensor *score, uint32_t n_tok, uint32_t ng, uint32_t topk, uint32_t ratio, const ds4_gpu_tensor *posd)
+V41_STUB(ds4_gpu_v41_indexer_score_tensor, ds4_gpu_tensor *score, const ds4_gpu_tensor *q, const ds4_gpu_tensor *k, const ds4_gpu_tensor *weights, const ds4_gpu_tensor *cand_list, uint32_t cand_bs, uint32_t cand_cap, uint32_t n_tok, uint32_t pos0, uint32_t ng, uint32_t n_head, uint32_t dk, uint32_t ratio, const ds4_gpu_tensor *posd)
+V41_STUB(ds4_gpu_v41_candidate_blocks_tensor, ds4_gpu_tensor *cand_list, const ds4_gpu_tensor *score, uint32_t n_tok, uint32_t pos0, uint32_t ng, uint32_t ratio, uint32_t topk_blocks, uint32_t block_size, const ds4_gpu_tensor *posd)
+V41_STUB(ds4_gpu_v41_indexer_topk_tensor, ds4_gpu_tensor *idx, const ds4_gpu_tensor *score, uint32_t n_tok, uint32_t ng, uint32_t topk, uint32_t ratio, const ds4_gpu_tensor *posd, const ds4_gpu_tensor *cand_list, uint32_t cand_bs, uint32_t cand_cap)
 V41_STUB(ds4_gpu_v41_matmul_fp8blk_round_tensor, ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint32_t n_tok, int round_out)
 V41_STUB(ds4_gpu_v41_grouped_matmul_fp8blk_tensor, ds4_gpu_tensor *low, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n_groups, uint64_t group_dim, uint64_t rank, const ds4_gpu_tensor *heads, uint32_t n_tok, int round_out)
 V41_STUB(ds4_gpu_v41_head_colnorm_tensor, ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n_vocab, uint32_t n_embd)
@@ -63,10 +63,17 @@ V41_STUB(ds4_gpu_v41_hc_mean_tensor, ds4_gpu_tensor *out, const ds4_gpu_tensor *
 V41_STUB(ds4_gpu_v41_ring_rows_tensor, ds4_gpu_tensor *dst, const ds4_gpu_tensor *ring, uint32_t row_floats, uint32_t cap, uint32_t first_row, uint32_t count, const ds4_gpu_tensor *firstd)
 V41_STUB(ds4_gpu_v41_row_gather_tensor, ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t tab_offset, uint64_t n_rows, uint32_t dim, uint32_t elem_bytes, const ds4_gpu_tensor *ids, uint32_t which, uint32_t out_row)
 V41_STUB(ds4_gpu_v41_row_add_tensor, ds4_gpu_tensor *dst, uint64_t dst_row, const ds4_gpu_tensor *src, uint64_t n)
+V41_STUB(ds4_gpu_v41_mkcache_lookup_tensor, ds4_gpu_tensor *hit, ds4_gpu_tensor *cache_ids, ds4_gpu_tensor *next, const ds4_gpu_tensor *ids, uint32_t which, uint32_t n_slots)
+V41_STUB(ds4_gpu_v41_mkcache_add_tensor, ds4_gpu_tensor *logits, uint64_t row, const ds4_gpu_tensor *bias, ds4_gpu_tensor *cache, const ds4_gpu_tensor *hit, uint64_t n)
+V41_STUB(ds4_gpu_v41_matmul_bf16_skip_tensor, ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint32_t n_tok, const ds4_gpu_tensor *skip)
 V41_STUB(ds4_gpu_v41_compress_step_n_tensor, ds4_gpu_tensor *pooled, ds4_gpu_tensor *posg, ds4_gpu_tensor *cpre_kv, ds4_gpu_tensor *cpre_sc, ds4_gpu_tensor *snap_kv, ds4_gpu_tensor *snap_sc, const ds4_gpu_tensor *ckv, const ds4_gpu_tensor *csc, const ds4_gpu_tensor *posd, uint32_t ratio, uint32_t dim, uint32_t n)
 V41_STUB(ds4_gpu_v41_attn_scratch_prepare, uint32_t n_tok, uint32_t n_head, uint32_t head_dim)
 V41_STUB(ds4_gpu_v41_candidate_scratch_prepare, uint32_t n_tok, uint32_t nb)
+V41_STUB(ds4_gpu_v41_indexer_scratch_prepare, uint32_t n_tok, uint32_t n_head)
+void ds4_gpu_v41_set_indexer_mma(int on) { (void)on; }   /* Metal 没有 V4.1 打分核, 开关无处可落 */
 uint64_t ds4_gpu_v41_scratch_generation(void) { return 0; }   /* Metal 没有解码 graph, 暂存代号恒 0 */
+uint64_t ds4_gpu_v41_scratch_release(void) { return 0; }
+uint64_t ds4_gpu_v41_scratch_bytes(void) { return 0; }
 
 /* 解码整步 CUDA graph 原语(ds4_gpu_core.h, 2026-09-18): Metal 没有流捕获这一套, 捕获入口返回 0 ⇒ core 走直发;
  * 两个异步拷贝退成同步版(语义仍成立: 直发路 synchronize 之后读结果), host_func 直接调用(前面的命令先 flush)。 */
@@ -81,3 +88,39 @@ int ds4_gpu_tensor_write_zerocopy(ds4_gpu_tensor *t, uint64_t offset, const void
 void *ds4_gpu_host_device_ptr(void *pinned) { return pinned; }
 int ds4_gpu_tensor_read_zerocopy(void *pinned, const ds4_gpu_tensor *t, uint64_t offset, uint64_t bytes) { return ds4_gpu_tensor_read(t, offset, pinned, bytes); }
 V41_STUB(ds4_gpu_v41_moe_tail_tensor, ds4_gpu_tensor *y, const ds4_gpu_tensor *so, const ds4_gpu_tensor *weights, uint32_t n_tok, uint32_t n_used, uint32_t out_dim)
+/* 后训练反传原语(2026-10-01, ds4_gpu_bwd.h): 只有 CUDA */
+V41_STUB(ds4_gpu_bwd_matmul_t_tensor, ds4_gpu_tensor *gx, const void *model_map, uint64_t model_size, uint32_t wtype, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *gy, uint32_t n_tok, int accumulate)
+V41_STUB(ds4_gpu_bwd_grouped_matmul_t_tensor, ds4_gpu_tensor *gheads, const void *model_map, uint64_t model_size, uint32_t wtype, uint64_t weight_offset, uint32_t n_groups, uint64_t group_dim, uint64_t rank, const ds4_gpu_tensor *glow, uint32_t n_tok, int accumulate)
+V41_STUB(ds4_gpu_bwd_kl_topk_tensor, ds4_gpu_tensor *glogits, ds4_gpu_tensor *loss, const ds4_gpu_tensor *logits, uint32_t row0, uint32_t m, uint32_t n_vocab, const ds4_gpu_tensor *tid, const ds4_gpu_tensor *tp, const ds4_gpu_tensor *trest, const ds4_gpu_tensor *w, uint32_t k, float scale)
+V41_STUB(ds4_gpu_bwd_topk_tensor, ds4_gpu_tensor *tid, ds4_gpu_tensor *tp, ds4_gpu_tensor *trest, ds4_gpu_tensor *logits, uint32_t row0, uint32_t m, uint32_t n_vocab, uint32_t k)
+V41_STUB(ds4_gpu_bwd_rms_norm_tensor, ds4_gpu_tensor *gx, const ds4_gpu_tensor *gxn, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t dim, uint32_t n_tok, float eps, int accumulate)
+V41_STUB(ds4_gpu_bwd_hc_pre_tensor, ds4_gpu_tensor *ghc, ds4_gpu_tensor *gpre, const ds4_gpu_tensor *gx, const ds4_gpu_tensor *hc, const ds4_gpu_tensor *pre, uint32_t n_embd, uint32_t n_hc, uint32_t n_tok)
+V41_STUB(ds4_gpu_bwd_hc_post_tensor, ds4_gpu_tensor *gy, ds4_gpu_tensor *gres, ds4_gpu_tensor *gpost, ds4_gpu_tensor *gcomb, const ds4_gpu_tensor *gout, const ds4_gpu_tensor *y, const ds4_gpu_tensor *res, const ds4_gpu_tensor *post, const ds4_gpu_tensor *comb, uint32_t n_embd, uint32_t n_hc, uint32_t n_tok)
+V41_STUB(ds4_gpu_bwd_amp_tensor, ds4_gpu_tensor *gA, ds4_gpu_tensor *gB, ds4_gpu_tensor *gx, const ds4_gpu_tensor *gy, const ds4_gpu_tensor *x, const ds4_gpu_tensor *A, const ds4_gpu_tensor *B, ds4_gpu_tensor *T, ds4_gpu_tensor *gT, uint32_t n_tok, uint32_t D, uint32_t K)
+V41_STUB(ds4_gpu_bwd_sumsq_tensor, const ds4_gpu_tensor *g, uint64_t n, double *out)
+V41_STUB(ds4_gpu_bwd_adam_tensor, ds4_gpu_tensor *p, ds4_gpu_tensor *g, ds4_gpu_tensor *m, ds4_gpu_tensor *v, uint64_t n, float lr, float beta1, float beta2, float eps, float gs, uint32_t step)
+V41_STUB(ds4_gpu_bwd_axpy_tensor, ds4_gpu_tensor *y, const ds4_gpu_tensor *x, float a, uint64_t n)
+V41_STUB(ds4_gpu_bwd_sparse_attn_tensor, ds4_gpu_tensor *gq, ds4_gpu_tensor *gkv, ds4_gpu_tensor *gcomp, const ds4_gpu_tensor *go, const ds4_gpu_tensor *o, const ds4_gpu_tensor *q, const ds4_gpu_tensor *kv_win, const ds4_gpu_tensor *kv_comp, const ds4_gpu_tensor *idx, const void *model_map, uint64_t model_size, uint64_t sink_offset, uint32_t n_tok, uint32_t window, uint32_t ng, uint32_t topk, uint32_t n_head, uint32_t head_dim, float scale)
+V41_STUB(ds4_gpu_bwd_rope_tensor, ds4_gpu_tensor *x, const ds4_gpu_tensor *pos, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, float theta, uint32_t original_seq_len, float factor, float beta_fast, float beta_slow, bool inverse)
+V41_STUB(ds4_gpu_bwd_hc_mix_tensor, ds4_gpu_tensor *ghc, const ds4_gpu_tensor *gpre, const ds4_gpu_tensor *gpost, const ds4_gpu_tensor *gcomb, const ds4_gpu_tensor *hc, const ds4_gpu_tensor *mix, const void *model_map, uint64_t model_size, uint64_t fn_offset, uint64_t scale_offset, uint64_t base_offset, uint32_t n_embd, uint32_t n_hc, uint32_t iters, float hc_eps, float norm_eps, uint32_t n_tok)
+V41_STUB(ds4_gpu_bwd_swiglu_tensor, ds4_gpu_tensor *ggate, ds4_gpu_tensor *gup, const ds4_gpu_tensor *gh, const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up, uint64_t n, float limit)
+V41_STUB(ds4_gpu_bwd_router_tensor, ds4_gpu_tensor *gz, const ds4_gpu_tensor *gw, const ds4_gpu_tensor *sel, const ds4_gpu_tensor *z, uint32_t n_tok, uint32_t n_expert, uint32_t k, float route_scale)
+V41_STUB(ds4_gpu_bwd_moe_capture, int on)
+V41_STUB(ds4_gpu_bwd_wcache, int mode)
+V41_STUB(ds4_gpu_bwd_routed_moe_tensor,ds4_gpu_tensor *gx, ds4_gpu_tensor *gw, const ds4_gpu_tensor *gy, const ds4_gpu_tensor *x, const ds4_gpu_tensor *sel, const ds4_gpu_tensor *rw, const void *model_map, uint64_t model_size, uint64_t blob_offset, uint64_t blob_bytes, uint32_t IN, uint32_t MID, uint32_t OUT, uint32_t n_total_expert, uint32_t K, float clamp, uint32_t layer, uint32_t n_tok)
+V41_STUB(ds4_gpu_bwd_router_fixed_tensor, ds4_gpu_tensor *weights, const ds4_gpu_tensor *sel, const ds4_gpu_tensor *logits, uint32_t n_tok, uint32_t n_expert, uint32_t topk, float route_scale)
+V41_STUB(ds4_gpu_bwd_compress_pool_tensor, ds4_gpu_tensor *gkv, ds4_gpu_tensor *gsc, const ds4_gpu_tensor *gpooled, const ds4_gpu_tensor *kv, const ds4_gpu_tensor *score, uint32_t n_groups, uint32_t ratio, uint32_t dim)
+V41_STUB(ds4_gpu_bwd_engram_gate_tensor, ds4_gpu_tensor *g, const ds4_gpu_tensor *hc_pre, const ds4_gpu_tensor *kv, const void *model_map, uint64_t model_size, uint64_t q_w_offset, uint64_t k_w_offset, uint32_t n_embd, uint32_t n_hc, uint32_t n_tok, float eps)
+V41_STUB(ds4_gpu_bwd_pack_bf16_tensor, ds4_gpu_tensor *dst16, const ds4_gpu_tensor *src, uint64_t n)
+/* 草稿器蒸馏原语(2026-10-07, ds4_gpu_bwd.h): 只有 CUDA */
+V41_STUB(ds4_gpu_draft_attn_fwd_tensor, ds4_gpu_tensor *o, ds4_gpu_tensor *lse, const ds4_gpu_tensor *q, const ds4_gpu_tensor *hist, uint32_t hbase, const ds4_gpu_tensor *blk, const ds4_gpu_tensor *bpos, uint32_t nb, uint32_t B, uint32_t window, const void *model_map, uint64_t model_size, uint64_t sink_offset, uint32_t n_head, uint32_t head_dim, float scale)
+V41_STUB(ds4_gpu_draft_attn_bwd_tensor, ds4_gpu_tensor *gq, ds4_gpu_tensor *gblk, const ds4_gpu_tensor *go, const ds4_gpu_tensor *o, const ds4_gpu_tensor *q, const ds4_gpu_tensor *lse, const ds4_gpu_tensor *hist, uint32_t hbase, const ds4_gpu_tensor *blk, const ds4_gpu_tensor *bpos, uint32_t nb, uint32_t B, uint32_t window, uint32_t n_head, uint32_t head_dim, float scale)
+V41_STUB(ds4_gpu_draft_jury_tensor, ds4_gpu_tensor *out, const ds4_gpu_tensor *ls, const ds4_gpu_tensor *lt, uint32_t m, uint32_t n_vocab, float T)
+V41_STUB(ds4_gpu_draft_tv_tensor, ds4_gpu_tensor *glogits, ds4_gpu_tensor *loss, const ds4_gpu_tensor *logits, uint32_t m, uint32_t n_vocab, const ds4_gpu_tensor *tid, const ds4_gpu_tensor *tp, const ds4_gpu_tensor *trest, uint32_t k, float T, float scale)
+V41_STUB(ds4_gpu_draft_amp_apply_tensor, ds4_gpu_tensor *y, const ds4_gpu_tensor *x, const ds4_gpu_tensor *A, const ds4_gpu_tensor *B, ds4_gpu_tensor *T, uint32_t n_tok, uint32_t D, uint32_t K)
+V41_STUB(ds4_gpu_draft_bias_tensor, ds4_gpu_tensor *out, const ds4_gpu_tensor *e, const ds4_gpu_tensor *W, uint32_t n, uint32_t R, uint32_t V)
+V41_STUB(ds4_gpu_draft_bias_bwd_tensor, ds4_gpu_tensor *gW, ds4_gpu_tensor *ge, const ds4_gpu_tensor *g, const ds4_gpu_tensor *e, const ds4_gpu_tensor *W, uint32_t n, uint32_t R, uint32_t V)
+V41_STUB(ds4_gpu_draft_rows_dev_tensor, ds4_gpu_tensor *out, const ds4_gpu_tensor *tab, const ds4_gpu_tensor *ids, uint32_t ids_off, uint32_t n, uint32_t R, uint32_t Vm)
+V41_STUB(ds4_gpu_draft_rows_scatter_tensor, ds4_gpu_tensor *gtab, const ds4_gpu_tensor *g, const ds4_gpu_tensor *ids, uint32_t n, uint32_t R, uint32_t Vm)
+V41_STUB(ds4_gpu_draft_rows_gather_tensor, ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t tab_offset, uint64_t n_rows_tab, uint32_t dim, uint32_t elem_bytes, const ds4_gpu_tensor *ids, uint32_t n)
+V41_STUB(ds4_gpu_bwd_unpack_bf16_tensor, ds4_gpu_tensor *dst, const ds4_gpu_tensor *src16, uint64_t n)

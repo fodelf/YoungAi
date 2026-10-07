@@ -43,6 +43,9 @@ typedef struct {
     uint32_t k0steps;          /* 草稿白跑(k=0)后走 n=1 图的步(2026-09-28): 不进"稳态"账 —— 它前面挂着一轮草稿, 不是纯解码步 */
     int cur_pure;              /* 本步是纯解码步(进账)还是 k=0 轮的步(只计数) */
     double t_prep, t_launch, t_sync, t_gap;   /* 步边界的账(秒, 累计; 只记 n=1): 起手+取行提交 / cudaGraphLaunch 主机耗时 / 等图 / 上一步 sync 返回→本步进来 */
+    double b_prep, b_launch; uint32_t b_n;    /* 同两项, 验证批(n≥2)与 k=0 轮的步(2026-10-07 主机空隙分账: nsys 量到草稿完→验证首核之间 GPU 空 1.2 ms) */
+    double b_begin, b_engram, b_check, b_arm;  /* 起手拆四段: 写槽+hist / engram 取行提交 / 图代号校验(+重捕获) / 置位 */
+    double t_capture; uint32_t n_capture;      /* 捕获(含 n=1)的主机耗时累计 / 次数 */
     double t_last_sync, t_launched;   /* 上一步 sync 返回的时刻 / 本步 launch 返回的时刻 */
     int direct_pending; int32_t pending_tok;   /* n=1 捕获失败那一步: launch 没发出去, wait 里按直发补跑 */
     uint32_t cur_n;            /* 本步发的是几行(wait 按它读回/推进) */
@@ -97,6 +100,13 @@ bool v41_graph_ready(const ds4_v41_state *st) {
     const decode_graph *g = (const decode_graph *)st->dgraph;
     return g_ds4_v41_graph && !st->draft && st->n_direct1 > 0 && !g_ds4_v41_prof && !g_ds4_v41_hook && !st->dump_prefix &&
            !(g && g->n1_off);
+}
+/* 草稿图用的"主路允许走图"(2026-10-07 实撞): 以前草稿图拿 v41_graph_ready 判, 它要求 n=1 直发暖过一步 —— 投机每轮 k≥1 时 n=1 一步都不跑,
+ * 草稿图就永远开不了, 每轮 ~200 发核直发(nsys: 每发 3~4 µs 空隙 ≈ 0.8 ms/轮), 日志里一行"草稿图已捕获"都没有。验证批图 09-22 已按同样理由
+ * 去掉了 n=1 暖过的要求(v41_graph_batch_ready), 草稿图漏了。草稿图自己的暖身由 dr->gwarm[rows] 守。 */
+bool v41_graph_allowed(const ds4_v41_state *st) {
+    const decode_graph *g = (const decode_graph *)st->dgraph;
+    return g_ds4_v41_graph && !st->draft && !g_ds4_v41_prof && !g_ds4_v41_hook && !st->dump_prefix && !(g && g->n1_off);
 }
 /* 验证批同上, 且这个 n 直发暖过(每个 n 的暂存/核属性各自懒建)、这个批的快照缓冲建过(直发那一轮 v41_spec_snapshot 建) */
 bool v41_graph_batch_ready(const ds4_v41_state *st, uint32_t n) {
@@ -158,7 +168,7 @@ static bool dg_capture(ds4_engine *e, ds4_v41_state *st, uint32_t n) {
         const uint32_t r = ds4_layer_compress_ratio(il);
         if (r && (cap + n) / r > ng_max) ng_max = (cap + n) / r;
     }
-    if (ng_max && !v41_index_scratch_prepare(st, ng_max, n)) return false;
+    if (ng_max && !v41_index_scratch_prepare(st, ng_max, n, n)) return false;
     /* 候选块暂存: 按**桶上限**那一批的组数算块数(桶里位置越靠后组越多, 捕获时就得按最大的开), n 行各一份 */
     if (g_ds4_v41.candidate_source_layer >= 0 && g_ds4_v41.candidate_block_size > 0) {
         const uint32_t cr = ds4_layer_compress_ratio((uint32_t)g_ds4_v41.candidate_source_layer);
@@ -166,6 +176,7 @@ static bool dg_capture(ds4_engine *e, ds4_v41_state *st, uint32_t n) {
         const uint32_t cng = cr ? (cap + n) / cr : 0u;
         if (cng && !ds4_gpu_v41_candidate_scratch_prepare(n, (cng + cbs - 1u) / cbs)) return false;
     }
+    if (!ds4_gpu_v41_indexer_scratch_prepare(n, DS4_N_INDEXER_HEAD)) return false;   /* --idx-mma 的 q 整数尾数暂存(开关关着 = no-op) */
     st->graph = 1; st->graph_pos_lo = in->lo; st->graph_pos_cap = cap; st->egraph_uploaded = 0;
     if (!ds4_gpu_decode_graph_capture_begin()) { st->graph = 0; return false; }
     /* ★槽走零拷贝小核, 不走 memcpy 节点★(nsys 实撞: GB10 上图里每个 memcpy 节点 ~170 µs, 四个就是 0.69 ms/步) */
@@ -219,8 +230,10 @@ static bool dg_launch(ds4_engine *e, ds4_v41_state *st, const int32_t *ids, uint
     dg_begin_step(st, ids, n);
     for (uint32_t i = 0; i < n; i++) { g->tokv[i] = ids[i]; g->posv[i] = (int32_t)(st->pos0 + i); }
     __sync_synchronize();   /* 槽先落内存再发图: 图开头的零拷贝小核读的是内存里的值 */
+    const double tp0 = now_sec();
     /* 取行任务先提交: 图里 engram 层前的自旋核等的就是这一轮 */
     if (!st->no_engram && !v41_engram_prefetch(e, st)) return false;
+    const double tp1 = now_sec();
     /* ★暂存换过指针 ⇒ 图作废, 重捕获★(2026-09-19): 投机验证批(直发, n≤6)让 attn/hc/VQ 的暂存扩容, 图里烤死的旧指针
      * 指向已释放页 —— 这就是 09-18 第三版"歇轮走图"2K 崩 illegal memory access 的真因(定罪见 cuda_v41_1.inc.cu v41_grow)。
      * 代号是全局的: 变了所有 n 的图一起作废。 */
@@ -228,7 +241,10 @@ static bool dg_launch(ds4_engine *e, ds4_v41_state *st, const int32_t *ids, uint
     /* 同一个坑的另一半: 直发路(投机验证批/捕获失败重来)可能让索引草稿翻倍, iscore/cand 换了指针 */
     if (in->exec && in->idx_gen != st->iscap_gen) dg_invalidate(g, "索引草稿长过");
     if (!in->exec || st->pos0 < in->lo || st->pos0 + n - 1u > in->cap) {
-        if (!dg_capture(e, st, n)) {
+        const double tc0 = now_sec();
+        const bool cap_ok = dg_capture(e, st, n);
+        g->t_capture += now_sec() - tc0; g->n_capture++;   /* 捕获的主机耗时单记: 短跑里它把"起手"均值撑大(10-07 实撞: 4 次捕获摊成 1 ms/轮) */
+        if (!cap_ok) {
             if (n == 1u) {
                 fprintf(stderr, "ds4: ★[graph] 捕获失败, 本条请求这一步与之后改走直发★\n");
                 g->n1_off = 1;
@@ -244,11 +260,27 @@ static bool dg_launch(ds4_engine *e, ds4_v41_state *st, const int32_t *ids, uint
     const double t1 = now_sec();
     st->eg_t_launch = t1;
     if (!st->no_engram && !v41_engram_graph_arm(st)) return false;   /* 本步序号进 want 槽, 图里的自旋核等它 */
+    const double tp2 = now_sec();
     if (!ds4_gpu_decode_graph_launch(in->exec)) return false;
     g->t_launched = now_sec();
     if (g->cur_pure) { g->t_prep += t1 - t0; g->t_launch += g->t_launched - t1; }
+    else { g->b_prep += tp2 - t0; g->b_launch += g->t_launched - tp2; g->b_n++;
+           g->b_begin += tp0 - t0; g->b_engram += tp1 - tp0; g->b_check += t1 - tp1; g->b_arm += tp2 - t1; }
     g->cur_n = n;
     return true;
+}
+/* 验证批/k=0 步的发图主机账(累计秒): 起手(写槽 + 取行提交 + 图校验) / cudaGraphLaunch 本身 / 几发。给 core_v41_api 的 --v41-prof 分账行 */
+void v41_graph_batch_host(const ds4_v41_state *st, double *prep, double *launch, uint32_t *n) {
+    const decode_graph *g = (const decode_graph *)st->dgraph;
+    *prep = g ? g->b_prep : 0.0; *launch = g ? g->b_launch : 0.0; *n = g ? g->b_n : 0u;
+}
+void v41_graph_batch_prep(const ds4_v41_state *st, double *t_begin, double *t_engram, double *t_check, double *t_arm) {
+    const decode_graph *g = (const decode_graph *)st->dgraph;
+    *t_begin = g ? g->b_begin : 0.0; *t_engram = g ? g->b_engram : 0.0; *t_check = g ? g->b_check : 0.0; *t_arm = g ? g->b_arm : 0.0;
+}
+void v41_graph_capture_cost(const ds4_v41_state *st, double *t_capture, uint32_t *n_capture) {
+    const decode_graph *g = (const decode_graph *)st->dgraph;
+    *t_capture = g ? g->t_capture : 0.0; *n_capture = g ? g->n_capture : 0u;
 }
 
 static bool dg_wait(ds4_engine *e, ds4_v41_state *st, int32_t *next) {

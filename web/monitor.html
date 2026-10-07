@@ -1,0 +1,497 @@
+<!doctype html>
+<!-- web/monitor.html — DwarfStar (ds4-server) 自带的监控页, GET /monitor 直接返回(同源, 无需 --cors)。
+     零依赖单文件: 无 CDN、无外部字体/脚本, 离线可用。每秒拉一次同源 GET /metrics(JSON), 把它画出来。
+     板块与指标照 Strata(github.com/Niko1221/Strata)的 Monitor 页: 模型状态 / 八张读数卡(速度·GPU 负载·显存·GPU 温度·功耗·PCIe·CPU·
+     磁盘读, 各带一分钟火花线) / 上下文占用 / 系统内存 / 最近请求表 / 累计 / 磁盘 KV 缓存。服务端读不到的数就显示 "–", 不编。
+     语言: 中文 / English, 跟浏览器语言, 右上角可切(记在 localStorage), URL ?lang=en|zh 可强制。
+     数据只经 textContent 与 DOM 节点进页面, 不拼 HTML 字符串。 -->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">   <!-- 服务端没有 /favicon.ico: 空图标免得浏览器每次开页都打一条 404 -->
+<title>DwarfStar 监控</title>
+<style>
+  :root {
+    --bg: #0e1116; --panel: #161b22; --panel-2: #1c2330; --border: #2b3240;
+    --text: #e6edf3; --dim: #8b949e; --accent: #4ea1ff; --accent-dim: #1f3a5f;
+    --ok: #3fb950; --warn: #d29922; --err: #f85149; --info: #a371f7; --radius: 10px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; padding: 10px 16px; flex-wrap: wrap;
+    background: var(--panel); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 10;
+  }
+  .logo { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+  .logo .star { color: var(--accent); }
+  header a { color: var(--dim); text-decoration: none; font-size: 13.5px; }
+  header a:hover { color: var(--accent); }
+  .spacer { flex: 1; }
+  #pill { display: inline-flex; align-items: center; gap: 7px; padding: 3px 10px; border-radius: 999px; background: var(--panel-2); border: 1px solid var(--border); font-size: 13px; }
+  #pill::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--dim); }
+  #pill[data-state=reading]::before { background: var(--info); }
+  #pill[data-state=generating]::before { background: var(--ok); }
+  #pill[data-state=queued]::before { background: var(--warn); }
+  #pill[data-state=error]::before { background: var(--err); }
+  #updated, .muted { color: var(--dim); font-size: 12.5px; }
+  main { max-width: 1280px; margin: 0 auto; padding: 16px; display: grid; gap: 14px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px; }
+  .card-title { font-size: 12.5px; color: var(--dim); text-transform: uppercase; letter-spacing: .6px; }
+  .state-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+  .badges { display: flex; gap: 6px; flex-wrap: wrap; }
+  .badge { font-size: 12px; padding: 2px 8px; border-radius: 6px; background: var(--panel-2); color: var(--dim); border: 1px solid var(--border); }
+  .badge.on { color: var(--text); border-color: var(--accent); background: var(--accent-dim); }
+  .badge[data-s=generating].on { border-color: var(--ok); }
+  .badge[data-s=reading].on { border-color: var(--info); }
+  .badge[data-s=queued].on { border-color: var(--warn); }
+  .badge[data-s=error].on { border-color: var(--err); }
+  .state-row { display: flex; justify-content: space-between; gap: 12px; margin: 10px 0 8px; flex-wrap: wrap; }
+  .progress { height: 8px; border-radius: 999px; background: var(--panel-2); overflow: hidden; }
+  .progress > div { height: 100%; width: 0; background: var(--accent); transition: width .4s; }
+  .progress[data-tone=info] > div { background: var(--info); }
+  .progress[data-tone=warn] > div { background: var(--warn); }
+  .progress[data-tone=danger] > div { background: var(--err); }
+  .metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+  .metric .label { font-size: 12.5px; color: var(--dim); }
+  .metric .value { font-size: 26px; font-weight: 500; line-height: 1.25; margin-top: 4px; }
+  .metric .value small { font-size: 13px; color: var(--dim); margin-left: 4px; font-weight: 400; }
+  .metric .sub { font-size: 12px; color: var(--dim); min-height: 1.3em; overflow-wrap: anywhere; }
+  .metric svg { display: block; width: 100%; height: 36px; margin-top: 6px; color: var(--accent); }
+  .metric svg[data-tone=warn] { color: var(--warn); }
+  .metric svg[data-tone=info] { color: var(--info); }
+  .speed-values { display: flex; gap: 18px; }
+  .speed-values .value.prefill { color: var(--info); }
+  .row2 { display: grid; grid-template-columns: minmax(280px, 1fr) minmax(0, 2fr); gap: 14px; }
+  .gauge { display: flex; align-items: center; gap: 14px; margin: 8px 0 12px; }
+  .gauge svg { width: 110px; height: 110px; }
+  .gauge .track { stroke: var(--panel-2); }
+  .gauge .fill { stroke: var(--accent); transition: stroke-dasharray .4s; }
+  .gauge .pct { font-size: 26px; font-weight: 500; }
+  .bar-row { display: flex; justify-content: space-between; font-size: 13px; margin: 10px 0 4px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { padding: 6px 8px; text-align: left; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th { color: var(--dim); font-weight: 500; font-size: 12px; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .table-wrap { overflow: auto; max-height: 420px; }
+  .req-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  button {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 7px; padding: 4px 10px; font: inherit; font-size: 12.5px; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  .tag { font-size: 11.5px; padding: 1px 7px; border-radius: 5px; background: var(--panel-2); color: var(--dim); }
+  .tag.ok { color: var(--ok); } .tag.warn { color: var(--warn); } .tag.err { color: var(--err); }
+  .totals { font-size: 12.5px; color: var(--dim); margin: 10px 0 0; }
+  dl.facts { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; margin: 10px 0 0; font-size: 13px; }
+  dl.facts dt { color: var(--dim); } dl.facts dd { margin: 0; overflow-wrap: anywhere; }
+  .cc-bars { display: grid; grid-template-columns: 1fr 1fr; gap: 0 20px; }
+  .note { font-size: 12.5px; color: var(--dim); margin: 10px 0 0; }
+  @media (max-width: 1000px) { .metrics { grid-template-columns: repeat(2, 1fr); } .row2 { grid-template-columns: 1fr; } }
+  @media (max-width: 560px) { .metrics { grid-template-columns: 1fr; } .cc-bars { grid-template-columns: 1fr; } main { padding: 12px; } }
+</style>
+</head>
+<body>
+<header>
+  <span class="logo"><span class="star">✦</span> <span data-i18n="brand">DwarfStar 监控</span></span>
+  <span id="pill" data-state="idle"><span id="pill-text">连接中…</span></span>
+  <span class="spacer"></span>
+  <a href="/" data-i18n="nav_chat">聊天页</a>
+  <a href="/metrics" target="_blank" data-i18n-title="nav_metrics_title">/metrics</a>
+  <button id="lang" title="Language / 语言">EN</button>
+  <span id="updated">—</span>
+</header>
+
+<main>
+  <section class="card">
+    <div class="state-head">
+      <span class="card-title" data-i18n="state_title">模型状态</span>
+      <span class="badges" id="badges">
+        <span class="badge" data-s="idle" data-i18n="st_idle">空闲</span>
+        <span class="badge" data-s="reading" data-i18n="st_reading">读提示</span>
+        <span class="badge" data-s="generating" data-i18n="st_generating">生成中</span>
+        <span class="badge" data-s="queued" data-i18n="st_queued">排队</span>
+        <span class="badge" data-s="error" data-i18n="st_error">错误</span>
+      </span>
+    </div>
+    <div class="state-row"><span id="state-label">等待请求</span><span class="muted" id="state-detail"></span></div>
+    <div class="progress" id="state-progress"><div id="state-bar"></div></div>
+  </section>
+
+  <section class="metrics" id="metrics"></section>
+
+  <section class="row2">
+    <div class="card">
+      <span class="card-title" data-i18n="ctx_title">上下文占用</span>
+      <div class="gauge">
+        <svg viewBox="0 0 120 120" aria-hidden="true">
+          <circle class="track" cx="60" cy="60" r="50" fill="none" stroke-width="10" stroke-linecap="round" stroke-dasharray="235.6 314.2" transform="rotate(135 60 60)"/>
+          <circle class="fill" id="ctx-fill" cx="60" cy="60" r="50" fill="none" stroke-width="10" stroke-linecap="round" stroke-dasharray="0 314.2" transform="rotate(135 60 60)"/>
+        </svg>
+        <div><div class="pct" id="ctx-pct">0%</div><div class="muted" id="ctx-sub">–</div></div>
+      </div>
+      <div class="bar-row"><span data-i18n="experts">专家在显存</span><span class="muted" id="experts-text">–</span></div>
+      <div class="progress"><div id="experts-bar"></div></div>
+      <div class="bar-row"><span data-i18n="ram">系统内存</span><span class="muted" id="ram-text">–</span></div>
+      <div class="progress" id="ram-progress"><div id="ram-bar"></div></div>
+      <div class="bar-row"><span data-i18n="gpu_temp_bar">GPU 温度</span><span class="muted" id="temp-text">–</span></div>
+      <div class="progress" data-tone="warn"><div id="temp-bar"></div></div>
+      <dl class="facts" id="facts"></dl>
+    </div>
+    <div class="card">
+      <div class="req-head"><span class="card-title" data-i18n="req_title">最近请求</span><button id="req-all" hidden>显示全部</button></div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th data-i18n="th_time">时间</th><th data-i18n="th_status">状态</th><th data-i18n="th_api">接口</th>
+            <th class="num" data-i18n="th_prompt">提示</th><th class="num" data-i18n="th_reused">复用</th><th class="num" data-i18n="th_output">输出</th>
+            <th class="num">t/s</th><th class="num" data-i18n="th_drafts" data-i18n-title="th_drafts_title">草稿</th>
+            <th class="num" data-i18n="th_first">首 token</th><th class="num" data-i18n="th_duration">用时</th>
+          </tr></thead>
+          <tbody id="req-body"></tbody>
+        </table>
+      </div>
+      <p class="totals" id="req-totals"></p>
+    </div>
+  </section>
+
+  <section class="card" id="cc-card">
+    <div class="req-head"><span class="card-title" data-i18n="cc_title">磁盘 KV 缓存</span><span class="muted" id="cc-sum"></span></div>
+    <div class="cc-bars" id="cc-bars" hidden>
+      <div><div class="bar-row"><span data-i18n="cc_parked">盘上检查点</span><span class="muted" id="cc-slots-text">–</span></div></div>
+      <div><div class="bar-row"><span data-i18n="cc_budget">占用预算</span><span class="muted" id="cc-mem-text">–</span></div><div class="progress"><div id="cc-mem-bar"></div></div></div>
+    </div>
+    <dl class="facts" id="cc-facts"></dl>
+    <p class="note" id="cc-note"></p>
+  </section>
+</main>
+
+<script>
+"use strict";
+/* ---------- 语言 ---------- */
+const I18N = {
+  zh: {
+    brand: "DwarfStar 监控", title: "DwarfStar 监控", nav_chat: "聊天页", lang_btn: "EN",
+    nav_metrics_title: "本页的数据源(JSON); 加 Accept: text/plain 或 ?format=prometheus 给 Prometheus 文本",
+    connecting: "连接中…", live: "实时 · {0}", disconnected: "已断开 · 重试中", unreachable: "连不上服务",
+    pill_idle: "空闲", pill_reading: "读提示", pill_reading_pct: "读提示 · {0}%", pill_generating: "生成中 · {0} t/s", pill_queued: "{0} 条排队",
+    state_title: "模型状态", st_idle: "空闲", st_reading: "读提示", st_generating: "生成中", st_queued: "排队", st_error: "错误",
+    waiting: "等待请求", reading: "读提示", generating: "生成中",
+    detail_reading: "{0} / {1} token · {2}%", detail_tokens: "{0} token", detail_generating: "{0} token · {1} t/s", detail_last: "上一条: {0} token", detail_last_speed: " · {0} t/s",
+    m_speed: "速度", m_gpu: "GPU 负载", m_vram: "显存", m_temp: "GPU 温度", m_power: "功耗", m_pcie: "PCIe", m_cpu: "CPU", m_disk: "磁盘读",
+    decode_now: "解码 · 当前", decode_last: "解码 · 上一条", decode: "解码", prefill_now: "预填 · 当前", prefill_this: "预填 · 本请求", prefill_last: "预填 · 上一条", prefill: "预填",
+    gpu_unreadable: "读不到(NVML/IOKit)", mem_ram: "统一内存 = 整机内存", mem_ram_kernel: "统一内存 · 内核可见 {0} GB", mem_metal: "本进程 Metal 工作集 / 设备上限",
+    temp_none: "此平台无免 root 接口", power_limit: "上限 {0} W", pcie_rx: "到 GPU {0} MB/s", pcie_idle: " · 空闲降到 Gen{0}", pcie_unified: "统一内存, 无 PCIe 搬运",
+    cores_threads: "{0} 核 · {1} 线程", threads: "{0} 线程", disk_write: "写 {0} MB/s",
+    ctx_title: "上下文占用", ctx_sub: "{0} / {1} token", experts: "专家在显存", experts_resident: "全部常驻(无专家缓存)", experts_n: "{0} 个",
+    ram: "系统内存", ram_text: "{0} / {1} GB", gpu_temp_bar: "GPU 温度", temp_text: "{0} °C",
+    f_model: "模型", f_backend: "后端", f_ctx: "上下文", f_ctx_v: "{0} token", f_parallel: "并发", f_lanes: "{0} 路合批", f_single: "单路",
+    f_spec: "投机解码", on: "开", off: "关", f_gpu: "GPU", f_gpu_mem: "{0}, {1} GB", f_cpu: "CPU", f_images: "图像输入",
+    req_title: "最近请求", th_time: "时间", th_status: "状态", th_api: "接口", th_prompt: "提示", th_reused: "复用", th_output: "输出", th_drafts: "草稿",
+    th_drafts_title: "解码期接受的草稿位 / 出过的草稿位(投机解码)", th_first: "首 token", th_duration: "用时",
+    no_requests: "还没有请求", stream: " · 流式", fin_stop: "完成", fin_tool_calls: "工具调用", fin_length: "到上限", fin_cancel: "已停", fin_disconnect: "客户端断开", fin_error: "错误",
+    show_all: "显示全部({0})", show_fewer: "只看最近 12 条",
+    totals: "自 {0}: {1} 条请求 · 读提示 {2} token{3}(复用 {4}) · 生成 {5} token{6}{7}", totals_speed: " · {0} t/s", totals_drafts: " · 草稿接受 {0}%",
+    cc_title: "磁盘 KV 缓存", cc_parked: "盘上检查点", cc_budget: "占用预算", cc_n: "{0} 条", cc_mem: "{0} / {1} GB", cc_mem_only: "{0} GB",
+    cc_sum: "{0} / {1} 条请求复用了提示前缀", cc_share: "(占全部提示 token 的 {0}%)", cc_parked_ev: "存盘", cc_restored_ev: "装回", cc_event: "{0} {1} token, {2}",
+    cc_last_req: "上一条请求", cc_last_req_v: "复用 {0} / {1} 提示 token", cc_since: "开服以来复用", cc_since_v: "{0} token {1}", cc_pr: "存盘 / 装回", cc_evicted: " · 逐出 {0}", cc_last: "最近一次",
+    cc_note_on: "命中前缀的请求直接装回检查点, 不再重读提示; 预算满了先逐出最旧的。",
+    cc_note_off: "磁盘 KV 缓存没开(V4.1 服务路没有会话 KV; V4 用 --kv-disk-dir 开)。表里的「复用」= 请求命中的活 KV 前缀。",
+    just_now: "刚刚", min_ago: "{0} 分钟前", h_ago: "{0} 小时前",
+  },
+  en: {
+    brand: "DwarfStar Monitor", title: "DwarfStar Monitor", nav_chat: "Chat", lang_btn: "中文",
+    nav_metrics_title: "This page's data (JSON); add Accept: text/plain or ?format=prometheus for the Prometheus text",
+    connecting: "Connecting…", live: "Live · {0}", disconnected: "Disconnected · retrying", unreachable: "Server unreachable",
+    pill_idle: "Idle", pill_reading: "Reading prompt", pill_reading_pct: "Reading prompt · {0}%", pill_generating: "Generating · {0} t/s", pill_queued: "{0} queued",
+    state_title: "Model state", st_idle: "Idle", st_reading: "Reading", st_generating: "Generating", st_queued: "Queued", st_error: "Error",
+    waiting: "Waiting for a request", reading: "Reading prompt", generating: "Generating",
+    detail_reading: "{0} / {1} tokens · {2}%", detail_tokens: "{0} tokens", detail_generating: "{0} tokens · {1} t/s", detail_last: "last: {0} tokens", detail_last_speed: " at {0} t/s",
+    m_speed: "Speed", m_gpu: "GPU load", m_vram: "VRAM", m_temp: "GPU temp", m_power: "Power", m_pcie: "PCIe", m_cpu: "CPU", m_disk: "Disk read",
+    decode_now: "Decode now", decode_last: "Decode last request", decode: "Decode", prefill_now: "Prefill now", prefill_this: "Prefill this request", prefill_last: "Prefill last request", prefill: "Prefill",
+    gpu_unreadable: "not readable (NVML/IOKit)", mem_ram: "unified memory = system RAM", mem_ram_kernel: "unified memory · {0} GB visible to the kernel", mem_metal: "this process's Metal working set / device limit",
+    temp_none: "no unprivileged interface on this platform", power_limit: "of {0} W limit", pcie_rx: "to GPU {0} MB/s", pcie_idle: " · idle Gen{0}", pcie_unified: "unified memory, no PCIe traffic",
+    cores_threads: "{0} cores · {1} threads", threads: "{0} threads", disk_write: "write {0} MB/s",
+    ctx_title: "Context fill", ctx_sub: "{0} / {1} tokens", experts: "Experts in VRAM", experts_resident: "all resident (no expert cache)", experts_n: "{0}",
+    ram: "System RAM", ram_text: "{0} / {1} GB", gpu_temp_bar: "GPU temperature", temp_text: "{0} °C",
+    f_model: "Model", f_backend: "Backend", f_ctx: "Context", f_ctx_v: "{0} tokens", f_parallel: "Parallel", f_lanes: "{0} lanes batched", f_single: "single lane",
+    f_spec: "Speculative decoding", on: "on", off: "off", f_gpu: "GPU", f_gpu_mem: "{0}, {1} GB", f_cpu: "CPU", f_images: "Images",
+    req_title: "Recent requests", th_time: "Time", th_status: "Status", th_api: "API", th_prompt: "Prompt", th_reused: "Reused", th_output: "Output", th_drafts: "Drafts",
+    th_drafts_title: "speculative decoding: draft tokens accepted / offered while generating", th_first: "First token", th_duration: "Duration",
+    no_requests: "No requests yet", stream: " · stream", fin_stop: "Done", fin_tool_calls: "Tool call", fin_length: "Max tokens", fin_cancel: "Stopped", fin_disconnect: "Disconnected", fin_error: "Error",
+    show_all: "Show all ({0})", show_fewer: "Show fewer",
+    totals: "Since {0}: {1} requests · {2} prompt tokens read{3} ({4} reused) · {5} written{6}{7}", totals_speed: " at {0} t/s", totals_drafts: " · drafts accepted {0}%",
+    cc_title: "Disk KV cache", cc_parked: "Checkpoints on disk", cc_budget: "Budget used", cc_n: "{0}", cc_mem: "{0} / {1} GB", cc_mem_only: "{0} GB",
+    cc_sum: "{0} of {1} requests reused part of their prompt", cc_share: "({0}% of all prompt tokens)", cc_parked_ev: "Parked", cc_restored_ev: "Restored", cc_event: "{0} {1} tokens, {2}",
+    cc_last_req: "Last request", cc_last_req_v: "{0} of {1} prompt tokens reused", cc_since: "Reused since start", cc_since_v: "{0} tokens {1}", cc_pr: "Parked / restored", cc_evicted: " · {0} evicted", cc_last: "Last switch",
+    cc_note_on: "A request that matches a checkpoint's prefix restores it instead of reading the prompt again; the oldest goes when the budget is full.",
+    cc_note_off: "The disk KV cache is off (the V4.1 serving path has no session KV; V4 enables it with --kv-disk-dir). \"Reused\" in the table = live KV prefix a request matched.",
+    just_now: "just now", min_ago: "{0} min ago", h_ago: "{0} h ago",
+  },
+};
+const LS_LANG = "ds4.monitor.lang";
+function pickLang() {
+  const q = new URLSearchParams(location.search).get("lang");
+  if (q === "en" || q === "zh") return q;
+  try { const v = localStorage.getItem(LS_LANG); if (v === "en" || v === "zh") return v; } catch (_) {}
+  return (navigator.language || "").toLowerCase().startsWith("zh") ? "zh" : "en";
+}
+let lang = pickLang();
+const t = (k, ...a) => { let s = (I18N[lang][k] ?? I18N.zh[k] ?? k); for (let i = 0; i < a.length; i++) s = s.split(`{${i}}`).join(String(a[i])); return s; };
+const locale = () => lang === "zh" ? "zh-CN" : "en-US";
+function applyI18n() {
+  document.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
+  document.title = t("title");
+  for (const el of document.querySelectorAll("[data-i18n]")) el.textContent = t(el.dataset.i18n);
+  for (const el of document.querySelectorAll("[data-i18n-title]")) el.title = t(el.dataset.i18nTitle);
+  text("lang", t("lang_btn"));
+  for (const m of METRICS) text("ml-" + m.key, t(m.label));
+}
+
+/* ---------- 工具 ---------- */
+const $ = id => document.getElementById(id);
+const fmt = (v, d = 0) => (v == null || Number.isNaN(v)) ? "–" : Number(v).toLocaleString(locale(), { minimumFractionDigits: d, maximumFractionDigits: d });
+const gb = (bytes, d = 1) => bytes == null ? "–" : fmt(bytes / 1073741824, d);   /* 内存按二进制 GB(内存条、free、nvidia-smi 都这么标) */
+const kfmt = n => n == null ? "–" : n >= 1e6 ? fmt(n / 1e6, 2) + "M" : n >= 1e4 ? fmt(n / 1e3, 1) + "k" : fmt(n);
+/* 上下文上限按 2 的幂写(模型元数据 1048576 = 1M, 131072 = 128K), 不走十进制: "1.05M" 对不上项目里说的 1M */
+const ctxfmt = n => n == null ? "–" : n % 1048576 === 0 ? `${n / 1048576}M` : n % 1024 === 0 ? `${n / 1024}K` : kfmt(n);
+/* 占比: 1M 上下文里一条 3k 的请求只有 0.3%, 四舍五入成 0% 就像没数据; 10% 以下留一位小数, 0.1% 以下写 "<0.1%" */
+const pctfmt = frac => frac <= 0 ? "0%" : frac * 100 < 0.1 ? "<0.1%" : frac * 100 < 10 ? `${fmt(frac * 100, 1)}%` : `${Math.round(frac * 100)}%`;
+const text = (id, v) => { const el = $(id); if (el && el.textContent !== String(v)) el.textContent = v; };
+function node(tag, cls, content) { const el = document.createElement(tag); if (cls) el.className = cls; if (content != null) el.textContent = content; return el; }
+
+/* 八张读数卡(与 Strata METRICS 同序同名): key / 标题键 / 单位 / history 里的序列名 / 火花线满刻度 */
+const METRICS = [
+  { key: "speed", label: "m_speed", unit: "t/s", series: "tok_s" },
+  { key: "gpu", label: "m_gpu", unit: "%", series: "gpu_util", max: 100 },
+  { key: "vram", label: "m_vram", unit: "GB", series: "gpu_mem_used" },
+  { key: "temp", label: "m_temp", unit: "°C", series: "gpu_temp", tone: "warn" },
+  { key: "power", label: "m_power", unit: "W", series: "gpu_power" },
+  { key: "pcie", label: "m_pcie", unit: "", series: "gpu_pcie_rx_mb", tone: "info" },
+  { key: "cpu", label: "m_cpu", unit: "%", series: "cpu", max: 100 },
+  { key: "disk", label: "m_disk", unit: "MB/s", series: "disk_read_mb", tone: "info" },
+];
+const SVG = "http://www.w3.org/2000/svg";
+function sparkSvg(id, tone, extraId) {
+  const svg = document.createElementNS(SVG, "svg");
+  svg.id = id; svg.setAttribute("viewBox", "0 0 100 32"); svg.setAttribute("preserveAspectRatio", "none");
+  if (tone) svg.dataset.tone = tone;
+  const mk = (cls, fill) => { const p = document.createElementNS(SVG, "path"); p.setAttribute("class", cls); p.setAttribute("fill", fill ? "currentColor" : "none");
+    if (fill) p.setAttribute("opacity", ".12"); else { p.setAttribute("stroke", "currentColor"); p.setAttribute("stroke-width", "1.6"); p.setAttribute("vector-effect", "non-scaling-stroke"); p.setAttribute("stroke-linejoin", "round"); }
+    return p; };
+  svg.append(mk("area", true), mk("line", false));
+  if (extraId) { const g = document.createElementNS(SVG, "g"); g.id = extraId; g.style.color = "var(--info)"; g.append(mk("area", true), mk("line", false)); svg.append(g); }
+  return svg;
+}
+for (const m of METRICS) {
+  const card = node("div", "card metric");
+  card.append(Object.assign(node("div", "label"), { id: "ml-" + m.key }));
+  if (m.key === "speed") {
+    const wrap = node("div", "speed-values");
+    const a = node("div"); a.append(Object.assign(node("div", "value"), { id: "mv-speed" }), Object.assign(node("div", "sub"), { id: "ms-speed" }));
+    const b = node("div"); b.append(Object.assign(node("div", "value prefill"), { id: "mv-prefill" }), Object.assign(node("div", "sub"), { id: "ms-prefill" }));
+    wrap.append(a, b); card.append(wrap, sparkSvg("sp-speed", null, "sp-prefill"));
+  } else {
+    card.append(Object.assign(node("div", "value"), { id: "mv-" + m.key }), Object.assign(node("div", "sub"), { id: "ms-" + m.key }), sparkSvg("sp-" + m.key, m.tone));
+  }
+  $("metrics").append(card);
+}
+function spark(el, values, max) {
+  const v = (values || []).map(x => x == null ? 0 : x);
+  const line = el.querySelector(":scope > .line"), area = el.querySelector(":scope > .area");
+  if (v.length < 2) { line.setAttribute("d", ""); area.setAttribute("d", ""); return; }
+  const top = Math.max(max || 0, ...v, 1e-9);
+  const pts = v.map((x, i) => [(i / (v.length - 1)) * 100, 30 - (x / top) * 26]);
+  const d = pts.map((p, i) => `${i ? "L" : "M"}${p[0].toFixed(2)},${p[1].toFixed(2)}`).join("");
+  line.setAttribute("d", d); area.setAttribute("d", `${d}L100,32L0,32Z`);
+}
+function setMetric(key, value, unit, sub) {
+  const el = $("mv-" + key);
+  el.replaceChildren();
+  if (value == null) el.append("–"); else { el.append(String(value)); if (unit) el.append(node("small", null, unit)); }
+  text("ms-" + key, sub || "");
+}
+function setPill(state, label) { $("pill").dataset.state = state; text("pill-text", label); }
+
+/* ---------- 轮询 ---------- */
+let lastMetrics = null, failures = 0, showAll = false;
+async function poll() {
+  try {
+    const r = await fetch(showAll ? "/metrics?requests=all" : "/metrics", { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    lastMetrics = await r.json(); failures = 0;
+    render(lastMetrics);
+    text("updated", t("live", new Date().toLocaleTimeString(locale())));
+  } catch (e) {
+    if (++failures >= 3) { setPill("error", t("unreachable")); text("updated", t("disconnected")); }
+  }
+  setTimeout(poll, 1000);
+}
+
+function render(m) {
+  const live = m.live || {}, hw = m.hardware || {}, st = m.hardware_static || {}, eng = m.engine || {}, h = m.history || {};
+  const reqs = m.requests || [], last = reqs[0];
+  /* 顶栏状态 */
+  if (live.state === "reading") {
+    const pct = live.prompt_total ? Math.round(100 * live.prompt_read / live.prompt_total) : null;
+    setPill("reading", pct == null ? t("pill_reading") : t("pill_reading_pct", pct));
+  } else if (live.state === "generating") setPill("generating", t("pill_generating", fmt(live.tok_s, 1)));
+  else setPill("idle", t("pill_idle"));
+  if (live.queued > 0) setPill("queued", t("pill_queued", live.queued));
+
+  /* 模型状态卡 */
+  const on = live.queued > 0 ? "queued" : live.state;
+  for (const b of document.querySelectorAll("#badges .badge")) b.classList.toggle("on", b.dataset.s === on || b.dataset.s === live.state);
+  const prog = $("state-progress");
+  let label = t("waiting"), detail = "", pct = 0;
+  if (live.state === "reading") {
+    label = t("reading"); prog.dataset.tone = "info";
+    if (live.prompt_total) { pct = 100 * live.prompt_read / live.prompt_total; detail = t("detail_reading", fmt(live.prompt_read), fmt(live.prompt_total), fmt(pct)); }
+    else detail = t("detail_tokens", fmt(live.prompt_tokens));
+  } else if (live.state === "generating") {
+    label = t("generating"); delete prog.dataset.tone;
+    pct = live.max_tokens ? Math.min(100, 100 * live.generated / live.max_tokens) : 0;
+    detail = t("detail_generating", fmt(live.generated), fmt(live.tok_s, 1));
+  } else if (last) {
+    delete prog.dataset.tone;
+    detail = t("detail_last", fmt(last.output_tokens)) + (last.decode_tok_s ? t("detail_last_speed", fmt(last.decode_tok_s, 1)) : "");
+  }
+  text("state-label", label); text("state-detail", detail); $("state-bar").style.width = pct + "%";
+
+  /* 八张卡 */
+  const speed = live.state === "generating" ? live.tok_s : last ? last.decode_tok_s : null;
+  setMetric("speed", speed == null ? null : fmt(speed, 1), "t/s", live.state === "generating" ? t("decode_now") : last ? t("decode_last") : t("decode"));
+  const prefill = live.state !== "idle" ? live.prefill_tok_s_mean
+    : last && last.prompt_ms > 0 ? Math.max(0, last.prompt_tokens - (last.reused || 0)) / (last.prompt_ms / 1000) : null;
+  setMetric("prefill", prefill == null ? null : fmt(prefill), "t/s", live.state === "reading" ? t("prefill_now") : live.state === "generating" ? t("prefill_this") : last ? t("prefill_last") : t("prefill"));
+  spark($("sp-speed"), h.tok_s); spark($("sp-prefill"), h.prefill_tok_s_mean);
+  setMetric("gpu", hw.gpu_util == null ? null : fmt(hw.gpu_util), "%", st.gpu_name || (st.gpu_count ? "" : t("gpu_unreadable")));
+  spark($("sp-gpu"), h.gpu_util, 100);
+  /* 统一内存: 总量是物理内存(GB10 128 GB), 副标题带上内核自己能分配的量(MemTotal 121.7 GB) —— 两个数都真, 差的是内核保留 */
+  const memSub = st.gpu_mem_source === "ram"
+    ? (hw.ram_kernel_total && hw.ram_kernel_total < hw.gpu_mem_total ? t("mem_ram_kernel", gb(hw.ram_kernel_total)) : t("mem_ram"))
+    : st.gpu_mem_source === "metal" ? t("mem_metal") : "";
+  setMetric("vram", hw.gpu_mem_used == null ? null : gb(hw.gpu_mem_used), hw.gpu_mem_total ? `/ ${gb(hw.gpu_mem_total, 0)} GB` : "GB", memSub);
+  spark($("sp-vram"), h.gpu_mem_used, hw.gpu_mem_total);
+  setMetric("temp", hw.gpu_temp == null ? null : fmt(hw.gpu_temp), "°C", hw.gpu_temp == null && st.gpu_count ? t("temp_none") : "");
+  spark($("sp-temp"), h.gpu_temp, 90);
+  setMetric("power", hw.gpu_power == null ? null : fmt(hw.gpu_power), "W", hw.gpu_power_limit ? t("power_limit", fmt(hw.gpu_power_limit)) : "");
+  spark($("sp-power"), h.gpu_power, hw.gpu_power_limit);
+  const gen = hw.gpu_pcie_gen_max || hw.gpu_pcie_gen;
+  setMetric("pcie", gen ? `Gen${gen}` : null, hw.gpu_pcie_width ? `x${hw.gpu_pcie_width}` : "",
+    hw.gpu_pcie_rx_mb == null ? (st.gpu_mem_source === "ram" ? t("pcie_unified") : "") :
+    t("pcie_rx", fmt(hw.gpu_pcie_rx_mb, hw.gpu_pcie_rx_mb < 10 ? 1 : 0)) + (hw.gpu_pcie_gen && gen && hw.gpu_pcie_gen < gen ? t("pcie_idle", hw.gpu_pcie_gen) : ""));
+  spark($("sp-pcie"), h.gpu_pcie_rx_mb);
+  setMetric("cpu", hw.cpu == null ? null : fmt(hw.cpu), "%", st.threads ? (st.cores ? t("cores_threads", st.cores, st.threads) : t("threads", st.threads)) : "");
+  spark($("sp-cpu"), h.cpu, 100);
+  if (hw.disk_read_mb == null) setMetric("disk", null, "", "");
+  else {
+    const big = hw.disk_read_mb >= 1000;
+    setMetric("disk", big ? fmt(hw.disk_read_mb / 1024, 2) : fmt(hw.disk_read_mb, hw.disk_read_mb < 10 ? 1 : 0), big ? "GB/s" : "MB/s",
+      hw.disk_write_mb == null ? "" : t("disk_write", fmt(hw.disk_write_mb, 1)));
+  }
+  spark($("sp-disk"), h.disk_read_mb);
+
+  /* 上下文占用: 在跑的请求, 否则上一条 */
+  const ctx = eng.max_context || 0;
+  let used = 0;
+  if (live.state !== "idle") used = (live.prompt_tokens || 0) + (live.generated || 0);
+  else if (last) used = (last.prompt_tokens || 0) + (last.output_tokens || 0);
+  const frac = ctx ? Math.min(1, used / ctx) : 0;
+  /* 弧长按占比, 但只要用了就至少画出一小截(3/314 周长): 1M 上下文里 0.3% 的弧按比例画不出来, 看着像没数据 */
+  const arc = used > 0 ? Math.max(3, 235.6 * frac) : 0;
+  $("ctx-fill").setAttribute("stroke-dasharray", `${arc.toFixed(1)} 314.2`);
+  $("ctx-fill").style.opacity = arc > 0 ? "1" : "0";
+  text("ctx-pct", pctfmt(frac)); text("ctx-sub", ctx ? t("ctx_sub", fmt(used), ctxfmt(ctx)) : "–");
+  text("experts-text", eng.expert_slots ? t("experts_n", fmt(eng.expert_slots)) : t("experts_resident"));
+  $("experts-bar").style.width = eng.expert_slots ? "100%" : "0%";
+  text("ram-text", hw.ram_total ? t("ram_text", gb(hw.ram_used), gb(hw.ram_total, 0)) : "–");
+  const ramPct = hw.ram_total ? 100 * hw.ram_used / hw.ram_total : 0;
+  $("ram-bar").style.width = ramPct + "%";
+  if (ramPct > 92) $("ram-progress").dataset.tone = "danger"; else delete $("ram-progress").dataset.tone;
+  text("temp-text", hw.gpu_temp == null ? "–" : t("temp_text", fmt(hw.gpu_temp)));
+  $("temp-bar").style.width = hw.gpu_temp == null ? "0%" : `${Math.min(100, hw.gpu_temp)}%`;
+  facts($("facts"), [
+    [t("f_model"), eng.model], [t("f_backend"), eng.backend ? `${eng.backend}${eng.variant ? ` · ${eng.variant}` : ""}` : null],
+    [t("f_ctx"), ctx ? t("f_ctx_v", fmt(ctx)) : null], [t("f_parallel"), eng.batch >= 2 ? t("f_lanes", eng.batch) : t("f_single")],
+    [t("f_spec"), eng.spec == null ? null : eng.spec ? t("on") : t("off")],
+    [t("f_gpu"), st.gpu_name ? (hw.gpu_mem_total ? t("f_gpu_mem", st.gpu_name, gb(hw.gpu_mem_total, 0)) : st.gpu_name) : null],
+    [t("f_cpu"), st.cpu_name], [t("f_images"), eng.images == null ? null : eng.images ? t("on") : t("off")],
+  ]);
+
+  /* 最近请求 */
+  const body = $("req-body");
+  body.replaceChildren();
+  if (!reqs.length) { const tr = node("tr"); const td = node("td", "muted", t("no_requests")); td.colSpan = 10; tr.append(td); body.append(tr); }
+  const badge = { stop: ["ok", "fin_stop"], tool_calls: ["ok", "fin_tool_calls"], length: ["", "fin_length"], cancel: ["warn", "fin_cancel"], disconnect: ["warn", "fin_disconnect"], error: ["err", "fin_error"] };
+  for (const r of reqs) {
+    const [cls, key] = badge[r.finish] || ["", null];
+    const tr = node("tr");
+    tr.append(node("td", null, new Date(r.time * 1000).toLocaleTimeString(locale())));
+    const tdS = node("td"); tdS.append(node("span", `tag ${cls}`, key ? t(key) : (r.finish || "–"))); tr.append(tdS);
+    tr.append(node("td", "muted", `${r.api || ""}${r.stream ? t("stream") : ""}`));
+    tr.append(node("td", "num", fmt(r.prompt_tokens)), node("td", "num", fmt(r.reused)), node("td", "num", fmt(r.output_tokens)), node("td", "num", fmt(r.decode_tok_s, 1)));
+    tr.append(node("td", "num", r.drafts_offered == null ? "–" : `${fmt(r.drafts_accepted)}/${fmt(r.drafts_offered)}`));
+    tr.append(node("td", "num", r.first_token_s == null ? "–" : `${fmt(r.first_token_s, 2)} s`), node("td", "num", `${fmt(r.duration_s, 1)} s`));
+    body.append(tr);
+  }
+  const kept = m.requests_kept == null ? reqs.length : m.requests_kept;
+  $("req-all").hidden = kept <= 12;
+  text("req-all", showAll ? t("show_fewer") : t("show_all", kept));
+  text("req-totals", renderTotals(m.totals));
+  renderCache(m.conversation_cache);
+}
+function renderTotals(tt) {
+  if (!tt || !tt.requests) return "";
+  const since = new Date(tt.since * 1000).toLocaleString(locale(), { weekday: "short", hour: "2-digit", minute: "2-digit" });
+  const read = tt.prompt_tokens - tt.reused;
+  const pSpeed = tt.prompt_ms > 0 && read > 0 ? t("totals_speed", fmt(read / (tt.prompt_ms / 1000))) : "";
+  const oSpeed = tt.decode_ms > 0 && tt.output_tokens > 0 ? t("totals_speed", fmt(tt.output_tokens / (tt.decode_ms / 1000), 1)) : "";
+  const drafts = tt.drafts_offered > 0 ? t("totals_drafts", fmt(100 * tt.drafts_accepted / tt.drafts_offered, 1)) : "";
+  return t("totals", since, fmt(tt.requests), fmt(read), pSpeed, fmt(tt.reused), fmt(tt.output_tokens), oSpeed, drafts);
+}
+function facts(el, rows) {
+  el.replaceChildren();
+  for (const [k, v] of rows) { if (v == null || v === "") continue; el.append(node("dt", null, k), node("dd", null, v)); }
+}
+function since(ts) {
+  if (!ts) return "";
+  const s = Math.max(0, Date.now() / 1000 - ts);
+  return s < 60 ? t("just_now") : s < 3600 ? t("min_ago", fmt(s / 60)) : t("h_ago", fmt(s / 3600, 1));
+}
+function renderCache(c) {
+  $("cc-card").hidden = !c;
+  if (!c) return;
+  $("cc-bars").hidden = !c.enabled;
+  if (c.enabled) {
+    text("cc-slots-text", t("cc_n", fmt(c.parked)));
+    const budget = (c.budget_mib || 0) * 1048576;
+    text("cc-mem-text", budget ? t("cc_mem", gb(c.bytes, 2), gb(budget, 1)) : t("cc_mem_only", gb(c.bytes, 2)));
+    $("cc-mem-bar").style.width = budget ? `${Math.min(100, 100 * c.bytes / budget)}%` : "0%";
+  }
+  text("cc-sum", c.requests ? t("cc_sum", fmt(c.requests_reused), fmt(c.requests)) : "");
+  const share = c.prompt_tokens ? t("cc_share", fmt(100 * c.reused_tokens / c.prompt_tokens)) : "";
+  const event = c.last_event ? t("cc_event", c.last_event === "parked" ? t("cc_parked_ev") : t("cc_restored_ev"), fmt(c.last_tokens), since(c.last_at)) : null;
+  facts($("cc-facts"), [
+    [t("cc_last_req"), c.last_prompt != null ? t("cc_last_req_v", fmt(c.last_reused || 0), fmt(c.last_prompt)) : null],
+    [t("cc_since"), c.requests ? t("cc_since_v", fmt(c.reused_tokens), share) : null],
+    [t("cc_pr"), c.enabled ? `${fmt(c.parks)} / ${fmt(c.restores)}${c.evictions ? t("cc_evicted", fmt(c.evictions)) : ""}` : null],
+    [t("cc_last"), c.enabled ? event : null],
+  ]);
+  text("cc-note", c.enabled ? t("cc_note_on") : t("cc_note_off"));
+}
+$("req-all").addEventListener("click", () => { showAll = !showAll; if (lastMetrics) render(lastMetrics); });
+$("lang").addEventListener("click", () => {
+  lang = lang === "zh" ? "en" : "zh";
+  try { localStorage.setItem(LS_LANG, lang); } catch (_) {}
+  applyI18n(); if (lastMetrics) render(lastMetrics);
+});
+applyI18n();
+text("pill-text", t("connecting"));
+poll();
+</script>
+</body>
+</html>
