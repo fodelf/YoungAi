@@ -10492,3 +10492,11 @@ A = 只在提示里找(Strata 默认索引范围), B = 提示 + 已生成都找;
 按匹配长度卡门, 门越高精度越高但覆盖掉得更快, 事后挑最优门也只 +1.0~1.1%(贪心), 温 1.0 +0.2%。③Strata 自报的 6~11% 来自代码改写(整段照抄), 与这里一致: 收益 ∝ 整段照抄的占比, CFO 没有这种段落。
 **判**: 提示查表草稿对 ds4 判负(贪心最优门 +1%, Strata 默认档 −13%), 不进引擎。探针与料留档: 本地 `speed-bench/lookup_draft_probe.c`(未提交), spark `texts/req_*_t0_s1.ids`(贪心料, 顺手可作以后的逐字节门料)。
 至此参考 Strata 的全部手段对 ds4 清零; 解码速度剩余账仍是 10-07 下午那本(单机小刀 46.5 → 48~50, 动墙只有第二台 Spark 或少读字节)。
+
+## 10-08 07:30 · README 加 GitHub 地址 + spark 重编 + HF 发布(用户令"把当前项目的github地址加到readme当中，编译引擎推送到huggingface")
+
+- README 双语三处加 `github.com/fodelf/YoungAi`(公开仓库, 默认分支 restructure): 页首语言切换行、§7 文件表 `bin/ds4` 那行(源码从哪编)、作者段(bug/PR 去向)。本地提交 3946dbc。
+- spark: `sync_spark.sh engine`(rsync 报 9 个 "cannot delete non-empty directory", 是重构前留在对面根目录的旧 server/kv/core… 目录, 无害) → `make cuda-spark` 重链 ds4/ds4-server(07:38, 体积与 10-07 同 16,541,352 / 17,661,608 B);
+  门: `make cuda-regression` exit 0(long_context_smoke + 采样核分布门四档全绿)。
+- HF: spark 直连 HF 仍不通(curl 000), 走 Mac 反向隧道 127.0.0.1:17897(curl 200); `hf_publish_spark.sh stage → small → verify`: HF 提交 **f1b842a1**, 只传了 README×2 + bin×2(347 个文件未变被 hf 摘掉),
+  VERIFY_OK 391 个文件与远端逐个同大小; bin/ds4 sha256 cb5621cf… / bin/ds4-server d2e09aef…; 线上 README.md 3 处、README.zh-CN.md 3 处含 GitHub 链接(raw 抓回核过)。
