@@ -18,7 +18,7 @@ pipeline_tag: text-generation
 
 # YoungAi — DeepSeek V4.1 Flash on one DGX Spark
 
-**English** · [中文](README.zh-CN.md)
+**English** · [中文](README.zh-CN.md) · Source code: [github.com/fodelf/YoungAi](https://github.com/fodelf/YoungAi)
 
 > One 128 GB box. Three files. A model whose official checkpoint is 510 GB.
 >
@@ -639,7 +639,7 @@ The steps below are what the script does, for doing it by hand.
 | `DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-med_fit_n15360-engine/` | ② medicine sidecar: gains on 40 layers, router bias on 29 layers |
 | `DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-sci_fit_n15360-engine/` | ② science sidecar: gains on 40 layers, router bias on 29 layers |
 | `posttrain-experimental-20260924/` | ③ an experimental post-training file: `gr_L39.bin` + `base.fnv` (see below) |
-| `bin/ds4`, `bin/ds4-server` | engine binaries, built on the Spark with `make cuda-spark` |
+| `bin/ds4`, `bin/ds4-server` | engine binaries, built on the Spark with `make cuda-spark` from the source at [github.com/fodelf/YoungAi](https://github.com/fodelf/YoungAi) (engine, CUDA kernels, quantization and sidecar toolchain) |
 | `LICENSE`, `LICENSE-DeepSeek` | MIT notices for the engine (incl. GGML) and for the model weights |
 
 **Step 1 — download and assemble.** By hand this needs 227 GB free during assembly (the installer needs one
@@ -746,7 +746,8 @@ and the engine refuses any other pairing:
 
 Wenzhou Wu (吴文周) · 310066827@qq.com
 
-Questions, reproduction reports and collaboration offers are welcome.
+Questions, reproduction reports and collaboration offers are welcome. Bug reports and pull requests go to
+[github.com/fodelf/YoungAi](https://github.com/fodelf/YoungAi).
 
 ## Acknowledgements
 

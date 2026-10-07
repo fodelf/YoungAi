@@ -1,6 +1,6 @@
 # YoungAi —— 一台 DGX Spark 跑 DeepSeek V4.1 Flash
 
-[English](README.md) · **中文**
+[English](README.md) · **中文** · 源码：[github.com/fodelf/YoungAi](https://github.com/fodelf/YoungAi)
 
 > 一台 128 GB 的机器，三个文件，一个官方权重 510 GB 的模型。
 >
@@ -539,7 +539,7 @@ bash install.sh stop && bash install.sh start --domain finance   # 换领域（�
 | `DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-med_fit_n15360-engine/` | ② 医疗侧车：增益 40 层，路由偏置 29 层 |
 | `DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-sci_fit_n15360-engine/` | ② 科研侧车：增益 40 层，路由偏置 29 层 |
 | `posttrain-experimental-20260924/` | ③ 一份实验性的后训练文件：`gr_L39.bin` + `base.fnv`（见下） |
-| `bin/ds4`、`bin/ds4-server` | 引擎二进制，在 Spark 上用 `make cuda-spark` 编出来的 |
+| `bin/ds4`、`bin/ds4-server` | 引擎二进制，在 Spark 上用 `make cuda-spark` 从源码编出来的；源码在 [github.com/fodelf/YoungAi](https://github.com/fodelf/YoungAi)（引擎、CUDA 核、量化与侧车工具链） |
 | `LICENSE`、`LICENSE-DeepSeek` | 引擎（含 GGML）与模型权重各自的 MIT 声明 |
 
 **第一步：下载并拼回基座。** 手动拼接时需要 227 GB 空闲空间（一键脚本只多占一份的空间，因为它每追加一份就删一份）。
@@ -633,7 +633,7 @@ SIDECAR=DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-vqfin41_vqhalf_a_n8192-en
 
 吴文周 · 310066827@qq.com
 
-欢迎来信交流问题、复现结果或合作。
+欢迎来信交流问题、复现结果或合作。Bug 和 Pull Request 请提到 [github.com/fodelf/YoungAi](https://github.com/fodelf/YoungAi)。
 
 ## 致谢
 
