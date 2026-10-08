@@ -18,7 +18,8 @@ extern "C" {
  * 在官方 bf16 模块边界处显式舍到 bf16(ds4_gpu_v41_round_bf16), 这样引擎 logits 与 Python 学生
  * (同一文件)可逐位置对拍到 KL 1e-4 量级 —— 这是 P2 的判决尺。激活张量一律 f32 行主序 [n, dim]。
  * 权重类型: fp4x32(type 43, 见 ds4_quantfmt.h) / f32 / f16 / VQ blob(DQVL v2)。
- * 只有 GPU 实现(CUDA); Metal 后置。 */
+ * 两个 GPU 后端都有实现: CUDA(src/cuda/cuda_v41_*.inc.cu, 部署路)与 Metal(src/metal/metal_v41_*.m + metal/v41_*.metal, 2026-10-08 落地;
+ * 没有解码整步 graph, 预填 GEMM 是权重边解边乘的 8×8 瓦片核而不是 cuBLAS ⇒ 与 CUDA 只差累加序, 门是 tests/t_metal_v41_*.c 的金标/有限差分)。 */
 
 /* out[n][out_dim] = x[n][in_dim] · Wᵀ, W 是 fp4x32 [out_dim 行][in_dim]。
  * n ≤ 8: 融合 GEMV(权重直接解码即乘, 不落 f16); 大批: 块解码成 f16 暂存 + cuBLAS GEMM(f32 累加)。

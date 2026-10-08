@@ -123,7 +123,7 @@ int ds4_gpu_flush_commands(void);
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
 
-/* ★解码整步 graph 原语(2026-09-18; CUDA 实现 src/cuda/cuda_decode_graph.inc.cu, Metal 只有占位)★
+/* ★解码整步 graph 原语(2026-09-18; CUDA 实现 src/cuda/cuda_decode_graph.inc.cu; Metal 没有流捕获, capture_begin 返回 0 ⇒ core 走直发路, 见 src/metal/metal_v41_graph.m)★
  * 用法(core_decode_graph.c): capture_begin → 照常发一整步的核/拷贝 → capture_end 得到图实例 → 每步 launch。
  * 捕获期间核**不执行**: capture_end 返回 NULL(捕获作废)时调用方必须把这一步按直发重来一遍。
  * host_flag_wait: 一个 1 线程小核自旋等 pinned 里的 flag ≥ want(都是 int32, ds4_gpu_host_alloc 给的映射内存), 超时约 5 s

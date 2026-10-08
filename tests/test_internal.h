@@ -49,6 +49,32 @@ void test_metal_go2b_routed_moe(void);
 void test_metal_kernel_group(void);
 void test_metal_short_prefill_ratio4(void);
 
+/* ---- t_metal_v41_*.c: DeepSeek V4.1 Metal 原语数值回归(2026-10-08; 合成数据, 不要模型) ---- */
+void test_v41_seed(uint64_t s);
+uint32_t test_v41_rand_u32(void);
+float test_v41_randf(void);
+float test_v41_bf16r(float x);
+int test_v41_model_begin(uint64_t bytes);
+uint64_t test_v41_model_alloc(uint64_t bytes);
+uint8_t *test_v41_model_ptr(uint64_t off);
+const void *test_v41_model_map(void);
+uint64_t test_v41_model_size(void);
+int test_v41_map(void);
+uint64_t test_v41_wbytes(uint32_t wt, uint64_t rows, uint64_t cols);
+void test_v41_make_weights(uint32_t wt, uint64_t rows, uint64_t cols, uint8_t *dst, float *ref);
+void test_v41_fill_bf16(float *x, uint64_t n, float scale);
+ds4_gpu_tensor *test_v41_tensor(const void *src, uint64_t bytes);
+int test_v41_read(const ds4_gpu_tensor *t, void *dst, uint64_t bytes);
+int test_v41_cmp(const char *name, const float *got, const float *ref, uint64_t n, float tol, float floor_);
+void test_v41_ref_matmul(const float *x, const float *w, float *out, uint32_t M, uint32_t N, uint32_t K, int round_out);
+void test_metal_v41_dense(void);
+void test_metal_v41_layer(void);
+void test_metal_v41_attn(void);
+void test_metal_v41_vq(void);
+void test_metal_v41_bwd(void);
+void test_metal_v41_bwd_attn(void);
+void test_metal_v41_group(void);
+
 /* ---- t_long_context.c(hex/token 字节助手被 t_vectors.c 复用) ---- */
 char *test_read_file(const char *path);
 bool test_hex_to_bytes(const char *hex, unsigned char *out, int cap, int *len);

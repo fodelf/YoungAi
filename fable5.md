@@ -10500,3 +10500,49 @@ A = 只在提示里找(Strata 默认索引范围), B = 提示 + 已生成都找;
   门: `make cuda-regression` exit 0(long_context_smoke + 采样核分布门四档全绿)。
 - HF: spark 直连 HF 仍不通(curl 000), 走 Mac 反向隧道 127.0.0.1:17897(curl 200); `hf_publish_spark.sh stage → small → verify`: HF 提交 **f1b842a1**, 只传了 README×2 + bin×2(347 个文件未变被 hf 摘掉),
   VERIFY_OK 391 个文件与远端逐个同大小; bin/ds4 sha256 cb5621cf… / bin/ds4-server d2e09aef…; 线上 README.md 3 处、README.zh-CN.md 3 处含 GitHub 链接(raw 抓回核过)。
+
+## 10-08 晚 · Metal 侧 V4.1 全部原语落地(用户令"把 mac 没有实现的代码先实现了, 不要管这台设备是否能跑")
+
+**起点**: `src/metal/metal_v41_stub.m` 93 个桩(前向 59 + 反传/草稿蒸馏 34), V4.1 模型/反修侧车/后训练件在 Mac 上只能编译、一到前向就停; metal/ 下没有任何 V4.1 shader。
+**落地**(全部按 src/cuda 的同名核逐式转录, 口径同: f32 计算, 官方 bf16 边界处舍 bf16; 解码路/格式基元与 src/common 同一张表):
+- shader 8 份 `metal/v41_{common,dense,layer,attn,sample,vq,bwd,draft}.metal`(拼接清单在 metal_source.m 末尾, common 必须最前): bf16r / E4M3 / E8M0 / FP4 / q4_K 拆包 / 树归约 / 单调键;
+  GEMV 8 档 NT 实例(fp4x32·q4_K·bf16·f32·fp8blk 五种类型一个核, 一 lane 8 个连续元素, ksplit 段和定序)、8×8 simdgroup 瓦片 GEMM 两套(wgemm 权重边解边乘、NT/NN 两向; sgemm 四种转置);
+  RMSNorm / mHC 四件(含合一核, sinkhorn 在 simdgroup 0 并行) / engram 门 / 路由(含偏置侧车) / SwiGLU / 压缩器(含解码一步 n 行) / RoPE(YaRN) / 激活量化 / KV 打包 / 窗口环;
+  稀疏注意力标量版(8 头一 threadgroup, 8 键一片在线 softmax) / indexer 打分(含 C2 候选紧凑) / 候选块 radix select / topk radix select; 设备采样核(Gumbel-max + 三道门 + 拒绝采样);
+  VQ 专家解码即乘(v2 f16 码本任意位宽、v3 层码本 E4M3 12 位 + 13 位位平面)、预填按专家分组(同一行码字只解一次)、尾巴合一、取料展开、草稿塔 dense MoE(逐专家 fp4x32, 跨视图按视图分发);
+  反传: 转置乘(wgemm NN) / 教师 top-K + KL / RMSNorm·hc_pre·hc_post·SwiGLU·路由·压缩器·engram 门·mHC 混合系数(sinkhorn 倒推)反向 / 稀疏注意力反向(device atomic float) / 放大器反向 / Adam / Σg² / bf16 存档 /
+  routed 专家反向(直读位流行点积 + 转置累加, 放回 token 行走 inv 表定序) / 草稿块注意力前向+反向 / 陪审团 / 总变差 / markov 表取行散加。
+- 主机 10 份 `src/metal/metal_v41_{common,dense,misc,layer,attn,moe,graph}.m` + `metal_bwd_{dense,layer}.m` + `metal_draft_kd.m`, 参数块镜像 `metal_v41_args.h`, 内部头 `metal_v41.h`。桩文件删除。
+- 三个 Metal 特有的处理: ①没有流捕获 ⇒ decode graph 四件保持返回 0, core 走直发(metal_v41_graph.m, 这不是"未实现"); ②threadgroup 没有 64 位原子 ⇒ 采样核 top_p 定点质量拆 lo/hi 两个 32 位原子带进位,
+  定点权重用 2^16 整数 + 2^24 小数拼 u64(CUDA 用 double); ③Metal 库默认 fast-math, `isfinite` 可能被折成恒真 ⇒ 全部换成位型判定 v41_finite(与 C 侧"-ffast-math 禁 NaN 哨兵"同一类坑)。
+- 主机读设备结果(预填的路由排序 / 取料 / Σg²)用 v41_host_sync(flush + 等 pending, 批保持打开): ds4_gpu_synchronize 在 Metal 上会把批关掉, core 之后的 end_commands 报失败 —— V4 路的老约定, 没动它。
+- 已知只做到"正确", 没做的优化: 没有 graph; 预填 GEMM 是 f32 瓦片核不是张量核; 码本不进 threadgroup 内存(Apple GPU 上限 32 KB, 64 KB 码本放不下), 走 device 读; 注意力/indexer 只有标量版。
+**门**(本机 M4 真 GPU, 合成数据, 不要模型): 新套件 `ds4_test --metal-v41`(tests/t_metal_v41_{util,dense,layer,attn,vq,bwd,bwd2,group}.c, 126 项全 ok):
+- 五种权重 GEMV n=1/3 + GEMM n=40 + 分组 + 反传转置乘 对 src/common 解码 + CPU 逐式乘: 不舍 bf16 的 max_abs 1e-4 量级; 舍 bf16 的逐元素同(max_abs 0)。嵌入/列平方和逐元素同。
+- mHC 四件 / 合一核 / hc_post / engram 门 / 路由 top-6 / SwiGLU / 池化 / RoPE / 激活量化(fp4 两档 + fp8)逐元素同或 1e-5; KV 打包解回 ↔ act_quant 逐位同(max_abs 0); 窗口环提交/快照/还原逐位同。
+- 稀疏注意力对 CPU 精确 softmax 2%(p 舍 bf16 一格); indexer 打分/候选块/topk/C2 紧凑路整数结果 0 不一致; 采样核 温 1 峰值词 36/64、top_k=1 全 argmax、top_p/min_p 保留集语义、投机结构全对。
+- VQ v2/9 位、v3/12 位、v3/13 位(位平面): 解码路 n=3、预填路 n=12、尾巴合一、反修 gr 覆盖、取料 全部 **max_abs 0**(逐元素同 CPU 参考); 草稿塔 dense MoE 逐元素同。
+- 反传: RMSNorm / hc_pre / hc_post / 路由 / 池化 / engram 门 / mHC 混合系数 / 稀疏注意力 q·kv·comp / 草稿块注意力 q·blk 有限差分全过(|fd−g| ≤ 1e-4~1e-5 量级); 教师 top-K / KL / 总变差 loss 与梯度对 CPU 1e-6;
+  routed 专家反向 g_w 逐元素同, g_x 对直通解析式 max_abs ≤ 3e-4(首跑 28% 差是**参考**没把 g/u 舍到 bf16 再判截断: g=1.9993 对截断边 2.0 翻面, 修参考不修核)。
+- `make test` 全绿(含 linecount, 全部新文件 ≤ 500 行), `make`/`make ds4_test` 零新警告。
+**未做 / 待批**: 代码全在工作区未提交(commit 要用户批准)。真模型跑不了: 这台 Mac 16 GB, V4.1 113 GB 全驻留; ≥128 GB 的 Mac 才能跑端到端门(ds4_test --logprob-vectors / 五指标)。
+
+**10-08 22:27~22:38 用户 "看看 cuda 版本有没有问题, 跑一下侧车五指标"**(Metal 落地那批改动同步到 spark 后的 CUDA 门):
+- 测试套件先限定 Apple 构建(`tests/t_metal_v41_*.c` 与 t_main.c 的 `--metal-v41` 条目加 `__APPLE__`): CUDA 核的形状闸不同(专家核只认 11/12/13 位、注意力只认 64 头), 合成小形状在 CUDA 构建里会误报。
+- `sync_spark.sh engine` → `make cuda-spark` 全量通过(新 ds4 md5 7ff1de85; 现役 07:38 二进制留档 `ds4.base_metal1008` md5 17e46660); `make cuda-regression` 全绿(top-k 多块 parity n_comp=262144 OK / 长上下文 smoke OK)。
+- `v41_amp_pair_judge.sh … --bins ds4,ds4.base_metal1008 <grrb-vqfin41_vqhalf_a_n8192-engine>`(日志 spark `/tmp/judge_metal1008.log`), 四趟 25/25/6/6 s:
+| 二进制 | 金融 j 8192 | wt2 512 |
+|---|---|---|
+| 新 ds4 | 74.77% / Σmin 0.7441(0.8090/0.2833) / KLD 0.51310 / PPL 8.8980(1.275) | 80.27% / 0.7887(0.9688/0.0876) / 0.61697 / 2.7485(1.659) |
+| ds4.base_metal1008 | 一字不差 | 一字不差 |
+  学生 logits `cmp`: 金融 4,236,247,048 字节同 ✓, wt2 264,765,448 字节同 ✓ —— 与 10-07 两趟(ptrain1006 / envclean)的七行数字也一字不差。
+**判**: 这批改动没碰 `src/cuda` 一行, CUDA 路逐字节不变; 侧车五指标与 README §5.1 金融行继续对应。spark 上两个进程都已退出, available 118 GB。
+
+## 10-08 22:55 · 服务起给交易 Agent 过夜(用户令"启动引擎服务加金融侧车, 对应的启动交易 Agent 镜像服务, 晚上跑任务")
+
+- spark `serve_1m_spark.sh start`(默认现役对 v3 + grrb 金融侧车, 不挂 ③; 二进制 10-08 22:27 那份): 22:53:48 起, 22:55:25 SERVE1M_UP,
+  起来后 MemAvailable 11,356 MB(地板 10,000), 看门狗红线 2,500 MB 已起; trace 落 `gguf/v41/night/trace/current` 指的那份。
+  冒烟(温 0)原样: "市盈率（PE）是股价与每股收益的比值，偏高通常意味着市场对公司未来增长预期较高，但也可能暗示股价被高估。" 31 token 自己停。
+- 交易 Agent: Mac docker 三容器(frontend 9528 / backend 8001 / mongodb)已连续跑 4 天, 没重建; `/api/health` ok; 容器内打
+  `http://192.168.2.97:8000/v1/models` 通(context_length 1048576)。`/api/tasks/status`: 调度器 running, 下一次早盘 **10-09 04:30**, 复盘 10-09 15:30。
+- 10-08 04:30 早盘失败 = 当时 spark 服务没起(`litellm ... Connection error`), 不是 Agent 的事; 今晚 04:30 会打这台服务。

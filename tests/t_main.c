@@ -22,6 +22,9 @@ static const ds4_test_entry test_entries[] = {
     {"--local-golden-vectors", "local-golden-vectors", "local top-k/logit drift regression for long Metal prefill", test_local_golden_vectors, 1},
     {"--metal-short-prefill", "metal-short-prefill", "Metal ratio-4 short prefill regression", test_metal_short_prefill_ratio4, 1},
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_kernel_group, 0},
+#ifdef __APPLE__
+    {"--metal-v41", "metal-v41", "DeepSeek V4.1 Metal primitives vs src/common golden + finite differences (no model)", test_metal_v41_group, 0},
+#endif
     {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence, 1},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group, 0},

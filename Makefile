@@ -350,7 +350,8 @@ linenoise.o: linenoise.c linenoise.h
 # src/metal 全组 .m 只包含 metal_internal.h(其再包含 metal_args.h/metal_expert.h 与根公共头),
 # 头依赖对整组一致。metal_source.o 额外依赖 .metal kernel 文件(运行时拼接清单),
 # metal_moe_vq.o/metal_routed_moe_batch.o 额外包含 vq_fmt.h。
-METAL_INTERNAL_HDRS = src/metal/metal_internal.h src/metal/metal_args.h src/metal/metal_expert.h ds4_gpu.h ds4.h
+METAL_INTERNAL_HDRS = src/metal/metal_internal.h src/metal/metal_args.h src/metal/metal_expert.h ds4_gpu.h ds4.h \
+                      src/metal/metal_v41.h src/metal/metal_v41_args.h ds4_gpu_v41.h ds4_gpu_bwd.h ds4_gpu_core.h
 src/metal/%.o: src/metal/%.m $(METAL_INTERNAL_HDRS)
 	$(CC) $(OBJCFLAGS) -c -o $@ $<
 

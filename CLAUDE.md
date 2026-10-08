@@ -20,7 +20,9 @@ src/common/   全仓唯一的格式基元: GGUF 读取(ds4_gguf)、量化块 deq
 src/core/     引擎主体(原 ds4.c 24.6k 行拆 60 文件): gguf 加载/权重绑定/CPU 前向/
               GPU graph 编排/tokenizer/采样/session 与 payload。内部头 core_internal.h。
 src/metal/    Metal 后端(原 ds4_metal.m 拆 62 文件); shader 在顶层 metal/(运行时按
-              相对路径拼接加载, 移动该目录=运行时炸)。
+              相对路径拼接加载, 移动该目录=运行时炸)。V4.1 原语(前向/反传/草稿蒸馏)在
+              metal_v41_*.m / metal_bwd_*.m / metal_draft_kd.m + metal/v41_*.metal(2026-10-08);
+              只缺解码整步 graph(Metal 无流捕获, core 走直发)。单测 `ds4_test --metal-v41`。
 src/cuda/     CUDA 后端: ds4_cuda.cu 是聚合根, 分片在 src/cuda/*.inc.cu(单 TU 语义)。
               ds4_gpu.h(伞头)+六个子头是 Metal/CUDA 共同契约, 已带 extern "C" 守卫,
               CUDA 直接 include——契约漂移=编译错误。
