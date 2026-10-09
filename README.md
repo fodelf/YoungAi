@@ -12,6 +12,8 @@ tags:
 - gguf
 - cuda
 - dgx-spark
+- metal
+- apple-silicon
 - on-device
 pipeline_tag: text-generation
 ---
@@ -29,6 +31,12 @@ single NVIDIA DGX Spark (GB10, 128 GB unified memory). Everything described here
 the vector-quantization format, the solvers that produce the sidecar and the post-training file,
 the CUDA kernels, and the rulers we judge all of it with. The model architecture is DeepSeek's and
 is not re-explained here — read the official release for that.
+
+**Open source.** The engine, the CUDA and Metal kernels, the quantizer and the sidecar / post-training
+solvers are public under MIT at [github.com/fodelf/YoungAi](https://github.com/fodelf/YoungAi).
+**Macs too.** Every GPU operation V4.1 needs also has a Metal implementation for Apple Silicon, checked
+kernel by kernel on a real Apple GPU; it has not yet run the full model end to end — see
+[§7](#build-from-source-linux--cuda-or-macos--metal).
 
 **How to read this page.** It unfolds in five steps; stop wherever you have what you need.
 
@@ -588,8 +596,9 @@ Negative results carry as much of the design as positive ones. Each row was meas
 
 **What you need.**
 
-- NVIDIA DGX Spark (GB10, sm_121, 128 GB) — the only machine tested. The FP8 codebook path needs sm_89
-  or newer. V4.1 runs on CUDA only.
+- NVIDIA DGX Spark (GB10, sm_121, 128 GB) — the only machine tested end to end. The FP8 codebook path
+  needs sm_89 or newer. For a Mac see [Build from source](#build-from-source-linux--cuda-or-macos--metal);
+  everything else in this section is the Spark path.
 - Linux aarch64 with the CUDA 13 runtime (`libcudart.so.13`, `libcublas.so.13`, `libcublasLt.so.13`;
   DGX OS ships them). Missing libraries show up as `error while loading shared libraries: libcudart.so.13`.
 - ~320 GB of local SSD: 113.6 GB for this repository + 203 GB for two official shards (below).
@@ -724,7 +733,47 @@ and the engine refuses any other pairing:
     --posttrain posttrain-experimental-20260924
 ```
 
-**Source code** of the engine, the quantizer and the solvers is not public yet.
+### Build from source (Linux + CUDA, or macOS + Metal)
+
+Source: [github.com/fodelf/YoungAi](https://github.com/fodelf/YoungAi) (default branch `restructure`, MIT).
+Pure C99 (Objective-C only where Metal requires it) and one hand-written `Makefile` — no CMake, no Python
+in the numeric path.
+
+```sh
+git clone https://github.com/fodelf/YoungAi.git && cd YoungAi
+make cuda-spark                    # Linux + CUDA: what bin/ here is built with; other GPUs: make cuda CUDA_ARCH=sm_120
+make                               # macOS + Metal (Apple Silicon): ds4, ds4-server, ds4-bench, ds4-eval, ds4-agent
+make test                          # offline tests; suites that need the real model print SKIP, not FAIL
+```
+
+On Linux a bare `make` only prints the target list — pick `cuda-spark` / `cuda` explicitly. Binaries land
+in the repository root (`./ds4`, `./ds4-server`), replacing `./bin/…` in the commands above.
+
+**On a Mac.** Every GPU operation V4.1 uses has a Metal implementation, transcribed kernel by kernel from
+the CUDA one: the forward pass, the VQ expert decode (12-bit and 13-bit bit-plane), sidecar gains and router
+bias, GPU sampling and speculative verification, and the backward pass the post-training solver needs.
+`./ds4_test --metal-v41` checks 126 cases on a real Apple GPU against CPU references on synthetic data
+(no model needed): VQ expert decode matches bit for bit; the other matrix products agree to ~1e-4 and
+are identical wherever the model rounds to bf16; attention is within one bf16 rounding step; every
+backward kernel passes a finite-difference check.
+
+What has **not** been done yet: running the real model on a Mac. The base stays resident in memory
+(113.6 GB) and our Mac has 16 GB, so there are no Mac speed or quality numbers, and whether a 128 GB Mac
+is enough in practice is untested. It is also expected to be slower than its hardware allows for now: Metal
+has no stream capture, so each token is dispatched kernel by kernel instead of as one recorded graph;
+prefill uses f32 tiles rather than the GPU's matrix units; attention has only a scalar kernel.
+
+To try it on a Mac with enough memory: `install.sh` is Linux-only, so do Steps 1–2 by hand (use
+`shasum -a 256 -c` in place of `sha256sum -c`, and skip `chmod` — the downloaded `bin/` is Linux), then
+start your own build from the source tree:
+
+```sh
+./ds4-server --metal -m /path/to/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf --zchain /path/to/$SIDECAR \
+    --engram-dir /path/to/DeepSeek-V4.1-Flash --mem-budget-mb 110000 --port 8000
+```
+
+Start it from the source directory (or pass `--chdir <source dir>`): the Metal shaders are compiled at
+startup from `metal/*.metal` by relative path, so a binary copied elsewhere cannot find them.
 
 ---
 
@@ -735,8 +784,9 @@ and the engine refuses any other pairing:
   decision points stay at 55% → 55%. One flipped token changes one sentence, not a chain of reasoning.
 - **Five domains.** Finance, code, law, medicine and science (§5.1), all five sidecars in this repository.
   All are judged teacher-forced on held-out text; none has been evaluated on end-to-end tasks (agentic coding, legal or clinical question answering).
-- **CUDA only, one machine type tested.** V4.1 does not run on Metal.
-- **Speculative decoding is greedy-only.** Sampling requests fall back to plain decode.
+- **One machine type tested end to end.** All numbers on this page are from a DGX Spark. The Metal
+  backend passes its kernel tests but has not run the real model yet (see
+  [Build from source](#build-from-source-linux--cuda-or-macos--metal)).
 - **Prefill on tensor cores is not bit-identical** to the fused scalar path (experts) or to the two-pass
   attention kernel (single-pass flash attention); both differences are at the rounding-noise level (§4.4).
 

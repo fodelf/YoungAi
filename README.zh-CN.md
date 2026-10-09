@@ -10,6 +10,11 @@ ds4 是一个原生 C/CUDA 推理引擎加一套离线工具链，把 DeepSeek V
 （GB10 芯片，128 GB 统一内存）上。下面写的全部是我们自己的设计：向量量化格式、产出侧车和后训练文件的
 解算器、CUDA 核，以及评判这一切的尺子。模型结构本身是 DeepSeek 的，这里不复述，请看官方发布。
 
+**开源。** 引擎、CUDA 与 Metal 核、量化器、侧车与后训练解算器全部以 MIT 协议公开在
+[github.com/fodelf/YoungAi](https://github.com/fodelf/YoungAi)。
+**也支持 Mac。** V4.1 用到的每一个 GPU 操作在 Apple Silicon 上都有 Metal 实现，已在真 Apple GPU 上逐核验过；
+但还没在 Mac 上端到端跑过整个模型——详见第七节"从源码编译"。
+
 **怎么读这篇。** 按五步展开，读到够用就可以停：
 
 1. **数字** —— 跑得动什么、多快、离原模型多近。
@@ -490,8 +495,8 @@ KL 0.5149 → 0.5131、top-1 一致率 74.56% → 74.77%；除注意力核外其
 
 **需要什么。**
 
-- NVIDIA DGX Spark（GB10，sm_121，128 GB）——唯一实测过的机器。FP8 码本路径需要 sm_89 及以上。
-  V4.1 只支持 CUDA。
+- NVIDIA DGX Spark（GB10，sm_121，128 GB）——唯一端到端实测过的机器。FP8 码本路径需要 sm_89 及以上。
+  Mac 见本节末尾"从源码编译"；本节其余内容都是 Spark 的走法。
 - Linux aarch64，装有 CUDA 13 运行库（`libcudart.so.13`、`libcublas.so.13`、`libcublasLt.so.13`；DGX OS 自带）。
   缺库时的报错是 `error while loading shared libraries: libcudart.so.13`。
 - 本地 SSD 约 320 GB：本仓库 113.6 GB + 官方两个分片 203 GB（见下）。
@@ -613,7 +618,40 @@ SIDECAR=DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-vqfin41_vqhalf_a_n8192-en
     --posttrain posttrain-experimental-20260924
 ```
 
-**源码**（引擎、量化器、解算器）暂未公开。
+### 从源码编译（Linux + CUDA，或 macOS + Metal）
+
+源码：[github.com/fodelf/YoungAi](https://github.com/fodelf/YoungAi)（默认分支 `restructure`，MIT 协议）。
+纯 C99（只有 Metal 必须的地方用 Objective-C），一个手写 `Makefile`——不用 CMake，数值链路里没有 Python。
+
+```sh
+git clone https://github.com/fodelf/YoungAi.git && cd YoungAi
+make cuda-spark                    # Linux + CUDA：本仓库 bin/ 就是这么编的；别的显卡用 make cuda CUDA_ARCH=sm_120
+make                               # macOS + Metal（Apple Silicon）：编出 ds4、ds4-server、ds4-bench、ds4-eval、ds4-agent
+make test                          # 离线测试；需要真模型的套件打 SKIP，不算失败
+```
+
+Linux 上直接 `make` 只会打印目标列表——要显式选 `cuda-spark` / `cuda`。二进制出在仓库根目录（`./ds4`、`./ds4-server`），
+上面命令里的 `./bin/…` 换成它们即可。
+
+**在 Mac 上。** V4.1 用到的每一个 GPU 操作都有 Metal 实现，逐核照 CUDA 版转写：前向、VQ 专家解码（12 bit 和 13 bit
+位平面）、侧车增益与路由偏置、GPU 采样与投机验证，以及后训练解算要用的反向传播。`./ds4_test --metal-v41` 在真
+Apple GPU 上用合成数据对 CPU 参考核了 126 项（不需要模型）：VQ 专家解码逐位相同；其余矩阵乘误差约 1e-4，在模型舍到
+bf16 的地方逐元素相同；注意力差在一个 bf16 舍入格以内；每个反向核都过了有限差分检查。
+
+**还没做的**：在 Mac 上跑真模型。基座要整个常驻内存（113.6 GB），而我们手上的 Mac 只有 16 GB，所以还没有任何 Mac 上的
+速度和质量数字，128 GB 的 Mac 实际够不够也没验过。眼下它也跑不满硬件：Metal 没有流捕获，每个 token 只能一个核一个核
+地发，不能像 CUDA 那样整步录成一张图重放；预填用的是 f32 瓦片，没用上 GPU 的矩阵单元；注意力只有标量版的核。
+
+想在内存够大的 Mac 上试：`install.sh` 只支持 Linux，第一、二步手动做（`sha256sum -c` 换成 `shasum -a 256 -c`；`chmod`
+那步跳过——下载来的 `bin/` 是 Linux 的），然后用自己编的二进制在源码目录里起服务：
+
+```sh
+./ds4-server --metal -m /path/to/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf --zchain /path/to/$SIDECAR \
+    --engram-dir /path/to/DeepSeek-V4.1-Flash --mem-budget-mb 110000 --port 8000
+```
+
+必须在源码目录里启动（或传 `--chdir <源码目录>`）：Metal shader 是启动时按相对路径从 `metal/*.metal` 现编的，
+把二进制拷到别处就找不到它们。
 
 ---
 
@@ -623,8 +661,8 @@ SIDECAR=DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-vqfin41_vqhalf_a_n8192-en
   其他 token，但迁移不出去：留出交易日上决策点 55% → 55%。翻一个 token 只能改一句话，改不动整条推理链。
 - **五个领域。** 金融、编程、法律、医疗、科研（指标见 5.1），五个侧车都在本仓库里。所有侧车都只在留出文本上做过 teacher-forced 判决，还没在端到端任务上评过（Agent 式编程、
   法律或临床问答）。
-- **只支持 CUDA，只在一种机器上验过。** V4.1 不能在 Metal 上跑。
-- **投机解码只在贪心时生效。** 采样请求自动退回纯解码。
+- **只在一种机器上端到端验过。** 本页所有数字都来自 DGX Spark。Metal 后端过了逐核测试，但还没跑过真模型
+  （见第七节"从源码编译"）。
 - **张量核预填不是逐位相同**：专家核对老的融合路径、单遍 flash 注意力对两遍扫键的旧核，差距都在舍入噪声量级（见 4.4）。
 
 ---
