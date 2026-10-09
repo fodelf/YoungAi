@@ -10546,3 +10546,12 @@ A = 只在提示里找(Strata 默认索引范围), B = 提示 + 已生成都找;
 - 交易 Agent: Mac docker 三容器(frontend 9528 / backend 8001 / mongodb)已连续跑 4 天, 没重建; `/api/health` ok; 容器内打
   `http://192.168.2.97:8000/v1/models` 通(context_length 1048576)。`/api/tasks/status`: 调度器 running, 下一次早盘 **10-09 04:30**, 复盘 10-09 15:30。
 - 10-08 04:30 早盘失败 = 当时 spark 服务没起(`litellm ... Connection error`), 不是 Agent 的事; 今晚 04:30 会打这台服务。
+
+## 10-09 10:53 · README 写开源 + 支持 Mac, 推 GitHub 与 HF(用户令"更新readme，把开源和支持mac加入进去，并且推送git和HuggingFace")
+
+- README 双语: 页首加"开源(MIT, GitHub)/也支持 Mac"两句; §7 删"源码暂未公开"(与页首 GitHub 链接自相矛盾), 新增"从源码编译"小节
+  (make cuda-spark / make / make test; Mac 验证程度 = `--metal-v41` 126 项合成数据, 未跑真模型、无 Mac 速度/质量数字; 三项未做优化;
+  Mac 起服命令 + shader 相对路径须在源码目录启动); §8 "只支持 CUDA"改为"只在一种机器上端到端验过"; 顺手删过时条目"投机只在贪心时生效"。
+  HF 卡片 tags 加 metal / apple-silicon。提交 435cb53, 已推 origin/restructure。
+- HF: spark 直连仍 000, 走 Mac 反向隧道 17897(200); `hf_publish_spark.sh stage → small --keep-bin → verify`, HF 提交 **56335725**,
+  VERIFY_OK 391 个文件; 线上 README.md / README.zh-CN.md raw 抓回 md5 与本地一致(a2b7a648 / 9b48a4a4)。bin/ 未动(仍是 10-08 07:38 那份)。
