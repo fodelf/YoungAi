@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-**DwarfStar** (`ds4`) is a self-contained native inference engine **purpose-built for DeepSeek V4 Flash** (and, on very high-memory machines, DeepSeek V4 PRO). It is *not* a generic GGUF runner and does **not** link against GGML — it reimplements the loading, tokenizer, prompt/DSML rendering, KV cache, graph scheduling, server API, and a native coding agent for this one model family. It only runs the DeepSeek V4 GGUFs published for this project (asymmetric quant: routed MoE experts at `IQ2_XXS`/`Q2_K`, everything else left high-precision). `README.md`(英文主版) / `README.zh-CN.md` 是 V4.1 三文件架构与现役读数的对外介绍; V4 时代的完整功能说明(服务端 API、磁盘 KV、运行时参数、Capability Evaluation)归档在 `docs/archive/README_v4_upstream.md`; 模型见 `MODEL_CARD.md`。
+**DwarfStar** (`ds4`) is a self-contained native inference engine **purpose-built for DeepSeek V4 Flash** (and, on very high-memory machines, DeepSeek V4 PRO). It is *not* a generic GGUF runner and does **not** link against GGML — it reimplements the loading, tokenizer, prompt/DSML rendering, KV cache, graph scheduling, server API, and a native coding agent for this one model family. It only runs the DeepSeek V4 GGUFs published for this project (asymmetric quant: routed MoE experts at `IQ2_XXS`/`Q2_K`, everything else left high-precision). `README.md`(英文主版) / `README.zh-CN.md` 是 V4.1 三文件架构与现役读数的对外介绍; V4 时代的完整功能说明(服务端 API、磁盘 KV、运行时参数、Capability Evaluation)归档在 `docs/archive/README_v4_upstream.md`; 模型见 `docs/MODEL_CARD.md`。
 
 Primary backend is **Metal on macOS**; **CUDA on Linux** is the second production path; the **CPU path is reference/debug only**.
 
@@ -36,6 +36,7 @@ gguf-tools/   离线量化与反修工具链(独立 Makefile): quantize/(HF→GG
               legacy/(冻结旧代) docs/ migrate/(迁移金标账本 golden.txt)。
 tests/        ds4_test 套件(tests/t_*.c)+server 测试(server_tests_*.c)+单元测试
               (unit/)+金标夹具(fixtures/quantfmt: dequant 七类型逐字节金标)。
+docs/         根目录以外的全部 md(MODEL_CARD/CONTRIBUTING/AGENT 与各战役方案稿 speed/decode/back 等); 根目录只留 README×2、CLAUDE.md、fable5.md。
 docs/archive/ 已收官战役的设计稿。根目录还剩: 公共头(ds4.h/ds4_gpu*.h 等)、
               vendored(rax/linenoise)、小模块(ds4_z/ds4_loss/ds4_corr/ds4_zchain/
               ds4_multimodal/ds4_spatial/ds4_css/ds4_posttrain)、Makefile、文档。
@@ -73,7 +74,7 @@ make -C gguf-tools all amp legacy calib bench tools-test   # 工具链全目标(
 
 ## Test
 
-Read `CONTRIBUTING.md` before changing inference code — it defines the correctness and speed regression tracks.
+Read `docs/CONTRIBUTING.md` before changing inference code — it defines the correctness and speed regression tracks.
 
 ```sh
 make test                      # ds4_unit(离线金标) + linecount 守卫 + 抽取器自测 + ds4_test 全套
@@ -145,7 +146,7 @@ Quantization/GGUF changes are scored with `gguf-tools/bench/quality-testing` (`m
   routing/quant/repack changes additionally run `ds4-eval q1..q4 --temp 0 --seed 1`。
   量化质量判决只认参考前向尺(caliper), 真代码基准必须 completions 口径(memory 铁律)。
 
-## Project rules (from `AGENT.md` — follow these)
+## Project rules (from `docs/AGENT.md` — follow these)
 
 - **No C++.** Pure C99, with Objective-C only where Metal requires it. Python 禁止进入
   数值/算法链(全仓零 Python 裁决; 仅存的 .py 是外部 API 采集/绘图/金标夹具生成器)。
