@@ -10,10 +10,10 @@
 </p>
 
 <p align="center">
-  <a href="README.md">English</a> · <b>中文</b> ·
+  <a href="https://github.com/fodelf/YoungAi/blob/restructure/README.md">English</a> · <b>中文</b> ·
   <a href="https://github.com/fodelf/YoungAi">GitHub</a> ·
   <a href="https://huggingface.co/wenzhouwu/YoungAi-DeepSeek-V4.1-Flash">Hugging Face</a> ·
-  <a href="docs/TECHNICAL.zh-CN.md">技术细节</a>
+  <a href="https://github.com/fodelf/YoungAi/blob/restructure/docs/TECHNICAL.zh-CN.md">技术细节</a>
 </p>
 
 ![YoungAi 工作台：聊天](docs/img/studio-chat.png)
@@ -45,7 +45,7 @@
 | 通用英文（WikiText-2），五个侧车挂任意一个 | 78.5% → **80.7–82.8%** | 0.769 → **0.787–0.801** |
 
 *top-1 一致率*：我们最可能写的下一个字，有多少比例和原模型一样。*Σmin*：两边下一个字的概率分布重叠了多少，
-1.0 就是一模一样。完整表格和测法见[技术细节第五章](docs/TECHNICAL.zh-CN.md#五实测结果)。
+1.0 就是一模一样。完整表格和测法见[技术细节第五章](https://github.com/fodelf/YoungAi/blob/restructure/docs/TECHNICAL.zh-CN.md#五实测结果)。
 
 **速度**
 
@@ -144,9 +144,9 @@ Mac 上跑过，我们手上的 Mac 只有 16 GB。
 
 上面一层叠在下面一层上，不改下面任何东西。① 单独就是一个完整的模型。
 
-- [为什么这么设计](docs/TECHNICAL.zh-CN.md#二三个信念)
-- [算法](docs/TECHNICAL.zh-CN.md#四算法)
-- [没走通的路](docs/TECHNICAL.zh-CN.md#六没走通的路)
+- [为什么这么设计](https://github.com/fodelf/YoungAi/blob/restructure/docs/TECHNICAL.zh-CN.md#二三个信念)
+- [算法](https://github.com/fodelf/YoungAi/blob/restructure/docs/TECHNICAL.zh-CN.md#四算法)
+- [没走通的路](https://github.com/fodelf/YoungAi/blob/restructure/docs/TECHNICAL.zh-CN.md#六没走通的路)
 
 ## 局限
 

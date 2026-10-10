@@ -30,10 +30,10 @@ pipeline_tag: text-generation
 </p>
 
 <p align="center">
-  <b>English</b> · <a href="README.zh-CN.md">中文</a> ·
+  <b>English</b> · <a href="https://github.com/fodelf/YoungAi/blob/restructure/README.zh-CN.md">中文</a> ·
   <a href="https://github.com/fodelf/YoungAi">GitHub</a> ·
   <a href="https://huggingface.co/wenzhouwu/YoungAi-DeepSeek-V4.1-Flash">Hugging Face</a> ·
-  <a href="docs/TECHNICAL.md">Technical notes</a>
+  <a href="https://github.com/fodelf/YoungAi/blob/restructure/docs/TECHNICAL.md">Technical notes</a>
 </p>
 
 ![YoungAi Studio: chat](docs/img/studio-chat.png)
@@ -68,7 +68,7 @@ running the original weights at full precision, on text that was never used for 
 
 *Same top-1* is how often our most likely next token is also the original's. *Σmin* is how much of the two
 next-token distributions overlap: 1.0 means identical. Full tables and how they are measured:
-[technical notes §5](docs/TECHNICAL.md#5-results).
+[technical notes §5](https://github.com/fodelf/YoungAi/blob/restructure/docs/TECHNICAL.md#5-results).
 
 **Speed**
 
@@ -177,9 +177,9 @@ tests pass on a real Apple GPU. The full model has not run on a Mac yet; ours ha
 
 Each file stacks on the one below without changing it. ① alone is a complete model.
 
-- [Why it is built this way](docs/TECHNICAL.md#2-three-convictions)
-- [The algorithms](docs/TECHNICAL.md#4-the-algorithms)
-- [What did not work](docs/TECHNICAL.md#6-what-did-not-work)
+- [Why it is built this way](https://github.com/fodelf/YoungAi/blob/restructure/docs/TECHNICAL.md#2-three-convictions)
+- [The algorithms](https://github.com/fodelf/YoungAi/blob/restructure/docs/TECHNICAL.md#4-the-algorithms)
+- [What did not work](https://github.com/fodelf/YoungAi/blob/restructure/docs/TECHNICAL.md#6-what-did-not-work)
 
 ## Limits
 
