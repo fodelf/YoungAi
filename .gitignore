@@ -5,6 +5,7 @@
 /ds4-bench
 /ds4-eval
 /ds4-agent
+/ds4-train
 /ds4_native
 /ds4_server_test
 /ds4_test
@@ -68,3 +69,4 @@ route_alpha_set
 /*.jpeg
 /*.jpg
 /*.png
+dist/

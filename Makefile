@@ -80,7 +80,10 @@ CORE_ENGINE_OBJS := $(CORE_ENGINE_SRCS:.c=.o)
 CORE_ENGINE_CPU_OBJS := $(CORE_ENGINE_SRCS:.c=_cpu.o)
 
 # src/common 共享格式库(纯主机 C, 无 GPU 引用 — 全部构建共用一个 .o)
-COMMON_FMT_OBJS := src/common/ds4_quantfmt.o
+COMMON_FMT_OBJS := src/common/ds4_quantfmt.o src/common/ds4_json.o
+# 训练页四件(src/train/, 规则在下面; train_models.o = 模型页): 要在 ds4-server 的依赖行之前定义 —— 依赖列表在解析时就展开, 定义在后面 Linux 那条 $^ 就是空的(10-10 实撞)
+TRAIN_API_OBJS := src/train/train_api.o src/train/train_runs.o src/train/train_ctl.o src/train/train_models.o \
+                  src/train/train_child.o src/train/train_model.o src/train/train_job.o src/train/train_gate.o src/train/train_gen.o
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal -framework Accelerate
@@ -118,7 +121,7 @@ AGENT_HDRS = src/agent/agent_internal.h src/agent/agent_types.h ds4.h ds4_distri
 .PHONY: all help clean test linecount cpu cuda cuda-spark cuda-generic cuda-regression e0
 
 ifeq ($(UNAME_S),Darwin)
-all: ds4 ds4-server ds4-bench ds4-eval ds4-agent modules
+all: ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4-train modules
 
 help:
 	@echo "DS4 build targets:"
@@ -130,8 +133,8 @@ help:
 ds4: $(CLI_OBJS) linenoise.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $(CLI_OBJS) linenoise.o $(CORE_OBJS) $(METAL_LDLIBS)
 
-ds4-server: $(SERVER_OBJS) $(KV_OBJS) rax.o $(CORE_OBJS)
-	$(CC) $(CFLAGS) -o $@ $(SERVER_OBJS) $(KV_OBJS) rax.o $(CORE_OBJS) $(METAL_LDLIBS)
+ds4-server: $(SERVER_OBJS) $(KV_OBJS) rax.o $(TRAIN_API_OBJS) $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(SERVER_OBJS) $(KV_OBJS) rax.o $(TRAIN_API_OBJS) $(CORE_OBJS) $(METAL_LDLIBS)
 
 ds4-bench: $(BENCH_OBJS) $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $(BENCH_OBJS) $(CORE_OBJS) $(METAL_LDLIBS)
@@ -153,7 +156,7 @@ mm-ocr: tools/mm_ocr.swift
 
 cpu: $(CLI_CPU_OBJS) $(SERVER_CPU_OBJS) $(BENCH_CPU_OBJS) $(EVAL_CPU_OBJS) $(AGENT_CPU_OBJS) $(WEB_OBJS) $(KV_OBJS) linenoise.o rax.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o ds4 $(CLI_CPU_OBJS) linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
-	$(CC) $(CFLAGS) -o ds4-server $(SERVER_CPU_OBJS) $(KV_OBJS) rax.o $(CPU_CORE_OBJS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o ds4-server $(SERVER_CPU_OBJS) $(KV_OBJS) rax.o $(TRAIN_API_OBJS) $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-bench $(BENCH_CPU_OBJS) $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-eval $(EVAL_CPU_OBJS) $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-agent $(AGENT_CPU_OBJS) $(WEB_OBJS) $(KV_OBJS) linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
@@ -176,7 +179,7 @@ help:
 # 编译期是 750, sm_80+ 才有的指令(mma.m16n8k16 / ldmatrix / cp.async)一律编不进去 —— indexer 打分核的 #if >= 800 分支
 # 被整个吃掉, 发出去的是空核(剖面 9.8 µs/发), 静默失效。改 native = 直出 sm_121 SASS。
 cuda-generic:
-	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=native
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4-train CUDA_ARCH=native
 
 # 2026-10-07: cuda-spark 不再是独立配方。原来它比 cuda-generic 多带 -DDS4_CUDA_SPARK_HBM_CACHE(启动权重缓存 / 专家收编 /
 # 预算公式)和 -default-stream per-thread, cuda-generic 编出来的二进制放到 GB10 上会退化成"只缓骨架、每次专家读跨 C2C"。
@@ -195,7 +198,7 @@ cuda:
 ds4: $(CLI_OBJS) linenoise.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-ds4-server: $(SERVER_OBJS) $(KV_OBJS) rax.o $(CORE_OBJS)
+ds4-server: $(SERVER_OBJS) $(KV_OBJS) rax.o $(TRAIN_API_OBJS) $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 ds4-bench: $(BENCH_OBJS) $(CORE_OBJS)
@@ -209,7 +212,7 @@ ds4-agent: $(AGENT_OBJS) $(WEB_OBJS) $(KV_OBJS) linenoise.o $(CORE_OBJS)
 
 cpu: $(CLI_CPU_OBJS) $(SERVER_CPU_OBJS) $(BENCH_CPU_OBJS) $(EVAL_CPU_OBJS) $(AGENT_CPU_OBJS) $(WEB_OBJS) $(KV_OBJS) linenoise.o rax.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o ds4 $(CLI_CPU_OBJS) linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
-	$(CC) $(CFLAGS) -o ds4-server $(SERVER_CPU_OBJS) $(KV_OBJS) rax.o $(CPU_CORE_OBJS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o ds4-server $(SERVER_CPU_OBJS) $(KV_OBJS) rax.o $(TRAIN_API_OBJS) $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-bench $(BENCH_CPU_OBJS) $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-eval $(EVAL_CPU_OBJS) $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-agent $(AGENT_CPU_OBJS) $(WEB_OBJS) $(KV_OBJS) linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
@@ -227,6 +230,16 @@ src/core/%_cpu.o: src/core/%.c $(wildcard src/core/*.h) ds4.h ds4_internal.h ds4
 
 src/common/ds4_quantfmt.o: src/common/ds4_quantfmt.c src/common/ds4_quantfmt.h src/common/ds4_float.h
 	$(CC) $(CFLAGS) -c -o $@ src/common/ds4_quantfmt.c
+
+src/common/ds4_json.o: src/common/ds4_json.c src/common/ds4_json.h
+	$(CC) $(CFLAGS) -c -o $@ src/common/ds4_json.c
+
+# 训练页(src/train/): 路由/产物解析/进程控制三件(TRAIN_API_OBJS)ds4-server 与 ds4-train 共用; ds4-train 只多一层薄 HTTP。
+# 纯主机 C, 不链引擎; Mac/Linux 同一条规则(nvcc 不参与)
+src/train/%.o: src/train/%.c src/train/train_internal.h src/common/ds4_json.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+ds4-train: src/train/train_main.o src/train/train_http.o src/train/train_proxy.o $(TRAIN_API_OBJS) src/common/ds4_json.o
+	$(CC) $(CFLAGS) -o $@ src/train/train_main.o src/train/train_http.o src/train/train_proxy.o $(TRAIN_API_OBJS) src/common/ds4_json.o $(LDLIBS)
 
 
 # Standalone capability modules (self-contained, no engine coupling): z 隐变量
@@ -377,11 +390,11 @@ tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o $(CORE_OBJS)
 tests/cuda_sample_selftest: tests/cuda_sample_selftest.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-ds4_test: $(TESTS_OBJS) $(SERVER_TEST_OBJS) $(SERVER_TESTS_OBJS) $(KV_OBJS) rax.o $(CORE_OBJS)
+ds4_test: $(TESTS_OBJS) $(SERVER_TEST_OBJS) $(SERVER_TESTS_OBJS) $(KV_OBJS) rax.o $(TRAIN_API_OBJS) $(CORE_OBJS)
 ifeq ($(UNAME_S),Darwin)
-	$(CC) $(CFLAGS) -o $@ $(TESTS_OBJS) $(SERVER_TEST_OBJS) $(SERVER_TESTS_OBJS) $(KV_OBJS) rax.o $(CORE_OBJS) $(METAL_LDLIBS)
+	$(CC) $(CFLAGS) -o $@ $(TESTS_OBJS) $(SERVER_TEST_OBJS) $(SERVER_TESTS_OBJS) $(KV_OBJS) rax.o $(TRAIN_API_OBJS) $(CORE_OBJS) $(METAL_LDLIBS)
 else
-	$(NVCC) $(NVCCFLAGS) -o $@ $(TESTS_OBJS) $(SERVER_TEST_OBJS) $(SERVER_TESTS_OBJS) $(KV_OBJS) rax.o $(CORE_OBJS) $(CUDA_LDLIBS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $(TESTS_OBJS) $(SERVER_TEST_OBJS) $(SERVER_TESTS_OBJS) $(KV_OBJS) rax.o $(TRAIN_API_OBJS) $(CORE_OBJS) $(CUDA_LDLIBS)
 endif
 
 # src/common 共享格式库单测: 无模型/无 GPU, 纯主机 C。夹具路径相对仓库根。

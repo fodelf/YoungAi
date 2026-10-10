@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-**DwarfStar** (`ds4`) is a self-contained native inference engine **purpose-built for DeepSeek V4 Flash** (and, on very high-memory machines, DeepSeek V4 PRO). It is *not* a generic GGUF runner and does **not** link against GGML — it reimplements the loading, tokenizer, prompt/DSML rendering, KV cache, graph scheduling, server API, and a native coding agent for this one model family. It only runs the DeepSeek V4 GGUFs published for this project (asymmetric quant: routed MoE experts at `IQ2_XXS`/`Q2_K`, everything else left high-precision). `README.md`(英文主版) / `README.zh-CN.md` 是 V4.1 三文件架构与现役读数的对外介绍; V4 时代的完整功能说明(服务端 API、磁盘 KV、运行时参数、Capability Evaluation)归档在 `docs/archive/README_v4_upstream.md`; 模型见 `docs/MODEL_CARD.md`。
+**DwarfStar** (`ds4`) is a self-contained native inference engine **purpose-built for DeepSeek V4 Flash** (and, on very high-memory machines, DeepSeek V4 PRO). It is *not* a generic GGUF runner and does **not** link against GGML — it reimplements the loading, tokenizer, prompt/DSML rendering, KV cache, graph scheduling, server API, and a native coding agent for this one model family. It only runs the DeepSeek V4 GGUFs published for this project (asymmetric quant: routed MoE experts at `IQ2_XXS`/`Q2_K`, everything else left high-precision). `README.md`(英文主版) / `README.zh-CN.md` 是对外门面(卖点+指标+用法+工作台截图 docs/img/), 算法/完整结果表/没走通的路/手动安装在 `docs/TECHNICAL.md` / `docs/TECHNICAL.zh-CN.md`; V4 时代的完整功能说明(服务端 API、磁盘 KV、运行时参数、Capability Evaluation)归档在 `docs/archive/README_v4_upstream.md`; 模型见 `docs/MODEL_CARD.md`。
 
 Primary backend is **Metal on macOS**; **CUDA on Linux** is the second production path; the **CPU path is reference/debug only**.
 
@@ -68,6 +68,12 @@ make -C gguf-tools all amp legacy calib bench tools-test   # 工具链全目标(
 ./ds4-server --cuda -m gguf/v41/<model>.gguf --zchain <反修目录>   # V4.1: 上下文只有 1M 一个取值, 没有 --ctx(spark 上用 gguf-tools/scripts/serve_1m_spark.sh)
 #   起服后 GET /monitor = 监控页(web/monitor.html, 指标照 Strata Monitor), GET /metrics = 数据(JSON; Accept: text/plain 给 Prometheus 文本)
 ./ds4-agent                      # in-process native coding agent (sessions in ~/.ds4/kvcache)
+./ds4-train --port 8000          # ★工作台主进程, 永远不退★(10-10 用户定): GET / = web/studio.html(聊天/模型/训练/语料/记录), 全部 /api/*; spark 上 train_ui_spark.sh start
+#   模型 = 它直接 fork 的子进程 ds4-server(src/train/train_model.c, 绑 127.0.0.1:8001, 起跑清单/冒烟/看门狗都在 C 里), /v1/… /monitor /metrics 与热切(/api/models/plugins)、清单(/api/models/list)由主进程转发(src/train/train_proxy.c)
+#   训练 = 它自己的作业线程(src/train/train_job.c: 停模型子进程 → fork ./ds4 --ptrain → wt2 门+选轮(train_gate.c: ./ds4 --score-ids 两臂 + anchor_metrics) → 子进程按 serve_pick.txt 装回来)
+#   ★页面不调任何 shell 脚本★(10-10 用户令, 只剩下载 hf_install.sh); serve_1m_spark.sh / z_nightly_spark.sh / v41_judge.sh 只是命令行工具, 产物目录与格式和 C 一致
+#   模型页"加载"= 写 gguf/serve_pick.txt(C 直接写, 格式与 serve_1m_spark.sh pick 同)+ 重起子进程; 聊天页下拉 = 热切侧车, "后训练"开关 = 挂/卸当前侧车关联的最新 ③(server_plugins.c, 不重装底座)
+#   ★训完不自动挂★(10-10 用户: "训练完就是训练完不要直接挂"): ③ 只落盘并关联训练时装着的侧车(base.fnv), 开关打开才挂, 切侧车跟着换
 ```
 
 `./ds4flash.gguf` (a symlink) is the default model for every binary; pass `-m gguf/<file>` to override. Use `--metal`/`--cuda`/`--cpu` to force a backend, `--chdir /path/to/ds4` when launching from elsewhere so `metal/*.metal` resolves.
