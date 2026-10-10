@@ -78,6 +78,8 @@ const char *g_ds4_v41_pt_dir = NULL;
  * 命令行解析时 ② 还没设(--zchain 要到打开引擎才转进 g_ds4_v41_amp_dir), 在这里查永远报"没挂反修件"(10-02 实撞,
  * ②③ 都挂上了还报)。改在插件真正装载时查, 见 core_v41_state.c v41_state_plugins。 */
 void ds4_engine_v41_set_posttrain_dir(const char *dir) { g_ds4_v41_pt_dir = (dir && dir[0]) ? dir : NULL; }
+const char *ds4_engine_v41_amp_dir(void) { return g_ds4_v41_amp_dir; }
+const char *ds4_engine_v41_posttrain_dir(void) { return g_ds4_v41_pt_dir; }
 float g_ds4_v41_amp_scale = 1.0f;
 /* β ≤ 0 当"没传"处理(1.0 = 原样)。负 β 是把修正反向注入, 没有任何用途, 不留这条路。 */
 void ds4_engine_v41_set_amp_scale(float s) { g_ds4_v41_amp_scale = s > 0.f ? s : 1.0f; }

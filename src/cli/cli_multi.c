@@ -18,7 +18,7 @@ static int cmp_dbl(const void *a, const void *b) { const double x = *(const doub
 
 int run_v41_multi_probe(ds4_engine *e, const cli_config *cfg, const ds4_tokens *prompt) {
     const int N = cfg->gen.multi_probe, steps = cfg->gen.n_predict > 0 ? cfg->gen.n_predict : 64;
-    if (N < 1 || N > 8) { fprintf(stderr, "ds4: --multi-probe 只收 1..8 路(解码小批核路上限)\n"); return 1; }
+    if (N < 1 || N > 16) { fprintf(stderr, "ds4: --multi-probe 只收 1..16 路(合批上限 DS4_V41_MULTI_MAX; 超 8 路稠密段走预填路)\n"); return 1; }
     ds4_engine_v41_set_prof(cfg->gen.v41_prof);
     ds4_engine_v41_set_decoder_full(cfg->gen.decoder_full);
     ds4_engine_v41_set_chunk(cfg->gen.v41_chunk);
@@ -33,9 +33,9 @@ int run_v41_multi_probe(ds4_engine *e, const cli_config *cfg, const ds4_tokens *
     };
     /* 批态行数 = 解码小批核路上限 8, 不是路数: 投机的验证批每路要 1+k 行(N=1 就是 6 行; N=3 时 8 行只够 k=2,2,1)。
      * ★实撞(09-30 17:23)★: 按路数开批态, N=1 时 cap=1, 草稿每轮都出(走图 62 次)却被"装不下就削 k"削成 0 —— 投机 0 轮, 每轮还白付草稿 9 ms。 */
-    struct ds4_v41_batch *b = ds4_v41_batch_open(e, 8);
+    struct ds4_v41_batch *b = ds4_v41_batch_open(e, N > 8 ? N : 8);   /* 超 8 路(纯解码, 每路 1 行)按路数开 */
     if (!b) { fprintf(stderr, "ds4: 批态开不出来\n"); return 1; }
-    struct ds4_v41_req *r[8] = {0};
+    struct ds4_v41_req *r[16] = {0};
     int rc = 1;
     double t0 = now_sec();
     for (int i = 0; i < N; i++) {
@@ -49,7 +49,7 @@ int run_v41_multi_probe(ds4_engine *e, const cli_config *cfg, const ds4_tokens *
     double *ms = malloc((size_t)steps * sizeof(double));
     /* 各路吐出的 token 串(投机下各路每轮 k 不同、每轮吐出的个数不同, 门只能比整串): [路][steps+16] */
     const int seqcap = steps + 16;
-    int *seq = malloc((size_t)N * (size_t)seqcap * sizeof(int)), nseq[8] = {0};
+    int *seq = malloc((size_t)N * (size_t)seqcap * sizeof(int)), nseq[16] = {0};
     if (!ms || !seq) { free(ms); free(seq); goto out; }
     int done = 0, mismatch = 0, ntok = 0, stop = 0;
     const int eos = ds4_token_eos(e);

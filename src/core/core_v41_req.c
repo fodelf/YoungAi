@@ -29,6 +29,11 @@ struct ds4_v41_req {
     v41_sched cal;
     int32_t outq[DS4_MTP_MAX_BLOCK + 2u]; int nout;   /* 这一轮吐出的 token(接受的草稿 + 模型自己的那个), 调用方 take 走 */
     uint32_t rounds, acc_sum, off_sum;   /* 投机账: 轮数 / 接受的草稿位 / 出过的草稿位(服务监控页算接受率用) */
+    int n_predict, dev_sample;
+    ds4_gpu_sample_params samp;          /* 本请求的设备采样参数; 状态克隆会整份覆盖 st, 所以请求自己也存一份(v41_req_bind 灌回去) */
+    /* 共享预填(ds4_v41_req_fork): 分身挂在 src 的 kid[] 上等它预填完; forked = 1 的请求态没有自己的预填 */
+    struct ds4_v41_req *parent, *kid[DS4_V41_MULTI_MAX];
+    int nkid, forked;
 };
 
 struct ds4_v41_batch *ds4_v41_batch_open(ds4_engine *e, int cap) {
@@ -45,6 +50,36 @@ void ds4_v41_batch_close(struct ds4_v41_batch *b) {
     free(b);
 }
 
+/* 采样面灌进状态: open 时一次; 分身克隆完 src 的状态(整份覆盖)后再灌一次 */
+static void v41_req_bind(struct ds4_v41_req *r) {
+    r->st.psamp = &r->sp;
+    r->st.dev_sample = r->dev_sample;
+    r->st.samp = r->samp;
+    r->st.spec_q = (r->spec && r->dev_sample) ? r->dr.st.logits : NULL;
+}
+
+/* 取 token 的家当(open 与 fork 共用): 落点槽 / 惩罚路缓冲 / 硬币 / 草稿器 */
+static bool v41_req_setup(struct ds4_v41_req *r) {
+    r->am = ds4_gpu_tensor_alloc((uint64_t)(DS4_MTP_MAX_BLOCK + 2u) * 16u);
+    /* 三条取 token 的路(core_v41_sample.c): 温度 > 0 且无惩罚 = 设备采样核; 任一惩罚非零 = 主机惩罚路; 否则设备 argmax */
+    const bool penal = r->sp.dry_multiplier > 0.f || r->sp.freq_penalty != 0.f || r->sp.presence_penalty != 0.f;
+    r->dev_sample = (r->sp.temperature > 0.f && !penal) ? 1 : 0;
+    if (penal) {
+        r->rowbuf = xmalloc((size_t)DS4_N_VOCAB * 4u);
+        r->hist.cap = (uint32_t)(r->n_predict > 0 ? r->n_predict : 0) + 2u;
+        r->hist.tok = xmalloc((size_t)r->hist.cap * sizeof(int32_t));
+        if (r->sp.dry_multiplier > 0.f) r->hist.brk = ds4_decode_breakers(r->e, DS4_N_VOCAB);
+    }
+    r->rng = r->sp.seed ? r->sp.seed : ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());   /* 与 CLI 同一条规则 */
+    r->samp = (ds4_gpu_sample_params){ .temperature = r->sp.temperature, .top_p = r->sp.top_p, .min_p = r->sp.min_p,
+                                       .top_k = r->sp.top_k, .seed = r->rng };
+    /* 投机: 惩罚路不接(与 generate_argmax 同: 惩罚要按 token 史改 logits); 没三塔的 GGUF dr.ready=0 就是纯解码 */
+    r->spec = (g_ds4_v41_dspark && !penal && v41_draft_alloc(r->e, &r->dr)) ? 1 : 0;
+    if (r->spec && r->dev_sample) { r->dr.dev_sample = 1; r->dr.samp = r->samp; r->dr.samp.stream = 1u; }
+    v41_req_bind(r);
+    return r->am != NULL;
+}
+
 struct ds4_v41_req *ds4_v41_req_open(ds4_engine *e, const int *prompt, int n_prompt, int n_predict, const ds4_decode_sampling *sp) {
     if (!e || !prompt || n_prompt < 1 || !ds4_engine_is_v41(e) || !e->metal_ready) return NULL;
     const uint32_t np = (uint32_t)n_prompt;
@@ -56,34 +91,38 @@ struct ds4_v41_req *ds4_v41_req_open(ds4_engine *e, const int *prompt, int n_pro
     const uint32_t ck = g_ds4_v41_chunk > 0 ? (uint32_t)g_ds4_v41_chunk : DS4_V41_CHUNK;
     struct ds4_v41_req *r = xmalloc(sizeof *r);
     memset(r, 0, sizeof *r);
-    r->e = e; r->prompt = (const int32_t *)prompt; r->np = np; r->cap = ck < np ? ck : np;
+    r->e = e; r->prompt = (const int32_t *)prompt; r->np = np; r->cap = ck < np ? ck : np; r->n_predict = n_predict;
     r->sp = sp ? *sp : g_decode_sampling;
     if (!v41_state_alloc(&r->st, r->cap, ctx, DS4_MTP_MAX_BLOCK + 2u)) { free(r); return NULL; }
     r->st.head_last_only = 1;   /* 预填块只算末位 logits(core_v41.h) */
-    r->st.psamp = &r->sp;
-    r->am = ds4_gpu_tensor_alloc((uint64_t)(DS4_MTP_MAX_BLOCK + 2u) * 16u);
-    /* 三条取 token 的路(core_v41_sample.c): 温度 > 0 且无惩罚 = 设备采样核; 任一惩罚非零 = 主机惩罚路; 否则设备 argmax */
-    const bool penal = r->sp.dry_multiplier > 0.f || r->sp.freq_penalty != 0.f || r->sp.presence_penalty != 0.f;
-    const bool dev_sample = r->sp.temperature > 0.f && !penal;
-    if (penal) {
-        r->rowbuf = xmalloc((size_t)DS4_N_VOCAB * 4u);
-        r->hist.cap = (uint32_t)(n_predict > 0 ? n_predict : 0) + 2u;
-        r->hist.tok = xmalloc((size_t)r->hist.cap * sizeof(int32_t));
-        if (r->sp.dry_multiplier > 0.f) r->hist.brk = ds4_decode_breakers(e, DS4_N_VOCAB);
-    }
-    r->rng = r->sp.seed ? r->sp.seed : ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());   /* 与 CLI 同一条规则 */
-    r->st.dev_sample = dev_sample ? 1 : 0;
-    r->st.samp = (ds4_gpu_sample_params){ .temperature = r->sp.temperature, .top_p = r->sp.top_p, .min_p = r->sp.min_p,
-                                          .top_k = r->sp.top_k, .seed = r->rng };
-    /* 投机: 惩罚路不接(与 generate_argmax 同: 惩罚要按 token 史改 logits); 没三塔的 GGUF dr.ready=0 就是纯解码 */
-    r->spec = (g_ds4_v41_dspark && !penal && v41_draft_alloc(e, &r->dr)) ? 1 : 0;
-    if (r->spec && dev_sample) { r->dr.dev_sample = 1; r->dr.samp = r->st.samp; r->dr.samp.stream = 1u; r->st.spec_q = r->dr.st.logits; }
-    if (!r->am) { ds4_v41_req_close(r); return NULL; }
+    if (!v41_req_setup(r)) { ds4_v41_req_close(r); return NULL; }
+    return r;
+}
+
+struct ds4_v41_req *ds4_v41_req_fork(struct ds4_v41_req *src, const ds4_decode_sampling *sp) {
+    if (!src || src->prefilled || src->forked || src->nkid + 1 >= (int)DS4_V41_MULTI_MAX) {
+        fprintf(stderr, "ds4: V4.1 分身只能挂在还没预填完的原请求上(每个至多 %u 个)\n", DS4_V41_MULTI_MAX - 1u); return NULL; }
+    struct ds4_v41_req *r = xmalloc(sizeof *r);
+    memset(r, 0, sizeof *r);
+    for (uint32_t i = 0; i < DS4_V41_MAX_ENGRAM; i++) r->st.eshard[i].fd = -1;   /* 空状态也要能 v41_state_free: fd 0 是 stdin */
+    r->e = src->e; r->prompt = src->prompt; r->np = src->np; r->cap = src->cap; r->n_predict = src->n_predict;
+    r->sp = sp ? *sp : g_decode_sampling;
+    r->forked = 1;
+    if (!v41_req_setup(r)) { ds4_v41_req_close(r); return NULL; }
+    /* 收缩行数按投机定(1 或 1+块长): 分身克隆的是 src 收缩后的形状, 两边投机开关不一样就装不下验证批 */
+    if (r->spec != src->spec) { fprintf(stderr, "ds4: V4.1 分身与原请求投机开关不同(惩罚路不投机), 不能共享预填\n"); ds4_v41_req_close(r); return NULL; }
+    r->parent = src;
+    src->kid[src->nkid++] = r;
     return r;
 }
 
 void ds4_v41_req_close(struct ds4_v41_req *r) {
     if (!r) return;
+    if (r->parent) {   /* 还没等到预填的分身: 从原请求的名单里摘掉, 免得它预填完往已释放的分身里写 */
+        struct ds4_v41_req *p = r->parent;
+        for (int i = 0; i < p->nkid; i++) if (p->kid[i] == r) { p->kid[i] = p->kid[--p->nkid]; break; }
+    }
+    for (int i = 0; i < r->nkid; i++) r->kid[i]->parent = NULL;   /* 原请求先关: 分身停在没预填完 */
     if (r->spec) v41_draft_free(&r->dr);
     if (r->am) ds4_gpu_tensor_free(r->am);
     v41_state_free(&r->st);
@@ -94,11 +133,27 @@ void ds4_v41_req_close(struct ds4_v41_req *r) {
 int ds4_v41_req_prefill_step(struct ds4_v41_req *r) {
     if (!r) return -1;
     if (r->prefilled) return 1;
+    if (r->forked) { fprintf(stderr, "ds4: V4.1 分身没有自己的预填(原请求没预填完或已关)\n"); return -1; }
     if (!v41_prefill_chunk(r->e, &r->st, r->prompt, r->np, &r->c0, r->cap)) return -1;
     if (r->c0 < r->np) return 0;
     /* 最后一块: 末位 logits → 首个 token(设备 argmax / 采样核 / 主机惩罚路), 然后收缩成解码态(投机的验证批要 1+块长 行) */
     if (!v41_next_token(&r->st, r->am, r->st.last_logit_row, r->rowbuf, &r->rng, &r->hist, &r->next)) return -1;
+    /* 分身的首个 token: 同一行 logits、同一组 pos/tok 槽, 只换采样面(种子) —— 与它自己预填到这一步再取逐字节同。
+     * 用状态的浅拷贝当视图(取 token 只读状态), src 本身一个字段不动。 */
+    for (int k = 0; k < r->nkid; k++) {
+        struct ds4_v41_req *q = r->kid[k];
+        ds4_v41_state view = r->st;
+        view.psamp = &q->sp; view.dev_sample = q->dev_sample; view.samp = q->samp; view.spec_q = NULL;
+        if (!v41_next_token(&view, q->am, r->st.last_logit_row, q->rowbuf, &q->rng, &q->hist, &q->next)) return -1;
+    }
     if (!v41_state_shrink(&r->st, r->spec ? DS4_MTP_MAX_BLOCK + 1u : 1u)) return -1;
+    for (int k = 0; k < r->nkid; k++) {
+        struct ds4_v41_req *q = r->kid[k];
+        if (!v41_state_clone(&q->st, &r->st)) return -1;
+        v41_req_bind(q);
+        q->c0 = q->np; q->prefilled = 1; q->parent = NULL;
+    }
+    r->nkid = 0;
     r->prefilled = 1;
     return 1;
 }
@@ -115,14 +170,14 @@ int ds4_v41_req_take(struct ds4_v41_req *r, int *out, int max) {
 }
 
 int ds4_v41_multi_step(struct ds4_v41_batch *b, struct ds4_v41_req **r, int n) {
-    ds4_v41_state *m[DS4_V41_GEMV_MAX_TOK];
-    int32_t tok[DS4_V41_GEMV_MAX_TOK];
+    ds4_v41_state *m[DS4_V41_MULTI_MAX];
+    int32_t tok[DS4_V41_MULTI_MAX];
     if (!b || !r || n < 1 || n > (int)b->cap) return 1;
     for (int i = 0; i < n; i++) {
         if (!r[i] || !r[i]->prefilled) { fprintf(stderr, "ds4: V4.1 合批第 %d 路还没预填完\n", i); return 1; }
         m[i] = &r[i]->st; tok[i] = r[i]->next;
     }
-    uint32_t ones[DS4_V41_GEMV_MAX_TOK]; int32_t wants[DS4_V41_GEMV_MAX_TOK];
+    uint32_t ones[DS4_V41_MULTI_MAX]; int32_t wants[DS4_V41_MULTI_MAX];
     for (int i = 0; i < n; i++) ones[i] = 1u;
     const bool walked = v41_multi_graph_ready(b, m, ones, (uint32_t)n) && v41_multi_graph_round(b->e, b, m, tok, ones, (uint32_t)n, wants);
     if (!walked && !v41_multi_step(b->e, b, m, tok, NULL, (uint32_t)n)) return 1;
@@ -137,10 +192,10 @@ int ds4_v41_multi_step(struct ds4_v41_batch *b, struct ds4_v41_req **r, int n) {
 /* 一轮(投机): 各路出草稿定 k → 验证行拼进一次前向 → 各路取 want、接受最长前缀、回滚 → outq = 接受的草稿 + 模型自己的那个(= 新 next)。
  * 温 0 下与单请求路同一串输出(接受条件就是"主模型自己也会选这个 token"); 采样下按设备核的拒绝采样(分布同, 硬币不同)。 */
 int ds4_v41_multi_round(struct ds4_v41_batch *b, struct ds4_v41_req **r, int n) {
-    ds4_v41_state *m[DS4_V41_GEMV_MAX_TOK];
-    int32_t tok[DS4_V41_GEMV_MAX_TOK], batch[DS4_V41_GEMV_MAX_TOK][DS4_MTP_MAX_BLOCK + 1u];
-    uint32_t rows[DS4_V41_GEMV_MAX_TOK], R = 0;
-    int drafted[DS4_V41_GEMV_MAX_TOK];
+    ds4_v41_state *m[DS4_V41_MULTI_MAX];
+    int32_t tok[DS4_V41_MULTI_MAX], batch[DS4_V41_MULTI_MAX][DS4_MTP_MAX_BLOCK + 1u];
+    uint32_t rows[DS4_V41_MULTI_MAX], R = 0;
+    int drafted[DS4_V41_MULTI_MAX];
     if (!b || !r || n < 1 || n > (int)b->cap) return 1;
     const double t0 = now_sec();
     /* ★投机只在同批 ≤ 2 路时开★(09-30 金融提示实测): 合批里骨架已被各路摊掉, 每多一行只剩专家字节 + 注意力(~7 ms), 而一行验证按接受直方图只值 0.43 个 token
@@ -170,7 +225,7 @@ int ds4_v41_multi_round(struct ds4_v41_batch *b, struct ds4_v41_req **r, int n) 
     uint32_t off = 0;
     for (int i = 0; i < n; i++) { for (uint32_t j = 0; j < rows[i]; j++) tok[off + j] = batch[i][j]; off += rows[i]; }
     /* 整步走图(core_v41_mgraph.c): 键中或能捕就发图(快照字节在图里, 主机只记账); 否则直发(验证批先备份环格)。两条路输出逐字节同。 */
-    int32_t wants[DS4_V41_GEMV_MAX_TOK];
+    int32_t wants[DS4_V41_MULTI_MAX];
     bool walked = v41_multi_graph_ready(b, m, rows, (uint32_t)n) && v41_multi_graph_round(b->e, b, m, tok, rows, (uint32_t)n, wants);
     if (!walked) {
         for (int i = 0; i < n; i++) if (rows[i] > 1u && !v41_spec_snapshot(m[i], rows[i])) return 1;   /* 验证批会盖环里的格, 先备份 */

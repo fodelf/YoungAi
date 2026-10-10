@@ -25,6 +25,12 @@ void ds4_engine_v41_set_verify_k(unsigned k);   /* --dspark-verify N: 每轮验�
 void ds4_engine_v41_set_amp_dir(const char *dir);   /* --zchain <dir>: V4.1 反修放大器目录(amp_Lnn.bin), 每层 MoE 出口 y += x·(B·A) */
 void ds4_engine_v41_set_amp_scale(float s);         /* --zchain-scale β: 加载时把 A 乘 β(修正整体缩到 β 倍); ≤0 = 1.0 */
 void ds4_engine_v41_set_posttrain_dir(const char *dir);   /* --posttrain <dir>: 三文件部署的第三件(后训练增益), 与 --zchain 的表逐元素相乘 */
+/* 服务里热切换 ②③(目录给 NULL/空 = 不挂): 先用试探状态真装一遍, 装不上就保持原样返回 -1(err 写原因)。
+ * ★调用时不许有活着的 V4.1 状态★(进程级的路由偏置/增益表会被换掉), 见 core_v41_state.c */
+int ds4_engine_v41_switch_plugins(const char *amp_dir, const char *pt_dir, char *err, size_t errn);
+/* 当前挂着的 ②③ 目录(没挂 = NULL), 给服务端报给页面 */
+const char *ds4_engine_v41_amp_dir(void);
+const char *ds4_engine_v41_posttrain_dir(void);
 void ds4_engine_v41_set_engram_dir(const char *dir);      /* --engram-dir <dir>: n-gram 表分片所在目录, 顶替 GGUF 里记的转换机绝对路径 */
 /* --score-nll FILE / --score-topk K FILE / --score-no-logits: --score-ids 的三个小出口。
  * 与 V4 的 --eval-nll/--eval-topk 同一份实现(core_score_aux.c)、同一种字节。
@@ -96,6 +102,10 @@ struct ds4_v41_batch *ds4_v41_batch_open(ds4_engine *e, int cap);   /* cap = 一
 void ds4_v41_batch_close(struct ds4_v41_batch *b);
 struct ds4_v41_req *ds4_v41_req_open(ds4_engine *e, const int *prompt, int n_prompt, int n_predict, const ds4_decode_sampling *sp);
 int ds4_v41_req_prefill_step(struct ds4_v41_req *r);   /* 跑一块预填: 1 = 预填完(首个 token 在 req_next), 0 = 还有块, -1 = 失败 */
+/* 共享预填(2026-10-09): 在 src 预填完之前挂一个同提示、自己采样面的分身; src 最后一块出完 logits 时分身按自己的采样面取首个 token,
+ * 收缩后深拷 src 的 KV ⇒ 分身直接是预填完的请求态(不要再 prefill_step)。src 预填失败或先关, 分身停在没预填完(multi_step 会拒)。
+ * 与各自预填逐字节同(预填是确定的), 省掉 G−1 遍预填。分身各自 close。 */
+struct ds4_v41_req *ds4_v41_req_fork(struct ds4_v41_req *src, const ds4_decode_sampling *sp);
 void ds4_v41_req_progress(const struct ds4_v41_req *r, int *c0, int *np);
 int ds4_v41_req_next(const struct ds4_v41_req *r);    /* 还没进模型的下一个 token(= 刚生成的那个) */
 int ds4_v41_req_pos(const struct ds4_v41_req *r);     /* 已进缓存的位置数 */
@@ -110,6 +120,12 @@ void ds4_v41_req_spec_stats(const struct ds4_v41_req *r, int *rounds, int *offer
 void ds4_engine_v41_last_spec_stats(int *rounds, int *offered, int *accepted);
 int ds4_engine_v41_dspark(void);   /* 投机开关现值(ds4_engine_v41_set_dspark 设的那个): 0 关 / 1 默认开 / 2 显式开 */
 void ds4_v41_req_close(struct ds4_v41_req *r);
+/* 合批生成驱动(2026-10-09, core_v41_gen.c): 作业 = 已渲染的提示 ids + 自己的采样面 + 上限 token 数(含 EOS 那一位)。至多 bcap 路一起解码;
+ * refill = 0 整组跑完才开下一组(训练器探针/采样, 与 10-06 的组划分逐字节同), 1 = 哪路写完立刻补下一个作业(出题)。相邻同提示作业共享预填。
+ * done 每个作业回调一次(text 只在回调内有效; eos = 1 以 EOS 收口, 0 = 到上限或上下文满)。返回 false = 中途失败, 没回调的作业没写完。 */
+typedef struct { const int *ids; uint32_t len; uint32_t max_tok; ds4_decode_sampling sp; } ds4_v41_gen_job;
+typedef void (*ds4_v41_gen_done_fn)(void *ud, uint32_t job, const char *text, size_t len, int eos, uint32_t ntok);
+bool ds4_v41_gen_run(ds4_engine *e, const ds4_v41_gen_job *jobs, uint32_t n, uint32_t bcap, int refill, ds4_v41_gen_done_fn done, void *ud);
 void ds4_engine_v41_set_lanes(int on);              /* --no-lanes: 合批的缓存段不按路分流(默认分; 只作 A/B, 输出逐字节同) */
 uint64_t ds4_v41_req_prefill_bytes(int n_prompt);   /* 预填期设备峰值字节(行缓冲 + KV + 索引草稿), 服务端准入用 */
 uint64_t ds4_v41_req_resident_bytes(void);          /* 预填完收缩后的常驻字节(KV 按模型上下文) */

@@ -302,12 +302,17 @@ void v41_state_free(ds4_v41_state *st);
  * 请求态预填完 v41_state_shrink: 稠密段的行放掉、注意力侧缩到 rcap 行, 只剩 KV + 几十 MB; 批态(v41_batch_rows_alloc)持有稠密段的
  * R 行缓冲 + 反修表; v41_multi_step 一步喂 R 个请求态各 1 个 token(稠密段拼行一次发, 注意力段逐请求用视图发)。 */
 bool v41_state_shrink(ds4_v41_state *st, uint32_t rcap);
+bool v41_state_clone(ds4_v41_state *dst, const ds4_v41_state *src);
+/* ★合批纯解码一步最多几行(2026-10-10)★: 与 DS4_V41_GEMV_MAX_TOK(8, 解码小批核与预填 GEMM 的分界, 单请求路/验证批/打分路都按它分岔)分开 ——
+ * 合批行数超过 8 时稠密段各核按行数自己走预填路, 不改任何 ≤ 8 行的路径。批态 / 合批步 / 生成驱动的数组按它开。 */
+#define DS4_V41_MULTI_MAX 16u   /* 刚收缩的请求态 → 深拷一份(同提示多份采样共享预填, core_v41_req.c) */
 bool v41_batch_rows_alloc(ds4_v41_state *st, uint32_t cap);
 typedef struct ds4_v41_batch {
     ds4_v41_state rows;         /* 稠密段的行缓冲(批态): x/hc/…/logits 按 cap 行; 没有 KV */
     ds4_gpu_tensor *am;         /* [cap][16 B] 采样核 / argmax 落点 */
     float *onehot;              /* [cap][HC] pre_mix 的 one-hot(第 0 路), 每步灌进批态 */
     uint32_t cap;
+    uint32_t warm_R;            /* 直发成功过的最大总行数(≤ 8 那档): 稠密段按总行数懒长的暂存(hc mix 合一核的段和等)只增不减, 捕获只许 R ≤ 它 */
     ds4_engine *e;
     void *mg;                   /* 合批整步图的缓存(core_v41_mgraph.c 私有) */
 } ds4_v41_batch;

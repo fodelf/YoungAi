@@ -192,6 +192,8 @@ int main(int argc, char **argv) {
         rc = run_perplexity_file(engine, &cfg);
     } else if (cfg.gen.gen_ids_path) {
         rc = run_gen_ids(engine, &cfg);
+    } else if (cfg.gen.gen_jobs_path) {
+        rc = run_gen_jobs(engine, &cfg);
     } else if (cfg.gen.ptrain_spec) {
         /* --v41-prof 对训练路也要生效: 前向里的逐层探针(如每层逐专家 token 数落 /tmp/v41_route_*.txt)认的是同一个全局开关 */
         ds4_engine_v41_set_prof(cfg.gen.v41_prof);
