@@ -175,7 +175,10 @@
   .drop.over { background: var(--accent-soft); border-color: var(--accent-2); }
   .drop .big { font-size: 15px; font-weight: 600; margin: 6px 0 4px; }
   .drop svg.i { width: 30px; height: 30px; color: var(--accent-2); }
-  .data-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; margin-top: 16px; align-items: start; }
+  /* 训练料表在上、预览在下, 各占整行: 并排时表格只有半宽, 长文件名 + 两个按钮会把按钮挤出卡片(10-10 用户实撞) */
+  .data-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; margin-top: 16px; }
+  table.jsonl td:first-child { white-space: normal; word-break: break-all; }   /* 文件名太长就换行, 别把右边的按钮推出去 */
+  table.jsonl td:last-child { text-align: right; width: 1%; }   /* 按钮列只占按钮本身的宽, 贴右 */
   .pv { display: flex; flex-direction: column; gap: 10px; }
   .pv .row { background: var(--panel-2); border: 1px solid var(--border); border-radius: 9px; padding: 9px 11px; font-size: 13px; }
   .pv .k { color: var(--accent-2); font-size: 11.5px; font-weight: 600; margin-right: 6px; }
@@ -318,19 +321,15 @@
     <div class="drop" id="drop">
       <svg class="i" viewBox="0 0 24 24"><path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg>
       <div class="big" data-i18n="d_drop">拖文件到这里, 或点击选择</div>
-      <div class="muted" data-i18n="d_drop_sub">.jsonl 直接训: 一行一题 {"messages":[user, assistant], "context"?} 或一行一段原文 {"text": "…"} · .txt / .md = 文档, 进料目录后自动成为原文料(&lt;目录&gt;.text.jsonl), 也可以再"出题"成问答料 · 64 MB 以内</div>
+      <div class="muted" data-i18n="d_drop_sub">.jsonl 直接训: 一行一题 {"messages":[user, assistant], "context"?} 或一行一段原文 {"text": "…"} · .txt / .md = 文档, 进料目录后自动成为原文料(&lt;目录&gt;.text.jsonl) · 64 MB 以内</div>
       <input type="file" id="file" multiple style="display:none">
     </div>
     <div class="row" style="display:flex;gap:10px;align-items:center;margin-top:10px">
       <span class="muted" data-i18n="d_docdir">文档放进料目录:</span><input id="docdir" value="my_docs" style="width:180px"><span class="muted" id="up-msg"></span>
     </div>
     <div class="data-grid">
-      <div style="display:flex;flex-direction:column;gap:16px">
-        <div class="card"><div class="card-title" data-i18n="d_jsonl">训练料(.jsonl)</div><table><thead><tr><th data-i18n="d_file">文件</th><th data-i18n="d_rows">行数</th><th data-i18n="d_size">大小</th><th data-i18n="d_teacher">教师表</th><th></th></tr></thead><tbody id="jsonl-rows"></tbody></table></div>
-        <div class="card"><div class="card-title" data-i18n="d_dirs">文档目录(可选: 出题 → 问答料)</div><table><thead><tr><th data-i18n="d_dir">目录</th><th data-i18n="d_chunks">文档块</th><th data-i18n="d_hasq">已出题</th><th data-i18n="d_rounds">轮数</th><th></th></tr></thead><tbody id="dir-rows"></tbody></table>
-          <div class="muted" style="margin-top:8px" data-i18n="d_dirs_note">文档上传后已经是原文料, 可以直接训; 出题是另一条路(模型读每块文档写问答, 要先卸下服务, 出完自动装回来)。</div></div>
-      </div>
-      <div class="card"><div class="card-title"><span data-i18n="d_preview">预览</span> <span id="pv-name" style="text-transform:none;color:var(--text)"></span></div><div class="pv" id="pv"><div class="muted" data-i18n="d_pv_hint">点左边"预览"看前几行</div></div></div>
+      <div class="card"><div class="card-title" data-i18n="d_jsonl">训练料(.jsonl)</div><div style="overflow-x:auto"><table class="jsonl"><thead><tr><th data-i18n="d_file">文件</th><th data-i18n="d_rows">行数</th><th data-i18n="d_size">大小</th><th data-i18n="d_teacher">教师表</th><th></th></tr></thead><tbody id="jsonl-rows"></tbody></table></div></div>
+      <div class="card"><div class="card-title"><span data-i18n="d_preview">预览</span> <span id="pv-name" style="text-transform:none;color:var(--text)"></span></div><div class="pv" id="pv"><div class="muted" data-i18n="d_pv_hint">点上面表格里的"预览"看前几行</div></div></div>
     </div>
   </section>
 
@@ -370,12 +369,10 @@ const I18N = {
     t_dataset: "数据集", t_manage: "上传或管理语料 →", t_hparams: "超参数", t_epochs: "轮数", t_lr: "学习率", t_layers: "训练层", t_adv: "高级(k=v, 逗号分隔)",
     t_start: "开始训练", t_stop: "停止训练", t_note: "开始训练会自动卸下模型(只能装一份), 训完或停止后自动装回来。每轮过一次 wt2 门, 过门的轮里留出损失最低者自动选中。",
     d_drop: "拖文件到这里, 或点击选择",
-    d_drop_sub: ".jsonl 直接训: 一行一题 {\"messages\":[user, assistant], \"context\"?} 或一行一段原文 {\"text\": \"…\"} · .txt / .md = 文档, 进料目录后自动成为原文料(<目录>.text.jsonl), 也可以再\"出题\"成问答料 · 64 MB 以内",
+    d_drop_sub: ".jsonl 直接训: 一行一题 {\"messages\":[user, assistant], \"context\"?} 或一行一段原文 {\"text\": \"…\"} · .txt / .md = 文档, 进料目录后自动成为原文料(<目录>.text.jsonl) · 64 MB 以内",
     d_docdir: "文档放进料目录:", d_jsonl: "训练料(.jsonl)", d_file: "文件", d_rows: "行数", d_size: "大小", d_teacher: "教师表",
-    d_dirs: "文档目录(可选: 出题 → 问答料)", d_dir: "目录", d_chunks: "文档块", d_hasq: "已出题", d_rounds: "轮数",
-    d_dirs_note: "文档上传后已经是原文料, 可以直接训; 出题是另一条路(模型读每块文档写问答, 要先卸下服务, 出完自动装回来)。",
-    d_preview: "预览", d_pv_hint: "点左边\"预览\"看前几行", d_opt: "{0} · {1} 行", d_hold: "(保持料, 自动混入)", d_cached: "已缓存", d_first: "首训时算",
-    d_use: "用它训练", d_yes: "有", d_no: "没有", d_gen: "出题", d_gen_started: "开始出题", d_nodirs: "还没有文档目录, 拖 .txt / .md 进上面",
+    d_preview: "预览", d_pv_hint: "点上面表格里的\"预览\"看前几行", d_opt: "{0} · {1} 行", d_hold: "(保持料, 自动混入)", d_cached: "已缓存", d_first: "首训时算",
+    d_use: "用它训练",
     pv_loading: "读取中…", pv_text: "原文", pv_q: "问", pv_a: "答", pv_ctx: "材料: {0}", pv_empty: "空文件", pv_err: "读不了: {0}",
     up_bad: "{0}: 只收 .jsonl / .txt / .md", up_ing: "上传 {0}…", up_ok: "已存 {0}", up_text: " → 原文料 {0}", up_rows: " · {0} 行", up_fail: "{0} 上传失败: {1}",
     r_title: "全部训练(点一行进训练页查看)", r_run: "训练", r_cfg: "轮 / 层 / lr", r_status: "状态", r_eval: "留出 第0步 → 末", r_pick: "选中", r_started: "开始于",
@@ -429,12 +426,10 @@ const I18N = {
     t_dataset: "Dataset", t_manage: "Upload or manage data →", t_hparams: "Hyperparameters", t_epochs: "Epochs", t_lr: "Learning rate", t_layers: "Layers", t_adv: "Advanced (k=v, comma-separated)",
     t_start: "Start training", t_stop: "Stop training", t_note: "Starting training unloads the model (only one copy fits) and reloads it when training finishes or stops. Each epoch runs the wt2 gate; among epochs that pass, the lowest held-out loss is picked automatically.",
     d_drop: "Drop files here, or click to choose",
-    d_drop_sub: ".jsonl trains as-is: one item per line {\"messages\":[user, assistant], \"context\"?} or one passage per line {\"text\": \"…\"} · .txt / .md = documents; they go into a folder and become raw-text data (<folder>.text.jsonl), and can also be turned into Q&A · up to 64 MB",
+    d_drop_sub: ".jsonl trains as-is: one item per line {\"messages\":[user, assistant], \"context\"?} or one passage per line {\"text\": \"…\"} · .txt / .md = documents; they go into a folder and become raw-text data (<folder>.text.jsonl) · up to 64 MB",
     d_docdir: "Document folder:", d_jsonl: "Training data (.jsonl)", d_file: "File", d_rows: "Rows", d_size: "Size", d_teacher: "Teacher cache",
-    d_dirs: "Document folders (optional: generate Q&A)", d_dir: "Folder", d_chunks: "Chunks", d_hasq: "Q&A made", d_rounds: "Rounds",
-    d_dirs_note: "Uploaded documents are already raw-text data and can be trained on directly. Generating Q&A is a separate path (the model reads each chunk and writes questions and answers; the server is unloaded first and reloaded afterwards).",
-    d_preview: "Preview", d_pv_hint: "Click \"Preview\" on the left to see the first rows", d_opt: "{0} · {1} rows", d_hold: " (retain set, mixed in automatically)", d_cached: "Cached", d_first: "Built on first run",
-    d_use: "Train on it", d_yes: "Yes", d_no: "No", d_gen: "Generate Q&A", d_gen_started: "Q&A generation started", d_nodirs: "No document folders yet; drop .txt / .md above",
+    d_preview: "Preview", d_pv_hint: "Click \"Preview\" in the table above to see the first rows", d_opt: "{0} · {1} rows", d_hold: " (retain set, mixed in automatically)", d_cached: "Cached", d_first: "Built on first run",
+    d_use: "Train on it",
     pv_loading: "Loading…", pv_text: "Text", pv_q: "Q", pv_a: "A", pv_ctx: "Context: {0}", pv_empty: "Empty file", pv_err: "Can't read: {0}",
     up_bad: "{0}: only .jsonl / .txt / .md", up_ing: "Uploading {0}…", up_ok: "Saved {0}", up_text: " → raw text {0}", up_rows: " · {0} rows", up_fail: "{0} upload failed: {1}",
     r_title: "All runs (click a row to open it on the Train page)", r_run: "Run", r_cfg: "Epochs / layers / lr", r_status: "Status", r_eval: "Held-out step 0 → last", r_pick: "Picked", r_started: "Started",
@@ -691,15 +686,6 @@ async function loadData() {
     if (!hold) { const go = node("button", "act primary", t("d_use")); go.onclick = () => { sel.value = j.path; lsSet("ds4.studio.data", j.path); location.hash = "train"; }; ta.appendChild(go); }
     tr.appendChild(ta); jt.appendChild(tr);
   });
-  const dt = $("dir-rows"); dt.replaceChildren();
-  d.dirs.forEach(x => {
-    const tr = node("tr"); tr.appendChild(node("td", null, short(x.path))); tr.appendChild(node("td", null, x.chunks));
-    const tc = node("td"); tc.appendChild(node("span", "badge " + (x.has_jsonl ? "green" : ""), t(x.has_jsonl ? "d_yes" : "d_no"))); tr.appendChild(tc);
-    const tn = node("td"); const rin = node("input"); rin.value = "1"; rin.style.width = "54px"; tn.appendChild(rin); tr.appendChild(tn);
-    const ta = node("td"); const g = node("button", "act primary", t("d_gen")); g.disabled = training();
-    g.onclick = () => act("/api/train/gen", { dir: x.path, rounds: rin.value }, t("d_gen_started"), 1); ta.appendChild(g); tr.appendChild(ta); dt.appendChild(tr);
-  });
-  if (!d.dirs.length) { const tr = node("tr"); const td = node("td", "muted", t("d_nodirs")); td.colSpan = 5; tr.appendChild(td); dt.appendChild(tr); }
 }
 $("data").onchange = () => lsSet("ds4.studio.data", $("data").value);
 async function preview(path) {
