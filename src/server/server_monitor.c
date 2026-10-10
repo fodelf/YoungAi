@@ -250,48 +250,48 @@ void mon_kv_event(server *s, const char *event, int tokens, int parked, uint64_t
 
 /* ---- /metrics JSON ----------------------------------------------------------- */
 static void jnum(buf *b, double v, int digits) {   /* MON_NA(负) → null; digits 0 = 不带小数 */
-    if (!mon_known(v)) { buf_puts(b, "null"); return; }
-    if (digits <= 0) buf_printf(b, "%.0f", v);
-    else buf_printf(b, "%.*f", digits, v);
+    if (!mon_known(v)) { ds4_buf_puts(b, "null"); return; }
+    if (digits <= 0) ds4_buf_printf(b, "%.0f", v);
+    else ds4_buf_printf(b, "%.*f", digits, v);
 }
-static void jkey(buf *b, const char *k) { buf_putc(b, '"'); buf_puts(b, k); buf_puts(b, "\":"); }
-static void jint_or_null(buf *b, long long v, bool valid) { if (valid) buf_printf(b, "%lld", v); else buf_puts(b, "null"); }
-static void jstr_or_null(buf *b, const char *v) { if (v && v[0]) json_escape(b, v); else buf_puts(b, "null"); }
+static void jkey(buf *b, const char *k) { ds4_buf_putc(b, '"'); ds4_buf_puts(b, k); ds4_buf_puts(b, "\":"); }
+static void jint_or_null(buf *b, long long v, bool valid) { if (valid) ds4_buf_printf(b, "%lld", v); else ds4_buf_puts(b, "null"); }
+static void jstr_or_null(buf *b, const char *v) { if (v && v[0]) json_escape(b, v); else ds4_buf_puts(b, "null"); }
 
 static const char *api_name(api_style a) { return a == API_ANTHROPIC ? "anthropic" : a == API_RESPONSES ? "responses" : "openai"; }
 static const char *state_name(mon_state st) { return st == MON_GENERATING ? "generating" : st == MON_READING ? "reading" : "queued"; }
 
 static void series_json(buf *b, const mon_series *s) {
-    buf_putc(b, '[');
+    ds4_buf_putc(b, '[');
     for (int k = s->len; k >= 1; k--) {
         const int idx = (s->head + MON_HW_HISTORY - k) % MON_HW_HISTORY;
-        if (k != s->len) buf_putc(b, ',');
+        if (k != s->len) ds4_buf_putc(b, ',');
         jnum(b, s->v[idx], 2);
     }
-    buf_putc(b, ']');
+    ds4_buf_putc(b, ']');
 }
 
 static void done_json(buf *b, const mon_done *d) {
     const double decode_tok_s = d->output_tokens > 0 && d->decode_ms > 0.0 ? d->output_tokens / (d->decode_ms / 1e3) : MON_NA;
-    buf_putc(b, '{');
+    ds4_buf_putc(b, '{');
     jkey(b, "time"); jnum(b, d->time, 3);
-    buf_putc(b, ','); jkey(b, "duration_s"); jnum(b, d->duration_s, 1);
-    buf_putc(b, ','); jkey(b, "finish"); json_escape(b, d->finish);
-    buf_putc(b, ','); jkey(b, "api"); json_escape(b, api_name(d->api));
-    buf_putc(b, ','); jkey(b, "stream"); buf_puts(b, d->stream ? "true" : "false");
-    buf_putc(b, ','); jkey(b, "prompt_tokens"); buf_printf(b, "%d", d->prompt_tokens);
-    buf_putc(b, ','); jkey(b, "reused"); buf_printf(b, "%d", d->reused);
-    buf_putc(b, ','); jkey(b, "output_tokens"); buf_printf(b, "%d", d->output_tokens);
-    buf_putc(b, ','); jkey(b, "prompt_total"); buf_printf(b, "%d", d->prompt_tokens);
-    buf_putc(b, ','); jkey(b, "prompt_read"); buf_printf(b, "%d", d->prompt_read);
-    buf_putc(b, ','); jkey(b, "first_token_s"); jnum(b, d->first_token_s, 3);
-    buf_putc(b, ','); jkey(b, "prompt_ms"); jnum(b, d->prompt_ms, 1);
-    buf_putc(b, ','); jkey(b, "decode_ms"); jnum(b, d->decode_ms, 1);
-    buf_putc(b, ','); jkey(b, "decode_tok_s"); jnum(b, decode_tok_s, 1);
-    buf_putc(b, ','); jkey(b, "hit_rate"); buf_puts(b, "null");   /* 专家全常驻, 没有专家缓存命中率这个量; 留键给页面/看板 */
-    buf_putc(b, ','); jkey(b, "drafts_offered"); jint_or_null(b, d->drafts_offered, d->drafts_offered >= 0);
-    buf_putc(b, ','); jkey(b, "drafts_accepted"); jint_or_null(b, d->drafts_accepted, d->drafts_accepted >= 0);
-    buf_putc(b, '}');
+    ds4_buf_putc(b, ','); jkey(b, "duration_s"); jnum(b, d->duration_s, 1);
+    ds4_buf_putc(b, ','); jkey(b, "finish"); json_escape(b, d->finish);
+    ds4_buf_putc(b, ','); jkey(b, "api"); json_escape(b, api_name(d->api));
+    ds4_buf_putc(b, ','); jkey(b, "stream"); ds4_buf_puts(b, d->stream ? "true" : "false");
+    ds4_buf_putc(b, ','); jkey(b, "prompt_tokens"); ds4_buf_printf(b, "%d", d->prompt_tokens);
+    ds4_buf_putc(b, ','); jkey(b, "reused"); ds4_buf_printf(b, "%d", d->reused);
+    ds4_buf_putc(b, ','); jkey(b, "output_tokens"); ds4_buf_printf(b, "%d", d->output_tokens);
+    ds4_buf_putc(b, ','); jkey(b, "prompt_total"); ds4_buf_printf(b, "%d", d->prompt_tokens);
+    ds4_buf_putc(b, ','); jkey(b, "prompt_read"); ds4_buf_printf(b, "%d", d->prompt_read);
+    ds4_buf_putc(b, ','); jkey(b, "first_token_s"); jnum(b, d->first_token_s, 3);
+    ds4_buf_putc(b, ','); jkey(b, "prompt_ms"); jnum(b, d->prompt_ms, 1);
+    ds4_buf_putc(b, ','); jkey(b, "decode_ms"); jnum(b, d->decode_ms, 1);
+    ds4_buf_putc(b, ','); jkey(b, "decode_tok_s"); jnum(b, decode_tok_s, 1);
+    ds4_buf_putc(b, ','); jkey(b, "hit_rate"); ds4_buf_puts(b, "null");   /* 专家全常驻, 没有专家缓存命中率这个量; 留键给页面/看板 */
+    ds4_buf_putc(b, ','); jkey(b, "drafts_offered"); jint_or_null(b, d->drafts_offered, d->drafts_offered >= 0);
+    ds4_buf_putc(b, ','); jkey(b, "drafts_accepted"); jint_or_null(b, d->drafts_accepted, d->drafts_accepted >= 0);
+    ds4_buf_putc(b, '}');
 }
 
 static void live_json(buf *b, const struct server_monitor *m, double now) {
@@ -306,142 +306,142 @@ static void live_json(buf *b, const struct server_monitor *m, double now) {
     double tok_s, tok_s_mean, prefill;
     rates_locked(m, now, &tok_s, &tok_s_mean, &prefill);
     const bool busy = newest != NULL;
-    buf_putc(b, '{');
+    ds4_buf_putc(b, '{');
     jkey(b, "state"); json_escape(b, state);
-    buf_putc(b, ','); jkey(b, "queued"); buf_printf(b, "%d", queued);
-    buf_putc(b, ','); jkey(b, "phase"); buf_puts(b, "null");
-    buf_putc(b, ','); jkey(b, "prompt_tokens"); jint_or_null(b, busy ? newest->prompt_tokens : 0, busy);
-    buf_putc(b, ','); jkey(b, "prompt_read"); jint_or_null(b, busy ? newest->prompt_read : 0, busy && newest->state == MON_READING);
-    buf_putc(b, ','); jkey(b, "prompt_total"); jint_or_null(b, busy ? newest->prompt_tokens : 0, busy && newest->state == MON_READING);
-    buf_putc(b, ','); jkey(b, "generated"); jint_or_null(b, busy ? newest->generated : 0, busy);
-    buf_putc(b, ','); jkey(b, "max_tokens"); jint_or_null(b, busy ? newest->max_tokens : 0, busy);
-    buf_putc(b, ','); jkey(b, "elapsed_s"); jnum(b, busy ? now - newest->t_read : MON_NA, 1);
-    buf_putc(b, ','); jkey(b, "tok_s"); jnum(b, generating ? tok_s : MON_NA, 1);
-    buf_putc(b, ','); jkey(b, "tok_s_mean"); jnum(b, generating ? tok_s_mean : MON_NA, 1);
-    buf_putc(b, ','); jkey(b, "prefill_tok_s_mean"); jnum(b, busy ? prefill : MON_NA, 0);
-    buf_putc(b, ','); jkey(b, "tok_s_window_s"); jnum(b, generating ? MON_RATE_WINDOW_S : MON_NA, 1);
+    ds4_buf_putc(b, ','); jkey(b, "queued"); ds4_buf_printf(b, "%d", queued);
+    ds4_buf_putc(b, ','); jkey(b, "phase"); ds4_buf_puts(b, "null");
+    ds4_buf_putc(b, ','); jkey(b, "prompt_tokens"); jint_or_null(b, busy ? newest->prompt_tokens : 0, busy);
+    ds4_buf_putc(b, ','); jkey(b, "prompt_read"); jint_or_null(b, busy ? newest->prompt_read : 0, busy && newest->state == MON_READING);
+    ds4_buf_putc(b, ','); jkey(b, "prompt_total"); jint_or_null(b, busy ? newest->prompt_tokens : 0, busy && newest->state == MON_READING);
+    ds4_buf_putc(b, ','); jkey(b, "generated"); jint_or_null(b, busy ? newest->generated : 0, busy);
+    ds4_buf_putc(b, ','); jkey(b, "max_tokens"); jint_or_null(b, busy ? newest->max_tokens : 0, busy);
+    ds4_buf_putc(b, ','); jkey(b, "elapsed_s"); jnum(b, busy ? now - newest->t_read : MON_NA, 1);
+    ds4_buf_putc(b, ','); jkey(b, "tok_s"); jnum(b, generating ? tok_s : MON_NA, 1);
+    ds4_buf_putc(b, ','); jkey(b, "tok_s_mean"); jnum(b, generating ? tok_s_mean : MON_NA, 1);
+    ds4_buf_putc(b, ','); jkey(b, "prefill_tok_s_mean"); jnum(b, busy ? prefill : MON_NA, 0);
+    ds4_buf_putc(b, ','); jkey(b, "tok_s_window_s"); jnum(b, generating ? MON_RATE_WINDOW_S : MON_NA, 1);
     if (m->s->batch_max >= 2) {   /* 并发调度器: 每条道一行(Strata 的 slots 视图) */
-        buf_putc(b, ','); jkey(b, "parallel"); buf_printf(b, "%d", m->s->batch_max);
-        buf_putc(b, ','); jkey(b, "running"); buf_printf(b, "%d", reading + generating);
-        buf_putc(b, ','); jkey(b, "waiting"); buf_printf(b, "%d", queued);
-        buf_putc(b, ','); jkey(b, "outside_slots"); buf_puts(b, "0");
-        buf_putc(b, ','); jkey(b, "slots"); buf_putc(b, '[');
+        ds4_buf_putc(b, ','); jkey(b, "parallel"); ds4_buf_printf(b, "%d", m->s->batch_max);
+        ds4_buf_putc(b, ','); jkey(b, "running"); ds4_buf_printf(b, "%d", reading + generating);
+        ds4_buf_putc(b, ','); jkey(b, "waiting"); ds4_buf_printf(b, "%d", queued);
+        ds4_buf_putc(b, ','); jkey(b, "outside_slots"); ds4_buf_puts(b, "0");
+        ds4_buf_putc(b, ','); jkey(b, "slots"); ds4_buf_putc(b, '[');
         int slot = 0;
         for (int i = 0; i < m->live_len && slot < m->s->batch_max; i++) {
             const mon_live *L = &m->live[i];
             if (L->state == MON_QUEUED) continue;
-            if (slot) buf_putc(b, ',');
-            buf_printf(b, "{\"slot\":%d,\"state\":\"%s\",\"prompt_tokens\":%d,\"generated\":%d,\"elapsed_s\":", slot, state_name(L->state), L->prompt_tokens, L->generated);
+            if (slot) ds4_buf_putc(b, ',');
+            ds4_buf_printf(b, "{\"slot\":%d,\"state\":\"%s\",\"prompt_tokens\":%d,\"generated\":%d,\"elapsed_s\":", slot, state_name(L->state), L->prompt_tokens, L->generated);
             jnum(b, now - L->t_read, 1);
-            buf_puts(b, ",\"tok_s\":"); jnum(b, L->state == MON_GENERATING ? live_rate(L, now) : MON_NA, 1);
-            buf_putc(b, '}');
+            ds4_buf_puts(b, ",\"tok_s\":"); jnum(b, L->state == MON_GENERATING ? live_rate(L, now) : MON_NA, 1);
+            ds4_buf_putc(b, '}');
             slot++;
         }
-        for (; slot < m->s->batch_max; slot++) buf_printf(b, "%s{\"slot\":%d,\"state\":\"idle\",\"held_tokens\":0}", slot ? "," : "", slot);
-        buf_putc(b, ']');
+        for (; slot < m->s->batch_max; slot++) ds4_buf_printf(b, "%s{\"slot\":%d,\"state\":\"idle\",\"held_tokens\":0}", slot ? "," : "", slot);
+        ds4_buf_putc(b, ']');
     }
-    buf_putc(b, '}');
+    ds4_buf_putc(b, '}');
 }
 
 static void hardware_json(buf *b, const struct server_monitor *m, double now) {
     const mon_hw_now *h = &m->hw_now;
     double tok_s, tok_s_mean, prefill;
     rates_locked(m, now, &tok_s, &tok_s_mean, &prefill);
-    buf_putc(b, '{');
+    ds4_buf_putc(b, '{');
     jkey(b, "gpu_util"); jnum(b, h->gpu_util, 1);
-    buf_putc(b, ','); jkey(b, "gpu_mem_used"); jnum(b, h->gpu_mem_used, 0);
-    buf_putc(b, ','); jkey(b, "gpu_mem_total"); jnum(b, h->gpu_mem_total, 0);
-    buf_putc(b, ','); jkey(b, "gpu_temp"); jnum(b, h->gpu_temp, 1);
-    buf_putc(b, ','); jkey(b, "gpu_power"); jnum(b, h->gpu_power, 1);
-    buf_putc(b, ','); jkey(b, "gpu_power_limit"); jnum(b, h->gpu_power_limit, 1);
-    buf_putc(b, ','); jkey(b, "gpu_pcie_gen"); jnum(b, h->gpu_pcie_gen, 0);
-    buf_putc(b, ','); jkey(b, "gpu_pcie_gen_max"); jnum(b, h->gpu_pcie_gen_max, 0);
-    buf_putc(b, ','); jkey(b, "gpu_pcie_width"); jnum(b, h->gpu_pcie_width, 0);
-    buf_putc(b, ','); jkey(b, "gpu_pcie_rx_mb"); jnum(b, h->gpu_pcie_rx_mb, 2);
-    buf_putc(b, ','); jkey(b, "gpu_pcie_tx_mb"); jnum(b, h->gpu_pcie_tx_mb, 2);
-    buf_putc(b, ','); jkey(b, "cpu"); jnum(b, h->cpu, 1);
-    buf_putc(b, ','); jkey(b, "ram_used"); jnum(b, h->ram_used, 0);
-    buf_putc(b, ','); jkey(b, "ram_total"); jnum(b, h->ram_total, 0);
-    buf_putc(b, ','); jkey(b, "ram_kernel_total"); jnum(b, h->ram_kernel_total, 0);
-    buf_putc(b, ','); jkey(b, "disk_read_mb"); jnum(b, h->disk_read_mb, 2);
-    buf_putc(b, ','); jkey(b, "disk_write_mb"); jnum(b, h->disk_write_mb, 2);
-    buf_putc(b, ','); jkey(b, "tok_s"); jnum(b, tok_s, 1);
-    buf_putc(b, ','); jkey(b, "tok_s_mean"); jnum(b, tok_s_mean, 1);
-    buf_putc(b, ','); jkey(b, "prefill_tok_s_mean"); jnum(b, prefill, 0);
-    buf_putc(b, '}');
+    ds4_buf_putc(b, ','); jkey(b, "gpu_mem_used"); jnum(b, h->gpu_mem_used, 0);
+    ds4_buf_putc(b, ','); jkey(b, "gpu_mem_total"); jnum(b, h->gpu_mem_total, 0);
+    ds4_buf_putc(b, ','); jkey(b, "gpu_temp"); jnum(b, h->gpu_temp, 1);
+    ds4_buf_putc(b, ','); jkey(b, "gpu_power"); jnum(b, h->gpu_power, 1);
+    ds4_buf_putc(b, ','); jkey(b, "gpu_power_limit"); jnum(b, h->gpu_power_limit, 1);
+    ds4_buf_putc(b, ','); jkey(b, "gpu_pcie_gen"); jnum(b, h->gpu_pcie_gen, 0);
+    ds4_buf_putc(b, ','); jkey(b, "gpu_pcie_gen_max"); jnum(b, h->gpu_pcie_gen_max, 0);
+    ds4_buf_putc(b, ','); jkey(b, "gpu_pcie_width"); jnum(b, h->gpu_pcie_width, 0);
+    ds4_buf_putc(b, ','); jkey(b, "gpu_pcie_rx_mb"); jnum(b, h->gpu_pcie_rx_mb, 2);
+    ds4_buf_putc(b, ','); jkey(b, "gpu_pcie_tx_mb"); jnum(b, h->gpu_pcie_tx_mb, 2);
+    ds4_buf_putc(b, ','); jkey(b, "cpu"); jnum(b, h->cpu, 1);
+    ds4_buf_putc(b, ','); jkey(b, "ram_used"); jnum(b, h->ram_used, 0);
+    ds4_buf_putc(b, ','); jkey(b, "ram_total"); jnum(b, h->ram_total, 0);
+    ds4_buf_putc(b, ','); jkey(b, "ram_kernel_total"); jnum(b, h->ram_kernel_total, 0);
+    ds4_buf_putc(b, ','); jkey(b, "disk_read_mb"); jnum(b, h->disk_read_mb, 2);
+    ds4_buf_putc(b, ','); jkey(b, "disk_write_mb"); jnum(b, h->disk_write_mb, 2);
+    ds4_buf_putc(b, ','); jkey(b, "tok_s"); jnum(b, tok_s, 1);
+    ds4_buf_putc(b, ','); jkey(b, "tok_s_mean"); jnum(b, tok_s_mean, 1);
+    ds4_buf_putc(b, ','); jkey(b, "prefill_tok_s_mean"); jnum(b, prefill, 0);
+    ds4_buf_putc(b, '}');
 }
 
 static void conversation_cache_json(buf *b, const struct server_monitor *m) {
     const server *s = m->s;
     int requests_reused = 0; const mon_done *last = m->hist_len ? &m->hist[(m->hist_head + MON_HISTORY - 1) % MON_HISTORY] : NULL;
     for (int k = 1; k <= m->hist_len; k++) if (m->hist[(m->hist_head + MON_HISTORY - k) % MON_HISTORY].reused > 0) requests_reused++;
-    buf_putc(b, '{');
-    jkey(b, "enabled"); buf_puts(b, s->kv.enabled ? "true" : "false");
-    buf_putc(b, ','); jkey(b, "budget_mib"); jint_or_null(b, (long long)(s->kv.budget_bytes >> 20), s->kv.enabled);
-    buf_putc(b, ','); jkey(b, "slots"); buf_puts(b, "null");   /* 磁盘 KV 按字节预算, 不按条数 */
-    buf_putc(b, ','); jkey(b, "parked"); buf_printf(b, "%d", m->kv.parked);
-    buf_putc(b, ','); jkey(b, "bytes"); buf_printf(b, "%llu", (unsigned long long)m->kv.bytes);
-    buf_putc(b, ','); jkey(b, "parks"); buf_printf(b, "%llu", (unsigned long long)m->kv.parks);
-    buf_putc(b, ','); jkey(b, "restores"); buf_printf(b, "%llu", (unsigned long long)m->kv.restores);
-    buf_putc(b, ','); jkey(b, "evictions"); buf_printf(b, "%llu", (unsigned long long)m->kv.evictions);
-    buf_putc(b, ','); jkey(b, "requests"); buf_printf(b, "%llu", (unsigned long long)m->totals.requests);
-    buf_putc(b, ','); jkey(b, "requests_reused"); buf_printf(b, "%d", requests_reused);
-    buf_putc(b, ','); jkey(b, "reused_tokens"); buf_printf(b, "%llu", (unsigned long long)m->totals.reused);
-    buf_putc(b, ','); jkey(b, "prompt_tokens"); buf_printf(b, "%llu", (unsigned long long)m->totals.prompt_tokens);
-    buf_putc(b, ','); jkey(b, "last_prompt"); jint_or_null(b, last ? last->prompt_tokens : 0, last != NULL);
-    buf_putc(b, ','); jkey(b, "last_reused"); jint_or_null(b, last ? last->reused : 0, last != NULL);
-    buf_putc(b, ','); jkey(b, "last_event"); jstr_or_null(b, m->kv.last_event);
-    buf_putc(b, ','); jkey(b, "last_tokens"); jint_or_null(b, m->kv.last_tokens, m->kv.last_event[0] != 0);
-    buf_putc(b, ','); jkey(b, "last_at"); jnum(b, m->kv.last_event[0] ? m->kv.last_at : MON_NA, 3);
-    buf_putc(b, '}');
+    ds4_buf_putc(b, '{');
+    jkey(b, "enabled"); ds4_buf_puts(b, s->kv.enabled ? "true" : "false");
+    ds4_buf_putc(b, ','); jkey(b, "budget_mib"); jint_or_null(b, (long long)(s->kv.budget_bytes >> 20), s->kv.enabled);
+    ds4_buf_putc(b, ','); jkey(b, "slots"); ds4_buf_puts(b, "null");   /* 磁盘 KV 按字节预算, 不按条数 */
+    ds4_buf_putc(b, ','); jkey(b, "parked"); ds4_buf_printf(b, "%d", m->kv.parked);
+    ds4_buf_putc(b, ','); jkey(b, "bytes"); ds4_buf_printf(b, "%llu", (unsigned long long)m->kv.bytes);
+    ds4_buf_putc(b, ','); jkey(b, "parks"); ds4_buf_printf(b, "%llu", (unsigned long long)m->kv.parks);
+    ds4_buf_putc(b, ','); jkey(b, "restores"); ds4_buf_printf(b, "%llu", (unsigned long long)m->kv.restores);
+    ds4_buf_putc(b, ','); jkey(b, "evictions"); ds4_buf_printf(b, "%llu", (unsigned long long)m->kv.evictions);
+    ds4_buf_putc(b, ','); jkey(b, "requests"); ds4_buf_printf(b, "%llu", (unsigned long long)m->totals.requests);
+    ds4_buf_putc(b, ','); jkey(b, "requests_reused"); ds4_buf_printf(b, "%d", requests_reused);
+    ds4_buf_putc(b, ','); jkey(b, "reused_tokens"); ds4_buf_printf(b, "%llu", (unsigned long long)m->totals.reused);
+    ds4_buf_putc(b, ','); jkey(b, "prompt_tokens"); ds4_buf_printf(b, "%llu", (unsigned long long)m->totals.prompt_tokens);
+    ds4_buf_putc(b, ','); jkey(b, "last_prompt"); jint_or_null(b, last ? last->prompt_tokens : 0, last != NULL);
+    ds4_buf_putc(b, ','); jkey(b, "last_reused"); jint_or_null(b, last ? last->reused : 0, last != NULL);
+    ds4_buf_putc(b, ','); jkey(b, "last_event"); jstr_or_null(b, m->kv.last_event);
+    ds4_buf_putc(b, ','); jkey(b, "last_tokens"); jint_or_null(b, m->kv.last_tokens, m->kv.last_event[0] != 0);
+    ds4_buf_putc(b, ','); jkey(b, "last_at"); jnum(b, m->kv.last_event[0] ? m->kv.last_at : MON_NA, 3);
+    ds4_buf_putc(b, '}');
 }
 
 void mon_metrics_json(server *s, buf *b, bool all_requests) {
     struct server_monitor *m = s->mon;
     const double now = now_sec();
     pthread_mutex_lock(&m->mu);
-    buf_puts(b, "{\"engine\":{");
+    ds4_buf_puts(b, "{\"engine\":{");
     jkey(b, "model"); json_escape(b, s->engine ? ds4_engine_model_name(s->engine) : "");   /* 离线单测没有引擎 */
-    buf_putc(b, ','); jkey(b, "max_context"); buf_printf(b, "%d", server_ctx_size(s));
-    buf_putc(b, ','); jkey(b, "images"); buf_puts(b, s->engine && ds4_engine_mm(s->engine) ? "true" : "false");
-    buf_putc(b, ','); jkey(b, "backend"); json_escape(b, s->backend_name ? s->backend_name : "");
-    buf_putc(b, ','); jkey(b, "variant"); json_escape(b, ds4_engine_is_v41(s->engine) ? "v4.1" : "v4");
-    buf_putc(b, ','); jkey(b, "spec"); buf_puts(b, ds4_engine_is_v41(s->engine) && ds4_engine_v41_dspark() ? "true" : "false");
-    buf_putc(b, ','); jkey(b, "batch"); buf_printf(b, "%d", s->batch_max);
-    buf_putc(b, ','); jkey(b, "kv_disk"); buf_puts(b, s->kv.enabled ? "true" : "false");
-    buf_puts(b, "},\"live\":");
+    ds4_buf_putc(b, ','); jkey(b, "max_context"); ds4_buf_printf(b, "%d", server_ctx_size(s));
+    ds4_buf_putc(b, ','); jkey(b, "images"); ds4_buf_puts(b, s->engine && ds4_engine_mm(s->engine) ? "true" : "false");
+    ds4_buf_putc(b, ','); jkey(b, "backend"); json_escape(b, s->backend_name ? s->backend_name : "");
+    ds4_buf_putc(b, ','); jkey(b, "variant"); json_escape(b, ds4_engine_is_v41(s->engine) ? "v4.1" : "v4");
+    ds4_buf_putc(b, ','); jkey(b, "spec"); ds4_buf_puts(b, ds4_engine_is_v41(s->engine) && ds4_engine_v41_dspark() ? "true" : "false");
+    ds4_buf_putc(b, ','); jkey(b, "batch"); ds4_buf_printf(b, "%d", s->batch_max);
+    ds4_buf_putc(b, ','); jkey(b, "kv_disk"); ds4_buf_puts(b, s->kv.enabled ? "true" : "false");
+    ds4_buf_puts(b, "},\"live\":");
     live_json(b, m, now);
-    buf_puts(b, ",\"requests\":[");
+    ds4_buf_puts(b, ",\"requests\":[");
     const int show = all_requests || m->hist_len < MON_SHOW ? m->hist_len : MON_SHOW;
     for (int k = 1; k <= show; k++) {   /* 最新的在前 */
-        if (k > 1) buf_putc(b, ',');
+        if (k > 1) ds4_buf_putc(b, ',');
         done_json(b, &m->hist[(m->hist_head + MON_HISTORY - k) % MON_HISTORY]);
     }
-    buf_printf(b, "],\"requests_kept\":%d,\"totals\":{", m->hist_len);
+    ds4_buf_printf(b, "],\"requests_kept\":%d,\"totals\":{", m->hist_len);
     jkey(b, "since"); jnum(b, m->since, 3);
-    buf_printf(b, ",\"requests\":%llu,\"prompt_tokens\":%llu,\"reused\":%llu,\"output_tokens\":%llu,\"prompt_ms\":%.1f,\"decode_ms\":%.1f,\"drafts_offered\":%llu,\"drafts_accepted\":%llu}",
+    ds4_buf_printf(b, ",\"requests\":%llu,\"prompt_tokens\":%llu,\"reused\":%llu,\"output_tokens\":%llu,\"prompt_ms\":%.1f,\"decode_ms\":%.1f,\"drafts_offered\":%llu,\"drafts_accepted\":%llu}",
                (unsigned long long)m->totals.requests, (unsigned long long)m->totals.prompt_tokens, (unsigned long long)m->totals.reused,
                (unsigned long long)m->totals.output_tokens, m->totals.prompt_ms, m->totals.decode_ms,
                (unsigned long long)m->totals.drafts_offered, (unsigned long long)m->totals.drafts_accepted);
-    buf_puts(b, ",\"hardware\":");
+    ds4_buf_puts(b, ",\"hardware\":");
     hardware_json(b, m, now);
-    buf_puts(b, ",\"hardware_static\":{");
+    ds4_buf_puts(b, ",\"hardware_static\":{");
     jkey(b, "gpu_name"); jstr_or_null(b, m->hw_static.gpu_name);
-    buf_putc(b, ','); jkey(b, "gpu_count"); buf_printf(b, "%d", m->hw_static.gpu_count);
-    buf_putc(b, ','); jkey(b, "gpu_mem_source"); jstr_or_null(b, m->hw_static.gpu_mem_source);
-    buf_putc(b, ','); jkey(b, "cpu_name"); jstr_or_null(b, m->hw_static.cpu_name);
-    buf_putc(b, ','); jkey(b, "cores"); jint_or_null(b, m->hw_static.cores, m->hw_static.cores > 0);
-    buf_putc(b, ','); jkey(b, "threads"); jint_or_null(b, m->hw_static.threads, m->hw_static.threads > 0);
-    buf_puts(b, "},\"history\":{");
+    ds4_buf_putc(b, ','); jkey(b, "gpu_count"); ds4_buf_printf(b, "%d", m->hw_static.gpu_count);
+    ds4_buf_putc(b, ','); jkey(b, "gpu_mem_source"); jstr_or_null(b, m->hw_static.gpu_mem_source);
+    ds4_buf_putc(b, ','); jkey(b, "cpu_name"); jstr_or_null(b, m->hw_static.cpu_name);
+    ds4_buf_putc(b, ','); jkey(b, "cores"); jint_or_null(b, m->hw_static.cores, m->hw_static.cores > 0);
+    ds4_buf_putc(b, ','); jkey(b, "threads"); jint_or_null(b, m->hw_static.threads, m->hw_static.threads > 0);
+    ds4_buf_puts(b, "},\"history\":{");
     static const char *series_keys[MON_S_COUNT] = {"gpu_util", "gpu_mem_used", "gpu_temp", "gpu_power", "gpu_pcie_rx_mb", "cpu", "ram_used", "disk_read_mb", "tok_s", "prefill_tok_s_mean"};
     for (int i = 0; i < MON_S_COUNT; i++) {
-        if (i) buf_putc(b, ',');
+        if (i) ds4_buf_putc(b, ',');
         jkey(b, series_keys[i]); series_json(b, &m->series[i]);
     }
-    buf_puts(b, "},\"conversation_cache\":");
+    ds4_buf_puts(b, "},\"conversation_cache\":");
     conversation_cache_json(b, m);
-    buf_puts(b, ",\"time\":");
+    ds4_buf_puts(b, ",\"time\":");
     jnum(b, wall_now(), 3);
-    buf_puts(b, "}\n");
+    ds4_buf_puts(b, "}\n");
     pthread_mutex_unlock(&m->mu);
 }

@@ -22,7 +22,7 @@ static void monitor_test_server_free(server *s) {
 static char *metrics_json(server *s, bool all) {
     buf b = {0};
     mon_metrics_json(s, &b, all);
-    return buf_take(&b);
+    return ds4_buf_take(&b);
 }
 
 static int count_substr(const char *s, const char *needle) {
@@ -158,7 +158,7 @@ void test_monitor_prometheus_text_uses_vllm_names(void) {
     TEST_ASSERT(strstr(b.ptr, "ds4:engine_max_context{model_name=\"ds4\"} 4096\n") != NULL);
     TEST_ASSERT(count_substr(b.ptr, "# TYPE ds4:live_state") == 1);   /* 一族只出一次 TYPE */
     TEST_ASSERT(strstr(b.ptr, "ds4:gpu_temp_celsius") == NULL || strstr(b.ptr, "ds4:gpu_temp_celsius{model_name=\"ds4\",gpu=\"0\"} ") != NULL);   /* 读不到就整条不出, 不出 0 */
-    buf_free(&b);
+    ds4_buf_free(&b);
     request_free(&r);
     monitor_test_server_free(s);
 }

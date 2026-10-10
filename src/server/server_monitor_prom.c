@@ -14,13 +14,13 @@
 extern const double mon_buckets[MON_BUCKETS];
 
 static void metric(buf *b, const char *name, const char *kind, const char *help, const char *lab, double v) {
-    buf_printf(b, "# HELP %s %s\n# TYPE %s %s\n%s{%s} %.10g\n", name, help, name, kind, name, lab, v);
+    ds4_buf_printf(b, "# HELP %s %s\n# TYPE %s %s\n%s{%s} %.10g\n", name, help, name, kind, name, lab, v);
 }
 
 static void histogram(buf *b, const char *name, const char *help, const char *lab, const mon_hist *h) {
-    buf_printf(b, "# HELP %s %s\n# TYPE %s histogram\n", name, help, name);
-    for (int i = 0; i < MON_BUCKETS; i++) buf_printf(b, "%s_bucket{%s,le=\"%g\"} %u\n", name, lab, mon_buckets[i], h->count[i]);
-    buf_printf(b, "%s_bucket{%s,le=\"+Inf\"} %u\n%s_sum{%s} %.6f\n%s_count{%s} %u\n", name, lab, h->n, name, lab, h->sum, name, lab, h->n);
+    ds4_buf_printf(b, "# HELP %s %s\n# TYPE %s histogram\n", name, help, name);
+    for (int i = 0; i < MON_BUCKETS; i++) ds4_buf_printf(b, "%s_bucket{%s,le=\"%g\"} %u\n", name, lab, mon_buckets[i], h->count[i]);
+    ds4_buf_printf(b, "%s_bucket{%s,le=\"+Inf\"} %u\n%s_sum{%s} %.6f\n%s_count{%s} %u\n", name, lab, h->n, name, lab, h->sum, name, lab, h->n);
 }
 
 /* ds4: 族: 每族只出一次 HELP/TYPE, 值 NAN 的样本整条不出 */
@@ -31,9 +31,9 @@ static void ds4_metric(ds4_fam *f, const char *name, const char *kind, const cha
     for (int i = 0; i < f->ntyped && !seen; i++) seen = !strcmp(f->typed[i], name);
     if (!seen) {
         if (f->ntyped < 32) f->typed[f->ntyped++] = name;
-        buf_printf(f->b, "# HELP ds4:%s %s\n# TYPE ds4:%s %s\n", name, help, name, kind);
+        ds4_buf_printf(f->b, "# HELP ds4:%s %s\n# TYPE ds4:%s %s\n", name, help, name, kind);
     }
-    buf_printf(f->b, "ds4:%s{%s%s} %.10g\n", name, f->lab, labels ? labels : "", v);
+    ds4_buf_printf(f->b, "ds4:%s{%s%s} %.10g\n", name, f->lab, labels ? labels : "", v);
 }
 
 void mon_prometheus_text(server *s, buf *b) {
@@ -42,9 +42,9 @@ void mon_prometheus_text(server *s, buf *b) {
     {
         buf esc = {0};   /* model_name 标签: 反斜杠与双引号按 Prometheus 规矩转义 */
         const char *model = s->engine ? ds4_engine_model_name(s->engine) : "";
-        for (const char *p = model ? model : "ds4"; *p; p++) { if (*p == '\\' || *p == '"') buf_putc(&esc, '\\'); buf_putc(&esc, *p); }
+        for (const char *p = model ? model : "ds4"; *p; p++) { if (*p == '\\' || *p == '"') ds4_buf_putc(&esc, '\\'); ds4_buf_putc(&esc, *p); }
         snprintf(lab, sizeof lab, "model_name=\"%s\"", esc.ptr ? esc.ptr : "ds4");
-        buf_free(&esc);
+        ds4_buf_free(&esc);
     }
     pthread_mutex_lock(&m->mu);
     int queued = 0, reading = 0, generating = 0; const mon_live *newest = NULL;
