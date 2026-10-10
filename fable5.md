@@ -10839,3 +10839,10 @@ A = 只在提示里找(Strata 默认索引范围), B = 提示 + 已生成都找;
 - **10-10 夜 提交 + Release**(用户: "发 release 和提交代码"): 97 处改动按主题九个 commit(e3ae4e1 ds4_json / 5e304de 监控 / 76d8d10 q4k mma / f0a3e18 --gen-jobs / ab508dd ptrain 收口 / 617ff38 热切 / 33b524b 工作台 C 编排 / 14e4a1c 脚本 / 95bb8f4 文档),
   推 origin/restructure; tag v0.1.0 → https://github.com/fodelf/YoungAi/releases/tag/v0.1.0 四个附件(linux 265 MB / darwin 240 MB + sha256)。
   撞: gh 的默认仓库被设成上游 antirez/ds4, 建 release 报"workflow scope", 要 `-R fodelf/YoungAi`; tag 先用 git push 再建。
+
+## 10-10 深夜 · 工作台中英双语 + 删出题 + 语料页布局, v0.1.0 重发(用户: "启动的页面不支持多语言, 修改一下, 然后能不能把发布的 release 删除, 再发一遍" → "我之前说删除出题的怎么还在啊" / "训练料的布局也不对, 用他训练的按钮都跑出去了")
+- **双语**(5073e91): studio.html 照 monitor.html 的写法(data-i18n + t(key) 字典 zh/en, 跟浏览器语言, 右上角切, ?lang= 强制); localStorage 键两页统一成 ds4.lang。后端回的报错/日志/探针原文不翻。mock 后端 + playwright 实测: 英文模式五个 tab 除切换按钮外零中文; 切回中文、刷新保持。
+- **删出题**(15546bc): 用户早先就要求删, 我当时只降成"可选数据工具"留在语料页, 没删干净, 也没记进 fable5 —— 漏了。这次删 train_gen.c、作业线程 do_gen/TR_JOB_GEN、POST /api/train/gen(实测 404)、料清单 dirs。保留: 上传文档自动重写 <目录>.text.jsonl(可直接训的 text 料); 引擎 ./ds4 --gen-jobs 与 z_nightly gen 是命令行侧, 没动。spark 上的 train_gen.c 没删(Makefile 已不引用; 删另一台文件要先问)。
+- **布局**(90c51ce): 训练料表原来和预览并排半宽 + 全列 nowrap, 长文件名把"预览/用它训练"撑出卡片。改表格/预览各占整行, 文件名列可换行, 按钮列贴右; 900 px 窗口实测按钮不出界。
+- 门: Mac make test 全绿(真模型套件 SKIP); spark make cuda-spark 过, 新 ds4-train 临时起 18800 验了 data/gen/页面后关掉, 生产 :8000(23:09 起的那个)没动, 它还是旧二进制(页面每次从盘读, 已是新页; 旧进程仍认 /api/train/gen, 重启它才换掉)。
+- **Release**: v0.1.0 删了重发两次, 现在 tag = 90c51ce, 四个附件(linux 265 MB / darwin 245 MB + sha256), 说明里加了双语一句; 包内核对: studio 有 ds4.lang、无"出题", ds4-train 有 /api/train/start、无 /api/train/gen。
