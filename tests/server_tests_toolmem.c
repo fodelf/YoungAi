@@ -42,8 +42,8 @@ void test_tool_checkpoint_suffix_is_future_prompt_canonical(void) {
     TEST_ASSERT(strstr(suffix, "&amp;&amp;") == NULL);
     TEST_ASSERT(strstr(suffix, "2&gt;/dev/null") == NULL);
     buf canonical = {0};
-    buf_puts(&canonical, prompt_text);
-    buf_puts(&canonical, suffix);
+    ds4_buf_puts(&canonical, prompt_text);
+    ds4_buf_puts(&canonical, suffix);
 
     chat_msgs history_msgs = {0};
     chat_msg user2 = {0};
@@ -63,7 +63,7 @@ void test_tool_checkpoint_suffix_is_future_prompt_canonical(void) {
     TEST_ASSERT(!strcmp(canonical.ptr, future_prompt));
 
     free(future_prompt);
-    buf_free(&canonical);
+    ds4_buf_free(&canonical);
     free(suffix);
     free(prompt_text);
     free(content);
@@ -116,8 +116,8 @@ void test_tool_checkpoint_minifies_json_parameters(void) {
     memset(&orders, 0, sizeof(orders));
     char *suffix = build_tool_checkpoint_suffix(&r, content, reasoning, &calls);
     buf canonical = {0};
-    buf_puts(&canonical, prompt_text);
-    buf_puts(&canonical, suffix);
+    ds4_buf_puts(&canonical, prompt_text);
+    ds4_buf_puts(&canonical, suffix);
 
     chat_msgs history_msgs = {0};
     chat_msg user2 = {0};
@@ -137,7 +137,7 @@ void test_tool_checkpoint_minifies_json_parameters(void) {
     TEST_ASSERT(!strcmp(canonical.ptr, future_prompt));
 
     free(future_prompt);
-    buf_free(&canonical);
+    ds4_buf_free(&canonical);
     free(suffix);
     free(prompt_text);
     free(content);

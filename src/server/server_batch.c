@@ -140,7 +140,7 @@ static void generate_jobs_batched(server *s, job **jobs, uint32_t n) {
             if (t == ds4_token_eos(s->engine)) { done[i] = true; finish[i] = "stop"; continue; }
             size_t plen = 0;
             char *piece = ds4_token_text(s->engine, t, &plen);
-            if (piece && plen) buf_append(&text[i], piece, plen);
+            if (piece && plen) ds4_buf_append(&text[i], piece, plen);
             completion[i]++;
             mon_token(s, jobs[i]->mon, completion[i]);
             act[na] = sess[i]; tok[na] = t; idx[na] = i; na++;
@@ -186,7 +186,7 @@ static void generate_jobs_batched(server *s, job **jobs, uint32_t n) {
                            body, reasoning, &calls, fin,
                            prompt_tokens[i], completion[i]);
         free(content); free(reasoning); tool_calls_free(&calls);
-        buf_free(&text[i]);
+        ds4_buf_free(&text[i]);
         if (sess[i]) ds4_session_free(sess[i]);
         mon_end(s, jobs[i]->mon, fin, completion[i], -1, -1);
         job_finish(jobs[i]);
@@ -200,6 +200,7 @@ void *worker_main(void *arg) {
     for (;;) {
         job *j = dequeue(s);
         if (!j) break;
+        if (j->sw) { server_plugins_apply(s, j); continue; }   /* 切侧车任务: 单 worker 按序取, 走到这里前面的请求都答完了 */
         if (s->batch_max >= 2 && job_batchable(j)) {
             job *batch[DS4_SERVER_BATCH_LANES];
             batch[0] = j;

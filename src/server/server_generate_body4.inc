@@ -15,11 +15,11 @@
                     parsed_reasoning,
                     &parsed_calls);
             buf visible = {0};
-            buf_puts(&visible, j->req.prompt_text ? j->req.prompt_text : "");
-            buf_puts(&visible, visible_suffix ? visible_suffix : "");
+            ds4_buf_puts(&visible, j->req.prompt_text ? j->req.prompt_text : "");
+            ds4_buf_puts(&visible, visible_suffix ? visible_suffix : "");
             responses_live_remember(s, visible.ptr ? visible.ptr : "",
                                     parsed_calls.len ? &parsed_calls : NULL);
-            buf_free(&visible);
+            ds4_buf_free(&visible);
             free(visible_suffix);
         } else {
             responses_live_clear(s);
@@ -186,5 +186,5 @@
     anthropic_stream_free(&anthropic_live);
     openai_stream_free(&openai_live);
     responses_stream_free(&responses_live);
-    buf_free(&text);
+    ds4_buf_free(&text);
     ds4_tokens_free(&effective_prompt);

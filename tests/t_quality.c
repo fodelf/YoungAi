@@ -51,7 +51,7 @@ static void test_tool_call_quality_one(bool quality) {
                                        r.top_p, r.min_p, &rng);
         size_t piece_len = 0;
         char *piece = ds4_token_text(engine, token, &piece_len);
-        buf_append(&text, piece, piece_len);
+        ds4_buf_append(&text, piece, piece_len);
         free(piece);
         observe_tool_markers(text.ptr ? text.ptr : "", &saw_tool_start, &saw_tool_end, NULL);
         if (saw_tool_end) break;
@@ -74,7 +74,7 @@ static void test_tool_call_quality_one(bool quality) {
     free(content);
     free(reasoning);
     tool_calls_free(&calls);
-    buf_free(&text);
+    ds4_buf_free(&text);
     ds4_session_free(session);
     request_free(&r);
 }

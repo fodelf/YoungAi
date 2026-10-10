@@ -111,13 +111,13 @@ char *build_tool_checkpoint_suffix(const request *r, const char *content,
                                           const char *reasoning, const tool_calls *calls) {
     buf suffix = {0};
     if (ds4_think_mode_enabled(r->think_mode)) {
-        buf_puts(&suffix, reasoning ? reasoning : "");
-        buf_puts(&suffix, "</think>");
+        ds4_buf_puts(&suffix, reasoning ? reasoning : "");
+        ds4_buf_puts(&suffix, "</think>");
     }
-    buf_puts(&suffix, content ? content : "");
+    ds4_buf_puts(&suffix, content ? content : "");
     append_dsml_tool_calls_text(&suffix, calls);
-    buf_puts(&suffix, "<｜end▁of▁sentence｜>");
-    return buf_take(&suffix);
+    ds4_buf_puts(&suffix, "<｜end▁of▁sentence｜>");
+    return ds4_buf_take(&suffix);
 }
 
 char *build_responses_visible_assistant_suffix(const request *r,
@@ -135,14 +135,14 @@ char *build_responses_visible_assistant_suffix(const request *r,
      * match this visible shortcut and can still use exact token-prefix replay. */
     if (ds4_think_mode_enabled(r->think_mode)) {
         if (r->reasoning_summary_emit && calls && calls->len > 0) {
-            buf_puts(&suffix, reasoning ? reasoning : "");
+            ds4_buf_puts(&suffix, reasoning ? reasoning : "");
         }
-        buf_puts(&suffix, "</think>");
+        ds4_buf_puts(&suffix, "</think>");
     }
-    buf_puts(&suffix, content ? content : "");
+    ds4_buf_puts(&suffix, content ? content : "");
     append_dsml_tool_calls_text(&suffix, calls);
-    buf_puts(&suffix, "<｜end▁of▁sentence｜>");
-    return buf_take(&suffix);
+    ds4_buf_puts(&suffix, "<｜end▁of▁sentence｜>");
+    return ds4_buf_take(&suffix);
 }
 
 /* In thinking mode without tools, old assistant reasoning is intentionally not
@@ -172,11 +172,11 @@ char *build_toolless_thinking_visible_text(const request *r,
     }
 
     buf visible = {0};
-    buf_append(&visible, r->prompt_text, pt_len - tag_len);
-    buf_puts(&visible, "</think>");
-    buf_puts(&visible, content ? content : "");
-    buf_puts(&visible, "<｜end▁of▁sentence｜>");
-    return buf_take(&visible);
+    ds4_buf_append(&visible, r->prompt_text, pt_len - tag_len);
+    ds4_buf_puts(&visible, "</think>");
+    ds4_buf_puts(&visible, content ? content : "");
+    ds4_buf_puts(&visible, "<｜end▁of▁sentence｜>");
+    return ds4_buf_take(&visible);
 }
 
 void remember_thinking_checkpoint(server *s, const job *j, const char *ctx,
@@ -207,8 +207,8 @@ void canonicalize_tool_checkpoint(server *s, const job *j, const char *ctx,
     char *suffix_text = build_tool_checkpoint_suffix(&j->req, content, reasoning, calls);
 
     buf rendered = {0};
-    buf_puts(&rendered, j->req.prompt_text);
-    buf_puts(&rendered, suffix_text);
+    ds4_buf_puts(&rendered, j->req.prompt_text);
+    ds4_buf_puts(&rendered, suffix_text);
 
     ds4_tokens canonical = {0};
     ds4_tokenize_rendered_chat(s->engine, rendered.ptr ? rendered.ptr : "", &canonical);
@@ -343,7 +343,7 @@ void canonicalize_tool_checkpoint(server *s, const job *j, const char *ctx,
 
 done:
     ds4_tokens_free(&canonical);
-    buf_free(&rendered);
+    ds4_buf_free(&rendered);
     free(suffix_text);
 }
 

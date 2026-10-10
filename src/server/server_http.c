@@ -54,91 +54,95 @@ void append_json_object_string(buf *b, const char *json) {
     buf tmp = {0};
     append_json_object_or_empty(&tmp, json);
     json_escape(b, tmp.ptr ? tmp.ptr : "{}");
-    buf_free(&tmp);
+    ds4_buf_free(&tmp);
 }
 
 void append_tool_calls_json(buf *b, const tool_calls *calls, const char *id_prefix,
                                    const tool_schema_orders *orders) {
     (void)orders;
-    buf_putc(b, '[');
+    ds4_buf_putc(b, '[');
     for (int i = 0; i < calls->len; i++) {
         const tool_call *tc = &calls->v[i];
-        if (i) buf_putc(b, ',');
+        if (i) ds4_buf_putc(b, ',');
         char idbuf[128];
         snprintf(idbuf, sizeof(idbuf), "%s_tool_%d", id_prefix, i);
-        buf_puts(b, "{\"id\":");
+        ds4_buf_puts(b, "{\"id\":");
         json_escape(b, tc->id ? tc->id : idbuf);
-        buf_puts(b, ",\"type\":\"function\",\"function\":{\"name\":");
+        ds4_buf_puts(b, ",\"type\":\"function\",\"function\":{\"name\":");
         json_escape(b, tc->name ? tc->name : "");
-        buf_puts(b, ",\"arguments\":");
+        ds4_buf_puts(b, ",\"arguments\":");
         append_json_object_string(b, tc->arguments);
-        buf_puts(b, "}}");
+        ds4_buf_puts(b, "}}");
     }
-    buf_putc(b, ']');
+    ds4_buf_putc(b, ']');
 }
 
 void append_tool_call_deltas_json(buf *b, const tool_calls *calls, const char *id_prefix,
                                          const tool_schema_orders *orders) {
     (void)orders;
-    buf_putc(b, '[');
+    ds4_buf_putc(b, '[');
     for (int i = 0; i < calls->len; i++) {
         const tool_call *tc = &calls->v[i];
-        if (i) buf_putc(b, ',');
+        if (i) ds4_buf_putc(b, ',');
         char idbuf[128];
         snprintf(idbuf, sizeof(idbuf), "%s_tool_%d", id_prefix, i);
-        buf_puts(b, "{\"index\":");
-        buf_printf(b, "%d", i);
-        buf_puts(b, ",\"id\":");
+        ds4_buf_puts(b, "{\"index\":");
+        ds4_buf_printf(b, "%d", i);
+        ds4_buf_puts(b, ",\"id\":");
         json_escape(b, tc->id ? tc->id : idbuf);
-        buf_puts(b, ",\"type\":\"function\",\"function\":{\"name\":");
+        ds4_buf_puts(b, ",\"type\":\"function\",\"function\":{\"name\":");
         json_escape(b, tc->name ? tc->name : "");
-        buf_puts(b, ",\"arguments\":");
+        ds4_buf_puts(b, ",\"arguments\":");
         append_json_object_string(b, tc->arguments);
-        buf_puts(b, "}}");
+        ds4_buf_puts(b, "}}");
     }
-    buf_putc(b, ']');
+    ds4_buf_putc(b, ']');
 }
 
 static void append_cors_headers(buf *h) {
-    buf_puts(h,
+    ds4_buf_puts(h,
         "Access-Control-Allow-Origin: *\r\n"
         "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
         "Access-Control-Allow-Headers: *\r\n");
 }
 
 bool http_response(int fd, bool enable_cors, int code, const char *type, const char *body) {
+    return http_response_n(fd, enable_cors, code, type, body, body ? strlen(body) : 0);
+}
+
+/* 带长度的版本: 体里可以有 NUL(训练页的 /logo.jpg 是 JPEG, strlen 会截在第一个 0 字节) */
+bool http_response_n(int fd, bool enable_cors, int code, const char *type, const char *body, size_t body_len) {
     const char *reason = code == 200 ? "OK" :
                          code == 204 ? "No Content" :
                          code == 400 ? "Bad Request" :
                          code == 404 ? "Not Found" :
                          code == 409 ? "Conflict" :
                          code == 500 ? "Internal Server Error" : "Error";
-    const size_t body_len = body ? strlen(body) : 0;
     buf h = {0};
-    buf_printf(&h,
+    ds4_buf_printf(&h,
         "HTTP/1.1 %d %s\r\n"
         "Content-Length: %zu\r\n",
         code, reason, body_len);
     if (type && type[0]) {
-        buf_puts(&h, "Content-Type: ");
-        buf_puts(&h, type);
-        buf_puts(&h, "\r\n");
+        ds4_buf_puts(&h, "Content-Type: ");
+        ds4_buf_puts(&h, type);
+        ds4_buf_puts(&h, "\r\n");
     }
     if (enable_cors) append_cors_headers(&h);
-    buf_puts(&h, "Connection: close\r\n\r\n");
+    ds4_buf_puts(&h, "Connection: close\r\n\r\n");
     bool ok = send_all(fd, h.ptr, h.len);
     if (ok && body_len) ok = send_all(fd, body, body_len);
-    buf_free(&h);
+    ds4_buf_free(&h);
     return ok;
 }
 
 bool http_error(int fd, bool enable_cors, int code, const char *msg) {
     buf b = {0};
-    buf_puts(&b, "{\"error\":{\"message\":");
+    ds4_buf_puts(&b, "{\"error\":{\"message\":");
     json_escape(&b, msg);
-    buf_puts(&b, ",\"type\":\"invalid_request_error\"}}\n");
+    ds4_buf_puts(&b, ",\"type\":\"invalid_request_error\"}}\n");
     bool ok = http_response(fd, enable_cors, code, "application/json", b.ptr);
-    buf_free(&b);
+    ds4_buf_free(&b);
     return ok;
 }
 
@@ -198,26 +202,26 @@ bool http_error_context_length_exceeded(int fd, bool enable_cors,
              n_prompt_tokens, ctx_size);
 
     if (r && r->api == API_ANTHROPIC) {
-        buf_puts(&b, "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":");
+        ds4_buf_puts(&b, "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":");
         json_escape(&b, msg);
-        buf_puts(&b, ",\"n_prompt_tokens\":");
-        buf_printf(&b, "%d", n_prompt_tokens);
-        buf_puts(&b, ",\"n_ctx\":");
-        buf_printf(&b, "%d", ctx_size);
-        buf_puts(&b, "}}\n");
+        ds4_buf_puts(&b, ",\"n_prompt_tokens\":");
+        ds4_buf_printf(&b, "%d", n_prompt_tokens);
+        ds4_buf_puts(&b, ",\"n_ctx\":");
+        ds4_buf_printf(&b, "%d", ctx_size);
+        ds4_buf_puts(&b, "}}\n");
     } else {
-        buf_puts(&b, "{\"error\":{\"message\":");
+        ds4_buf_puts(&b, "{\"error\":{\"message\":");
         json_escape(&b, msg);
-        buf_puts(&b, ",\"type\":\"invalid_request_error\",\"param\":");
+        ds4_buf_puts(&b, ",\"type\":\"invalid_request_error\",\"param\":");
         json_escape(&b, context_length_error_param(r));
-        buf_puts(&b, ",\"code\":\"context_length_exceeded\",\"n_prompt_tokens\":");
-        buf_printf(&b, "%d", n_prompt_tokens);
-        buf_puts(&b, ",\"n_ctx\":");
-        buf_printf(&b, "%d", ctx_size);
-        buf_puts(&b, "}}\n");
+        ds4_buf_puts(&b, ",\"code\":\"context_length_exceeded\",\"n_prompt_tokens\":");
+        ds4_buf_printf(&b, "%d", n_prompt_tokens);
+        ds4_buf_puts(&b, ",\"n_ctx\":");
+        ds4_buf_printf(&b, "%d", ctx_size);
+        ds4_buf_puts(&b, "}}\n");
     }
     bool ok = http_response(fd, enable_cors, 400, "application/json", b.ptr);
-    buf_free(&b);
+    ds4_buf_free(&b);
     return ok;
 }
 
@@ -269,14 +273,14 @@ bool path_route_is(const char *path, const char *route) {
 
 bool sse_headers(int fd, bool enable_cors) {
     buf h = {0};
-    buf_puts(&h,
+    ds4_buf_puts(&h,
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/event-stream\r\n"
         "Cache-Control: no-cache\r\n");
     if (enable_cors) append_cors_headers(&h);
-    buf_puts(&h, "Connection: close\r\n\r\n");
+    ds4_buf_puts(&h, "Connection: close\r\n\r\n");
     bool ok = send_all(fd, h.ptr, h.len);
-    buf_free(&h);
+    ds4_buf_free(&h);
     return ok;
 }
 
@@ -284,16 +288,16 @@ bool sse_error_event(int fd, const request *r, const char *msg) {
     const char *message = msg && msg[0] ? msg : "internal server error";
     buf b = {0};
     if (r && r->api == API_ANTHROPIC) {
-        buf_puts(&b, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":");
+        ds4_buf_puts(&b, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":");
         json_escape(&b, message);
-        buf_puts(&b, "}}\n\n");
+        ds4_buf_puts(&b, "}}\n\n");
     } else {
-        buf_puts(&b, "event: error\ndata: {\"error\":{\"message\":");
+        ds4_buf_puts(&b, "event: error\ndata: {\"error\":{\"message\":");
         json_escape(&b, message);
-        buf_puts(&b, ",\"type\":\"server_error\"}}\n\n");
+        ds4_buf_puts(&b, ",\"type\":\"server_error\"}}\n\n");
     }
     bool ok = send_all(fd, b.ptr, b.len);
-    buf_free(&b);
+    ds4_buf_free(&b);
     return ok;
 }
 
@@ -301,30 +305,30 @@ bool sse_chunk(int fd, const request *r, const char *id, const char *text, const
     buf b = {0};
     long now = (long)time(NULL);
     if (r->kind == REQ_CHAT) {
-        buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
+        ds4_buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
         json_escape(&b, r->model);
-        buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":");
+        ds4_buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":");
         if (text) {
-            buf_puts(&b, "{\"content\":");
+            ds4_buf_puts(&b, "{\"content\":");
             json_escape(&b, text);
-            buf_putc(&b, '}');
+            ds4_buf_putc(&b, '}');
         } else {
-            buf_puts(&b, finish ? "{}" : "{\"role\":\"assistant\"}");
+            ds4_buf_puts(&b, finish ? "{}" : "{\"role\":\"assistant\"}");
         }
-        buf_puts(&b, ",\"finish_reason\":");
-        if (finish) json_escape(&b, finish); else buf_puts(&b, "null");
-        buf_puts(&b, "}]}\n\n");
+        ds4_buf_puts(&b, ",\"finish_reason\":");
+        if (finish) json_escape(&b, finish); else ds4_buf_puts(&b, "null");
+        ds4_buf_puts(&b, "}]}\n\n");
     } else {
-        buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"text_completion\",\"created\":%ld,\"model\":", id, now);
+        ds4_buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"text_completion\",\"created\":%ld,\"model\":", id, now);
         json_escape(&b, r->model);
-        buf_puts(&b, ",\"choices\":[{\"text\":");
+        ds4_buf_puts(&b, ",\"choices\":[{\"text\":");
         json_escape(&b, text ? text : "");
-        buf_puts(&b, ",\"index\":0,\"finish_reason\":");
-        if (finish) json_escape(&b, finish); else buf_puts(&b, "null");
-        buf_puts(&b, "}]}\n\n");
+        ds4_buf_puts(&b, ",\"index\":0,\"finish_reason\":");
+        if (finish) json_escape(&b, finish); else ds4_buf_puts(&b, "null");
+        ds4_buf_puts(&b, "}]}\n\n");
     }
     bool ok = send_all(fd, b.ptr, b.len);
-    buf_free(&b);
+    ds4_buf_free(&b);
     return ok;
 }
 
@@ -344,7 +348,7 @@ void append_openai_usage_json(buf *b, const request *r,
      * Newly-prefilled tokens are useful to expose, but they are a DS4 extension
      * and must stay separate so OpenAI-compatible clients do not over-count
      * cache hits. */
-    buf_printf(b,
+    ds4_buf_printf(b,
                "{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d,"
                "\"prompt_tokens_details\":{\"cached_tokens\":%d,\"cache_write_tokens\":%d}}",
                prompt_tokens, completion_tokens, prompt_tokens + completion_tokens,
@@ -358,19 +362,19 @@ static bool sse_usage_chunk(int fd, const request *r, const char *id,
     buf b = {0};
     long now = (long)time(NULL);
     if (r->kind == REQ_CHAT) {
-        buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
+        ds4_buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
         json_escape(&b, r->model);
-        buf_puts(&b, ",\"choices\":[],\"usage\":");
+        ds4_buf_puts(&b, ",\"choices\":[],\"usage\":");
     } else {
-        buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"text_completion\",\"created\":%ld,\"model\":", id, now);
+        ds4_buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"text_completion\",\"created\":%ld,\"model\":", id, now);
         json_escape(&b, r->model);
-        buf_puts(&b, ",\"choices\":[],\"usage\":");
+        ds4_buf_puts(&b, ",\"choices\":[],\"usage\":");
     }
     append_openai_usage_json(&b, r, prompt_tokens, completion_tokens);
-    buf_puts(&b, "}\n\n");
+    ds4_buf_puts(&b, "}\n\n");
 
     bool ok = send_all(fd, b.ptr, b.len);
-    buf_free(&b);
+    ds4_buf_free(&b);
     return ok;
 }
 
@@ -388,34 +392,34 @@ bool sse_chat_finish(int fd, const request *r, const char *id, const char *conte
     buf b = {0};
     long now = (long)time(NULL);
     if (reasoning && reasoning[0]) {
-        buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
+        ds4_buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
         json_escape(&b, r->model);
-        buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":");
+        ds4_buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":");
         json_escape(&b, reasoning);
-        buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
+        ds4_buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
     }
     if (content && content[0]) {
-        buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
+        ds4_buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
         json_escape(&b, r->model);
-        buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"content\":");
+        ds4_buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"content\":");
         json_escape(&b, content);
-        buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
+        ds4_buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
     }
     if (calls && calls->len) {
-        buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
+        ds4_buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
         json_escape(&b, r->model);
-        buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":");
+        ds4_buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":");
         append_tool_call_deltas_json(&b, calls, id, &r->tool_orders);
-        buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
+        ds4_buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
     }
-    buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
+    ds4_buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
     json_escape(&b, r->model);
-    buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":");
+    ds4_buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":");
     json_escape(&b, finish);
-    buf_puts(&b, "}]}\n\n");
+    ds4_buf_puts(&b, "}]}\n\n");
 
     bool ok = send_all(fd, b.ptr, b.len) &&
               sse_done(fd, r, id, prompt_tokens, completion_tokens);
-    buf_free(&b);
+    ds4_buf_free(&b);
     return ok;
 }

@@ -189,11 +189,11 @@ void test_mcp_tool_schema_names_roundtrip(void) {
     TEST_ASSERT(prompt != NULL);
     TEST_ASSERT(strstr(prompt, name) != NULL);
     buf invoke = {0};
-    buf_puts(&invoke, "invoke name=\"");
-    buf_puts(&invoke, name);
-    buf_puts(&invoke, "\"");
+    ds4_buf_puts(&invoke, "invoke name=\"");
+    ds4_buf_puts(&invoke, name);
+    ds4_buf_puts(&invoke, "\"");
     TEST_ASSERT(strstr(prompt, invoke.ptr) != NULL);
-    buf_free(&invoke);
+    ds4_buf_free(&invoke);
 
     free(prompt);
     chat_msgs_free(&msgs);

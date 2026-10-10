@@ -112,8 +112,8 @@ bad:
 
 void append_raw_json_line(buf *b, const char *json) {
     if (!json || !json[0]) return;
-    if (b->len) buf_putc(b, '\n');
-    buf_puts(b, json);
+    if (b->len) ds4_buf_putc(b, '\n');
+    ds4_buf_puts(b, json);
 }
 
 char *openai_function_schema_from_tool(const char *raw) {
@@ -197,13 +197,13 @@ char *responses_special_schema_from_tool(const char *raw) {
 
     if (type && !strcmp(type, "tool_search")) {
         buf b = {0};
-        buf_puts(&b, "{\"name\":\"tool_search\",\"description\":");
+        ds4_buf_puts(&b, "{\"name\":\"tool_search\",\"description\":");
         json_escape(&b, description ? description : "Search available tools.");
-        buf_puts(&b, ",\"parameters\":");
-        buf_puts(&b, parameters ? parameters :
+        ds4_buf_puts(&b, ",\"parameters\":");
+        ds4_buf_puts(&b, parameters ? parameters :
                  "{\"type\":\"object\",\"properties\":{}}");
-        buf_putc(&b, '}');
-        out = buf_take(&b);
+        ds4_buf_putc(&b, '}');
+        out = ds4_buf_take(&b);
     }
 
 done:
@@ -273,21 +273,21 @@ char *responses_namespace_function_schema_from_tool(const char *raw,
 
     if ((!type || !strcmp(type, "function")) && namespace && name && name[0]) {
         buf prompt_name = {0};
-        buf_puts(&prompt_name, namespace);
-        buf_puts(&prompt_name, name);
+        ds4_buf_puts(&prompt_name, namespace);
+        ds4_buf_puts(&prompt_name, name);
 
         buf b = {0};
-        buf_puts(&b, "{\"name\":");
+        ds4_buf_puts(&b, "{\"name\":");
         json_escape(&b, prompt_name.ptr ? prompt_name.ptr : name);
-        buf_puts(&b, ",\"description\":");
+        ds4_buf_puts(&b, ",\"description\":");
         json_escape(&b, description ? description : "");
-        buf_puts(&b, ",\"parameters\":");
-        buf_puts(&b, parameters ? parameters :
+        ds4_buf_puts(&b, ",\"parameters\":");
+        ds4_buf_puts(&b, parameters ? parameters :
                  "{\"type\":\"object\",\"properties\":{}}");
-        buf_putc(&b, '}');
-        out = buf_take(&b);
+        ds4_buf_putc(&b, '}');
+        out = ds4_buf_take(&b);
         if (wire_name) *wire_name = xstrdup(name);
-        buf_free(&prompt_name);
+        ds4_buf_free(&prompt_name);
     }
 
 done:

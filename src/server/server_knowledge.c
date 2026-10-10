@@ -104,7 +104,7 @@ const char *knowledge_retrieve(const char *query) {
 
 void append_tools_prompt_text(buf *b, const char *tool_schemas) {
     if (!tool_schemas || !tool_schemas[0]) return;
-    buf_puts(b,
+    ds4_buf_puts(b,
         "## Tools\n\n"
         "You have access to a set of tools to help answer the user question. "
         "You can invoke tools by writing a \"<｜DSML｜tool_calls>\" block like the following:\n\n"
@@ -132,15 +132,15 @@ void append_tools_prompt_text(buf *b, const char *tool_schemas) {
      * token 明晃晃写进上下文, 对 1-bit base 是校准盲区陷阱 — 无 soul 模板可跟的
      * 任务(写新代码)会"听 header 的话"试图发 <think>, 劣化成 <思> 循环。 */
     if (!g_force_nothink)
-        buf_puts(b,
+        ds4_buf_puts(b,
             "If thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\n"
             "Otherwise, output directly after </think> with tool calls or final response.\n\n");
-    buf_puts(b, "### Available Tool Schemas\n\n");
-    buf_puts(b, tool_schemas);
-    buf_puts(b, "\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls. "
+    ds4_buf_puts(b, "### Available Tool Schemas\n\n");
+    ds4_buf_puts(b, tool_schemas);
+    ds4_buf_puts(b, "\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls. "
                 "Use the exact parameter names from the schemas.");
     if (g_soul_text && g_soul_text[0]) {
-        buf_puts(b, "\n\n");
-        buf_puts(b, g_soul_text);
+        ds4_buf_puts(b, "\n\n");
+        ds4_buf_puts(b, g_soul_text);
     }
 }

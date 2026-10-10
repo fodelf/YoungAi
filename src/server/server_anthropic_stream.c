@@ -235,32 +235,32 @@ static bool anthropic_sse_tool_blocks_live(int fd, const request *r, const char 
         const tool_call *tc = &calls->v[i];
         char idbuf[128];
         snprintf(idbuf, sizeof(idbuf), DS4_TOOL_ID_PREFIX_ANTHROPIC "%s_%d", id, i);
-        buf_printf(&b,
+        ds4_buf_printf(&b,
                    "{\"type\":\"content_block_start\",\"index\":%d,"
                    "\"content_block\":{\"type\":\"tool_use\",\"id\":",
                    st->next_index);
         json_escape(&b, tc->id && tc->id[0] ? tc->id : idbuf);
-        buf_puts(&b, ",\"name\":");
+        ds4_buf_puts(&b, ",\"name\":");
         json_escape(&b, tc->name ? tc->name : "");
-        buf_puts(&b, ",\"input\":{}}}");
+        ds4_buf_puts(&b, ",\"input\":{}}}");
         bool ok = sse_event(fd, "content_block_start", b.ptr);
-        buf_free(&b);
+        ds4_buf_free(&b);
         if (!ok) return false;
 
-        buf_printf(&b,
+        ds4_buf_printf(&b,
                    "{\"type\":\"content_block_delta\",\"index\":%d,"
                    "\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":",
                    st->next_index);
         append_json_object_string(&b, tc->arguments);
-        buf_puts(&b, "}}");
+        ds4_buf_puts(&b, "}}");
         ok = sse_event(fd, "content_block_delta", b.ptr);
-        buf_free(&b);
+        ds4_buf_free(&b);
         if (!ok) return false;
 
-        buf_printf(&b, "{\"type\":\"content_block_stop\",\"index\":%d}",
+        ds4_buf_printf(&b, "{\"type\":\"content_block_stop\",\"index\":%d}",
                    st->next_index);
         ok = sse_event(fd, "content_block_stop", b.ptr);
-        buf_free(&b);
+        ds4_buf_free(&b);
         if (!ok) return false;
     }
     return true;
@@ -269,12 +269,12 @@ static bool anthropic_sse_tool_blocks_live(int fd, const request *r, const char 
 static bool anthropic_sse_stop_live(int fd, const char *finish,
                                     int completion_tokens) {
     buf b = {0};
-    buf_puts(&b, "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":");
+    ds4_buf_puts(&b, "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":");
     json_escape(&b, anthropic_stop_reason(finish));
-    buf_puts(&b, ",\"stop_sequence\":null},\"usage\":{\"output_tokens\":");
-    buf_printf(&b, "%d}}", completion_tokens);
+    ds4_buf_puts(&b, ",\"stop_sequence\":null},\"usage\":{\"output_tokens\":");
+    ds4_buf_printf(&b, "%d}}", completion_tokens);
     bool ok = sse_event(fd, "message_delta", b.ptr);
-    buf_free(&b);
+    ds4_buf_free(&b);
     if (ok) ok = sse_event(fd, "message_stop", "{\"type\":\"message_stop\"}");
     return ok;
 }

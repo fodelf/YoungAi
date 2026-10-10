@@ -74,11 +74,11 @@ bad:
 
 static void append_dsml_attr_escaped(buf *b, const char *s) {
     for (s = s ? s : ""; *s; s++) {
-        if (*s == '&') buf_puts(b, "&amp;");
-        else if (*s == '<') buf_puts(b, "&lt;");
-        else if (*s == '>') buf_puts(b, "&gt;");
-        else if (*s == '"') buf_puts(b, "&quot;");
-        else buf_putc(b, *s);
+        if (*s == '&') ds4_buf_puts(b, "&amp;");
+        else if (*s == '<') ds4_buf_puts(b, "&lt;");
+        else if (*s == '>') ds4_buf_puts(b, "&gt;");
+        else if (*s == '"') ds4_buf_puts(b, "&quot;");
+        else ds4_buf_putc(b, *s);
     }
 }
 
@@ -87,10 +87,10 @@ static void append_dsml_parameter_text(buf *b, const char *s) {
     const size_t endlen = strlen(end);
     for (s = s ? s : ""; *s;) {
         if (!strncmp(s, end, endlen)) {
-            buf_puts(b, "&lt;");
+            ds4_buf_puts(b, "&lt;");
             s++;
         } else {
-            buf_putc(b, *s++);
+            ds4_buf_putc(b, *s++);
         }
     }
 }
@@ -105,10 +105,10 @@ void append_tool_result_text(buf *b, const char *s) {
     const size_t endlen = strlen(end);
     for (s = s ? s : ""; *s;) {
         if (!strncmp(s, end, endlen)) {
-            buf_puts(b, "&lt;");
+            ds4_buf_puts(b, "&lt;");
             s++;
         } else {
-            buf_putc(b, *s++);
+            ds4_buf_putc(b, *s++);
         }
     }
 }
@@ -118,23 +118,23 @@ static void append_dsml_json_literal(buf *b, const char *s) {
     const size_t endlen = strlen(end);
     for (s = s ? s : ""; *s;) {
         if (!strncmp(s, end, endlen)) {
-            buf_puts(b, "\\u003c");
+            ds4_buf_puts(b, "\\u003c");
             s++;
         } else {
-            buf_putc(b, *s++);
+            ds4_buf_putc(b, *s++);
         }
     }
 }
 
 static void append_dsml_arg(buf *b, const json_arg *arg) {
-    buf_puts(b, "<｜DSML｜parameter name=\"");
+    ds4_buf_puts(b, "<｜DSML｜parameter name=\"");
     append_dsml_attr_escaped(b, arg->key);
-    buf_puts(b, "\" string=\"");
-    buf_puts(b, arg->is_string ? "true" : "false");
-    buf_puts(b, "\">");
+    ds4_buf_puts(b, "\" string=\"");
+    ds4_buf_puts(b, arg->is_string ? "true" : "false");
+    ds4_buf_puts(b, "\">");
     if (arg->is_string) append_dsml_parameter_text(b, arg->value);
     else append_dsml_json_literal(b, arg->value);
-    buf_puts(b, "</｜DSML｜parameter>\n");
+    ds4_buf_puts(b, "</｜DSML｜parameter>\n");
 }
 
 bool append_dsml_arguments_from_json(buf *b, const char *json, const tool_schema_order *order) {
@@ -158,48 +158,48 @@ bool append_dsml_arguments_from_json(buf *b, const char *json, const tool_schema
 
 static void append_json_arg_pair(buf *b, const json_arg *arg) {
     json_escape(b, arg->key);
-    buf_puts(b, ":");
+    ds4_buf_puts(b, ":");
     if (arg->is_string) json_escape(b, arg->value);
-    else buf_puts(b, arg->value);
+    else ds4_buf_puts(b, arg->value);
 }
 
 void append_json_object_or_empty(buf *b, const char *json) {
     json_args args = {0};
     if (!json_args_parse(json, &args)) {
-        buf_puts(b, "{}");
+        ds4_buf_puts(b, "{}");
         return;
     }
-    buf_putc(b, '{');
+    ds4_buf_putc(b, '{');
     bool wrote = false;
     for (int i = 0; i < args.len; i++) {
-        if (wrote) buf_putc(b, ',');
+        if (wrote) ds4_buf_putc(b, ',');
         append_json_arg_pair(b, &args.v[i]);
         wrote = true;
     }
-    buf_putc(b, '}');
+    ds4_buf_putc(b, '}');
     json_args_free(&args);
 }
 
 void append_dsml_tool_calls_text(buf *b, const tool_calls *calls) {
     if (!calls || calls->len == 0) return;
     if (calls->raw_dsml && calls->raw_dsml[0]) {
-        buf_puts(b, calls->raw_dsml);
+        ds4_buf_puts(b, calls->raw_dsml);
         return;
     }
-    buf_puts(b, "\n\n<｜DSML｜tool_calls>\n");
+    ds4_buf_puts(b, "\n\n<｜DSML｜tool_calls>\n");
     for (int i = 0; i < calls->len; i++) {
         const tool_call *tc = &calls->v[i];
-        buf_puts(b, "<｜DSML｜invoke name=\"");
+        ds4_buf_puts(b, "<｜DSML｜invoke name=\"");
         append_dsml_attr_escaped(b, tc->name);
-        buf_puts(b, "\">\n");
+        ds4_buf_puts(b, "\">\n");
         if (!append_dsml_arguments_from_json(b, tc->arguments, NULL)) {
-            buf_puts(b, "<｜DSML｜parameter name=\"arguments\" string=\"true\">");
+            ds4_buf_puts(b, "<｜DSML｜parameter name=\"arguments\" string=\"true\">");
             append_dsml_parameter_text(b, tc->arguments);
-            buf_puts(b, "</｜DSML｜parameter>\n");
+            ds4_buf_puts(b, "</｜DSML｜parameter>\n");
         }
-        buf_puts(b, "</｜DSML｜invoke>\n");
+        ds4_buf_puts(b, "</｜DSML｜invoke>\n");
     }
-    buf_puts(b, "</｜DSML｜tool_calls>");
+    ds4_buf_puts(b, "</｜DSML｜tool_calls>");
 }
 
 bool role_is_system(const char *role) {
@@ -236,19 +236,19 @@ bool chat_history_uses_tool_context(const chat_msgs *msgs,
 static char *render_chat_prompt_base_native(const chat_msgs *msgs, const char *tool_schemas,
                                              size_t *conv_off) {
     buf out = {0};
-    buf_puts(&out, "<｜begin▁of▁sentence｜>");
+    ds4_buf_puts(&out, "<｜begin▁of▁sentence｜>");
     if (tool_schemas && tool_schemas[0]) {
         buf sys = {0};
         append_tools_prompt_text(&sys, tool_schemas);
-        buf_puts(&out, sys.ptr ? sys.ptr : "");
-        buf_puts(&out, "\n\n");
-        buf_free(&sys);
+        ds4_buf_puts(&out, sys.ptr ? sys.ptr : "");
+        ds4_buf_puts(&out, "\n\n");
+        ds4_buf_free(&sys);
     }
     for (int i = 0; i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         if (!role_is_system(m->role)) continue;
-        buf_puts(&out, m->content ? m->content : "");
-        buf_puts(&out, "\n\n");
+        ds4_buf_puts(&out, m->content ? m->content : "");
+        ds4_buf_puts(&out, "\n\n");
     }
     /* knowledge-primer: 用末条 user 消息检索最相关参考块, 注入 header (system 后、
      * 对话前 → KV 前缀友好且落在续写锚上游)。命中零重叠不注入(避免噪声)。 */
@@ -261,9 +261,9 @@ static char *render_chat_prompt_base_native(const chat_msgs *msgs, const char *t
             if (!strcmp(msgs->v[i].role, "user")) { last_user = msgs->v[i].content; break; }
         const char *ref = knowledge_retrieve(last_user);
         if (ref) {
-            buf_puts(&out, "# Reference (use this to answer accurately):\n");
-            buf_puts(&out, ref);
-            buf_puts(&out, "\n\n");
+            ds4_buf_puts(&out, "# Reference (use this to answer accurately):\n");
+            ds4_buf_puts(&out, ref);
+            ds4_buf_puts(&out, "\n\n");
             knowledge_hit = true;
         }
     }
@@ -272,21 +272,21 @@ static char *render_chat_prompt_base_native(const chat_msgs *msgs, const char *t
         const chat_msg *m = &msgs->v[i];
         if (role_is_system(m->role)) continue;
         if (!strcmp(m->role, "user")) {
-            buf_puts(&out, "# User:\n");
-            buf_puts(&out, m->content ? m->content : "");
-            buf_puts(&out, "\n\n");
+            ds4_buf_puts(&out, "# User:\n");
+            ds4_buf_puts(&out, m->content ? m->content : "");
+            ds4_buf_puts(&out, "\n\n");
         } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
-            buf_puts(&out, "# Tool result:\n");
+            ds4_buf_puts(&out, "# Tool result:\n");
             append_tool_result_text(&out, m->content);
-            buf_puts(&out, "\n\n");
+            ds4_buf_puts(&out, "\n\n");
         } else if (!strcmp(m->role, "assistant")) {
-            buf_puts(&out, "# Assistant:\n");
-            buf_puts(&out, m->content ? m->content : "");
+            ds4_buf_puts(&out, "# Assistant:\n");
+            ds4_buf_puts(&out, m->content ? m->content : "");
             append_dsml_tool_calls_text(&out, &m->calls);
-            buf_puts(&out, "\n\n");
+            ds4_buf_puts(&out, "\n\n");
         }
     }
-    buf_puts(&out, "# Assistant:\n");
+    ds4_buf_puts(&out, "# Assistant:\n");
     /* 续写锚: base 惯性会"评论任务"而非动手 → 锚把续写钉进干活分布。 */
     {   /* 有 tools 时不设锚: 工具调用帧归 --tool-primer 引导采样接管(server 注入全部
          * 结构 token, 模型只填值) —— 1-bit 下 DSML 特殊 token 会被采成汉字, 结构必须
@@ -328,9 +328,9 @@ static char *render_chat_prompt_base_native(const chat_msgs *msgs, const char *t
                 }
             }
         }
-        buf_puts(&out, anchor);
+        ds4_buf_puts(&out, anchor);
     }
-    return buf_take(&out);
+    return ds4_buf_take(&out);
 }
 
 /* base-native 的边界: 母语骨架里没有 EOS 角色帧, base 会继续自问自答("# User:" 再来一轮)
@@ -363,8 +363,8 @@ char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
     for (int i = 0; i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         if (!role_is_system(m->role)) continue;
-        if (system.len) buf_puts(&system, "\n\n");
-        buf_puts(&system, m->content ? m->content : "");
+        if (system.len) ds4_buf_puts(&system, "\n\n");
+        ds4_buf_puts(&system, m->content ? m->content : "");
     }
     for (int i = 0; i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
@@ -372,15 +372,15 @@ char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
     }
 
     buf out = {0};
-    buf_puts(&out, "<｜begin▁of▁sentence｜>");
+    ds4_buf_puts(&out, "<｜begin▁of▁sentence｜>");
     /* ★V4.1 官方 encoding.py★: 有 system 正文或 thinking 的 effort 前缀 ⇒ 先写 <｜System｜>(一次), 再前缀, 再 system 正文。
      * 2026-09-21 实撞: 这里原来是 V4 写法(BOS 后直接 system 正文, 前缀只在 max 档且是一段英文长段落), V4.1 的 tokenizer
      * 新增了 <｜System｜>(id 128799), 漏掉它 = 每条带 system 的产品请求都跑在模型没训练过的格式上(bug.md §1)。
      * V4 的 tokenizer 没这个 token, 那时 ds4_chat_system_token() 是空串, 渲染退回原样。金标单测: test_render_matches_official_v41_encoding。 */
     const char *effort = ds4_think_effort_prefix(think_mode);
-    if (effort[0] || system.len) buf_puts(&out, ds4_chat_system_token());
-    buf_puts(&out, effort);
-    buf_puts(&out, system.ptr ? system.ptr : "");
+    if (effort[0] || system.len) ds4_buf_puts(&out, ds4_chat_system_token());
+    ds4_buf_puts(&out, effort);
+    ds4_buf_puts(&out, system.ptr ? system.ptr : "");
 
     bool pending_assistant = false;
     bool pending_tool_result = false;
@@ -389,45 +389,45 @@ char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
         if (role_is_system(m->role)) {
             continue;
         } else if (!strcmp(m->role, "user")) {
-            buf_puts(&out, "<｜User｜>");
-            buf_puts(&out, m->content ? m->content : "");
+            ds4_buf_puts(&out, "<｜User｜>");
+            ds4_buf_puts(&out, m->content ? m->content : "");
             pending_assistant = true;
             pending_tool_result = false;
         } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
-            if (!pending_tool_result) buf_puts(&out, "<｜User｜>");
-            buf_puts(&out, "<tool_result>");
+            if (!pending_tool_result) ds4_buf_puts(&out, "<｜User｜>");
+            ds4_buf_puts(&out, "<tool_result>");
             append_tool_result_text(&out, m->content);
-            buf_puts(&out, "</tool_result>");
+            ds4_buf_puts(&out, "</tool_result>");
             pending_assistant = true;
             pending_tool_result = true;
         } else if (!strcmp(m->role, "assistant")) {
             if (pending_assistant) {
-                buf_puts(&out, "<｜Assistant｜>");
+                ds4_buf_puts(&out, "<｜Assistant｜>");
                 if (think) {
                     if (tool_context || i > last_user_idx) {
-                        buf_puts(&out, "<think>");
-                        buf_puts(&out, m->reasoning ? m->reasoning : "");
-                        buf_puts(&out, "</think>");
+                        ds4_buf_puts(&out, "<think>");
+                        ds4_buf_puts(&out, m->reasoning ? m->reasoning : "");
+                        ds4_buf_puts(&out, "</think>");
                     } else {
-                        buf_puts(&out, "</think>");
+                        ds4_buf_puts(&out, "</think>");
                     }
                 } else {
-                    buf_puts(&out, "</think>");
+                    ds4_buf_puts(&out, "</think>");
                 }
             }
-            buf_puts(&out, m->content ? m->content : "");
+            ds4_buf_puts(&out, m->content ? m->content : "");
             append_dsml_tool_calls_text(&out, &m->calls);
-            buf_puts(&out, "<｜end▁of▁sentence｜>");
+            ds4_buf_puts(&out, "<｜end▁of▁sentence｜>");
             pending_assistant = false;
             pending_tool_result = false;
         }
     }
 
     if (pending_assistant) {
-        buf_puts(&out, "<｜Assistant｜>");
-        buf_puts(&out, think ? "<think>" : "</think>");
+        ds4_buf_puts(&out, "<｜Assistant｜>");
+        ds4_buf_puts(&out, think ? "<think>" : "</think>");
     }
 
-    buf_free(&system);
-    return buf_take(&out);
+    ds4_buf_free(&system);
+    return ds4_buf_take(&out);
 }

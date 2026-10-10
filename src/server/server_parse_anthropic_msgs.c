@@ -121,42 +121,42 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
     } else if (type && !strcmp(type, "tool_result")) {
         chat_msg_add_tool_call_id(msg, id);
         buf b = {0};
-        buf_puts(&b, msg->content ? msg->content : "");
-        buf_puts(&b, "<tool_result>");
+        ds4_buf_puts(&b, msg->content ? msg->content : "");
+        ds4_buf_puts(&b, "<tool_result>");
         /* is_error is protocol state, not payload: clients often send terse
          * or empty error content where the flag itself is the signal.  Keep
          * it as a literal marker before the (escaped) payload; non-error
          * results render byte-identically to the pre-flag format. */
-        if (result_is_error) buf_puts(&b, "[tool_error] ");
+        if (result_is_error) ds4_buf_puts(&b, "[tool_error] ");
         append_tool_result_text(&b, tool_result);
-        buf_puts(&b, "</tool_result>");
+        ds4_buf_puts(&b, "</tool_result>");
         free(msg->content);
-        msg->content = buf_take(&b);
+        msg->content = ds4_buf_take(&b);
     } else if (type && !strcmp(type, "image")) {
         /* Image block -> canonical text via the modality registry (frontend-
          * domain encoder: UI geometry / palette / verbatim text). */
         buf b = {0};
-        buf_puts(&b, msg->content ? msg->content : "");
+        ds4_buf_puts(&b, msg->content ? msg->content : "");
         if (!mm_image_source_to_text(mm, src_type, src_media, src_data, &b)) {
-            buf_free(&b);
+            ds4_buf_free(&b);
             goto bad;
         }
         free(msg->content);
-        msg->content = buf_take(&b);
+        msg->content = ds4_buf_take(&b);
     } else {
         if (text) {
             buf b = {0};
-            buf_puts(&b, msg->content ? msg->content : "");
+            ds4_buf_puts(&b, msg->content ? msg->content : "");
             append_anthropic_block_content(&b, text);
             free(msg->content);
-            msg->content = buf_take(&b);
+            msg->content = ds4_buf_take(&b);
         }
         if (thinking) {
             buf b = {0};
-            buf_puts(&b, msg->reasoning ? msg->reasoning : "");
+            ds4_buf_puts(&b, msg->reasoning ? msg->reasoning : "");
             append_anthropic_block_content(&b, thinking);
             free(msg->reasoning);
-            msg->reasoning = buf_take(&b);
+            msg->reasoning = ds4_buf_take(&b);
         }
     }
 
@@ -200,10 +200,10 @@ static bool parse_anthropic_content(const char **p, chat_msg *msg, ds4_mm *mm) {
             char *s = NULL;
             if (!json_string(p, &s)) return false;
             buf b = {0};
-            buf_puts(&b, msg->content ? msg->content : "");
-            buf_puts(&b, s);
+            ds4_buf_puts(&b, msg->content ? msg->content : "");
+            ds4_buf_puts(&b, s);
             free(msg->content);
-            msg->content = buf_take(&b);
+            msg->content = ds4_buf_take(&b);
             free(s);
         } else if (**p == '{') {
             if (!parse_anthropic_content_block(p, msg->role ? msg->role : "", msg, mm)) return false;
@@ -287,8 +287,8 @@ static bool anthropic_system_part_is_private(const char *s) {
 
 static void append_anthropic_system_part(buf *b, const char *s) {
     if (!s || !s[0] || anthropic_system_part_is_private(s)) return;
-    if (b->len && b->ptr[b->len - 1] != '\n') buf_putc(b, '\n');
-    buf_puts(b, s);
+    if (b->len && b->ptr[b->len - 1] != '\n') ds4_buf_putc(b, '\n');
+    ds4_buf_puts(b, s);
 }
 
 static bool parse_anthropic_system_object(const char **p, buf *out) {
@@ -334,7 +334,7 @@ bool parse_anthropic_system(const char **p, char **out) {
         if (!json_string(p, &text)) return false;
         append_anthropic_system_part(&b, text);
         free(text);
-        *out = buf_take(&b);
+        *out = ds4_buf_take(&b);
         return true;
     }
     if (json_lit(p, "null")) {
@@ -365,9 +365,9 @@ bool parse_anthropic_system(const char **p, char **out) {
     }
     if (**p != ']') goto bad;
     (*p)++;
-    *out = buf_take(&b);
+    *out = ds4_buf_take(&b);
     return true;
 bad:
-    buf_free(&b);
+    ds4_buf_free(&b);
     return false;
 }

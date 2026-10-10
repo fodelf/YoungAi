@@ -24,7 +24,7 @@ bool parse_responses_content_array(const char **p, char **out) {
         if (**p == '"') {
             char *s = NULL;
             if (!json_string(p, &s)) goto fail;
-            buf_puts(&b, s);
+            ds4_buf_puts(&b, s);
             free(s);
         } else if (**p == '{') {
             (*p)++;
@@ -99,7 +99,7 @@ bool parse_responses_content_array(const char **p, char **out) {
                 free(text);
                 goto fail;
             }
-            buf_puts(&b, text);
+            ds4_buf_puts(&b, text);
             free(type);
             free(text);
         } else {
@@ -113,10 +113,10 @@ bool parse_responses_content_array(const char **p, char **out) {
     }
     if (**p != ']') goto fail;
     (*p)++;
-    *out = buf_take(&b);
+    *out = ds4_buf_take(&b);
     return true;
 fail:
-    buf_free(&b);
+    ds4_buf_free(&b);
     return false;
 }
 
@@ -276,7 +276,7 @@ bool parse_responses_request(ds4_engine *e, server *s, const char *body, int def
                     free(choice);
                     free(key);
                     chat_msgs_free(&msgs);
-                    buf_free(&loaded_tool_schemas);
+                    ds4_buf_free(&loaded_tool_schemas);
                     free(instructions);
                     free(tool_schemas);
                     request_free(r);
@@ -287,7 +287,7 @@ bool parse_responses_request(ds4_engine *e, server *s, const char *body, int def
                 snprintf(err, errlen, "forced tool_choice not supported");
                 free(key);
                 chat_msgs_free(&msgs);
-                buf_free(&loaded_tool_schemas);
+                ds4_buf_free(&loaded_tool_schemas);
                 free(instructions);
                 free(tool_schemas);
                 request_free(r);
@@ -388,7 +388,7 @@ bool parse_responses_request(ds4_engine *e, server *s, const char *body, int def
                          key);
                 free(key);
                 chat_msgs_free(&msgs);
-                buf_free(&loaded_tool_schemas);
+                ds4_buf_free(&loaded_tool_schemas);
                 free(instructions);
                 free(tool_schemas);
                 request_free(r);
@@ -407,7 +407,7 @@ bool parse_responses_request(ds4_engine *e, server *s, const char *body, int def
     if (!got_input) {
         snprintf(err, errlen, "missing input");
         chat_msgs_free(&msgs);
-        buf_free(&loaded_tool_schemas);
+        ds4_buf_free(&loaded_tool_schemas);
         free(instructions);
         free(tool_schemas);
         request_free(r);
@@ -430,10 +430,10 @@ bool parse_responses_request(ds4_engine *e, server *s, const char *body, int def
         }
     }
     buf combined_tool_schemas = {0};
-    if (tool_schemas && tool_schemas[0]) buf_puts(&combined_tool_schemas, tool_schemas);
+    if (tool_schemas && tool_schemas[0]) ds4_buf_puts(&combined_tool_schemas, tool_schemas);
     if (loaded_tool_schemas.len) {
-        if (combined_tool_schemas.len) buf_putc(&combined_tool_schemas, '\n');
-        buf_append(&combined_tool_schemas, loaded_tool_schemas.ptr,
+        if (combined_tool_schemas.len) ds4_buf_putc(&combined_tool_schemas, '\n');
+        ds4_buf_append(&combined_tool_schemas, loaded_tool_schemas.ptr,
                    loaded_tool_schemas.len);
     }
     const char *active_tool_schemas =
@@ -450,8 +450,8 @@ bool parse_responses_request(ds4_engine *e, server *s, const char *body, int def
                                          &r->responses_requires_live_reasoning,
                                          err, errlen)) {
         chat_msgs_free(&msgs);
-        buf_free(&combined_tool_schemas);
-        buf_free(&loaded_tool_schemas);
+        ds4_buf_free(&combined_tool_schemas);
+        ds4_buf_free(&loaded_tool_schemas);
         free(instructions);
         free(tool_schemas);
         request_free(r);
@@ -469,14 +469,14 @@ bool parse_responses_request(ds4_engine *e, server *s, const char *body, int def
     base_native_default_stops(&r->stops);
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
-    buf_free(&combined_tool_schemas);
-    buf_free(&loaded_tool_schemas);
+    ds4_buf_free(&combined_tool_schemas);
+    ds4_buf_free(&loaded_tool_schemas);
     free(instructions);
     free(tool_schemas);
     return true;
 bad:
     chat_msgs_free(&msgs);
-    buf_free(&loaded_tool_schemas);
+    ds4_buf_free(&loaded_tool_schemas);
     free(instructions);
     free(tool_schemas);
     snprintf(err, errlen, "invalid JSON request");

@@ -117,31 +117,31 @@ char *build_invalid_dsml_tool_error_suffix(const request *r,
                                                   const char *detail) {
     char *system = rendered_chat_system_region(r ? r->prompt_text : NULL);
     buf tool_error = {0};
-    buf_puts(&tool_error, "Tool error: invalid DSML tool call");
+    ds4_buf_puts(&tool_error, "Tool error: invalid DSML tool call");
     if (detail && detail[0]) {
-        buf_puts(&tool_error, ": ");
-        buf_puts(&tool_error, detail);
+        ds4_buf_puts(&tool_error, ": ");
+        ds4_buf_puts(&tool_error, detail);
     }
-    buf_puts(&tool_error,
+    ds4_buf_puts(&tool_error,
              "\nThe previous assistant output was not executed because the DSML syntax was malformed. "
              "Emit a new valid DSML tool call, or answer normally if no tool is needed.");
     if (system && system[0]) {
-        buf_puts(&tool_error, "\n\nSystem prompt reminder:\n");
-        buf_puts(&tool_error, system);
+        ds4_buf_puts(&tool_error, "\n\nSystem prompt reminder:\n");
+        ds4_buf_puts(&tool_error, system);
     }
 
     buf suffix = {0};
     if (r && ds4_think_mode_enabled(r->think_mode) && thinking && thinking->inside) {
-        buf_puts(&suffix, "</think>");
+        ds4_buf_puts(&suffix, "</think>");
     }
-    buf_puts(&suffix, "<｜end▁of▁sentence｜><｜User｜><tool_result>");
+    ds4_buf_puts(&suffix, "<｜end▁of▁sentence｜><｜User｜><tool_result>");
     append_tool_result_text(&suffix, tool_error.ptr ? tool_error.ptr : "");
-    buf_puts(&suffix, "</tool_result><｜Assistant｜>");
-    buf_puts(&suffix, r && ds4_think_mode_enabled(r->think_mode) ? "<think>" : "</think>");
+    ds4_buf_puts(&suffix, "</tool_result><｜Assistant｜>");
+    ds4_buf_puts(&suffix, r && ds4_think_mode_enabled(r->think_mode) ? "<think>" : "</think>");
 
     free(system);
-    buf_free(&tool_error);
-    return buf_take(&suffix);
+    ds4_buf_free(&tool_error);
+    return ds4_buf_take(&suffix);
 }
 
 static bool append_rendered_suffix_to_live_session(server *s, const char *suffix,
@@ -197,10 +197,10 @@ void log_tool_calls_summary(const char *ctx, const tool_calls *calls,
     buf names = {0};
     buf ids = {0};
     for (int i = 0; i < calls->len; i++) {
-        if (i) buf_putc(&names, ',');
-        if (i) buf_putc(&ids, ',');
-        buf_puts(&names, calls->v[i].name ? calls->v[i].name : "?");
-        buf_puts(&ids, calls->v[i].id ? calls->v[i].id : "?");
+        if (i) ds4_buf_putc(&names, ',');
+        if (i) ds4_buf_putc(&ids, ',');
+        ds4_buf_puts(&names, calls->v[i].name ? calls->v[i].name : "?");
+        ds4_buf_puts(&ids, calls->v[i].id ? calls->v[i].id : "?");
     }
     char flags[32];
     log_flags(flags, sizeof(flags), responses_protocol, false, false, false, false);
@@ -213,6 +213,6 @@ void log_tool_calls_summary(const char *ctx, const tool_calls *calls,
                calls->raw_dsml && calls->raw_dsml[0] ? 1 : 0,
                ids.ptr ? ids.ptr : "",
                names.ptr ? names.ptr : "");
-    buf_free(&ids);
-    buf_free(&names);
+    ds4_buf_free(&ids);
+    ds4_buf_free(&names);
 }

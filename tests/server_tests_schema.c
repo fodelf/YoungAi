@@ -94,7 +94,7 @@ void test_responses_function_named_tool_search_stays_function_call(void) {
     TEST_ASSERT(strstr(out.ptr, "\"type\":\"function_call\"") != NULL);
     TEST_ASSERT(strstr(out.ptr, "\"type\":\"tool_search_call\"") == NULL);
 
-    buf_free(&out);
+    ds4_buf_free(&out);
     tool_calls_free(&calls);
     free(schemas);
     tool_schema_orders_free(&orders);
@@ -142,7 +142,7 @@ void test_responses_namespace_tool_schemas_restore_wire_namespace(void) {
     TEST_ASSERT(strstr(out.ptr, "\"namespace\":\"mcp__perplexity__\"") != NULL);
     TEST_ASSERT(strstr(out.ptr, "mcp__perplexity__perplexity_search") == NULL);
 
-    buf_free(&out);
+    ds4_buf_free(&out);
     tool_calls_free(&calls);
     free(schemas);
     tool_schema_orders_free(&orders);
@@ -178,7 +178,7 @@ void test_responses_input_tool_search_output_loads_tools(void) {
     TEST_ASSERT(!strcmp(msgs.v[0].calls.v[0].name, "tool_search"));
     TEST_ASSERT(strstr(msgs.v[1].content, "mcp__perplexity__") != NULL);
 
-    buf_free(&loaded);
+    ds4_buf_free(&loaded);
     tool_schema_orders_free(&orders);
     chat_msgs_free(&msgs);
 }
@@ -192,7 +192,7 @@ void test_responses_input_tool_search_output_rejects_bad_tools(void) {
     buf loaded = {0};
     tool_schema_orders orders = {0};
     TEST_ASSERT(!parse_responses_input(&p, &msgs, &loaded, &orders));
-    buf_free(&loaded);
+    ds4_buf_free(&loaded);
     tool_schema_orders_free(&orders);
     chat_msgs_free(&msgs);
 }
@@ -263,7 +263,7 @@ void test_responses_output_sends_tool_search_call_item(void) {
     TEST_ASSERT(strstr(out.ptr, "\"arguments\":{\"limit\":3,\"query\":\"perplexity\"}") != NULL);
     TEST_ASSERT(strstr(out.ptr, "\"type\":\"function_call\"") == NULL);
 
-    buf_free(&out);
+    ds4_buf_free(&out);
     free(schemas);
     tool_schema_orders_free(&orders);
     tool_calls_free(&calls);
@@ -292,7 +292,7 @@ char *read_socket_text(int fd) {
     char tmp[1024];
     ssize_t n;
     while ((n = read(fd, tmp, sizeof(tmp))) > 0) {
-        buf_append(&b, tmp, (size_t)n);
+        ds4_buf_append(&b, tmp, (size_t)n);
     }
-    return buf_take(&b);
+    return ds4_buf_take(&b);
 }

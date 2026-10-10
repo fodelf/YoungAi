@@ -1,6 +1,7 @@
 /* server_httpd.c — 机械拆分自 ds4_server.c (12449-12786 行): HTTP 读写/模型列表/客户端线程。 */
 
 #include "server_internal.h"
+#include "../train/train_internal.h"
 
 static void http_request_free(http_request *r) {
     free(r->body);
@@ -64,7 +65,7 @@ static bool read_http_request(int fd, http_request *r) {
         ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) goto fail;
-        buf_append(&b, tmp, (size_t)n);
+        ds4_buf_append(&b, tmp, (size_t)n);
         hend = header_end(b.ptr, b.len);
     }
     if (hend < 0) goto fail;
@@ -89,33 +90,33 @@ static bool read_http_request(int fd, http_request *r) {
         ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) goto fail;
-        buf_append(&b, tmp, (size_t)n);
+        ds4_buf_append(&b, tmp, (size_t)n);
     }
 
     r->body_len = (size_t)clen;
     r->body = xmalloc(r->body_len + 1);
     memcpy(r->body, b.ptr + hend, r->body_len);
     r->body[r->body_len] = '\0';
-    buf_free(&b);
+    ds4_buf_free(&b);
     return true;
 fail:
-    buf_free(&b);
+    ds4_buf_free(&b);
     return false;
 }
 
 void append_model_json_values(buf *b, const char *id, const char *name,
                                      int ctx, int default_tokens) {
     const int max_completion = default_tokens < ctx ? default_tokens : ctx;
-    buf_printf(b,
+    ds4_buf_printf(b,
         "{\"id\":");
     json_escape(b, id);
-    buf_puts(b,
+    ds4_buf_puts(b,
         ",\"object\":\"model\","
         "\"created\":1767225600,"
         "\"owned_by\":\"ds4.c\","
         "\"name\":");
     json_escape(b, name);
-    buf_printf(b,
+    ds4_buf_printf(b,
         ","
         "\"context_length\":%d,"
         "\"top_provider\":{"
@@ -152,21 +153,21 @@ static void append_model_json(buf *b, const server *s, const char *id) {
 static bool send_model(server *s, int fd, const char *id) {
     buf b = {0};
     append_model_json(&b, s, id);
-    buf_putc(&b, '\n');
+    ds4_buf_putc(&b, '\n');
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
-    buf_free(&b);
+    ds4_buf_free(&b);
     return ok;
 }
 
 static bool send_models(server *s, int fd) {
     buf b = {0};
-    buf_puts(&b, "{\"object\":\"list\",\"data\":[");
+    ds4_buf_puts(&b, "{\"object\":\"list\",\"data\":[");
     append_model_json(&b, s, "deepseek-v4-flash");
-    buf_putc(&b, ',');
+    ds4_buf_putc(&b, ',');
     append_model_json(&b, s, "deepseek-v4-pro");
-    buf_puts(&b, "]}\n");
+    ds4_buf_puts(&b, "]}\n");
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
-    buf_free(&b);
+    ds4_buf_free(&b);
     return ok;
 }
 
@@ -195,14 +196,26 @@ void *client_main(void *arg) {
         goto done;
     }
 
-    if (!strcmp(hr.method, "GET") &&
-        (path_route_is(hr.path, "/") || path_route_is(hr.path, "/chat") ||
-         path_route_is(hr.path, "/index.html"))) {
+    /* 首页 = 工作台(web/studio.html: 聊天/训练/语料/记录, 10-10); 老的单页聊天留在 /chat */
+    if (!strcmp(hr.method, "GET") && path_route_is(hr.path, "/chat")) {
         serve_chat_page(fd, s->enable_cors, DS4_CHAT_PAGE_FILE);
         http_request_free(&hr);
         goto done;
     }
 
+    /* 工作台页与它的接口(src/train/train_api.c, 与主进程 ds4-train 共用一份): 这里是模型子进程, 页面能聊、能热切侧车/③(server_plugins.c);
+     * 发车/换模型/起服这些管子进程的操作 tr_api 在 serving=1 时拒 —— 它们归主进程(主进程把 /api/models/plugins|list 转到这里) */
+    if (!strcmp(hr.path, "/") || !strcmp(hr.path, "/index.html") || !strcmp(hr.path, "/studio") || !strcmp(hr.path, "/train") || !strcmp(hr.path, "/logo.jpg") || !strcmp(hr.path, "/favicon.ico") || !strncmp(hr.path, "/api/train/", 11) || !strncmp(hr.path, "/api/models/", 12)) {
+        tr_req rq; memset(&rq, 0, sizeof rq);
+        snprintf(rq.method, sizeof rq.method, "%s", hr.method); snprintf(rq.path, sizeof rq.path, "%s", hr.path); snprintf(rq.query, sizeof rq.query, "%s", hr.query);
+        rq.body = hr.body; rq.body_len = hr.body_len;
+        buf b = {0}; const char *ctype = "application/json; charset=utf-8";
+        const int code = tr_api(&rq, &b, &ctype, 1, s->port);
+        http_response_n(fd, s->enable_cors, code, ctype, b.ptr ? b.ptr : "", b.len);
+        ds4_buf_free(&b);
+        http_request_free(&hr);
+        goto done;
+    }
     if (!strcmp(hr.method, "GET") && (!strcmp(hr.path, "/monitor") || !strcmp(hr.path, "/monitor.html"))) {
         serve_page_file(fd, s->enable_cors, DS4_MONITOR_PAGE_FILE);
         http_request_free(&hr);
@@ -218,7 +231,7 @@ void *client_main(void *arg) {
             mon_metrics_json(s, &b, strstr(hr.query, "requests=all") != NULL);
             http_response(fd, s->enable_cors, 200, "application/json", b.ptr ? b.ptr : "{}");
         }
-        buf_free(&b);
+        ds4_buf_free(&b);
         http_request_free(&hr);
         goto done;
     }
@@ -257,9 +270,9 @@ void *client_main(void *arg) {
                                      ctx_size, &req, err, sizeof(err));
         if (ok) {
             buf b = {0};
-            buf_printf(&b, "{\"input_tokens\":%d}\n", req.prompt.len);
+            ds4_buf_printf(&b, "{\"input_tokens\":%d}\n", req.prompt.len);
             http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
-            buf_free(&b);
+            ds4_buf_free(&b);
             request_free(&req);
             http_request_free(&hr);
             goto done;

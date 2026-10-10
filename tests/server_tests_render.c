@@ -274,7 +274,7 @@ void test_dsml_tool_args_preserve_call_order(void) {
     TEST_ASSERT(timeout != NULL);
     TEST_ASSERT(description < command);
     TEST_ASSERT(command < timeout);
-    buf_free(&b);
+    ds4_buf_free(&b);
     tool_calls_free(&calls);
 }
 
@@ -293,7 +293,7 @@ void test_openai_tool_args_preserve_call_order(void) {
     TEST_ASSERT(timeout != NULL);
     TEST_ASSERT(description < command);
     TEST_ASSERT(command < timeout);
-    buf_free(&b);
+    ds4_buf_free(&b);
     tool_calls_free(&calls);
     request_free(&r);
 }
@@ -318,7 +318,7 @@ void test_anthropic_thinking_and_tool_args_preserve_call_order(void) {
     TEST_ASSERT(command != NULL);
     TEST_ASSERT(description != NULL);
     TEST_ASSERT(description < command);
-    buf_free(&b);
+    ds4_buf_free(&b);
     tool_calls_free(&calls);
     request_free(&r);
 }

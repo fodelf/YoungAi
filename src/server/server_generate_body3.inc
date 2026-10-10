@@ -74,7 +74,7 @@
             mon_token(s, j->mon, completion);
 
             trace_piece(s, trace_id, piece, piece_len);
-            buf_append(&text, piece, piece_len);
+            ds4_buf_append(&text, piece, piece_len);
             thinking_state_feed(&thinking, piece, piece_len);
             if (j->req.kind == REQ_CHAT && j->req.has_tools) {
                 dsml_decode_tracker_update(&dsml_tracker, text.ptr, text.len);
@@ -335,7 +335,7 @@
                     trace_event(s, trace_id,
                                 "tool-error continuation appended %d tokens",
                                 recovery_tokens);
-                    buf_free(&text);
+                    ds4_buf_free(&text);
                     goto decode_again;
                 }
                 finish = "error";
@@ -419,7 +419,7 @@
                     free(parsed_content);
                     free(parsed_reasoning);
                     tool_calls_free(&parsed_calls);
-                    buf_free(&text);
+                    ds4_buf_free(&text);
                     goto decode_again;
                 }
                 final_finish = "error";

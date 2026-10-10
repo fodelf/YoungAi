@@ -35,27 +35,7 @@ bool send_all(int fd, const void *p, size_t n) {
     return true;
 }
 
-void json_escape(buf *b, const char *s) {
-    buf_putc(b, '"');
-    for (; *s; s++) {
-        unsigned char c = (unsigned char)*s;
-        if (c == '"' || c == '\\') {
-            buf_putc(b, '\\');
-            buf_putc(b, (char)c);
-        } else if (c == '\n') {
-            buf_puts(b, "\\n");
-        } else if (c == '\r') {
-            buf_puts(b, "\\r");
-        } else if (c == '\t') {
-            buf_puts(b, "\\t");
-        } else if (c < 0x20) {
-            buf_printf(b, "\\u%04x", (unsigned)c);
-        } else {
-            buf_putc(b, (char)c);
-        }
-    }
-    buf_putc(b, '"');
-}
+void json_escape(buf *b, const char *s) { ds4_json_escape(b, s); }   /* 实现在 src/common/ds4_json.c(训练页 daemon 共用) */
 
 void json_escape_n(buf *b, const char *s, size_t n) {
     char *tmp = xstrndup(s ? s : "", n);
@@ -67,18 +47,18 @@ void json_escape_fragment_n(buf *b, const char *s, size_t n) {
     for (size_t i = 0; i < n; i++) {
         unsigned char c = (unsigned char)s[i];
         if (c == '"' || c == '\\') {
-            buf_putc(b, '\\');
-            buf_putc(b, (char)c);
+            ds4_buf_putc(b, '\\');
+            ds4_buf_putc(b, (char)c);
         } else if (c == '\n') {
-            buf_puts(b, "\\n");
+            ds4_buf_puts(b, "\\n");
         } else if (c == '\r') {
-            buf_puts(b, "\\r");
+            ds4_buf_puts(b, "\\r");
         } else if (c == '\t') {
-            buf_puts(b, "\\t");
+            ds4_buf_puts(b, "\\t");
         } else if (c < 0x20) {
-            buf_printf(b, "\\u%04x", (unsigned)c);
+            ds4_buf_printf(b, "\\u%04x", (unsigned)c);
         } else {
-            buf_putc(b, (char)c);
+            ds4_buf_putc(b, (char)c);
         }
     }
 }
@@ -154,27 +134,27 @@ char *dsml_unescape_text(const char *s) {
     buf b = {0};
     for (s = s ? s : ""; *s; s++) {
         if (*s != '&') {
-            buf_putc(&b, *s);
+            ds4_buf_putc(&b, *s);
         } else if (!strncmp(s, "&amp;", 5)) {
-            buf_putc(&b, '&');
+            ds4_buf_putc(&b, '&');
             s += 4;
         } else if (!strncmp(s, "&lt;", 4)) {
-            buf_putc(&b, '<');
+            ds4_buf_putc(&b, '<');
             s += 3;
         } else if (!strncmp(s, "&gt;", 4)) {
-            buf_putc(&b, '>');
+            ds4_buf_putc(&b, '>');
             s += 3;
         } else if (!strncmp(s, "&quot;", 6)) {
-            buf_putc(&b, '"');
+            ds4_buf_putc(&b, '"');
             s += 5;
         } else if (!strncmp(s, "&apos;", 6)) {
-            buf_putc(&b, '\'');
+            ds4_buf_putc(&b, '\'');
             s += 5;
         } else {
-            buf_putc(&b, '&');
+            ds4_buf_putc(&b, '&');
         }
     }
-    return buf_take(&b);
+    return ds4_buf_take(&b);
 }
 
 char *dsml_attr(const char *tag, const char *name) {
@@ -192,14 +172,14 @@ char *dsml_attr(const char *tag, const char *name) {
 }
 
 static void tool_call_json_args_add(buf *args, const char *name, const char *value, const char *is_string) {
-    if (args->len) buf_puts(args, ", ");
+    if (args->len) ds4_buf_puts(args, ", ");
     json_escape(args, name ? name : "");
-    buf_puts(args, ": ");
+    ds4_buf_puts(args, ": ");
     if (is_string && !strcmp(is_string, "true")) {
         json_escape(args, value ? value : "");
     } else {
         char *min = json_minify_raw_value(value ? value : "null");
-        buf_puts(args, min && min[0] ? min : "null");
+        ds4_buf_puts(args, min && min[0] ? min : "null");
         free(min);
     }
 }
@@ -266,20 +246,20 @@ static bool dsml_parse_nested_params_object(const char **p_in,
         p = skip_ascii_ws(p);
         if (strncmp(p, param_start, strlen(param_start)) != 0) break;
         if (!dsml_parse_leaf_param_json(&p, param_start, param_end, &members)) {
-            buf_free(&members);
+            ds4_buf_free(&members);
             return false;
         }
         any = true;
     }
 
     if (!any) {
-        buf_free(&members);
+        ds4_buf_free(&members);
         return false;
     }
-    buf_putc(out, '{');
-    buf_puts(out, members.ptr ? members.ptr : "");
-    buf_putc(out, '}');
-    buf_free(&members);
+    ds4_buf_putc(out, '{');
+    ds4_buf_puts(out, members.ptr ? members.ptr : "");
+    ds4_buf_putc(out, '}');
+    ds4_buf_free(&members);
     *p_in = p;
     return true;
 }
@@ -413,13 +393,13 @@ bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
             }
             if (strncmp(p, param_start, strlen(param_start)) != 0) {
                 free(name);
-                buf_free(&args);
+                ds4_buf_free(&args);
                 return false;
             }
             tag_end = strchr(p, '>');
             if (!tag_end) {
                 free(name);
-                buf_free(&args);
+                ds4_buf_free(&args);
                 return false;
             }
             tag = xstrndup(p, (size_t)(tag_end - p + 1));
@@ -430,7 +410,7 @@ bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
                 free(name);
                 free(param_name);
                 free(param_is_string);
-                buf_free(&args);
+                ds4_buf_free(&args);
                 return false;
             }
             const char *value_start = tag_end + 1;
@@ -443,14 +423,14 @@ bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
                                                      param_end, &nested)) {
                     free(name);
                     free(param_name);
-                    buf_free(&nested);
-                    buf_free(&args);
+                    ds4_buf_free(&nested);
+                    ds4_buf_free(&args);
                     return false;
                 }
                 tool_call_json_args_add(&args, param_name,
                                         nested.ptr ? nested.ptr : "{}",
                                         "false");
-                buf_free(&nested);
+                ds4_buf_free(&nested);
                 p = skip_ascii_ws(nested_p);
                 if (!strncmp(p, param_end, strlen(param_end))) {
                     p += strlen(param_end);
@@ -463,7 +443,7 @@ bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
                 free(name);
                 free(param_name);
                 free(param_is_string);
-                buf_free(&args);
+                ds4_buf_free(&args);
                 return false;
             }
             char *raw_value = xstrndup(value_start, (size_t)(value_end - value_start));
@@ -481,11 +461,11 @@ bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
         tool_call tc = {0};
         tc.name = name;
         buf wrapped = {0};
-        buf_putc(&wrapped, '{');
-        buf_puts(&wrapped, args.ptr ? args.ptr : "");
-        buf_putc(&wrapped, '}');
-        tc.arguments = buf_take(&wrapped);
+        ds4_buf_putc(&wrapped, '{');
+        ds4_buf_puts(&wrapped, args.ptr ? args.ptr : "");
+        ds4_buf_putc(&wrapped, '}');
+        tc.arguments = ds4_buf_take(&wrapped);
         tool_calls_push(calls, tc);
-        buf_free(&args);
+        ds4_buf_free(&args);
     }
 }

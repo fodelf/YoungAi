@@ -190,7 +190,7 @@ void test_long_story_fact_recall(void) {
 
         size_t piece_len = 0;
         char *piece = ds4_token_text(engine, token, &piece_len);
-        buf_append(&out, piece, piece_len);
+        ds4_buf_append(&out, piece, piece_len);
         free(piece);
 
         if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
@@ -206,7 +206,7 @@ void test_long_story_fact_recall(void) {
         TEST_ASSERT(test_output_has_fact(text, &test_long_facts[i]));
     }
 
-    buf_free(&out);
+    ds4_buf_free(&out);
     ds4_session_free(session);
     ds4_tokens_free(&prompt);
     free(prompt_text);

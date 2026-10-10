@@ -59,15 +59,15 @@ static bool sse_chat_delta_n(int fd, const request *r, const char *id,
     if (len == 0) return true;
     buf b = {0};
     long now = (long)time(NULL);
-    buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
+    ds4_buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
     json_escape(&b, r->model);
-    buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{");
+    ds4_buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{");
     json_escape(&b, field);
-    buf_putc(&b, ':');
+    ds4_buf_putc(&b, ':');
     json_escape_n(&b, text, len);
-    buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
+    ds4_buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
     bool ok = send_all(fd, b.ptr, b.len);
-    buf_free(&b);
+    ds4_buf_free(&b);
     return ok;
 }
 
@@ -81,17 +81,17 @@ static bool sse_chat_tool_call_start_delta(int fd, const request *r, const char 
                                            const char *name) {
     buf b = {0};
     long now = (long)time(NULL);
-    buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
+    ds4_buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
     json_escape(&b, r->model);
-    buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":");
-    buf_printf(&b, "%d", index);
-    buf_puts(&b, ",\"id\":");
+    ds4_buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":");
+    ds4_buf_printf(&b, "%d", index);
+    ds4_buf_puts(&b, ",\"id\":");
     json_escape(&b, tool_id ? tool_id : "");
-    buf_puts(&b, ",\"type\":\"function\",\"function\":{\"name\":");
+    ds4_buf_puts(&b, ",\"type\":\"function\",\"function\":{\"name\":");
     json_escape(&b, name ? name : "");
-    buf_puts(&b, ",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\n");
+    ds4_buf_puts(&b, ",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\n");
     bool ok = send_all(fd, b.ptr, b.len);
-    buf_free(&b);
+    ds4_buf_free(&b);
     return ok;
 }
 
@@ -100,15 +100,15 @@ static bool sse_chat_tool_call_args_delta_n(int fd, const request *r, const char
     if (len == 0) return true;
     buf b = {0};
     long now = (long)time(NULL);
-    buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
+    ds4_buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
     json_escape(&b, r->model);
-    buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":");
-    buf_printf(&b, "%d", index);
-    buf_puts(&b, ",\"function\":{\"arguments\":");
+    ds4_buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":");
+    ds4_buf_printf(&b, "%d", index);
+    ds4_buf_puts(&b, ",\"function\":{\"arguments\":");
     json_escape_n(&b, text, len);
-    buf_puts(&b, "}}]},\"finish_reason\":null}]}\n\n");
+    ds4_buf_puts(&b, "}}]},\"finish_reason\":null}]}\n\n");
     bool ok = send_all(fd, b.ptr, b.len);
-    buf_free(&b);
+    ds4_buf_free(&b);
     return ok;
 }
 
@@ -153,7 +153,7 @@ static bool openai_tool_emit_string_value(int fd, const request *r, const char *
     buf frag = {0};
     json_escape_fragment_n(&frag, unescaped, strlen(unescaped));
     bool ok = openai_tool_emit_args_fragment(fd, r, id, ts, frag.ptr ? frag.ptr : "", frag.len);
-    buf_free(&frag);
+    ds4_buf_free(&frag);
     free(unescaped);
     free(raw);
     return ok;
@@ -164,12 +164,12 @@ static bool openai_tool_emit_param_prefix(int fd, const request *r, const char *
                                           const char *name, bool is_string) {
     buf frag = {0};
     if (ts->first_param) ts->first_param = false;
-    else buf_putc(&frag, ',');
+    else ds4_buf_putc(&frag, ',');
     json_escape(&frag, name ? name : "");
-    buf_putc(&frag, ':');
-    if (is_string) buf_putc(&frag, '"');
+    ds4_buf_putc(&frag, ':');
+    if (is_string) ds4_buf_putc(&frag, '"');
     bool ok = openai_tool_emit_args_fragment(fd, r, id, ts, frag.ptr ? frag.ptr : "", frag.len);
-    buf_free(&frag);
+    ds4_buf_free(&frag);
     return ok;
 }
 
@@ -451,21 +451,21 @@ bool openai_sse_finish_live(int fd, server *s, const request *r, const char *id,
     buf b = {0};
     long now = (long)time(NULL);
     if (calls && calls->len && !st->tool.emitted_any) {
-        buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
+        ds4_buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
         json_escape(&b, r->model);
-        buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":");
+        ds4_buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":");
         append_tool_call_deltas_json(&b, calls, id, &r->tool_orders);
-        buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
+        ds4_buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
     }
-    buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
+    ds4_buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
     json_escape(&b, r->model);
-    buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":");
+    ds4_buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":");
     json_escape(&b, finish);
-    buf_puts(&b, "}]}\n\n");
+    ds4_buf_puts(&b, "}]}\n\n");
 
     bool ok = send_all(fd, b.ptr, b.len) &&
               sse_done(fd, r, id, prompt_tokens, completion_tokens);
-    buf_free(&b);
+    ds4_buf_free(&b);
     return ok;
 }
 

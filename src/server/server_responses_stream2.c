@@ -18,19 +18,19 @@ bool responses_sse_completed(int fd, const request *r,
     const char *status = responses_status_for_finish(finish);
 
     buf b = {0};
-    buf_printf(&b,
+    ds4_buf_printf(&b,
         "{\"type\":\"%s\",\"response\":{\"id\":\"%s\","
         "\"object\":\"response\",\"created_at\":%ld,\"status\":\"%s\",\"model\":",
         event_type, st->response_id, created_at, status);
     json_escape(&b, r->model);
     if (!strcmp(event_type, "response.failed")) {
-        buf_puts(&b, ",\"error\":{\"code\":\"server_error\","
+        ds4_buf_puts(&b, ",\"error\":{\"code\":\"server_error\","
                      "\"message\":\"generation failed\"}");
     } else if (!strcmp(event_type, "response.incomplete")) {
-        buf_puts(&b, ",\"incomplete_details\":{\"reason\":\"max_tokens\"}");
+        ds4_buf_puts(&b, ",\"incomplete_details\":{\"reason\":\"max_tokens\"}");
     }
     const char *item_status = responses_item_status_for_finish(finish);
-    buf_puts(&b, ",\"output\":[");
+    ds4_buf_puts(&b, ",\"output\":[");
     bool wrote = false;
     if (st->reasoning_emitted_any) {
         /* Match responses_sse_reasoning_done: if the stream stopped before
@@ -38,43 +38,43 @@ bool responses_sse_completed(int fd, const request *r,
          * response-level finish status, so replay must reject it. */
         const char *reasoning_status =
             st->reasoning_closed_naturally ? "completed" : "incomplete";
-        buf_printf(&b,
+        ds4_buf_printf(&b,
             "{\"id\":\"%s\",\"type\":\"reasoning\",\"status\":\"%s\",\"summary\":[",
             st->reasoning_id, reasoning_status);
         if (st->reasoning_text.len) {
-            buf_puts(&b, "{\"type\":\"summary_text\",\"text\":");
+            ds4_buf_puts(&b, "{\"type\":\"summary_text\",\"text\":");
             json_escape_n(&b, st->reasoning_text.ptr, st->reasoning_text.len);
-            buf_putc(&b, '}');
+            ds4_buf_putc(&b, '}');
         }
-        buf_puts(&b, "]}");
+        ds4_buf_puts(&b, "]}");
         wrote = true;
     }
     if (st->message_emitted_any) {
-        if (wrote) buf_putc(&b, ',');
-        buf_printf(&b,
+        if (wrote) ds4_buf_putc(&b, ',');
+        ds4_buf_printf(&b,
             "{\"id\":\"%s\",\"type\":\"message\",\"status\":\"%s\","
             "\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":",
             st->message_id, item_status);
         json_escape_n(&b, st->message_text.ptr ? st->message_text.ptr : "",
                       st->message_text.len);
-        buf_puts(&b, ",\"annotations\":[]}]}");
+        ds4_buf_puts(&b, ",\"annotations\":[]}]}");
         wrote = true;
     }
     if (calls && tool_items) {
         for (int i = 0; i < calls->len; i++) {
-            if (wrote) buf_putc(&b, ',');
+            if (wrote) ds4_buf_putc(&b, ',');
             responses_append_function_call_item(&b, &calls->v[i], &tool_items[i],
                                                 item_status, true,
                                                 &r->tool_orders);
             wrote = true;
         }
     }
-    buf_putc(&b, ']');
-    buf_puts(&b, ",\"usage\":");
+    ds4_buf_putc(&b, ']');
+    ds4_buf_puts(&b, ",\"usage\":");
     append_responses_usage_json(&b, r, prompt_tokens, completion_tokens);
-    buf_puts(&b, "}}");
+    ds4_buf_puts(&b, "}}");
     bool ok = responses_sse_emit_event(fd, st, b.ptr);
-    buf_free(&b);
+    ds4_buf_free(&b);
     return ok;
 }
 
@@ -141,7 +141,7 @@ bool responses_sse_stream_update(int fd, const request *r,
                 if (!responses_sse_reasoning_delta(fd, st,
                                                    raw + st->emit_pos,
                                                    limit - st->emit_pos)) return false;
-                buf_append(&st->reasoning_text, raw + st->emit_pos, limit - st->emit_pos);
+                ds4_buf_append(&st->reasoning_text, raw + st->emit_pos, limit - st->emit_pos);
                 st->reasoning_emitted_any = true;
             }
             st->emit_pos = limit;
@@ -177,7 +177,7 @@ bool responses_sse_stream_update(int fd, const request *r,
             if (!responses_sse_output_text_delta(fd, st,
                                                  raw + st->emit_pos,
                                                  limit - st->emit_pos)) return false;
-            buf_append(&st->message_text, raw + st->emit_pos, limit - st->emit_pos);
+            ds4_buf_append(&st->message_text, raw + st->emit_pos, limit - st->emit_pos);
             st->message_emitted_any = true;
             st->emit_pos = limit;
         }
@@ -229,7 +229,7 @@ bool responses_sse_finish_live(int fd, const request *r,
             st->message_text_part_open = true;
         }
         if (!responses_sse_output_text_delta(fd, st, tail, tail_len)) return false;
-        buf_append(&st->message_text, tail, tail_len);
+        ds4_buf_append(&st->message_text, tail, tail_len);
         st->message_emitted_any = true;
         st->emit_pos = raw_len;
     }
@@ -276,18 +276,18 @@ bool responses_final_response(int fd, bool enable_cors,
     const char *status = responses_status_for_finish(finish);
     const char *item_status = responses_item_status_for_finish(finish);
     buf b = {0};
-    buf_printf(&b,
+    ds4_buf_printf(&b,
         "{\"id\":\"%s\",\"object\":\"response\",\"created_at\":%ld,\"status\":\"%s\","
         "\"model\":",
         response_id, now, status);
     json_escape(&b, r->model);
     if (finish && !strcmp(finish, "error")) {
-        buf_puts(&b, ",\"error\":{\"code\":\"server_error\","
+        ds4_buf_puts(&b, ",\"error\":{\"code\":\"server_error\","
                      "\"message\":\"generation failed\"}");
     } else if (finish && !strcmp(finish, "length")) {
-        buf_puts(&b, ",\"incomplete_details\":{\"reason\":\"max_tokens\"}");
+        ds4_buf_puts(&b, ",\"incomplete_details\":{\"reason\":\"max_tokens\"}");
     }
-    buf_puts(&b, ",\"output\":[");
+    ds4_buf_puts(&b, ",\"output\":[");
     bool wrote = false;
     if (reasoning && reasoning[0] && r->reasoning_summary_emit) {
         /* Non-streaming path runs after the worker has post-processed the
@@ -295,39 +295,39 @@ bool responses_final_response(int fd, bool enable_cors,
          * where </think> was observed (otherwise the reasoning text would be
          * empty). Tag it with the response-level item_status which still flips
          * to incomplete/failed when finish is length/error. */
-        buf_printf(&b,
+        ds4_buf_printf(&b,
             "{\"id\":\"%s\",\"type\":\"reasoning\",\"status\":\"%s\","
             "\"summary\":[{\"type\":\"summary_text\",\"text\":",
             reasoning_id, item_status);
         json_escape(&b, reasoning);
-        buf_puts(&b, "}]}");
+        ds4_buf_puts(&b, "}]}");
         wrote = true;
     }
     if (text && text[0]) {
-        if (wrote) buf_putc(&b, ',');
-        buf_printf(&b,
+        if (wrote) ds4_buf_putc(&b, ',');
+        ds4_buf_printf(&b,
             "{\"id\":\"%s\",\"type\":\"message\",\"status\":\"%s\","
             "\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":",
             message_id, item_status);
         json_escape(&b, text);
-        buf_puts(&b, ",\"annotations\":[]}]}");
+        ds4_buf_puts(&b, ",\"annotations\":[]}]}");
         wrote = true;
     }
     if (calls && items) {
         for (int i = 0; i < calls->len; i++) {
-            if (wrote) buf_putc(&b, ',');
+            if (wrote) ds4_buf_putc(&b, ',');
             responses_append_function_call_item(&b, &calls->v[i], &items[i],
                                                 item_status, true,
                                                 &r->tool_orders);
             wrote = true;
         }
     }
-    buf_putc(&b, ']');
-    buf_puts(&b, ",\"usage\":");
+    ds4_buf_putc(&b, ']');
+    ds4_buf_puts(&b, ",\"usage\":");
     append_responses_usage_json(&b, r, prompt_tokens, completion_tokens);
-    buf_putc(&b, '}');
+    ds4_buf_putc(&b, '}');
     bool ok = http_response(fd, enable_cors, 200, "application/json", b.ptr);
-    buf_free(&b);
+    ds4_buf_free(&b);
     free(items);
     return ok;
 }
@@ -339,33 +339,33 @@ bool final_response(int fd, bool enable_cors,
     buf b = {0};
     long now = (long)time(NULL);
     if (r->kind == REQ_CHAT) {
-        buf_printf(&b, "{\"id\":\"%s\",\"object\":\"chat.completion\",\"created\":%ld,\"model\":", id, now);
+        ds4_buf_printf(&b, "{\"id\":\"%s\",\"object\":\"chat.completion\",\"created\":%ld,\"model\":", id, now);
         json_escape(&b, r->model);
-        buf_puts(&b, ",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":");
+        ds4_buf_puts(&b, ",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":");
         json_escape(&b, text ? text : "");
         if (reasoning && reasoning[0]) {
-            buf_puts(&b, ",\"reasoning_content\":");
+            ds4_buf_puts(&b, ",\"reasoning_content\":");
             json_escape(&b, reasoning);
         }
         if (calls && calls->len) {
-            buf_puts(&b, ",\"tool_calls\":");
+            ds4_buf_puts(&b, ",\"tool_calls\":");
             append_tool_calls_json(&b, calls, id, &r->tool_orders);
         }
-        buf_puts(&b, "},\"finish_reason\":");
+        ds4_buf_puts(&b, "},\"finish_reason\":");
         json_escape(&b, finish);
-        buf_puts(&b, "}],\"usage\":");
+        ds4_buf_puts(&b, "}],\"usage\":");
     } else {
-        buf_printf(&b, "{\"id\":\"%s\",\"object\":\"text_completion\",\"created\":%ld,\"model\":", id, now);
+        ds4_buf_printf(&b, "{\"id\":\"%s\",\"object\":\"text_completion\",\"created\":%ld,\"model\":", id, now);
         json_escape(&b, r->model);
-        buf_puts(&b, ",\"choices\":[{\"text\":");
+        ds4_buf_puts(&b, ",\"choices\":[{\"text\":");
         json_escape(&b, text);
-        buf_puts(&b, ",\"index\":0,\"finish_reason\":");
+        ds4_buf_puts(&b, ",\"index\":0,\"finish_reason\":");
         json_escape(&b, finish);
-        buf_puts(&b, "}],\"usage\":");
+        ds4_buf_puts(&b, "}],\"usage\":");
     }
     append_openai_usage_json(&b, r, prompt_tokens, completion_tokens);
-    buf_puts(&b, "}\n");
+    ds4_buf_puts(&b, "}\n");
     bool ok = http_response(fd, enable_cors, 200, "application/json", b.ptr);
-    buf_free(&b);
+    ds4_buf_free(&b);
     return ok;
 }

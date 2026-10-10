@@ -134,10 +134,10 @@ bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders) {
     }
     if (**p != ']') goto bad;
     (*p)++;
-    *out = buf_take(&schemas);
+    *out = ds4_buf_take(&schemas);
     return true;
 bad:
-    buf_free(&schemas);
+    ds4_buf_free(&schemas);
     return false;
 }
 
@@ -223,7 +223,7 @@ fail:
 
 bool append_anthropic_block_content(buf *dst, const char *text) {
     if (!text || !text[0]) return true;
-    buf_puts(dst, text);
+    ds4_buf_puts(dst, text);
     return true;
 }
 
@@ -292,10 +292,10 @@ bool mm_image_source_to_text(ds4_mm *mm, const char *src_type,
     int mm_rc = ds4_mm_encode_as_text(mm, src_media, raw, raw_len, &mm_text);
     free(raw);
     if (mm_rc != 0 || !mm_text) return false;
-    buf_puts(dst, "<image>\n");
-    buf_puts(dst, mm_text);
-    if (mm_text[0] && mm_text[strlen(mm_text) - 1] != '\n') buf_puts(dst, "\n");
-    buf_puts(dst, "</image>");
+    ds4_buf_puts(dst, "<image>\n");
+    ds4_buf_puts(dst, mm_text);
+    if (mm_text[0] && mm_text[strlen(mm_text) - 1] != '\n') ds4_buf_puts(dst, "\n");
+    ds4_buf_puts(dst, "</image>");
     free(mm_text);
     return true;
 }
@@ -327,7 +327,7 @@ bool json_tool_result_content(const char **p, ds4_mm *mm, char **out) {
         if (**p == '"') {
             char *s = NULL;
             if (!json_string(p, &s)) goto fail;
-            buf_puts(&b, s);
+            ds4_buf_puts(&b, s);
             free(s);
         } else if (**p == '{') {
             (*p)++;
@@ -376,7 +376,7 @@ bool json_tool_result_content(const char **p, ds4_mm *mm, char **out) {
                     ok = mm_image_source_to_text(mm, src_type, src_media,
                                                  src_data, &b);
                 else if (text)
-                    buf_puts(&b, text);
+                    ds4_buf_puts(&b, text);
             }
             free(type);
             free(text);
@@ -393,9 +393,9 @@ bool json_tool_result_content(const char **p, ds4_mm *mm, char **out) {
     }
     if (**p != ']') goto fail;
     (*p)++;
-    *out = buf_take(&b);
+    *out = ds4_buf_take(&b);
     return true;
 fail:
-    buf_free(&b);
+    ds4_buf_free(&b);
     return false;
 }

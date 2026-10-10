@@ -36,8 +36,8 @@ void responses_stream_init(const request *r, responses_stream *st) {
 
 void responses_stream_free(responses_stream *st) {
     if (!st) return;
-    buf_free(&st->reasoning_text);
-    buf_free(&st->message_text);
+    ds4_buf_free(&st->reasoning_text);
+    ds4_buf_free(&st->message_text);
 }
 
 /* Codex parses an explicit sequence_number on every Responses event for
@@ -46,7 +46,7 @@ void responses_stream_free(responses_stream *st) {
  * expects. */
 bool responses_sse_emit_event(int fd, responses_stream *st, const char *body) {
     buf b = {0};
-    buf_puts(&b, "data: ");
+    ds4_buf_puts(&b, "data: ");
     /* body always starts with `{"type":"..."`. We splice in sequence_number
      * after the closing quote of that string so every event has it as the
      * second field. */
@@ -65,53 +65,53 @@ bool responses_sse_emit_event(int fd, responses_stream *st, const char *body) {
     }
     if (type_close) {
         size_t head_len = (size_t)(type_close - body);
-        buf_append(&b, body, head_len);
-        buf_printf(&b, ",\"sequence_number\":%d", st->sequence++);
-        buf_puts(&b, type_close);
+        ds4_buf_append(&b, body, head_len);
+        ds4_buf_printf(&b, ",\"sequence_number\":%d", st->sequence++);
+        ds4_buf_puts(&b, type_close);
     } else {
-        buf_puts(&b, body);
+        ds4_buf_puts(&b, body);
     }
-    buf_puts(&b, "\n\n");
+    ds4_buf_puts(&b, "\n\n");
     bool ok = send_all(fd, b.ptr, b.len);
-    buf_free(&b);
+    ds4_buf_free(&b);
     return ok;
 }
 
 bool responses_sse_created(int fd, const request *r, responses_stream *st,
                                   long created_at) {
     buf b = {0};
-    buf_printf(&b,
+    ds4_buf_printf(&b,
         "{\"type\":\"response.created\",\"response\":{\"id\":\"%s\","
         "\"object\":\"response\",\"created_at\":%ld,\"status\":\"in_progress\","
         "\"model\":", st->response_id, created_at);
     json_escape(&b, r->model);
-    buf_puts(&b, ",\"output\":[]}}");
+    ds4_buf_puts(&b, ",\"output\":[]}}");
     bool ok = responses_sse_emit_event(fd, st, b.ptr);
-    buf_free(&b);
+    ds4_buf_free(&b);
     return ok;
 }
 
 bool responses_sse_reasoning_added(int fd, responses_stream *st) {
     buf b = {0};
-    buf_printf(&b,
+    ds4_buf_printf(&b,
         "{\"type\":\"response.output_item.added\",\"output_index\":%d,"
         "\"item\":{\"id\":\"%s\",\"type\":\"reasoning\",\"status\":\"in_progress\","
         "\"summary\":[]}}",
         st->reasoning_index, st->reasoning_id);
     bool ok = responses_sse_emit_event(fd, st, b.ptr);
-    buf_free(&b);
+    ds4_buf_free(&b);
     return ok;
 }
 
 bool responses_sse_reasoning_summary_part_added(int fd, responses_stream *st) {
     buf b = {0};
-    buf_printf(&b,
+    ds4_buf_printf(&b,
         "{\"type\":\"response.reasoning_summary_part.added\","
         "\"item_id\":\"%s\",\"output_index\":%d,\"summary_index\":0,"
         "\"part\":{\"type\":\"summary_text\",\"text\":\"\"}}",
         st->reasoning_id, st->reasoning_index);
     bool ok = responses_sse_emit_event(fd, st, b.ptr);
-    buf_free(&b);
+    ds4_buf_free(&b);
     return ok;
 }
 
@@ -119,14 +119,14 @@ bool responses_sse_reasoning_delta(int fd, responses_stream *st,
                                           const char *text, size_t len) {
     if (len == 0) return true;
     buf b = {0};
-    buf_printf(&b,
+    ds4_buf_printf(&b,
         "{\"type\":\"response.reasoning_summary_text.delta\","
         "\"item_id\":\"%s\",\"output_index\":%d,\"summary_index\":0,\"delta\":",
         st->reasoning_id, st->reasoning_index);
     json_escape_n(&b, text, len);
-    buf_putc(&b, '}');
+    ds4_buf_putc(&b, '}');
     bool ok = responses_sse_emit_event(fd, st, b.ptr);
-    buf_free(&b);
+    ds4_buf_free(&b);
     return ok;
 }
 
@@ -149,73 +149,73 @@ bool responses_sse_reasoning_done(int fd, responses_stream *st,
      * summary_part.done before the output_item.done so clients that key off
      * part lifecycle don't see a dangling open summary part. */
     buf b = {0};
-    buf_printf(&b,
+    ds4_buf_printf(&b,
         "{\"type\":\"response.reasoning_summary_text.done\","
         "\"item_id\":\"%s\",\"output_index\":%d,\"summary_index\":0,\"text\":",
         st->reasoning_id, st->reasoning_index);
     json_escape_n(&b, st->reasoning_text.ptr ? st->reasoning_text.ptr : "",
                   st->reasoning_text.len);
-    buf_putc(&b, '}');
+    ds4_buf_putc(&b, '}');
     bool ok = responses_sse_emit_event(fd, st, b.ptr);
     if (!ok) {
-        buf_free(&b);
+        ds4_buf_free(&b);
         return false;
     }
 
     if (st->reasoning_summary_started) {
-        buf_free(&b);
-        buf_printf(&b,
+        ds4_buf_free(&b);
+        ds4_buf_printf(&b,
             "{\"type\":\"response.reasoning_summary_part.done\","
             "\"item_id\":\"%s\",\"output_index\":%d,\"summary_index\":0,"
             "\"part\":{\"type\":\"summary_text\",\"text\":",
             st->reasoning_id, st->reasoning_index);
         json_escape_n(&b, st->reasoning_text.ptr ? st->reasoning_text.ptr : "",
                       st->reasoning_text.len);
-        buf_puts(&b, "}}");
+        ds4_buf_puts(&b, "}}");
         ok = responses_sse_emit_event(fd, st, b.ptr);
         if (!ok) {
-            buf_free(&b);
+            ds4_buf_free(&b);
             return false;
         }
     }
 
-    buf_free(&b);
-    buf_printf(&b,
+    ds4_buf_free(&b);
+    ds4_buf_printf(&b,
         "{\"type\":\"response.output_item.done\",\"output_index\":%d,"
         "\"item\":{\"id\":\"%s\",\"type\":\"reasoning\",\"status\":\"%s\",\"summary\":[",
         st->reasoning_index, st->reasoning_id, item_status);
     if (st->reasoning_text.len) {
-        buf_puts(&b, "{\"type\":\"summary_text\",\"text\":");
+        ds4_buf_puts(&b, "{\"type\":\"summary_text\",\"text\":");
         json_escape_n(&b, st->reasoning_text.ptr, st->reasoning_text.len);
-        buf_putc(&b, '}');
+        ds4_buf_putc(&b, '}');
     }
-    buf_puts(&b, "]}}");
+    ds4_buf_puts(&b, "]}}");
     ok = responses_sse_emit_event(fd, st, b.ptr);
-    buf_free(&b);
+    ds4_buf_free(&b);
     return ok;
 }
 
 bool responses_sse_message_added(int fd, responses_stream *st) {
     buf b = {0};
-    buf_printf(&b,
+    ds4_buf_printf(&b,
         "{\"type\":\"response.output_item.added\",\"output_index\":%d,"
         "\"item\":{\"id\":\"%s\",\"type\":\"message\",\"status\":\"in_progress\","
         "\"role\":\"assistant\",\"content\":[]}}",
         st->message_index, st->message_id);
     bool ok = responses_sse_emit_event(fd, st, b.ptr);
-    buf_free(&b);
+    ds4_buf_free(&b);
     return ok;
 }
 
 bool responses_sse_message_text_part_added(int fd, responses_stream *st) {
     buf b = {0};
-    buf_printf(&b,
+    ds4_buf_printf(&b,
         "{\"type\":\"response.content_part.added\","
         "\"item_id\":\"%s\",\"output_index\":%d,\"content_index\":0,"
         "\"part\":{\"type\":\"output_text\",\"text\":\"\",\"annotations\":[]}}",
         st->message_id, st->message_index);
     bool ok = responses_sse_emit_event(fd, st, b.ptr);
-    buf_free(&b);
+    ds4_buf_free(&b);
     return ok;
 }
 
@@ -223,14 +223,14 @@ bool responses_sse_output_text_delta(int fd, responses_stream *st,
                                             const char *text, size_t len) {
     if (len == 0) return true;
     buf b = {0};
-    buf_printf(&b,
+    ds4_buf_printf(&b,
         "{\"type\":\"response.output_text.delta\","
         "\"item_id\":\"%s\",\"output_index\":%d,\"content_index\":0,\"delta\":",
         st->message_id, st->message_index);
     json_escape_n(&b, text, len);
-    buf_putc(&b, '}');
+    ds4_buf_putc(&b, '}');
     bool ok = responses_sse_emit_event(fd, st, b.ptr);
-    buf_free(&b);
+    ds4_buf_free(&b);
     return ok;
 }
 
@@ -238,45 +238,45 @@ bool responses_sse_message_done(int fd, responses_stream *st,
                                        const char *finish) {
     const char *item_status = responses_item_status_for_finish(finish);
     buf b = {0};
-    buf_printf(&b,
+    ds4_buf_printf(&b,
         "{\"type\":\"response.output_text.done\","
         "\"item_id\":\"%s\",\"output_index\":%d,\"content_index\":0,\"text\":",
         st->message_id, st->message_index);
     json_escape_n(&b, st->message_text.ptr ? st->message_text.ptr : "",
                   st->message_text.len);
-    buf_putc(&b, '}');
+    ds4_buf_putc(&b, '}');
     bool ok = responses_sse_emit_event(fd, st, b.ptr);
     if (!ok) {
-        buf_free(&b);
+        ds4_buf_free(&b);
         return false;
     }
 
-    buf_free(&b);
-    buf_printf(&b,
+    ds4_buf_free(&b);
+    ds4_buf_printf(&b,
         "{\"type\":\"response.content_part.done\","
         "\"item_id\":\"%s\",\"output_index\":%d,\"content_index\":0,"
         "\"part\":{\"type\":\"output_text\",\"text\":",
         st->message_id, st->message_index);
     json_escape_n(&b, st->message_text.ptr ? st->message_text.ptr : "",
                   st->message_text.len);
-    buf_puts(&b, ",\"annotations\":[]}}");
+    ds4_buf_puts(&b, ",\"annotations\":[]}}");
     ok = responses_sse_emit_event(fd, st, b.ptr);
     if (!ok) {
-        buf_free(&b);
+        ds4_buf_free(&b);
         return false;
     }
 
-    buf_free(&b);
-    buf_printf(&b,
+    ds4_buf_free(&b);
+    ds4_buf_printf(&b,
         "{\"type\":\"response.output_item.done\",\"output_index\":%d,"
         "\"item\":{\"id\":\"%s\",\"type\":\"message\",\"status\":\"%s\","
         "\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":",
         st->message_index, st->message_id, item_status);
     json_escape_n(&b, st->message_text.ptr ? st->message_text.ptr : "",
                   st->message_text.len);
-    buf_puts(&b, ",\"annotations\":[]}]}}");
+    ds4_buf_puts(&b, ",\"annotations\":[]}]}}");
     ok = responses_sse_emit_event(fd, st, b.ptr);
-    buf_free(&b);
+    ds4_buf_free(&b);
     return ok;
 }
 
@@ -319,38 +319,38 @@ void responses_append_function_call_item(buf *b, const tool_call *tc,
                                                 const tool_schema_orders *orders) {
     const tool_schema_order *order = tool_schema_orders_find(orders, tc->name);
     if (responses_tool_call_is_tool_search(tc, order)) {
-        buf_printf(b,
+        ds4_buf_printf(b,
             "{\"id\":\"%s\",\"type\":\"tool_search_call\",\"status\":\"%s\","
             "\"call_id\":\"%s\",\"execution\":\"client\",\"arguments\":",
             item->fc_id, item_status, item->call_id);
         if (with_args) append_json_object_or_empty(b, tc->arguments);
-        else buf_puts(b, "{}");
-        buf_putc(b, '}');
+        else ds4_buf_puts(b, "{}");
+        ds4_buf_putc(b, '}');
         return;
     }
 
     const char *item_type = item->is_custom ? "custom_tool_call" : "function_call";
     const char *body_field = item->is_custom ? "input" : "arguments";
-    buf_printf(b,
+    ds4_buf_printf(b,
         "{\"id\":\"%s\",\"type\":\"%s\",\"status\":\"%s\",\"name\":",
         item->fc_id, item_type, item_status);
     json_escape(b, order && order->wire_name ? order->wire_name :
                    (tc->name ? tc->name : ""));
     if (order && order->namespace) {
-        buf_puts(b, ",\"namespace\":");
+        ds4_buf_puts(b, ",\"namespace\":");
         json_escape(b, order->namespace);
     }
-    buf_puts(b, ",\"call_id\":");
+    ds4_buf_puts(b, ",\"call_id\":");
     json_escape(b, item->call_id);
-    buf_printf(b, ",\"%s\":", body_field);
+    ds4_buf_printf(b, ",\"%s\":", body_field);
     if (!with_args) {
-        buf_puts(b, "\"\"");
+        ds4_buf_puts(b, "\"\"");
     } else if (item->is_custom) {
         json_escape(b, tc->arguments ? tc->arguments : "");
     } else {
         append_json_object_string(b, tc->arguments);
     }
-    buf_putc(b, '}');
+    ds4_buf_putc(b, '}');
 }
 
 bool responses_sse_function_call_event(int fd, responses_stream *st,
@@ -366,13 +366,13 @@ bool responses_sse_function_call_event(int fd, responses_stream *st,
      * function_call_arguments.delta + .done don't end up with doubled JSON. */
     const char *item_status = done ? responses_item_status_for_finish(finish) : "in_progress";
     buf b = {0};
-    buf_printf(&b,
+    ds4_buf_printf(&b,
         "{\"type\":\"response.output_item.%s\",\"output_index\":%d,\"item\":",
         done ? "done" : "added", item->output_index);
     responses_append_function_call_item(&b, tc, item, item_status, done, orders);
-    buf_putc(&b, '}');
+    ds4_buf_putc(&b, '}');
     bool ok = responses_sse_emit_event(fd, st, b.ptr);
-    buf_free(&b);
+    ds4_buf_free(&b);
     return ok;
 }
 
@@ -389,36 +389,36 @@ bool responses_sse_function_call_arguments_done(int fd, responses_stream *st,
     buf args = {0};
     append_json_object_string(&args, tc->arguments);
     buf b = {0};
-    buf_printf(&b,
+    ds4_buf_printf(&b,
         "{\"type\":\"response.function_call_arguments.delta\","
         "\"item_id\":\"%s\",\"output_index\":%d,\"delta\":",
         item->fc_id, item->output_index);
-    buf_append(&b, args.ptr ? args.ptr : "\"\"", args.ptr ? args.len : 2);
-    buf_putc(&b, '}');
+    ds4_buf_append(&b, args.ptr ? args.ptr : "\"\"", args.ptr ? args.len : 2);
+    ds4_buf_putc(&b, '}');
     bool ok = responses_sse_emit_event(fd, st, b.ptr);
     if (!ok) {
-        buf_free(&b);
-        buf_free(&args);
+        ds4_buf_free(&b);
+        ds4_buf_free(&args);
         return false;
     }
 
-    buf_free(&b);
-    buf_printf(&b,
+    ds4_buf_free(&b);
+    ds4_buf_printf(&b,
         "{\"type\":\"response.function_call_arguments.done\","
         "\"item_id\":\"%s\",\"output_index\":%d,\"name\":",
         item->fc_id, item->output_index);
     json_escape(&b, order && order->wire_name ? order->wire_name :
                     (tc->name ? tc->name : ""));
     if (order && order->namespace) {
-        buf_puts(&b, ",\"namespace\":");
+        ds4_buf_puts(&b, ",\"namespace\":");
         json_escape(&b, order->namespace);
     }
-    buf_puts(&b, ",\"arguments\":");
-    buf_append(&b, args.ptr ? args.ptr : "\"\"", args.ptr ? args.len : 2);
-    buf_putc(&b, '}');
+    ds4_buf_puts(&b, ",\"arguments\":");
+    ds4_buf_append(&b, args.ptr ? args.ptr : "\"\"", args.ptr ? args.len : 2);
+    ds4_buf_putc(&b, '}');
     ok = responses_sse_emit_event(fd, st, b.ptr);
-    buf_free(&b);
-    buf_free(&args);
+    ds4_buf_free(&b);
+    ds4_buf_free(&args);
     return ok;
 }
 
@@ -434,7 +434,7 @@ void append_responses_usage_json(buf *b, const request *r,
     int cache_write_tokens = r ? r->cache_write_tokens : 0;
     cached_tokens = clamp_usage_tokens(cached_tokens, input_tokens);
     cache_write_tokens = clamp_usage_tokens(cache_write_tokens, input_tokens - cached_tokens);
-    buf_printf(b,
+    ds4_buf_printf(b,
         "{\"input_tokens\":%d,\"input_tokens_details\":{\"cached_tokens\":%d,\"cache_write_tokens\":%d},"
         "\"output_tokens\":%d,\"output_tokens_details\":{\"reasoning_tokens\":0},"
         "\"total_tokens\":%d}",

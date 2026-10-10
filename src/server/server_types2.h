@@ -297,6 +297,7 @@ struct server {
     /* 监控(server_monitor.c, 2026-10-07): GET /monitor 页与 GET /metrics 的数据面; 起服时 mon_open, 停服 mon_close。 */
     struct server_monitor *mon;
     const char *backend_name;   /* ds4_backend_name(cfg.engine.backend), /metrics 的 engine.backend */
+    int port;                   /* 监听端口: 训练页切到训练时交给 train_cycle.sh, 让 ds4-train 用同一端口接管页面(src/train/) */
 };
 
 /* Jobs are stack-owned by the client thread.  The worker signals completion
@@ -310,6 +311,9 @@ struct job {
     pthread_cond_t cv;
     job *next;
     uint64_t mon;   /* 监控记录 id(mon_begin; 0 = 没记): 生成路的 mon_prefill/mon_token/mon_end 都靠它找到这条请求 */
+    /* 非空 = 这不是请求, 是"热切侧车/后训练件"任务(server_plugins.c): 堆上分配, 没有客户端在等, worker 做完自己释放。
+     * 走同一个队列是为了让它排在已到的请求后面、只在两条请求之间生效 —— 插件表是进程级的。 */
+    struct server_plugin_switch *sw;
 };
 
 /* 客户端没给 max_tokens 时用它 = 不设上限; 真正的界是 ctx − 提示, 两条生成路各自 clamp。

@@ -205,7 +205,7 @@ item_fail:
             free(result);
             free(tools_json);
             free(status_str);
-            buf_free(&pending_reasoning);
+            ds4_buf_free(&pending_reasoning);
             return false;
         }
         if (**p != '}') {
@@ -251,7 +251,7 @@ item_fail:
             free(result);
             free(tools_json);
             free(status_str);
-            buf_free(&pending_reasoning);
+            ds4_buf_free(&pending_reasoning);
             return false;
         }
         /* Three classes of items:
@@ -273,7 +273,7 @@ item_fail:
             chat_msg flush_msg = {0};
             flush_msg.role = xstrdup("assistant");
             flush_msg.content = xstrdup("");
-            flush_msg.reasoning = buf_take(&pending_reasoning);
+            flush_msg.reasoning = ds4_buf_take(&pending_reasoning);
             chat_msgs_push(msgs, flush_msg);
         }
         if (!strcmp(t, "message")) {
@@ -282,7 +282,7 @@ item_fail:
             msg.content = content ? content : xstrdup("");
             content = NULL;
             if (!strcmp(msg.role, "assistant") && pending_reasoning.len) {
-                msg.reasoning = buf_take(&pending_reasoning);
+                msg.reasoning = ds4_buf_take(&pending_reasoning);
             }
             chat_msgs_push(msgs, msg);
         } else if (!strcmp(t, "function_call") || !strcmp(t, "custom_tool_call")) {
@@ -299,9 +299,9 @@ item_fail:
                 name && name[0])
             {
                 buf qualified = {0};
-                buf_puts(&qualified, namespace);
-                buf_puts(&qualified, name);
-                tc.name = buf_take(&qualified);
+                ds4_buf_puts(&qualified, namespace);
+                ds4_buf_puts(&qualified, name);
+                tc.name = ds4_buf_take(&qualified);
             } else {
                 tc.name = xstrdup(name ? name : "");
             }
@@ -314,14 +314,14 @@ item_fail:
             if (last && !strcmp(last->role, "assistant")) {
                 if (pending_reasoning.len && (!last->reasoning || !last->reasoning[0])) {
                     free(last->reasoning);
-                    last->reasoning = buf_take(&pending_reasoning);
+                    last->reasoning = ds4_buf_take(&pending_reasoning);
                 }
                 tool_calls_push(&last->calls, tc);
             } else {
                 chat_msg msg = {0};
                 msg.role = xstrdup("assistant");
                 msg.content = xstrdup("");
-                if (pending_reasoning.len) msg.reasoning = buf_take(&pending_reasoning);
+                if (pending_reasoning.len) msg.reasoning = ds4_buf_take(&pending_reasoning);
                 tool_calls_push(&msg.calls, tc);
                 chat_msgs_push(msgs, msg);
             }
@@ -338,12 +338,12 @@ item_fail:
             /* Stash so it merges into the next assistant message. summary is the
              * short-form list, content is the verbose chain. Either can be empty. */
             if (summary && summary[0]) {
-                if (pending_reasoning.len) buf_putc(&pending_reasoning, '\n');
-                buf_puts(&pending_reasoning, summary);
+                if (pending_reasoning.len) ds4_buf_putc(&pending_reasoning, '\n');
+                ds4_buf_puts(&pending_reasoning, summary);
             }
             if (content && content[0]) {
-                if (pending_reasoning.len) buf_putc(&pending_reasoning, '\n');
-                buf_puts(&pending_reasoning, content);
+                if (pending_reasoning.len) ds4_buf_putc(&pending_reasoning, '\n');
+                ds4_buf_puts(&pending_reasoning, content);
             }
         } else if (!strcmp(t, "local_shell_call") || !strcmp(t, "web_search_call") ||
                    !strcmp(t, "tool_search_call") || !strcmp(t, "image_generation_call"))
@@ -369,14 +369,14 @@ item_fail:
             if (last && !strcmp(last->role, "assistant")) {
                 if (pending_reasoning.len && (!last->reasoning || !last->reasoning[0])) {
                     free(last->reasoning);
-                    last->reasoning = buf_take(&pending_reasoning);
+                    last->reasoning = ds4_buf_take(&pending_reasoning);
                 }
                 tool_calls_push(&last->calls, tc);
             } else {
                 chat_msg msg = {0};
                 msg.role = xstrdup("assistant");
                 msg.content = xstrdup("");
-                if (pending_reasoning.len) msg.reasoning = buf_take(&pending_reasoning);
+                if (pending_reasoning.len) msg.reasoning = ds4_buf_take(&pending_reasoning);
                 tool_calls_push(&msg.calls, tc);
                 chat_msgs_push(msgs, msg);
             }
@@ -408,12 +408,12 @@ item_fail:
                     free(result);
                     free(tools_json);
                     free(status_str);
-                    buf_free(&pending_reasoning);
+                    ds4_buf_free(&pending_reasoning);
                     return false;
                 }
                 if (schemas && schemas[0]) {
-                    if (loaded_tool_schemas->len) buf_putc(loaded_tool_schemas, '\n');
-                    buf_puts(loaded_tool_schemas, schemas);
+                    if (loaded_tool_schemas->len) ds4_buf_putc(loaded_tool_schemas, '\n');
+                    ds4_buf_puts(loaded_tool_schemas, schemas);
                 }
                 free(schemas);
             }
@@ -448,7 +448,7 @@ item_fail:
             free(result);
             free(tools_json);
             free(status_str);
-            buf_free(&pending_reasoning);
+            ds4_buf_free(&pending_reasoning);
             return false;
         }
 
@@ -481,12 +481,12 @@ item_fail:
         chat_msg msg = {0};
         msg.role = xstrdup("assistant");
         msg.content = xstrdup("");
-        msg.reasoning = buf_take(&pending_reasoning);
+        msg.reasoning = ds4_buf_take(&pending_reasoning);
         chat_msgs_push(msgs, msg);
     }
-    buf_free(&pending_reasoning);
+    ds4_buf_free(&pending_reasoning);
     return true;
 fail:
-    buf_free(&pending_reasoning);
+    ds4_buf_free(&pending_reasoning);
     return false;
 }

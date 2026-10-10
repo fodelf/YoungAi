@@ -15,20 +15,6 @@ static inline void *xrealloc(void *p, size_t n) {   /* 同 xmalloc: 与 core 撞
 char *xstrdup(const char *s);
 bool random_bytes(void *dst, size_t len);
 char *xstrndup(const char *s, size_t n);
-void buf_append(buf *b, const void *p, size_t n);
-void buf_putc(buf *b, char c);
-void buf_puts(buf *b, const char *s);
-void buf_printf(buf *b, const char *fmt, ...);
-char *buf_take(buf *b);
-void buf_free(buf *b);
-void json_ws(const char **p);
-bool json_lit(const char **p, const char *lit);
-bool json_string(const char **p, char **out);
-bool json_number(const char **p, double *out);
-bool json_int(const char **p, int *out);
-bool json_bool(const char **p, bool *out);
-bool json_skip_value(const char **p);
-bool json_raw_value(const char **p, char **out);
 char *json_minify_raw_value(const char *json);
 bool json_content(const char **p, char **out);
 void random_tool_id(char *dst, size_t dstlen, api_style api);
@@ -115,6 +101,7 @@ void append_json_object_string(buf *b, const char *json);
 void append_tool_calls_json(buf *b, const tool_calls *calls, const char *id_prefix, const tool_schema_orders *orders);
 void append_tool_call_deltas_json(buf *b, const tool_calls *calls, const char *id_prefix, const tool_schema_orders *orders);
 bool http_response(int fd, bool enable_cors, int code, const char *type, const char *body);
+bool http_response_n(int fd, bool enable_cors, int code, const char *type, const char *body, size_t body_len);
 bool http_error(int fd, bool enable_cors, int code, const char *msg);
 bool request_exceeds_context(const request *r, int ctx_size);
 bool http_error_context_length_exceeded(int fd, bool enable_cors, const request *r, int n_prompt_tokens, int ctx_size);
@@ -324,6 +311,9 @@ int v41_progress_cb(void *ud, const char *event, int current, int total);   /* �
 void v41_gen_end(v41_gen *g, int rc);                 /* rc = 引擎返回码(非 0 且没出过 token = 预填失败) */
 /* V4.1 并发调度器(server_sched_v41.c, batch.md §3.2): --batch N ≥ 2 时 worker 线程整个交给它 */
 void v41_sched_run(server *s);
+/* 热切侧车/后训练件(server_plugins.c): init 起服时挂上训练页模块的钩子; apply 由 worker 在没有活着的请求时调, 做完释放 j */
+void server_plugins_init(server *s, const char *gguf);
+void server_plugins_apply(server *s, job *j);
 /* 任务队列(server_batch.c): dequeue 阻塞到有 job 或服务在停(NULL); dequeue_try 不阻塞; job_finish 唤醒等着的客户端线程 */
 job *dequeue(server *s);
 job *dequeue_try(server *s);

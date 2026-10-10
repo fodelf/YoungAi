@@ -28,10 +28,10 @@ void test_thinking_checkpoint_canonical_matches_future_prompt(void) {
 
     /* Build the canonical checkpoint text (what we'd produce after canonicalization) */
     buf canonical = {0};
-    buf_append(&canonical, prompt_text, pt_len - 7);  /* strip <think> */
-    buf_puts(&canonical, "</think>");
-    buf_puts(&canonical, content);
-    buf_puts(&canonical, "<" "｜" "end" "\xe2\x96\x81" "of" "\xe2\x96\x81" "sentence" "｜" ">");
+    ds4_buf_append(&canonical, prompt_text, pt_len - 7);  /* strip <think> */
+    ds4_buf_puts(&canonical, "</think>");
+    ds4_buf_puts(&canonical, content);
+    ds4_buf_puts(&canonical, "<" "｜" "end" "\xe2\x96\x81" "of" "\xe2\x96\x81" "sentence" "｜" ">");
 
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -79,7 +79,7 @@ void test_thinking_checkpoint_canonical_matches_future_prompt(void) {
     TEST_ASSERT(strstr(future_prompt, reasoning) == NULL);  /* reasoning dropped */
 
     free(future_prompt);
-    buf_free(&canonical);
+    ds4_buf_free(&canonical);
     free(prompt_text);
     chat_msgs_free(&prefix_msgs);
     chat_msgs_free(&history_msgs);
@@ -100,10 +100,10 @@ void test_thinking_canonical_empty_content(void) {
 
     /* Build canonical with empty content */
     buf canonical = {0};
-    buf_append(&canonical, prompt_text, pt_len - 7);
-    buf_puts(&canonical, "</think>");
+    ds4_buf_append(&canonical, prompt_text, pt_len - 7);
+    ds4_buf_puts(&canonical, "</think>");
     /* empty content */
-    buf_puts(&canonical, "<" "｜" "end" "\xe2\x96\x81" "of" "\xe2\x96\x81" "sentence" "｜" ">");
+    ds4_buf_puts(&canonical, "<" "｜" "end" "\xe2\x96\x81" "of" "\xe2\x96\x81" "sentence" "｜" ">");
 
     /* Future prompt with empty content assistant message */
     chat_msgs history = {0};
@@ -128,7 +128,7 @@ void test_thinking_canonical_empty_content(void) {
     TEST_ASSERT(strstr(future, "Deep thoughts") == NULL);
 
     free(future);
-    buf_free(&canonical);
+    ds4_buf_free(&canonical);
     free(prompt_text);
     chat_msgs_free(&msgs);
     chat_msgs_free(&history);
@@ -166,10 +166,10 @@ void test_thinking_canonical_multi_turn(void) {
     /* After 2nd generation: canonical drops 2nd reasoning too */
     const char *content2 = "I'm doing well";
     buf canonical = {0};
-    buf_append(&canonical, prompt_text, pt_len - 7);
-    buf_puts(&canonical, "</think>");
-    buf_puts(&canonical, content2);
-    buf_puts(&canonical, "<" "｜" "end" "\xe2\x96\x81" "of" "\xe2\x96\x81" "sentence" "｜" ">");
+    ds4_buf_append(&canonical, prompt_text, pt_len - 7);
+    ds4_buf_puts(&canonical, "</think>");
+    ds4_buf_puts(&canonical, content2);
+    ds4_buf_puts(&canonical, "<" "｜" "end" "\xe2\x96\x81" "of" "\xe2\x96\x81" "sentence" "｜" ">");
 
     /* Future: 3rd user message arrives */
     chat_msgs future_msgs = {0};
@@ -197,7 +197,7 @@ void test_thinking_canonical_multi_turn(void) {
     TEST_ASSERT(!memcmp(future, canonical.ptr, canonical.len));
 
     free(future);
-    buf_free(&canonical);
+    ds4_buf_free(&canonical);
     free(prompt_text);
     chat_msgs_free(&turn2_prefix);
     chat_msgs_free(&future_msgs);

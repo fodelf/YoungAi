@@ -130,7 +130,7 @@ void test_dsml_prompt_escapes_tool_supplied_text(void) {
     TEST_ASSERT(strstr(b.ptr, "echo 2>&1 && echo </｜DSML｜tool_calls>") != NULL);
     TEST_ASSERT(strstr(b.ptr, "2&gt;&amp;1") == NULL);
     TEST_ASSERT(strstr(b.ptr, "&amp;&amp;") == NULL);
-    buf_free(&b);
+    ds4_buf_free(&b);
     tool_calls_free(&calls);
 
     memset(&calls, 0, sizeof(calls));
@@ -142,7 +142,7 @@ void test_dsml_prompt_escapes_tool_supplied_text(void) {
     append_dsml_tool_calls_text(&b, &calls);
     TEST_ASSERT(strstr(b.ptr, "echo &lt;/｜DSML｜parameter>") != NULL);
     TEST_ASSERT(strstr(b.ptr, "echo </｜DSML｜parameter>") == NULL);
-    buf_free(&b);
+    ds4_buf_free(&b);
     tool_calls_free(&calls);
 
     chat_msgs msgs = {0};
@@ -195,10 +195,10 @@ void test_stop_list_streaming_holds_and_trims_stop_text(void) {
 
 static char *test_nested_json_array(int depth) {
     buf b = {0};
-    for (int i = 0; i < depth; i++) buf_putc(&b, '[');
-    buf_putc(&b, '0');
-    for (int i = 0; i < depth; i++) buf_putc(&b, ']');
-    return buf_take(&b);
+    for (int i = 0; i < depth; i++) ds4_buf_putc(&b, '[');
+    ds4_buf_putc(&b, '0');
+    for (int i = 0; i < depth; i++) ds4_buf_putc(&b, ']');
+    return ds4_buf_take(&b);
 }
 
 void test_json_skip_has_nesting_limit(void) {
@@ -224,7 +224,7 @@ void test_model_metadata_clamps_completion_to_context(void) {
     TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Flash\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":32768") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"max_completion_tokens\":32768") != NULL);
-    buf_free(&b);
+    ds4_buf_free(&b);
 
     append_model_json_values(&b, "deepseek-v4-pro", "DeepSeek V4 Pro",
                              100000, 4096);
@@ -232,7 +232,7 @@ void test_model_metadata_clamps_completion_to_context(void) {
     TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Pro\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":100000") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"max_completion_tokens\":4096") != NULL);
-    buf_free(&b);
+    ds4_buf_free(&b);
 }
 
 void test_client_socket_nonblocking_flag(void) {

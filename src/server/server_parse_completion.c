@@ -183,14 +183,14 @@ bool parse_completion_request(ds4_engine *e, const char *body, int def_tokens,
         return true;
     }
     buf rendered = {0};
-    buf_puts(&rendered, "<｜begin▁of▁sentence｜>");
-    buf_puts(&rendered, ds4_chat_system_token());   /* V4.1: 注入的 system 正文前先开 system 块(与 chat 路同一条规则) */
-    buf_puts(&rendered, ds4_think_effort_prefix(r->think_mode));
-    buf_puts(&rendered, "You are a helpful assistant<｜User｜>");
-    buf_puts(&rendered, prompt);
-    buf_puts(&rendered, "<｜Assistant｜>");
-    buf_puts(&rendered, ds4_think_mode_enabled(r->think_mode) ? "<think>" : "</think>");
-    r->prompt_text = buf_take(&rendered);
+    ds4_buf_puts(&rendered, "<｜begin▁of▁sentence｜>");
+    ds4_buf_puts(&rendered, ds4_chat_system_token());   /* V4.1: 注入的 system 正文前先开 system 块(与 chat 路同一条规则) */
+    ds4_buf_puts(&rendered, ds4_think_effort_prefix(r->think_mode));
+    ds4_buf_puts(&rendered, "You are a helpful assistant<｜User｜>");
+    ds4_buf_puts(&rendered, prompt);
+    ds4_buf_puts(&rendered, "<｜Assistant｜>");
+    ds4_buf_puts(&rendered, ds4_think_mode_enabled(r->think_mode) ? "<think>" : "</think>");
+    r->prompt_text = ds4_buf_take(&rendered);
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     free(prompt);
     return true;

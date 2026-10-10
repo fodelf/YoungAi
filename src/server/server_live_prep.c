@@ -22,7 +22,7 @@ static char *render_live_tool_tail(const chat_msgs *msgs, int start,
                                    ds4_think_mode think_mode) {
     const bool think = ds4_think_mode_enabled(think_mode);
     buf out = {0};
-    buf_puts(&out, "<｜end▁of▁sentence｜>");
+    ds4_buf_puts(&out, "<｜end▁of▁sentence｜>");
 
     bool pending_assistant = false;
     bool pending_tool_result = false;
@@ -31,41 +31,41 @@ static char *render_live_tool_tail(const chat_msgs *msgs, int start,
         if (role_is_system(m->role)) {
             continue;
         } else if (!strcmp(m->role, "user")) {
-            buf_puts(&out, "<｜User｜>");
-            buf_puts(&out, m->content ? m->content : "");
+            ds4_buf_puts(&out, "<｜User｜>");
+            ds4_buf_puts(&out, m->content ? m->content : "");
             pending_assistant = true;
             pending_tool_result = false;
         } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
-            if (!pending_tool_result) buf_puts(&out, "<｜User｜>");
-            buf_puts(&out, "<tool_result>");
+            if (!pending_tool_result) ds4_buf_puts(&out, "<｜User｜>");
+            ds4_buf_puts(&out, "<tool_result>");
             append_tool_result_text(&out, m->content);
-            buf_puts(&out, "</tool_result>");
+            ds4_buf_puts(&out, "</tool_result>");
             pending_assistant = true;
             pending_tool_result = true;
         } else if (!strcmp(m->role, "assistant")) {
             if (pending_assistant) {
-                buf_puts(&out, "<｜Assistant｜>");
+                ds4_buf_puts(&out, "<｜Assistant｜>");
                 if (think) {
-                    buf_puts(&out, "<think>");
-                    buf_puts(&out, m->reasoning ? m->reasoning : "");
-                    buf_puts(&out, "</think>");
+                    ds4_buf_puts(&out, "<think>");
+                    ds4_buf_puts(&out, m->reasoning ? m->reasoning : "");
+                    ds4_buf_puts(&out, "</think>");
                 } else {
-                    buf_puts(&out, "</think>");
+                    ds4_buf_puts(&out, "</think>");
                 }
             }
-            buf_puts(&out, m->content ? m->content : "");
+            ds4_buf_puts(&out, m->content ? m->content : "");
             append_dsml_tool_calls_text(&out, &m->calls);
-            buf_puts(&out, "<｜end▁of▁sentence｜>");
+            ds4_buf_puts(&out, "<｜end▁of▁sentence｜>");
             pending_assistant = false;
             pending_tool_result = false;
         }
     }
 
     if (pending_assistant) {
-        buf_puts(&out, "<｜Assistant｜>");
-        buf_puts(&out, think ? "<think>" : "</think>");
+        ds4_buf_puts(&out, "<｜Assistant｜>");
+        ds4_buf_puts(&out, think ? "<think>" : "</think>");
     }
-    return buf_take(&out);
+    return ds4_buf_take(&out);
 }
 
 static bool chat_msg_has_call_id(const chat_msg *m, const char *id) {

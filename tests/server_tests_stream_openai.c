@@ -430,16 +430,16 @@ void test_openai_tool_stream_holds_partial_utf8_arguments(void) {
     const char replacement[] = {(char)0xef, (char)0xbf, (char)0xbd, 0};
 
     buf partial = {0};
-    buf_append(&partial, prefix, strlen(prefix));
-    buf_putc(&partial, (char)0xf0);
-    buf_putc(&partial, (char)0x9f);
+    ds4_buf_append(&partial, prefix, strlen(prefix));
+    ds4_buf_putc(&partial, (char)0xf0);
+    ds4_buf_putc(&partial, (char)0x9f);
     TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_utf8_tool", &st,
                                          partial.ptr, partial.len, false));
 
     buf complete = {0};
-    buf_append(&complete, prefix, strlen(prefix));
-    buf_append(&complete, flag_utf8, 4);
-    buf_append(&complete, suffix, strlen(suffix));
+    ds4_buf_append(&complete, prefix, strlen(prefix));
+    ds4_buf_append(&complete, flag_utf8, 4);
+    ds4_buf_append(&complete, suffix, strlen(suffix));
     TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_utf8_tool", &st,
                                          complete.ptr, complete.len, false));
 
@@ -451,8 +451,8 @@ void test_openai_tool_stream_holds_partial_utf8_arguments(void) {
     TEST_ASSERT(strstr(out, replacement) == NULL);
 
     free(out);
-    buf_free(&partial);
-    buf_free(&complete);
+    ds4_buf_free(&partial);
+    ds4_buf_free(&complete);
     openai_stream_free(&st);
     request_free(&r);
     close(sv[0]);

@@ -119,7 +119,7 @@ int v41_emit(int token, void *ud) {
     g->completion++;
     mon_token(s, j->mon, g->completion);
     trace_piece(s, g->trace_id, piece, piece_len);
-    buf_append(&g->text, piece, piece_len);
+    ds4_buf_append(&g->text, piece, piece_len);
     thinking_state_feed(&g->thinking, piece, piece_len);
     if (j->req.kind == REQ_CHAT && j->req.has_tools) dsml_decode_tracker_update(&g->dsml_tracker, g->text.ptr, g->text.len);
 
@@ -382,12 +382,12 @@ void v41_gen_end(v41_gen *g, int rc) {
             send_prefill_failure_response(s, j, &g->progress, g->ctx_span, g->req_flags, "V4.1 prefill failed");
         }
         mon_end(s, j->mon, g->client_gone ? "disconnect" : "error", 0, -1, -1);
-        free(g->ids); buf_free(&g->text);
+        free(g->ids); ds4_buf_free(&g->text);
         return;
     }
     if (!g->started) {   /* max_tokens == 0: 预填成了但一个 token 都不要 */
         v41_prefill_done(g);
-        if (!v41_stream_begin(g)) { mon_end(s, j->mon, "disconnect", 0, -1, -1); free(g->ids); buf_free(&g->text); return; }
+        if (!v41_stream_begin(g)) { mon_end(s, j->mon, "disconnect", 0, -1, -1); free(g->ids); ds4_buf_free(&g->text); return; }
     }
     if (rc != 0 && strcmp(g->finish, "error") != 0) { g->finish = "error"; snprintf(g->err, sizeof(g->err), "V4.1 decode failed"); }
     const char *final_finish = v41_finish(g);
@@ -399,7 +399,7 @@ void v41_gen_end(v41_gen *g, int rc) {
     anthropic_stream_free(&g->anthropic_live);
     openai_stream_free(&g->openai_live);
     responses_stream_free(&g->responses_live);
-    buf_free(&g->text);
+    ds4_buf_free(&g->text);
 }
 
 /* 单 worker 路(不带 --batch): 引擎整段跑(预填 → 逐 token, 带投机), token 从回调来 */

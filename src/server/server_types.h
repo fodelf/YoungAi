@@ -91,17 +91,9 @@
 /* 合批出队前的聚集窗口: 首请求到达后再等这么久收拢同型请求, 换 tile 填充率。 */
 #define DS4_SERVER_BATCH_WAIT_MS 60
 
-typedef struct {
-    char *ptr;
-    size_t len;
-    size_t cap;
-} buf;
-
-/* The request parser only understands the API fields we use and skips the
- * rest.  Skipping is recursive because JSON values nest, so keep an explicit
- * ceiling: without it, a useless ignored field like {"x":[[[...]]]} can spend
- * the whole C stack before the request is rejected. */
-#define JSON_MAX_NESTING 256
+/* buf 与 JSON 词法基元在 src/common/ds4_json.h(2026-10-10 挪出: 训练器读 jsonl 料共用一份); 服务端沿用 buf 这个名 */
+#include "../common/ds4_json.h"
+typedef ds4_buf buf;
 
 typedef enum {
     REQ_CHAT,

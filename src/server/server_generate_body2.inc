@@ -192,7 +192,7 @@ guided_primer:
                     PRIMER_KA(); \
                 } \
             } \
-            if (gok) buf_append(&text, (lit), strlen(lit)); \
+            if (gok) ds4_buf_append(&text, (lit), strlen(lit)); \
             inject_sec += now_sec() - inj_t0; \
             ds4_tokens_free(&itoks); \
         } while (0)
@@ -239,7 +239,7 @@ guided_primer:
                 } \
                 size_t gl = 0; char *gp = ds4_token_text(s->engine, gt, &gl); \
                 if (ds4_session_eval(s->session, gt, perr, sizeof(perr)) != 0) { gok = false; free(gp); break; } \
-                if (gp) buf_append(&text, gp, gl); \
+                if (gp) ds4_buf_append(&text, gp, gl); \
                 free(gp); \
                 gen_used++; \
                 PRIMER_KA(); \
@@ -256,8 +256,8 @@ guided_primer:
         for (int ti = 0; ti < j->req.tool_orders.len; ti++) {
             const tool_schema_order *nts = &j->req.tool_orders.v[ti];
             if (!nts->name) continue;
-            buf_append(&names_src, "\x01", 1);
-            buf_append(&names_src, nts->name, strlen(nts->name));
+            ds4_buf_append(&names_src, "\x01", 1);
+            ds4_buf_append(&names_src, nts->name, strlen(nts->name));
         }
         primer_copy name_cm;
         primer_copy_init(&name_cm, names_src.ptr, names_src.len, true);
@@ -333,7 +333,7 @@ guided_primer:
                 strncmp(text.ptr + name_from, ts->name, text.len - name_from) != 0)
                 continue;
             text.len = name_from;               /* canonical name replaces prefix */
-            buf_append(&text, ts->name, strlen(ts->name));
+            ds4_buf_append(&text, ts->name, strlen(ts->name));
             /* 发射全部 required 参数 (schema 序; 无 required 声明时退回 v0
              * 首参行为)。每参数一个独立拷贝匹配器 —— span 状态不跨参数。 */
             bool opened = false;

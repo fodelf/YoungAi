@@ -13,27 +13,27 @@ static void append_anthropic_tool_use(buf *b, const tool_call *tc, const char *i
     (void)orders;
     char idbuf[128];
     snprintf(idbuf, sizeof(idbuf), DS4_TOOL_ID_PREFIX_ANTHROPIC "%s_%d", id_prefix, i);
-    buf_puts(b, "{\"type\":\"tool_use\",\"id\":");
+    ds4_buf_puts(b, "{\"type\":\"tool_use\",\"id\":");
     json_escape(b, tc->id && tc->id[0] ? tc->id : idbuf);
-    buf_puts(b, ",\"name\":");
+    ds4_buf_puts(b, ",\"name\":");
     json_escape(b, tc->name ? tc->name : "");
-    buf_puts(b, ",\"input\":");
+    ds4_buf_puts(b, ",\"input\":");
     append_json_object_or_empty(b, tc->arguments);
-    buf_putc(b, '}');
+    ds4_buf_putc(b, '}');
 }
 
 static void append_anthropic_thinking(buf *b, const char *reasoning, const char *signature) {
-    buf_puts(b, "{\"type\":\"thinking\",\"thinking\":");
+    ds4_buf_puts(b, "{\"type\":\"thinking\",\"thinking\":");
     json_escape(b, reasoning ? reasoning : "");
-    buf_puts(b, ",\"signature\":");
+    ds4_buf_puts(b, ",\"signature\":");
     json_escape(b, signature ? signature : "");
-    buf_putc(b, '}');
+    ds4_buf_putc(b, '}');
 }
 
 void append_anthropic_content(buf *b, const char *text, const char *reasoning,
                                      const tool_calls *calls, const char *id_prefix,
                                      const tool_schema_orders *orders) {
-    buf_putc(b, '[');
+    ds4_buf_putc(b, '[');
     bool wrote = false;
     bool wrote_after_thinking = false;
     if (reasoning && reasoning[0]) {
@@ -41,26 +41,26 @@ void append_anthropic_content(buf *b, const char *text, const char *reasoning,
         wrote = true;
     }
     if (text && text[0]) {
-        if (wrote) buf_putc(b, ',');
-        buf_puts(b, "{\"type\":\"text\",\"text\":");
+        if (wrote) ds4_buf_putc(b, ',');
+        ds4_buf_puts(b, "{\"type\":\"text\",\"text\":");
         json_escape(b, text);
-        buf_putc(b, '}');
+        ds4_buf_putc(b, '}');
         wrote = true;
         wrote_after_thinking = true;
     }
     if (calls) {
         for (int i = 0; i < calls->len; i++) {
-            if (wrote) buf_putc(b, ',');
+            if (wrote) ds4_buf_putc(b, ',');
             append_anthropic_tool_use(b, &calls->v[i], id_prefix, i, orders);
             wrote = true;
             wrote_after_thinking = true;
         }
     }
     if (!wrote || ((reasoning && reasoning[0]) && !wrote_after_thinking)) {
-        if (wrote) buf_putc(b, ',');
-        buf_puts(b, "{\"type\":\"text\",\"text\":\"\"}");
+        if (wrote) ds4_buf_putc(b, ',');
+        ds4_buf_puts(b, "{\"type\":\"text\",\"text\":\"\"}");
     }
-    buf_putc(b, ']');
+    ds4_buf_putc(b, ']');
 }
 
 static void append_anthropic_usage_json(buf *b, const request *r,
@@ -71,7 +71,7 @@ static void append_anthropic_usage_json(buf *b, const request *r,
     cache_write_tokens = clamp_usage_tokens(cache_write_tokens, prompt_tokens - cache_read_tokens);
     int input_tokens = prompt_tokens - cache_read_tokens - cache_write_tokens;
     if (input_tokens < 0) input_tokens = 0;
-    buf_printf(b,
+    ds4_buf_printf(b,
                "{\"input_tokens\":%d,\"output_tokens\":%d,"
                "\"cache_read_input_tokens\":%d,\"cache_creation_input_tokens\":%d}",
                input_tokens, completion_tokens, cache_read_tokens, cache_write_tokens);
@@ -82,29 +82,29 @@ bool anthropic_final_response(int fd, bool enable_cors,
                                      const char *reasoning, const tool_calls *calls, const char *finish,
                                      int prompt_tokens, int completion_tokens) {
     buf b = {0};
-    buf_printf(&b, "{\"id\":\"%s\",\"type\":\"message\",\"role\":\"assistant\",\"model\":", id);
+    ds4_buf_printf(&b, "{\"id\":\"%s\",\"type\":\"message\",\"role\":\"assistant\",\"model\":", id);
     json_escape(&b, r->model);
-    buf_puts(&b, ",\"content\":");
+    ds4_buf_puts(&b, ",\"content\":");
     append_anthropic_content(&b, text, reasoning, calls, id, &r->tool_orders);
-    buf_puts(&b, ",\"stop_reason\":");
+    ds4_buf_puts(&b, ",\"stop_reason\":");
     json_escape(&b, anthropic_stop_reason(finish));
-    buf_puts(&b, ",\"stop_sequence\":null,\"usage\":");
+    ds4_buf_puts(&b, ",\"stop_sequence\":null,\"usage\":");
     append_anthropic_usage_json(&b, r, prompt_tokens, completion_tokens);
-    buf_puts(&b, "}\n");
+    ds4_buf_puts(&b, "}\n");
     bool ok = http_response(fd, enable_cors, 200, "application/json", b.ptr);
-    buf_free(&b);
+    ds4_buf_free(&b);
     return ok;
 }
 
 bool sse_event(int fd, const char *event, const char *data) {
     buf b = {0};
-    buf_puts(&b, "event: ");
-    buf_puts(&b, event);
-    buf_puts(&b, "\ndata: ");
-    buf_puts(&b, data);
-    buf_puts(&b, "\n\n");
+    ds4_buf_puts(&b, "event: ");
+    ds4_buf_puts(&b, event);
+    ds4_buf_puts(&b, "\ndata: ");
+    ds4_buf_puts(&b, data);
+    ds4_buf_puts(&b, "\n\n");
     bool ok = send_all(fd, b.ptr, b.len);
-    buf_free(&b);
+    ds4_buf_free(&b);
     return ok;
 }
 
@@ -112,17 +112,17 @@ bool anthropic_sse_start_live(int fd, const request *r, const char *id,
                                      int prompt_tokens, anthropic_stream *st) {
     buf b = {0};
     json_escape(&b, r->model);
-    char *model_json = buf_take(&b);
+    char *model_json = ds4_buf_take(&b);
 
-    buf_printf(&b,
+    ds4_buf_printf(&b,
         "{\"type\":\"message_start\",\"message\":{\"id\":\"%s\",\"type\":\"message\","
         "\"role\":\"assistant\",\"model\":%s,\"content\":[],\"stop_reason\":null,"
         "\"stop_sequence\":null,\"usage\":",
         id, model_json);
     append_anthropic_usage_json(&b, r, prompt_tokens, 0);
-    buf_puts(&b, "}}");
+    ds4_buf_puts(&b, "}}");
     bool ok = sse_event(fd, "message_start", b.ptr);
-    buf_free(&b);
+    ds4_buf_free(&b);
     free(model_json);
 
     memset(st, 0, sizeof(*st));
@@ -187,19 +187,19 @@ bool anthropic_sse_open_block(int fd, anthropic_stream *st,
 
     buf b = {0};
     if (type == ANTH_BLOCK_THINKING) {
-        buf_printf(&b,
+        ds4_buf_printf(&b,
                    "{\"type\":\"content_block_start\",\"index\":%d,"
                    "\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\","
                    "\"signature\":\"\"}}",
                    st->next_index);
     } else {
-        buf_printf(&b,
+        ds4_buf_printf(&b,
                    "{\"type\":\"content_block_start\",\"index\":%d,"
                    "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}",
                    st->next_index);
     }
     bool ok = sse_event(fd, "content_block_start", b.ptr);
-    buf_free(&b);
+    ds4_buf_free(&b);
     if (ok) st->open_block = type;
     return ok;
 }
@@ -211,16 +211,16 @@ static bool anthropic_sse_open_tool_block(int fd, anthropic_stream *st,
     if (st->open_block != ANTH_BLOCK_NONE) return false;
 
     buf b = {0};
-    buf_printf(&b,
+    ds4_buf_printf(&b,
                "{\"type\":\"content_block_start\",\"index\":%d,"
                "\"content_block\":{\"type\":\"tool_use\",\"id\":",
                st->next_index);
     json_escape(&b, tool_id ? tool_id : "");
-    buf_puts(&b, ",\"name\":");
+    ds4_buf_puts(&b, ",\"name\":");
     json_escape(&b, name ? name : "");
-    buf_puts(&b, ",\"input\":{}}}");
+    ds4_buf_puts(&b, ",\"input\":{}}}");
     bool ok = sse_event(fd, "content_block_start", b.ptr);
-    buf_free(&b);
+    ds4_buf_free(&b);
     if (ok) st->open_block = ANTH_BLOCK_TOOL;
     return ok;
 }
@@ -231,22 +231,22 @@ bool anthropic_sse_delta_live(int fd, const anthropic_stream *st,
     if (len == 0) return true;
     buf b = {0};
     if (type == ANTH_BLOCK_THINKING) {
-        buf_printf(&b,
+        ds4_buf_printf(&b,
                    "{\"type\":\"content_block_delta\",\"index\":%d,"
                    "\"delta\":{\"type\":\"thinking_delta\",\"thinking\":",
                    st->next_index);
         json_escape_n(&b, text, len);
-        buf_puts(&b, "}}");
+        ds4_buf_puts(&b, "}}");
     } else {
-        buf_printf(&b,
+        ds4_buf_printf(&b,
                    "{\"type\":\"content_block_delta\",\"index\":%d,"
                    "\"delta\":{\"type\":\"text_delta\",\"text\":",
                    st->next_index);
         json_escape_n(&b, text, len);
-        buf_puts(&b, "}}");
+        ds4_buf_puts(&b, "}}");
     }
     bool ok = sse_event(fd, "content_block_delta", b.ptr);
-    buf_free(&b);
+    ds4_buf_free(&b);
     return ok;
 }
 
@@ -258,14 +258,14 @@ static bool anthropic_sse_tool_delta_live(int fd, const anthropic_stream *st,
                                           const char *text, size_t len) {
     if (len == 0) return true;
     buf b = {0};
-    buf_printf(&b,
+    ds4_buf_printf(&b,
                "{\"type\":\"content_block_delta\",\"index\":%d,"
                "\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":",
                st->next_index);
     json_escape_n(&b, text, len);
-    buf_puts(&b, "}}");
+    ds4_buf_puts(&b, "}}");
     bool ok = sse_event(fd, "content_block_delta", b.ptr);
-    buf_free(&b);
+    ds4_buf_free(&b);
     return ok;
 }
 
@@ -276,20 +276,20 @@ bool anthropic_sse_close_block_live(int fd, const char *id,
     buf b = {0};
     bool ok = true;
     if (st->open_block == ANTH_BLOCK_THINKING) {
-        buf_printf(&b,
+        ds4_buf_printf(&b,
                    "{\"type\":\"content_block_delta\",\"index\":%d,"
                    "\"delta\":{\"type\":\"signature_delta\",\"signature\":",
                    st->next_index);
         json_escape(&b, id);
-        buf_puts(&b, "}}");
+        ds4_buf_puts(&b, "}}");
         ok = sse_event(fd, "content_block_delta", b.ptr);
-        buf_free(&b);
+        ds4_buf_free(&b);
     }
     if (ok) {
-        buf_printf(&b, "{\"type\":\"content_block_stop\",\"index\":%d}",
+        ds4_buf_printf(&b, "{\"type\":\"content_block_stop\",\"index\":%d}",
                    st->next_index);
         ok = sse_event(fd, "content_block_stop", b.ptr);
-        buf_free(&b);
+        ds4_buf_free(&b);
     }
     if (ok) {
         st->open_block = ANTH_BLOCK_NONE;
@@ -313,7 +313,7 @@ bool anthropic_tool_emit_string_value(int fd, anthropic_stream *st,
     bool ok = anthropic_tool_emit_args_fragment(fd, st,
                                                 frag.ptr ? frag.ptr : "",
                                                 frag.len);
-    buf_free(&frag);
+    ds4_buf_free(&frag);
     free(unescaped);
     free(raw);
     return ok;
@@ -324,14 +324,14 @@ static bool anthropic_tool_emit_param_prefix(int fd, anthropic_stream *st,
     anthropic_tool_stream *ts = &st->tool;
     buf frag = {0};
     if (ts->first_param) ts->first_param = false;
-    else buf_putc(&frag, ',');
+    else ds4_buf_putc(&frag, ',');
     json_escape(&frag, name ? name : "");
-    buf_putc(&frag, ':');
-    if (is_string) buf_putc(&frag, '"');
+    ds4_buf_putc(&frag, ':');
+    if (is_string) ds4_buf_putc(&frag, '"');
     bool ok = anthropic_tool_emit_args_fragment(fd, st,
                                                 frag.ptr ? frag.ptr : "",
                                                 frag.len);
-    buf_free(&frag);
+    ds4_buf_free(&frag);
     return ok;
 }
 
