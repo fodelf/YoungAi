@@ -1,11 +1,11 @@
-/* core_ptrain.c — 后训练 ③ 第八版(上下文蒸馏)的主循环: --ptrain <配置>(2026-10-01)。总述见 core_ptrain.h。
+/* core_ptrain.c — 后训练 ③ 的主循环: --ptrain <配置>(2026-10-01; 10-10 收口)。总述见 core_ptrain.h。
  *
- * 一趟 = 读料 → 教师 top-K(有缓存就读) → 评估(第 0 步 = 部署态, ③ 恒等) → 若干轮: 打乱训练题、每 batch 题攒梯度一次 Adam
+ * 一趟 = 读料(jsonl) → 教师 top-K(有缓存就读; 不带材料的题不要教师) → 第 0 步评估(部署态, ③ 恒等) → 若干轮: 打乱训练题、每 batch 题攒梯度一次 Adam
  * → 每轮末评估 + 贪心探针(留出题) + 存 ckpt_eNN → 落 ③(amp_Lnn.bin + base.fnv, 引擎 --posttrain 直接挂)。
- * 判据(全打印, 判读归人): ①留出题答案位 KL(教师‖学生)较第 0 步降多少 —— 措辞没进训练, 降 = 学会了复盘内容而不是背了题;
- * ②同一道留出题的贪心回答: 部署态 / 挂 ③ / 教师参考三份原样并排; ③守门(wt2 五指标)在脚本里另跑(docgate 段)。
- * 轮数照配置训满(10-02 用户: "支持设置训练轮数, 然后选出最优就行了"), 挑哪一轮归脚本 kdpick 段(过 wt2 门的轮里留出 KL 最低者);
- * 每轮末另打一行"留出 KL 较上轮逐题配对降多少 ± 标准误"(见 pt_paired_gain), 只打不判 —— 末轮还在显著降 = 下次轮数可以给多些。 */
+ * 判据(全打印, 判读归人): ①留出题答案位损失(带材料 = KL 教师‖学生, 不带 = NLL)较第 0 步降多少 —— 措辞没进训练, 降 = 学到了内容而不是背了题;
+ * ②同一道留出题的贪心回答: 部署态 / 挂 ③ / 参考答案三份原样并排; ③守门(wt2 五指标)在脚本里另跑(docgate 段)。
+ * 轮数照配置训满(10-02 用户: "支持设置训练轮数, 然后选出最优就行了"), 挑哪一轮归脚本 kdpick 段(过 wt2 门的轮里留出损失最低者);
+ * 每轮末另打一行"留出损失较上轮逐题配对降多少 ± 标准误"(见 pt_paired_gain), 只打不判 —— 末轮还在显著降 = 下次轮数可以给多些。 */
 #include "core_ptrain.h"
 #include <sys/stat.h>
 #ifndef DS4_NO_GPU
@@ -39,8 +39,6 @@ static void pt_prof_print(const pt_run *r, const char *tag) {
             (t[PT_TM_LAYERS] - t[PT_TM_RECOMP] - t[PT_TM_ROUTED] - t[PT_TM_ATTN] - t[PT_TM_LREST]) / n,
             seg / n, t[PT_TM_Q] / n, t[PT_TM_ADAM] / ns, t[PT_TM_STEP] / ns);
 }
-
-/* 探针 / 采样(生成侧)在 core_ptrain_probe.c(10-06 拆出并合批) */
 
 static bool pt_in_eval(const pt_data *d, const pt_sample *s, int which, int hold) {
     return s->eval == which && s->top_id && d->ch[s->chunk].hold == hold;
@@ -202,18 +200,10 @@ int ds4_engine_ptrain(ds4_engine *e, const char *spec) {
     char lp[1100]; snprintf(lp, sizeof lp, "%s/train.log", c.out);
     FILE *lf = fopen(lp, "a");
     int rc = 1;
-    double kl_ev0 = 0, kl_tr0 = 0, kl = 0, kl_h0 = 0, kh = 0, ka0 = 0, ka = 0;
-    uint32_t nka = 0;   /* 锚行(自采样 kl 行)数; 0 = 清单里没有, 不打锚 KL */
+    double kl_ev0 = 0, kl_tr0 = 0, kl = 0, kl_h0 = 0, kh = 0;
     uint64_t rs = 0x2545F4914F6CDD1Dull ^ c.seed;
     uint32_t step = 0;
     double t0 = now_sec();
-    pt_userq uq = { NULL, NULL, 0 };
-    {
-        const uint32_t n = pt_userq_load(c.probe_q, &uq.q);
-        if (n == UINT32_MAX) goto out;
-        uq.n = n;
-        uq.ub = xmalloc_zeroed(n + 1, sizeof(char *));
-    }
     /* 逐位诊断: 只读不训, 不要预热(预热会把一道训练题的梯度算进缓冲, 诊断用不上); 它会把 A 置零, 所以跑完只能退出 */
     if (c.diag) { rc = pt_diag(e, &c, &r, &d) ? 0 : 1; goto out; }
     {   /* ★预热探底★: 最满的包(不合批时 = 最长的训练题)完整走一趟前向 + 反传, 按需长的暂存一次长到顶, 内存峰值在开训前就量出来 ——
@@ -252,39 +242,23 @@ int ds4_engine_ptrain(ds4_engine *e, const char *spec) {
     if (only_check) { rc = 0; goto out; }
     fprintf(stderr, "ds4: [ptrain] 训练 L%u-L%u 放大器 K=%u, lr %.2g, batch %u, %u 轮, 训练题 %u; 第 0 步评估…\n",
             c.layer_lo, c.layer_hi, c.rank, (double)c.lr, c.batch, c.epochs, ntr);
-    /* 第 0 步的评估 / 探针可按配置跳(eval0=0 / probe0=0, 10-06): 奖励回路第 2 轮起的起点 = 上一轮末同一份 ③, 那一轮末已经评估、探针过它(同题同种子),
-     * 再算一遍纯是重复(每轮 5 分多); epochs=0 的趟(回路第 0 轮)产物就是第 0 步的探针与采样, 强制都做 */
-    const bool ev0 = c.eval0 || !c.epochs, pr0 = c.probe0 || !c.epochs;
-    bool have0 = false;   /* 有没有第 0 步的留出基线(轮末行里"第 0 步 X"与第 1 轮的逐题配对都靠它) */
     if (c.max_steps) fprintf(stderr, "ds4: [ptrain] max_steps=%u: 计时模式, 不做第 0 步评估/探针, 到步数就退出, 不评估不存盘\n", c.max_steps);
     else {
-        if (ev0) {
-            if (!pt_eval(e, &c, &r, &d, 1, UINT32_MAX, &kl_ev0, 0, ev_prev, ev_m) || !pt_eval(e, &c, &r, &d, 0, 64, &kl_tr0, 0, NULL, NULL) ||
-                !pt_eval(e, &c, &r, &d, 1, UINT32_MAX, &kl_h0, 1, NULL, NULL)) goto out;
-            fprintf(stderr, "ds4: [ptrain] 第 0 步(%s): 留出 KL %.4f(%u 题) / 训练前 64 题 KL %.4f / 保持料留出 KL %.4f\n",
-                    c.init[0] ? "起点 = init 的 ③" : "部署态", kl_ev0, nev, kl_tr0, kl_h0);
-            if (!pt_eval_anchor(e, &c, &r, &d, &ka0, &nka)) goto out;
-            if (nka) fprintf(stderr, "ds4: [ptrain] 锚 KL(自采样 %u 份, 教师 = %s): 第 0 步 %.4f(学生就是起点, 应 ≈ 0; 之后涨多少 = 奖励把策略推离起点多远)\n",
-                             nka, c.anchor[0] ? "anchor= 的 ③" : "部署态", ka0);
-            if (lf) { fprintf(lf, "step 0 eval_kl %.5f train_kl %.5f hold_kl %.5f anchor_kl %.5f\n", kl_ev0, kl_tr0, kl_h0, ka0); fflush(lf); }
-            pt_heldout_dump(&c, &d, ev_prev, ev_m, "e00");
-            have0 = true;
-            pt_release("第 0 步评估");   /* 探针走解码路, 它的暂存别叠在评估/训练暂存上面 */
-        } else {
-            fprintf(stderr, "ds4: [ptrain] eval0=0: 跳过第 0 步评估(起点 = 上一轮末同一份 ③, 它的轮末评估就是这一步的读数)\n");
-            for (uint32_t i = 0; i < d.ns; i++) if (pt_in_eval(&d, &d.s[i], 1, 0)) nka++;   /* 锚行数照数, 轮末的锚 KL 才会打 */
-            nka = 0; for (uint32_t i = 0; i < d.ns; i++) if (d.s[i].nocache) nka++;
-        }
-        /* 给了 init 时第 0 步的"挂 ③"= 起点那份 ③(叠加训练 / kdfwd 转移测试: 前一天的 ③ 对今天的题答什么, 与部署态并排); 没给就只有部署态 */
-        if (pr0) {
-            if (!pt_probes(e, &c, &d, base, &uq, c.init[0] ? c.init : NULL, "e00")) goto out;
-            pt_release("第 0 步探针");
-        } else fprintf(stderr, "ds4: [ptrain] probe0=0: 跳过第 0 步探针(同上)\n");
+        if (!pt_eval(e, &c, &r, &d, 1, UINT32_MAX, &kl_ev0, 0, ev_prev, ev_m) || !pt_eval(e, &c, &r, &d, 0, 64, &kl_tr0, 0, NULL, NULL) ||
+            !pt_eval(e, &c, &r, &d, 1, UINT32_MAX, &kl_h0, 1, NULL, NULL)) goto out;
+        fprintf(stderr, "ds4: [ptrain] 第 0 步(%s): 留出损失 %.4f(%u 题) / 训练前 64 题 %.4f / 保持料留出 KL %.4f\n",
+                c.init[0] ? "起点 = init 的 ③" : "部署态", kl_ev0, nev, kl_tr0, kl_h0);
+        if (lf) { fprintf(lf, "step 0 eval_kl %.5f train_kl %.5f hold_kl %.5f\n", kl_ev0, kl_tr0, kl_h0); fflush(lf); }
+        pt_heldout_dump(&c, &d, ev_prev, ev_m, "e00");
+        pt_release("第 0 步评估");   /* 探针走解码路, 它的暂存别叠在评估/训练暂存上面 */
+        /* 给了 init 时第 0 步的"挂 ③"= 起点那份 ③(续训: 起点对留出题答什么, 与部署态并排); 没给就只有部署态 */
+        if (!pt_probes(e, &c, &d, base, c.init[0] ? c.init : NULL, "e00")) goto out;
+        pt_release("第 0 步探针");
     }
     /* ★每轮按 token 预算抽题(10-03 用户定)★: epoch_tok > 0 时一轮 = 打乱序里连续的一段, 各题行数累计到预算就收, 下一轮从游标接着取,
      * 取完整个打乱序才重新打乱 —— 一个周期内每题恰好一次、不放回; 轮与轮之间是相邻切片, 不是同一批题。预算 0 = 老口径(一轮 = 全量过一遍)。 */
     uint64_t rows_all = 0;
-    for (uint32_t i = 0; i < ntr; i++) rows_all += d.s[ord[i]].sn;
+    for (uint32_t i = 0; i < ntr; i++) rows_all += (uint64_t)d.s[ord[i]].sn;
     fprintf(stderr, "ds4: [ptrain] 训练料 %u 题共 %llu 行(含提示)%s", ntr, (unsigned long long)rows_all, c.epoch_tok ? "" : ", 一轮 = 全量过一遍\n");
     if (c.epoch_tok) fprintf(stderr, "; 每轮 token 预算 %u ⇒ 约 %.1f 轮过一遍, 轮末\"留出 KL 较上轮降\"比的是相邻切片\n", c.epoch_tok, (double)rows_all / (double)c.epoch_tok);
     uint32_t cur = ntr;   /* 打乱序的游标: 到头就重新打乱 */
@@ -303,9 +277,9 @@ int ds4_engine_ptrain(ds4_engine *e, const char *spec) {
                 cur = 0;
             }
             double ls = 0; uint32_t nt = 0;
-            const uint32_t b0 = cur, b1 = b0 + c.batch < ntr ? b0 + c.batch : ntr;
+            const uint32_t b0 = cur, b1 = cur + c.batch < ntr ? cur + c.batch : ntr;   /* 一批 = c.batch 道题 */
             const double s0 = pt_tick(&c);
-            for (uint32_t b = b0; b < b1; b++) { bs[b - b0] = &d.s[ord[b]]; erows += d.s[ord[b]].sn; }
+            for (uint32_t b = b0; b < b1; b++) { bs[b - b0] = &d.s[ord[b]]; erows += (uint64_t)d.s[ord[b]].sn; }
             cur = b1; eq += b1 - b0;
             const bool last = c.epoch_tok ? erows >= c.epoch_tok : cur >= ntr;   /* 本轮最后一批 */
             if (!pt_run_list(e, &c, &r, bs, b1 - b0, 1, &ls, &nt, NULL, NULL)) goto out;   /* 一批的题装包后逐包过, 梯度照旧攒到批末 */
@@ -332,7 +306,7 @@ int ds4_engine_ptrain(ds4_engine *e, const char *spec) {
             if (step % 10 == 0 || last)
                 fprintf(stderr, "ds4: [ptrain] 轮 %u 步 %u: 批 KL %.4f, 梯度范数 %.3g%s, %.0f s, 可用内存 %ld MB(暂存 %.0f MB)\n", ep, step, nt ? ls / nt : 0.0, gn,
                         gs < 1.f ? "(裁剪)" : "", now_sec() - t0, mem, (double)ds4_gpu_v41_scratch_bytes() / 1048576.0);
-            if (c.max_steps && step >= c.max_steps) {
+            if (c.max_steps && (step >= c.max_steps || last)) {   /* 轮先跑完也收: 计时模式不评估不存盘(10-09 实撞: 合并后一轮 63 步 < 67, 白跑了评估/探针/采样 13 分钟) */
                 pt_prof_print(&r, "终");
                 fprintf(stderr, "ds4: [ptrain] max_steps=%u 到了: 计时模式退出(不评估不存盘, 产物不能挂), 共 %.0f s\n", c.max_steps, now_sec() - t0);
                 rc = 0; goto out;
@@ -342,35 +316,24 @@ int ds4_engine_ptrain(ds4_engine *e, const char *spec) {
         double kt = 0, gain = 0, se = 0;
         if (!pt_eval(e, &c, &r, &d, 1, UINT32_MAX, &kl, 0, ev_cur, ev_m) || !pt_eval(e, &c, &r, &d, 0, 64, &kt, 0, NULL, NULL) ||
             !pt_eval(e, &c, &r, &d, 1, UINT32_MAX, &kh, 1, NULL, NULL)) goto out;
-        const bool paired = have0 || ep > 1;   /* 没有第 0 步基线时第 1 轮没得配对(eval0=0 的趟: 与上一趟末比在脚本里做, heldout_eNN.tsv 照落) */
-        if (paired) pt_paired_gain(ev_prev, ev_cur, ev_m, nev, &gain, &se);
+        pt_paired_gain(ev_prev, ev_cur, ev_m, nev, &gain, &se);
         qall += eq;
-        if (have0)
-            fprintf(stderr, "ds4: [ptrain] ★轮 %u 末(本轮 %u 题 %llu 行, 累计覆盖 %.2f 遍): 留出 KL %.4f(第 0 步 %.4f, %+.1f%%) / 训练前 64 题 KL %.4f(第 0 步 %.4f) / 保持料留出 KL %.4f(第 0 步 %.4f)★\n",
-                    ep, eq, (unsigned long long)erows, ntr ? (double)qall / (double)ntr : 0.0,
-                    kl, kl_ev0, kl_ev0 > 0 ? (kl / kl_ev0 - 1.0) * 100.0 : 0.0, kt, kl_tr0, kh, kl_h0);
-        else
-            fprintf(stderr, "ds4: [ptrain] ★轮 %u 末(本轮 %u 题 %llu 行, 累计覆盖 %.2f 遍): 留出 KL %.4f / 训练前 64 题 KL %.4f / 保持料留出 KL %.4f(第 0 步没评估, 基线 = 上一趟末)★\n",
-                    ep, eq, (unsigned long long)erows, ntr ? (double)qall / (double)ntr : 0.0, kl, kt, kh);
-        if (paired) fprintf(stderr, "ds4: [ptrain] 轮 %u 留出 KL 较上轮降 %.4f ± %.4f(%u 题逐题配对, %.1f 个标准误; 不到 2 个 = 这轮的进步分不清是学到了还是题目抽样)\n",
-                            ep, gain, se, nev, se > 0 ? gain / se : 0.0);
-        if (nka) {
-            uint32_t nn = 0;
-            if (!pt_eval_anchor(e, &c, &r, &d, &ka, &nn)) goto out;
-            if (have0) fprintf(stderr, "ds4: [ptrain] 轮 %u 锚 KL %.4f(第 0 步 %.4f, %u 份)\n", ep, ka, ka0, nn);
-            else fprintf(stderr, "ds4: [ptrain] 轮 %u 锚 KL %.4f(%u 份; 第 0 步没评估, 起点处恒 0)\n", ep, ka, nn);
-        }
-        if (lf) { fprintf(lf, "epoch %u eval_kl %.5f train_kl %.5f hold_kl %.5f gain %.5f se %.5f nq %u rows %llu anchor_kl %.5f\n", ep, kl, kt, kh, gain, se, eq, (unsigned long long)erows, ka); fflush(lf); }
+        fprintf(stderr, "ds4: [ptrain] ★轮 %u 末(本轮 %u 题 %llu 行, 累计覆盖 %.2f 遍): 留出损失 %.4f(第 0 步 %.4f, %+.1f%%) / 训练前 64 题 %.4f(第 0 步 %.4f) / 保持料留出 KL %.4f(第 0 步 %.4f)★\n",
+                ep, eq, (unsigned long long)erows, ntr ? (double)qall / (double)ntr : 0.0,
+                kl, kl_ev0, kl_ev0 > 0 ? (kl / kl_ev0 - 1.0) * 100.0 : 0.0, kt, kl_tr0, kh, kl_h0);
+        fprintf(stderr, "ds4: [ptrain] 轮 %u 留出损失较上轮降 %.4f ± %.4f(%u 题逐题配对, %.1f 个标准误; 不到 2 个 = 这轮的进步分不清是学到了还是题目抽样)\n",
+                ep, gain, se, nev, se > 0 ? gain / se : 0.0);
+        if (lf) { fprintf(lf, "epoch %u eval_kl %.5f train_kl %.5f hold_kl %.5f gain %.5f se %.5f nq %u rows %llu\n", ep, kl, kt, kh, gain, se, eq, (unsigned long long)erows); fflush(lf); }
         char tag[16]; snprintf(tag, sizeof tag, "e%02u", ep);
         pt_heldout_dump(&c, &d, ev_cur, ev_m, tag);
         snprintf(ck, sizeof ck, "%s/ckpt_e%02u", c.out, ep);
         if (!pt_save_amp(&c, &r, ck)) goto out;
         pt_release("轮末评估");
-        if (!pt_probes(e, &c, &d, base, &uq, ck, tag)) goto out;
+        if (!pt_probes(e, &c, &d, base, ck, tag)) goto out;
         pt_release("轮末探针");
         double *t = ev_prev; ev_prev = ev_cur; ev_cur = t;
     }
-    if (c.epochs) {   /* epochs=0 = 只做第 0 步评估 + 探针(kdfwd 的转移测试), 没训过的 ③ 不落盘(落了只是 init 的一份拷贝) */
+    if (c.epochs) {   /* epochs=0 = 只做第 0 步评估 + 探针, 没训过的 ③ 不落盘(落了只是 init 的一份拷贝) */
         if (!pt_save_amp(&c, &r, c.out)) goto out;
         fprintf(stderr, "ds4: [ptrain] ③ 已落 %s(amp_L%02u..L%02u.bin + base.fnv); 挂法: --zchain ② --posttrain %s\n", c.out, c.layer_lo, c.layer_hi, c.out);
     }
@@ -379,8 +342,6 @@ out:
     if (lf) fclose(lf);
     for (uint32_t k = 0; k < c.probe_n + PT_PROBE_HOLD; k++) free(base[k]);
     free(base); free(ord); free(bs); free(ev_prev); free(ev_cur); free(ev_m);
-    for (uint32_t k = 0; k < uq.n; k++) { free(uq.q[k]); if (uq.ub) free(uq.ub[k]); }
-    free(uq.q); free(uq.ub);
     pt_run_free(&r);
     pt_data_free(&d);
     return rc;

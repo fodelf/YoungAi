@@ -1,14 +1,15 @@
-/* core_ptrain_data.c — 后训练 ③ 第八版的料: 配置、分词、教师 top-K(2026-10-01)。总述见 core_ptrain.h。
+/* core_ptrain_data.c — 后训练 ③ 的料: 配置、jsonl 读取、分词(2026-10-10 收口版; 总述见 core_ptrain.h)。
  *
- * 料的形状(z_nightly_spark.sh kdgen 产出): 清单每行 `<块.txt> <问答.qa> <train|eval> [hard|rft|kl] [权重]`; .qa 是 "#Q\n问题\n#A\n答案\n[#W 数]\n" 的串。
- * hard = 答案是代码算的(账本料): 目标换成答案 token 的 one-hot + 数字位加权(pt_add_sample), 不走教师。
- * rft = 模型自己抽的答案 + 代码结算的奖励(#W 行; 10-04 奖励回路): one-hot × (奖励 − 同题组均值)(pt_rft_group) = REINFORCE 的梯度, 负的往下压;
- * kl = 自采样的锚: 同一串 token 的教师表(教师挂 anchor= 的 ③ = 本轮起点), 全 token 权重 = 清单第 5 列 β。
- * 渲染一律走部署同一个函数(ds4_encode_chat_prompt: BOS <｜User｜>正文 <｜Assistant｜></think>, 无 system、不思考):
- *   学生 = 问题;  教师 = 块正文 + 空行 + 问题;  两边接同一串答案 token + EOS(答案单独分词, 两边逐 id 相同, 位置一一对齐)。
- * 教师的块前缀(同块各题共享的那几千个 token)只预填一次: 按部署的 CED 口径跑完前缀 → 存状态快照 → 每题从快照续算
- * "前缀最后 256 个 token + 问题 + 答案"(这一段跑满解码器, 与生成时提示末块同一种状态)。一题从 3~4 s 降到半秒。 */
+ * 料 = jsonl, 一行一题: {"messages":[{"role":"user","content":"问"},{"role":"assistant","content":"答"}], "context":"材料(可省)"}
+ *   或一行一段原文: {"text":"..."}(unsloth 的 continued pretraining 口径: 不套聊天模板, BOS + 原文 + EOS, 每个 token 都是目标)。
+ *   messages 前面可以多一条 {"role":"system",...}(两边渲染都带); 别的字段一律报错 —— 10-09 那版收 reward/mode/split, 用户 10-10 判为跑偏, 不留口子。
+ *   带 context = 上下文蒸馏(同一份 context 的题共一块, 教师前缀只预填一次); 不带 = 答案 one-hot(交叉熵), 不要教师。
+ *   留出: 问题(text 行: 整段原文)去空白后的 FNV-1a 五取一(措辞没进训练); 保持料(cfg hold=)同规则, 只是教师 = 不看材料的部署态自己。
+ * 渲染一律走部署同一个函数(ds4_encode_chat_prompt: BOS <｜User｜>正文 <｜Assistant｜></think>, 不思考):
+ *   学生 = 问题;  教师 = 材料 + 空行 + 问题;  两边接同一串答案 token + EOS(答案单独分词, 两边逐 id 相同, 位置一一对齐)。
+ * 出错会怎样: 一行坏了整趟停(打行号 + 原因), 不跳过 —— 静默跳过会让"料少了一半"看起来像"没学会"。 */
 #include "core_ptrain.h"
+#include "../common/ds4_json.h"
 #ifndef DS4_NO_GPU
 
 static char *pt_slurp(const char *path) {
@@ -24,13 +25,9 @@ static void pt_rstrip(char *s) { size_t n = strlen(s); while (n && (s[n - 1] == 
 
 bool pt_cfg_load(pt_cfg *c, const char *path) {
     memset(c, 0, sizeof *c);
-    c->layer_lo = c->layer_hi = DS4_N_LAYER - 1u;   /* 第一阶段: 只训末层 */
-    c->rank = 64; c->topk = 64; c->epochs = 2; c->batch = 4; c->maxlen = 1024; c->probe_n = 4; c->probe_tok = 96; c->seed = 1; c->dbg_layer = -1;
-    c->lr = 1e-3f; c->clip = 1.0f; c->init_std = 0.f;
-    c->hard_num = 4.f; c->hard_txt = 0.25f;   /* 一道决策题 ~70 个答案 token 里数字只有 ~10 个: 4 : 0.25 让数字段与叙事段的总权重相当(10-04) */
-    c->rft_scale = 1.f;   /* 奖励单位是百分点收益(一天 ±几个点), 优势 ±1~3 与硬目标的 4 同量级, 不另放大 */
-    c->eval0 = c->probe0 = 1;
-    c->probe_batch = 1; c->sample_batch = 8;
+    c->layer_lo = 0; c->layer_hi = DS4_N_LAYER - 1u;   /* 缺省全层(10-01 子集 1 轮: 全层 −32% 对 L21-39 −26%) */
+    c->rank = 64; c->topk = 64; c->epochs = 3; c->batch = 4; c->maxlen = 1024; c->probe_n = 6; c->probe_tok = 96; c->seed = 1; c->dbg_layer = -1;
+    c->lr = 2e-4f; c->clip = 1.0f; c->init_std = 0.f;
     char *b = pt_slurp(path);
     if (!b) { fprintf(stderr, "ds4: --ptrain 读不了配置 %s\n", path); return false; }
     for (char *ln = strtok(b, "\n"); ln; ln = strtok(NULL, "\n")) {
@@ -42,17 +39,8 @@ bool pt_cfg_load(pt_cfg *c, const char *path) {
         while (*v == ' ') v++;
         if (!strcmp(k, "data")) snprintf(c->data, sizeof c->data, "%s", v);
         else if (!strcmp(k, "out")) snprintf(c->out, sizeof c->out, "%s", v);
+        else if (!strcmp(k, "hold")) snprintf(c->hold, sizeof c->hold, "%s", v);
         else if (!strcmp(k, "init")) snprintf(c->init, sizeof c->init, "%s", v);
-        else if (!strcmp(k, "probe_q")) snprintf(c->probe_q, sizeof c->probe_q, "%s", v);
-        else if (!strcmp(k, "teacher")) snprintf(c->teacher, sizeof c->teacher, "%s", v);
-        else if (!strcmp(k, "anchor")) snprintf(c->anchor, sizeof c->anchor, "%s", v);
-        else if (!strcmp(k, "sample_n")) c->sample_n = (uint32_t)atoi(v);
-        else if (!strcmp(k, "probe_base")) snprintf(c->probe_base, sizeof c->probe_base, "%s", v);
-        else if (!strcmp(k, "eval0")) c->eval0 = (uint32_t)atoi(v);
-        else if (!strcmp(k, "probe0")) c->probe0 = (uint32_t)atoi(v);
-        else if (!strcmp(k, "probe_batch")) c->probe_batch = (uint32_t)atoi(v);
-        else if (!strcmp(k, "sample_batch")) c->sample_batch = (uint32_t)atoi(v);
-        else if (!strcmp(k, "rft_scale")) c->rft_scale = (float)atof(v);
         else if (!strcmp(k, "layers")) { unsigned a = 0, z = 0; if (sscanf(v, "%u-%u", &a, &z) == 2) { c->layer_lo = a; c->layer_hi = z; } else c->layer_lo = c->layer_hi = (uint32_t)atoi(v); }
         else if (!strcmp(k, "rank")) c->rank = (uint32_t)atoi(v);
         else if (!strcmp(k, "topk")) c->topk = (uint32_t)atoi(v);
@@ -72,8 +60,6 @@ bool pt_cfg_load(pt_cfg *c, const char *path) {
         else if (!strcmp(k, "nopack")) c->nopack = (uint32_t)atoi(v);
         else if (!strcmp(k, "dbglayer")) c->dbg_layer = atoi(v);
         else if (!strcmp(k, "poison")) c->poison = (uint32_t)atoi(v);
-        else if (!strcmp(k, "hard_num")) c->hard_num = (float)atof(v);
-        else if (!strcmp(k, "hard_txt")) c->hard_txt = (float)atof(v);
         else if (!strcmp(k, "gclayers")) {
             for (char *q = v, *nx; *q && c->ngcl < 16u; q = nx) {
                 c->gcl[c->ngcl] = (uint32_t)strtoul(q, &nx, 10);
@@ -82,7 +68,7 @@ bool pt_cfg_load(pt_cfg *c, const char *path) {
                 while (*nx == '/' || *nx == ' ') nx++;
             }
         }
-        else if (!strcmp(k, "hccheck")) {   /* 层号用 / 隔开(kdtrain 段的额外配置按逗号拆行, 这里不能用逗号) */
+        else if (!strcmp(k, "hccheck")) {   /* 层号用 / 隔开(脚本的额外配置按逗号拆行, 这里不能用逗号) */
             for (char *q = v, *nx; *q && c->nhcl < 16u; q = nx) {
                 c->hcl[c->nhcl] = (uint32_t)strtoul(q, &nx, 10);
                 if (nx == q) break;
@@ -105,34 +91,22 @@ bool pt_cfg_load(pt_cfg *c, const char *path) {
     return true;
 }
 
-uint32_t pt_userq_load(const char *path, char ***out) {
-    *out = NULL;
-    if (!path[0]) return 0;
-    char *b = pt_slurp(path);
-    if (!b) { fprintf(stderr, "ds4: --ptrain 读不了探针题 %s\n", path); return UINT32_MAX; }
-    uint32_t n = 0;
-    for (char *ln = strtok(b, "\n"); ln; ln = strtok(NULL, "\n")) {
-        pt_rstrip(ln);
-        if (!*ln) continue;
-        char *q = ln[0] == '@' ? pt_slurp(ln + 1) : strdup(ln);   /* "@路径" = 整个文件当一道题(多行提示, 如决策日材料节选 + 问题; 10-03 kdfwd 决策探针) */
-        if (!q) { fprintf(stderr, "ds4: --ptrain 探针题文件 %s 读不了\n", ln + 1); for (uint32_t k = 0; k < n; k++) free((*out)[k]); free(*out); *out = NULL; free(b); return UINT32_MAX; }
-        pt_rstrip(q);
-        *out = realloc(*out, (n + 1) * sizeof **out);
-        (*out)[n++] = q;
+/* 块: 同一份材料一块(名字 = 材料的 FNV, 教师前缀只预填一次); 保持料共一块(hold); 不带材料的普通题共一块(sft); 原文段共一块(text) */
+static uint32_t pt_chunk_of(pt_data *d, const char *ctx, int hold, int raw) {
+    char name[32];
+    if (hold) snprintf(name, sizeof name, "hold");
+    else if (raw) snprintf(name, sizeof name, "text");
+    else if (!ctx[0]) snprintf(name, sizeof name, "sft");
+    else {
+        uint64_t h = 1469598103934665603ull;
+        for (const unsigned char *p = (const unsigned char *)ctx; *p; p++) { h ^= *p; h *= 1099511628211ull; }
+        snprintf(name, sizeof name, "c_%016llx", (unsigned long long)h);
     }
-    free(b);
-    return n;
-}
-
-static uint32_t pt_chunk_id(pt_data *d, const char *path) {
-    for (uint32_t i = 0; i < d->nch; i++) if (!strcmp(d->ch[i].name, path)) return i;
+    for (uint32_t i = 0; i < d->nch; i++) if (!strcmp(d->ch[i].name, name)) return i;
     d->ch = realloc(d->ch, (d->nch + 1) * sizeof *d->ch);
     pt_chunk *c = &d->ch[d->nch];
     memset(c, 0, sizeof *c);
-    c->name = strdup(path); c->text = pt_slurp(path);
-    if (!c->text) { fprintf(stderr, "ds4: --ptrain 读不了块 %s\n", path); return UINT32_MAX; }
-    pt_rstrip(c->text);
-    c->hold = c->text[0] == 0;
+    c->name = strdup(name); c->text = strdup(ctx); c->hold = hold; c->sft = !hold && !ctx[0];
     return d->nch++;
 }
 
@@ -144,140 +118,181 @@ static int32_t *pt_cat(const ds4_tokens *a, const ds4_tokens *b, uint32_t *n) {
     return v;
 }
 
-/* 清单第 4 列: 教师表(0) / hard / rft / kl(见文件头); wt = 这道题的权重(rft: 原始奖励; kl: β; 其余不用) */
-enum { PT_TAG_SOFT = 0, PT_TAG_HARD = 1, PT_TAG_RFT = 2, PT_TAG_KL = 3 };
-static int pt_tag(const char *s) { return !strcmp(s, "hard") ? PT_TAG_HARD : !strcmp(s, "rft") ? PT_TAG_RFT : !strcmp(s, "kl") ? PT_TAG_KL : PT_TAG_SOFT; }
+/* 留出 = 问题去空白后 FNV-1a 五取一: 同一道题不管出现在哪份料、哪一趟, 永远在同一边 */
+static int pt_is_eval(const char *q) {
+    uint64_t h = 1469598103934665603ull;
+    for (const unsigned char *p = (const unsigned char *)q; *p; p++) { if (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t') continue; h ^= *p; h *= 1099511628211ull; }
+    return h % 5u == 0u;
+}
 
-static bool pt_add_sample(ds4_engine *e, const pt_cfg *c, pt_data *d, uint32_t ci, int eval, int tag, float wt, const char *q, const char *a, uint32_t *skipped) {
+/* one-hot 的表(目标 = 序列里答案位的 token 自己, 余量 0): 同一个 KL 核算出来就是 −log p(目标), 梯度 = 交叉熵的; 不进教师缓存 */
+static void pt_fill_onehot(const pt_cfg *c, pt_sample *s) {
+    const uint32_t K = c->topk, m = s->m;
+    s->sft = 1;
+    s->top_id = xmalloc((size_t)m * K * 4); s->top_p = xmalloc((size_t)m * K * 4); s->top_rest = xmalloc((size_t)m * 4);
+    for (uint32_t i = 0; i < m; i++) {
+        for (uint32_t k = 0; k < K; k++) { s->top_id[i * K + k] = k ? -1 : s->sids[s->sa0 + i]; s->top_p[i * K + k] = k ? 0.f : 1.f; }
+        s->top_rest[i] = 0.f;
+    }
+}
+
+/* text 行: BOS + 原文 + EOS, 从第 1 个 token 起每个都是目标。超 maxlen 的按 token 切成连续几段(每段 BOS + ≤ maxlen−1 个 token, EOS 只跟末段),
+ * 各段自成样本、同一边留出(按整段原文算 FNV) —— unsloth 是截到 max_seq_length 丢尾, 这里不丢: 料就是一篇文档一行, 丢尾 = 后半篇白传。 */
+static bool pt_add_text(ds4_engine *e, const pt_cfg *c, pt_data *d, const char *txt) {
+    const uint32_t ci = pt_chunk_of(d, "", 0, 1);
+    const int eval = pt_is_eval(txt);
+    ds4_tokens at = {0};
+    ds4_tokenize_text(e, txt, &at);
+    ds4_tokens_push(&at, ds4_token_eos(e));
+    const uint32_t W = c->maxlen - 1u;
+    for (uint32_t off = 0; off < (uint32_t)at.len; off += W) {
+        const uint32_t m = (uint32_t)at.len - off < W ? (uint32_t)at.len - off : W;
+        d->s = realloc(d->s, (d->ns + 1) * sizeof *d->s);
+        pt_sample *s = &d->s[d->ns++];
+        memset(s, 0, sizeof *s);
+        s->chunk = ci; s->eval = eval; s->raw = 1; s->q = strdup(""); s->a = strdup(""); s->src = 0;
+        s->sn = m + 1u; s->sa0 = 1u; s->m = m;
+        s->sids = xmalloc((size_t)s->sn * 4);
+        s->sids[0] = e->vocab.bos_id;
+        memcpy(s->sids + 1, at.v + off, (size_t)m * 4);
+        s->tids = xmalloc((size_t)s->sn * 4); memcpy(s->tids, s->sids, (size_t)s->sn * 4); s->tn = s->sn; s->ta0 = 1u;
+        pt_fill_onehot(c, s);
+    }
+    ds4_tokens_free(&at);
+    return true;
+}
+
+static bool pt_add_sample(ds4_engine *e, const pt_cfg *c, pt_data *d, int src, const char *sys, const char *ctx, const char *q, const char *a, uint32_t *skipped) {
+    const int hold = src == 1;
+    const uint32_t ci = pt_chunk_of(d, ctx, hold, 0);
     ds4_tokens sp = {0}, tp = {0}, at = {0};
-    ds4_encode_chat_prompt(e, NULL, q, DS4_THINK_NONE, &sp);
-    const size_t tl = strlen(d->ch[ci].text) + strlen(q) + 3;
-    char *tt = xmalloc(tl);
-    if (d->ch[ci].hold) snprintf(tt, tl, "%s", q);   /* 保持料: 教师不看任何材料 = 部署态自己 */
-    else snprintf(tt, tl, "%s\n\n%s", d->ch[ci].text, q);
-    ds4_encode_chat_prompt(e, NULL, tt, DS4_THINK_NONE, &tp);
-    free(tt);
+    ds4_encode_chat_prompt(e, sys, q, DS4_THINK_NONE, &sp);
+    if (ctx[0]) {
+        const size_t tl = strlen(ctx) + strlen(q) + 3;
+        char *tt = xmalloc(tl);
+        snprintf(tt, tl, "%s\n\n%s", ctx, q);
+        ds4_encode_chat_prompt(e, sys, tt, DS4_THINK_NONE, &tp);
+        free(tt);
+    } else ds4_encode_chat_prompt(e, sys, q, DS4_THINK_NONE, &tp);   /* 保持料 / 普通题: 教师提示 = 学生提示 */
     ds4_tokenize_text(e, a, &at);
     ds4_tokens_push(&at, ds4_token_eos(e));
     if ((uint32_t)(sp.len + at.len) > c->maxlen) { (*skipped)++; ds4_tokens_free(&sp); ds4_tokens_free(&tp); ds4_tokens_free(&at); return true; }
     d->s = realloc(d->s, (d->ns + 1) * sizeof *d->s);
     pt_sample *s = &d->s[d->ns++];
     memset(s, 0, sizeof *s);
-    s->chunk = ci; s->eval = eval; s->q = strdup(q); s->a = strdup(a);
+    s->chunk = ci; s->eval = pt_is_eval(q); s->q = strdup(q); s->a = strdup(a); s->src = src;
     s->sids = pt_cat(&sp, &at, &s->sn); s->sa0 = (uint32_t)sp.len;
     s->tids = pt_cat(&tp, &at, &s->tn); s->ta0 = (uint32_t)tp.len;
     s->m = (uint32_t)at.len;
-    if (tag == PT_TAG_HARD || tag == PT_TAG_RFT) {
-        /* ★硬目标★(10-04): 答案是代码算的(账本料), 不该再过"教师信不信"这一道 —— 10-03 实撞: 教师读着规则仍给自己习惯的高目标价 0.5、给规则数字 0.3,
-         * 学生学到的是这个混合, 第 2 轮从没把先验带到新股上。教师表直接写成答案 token 的 one-hot(余量 0), 同一个 KL 核算出来就是 −log p(答案),
-         * 梯度 = 交叉熵的; 不进教师缓存(core_ptrain_teacher.c 跳过 hard 题)。权重: 含数字的 token(决策数字)= hard_num, 其余(格式/理由)= hard_txt。
-         * 自采样(rft)同一张 one-hot, 权重先记原始奖励 r, 全题装完后 pt_rft_group 换成组内优势(同一个核: 权重为负就是把这份答案往下压) */
-        const uint32_t K = c->topk, m = s->m;
-        s->hard = tag == PT_TAG_RFT ? 2 : 1; s->r = wt;
-        s->top_id = xmalloc((size_t)m * K * 4); s->top_p = xmalloc((size_t)m * K * 4); s->top_rest = xmalloc((size_t)m * 4); s->w = xmalloc((size_t)m * 4);
-        for (uint32_t i = 0; i < m; i++) {
-            for (uint32_t k = 0; k < K; k++) { s->top_id[i * K + k] = k ? -1 : s->sids[s->sa0 + i]; s->top_p[i * K + k] = k ? 0.f : 1.f; }
-            s->top_rest[i] = 0.f;
-            size_t len = 0; char *t = ds4_token_text(e, s->sids[s->sa0 + i], &len); int dig = 0;
-            for (size_t j = 0; t && j < len; j++) if (t[j] >= '0' && t[j] <= '9') { dig = 1; break; }
-            free(t);
-            s->w[i] = tag == PT_TAG_RFT ? 0.f : dig ? c->hard_num : c->hard_txt;
-        }
-    } else if (tag == PT_TAG_KL) {   /* 锚: 教师表照算(教师挂 anchor= 的 ③), 全 token 权重 β; 一次性的题, 不进教师缓存 */
-        s->nocache = 1; s->w = xmalloc((size_t)s->m * 4);
-        for (uint32_t i = 0; i < s->m; i++) s->w[i] = wt;
-    }
+    if (d->ch[ci].sft) pt_fill_onehot(c, s);   /* 不带材料: 目标 = 答案 token 本身 */
     ds4_tokens_free(&sp); ds4_tokens_free(&tp); ds4_tokens_free(&at);
     return true;
 }
 
-/* .qa: "#Q" 行起一题, "#A" 行起答案, 各自到下一个标记行为止(可多行) */
-typedef struct { char *p; size_t n, cap; } pt_buf;
-static void pt_buf_line(pt_buf *b, const char *s) {
-    const size_t L = strlen(s), need = b->n + L + 2;
-    if (need > b->cap) { b->cap = need * 2; b->p = realloc(b->p, b->cap); }
-    if (b->n) b->p[b->n++] = '\n';
-    memcpy(b->p + b->n, s, L + 1); b->n += L;
-}
-static bool pt_flush_qa(ds4_engine *e, const pt_cfg *c, pt_data *d, uint32_t ci, int eval, int tag, float wt, pt_buf *q, pt_buf *a, uint32_t *skipped) {
-    bool ok = true;
-    if (q->n && a->n) {
-        pt_rstrip(q->p); pt_rstrip(a->p);
-        if (q->p[0] && a->p[0]) ok = pt_add_sample(e, c, d, ci, eval, tag, wt, q->p, a->p, skipped);
+/* 一行 jsonl → system/context/user/assistant 四串(malloc; 没有的给 ""), 或 text 一串(*txt 非空时另四串都是 ""); 失败时 *err 指向原因(静态串) */
+static bool pt_parse_line(const char *ln, char **sys, char **ctx, char **q, char **a, char **txt, const char **err) {
+    const char *p = ln; char *key = NULL, *role = NULL, *content = NULL;
+    *sys = *ctx = *q = *a = *txt = NULL; *err = "不是 JSON 对象";
+    json_ws(&p);
+    if (*p != '{') return false;
+    p++;
+    for (;;) {
+        json_ws(&p);
+        if (*p == '}') { p++; break; }
+        if (!json_string(&p, &key)) { *err = "键不是字符串"; return false; }
+        json_ws(&p);
+        if (*p != ':') { free(key); *err = "键后面没有冒号"; return false; }
+        p++;
+        if (!strcmp(key, "context")) {
+            if (!json_string(&p, ctx)) { free(key); *err = "context 要是字符串"; return false; }
+        } else if (!strcmp(key, "text")) {
+            if (!json_string(&p, txt)) { free(key); *err = "text 要是字符串"; return false; }
+        } else if (!strcmp(key, "messages")) {
+            json_ws(&p);
+            if (*p != '[') { free(key); *err = "messages 要是数组"; return false; }
+            p++;
+            for (;;) {
+                json_ws(&p);
+                if (*p == ']') { p++; break; }
+                if (*p != '{') { free(key); *err = "messages 的元素要是对象"; return false; }
+                p++; role = content = NULL;
+                for (;;) {
+                    json_ws(&p);
+                    if (*p == '}') { p++; break; }
+                    char *mk = NULL;
+                    if (!json_string(&p, &mk)) { free(key); *err = "message 的键不是字符串"; return false; }
+                    json_ws(&p);
+                    if (*p != ':') { free(key); free(mk); *err = "message 键后面没有冒号"; return false; }
+                    p++;
+                    bool ok = !strcmp(mk, "role") ? json_string(&p, &role) : !strcmp(mk, "content") ? json_string(&p, &content) : false;
+                    if (!ok) { *err = !strcmp(mk, "role") || !strcmp(mk, "content") ? "role/content 要是字符串" : "message 只认 role / content"; free(key); free(mk); return false; }
+                    free(mk);
+                    json_ws(&p);
+                    if (*p == ',') p++;
+                }
+                if (!role || !content) { free(key); *err = "message 缺 role 或 content"; return false; }
+                char **slot = !strcmp(role, "system") ? sys : !strcmp(role, "user") ? q : !strcmp(role, "assistant") ? a : NULL;
+                if (!slot) { free(key); *err = "role 只认 system / user / assistant"; return false; }
+                if (*slot) { free(key); *err = "只收单轮(system 可选 + user + assistant 各一条)"; return false; }
+                *slot = content; free(role); role = content = NULL;
+                json_ws(&p);
+                if (*p == ',') p++;
+            }
+        } else { free(key); *err = "只认 messages / context / text 三个字段(reward/mode/split 10-10 起不收)"; return false; }
+        free(key);
+        json_ws(&p);
+        if (*p == ',') p++;
     }
-    q->n = a->n = 0;
-    if (q->p) q->p[0] = 0;
-    if (a->p) a->p[0] = 0;
-    return ok;
-}
-/* filew = 清单第 5 列(这份问答每题的缺省权重); 答案段后的 "#W 数" 行只管它前面那一题(rft 的奖励按份不同) */
-static bool pt_load_qa(ds4_engine *e, const pt_cfg *c, pt_data *d, uint32_t ci, const char *path, int eval, int tag, float filew, uint32_t *skipped) {
-    char *b = pt_slurp(path);
-    if (!b) { fprintf(stderr, "ds4: --ptrain 读不了问答 %s\n", path); return false; }
-    pt_buf q = {0}, a = {0};
-    int mode = 0;   /* 0 还没进题 / 1 问题段 / 2 答案段 */
-    float wt = filew;
-    bool ok = true;
-    for (char *p = b; ok && p; ) {
-        char *nl = strchr(p, '\n');
-        if (nl) *nl = 0;
-        if (!strcmp(p, "#Q")) { ok = pt_flush_qa(e, c, d, ci, eval, tag, wt, &q, &a, skipped); wt = filew; mode = 1; }
-        else if (!strcmp(p, "#A")) mode = 2;
-        else if (mode == 2 && !strncmp(p, "#W", 2)) wt = (float)atof(p + 2);
-        else if (mode == 1) pt_buf_line(&q, p);
-        else if (mode == 2) pt_buf_line(&a, p);
-        p = nl ? nl + 1 : NULL;
+    json_ws(&p);
+    if (*p) { *err = "行尾有多余内容"; return false; }
+    if (!*sys) *sys = strdup("");
+    if (!*ctx) *ctx = strdup("");
+    if (*txt) {   /* 原文行: 不许再带 messages/context(一行只能是一种料, 混着写说不清目标是什么) */
+        if (*q || *a || (*ctx)[0]) { *err = "text 行不能再带 messages / context"; return false; }
+        pt_rstrip(*txt);
+        if (!(*txt)[0]) { *err = "text 是空的"; return false; }
+        if (!*q) *q = strdup(""); if (!*a) *a = strdup("");
+        return true;
     }
-    if (ok) ok = pt_flush_qa(e, c, d, ci, eval, tag, wt, &q, &a, skipped);
-    free(q.p); free(a.p); free(b);
-    return ok;
+    *txt = strdup("");
+    if (!*q || !*a) { *err = "messages 要有 user 和 assistant"; return false; }
+    pt_rstrip(*q); pt_rstrip(*a); pt_rstrip(*ctx);
+    if (!(*q)[0] || !(*a)[0]) { *err = "问或答是空的"; return false; }
+    return true;
 }
 
-/* ★组内优势★(10-04 奖励回路): 同一道提示抽的 G 份答案互为基线 —— 优势 = 奖励 − 组均值, 全组同分 = 这组没信息(优势 0, 不进训练)。
- * 不除标准差: 组内收益只差 0.1% 时除出来是 ±1 的噪声放大(Dr. GRPO 的理由); 奖励本身就是百分点收益, 量级够。 */
-static void pt_rft_group(pt_data *d, const pt_cfg *c) {
-    uint32_t nr = 0, ng = 0, nz = 0; double sa = 0;
-    uint8_t *done = xmalloc_zeroed(d->ns + 1, 1);
-    for (uint32_t i = 0; i < d->ns; i++) {
-        if (d->s[i].hard != 2 || done[i]) continue;
-        double sum = 0; uint32_t n = 0;
-        for (uint32_t j = i; j < d->ns; j++) if (d->s[j].hard == 2 && !done[j] && !strcmp(d->s[j].q, d->s[i].q)) { sum += d->s[j].r; n++; }
-        const double mean = sum / n; ng++;
-        for (uint32_t j = i; j < d->ns; j++) {
-            pt_sample *s = &d->s[j];
-            if (s->hard != 2 || done[j] || strcmp(s->q, d->s[i].q)) continue;
-            done[j] = 1; nr++;
-            const float A = (float)((s->r - mean) * c->rft_scale);
-            if (A == 0.f) { nz++; free(s->top_id); s->top_id = NULL; continue; }   /* 没表 = 不可训(pt_runnable), 不占步 */
-            for (uint32_t t = 0; t < s->m; t++) s->w[t] = A;
-            /* ★负优势不压 EOS★(10-04 第 0007 次实撞): 答案末位是 pt_add_sample 补的 EOS, 负权重打在它上面 = 教模型"别在这停", 三轮重抽收口 56 → 36 → 22 → 9 份/88,
-             * 答案越写越长、可训样本枯竭。差样本差在数字, 不差在结束; 只把它的数字/叙事往下压, 结束位不动(正优势照常加强 EOS) */
-            if (A < 0.f) s->w[s->m - 1u] = 0.f;
-            sa += fabs((double)A);
+/* 读一份 jsonl(src 0 = data, 1 = hold) */
+static bool pt_load_file(ds4_engine *e, const pt_cfg *c, pt_data *d, const char *path, int src, uint32_t *skipped) {
+    char *b = pt_slurp(path);
+    if (!b) { fprintf(stderr, "ds4: --ptrain 读不了料 %s\n", path); return false; }
+    uint32_t lineno = 0, n0 = d->ns;
+    bool ok = true;
+    for (char *p = b; ok && p && *p; ) {
+        char *nl = strchr(p, '\n');
+        if (nl) *nl = 0;
+        lineno++;
+        const char *q0 = p; while (*q0 == ' ' || *q0 == '\t' || *q0 == '\r') q0++;
+        if (*q0) {
+            char *sys, *ctx, *q, *a, *txt; const char *err;
+            if (!pt_parse_line(p, &sys, &ctx, &q, &a, &txt, &err)) { fprintf(stderr, "ds4: --ptrain %s 第 %u 行: %s\n", path, lineno, err); ok = false; }
+            else if (src == 1 && (ctx[0] || txt[0])) { fprintf(stderr, "ds4: --ptrain %s 第 %u 行: 保持料只收不带 context 的问答(教师 = 部署态自己)\n", path, lineno); ok = false; }
+            else if (txt[0]) ok = pt_add_text(e, c, d, txt);
+            else ok = pt_add_sample(e, c, d, src, sys[0] ? sys : NULL, ctx, q, a, skipped);
+            free(sys); free(ctx); free(q); free(a); free(txt);
         }
+        p = nl ? nl + 1 : NULL;
     }
-    free(done);
-    if (nr) fprintf(stderr, "ds4: [ptrain] 自采样 %u 份 / %u 题(同题互为基线): 权重 = (奖励 − 组均值) × %.2g, |权重| 均值 %.3f, 全组同分跳过 %u 份\n",
-                    nr, ng, (double)c->rft_scale, nr > nz ? sa / (double)(nr - nz) : 0.0, nz);
+    free(b);
+    if (ok) fprintf(stderr, "ds4: [ptrain] %s: %u 行, 收 %u 题\n", path, lineno, d->ns - n0);
+    return ok;
 }
 
 bool pt_data_load(ds4_engine *e, const pt_cfg *c, pt_data *d) {
     memset(d, 0, sizeof *d);
-    char *b = pt_slurp(c->data);
-    if (!b) { fprintf(stderr, "ds4: --ptrain 读不了清单 %s\n", c->data); return false; }
     uint32_t skipped = 0;
-    for (char *ln = strtok(b, "\n"); ln; ln = strtok(NULL, "\n")) {
-        char cp[1024], qp[1024], sp[16], hp[16] = "", wp[32] = "";
-        const int nf = ln[0] == '#' ? 0 : sscanf(ln, "%1023s %1023s %15s %15s %31s", cp, qp, sp, hp, wp);   /* 第 4 列 hard/rft/kl, 第 5 列权重(见文件头) */
-        if (nf < 3) continue;
-        const uint32_t ci = pt_chunk_id(d, cp);
-        if (ci == UINT32_MAX) { free(b); return false; }
-        const int tag = nf >= 4 ? pt_tag(hp) : PT_TAG_SOFT;
-        if (nf >= 4 && tag == PT_TAG_SOFT) { fprintf(stderr, "ds4: --ptrain 清单第 4 列不认识: %s(只认 hard / rft / kl)\n", hp); free(b); return false; }
-        if (!pt_load_qa(e, c, d, ci, qp, !strcmp(sp, "eval"), tag, nf >= 5 ? (float)atof(wp) : 1.f, &skipped)) { free(b); return false; }
-    }
-    free(b);
-    pt_rft_group(d, c);
+    if (!pt_load_file(e, c, d, c->data, 0, &skipped)) return false;
+    if (c->hold[0]) { if (!pt_load_file(e, c, d, c->hold, 1, &skipped)) return false; }
+    else fprintf(stderr, "ds4: ★[ptrain] 没给 hold=(保持料): ③ 在通用问题上没有东西钉着, 10-01 实撞局部性崩 —— 只在故意对照时这么跑★\n");
     /* 每块的公共前缀: 同块各题教师序列逐 id 相同的那一段(封顶到最短提示 −1: 前缀里不许含任何一题自己的问题 token) */
     for (uint32_t ci = 0; ci < d->nch; ci++) {
         const pt_sample *f = NULL; uint32_t lcp = 0;
@@ -290,15 +305,15 @@ bool pt_data_load(ds4_engine *e, const pt_cfg *c, pt_data *d) {
         }
         d->ch[ci].lcp = lcp;
     }
-    uint32_t ne = 0, nh = 0, nr = 0, nk = 0, mx = 0, h[4] = { 0, 0, 0, 0 };   /* 学生序列长度分布: 训练缓冲按 maxlen 行预分配, 定 maxlen 要看尾巴有多长 */
+    uint32_t ne = 0, nsft = 0, nraw = 0, nh = 0, mx = 0, h[4] = { 0, 0, 0, 0 };   /* 学生序列长度分布: 训练缓冲按 maxlen 行预分配, 定 maxlen 要看尾巴有多长 */
     for (uint32_t i = 0; i < d->ns; i++) {
-        ne += d->s[i].eval ? 1u : 0u; nh += d->s[i].hard == 1 ? 1u : 0u; nr += d->s[i].hard == 2 ? 1u : 0u; nk += d->s[i].nocache ? 1u : 0u;
+        ne += d->s[i].eval ? 1u : 0u; nsft += d->s[i].sft && !d->s[i].raw ? 1u : 0u; nraw += d->s[i].raw ? 1u : 0u; nh += d->s[i].src == 1 ? 1u : 0u;
         const uint32_t L = d->s[i].sn;
         if (L > mx) mx = L;
         h[L <= 256u ? 0 : L <= 512u ? 1 : L <= 768u ? 2 : 3]++;
     }
-    fprintf(stderr, "ds4: [ptrain] 料: %u 块, %u 题(训练 %u / 留出 %u; 硬目标 %u, 数字 ×%.2g 其余 ×%.2g; 自采样 %u, 锚 %u), 超 maxlen %u 跳过 %u 题; 长度 ≤256/≤512/≤768/更长 = %u/%u/%u/%u, 最长 %u\n",
-            d->nch, d->ns, d->ns - ne, ne, nh, (double)c->hard_num, (double)c->hard_txt, nr, nk, c->maxlen, skipped, h[0], h[1], h[2], h[3], mx);
+    fprintf(stderr, "ds4: [ptrain] 料: %u 块, %u 题(训练 %u / 留出 %u; 带材料 %u, 不带材料 %u, 原文段 %u, 保持料 %u), 超 maxlen %u 跳过 %u 题; 长度 ≤256/≤512/≤768/更长 = %u/%u/%u/%u, 最长 %u\n",
+            d->nch, d->ns, d->ns - ne, ne, d->ns - nsft - nraw - nh, nsft, nraw, nh, c->maxlen, skipped, h[0], h[1], h[2], h[3], mx);
     return d->ns > 0;
 }
 
@@ -306,7 +321,7 @@ void pt_data_free(pt_data *d) {
     for (uint32_t i = 0; i < d->nch; i++) { free(d->ch[i].name); free(d->ch[i].text); }
     for (uint32_t i = 0; i < d->ns; i++) {
         pt_sample *s = &d->s[i];
-        free(s->q); free(s->a); free(s->sids); free(s->tids); free(s->top_id); free(s->top_p); free(s->top_rest); free(s->w);
+        free(s->q); free(s->a); free(s->sids); free(s->tids); free(s->top_id); free(s->top_p); free(s->top_rest);
     }
     free(d->ch); free(d->s); memset(d, 0, sizeof *d);
 }

@@ -172,7 +172,7 @@ static bool pt_pack_forward(ds4_engine *e, pt_run *r) {
 bool pt_pack_step(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_sample *const *ss, uint32_t nb, int grad, double *loss_each, uint32_t *ntok_each) {
     pt_pack *pk = &r->pk; ds4_v41_state *B = &r->st;
     const ds4_model *mdl = &e->model;
-    const uint32_t E = DS4_N_EMBD, HC = DS4_N_HC, V = DS4_N_VOCAB, TK = c->topk;
+    const uint32_t E = DS4_N_EMBD, HC = DS4_N_HC, V = DS4_N_VOCAB;
     if (!pk->ready || !nb || nb > PT_PACK_MAX) return false;
     uint32_t R = 0, gacc[DS4_MAX_LAYER];
     memset(gacc, 0, sizeof gacc);
@@ -191,17 +191,8 @@ bool pt_pack_step(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_sample *co
     /* 各题答案位的 KL: 教师表逐题上传, 核读第 row 行起 m 行 logits、梯度就地写回那几行(与 pt_step_sample 同一个核同一个缩放) */
     ds4_gpu_tensor *glog[PT_PACK_MAX];
     memset(glog, 0, sizeof glog);
-    for (uint32_t i = 0; ok && i < nb; i++) {
-        const pt_sample *s = ss[i];
-        const uint32_t m = s->m, row = pk->r0[i] + s->sa0 - 1u;
-        const float scale = 1.0f / ((float)m * (float)c->batch);
-        glog[i] = pt_rows(B->logits, row, m, V);
-        ok = glog[i] && ds4_gpu_tensor_write(r->tid, 0, s->top_id, (uint64_t)m * TK * 4) && ds4_gpu_tensor_write(r->tp, 0, s->top_p, (uint64_t)m * TK * 4) &&
-             ds4_gpu_tensor_write(r->trest, 0, s->top_rest, (uint64_t)m * 4) && (!s->w || ds4_gpu_tensor_write(r->tw, 0, s->w, (uint64_t)m * 4)) &&
-             ds4_gpu_bwd_kl_topk_tensor(glog[i], r->loss, B->logits, row, m, V, r->tid, r->tp, r->trest, s->w ? r->tw : NULL, TK, scale) &&
-             ds4_gpu_tensor_read(r->loss, 0, r->loss_h, (uint64_t)m * 4);   /* 读回 = 同步: 下一题再覆盖教师表 */
-        if (ok) { for (uint32_t k = 0; k < m; k++) loss_each[i] += r->loss_h[k]; ntok_each[i] = m; }
-    }
+    for (uint32_t i = 0; ok && i < nb; i++)
+        ok = pt_loss_rows(c, r, B->logits, pk->r0[i] + ss[i]->sa0 - 1u, ss[i], &loss_each[i], &ntok_each[i], &glog[i]);
     const double q2 = pt_tick(c);
     double q3 = q2, q4 = q2;
     if (ok && grad) {   /* 出口: 各题答案行的 g_xn = glog·W_head(其余行 0) → RMSNorm → hc_pre, 整批 R 行; 再逐层往下(按题分段的在层里) */
@@ -292,21 +283,6 @@ bool pt_pack_warm(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d, u
         fprintf(stderr, "ds4: [ptrain] 预热第 %d 包: %u 题 %u 行\n", pass + 1, np, R);
     }
     free(ss);
-    return ok;
-}
-
-/* 锚 KL(10-04 奖励回路): 清单里 kl 行(自采样的锚, 教师 = anchor= 的 ③)上学生对教师的平均 KL, 评估时把逐 token 权重 β 摘掉算裸的(β 只管梯度)。
- * 第 0 步学生就是起点 ⇒ 应 ≈ 0(学生路与挂 ③ 的生成路核不同, 不是严格 0); 之后涨多少 = 奖励把策略推离起点多远 —— "锚守住没有"看这个数。 */
-bool pt_eval_anchor(ds4_engine *e, const pt_cfg *c, pt_run *r, pt_data *d, double *kl, uint32_t *nq) {
-    const pt_sample **ss = xmalloc((size_t)(d->ns + 1) * sizeof *ss);
-    float **w = xmalloc((size_t)(d->ns + 1) * sizeof *w);
-    uint32_t k = 0, nt = 0; double ls = 0;
-    for (uint32_t i = 0; i < d->ns; i++)
-        if (d->s[i].nocache && !d->s[i].eval && pt_runnable(r, &d->s[i])) { ss[k] = &d->s[i]; w[k] = d->s[i].w; d->s[i].w = NULL; k++; }
-    const bool ok = !k || pt_run_list(e, c, r, ss, k, 0, &ls, &nt, NULL, NULL);
-    for (uint32_t i = 0; i < k; i++) ((pt_sample *)ss[i])->w = w[i];
-    free(ss); free(w);
-    *kl = nt ? ls / nt : 0.0; *nq = k;
     return ok;
 }
 

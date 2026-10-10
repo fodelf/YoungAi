@@ -5,7 +5,7 @@
  *   y = MoE(xn) + xn·B·A
  * ⇒ g_xn_exit = g_logits·W_head → RMSNorm 反向 → hc_pre 反向 → hc_post 反向得 g_y → 放大器两件的梯度。
  * 只有答案位(教师给了分布的那 m 行)有梯度: 末层之后没有注意力, 别的行对答案位没有影响。
- * 第二阶段(多层)要逐层重算并穿过注意力/MoE, 在 core_ptrain_layer.c(待写), 本文件的出口段不变。 */
+ * 多层模式逐层重算并穿过注意力/MoE, 在 core_ptrain_layer.c, 本文件的出口段不变。 */
 #include "core_ptrain.h"
 #include "../common/ds4_gr_fnv.h"
 #include <sys/stat.h>
@@ -81,7 +81,7 @@ bool pt_run_alloc(ds4_engine *e, const pt_cfg *c, pt_run *r) {
     r->st.tsave = &r->save;
     const uint32_t TK = c->topk;
     r->tid = v41_alloc((uint64_t)cap * TK * 4, &ok); r->tp = v41_alloc((uint64_t)cap * TK * 4, &ok);
-    r->trest = v41_alloc((uint64_t)cap * 4, &ok); r->tw = v41_alloc((uint64_t)cap * 4, &ok); r->loss = v41_alloc((uint64_t)cap * 4, &ok);
+    r->trest = v41_alloc((uint64_t)cap * 4, &ok); r->loss = v41_alloc((uint64_t)cap * 4, &ok);
     r->gxn = v41_alloc((uint64_t)cap * E * 4, &ok); r->gx = v41_alloc((uint64_t)cap * E * 4, &ok);
     r->ghc = v41_alloc((uint64_t)cap * HC * E * 4, &ok); r->gpre = v41_alloc((uint64_t)cap * HC * 4, &ok);
     r->gy = v41_alloc((uint64_t)cap * E * 4, &ok);
@@ -94,7 +94,7 @@ bool pt_run_alloc(ds4_engine *e, const pt_cfg *c, pt_run *r) {
 void pt_run_free(pt_run *r) {
     pt_pack_free(r);   /* 槽的视图指着批态的缓冲: 先摘槽再放批态 */
     pt_layer_free(r);
-    ds4_gpu_tensor **all[] = { &r->tid, &r->tp, &r->trest, &r->tw, &r->loss, &r->gxn, &r->gx, &r->ghc, &r->gpre, &r->gy, &r->T, &r->gT };
+    ds4_gpu_tensor **all[] = { &r->tid, &r->tp, &r->trest, &r->loss, &r->gxn, &r->gx, &r->ghc, &r->gpre, &r->gy, &r->T, &r->gT };
     for (size_t i = 0; i < sizeof all / sizeof all[0]; i++) if (*all[i]) { ds4_gpu_tensor_free(*all[i]); *all[i] = NULL; }
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
         ds4_gpu_tensor **pl[] = { &r->gA[il], &r->gB[il], &r->mA[il], &r->vA[il], &r->mB[il], &r->vB[il], &r->save.moe_in[il], &r->save.hc_in[il], &r->save.pm_in[il] };
@@ -105,24 +105,32 @@ void pt_run_free(pt_run *r) {
     free(r->loss_h); r->loss_h = NULL;
 }
 
+/* 损失 = 本题答案位的平均 KL(不带材料的题: 表是 one-hot ⇒ 交叉熵); 梯度再除以批大小 ⇒ 一批 = 各题平均的平均(长答案不压过短答案)。
+ * KL 核就地写梯度(读完 logits 就盖掉), 读回损失 = 同步, 之后才能覆盖教师表。 */
+bool pt_loss_rows(const pt_cfg *c, pt_run *r, ds4_gpu_tensor *logits, uint32_t row, const pt_sample *s, double *loss, uint32_t *ntok, ds4_gpu_tensor **glog) {
+    const uint32_t m = s->m, V = DS4_N_VOCAB, TK = c->topk;
+    const float scale = 1.0f / ((float)m * (float)c->batch);
+    *glog = pt_rows(logits, row, m, V);
+    bool ok = *glog && ds4_gpu_tensor_write(r->tid, 0, s->top_id, (uint64_t)m * TK * 4) && ds4_gpu_tensor_write(r->tp, 0, s->top_p, (uint64_t)m * TK * 4) &&
+              ds4_gpu_tensor_write(r->trest, 0, s->top_rest, (uint64_t)m * 4) &&
+              ds4_gpu_bwd_kl_topk_tensor(*glog, r->loss, logits, row, m, V, r->tid, r->tp, r->trest, NULL, TK, scale) &&
+              ds4_gpu_tensor_read(r->loss, 0, r->loss_h, (uint64_t)m * 4);
+    if (ok) { double l = 0; for (uint32_t k = 0; k < m; k++) l += r->loss_h[k]; *loss += l; *ntok += m; }
+    return ok;
+}
+
 bool pt_step_sample(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_sample *s, int grad, double *loss_sum, uint32_t *ntok) {
     ds4_v41_state *st = &r->st;
     const ds4_model *mdl = &e->model;
-    const uint32_t E = DS4_N_EMBD, HC = DS4_N_HC, V = DS4_N_VOCAB, K = r->K, TK = c->topk, m = s->m, r0 = s->sa0 - 1u;
+    const uint32_t E = DS4_N_EMBD, HC = DS4_N_HC, V = DS4_N_VOCAB, K = r->K, m = s->m, r0 = s->sa0 - 1u;
     if (!s->top_id || s->sn > st->cap_tok) return true;   /* 教师没给表(续算块超长)的题不进 */
     const double q0 = pt_tick(c);
     pt_state_reset(st);
     st->ced_skip = 0; st->head_last_only = 0;
     if (!v41_forward(e, st, s->sids, s->sn)) return false;
     const double q1 = pt_tick(c);
-    if (!ds4_gpu_tensor_write(r->tid, 0, s->top_id, (uint64_t)m * TK * 4) || !ds4_gpu_tensor_write(r->tp, 0, s->top_p, (uint64_t)m * TK * 4) ||
-        !ds4_gpu_tensor_write(r->trest, 0, s->top_rest, (uint64_t)m * 4) || (s->w && !ds4_gpu_tensor_write(r->tw, 0, s->w, (uint64_t)m * 4))) return false;
-    /* 损失 = 本题答案位的平均 KL; 梯度再除以批大小 ⇒ 一批 = 各题平均的平均(长答案不压过短答案); 硬目标题再乘逐 token 权重 */
-    const float scale = 1.0f / ((float)m * (float)c->batch);
-    ds4_gpu_tensor *glog = pt_rows(st->logits, r0, m, V);
-    bool ok = glog && ds4_gpu_bwd_kl_topk_tensor(glog, r->loss, st->logits, r0, m, V, r->tid, r->tp, r->trest, s->w ? r->tw : NULL, TK, scale) &&
-              ds4_gpu_tensor_read(r->loss, 0, r->loss_h, (uint64_t)m * 4);
-    if (ok) { for (uint32_t i = 0; i < m; i++) *loss_sum += r->loss_h[i]; *ntok += m; }
+    ds4_gpu_tensor *glog = NULL;
+    bool ok = pt_loss_rows(c, r, st->logits, r0, s, loss_sum, ntok, &glog);
     const double q2 = pt_tick(c);
     double q3 = q2, q4 = q2;
     if (ok && grad && c->layer_lo < DS4_N_LAYER - 1u) {

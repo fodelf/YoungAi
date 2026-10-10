@@ -80,9 +80,9 @@ bool pt_diag(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
     if (!f) { fprintf(stderr, "ds4: [ptrain diag] 写不了 %s\n", path); return false; }
     pt_dtab *with = xmalloc_zeroed(d->ns, sizeof *with), *bare = xmalloc_zeroed(d->ns, sizeof *bare);
     bool ok = true;
-    /* 先挂 ③ 跑一遍, 再把 A 置零(= 部署态, 放大器输出 xn·B·A 恰为 0)跑第二遍 —— 置零不可逆, 顺序不能反 */
+    /* 只诊断料的留出题(不含保持料): 诊断问的是"没见过的问法上材料写进去了多少"。先挂 ③ 跑一遍, 再把 A 置零(= 部署态, 放大器输出 xn·B·A 恰为 0)跑第二遍 —— 置零不可逆, 顺序不能反 */
     for (uint32_t i = 0; ok && i < d->ns; i++)
-        if (d->s[i].top_id && d->s[i].sn <= r->st.cap_tok) ok = pt_diag_student(e, c, r, &d->s[i], &with[i]);
+        if (d->s[i].eval && !d->ch[d->s[i].chunk].hold && d->s[i].top_id && d->s[i].sn <= r->st.cap_tok) ok = pt_diag_student(e, c, r, &d->s[i], &with[i]);
     for (uint32_t il = c->layer_lo; ok && il <= c->layer_hi; il++) ok = ds4_gpu_tensor_fill_f32(r->st.ampA[il], 0.f, (uint64_t)r->K * DS4_N_EMBD);
     for (uint32_t i = 0; ok && i < d->ns; i++) if (with[i].id) ok = pt_diag_student(e, c, r, &d->s[i], &bare[i]);
     if (!ok) fprintf(stderr, "ds4: [ptrain diag] 学生前向失败\n");
@@ -273,5 +273,6 @@ bool pt_pack_check(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) 
             pass1 ? "过" : "没过", pass2 ? "过" : "没过");
     return ok && pass1 && pass2;
 }
+
 #endif /* !DS4_NO_GPU */
 typedef int ds4_core_ptrain_diag_nonempty_tu;
