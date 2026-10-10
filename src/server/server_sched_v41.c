@@ -36,10 +36,12 @@ static void lane_finish(v41_lane *L, int rc) {
     memset(L, 0, sizeof *L);
 }
 
-/* 队列里取一个 job 进空道; begin 失败(请求不合法, 错误响应已发)就直接收尾。返回 false = 没取到(不阻塞时队列空 / 阻塞时服务在停) */
-static bool lane_admit(server *s, v41_lane *lanes, int cap, int *nl, uint64_t *order, bool block) {
+/* 队列里取一个 job 进空道; begin 失败(请求不合法, 错误响应已发)就直接收尾。返回 false = 没取到(不阻塞时队列空 / 阻塞时服务在停)。
+ * 取到的是切侧车任务(server_plugins.c)就不占道, 放进 *sw 交给调度圈: 圈里先停止接新请求, 等在跑的几路收尾再换 */
+static bool lane_admit(server *s, v41_lane *lanes, int cap, int *nl, uint64_t *order, bool block, job **sw) {
     job *j = block ? dequeue(s) : dequeue_try(s);
     if (!j) return false;
+    if (j->sw) { *sw = j; return true; }
     v41_lane *L = NULL;
     for (int i = 0; i < cap && !L; i++) if (!lanes[i].j) L = &lanes[i];
     L->j = j;
@@ -95,8 +97,18 @@ void v41_sched_run(server *s) {
     double t_chunk = 0, t_dec = 0;   /* 时间片账: 上一块预填用时 / 之后解码累计 */
     server_log(DS4_LOG_DEFAULT, "ds4-server: V4.1 并发调度器: 最多 %d 路合批解码, 预填一次一路, 时间片预填/解码各半, 准入 = 余量 ≥ 2 × 预填峰值(常驻 %llu MB/路)",
                cap, (unsigned long long)(ds4_v41_req_resident_bytes() >> 20));
+    job *sw = NULL;   /* 排着的切侧车任务: 有它就不再接新请求 */
     for (;;) {
-        while (nl < cap && lane_admit(s, lanes, cap, &nl, &order, nl == 0)) {}
+        while (!sw && nl < cap && lane_admit(s, lanes, cap, &nl, &order, nl == 0, &sw)) {}
+        if (sw && nl == 0) {
+            /* 一路都不在跑了才换。批态上也挂着插件、还缓存着按老表指针捕获的整步图 —— 关掉重开, 新的批态按新插件装、图重新捕 */
+            ds4_v41_batch_close(b);
+            server_plugins_apply(s, sw); sw = NULL;
+            b = ds4_v41_batch_open(s->engine, 8);
+            if (!b) die("ds4-server: 切换插件后 V4.1 批态重开失败");
+            t_chunk = t_dec = 0;
+            continue;
+        }
         if (nl == 0) break;   /* 阻塞取到 NULL = 服务在停 */
         v41_lane *P = NULL;
         v41_lane *dl[DS4_SERVER_BATCH_LANES]; struct ds4_v41_req *dreq[DS4_SERVER_BATCH_LANES]; int nd = 0;

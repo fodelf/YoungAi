@@ -1,6 +1,7 @@
 /* server_main.c — ds4_server.c 拆分后的生产入口: main() 与信号/服务装配。
  * 其余全部域见同目录 server_*.c; 内部接口在 server_internal.h。 */
 #include "server_internal.h"
+#include "../train/train_internal.h"
 
 #ifndef DS4_SERVER_TEST
 int main(int argc, char **argv) {
@@ -111,6 +112,12 @@ int main(int argc, char **argv) {
     s.ctx_size = cfg.ctx_size;
     s.batch_max = cfg.batch_max;
     s.backend_name = ds4_backend_name(cfg.engine.backend);
+    s.port = cfg.port;
+    {   /* 训练页(GET /train, /api/train/…; src/train/): 根 = 当前目录(--chdir 之后 = 仓库根, 与 web/ 页面同一个约定) */
+        char cwd[1024];
+        if (getcwd(cwd, sizeof cwd)) tr_init(cwd);
+    }
+    server_plugins_init(&s, cfg.engine.model_path);   /* 聊天页热切侧车的钩子(server_plugins.c); 要在 worker 起之前, 它读 s->engine */
     s.mon = mon_open(&s);   /* 监控数据面要先于 worker 存在: worker 一拿到 job 就打点 */
     if (s.batch_max >= 2 && !v41)
         server_log(DS4_LOG_GENERATION,

@@ -86,6 +86,31 @@ static bool v41_state_plugins(ds4_v41_state *st) {
     return false;
 }
 
+/* 服务里热切换 ②③(2026-10-10, 工作台聊天页"切侧车" + 训完挂新 ③): 插件本来就是每个状态创建时从盘上读进来的(上面那个函数),
+ * 所以切换 = 换掉两个目录, 下一个状态就用新的, 113 GB 的底座不用重装。
+ * ★调用方保证此刻没有活着的状态★(服务端在两条请求之间调; 合批的批态先关掉再调): 路由偏置 / 增益覆盖表是进程级的, 而且每次装都是
+ * 先 cudaFree 再 cudaMalloc —— 有请求在跑时换, 它后半段就用错了表, 已捕获的图还会指到释放掉的显存。
+ * 换之前先开一个 16 行的试探状态把新插件真装一遍: 坏目录、③ 的 base.fnv 对不上 ② 都在这里就拒, 不等下一条请求才炸; 拒了换回老目录。
+ * 返回 0 = 已换; -1 = 没换(err 写原因, 细节在服务日志里 —— 装载失败的具体行是 v41_amp_load 打的)。 */
+int ds4_engine_v41_switch_plugins(const char *amp_dir, const char *pt_dir, char *err, size_t errn) {
+    if (g_ds4_v41_draft_amp) { snprintf(err, errn, "挂了草稿器对齐件(--draft-amp), 它绑着当前侧车的指纹, 不能热切"); return -1; }
+    static char *own_amp, *own_pt;   /* 这里 strdup 的那份; 命令行给的指向 argv, 不归这里释放 */
+    const char *old_amp = g_ds4_v41_amp_dir, *old_pt = g_ds4_v41_pt_dir;
+    char *na = (amp_dir && amp_dir[0]) ? strdup(amp_dir) : NULL, *np = (pt_dir && pt_dir[0]) ? strdup(pt_dir) : NULL;
+    g_ds4_v41_amp_dir = na; g_ds4_v41_pt_dir = np;
+    ds4_v41_state st;
+    if (!v41_state_alloc(&st, 16, 16, 2)) {   /* 失败时它自己已经 free 过 */
+        g_ds4_v41_amp_dir = old_amp; g_ds4_v41_pt_dir = old_pt;
+        free(na); free(np);
+        snprintf(err, errn, "新侧车/后训练件挂不上(原因在服务日志), 已保持原来的");
+        return -1;   /* 进程级表此刻可能是半装的: 下一个状态创建时会按老目录整套重装, 不用在这里补 */
+    }
+    v41_state_free(&st);
+    free(own_amp); free(own_pt);
+    own_amp = na; own_pt = np;
+    return 0;
+}
+
 static uint64_t g_v41_state_uid = 0;   /* 状态序号发号器(见 core_v41.h uid) */
 bool v41_state_alloc(ds4_v41_state *st, uint32_t cap, uint32_t ctx, uint32_t logits_rows) {
     memset(st, 0, sizeof *st);
@@ -186,6 +211,52 @@ bool v41_state_shrink(ds4_v41_state *st, uint32_t rcap) {
     return ok;
 }
 
+/* ★收缩态克隆★(2026-10-09, 奖励回路同题多份采样): 同一提示的 G 份采样以前各自预填一遍(20 题 × 8 份 × ~1.0 s = 160 s, 其中 7/8 是重复算),
+ * 现在只预填一份, 收缩后把它的 KV 深拷给其余几份。预填是确定的(同提示两趟逐字节同, 10-06 门), 所以克隆出的 KV 与各自预填的逐字节同。
+ * 只认收缩态(稠密段 / logits 已放、图与反修表已放): 那时状态里剩的全是本请求自己的缓冲, 一个个深拷; 其余指针字段在收缩态里恒 NULL,
+ * 开头就核, 不是 NULL 说明调用顺序错了(漏一个就是两个状态共用一块缓冲, 一个写另一个读到 —— 不报错只出胡话)。
+ * engram 的后台任务与表分片 fd 不拷: 首次前向时懒建(core_v41_engram.c), 共用 fd 会在 free 时关两遍。 */
+static ds4_gpu_tensor *v41_dup(const ds4_gpu_tensor *s, bool *ok) {
+    if (!s || !*ok) return NULL;
+    const uint64_t n = ds4_gpu_tensor_bytes(s);
+    ds4_gpu_tensor *d = v41_alloc(n, ok);
+    if (d && !ds4_gpu_tensor_copy(d, 0, s, 0, n)) *ok = false;
+    return d;
+}
+bool v41_state_clone(ds4_v41_state *dst, const ds4_v41_state *src) {
+    memset(dst, 0, sizeof *dst);
+    if (src->hc || src->logits || src->tok || src->qr || src->iscore || src->cand || src->dgraph || src->tsave || src->ampT || src->snap_on || src->ced_skip) {
+        fprintf(stderr, "ds4: V4.1 状态克隆只认刚收缩的请求态\n"); return false;
+    }
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++)
+        if (src->ampA[il] || src->snap_win[il] || src->snap_cpre_kv[il]) { fprintf(stderr, "ds4: V4.1 状态克隆只认刚收缩的请求态(L%u)\n", il); return false; }
+    *dst = *src;   /* 标量(位置/组数/余行/窗口下界/mainh 账…)整份带过去; 下面把每个自有缓冲换成新拷贝 —— 失败也照样赋 NULL, 不留指向 src 的指针 */
+    dst->uid = ++g_v41_state_uid;   /* 新状态新序号: 合批图按 (指针, uid) 认状态 */
+    dst->ejob = NULL; dst->psamp = NULL; dst->spec_q = NULL;
+    dst->eg_job_s = dst->eg_wait_s = dst->eg_enter_s = 0.0; dst->eg_n = 0;   /* engram 取行账按状态记, 关时打印; 不带 src 的 */
+    for (uint32_t i = 0; i < DS4_V41_MAX_ENGRAM; i++) { dst->eshard[i].fd = -1; dst->eshard[i].dio = 0; dst->eshard[i].size = 0; }
+    bool ok = true;
+    dst->hist = xmalloc((size_t)src->ctx * 4);
+    memcpy(dst->hist, src->hist, (size_t)src->ctx * 4);
+    dst->posg = v41_dup(src->posg, &ok);     dst->ckv = v41_dup(src->ckv, &ok);   dst->csc = v41_dup(src->csc, &ok);
+    dst->pooled = v41_dup(src->pooled, &ok); dst->latent = v41_dup(src->latent, &ok); dst->ktmp = v41_dup(src->ktmp, &ok);
+    dst->iq = v41_dup(src->iq, &ok);         dst->iw = v41_dup(src->iw, &ok);     dst->idx = v41_dup(src->idx, &ok);
+    dst->wintmp = v41_dup(src->wintmp, &ok); dst->mainh = v41_dup(src->mainh, &ok);
+    for (uint32_t k = 0; k < DS4_V41_MAX_ENGRAM; k++) dst->eraw[k] = v41_dup(src->eraw[k], &ok);
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        dst->win[il] = v41_dup(src->win[il], &ok);
+        dst->comp_kv[il] = v41_dup(src->comp_kv[il], &ok); dst->index_k[il] = v41_dup(src->index_k[il], &ok);
+        dst->cpre_kv[il] = v41_dup(src->cpre_kv[il], &ok); dst->cpre_sc[il] = v41_dup(src->cpre_sc[il], &ok);
+        dst->posg_pin[il] = NULL;
+        if (src->posg_pin[il] && ok) {   /* 零拷贝位置槽: 内容每块重写, 不用拷; 收缩态一块最多 cap_tok 个新组 */
+            dst->posg_pin[il] = ds4_gpu_host_alloc((uint64_t)src->cap_tok * 4);
+            if (!dst->posg_pin[il]) ok = false;
+        }
+    }
+    if (!ok) { fprintf(stderr, "ds4: V4.1 状态克隆失败(ctx %u)\n", src->ctx); v41_state_free(dst); }
+    return ok;
+}
+
 /* ★索引打分的草稿按"这一趟走到哪"长, 不按配置的 ctx★(2026-09-22, 用户: "最新的架构 1m 上下文只好 0.89g")
  *
  * iscore [cap_tok][ng] f32 与 cand [cap_tok][ng] u8 是**每次前向都重写**的草稿(核里的行距就是当次的 ng,
@@ -244,6 +315,11 @@ void v41_state_free(ds4_v41_state *st) {
         if (st->posg_pin[il]) { ds4_gpu_host_free(st->posg_pin[il]); st->posg_pin[il] = NULL; }
     }
     free(st->hist); st->hist = NULL;
+}
+#else
+/* 只为让服务端在 -DDS4_NO_GPU 构建里链得上: V4.1 插件只在 GPU 上挂, 这里不是 CPU 实现 */
+int ds4_engine_v41_switch_plugins(const char *amp_dir, const char *pt_dir, char *err, size_t errn) {
+    (void)amp_dir; (void)pt_dir; snprintf(err, errn, "CPU 构建没有 V4.1 插件"); return -1;
 }
 #endif /* !DS4_NO_GPU */
 typedef int ds4_core_v41_state_nonempty_tu;
