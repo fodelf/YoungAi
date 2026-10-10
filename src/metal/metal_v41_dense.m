@@ -125,6 +125,9 @@ int ds4_gpu_v41_grouped_matmul_fp4x32_tensor(ds4_gpu_tensor *low, const void *mo
                                              uint64_t group_dim, uint64_t rank, const ds4_gpu_tensor *heads, uint32_t n_tok, int round_out) {
     return v41_grouped(V41_WT_FP4X32, low, model_map, model_size, weight_offset, n_groups, group_dim, rank, heads, n_tok, round_out, "v41 wo_a fp4x32");
 }
+/* 合批 9~16 行的张量核形态只有 CUDA 有(cuda_v41_q4k_mma.inc.cu); Metal 没有合批路, 开关不起作用 */
+int ds4_gpu_v41_set_multi_rows(int on) { (void)on; return 1; }
+
 int ds4_gpu_v41_matmul_q4k_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
                                   const ds4_gpu_tensor *x, uint32_t n_tok, int round_out) {
     return v41_matmul(V41_WT_Q4K, out, model_map, model_size, weight_offset, in_dim, out_dim, x, n_tok, round_out, "v41 q4k matmul");

@@ -50,6 +50,9 @@ int ds4_gpu_v41_matmul_q4k_tensor(ds4_gpu_tensor *out, const void *model_map, ui
 int ds4_gpu_v41_grouped_matmul_q4k_tensor(ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
                                           uint64_t weight_offset, uint32_t n_groups, uint64_t group_dim,
                                           uint64_t rank, const ds4_gpu_tensor *heads, uint32_t n_tok, int round_out);
+/* 合批开关(2026-10-10): 1 = 接下来的 q4_K 乘法若行数在 9..16, 走张量核小批形态(与解码 GEMV 只差加法次序); 0 = 照旧(9 行起走预填 GEMM)。
+ * 只有合批步(core_v41_multi.c)在一步超 8 行时开、步末关; 没有这条路的后端(Metal)空实现返回 1。 */
+int ds4_gpu_v41_set_multi_rows(int on);
 int ds4_gpu_v41_embed_q4k_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *tokens, const void *model_map,
                                  uint64_t model_size, uint64_t weight_offset, uint64_t n_vocab,
                                  uint32_t n_tok, uint64_t dim);

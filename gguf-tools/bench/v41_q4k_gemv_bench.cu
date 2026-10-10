@@ -24,6 +24,8 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
+#include <cmath>
 #include <cuda_pipeline.h>
 
 #define CK(x) do { cudaError_t e = (x); if (e != cudaSuccess) { printf("CUDA err %s @%d\n", cudaGetErrorString(e), __LINE__); exit(1); } } while (0)
@@ -281,8 +283,11 @@ static void launch(float *o, const uint8_t *w, const void *x, uint32_t in_dim, u
     }
 }
 
+#include "v41_q4k_gemv_bench_mma.cuh"   /* 10-10 张量核小批形态(NT 是 8 的倍数时每个形状多量一遍) */
+
 template <uint32_t NT>
 static void run_nt(int iters, int only_shape, int only_mode) {
+    double tot_mma = 0, tot_mma2 = 0;
     const shape_t shapes[] = {
         {"q_b 32768x1280", 32768, 1280, 40, 1}, {"wo_a(8组之1) 1024x4096", 1024, 4096, 320, 8},
         {"wo_b 5120x8192", 5120, 8192, 40, 1}, {"q_a 1280x5120", 1280, 5120, 40, 1},
@@ -387,6 +392,37 @@ static void run_nt(int iters, int only_shape, int only_mode) {
                    t_pfk * 1e3 / iters, t_dm * 1e3 / iters);
             cudaFree(scr); cudaFree(sink);
         }
+        constexpr uint32_t MT_ = NT % 8u == 0u ? NT / 8u : 1u;   /* NT 不是 8 的倍数时模板也会实例化: 钉成 1, 下面的 if 挡住不跑 */
+        if (NT % 8u == 0u) {   /* 张量核形态: 与跑过的第一种发法比相对误差(只差加法次序, 不要求逐位), 计时含 Σx 小核 */
+            float *xs, *om; CK(cudaMalloc(&xs, (uint64_t)NT * (sh.in_dim / 32u) * 4)); CK(cudaMalloc(&om, on * 4));
+            for (int i = 0; i < 5; i++) launch_mma<MT_>(om, dw[i % ncopy], dx16, xs, sh.in_dim, sh.out_dim);
+            CK(cudaEventRecord(e0));
+            for (int i = 0; i < iters; i++) launch_mma<MT_>(om, dw[i % ncopy], dx16, xs, sh.in_dim, sh.out_dim);
+            CK(cudaEventRecord(e1)); CK(cudaEventSynchronize(e1)); CK(cudaGetLastError());
+            float ms; CK(cudaEventElapsedTime(&ms, e0, e1)); const float um = ms * 1000.f / iters;
+            launch_mma<MT_>(om, dw[0], dx16, xs, sh.in_dim, sh.out_dim); CK(cudaDeviceSynchronize());
+            float *rm = (float *)malloc(on * 4); CK(cudaMemcpy(rm, om, on * 4, cudaMemcpyDeviceToHost));
+            double emax = 0, amax = 0;
+            for (uint64_t i = 0; i < on; i++) { const double e = fabs((double)rm[i] - (double)r[ref][i]); if (e > emax) emax = e; if (fabs(r[ref][i]) > amax) amax = fabs(r[ref][i]); }
+            printf("   张量核 %6.1f us %3.0f GB/s(对最快 %.2fx) | 最大绝对差 %.3g / 最大幅值 %.3g = 相对 %.2e\n", um, mbytes / (um * 1e3), us[best] / um, emax, amax, amax > 0 ? emax / amax : 0.0);
+            tot_mma += um * sh.per_step;
+            free(rm); cudaFree(xs); cudaFree(om);
+        }
+                if (NT % 8u == 0u) {   /* 张量核形态: 与跑过的第一种发法比相对误差(只差加法次序, 不要求逐位), 计时含 Σx 小核 */
+            float *xs, *om; CK(cudaMalloc(&xs, (uint64_t)NT * (sh.in_dim / 32u) * 4)); CK(cudaMalloc(&om, on * 4));
+            for (int i = 0; i < 5; i++) launch_mma2<MT_>(om, dw[i % ncopy], dx16, xs, sh.in_dim, sh.out_dim);
+            CK(cudaEventRecord(e0));
+            for (int i = 0; i < iters; i++) launch_mma2<MT_>(om, dw[i % ncopy], dx16, xs, sh.in_dim, sh.out_dim);
+            CK(cudaEventRecord(e1)); CK(cudaEventSynchronize(e1)); CK(cudaGetLastError());
+            float ms; CK(cudaEventElapsedTime(&ms, e0, e1)); const float um = ms * 1000.f / iters;
+            launch_mma2<MT_>(om, dw[0], dx16, xs, sh.in_dim, sh.out_dim); CK(cudaDeviceSynchronize());
+            float *rm = (float *)malloc(on * 4); CK(cudaMemcpy(rm, om, on * 4, cudaMemcpyDeviceToHost));
+            double emax = 0, amax = 0;
+            for (uint64_t i = 0; i < on; i++) { const double e = fabs((double)rm[i] - (double)r[ref][i]); if (e > emax) emax = e; if (fabs(r[ref][i]) > amax) amax = fabs(r[ref][i]); }
+            printf("   张量核2 %5.1f us %3.0f GB/s(对最快 %.2fx) | 最大绝对差 %.3g / 最大幅值 %.3g = 相对 %.2e\n", um, mbytes / (um * 1e3), us[best] / um, emax, amax, amax > 0 ? emax / amax : 0.0);
+            tot_mma2 += um * sh.per_step;
+            free(rm); cudaFree(xs); cudaFree(om);
+        }
         for (int v = 0; v < NM; v++) if (us[v] < 1e9f) tot[v] += us[v] * sh.per_step;
         best_tot += us[best] * sh.per_step;
         tot_bytes += (double)mbytes * sh.per_step;
@@ -398,6 +434,8 @@ static void run_nt(int iters, int only_shape, int only_mode) {
     printf("== NT=%u 每步合计(按发射次数加权):", NT);
     for (int v = 0; v < NM; v++) if (tot[v] > 0) printf(" %s %.2f /", mname[v], tot[v] / 1e3);
     printf(" 逐形状取最快 %.2f ms, 字节 %.2f GB ⇒ 墙(242 GB/s) %.2f ms\n", best_tot / 1e3, tot_bytes / 1e9, tot_bytes / 242e9 * 1e3);
+    if (tot_mma2 > 0) printf("== NT=%u 张量核第二版每步合计 %.2f ms\n", NT, tot_mma2 / 1e3);
+    if (tot_mma > 0) printf("== NT=%u 张量核形态每步合计 %.2f ms(对逐形状取最快 %.2f ms)\n", NT, tot_mma / 1e3, best_tot / 1e3);
 }
 
 int main(int argc, char **argv) {
@@ -414,7 +452,10 @@ int main(int argc, char **argv) {
     switch (nt) {
         case 1: run_nt<1>(iters, os, om); break; case 2: run_nt<2>(iters, os, om); break; case 3: run_nt<3>(iters, os, om); break;
         case 4: run_nt<4>(iters, os, om); break; case 5: run_nt<5>(iters, os, om); break; case 6: run_nt<6>(iters, os, om); break;
-        default: printf("NT 只支持 1..6\n"); return 1;
+        /* 10-10: 合批解码想把一步的行数从 8 放到 16/32(骨架 GEMV 一步只读一遍权重, 行多了摊薄), 先量 GEMV 随行数涨多少 */
+        case 8: run_nt<8>(iters, os, om); break; case 12: run_nt<12>(iters, os, om); break; case 16: run_nt<16>(iters, os, om); break;
+        case 24: run_nt<24>(iters, os, om); break; case 32: run_nt<32>(iters, os, om); break;
+        default: printf("NT 只支持 1..6 / 8 / 12 / 16 / 24 / 32\n"); return 1;
     }
     return 0;
 }

@@ -24,7 +24,8 @@ typedef struct {
 typedef struct {
     mg_inst g[MG_SLOTS];
     int32_t *tokv, *posv; float *onehot; int32_t *next;   /* pinned: 输入槽 / 各行 argmax 落点(每行 16 B) */
-    ds4_gpu_tensor *amv[DS4_V41_GEMV_MAX_TOK];             /* am 的逐行视图(argmax 核只写自己那块) */
+    ds4_gpu_tensor *amv[DS4_V41_MULTI_MAX];                /* am 的逐行视图(argmax 核只写自己那块); 按批态行数建, 批态最多 DS4_V41_MULTI_MAX 行
+                                                            * (10-10 实撞: 按 8 开而 16 路批态建 16 个, 写穿结构体 ⇒ 统计乱码 + 释放时 double free) */
     uint64_t tick; uint32_t launches, captures, misses;
 } v41_mgraph;
 
@@ -32,7 +33,7 @@ void v41_mgraph_free(ds4_v41_batch *b) {
     v41_mgraph *g = (v41_mgraph *)b->mg;
     if (!g) return;
     for (int i = 0; i < MG_SLOTS; i++) if (g->g[i].exec) ds4_gpu_decode_graph_free(g->g[i].exec);
-    for (uint32_t i = 0; i < DS4_V41_GEMV_MAX_TOK; i++) if (g->amv[i]) ds4_gpu_tensor_free(g->amv[i]);
+    for (uint32_t i = 0; i < DS4_V41_MULTI_MAX; i++) if (g->amv[i]) ds4_gpu_tensor_free(g->amv[i]);
     ds4_gpu_host_free(g->tokv); ds4_gpu_host_free(g->posv); ds4_gpu_host_free(g->onehot); ds4_gpu_host_free(g->next);
     if (g->launches) fprintf(stderr, "ds4: [mgraph] 合批走图 %u 步, 捕获 %u 次, 键不中 %u 次\n", g->launches, g->captures, g->misses);
     free(g); b->mg = NULL;
@@ -73,6 +74,11 @@ static mg_inst *mg_find(v41_mgraph *g, ds4_v41_state **m, const uint32_t *nr, ui
 
 bool v41_multi_graph_ready(ds4_v41_batch *b, ds4_v41_state **m, const uint32_t *nr, uint32_t nm) {
     if (!g_ds4_v41_graph || g_ds4_v41_prof || g_ds4_v41_hook || !nm || nm > b->cap) return false;
+    uint32_t R = 0; for (uint32_t i = 0; i < nm; i++) R += nr[i];
+    if (R > DS4_V41_GEMV_MAX_TOK) return false;   /* 超 8 行稠密段走预填路(按需长暂存), 捕获态不许分配 ⇒ 直发(图的数组也按 8 开) */
+    /* ★稠密段的暂存按整批总行数懒长, 不是按各路行数★(10-10 实撞: 16 路一直 >8 行走 hc mix 三发路, 降到 8 行头一轮就捕获 ⇒
+     * 合一核在捕获态里分配段和暂存 ⇒ 整张图作废、这一轮改直发)。下面各路的 n_direct_n 管不到它, 所以批态自己记一个 */
+    if (R > b->warm_R) return false;
     for (uint32_t i = 0; i < nm; i++) {
         const ds4_v41_state *st = m[i];
         if (st->draft || st->dump_prefix || nr[i] == 0 || nr[i] >= DS4_MTP_MAX_BLOCK + 2u) return false;

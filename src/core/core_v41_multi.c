@@ -18,7 +18,7 @@ void ds4_engine_v41_set_lanes(int on) { g_ds4_v41_lanes = on ? 1 : 0; }
 
 bool v41_batch_alloc(ds4_v41_batch *b, uint32_t cap) {
     memset(b, 0, sizeof *b);
-    if (!cap || cap > DS4_V41_GEMV_MAX_TOK) { fprintf(stderr, "ds4: V4.1 批态行数 %u 超解码小批核路上限 %u\n", cap, DS4_V41_GEMV_MAX_TOK); return false; }
+    if (!cap || cap > DS4_V41_MULTI_MAX) { fprintf(stderr, "ds4: V4.1 批态行数 %u 超合批上限 %u\n", cap, DS4_V41_MULTI_MAX); return false; }
     if (!v41_batch_rows_alloc(&b->rows, cap)) return false;
     b->cap = cap;
     b->am = ds4_gpu_tensor_alloc((uint64_t)cap * 16u);
@@ -72,7 +72,7 @@ void v41_detach(ds4_v41_state *m, v41_rowview *v) {
 
 /* --v41-prof 下的逐段账: 每段后 flush + synchronize 记墙钟(会把总时长撑大, 但各段的比例是对的 —— d0a 那套的口径), 每步打一行。
  * 段: embed / engram / hc 三件 / 注意力投影进 / 缓存段(逐路) / 注意力投影出 / MoE / 出口。 */
-typedef struct { double embed, engram, hc, attn_in, cache[DS4_V41_GEMV_MAX_TOK], attn_out, moe, exit; } v41_mprof;
+typedef struct { double embed, engram, hc, attn_in, cache[DS4_V41_MULTI_MAX], attn_out, moe, exit; } v41_mprof;
 static double mp_tick(double *acc, double t) { if (ds4_gpu_flush_commands()) (void)ds4_gpu_synchronize(); const double n = now_sec(); *acc += n - t; return n; }
 
 /* 前向主体: embed → 40 层 → 出口 logits(R 行)。直发(v41_multi_step)与捕获(core_v41_mgraph.c)共用: 里面没有主机等待/同步拷贝/位置推进。
@@ -111,9 +111,11 @@ bool v41_multi_body(ds4_engine *e, ds4_v41_batch *b, ds4_v41_state **m, const ui
         if (ok && !v41_attn_in(e, B, il)) ok = false;
         if (prof) tp = mp_tick(&P.attn_in, tp);
         /* 缓存段各路互不相干 ⇒ 各路一条流(ds4_gpu_lanes_fork; 不可用/关掉/逐段计时时串行), 汇合后才投影出; 捕获态里 fork/join 事件成图的分支 */
-        const int lanes = (ok && g_ds4_v41_lanes && !prof && nm > 1u) ? ds4_gpu_lanes_fork((int)nm) : 0;
+        /* ★超 8 路不分道★(10-10 实测 16 路: 分道 152.9 ms/步 对 不分道 123.3): 道最多 8 条, 多出的路挤在同一条道上, 每层压缩源的位置写入
+         * 在道上要带流同步(ds4_gpu_tensor_write 的 lane 分支), 16 路一步几百次同步; 超 8 路本来就直发不走图, 串行发反而快 */
+        const int lanes = (ok && g_ds4_v41_lanes && !prof && nm > 1u && nm <= DS4_V41_GEMV_MAX_TOK) ? ds4_gpu_lanes_fork((int)nm) : 0;
         for (uint32_t i = 0; ok && i < nm; i++) {
-            if (lanes && !ds4_gpu_lane_begin((int)i)) ok = false;
+            if (lanes && !ds4_gpu_lane_begin((int)(i % (uint32_t)lanes))) ok = false;   /* 道最多 8 条: 超过的路轮流挂, 同一条流上先后跑(按道分的暂存不互踩) */
             if (ok && !v41_attn_cache(e, m[i], il)) ok = false;
             if (lanes) ds4_gpu_lane_end();
             if (prof) tp = mp_tick(&P.cache[i], tp);
@@ -165,12 +167,12 @@ void v41_multi_advance(ds4_v41_state *st, uint32_t n) {
 bool v41_multi_step(ds4_engine *e, ds4_v41_batch *b, ds4_v41_state **m, const int32_t *tok, const uint32_t *rows, uint32_t nm) {
     ds4_v41_state *B = &b->rows;
     const uint32_t HC = DS4_N_HC;
-    uint32_t r0[DS4_V41_GEMV_MAX_TOK], nr[DS4_V41_GEMV_MAX_TOK], R = 0;
+    uint32_t r0[DS4_V41_MULTI_MAX], nr[DS4_V41_MULTI_MAX], R = 0;
     if (!nm || nm > b->cap) { fprintf(stderr, "ds4: V4.1 合批 %u 路超批态 %u\n", nm, b->cap); return false; }
     for (uint32_t i = 0; i < nm; i++) { nr[i] = rows ? rows[i] : 1u; r0[i] = R; R += nr[i]; }
     if (!R || R > b->cap) { fprintf(stderr, "ds4: V4.1 合批 %u 行超批态 %u\n", R, b->cap); return false; }
-    int32_t posv[DS4_V41_GEMV_MAX_TOK];
-    v41_rowview rv[DS4_V41_GEMV_MAX_TOK];
+    int32_t posv[DS4_V41_MULTI_MAX];
+    v41_rowview rv[DS4_V41_MULTI_MAX];
     memset(rv, 0, sizeof rv);
     for (uint32_t i = 0; i < nm; i++) {
         if (m[i]->n_past + nr[i] > m[i]->ctx) { fprintf(stderr, "ds4: V4.1 合批第 %u 路上下文满(%u)\n", i, m[i]->ctx); return false; }
@@ -184,9 +186,13 @@ bool v41_multi_step(ds4_engine *e, ds4_v41_batch *b, ds4_v41_state **m, const in
         else { m[i]->graph = 0; if (!m[i]->no_engram && !v41_engram_prefetch(e, m[i])) ok = false; }   /* 各路自己的行: 盘读与前几层的 GPU 算重叠 */
     }
     if (ok && ds4_gpu_begin_commands() == 0) ok = false;
+    const bool big = R > DS4_V41_GEMV_MAX_TOK;   /* 超 8 行: q4_K 骨架走张量核小批形态(而不是预填 GEMM), 只在这一步里开 */
+    if (big) (void)ds4_gpu_v41_set_multi_rows(1);
     if (ok) ok = v41_multi_body(e, b, m, r0, nr, nm, R);
+    if (big) (void)ds4_gpu_v41_set_multi_rows(0);
     if (ok && (ds4_gpu_end_commands() == 0 || ds4_gpu_synchronize() == 0)) ok = false;
     for (uint32_t i = 0; i < nm; i++) { v41_detach(m[i], &rv[i]); if (ok) v41_multi_advance(m[i], nr[i]); }
+    if (ok && !big && R > b->warm_R) b->warm_R = R;
     if (!ok) fprintf(stderr, "ds4: V4.1 合批前向失败(%u 路 %u 行)\n", nm, R);
     return ok;
 }

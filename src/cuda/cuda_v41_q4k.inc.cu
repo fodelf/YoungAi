@@ -387,6 +387,11 @@ static int v41_q4k_gemm(const void *model_map, uint64_t model_size, uint64_t off
     return 1;
 }
 
+/* 合批 9~16 行的张量核形态, 定义在下一个分片 cuda_v41_q4k_mma.inc.cu(返回 -1 = 不归它, 照旧走下面的路) */
+static int v41_q4k_mma(const void *model_map, uint64_t model_size, uint64_t off, uint64_t in_dim, uint64_t out_dim,
+                       const float *x, uint32_t x_stride, float *out, uint32_t out_stride, uint32_t n_tok,
+                       uint32_t n_groups, uint32_t x_gstride, uint32_t out_gstride, int round_out, const char *what);
+
 /* ---- ds4_gpu_v41.h 契约的 q4_K 三支(命名沿用 v41_* 只为与同一伞头里的既有 API 一致;
  * 按铁律 09-15 新代码不该带版本名, 这是既有欠账, 整族改名时一起处理) ---- */
 int ds4_gpu_v41_matmul_q4k_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
@@ -397,6 +402,11 @@ int ds4_gpu_v41_matmul_q4k_tensor(ds4_gpu_tensor *out, const void *model_map, ui
     if (n_tok <= V41_GEMV_MAX_TOK)
         return v41_q4k_gemv(model_map, model_size, weight_offset, in_dim, out_dim, (const float *)x->ptr, (uint32_t)in_dim,
                             (float *)out->ptr, (uint32_t)out_dim, n_tok, 1u, 0u, 0u, round_out, "v41 q4k gemv");
+    {   /* 合批 9~16 行: 张量核(cuda_v41_q4k_mma.inc.cu; 开关由合批步打开, 其余路径照旧走下面的预填 GEMM) */
+        const int mr = v41_q4k_mma(model_map, model_size, weight_offset, in_dim, out_dim, (const float *)x->ptr, (uint32_t)in_dim,
+                                   (float *)out->ptr, (uint32_t)out_dim, n_tok, 1u, 0u, 0u, round_out, "v41 q4k mma");
+        if (mr >= 0) return mr;
+    }
     if (!v41_q4k_gemm(model_map, model_size, weight_offset, in_dim, out_dim, (const float *)x->ptr,
                       (float *)out->ptr, n_tok, 1u, (uint32_t)in_dim, (uint32_t)out_dim, round_out, "v41 q4k gemm")) return 0;
     return round_out ? ds4_gpu_v41_round_bf16_tensor(out, (uint64_t)n_tok * out_dim) : 1;
@@ -412,6 +422,11 @@ int ds4_gpu_v41_grouped_matmul_q4k_tensor(ds4_gpu_tensor *low, const void *model
         if (group_dim % V41_Q4K_BLK) return 0;
         return v41_q4k_gemv(model_map, model_size, weight_offset, group_dim, rank, (const float *)heads->ptr, (uint32_t)in_all,
                             (float *)low->ptr, (uint32_t)out_all, n_tok, n_groups, (uint32_t)group_dim, (uint32_t)rank, round_out, "v41 wo_a q4k gemv");
+    }
+    {
+        const int mr = v41_q4k_mma(model_map, model_size, weight_offset, group_dim, rank, (const float *)heads->ptr, (uint32_t)in_all,
+                                   (float *)low->ptr, (uint32_t)out_all, n_tok, n_groups, (uint32_t)group_dim, (uint32_t)rank, round_out, "v41 wo_a q4k mma");
+        if (mr >= 0) return mr;
     }
     if (!v41_q4k_gemm(model_map, model_size, weight_offset, group_dim, rank, (const float *)heads->ptr,
                       (float *)low->ptr, n_tok, n_groups, (uint32_t)in_all, (uint32_t)out_all, round_out, "v41 wo_a q4k gemm")) return 0;
