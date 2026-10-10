@@ -10836,3 +10836,6 @@ A = 只在提示里找(Strata 默认索引范围), B = 提示 + 已生成都找;
   模型页下载走镜像: hf 环境自动装进 gguf/hub/.hfenv, probe 读到仓库/体积 ✓ → ★撞 hf_install.sh 用 GNU df 的 -B1/--output=, macOS 报 "need 319 GB more on , only 0 GB free"★ → 改 POSIX df -Pk, 再跑正确拒绝"only 18 GB free on /System/Volumes/Data"(本机盘不够, 行为对)。
   包 240 MB。**Mac 上加载/聊天/训练三段没有机器可验**, 发布说明要写明。
 - 两个包都在各自机器的 dist/(不进 git)。发 GitHub Release 对外, 等用户点头; 代码未提交。
+- **10-10 夜 提交 + Release**(用户: "发 release 和提交代码"): 97 处改动按主题九个 commit(e3ae4e1 ds4_json / 5e304de 监控 / 76d8d10 q4k mma / f0a3e18 --gen-jobs / ab508dd ptrain 收口 / 617ff38 热切 / 33b524b 工作台 C 编排 / 14e4a1c 脚本 / 95bb8f4 文档),
+  推 origin/restructure; tag v0.1.0 → https://github.com/fodelf/YoungAi/releases/tag/v0.1.0 四个附件(linux 265 MB / darwin 240 MB + sha256)。
+  撞: gh 的默认仓库被设成上游 antirez/ds4, 建 release 报"workflow scope", 要 `-R fodelf/YoungAi`; tag 先用 git push 再建。
