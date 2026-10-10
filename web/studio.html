@@ -5,7 +5,9 @@
      不要强硬写起服务就不能训练, 训练时内部就停服务 … 再多一个聊天 tab")。主进程 ds4-train 在 GET / 返回它(模型子进程 ds4-server 也返回, 直接开它能聊)。
      零依赖单文件: 无 CDN、无外部脚本, 离线可用。数据: /api/train/status|runs|run|data|preview + /api/models/* + /v1/chat/completions(主进程转给模型子进程)。
      主进程永远在(10-10 用户), 页面从不断连: 发车 = 主进程停模型子进程 → 训练 → 子进程自动装回来; 换模型同理。页面只看 status.mode 变化。
-     聊天只在模型装着时能发: 训练中显示进度条幅, 没装时给"加载模型"。数据进页面一律走 textContent; 唯一的 innerHTML 是聊天回答的 markdown(先整段转义再加标记)。 -->
+     聊天只在模型装着时能发: 训练中显示进度条幅, 没装时给"加载模型"。数据进页面一律走 textContent; 唯一的 innerHTML 是聊天回答的 markdown(先整段转义再加标记)。
+     语言: 中文 / English, 写法同 monitor.html(静态文字标 data-i18n, 动态文字走 t(key)); 跟浏览器语言, 右上角可切, URL ?lang=en|zh 可强制。
+     选择记在 localStorage 的 ds4.lang, 与监控页共用: 在一页切了, 开另一页也是同一种。后端返回的报错/日志/探针原文照原样显示, 不翻。 -->
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
@@ -203,38 +205,38 @@
 </head>
 <body>
 <aside>
-  <div class="brand"><img src="/logo.jpg" alt=""><span>YoungAi<small>DwarfStar 引擎</small></span></div>
+  <div class="brand"><img src="/logo.jpg" alt=""><span>YoungAi<small data-i18n="brand_sub">DwarfStar 引擎</small></span></div>
   <nav>
-    <a data-tab="chat"><svg class="i" viewBox="0 0 24 24"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z"/></svg><span>聊天</span></a>
-    <a data-tab="models"><svg class="i" viewBox="0 0 24 24"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></svg><span>模型</span><span class="ext" id="nav-dl"></span></a>
-    <a data-tab="train"><svg class="i" viewBox="0 0 24 24"><path d="M3 17l5-5 4 4 8-9"/><path d="M14 7h6v6"/></svg><span>训练</span></a>
-    <a data-tab="data"><svg class="i" viewBox="0 0 24 24"><ellipse cx="12" cy="5.5" rx="8" ry="3"/><path d="M4 5.5v13c0 1.7 3.6 3 8 3s8-1.3 8-3v-13"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg><span>语料</span></a>
-    <a data-tab="runs"><svg class="i" viewBox="0 0 24 24"><path d="M8 6h13M8 12h13M8 18h13"/><circle cx="3.5" cy="6" r="1"/><circle cx="3.5" cy="12" r="1"/><circle cx="3.5" cy="18" r="1"/></svg><span>记录</span></a>
+    <a data-tab="chat"><svg class="i" viewBox="0 0 24 24"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z"/></svg><span data-i18n="tab_chat">聊天</span></a>
+    <a data-tab="models"><svg class="i" viewBox="0 0 24 24"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></svg><span data-i18n="tab_models">模型</span><span class="ext" id="nav-dl"></span></a>
+    <a data-tab="train"><svg class="i" viewBox="0 0 24 24"><path d="M3 17l5-5 4 4 8-9"/><path d="M14 7h6v6"/></svg><span data-i18n="tab_train">训练</span></a>
+    <a data-tab="data"><svg class="i" viewBox="0 0 24 24"><ellipse cx="12" cy="5.5" rx="8" ry="3"/><path d="M4 5.5v13c0 1.7 3.6 3 8 3s8-1.3 8-3v-13"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg><span data-i18n="tab_data">语料</span></a>
+    <a data-tab="runs"><svg class="i" viewBox="0 0 24 24"><path d="M8 6h13M8 12h13M8 18h13"/><circle cx="3.5" cy="6" r="1"/><circle cx="3.5" cy="12" r="1"/><circle cx="3.5" cy="18" r="1"/></svg><span data-i18n="tab_runs">记录</span></a>
     <div class="sep"></div>
-    <a href="/monitor" target="_blank"><svg class="i" viewBox="0 0 24 24"><path d="M3 12h4l3 7 4-14 3 7h4"/></svg><span>监控</span><span class="ext">↗</span></a>
+    <a href="/monitor" target="_blank"><svg class="i" viewBox="0 0 24 24"><path d="M3 12h4l3 7 4-14 3 7h4"/></svg><span data-i18n="nav_monitor">监控</span><span class="ext">↗</span></a>
   </nav>
   <div class="engine">
     <div class="row1"><span class="dot" id="eng-dot"></span><span id="eng-title">连接中</span></div>
     <div class="sub" id="eng-sub">–</div>
-    <button class="primary" id="btn-load" style="display:none">加载模型</button>
+    <button class="primary" id="btn-load" style="display:none" data-i18n="load_model">加载模型</button>
   </div>
 </aside>
 
 <div class="main">
-  <div class="topbar"><h1 id="page-title">聊天</h1><span class="hint" id="page-hint"></span><div class="spacer"></div><span class="muted" id="updated"></span></div>
+  <div class="topbar"><h1 id="page-title">聊天</h1><span class="hint" id="page-hint"></span><div class="spacer"></div><span class="muted" id="updated"></span><button class="ghost" id="lang" title="Language / 语言" style="font-size:12.5px;padding:4px 10px">EN</button></div>
 
   <!-- ============ 聊天 ============ -->
   <section class="view" id="v-chat">
-    <div class="banner" id="chat-banner"><span id="chat-banner-text"></span><div class="bar"><div id="chat-banner-bar"></div></div><button class="primary" id="btn-load2" style="display:none">加载模型</button></div>
+    <div class="banner" id="chat-banner"><span id="chat-banner-text"></span><div class="bar"><div id="chat-banner-bar"></div></div><button class="primary" id="btn-load2" style="display:none" data-i18n="load_model">加载模型</button></div>
     <div class="chat-scroll" id="chat-scroll"><div class="chat-inner" id="chat"></div></div>
     <div class="composer">
       <div class="box">
-        <textarea id="input" rows="1" placeholder="输入消息, Enter 发送, Shift+Enter 换行"></textarea>
+        <textarea id="input" rows="1"></textarea>
         <div class="tools">
-          <select id="plug" style="display:none"></select><label id="pt-sw" class="switch" style="display:none" title="挂/卸自己训出来的后训练件"><input type="checkbox" id="pt-on"><span class="knob"></span> 后训练</label><span class="muted" id="plug-st" style="font-size:12px"></span>
-          <button class="ghost" id="btn-clear" style="font-size:12.5px;padding:4px 9px">清空</button>
+          <select id="plug" style="display:none"></select><label id="pt-sw" class="switch" style="display:none"><input type="checkbox" id="pt-on"><span class="knob"></span><span data-i18n="pt">后训练</span></label><span class="muted" id="plug-st" style="font-size:12px"></span>
+          <button class="ghost" id="btn-clear" style="font-size:12.5px;padding:4px 9px" data-i18n="clear">清空</button>
           <div class="spacer"></div>
-          <button class="primary" id="btn-send">发送</button>
+          <button class="primary" id="btn-send"></button>
         </div>
       </div>
     </div>
@@ -243,18 +245,18 @@
   <!-- ============ 模型 ============ -->
   <section class="view" id="v-models">
     <div class="card" id="m-cur"></div>
-    <div class="card" style="margin-top:16px"><div class="card-title">本机模型 <span id="m-mem" style="text-transform:none;letter-spacing:0;margin-left:auto"></span></div><div class="mgrid" id="m-local"></div></div>
+    <div class="card" style="margin-top:16px"><div class="card-title"><span data-i18n="m_local">本机模型</span> <span id="m-mem" style="text-transform:none;letter-spacing:0;margin-left:auto"></span></div><div class="mgrid" id="m-local"></div></div>
     <div class="card" style="margin-top:16px">
-      <div class="card-title">从 Hugging Face 下载 <a class="lnk" id="m-repo" target="_blank" rel="noopener" style="text-transform:none;letter-spacing:0"></a></div>
+      <div class="card-title"><span data-i18n="m_hub">从 Hugging Face 下载</span> <a class="lnk" id="m-repo" target="_blank" rel="noopener" style="text-transform:none;letter-spacing:0"></a></div>
       <div id="m-items"></div>
       <div class="dlopts">
-        <label class="f">下载源<select id="m-ep"><option value="">Hugging Face 官方</option><option value="https://hf-mirror.com">hf-mirror.com 镜像(国内)</option></select></label>
-        <label class="f" style="flex:1;min-width:240px">本机已有的官方 n-gram 分片目录(填了就不下那 203 GB)<input id="m-eg" placeholder="例如 hf/DeepSeek-V4.1-Flash, 不填就下载"></label>
-        <label class="ck"><input type="checkbox" id="m-noxet"> 不走 Xet 通道(代理总掐连接时勾)</label>
+        <label class="f"><span data-i18n="m_ep">下载源</span><select id="m-ep"><option value="" data-i18n="m_ep_hf">Hugging Face 官方</option><option value="https://hf-mirror.com" data-i18n="m_ep_mirror">hf-mirror.com 镜像(国内)</option></select></label>
+        <label class="f" style="flex:1;min-width:240px"><span data-i18n="m_eg">本机已有的官方 n-gram 分片目录(填了就不下那 203 GB)</span><input id="m-eg" data-i18n-ph="m_eg_ph"></label>
+        <label class="ck"><input type="checkbox" id="m-noxet"><span data-i18n="m_noxet">不走 Xet 通道(代理总掐连接时勾)</span></label>
       </div>
       <div style="display:flex;gap:10px;align-items:center;margin-top:12px">
-        <button class="primary" id="m-dl">下载</button><button class="danger" id="m-cancel" style="display:none">取消下载</button>
-        <span class="muted" id="m-dlnote">断点续传: 中途取消或断网, 再点一次从断点接着下; 每个分片都校验 sha256。</span>
+        <button class="primary" id="m-dl" data-i18n="m_dl">下载</button><button class="danger" id="m-cancel" style="display:none" data-i18n="m_cancel">取消下载</button>
+        <span class="muted" id="m-dlnote"></span>
       </div>
       <pre class="box" id="m-log" style="margin-top:12px;display:none;max-height:200px"></pre>
     </div>
@@ -265,22 +267,22 @@
     <div class="train-grid">
       <div class="cfg">
         <div class="card sec">
-          <div class="card-title" style="margin:0">数据集</div>
+          <div class="card-title" style="margin:0" data-i18n="t_dataset">数据集</div>
           <select id="data"></select>
-          <a class="lnk" data-goto="data">上传或管理语料 →</a>
+          <a class="lnk" data-goto="data" data-i18n="t_manage">上传或管理语料 →</a>
         </div>
         <div class="card sec">
-          <div class="card-title" style="margin:0">超参数</div>
+          <div class="card-title" style="margin:0" data-i18n="t_hparams">超参数</div>
           <div class="two">
-            <label class="f">轮数<input id="epochs" value="3"></label>
-            <label class="f">学习率<input id="lr" value="2e-4"></label>
+            <label class="f"><span data-i18n="t_epochs">轮数</span><input id="epochs" value="3"></label>
+            <label class="f"><span data-i18n="t_lr">学习率</span><input id="lr" value="2e-4"></label>
           </div>
-          <label class="f">训练层<input id="layers" value="0-39"></label>
-          <details><summary>高级(k=v, 逗号分隔)</summary><input id="extra" placeholder="epoch_tok=78000" style="margin-top:8px"></details>
+          <label class="f"><span data-i18n="t_layers">训练层</span><input id="layers" value="0-39"></label>
+          <details><summary data-i18n="t_adv">高级(k=v, 逗号分隔)</summary><input id="extra" placeholder="epoch_tok=78000" style="margin-top:8px"></details>
         </div>
-        <button class="primary go" id="btn-train">开始训练</button>
-        <button class="danger go" id="btn-stop" style="display:none">停止训练</button>
-        <div class="note">开始训练会自动卸下模型(只能装一份), 训完或停止后自动装回来。每轮过一次 wt2 门, 过门的轮里留出损失最低者自动选中。</div>
+        <button class="primary go" id="btn-train" data-i18n="t_start">开始训练</button>
+        <button class="danger go" id="btn-stop" style="display:none" data-i18n="t_stop">停止训练</button>
+        <div class="note" data-i18n="t_note">开始训练会自动卸下模型(只能装一份), 训完或停止后自动装回来。每轮过一次 wt2 门, 过门的轮里留出损失最低者自动选中。</div>
       </div>
       <div class="right">
         <div class="card">
@@ -288,23 +290,23 @@
           <div class="progress"><div id="prog"></div></div>
           <div class="muted" id="cur-sub">–</div>
           <div class="tiles">
-            <div class="tile"><div class="l">批损失</div><div class="v" id="t-loss">–</div><div class="s" id="t-loss-s"></div></div>
-            <div class="tile"><div class="l">留出损失</div><div class="v" id="t-eval">–</div><div class="s" id="t-eval-s"></div></div>
-            <div class="tile"><div class="l">保持料 KL</div><div class="v" id="t-hold">–</div><div class="s" id="t-hold-s"></div></div>
-            <div class="tile"><div class="l">梯度范数</div><div class="v" id="t-gn">–</div><div class="s">裁剪线 1.0</div></div>
-            <div class="tile"><div class="l">可用内存</div><div class="v" id="t-mem">–</div><div class="s">看门狗线 2.5 GB</div></div>
+            <div class="tile"><div class="l" data-i18n="k_loss">批损失</div><div class="v" id="t-loss">–</div><div class="s" id="t-loss-s"></div></div>
+            <div class="tile"><div class="l" data-i18n="k_eval">留出损失</div><div class="v" id="t-eval">–</div><div class="s" id="t-eval-s"></div></div>
+            <div class="tile"><div class="l" data-i18n="k_hold">保持料 KL</div><div class="v" id="t-hold">–</div><div class="s" id="t-hold-s"></div></div>
+            <div class="tile"><div class="l" data-i18n="k_gn">梯度范数</div><div class="v" id="t-gn">–</div><div class="s" data-i18n="k_gn_s">裁剪线 1.0</div></div>
+            <div class="tile"><div class="l" data-i18n="k_mem">可用内存</div><div class="v" id="t-mem">–</div><div class="s" data-i18n="k_mem_s">看门狗线 2.5 GB</div></div>
           </div>
         </div>
         <div class="charts">
-          <div class="card"><div class="card-title">批损失 · 逐步(虚线 = 轮界)</div><canvas id="c-loss"></canvas></div>
-          <div class="card"><div class="card-title">留出损失 / 保持料 KL · 逐轮</div><canvas id="c-eval"></canvas></div>
+          <div class="card"><div class="card-title" data-i18n="c_loss">批损失 · 逐步(虚线 = 轮界)</div><canvas id="c-loss"></canvas></div>
+          <div class="card"><div class="card-title" data-i18n="c_eval">留出损失 / 保持料 KL · 逐轮</div><canvas id="c-eval"></canvas></div>
         </div>
         <div class="card">
-          <div class="card-title">轮次 · wt2 门(Σmin 退 ≤0.5pp 且 KLD 涨 ≤3%)</div>
-          <div style="overflow:auto"><table><thead><tr><th>轮</th><th>留出损失</th><th>训练前64题</th><th>保持料 KL</th><th>较上轮降 ± SE</th><th>Σmin</th><th>Mean KLD</th><th>中位 KLD</th><th>Same top</th><th>门</th></tr></thead><tbody id="ep-rows"></tbody></table></div>
+          <div class="card-title" data-i18n="ep_title">轮次 · wt2 门(Σmin 退 ≤0.5pp 且 KLD 涨 ≤3%)</div>
+          <div style="overflow:auto"><table><thead><tr><th data-i18n="ep_n">轮</th><th data-i18n="k_eval">留出损失</th><th data-i18n="ep_train64">训练前64题</th><th data-i18n="k_hold">保持料 KL</th><th data-i18n="ep_gain">较上轮降 ± SE</th><th>Σmin</th><th>Mean KLD</th><th data-i18n="ep_kldmed">中位 KLD</th><th>Same top</th><th data-i18n="ep_gate">门</th></tr></thead><tbody id="ep-rows"></tbody></table></div>
         </div>
         <div class="card">
-          <div class="card-title"><span class="seg"><button class="on" data-pane="probe">探针原文</button><button data-pane="log">日志</button></span><select id="probe-sel" style="margin-left:auto;font-size:12.5px;padding:4px 8px"></select></div>
+          <div class="card-title"><span class="seg"><button class="on" data-pane="probe" data-i18n="pane_probe">探针原文</button><button data-pane="log" data-i18n="pane_log">日志</button></span><select id="probe-sel" style="margin-left:auto;font-size:12.5px;padding:4px 8px"></select></div>
           <pre class="box" id="pane">–</pre>
         </div>
       </div>
@@ -315,33 +317,172 @@
   <section class="view" id="v-data">
     <div class="drop" id="drop">
       <svg class="i" viewBox="0 0 24 24"><path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg>
-      <div class="big">拖文件到这里, 或点击选择</div>
-      <div class="muted">.jsonl 直接训: 一行一题 {"messages":[user, assistant], "context"?} 或一行一段原文 {"text": "…"} · .txt / .md = 文档, 进料目录后自动成为原文料(&lt;目录&gt;.text.jsonl), 也可以再"出题"成问答料 · 64 MB 以内</div>
+      <div class="big" data-i18n="d_drop">拖文件到这里, 或点击选择</div>
+      <div class="muted" data-i18n="d_drop_sub">.jsonl 直接训: 一行一题 {"messages":[user, assistant], "context"?} 或一行一段原文 {"text": "…"} · .txt / .md = 文档, 进料目录后自动成为原文料(&lt;目录&gt;.text.jsonl), 也可以再"出题"成问答料 · 64 MB 以内</div>
       <input type="file" id="file" multiple style="display:none">
     </div>
     <div class="row" style="display:flex;gap:10px;align-items:center;margin-top:10px">
-      <span class="muted">文档放进料目录:</span><input id="docdir" value="my_docs" style="width:180px"><span class="muted" id="up-msg"></span>
+      <span class="muted" data-i18n="d_docdir">文档放进料目录:</span><input id="docdir" value="my_docs" style="width:180px"><span class="muted" id="up-msg"></span>
     </div>
     <div class="data-grid">
       <div style="display:flex;flex-direction:column;gap:16px">
-        <div class="card"><div class="card-title">训练料(.jsonl)</div><table><thead><tr><th>文件</th><th>行数</th><th>大小</th><th>教师表</th><th></th></tr></thead><tbody id="jsonl-rows"></tbody></table></div>
-        <div class="card"><div class="card-title">文档目录(可选: 出题 → 问答料)</div><table><thead><tr><th>目录</th><th>文档块</th><th>已出题</th><th>轮数</th><th></th></tr></thead><tbody id="dir-rows"></tbody></table>
-          <div class="muted" style="margin-top:8px">文档上传后已经是原文料, 可以直接训; 出题是另一条路(模型读每块文档写问答, 要先卸下服务, 出完自动装回来)。</div></div>
+        <div class="card"><div class="card-title" data-i18n="d_jsonl">训练料(.jsonl)</div><table><thead><tr><th data-i18n="d_file">文件</th><th data-i18n="d_rows">行数</th><th data-i18n="d_size">大小</th><th data-i18n="d_teacher">教师表</th><th></th></tr></thead><tbody id="jsonl-rows"></tbody></table></div>
+        <div class="card"><div class="card-title" data-i18n="d_dirs">文档目录(可选: 出题 → 问答料)</div><table><thead><tr><th data-i18n="d_dir">目录</th><th data-i18n="d_chunks">文档块</th><th data-i18n="d_hasq">已出题</th><th data-i18n="d_rounds">轮数</th><th></th></tr></thead><tbody id="dir-rows"></tbody></table>
+          <div class="muted" style="margin-top:8px" data-i18n="d_dirs_note">文档上传后已经是原文料, 可以直接训; 出题是另一条路(模型读每块文档写问答, 要先卸下服务, 出完自动装回来)。</div></div>
       </div>
-      <div class="card"><div class="card-title">预览 <span id="pv-name" style="text-transform:none;color:var(--text)"></span></div><div class="pv" id="pv"><div class="muted">点左边"预览"看前几行</div></div></div>
+      <div class="card"><div class="card-title"><span data-i18n="d_preview">预览</span> <span id="pv-name" style="text-transform:none;color:var(--text)"></span></div><div class="pv" id="pv"><div class="muted" data-i18n="d_pv_hint">点左边"预览"看前几行</div></div></div>
     </div>
   </section>
 
   <!-- ============ 记录 ============ -->
   <section class="view" id="v-runs">
-    <div class="card"><div class="card-title">全部训练(点一行进训练页查看)</div>
-      <div style="overflow:auto"><table><thead><tr><th>训练</th><th>数据集</th><th>轮 / 层 / lr</th><th>状态</th><th>留出 第0步 → 末</th><th>选中</th><th>开始于</th></tr></thead><tbody id="runs"></tbody></table></div>
+    <div class="card"><div class="card-title" data-i18n="r_title">全部训练(点一行进训练页查看)</div>
+      <div style="overflow:auto"><table><thead><tr><th data-i18n="r_run">训练</th><th data-i18n="t_dataset">数据集</th><th data-i18n="r_cfg">轮 / 层 / lr</th><th data-i18n="r_status">状态</th><th data-i18n="r_eval">留出 第0步 → 末</th><th data-i18n="r_pick">选中</th><th data-i18n="r_started">开始于</th></tr></thead><tbody id="runs"></tbody></table></div>
     </div>
   </section>
 </div>
 <div id="toast"></div>
 
 <script>
+/* ---------------- 语言(同 monitor.html 的写法) ---------------- */
+const I18N = {
+  zh: {
+    title: "YoungAi · DwarfStar", lang_btn: "EN", brand_sub: "DwarfStar 引擎",
+    tab_chat: "聊天", tab_models: "模型", tab_train: "训练", tab_data: "语料", tab_runs: "记录", nav_monitor: "监控",
+    hint_models: "本机模型与侧车, 一键加载; 从 Hugging Face 下载发布包", hint_train: "上下文蒸馏 + 答案 NLL, 写进独立的 ③ 文件", hint_data: "上传问答料、原文料或文档",
+    load_model: "加载模型", pt: "后训练", clear: "清空", send: "发送", stop: "停止", updated: "更新 {0}",
+    eng_unreachable: "连不上", eng_connecting: "连接中", eng_switching: "切换中", eng_switching_sub: "停模型 / 装模型, 稍等", eng_unloading_sub: "卸下当前模型, 稍等",
+    eng_serving: "模型已加载", eng_port: "端口 {0}", eng_loading: "加载模型中", eng_loading_sub: "装完、冒烟过了就能聊",
+    eng_train_gate: "训练中 · wt2 门", eng_training: "训练中", eng_handover: "交接中", eng_train_sub: "训完自动加载模型",
+    eng_lobby: "模型未加载", eng_lobby_sub: "可以直接开始训练", eng_avail: " · 可用 {0} GB",
+    fail: "失败: {0}", not_sent: "请求没发出去: {0}", load_started: "开始加载模型(约 1~2 分钟)",
+    pick_data_first: "先选数据集, 或去语料页上传", train_started: "已开始训练", stop_confirm: "停止训练? 停下后模型会自动装回来。", stopped_toast: "已停止, 模型稍后自动加载",
+    st_running: "进行中", st_done: "完成", st_nopick: "落盘·未选中", st_failed: "失败", st_stopped: "已停",
+    ph_gate: "wt2 门", ph_pick: "落盘 / 选轮", ph_probe: "探针", ph_teacher: "教师表", ph_step0: "第 0 步评估", ph_train: "训练", ph_load: "装载",
+    dur_hm: "{0} 小时 {1} 分", dur_ms: "{0} 分 {1} 秒", dur_s: "{0} 秒",
+    sub_cfg: "数据集 {0} · 层 {1} · lr {2} · batch {3}", sub_ntr: " · 训练题 {0}", sub_prog: "轮 {0}/{1} · 步 {2} · 已用 {3}", sub_eta: " · 训练段约剩 {0}",
+    step_n: "第 {0} 步", step0: "第 0 步", step0_v: "第 0 步 {0}", step0_deploy: "第 0 步(部署态)", picked: "  ★ 选中", gate_pass: "过", gate_fail: "没过", gate_wait: "待门",
+    no_probe: "这趟还没有探针", no_steps: "还没有步", steps_n: "步 {0}", no_eval: "还没有评估", lg_eval: "留出", lg_hold: "保持料", no_runs: "还没有训练过",
+    k_loss: "批损失", k_eval: "留出损失", k_hold: "保持料 KL", k_gn: "梯度范数", k_gn_s: "裁剪线 1.0", k_mem: "可用内存", k_mem_s: "看门狗线 2.5 GB",
+    c_loss: "批损失 · 逐步(虚线 = 轮界)", c_eval: "留出损失 / 保持料 KL · 逐轮",
+    ep_title: "轮次 · wt2 门(Σmin 退 ≤0.5pp 且 KLD 涨 ≤3%)", ep_n: "轮", ep_train64: "训练前64题", ep_gain: "较上轮降 ± SE", ep_kldmed: "中位 KLD", ep_gate: "门",
+    pane_probe: "探针原文", pane_log: "日志",
+    t_dataset: "数据集", t_manage: "上传或管理语料 →", t_hparams: "超参数", t_epochs: "轮数", t_lr: "学习率", t_layers: "训练层", t_adv: "高级(k=v, 逗号分隔)",
+    t_start: "开始训练", t_stop: "停止训练", t_note: "开始训练会自动卸下模型(只能装一份), 训完或停止后自动装回来。每轮过一次 wt2 门, 过门的轮里留出损失最低者自动选中。",
+    d_drop: "拖文件到这里, 或点击选择",
+    d_drop_sub: ".jsonl 直接训: 一行一题 {\"messages\":[user, assistant], \"context\"?} 或一行一段原文 {\"text\": \"…\"} · .txt / .md = 文档, 进料目录后自动成为原文料(<目录>.text.jsonl), 也可以再\"出题\"成问答料 · 64 MB 以内",
+    d_docdir: "文档放进料目录:", d_jsonl: "训练料(.jsonl)", d_file: "文件", d_rows: "行数", d_size: "大小", d_teacher: "教师表",
+    d_dirs: "文档目录(可选: 出题 → 问答料)", d_dir: "目录", d_chunks: "文档块", d_hasq: "已出题", d_rounds: "轮数",
+    d_dirs_note: "文档上传后已经是原文料, 可以直接训; 出题是另一条路(模型读每块文档写问答, 要先卸下服务, 出完自动装回来)。",
+    d_preview: "预览", d_pv_hint: "点左边\"预览\"看前几行", d_opt: "{0} · {1} 行", d_hold: "(保持料, 自动混入)", d_cached: "已缓存", d_first: "首训时算",
+    d_use: "用它训练", d_yes: "有", d_no: "没有", d_gen: "出题", d_gen_started: "开始出题", d_nodirs: "还没有文档目录, 拖 .txt / .md 进上面",
+    pv_loading: "读取中…", pv_text: "原文", pv_q: "问", pv_a: "答", pv_ctx: "材料: {0}", pv_empty: "空文件", pv_err: "读不了: {0}",
+    up_bad: "{0}: 只收 .jsonl / .txt / .md", up_ing: "上传 {0}…", up_ok: "已存 {0}", up_text: " → 原文料 {0}", up_rows: " · {0} 行", up_fail: "{0} 上传失败: {1}",
+    r_title: "全部训练(点一行进训练页查看)", r_run: "训练", r_cfg: "轮 / 层 / lr", r_status: "状态", r_eval: "留出 第0步 → 末", r_pick: "选中", r_started: "开始于",
+    copy: "复制", copied: "已复制", me: "我", thinking: "思考过程", empty_h: "有什么可以帮你?", empty_sub: "请求发往本机 /v1/chat/completions(流式), 对话只存在这个浏览器里。",
+    ph_input: "输入消息, Enter 发送, Shift+Enter 换行", ph_noinput: "模型没装着, 现在不能聊",
+    ban_switch: "正在切换(停模型 / 装模型), 稍等…", ban_train: "模型正在训练{0}, 训完模型自动装回来(新训出的后训练件用开关挂)",
+    ban_loading: "正在加载模型(装完、冒烟过了就能聊), 稍等…", ban_lobby: "模型还没加载(换哪个模型去左边\"模型\"页选)。",
+    server_err: "服务端错误", gen_stopped: "已停止", gen_stats: "{0} token · {1} t/s · 首字 {2} s",
+    dom_finance: "金融", dom_code: "编程", dom_law: "法律", dom_medicine: "医疗", dom_science: "科研", dom_other: "其他", dom_none: "无",
+    mem_ok: "内存装得下(本机 {0} GB)", mem_bad: "内存不够(本机 {0} GB)",
+    m_using: "正在使用", m_sidecar: "侧车: {0}", m_nosc: "不挂侧车(只装基座)", m_pt: " · 后训练: {0}", m_live: " · 侧车可在聊天页直接切, 不用重装",
+    m_busy_train: "训练中, 模型被训练占着", m_busy_load: "正在加载…", m_none: "没有装着的模型", m_next: "下次起服用: {0}", m_next_pt: " + 后训练 {0}",
+    ms_serving: "服务中", ms_training: "训练中", ms_loading: "加载中", ms_lobby: "未加载", m_loadlog: "最近一次加载的日志",
+    m_mem: "本机内存 {0} GB", m_local: "本机模型", m_nolocal: "gguf/ 下还没有模型(≥8 GB 的 .gguf)。在下面从 Hugging Face 下载。",
+    m_pkg: "下载包", m_inuse: "使用中", m_load: "加载", m_engram: "n-gram 表: {0}",
+    m_hub: "从 Hugging Face 下载", m_ep: "下载源", m_ep_hf: "Hugging Face 官方", m_ep_mirror: "hf-mirror.com 镜像(国内)",
+    m_eg: "本机已有的官方 n-gram 分片目录(填了就不下那 203 GB)", m_eg_ph: "例如 hf/DeepSeek-V4.1-Flash, 不填就下载", m_noxet: "不走 Xet 通道(代理总掐连接时勾)",
+    m_dl: "下载", m_cancel: "取消下载", m_dl_resume: "继续下载", m_dl_verify: "重新校验 / 补齐",
+    dl_done: "已下载", dl_prog: "{0} / {1} · {2}%", hub_none: "读不到下载清单(gguf-tools/scripts/hf_install.sh probe 没有输出)",
+    hub_base: "基座模型", hub_base_sub: "{0} · 分 40 片下载, 逐片校验后拼成一个文件", hub_eg: "n-gram 表", hub_eg_sub: "官方 DeepSeek-V4.1-Flash 的第 47、48 片权重, 模型推理要查它",
+    hub_eg_local: "用本机已有: {0}", hub_sc: "领域侧车", hub_sc_sub: "每个约 40 MB, 一起下",
+    dl_ing_speed: "下载中 · {0} MB/s · 约剩 {1}", dl_ing: "下载中…", dl_dest: "(落盘 {0}/, 关掉页面也会继续)", dl_all: "下载齐了, 在上面\"本机模型\"里加载 {0}。",
+    dl_note: "断点续传: 中途取消或断网, 再点一次从断点接着下; 每个分片都校验 sha256。", dl_lastfail: "上次没下完: {0}",
+    dl_started: "开始下载(关掉页面也会继续)", dl_fail: "下载没起来: {0}", dl_cancel_confirm: "取消下载? 已下的部分留着, 下次点下载从断点接着下。", dl_cancelled: "已取消",
+    ld_confirm: "换成 {0}?\n要先卸下当前模型再装新的(大约 2~3 分钟), 期间聊天用不了。", ld_fail: "加载失败: {0}",
+    ld_deferred: "训练中, 不打断: 已记下, 训完按这一套装回来", ld_started: "开始加载(约 2~3 分钟, 装完会打一条冒烟问答)",
+    pl_after: "这条回答结束后切换", pl_fail: "切换失败: {0}", pl_on: "挂着: {0}", pl_newer: "(有更新的: {0}, 关再开换上)", pl_can: "可挂: {0}", pl_tip: "挂/卸自己训出来的后训练件",
+    pl_switching: "切换中…", pl_err: "侧车没切成: {0}", pt_done: "训练完成: {0} 已关联侧车 {1}, 切到它并打开后训练开关即可挂上",
+  },
+  en: {
+    title: "YoungAi · DwarfStar", lang_btn: "中文", brand_sub: "DwarfStar engine",
+    tab_chat: "Chat", tab_models: "Models", tab_train: "Train", tab_data: "Data", tab_runs: "Runs", nav_monitor: "Monitor",
+    hint_models: "Local models and sidecars, one-click load; download the release from Hugging Face", hint_train: "Context distillation + answer NLL, written to a separate ③ file", hint_data: "Upload Q&A data, raw text or documents",
+    load_model: "Load model", pt: "Post-train", clear: "Clear", send: "Send", stop: "Stop", updated: "Updated {0}",
+    eng_unreachable: "Unreachable", eng_connecting: "Connecting", eng_switching: "Switching", eng_switching_sub: "Stopping / loading the model, hold on", eng_unloading_sub: "Unloading the current model, hold on",
+    eng_serving: "Model loaded", eng_port: "port {0}", eng_loading: "Loading model", eng_loading_sub: "Chat opens once it loads and passes the smoke test",
+    eng_train_gate: "Training · wt2 gate", eng_training: "Training", eng_handover: "Handing over", eng_train_sub: "Model reloads when training ends",
+    eng_lobby: "No model loaded", eng_lobby_sub: "You can start training right away", eng_avail: " · {0} GB free",
+    fail: "Failed: {0}", not_sent: "Request not sent: {0}", load_started: "Loading model (about 1–2 min)",
+    pick_data_first: "Pick a dataset first, or upload one on the Data page", train_started: "Training started", stop_confirm: "Stop training? The model reloads automatically afterwards.", stopped_toast: "Stopped; the model will reload shortly",
+    st_running: "Running", st_done: "Done", st_nopick: "Saved · none picked", st_failed: "Failed", st_stopped: "Stopped",
+    ph_gate: "wt2 gate", ph_pick: "Saving / picking epoch", ph_probe: "Probes", ph_teacher: "Teacher cache", ph_step0: "Step-0 eval", ph_train: "Training", ph_load: "Loading",
+    dur_hm: "{0} h {1} min", dur_ms: "{0} min {1} s", dur_s: "{0} s",
+    sub_cfg: "Dataset {0} · layers {1} · lr {2} · batch {3}", sub_ntr: " · {0} training items", sub_prog: "Epoch {0}/{1} · step {2} · elapsed {3}", sub_eta: " · ~{0} left in training",
+    step_n: "Step {0}", step0: "Step 0", step0_v: "Step 0: {0}", step0_deploy: "Step 0 (as deployed)", picked: "  ★ picked", gate_pass: "Pass", gate_fail: "Fail", gate_wait: "Pending",
+    no_probe: "No probes for this run yet", no_steps: "No steps yet", steps_n: "step {0}", no_eval: "No evals yet", lg_eval: "held-out", lg_hold: "retain", no_runs: "No training runs yet",
+    k_loss: "Batch loss", k_eval: "Held-out loss", k_hold: "Retain-set KL", k_gn: "Grad norm", k_gn_s: "clip at 1.0", k_mem: "Free memory", k_mem_s: "watchdog at 2.5 GB",
+    c_loss: "Batch loss · per step (dashed = epoch boundary)", c_eval: "Held-out loss / retain-set KL · per epoch",
+    ep_title: "Epochs · wt2 gate (Σmin drop ≤0.5pp and KLD rise ≤3%)", ep_n: "Epoch", ep_train64: "First 64 train items", ep_gain: "Drop vs prev ± SE", ep_kldmed: "Median KLD", ep_gate: "Gate",
+    pane_probe: "Probe outputs", pane_log: "Log",
+    t_dataset: "Dataset", t_manage: "Upload or manage data →", t_hparams: "Hyperparameters", t_epochs: "Epochs", t_lr: "Learning rate", t_layers: "Layers", t_adv: "Advanced (k=v, comma-separated)",
+    t_start: "Start training", t_stop: "Stop training", t_note: "Starting training unloads the model (only one copy fits) and reloads it when training finishes or stops. Each epoch runs the wt2 gate; among epochs that pass, the lowest held-out loss is picked automatically.",
+    d_drop: "Drop files here, or click to choose",
+    d_drop_sub: ".jsonl trains as-is: one item per line {\"messages\":[user, assistant], \"context\"?} or one passage per line {\"text\": \"…\"} · .txt / .md = documents; they go into a folder and become raw-text data (<folder>.text.jsonl), and can also be turned into Q&A · up to 64 MB",
+    d_docdir: "Document folder:", d_jsonl: "Training data (.jsonl)", d_file: "File", d_rows: "Rows", d_size: "Size", d_teacher: "Teacher cache",
+    d_dirs: "Document folders (optional: generate Q&A)", d_dir: "Folder", d_chunks: "Chunks", d_hasq: "Q&A made", d_rounds: "Rounds",
+    d_dirs_note: "Uploaded documents are already raw-text data and can be trained on directly. Generating Q&A is a separate path (the model reads each chunk and writes questions and answers; the server is unloaded first and reloaded afterwards).",
+    d_preview: "Preview", d_pv_hint: "Click \"Preview\" on the left to see the first rows", d_opt: "{0} · {1} rows", d_hold: " (retain set, mixed in automatically)", d_cached: "Cached", d_first: "Built on first run",
+    d_use: "Train on it", d_yes: "Yes", d_no: "No", d_gen: "Generate Q&A", d_gen_started: "Q&A generation started", d_nodirs: "No document folders yet; drop .txt / .md above",
+    pv_loading: "Loading…", pv_text: "Text", pv_q: "Q", pv_a: "A", pv_ctx: "Context: {0}", pv_empty: "Empty file", pv_err: "Can't read: {0}",
+    up_bad: "{0}: only .jsonl / .txt / .md", up_ing: "Uploading {0}…", up_ok: "Saved {0}", up_text: " → raw text {0}", up_rows: " · {0} rows", up_fail: "{0} upload failed: {1}",
+    r_title: "All runs (click a row to open it on the Train page)", r_run: "Run", r_cfg: "Epochs / layers / lr", r_status: "Status", r_eval: "Held-out step 0 → last", r_pick: "Picked", r_started: "Started",
+    copy: "Copy", copied: "Copied", me: "Me", thinking: "Thinking", empty_h: "How can I help?", empty_sub: "Requests go to this machine's /v1/chat/completions (streaming); the conversation is stored only in this browser.",
+    ph_input: "Type a message; Enter to send, Shift+Enter for a new line", ph_noinput: "No model loaded, can't chat right now",
+    ban_switch: "Switching (stopping / loading the model), hold on…", ban_train: "The model is training{0}; it reloads when training ends (use the switch to attach the new post-train file)",
+    ban_loading: "Loading the model (chat opens once it loads and passes the smoke test), hold on…", ban_lobby: "No model loaded (pick one on the \"Models\" page on the left).",
+    server_err: "Server error", gen_stopped: "Stopped", gen_stats: "{0} tokens · {1} t/s · first token {2} s",
+    dom_finance: "Finance", dom_code: "Code", dom_law: "Law", dom_medicine: "Medicine", dom_science: "Science", dom_other: "Other", dom_none: "None",
+    mem_ok: "Fits in memory ({0} GB here)", mem_bad: "Not enough memory ({0} GB here)",
+    m_using: "In use", m_sidecar: "Sidecar: {0}", m_nosc: "No sidecar (base only)", m_pt: " · post-train: {0}", m_live: " · sidecars can be switched on the Chat page without reloading",
+    m_busy_train: "Training; the model is in use by training", m_busy_load: "Loading…", m_none: "No model loaded", m_next: "Next start uses: {0}", m_next_pt: " + post-train {0}",
+    ms_serving: "Serving", ms_training: "Training", ms_loading: "Loading", ms_lobby: "Not loaded", m_loadlog: "Log of the last load",
+    m_mem: "{0} GB memory", m_local: "Local models", m_nolocal: "No models under gguf/ yet (.gguf ≥8 GB). Download one from Hugging Face below.",
+    m_pkg: "Downloaded", m_inuse: "In use", m_load: "Load", m_engram: "n-gram table: {0}",
+    m_hub: "Download from Hugging Face", m_ep: "Source", m_ep_hf: "Hugging Face (official)", m_ep_mirror: "hf-mirror.com mirror (China)",
+    m_eg: "Existing local folder with the official n-gram shards (fill it in to skip the 203 GB)", m_eg_ph: "e.g. hf/DeepSeek-V4.1-Flash; leave empty to download", m_noxet: "Don't use Xet (tick if your proxy keeps dropping connections)",
+    m_dl: "Download", m_cancel: "Cancel download", m_dl_resume: "Resume download", m_dl_verify: "Re-verify / fill gaps",
+    dl_done: "Downloaded", dl_prog: "{0} / {1} · {2}%", hub_none: "Can't read the download manifest (gguf-tools/scripts/hf_install.sh probe printed nothing)",
+    hub_base: "Base model", hub_base_sub: "{0} · downloaded in 40 shards, each verified, then joined into one file", hub_eg: "n-gram table", hub_eg_sub: "Shards 47 and 48 of the official DeepSeek-V4.1-Flash weights; inference looks things up in it",
+    hub_eg_local: "Using local: {0}", hub_sc: "Domain sidecars", hub_sc_sub: "about 40 MB each, downloaded together",
+    dl_ing_speed: "Downloading · {0} MB/s · ~{1} left", dl_ing: "Downloading…", dl_dest: " (saving to {0}/, keeps going if you close the page)", dl_all: "All downloaded. Load {0} under \"Local models\" above.",
+    dl_note: "Resumable: if you cancel or lose the connection, click again to continue where it stopped; every shard is checked with sha256.", dl_lastfail: "Last download didn't finish: {0}",
+    dl_started: "Download started (keeps going if you close the page)", dl_fail: "Download didn't start: {0}", dl_cancel_confirm: "Cancel the download? What's already downloaded is kept; clicking Download again resumes from there.", dl_cancelled: "Cancelled",
+    ld_confirm: "Switch to {0}?\nThe current model is unloaded first, then the new one is loaded (about 2–3 min); chat is unavailable meanwhile.", ld_fail: "Load failed: {0}",
+    ld_deferred: "Training in progress, not interrupting: noted, this setup will be loaded after training", ld_started: "Loading (about 2–3 min; a smoke-test Q&A runs once it's up)",
+    pl_after: "Will switch after this answer finishes", pl_fail: "Switch failed: {0}", pl_on: "Attached: {0}", pl_newer: " (newer one available: {0}; toggle off and on to use it)", pl_can: "Available: {0}", pl_tip: "Attach / detach the post-train file you trained",
+    pl_switching: "Switching…", pl_err: "Sidecar switch failed: {0}", pt_done: "Training finished: {0} is linked to sidecar {1}; switch to it and turn on Post-train to attach it",
+  },
+};
+const LS_LANG = "ds4.lang";
+function pickLang() {
+  const q = new URLSearchParams(location.search).get("lang");
+  if (q === "en" || q === "zh") return q;
+  try { const v = localStorage.getItem(LS_LANG); if (v === "en" || v === "zh") return v; } catch (_) {}
+  return (navigator.language || "").toLowerCase().startsWith("zh") ? "zh" : "en";
+}
+let lang = pickLang();
+const t = (k, ...a) => { let s = (I18N[lang][k] ?? I18N.zh[k] ?? k); for (let i = 0; i < a.length; i++) s = s.split(`{${i}}`).join(String(a[i])); return s; };
+const locale = () => lang === "zh" ? "zh-CN" : "en-US";
+function applyI18n() {
+  document.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
+  document.title = t("title");
+  for (const el of document.querySelectorAll("[data-i18n]")) el.textContent = t(el.dataset.i18n);
+  for (const el of document.querySelectorAll("[data-i18n-ph]")) el.placeholder = t(el.dataset.i18nPh);
+  $("lang").textContent = t("lang_btn");
+}
+
 const $ = id => document.getElementById(id);
 const text = (id, v) => { $(id).textContent = v == null || v === "" ? "–" : String(v); };
 function node(tag, cls, content) { const el = document.createElement(tag); if (cls) el.className = cls; if (content != null) el.textContent = content; return el; }
@@ -356,13 +497,13 @@ async function getJSON(url, opt) { const r = await fetch(url, Object.assign({ ca
 
 /* ---------------- 状态 ---------------- */
 let status = null, runs = [], detail = null, selected = null, userPicked = false, switching = 0, failCount = 0;
-const TABS = { chat: ["聊天", ""], models: ["模型", "本机模型与侧车, 一键加载; 从 Hugging Face 下载发布包"], train: ["训练", "上下文蒸馏 + 答案 NLL, 写进独立的 ③ 文件"], data: ["语料", "上传问答料、原文料或文档"], runs: ["记录", ""] };
-function curTab() { const h = location.hash.slice(1); return TABS[h] ? h : null; }
-function showTab(t) {
-  document.querySelectorAll("nav a[data-tab]").forEach(a => a.classList.toggle("on", a.dataset.tab === t));
-  document.querySelectorAll(".view").forEach(v => v.classList.toggle("on", v.id === "v-" + t));
-  text("page-title", TABS[t][0]); $("page-hint").textContent = TABS[t][1];
-  if (t === "train") { loadDetail(); } if (t === "data") loadData(); if (t === "chat") inputEl.focus(); if (t === "models") loadModels();
+const TABS = ["chat", "models", "train", "data", "runs"];   /* 标题 = t("tab_<名>"), 副标题 = t("hint_<名>")(没有就空) */
+function curTab() { const h = location.hash.slice(1); return TABS.includes(h) ? h : null; }
+function showTab(tab) {
+  document.querySelectorAll("nav a[data-tab]").forEach(a => a.classList.toggle("on", a.dataset.tab === tab));
+  document.querySelectorAll(".view").forEach(v => v.classList.toggle("on", v.id === "v-" + tab));
+  text("page-title", t("tab_" + tab)); $("page-hint").textContent = I18N.zh["hint_" + tab] ? t("hint_" + tab) : "";
+  if (tab === "train") { loadDetail(); } if (tab === "data") loadData(); if (tab === "chat") inputEl.focus(); if (tab === "models") loadModels();
 }
 document.querySelectorAll("nav a[data-tab]").forEach(a => a.onclick = () => { location.hash = a.dataset.tab; });
 document.querySelectorAll("[data-goto]").forEach(a => a.onclick = () => { location.hash = a.dataset.goto; });
@@ -371,14 +512,14 @@ window.addEventListener("hashchange", () => showTab(curTab() || "chat"));
 function training() { return status && status.busy; }
 function renderEngine() {
   const dot = $("eng-dot"); let title, sub, cls, load = false;
-  if (!status) { cls = failCount > 3 ? "error" : "switching"; title = failCount > 3 ? "连不上" : "连接中"; sub = "–"; }
-  else if (switching && !(status.mode === "serving" || status.mode === "training")) { cls = "switching"; title = "切换中"; sub = "停模型 / 装模型, 稍等"; }
-  else if (switching === 3 && status.mode === "serving") { cls = "switching"; title = "切换中"; sub = "卸下当前模型, 稍等"; }
-  else if (status.mode === "serving") { cls = "serving"; title = "模型已加载"; sub = (mdata && mdata.loaded ? modelName(mdata.loaded.gguf) + " · " : "") + `端口 ${status.port}`; }
-  else if (status.mode === "loading") { cls = "switching"; title = "加载模型中"; sub = "装完、冒烟过了就能聊"; }
-  else if (status.mode === "training") { cls = "training"; title = status.proc.judge ? "训练中 · wt2 门" : status.proc.script ? "训练中" : "交接中"; sub = "训完自动加载模型"; }
-  else { cls = ""; title = "模型未加载"; sub = "可以直接开始训练"; load = true; }
-  dot.className = "dot " + cls; text("eng-title", title); text("eng-sub", sub + (status && status.mem_avail_mb >= 0 ? ` · 可用 ${(status.mem_avail_mb / 1024).toFixed(1)} GB` : ""));
+  if (!status) { cls = failCount > 3 ? "error" : "switching"; title = t(failCount > 3 ? "eng_unreachable" : "eng_connecting"); sub = "–"; }
+  else if (switching && !(status.mode === "serving" || status.mode === "training")) { cls = "switching"; title = t("eng_switching"); sub = t("eng_switching_sub"); }
+  else if (switching === 3 && status.mode === "serving") { cls = "switching"; title = t("eng_switching"); sub = t("eng_unloading_sub"); }
+  else if (status.mode === "serving") { cls = "serving"; title = t("eng_serving"); sub = (mdata && mdata.loaded ? modelName(mdata.loaded.gguf) + " · " : "") + t("eng_port", status.port); }
+  else if (status.mode === "loading") { cls = "switching"; title = t("eng_loading"); sub = t("eng_loading_sub"); }
+  else if (status.mode === "training") { cls = "training"; title = t(status.proc.judge ? "eng_train_gate" : status.proc.script ? "eng_training" : "eng_handover"); sub = t("eng_train_sub"); }
+  else { cls = ""; title = t("eng_lobby"); sub = t("eng_lobby_sub"); load = true; }
+  dot.className = "dot " + cls; text("eng-title", title); text("eng-sub", sub + (status && status.mem_avail_mb >= 0 ? t("eng_avail", (status.mem_avail_mb / 1024).toFixed(1)) : ""));
   $("btn-load").style.display = load && !switching ? "" : "none";
   $("btn-train").style.display = training() ? "none" : ""; $("btn-stop").style.display = training() ? "" : "none";
   $("btn-train").disabled = !!switching && !status;
@@ -393,7 +534,7 @@ async function poll() {
     else if (switching && switching !== 3 && ((switching === 1 && st.mode === "training") || st.mode === "serving")) switching = 0;
     if (!userPicked || !selected) { const r = runs.find(x => x.status === "running"); selected = (r || runs[0] || {}).name || null; }
     renderEngine(); renderRuns(); renderRunPick();
-    text("updated", "更新 " + new Date().toLocaleTimeString());
+    text("updated", t("updated", new Date().toLocaleTimeString(locale())));
     if (curTab() === "train" || curTab() === "chat") await loadDetail();
     if (curTab() === "models" || st.downloading || !mdata) loadModels();   /* 下载中也拉: 侧栏"模型"旁的百分比要跟着走 */
     else if (curTab() === "chat") loadModels(true);   /* 聊天页的侧车下拉与切换状态 */
@@ -403,28 +544,28 @@ async function act(url, body, okMsg, sw) {
   try {
     const r = await getJSON(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
     if (r.ok) { toast(okMsg); if (sw) switching = sw; userPicked = false; }
-    else toast("失败: " + (r.error || ""), true);
+    else toast(t("fail", r.error || ""), true);
     setTimeout(poll, 1200);
     return r.ok;
-  } catch (e) { toast("请求没发出去: " + e, true); return false; }
+  } catch (e) { toast(t("not_sent", e), true); return false; }
 }
 /* 还没选过模型(刚解压的发布包)就去模型页: 直接起服会去找脚本里的默认模型, 新机器上没有那个文件 */
-$("btn-load").onclick = $("btn-load2").onclick = () => mdata && mdata.pick ? act("/api/train/serve", {}, "开始加载模型(约 1~2 分钟)", 2) : (location.hash = "models");
-$("btn-train").onclick = () => { if (!$("data").value) { toast("先选数据集, 或去语料页上传", true); return; }
-  act("/api/train/start", { data: $("data").value, epochs: $("epochs").value, layers: $("layers").value, lr: $("lr").value, extra: $("extra").value }, "已开始训练", 1); };
-$("btn-stop").onclick = () => { if (confirm("停止训练? 停下后模型会自动装回来。")) act("/api/train/stop", {}, "已停止, 模型稍后自动加载", 2); };
+$("btn-load").onclick = $("btn-load2").onclick = () => mdata && mdata.pick ? act("/api/train/serve", {}, t("load_started"), 2) : (location.hash = "models");
+$("btn-train").onclick = () => { if (!$("data").value) { toast(t("pick_data_first"), true); return; }
+  act("/api/train/start", { data: $("data").value, epochs: $("epochs").value, layers: $("layers").value, lr: $("lr").value, extra: $("extra").value }, t("train_started"), 1); };
+$("btn-stop").onclick = () => { if (confirm(t("stop_confirm"))) act("/api/train/stop", {}, t("stopped_toast"), 2); };
 
 /* ---------------- 训练 ---------------- */
-function statusLabel(s) { return { running: ["进行中", "blue"], done: ["完成", "green"], nopick: ["落盘·未选中", "amber"], failed: ["失败", "red"], stopped: ["已停", ""] }[s] || [s, ""]; }
-function phaseOf(r) {
+function statusLabel(s) { const c = { running: "blue", done: "green", nopick: "amber", failed: "red", stopped: "" }; return s in c ? [t("st_" + s), c[s]] : [s, ""]; }
+function phaseOf(r) {   /* 认的是训练日志(中文)的行首关键词, 日志本身不翻, 只翻显示出来的阶段名 */
   if (!r) return "";
   const tail = (r.tail || "").trimEnd().split("\n").pop() || "";
   if (r.status !== "running") return "";
-  if (status && status.proc && status.proc.judge) return "wt2 门";
-  if (/③ 已落/.test(tail)) return "落盘 / 选轮"; if (/探针/.test(tail)) return "探针"; if (/教师/.test(tail)) return "教师表";
-  if (/第 0 步/.test(tail)) return "第 0 步评估"; if (/轮 \d+ 步|轮 \d+ 末/.test(tail)) return "训练"; return "装载";
+  if (status && status.proc && status.proc.judge) return t("ph_gate");
+  if (/③ 已落/.test(tail)) return t("ph_pick"); if (/探针/.test(tail)) return t("ph_probe"); if (/教师/.test(tail)) return t("ph_teacher");
+  if (/第 0 步/.test(tail)) return t("ph_step0"); if (/轮 \d+ 步|轮 \d+ 末/.test(tail)) return t("ph_train"); return t("ph_load");
 }
-function fmtDur(s) { s = Math.max(0, Math.round(s)); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60); return h ? `${h} 小时 ${m} 分` : m ? `${m} 分 ${s % 60} 秒` : `${s} 秒`; }
+function fmtDur(s) { s = Math.max(0, Math.round(s)); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60); return h ? t("dur_hm", h, m) : m ? t("dur_ms", m, s % 60) : t("dur_s", s); }
 function renderRunPick() {
   const sel = $("run-pick"); const names = runs.map(r => r.name).join();
   if (sel.dataset.names !== names) { sel.replaceChildren(); runs.forEach(r => { const o = node("option", null, r.name); o.value = r.name; sel.appendChild(o); }); sel.dataset.names = names; }
@@ -441,36 +582,36 @@ function renderDetail() {
   const [lab, col] = statusLabel(r.status), ph = phaseOf(r); const b = $("cur-badge"); b.className = "badge " + col; b.textContent = ph ? `${lab} · ${ph}` : lab;
   const ep = r.last.ep || 0, per = r.ntr && r.batch ? Math.ceil(r.ntr / Number(r.batch)) : 0, tot = per * Number(r.epochs_cfg || 0);
   $("prog").style.width = tot ? Math.min(100, 100 * r.steps_done / tot) + "%" : (r.status === "done" ? "100%" : "0");
-  let sub = `数据集 ${short(r.data)} · 层 ${r.layers} · lr ${r.lr} · batch ${r.batch}` + (r.ntr ? ` · 训练题 ${r.ntr}` : "");
+  let sub = t("sub_cfg", short(r.data), r.layers, r.lr, r.batch) + (r.ntr ? t("sub_ntr", r.ntr) : "");
   if (r.steps_done) {
-    sub = `轮 ${ep}/${r.epochs_cfg} · 步 ${r.steps_done}${tot ? "/" + tot : ""} · 已用 ${fmtDur(r.last.t)}` +
-          (r.status === "running" && tot && r.steps_done < tot ? ` · 训练段约剩 ${fmtDur(r.last.t / r.steps_done * (tot - r.steps_done))}` : "") + " · " + sub;
+    sub = t("sub_prog", ep, r.epochs_cfg, r.steps_done + (tot ? "/" + tot : ""), fmtDur(r.last.t)) +
+          (r.status === "running" && tot && r.steps_done < tot ? t("sub_eta", fmtDur(r.last.t / r.steps_done * (tot - r.steps_done))) : "") + " · " + sub;
   }
   text("cur-sub", sub);
-  text("t-loss", r.steps_done ? f4(r.last.loss) : null); text("t-loss-s", r.steps_done ? `第 ${r.steps_done} 步` : "");
+  text("t-loss", r.steps_done ? f4(r.last.loss) : null); text("t-loss-s", r.steps_done ? t("step_n", r.steps_done) : "");
   const lastE = r.epochs.length ? r.epochs[r.epochs.length - 1] : null;
   text("t-eval", lastE ? f4(lastE.eval) : r.step0 ? f4(r.step0.eval) : null);
-  text("t-eval-s", lastE && r.step0 ? `第 0 步 ${f4(r.step0.eval)} · ${((lastE.eval / r.step0.eval - 1) * 100).toFixed(1)}%` : r.step0 ? "第 0 步(部署态)" : "");
-  text("t-hold", lastE ? f4(lastE.hold) : r.step0 ? f4(r.step0.hold) : null); text("t-hold-s", r.step0 ? `第 0 步 ${f4(r.step0.hold)}` : "");
+  text("t-eval-s", lastE && r.step0 ? `${t("step0_v", f4(r.step0.eval))} · ${((lastE.eval / r.step0.eval - 1) * 100).toFixed(1)}%` : r.step0 ? t("step0_deploy") : "");
+  text("t-hold", lastE ? f4(lastE.hold) : r.step0 ? f4(r.step0.hold) : null); text("t-hold-s", r.step0 ? t("step0_v", f4(r.step0.hold)) : "");
   text("t-gn", r.steps_done ? Number(r.last.gnorm).toPrecision(3) : null);
   const mem = status ? status.mem_avail_mb : -1, mv = $("t-mem"); mv.textContent = mem >= 0 ? (mem / 1024).toFixed(1) + " GB" : "–";
   mv.className = "v" + (mem >= 0 && mem < 3000 ? (mem < 2500 ? " err" : " warn") : "");
   const tb = $("ep-rows"); tb.replaceChildren();
   [{ n: 0, eval: r.step0 && r.step0.eval, train: r.step0 && r.step0.train, hold: r.step0 && r.step0.hold }].concat(r.epochs).forEach(e => {
     const tr = node("tr"), g = e.gate, pick = r.pick && r.pick === `ckpt_e${String(e.n).padStart(2, "0")}`;
-    tr.appendChild(node("td", null, e.n === 0 ? "第 0 步" : `e${String(e.n).padStart(2, "0")}${pick ? "  ★ 选中" : ""}`));
+    tr.appendChild(node("td", null, e.n === 0 ? t("step0") : `e${String(e.n).padStart(2, "0")}${pick ? t("picked") : ""}`));
     [f4(e.eval), f4(e.train), f4(e.hold), e.n ? `${f4(e.gain)} ± ${f4(e.se)}` : "–"].forEach(v => tr.appendChild(node("td", null, v)));
     if (g) {
       tr.appendChild(node("td", g.dpp >= -0.5 ? "ok" : "bad", `${g.smin[0].toFixed(4)} → ${g.smin[1].toFixed(4)} (${g.dpp >= 0 ? "+" : ""}${g.dpp.toFixed(2)}pp)`));
       tr.appendChild(node("td", g.dkld <= 3 ? "ok" : "bad", `${g.kld[0].toFixed(4)} → ${g.kld[1].toFixed(4)} (${g.dkld >= 0 ? "+" : ""}${g.dkld.toFixed(1)}%)`));
       tr.appendChild(node("td", null, `${g.kldmed[0].toFixed(4)} → ${g.kldmed[1].toFixed(4)}`));
       tr.appendChild(node("td", null, `${g.top[0].toFixed(2)}% → ${g.top[1].toFixed(2)}%`));
-      const td = node("td"); td.appendChild(node("span", "badge " + (g.pass ? "green" : "red"), g.pass ? "过" : "没过")); tr.appendChild(td);
-    } else for (let k = 0; k < 5; k++) tr.appendChild(node("td", "muted", e.n ? "待门" : "–"));
+      const td = node("td"); td.appendChild(node("span", "badge " + (g.pass ? "green" : "red"), t(g.pass ? "gate_pass" : "gate_fail"))); tr.appendChild(td);
+    } else for (let k = 0; k < 5; k++) tr.appendChild(node("td", "muted", e.n ? t("gate_wait") : "–"));
     tb.appendChild(tr);
   });
   const ps = $("probe-sel"), tags = Object.keys(r.probes || {}), keep = ps.value;
-  if (tags.join() !== (ps.dataset.tags || "")) { ps.replaceChildren(); tags.forEach(t => ps.appendChild(node("option", null, t))); ps.dataset.tags = tags.join(); ps.value = tags.includes(keep) ? keep : tags[tags.length - 1] || ""; }
+  if (tags.join() !== (ps.dataset.tags || "")) { ps.replaceChildren(); tags.forEach(tg => ps.appendChild(node("option", null, tg))); ps.dataset.tags = tags.join(); ps.value = tags.includes(keep) ? keep : tags[tags.length - 1] || ""; }
   renderPane();
   if (curTab() === "train") { drawLoss(r); drawEval(r); }
   renderChatGate();
@@ -481,14 +622,14 @@ $("probe-sel").onchange = renderPane;
 function renderPane() {
   const r = detail, el = $("pane"); $("probe-sel").style.display = pane === "probe" ? "" : "none";
   if (!r) { el.textContent = "–"; return; }
-  if (pane === "probe") el.textContent = r.probes && r.probes[$("probe-sel").value] ? r.probes[$("probe-sel").value] : "这趟还没有探针";
+  if (pane === "probe") el.textContent = r.probes && r.probes[$("probe-sel").value] ? r.probes[$("probe-sel").value] : t("no_probe");
   else { const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 8; el.textContent = r.tail || "–"; if (atBottom) el.scrollTop = el.scrollHeight; }
 }
 function setupCanvas(c) { const dpr = window.devicePixelRatio || 1, w = c.clientWidth, h = c.clientHeight; c.width = w * dpr; c.height = h * dpr; const g = c.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h); return [g, w, h]; }
 function axes(g, w, h, lo, hi, fmt) { g.strokeStyle = "#1e2b47"; g.fillStyle = "#6b7894"; g.font = "11px system-ui"; g.lineWidth = 1; for (let i = 0; i <= 4; i++) { const y = 10 + (h - 30) * i / 4; g.beginPath(); g.moveTo(44, y); g.lineTo(w - 6, y); g.stroke(); g.fillText(fmt(hi - (hi - lo) * i / 4), 4, y + 4); } }
 function drawLoss(r) {
   const [g, w, h] = setupCanvas($("c-loss")), s = r.steps || [];
-  if (s.length < 2) { g.fillStyle = "#6b7894"; g.font = "13px system-ui"; g.fillText("还没有步", 50, 40); return; }
+  if (s.length < 2) { g.fillStyle = "#6b7894"; g.font = "13px system-ui"; g.fillText(t("no_steps"), 50, 40); return; }
   const n = s[s.length - 1][0]; let lo = Infinity, hi = -Infinity; s.forEach(p => { lo = Math.min(lo, p[2]); hi = Math.max(hi, p[2]); }); if (hi === lo) hi = lo + 1;
   axes(g, w, h, lo, hi, v => v.toFixed(2));
   const X = st => 44 + (w - 50) * st / n, Y = v => 10 + (h - 30) * (1 - (v - lo) / (hi - lo));
@@ -499,21 +640,21 @@ function drawLoss(r) {
   /* 滑动均值(窗口 = 总步数 2%): 单步批损失抖得厉害, 趋势看这条 */
   const k = Math.max(3, Math.round(s.length * 0.02)); g.strokeStyle = "#60a5fa"; g.lineWidth = 2; g.beginPath(); let acc = 0;
   s.forEach((p, i) => { acc += p[2]; if (i >= k) acc -= s[i - k][2]; const v = acc / Math.min(i + 1, k); i ? g.lineTo(X(p[0]), Y(v)) : g.moveTo(X(p[0]), Y(v)); }); g.stroke();
-  g.fillStyle = "#6b7894"; g.fillText("步 " + n, w - 52, h - 5);
+  g.fillStyle = "#6b7894"; g.textAlign = "right"; g.fillText(t("steps_n", n), w - 6, h - 5); g.textAlign = "left";
 }
 function drawEval(r) {
   const [g, w, h] = setupCanvas($("c-eval"));
   const pts = [[0, r.step0 && r.step0.eval, r.step0 && r.step0.hold]].concat(r.epochs.map(e => [e.n, e.eval, e.hold])).filter(p => p[1] != null);
-  if (!pts.length) { g.fillStyle = "#6b7894"; g.font = "13px system-ui"; g.fillText("还没有评估", 50, 40); return; }
+  if (!pts.length) { g.fillStyle = "#6b7894"; g.font = "13px system-ui"; g.fillText(t("no_eval"), 50, 40); return; }
   let hi = 0; pts.forEach(p => hi = Math.max(hi, p[1], p[2] || 0)); hi = hi * 1.08 || 1;
   axes(g, w, h, 0, hi, v => v.toFixed(2));
-  const N = Math.max(pts.length - 1, Number(r.epochs_cfg) || 1), X = n => 52 + (w - 110) * n / N, Y = v => 10 + (h - 30) * (1 - v / hi);
-  [["#60a5fa", 1, "留出"], ["#fbbf24", 2, "保持料"]].forEach(([col, k, lab], li) => {
+  const N = Math.max(pts.length - 1, Number(r.epochs_cfg) || 1), X = n => 52 + (w - 110) * n / N, Y = v => 10 + (h - 30) * (1 - v / hi); let lgX = 52;
+  [["#60a5fa", 1, t("lg_eval")], ["#fbbf24", 2, t("lg_hold")]].forEach(([col, k, lab], li) => {
     g.strokeStyle = col; g.fillStyle = col; g.lineWidth = 2; g.beginPath();
     pts.forEach((p, i) => { if (p[k] == null) return; i ? g.lineTo(X(p[0]), Y(p[k])) : g.moveTo(X(p[0]), Y(p[k])); }); g.stroke();
     g.font = "11px system-ui";
     pts.forEach(p => { if (p[k] != null) { g.beginPath(); g.arc(X(p[0]), Y(p[k]), 3.5, 0, 6.3); g.fill(); g.fillText(p[k].toFixed(3), X(p[0]) + 6, Math.max(20, Y(p[k]) - 6)); } });
-    g.fillText("● " + lab, 52 + li * 64, h - 5);
+    g.fillText("● " + lab, lgX, h - 5); lgX += g.measureText("● " + lab).width + 16;   /* 按实际字宽排图例: 英文标签比中文长 */
   });
 }
 
@@ -525,11 +666,11 @@ function renderRuns() {
     tr.appendChild(node("td", null, r.name)); tr.appendChild(node("td", null, short(r.data))); tr.appendChild(node("td", null, `${r.epochs_cfg} / ${r.layers} / ${r.lr}`));
     const td = node("td"); td.appendChild(node("span", "badge " + col, lab)); tr.appendChild(td);
     tr.appendChild(node("td", null, `${r.step0 ? f4(r.step0.eval) : "–"} → ${f4(last)}`)); tr.appendChild(node("td", null, r.pick || "–"));
-    tr.appendChild(node("td", "muted", new Date(r.started * 1000).toLocaleString()));
+    tr.appendChild(node("td", "muted", new Date(r.started * 1000).toLocaleString(locale())));
     tr.onclick = () => { selected = r.name; userPicked = true; location.hash = "train"; };
     tb.appendChild(tr);
   });
-  if (!runs.length) { const tr = node("tr"); const td = node("td", "muted", "还没有训练过"); td.colSpan = 7; tr.appendChild(td); tb.appendChild(tr); }
+  if (!runs.length) { const tr = node("tr"); const td = node("td", "muted", t("no_runs")); td.colSpan = 7; tr.appendChild(td); tb.appendChild(tr); }
 }
 
 /* ---------------- 语料 ---------------- */
@@ -538,45 +679,45 @@ async function loadData() {
   try { dataCache = await getJSON("/api/train/data"); } catch (e) { return; }
   const d = dataCache, sel = $("data"), keep = sel.value || lsGet("ds4.studio.data", "");
   sel.replaceChildren();
-  d.jsonl.filter(j => !j.path.endsWith("/hold.jsonl")).forEach(j => { const o = node("option", null, `${short(j.path)} · ${j.rows} 行`); o.value = j.path; sel.appendChild(o); });
+  d.jsonl.filter(j => !j.path.endsWith("/hold.jsonl")).forEach(j => { const o = node("option", null, t("d_opt", short(j.path), j.rows)); o.value = j.path; sel.appendChild(o); });
   if (keep && [...sel.options].some(o => o.value === keep)) sel.value = keep;
   const jt = $("jsonl-rows"); jt.replaceChildren();
   d.jsonl.forEach(j => {
     const tr = node("tr"), hold = j.path.endsWith("/hold.jsonl");
-    tr.appendChild(node("td", null, short(j.path) + (hold ? "(保持料, 自动混入)" : ""))); tr.appendChild(node("td", null, j.rows));
+    tr.appendChild(node("td", null, short(j.path) + (hold ? t("d_hold") : ""))); tr.appendChild(node("td", null, j.rows));
     tr.appendChild(node("td", "muted", j.bytes >= 1048576 ? (j.bytes / 1048576).toFixed(1) + " MB" : (j.bytes / 1024).toFixed(0) + " KB"));
-    const tc = node("td"); tc.appendChild(node("span", "badge " + (j.teacher ? "green" : ""), j.teacher ? "已缓存" : "首训时算")); tr.appendChild(tc);
-    const ta = node("td"); const pv = node("button", "act ghost", "预览"); pv.onclick = () => preview(j.path); ta.appendChild(pv);
-    if (!hold) { const go = node("button", "act primary", "用它训练"); go.onclick = () => { sel.value = j.path; lsSet("ds4.studio.data", j.path); location.hash = "train"; }; ta.appendChild(go); }
+    const tc = node("td"); tc.appendChild(node("span", "badge " + (j.teacher ? "green" : ""), t(j.teacher ? "d_cached" : "d_first"))); tr.appendChild(tc);
+    const ta = node("td"); const pv = node("button", "act ghost", t("d_preview")); pv.onclick = () => preview(j.path); ta.appendChild(pv);
+    if (!hold) { const go = node("button", "act primary", t("d_use")); go.onclick = () => { sel.value = j.path; lsSet("ds4.studio.data", j.path); location.hash = "train"; }; ta.appendChild(go); }
     tr.appendChild(ta); jt.appendChild(tr);
   });
   const dt = $("dir-rows"); dt.replaceChildren();
   d.dirs.forEach(x => {
     const tr = node("tr"); tr.appendChild(node("td", null, short(x.path))); tr.appendChild(node("td", null, x.chunks));
-    const tc = node("td"); tc.appendChild(node("span", "badge " + (x.has_jsonl ? "green" : ""), x.has_jsonl ? "有" : "没有")); tr.appendChild(tc);
+    const tc = node("td"); tc.appendChild(node("span", "badge " + (x.has_jsonl ? "green" : ""), t(x.has_jsonl ? "d_yes" : "d_no"))); tr.appendChild(tc);
     const tn = node("td"); const rin = node("input"); rin.value = "1"; rin.style.width = "54px"; tn.appendChild(rin); tr.appendChild(tn);
-    const ta = node("td"); const g = node("button", "act primary", "出题"); g.disabled = training();
-    g.onclick = () => act("/api/train/gen", { dir: x.path, rounds: rin.value }, "开始出题", 1); ta.appendChild(g); tr.appendChild(ta); dt.appendChild(tr);
+    const ta = node("td"); const g = node("button", "act primary", t("d_gen")); g.disabled = training();
+    g.onclick = () => act("/api/train/gen", { dir: x.path, rounds: rin.value }, t("d_gen_started"), 1); ta.appendChild(g); tr.appendChild(ta); dt.appendChild(tr);
   });
-  if (!d.dirs.length) { const tr = node("tr"); const td = node("td", "muted", "还没有文档目录, 拖 .txt / .md 进上面"); td.colSpan = 5; tr.appendChild(td); dt.appendChild(tr); }
+  if (!d.dirs.length) { const tr = node("tr"); const td = node("td", "muted", t("d_nodirs")); td.colSpan = 5; tr.appendChild(td); dt.appendChild(tr); }
 }
 $("data").onchange = () => lsSet("ds4.studio.data", $("data").value);
 async function preview(path) {
-  text("pv-name", short(path)); const box = $("pv"); box.replaceChildren(node("div", "muted", "读取中…"));
+  text("pv-name", short(path)); const box = $("pv"); box.replaceChildren(node("div", "muted", t("pv_loading")));
   try {
     const r = await getJSON("/api/train/preview?n=6&path=" + encodeURIComponent(path)); box.replaceChildren();
     (r.rows || []).forEach(line => {
       const row = node("div", "row"); let o = null; try { o = JSON.parse(line); } catch (e) { /* 截断的长行 */ }
       if (!o) { row.appendChild(node("div", "muted", line.slice(0, 300) + "…")); box.appendChild(row); return; }
-      if (o.text != null) { const t = node("div"); t.appendChild(node("span", "k", "原文")); t.appendChild(document.createTextNode(o.text)); row.appendChild(t); box.appendChild(row); return; }
+      if (o.text != null) { const tx = node("div"); tx.appendChild(node("span", "k", t("pv_text"))); tx.appendChild(document.createTextNode(o.text)); row.appendChild(tx); box.appendChild(row); return; }
       const msgs = o.messages || [], u = msgs.find(m => m.role === "user"), a = msgs.find(m => m.role === "assistant");
-      const q = node("div"); q.appendChild(node("span", "k", "问")); q.appendChild(document.createTextNode(u ? u.content : "")); row.appendChild(q);
-      const an = node("div"); an.style.marginTop = "4px"; an.appendChild(node("span", "k", "答")); an.appendChild(document.createTextNode(a ? a.content : "")); row.appendChild(an);
-      if (o.context) row.appendChild(node("div", "ctx", "材料: " + o.context));
+      const q = node("div"); q.appendChild(node("span", "k", t("pv_q"))); q.appendChild(document.createTextNode(u ? u.content : "")); row.appendChild(q);
+      const an = node("div"); an.style.marginTop = "4px"; an.appendChild(node("span", "k", t("pv_a"))); an.appendChild(document.createTextNode(a ? a.content : "")); row.appendChild(an);
+      if (o.context) row.appendChild(node("div", "ctx", t("pv_ctx", o.context)));
       box.appendChild(row);
     });
-    if (!(r.rows || []).length) box.appendChild(node("div", "muted", r.error || "空文件"));
-  } catch (e) { box.replaceChildren(node("div", "muted", "读不了: " + e)); }
+    if (!(r.rows || []).length) box.appendChild(node("div", "muted", r.error || t("pv_empty")));
+  } catch (e) { box.replaceChildren(node("div", "muted", t("pv_err", e))); }
 }
 const drop = $("drop");
 drop.onclick = () => $("file").click();
@@ -587,15 +728,15 @@ $("file").onchange = () => { upload([...$("file").files]); $("file").value = "";
 async function upload(files) {
   for (const f of files) {
     const isJ = /\.jsonl$/i.test(f.name), isD = /\.(txt|md)$/i.test(f.name);
-    if (!isJ && !isD) { toast(`${f.name}: 只收 .jsonl / .txt / .md`, true); continue; }
+    if (!isJ && !isD) { toast(t("up_bad", f.name), true); continue; }
     const name = f.name.replace(/[^A-Za-z0-9._-]/g, "_");
     const q = isJ ? `kind=jsonl&name=${encodeURIComponent(name)}` : `kind=doc&dir=${encodeURIComponent($("docdir").value)}&name=${encodeURIComponent(name)}`;
-    $("up-msg").textContent = `上传 ${f.name}…`;
+    $("up-msg").textContent = t("up_ing", f.name);
     try {
       const r = await getJSON("/api/train/upload?" + q, { method: "POST", body: f });
-      if (r.ok) { toast(`已存 ${short(r.path)}${r.text_jsonl ? " → 原文料 " + short(r.text_jsonl) : ""}${r.rows != null ? " · " + r.rows + " 行" : ""}`); lsSet("ds4.studio.data", isJ ? r.path : r.text_jsonl); }
+      if (r.ok) { toast(t("up_ok", short(r.path)) + (r.text_jsonl ? t("up_text", short(r.text_jsonl)) : "") + (r.rows != null ? t("up_rows", r.rows) : "")); lsSet("ds4.studio.data", isJ ? r.path : r.text_jsonl); }
       else toast(`${f.name}: ${r.error}`, true);
-    } catch (e) { toast(`${f.name} 上传失败: ${e}`, true); }
+    } catch (e) { toast(t("up_fail", f.name, e), true); }
   }
   $("up-msg").textContent = ""; loadData();
 }
@@ -618,7 +759,7 @@ function renderMd(src) {   /* 先整段转义再加标记: 模型输出里的 < 
   while (i < lines.length) {
     const ln = lines[i], fence = ln.match(/^```(\S*)\s*$/);
     if (fence) { fp(); fl(); const code = []; i++; while (i < lines.length && !/^```\s*$/.test(lines[i])) code.push(lines[i++]); i++;
-      out.push('<div class="codeblock">' + (fence[1] ? '<span class="lang">' + fence[1] + "</span>" : "") + '<button class="copy" data-copy>复制</button><pre><code>' + code.join("\n") + "</code></pre></div>"); continue; }
+      out.push('<div class="codeblock">' + (fence[1] ? '<span class="lang">' + fence[1] + "</span>" : "") + '<button class="copy" data-copy>' + t("copy") + '</button><pre><code>' + code.join("\n") + "</code></pre></div>"); continue; }
     /* GFM 表格: 表头行 + |---|:--:| 分隔行; 单元格里模型常写 <br> 换行, 转义后只放行这一个标签 */
     if (/^\s*\|.*\|\s*$/.test(ln) && i + 1 < lines.length && /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?\s*$/.test(lines[i + 1])) {
       fp(); fl(); const cells = r => r.trim().replace(/^\||\|$/g, "").split("|").map(c => inlineMd(c.trim()).replace(/&lt;br\s*\/?&gt;/g, "<br>"));
@@ -636,13 +777,13 @@ function renderMd(src) {   /* 先整段转义再加标记: 模型输出里的 < 
   }
   fp(); fl(); return out.join("");
 }
-chatEl.addEventListener("click", e => { const b = e.target.closest("[data-copy]"); if (!b) return; navigator.clipboard.writeText(b.parentElement.querySelector("code").textContent).then(() => { b.textContent = "已复制"; setTimeout(() => b.textContent = "复制", 1200); }); });
+chatEl.addEventListener("click", e => { const b = e.target.closest("[data-copy]"); if (!b) return; navigator.clipboard.writeText(b.parentElement.querySelector("code").textContent).then(() => { b.textContent = t("copied"); setTimeout(() => b.textContent = t("copy"), 1200); }); });
 function msgEl(m, streaming) {
   const w = node("div", "msg " + m.role), who = node("div", "who");
-  if (m.role === "assistant") who.appendChild(logoImg()); else who.textContent = "我";
+  if (m.role === "assistant") who.appendChild(logoImg()); else who.textContent = t("me");
   const b = node("div", "bubble"); w.appendChild(who); w.appendChild(b);
   if (m.role === "user") { b.textContent = m.content; return w; }
-  if (m.reasoning) { const d = node("details", "think"); d.appendChild(node("summary", null, "思考过程")); d.appendChild(node("div", null, m.reasoning)); b.appendChild(d); }
+  if (m.reasoning) { const d = node("details", "think"); d.appendChild(node("summary", null, t("thinking"))); d.appendChild(node("div", null, m.reasoning)); b.appendChild(d); }
   const md = node("div", "md" + (streaming ? " cursor" : "")); md.innerHTML = renderMd(m.content || ""); b.appendChild(md);
   if (m.error) b.appendChild(node("div", "bad", m.error));
   if (m.stats) b.appendChild(node("div", "stats", m.stats));
@@ -650,36 +791,36 @@ function msgEl(m, streaming) {
 }
 function renderChat() {
   chatEl.replaceChildren();
-  if (!conv.length) { const e = node("div", "empty"); e.appendChild(logoImg()); e.appendChild(node("h2", null, "有什么可以帮你?")); e.appendChild(node("div", null, "请求发往本机 /v1/chat/completions(流式), 对话只存在这个浏览器里。")); chatEl.appendChild(e); return; }
+  if (!conv.length) { const e = node("div", "empty"); e.appendChild(logoImg()); e.appendChild(node("h2", null, t("empty_h"))); e.appendChild(node("div", null, t("empty_sub"))); chatEl.appendChild(e); return; }
   conv.forEach(m => chatEl.appendChild(msgEl(m, false)));
   scrollEl.scrollTop = scrollEl.scrollHeight;
 }
 function renderChatGate() {
   const serving = status && status.mode === "serving" && !switching, ban = $("chat-banner");
   sendBtn.disabled = !serving && !generating; inputEl.disabled = !serving;
-  inputEl.placeholder = serving ? "输入消息, Enter 发送, Shift+Enter 换行" : "模型没装着, 现在不能聊";
+  inputEl.placeholder = t(serving ? "ph_input" : "ph_noinput");
   if (serving || !status && !switching) { ban.classList.remove("on"); return; }
   ban.classList.add("on");
   const bar = $("chat-banner-bar"); bar.parentElement.style.display = "none"; $("btn-load2").style.display = "none";
-  if (switching || !status) { $("chat-banner-text").textContent = "正在切换(停模型 / 装模型), 稍等…"; return; }
+  if (switching || !status) { $("chat-banner-text").textContent = t("ban_switch"); return; }
   if (status.mode === "training") {
     const r = detail && detail.status === "running" ? detail : null;
     const per = r && r.ntr && r.batch ? Math.ceil(r.ntr / Number(r.batch)) : 0, tot = per * Number(r ? r.epochs_cfg : 0);
-    $("chat-banner-text").textContent = "模型正在训练" + (r ? `(${r.name}${phaseOf(r) ? " · " + phaseOf(r) : ""})` : "") + ", 训完模型自动装回来(新训出的后训练件用开关挂)";
+    $("chat-banner-text").textContent = t("ban_train", r ? ` (${r.name}${phaseOf(r) ? " · " + phaseOf(r) : ""})` : "");
     if (tot) { bar.parentElement.style.display = ""; bar.style.width = Math.min(100, 100 * r.steps_done / tot) + "%"; }
-  } else if (status.mode === "loading") { $("chat-banner-text").textContent = "正在加载模型(装完、冒烟过了就能聊), 稍等…";
-  } else { $("chat-banner-text").textContent = "模型还没加载(换哪个模型去左边\"模型\"页选)。"; $("btn-load2").style.display = ""; }
+  } else if (status.mode === "loading") { $("chat-banner-text").textContent = t("ban_loading");
+  } else { $("chat-banner-text").textContent = t("ban_lobby"); $("btn-load2").style.display = ""; }
 }
 function autosize() { inputEl.style.height = "auto"; inputEl.style.height = Math.min(220, inputEl.scrollHeight) + "px"; inputEl.style.overflowY = inputEl.scrollHeight > 220 ? "auto" : "hidden"; }
 inputEl.oninput = autosize;
 inputEl.onkeydown = e => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } if (e.key === "Escape" && generating) aborter.abort(); };
 sendBtn.onclick = () => generating ? aborter.abort() : send();
 function send() {
-  const t = inputEl.value.trim(); if (!t || generating || inputEl.disabled) return;
-  conv.push({ role: "user", content: t }); inputEl.value = ""; autosize(); renderChat(); generate();
+  const msg = inputEl.value.trim(); if (!msg || generating || inputEl.disabled) return;
+  conv.push({ role: "user", content: msg }); inputEl.value = ""; autosize(); renderChat(); generate();
 }
 async function generate() {
-  generating = true; sendBtn.textContent = "停止"; sendBtn.className = "danger"; sendBtn.disabled = false;
+  generating = true; sendBtn.textContent = t("stop"); sendBtn.className = "danger"; sendBtn.disabled = false;
   const asst = { role: "assistant", content: "", reasoning: "" }; conv.push(asst);
   const el = msgEl(asst, true); if (conv.length === 2) chatEl.replaceChildren(...[...conv.slice(0, -1).map(m => msgEl(m, false)), el]); else chatEl.appendChild(el);
   scrollEl.scrollTop = scrollEl.scrollHeight;
@@ -702,18 +843,18 @@ async function generate() {
         for (const ln of blk.split("\n")) if (ln.startsWith("data: ")) data += ln.slice(6);
         if (!data || data === "[DONE]") continue;
         let o; try { o = JSON.parse(data); } catch (e) { continue; }
-        if (o.error) throw new Error(o.error.message || "服务端错误");
+        if (o.error) throw new Error(o.error.message || t("server_err"));
         const d = o.choices && o.choices[0] && o.choices[0].delta;
         if (d) { if (d.reasoning_content) { tFirst = tFirst || performance.now(); asst.reasoning += d.reasoning_content; repaint(false); }
                  if (d.content) { tFirst = tFirst || performance.now(); asst.content += d.content; repaint(false); } }
         if (o.usage) usage = o.usage;
       }
     }
-  } catch (err) { if (err.name === "AbortError") asst.stats = "已停止"; else asst.error = String(err.message || err); }
+  } catch (err) { if (err.name === "AbortError") asst.stats = t("gen_stopped"); else asst.error = String(err.message || err); }
   const dt = (performance.now() - (tFirst || t0)) / 1000;
-  if (usage && usage.completion_tokens) asst.stats = (asst.stats ? asst.stats + " · " : "") + `${usage.completion_tokens} token · ${(usage.completion_tokens / Math.max(dt, 1e-3)).toFixed(1)} t/s · 首字 ${(((tFirst || performance.now()) - t0) / 1000).toFixed(2)} s`;
+  if (usage && usage.completion_tokens) asst.stats = (asst.stats ? asst.stats + " · " : "") + t("gen_stats", usage.completion_tokens, (usage.completion_tokens / Math.max(dt, 1e-3)).toFixed(1), (((tFirst || performance.now()) - t0) / 1000).toFixed(2));
   swap(msgEl(asst, false));
-  generating = false; sendBtn.textContent = "发送"; sendBtn.className = "primary";
+  generating = false; sendBtn.textContent = t("send"); sendBtn.className = "primary";
   lsSet("ds4.studio.conv", conv); renderChatGate(); inputEl.focus();
 }
 
@@ -723,11 +864,12 @@ async function generate() {
 let mdata = null, dlPrev = null, dlSpeed = 0, egTouched = false;
 const GB = b => (b / 1e9).toFixed(1) + " GB";   /* 十进制 GB: 与 Finder / HF 页面显示的数一致 */
 const modelName = p => (p || "").split("/").pop().replace(/\.gguf$/, "");
-const DOMAIN = [[/fin/, "金融"], [/code/, "编程"], [/law/, "法律"], [/med/, "医疗"], [/sci/, "科研"]];
-const DOMAIN_KEY = { finance: "金融", code: "编程", law: "法律", medicine: "医疗", science: "科研" };
-function sidecarLabel(gguf, sc) {   /* 侧车目录名去掉模型名前缀; 认得出领域就在前面标中文 */
+/* 侧车目录名里认领域的子串 → 领域键(= hf 清单 sidecars[].domain 的取值); 显示名 = t("dom_<键>") */
+const DOMAIN = [[/fin/, "finance"], [/code/, "code"], [/law/, "law"], [/med/, "medicine"], [/sci/, "science"]];
+const domLabel = k => I18N.zh["dom_" + k] ? t("dom_" + k) : k;
+function sidecarLabel(gguf, sc) {   /* 侧车目录名去掉模型名前缀; 认得出领域就在前面标领域名 */
   const tail = sc.split("/").pop().slice(modelName(gguf).length + 1), d = DOMAIN.find(x => x[0].test(tail));
-  return (d ? d[1] + " · " : "") + tail;
+  return (d ? domLabel(d[1]) + " · " : "") + tail;
 }
 async function loadModels(light) {   /* light: 聊天页只要侧车与切换状态, 不跑下载进度探测(?hub=0), 下载那半沿用上一次的 */
   try {
@@ -748,57 +890,57 @@ async function loadModels(light) {   /* light: 聊天页只要侧车与切换状
 function memBadge(bytes) {   /* 整模型要常驻: 体积 + 10 GB 余量(起服脚本的地板)放得进总内存才算装得下 */
   const tot = mdata.mem_total_mb; if (!(tot > 0)) return null;
   const ok = bytes / 1048576 + 10000 <= tot;
-  return node("span", "badge " + (ok ? "green" : "red"), ok ? `内存装得下(本机 ${(tot / 1024).toFixed(0)} GB)` : `内存不够(本机 ${(tot / 1024).toFixed(0)} GB)`);
+  return node("span", "badge " + (ok ? "green" : "red"), t(ok ? "mem_ok" : "mem_bad", (tot / 1024).toFixed(0)));
 }
 function renderModels() {
   const d = mdata; if (!d) return;
   /* 正在使用 */
-  const cur = $("m-cur"); cur.replaceChildren(node("div", "card-title", "正在使用"));
+  const cur = $("m-cur"); cur.replaceChildren(node("div", "card-title", t("m_using")));
   const row = node("div", "cur"); row.appendChild(logoImg()); const info = node("div"); info.style.minWidth = "0"; info.style.flex = "1";
   const mode = status ? status.mode : "";
   if (d.loaded) {
     info.appendChild(node("div", "nm", modelName(d.loaded.gguf)));
-    info.appendChild(node("div", "muted", (d.loaded.zchain ? "侧车: " + sidecarLabel(d.loaded.gguf, d.loaded.zchain) : "不挂侧车(只装基座)") +
-      (d.loaded.posttrain ? " · 后训练: " + ptLabel(d.loaded.posttrain) : "") + (d.live ? " · 侧车可在聊天页直接切, 不用重装" : "")));
-  } else info.appendChild(node("div", "nm", { training: "训练中, 模型被训练占着", loading: "正在加载…" }[mode] || "没有装着的模型"));
+    info.appendChild(node("div", "muted", (d.loaded.zchain ? t("m_sidecar", sidecarLabel(d.loaded.gguf, d.loaded.zchain)) : t("m_nosc")) +
+      (d.loaded.posttrain ? t("m_pt", ptLabel(d.loaded.posttrain)) : "") + (d.live ? t("m_live") : "")));
+  } else info.appendChild(node("div", "nm", mode === "training" ? t("m_busy_train") : mode === "loading" ? t("m_busy_load") : t("m_none")));
   if (d.pick && (!d.loaded || d.pick.gguf !== d.loaded.gguf || d.pick.zchain !== d.loaded.zchain || d.pick.posttrain !== d.loaded.posttrain))
-    info.appendChild(node("div", "muted", `下次起服用: ${modelName(d.pick.gguf)}${d.pick.zchain ? " + " + sidecarLabel(d.pick.gguf, d.pick.zchain) : ""}${d.pick.posttrain ? " + 后训练 " + ptLabel(d.pick.posttrain) : ""}`));
+    info.appendChild(node("div", "muted", t("m_next", modelName(d.pick.gguf) + (d.pick.zchain ? " + " + sidecarLabel(d.pick.gguf, d.pick.zchain) : "")) + (d.pick.posttrain ? t("m_next_pt", ptLabel(d.pick.posttrain)) : "")));
   row.appendChild(info);
-  const [lab, col] = { serving: ["服务中", "blue"], training: ["训练中", "green"], loading: ["加载中", "amber"], lobby: ["未加载", ""] }[mode] || ["–", ""];
-  row.appendChild(node("span", "badge " + col, lab)); cur.appendChild(row);
+  const col = { serving: "blue", training: "green", loading: "amber", lobby: "" }[mode], lab = col == null ? "–" : t("ms_" + mode);
+  row.appendChild(node("span", "badge " + (col || ""), lab)); cur.appendChild(row);
   if ((mode === "lobby" || mode === "loading") && d.load_log) {   /* 没装上/装着的时候给起服日志尾巴: 失败原因就在这 */
     const det = node("details"); det.style.marginTop = "10px"; det.open = mode === "lobby";
-    det.appendChild(node("summary", "muted", "最近一次加载的日志")); const pre = node("pre", "box", lastLines(d.load_log, 14)); pre.style.marginTop = "8px"; det.appendChild(pre); cur.appendChild(det);
+    det.appendChild(node("summary", "muted", t("m_loadlog"))); const pre = node("pre", "box", lastLines(d.load_log, 14)); pre.style.marginTop = "8px"; det.appendChild(pre); cur.appendChild(det);
   }
   /* 本机模型 */
-  $("m-mem").textContent = d.mem_total_mb > 0 ? `本机内存 ${(d.mem_total_mb / 1024).toFixed(0)} GB` + (d.mem_avail_mb >= 0 ? ` · 可用 ${(d.mem_avail_mb / 1024).toFixed(1)} GB` : "") : "";
-  /* 卡片里有下拉框: 数据没变就不重建, 不然用户刚点开的下拉每 2.5 s 被收起一次 */
-  const sig = JSON.stringify([d.local, d.loaded, d.pick, mode, switching]);
+  $("m-mem").textContent = d.mem_total_mb > 0 ? t("m_mem", (d.mem_total_mb / 1024).toFixed(0)) + (d.mem_avail_mb >= 0 ? t("eng_avail", (d.mem_avail_mb / 1024).toFixed(1)) : "") : "";
+  /* 卡片里有下拉框: 数据没变就不重建, 不然用户刚点开的下拉每 2.5 s 被收起一次(切语言也要重建, 所以签名里带 lang) */
+  const sig = JSON.stringify([d.local, d.loaded, d.pick, mode, switching, lang]);
   if (sig !== renderModels.sig) { renderModels.sig = sig; renderLocal(d, mode); }
   renderHub();
 }
 function renderLocal(d, mode) {
   const box = $("m-local"), keepSel = {}; box.querySelectorAll("select[data-m]").forEach(s => keepSel[s.dataset.m] = s.value); box.replaceChildren();
-  if (!d.local.length) box.appendChild(node("div", "muted", "gguf/ 下还没有模型(≥8 GB 的 .gguf)。在下面从 Hugging Face 下载。"));
+  if (!d.local.length) box.appendChild(node("div", "muted", t("m_nolocal")));
   d.local.forEach(m => {
     const using = d.loaded && d.loaded.gguf === m.path, c = node("div", "mcard" + (using ? " on" : ""));
     c.appendChild(node("div", "nm", modelName(m.path))); c.appendChild(node("div", "muted", m.path));
     const chips = node("div", "chips"); chips.appendChild(node("span", "badge", GB(m.bytes)));
     const mb = memBadge(m.bytes); if (mb) chips.appendChild(mb);
-    if (m.hub) chips.appendChild(node("span", "badge blue", "下载包"));
-    if (using) chips.appendChild(node("span", "badge blue", "使用中"));
+    if (m.hub) chips.appendChild(node("span", "badge blue", t("m_pkg")));
+    if (using) chips.appendChild(node("span", "badge blue", t("m_inuse")));
     c.appendChild(chips);
     const r = node("div", "row"), sel = node("select"); sel.dataset.m = m.path;
-    m.sidecars.forEach(s => { const o = node("option", null, "侧车: " + sidecarLabel(m.path, s)); o.value = s; sel.appendChild(o); });
-    const o = node("option", null, "不挂侧车(只装基座)"); o.value = "none"; sel.appendChild(o);
+    m.sidecars.forEach(s => { const o = node("option", null, t("m_sidecar", sidecarLabel(m.path, s))); o.value = s; sel.appendChild(o); });
+    const o = node("option", null, t("m_nosc")); o.value = "none"; sel.appendChild(o);
     const want = keepSel[m.path] || (using ? d.loaded.zchain || "none" : d.pick && d.pick.gguf === m.path ? d.pick.zchain || "none" : lsGet("ds4.studio.sc." + m.path, ""));
     if (want && [...sel.options].some(x => x.value === want)) sel.value = want;
     sel.onchange = () => lsSet("ds4.studio.sc." + m.path, sel.value);
-    const same = using && (d.loaded.zchain || "none") === sel.value, b = node("button", same ? "ghost" : "primary", same ? "使用中" : "加载");
+    const same = using && (d.loaded.zchain || "none") === sel.value, b = node("button", same ? "ghost" : "primary", t(same ? "m_inuse" : "m_load"));
     b.disabled = same || mode === "loading" || !!switching; b.onclick = () => loadModel(m.path, sel.value);
-    sel.addEventListener("change", () => { const s2 = using && (d.loaded.zchain || "none") === sel.value; b.textContent = s2 ? "使用中" : "加载"; b.className = s2 ? "ghost" : "primary"; b.disabled = s2; });
+    sel.addEventListener("change", () => { const s2 = using && (d.loaded.zchain || "none") === sel.value; b.textContent = t(s2 ? "m_inuse" : "m_load"); b.className = s2 ? "ghost" : "primary"; b.disabled = s2; });
     r.appendChild(sel); r.appendChild(b); c.appendChild(r);
-    if (m.engram) c.appendChild(node("div", "muted", "n-gram 表: " + m.engram));
+    if (m.engram) c.appendChild(node("div", "muted", t("m_engram", m.engram)));
     box.appendChild(c);
   });
 }
@@ -806,61 +948,61 @@ function lastLines(t, n) { return t.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "").split(
 function fmtEta(s) { return !isFinite(s) || s <= 0 ? "" : fmtDur(s); }
 function dlItem(title, sub, bytes, have, done, extra) {
   const it = node("div", "dlitem"), top = node("div", "top"); top.appendChild(node("b", null, title)); top.appendChild(node("span", "badge", GB(bytes)));
-  if (done) top.appendChild(node("span", "badge green", "已下载"));
+  if (done) top.appendChild(node("span", "badge green", t("dl_done")));
   else if (extra) top.appendChild(node("span", "badge blue", extra));
   it.appendChild(top); if (sub) it.appendChild(node("div", "muted", sub));
   if (!done && !extra && bytes) {
     const p = node("div", "progress"), bar = node("div"); bar.style.width = Math.min(100, 100 * have / bytes) + "%"; p.appendChild(bar); it.appendChild(p);
-    it.appendChild(node("div", "muted", `${GB(have)} / ${GB(bytes)} · ${(100 * have / bytes).toFixed(1)}%`));
+    it.appendChild(node("div", "muted", t("dl_prog", GB(have), GB(bytes), (100 * have / bytes).toFixed(1))));
   }
   return it;
 }
 function renderHub() {
   const h = mdata.hub, items = $("m-items"); items.replaceChildren();
-  if (!h.gguf) { items.appendChild(node("div", "muted", "读不到下载清单(gguf-tools/scripts/hf_install.sh probe 没有输出)")); return; }
+  if (!h.gguf) { items.appendChild(node("div", "muted", t("hub_none"))); return; }
   const a = $("m-repo"); a.textContent = h.repo + " ↗"; a.href = "https://huggingface.co/" + h.repo;
   if (!egTouched && !$("m-eg").value && h.engram_hint && h.engram.have < h.engram.bytes) $("m-eg").value = h.engram_hint;
   const eg = $("m-eg").value.trim(), gDone = h.gguf.have >= h.gguf.bytes, eDone = h.engram.have >= h.engram.bytes;
-  items.appendChild(dlItem("基座模型", h.gguf.name + " · 分 40 片下载, 逐片校验后拼成一个文件", h.gguf.bytes, h.gguf.have, gDone));
-  items.appendChild(dlItem("n-gram 表", "官方 DeepSeek-V4.1-Flash 的第 47、48 片权重, 模型推理要查它", h.engram.bytes, h.engram.have, eDone, !eDone && eg ? "用本机已有: " + eg : ""));
-  const sc = node("div", "dlitem"), t = node("div", "top"); t.appendChild(node("b", null, "领域侧车")); t.appendChild(node("span", "badge", "每个约 40 MB, 一起下"));
-  sc.appendChild(t); const chips = node("div", "chips"); chips.style.marginTop = "8px";
-  h.sidecars.forEach(s => chips.appendChild(node("span", "badge " + (s.have ? "green" : ""), (DOMAIN_KEY[s.domain] || s.domain) + (s.have ? " ✓" : ""))));
+  items.appendChild(dlItem(t("hub_base"), t("hub_base_sub", h.gguf.name), h.gguf.bytes, h.gguf.have, gDone));
+  items.appendChild(dlItem(t("hub_eg"), t("hub_eg_sub"), h.engram.bytes, h.engram.have, eDone, !eDone && eg ? t("hub_eg_local", eg) : ""));
+  const sc = node("div", "dlitem"), top = node("div", "top"); top.appendChild(node("b", null, t("hub_sc"))); top.appendChild(node("span", "badge", t("hub_sc_sub")));
+  sc.appendChild(top); const chips = node("div", "chips"); chips.style.marginTop = "8px";
+  h.sidecars.forEach(s => chips.appendChild(node("span", "badge " + (s.have ? "green" : ""), domLabel(s.domain) + (s.have ? " ✓" : ""))));
   sc.appendChild(chips); items.appendChild(sc);
   const dl = mdata.downloading, allDone = gDone && (eDone || eg) && h.sidecars.every(s => s.have);
   $("m-dl").style.display = dl ? "none" : ""; $("m-cancel").style.display = dl ? "" : "none";
-  $("m-dl").textContent = allDone ? "重新校验 / 补齐" : (h.gguf.have || h.engram.have) ? "继续下载" : "下载";
+  $("m-dl").textContent = t(allDone ? "m_dl_verify" : (h.gguf.have || h.engram.have) ? "m_dl_resume" : "m_dl");
   const tot = h.gguf.bytes + (eg ? 0 : h.engram.bytes), have = h.gguf.have + (eg ? 0 : h.engram.have);
-  $("m-dlnote").textContent = dl ? (dlSpeed > 0 ? `下载中 · ${(dlSpeed / 1e6).toFixed(1)} MB/s · 约剩 ${fmtEta((tot - have) / dlSpeed)}` : "下载中…") + `(落盘 ${mdata.hub.dir}/, 关掉页面也会继续)`
-    : allDone ? `下载齐了, 在上面"本机模型"里加载 ${modelName(h.gguf.name)}。` : "断点续传: 中途取消或断网, 再点一次从断点接着下; 每个分片都校验 sha256。";
+  $("m-dlnote").textContent = dl ? (dlSpeed > 0 ? t("dl_ing_speed", (dlSpeed / 1e6).toFixed(1), fmtEta((tot - have) / dlSpeed)) : t("dl_ing")) + t("dl_dest", mdata.hub.dir)
+    : allDone ? t("dl_all", modelName(h.gguf.name)) : t("dl_note");
   const lg = $("m-log"), txt = lastLines(mdata.hub_log || "", 12); lg.style.display = txt ? "" : "none"; lg.textContent = txt;
   /* 上一趟是报错退的(脚本的 die 写 "[youngai] ERROR: …"): 原因直接摆在按钮旁, 别让人去日志里找 */
   const bad = !dl && !allDone ? (txt.split("\n").reverse().find(l => /\bERROR:/.test(l)) || "") : "";
-  $("m-dlnote").className = bad ? "bad" : "muted"; if (bad) $("m-dlnote").textContent = "上次没下完: " + bad.replace(/^.*ERROR:\s*/, "");
+  $("m-dlnote").className = bad ? "bad" : "muted"; if (bad) $("m-dlnote").textContent = t("dl_lastfail", bad.replace(/^.*ERROR:\s*/, ""));
 }
 $("m-eg").oninput = () => { egTouched = true; };
 $("m-dl").onclick = async () => {
   try {
     const r = await getJSON("/api/models/download", { method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ endpoint: $("m-ep").value, engram_dir: $("m-eg").value.trim(), no_xet: $("m-noxet").checked }) });
-    if (r.ok) toast("开始下载(关掉页面也会继续)"); else toast("下载没起来: " + r.error, true);
-  } catch (e) { toast("请求没发出去: " + e, true); }
+    if (r.ok) toast(t("dl_started")); else toast(t("dl_fail", r.error), true);
+  } catch (e) { toast(t("not_sent", e), true); }
   setTimeout(loadModels, 1500);
 };
 $("m-cancel").onclick = async () => {
-  if (!confirm("取消下载? 已下的部分留着, 下次点下载从断点接着下。")) return;
-  try { const r = await getJSON("/api/models/cancel", { method: "POST" }); toast(r.ok ? "已取消" : "失败: " + r.error, !r.ok); } catch (e) { toast("请求没发出去: " + e, true); }
+  if (!confirm(t("dl_cancel_confirm"))) return;
+  try { const r = await getJSON("/api/models/cancel", { method: "POST" }); toast(r.ok ? t("dl_cancelled") : t("fail", r.error), !r.ok); } catch (e) { toast(t("not_sent", e), true); }
   setTimeout(loadModels, 2500);
 };
 async function loadModel(gguf, sidecar) {
   const mode = status ? status.mode : "";
-  if (mode === "serving" && !confirm(`换成 ${modelName(gguf)}?\n要先卸下当前模型再装新的(大约 2~3 分钟), 期间聊天用不了。`)) return;
+  if (mode === "serving" && !confirm(t("ld_confirm", modelName(gguf)))) return;
   try {
     const r = await getJSON("/api/models/load", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ gguf, sidecar }) });
-    if (!r.ok) { toast("加载失败: " + r.error, true); return; }
-    if (r.deferred) toast("训练中, 不打断: 已记下, 训完按这一套装回来");
-    else { toast("开始加载(约 2~3 分钟, 装完会打一条冒烟问答)"); switching = mode === "serving" ? 3 : 2; renderEngine(); }
-  } catch (e) { toast("请求没发出去: " + e, true); }
+    if (!r.ok) { toast(t("ld_fail", r.error), true); return; }
+    if (r.deferred) toast(t("ld_deferred"));
+    else { toast(t("ld_started")); switching = mode === "serving" ? 3 : 2; renderEngine(); }
+  } catch (e) { toast(t("not_sent", e), true); }
   setTimeout(() => { poll(); loadModels(); }, 1500);
 }
 
@@ -883,8 +1025,8 @@ async function sendPlug(z, p) {
   plugBusy = true; renderPlug();
   try {
     const r = await getJSON("/api/models/plugins", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ zchain: z || "none", posttrain: p }) });
-    if (r.ok) { if (generating) toast("这条回答结束后切换"); } else toast("切换失败: " + r.error, true);
-  } catch (e) { toast("请求没发出去: " + e, true); }
+    if (r.ok) { if (generating) toast(t("pl_after")); } else toast(t("pl_fail", r.error), true);
+  } catch (e) { toast(t("not_sent", e), true); }
   plugBusy = false; await loadModels(true);
 }
 function plugOptions() {
@@ -893,9 +1035,9 @@ function plugOptions() {
   const dom = s => { const t = s.split("/").pop().slice(modelName(g).length + 1), x = DOMAIN.find(r => r[0].test(t)); return x ? x[1] : null; };
   const rank = s => s === d.loaded.zchain ? 0 : (d.posttrains || []).some(p => d.fnv && p.fnv === d.fnv[s]) ? 1 : 2;
   list.forEach(s => { const k = dom(s); if (k && (!by[k] || rank(s) < rank(by[k]))) by[k] = s; });
-  const out = DOMAIN.map(x => x[1]).filter(k => by[k]).map(k => ({ z: by[k], label: k }));
+  const out = DOMAIN.map(x => x[1]).filter(k => by[k]).map(k => ({ z: by[k], label: domLabel(k) }));
   const cur = d.loaded.zchain;   /* 正挂着的不是任何一项的代表(没挂 / 认不出领域)也要显示出来, 不然下拉显示的不是真相 */
-  if (!out.some(o => o.z === cur)) out.unshift({ z: cur, label: cur ? (dom(cur) || "其他") : "无" });
+  if (!out.some(o => o.z === cur)) out.unshift({ z: cur, label: cur ? domLabel(dom(cur) || "other") : t("dom_none") });
   return out;
 }
 function renderPlug() {
@@ -908,16 +1050,16 @@ function renderPlug() {
   sw.style.display = (d.loaded.posttrain || want) ? "" : "none";
   /* 切换排队期间(等当前回答结束)不按"真装着的"刷开关, 否则刚点的开关会先弹回去、切成了再跳过来 */
   if (document.activeElement !== on && !pend && !plugBusy) on.checked = !!d.loaded.posttrain;
-  sw.title = d.loaded.posttrain ? "挂着: " + ptLabel(d.loaded.posttrain) + (want && want !== d.loaded.posttrain ? "(有更新的: " + ptLabel(want) + ", 关再开换上)" : "")
-                                : want ? "可挂: " + ptLabel(want) : "挂/卸自己训出来的后训练件";
+  sw.title = d.loaded.posttrain ? t("pl_on", ptLabel(d.loaded.posttrain)) + (want && want !== d.loaded.posttrain ? t("pl_newer", ptLabel(want)) : "")
+                                : want ? t("pl_can", ptLabel(want)) : t("pl_tip");
   const key = o => o.z, opts = plugOptions(), sig = opts.map(o => key(o) + o.label).join();
   if (sel.dataset.sig !== sig) { sel.replaceChildren(); opts.forEach(o => { const e = node("option", null, o.label); e.value = key(o); sel.appendChild(e); }); sel.dataset.sig = sig; }
   if (document.activeElement !== sel) sel.value = d.loaded.zchain;
   sel.title = (sel.selectedOptions[0] || {}).textContent || "";
   sel.disabled = on.disabled = pend || plugBusy;
-  st.textContent = pend ? "切换中…" : "";
+  st.textContent = pend ? t("pl_switching") : "";
   const err = d.switch ? d.switch.error : "";
-  if (err && err !== renderPlug.lastErr) toast("侧车没切成: " + err, true);
+  if (err && err !== renderPlug.lastErr) toast(t("pl_err", err), true);
   renderPlug.lastErr = err;
 }
 /* 训完的提示: 新 ③ 只落盘(z_nightly train 不改起服选择), 页面看到 posttrains 里多了一份就说一声, 挂不挂归开关 */
@@ -926,7 +1068,7 @@ function noteAutoReload() {
   const n = mdata && mdata.posttrains && mdata.posttrains.length ? mdata.posttrains[0].path : "";
   if (prevNewest !== undefined && n && n !== prevNewest) {
     const z = mdata.fnv ? Object.keys(mdata.fnv).find(k => mdata.fnv[k] === mdata.posttrains[0].fnv) : undefined;
-    toast("训练完成: " + ptLabel(n) + " 已关联侧车 " + (z === undefined ? "?" : z ? sidecarLabel(mdata.loaded.gguf, z) : "无") + ", 切到它并打开后训练开关即可挂上");
+    toast(t("pt_done", ptLabel(n), z === undefined ? "?" : z ? sidecarLabel(mdata.loaded.gguf, z) : t("dom_none")));
   }
   prevNewest = n;
 }
@@ -938,8 +1080,19 @@ $("plug").onchange = async () => {
 };
 $("pt-on").onchange = async () => { const z = mdata.loaded.zchain; await sendPlug(z, $("pt-on").checked ? bestPt(z) : ""); };
 
+/* 切语言: 静态文字走 applyI18n, 动态区域按当前数据重画一遍(不等下一轮 poll) */
+$("lang").onclick = () => {
+  lang = lang === "zh" ? "en" : "zh";
+  try { localStorage.setItem(LS_LANG, lang); } catch (_) {}
+  applyI18n(); showTab(curTab() || "chat"); renderEngine(); renderRuns(); renderChat();
+  sendBtn.textContent = t(generating ? "stop" : "send");
+  if (detail) renderDetail();
+  if (dataCache) loadData();
+  if (mdata) { renderPlug(); if (mdata.hub) renderModels(); }
+};
+
 /* ---------------- 起 ---------------- */
-renderChat(); autosize(); loadData(); poll(); setInterval(poll, 2500); setInterval(loadData, 20000);
+applyI18n(); sendBtn.textContent = t("send"); renderChat(); autosize(); loadData(); poll(); setInterval(poll, 2500); setInterval(loadData, 20000);
 (async () => { for (let i = 0; i < 20 && !status && failCount < 4; i++) await new Promise(r => setTimeout(r, 300));
   showTab(curTab() || (status && status.busy ? "train" : "chat")); })();
 window.addEventListener("resize", () => { if (detail && curTab() === "train") { drawLoss(detail); drawEval(detail); } });

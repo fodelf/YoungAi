@@ -232,7 +232,7 @@ const I18N = {
     just_now: "just now", min_ago: "{0} min ago", h_ago: "{0} h ago",
   },
 };
-const LS_LANG = "ds4.monitor.lang";
+const LS_LANG = "ds4.lang";   /* 与工作台 studio.html 共用: 一页切了另一页跟着 */
 function pickLang() {
   const q = new URLSearchParams(location.search).get("lang");
   if (q === "en" || q === "zh") return q;
