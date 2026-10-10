@@ -10846,3 +10846,23 @@ A = 只在提示里找(Strata 默认索引范围), B = 提示 + 已生成都找;
 - **布局**(90c51ce): 训练料表原来和预览并排半宽 + 全列 nowrap, 长文件名把"预览/用它训练"撑出卡片。改表格/预览各占整行, 文件名列可换行, 按钮列贴右; 900 px 窗口实测按钮不出界。
 - 门: Mac make test 全绿(真模型套件 SKIP); spark make cuda-spark 过, 新 ds4-train 临时起 18800 验了 data/gen/页面后关掉, 生产 :8000(23:09 起的那个)没动, 它还是旧二进制(页面每次从盘读, 已是新页; 旧进程仍认 /api/train/gen, 重启它才换掉)。
 - **Release**: v0.1.0 删了重发两次, 现在 tag = 90c51ce, 四个附件(linux 265 MB / darwin 245 MB + sha256), 说明里加了双语一句; 包内核对: studio 有 ds4.lang、无"出题", ds4-train 有 /api/train/start、无 /api/train/gen。
+
+## 10-11 凌晨 · issue fodelf/YoungAi#1 工具调用不出 tool_calls(DSML 漏进 content)
+- **根因**: V4.1 官方 encoding.py 的 DSML 标签是 `<｜DSML｜ calls>` / `<｜DSML｜ invoke>` / `<｜DSML｜ parameter>`(块名 " calls", 标签名前带空格); 服务端一直在用 V4 的 `<｜DSML｜tool_calls>` 写工具说明、渲染历史、解析输出。模型被教了没训练过的写法, 写到一半漂成裸 `<parameter>`, 解析失败整段退回正文、finish=stop。spark 真模型按 issue 原请求复现: chat/responses 两条都坏。
+- **修法**(按 tokenizer 有没有 `<｜System｜>` 选写法, 那是 GGUF 里唯一看得出编码代际的标记; V4 字节不动):
+  解析侧四种写法一张表(dsml_syntaxes[DSML_SYN_SPACED] 新增), 非流式/OpenAI 流式/Anthropic 流式/KV 工具块定位全走表; 带空格写法的 string 值不做实体反转义(官方原样写, 只还原渲染侧给闭合标签加的那个 &lt;)。
+  渲染侧照官方: TOOLS_TEMPLATE 逐字、工具说明接在 system 正文之后、schema 与非字符串参数按 json.dumps 的 ", "/": " 形状(json_pyfmt_raw_value)、invoke/参数 "\n".join、相邻工具结果与用户文本并进同一个 <｜User｜> 用 "\n\n" 连。
+- **金标**: 官方 encoding.py 本机实跑出期望字节(case1 = 官方 tests/test_input_1, 与它自带 test_output_1.txt 逐字节同; case2 自造覆盖并行/零参数/非字符串参数/连续工具结果/\u 转义 schema), 加解析往返、OpenAI 流式三组单测。Mac make test 全绿。
+- **spark 真模型**(make cuda-spark, 停服后工作台按 pick 拉起): issue 两条原请求 → chat 出 tool_calls + finish=tool_calls, responses 出 function_call; 温 0 流式逐段 arguments 增量完整; 带工具结果的第二轮正常作答。
+  默认采样(温 1)20 条: **18 条 tool_calls, 2 条失败**, 原始输出: ① 写成裸 `<parameter name="command">`(没 DSML 前缀没 string 属性) ② `</｜DSML｜ invoke>\n</` 之后直接 EOS。参数内容都对, 错在语法 token 被采歪。
+  CLAUDE.md 写着"工具语法段服务端强制 temperature=0", 但核对代码: V4 路和 V4.1 路现在都没有(dsml_decode_state_uses_payload_sampling 是没人调用的死函数, 编译 warning 就是它; tracker 状态只用在 V4 路的 KV 存档判断)。
+- **对照上游 antirez/ds4**(用户: "原始项目是不是这么修复的, 是就这么修"): 上游三层 ① 解析认 `<｜DSML｜ calls>` ② 渲染换 V4.1 标签(bd66c40) ③ 工具语法位强制贪心、参数值照采样(22ca6ab)。①② 与我同; 差别: 上游工具说明是自己缩写的一段、放 system 之前、教 &lt; 转义 —— 我保留官方 encoding.py 原文(有金标)。③ 我们 fork 的 V4.1 路丢了, 补上。
+- **③ 的实现**: 采样核槽[3] 原来是保留集大小(只给自测打印), 改写原始 logits argmax(核里本来就算了 Mi, 零额外开销); 主机拼 want[] 时逐位问"已吐文本 + 接受前缀之后是不是工具语法", 是就取槽[3](贪心位验证 = 草稿等于 argmax 才接受, 采样位仍是拒绝采样)。
+  钩子放在每条请求本来就有的采样面 ds4_decode_sampling 里(greedy_fn/greedy_ud), 单 worker 路与并发路读同一份。★第一版给两条路各加了一个设钩子的接口, 用户否了("是否并发为什么加变量参数, 不要这样的定制代码"), 撤掉改成随采样面走★。
+  门: Mac make test 全绿(新增 pick 拼装 / 判定函数 / Metal 采样核槽[3] 单测); spark CUDA 采样核分布门全绿且槽[3] 与主机 argmax 同。
+- **spark 终测**(默认采样温 1): 40/40 tool_calls; issue 两条原请求正常; 无工具请求不受影响。
+  另记: 补 ③ 后某一趟 20 条里还有 1 条写成裸 `<parameter>` —— raw 续写逐位复现(272 token 与原请求逐位同): 那个前缀("不说话直接开工具块")下模型自己的 argmax 就是 `<` + `parameter`, 贪心救不了, 是模型行为不是服务端 bug; 上游同样会这样。
+- **提交 + Release**(用户: "提交commit, 删除release重新打, 都做完之后关闭issue用英语表示感谢"): 4294136 DSML 写法 / c6e2706 语法位贪心, 推 origin/restructure。
+  v0.1.0 第三次删了重发, tag = c6e2706, 四个附件 youngai-{linux-aarch64,darwin-arm64}-20261011(265 / 245 MB + sha256); 包内 ds4-server 字节匹配到 `<｜DSML｜ calls>` 与 v41_syntax_greedy。
+  说明里加了工具调用一句(中英), 并写明 10-11 重打没重走干净目录全链, 只在 spark 真模型上复测了工具调用。
+  撞: 第一次按 hunk 拆 commit 时, 测试文件里两件事挤在同一个大 hunk 里拆不开, 改成直接生成第一个 commit 该有的文件内容写进暂存区, 单独检出编过 + server 单测全绿再提交。
