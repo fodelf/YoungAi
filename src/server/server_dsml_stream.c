@@ -226,8 +226,10 @@ bool dsml_decode_state_is_tool(dsml_decode_state state) {
     return state != DSML_DECODE_OUTSIDE;
 }
 
-static bool dsml_decode_state_uses_payload_sampling(dsml_decode_state state) {
-    return state == DSML_DECODE_STRING_BODY || state == DSML_DECODE_JSON_STRING;
+/* 下一位是工具调用的协议语法(标签 / 参数头 / JSON 标点 / 闭合标记), 不是参数值。采样请求在这些位取 argmax
+ * (server_generate_v41.c v41_syntax_greedy); string 值体与 JSON 字符串照请求采样 —— 值也贪心的话长文件体会复读(上游 22ca6ab 的教训)。 */
+bool dsml_decode_state_is_syntax(dsml_decode_state state) {
+    return state != DSML_DECODE_OUTSIDE && state != DSML_DECODE_STRING_BODY && state != DSML_DECODE_JSON_STRING;
 }
 
 void dsml_decode_tracker_init(dsml_decode_tracker *dt) {

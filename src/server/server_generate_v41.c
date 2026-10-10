@@ -32,6 +32,28 @@ int v41_progress_cb(void *ud, const char *event, int current, int total) {
     return 1;
 }
 
+/* 引擎取下一个 token 之前问(ds4_greedy_fn, 规则见 core_v41_sample.c v41_sample_pick): 已吐的文本 + ahead 这几个还没吐的草稿 token 之后,
+ * 下一位是不是工具调用的协议语法。是 ⇒ 引擎取 argmax; 参数值与普通正文照请求采样。思考段里的 DSML 不算(那里的块不可执行, 与 v41_emit 同一条守卫)。
+ * ahead 要临时拼进 g->text 才能让 tracker 往前看: 拼在副本状态上, 文本长度事后退回, 不留痕。 */
+int v41_syntax_greedy(void *ud, const int32_t *ahead, uint32_t n) {
+    v41_gen *g = ud;
+    if (g->j->req.kind != REQ_CHAT || !g->j->req.has_tools) return 0;
+    dsml_decode_tracker dt = g->dsml_tracker;
+    thinking_state th = g->thinking;
+    const size_t keep = g->text.len;
+    for (uint32_t i = 0; i < n && ahead[i] != g->eos; i++) {
+        size_t len = 0;
+        char *piece = ds4_token_text(g->s->engine, ahead[i], &len);
+        ds4_buf_append(&g->text, piece, len);
+        thinking_state_feed(&th, piece, len);
+        free(piece);
+    }
+    if (g->text.ptr) dsml_decode_tracker_update(&dt, g->text.ptr, g->text.len);
+    g->text.len = keep;
+    if (g->text.ptr) g->text.ptr[keep] = '\0';
+    return !th.inside && dsml_decode_state_is_syntax(dt.decode);
+}
+
 /* 预填刚结束: 与 V4 路在 ds4_session_sync 之后做的事一样 —— 发流式头(预填心跳可能已经发过)、OpenAI 角色块、
  * Anthropic/Responses 的起始事件。失败 = 客户端没了, 返回 false, 调用方停止生成。 */
 static bool v41_stream_begin(v41_gen *g) {
@@ -363,6 +385,7 @@ bool v41_gen_begin(server *s, job *j, v41_gen *g) {
         .dry_multiplier = j->req.dry_set ? j->req.dry_multiplier : s->dry_multiplier,
         .dry_base = j->req.dry_set ? (j->req.dry_base > 1.f ? j->req.dry_base : 1.75f) : s->dry_base,
         .dry_allowed_length = j->req.dry_set ? (j->req.dry_allowed_length > 0 ? j->req.dry_allowed_length : 2) : s->dry_allowed_length,
+        .greedy_fn = v41_syntax_greedy, .greedy_ud = g,
     };
     const ds4_decode_sampling *sp = &g->sp;
     if (sp->temperature > 0.f || sp->dry_multiplier > 0.f || sp->freq_penalty != 0.f || sp->presence_penalty != 0.f)
@@ -413,6 +436,7 @@ void generate_job_v41(server *s, job *j) {
     mon_prefill(s, j->mon, g.prompt_tokens, 0, g.max_tokens);   /* 监控: 排队结束, 开始读提示 */
     const int rc = ds4_engine_v41_generate_argmax(s->engine, j->req.prompt.v, j->req.prompt.len, g.max_tokens, v41_emit, &g);
     ds4_engine_v41_set_progress(NULL, NULL);
+    ds4_engine_set_decode_sampling(NULL);   /* 采样面里的 greedy_ud 指向栈上的 g, 请求结束就清, 不留悬空指针给下一个读全局的人 */
     ds4_engine_v41_last_spec_stats(&g.spec_rounds, &g.spec_offered, &g.spec_accepted);
     v41_gen_end(&g, rc);
 }

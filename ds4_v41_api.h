@@ -74,10 +74,16 @@ int ds4_engine_draft_train(ds4_engine *e, const char *spec);
  * dry_multiplier > 0 开 DRY 序列复读惩罚(base 1.75 / allowed_length 2 是 llama.cpp 默认): 这是温 0 下也能挡死循环的唯一手段。
  * 任一惩罚非零时, 温 0 也走"读回 logits 行 → 罚 → argmax"这条路(argmax 由同一份采样器在温 0 时给出); 惩罚要按 token 史改 logits,
  * 投机不接它: 显式 --dspark + 惩罚 直接拒, 投机只是默认开着时该请求走纯解码并打日志。 */
+/* greedy_fn: 工具语法位贪心(2026-10-11)。取每个 token 之前问一次 greedy_fn(greedy_ud, ahead, n) —— "调用方已收到的文本后面再接
+ * ahead[0..n) 这几个 token, 下一位是不是工具调用的协议语法(DSML 标签 / 参数头 / JSON 标点)", 非 0 = 这一位取 argmax, 0 = 照采样。
+ * 跟着采样面走, 单请求路与并发请求态读的是同一份, 不分路。只在采样路生效(温 0 本来就是 argmax); NULL = 不问。
+ * 规则与实现见 core_v41_sample.c v41_sample_pick。 */
+typedef int (*ds4_greedy_fn)(void *ud, const int32_t *ahead, uint32_t n);
 typedef struct {
     float temperature, top_p, min_p; int top_k; uint64_t seed;
     float freq_penalty, presence_penalty;
     float dry_multiplier, dry_base; int dry_allowed_length;
+    ds4_greedy_fn greedy_fn; void *greedy_ud;
 } ds4_decode_sampling;
 void ds4_engine_set_decode_sampling(const ds4_decode_sampling *sp);
 /* 服务接入(2026-09-19, src/server/server_generate_v41.c): 预填每跑完一块回调一次("prefill_chunk", 已预填 token 数, 提示总数),

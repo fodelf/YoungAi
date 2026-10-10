@@ -19,6 +19,9 @@
  *   两种合起来吐出 token 的边缘分布都恰是 p; 后者接受率上限 Σmin(p,q), 分布平时远高于点质量的 p(argmax q)。
  *   接受硬币与 Gumbel 噪声用不同盐, 草稿抽样(stream 1)与验证(stream 0)用不同流 ⇒ 全部独立。残差为空(p == q 或 K ⊆ {d})时直接接受。
  *   末行没有草稿, 只出全分布样本。
+ * 槽的四个字: [0] 全分布样本 / [1] 草稿接受 / [2] 拒绝时的残差样本 / [3] 原始 logits 的 argmax(并列取小下标, 与 argmax 核同)。
+ *   [3] 给服务端"工具语法位贪心"用(server_generate_v41.c v41_syntax_greedy): 采样请求里 DSML 标签那几位要取 argmax,
+ *   不然温 1 下 10% 的工具调用标签被采歪(<parameter> 丢了 DSML 前缀)、整个调用解析失败; 顺手在这一发里出, 不用为它再跑 argmax 核。
  * 出错会怎样: 全行非有限 → 四个字全 0(与主机 sample_argmax 的兜底同: 下标 0); 温度 ≤ 0 不该进这个核(调用方走 argmax 核, 那是贪心的门)。 */
 
 #define V41_SAMPLE_THREADS 1024u
@@ -178,14 +181,13 @@ __global__ static void v41_sample_kernel(int32_t *out, const float *logits, cons
         Zp = v41_blk_sumf(sf, zp); Zq = v41_blk_sumf(sf, zq);
     }
     /* 保留集上的 Gumbel-max: 全分布样本; 残差样本(q: max(0, p−q) 上 / 点质量: 去掉 d); 顺手算 Z_K、p(d)、q(d) 的分子 */
-    float gb = -INFINITY, gxb = -INFINITY, zk = 0.0f, md = 0.0f, mqd = 0.0f; int32_t gi = -1, gxi = -1; uint32_t nk = 0u;
+    float gb = -INFINITY, gxb = -INFINITY, zk = 0.0f, md = 0.0f, mqd = 0.0f; int32_t gi = -1, gxi = -1;
     for (uint32_t i = threadIdx.x; i < V; i += blockDim.x) {
         const float v = l[i];
         /* q(d) 要在 p 的保留集之外也算到(09-29 自测实撞: 草稿落在 K_p 外时这里以前直接 continue, q(d) 留 0 被当成"抽不出来的草稿"而接受,
          * 吐出保留集外的 token) —— 草稿在 K_p 外 ⇒ p(d) = 0 ⇒ 必拒 */
         if (lq && (int32_t)i == d) { const float vq = lq[i]; mqd = (isfinite(vq) && v41_fkey(vq) >= cutq) ? expf((vq - Mq) * inv_T) : 0.0f; }
         if (!isfinite(v) || v41_fkey(v) < cut) continue;
-        nk++;
         const float m = expf((v - M) * inv_T);
         zk += m;
         if ((int32_t)i == d) md = m;
@@ -211,10 +213,6 @@ __global__ static void v41_sample_kernel(int32_t *out, const float *logits, cons
     const float ZK = v41_blk_sumf(sf, zk);
     const float MD = v41_blk_sumf(sf, md);     /* 只有一个线程持有 d 的项, 求和 = 取值 */
     const float MQD = v41_blk_sumf(sf, mqd);
-    if (threadIdx.x == 0) s_u64 = 0ull;
-    __syncthreads();
-    atomicAdd(&s_u64, (unsigned long long)nk);
-    __syncthreads();
     if (threadIdx.x == 0) {
         int32_t acc = 0;
         if (d >= 0) {
@@ -226,7 +224,7 @@ __global__ static void v41_sample_kernel(int32_t *out, const float *logits, cons
                 acc = (qd <= 0.0f || v41_u01(seed, p, (uint32_t)d, salt_a) < pd / qd) ? 1 : 0;
             } else acc = v41_u01(seed, p, (uint32_t)d, salt_a) < pd ? 1 : 0;
         }
-        o[0] = full; o[1] = acc; o[2] = resid >= 0 ? resid : full; o[3] = (int32_t)s_u64;
+        o[0] = full; o[1] = acc; o[2] = resid >= 0 ? resid : full; o[3] = Mi;
     }
 }
 

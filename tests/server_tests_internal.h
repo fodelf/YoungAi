@@ -49,6 +49,7 @@ void test_render_matches_official_v41_encoding(void);
 void test_render_matches_official_spaced_dsml_tools(void);
 void test_parse_spaced_dsml_tool_calls(void);
 void test_openai_stream_spaced_dsml_tool_call(void);
+void test_syntax_greedy_spaced_dsml(void);
 void test_render_non_thinking_prompt_closes_think(void);
 void test_render_drops_old_reasoning_without_tools(void);
 void test_render_preserves_reasoning_with_tools(void);

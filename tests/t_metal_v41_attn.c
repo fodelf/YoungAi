@@ -127,21 +127,22 @@ static void test_sampler(void) {
     ds4_gpu_sample_params sp = { 1.0f, 1.0f, 0.0f, 0, 12345u, 0 };
     TEST_ASSERT(ds4_gpu_v41_sample_tensor(to, tl, 0, R, V, tp, tt, &sp, NULL) != 0 && test_v41_read(to, out, R * 16));
     uint32_t hit = 0, ok = 0;
-    for (uint32_t r = 0; r < R; r++) { if (out[4 * r] == 77) hit++; if (out[4 * r] >= 0 && out[4 * r] < (int)V && out[4 * r + 3] == (int)V) ok++; }
+    for (uint32_t r = 0; r < R; r++) { if (out[4 * r] == 77) hit++; if (out[4 * r] >= 0 && out[4 * r] < (int)V && out[4 * r + 3] == 77) ok++; }   /* 槽[3] = 原始 argmax(工具语法位贪心取它) */
     /* 77 的概率 ≈ e^8/(e^8 + Σ_others) ≈ 0.6~0.7(随机 logits ±2), 64 行里命中应远多于 20 */
     fprintf(stderr, "ds4: [v41-test] sampler 温 1: 峰值词命中 %u/%u, 结构合法 %u/%u\n", hit, R, ok, R);
     TEST_ASSERT(ok == R && hit >= 20);
     sp.top_k = 1;
     TEST_ASSERT(ds4_gpu_v41_sample_tensor(to, tl, 0, R, V, tp, tt, &sp, NULL) != 0 && test_v41_read(to, out, R * 16));
-    uint32_t am = 0; for (uint32_t r = 0; r < R; r++) if (out[4 * r] == 77 && out[4 * r + 3] == 1) am++;
-    fprintf(stderr, "ds4: [v41-test] sampler top_k=1: argmax 命中 %u/%u(保留集 1)\n", am, R); TEST_ASSERT(am == R);
+    uint32_t am = 0; for (uint32_t r = 0; r < R; r++) if (out[4 * r] == 77 && out[4 * r + 3] == 77) am++;
+    fprintf(stderr, "ds4: [v41-test] sampler top_k=1: argmax 命中 %u/%u\n", am, R); TEST_ASSERT(am == R);
     sp.top_k = 0; sp.top_p = 0.5f;
     TEST_ASSERT(ds4_gpu_v41_sample_tensor(to, tl, 0, R, V, tp, tt, &sp, NULL) != 0 && test_v41_read(to, out, R * 16));
-    uint32_t small = 0; for (uint32_t r = 0; r < R; r++) if (out[4 * r + 3] >= 1 && out[4 * r + 3] < 50) small++;
-    fprintf(stderr, "ds4: [v41-test] sampler top_p=0.5: 保留集 <50 的行 %u/%u\n", small, R); TEST_ASSERT(small == R);
+    /* 峰值词 77 的概率 ≈ 0.6 > 0.5 ⇒ top_p=0.5 的保留集只剩它: 每行必抽到 77 */
+    uint32_t small = 0; for (uint32_t r = 0; r < R; r++) if (out[4 * r] == 77 && out[4 * r + 3] == 77) small++;
+    fprintf(stderr, "ds4: [v41-test] sampler top_p=0.5: 只剩峰值词 %u/%u\n", small, R); TEST_ASSERT(small == R);
     sp.top_p = 1.0f; sp.min_p = 0.5f;
     TEST_ASSERT(ds4_gpu_v41_sample_tensor(to, tl, 0, R, V, tp, tt, &sp, NULL) != 0 && test_v41_read(to, out, R * 16));
-    uint32_t one = 0; for (uint32_t r = 0; r < R; r++) if (out[4 * r] == 77 && out[4 * r + 3] == 1) one++;
+    uint32_t one = 0; for (uint32_t r = 0; r < R; r++) if (out[4 * r] == 77 && out[4 * r + 3] == 77) one++;
     fprintf(stderr, "ds4: [v41-test] sampler min_p=0.5: 只剩峰值词 %u/%u\n", one, R); TEST_ASSERT(one == R);
     /* 投机: 草稿 = 下一行的输入 token; 温 1 下接受标志必须是 0/1, 残差样本 ≠ 草稿(残差非空时) */
     sp.min_p = 0.f;

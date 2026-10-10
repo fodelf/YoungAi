@@ -138,6 +138,7 @@ bool raw_partial_lit(const char *raw, size_t raw_len, size_t pos, const char *li
 bool raw_partial_any(const char *raw, size_t raw_len, size_t pos, const char *a, const char *b);
 const char *find_lit_bounded(const char *s, size_t n, const char *lit);
 bool dsml_decode_state_is_tool(dsml_decode_state state);
+bool dsml_decode_state_is_syntax(dsml_decode_state state);
 void dsml_decode_tracker_init(dsml_decode_tracker *dt);
 void dsml_decode_tracker_update(dsml_decode_tracker *dt, const char *raw, size_t raw_len);
 size_t tool_param_value_stream_safe_len(const char *raw, size_t start, size_t raw_len, const dsml_syntax *syn, bool is_string);
@@ -310,6 +311,7 @@ enum { V41_ALIVE_CHECK_TOKENS = 16 };
 bool v41_gen_begin(server *s, job *j, v41_gen *g);   /* false = 请求不合法, 错误响应已发 */
 int v41_emit(int token, void *ud);                    /* 引擎逐 token 回调; 非 0 = 停 */
 int v41_progress_cb(void *ud, const char *event, int current, int total);   /* 预填块间: 心跳 + 探客户端; 非 0 = 中止 */
+int v41_syntax_greedy(void *ud, const int32_t *ahead, uint32_t n);   /* 引擎取 token 前问: 下一位是工具语法 ⇒ 取 argmax(ds4_greedy_fn) */
 void v41_gen_end(v41_gen *g, int rc);                 /* rc = 引擎返回码(非 0 且没出过 token = 预填失败) */
 /* V4.1 并发调度器(server_sched_v41.c, batch.md §3.2): --batch N ≥ 2 时 worker 线程整个交给它 */
 void v41_sched_run(server *s);

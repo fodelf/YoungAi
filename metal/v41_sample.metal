@@ -119,7 +119,7 @@ kernel void kernel_v41_sample(constant v41_sample_args &a [[buffer(0)]], device 
                               device const float *qlogits [[buffer(3)]], device const int *pos [[buffer(4)]], device const int *tok [[buffer(5)]],
                               uint blk [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
     threadgroup float sf[V41_SAMPLE_THREADS]; threadgroup int si[V41_SAMPLE_THREADS];
-    threadgroup atomic_uint hlo[V41_SAMPLE_BINS], hhi[V41_SAMPLE_BINS], zlo, zhi, nk_sum;
+    threadgroup atomic_uint hlo[V41_SAMPLE_BINS], hhi[V41_SAMPLE_BINS], zlo, zhi;
     threadgroup uint s_prefix; threadgroup ulong s_u64;
     const uint V = a.V, r = a.row0 + blk;
     device const float *l = logits + (ulong)r * V;
@@ -146,12 +146,11 @@ kernel void kernel_v41_sample(constant v41_sample_args &a [[buffer(0)]], device 
         }
         Zp = v41_blk_sumf(sf, zp, tid); Zq = v41_blk_sumf(sf, zq, tid);
     }
-    float gb = -INFINITY, gxb = -INFINITY, zk = 0.0f, md = 0.0f, mqd = 0.0f; int gi = -1, gxi = -1; uint nk = 0u;
+    float gb = -INFINITY, gxb = -INFINITY, zk = 0.0f, md = 0.0f, mqd = 0.0f; int gi = -1, gxi = -1;
     for (uint i = tid; i < V; i += V41_SAMPLE_THREADS) {
         const float v = l[i];
         if (haveq && (int)i == d) { const float vq = lq[i]; mqd = (v41_finite(vq) && v41_fkey(vq) >= cutq) ? precise::exp((vq - Mq) * a.inv_T) : 0.0f; }
         if (!v41_finite(v) || v41_fkey(v) < cut) continue;
-        nk++;
         const float m = precise::exp((v - M) * a.inv_T);
         zk += m;
         if ((int)i == d) md = m;
@@ -170,10 +169,6 @@ kernel void kernel_v41_sample(constant v41_sample_args &a [[buffer(0)]], device 
     v41_tg_argmax(gb, gi, sf, si, tid, V41_SAMPLE_THREADS, tv, full);
     v41_tg_argmax(gxb, gxi, sf, si, tid, V41_SAMPLE_THREADS, tv, resid);
     const float ZK = v41_blk_sumf(sf, zk, tid), MD = v41_blk_sumf(sf, md, tid), MQD = v41_blk_sumf(sf, mqd, tid);
-    if (tid == 0u) atomic_store_explicit(&nk_sum, 0u, memory_order_relaxed);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    atomic_fetch_add_explicit(&nk_sum, nk, memory_order_relaxed);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0u) {
         int acc = 0;
         if (d >= 0) {
@@ -183,6 +178,6 @@ kernel void kernel_v41_sample(constant v41_sample_args &a [[buffer(0)]], device 
             else if (haveq) { const float qd = MQD / Zq; acc = (qd <= 0.0f || v41_u01(a.seed, p, (uint)d, salt_a) < pd / qd) ? 1 : 0; }
             else acc = v41_u01(a.seed, p, (uint)d, salt_a) < pd ? 1 : 0;
         }
-        o[0] = full; o[1] = acc; o[2] = resid >= 0 ? resid : full; o[3] = (int)atomic_load_explicit(&nk_sum, memory_order_relaxed);
+        o[0] = full; o[1] = acc; o[2] = resid >= 0 ? resid : full; o[3] = Mi;   // [3] = 原始 argmax, 用途见 CUDA 版头注释
     }
 }

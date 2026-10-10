@@ -149,8 +149,12 @@ int main(void) {
             for (uint32_t i = 0; i + 1u < ROWS; i++) { const int32_t *o = out + 4u * i; cnt_q[o[1] ? tok[i + 1u] : o[2]]++; naccq += o[1] ? 1u : 0u; }
         }
         const uint32_t n_spec = N / ROWS * (ROWS - 1u);
-        printf("== %s: 保留集 %d 项(核报), 确定性 %s\n", r->name, out[3], ndet ? "✓" : "★两遍不同★");
-        fail |= !ndet;
+        /* 槽 [3] = 原始 logits 的 argmax(工具语法位贪心取它): 与主机顺序扫(同值取小下标)必须同一个下标 */
+        int32_t host_am = -1;
+        for (uint32_t i = 0; i < V; i++) if (isfinite(l[i]) && (host_am < 0 || l[i] > l[host_am])) host_am = (int32_t)i;
+        const int ambad = out[3] != host_am;
+        printf("== %s: 槽[3] argmax %d vs 主机 %d %s, 确定性 %s\n", r->name, out[3], host_am, ambad ? "★不同★" : "✓", ndet ? "✓" : "★两遍不同★");
+        fail |= !ndet || ambad;
         fail |= check_freq("① 全分布", cnt, p, N);
         fail |= check_freq("② 点质量草稿边缘", cnt_spec, p, n_spec);
         const double acc = (double)nacc / n_spec, sd = sqrt(p[d] * (1.0 - p[d]) / n_spec);

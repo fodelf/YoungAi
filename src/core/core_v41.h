@@ -245,7 +245,7 @@ void v41_sched_draft_cost(v41_sched *s, double ms);                 /* 草稿一
  * 设备槽每行 4 个 int32(ds4_gpu_v41_sample_tensor 的口径; argmax 路只用 [0]): pick 把 n 行槽拼成 want[i] =
  * "第 i 行之后该是哪个 token" —— 采样 + 有草稿: 接受 ⇒ 草稿 token, 拒绝 ⇒ 残差样本(必 ≠ 草稿); 否则 = [0]。
  * 于是投机的"接受最长前缀 = want[a] == batch[a+1]"那一行对贪心与采样是同一句。 */
-void v41_sample_pick(const int32_t *slot, const int32_t *batch, uint32_t n, int dev_sample, int32_t *want);
+void v41_sample_pick(const ds4_v41_state *st, const int32_t *slot, const int32_t *batch, uint32_t n, int32_t *want);
 /* 直发: 对 logits 第 row0..row0+n-1 行发采样核(dev_sample)或逐行 argmax, 同步, 读回, 拼 want[n]。batch = 这 n 行的输入 token(草稿判据), 单行给 NULL */
 bool v41_device_next(ds4_v41_state *st, ds4_gpu_tensor *am, uint32_t row0, uint32_t n, const int32_t *batch, int32_t *want);
 extern ds4_decode_sampling g_decode_sampling;   /* ds4_engine_set_decode_sampling 设的每请求采样面(core_v41_api.c) */

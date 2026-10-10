@@ -14,10 +14,20 @@
 #include "core_internal.h"
 #ifndef DS4_NO_GPU
 
-void v41_sample_pick(const int32_t *slot, const int32_t *batch, uint32_t n, int dev_sample, int32_t *want) {
+/* ★工具语法位取 argmax★(2026-10-11, 与上游 antirez/ds4 22ca6ab 同一条规则): 采样请求里 DSML 标签/参数头/JSON 标点这些协议字节取贪心,
+ * 参数值(文件内容/命令)照请求采样 —— 值也贪心的话长文件体会复读。不这么做: 温 1 实测 20 条工具调用 2 条标签被采歪
+ * (<parameter> 丢了 DSML 前缀; </ 之后直接 EOS), 解析失败整条调用作废(issue fodelf/YoungAi#1)。
+ * 第 i 行之前的文本 = 服务端已收到的 + batch[1..i](接受前缀), 所以逐位问; 某位没接受草稿, 后面的位用不上, 不再问。
+ * 贪心位的验证 = 草稿等于 argmax 才接受(贪心投机的判据), 采样位仍是拒绝采样 —— 混在一轮里, 每位的边缘分布各自正确。
+ * 槽 [3] 是采样核顺手写的原始 argmax(cuda_v41_sample.inc.cu 头注释); argmax 路(温 0)本来就是 [0], 不问。 */
+void v41_sample_pick(const ds4_v41_state *st, const int32_t *slot, const int32_t *batch, uint32_t n, int32_t *want) {
+    const ds4_decode_sampling *sp = st->psamp ? st->psamp : &g_decode_sampling;
+    bool ask = st->dev_sample && sp->greedy_fn;
     for (uint32_t i = 0; i < n; i++) {
         const int32_t *s = slot + 4u * i;
-        want[i] = (dev_sample && batch && i + 1u < n) ? (s[1] ? batch[i + 1u] : s[2]) : s[0];
+        if (ask && sp->greedy_fn(sp->greedy_ud, batch ? batch + 1 : NULL, i)) want[i] = s[3];
+        else want[i] = (st->dev_sample && batch && i + 1u < n) ? (s[1] ? batch[i + 1u] : s[2]) : s[0];
+        if (ask && !(batch && i + 1u < n && want[i] == batch[i + 1u])) ask = false;
     }
 }
 
@@ -35,7 +45,7 @@ bool v41_device_next(ds4_v41_state *st, ds4_gpu_tensor *am, uint32_t row0, uint3
                 !ds4_gpu_tensor_read(am, 0, &slot[4u * i], 4)) return false;
         }
     }
-    v41_sample_pick(slot, batch, n, st->dev_sample, want);
+    v41_sample_pick(st, slot, batch, n, want);
     return true;
 }
 
@@ -47,7 +57,9 @@ bool v41_next_token(ds4_v41_state *st, ds4_gpu_tensor *am, uint32_t row, float *
     if (h && h->n && (sp->dry_multiplier > 0.f || sp->freq_penalty != 0.f || sp->presence_penalty != 0.f))
         ds4_decode_penalize(rowbuf, DS4_N_VOCAB, h->tok, h->n, h->brk, sp->freq_penalty, sp->presence_penalty,
                             sp->dry_multiplier, sp->dry_base, sp->dry_allowed_length);
-    *out = (int32_t)ds4_sample_logits(rowbuf, (int)DS4_N_VOCAB, sp->temperature, sp->top_k, sp->top_p, sp->min_p, rng);
+    /* 惩罚路同一条工具语法位规则(v41_sample_pick): 温 0 时采样器给罚后的 argmax */
+    const float temp = (sp->greedy_fn && sp->greedy_fn(sp->greedy_ud, NULL, 0)) ? 0.f : sp->temperature;
+    *out = (int32_t)ds4_sample_logits(rowbuf, (int)DS4_N_VOCAB, temp, sp->top_k, sp->top_p, sp->min_p, rng);
     if (h && h->n < h->cap) h->tok[h->n++] = *out;
     return true;
 }

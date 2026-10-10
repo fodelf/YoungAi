@@ -215,6 +215,45 @@ static void units_test_sample_tiny_top_p_is_argmax(void) {
         TEST_ASSERT(ds4_sample_logits(logits, UNITS_VOCAB, 1.0f, 0, 1e-6f, 0.0f, &rng) == 42);
 }
 
+#ifndef DS4_NO_GPU
+/* 工具语法位贪心的拼装(core_v41_sample.c v41_sample_pick): 槽每行 {样本, 接受, 残差, argmax}, batch = {轮首, 草稿1, 草稿2, 草稿3}。
+ * 钩子只在"已接受 1 个草稿之后"那一位说贪心。要验: ① 贪心位取槽[3], 哪怕采样核判了接受; ② 问的 ahead 就是接受前缀;
+ * ③ 某位没接受草稿之后不再问(后面的位用不上, 问了还白拼文本)。 */
+static uint32_t units_greedy_calls, units_greedy_last_n;
+static const int32_t *units_greedy_ahead;
+static int units_greedy_at1(void *ud, const int32_t *ahead, uint32_t n) {
+    (void)ud;
+    units_greedy_calls++; units_greedy_last_n = n; units_greedy_ahead = ahead;
+    return n == 1;
+}
+
+static void units_test_sample_pick_greedy_hook(void) {
+    static ds4_v41_state st;   /* 只读 dev_sample 与 psamp(采样面里的 greedy_fn) */
+    memset(&st, 0, sizeof st);
+    ds4_decode_sampling sp = { .temperature = 1.f, .greedy_fn = units_greedy_at1 };
+    st.dev_sample = 1;
+    st.psamp = &sp;
+    const int32_t batch[4] = {100, 5, 6, 7};
+    int32_t want[4];
+    /* 贪心位 argmax 恰等于草稿 ⇒ 接着验下一位(采样位, 拒绝 ⇒ 残差 4), 之后不再问 */
+    const int32_t a[16] = {9, 1, 8, 99,   20, 0, 21, 6,   3, 0, 4, 55,   1, 1, 2, 3};
+    units_greedy_calls = 0;
+    v41_sample_pick(&st, a, batch, 4, want);
+    TEST_ASSERT(want[0] == 5 && want[1] == 6 && want[2] == 4);
+    TEST_ASSERT(units_greedy_calls == 3 && units_greedy_last_n == 2 && units_greedy_ahead == batch + 1);
+    /* 贪心位 argmax ≠ 草稿: 即使采样核判接受(槽[1]=1)也取 argmax 42, 草稿到此为止 */
+    const int32_t b[16] = {9, 1, 8, 99,   20, 1, 21, 42,   3, 1, 4, 55,   1, 1, 2, 3};
+    units_greedy_calls = 0;
+    v41_sample_pick(&st, b, batch, 4, want);
+    TEST_ASSERT(want[0] == 5 && want[1] == 42);
+    TEST_ASSERT(units_greedy_calls == 2);
+    /* 没有钩子 = 原口径(接受 ⇒ 草稿 / 拒绝 ⇒ 残差) */
+    sp.greedy_fn = NULL;
+    v41_sample_pick(&st, b, batch, 4, want);
+    TEST_ASSERT(want[0] == 5 && want[1] == 6 && want[2] == 7 && want[3] == 1);
+}
+#endif
+
 void test_engine_units(void) {
     units_shape_shrink();
     units_test_freq_accumulates_presence_once();
@@ -229,6 +268,9 @@ void test_engine_units(void) {
     units_test_sample_temp0_is_argmax();
     units_test_sample_seed_reproducible();
     units_test_sample_tiny_top_p_is_argmax();
+#ifndef DS4_NO_GPU
+    units_test_sample_pick_greedy_hook();
+#endif
 }
 
 /* ---- rax 基数树 -------------------------------------------------------- */

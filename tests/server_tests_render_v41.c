@@ -208,6 +208,38 @@ void test_parse_spaced_dsml_tool_calls(void) {
     ds4_chat_set_system_token(false);
 }
 
+/* 工具语法位贪心的判定(v41_syntax_greedy): 标签/参数头处 = 贪心, string 值体里 = 照采样, 思考段里 = 不管, 块外正文 = 不管 */
+static int syntax_greedy_after(const char *text, bool thinking_inside) {
+    v41_gen g;
+    memset(&g, 0, sizeof g);
+    static job j;   /* 判定只读 req.kind / req.has_tools */
+    j.req.kind = REQ_CHAT;
+    j.req.has_tools = true;
+    g.j = &j;
+    dsml_decode_tracker_init(&g.dsml_tracker);
+    g.thinking.inside = thinking_inside;
+    ds4_buf_puts(&g.text, text);
+    dsml_decode_tracker_update(&g.dsml_tracker, g.text.ptr, g.text.len);
+    const int r = v41_syntax_greedy(&g, NULL, 0);
+    TEST_ASSERT(g.text.len == strlen(text));   /* 往前看不能改动已吐文本 */
+    ds4_buf_free(&g.text);
+    return r;
+}
+
+void test_syntax_greedy_spaced_dsml(void) {
+    const char *head = "Listing.\n\n" DS4_TOOL_CALLS_START_SPACED "\n" DS4_INVOKE_START_SPACED " name=\"bash\">\n";
+    TEST_ASSERT(syntax_greedy_after("Listing.", false) == 0);
+    TEST_ASSERT(syntax_greedy_after(head, false) == 1);
+    TEST_ASSERT(syntax_greedy_after(head, true) == 0);
+    char buf[512];
+    snprintf(buf, sizeof buf, "%s" DS4_PARAM_START_SPACED " name=\"command\" string=\"true\">ls -la", head);
+    TEST_ASSERT(syntax_greedy_after(buf, false) == 0);   /* 参数值: 照请求采样 */
+    snprintf(buf, sizeof buf, "%s" DS4_PARAM_START_SPACED " name=\"n\" string=\"false\">", head);
+    TEST_ASSERT(syntax_greedy_after(buf, false) == 1);   /* JSON 值的结构位(数字/括号): 贪心 */
+    snprintf(buf, sizeof buf, "%s" DS4_PARAM_START_SPACED " name=\"command\" string=\"true\">ls" DS4_PARAM_END_SPACED "\n", head);
+    TEST_ASSERT(syntax_greedy_after(buf, false) == 1);   /* 值关了, 回到标签位 */
+}
+
 /* OpenAI 流式: 带空格写法也要逐段吐 tool_calls 增量, 原始 DSML 一个字节都不能漏进 content */
 void test_openai_stream_spaced_dsml_tool_call(void) {
     int sv[2];

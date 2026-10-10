@@ -297,7 +297,7 @@ static bool dg_wait(ds4_engine *e, ds4_v41_state *st, int32_t *next) {
     __sync_synchronize();
     if (st->egraph_err || (!st->no_engram && v41_engram_graph_err(st))) { fprintf(stderr, "ds4: [graph] engram 取行失败(位置 %u)\n", st->pos0); return false; }
     /* 每行 4 个 int: 采样路按"接受 ⇒ 草稿 / 拒绝 ⇒ 残差"拼, argmax 路取第 0 个(core_v41_sample.c) */
-    v41_sample_pick(g->next, g->tokv, n, st->dev_sample, next);
+    v41_sample_pick(st, g->next, g->tokv, n, next);
     dg_advance(st, n);
     if (n != 1u) g->bsteps++; else if (g->cur_pure) g->steps++; else g->k0steps++;
     return true;

@@ -199,7 +199,7 @@ bool v41_multi_graph_round(ds4_engine *e, ds4_v41_batch *b, ds4_v41_state **m, c
     for (uint32_t i = 0; i < nm; i++) if (!m[i]->no_engram && v41_engram_graph_err(m[i])) eg_ok = false;
     if (!eg_ok) { fprintf(stderr, "ds4: [mgraph] engram 取行失败\n"); return false; }
     for (uint32_t i = 0; i < nm; i++) {
-        v41_sample_pick(g->next + 4u * r0[i], tok + r0[i], nr[i], m[i]->dev_sample, want + r0[i]);
+        v41_sample_pick(m[i], g->next + 4u * r0[i], tok + r0[i], nr[i], want + r0[i]);
         /* 位置按闭式推进(图里的核按设备位置写缓存, 主机只记同一个数; 与 core_decode_graph.c dg_advance 同式) */
         ds4_v41_state *st = m[i];
         v41_multi_advance(st, nr[i]);
