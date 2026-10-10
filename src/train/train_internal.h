@@ -5,7 +5,8 @@
  *   模型    ds4-server 由它直接 fork/exec(train_model.c), 绑 127.0.0.1:<页面端口+1>(TR_MODEL_PORT); 主进程把 /v1/… /monitor /metrics
  *           与要问活引擎的两条(/api/models/plugins 热切、/api/models/list)原字节转给它(train_proxy.c), 页面与 API 客户端只认主进程的端口。
  *   训练    主进程里一条作业线程(train_job.c): 停模型子进程 → fork ./ds4 --ptrain → wt2 门(train_gate.c: fork ./ds4 --score-ids 两臂 +
- *           anchor_metrics 五指标)→ 选轮 → 模型子进程按 gguf/serve_pick.txt 装回来。出题(train_gen.c)同一条线: fork ./ds4 --gen-jobs → 拆问答。
+ *           anchor_metrics 五指标)→ 选轮 → 模型子进程按 gguf/serve_pick.txt 装回来。
+ *           (页面上原有的"出题"(文档 → 模型写问答)10-10 按用户要求删掉; 文档上传后直接成原文料 <目录>.text.jsonl 可训。)
  *   ★流程编排全在 C 里, 页面不调任何 shell 脚本★(10-10 用户: "所有功能不应该是 c 代码实现的吗, 为什么一直看你在改 sh 脚本"):
  *   此前停模型/训/门/选轮/起服散在 train_cycle.sh + z_nightly_spark.sh + v41_judge.sh + serve_1m_spark.sh 里, 产品行为(训完挂不挂)埋在脚本,
  *   发布包要带五个脚本, Mac 上跑不了。脚本保留为命令行工具, 产物目录布局/日志格式与它们一致, 记录页两边都能读。
@@ -14,7 +15,7 @@
  * 为什么不在进程内卸引擎再重装: CUDA 清理后重初始化从没走过, 崩在中间页面也没了; 进程级起停是天天在用的路。
  * 一份实现: 数据面(train_runs.c, 盘上产物 → JSON)+ 控制面(train_ctl.c /proc 扫 + train_child.c 子进程 + train_model.c/train_job.c)+ 路由(train_api.c)
  *   两个二进制共用: ds4-server 也出同一页(直接开它的端口能聊、能热切), 但发车/换模型/起服这些"管子进程"的操作只在主进程里做(serving=1 时拒)。
- * 接口: GET / 页; GET /api/train/status|runs|run?name=|data|preview; POST /api/train/start|gen|stop|serve|upload?kind=jsonl|doc&name=&dir=(原始体)。
+ * 接口: GET / 页; GET /api/train/status|runs|run?name=|data|preview; POST /api/train/start|stop|serve|upload?kind=jsonl|doc&name=&dir=(原始体)。
  * 模型页(train_models.c, 10-10 用户 "少一个模型 tab, 可以下载模型, 跟 unsloth 的客户端页面一样"):
  *   GET /api/models/list(本机 GGUF + 配套侧车 + 正在用的 + HF 下载进度); POST /api/models/download|cancel|load|plugins。
  *   加载 = 写 gguf/serve_pick.txt 再(重)起模型子进程。 */
@@ -65,7 +66,7 @@ extern char tr_datad[TR_PATH];      /* $ROOT/gguf-tools/data/posttrain */
 /* train_runs.c: 盘上产物 → JSON */
 void tr_json_runs(ds4_buf *b);                 /* [{name, ...摘要}] 按 ptrain.cfg 修改时间倒序 */
 bool tr_json_run(ds4_buf *b, const char *name);   /* 一趟全量; 目录不存在返回 false */
-void tr_json_data(ds4_buf *b);                 /* {jsonl:[...], dirs:[...]} */
+void tr_json_data(ds4_buf *b);                 /* {jsonl:[...]} */
 long tr_mem_avail_mb(void);                    /* /proc/meminfo MemAvailable(MB); 没有 -1 */
 bool tr_run_active(const char *dir);           /* 这趟的 train.out 近两分钟内还在写 */
 char *tr_slurp(const char *path, size_t *len); /* 整文件读进 malloc 缓冲(NUL 结尾); 没有 NULL */
@@ -99,15 +100,14 @@ tr_model_phase tr_model_state(void);
 bool tr_model_live(void);                      /* 模型子进程在且装完了(冒烟过): 这时才转发 */
 bool tr_pick_read(char *g, size_t gn, char *z, size_t zn, char *extra[], int max_extra, char *storage, size_t sn);   /* serve_pick.txt: ①, ②(none→空), 第 3 行起的额外参数 */
 
-/* train_job.c: 训练/出题作业线程(一次一条) */
-typedef enum { TR_JOB_NONE, TR_JOB_STOP_MODEL, TR_JOB_TRAIN, TR_JOB_GATE, TR_JOB_GEN, TR_JOB_RESTART } tr_job_phase;
-typedef struct { bool active, gen; tr_job_phase phase; pid_t child; char run[256]; } tr_job_info;   /* run = 训练目录名(kd-…)或料目录 */
+/* train_job.c: 训练作业线程(一次一条) */
+typedef enum { TR_JOB_NONE, TR_JOB_STOP_MODEL, TR_JOB_TRAIN, TR_JOB_GATE, TR_JOB_RESTART } tr_job_phase;
+typedef struct { bool active; tr_job_phase phase; pid_t child; char run[256]; } tr_job_info;   /* run = 训练目录名(kd-…) */
 bool tr_job_train(const char *data_rel, const char *epochs, const char *layers, const char *lr, const char *extra, int model_port, char *err, size_t errn);
-bool tr_job_gen(const char *dir_rel, const char *rounds, int model_port, char *err, size_t errn);
 bool tr_job_stop(char *err, size_t errn);      /* 杀正在跑的 ./ds4; 作业线程收到后照样把模型装回来 */
 void tr_job_status(tr_job_info *out);
 bool tr_job_owns(const char *run_dir_abs);     /* 这趟目录是正在跑的作业的(记录页判 running 用: 门阶段 train.out 不动, 只看文件时间会误判"没选轮") */
-/* 训练/出题/打分共用的 ./ds4 参数前缀: --cuda -m ① [--zchain ②] [--engram-dir …]; 返回 argv 项数 */
+/* 训练/打分共用的 ./ds4 参数前缀: --cuda -m ① [--zchain ②] [--engram-dir …]; 返回 argv 项数 */
 int tr_ds4_base_argv(const char *argv[], int max, const char *mdl, const char *zch, char *const extra[], int nextra);
 
 /* train_gate.c: wt2 门 + 选轮 */
@@ -117,10 +117,6 @@ int tr_ds4_base_argv(const char *argv[], int max, const char *mdl, const char *z
 /* 对 run_dir 下每个 ckpt_eNN 跑 ② 臂(一次)与 ②+③ 臂, 判决全文落 eval/gate_ckpt_eNN.txt(先 ② 后 ②+③, 记录页同口径读), 过门里留出损失最低者写 pick.txt;
  * 返回选中的 ckpt 名(空串 = 没有一轮过门或失败) */
 bool tr_gate_pick(const char *run_dir, const char *mdl, const char *zch, char *const extra[], int nextra, FILE *log, tr_cancel_fn cancel, void *ud, char *pick, size_t pn);
-
-/* train_gen.c: 出题(可选数据工具, 与 unsloth 的 synthetic data 工具对应, 不在训练链里) */
-bool tr_gen_jobs(const char *doc_dir, int rounds, char *jobs_path, size_t jn, unsigned *njobs, FILE *log);   /* chunks 下的 .txt → gen/jobs.tsv(已出的跳过) */
-unsigned tr_gen_split(const char *doc_dir, FILE *log);   /* gen 下的 .txt → <料目录>/<料名>.jsonl(messages + context), 返回题数 */
 
 /* train_models.c: 模型页路由; 不是 /api/models/ 开头返回 -1 */
 int tr_models_api(const tr_req *rq, ds4_buf *out, int serving, int port);

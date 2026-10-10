@@ -83,7 +83,7 @@ CORE_ENGINE_CPU_OBJS := $(CORE_ENGINE_SRCS:.c=_cpu.o)
 COMMON_FMT_OBJS := src/common/ds4_quantfmt.o src/common/ds4_json.o
 # 训练页四件(src/train/, 规则在下面; train_models.o = 模型页): 要在 ds4-server 的依赖行之前定义 —— 依赖列表在解析时就展开, 定义在后面 Linux 那条 $^ 就是空的(10-10 实撞)
 TRAIN_API_OBJS := src/train/train_api.o src/train/train_runs.o src/train/train_ctl.o src/train/train_models.o \
-                  src/train/train_child.o src/train/train_model.o src/train/train_job.o src/train/train_gate.o src/train/train_gen.o
+                  src/train/train_child.o src/train/train_model.o src/train/train_job.o src/train/train_gate.o
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal -framework Accelerate

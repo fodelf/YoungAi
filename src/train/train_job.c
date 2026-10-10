@@ -1,5 +1,5 @@
-/* train_job.c — 训练/出题作业线程(2026-10-10, 原 train_cycle.sh + z_nightly_spark.sh stage_train/stage_gen 的 C 版)。总述见 train_internal.h。
- * 一次一条作业: 停模型子进程 → fork ./ds4 --ptrain(或 --gen-jobs) → (训练)wt2 门 + 选轮 → 模型子进程按 gguf/serve_pick.txt 装回来。
+/* train_job.c — 训练作业线程(2026-10-10, 原 train_cycle.sh + z_nightly_spark.sh stage_train 的 C 版)。总述见 train_internal.h。
+ * 一次一条作业: 停模型子进程 → fork ./ds4 --ptrain → wt2 门 + 选轮 → 模型子进程按 gguf/serve_pick.txt 装回来。
  * ★训完只产出, 不挂★(10-10 用户: "训练完就是训练完不要直接挂"): 不碰 serve_pick.txt, 装回来的还是训前那套; ③ 关联训练时装着的侧车
  *   (③ 的 base.fnv = 它的指纹), 聊天页切到那份侧车、打开"后训练"开关才挂, 切走就卸。
  * 训练用的 ①② = serve_pick.txt 里的那对(工作台选了哪套就训哪套; ③ 是对着这对解的, 对不上引擎拒挂); 第 3 行起只取 --engram-dir 给 ./ds4
@@ -12,19 +12,19 @@
 #include <time.h>
 #include <unistd.h>
 
-#define TR_TRAIN_BUDGET_MB 110000   /* 训练/出题的引擎预算(与起服同: 机器空着时整机给它) */
+#define TR_TRAIN_BUDGET_MB 110000   /* 训练的引擎预算(与起服同: 机器空着时整机给它) */
 
 static struct {
-    pthread_mutex_t mu; bool active, gen, stop; tr_job_phase phase; pid_t child; int port;
-    char run[256], run_abs[TR_PATH + 320], data[TR_PATH], epochs[64], layers[64], lr[64], extra[512]; int rounds;
-} g = { PTHREAD_MUTEX_INITIALIZER, false, false, false, TR_JOB_NONE, 0, 0, "", "", "", "", "", "", "", 1 };
+    pthread_mutex_t mu; bool active, stop; tr_job_phase phase; pid_t child; int port;
+    char run[256], run_abs[TR_PATH + 320], data[TR_PATH], epochs[64], layers[64], lr[64], extra[512];
+} g = { PTHREAD_MUTEX_INITIALIZER, false, false, TR_JOB_NONE, 0, 0, "", "", "", "", "", "", "" };
 
 static void set_phase(tr_job_phase p, pid_t child) { pthread_mutex_lock(&g.mu); g.phase = p; g.child = child; pthread_mutex_unlock(&g.mu); }
 static int want_stop(void *ud) { (void)ud; pthread_mutex_lock(&g.mu); const bool s = g.stop; pthread_mutex_unlock(&g.mu); return s; }
 
 void tr_job_status(tr_job_info *o) {
     pthread_mutex_lock(&g.mu);
-    o->active = g.active; o->gen = g.gen; o->phase = g.phase; o->child = g.child; snprintf(o->run, sizeof o->run, "%s", g.run);
+    o->active = g.active; o->phase = g.phase; o->child = g.child; snprintf(o->run, sizeof o->run, "%s", g.run);
     pthread_mutex_unlock(&g.mu);
 }
 bool tr_job_owns(const char *run_dir_abs) {
@@ -93,22 +93,6 @@ static void do_train(const char *mdl, const char *zch, char *const eng[], int ne
     tr_logf(log, "TRAIN_DONE %s 选中 %s (关联侧车 %s; 没挂, 聊天页开关挂)", out, pick[0] ? pick : "无(没过门)", zch[0] ? zch : "无");
 }
 
-static void do_gen(const char *mdl, const char *zch, char *const eng[], int neng, FILE *log) {
-    char dir[TR_PATH + 340], jobs[TR_PATH + 400], gout[TR_PATH + 400], bud[16]; unsigned nj = 0;
-    snprintf(dir, sizeof dir, "%s/%s", tr_root, g.data);
-    pthread_mutex_lock(&g.mu); snprintf(g.run, sizeof g.run, "%s", g.data); g.run_abs[0] = 0; pthread_mutex_unlock(&g.mu);
-    if (!tr_gen_jobs(dir, g.rounds, jobs, sizeof jobs, &nj, log)) return;
-    if (nj) {
-        snprintf(gout, sizeof gout, "%s/gen/gen.out", dir); snprintf(bud, sizeof bud, "%d", TR_TRAIN_BUDGET_MB);
-        const char *argv[64]; int na = tr_ds4_base_argv(argv, 40, mdl, zch, eng, neng);
-        argv[na++] = "--mem-budget-mb"; argv[na++] = bud; argv[na++] = "--no-dspark"; argv[na++] = "--gen-jobs"; argv[na++] = jobs; argv[na] = NULL;
-        set_phase(TR_JOB_GEN, 0);
-        const int rc = run_ds4(argv, gout, log);
-        if (rc != 0) { tr_logf(log, "★合批出题失败(rc=%d, 见 %s)★", rc, gout); return; }
-    }
-    tr_logf(log, "GEN_DONE %u 题", tr_gen_split(dir, log));
-}
-
 static void *job_thread(void *arg) {
     (void)arg;
     char lp[TR_PATH + 96]; tr_ui_log_path("cycle", lp, sizeof lp);
@@ -122,7 +106,7 @@ static void *job_thread(void *arg) {
         static const char *const busy[] = { "ds4", "ds4-bench", "ds4-server", "ds4quant_run", "zlayer", "v41_amp_run", NULL };
         bool idle = true;
         for (int i = 0; busy[i]; i++) if (tr_proc_kill(busy[i], 0)) { tr_logf(log, "★机器非空(实例锁): %s 在跑★", busy[i]); idle = false; }
-        if (idle && !want_stop(NULL)) { if (g.gen) do_gen(mdl, zch, eng, neng, log); else do_train(mdl, zch, eng, neng, log); }
+        if (idle && !want_stop(NULL)) do_train(mdl, zch, eng, neng, log);
     }
     set_phase(TR_JOB_RESTART, 0);
     tr_logf(log, "模型子进程装回来(按 serve_pick.txt)");
@@ -132,12 +116,12 @@ static void *job_thread(void *arg) {
     return NULL;
 }
 
-static bool launch(bool gen, int model_port, char *err, size_t errn) {
+static bool launch(int model_port, char *err, size_t errn) {
     const tr_model_phase mp = tr_model_state();
     if (mp == TR_MODEL_STARTING || mp == TR_MODEL_STOPPING) { snprintf(err, errn, "正在加载模型, 等它装完"); return false; }
     pthread_mutex_lock(&g.mu);
-    if (g.active) { pthread_mutex_unlock(&g.mu); snprintf(err, errn, "有训练/出题在跑, 先停它"); return false; }
-    g.active = true; g.gen = gen; g.stop = false; g.phase = TR_JOB_STOP_MODEL; g.child = 0; g.port = model_port; g.run[0] = 0; g.run_abs[0] = 0;
+    if (g.active) { pthread_mutex_unlock(&g.mu); snprintf(err, errn, "有训练在跑, 先停它"); return false; }
+    g.active = true; g.stop = false; g.phase = TR_JOB_STOP_MODEL; g.child = 0; g.port = model_port; g.run[0] = 0; g.run_abs[0] = 0;
     pthread_mutex_unlock(&g.mu);
     pthread_t th; pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
     const int rc = pthread_create(&th, &at, job_thread, NULL); pthread_attr_destroy(&at);
@@ -147,19 +131,11 @@ static bool launch(bool gen, int model_port, char *err, size_t errn) {
 
 bool tr_job_train(const char *data_rel, const char *epochs, const char *layers, const char *lr, const char *extra, int model_port, char *err, size_t errn) {
     pthread_mutex_lock(&g.mu);
-    if (g.active) { pthread_mutex_unlock(&g.mu); snprintf(err, errn, "有训练/出题在跑, 先停它"); return false; }
+    if (g.active) { pthread_mutex_unlock(&g.mu); snprintf(err, errn, "有训练在跑, 先停它"); return false; }
     snprintf(g.data, sizeof g.data, "%s", data_rel); snprintf(g.epochs, sizeof g.epochs, "%s", epochs); snprintf(g.layers, sizeof g.layers, "%s", layers);
     snprintf(g.lr, sizeof g.lr, "%s", lr); snprintf(g.extra, sizeof g.extra, "%s", extra ? extra : "");
     pthread_mutex_unlock(&g.mu);
-    return launch(false, model_port, err, errn);
-}
-
-bool tr_job_gen(const char *dir_rel, const char *rounds, int model_port, char *err, size_t errn) {
-    pthread_mutex_lock(&g.mu);
-    if (g.active) { pthread_mutex_unlock(&g.mu); snprintf(err, errn, "有训练/出题在跑, 先停它"); return false; }
-    snprintf(g.data, sizeof g.data, "%s", dir_rel); g.rounds = atoi(rounds) > 0 ? atoi(rounds) : 1;
-    pthread_mutex_unlock(&g.mu);
-    return launch(true, model_port, err, errn);
+    return launch(model_port, err, errn);
 }
 
 bool tr_job_stop(char *err, size_t errn) {

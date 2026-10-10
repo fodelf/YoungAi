@@ -227,13 +227,12 @@ static void jsonl_entry(ds4_buf *b, const char *rel, const char *abs, bool *firs
     ds4_buf_printf(b, ",\"rows\":%u,\"bytes\":%lld,\"teacher\":%s}", count_lines(abs), (long long)st.st_size, exists(tb) ? "true" : "false");
     *first = false;
 }
-/* 料清单: $datad 下一层与两层的 *.jsonl(路径相对仓库根, 训练命令直接用), 以及带 chunks/ 的料目录(gen 用) */
+/* 料清单: $datad 下一层与两层的 *.jsonl(路径相对仓库根, 训练命令直接用) */
 void tr_json_data(ds4_buf *b) {
     const char *rel0 = "gguf-tools/data/posttrain";
     ds4_buf_puts(b, "{\"jsonl\":[");
     bool first = true;
     DIR *d = opendir(tr_datad); struct dirent *de;
-    ds4_buf dirs = {0}; bool dfirst = true;
     while (d && (de = readdir(d))) {
         if (de->d_name[0] == '.') continue;
         char abs[TR_PATH + 320], rel[TR_PATH + 320];
@@ -242,16 +241,7 @@ void tr_json_data(ds4_buf *b) {
         if (L > 6 && !strcmp(de->d_name + L - 6, ".jsonl")) { jsonl_entry(b, rel, abs, &first); continue; }
         struct stat st;
         if (stat(abs, &st) || !S_ISDIR(st.st_mode)) continue;
-        char ch[TR_PATH + 340]; snprintf(ch, sizeof ch, "%s/chunks", abs);
-        DIR *cd = opendir(ch); unsigned nch = 0; struct dirent *ce;
-        while (cd && (ce = readdir(cd))) { const size_t l = strlen(ce->d_name); nch += l > 4 && !strcmp(ce->d_name + l - 4, ".txt"); }
-        if (cd) closedir(cd);
-        if (nch) {
-            char jl[TR_PATH + 600]; snprintf(jl, sizeof jl, "%s/%s.jsonl", abs, de->d_name);
-            ds4_buf_printf(&dirs, "%s{\"path\":", dfirst ? "" : ","); ds4_json_escape(&dirs, rel);
-            ds4_buf_printf(&dirs, ",\"chunks\":%u,\"has_jsonl\":%s}", nch, exists(jl) ? "true" : "false"); dfirst = false;
-        }
-        DIR *sd = opendir(abs); struct dirent *se;   /* 两层: 料目录里 gen 出的 <料名>.jsonl */
+        DIR *sd = opendir(abs); struct dirent *se;   /* 两层: 文档目录里上传文档自动生成的原文料 <目录>.text.jsonl */
         while (sd && (se = readdir(sd))) {
             const size_t l = strlen(se->d_name);
             if (l > 6 && !strcmp(se->d_name + l - 6, ".jsonl")) {
@@ -263,6 +253,5 @@ void tr_json_data(ds4_buf *b) {
         if (sd) closedir(sd);
     }
     if (d) closedir(d);
-    ds4_buf_printf(b, "],\"dirs\":[%s]}", dirs.ptr ? dirs.ptr : "");
-    ds4_buf_free(&dirs);
+    ds4_buf_puts(b, "]}");
 }

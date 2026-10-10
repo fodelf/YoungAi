@@ -74,51 +74,43 @@ static int serve_page(ds4_buf *out, const char **ctype) {
     return 200;
 }
 
-/* mode: training(作业线程在: 停模型/训/门/出题/装回来) / loading(模型子进程在装或在停) / serving(模型子进程装着、冒烟过) / lobby(都没有)。
- * proc 里的 script/judge/cycle 沿用老名字(页面按它们显示 "训练中 · wt2 门" / "交接中"): script = 训练或出题在跑, judge = 门在跑, cycle = 作业线程在, ds4 = ./ds4 子进程在 */
+/* mode: training(作业线程在: 停模型/训/门/装回来) / loading(模型子进程在装或在停) / serving(模型子进程装着、冒烟过) / lobby(都没有)。
+ * proc 里的 script/judge/cycle 沿用老名字(页面按它们显示 "训练中 · wt2 门" / "交接中"): script = 训练在跑, judge = 门在跑, cycle = 作业线程在, ds4 = ./ds4 子进程在 */
 static int api_status(ds4_buf *out, int serving, int port) {
     tr_procs p; tr_proc_scan(&p);
     tr_job_info j; tr_job_status(&j);
     const tr_model_phase mp = tr_model_state();
     const bool busy = j.active;
     const char *mode = busy ? "training" : (serving || tr_model_live()) ? "serving" : (mp == TR_MODEL_STARTING || mp == TR_MODEL_STOPPING) ? "loading" : "lobby";
-    static const char *const phase_name[] = { "", "stop_model", "train", "gate", "gen", "restart" };
+    static const char *const phase_name[] = { "", "stop_model", "train", "gate", "restart" };
     ds4_buf_printf(out, "{\"time\":%ld,\"mem_avail_mb\":%ld,\"port\":%d,\"mode\":\"%s\",\"busy\":%s,\"downloading\":%s,\"phase\":\"%s\",\"run\":",
                    (long)time(NULL), tr_mem_avail_mb(), port, mode, busy ? "true" : "false", p.dl ? "true" : "false", phase_name[j.phase]);
     ds4_json_escape(out, j.run);
     ds4_buf_printf(out, ",\"proc\":{\"scanned\":%s,\"script\":%s,\"ds4\":%s,\"judge\":%s,\"cycle\":%s,\"server\":%s},\"root\":",
-                   p.scanned ? "true" : "false", (j.phase == TR_JOB_TRAIN || j.phase == TR_JOB_GEN) ? "true" : "false", (p.ds4 || j.child) ? "true" : "false",
+                   p.scanned ? "true" : "false", j.phase == TR_JOB_TRAIN ? "true" : "false", (p.ds4 || j.child) ? "true" : "false",
                    j.phase == TR_JOB_GATE ? "true" : "false", busy ? "true" : "false", (p.server || serving || mp == TR_MODEL_UP) ? "true" : "false");
     ds4_json_escape(out, tr_root); ds4_buf_putc(out, '}');
     return 200;
 }
 
-/* 发车(train / gen): 参数白名单 → 作业线程(train_job.c: 先停模型子进程, 训完再装回来) */
-static int api_launch(const tr_req *rq, ds4_buf *out, int serving, int port, bool gen) {
+/* 发车: 参数白名单 → 作业线程(train_job.c: 先停模型子进程, 训完再装回来) */
+static int api_launch(const tr_req *rq, ds4_buf *out, int serving, int port) {
     char err[256] = "", a1[TR_PATH], a2[64], a3[64], a4[64], a5[512];
     struct stat st; char abs[TR_PATH + 64];
     bool ok = false;
     if (serving) return reply(out, false, "这是模型子进程; 发车要从主进程 ds4-train 的页面操作", 409);
-    if (!gen) {
-        tr_body_get(rq, "data", a1, sizeof a1); tr_body_get(rq, "epochs", a2, sizeof a2); tr_body_get(rq, "layers", a3, sizeof a3);
-        tr_body_get(rq, "lr", a4, sizeof a4); tr_body_get(rq, "extra", a5, sizeof a5);
-        snprintf(abs, sizeof abs, "%.900s/%.100s", tr_root, a1);
-        if (!a1[0] || !tr_clean(a1, "._/-") || strstr(a1, "..") || stat(abs, &st)) snprintf(err, sizeof err, "料路径不合法或不存在: %s", a1);
-        else if (!tr_clean(a2, "") || !tr_clean(a3, "-") || !tr_clean(a4, ".-") || !tr_clean(a5, "=,._-/")) snprintf(err, sizeof err, "参数只许字母数字与 . - / = ,");
-        else ok = tr_job_train(a1, a2[0] ? a2 : "3", a3[0] ? a3 : "0-39", a4[0] ? a4 : "2e-4", a5, TR_MODEL_PORT(port), err, sizeof err);
-    } else {
-        tr_body_get(rq, "dir", a1, sizeof a1); tr_body_get(rq, "rounds", a2, sizeof a2);
-        snprintf(abs, sizeof abs, "%.900s/%.100s/chunks", tr_root, a1);
-        if (!a1[0] || !tr_clean(a1, "._/-") || strstr(a1, "..") || stat(abs, &st)) snprintf(err, sizeof err, "料目录不合法或没有 chunks/: %s", a1);
-        else if (!tr_clean(a2, "")) snprintf(err, sizeof err, "轮数只许数字");
-        else ok = tr_job_gen(a1, a2[0] ? a2 : "1", TR_MODEL_PORT(port), err, sizeof err);
-    }
+    tr_body_get(rq, "data", a1, sizeof a1); tr_body_get(rq, "epochs", a2, sizeof a2); tr_body_get(rq, "layers", a3, sizeof a3);
+    tr_body_get(rq, "lr", a4, sizeof a4); tr_body_get(rq, "extra", a5, sizeof a5);
+    snprintf(abs, sizeof abs, "%.900s/%.100s", tr_root, a1);
+    if (!a1[0] || !tr_clean(a1, "._/-") || strstr(a1, "..") || stat(abs, &st)) snprintf(err, sizeof err, "料路径不合法或不存在: %s", a1);
+    else if (!tr_clean(a2, "") || !tr_clean(a3, "-") || !tr_clean(a4, ".-") || !tr_clean(a5, "=,._-/")) snprintf(err, sizeof err, "参数只许字母数字与 . - / = ,");
+    else ok = tr_job_train(a1, a2[0] ? a2 : "3", a3[0] ? a3 : "0-39", a4[0] ? a4 : "2e-4", a5, TR_MODEL_PORT(port), err, sizeof err);
     ds4_buf_printf(out, "{\"ok\":%s,\"error\":", ok ? "true" : "false"); ds4_json_escape(out, err); ds4_buf_putc(out, '}');
     return ok ? 200 : strstr(err, "在跑") || strstr(err, "正在") ? 409 : 400;
 }
 
 /* 文档目录 → 原文料 <dir>/<dir>.text.jsonl: chunks/ 下每个 .txt 一行 {"text": 全文}(unsloth 的 continued-pretraining 口径, 训练器按 token 自己切段)。
- * 每次上传文档后整份重写, 文件就是目录的镜像; 想出成问答再训的, 另点"出题"(gen) —— 两条路都通, 不强迫先出题。 */
+ * 每次上传文档后整份重写, 文件就是目录的镜像。 */
 static unsigned rebuild_text_jsonl(const char *dir) {
     char ch[TR_PATH + 320], outp[TR_PATH + 600];
     snprintf(ch, sizeof ch, "%s/%s/chunks", tr_datad, dir);
@@ -142,7 +134,7 @@ static unsigned rebuild_text_jsonl(const char *dir) {
     return n;
 }
 
-/* 上传(原始体): kind=jsonl → $datad/<name>(逐行校验是带 messages 或 text 的 JSON 对象); kind=doc → $datad/<dir>/chunks/<name>.txt(文档: 同时重写原文料 <dir>.text.jsonl, 也可再 gen 出题) */
+/* 上传(原始体): kind=jsonl → $datad/<name>(逐行校验是带 messages 或 text 的 JSON 对象); kind=doc → $datad/<dir>/chunks/<name>.txt(文档: 同时重写原文料 <dir>.text.jsonl) */
 static int api_upload(const tr_req *rq, ds4_buf *out) {
     char kind[16], name[256], dir[256], err[300] = "";
     tr_query_get(rq->query, "kind", kind, sizeof kind); tr_query_get(rq->query, "name", name, sizeof name); tr_query_get(rq->query, "dir", dir, sizeof dir);
@@ -180,7 +172,7 @@ static int api_upload(const tr_req *rq, ds4_buf *out) {
         snprintf(path, sizeof path, "%s/%s", tr_datad, dir); mkdir(path, 0755);
         snprintf(path, sizeof path, "%s/%s/chunks", tr_datad, dir); mkdir(path, 0755);
         char base[256]; snprintf(base, sizeof base, "%s", name);
-        char *dot = strrchr(base, '.'); if (dot && dot != base) *dot = 0;   /* 块名 = 去扩展名 + .txt(gen 只认 chunks/ 下的 .txt) */
+        char *dot = strrchr(base, '.'); if (dot && dot != base) *dot = 0;   /* 块名 = 去扩展名 + .txt(rebuild_text_jsonl 只认 chunks/ 下的 .txt) */
         snprintf(path, sizeof path, "%s/%s/chunks/%s.txt", tr_datad, dir, base);
         FILE *f = fopen(path, "wb");
         if (!f || fwrite(rq->body, 1, rq->body_len, f) != rq->body_len) { if (f) fclose(f); return reply(out, false, "写不进料目录", 500); }
@@ -239,8 +231,7 @@ int tr_api(const tr_req *rq, ds4_buf *out, const char **ctype, int serving, int 
     }
     if (!post) { ds4_buf_puts(out, "{\"error\":\"没有这个路径(或要 POST)\"}"); return 404; }
     char err[256] = "";
-    if (!strcmp(rq->path, "/api/train/start")) return api_launch(rq, out, serving, port, false);
-    if (!strcmp(rq->path, "/api/train/gen")) return api_launch(rq, out, serving, port, true);
+    if (!strcmp(rq->path, "/api/train/start")) return api_launch(rq, out, serving, port);
     if (!strcmp(rq->path, "/api/train/stop")) { if (serving) return reply(out, false, "要从主进程 ds4-train 的页面操作", 409); return reply(out, tr_job_stop(err, sizeof err), err, 409); }
     if (!strcmp(rq->path, "/api/train/upload")) return api_upload(rq, out);
     if (!strcmp(rq->path, "/api/train/serve")) {   /* 大厅 → 起模型子进程(按 gguf/serve_pick.txt) */
