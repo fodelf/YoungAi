@@ -3,6 +3,8 @@
 #
 # 发什么(用户令"readme、量化模型、侧车、后训练、spark 的可执行文件, 不要上传其他代码"):
 #   README.md / README.zh-CN.md          对外介绍(Mac 仓库里的定稿, 先 scp 到 spark 的 ~/ds4-main/)
+#   README_ASSETS(见下)                  README 引用的截图 / logo / 技术细节两篇, 按仓库里的相对路径原样摆 ——
+#                                        不带上它们, HF 页面上图是裂的、"技术细节"链接 404
 #   LICENSE / LICENSE-DeepSeek           ★不是代码, 是必须的★: 分发二进制要带 ds4/ggml 的 MIT 声明,
 #                                        分发量化权重要带 DeepSeek 的 MIT 声明 —— MIT 唯一的条件就是保留它
 #   DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf.partNN-of-40 + SHA256SUMS   ① 113.6 GB 切 40 份(见 split_parts 的 why)
@@ -34,13 +36,14 @@ AMP_NAMES=$(sed -n 's/^ *[a-z]*) *echo "\(DeepSeek-[^"]*-engine\)";;$/\1/p' "$RO
 PT_SRC="$V41/night/review_iter_20260924_0729/r1_pt/cand_g1_t6_r10_l1_k1e+09_n0"
 PT_NAME="posttrain-experimental-20260924"
 STAGE="$ROOT/gguf/hf_upload/${REPO#*/}"
+README_ASSETS="web/logo.jpg docs/img/studio-chat.png docs/TECHNICAL.md docs/TECHNICAL.zh-CN.md"
 LOG(){ echo "[hfpub $(date '+%m-%d %H:%M:%S')] $*"; }
 die(){ LOG "★$*★"; exit 1; }
 
 stage() {
-    for f in README.md README.zh-CN.md LICENSE ds4 ds4-server; do [ -s "$ROOT/$f" ] || die "缺 $ROOT/$f"; done
+    for f in README.md README.zh-CN.md LICENSE ds4 ds4-server $README_ASSETS; do [ -s "$ROOT/$f" ] || die "缺 $ROOT/$f"; done
     # ★README 必须是新版★: spark 这份工作树不走 git, 没 scp 过来的话这里是上游 V4 的旧 README
-    grep -q 'YoungAi — DeepSeek V4.1 Flash' "$ROOT/README.md" || die "spark 上的 README.md 不是新版, 先从 Mac scp 过来"
+    grep -q '<h1 align="center">YoungAi</h1>' "$ROOT/README.md" || die "spark 上的 README.md 不是新版, 先从 Mac scp 过来"
     # 下载命令里的仓库名要登录拿到用户名后才填得上; 占位符还在 = 读者照抄就 404
     ! grep -q '__HF_REPO__' "$ROOT/README.md" "$ROOT/README.zh-CN.md" || die "README 里还有 __HF_REPO__ 占位符, 先换成 $REPO"
     grep -q "$REPO" "$ROOT/README.md" || die "README.md 里的下载命令不是 $REPO"
@@ -54,7 +57,7 @@ stage() {
         ls "$V41/$a"/gr_L*.bin >/dev/null 2>&1 && [ -s "$V41/$a/manifest.txt" ] || die "侧车 $a 缺 gr_L*.bin 或 manifest.txt"
         mans+=("$V41/$a/manifest.txt")
     done
-    ! grep -nE '/home/|/Users/' "$ROOT/gguf-tools/scripts/hf_install.sh" "$ROOT/README.md" "$ROOT/README.zh-CN.md" "${mans[@]}" \
+    ! grep -nE '/home/|/Users/' "$ROOT/gguf-tools/scripts/hf_install.sh" "$ROOT/README.md" "$ROOT/README.zh-CN.md" "$ROOT/docs/TECHNICAL.md" "$ROOT/docs/TECHNICAL.zh-CN.md" "${mans[@]}" \
         || die "上面几行写死了本机用户目录, 下载用户的机器上没有, 改掉再发"
     # install.sh 启动服务时传 --engram-dir; 二进制不认它 = 用户那边服务起到一半退出
     local b h
@@ -74,6 +77,7 @@ stage() {
     [ -s "$PT_SRC/gr_L39.bin" ] && [ -s "$PT_SRC/base.fnv" ] || die "后训练候选缺 gr_L39.bin/base.fnv: $PT_SRC"
     mkdir -p "$STAGE/bin" "$STAGE/$PT_NAME"
     cp -f "$ROOT/README.md" "$ROOT/README.zh-CN.md" "$ROOT/LICENSE" "$STAGE/"
+    for f in $README_ASSETS; do mkdir -p "$STAGE/$(dirname "$f")" && cp -f "$ROOT/$f" "$STAGE/$f"; done
     cp -f "$ROOT/hf/DeepSeek-V4.1-Flash/LICENSE" "$STAGE/LICENSE-DeepSeek"
     cp -f "$ROOT/gguf-tools/scripts/hf_install.sh" "$STAGE/install.sh"
     cp -f "$ROOT/ds4" "$ROOT/ds4-server" "$STAGE/bin/"
@@ -177,7 +181,7 @@ case "$CMD" in
     # 与 big 同一条线路、同一个病(见 big 段的 ★走 LFS★): 侧车 + 二进制几十 MB, 走 Xet 正好撞上 10~20 s 掐断; 卡死同样不超时
     if ! run_with_stall_guard "$STALL_S" "$PLOG" env HF_HUB_DISABLE_XET=1 "$HF" upload "$REPO" "$STAGE" . --repo-type model --no-private \
         --exclude "*.gguf" --exclude "*.part*-of-*" --exclude ".cache/*" "${KEEP[@]}" \
-        --commit-message "README, install.sh, licenses, SHA256SUMS, domain sidecars (finance, code, law, medicine, science), experimental post-training file$BINMSG"; then
+        --commit-message "README (with screenshots and technical notes), install.sh, licenses, SHA256SUMS, domain sidecars (finance, code, law, medicine, science), experimental post-training file$BINMSG"; then
         tail -c 600 "$PLOG" | tr '\r' '\n' | grep -v '^\s*$' | tail -5; die "小文件上传失败(完整输出 $PLOG)"
     fi
     LOG "SMALL_DONE https://huggingface.co/$REPO";;

@@ -24,7 +24,7 @@
 # 挂着放大器跑一趟打五指标。两份语料必须不同 —— 在判决料上拟合就是自己给自己判卷,
 # 09-11 实撞: 拟合料 PPL 比值 1.051 而判决料崩到 55837。
 set -uo pipefail
-ROOT="$HOME/ds4-main"; cd "$ROOT" || exit 1
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"; cd "$ROOT" || exit 1   # 仓库根或发布包根(10-10: 发布包里的训练门也走这里)
 PY="$HOME/v41env/bin/python"
 HF="$ROOT/hf/DeepSeek-V4.1-Flash"
 T="$ROOT/gguf-tools/scripts/v41_teacher.py"
@@ -60,7 +60,7 @@ watchdog() {
         if [ "${av:-99}" -lt "$WD_MIN_AVAIL_GB" ]; then
             echo "★看门狗: available ${av}G < ${WD_MIN_AVAIL_GB}G, 停车★" | tee -a "$WD_LOG"
             pkill -f "v41_teacher[.]py"      # [.] 防自匹配(pkill -f 的模式会命中自己的命令行)
-            pkill -f "ds4 -m gguf/v41[/]"; pkill -f "v41_amp_ru[n] "   # 引擎路学生 / 引擎路反修驱动
+            pkill -x ds4; pkill -f "v41_amp_ru[n] "   # 引擎路学生(按进程名: 模型路径不再固定在 gguf/v41) / 引擎路反修驱动
             return 1
         fi
     done
@@ -87,12 +87,20 @@ run_py() {
 # ★默认 = 现役部署文件★(2026-09-22 改成 v3 vq8sh14-q4k; 老的 fp4 那份已删) ——
 # 默认指着一个打不开的文件, 谁漏传 gguf 字段就白等一次加载。
 GG_DEFAULT="$ROOT/gguf/v41/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf"
+# 工作台选的那套(gguf/serve_pick.txt, 10-10): 默认 gguf 按它; 学生判它那个 gguf 时把它的 --engram-dir 一起带上 —— 发布包里模型在
+# gguf/hub, engram 表不在转换机写进元数据的路径上, 不传打分路开头就报"engram 表打不开"。判别的 gguf 时不带(engram 跟着模型走)。
+PK_GG=""; PK_ENG=""
+if [ -s "$ROOT/gguf/serve_pick.txt" ]; then
+    mapfile -t _PK < "$ROOT/gguf/serve_pick.txt"; PK_GG="${_PK[0]}"; GG_DEFAULT="$PK_GG"
+    for ((_i = 2; _i < ${#_PK[@]}; _i++)); do [ "${_PK[_i]}" = --engram-dir ] && PK_ENG="--engram-dir ${_PK[_i + 1]}"; done
+fi
 run_eng() {
     local stu="$1" gg="$2" zarg="$3" tag="$4" bin="${5:-$ROOT/ds4}"   # zarg 里可以带 --zchain/--zchain-scale/--posttrain
     local idsn="$OUT/ids_${TAG}.txt" lf="$OUT/log_${tag}.txt"
     head -n "$NTOK" "$IDS" > "$idsn"
     [ -x "$bin" ] || { LOG "★$bin 没编(make cuda-spark)★"; return 1; }
     file "$bin" | grep -q "ELF.*aarch64" || { LOG "★$bin 不是 ELF aarch64★"; return 1; }
+    [ "$gg" = "$PK_GG" ] && zarg="$zarg $PK_ENG"
     # 上下文没有参数(2026-09-22): V4.1 打分路按 ids 行数分配状态, 以前这里传 --ctx "$NTOK" 是为了躲开 CLI 打的那行
     # V4 会话"context buffer 2416 MiB"估算(09-20 把它当成了真分配), 现在 V4.1 不打那行、也不接受 --ctx。
     "$bin" -m "$gg" --cuda --mem-budget-mb 40000 --weight-cache-mb 88000 --score-ids "$idsn" --score-out "$stu" $zarg 2>&1 \
@@ -120,6 +128,8 @@ file "$AM" | grep -q "ELF.*aarch64" || { LOG "★$AM 不是 ELF aarch64, 重编�
     rm -f "$AM"; make -C "$ROOT/gguf-tools" anchor_metrics || exit 2; }
 
 if [ ! -s "$REF" ]; then
+    # 教师锚要 HF 出厂权重(476 GB)+ 教师端 venv, 发布包只带 wt2 n512 那一份(release_pack.sh): 缺就说清楚, 别让它死在 "python: 没有那个文件"
+    [ -x "$PY" ] || { LOG "★教师锚 $REF 缺, 本机又没有教师端 $PY —— 发布包只带 wt2 512 token 的锚, 别的判决料/长度要在有 HF 出厂权重的机器上出★"; exit 3; }
     LOG "① FP 教师(不量化) → $REF"
     run_py "teacher_$TAG" "配置|完成|PPL|→" --ids "$IDS" --ntok "$NTOK" --out "$REF" || exit 3
 else
@@ -152,7 +162,8 @@ ACTSFX=""; [ -n "$ACTIDS" ] && ACTSFX="_cal"
 # 要 nc=65536, 码本 1 MB/专家 × 15360 = 16 GB, 光码本就吃掉 0.24 bpw ⇒ 不可行。
 # dim=4 在 2~3 bpw 区间码本才几 KB, 可忽略。
 CBD="$ROOT/gguf-tools/quantize"
-[ -x "$CBD/v41_codebook" ] || { LOG "编 v41_codebook"; ( cd "$CBD" && cc -O3 -std=c99 -o v41_codebook v41_codebook.c -lm ) || exit 2; }
+# 只有量化档(dim:nc)用它; 发布包里没有量化源码(只跑 engine 档守 wt2 门), 这里编不出来就不许把整趟判决拖死(10-10 实撞: 门报"两臂读数不全")
+[ -x "$CBD/v41_codebook" ] || [ ! -s "$CBD/v41_codebook.c" ] || { LOG "编 v41_codebook"; ( cd "$CBD" && cc -O3 -std=c99 -o v41_codebook v41_codebook.c -lm ) || exit 2; }
 for NB in "$@"; do
   case "$NB" in
     scank:*) # K 扫描诊断: scank:<拟合ids>:<ntok>:<vqdim>:<vqnc>:<跑前几层>
@@ -297,7 +308,10 @@ for NB in "$@"; do
           # ③ 两种形态(10-01): 增益表 gr_Lnn.bin 或低秩放大器 amp_Lnn.bin(引擎 --posttrain 两种都读, 与 ② 按秩拼接), 有其一就判
           # 两个 glob 分开查: ls 对多个参数只要有一个不存在就非零退出, 合在一起查等于要求两种文件都在
           ls "$PTD"/gr_L*.bin >/dev/null 2>&1 || ls "$PTD"/amp_L*.bin >/dev/null 2>&1 || { LOG "★后训练目录 $PTD 里既没有 gr_Lnn.bin 也没有 amp_Lnn.bin, 不判★"; continue; }
-          ZARG="$ZARG --posttrain $PTD"; SFX="${SFX}_pt_$(basename "$PTD")"
+          # 后缀按 ③ 相对仓库根的整条路径(/ → _), 不只取末级名: 各次增量的选中轮都叫 ckpt_eNN, 一趟判多臂时(10-10 十臂)
+          #   0001/0003/0004 都是 ckpt_e02, 后一臂把前一臂的 stu_*.bin / .rows 盖掉 —— 五指标当场算不受影响, 事后的逐位配对就拿错了文件
+          ptn="${PTD%/}"; ptn="${ptn#"$ROOT"/}"
+          ZARG="$ZARG --posttrain $PTD"; SFX="${SFX}_pt_${ptn//\//_}"
       fi
       [ -n "${EBIN:-}" ] && SFX="${SFX}_bin_$(basename "$EBIN")"
       STU="$OUT/stu_${TAG}_eng_$(basename "$GG" .gguf)${SFX}.bin"

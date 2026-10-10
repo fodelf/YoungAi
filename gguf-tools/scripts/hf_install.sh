@@ -8,9 +8,13 @@
 #                                    (domains: finance, code, law, medicine, science)
 #   bash install.sh --no-start       everything except starting the server
 #   bash install.sh start | stop | status
+#   bash install.sh download         download only, on any machine (no hardware check, no server start); the
+#                                    DwarfStar workbench's Models tab runs this into <repo>/gguf/hub
+#   bash install.sh probe            print download progress from disk, one item per line (no network):
+#                                    repo R · shards S47 S48 · gguf NAME TOTAL HAVE · engram TOTAL HAVE · sidecar DOMAIN DIR 0|1
 #
 # Options:
-#   --domain NAME      which domain sidecar the server loads (README §3): finance (default), code, law, medicine,
+#   --domain NAME      which domain sidecar the server loads (docs/TECHNICAL.md §3): finance (default), code, law, medicine,
 #                      science, or none (bare base). Every sidecar is downloaded (~40 MB each), so switching is just: stop, start --domain X
 #   --dir DIR          install directory (default: $HOME/youngai); needs ~325 GB free, ~122 GB with --engram-dir
 #   --engram-dir DIR   you already have the two official n-gram shards (a folder holding
@@ -20,9 +24,9 @@
 #   --port N           listen port (default 8000)
 #   --endpoint URL     Hugging Face endpoint for the downloads, e.g. https://hf-mirror.com
 #   --pip-index URL    package index, used only if the `hf` CLI has to be installed first
-#   --posttrain        also load the experimental post-training file (see README, §7; finance only)
+#   --posttrain        also load the experimental post-training file (docs/TECHNICAL.md §7; finance only)
 #   --no-xet           download over the plain LFS channel instead of Xet (use it if downloads keep failing with
-#                      "peer closed connection": some proxies cut Xet transfers, see README §8)
+#                      "peer closed connection": some proxies cut Xet transfers)
 #
 # Running it again is safe: finished files are skipped, partial downloads resume.
 # Everything is written under --dir; no sudo, nothing outside it.
@@ -38,7 +42,7 @@ GGUF_BYTES=113556639424
 NPART=40
 PART_BASE=2838915985
 PART_EXTRA=24
-# Domain → sidecar directory in this repository. A new domain = one more line here (and in README §7).
+# Domain → sidecar directory in this repository. A new domain = one more line here (and in the README quality table).
 sidecar_of() {
     case "$1" in
         finance) echo "DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-vqfin41_vqhalf_a_n8192-engine";;
@@ -68,7 +72,7 @@ CMD="install"; DIR="$HOME/youngai"; HOST="127.0.0.1"; PORT=8000; ENDPOINT=""; PI
 ENGRAM_SRC=""; DOMAIN="finance"
 while [ $# -gt 0 ]; do
     case "$1" in
-        install|start|stop|status) CMD="$1"; shift;;
+        install|start|stop|status|download|probe) CMD="$1"; shift;;
         --domain) DOMAIN="$2"; shift 2;;
         --dir) DIR="$2"; shift 2;;
         --engram-dir) ENGRAM_SRC="$2"; shift 2;;
@@ -94,7 +98,7 @@ SIDECAR=$(sidecar_of "$DOMAIN") || die "unknown --domain '$DOMAIN' (choose $DOMA
 [ "$WITH_PT" = 0 ] || [ "$DOMAIN" = "$POSTTRAIN_DOMAIN" ] \
     || die "--posttrain was solved on the $POSTTRAIN_DOMAIN sidecar and cannot be stacked on --domain $DOMAIN"
 avail_mb() { awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo; }
-fsize() { stat -L -c %s "$1" 2>/dev/null || echo 0; }
+fsize() { stat -L -c %s "$1" 2>/dev/null || stat -L -f %z "$1" 2>/dev/null || echo 0; }   # GNU stat, then BSD/macOS stat
 part_name() { printf '%s.part%02d-of-%d' "$GGUF" "$1" "$NPART"; }
 parts_len() { local k="$1"; echo $(( k * PART_BASE + (k < PART_EXTRA ? k : PART_EXTRA) )); }   # bytes in parts 1..k
 alive() { [ -s "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null; }
@@ -151,8 +155,9 @@ check_disk() {
         for i in 0 1; do [ "$(fsize "$ENGRAM/${SHARDS[$i]}")" = "${SHARD_BYTES[$i]}" ] || need=$((need + SHARD_BYTES[i])); done
     fi
     mkdir -p "$DIR"
-    free=$(df -B1 --output=avail "$DIR" | tail -1)
-    [ "$free" -gt $((need + 5000000000)) ] || die "need $((need / 1000000000)) GB more on $(df --output=target "$DIR" | tail -1), only $((free / 1000000000)) GB free (use --dir elsewhere)"
+    # POSIX df -Pk (KB): GNU 的 -B1/--output= 在 macOS 的 df 上没有, 以前在 Mac 上一跑就报 "need 319 GB more on , only 0 GB free"
+    free=$(( $(df -Pk "$DIR" | awk 'NR==2{print $4}') * 1024 ))
+    [ "$free" -gt $((need + 5000000000)) ] || die "need $((need / 1000000000)) GB more on $(df -Pk "$DIR" | awk 'NR==2{print $6}'), only $((free / 1000000000)) GB free (use --dir elsewhere)"
     say "disk ok: $((need / 1000000000)) GB still to download, $((free / 1000000000)) GB free"
 }
 
@@ -160,6 +165,11 @@ download() {
     [ -n "$ENDPOINT" ] && export HF_ENDPOINT="$ENDPOINT"
     [ "$NO_XET" = 1 ] && export HF_HUB_DISABLE_XET=1
     mkdir -p "$MODEL"
+    # When the endpoint is unreachable, hf sits on the connection for minutes without a word and the download looks
+    # "running" forever. One quick request tells the user why, and what to try instead.
+    local ep="${HF_ENDPOINT:-https://huggingface.co}"
+    curl -sf -m 15 -o /dev/null "$ep/api/models/$REPO" \
+        || die "cannot reach $ep within 15 s (proxy/firewall?); try --endpoint https://hf-mirror.com"
     say "① $REPO: everything except the base-model parts → $MODEL"
     "$HF" download "$REPO" --local-dir "$MODEL" --exclude "*.part*-of-*" || die "download of $REPO failed; run the same command again to resume"
     [ -s "$MODEL/SHA256SUMS" ] || die "SHA256SUMS missing from the download"
@@ -277,7 +287,36 @@ status() {
     say "memory available: $(avail_mb) MB"
 }
 
+# Bytes of the half-finished downloads under one --local-dir (hf writes them as .cache/huggingface/download/*.incomplete
+# and renames on completion, so nothing is counted twice).
+incomplete_bytes() {
+    find "$1/.cache/huggingface/download" -name '*.incomplete' 2>/dev/null | while read -r f; do fsize "$f"; done | awk '{s += $1} END {print s + 0}'
+}
+# Progress from disk only, read every few seconds by the workbench's Models tab (src/train/train_models.c).
+# "HAVE" counts the part being downloaded right now, so it keeps rising during a download instead of jumping per part.
+probe() {
+    local have k=0 i d
+    echo "repo $REPO"
+    echo "shards ${SHARDS[*]}"
+    if [ "$(fsize "$MODEL/$GGUF")" = "$GGUF_BYTES" ]; then have=$GGUF_BYTES
+    else
+        [ -s "$MODEL/.merge-progress" ] && k=$(cat "$MODEL/.merge-progress")
+        have=$(( $(parts_len "$k") + $(fsize "$MODEL/$(part_name $((k + 1)))") + $(incomplete_bytes "$MODEL") ))
+    fi
+    echo "gguf $GGUF $GGUF_BYTES $have"
+    have=$(incomplete_bytes "$ENGRAM")
+    for i in 0 1; do have=$((have + $(fsize "$ENGRAM/${SHARDS[$i]}"))); done
+    echo "engram $((SHARD_BYTES[0] + SHARD_BYTES[1])) $have"
+    for d in ${DOMAINS//|/}; do
+        [ "$d" = none ] && continue
+        i=0; [ -s "$MODEL/$(sidecar_of "$d")/manifest.txt" ] && i=1
+        echo "sidecar $d $(sidecar_of "$d") $i"
+    done
+}
+
 case "$CMD" in
+    download) ensure_hf; use_engram_src; check_disk; download; say "downloaded into $DIR";;
+    probe)   probe;;
     install) preflight; ensure_hf; use_engram_src; check_disk; download
              say "installed in $DIR"
              [ "$START" = 1 ] && start;;

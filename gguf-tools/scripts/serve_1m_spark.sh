@@ -2,7 +2,8 @@
 # serve_1m_spark.sh — 在 spark 本机起 ds4-server(DeepSeek V4.1 现役对), 局域网可达(给 quant_trading_flow 用)。
 # ★以后只有 V4.1★(用户 2026-09-19): V4 那套(q8ve GGUF + zchain.bin 单文件 + 外置 drafter + 1M 上下文)不再是任何默认或退路。
 #
-# 用法: serve_1m_spark.sh [start|stop|status|smoke] [GGUF] [zchain目录] [额外引擎参数...]
+# 用法: serve_1m_spark.sh [start|stop|status|smoke] [GGUF] [zchain目录] [额外引擎参数...] [--port N(默认 8000)] [--host H(默认 0.0.0.0)](两个旗可放任意位置)
+#       serve_1m_spark.sh pick <GGUF> <zchain目录|none> [额外引擎参数...]   记下"下次不带参数起服用哪套"(gguf/serve_pick.txt)
 #   三文件部署的第三件用额外参数挂: ... --posttrain <后训练目录>
 #   start   起跑清单(机器空/内存/模型/链) → nohup 起服务 → 等 /v1/models 可达 → 余量判 → 冒烟(不过就停服务) → 看门狗
 #   stop    只杀 ds4-server 进程(清理=关进程, 不删文件)
@@ -19,7 +20,17 @@
 #   起服地板 10 GB(在分请求缓冲之前量), 看门狗红线 2.5 GB(连续两次就杀服务: 08-24 那次是 available → 0 才假死)。
 #   ★别手动调大 --mem-budget-mb 硬塞★(spark_95g_server_memory_wall)。
 set -uo pipefail
-ROOT="$HOME/ds4-main"; cd "$ROOT" || exit 1
+# 根目录 = 本脚本往上两级(源码仓库根, 或解压出来的发布包根): 不写死 ~/ds4-main —— 发布包解压到哪都要能起(10-10 用户要
+# "release 直接下载到 spark, 执行就起页面, 到模型页下载模型")。写死时包放别处, 页面点"加载"就报找不到 ds4-server。
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"; cd "$ROOT" || exit 1
+# --port N / --host H 可放在任意位置: 主进程 ds4-train 把模型子进程起在 127.0.0.1:<页面端口+1>(外面只认主进程的端口, 它转发); 手起默认 0.0.0.0:8000
+PORT=8000; HOST=0.0.0.0
+_A=(); while [ $# -gt 0 ]; do
+    if [ "$1" = --port ]; then PORT="${2:?--port 后面要端口}"; shift 2
+    elif [ "$1" = --host ]; then HOST="${2:?--host 后面要地址}"; shift 2
+    else _A+=("$1"); shift; fi
+done
+set -- ${_A[@]+"${_A[@]}"}
 CMD="${1:-start}"
 # ★现役对 2026-09-22 换成 v3★(用户令"现在就切到 v3"): 原来是 fp4 那套(vq8x4096-fp4 + gr-fin-40-fp4, 118.0 GB)。
 # 换的依据(全在 fable5.md):
@@ -34,8 +45,24 @@ ZCH="${3:-$ROOT/gguf/v41/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-vqfin41_
 # 第 4 个参数起原样透传给 ds4-server(如 --posttrain <③目录>)。老调用方传的 spec/plain(V4 的 drafter 模式)在 V4.1 上没有意义, 跳过。
 EXTRA=("${@:4}")
 if [ "${EXTRA[0]:-}" = spec ] || [ "${EXTRA[0]:-}" = plain ]; then EXTRA=("${EXTRA[@]:1}"); fi
+# 选择文件 gguf/serve_pick.txt: 第 1 行 GGUF, 第 2 行侧车目录或 none, 之后每行一个额外引擎参数(--engram-dir / --posttrain …)。
+# ★格式只归本脚本管★: 写走 `serve_1m_spark.sh pick <GGUF> <侧车|none> [额外参数...]`(工作台模型页加载、聊天页热切侧车、
+#   z_nightly train 训完挂新 ③ 都调它), 读在下面 —— 别处不许自己拼这个文件。
+# 不带模型参数的起服(页面"加载"、train_cycle.sh 训完装回来)一律按它: 不然装回来的是上面的脚本默认对, 用户选的白选、刚训好的 ③ 也没挂上。
+# 带了参数的调用照旧按参数走, 不读这个文件。
+PICK="$ROOT/gguf/serve_pick.txt"
+if [ "$CMD" = pick ]; then
+    [ $# -ge 3 ] || { echo "用法: $0 pick <GGUF> <侧车目录|none> [额外引擎参数...]"; exit 2; }
+    printf '%s\n' "${@:2}" > "$PICK.tmp" && mv "$PICK.tmp" "$PICK" || exit 1   # 先写临时再改名: 起服脚本不会读到半个文件
+    echo "[serve1m $(date +%H:%M:%S)] 下次起服按: ${*:2}"; exit 0
+fi
+if [ "$CMD" = start ] && [ $# -lt 2 ] && [ -s "$PICK" ]; then
+    mapfile -t PK < "$PICK"; MDL="${PK[0]}"; ZCH="${PK[1]}"; EXTRA=("${PK[@]:2}")
+fi
+# 侧车 none = 只装基座(不传 --zchain)
+ZCH_ARGS=(); [ "$ZCH" = none ] || ZCH_ARGS=(--zchain "$ZCH")
 # 上下文不在这里配(用户 2026-09-22): 引擎从模型元数据读, 以前这里写过 500000/1048576 都是多余的一份数。
-PORT=8000; BUDGET_MB=110000
+BUDGET_MB=110000
 LOGF="$HOME/ds4-server-1m.log"
 LOG(){ echo "[serve1m $(date +%H:%M:%S)] $*"; }
 alive(){ pgrep -x ds4-server >/dev/null; }
@@ -85,7 +112,7 @@ esac
 
 # ---- 起跑清单 ----
 [ -s "$MDL" ] || { LOG "★模型缺 $MDL★"; exit 2; }
-[ -d "$ZCH" ] && ls "$ZCH"/gr_L*.bin >/dev/null 2>&1 || { LOG "★zchain 目录缺或没有 gr_L*.bin: $ZCH★"; exit 2; }
+[ "$ZCH" = none ] || { [ -d "$ZCH" ] && ls "$ZCH"/gr_L*.bin >/dev/null 2>&1; } || { LOG "★zchain 目录缺或没有 gr_L*.bin: $ZCH★"; exit 2; }
 # pgrep -x 精确进程名: -f 会自匹配 ssh 远程命令行(实撞 08-18/09-05)
 BUSY=$(for p in ds4 ds4-bench ds4-server ds4quant_run zlayer v41_amp_run; do pgrep -x "$p"; done)
 [ -z "$BUSY" ] || { LOG "★机器非空(实例锁: 大模型进程只许一个): $BUSY★"; ps -o pid,comm -p $(echo $BUSY | tr ' ' ',') ; exit 3; }
@@ -107,8 +134,8 @@ LOG "起服务(V4.1 纯解码)"
 TRACE_DIR="$ROOT/gguf/v41/night/trace"; mkdir -p "$TRACE_DIR"
 TRACE_FILE="$TRACE_DIR/serve_$(date +%Y%m%d_%H%M%S).txt"
 echo "$TRACE_FILE" > "$TRACE_DIR/current"
-nohup ./ds4-server --cuda -m "$MDL" --zchain "$ZCH" --mem-budget-mb "$BUDGET_MB" \
-    --host 0.0.0.0 --port "$PORT" --trace "$TRACE_FILE" ${EXTRA[@]+"${EXTRA[@]}"} > "$LOGF" 2>&1 </dev/null &
+nohup ./ds4-server --cuda -m "$MDL" ${ZCH_ARGS[@]+"${ZCH_ARGS[@]}"} --mem-budget-mb "$BUDGET_MB" \
+    --host "$HOST" --port "$PORT" --trace "$TRACE_FILE" ${EXTRA[@]+"${EXTRA[@]}"} > "$LOGF" 2>&1 </dev/null &
 if ! wait_up 120; then
     LOG "★没起来, 日志尾:★"; tail -6 "$LOGF" | cut -c1-200
     alive && pkill -x ds4-server; exit 4
@@ -117,7 +144,7 @@ MEM_FLOOR_MB=10000
 a=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
 LOG "起来后 MemAvailable ${a} MB(地板 $MEM_FLOOR_MB) | $(free -m | awk 'NR==2{printf "used %d buff/cache %d", $3, $6} NR==3{printf " swap %d", $3}')"
 if [ "$a" -lt "$MEM_FLOOR_MB" ]; then LOG "★余量 ${a} MB < ${MEM_FLOOR_MB}, 会 swap/读盘假死, 停★"; pkill -x ds4-server; sleep 4; exit 4; fi
-LOG "服务可达 http://$(hostname -I | awk '{print $1}'):$PORT/v1  (日志 $LOGF)"
+LOG "服务可达 http://$([ "$HOST" = 0.0.0.0 ] && hostname -I | awk '{print $1}' || echo "$HOST"):$PORT/v1  (日志 $LOGF)"
 grep -E "V4.1 服务路|budget gate|内存地板|listening" "$LOGF" | head -6 | cut -c1-160
 # ★冒烟不过 = 服务没用★(09-19 实撞: 服务可达、/v1/models 正常, 每条 chat 却回 "cuda prefill failed", 下游整批报错还以为是模型的事)
 if ! smoke; then LOG "★冒烟失败, 停服务★"; pkill -x ds4-server; sleep 3; exit 5; fi

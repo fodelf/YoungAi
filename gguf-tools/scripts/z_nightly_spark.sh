@@ -34,33 +34,20 @@
 #   docgate <③目录> [ntok]   守门: 同趟 v41_judge 出 ② 与 ②+③ 的 wt2 五指标(默认 512 token)
 #   docflip <料目录> <η> <λ> <K> <conf-min> [标签]   ★一篮子★: doc3 → 基线/挂 ③ 逐题探针(温 0 + 两粒种子) → docgate;
 #                 问题在 <料目录>/probe/questions.txt(10-01 晚, 复盘文本当 ③ 目标的翻转验证)
-#   kdgen <料目录> [块名正则] [轮数] [并发]   ★第八版 上下文蒸馏的料★: 起服务让模型读每个复盘块自出问答(三种种子) → qa/<块>.{train,eval}.qa
-#   kdsplit <料目录>   只重拆问答(gen/*.json → qa/), 不起服务; 改了拆对规则后用
-#   kdtrain <料目录> [层] [lr] [轮数] [块名正则] [标签] [k=v,...]   ★第八版训练★: ./ds4 --ptrain(教师 top-K → 反传训 ③ → 留出 KL + 贪心探针)
-#                 → $FTD/kd-<料名>-<标签>/(每轮 ckpt_eNN + 末轮本目录; 轮数照训满, 挑轮交给 kdpick);
-#                 第 7 参追加配置(gradcheck=2 只查梯度就退, probe_n=12 等)
-#   reviewrun <请求 JSON> <③目录|-> <输出 .sse> [温度]   真实请求重跑一趟(起服务挂/不挂 ③), 打思考/正文结论 + CFO 决策 JSON; A/B 给温度 0
-#   kdpick <③根目录>   自动选轮: 每轮 ckpt 过 wt2 门(Σmin/KLD) → 过门的轮里留出 KL 最低者, 打各轮对照表
-#   kdtable <③根目录>  只重打逐轮对照表(留出 KL + 各轮 kddiag 的分叉位跟上率), kdrun 中途停车后补齐 kddiag 再看表时用
-#   kdrun <料目录> <训练轮数> [层] [lr] [出题轮数] [标签] [k=v,...]   ★一条龙★: kdgen → kdtrain → kdpick → 逐轮 kddiag + 对照表; 出题轮数 0 = 用现有问答; 料目录 = chunks/ 文本 + hold/questions.txt
-#                 [+ probe/questions.txt 自定义探针] [+ seeds/s0~s2.txt 出题提示]
-#   kdeval <③根目录> <请求 JSON>...   第八版训完验收: kdpick 选轮 → 每条请求温 0 不挂/挂选中的 ③(原样输出, 不参与选轮) → 解码图门
-#   kdprof <料目录> [步数 5] [nsys|-] [k=v,...] [二进制] [额外引擎参数]   训练计时(只跑 N 步, 整步分段表; nsys = 再出逐核合计表), 要现成教师表; 二进制给 ds4.base_xxx = A/B; 额外参数例 --v41-prof(落训练路由)
-#   kddiag <③根目录> <ckpt_eNN|-> <问答.qa|eval> [块.txt]   逐位诊断(不训练): 每道题答案逐位并排 教师 / 挂 ③ / 部署态 前 5 名 + 分叉位汇总 → <根>/diag-<ckpt>…/diag.txt
-#   kdinc [篇数上限 4] [轮数 3] [lr 1e-4] [k=v,...]   ★一次增量后训练★(10-03/04): 不用给料 —— 从料池 $FTD/incr/pool/ 取还没训过的前 K 篇(名字序), 分配下一个序号
-#                 → $FTD/incr/<序号>/ → (没问答就 kdgen) → 账本 + 校准料 → 训练前 kdfwd(转移 + 决策探针) → init=上一次 ACCEPTED 的 ③ 叠加训练 → wt2 门 + 套件门
-#                 → ACCEPTED(current 指过去)/REJECTED → kddiag → incr/ledger.txt。进度 = incr/SEQ(序号) + incr/current(上线的 ③) + 各序号 chunks/(训过的料); kdinc @序号 [轮] [lr] [k=v] = 重跑该文件夹
-#   kdpool        只看进度: SEQ / current / 料池里还没训过的篇(kdinc 下一次会取哪些), 不动模型。喂料 = 把 qtf corpus 产物的 chunks/ docs/ [qa/] [hold/] 同步进 $FTD/incr/pool/
-#   kdtake [篇数上限 4]   只取料不训练(分配序号 + 账本 + 决策提示), 之后 kdinc @序号 训; kdscore <序号> <probe 文件> [stats 序号] 对训练器任一份 probe 文件按领域打三臂分
-#                 账本料在清单里带第 4 列 hard: 训练器用答案 one-hot 当目标(交叉熵) + 数字位 ×hard_num(4) 其余 ×hard_txt(0.25), 不过教师信念(10-04)
-#   kdfwd <序号> [③目录] [标签]   时间向前的转移测试: 用该序号之前训出的 ③ 对该次全部问答(它没见过)跑 kddiag + 决策探针(各股决策日材料 → 目标/止损 对次日实际), 挂③ 对部署态 对规则
-#   kdledger <序号>   决策账本 + 校准料(kdinc 自动跑): 逐领域适配器(gguf-tools/scripts/kd_domain/<域>.sh, 契约见 _template.sh) docs/ 整篇 → ledger/<域>/<序号>.tsv 逐笔
-#                 → 累计统计与规则 stats_<序号>.txt → chunks/ledger_<域>_<序号>.txt + 代码产问答 + decide/<域>/ 决策提示; 加领域 = 加一个文件, 主脚本不改
-#   kdrft [轮数 3] [每题份数 8] [留出序号 = 最新有决策提示的序号] [lr 1e-4] [锚 β 1] [k=v,...]   ★奖励回路★(10-04): 分配序号, 起点 = current; 各序号的决策提示(留出序号的除外)当训练提示,
-#                 每轮: 模型自己抽 G 份答案(训练器 sample_n, 温 1) → 适配器 <域>_reward 按次日实际结算 → one-hot × (收益 − 组均值) + 同串 token 的 kl 锚(教师 = 本轮起点 ③, β) + 回放 + 保持料
-#                 → 一遍训练 → 轮末再抽(下一轮样本 + 本轮读数) → 各轮 wt2 门 + 套件门, 过门里训练提示收益最高者 ACCEPTED。kdrft @序号 [同参] = 续跑/重跑(第 0 轮抽过就不重抽)
+#   ★③ 后训练(2026-10-10 收口: 一份 jsonl 一条命令; 料两种 = messages 问答 / text 原文, 与 unsloth 同)★
+#   gen <料目录> [块名正则] [轮数]   可选数据工具: 模型读 chunks/*.txt 每块出问答(synthetic-data-kit 那句提示) → <料目录>/<料名>.jsonl(带 context)
+#   gensplit <料目录>   只重拆问答(gen/*.txt → jsonl), 不起服务
+#   train <数据.jsonl> [轮 3] [层 0-39] [lr 2e-4] [k=v,...]   ★训 ③★: ./ds4 --ptrain → $FTD/kd-<料名>-<标签>/ → kdpick 选轮(过 wt2 门里留出损失最低)
+#   kdpick <③根目录>   只重选轮;  kdprof <数据.jsonl> [步数 5] [nsys|-] [k=v,...] [二进制] [额外引擎参数]   训练计时(要现成教师表)
+#   kddiag <③根目录> <ckpt_eNN|->   逐位诊断(不训练): 留出题答案逐位并排 教师 / 挂 ③ / 部署态 前 5 名 + 分叉位汇总
+#   ptgate <训练器输出目录(epochs=0)> [标签] [k=v]   生成侧改动的逐字节门;  ptcheck <训练器输出目录> <k=v,...> [标签]   同配置再跑一趟开检查项(packcheck/gradcheck/计时)
+#   docgate <③目录> [ntok]   守门: 同趟 v41_judge 出 ② 与 ②+③ 的 wt2 五指标(默认 512 token)
+#   docprobe <③目录|-> <标签> <温度|-> <问题>...  挂/不挂 ③ 走 CLI 聊天模板逐题问, 原始输出落盘
+#   (10-10 砍掉: kdinc/kdtake/kdpool/kdledger/kdfwd/kdrft/kdscore/kdrun/jsonl/kdeval/kdgengate/kdtrain 与 kd_domain/ 领域适配器 —— 账本/奖励回路/决策探针全是
+#    金融 CFO 专属的定制件, 用户判为跑偏; 盘上 incr/ 产物不删只是没有命令再读它们)
 set -uo pipefail
-ROOT="$HOME/ds4-main"; cd "$ROOT" || exit 1
+# 根 = 本脚本往上两级(源码仓库根, 或解压出来的发布包根), 不写死 ~/ds4-main: 发布包里的训练页也走这条链(10-10)
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"; cd "$ROOT" || exit 1
 SC="$ROOT/gguf-tools/scripts"; AMP="$ROOT/gguf-tools/amp"
 # ★2026-09-13 起整条链走 DeepSeek V4.1★(用户令"不要考虑 V4 了"): 三个文件依次加载 ——
 #   ① 量化 GGUF(1.519 bpw VQ + FP4 骨架)  ② 反修插件目录(逐专家逐通道增益, 冻结)
@@ -71,6 +58,16 @@ D2="$ROOT/gguf/v41/night"
 # 指着旧对解出的 ③ 指纹(base.fnv)对不上现役, 挂上去引擎直接拒。改 ①② 先改这里, 与 serve_1m_spark.sh 的默认值保持一致。
 MDL="$ROOT/gguf/v41/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf"   # ① 量化模型(不改)
 ZCH="$ROOT/gguf/v41/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-vqfin41_vqhalf_a_n8192-engine"   # ② 反修(金融 j Same top 74.57%)
+# ★工作台选了哪套就训哪套★(10-10): gguf/serve_pick.txt 在(模型页"加载"写的, 格式归 serve_1m_spark.sh pick 管)就按它 ——
+#   ③ 是对着 ①② 这个态解的(base.fnv), 训练用的对与服务装的对不一致, 训完挂上去引擎直接拒。第 3 行起只拿 --engram-dir
+#   (发布包里模型在 gguf/hub, engram 表不在转换机的路径上, 训练器/判决器同样要它); 侧车 none = 对着裸 ① 训; ③ 不继承(起点恒为 ①+②)。
+ENG=()
+if [ -s "$ROOT/gguf/serve_pick.txt" ]; then
+    mapfile -t _PK < "$ROOT/gguf/serve_pick.txt"; MDL="${_PK[0]}"; ZCH="${_PK[1]:-none}"
+    for ((_i = 2; _i < ${#_PK[@]}; _i++)); do [ "${_PK[_i]}" = --engram-dir ] && ENG=(--engram-dir "${_PK[_i + 1]}"); done
+fi
+[ "$ZCH" = none ] && ZCH=""
+ZARGS=(); [ -z "$ZCH" ] || ZARGS=(--zchain "$ZCH")
 FTD="$ROOT/gguf/v41/posttrain"            # ③ 后训练件版本库(pt-<日期>/)
 HFDIR="$ROOT/hf/DeepSeek-V4.1-Flash"   # HF 出厂目录(后训练只用它读形状, 不读权重)
 BEN="$ROOT/gguf-tools/bench"
@@ -1933,75 +1930,12 @@ kd_pick(){
             if [ -z "$bkl" ] || awk -v a="$kl" -v b="$bkl" 'BEGIN{exit !(a < b)}'; then KD_PICK="$c"; bkl="$kl"; fi
         else LOG "选轮 $(basename "$c"): 留出 KL $kl(较上轮降 $gn ± $se) 保持料 KL $hk | $r | ★没过门★"; fi
     done
+    rm -f "$R0/pick.txt"   # 重选时先清: 旧的选中不许留给训练页(ds4-train 读它当"done")
     [ -n "$KD_PICK" ] || DIE "选轮: 没有一轮过 wt2 门, 不进任何对比(读数见 $W/gate_*.txt)"
+    basename "$KD_PICK" > "$R0/pick.txt"   # 训练页(ds4-train /api/runs)读: 选中的 ckpt 名
     LOG "选轮结果: $KD_PICK(过门的轮里留出 KL 最低, $bkl)"
 }
 stage_kdpick(){ kd_pick "${1:?③根目录}"; LOG "KDPICK_DONE $KD_PICK"; }
-
-# kdrun <料目录> <训练轮数> [层 0-39] [lr 2e-4] [出题轮数 1] [标签] [k=v,...]: ★料目录放好, 一条命令走完★(10-02)
-#   kdgen(模型读 chunks/ 每块自出问答 + 部署态答 hold/ 通用题) → kdtrain(照轮数训满, 每轮存 ckpt_eNN) → kdpick(过 wt2 门的轮里留出 KL 最低)
-#   → 每轮 kddiag eval(分叉位跟上率, 只打不判) → 逐轮对照表。出题轮数给 0 = 跳过 kdgen, 用 qa/ 现有问答(只改训练配置重训时用)。
-#   料目录: chunks/*.txt = 要写进 ③ 的文本; hold/questions.txt = 通用题(教师 = 部署态自己, 把 ③ 钉住; 别放和要写的事实冲突的题,
-#   比如写 1+1=3 时放"一加一等于几"等于让两头对拉); 可选 probe/questions.txt = 自定义探针(第 0 步和每轮末原样答一遍),
-#   seeds/s0~s2.txt = 出题提示(缺省 = 复盘三种子)。层/lr 缺省 = 10-02 全量全层那趟的配方。
-stage_kdrun(){
-    local DOCD="${1:?料目录}" EP="${2:?训练轮数}" LAYERS="${3:-0-39}" LR="${4:-2e-4}" ROUNDS="${5:-1}" TAG="${6:-}" EXTRA="${7:-}"
-    [ -d "$DOCD/chunks" ] || DIE "没有 $DOCD/chunks(要写进 ③ 的文本放这里)"
-    [ -s "$DOCD/hold/questions.txt" ] || DIE "没有 $DOCD/hold/questions.txt(通用题, 不给的话 ③ 没有东西钉着, 10-01 不加约束料局部性崩)"
-    local NAME; NAME="$(basename "$DOCD")"; [ -n "$TAG" ] || TAG="L${LAYERS}-lr${LR}-e${EP}"
-    # 出题轮数 0 = 不出题, 用料目录现有问答(同一批题只改训练配置时用; 重新出题会换掉题目, 前后两趟就不可比了)
-    if [ "$ROUNDS" = 0 ]; then
-        ls "$DOCD"/qa/*.train.qa >/dev/null 2>&1 || DIE "出题轮数 0 = 用现有问答, 但 $DOCD/qa 里没有 *.train.qa(先跑一遍 kdgen)"
-        LOG "kdrun: 出题轮数 0, 不出题, 用 $DOCD/qa 现有问答($(ls "$DOCD"/qa/*.train.qa | wc -l) 份训练题文件)"
-    else stage_kdgen "$DOCD" . "$ROUNDS" 1; fi
-    stage_kdtrain "$DOCD" "$LAYERS" "$LR" "$EP" . "$TAG" "$EXTRA"
-    local R="$FTD/kd-$NAME-$TAG" n
-    stage_kdpick "$R"
-    # 逐轮分叉位核对(只打不判, 选轮仍按 kdpick): 留出 KL 是整段平均, 分叉位跟上率才直接说"材料写进去了多少"(10-02 加)
-    for n in $(seq 1 "$EP"); do stage_kddiag "$R" "$(printf 'ckpt_e%02d' "$n")" eval; done
-    kd_diag_table "$R"
-    LOG "KDRUN_DONE $R 选中 $KD_PICK"
-}
-
-# 逐轮对照表: 留出 KL(train.log 最后一趟) + 分叉位挂③跟上率 / 教师有把握的分叉位跟上率 / 含数字参考位挂③答对率(各轮 diag.out 汇总行)
-kd_diag_table(){
-    local R="$1" f n kl a b c
-    LOG "逐轮对照(只打不判): 轮 | 留出 KL | 分叉位挂③跟上教师 | 教师有把握(p≥0.5)的分叉位 | 含数字参考位挂③答对"
-    for f in "$R"/diag-ckpt_e*-eval/diag.out; do
-        [ -s "$f" ] || continue
-        n="$(basename "$(dirname "$f")" | sed 's/diag-ckpt_e0*\([0-9]*\)-eval/\1/')"
-        kl="$(awk -v n="$n" '$1=="step" && $2=="0"{split("",v)} $1=="epoch" && $2==n{v[n]=$4} END{print v[n]}' "$R/train.log")"
-        a="$(grep -a '分叉位(教师榜首≠部署榜首)' "$f" | tail -1 | sed 's/.*挂③榜首 = 教师榜首 \([0-9.]*%\).*/\1/')"
-        b="$(grep -a '分叉位且教师榜首' "$f" | tail -1 | sed 's/.*挂③榜首 = 教师榜首 \([0-9.]*%\).*/\1/')"
-        c="$(grep -a '含数字的参考位' "$f" | tail -1 | sed 's/.*挂③ \([0-9.]*%\) \/ 部署.*/\1/')"
-        LOG "  e$n | $kl | $a | $b | $c"
-    done
-}
-
-# kdeval <③根目录> <请求 JSON>...: 第八版训完的验收一条龙(10-02)。
-#   ① kd_pick 自动选轮(见上);
-#   ② 每条真实请求按温 0 跑: 不挂 ③ + 挂选中的 ③, sse 落 <根>/eval/<请求名>.{base,ckpt_eNN}.sse, CFO_JSON 进 nightly.log ——
-#      只为把原样输出摆出来看行为, 不参与选轮;
-#   ③ 挂选中的 ③ 过解码图门(d1_kv_ring_gate.sh graph): 放大器的 cuBLAS 核进了整步图, 走图 == 直发逐字节且没有"捕获失败/PDL 改边失败"。
-stage_kdeval(){
-    local R0="${1:?③根目录}"; shift
-    [ $# -ge 1 ] || DIE "kdeval 至少要一条请求 JSON"
-    local q; for q in "$@"; do [ -s "$q" ] || DIE "没有请求 $q"; done
-    kd_pick "$R0"
-    local W="$R0/eval" n pick="$KD_PICK"
-    for q in "$@"; do
-        n="$(basename "$q" .json)"
-        stage_reviewrun "$q" - "$W/$n.base.sse" 0
-        stage_reviewrun "$q" "$pick" "$W/$n.$(basename "$pick").sse" 0
-    done
-    # 门脚本自己不查实例锁: 服务被 pkill -9 后要等它真退出再装下一份模型(need_idle 不认 ds4-server)
-    bash "$SC/serve_1m_spark.sh" stop >>"$LOGF" 2>&1; sleep 3
-    pgrep -x ds4-server >/dev/null && DIE "服务还没退干净, 不装第二份模型"
-    need_idle
-    LOG "解码图门: 挂 $pick"
-    bash "$ROOT/speed-bench/d1_kv_ring_gate.sh" - "$MDL" 64 graph "$ZCH" "--posttrain $pick" 2>&1 | tee -a "$LOGF" | tail -14
-    LOG "KDEVAL_DONE $R0 选中 $pick"
-}
 
 # docnll <ids文件> <标签> [二进制=./ds4] [chunk]: 同一份 ids 用指定引擎二进制打逐位 NLL(--score-ids 部署同路, 挂现役 ②), 逐位打印。
 #   为什么要它(10-01 实撞): 解算器 13:08 重编(链 11:04 回滚后的引擎对象)后, 同一篇 44 token 文档的基线 logp 与 09-30 00:08 那版
@@ -2052,44 +1986,45 @@ stage_docflip(){
     LOG "DOCFLIP_DONE $TAG 候选 $CAND"
 }
 
-# ---------------- ③ 第八版: 上下文蒸馏(2026-10-01 夜, 用户"发车") ----------------
-# 方法(成熟方案的共识, fable5 10-01 夜检索段): 教师 = ①+② 把复盘块放进上下文; 学生 = ①+②+③ 不看块; 料 = 教师围着块自己出的
-# 大量多样问答; 目标 = 学生在答案位逼近教师分布(KL), 走反传训练 ③。对原文做 next-token(六趟 doc3 的做法)各家都判了负。
-# kdgen <料目录> [块名正则] [每种种子轮数] [并发路数]: 起服务(①+②, 不挂 ③) → 每块 × 三种种子提示 × 轮数 让模型读块出问答
-#   → 按"问：/答："拆对 → 按问题哈希五取一留作 eval(措辞没进训练) → qa/<块>.train.qa / .eval.qa → 停服务。
-#   三种种子(Cartridges 的五类收成三类, 都要求问题自带完整指代 —— 学生不看材料, "这份复盘"指不到任何东西):
-#     s0 事实问答 8 组 / s1 推理与教训问答 6 组 / s2 概括 2 组 + 交易员请教 2 组。采样走模型卡(温 1), 不思考。
-KD_SEED0='请仔细阅读上面的复盘材料，然后提出 8 个具体问题并逐一作答。要求：1. 每个问题都必须写明完整指代（如股票代码和名称、具体日期），让没看过这份材料的人也知道问的是哪一件事，不许出现“这份材料”“上文”之类的说法；2. 问题覆盖材料里不同的具体事实（价格、日期、数字、错误类型、结论、原因等），不要重复；3. 答案只依据材料，简洁准确。严格按下面的格式输出，不要输出别的内容：
+# ---------------- ③ 后训练: 一份 jsonl 一条命令(2026-10-10 收口; 用户: "更简单的数据结构, 更好更快的训练效果") ----------------
+# 料 = jsonl, 一行一题: {"messages":[{"role":"user","content":"问"},{"role":"assistant","content":"答"}], "context":"材料(可省)"}
+#   带 context = 上下文蒸馏(教师 = 读了材料的部署态自己, 学生不看材料, 蒸 top-K 分布; 文献 KMs/PD/Cartridges 的共识); 不带 = 答案 one-hot(交叉熵)。
+#   别的字段训练器直接报错(10-09 那版收 reward/mode/split, 10-10 用户判为跑偏)。留出 = 问题去空白 FNV 五取一(训练器定, 与料文件无关)。
+#   保持料 = 固定的 $HOLD(通用题 + 部署态自己的回答, 教师 = 部署态自己), 训练器自动混入, 用户不用管 —— 10-01 实撞: 没有它 ③ 局部性崩。
+HOLD="$ROOT/gguf-tools/data/posttrain/hold.jsonl"
+# gen <料目录> [块名正则] [轮数]: 文档 → 问答料(可选的数据工具, 不是训练的一环: 文档也可以直接当 {"text"} 原文料训, unsloth 同样两条路)。
+#   chunks/*.txt 每块 × 轮数, 模型读块出问答(合批 --gen-jobs, 8 路; 种子按 块名+轮 定 ⇒ 可复现) → gensplit 按"问：/答："拆对 → <料目录>/<料名>.jsonl(每行 context = 块正文)。
+#   提示只有一句, 照 Meta synthetic-data-kit 默认的 qa_generation(问题只问原文里的重要事实 / 答案必须有原文直接支持 / 每块固定 N 组), 10-10 对齐时把原先
+#   带复盘味的三条("有什么教训""读者请教怎么做")删了; 唯一加的要求是问题自带完整指代 —— 学生训练时不看材料, "这份材料"指不到任何东西。
+#   料目录自带 seeds/qa.txt 就用它(对应 synthetic-data-kit 的自定义 prompts.qa_generation)。采样走模型卡(温 1), 不思考。
+KD_SEED_QA='请根据上面这段文字写 10 组问答，用于训练大模型。规则：1. 问题只问这段文字里的重要事实；2. 答案必须能在这段文字里直接找到依据；3. 每个问题写明完整指代（具体的名称、日期、对象），不许出现“这段文字”“上文”之类的说法。严格按下面的格式输出，不要输出别的内容：
 问：……
 答：……'
-KD_SEED1='请仔细阅读上面的复盘材料，然后提出 6 个需要理解和推理才能回答的问题并作答，例如：当时的判断错在哪里、为什么会错、应该怎样修正、这次复盘的教训是什么、以后遇到类似情况该怎么做。要求每个问题都写明完整指代（如股票代码和名称、具体日期），不许出现“这份材料”“上文”之类的说法；答案要有依据、讲清理由。严格按下面的格式输出，不要输出别的内容：
-问：……
-答：……'
-KD_SEED2='请根据上面的复盘材料写 4 组问答：第 1、2 组请对方概括这次复盘的要点（问题里写明股票代码和名称或具体日期）；第 3、4 组是一位交易员向你请教在类似行情里怎样避免同样的错误（问题里点明是哪只股票或哪一天的复盘）。不许出现“这份材料”“上文”之类的说法；答案要具体。严格按下面的格式输出，不要输出别的内容：
-问：……
-答：……'
-# 问答拆对(kdgen 末尾调; 也可单独 kdsplit <料目录> 重拆, 不起服务): gen/*.json → qa/<块>.{train,eval}.qa, 留出 = md5(题) % 5 == 0
+# gensplit <料目录>: gen/*.txt(引擎原始输出; 老目录的 gen/*.json 也认) → <料目录>/<料名>.jsonl。同块同题去重; 没拆出问答的份数打出来
 kd_split(){
-    local DOCD="${1:?料目录}"
-    python3 - "$DOCD" <<'PY' || DIE "问答拆对失败"
-import glob, hashlib, json, os, re, sys
-d = sys.argv[1]
-by = {}
-bad = 0
-hq = [l.strip() for l in open(os.path.join(d, "hold", "questions.txt"))] if os.path.exists(os.path.join(d, "hold", "questions.txt")) else []
-hq = [q for q in hq if q]
-for p in sorted(glob.glob(os.path.join(d, "gen", "hold_q*.json"))):   # 保持料: 题目在 hold/questions.txt 第 N 行, 答案是整段回答
-    i = int(re.search(r"hold_q(\d+)\.json$", p).group(1)) - 1
-    a = (json.load(open(p))["choices"][0]["message"].get("content") or "").strip()
-    if 0 <= i < len(hq) and a: by.setdefault("hold_general", []).append((hq[i], a))
-for p in sorted(glob.glob(os.path.join(d, "gen", "*.json"))):
-    if os.path.basename(p).startswith("hold_q"): continue
-    chunk = re.sub(r"_s\d+r\d+\.json$", "", os.path.basename(p))
-    txt = json.load(open(p))["choices"][0]["message"].get("content") or ""
-    txt = txt.replace("**", "")
+    local DOCD="${1:?料目录}" OUT; OUT="$DOCD/$(basename "$DOCD").jsonl"
+    python3 - "$DOCD" "$OUT" <<'PYSPLIT' || DIE "问答拆对失败"
+import glob, json, os, re, sys
+d, out = sys.argv[1], sys.argv[2]
+by, bad, chunks = {}, 0, {}
+def body(p):
+    if p.endswith(".json"): return json.load(open(p))["choices"][0]["message"].get("content") or ""
+    return open(p, encoding="utf-8").read()
+seen_files = set()
+for p in sorted(glob.glob(os.path.join(d, "gen", "*.txt")) + glob.glob(os.path.join(d, "gen", "*.json"))):
+    b = os.path.basename(p)
+    if b.startswith("hold_q") or b in ("gen.out", "jobs.tsv"): continue
+    stem = re.sub(r"\.(txt|json)$", "", b)
+    if stem in seen_files: continue      # 同名 .txt 与 .json 只读一份
+    seen_files.add(stem)
+    chunk = re.sub(r"_s\d+r\d+$", "", stem)
+    cf = os.path.join(d, "chunks", chunk + ".txt")
+    if not os.path.exists(cf): continue
+    chunks[chunk] = open(cf, encoding="utf-8").read().rstrip()
+    txt = body(p).replace("**", "")
     cur_q, cur_a, mode, pairs = [], [], None, []
     for line in txt.splitlines():
-        # 标记行: "问：/答：", 前面可带序号("1. 问："), 后面也可带序号("问1：/答1：", 10-01 有 13 份生成这样写, 原正则整份拆不出)
+        # 标记行: "问：/答：", 前面可带序号("1. 问："), 后面也可带序号("问1：/答1：")
         m = re.match(r"^\s*(?:\d+[.、)]\s*)?(问|答)\s*\d*\s*[：:]\s*(.*)$", line)
         if m:
             if m.group(1) == "问":
@@ -2102,140 +2037,95 @@ for p in sorted(glob.glob(os.path.join(d, "gen", "*.json"))):
         elif mode == "a": cur_a.append(line)
     if cur_q and cur_a: pairs.append(("\n".join(cur_q).strip(), "\n".join(cur_a).strip()))
     if not pairs: bad += 1
-    by.setdefault(chunk, []).extend(p for p in pairs if p[0] and p[1])
-ntr = nev = 0
-for chunk, pairs in by.items():
-    seen, tr, ev = set(), [], []
-    for q, a in pairs:
-        k = re.sub(r"\s+", "", q)
-        if k in seen: continue
-        seen.add(k)
-        (ev if int(hashlib.md5(k.encode()).hexdigest(), 16) % 5 == 0 else tr).append((q, a))
-    for name, lst in (("train", tr), ("eval", ev)):
-        with open(os.path.join(d, "qa", "%s.%s.qa" % (chunk, name)), "w") as f:
-            for q, a in lst: f.write("#Q\n%s\n#A\n%s\n" % (q, a))
-    ntr += len(tr); nev += len(ev)
-print("问答拆对: %d 块, 训练 %d 组 / 留出 %d 组; 没拆出问答的生成 %d 份" % (len(by), ntr, nev, bad))
-PY
+    by.setdefault(chunk, []).extend(x for x in pairs if x[0] and x[1])
+n = 0
+with open(out, "w", encoding="utf-8") as f:
+    for chunk in sorted(by):
+        seen = set()
+        for q, a in by[chunk]:
+            k = re.sub(r"\s+", "", q)
+            if k in seen: continue
+            seen.add(k); n += 1
+            f.write(json.dumps({"messages": [{"role": "user", "content": q}, {"role": "assistant", "content": a}], "context": chunks[chunk]}, ensure_ascii=False) + "\n")
+print("问答拆对: %d 块, %d 题 → %s; 没拆出问答的生成 %d 份" % (len(by), n, out, bad))
+PYSPLIT
 }
-stage_kdsplit(){ kd_split "${1:?料目录}"; }
-stage_kdgen(){
-    # 并发默认 1(10-01 实撞): --batch 3 的并发调度器在"采样 + 长提示"下每对请求一条首 token 就 "V4.1 decode failed"、另一条百来个 token 后同样报错
-    #   (服务端日志 finish=error, 24 份生成全废)。并发路的病单独立案, 这里走单路串行, 给 >1 才开 --batch。
-    local DOCD="${1:?料目录}" PAT="${2:-.}" ROUNDS="${3:-1}" PAR="${4:-1}"
-    [ -d "$DOCD/chunks" ] || DIE "没有块目录 $DOCD/chunks(先在 Mac 上 qtf_requests_mac.sh corpus <料名>)"
-    local -a CH=(); local f
-    # 空块跳过: hold_general.txt 是保持料的空块(本段第一次跑完才落盘), 续跑时若当普通块去生成, 模型会对着空材料自编问答混进保持料
-    # 账本块跳过: ledger_<域>_<序号>.txt 与它的问答都是 kd_ledger 代码产的, 不让模型出题(10-06 实撞: kdtake 之后 kdinc @序号, 账本块已在 chunks/ 里,
-    #   白生成 3 份且 kd_split 把代码问答盖掉, 全靠随后的 kd_ledger 再盖回来)
-    for f in "$DOCD"/chunks/*.txt; do b="$(basename "$f" .txt)"; [[ "$b" == ledger_* ]] && continue; [ -s "$f" ] && [[ "$b" =~ $PAT ]] && CH+=("$f"); done
+stage_gensplit(){ kd_split "${1:?料目录}"; }
+stage_gen(){
+    local DOCD="${1:?料目录}" PAT="${2:-.}" ROUNDS="${3:-1}"
+    [ -d "$DOCD/chunks" ] || DIE "没有块目录 $DOCD/chunks(要写进 ③ 的文本, 一块一个 .txt; Mac 上 qtf_requests_mac.sh corpus <料名> 出的就是)"
+    local -a CH=(); local f b
+    for f in "$DOCD"/chunks/*.txt; do b="$(basename "$f" .txt)"; [ -s "$f" ] && [[ "$b" =~ $PAT ]] && CH+=("$f"); done
     [ "${#CH[@]}" -gt 0 ] || DIE "块名正则 $PAT 一个都没选中"
-    mkdir -p "$DOCD/gen" "$DOCD/qa"
-    LOG "kdgen: ${#CH[@]} 块 × 3 种子 × $ROUNDS 轮, 并发 $PAR → $DOCD/gen"
-    bash "$SC/serve_1m_spark.sh" stop >>"$LOGF" 2>&1; sleep 1; need_idle
-    local -a BATCH=(); [ "$PAR" -gt 1 ] && BATCH=(--batch "$PAR")
-    bash "$SC/serve_1m_spark.sh" start "$MDL" "$ZCH" ${BATCH[@]+"${BATCH[@]}"} >>"$LOGF" 2>&1 || DIE "服务起不来(看 ~/ds4-server-1m.log)"
+    mkdir -p "$DOCD/gen/prompt"
+    local JOBS="$DOCD/gen/jobs.tsv" s r seed name sd
+    : > "$JOBS"
+    # 一份作业 = 提示文件 + 原始输出(.txt, 引擎写; 没收口的不落盘) + 种子 + 上限; 产物已在的跳过(断点续跑)
+    seed="$KD_SEED_QA"; [ -s "$DOCD/seeds/qa.txt" ] && seed="$(cat "$DOCD/seeds/qa.txt")"
+    for r in $(seq 1 "$ROUNDS"); do for f in "${CH[@]}"; do
+        name="$(basename "$f" .txt)_s0r${r}"   # 名字留 _s0: gensplit 按 _s<n>r<n> 去后缀认块, 老目录的 s1/s2 产物照样能拆
+        { [ -s "$DOCD/gen/$name.txt" ] || [ -s "$DOCD/gen/$name.json" ]; } && continue
+        { cat "$f"; printf '\n%s' "$seed"; } > "$DOCD/gen/prompt/$name.txt"
+        sd=$(printf '%s' "$name" | cksum | cut -d' ' -f1); [ "$sd" = 0 ] && sd=1
+        printf '%s\t%s\t%s\t%s\n' "$DOCD/gen/prompt/$name.txt" "$DOCD/gen/$name.txt" "$sd" 4096 >> "$JOBS"
+    done; done
+    LOG "gen: ${#CH[@]} 块 × $ROUNDS 轮, 本次要生成 $(wc -l < "$JOBS") 份 → $DOCD/gen(合批 --gen-jobs)"
     local t0; t0=$(date +%s)
-    gen_one(){   # <块文件> <种子号> <轮> —— 已有非空产物就跳过(断点续跑)
-        local cf="$1" s="$2" r="$3" b out seed
-        b="$(basename "$cf" .txt)"; out="$DOCD/gen/${b}_s${s}r${r}.json"
-        [ -s "$out" ] && return 0
-        # 料目录自带 seeds/s<号>.txt 就用它: 内置三种子句句是"复盘材料/股票代码/交易员", 拿去问一篇不是复盘的文档会答非所问
-        if [ -s "$DOCD/seeds/s$s.txt" ]; then seed="$(cat "$DOCD/seeds/s$s.txt")"
-        else case "$s" in 0) seed="$KD_SEED0";; 1) seed="$KD_SEED1";; *) seed="$KD_SEED2";; esac; fi
-        jq -n --rawfile c "$cf" --arg q "$seed" '{model:"deepseek-chat", max_tokens:4096, messages:[{role:"user", content:($c + "\n" + $q)}]}' \
-            | curl -s -m 1800 "http://127.0.0.1:8000/v1/chat/completions" -H 'Content-Type: application/json' -d @- > "$out.tmp" \
-            && jq -e '.choices[0].finish_reason == "stop"' "$out.tmp" >/dev/null 2>&1 && mv "$out.tmp" "$out" \
-            || { echo "★生成失败 $b s$s r$r: $(head -c 300 "$out.tmp" 2>/dev/null)★"; rm -f "$out.tmp"; }
-    }
-    # ★保持料★(10-01 夜, wt2 守门中位 KLD 0.031 → 0.055 之后加): hold/questions.txt 每行一道通用题, 部署态不看任何块直接答 →
-    #   训练时这些题的教师 = 部署态自己(同一个提示), KL 把 ③ 在通用问题上钉住不许漂。产物 gen/hold_qNNN.json → qa/hold_general.*.qa
-    hold_one(){
-        local i="$1" q="$2" out="$DOCD/gen/hold_q$(printf '%03d' "$1").json"
-        [ -s "$out" ] && return 0
-        jq -n --arg q "$q" '{model:"deepseek-chat", max_tokens:2048, messages:[{role:"user", content:$q}]}' \
-            | curl -s -m 1800 "http://127.0.0.1:8000/v1/chat/completions" -H 'Content-Type: application/json' -d @- > "$out.tmp" \
-            && jq -e '.choices[0].finish_reason == "stop"' "$out.tmp" >/dev/null 2>&1 && mv "$out.tmp" "$out" \
-            || { echo "★保持料生成失败 第 $i 题: $(head -c 300 "$out.tmp" 2>/dev/null)★"; rm -f "$out.tmp"; }
-    }
-    if [ -s "$DOCD/hold/questions.txt" ]; then
-        local hi=0 hq
-        while IFS= read -r hq || [ -n "$hq" ]; do
-            [ -n "$hq" ] || continue; hi=$((hi+1))
-            while [ "$(jobs -rp | wc -l)" -ge "$PAR" ]; do sleep 2; done
-            hold_one "$hi" "$hq" >>"$LOGF" 2>&1 &
-        done < "$DOCD/hold/questions.txt"
-        wait
-        : > "$DOCD/chunks/hold_general.txt"   # 空块 = 教师不看任何材料(训练器认空块: 教师提示 = 学生提示)
-        LOG "kdgen 保持料: $hi 题, 产出 $(ls "$DOCD"/gen/hold_q*.json 2>/dev/null | wc -l)"
+    if [ -s "$JOBS" ]; then
+        bash "$SC/serve_1m_spark.sh" stop >>"$LOGF" 2>&1; sleep 1; need_idle
+        ( sleep 20; train_guard ) &
+        local GUARD=$! RC
+        ./ds4 --cuda -m "$MDL" ${ZARGS[@]+"${ZARGS[@]}"} ${ENG[@]+"${ENG[@]}"} --mem-budget-mb 110000 --no-dspark --gen-jobs "$JOBS" > "$DOCD/gen/gen.out" 2>&1 </dev/null
+        RC=$?
+        kill "$GUARD" 2>/dev/null; wait "$GUARD" 2>/dev/null
+        grep -a "★" "$DOCD/gen/gen.out" | tee -a "$LOGF" | head -20
+        grep -a "gen-jobs\] 完" "$DOCD/gen/gen.out" | tee -a "$LOGF"
+        [ "$RC" = 0 ] || DIE "合批出题失败(rc=$RC, 见 $DOCD/gen/gen.out)"
     fi
-    local s r k=0 tot=$(( ${#CH[@]} * 3 * ROUNDS ))
-    for r in $(seq 1 "$ROUNDS"); do for f in "${CH[@]}"; do for s in 0 1 2; do
-        k=$((k+1))
-        # 续跑: 已有产物的先在这里跳过 —— 放进后台再判, 每份都要白等一轮 sleep 2(10-01 续跑实撞: 122 份已有产物空等 4 分钟)
-        [ -s "$DOCD/gen/$(basename "$f" .txt)_s${s}r${r}.json" ] && continue
-        while [ "$(jobs -rp | wc -l)" -ge "$PAR" ]; do sleep 2; done
-        gen_one "$f" "$s" "$r" >>"$LOGF" 2>&1 &
-        [ $((k % 6)) = 0 ] && LOG "kdgen 已发 $k/$tot, $(( $(date +%s) - t0 )) s, 产出 $(ls "$DOCD"/gen/*.json 2>/dev/null | wc -l)"
-    done; done; done
-    wait
-    bash "$SC/serve_1m_spark.sh" stop >>"$LOGF" 2>&1
     kd_split "$DOCD"
-    LOG "KDGEN_DONE $(( $(date +%s) - t0 )) s, $(ls "$DOCD"/gen/*.json | wc -l) 份生成"
+    LOG "GEN_DONE $(( $(date +%s) - t0 )) s"
 }
 
-# kdtrain <料目录> [层 39|a-b] [lr] [轮数] [块名正则] [标签]: 拼清单(qa/<块>.{train,eval}.qa ↔ chunks/<块>.txt) + 配置 → ./ds4 --ptrain
-#   (src/core/core_ptrain*.c: 教师 top-K 带缓存 → 第 0 步评估 → 训练 → 每轮留出 KL + 贪心探针) → ③ 落 $FTD/kd-<料名>-<标签>/。
-#   看门狗同解算段(MemAvailable < 2500 MB 连续两次杀); 探针走生成路, 关投机(省草稿塔那 1.2 GB, 温 0 下两条路逐字节同)。
-# 拼训练清单: qa/<块>.{train,eval}.qa ↔ chunks/<块>.txt, 一行 "<块> <问答> <train|eval>"(kdtrain / kdprof 共用)
-# 保持料训练题在清单里列 KD_HOLD_REP 遍(= 这些题每轮练 KD_HOLD_REP 次): 通用题只有 ~50 道, 复盘题上千, 不加权时只占 ~5%,
-#   拉回力太弱 —— 小子集那趟(116 题 × 3 轮)wt2 中位 KLD 已 0.031 → 0.055, 全量步数是它的 9 倍。4 遍 ≈ 17%。
-#   增量(kdinc)一次只有一两百题, 保持料列 1 遍就占 15~25%, 那边按份额给(见 kd_inc_run)。
-KD_HOLD_REP=4
-kd_list(){
-    local DOCD="$1" PAT="$2" LIST="$3" f b rep
-    : > "$LIST"
-    for f in "$DOCD"/qa/*.train.qa; do
-        b="$(basename "$f" .train.qa)"; [[ "$b" =~ $PAT ]] || continue
-        rep=1; [ "$b" = hold_general ] && rep=$KD_HOLD_REP
-        for _ in $(seq 1 "$rep"); do echo "$DOCD/chunks/$b.txt $f train" >> "$LIST"; done
-        [ -s "$DOCD/qa/$b.eval.qa" ] && echo "$DOCD/chunks/$b.txt $DOCD/qa/$b.eval.qa eval" >> "$LIST"
-    done
-    [ -s "$LIST" ] || DIE "清单为空(先跑 kdgen; 块名正则 $PAT)"
+# train <数据.jsonl> [轮 3] [层 0-39] [lr 2e-4] [k=v,...]: ★训 ③★ 停服 → 看门狗 → ./ds4 --ptrain(教师 top-K 带缓存 <料>.teacher.bin → 第 0 步评估 → 训练
+#   → 每轮留出损失 + 贪心探针 + ckpt_eNN) → kdpick(每轮 wt2 门, 过门里留出损失最低者) → ③ = $FTD/kd-<料名>-<标签>/ckpt_eNN。
+#   一轮 = 全量过一遍(epoch_tok=0); 料大时 k=v 给 epoch_tok=N 切片(10-03 用户定的 10 分钟一轮)。续训给 init=<上一份 ③>。
+pt_cfg_write(){   # <输出目录> <料> <层> <lr> <轮> [k=v,...]: 训练配置(train / kdprof 共用)
+    local OUT="$1" SRC="$2" LAYERS="$3" LR="$4" EP="$5" EXTRA="${6:-}"
+    [ -s "$HOLD" ] || DIE "没有保持料 $HOLD(通用题 + 部署态回答)"
+    printf 'data=%s\nout=%s\nhold=%s\nlayers=%s\nrank=64\nlr=%s\nepochs=%s\nbatch=4\ntopk=64\nmaxlen=1024\nprobe_n=6\nprobe_tok=96\nepoch_tok=0\n' \
+        "$SRC" "$OUT" "$HOLD" "$LAYERS" "$LR" "$EP" > "$OUT/ptrain.cfg"
+    [ -z "$EXTRA" ] || tr ',' '\n' <<< "$EXTRA" >> "$OUT/ptrain.cfg"
+}
+stage_train(){
+    local SRC="${1:?数据 .jsonl}" EP="${2:-3}" LAYERS="${3:-0-39}" LR="${4:-2e-4}" EXTRA="${5:-}"
+    [ -s "$SRC" ] || DIE "没有 $SRC"
+    # 目录名带发车时间: 同料同参数再训一次是新目录, 不盖掉上一次的 ckpt / 门读数(10-10 训练页实撞: 重训写进同名目录, 旧 pick.txt 让新趟一开始就显示"完成")
+    local NAME TAG OUT; NAME="$(basename "$SRC" .jsonl)"; TAG="L${LAYERS}-lr${LR}-e${EP}-$(date +%m%d%H%M)"; OUT="$FTD/kd-$NAME-$TAG"
+    mkdir -p "$OUT"
+    pt_cfg_write "$OUT" "$SRC" "$LAYERS" "$LR" "$EP" "$EXTRA"
+    LOG "train: $SRC → 层 $LAYERS lr $LR 轮 $EP → $OUT"
+    kd_train_run "$OUT"
+    stage_kdpick "$OUT"
+    # ★训完只产出, 不挂★(10-10 晚用户: "训练完就是训练完不要直接挂"): 不碰 serve_pick.txt, train_cycle.sh 装回来的还是训前那套。
+    # ③ 关联的侧车 = 训练时装着的 $ZCH(③ 的 base.fnv 就是它的指纹); 聊天页切到这份侧车、打开"后训练"开关才挂上, 切走就卸。
+    LOG "TRAIN_DONE $OUT 选中 $KD_PICK (关联侧车 ${ZCH:-none}; 没挂, 聊天页开关挂)"
 }
 
-# 同料同清单的教师表跨目录复用: 教师 = 部署态读块, 只跟料有关、跟训练配置无关。同料的别的 kd-<料名>-* 目录里清单相同(按文件名比,
-#   不比路径前缀)的 teacher.bin 拷过来, 引擎再按料哈希(全部 id + topk)核对, 对不上自动重算。为什么: 新目录现算教师表要 ~31 min,
-#   而且在训练进程里现算会留下一块不还的内存(10-02 full6: 预热峰值余量 3067 MB, 读缓存 3494 MB), 贴着看门狗线。
-kd_teacher_cache(){
-    local OUT="$1" NAME="$2" sib
-    [ -s "$OUT/teacher.bin" ] && return 0
-    for sib in "$FTD"/kd-"$NAME"-*; do
-        [ "$sib" != "$OUT" ] && [ -s "$sib/teacher.bin" ] && [ -s "$sib/data.list" ] || continue
-        diff -q <(sed 's#[^ ]*/##g' "$sib/data.list") <(sed 's#[^ ]*/##g' "$OUT/data.list") >/dev/null || continue
-        cp "$sib/teacher.bin" "$OUT/teacher.bin" && LOG "教师表从 $(basename "$sib") 拷来(引擎按料哈希核对, 对不上自动重算)"
-        return 0
-    done
-}
-
-# kdprof <料目录> [步数 5] [nsys|-] [k=v,...]: 训练计时(./ds4 --ptrain prof=1 max_steps=N, 10-02)。配置照 kdrun 缺省(全层 0-39, lr 2e-4, batch 4)
+# kdprof <数据.jsonl> [步数 5] [nsys|-] [k=v,...]: 训练计时(./ds4 --ptrain prof=1 max_steps=N, 10-02)。配置照 train 缺省(全层 0-39, lr 2e-4, batch 4)
 #   + maxlen 880(复盘全量口径), 第 4 参追加/覆盖。只跑 N 步: 不做第 0 步评估/探针、不评估不存盘; 每 5 步打一张整步分段表
 #   (前向 / 损失 / 出口反传 / 逐层反传 = 重算 + routed 专家反向 + 注意力半层 + 层内其余 + 层间 / Adam, 段和对每题墙钟)。
-#   要现成的教师表(kd_teacher_cache 从同料目录拷), 没有就停车 —— 不让 31 分钟的教师那遍混进计时。
+#   要现成的教师表(<料>.teacher.bin, train 跑过一趟就有), 没有就停车 —— 不让教师那遍混进计时。
 #   第 3 参给 nsys = 套 nsys 采 GPU 时间线, 出逐核名合计表(cuda_gpu_kern_sum; 训练路 prof 每段同步、单流, 核时长不重叠, 直接加和可信);
 #   nsys 下墙钟会虚高, 只看比例。第 5 参 = 用哪个引擎二进制(缺省 ./ds4; 改反传前 cp 一份 ds4.base_xxx, 同一题同一配置 A/B,
 #   例: 第 4 参 gradcheck=2,gclayers=0/14/20/30/39 两个二进制各跑一遍, 比每层"反传"梯度与有限差分比值)。输出按二进制名分文件, 不互相覆盖。
 #   第 6 参 = 额外的引擎命令行参数(原样追加), 例 --v41-prof: 训练前向里每层把逐专家 token 数落 /tmp/v41_route_Lnn_n<行数>.txt
 #   (给 gguf-tools/bench/v41_vq_train_bench.cu 当训练形状的真路由; 每层要同步读回 sel, 计时作废)。
 stage_kdprof(){
-    local DOCD="${1:?料目录}" STEPS="${2:-5}" NS="${3:-}" EXTRA="${4:-}" BIN="${5:-./ds4}" XARGS="${6:-}"
-    [ -x "$BIN" ] || DIE "没有引擎二进制 $BIN"
-    local NAME OUT LIST RC; NAME="$(basename "$DOCD")"; OUT="$FTD/kd-$NAME-prof"; mkdir -p "$OUT"; LIST="$OUT/data.list"
-    kd_list "$DOCD" . "$LIST"
-    printf 'data=%s\nout=%s\nlayers=0-39\nrank=64\nlr=2e-4\nepochs=1\nbatch=4\ntopk=64\nmaxlen=880\nprof=1\nmax_steps=%s\n' "$LIST" "$OUT" "$STEPS" > "$OUT/ptrain.cfg"
-    [ -z "$EXTRA" ] || tr ',' '\n' <<< "$EXTRA" >> "$OUT/ptrain.cfg"
-    kd_teacher_cache "$OUT" "$NAME"
-    [ -s "$OUT/teacher.bin" ] || DIE "kdprof 要现成的教师表(同料同清单的 kd-$NAME-* 目录里没有), 先跑一趟 kdtrain"
+    local SRC="${1:?数据 .jsonl}" STEPS="${2:-5}" NS="${3:-}" EXTRA="${4:-}" BIN="${5:-./ds4}" XARGS="${6:-}"
+    [ -x "$BIN" ] || DIE "没有引擎二进制 $BIN"; [ -s "$SRC" ] || DIE "没有 $SRC"
+    local NAME OUT RC; NAME="$(basename "$SRC" .jsonl)"; OUT="$FTD/kd-$NAME-prof"; mkdir -p "$OUT"
+    pt_cfg_write "$OUT" "$SRC" 0-39 2e-4 1 "maxlen=880,prof=1,max_steps=$STEPS${EXTRA:+,$EXTRA}"
+    [ -s "$SRC.teacher.bin" ] || DIE "kdprof 要现成的教师表 $SRC.teacher.bin, 先跑一趟 train"
     bash "$SC/serve_1m_spark.sh" stop >>"$LOGF" 2>&1; sleep 1; need_idle
     local B; B="$(basename "$BIN")"
     LOG "kdprof: $NAME $STEPS 步$([ "$NS" = nsys ] && echo ', 套 nsys')${EXTRA:+, 额外 $EXTRA}, 二进制 $B → $OUT"
@@ -2443,89 +2333,37 @@ stage_dkgate(){
     LOG "DKGATE_DONE $OUT"
 }
 
-stage_kdtrain(){
-    # 第 7 参: 额外配置项, 逗号分隔 k=v(如 gradcheck=2 只做梯度检查就退出; batch=8), 原样追加进配置(后写的覆盖前面的默认)
-    # 第 4 参 = 训几轮(照训满, 每轮存 ckpt_eNN), 挑哪一轮归 kdpick。日志每轮一行"留出 KL 较上轮降 X ± 标准误":
-    #   末轮还降 2 个标准误以上 = 下次可以多给几轮(10-02 全量 3 轮, 第 3 轮还在降 0.069)。
-    #   ★10-03 起一轮 = 一个 epoch_tok 切片(≈ 1/3 料), 3 轮才覆盖全量一遍 —— 给轮数时按"想过几遍 × 3"给; 轮末那行比的是相邻切片★
-    local DOCD="${1:?料目录}" LAYERS="${2:-39}" LR="${3:-3e-4}" EP="${4:-3}" PAT="${5:-.}" TAG="${6:-}" EXTRA="${7:-}"
-    local NAME; NAME="$(basename "$DOCD")"; [ -n "$TAG" ] || TAG="L${LAYERS}-lr${LR}-e${EP}"
-    local OUT="$FTD/kd-$NAME-$TAG"; mkdir -p "$OUT"
-    local LIST="$OUT/data.list"
-    kd_list "$DOCD" "$PAT" "$LIST"
-    # epoch_tok(10-03 用户定): 一轮 = 打乱序里连续的一段, 行数(含提示)累计到它即收, 下一轮接着取, 取完才重新打乱(一个周期内每题恰好一次)。
-    #   review_v2 全量训练料 1287 题 232023 行, 78000 ≈ 三分之一 ⇒ 3 轮过一遍; 按 10-03 的 7.4 ms/行, 一轮训练 ≈ 9.6 分钟 + 轮末评估/探针 ≈ 2.5 分钟。
-    #   为什么不是全量一轮: 全层 + 全量一轮 30 分钟低于这台机器的带宽地板(每步 800 token 要流三遍几乎整层专家权重), 10 分钟一轮只能切片。
-    printf 'data=%s\nout=%s\nlayers=%s\nrank=64\nlr=%s\nepochs=%s\nbatch=4\ntopk=64\nmaxlen=1024\nprobe_n=6\nprobe_tok=96\nepoch_tok=78000\n' \
-        "$LIST" "$OUT" "$LAYERS" "$LR" "$EP" > "$OUT/ptrain.cfg"
-    # 料目录里有 probe/questions.txt(一行一题)就当自定义探针: 第 0 步和每轮末部署态 / 挂 ③ 各答一遍, 原样进 probe_eNN.txt
-    [ -s "$DOCD/probe/questions.txt" ] && echo "probe_q=$DOCD/probe/questions.txt" >> "$OUT/ptrain.cfg"
-    [ -z "$EXTRA" ] || tr ',' '\n' <<< "$EXTRA" >> "$OUT/ptrain.cfg"
-    kd_teacher_cache "$OUT" "$NAME"
-    LOG "kdtrain: 层 $LAYERS lr $LR 轮 $EP"
-    kd_train_run "$OUT"
-    LOG "KDTRAIN_DONE $OUT"
-}
-# 训练发车(kdtrain / kdinc 共用): 停服务 → 看门狗(train_guard) → ./ds4 --ptrain <输出目录>/ptrain.cfg → 日志尾部上屏, 失败停车
+# 训练发车(train / ptgate / ptcheck 共用): 停服务 → 看门狗(train_guard) → ./ds4 --ptrain <输出目录>/ptrain.cfg → 日志尾部上屏, 失败停车
 kd_train_run(){
     local OUT="$1"
     bash "$SC/serve_1m_spark.sh" stop >>"$LOGF" 2>&1; sleep 1; need_idle
-    LOG "训练: $(wc -l < "$OUT/data.list") 行清单 → $OUT; MemAvailable $(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo) MB"
+    LOG "训练: $(awk -F= '$1=="data"{v=$2} END{print v}' "$OUT/ptrain.cfg") → $OUT; MemAvailable $(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo) MB"
     ( sleep 20; train_guard ) &
     local GUARD=$!
-    ./ds4 --cuda -m "$MDL" --zchain "$ZCH" --mem-budget-mb 110000 --no-dspark --ptrain "$OUT/ptrain.cfg" > "$OUT/train.out" 2>&1 </dev/null
+    ./ds4 --cuda -m "$MDL" ${ZARGS[@]+"${ZARGS[@]}"} ${ENG[@]+"${ENG[@]}"} --mem-budget-mb 110000 --no-dspark --ptrain "$OUT/ptrain.cfg" > "$OUT/train.out" 2>&1 </dev/null
     local RC=$?
     kill "$GUARD" 2>/dev/null; wait "$GUARD" 2>/dev/null
     tr '\r' '\n' < "$OUT/train.out" | grep -E "ptrain|探针|部署态|挂 ③|教师参考|问:" | tail -80
     [ "$RC" = 0 ] || DIE "训练失败(rc=$RC, 见 $OUT/train.out)"
 }
 
-# kddiag <③根目录> <ckpt_eNN|-> <问答.qa|eval> [块.txt]: 逐位诊断(./ds4 --ptrain diag=1, 10-02)。不训练, 一次装载打完所有题:
-#   每道题的答案逐位并排 教师(读块) / 挂 ③ / 部署态(③ 置零) 三份前 5 名 + 参考 token 的概率, 末尾汇总"分叉位"
-#   (教师榜首 ≠ 部署态榜首 = 材料改了模型选择的位置: 教师选的是不是参考答案、挂 ③ 跟上没有) → <③根目录>/diag-<ckpt>[-块名]/diag.txt。
-#   为什么: 选轮用的留出 KL 是整段平均, 量不到"答二还是答三"那一位(10-02 1+1=3: 留出 KL 降 80%, 探针照样答二)。
-#   第 3 参给 eval = 用这份 ③ 训练时的全部留出题(清单里 eval 行, 不含保持料), 各题配各自的块; 给 .qa 文件 = 只用这些题 + 一个块
-#   (块缺省 = 清单里第一个非保持料块)。.qa 的答案填学生自己的贪心输出 = 打它自己走的那条路上的决策位。层与秩照 ③ 的 ptrain.cfg。
+# kddiag <③根目录> <ckpt_eNN|->: 逐位诊断(./ds4 --ptrain diag=1, 10-02)。不训练, 一次装载打完训练那趟的全部留出题(不含保持料):
+#   每道题的答案逐位并排 教师(读材料) / 挂 ③ / 部署态(③ 置零) 三份前 5 名 + 参考 token 的概率, 末尾汇总"分叉位"
+#   (教师榜首 ≠ 部署态榜首 = 材料改了模型选择的位置: 教师选的是不是参考答案、挂 ③ 跟上没有) → <③根目录>/diag-<ckpt>/diag.txt。
+#   为什么: 选轮用的留出损失是整段平均, 量不到"答二还是答三"那一位(10-02 1+1=3: 留出 KL 降 80%, 探针照样答二)。料/层/秩/maxlen 照 ③ 的 ptrain.cfg。
 stage_kddiag(){
-    local R0="${1:?③根目录}" CK="${2:?ckpt 名(ckpt_eNN; - = 根目录那份)}" QA="${3:?问答 .qa 或 eval}" CH="${4:-}"
-    [ -s "$R0/ptrain.cfg" ] && [ -s "$R0/data.list" ] || DIE "$R0 不是 kdtrain 的输出目录(缺 ptrain.cfg / data.list)"
-    local PT="$R0"; [ "$CK" = - ] || PT="$R0/$CK"
+    local R0="${1:?③根目录}" CK="${2:-}"
+    [ -s "$R0/ptrain.cfg" ] || DIE "$R0 不是 train 的输出目录(缺 ptrain.cfg)"
+    local PT="$R0"; [ -z "$CK" ] || [ "$CK" = - ] || PT="$R0/$CK"
     [ -s "$PT/amp_L39.bin" ] || DIE "没有 $PT/amp_L39.bin"
-    local OUT LAYERS RANK NQ
-    # 显式给了块 = 换教师上下文做对比, 输出目录带块名, 不覆盖默认那份; eval = 整份留出集, 目录带 -eval
-    if [ "$QA" = eval ]; then OUT="$R0/diag-$(basename "$PT")-eval"
-    else OUT="$R0/diag-$(basename "$PT")${CH:+-$(basename "$CH" .txt)}"; fi
-    mkdir -p "$OUT"
-    if [ "$QA" = eval ]; then
-        grep ' eval$' "$R0/data.list" | grep -v hold_general > "$OUT/data.list"
-        [ -s "$OUT/data.list" ] || DIE "$R0/data.list 里没有留出行"
-        # 同一份留出集的教师表与 ③ 无关(教师 = 部署态读块): 别的 ckpt 的 eval 诊断目录有同清单的 teacher.bin 就拷来,
-        #   引擎按料哈希核对, 对不上自动重算 —— 逐轮诊断时每轮省掉教师那一遍(复盘 70 块 381 s)
-        local sib; for sib in "$R0"/diag-*-eval; do
-            [ "$sib" != "$OUT" ] && [ -s "$sib/teacher.bin" ] && cmp -s "$sib/data.list" "$OUT/data.list" && {
-                cp "$sib/teacher.bin" "$OUT/"; LOG "kddiag: 教师表从 $(basename "$sib") 拷来(引擎按料哈希核对)"; break; }
-        done
-        NQ=$(awk '{print $2}' "$OUT/data.list" | xargs grep -h -c '^#Q' | awk '{s+=$1} END{print s}')
-        CH="$(wc -l < "$OUT/data.list") 块"
-    else
-        [ -s "$QA" ] || DIE "没有问答 $QA"
-        [ -n "$CH" ] || CH="$(awk '$1 !~ /hold_general/ {print $1; exit}' "$R0/data.list")"
-        [ -s "$CH" ] || DIE "没有块 $CH"
-        echo "$CH $QA eval" > "$OUT/data.list"
-        NQ=$(grep -c '^#Q' "$QA"); CH="$(basename "$CH")"
-    fi
-    LAYERS="$(awk -F= '$1=="layers"{v=$2} END{print v}' "$R0/ptrain.cfg")"
-    RANK="$(awk -F= '$1=="rank"{v=$2} END{print v}' "$R0/ptrain.cfg")"
-    # maxlen 照训练那趟(配置里最后一个生效): 同一批题进出一致, 训练缓冲也不比训练时大(全层训练内存余量只 ~3 GB)
-    local MAXLEN; MAXLEN="$(awk -F= '$1=="maxlen"{v=$2} END{print v}' "$R0/ptrain.cfg")"
-    printf 'data=%s\nout=%s\ninit=%s\nlayers=%s\nrank=%s\ntopk=64\nmaxlen=%s\ndiag=1\n' "$OUT/data.list" "$OUT" "$PT" "$LAYERS" "$RANK" "${MAXLEN:-1024}" > "$OUT/ptrain.cfg"
-    # 训练那趟用了共用的按题教师缓存(kdinc 的 teacher=)就接着用: 同一批留出题的教师全命中, 不用再算一遍
-    local TCH; TCH="$(awk -F= '$1=="teacher"{v=$2} END{print v}' "$R0/ptrain.cfg")"; [ -z "$TCH" ] || echo "teacher=$TCH" >> "$OUT/ptrain.cfg"
+    local OUT="$R0/diag-$(basename "$PT")"; mkdir -p "$OUT"
+    grep -v '^out=\|^init=\|^diag=\|^epochs=\|^prof=\|^max_steps=\|^gradcheck=\|^packcheck=' "$R0/ptrain.cfg" > "$OUT/ptrain.cfg"
+    printf 'out=%s\ninit=%s\ndiag=1\n' "$OUT" "$PT" >> "$OUT/ptrain.cfg"
     bash "$SC/serve_1m_spark.sh" stop >>"$LOGF" 2>&1; sleep 1; need_idle
-    LOG "kddiag: $NQ 题, 块 $CH, 挂 $PT(层 $LAYERS 秩 $RANK) → $OUT"
+    LOG "kddiag: 挂 $PT → $OUT"
     ( sleep 20; train_guard ) &
     local GUARD=$!
-    ./ds4 --cuda -m "$MDL" --zchain "$ZCH" --mem-budget-mb 110000 --no-dspark --ptrain "$OUT/ptrain.cfg" > "$OUT/diag.out" 2>&1 </dev/null
+    ./ds4 --cuda -m "$MDL" ${ZARGS[@]+"${ZARGS[@]}"} ${ENG[@]+"${ENG[@]}"} --mem-budget-mb 110000 --no-dspark --ptrain "$OUT/ptrain.cfg" > "$OUT/diag.out" 2>&1 </dev/null
     local RC=$?
     kill "$GUARD" 2>/dev/null; wait "$GUARD" 2>/dev/null
     tr '\r' '\n' < "$OUT/diag.out" | grep -E "ptrain" | tail -40
@@ -2533,575 +2371,42 @@ stage_kddiag(){
     LOG "KDDIAG_DONE $OUT/diag.txt"
 }
 
-# ---------------- ★增量后训练序列★(2026-10-03 用户: "第一天在日期文件夹下面训练, 第二天叠加训练, 而不是重新训" → 当晚 "文件夹换成自增序号, 每一次都是增量, 记住进度序号"
-#                  → 10-04 "跟每天没有关系, 只需要执行训练命令, 直接开始训练": 料不再按天给, kdinc 自己从料池取没训过的) ----------------
-# 目录 $FTD/incr/:
-#   pool/chunks/ docs/ qa/ hold/   料池 = qtf corpus 产物原样同步进来(块 <篇>_cNN.txt, 整篇 docs/<篇>.txt, 已出的问答 qa/<块>.{train,eval}.qa); kdinc 只读不改
-#   SEQ                     进度: 最后分配出去的序号(kdinc 每次 +1, 四位零填充; 目录已存在就继续加)
-#   hold/questions.txt      通用题, 各次共用(第一次 kdgen 让部署态答一遍 → hold/qa/hold_general.{train,eval}.qa, 以后直接用这一份)
-#   teacher.bin             按题教师缓存(训练器 cfg teacher=), 各次共用: 回放的旧题永远命中, 一次只算新题
-#   ledger.txt              一次几行: 序号 / 料的量 / 转移读数 / 选中轮 / 留出 KL / current 指向
-#   ledger/<序号>.tsv       决策账本逐笔(kd_ledger), ledger/stats_<序号>.txt 累计统计
-#   current -> <序号>/out/ckpt_eNN   上线的那份 = 过门的最新一次; 回滚 = 改指向
-#   <序号>/source.txt       这次的料从哪来(料目录 / 块名正则 / 时间); chunks/ docs/ 文本; qa/ 问答(kdgen 或从料目录带); out/ 训练输出(data.list ptrain.cfg
-#              train.log ckpt_eNN heldout_eNN.tsv …); fwd/ 转移测试; gate/wt2_ckpt_eNN.txt 守门全文; ACCEPTED | REJECTED 一行结论
-# 叠加 = 训练器 init=<current>(逐层读 A/B, Adam 动量从零起; init 的 base.fnv 与现挂 ② 对不上就停车 —— 换底座只能从零重蒸馏)。
-# 三条规矩写死: ①本次 eval 题永远不进任何一次的 train(留出 + 套件先剔掉在任何 train 文件里出现过的题, 剔了就打出来);
-#   ②回放 1:1(前面各次 train 题等距抽 ≈ 本次题数); ③没过门那次的料不丢 —— 以后的回放照抽。
-# 一次 = 料池里还没训过的前 K 篇(篇 = 块名去掉 _cNN 的前缀, 一篇的块永远同一次进; 名字序 = stock_<日期>_<代码> 的时间序)。"训过" = 块名前缀在任何
-# 序号文件夹的 chunks/ 里出现过 —— 进度就是盘上这些文件夹, 没有第二份账要对。K 默认 4 篇: 10-03 实测 2 篇 121 题(+回放 121)一轮 4 分钟, 4 篇 ≈ 200 题
-# 对着用户定的"一轮 10 分钟"。料池空了 kdinc 不分配序号直接退。
-INCR="$FTD/incr"
-# 下一个序号: SEQ + 1, 目录已占就继续加(手工放过目录也不撞); 写回 SEQ
-kd_seq_next(){
-    local n; n=$(cat "$INCR/SEQ" 2>/dev/null || echo 0); n=$((10#$n + 1))
-    while [ -e "$INCR/$(printf '%04d' "$n")" ]; do n=$((n + 1)); done
-    mkdir -p "$INCR"; printf '%04d' "$n" > "$INCR/SEQ"; printf '%04d' "$n"
-}
-# 上一次 ACCEPTED 的序号(< 给定序号; 没有打空)
-kd_prev_accepted(){
-    local N="$1" dd p=""
-    for dd in "$INCR"/[0-9]*/; do dd="$(basename "$dd")"; [[ "$dd" < "$N" ]] && [ -s "$INCR/$dd/ACCEPTED" ] && p="$dd"; done
-    echo "$p"
-}
-
-# 块名 → 篇名(去掉 _cNN); 一行一个, 去重排序。保持料块 hold_general 不是料
-kd_units(){ xargs -rn1 basename | sed -E 's/(_c[0-9]+)?\.txt$//' | grep -vx hold_general | sort -u; }
-# 料池里还没训过的篇(名字序): 料池全部篇 − 任何序号文件夹 chunks/ 里出现过的篇。只打名字, 不打日志(调用方要捕获)
-kd_pool_new(){
-    local seen; seen="$(ls "$INCR"/[0-9]*/chunks/*.txt 2>/dev/null | kd_units)"
-    ls "$INCR"/pool/chunks/*.txt 2>/dev/null | kd_units | grep -vxF -f <(printf '%s\n' "$seen")
-}
-# kd_ingest <序号> <篇>...: 把料池里这些篇的块(与整篇 docs/、已出的问答)放进序号文件夹, 写 source.txt; 第一次顺带把保持料放进 incr/hold/
-kd_ingest(){
-    local N="${1:?序号}" POOL="$INCR/pool" D="$INCR/$N" u f b s n=0; shift
-    mkdir -p "$D/chunks" "$D/qa" "$INCR/hold"
-    { printf '料池 %s\n时间 %s\n' "$POOL" "$(date '+%F %T')"; printf '篇 %s\n' "$@"; } > "$D/source.txt"
-    for u in "$@"; do
-        for f in "$POOL/chunks/$u.txt" "$POOL/chunks/${u}"_c[0-9]*.txt; do
-            [ -s "$f" ] || continue; b="$(basename "$f" .txt)"
-            cp "$f" "$D/chunks/"; n=$((n+1))
-            for s in train eval; do [ -s "$POOL/qa/$b.$s.qa" ] && cp "$POOL/qa/$b.$s.qa" "$D/qa/"; done
-        done
-        # 整篇复盘(docs/)也带上: 账本的决策日材料节选从整篇里切(块里每块重复开头的结论段, 切不干净会把结果带进决策提示)
-        [ -s "$POOL/docs/$u.txt" ] && { mkdir -p "$D/docs"; cp "$POOL/docs/$u.txt" "$D/docs/"; }
-    done
-    [ "$n" -gt 0 ] || DIE "篇 $* 在 $POOL/chunks 一个块都没有"
-    if [ ! -s "$INCR/hold/questions.txt" ] && [ -s "$POOL/hold/questions.txt" ]; then
-        cp "$POOL/hold/questions.txt" "$INCR/hold/"
-        if ls "$POOL"/qa/hold_general.train.qa >/dev/null 2>&1; then mkdir -p "$INCR/hold/qa"; cp "$POOL"/qa/hold_general.*.qa "$INCR/hold/qa/"; fi
-    fi
-    LOG "第 $N 次 取料: $# 篇 $n 块, $(ls "$D"/qa/*.train.qa 2>/dev/null | wc -l) 份训练问答 ← 料池; 篇 = $*; 保持料 $([ -s "$INCR/hold/qa/hold_general.train.qa" ] && echo 已有答案 || echo 待第一次 kdgen)"
-}
-# kdpool: 只看进度 —— 序号 / 上线的 ③ / 料池里还没训过的篇(下一次 kdinc 会取前 K 篇)。不动模型
-stage_kdpool(){
-    local -a NEW=(); local u
-    while IFS= read -r u; do [ -n "$u" ] && NEW+=("$u"); done < <(kd_pool_new)
-    LOG "进度: SEQ=$(cat "$INCR/SEQ" 2>/dev/null || echo 0)(已跑 $(ls -d "$INCR"/[0-9]*/ 2>/dev/null | wc -l) 次, ACCEPTED $(ls "$INCR"/[0-9]*/ACCEPTED 2>/dev/null | wc -l) 次), current → $(readlink -f "$INCR/current" 2>/dev/null || echo 无)"
-    LOG "料池 $INCR/pool: 共 $(ls "$INCR"/pool/chunks/*.txt 2>/dev/null | kd_units | wc -l) 篇, 没训过 ${#NEW[@]} 篇: ${NEW[*]:-无}"
-}
-# kdtake [篇数上限 4]: 只取料不训练 —— 分配下一个序号, 从料池取没训过的前 K 篇, 出账本 + 校准料 + 决策提示(kd_ledger); 之后 kdinc @序号 训它。
-#   用处: 先把下一批的决策提示做出来, 当本批训练的 probe_q(kdinc @本批 3 1e-4 probe_q=<下一批>/decide/questions.txt): 训练中每轮末对没见过的决策答一遍,
-#   kdscore 逐轮打分 = 一次训练里就看到先验第几轮带过去, 不用等下一次增量。
-stage_kdtake(){
-    local CAP="${1:-4}" N u; local -a NEW=()
-    [[ "$CAP" =~ ^[0-9]+$ ]] || DIE "kdtake 第 1 参是篇数上限(数字)"
-    while IFS= read -r u; do [ -n "$u" ] && NEW+=("$u"); done < <(kd_pool_new)
-    [ "${#NEW[@]}" -gt 0 ] || { stage_kdpool; DIE "料池里没有没训过的料"; }
-    [ "$CAP" -gt 0 ] && [ "${#NEW[@]}" -gt "$CAP" ] && NEW=("${NEW[@]:0:$CAP}")
-    N="$(kd_seq_next)"; kd_ingest "$N" "${NEW[@]}"
-    kd_ledger "$N"
-    LOG "KDTAKE_DONE $N: 料在 $INCR/$N/(chunks qa docs decide), 训它 = kdinc @$N"
-}
-# kdscore <序号(提示与真值所属)> <probe 文件> [规则 stats 截至的序号 = 序号−1]: 对任意一份训练器 probe 文件(out/probe_eNN.txt)按领域切片打三臂分(只打不写账本)
-stage_kdscore(){
-    local N="${1:?序号}" P="${2:?probe 文件}" PD="${3:-}" dom nq k0=1 ST
-    [ -s "$P" ] || DIE "没有 $P"
-    [ -n "$PD" ] || PD="$(printf '%04d' $((10#$N - 1)))"
-    kd_domain_load
-    for dom in $(kd_domains); do
-        [ -s "$INCR/$N/decide/$dom/questions.txt" ] || continue
-        nq=$(wc -l < "$INCR/$N/decide/$dom/questions.txt"); ST="$(kd_stats_upto "$dom" "$PD")"
-        kd_probe_slice "$P" "$k0" "$nq" > "${P%.txt}_$dom.txt"; k0=$((k0 + nq))
-        [ -n "$ST" ] || { LOG "kdscore [$dom]: 第 $PD 次为止这个领域没有 stats, 规则臂算不了"; continue; }
-        LOG "kdscore [$dom] $(basename "$(dirname "$P")")/$(basename "$P") (真值 第 $N 次, 规则 stats ≤ $PD):"
-        "${dom}_score" "${P%.txt}_$dom.txt" "$INCR/$N/decide/$dom/truth.tsv" "$ST" | tee -a "$LOGF"
-    done
-}
-# kdinc [篇数上限 4] [训练轮数 3] [lr 1e-4] [k=v,...]: ★一次增量后训练★ —— 从料池取没训过的前 K 篇, 分配下一个序号, 在上一次 ACCEPTED 的 ③ 上叠加训练, 过门, 更新 current。
-#   kdinc @序号 [轮] [lr] [k=v] = 不取新料, 对已有的序号文件夹(重)跑(失败后续跑 / 手工放好料的文件夹)。进度打在日志: "第 N 次, 起点 第 M 次"。
-stage_kdinc(){
-    local A="${1:-}" EP="${2:-3}" LR="${3:-1e-4}" EXTRA="${4:-}" N CAP u; local -a NEW=()
-    if [ -n "$A" ] && [ "${A#@}" != "$A" ]; then N="${A#@}"; [ -d "$INCR/$N" ] || DIE "没有序号文件夹 $INCR/$N"
-    else
-        CAP="${A:-4}"; [[ "$CAP" =~ ^[0-9]+$ ]] || DIE "kdinc 第 1 参是篇数上限(数字)或 @序号, 不是 $CAP"
-        while IFS= read -r u; do [ -n "$u" ] && NEW+=("$u"); done < <(kd_pool_new)
-        [ "${#NEW[@]}" -gt 0 ] || { stage_kdpool; LOG "料池里没有没训过的料, 本次不分配序号; 喂料 = 把 qtf corpus 产物的 chunks/ docs/ [qa/] 同步进 $INCR/pool/"; return 0; }
-        [ "$CAP" -gt 0 ] && [ "${#NEW[@]}" -gt "$CAP" ] && NEW=("${NEW[@]:0:$CAP}")
-        N="$(kd_seq_next)"; kd_ingest "$N" "${NEW[@]}"
-    fi
-    LOG "进度: 本次 = 第 $N 次增量(SEQ=$(cat "$INCR/SEQ")), 起点 = $(p=$(kd_prev_accepted "$N"); [ -n "$p" ] && echo "第 $p 次(ACCEPTED)" || echo "①+②(第一次)")"
-    kd_inc_run "$N" "$EP" "$LR" "$EXTRA"
-}
-
-# ---------------- 决策账本 + 校准料(10-03 夜, 用户 "继续 rsi 设计, 完成代码编写, 跑两天, 再看看有没有变聪明") ----------------
-# 为什么: 蒸馏复盘叙事只让 ③ "记住"(10-03 转移测试: 对没见过的下一天, 数字位 52.2 → 53.6%, 只带过去了答题格式)。要"越预测越准", 教师得是
-# 结果本身: 每笔决策的次日实际(代码从复盘头部逐笔核定)进账本, 账本算出校准规则(目标/止损该留多少空间 = 历史实现涨跌幅的中位数), 规则 + 逐笔
-# 事实 + 规则应用示例写成一块代码产的材料和问答(答案全是代码算的, 不让模型编), 跟复盘块一起蒸进 ③。测"聪明"= 下一天训练前(kdfwd): 用前面的 ③
-# 对下一天各股的【决策日材料节选】(不含结果)要目标价/止损位, 与部署态并排, 对账本里的次日实际最高/最低算误差 —— 这才是决策位上的转移。
-# ★领域适配器★(10-04, 用户 "我不是说了泛化的吗"): 校准回路里随领域变的三件(解析器 / 规则与料 / 打分)住 $SC/kd_domain/<域>.sh, 每个定义
-#   <域>_parse / <域>_material / <域>_score(契约与为什么见 kd_domain/_template.sh; 金融版 finance.sh 是从这里原样拆出去的, 产物逐字节没变)。
-#   主回路对每个领域各走一遍, 认不出的篇适配器自己跳过; 哪个领域有笔哪个领域就出材料。加领域 = 加一个文件, 这里不改。
-kd_domains(){ local a; for a in "$SC"/kd_domain/[a-z]*.sh; do [ -s "$a" ] && basename "$a" .sh; done; }
-kd_domain_load(){ local d; for d in $(kd_domains); do . "$SC/kd_domain/$d.sh"; done; }
-# kd_stats_upto <域> <序号>: 该领域截至该序号的最新 stats 文件(那次没笔就没有 stats, 往前找; 一个都没有打空)
-kd_stats_upto(){ local f b p=""; for f in "$INCR/ledger/$1"/stats_[0-9]*.txt; do [ -s "$f" ] || continue; b="$(basename "$f" .txt)"; b="${b#stats_}"; [[ "$b" > "$2" ]] || p="$f"; done; echo "$p"; }
-# kd_ledger <序号>: 决策账本 + 校准料, 逐领域: docs/ 整篇 → ledger/<域>/<序号>.tsv(逐笔) → 累计(序号 ≤ 本次; 最后一列 = 序号, 本次的笔按它挑) → ledger/<域>/stats_<序号>.txt +
-#   chunks/ledger_<域>_<序号>.txt + qa/ledger_<域>_<序号>.{train,eval}.qa + decide/<域>/(<id>.txt 决策提示, questions.txt @文件行, truth.tsv);
-#   各领域 questions.txt 按领域名序拼成 decide/questions.txt(kdfwd 的决策探针一次装载全问, 打分再切回去)。各领域都没笔 = 本次没有校准料, 只走知识回路(不停车)。
-kd_ledger(){
-    local N="${1:?序号}" D="$INCR/${1:?}" LG="$INCR/ledger" dom msg n ALL tot=0
-    mkdir -p "$D/decide" "$D/qa" "$D/chunks"; : > "$D/decide/questions.txt"
-    [ -d "$D/docs" ] || { LOG "账本 第 $N 次: 没有 $D/docs(整篇), 本次没有校准料"; return 0; }
-    kd_domain_load
-    for dom in $(kd_domains); do
-        mkdir -p "$LG/$dom" "$D/decide/$dom"; : > "$LG/$dom/$N.tsv"
-        msg="$("${dom}_parse" "$D/docs" "$N" "$LG/$dom/$N.tsv")" || DIE "账本[$dom] 第 $N 次: 解析停车($msg)"
-        n=$(wc -l < "$LG/$dom/$N.tsv")
-        [ "$n" -gt 0 ] || { LOG "账本[$dom] 第 $N 次: 本次 0 笔($msg)"; continue; }
-        ALL="$D/decide/$dom/all.tsv"; cat $(ls "$LG/$dom"/[0-9]*.tsv | awk -v d="$N" -F/ '{n = $NF; sub(/\.tsv$/, "", n); if (n <= d) print}') > "$ALL"
-        msg="$("${dom}_material" "$ALL" "$N" "$LG/$dom/stats_$N.txt" "$D/chunks/ledger_${dom}_$N.txt" "$D/qa/ledger_${dom}_$N.train.qa" "$D/qa/ledger_${dom}_$N.eval.qa" "$D/decide/$dom")" \
-            || DIE "账本[$dom] 第 $N 次: 出料停车($msg)"
-        LOG "账本[$dom] $msg"
-        [ ! -s "$D/decide/$dom/questions.txt" ] || cat "$D/decide/$dom/questions.txt" >> "$D/decide/questions.txt"
-        tot=$((tot + n))
-    done
-    [ "$tot" -gt 0 ] || LOG "账本 第 $N 次: 各领域都没有逐笔记录, 本次没有校准料(只走知识回路)"
-}
-stage_kdledger(){ kd_ledger "${1:?序号}"; LOG "KDLEDGER_DONE $1: $INCR/$1/chunks/ledger_<域>_$1.txt + qa/ledger_<域>_$1.{train,eval}.qa + decide/<域>/"; }
-
-# kd_replay <当日训练题数 N> <输出目录> <清单> <前面各日期目录...>: 回放抽样。前面各日的 train 题(不含保持料)按文件序排成一串(M 题),
-#   第 j 题取当 floor(j·N/M) 比上一题进了位 —— 每天每块按比例出人, 同输入同输出(可复现)。抽中的题按来源块写进 <输出目录>/<日期>_<块>.qa,
-#   清单加一行 "<那天的块> <抽样问答> train"(教师缓存按题命中, 回放不重算教师)。
-kd_replay(){
-    local N="$1" RD="$2" LIST="$3"; shift 3
-    local -a SRC=(); local d f
-    for d in "$@"; do for f in "$d"/qa/*.train.qa; do [ -s "$f" ] && [ "$(basename "$f")" != hold_general.train.qa ] && SRC+=("$f"); done; done
-    [ "${#SRC[@]}" -gt 0 ] || return 0
-    rm -rf "$RD"; mkdir -p "$RD"
-    local M; M=$(cat "${SRC[@]}" | grep -c '^#Q')
-    [ "$M" -gt 0 ] && [ "$N" -gt 0 ] || return 0
-    awk -v N="$N" -v M="$M" -v RD="$RD" -v LIST="$LIST" '
-        function flush(   out) { if (blk == "") return
-            if (int(j * N / M) > int((j - 1) * N / M)) { out = RD "/" tag ".qa"; printf "%s", blk >> out; close(out)
-                if (!(out in seen)) { seen[out] = 1; print chunk, out, (b ~ /^ledger_/ ? "train hard" : "train") >> LIST; close(LIST) } }   # 回放的账本料同样是硬目标
-            blk = "" }
-        FNR == 1 { flush(); n = split(FILENAME, p, "/"); b = p[n]; sub(/\.train\.qa$/, "", b); tag = p[n - 2] "_" b
-                   chunk = FILENAME; sub(/\/qa\/[^\/]*\.train\.qa$/, "/chunks/" b ".txt", chunk) }
-        /^#Q$/ { flush(); j++; blk = $0 "\n"; next }
-        { blk = blk $0 "\n" }
-        END { flush() }' "${SRC[@]}"
-}
-
-# kd_leakfilter <train 问答文件清单(一行一个路径)> <清单> <输出目录> <eval 源文件...>: 留出题剔重 —— 在【任何一天】的 train 问答里出现过
-#   (问题去空白后逐字同)的题不算留出: 哪怕今天没回放到它, ③ 是叠着来的, 前几天练过的题今天也不是"没见过"。过滤后的副本落
-#   <输出目录>/<日期>_<块>.eval.qa, 清单加 eval 行; 打一行"留 X 剔 Y"。为什么必须: 重复出题 / 回放都可能把一道留出题带进训练,
-#   带进去"学会了没 / 忘了没"两道门都是假的。
-kd_leakfilter(){
-    local TRL="$1" LIST="$2" OD="$3"; shift 3
-    rm -rf "$OD"; mkdir -p "$OD"
-    local -a TR=(); local f src b day out kept=0 leak=0 k l
-    while read -r f; do [ -s "$f" ] && TR+=("$f"); done < "$TRL"
-    awk '/^#Q$/ { q = ""; m = 1; next } /^#A$/ { if (m) print q; m = 0; next } m { l = $0; gsub(/[ \t\r]/, "", l); q = q l }' "${TR[@]}" | sort -u > "$OD/train_keys.txt"
-    for src in "$@"; do
-        b="$(basename "$src" .eval.qa)"; day="$(basename "$(dirname "$(dirname "$src")")")"; out="$OD/${day}_$b.eval.qa"
-        awk -v K="$OD/train_keys.txt" '
-            BEGIN { while ((getline l < K) > 0) keys[l] = 1; close(K) }
-            function flush() { if (blk == "") return; if (q in keys) leak++; else { printf "%s", blk; kept++ } blk = "" }
-            /^#Q$/ { flush(); blk = $0 "\n"; q = ""; m = 1; next }
-            /^#A$/ { m = 0 }
-            { blk = blk $0 "\n"; if (m) { l = $0; gsub(/[ \t\r]/, "", l); q = q l } }
-            END { flush(); printf "%d %d\n", kept + 0, leak + 0 > "/dev/stderr" }' "$src" > "$out" 2> "$out.cnt"
-        read -r k l < "$out.cnt"; rm -f "$out.cnt"; kept=$((kept + k)); leak=$((leak + l))
-        [ -s "$out" ] && echo "$(dirname "$(dirname "$src")")/chunks/$b.txt $out eval" >> "$LIST"
-    done
-    LOG "留出剔重: 留 $kept 题, 剔掉 $leak 题(在 train 里出现过)"
-}
-
-# kd_paired <heldout_e00.tsv> <heldout_eNN.tsv> <块路径前缀> <in|out>: 逐题配对(in = 块路径以前缀起头的题 = 当日; out = 其余 = 套件)。
-#   与训练器 pt_paired_gain 同口径: 降幅 D = Σ(起点_i − 本轮_i)/Σm_i(按答案 token 加权), 题当独立单位, 比值估计线性化的标准误。
-#   打 "题数 降幅 标准误 本轮KL 起点KL"(没题全 0)。
-kd_paired(){
-    awk -F'\t' -v P="$3" -v IN="$4" 'NR == FNR { a[$2] = $4; next }
-        ((index($1, P) == 1) == (IN == "in")) && ($2 in a) { q++; d = a[$2] - $4; sd += d; sm += $3; dd[q] = d; mm[q] = $3; cur += $4; prev += a[$2] }
-        END { if (!q || !sm) { print 0, 0, 0, 0, 0; exit } g = sd / sm; for (i = 1; i <= q; i++) { u = dd[i] - g * mm[i]; ss += u * u }
-              se = q > 1 ? sqrt(ss * q / (q - 1)) / sm : 0; printf "%d %.5f %.5f %.5f %.5f\n", q, g, se, cur / sm, prev / sm }' "$1" "$2"
-}
-
-# kd_wt2_se <docgate 全文>: 两臂(② / ②+③)逐位行配对 → ΔΣmin、ΔKLD 的均值 ± 标准误。32 token 一块取块均值再算标准误 —— 相邻 token 高度相关,
-#   按 token 算会把误差低估好几倍。只打不判(门仍是 gate_read 的 Σmin ≥ −0.5pp 且 KLD ≤ +3%); 读法: |Δ| 不到 2 个标准误 = 分不清是 ③ 还是噪声。
-kd_wt2_se(){
-    local a b; read -r a b < <(grep -o "逐位行 → [^ ]*" "$1" | awk '{print $3}' | head -2 | tr '\n' ' ')
-    [ -n "${a:-}" ] && [ -s "$a" ] && [ -n "${b:-}" ] && [ -s "$b" ] || { echo "(无逐位行)"; return 0; }
-    awk -v B=32 'NR == FNR { k[$1] = $2; s[$1] = $3; next } ($1 in k) { i = int(n / B); dk[i] += $2 - k[$1]; ds[i] += $3 - s[$1]; c[i]++; n++ }
-         END { nb = 0; for (i in c) { nb++; mk = dk[i] / c[i]; ms = ds[i] / c[i]; sk += mk; ss += ms; qk += mk * mk; qs += ms * ms }
-               if (nb < 2) { print "(块数不足)"; exit }
-               mk = sk / nb; ms = ss / nb; vk = qk / nb - mk * mk; vs = qs / nb - ms * ms; if (vk < 0) vk = 0; if (vs < 0) vs = 0
-               printf "ΔΣmin %+.2f ± %.2f pp, ΔKLD %+.4f ± %.4f(%d 块 × %d token 配对)", 100 * ms, 100 * sqrt(vs / (nb - 1)), mk, sqrt(vk / (nb - 1)), nb, B }' "$a" "$b"
-}
-
-# kdfwd <日期> [③目录]: ★时间向前的转移测试★(10-03 用户 "测一下有没有变聪明") —— 用【该日期之前训出的 ③】(缺省 = 该日期前最近一个 ACCEPTED 的选中轮)
-#   对该日期的【全部】问答(train + eval, 这份 ③ 一道都没见过)跑 kddiag: 挂③ 对部署态在分叉位 / 含数字参考位 / 参考 token 概率上的差 = 前几天学的对新一天
-#   有没有用。为什么只认这个: 训完当日再量(留出 KL、数字位)量的是"记住了多少"; "越来越聪明"只能用它没见过的下一天来量, 而且要连着几十天看曲线, 一两天说明不了。
-#   产物 incr/<序号>/fwd/diag-<标签>-eval/diag.txt, ledger 加行 "转移"/"决策转移"。kdinc 有起点时训练前自动跑。
-#   第 3 参 = 标签(缺省 prev; 对比别的 ③ 时给, 如 v1), 产物目录按它分: diag-<标签>-eval / decide-<标签>。
-#   ② 决策探针(10-03 夜加): 前面的 ③ 与部署态对今天各股的【决策日材料节选】(decide/<代码>.txt, 不含结果)各给一次目标价/止损位(训练器 epochs=0 +
-#   init + probe_q, 一次装载两臂), 对账本里的次日实际最高/最低算 |目标−最高|/最高 等; 第三臂 = 账本校准规则本身(前一天的统计)。
-#   ③ 比它只是"记住了规则还是会用": 规则臂赢部署 = 从结果学到的先验有用; 挂③ 贴近规则臂 = ③ 把先验用上了(不提规则也用)。
-stage_kdfwd(){
-    local N="${1:?序号}" PT="${2:-}" TAG="${3:-prev}" D="$INCR/${1:?}" FWD="$INCR/${1:?}/fwd" dd f b
-    if [ -z "$PT" ]; then
-        for dd in "$INCR"/[0-9]*/; do dd="$(basename "$dd")"; [[ "$dd" < "$N" ]] && [ -s "$INCR/$dd/ACCEPTED" ] && PT="$(awk '{print $3}' "$INCR/$dd/ACCEPTED")"; done
-    fi
-    [ -n "$PT" ] && [ -s "$PT/amp_L39.bin" ] || DIE "kdfwd $N: 没有在它之前训出的 ③(给第 2 参, 或先跑前一次)"
-    PT="$(readlink -f "$PT")"   # 第 2 参给相对路径时 fwd/<标签> 符号链会按链所在目录解析 → 断链(10-03 实撞: kddiag 报 "没有 …/fwd/e03/amp_L39.bin")
-    mkdir -p "$FWD"; : > "$FWD/data.list"
-    for f in "$D"/qa/*.qa; do b="$(basename "$f")"; b="${b%%.*}"; [ "$b" = hold_general ] && continue; echo "$D/chunks/$b.txt $f eval" >> "$FWD/data.list"; done
-    [ -s "$FWD/data.list" ] || DIE "kdfwd $N: $D/qa 里没有问答"
-    printf 'data=%s\nout=%s\nlayers=0-39\nrank=64\nmaxlen=1024\nteacher=%s\n' "$FWD/data.list" "$FWD" "$INCR/teacher.bin" > "$FWD/ptrain.cfg"
-    ln -sfn "$PT" "$FWD/$TAG"
-    local Q="$D/decide/questions.txt" DEC="$FWD/decide-$TAG"
-    if [ -s "$Q" ]; then
-        mkdir -p "$DEC"
-        { cat "$FWD/data.list"; echo "$D/chunks/hold_general.txt $D/qa/hold_general.train.qa train"; } > "$DEC/data.list"   # 预热探底要一道训练题, 拿保持料
-        printf 'data=%s\nout=%s\ninit=%s\nlayers=0-39\nrank=64\ntopk=64\nmaxlen=1024\nepochs=0\nprobe_n=0\nprobe_tok=120\nprobe_q=%s\nteacher=%s\n' \
-            "$DEC/data.list" "$DEC" "$PT" "$Q" "$INCR/teacher.bin" > "$DEC/ptrain.cfg"
-        kd_train_run "$DEC"
-        # 逐领域打分: 探针文件按各领域题数切片(questions.txt 是按领域名序拼的); 规则臂用 ③ 所在那次(PD)为止该领域的 stats —— ③ 学到的只到那次
-        local PD dom nq k0=1 ST; PD="$(grep -o '/incr/[0-9]\{4\}/' <<< "$PT/" | head -1 | tr -dc '0-9')"
-        # ③ 来自比本次更晚的序号(kdtake 取料后先跑了奖励回路)时, stats ≤ PD 会含本次这几笔的次日实际 = 规则臂偷看答案; 封到本次之前(10-06)
-        [[ "$PD" < "$N" ]] || PD="$(printf '%04d' $((10#$N - 1)))"
-        kd_domain_load
-        for dom in $(kd_domains); do
-            [ -s "$D/decide/$dom/questions.txt" ] || continue
-            nq=$(wc -l < "$D/decide/$dom/questions.txt"); ST="$(kd_stats_upto "$dom" "$PD")"
-            kd_probe_slice "$DEC/probe_e00.txt" "$k0" "$nq" > "$DEC/probe_$dom.txt"; k0=$((k0 + nq))
-            [ -n "$ST" ] || { LOG "kdfwd $N [$dom]: 第 $PD 次为止这个领域没有 stats, 规则臂算不了, 不打分"; continue; }
-            "${dom}_score" "$DEC/probe_$dom.txt" "$D/decide/$dom/truth.tsv" "$ST" | tee "$DEC/score_$dom.txt" | tee -a "$LOGF"
-            echo "$N 决策转移[$dom] ③=$PT $(tail -1 "$DEC/score_$dom.txt")" >> "$INCR/ledger.txt"
-        done
-    else LOG "kdfwd $N: 没有 decide/questions.txt(kd_ledger 没跑或各领域都没有决策日材料), 跳过决策探针"; fi
-    stage_kddiag "$FWD" "$TAG" eval
-    local S="$FWD/diag-$TAG-eval/diag.out" a n p nq
-    a="$(grep -a '分叉位(教师榜首≠部署榜首)' "$S" | tail -1 | sed 's/.*: \([0-9]*\) 位 .*挂③榜首 = 教师榜首 \([0-9.]*%\).*/\1 位, 挂③跟上教师 \2/')"
-    n="$(grep -a '含数字的参考位' "$S" | tail -1 | sed 's/.*: \([0-9]*\) 位 | 榜首 = 参考: 教师 \([0-9.]*%\) \/ 挂③ \([0-9.]*%\) \/ 部署 \([0-9.]*%\).*/\1 位, 教师 \2 挂③ \3 部署 \4/')"
-    p="$(grep -a '参考 token 平均概率(榜外按 0)' "$S" | tail -1 | sed 's/.*: 教师 \([0-9.]*\) \/ 挂③ \([0-9.]*\) \/ 部署 \([0-9.]*\).*/教师 \1 挂③ \2 部署 \3/')"
-    nq="$(grep -c '^#Q' "$D"/qa/*.qa | awk -F: '$1 !~ /hold_general/ {s += $2} END {print s + 0}')"
-    LOG "kdfwd $N ← $PT(本次 $nq 题全没见过): 分叉位 $a | 含数字位 $n | 参考 token 平均概率 $p"
-    echo "$N 转移 ③=$PT 本次 $nq 题 分叉位 $a 含数字位 $n 参考概率 $p" >> "$INCR/ledger.txt"
-}
-
-# kd_probe_slice <probe 文件> <起始题号> <题数>: 训练器 probe 文件按 "自定义#k 问:" 分题, 取第 k0..k0+n−1 题, 题号重编从 1 起(各领域的决策提示拼在一个
-#   questions.txt 里一次装载, 打分按领域切开; 各领域 _score 只看自己那片。打分本身在 kd_domain/<域>.sh 的 <域>_score 里)
-kd_probe_slice(){
-    LC_ALL=C.UTF-8 gawk -v k0="$2" -v n="$3" '/^自定义#[0-9]+ 问: / { k++; on = (k >= k0 && k < k0 + n); if (on) sub(/^自定义#[0-9]+/, "自定义#" (k - k0 + 1)) } on' "$1"
-}
-
-# kd_inc_run <序号> [训练轮数 3] [lr 1e-4] [k=v,...]: 一次增量后训练的主流程(stage_kdinc 分配序号取料后调; 目录与规矩见本段头注释)。
-#   当日文本 → (没问答就 kdgen) → 清单 = 当日 train + 回放(kd_replay) + 保持料 1 遍 + 留出(当日 eval + 套件 = 前面各日 eval, 都过 kd_leakfilter)
-#   → init=current 训练(epoch_tok=0: 料小, 一轮 = 过一遍; lr 比首训 2e-4 低一半, 少扰动已学的) → 每轮 ckpt 三道读数:
-#     wt2(gate_read 口径判, kd_wt2_se 只打) / 套件(③_t 对 ③_{t-1} 逐题配对, 退 ≤ 2 个标准误才过; 第一天套件空 = 过) / 当日学到(只打)
-#   → 过门的轮里当日留出 KL 最低者 → ACCEPTED + current 指过去; 没有 → REJECTED, current 不动 → 选中轮(没选中 = 末轮) kddiag eval → ledger。
-#   不起服务(训练段都要停服务; 上线是另一件事): bash serve_1m_spark.sh start "$MDL" "$ZCH" --posttrain $FTD/daily/current
-kd_inc_run(){
-    local N="${1:?序号}" EP="${2:-3}" LR="${3:-1e-4}" EXTRA="${4:-}"
-    [[ "$N" =~ ^[0-9]{4}$ ]] || DIE "序号要四位数字"
-    local D="$INCR/$N" OUT="$INCR/$N/out" G="$INCR/$N/gate" HQ="$INCR/hold/questions.txt"
-    ls "$D"/chunks/*.txt >/dev/null 2>&1 || DIE "没有 $D/chunks/*.txt(本次文本放这里; kdinc 会从料池取)"
-    [ -s "$HQ" ] || DIE "没有 $HQ(通用题, 各次共用; kdinc 第一次会从料池 pool/hold/ 带过来)"
-    mkdir -p "$OUT" "$G" "$D/qa"
-    # 保持料答案只出一次(第一天 kdgen 让部署态答): 每天重答是另一组采样, 教师缓存全不命中, 还白烧几分钟
-    if [ -s "$INCR/hold/qa/hold_general.train.qa" ]; then cp "$INCR"/hold/qa/hold_general.*.qa "$D/qa/"; : > "$D/chunks/hold_general.txt"
-    else mkdir -p "$D/hold"; cp "$HQ" "$D/hold/questions.txt"; fi
-    # 本次问答已有就不重出: 日期文件夹里的料是定格的, 重出会换掉题目, 和前后两天就不可比。
-    #   账本问答(ledger_*, kdtake 先出的)不算"已有"(10-06 实撞: kdtake → kdinc @序号 把 kdgen 整个跳过, 复盘块一道题都没有, 清单只剩账本硬目标)
-    if ! ls "$D"/qa/*.train.qa 2>/dev/null | grep -v hold_general | grep -qv '/ledger_'; then stage_kdgen "$D" . 1 1; fi
-    if [ ! -s "$INCR/hold/qa/hold_general.train.qa" ]; then
-        [ -s "$D/qa/hold_general.train.qa" ] || DIE "kdgen 没出保持料问答($D/qa/hold_general.train.qa)"
-        mkdir -p "$INCR/hold/qa"; cp "$D"/qa/hold_general.*.qa "$INCR/hold/qa/"
-    fi
-    # 决策账本 + 校准料(kd_ledger, 逐领域适配器 kd_domain/<域>.sh): 代码产的块 chunks/ledger_<域>_<序号>.txt 与问答 qa/ledger_<域>_<序号>.*.qa 跟复盘块一起进清单; decide/ 给 kdfwd 的决策探针用
-    kd_ledger "$N"
-    # 前面各日(按日期字符串比, 只认有训练问答的) + 起点
-    local -a PREV=(); local dd
-    for dd in "$INCR"/[0-9]*/; do dd="$(basename "$dd")"; [[ "$dd" < "$N" ]] && ls "$INCR/$dd"/qa/*.train.qa >/dev/null 2>&1 && PREV+=("$INCR/$dd"); done
-    local INIT=""; [ -e "$INCR/current" ] && INIT="$(readlink -f "$INCR/current")"
-    [ -z "$INIT" ] || [ -s "$INIT/amp_L39.bin" ] || DIE "current 指向的 $INIT 没有 amp_L39.bin"
-    # ★训练前先量"前面学到的对今天有没有用"★(kdfwd): 本次全部问答这份 ③ 一道没见过, 挂③ 对部署态的决策位差就是转移; 训完再量的是记住了多少
-    [ -z "$INIT" ] || stage_kdfwd "$N" "$INIT"
-    # 清单: 本次 train(保持料 1 遍, 份额 15~25%, 与全量料的 4 遍 ≈ 17% 同一个量级) + 回放 + 留出
-    local LIST="$OUT/data.list" b f nq=0 nrep=0
-    : > "$LIST"
-    for f in "$D"/qa/*.train.qa; do
-        # 账本料(ledger_<域>_<序号>)的答案全是代码算的 → 清单第 4 列 hard: 训练器用答案 one-hot 当目标 + 数字位加权, 不过"教师信不信规则"这一道(10-04)
-        b="$(basename "$f" .train.qa)"; echo "$D/chunks/$b.txt $f train$([[ "$b" == ledger_* ]] && echo " hard")" >> "$LIST"
-        [ "$b" = hold_general ] || nq=$((nq + $(grep -c '^#Q' "$f")))
-    done
-    [ "$nq" -gt 0 ] || DIE "本次没有训练题($D/qa)"
-    if [ "${#PREV[@]}" -gt 0 ]; then kd_replay "$nq" "$OUT/replay" "$LIST" "${PREV[@]}"; nrep=$(cat "$OUT"/replay/*.qa 2>/dev/null | grep -c '^#Q'); fi
-    local -a EV=(); local p
-    ls "$D"/qa/*.train.qa > "$OUT/train_files.txt"   # 剔重的依据 = 今天 + 前面各日的全部 train 问答(不只是今天抽到的回放)
-    for f in "$D"/qa/*.eval.qa; do [ -s "$f" ] && EV+=("$f"); done
-    for p in ${PREV[@]+"${PREV[@]}"}; do
-        ls "$p"/qa/*.train.qa >> "$OUT/train_files.txt"
-        # 套件 = 前面各次的复盘留出题, 不含前面各次的账本留出题: 账本题的答案是"截至那时"的规则数字, 规则按设计随账本变(0001 涨幅中位 +1.9% → 0005 −0.1%),
-        # 学了新规则之后旧规则的题 KL 必然上去(10-04 实撞: 0005 e01 套件-账本 17 题 0.403 → 0.512), 那不是忘, 是改口 —— 当门会把"学会新规则"判成退
-        for f in "$p"/qa/*.eval.qa; do b="$(basename "$f")"; [ -s "$f" ] && [ "$b" != hold_general.eval.qa ] && [[ "$b" != ledger_* ]] && EV+=("$f"); done
-    done
-    kd_leakfilter "$OUT/train_files.txt" "$LIST" "$OUT/evalq" "${EV[@]}"
-    # 本次留出题数不含保持料的留出题(它们另有"保持料留出 KL"一栏, 门里的"本次 N 题"也不含), 与 kd_paired 的题数对得上
-    local nev nsu; nev=$(ls "$OUT"/evalq/"${N}"_*.eval.qa | grep -v hold_general | xargs -r cat | grep -c '^#Q'); nsu=$(ls "$OUT"/evalq/*.eval.qa | grep -v "/${N}_" | xargs -r cat | grep -c '^#Q')
-    printf 'data=%s\nout=%s\nlayers=0-39\nrank=64\nlr=%s\nepochs=%s\nbatch=4\ntopk=64\nmaxlen=1024\nprobe_n=6\nprobe_tok=96\nepoch_tok=0\nteacher=%s\n' \
-        "$LIST" "$OUT" "$LR" "$EP" "$INCR/teacher.bin" > "$OUT/ptrain.cfg"
-    [ -z "$INIT" ] || echo "init=$INIT" >> "$OUT/ptrain.cfg"
-    [ -s "$D/probe/questions.txt" ] && echo "probe_q=$D/probe/questions.txt" >> "$OUT/ptrain.cfg"
-    [ -z "$EXTRA" ] || tr ',' '\n' <<< "$EXTRA" >> "$OUT/ptrain.cfg"
-    LOG "kdinc 第 $N 次: 本次 $nq 题 + 回放 $nrep 题(前 ${#PREV[@]} 次) + 保持料 $(grep -c '^#Q' "$D/qa/hold_general.train.qa") 题; 留出 本次 $nev 题 + 套件 $nsu 题; 起点 ${INIT:-①+②(第一次)}; 轮 $EP lr $LR → $OUT"
-    kd_train_run "$OUT"
-    # 每轮三道读数 → 选轮
-    local n ck c tq tg tse tkl tkl0 sq sg sse skl skl0 r w se pass best="" bkl="" e0="$OUT/heldout_e00.tsv" en
-    [ -s "$e0" ] || DIE "没有 $e0(训练器第 0 步没落逐题留出表)"
-    for n in $(seq 1 "$EP"); do
-        ck="$(printf 'ckpt_e%02d' "$n")"; c="$OUT/$ck"; en="$OUT/heldout_e$(printf '%02d' "$n").tsv"
-        [ -s "$c/amp_L39.bin" ] && [ -s "$en" ] || { LOG "kdinc 第 $N 次 $ck: 没有 ckpt 或逐题留出表, 不参选"; continue; }
-        read -r tq tg tse tkl tkl0 <<< "$(kd_paired "$e0" "$en" "$D/chunks/" in)"
-        read -r sq sg sse skl skl0 <<< "$(kd_paired "$e0" "$en" "$D/chunks/" out)"
-        stage_docgate "$c" 512 "$G/wt2_$ck.txt" >/dev/null
-        w=0; r=$(gate_read "$G/wt2_$ck.txt") || w=$?
-        se=$(kd_wt2_se "$G/wt2_$ck.txt")
-        # ★本域门★(10-07): 金融 j 2048 同一口径(Σmin 退 ≤0.5pp 且 KLD 涨 ≤3%); 只守 wt2 时本域漂了九次没人拦
-        stage_docgate "$c" 2048 "$G/finj_$ck.txt" "$FINJ" >/dev/null
-        local wj=0 rj; rj=$(gate_read "$G/finj_$ck.txt") || wj=$?
-        pass=1; [ "$w" = 0 ] || pass=0; [ "$wj" = 0 ] || pass=0
-        [ "$sq" = 0 ] || awk -v g="$sg" -v s="$sse" 'BEGIN{exit !(g >= -2 * s)}' || pass=0   # 套件: 起点 − 本轮 < −2SE = 显著退
-        LOG "kdinc 第 $N 次 $ck: 本次留出 KL $tkl0 → $tkl(配对降 $tg ± $tse, $tq 题) | 套件 $([ "$sq" = 0 ] && echo "空" || echo "$skl0 → $skl(配对降 $sg ± $sse, $sq 题)") | wt2 $r | $se | 金融j $rj$([ "$wj" = 0 ] || echo "★本域没过★") | $([ "$pass" = 1 ] && echo 过门 || echo ★没过门★)"
-        if [ "$pass" = 1 ] && { [ -z "$bkl" ] || awk -v a="$tkl" -v b="$bkl" 'BEGIN{exit !(a < b)}'; }; then best="$c"; bkl="$tkl"; fi
-    done
-    if [ -n "$best" ]; then
-        ln -sfn "$best" "$INCR/current"; rm -f "$D/REJECTED"
-        echo "$(date '+%F %T') $best 本次留出 KL $bkl, 起点 ${INIT:-①+②}" > "$D/ACCEPTED"
-        LOG "kdinc 第 $N 次: ★ACCEPTED★ $(basename "$best"), current → $best(上线: bash $SC/serve_1m_spark.sh start \"\$MDL\" \"\$ZCH\" --posttrain $INCR/current)"
-    else
-        rm -f "$D/ACCEPTED"; echo "$(date '+%F %T') 没有一轮同时过 wt2 门与套件门, current 不动(${INIT:-无}); 读数见 gate/ 与 nightly.log" > "$D/REJECTED"
-        LOG "kdinc 第 $N 次: ★REJECTED★ current 不动(${INIT:-无})"
-    fi
-    echo "$N 本次 $nq 回放 $nrep 留出 $nev 套件 $nsu 轮 $EP lr $LR 选中 ${best:-无} 本次KL ${bkl:--} current $(readlink -f "$INCR/current" 2>/dev/null || echo 无)" >> "$INCR/ledger.txt"
-    # 逐位核对(只打不判): 选中轮(没选中 = 末轮)在全部留出题(本次 + 套件)上 —— 教师数字位答对率 = 本次料教师信不信材料, 挂 ③ 跟上率 = 写进去多少
-    stage_kddiag "$OUT" "$(basename "${best:-$OUT/$(printf 'ckpt_e%02d' "$EP")}")" eval
-    kd_diag_table "$OUT"
-    LOG "KDINC_DONE $N ${best:-REJECTED}"
-}
-
-# ---------------- 奖励回路 kdrft(10-04, 用户 "奖励写进去") ----------------
-# 为什么: 六次增量三组指标都不动的根因在信号 —— 教师 = 自己读材料(上限 = 记住), 硬目标 = 代码算的中位数规则(上限 = 规则, 位移到 1 封顶),
-# 损失里从来没有"这个决策后来对不对"。这里把结果放进损失: 模型自己对决策提示抽 G 份答案(训练器 sample_n, 模型卡配方温 1, 种子固定), 代码按次日
-# 实际结算每份收益(适配器 <域>_reward), 同题 G 份互为基线(权重 = 收益 − 组均值, 训练器 pt_rft_group 算), 答案 one-hot × 权重当目标(= REINFORCE 的梯度,
-# 负的往下压); 同一串 token 再配一行 kl 锚(教师 = 本轮起点的 ③ 自己答, 权重 β; 不锚部署态 —— 那是没学规则的那个): 奖励推、锚拉; 回放 + 保持料护知识;
-# 各轮 wt2 门 + 套件门照旧。一轮 = 结算上一轮末抽的样本 → 清单 → 一遍训练 → 轮末再抽(既是下一轮的样本, 也是这轮的读数)。第 0 轮只抽不训(起点 = current)。
-# 读数(只打不判, 账本不到百笔时留出收益是噪声): 训练提示平均收益逐轮 / 留出提示平均收益 / 失败份数 / 锚 KL / 贪心决策探针三臂(同 kdscore)。
-# 目录 incr/<序号>/rft/: questions.txt(训练提示在前、留出提示在后, 一次装载全答) layout.txt(每片 "领域 片 题数") truth_<域>_{train,held}.tsv r0/ r1/ …
-# 序号照常分配(source.txt 写"奖励回路", 没有 chunks/qa ⇒ 后面的 kdinc 不把它当料); 过门的轮里训练提示收益最高者 ACCEPTED → current。
-
-# kd_rft_prompts <序号> <留出序号>: 其余各序号 decide/<域>/ 的提示 = 训练提示, 留出序号的 = 留出提示; questions.txt 训练片在前, layout.txt 记切片
-kd_rft_prompts(){
-    local N="$1" HELD="$2" R="$INCR/$1/rft" dom M part q n
-    mkdir -p "$R"; : > "$R/questions.txt"; : > "$R/layout.txt"
-    for part in train held; do for dom in $(kd_domains); do
-        : > "$R/truth_${dom}_$part.tsv"; n=0
-        for M in $(ls -d "$INCR"/[0-9]*/ | xargs -n1 basename | sort); do
-            q="$INCR/$M/decide/$dom/questions.txt"
-            [ "$M" != "$N" ] && [ -s "$q" ] || continue
-            if [ "$part" = held ]; then [ "$M" = "$HELD" ] || continue; else [ "$M" != "$HELD" ] || continue; fi
-            cat "$q" >> "$R/questions.txt"; cat "$INCR/$M/decide/$dom/truth.tsv" >> "$R/truth_${dom}_$part.tsv"; n=$((n + $(wc -l < "$q")))
-        done
-        echo "$dom $part $n" >> "$R/layout.txt"
-    done; done
-}
-# kd_rft_reward <样本文件> <序号> <输出目录>: 按 layout 切片 → <域>_reward 结算 → <输出目录>/reward_<域>_<片>.tsv; 汇总一行进 reward.txt 并打出:
-#   "train <均值> <份数> <失败> held <均值> <份数> <失败>"(均值含失败份的最坏值; 失败 = 没解析到 / 止损≥入场 / 目标≤入场)
-kd_rft_reward(){
-    local S="$1" N="$2" O="$3" R="$INCR/$2/rft" dom part n k0=1 f
-    mkdir -p "$O"; rm -f "$O"/reward_*.tsv "$O"/sample_*_*.tsv
-    while read -r dom part n; do
-        if [ "$n" -gt 0 ]; then
-            f="$O/reward_${dom}_$part.tsv"
-            awk -F'\t' -v OFS='\t' -v k0="$k0" -v n="$n" '$1 >= k0 && $1 < k0 + n { $1 = $1 - k0 + 1; print }' "$S" > "$O/sample_${dom}_$part.tsv"
-            "${dom}_reward" "$O/sample_${dom}_$part.tsv" "$R/truth_${dom}_$part.tsv" > "$f"
-        fi
-        k0=$((k0 + n))
-    done < "$R/layout.txt"
-    # 汇总一行 "train <奖励均值> <份数> <失败> <第 5 列均值(金融 = 持仓一天收益, 只记)> held <同四项>"
-    { for part in train held; do printf '%s ' "$part"; cat "$O"/reward_*_"$part".tsv 2>/dev/null | awk -F'\t' '{ s += $3; c++; if ($4 ~ /fail/) fl++; x += $5 } END { printf "%.3f %d %d %.3f ", c ? s / c : 0, c + 0, fl + 0, c ? x / c : 0 }'; done; echo; } > "$O/reward.txt"
-    cat "$O/reward.txt"
-}
-# kd_rft_score <probe 文件> <序号> <标签> <规则 stats 截至的序号>: 贪心决策探针三臂打分(同 kdscore), 训练片 / 留出片各一行汇总进日志。
-#   规则臂只许用留出序号之前的 stats(第 4 参 = 留出序号 − 1): kdtake 出的 stats_<留出序号> 累计里含留出那几笔的次日实际, 拿它当规则臂 = 规则偷看答案
-#   (10-06 改; 第 0008 次留出 0006 时它就是最新 stats, 读数不变)
-kd_rft_score(){
-    local P="$1" N="$2" TAG="$3" PD="${4:?规则 stats 截至的序号}" R="$INCR/$2/rft" dom part n k0=1 ST
-    while read -r dom part n; do
-        if [ "$n" -gt 0 ]; then
-            ST="$(kd_stats_upto "$dom" "$PD")"
-            kd_probe_slice "$P" "$k0" "$n" > "${P%.txt}_${dom}_$part.txt"
-            [ -z "$ST" ] || LOG "奖励回路 $TAG 贪心决策探针[$dom/$part] $("${dom}_score" "${P%.txt}_${dom}_$part.txt" "$R/truth_${dom}_$part.tsv" "$ST" | tail -1)"
-        fi
-        k0=$((k0 + n))
-    done < "$R/layout.txt"
-}
-# kd_rft_list <轮目录> <样本文件> <奖励目录> <序号> <β> <清单>: 训练片里收口的样本 → rft_<域>.qa(#Q 提示 / #A 答案 / #W 收益) + anchor_<域>.qa(同题同答)
-#   + 清单两行(块 = 空文件 anchor.txt: 教师提示 = 学生提示, 锚行的教师由训练器 anchor= 定)。打收进来的份数(回放按它定量)
-kd_rft_list(){
-    local RD="$1" S="$2" RW="$3" N="$4" BETA="$5" LIST="$6" R="$INCR/$4/rft" dom part n k0=1 c tot=0
-    : > "$RD/anchor.txt"
-    while read -r dom part n; do
-        if [ "$part" = train ] && [ "$n" -gt 0 ] && [ -s "$RW/reward_${dom}_train.tsv" ]; then
-            c=$(LC_ALL=C.UTF-8 gawk -F'\t' -v Q="$R/questions.txt" -v k0="$k0" -v n="$n" -v RW="$RW/reward_${dom}_train.tsv" -v QF="$RD/rft_$dom.qa" -v AF="$RD/anchor_$dom.qa" '
-                function unesc(s,   o, i, ch) { o = ""; for (i = 1; i <= length(s); i++) { ch = substr(s, i, 1); if (ch == "\\" && i < length(s)) { i++; ch = substr(s, i, 1); o = o (ch == "n" ? "\n" : ch == "t" ? "\t" : ch) } else o = o ch } return o }
-                BEGIN { while ((getline l < Q) > 0) { nq++; p = l; sub(/^@/, "", p); txt = ""; while ((getline x < p) > 0) txt = txt (txt == "" ? "" : "\n") x; close(p); prompt[nq] = txt } close(Q)
-                        while ((getline l < RW) > 0) { split(l, f, "\t"); r[f[1] "," f[2]] = f[3] } close(RW); printf "" > QF; printf "" > AF }
-                $1 >= k0 && $1 < k0 + n && $3 == 1 { key = ($1 - k0 + 1) "," ($2 + 0); if (!(key in r)) next; a = unesc($4); q = prompt[$1]
-                    printf "#Q\n%s\n#A\n%s\n#W %s\n", q, a, r[key] >> QF; printf "#Q\n%s\n#A\n%s\n", q, a >> AF; c++ }
-                END { close(QF); close(AF); print c + 0 }' "$S")
-            if [ "${c:-0}" -gt 0 ]; then
-                echo "$RD/anchor.txt $RD/rft_$dom.qa train rft" >> "$LIST"; echo "$RD/anchor.txt $RD/anchor_$dom.qa train kl $BETA" >> "$LIST"; tot=$((tot + c))
-            fi
-        fi
-        k0=$((k0 + n))
-    done < "$R/layout.txt"
-    echo "$tot"
-}
-# kd_rft_run <序号> <轮数> <每题份数> <留出序号> <lr> <β> [k=v,...]: 主流程(见本段头注释)
-kd_rft_run(){
-    local N="$1" T="${2:-3}" G="${3:-8}" HELD="${4:-}" LR="${5:-1e-4}" BETA="${6:-1}" EXTRA="${7:-}"
-    local R="$INCR/$N/rft" START O LIST PREV3 S RW t nrft dd f b p ntr nhe
-    START="$(readlink -f "$INCR/current" 2>/dev/null || true)"; [ -n "$START" ] && [ -s "$START/amp_L39.bin" ] || DIE "奖励回路要有 current(先跑 kdinc)"
-    kd_domain_load
-    [ -n "$HELD" ] || HELD="$(for dd in "$INCR"/[0-9]*/; do dd="$(basename "$dd")"; [ "$dd" != "$N" ] && [ -s "$INCR/$dd/decide/questions.txt" ] && echo "$dd"; done | tail -1)"
-    kd_rft_prompts "$N" "$HELD"
-    local RPD; RPD="$(printf '%04d' $((10#${HELD:-1} - 1)))"   # 规则臂 stats 截至留出序号之前(见 kd_rft_score)
-    ntr=$(awk '$2 == "train" {s += $3} END {print s + 0}' "$R/layout.txt"); nhe=$(awk '$2 == "held" {s += $3} END {print s + 0}' "$R/layout.txt")
-    [ "$ntr" -gt 0 ] || DIE "奖励回路: 没有训练提示(各序号 decide/ 都空?)"
-    local HOLDQ="$INCR/hold/qa/hold_general.train.qa"; [ -s "$HOLDQ" ] || DIE "没有 $HOLDQ"
-    : > "$R/hold_general.txt"
-    LOG "奖励回路 第 $N 次: 起点 $START, 训练提示 $ntr 道(留出 = 第 ${HELD:-无} 次 $nhe 道), 每道抽 $G 份, $T 轮, lr $LR, 锚 β $BETA"
-    # probe_base: 自定义探针的部署态答案各轮不变, 第 0 轮算一次落 $R/probe_base.txt, 后面各轮直接读(10-06: 每轮重装再算 20 道单流 ≈ 3 分钟白算)
-    local CFG="layers=0-39\nrank=64\ntopk=64\nmaxlen=1024\nbatch=4\nprobe_n=0\nprobe_tok=120\nepoch_tok=0\nprobe_base=$R/probe_base.txt\n"
-    # 第 0 轮: 只抽样(epochs=0: 第 0 步的 init 就是产物); 抽过就不重抽(kdrft @序号 续跑)
-    O="$R/r0"; mkdir -p "$O"
-    if [ ! -s "$O/sample_e00.txt" ]; then
-        echo "$R/hold_general.txt $HOLDQ train" > "$O/data.list"   # 预热探底要一道训练题
-        printf "data=%s\nout=%s\ninit=%s\nepochs=0\nprobe_q=%s\nsample_n=%s\nteacher=%s\n$CFG" "$O/data.list" "$O" "$START" "$R/questions.txt" "$G" "$INCR/teacher.bin" > "$O/ptrain.cfg"
-        [ -z "$EXTRA" ] || tr ',' '\n' <<< "$EXTRA" >> "$O/ptrain.cfg"   # 第 0 轮也吃 k=v(probe_tok 等采样口径三轮必须一致; 10-04 第 0008 次第一发漏了)
-        kd_train_run "$O"
-        [ -s "$O/sample_e00.txt" ] || DIE "奖励回路 轮 0: 训练器没落 sample_e00.txt"
-    fi
-    LOG "奖励回路 轮 0(起点 ③ 抽样): 收益 $(kd_rft_reward "$O/sample_e00.txt" "$N" "$O")"
-    kd_rft_score "$O/probe_e00.txt" "$N" "轮 0" "$RPD"
-    # 套件(前面各次的复盘留出题, 剔重; 不含账本题, 理由见 kd_inc_run)与回放来源 = 全部有训练问答的序号
-    local -a PREV=() EV=()
-    for dd in "$INCR"/[0-9]*/; do dd="$(basename "$dd")"; [ "$dd" != "$N" ] && ls "$INCR/$dd"/qa/*.train.qa >/dev/null 2>&1 && PREV+=("$INCR/$dd"); done
-    for p in ${PREV[@]+"${PREV[@]}"}; do for f in "$p"/qa/*.eval.qa; do b="$(basename "$f")"; [ -s "$f" ] && [ "$b" != hold_general.eval.qa ] && [[ "$b" != ledger_* ]] && EV+=("$f"); done; done
-    for t in $(seq 1 "$T"); do
-        if [ "$t" = 1 ]; then PREV3="$START"; RW="$R/r0"; S="$R/r0/sample_e00.txt"; else PREV3="$R/r$((t - 1))/ckpt_e01"; RW="$R/r$((t - 1))"; S="$R/r$((t - 1))/sample_e01.txt"; fi
-        [ -s "$PREV3/amp_L39.bin" ] && [ -s "$S" ] || DIE "奖励回路 轮 $t: 缺上一轮的 ③($PREV3)或样本($S)"
-        O="$R/r$t"; mkdir -p "$O"; LIST="$O/data.list"; : > "$LIST"
-        # 留出(套件)先写且各轮同序 ⇒ 题号跨轮一致, 逐题配对可比; 然后保持料、自采样 + 锚、回放
-        : > "$O/train_files.txt"; for p in ${PREV[@]+"${PREV[@]}"}; do ls "$p"/qa/*.train.qa >> "$O/train_files.txt"; done
-        [ "${#EV[@]}" -eq 0 ] || kd_leakfilter "$O/train_files.txt" "$LIST" "$O/evalq" "${EV[@]}"
-        echo "$R/hold_general.txt $HOLDQ train" >> "$LIST"
-        nrft=$(kd_rft_list "$O" "$S" "$RW" "$N" "$BETA" "$LIST")
-        [ "${nrft:-0}" -gt 0 ] || DIE "奖励回路 轮 $t: 没有可训的样本(全没收口?)"
-        [ "${#PREV[@]}" -eq 0 ] || kd_replay "$nrft" "$O/replay" "$LIST" "${PREV[@]}"
-        printf "data=%s\nout=%s\ninit=%s\nanchor=%s\nepochs=1\nlr=%s\nprobe_q=%s\nsample_n=%s\nteacher=%s\n$CFG" "$LIST" "$O" "$PREV3" "$PREV3" "$LR" "$R/questions.txt" "$G" "$INCR/teacher.bin" > "$O/ptrain.cfg"
-        # 第 0 步的探针每轮都跳(起点 ③ 的探针与采样上一轮末 / 第 0 轮已出过); 第 0 步评估只第 1 轮做(它的 heldout_e00 = 套件门的基线), 第 2 轮起跳
-        # (起点 = 上一轮末同一份 ③, 轮末评估就是它的读数; 10-06: 一轮 40 分钟里这两样白算 5 分多)
-        printf 'probe0=0\neval0=%s\n' "$([ "$t" = 1 ] && echo 1 || echo 0)" >> "$O/ptrain.cfg"
-        [ -z "$EXTRA" ] || tr ',' '\n' <<< "$EXTRA" >> "$O/ptrain.cfg"
-        LOG "奖励回路 轮 $t: 自采样 $nrft 份(+ 同数锚行) + 回放 $(cat "$O"/replay/*.qa 2>/dev/null | grep -c '^#Q') 题 + 保持料; 起点 $PREV3"
-        kd_train_run "$O"
-        [ -s "$O/ckpt_e01/amp_L39.bin" ] && [ -s "$O/sample_e01.txt" ] || DIE "奖励回路 轮 $t: 训练器没落 ckpt_e01 或 sample_e01.txt"
-        LOG "奖励回路 轮 $t: 收益 $(kd_rft_reward "$O/sample_e01.txt" "$N" "$O") | $(tr '\r' '\n' < "$O/train.out" | grep -a '锚 KL' | tail -1 | sed 's/.*ptrain\] //')"
-        kd_rft_score "$O/probe_e01.txt" "$N" "轮 $t" "$RPD"
-    done
-    # 门(各轮 ckpt_e01): wt2 + 套件(对第 1 轮第 0 步 = 起点, 逐题配对) + ★训练提示奖励必须高过轮 0(起点 ③ 自己的样本)★ → 过门里奖励最高者(同分取后面的轮)。
-    #   没有第三道: 三轮都比起点差照样 ACCEPTED 一个(10-04 第 0007 次第 1 轮实撞: −4.15 → −4.52 时才看见这个缺口)
-    local GD="$INCR/$N/gate" c w r se pass best="" brw="" sq sg sse skl skl0 rw e0="$R/r1/heldout_e00.tsv" rw0
-    rw0=$(awk '{print $2}' "$R/r0/reward.txt")
-    mkdir -p "$GD"
-    for t in $(seq 1 "$T"); do
-        c="$R/r$t/ckpt_e01"; [ -s "$c/amp_L39.bin" ] || continue
-        rw=$(awk '{print $2}' "$R/r$t/reward.txt")
-        stage_docgate "$c" 512 "$GD/wt2_r$t.txt" >/dev/null
-        w=0; r=$(gate_read "$GD/wt2_r$t.txt") || w=$?
-        se=$(kd_wt2_se "$GD/wt2_r$t.txt")
-        stage_docgate "$c" 2048 "$GD/finj_r$t.txt" "$FINJ" >/dev/null   # 本域门(10-07, 同 kd_inc_run)
-        local wj=0 rj; rj=$(gate_read "$GD/finj_r$t.txt") || wj=$?
-        pass=1; [ "$w" = 0 ] || pass=0; [ "$wj" = 0 ] || pass=0
-        sq=0
-        if [ -s "$e0" ] && [ -s "$R/r$t/heldout_e01.tsv" ]; then
-            read -r sq sg sse skl skl0 <<< "$(kd_paired "$e0" "$R/r$t/heldout_e01.tsv" "$R/" out)"
-            [ "$sq" = 0 ] || awk -v g="$sg" -v s="$sse" 'BEGIN{exit !(g >= -2 * s)}' || pass=0
-        fi
-        awk -v a="$rw" -v b="$rw0" 'BEGIN{exit !(a > b)}' || pass=0
-        LOG "奖励回路 轮 $t ckpt: 训练提示奖励 $rw(轮 0 $rw0) | 套件 $([ "$sq" = 0 ] && echo 空 || echo "$skl0 → $skl(配对降 $sg ± $sse, $sq 题)") | wt2 $r | $se | 金融j $rj$([ "$wj" = 0 ] || echo "★本域没过★") | $([ "$pass" = 1 ] && echo 过门 || echo ★没过门★)"
-        if [ "$pass" = 1 ] && { [ -z "$brw" ] || awk -v a="$rw" -v b="$brw" 'BEGIN{exit !(a >= b)}'; }; then best="$c"; brw="$rw"; fi
-    done
-    if [ -n "$best" ]; then
-        ln -sfn "$best" "$INCR/current"; rm -f "$INCR/$N/REJECTED"
-        echo "$(date '+%F %T') $best 奖励回路 训练提示收益 $brw, 起点 $START" > "$INCR/$N/ACCEPTED"
-        LOG "奖励回路 第 $N 次: ★ACCEPTED★ $(basename "$(dirname "$best")")/ckpt_e01(训练提示收益 $brw), current → $best"
-    else
-        rm -f "$INCR/$N/ACCEPTED"; echo "$(date '+%F %T') 没有一轮同时过 wt2 门与套件门, current 不动($START)" > "$INCR/$N/REJECTED"
-        LOG "奖励回路 第 $N 次: ★REJECTED★ current 不动($START)"
-    fi
-    echo "$N 奖励回路 起点 $START 轮 $T G $G 训练提示 $ntr 留出 $nhe(第 ${HELD:-无} 次) 奖励(训/留 失败 附带) $(for t in $(seq 0 "$T"); do [ -s "$R/r$t/reward.txt" ] && awk -v t="$t" '{printf "r%s %s/%s %s/%s %s/%s; ", t, $2, $7, $4, $9, $5, $10}' "$R/r$t/reward.txt"; done)选中 ${best:-无} current $(readlink -f "$INCR/current" 2>/dev/null || echo 无)" >> "$INCR/ledger.txt"
-    LOG "KDRFT_DONE $N ${best:-REJECTED}"
-}
-# ptgate <训练器输出目录> [标签 gate]: ★生成侧改动的逐字节门★(10-06, 探针/采样改合批): 拿该目录的 ptrain.cfg 原样再跑一趟(只换 out=<目录>_<标签>,
-#   probe_base 另起一份让部署态也重算), 然后 diff probe_e00.txt / sample_e00.txt —— 温 0 探针与按份种子的采样都必须逐字节同(构造上同一批核, 差一字节 = bug),
-#   再打两趟各自的探针/采样用时。只对 epochs=0 的目录有意义(第 0 步就是产物); 不动 current、不写账本。
-#   第 3 参 k=v,...(可选)追加进配置: 例 probe_batch=1,sample_batch=1 = 全 1 路(必须逐字节同), sample_batch=8 = 采样 8 路(分布级同, 看用时)。
+# ptgate <训练器输出目录(含 ptrain.cfg, epochs=0)> [标签] [k=v]: ★生成侧改动的逐字节门★ —— 同配置再跑一趟, probe_e00.txt 与原目录逐字节比(温 0 探针 1 路一批与单请求路同轨)
 stage_ptgate(){
     local SRC="${1:?训练器输出目录(含 ptrain.cfg, epochs=0)}" TAG="${2:-gate}" EXTRA="${3:-}" OUT="${1%/}_${2:-gate}" f
     [ -s "$SRC/ptrain.cfg" ] && [ -s "$SRC/probe_e00.txt" ] || DIE "ptgate: $SRC 缺 ptrain.cfg 或 probe_e00.txt"
     grep -q '^epochs=0' "$SRC/ptrain.cfg" || DIE "ptgate: 只对 epochs=0 的目录(第 0 步就是产物)"
     mkdir -p "$OUT"
-    grep -v '^out=\|^probe_base=' "$SRC/ptrain.cfg" > "$OUT/ptrain.cfg"
-    printf 'out=%s\nprobe_base=%s/probe_base.txt\n' "$OUT" "$OUT" >> "$OUT/ptrain.cfg"
+    grep -v '^out=' "$SRC/ptrain.cfg" > "$OUT/ptrain.cfg"
+    printf 'out=%s\n' "$OUT" >> "$OUT/ptrain.cfg"
     [ -z "$EXTRA" ] || tr ',' '\n' <<< "$EXTRA" >> "$OUT/ptrain.cfg"
     LOG "ptgate: 重跑 $SRC 的配置 → $OUT${EXTRA:+ (+ $EXTRA)}"
     kd_train_run "$OUT"
     local bad=0
-    for f in probe_e00.txt sample_e00.txt; do
+    for f in probe_e00.txt; do
         [ -s "$SRC/$f" ] || continue
         if cmp -s "$SRC/$f" "$OUT/$f"; then LOG "ptgate: $f 逐字节同($(wc -c < "$OUT/$f") B)"
         else bad=1; LOG "ptgate: ★$f 不同★ $(diff "$SRC/$f" "$OUT/$f" | grep -c '^[<>]') 行有差; 前 6 行差异:"; diff "$SRC/$f" "$OUT/$f" | head -6 | cut -c1-200 | tee -a "$LOGF"; fi
     done
-    LOG "ptgate 用时 旧: $(tr '\r' '\n' < "$SRC/train.out" | grep -a -E 'ptrain (探针|采样) e00\]' | sed -E 's/.*\] //' | tr '\n' ' ')"
-    LOG "ptgate 用时 新: $(tr '\r' '\n' < "$OUT/train.out" | grep -a -E 'ptrain (探针|采样) e00\]' | sed -E 's/.*\] //' | tr '\n' ' ')"
+    LOG "ptgate 用时 旧: $(tr '\r' '\n' < "$SRC/train.out" | grep -a -E 'ptrain 探针 e00\]' | sed -E 's/.*\] //' | tr '\n' ' ')"
+    LOG "ptgate 用时 新: $(tr '\r' '\n' < "$OUT/train.out" | grep -a -E 'ptrain 探针 e00\]' | sed -E 's/.*\] //' | tr '\n' ' ')"
     [ "$bad" = 0 ] && LOG "PTGATE_DONE 过门" || DIE "PTGATE 没过门(产物在 $OUT)"
 }
 
-# kdrft [轮数 3] [每题份数 8] [留出序号] [lr 1e-4] [锚 β 1] [k=v,...]; kdrft @序号 [同参] = 对已分配的序号续跑/重跑
-stage_kdrft(){
-    local A="${1:-}" N
-    if [ -n "$A" ] && [ "${A#@}" != "$A" ]; then N="${A#@}"; [ -d "$INCR/$N" ] || DIE "没有序号文件夹 $INCR/$N"; shift
-    else
-        N="$(kd_seq_next)"; mkdir -p "$INCR/$N/rft"
-        printf '奖励回路\n时间 %s\n起点 %s\n' "$(date '+%F %T')" "$(readlink -f "$INCR/current" 2>/dev/null || echo 无)" > "$INCR/$N/source.txt"
-    fi
-    LOG "进度: 本次 = 第 $N 次(奖励回路, SEQ=$(cat "$INCR/SEQ")), 起点 = current"
-    kd_rft_run "$N" "${1:-3}" "${2:-8}" "${3:-}" "${4:-1e-4}" "${5:-1}" "${6:-}"
+# ptcheck <训练器输出目录> <k=v,...> [标签 check]: 拿该目录的 ptrain.cfg 原样再跑一趟、追加几项(只换 out=<目录>_<标签>), 打检查/计时行。
+#   训练器自带的检查与计时都靠配置键开: packcheck=1 / gradcheck=2 / max_steps=N,prof=1(计时) —— 不动原目录。
+stage_ptcheck(){
+    local SRC="${1:?训练器输出目录(含 ptrain.cfg)}" EXTRA="${2:?追加的 k=v,...}" TAG="${3:-check}" OUT
+    OUT="${1%/}_${TAG}"
+    [ -s "$SRC/ptrain.cfg" ] || DIE "ptcheck: $SRC 缺 ptrain.cfg"
+    mkdir -p "$OUT"
+    grep -v '^out=' "$SRC/ptrain.cfg" > "$OUT/ptrain.cfg"
+    printf 'out=%s\n' "$OUT" >> "$OUT/ptrain.cfg"
+    tr ',' '\n' <<< "$EXTRA" >> "$OUT/ptrain.cfg"
+    LOG "ptcheck: $SRC + $EXTRA → $OUT"
+    kd_train_run "$OUT"
+    tr '\r' '\n' < "$OUT/train.out" | grep -aE "packcheck|梯度检查|ptrain prof 终|max_steps=.*到了|训练料" | tee -a "$LOGF"
+    LOG "PTCHECK_DONE $OUT"
 }
 
 case "${1:-all}" in
@@ -3112,16 +2417,11 @@ case "${1:-all}" in
   dkspeed) stage_dkspeed "${2:-}" "${3:-}" "${4:-3}" "${5:-1024}" "${6:-}";;
   dkloop)  stage_dkloop "${2:-}" "${3:-}" "${4:-3}" "${5:-4096}";;
   dkab)    stage_dkab "${2:-}" "${3:-}" "${4:-512}";;
-  kdinc)   stage_kdinc "${2:-}" "${3:-}" "${4:-}" "${5:-}";;
-  kdrft)   stage_kdrft "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}" "${8:-}";;
   ptgate)  stage_ptgate "${2:-}" "${3:-}" "${4:-}";;
-  kdpool)  stage_kdpool;;
-  kdtake)  stage_kdtake "${2:-}";;
-  kdscore) stage_kdscore "${2:-}" "${3:-}" "${4:-}";;
-  kdfwd)   stage_kdfwd "${2:-}" "${3:-}" "${4:-}";;
-  kdledger) stage_kdledger "${2:-}";;
-  kdgen)   stage_kdgen "${2:-}" "${3:-}" "${4:-}" "${5:-}";;
-  kdtrain) stage_kdtrain "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}" "${8:-}";;
+  gen)     stage_gen "${2:-}" "${3:-}" "${4:-}";;
+  gensplit) stage_gensplit "${2:-}";;
+  train)   stage_train "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}";;
+  ptcheck) stage_ptcheck "${2:-}" "${3:-}" "${4:-}";;
   docflip) stage_docflip "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}";;
   docnll)  stage_docnll "${2:-}" "${3:-}" "${4:-}" "${5:-}";;
   doc3)    stage_doc3 "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}";;
@@ -3135,11 +2435,7 @@ case "${1:-all}" in
   review)  stage_review "${2:-}" "${3:-}" "${4:-}" "${5:-}";;
   reviewrun) stage_reviewrun "${2:-}" "${3:-}" "${4:-}" "${5:-}";;
   kdpick)  stage_kdpick "${2:-}";;
-  kdtable) kd_diag_table "${2:-}";;   # 只重打逐轮对照表(kdrun 在 kdpick 停车后补跑 kddiag 时用)
-  kdrun)   stage_kdrun "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}" "${8:-}";;
-  kdeval)  shift; stage_kdeval "$@";;
-  kdsplit) stage_kdsplit "${2:-}";;
-  kddiag)  stage_kddiag "${2:-}" "${3:-}" "${4:-}" "${5:-}";;
+  kddiag)  stage_kddiag "${2:-}" "${3:-}";;
   kdprof)  stage_kdprof "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}";;
   samples) stage_samples "${2:-}";;
   split)   stage_split;;
