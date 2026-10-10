@@ -63,28 +63,32 @@ void json_escape_fragment_n(buf *b, const char *s, size_t n) {
     }
 }
 
-const char *find_any_tool_start(const char *s) {
+/* 所有 DSML 写法里最早出现的块起点。need_sep: 只认前面紧跟 "\n\n" 的(模板在正文与工具块之间写的分隔),
+ * 命中时返回指向 "\n\n" —— raw_dsml 要带着它, 重放时才与采样出的字节一致。 */
+static const char *find_tool_block(const char *s, bool need_sep, const dsml_syntax **syn_out) {
     const char *best = NULL;
-    const char *candidates[] = {
-        strstr(s, DS4_TOOL_CALLS_START),
-        strstr(s, DS4_TOOL_CALLS_START_SHORT),
-        strstr(s, "<tool_calls>"),
-    };
-    for (size_t i = 0; i < sizeof(candidates)/sizeof(candidates[0]); i++) {
-        if (candidates[i] && (!best || candidates[i] < best)) best = candidates[i];
+    for (int i = 0; i < DSML_SYN_COUNT; i++) {
+        const char *p = strstr(s, dsml_syntaxes[i].tool_calls_start);
+        while (p && need_sep && !(p - s >= 2 && p[-1] == '\n' && p[-2] == '\n'))
+            p = strstr(p + 1, dsml_syntaxes[i].tool_calls_start);
+        if (p && need_sep) p -= 2;
+        if (p && (!best || p < best)) {
+            best = p;
+            if (syn_out) *syn_out = &dsml_syntaxes[i];
+        }
     }
     return best;
 }
 
+const char *find_any_tool_start(const char *s) {
+    return find_tool_block(s, false, NULL);
+}
+
 static const char *find_any_tool_end(const char *s) {
     const char *best = NULL;
-    const char *candidates[] = {
-        strstr(s, DS4_TOOL_CALLS_END),
-        strstr(s, DS4_TOOL_CALLS_END_SHORT),
-        strstr(s, "</tool_calls>"),
-    };
-    for (size_t i = 0; i < sizeof(candidates)/sizeof(candidates[0]); i++) {
-        if (candidates[i] && (!best || candidates[i] < best)) best = candidates[i];
+    for (int i = 0; i < DSML_SYN_COUNT; i++) {
+        const char *p = strstr(s, dsml_syntaxes[i].tool_calls_end);
+        if (p && (!best || p < best)) best = p;
     }
     return best;
 }
@@ -196,8 +200,8 @@ static void tool_call_json_args_add(buf *args, const char *name, const char *val
  * reject or repair the call, which is much better than aborting the assistant
  * turn and losing the whole sampled continuation.
  */
-static bool dsml_parse_leaf_param_json(const char **p_in, const char *param_start,
-                                       const char *param_end, buf *out) {
+static bool dsml_parse_leaf_param_json(const char **p_in, const dsml_syntax *syn, buf *out) {
+    const char *param_start = syn->param_start, *param_end = syn->param_end;
     const char *p = *p_in;
     if (strncmp(p, param_start, strlen(param_start)) != 0) return false;
     const char *tag_end = strchr(p, '>');
@@ -223,7 +227,7 @@ static bool dsml_parse_leaf_param_json(const char **p_in, const char *param_star
     char *raw_value = xstrndup(value_start, (size_t)(value_end - value_start));
     const char *type = is_string ? is_string : "true";
     char *value = !strcmp(type, "true") ?
-        dsml_unescape_text(raw_value) : xstrdup(raw_value);
+        dsml_value_unescape(syn, raw_value) : xstrdup(raw_value);
     tool_call_json_args_add(out, name, value, type);
 
     free(name);
@@ -234,18 +238,15 @@ static bool dsml_parse_leaf_param_json(const char **p_in, const char *param_star
     return true;
 }
 
-static bool dsml_parse_nested_params_object(const char **p_in,
-                                            const char *param_start,
-                                            const char *param_end,
-                                            buf *out) {
+static bool dsml_parse_nested_params_object(const char **p_in, const dsml_syntax *syn, buf *out) {
     const char *p = *p_in;
     buf members = {0};
     bool any = false;
 
     for (;;) {
         p = skip_ascii_ws(p);
-        if (strncmp(p, param_start, strlen(param_start)) != 0) break;
-        if (!dsml_parse_leaf_param_json(&p, param_start, param_end, &members)) {
+        if (strncmp(p, syn->param_start, strlen(syn->param_start)) != 0) break;
+        if (!dsml_parse_leaf_param_json(&p, syn, &members)) {
             ds4_buf_free(&members);
             return false;
         }
@@ -314,25 +315,10 @@ bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
         tool_search = think_end + 8;
     }
 
-    const char *start = strstr(tool_search, "\n\n" DS4_TOOL_CALLS_START);
-    int style = 0; /* 0: DSML, 1: plain XML, 2: DSML with the first vertical bar omitted. */
-    if (!start) start = strstr(tool_search, DS4_TOOL_CALLS_START);
-    if (!start) {
-        start = strstr(tool_search, "\n\n" DS4_TOOL_CALLS_START_SHORT);
-        style = start ? 2 : style;
-    }
-    if (!start) {
-        start = strstr(tool_search, DS4_TOOL_CALLS_START_SHORT);
-        style = start ? 2 : style;
-    }
-    if (!start) {
-        start = strstr(tool_search, "\n\n<tool_calls>");
-        style = start ? 1 : style;
-    }
-    if (!start) {
-        start = strstr(tool_search, "<tool_calls>");
-        style = start ? 1 : style;
-    }
+    /* 先找模板里那种带 "\n\n" 分隔的块, 找不到再退到裸标记: 正文中途引用一个标签不该截走后面真正的工具块 */
+    const dsml_syntax *syn = NULL;
+    const char *start = find_tool_block(tool_search, true, &syn);
+    if (!start) start = find_tool_block(tool_search, false, &syn);
     if (!start) {
         split_reasoning_content(text, strlen(text), content_out, reasoning_out);
         return true;
@@ -340,27 +326,12 @@ bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
 
     size_t content_len = trim_tool_separator_ws(text, 0, (size_t)(start - text));
     const char *raw_block_start = start;
-    const char *tool_calls_start = DS4_TOOL_CALLS_START;
-    const char *tool_calls_end = DS4_TOOL_CALLS_END;
-    const char *invoke_start = DS4_INVOKE_START;
-    const char *invoke_end = DS4_INVOKE_END;
-    const char *param_start = DS4_PARAM_START;
-    const char *param_end = DS4_PARAM_END;
-    if (style == 1) {
-        tool_calls_start = "<tool_calls>";
-        tool_calls_end = "</tool_calls>";
-        invoke_start = "<invoke";
-        invoke_end = "</invoke>";
-        param_start = "<parameter";
-        param_end = "</parameter>";
-    } else if (style == 2) {
-        tool_calls_start = DS4_TOOL_CALLS_START_SHORT;
-        tool_calls_end = DS4_TOOL_CALLS_END_SHORT;
-        invoke_start = DS4_INVOKE_START_SHORT;
-        invoke_end = DS4_INVOKE_END_SHORT;
-        param_start = DS4_PARAM_START_SHORT;
-        param_end = DS4_PARAM_END_SHORT;
-    }
+    const char *tool_calls_start = syn->tool_calls_start;
+    const char *tool_calls_end = syn->tool_calls_end;
+    const char *invoke_start = syn->invoke_start;
+    const char *invoke_end = syn->invoke_end;
+    const char *param_start = syn->param_start;
+    const char *param_end = syn->param_end;
 
     const char *p = strstr(start, tool_calls_start);
     if (!p) return false;
@@ -419,8 +390,7 @@ bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
             {
                 buf nested = {0};
                 const char *nested_p = value_start;
-                if (!dsml_parse_nested_params_object(&nested_p, param_start,
-                                                     param_end, &nested)) {
+                if (!dsml_parse_nested_params_object(&nested_p, syn, &nested)) {
                     free(name);
                     free(param_name);
                     ds4_buf_free(&nested);
@@ -449,7 +419,7 @@ bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
             char *raw_value = xstrndup(value_start, (size_t)(value_end - value_start));
             const char *type = param_is_string ? param_is_string : "true";
             char *value = !strcmp(type, "true") ?
-                dsml_unescape_text(raw_value) : xstrdup(raw_value);
+                dsml_value_unescape(syn, raw_value) : xstrdup(raw_value);
             tool_call_json_args_add(&args, param_name, value, type);
             free(param_name);
             free(param_is_string);

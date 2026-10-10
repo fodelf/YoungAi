@@ -19,14 +19,6 @@ static void json_args_push(json_args *args, json_arg arg) {
     args->v[args->len++] = arg;
 }
 
-static int json_args_find_unused(json_args *args, const char *key) {
-    if (!key) return -1;
-    for (int i = 0; i < args->len; i++) {
-        if (!args->v[i].used && args->v[i].key && !strcmp(args->v[i].key, key)) return i;
-    }
-    return -1;
-}
-
 static bool json_args_parse(const char *json, json_args *args) {
     const char *p = json ? json : "";
     json_ws(&p);
@@ -82,8 +74,8 @@ static void append_dsml_attr_escaped(buf *b, const char *s) {
     }
 }
 
-static void append_dsml_parameter_text(buf *b, const char *s) {
-    const char *end = "</｜DSML｜parameter>";
+static void append_dsml_parameter_text(buf *b, const dsml_syntax *syn, const char *s) {
+    const char *end = syn->param_end;
     const size_t endlen = strlen(end);
     for (s = s ? s : ""; *s;) {
         if (!strncmp(s, end, endlen)) {
@@ -113,8 +105,8 @@ void append_tool_result_text(buf *b, const char *s) {
     }
 }
 
-static void append_dsml_json_literal(buf *b, const char *s) {
-    const char *end = "</｜DSML｜parameter>";
+static void append_dsml_json_literal(buf *b, const dsml_syntax *syn, const char *s) {
+    const char *end = syn->param_end;
     const size_t endlen = strlen(end);
     for (s = s ? s : ""; *s;) {
         if (!strncmp(s, end, endlen)) {
@@ -126,34 +118,36 @@ static void append_dsml_json_literal(buf *b, const char *s) {
     }
 }
 
-static void append_dsml_arg(buf *b, const json_arg *arg) {
-    ds4_buf_puts(b, "<｜DSML｜parameter name=\"");
+static void append_dsml_arg(buf *b, const dsml_syntax *syn, const json_arg *arg) {
+    ds4_buf_puts(b, syn->param_start);
+    ds4_buf_puts(b, " name=\"");
     append_dsml_attr_escaped(b, arg->key);
     ds4_buf_puts(b, "\" string=\"");
     ds4_buf_puts(b, arg->is_string ? "true" : "false");
     ds4_buf_puts(b, "\">");
-    if (arg->is_string) append_dsml_parameter_text(b, arg->value);
-    else append_dsml_json_literal(b, arg->value);
-    ds4_buf_puts(b, "</｜DSML｜parameter>\n");
+    if (arg->is_string) {
+        append_dsml_parameter_text(b, syn, arg->value);
+    } else if (syn->entity_values) {
+        append_dsml_json_literal(b, syn, arg->value);
+    } else {   /* 官方 encoding.py 非字符串值走 json.dumps, 见 json_pyfmt_raw_value */
+        char *py = json_pyfmt_raw_value(arg->value);
+        append_dsml_json_literal(b, syn, py);
+        free(py);
+    }
+    ds4_buf_puts(b, syn->param_end);
 }
 
-bool append_dsml_arguments_from_json(buf *b, const char *json, const tool_schema_order *order) {
+/* 参数之间用 "\n" 连接, 末尾不带。返回写了几个参数; arguments 不是 JSON 对象返回 -1(调用方退回单个文本参数)。 */
+static int append_dsml_arguments_from_json(buf *b, const dsml_syntax *syn, const char *json) {
     json_args args = {0};
-    if (!json_args_parse(json, &args)) return false;
-    if (order) {
-        for (int i = 0; i < order->len; i++) {
-            int idx = json_args_find_unused(&args, order->prop[i]);
-            if (idx < 0) continue;
-            append_dsml_arg(b, &args.v[idx]);
-            args.v[idx].used = true;
-        }
-    }
+    if (!json_args_parse(json, &args)) return -1;
     for (int i = 0; i < args.len; i++) {
-        if (args.v[i].used) continue;
-        append_dsml_arg(b, &args.v[i]);
+        if (i) ds4_buf_putc(b, '\n');
+        append_dsml_arg(b, syn, &args.v[i]);
     }
+    const int n = args.len;
     json_args_free(&args);
-    return true;
+    return n;
 }
 
 static void append_json_arg_pair(buf *b, const json_arg *arg) {
@@ -186,20 +180,35 @@ void append_dsml_tool_calls_text(buf *b, const tool_calls *calls) {
         ds4_buf_puts(b, calls->raw_dsml);
         return;
     }
-    ds4_buf_puts(b, "\n\n<｜DSML｜tool_calls>\n");
+    /* 两代模板的换行位置不同, 各照各的官方字节:
+     *   旧:   每个参数、每个 invoke 后都跟 "\n"
+     *   带空格: 官方 encoding.py 的 "\n".join —— 参数间、invoke 间才有 "\n", 块尾 "\n</calls>" */
+    const dsml_syntax *syn = dsml_render_syntax();
+    const bool joined = syn == &dsml_syntaxes[DSML_SYN_SPACED];
+    ds4_buf_puts(b, "\n\n");
+    ds4_buf_puts(b, syn->tool_calls_start);
+    ds4_buf_putc(b, '\n');
     for (int i = 0; i < calls->len; i++) {
         const tool_call *tc = &calls->v[i];
-        ds4_buf_puts(b, "<｜DSML｜invoke name=\"");
+        if (joined && i) ds4_buf_putc(b, '\n');
+        ds4_buf_puts(b, syn->invoke_start);
+        ds4_buf_puts(b, " name=\"");
         append_dsml_attr_escaped(b, tc->name);
         ds4_buf_puts(b, "\">\n");
-        if (!append_dsml_arguments_from_json(b, tc->arguments, NULL)) {
-            ds4_buf_puts(b, "<｜DSML｜parameter name=\"arguments\" string=\"true\">");
-            append_dsml_parameter_text(b, tc->arguments);
-            ds4_buf_puts(b, "</｜DSML｜parameter>\n");
+        int n = append_dsml_arguments_from_json(b, syn, tc->arguments);
+        if (n < 0) {
+            ds4_buf_puts(b, syn->param_start);
+            ds4_buf_puts(b, " name=\"arguments\" string=\"true\">");
+            append_dsml_parameter_text(b, syn, tc->arguments);
+            ds4_buf_puts(b, syn->param_end);
+            n = 1;
         }
-        ds4_buf_puts(b, "</｜DSML｜invoke>\n");
+        if (joined || n > 0) ds4_buf_putc(b, '\n');
+        ds4_buf_puts(b, syn->invoke_end);
+        if (!joined) ds4_buf_putc(b, '\n');
     }
-    ds4_buf_puts(b, "</｜DSML｜tool_calls>");
+    if (joined) ds4_buf_putc(b, '\n');
+    ds4_buf_puts(b, syn->tool_calls_end);
 }
 
 bool role_is_system(const char *role) {
@@ -352,19 +361,24 @@ char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
         return render_chat_prompt_base_native(msgs, tool_schemas, conv_off);
     const bool think = ds4_think_mode_enabled(think_mode);
     const bool tool_context = chat_history_uses_tool_context(msgs, tool_schemas);
+    const bool has_schemas = tool_schemas && tool_schemas[0];
+    /* 带空格 DSML 那一代(官方 encoding.py, 金标 test_render_matches_official_spaced_dsml_tools):
+     *   ① 工具说明接在 system 正文之后("\n\n" 隔开), 不在之前;
+     *   ② tool 消息并进 user 轮, 相邻的 user 侧块(工具结果/用户文本)共用一个 <｜User｜>, 块间 "\n\n"。
+     * 旧代保持原字节(工具说明在前是为了 --kv-cache-boundary-trim-tokens 只裁客户端 system 尾巴)。 */
+    const bool official_order = dsml_render_syntax() == &dsml_syntaxes[DSML_SYN_SPACED];
     int last_user_idx = -1;
     buf system = {0};
-    /* Render tool schemas before the client system content so
-     * --kv-cache-boundary-trim-tokens chops a dynamic tail from the client
-     * message instead of the much larger tool-schema region. */
-    if (tool_schemas && tool_schemas[0]) {
-        append_tools_prompt_text(&system, tool_schemas);
-    }
+    if (has_schemas && !official_order) append_tools_prompt_text(&system, tool_schemas);
     for (int i = 0; i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         if (!role_is_system(m->role)) continue;
         if (system.len) ds4_buf_puts(&system, "\n\n");
         ds4_buf_puts(&system, m->content ? m->content : "");
+    }
+    if (has_schemas && official_order) {
+        if (system.len) ds4_buf_puts(&system, "\n\n");
+        append_tools_prompt_text(&system, tool_schemas);
     }
     for (int i = 0; i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
@@ -389,12 +403,13 @@ char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
         if (role_is_system(m->role)) {
             continue;
         } else if (!strcmp(m->role, "user")) {
-            ds4_buf_puts(&out, "<｜User｜>");
+            ds4_buf_puts(&out, official_order && pending_assistant ? "\n\n" : "<｜User｜>");
             ds4_buf_puts(&out, m->content ? m->content : "");
             pending_assistant = true;
             pending_tool_result = false;
         } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
-            if (!pending_tool_result) ds4_buf_puts(&out, "<｜User｜>");
+            if (official_order && pending_assistant) ds4_buf_puts(&out, "\n\n");
+            else if (!pending_tool_result) ds4_buf_puts(&out, "<｜User｜>");
             ds4_buf_puts(&out, "<tool_result>");
             append_tool_result_text(&out, m->content);
             ds4_buf_puts(&out, "</tool_result>");

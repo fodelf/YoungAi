@@ -290,6 +290,20 @@ typedef struct {
 
 #define DS4_PARAM_END_SHORT "</" DS4_DSML_SHORT "parameter>"
 
+/* 带 <｜System｜> 的 tokenizer 那一代(官方 encoding.py)改了标签名: 块名 " calls", 标签名前都有一个空格。
+ * 模型只在这种写法上训练过 —— 拿旧写法的提示词教它, 它写到一半就漂成 <parameter>, 整个工具调用解析失败。 */
+#define DS4_TOOL_CALLS_START_SPACED "<" DS4_DSML " calls>"
+
+#define DS4_TOOL_CALLS_END_SPACED "</" DS4_DSML " calls>"
+
+#define DS4_INVOKE_START_SPACED "<" DS4_DSML " invoke"
+
+#define DS4_INVOKE_END_SPACED "</" DS4_DSML " invoke>"
+
+#define DS4_PARAM_START_SPACED "<" DS4_DSML " parameter"
+
+#define DS4_PARAM_END_SPACED "</" DS4_DSML " parameter>"
+
 /* Streaming is a translation state machine over the raw DS4 text.  The model
  * may produce <think> and DSML tool blocks; clients should receive those as
  * protocol-native reasoning/tool deltas, never as visible assistant text. */

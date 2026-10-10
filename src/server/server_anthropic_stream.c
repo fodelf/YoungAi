@@ -64,7 +64,7 @@ static bool anthropic_tool_stream_update(int fd, server *s, const char *id,
             }
             size_t limit = tool_param_value_stream_safe_len(raw, ts->parse_pos,
                                                             raw_len,
-                                                            ts->syn->param_end,
+                                                            ts->syn,
                                                             ts->param_is_string);
             if (limit > ts->parse_pos) {
                 bool ok = ts->param_is_string ?

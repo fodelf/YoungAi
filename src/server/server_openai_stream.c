@@ -149,7 +149,7 @@ static bool openai_tool_emit_string_value(int fd, const request *r, const char *
                                           const char *text, size_t len) {
     if (len == 0) return true;
     char *raw = xstrndup(text, len);
-    char *unescaped = dsml_unescape_text(raw);
+    char *unescaped = dsml_value_unescape(ts->syn, raw);
     buf frag = {0};
     json_escape_fragment_n(&frag, unescaped, strlen(unescaped));
     bool ok = openai_tool_emit_args_fragment(fd, r, id, ts, frag.ptr ? frag.ptr : "", frag.len);
@@ -179,34 +179,16 @@ static bool openai_tool_stream_init(openai_tool_stream *ts, const char *raw,
     memset(ts, 0, sizeof(*ts));
     ts->active = true;
     ts->state = DSML_TOOL_BETWEEN_INVOKES;
-    ts->parse_pos = pos;
-    if (raw_full_lit(raw, raw_len, pos, DS4_TOOL_CALLS_START)) {
-        ts->parse_pos += strlen(DS4_TOOL_CALLS_START);
-        ts->tool_calls_end = DS4_TOOL_CALLS_END;
-        ts->invoke_start = DS4_INVOKE_START;
-        ts->invoke_end = DS4_INVOKE_END;
-        ts->param_start = DS4_PARAM_START;
-        ts->param_end = DS4_PARAM_END;
-    } else if (raw_full_lit(raw, raw_len, pos, DS4_TOOL_CALLS_START_SHORT)) {
-        ts->parse_pos += strlen(DS4_TOOL_CALLS_START_SHORT);
-        ts->tool_calls_end = DS4_TOOL_CALLS_END_SHORT;
-        ts->invoke_start = DS4_INVOKE_START_SHORT;
-        ts->invoke_end = DS4_INVOKE_END_SHORT;
-        ts->param_start = DS4_PARAM_START_SHORT;
-        ts->param_end = DS4_PARAM_END_SHORT;
-    } else if (raw_full_lit(raw, raw_len, pos, "<tool_calls>")) {
-        ts->parse_pos += strlen("<tool_calls>");
-        ts->tool_calls_end = "</tool_calls>";
-        ts->invoke_start = "<invoke";
-        ts->invoke_end = "</invoke>";
-        ts->param_start = "<parameter";
-        ts->param_end = "</parameter>";
-    } else {
-        ts->active = false;
-        ts->state = DSML_TOOL_ERROR;
-        return false;
+    for (int i = 0; i < DSML_SYN_COUNT; i++) {
+        if (raw_full_lit(raw, raw_len, pos, dsml_syntaxes[i].tool_calls_start)) {
+            ts->syn = &dsml_syntaxes[i];
+            ts->parse_pos = pos + strlen(ts->syn->tool_calls_start);
+            return true;
+        }
     }
-    return true;
+    ts->active = false;
+    ts->state = DSML_TOOL_ERROR;
+    return false;
 }
 
 static bool openai_tool_stream_fail(openai_tool_stream *ts) {
@@ -278,7 +260,7 @@ static bool openai_tool_finish_param(int fd, const request *r, const char *id,
     }
     if (ts->param_is_string &&
         !openai_tool_emit_args_fragment(fd, r, id, ts, "\"", 1)) return false;
-    ts->parse_pos = value_end + strlen(ts->param_end);
+    ts->parse_pos = value_end + strlen(ts->syn->param_end);
     ts->state = DSML_TOOL_BETWEEN_PARAMS;
     return true;
 }
@@ -290,14 +272,14 @@ static bool openai_tool_stream_update(int fd, server *s, const request *r, const
         if (ts->state == DSML_TOOL_BETWEEN_INVOKES) {
             while (ts->parse_pos < raw_len && isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
             if (ts->parse_pos >= raw_len) return true;
-            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->tool_calls_end)) {
-                ts->parse_pos += strlen(ts->tool_calls_end);
+            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->syn->tool_calls_end)) {
+                ts->parse_pos += strlen(ts->syn->tool_calls_end);
                 ts->active = false;
                 ts->state = DSML_TOOL_DONE;
                 return true;
             }
-            if (raw_partial_any(raw, raw_len, ts->parse_pos, ts->tool_calls_end, ts->invoke_start)) return true;
-            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->invoke_start)) {
+            if (raw_partial_any(raw, raw_len, ts->parse_pos, ts->syn->tool_calls_end, ts->syn->invoke_start)) return true;
+            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->syn->invoke_start)) {
                 size_t before_pos = ts->parse_pos;
                 dsml_tool_stream_state before_state = ts->state;
                 if (!openai_tool_start_invoke(fd, s, r, id, ts, raw, raw_len)) return false;
@@ -310,17 +292,17 @@ static bool openai_tool_stream_update(int fd, server *s, const request *r, const
         if (ts->state == DSML_TOOL_BETWEEN_PARAMS) {
             while (ts->parse_pos < raw_len && isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
             if (ts->parse_pos >= raw_len) return true;
-            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->invoke_end)) {
+            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->syn->invoke_end)) {
                 if (ts->args_open &&
                     !openai_tool_emit_args_fragment(fd, r, id, ts, "}", 1)) return false;
                 ts->args_open = false;
-                ts->parse_pos += strlen(ts->invoke_end);
+                ts->parse_pos += strlen(ts->syn->invoke_end);
                 ts->index++;
                 ts->state = DSML_TOOL_BETWEEN_INVOKES;
                 continue;
             }
-            if (raw_partial_any(raw, raw_len, ts->parse_pos, ts->invoke_end, ts->param_start)) return true;
-            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->param_start)) {
+            if (raw_partial_any(raw, raw_len, ts->parse_pos, ts->syn->invoke_end, ts->syn->param_start)) return true;
+            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->syn->param_start)) {
                 size_t before_pos = ts->parse_pos;
                 dsml_tool_stream_state before_state = ts->state;
                 if (!openai_tool_start_param(fd, r, id, ts, raw, raw_len)) return false;
@@ -333,14 +315,14 @@ static bool openai_tool_stream_update(int fd, server *s, const request *r, const
         if (ts->state == DSML_TOOL_PARAM_VALUE) {
             const char *end = find_lit_bounded(raw + ts->parse_pos,
                                                raw_len - ts->parse_pos,
-                                               ts->param_end);
+                                               ts->syn->param_end);
             if (end) {
                 if (!openai_tool_finish_param(fd, r, id, ts, raw,
                                               (size_t)(end - raw))) return false;
                 continue;
             }
             size_t limit = tool_param_value_stream_safe_len(raw, ts->parse_pos,
-                                                            raw_len, ts->param_end,
+                                                            raw_len, ts->syn,
                                                             ts->param_is_string);
             if (limit > ts->parse_pos) {
                 bool ok = ts->param_is_string ?

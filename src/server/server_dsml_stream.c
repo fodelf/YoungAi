@@ -2,23 +2,52 @@
 
 #include "server_internal.h"
 
-const dsml_syntax dsml_syntaxes[] = {
-    {
+const dsml_syntax dsml_syntaxes[DSML_SYN_COUNT] = {
+    [DSML_SYN_LONG] = {
         DS4_TOOL_CALLS_START, DS4_TOOL_CALLS_END,
         DS4_INVOKE_START, DS4_INVOKE_END,
-        DS4_PARAM_START, DS4_PARAM_END,
+        DS4_PARAM_START, DS4_PARAM_END, true,
     },
-    {
+    [DSML_SYN_SHORT] = {
         DS4_TOOL_CALLS_START_SHORT, DS4_TOOL_CALLS_END_SHORT,
         DS4_INVOKE_START_SHORT, DS4_INVOKE_END_SHORT,
-        DS4_PARAM_START_SHORT, DS4_PARAM_END_SHORT,
+        DS4_PARAM_START_SHORT, DS4_PARAM_END_SHORT, true,
     },
-    {
+    [DSML_SYN_PLAIN] = {
         "<tool_calls>", "</tool_calls>",
         "<invoke", "</invoke>",
-        "<parameter", "</parameter>",
+        "<parameter", "</parameter>", true,
+    },
+    [DSML_SYN_SPACED] = {
+        DS4_TOOL_CALLS_START_SPACED, DS4_TOOL_CALLS_END_SPACED,
+        DS4_INVOKE_START_SPACED, DS4_INVOKE_END_SPACED,
+        DS4_PARAM_START_SPACED, DS4_PARAM_END_SPACED, false,
     },
 };
+
+/* 渲染(工具说明/历史工具调用)用哪种写法。GGUF 里没有 chat template, tokenizer 能看出编码代际的
+ * 唯一标记是 <｜System｜>: 官方 encoding.py 加它的同一版把 DSML 标签改成了带空格的 " calls"/" invoke"/" parameter"。
+ * 写错代际的代价见 server_types.h DS4_TOOL_CALLS_START_SPACED 处。单测里 ds4_chat_set_system_token 切换两态。 */
+const dsml_syntax *dsml_render_syntax(void) {
+    return &dsml_syntaxes[ds4_chat_system_token()[0] ? DSML_SYN_SPACED : DSML_SYN_LONG];
+}
+
+/* string 值从 DSML 文本还原成真值。实体写法(旧格式)全反转义; 原样写法只还原渲染侧为闭合标签加的
+ * 那一个 "&lt;"(append_dsml_parameter_text), 其余字节不动 —— 值里本来就有的 "&lt;" 必须原样交给客户端。 */
+char *dsml_value_unescape(const dsml_syntax *syn, const char *s) {
+    if (syn->entity_values) return dsml_unescape_text(s);
+    buf b = {0};
+    const char *end = syn->param_end;
+    for (s = s ? s : ""; *s;) {
+        if (!strncmp(s, "&lt;", 4) && !strncmp(s + 4, end + 1, strlen(end + 1))) {
+            ds4_buf_putc(&b, '<');
+            s += 4;
+        } else {
+            ds4_buf_putc(&b, *s++);
+        }
+    }
+    return ds4_buf_take(&b);
+}
 
 static bool raw_partial_lit_min(const char *raw, size_t raw_len, size_t pos,
                                 const char *lit, size_t min_len) {
@@ -352,17 +381,25 @@ structural:
     }
 }
 
-static size_t dsml_entity_stream_safe_len(const char *raw, size_t start, size_t limit) {
+/* 流式 string 值按块反转义: 块尾若停在一个转义序列的前半截, 先扣住不发, 否则客户端收到半截 "&l"。
+ * 原样写法唯一的转义序列是 "&lt;" + 闭合标签剩余部分(dsml_value_unescape)。 */
+static size_t dsml_entity_stream_safe_len(const dsml_syntax *syn, const char *raw,
+                                          size_t start, size_t limit) {
     static const char *ents[] = {"&amp;", "&lt;", "&gt;", "&quot;", "&apos;"};
-    const size_t max_ent = 6;
+    char sentinel[64];
+    snprintf(sentinel, sizeof(sentinel), "&lt;%s", syn->param_end + 1);
+    const char *raw_ents[] = {sentinel};
+    const char **list = syn->entity_values ? ents : raw_ents;
+    const size_t n = syn->entity_values ? sizeof(ents) / sizeof(ents[0]) : 1;
+    const size_t max_ent = syn->entity_values ? 6 : strlen(sentinel);
     size_t scan = limit > start + max_ent ? limit - max_ent : start;
     for (size_t i = limit; i > scan; i--) {
         if (raw[i - 1] != '&') continue;
         size_t amp = i - 1;
         size_t tail = limit - amp;
-        for (size_t ei = 0; ei < sizeof(ents) / sizeof(ents[0]); ei++) {
-            size_t elen = strlen(ents[ei]);
-            if (tail < elen && !memcmp(raw + amp, ents[ei], tail)) return amp;
+        for (size_t ei = 0; ei < n; ei++) {
+            size_t elen = strlen(list[ei]);
+            if (tail < elen && !memcmp(raw + amp, list[ei], tail)) return amp;
         }
         break;
     }
@@ -370,8 +407,9 @@ static size_t dsml_entity_stream_safe_len(const char *raw, size_t start, size_t 
 }
 
 size_t tool_param_value_stream_safe_len(const char *raw, size_t start,
-                                               size_t raw_len, const char *param_end,
+                                               size_t raw_len, const dsml_syntax *syn,
                                                bool is_string) {
+    const char *param_end = syn->param_end;
     size_t limit = raw_len;
     size_t end_len = strlen(param_end);
     size_t scan = raw_len > start + end_len ? raw_len - end_len : start;
@@ -382,6 +420,6 @@ size_t tool_param_value_stream_safe_len(const char *raw, size_t start,
         if (tail < end_len && !memcmp(raw + marker, param_end, tail)) limit = marker;
         break;
     }
-    if (is_string) limit = dsml_entity_stream_safe_len(raw, start, limit);
+    if (is_string) limit = dsml_entity_stream_safe_len(syn, raw, start, limit);
     return utf8_stream_safe_len(raw, start, limit, false);
 }

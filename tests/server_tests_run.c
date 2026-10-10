@@ -16,6 +16,9 @@ void ds4_server_unit_tests_run(void) {
     test_api_thinking_controls_parse();
     test_render_think_max_prompt_prefix();
     test_render_matches_official_v41_encoding();
+    test_render_matches_official_spaced_dsml_tools();
+    test_parse_spaced_dsml_tool_calls();
+    test_openai_stream_spaced_dsml_tool_call();
     test_render_non_thinking_prompt_closes_think();
     test_render_drops_old_reasoning_without_tools();
     test_render_preserves_reasoning_with_tools();

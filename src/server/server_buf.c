@@ -87,6 +87,80 @@ char *json_minify_raw_value(const char *json) {
     return ds4_buf_take(&b);
 }
 
+/* Python json.dumps(ensure_ascii=False) 的字节形状: 分隔符 ", " 与 ": ", 字符串里非 ASCII 原样、只转义
+ * 引号/反斜杠/控制字符。带空格 DSML 那一代的官方 encoding.py 用它序列化工具 schema 和非字符串参数, 模型只见过
+ * 这种形状; 客户端的紧凑 JSON 原样塞进提示词 = 每条 schema 都是没训练过的写法。数字照客户端原样
+ * (Python 会把 1e5 改写成 100000.0, 这种少见形状不追)。 */
+static void pyjson_string(buf *b, const char *s) {
+    ds4_buf_putc(b, '"');
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c == '"' || c == '\\') { ds4_buf_putc(b, '\\'); ds4_buf_putc(b, (char)c); }
+        else if (c == '\n') ds4_buf_puts(b, "\\n");
+        else if (c == '\r') ds4_buf_puts(b, "\\r");
+        else if (c == '\t') ds4_buf_puts(b, "\\t");
+        else if (c == '\b') ds4_buf_puts(b, "\\b");
+        else if (c == '\f') ds4_buf_puts(b, "\\f");
+        else if (c < 0x20) ds4_buf_printf(b, "\\u%04x", c);
+        else ds4_buf_putc(b, (char)c);
+    }
+    ds4_buf_putc(b, '"');
+}
+
+static bool pyjson_value(const char **p, buf *b) {
+    json_ws(p);
+    if (**p == '"') {
+        char *s = NULL;
+        if (!json_string(p, &s)) return false;
+        pyjson_string(b, s);
+        free(s);
+        return true;
+    }
+    if (**p != '{' && **p != '[') {
+        const char *start = *p;
+        if (!json_skip_value(p)) return false;
+        ds4_buf_append(b, start, (size_t)(*p - start));
+        return true;
+    }
+    const bool obj = **p == '{';
+    const char close = obj ? '}' : ']';
+    ds4_buf_putc(b, **p);
+    (*p)++;
+    json_ws(p);
+    for (bool first = true; **p && **p != close; first = false) {
+        if (!first) ds4_buf_puts(b, ", ");
+        if (obj) {
+            char *k = NULL;
+            if (!json_string(p, &k)) return false;
+            pyjson_string(b, k);
+            free(k);
+            json_ws(p);
+            if (**p != ':') return false;
+            (*p)++;
+            ds4_buf_puts(b, ": ");
+        }
+        if (!pyjson_value(p, b)) return false;
+        json_ws(p);
+        if (**p == ',') { (*p)++; json_ws(p); }
+        else if (**p != close) return false;
+    }
+    if (**p != close) return false;
+    ds4_buf_putc(b, close);
+    (*p)++;
+    return true;
+}
+
+/* 解析失败(客户端发了坏 JSON)退回压缩形状: 至少与旧行为一致, 不吞掉内容 */
+char *json_pyfmt_raw_value(const char *json) {
+    const char *p = json ? json : "null";
+    buf b = {0};
+    if (!pyjson_value(&p, &b)) {
+        ds4_buf_free(&b);
+        return json_minify_raw_value(json);
+    }
+    return ds4_buf_take(&b);
+}
+
 bool json_content(const char **p, char **out) {
     json_ws(p);
     if (**p == '"') return json_string(p, out);

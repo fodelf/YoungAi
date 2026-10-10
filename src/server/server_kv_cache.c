@@ -204,27 +204,18 @@ char *path_join(const char *dir, const char *name) {
 }
 
 static const char *find_next_dsml_tool_block(const char *p, const char **end_out) {
-    struct block_form {
-        const char *start;
-        const char *end;
-    } forms[] = {
-        {"\n\n" DS4_TOOL_CALLS_START, DS4_TOOL_CALLS_END},
-        {DS4_TOOL_CALLS_START, DS4_TOOL_CALLS_END},
-        {"\n\n" DS4_TOOL_CALLS_START_SHORT, DS4_TOOL_CALLS_END_SHORT},
-        {DS4_TOOL_CALLS_START_SHORT, DS4_TOOL_CALLS_END_SHORT},
-        {"\n\n<tool_calls>", "</tool_calls>"},
-        {"<tool_calls>", "</tool_calls>"},
-    };
-
+    /* 块起点连同前面的 "\n\n" 一起算(渲染模板就是这么写的), 与 raw_dsml 的边界一致 */
     const char *best = NULL;
     const char *best_end = NULL;
-    for (size_t i = 0; i < sizeof(forms) / sizeof(forms[0]); i++) {
-        const char *s = strstr(p, forms[i].start);
-        if (!s || (best && s >= best)) continue;
-        const char *e = strstr(s, forms[i].end);
+    for (int i = 0; i < DSML_SYN_COUNT; i++) {
+        const char *s = strstr(p, dsml_syntaxes[i].tool_calls_start);
+        if (!s) continue;
+        if (s - p >= 2 && s[-1] == '\n' && s[-2] == '\n') s -= 2;
+        if (best && s >= best) continue;
+        const char *e = strstr(s, dsml_syntaxes[i].tool_calls_end);
         if (!e) continue;
         best = s;
-        best_end = e + strlen(forms[i].end);
+        best_end = e + strlen(dsml_syntaxes[i].tool_calls_end);
     }
     if (end_out) *end_out = best_end;
     return best;

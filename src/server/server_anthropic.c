@@ -307,7 +307,7 @@ bool anthropic_tool_emit_string_value(int fd, anthropic_stream *st,
                                              const char *text, size_t len) {
     if (len == 0) return true;
     char *raw = xstrndup(text, len);
-    char *unescaped = dsml_unescape_text(raw);
+    char *unescaped = dsml_value_unescape(st->tool.syn, raw);
     buf frag = {0};
     json_escape_fragment_n(&frag, unescaped, strlen(unescaped));
     bool ok = anthropic_tool_emit_args_fragment(fd, st,

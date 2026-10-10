@@ -19,16 +19,25 @@ typedef enum {
     DSML_TOOL_ERROR,
 } dsml_tool_stream_state;
 
-/* Shared states for protocol-specific DSML stream projections.  The model
- * still samples DSML; these states only translate already-sampled bytes into
- * OpenAI / Anthropic wire events while final parsing remains authoritative. */
+/* 一种 DSML 写法的六个定界标签。entity_values: string 值里的 & < > 是否按 XML 实体写
+ * (旧格式的提示词教模型转义; 带空格标签那一代的官方 encoding.py 原样写值, 解析时再反转义就会把
+ * 值里真实的 "&lt;" 改成 "<", 改 HTML 文件的工具调用当场写坏)。 */
 typedef struct {
-    dsml_tool_stream_state state;
+    const char *tool_calls_start;
     const char *tool_calls_end;
     const char *invoke_start;
     const char *invoke_end;
     const char *param_start;
     const char *param_end;
+    bool entity_values;
+} dsml_syntax;
+
+/* Shared states for protocol-specific DSML stream projections.  The model
+ * still samples DSML; these states only translate already-sampled bytes into
+ * OpenAI / Anthropic wire events while final parsing remains authoritative. */
+typedef struct {
+    dsml_tool_stream_state state;
+    const dsml_syntax *syn;
     size_t parse_pos;
     int index;
     bool active;
@@ -65,15 +74,6 @@ typedef enum {
     DSML_TRACK_JSON_PARAM,
     DSML_TRACK_DONE,
 } dsml_track_mode;
-
-typedef struct {
-    const char *tool_calls_start;
-    const char *tool_calls_end;
-    const char *invoke_start;
-    const char *invoke_end;
-    const char *param_start;
-    const char *param_end;
-} dsml_syntax;
 
 typedef struct {
     dsml_track_mode mode;
@@ -485,6 +485,8 @@ extern int g_knowledge_n;
 
 extern int g_req_mode;
 
-extern const dsml_syntax dsml_syntaxes[3];  /* 条目数与定义处一致(长/短/裸三种 DSML 语法), 供跨文件 sizeof */
+/* 解析侧四种写法都认; 渲染侧只用其中一种(dsml_render_syntax)。下标顺序与 server_dsml_stream.c 定义处一致。 */
+enum { DSML_SYN_LONG, DSML_SYN_SHORT, DSML_SYN_PLAIN, DSML_SYN_SPACED, DSML_SYN_COUNT };
+extern const dsml_syntax dsml_syntaxes[DSML_SYN_COUNT];
 
 #endif /* DS4_SERVER_TYPES2_H */

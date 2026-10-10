@@ -102,8 +102,61 @@ const char *knowledge_retrieve(const char *query) {
     return (best >= 0 && best_score >= 1) ? g_knowledge_blocks[best] : NULL;  /* score≥1: ≥3字符判别词一命中即注入(g4 "vet" 修复); 误注入参考害<代码框失败 */
 }
 
+/* 官方 encoding.py TOOLS_TEMPLATE 逐字(带空格 DSML 那一代)。与旧代模板的差别全是训练分布上的:
+ * "user's question"、"specified as is"、没有实体转义说明、schema 按 json.dumps 形状、结尾单个 "\n"。
+ * 旧代那段"遇到闭合标签写 &lt;"的说明这里不能加 —— 官方值原样写, 模型没学过转义。 */
+static void append_tools_prompt_spaced(buf *b, const char *tool_schemas) {
+    ds4_buf_puts(b,
+        "## Tools\n\n"
+        "You have access to a set of tools to help answer the user's question. "
+        "You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n"
+        "<｜DSML｜ calls>\n"
+        "<｜DSML｜ invoke name=\"$TOOL_NAME\">\n"
+        "<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n"
+        "...\n"
+        "</｜DSML｜ invoke>\n"
+        "<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n"
+        "...\n"
+        "</｜DSML｜ invoke>\n"
+        "</｜DSML｜ calls>\n\n"
+        "String parameters should be specified as is and set `string=\"true\"`. "
+        "For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\n");
+    if (!g_force_nothink)   /* --nothink 剥掉 <think> 指令段, 理由见 append_tools_prompt_text */
+        ds4_buf_puts(b,
+            "If thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\n"
+            "Otherwise, output directly after </think> with tool calls or final response.\n\n");
+    ds4_buf_puts(b, "### Available Tool Schemas\n\n");
+    /* tool_schemas 是逐个客户端 JSON 值("\n" 拼接, 值内部可能自带换行), 逐个重排成 json.dumps 形状 */
+    const char *p = tool_schemas;
+    for (bool first = true;; first = false) {
+        json_ws(&p);
+        if (!*p) break;
+        const char *s = p;
+        if (!json_skip_value(&p)) {   /* 不是 JSON(不会发生: 拼接方只放 json_raw_value 的结果) —— 原样放, 不吞内容 */
+            if (!first) ds4_buf_putc(b, '\n');
+            ds4_buf_puts(b, s);
+            break;
+        }
+        char *one = xstrndup(s, (size_t)(p - s));
+        char *py = json_pyfmt_raw_value(one);
+        if (!first) ds4_buf_putc(b, '\n');
+        ds4_buf_puts(b, py);
+        free(py);
+        free(one);
+    }
+    ds4_buf_puts(b, "\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n");
+    if (g_soul_text && g_soul_text[0]) {
+        ds4_buf_puts(b, "\n");
+        ds4_buf_puts(b, g_soul_text);
+    }
+}
+
 void append_tools_prompt_text(buf *b, const char *tool_schemas) {
     if (!tool_schemas || !tool_schemas[0]) return;
+    if (dsml_render_syntax() == &dsml_syntaxes[DSML_SYN_SPACED]) {
+        append_tools_prompt_spaced(b, tool_schemas);
+        return;
+    }
     ds4_buf_puts(b,
         "## Tools\n\n"
         "You have access to a set of tools to help answer the user question. "

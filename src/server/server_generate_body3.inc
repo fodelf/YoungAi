@@ -429,16 +429,7 @@
             if (!parsed_ok) {
                 /* Print raw DSML snippet for debugging */
                 size_t dsml_snippet_len = 0;
-                const char *dsml_start = NULL;
-                const char *p;
-                for (p = text.ptr; p && (size_t)(p - text.ptr) < text.len - 20; p++) {
-                    if ((strncmp(p, DS4_TOOL_CALLS_START, strlen(DS4_TOOL_CALLS_START)) == 0) ||
-                        (strncmp(p, DS4_TOOL_CALLS_START_SHORT, strlen(DS4_TOOL_CALLS_START_SHORT)) == 0) ||
-                        (strncmp(p, "<tool_calls>", 12) == 0)) {
-                        dsml_start = p;
-                        break;
-                    }
-                }
+                const char *dsml_start = text.ptr ? find_any_tool_start(text.ptr) : NULL;
                 if (dsml_start) {
                     dsml_snippet_len = text.len - (dsml_start - text.ptr);
                     if (dsml_snippet_len > 500) dsml_snippet_len = 500;
