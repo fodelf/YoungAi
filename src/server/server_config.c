@@ -80,6 +80,11 @@ void usage(FILE *fp) {
         "  --max-output-tokens N\n"
         "      Hard server-side cap on output tokens per request, overriding larger client limits.\n"
         "      0 disables; protects a single-worker local server from runaway generations. Default: 0\n"
+        "  --think-budget N\n"
+        "      Thinking-token budget: at N thinking tokens the server forces </think> so the model answers.\n"
+        "      A request's thinking.budget_tokens overrides it. 0 disables. Default: 0\n"
+        "  --budget-answer-prefix STR\n"
+        "      After a budget-forced </think>, force the answer to start with STR (e.g. a code fence). Default: none\n"
         "  --dry-multiplier F [--dry-base F] [--dry-allowed-length N]\n"
         "      DRY sequence-repetition penalty on the V4.1 decode path, applied to every request (works at temperature 0).\n"
         "      0 disables (default: bare model output). Defaults: base 1.75, allowed length 2\n"
@@ -251,6 +256,7 @@ server_config parse_options(int argc, char **argv) {
         .ctx_size = DS4_DEFAULT_CTX_SIZE,
         .default_tokens = SERVER_NO_OUTPUT_CAP,
         .max_output_tokens = 0,
+        .think_budget = 0,
         .dry_multiplier = 0.0f, .dry_base = 1.75f, .dry_allowed_length = 2,
         .force_nothink = false,
         .tool_primer = false,
@@ -343,6 +349,10 @@ server_config parse_options(int argc, char **argv) {
             exit(2);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
             c.default_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--think-budget")) {
+            c.think_budget = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--budget-answer-prefix")) {
+            c.budget_answer_prefix = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--max-output-tokens")) {
             c.max_output_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--dry-multiplier")) {

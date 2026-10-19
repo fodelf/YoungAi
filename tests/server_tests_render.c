@@ -116,10 +116,10 @@ void test_reasoning_effort_mapping(void) {
 void test_api_thinking_controls_parse(void) {
     bool enabled = true;
     const char *thinking = "{\"type\":\"disabled\",\"budget_tokens\":1024}";
-    TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled));
+    TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled, NULL));
     TEST_ASSERT(!enabled);
     thinking = "true";
-    TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled));
+    TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled, NULL));
     TEST_ASSERT(enabled);
 
     ds4_think_mode mode = DS4_THINK_HIGH;

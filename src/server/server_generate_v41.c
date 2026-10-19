@@ -160,6 +160,7 @@ int v41_emit(int token, void *ud) {
     /* 死环检测喂 token(server_think_loop.c): 思考段只在思考请求上喂, 正文一律喂; </think> 本身不喂, 收口后正文从零起算 */
     if (g->thinking.inside) { if (g->think_loop_on && token != g->think_end) think_loop_push(&g->loop, token); }
     else think_loop_push(&g->loop, token);
+    if (g->budget_closed && token != g->think_end) g->post_n++;
     if (token == g->think_end) {
         if (g->loop_period) {
             server_log(DS4_LOG_WARNING, "ds4-server: %s ctx=%s 思考段逐 token 复读(周期 %d, 段长 %d)已成死环, 第 %d 个生成 token 处强制收口",
@@ -167,6 +168,12 @@ int v41_emit(int token, void *ud) {
             trace_event(s, g->trace_id, "think loop: token-exact repeat period %d over %d tokens, forced </think> at generated token %d",
                         g->loop_period, g->loop_span, g->completion);
             g->loop_period = 0;
+        } else if (g->budget_hit) {
+            server_log(DS4_LOG_GENERATION, "ds4-server: %s ctx=%s 思考段到预算 %d token, 第 %d 个生成 token 处强制收口",
+                       v41_kind(g), g->ctx_span, g->think_budget, g->completion);
+            trace_event(s, g->trace_id, "think budget: %d thinking tokens, forced </think> at generated token %d", g->think_budget, g->completion);
+            g->budget_hit = false;
+            g->budget_closed = true;
         }
         memset(&g->loop, 0, sizeof g->loop);
     }
@@ -399,6 +406,7 @@ bool v41_gen_begin(server *s, job *j, v41_gen *g) {
     g->tool_scan_waiting_for_think_close = g->thinking_gates_tool_markers && g->thinking.inside;
     g->think_end = ds4_token_think_end(s->engine);
     g->think_loop_on = g->thinking_gates_tool_markers && g->thinking.inside && g->think_end >= 0;
+    v41_think_budget_setup(s, j, g);   /* server_think_loop.c */
     dsml_decode_tracker_init(&g->dsml_tracker);
     g->next_tool_progress = 128; g->next_decode_log = 50; g->next_alive_check = V41_ALIVE_CHECK_TOKENS;
     snprintf(g->id, sizeof(g->id), "%s-%llu", j->req.kind == REQ_CHAT ? "chatcmpl" : "cmpl", (unsigned long long)++s->seq);
@@ -437,12 +445,12 @@ void v41_gen_end(v41_gen *g, int rc) {
             send_prefill_failure_response(s, j, &g->progress, g->ctx_span, g->req_flags, "V4.1 prefill failed");
         }
         mon_end(s, j->mon, g->client_gone ? "disconnect" : "error", 0, -1, -1);
-        free(g->ids); ds4_buf_free(&g->text);
+        free(g->ids); v41_think_budget_free(g); ds4_buf_free(&g->text);
         return;
     }
     if (!g->started) {   /* max_tokens == 0: 预填成了但一个 token 都不要 */
         v41_prefill_done(g);
-        if (!v41_stream_begin(g)) { mon_end(s, j->mon, "disconnect", 0, -1, -1); free(g->ids); ds4_buf_free(&g->text); return; }
+        if (!v41_stream_begin(g)) { mon_end(s, j->mon, "disconnect", 0, -1, -1); free(g->ids); v41_think_budget_free(g); ds4_buf_free(&g->text); return; }
     }
     if (rc != 0 && strcmp(g->finish, "error") != 0) { g->finish = "error"; snprintf(g->err, sizeof(g->err), "V4.1 decode failed"); }
     const char *final_finish = v41_finish(g);
@@ -452,7 +460,7 @@ void v41_gen_end(v41_gen *g, int rc) {
     trace_token_ids(s, g->trace_id, j->req.prompt.v, j->req.prompt.len, g->ids, g->n_ids);
     { const double *ls; const int nl = ds4_engine_v41_logit_sums(&ls);   /* 精确门(kv_reuse_gate.sh)比逐步 logits 用; 只有惩罚路的请求有 */
       if (nl > 0 && s->trace) { ds4_buf lb = {0}; for (int i = 0; i < nl; i++) ds4_buf_printf(&lb, " %.17g", ls[i]); trace_event(s, g->trace_id, "logit sums:%s", lb.ptr); ds4_buf_free(&lb); } }   /* 提示 + 生成的 id 全落 trace(只在 --trace 开时) */
-    free(g->ids);
+    free(g->ids); v41_think_budget_free(g);
     anthropic_stream_free(&g->anthropic_live);
     openai_stream_free(&g->openai_live);
     responses_stream_free(&g->responses_live);

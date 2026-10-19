@@ -84,3 +84,47 @@ void test_think_loop_force_hook(void) {
     ahead[4] = 1;
     TEST_ASSERT(v41_think_loop_force(&g, ahead, 6) == -1);          /* 草稿里已经 EOS */
 }
+
+/* 思考预算(--think-budget): 思考位到预算后逐位强制 收尾句 → </think> → 正文起手串(--budget-answer-prefix)。
+ * 无状态, 只看位置: 草稿越过的位上返回的就是那一位该强制的 token, 引擎只接受等于它的草稿。 */
+void test_think_budget_force_hook(void) {
+    v41_gen g;
+    memset(&g, 0, sizeof g);
+    int32_t tail[3] = { 700, 701, 702 }, prefix[2] = { 900, 901 };   /* 收尾句 3 个 token, 起手串 2 个(真实里如 ```python) */
+    g.think_loop_on = true; g.thinking.inside = true; g.think_end = 128822; g.eos = 1;
+    g.think_budget = 100; g.budget_tail = tail; g.budget_tail_n = 3; g.budget_prefix = prefix; g.budget_prefix_n = 2;
+    push_fresh(&g.loop, 98, 1000);                                  /* 已真吐 98 个思考 token */
+    TEST_ASSERT(v41_think_loop_force(&g, NULL, 0) == -1);
+    int32_t ahead[8] = { 2000, 2001, 700, 701, 702, 128822, 900, 901 };
+    TEST_ASSERT(v41_think_loop_force(&g, ahead, 1) == -1);          /* 第 100 位还是自由的 */
+    TEST_ASSERT(v41_think_loop_force(&g, ahead, 2) == 700);         /* 第 101 位: 收尾句第一个 */
+    TEST_ASSERT(!g.budget_hit);
+    TEST_ASSERT(v41_think_loop_force(&g, ahead, 4) == 702);         /* 收尾句最后一个: 记 budget_hit, v41_emit 落日志 */
+    TEST_ASSERT(g.budget_hit);
+    TEST_ASSERT(v41_think_loop_force(&g, ahead, 5) == 128822);      /* 收尾句之后: </think> */
+    TEST_ASSERT(v41_think_loop_force(&g, ahead, 6) == 900);         /* 草稿已越过 </think>: 起手串 */
+    TEST_ASSERT(v41_think_loop_force(&g, ahead, 7) == 901);
+    TEST_ASSERT(v41_think_loop_force(&g, ahead, 8) == -1);          /* 起手串用完: 不再管 */
+    TEST_ASSERT(g.loop.n == 98);                                    /* 草稿只在副本上推 */
+
+    /* 收口之后的正文: 按已出正文 token 数(post_n)接着强制起手串, 用完回到正文死环检测 */
+    g.thinking.inside = false; g.budget_closed = true; g.post_n = 0;
+    memset(&g.loop, 0, sizeof g.loop);
+    TEST_ASSERT(v41_think_loop_force(&g, NULL, 0) == 900);
+    TEST_ASSERT(v41_think_loop_force(&g, prefix, 1) == 901);
+    TEST_ASSERT(v41_think_loop_force(&g, prefix, 2) == -1);
+    g.post_n = 1;
+    TEST_ASSERT(v41_think_loop_force(&g, NULL, 0) == 901);
+    ahead[0] = 1;
+    TEST_ASSERT(v41_think_loop_force(&g, ahead, 1) == -1);          /* 草稿里已经 EOS */
+
+    /* 预算前草稿自己收口: 不强制起手串; 预算关(budget_tail_n = 0): 只剩死环检测 */
+    memset(&g.loop, 0, sizeof g.loop);
+    g.thinking.inside = true; g.budget_closed = false; g.budget_hit = false; g.post_n = 0;
+    push_fresh(&g.loop, 50, 1000);
+    int32_t early[2] = { 128822, 900 };
+    TEST_ASSERT(v41_think_loop_force(&g, early, 2) == -1);
+    g.budget_tail_n = 0;
+    push_fresh(&g.loop, 200, 3000);
+    TEST_ASSERT(v41_think_loop_force(&g, NULL, 0) == -1);
+}

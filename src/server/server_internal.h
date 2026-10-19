@@ -37,7 +37,7 @@ void request_free(request *r);
 ds4_think_mode think_mode_from_enabled(bool enabled, ds4_think_mode effort);
 bool parse_reasoning_effort_name(const char *s, ds4_think_mode *out);
 bool parse_reasoning_effort_value(const char **p, ds4_think_mode *out);
-bool parse_thinking_control_value(const char **p, bool *thinking_enabled);
+bool parse_thinking_control_value(const char **p, bool *thinking_enabled, int *budget);   /* budget 可为 NULL */
 bool parse_output_config_effort(const char **p, ds4_think_mode *effort);
 bool model_alias_disables_thinking(const char *model);
 bool model_alias_enables_thinking(const char *model);
@@ -339,7 +339,13 @@ typedef struct {
     think_loop loop;          /* 死环检测(server_think_loop.c): 喂当前段真吐的 token, 思考段收口时清零, 正文从零起算 */
     bool think_loop_on;       /* 思考段检测只在提示以思考开场时开(非思考请求没有思考段); 正文检测一律开 */
     int think_end, loop_period, loop_span;   /* </think> 的 id; 强制收口/结束时记下的周期/段长, v41_emit 收到那个 token 时落日志 */
+    int think_budget; bool budget_hit;   /* 思考预算(0=关); 到预算强制 </think> 时置 budget_hit, v41_emit 落日志 */
+    int32_t *budget_tail; int budget_tail_n;   /* 到预算后逐位强制的 token: 收尾句 + </think>(v41_gen_begin 分词一次) */
+    int32_t *budget_prefix; int budget_prefix_n;   /* 预算收口后正文开头逐位强制的 token(--budget-answer-prefix) */
+    bool budget_closed; int post_n;   /* 预算 </think> 已出; 之后已出的正文 token 数 */
 } v41_gen;
+void v41_think_budget_setup(server *s, job *j, v41_gen *g);   /* server_think_loop.c: 分词收尾序列 / 起手串 */
+void v41_think_budget_free(v41_gen *g);
 /* 每多少个 token 探一次对端: 一次 poll 约 1 µs, 一步解码 40 ms ⇒ 开销在噪声里; 最坏多算 16 个 token。 */
 enum { V41_ALIVE_CHECK_TOKENS = 16 };
 bool v41_gen_begin(server *s, job *j, v41_gen *g);   /* false = 请求不合法, 错误响应已发 */

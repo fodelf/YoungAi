@@ -65,6 +65,7 @@ char *sse_join_field(const char *out, const char *key);   /* 把所有 SSE 帧�
 void test_openai_stream_stray_think_before_tool(void);
 void test_think_loop_detector(void);      /* server_tests_think_loop.c */
 void test_think_loop_force_hook(void);
+void test_think_budget_force_hook(void);
 void test_render_non_thinking_prompt_closes_think(void);
 void test_render_drops_old_reasoning_without_tools(void);
 void test_render_preserves_reasoning_with_tools(void);

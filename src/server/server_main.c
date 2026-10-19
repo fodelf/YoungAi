@@ -98,6 +98,8 @@ int main(int argc, char **argv) {
     s.session = session;
     s.default_tokens = cfg.default_tokens;
     s.max_output_tokens = cfg.max_output_tokens;
+    s.think_budget = cfg.think_budget;
+    s.budget_answer_prefix = cfg.budget_answer_prefix;
     s.dry_multiplier = cfg.dry_multiplier; s.dry_base = cfg.dry_base; s.dry_allowed_length = cfg.dry_allowed_length;
     s.force_nothink = cfg.force_nothink;
     s.tool_primer = cfg.tool_primer;

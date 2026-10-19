@@ -254,7 +254,7 @@ struct server {
      * Resource protection for small local models with weak EOS discipline:
      * a client asking for max_tokens=32000 (e.g. Claude Code utility calls)
      * must not pin the single graph worker for hours. */
-    int max_output_tokens;
+    int max_output_tokens; int think_budget; const char *budget_answer_prefix;   /* 后两个: --think-budget(0=关) / --budget-answer-prefix(server_think_loop.c) */
     /* --dry-multiplier/--dry-base/--dry-allowed-length(2026-09-21, 113-1.md §4): V4.1 生成路的 DRY 序列复读惩罚, 服务级开关
      * (客户端协议里没有这个字段; qtf 这种调用方也不会传)。0 = 关 = 裸模型真值; 开了对每条请求生效, 温 0 也生效。 */
     float dry_multiplier, dry_base;
@@ -457,7 +457,7 @@ typedef struct {
     int batch_max;             /* --batch: 并发合批上限(0=关, 钳到 DS4_SERVER_BATCH_LANES) */
     bool tool_primer;
     bool force_nothink;
-    int max_output_tokens;
+    int max_output_tokens; int think_budget; const char *budget_answer_prefix;   /* 后两个: --think-budget(0=关) / --budget-answer-prefix(server_think_loop.c) */
     float dry_multiplier, dry_base; int dry_allowed_length;   /* 见 server_config 同名字段 */
     int default_tokens;
     const char *chdir_path;

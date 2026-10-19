@@ -212,6 +212,7 @@ typedef struct {
     int cache_read_tokens;
     int cache_write_tokens;
     ds4_think_mode think_mode;
+    int think_budget;   /* thinking.budget_tokens: 思考段 token 上限, 到了强制 </think>; 0 = 用服务默认 --think-budget */
     bool has_tools;
     bool prompt_preserves_reasoning;
     /* For /v1/responses: emit reasoning_summary_* events / fields only when the

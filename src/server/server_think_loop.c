@@ -48,13 +48,53 @@ int32_t v41_think_loop_force(void *ud, const int32_t *ahead, uint32_t n) {
     v41_gen *g = ud;
     const bool inside = g->thinking.inside;
     if (inside && !g->think_loop_on) return -1;
+    if (!inside && g->budget_closed) {   /* 预算收口之后: 正文前 budget_prefix_n 位逐位强制起手串, 之后照常查正文死环 */
+        for (uint32_t i = 0; i < n; i++) if (ahead[i] == g->eos) return -1;
+        const uint32_t k = (uint32_t)g->post_n + n;
+        if (k < (uint32_t)g->budget_prefix_n) return g->budget_prefix[k];
+    }
     think_loop d = g->loop;
     for (uint32_t i = 0; i < n; i++) {
-        if (ahead[i] == g->think_end || ahead[i] == g->eos) return -1;
+        if (ahead[i] == g->eos) return -1;
+        if (ahead[i] == g->think_end) {   /* 草稿已越过 </think>: 只有预算收口(思考位 ≥ 预算)才接着强制起手串 */
+            if (!inside || g->budget_tail_n == 0 || d.n < (uint32_t)g->think_budget) return -1;
+            const uint32_t k = n - 1u - i;
+            return k < (uint32_t)g->budget_prefix_n ? g->budget_prefix[k] : -1;
+        }
         think_loop_push(&d, ahead[i]);
+    }
+    if (inside && g->budget_tail_n > 0 && d.n >= (uint32_t)g->think_budget) {   /* 思考预算: 量化权重把 </think> 压低 4~22 倍, 长推演自己收不了口 */
+        /* 无状态: 预算之后的第 k 个思考位就是收尾序列第 k 个(前面的位都是被强制的, 草稿只有等于它才会被接受) */
+        const uint32_t k = d.n - (uint32_t)g->think_budget;
+        if (k >= (uint32_t)g->budget_tail_n) return g->think_end;
+        if (k == (uint32_t)g->budget_tail_n - 1) g->budget_hit = true;
+        return g->budget_tail[k];
     }
     int p = 0, span = 0;
     if (!think_loop_hit(&d, &p, &span)) return -1;
     g->loop_period = p; g->loop_span = span;
     return inside ? g->think_end : g->eos;
 }
+
+/* 思考预算(--think-budget / thinking.budget_tokens): 收尾序列 = 交接句 + </think>, v41_think_loop_force 到预算后逐位强制。
+ * 光强制 </think> 不够: 1.6-bit 会在正文里接着推(收口后 2700 token 没写代码), 所以先强制一句交接(Qwen3 思考预算同法);
+ * --budget-answer-prefix 再逼正文直接起手(LCB 用 ```python: 不加时 20 题里 7 题收口后在正文接着推 8k token)。 */
+void v41_think_budget_setup(server *s, job *j, v41_gen *g) {
+    g->think_budget = j->req.think_budget > 0 ? j->req.think_budget : s->think_budget;
+    if (g->think_budget <= 0 || !g->think_loop_on) return;
+    ds4_tokens tt = {0};
+    ds4_tokenize_text(s->engine, "\n\nConsidering the limited time, I have to give the solution based on the thinking directly now.\n", &tt);
+    g->budget_tail = xmalloc((size_t)(tt.len + 1) * sizeof(int32_t));
+    for (int i = 0; i < tt.len; i++) g->budget_tail[i] = tt.v[i];
+    g->budget_tail[tt.len] = g->think_end;
+    g->budget_tail_n = tt.len + 1;
+    ds4_tokens_free(&tt);
+    if (!s->budget_answer_prefix || !*s->budget_answer_prefix) return;
+    ds4_tokens pt = {0};
+    ds4_tokenize_text(s->engine, s->budget_answer_prefix, &pt);
+    g->budget_prefix = xmalloc((size_t)(pt.len + 1) * sizeof(int32_t));
+    for (int i = 0; i < pt.len; i++) g->budget_prefix[i] = pt.v[i];
+    g->budget_prefix_n = pt.len;
+    ds4_tokens_free(&pt);
+}
+void v41_think_budget_free(v41_gen *g) { free(g->budget_tail); free(g->budget_prefix); g->budget_tail = g->budget_prefix = NULL; }

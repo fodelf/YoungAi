@@ -170,7 +170,7 @@ bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, int def
                 goto bad;
             }
         } else if (!strcmp(key, "thinking")) {
-            if (!parse_thinking_control_value(&p, &thinking_enabled)) {
+            if (!parse_thinking_control_value(&p, &thinking_enabled, &r->think_budget)) {
                 free(key);
                 goto bad;
             }

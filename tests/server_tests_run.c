@@ -33,6 +33,7 @@ void ds4_server_unit_tests_run(void) {
     test_openai_stream_stray_think_before_tool();
     test_think_loop_detector();
     test_think_loop_force_hook();
+    test_think_budget_force_hook();
     test_render_non_thinking_prompt_closes_think();
     test_render_drops_old_reasoning_without_tools();
     test_render_preserves_reasoning_with_tools();

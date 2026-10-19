@@ -245,7 +245,7 @@ bool parse_reasoning_effort_value(const char **p, ds4_think_mode *out) {
     return ok;
 }
 
-bool parse_thinking_control_value(const char **p, bool *thinking_enabled) {
+bool parse_thinking_control_value(const char **p, bool *thinking_enabled, int *budget) {
     json_ws(p);
     if (json_lit(p, "null")) return true;
     if (**p == 't' || **p == 'f') return json_bool(p, thinking_enabled);
@@ -270,6 +270,13 @@ bool parse_thinking_control_value(const char **p, bool *thinking_enabled) {
             if (!strcmp(type, "enabled")) *thinking_enabled = true;
             else if (!strcmp(type, "disabled")) *thinking_enabled = false;
             free(type);
+        } else if (!strcmp(key, "budget_tokens") && budget) {
+            double v = 0.0;
+            if (!json_number(p, &v)) {
+                free(key);
+                return false;
+            }
+            *budget = v > 0 ? (int)v : 0;
         } else if (!json_skip_value(p)) {
             free(key);
             return false;
