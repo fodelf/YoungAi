@@ -1,0 +1,5 @@
+{
+  "text": "A FIFO queue returns elements in the order they were inserted. To implement a thread-safe queue, protect its storage with a mutex and use a condition variable to wake waiting consumers. The producer acquires the lock, appends an item, signals a waiting consumer, and releases the lock. A consumer waits in a loop until an item is available, removes the oldest item, and releases the lock. The loop handles spurious wakeups. Bounded queues also make producers wait when capacity is reached. This prevents unbounded memory growth and provides backpressure. Cancellation should wake blocked workers and release every acquired resource. Repeating the same deterministic computation in a batch should preserve every output value.",
+  "truncated_tokens": 128,
+  "tokenizer_sha256": "c90dfa01249db1be4245780a052ede752e1361c612ac6d08e2bdada7d599476b"
+}

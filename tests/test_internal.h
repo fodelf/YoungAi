@@ -69,6 +69,8 @@ int test_v41_cmp(const char *name, const float *got, const float *ref, uint64_t 
 void test_v41_ref_matmul(const float *x, const float *w, float *out, uint32_t M, uint32_t N, uint32_t K, int round_out);
 void test_metal_v41_dense(void);
 void test_metal_v41_layer(void);
+void test_metal_v41_memory(void);
+void test_metal_tensor_lifetime(void);
 void test_metal_v41_attn(void);
 void test_metal_v41_vq(void);
 void test_metal_v41_bwd(void);

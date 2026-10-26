@@ -23,7 +23,7 @@ typedef struct { uint32_t ratio, dim, n, has_snap; } v41_cstep_args;
 typedef struct { uint32_t n_head, head_dim, n_rot, osl, inverse, do_round; float theta, factor, beta_fast, beta_slow; } v41_rope_args;
 typedef struct { uint32_t g0, dim, blk, row_bytes, nib_bytes, nb_row, mode, has_posd, ratio, g_trash, nbatch, pad; } v41_kvpack_args;
 typedef struct { uint32_t pos0, i0, window, hd, back, has_posd, pad0, pad1; } v41_ring_args;
-typedef struct { uint32_t pos0, window, ng, topk, n_head, hd, full_block, ring, win_lo, has_posd, has_comp, pad; float scale; float pad1, pad2, pad3; } v41_attn_args;
+typedef struct { uint32_t pos0, window, ng, topk, n_head, hd, full_block, ring, win_lo, has_posd, has_comp, pad; float scale; uint32_t ratio; float pad2, pad3; } v41_attn_args;
 typedef struct { uint32_t pos0, ng, n_head, dk, ratio, has_posd, has_cand, cand_bs, cand_cap, n_rows, topk, pad; } v41_idx_args;
 typedef struct { uint32_t pos0, ng, ratio, topk_blocks, bs, has_posd, n_rows, nb_cap; } v41_cand_args;
 typedef struct { uint64_t seed; uint32_t V, row0, n_rows, top_k, stream, has_q; float inv_T, min_p, top_p; uint32_t pad0, pad1, pad2; } v41_sample_args;

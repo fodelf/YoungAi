@@ -311,6 +311,7 @@ void v41_state_free(ds4_v41_state *st);
  * 请求态预填完 v41_state_shrink: 稠密段的行放掉、注意力侧缩到 rcap 行, 只剩 KV + 几十 MB; 批态(v41_batch_rows_alloc)持有稠密段的
  * R 行缓冲 + 反修表; v41_multi_step 一步喂 R 个请求态各 1 个 token(稠密段拼行一次发, 注意力段逐请求用视图发)。 */
 bool v41_state_shrink(ds4_v41_state *st, uint32_t rcap);
+bool v41_state_decode_shrink(ds4_v41_state *st, uint32_t rcap);
 bool v41_state_clone(ds4_v41_state *dst, const ds4_v41_state *src);
 /* ★合批纯解码一步最多几行(2026-10-10)★: 与 DS4_V41_GEMV_MAX_TOK(8, 解码小批核与预填 GEMM 的分界, 单请求路/验证批/打分路都按它分岔)分开 ——
  * 合批行数超过 8 时稠密段各核按行数自己走预填路, 不改任何 ≤ 8 行的路径。批态 / 合批步 / 生成驱动的数组按它开。 */
@@ -359,6 +360,8 @@ void v41_kvreuse_save(const ds4_v41_state *st, const int32_t *prompt, uint32_t n
 void v41_kvreuse_save_end(const ds4_v41_state *st, const int32_t *prompt, uint32_t np, const uint64_t *sig,
                           const int32_t *fed, uint32_t nf, uint32_t logit_row);   /* fed = 真喂进 KV 的生成 token; logit_row = 末位 logits 所在行 */
 uint32_t v41_kvreuse_restore(ds4_v41_state *st, const int32_t *prompt, uint32_t np, const uint64_t *sig);
+bool v41_kvreuse_alloc(ds4_v41_state *st, const int32_t *prompt, uint32_t np,
+                       uint32_t ctx, uint32_t chunk, const uint64_t *sig, uint32_t *reused);
 void v41_kvreuse_drop(void);   /* 作废检查点但留着它的提示 token(ds4_engine_v41_kv_stale_prompt 取, 切换插件后预热用) */
 #define DS4_V41_LOGIT_LOG 1024   /* 逐步 logits 指纹最多记几步(core_v41_sample.c) */
 void v41_logit_log_reset(void);

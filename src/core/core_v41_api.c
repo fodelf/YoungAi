@@ -151,9 +151,15 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
     const int room = ctx > np ? (int)(ctx - np) : 0;
     if (n_predict > room) n_predict = room;
     const uint32_t ck = g_ds4_v41_chunk > 0 ? (uint32_t)g_ds4_v41_chunk : DS4_V41_CHUNK;
-    const uint32_t cap = ck < np ? ck : np;
+    const double t0 = now_sec();
+    const uint64_t *isig = imgs ? imgs->sig_of : NULL;
+    uint32_t reused = 0;
     ds4_v41_state st;
-    if (!v41_state_alloc(&st, cap, ctx, DS4_MTP_MAX_BLOCK + 2u)) return 1;   /* 生成路: logits 只要解码/验证批那几行 + 预填末位 */
+    const bool metal = e->backend == DS4_BACKEND_METAL;
+    if (metal) {
+        if (!v41_kvreuse_alloc(&st, prompt, np, ctx, ck, isig, &reused)) return 1;
+    } else if (!v41_state_alloc(&st, ck < np ? ck : np, ctx, DS4_MTP_MAX_BLOCK + 2u)) return 1;
+    const uint32_t cap = ck < st.cap_tok ? ck : st.cap_tok;
     st.head_last_only = 1;   /* 预填块只算末位 logits(core_v41.h) */
     st.half_prefill = 1;     /* 推理路: 预填快核(core_v41.h) */
     ds4_gpu_tensor *am = ds4_gpu_tensor_alloc((uint64_t)(DS4_MTP_MAX_BLOCK + 2u) * 16u);   /* 设备槽: 每行 16 B(采样核 4 个 int; argmax 只用第 0 个) */
@@ -198,10 +204,8 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
         /* --emit-trace 连提示也打(`[ptok] 位置 id`): 提示是 build_prompt 套过聊天模板的(比 --dump-tokens 的原文分词多
          * BOS/角色/think 几个 token, 09-20 实撞 79 vs 75), 事后重新分词拼不回引擎真吃的序列; 教师锚/取料要的是这一份。 */
         if (g_ds4_v41_emit_trace) for (uint32_t i = 0; i < np; i++) fprintf(stderr, "[ptok] %u %d\n", i, prompt[i]);
-        const double t0 = now_sec();
         bool ok = true, aborted = false;
-        const uint64_t *isig = imgs ? imgs->sig_of : NULL;   /* 图片位的指纹: 同占位 token 不同图不许接上一条的 KV */
-        const uint32_t reused = v41_kvreuse_restore(&st, prompt, np, isig);   /* 提示以上一条的提示开头 ⇒ 从那里接着填(core_v41_kvreuse.c) */
+        if (!metal) reused = v41_kvreuse_restore(&st, prompt, np, isig);
         st.vimg = imgs;   /* 预填块按位置盖视觉嵌入(core_v41_forward.c); 预填完清掉 */
         for (uint32_t c0 = reused; ok && c0 < np; ) {
             ok = v41_prefill_chunk(e, &st, prompt, np, &c0, cap);   /* 分块 / CED / 窗口尾规则在 core_v41_forward.c, 与并发路同一份 */
@@ -245,6 +249,11 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
          * 不接受的位置全部回滚。所以它是纯粹的省时间, 不是近似 —— 门也就是逐字节同。
          * ★采样下(2026-09-28)★: 接受 ⇔ 均匀数 < 目标分布给草稿的概率, 拒绝从残差抽(设备核里做); 吐出 token 的边缘分布 = 纯解码采样的分布,
          * 但同 seed 下两条路的具体 token 不同(用了不同的硬币) —— 门是分布级(tests/cuda_sample_selftest.c), 不是逐字节。 */
+        if (e->backend == DS4_BACKEND_METAL) {
+            if (!v41_state_decode_shrink(&st, dspark ? DS4_MTP_MAX_BLOCK + 1u : 1u)) break;
+            const uint64_t freed = ds4_gpu_v41_scratch_release();
+            fprintf(stderr, "[v41] decode buffers: %u rows, released %.1f MiB backend scratch\n", st.cap_tok, (double)freed / (1024.0 * 1024.0));
+        }
         ds4_v41_draft dr;
         const bool spec = dspark && v41_draft_alloc(e, &dr);
         /* ★采样 + 投机: 草稿按塔的分布抽(硬币流 1), 验证核读塔 logits 做拒绝采样(接受 ⇔ u < min(1,p/q), 拒绝从 max(0,p−q) 抽)★(2026-09-29)
@@ -453,9 +462,17 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
         const int n_out = produced - (hit_eos ? 1 : 0);   /* 真吐出的 token 数, 与服务端 usage.completion_tokens 同口径 */ if (n_out > 0) fprintf(stderr, "\n[v41] decode %d token %.1fs (%.2f t/s)\n", n_out, t2 - t1, (double)n_out / (t2 - t1 + 1e-9));
         rc = ok ? 0 : 1;
     } while (0);
+    /* Failure and cancellation may leave async copies pending. Release their
+     * resources only after the queue has drained, just as on the success path. */
+    if (!ds4_gpu_synchronize()) rc = 1;
     free(rowbuf); free(hist.tok); free((void *)hist.brk); free(fed);
     if (am) ds4_gpu_tensor_free(am);
     v41_state_free(&st);
+    if (e->backend == DS4_BACKEND_METAL) {
+        const uint64_t freed = ds4_gpu_v41_scratch_release();
+        fprintf(stderr, "[v41] request cleanup: rc=%d scratch_freed=%.2f MiB metal_allocated=%.2f MiB\n",
+                rc, (double)freed / 1048576., (double)ds4_gpu_current_allocated_bytes() / 1048576.);
+    }
     return rc;
 }
 #else

@@ -76,9 +76,11 @@ uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor) {
 }
 
 void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
-    if (!tensor) return NULL;
-    DS4MetalTensor *obj = ds4_gpu_tensor_obj(tensor);
-    return (uint8_t *)[obj.buffer contents] + obj.offset;
+    @autoreleasepool {
+        if (!tensor) return NULL;
+        DS4MetalTensor *obj = ds4_gpu_tensor_obj(tensor);
+        return (uint8_t *)[obj.buffer contents] + obj.offset;
+    }
 }
 
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count) {
@@ -89,86 +91,108 @@ int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count)
     return 1;
 }
 
+/* C worker threads have no outer autorelease pool. Buffer property getters
+ * may autorelease retained MTLBuffer references; drain them at each API call
+ * while command buffers / transient_buffers keep in-flight uploads alive. */
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
-    if (!tensor || (!data && bytes != 0)) return 0;
-    DS4MetalTensor *obj = ds4_gpu_tensor_obj(tensor);
-    if (offset > obj.bytes || bytes > obj.bytes - offset) return 0;
-    if (bytes != 0) {
-        memcpy((uint8_t *)[obj.buffer contents] + obj.offset + offset, data, (size_t)bytes);
+    @autoreleasepool {
+        if (!tensor || (!data && bytes != 0)) return 0;
+        DS4MetalTensor *obj = ds4_gpu_tensor_obj(tensor);
+        if (offset > obj.bytes || bytes > obj.bytes - offset) return 0;
+        if (bytes && (g_batch_cb || [g_pending_cbs count] != 0)) {
+            /* A host memcpy here can overwrite input of an earlier, unexecuted
+             * dispatch (notably V4.1's reused posg buffer during DSpark). Snapshot
+             * the upload and order its copy on the same GPU queue as the readers. */
+            ds4_gpu_tensor *upload = ds4_gpu_tensor_alloc(bytes);
+            if (!upload) return 0;
+            DS4MetalTensor *u = ds4_gpu_tensor_obj(upload);
+            memcpy([u.buffer contents], data, (size_t)bytes);
+            [g_transient_buffers addObject:u.buffer]; /* retain until queued work completes */
+            const int ok = ds4_gpu_tensor_copy(tensor, offset, upload, 0, bytes);
+            ds4_gpu_tensor_free(upload);
+            return ok;
+        }
+        if (bytes != 0) {
+            memcpy((uint8_t *)[obj.buffer contents] + obj.offset + offset, data, (size_t)bytes);
+        }
+        return 1;
     }
-    return 1;
 }
 
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
-    if (!tensor || (!data && bytes != 0)) return 0;
-    const DS4MetalTensor *obj = ds4_gpu_tensor_const_obj(tensor);
-    if (offset > obj.bytes || bytes > obj.bytes - offset) return 0;
-    /* Host-read boundary: async-submitted CBs (corr sidecar) may still be
-     * writing this buffer. Reading GPU memory with in-flight writes is a
-     * race — drain pending before the memcpy (no-op when the list is empty,
-     * which is the steady decode state: end_commands already swept it). */
-    if ([g_pending_cbs count] != 0)
-        (void)ds4_gpu_wait_pending_command_buffers("tensor read");
-    if (bytes != 0) {
-        memcpy(data, (const uint8_t *)[obj.buffer contents] + obj.offset + offset, (size_t)bytes);
+    @autoreleasepool {
+        if (!tensor || (!data && bytes != 0)) return 0;
+        const DS4MetalTensor *obj = ds4_gpu_tensor_const_obj(tensor);
+        if (offset > obj.bytes || bytes > obj.bytes - offset) return 0;
+        /* Host-read boundary: async-submitted CBs (corr sidecar) may still be
+         * writing this buffer. Reading GPU memory with in-flight writes is a
+         * race — drain pending before the memcpy (no-op when the list is empty,
+         * which is the steady decode state: end_commands already swept it). */
+        if ([g_pending_cbs count] != 0)
+            if (!ds4_gpu_wait_pending_command_buffers("tensor read")) return 0;
+        if (bytes != 0) {
+            memcpy(data, (const uint8_t *)[obj.buffer contents] + obj.offset + offset, (size_t)bytes);
+        }
+        return 1;
     }
-    return 1;
 }
 
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes) {
-    if (!dst || !src) return 0;
-    if (!g_initialized && !ds4_gpu_init()) return 0;
-    DS4MetalTensor *d = ds4_gpu_tensor_obj(dst);
-    const DS4MetalTensor *s = ds4_gpu_tensor_const_obj(src);
-    if (dst_offset > d.bytes || bytes > d.bytes - dst_offset) return 0;
-    if (src_offset > s.bytes || bytes > s.bytes - src_offset) return 0;
-    if (bytes == 0) return 1;
-    if (!g_batch_cb) {
-        /* 批外拷贝(2026-10-17): V4.1 草稿器推窗口在批外发, 以前这里恒失败 ⇒ DSpark 每步都废。
-         * 与 v41_launch 批外同法: 自建命令缓冲异步提交, 同一队列保序。 */
-        @autoreleasepool {
-            id<MTLCommandBuffer> cb = [g_queue commandBuffer];
-            if (!cb) return 0;
-            id<MTLBlitCommandEncoder> b2 = [cb blitCommandEncoder];
-            if (!b2) return 0;
-            [b2 copyFromBuffer:s.buffer sourceOffset:(NSUInteger)(s.offset + src_offset)
-                      toBuffer:d.buffer destinationOffset:(NSUInteger)(d.offset + dst_offset) size:(NSUInteger)bytes];
-            [b2 endEncoding];
-            return ds4_gpu_submit_command_buffer_async(cb, 1);
-        }
-    }
-
-    {   /* 批内拷贝走计算核(2026-10-17 M5): blit 编码器要先关掉当前计算编码器, 一步里几十次拷贝 = 几十次编码器切换;
-         * 4 B 对齐、不重叠时同一个计算编码器里一发核做完。值逐位同。 */
-        const NSUInteger so = (NSUInteger)(s.offset + src_offset), dof = (NSUInteger)(d.offset + dst_offset);
-        const int overlap = s.buffer == d.buffer && so < dof + bytes && dof < so + bytes;
-        if (!overlap && (so % 4u) == 0 && (dof % 4u) == 0 && (bytes % 4u) == 0 && bytes / 4u <= 0xFFFFFFFFull) {
-            id<MTLComputePipelineState> pso = ds4_gpu_get_pipeline("kernel_v41_copy_u32");
-            if (pso) {
-                const uint32_t n = (uint32_t)(bytes / 4u);
-                id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(g_batch_cb);
-                [enc setComputePipelineState:pso];
-                [enc setBuffer:s.buffer offset:so atIndex:0];
-                [enc setBuffer:d.buffer offset:dof atIndex:1];
-                [enc setBytes:&n length:sizeof n atIndex:2];
-                [enc dispatchThreadgroups:MTLSizeMake((n + 255u) / 256u, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-                ds4_gpu_end_compute_encoder(g_batch_cb, enc);
-                return 1;
+    @autoreleasepool {
+        if (!dst || !src) return 0;
+        if (!g_initialized && !ds4_gpu_init()) return 0;
+        DS4MetalTensor *d = ds4_gpu_tensor_obj(dst);
+        const DS4MetalTensor *s = ds4_gpu_tensor_const_obj(src);
+        if (dst_offset > d.bytes || bytes > d.bytes - dst_offset) return 0;
+        if (src_offset > s.bytes || bytes > s.bytes - src_offset) return 0;
+        if (bytes == 0) return 1;
+        if (!g_batch_cb) {
+            /* 批外拷贝(2026-10-17): V4.1 草稿器推窗口在批外发, 以前这里恒失败 ⇒ DSpark 每步都废。
+             * 与 v41_launch 批外同法: 自建命令缓冲异步提交, 同一队列保序。 */
+            @autoreleasepool {
+                id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+                if (!cb) return 0;
+                id<MTLBlitCommandEncoder> b2 = [cb blitCommandEncoder];
+                if (!b2) return 0;
+                [b2 copyFromBuffer:s.buffer sourceOffset:(NSUInteger)(s.offset + src_offset)
+                          toBuffer:d.buffer destinationOffset:(NSUInteger)(d.offset + dst_offset) size:(NSUInteger)bytes];
+                [b2 endEncoding];
+                return ds4_gpu_submit_command_buffer_async(cb, 1);
             }
         }
+
+        {   /* 批内拷贝走计算核(2026-10-17 M5): blit 编码器要先关掉当前计算编码器, 一步里几十次拷贝 = 几十次编码器切换;
+             * 4 B 对齐、不重叠时同一个计算编码器里一发核做完。值逐位同。 */
+            const NSUInteger so = (NSUInteger)(s.offset + src_offset), dof = (NSUInteger)(d.offset + dst_offset);
+            const int overlap = s.buffer == d.buffer && so < dof + bytes && dof < so + bytes;
+            if (!overlap && (so % 4u) == 0 && (dof % 4u) == 0 && (bytes % 4u) == 0 && bytes / 4u <= 0xFFFFFFFFull) {
+                id<MTLComputePipelineState> pso = ds4_gpu_get_pipeline("kernel_v41_copy_u32");
+                if (pso) {
+                    const uint32_t n = (uint32_t)(bytes / 4u);
+                    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(g_batch_cb);
+                    [enc setComputePipelineState:pso];
+                    [enc setBuffer:s.buffer offset:so atIndex:0];
+                    [enc setBuffer:d.buffer offset:dof atIndex:1];
+                    [enc setBytes:&n length:sizeof n atIndex:2];
+                    [enc dispatchThreadgroups:MTLSizeMake((n + 255u) / 256u, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    ds4_gpu_end_compute_encoder(g_batch_cb, enc);
+                    return 1;
+                }
+            }
+        }
+        ds4_gpu_close_batch_encoder();
+        id<MTLBlitCommandEncoder> blit = [g_batch_cb blitCommandEncoder];
+        if (!blit) return 0;
+        [blit copyFromBuffer:s.buffer
+                sourceOffset:(NSUInteger)(s.offset + src_offset)
+                    toBuffer:d.buffer
+           destinationOffset:(NSUInteger)(d.offset + dst_offset)
+                        size:(NSUInteger)bytes];
+        [blit endEncoding];
+        return 1;
     }
-    ds4_gpu_close_batch_encoder();
-    id<MTLBlitCommandEncoder> blit = [g_batch_cb blitCommandEncoder];
-    if (!blit) return 0;
-    [blit copyFromBuffer:s.buffer
-            sourceOffset:(NSUInteger)(s.offset + src_offset)
-                toBuffer:d.buffer
-       destinationOffset:(NSUInteger)(d.offset + dst_offset)
-                    size:(NSUInteger)bytes];
-    [blit endEncoding];
-    return 1;
 }
 
 int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,

@@ -1,0 +1,265 @@
+{
+  "baseline_revision": "8bf93945cc352195cdda75ae496801d6f4a63099",
+  "hardware": "M5 Max, 18 CPU cores, 40 GPU cores, 128 GiB",
+  "os": "macOS 26.6.2 (25G83)",
+  "compiler": "Apple clang 17.0.0 (clang-1700.3.19.1)",
+  "model": "DeepSeek-V4.1-Flash-1017-vq8sh14-q4k-mtpnative.gguf",
+  "model_sha256": "0da4ae2d7528ae6a60153ee072ddb4680b9d36f1c8f0b5915cdd950e89de5070",
+  "source_sha256": {
+    "metal/v41_attn.metal": "89509ea8fc46bdb1e4aa6f74467ef44be925132a698387d24e709a1fcfae7afa",
+    "metal/v41_dense.metal": "409d90534dd8dfd1ed088af392556f509235c29398d09ae99b302918caa905b0",
+    "src/core/core_v41.h": "770e7038fac65c36748701d557af7ec1acaebfd00af1c2ed2db7c5d370462e44",
+    "src/core/core_v41_api.c": "e3a2ed6299c36f12d8672e512648ec1c95a7635a388f9c971cd7a0e7b45f37a5",
+    "src/core/core_v41_engram.c": "e351c0f98208e15463e138667d90baa0d437daff9a379526d9df5818d8983d10",
+    "src/core/core_v41_forward.c": "b4e11a5f2b013db66bd1c4aafc338246e226ac8396835bd6caf7e553d8f7a6d1",
+    "src/core/core_v41_kvreuse.c": "5151ffbe3591b3f86a6a4d46e072b132783d44345ef64519394b5a256327beec",
+    "src/core/core_v41_state.c": "2b298c0b9b9f3717196a84895e17e0da7db8868a542efe34bc90b74298ab8612",
+    "src/metal/metal_tensor.m": "94698970c78bcbbf845bbda36eb6660689a662790eaf019d32567ee3086b917c",
+    "src/metal/metal_v41_args.h": "3b100888462c1b5f7ff9d1fde7286302927cf29554a8d4b51ce8b2f4167d35cd",
+    "src/metal/metal_v41_attn.m": "67a19e28344a63dce291a726b4bc0849d3057f9051b0d62d587f224cf07122c2",
+    "src/metal/metal_v41_dense.m": "06b87a0105157b24070eaa2b4cf7a7d791b4fe22b59e2e6a3ede03cd0f4f5c1f"
+  },
+  "api": {
+    "baseline-off": {
+      "runs": [
+        {"completed":true,"finish_reason":"length","usage":{"prompt_tokens":8192,"completion_tokens":128,"total_tokens":8320,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":8192}},"metrics":{"duration_s":28.1,"finish":"length","api":"openai","stream":true,"prompt_tokens":8192,"reused":0,"output_tokens":128,"prompt_total":8192,"prompt_read":8192,"first_token_s":12.684,"prompt_ms":12684.1,"decode_ms":15432.2,"decode_tok_s":8.3,"hit_rate":null,"drafts_offered":null,"drafts_accepted":null},"all_sha256":"7b9e2b1997de69d1a23b52998ca620982e3f5f486a812cb3dc3c6491b3c3bdf6","case":"quick/chinese-1"},
+        {"completed":true,"finish_reason":"length","usage":{"prompt_tokens":8192,"completion_tokens":128,"total_tokens":8320,"prompt_tokens_details":{"cached_tokens":8192,"cache_write_tokens":0}},"metrics":{"duration_s":15.5,"finish":"length","api":"openai","stream":true,"prompt_tokens":8192,"reused":8192,"output_tokens":128,"prompt_total":8192,"prompt_read":8192,"first_token_s":0.019,"prompt_ms":19.4,"decode_ms":15450.4,"decode_tok_s":8.3,"hit_rate":null,"drafts_offered":null,"drafts_accepted":null},"all_sha256":"7b9e2b1997de69d1a23b52998ca620982e3f5f486a812cb3dc3c6491b3c3bdf6","case":"quick/chinese-2"},
+        {"completed":true,"finish_reason":"length","usage":{"prompt_tokens":8192,"completion_tokens":128,"total_tokens":8320,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":8192}},"metrics":{"duration_s":28.3,"finish":"length","api":"openai","stream":true,"prompt_tokens":8192,"reused":0,"output_tokens":128,"prompt_total":8192,"prompt_read":8192,"first_token_s":12.876,"prompt_ms":12875.6,"decode_ms":15429.3,"decode_tok_s":8.3,"hit_rate":null,"drafts_offered":null,"drafts_accepted":null},"all_sha256":"852cbf3eb2fa2fc97ee8ed424e76e67c8f0b6bf5679f10b6517559dfcff508a4","case":"quick/code-1"},
+        {"completed":true,"finish_reason":"length","usage":{"prompt_tokens":8192,"completion_tokens":128,"total_tokens":8320,"prompt_tokens_details":{"cached_tokens":8192,"cache_write_tokens":0}},"metrics":{"duration_s":15.5,"finish":"length","api":"openai","stream":true,"prompt_tokens":8192,"reused":8192,"output_tokens":128,"prompt_total":8192,"prompt_read":8192,"first_token_s":0.018,"prompt_ms":18.2,"decode_ms":15441.1,"decode_tok_s":8.3,"hit_rate":null,"drafts_offered":null,"drafts_accepted":null},"all_sha256":"852cbf3eb2fa2fc97ee8ed424e76e67c8f0b6bf5679f10b6517559dfcff508a4","case":"quick/code-2"},
+        {"completed":true,"finish_reason":"length","usage":{"prompt_tokens":10,"completion_tokens":32,"total_tokens":42,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":10}},"metrics":{"duration_s":8.3,"finish":"length","api":"openai","stream":true,"prompt_tokens":10,"reused":0,"output_tokens":32,"prompt_total":10,"prompt_read":10,"first_token_s":4.618,"prompt_ms":4617.7,"decode_ms":3637.7,"decode_tok_s":8.8,"hit_rate":null,"drafts_offered":null,"drafts_accepted":null},"all_sha256":"d651852746a88ad54aea934dc7ca6a0bf6bf459f9160a20bbb0294dcaa988845","case":"quick/warmup"},
+        {"completed":true,"finish_reason":"stop","usage":{"prompt_tokens":227,"completion_tokens":577,"total_tokens":804,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":227}},"metrics":{"duration_s":69.9,"finish":"stop","api":"openai","stream":true,"prompt_tokens":227,"reused":0,"output_tokens":577,"prompt_total":227,"prompt_read":227,"first_token_s":1.509,"prompt_ms":1509.0,"decode_ms":68422.1,"decode_tok_s":8.4,"hit_rate":null,"drafts_offered":null,"drafts_accepted":null},"all_sha256":"44ee8f9af1633e062a98333bbf4e10587b3a27057a867be9ecdd432fce68b3a4","case":"questions/q1","final_answer":"B"},
+        {"completed":true,"finish_reason":"stop","usage":{"prompt_tokens":175,"completion_tokens":296,"total_tokens":471,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":175}},"metrics":{"duration_s":35.9,"finish":"stop","api":"openai","stream":true,"prompt_tokens":175,"reused":0,"output_tokens":296,"prompt_total":175,"prompt_read":175,"first_token_s":1.232,"prompt_ms":1232.1,"decode_ms":34647.1,"decode_tok_s":8.5,"hit_rate":null,"drafts_offered":null,"drafts_accepted":null},"all_sha256":"fd3f9bd823d308f8309fac5d0278f268c5acbbaf0b3845d7b729f4756f389fa2","case":"questions/q2","final_answer":"C"},
+        {"completed":true,"finish_reason":"stop","usage":{"prompt_tokens":107,"completion_tokens":384,"total_tokens":491,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":107}},"metrics":{"duration_s":46.0,"finish":"stop","api":"openai","stream":true,"prompt_tokens":107,"reused":0,"output_tokens":384,"prompt_total":107,"prompt_read":107,"first_token_s":1.101,"prompt_ms":1100.9,"decode_ms":44873.3,"decode_tok_s":8.6,"hit_rate":null,"drafts_offered":null,"drafts_accepted":null},"all_sha256":"60285feaa070017d31dc6eefa44af946e1586d2c0053425f33b6bdb9344d059d","case":"questions/q3","final_answer":"70"},
+        {"completed":true,"finish_reason":"length","usage":{"prompt_tokens":339,"completion_tokens":2048,"total_tokens":2387,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":339}},"metrics":{"duration_s":247.0,"finish":"length","api":"openai","stream":true,"prompt_tokens":339,"reused":0,"output_tokens":2048,"prompt_total":339,"prompt_read":339,"first_token_s":1.484,"prompt_ms":1483.8,"decode_ms":245560.9,"decode_tok_s":8.3,"hit_rate":null,"drafts_offered":null,"drafts_accepted":null},"all_sha256":"0330c8987f262679c029b1b94c80e71f4a03ee38f8652539f0b3261a16b38ce3","case":"questions/q4","final_answer":null}
+      ],
+      "memory": {
+        "peak_wired_gib": 111.30087280273438,
+        "max_pressure": 1,
+        "swap_use_growth_mib": 0.0,
+        "swapout_growth_mib": 0.0,
+        "compressed_growth_gib": 1.53472900390625,
+        "stop_reason": "InterruptedError: stop requested"
+      }
+    },
+    "baseline-on": {
+      "runs": [
+        {"completed":false,"error":"RuntimeError: incomplete stream","finish_reason":"error","usage":{"prompt_tokens":8192,"completion_tokens":1,"total_tokens":8193,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":8192}},"all_sha256":"43799a4d50e0cb19f37f6ce22b5cbcbf6954f13e9bb4604dca4104ae844374a4","case":"quick/chinese-1"},
+        {"completed":true,"finish_reason":"length","usage":{"prompt_tokens":10,"completion_tokens":32,"total_tokens":42,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":10}},"metrics":{"duration_s":4.5,"finish":"length","api":"openai","stream":true,"prompt_tokens":10,"reused":0,"output_tokens":32,"prompt_total":10,"prompt_read":10,"first_token_s":1.611,"prompt_ms":1611.3,"decode_ms":2934.2,"decode_tok_s":10.9,"hit_rate":null,"drafts_offered":40,"drafts_accepted":20},"all_sha256":"fdaff8ceb77fc938c4982ae61e5202fe3eedfabcd478770d70bce0087f79975f","case":"quick/warmup"}
+      ],
+      "memory": {
+        "peak_wired_gib": 112.24406433105469,
+        "max_pressure": 1,
+        "swap_use_growth_mib": 0.0,
+        "swapout_growth_mib": 0.0,
+        "compressed_growth_gib": 2.1944732666015625,
+        "stop_reason": "InterruptedError: stop requested"
+      }
+    },
+    "candidate-off": {
+      "runs": [
+        {"completed":true,"finish_reason":"length","usage":{"prompt_tokens":8192,"completion_tokens":128,"total_tokens":8320,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":8192}},"metrics":{"duration_s":27.8,"finish":"length","api":"openai","stream":true,"prompt_tokens":8192,"reused":0,"output_tokens":128,"prompt_total":8192,"prompt_read":8192,"first_token_s":12.328,"prompt_ms":12327.9,"decode_ms":15426.7,"decode_tok_s":8.3,"hit_rate":null,"drafts_offered":null,"drafts_accepted":null},"all_sha256":"5c4f2117aaf5fe9b7990446705c9497fcda52d510693e6269d32f868054177e7","case":"quick/chinese-1"},
+        {"completed":true,"finish_reason":"length","usage":{"prompt_tokens":8192,"completion_tokens":128,"total_tokens":8320,"prompt_tokens_details":{"cached_tokens":8192,"cache_write_tokens":0}},"metrics":{"duration_s":15.0,"finish":"length","api":"openai","stream":true,"prompt_tokens":8192,"reused":8192,"output_tokens":128,"prompt_total":8192,"prompt_read":8192,"first_token_s":0.006,"prompt_ms":5.5,"decode_ms":15015.4,"decode_tok_s":8.5,"hit_rate":null,"drafts_offered":null,"drafts_accepted":null},"all_sha256":"5c4f2117aaf5fe9b7990446705c9497fcda52d510693e6269d32f868054177e7","case":"quick/chinese-2"},
+        {"completed":true,"finish_reason":"length","usage":{"prompt_tokens":8192,"completion_tokens":128,"total_tokens":8320,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":8192}},"metrics":{"duration_s":28.6,"finish":"length","api":"openai","stream":true,"prompt_tokens":8192,"reused":0,"output_tokens":128,"prompt_total":8192,"prompt_read":8192,"first_token_s":13.077,"prompt_ms":13077.0,"decode_ms":15486.0,"decode_tok_s":8.3,"hit_rate":null,"drafts_offered":null,"drafts_accepted":null},"all_sha256":"33b2cd1aec934a8d8dcaafbe51d3695e908ff941ec5c30ef10fd74d06c5fffca","case":"quick/code-1"},
+        {"completed":true,"finish_reason":"length","usage":{"prompt_tokens":8192,"completion_tokens":128,"total_tokens":8320,"prompt_tokens_details":{"cached_tokens":8192,"cache_write_tokens":0}},"metrics":{"duration_s":15.1,"finish":"length","api":"openai","stream":true,"prompt_tokens":8192,"reused":8192,"output_tokens":128,"prompt_total":8192,"prompt_read":8192,"first_token_s":0.006,"prompt_ms":6.0,"decode_ms":15115.2,"decode_tok_s":8.5,"hit_rate":null,"drafts_offered":null,"drafts_accepted":null},"all_sha256":"33b2cd1aec934a8d8dcaafbe51d3695e908ff941ec5c30ef10fd74d06c5fffca","case":"quick/code-2"},
+        {"completed":true,"finish_reason":"length","usage":{"prompt_tokens":10,"completion_tokens":32,"total_tokens":42,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":10}},"metrics":{"duration_s":4.7,"finish":"length","api":"openai","stream":true,"prompt_tokens":10,"reused":0,"output_tokens":32,"prompt_total":10,"prompt_read":10,"first_token_s":1.216,"prompt_ms":1215.7,"decode_ms":3498.2,"decode_tok_s":9.1,"hit_rate":null,"drafts_offered":null,"drafts_accepted":null},"all_sha256":"fdaff8ceb77fc938c4982ae61e5202fe3eedfabcd478770d70bce0087f79975f","case":"quick/warmup"}
+      ],
+      "memory": {
+        "peak_wired_gib": 110.95602416992188,
+        "max_pressure": 1,
+        "swap_use_growth_mib": 0.0,
+        "swapout_growth_mib": 0.0,
+        "compressed_growth_gib": 0.7624359130859375,
+        "stop_reason": "InterruptedError: stop requested"
+      },
+      "exact_match_to_correctness-only-off": {
+        "quick/warmup": true,
+        "quick/chinese-1": true,
+        "quick/chinese-2": true,
+        "quick/code-1": true,
+        "quick/code-2": true
+      },
+      "median_8k_decode_tps": 8.4
+    },
+    "candidate-on": {
+      "runs": [
+        {"completed":true,"finish_reason":"length","usage":{"prompt_tokens":8192,"completion_tokens":128,"total_tokens":8320,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":8192}},"metrics":{"duration_s":26.1,"finish":"length","api":"openai","stream":true,"prompt_tokens":8192,"reused":0,"output_tokens":128,"prompt_total":8192,"prompt_read":8192,"first_token_s":17.133,"prompt_ms":17133.0,"decode_ms":8989.2,"decode_tok_s":14.2,"hit_rate":null,"drafts_offered":114,"drafts_accepted":77},"all_sha256":"5c4f2117aaf5fe9b7990446705c9497fcda52d510693e6269d32f868054177e7","case":"quick/chinese-1"},
+        {"completed":true,"finish_reason":"length","usage":{"prompt_tokens":8192,"completion_tokens":128,"total_tokens":8320,"prompt_tokens_details":{"cached_tokens":8192,"cache_write_tokens":0}},"metrics":{"duration_s":8.8,"finish":"length","api":"openai","stream":true,"prompt_tokens":8192,"reused":8192,"output_tokens":128,"prompt_total":8192,"prompt_read":8192,"first_token_s":0.007,"prompt_ms":6.5,"decode_ms":8825.9,"decode_tok_s":14.5,"hit_rate":null,"drafts_offered":113,"drafts_accepted":77},"all_sha256":"5c4f2117aaf5fe9b7990446705c9497fcda52d510693e6269d32f868054177e7","case":"quick/chinese-2"},
+        {"completed":true,"finish_reason":"length","usage":{"prompt_tokens":8192,"completion_tokens":128,"total_tokens":8320,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":8192}},"metrics":{"duration_s":27.2,"finish":"length","api":"openai","stream":true,"prompt_tokens":8192,"reused":0,"output_tokens":128,"prompt_total":8192,"prompt_read":8192,"first_token_s":17.381,"prompt_ms":17381.0,"decode_ms":9851.1,"decode_tok_s":13.0,"hit_rate":null,"drafts_offered":134,"drafts_accepted":75},"all_sha256":"33b2cd1aec934a8d8dcaafbe51d3695e908ff941ec5c30ef10fd74d06c5fffca","case":"quick/code-1"},
+        {"completed":true,"finish_reason":"length","usage":{"prompt_tokens":8192,"completion_tokens":128,"total_tokens":8320,"prompt_tokens_details":{"cached_tokens":8192,"cache_write_tokens":0}},"metrics":{"duration_s":9.7,"finish":"length","api":"openai","stream":true,"prompt_tokens":8192,"reused":8192,"output_tokens":128,"prompt_total":8192,"prompt_read":8192,"first_token_s":0.006,"prompt_ms":6.3,"decode_ms":9676.7,"decode_tok_s":13.2,"hit_rate":null,"drafts_offered":132,"drafts_accepted":75},"all_sha256":"33b2cd1aec934a8d8dcaafbe51d3695e908ff941ec5c30ef10fd74d06c5fffca","case":"quick/code-2"},
+        {"completed":true,"finish_reason":"length","usage":{"prompt_tokens":10,"completion_tokens":32,"total_tokens":42,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":10}},"metrics":{"duration_s":3.7,"finish":"length","api":"openai","stream":true,"prompt_tokens":10,"reused":0,"output_tokens":32,"prompt_total":10,"prompt_read":10,"first_token_s":1.485,"prompt_ms":1485.1,"decode_ms":2190.6,"decode_tok_s":14.6,"hit_rate":null,"drafts_offered":34,"drafts_accepted":20},"all_sha256":"fdaff8ceb77fc938c4982ae61e5202fe3eedfabcd478770d70bce0087f79975f","case":"quick/warmup"},
+        {"completed":true,"finish_reason":"length","usage":{"prompt_tokens":227,"completion_tokens":2048,"total_tokens":2275,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":227}},"metrics":{"duration_s":152.5,"finish":"length","api":"openai","stream":true,"prompt_tokens":227,"reused":0,"output_tokens":2048,"prompt_total":227,"prompt_read":227,"first_token_s":1.833,"prompt_ms":1833.2,"decode_ms":150693.5,"decode_tok_s":13.6,"hit_rate":null,"drafts_offered":1773,"drafts_accepted":1256},"all_sha256":"964b7c8d350eff6e0eb85890521b810d43f68de15580b6e15a2d667af963dd89","case":"questions/q1","final_answer":null},
+        {"completed":true,"finish_reason":"stop","usage":{"prompt_tokens":175,"completion_tokens":321,"total_tokens":496,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":175}},"metrics":{"duration_s":23.8,"finish":"stop","api":"openai","stream":true,"prompt_tokens":175,"reused":0,"output_tokens":321,"prompt_total":175,"prompt_read":175,"first_token_s":1.811,"prompt_ms":1810.6,"decode_ms":21958.5,"decode_tok_s":14.6,"hit_rate":null,"drafts_offered":296,"drafts_accepted":198},"all_sha256":"93f23e82e8fa94dc0c666c3c00c698e05eaf2bf1b0ee8ce1acb46c17e044c71e","case":"questions/q2","final_answer":"C"},
+        {"completed":true,"finish_reason":"stop","usage":{"prompt_tokens":107,"completion_tokens":459,"total_tokens":566,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":107}},"metrics":{"duration_s":30.1,"finish":"stop","api":"openai","stream":true,"prompt_tokens":107,"reused":0,"output_tokens":459,"prompt_total":107,"prompt_read":107,"first_token_s":1.591,"prompt_ms":1591.0,"decode_ms":28547.0,"decode_tok_s":16.1,"hit_rate":null,"drafts_offered":437,"drafts_accepted":311},"all_sha256":"7256fcecd597691589b24ff2c1e875ee01610edbe655f790c7d83dc2e9a66cec","case":"questions/q3","final_answer":"70"},
+        {"completed":true,"finish_reason":"stop","usage":{"prompt_tokens":339,"completion_tokens":412,"total_tokens":751,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":339}},"metrics":{"duration_s":31.3,"finish":"stop","api":"openai","stream":true,"prompt_tokens":339,"reused":0,"output_tokens":412,"prompt_total":339,"prompt_read":339,"first_token_s":2.266,"prompt_ms":2266.0,"decode_ms":29063.9,"decode_tok_s":14.2,"hit_rate":null,"drafts_offered":380,"drafts_accepted":259},"all_sha256":"4802223c29ea7ccffd03d10cc1eccd2d9e68e1f5c0d3768dfa8df8504bec4a84","case":"questions/q4","final_answer":"C"},
+        {"completed":true,"finish_reason":"length","usage":{"prompt_tokens":73696,"completion_tokens":16,"total_tokens":73712,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":73696}},"metrics":{"duration_s":242.9,"finish":"length","api":"openai","stream":true,"prompt_tokens":73696,"reused":0,"output_tokens":16,"prompt_total":73696,"prompt_read":73696,"first_token_s":241.928,"prompt_ms":241927.4,"decode_ms":1003.2,"decode_tok_s":15.9,"hit_rate":null,"drafts_offered":14,"drafts_accepted":13},"all_sha256":"41f235cf050bc1d4d4b63e129ce2de12c913cf7974302039e5384bef3f275cad","case":"lifetime/long-cold"},
+        {"completed":true,"finish_reason":"length","usage":{"prompt_tokens":73718,"completion_tokens":16,"total_tokens":73734,"prompt_tokens_details":{"cached_tokens":73696,"cache_write_tokens":22}},"metrics":{"duration_s":1.9,"finish":"length","api":"openai","stream":true,"prompt_tokens":73718,"reused":73696,"output_tokens":16,"prompt_total":73718,"prompt_read":73718,"first_token_s":0.776,"prompt_ms":773.0,"decode_ms":1117.6,"decode_tok_s":14.3,"hit_rate":null,"drafts_offered":15,"drafts_accepted":13},"all_sha256":"48030369131779c38bc6609f1f08b34f5d26a47230dbdaab746cb81528f8be0a","case":"lifetime/long-followup-01"},
+        {"completed":true,"finish_reason":"length","usage":{"prompt_tokens":73740,"completion_tokens":16,"total_tokens":73756,"prompt_tokens_details":{"cached_tokens":73718,"cache_write_tokens":22}},"metrics":{"duration_s":1.9,"finish":"length","api":"openai","stream":true,"prompt_tokens":73740,"reused":73718,"output_tokens":16,"prompt_total":73740,"prompt_read":73740,"first_token_s":0.777,"prompt_ms":774.8,"decode_ms":1117.1,"decode_tok_s":14.3,"hit_rate":null,"drafts_offered":14,"drafts_accepted":13},"all_sha256":"48030369131779c38bc6609f1f08b34f5d26a47230dbdaab746cb81528f8be0a","case":"lifetime/long-followup-02"},
+        {"completed":true,"finish_reason":"length","usage":{"prompt_tokens":73762,"completion_tokens":16,"total_tokens":73778,"prompt_tokens_details":{"cached_tokens":73740,"cache_write_tokens":22}},"metrics":{"duration_s":1.8,"finish":"length","api":"openai","stream":true,"prompt_tokens":73762,"reused":73740,"output_tokens":16,"prompt_total":73762,"prompt_read":73762,"first_token_s":0.775,"prompt_ms":772.3,"decode_ms":1028.5,"decode_tok_s":15.6,"hit_rate":null,"drafts_offered":13,"drafts_accepted":13},"all_sha256":"48030369131779c38bc6609f1f08b34f5d26a47230dbdaab746cb81528f8be0a","case":"lifetime/long-followup-03"},
+        {"completed":true,"finish_reason":"length","usage":{"prompt_tokens":73784,"completion_tokens":16,"total_tokens":73800,"prompt_tokens_details":{"cached_tokens":73762,"cache_write_tokens":22}},"metrics":{"duration_s":1.7,"finish":"length","api":"openai","stream":true,"prompt_tokens":73784,"reused":73762,"output_tokens":16,"prompt_total":73784,"prompt_read":73784,"first_token_s":0.734,"prompt_ms":731.7,"decode_ms":993.6,"decode_tok_s":16.1,"hit_rate":null,"drafts_offered":13,"drafts_accepted":13},"all_sha256":"48030369131779c38bc6609f1f08b34f5d26a47230dbdaab746cb81528f8be0a","case":"lifetime/long-followup-04"},
+        {"completed":true,"finish_reason":"length","usage":{"prompt_tokens":73806,"completion_tokens":16,"total_tokens":73822,"prompt_tokens_details":{"cached_tokens":73784,"cache_write_tokens":22}},"metrics":{"duration_s":1.9,"finish":"length","api":"openai","stream":true,"prompt_tokens":73806,"reused":73784,"output_tokens":16,"prompt_total":73806,"prompt_read":73806,"first_token_s":0.761,"prompt_ms":758.2,"decode_ms":1142.6,"decode_tok_s":14.0,"hit_rate":null,"drafts_offered":15,"drafts_accepted":12},"all_sha256":"48030369131779c38bc6609f1f08b34f5d26a47230dbdaab746cb81528f8be0a","case":"lifetime/long-followup-05"},
+        {"completed":true,"finish_reason":"length","usage":{"prompt_tokens":73828,"completion_tokens":16,"total_tokens":73844,"prompt_tokens_details":{"cached_tokens":73822,"cache_write_tokens":6}},"metrics":{"duration_s":1.3,"finish":"length","api":"openai","stream":true,"prompt_tokens":73828,"reused":73822,"output_tokens":16,"prompt_total":73828,"prompt_read":73828,"first_token_s":0.284,"prompt_ms":281.0,"decode_ms":1001.3,"decode_tok_s":16.0,"hit_rate":null,"drafts_offered":13,"drafts_accepted":13},"all_sha256":"48030369131779c38bc6609f1f08b34f5d26a47230dbdaab746cb81528f8be0a","case":"lifetime/long-followup-06"},
+        {"completed":true,"finish_reason":"length","usage":{"prompt_tokens":73850,"completion_tokens":16,"total_tokens":73866,"prompt_tokens_details":{"cached_tokens":73828,"cache_write_tokens":22}},"metrics":{"duration_s":1.9,"finish":"length","api":"openai","stream":true,"prompt_tokens":73850,"reused":73828,"output_tokens":16,"prompt_total":73850,"prompt_read":73850,"first_token_s":0.839,"prompt_ms":836.1,"decode_ms":1043.1,"decode_tok_s":15.3,"hit_rate":null,"drafts_offered":13,"drafts_accepted":13},"all_sha256":"48030369131779c38bc6609f1f08b34f5d26a47230dbdaab746cb81528f8be0a","case":"lifetime/long-followup-07"},
+        {"completed":true,"finish_reason":"length","usage":{"prompt_tokens":73872,"completion_tokens":16,"total_tokens":73888,"prompt_tokens_details":{"cached_tokens":73850,"cache_write_tokens":22}},"metrics":{"duration_s":1.8,"finish":"length","api":"openai","stream":true,"prompt_tokens":73872,"reused":73850,"output_tokens":16,"prompt_total":73872,"prompt_read":73872,"first_token_s":0.792,"prompt_ms":789.2,"decode_ms":1004.8,"decode_tok_s":15.9,"hit_rate":null,"drafts_offered":13,"drafts_accepted":13},"all_sha256":"48030369131779c38bc6609f1f08b34f5d26a47230dbdaab746cb81528f8be0a","case":"lifetime/long-followup-08"},
+        {"completed":true,"finish_reason":"length","usage":{"prompt_tokens":73894,"completion_tokens":16,"total_tokens":73910,"prompt_tokens_details":{"cached_tokens":73872,"cache_write_tokens":22}},"metrics":{"duration_s":1.8,"finish":"length","api":"openai","stream":true,"prompt_tokens":73894,"reused":73872,"output_tokens":16,"prompt_total":73894,"prompt_read":73894,"first_token_s":0.761,"prompt_ms":757.9,"decode_ms":1081.1,"decode_tok_s":14.8,"hit_rate":null,"drafts_offered":13,"drafts_accepted":13},"all_sha256":"48030369131779c38bc6609f1f08b34f5d26a47230dbdaab746cb81528f8be0a","case":"lifetime/long-followup-09"},
+        {"completed":true,"finish_reason":"length","usage":{"prompt_tokens":73916,"completion_tokens":16,"total_tokens":73932,"prompt_tokens_details":{"cached_tokens":73894,"cache_write_tokens":22}},"metrics":{"duration_s":1.8,"finish":"length","api":"openai","stream":true,"prompt_tokens":73916,"reused":73894,"output_tokens":16,"prompt_total":73916,"prompt_read":73916,"first_token_s":0.767,"prompt_ms":764.5,"decode_ms":1037.7,"decode_tok_s":15.4,"hit_rate":null,"drafts_offered":13,"drafts_accepted":13},"all_sha256":"48030369131779c38bc6609f1f08b34f5d26a47230dbdaab746cb81528f8be0a","case":"lifetime/long-followup-10"},
+        {"completed":true,"finish_reason":"length","usage":{"prompt_tokens":73938,"completion_tokens":16,"total_tokens":73954,"prompt_tokens_details":{"cached_tokens":73916,"cache_write_tokens":22}},"metrics":{"duration_s":1.8,"finish":"length","api":"openai","stream":true,"prompt_tokens":73938,"reused":73916,"output_tokens":16,"prompt_total":73938,"prompt_read":73938,"first_token_s":0.762,"prompt_ms":759.1,"decode_ms":995.0,"decode_tok_s":16.1,"hit_rate":null,"drafts_offered":13,"drafts_accepted":13},"all_sha256":"48030369131779c38bc6609f1f08b34f5d26a47230dbdaab746cb81528f8be0a","case":"lifetime/long-followup-11"},
+        {"completed":true,"finish_reason":"length","usage":{"prompt_tokens":73960,"completion_tokens":16,"total_tokens":73976,"prompt_tokens_details":{"cached_tokens":73938,"cache_write_tokens":22}},"metrics":{"duration_s":1.8,"finish":"length","api":"openai","stream":true,"prompt_tokens":73960,"reused":73938,"output_tokens":16,"prompt_total":73960,"prompt_read":73960,"first_token_s":0.76,"prompt_ms":757.5,"decode_ms":1041.9,"decode_tok_s":15.4,"hit_rate":null,"drafts_offered":13,"drafts_accepted":12},"all_sha256":"48030369131779c38bc6609f1f08b34f5d26a47230dbdaab746cb81528f8be0a","case":"lifetime/long-followup-12"},
+        {"completed":true,"finish_reason":"length","usage":{"prompt_tokens":10,"completion_tokens":32,"total_tokens":42,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":10}},"metrics":{"duration_s":2.4,"finish":"length","api":"openai","stream":true,"prompt_tokens":10,"reused":0,"output_tokens":32,"prompt_total":10,"prompt_read":10,"first_token_s":0.501,"prompt_ms":500.8,"decode_ms":1870.5,"decode_tok_s":17.1,"hit_rate":null,"drafts_offered":30,"drafts_accepted":20},"all_sha256":"fdaff8ceb77fc938c4982ae61e5202fe3eedfabcd478770d70bce0087f79975f","case":"lifetime/post-cancel"}
+      ],
+      "memory": {
+        "peak_wired_gib": 112.75984191894531,
+        "max_pressure": 1,
+        "swap_use_growth_mib": 0.0,
+        "swapout_growth_mib": 0.0,
+        "compressed_growth_gib": 0.4221649169921875,
+        "stop_reason": "InterruptedError: stop requested"
+      },
+      "exact_match_to_candidate-off": {
+        "quick/warmup": true,
+        "quick/chinese-1": true,
+        "quick/chinese-2": true,
+        "quick/code-1": true,
+        "quick/code-2": true
+      },
+      "median_8k_decode_tps": 13.7
+    },
+    "correctness-only-off": {
+      "runs": [
+        {"completed":true,"finish_reason":"length","usage":{"prompt_tokens":8192,"completion_tokens":128,"total_tokens":8320,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":8192}},"metrics":{"duration_s":28.7,"finish":"length","api":"openai","stream":true,"prompt_tokens":8192,"reused":0,"output_tokens":128,"prompt_total":8192,"prompt_read":8192,"first_token_s":13.131,"prompt_ms":13131.1,"decode_ms":15529.8,"decode_tok_s":8.2,"hit_rate":null,"drafts_offered":null,"drafts_accepted":null},"all_sha256":"5c4f2117aaf5fe9b7990446705c9497fcda52d510693e6269d32f868054177e7","case":"quick/chinese-1"},
+        {"completed":true,"finish_reason":"length","usage":{"prompt_tokens":8192,"completion_tokens":128,"total_tokens":8320,"prompt_tokens_details":{"cached_tokens":8192,"cache_write_tokens":0}},"metrics":{"duration_s":15.4,"finish":"length","api":"openai","stream":true,"prompt_tokens":8192,"reused":8192,"output_tokens":128,"prompt_total":8192,"prompt_read":8192,"first_token_s":0.019,"prompt_ms":18.8,"decode_ms":15373.8,"decode_tok_s":8.3,"hit_rate":null,"drafts_offered":null,"drafts_accepted":null},"all_sha256":"5c4f2117aaf5fe9b7990446705c9497fcda52d510693e6269d32f868054177e7","case":"quick/chinese-2"},
+        {"completed":true,"finish_reason":"length","usage":{"prompt_tokens":8192,"completion_tokens":128,"total_tokens":8320,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":8192}},"metrics":{"duration_s":28.9,"finish":"length","api":"openai","stream":true,"prompt_tokens":8192,"reused":0,"output_tokens":128,"prompt_total":8192,"prompt_read":8192,"first_token_s":13.372,"prompt_ms":13371.6,"decode_ms":15558.5,"decode_tok_s":8.2,"hit_rate":null,"drafts_offered":null,"drafts_accepted":null},"all_sha256":"33b2cd1aec934a8d8dcaafbe51d3695e908ff941ec5c30ef10fd74d06c5fffca","case":"quick/code-1"},
+        {"completed":true,"finish_reason":"length","usage":{"prompt_tokens":8192,"completion_tokens":128,"total_tokens":8320,"prompt_tokens_details":{"cached_tokens":8192,"cache_write_tokens":0}},"metrics":{"duration_s":15.8,"finish":"length","api":"openai","stream":true,"prompt_tokens":8192,"reused":8192,"output_tokens":128,"prompt_total":8192,"prompt_read":8192,"first_token_s":0.034,"prompt_ms":33.4,"decode_ms":15762.6,"decode_tok_s":8.1,"hit_rate":null,"drafts_offered":null,"drafts_accepted":null},"all_sha256":"33b2cd1aec934a8d8dcaafbe51d3695e908ff941ec5c30ef10fd74d06c5fffca","case":"quick/code-2"},
+        {"completed":true,"finish_reason":"length","usage":{"prompt_tokens":10,"completion_tokens":32,"total_tokens":42,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":10}},"metrics":{"duration_s":4.9,"finish":"length","api":"openai","stream":true,"prompt_tokens":10,"reused":0,"output_tokens":32,"prompt_total":10,"prompt_read":10,"first_token_s":1.244,"prompt_ms":1243.6,"decode_ms":3620.2,"decode_tok_s":8.8,"hit_rate":null,"drafts_offered":null,"drafts_accepted":null},"all_sha256":"fdaff8ceb77fc938c4982ae61e5202fe3eedfabcd478770d70bce0087f79975f","case":"quick/warmup"}
+      ],
+      "memory": {
+        "peak_wired_gib": 111.89596557617188,
+        "max_pressure": 2,
+        "swap_use_growth_mib": 0.0,
+        "swapout_growth_mib": 0.0,
+        "compressed_growth_gib": 3.6328277587890625,
+        "stop_reason": "InterruptedError: stop requested"
+      }
+    }
+  },
+  "scoring": {
+    "baseline-score-1": {
+      "nll_sha256": "4cb1a00a8cc9ee0d1db219bc3bf6c68093a222dbf1a50e9728b368fe327cc49e",
+      "topk_sha256": "02275e4752a2770d6884e0e9256bc013e677d5d7ee04c3d4308b3366423e52f5",
+      "native_summary": ["ds4: [v41] NLL 已写: n=127 全序列平均 1.9667 (PPL 7.1469)"]
+    },
+    "baseline-score-8": {
+      "nll_sha256": "3cadcb2c6e6eebf84d646f9c8f090ef314250dcfdbf477ceef50315b766f246f",
+      "topk_sha256": "aa811826d49c5124a09e587d61396591666f5053ff4e31a76189474a62cc4855",
+      "native_summary": ["ds4: [v41] NLL 已写: n=127 全序列平均 1.9638 (PPL 7.1266)"]
+    },
+    "candidate-score-1": {
+      "nll_sha256": "e7b04ec6f6c06f0f09caf265b0fd9112dd7b5e017849f6acbc9bf9582ae4f0c0",
+      "topk_sha256": "d41dece79b336a87aacca44e9fa883ac7c07ed9a52bc1680fa1688351591b61d",
+      "native_summary": ["ds4: [v41] NLL 已写: n=127 全序列平均 1.9611 (PPL 7.1070)"]
+    },
+    "candidate-score-8": {
+      "nll_sha256": "e7b04ec6f6c06f0f09caf265b0fd9112dd7b5e017849f6acbc9bf9582ae4f0c0",
+      "topk_sha256": "d41dece79b336a87aacca44e9fa883ac7c07ed9a52bc1680fa1688351591b61d",
+      "native_summary": ["ds4: [v41] NLL 已写: n=127 全序列平均 1.9611 (PPL 7.1070)"]
+    },
+    "baseline_chunk1_vs_chunk8_nll_equal": false,
+    "baseline_chunk1_vs_chunk8_topk_equal": false,
+    "candidate_chunk1_vs_chunk8_nll_equal": true,
+    "candidate_chunk1_vs_chunk8_topk_equal": true
+  },
+  "checks": {
+    "baseline-make-test": {
+      "exit": 2,
+      "failure_count": ["29"],
+      "diagnostics": ["ds4: [v41-test] q4_K batch parity groups=1 n=5 round=0 n=320 ref_rms=969.27 max_abs=0.00061 (限 0) @121 got=1601.05 ref=1601.05 ★FAIL★","tests/t_metal_v41_util.c:113: assertion failed: ok","ds4: [v41-test] q4_K batch parity groups=1 n=6 round=0 n=384 ref_rms=1019.5 max_abs=0.00061 (限 0) @121 got=1601.05 ref=1601.05 ★FAIL★","tests/t_metal_v41_util.c:113: assertion failed: ok","ds4: [v41-test] q4_K batch parity groups=1 n=7 round=0 n=448 ref_rms=998.5 max_abs=0.00061 (限 0) @121 got=1601.05 ref=1601.05 ★FAIL★","tests/t_metal_v41_util.c:113: assertion failed: ok","ds4: [v41-test] q4_K batch parity groups=1 n=8 round=0 n=512 ref_rms=1069.7 max_abs=0.00061 (限 0) @121 got=1601.05 ref=1601.05 ★FAIL★","tests/t_metal_v41_util.c:113: assertion failed: ok","ds4: [v41-test] q4_K batch parity groups=1 n=4 round=1 n=256 ref_rms=1006 max_abs=0.0312 (限 0) @237 got=-7.9375 ref=-7.90625 ★FAIL★","tests/t_metal_v41_util.c:113: assertion failed: ok","ds4: [v41-test] q4_K batch parity groups=1 n=5 round=1 n=320 ref_rms=969.14 max_abs=0.0312 (限 0) @237 got=-7.9375 ref=-7.90625 ★FAIL★","tests/t_metal_v41_util.c:113: assertion failed: ok","ds4: [v41-test] q4_K batch parity groups=1 n=6 round=1 n=384 ref_rms=1019.4 max_abs=0.0312 (限 0) @237 got=-7.9375 ref=-7.90625 ★FAIL★","tests/t_metal_v41_util.c:113: assertion failed: ok","ds4: [v41-test] q4_K batch parity groups=1 n=7 round=1 n=448 ref_rms=998.34 max_abs=0.0312 (限 0) @237 got=-7.9375 ref=-7.90625 ★FAIL★","tests/t_metal_v41_util.c:113: assertion failed: ok","ds4: [v41-test] q4_K batch parity groups=1 n=8 round=1 n=512 ref_rms=1069.5 max_abs=0.0312 (限 0) @237 got=-7.9375 ref=-7.90625 ★FAIL★","tests/t_metal_v41_util.c:113: assertion failed: ok","ds4: [v41-test] q4_K batch parity groups=4 n=2 round=0 n=544 ref_rms=1513.5 max_abs=0.000732 (限 0) @42 got=-3582.98 ref=-3582.98 ★FAIL★","tests/t_metal_v41_util.c:113: assertion failed: ok","ds4: [v41-test] q4_K batch parity groups=4 n=3 round=0 n=816 ref_rms=1419.8 max_abs=0.000732 (限 0) @42 got=-3582.98 ref=-3582.98 ★FAIL★","tests/t_metal_v41_util.c:113: assertion failed: ok","ds4: [v41-test] q4_K batch parity groups=4 n=4 round=0 n=1088 ref_rms=1354.6 max_abs=0.000732 (限 0) @42 got=-3582.98 ref=-3582.98 ★FAIL★","tests/t_metal_v41_util.c:113: assertion failed: ok","ds4: [v41-test] q4_K batch parity groups=4 n=5 round=0 n=1360 ref_rms=1322 max_abs=0.000732 (限 0) @42 got=-3582.98 ref=-3582.98 ★FAIL★","tests/t_metal_v41_util.c:113: assertion failed: ok","ds4: [v41-test] q4_K batch parity groups=4 n=6 round=0 n=1632 ref_rms=1367.2 max_abs=0.000732 (限 0) @42 got=-3582.98 ref=-3582.98 ★FAIL★","tests/t_metal_v41_util.c:113: assertion failed: ok","ds4: [v41-test] q4_K batch parity groups=4 n=7 round=0 n=1904 ref_rms=1325.8 max_abs=0.000732 (限 0) @42 got=-3582.98 ref=-3582.98 ★FAIL★","tests/t_metal_v41_util.c:113: assertion failed: ok","ds4: [v41-test] q4_K batch parity groups=4 n=8 round=0 n=2176 ref_rms=1284.1 max_abs=0.000732 (限 0) @42 got=-3582.98 ref=-3582.98 ★FAIL★","tests/t_metal_v41_util.c:113: assertion failed: ok","ds4: [v41-test] attention batch parity pos=27 ratio=128 n=24576 ref_rms=0.05012 max_abs=0.000977 (限 0) @463 got=-0.138672 ref=-0.137695 ★FAIL★","tests/t_metal_v41_util.c:113: assertion failed: ok","ds4: [v41-test] attention batch parity pos=60 ratio=128 n=24576 ref_rms=0.037901 max_abs=0.000488 (限 0) @30 got=-0.0625 ref=-0.0629883 ★FAIL★","tests/t_metal_v41_util.c:113: assertion failed: ok","metal-v41: ERR","metal-tensor-equivalence: SKIP (model 'ds4flash.gguf' 不存在 — 该套件要真模型, 见 --model)","ds4 tests: 29 failure(s)","asr: SKIP (no model at gguf/asr/moonshine-tiny-zh)"]
+    },
+    "baseline-all-test": {
+      "exit": 1,
+      "failure_count": ["29"],
+      "diagnostics": ["ds4: [v41-test] q4_K batch parity groups=1 n=5 round=0 n=320 ref_rms=969.27 max_abs=0.00061 (限 0) @121 got=1601.05 ref=1601.05 ★FAIL★","tests/t_metal_v41_util.c:113: assertion failed: ok","ds4: [v41-test] q4_K batch parity groups=1 n=6 round=0 n=384 ref_rms=1019.5 max_abs=0.00061 (限 0) @121 got=1601.05 ref=1601.05 ★FAIL★","tests/t_metal_v41_util.c:113: assertion failed: ok","ds4: [v41-test] q4_K batch parity groups=1 n=7 round=0 n=448 ref_rms=998.5 max_abs=0.00061 (限 0) @121 got=1601.05 ref=1601.05 ★FAIL★","tests/t_metal_v41_util.c:113: assertion failed: ok","ds4: [v41-test] q4_K batch parity groups=1 n=8 round=0 n=512 ref_rms=1069.7 max_abs=0.00061 (限 0) @121 got=1601.05 ref=1601.05 ★FAIL★","tests/t_metal_v41_util.c:113: assertion failed: ok","ds4: [v41-test] q4_K batch parity groups=1 n=4 round=1 n=256 ref_rms=1006 max_abs=0.0312 (限 0) @237 got=-7.9375 ref=-7.90625 ★FAIL★","tests/t_metal_v41_util.c:113: assertion failed: ok","ds4: [v41-test] q4_K batch parity groups=1 n=5 round=1 n=320 ref_rms=969.14 max_abs=0.0312 (限 0) @237 got=-7.9375 ref=-7.90625 ★FAIL★","tests/t_metal_v41_util.c:113: assertion failed: ok","ds4: [v41-test] q4_K batch parity groups=1 n=6 round=1 n=384 ref_rms=1019.4 max_abs=0.0312 (限 0) @237 got=-7.9375 ref=-7.90625 ★FAIL★","tests/t_metal_v41_util.c:113: assertion failed: ok","ds4: [v41-test] q4_K batch parity groups=1 n=7 round=1 n=448 ref_rms=998.34 max_abs=0.0312 (限 0) @237 got=-7.9375 ref=-7.90625 ★FAIL★","tests/t_metal_v41_util.c:113: assertion failed: ok","ds4: [v41-test] q4_K batch parity groups=1 n=8 round=1 n=512 ref_rms=1069.5 max_abs=0.0312 (限 0) @237 got=-7.9375 ref=-7.90625 ★FAIL★","tests/t_metal_v41_util.c:113: assertion failed: ok","ds4: [v41-test] q4_K batch parity groups=4 n=2 round=0 n=544 ref_rms=1513.5 max_abs=0.000732 (限 0) @42 got=-3582.98 ref=-3582.98 ★FAIL★","tests/t_metal_v41_util.c:113: assertion failed: ok","ds4: [v41-test] q4_K batch parity groups=4 n=3 round=0 n=816 ref_rms=1419.8 max_abs=0.000732 (限 0) @42 got=-3582.98 ref=-3582.98 ★FAIL★","tests/t_metal_v41_util.c:113: assertion failed: ok","ds4: [v41-test] q4_K batch parity groups=4 n=4 round=0 n=1088 ref_rms=1354.6 max_abs=0.000732 (限 0) @42 got=-3582.98 ref=-3582.98 ★FAIL★","tests/t_metal_v41_util.c:113: assertion failed: ok","ds4: [v41-test] q4_K batch parity groups=4 n=5 round=0 n=1360 ref_rms=1322 max_abs=0.000732 (限 0) @42 got=-3582.98 ref=-3582.98 ★FAIL★","tests/t_metal_v41_util.c:113: assertion failed: ok","ds4: [v41-test] q4_K batch parity groups=4 n=6 round=0 n=1632 ref_rms=1367.2 max_abs=0.000732 (限 0) @42 got=-3582.98 ref=-3582.98 ★FAIL★","tests/t_metal_v41_util.c:113: assertion failed: ok","ds4: [v41-test] q4_K batch parity groups=4 n=7 round=0 n=1904 ref_rms=1325.8 max_abs=0.000732 (限 0) @42 got=-3582.98 ref=-3582.98 ★FAIL★","tests/t_metal_v41_util.c:113: assertion failed: ok","ds4: [v41-test] q4_K batch parity groups=4 n=8 round=0 n=2176 ref_rms=1284.1 max_abs=0.000732 (限 0) @42 got=-3582.98 ref=-3582.98 ★FAIL★","tests/t_metal_v41_util.c:113: assertion failed: ok","ds4: [v41-test] attention batch parity pos=27 ratio=128 n=24576 ref_rms=0.05012 max_abs=0.000977 (限 0) @463 got=-0.138672 ref=-0.137695 ★FAIL★","tests/t_metal_v41_util.c:113: assertion failed: ok","ds4: [v41-test] attention batch parity pos=60 ratio=128 n=24576 ref_rms=0.037901 max_abs=0.000488 (限 0) @30 got=-0.0625 ref=-0.0629883 ★FAIL★","tests/t_metal_v41_util.c:113: assertion failed: ok","metal-v41: ERR","metal-tensor-equivalence: SKIP (model 'ds4flash.gguf' 不存在 — 该套件要真模型, 见 --model)","ds4 tests: 29 failure(s)","asr: SKIP (no model at gguf/asr/moonshine-tiny-zh)"]
+    },
+    "candidate-make-test": {
+      "exit": 2,
+      "failure_count": ["5"],
+      "diagnostics": ["asst lottery: 50 passed, 0 failed","  SKIP db live: cannot connect to 127.0.0.1:27017 (connection refused)","asst db: 76 passed, 0 failed","SKIP make_video render (no Firefox on this machine)","asst video: 1 passed, 0 failed","studio auth: 61 passed, 0 failed","studio net: 50 passed, 0 failed","studio models: 23 passed, 0 failed","phone: 38 passed, 0 failed","asst pay: 49 passed, 0 failed","asst task: 51 passed, 0 failed","asst push: 76 passed, 0 failed","asst plan: 69 passed, 0 failed","asst: 51 passed, 0 failed","push: 37 passed, 0 failed","long-context: SKIP (model 'ds4flash.gguf' 不存在 — 该套件要真模型, 见 --model)","tool-call-quality: SKIP (model 'ds4flash.gguf' 不存在 — 该套件要真模型, 见 --model)","logprob-vectors: SKIP (model 'ds4flash.gguf' 不存在 — 该套件要真模型, 见 --model)","local-golden-vectors: SKIP (model 'ds4flash.gguf' 不存在 — 该套件要真模型, 见 --model)","metal-short-prefill: SKIP (model 'ds4flash.gguf' 不存在 — 该套件要真模型, 见 --model)","tests/t_metal_kernels_moe.c:221: assertion failed: ok != 0","tests/t_metal_kernels_moe.c:258: assertion failed: rms < 0.06f * ref_rms","tests/t_metal_kernels_moe.c:259: assertion failed: max_abs < 0.25f * ref_rms","tests/t_metal_kernels_moe.c:374: assertion failed: ok != 0","tests/t_metal_kernels_moe.c:403: assertion failed: rms < 0.06f * ref_rms","metal-kernels: ERR","ds4: [v41-test] prefix 70754: exact / +5 reuse and failed-copy cold fallback passed","ds4: [v41-test] prefix 524288: exact / +5 reuse and failed-copy cold fallback passed","ds4: [v41-test] prefix 1048560: exact / +5 reuse and failed-copy cold fallback passed","ds4: V4.1 前向失败(pos0 0 n 1)","ds4: V4.1 前向失败(pos0 0 n 1)","ds4: V4.1 前向失败(pos0 0 n 1)","ds4: V4.1 前向失败(pos0 0 n 1)","ds4: V4.1 前向失败(pos0 0 n 1)","ds4: V4.1 前向失败(pos0 0 n 1)","ds4: V4.1 前向失败(pos0 0 n 1)","ds4: V4.1 前向失败(pos0 0 n 1)","metal-tensor-equivalence: SKIP (model 'ds4flash.gguf' 不存在 — 该套件要真模型, 见 --model)","ds4 tests: 5 failure(s)","asr: SKIP (no model at gguf/asr/moonshine-tiny-zh)"]
+    },
+    "candidate-all-test": {
+      "exit": 1,
+      "failure_count": ["5"],
+      "diagnostics": ["long-context: SKIP (model 'ds4flash.gguf' 不存在 — 该套件要真模型, 见 --model)","tool-call-quality: SKIP (model 'ds4flash.gguf' 不存在 — 该套件要真模型, 见 --model)","logprob-vectors: SKIP (model 'ds4flash.gguf' 不存在 — 该套件要真模型, 见 --model)","local-golden-vectors: SKIP (model 'ds4flash.gguf' 不存在 — 该套件要真模型, 见 --model)","metal-short-prefill: SKIP (model 'ds4flash.gguf' 不存在 — 该套件要真模型, 见 --model)","tests/t_metal_kernels_moe.c:221: assertion failed: ok != 0","tests/t_metal_kernels_moe.c:258: assertion failed: rms < 0.06f * ref_rms","tests/t_metal_kernels_moe.c:259: assertion failed: max_abs < 0.25f * ref_rms","tests/t_metal_kernels_moe.c:374: assertion failed: ok != 0","tests/t_metal_kernels_moe.c:403: assertion failed: rms < 0.06f * ref_rms","metal-kernels: ERR","ds4: [v41-test] prefix 70754: exact / +5 reuse and failed-copy cold fallback passed","ds4: [v41-test] prefix 524288: exact / +5 reuse and failed-copy cold fallback passed","ds4: [v41-test] prefix 1048560: exact / +5 reuse and failed-copy cold fallback passed","ds4: V4.1 前向失败(pos0 0 n 1)","ds4: V4.1 前向失败(pos0 0 n 1)","ds4: V4.1 前向失败(pos0 0 n 1)","ds4: V4.1 前向失败(pos0 0 n 1)","ds4: V4.1 前向失败(pos0 0 n 1)","ds4: V4.1 前向失败(pos0 0 n 1)","ds4: V4.1 前向失败(pos0 0 n 1)","ds4: V4.1 前向失败(pos0 0 n 1)","metal-tensor-equivalence: SKIP (model 'ds4flash.gguf' 不存在 — 该套件要真模型, 见 --model)","ds4 tests: 5 failure(s)","asr: SKIP (no model at gguf/asr/moonshine-tiny-zh)"]
+    },
+    "candidate-targeted": {
+      "exit": 0,
+      "suites": ["metal-tensor-lifetime","metal-v41-memory","metal-v41","server","engine-units","rax","tp-allreduce"]
+    }
+  },
+  "limits": {
+    "engine_budget_mib": 114000,
+    "max_output_tokens": 32768,
+    "rss_limit_gib": 120,
+    "footprint_limit_gib": 120,
+    "system_wired_limit_gib": 120,
+    "swap_growth_limit_mib": 8192,
+    "compressor_growth_limit_gib": 24,
+    "pressure_warning_seconds": 1800,
+    "sample_seconds": 0.5
+  },
+  "lifetime": {
+    "workspace": [
+      {"prompt":73696,"reused":0,"pending":73696,"rows":2048,"ctx":73722},
+      {"prompt":73718,"reused":73696,"pending":22,"rows":22,"ctx":73744},
+      {"prompt":73740,"reused":73718,"pending":22,"rows":22,"ctx":73766},
+      {"prompt":73762,"reused":73740,"pending":22,"rows":22,"ctx":73788},
+      {"prompt":73784,"reused":73762,"pending":22,"rows":22,"ctx":73810},
+      {"prompt":73806,"reused":73784,"pending":22,"rows":22,"ctx":73832},
+      {"prompt":73828,"reused":73822,"pending":6,"rows":10,"ctx":73854},
+      {"prompt":73850,"reused":73828,"pending":22,"rows":22,"ctx":73876},
+      {"prompt":73872,"reused":73850,"pending":22,"rows":22,"ctx":73898},
+      {"prompt":73894,"reused":73872,"pending":22,"rows":22,"ctx":73920},
+      {"prompt":73916,"reused":73894,"pending":22,"rows":22,"ctx":73942},
+      {"prompt":73938,"reused":73916,"pending":22,"rows":22,"ctx":73964},
+      {"prompt":73960,"reused":73938,"pending":22,"rows":22,"ctx":73986},
+      {"prompt":139188,"reused":0,"pending":139188,"rows":2048,"ctx":139326},
+      {"prompt":10,"reused":0,"pending":10,"rows":10,"ctx":52}
+    ],
+    "post_request_metal_mib": [108944.08,108944.08,108944.08,108944.08,108944.08,108944.08,108944.08,108944.2,108944.2,108944.2,108944.2,108944.2,108944.2,108944.31,108944.31],
+    "followup_allocation_range_mib": 0.12,
+    "cancel": {
+      "seconds_to_idle": 3.6739729999098927,
+      "request": {
+        "duration_s": 4.6,
+        "finish": "disconnect",
+        "api": "openai",
+        "stream": true,
+        "prompt_tokens": 139188,
+        "reused": 0,
+        "output_tokens": 0,
+        "prompt_total": 139188,
+        "prompt_read": 2048,
+        "first_token_s": null,
+        "prompt_ms": 4552.5,
+        "decode_ms": null,
+        "decode_tok_s": null,
+        "hit_rate": null,
+        "drafts_offered": null,
+        "drafts_accepted": null
+      }
+    }
+  },
+  "known_limits": ["CUDA runtime validation unavailable on this host.","make cpu fails in unchanged cli_opts.c on both revisions: missing ds4_gpu_set_model_cache_limit_mb and ds4_gpu_v41_set_indexer_mma declarations.","V4 logprob fixtures are not used as a V4.1 quality oracle; model-dependent all-test suites skip without a default V4 GGUF.","Synthetic near-1M state tests are capacity/index tests, not a full real-model 1M-token stress run.","Output drift relative to unmodified upstream is reported separately from DSpark parity and reclamation parity."],
+  "regressions": {
+    "baseline_new_failures": 24,
+    "candidate_new_failures": 0,
+    "baseline_all_failures": 29,
+    "candidate_all_failures": 5,
+    "warmed_32_cycle_growth_mib": {
+      "baseline": 256,
+      "candidate": 0
+    },
+    "guard_selftest": {
+      "limit_gib": 0.02,
+      "terminated": true,
+      "reason": "process memory"
+    }
+  }
+}

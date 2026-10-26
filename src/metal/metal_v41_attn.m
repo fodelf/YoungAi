@@ -8,7 +8,7 @@ int ds4_gpu_v41_sparse_attn_tensor(ds4_gpu_tensor *o, const ds4_gpu_tensor *q, c
                                    const void *model_map, uint64_t model_size, uint64_t sink_offset, uint32_t n_tok, uint32_t pos0, uint32_t window, uint32_t ng,
                                    uint32_t topk, uint32_t ratio, uint32_t n_head, uint32_t head_dim, float scale, int full_block, int ring, uint32_t win_lo,
                                    const ds4_gpu_tensor *posd, uint32_t pos_cap) {
-    (void)ratio; (void)pos_cap;
+    (void)pos_cap;
     if (!o || !q || !kv_win || head_dim != 512u || (n_head % 8u) || n_tok == 0) { fprintf(stderr, "ds4: [v41-metal] sparse attn 只实现 head_dim 512、头数 8 的倍数\n"); return 0; }
     if (!full_block && !ring) { fprintf(stderr, "ds4: [v41-metal] sparse attn: 主路窗口必须是环(decode.md D1)\n"); return 0; }
     if (ds4_gpu_tensor_bytes(kv_win) < (uint64_t)(window + n_tok) * head_dim * 4) { fprintf(stderr, "ds4: [v41-metal] 窗口缓冲不够 %u+%u 行\n", window, n_tok); return 0; }
@@ -17,7 +17,7 @@ int ds4_gpu_v41_sparse_attn_tensor(ds4_gpu_tensor *o, const ds4_gpu_tensor *q, c
     if (!sb) return 0;
     const int hasc = kv_comp && idx;
     v41_attn_args a = { pos0, window, hasc ? ng : 0u, hasc ? topk : 0u, n_head, head_dim, full_block ? n_tok : 0u, ring ? 1u : 0u, win_lo, posd ? 1u : 0u, hasc ? 1u : 0u, 0,
-                        scale, 0, 0, 0 };
+                        scale, g_v41_half_prefill ? ratio : 0u, 0, 0 }; /* training may supply frozen/noncausal index fixtures */
     /* ★解码小批分段(2026-10-17 M5)★: n ≤ 8 时原核一 threadgroup 串行扫全部键, 长上下文下 GPU 只开 n×8 个 threadgroup。
      * 键按 V41_ATTN_SPLIT_KEYS 一段分到 grid.z(最多 V41_ATTN_SPLIT_MAX 段), 再由 reduce 核合并(在线 softmax 的 max/sum 合法合并)。
      * 段数按实际可见键数估(主机知道位置时: 窗口里可见行 + 实际可选压缩组); 设备位置(posd)时只能按上限。
@@ -32,7 +32,10 @@ int ds4_gpu_v41_sparse_attn_tensor(ds4_gpu_tensor *o, const ds4_gpu_tensor *q, c
     }
     uint32_t S = (uint32_t)((kmax + V41_ATTN_SPLIT_KEYS - 1u) / V41_ATTN_SPLIT_KEYS);
     if (S > V41_ATTN_SPLIT_MAX) S = V41_ATTN_SPLIT_MAX;
-    if (n_tok <= DS4_V41_GEMV_MAX_TOK && S > 1u) {
+    /* Causal rows also use this kernel for S=1. A batch can straddle S=1/2;
+     * choosing a different kernel for the same row breaks greedy parity. */
+    if (n_tok <= DS4_V41_GEMV_MAX_TOK && (S > 1u || !full_block)) {
+        if (!S) S = 1u;
         static v41_scratch g_attn_part;
         id<MTLBuffer> pb = v41_grow(&g_attn_part, (uint64_t)n_tok * n_head * S * (head_dim + 2u) * 4u, "v41 attn split");
         if (pb) {

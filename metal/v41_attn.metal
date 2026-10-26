@@ -3,7 +3,7 @@
 // 这里只有标量版: 一 threadgroup 8 个 simdgroup = 8 个头(CUDA 是 4 warp × 2 头, 键序与在线 softmax 的分块(8 键一块)一致)。
 // posd 口径同 CUDA(ds4_gpu_v41.h "设备位置"): 非 NULL 时位置从 posd[0] 读, 主机的 ng/topk 当上限。必须排在 v41_common.metal 之后。
 
-struct v41_attn_args { uint pos0, window, ng, topk, n_head, hd, full_block, ring, win_lo, has_posd, has_comp, pad; float scale; float pad1, pad2, pad3; };
+struct v41_attn_args { uint pos0, window, ng, topk, n_head, hd, full_block, ring, win_lo, has_posd, has_comp, pad; float scale; uint ratio; float pad2, pad3; };
 // 窗口缓冲里绝对位置 a 住第几行(decode.md D1): 本批段 [window, window+n); 历史段 ring=1 环 / ring=0 线性
 inline uint v41_win_row(int a, uint pos0, uint window, uint ring) {
     if (a >= (int)pos0) return window + (uint)(a - (int)pos0);
@@ -220,8 +220,15 @@ kernel void kernel_v41_sparse_attn_split(constant v41_attn_args &a [[buffer(0)]]
     const uint nwin = last - lo + 1u;
     const uint topk = a.has_comp ? a.topk : 0u;
     const uint nkeys = nwin + topk;
-    const uint chunk = ((nkeys + S - 1u) / S + 7u) & ~7u;
-    const uint kb = sp * chunk, ke = min(nkeys, kb + chunk);
+    /* The host allocates for the largest row, but each causal row uses exactly
+     * its single-token key count and partitioning. Batch-end ng/topk can include
+     * future groups (-1 index padding); counting them changes bf16 softmax. */
+    const uint visible = a.has_comp && a.ratio ? min(topk, (p + 1u) / a.ratio) : topk;
+    const uint keys = a.full_block ? nkeys : nwin + visible;
+    const uint estimate = min(p + 1u, a.window + 1u) + min(a.ng, visible);
+    const uint row_s = a.full_block ? S : clamp((estimate + 31u) / 32u, 1u, 32u);
+    const uint chunk = ((keys + row_s - 1u) / row_s + 7u) & ~7u;
+    const uint kb = sp * chunk, ke = sp < row_s ? min(keys, kb + chunk) : 0u;
     for (uint base = kb; base < ke; base += 8u) {
         const uint nt = (ke - base) < 8u ? (ke - base) : 8u;
         threadgroup_barrier(mem_flags::mem_threadgroup);

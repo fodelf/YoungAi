@@ -60,7 +60,8 @@ template [[host_name("kernel_v41_gemv_nt6")]] kernel v41_gemv_t kernel_v41_gemv<
 template [[host_name("kernel_v41_gemv_nt7")]] kernel v41_gemv_t kernel_v41_gemv<7>;
 template [[host_name("kernel_v41_gemv_nt8")]] kernel v41_gemv_t kernel_v41_gemv<8>;
 
-// ---- q4_K、n_tok == 1 的 GEMV(2026-10-17 M5 提速): 移植自 llama.cpp kernel_mul_mv_q4_K_f32_impl(MIT, ggml-org/llama.cpp)。
+// ---- q4_K GEMV: each token runs identical arithmetic (grid.z selects token).
+// 移植自 llama.cpp kernel_mul_mv_q4_K_f32_impl(MIT, ggml-org/llama.cpp)。
 // 每 simdgroup 2 行, 每 threadgroup 2 个 simdgroup(64 线程); 一 lane 的 32 个 x 读进寄存器后两行复用; 16 位读量化字节 + 掩码不移位;
 // min 项按块 Σx 提出来。累加序与 kernel_v41_gemv<1> 不同 ⇒ 门是 NLL。要求 out_dim % 4 == 0、in_dim % 256 == 0(主机校验)。
 #define V41_Q4K_NR0 2
@@ -69,10 +70,12 @@ kernel void kernel_v41_gemv_q4k_ll(constant v41_gemv_args &a [[buffer(0)]], devi
                                    device float *out [[buffer(3)]], device const int *skip [[buffer(4)]],
                                    uint3 tgpig [[threadgroup_position_in_grid]], ushort tiisg [[thread_index_in_simdgroup]],
                                    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    if (a.has_skip != 0u && skip[0] >= 0) return;
+    const uint t = tgpig.z;
+    if (a.has_skip != 0u && skip[t] >= 0) return;
     constexpr ushort kmask1 = 0x3f3f, kmask2 = 0x0f0f, kmask3 = 0xc0c0;
     const uint g = tgpig.y;
-    x += (ulong)g * a.x_gstride; out += (ulong)g * a.out_gstride;
+    x += (ulong)t * a.x_stride + (ulong)g * a.x_gstride;
+    out += (ulong)t * a.out_stride + (ulong)g * a.out_gstride;
     const short ix = tiisg / 8, it = tiisg % 8, iq = it / 4, ir = it % 4;
     const uint nb = a.in_dim / 256u, rowb = nb * 144u;
     const uint first_row = (tgpig.x * V41_Q4K_NSG + sgitg) * V41_Q4K_NR0;
