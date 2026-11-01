@@ -40,7 +40,7 @@ LOG="$AIDER/tmp.benchmarks/$TAG.log"
 # 进过训练料的题跳过(gguf-tools/bench/data/trained_exclude.jsonl 里 task=aider 的行, bench_fail_to_task.py 写的): 没显式给 --keywords 时, 把其余全部题目列成 --keywords
 EXF=$ROOT/gguf-tools/bench/data/trained_exclude.jsonl
 if [ -s "$EXF" ] && [[ "$EXTRA" != *--keywords* ]]; then
-    KW=$(cd "$AIDER/tmp.benchmarks/polyglot-benchmark" && ls -d */exercises/practice/* | grep -v -x -F -f <(python3 -c "import json,sys; [print(r['id']) for r in map(json.loads, open(sys.argv[1])) if r['task'] == 'aider']" "$EXF") | paste -sd,)
+    KW=$(cd "$AIDER/tmp.benchmarks/polyglot-benchmark" && ls -d */exercises/practice/* | grep -v -x -F -f <(python3 -c "import json,sys; [print(r['id']) for r in map(json.loads, open(sys.argv[1])) if r['task'] == 'aider']" "$EXF") | paste -sd, -)   # macOS 的 paste 不给文件名就报 usage(11-01 实撞: 题目表空, benchmark.py 收到裸 --keywords 秒退), 要显式写 -
     NEX=$(python3 -c "import json,sys; print(sum(1 for r in map(json.loads, open(sys.argv[1])) if r['task'] == 'aider'))" "$EXF")
     EXTRA="$EXTRA --keywords $KW"; echo "# 排除进过训练料的题 $NEX 道($EXF)" | tee -a "$LOG"
 fi
