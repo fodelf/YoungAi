@@ -124,7 +124,9 @@ def ask(server, row, args, seed):
                                  headers={"Content-Type": "application/json"})
     t0 = time.time()
     with urllib.request.urlopen(req, timeout=args.timeout) as r:
-        return json.loads(r.read().decode()), time.time() - t0
+        # errors="replace": 11-01 04:41 IFEval 跑到 36 分钟服务端回了一段不是合法 UTF-8 的正文(温 1 采出的字节级 token 拼不成字),
+        # 严格解码炸掉整项; 坏字换成 U+FFFD 继续, 判分器看到的是 �(服务端该不该转义是引擎侧的事, 记在 fable5)
+        return json.loads(r.read().decode(errors="replace")), time.time() - t0
 
 
 def summarize(recs, args, n_items):
