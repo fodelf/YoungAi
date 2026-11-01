@@ -53,12 +53,14 @@ pipeline_tag: text-generation
 
 ![1-bit quants of DeepSeek V4.1 Flash 1017 compared on Unsloth's benchmarks: this project vs Unsloth UD-IQ1_S / IQ1_M and ISTA-DASLab GSQ-RCO IQ1_M](docs/img/quant_compare-en.png)
 
-**Our dataset here is small: read the magnitudes, not a ranking.** Each benchmark got 50 minutes on one serial lane, so our
-rows are random subsets with one sample per item: 205 answers in all (AIME25 18, HMMT 11, GPQA 27, MMLU-Pro 73, IFEval 61,
-LiveCodeBench 15). Unsloth's numbers use every item, up to 16 samples each. Our error bars run from ±3.5 to ±13.4 points.
-Avg of 6 is 82.5 ± 3.6, against 81.8 for GSQ-RCO, 83.5 for UD-IQ1_S and 85.6 for UD-IQ1_M. AIME25 reads low (77.8 ± 9.8
-against 92–95) and HMMT reads high (72.7 ± 13.4 against 54–63); neither is settled at this size. Aider Polyglot was not run:
-its official harness needs Docker, which our Spark lacks.
+**Our dataset here is small: read the magnitudes, not a ranking.** Each benchmark got 90 minutes on one serial lane, so our
+rows are random subsets, mostly one sample per item: 296 answers in all (AIME25 32, HMMT 14, GPQA 30, MMLU-Pro 117, IFEval 82,
+LiveCodeBench 21) plus 14 Aider exercises. The 9 items (1–2 per benchmark) that went into the restoration sidecar's training data
+are excluded. Unsloth's numbers use every item, up to 16 samples each. Our error bars run from ±2.4 to ±13.4 points.
+Avg of 6 is 80.9 ± 3.1, against 81.8 for GSQ-RCO, 83.5 for UD-IQ1_S and 85.6 for UD-IQ1_M. GPQA (80.0 ± 7.3 against 85–88)
+and HMMT (50.0 ± 13.4 against 54–63) read low, and in both the misses are mostly answers that hit the 32,768-token cap
+(5 of 30 and 4 of 14); neither is settled at this size. Aider Polyglot ran in the official Docker harness on a Mac with requests
+tunnelled to the Spark: 6 of 14 exercises passed, 42.9 ± 13.2, against 29.8–42.1.
 
 **These scores do not stand for what the model can actually do.** The pelican test below shows it: same model, same task,
 benchmark scores barely move, and the drawings are a step apart.
