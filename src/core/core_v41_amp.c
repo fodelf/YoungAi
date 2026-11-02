@@ -166,6 +166,39 @@ bool v41_amp_disown(ds4_v41_state *st) {
     return true;
 }
 
+/* 训练态叠在【带低秩件的 ②】上训 ③(2026-11-01, 用户: 行为类的轮不该碰 ② 的编程指标): 把缓存里 ② 的 A/B 拷成状态自己的张量(秩 k2 原样),
+ * 放掉缓存引用; 调用方(core_ptrain_bwd.c pt_run_alloc)再把它扩成 [k2 + k3] 行 —— 前 k2 行冻结(梯度每步清零), 后 k3 行是 ③, 落盘只写后 k3 行。
+ * 返回 ② 的秩 k2(训练层范围内各层要一样, 带路由 S 的 ② 不接 → −1); ② 没低秩件时等价 v41_amp_disown, 返回 0。
+ * 为什么不改应用核: 引擎挂 ②+③ 本来就是按秩拼接成一份 A/B(v41_amp_load), 训练态里同一形状, 前向/反传/落盘后的挂载逐位同一条路。 */
+int v41_amp_adopt(ds4_v41_state *st, uint32_t lo, uint32_t hi) {
+    if (!st->amp_shared) return 0;
+    uint32_t k2 = 0;
+    for (uint32_t il = lo; il <= hi && il < DS4_MAX_LAYER; il++) {
+        if (st->ampS[il]) { fprintf(stderr, "ds4: [ptrain] ② 在 L%u 带路由系数, 叠 ③ 不接\n", il); return -1; }
+        if (!st->ampA[il]) continue;
+        if (k2 && st->ampK[il] != k2) { fprintf(stderr, "ds4: [ptrain] ② 各层秩不一(L%u %u vs %u), 叠 ③ 不接\n", il, st->ampK[il], k2); return -1; }
+        k2 = st->ampK[il];
+    }
+    if (!k2) { for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) st->ampA[il] = st->ampB[il] = st->ampS[il] = NULL, st->ampK[il] = 0; }
+    else {
+        float *buf = NULL; size_t bn = 0;
+        for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {   /* 训练范围外有 ② 的层也拷成自己的: 放掉引用后不能再指着缓存 */
+            if (!st->ampA[il]) continue;
+            const uint64_t nel = (uint64_t)st->ampK[il] * DS4_N_EMBD;
+            if (bn < nel * 4) { free(buf); buf = xmalloc((size_t)nel * 4); bn = nel * 4; }
+            ds4_gpu_tensor *A = ds4_gpu_tensor_alloc(nel * 4), *B = ds4_gpu_tensor_alloc(nel * 4);
+            const bool ok = A && B && ds4_gpu_tensor_read(st->ampA[il], 0, buf, nel * 4) && ds4_gpu_tensor_write(A, 0, buf, nel * 4) &&
+                            ds4_gpu_tensor_read(st->ampB[il], 0, buf, nel * 4) && ds4_gpu_tensor_write(B, 0, buf, nel * 4);
+            if (!ok) { fprintf(stderr, "ds4: [ptrain] 拷 ② L%u 放大器失败\n", il); if (A) ds4_gpu_tensor_free(A); if (B) ds4_gpu_tensor_free(B); free(buf); return -1; }
+            st->ampA[il] = A; st->ampB[il] = B; st->ampS[il] = NULL;
+        }
+        free(buf);
+    }
+    st->amp_shared = 0;
+    if (g_pc.refs > 0) g_pc.refs--;
+    return (int)k2;
+}
+
 /* 裸底座: 两张进程级表全卸 + 缓存丢掉。★gr 也要卸★: 以前只卸 rb, 从"挂 ②③"切到"不挂"时上一套的增益覆盖还留在设备上, 裸底座不裸 */
 void v41_plugins_clear_all(void) {
     (void)v41_rb_load(NULL);

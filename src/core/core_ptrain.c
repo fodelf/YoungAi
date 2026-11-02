@@ -236,6 +236,13 @@ static bool pt_hccheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data 
 /* 一个优化步: 全局范数裁剪(标准配方, 防单批炸步) + Adam(核里顺手把梯度清零) */
 bool pt_opt_step(const pt_cfg *c, pt_run *r, uint32_t step, double *gnorm, int *clipped) {
     double ss = 0;
+    if (r->k2) {   /* ③ 叠在 ② 上(11-01): 前 k2 行是 ② 的低秩件, 冻结 —— 梯度清零(裁剪的范数也不算它); Adam 的 m/v 从零起、梯度恒零 ⇒ 这些行一步都不动 */
+        static float *zero = NULL; static uint64_t zn = 0;
+        const uint64_t n2 = (uint64_t)r->k2 * DS4_N_EMBD;
+        if (zn < n2) { free(zero); zero = xmalloc_zeroed((size_t)n2, 4); zn = n2; }
+        for (uint32_t il = c->layer_lo; il <= c->layer_hi; il++)
+            if (!ds4_gpu_tensor_write(r->gA[il], 0, zero, n2 * 4) || !ds4_gpu_tensor_write(r->gB[il], 0, zero, n2 * 4)) return false;
+    }
     for (uint32_t il = c->layer_lo; il <= c->layer_hi; il++) {
         double a = 0, bb = 0;
         if (!ds4_gpu_bwd_sumsq_tensor(r->gA[il], (uint64_t)r->K * DS4_N_EMBD, &a) || !ds4_gpu_bwd_sumsq_tensor(r->gB[il], (uint64_t)r->K * DS4_N_EMBD, &bb)) return false;

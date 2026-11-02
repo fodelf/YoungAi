@@ -24,43 +24,54 @@ static double pt_randn(void) {   /* Box-Muller, xorshift64*: 只用于放大器 
 bool pt_run_alloc(ds4_engine *e, const pt_cfg *c, pt_run *r) {
     (void)e;
     memset(r, 0, sizeof *r);
-    const uint32_t cap = c->maxlen, K = c->rank, E = DS4_N_EMBD, HC = DS4_N_HC;
+    const uint32_t cap = c->maxlen, E = DS4_N_EMBD, HC = DS4_N_HC;
+    uint32_t K = c->rank;   /* 可训的秩; ② 带低秩件时下面加上 ② 的 k2(前 k2 行冻结) */
     const bool multi = c->layer_lo < DS4_N_LAYER - 1u;   /* 末层以外也训 ⇒ 逐层反传(core_ptrain_layer.c) */
     /* 行缓冲(x/hc/logits/窗口块区)按 cap = maxlen; 组级缓存(comp_kv/index_k)按 ctx = max(ctxlen, maxlen)+8 —— 前缀形态整条样本的压缩行都要留着, 便宜 */
     const uint32_t ctx_total = c->ctxlen > cap ? c->ctxlen : cap;
     if (!v41_state_alloc(&r->st, cap, ctx_total + 8u, 0)) return false;   /* logits 每个位置都要(答案位那几行算 KL) */
     /* 训练态的 A/B 下面自己开, 不占插件缓存的引用: 占着, 轮末探针挂 (②, ckpt_eNN) 时缓存换不了组, 探针批态装不上插件 → 停车(10-22 实撞) */
-    if (!v41_amp_disown(&r->st)) { fprintf(stderr, "ds4: [ptrain] ② 带低秩放大器, 本版不接按秩拼接训练\n"); v41_state_free(&r->st); return false; }
-    r->K = K;
+    /* ② 带低秩件(10-25 起段 B 的产物都是)时: ② 的 A/B 拷成自己的占前 k2 行、冻结, ③ 占后 rank 行(11-01); 以前这里直接拒 */
+    const int k2i = v41_amp_adopt(&r->st, c->layer_lo, c->layer_hi);
+    if (k2i < 0) { v41_state_free(&r->st); return false; }
+    r->k2 = (uint32_t)k2i; K += r->k2; r->K = K;
+    if (r->k2) fprintf(stderr, "ds4: [ptrain] ② 带秩 %u 低秩件: 冻结在前 %u 行, ③ 秩 %u 叠在后面训(落盘只写 ③)\n", r->k2, r->k2, c->rank);
     bool ok = true;
-    const uint64_t nel = (uint64_t)K * E;
+    const uint64_t nel = (uint64_t)K * E, o2 = (uint64_t)r->k2 * E;   /* o2 = ② 那段的元素数 */
     float *buf = xmalloc((size_t)nel * 4);
     pt_rng_state = 0x9E3779B97F4A7C15ull ^ ((uint64_t)c->seed * 0xBF58476D1CE4E5B9ull);
     const float std = c->init_std > 0.f ? c->init_std : (float)(1.0 / sqrt((double)E));
     for (uint32_t il = c->layer_lo; il <= c->layer_hi && ok; il++) {
-        if (r->st.ampA[il]) { fprintf(stderr, "ds4: [ptrain] ② 在 L%u 已有放大器, 本版不接按秩拼接训练\n", il); ok = false; break; }
+        ds4_gpu_tensor *A2 = r->st.ampA[il], *B2 = r->st.ampB[il];   /* v41_amp_adopt 拷出来的 ② 本层低秩件(秩 k2), 没有 = 本层 ② 无低秩件(前 k2 行补零)*/
         /* A = 0(初态 ③ 恒等, 起点就是部署态), B ~ N(0, std²): 与 LoRA 一样一边置零一边随机, 否则两边梯度都是 0 */
         r->st.ampA[il] = v41_alloc(nel * 4, &ok); r->st.ampB[il] = v41_alloc(nel * 4, &ok);
         r->gA[il] = v41_alloc(nel * 4, &ok); r->gB[il] = v41_alloc(nel * 4, &ok);
         r->mA[il] = v41_alloc(nel * 4, &ok); r->vA[il] = v41_alloc(nel * 4, &ok);
         r->mB[il] = v41_alloc(nel * 4, &ok); r->vB[il] = v41_alloc(nel * 4, &ok);
         if (!ok) break;
-        for (uint64_t t = 0; t < nel; t++) buf[t] = (float)(pt_randn() * std);
+        for (uint64_t t = 0; t < o2; t++) buf[t] = 0.f;
+        for (uint64_t t = o2; t < nel; t++) buf[t] = (float)(pt_randn() * std);
         ok = ds4_gpu_tensor_fill_f32(r->st.ampA[il], 0.f, nel) && ds4_gpu_tensor_write(r->st.ampB[il], 0, buf, nel * 4) &&
              ds4_gpu_tensor_fill_f32(r->gA[il], 0.f, nel) && ds4_gpu_tensor_fill_f32(r->gB[il], 0.f, nel) &&
              ds4_gpu_tensor_fill_f32(r->mA[il], 0.f, nel) && ds4_gpu_tensor_fill_f32(r->vA[il], 0.f, nel) &&
              ds4_gpu_tensor_fill_f32(r->mB[il], 0.f, nel) && ds4_gpu_tensor_fill_f32(r->vB[il], 0.f, nel);
+        if (ok && A2) ok = ds4_gpu_tensor_read(A2, 0, buf, o2 * 4) && ds4_gpu_tensor_write(r->st.ampA[il], 0, buf, o2 * 4) &&
+                          ds4_gpu_tensor_read(B2, 0, buf, o2 * 4) && ds4_gpu_tensor_write(r->st.ampB[il], 0, buf, o2 * 4);
+        if (A2) ds4_gpu_tensor_free(A2);
+        if (B2) ds4_gpu_tensor_free(B2);
+        if (!ok) break;
         r->st.ampK[il] = K;
         if (!multi) r->save.moe_in[il] = v41_alloc((uint64_t)cap * E * 4, &ok);
-        if (ok && c->init[0]) {   /* 从已有 ③ 读起: 头 {E, K, 1=f32} + A[K][E] + B[K][E](pt_save_amp 的格式), 形状不对就停车, 不静默用随机初值 */
+        if (ok && c->init[0]) {   /* 从已有 ③ 读起: 头 {E, rank, 1=f32} + A[rank][E] + B[rank][E](pt_save_amp 的格式), 落在 ③ 那段(② 之后); 形状不对就停车, 不静默用随机初值 */
             char p[1200]; snprintf(p, sizeof p, "%s/amp_L%02u.bin", c->init, il);
             FILE *f = fopen(p, "rb");
             int32_t hd[3] = { 0, 0, 0 };
-            const bool got = f && fread(hd, 4, 3, f) == 3 && hd[0] == (int32_t)E && hd[1] == (int32_t)K && hd[2] == 1 &&
-                             fread(buf, 4, nel, f) == nel && ds4_gpu_tensor_write(r->st.ampA[il], 0, buf, nel * 4) &&
-                             fread(buf, 4, nel, f) == nel && ds4_gpu_tensor_write(r->st.ampB[il], 0, buf, nel * 4);
+            const uint64_t n3 = nel - o2;
+            const bool got = f && fread(hd, 4, 3, f) == 3 && hd[0] == (int32_t)E && hd[1] == (int32_t)c->rank && hd[2] == 1 &&
+                             fread(buf, 4, n3, f) == n3 && ds4_gpu_tensor_write(r->st.ampA[il], o2 * 4, buf, n3 * 4) &&
+                             fread(buf, 4, n3, f) == n3 && ds4_gpu_tensor_write(r->st.ampB[il], o2 * 4, buf, n3 * 4);
             if (f) fclose(f);
-            if (!got) { fprintf(stderr, "ds4: [ptrain] init: %s 读不了或形状不对(要 E %u K %u f32)\n", p, E, K); ok = false; break; }
+            if (!got) { fprintf(stderr, "ds4: [ptrain] init: %s 读不了或形状不对(要 E %u K %u f32)\n", p, E, c->rank); ok = false; break; }
         }
     }
     if (ok && c->init[0]) {   /* 叠加训练只许叠在同一份 ② 上: init 的 ③ 带 base.fnv(pt_save_amp 写的 ② 指纹), 与现挂的 ② 对不上就停车 */
@@ -81,7 +92,10 @@ bool pt_run_alloc(ds4_engine *e, const pt_cfg *c, pt_run *r) {
     if (ok && multi) ok = pt_layer_alloc(c, r);
     if (ok && multi && !c->nopack) ok = pt_pack_alloc(c, r);   /* 合批只接多层模式(只训末层的那条出口反传是按单题写的) */
     free(buf);
-    if (ok && !r->st.ampT) r->st.ampT = v41_alloc((uint64_t)cap * K * 4, &ok);
+    if (ok) {   /* T = x·B 按总秩 K 开; 状态从缓存拿来的 ampT 是按 ② 的秩开的, 叠 ③ 后不够, 重开 */
+        if (r->st.ampT) { ds4_gpu_tensor_free(r->st.ampT); r->st.ampT = NULL; }
+        r->st.ampT = v41_alloc((uint64_t)cap * K * 4, &ok);
+    }
     r->st.tsave = &r->save;
     const uint32_t TK = c->topk;
     r->tid = v41_alloc((uint64_t)cap * TK * 4, &ok); r->tp = v41_alloc((uint64_t)cap * TK * 4, &ok);
@@ -243,10 +257,12 @@ bool pt_save_amp(const pt_cfg *c, pt_run *r, const char *dir) {
         char p[1200]; snprintf(p, sizeof p, "%s/amp_L%02u.bin", dir, il);
         FILE *f = fopen(p, "wb");
         if (!f) { ok = false; break; }
-        const int32_t hd[3] = { (int32_t)E, (int32_t)K, 1 };   /* 1 = f32(训练产物原值落盘; 要省盘再走 fp4x32) */
+        /* 只写 ③ 那段(行 [k2, K)): ② 的前 k2 行是冻结的原件, 留在 ② 目录里, 挂载时引擎按秩拼回同一形状 */
+        const uint64_t o2 = (uint64_t)r->k2 * E, n3 = nel - o2;
+        const int32_t hd[3] = { (int32_t)E, (int32_t)(K - r->k2), 1 };   /* 1 = f32(训练产物原值落盘; 要省盘再走 fp4x32) */
         ok = fwrite(hd, 4, 3, f) == 3;
-        if (ok) ok = ds4_gpu_tensor_read(r->st.ampA[il], 0, buf, nel * 4) && fwrite(buf, 4, nel, f) == nel;
-        if (ok) ok = ds4_gpu_tensor_read(r->st.ampB[il], 0, buf, nel * 4) && fwrite(buf, 4, nel, f) == nel;
+        if (ok) ok = ds4_gpu_tensor_read(r->st.ampA[il], o2 * 4, buf, n3 * 4) && fwrite(buf, 4, n3, f) == n3;
+        if (ok) ok = ds4_gpu_tensor_read(r->st.ampB[il], o2 * 4, buf, n3 * 4) && fwrite(buf, 4, n3, f) == n3;
         fclose(f);
     }
     free(buf);

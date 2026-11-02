@@ -171,7 +171,8 @@ static inline ds4_gpu_tensor *pt_rows(const ds4_gpu_tensor *t, uint32_t r0, uint
 typedef struct {
     ds4_v41_state st;
     v41_tsave save;
-    uint32_t K;
+    uint32_t K;      /* A/B 的总行数 = k2 + rank */
+    uint32_t k2;     /* 前 k2 行是挂着的 ② 的低秩件(冻结: 梯度每步清零, 落盘不写; 11-01 ③ 叠 ②); ② 无低秩 / 训 ② 本身时 0 */
     ds4_gpu_tensor *gA[DS4_MAX_LAYER], *gB[DS4_MAX_LAYER], *mA[DS4_MAX_LAYER], *vA[DS4_MAX_LAYER], *mB[DS4_MAX_LAYER], *vB[DS4_MAX_LAYER];
     ds4_gpu_tensor *tid, *tp, *trest, *loss;   /* 一个样本的教师表 / 逐行损失(设备) */
     ds4_gpu_tensor *gxn, *gx, *ghc, *gpre, *gy, *T, *gT;   /* 反传暂存(按 maxlen 行); ghc/gpre 在多层模式下 = 逐层往下传的 g_hc / g_pre_mix */
