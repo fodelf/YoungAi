@@ -100,11 +100,18 @@ A 113.6 GB base plus a 145 MB restore sidecar picks the same next token as the 5
 | ① + ② code sidecar | + 41 MB | 82.0% | 79.7% |
 | ① + ② + ③ post-training | + 101 MB | 84.8% | 82.4% |
 | **① + restore sidecar (default on the Spark)** | **+ 145 MB** | **85.1%** | **82.2%** |
+| ① + restore sidecar + index patch | + 13 MB | **85.2%** | 81.6% |
 
 "Same" means that on the same text, our model and the original rank the same token first. Code is 15,360 held-out tokens
-across 30 languages; general English is WikiText-2. Mean KL by row: code 0.446 → 0.318 → 0.230 → 0.227, general English
-0.803 → 0.673 → 0.574 → 0.590. Against ② + ③ the restore sidecar is ahead on code Same top and level on code KL; on general
-English it is 0.2 points lower (1 of 512 tokens), above the 80% floor we hold it to.
+across 30 languages; general English is WikiText-2. Mean KL by row: code 0.446 → 0.318 → 0.230 → 0.227 → 0.224, general
+English 0.803 → 0.673 → 0.574 → 0.590 → 0.572. Against ② + ③ the restore sidecar is ahead on code Same top and level on
+code KL; on general English it is 0.2 points lower (1 of 512 tokens), above the 80% floor we hold it to.
+
+**The index patch** (`posttrain-restore-20261103`, 13 MB) changes no weight value at all: in layers 10–29 it re-picks the
+codeword of 788,000 groups of 8 expert weights, choosing by the gradient of the KL to the original on code token streams
+the ruler never sees and on short factual answers from the official API. A round is kept only if held-out code
+KL does not rise. It sits on top of the restore sidecar (`ds4-server --zchain <restore sidecar> --posttrain <patch>`)
+and is off by default: code KL drops 1.4% and general English gives back 0.6 points (3 of 512 tokens).
 
 **Three things get 113.6 GB this far:**
 

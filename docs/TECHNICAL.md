@@ -658,6 +658,25 @@ Same ruler:
 | Code judge slice, 15,360 | **85.04%** | 0.834 (0.902 / 0.475) | 0.230 | 1.098 |
 | WikiText-2, 512 | 82.03% | 0.777 (0.944 / 0.075) | 0.586 | 1.276 |
 
+**The index patch** (repository directory `posttrain-restore-20261103`, 12.6 MB, passed to `ds4-server --posttrain` on top
+of the restore sidecar) is the first piece that touches the quantized experts themselves without adding a parameter: the
+base stores every 8 expert weights as one index into a per-layer codebook, and the patch is a list of `{expert, matrix,
+row, column group, new index, old index}` records that the engine applies to the copy of the blob the GPU reads (the file
+on disk stays byte-identical; unloading writes the old indices back). Records are chosen one step per round: the
+gradient of the KL to the original weights with respect to each group's 8 dequantized weights is accumulated over a
+batch (one 15,360-token code stream, rotating over three fitting streams the ruler never sees, with the original model's
+full logits as teacher, plus 24 short factual answers with the official API's top-20 as teacher); for each group the 16 nearest codewords are scored by the first-order change and
+the best 0.05% of groups per matrix switch, but only when every stream in the batch agrees on the switch. A round is
+reverted if held-out code KL rises or the paired code gate drops by more than 2 SE. Two rounds of one hour each: layers
+10–19 on code + facts, then layers 20–29 with the agent-planning heads added (`core_ptrain_vstep.c`,
+`gguf-tools/scripts/vstep_spark.sh`). 787,503 groups changed (665,922 in 10–19, 121,581 in 20–29). Same ruler, against
+the restore sidecar it sits on (85.07% / 0.227 / 82.2%):
+
+| | Same top-1 | Σmin | Mean KL | Tail KL > 2 / > 1 |
+|---|---:|---:|---:|---:|
+| Code judge slice, 15,360 | **85.16%** | 0.838 | 0.2238 | 184 / 629 (sidecar 177 / 634) |
+| WikiText-2, 512 | 81.64% | 0.780 | 0.572 | |
+
 All of its training text is generated fresh by the official API. A 16-gram fingerprint check against both rulers: 24 of
 25 data files have zero hits; the one left hits two lines of Dockerfile boilerplate.
 
