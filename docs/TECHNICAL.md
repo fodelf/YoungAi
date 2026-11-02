@@ -669,7 +669,7 @@ full logits as teacher, plus 24 short factual answers with the official API's to
 the best 0.05% of groups per matrix switch, but only when every stream in the batch agrees on the switch. A round is
 reverted if held-out code KL rises or the paired code gate drops by more than 2 SE. Two rounds of one hour each: layers
 10–19 on code + facts, then layers 20–29 with the agent-planning heads added (`core_ptrain_vstep.c`,
-`gguf-tools/scripts/vstep_spark.sh`). 787,503 groups changed (665,922 in 10–19, 121,581 in 20–29). Same ruler, against
+`gguf-tools/scripts/vstep_spark.sh`). 786,957 groups changed (665,394 in 10–19, 121,563 in 20–29). Same ruler, against
 the restore sidecar it sits on (85.07% / 0.227 / 82.2%):
 
 | | Same top-1 | Σmin | Mean KL | Tail KL > 2 / > 1 |

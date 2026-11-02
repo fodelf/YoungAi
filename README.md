@@ -108,7 +108,7 @@ English 0.803 → 0.673 → 0.574 → 0.590 → 0.572. Against ② + ③ the res
 code KL; on general English it is 0.2 points lower (1 of 512 tokens), above the 80% floor we hold it to.
 
 **The index patch** (`posttrain-restore-20261103`, 13 MB) changes no weight value at all: in layers 10–29 it re-picks the
-codeword of 788,000 groups of 8 expert weights, choosing by the gradient of the KL to the original on code token streams
+codeword of 787,000 groups of 8 expert weights, choosing by the gradient of the KL to the original on code token streams
 the ruler never sees and on short factual answers from the official API. A round is kept only if held-out code
 KL does not rise. It sits on top of the restore sidecar (`ds4-server --zchain <restore sidecar> --posttrain <patch>`)
 and is what the Spark runs by default since Nov 3: code KL drops 1.4%, general English gives back 0.6 points (3 of 512
