@@ -249,16 +249,47 @@ bool json_raw_value(const char **p, char **out) {
     return true;
 }
 
+/* 一个 UTF-8 序列从 s[i] 起合法占几个字节; 0 = s[i] 不是合法领头(孤立续接字节 80~BF、C0/C1、F5 以上)。
+ * 领头合法但后面续接字节不够 / 不对(含 E0/ED/F0/F4 的第二字节范围: 超长编码与代理区按 RFC 3629 不算合法)时返回 -(已对上的字节数),
+ * 调用方把这几个字节整体换成一个 U+FFFD, 与 Python / HF tokenizer 的 errors="replace" 同样切法。 */
+static int utf8_seq_len(const unsigned char *s, size_t n, size_t i) {
+    const unsigned char c = s[i];
+    int need = c >= 0xC2 && c <= 0xDF ? 2 : c >= 0xE0 && c <= 0xEF ? 3 : c >= 0xF0 && c <= 0xF4 ? 4 : 0;
+    if (!need) return 0;
+    unsigned char lo = 0x80, hi = 0xBF;
+    if (c == 0xE0) lo = 0xA0; else if (c == 0xED) hi = 0x9F; else if (c == 0xF0) lo = 0x90; else if (c == 0xF4) hi = 0x8F;
+    int k = 1;
+    for (; k < need && i + (size_t)k < n; k++) {
+        const unsigned char d = s[i + (size_t)k];
+        if (d < (k == 1 ? lo : 0x80) || d > (k == 1 ? hi : 0xBF)) break;
+    }
+    return k == need ? need : -k;
+}
+
+/* 字符串体转义(不带引号), 顺手校验 UTF-8: 非法 / 不完整的多字节序列换成 U+FFFD(EF BF BD), 和 HF tokenizer decode 的行为一致。
+ * 为什么(2026-11-01 实撞): 字节级 BPE 词表里有"整字 + 下一个字的前两个字节"这种合并 token(15725 = E0 B0 BE E0 B0), 温 1 采样下模型
+ * 接着采了一个完整字而不是续接字节, 泰卢固语正文里就悬着 E0 B0; 以前这里逐字节原样拷进 JSON, 合法 JSON 必须是合法 UTF-8,
+ * 客户端严格解码炸掉整项跑分(IFEval 38 条里 2 条)。末尾被截的半字 utf8_stream_safe_len 已经挡住, 中间的只能在这里换。 */
+void ds4_json_escape_body(ds4_buf *b, const char *s, size_t n) {
+    const unsigned char *u = (const unsigned char *)s;
+    for (size_t i = 0; i < n; ) {
+        const unsigned char c = u[i];
+        if (c == '"' || c == '\\') { ds4_buf_putc(b, '\\'); ds4_buf_putc(b, (char)c); i++; }
+        else if (c == '\n') { ds4_buf_puts(b, "\\n"); i++; }
+        else if (c == '\r') { ds4_buf_puts(b, "\\r"); i++; }
+        else if (c == '\t') { ds4_buf_puts(b, "\\t"); i++; }
+        else if (c < 0x20) { ds4_buf_printf(b, "\\u%04x", (unsigned)c); i++; }
+        else if (c < 0x80) { ds4_buf_putc(b, (char)c); i++; }
+        else {
+            const int k = utf8_seq_len(u, n, i);
+            if (k > 0) { ds4_buf_append(b, s + i, (size_t)k); i += (size_t)k; }
+            else { ds4_buf_puts(b, "\xEF\xBF\xBD"); i += k < 0 ? (size_t)-k : 1; }
+        }
+    }
+}
+
 void ds4_json_escape(ds4_buf *b, const char *s) {
     ds4_buf_putc(b, '"');
-    for (; *s; s++) {
-        unsigned char c = (unsigned char)*s;
-        if (c == '"' || c == '\\') { ds4_buf_putc(b, '\\'); ds4_buf_putc(b, (char)c); }
-        else if (c == '\n') ds4_buf_puts(b, "\\n");
-        else if (c == '\r') ds4_buf_puts(b, "\\r");
-        else if (c == '\t') ds4_buf_puts(b, "\\t");
-        else if (c < 0x20) ds4_buf_printf(b, "\\u%04x", (unsigned)c);
-        else ds4_buf_putc(b, (char)c);
-    }
+    ds4_json_escape_body(b, s, strlen(s));
     ds4_buf_putc(b, '"');
 }

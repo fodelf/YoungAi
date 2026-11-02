@@ -35,5 +35,6 @@ bool json_bool(const char **p, bool *out);
 bool json_skip_value(const char **p);
 bool json_raw_value(const char **p, char **out);   /* 一个值的原文(malloc) */
 void ds4_json_escape(ds4_buf *b, const char *s);   /* 带双引号的 JSON 字符串字面量追加进 b */
+void ds4_json_escape_body(ds4_buf *b, const char *s, size_t n);   /* 只追加转义后的字符串体(不带引号), 前 n 字节; 非法 UTF-8 换 U+FFFD */
 
 #endif

@@ -42,6 +42,7 @@ void test_openai_tool_stream_holds_partial_dsml_entities(void);
 void test_openai_tool_stream_holds_partial_utf8_arguments(void);
 void test_openai_tool_stream_handles_multiple_calls(void);
 void test_streaming_holds_partial_utf8(void);
+void test_json_escape_replaces_invalid_utf8(void);   /* 非法 / 不完整 UTF-8 换 U+FFFD(server_tests_json_utf8.c, 2026-11-01) */
 void test_request_defaults_use_min_p_filtering(void);
 void test_reasoning_effort_mapping(void);
 void test_api_thinking_controls_parse(void);

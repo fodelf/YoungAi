@@ -37,31 +37,13 @@ bool send_all(int fd, const void *p, size_t n) {
 
 void json_escape(buf *b, const char *s) { ds4_json_escape(b, s); }   /* 实现在 src/common/ds4_json.c(训练页 daemon 共用) */
 
-void json_escape_n(buf *b, const char *s, size_t n) {
-    char *tmp = xstrndup(s ? s : "", n);
-    json_escape(b, tmp);
-    free(tmp);
+void json_escape_n(buf *b, const char *s, size_t n) {   /* 三个入口同一份转义(含非法 UTF-8 换 U+FFFD), 别再各抄一遍 */
+    ds4_buf_putc(b, '"');
+    ds4_json_escape_body(b, s ? s : "", s ? n : 0);
+    ds4_buf_putc(b, '"');
 }
 
-void json_escape_fragment_n(buf *b, const char *s, size_t n) {
-    for (size_t i = 0; i < n; i++) {
-        unsigned char c = (unsigned char)s[i];
-        if (c == '"' || c == '\\') {
-            ds4_buf_putc(b, '\\');
-            ds4_buf_putc(b, (char)c);
-        } else if (c == '\n') {
-            ds4_buf_puts(b, "\\n");
-        } else if (c == '\r') {
-            ds4_buf_puts(b, "\\r");
-        } else if (c == '\t') {
-            ds4_buf_puts(b, "\\t");
-        } else if (c < 0x20) {
-            ds4_buf_printf(b, "\\u%04x", (unsigned)c);
-        } else {
-            ds4_buf_putc(b, (char)c);
-        }
-    }
-}
+void json_escape_fragment_n(buf *b, const char *s, size_t n) { ds4_json_escape_body(b, s, n); }
 
 /* 所有 DSML 写法里最早出现的块起点。need_sep: 只认前面紧跟 "\n\n" 的(模板在正文与工具块之间写的分隔),
  * 命中时返回指向 "\n\n" —— raw_dsml 要带着它, 重放时才与采样出的字节一致。 */
