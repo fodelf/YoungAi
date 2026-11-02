@@ -295,11 +295,11 @@ kernel void kernel_v41_act_quant(constant v41_n_args &a [[buffer(0)]], device fl
     float s;
     if (mode == 0u) { am = max(am, 1e-4f); s = v41_pow2_ceil_log2(am / 448.0f); }
     else if (mode == 1u) { am = max(am, 6.0f * ldexp(1.0f, -126)); s = v41_pow2_ceil_log2(am / 6.0f); }
-    else { am = max(am, 6.0f * ldexp(1.0f, -9)); s = v41_e4m3_round(am / 6.0f); }
+    else { am = max(am, 6.0f * ldexp(1.0f, -9)); s = v41_fp4_e4m3_scale(am); }
     if (lane < block) {
-        float q = v / s;
-        if (mode == 0u) { q = min(max(q, -448.0f), 448.0f); q = v41_e4m3_round(q); }
-        else { q = min(max(q, -6.0f), 6.0f); q = v41_e2m1_round(q); }
+        float q;
+        if (mode == 0u) { q = min(max(v / s, -448.0f), 448.0f); q = v41_e4m3_round(q); }
+        else q = v41_fp4_to_f32(v41_fp4_scaled_nibble(v, s));
         p[lane] = v41_bf16r(q * s);
     }
 }
@@ -317,11 +317,11 @@ kernel void kernel_v41_kv_pack(constant v41_kvpack_args &a [[buffer(0)]], device
     const float v = lane < a.blk ? p[lane] : 0.0f;
     float am = simd_max(abs(v));
     float s;
-    if (a.mode == 0u) { am = max(am, 6.0f * ldexp(1.0f, -9)); s = v41_e4m3_round(am / 6.0f); }
+    if (a.mode == 0u) { am = max(am, 6.0f * ldexp(1.0f, -9)); s = v41_fp4_e4m3_scale(am); }
     else { am = max(am, 6.0f * ldexp(1.0f, -126)); s = v41_pow2_ceil_log2(am / 6.0f); }
     device uchar *row = cache + (ulong)grp * a.row_bytes;
     if (lane == 0u) row[a.nib_bytes + b] = (uchar)(a.mode == 0u ? v41_e4m3_f32_to_byte(s) : v41_e8m0_f32_to_byte(s));
-    const uint nib = lane < a.blk ? v41_fp4_f32_to_nibble(v / s) : 0u;
+    const uint nib = lane < a.blk ? v41_fp4_scaled_nibble(v, s) : 0u;
     const uint odd = simd_shuffle_down(nib, 1u);
     if (lane < a.blk && (lane & 1u) == 0u) row[(b * a.blk + lane) >> 1] = (uchar)(nib | (odd << 4));
 }

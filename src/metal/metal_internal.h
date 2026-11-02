@@ -188,6 +188,8 @@ int ds4_gpu_ensure_res_scratch(uint32_t n_active, uint64_t expert_bytes);
 void ds4_gpu_print_device_summary(void);
 void ds4_gpu_close_batch_encoder(void);
 int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *label);
+int ds4_gpu_tensor_write_queued(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
+void ds4_gpu_upload_pool_cleanup(void);
 int ds4_gpu_wait_pending_command_buffers(const char *label);
 int ds4_gpu_finish_command_buffer(id<MTLCommandBuffer> cb, int owned, const char *label);
 int ds4_gpu_submit_command_buffer_async(id<MTLCommandBuffer> cb, int owned);

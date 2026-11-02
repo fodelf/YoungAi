@@ -36,7 +36,7 @@ int ds4_engine_v41_score_ids(ds4_engine *e, const int *ids, int n_ids, const cha
     /* 单块样本自动落逐层 x/y(<out>.x_Lnn.bin / .y_Lnn.bin, f32 [n][5120]), 对拍定位用。上限原来是 64 位(09-12 P2 短样本);
      * 10-25 放到一块的容量: FP 教师 600 位之后回看失灵, 要在 2000 位的序列上按层、按位置段对拍才能定位在哪一层, 64 位看不到。
      * 一块 2048 位 × 40 层 × 2 份 × 20 KB = 3.3 GB 文件, 只在给了 --score-out 且整条一块时落。 */
-    st.dump_prefix = (n <= DS4_V41_CHUNK && cap == n) ? out_path : NULL;
+    st.dump_prefix = ((n <= DS4_V41_CHUNK && cap == n) || getenv("DS4_V41_PARITY_DUMP")) ? out_path : NULL;
     st.no_engram = no_engram;
     st.half_prefill = 1;   /* 打分量的是推理路的数(NLL 门), 与生成同核 */
     if (no_engram) fprintf(stderr, "[v41] ★no-engram★ 对拍口径, 跳过 engram 层\n");

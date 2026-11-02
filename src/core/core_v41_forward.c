@@ -51,7 +51,7 @@ static void v41_moe_uniq_probe(ds4_v41_state *st, uint32_t il, uint32_t topk, co
         /* ★预填块的路由分布(2026-09-29)★: 预填专家核按专家开工作项(≤ BN 个 token 一项, 超了再开一项 = 位流再解一遍), 所以每层"有 token 的专家数 /
          * 最大专家的 token 数 / 项数"决定它的成本; 微基准按均匀哈希路由(384 个专家各 n/64 个)算, 真路由偏斜多少只有量了才知道。 */
         int32_t *sb = xmalloc((size_t)ns * 4); uint32_t cnt[1024]; memset(cnt, 0, sizeof cnt);
-        if (ds4_gpu_synchronize() && ds4_gpu_tensor_read(st->sel, 0, sb, (uint64_t)ns * 4)) {
+        if (ds4_gpu_flush_commands() && ds4_gpu_tensor_read(st->sel, 0, sb, (uint64_t)ns * 4)) {
             uint32_t ne = 0, mx = 0, items32 = 0, items64 = 0, items128 = 0;
             for (uint32_t i = 0; i < ns; i++) if (sb[i] >= 0 && sb[i] < 1024) cnt[sb[i]]++;
             for (uint32_t e = 0; e < 1024u; e++) if (cnt[e]) { ne++; if (cnt[e] > mx) mx = cnt[e]; items32 += (cnt[e] + 31u) / 32u; items64 += (cnt[e] + 63u) / 64u; items128 += (cnt[e] + 127u) / 128u; }
@@ -66,7 +66,7 @@ static void v41_moe_uniq_probe(ds4_v41_state *st, uint32_t il, uint32_t topk, co
         free(sb);
         return;
     }
-    if (!ds4_gpu_synchronize() || !ds4_gpu_tensor_read(st->sel, 0, s, (uint64_t)ns * 4)) return;
+    if (!ds4_gpu_flush_commands() || !ds4_gpu_tensor_read(st->sel, 0, s, (uint64_t)ns * 4)) return;
     for (uint32_t i = 0; i < ns; i++) { uint32_t j = 0; while (j < i && s[j] != s[i]) j++; if (j == i) uniq++; }
     fprintf(stderr, "[%s] L%02u n=%u: 唯一专家 %u / %u\n", tag, il, st->n, uniq, ns);
 }
@@ -172,10 +172,12 @@ static void v41_nan_scan(const ds4_v41_state *st, uint32_t il) {
 
 static void v41_dump_rows(const ds4_v41_state *st, const ds4_gpu_tensor *t, const char *kind, uint32_t il, uint64_t rowf) {
     char p[4400]; float *buf = xmalloc((size_t)st->n * rowf * 4);
-    ds4_gpu_synchronize();
+    /* synchronize closes Metal's active batch; flush keeps it open for the
+     * remaining layer work. tensor_read waits for the flushed commands. */
+    ds4_gpu_flush_commands();
     if (ds4_gpu_tensor_read(t, 0, buf, (uint64_t)st->n * rowf * 4)) {
         snprintf(p, sizeof p, "%s.%s_L%02u.bin", st->dump_prefix, kind, il);
-        FILE *f = fopen(p, "wb"); if (f) { fwrite(buf, 4, (size_t)st->n * rowf, f); fclose(f); }
+        FILE *f = fopen(p, st->pos0 ? "ab" : "wb"); if (f) { fwrite(buf, 4, (size_t)st->n * rowf, f); fclose(f); }
     }
     free(buf);
 }
@@ -185,6 +187,7 @@ bool v41_layer(ds4_engine *e, ds4_v41_state *st, uint32_t il) {
     const ds4_model *m = &e->model;
     const ds4_layer_weights *l = st->draft ? &e->weights.mtp.tower[il] : &e->weights.layer[il];
     const uint32_t n = st->n, E = DS4_N_EMBD;
+    const bool trace = st->dump_prefix && getenv("DS4_V41_PARITY_DUMP");
     /* 后训练的 hc 边界检查: 在这一层入口给 hc 加一个方向扰动(推理时 tsave 恒 NULL, 不走这里) */
     if (!st->draft && st->tsave && st->tsave->hpert && st->tsave->hpert_layer == (int32_t)il && !st->tsave->hpert_mid &&
         !ds4_gpu_bwd_axpy_tensor(st->hc, st->tsave->hpert, st->tsave->hpert_eps, (uint64_t)n * DS4_N_HC * E)) return false;
@@ -208,8 +211,11 @@ bool v41_layer(ds4_engine *e, ds4_v41_state *st, uint32_t il) {
         st->mainh_wrote = rows;
     }
     /* attn 半层: 本层 attn 的 mixes 产 attn_pre(给下面 ffn 用)/attn_post/attn_comb; 入口用上一层传来的 pre_mix */
+    if (trace) v41_dump_rows(st, st->hc, "hi", il, E * DS4_N_HC);
     if (!v41_hc_half(e, st, l, true)) return false;
+    if (trace) v41_dump_rows(st, st->xn, "ax", il, E);
     if (!v41_attention(e, st, il)) return false;
+    if (trace) v41_dump_rows(st, st->attn_out, "ao", il, E);
     if (!st->draft && st->tsave && st->tsave->hc_in[il]) {   /* 后训练存档: 本层注意力用的压缩组号(倒着重算时它的来源层已经不在手边) */
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         const int16_t src = ratio ? g_ds4_v41.kv_source_of[il] : -1;
@@ -230,6 +236,7 @@ bool v41_layer(ds4_engine *e, ds4_v41_state *st, uint32_t il) {
     if (st->dump_prefix) { v41_dump_rows(st, st->xn, "x", il, E); v41_dump_rows(st, st->y, "y", il, E); }   /* 对拍夹具: MoE 入/出 */
     if (!ds4_gpu_v41_hc_post_tensor(st->hc2, st->y, st->hc, st->post, st->comb, E, DS4_N_HC, n)) return false;
     { ds4_gpu_tensor *t = st->hc; st->hc = st->hc2; st->hc2 = t; }   /* pre_mix ← ffn_pre 的交换已在 v41_hc_half 里做过 */
+    if (trace) v41_dump_rows(st, st->hc, "h", il, E * DS4_N_HC);
     return true;
 }
 

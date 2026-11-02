@@ -61,7 +61,14 @@ static void attn_case(uint32_t P0) {
     TEST_ASSERT(ds4_gpu_v41_ckv_pack_tensor(tc, 0, trow, NG, NULL, 0, 0, 0) != 0);
     uint8_t *cache = malloc((size_t)NG * DS4_V41_CKV_BYTES); TEST_ASSERT(test_v41_read(tc, cache, (uint64_t)NG * DS4_V41_CKV_BYTES));
     for (uint32_t g = 0; g < NG; g++) for (uint32_t d = 0; d < HD; d++) comp[g * HD + d] = ckv_get(cache + (size_t)g * DS4_V41_CKV_BYTES, d);
-    TEST_ASSERT(ds4_gpu_v41_sparse_attn_tensor(to, tq, tw, tc, tidx, test_v41_model_map(), test_v41_model_size(), o_sink, N, P0, W, NG, TOPK, 4, NH, HD, scale, 0, 1, 0, NULL, 0) != 0);
+    /* Frozen synthetic indices include noncausal entries; this is independent
+     * of the Metal forward precision setting. Preserve the CUDA fixture. */
+#ifdef __APPLE__
+    const uint32_t forward_ratio = 0;
+#else
+    const uint32_t forward_ratio = 4;
+#endif
+    TEST_ASSERT(ds4_gpu_v41_sparse_attn_tensor(to, tq, tw, tc, tidx, test_v41_model_map(), test_v41_model_size(), o_sink, N, P0, W, NG, TOPK, forward_ratio, NH, HD, scale, 0, 1, 0, NULL, 0) != 0);
     TEST_ASSERT(ds4_gpu_bwd_sparse_attn_tensor(tgq, tgkv, tgc, tgo, to, tq, tw, tc, tidx, test_v41_model_map(), test_v41_model_size(), o_sink, N, P0, W, NG, TOPK, NH, HD, scale) != 0);
     float *gq = malloc(nq * 4), *gkv = malloc((uint64_t)N * HD * 4), *gc = malloc((uint64_t)NG * HD * 4), *gwin = calloc(nw, 4);
     TEST_ASSERT(test_v41_read(to, o, nq * 4) && test_v41_read(tgq, gq, nq * 4) && test_v41_read(tgkv, gkv, (uint64_t)N * HD * 4) && test_v41_read(tgc, gc, (uint64_t)NG * HD * 4));

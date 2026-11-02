@@ -70,6 +70,30 @@ inline uint v41_fp4_f32_to_nibble(float x) {
     for (int i = 1; i < 8; i++) if (av == v41_fp4_tab[i]) { n = (uint)i; break; }
     return n == 0u ? 0u : (v < 0.0f ? (n | 8u) : n);
 }
+// Select in the original value domain: fast division can move an exact FP4
+// midpoint across its RNE boundary (e.g. .5859375 / .234375 = 2.5).
+// E4M3 scales and these binary midpoints multiply exactly in f32.
+inline uint v41_fp4_scaled_nibble(float x, float scale) {
+    const float ax = abs(x);
+    const uint n = uint(ax > .25f * scale) + uint(ax >= .75f * scale) +
+                   uint(ax > 1.25f * scale) + uint(ax >= 1.75f * scale) +
+                   uint(ax > 2.5f * scale) + uint(ax >= 3.5f * scale) + uint(ax > 5.0f * scale);
+    return n && x < 0.0f ? n | 8u : n;
+}
+// Round amax/6 to E4M3 without approximate division at a scale midpoint.
+inline float v41_fp4_e4m3_scale(float amax) {
+    int lo = 0, hi = 126;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) >> 1;
+        if (6.0f * v41_e4m3_value(mid) <= amax) lo = mid; else hi = mid - 1;
+    }
+    int best = lo;
+    if (best < 126) {
+        const float midpoint = 3.0f * (v41_e4m3_value(best) + v41_e4m3_value(best + 1));
+        if (amax > midpoint || (amax == midpoint && (best & 1))) best++;
+    }
+    return v41_e4m3_value(best);
+}
 inline uint v41_e8m0_f32_to_byte(float s) {
     const uint bits = as_type<uint>(s);
     return bits == 0x00400000u ? 0u : ((bits >> 23) & 0xffu);

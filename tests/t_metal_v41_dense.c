@@ -189,12 +189,54 @@ static void test_embed_colnorm(void) {
     }
 }
 
+/* Greedy DSpark verifies several rows at once. Each row must match the same
+ * production matmul dispatched alone, including grouped strides and rounding. */
+static void test_decode_batch_parity(uint32_t wt) {
+    const uint32_t sizes[] = {256, 1024, 5120}, N = 8;
+    for (uint32_t shape = 0; shape < 3; shape++) {
+    const uint32_t K = sizes[shape];
+    for (uint32_t G = 1; G <= ((wt == V41_WT_BF16 || wt == V41_WT_F32) ? 1u : 4u); G += 3) {
+        const uint32_t R = wt == V41_WT_Q4K && G == 4 ? 68 : 64;
+        const uint32_t D = G * K, O = G * R;
+        const uint64_t wb = test_v41_wbytes(wt, O, K);
+        TEST_ASSERT(test_v41_model_begin(wb + 4096));
+        const uint64_t off = test_v41_model_alloc(wb);
+        float *wref = malloc((size_t)O * K * 4), *x = malloc((size_t)N * D * 4);
+        float *single = malloc((size_t)N * O * 4), *batch = malloc((size_t)N * O * 4);
+        test_v41_make_weights(wt, O, K, test_v41_model_ptr(off), wref);
+        test_v41_fill_bf16(x, (uint64_t)N * D, 1.f);
+        TEST_ASSERT(test_v41_map());
+        ds4_gpu_tensor *tx = test_v41_tensor(x, (uint64_t)N * D * 4);
+        ds4_gpu_tensor *to = test_v41_tensor(NULL, (uint64_t)N * O * 4);
+        for (int rounded = 0; rounded <= 1; rounded++) {
+            for (uint32_t t = 0; t < N; t++) {
+                ds4_gpu_tensor *row = test_v41_tensor(x + (uint64_t)t * D, (uint64_t)D * 4);
+                TEST_ASSERT((G == 1 ? call_matmul(wt, to, off, K, R, row, 1, rounded)
+                                   : call_grouped(wt, to, off, G, K, R, row, 1, rounded)) != 0);
+                TEST_ASSERT(test_v41_read(to, single + (uint64_t)t * O, (uint64_t)O * 4));
+                ds4_gpu_tensor_free(row);
+            }
+            for (uint32_t n = 2; n <= N; n++) {
+                TEST_ASSERT((G == 1 ? call_matmul(wt, to, off, K, R, tx, n, rounded)
+                                   : call_grouped(wt, to, off, G, K, R, tx, n, rounded)) != 0);
+                TEST_ASSERT(test_v41_read(to, batch, (uint64_t)n * O * 4));
+                char label[80]; snprintf(label, sizeof label, "%s batch parity groups=%u n=%u round=%d", wt_name(wt), G, n, rounded);
+                test_v41_cmp(label, batch, single, (uint64_t)n * O, 0.f, 0.f);
+            }
+        }
+        ds4_gpu_tensor_free(tx); ds4_gpu_tensor_free(to);
+        free(wref); free(x); free(single); free(batch);
+    }
+    }
+}
+
 void test_metal_v41_dense(void) {
     test_v41_seed(0x41);
     for (uint32_t wt = 0; wt < 5; wt++) test_dense_type(wt);
     test_grouped_type(V41_WT_FP4X32); test_grouped_type(V41_WT_Q4K); test_grouped_type(V41_WT_FP8BLK);
     test_sgemm();
     test_embed_colnorm();
+    for (uint32_t wt = 0; wt < 5; wt++) test_decode_batch_parity(wt);
 }
 #else
 typedef int ds4_t_metal_v41_dense_nonempty_tu;

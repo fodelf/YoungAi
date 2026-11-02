@@ -93,6 +93,10 @@ int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *da
     if (!tensor || (!data && bytes != 0)) return 0;
     DS4MetalTensor *obj = ds4_gpu_tensor_obj(tensor);
     if (offset > obj.bytes || bytes > obj.bytes - offset) return 0;
+    /* Preserve queue order when an earlier dispatch still reads this tensor.
+     * The caller's bytes are snapshotted before return, including stack inputs. */
+    if (bytes && (g_batch_cb || [g_pending_cbs count]))
+        return ds4_gpu_tensor_write_queued(tensor, offset, data, bytes);
     if (bytes != 0) {
         memcpy((uint8_t *)[obj.buffer contents] + obj.offset + offset, data, (size_t)bytes);
     }

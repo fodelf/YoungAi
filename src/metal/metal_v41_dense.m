@@ -41,17 +41,14 @@ int v41_gemv(const void *model_map, uint64_t model_size, uint32_t wtype, uint64_
     a.sc_gstride = wtype == V41_WT_FP8BLK ? (uint64_t)((out_dim + 31u) / 32u) * a.sbc : 0;
     a.in_dim = (uint32_t)in_dim; a.out_dim = (uint32_t)out_dim; a.x_stride = x_stride; a.out_stride = out_stride; a.ksplit = ksplit;
     a.x_gstride = x_gstride; a.out_gstride = out_gstride; a.n_tok = n_tok; a.round_out = round_out ? 1u : 0u; a.wtype = wtype; a.has_skip = skip ? 1u : 0u;
-    /* q4_K、n_tok == 1: llama.cpp kernel_mul_mv_q4_K_f32 移植核(f32 激活, 只差加法次序; M5 解码 33.7 → 38 tok/s 的一半来自这里) */
-    if (wtype == V41_WT_Q4K && n_tok == 1u && (out_dim % 4u) == 0u && (in_dim % 256u) == 0u) {
+    /* Single-row and DSpark verification must use identical accumulation order.
+     * Verification shares weight loads while preserving each lane's decode arithmetic. */
+    if (wtype == V41_WT_Q4K && (out_dim % 4u) == 0u && (in_dim % 256u) == 0u) {
         v41_bind bq[] = { V41_A(a), V41_B(wb, 0), V41_T(x), V41_T(out), V41_T(skip) };
-        return v41_launch("kernel_v41_gemv_q4k_ll", bq, 5, MTLSizeMake((NSUInteger)(out_dim / 4u), n_groups, 1), MTLSizeMake(64, 1, 1));
-    }
-    /* q4_K、2 ≤ n_tok ≤ 8(投机验证批): 8 行同块广播 x + 权重整解一次的核(f32 激活) */
-    if (wtype == V41_WT_Q4K && n_tok >= 2u && (out_dim % 8u) == 0u && (in_dim % 256u) == 0u && (x_stride % 4u) == 0u &&
-        (x_gstride % 4u) == 0u && (ds4_gpu_tensor_offset(x) % 16u) == 0u) {
-        char qn[40]; snprintf(qn, sizeof qn, "kernel_v41_gemv_q4k_w%u", n_tok);
-        v41_bind bq[] = { V41_A(a), V41_B(wb, 0), V41_T(x), V41_T(out), V41_T(skip) };
-        return v41_launch(qn, bq, 5, MTLSizeMake((NSUInteger)(out_dim / 8u), n_groups, 1), MTLSizeMake(128, 1, 1));
+        char qname[48];
+        if (n_tok == 1u) snprintf(qname, sizeof qname, "kernel_v41_gemv_q4k_ll");
+        else snprintf(qname, sizeof qname, "kernel_v41_gemv_q4k_w%u", n_tok);
+        return v41_launch(qname, bq, 5, MTLSizeMake((NSUInteger)(out_dim / 4u), n_groups, 1), MTLSizeMake(64, 1, 1));
     }
     char name[48]; snprintf(name, sizeof name, "kernel_v41_gemv_nt%u", n_tok);
     const uint32_t rpb = 8u / ksplit;

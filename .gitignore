@@ -133,3 +133,6 @@ gguf-tools/bench/data/hmmt_feb26.jsonl
 gguf-tools/bench/data/ifeval.jsonl
 gguf-tools/bench/data/lcb_v6.jsonl
 gguf-tools/bench/data/mmlu_pro.jsonl
+
+/ds4-metal-q4-bench
+/ds4-metal-attention-replay

@@ -409,7 +409,7 @@ static void v41_engram_fingerprint(const ds4_v41_state *st, const v41_ejob *J, u
     const uint32_t n = st->n, cols = J->cols, stride = J->HD + J->nsc;
     const uint64_t cnt = (uint64_t)n * DS4_N_HC * DS4_N_EMBD;
     float *buf = xmalloc((size_t)cnt * 4);
-    ds4_gpu_synchronize();
+    ds4_gpu_flush_commands();
     const uint64_t hhc = ds4_gpu_tensor_read(st->hc, 0, buf, cnt * 4) ? v41_fnv1a(buf, (size_t)cnt * 4) : 0;
     free(buf);
     fprintf(stderr, "[v41-prof] L%02u engram 指纹 rows %016llx raw %016llx hc %016llx\n", il,
@@ -452,7 +452,7 @@ bool v41_engram_rows(ds4_engine *e, ds4_v41_state *st, uint32_t il) {
     }
     if (st->dump_prefix) {   /* 对拍夹具: 行号落 <prefix>.erows_Lnn.txt(每行一个位置, 24 个全局行号), 与 Python hash_ids 直接 diff */
         char p[4400]; snprintf(p, sizeof p, "%s.erows_L%02u.txt", st->dump_prefix, il);
-        FILE *df = fopen(p, "w");
+        FILE *df = fopen(p, st->pos0 ? "a" : "w");
         if (df) { for (uint32_t q = 0; q < n; q++) for (uint32_t c = 0; c < cols; c++) fprintf(df, "%lld%c", (long long)J->rows[ei][(size_t)q * cols + c], c + 1 == cols ? '\n' : ' '); fclose(df); }
     }
     if (!ds4_gpu_v41_engram_rows_tensor(st->erows, st->eraw[ei], n * cols, HD)) return false;
@@ -477,8 +477,8 @@ bool v41_engram_apply(ds4_engine *e, ds4_v41_state *st, uint32_t il) {
     if (!ds4_gpu_v41_engram_gate_tensor(st->hc, st->ekv, m->map, m->size, l->engram_q->abs_offset, l->engram_k->abs_offset, E, HC, n, DS4_RMS_EPS)) return false;
     if (st->dump_prefix) {   /* 对拍夹具: engram 后的 hc [n][HC][E] 落 <prefix>.hce_Lnn.bin(对 Python engram 模块输出) */
         char p[4400]; snprintf(p, sizeof p, "%s.hce_L%02u.bin", st->dump_prefix, il);
-        float *buf = xmalloc((size_t)n * HC * E * 4); ds4_gpu_synchronize();
-        if (ds4_gpu_tensor_read(st->hc, 0, buf, (uint64_t)n * HC * E * 4)) { FILE *f = fopen(p, "wb"); if (f) { fwrite(buf, 4, (size_t)n * HC * E, f); fclose(f); } }
+        float *buf = xmalloc((size_t)n * HC * E * 4); ds4_gpu_flush_commands();
+        if (ds4_gpu_tensor_read(st->hc, 0, buf, (uint64_t)n * HC * E * 4)) { FILE *f = fopen(p, st->pos0 ? "ab" : "wb"); if (f) { fwrite(buf, 4, (size_t)n * HC * E, f); fclose(f); } }
         free(buf);
     }
     if (g_ds4_v41_prof && J) v41_engram_fingerprint(st, J, il, (uint32_t)ei);

@@ -244,11 +244,71 @@ static void test_quant_pack_ring(void) {
       ds4_gpu_tensor_free(tw); ds4_gpu_tensor_free(ts); free(buf); free(got); free(snap); }
 }
 
+/* Non-power-of-two E4M3 scales expose approximate-division errors at FP4
+ * midpoints. Check every positive finite scale, both signs and both neighbours;
+ * expected codes come from the format's ties-to-even rule, not a division. */
+static void test_fp4_scaled_ties(void) {
+    const uint32_t dim = 512, rows = 126 * 3, count = rows * dim;
+    const float mids[7] = { .25f, .75f, 1.25f, 1.75f, 2.5f, 3.5f, 5.f };
+    const uint32_t ties[7] = { 0, 2, 2, 4, 4, 6, 6 };
+    float *x = malloc(count * 4), *got = malloc(count * 4), *ref = malloc(count * 4);
+    uint8_t *packed = malloc((size_t)rows * DS4_V41_CKV_BYTES);
+    for (uint32_t code = 1; code <= 126; code++) for (uint32_t near = 0; near < 3; near++) {
+        const uint32_t r = (code - 1) * 3 + near;
+        const float scale = ds4_e4m3fn_to_f32((uint8_t)code);
+        for (uint32_t d = 0; d < dim; d++) {
+            const uint32_t lane = d % 16, k = lane % 7;
+            float v = lane < 14 ? mids[k] * scale : (lane == 14 ? 6.f * scale : 0.f);
+            uint32_t q = near == 0 ? k : near == 2 ? k + 1 : ties[k];
+            if (lane < 14 && near != 1) v = nextafterf(v, near == 0 ? 0.f : INFINITY);
+            if (lane < 14 && lane >= 7) { v = -v; if (q) q |= 8; }
+            x[r * dim + d] = v;
+            ref[r * dim + d] = lane < 14 ? test_v41_bf16r(ds4_fp4_nibble_to_f32(q) * scale) : v;
+        }
+    }
+    ds4_gpu_tensor *tx = test_v41_tensor(x, count * 4), *tq = test_v41_tensor(x, count * 4);
+    ds4_gpu_tensor *tp = test_v41_tensor(NULL, (uint64_t)rows * DS4_V41_CKV_BYTES);
+    TEST_ASSERT(ds4_gpu_v41_act_quant_fp4_tensor(tq, rows, dim, 16, true) && test_v41_read(tq, got, count * 4));
+    test_v41_cmp("FP4 scaled midpoint act", got, ref, count, 0.f, 1e-3f);
+    TEST_ASSERT(ds4_gpu_v41_ckv_pack_tensor(tp, 0, tx, rows, NULL, 0, 0, 0) && test_v41_read(tp, packed, (uint64_t)rows * DS4_V41_CKV_BYTES));
+    uint32_t bad_scale = 0;
+    for (uint32_t r = 0; r < rows; r++) for (uint32_t d = 0; d < dim; d++) {
+        const uint8_t *p = packed + (size_t)r * DS4_V41_CKV_BYTES;
+        const uint32_t nib = (p[d / 2] >> ((d & 1) * 4)) & 15;
+        const uint8_t sc = p[DS4_V41_CKV_NIB + d / 16];
+        bad_scale += sc != r / 3 + 1;
+        got[r * dim + d] = test_v41_bf16r(ds4_fp4_nibble_to_f32(nib) * ds4_e4m3fn_to_f32(sc));
+    }
+    TEST_ASSERT(bad_scale == 0);
+    test_v41_cmp("FP4 scaled midpoint pack", got, ref, count, 0.f, 1e-3f);
+    /* Scale selection itself divides the block maximum by six. Exercise every
+     * E4M3 scale midpoint and its adjacent f32 values as well. */
+    for (uint32_t r = 0; r < rows; r++) {
+        const uint32_t lo = r / 3 + 1, near = r % 3;
+        float am = 3.f * (ds4_e4m3fn_to_f32(lo) + ds4_e4m3fn_to_f32(lo < 126 ? lo + 1 : lo));
+        if (near != 1) am = nextafterf(am, near == 0 ? 0.f : INFINITY);
+        for (uint32_t d = 0; d < dim; d++) x[r * dim + d] = am;
+    }
+    TEST_ASSERT(ds4_gpu_tensor_write(tx, 0, x, count * 4));
+    TEST_ASSERT(ds4_gpu_v41_ckv_pack_tensor(tp, 0, tx, rows, NULL, 0, 0, 0) && test_v41_read(tp, packed, (uint64_t)rows * DS4_V41_CKV_BYTES));
+    bad_scale = 0;
+    for (uint32_t r = 0; r < rows; r++) {
+        const uint32_t lo = r / 3 + 1, near = r % 3;
+        const uint32_t expected = lo == 126 ? lo : near == 0 ? lo : near == 2 ? lo + 1 : lo + (lo & 1);
+        for (uint32_t b = 0; b < dim / 16; b++) bad_scale += packed[(size_t)r * DS4_V41_CKV_BYTES + DS4_V41_CKV_NIB + b] != expected;
+    }
+    fprintf(stderr, "ds4: [v41-test] E4M3 scale midpoint mismatches %u\n", bad_scale);
+    TEST_ASSERT(bad_scale == 0);
+    ds4_gpu_tensor_free(tx); ds4_gpu_tensor_free(tq); ds4_gpu_tensor_free(tp);
+    free(x); free(got); free(ref); free(packed);
+}
+
 void test_metal_v41_layer(void) {
     test_v41_seed(0x4c);
     test_norm_hc();
     test_router_swiglu_pool_rope();
     test_quant_pack_ring();
+    test_fp4_scaled_ties();
 }
 #else
 typedef int ds4_t_metal_v41_layer_nonempty_tu;

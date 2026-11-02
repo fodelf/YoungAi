@@ -60,7 +60,8 @@ template [[host_name("kernel_v41_gemv_nt6")]] kernel v41_gemv_t kernel_v41_gemv<
 template [[host_name("kernel_v41_gemv_nt7")]] kernel v41_gemv_t kernel_v41_gemv<7>;
 template [[host_name("kernel_v41_gemv_nt8")]] kernel v41_gemv_t kernel_v41_gemv<8>;
 
-// ---- q4_K、n_tok == 1 的 GEMV(2026-10-17 M5 提速): 移植自 llama.cpp kernel_mul_mv_q4_K_f32_impl(MIT, ggml-org/llama.cpp)。
+// ---- q4_K single-row decode; verification below preserves this arithmetic.
+// 移植自 llama.cpp kernel_mul_mv_q4_K_f32_impl(MIT, ggml-org/llama.cpp)。
 // 每 simdgroup 2 行, 每 threadgroup 2 个 simdgroup(64 线程); 一 lane 的 32 个 x 读进寄存器后两行复用; 16 位读量化字节 + 掩码不移位;
 // min 项按块 Σx 提出来。累加序与 kernel_v41_gemv<1> 不同 ⇒ 门是 NLL。要求 out_dim % 4 == 0、in_dim % 256 == 0(主机校验)。
 #define V41_Q4K_NR0 2
@@ -69,6 +70,7 @@ kernel void kernel_v41_gemv_q4k_ll(constant v41_gemv_args &a [[buffer(0)]], devi
                                    device float *out [[buffer(3)]], device const int *skip [[buffer(4)]],
                                    uint3 tgpig [[threadgroup_position_in_grid]], ushort tiisg [[thread_index_in_simdgroup]],
                                    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    #pragma clang fp reassociate(off) contract(on)
     if (a.has_skip != 0u && skip[0] >= 0) return;
     constexpr ushort kmask1 = 0x3f3f, kmask2 = 0x0f0f, kmask3 = 0xc0c0;
     const uint g = tgpig.y;
@@ -112,9 +114,9 @@ kernel void kernel_v41_gemv_q4k_ll(constant v41_gemv_args &a [[buffer(0)]], devi
                 acc2[3] += yh[2 * i + 9] * (q2[i] & 0xF000);
             }
             sumf[row] += float(dh[0]) * ((acc1[0] + 1.f / 256.f * acc1[1]) * sc8[0] +
-                                         (acc1[2] + 1.f / 256.f * acc1[3]) * sc8[1] * 1.f / 16.f +
-                                         (acc2[0] + 1.f / 256.f * acc2[1]) * sc8[4] +
-                                         (acc2[2] + 1.f / 256.f * acc2[3]) * sc8[5] * 1.f / 16.f) -
+                                                                  (acc1[2] + 1.f / 256.f * acc1[3]) * sc8[1] * 1.f / 16.f +
+                                                                  (acc2[0] + 1.f / 256.f * acc2[1]) * sc8[4] +
+                                                                  (acc2[2] + 1.f / 256.f * acc2[3]) * sc8[5] * 1.f / 16.f) -
                          float(dh[1]) * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
             q1 += rowb / 2; sc += rowb / 2; dh += rowb / 2;
         }
@@ -127,75 +129,76 @@ kernel void kernel_v41_gemv_q4k_ll(constant v41_gemv_args &a [[buffer(0)]], devi
     }
 }
 
-// ---- q4_K、2 ≤ n_tok ≤ 8 的验证批 GEMV(2026-10-18 M5, DSpark 验证路): 一 simdgroup 管 8 行、32 lane 同时啃同一个 q4_K 块
-// (lane/8 = 行对, lane%8 = 块内 32 个权重, 布局同 ll 核), 4 个行对读同一段 x ⇒ 硬件合并成一次广播; 每行权重整解成 f32 后对 NT 个 token 各一次 FMA。
-// 一 threadgroup 4 个 simdgroup 管同 8 行、按块轮流分 K, 末尾 threadgroup 求和(小矩阵也有足够的并行)。累加序与 nt 核不同 ⇒ 门是 NLL。
-// 要求 out_dim % 8 == 0、in_dim % 256 == 0、x 行 16 B 对齐(主机校验)。
+// Verification rows share packed weights/scales; each row keeps the _ll lane
+// assignment, block traversal, expression tree, and simd_sum reduction.
 template <uint NT>
 kernel void kernel_v41_gemv_q4k_w(constant v41_gemv_args &a [[buffer(0)]], device const uchar *w [[buffer(1)]], device const float *x [[buffer(2)]],
-                                  device float *out [[buffer(3)]], device const int *skip [[buffer(4)]],
-                                  uint3 tgpig [[threadgroup_position_in_grid]], ushort tiisg [[thread_index_in_simdgroup]],
-                                  ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    threadgroup float red[4][8 * NT];
+                                   device float *out [[buffer(3)]], device const int *skip [[buffer(4)]],
+                                   uint3 tgpig [[threadgroup_position_in_grid]], ushort tiisg [[thread_index_in_simdgroup]],
+                                   ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    #pragma clang fp reassociate(off) contract(on)
     if (a.has_skip != 0u && skip[0] >= 0) return;
     constexpr ushort kmask1 = 0x3f3f, kmask2 = 0x0f0f, kmask3 = 0xc0c0;
     const uint g = tgpig.y;
     x += (ulong)g * a.x_gstride; out += (ulong)g * a.out_gstride;
-    const short rp = tiisg / 8, it = tiisg % 8, iq = it / 4, ir = it % 4;
+    const short ix = tiisg / 8, it = tiisg % 8, iq = it / 4, ir = it % 4;
     const uint nb = a.in_dim / 256u, rowb = nb * 144u;
-    const uint first_row = tgpig.x * 8u + (uint)rp * 2u;
+    const uint first_row = (tgpig.x * V41_Q4K_NSG + sgitg) * V41_Q4K_NR0;
     device const uchar *wrow = w + a.w_off + (ulong)g * a.w_gstride + (ulong)first_row * rowb;
-    float sumf[NT][2];
-    for (uint t = 0; t < NT; t++) { sumf[t][0] = 0.f; sumf[t][1] = 0.f; }
-    ushort sc16[4];
-    thread const uchar *sc8 = (thread const uchar *)sc16;
-    for (uint ib = sgitg; ib < nb; ib += 4u) {
-        float4 wv[2][8];
-        for (short row = 0; row < 2; row++) {
+    float sumf[NT][V41_Q4K_NR0] = {};
+    for (uint ib = ix; ib < nb; ib += 4) {
+        ushort4 scales[V41_Q4K_NR0], qlo[V41_Q4K_NR0], qhi[V41_Q4K_NR0];
+        half2 dm[V41_Q4K_NR0];
+        for (short row = 0; row < V41_Q4K_NR0; row++) {
             device const uchar *blk = wrow + (ulong)row * rowb + (ulong)ib * 144u;
             device const ushort *sc = (device const ushort *)(blk + 4) + iq;
-            const half2 dd = *(device const half2 *)blk;
-            const float d = float(dd.x), dm = float(dd.y);
-            sc16[0] = sc[0] & kmask1;
-            sc16[1] = sc[2] & kmask1;
-            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
-            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
-            const uint2 b1 = *(device const uint2 *)(blk + 16u + 32u * iq + 8u * ir);
-            const uint2 b2 = *(device const uint2 *)(blk + 16u + 32u * iq + 8u * ir + 64u);
-            const float s0 = d * sc8[0], s1 = d * sc8[1], s4 = d * sc8[4], s5 = d * sc8[5];
-            const float m0 = dm * sc8[2], m1 = dm * sc8[3], m4 = dm * sc8[6], m5 = dm * sc8[7];
-            wv[row][0] = s0 * float4(uint4(b1.x, b1.x >> 8, b1.x >> 16, b1.x >> 24) & 0xFu) - m0;
-            wv[row][1] = s0 * float4(uint4(b1.y, b1.y >> 8, b1.y >> 16, b1.y >> 24) & 0xFu) - m0;
-            wv[row][2] = s1 * float4(uint4(b1.x >> 4, b1.x >> 12, b1.x >> 20, b1.x >> 28) & 0xFu) - m1;
-            wv[row][3] = s1 * float4(uint4(b1.y >> 4, b1.y >> 12, b1.y >> 20, b1.y >> 28) & 0xFu) - m1;
-            wv[row][4] = s4 * float4(uint4(b2.x, b2.x >> 8, b2.x >> 16, b2.x >> 24) & 0xFu) - m4;
-            wv[row][5] = s4 * float4(uint4(b2.y, b2.y >> 8, b2.y >> 16, b2.y >> 24) & 0xFu) - m4;
-            wv[row][6] = s5 * float4(uint4(b2.x >> 4, b2.x >> 12, b2.x >> 20, b2.x >> 28) & 0xFu) - m5;
-            wv[row][7] = s5 * float4(uint4(b2.y >> 4, b2.y >> 12, b2.y >> 20, b2.y >> 28) & 0xFu) - m5;
+            device const ushort *q1 = (device const ushort *)(blk + 16) + 16 * iq + 4 * ir;
+            scales[row][0] = sc[0] & kmask1;
+            scales[row][1] = sc[2] & kmask1;
+            scales[row][2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+            scales[row][3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+            qlo[row] = *(device const ushort4 *)q1;
+            qhi[row] = *(device const ushort4 *)(q1 + 32);
+            dm[row] = *(device const half2 *)blk;
         }
         for (uint t = 0; t < NT; t++) {
-            device const float4 *y4 = (device const float4 *)(x + (ulong)t * a.x_stride + ib * 256u + 64u * iq + 8u * ir);
-            const float4 y0 = y4[0], y1 = y4[1], y2 = y4[8], y3 = y4[9], y4a = y4[32], y5 = y4[33], y6 = y4[40], y7 = y4[41];
-            for (short row = 0; row < 2; row++) {
-                sumf[t][row] += (dot(wv[row][0], y0) + dot(wv[row][1], y1)) + (dot(wv[row][2], y2) + dot(wv[row][3], y3)) +
-                                (dot(wv[row][4], y4a) + dot(wv[row][5], y5)) + (dot(wv[row][6], y6) + dot(wv[row][7], y7));
+            float yl[16], yh[16];
+            float4 sumy = {};
+            device const float *y4 = x + (ulong)t * a.x_stride + ib * 256u + 64 * iq + 8 * ir;
+            for (short i = 0; i < 8; ++i) {
+                yl[i + 0] = y4[i + 0];   sumy[0] += yl[i + 0];
+                yl[i + 8] = y4[i + 32];  sumy[1] += yl[i + 8];
+                yh[i + 0] = y4[i + 128]; sumy[2] += yh[i + 0];
+                yh[i + 8] = y4[i + 160]; sumy[3] += yh[i + 8];
+            }
+            for (short row = 0; row < V41_Q4K_NR0; row++) {
+                thread const uchar *sc8 = (thread const uchar *)(scales + row);
+                float4 acc1 = { 0.f, 0.f, 0.f, 0.f }, acc2 = { 0.f, 0.f, 0.f, 0.f };
+                for (short i = 0; i < 4; ++i) {
+                    acc1[0] += yl[2 * i + 0] * (qlo[row][i] & 0x000F);
+                    acc1[1] += yl[2 * i + 1] * (qlo[row][i] & 0x0F00);
+                    acc1[2] += yl[2 * i + 8] * (qlo[row][i] & 0x00F0);
+                    acc1[3] += yl[2 * i + 9] * (qlo[row][i] & 0xF000);
+                    acc2[0] += yh[2 * i + 0] * (qhi[row][i] & 0x000F);
+                    acc2[1] += yh[2 * i + 1] * (qhi[row][i] & 0x0F00);
+                    acc2[2] += yh[2 * i + 8] * (qhi[row][i] & 0x00F0);
+                    acc2[3] += yh[2 * i + 9] * (qhi[row][i] & 0xF000);
+                }
+                sumf[t][row] += float(dm[row][0]) * ((acc1[0] + 1.f / 256.f * acc1[1]) * sc8[0] +
+                                         (acc1[2] + 1.f / 256.f * acc1[3]) * sc8[1] * 1.f / 16.f +
+                                         (acc2[0] + 1.f / 256.f * acc2[1]) * sc8[4] +
+                                         (acc2[2] + 1.f / 256.f * acc2[3]) * sc8[5] * 1.f / 16.f) -
+                         float(dm[row][1]) * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
             }
         }
     }
-    /* 行对内 8 个 lane 求和(xor 4/2/1 不跨行对), 再跨 4 个 simdgroup 求和 */
-    for (uint t = 0; t < NT; t++) for (short row = 0; row < 2; row++) {
-        float v = sumf[t][row];
-        v += simd_shuffle_xor(v, 4u); v += simd_shuffle_xor(v, 2u); v += simd_shuffle_xor(v, 1u);
-        if (it == 0) red[sgitg][((uint)rp * 2u + (uint)row) * NT + t] = v;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const uint tid = (uint)sgitg * 32u + tiisg;
-    if (tid < 8u * NT) {
-        const uint rl = tid / NT, t = tid % NT, r = tgpig.x * 8u + rl;
-        const float v = (red[0][tid] + red[1][tid]) + (red[2][tid] + red[3][tid]);
-        if (r < a.out_dim) out[(ulong)t * a.out_stride + r] = a.round_out ? v41_bf16r(v) : v;
+    for (uint t = 0; t < NT; t++) for (short row = 0; row < V41_Q4K_NR0; ++row) {
+        const uint r = first_row + row;
+        const float sa = simd_sum(sumf[t][row]);
+        if (tiisg == 0 && r < a.out_dim) out[(ulong)t * a.out_stride + r] = a.round_out ? v41_bf16r(sa) : sa;
     }
 }
+
 typedef decltype(kernel_v41_gemv_q4k_w<2>) v41_q4k_w_t;
 template [[host_name("kernel_v41_gemv_q4k_w2")]] kernel v41_q4k_w_t kernel_v41_gemv_q4k_w<2>;
 template [[host_name("kernel_v41_gemv_q4k_w3")]] kernel v41_q4k_w_t kernel_v41_gemv_q4k_w<3>;

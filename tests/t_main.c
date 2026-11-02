@@ -25,6 +25,7 @@ static const ds4_test_entry test_entries[] = {
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_kernel_group, 0},
 #ifdef __APPLE__
     {"--metal-v41", "metal-v41", "DeepSeek V4.1 Metal primitives vs src/common golden + finite differences (no model)", test_metal_v41_group, 0},
+    {"--metal-upload", "metal-upload", "ordered upload snapshots and staging reuse (no model)", test_metal_upload, 0},
 #endif
     {"--bwd-attn", "bwd-attn", "sparse-attention backward vs finite differences, 64 heads, pos0 = 0/2/6 (ctxlen prefix form; both backends, no model)", test_v41_bwd_attn, 0},
     {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence, 1},

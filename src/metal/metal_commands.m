@@ -157,6 +157,7 @@ void ds4_gpu_cleanup(void) {
         }
         (void)ds4_gpu_wait_pending_command_buffers("cleanup");
         [g_transient_buffers removeAllObjects];
+        ds4_gpu_upload_pool_cleanup();
         g_tp_event = nil;
         g_tp_event_value = 0;
         g_a3_drain_event = nil;

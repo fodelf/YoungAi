@@ -25,7 +25,7 @@ static void test_attention(void) {
     TEST_ASSERT(ds4_gpu_v41_ckv_pack_tensor(tc, 0, trow, NG, NULL, 0, 0, 0) != 0);
     uint8_t *cache = malloc((size_t)NG * DS4_V41_CKV_BYTES);
     TEST_ASSERT(test_v41_read(tc, cache, (uint64_t)NG * DS4_V41_CKV_BYTES));
-    TEST_ASSERT(ds4_gpu_v41_sparse_attn_tensor(to, tq, tw, tc, tidx, test_v41_model_map(), test_v41_model_size(), o_sink, N, pos0, W, NG, TOPK, 4, NH, HD, scale, 0, 1, 0, NULL, 0) != 0);
+    TEST_ASSERT(ds4_gpu_v41_sparse_attn_tensor(to, tq, tw, tc, tidx, test_v41_model_map(), test_v41_model_size(), o_sink, N, pos0, W, NG, TOPK, 0, NH, HD, scale, 0, 1, 0, NULL, 0) != 0);
     float *got = malloc((size_t)N * NH * HD * 4), *ref = malloc((size_t)N * NH * HD * 4), *keys = malloc((size_t)(W + TOPK) * HD * 4), *s = malloc((W + TOPK) * 4);
     TEST_ASSERT(test_v41_read(to, got, (size_t)N * NH * HD * 4));
     for (uint32_t i = 0; i < N; i++) {
@@ -152,11 +152,65 @@ static void test_sampler(void) {
     fprintf(stderr, "ds4: [v41-test] sampler 投机结构: %u/%u\n", spec_ok, R - 1); TEST_ASSERT(spec_ok == R - 1);
     ds4_gpu_tensor_free(tl); ds4_gpu_tensor_free(tp); ds4_gpu_tensor_free(tt); ds4_gpu_tensor_free(to); free(lg); free(pos); free(tok);
 }
+/* A causal verification row must see the same keys and reduction order as a
+ * single decode step, even across split and compression-group boundaries. */
+static void test_attention_batch_parity(void) {
+    TEST_ASSERT(ds4_gpu_v41_set_half_prefill(1));
+    const uint32_t N = 6, W = 128, H = 8, D = 512, positions[] = { 0, 1, 27, 31, 60, 125, 8191 }, ratios[] = {1, 2, 4, 128};
+    TEST_ASSERT(test_v41_model_begin(4096));
+    const uint64_t sink = test_v41_model_alloc(H * 4);
+    memset(test_v41_model_ptr(sink), 0, H * 4);
+    TEST_ASSERT(test_v41_map());
+    for (int half = 0; half <= 1; half++) for (uint32_t c = 0; c < 7; c++) for (uint32_t r = 0; r < 4; r++) {
+        const uint32_t ratio = ratios[r];
+        const uint32_t p = positions[c], ng = (p + N) / ratio, topk = ng < 512 ? ng : 512;
+        float *q = malloc((size_t)N * H * D * 4), *win = malloc((size_t)(W + N) * D * 4);
+        float *rows = malloc((size_t)(ng + 1) * D * 4), *onewin = malloc((size_t)(W + 1) * D * 4);
+        float *batch = malloc((size_t)N * H * D * 4), *single = malloc((size_t)N * H * D * 4);
+        int32_t *idx = malloc((size_t)N * (topk + 1) * 4);
+        test_v41_fill_bf16(q, (uint64_t)N * H * D, .5f);
+        test_v41_fill_bf16(win, (uint64_t)(W + N) * D, .5f);
+        test_v41_fill_bf16(rows, (uint64_t)(ng + 1) * D, .5f);
+        for (uint32_t t = 0; t < N; t++) for (uint32_t j = 0; j < topk; j++) idx[t * topk + j] = j < (p + t + 1) / ratio ? (int32_t)j : -1;
+        ds4_gpu_tensor *tq = test_v41_tensor(q, (uint64_t)N * H * D * 4), *tw = test_v41_tensor(win, (uint64_t)(W + N) * D * 4);
+        ds4_gpu_tensor *tr = test_v41_tensor(rows, (uint64_t)(ng + 1) * D * 4), *tc = test_v41_tensor(NULL, (uint64_t)(ng + 1) * DS4_V41_CKV_BYTES);
+        ds4_gpu_tensor *ti = test_v41_tensor(idx, (uint64_t)N * (topk + 1) * 4), *to = test_v41_tensor(NULL, (uint64_t)N * H * D * 4);
+        TEST_ASSERT(ds4_gpu_v41_set_half_prefill(half));
+        if (ng) TEST_ASSERT(ds4_gpu_v41_ckv_pack_tensor(tc, 0, tr, ng, NULL, 0, 0, 0));
+        TEST_ASSERT(ds4_gpu_v41_sparse_attn_tensor(to, tq, tw, ng ? tc : NULL, ng ? ti : NULL, test_v41_model_map(), test_v41_model_size(), sink,
+                    N, p, W, ng, topk, ratio, H, D, .0442f, 0, 1, 0, NULL, 0));
+        TEST_ASSERT(test_v41_read(to, batch, (uint64_t)N * H * D * 4));
+        /* Independently bounded single rows use the existing non-inference
+         * visibility contract. This also catches a host/shader ratio ABI mismatch
+         * that would incorrectly drop compressed keys in BOTH inference paths. */
+        TEST_ASSERT(ds4_gpu_v41_set_half_prefill(0));
+        memcpy(onewin, win, (size_t)W * D * 4);
+        for (uint32_t t = 0; t < N; t++) {
+            const uint32_t vis = (p + t + 1) / ratio, tk = vis < topk ? vis : topk;
+            memcpy(onewin + W * D, win + (W + t) * D, D * 4);
+            ds4_gpu_tensor *sq = test_v41_tensor(q + (uint64_t)t * H * D, (uint64_t)H * D * 4);
+            ds4_gpu_tensor *sw = test_v41_tensor(onewin, (uint64_t)(W + 1) * D * 4);
+            ds4_gpu_tensor *si = test_v41_tensor(idx + t * topk, (uint64_t)(tk ? tk : 1) * 4);
+            TEST_ASSERT(ds4_gpu_v41_sparse_attn_tensor(to, sq, sw, vis ? tc : NULL, vis ? si : NULL, test_v41_model_map(), test_v41_model_size(), sink,
+                        1, p + t, W, vis, tk, 0, H, D, .0442f, 0, 1, 0, NULL, 0));
+            TEST_ASSERT(test_v41_read(to, single + (uint64_t)t * H * D, (uint64_t)H * D * 4));
+            memcpy(onewin + ((p + t) % W) * D, win + (W + t) * D, D * 4);
+            ds4_gpu_tensor_free(sq); ds4_gpu_tensor_free(sw); ds4_gpu_tensor_free(si);
+        }
+        char label[80]; snprintf(label, sizeof label, "attention batch parity pos=%u ratio=%u", p, ratio);
+        test_v41_cmp(label, batch, single, (uint64_t)N * H * D, 0.f, 0.f);
+        ds4_gpu_tensor_free(tq); ds4_gpu_tensor_free(tw); ds4_gpu_tensor_free(tr); ds4_gpu_tensor_free(tc); ds4_gpu_tensor_free(ti); ds4_gpu_tensor_free(to);
+        free(q); free(win); free(rows); free(onewin); free(batch); free(single); free(idx);
+    }
+    TEST_ASSERT(ds4_gpu_v41_set_half_prefill(0));
+}
+
 void test_metal_v41_attn(void) {
     test_v41_seed(0x61);
     test_attention();
     test_indexer();
     test_sampler();
+    test_attention_batch_parity();
 }
 #else
 typedef int ds4_t_metal_v41_attn_nonempty_tu;

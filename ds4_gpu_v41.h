@@ -221,6 +221,8 @@ uint64_t ds4_gpu_v41_scratch_bytes(void);   /* 当前暂存槽合计字节(日�
  * win_lo(2026-09-21, bug.md §6.2): 窗口环里最早有效的绝对位置, 窗口下界钳到 max(p+1-window, win_lo) —— CED 跳过解码器段的
  * 块不写 L20~L39 的环, 那些槽是脏的(官方 get_window_topk_idxs 把未填槽标 -1 屏蔽, 这是同一语义)。只有预填核(标量版/预填张量核版)
  * 实现钳位; 解码核(n≤8)不实现 —— 生成路把最后一块留够 window 个位置(core_v41_api.c), 解码时钳位永远不起作用, 真起作用了这里报错停车。 */
+/* Metal split attention: ratio > 0 selects causal per-row compressed-key visibility; ratio == 0
+ * explicitly keeps frozen/noncausal index fixtures. Independent of precision. */
 int ds4_gpu_v41_sparse_attn_tensor(ds4_gpu_tensor *o, const ds4_gpu_tensor *q, const ds4_gpu_tensor *kv_win,
                                    const ds4_gpu_tensor *kv_comp, const ds4_gpu_tensor *idx,
                                    const void *model_map, uint64_t model_size, uint64_t sink_offset,
