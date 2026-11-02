@@ -168,8 +168,26 @@ def assistant_blocks(r):
     return blocks
 
 
+def head_cut(recs, n, hf, out):
+    """--head N(11-01, 风格档位轮): 每轮只留官方思考的前 n 个 token 当靶(文字按 API token 字节拼回, lp 同步截, 正文/工具调用清空, 标 head), 截过的原料另存 out 给 ptf 配表。
+    为什么: 鹈鹕质感差定在 agent 上下文里规划开头"抬不抬标准"一位(fable5 11-01), 整轮 1~2 万位里只有开头几千位是靶, 其余只是算力; 与 api_branch.py head 同一做法。
+    rows 见 head 只渲染到思考截断处: 不接 </think>、不补 EOS(接了等于教它在这儿停止思考)。"""
+    from api_branch import prefix_text
+    _, b2id = hf_byte_table(hf); id2b = {i: b for b, i in b2id.items()}; o = []
+    for r in recs:
+        rows = (r.get("lp") or {}).get("reasoning_content") or []
+        if len(rows) < 16 or any(x[0] not in id2b for x in rows[:n + 8]): continue
+        txt, cut = prefix_text([x[0] for x in rows], min(n, len(rows)), id2b)
+        o.append(dict(r, id=f"{r['id']}#h{n}", reasoning=txt, content="", tool_calls=[], head=True, finish="length", lp={"reasoning_content": rows[:cut], "content": []}))
+    with open(out, "w", encoding="utf-8") as f:
+        for r in o: f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    print(f"head: {len(o)}/{len(recs)} 轮 × 思考前 {n} 位 → {out}")
+    return o
+
+
 def cmd_rows(a):
     recs = [json.loads(ln) for ln in open(a.raw, encoding="utf-8") if ln.strip()]; recs = [r for r in recs if r.get("ok") and r.get("lp")]
+    if a.head: recs = head_cut(recs, a.head, a.hf, a.head_raw)
     with tempfile.TemporaryDirectory(prefix="agent_render_") as td:
         lst = os.path.join(td, "list.tsv")
         with open(lst, "w", encoding="utf-8") as lf:
@@ -190,8 +208,41 @@ def cmd_rows(a):
                     bad += 1; print(f"  ★[{r['id']}] 整轮渲染不以前缀渲染开头(前缀 {len(pt)} 字 / 整轮 {len(ft)} 字), 作废★"); continue
                 text = ft[len(pt):]
                 if r.get("reasoning") and not text.startswith(r["reasoning"]): bad += 1; print(f"  ★[{r['id']}] 靶文本不以重采的思考开头, 作废★"); continue
+                if r.get("head"): text = r["reasoning"]   # 只到思考截断处(渲染器给整轮补的 </think> + EOS 不要)
                 f.write(json.dumps({"prefix": pt[len(BOS):], "text": text, "eos": False}, ensure_ascii=False) + "\n"); n += 1
     print(f"rows: {n} 行 → {a.out}(作废 {bad}); 靶 = 思考</think>正文 + DSML 工具调用 + <｜end▁of▁sentence｜>, 前缀零梯度")
+
+
+def cmd_step2(a):
+    """第一步重采结果 → 第二步请求体(11-01): 官方在 dsh 里第一步只看目录(思考 200 字 + bash `pwd && ls -la` / glob), 规划(抬标准 / 配色 / 坐标)全在第二步;
+    把第一步的 assistant 块(思考 + 工具调用)和【本机真跑出来的】工具结果接在首请求体后面 → <out>/<任务>/req_003.json, 再拿去 resample 就是规划段。
+    工具结果照 dsh 的样子: bash = 在空的 git init 临时目录里真跑, stdout 原文(路径换成请求体里声称的工作目录; 非零退出补 [exit code: N]); glob = 空目录 "No files found"。
+    别的工具(todo_write 等)这里不会模拟, 那条任务跳过并打出来。在 Mac 跑(dsh 官方臂就是在这台 Mac 上跑的, node / Chrome 探测结果才是同一个环境)。"""
+    import re, shutil, subprocess as sp, uuid
+    os.makedirs(a.out, exist_ok=True); n = skip = 0
+    for r in (json.loads(l) for l in open(a.raw, encoding="utf-8") if l.strip()):
+        if not r.get("ok"): skip += 1; print(f"  跳过 {r['id']}: 第一步 {r.get('finish')}"); continue
+        task = r["id"].split("/")[0]; body = json.load(open(os.path.join(a.captures, task, "req_002.json"), encoding="utf-8"))
+        cwd = re.search(r'Current working directory: "([^"]+)"', blocks_text(body["messages"][0]["content"]) or "").group(1)
+        tmp = tempfile.mkdtemp(prefix="project."); sp.run(["git", "init", "-q"], cwd=tmp, check=True); real = os.path.realpath(tmp)
+        blocks, results, bad = [{"type": "thinking", "thinking": r["reasoning"], "signature": str(uuid.uuid4())}], [], None
+        if r.get("content"): blocks.append({"type": "text", "text": r["content"]})
+        for c in r.get("tool_calls") or []:
+            inp = json.loads(c["arguments"]) if c.get("arguments") else {}
+            blocks.append({"type": "tool_use", "id": c["id"], "name": c["name"], "input": inp}); err = False
+            if c["name"] == "bash":
+                p = sp.run(inp.get("command", ""), shell=True, cwd=tmp, capture_output=True, text=True, timeout=60)
+                txt = (p.stdout + p.stderr).replace(real, cwd).replace(tmp, cwd); err = p.returncode != 0
+                if err: txt += f"\n[exit code: {p.returncode}]"
+            elif c["name"] == "glob": txt = "No files found"
+            else: bad = c["name"]; break
+            results.append({"type": "tool_result", "tool_use_id": c["id"], "content": [{"type": "text", "text": txt}], "is_error": err})
+        shutil.rmtree(tmp, ignore_errors=True)
+        if bad: skip += 1; print(f"  跳过 {task}: 第一步调了 {bad}, 这里不模拟"); continue
+        body["messages"] = body["messages"][:1] + [{"role": "assistant", "content": blocks}, {"role": "user", "content": results}]
+        os.makedirs(os.path.join(a.out, task), exist_ok=True)
+        json.dump(body, open(os.path.join(a.out, task, "req_003.json"), "w", encoding="utf-8"), ensure_ascii=False); n += 1
+    print(f"step2: {n} 个第二步请求体 → {a.out}(跳过 {skip})")
 
 
 def main():
@@ -200,8 +251,11 @@ def main():
     r = sp.add_parser("resample"); r.add_argument("--key", required=True); r.add_argument("--captures", required=True); r.add_argument("--out", required=True); r.add_argument("--hf", required=True)
     r.add_argument("--model", default="deepseek-flash"); r.add_argument("--jobs", type=int, default=4); r.add_argument("--timeout", type=int, default=3600)
     w = sp.add_parser("rows"); w.add_argument("--raw", required=True); w.add_argument("--out", required=True); w.add_argument("--gguf", required=True); w.add_argument("--server", default="./ds4-server")
+    w.add_argument("--head", type=int, default=0); w.add_argument("--hf"); w.add_argument("--head-raw")   # --head N 要 --hf(拼字节)与 --head-raw(截过的原料给 ptf)
+    s2 = sp.add_parser("step2"); s2.add_argument("--raw", required=True); s2.add_argument("--captures", required=True); s2.add_argument("--out", required=True)
     a = ap.parse_args()
-    {"resample": cmd_resample, "rows": cmd_rows}[a.cmd](a)
+    if a.cmd == "rows" and a.head and not (a.hf and a.head_raw): ap.error("--head 要同时给 --hf 和 --head-raw")
+    {"resample": cmd_resample, "rows": cmd_rows, "step2": cmd_step2}[a.cmd](a)
 
 
 if __name__ == "__main__":

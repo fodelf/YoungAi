@@ -90,10 +90,13 @@
 set -uo pipefail
 ROOT="$HOME/ds4-main"; cd "$ROOT" || exit 1
 FROM=0; TO=7; WORK=""; Q=""; INIT=cur; BEH=1; LR=""; JMODE=""; BUDGET=60; RANK=""; GAP=""; REST=""; RAWM=0; DECM=0; RAWTOK=""; WHYRUN=""; EPOCHS=""; BATCH=""; MAXLEN=""; TASKQ=""; TEVERY=""; ANCHOR=""; FISHER=0; GATE=1; GATEMODE=improve
+AGENTCAP=""; AHEAD=2048   # --agent 抓包目录 / --agent-head 每轮只留官方思考前几位当靶(见 ① 的 --agent 分支)
+PTM=0; JPT=""; JUDGEPT=""   # --pt(11-01 用户: 行为类的轮别碰 ② 的编程指标): ③ 训 ./ds4 --ptrain 落在 ② 之上, ② 原封不动; 挂/卸 = serve_pick 的 --posttrain 两行; 判与门同 ②, 不过就卸
 # student 50 = 4 题 × 32768 位上限, 两路并发每路只有 ~25 t/s(10-30 d002 实测 32768 位 1317 s; 45 t/s 是单路的数, 按它算的 30 分钟在第 4 题上撞停过一次); branch = 官方续 ≤32768 位 @170 tok/s 六路
 declare -A TMO=([q]=5 [collect]=25 [student]=50 [branch]=15 [train]="" [judge]=30 [beh]=20 [review]=10 [plan]=15)
 while [ $# -gt 0 ]; do case "$1" in
-    --work) WORK="${2:?}"; shift 2;; --budget) BUDGET="${2:?}"; shift 2;; --rank) RANK="${2:?}"; shift 2;; --gap) GAP="${2:?}"; shift 2;; --rest) REST="${2:?}"; shift 2;; --raw) RAWM=1; shift;; --dec) DECM=1; shift;; --task) TASKQ="${2:?}"; DECM=1; shift 2;; --every) TEVERY="${2:?}"; shift 2;; --why) WHYRUN="${2:?}"; shift 2;; --raw-tok) RAWTOK="${2:?}"; shift 2;; --epochs) EPOCHS="${2:?}"; shift 2;; --batch) BATCH="${2:?}"; shift 2;; --maxlen) MAXLEN="${2:?}"; shift 2;; --q) Q="${2:?}"; shift 2;; --init) INIT="${2:?}"; shift 2;; --beh) BEH="${2:?}"; shift 2;;
+    --work) WORK="${2:?}"; shift 2;; --budget) BUDGET="${2:?}"; shift 2;; --rank) RANK="${2:?}"; shift 2;; --gap) GAP="${2:?}"; shift 2;; --rest) REST="${2:?}"; shift 2;; --raw) RAWM=1; shift;; --dec) DECM=1; shift;; --task) TASKQ="${2:?}"; DECM=1; shift 2;; --every) TEVERY="${2:?}"; shift 2;; --why) WHYRUN="${2:?}"; shift 2;;
+    --agent) AGENTCAP="${2:?}"; shift 2;; --agent-head) AHEAD="${2:?}"; shift 2;; --pt) PTM=1; shift;; --_pt) JPT="${2:?}"; shift 2;; --raw-tok) RAWTOK="${2:?}"; shift 2;; --epochs) EPOCHS="${2:?}"; shift 2;; --batch) BATCH="${2:?}"; shift 2;; --maxlen) MAXLEN="${2:?}"; shift 2;; --q) Q="${2:?}"; shift 2;; --init) INIT="${2:?}"; shift 2;; --beh) BEH="${2:?}"; shift 2;;
     --from) FROM="${2:?}"; shift 2;; --to) TO="${2:?}"; shift 2;; --lr) LR="${2:?}"; shift 2;; --tmo) TMO[${2%%=*}]="${2#*=}"; shift 2;;
     --anchor) ANCHOR="${2:?}"; shift 2;; --fisher-only) FISHER=1; LR=0; EPOCHS=1; TO=3; shift;; --gate) GATE=1; shift;; --no-gate) GATE=0; shift;; --lock) GATE=1; GATEMODE=lock; shift;;
     --_judge) JMODE="${2:?}"; shift 2;;   # 内部: 停模型包装里回调自己, 把现在侧车判一遍存到这个目录
@@ -118,9 +121,10 @@ tick(){ [ -n "$WORK" ] && ! grep -q "^$1 " "$WORK/times.tsv" 2>/dev/null && echo
 # ---- 判一套侧车(只在停模型包装里跑): 引擎挂整个侧车目录; rows 与五指标输出存进 $1, 学生 logits 本体判完就删(全词表 f32, 编程一份 7.9 GB) ----
 if [ -n "$JMODE" ]; then
     mkdir -p "$JMODE"; rc=0
-    one(){ local ids=$1 n=$2 name=$3 stu
-        stu="gguf/v41judge/stu_$(basename "$(dirname "$ids")")_$(basename "$ids" .ids)_n${n}_eng_${GB}_amp_${AB}"
-        bash gguf-tools/scripts/v41_judge.sh "$ids" "$n" --hf "$HF" "engine:$GG:$ARM" > "$JMODE/$name.judge.txt" 2>&1 && cp "$stu.rows" "$JMODE/$name.rows"; local r=$?
+    one(){ local ids=$1 n=$2 name=$3 stu arm="engine:$GG:$ARM" sfx="_amp_${AB}" ptn
+        [ -z "$JPT" ] || { ptn="${JPT%/}"; ptn="${ptn#"$ROOT"/}"; arm="$arm::$JPT"; sfx="${sfx}_pt_${ptn//\//_}"; }   # --_pt: 三文件臂(①+②+③), 后缀照 v41_judge.sh 的写法
+        stu="gguf/v41judge/stu_$(basename "$(dirname "$ids")")_$(basename "$ids" .ids)_n${n}_eng_${GB}${sfx}"
+        bash gguf-tools/scripts/v41_judge.sh "$ids" "$n" --hf "$HF" "$arm" > "$JMODE/$name.judge.txt" 2>&1 && cp "$stu.rows" "$JMODE/$name.rows"; local r=$?
         rm -f "$stu.bin" "$stu".bin.*; grep -E "Same top|Mean KLD|RMS|Σmin|PPL\(student" "$JMODE/$name.judge.txt" | sed "s/^ */  $name /"; return "$r"; }
     [ -s "$JMODE/code.rows" ] || one "$CODE" 15360 code || rc=1   # 已判过的尺不重判
     [ -s "$JMODE/wt2.rows" ] || one "$WT2" 512 wt2 || rc=1
@@ -133,7 +137,7 @@ for t in code_judge_n15360 g7_wt2_n512; do [ -s "gguf/v41judge/teacher_${t}_$(ba
 grep -q "^# 完成" "$ARM/manifest.txt" 2>/dev/null || die "侧车 $ARM 没有完成标记(段 A)"
 mkdir -p "$WORK" "$FR" "$EVO/beh"; RN=$((10#$(basename "$WORK" | tr -dc 0-9)))
 TAG=$(basename "$WORK"); [ -n "$LR" ] && TAG="$TAG-lr$LR"; [ -n "$GAP" ] && TAG="$TAG-g$GAP"; [ -n "$REST" ] && TAG="$TAG-w$REST"; [ -n "$EPOCHS$BATCH$MAXLEN" ] && TAG="$TAG-e${EPOCHS:-p}b${BATCH:-p}m${MAXLEN:-p}"   # 显式给 --gap = 同料对照, 产物与账本另记   # 显式换学习率重训同一份料: 产物与账本分开记, 不覆盖按计划跑的那趟
-[ -n "$ANCHOR" ] && TAG="$TAG-a$ANCHOR"; [ "$FISHER" = 1 ] && TAG="$TAG-fisher"; [ -n "$ANCHOR" ] || ANCHOR=0   # 锚是对照变量, 产物与账本另记; 不给 = 0(只攒 F 不拉)
+[ -n "$ANCHOR" ] && TAG="$TAG-a$ANCHOR"; [ "$FISHER" = 1 ] && TAG="$TAG-fisher"; [ "$PTM" = 1 ] && TAG="$TAG-pt"; [ -n "$ANCHOR" ] || ANCHOR=0   # 锚是对照变量, 产物与账本另记; 不给 = 0(只攒 F 不拉)
 # 秩: 不给就跟现役同秩(amp 头第 2 个 i32); 给了比现役大 = 扩秩续训(训练器前 K0 秩读现役, 多出的 A=0 起步), 产物与账本带 -rN
 LIVEK=$(od -An -t d4 -j 4 -N 4 "$ARM/amp_L00.bin" 2>/dev/null | tr -d " "); [ -n "$LIVEK" ] || LIVEK=64
 if [ -n "$RANK" ]; then [ "$RANK" -ge "$LIVEK" ] || die "--rank $RANK 比现役的秩 $LIVEK 小(训练器只接扩秩续训)"; [ "$RANK" = "$LIVEK" ] || TAG="$TAG-r$RANK"; else RANK=$LIVEK; fi
@@ -194,6 +198,10 @@ if [ "$DECM" = 1 ]; then
     [ -z "$TASKQ" ] || { [ -s "$TASKQ" ] || die "--task $TASKQ 不在或是空的"; Q=$(grep -c . "$TASKQ"); }
     TMO[train]=$((30 + 8 * Q * 4 * EPOCHS)); TMO[student]=$((20 + 12 * Q))   # 学生整做: 每题最坏 32768 位 / 25 t/s ≈ 22 min, 两路 ⇒ 11 min/题 + 余量(d002 4 题实测 45 min)
 fi
+if [ -n "$AGENTCAP" ]; then   # --agent: 题 = 抓包目录里每个 req_*.json(dsh 真发出的请求体, 系统提示 + 工具表 + 任务), 一轮一行
+    Q=$(find "$AGENTCAP" -name 'req_*.json' | wc -l); [ "$Q" -gt 0 ] || die "--agent $AGENTCAP 里没有 req_*.json"
+    TMO[collect]=40; TMO[train]=$((30 + 2 * Q * EPOCHS))   # 靶每轮只有思考前 $AHEAD 位 ≈ 2 段, 24 轮 ≈ 48 步
+fi
 TEVERY="${TEVERY:-1024}"   # --task 的分支密度(--every 改): t001 aider 一题学生思考 1.7k~5k 位, 8192 一刀切不到, 用 1024; t002 六项错题思考中位 7k 位、撞上限的 32k 位, 1024 一道切 30 刀, 用 8192(第二层验过的密度)
 printf 'code 15360 0:15360\n' > "$FR/code.lst"; printf 'wt2 512 0:512\n' > "$FR/wt2.lst"
 # 门半边 / 报数半边(见头注释 ⑤): 按 layout 的窗交替分, 每种语言第 1/3 窗进门、第 2/4 窗只报数
@@ -210,7 +218,11 @@ waitready(){ local f; waitidle || return 1
     for _ in $(seq 120); do f=$(ls -t gguf/v41/posttrain/ui_logs/serve_*.log 2>/dev/null | head -1)
         grep -q "冒烟 过" "$f" 2>/dev/null && return 0; grep -q "冒烟 ★失败★\|★没起来\|★余量" "$f" 2>/dev/null && { M "★模型子进程没起来: $(grep -h "★" "$f" | tail -1)★"; return 1; }; sleep 5; done; return 1; }
 # 段 B 换回 init(现役)并装回模型: 模型在跑 = 停了按新侧车重装; 不在(包着训练/判尺的那层被杀了, 没机会装回) = 只装
-restore_init(){ rm -f "$ARM"/amp_L*.bin "$ARM"/fisher_L*.bin; cp "$WORK/init"/amp_L*.bin "$ARM/" || return 1; cp "$WORK/init"/fisher_L*.bin "$ARM/" 2>/dev/null   # fisher 跟着 amp 走(以前的轮没有, 没有就没有)
+# --pt 的挂/卸 = gguf/serve_pick.txt 里 "--posttrain\n<③ 目录>" 两行(model_catalog.c 读这两行; 停模型包装按 serve_pick 装回, 子进程 --posttrain 挂上)
+pt_unmount(){ awk 'skip {skip = 0; next} $0 == "--posttrain" {skip = 1; next} {print}' gguf/serve_pick.txt > gguf/serve_pick.txt.new && mv gguf/serve_pick.txt.new gguf/serve_pick.txt; }
+pt_mount(){ pt_unmount; printf -- '--posttrain\n%s\n' "$ROOT/${1#"$ROOT"/}" >> gguf/serve_pick.txt; }
+restore_init(){ if [ "$PTM" = 1 ]; then pt_unmount   # --pt: ② 没动过, "换回" = 把 ③ 从 serve_pick 卸掉
+    else rm -f "$ARM"/amp_L*.bin "$ARM"/fisher_L*.bin; cp "$WORK/init"/amp_L*.bin "$ARM/" || return 1; cp "$WORK/init"/fisher_L*.bin "$ARM/" 2>/dev/null; fi   # fisher 跟着 amp 走(以前的轮没有, 没有就没有)
     if pgrep -x ds4-server >/dev/null; then bash "$W" true; else bash "$W" --load; fi > "$WORK/reload.log" 2>&1; }
 # 退出保护(10-28: ③ 中途杀脚本两次, 现役 amp 留在 init 里没拷回、模型也没装回, 都是手救的): ③ 把现役挪进 init 起到 ⑤ 定下去留为止挂着;
 #   INT/TERM → 杀全部子孙(训练 / 判尺 / 停模型包装) → init 拷回 → 装回 → 核指纹。训练与判尺都是 "后台 + wait" 跑的:
@@ -223,10 +235,10 @@ match_api(){ local rows=$1 raw=$2 keep=$3
     "$PY" "$APT" ptf --ids "$rows.seqs" --raw "$raw" --hf "$HF" --out "$rows.ptf" --covered "$rows.covered" --topk 20 | sed 's/^/    /' || return 1
     awk 'NR==FNR{c[$0]=1; next} ($0 in c){print FNR}' "$rows.covered" "$rows.seqs" > "$keep"; }
 judge_now(){   # 停模型判现在这套侧车 → fprows/<指纹>/; 超时套在包装里面(套外面会连包装层一起杀, 模型装不回来)
-    local fp; fp=$(ampmd5); [ -n "$fp" ] || { M "★侧车里没有 amp★"; return 1; }
-    M "判侧车 $fp: 编程判决份 15360 位 / wt2 512 位 → $FR/$fp"
+    local fp; if [ -n "$JUDGEPT" ]; then fp=$(md5sum "$JUDGEPT/amp_L00.bin" 2>/dev/null | cut -c1-12); else fp=$(ampmd5); fi; [ -n "$fp" ] || { M "★侧车里没有 amp★"; return 1; }
+    M "判侧车 $fp$([ -n "$JUDGEPT" ] && echo "(② $BFP + ③ $JUDGEPT)"): 编程判决份 15360 位 / wt2 512 位 → $FR/$fp"
     rm -rf "$FR/$fp.tmp"; [ -d "$FR/$fp" ] && cp -r "$FR/$fp" "$FR/$fp.tmp"   # 判过的带过去, 子进程只补缺的
-    "$W" timeout --kill-after=60 "${TMO[judge]}m" bash "$0" --_judge "$FR/$fp.tmp" > "$WORK/judge_$fp.log" 2>&1 & wait $!; local rc=$?
+    "$W" timeout --kill-after=60 "${TMO[judge]}m" bash "$0" --_judge "$FR/$fp.tmp" ${JUDGEPT:+--_pt "$JUDGEPT"} > "$WORK/judge_$fp.log" 2>&1 & wait $!; local rc=$?
     grep -E "^  (code|wt2) " "$WORK/judge_$fp.log"
     [ "$rc" = 0 ] || { M "★判决 rc=$rc(124 = 超时), 看 $WORK/judge_$fp.log★"; return 1; }
     rm -rf "${FR:?}/$fp"; mv "$FR/$fp.tmp" "$FR/$fp"; waitready
@@ -249,7 +261,11 @@ if stage 1; then   # ① 官方现出新编程题 + 官方轨迹
     tick 出题采轨迹
     SEEN=("$PD"/mix_q_*.txt "$PD"/hold_q_*.txt "$HOLD/q.jsonl"); for f in "$EVO"/[rfad][0-9]*/q.jsonl "$EVO"/[rfad][0-9]*/q_design.jsonl; do [ -s "$f" ] && [ "$f" != "$QJ" ] && [ "$f" != "$QD" ] && SEEN+=("$f"); done
     [ -z "$TASKQ" ] || [ -s "$QJ" ] || cp "$TASKQ" "$QJ"   # --task: 题集就是录下来的真实请求
-    if [ "$RAWM" = 1 ]; then
+    if [ -n "$AGENTCAP" ]; then   # --agent(11-01 风格档位轮): 官方在 dsh 首请求体(系统提示 + 25 个工具 + 一句话任务)上开思考重采, 带逐位 top-20; 已 ok 的轮续跑只补缺
+        # 为什么不是单轮题: 单轮里官方自己也画扁平卡通(10-27 peldist 8 份), "impressive / polished / golden hour / layered" 只在 agent 上下文的规划开头出现(fable5 11-01 定位)
+        M "① 官方重采 $Q 轮 dsh 请求体($AGENTCAP; 开思考, 带逐位 top-20, 4 路, 上限随请求体) → $RAW"
+        T collect "$PY" gguf-tools/scripts/api_agent.py resample --key "$KEY" --captures "$AGENTCAP" --out "$RAW" --hf "$HF" --jobs 4 --timeout 1800 || die "重采失败"
+    elif [ "$RAWM" = 1 ]; then
         RL=("${PLANG[@]}"); [ "${#RL[@]}" -gt 0 ] || mapfile -t RL < <(grep -v '^#' gguf/go-onebit/code/judge.ids.layout | awk 'NF == 3 {print $1}')   # 计划定的语言; 没计划 = 30 种全上
         if [ -s "$QJ" ]; then M "① 开头已在($(wc -l < "$QJ") 个), 沿用"
         else M "① 官方出 ${#RL[@]} 种语言各 $Q 个源文件开头(裸续写的种子) → $QJ"
@@ -297,7 +313,7 @@ if stage 1; then   # ① 官方现出新编程题 + 官方轨迹
         M "① 正文分支 $("$PY" -c "import json,sys; R=[json.loads(l) for l in open(sys.argv[1]) if json.loads(l).get('ok')]; print(f'ok {len(R)} 条, 官方写完正文 {sum(1 for r in R if r.get(\"finish\") == \"stop\")} 条')" "$BRRAWC")"
         wait "$CPID" || die "官方开思考采集失败(看 $WORK/collect.log)"; grep -E "^collect 完成" "$WORK/collect.log"
         "$PY" gguf-tools/scripts/api_branch.py head --hf "$HF" --n "$DHEAD" --out "$HEADRAW" --raw "$RAWD" || die "官方规划位题开头截取失败"
-    elif [ "$RAWM" = 0 ]; then
+    elif [ "$RAWM" = 0 ] && [ -z "$AGENTCAP" ]; then
     # 关思考(10-28 用户批): 思考模式的料正文只占 11~13%(a001~a003), 其余是思考段的文字, 编程尺量的却是原始代码 ⇒ 让官方直接写正文, 料几乎全是代码
     M "① 官方解答(关思考, 带逐位 top-20, 8 路, 上限 65536) → $RAW"
     T collect "$PY" "$APT" collect --key "$KEY" --questions "$QJ" --out "$RAW" --hf "$HF" --max-tokens 65536 --jobs 8 --timeout 1200 --no-think || die "采集失败"
@@ -306,12 +322,17 @@ fi
 if stage 2; then   # ② 料
     tick 拼料
     "$PY" -c "import json,sys; [print(l, end='') for l in open(sys.argv[1]) if json.loads(l).get('ok')]" "$RAW" > "$WORK/api_ok.jsonl"
-    if [ "$RAWM" = 1 ]; then   # 裸文档一份一行: 开头只当上下文, 续写是靶; 写到上限停的文档没有结尾, 不补 EOS
+    if [ -n "$AGENTCAP" ]; then   # --agent: 每轮只留官方思考前 $AHEAD 位当靶, 前缀 = ds4-server 按部署同一渲染(系统提示 + 工具表 + 任务 + <think>), 零梯度
+        # 渲染要开引擎读 GGUF, 放在停模型窗口里做(一台机不许双装底座); 截过的原料 api_head.jsonl 给 ptf 配表(块 = 截断后的思考)
+        M "② 行: 官方思考前 $AHEAD 位 × $(wc -l < "$WORK/api_ok.jsonl") 轮, 部署同款渲染(停模型窗口) → $DATA.all"
+        "$W" "$PY" gguf-tools/scripts/api_agent.py rows --raw "$WORK/api_ok.jsonl" --out "$DATA.all" --gguf "$GG" --head "$AHEAD" --hf "$HF" --head-raw "$WORK/api_head.jsonl" > "$WORK/rows.log" 2>&1 || { cat "$WORK/rows.log" | tail -20; die "行失败"; }
+        grep -E "^head:|^rows:" "$WORK/rows.log"
+    elif [ "$RAWM" = 1 ]; then   # 裸文档一份一行: 开头只当上下文, 续写是靶; 写到上限停的文档没有结尾, 不补 EOS
         "$PY" -c "import json,sys; [print(json.dumps({'prefix': r['q'], 'text': r['content'], 'eos': False}, ensure_ascii=False)) for r in map(json.loads, open(sys.argv[1]))]" "$WORK/api_ok.jsonl" > "$DATA.all" || die "料失败"
     elif [ "$DECM" = 1 ]; then   # 第二层: 官方整轨迹也走 api_branch rows(与分支行同一处出行, 靶留头尾; 不拆时与 chunks --head-prefix 逐字节同, 10-30 d006 核过)
         "$PY" gguf-tools/scripts/api_branch.py rows --raw "$WORK/api_ok.jsonl" --out "$DATA.all" --hf "$HF" --cap "$TCAP" --traces "$WORK/cap_traces_full.jsonl" || die "料失败"
     else "$PY" "$TTC" chunks --hf "$HF" --raw "$WORK/api_ok.jsonl" --out "$DATA.all" --max-tok 1000000 --max-chunks 1 --head-prefix >/dev/null || die "料失败"; fi
-    TRAW=$RAW
+    TRAW=$RAW; [ -z "$AGENTCAP" ] || TRAW=$WORK/api_head.jsonl
     if [ -n "$TASKQ" ]; then   # --task: 官方整轨迹行 + 分支行, 没有规划位 / 正文分支
         [ -s "$BRRAW" ] || die "分支原料是空的"
         "$PY" gguf-tools/scripts/api_branch.py rows --raw "$BRRAW" --out "$BRROW" --hf "$HF" --cap "$TCAP" --traces "$WORK/cap_traces_close.jsonl" || die "分支行失败"
@@ -356,20 +377,28 @@ fi
 if stage 3; then   # ③ 训: 靶 = 官方 API top-20, 起点 = 侧车里现在那套
     tick 训练
     [ "$(ampmd5)" = "$BFP" ] || die "侧车 amp 指纹变了(⓪ 记 $BFP, 现在 $(ampmd5)), 有别人动过侧车"
+    rm -rf "$OUT"; mkdir -p "$OUT"
+    if [ "$PTM" = 1 ]; then   # --pt: ③ 训在挂着的 ② 之上(./ds4 --ptrain, 与工作台训练页同一个训练器), ② 不挪不动; ③ 落 ckpt(amp_Lnn.bin + base.fnv = ② 指纹)
+        guard_on; TRAINFLAG=--ptrain
+        {   echo "# restore_B_api_round_spark.sh $TAG: ③ 后训练件(./ds4 --ptrain): 靶 = 官方 API top-20, 叠在 ② $BFP 之上, ② 原封不动"
+            echo "data=$DATA"; echo "out=$OUT"; echo "teacher=fp:$WORK/teacher.ptf"; echo "lr=$LR"
+            printf '%s\n' layers=0-39 rank=$RANK epochs=$EPOCHS batch=$BATCH topk=20 maxlen=$MAXLEN expand=0 ctxlen=65536 doc_tail=0
+        } > "$WORK/train.cfg"
+    else TRAINFLAG=--restore-b
     # 训练器见挂着的侧车带低秩项直接拒(不接按秩拼接, 10-25 实撞) ⇒ 侧车里的 amp 挪成 init(续训起点; 回退也从这里拷回)
     rm -rf "$WORK/init"; mkdir -p "$WORK/init"; mv "$ARM"/amp_L*.bin "$WORK/init/" || die "挪 amp 失败"; guard_on
     ls "$ARM"/fisher_L*.bin >/dev/null 2>&1 && { mv "$ARM"/fisher_L*.bin "$WORK/init/" || die "挪 fisher 失败"; }   # 以前各轮攒的 F 跟着起点走(--anchor 要读它)
     for b in gguf/v41/posttrain/restore-evo-*/base.fnv; do [ -s "$b" ] && { cp "$b" "$WORK/init/"; break; }; done   # base.fnv = 段 A 指纹, 段 A 没变
-    rm -rf "$OUT"; mkdir -p "$OUT"
     {   # 配方只有这一份, 写在这里(data/ 不进仓库, 配方得跟着脚本走); topk=20 = API 给的就是 20 个
         echo "# restore_B_api_round_spark.sh $TAG: 段 B 还原训练(./ds4 --restore-b, core_restoreb.c): 靶 = 官方 API top-20, 只在缺口位出梯度"
         echo "data=$DATA"; echo "out=$OUT"; echo "teacher=fp:$WORK/teacher.ptf"; [ "$INIT" = none ] || echo "rb_init=$WORK/init"; echo "lr=$LR"; echo "rb_gap=$GAP"; echo "rb_rest=$REST"; echo "rb_anchor=$ANCHOR"
         printf '%s\n' layers=0-39 rank=$RANK epochs=$EPOCHS batch=$BATCH topk=20 maxlen=$MAXLEN expand=0 ctxlen=65536 doc_tail=0
     } > "$WORK/train.cfg"
+    fi
     M "③ $([ "$FISHER" = 1 ] && echo "只攒 F(lr=0, 不训)" || echo "训")(段 B 还原, $PARAMSJ, 秩 $RANK): $WORK/train.cfg → $OUT(起点 $([ "$INIT" = none ] && echo "零" || echo "现役 $BFP"); 料 $(wc -l < "$DATA") 行; 起点 F $(ls "$WORK/init"/fisher_L*.bin 2>/dev/null | wc -l) 层; 停模型)"
     # 训练子进程的旗照 posttrain_fp_spark.sh(预算 110000 = 机器空着整机给它; --no-dspark 不建草稿器)
-    "$W" timeout --kill-after=60 "${TMO[train]}m" ./ds4 --cuda -m "$GG" --zchain "$ARM" --mem-budget-mb 110000 --no-dspark --restore-b "$WORK/train.cfg" > "$WORK/train_$TAG.log" 2>&1 & wait $!; rc=$?
-    grep -aE "restore-b|★|教师表|^ds4: --restore-b" "$WORK/train_$TAG.log" | tail -12
+    "$W" timeout --kill-after=60 "${TMO[train]}m" ./ds4 --cuda -m "$GG" --zchain "$ARM" --mem-budget-mb 110000 --no-dspark "$TRAINFLAG" "$WORK/train.cfg" > "$WORK/train_$TAG.log" 2>&1 & wait $!; rc=$?
+    grep -aE "restore-b|ptrain|★|教师表|^ds4: --restore-b" "$WORK/train_$TAG.log" | tail -12
     if [ "$rc" != 0 ] || [ ! -s "$OUT/$CK/amp_L00.bin" ]; then restore_init; die "训练 rc=$rc(124 = 超时; 看 $WORK/train_$TAG.log), 侧车已换回 init 重装"; fi
     if [ "$FISHER" = 1 ]; then   # 只攒 F: amp 没动(lr=0), 把 ckpt 里的 fisher 放进 init 再整套装回侧车, 到此为止
         cp "$OUT/$CK"/fisher_L*.bin "$WORK/init/" || { restore_init; die "ckpt 里没有 fisher"; }
@@ -383,13 +412,21 @@ if stage 3; then   # ③ 训: 靶 = 官方 API top-20, 起点 = 侧车里现在�
     awk -v a="$K0" -v b="$K1" 'BEGIN{exit !(a != "" && b != "" && b < a)}' || { restore_init; die "训练料 KLD 没降($K0 → $K1), 不并进; 侧车已换回 init 重装"; }
 fi
 if stage 4; then   # ④ 并进 + 判
-    [ -s "$WORK/init/amp_L00.bin" ] && guard_on   # 分段从 ④ 起跑也挂保护: 侧车里是待判的新段 B, 现役在 init
+    { [ -s "$WORK/init/amp_L00.bin" ] || [ "$PTM" = 1 ]; } && guard_on   # 分段从 ④ 起跑也挂保护: 侧车里是待判的新段 B, 现役在 init
     tick 判新侧车
+    if [ "$PTM" = 1 ]; then   # --pt: ③ 挂到 serve_pick, ② 不动; 判的是 ②+③ 三文件臂
+        [ -s "$OUT/$CK/base.fnv" ] || die "③ $OUT/$CK 没有 base.fnv(训练器没把 ② 指纹写进去, 挂不上)"
+        md5sum "$OUT/$CK/amp_L00.bin" | cut -c1-12 > "$WORK/new.fp"; JUDGEPT="$OUT/$CK"; pt_mount "$OUT/$CK"
+        printf '# ③ 挂上(%s, 叠在 ② %s 上, 料 %s): %s, %s\n' "$TAG" "$BFP" "$DATA" "$OUT/$CK" "$(date '+%Y-%m-%d %H:%M')" >> "$ARM/manifest.txt"
+        M "④ 新 ③ $(cat "$WORK/new.fp") 写进 serve_pick(② $BFP 不动)"
+        judge_now || { restore_init; die "新 ③ 判决失败, 已从 serve_pick 卸掉重装"; }
+    else
     ls "$ARM"/amp_L*.bin >/dev/null 2>&1 && die "侧车里已经有 amp($(ampmd5)), 不是 ③ 刚训完的状态"
     cp "$OUT/$CK"/amp_L*.bin "$ARM/" || die "拷 amp 进侧车失败"; cp "$OUT/$CK"/fisher_L*.bin "$ARM/" 2>/dev/null   # 本轮攒的 F 一起并进(回退时 restore_init 一起换回)
     printf '# 段 B(自学习, 靶 = 官方 API): %s/%s, 料 %s, %s\n' "$OUT" "$CK" "$DATA" "$(date '+%Y-%m-%d %H:%M')" >> "$ARM/manifest.txt"
     M "④ 新侧车 $(ampmd5) 并进 $ARM"; ampmd5 > "$WORK/new.fp"   # 回退后侧车里就不是它了, ⑥ 复盘按这个指纹找它的 rows
     judge_now || { restore_init; die "新侧车判决失败, 侧车已换回 init 重装"; }
+    fi
 fi
 NFP=$(cat "$WORK/new.fp" 2>/dev/null)
 # 配对输出先收进变量再打到 stderr。别写 tee /dev/stderr(10-28 实撞): Linux 上那是按路径重开日志文件且截断,
@@ -398,7 +435,8 @@ pj(){ local l=$1 o; shift; o=$("$PY" gguf-tools/scripts/judge_rows_tokclass.py -
 if stage 5; then   # ⑤ 门
     [ -s "$WORK/init/amp_L00.bin" ] && guard_on
     tick 门与评委
-    [ -n "$NFP" ] && [ "$NFP" != "$BFP" ] && [ "$(ampmd5)" = "$NFP" ] || die "侧车指纹 '$(ampmd5)' 不是 ④ 并进的新侧车 '$NFP'(现役 $BFP)"
+    curfp(){ if [ "$PTM" = 1 ]; then md5sum "$OUT/$CK/amp_L00.bin" 2>/dev/null | cut -c1-12; else ampmd5; fi; }
+    [ -n "$NFP" ] && [ "$NFP" != "$BFP" ] && [ "$(curfp)" = "$NFP" ] || die "侧车指纹 '$(curfp)' 不是 ④ 并进的新侧车 '$NFP'(现役 $BFP)"
     M "⑤ 编程(要提升): 编程判决份门半边(每种语言第 1/3 窗)逐位配对"; CJ=$(pj "$FR/code_gate.lst") || die "编程配对失败"
     M "⑤ 编程报数半边(第 2/4 窗, 不参与去留, 这条链真攒下的看它)"; RJ=$(pj "$FR/code_report.lst") || die "报数半边配对失败"
     M "⑤ 通用(不许退): wt2 512 位逐位配对"; WJ=$(pj "$FR/wt2.lst" --block 32) || die "wt2 配对失败"
@@ -450,8 +488,9 @@ EOF
             M "⑤ 评委(只报):"; "$PY" gguf-tools/scripts/api_round.py summary "官方=$HOLD/official.review.jsonl" "旧现役=$EVO/beh/$BFP.review.jsonl" "新现役=$EVO/beh/$NFP.review.jsonl" 2>&1 | tail -8
         fi
     else
-        rm -f "$ARM"/amp_L*.bin "$ARM"/fisher_L*.bin; cp "$WORK/init"/amp_L*.bin "$ARM/" || die "回退拷 amp 失败"; cp "$WORK/init"/fisher_L*.bin "$ARM/" 2>/dev/null
-        printf '# 回退(%s 没过门: %s): 段 B 换回 %s/init(%s), 新 amp 在 %s/%s, %s\n' "$TAG" "$WHY" "$WORK" "$BFP" "$OUT" "$CK" "$(date '+%Y-%m-%d %H:%M')" >> "$ARM/manifest.txt"
+        if [ "$PTM" = 1 ]; then pt_unmount; printf '# ③ 卸掉(%s 没过门: %s): ② %s 没动过, ③ 留在 %s/%s, %s\n' "$TAG" "$WHY" "$BFP" "$OUT" "$CK" "$(date '+%Y-%m-%d %H:%M')" >> "$ARM/manifest.txt"
+        else rm -f "$ARM"/amp_L*.bin "$ARM"/fisher_L*.bin; cp "$WORK/init"/amp_L*.bin "$ARM/" || die "回退拷 amp 失败"; cp "$WORK/init"/fisher_L*.bin "$ARM/" 2>/dev/null
+        printf '# 回退(%s 没过门: %s): 段 B 换回 %s/init(%s), 新 amp 在 %s/%s, %s\n' "$TAG" "$WHY" "$WORK" "$BFP" "$OUT" "$CK" "$(date '+%Y-%m-%d %H:%M')" >> "$ARM/manifest.txt"; fi
         bash "$W" true > "$WORK/reload.log" 2>&1; waitready || die "回退后模型没装回"
         [ "$(ampmd5)" = "$BFP" ] || die "回退后指纹不对"; M "⑤ 回退: $WHY; 侧车换回 $BFP 并已重装"
     fi
@@ -468,7 +507,7 @@ print("\t".join(map(str, ["$TAG", "$BFP", "$NFP", "$K0", "$K1", r(c["kld0"]), r(
 EOF
     M "ledger: $(tail -1 "$EVO/ledger_api.tsv")"
 fi
-if stage 6 && [ "$DECM" = 1 ]; then M "⑥ 第二层本轮不复盘(计划分层只有 raw / task; 10-29 用户: 先看指标和鹈鹕)"
+if stage 6 && { [ "$DECM" = 1 ] || [ -n "$AGENTCAP" ]; }; then M "⑥ 第二层本轮不复盘(计划分层只有 raw / task; 10-29 用户: 先看指标和鹈鹕)"
 elif stage 6; then   # ⑥ 官方复盘 → 下一轮计划
     tick 复盘
     # 本轮的去留以账本为准(⑤ 写的那一行: 第 3 列新侧车指纹, 第 18/19 列去留与理由); 门的读数从两套 rows 重算(同一工具, 逐位确定)

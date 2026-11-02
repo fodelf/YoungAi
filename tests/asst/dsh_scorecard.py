@@ -20,6 +20,42 @@ import json, os, re, sys
 
 TAG = re.compile(r"<([a-zA-Z][a-zA-Z0-9]*)")
 NUM = re.compile(r"-?\d+\.?\d*")
+# --plan 模式(11-01): 质感差定在首稿前的规划段(fable5 11-01), 默认表看不见, 所以单开一张:
+#   规划字 = 第一个写出页面的工具调用之前的思考字符(下限, events 每段截 8~9k) / 坐标对 = 那段里预先算好的 "(x, y)" 个数 /
+#   path 草 = 那段里写出的 "M x y" 条数(官方在思考里先把 path 画一遍再落笔) / 抬标 · 降标 = 抬高/降低标准的措辞次数 /
+#   审美 = 首稿前 gradient/shadow/highlight/layer/palette/glow 次数; 页面栏 = 渐变 / stop / opacity / 滤镜 / 不同颜色数(质感要素, 10-24 起只数过 path)。
+RAISE = re.compile(r"impressive|polished|high.quality|premium|beautiful|stunning|detailed|精致|高质量|漂亮", re.I)
+LOWER = re.compile(r"simpler|keep it simple|simple enough|enough\.|not necessary|avoid complex|visual enough|skip", re.I)
+AESTH = re.compile(r"gradient|shadow|highlight|layer|palette|glow|渐变|阴影|高光|配色", re.I)
+XY = re.compile(r"\(\s*\d{2,4}\s*,\s*\d{2,4}\s*\)")
+PATHM = re.compile(r"\bM\s*\d+[ ,]\d+")
+COLOR = re.compile(r"#[0-9a-fA-F]{6}\b")
+
+
+def plan(run):
+    """首稿前规划段 + 页面质感要素。写出页面 = write 工具, 或任何工具输入里带 index.html 且含 <svg(bash heredoc 也算)。"""
+    ev = os.path.join(run, "events.jsonl")
+    if not os.path.isfile(ev): return None
+    th = []; first = None
+    for ln in open(ev, encoding="utf-8"):
+        try: e = json.loads(ln)
+        except json.JSONDecodeError: continue
+        if e.get("type") == "thinking": th.append(e.get("text") or "")
+        elif e.get("type") == "tool_call" and first is None:
+            s = json.dumps(e.get("input"), ensure_ascii=False)
+            if e.get("tool") in ("write", "write_file") or ("index.html" in s and "<svg" in s): first = len("".join(th))
+    pre = "".join(th)[:first] if first is not None else "".join(th)
+    r = one(run) or {}
+    txt = ""
+    for dp, dn, fn in os.walk(os.path.join(run, "ws")):
+        dn[:] = [d for d in dn if not d.startswith(".")]
+        for f in fn:
+            if f == r.get("file"): txt = open(os.path.join(dp, f), encoding="utf-8", errors="replace").read()
+    tags = [m.lower() for m in TAG.findall(txt)]
+    return dict(run=r.get("run"), pre=len(pre), xy=len(XY.findall(pre)), pm=len(PATHM.findall(pre)), up=len(RAISE.findall(pre)),
+                down=len(LOWER.findall(pre)), aes=len(AESTH.findall(pre)), paths=r.get("paths", 0),
+                grad=tags.count("lineargradient") + tags.count("radialgradient"), stop=tags.count("stop"),
+                opa=len(re.findall(r"opacity", txt)), filt=tags.count("filter"), col=len({c.lower() for c in COLOR.findall(txt)}))
 
 
 def one(run):
@@ -93,6 +129,13 @@ def main():
         a = sys.argv[2:]
         return trace(a[0], int(a[a.index("--from") + 1]) if "--from" in a else 0)
     runs = sys.argv[1:]
+    if runs[:1] == ["--plan"]:
+        runs = runs[1:] or sorted(os.path.join("gguf/dsh/runs", d) for d in os.listdir("gguf/dsh/runs"))
+        print("| run | 规划字 | 坐标对 | path 草 | 抬标 | 降标 | 审美 | path | 渐变 | stop | opacity | 滤镜 | 颜色 |")
+        print("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+        for p in (plan(x) for x in runs if os.path.isdir(x)):
+            if p: print(f"| {p['run']} | {p['pre']} | {p['xy']} | {p['pm']} | {p['up']} | {p['down']} | {p['aes']} | {p['paths']} | {p['grad']} | {p['stop']} | {p['opa']} | {p['filt']} | {p['col']} |")
+        return 0
     if not runs:
         base = "gguf/dsh/runs"
         runs = sorted(os.path.join(base, d) for d in os.listdir(base) if os.path.isdir(os.path.join(base, d)))
