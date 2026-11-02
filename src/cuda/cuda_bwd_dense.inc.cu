@@ -146,14 +146,17 @@ __device__ static float bwd_block_max(float v, float *sh) {
 /* ★余量必须直接累加榜外项, 不许 1 − Σ榜上★(2026-10-01 实撞): 学生把概率几乎全押在榜上时, 1 − Σp 在 f32 里抵消成 0 甚至负数,
  * 托底成 1e-20 后 r_T/r_S 炸到 1e16, 榜外每个 token 的梯度 = p_j·(1 − 1e16) —— 批梯度范数在 0.2 与 2.7e7 之间来回跳, 一轮就把模型
  * 推成只吐"2026303030…"。现在 r_S = Σ_{j∉榜} e^{z_j−m} / Σ_j e^{z_j−m}(位图标榜上, 一遍归约), 两数都是正项和, 没有相消。 */
+static struct { float tau, cap; } g_kl_tail;   /* 尾权(ds4_gpu_bwd.h ds4_gpu_bwd_kl_tail): tau 0 = 关 */
+int ds4_gpu_bwd_kl_tail(float tau, float cap) { g_kl_tail.tau = tau > 0.f ? tau : 0.f; g_kl_tail.cap = cap > 1.f ? cap : 1.f; return 1; }
+
 __global__ static void bwd_kl_topk_kernel(float *g, float *loss, const float *z, uint32_t row0, uint32_t V,
-                                          const int32_t *tid, const float *tp, const float *trest, const float *w, uint32_t K, float scale) {
+                                          const int32_t *tid, const float *tp, const float *trest, const float *w, uint32_t K, float scale,
+                                          float tail_tau, float tail_cap) {
     __shared__ float sh[32];
     __shared__ float ps_k[BWD_KMAX];
     __shared__ uint32_t mask[BWD_VMASK_WORDS];
     const uint32_t i = blockIdx.x;
     const float wi = w ? w[i] : 1.f;   /* 逐行权重(硬目标题: 数字位 × hard_num, 其余 × hard_txt); 损失与梯度同乘, 报出来的 KL 也是加权的 */
-    scale *= wi;
     const float *zr = z + (uint64_t)(row0 + i) * V;
     float *gr = g + (uint64_t)i * V;
     const int32_t *ids = tid + (uint64_t)i * K;
@@ -178,23 +181,25 @@ __global__ static void bwd_kl_topk_kernel(float *g, float *loss, const float *z,
         ps_k[k] = (id >= 0 && (uint32_t)id < V) ? expf(zr[id] - lse) : 0.f;
     }
     __syncthreads();
-    __shared__ float s_off;
+    __shared__ float s_off, s_w;
     if (threadIdx.x == 0) {
         float l = 0.f;
         for (uint32_t k = 0; k < K; k++) if (pt[k] > 0.f) l += pt[k] * (logf(pt[k]) - logf(fmaxf(ps_k[k], 1e-30f)));
         const float rt = fmaxf(trest[i], 0.f);
         if (rt > 1e-12f) l += rt * (logf(rt) - logf(fmaxf(rs, 1e-30f)));
-        loss[i] = l * wi;
+        /* 尾权: 本行自己的 KL 当常数定权重(停梯度), 损失与梯度同乘 ⇒ 一阶预测与实测仍同口径 */
+        s_w = wi * (tail_tau > 0.f ? fminf(tail_cap, fmaxf(1.f, l / tail_tau)) : 1.f);
+        loss[i] = l * s_w;
         /* 榜外: q_j = r_T·pS_j/r_S ⇒ g_j = pS_j·(1 − r_T/r_S); r_S 真为 0 时 pS_j 也全为 0, 这一项本来就没有梯度 */
         s_off = rs > 1e-30f ? 1.f - rt / rs : 0.f;
     }
     __syncthreads();
-    const float off = s_off;
-    for (uint32_t j = threadIdx.x; j < V; j += blockDim.x) gr[j] = scale * expf(zr[j] - lse) * off;   /* 同址时: 每个 j 先读后写, 只有本线程碰它 */
+    const float off = s_off, sc = scale * s_w;
+    for (uint32_t j = threadIdx.x; j < V; j += blockDim.x) gr[j] = sc * expf(zr[j] - lse) * off;   /* 同址时: 每个 j 先读后写, 只有本线程碰它 */
     __syncthreads();
     for (uint32_t k = threadIdx.x; k < K; k += blockDim.x) {
         const int32_t id = ids[k];
-        if (id >= 0 && (uint32_t)id < V) gr[id] = scale * (ps_k[k] - pt[k]);
+        if (id >= 0 && (uint32_t)id < V) gr[id] = sc * (ps_k[k] - pt[k]);
     }
 }
 int ds4_gpu_bwd_kl_topk_tensor(ds4_gpu_tensor *glogits, ds4_gpu_tensor *loss, const ds4_gpu_tensor *logits, uint32_t row0,
@@ -211,7 +216,7 @@ int ds4_gpu_bwd_kl_topk_tensor(ds4_gpu_tensor *glogits, ds4_gpu_tensor *loss, co
     }
     bwd_kl_topk_kernel<<<m, 1024, 0, g_cur_stream>>>((float *)glogits->ptr, (float *)loss->ptr, (const float *)logits->ptr, row0, n_vocab,
                                                      (const int32_t *)tid->ptr, (const float *)tp->ptr, (const float *)trest->ptr,
-                                                     w ? (const float *)w->ptr : NULL, k, scale);
+                                                     w ? (const float *)w->ptr : NULL, k, scale, g_kl_tail.tau, g_kl_tail.cap);
     return cuda_ok(cudaGetLastError(), "bwd kl topk");
 }
 

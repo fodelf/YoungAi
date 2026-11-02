@@ -320,7 +320,7 @@ for NB in "$@"; do
       if [ -n "${PTD:-}" ]; then
           # ③ 两种形态(10-01): 增益表 gr_Lnn.bin 或低秩放大器 amp_Lnn.bin(引擎 --posttrain 两种都读, 与 ② 按秩拼接), 有其一就判
           # 两个 glob 分开查: ls 对多个参数只要有一个不存在就非零退出, 合在一起查等于要求两种文件都在
-          ls "$PTD"/gr_L*.bin >/dev/null 2>&1 || ls "$PTD"/amp_L*.bin >/dev/null 2>&1 || { LOG "★后训练目录 $PTD 里既没有 gr_Lnn.bin 也没有 amp_Lnn.bin, 不判★"; continue; }
+          ls "$PTD"/gr_L*.bin >/dev/null 2>&1 || ls "$PTD"/amp_L*.bin >/dev/null 2>&1 || ls "$PTD"/vqpatch_L*.bin >/dev/null 2>&1 || { LOG "★后训练目录 $PTD 里既没有 gr_Lnn.bin / amp_Lnn.bin 也没有 vqpatch_Lnn.bin(V 步索引补丁, 11-02), 不判★"; continue; }
           # 后缀按 ③ 相对仓库根的整条路径(/ → _), 不只取末级名: 各次增量的选中轮都叫 ckpt_eNN, 一趟判多臂时(10-10 十臂)
           #   0001/0003/0004 都是 ckpt_e02, 后一臂把前一臂的 stu_*.bin / .rows 盖掉 —— 五指标当场算不受影响, 事后的逐位配对就拿错了文件
           ptn="${PTD%/}"; ptn="${ptn#"$ROOT"/}"

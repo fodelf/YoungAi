@@ -457,6 +457,19 @@ int ds4_gpu_v41_mkcache_add_tensor(ds4_gpu_tensor *logits, uint64_t row, const d
 int ds4_gpu_v41_matmul_bf16_skip_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset,
                                         uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint32_t n_tok, const ds4_gpu_tensor *skip);
 
+/* V 步(离散码字重选, 11-02, src/cuda/cuda_vq_vstep.inc.cu; 训练侧 core_ptrain_vstep.c)。专家 blob 必须是 v3(层码本 E4M3 + 12 位主流 [+ 位平面])。
+ * knn: 层码本(主机 E4M3 字节 nc×8)每个码字按欧氏距离取 K(≤32) 个最近邻 → 主机 nbr[nc][K]。
+ * vselect: 对 (专家 e, 矩阵 which, R×C) 的每个 8 维组, 用 dw(ds4_gpu_bwd_moe_vgrad 累加的按组梯度, 从 dw_off 起 [R][C] f32)在近邻里选一阶 Δ 最小的码字;
+ *   输出主机数组 delta / code / cur 各 R×C/8。gov_dev = ② 的该矩阵逐行增益覆盖(设备, 可 NULL; 只影响读, Δ 不用它)。
+ * code_patch: 记录 4×u32 {e | which<<16, 行, 列组, 新码 | 旧码<<16}, 改 GPU 读的那份 blob 的索引位并逐条回读; *mismatch = 回读与目标不同的条数(≠0 调用方停车);
+ *   盘上文件与主机映射一个字节不动; 整映射直读文件页的装载路改不了 ⇒ 返回 0。 */
+int ds4_gpu_v41_vq_knn(const uint8_t *cb_e4m3, uint32_t nc, uint32_t K, uint16_t *nbr_out);
+int ds4_gpu_v41_vq_vselect(const ds4_gpu_tensor *dw, uint64_t dw_off, const void *model_map, uint64_t model_size, uint64_t blob_offset, uint64_t blob_bytes,
+                           uint32_t e, uint32_t which, uint32_t R, uint32_t C, const float *gov_dev, const uint16_t *nbr_host, uint32_t nc, uint32_t K,
+                           float *delta_out, uint16_t *code_out, uint16_t *cur_out);
+int ds4_gpu_v41_vq_code_patch(const void *model_map, uint64_t model_size, uint64_t blob_offset, uint64_t blob_bytes, uint32_t IN, uint32_t MID, uint32_t OUT,
+                              const uint32_t *recs, uint32_t n, uint32_t *mismatch);
+
 #ifdef __cplusplus
 }
 #endif

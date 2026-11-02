@@ -266,6 +266,7 @@ static bool pt_layer_bwd(ds4_engine *e, const pt_cfg *c, pt_run *r, uint32_t il,
     if (ok) {
         char nm[64]; snprintf(nm, sizeof nm, "blk.%u.ffn_exps_vq.blob", il);
         const ds4_tensor *blob = model_find_tensor(m, nm);
+        ds4_gpu_bwd_moe_vgrad(r->vg_slot[il] ? r->vg_dw : NULL, r->vg_slot[il], 0, E, FF, E);   /* V 步: 这一层要收按组梯度就开, 否则关(core_ptrain_vstep.c) */
         ok = blob && ds4_gpu_bwd_routed_moe_tensor(b->g_xnf, b->g_rw, b->g_y, b->xnf, st->sel, st->rw, m->map, m->size, blob->abs_offset, blob->bytes,
                                                    E, FF, E, DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, il, n) &&
              ds4_gpu_bwd_router_tensor(b->g_glog, b->g_rw, st->sel, st->glog, n, DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE) &&

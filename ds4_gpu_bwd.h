@@ -43,6 +43,10 @@ int ds4_gpu_bwd_grouped_matmul_t_tensor(ds4_gpu_tensor *gheads, const void *mode
 int ds4_gpu_bwd_kl_topk_tensor(ds4_gpu_tensor *glogits, ds4_gpu_tensor *loss, const ds4_gpu_tensor *logits, uint32_t row0,
                                uint32_t m, uint32_t n_vocab, const ds4_gpu_tensor *tid, const ds4_gpu_tensor *tp,
                                const ds4_gpu_tensor *trest, const ds4_gpu_tensor *w, uint32_t k, float scale);
+/* 尾权(2026-11-02 V 步): tau > 0 时上面的核按行自加权 w_i = min(cap, max(1, KL_i / tau))(KL_i = 该行自己的未加权 KL, 当常数), 损失与梯度同乘;
+ * tau = 0 关(全 1, 老路逐位同)。为什么: 判决份 15360 位里 KLD>2 的 177 位四趟 V 步一位没动——均值目标下尾位梯度占 1% 被淹掉, 而长生成的决策全在尾位。
+ * 只在 V 步的选码/审计趟开(core_ptrain_vstep.c vs_pass), 留出评估一律关 —— 报出来的留出仍是老口径。 */
+int ds4_gpu_bwd_kl_tail(float tau, float cap);
 
 /* 教师 top-K: logits 第 row0..row0+m-1 行 → 概率最大的 K 个 (id, p) 与余量 1 − Σp(softmax 全词表)。
  * ★会改写 logits 这几行★(选中的位置置 −inf, 选 K 轮)—— 调用方读完才许调。tid[m][K] / tp[m][K] / trest[m]。 */
@@ -111,6 +115,11 @@ int ds4_gpu_bwd_routed_moe_tensor(ds4_gpu_tensor *gx, ds4_gpu_tensor *gw, const 
                                   const ds4_gpu_tensor *sel, const ds4_gpu_tensor *rw, const void *model_map, uint64_t model_size,
                                   uint64_t blob_offset, uint64_t blob_bytes, uint32_t IN, uint32_t MID, uint32_t OUT,
                                   uint32_t n_total_expert, uint32_t K, float clamp, uint32_t layer, uint32_t n_tok);
+/* V 步按组权重梯度(11-02, src/cuda/cuda_bwd_vgrad.inc.cu): 设了接收区, 之后每次 ds4_gpu_bwd_routed_moe_tensor 把 slot_of[e] ≥ 0 的专家
+ * 三矩阵对去量化权重的梯度(含行增益)累加进 dw[slot][gate MID×IN | up MID×IN | down OUT×MID] f32(跨批累加, 调用方清零)。
+ * dw = NULL = 关。slot_of = 设备 int32 [n_expert]。形状不整除 64×128 ⇒ 反传返回 0。 */
+int ds4_gpu_bwd_moe_vgrad(ds4_gpu_tensor *dw, const ds4_gpu_tensor *slot_of, uint32_t nslot, uint32_t IN, uint32_t MID, uint32_t OUT);
+int ds4_gpu_bwd_moe_count(uint32_t *counts, uint32_t n_layer, uint32_t n_expert);   /* 路由计数接收区(主机 [n_layer][n_expert], NULL = 关) */
 /* 重算截留开关: on=1 期间预填专家路(v3 张量核)把 up 出口 H_u 顺手存一份, 连同它本来就留在暂存里的 H_g/A/O, 给紧接着的
  * ds4_gpu_bwd_routed_moe_tensor 直接用(同层同配对数才认, 用一次即作废)—— 省掉反传里对本层专家前向的第二遍重算。
  * 只有训练器重算那一步开, 推理路永远关着; 返回 1。 */

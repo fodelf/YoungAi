@@ -298,10 +298,13 @@ extern void *g_ds4_v41_logits_ud;
 bool v41_attention_kv_only(ds4_engine *e, ds4_v41_state *st, uint32_t il);   /* CED 分界层: 只写全局 KV */
 extern const ds4_model *g_ds4_v41_model;   /* 引擎打开时指向 e->model(core_engine_open.c): 路由偏置侧车要按层找 exp_probs_b 张量(core_v41_amp.c) */
 bool v41_amp_load(ds4_v41_state *st, const char *dir, const char *pt_dir);   /* core_v41_amp.c: ②反修目录 + ③后训练目录 */
+int v41_vqpatch_load(const char *dir);   /* core_v41_vqpatch.c(11-02): ③ 目录里的 V 步索引补丁 vqpatch_Lnn.bin; 先还原上一组; dir 空 = 只还原; <0 = 失败 */
+const void *v41_vqpatch_records(uint32_t il, uint32_t *n);   /* 此刻挂着的这一层记录({专家|矩阵, 行, 列组, 新码|旧码}): V 步 vq_init= 续训把它们并进自己的日志 */
 void v41_plugins_clear_all(void);   /* 全卸路由偏置 + 增益覆盖(设备表是进程级的)并丢插件缓存; 裸底座状态开张前调 */
 void v41_amp_cache_drop(void);      /* 丢进程级插件缓存(没有状态在用时才真丢): 切换插件前调, 下一个状态从盘重读 */
 void v41_amp_free(ds4_v41_state *st);
 bool v41_amp_disown(ds4_v41_state *st);   /* 状态自己拥有 A/B(训练态): 退掉插件缓存的引用; ② 带低秩件时拒(false), 调用方停车 */
+int v41_amp_adopt(ds4_v41_state *st, uint32_t lo, uint32_t hi);   /* 训 ③ 叠在带低秩的 ② 上: ② 的 A/B 拷成自己的(秩 k2)并退掉缓存引用, 返回 k2(0 = ② 无低秩; −1 = 不接) */
 int v41_amp_hook(ds4_v41_state *st, uint32_t il);        /* 钩子回调(挂了才动): 同步 → x/y/sel/rw 下主机 → 回调; 0 继续 / 1 提前结束(置 stop_early) / <0 失败 */
 bool v41_amp_apply(ds4_v41_state *st, uint32_t il);      /* y += x·(B·A) → bf16(挂了该层才动) */
 ds4_gpu_tensor *v41_alloc(uint64_t bytes, bool *ok);   /* 小工具: 分配失败只置 ok=false, 调用方一路攒到最后再判 */

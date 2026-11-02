@@ -43,6 +43,8 @@ int ds4_gpu_bwd_grouped_matmul_t_tensor(ds4_gpu_tensor *gheads, const void *mode
     return v41_wgemm(model_map, model_size, wt, weight_offset, 1u, n_tok, (uint32_t)group_dim, (uint32_t)rank, glow, (uint32_t)out_all, gheads, (uint32_t)in_all,
                      n_groups, v41_wbytes_rc(wt, rank, group_dim), (uint32_t)rank, (uint32_t)group_dim, accumulate, 0, "bwd wo_a matmul_t");
 }
+/* 尾权(ds4_gpu_bwd.h): Metal 的 KL 核没接按行自加权 —— 开了就拒, 不许静默按全 1 跑(V 步只在 CUDA 上跑) */
+int ds4_gpu_bwd_kl_tail(float tau, float cap) { (void)cap; return tau > 0.f ? 0 : 1; }
 int ds4_gpu_bwd_kl_topk_tensor(ds4_gpu_tensor *glogits, ds4_gpu_tensor *loss, const ds4_gpu_tensor *logits, uint32_t row0, uint32_t m, uint32_t n_vocab,
                                const ds4_gpu_tensor *tid, const ds4_gpu_tensor *tp, const ds4_gpu_tensor *trest, const ds4_gpu_tensor *w, uint32_t k, float scale) {
     if (!glogits || !loss || !logits || !tid || !tp || !trest || m == 0 || k == 0 || k > 128u || n_vocab > 4096u * 32u) return 0;
@@ -168,4 +170,18 @@ int ds4_gpu_bwd_unpack_bf16_tensor(ds4_gpu_tensor *dst, const ds4_gpu_tensor *sr
     return v41_launch_1d("kernel_v41_unpack_bf16", b, 3, n);
 }
 int ds4_gpu_bwd_wcache(int mode) { (void)mode; return 1; }        /* Metal 不落 bf16 暂存, 没有可缓存的解码产物 */
+/* V 步(11-02, CUDA: cuda_bwd_vgrad / cuda_vq_vstep)Metal 未实现: 梯度接收区当关, 近邻/选码/补丁报错返回 0(调用方停车, 不会悄悄跑成别的权重) */
+int ds4_gpu_bwd_moe_vgrad(ds4_gpu_tensor *dw, const ds4_gpu_tensor *slot_of, uint32_t nslot, uint32_t IN, uint32_t MID, uint32_t OUT) { (void)dw; (void)slot_of; (void)nslot; (void)IN; (void)MID; (void)OUT; return 1; }
+int ds4_gpu_bwd_moe_count(uint32_t *counts, uint32_t n_layer, uint32_t n_expert) { (void)counts; (void)n_layer; (void)n_expert; return 1; }
+int ds4_gpu_v41_vq_knn(const uint8_t *cb_e4m3, uint32_t nc, uint32_t K, uint16_t *nbr_out) { (void)cb_e4m3; (void)nc; (void)K; (void)nbr_out; fprintf(stderr, "ds4: [V步] Metal 未实现\n"); return 0; }
+int ds4_gpu_v41_vq_vselect(const ds4_gpu_tensor *dw, uint64_t dw_off, const void *model_map, uint64_t model_size, uint64_t blob_offset, uint64_t blob_bytes,
+                           uint32_t e, uint32_t which, uint32_t R, uint32_t C, const float *gov_dev, const uint16_t *nbr_host, uint32_t nc, uint32_t K,
+                           float *delta_out, uint16_t *code_out, uint16_t *cur_out) {
+    (void)dw; (void)dw_off; (void)model_map; (void)model_size; (void)blob_offset; (void)blob_bytes; (void)e; (void)which; (void)R; (void)C; (void)gov_dev; (void)nbr_host; (void)nc; (void)K;
+    (void)delta_out; (void)code_out; (void)cur_out; fprintf(stderr, "ds4: [V步] Metal 未实现\n"); return 0;
+}
+int ds4_gpu_v41_vq_code_patch(const void *model_map, uint64_t model_size, uint64_t blob_offset, uint64_t blob_bytes, uint32_t IN, uint32_t MID, uint32_t OUT,
+                              const uint32_t *recs, uint32_t n, uint32_t *mismatch) {
+    (void)model_map; (void)model_size; (void)blob_offset; (void)blob_bytes; (void)IN; (void)MID; (void)OUT; (void)recs; (void)n; (void)mismatch; fprintf(stderr, "ds4: [V步·补丁] Metal 未实现\n"); return 0;
+}
 int ds4_gpu_bwd_moe_capture(int on) { (void)on; return 1; }      /* 专家反向照常重算(见 metal_bwd_layer.m) */

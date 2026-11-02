@@ -135,6 +135,7 @@ bool pt_loss_rows(const pt_cfg *c, pt_run *r, ds4_gpu_tensor *logits, uint32_t r
               ds4_gpu_bwd_kl_topk_tensor(*glog, r->loss, logits, row, m, V, r->tid, r->tp, r->trest, NULL, TK, scale) &&
               ds4_gpu_tensor_read(r->loss, 0, r->loss_h, (uint64_t)m * 4);
     if (ok) { double l = 0; for (uint32_t k = 0; k < m; k++) l += r->loss_h[k]; *loss += l; *ntok += m; }
+    if (ok && r->tail_on) for (uint32_t k = 0; k < m; k++) { r->tail_n++; r->tail_n1 += r->loss_h[k] > 1.f; r->tail_n2 += r->loss_h[k] > 2.f; }   /* 尾位计数(pt_run.tail_*) */
     r->dec_last = -1.0;
     if (ok && r->dec_on) for (uint32_t k = 0; k < m; k++) {   /* 决策位读数(见 pt_run.dec_*): 第 k 行预测的目标 = 答案第 off+k 位 */
         const size_t kk = (size_t)off + k;

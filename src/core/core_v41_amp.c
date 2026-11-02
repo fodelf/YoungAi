@@ -367,8 +367,10 @@ bool v41_amp_load(ds4_v41_state *st, const char *dir, const char *pt_dir) {
         if (K > kmax) kmax = K;
         n_arm++;
     }
-    /* 只有增益覆盖/路由偏置、没有低秩放大器也是合法的一种插件(权重侧反修与后训练的产物都长这样) */
-    if (!n_arm && n_gr <= 0 && n_rb <= 0) {
+    const int n_vq = v41_vqpatch_load(pt_dir);   /* V 步索引补丁(core_v41_vqpatch.c): 先还原上一组再装这一组; 挂不上就停 */
+    if (n_vq < 0) { g_pc.valid = 1; v41_amp_cache_drop(); return false; }
+    /* 只有增益覆盖/路由偏置、没有低秩放大器也是合法的一种插件(权重侧反修与后训练的产物都长这样); 只有索引补丁的 ③ 同样合法 */
+    if (!n_arm && n_gr <= 0 && n_rb <= 0 && n_vq <= 0) {
         fprintf(stderr, "ds4: 目录里既没有 amp_Lnn.bin 也没有 gr_Lnn.bin / rb_Lnn.bin(反修 %s / 后训练 %s)\n",
                 dir && dir[0] ? dir : "(无)", pt_dir && pt_dir[0] ? pt_dir : "(无)");
         return false;

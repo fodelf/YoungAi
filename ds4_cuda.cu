@@ -107,6 +107,8 @@
 #include "src/cuda/cuda_bwd_attn.inc.cu"    /* 后训练反传: 稀疏注意力 + RoPE(借 v41_rope_freq / KV 打包常量) */
 #include "src/cuda/cuda_bwd_hc.inc.cu"      /* 后训练反传: mHC 混合系数(sinkhorn 重算倒推) */
 #include "src/cuda/cuda_bwd_vq.inc.cu"      /* 后训练反传: routed 专家的 VQ 直读两种核(行点积 / 转置累加), 不落稠密阵 */
+#include "src/cuda/cuda_bwd_vgrad.inc.cu"   /* V 步按组权重梯度(11-02): 借 cuda_bwd_vq 的 vqb_code/vqb_gain 与 vq_prefill_mma 的 vqm_mma, 被 bwd_moe 调 */
+#include "src/cuda/cuda_vq_vstep.inc.cu"    /* V 步设备侧(11-02): 近邻表 / 按组选码 / 索引补丁; 借 vqb_code 与 v41_3 的锁页暂存 g_v41_stage(被 v41_stage_fill 调) */
 #include "src/cuda/cuda_bwd_moe.inc.cu"     /* 后训练反传: SwiGLU / 路由 / routed 专家(借 v41_vq_open·v41_vq_cw 解码与 g_v41_gr 增益覆盖) */
 #include "src/cuda/cuda_draft_attn.inc.cu"  /* 草稿器蒸馏(2026-10-07): 批量全可见块注意力前向(借 sparse_attn_mma 的打分/统计积木与 attn_split 的分段公式)/反向、陪审团、批量取行 */
 #include "src/cuda/cuda_v41_vision.inc.cu"  /* 视觉塔(2026-10-13): bias / 2D RoPE / 稠密注意力 / SwiGLU 对 / GELU / unfold / 行替换(借 v41_1 的暂存与 bf16 舍入) */

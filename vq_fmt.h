@@ -52,6 +52,23 @@ static inline uint64_t ds4vq_slot(const uint8_t *blob, int e, int which) {
     return off;
 }
 
+/* v3 层码本在 blob 里的位置(10-29 码本牵引首写, 11-02 V 步沿用): 第一个非空槽的载荷头 +24 是 cb_off, +6 是码字数; 同层三矩阵指同一处。
+ * 返回 0 = 不是 v3 / 头不对 / 码本没落在载荷之前(前缀里)。 */
+static inline int ds4vq_v3_codebook(const uint8_t *blob, size_t sz, uint64_t *cb_off, uint32_t *nc) {
+    if (!ds4vq_blob_ok(blob, sz) || ds4vq_blob_ver(blob) != 3u) return 0;
+    const uint32_t ns = ds4vq_blob_nexp(blob) * 3u;
+    for (uint32_t k = 0; k < ns; k++) {
+        const uint64_t o = ds4vq_slot(blob, (int)(k / 3u), (int)(k % 3u));
+        if (!o || o + 32u > sz) continue;
+        uint32_t mg; uint16_t n16; uint64_t cbo;
+        memcpy(&mg, blob + o, 4); memcpy(&n16, blob + o + 6, 2); memcpy(&cbo, blob + o + 24, 8);
+        if (mg != DS4VQ_MAT3_MAGIC || cbo + (uint64_t)n16 * 8u > o) return 0;
+        *cb_off = cbo; *nc = n16;
+        return 1;
+    }
+    return 0;
+}
+
 /* 载荷 dequant → f32(引擎 CPU MoE fallback 用)。out[rows*cols] row-major。0=成功 */
 static inline int ds4vq_dequant_f32(const uint8_t *pay, float *out, int exp_rows, int exp_cols) {
     uint32_t mg; memcpy(&mg, pay, 4);

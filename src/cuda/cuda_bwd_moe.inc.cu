@@ -158,6 +158,8 @@ int ds4_gpu_bwd_routed_moe_tensor(ds4_gpu_tensor *gx, ds4_gpu_tensor *gw, const 
         for (uint64_t p = 0; p < npair; p++) if (sel_h[p] >= 0 && (uint32_t)sel_h[p] < n_total_expert) list[cur[sel_h[p]]++] = (int32_t)p;
         free(cur);
         for (uint32_t e = 0; e < n_total_expert; e++) if (cnt[e]) { meta[nact] = e; meta[n_total_expert + nact] = off[e]; meta[2u * n_total_expert + nact] = cnt[e]; nact++; }
+        if (g_vg.counts && layer < g_vg.cnt_layers && n_total_expert <= g_vg.cnt_experts)   /* V 步的路由计数(cuda_bwd_vgrad.inc.cu) */
+            for (uint32_t e = 0; e < n_total_expert; e++) g_vg.counts[(size_t)layer * g_vg.cnt_experts + e] += cnt[e];
     }
     /* 本层重算刚截留的逐对四样(g_vqm_cap, cuda_vq_prefill_mma.inc.cu): H_g/A 在 g_vqm 暂存, O 在 g_vqp.ys, H_u 在截留缓冲。
      * 同层、同配对数才认; 配对序 = 同一份 sel 的同一个计数排序(专家内保持 token 序) ⇒ 一致。认上了就不再把本层专家前向算第二遍,
@@ -203,6 +205,8 @@ int ds4_gpu_bwd_routed_moe_tensor(ds4_gpu_tensor *gx, ds4_gpu_tensor *gw, const 
         }
         bwd_rowdot_kernel<<<nv, 256, 0, g_cur_stream>>>((float *)gw->ptr, (const float *)gy->ptr, og, pair, K, OUT);
         bwd_gather_f32_kernel<<<nv, 256, 0, g_cur_stream>>>(og, (const float *)gy->ptr, pair, K, OUT, (const float *)rw->ptr);   /* og ← G_O */
+        /* V 步按组梯度(cuda_bwd_vgrad.inc.cu): down 的 dW 要 G_O 与 A, 趁转置核还没动这两块先算; gate/up 的在 SwiGLU 反向之后 */
+        if (ok && g_vg.dw && ver == 3u) ok = vg_launch(2u, OUT, MID, og, ab, 0, pair, K, act, aoff, acnt, nact, blob, gr_all, OUT, bad);
         /* 三发转置: v3 走 bf16 张量核(vqst_kernel, 工作项表三发共用, 按码本位宽切), v2 仍走直读转置累加(码本转 bf16 丢尾数, 同推理路的取舍) */
         const uint32_t nc = ver == 3u ? g_vqp_hdr[layer][0].nc : 0u;
         uint32_t nbit = 0; while (nc && (1u << nbit) < nc) nbit++;
@@ -213,6 +217,8 @@ int ds4_gpu_bwd_routed_moe_tensor(ds4_gpu_tensor *gx, ds4_gpu_tensor *gw, const 
         if (ok) ok = ver == 3u ? vqt_launch(ga, og, blob, 2u, OUT, MID, nc, gr_all, OUT, 0, bad)
                                : vqb_tdot(ga, og, blob, ver, 2u, OUT, MID, act, aoff, acnt, nact, gr_all, OUT, 0, bad);   /* G_A = G_O·W2 */
         bwd_swiglu_kernel<<<(unsigned)((nh + 255) / 256), 256, 0, g_cur_stream>>>(hg, hu, ga, hg, hu, nh, clamp);      /* hg/hu ← G_Hg/G_Hu */
+        if (ok && g_vg.dw && ver == 3u) ok = vg_launch(0u, MID, IN, hg, x->ptr, 1, pair, K, act, aoff, acnt, nact, blob, gr_all, OUT, bad) &&
+                                             vg_launch(1u, MID, IN, hu, x->ptr, 1, pair, K, act, aoff, acnt, nact, blob, gr_all, OUT, bad);
         if (ok) ok = ver == 3u ? vqt_launch(og, hg, blob, 0u, MID, IN, nc, gr_all, OUT, 0, bad)
                                : vqb_tdot(og, hg, blob, ver, 0u, MID, IN, act, aoff, acnt, nact, gr_all, OUT, 0, bad);   /* og ← G_X(gate 部分) */
         if (ok) ok = ver == 3u ? vqt_launch(og, hu, blob, 1u, MID, IN, nc, gr_all, OUT, 1, bad)

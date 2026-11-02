@@ -104,8 +104,8 @@ static void pt_dec_end(pt_run *r, double *kl, double *tp, uint32_t *n) {
 
 /* 评估: 留出题(eval=1)或训练题前若干道的平均 KL(nat/答案 token)。hold: 0 = 复盘题, 1 = 保持料(通用题, 教师 = 部署态), 分开报。
  * li/ni/di 非空 = 逐题记 KL 和 / 答案 token 数 / 决策位 KL 和(第 k 道入选题进第 k 格, 顺序与 pt_heldout_dump 同): 轮间逐题配对比用 */
-static bool pt_eval(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d, int which, uint32_t cap_n, double *kl, int hold,
-                    double *li, uint32_t *ni, double *di) {
+bool pt_eval(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d, int which, uint32_t cap_n, double *kl, int hold,
+             double *li, uint32_t *ni, double *di) {
     const pt_sample **ss = xmalloc((size_t)(d->ns + 1) * sizeof *ss);
     uint32_t k = 0, nt = 0;
     for (uint32_t i = 0; i < d->ns && k < cap_n; i++) if (pt_in_eval(d, &d->s[i], which, hold)) ss[k++] = &d->s[i];
@@ -360,6 +360,11 @@ int ds4_engine_ptrain(ds4_engine *e, const char *spec) {
         if (lf) { fprintf(lf, "probe e00 stop %u %u base %d\n", stop_k, stop_n, base_stop); fflush(lf); }   /* 选轮读: ③ 收口不得少于部署态(model_train_pick.c) */
         pt_release("第 0 步探针");
     }
+    if (c.vq_nl) {   /* V 步(11-02, core_ptrain_vstep.c): 不训低秩, 每轮重选一批专家码字; 产物只有索引补丁 */
+        t0 = now_sec();
+        rc = pt_vstep_run(e, &c, &r, &d, ord, ntr, kl_ev0, lf, t0) ? 0 : 1;
+        goto out;
+    }
     /* ★每轮按 token 预算抽题(10-03 用户定)★: epoch_tok > 0 时一轮 = 打乱序里连续的一段, 各题行数累计到预算就收, 下一轮从游标接着取,
      * 取完整个打乱序才重新打乱 —— 一个周期内每题恰好一次、不放回; 轮与轮之间是相邻切片, 不是同一批题。预算 0 = 老口径(一轮 = 全量过一遍)。 */
     uint64_t rows_all = 0;
@@ -369,6 +374,7 @@ int ds4_engine_ptrain(ds4_engine *e, const char *spec) {
     uint32_t cur = ntr;   /* 打乱序的游标: 到头就重新打乱 */
     uint64_t qall = 0;    /* 开训以来过了多少题(算覆盖了几遍) */
     t0 = now_sec();
+    bool budget_hit = false;   /* budget_s 到了: 本轮按最后一批收, 轮末照常评估/落盘, 之后不开下一轮 */
     for (uint32_t ep = 1; ep <= c.epochs; ep++) {
         uint64_t erows = 0; uint32_t eq = 0;   /* 本轮已过的行 / 题 */
         nq = 0;
@@ -392,8 +398,12 @@ int ds4_engine_ptrain(ds4_engine *e, const char *spec) {
                 qs[nq++] = ord[b];
             }
             cur = b1; eq += b1 - b0;
-            const bool last = c.epoch_tok ? erows >= c.epoch_tok : cur >= ntr;   /* 本轮最后一批 */
+            bool last = c.epoch_tok ? erows >= c.epoch_tok : cur >= ntr;   /* 本轮最后一批 */
             if (!pt_run_list(e, &c, &r, bs, b1 - b0, 1, &ls, &nt, NULL, NULL, NULL)) goto out;   /* 一批的题装包后逐包过, 梯度照旧攒到批末 */
+            if (c.budget_s && !last && now_sec() - t0 >= (double)c.budget_s) {   /* 预算到了(这一批已经过完, 优化步照做): 当最后一批收轮 */
+                budget_hit = last = true;
+                fprintf(stderr, "ds4: [ptrain] budget_s=%u 到了(轮 %u 过了 %u/%u 题): 本轮到此收, 照常轮末评估 + 落 ckpt, 不开下一轮\n", c.budget_s, ep, eq, ntr);
+            }
             const double s1 = pt_tick(&c);
             double gn = 0; int clipped = 0;
             step++;
@@ -454,6 +464,7 @@ int ds4_engine_ptrain(ds4_engine *e, const char *spec) {
         if (lf) { fprintf(lf, "probe %s stop %u %u base %d\n", tag, stop_k, stop_n, base_stop); fflush(lf); }
         pt_release("轮末探针");
         double *t = ev_prev; ev_prev = ev_cur; ev_cur = t;
+        if (budget_hit) break;
     }
     if (c.epochs) {   /* epochs=0 = 只做第 0 步评估 + 探针, 没训过的 ③ 不落盘(落了只是 init 的一份拷贝) */
         if (!pt_save_amp(&c, &r, c.out)) goto out;

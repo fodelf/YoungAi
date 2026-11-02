@@ -30,6 +30,8 @@ typedef struct {
     char hold[1024];               /* 保持料 jsonl(可空, 空就打一行警告): 题不带 context, 答案 = 部署态自己答的, 教师 = 部署态自己 */
     char init[1024];               /* 非空 = 放大器 A/B 从这个 ③ 目录的 amp_Lnn.bin 读起(续训 / 在非零点做梯度检查); 空 = A=0、B 随机 */
     char evalf[1024];              /* eval=: 泛化留出 jsonl(料格式同 data), 整份不进训练; 空 = 没有泛化指标, 选轮退回同形式留出 */
+    char evalkl[1024];             /* eval_kl=: 同形式留出(eval 1)从这份文件来, data= 整份进训练、不再五取一。为什么(11-02 V 步 v06/v09): 实体料一只动物三种问法, 按行五取一
+                                    * 留出降了 5% 却一点没迁到没练过的实体 —— 降的是"背同实体的别种问法"; 留出要按实体整只切, 调用方(vstep_spark.sh prep)切好给这里 */
     char teacher_fp[1024];         /* teacher=fp:<表>: 教师 = 出厂原件的参考前向(v41_teacher.py --seqs --topk 出的 top-K 表, core_ptrain_fp.c), 每道题按整条教师序列
                                     * 逐 id 对上才填, 对不上就停(不回退到部署态教师); 这时 one-hot 行也全改成向 FP 蒸馏。空 = 教师是部署态自己(老路逐位同) */
     char dumpids[1024];            /* dumpids=<文件>: 装料后把每道题的教师序列(去重, 一行一串 id)写出去就退出 —— 拿去给 FP 参考前向打分 */
@@ -37,6 +39,16 @@ typedef struct {
     uint32_t expand;               /* expand=N(缺省 4): 装料时让部署态把每道训练题改写成 N 组同格式 jsonl 新问答一起训, 缓存 <data>.expandN.jsonl(0 = 关, 老路逐位同), core_ptrain_expand.c */
     uint32_t layer_lo, layer_hi;   /* 训练哪几层的放大器(含两端); 只训末层时出口反传是闭式的, 不用穿注意力 */
     uint32_t rank, topk, epochs, batch, maxlen, probe_n, probe_tok, seed;
+    uint32_t budget_s;             /* budget_s=N(11-02, 缺省 0 = 不限): 训练墙上时间预算(秒, 从第一步起算, 不含装载/第 0 步评估)。到了就把当前批当本轮最后一批:
+                                    * 照常轮末评估 + 落 ckpt, 然后不再开下一轮。为什么是硬闸不是算料: 用户定"本地一轮 ≤ 1 小时", 料长/步速的账总有漂移(ent04 账 ~100 分钟/轮实跑 62),
+                                    * 闸在训练器里才保证超时不是靠人盯。与 max_steps 不同: max_steps 是计时模式(不评估不存盘), 这里产物照样能挂 */
+    uint32_t vq_l[DS4_MAX_LAYER], vq_nl;   /* vq_layers=a-b(11-02 V 步, core_ptrain_vstep.c): 给了就不训低秩, 改成端到端重选这几层专家权重的离散码字(每轮一步), 产物 = 索引补丁 */
+    uint32_t vq_hot, vq_knn, vq_group, vq_bs, vq_check;   /* 每层每步最热几个专家(缺省 4) / 码本近邻数(16) / 每趟梯度几层一组(5) / 每步批几题(≥batch, 缺省 16) / 1 = 第 1 轮先做一阶预测对实测的机制审计 */
+    float vq_frac;                 /* 每步每矩阵最多改多少份组(缺省 0.005): 一阶线性化只在小步内成立, PV-Tuning 同一取舍 */
+    float vq_tail;                 /* vq_tail=τ(11-02 晚): V 步选码/审计趟按行尾权 w = min(16, max(1, KL/τ))(ds4_gpu_bwd_kl_tail); 0 = 关。留出评估不加权 */
+    uint32_t vq_docs;              /* vq_docs=N(11-02 晚, 缺省 4): V 步每轮的"前缀文档份"带 N 篇(BOS 开头的长行: agent 头行那种 10k 前缀 + 2k 靶), 轮转; ids 流仍每轮 1 篇一份 */
+    char vq_init[1024];            /* vq_init=<③ 目录>(11-02 深夜): V 步起点 = 这份索引补丁盖上后的态(续训 / 跨层叠); 它的记录并进本趟日志 ⇒ 每个 ckpt 自包含可单独挂 */
+    uint32_t data_eval;            /* data_eval=1(11-02): 给了 eval= 时 data 的料也照常 FNV 五取一留出(缺省 0 = 老规矩不留出) —— V 步要知识留出与编程判决份两边都把门 */
     uint32_t ctxlen;               /* ctxlen=N(10-25, 缺省 0 = maxlen): 样本最长可到 N 位; 超过 maxlen 的 one-hot 样本按"前缀只预填、尾窗才反传"过 ——
                                     * 前 sn−maxlen 位当普通预填进 KV 缓存(不存档不反传), 最后 maxlen 位存档 + 反传, 损失只算尾窗里的目标。
                                     * 为什么: 反传缓冲按 maxlen 分(每层 hc_in 存档 + 几十个 n×E×4), 4096 窗 10 GB+ 分不出(10-25 两次实撞), 而鹈鹕
@@ -109,6 +121,10 @@ bool pt_expand(ds4_engine *e, const pt_cfg *c, const pt_data *d, const char *cac
 
 /* core_ptrain_data.c */
 bool pt_cfg_load(pt_cfg *c, const char *path);
+bool pt_parse_ids_line(const char *ln, int32_t **ids, uint32_t *n);   /* ids 行 {"ids":[…]}(core_ptrain_ids.c, 11-02): 是 ids 行才返回 true; 坏行直接停 */
+bool pt_add_ids(ds4_engine *e, const pt_cfg *c, pt_data *d, int src, const int32_t *ids, uint32_t n);
+bool pt_add_tokens(ds4_engine *e, const pt_cfg *c, pt_data *d, int src, int eval, int32_t first, const int32_t *tok, uint32_t T, uint32_t np);   /* 原文段切段建样本(core_ptrain_data.c) */
+int pt_is_eval(const char *q);   /* 去空白 FNV 五取一(core_ptrain_data.c) */
 bool pt_parse_line(const char *ln, char **sys, char **ctx, char **q, char **a, char **txt, char **pfx, int *eos, const char **err);   /* 料行解析(唯一一份);
                                     * eos: text 行的 "eos" 字段(缺省 1 = 末尾补 EOS 当目标; false = 原文没写完, 不补 —— 撞长度上限的轨迹末尾补 EOS 是假靶)
                                     * pfx: text 行可选的 "prefix"(没有给 ""): 排在 text 前面、只当上下文不当靶的原文(分支续写料的学生前缀, 见 pt_sample.l0) */
@@ -180,6 +196,9 @@ typedef struct {
     /* 决策位读数(10-22, docs/think_close.md §4): dec_on 期间 pt_loss_rows 把目标是 dec_ids(EOS / </think>)的位单独累计 —— 这几位的 KL 与教师给它的 p。
      * 为什么: 留出 KL 是逐位平权, 一道题几百位里决策位只有一位, 量化把它压 4~22 倍在总 KL 里看不见(10-17 的 ③ 留出 −46% 而生成纹丝不动) */
     int dec_on; int32_t dec_ids[2]; double dec_kl, dec_tp; uint32_t dec_n;
+    /* 尾位计数(11-02 晚): tail_on 期间 pt_loss_rows 数 KL>1 / KL>2 的位 —— V 步每轮在判决份上打出来, 与判决尺的尾位数(c5f2 634 / 177)直接可比;
+     * 为什么: 均值四趟都动尾巴一位不动, 轮内只看均值分不清"尾位修了均值付了代价"和"什么都没修" */
+    int tail_on; uint32_t tail_n, tail_n1, tail_n2;
     /* 逐题决策位 KL(10-22 下午): dec_last = pt_loss_rows 刚算的那道题决策位 KL 和(没有决策位 = -1), dec_slot[i] = 包里第 i 题的(单题路放 [0]);
      * pt_run_list 按题抄进 dec_each → heldout_eNN.tsv 第 5 列。为什么: 24 位的均值两趟差 0.433/0.329 而整体留出几乎同, 不看逐题分不清是尺的噪声还是真变化 */
     double dec_last, dec_slot[PT_PACK_MAX];
@@ -193,6 +212,7 @@ typedef struct {
     double tm[11]; uint32_t tm_n, tm_steps;   /* prof 累计秒数(下标 PT_TM_*), 训练题数, 优化步数 */
     ds4_gpu_tensor *hcap; int32_t hcap_layer; int hcap_mid;   /* hc 边界检查: 反传经过第 hcap_layer 层时把该层入口(mid=1: 中段)梯度抄进 hcap */
     pt_pack pk;                     /* 合批(多层模式才开; 梯度检查/重算对拍/hc 检查仍走单题路, pk.nb = 0) */
+    ds4_gpu_tensor *vg_dw, *vg_slot[DS4_MAX_LAYER];   /* V 步(core_ptrain_vstep.c): 按组梯度缓冲 + 每层"专家 → 槽"表(NULL = 该层不收); 逐层反传前设给 ds4_gpu_bwd_moe_vgrad */
 } pt_run;
 /* 这道题能不能进训练/评估(教师给了表、不超批态行数; 长样本在 ctxlen 内走前缀形态): 与 pt_step_sample 的跳过条件同一个。
  * 前缀形态只许 one-hot 或原文段(raw): 它们的表每行都是"整篇前缀下的分布"(one-hot / 整篇打的 FP 表, core_ptrain_fp.c), 窄窗的部署态教师表不是(data.c pt_add_sample 的 lim)。
@@ -207,6 +227,8 @@ bool pt_run_alloc(ds4_engine *e, const pt_cfg *c, pt_run *r);
 void pt_run_free(pt_run *r);
 bool pt_step_sample(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_sample *s, int grad, double *loss_sum, uint32_t *ntok);
 bool pt_save_amp(const pt_cfg *c, pt_run *r, const char *dir);   /* ③ 落盘: amp_Lnn.bin(f32) + base.fnv */
+bool pt_eval(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d, int which, uint32_t cap_n, double *kl, int hold, double *li, uint32_t *ni, double *di);   /* core_ptrain.c; V 步的轮末评估也用 */
+bool pt_vstep_run(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d, const uint32_t *ord, uint32_t ntr, double kl_ev0, FILE *lf, double t0);   /* core_ptrain_vstep.c */
 long pt_mem_mb(void);   /* 可用内存 MB(/proc/meminfo; 没有 = -1), core_ptrain.c */
 /* 一个优化步(core_ptrain.c): 全局梯度范数 → 裁剪系数 → 各训练层 A/B 的 Adam(step 从 1 起)。步 1 与步 2 共用, 同一个 Adam 状态 */
 bool pt_opt_step(const pt_cfg *c, pt_run *r, uint32_t step, double *gnorm, int *clipped);

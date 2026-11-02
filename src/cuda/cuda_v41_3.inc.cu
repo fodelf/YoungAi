@@ -171,6 +171,7 @@ static struct { uintptr_t reg; uint64_t bytes; uint8_t *host; void *dev; uint64_
 typedef struct { uint8_t *dst; const uint8_t *src; size_t n; } v41_stage_job;
 static void *v41_stage_copy(void *a) { v41_stage_job *j = (v41_stage_job *)a; memcpy(j->dst, j->src, j->n); return NULL; }
 /* [reg, reg+bytes) 页对齐的整层范围拷进暂存; 成功返回 1。线程数取在线核数的一半(内存带宽先饱和, 另一半留给引擎自己的线程)。 */
+static void v41_vsp_stage_apply(uintptr_t reg, uint64_t bytes, uint8_t *stage);   /* 定义在 cuda_vq_vstep.inc.cu(本 TU 后面) */
 static int v41_stage_fill(uintptr_t reg, uint64_t bytes, uint32_t layer) {
     (void)cudaDeviceSynchronize();   /* 侧流 lane 可能还在读暂存里的上一层; 覆盖前必须全部落地 */
     g_v41_stage.valid = 0;
@@ -205,6 +206,7 @@ static int v41_stage_fill(uintptr_t reg, uint64_t bytes, uint32_t layer) {
         if (jobs[t].n && !started[t]) v41_stage_copy(&jobs[t]);
     }
     for (int t = 0; t < nt; t++) if (started[t]) pthread_join(th[t], NULL);
+    v41_vsp_stage_apply(reg, bytes, g_v41_stage.host);   /* V 步索引补丁(cuda_vq_vstep.inc.cu): 拷完一层再把这一层改过的索引位盖回去, 不盖就回到盘上原样 */
     g_v41_stage.reg = reg; g_v41_stage.bytes = bytes; g_v41_stage.valid = 1;
     return 1;
 }

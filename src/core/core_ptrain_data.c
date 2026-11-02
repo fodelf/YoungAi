@@ -31,6 +31,7 @@ bool pt_cfg_load(pt_cfg *c, const char *path) {
      * expand=0 回到只训原料(老路逐位同) */
     c->expand = 4;
     c->lr = 2e-4f; c->clip = 1.0f; c->init_std = 0.f;
+    c->vq_hot = 4; c->vq_knn = 16; c->vq_group = 5; c->vq_bs = 16; c->vq_check = 1; c->vq_frac = 0.005f; c->vq_docs = 4;   /* V 步缺省(见 pt_cfg.vq_*; vq_layers 不给 = 不走 V 步) */
     char *b = pt_slurp(path);
     if (!b) { fprintf(stderr, "ds4: --ptrain 读不了配置 %s\n", path); return false; }
     for (char *ln = strtok(b, "\n"); ln; ln = strtok(NULL, "\n")) {
@@ -45,6 +46,7 @@ bool pt_cfg_load(pt_cfg *c, const char *path) {
         else if (!strcmp(k, "hold")) snprintf(c->hold, sizeof c->hold, "%s", v);
         else if (!strcmp(k, "init")) snprintf(c->init, sizeof c->init, "%s", v);
         else if (!strcmp(k, "eval")) snprintf(c->evalf, sizeof c->evalf, "%s", v);
+        else if (!strcmp(k, "eval_kl")) snprintf(c->evalkl, sizeof c->evalkl, "%s", v);
         else if (!strcmp(k, "teacher")) {   /* 只认 fp:<表>(core_ptrain_fp.c); 别的教师来源不存在, 写错直接停 */
             if (strncmp(v, "fp:", 3) || !v[3]) { fprintf(stderr, "ds4: --ptrain teacher= 只认 fp:<top-K 表>, 给的是 %s\n", v); free(b); return false; }
             snprintf(c->teacher_fp, sizeof c->teacher_fp, "%s", v + 3);
@@ -56,6 +58,22 @@ bool pt_cfg_load(pt_cfg *c, const char *path) {
         else if (!strcmp(k, "rank")) c->rank = (uint32_t)atoi(v);
         else if (!strcmp(k, "topk")) c->topk = (uint32_t)atoi(v);
         else if (!strcmp(k, "epochs")) c->epochs = (uint32_t)atoi(v);
+        else if (!strcmp(k, "budget_s")) c->budget_s = (uint32_t)atoi(v);   /* 训练墙上时间预算(见 pt_cfg.budget_s) */
+        else if (!strcmp(k, "vq_layers")) {   /* V 步的层(见 pt_cfg.vq_l): a-b 或单层 */
+            unsigned a = 0, z = 0; c->vq_nl = 0;
+            if (sscanf(v, "%u-%u", &a, &z) != 2) a = z = (unsigned)atoi(v);
+            for (unsigned il = a; il <= z && il < DS4_MAX_LAYER && c->vq_nl < DS4_MAX_LAYER; il++) c->vq_l[c->vq_nl++] = il;
+        }
+        else if (!strcmp(k, "vq_hot")) c->vq_hot = (uint32_t)atoi(v);
+        else if (!strcmp(k, "vq_knn")) c->vq_knn = (uint32_t)atoi(v);
+        else if (!strcmp(k, "vq_group")) c->vq_group = (uint32_t)atoi(v);
+        else if (!strcmp(k, "vq_bs")) c->vq_bs = (uint32_t)atoi(v);
+        else if (!strcmp(k, "vq_check")) c->vq_check = (uint32_t)atoi(v);
+        else if (!strcmp(k, "vq_tail")) c->vq_tail = (float)atof(v);   /* 尾权阈 τ(ds4_gpu_bwd_kl_tail): 0 关 */
+        else if (!strcmp(k, "vq_docs")) c->vq_docs = (uint32_t)atoi(v);
+        else if (!strcmp(k, "vq_init")) snprintf(c->vq_init, sizeof c->vq_init, "%s", v);   /* V 步起点补丁目录(见 pt_cfg.vq_init) */
+        else if (!strcmp(k, "vq_frac")) c->vq_frac = (float)atof(v);
+        else if (!strcmp(k, "data_eval")) c->data_eval = (uint32_t)atoi(v);   /* 1 = 给了 eval= 料也照常五取一留出(V 步两边信赖域要两份留出) */
         else if (!strcmp(k, "batch")) c->batch = (uint32_t)atoi(v);
         else if (!strcmp(k, "maxlen")) c->maxlen = (uint32_t)atoi(v);
         else if (!strcmp(k, "ctxlen")) c->ctxlen = (uint32_t)atoi(v);   /* 前缀形态的样本上限(见 core_ptrain.h pt_cfg.ctxlen) */
@@ -104,6 +122,7 @@ bool pt_cfg_load(pt_cfg *c, const char *path) {
     /* 反传从出口往下逐层推, 出口梯度直接进第 hi 层: hi 不是末层时中间那几层被跳过, 梯度是错的(不报错, 只是训歪) */
     if (c->layer_hi != DS4_N_LAYER - 1u) { fprintf(stderr, "ds4: --ptrain layers 必须到末层 L%u(给的是 %u-%u)\n", DS4_N_LAYER - 1u, c->layer_lo, c->layer_hi); return false; }
     if (c->evalf[0] && !strcmp(c->evalf, c->data)) { fprintf(stderr, "ds4: --ptrain eval= 与 data= 是同一份料: 泛化留出必须是没进训练的另一份\n"); return false; }
+    if (c->evalkl[0] && (!strcmp(c->evalkl, c->data) || c->data_eval)) { fprintf(stderr, "ds4: --ptrain eval_kl= 不能是 data= 本身, 也不能和 data_eval=1 同给(两种留出规则打架)\n"); return false; }
     if (!c->rank || c->topk < 1 || c->topk > 128 || !c->batch || c->maxlen < 16) { fprintf(stderr, "ds4: --ptrain rank/topk(1..128)/batch/maxlen 不合法\n"); return false; }
     if (c->ctxlen && c->ctxlen < c->maxlen) { fprintf(stderr, "ds4: --ptrain ctxlen %u 小于 maxlen %u(ctxlen 是样本上限, 尾窗 = maxlen)\n", c->ctxlen, c->maxlen); return false; }
     if (c->teacher_fp[0] && c->sample_n) { fprintf(stderr, "ds4: --ptrain teacher=fp: 与 sample_n 不能同开: 步 2 的教师是部署态自己当场打分, 两种教师不能混一趟\n"); return false; }
@@ -138,7 +157,7 @@ static int32_t *pt_cat(const ds4_tokens *a, const ds4_tokens *b, uint32_t *n) {
 }
 
 /* 留出 = 问题去空白后 FNV-1a 五取一: 同一道题不管出现在哪份料、哪一趟, 永远在同一边 */
-static int pt_is_eval(const char *q) {
+int pt_is_eval(const char *q) {
     uint64_t h = 1469598103934665603ull;
     for (const unsigned char *p = (const unsigned char *)q; *p; p++) { if (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t') continue; h ^= *p; h *= 1099511628211ull; }
     return h % 5u == 0u;
@@ -182,8 +201,7 @@ static void pt_doc_slot(pt_data *d) {
  *   前缀是学生的(只给上下文, 零梯度), 靶 100% 是原件的分布 —— 09-30 铁律禁的是"自吐当靶", 这里自吐只是提问的方式。
  * prefix 与 text 各自分词再拼: 分界正好是学生停笔 / 官方接笔的那个 token 边界(API 续写就是从这个前缀 token 串起的), 拼起来再切会在边界合并出别的 token。 */
 static bool pt_add_text(ds4_engine *e, const pt_cfg *c, pt_data *d, int src, const char *pfxtxt, const char *txt, int eos) {
-    const uint32_t ci = pt_chunk_of(d, "", 0, 1);
-    const int eval = src == 2 ? 2 : (src == 0 && c->evalf[0]) ? 0 : pt_is_eval(txt);   /* 给了 eval= 时料不留出(同 pt_add_sample) */
+    const int eval = src == 2 ? 2 : (src == 0 && c->evalf[0] && !c->data_eval) ? 0 : pt_is_eval(txt);   /* 给了 eval= 时料不留出(同 pt_add_sample); data_eval=1 照常五取一 */
     ds4_tokens at = {0};
     /* 认特殊 token 的切分(10-22): 原文段里的 <think> / </think> / <｜end▁of▁sentence｜> 要成为它们的 id, 思考轨迹尾段才能把 </think> 这个决策位放进 KL;
      * 纯 BPE 会把 "</think>" 切成几个普通片。不含这些字串的原文两条路逐 token 同(只有一个 span, 同一个 BPE) */
@@ -194,14 +212,23 @@ static bool pt_add_text(ds4_engine *e, const pt_cfg *c, pt_data *d, int src, con
     for (int i = 0; i < tt.len; i++) ds4_tokens_push(&at, tt.v[i]);
     ds4_tokens_free(&tt);
     if (eos) ds4_tokens_push(&at, ds4_token_eos(e));
+    const bool ok = pt_add_tokens(e, c, d, src, eval, e->vocab.bos_id, at.v, (uint32_t)at.len, np);
+    ds4_tokens_free(&at);
+    return ok;
+}
+
+/* 原文段的切段与建样本(text 行与 ids 行共用, 11-02): 序列 = first + tok[0..T), 前 np 个 tok 只当上下文。text 行 first = BOS;
+ * ids 行(core_ptrain_ids.c, 判决尺那种裸 token 流)first = 流的第 0 个 id, 不另加 BOS —— FP 锚就是对这串原样算的, 加了 BOS 教师/学生看到的就不是同一条流 */
+bool pt_add_tokens(ds4_engine *e, const pt_cfg *c, pt_data *d, int src, int eval, int32_t first, const int32_t *tok, uint32_t T, uint32_t np) {
+    const uint32_t ci = pt_chunk_of(d, "", 0, 1);
     const bool pf = c->ctxlen > c->maxlen;
-    const uint32_t T = (uint32_t)at.len, S = pf ? (c->maxlen - 2u) / pt_pfx_align() * pt_pfx_align() : c->maxlen - 1u, Wc = c->ctxlen - 1u;
+    const uint32_t S = pf ? (c->maxlen - 2u) / pt_pfx_align() * pt_pfx_align() : c->maxlen - 1u, Wc = c->ctxlen - 1u;
     uint32_t nseg = 0;   /* 前缀形态的段数(与下面的段界同式): doc_tail 按它数末 K 段 */
     if (pf) for (uint32_t k = 0, off = 0; off < T; k++) { uint32_t en = (k + 1u) * S - 1u < T ? (k + 1u) * S - 1u : T; if (en + 1u == T) en = T; nseg++; off = (k + 1u) * S; if (en >= T) break; }
     /* 整篇一条教师序列(10-26): 前缀形态下各段的 tids 都是它的前缀(没被 ctxlen 截时), FP 表按它导一次填所有段, 不按段的窗各导一条(一篇 doc_tail 遍白算) */
     pt_doc_slot(d); uint64_t fpkey = 0;
     if (pf) {
-        int32_t *ds = xmalloc((size_t)(T + 1u) * 4); ds[0] = e->vocab.bos_id; memcpy(ds + 1, at.v, (size_t)T * 4);
+        int32_t *ds = xmalloc((size_t)(T + 1u) * 4); ds[0] = first; memcpy(ds + 1, tok, (size_t)T * 4);
         d->docids[d->ndoc] = ds; d->docn[d->ndoc] = T + 1u; fpkey = pt_ids_fnv(ds, T + 1u);
     }
     for (uint32_t k = 0, off = 0; off < T; k++) {
@@ -219,15 +246,14 @@ static bool pt_add_text(ds4_engine *e, const pt_cfg *c, pt_data *d, int src, con
         s->sn = en - st0 + 1u; s->sa0 = off - st0 + 1u; s->m = m;
         s->l0 = np > off ? np - off : 0u;   /* 本段靶里落在 prefix 的头几位: 只当上下文(上面保证了 l0 ≤ m−1, 至少 1 位进损失) */
         s->sids = xmalloc((size_t)(s->sn + xt) * 4);
-        s->sids[0] = e->vocab.bos_id;
-        memcpy(s->sids + 1, at.v + st0, (size_t)(en - st0 + xt) * 4);
+        s->sids[0] = first;
+        memcpy(s->sids + 1, tok + st0, (size_t)(en - st0 + xt) * 4);
         s->tids = xmalloc((size_t)(s->sn + xt) * 4); memcpy(s->tids, s->sids, (size_t)(s->sn + xt) * 4); s->tn = s->sn; s->ta0 = s->sa0;
         s->fpkey = (pf && st0 == 0u) ? fpkey : 0;   /* 被 ctxlen 截过头的窗不是整篇的前缀, 仍按自己的窗做键 */
         pt_fill_onehot(c, s);
         off = pf ? (k + 1u) * S : en;
     }
     d->ndoc++;
-    ds4_tokens_free(&at);
     return true;
 }
 
@@ -255,7 +281,7 @@ static bool pt_add_sample(ds4_engine *e, const pt_cfg *c, pt_data *d, int src, c
      * 再从料里抽 20% 走只会吃掉小料里一条事实唯一的信息行(youngai 24 行被抽走 5 行, fact 2/8/9/10 各只剩答案漏在问句里的那行, 挂上去这几条全错);
      * unsloth/TRL 也没有自动留出, eval_dataset 才是留出。保持料(src 1)照旧五取一: 它的留出 KL 量的是"通用回答没被带偏", 与 eval= 无关 */
     pt_doc_slot(d); s->doc = d->ndoc++;
-    s->chunk = ci; s->eval = src == 2 ? 2 : (src == 0 && c->evalf[0]) ? 0 : pt_is_eval(q); s->q = strdup(q); s->a = strdup(a); s->src = src;
+    s->chunk = ci; s->eval = src == 2 ? 2 : (src == 0 && c->evalf[0] && !c->data_eval) ? 0 : pt_is_eval(q); s->q = strdup(q); s->a = strdup(a); s->src = src;
     s->sids = pt_cat(&sp, &at, &s->sn); s->sa0 = (uint32_t)sp.len;
     s->tids = pt_cat(&tp, &at, &s->tn); s->ta0 = (uint32_t)tp.len;
     s->m = (uint32_t)at.len;
@@ -368,7 +394,12 @@ static bool pt_load_file(ds4_engine *e, const pt_cfg *c, pt_data *d, const char 
         if (nl) *nl = 0;
         lineno++;
         const char *q0 = p; while (*q0 == ' ' || *q0 == '\t' || *q0 == '\r') q0++;
-        if (*q0) {
+        int32_t *ids = NULL; uint32_t nids = 0;
+        if (*q0 && pt_parse_ids_line(p, &ids, &nids)) {   /* ids 行(裸 token 流, core_ptrain_ids.c): 保持料不收(教师 = 部署态按问答算, 没有流的形态) */
+            if (src == 1) { fprintf(stderr, "ds4: --ptrain %s 第 %u 行: 保持料不收 ids 行\n", path, lineno); ok = false; }
+            else ok = pt_add_ids(e, c, d, src, ids, nids);
+            free(ids);
+        } else if (*q0) {
             char *sys, *ctx, *q, *a, *txt, *pfx; const char *err; int eos = 1;
             if (!pt_parse_line(p, &sys, &ctx, &q, &a, &txt, &pfx, &eos, &err)) { fprintf(stderr, "ds4: --ptrain %s 第 %u 行: %s\n", path, lineno, err); ok = false; }
             else if (src == 1 && (ctx[0] || txt[0])) { fprintf(stderr, "ds4: --ptrain %s 第 %u 行: 保持料只收不带 context 的问答(教师 = 部署态自己)\n", path, lineno); ok = false; }
@@ -395,6 +426,12 @@ bool pt_data_load(ds4_engine *e, const pt_cfg *c, pt_data *d) {
         if (!pt_load_file(e, c, d, cache, 0, &skipped, &npfx)) return false;
         for (uint32_t i = n0; i < d->ns; i++) d->s[i].eval = 0;
         nexp = d->ns - n0;
+    }
+    if (c->evalkl[0]) {   /* 同形式留出整份从 eval_kl= 来: 当 src 0 装(教师缓存/FP 配表与 data 同一路), 装完全标 eval 1; data= 的行此时全是训练(eval= 给了且 data_eval=0 ⇒ 不五取一) */
+        const uint32_t n0 = d->ns;
+        if (!pt_load_file(e, c, d, c->evalkl, 0, &skipped, &npfx)) return false;
+        for (uint32_t i = n0; i < d->ns; i++) d->s[i].eval = 1;
+        fprintf(stderr, "ds4: [ptrain] 同形式留出(eval_kl= %s): %u 题, data= 整份进训练\n", c->evalkl, d->ns - n0);
     }
     if (c->hold[0]) { if (!pt_load_file(e, c, d, c->hold, 1, &skipped, &npfx)) return false; }
     else fprintf(stderr, "ds4: ★[ptrain] 没给 hold=(保持料): ③ 在通用问题上没有东西钉着, 10-01 实撞局部性崩 —— 只在故意对照时这么跑★\n");
