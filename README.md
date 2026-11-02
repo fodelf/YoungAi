@@ -53,14 +53,9 @@ pipeline_tag: text-generation
 
 ![1-bit quants of DeepSeek V4.1 Flash 1017 compared on Unsloth's benchmarks: this project vs Unsloth UD-IQ1_S / IQ1_M and ISTA-DASLab GSQ-RCO IQ1_M](docs/img/quant_compare-en.png)
 
-**Our dataset here is small: read the magnitudes, not a ranking.** Each benchmark got 90 minutes on one serial lane, so our
-rows are random subsets, mostly one sample per item: 296 answers in all (AIME25 32, HMMT 14, GPQA 30, MMLU-Pro 117, IFEval 82,
-LiveCodeBench 21) plus 14 Aider exercises. The 9 items (1–2 per benchmark) that went into the restoration sidecar's training data
-are excluded. Unsloth's numbers use every item, up to 16 samples each. Our error bars run from ±2.4 to ±13.4 points.
-Avg of 6 is 80.9 ± 3.1, against 81.8 for GSQ-RCO, 83.5 for UD-IQ1_S and 85.6 for UD-IQ1_M. GPQA (80.0 ± 7.3 against 85–88)
-and HMMT (50.0 ± 13.4 against 54–63) read low, and in both the misses are mostly answers that hit the 32,768-token cap
-(5 of 30 and 4 of 14); neither is settled at this size. Aider Polyglot ran in the official Docker harness on a Mac with requests
-tunnelled to the Spark: 6 of 14 exercises passed, 42.9 ± 13.2, against 29.8–42.1.
+**Read the magnitudes, not a ranking.** Our rows are small random subsets (296 answers plus 14 Aider exercises, 90 minutes
+per benchmark, error bars ±2.4 to ±13.4 points); the 9 items that went into the sidecar's training data are excluded.
+Sample sizes and what the low GPQA / HMMT rows are: [technical notes §5.1](docs/TECHNICAL.md#51-quality).
 
 **These scores do not stand for what the model can actually do.** The pelican test below shows it: same model, same task,
 benchmark scores barely move, and the drawings are a step apart.
@@ -71,17 +66,9 @@ Same prompt ("create an HTML page with a 2D SVG animation of a pelican riding a 
 |:---:|:---:|:---:|
 | ![Official](docs/img/pelican-official.png) | ![This project, Oct 27](docs/img/pelican-local.png) | ![This project, Oct 30](docs/img/pelican-local-1030.png) |
 
-Both local runs use the 113.6 GB equal-weight base plus the restore sidecar on one machine; only the sidecar's correction
-changed in between. One run each, not hand-picked.
-
-- **Oct 27.** A frame from the first draft while the model reviewed its own screenshot; we stopped the run there. The
-  pouch comes out as a round ball under a short bill, and body, wings and neck merge into one lump.
-- **Oct 30.** The final page: the model wrote it, looked at its own screenshot, fixed what it saw and stopped by itself
-  after 72 tool calls (38 minutes). The long bill and the pouch hanging along it are there now. The gap is still
-  visible: the neck does not stand up, the pouch is small, and the body reads more like a duck.
-
-Between the two, on the same rulers: code Same top 84.3% → 85.0% (KL 0.252 → 0.230), general English 81.4% → 82.0%
-(KL 0.621 → 0.586). How the sidecar learns is under [The model](#the-model).
+Both local runs use the same 113.6 GB base plus the restore sidecar on one machine; only the sidecar's correction changed
+in between. One run each, not hand-picked. What changed between the two drawings, and the rulers that barely moved:
+[technical notes §5.1](docs/TECHNICAL.md#51-quality).
 
 ![YoungAi Studio: the assistant hunting for the cheapest DGX Spark](docs/img/studio-agent-en.png)
 
@@ -102,17 +89,9 @@ weights (Same top) **85.2%** of the time on code:
 | ① + restore sidecar | + 145 MB | 85.1% | **82.2%** |
 | **① + restore sidecar + index patch (default on the Spark)** | **+ 13 MB** | **85.2%** | 81.6% |
 
-"Same" means that on the same text, our model and the original rank the same token first. Code is 15,360 held-out tokens
-across 30 languages; general English is WikiText-2. Mean KL by row: code 0.446 → 0.318 → 0.230 → 0.227 → 0.224, general
-English 0.803 → 0.673 → 0.574 → 0.590 → 0.572. Against ② + ③ the restore sidecar is ahead on code Same top and level on
-code KL; on general English it is 0.2 points lower (1 of 512 tokens), above the 80% floor we hold it to.
-
-**The index patch** (`posttrain-restore-20261103`, 13 MB) changes no weight value at all: in layers 10–29 it re-picks the
-codeword of 787,000 groups of 8 expert weights, choosing by the gradient of the KL to the original on code token streams
-the ruler never sees and on short factual answers from the official API. A round is kept only if held-out code
-KL does not rise. It sits on top of the restore sidecar (`ds4-server --zchain <restore sidecar> --posttrain <patch>`)
-and is what the Spark runs by default since Nov 3: code KL drops 1.4%, general English gives back 0.6 points (3 of 512
-tokens); we pick by the code ruler and only report general English.
+"Same" means that on the same text, our model and the original rank the same token first; code is 15,360 held-out
+tokens across 30 languages, general English is WikiText-2. Mean KL per row, what the index patch is, and the full tables:
+[technical notes §5.1](docs/TECHNICAL.md#51-quality).
 
 **Three things get 113.6 GB this far:**
 
@@ -131,7 +110,7 @@ tokens); we pick by the code ruler and only report general English.
 **The restore sidecar** puts both pieces in one directory: gains and router biases like ② (40 MB), a rank-64 correction
 like ③ (105 MB). Its correction keeps learning from source files the official API writes fresh. No training text shares a
 16-token stretch with either ruler, apart from two lines of Dockerfile boilerplate. Pass the directory to
-`ds4-server --zchain`.
+`ds4-server --zchain`; the index patch (`posttrain-restore-20261103`) goes on top with `--posttrain`.
 
 Context is 1M tokens; the full KV cache is 0.89 GB. Method and full tables: [technical notes §5](docs/TECHNICAL.md#5-results);
 how the post-training file is made: [§4.3](docs/TECHNICAL.md#43-the-post-training-file).

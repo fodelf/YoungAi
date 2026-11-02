@@ -677,6 +677,48 @@ the restore sidecar it sits on (85.07% / 0.227 / 82.2%):
 | Code judge slice, 15,360 | **85.16%** | 0.838 | 0.2238 | 184 / 629 (sidecar 177 / 634) |
 | WikiText-2, 512 | 81.64% | 0.780 | 0.572 | |
 
+It is what the Spark runs by default since Nov 3 (`serve_pick.txt` carries the `--posttrain` line): code KL −1.4%,
+general English −0.6 pp (3 of 512 tokens). We pick versions by the code ruler and only report general English, with
+80% as the floor it may not cross.
+
+**The ladder in the README table**, same two rulers (Same top-1 / mean KL): base 78.4% / 0.446 on code and 76.8% / 0.803
+on WikiText-2; + code sidecar 82.0% / 0.318 and 79.7% / 0.673; + post-training file 84.8% / 0.230 and 82.4% / 0.574;
+restore sidecar 85.1% / 0.227 and 82.2% / 0.590; restore sidecar + index patch 85.2% / 0.224 and 81.6% / 0.572. Against
+② + ③ the restore sidecar is ahead on code Same top and level on code KL; on general English it is 0.2 pp lower (1 of 512
+tokens).
+
+#### Task benchmarks (Unsloth's set)
+
+The chart at the top of the README puts this project next to Unsloth UD-IQ1_S / IQ1_M and ISTA-DASLab GSQ-RCO IQ1_M on
+the benchmarks Unsloth publishes. **Our dataset there is small: read the magnitudes, not a ranking.** Each benchmark got
+90 minutes on one serial lane, so our rows are random subsets, mostly one sample per item: 296 answers in all (AIME25 32,
+HMMT Feb26 14, GPQA-Diamond 30, MMLU-Pro 117, IFEval 82, LiveCodeBench v6 21) plus 14 Aider Polyglot exercises. The 9
+items (1–2 per benchmark) that went into the restore sidecar's training data are excluded (`gguf-tools/bench/data/trained_exclude.jsonl`).
+Unsloth's numbers use every item, up to 16 samples each. Our error bars run from ±2.4 to ±13.4 points. Avg of 6 is
+80.9 ± 3.1, against 81.8 for GSQ-RCO, 83.5 for UD-IQ1_S and 85.6 for UD-IQ1_M. GPQA (80.0 ± 7.3 against 85–88) and HMMT
+(50.0 ± 13.4 against 54–63) read low, and in both the misses are mostly answers that hit the 32,768-token cap (5 of 30 and
+4 of 14); neither is settled at this size. Aider Polyglot ran in the official Docker harness on a Mac with requests
+tunnelled to the Spark: 6 of 14 exercises passed, 42.9 ± 13.2, against 29.8–42.1. The chart was measured on Nov 1 with
+the restore sidecar alone (the index patch came two days later); the run is `gguf-tools/scripts/bench_chain_mac.sh`.
+
+#### The pelican test
+
+Benchmark scores do not stand for what the model can actually do: the README shows the same model, the same task, scores
+that barely move, and drawings a step apart. The prompt is "create an HTML page with a 2D SVG animation of a pelican riding
+a bicycle", the agent flow is dsh, and the three pictures are the official model through the official API, this project on
+Oct 27 (restore sidecar before self-learning) and this project on Oct 30 (after 8 kept rounds of self-learning). Both local
+runs use the 113.6 GB base plus the restore sidecar on one machine; only the sidecar's correction changed in between. One run
+each, not hand-picked.
+
+- **Oct 27.** A frame from the first draft while the model reviewed its own screenshot; we stopped the run there. The
+  pouch comes out as a round ball under a short bill, and body, wings and neck merge into one lump.
+- **Oct 30.** The final page: the model wrote it, looked at its own screenshot, fixed what it saw and stopped by itself
+  after 72 tool calls (38 minutes). The long bill and the pouch hanging along it are there now. The gap is still
+  visible: the neck does not stand up, the pouch is small, and the body reads more like a duck.
+
+Between the two, on the same rulers: code Same top 84.3% → 85.0% (KL 0.252 → 0.230), general English 81.4% → 82.0%
+(KL 0.621 → 0.586). How the sidecar learns between rounds is in [§4.3](#43-the-post-training-file).
+
 All of its training text is generated fresh by the official API. A 16-gram fingerprint check against both rulers: 24 of
 25 data files have zero hits; the one left hits two lines of Dockerfile boilerplate.
 
