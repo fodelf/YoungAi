@@ -24,6 +24,8 @@
   ptfpick <api.ptf> <out.seqs> [每隔=10]  从段 B 一轮的官方 API 表里隔条取序列, 给 v41_teacher.py --seqs 打 FP 表。
   ptfcmp <api.ptf> <fp.ptf> [kl0.tsv]     同一批序列上官方 API top-20(训练靶)对 FP 原件(尺子参考)逐位比; 给 kl0.tsv 并排报学生。
 """
+import json
+import os
 import struct
 import sys
 
@@ -451,6 +453,16 @@ def read_ptf(path):
     return recs
 
 
+def cmd_ptfhit(ptf_path):
+    """教师表自检(11-02): 每条记录里 top-1 == 下一个真 token 的比例。FP 锚对本模型自然语料的 top-1 命中约 70%(v41_judge 参考 PPL 行);
+    远低于 50% = 锚和 ids 不是同一串(配错了文件), 训练器照样能配上表、只是教的全是别的位置的分布, 不报错 —— 所以 prep 必须先过这一关。"""
+    recs = read_ptf(ptf_path); hit = 0; n = 0
+    for ids, ti, tp, rest in recs:
+        n += len(ids) - 1; hit += int((ti[:, 0] == ids[1:]).sum())
+    print("ptfhit %s: %d 条 %d 位, 教师 top-1 命中下一 token %.1f%%" % (ptf_path.split("/")[-1], len(recs), n, 100.0 * hit / max(n, 1)))
+    if n and hit / n < 0.5: sys.exit("★命中率过低: 锚与 ids 不是同一串★")
+
+
 def cmd_anchor2ptf(anchor_path, ids_path, out_path, kk="64", prefixes=""):
     """FP 全 logits 锚(<i32 S><i32 V><f32 S×V>, v41_judge.sh 的 teacher_*.bin)→ PTF1 top-K 表(训练器 teacher=fp: 吃的格式)。
     10-28 段 B 天花板: 尺子自己的 FP 读数当训练靶, 不另跑一趟原件。ids 文件 = 锚对应的那串 id(空白分隔), 长度必须等于 S, 否则停。
@@ -794,11 +806,166 @@ def cmd_temper(topk_path, ids_path, n_prompt, entry="0", temps="1.0,1.2,1.5,2.0"
                   st["tail"] / max(1, st["tail_n"])))
 
 
+def cmd_entq(tsv_path, out_dir):
+    """实体特征知识召回尺的题单(2026-11-01, fable5 "不像鹈鹕 = 实体特征知识召回位被压"): 实体表(类别 中文 英文) → 三份 q.jsonl(api_teacher.py collect 的输入)。
+    留出 = bird 整类 + 其余每类类内序号 % 5 == 4 的实体, 永不进料, 只量; 训练 = 其余实体 × 三问(中文外形 / 英文外形 / 中文"简笔画必须画对什么");
+    训练探针 = 训练实体里类内序号 % 5 == 0 的, 只问中文外形 —— 和留出一起量, 分清"只有练过的实体动"与"没练过的也动"。
+    id = 类别|中文|语言|问号, ptfprobe 靠它分组; 题面里不出现"鸟"字以外的禁词由 entity_probe_spark.sh 用 evo_ban.txt 再筛一遍。"""
+    ents = []
+    for ln in open(tsv_path, encoding="utf-8"):
+        if not ln.strip() or ln.startswith("#"): continue
+        cat, zh, en = ln.rstrip("\n").split("\t"); ents.append((cat, zh, en))
+    q_zh = "请描述{zh}的外形特征：先说它最有辨识度的部位和各部位的大致比例，再说它和容易混淆的近似事物的区别。不超过 200 字。"
+    q_en = "Describe the physical appearance of a {en}: first its most distinctive parts and their rough proportions, then how it differs from things it is commonly confused with. Under 150 words."
+    q_dr = "如果要用简笔画画一个{zh}，必须画对哪几个特征才能一眼认出来？按重要性列出，并说明每个特征的大小比例。不超过 200 字。"
+    idx = {}; out = {"train": [], "hold": [], "ptrain": []}
+    for cat, zh, en in ents:
+        k = idx.get(cat, 0); idx[cat] = k + 1
+        hold = cat == "bird" or k % 5 == 4
+        mk = lambda lang, qk, q: {"id": f"{cat}|{zh}|{lang}|{qk}", "q": q.format(zh=zh, en=en)}
+        if hold:
+            out["hold"] += [mk("zh", "q1", q_zh), mk("en", "q2", q_en)]
+        else:
+            out["train"] += [mk("zh", "q1", q_zh), mk("en", "q2", q_en), mk("zh", "q3", q_dr)]
+            if k % 5 == 0: out["ptrain"].append(mk("zh", "q1", q_zh))
+    os.makedirs(out_dir, exist_ok=True)
+    for name, rows in out.items():
+        with open(os.path.join(out_dir, f"{name}_q.jsonl"), "w", encoding="utf-8") as f:
+            for r in rows: f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    nh = sum(1 for c, _, _ in ents if c == "bird"); print("entq: 实体 %d(鸟 %d); 训练题 %d / 留出题 %d / 训练探针题 %d → %s" % (len(ents), nh, len(out["train"]), len(out["hold"]), len(out["ptrain"]), out_dir))
+
+
+def cmd_ptfhead(ptf_in, ptf_out, n="40"):
+    """PTF1 表取前 n 条另存(2026-11-01 测量分叉排查: 训练器报留出损失 −57%、引擎挂同一 ③ 在同类行上 KL 不动, 拿【训练过的行】本身在引擎上量一遍)。"""
+    import numpy as np
+    recs = read_ptf(ptf_in)[:int(n)]
+    with open(ptf_out, "wb") as f:
+        f.write(struct.pack("<III", 0x31465450, recs[0][1].shape[1], len(recs)))
+        for ids, ti, tp, rest in recs:
+            f.write(struct.pack("<I", len(ids))); np.asarray(ids, np.int32).tofile(f); np.asarray(ti, np.int32).tofile(f); np.asarray(tp, np.float32).tofile(f); np.asarray(rest, np.float32).tofile(f)
+    print("ptfhead: %s 前 %d 条(%d 位) → %s" % (ptf_in, len(recs), sum(len(r[0]) for r in recs), ptf_out))
+
+
+def cmd_entlong(rows_path, ok_path, out_path, n_rows="100", n_ctx="14", seed="7", step="3"):
+    """实体训练行加长上下文前缀(2026-11-01 晚, fable5 "修正只在流的前 ~1000 位起作用"): 从 train_rows.jsonl 每 3 行取 1 行当靶(每实体的中文外形题),
+    前缀 = n_ctx 个【别的实体】的问答按部署多轮格式拼起来(<｜User｜>题<｜Assistant｜></think>答<｜end▁of▁sentence｜>…)再接原题头, text 不变。
+    靶的 token 串与短行逐位同(前缀以特殊 token 收尾, BPE 不跨界), 教师表用 ptfprefix 从短行的表平移, 不重打 API。
+    n_ctx 可以是逗号表(11-02, 如 0,12,40): 第 i 行取第 i % 表长 个 —— 短/中/长三档各占 1/3。为什么混: 只训 7k 长行(ent04)短上下文知识题退了(探针 大 0.80 → 0.55),
+    "训多长管多长"反过来也成立, 部署里短问答和 10k agent 上下文都有, 料得两头都盖; 0 = 不加前缀(与短行逐位同, ptfprefix 当 P=1 平移)。"""
+    import random
+    import re
+    USER, ASST, TE, EOS = "<｜User｜>", "<｜Assistant｜>", "</think>", "<｜end▁of▁sentence｜>"
+    def ent_of(s):
+        for pat in (r"请描述(.+?)的外形", r"appearance of a (.+?):", r"简笔画画一个(.+?)，"):
+            m = re.search(pat, s)
+            if m: return m.group(1)
+        return s[:20]
+    rows = [json.loads(l) for l in open(rows_path, encoding="utf-8") if l.strip()]
+    oks = [json.loads(l) for l in open(ok_path, encoding="utf-8") if l.strip()]
+    oks = [(o["id"].split("|")[1], USER + o["q"] + ASST + TE + o["content"].rstrip(" \r\n") + EOS) for o in oks if o.get("ok") and o.get("content")]
+    rng = random.Random(int(seed)); n = 0; nctxs = [int(x) for x in str(n_ctx).split(",")]
+    with open(out_path, "w", encoding="utf-8") as f:
+        for r in rows[::int(step)][:int(n_rows)]:
+            nctx = nctxs[n % len(nctxs)]
+            ent = ent_of(r["prefix"]); pool = [t for e, t in oks if e != ent]; rng.shuffle(pool)
+            f.write(json.dumps({"prefix": "".join(pool[:nctx]) + r["prefix"], "text": r["text"], **({"eos": False} if r.get("eos") is False else {})}, ensure_ascii=False) + "\n"); n += 1
+    print("entlong: %d 行, 每行前缀 %s 个别的实体问答(轮流) → %s" % (n, "/".join(map(str, nctxs)), out_path))
+
+
+def cmd_ptfprefix(short_ptf, long_seqs, out_ptf):
+    """短行教师表 → 长前缀行教师表: 长序列(simids 导出)以某条短记录去掉 BOS 后的 id 串结尾时, 记录 = 长序列 ids + 前缀段 one-hot + 短记录的行原样平移。
+    为什么不重打 api_teacher.py ptf: 它按内容块找轨迹, 前缀里别的实体的答案会被先认领走(一条轨迹只认领一条序列), 长行自己反而配不上。
+    对不上后缀的长序列直接停(训练器按整条序列哈希查表, 少一条就是少一道题的教师, 不许静默)。"""
+    import numpy as np
+    recs = read_ptf(short_ptf); K = recs[0][1].shape[1]
+    by_tail = {}
+    for ids, ti, tp, rest in recs: by_tail.setdefault(tuple(ids.tolist()[1:]), []).append((ids, ti, tp, rest))
+    lens = sorted({len(k) for k in by_tail}, reverse=True)
+    lines = [[int(x) for x in ln.split()] for ln in open(long_seqs, encoding="utf-8") if ln.strip()]
+    out = []; tot = 0
+    for seq in lines:
+        hit = None
+        for L in lens:
+            if L < len(seq) and tuple(seq[-L:]) in by_tail: hit = (L, by_tail[tuple(seq[-L:])][0]); break
+        if not hit: sys.exit("★长序列(%d 位)的尾巴在短表里找不到: 前缀与题头的分词跨界了, 或行序不对★" % len(seq))
+        L, (sids, sti, stp, srest) = hit; P = len(seq) - L   # 长序列 = seq[:P](BOS + 前缀) + 短记录 ids[1:]
+        n = len(seq) - 1
+        ti = np.full((n, K), -1, np.int32); tp = np.zeros((n, K), np.float32); rest = np.zeros(n, np.float32)
+        ti[:, 0] = seq[1:]; tp[:, 0] = 1.0   # 前缀段 one-hot(不是分布, 训练器只当上下文; ptfprobe 跳过)
+        ti[P - 1:] = sti; tp[P - 1:] = stp; rest[P - 1:] = srest   # 短记录第 i 行预测 ids[i+1]; 长序列里 ids[P + i] = 短 ids[i + 1] ⇒ 行号 P − 1 + i
+        out.append((np.asarray(seq, np.int32), ti, tp, rest)); tot += len(seq)
+    with open(out_ptf, "wb") as f:
+        f.write(struct.pack("<III", 0x31465450, K, len(out)))
+        for ids, ti, tp, rest in out:
+            f.write(struct.pack("<I", len(ids))); ids.tofile(f); ti.tofile(f); tp.tofile(f); rest.tofile(f)
+    print("ptfprefix: %d 条长序列全部配上短表, 共 %d 位(均 %d) → %s" % (len(out), tot, tot // max(len(out), 1), out_ptf))
+
+
+def cmd_ptfprobe(anchor_path, tokenizer_json, out_tsv, *ptfs):
+    """★实体特征知识召回探针尺(2026-11-01)★: 学生全 logits 锚(--score-ids 跑 ptf 覆盖序列首尾相接的流) vs 官方 API top-20 表(ptf, 按给的顺序接起来就是流的顺序)。
+    选位 = 教师给真值 ≥ 0.7 且真值 token 是内容词(含汉字, 或 ≥ 3 个字母)的位 —— 这些位是"实体长什么样"的事实位(鹈鹕序列上的 长/喉 就是这种位);
+    报每条序列(实体 × 语言)上: 选位数 / 教师几何均值 / 学生几何均值 / 学生÷教师 / 选位上 top-1 同 / 全部分布位 KL(教师‖学生, top-20 + 余量桶, 训练器同口径)。
+    再按 组(留出 / 训练探针) × 语言 汇总; 组别从题面里的实体名反查(ptf 里只有 ids, 没有标签): 第 5 个参数起每个 ptf 可写成 组名=路径。
+    判读: 留出组 学生÷教师 往 1 靠 = 还原的是知识召回; 只有训练组动 = 低秩只会背。"""
+    import math
+    import re
+    import numpy as np
+    from tokenizers import Tokenizer
+    tok = Tokenizer.from_file(tokenizer_json)
+    f = open(anchor_path, "rb"); S, V = struct.unpack("<ii", f.read(8))
+    cjk = re.compile("[一-鿿]")
+    def content_word(t):
+        s = tok.decode([int(t)])
+        return bool(cjk.search(s)) or len(re.findall("[A-Za-z]", s)) >= 3
+    user_id, asst_id = tok.token_to_id("<｜User｜>"), tok.token_to_id("<｜Assistant｜>")
+    rows = []; off = 0; worst = []
+    for spec in ptfs:
+        grp, path = spec.split("=", 1) if "=" in spec else ("seq", spec)
+        for ids, ti, tp, rest in read_ptf(path):
+            L = len(ids); idl = ids.tolist()
+            try: u, a = idl.index(user_id), idl.index(asst_id)
+            except ValueError: u, a = 0, min(L, 32)
+            prompt = tok.decode(idl[u + 1:a]); lang = "zh" if cjk.search(prompt) else "en"
+            ent = prompt.split("描述")[1].split("的外形")[0] if "描述" in prompt and "的外形" in prompt else (prompt.split("appearance of a ")[1].split(":")[0] if "appearance of a " in prompt else prompt[:24])
+            onehot = (tp[:, 0] > 0.999) & (tp[:, 1:].sum(1) < 1e-6) & (rest < 1e-6)
+            if off + L > S: sys.exit("★锚只有 %d 行, 流到第 %d 行就超了: ptf 顺序或覆盖清单与打分的 ids 流不是同一串★" % (S, off + L))
+            sel_t, sel_s, same, kl, nkl = [], [], 0, 0.0, 0
+            for i in range(L - 1):
+                if onehot[i]: continue
+                y = idl[i + 1]; j = np.flatnonzero(ti[i] == y)
+                f.seek(8 + (off + i) * V * 4); row = np.frombuffer(f.read(V * 4), dtype=np.float32).astype(np.float64)
+                m = row.max(); ex = np.exp(row - m); p = ex / ex.sum()
+                q = np.clip(tp[i].astype(np.float64), 1e-12, 1); ps = np.clip(p[ti[i]], 1e-12, 1)
+                rq = max(float(rest[i]), 1e-12); rp = max(1.0 - float(p[ti[i]].sum()), 1e-12)
+                kl += float((q * np.log(q / ps)).sum() + rq * math.log(rq / rp)); nkl += 1
+                if len(j) == 0 or tp[i, j[0]] < 0.7 or not content_word(y): continue
+                pt, pst = float(tp[i, j[0]]), float(p[y]); sel_t.append(pt); sel_s.append(pst); same += int(row.argmax() == y)
+                worst.append((pst / pt, grp, ent, tok.decode([y]), pt, pst))
+            off += L
+            gm = lambda xs: math.exp(sum(math.log(max(x, 1e-12)) for x in xs) / len(xs)) if xs else float("nan")
+            rows.append((grp, lang, ent, len(sel_t), gm(sel_t), gm(sel_s), gm(sel_s) / gm(sel_t) if sel_t else float("nan"), same / max(len(sel_t), 1), kl / max(nkl, 1), nkl))
+    with open(out_tsv, "w", encoding="utf-8") as o:
+        o.write("组\t语言\t实体\t选位\t教师几何均值\t学生几何均值\t学生/教师\t选位top1同\t全位KL\t分布位\n")
+        for r in rows: o.write("%s\t%s\t%s\t%d\t%.4f\t%.4f\t%.3f\t%.3f\t%.4f\t%d\n" % r)
+        o.write("# 汇总 组×语言: 序列数 / 选位合计 / 学生÷教师(按选位合并的几何均值比) / 选位 top-1 同 / 全位 KL 均\n")
+        for grp in dict.fromkeys(r[0] for r in rows):
+            for lang in ("zh", "en"):
+                rs = [r for r in rows if r[0] == grp and r[1] == lang and r[3] > 0]
+                if not rs: continue
+                n = sum(r[3] for r in rs); lt = sum(math.log(r[4]) * r[3] for r in rs) / n; ls = sum(math.log(r[5]) * r[3] for r in rs) / n
+                line = "%s\t%s\t%d 条\t%d 位\t%.3f\t%.3f\t%.4f" % (grp, lang, len(rs), n, math.exp(ls - lt), sum(r[7] * r[3] for r in rs) / n, sum(r[8] * r[9] for r in rs) / max(sum(r[9] for r in rs), 1))
+                o.write("# " + line + "\n"); print(line)
+        worst.sort()
+        o.write("# 被压最狠的 15 位(学生/教师 组 实体 token 教师p 学生p):\n")
+        for w in worst[:15]: o.write("#   %.3f\t%s\t%s\t%r\t%.3f\t%.4f\n" % w)
+    print("ptfprobe: %d 条序列, 流 %d 行(锚 %d 行) → %s" % (len(rows), off, S, out_tsv))
+
+
 if __name__ == "__main__":
-    cmds = {"extract": cmd_extract, "cut": cmd_cut, "cmp-emit": cmd_cmp_emit, "cmp-topk": cmd_cmp_topk,
+    cmds = {"extract": cmd_extract, "cut": cmd_cut, "cmp-emit": cmd_cmp_emit, "cmp-topk": cmd_cmp_topk, "entq": cmd_entq, "ptfprobe": cmd_ptfprobe, "ptfhead": cmd_ptfhead, "entlong": cmd_entlong, "ptfprefix": cmd_ptfprefix,
             "eos-scan": cmd_eos_scan, "rows": cmd_rows, "loopstat": cmd_loopstat, "faith": cmd_faith,
             "anchor-faith": cmd_anchor_faith, "tokprobe": cmd_tokprobe, "minp": cmd_minp, "agree": cmd_agree,
-            "ids2seqs": cmd_ids2seqs, "ptfcheck": cmd_ptfcheck, "ptfstat": cmd_ptfstat, "ptfpick": cmd_ptfpick, "ptfcmp": cmd_ptfcmp, "anchor2ptf": cmd_anchor2ptf,
+            "ids2seqs": cmd_ids2seqs, "ptfcheck": cmd_ptfcheck, "ptfstat": cmd_ptfstat, "ptfpick": cmd_ptfpick, "ptfcmp": cmd_ptfcmp, "anchor2ptf": cmd_anchor2ptf, "ptfhit": cmd_ptfhit,
             "cyclescan": cmd_cyclescan, "temper": cmd_temper}
     if len(sys.argv) < 2 or sys.argv[1] not in cmds:
         sys.exit(__doc__ + "  rows <rows.txt> <ids> <n_prompt> <入口位置> [tokenizer.json] [窗口=12]   --row-out 的分桶命中率 + 入口逐行解码\n")
