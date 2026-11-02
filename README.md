@@ -91,16 +91,16 @@ Spark, Metal on the Mac, one Makefile, no third-party libraries linked.
 
 ## The model
 
-A 113.6 GB base plus a 145 MB restore sidecar picks the same next token as the 510 GB original weights (Same top)
-**85.1%** of the time on code:
+A 113.6 GB base plus a 145 MB restore sidecar and a 13 MB index patch picks the same next token as the 510 GB original
+weights (Same top) **85.2%** of the time on code:
 
 | | Size | Code | General English |
 |---|---:|---:|---:|
 | ① base | 113.6 GB | 78.4% | 76.8% |
 | ① + ② code sidecar | + 41 MB | 82.0% | 79.7% |
 | ① + ② + ③ post-training | + 101 MB | 84.8% | 82.4% |
-| **① + restore sidecar (default on the Spark)** | **+ 145 MB** | **85.1%** | **82.2%** |
-| ① + restore sidecar + index patch | + 13 MB | **85.2%** | 81.6% |
+| ① + restore sidecar | + 145 MB | 85.1% | **82.2%** |
+| **① + restore sidecar + index patch (default on the Spark)** | **+ 13 MB** | **85.2%** | 81.6% |
 
 "Same" means that on the same text, our model and the original rank the same token first. Code is 15,360 held-out tokens
 across 30 languages; general English is WikiText-2. Mean KL by row: code 0.446 → 0.318 → 0.230 → 0.227 → 0.224, general
@@ -111,7 +111,8 @@ code KL; on general English it is 0.2 points lower (1 of 512 tokens), above the 
 codeword of 788,000 groups of 8 expert weights, choosing by the gradient of the KL to the original on code token streams
 the ruler never sees and on short factual answers from the official API. A round is kept only if held-out code
 KL does not rise. It sits on top of the restore sidecar (`ds4-server --zchain <restore sidecar> --posttrain <patch>`)
-and is off by default: code KL drops 1.4% and general English gives back 0.6 points (3 of 512 tokens).
+and is what the Spark runs by default since Nov 3: code KL drops 1.4%, general English gives back 0.6 points (3 of 512
+tokens); we pick by the code ruler and only report general English.
 
 **Three things get 113.6 GB this far:**
 
