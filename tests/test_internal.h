@@ -73,6 +73,8 @@ float test_v41_rms(const float *g, uint64_t n);
 void test_v41_bwd_attn(void);   /* t_v41_bwd_attn.c: 两后端通用(64 头), suite --bwd-attn */
 void test_metal_v41_dense(void);
 void test_metal_v41_layer(void);
+void test_metal_v41_memory(void);
+void test_metal_tensor_lifetime(void);
 void test_metal_v41_attn(void);
 void test_metal_v41_vq(void);
 void test_metal_v41_bwd(void);

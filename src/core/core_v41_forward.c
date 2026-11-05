@@ -444,8 +444,10 @@ bool v41_forward(ds4_engine *e, ds4_v41_state *st, const int32_t *ids, uint32_t 
     const bool body_ok = v41_forward_body(e, st);
     (void)ds4_gpu_v41_set_half_prefill(0);
     st->vrows_on = 0;   /* 图片行只属于这一块 */
-    if (!body_ok) return false;
-    if (ds4_gpu_end_commands() == 0 || ds4_gpu_synchronize() == 0) return false;
+    /* Close even a partial forward: leaving a batch open pins its resources
+     * and makes the next request fail at begin_commands. */
+    const bool end_ok = ds4_gpu_end_commands() != 0;
+    if (!body_ok || !end_ok || ds4_gpu_synchronize() == 0) return false;
     if (st->mainh && st->mainh_wrote) {   /* mainh 环的账: 与上一段连续就接着数, 断了(CED 跳过的块)就从头数。st->n/pos0: 回放块里被截成末尾 K 行 */
         const int64_t first = (int64_t)st->pos0 + (int64_t)(st->n - st->mainh_wrote);
         const bool contig = st->mainh_n > 0 && st->mainh_end == first - 1;

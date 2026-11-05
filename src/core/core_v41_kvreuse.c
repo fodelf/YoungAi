@@ -171,16 +171,51 @@ static bool sig_match(const ckpt *k, const uint64_t *a, uint32_t n) {
 
 /* 新状态刚分配完(预填前)调: 能接上就把检查点拷进 st, 返回预填起点(= 检查点位置; = np 时一块都不用填, 末位 logits 已在第 0 行);
  * 接不上返回 0(整段预填)。两槽都接得上取长的(槽 1 ⊇ 槽 0 时它更长)。 */
-uint32_t v41_kvreuse_restore(ds4_v41_state *st, const int32_t *prompt, uint32_t np, const uint64_t *sig) {
-    g_last_reused = 0;
-    if (!g_ds4_v41_kv_reuse) return 0;
+static const ckpt *ckpt_match(const int32_t *prompt, uint32_t np, uint32_t ctx, const uint64_t *sig) {
+    if (!g_ds4_v41_kv_reuse) return NULL;
     const ckpt *k = NULL;
     for (int s = 0; s < CK_SLOTS; s++) {
         const ckpt *c = &K[s];
-        if (!c->valid || c->n > np || c->n > st->ctx || (k && c->n <= k->n)) continue;
+        if (!c->valid || c->n > np || c->n > ctx || (k && c->n <= k->n)) continue;
         if (memcmp(c->tok, prompt, (size_t)c->n * 4) || !sig_match(c, sig, c->n)) continue;
         k = c;
     }
+    return k;
+}
+
+/* Match before allocating rows: a 70K-token prefix plus five new tokens must
+ * not allocate a 2048-row prefill workspace. Keep enough rows for DSpark even
+ * on an exact hit. The context/KV capacity still covers the entire request. */
+bool v41_kvreuse_alloc(ds4_v41_state *st, const int32_t *prompt, uint32_t np,
+                       uint32_t ctx, uint32_t chunk, const uint64_t *sig, uint32_t *reused) {
+    const ckpt *k = ckpt_match(prompt, np, ctx, sig);
+    const uint32_t planned = k ? k->n : 0, remaining = np - planned;
+    uint32_t rows = remaining < chunk ? remaining : chunk;
+    const uint32_t floor = DS4_MTP_MAX_BLOCK + 2u;
+    if (rows < floor) rows = floor;
+    if (rows > ctx) rows = ctx;
+    *reused = 0;
+    if (!v41_state_alloc(st, rows, ctx, floor)) return false;
+    *reused = v41_kvreuse_restore(st, prompt, np, sig);
+    if (planned && *reused != planned) {
+        /* A failed copy may have queued writes into the partial state. Drain
+         * it before freeing, then cold-prefill a fresh, full-sized workspace. */
+        (void)ds4_gpu_synchronize();
+        v41_state_free(st);
+        rows = np < chunk ? np : chunk;
+        if (rows < floor) rows = floor;
+        if (rows > ctx) rows = ctx;
+        if (!v41_state_alloc(st, rows, ctx, floor)) return false;
+        *reused = 0;
+    }
+    fprintf(stderr, "[v41] request workspace: prompt=%u reused=%u pending=%u rows=%u ctx=%u\n",
+            np, *reused, np - *reused, rows, ctx);
+    return true;
+}
+
+uint32_t v41_kvreuse_restore(ds4_v41_state *st, const int32_t *prompt, uint32_t np, const uint64_t *sig) {
+    g_last_reused = 0;
+    const ckpt *k = ckpt_match(prompt, np, st->ctx, sig);
     if (!k) return 0;
     const uint64_t rowb = (uint64_t)DS4_N_HEAD_DIM * 4;
     bool ok = true;

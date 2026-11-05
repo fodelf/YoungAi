@@ -429,7 +429,7 @@ bool v41_engram_rows(ds4_engine *e, ds4_v41_state *st, uint32_t il) {
     const uint32_t n = st->n, HC = DS4_N_HC, HD = J->HD, cols = J->cols, stride = J->HD + J->nsc;
     const uint64_t in_dim = (uint64_t)cols * HD, out_dim = (uint64_t)(HC + 1) * DS4_N_EMBD;
     if (!st->erows) {   /* 单请求路: 三块按 cap 懒建; 并发的请求态 erows 是视图、eraw 在收缩时建, 不进这里 */
-        for (uint32_t k = 0; k < J->n_eng; k++) st->eraw[k] = ds4_gpu_tensor_alloc((uint64_t)st->cap_tok * cols * stride);
+        for (uint32_t k = 0; k < J->n_eng; k++) if (!st->eraw[k]) st->eraw[k] = ds4_gpu_tensor_alloc((uint64_t)st->cap_tok * cols * stride);
         st->erows = ds4_gpu_tensor_alloc((uint64_t)st->cap_tok * in_dim * 4);
         st->ekv = ds4_gpu_tensor_alloc((uint64_t)st->cap_tok * out_dim * 4);
     }

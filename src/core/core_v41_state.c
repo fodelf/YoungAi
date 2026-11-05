@@ -216,6 +216,19 @@ bool v41_state_shrink(ds4_v41_state *st, uint32_t rcap) {
     return ok;
 }
 
+/* Single-request generation owns its decode rows (unlike the batched request
+ * state). Reuse the KV-preserving shrink, then recreate only the small rows. */
+bool v41_state_decode_shrink(ds4_v41_state *st, uint32_t rcap) {
+    if (rcap >= st->cap_tok) return true;
+    if (!ds4_gpu_synchronize() || !v41_state_shrink(st, rcap)) return false;
+    bool ok = true;
+    v41_alloc_dense(st, rcap, rcap, &ok);
+    v41_alloc_attn_rows(st, rcap, &ok);
+    if (ok && !v41_state_plugins(st)) ok = false;
+    st->last_logit_row = 0;
+    return ok;
+}
+
 /* ★收缩态克隆★(2026-10-09, 奖励回路同题多份采样): 同一提示的 G 份采样以前各自预填一遍(20 题 × 8 份 × ~1.0 s = 160 s, 其中 7/8 是重复算),
  * 现在只预填一份, 收缩后把它的 KV 深拷给其余几份。预填是确定的(同提示两趟逐字节同, 10-06 门), 所以克隆出的 KV 与各自预填的逐字节同。
  * 只认收缩态(稠密段 / logits 已放、图与反修表已放): 那时状态里剩的全是本请求自己的缓冲, 一个个深拷; 其余指针字段在收缩态里恒 NULL,
