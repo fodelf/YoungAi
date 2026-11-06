@@ -39,6 +39,7 @@ typedef struct {
     uint32_t expand;               /* expand=N(缺省 4): 装料时让部署态把每道训练题改写成 N 组同格式 jsonl 新问答一起训, 缓存 <data>.expandN.jsonl(0 = 关, 老路逐位同), core_ptrain_expand.c */
     uint32_t layer_lo, layer_hi;   /* 训练哪几层的放大器(含两端); 只训末层时出口反传是闭式的, 不用穿注意力 */
     uint32_t rank, topk, epochs, batch, maxlen, probe_n, probe_tok, seed;
+    uint32_t token_mean;           /* loss_norm=token: 一次参数更新内每个有效目标等权；sample(缺省)保留各段等权。只改训练缩放，产物格式不变。 */
     uint32_t budget_s;             /* budget_s=N(11-02, 缺省 0 = 不限): 训练墙上时间预算(秒, 从第一步起算, 不含装载/第 0 步评估)。到了就把当前批当本轮最后一批:
                                     * 照常轮末评估 + 落 ckpt, 然后不再开下一轮。为什么是硬闸不是算料: 用户定"本地一轮 ≤ 1 小时", 料长/步速的账总有漂移(ent04 账 ~100 分钟/轮实跑 62),
                                     * 闸在训练器里才保证超时不是靠人盯。与 max_steps 不同: max_steps 是计时模式(不评估不存盘), 这里产物照样能挂 */
@@ -193,6 +194,7 @@ typedef struct {
     ds4_gpu_tensor *tid, *tp, *trest, *loss;   /* 一个样本的教师表 / 逐行损失(设备) */
     ds4_gpu_tensor *gxn, *gx, *ghc, *gpre, *gy, *T, *gT;   /* 反传暂存(按 maxlen 行); ghc/gpre 在多层模式下 = 逐层往下传的 g_hc / g_pre_mix */
     float *loss_h;
+    uint64_t grad_tokens;          /* 本次 pt_run_list 的有效目标总数；0 = 单题诊断，按该题目标数归一。退出批次后恢复。 */
     /* 决策位读数(10-22, docs/think_close.md §4): dec_on 期间 pt_loss_rows 把目标是 dec_ids(EOS / </think>)的位单独累计 —— 这几位的 KL 与教师给它的 p。
      * 为什么: 留出 KL 是逐位平权, 一道题几百位里决策位只有一位, 量化把它压 4~22 倍在总 KL 里看不见(10-17 的 ③ 留出 −46% 而生成纹丝不动) */
     int dec_on; int32_t dec_ids[2]; double dec_kl, dec_tp; uint32_t dec_n;
@@ -220,6 +222,10 @@ typedef struct {
 static inline bool pt_runnable(const pt_run *r, const pt_sample *s) {
     return s->top_id && (s->sn <= r->st.cap_tok || ((s->sft || s->raw) && s->sn + 8u <= r->st.ctx));   /* st.ctx = max(ctxlen, maxlen) + 8 */
 }
+/* core_ptrain_norm.c: 目标窗口与梯度分母共用一处，避免前缀/跳过的样本混进 token 数。pfx 可传 NULL。 */
+uint32_t pt_loss_offset(const pt_run *r, const pt_sample *s, uint32_t *pfx);
+uint64_t pt_batch_loss_tokens(const pt_run *r, const pt_sample *const *ss, uint32_t n);
+float pt_loss_scale(const pt_cfg *c, const pt_run *r, uint32_t m);
 /* 一个样本答案位的损失 + logits 梯度(就地写进 logits 第 row 行起 m−off 行; *glog = 那几行的视图, 调用方 free)。
  * off = 答案位里跳过前几位(前缀形态: 落在前缀里的目标没有 logits 行), 表指针按它偏移; 老路传 0 */
 bool pt_loss_rows(const pt_cfg *c, pt_run *r, ds4_gpu_tensor *logits, uint32_t row, const pt_sample *s, uint32_t off, double *loss, uint32_t *ntok, ds4_gpu_tensor **glog);

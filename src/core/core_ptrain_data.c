@@ -11,7 +11,6 @@
 #include "core_ptrain.h"
 #include "../common/ds4_json.h"
 #ifndef DS4_NO_GPU
-
 static char *pt_slurp(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
@@ -75,6 +74,7 @@ bool pt_cfg_load(pt_cfg *c, const char *path) {
         else if (!strcmp(k, "vq_frac")) c->vq_frac = (float)atof(v);
         else if (!strcmp(k, "data_eval")) c->data_eval = (uint32_t)atoi(v);   /* 1 = 给了 eval= 料也照常五取一留出(V 步两边信赖域要两份留出) */
         else if (!strcmp(k, "batch")) c->batch = (uint32_t)atoi(v);
+        else if (!strcmp(k, "loss_norm")) { if (strcmp(v, "token") && strcmp(v, "sample")) { fprintf(stderr, "ds4: --ptrain loss_norm 只认 token 或 sample\n"); free(b); return false; } c->token_mean = !strcmp(v, "token"); }
         else if (!strcmp(k, "maxlen")) c->maxlen = (uint32_t)atoi(v);
         else if (!strcmp(k, "ctxlen")) c->ctxlen = (uint32_t)atoi(v);   /* 前缀形态的样本上限(见 core_ptrain.h pt_cfg.ctxlen) */
         else if (!strcmp(k, "eval_n")) c->eval_n = (uint32_t)atoi(v);

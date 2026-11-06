@@ -222,7 +222,7 @@ bool pt_pack_step(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_sample *co
     return ok;
 }
 
-bool pt_run_list(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_sample *const *ss, uint32_t n, int grad,
+static bool pt_run_list_inner(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_sample *const *ss, uint32_t n, int grad,
                  double *loss_sum, uint32_t *ntok, double *loss_each, uint32_t *ntok_each, double *dec_each) {
     if (loss_each) for (uint32_t k = 0; k < n; k++) { loss_each[k] = 0.0; ntok_each[k] = 0; }
     if (dec_each) for (uint32_t k = 0; k < n; k++) dec_each[k] = -1.0;   /* -1 = 这题没有决策位(或没进评估) */
@@ -270,6 +270,15 @@ bool pt_run_list(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_sample *con
         }
     }
     free(ix); free(bin); free(brow); free(bcnt);
+    return ok;
+}
+
+bool pt_run_list(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_sample *const *ss, uint32_t n, int grad,
+                 double *loss_sum, uint32_t *ntok, double *loss_each, uint32_t *ntok_each, double *dec_each) {
+    const uint64_t saved = r->grad_tokens;
+    r->grad_tokens = grad && c->token_mean ? pt_batch_loss_tokens(r, ss, n) : 0;
+    const bool ok = pt_run_list_inner(e, c, r, ss, n, grad, loss_sum, ntok, loss_each, ntok_each, dec_each);
+    r->grad_tokens = saved;   /* 评估/单题梯度检查不能沿用上一批的分母；失败路径也恢复 */
     return ok;
 }
 

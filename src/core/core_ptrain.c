@@ -155,7 +155,7 @@ static bool pt_gradcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_dat
     const pt_sample *s = pt_check_sample(d);
     if (!s) return false;
     const uint64_t nel = (uint64_t)r->K * DS4_N_EMBD;
-    const double norm = 1.0 / ((double)s->m * (double)c->batch);
+    const double norm = pt_loss_scale(c, r, s->m - pt_loss_offset(r, s, NULL));
     bool ok = true;
     ds4_gpu_tensor *D = v41_alloc(nel * 4, &ok);
     for (uint32_t il = c->layer_lo; ok && il <= c->layer_hi; il++) {
@@ -199,7 +199,7 @@ static bool pt_hccheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data 
     const pt_sample *s = pt_check_sample(d);
     if (!s || !r->lb.ready) return false;
     const uint64_t nel = (uint64_t)s->sn * DS4_N_HC * DS4_N_EMBD;
-    const double norm = 1.0 / ((double)s->m * (double)c->batch);
+    const double norm = pt_loss_scale(c, r, s->m - pt_loss_offset(r, s, NULL));
     bool ok = true;
     ds4_gpu_tensor *D = v41_alloc(nel * 4, &ok);
     r->hcap = v41_alloc(nel * 4, &ok);
@@ -272,6 +272,7 @@ int ds4_engine_ptrain(ds4_engine *e, const char *spec) {
     pt_run r;
     if (!pt_run_alloc(e, &c, &r)) { pt_data_free(&d); return 1; }
     r.dec_ids[0] = ds4_token_eos(e); r.dec_ids[1] = ds4_token_think_end(e);   /* 决策位 = 答案里的 EOS / </think>(pt_loss_rows 在 dec_on 期间单独累计) */
+    fprintf(stderr, "ds4: [ptrain] 梯度归一: loss_norm=%s\n", c.token_mean ? "token(本批有效目标等权)" : "sample(各段等权)");
     fprintf(stderr, "ds4: [ptrain] 训练缓冲分配后可用内存 %ld MB\n", pt_mem_mb());
     uint32_t *ord = xmalloc((size_t)d.ns * 4), ntr = 0, nev = 0, nevg = 0;
     const pt_sample **bs = xmalloc((size_t)(c.batch + 1) * sizeof *bs);   /* 一批的题(装包用) */

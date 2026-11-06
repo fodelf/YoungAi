@@ -123,11 +123,11 @@ void pt_run_free(pt_run *r) {
     free(r->loss_h); r->loss_h = NULL;
 }
 
-/* 损失 = 本题答案位的平均 KL(不带材料的题: 表是 one-hot ⇒ 交叉熵); 梯度再除以批大小 ⇒ 一批 = 各题平均的平均(长答案不压过短答案)。
+/* 损失仍返回未归一的 KL 和；梯度按 loss_norm 选各段等权或本批各 token 等权(core_ptrain_norm.c)。
  * KL 核就地写梯度(读完 logits 就盖掉), 读回损失 = 同步, 之后才能覆盖教师表。 */
 bool pt_loss_rows(const pt_cfg *c, pt_run *r, ds4_gpu_tensor *logits, uint32_t row, const pt_sample *s, uint32_t off, double *loss, uint32_t *ntok, ds4_gpu_tensor **glog) {
     const uint32_t m = s->m - off, V = DS4_N_VOCAB, TK = c->topk;   /* off = 落在前缀里的答案位(没有 logits 行), 表从第 off 位起 */
-    const float scale = 1.0f / ((float)m * (float)c->batch);
+    const float scale = pt_loss_scale(c, r, m);
     *glog = pt_rows(logits, row, m, V);
     bool ok = *glog && ds4_gpu_tensor_write(r->tid, 0, s->top_id + (size_t)off * TK, (uint64_t)m * TK * 4) &&
               ds4_gpu_tensor_write(r->tp, 0, s->top_p + (size_t)off * TK, (uint64_t)m * TK * 4) &&
@@ -159,17 +159,11 @@ bool pt_step_sample(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_sample *
     /* 前缀尽量推到第一个目标前(sa0−1 向下对齐): 尾窗只放要算损失的行; 但尾窗不得超 cap, 所以下界 sn−cap(向上对齐) —— 对话题(sa0 小)走的是下界。
      * 对齐粒度 pt_pfx_align()(最大压缩比): 前缀/尾窗的块界落在组界上, 见 core_ptrain.h */
     /* 第一个要算损失的目标 = sa0 + l0(l0 = 只当上下文的头几位, 分支续写料的学生前缀, pt_sample.l0; 老料 0) */
-    uint32_t pfx = 0, n = s->sn;
-    const uint32_t f0 = s->sa0 + s->l0;
-    if (s->sn > cap) {
-        const uint32_t A = pt_pfx_align(), lo = (s->sn - cap + A - 1u) / A * A, hi = (f0 - 1u) / A * A;
-        pfx = hi > lo ? hi : lo;
-        n = s->sn - pfx;
-    }
+    uint32_t pfx = 0;
+    const uint32_t off = pt_loss_offset(r, s, &pfx), n = s->sn - pfx;
     r->pfx = pfx;
-    const uint32_t a0 = f0 > pfx + 1u ? f0 : pfx + 1u;
-    if (a0 > s->sa0 + s->m - 1u) return true;   /* 答案全落在前缀里(不该发生: one-hot 的 text 行 sa0 = 1; 末位可以是 sids[sn] 那个只当目标的 token) */
-    const uint32_t off = a0 - s->sa0, m = s->m - off, r0 = a0 - 1u - pfx;
+    if (off >= s->m) return true;   /* 没有目标落在本次尾窗里，分母也必须排除它 */
+    const uint32_t m = s->m - off, r0 = s->sa0 + off - 1u - pfx;
     const double q0 = pt_tick(c);
     /* ★按篇接力(pt_run.cont_s)★: 上一道刚好是这道的前缀(整段 [0, pfx) 逐 id 同, 状态里也正好 pfx 个位置)⇒ 不清状态、不预填, 直接接着算尾窗。
      * 同一篇 2.8 万位的轨迹切成 28 段时, 不接力每段都要从 0 重新预填(总量随篇长平方涨), 接力后每个位置只前向一次。 */
