@@ -68,6 +68,7 @@ static bool prog_is(const char *cmd, const char *name) {
 static void scan_fn(pid_t pid, const char *cmd, void *ud) {
     tr_procs *p = ud; (void)pid;
     if (prog_is(cmd, "ds4") && (strstr(cmd, " --cuda") || strstr(cmd, " --metal"))) p->ds4 = true;
+    if (prog_is(cmd, "ds4") && strstr(cmd, " --ptrain ")) p->training = true;
     if (prog_is(cmd, "ds4-server")) p->server = true;
     if (prog_is(cmd, "hf_install.sh")) p->dl = true;
 }

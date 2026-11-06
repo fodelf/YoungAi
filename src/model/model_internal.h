@@ -78,7 +78,7 @@ bool tr_run_active(const char *dir);           /* 这趟的 train.out 近两分�
 char *tr_slurp(const char *path, size_t *len); /* 整文件读进 malloc 缓冲(NUL 结尾); 没有 NULL */
 
 /* model_proc.c: /proc 扫进程(按程序名认, 不在整条命令行里找子串) */
-typedef struct { bool scanned, ds4, server, dl; } tr_procs;   /* ds4 = 任何 ./ds4 --cuda|--metal; server = ds4-server; dl = hf_install.sh */
+typedef struct { bool scanned, ds4, server, dl, training; } tr_procs;   /* ds4 = 任何 ./ds4 --cuda|--metal; training = ds4 --ptrain; server = ds4-server; dl = hf_install.sh */
 void tr_proc_scan(tr_procs *p);                /* 非 Linux: scanned=false 全 false */
 int tr_proc_kill(const char *prog, int sig);   /* 给名叫 prog 的进程(程序本身或 bash 跑的同名脚本)发信号, 返回个数 */
 bool tr_server_model(char *gguf, size_t gn, char *zch, size_t zn, char *pt, size_t pn);   /* 跑着的 ds4-server 的 -m / --zchain / --posttrain(没有就空串); 返回有没有扫到 */
