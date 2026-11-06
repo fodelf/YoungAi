@@ -1,0 +1,25 @@
+/* 低秩续训也要加载部署时已有的索引补丁。只在判决时拼上补丁，
+ * 会让梯度针对另一个模型；因此训练时冻结补丁，落盘时一起保存。 */
+#include "core_ptrain.h"
+#ifndef DS4_NO_GPU
+
+bool pt_frozen_vq_load(const pt_cfg *c) {
+    if (c->vq_nl || !c->vq_init[0]) return true;
+    if (!c->teacher_fp[0]) {
+        fprintf(stderr, "ds4: [ptrain] 固定索引补丁续训要求 teacher=fp:，避免缓存部署态教师时用错底座\n");
+        return false;
+    }
+    const int n = v41_vqpatch_load(c->vq_init);
+    if (n <= 0) fprintf(stderr, "ds4: [ptrain] 固定补丁 %s 未加载到有效层，停止\n", c->vq_init);
+    return n > 0;
+}
+
+bool pt_frozen_vq_save(const pt_cfg *c, const char *dir) {
+    if (c->vq_nl || !c->vq_init[0]) return true;
+    const int n = v41_vqpatch_save(dir);
+    if (n <= 0) fprintf(stderr, "ds4: [ptrain] 固定补丁未能随 %s 保存，产物不可部署\n", dir);
+    return n > 0;
+}
+
+#endif
+typedef int ds4_core_ptrain_vqbase_nonempty_tu;

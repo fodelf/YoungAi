@@ -269,6 +269,7 @@ bool pt_save_amp(const pt_cfg *c, pt_run *r, const char *dir) {
         ok = f && fprintf(f, "%016llx %u\n", (unsigned long long)h, n) > 0;
         if (f) fclose(f);
     }
+    if (ok) ok = pt_frozen_vq_save(c, dir);
     if (!ok) fprintf(stderr, "ds4: [ptrain] ③ 落盘失败 %s\n", dir);
     return ok;
 }

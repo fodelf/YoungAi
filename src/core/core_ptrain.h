@@ -48,7 +48,7 @@ typedef struct {
     float vq_frac;                 /* 每步每矩阵最多改多少份组(缺省 0.005): 一阶线性化只在小步内成立, PV-Tuning 同一取舍 */
     float vq_tail;                 /* vq_tail=τ(11-02 晚): V 步选码/审计趟按行尾权 w = min(16, max(1, KL/τ))(ds4_gpu_bwd_kl_tail); 0 = 关。留出评估不加权 */
     uint32_t vq_docs;              /* vq_docs=N(11-02 晚, 缺省 4): V 步每轮的"前缀文档份"带 N 篇(BOS 开头的长行: agent 头行那种 10k 前缀 + 2k 靶), 轮转; ids 流仍每轮 1 篇一份 */
-    char vq_init[1024];            /* vq_init=<③ 目录>(11-02 深夜): V 步起点 = 这份索引补丁盖上后的态(续训 / 跨层叠); 它的记录并进本趟日志 ⇒ 每个 ckpt 自包含可单独挂 */
+    char vq_init[1024];            /* 索引补丁起点：V 步继续选码；低秩训练固定这些码字，并随每个 ckpt 保存，训练/部署用同一份模型。 */
     uint32_t data_eval;            /* data_eval=1(11-02): 给了 eval= 时 data 的料也照常 FNV 五取一留出(缺省 0 = 老规矩不留出) —— V 步要知识留出与编程判决份两边都把门 */
     uint32_t ctxlen;               /* ctxlen=N(10-25, 缺省 0 = maxlen): 样本最长可到 N 位; 超过 maxlen 的 one-hot 样本按"前缀只预填、尾窗才反传"过 ——
                                     * 前 sn−maxlen 位当普通预填进 KV 缓存(不存档不反传), 最后 maxlen 位存档 + 反传, 损失只算尾窗里的目标。
@@ -233,6 +233,8 @@ bool pt_run_alloc(ds4_engine *e, const pt_cfg *c, pt_run *r);
 void pt_run_free(pt_run *r);
 bool pt_step_sample(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_sample *s, int grad, double *loss_sum, uint32_t *ntok);
 bool pt_save_amp(const pt_cfg *c, pt_run *r, const char *dir);   /* ③ 落盘: amp_Lnn.bin(f32) + base.fnv */
+bool pt_frozen_vq_load(const pt_cfg *c);   /* 低秩训练加载/恢复固定补丁；V 步仍由自己的日志管理 */
+bool pt_frozen_vq_save(const pt_cfg *c, const char *dir);
 bool pt_eval(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d, int which, uint32_t cap_n, double *kl, int hold, double *li, uint32_t *ni, double *di);   /* core_ptrain.c; V 步的轮末评估也用 */
 bool pt_vstep_run(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d, const uint32_t *ord, uint32_t ntr, double kl_ev0, FILE *lf, double t0);   /* core_ptrain_vstep.c */
 long pt_mem_mb(void);   /* 可用内存 MB(/proc/meminfo; 没有 = -1), core_ptrain.c */

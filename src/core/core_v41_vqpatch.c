@@ -54,4 +54,21 @@ int v41_vqpatch_load(const char *dir) {
     if (n) fprintf(stderr, "ds4: [反修·V步补丁] %d 层共 %llu 组换了码字(盘上 %.2f MB) ← %s\n", n, (unsigned long long)recs, (double)recs * 16 / 1e6, dir);
     return n;
 }
+/* 保存内存中已加载的记录，不能临时重读源目录：源文件被换过时，那会保存成另一份模型。 */
+int v41_vqpatch_save(const char *dir) {
+    if (!dir || !dir[0]) return -1;
+    int n = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) if (g_vqp[il].n) {
+        char p[4200]; snprintf(p, sizeof p, "%s/vqpatch_L%02u.bin", dir, il);
+        FILE *f = fopen(p, "wb");
+        if (!f) return -1;
+        const uint32_t hd[6] = { VQP_MAGIC, il, g_vqp[il].n, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD };
+        bool ok = fwrite(hd, sizeof(uint32_t), 6, f) == 6 &&
+                  fwrite(g_vqp[il].v, sizeof(vqp_rec), g_vqp[il].n, f) == g_vqp[il].n;
+        if (fclose(f) != 0) ok = false;
+        if (!ok) return -1;
+        n++;
+    }
+    return n;
+}
 #endif /* !DS4_NO_GPU */

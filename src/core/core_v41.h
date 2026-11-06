@@ -299,6 +299,7 @@ bool v41_attention_kv_only(ds4_engine *e, ds4_v41_state *st, uint32_t il);   /* 
 extern const ds4_model *g_ds4_v41_model;   /* 引擎打开时指向 e->model(core_engine_open.c): 路由偏置侧车要按层找 exp_probs_b 张量(core_v41_amp.c) */
 bool v41_amp_load(ds4_v41_state *st, const char *dir, const char *pt_dir);   /* core_v41_amp.c: ②反修目录 + ③后训练目录 */
 int v41_vqpatch_load(const char *dir);   /* core_v41_vqpatch.c(11-02): ③ 目录里的 V 步索引补丁 vqpatch_Lnn.bin; 先还原上一组; dir 空 = 只还原; <0 = 失败 */
+int v41_vqpatch_save(const char *dir);   /* 保存当前实际生效的补丁，返回层数；不重选码字、不改盘上 GGUF */
 const void *v41_vqpatch_records(uint32_t il, uint32_t *n);   /* 此刻挂着的这一层记录({专家|矩阵, 行, 列组, 新码|旧码}): V 步 vq_init= 续训把它们并进自己的日志 */
 void v41_plugins_clear_all(void);   /* 全卸路由偏置 + 增益覆盖(设备表是进程级的)并丢插件缓存; 裸底座状态开张前调 */
 void v41_amp_cache_drop(void);      /* 丢进程级插件缓存(没有状态在用时才真丢): 切换插件前调, 下一个状态从盘重读 */

@@ -271,6 +271,7 @@ int ds4_engine_ptrain(ds4_engine *e, const char *spec) {
     pt_release("教师表");
     pt_run r;
     if (!pt_run_alloc(e, &c, &r)) { pt_data_free(&d); return 1; }
+    if (!pt_frozen_vq_load(&c)) { pt_run_free(&r); pt_data_free(&d); return 1; }
     r.dec_ids[0] = ds4_token_eos(e); r.dec_ids[1] = ds4_token_think_end(e);   /* 决策位 = 答案里的 EOS / </think>(pt_loss_rows 在 dec_on 期间单独累计) */
     fprintf(stderr, "ds4: [ptrain] 梯度归一: loss_norm=%s\n", c.token_mean ? "token(本批有效目标等权)" : "sample(各段等权)");
     fprintf(stderr, "ds4: [ptrain] 训练缓冲分配后可用内存 %ld MB\n", pt_mem_mb());
@@ -357,7 +358,7 @@ int ds4_engine_ptrain(ds4_engine *e, const char *spec) {
         pt_heldout_dump(&c, &d, ev_prev, ev_m, ev_dec, "e00");
         pt_release("第 0 步评估");   /* 探针走解码路, 它的暂存别叠在评估/训练暂存上面 */
         /* 给了 init 时第 0 步的"挂 ③"= 起点那份 ③(续训: 起点对留出题答什么, 与部署态并排); 没给就只有部署态 */
-        if (!pt_probes(e, &c, &d, base, &base_stop, c.init[0] ? c.init : NULL, "e00", &stop_k, &stop_n)) goto out;
+        if (!pt_probes(e, &c, &d, base, &base_stop, c.init[0] ? c.init : NULL, "e00", &stop_k, &stop_n) || !pt_frozen_vq_load(&c)) goto out;
         if (lf) { fprintf(lf, "probe e00 stop %u %u base %d\n", stop_k, stop_n, base_stop); fflush(lf); }   /* 选轮读: ③ 收口不得少于部署态(model_train_pick.c) */
         pt_release("第 0 步探针");
     }
@@ -461,7 +462,7 @@ int ds4_engine_ptrain(ds4_engine *e, const char *spec) {
         snprintf(ck, sizeof ck, "%s/ckpt_e%02u", c.out, ep);
         if (!pt_save_amp(&c, &r, ck)) goto out;
         pt_release("轮末评估");
-        if (!pt_probes(e, &c, &d, base, &base_stop, ck, tag, &stop_k, &stop_n)) goto out;
+        if (!pt_probes(e, &c, &d, base, &base_stop, ck, tag, &stop_k, &stop_n) || !pt_frozen_vq_load(&c)) goto out;
         if (lf) { fprintf(lf, "probe %s stop %u %u base %d\n", tag, stop_k, stop_n, base_stop); fflush(lf); }
         pt_release("轮末探针");
         double *t = ev_prev; ev_prev = ev_cur; ev_cur = t;
