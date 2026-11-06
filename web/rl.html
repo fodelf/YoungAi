@@ -1,0 +1,697 @@
+<!doctype html>
+<!-- 训练提升直播页(GET /rl, 公开只读)。数据: /api/rl/status(studio_rl.c, 每 5 秒拉一次)+ /rl/compare.json(1 位量化对比, 静态)。
+     版式照 mimo.xiaomi.com/rl: 顶栏总花费 + 时钟, 公告, 一张 run 卡, 基准曲线, 指标网格, 实时事件流。不引任何外部脚本/字体(外部资源要先过用户同意)。 -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1-bit DeepSeek Restore</title>
+<style>
+:root {
+  --bg: #ffffff; --surface: #ffffff; --ink: #111; --ink2: #555; --ink3: #8a8a8a; --line: #e6e6e6; --grid: #efefef;
+  --s1: #eb6834; --s2: #2a78d6; --s3: #1baf7a; --s4: #9a6bd6; --drop: #b8b8b8; --bad: #d64545; --chip: #f1f1f1;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #0f1012; --surface: #17181b; --ink: #ededed; --ink2: #b0b0b0; --ink3: #7b7b7b; --line: #2a2b2f; --grid: #222327; --chip: #24252a; --drop: #5d5e63;
+} }
+:root[data-theme="dark"] { --bg: #0f1012; --surface: #17181b; --ink: #ededed; --ink2: #b0b0b0; --ink3: #7b7b7b; --line: #2a2b2f; --grid: #222327; --chip: #24252a; --drop: #5d5e63; }
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 var(--sans); }
+.mono { font-family: var(--mono); }
+header { position: sticky; top: 0; z-index: 5; background: var(--surface); border-bottom: 1px solid var(--line); }
+.bar { max-width: 1320px; margin: 0 auto; padding: 0 16px; display: flex; align-items: center; gap: 18px; min-height: 60px; flex-wrap: wrap; }
+nav a { color: var(--ink2); text-decoration: none; padding: 18px 0 16px; margin-right: 22px; display: inline-block; border-bottom: 2px solid transparent; font-size: 16px; }
+nav a.on { color: var(--ink); border-color: var(--ink); }
+.spacer { flex: 1; }
+.clk { text-align: right; line-height: 1.15; }
+.clk small { display: block; font-size: 11px; letter-spacing: .08em; color: var(--ink3); text-transform: uppercase; }
+.clk b { font: 500 17px var(--mono); }
+.sep { width: 1px; height: 30px; background: var(--line); }
+.btn { border: 1px solid var(--line); background: var(--surface); color: var(--ink); border-radius: 6px; padding: 4px 10px; cursor: pointer; font: 13px var(--sans); }
+.btn.on { background: var(--ink); color: var(--surface); border-color: var(--ink); }
+.conn { font-size: 12px; color: var(--ink3); display: flex; align-items: center; gap: 6px; }
+.dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; background: var(--drop); }
+.dot.live { background: var(--s3); box-shadow: 0 0 0 3px color-mix(in srgb, var(--s3) 25%, transparent); }
+.dot.run { background: var(--s1); animation: pulse 1.6s infinite; }
+@keyframes pulse { 50% { opacity: .35; } }
+main { max-width: 1320px; margin: 0 auto; padding: 22px 16px 60px; }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; margin-bottom: 18px; overflow: hidden; }
+.card > h3 { margin: 0; padding: 14px 20px 6px; font-size: 15px; font-weight: 600; }
+.card > h3 span { color: var(--ink3); font-weight: 400; margin-left: 6px; }
+.notices { padding: 0 20px 8px; }
+.notices div { display: grid; grid-template-columns: 120px 1fr; gap: 16px; padding: 10px 0; border-top: 1px solid var(--line); }
+.notices time { font: 13px var(--mono); color: var(--ink3); padding-top: 2px; }
+.runhead { display: flex; align-items: center; gap: 28px; padding: 18px 22px; flex-wrap: wrap; }
+.runhead .name { font: 600 18px var(--mono); display: flex; align-items: center; gap: 10px; }
+.runhead .st { color: var(--ink3); font-size: 15px; }
+.runhead .step { font: 600 22px var(--mono); }
+.runhead .el b { font: 500 18px var(--mono); display: block; }
+.runhead .el small, .runhead .ph small { font: 13px var(--mono); color: var(--ink3); }
+.runhead .ph { font-size: 14px; }
+.stats { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); border-top: 1px solid var(--line); }   /* 9 格固定两排(5 + 4), 自动排会挤成一排 */
+.stats > div { padding: 14px 20px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); margin: 0 -1px -1px 0; min-width: 0; }
+.stats small { display: block; color: var(--ink2); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.stats b { font: 600 24px var(--mono); display: block; white-space: nowrap; }
+.stats i { font: 12px var(--mono); font-style: normal; display: block; white-space: nowrap; color: var(--ink3); }
+.stats i em { font-style: normal; margin-right: 4px; }
+.up { color: var(--s3); } .down { color: var(--bad); }
+.phases { display: flex; gap: 6px; padding: 0 22px 16px; flex-wrap: wrap; }
+.phases span { font-size: 12px; padding: 3px 10px; border-radius: 99px; background: var(--chip); color: var(--ink3); }
+.phases span.done { color: var(--ink2); }
+.phases span.cur { background: var(--s1); color: #fff; }
+.grid3 { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 18px; }
+.chart { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px 6px; position: relative; min-width: 0; }
+.chart .hd { display: flex; justify-content: space-between; gap: 8px; align-items: flex-start; }
+.chart .ti { font: 14px var(--mono); color: var(--ink2); }
+.chart .ti b { color: var(--ink); font-weight: 500; }
+.chart .sub { font-size: 12px; color: var(--ink3); }
+.chart .lv { display: flex; flex-wrap: wrap; gap: 2px 14px; margin-top: 6px; font: 12px var(--mono); color: var(--ink2); }
+.chart .lv > span { white-space: nowrap; }
+.chart .lv b { color: var(--ink); font-weight: 600; }
+.chart svg { width: 100%; height: 210px; display: block; overflow: visible; }
+.chart .tip { position: absolute; pointer-events: none; background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; font: 12px var(--mono); box-shadow: 0 4px 14px rgba(0,0,0,.08); display: none; z-index: 3; white-space: nowrap; }
+.tick { font: 11px var(--mono); fill: var(--ink3); }
+.ctl { display: flex; align-items: center; gap: 14px; margin: 4px 0 16px; flex-wrap: wrap; font-size: 14px; color: var(--ink2); }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.seg button { border: 0; background: var(--surface); color: var(--ink2); padding: 5px 12px; cursor: pointer; font: 14px var(--sans); }
+.seg button.on { background: var(--ink); color: var(--surface); }
+.lg { display: inline-flex; align-items: center; gap: 6px; margin-right: 12px; font-size: 13px; }
+.lg i { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+.cmpkey { display: flex; flex-wrap: wrap; gap: 6px 18px; padding: 2px 20px 12px; font-size: 13px; color: var(--ink2); }
+.cmpkey i, .mr .tr b { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+.cmpkey i { margin-right: 6px; }
+.cmpkey small { color: var(--ink3); margin-left: 4px; }
+.cmpg { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(360px, 100%), 1fr)); gap: 18px; margin-bottom: 18px; }   /* 与 .grid3 判决尺卡片同宽 */
+.cmpg .cg { grid-column: 1 / -1; font-size: 13px; color: var(--ink2); margin: 6px 0 -6px; }
+.mt { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px 10px; min-width: 0; }
+.mt h4 { margin: 0 0 4px; font-size: 13px; font-weight: 500; color: var(--ink); }
+.mt h4 small { color: var(--ink3); font-weight: 400; margin-left: 6px; }
+.mt p { margin: 2px 0 0; font-size: 11px; color: var(--ink3); }
+.mr { display: grid; grid-template-columns: 76px 1fr 88px; align-items: center; gap: 10px; height: 22px; font: 12px var(--mono); }
+.mr .nm { color: var(--ink3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mr .tr { position: relative; height: 1px; background: var(--line); }
+.mr .tr b { position: absolute; top: 0; transform: translate(-50%, -50%); }
+.mr .v { text-align: right; white-space: nowrap; color: var(--ink2); }
+.mr .v small { color: var(--ink3); font-size: 10px; }
+.mr.best .v { color: var(--ink); font-weight: 700; }
+.mr.ours .nm { color: var(--s1); }
+.notes { padding: 8px 20px 16px; color: var(--ink3); font-size: 13px; }
+.notes p { margin: 6px 0; }
+.feed { max-height: 520px; overflow-y: auto; padding: 0 20px 10px; }
+.feed div { display: grid; grid-template-columns: 120px 1fr; gap: 16px; padding: 8px 0; border-top: 1px solid var(--line); font-size: 14px; }
+.feed time { font: 13px var(--mono); color: var(--ink3); }
+.feed .tag { font: 12px var(--mono); color: var(--ink3); margin-left: 8px; }
+.about .abody { padding: 2px 20px 12px; max-width: 900px; }
+.about .abody > :first-child { margin-top: 4px; }
+.about ol, .about ul { padding-left: 22px; }
+.about li { margin: 6px 0; }
+.about p, .about li { color: var(--ink2); }
+.about code { font: 13px var(--mono); background: var(--chip); padding: 1px 5px; border-radius: 4px; }
+.hide { display: none !important; }
+h1.hero { font-size: 26px; font-weight: 650; margin: 4px 0 6px; letter-spacing: -.01em; }
+.links { margin: 0 0 18px; font-size: 14px; color: var(--ink3); display: flex; gap: 16px; flex-wrap: wrap; }
+.links a { color: var(--ink2); text-decoration: none; border-bottom: 1px solid var(--line); }
+.links a:hover { color: var(--ink); border-color: var(--ink); }
+@media (max-width: 760px) { h1.hero { font-size: 21px; } }
+.warm { padding: 60px 0; text-align: center; color: var(--ink3); }
+@media (max-width: 760px) {
+  .clk.tz { display: none; }
+  nav a { margin-right: 14px; }
+  .grid3 { grid-template-columns: 1fr; }
+  .notices div, .feed div { grid-template-columns: 1fr; gap: 2px; }
+  .runhead { gap: 14px; }
+  .stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }   /* 9 格 = 3×3 */
+  .stats > div { padding: 10px 12px; }
+  .stats small { font-size: 12px; }
+  .stats b { font-size: 18px; }
+  .stats i { font-size: 11px; white-space: normal; }   /* 窄屏一格 ~95 px, "▼0.0137 较起点"放不下就折行, 不溢出 */
+  .runhead { padding: 14px 16px; }
+  .runhead .name { font-size: 15px; }
+  .runhead .step { font-size: 18px; }
+  .phases { padding: 0 16px 12px; align-items: center; }
+  .phases span:not(.cur) { font-size: 0; padding: 0; width: 22px; height: 6px; }   /* 窄屏六个阶段名要占三行: 只留当前这段的字, 其余缩成进度格 */
+  .phases span.done { background: var(--ink3); }
+  .cmpkey { padding-left: 16px; padding-right: 16px; }
+  .card > h3 { padding: 12px 16px 6px; }
+  .notes { padding: 6px 16px 14px; }
+  .about .abody { padding: 2px 16px 10px; }
+  .clk.vis { display: none; }
+}
+</style>
+</head>
+<body>
+<header><div class="bar">
+  <nav><a href="#overview" data-tab="overview" data-i="tab_overview"></a><a href="#metrics" data-tab="metrics" data-i="tab_metrics"></a><a href="#about" data-tab="about" data-i="tab_about"></a><a href="#notices" data-tab="notices" data-i="notices"></a></nav>
+  <div class="spacer"></div>
+  <div class="clk vis"><small data-i="visits"></small><b id="hdvis">—</b></div>
+  <div class="sep vis"></div>
+  <div class="clk"><small data-i="total_cost"></small><b id="hdcost">—</b></div>
+  <div class="sep"></div>
+  <div class="clk"><small data-i="beijing"></small><b id="c_bj">—</b></div>
+  <div class="clk tz"><small>UTC</small><b id="c_utc">—</b></div>
+  <div class="clk tz"><small data-i="la"></small><b id="c_la">—</b></div>
+  <div class="clk tz"><small data-i="london"></small><b id="c_ld">—</b></div>
+  <span class="conn"><span class="dot" id="conndot"></span><span id="conntxt"></span></span>
+  <button class="btn" id="langbtn">EN</button>
+  <button class="btn" id="themebtn" title="theme">◐</button>
+</div></header>
+
+<main>
+<h1 class="hero" data-i="hero"></h1>
+<div class="links"><a href="https://github.com/fodelf/YoungAi" target="_blank" rel="noopener">GitHub · fodelf/YoungAi</a><a href="https://huggingface.co/wenzhouwu/YoungAi-DeepSeek-V4.1-Flash-1017" target="_blank" rel="noopener">Hugging Face</a><a href="https://fodelf.github.io/YoungAi/" target="_blank" rel="noopener" data-i="site"></a></div>
+<div id="warm" class="warm" data-i="warming"></div>
+
+<section id="tab-overview" class="hide">
+  <div class="card" id="runcard">
+    <div class="runhead">
+      <div class="name"><span class="dot" id="rundot"></span>DS4 · V4.1-Flash-1017 <span class="st" id="runst"></span></div>
+      <div class="step" id="runround">—</div>
+      <div class="el"><b id="runel">—</b><small id="runstart"></small></div>
+      <div class="ph" id="runph"></div>
+    </div>
+    <div class="phases" id="phases"></div>
+    <div class="stats" id="stats"></div>
+  </div>
+
+  <div class="ctl" style="margin-top:6px"><b style="color:var(--ink)" data-i="live_round"></b><span id="livehd"></span></div>
+  <div class="grid3" id="livegrid" style="margin-bottom:18px"></div>
+
+  <div class="card">
+    <h3><span data-i="cmp_title" style="margin:0;color:var(--ink);font-weight:600"></span><span data-i="cmp_sub"></span></h3>
+    <div class="cmpkey" id="cmpkey"></div>
+  </div>
+  <div class="cmpg" id="cmp"></div>
+
+  <div class="ctl" style="margin-top:6px"><b style="color:var(--ink)" data-i="benchmarks"></b>
+    <span class="lg"><i style="background:var(--s3)"></i><span data-i="v_relay"></span></span>
+    <span class="lg"><i style="background:var(--s2)"></i><span data-i="v_chain"></span></span>
+    <span class="lg"><i style="background:var(--drop)"></i><span data-i="v_drop"></span></span>
+    <span class="lg"><i style="background:var(--s1)"></i><span data-i="best_line"></span></span>
+  </div>
+  <div class="grid3" id="benchgrid"></div>
+
+  <div class="card" style="margin-top:18px"><h3><span data-i="feed" style="margin:0;color:var(--ink);font-weight:600"></span><span data-i="bj_time"></span></h3><div class="feed" id="feed"></div></div>
+
+  <div class="card"><h3><span data-i="cmp_notes" style="margin:0;color:var(--ink);font-weight:600"></span></h3><div class="notes" id="cmpnotes"></div></div>
+</section>
+
+<section id="tab-metrics" class="hide">
+  <div class="ctl">
+    <span class="seg" id="xseg"><button data-x="round" class="on" data-i="x_round"></button><button data-x="time" data-i="x_time"></button></span>
+    <span class="seg" id="yseg"><button data-y="lin" class="on">linear</button><button data-y="log">log</button></span>
+    <span data-i="smoothing"></span><input type="range" id="smooth" min="0" max="0.98" step="0.02" value="0.6" style="width:140px"><span class="mono" id="smoothv"></span>
+  </div>
+  <div class="grid3" id="metricgrid"></div>
+</section>
+
+<section id="tab-about" class="hide"><div class="about" id="about"></div></section>
+
+<section id="tab-notices" class="hide">
+  <div class="card"><h3><span data-i="notices" style="margin:0;color:var(--ink);font-weight:600"></span><span data-i="bj_time"></span></h3><div class="notices" id="notices"></div></div>
+</section>
+</main>
+
+<script>
+'use strict';
+const L = {
+  zh: {
+    hero: '自学习还原 1 bit 的 DeepSeek 量化模型', site: '项目网站', visits: '访客 · 浏览 · 在看', tab_overview: '总览', tab_metrics: '指标', tab_about: '说明', total_cost: 'API 总花费', beijing: '北京', la: '洛杉矶', london: '伦敦',
+    warming: '正在读训练记录…', notices: '公告', bj_time: '北京时间', live: '实时', reconnecting: '重连中…',
+    running: '训练中', running_other: '另有训练任务运行中', idle: '思考中', round: '第 {n} 轮', round_done: '第 {n} 轮已结束', started: '开始于 {t}',
+    ph_data: '出料：官方出题作答', ph_anchor: 'FP 锚：原件参考前向', ph_load: '装载模型', ph_eval0: '第 0 步评估', ph_train: '训练中', ph_judge: '判决：四把尺',
+    ph_now: '{p} · 第 {s} 步 · 已训 {t}', ph_now0: '{p} · 本轮已过 {t}',
+    s_same: '最好 Same top', s_kld: '最好 KLD', s_smin: '最好 Σmin', s_cost: 'API 花费', s_tok: '训练位数',
+    s_q: '训练题', s_hours: '机时', s_rounds: '接力 / 总轮数', s_api_tok: 'API token', vs_start: '较起点', cmp_notes: '指标说明', lower_better: '越低越好',
+    cmp_title: '1 位量化对比', cmp_sub: 'Unsloth UD-IQ1 与 ISTA-DASLab GSQ-RCO IQ1_M（数取自 Unsloth 的 V4.1-Flash 指南）',
+    benchmarks: '判决尺', v_relay: '接力（新最好）', v_chain: '续训链头', v_drop: '丢弃', best_line: '当前最好', feed: '事件流',
+    x_round: '轮', x_time: '时间', smoothing: '平滑', live_round: '当前轮实时', prev_round: '上一轮', sec_step: '秒/步',
+    v: { relay: '接力 → 新最好', chain: '续训链头（没过最好的门）', drop: '丢弃', holdout: '留出升（背料），丢', nockpt: '没落 ckpt，丢', datafail: '料失败，跳过', prepfail: '料准备失败', base: '起点', other: '其他' },
+    ev_start: '第 {n} 轮开始（从 {f} 续训）', ev_start0: '第 {n} 轮开始', ev_train: '训练完：{s} 步，思考留出 {a} → {b}，决策位 KL {c} → {d}',
+    ev_step: '第 {n} 轮 第 {s} 步：损失 {l}，梯度范数 {g}', ev_data: '料：官方 {q} 题答对可用 {ok} 条，裸续写代码 {d} 篇',
+    ev_judge: '{v}：Same {s}% · KLD {k}', not_running: '在分析上一轮结果、安排下一轮',
+  },
+  en: {
+    hero: 'Self-learning restoration of a 1-bit quantized DeepSeek model', site: 'project site', visits: 'visitors · views · online', tab_overview: 'overview', tab_metrics: 'metrics', tab_about: 'about', total_cost: 'API cost', beijing: 'Beijing', la: 'Los Angeles', london: 'London',
+    warming: 'reading training records…', notices: 'notices', bj_time: 'Beijing time', live: 'live', reconnecting: 'reconnecting…',
+    running: 'running', running_other: 'another training job is running', idle: 'thinking', round: 'round {n}', round_done: 'round {n} finished', started: 'started {t}',
+    ph_data: 'data: official API questions + answers', ph_anchor: 'FP anchor: reference forward', ph_load: 'loading model', ph_eval0: 'step-0 eval', ph_train: 'training', ph_judge: 'judging: four rulers',
+    ph_now: '{p} · step {s} · {t} in', ph_now0: '{p} · {t} into the round',
+    s_same: 'best Same top', s_kld: 'best KLD', s_smin: 'best Σmin', s_cost: 'API cost', s_tok: 'trained positions',
+    s_q: 'training items', s_hours: 'machine time', s_rounds: 'relayed / rounds', s_api_tok: 'API tokens', vs_start: 'vs start', cmp_notes: 'about these numbers', lower_better: 'lower is better',
+    cmp_title: '1-bit quant comparison', cmp_sub: 'Unsloth UD-IQ1 and ISTA-DASLab GSQ-RCO IQ1_M (numbers from Unsloth’s V4.1-Flash guide)',
+    benchmarks: 'judge rulers', v_relay: 'relayed (new best)', v_chain: 'chain head', v_drop: 'discarded', best_line: 'best so far', feed: 'feed',
+    x_round: 'round', x_time: 'time', smoothing: 'smoothing', live_round: 'current round, live', prev_round: 'previous round', sec_step: 's/step',
+    v: { relay: 'relayed → new best', chain: 'chain head (missed the best gate)', drop: 'discarded', holdout: 'holdout rose (memorizing), discarded', nockpt: 'no checkpoint, discarded', datafail: 'data failed, skipped', prepfail: 'data prep failed', base: 'start', other: 'other' },
+    ev_start: 'round {n} started (continuing from {f})', ev_start0: 'round {n} started', ev_train: 'training done: {s} steps, think holdout {a} → {b}, decision KL {c} → {d}',
+    ev_step: 'round {n} step {s}: loss {l}, grad norm {g}', ev_data: 'data: {q} official questions, {ok} usable answers, {d} raw code docs',
+    ev_judge: '{v}: Same {s}% · KLD {k}', not_running: 'analyzing the last round, planning the next',
+  },
+};
+let lang = null;
+try { lang = localStorage.getItem('rl_lang'); } catch (e) { /* 隐私窗口读不了: 用缺省 */ }
+if (lang !== 'zh' && lang !== 'en') lang = 'en';   // 缺省英文(11-04 用户定), 不看浏览器语言; 点过切换按钮才记住选择
+const T = (k, o) => { let s = L[lang][k] ?? k; if (o) for (const a in o) s = s.replaceAll('{' + a + '}', o[a]); return s; };
+
+/* ---------- 格式 ---------- */
+const BJ = 8 * 3600;
+const pad = n => String(n).padStart(2, '0');
+function bj(t, sec) { const d = new Date((t + BJ) * 1000); return `${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}` + (sec ? ':' + pad(d.getUTCSeconds()) : ''); }
+function dur(s) { s = Math.max(0, Math.floor(s)); const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60), x = s % 60; return (d ? d + 'd ' : '') + `${pad(h)}:${pad(m)}:${pad(x)}`; }
+function big(n) { if (n == null) return '—'; const a = Math.abs(n); return a >= 1e9 ? (n / 1e9).toFixed(2) + 'B' : a >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : a >= 1e3 ? (n / 1e3).toFixed(1) + 'k' : String(Math.round(n)); }
+function fx(v, d) { return v == null ? '—' : (+v).toFixed(d); }
+const nz = v => v != null && isFinite(v);
+
+/* ---------- 状态 ---------- */
+let D = null, CMP = null, skew = 0, okAt = 0, firstPoll = true;
+let VID = null;
+try { VID = localStorage.getItem('rl_vid'); } catch (e) {}
+if (!/^[0-9a-f]{32}$/.test(VID || '')) {
+  const b = new Uint8Array(16); crypto.getRandomValues(b); VID = [...b].map(x => x.toString(16).padStart(2, '0')).join('');
+  try { localStorage.setItem('rl_vid', VID); } catch (e) { /* 存不了: 这次会话照样计, 下次算新访客 */ }
+}
+const UI = { x: 'round', y: 'lin', smooth: 0.6, tab: 'overview' };
+
+async function poll() {
+  try {
+    const r = await fetch('/api/rl/status?v=' + VID + (firstPoll ? '&first=1' : ''), { cache: 'no-store' });
+    const j = await r.json();
+    firstPoll = false;
+    if (j.visits) document.getElementById('hdvis').textContent = `${big(j.visits.uv)} · ${big(j.visits.pv)} · ${j.visits.online}`;
+    if (!j.warming) { D = j; skew = j.now - Date.now() / 1000; okAt = Date.now(); render(); }
+  } catch (e) { /* 断了: 顶栏显示重连中, 下一拍再来 */ }
+  conn();
+  setTimeout(poll, 5000);
+}
+async function loadCmp() { try { CMP = await (await fetch('/rl/compare.json', { cache: 'no-store' })).json(); if (D) render(); } catch (e) {} }
+
+function conn() {
+  const live = Date.now() - okAt < 15000;
+  document.getElementById('conndot').className = 'dot' + (live ? ' live' : '');
+  document.getElementById('conntxt').textContent = live ? T('live') : T('reconnecting');
+}
+
+/* ---------- 派生数据 ---------- */
+function derive() {
+  const R = D.rounds, base = D.base || {};
+  let best = { same: base.same, kld: base.kld, smin: base.smin, wkld: base.wkld, wsame: base.wsame, tag: base.tag };
+  const bestSeries = [];
+  for (const r of R) { if (r.verdict === 'relay') best = r; if (r.end) bestSeries.push({ n: r.n, t: r.end, same: best.same, kld: best.kld, smin: best.smin, wkld: best.wkld, wsame: best.wsame }); }
+  let cost = 0, tok = 0, pos = 0, nq = 0, hours = 0, relay = 0, done = 0;
+  for (const r of R) {
+    cost += r.cny || 0; tok += (r.hit || 0) + (r.miss || 0) + (r.out || 0); pos += r.rows || 0; nq += r.nq || 0;
+    if (r.start && r.end && r.end > r.start) hours += (r.end - r.start) / 3600;
+    if (r.verdict) done++; if (r.verdict === 'relay') relay++;
+  }
+  return { best, bestSeries, cost, tok, pos, nq, hours, relay, done };
+}
+
+/* ---------- 顶栏 ---------- */
+function clocks() {
+  const now = Date.now() / 1000 + skew;
+  const f = (tz) => new Date(now * 1000).toLocaleTimeString('en-GB', { timeZone: tz, hour12: false });
+  document.getElementById('c_bj').textContent = f('Asia/Shanghai');
+  document.getElementById('c_utc').textContent = f('UTC');
+  document.getElementById('c_la').textContent = f('America/Los_Angeles');
+  document.getElementById('c_ld').textContent = f('Europe/London');
+  if (D && D.camp_start) document.getElementById('runel').textContent = dur(now - D.camp_start);
+}
+
+/* ---------- 画图(纯 SVG) ---------- */
+const NS = 'http://www.w3.org/2000/svg';
+function el(p, tag, a, txt) { const e = document.createElementNS(NS, tag); for (const k in a) e.setAttribute(k, a[k]); if (txt != null) e.textContent = txt; p.appendChild(e); return e; }
+function niceTicks(lo, hi, n) {
+  const span = hi - lo || Math.abs(hi) || 1, step0 = span / n, mag = Math.pow(10, Math.floor(Math.log10(step0))), r = step0 / mag;
+  const step = (r < 1.5 ? 1 : r < 3 ? 2 : r < 7 ? 5 : 10) * mag, out = [];
+  for (let v = Math.ceil(lo / step) * step; v <= hi + step * 1e-6; v += step) out.push(+v.toPrecision(10));
+  return out;
+}
+function ema(pts, a) { if (!a) return pts; let s = null; return pts.map(([x, y]) => { s = s == null ? y : a * s + (1 - a) * y; return [x, s]; }); }
+function fmtV(v) { const a = Math.abs(v); return a >= 1000 ? big(v) : a >= 10 ? v.toFixed(2) : a >= 1 ? v.toFixed(3) : a >= 0.01 ? v.toFixed(4) : v.toPrecision(3); }
+
+/* spec: { title, sub, series: [{ name, color, pts: [[x,y,extra]], dots, line, dotColor(p), step }], refs: [{ y, label, color }], xfmt, lowerBetter } */
+function chart(host, spec) {
+  const box = document.createElement('div'); box.className = 'chart'; host.appendChild(box);
+  const hd = document.createElement('div'); hd.className = 'hd'; box.appendChild(hd);
+  const [pfx, last] = spec.title.includes('/') ? [spec.title.slice(0, spec.title.lastIndexOf('/') + 1), spec.title.slice(spec.title.lastIndexOf('/') + 1)] : ['', spec.title];
+  hd.innerHTML = `<div><div class="ti">${pfx}<b>${last}</b></div>${spec.sub ? `<div class="sub">${spec.sub}</div>` : ''}</div>`;
+  // 每条线的最新值横排在标题下面(带名字), 原来竖叠在右上角, 两条线的数挤成一团还看不出哪个是哪个
+  const lv = document.createElement('div'); lv.className = 'lv'; box.appendChild(lv);
+  for (const s of spec.series) {
+    const p = s.pts.filter(q => nz(q[1])); if (!p.length || s.noLegend) continue;
+    const v = p[p.length - 1][1], pv = p.length > 1 ? p[p.length - 2][1] : null;
+    const d = pv == null ? '' : v - pv, good = d === '' ? '' : ((d < 0) === !!spec.lowerBetter ? 'up' : 'down');
+    lv.insertAdjacentHTML('beforeend', `<span><span style="color:${s.color}">●</span> ${s.name} <b>${fmtV(v)}</b>${d === '' || d === 0 ? '' : ` <span class="${good}">${d > 0 ? '▲' : '▼'}${+Math.abs(d).toPrecision(2)}</span>`}</span>`);
+  }
+  const svg = el(box, 'svg', { viewBox: '0 0 400 210', preserveAspectRatio: 'none' });
+  const tip = document.createElement('div'); tip.className = 'tip'; box.appendChild(tip);
+  const all = spec.series.flatMap(s => s.pts.filter(p => nz(p[1]) && nz(p[0])));
+  if (!all.length) { el(svg, 'text', { x: 200, y: 110, 'text-anchor': 'middle', class: 'tick' }, '—'); return; }
+  const log = UI.y === 'log' && all.every(p => p[1] > 0);
+  const tf = v => log ? Math.log10(v) : v;
+  let xs = all.map(p => p[0]), ys = all.map(p => tf(p[1]));
+  for (const r of spec.refs || []) ys.push(tf(r.y));
+  let x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+  if (x1 === x0) { x0 -= 1; x1 += 1; }
+  const pad_ = (y1 - y0) * 0.08 || Math.abs(y1) * 0.05 || 1; y0 -= pad_; y1 += pad_;
+  const ML = 44, MR = 8, MT = 8, MB = 22, W = 400, H = 210;
+  const X = x => ML + (x - x0) / (x1 - x0) * (W - ML - MR), Y = y => MT + (y1 - tf(y)) / (y1 - y0) * (H - MT - MB);
+  const Yt = y => MT + (y1 - y) / (y1 - y0) * (H - MT - MB);
+  for (const t of niceTicks(y0, y1, 4)) {
+    el(svg, 'line', { x1: ML, x2: W - MR, y1: Yt(t), y2: Yt(t), stroke: 'var(--grid)', 'vector-effect': 'non-scaling-stroke' });
+    el(svg, 'text', { x: ML - 6, y: Yt(t) + 3.5, 'text-anchor': 'end', class: 'tick' }, log ? fmtV(Math.pow(10, t)) : fmtV(t));
+  }
+  const xt = UI.x === 'time' && spec.timeX !== false ? niceTimeTicks(x0, x1) : niceTicks(x0, x1, 5).filter(v => Number.isInteger(v));
+  for (const t of xt) el(svg, 'text', { x: X(t), y: H - 5, 'text-anchor': 'middle', class: 'tick' }, (spec.xfmt || String)(t));
+  for (const r of spec.refs || []) {
+    el(svg, 'line', { x1: ML, x2: W - MR, y1: Y(r.y), y2: Y(r.y), stroke: r.color, 'stroke-dasharray': '4 3', 'vector-effect': 'non-scaling-stroke', opacity: .8 });
+    el(svg, 'text', { x: r.left ? ML + 4 : W - MR - 2, y: Y(r.y) - 3, 'text-anchor': r.left ? 'start' : 'end', class: 'tick', fill: r.color }, r.label);   // 起点放左, 别家放右: 85.16 与 85.1 两条线挨着, 标签别叠
+  }
+  for (const s of spec.series) {
+    const p = s.pts.filter(q => nz(q[1]) && nz(q[0]));
+    if (s.line !== false && p.length > 1) {
+      let d = '';
+      p.forEach((q, i) => { const px = X(q[0]), py = Y(q[1]); d += i ? (s.step ? `H${px}V${py}` : `L${px},${py}`) : `M${px},${py}`; });
+      el(svg, 'path', { d, fill: 'none', stroke: s.color, 'stroke-width': s.width || 1.6, 'vector-effect': 'non-scaling-stroke', opacity: s.opacity || 1 });
+    }
+    if (s.dots) for (const q of p) el(svg, 'circle', { cx: X(q[0]), cy: Y(q[1]), r: 3, fill: s.dotColor ? s.dotColor(q) : s.color, stroke: 'var(--surface)', 'stroke-width': 1, 'vector-effect': 'non-scaling-stroke' });
+  }
+  // 悬停: 每条线取 x 最近的点
+  const cross = el(svg, 'line', { y1: MT, y2: H - MB, stroke: 'var(--ink3)', 'stroke-width': 1, 'vector-effect': 'non-scaling-stroke', opacity: 0 });
+  svg.addEventListener('mousemove', ev => {
+    const bb = svg.getBoundingClientRect(), xv = x0 + ((ev.clientX - bb.left) / bb.width * W - ML) / (W - ML - MR) * (x1 - x0);
+    let rows = [], xs_ = null;
+    for (const s of spec.series) {
+      const p = s.pts.filter(q => nz(q[1]) && nz(q[0])); if (!p.length) continue;
+      let b = p[0]; for (const q of p) if (Math.abs(q[0] - xv) < Math.abs(b[0] - xv)) b = q;
+      if (xs_ == null) xs_ = b[0];
+      rows.push(`<span style="color:${s.color}">●</span> ${s.name}: ${fmtV(b[1])}${b[2] ? ' · ' + b[2] : ''}`);
+    }
+    if (xs_ == null) return;
+    cross.setAttribute('x1', X(xs_)); cross.setAttribute('x2', X(xs_)); cross.setAttribute('opacity', .5);
+    tip.innerHTML = `<div style="color:var(--ink3)">${(spec.xfmt || String)(xs_)}</div>` + rows.join('<br>');
+    tip.style.display = 'block';
+    const bx = box.getBoundingClientRect(), left = ev.clientX - bx.left + 12;
+    tip.style.left = Math.min(left, bx.width - tip.offsetWidth - 6) + 'px'; tip.style.top = (ev.clientY - bx.top + 12) + 'px';
+  });
+  svg.addEventListener('mouseleave', () => { tip.style.display = 'none'; cross.setAttribute('opacity', 0); });
+}
+function niceTimeTicks(a, b) {
+  const span = b - a, steps = [600, 1800, 3600, 7200, 3 * 3600, 6 * 3600, 12 * 3600, 86400, 2 * 86400];
+  const st = steps.find(s => span / s <= 5) || 7 * 86400, out = [];
+  for (let t = Math.ceil((a + BJ) / st) * st - BJ; t <= b; t += st) out.push(t);
+  return out;
+}
+
+/* ---------- 各区块 ---------- */
+const VCOL = { relay: 'var(--s3)', chain: 'var(--s2)', base: 'var(--s1)' };
+const vcol = v => VCOL[v] || (v === 'holdout' ? 'var(--bad)' : 'var(--drop)');
+
+function renderRun(g) {
+  const live = D.live, run = D.running;
+  document.getElementById('rundot').className = 'dot' + (run ? ' run' : '');
+  document.getElementById('runst').textContent = run ? T(live ? 'ph_' + live.phase : 'running_other') : T('idle');
+  const last = D.rounds[D.rounds.length - 1], lastN = last ? last.n : 0;
+  document.getElementById('runround').textContent = T(!live && last && last.verdict ? 'round_done' : 'round', { n: live ? live.n : lastN });
+  document.getElementById('runstart').textContent = D.camp_start ? T('started', { t: bj(D.camp_start) }) : '';
+  const ph = document.getElementById('runph'), phs = document.getElementById('phases');
+  if (live) {
+    const now = Date.now() / 1000 + skew, p = T('ph_' + live.phase);
+    ph.innerHTML = live.step ? T('ph_now', { p, s: live.step, t: dur(live.t || 0) }) + (live.loss != null ? `<br><small>loss ${fmtV(live.loss)}</small>` : '')
+                             : T('ph_now0', { p, t: live.since ? dur(now - live.since) : '—' });
+    const order = ['data', 'anchor', 'load', 'eval0', 'train', 'judge'], k = order.indexOf(live.phase);
+    phs.innerHTML = order.map((o, i) => `<span class="${i < k ? 'done' : i === k ? 'cur' : ''}">${T('ph_' + o)}</span>`).join('');
+  } else { ph.textContent = run ? '' : T('not_running'); phs.innerHTML = ''; }
+  const b = D.base || {}, best = g.best;
+  const delta = (v, v0, d, lowerBetter) => v == null || v0 == null ? '' : `<i><em class="${(v - v0 < 0) === lowerBetter ? 'up' : 'down'}">${v - v0 >= 0 ? '▲' : '▼'}${Math.abs(v - v0).toFixed(d)}</em>${T('vs_start')}</i>`;
+  const cells = [
+    [T('s_same'), fx(best.same, 2) + '%', delta(best.same, b.same, 2, false)],
+    [T('s_kld'), fx(best.kld, 5), delta(best.kld, b.kld, 4, true)],
+    [T('s_smin'), fx(best.smin, 4), delta(best.smin, b.smin, 3, false)],
+    [T('s_cost'), '¥' + g.cost.toFixed(2), ''],
+    [T('s_api_tok'), big(g.tok), ''],
+    [T('s_tok'), big(g.pos), ''],
+    [T('s_q'), big(g.nq), ''],
+    [T('s_hours'), g.hours.toFixed(1) + ' h', ''],
+    [T('s_rounds'), `${g.relay} / ${g.done}`, ''],
+  ];
+  document.getElementById('stats').innerHTML = cells.map(c => `<div><small title="${c[0]}">${c[0]}</small><b>${c[1]}</b>${c[2]}</div>`).join('');
+  document.getElementById('hdcost').textContent = '¥' + g.cost.toFixed(2);
+}
+
+function renderNotices() {
+  const n = D.notices || [];
+  document.getElementById('notices').innerHTML = n.map(x => `<div><time>${esc(x.t)}</time><span>${esc(lang === 'zh' ? x.zh : x.en)}</span></div>`).join('') || '<div><time></time><span>—</span></div>';
+}
+function esc(s) { return String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+
+function renderCmp(g) {
+  if (!CMP) return;
+  const Q = CMP.quants.slice(), best = g.best;
+  // 本项目 · 现在: 只有 top-1 / KL 两组(四把尺每轮都量); 九项跑分不是每轮跑的, 留空
+  Q.push({ id: 'ours_now', name: lang === 'zh' ? `DS4 · 现在（${best.tag || ''}）` : `DS4 · now (${best.tag || ''})`, org: 'ours', gb: 113.7, live: true,
+           top1_long: best.same, kl_long: best.kld, top1_short: best.wsame, kl_short: best.wkld });
+  const rows = [
+    ['grp', lang === 'zh' ? '体积' : 'size'],
+    ['gb', lang === 'zh' ? '权重 GB（不含 Engram 表）' : 'weights GB (excl. Engram)', 1, true],
+    ['grp', lang === 'zh' ? '对原件的分布一致（越近 100% / 0 越好）' : 'agreement with the original (closer to 100% / 0 is better)'],
+    ['top1_long', lang === 'zh' ? 'top-1 一致率 % · 长文本' : 'top-1 agreement % · long', 2],
+    ['kl_long', lang === 'zh' ? '平均 KL · 长文本' : 'mean KL · long', 3, true],
+    ['top1_short', lang === 'zh' ? 'top-1 一致率 % · 短文本' : 'top-1 agreement % · short', 2],
+    ['kl_short', lang === 'zh' ? '平均 KL · 短文本' : 'mean KL · short', 3, true],
+    ['grp', lang === 'zh' ? '对 UD-Q8_K_XL · 7 套文本（Unsloth 图上读数，≈）' : 'vs UD-Q8_K_XL · 7 text sets (read off Unsloth’s chart, ≈)'],
+    ['top1_q8', lang === 'zh' ? 'top-1 一致率 %' : 'top-1 agreement %', 1],
+    ['kl_q8', lang === 'zh' ? '平均 KL' : 'mean KL', 3, true],
+    ['grp', lang === 'zh' ? '任务分（Unsloth 同口径）' : 'task scores (Unsloth recipe)'],
+    ['rec3', lang === 'zh' ? '三项恢复率 %（AIME25 / GPQA-D / LCB 对基线，Unsloth 实测）' : '3-benchmark recovery % (AIME25 / GPQA-D / LCB vs baseline, Unsloth-measured)', 2],
+    ['aime', 'AIME25', 2], ['hmmt', 'HMMT Feb26', 2], ['gpqa', 'GPQA-Diamond', 2], ['mmlu', 'MMLU-Pro', 2], ['ifeval', 'IFEval', 2], ['lcb', 'LiveCodeBench v6', 2],
+    ['avg6', lang === 'zh' ? '六项均分' : 'avg of 6', 2], ['aider', 'Aider Polyglot', 2], ['trunc', lang === 'zh' ? '截断率 %' : 'truncated %', 2, true],
+  ];
+  // 每个指标一小块点图: 一家一行(名字 · 在这项的相对位置 · 数), 轴只跨这一项的最小到最大, 所以点的远近只在块内比; 精确数看右边
+  const COL = { ud_iq1_s: 'var(--s2)', ud_iq1_m: 'var(--s4)', gsq_iq1_m: 'var(--s3)', ours_1101: 'var(--s1)', ours_now: 'var(--s1)' };
+  const SHORT = { ud_iq1_s: 'UD-IQ1_S', ud_iq1_m: 'UD-IQ1_M', gsq_iq1_m: 'GSQ-RCO', ours_1101: 'DS4 11-01', ours_now: lang === 'zh' ? 'DS4 现在' : 'DS4 now' };
+  const dot = q => `background:${COL[q.id] || 'var(--ink3)'};${q.id === 'ours_1101' ? 'opacity:.45' : ''}`;
+  document.getElementById('cmpkey').innerHTML = Q.map(q => `<span><i style="${dot(q)}"></i>${esc(q.name)}<small>${q.gb} GB</small></span>`).join('');
+  let h = '';
+  for (const r of rows) {
+    if (r[0] === 'grp') { h += `<div class="cg">${r[1]}</div>`; continue; }
+    const [k, label, d, low] = r, vals = Q.map(q => q[k]).filter(nz);
+    if (!vals.length) continue;
+    const bv = low ? Math.min(...vals) : Math.max(...vals), lo = Math.min(...vals), hi = Math.max(...vals), pad_ = (hi - lo) * 0.08;
+    const pos = v => hi === lo ? 50 : (v - lo + pad_) / (hi - lo + 2 * pad_) * 100;
+    const claim = Q.find(q => k === 'rec3' && q.rec3_claim);
+    h += `<div class="mt"><h4>${label}${low ? `<small>${T('lower_better')}</small>` : ''}</h4>` + Q.filter(q => nz(q[k])).map(q => {   // 这一项没数的家不占行(“现在”一列只有分布一致那几项)
+      const v = q[k], ok = true;
+      const se = ok && q.se && q.se[k] ? ` <small>±${q.se[k].toFixed(1)}</small>` : '';
+      return `<div class="mr${ok && v === bv ? ' best' : ''}${q.org === 'ours' ? ' ours' : ''}"><span class="nm">${SHORT[q.id] || esc(q.name)}</span>`
+           + `<span class="tr">${ok ? `<b style="left:${pos(v).toFixed(1)}%;${dot(q)}"></b>` : ''}</span><span class="v">${ok ? (+v).toFixed(d) + se : '—'}</span></div>`;
+    }).join('') + (claim ? `<p>${lang === 'zh' ? 'GSQ-RCO 模型卡自称' : 'GSQ-RCO model card claims'} ${claim.rec3_claim.toFixed(2)}</p>` : '') + '</div>';
+  }
+  document.getElementById('cmp').innerHTML = h;
+  document.getElementById('cmpnotes').innerHTML = lang === 'zh'
+    ? `<p>“长文本 / 短文本”两行：Unsloth 对官方 F32 参考、文本 long17k / wiki1100（未公开）；本项目对 510 GB 官方原件的参考前向，长文本 = 30 种语言留出代码 15,360 token（就是这里的判决尺 judge），短文本 = WikiText-2 512 token（wt2）。文本不同，只看量级。“现在”一列随训练每轮实时更新。“对 UD-Q8_K_XL”两行是 Unsloth 拿自家 8 bit 当参考、7 套 on-policy 文本的结果，GSQ-RCO 的 KL / top-1 只出现在这张图里（正文没给数），这里按像素读出，约 ±0.003 / ±0.05 个点；本项目没按这个口径量过。</p>
+       <p>任务分：别家来自 Unsloth 的同一套测试；本项目 11-01 是循环开始前的一次小随机子集（每项 90 分钟，±1 个标准误），只看量级，别当排名。体积只算权重本身，下载总包另含 Engram n-gram 表（别家 110.6 GB IQ4_NL，本项目用官方原件 203 GB）。来源：<a href="${CMP.source}" target="_blank" rel="noopener">${CMP.source}</a></p>`
+    : `<p>“long / short” rows: Unsloth measures against the official F32 reference on long17k / wiki1100 (unpublished); this project measures against a reference forward of the 510 GB original: long = held-out code in 30 languages, 15,360 tokens (the “judge” ruler on this page), short = WikiText-2, 512 tokens (wt2). Different texts, so compare magnitudes only. The “now” column updates every round. The two “vs UD-Q8_K_XL” rows are Unsloth’s comparison against their own 8-bit quant on 7 on-policy text sets; GSQ-RCO’s KL / top-1 appear only in that chart (no numbers in the text), so they are read off the pixels (about ±0.003 / ±0.05 pp). This project was not measured that way.</p>
+       <p>Task scores: others are from Unsloth’s own harness; ours (11-01) is one small random subset taken before this loop started (90 min per benchmark, ±1 standard error) — magnitude, not ranking. Sizes are weights only; downloads add the Engram n-gram table (others 110.6 GB IQ4_NL, ours the original 203 GB). Source: <a href="${CMP.source}" target="_blank" rel="noopener">${CMP.source}</a></p>`;
+}
+
+function xOf(r) { return UI.x === 'time' ? r.end : r.n; }
+function xfmt() { return UI.x === 'time' ? (t => bj(t).slice(6) ) : (n => String(n)); }
+function roundSeries(key, name, color, opt = {}) {
+  return { name, color, dots: true, line: false, dotColor: q => vcol(q[3]),
+           pts: D.rounds.filter(r => nz(r[key]) && (UI.x !== 'time' || r.end)).map(r => [xOf(r), r[key], r.tag + ' · ' + T('v')[r.verdict], r.verdict]), ...opt };
+}
+function bestSeries(g, key) {
+  return { name: T('best_line'), color: 'var(--s1)', step: true, noLegend: false, pts: g.bestSeries.filter(b => nz(b[key])).map(b => [UI.x === 'time' ? b.t : b.n, b[key]]) };
+}
+function cmpRefs(longKey) {
+  if (!CMP) return [];
+  const m = Object.fromEntries(CMP.quants.map(q => [q.id, q]));
+  const out = [];
+  for (const id of ['ud_iq1_s', 'ud_iq1_m']) if (m[id] && nz(m[id][longKey])) out.push({ y: m[id][longKey], label: m[id].name.replace('Unsloth ', ''), color: 'var(--s2)' });
+  return out;
+}
+
+function renderBench(g) {
+  const host = document.getElementById('benchgrid'); host.innerHTML = '';
+  const base = D.base || {}, br = (k, d) => nz(base[k]) ? [{ y: base[k], label: (lang === 'zh' ? '起点 ' : 'start ') + base.tag, color: 'var(--ink3)', left: true }] : [];
+  const sub = lang === 'zh' ? '30 种语言留出代码 15,360 位，对原件参考前向' : '15,360 held-out code tokens in 30 languages vs reference forward';
+  chart(host, { title: 'judge/same_top_%', sub, series: [roundSeries('same', 'Same top', 'var(--s3)'), bestSeries(g, 'same')], refs: [...br('same'), ...cmpRefs('top1_long')], xfmt: xfmt() });
+  chart(host, { title: 'judge/mean_kld', sub, lowerBetter: true, series: [roundSeries('kld', 'KLD', 'var(--s3)'), bestSeries(g, 'kld')], refs: [...br('kld'), ...cmpRefs('kl_long')], xfmt: xfmt() });
+  chart(host, { title: 'judge/sigma_min', sub: lang === 'zh' ? 'Σmin 分布还原率（逐位 Σ min(p, q) 的均值）' : 'Σmin recovery (mean per-token Σ min(p, q))', series: [roundSeries('smin', 'Σmin', 'var(--s3)'), bestSeries(g, 'smin')], refs: br('smin'), xfmt: xfmt() });
+}
+
+// 当前轮实时: x = 本轮步号, 叠上一轮(有步数据的最近一轮)当对照; 不在训练段时显示刚训完的那一轮
+function renderLive() {
+  const host = document.getElementById('livegrid'); host.innerHTML = '';
+  const ns = [...new Set(D.steps.map(s => s[0]))];
+  const cur = D.live && ns.includes(D.live.n) ? D.live.n : ns[ns.length - 1];
+  if (cur == null) { document.getElementById('livehd').textContent = '—'; return; }
+  const prev = ns.filter(n => n < cur).pop();
+  const tag = n => 'vl' + String(n).padStart(3, '0');
+  const of = n => D.steps.filter(s => s[0] === n);
+  const C = of(cur), P = prev != null ? of(prev) : [];
+  const last = C[C.length - 1], z = lang === 'zh';
+  document.getElementById('livehd').textContent = `${tag(cur)} · ` + (D.live && D.live.n === cur
+    ? `${T('ph_' + D.live.phase)} · ${z ? '第' : 'step'} ${last ? last[1] : 0}${z ? ' 步' : ''} · ${z ? '已训' : 'trained'} ${dur(D.live.t || 0)}`
+    : (z ? '本轮训练已结束' : 'training finished for this round'));
+  const line = (rows, i, name, color, extra = {}) => ({ name, color, pts: rows.map(s => [s[1], s[i], tag(s[0]) + ' #' + s[1]]), ...extra });
+  const sm = (rows, i, name, color) => UI.smooth
+    ? [line(rows, i, 'raw', color, { opacity: .25, width: 1, noLegend: true }), { name, color, pts: ema(line(rows, i, name, color).pts, UI.smooth) }]
+    : [line(rows, i, name, color, { width: 1.2 })];
+  const pv = (i) => P.length ? [{ ...line(P, i, `${T('prev_round')} ${tag(prev)}`, 'var(--drop)'), pts: ema(line(P, i, '', '').pts, UI.smooth) }] : [];
+  const sub = z ? '每步 · 横轴 = 本轮步号' : 'per step · x = step in this round';
+  chart(host, { title: 'live/kl_loss', sub, lowerBetter: true, timeX: false, series: [...pv(2), ...sm(C, 2, tag(cur), 'var(--s1)')] });
+  chart(host, { title: 'live/grad_norm', sub, lowerBetter: true, timeX: false, series: [...pv(3), ...sm(C, 3, tag(cur), 'var(--s2)')] });
+  const dt = rows => rows.slice(1).map((s, k) => [s[0], s[1], 0, 0, s[4] - rows[k][4]]).filter(s => s[4] > 0 && s[4] < 600);   // 相邻两行墙上时间差; 跨评估段的大间隔(>10 分钟)不算
+  chart(host, { title: 'live/sec_per_step', sub: z ? '每步墙上耗时（秒）' : 'wall-clock seconds per step', lowerBetter: true, timeX: false,
+                series: [...(P.length ? [line(dt(P), 4, `${T('prev_round')} ${tag(prev)}`, 'var(--drop)')] : []), line(dt(C), 4, tag(cur), 'var(--s4)', { width: 1.2 })] });
+}
+
+function renderMetrics(g) {
+  const host = document.getElementById('metricgrid'); host.innerHTML = '';
+  const xf = xfmt();
+  // 逐步曲线: x = 全局步号(轮次拼接)或墙上时间
+  let gs = 0, prevN = null; const S = D.steps.map(s => { if (s[0] !== prevN) { prevN = s[0]; } gs++; return { g: gs, n: s[0], step: s[1], loss: s[2], gn: s[3], t: s[4] }; });
+  const sx = s => UI.x === 'time' ? s.t : s.g, sxf = UI.x === 'time' ? xf : (v => String(v));
+  const raw = S.map(s => [sx(s), s.loss, `vl${String(s.n).padStart(3, '0')} #${s.step}`]), rawg = S.map(s => [sx(s), s.gn, `vl${String(s.n).padStart(3, '0')} #${s.step}`]);
+  const stepSub = lang === 'zh' ? (UI.x === 'time' ? '每步（墙上时间）' : '每步（各轮首尾相接的全局步号）') : (UI.x === 'time' ? 'per step (wall clock)' : 'per step (global step, rounds concatenated)');
+  chart(host, { title: 'train/kl_loss', sub: stepSub, lowerBetter: true, timeX: UI.x === 'time', xfmt: sxf, series: [{ name: 'raw', color: 'var(--s1)', pts: raw, opacity: UI.smooth ? .25 : 1, width: 1, noLegend: !!UI.smooth }, ...(UI.smooth ? [{ name: 'ema', color: 'var(--s1)', pts: ema(raw, UI.smooth) }] : [])] });
+  chart(host, { title: 'train/grad_norm', sub: stepSub, lowerBetter: true, timeX: UI.x === 'time', xfmt: sxf, series: [{ name: 'raw', color: 'var(--s2)', pts: rawg, opacity: UI.smooth ? .25 : 1, width: 1, noLegend: !!UI.smooth }, ...(UI.smooth ? [{ name: 'ema', color: 'var(--s2)', pts: ema(rawg, UI.smooth) }] : [])] });
+  const pair = (k0, k1, n0, n1) => [
+    { name: n0, color: 'var(--ink3)', dots: true, line: false, pts: D.rounds.filter(r => nz(r[k0]) && (UI.x !== 'time' || r.end || r.train_end)).map(r => [UI.x === 'time' ? (r.end || r.train_end) : r.n, r[k0], r.tag]) },
+    { name: n1, color: 'var(--s1)', dots: true, line: false, pts: D.rounds.filter(r => nz(r[k1]) && (UI.x !== 'time' || r.end || r.train_end)).map(r => [UI.x === 'time' ? (r.end || r.train_end) : r.n, r[k1], r.tag]) }];
+  const z = lang === 'zh';
+  chart(host, { title: 'judge/same_top_%', sub: z ? '判决份（代码，长文本）' : 'judge set (code, long)', series: [roundSeries('same', 'Same top', 'var(--s3)'), bestSeries(g, 'same')], refs: cmpRefs('top1_long'), xfmt: xf });
+  chart(host, { title: 'judge/mean_kld', sub: z ? '判决份（代码，长文本）' : 'judge set (code, long)', lowerBetter: true, series: [roundSeries('kld', 'KLD', 'var(--s3)'), bestSeries(g, 'kld')], refs: cmpRefs('kl_long'), xfmt: xf });
+  chart(host, { title: 'wt2/same_top_%', sub: z ? 'WikiText-2 512 位（短文本，只报数不当门）' : 'WikiText-2, 512 tokens (short; reported, not gated)', series: [roundSeries('wsame', 'wt2 Same', 'var(--s3)'), bestSeries(g, 'wsame')], refs: cmpRefs('top1_short'), xfmt: xf });
+  chart(host, { title: 'wt2/mean_kld', sub: z ? 'WikiText-2 512 位' : 'WikiText-2, 512 tokens', lowerBetter: true, series: [roundSeries('wkld', 'wt2 KLD', 'var(--s3)'), bestSeries(g, 'wkld')], refs: cmpRefs('kl_short'), xfmt: xf });
+  chart(host, { title: 'holdout/think_kl', sub: z ? '思考留出（永不进料）：第 0 步 vs 轮末' : 'think holdout (never trained on): step 0 vs round end', lowerBetter: true, series: pair('eval0', 'eval1', z ? '第 0 步' : 'step 0', z ? '轮末' : 'end'), xfmt: xf });
+  chart(host, { title: 'holdout/general_kl', sub: z ? '泛化留出（换了形式的题）' : 'generalization holdout (reworded items)', lowerBetter: true, series: pair('gen0', 'gen1', z ? '第 0 步' : 'step 0', z ? '轮末' : 'end'), xfmt: xf });
+  chart(host, { title: 'holdout/decision_kl', sub: z ? '决策位：目标是 EOS / </think> 的位置' : 'decision positions: target is EOS / </think>', lowerBetter: true, series: pair('dec0', 'dec1', z ? '第 0 步' : 'step 0', z ? '轮末' : 'end'), xfmt: xf });
+  const rx = r => UI.x === 'time' ? r.end : r.n;
+  chart(host, { title: 'timing/round_min', sub: z ? '停模型窗口 / 其中训练段（分钟）' : 'model-down window / of which training (min)', lowerBetter: true, xfmt: xf, series: [
+    { name: z ? '整轮' : 'round', color: 'var(--s2)', dots: true, pts: D.rounds.filter(r => r.start && r.end && r.end > r.start).map(r => [rx(r), (r.end - r.start) / 60, r.tag]) },
+    { name: z ? '训练' : 'train', color: 'var(--s1)', dots: true, pts: D.rounds.filter(r => nz(r.secs) && (UI.x !== 'time' || r.end)).map(r => [rx(r), r.secs / 60, r.tag]) }] });
+  let cum = 0; const cpts = D.rounds.filter(r => UI.x !== 'time' || r.end).map(r => { cum += r.cny || 0; return [rx(r), cum, r.tag]; });
+  chart(host, { title: 'cost/api_cny', sub: z ? '官方 API 花费：每轮 / 累计（元）' : 'official API spend: per round / cumulative (CNY)', xfmt: xf, series: [
+    { name: z ? '每轮' : 'per round', color: 'var(--s2)', dots: true, line: false, pts: D.rounds.filter(r => r.cny && (UI.x !== 'time' || r.end)).map(r => [rx(r), r.cny, r.tag]) },
+    { name: z ? '累计' : 'cumulative', color: 'var(--s1)', pts: cpts }] });
+  chart(host, { title: 'perf/trained_positions', sub: z ? '每轮训练过的位数（含提示）' : 'positions trained per round (incl. prompts)', xfmt: xf, series: [
+    { name: z ? '位数' : 'positions', color: 'var(--s4)', dots: true, pts: D.rounds.filter(r => nz(r.rows) && (UI.x !== 'time' || r.end)).map(r => [rx(r), r.rows, r.tag]) }] });
+  chart(host, { title: 'data/official_items', sub: z ? '官方出题 / 可用答案 / 裸续写代码篇数' : 'official questions / usable answers / raw code docs', xfmt: xf, series: [
+    { name: z ? '题' : 'questions', color: 'var(--ink3)', dots: true, line: false, pts: D.rounds.filter(r => r.q && (UI.x !== 'time' || r.end)).map(r => [rx(r), r.q, r.tag]) },
+    { name: z ? '可用' : 'usable', color: 'var(--s3)', dots: true, line: false, pts: D.rounds.filter(r => r.ok && (UI.x !== 'time' || r.end)).map(r => [rx(r), r.ok, r.tag]) },
+    { name: z ? '代码篇' : 'code docs', color: 'var(--s2)', dots: true, line: false, pts: D.rounds.filter(r => r.docs && (UI.x !== 'time' || r.end)).map(r => [rx(r), r.docs, r.tag]) }] });
+}
+
+function renderFeed() {
+  const ev = [], f5 = v => nz(v) ? (+v).toFixed(4) : '—';
+  for (const r of D.rounds) {
+    if (r.start) ev.push([r.start, r.from ? T('ev_start', { n: r.n, f: r.from }) : T('ev_start0', { n: r.n }), r.tag]);
+    if (r.q) ev.push([r.start ? r.start - 1 : (r.end || 0) - 3600, T('ev_data', { q: r.q, ok: r.ok, d: r.docs }), r.tag]);
+    if (r.train_end && r.steps && nz(r.eval1)) ev.push([r.train_end, T('ev_train', { s: r.steps, a: f5(r.eval0), b: f5(r.eval1), c: f5(r.dec0), d: f5(r.dec1) }), r.tag]);
+    if (r.end && r.verdict) ev.push([r.end, T('ev_judge', { v: T('v')[r.verdict] || r.verdict, s: fx(r.same, 2), k: fx(r.kld, 5) }), r.tag]);
+  }
+  if (D.live) for (const s of D.steps.filter(s => s[0] === D.live.n && (s[1] % 10 === 0 || s === D.steps[D.steps.length - 1])))
+    ev.push([s[4], T('ev_step', { n: s[0], s: s[1], l: fmtV(s[2]), g: fmtV(s[3]) }), 'vl' + String(s[0]).padStart(3, '0')]);
+  ev.sort((a, b) => b[0] - a[0]);
+  document.getElementById('feed').innerHTML = ev.slice(0, 80).map(e => `<div><time>${bj(e[0])}</time><span>${esc(e[1])}<span class="tag">${esc(e[2])}</span></span></div>`).join('');
+}
+
+function renderAbout() {
+  const z = lang === 'zh';
+  const html = z ? `
+<h2>这是什么</h2>
+<p>DS4 是给 DeepSeek V4.1 Flash（官方原件 510 GB）做的 1 位量化：113.6 GB，一台 128 GB 的机器（NVIDIA DGX Spark / GB10）就能跑整个模型。量化会让模型的输出分布偏离原件，这页直播的是把它<b>拉回原件</b>的自学习循环。</p>
+<h2>每一轮做什么（≤ 1 小时）</h2>
+<ol>
+<li><b>出料</b>：官方 DeepSeek API 出 6 类全新题目（编程、数学、数据、写作、插画、通用），先过泄题检查（和 Unsloth 九项基准题比对，撞了就整题丢），再由官方作答并带回每一位的前 20 个候选概率；另让官方写 10 种语言的源码续写。</li>
+<li><b>FP 锚</b>：把本轮代码拿去跑原件的参考前向，得到“原件在每一位上的完整分布”——这就是老师。</li>
+<li><b>训练</b>：停下线上模型，在量化模型旁边叠一份低秩修正（“③”，约 100 MB），让它在这些料上的输出分布向老师靠拢。</li>
+<li><b>判决</b>：四把尺重新量一遍，过门才“接力”成为新的当前最好；没过就丢掉，下轮还从原来的地方起。</li>
+</ol>
+<h2>指标怎么读</h2>
+<ul>
+<li><b>Same top</b>：同一段文字，量化模型和原件在每一位上“最可能的下一个 token”一样的比例。越高越好，100% = 和原件一字不差。这是这轮循环的主目标（往 90% 推）。</li>
+<li><b>KLD</b>：两个概率分布差多远（KL 散度）的平均。越低越好，0 = 完全一样。</li>
+<li><b>Σmin</b>：每一位两个分布重叠的部分（Σ min(p, q)）的平均，1 = 完全重叠。</li>
+<li><b>judge</b> = 30 种语言、15,360 位从没训练过的代码；<b>wt2</b> = WikiText-2 的 512 位英文百科文本，只报数不当门（防止修代码把通用能力修坏）。</li>
+<li><b>思考留出 / 泛化留出 / 决策位</b>：训练器每轮开始和结束各量一次的留出题。轮末比开始还高 = 在背料，这轮直接丢。</li>
+</ul>
+<h2>花费怎么算</h2>
+<p>只算官方 API 的钱：每次调用返回的 token 数（缓存命中 / 未命中 / 输出）× DeepSeek 官方价（deepseek-flash：高峰 0.04 / 2 / 8 元每百万 token，空闲减半；高峰 = 北京时间工作日 9–12 点、14–18 点，法定节假日没扣）。11-04 之前的出题调用没记 token，不在账里。训练、FP 锚、判决都在本机跑，不花钱，报的是机时。</p>
+<h2>数据从哪来</h2>
+<p>页面每 5 秒读一次训练脚本自己写的账本和训练日志，不另造数。任何一项读不到就显示“—”。</p>` : `
+<h2>What this is</h2>
+<p>DS4 is a 1-bit quantization of DeepSeek V4.1 Flash (510 GB original): 113.6 GB, small enough to run the whole model on one 128 GB machine (NVIDIA DGX Spark / GB10). Quantization pulls the model’s output distribution away from the original; this page streams the self-learning loop that <b>pulls it back</b>.</p>
+<h2>What one round does (≤ 1 hour)</h2>
+<ol>
+<li><b>Data</b>: the official DeepSeek API writes brand-new questions in 6 families (code, math, data, writing, illustration, general). Each passes a leak check against the Unsloth benchmark items (a hit drops the item), then the API answers them and returns the top-20 candidate probabilities for every token. It also writes raw source-code continuations in 10 languages.</li>
+<li><b>FP anchor</b>: this round’s code goes through a reference forward of the original model, giving the original’s full distribution at every position — the teacher.</li>
+<li><b>Train</b>: the live model is stopped, and a low-rank correction (“③”, ~100 MB) next to the quantized model is trained so its output distribution moves toward the teacher.</li>
+<li><b>Judge</b>: four rulers re-measure. Passing the gate “relays” it into the new best; otherwise it is discarded and the next round starts from the same place.</li>
+</ol>
+<h2>Reading the metrics</h2>
+<ul>
+<li><b>Same top</b>: on the same text, the share of positions where the quantized model and the original agree on the most likely next token. Higher is better; 100% = identical to the original. This loop’s main target (pushing toward 90%).</li>
+<li><b>KLD</b>: average KL divergence between the two distributions. Lower is better; 0 = identical.</li>
+<li><b>Σmin</b>: average overlap of the two distributions per position (Σ min(p, q)); 1 = full overlap.</li>
+<li><b>judge</b> = 15,360 never-trained code tokens across 30 languages; <b>wt2</b> = 512 tokens of WikiText-2 English encyclopedia text, reported but not gated (it guards against fixing code by breaking general ability).</li>
+<li><b>think / generalization holdout, decision positions</b>: held-out items the trainer measures at the start and end of each round. Ending higher than it started = memorizing; that round is discarded.</li>
+</ul>
+<h2>How cost is computed</h2>
+<p>Official API spend only: tokens returned by each call (cache hit / miss / output) × DeepSeek’s list price (deepseek-flash: peak 0.04 / 2 / 8 CNY per million tokens, half off-peak; peak = Beijing weekdays 9–12 and 14–18, public holidays not deducted). Question-writing calls before 11-04 did not record tokens and are not included. Training, FP anchors and judging run locally and cost no money; they are reported as machine time.</p>
+<h2>Where the data comes from</h2>
+<p>Every 5 seconds the page reads the ledger and training logs the training script writes itself; nothing is synthesized. Anything that can’t be read shows “—”.</p>`;
+  // 一个 <h2> 一张卡片, 跟其他 tab 同一套 .card 外观; 正文仍按 h2 分段写, 改文字不用碰卡片结构
+  document.getElementById('about').innerHTML = html.split('<h2>').slice(1).map(p => {
+    const i = p.indexOf('</h2>');
+    return `<div class="card"><h3>${p.slice(0, i)}</h3><div class="abody">${p.slice(i + 5)}</div></div>`;
+  }).join('');
+}
+
+function applyI18n() {
+  document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';
+  document.title = T('hero');
+  document.querySelectorAll('[data-i]').forEach(e => { e.textContent = T(e.dataset.i); });
+  document.getElementById('langbtn').textContent = lang === 'zh' ? 'EN' : '中文';
+  document.getElementById('smoothv').textContent = UI.smooth ? UI.smooth.toFixed(2) : 'off';
+}
+
+function render() {
+  if (!D) return;
+  document.getElementById('warm').classList.add('hide');
+  for (const t of ['overview', 'metrics', 'about', 'notices']) document.getElementById('tab-' + t).classList.toggle('hide', UI.tab !== t);
+  document.querySelectorAll('nav a').forEach(a => a.classList.toggle('on', a.dataset.tab === UI.tab));
+  const g = derive();
+  renderRun(g);
+  if (UI.tab === 'overview') { renderLive(); renderCmp(g); renderBench(g); renderFeed(); }
+  else if (UI.tab === 'metrics') renderMetrics(g);
+  else if (UI.tab === 'notices') renderNotices();
+  else renderAbout();
+  clocks();
+}
+
+/* ---------- 交互 ---------- */
+function setTab() { const h = location.hash.slice(1); UI.tab = ['overview', 'metrics', 'about', 'notices'].includes(h) ? h : 'overview'; render(); }
+window.addEventListener('hashchange', setTab);
+document.getElementById('langbtn').onclick = () => { lang = lang === 'zh' ? 'en' : 'zh'; try { localStorage.setItem('rl_lang', lang); } catch (e) {} applyI18n(); render(); conn(); };
+document.getElementById('themebtn').onclick = () => {
+  const cur = document.documentElement.dataset.theme || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+  const nx = cur === 'dark' ? 'light' : 'dark'; document.documentElement.dataset.theme = nx; try { localStorage.setItem('rl_theme', nx); } catch (e) {}
+};
+try { const th = localStorage.getItem('rl_theme'); if (th) document.documentElement.dataset.theme = th; } catch (e) {}
+for (const [id, key] of [['xseg', 'x'], ['yseg', 'y']]) document.getElementById(id).addEventListener('click', ev => {
+  const b = ev.target.closest('button'); if (!b) return;
+  UI[key] = b.dataset[key]; document.querySelectorAll(`#${id} button`).forEach(x => x.classList.toggle('on', x === b)); render();
+});
+document.getElementById('smooth').addEventListener('input', ev => { UI.smooth = +ev.target.value; applyI18n(); render(); });
+
+applyI18n(); setTab(); conn();
+setInterval(clocks, 1000);
+loadCmp(); poll();
+</script>
+</body>
+</html>
