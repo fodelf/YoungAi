@@ -9,6 +9,8 @@ bool pt_frozen_vq_load(const pt_cfg *c) {
         fprintf(stderr, "ds4: [ptrain] 固定索引补丁续训要求 teacher=fp: 且 sample_n=0；在线教师会切换插件状态，当前不支持\n");
         return false;
     }
+    /* 补丁在插件缓存之外切换；清掉旧缓存，随后探针才会按自己的目录重装。训练张量已独占，不受影响。 */
+    v41_amp_cache_drop();
     const int n = v41_vqpatch_load(c->vq_init);
     if (n <= 0) fprintf(stderr, "ds4: [ptrain] 固定补丁 %s 未加载到有效层，停止\n", c->vq_init);
     return n > 0;
