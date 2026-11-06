@@ -5,8 +5,8 @@
 
 bool pt_frozen_vq_load(const pt_cfg *c) {
     if (c->vq_nl || !c->vq_init[0]) return true;
-    if (!c->teacher_fp[0]) {
-        fprintf(stderr, "ds4: [ptrain] 固定索引补丁续训要求 teacher=fp:，避免缓存部署态教师时用错底座\n");
+    if (!c->teacher_fp[0] || c->sample_n) {
+        fprintf(stderr, "ds4: [ptrain] 固定索引补丁续训要求 teacher=fp: 且 sample_n=0；在线教师会切换插件状态，当前不支持\n");
         return false;
     }
     const int n = v41_vqpatch_load(c->vq_init);
