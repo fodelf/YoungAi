@@ -1,4 +1,4 @@
-/* diag=2：先量重复运行的波动，再判断两组低秩因子是否值得分别设学习率。
+/* diag=2：重复短训固定 TF32；只用 FP32 量因子贡献，避免低精度分解误差掩盖读数。
  * diag=3 只做一步数值核验：固定默认 TF32 前向/反传，同一更新额外用 FP32 分解，不跑评分集。
  * 每臂恢复同一份 GPU 权重快照并清空 Adam；只选每篇开头一个完整短段，
  * 因而不能把这里的结果说成长上下文成绩。独立留出只评分，不反传。
@@ -153,7 +153,7 @@ bool pt_optcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
         !(c->lr > 0) || !isfinite(c->lr) || c->lr_b < 0 || !isfinite(c->lr_b)) {
         fprintf(stderr, "[optcheck] 要 init、独立 eval、max_steps=1..32、batch<=8；不混用 eval_kl/data_eval\n"); return false;
     }
-    if (c->diag == 3) ds4_gpu_set_quality(false);
+    ds4_gpu_set_quality(false);
     oc_sample tr[OC_DOCS] = {0}, ev[OC_DOCS] = {0}; uint32_t nt = 0, ne = 0;
     for (uint32_t i = 0; i < d->ns; i++) {
         const pt_sample *s = &d->s[i];
@@ -190,6 +190,7 @@ bool pt_optcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
         for (uint32_t j = 0; j < nq; j++) { q[j].base = xmalloc((size_t)q[j].s->m * 4); q[j].first = xmalloc((size_t)q[j].s->m * 4); }
     }
     fprintf(stderr, "[optcheck] train_docs=%u eval_docs=%u steps=%u lrA=%.9g lrB=%.9g；每篇只取开头一段\n", nt, ne, c->max_steps, c->lr, c->lr_b > 0 ? c->lr_b : c->lr);
+    fprintf(stderr, "[optcheck] 训练/评分固定 TF32；贡献测量 %s；恒等式阈值仍为 1%%\n", c->diag == 3 ? "TF32 与 FP32" : "FP32");
     if (ok) ok = oc_score_check(e, c, r, tr[0].s);
     if (ok && c->diag != 3) ok = oc_eval(e, c, r, tr, nt, "base", "train", 0, f, rows) && oc_eval(e, c, r, ev, ne, "base", "eval", 0, f, rows);
     for (unsigned arm = 1; ok && arm <= 2; arm++) {
@@ -214,7 +215,9 @@ bool pt_optcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
             if (ok) ok = pt_opt_step(c, r, step, &gn, &clipped);
             fprintf(stderr, "[optcheck] arm=%u step=%u loss=%.9f gnorm=%.9g clip=%d mem=%ld\n", arm, step, n ? loss / n : 0, gn, clipped, pt_mem_mb());
             if (ok && step == 1) {
+                if (c->diag == 2) ds4_gpu_set_quality(true);
                 const int result = oc_contrib(c, r, a, b, tr[0].s->sn, arm, comp);
+                ds4_gpu_set_quality(false); /* 仅测量用 FP32，不能改变下一步训练或评分。 */
                 if (result < 0) ok = false;
                 if (result <= 0) contribution_ok = false; /* 恒等式未过仍完成独立的 A/A 指标，不通过双学习率准入。 */
                 if (ok && precise) {
