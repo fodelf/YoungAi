@@ -112,7 +112,7 @@ bool pt_cfg_load(pt_cfg *c, const char *path) {
             }
         }
         else if (!strcmp(k, "lr")) c->lr = (float)atof(v); else if (!strcmp(k, "lr_b")) c->lr_b = (float)atof(v);
-        else if (!strcmp(k, "clip")) c->clip = (float)atof(v);
+        else if (!strcmp(k, "clip")) c->clip = (float)atof(v); else if (!strcmp(k, "rankprob")) c->rankprob = (float)atof(v);
         else if (!strcmp(k, "init_std")) c->init_std = (float)atof(v);
         else { fprintf(stderr, "ds4: --ptrain 不认识的配置项 %s\n", k); free(b); return false; }
     }
@@ -126,7 +126,7 @@ bool pt_cfg_load(pt_cfg *c, const char *path) {
     if (!c->rank || c->topk < 1 || c->topk > 128 || !c->batch || c->maxlen < 16) { fprintf(stderr, "ds4: --ptrain rank/topk(1..128)/batch/maxlen 不合法\n"); return false; }
     if (c->ctxlen && c->ctxlen < c->maxlen) { fprintf(stderr, "ds4: --ptrain ctxlen %u 小于 maxlen %u(ctxlen 是样本上限, 尾窗 = maxlen)\n", c->ctxlen, c->maxlen); return false; }
     if (c->teacher_fp[0] && c->sample_n) { fprintf(stderr, "ds4: --ptrain teacher=fp: 与 sample_n 不能同开: 步 2 的教师是部署态自己当场打分, 两种教师不能混一趟\n"); return false; }
-    return true;
+    return pt_loss_config(c);
 }
 
 /* 块: 同一份材料一块(名字 = 材料的 FNV, 教师前缀只预填一次); 保持料共一块(hold); 不带材料的普通题共一块(sft); 原文段共一块(text) */

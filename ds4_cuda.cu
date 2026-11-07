@@ -129,3 +129,5 @@ static void v41_pdl_register_small(void) {
     };
     for (size_t i = 0; i < sizeof fns / sizeof fns[0]; i++) v41_pdl_register(fns[i]);
 }
+
+#include "src/cuda/cuda_bwd_rankprob.inc.cu" /* 独立训练损失分支，关闭时直接走原 KL。 */

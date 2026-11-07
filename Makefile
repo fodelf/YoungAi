@@ -577,3 +577,10 @@ clean:
 e0: e0-pingpong
 e0-pingpong: tools/e0_pingpong.c
 	$(CC) $(CFLAGS) -o $@ tools/e0_pingpong.c -lm
+
+# 不加载模型的损失梯度门；与训练器链接同一套 CUDA 对象。
+ds4_cuda.o src/core/core_ptrain_rankprob.o: ds4_gpu_rankprob.h
+tests/cuda_rankprob_selftest.o: tests/cuda_rankprob_selftest.c ds4_gpu_rankprob.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+tests/cuda_rankprob_selftest: tests/cuda_rankprob_selftest.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)

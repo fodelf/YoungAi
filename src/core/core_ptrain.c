@@ -110,7 +110,9 @@ bool pt_eval(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d, int wh
     uint32_t k = 0, nt = 0;
     for (uint32_t i = 0; i < d->ns && k < cap_n; i++) if (pt_in_eval(d, &d->s[i], which, hold)) ss[k++] = &d->s[i];
     double ls = 0.0;
+    pt_loss_mode(c, false);   /* 评估关掉所有排序项，保留纯 KL 口径。 */
     const bool ok = pt_run_list(e, c, r, ss, k, 0, &ls, &nt, li, ni, di);   /* 合批装包; li/ni/di 仍按入选顺序逐题记 */
+    pt_loss_mode(c, true);
     free(ss);
     *kl = nt ? ls / nt : 0.0;
     return ok;
@@ -273,6 +275,8 @@ int ds4_engine_ptrain(ds4_engine *e, const char *spec) {
     if (!pt_run_alloc(e, &c, &r)) { pt_data_free(&d); return 1; }
     if (!pt_frozen_vq_load(&c)) { pt_run_free(&r); pt_data_free(&d); return 1; }
     r.dec_ids[0] = ds4_token_eos(e); r.dec_ids[1] = ds4_token_think_end(e);   /* 决策位 = 答案里的 EOS / </think>(pt_loss_rows 在 dec_on 期间单独累计) */
+    if (!pt_loss_mode(&c, true)) { fprintf(stderr, "ds4: [ptrain] 这个后端不支持所选排序项\n"); pt_run_free(&r); pt_data_free(&d); return 1; }
+    if (c.rankprob > 0.f) fprintf(stderr, "ds4: [ptrain] 概率排序开: λ %.3g，T=1，仅教师严格偏好且学生榜首错排\n", (double)c.rankprob);
     fprintf(stderr, "ds4: [ptrain] 梯度归一: loss_norm=%s\n", c.token_mean ? "token(本批有效目标等权)" : "sample(各段等权)");
     fprintf(stderr, "ds4: [ptrain] 训练缓冲分配后可用内存 %ld MB\n", pt_mem_mb());
     uint32_t *ord = xmalloc((size_t)d.ns * 4), ntr = 0, nev = 0, nevg = 0;

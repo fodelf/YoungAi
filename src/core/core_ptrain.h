@@ -40,6 +40,7 @@ typedef struct {
     uint32_t layer_lo, layer_hi;   /* 训练哪几层的放大器(含两端); 只训末层时出口反传是闭式的, 不用穿注意力 */
     uint32_t rank, topk, epochs, batch, maxlen, probe_n, probe_tok, seed;
     uint32_t token_mean;           /* loss_norm=token: 一次参数更新内每个有效目标等权；sample(缺省)保留各段等权。只改训练缩放，产物格式不变。 */
+    float rankprob;                /* 0 关闭；>0 加概率排序，不能同时开原margin或V步；评估仍是纯KL。 */
     uint32_t budget_s;             /* budget_s=N(11-02, 缺省 0 = 不限): 训练墙上时间预算(秒, 从第一步起算, 不含装载/第 0 步评估)。到了就把当前批当本轮最后一批:
                                     * 照常轮末评估 + 落 ckpt, 然后不再开下一轮。为什么是硬闸不是算料: 用户定"本地一轮 ≤ 1 小时", 料长/步速的账总有漂移(ent04 账 ~100 分钟/轮实跑 62),
                                     * 闸在训练器里才保证超时不是靠人盯。与 max_steps 不同: max_steps 是计时模式(不评估不存盘), 这里产物照样能挂 */
@@ -245,6 +246,9 @@ bool pt_onpolicy(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d, co
 bool pt_diag(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d);   /* diag=1: 逐位诊断, core_ptrain_diag.c(会把 ③ 的 A 置零, 跑完只能退出) */
 bool pt_optcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d); /* diag=2 重复短对照；3 再用 FP32 核验同一输出分解；只写指标。 */
 bool pt_actcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_sample *s, uint32_t layer, uint32_t row, unsigned arm); /* 固定权重，只扰动激活。 */
+bool pt_loss_mode(const pt_cfg *c, bool training);
+bool pt_loss_config(const pt_cfg *c);
+bool pt_loss_kl(const pt_cfg *c, pt_run *r, ds4_gpu_tensor *g, ds4_gpu_tensor *logits, uint32_t row, uint32_t m, float scale);
 
 /* core_ptrain_layer.c: 多层模式。alloc 分逐层缓冲与前向存档(层入口 hc/pre_mix/组号, engram 层另存门输入); bwd 从 r->ghc/r->gpre
  * (末层输出处的梯度)起, 第 hi 层到第 lo 层逐层"重算本层 → 倒推梯度", 放大器梯度累加进 gA/gB。训练段必须到末层(hi = 最后一层):

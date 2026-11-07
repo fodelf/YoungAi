@@ -56,7 +56,7 @@ static bool oc_eval(ds4_engine *e, const pt_cfg *c, pt_run *r, oc_sample *q, uin
                     const char *stage, const char *split, int mode, FILE *f, FILE *rows) {
     uint64_t total = 0, hit = 0, repaired = 0, broken = 0, peer = 0;
     double sum = 0;
-    if (!ds4_gpu_bwd_kl_margin(0.f, c->margin_p1, c->margin_gap)) return false;
+    if (!pt_loss_mode(c, false)) return false;
     for (uint32_t k = 0; k < nq; k++) {
         const pt_sample *s = q[k].s;
         int32_t *id = xmalloc((size_t)s->m * 4);
@@ -84,18 +84,18 @@ static bool oc_eval(ds4_engine *e, const pt_cfg *c, pt_run *r, oc_sample *q, uin
     fprintf(stderr, "[optcheck] %s %s n=%llu same=%llu (%.6f%%) fixed=%llu broken=%llu KL=%.9f peer_flips=%llu\n",
             stage, split, (unsigned long long)total, (unsigned long long)hit, total ? 100.0 * hit / total : 0,
             (unsigned long long)repaired, (unsigned long long)broken, total ? sum / total : 0, (unsigned long long)peer);
-    return ds4_gpu_bwd_kl_margin(c->margin, c->margin_p1, c->margin_gap);
+    return pt_loss_mode(c, true);
 }
 
 static bool oc_score_check(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_sample *s) {
     int32_t *id = xmalloc((size_t)s->m * 4); double a = 0, b = 0; uint32_t na = 0, nb = 0;
-    bool ok = ds4_gpu_bwd_kl_margin(0.f, c->margin_p1, c->margin_gap) && oc_score(e, c, r, s, id, &a, &na);
+    bool ok = pt_loss_mode(c, false) && oc_score(e, c, r, s, id, &a, &na);
     r->cont_s = NULL;
     if (ok) ok = pt_step_sample(e, c, r, s, 0, &b, &nb);
     if (ok) ok = na == nb && na && fabs(a / na - b / nb) <= 1e-6;
     fprintf(stderr, "[optcheck] score_check diag_KL=%.12g native_KL=%.12g %s\n", na ? a / na : 0, nb ? b / nb : 0, ok ? "PASS" : "FAIL");
     free(id);
-    return ds4_gpu_bwd_kl_margin(c->margin, c->margin_p1, c->margin_gap) && ok;
+    return pt_loss_mode(c, true) && ok;
 }
 
 /* 保持训练的排序项和装包方式，只关闭反传；不选学习率，也不按评分集调参数。 */

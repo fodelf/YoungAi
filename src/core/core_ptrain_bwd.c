@@ -132,7 +132,7 @@ bool pt_loss_rows(const pt_cfg *c, pt_run *r, ds4_gpu_tensor *logits, uint32_t r
     bool ok = *glog && ds4_gpu_tensor_write(r->tid, 0, s->top_id + (size_t)off * TK, (uint64_t)m * TK * 4) &&
               ds4_gpu_tensor_write(r->tp, 0, s->top_p + (size_t)off * TK, (uint64_t)m * TK * 4) &&
               ds4_gpu_tensor_write(r->trest, 0, s->top_rest + off, (uint64_t)m * 4) &&
-              ds4_gpu_bwd_kl_topk_tensor(*glog, r->loss, logits, row, m, V, r->tid, r->tp, r->trest, NULL, TK, scale) &&
+              pt_loss_kl(c, r, *glog, logits, row, m, scale) &&
               ds4_gpu_tensor_read(r->loss, 0, r->loss_h, (uint64_t)m * 4);
     if (ok) { double l = 0; for (uint32_t k = 0; k < m; k++) l += r->loss_h[k]; *loss += l; *ntok += m; }
     if (ok && r->tail_on) for (uint32_t k = 0; k < m; k++) { r->tail_n++; r->tail_n1 += r->loss_h[k] > 1.f; r->tail_n2 += r->loss_h[k] > 2.f; }   /* 尾位计数(pt_run.tail_*) */
