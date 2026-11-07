@@ -2,7 +2,7 @@
  * 论文 B 对应这里 Aᵀ，论文 A 对应这里 B，缩放 s=1：
  * dB=(AAᵀ)^-1 gB；dA=(BBᵀ)^-1[gA-(gA Aᵀ)(AAᵀ)^-1 A]。
  * 不构造 E×E 矩阵；逆矩阵用 GPU Newton-Schulz，残差不过门直接失败，不能临时加 ridge。
- * 方向写入原 Adam 的 mA/mB 暂存；只有 diag=7 调用，正式训练仍走原 Adam。 */
+ * 方向写入原 Adam 的 mA/mB 暂存；diag=7/8调用，其他训练仍走原Adam。 */
 #include "core_ptrain.h"
 #ifndef DS4_NO_GPU
 
@@ -89,7 +89,7 @@ static bool pj_selftest(proj_work *w) {
 }
 
 bool pt_projected_gradient(const pt_cfg *c, pt_run *r, double *gnorm) {
-    if (c->rank != 64 || c->diag != 7) return false;
+    if (c->rank != 64 || (c->diag != 7 && c->diag != 8)) return false;
     bool ok = true; proj_work w = {0}; const uint64_t nf = (uint64_t)c->rank * DS4_N_EMBD;
     ds4_gpu_tensor **small[] = {&w.ha,&w.hb,&w.ia,&w.ib,&w.u,&w.v,&w.z,&w.id,&w.cross};
     ds4_gpu_tensor **large[] = {&w.scratch,&w.mid,&w.zero,&w.discard};
