@@ -246,6 +246,14 @@ bool pt_onpolicy(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d, co
 bool pt_diag(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d);   /* diag=1: 逐位诊断, core_ptrain_diag.c(会把 ③ 的 A 置零, 跑完只能退出) */
 bool pt_optcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d); /* diag=2 重复短对照；3 再用 FP32 核验同一输出分解；只写指标。 */
 bool pt_actcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_sample *s, uint32_t layer, uint32_t row, unsigned arm); /* 固定权重，只扰动激活。 */
+typedef struct pt_geometry pt_geometry; /* diag=6：等价因子坐标诊断，不保存权重。 */
+pt_geometry *pt_geometry_new(const pt_cfg *c, pt_run *r);
+void pt_geometry_free(pt_geometry *g);
+bool pt_geometry_basis(const pt_cfg *c, pt_run *r, pt_geometry *g, unsigned arm);
+bool pt_geometry_equivalence(const pt_cfg *c, pt_run *r, pt_geometry *g, unsigned arm);
+bool pt_geometry_before(const pt_cfg *c, pt_run *r, pt_geometry *g, uint32_t nrow, unsigned arm);
+bool pt_geometry_measure(const pt_cfg *c, pt_run *r, pt_geometry *g, unsigned arm, bool matched, double *norm);
+bool pt_geometry_rescale(const pt_cfg *c, pt_run *r, pt_geometry *g, double norm);
 bool pt_loss_mode(const pt_cfg *c, bool training);
 bool pt_loss_config(const pt_cfg *c);
 bool pt_loss_kl(const pt_cfg *c, pt_run *r, ds4_gpu_tensor *g, ds4_gpu_tensor *logits, uint32_t row, uint32_t m, float scale);

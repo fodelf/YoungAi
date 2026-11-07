@@ -2,6 +2,7 @@
  * diag=3 只做一步数值核验：固定默认 TF32 前向/反传，同一更新额外用 FP32 分解，不跑评分集。
  * diag=4 重建一步后的状态，在训练doc6的L15/序列行471检查激活方向；不改冻结权重。
  * diag=5 核对实际 Adam 更新前后的同批目标，确认激活局部失配是否真的导致跨步过大。
+ * diag=6：原写法重复两次，再测 Hadamard/倒数缩放；前向等价过闸才反传，单步且不存盘。
  * 每臂恢复同一份 GPU 权重快照并清空 Adam；只选每篇开头一个完整短段，
  * 因而不能把这里的结果说成长上下文成绩。独立留出只评分，不反传。
  * 所有矩阵计算复用生产 GPU 原语；退出时恢复快照，不保存 checkpoint。 */
@@ -107,6 +108,40 @@ static bool oc_objective(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_sam
     return isfinite(*mean);
 }
 
+/* 先排除有限精度让“等价参数”变成不同模型；失败的分支跳过，不能靠放宽阈值放行。 */
+static bool oc_basis_check(ds4_engine *e, const pt_cfg *c, pt_run *r, oc_sample *tr, uint32_t nt,
+                           unsigned arm, double original, bool *pass) {
+    uint64_t flips = 0, total = 0;
+    for (uint32_t k = 0; k < nt; k++) {
+        int32_t *id = xmalloc((size_t)tr[k].s->m * 4); double loss = 0; uint32_t n = 0;
+        bool ok = oc_score(e, c, r, tr[k].s, id, &loss, &n);
+        if (ok) for (uint32_t j = 0; j < n; j++) flips += id[j] != tr[k].base[j];
+        free(id); if (!ok) return false; total += n;
+    }
+    const pt_sample *ss[OC_DOCS];
+    for (uint32_t j = 0; j < c->batch; j++) ss[j] = tr[j].s;
+    const uint32_t expected = (uint32_t)pt_batch_loss_tokens(r, ss, c->batch);
+    double pre = 0, repeat = 0;
+    if (!oc_objective(e, c, r, ss, c->batch, expected, &pre) ||
+        !oc_objective(e, c, r, ss, c->batch, expected, &repeat)) return false;
+    *pass = !flips && fabs(pre - original) <= 1e-7 && fabs(pre - repeat) <= 1e-7;
+    fprintf(stderr, "[geometry] arm=%u pre_gate flips=%llu/%llu objective=%.12g original=%.12g difference=%.12g repeat=%.12g %s\n",
+            arm, (unsigned long long)flips, (unsigned long long)total, pre, original, fabs(pre - original), fabs(pre - repeat), *pass ? "PASS" : "SKIP");
+    return true;
+}
+
+static bool oc_frozen(const pt_cfg *c, pt_run *r, ds4_gpu_tensor **a, ds4_gpu_tensor **b) {
+    const size_t n = (size_t)r->k2 * DS4_N_EMBD * 4;
+    if (!n) return true;
+    unsigned char *x = xmalloc(n), *y = xmalloc(n); bool ok = true;
+    for (uint32_t l = c->layer_lo; ok && l <= c->layer_hi; l++) {
+        ds4_gpu_tensor *w[] = {r->st.ampA[l], r->st.ampB[l]}, *z[] = {a[l], b[l]};
+        for (unsigned k = 0; ok && k < 2; k++) ok = ds4_gpu_tensor_read(w[k], 0, x, n) &&
+            ds4_gpu_tensor_read(z[k], 0, y, n) && !memcmp(x, y, n);
+    }
+    free(x); free(y); fprintf(stderr, "[geometry] frozen_prefix %s\n", ok ? "PASS" : "FAIL"); return ok;
+}
+
 /* 固定一步更新前的真实层输入，拆解 Δy = xBΔA + xΔBA + xΔBΔA。
  * 这是局部输出贡献，不是端到端准确率的因果证明。冻结的前 k2 行差为零。 */
 static int oc_contrib(const pt_cfg *c, pt_run *r, ds4_gpu_tensor **a, ds4_gpu_tensor **b,
@@ -205,10 +240,23 @@ bool pt_optcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
     }
     fprintf(stderr, "[optcheck] train_docs=%u eval_docs=%u steps=%u lrA=%.9g lrB=%.9g；每篇只取开头一段\n", nt, ne, c->max_steps, c->lr, c->lr_b > 0 ? c->lr_b : c->lr);
     fprintf(stderr, "[optcheck] 训练/评分固定 TF32；贡献测量 %s；恒等式阈值仍为 1%%\n", c->diag == 3 ? "TF32 与 FP32" : "FP32");
+    pt_geometry *geo = c->diag == 6 ? pt_geometry_new(c, r) : NULL;
+    double original = 0, reference_norm = 0;
+    if (c->diag == 6 && !geo) ok = false;
     if (ok) ok = oc_score_check(e, c, r, tr[0].s);
     if (ok && c->diag != 3) ok = oc_eval(e, c, r, tr, nt, "base", "train", 0, f, rows) && oc_eval(e, c, r, ev, ne, "base", "eval", 0, f, rows);
-    for (unsigned arm = 1; ok && arm <= 2; arm++) {
+    if (ok && geo) {
+        const pt_sample *ss[OC_DOCS]; for (uint32_t j = 0; j < c->batch; j++) ss[j] = tr[j].s;
+        ok = oc_objective(e, c, r, ss, c->batch, (uint32_t)pt_batch_loss_tokens(r, ss, c->batch), &original);
+    }
+    for (unsigned arm = 1; ok && arm <= (geo ? 4u : 2u); arm++) {
         ok = oc_restore(c, r, a, b);
+        if (ok && geo) {
+            bool pass = false;
+            ok = pt_geometry_basis(c, r, geo, arm) && oc_frozen(c, r, a, b) && pt_geometry_equivalence(c, r, geo, arm) &&
+                 oc_basis_check(e, c, r, tr, nt, arm, original, &pass);
+            if (ok && !pass) { if (arm <= 2) ok = false; else continue; }
+        }
         char tag[24]; snprintf(tag, sizeof tag, "run%u_pre", arm);
         if (ok && c->diag != 3) ok = oc_eval(e, c, r, ev, ne, tag, "eval", 3, f, rows);
         for (uint32_t step = 1; ok && step <= (c->diag == 3 ? 1u : c->max_steps); step++) {
@@ -217,7 +265,7 @@ bool pt_optcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
             double loss = 0, gn = 0; uint32_t n = 0; int clipped = 0;
             r->cont_s = NULL;
             ok = pt_run_list(e, c, r, ss, c->batch, 1, &loss, &n, NULL, NULL, NULL);
-            if (ok && c->diag == 5) {
+            if (ok && (c->diag == 5 || geo)) {
                 double zero = 0;
                 ok = n && oc_objective(e, c, r, ss, c->batch, n, &zero) && fabs(zero - loss / n) <= 1e-7;
                 fprintf(stderr, "[stepcheck] arm=%u step=%u pre_repeat_error=%.12g %s\n", arm, step, n ? fabs(zero - loss / n) : -1., ok ? "PASS" : "FAIL");
@@ -231,9 +279,24 @@ bool pt_optcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
                 if (ok) ok = oc_score(e, c, r, tr[0].s, id, &v, &m);
                 free(id);
             }
+            if (ok && geo) ok = pt_geometry_before(c, r, geo, tr[0].s->sn, arm);
             if (ok) ok = pt_opt_step(c, r, step, &gn, &clipped);
             fprintf(stderr, "[optcheck] arm=%u step=%u loss=%.9f gnorm=%.9g clip=%d mem=%ld\n", arm, step, n ? loss / n : 0, gn, clipped, pt_mem_mb());
-            if (ok && step == 1) {
+            if (ok && geo) {
+                double norm = 0, matched = 0;
+                ok = pt_geometry_measure(c, r, geo, arm, false, &norm) && oc_frozen(c, r, a, b);
+                if (arm == 1) reference_norm = norm;
+                if (ok && arm > 2) {
+                    double raw_loss = 0;
+                    ok = oc_objective(e, c, r, ss, c->batch, n, &raw_loss) && pt_geometry_rescale(c, r, geo, norm) &&
+                         pt_geometry_measure(c, r, geo, arm, true, &matched) && oc_frozen(c, r, a, b);
+                    const bool match_ok = reference_norm > 0 && fabs(matched / reference_norm - 1) <= .01;
+                    if (!match_ok) contribution_ok = false;
+                    fprintf(stderr, "[geometry] arm=%u raw_post_loss=%.12g matched_norm_ratio=%.12g %s\n", arm, raw_loss,
+                            reference_norm > 0 ? matched / reference_norm : 0, match_ok ? "PASS" : "FAIL");
+                }
+            }
+            if (ok && step == 1 && !geo) {
                 if (c->diag != 3) ds4_gpu_set_quality(true);
                 const int result = oc_contrib(c, r, a, b, tr[0].s->sn, arm, comp);
                 ds4_gpu_set_quality(false); /* 仅测量用 FP32，不能改变下一步训练或评分。 */
@@ -250,7 +313,7 @@ bool pt_optcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
             if (step == 1 && c->layer_lo < c->layer_hi)
                 for (uint32_t l = c->layer_lo; l <= c->layer_hi; l++) oc_free(&r->save.moe_in[l]);
             if (ok && step == 1 && c->diag == 4) ok = pt_actcheck(e, c, r, tr[6].s, 15, 471, arm);
-            if (ok && c->diag == 5) {
+            if (ok && (c->diag == 5 || geo)) {
                 double post = 0, repeat = 0;
                 ok = oc_objective(e, c, r, ss, c->batch, n, &post) &&
                      oc_objective(e, c, r, ss, c->batch, n, &repeat) && fabs(post - repeat) <= 1e-7;
@@ -260,7 +323,7 @@ bool pt_optcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
             if (pt_mem_mb() >= 0 && pt_mem_mb() < 3000) { fprintf(stderr, "[optcheck] 内存低于 3000 MB，停止\n"); ok = false; }
         }
         snprintf(tag, sizeof tag, "run%u_post", arm);
-        if (ok && c->diag != 3) ok = oc_eval(e, c, r, tr, nt, tag, "train", arm, f, rows) && oc_eval(e, c, r, ev, ne, tag, "eval", arm, f, rows);
+        if (ok && c->diag != 3) ok = oc_eval(e, c, r, tr, nt, tag, "train", arm == 1 ? 1 : 2, f, rows) && oc_eval(e, c, r, ev, ne, tag, "eval", arm == 1 ? 1 : 2, f, rows);
     }
     if (ok) ok = oc_restore(c, r, a, b);
     if (ok && c->diag != 3) ok = oc_eval(e, c, r, ev, ne, "restored", "eval", 3, f, rows);
@@ -271,6 +334,7 @@ bool pt_optcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
     }
     fclose(f); fclose(rows); fclose(comp);
     if (precise) fclose(precise);
+    pt_geometry_free(geo);
     fprintf(stderr, "[optcheck] %s；输出分解%s；没有保存 checkpoint\n", ok ? "重复对照完成" : "失败", ok && contribution_ok ? "通过" : "未过门");
     return ok && contribution_ok;
 }
