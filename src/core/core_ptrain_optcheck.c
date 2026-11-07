@@ -320,7 +320,8 @@ bool pt_optcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
     double original = 0, reference_norm = 0, full_dev_base = 0;
     if (c->diag >= 6 && !geo) ok = false;
     if (ok) ok = oc_score_check(e, c, r, tr[0].s);
-    if (ok && c->diag != 3) ok = oc_eval(e, c, r, tr, nt, "base", "train", 0, f, rows) && oc_eval(e, c, r, ev, ne, "base", "eval", 0, f, rows);
+    if (ok && c->diag != 3) ok = oc_eval(e, c, r, tr, nt, "base", "train", 0, f, rows) &&
+        (c->diag == 10 || oc_eval(e, c, r, ev, ne, "base", "eval", 0, f, rows));
     if (ok && c->diag_save) {
         ok = pt_eval(e, c, r, d, 2, d->ns, &full_dev_base, 0, NULL, NULL, NULL) && full_dev_base > 0 && isfinite(full_dev_base);
         fprintf(stderr, "[increment] full_dev_base_KL=%.12g %s\n", full_dev_base, ok ? "PASS" : "FAIL");
@@ -329,7 +330,7 @@ bool pt_optcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
         const pt_sample *ss[OC_DOCS]; for (uint32_t j = 0; j < c->batch; j++) ss[j] = tr[j].s;
         ok = oc_objective(e, c, r, ss, c->batch, (uint32_t)pt_batch_loss_tokens(r, ss, c->batch), &original);
     }
-    for (unsigned arm = 1; ok && arm <= (geo ? 4u : 2u); arm++) {
+    for (unsigned arm = c->diag == 10 ? 3u : 1u; ok && arm <= (c->diag == 10 ? 3u : geo ? 4u : 2u); arm++) {
         ok = oc_restore(c, r, a, b);
         if (ok && geo) {
             bool pass = false;
@@ -338,7 +339,7 @@ bool pt_optcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
             if (ok && !pass) { if (arm <= 2) ok = false; else continue; }
         }
         char tag[24]; snprintf(tag, sizeof tag, "run%u_pre", arm);
-        if (ok && c->diag != 3) ok = oc_eval(e, c, r, ev, ne, tag, "eval", 3, f, rows);
+        if (ok && c->diag != 3 && c->diag != 10) ok = oc_eval(e, c, r, ev, ne, tag, "eval", 3, f, rows);
         for (uint32_t step = 1; ok && step <= (c->diag == 3 ? 1u : c->max_steps); step++) {
             const pt_sample *ss[OC_DOCS];
             const uint32_t nss = c->diag >= 8 && arm > 2 ? 2u * c->batch : c->batch;
@@ -368,6 +369,10 @@ bool pt_optcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
                 double norm = 0, matched = 0;
                 ok = pt_geometry_measure(c, r, geo, arm, false, &norm) && oc_frozen(c, r, a, b);
                 reference_norm = pt_geometry_reference(geo);
+                if (ok && c->diag == 10) {
+                    ok = pt_stability(e, c, r, ss, nss, n, a, b) && oc_frozen(c, r, a, b);
+                    break;
+                }
                 if (ok && arm > 2) {
                     double raw_loss = 0;
                     ok = oc_objective(e, c, r, ss, nss, n, &raw_loss) && pt_geometry_rescale(c, r, geo, norm) &&
@@ -405,7 +410,7 @@ bool pt_optcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
             if (pt_mem_mb() >= 0 && pt_mem_mb() < 3000) { fprintf(stderr, "[optcheck] 内存低于 3000 MB，停止\n"); ok = false; }
         }
         snprintf(tag, sizeof tag, "run%u_post", arm);
-        if (ok && c->diag != 3) ok = oc_eval(e, c, r, tr, nt, tag, "train", arm == 1 ? 1 : 2, f, rows) && oc_eval(e, c, r, ev, ne, tag, "eval", arm == 1 ? 1 : 2, f, rows);
+        if (ok && c->diag != 3 && c->diag != 10) ok = oc_eval(e, c, r, tr, nt, tag, "train", arm == 1 ? 1 : 2, f, rows) && oc_eval(e, c, r, ev, ne, tag, "eval", arm == 1 ? 1 : 2, f, rows);
         if (ok && contribution_ok && c->diag_save == arm) {
             double full_dev = 0;
             ok = pt_eval(e, c, r, d, 2, d->ns, &full_dev, 0, NULL, NULL, NULL) && full_dev > 0 && isfinite(full_dev);
@@ -419,7 +424,7 @@ bool pt_optcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
         }
     }
     if (ok) ok = oc_restore(c, r, a, b);
-    if (ok && c->diag != 3) ok = oc_eval(e, c, r, ev, ne, "restored", "eval", 3, f, rows);
+    if (ok && c->diag != 3) ok = c->diag == 10 ? oc_eval(e,c,r,tr,nt,"restored","train",3,f,rows) : oc_eval(e, c, r, ev, ne, "restored", "eval", 3, f, rows);
     for (uint32_t l = c->layer_lo; l <= c->layer_hi; l++) { oc_free(&a[l]); oc_free(&b[l]); }
     for (unsigned group = 0; group < 2; group++) {
         oc_sample *q = group ? ev : tr; uint32_t nq = group ? ne : nt;
