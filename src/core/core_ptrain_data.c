@@ -88,6 +88,7 @@ bool pt_cfg_load(pt_cfg *c, const char *path) {
         else if (!strcmp(k, "contcheck")) c->contcheck = (uint32_t)atoi(v);
         else if (!strcmp(k, "diag")) c->diag = (uint32_t)atoi(v);
         else if (!strcmp(k, "diag_save")) c->diag_save = (uint32_t)atoi(v);
+        else if (!strcmp(k, "diag_radius")) c->diag_radius = (float)atof(v);
         else if (!strcmp(k, "max_steps")) c->max_steps = (uint32_t)atoi(v);
         else if (!strcmp(k, "epoch_tok")) c->epoch_tok = (uint32_t)atoi(v);
         else if (!strcmp(k, "packcheck")) c->packcheck = (uint32_t)atoi(v);

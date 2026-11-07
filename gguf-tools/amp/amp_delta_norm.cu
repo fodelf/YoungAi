@@ -14,27 +14,34 @@
 #define CU(call) do { cudaError_t audit_cuda_rc=(call); if(audit_cuda_rc!=cudaSuccess){fprintf(stderr,"CUDA line %d: %s\n",__LINE__,cudaGetErrorString(audit_cuda_rc));exit(2);} } while(0)
 #define BL(call) do { cublasStatus_t audit_blas_rc=(call); if(audit_blas_rc!=CUBLAS_STATUS_SUCCESS){fprintf(stderr,"cuBLAS line %d: status=%d\n",__LINE__,(int)audit_blas_rc);exit(2);} } while(0)
 
-__global__ static void make_uv(const float *a0, const float *b0, const float *a1, const float *b1,
-                               double *u, double *v, uint32_t n) {
+template <typename T> __global__ static void make_uv(const float *a0, const float *b0, const float *a1, const float *b1,
+                               T *u, T *v, uint32_t n) {
     const uint32_t i=blockIdx.x*blockDim.x+threadIdx.x;
-    if(i<n){u[i]=(double)b0[i];u[n+i]=(double)b1[i]-(double)b0[i];
-             v[i]=(double)a1[i]-(double)a0[i];v[n+i]=(double)a1[i];}
+    if(i<n){u[i]=(T)b0[i];u[n+i]=(T)b1[i]-(T)b0[i];
+             v[i]=(T)a1[i]-(T)a0[i];v[n+i]=(T)a1[i];}
 }
 
-static double delta2(cublasHandle_t h, const float *a0, const float *b0,
+template <typename T> static double delta2(cublasHandle_t h, const float *a0, const float *b0,
                      const float *a1, const float *b1, int e, int r) {
     const uint32_t n=(uint32_t)e*r; const int k=2*r;
-    float *d[4]={0}; double *u=NULL,*v=NULL,*gu=NULL,*gv=NULL;
+    float *d[4]={0}; T *u=NULL,*v=NULL,*gu=NULL,*gv=NULL;
     const float *src[]={a0,b0,a1,b1};
     for(int j=0;j<4;j++){CU(cudaMalloc((void**)&d[j],n*sizeof(float)));CU(cudaMemcpy(d[j],src[j],n*sizeof(float),cudaMemcpyHostToDevice));}
-    CU(cudaMalloc((void**)&u,2*n*sizeof(double)));CU(cudaMalloc((void**)&v,2*n*sizeof(double)));
-    CU(cudaMalloc((void**)&gu,k*k*sizeof(double)));CU(cudaMalloc((void**)&gv,k*k*sizeof(double)));
-    make_uv<<<(n+255)/256,256>>>(d[0],d[1],d[2],d[3],u,v,n);CU(cudaGetLastError());
-    const double one=1,zero=0; double result=0;
+    CU(cudaMalloc((void**)&u,2*n*sizeof(T)));CU(cudaMalloc((void**)&v,2*n*sizeof(T)));
+    CU(cudaMalloc((void**)&gu,k*k*sizeof(T)));CU(cudaMalloc((void**)&gv,k*k*sizeof(T)));
+    make_uv<T><<<(n+255)/256,256>>>(d[0],d[1],d[2],d[3],u,v,n);CU(cudaGetLastError());
+    const T one=1,zero=0; T result=0;
     /* 行主序的k×e视作列主序e×k，转置乘自身即所需Gram。 */
-    BL(cublasDgemm(h,CUBLAS_OP_T,CUBLAS_OP_N,k,k,e,&one,u,e,u,e,&zero,gu,k));
-    BL(cublasDgemm(h,CUBLAS_OP_T,CUBLAS_OP_N,k,k,e,&one,v,e,v,e,&zero,gv,k));
-    BL(cublasDdot(h,k*k,gu,1,gv,1,&result));CU(cudaDeviceSynchronize());
+    if constexpr(sizeof(T)==sizeof(double)) {
+        BL(cublasDgemm(h,CUBLAS_OP_T,CUBLAS_OP_N,k,k,e,&one,u,e,u,e,&zero,gu,k));
+        BL(cublasDgemm(h,CUBLAS_OP_T,CUBLAS_OP_N,k,k,e,&one,v,e,v,e,&zero,gv,k));
+        BL(cublasDdot(h,k*k,gu,1,gv,1,&result));
+    } else {
+        BL(cublasSgemm(h,CUBLAS_OP_T,CUBLAS_OP_N,k,k,e,&one,u,e,u,e,&zero,gu,k));
+        BL(cublasSgemm(h,CUBLAS_OP_T,CUBLAS_OP_N,k,k,e,&one,v,e,v,e,&zero,gv,k));
+        BL(cublasSdot(h,k*k,gu,1,gv,1,&result));
+    }
+    CU(cudaDeviceSynchronize());
     for(int j=0;j<4;j++)CU(cudaFree(d[j]));
     CU(cudaFree(u));CU(cudaFree(v));CU(cudaFree(gu));CU(cudaFree(gv));
     if(!isfinite(result)||result<0){fprintf(stderr,"invalid matrix delta norm: %.17g\n",result);exit(2);}
@@ -44,10 +51,10 @@ static double delta2(cublasHandle_t h, const float *a0, const float *b0,
 static void selftest(cublasHandle_t h) {
     const float eye[]={1,0,0,1},a[]={1.1f,.2f,0,.9f},b[]={.9f,.1f,.3f,1.2f};
     const float twice[]={2,0,0,2},half[]={.5f,0,0,.5f};
-    const double actual=delta2(h,eye,eye,a,b,2,2),same=delta2(h,eye,eye,eye,eye,2,2);
-    const double basis=delta2(h,eye,eye,twice,half,2,2);
-    const int ok=fabs(actual-.2247)<1e-6 && same==0 && basis==0;
-    fprintf(stderr,"matrix_delta_selftest known=%.12g expected=.2247 identical=%.12g equivalent_basis=%.12g %s\n",actual,same,basis,ok?"PASS":"FAIL");
+    const double actual=delta2<double>(h,eye,eye,a,b,2,2),same=delta2<double>(h,eye,eye,eye,eye,2,2);
+    const double basis=delta2<double>(h,eye,eye,twice,half,2,2),single=delta2<float>(h,eye,eye,a,b,2,2);
+    const int ok=fabs(actual-.2247)<1e-6 && same==0 && basis==0 && fabs(single-actual)<1e-6;
+    fprintf(stderr,"matrix_delta_selftest known=%.12g expected=.2247 identical=%.12g equivalent_basis=%.12g fp32_error=%.12g %s\n",actual,same,basis,fabs(single-actual),ok?"PASS":"FAIL");
     if(!ok)exit(2);
 }
 
@@ -65,14 +72,16 @@ int main(int argc,char **argv) {
     if(argc!=1&&argc!=3){fprintf(stderr,"usage: %s [old_checkpoint new_checkpoint]\n",argv[0]);return 2;}
     cublasHandle_t h;BL(cublasCreate(&h));BL(cublasSetMathMode(h,CUBLAS_PEDANTIC_MATH));selftest(h);
     if(argc==3){
-        double sum=0;const size_t n=5120u*64;
-        puts("layer\teffective_weight_delta_squared\tfrobenius_norm");
+        double sum=0,single_sum=0,max_error=0;const size_t n=5120u*64;
+        puts("layer\teffective_weight_delta_squared\tfrobenius_norm\tfp32_squared\trelative_error");
         for(int l=0;l<40;l++){
             float *old=read_amp(argv[1],l),*next=read_amp(argv[2],l);
-            const double d=delta2(h,old,old+n,next,next+n,5120,64);sum+=d;
-            printf("%d\t%.17g\t%.17g\n",l,d,sqrt(d));free(old);free(next);
+            const double d=delta2<double>(h,old,old+n,next,next+n,5120,64),s=delta2<float>(h,old,old+n,next,next+n,5120,64);
+            const double error=fabs(s-d)/fmax(d,1e-30);sum+=d;single_sum+=s;max_error=fmax(max_error,error);
+            printf("%d\t%.17g\t%.17g\t%.17g\t%.9g\n",l,d,sqrt(d),s,error);free(old);free(next);
         }
-        printf("TOTAL\t%.17g\t%.17g\n",sum,sqrt(sum));
+        printf("TOTAL\t%.17g\t%.17g\t%.17g\t%.9g\n",sum,sqrt(sum),single_sum,max_error);
+        if(max_error>1e-4){fprintf(stderr,"FP32/FP64 discrepancy exceeds1e-4\n");return 2;}
     }
     BL(cublasDestroy(h));return 0;
 }

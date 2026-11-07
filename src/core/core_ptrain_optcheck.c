@@ -265,8 +265,8 @@ static int oc_contrib(const pt_cfg *c, pt_run *r, ds4_gpu_tensor **a, ds4_gpu_te
 }
 
 bool pt_optcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
-    if (c->diag_save && (c->diag_save != 3 || (c->diag != 7 && c->diag != 8) || c->max_steps != 1)) {
-        fprintf(stderr, "[optcheck] diag_save只允许diag=7/8、max_steps=1、预定第3臂，拒绝事后挑最好\n"); return false;
+    if (c->diag_save && (c->diag_save != 3 || (c->diag != 7 && c->diag != 8 && c->diag != 9) || c->max_steps != 1)) {
+        fprintf(stderr, "[optcheck] diag_save只允许diag=7/8/9、max_steps=1、预定第3臂，拒绝事后挑最好\n"); return false;
     }
     if (!c->init[0] || !c->evalf[0] || c->evalkl[0] || c->data_eval || !c->max_steps || c->max_steps > 32 || c->batch > OC_DOCS ||
         !(c->lr > 0) || !isfinite(c->lr) || c->lr_b < 0 || !isfinite(c->lr_b)) {
@@ -284,7 +284,7 @@ bool pt_optcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
         q[*nq].s = s; q[*nq].index = i; (*nq)++;
     }
     if (nt < c->batch || ne < 4) { fprintf(stderr, "[optcheck] 独立短篇不足 train=%u eval=%u\n", nt, ne); return false; }
-    if (c->diag == 8 && (c->batch != 4 || c->max_steps != 1 || nt < 8 || !c->token_mean)) {
+    if (c->diag >= 8 && (c->batch != 4 || c->max_steps != 1 || nt < 8 || !c->token_mean)) {
         fprintf(stderr, "[batchgrad] 固定batch4、两组共8篇、单次更新和token归一，拒绝改变实验定义\n"); return false;
     }
     if (c->diag == 4 && (nt < 7 || tr[6].s->doc != 6 || c->max_steps != 1 || c->batch != 4)) {
@@ -341,11 +341,11 @@ bool pt_optcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
         if (ok && c->diag != 3) ok = oc_eval(e, c, r, ev, ne, tag, "eval", 3, f, rows);
         for (uint32_t step = 1; ok && step <= (c->diag == 3 ? 1u : c->max_steps); step++) {
             const pt_sample *ss[OC_DOCS];
-            const uint32_t nss = c->diag == 8 && arm > 2 ? 2u * c->batch : c->batch;
+            const uint32_t nss = c->diag >= 8 && arm > 2 ? 2u * c->batch : c->batch;
             for (uint32_t j = 0; j < nss; j++) ss[j] = tr[((step - 1u) * c->batch + j) % nt].s;
             double loss = 0, gn = 0; uint32_t n = 0; int clipped = 0;
             r->cont_s = NULL;
-            ok = c->diag == 8 && arm > 2 ? oc_accum(e, c, r, ss, arm, &loss, &n) :
+            ok = c->diag >= 8 && arm > 2 ? oc_accum(e, c, r, ss, arm, &loss, &n) :
                  pt_run_list(e, c, r, ss, nss, 1, &loss, &n, NULL, NULL, NULL);
             if (ok && (c->diag == 5 || geo)) {
                 double zero = 0;

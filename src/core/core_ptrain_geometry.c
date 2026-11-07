@@ -9,6 +9,7 @@
 #define GEO_ROWS 64u
 struct pt_geometry {
     ds4_gpu_tensor *q, *scratch, *discard, *zero, *gram, *tmp, *y, *diff;
+    ds4_gpu_tensor *u, *v, *gu, *gv, *scalar;
     ds4_gpu_tensor *x[DS4_MAX_LAYER], *pre[DS4_MAX_LAYER], *ref[DS4_MAX_LAYER], *original[DS4_MAX_LAYER];
     ds4_gpu_tensor *a[DS4_MAX_LAYER], *b[DS4_MAX_LAYER];
     uint32_t rows;
@@ -24,6 +25,7 @@ void pt_geometry_free(pt_geometry *g) {
     if (!g) return;
     geo_drop(&g->q); geo_drop(&g->scratch); geo_drop(&g->discard); geo_drop(&g->zero);
     geo_drop(&g->gram); geo_drop(&g->tmp); geo_drop(&g->y); geo_drop(&g->diff);
+    geo_drop(&g->u); geo_drop(&g->v); geo_drop(&g->gu); geo_drop(&g->gv); geo_drop(&g->scalar);
     for (uint32_t l = 0; l < DS4_MAX_LAYER; l++) {
         geo_drop(&g->x[l]); geo_drop(&g->pre[l]); geo_drop(&g->ref[l]); geo_drop(&g->original[l]);
         geo_drop(&g->a[l]); geo_drop(&g->b[l]);
@@ -32,14 +34,53 @@ void pt_geometry_free(pt_geometry *g) {
     free(g);
 }
 
+/* 不建 E×E 大矩阵：||UᵀV||² = <UUᵀ,VVᵀ>。
+ * actual 时 U=[B0;B1-B0], V=[A1-A0;A1]，包含二阶交叉项；
+ * 方向时 U=[B;dB], V=[dA;A]。两者都覆盖未被64行输入探针看到的方向。 */
+static bool geo_matrix_norm(pt_geometry *g, ds4_gpu_tensor *a, ds4_gpu_tensor *b,
+                            ds4_gpu_tensor *aa, ds4_gpu_tensor *bb, uint32_t e, uint32_t k,
+                            bool actual, double *ss) {
+    const uint64_t n = (uint64_t)e * k; const uint32_t h = 2 * k;
+    ds4_gpu_tensor *u1 = pt_rows(g->u, k, k, e), *v0 = pt_rows(g->v, 0, k, e);
+    bool ok = u1 && v0 && ds4_gpu_tensor_copy(g->u, 0, b, 0, n * 4) &&
+              ds4_gpu_tensor_copy(g->u, n * 4, bb, 0, n * 4) &&
+              ds4_gpu_tensor_copy(g->v, 0, aa, 0, n * 4) &&
+              ds4_gpu_tensor_copy(g->v, n * 4, actual ? aa : a, 0, n * 4);
+    if (ok && actual) ok = ds4_gpu_bwd_axpy_tensor(u1, b, -1.f, n) && ds4_gpu_bwd_axpy_tensor(v0, a, -1.f, n);
+    float val = 0;
+    if (ok) ok = ds4_gpu_draft_bias_tensor(g->gu, g->u, g->u, h, e, h) &&
+                 ds4_gpu_draft_bias_tensor(g->gv, g->v, g->v, h, e, h) &&
+                 ds4_gpu_draft_bias_tensor(g->scalar, g->gu, g->gv, 1, h * h, 1) &&
+                 ds4_gpu_tensor_read(g->scalar, 0, &val, sizeof val);
+    geo_drop(&u1); geo_drop(&v0); *ss = val;
+    return ok && isfinite(val) && val >= 0;
+}
+
+static bool geo_matrix_selftest(pt_geometry *g) {
+    float data[4][4] = {{1,0,0,1},{1,0,0,1},{1.1f,.2f,0,.9f},{.9f,.1f,.3f,1.2f}};
+    ds4_gpu_tensor *p[4] = {0}; bool ok = true; double known = 0, zero = 0;
+    for (unsigned j = 0; j < 4; j++) { p[j] = v41_alloc(16, &ok); if (ok) ok = ds4_gpu_tensor_write(p[j], 0, data[j], 16); }
+    if (ok) ok = geo_matrix_norm(g,p[0],p[1],p[2],p[3],2,2,true,&known) &&
+                 geo_matrix_norm(g,p[0],p[1],p[0],p[1],2,2,true,&zero) && fabs(known-.2247)<1e-6 && zero==0;
+    fprintf(stderr,"[geometry] global_norm_selftest known=%.12g expected=.2247 identical=%.12g %s\n",known,zero,ok?"PASS":"FAIL");
+    for (unsigned j = 0; j < 4; j++) geo_drop(&p[j]);
+    return ok;
+}
+
 pt_geometry *pt_geometry_new(const pt_cfg *c, pt_run *r) {
     if (c->rank != 64 || r->K != r->k2 + c->rank || !c->max_steps || c->max_steps > (c->diag == 7 ? 2u : 1u)) return NULL;
+    if (c->diag == 9 && (!(c->diag_radius > 0) || !isfinite(c->diag_radius))) return NULL;
     pt_geometry *g = xmalloc_zeroed(1, sizeof *g); bool ok = true;
     const uint64_t nf = (uint64_t)c->rank * DS4_N_EMBD, ny = (uint64_t)GEO_ROWS * DS4_N_EMBD;
     g->q = v41_alloc(64 * 64 * 4, &ok); g->gram = v41_alloc(64 * 64 * 4, &ok);
     g->scratch = v41_alloc(nf * 4, &ok); g->discard = v41_alloc(nf * 4, &ok);
     g->zero = v41_alloc(nf * 4, &ok); g->tmp = v41_alloc(GEO_ROWS * 64 * 4, &ok);
     g->y = v41_alloc(ny * 4, &ok); g->diff = v41_alloc(ny * 4, &ok);
+    if (c->diag == 9) {
+        g->u = v41_alloc(2 * nf * 4, &ok); g->v = v41_alloc(2 * nf * 4, &ok);
+        g->gu = v41_alloc(128 * 128 * 4, &ok); g->gv = v41_alloc(128 * 128 * 4, &ok);
+        g->scalar = v41_alloc(4, &ok);
+    }
     float q[64 * 64];
     for (unsigned i = 0; i < 64; i++) for (unsigned j = 0; j < 64; j++) {
         unsigned z = i & j, parity = 0;
@@ -52,6 +93,7 @@ pt_geometry *pt_geometry_new(const pt_cfg *c, pt_run *r) {
     if (!ok || !g->f) { pt_geometry_free(g); return NULL; }
     fprintf(g->f, "kind\tarm\tlayer\tfactor\tvalue1\tvalue2\tvalue3\tvalue4\n");
     ds4_gpu_set_quality(true);
+    if (ok && c->diag == 9) ok = geo_matrix_selftest(g);
     for (uint32_t l = c->layer_lo; ok && l <= c->layer_hi; l++) {
         ds4_gpu_tensor *all[] = {r->st.ampA[l], r->st.ampB[l]};
         for (unsigned k = 0; ok && k < 2; k++) {
@@ -114,6 +156,7 @@ bool pt_geometry_basis(const pt_cfg *c, pt_run *r, pt_geometry *g, unsigned arm)
 bool pt_geometry_before(const pt_cfg *c, pt_run *r, pt_geometry *g, uint32_t nrow, unsigned arm, uint32_t step) {
     if (!step || step > 2) return false;
     g->step = step; g->ref2 = g->step_ref2[step - 1];
+    if (c->diag == 9 && arm > 2) g->ref2 = (double)c->diag_radius * c->diag_radius;
     bool ok = true; g->rows = nrow < GEO_ROWS ? nrow : GEO_ROWS;
     const uint64_t ny = (uint64_t)g->rows * DS4_N_EMBD, nf = (uint64_t)c->rank * DS4_N_EMBD;
     ds4_gpu_set_quality(true);
@@ -161,6 +204,20 @@ bool pt_geometry_measure(const pt_cfg *c, pt_run *r, pt_geometry *g, unsigned ar
     const char *kind = g->step == 1 ? (matched ? "matched" : "raw") : (matched ? "matched_step2" : "raw_step2");
     const uint64_t ny = (uint64_t)g->rows * DS4_N_EMBD;
     ds4_gpu_set_quality(true);
+    if (c->diag == 9) {
+        for (uint32_t l = c->layer_lo; ok && l <= c->layer_hi; l++) {
+            ds4_gpu_tensor *a = pt_rows(r->st.ampA[l], r->k2, c->rank, DS4_N_EMBD), *b = pt_rows(r->st.ampB[l], r->k2, c->rank, DS4_N_EMBD);
+            double ss = 0;
+            ok = a && b && geo_matrix_norm(g,g->a[l],g->b[l],a,b,DS4_N_EMBD,c->rank,true,&ss);
+            total += ss; geo_drop(&a); geo_drop(&b);
+        }
+        if (arm == 1) g->ref2 = g->step_ref2[g->step-1] = total;
+        *norm = sqrt(total);
+        fprintf(g->f,"global_%s_total\t%u\t-1\tAB\t%.12g\t%.12g\t0\t0\n",kind,arm,total,g->ref2);
+        fprintf(stderr,"[geometry] arm=%u %s global_weight_norm=%.12g target=%.12g ratio=%.12g\n",arm,matched?"matched":"raw",*norm,sqrt(g->ref2),g->ref2>0?sqrt(total/g->ref2):NAN);
+        ds4_gpu_set_quality(false); fflush(g->f);
+        return ok && total>0 && isfinite(total);
+    }
     for (uint32_t l = c->layer_lo; ok && l <= c->layer_hi; l++) {
         ds4_gpu_tensor *a = pt_rows(r->st.ampA[l], r->k2, c->rank, DS4_N_EMBD), *b = pt_rows(r->st.ampB[l], r->k2, c->rank, DS4_N_EMBD);
         double ss = 0, dd = 0;
@@ -198,7 +255,7 @@ bool pt_geometry_rescale(const pt_cfg *c, pt_run *r, pt_geometry *g, double norm
             geo_drop(&w);
         }
     }
-    fprintf(stderr, "[geometry] training_input_scale=%.12g\n", scale);
+    fprintf(stderr, "[geometry] %s_scale=%.12g\n", c->diag == 9 ? "global_weight" : "training_input", scale);
     return ok;
 }
 
@@ -212,7 +269,8 @@ bool pt_geometry_project(const pt_cfg *c, pt_run *r, pt_geometry *g, double *gno
         ds4_gpu_tensor *full[] = {r->st.ampA[l],r->st.ampB[l],r->mA[l],r->mB[l]}, *p[4] = {0};
         for (unsigned k = 0; k < 4; k++) { p[k] = pt_rows(full[k], r->k2, c->rank, DS4_N_EMBD); if (!p[k]) ok = false; }
         double ss = 0;
-        if (ok) ok = ds4_gpu_tensor_fill_f32(g->y, 0.f, ny) &&
+        if (ok && c->diag == 9) ok = geo_matrix_norm(g,p[0],p[1],p[2],p[3],DS4_N_EMBD,c->rank,false,&ss);
+        else if (ok) ok = ds4_gpu_tensor_fill_f32(g->y, 0.f, ny) &&
                      ds4_gpu_v41_amp_apply_tensor(g->y, g->x[l], p[2], p[1], g->tmp, g->rows, DS4_N_EMBD, c->rank) &&
                      ds4_gpu_v41_amp_apply_tensor(g->y, g->x[l], p[0], p[3], g->tmp, g->rows, DS4_N_EMBD, c->rank) &&
                      ds4_gpu_bwd_sumsq_tensor(g->y, ny, &ss);
