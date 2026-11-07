@@ -165,11 +165,11 @@ static size_t bwd_qm_smem_bytes(void) {
  * B 片 = wb 的 [128 个键][64 个 e](已是 bf16, 直接搬; 交织/取法同 vqm 的 B 片)。出口: 键 < nwin → gkv[lo+键], 否则 → gcomp[组号]。 */
 __global__ __launch_bounds__(512, 1) static void bwd_attn_kg_kernel(float *gkv, float *gcomp, const uint16_t *wb, uint32_t nkmax, const float *q,
                                                                     const float *go, const int32_t *idx, uint32_t n_head, uint32_t pos0, uint32_t window,
-                                                                    uint32_t ng, uint32_t topk) {
+                                                                    uint32_t ng, uint32_t topk, uint32_t query0) {
     __shared__ __align__(16) uint8_t As[64u * BWD_KG_BM * 2u];   /* 16 KB */
     __shared__ __align__(16) uint8_t Bs[BWD_KG_BN * 64u * 2u];   /* 16 KB */
     constexpr uint32_t NFW = (BWD_KG_BN / 8u) / 2u;               /* 每 warp 8 个 n8 片(键分两半给 th = 0/1) */
-    const uint32_t i = blockIdx.x, kc0 = blockIdx.y * BWD_KG_BN, d0 = blockIdx.z * BWD_KG_BM;
+    const uint32_t i = blockIdx.x + query0, kc0 = blockIdx.y * BWD_KG_BN, d0 = blockIdx.z * BWD_KG_BM;
     const uint32_t p = pos0 + i;   /* 与 qm 核同一套窗口下界: wb 的键序是 [lo, p] 的窗口键再接 topk 压缩行 */
     const uint32_t lo = p + 1u > window ? p + 1u - window : 0u, nwin = p - lo + 1u, nk = nwin + topk;
     if (kc0 >= nk) return;   /* 整个 block 一起退, 不会卡在屏障上 */
@@ -254,6 +254,7 @@ __global__ __launch_bounds__(512, 1) static void bwd_attn_kg_kernel(float *gkv, 
     }
 }
 
+#include "cuda_bwd_attn_ordered.inc.cu"
 static v41_scratch g_bwd_wb;
 int ds4_gpu_bwd_sparse_attn_tensor(ds4_gpu_tensor *gq, ds4_gpu_tensor *gkv, ds4_gpu_tensor *gcomp, const ds4_gpu_tensor *go, const ds4_gpu_tensor *o,
                                    const ds4_gpu_tensor *q, const ds4_gpu_tensor *kv_win, const ds4_gpu_tensor *kv_comp,
@@ -274,10 +275,9 @@ int ds4_gpu_bwd_sparse_attn_tensor(ds4_gpu_tensor *gq, ds4_gpu_tensor *gkv, ds4_
         idx ? (const int32_t *)idx->ptr : NULL, sink, n_head, pos0, window, ng, topk, scale);
     if (!cuda_ok(cudaGetLastError(), "bwd attn q")) return 0;
     if (cudaMemsetAsync(gkv->ptr, 0, (size_t)n_tok * 512u * 4u, g_cur_stream) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
-    bwd_attn_kg_kernel<<<dim3(n_tok, (nkmax + BWD_KG_BN - 1u) / BWD_KG_BN, 512u / BWD_KG_BM), 512, 0, g_cur_stream>>>((float *)gkv->ptr,
+    return bwd_attn_kg_dispatch((float *)gkv->ptr,
         (gcomp && kv_comp) ? (float *)gcomp->ptr : NULL, wb, nkmax, (const float *)q->ptr, (const float *)go->ptr,
-        idx ? (const int32_t *)idx->ptr : NULL, n_head, pos0, window, ng, topk);
-    return cuda_ok(cudaGetLastError(), "bwd attn kg");
+        idx ? (const int32_t *)idx->ptr : NULL, n_head, pos0, window, ng, topk,n_tok,g_cur_stream?g_cur_stream:cudaStreamPerThread);
 }
 
 /* RoPE 的反向 = 反方向旋转(正交阵的转置), 不舍 bf16。调用方传"前向那一发的 inverse 取反"。算式与 v41_rope_kernel 同源(v41_rope_freq)。 */
