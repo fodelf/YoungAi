@@ -196,6 +196,9 @@ static int oc_contrib(const pt_cfg *c, pt_run *r, ds4_gpu_tensor **a, ds4_gpu_te
 }
 
 bool pt_optcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
+    if (c->diag_save && (c->diag_save != 3 || c->diag != 7 || c->max_steps != 1)) {
+        fprintf(stderr, "[optcheck] diag_save只允许diag=7、max_steps=1、预定第3臂，拒绝事后挑最好\n"); return false;
+    }
     if (!c->init[0] || !c->evalf[0] || c->evalkl[0] || c->data_eval || !c->max_steps || c->max_steps > 32 || c->batch > OC_DOCS ||
         !(c->lr > 0) || !isfinite(c->lr) || c->lr_b < 0 || !isfinite(c->lr_b)) {
         fprintf(stderr, "[optcheck] 要 init、独立 eval、max_steps=1..32、batch<=8；不混用 eval_kl/data_eval\n"); return false;
@@ -230,7 +233,7 @@ bool pt_optcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
     fprintf(comp, "arm\tlayer\tA_sumsq\tB_sumsq\tsum_sumsq\tcross_sumsq\tidentity_rel_error\treference_sumsq\terror_sumsq\n");
     if (precise) fprintf(precise, "arm\tlayer\tA_sumsq\tB_sumsq\tsum_sumsq\tcross_sumsq\tidentity_rel_error\treference_sumsq\terror_sumsq\n");
     ds4_gpu_tensor *a[DS4_MAX_LAYER] = {0}, *b[DS4_MAX_LAYER] = {0};
-    bool ok = true, contribution_ok = true; const uint64_t bytes = (uint64_t)r->K * DS4_N_EMBD * 4;
+    bool ok = true, contribution_ok = true, saved = false; const uint64_t bytes = (uint64_t)r->K * DS4_N_EMBD * 4;
     for (uint32_t l = c->layer_lo; ok && l <= c->layer_hi; l++) {
         a[l] = v41_alloc(bytes, &ok); b[l] = v41_alloc(bytes, &ok);
         if (ok) ok = ds4_gpu_tensor_copy(a[l], 0, r->st.ampA[l], 0, bytes) && ds4_gpu_tensor_copy(b[l], 0, r->st.ampB[l], 0, bytes);
@@ -242,10 +245,14 @@ bool pt_optcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
     fprintf(stderr, "[optcheck] train_docs=%u eval_docs=%u steps=%u lrA=%.9g lrB=%.9g；每篇只取开头一段\n", nt, ne, c->max_steps, c->lr, c->lr_b > 0 ? c->lr_b : c->lr);
     fprintf(stderr, "[optcheck] 训练/评分固定 TF32；贡献测量 %s；恒等式阈值仍为 1%%\n", c->diag == 3 ? "TF32 与 FP32" : "FP32");
     pt_geometry *geo = c->diag >= 6 ? pt_geometry_new(c, r) : NULL;
-    double original = 0, reference_norm = 0;
+    double original = 0, reference_norm = 0, full_dev_base = 0;
     if (c->diag >= 6 && !geo) ok = false;
     if (ok) ok = oc_score_check(e, c, r, tr[0].s);
     if (ok && c->diag != 3) ok = oc_eval(e, c, r, tr, nt, "base", "train", 0, f, rows) && oc_eval(e, c, r, ev, ne, "base", "eval", 0, f, rows);
+    if (ok && c->diag_save) {
+        ok = pt_eval(e, c, r, d, 2, d->ns, &full_dev_base, 0, NULL, NULL, NULL) && full_dev_base > 0 && isfinite(full_dev_base);
+        fprintf(stderr, "[increment] full_dev_base_KL=%.12g %s\n", full_dev_base, ok ? "PASS" : "FAIL");
+    }
     if (ok && geo) {
         const pt_sample *ss[OC_DOCS]; for (uint32_t j = 0; j < c->batch; j++) ss[j] = tr[j].s;
         ok = oc_objective(e, c, r, ss, c->batch, (uint32_t)pt_batch_loss_tokens(r, ss, c->batch), &original);
@@ -325,6 +332,17 @@ bool pt_optcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
         }
         snprintf(tag, sizeof tag, "run%u_post", arm);
         if (ok && c->diag != 3) ok = oc_eval(e, c, r, tr, nt, tag, "train", arm == 1 ? 1 : 2, f, rows) && oc_eval(e, c, r, ev, ne, tag, "eval", arm == 1 ? 1 : 2, f, rows);
+        if (ok && contribution_ok && c->diag_save == arm) {
+            double full_dev = 0;
+            ok = pt_eval(e, c, r, d, 2, d->ns, &full_dev, 0, NULL, NULL, NULL) && full_dev > 0 && isfinite(full_dev);
+            fprintf(stderr, "[increment] full_dev_candidate_KL=%.12g base=%.12g relative_change=%.12g\n", full_dev, full_dev_base,
+                    full_dev_base > 0 ? full_dev / full_dev_base - 1 : 0);
+            char candidate[1200]; snprintf(candidate, sizeof candidate, "%s/ckpt_e01", c->out);
+            /* 创建独占目录，避免重跑悄悄覆盖已经量过的候选。这里只保存，不选轮。 */
+            if (ok) ok = mkdir(candidate, 0755) == 0 && pt_save_amp(c, r, candidate);
+            saved = ok;
+            fprintf(stderr, "[optcheck] predetermined_arm=%u candidate=%s %s；尚未通过独立主判\n", arm, candidate, ok ? "SAVED" : "FAIL");
+        }
     }
     if (ok) ok = oc_restore(c, r, a, b);
     if (ok && c->diag != 3) ok = oc_eval(e, c, r, ev, ne, "restored", "eval", 3, f, rows);
@@ -336,8 +354,9 @@ bool pt_optcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
     fclose(f); fclose(rows); fclose(comp);
     if (precise) fclose(precise);
     pt_geometry_free(geo);
-    fprintf(stderr, "[optcheck] %s；输出分解%s；没有保存 checkpoint\n", ok ? "重复对照完成" : "失败", ok && contribution_ok ? "通过" : "未过门");
-    return ok && contribution_ok;
+    fprintf(stderr, "[optcheck] %s；输出分解%s；%s\n", ok ? "重复对照完成" : "失败", ok && contribution_ok ? "通过" : "未过门",
+            saved ? "已保存预定候选，未自动接力" : "没有保存 checkpoint");
+    return ok && contribution_ok && (!c->diag_save || saved);
 }
 
 #endif
