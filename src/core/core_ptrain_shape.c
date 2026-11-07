@@ -162,6 +162,8 @@ bool pt_shapecheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) 
         backward = ok && nt == SHAPE_TARGETS && tail_ss == 0.0 && shape_finite(loss);
         fprintf(f, "backward\ttargets=%u\ttail_rows=%u\ttail_gradient_sumsq=%.12g\tobjective=%.12g\tpass=%u\n",
                 nt, SHAPE_ROWS - SHAPE_TARGETS, tail_ss, nt ? loss / nt : -1.0, backward);
+        /* 2048准入也保存完整参数梯度，不能只凭范数相同判断重复性。 */
+        if (ok && backward) ok = pt_diag_gradient(c, r, f);
         if (ok) ok = shape_emit(e, c, r, &s, "post_bwd", f) && shape_compare(c, &s, "aligned", "post_bwd", f, &post);
     } else fprintf(f, "backward\tSKIP\tforward_gate_or_memory\tavailable_MiB=%ld\n", before);
     const bool weights = pt_diag_weights(c, r);
