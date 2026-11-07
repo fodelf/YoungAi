@@ -13,6 +13,8 @@ struct pt_geometry {
     ds4_gpu_tensor *a[DS4_MAX_LAYER], *b[DS4_MAX_LAYER];
     uint32_t rows;
     double ref2;
+    double step_ref2[2];
+    uint32_t step;
     FILE *f;
 };
 
@@ -31,7 +33,7 @@ void pt_geometry_free(pt_geometry *g) {
 }
 
 pt_geometry *pt_geometry_new(const pt_cfg *c, pt_run *r) {
-    if (c->rank != 64 || r->K != r->k2 + c->rank || c->max_steps != 1) return NULL;
+    if (c->rank != 64 || r->K != r->k2 + c->rank || !c->max_steps || c->max_steps > (c->diag == 7 ? 2u : 1u)) return NULL;
     pt_geometry *g = xmalloc_zeroed(1, sizeof *g); bool ok = true;
     const uint64_t nf = (uint64_t)c->rank * DS4_N_EMBD, ny = (uint64_t)GEO_ROWS * DS4_N_EMBD;
     g->q = v41_alloc(64 * 64 * 4, &ok); g->gram = v41_alloc(64 * 64 * 4, &ok);
@@ -109,12 +111,14 @@ bool pt_geometry_basis(const pt_cfg *c, pt_run *r, pt_geometry *g, unsigned arm)
     return ok;
 }
 
-bool pt_geometry_before(const pt_cfg *c, pt_run *r, pt_geometry *g, uint32_t nrow, unsigned arm) {
+bool pt_geometry_before(const pt_cfg *c, pt_run *r, pt_geometry *g, uint32_t nrow, unsigned arm, uint32_t step) {
+    if (!step || step > 2) return false;
+    g->step = step; g->ref2 = g->step_ref2[step - 1];
     bool ok = true; g->rows = nrow < GEO_ROWS ? nrow : GEO_ROWS;
     const uint64_t ny = (uint64_t)g->rows * DS4_N_EMBD, nf = (uint64_t)c->rank * DS4_N_EMBD;
     ds4_gpu_set_quality(true);
     for (uint32_t l = c->layer_lo; ok && l <= c->layer_hi; l++) {
-        if (arm == 1) {
+        if (arm == 1 && step == 1) {
             g->x[l] = v41_alloc(ny * 4, &ok); g->pre[l] = v41_alloc(ny * 4, &ok); g->ref[l] = v41_alloc(ny * 4, &ok);
             g->original[l] = v41_alloc(ny * 4, &ok);
             g->a[l] = v41_alloc(nf * 4, &ok); g->b[l] = v41_alloc(nf * 4, &ok);
@@ -124,7 +128,7 @@ bool pt_geometry_before(const pt_cfg *c, pt_run *r, pt_geometry *g, uint32_t nro
         if (ok) ok = a && b && ds4_gpu_tensor_copy(g->a[l], 0, a, 0, nf * 4) && ds4_gpu_tensor_copy(g->b[l], 0, b, 0, nf * 4) &&
                      ds4_gpu_tensor_fill_f32(g->pre[l], 0.f, ny) &&
                      ds4_gpu_v41_amp_apply_tensor(g->pre[l], g->x[l], a, b, g->tmp, g->rows, DS4_N_EMBD, c->rank);
-        if (ok && arm == 1) ok = ds4_gpu_tensor_copy(g->original[l], 0, g->pre[l], 0, ny * 4);
+        if (ok && arm == 1 && step == 1) ok = ds4_gpu_tensor_copy(g->original[l], 0, g->pre[l], 0, ny * 4);
         geo_drop(&a); geo_drop(&b);
     }
     ds4_gpu_set_quality(false); return ok;
@@ -154,6 +158,7 @@ bool pt_geometry_equivalence(const pt_cfg *c, pt_run *r, pt_geometry *g, unsigne
 /* 报实际乘积的变化，包含 ΔBᵀΔA；以 arm1 为参照，先量原幅度，再只用训练输入定标。 */
 bool pt_geometry_measure(const pt_cfg *c, pt_run *r, pt_geometry *g, unsigned arm, bool matched, double *norm) {
     bool ok = true; double total = 0, diff = 0;
+    const char *kind = g->step == 1 ? (matched ? "matched" : "raw") : (matched ? "matched_step2" : "raw_step2");
     const uint64_t ny = (uint64_t)g->rows * DS4_N_EMBD;
     ds4_gpu_set_quality(true);
     for (uint32_t l = c->layer_lo; ok && l <= c->layer_hi; l++) {
@@ -162,19 +167,19 @@ bool pt_geometry_measure(const pt_cfg *c, pt_run *r, pt_geometry *g, unsigned ar
         ok = a && b && ds4_gpu_tensor_fill_f32(g->y, 0.f, ny) &&
              ds4_gpu_v41_amp_apply_tensor(g->y, g->x[l], a, b, g->tmp, g->rows, DS4_N_EMBD, c->rank) &&
              ds4_gpu_bwd_axpy_tensor(g->y, g->pre[l], -1.f, ny) && ds4_gpu_bwd_sumsq_tensor(g->y, ny, &ss);
-        if (ok && arm == 1) ok = ds4_gpu_tensor_copy(g->ref[l], 0, g->y, 0, ny * 4);
-        if (ok) ok = ds4_gpu_tensor_copy(g->diff, 0, g->y, 0, ny * 4) &&
+        if (ok && arm == 1 && g->step == 1) ok = ds4_gpu_tensor_copy(g->ref[l], 0, g->y, 0, ny * 4);
+        if (ok && g->step == 1) ok = ds4_gpu_tensor_copy(g->diff, 0, g->y, 0, ny * 4) &&
                      ds4_gpu_bwd_axpy_tensor(g->diff, g->ref[l], -1.f, ny) && ds4_gpu_bwd_sumsq_tensor(g->diff, ny, &dd);
         total += ss; diff += dd;
-        fprintf(g->f, "%s\t%u\t%u\tAB\t%.12g\t%.12g\t0\t0\n", matched ? "matched_layer" : "raw_layer", arm, l, ss, dd);
+        fprintf(g->f, "%s_layer\t%u\t%u\tAB\t%.12g\t%.12g\t0\t0\n", kind, arm, l, ss, g->step == 1 ? dd : NAN);
         geo_drop(&a); geo_drop(&b);
     }
-    if (arm == 1) g->ref2 = total;
-    const double cosine = total > 0 && g->ref2 > 0 ? (total + g->ref2 - diff) / (2 * sqrt(total * g->ref2)) : 0;
+    if (arm == 1) g->ref2 = g->step_ref2[g->step - 1] = total;
+    const double cosine = g->step == 1 && total > 0 && g->ref2 > 0 ? (total + g->ref2 - diff) / (2 * sqrt(total * g->ref2)) : NAN;
     *norm = sqrt(total);
-    fprintf(g->f, "%s\t%u\t-1\tAB\t%.12g\t%.12g\t%.12g\t%.12g\n", matched ? "matched_total" : "raw_total", arm, total, diff, cosine, g->ref2);
-    fprintf(stderr, "[geometry] arm=%u %s norm=%.12g ref_norm=%.12g cosine=%.12g relative_diff=%.12g rows=%u\n",
-            arm, matched ? "matched" : "raw", *norm, sqrt(g->ref2), cosine, g->ref2 > 0 ? sqrt(diff / g->ref2) : 0, g->rows);
+    fprintf(g->f, "%s_total\t%u\t-1\tAB\t%.12g\t%.12g\t%.12g\t%.12g\n", kind, arm, total, g->step == 1 ? diff : NAN, cosine, g->ref2);
+    fprintf(stderr, "[geometry] arm=%u step=%u %s norm=%.12g ref_norm=%.12g cosine=%.12g relative_diff=%.12g rows=%u\n",
+            arm, g->step, matched ? "matched" : "raw", *norm, sqrt(g->ref2), cosine, g->step == 1 && g->ref2 > 0 ? sqrt(diff / g->ref2) : NAN, g->rows);
     ds4_gpu_set_quality(false); fflush(g->f);
     return ok && total > 0 && isfinite(total) && isfinite(diff);
 }
@@ -197,6 +202,8 @@ bool pt_geometry_rescale(const pt_cfg *c, pt_run *r, pt_geometry *g, double norm
     return ok;
 }
 
+double pt_geometry_reference(const pt_geometry *g) { return sqrt(g->ref2); }
+
 bool pt_geometry_project(const pt_cfg *c, pt_run *r, pt_geometry *g, double *gnorm) {
     if (!pt_projected_gradient(c, r, gnorm)) return false;
     bool ok = true; double linear = 0; const uint64_t ny = (uint64_t)g->rows * DS4_N_EMBD;
@@ -218,7 +225,9 @@ bool pt_geometry_project(const pt_cfg *c, pt_run *r, pt_geometry *g, double *gno
         ds4_gpu_tensor *full[] = {r->st.ampA[l],r->st.ampB[l],r->mA[l],r->mB[l]}, *p[4] = {0};
         for (unsigned k = 0; k < 4; k++) { p[k] = pt_rows(full[k], r->k2, c->rank, DS4_N_EMBD); if (!p[k]) ok = false; }
         if (ok) ok = ds4_gpu_bwd_axpy_tensor(p[0], p[2], -eta, (uint64_t)c->rank * DS4_N_EMBD) &&
-                     ds4_gpu_bwd_axpy_tensor(p[1], p[3], -eta, (uint64_t)c->rank * DS4_N_EMBD);
+                     ds4_gpu_bwd_axpy_tensor(p[1], p[3], -eta, (uint64_t)c->rank * DS4_N_EMBD) &&
+                     ds4_gpu_tensor_fill_f32(r->gA[l], 0.f, (uint64_t)r->K * DS4_N_EMBD) &&
+                     ds4_gpu_tensor_fill_f32(r->gB[l], 0.f, (uint64_t)r->K * DS4_N_EMBD);
         for (unsigned k = 0; k < 4; k++) geo_drop(&p[k]);
     }
     fprintf(stderr, "[projected] linear_norm=%.12g target_norm=%.12g eta=%.12g %s\n", sqrt(linear), sqrt(g->ref2), eta, ok ? "PASS" : "FAIL");
