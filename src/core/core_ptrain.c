@@ -252,7 +252,7 @@ bool pt_opt_step(const pt_cfg *c, pt_run *r, uint32_t step, double *gnorm, int *
     const float gs = (c->clip > 0.f && gn > c->clip) ? (float)(c->clip / gn) : 1.0f;
     for (uint32_t il = c->layer_lo; il <= c->layer_hi; il++)
         if (!ds4_gpu_bwd_adam_tensor(r->st.ampA[il], r->gA[il], r->mA[il], r->vA[il], (uint64_t)r->K * DS4_N_EMBD, c->lr, 0.9f, 0.999f, 1e-8f, gs, step) ||
-            !ds4_gpu_bwd_adam_tensor(r->st.ampB[il], r->gB[il], r->mB[il], r->vB[il], (uint64_t)r->K * DS4_N_EMBD, c->lr, 0.9f, 0.999f, 1e-8f, gs, step)) return false;
+            !ds4_gpu_bwd_adam_tensor(r->st.ampB[il], r->gB[il], r->mB[il], r->vB[il], (uint64_t)r->K * DS4_N_EMBD, c->lr_b > 0.f ? c->lr_b : c->lr, 0.9f, 0.999f, 1e-8f, gs, step)) return false;
     *gnorm = gn; *clipped = gs < 1.f;
     return true;
 }

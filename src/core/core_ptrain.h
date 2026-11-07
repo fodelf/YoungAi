@@ -74,7 +74,7 @@ typedef struct {
     uint32_t nopack;               /* 1 = 训练/评估不合批(一题一题过, 10-02 之前的路; 只作对照) */
     int32_t dbg_layer;             /* ≥0 = 该层 ffn 半层反传逐步打梯度范数(第一题那几行, core_ptrain_layer.c pt_dbg), 定位哪一步把梯度算大; 缺省 -1 */
     uint32_t poison;               /* 1 = 毒值测试: 每层反传前把梯度暂存整块、状态第 n 行以后、本层窗口填 NaN, 哪层先出 NaN = 那层读了没写过的内存 */
-    float lr, clip, init_std;
+    float lr, lr_b, clip, init_std; /* lr_b=0 沿用 lr；诊断双学习率时只改变 B 的更新。 */
 } pt_cfg;
 
 /* 一个教师上下文块(同一份 context 的题共一块): 教师序列 = 材料 + 空行 + 问题, 同块的题共享前 lcp 个 token(前缀快照的依据)。
@@ -243,6 +243,7 @@ bool pt_opt_step(const pt_cfg *c, pt_run *r, uint32_t step, double *gnorm, int *
 /* 步 2(core_ptrain_onpolicy.c): qs[0..nq) = 本轮步 1 过的训练题号; 当前 ③ 存到 out/live 挂上去采样 → 教师打分 → 训, 步数接着 *step 往下记 */
 bool pt_onpolicy(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d, const uint32_t *qs, uint32_t nq, uint32_t ep, uint32_t *step, FILE *lf, double t0);
 bool pt_diag(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d);   /* diag=1: 逐位诊断, core_ptrain_diag.c(会把 ③ 的 A 置零, 跑完只能退出) */
+bool pt_optcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d); /* diag=2 重复短对照；3 再用 FP32 核验同一输出分解；只写指标。 */
 
 /* core_ptrain_layer.c: 多层模式。alloc 分逐层缓冲与前向存档(层入口 hc/pre_mix/组号, engram 层另存门输入); bwd 从 r->ghc/r->gpre
  * (末层输出处的梯度)起, 第 hi 层到第 lo 层逐层"重算本层 → 倒推梯度", 放大器梯度累加进 gA/gB。训练段必须到末层(hi = 最后一层):

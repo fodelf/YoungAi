@@ -111,7 +111,7 @@ bool pt_cfg_load(pt_cfg *c, const char *path) {
                 while (*nx == '/' || *nx == ' ') nx++;
             }
         }
-        else if (!strcmp(k, "lr")) c->lr = (float)atof(v);
+        else if (!strcmp(k, "lr")) c->lr = (float)atof(v); else if (!strcmp(k, "lr_b")) c->lr_b = (float)atof(v);
         else if (!strcmp(k, "clip")) c->clip = (float)atof(v);
         else if (!strcmp(k, "init_std")) c->init_std = (float)atof(v);
         else { fprintf(stderr, "ds4: --ptrain 不认识的配置项 %s\n", k); free(b); return false; }
