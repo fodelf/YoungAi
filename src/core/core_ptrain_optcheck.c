@@ -1,6 +1,7 @@
 /* diag=2：重复短训固定 TF32；只用 FP32 量因子贡献，避免低精度分解误差掩盖读数。
  * diag=3 只做一步数值核验：固定默认 TF32 前向/反传，同一更新额外用 FP32 分解，不跑评分集。
  * diag=4 重建一步后的状态，在训练doc6的L15/序列行471检查激活方向；不改冻结权重。
+ * diag=5 核对实际 Adam 更新前后的同批目标，确认激活局部失配是否真的导致跨步过大。
  * 每臂恢复同一份 GPU 权重快照并清空 Adam；只选每篇开头一个完整短段，
  * 因而不能把这里的结果说成长上下文成绩。独立留出只评分，不反传。
  * 所有矩阵计算复用生产 GPU 原语；退出时恢复快照，不保存 checkpoint。 */
@@ -95,6 +96,15 @@ static bool oc_score_check(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_s
     fprintf(stderr, "[optcheck] score_check diag_KL=%.12g native_KL=%.12g %s\n", na ? a / na : 0, nb ? b / nb : 0, ok ? "PASS" : "FAIL");
     free(id);
     return ds4_gpu_bwd_kl_margin(c->margin, c->margin_p1, c->margin_gap) && ok;
+}
+
+/* 保持训练的排序项和装包方式，只关闭反传；不选学习率，也不按评分集调参数。 */
+static bool oc_objective(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_sample *const *ss,
+                         uint32_t n, uint32_t expected, double *mean) {
+    double loss = 0; uint32_t nt = 0; r->cont_s = NULL;
+    if (!pt_run_list(e, c, r, ss, n, 0, &loss, &nt, NULL, NULL, NULL) || !nt || nt != expected) return false;
+    *mean = loss / nt;
+    return isfinite(*mean);
 }
 
 /* 固定一步更新前的真实层输入，拆解 Δy = xBΔA + xΔBA + xΔBΔA。
@@ -207,6 +217,11 @@ bool pt_optcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
             double loss = 0, gn = 0; uint32_t n = 0; int clipped = 0;
             r->cont_s = NULL;
             ok = pt_run_list(e, c, r, ss, c->batch, 1, &loss, &n, NULL, NULL, NULL);
+            if (ok && c->diag == 5) {
+                double zero = 0;
+                ok = n && oc_objective(e, c, r, ss, c->batch, n, &zero) && fabs(zero - loss / n) <= 1e-7;
+                fprintf(stderr, "[stepcheck] arm=%u step=%u pre_repeat_error=%.12g %s\n", arm, step, n ? fabs(zero - loss / n) : -1., ok ? "PASS" : "FAIL");
+            }
             /* 用同一训练篇的更新前输入量贡献；这趟只前向，保留刚累计的 gA/gB。 */
             if (ok && step == 1) {
                 /* 多层反传平时只存 hc 并重算 xn；诊断这趟临时留 xn，否则 moe_in 是 NULL。 */
@@ -235,6 +250,13 @@ bool pt_optcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
             if (step == 1 && c->layer_lo < c->layer_hi)
                 for (uint32_t l = c->layer_lo; l <= c->layer_hi; l++) oc_free(&r->save.moe_in[l]);
             if (ok && step == 1 && c->diag == 4) ok = pt_actcheck(e, c, r, tr[6].s, 15, 471, arm);
+            if (ok && c->diag == 5) {
+                double post = 0, repeat = 0;
+                ok = oc_objective(e, c, r, ss, c->batch, n, &post) &&
+                     oc_objective(e, c, r, ss, c->batch, n, &repeat) && fabs(post - repeat) <= 1e-7;
+                fprintf(stderr, "[stepcheck] arm=%u step=%u before=%.12g after=%.12g gain=%.12g post_repeat_error=%.12g %s\n",
+                        arm, step, loss / n, post, loss / n - post, fabs(post - repeat), ok ? "PASS" : "FAIL");
+            }
             if (pt_mem_mb() >= 0 && pt_mem_mb() < 3000) { fprintf(stderr, "[optcheck] 内存低于 3000 MB，停止\n"); ok = false; }
         }
         snprintf(tag, sizeof tag, "run%u_post", arm);
