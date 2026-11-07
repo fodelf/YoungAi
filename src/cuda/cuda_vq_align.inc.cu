@@ -19,7 +19,8 @@
 #include <algorithm>
 
 /* 返回设备指针; NULL 时看 *flat: 1 = 不适用(调用方平拷), 0 = 真失败(分配/拷贝错)。 */
-static const char *cuda_vq_blob_populate_aligned(const void *model_map, uint64_t offset, uint64_t bytes, const char *what, int *flat) {
+/* cache=0供单层反传临时副本使用：调用方同步后释放，不登记成整模型常驻权重。 */
+static const char *cuda_vq_blob_populate_aligned(const void *model_map, uint64_t offset, uint64_t bytes, const char *what, int *flat, int cache = 1) {
     static uint32_t s_done = 0;
     *flat = 1;
     const uint8_t *hb = (const uint8_t *)model_map + offset;
@@ -77,9 +78,11 @@ static const char *cuda_vq_blob_populate_aligned(const void *model_map, uint64_t
         (void)cudaGetLastError(); (void)cudaFree(dev);
         return NULL;
     }
-    g_model_ranges.push_back({model_map, offset, bytes, d, NULL, NULL, 0, 0, 0});   /* 登记的是主机侧跨度: 查找按原 offset/bytes 命中 blob 起点 */
-    g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
-    g_model_range_bytes += total;
+    if (cache) {
+        g_model_ranges.push_back({model_map, offset, bytes, d, NULL, NULL, 0, 0, 0});   /* 查找仍按原主机跨度命中blob起点 */
+        g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
+        g_model_range_bytes += total;
+    }
     if (s_done++ == 0)
         fprintf(stderr, "ds4: [vq-align] 专家 blob 载荷挪到位流 128 B 对齐(设备副本; 首个 %s: %zu 个载荷, 多占 %.1f KB)\n",
                 what, pl.size(), (double)(total - bytes) / 1024.0);

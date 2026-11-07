@@ -139,15 +139,18 @@ int ds4_gpu_bwd_routed_moe_tensor(ds4_gpu_tensor *gx, ds4_gpu_tensor *gw, const 
     if (!ds4vq_blob_ok(bh, (size_t)blob_bytes)) return 0;
     const uint32_t ver = ds4vq_blob_ver(bh);
     const uint8_t *blob = (const uint8_t *)cuda_model_range_cached_ptr(model_map, blob_offset, blob_bytes);
+    const uint8_t *stage_host = NULL, *temporary_blob = NULL;
+    vqp_slot_hdr *original_hdr = NULL;
     if (!blob && (g_model_registered || g_model_device_owned)) blob = (const uint8_t *)cuda_model_range_ptr(model_map, blob_offset, blob_bytes, "bwd vq blob");
     /* 逐层反传刚重算过同层MoE，冷层原字节仍在前向的锁页暂存中。
      * 只借用完全覆盖当前blob的那一段；不重新装层，避免覆盖截留激活或读到上一层。
      * 重算与反传共用同一流，下一层重算前本层反传已提交，stage_fill也会同步再覆写。 */
-    if (!blob && g_v41_stage.valid && g_v41_stage.dev) {
+    if (!blob && !g_vg.dw && g_v41_stage.valid && g_v41_stage.dev) {
         const uintptr_t address = (uintptr_t)bh;
         if (address >= g_v41_stage.reg && blob_bytes <= g_v41_stage.bytes &&
             address - g_v41_stage.reg <= g_v41_stage.bytes - blob_bytes) {
             blob = (const uint8_t *)g_v41_stage.dev + (address - g_v41_stage.reg);
+            stage_host = g_v41_stage.host + (address - g_v41_stage.reg);
             static int said = 0;
             if (!said++) fprintf(stderr, "ds4: [bwd] L%u 复用同层流式专家暂存，原址/长度已核对\n", layer);
         }
@@ -222,8 +225,21 @@ int ds4_gpu_bwd_routed_moe_tensor(ds4_gpu_tensor *gx, ds4_gpu_tensor *gw, const 
         /* 三发转置: v3 走 bf16 张量核(vqst_kernel, 工作项表三发共用, 按码本位宽切), v2 仍走直读转置累加(码本转 bf16 丢尾数, 同推理路的取舍) */
         const uint32_t nc = ver == 3u ? g_vqp_hdr[layer][0].nc : 0u;
         uint32_t nbit = 0; while (nc && (1u << nbit) < nc) nbit++;
-        if (ok && ver == 3u && !vqs_blob_fits(layer, blob, n_total_expert, IN, MID, OUT)) {   /* 转置核只有寄存器直解这一版: 要对齐的设备副本(训练本来就全驻留) */
-            fprintf(stderr, "ds4: [bwd] L%u 专家 blob 不是对齐的设备副本(封顶装载/映射), 转置张量核不认 —— 训练要全驻留\n", layer); ok = 0;
+        if (ok && ver == 3u && stage_host) {
+            /* 转置核仍要求对齐设备内存；复用原载荷搬运，不新增解码或低精度路径。
+             * 从已盖固定补丁的stage复制；只保留这一层，避免逐层累积成全驻留。
+             * 槽表偏移随布局改变，临时换头表，退出前恢复给原流式前向。 */
+            int flat = 0;
+            temporary_blob = (const uint8_t *)cuda_vq_blob_populate_aligned(stage_host, 0, blob_bytes, "bwd staged layer", &flat, 0);
+            ok = temporary_blob != NULL;
+            if (ok) {
+                original_hdr = g_vqp_hdr[layer]; g_vqp_hdr[layer] = NULL;
+                blob = temporary_blob; g_vqs_fit[layer].blob = NULL;
+                ok = vqp_hdr_build(layer, blob, n_total_expert, IN, MID, OUT, ver);
+            }
+        }
+        if (ok && ver == 3u && !vqs_blob_fits(layer, blob, n_total_expert, IN, MID, OUT)) {
+            fprintf(stderr, "ds4: [bwd] L%u 专家临时/常驻副本未满足转置核的对齐与设备内存要求\n", layer); ok = 0;
         }
         if (ok && ver == 3u) ok = vqt_prepare(cnt, off, n_total_expert, vqst_item_tokens(nbit));
         if (ok) ok = ver == 3u ? vqt_launch(ga, og, blob, 2u, OUT, MID, nc, gr_all, OUT, 0, bad)
@@ -241,6 +257,13 @@ int ds4_gpu_bwd_routed_moe_tensor(ds4_gpu_tensor *gx, ds4_gpu_tensor *gw, const 
     int bad_h = 0;
     if (ok && bad) ok = cudaMemcpy(&bad_h, bad, 4, cudaMemcpyDeviceToHost) == cudaSuccess && !bad_h;
     if (bad_h) fprintf(stderr, "ds4: [bwd] L%u 专家载荷头不认(版本 %u) —— 反向不出假梯度, 停车\n", layer, ver);
+    if (temporary_blob) {
+        /* 侧流也可能读权重；所有消费者落地后才释放，失败路径同样回收并恢复元数据。 */
+        if (cudaDeviceSynchronize() != cudaSuccess) ok = 0;
+        free(g_vqp_hdr[layer]); g_vqp_hdr[layer] = original_hdr;
+        g_vqs_fit[layer].blob = NULL; g_vqs_fit[layer].ok = 0;
+        if (cudaFree((void *)temporary_blob) != cudaSuccess) ok = 0;
+    }
     free(sel_h); free(list); free(cnt); free(off); free(meta);
     return ok;
 }

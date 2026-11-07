@@ -101,8 +101,10 @@ static int vqp_hdr_build(uint32_t layer, const uint8_t *blob, uint32_t n_total,
     if (!cuda_ok(cudaGetLastError(), "vq prefill hdr copy launch")) return 0;
     uint32_t *raw = (uint32_t *)malloc((size_t)n * 6u * sizeof(uint32_t));
     vqp_slot_hdr *tab = (vqp_slot_hdr *)calloc((size_t)n, sizeof(vqp_slot_hdr));
+    /* 头表核在g_cur_stream；同流读回并等完，避免临时布局跨流读到旧偏移。 */
     if (!raw || !tab ||
-        cudaMemcpy(raw, g_vqp_hdr_dev, (size_t)n * 6u * sizeof(uint32_t), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        cudaMemcpyAsync(raw, g_vqp_hdr_dev, (size_t)n * 6u * sizeof(uint32_t), cudaMemcpyDeviceToHost, g_cur_stream) != cudaSuccess ||
+        cudaStreamSynchronize(g_cur_stream) != cudaSuccess) {
         (void)cudaGetLastError(); free(raw); free(tab); return 0;
     }
     int bad = 0;
