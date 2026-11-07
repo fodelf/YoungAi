@@ -21,7 +21,6 @@ static char *pt_slurp(const char *path) {
     return b;
 }
 static void pt_rstrip(char *s) { size_t n = strlen(s); while (n && (s[n - 1] == '\n' || s[n - 1] == '\r' || s[n - 1] == ' ')) s[--n] = 0; }
-
 bool pt_cfg_load(pt_cfg *c, const char *path) {
     memset(c, 0, sizeof *c);
     c->layer_lo = 0; c->layer_hi = DS4_N_LAYER - 1u;   /* 缺省全层(10-01 子集 1 轮: 全层 −32% 对 L21-39 −26%) */
@@ -485,7 +484,6 @@ void pt_data_lcp(pt_data *d) {
         d->ch[ci].lcp = lcp;
     }
 }
-
 void pt_data_free(pt_data *d) {
     for (uint32_t i = 0; i < d->nch; i++) { free(d->ch[i].name); free(d->ch[i].text); }
     for (uint32_t i = 0; i < d->ns; i++) {
