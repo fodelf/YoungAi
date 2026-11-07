@@ -89,7 +89,7 @@ static bool pj_selftest(proj_work *w) {
 }
 
 bool pt_projected_gradient(const pt_cfg *c, pt_run *r, double *gnorm) {
-    if (c->rank != 64 || c->diag < 7 || c->diag > 10) return false;
+    if (c->rank != 64 || c->diag < 7 || c->diag > 11) return false;
     bool ok = true; proj_work w = {0}; const uint64_t nf = (uint64_t)c->rank * DS4_N_EMBD;
     ds4_gpu_tensor **small[] = {&w.ha,&w.hb,&w.ia,&w.ib,&w.u,&w.v,&w.z,&w.id,&w.cross};
     ds4_gpu_tensor **large[] = {&w.scratch,&w.mid,&w.zero,&w.discard};

@@ -265,8 +265,8 @@ static int oc_contrib(const pt_cfg *c, pt_run *r, ds4_gpu_tensor **a, ds4_gpu_te
 }
 
 bool pt_optcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
-    if (c->diag_save && (c->diag_save != 3 || (c->diag != 7 && c->diag != 8 && c->diag != 9) || c->max_steps != 1)) {
-        fprintf(stderr, "[optcheck] diag_save只允许diag=7/8/9、max_steps=1、预定第3臂，拒绝事后挑最好\n"); return false;
+    if (c->diag_save && (c->diag_save != 3 || (c->diag != 7 && c->diag != 8 && c->diag != 9 && c->diag != 11) || c->max_steps != 1)) {
+        fprintf(stderr, "[optcheck] diag_save只允许diag=7/8/9/11、max_steps=1、预定第3臂，拒绝事后挑最好\n"); return false;
     }
     if (!c->init[0] || !c->evalf[0] || c->evalkl[0] || c->data_eval || !c->max_steps || c->max_steps > 32 || c->batch > OC_DOCS ||
         !(c->lr > 0) || !isfinite(c->lr) || c->lr_b < 0 || !isfinite(c->lr_b)) {
@@ -330,7 +330,7 @@ bool pt_optcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
         const pt_sample *ss[OC_DOCS]; for (uint32_t j = 0; j < c->batch; j++) ss[j] = tr[j].s;
         ok = oc_objective(e, c, r, ss, c->batch, (uint32_t)pt_batch_loss_tokens(r, ss, c->batch), &original);
     }
-    for (unsigned arm = c->diag == 10 ? 3u : 1u; ok && arm <= (c->diag == 10 ? 3u : geo ? 4u : 2u); arm++) {
+    for (unsigned arm = c->diag >= 10 ? 3u : 1u; ok && arm <= (c->diag >= 10 ? 3u : geo ? 4u : 2u); arm++) {
         ok = oc_restore(c, r, a, b);
         if (ok && geo) {
             bool pass = false;
@@ -410,7 +410,7 @@ bool pt_optcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
             if (pt_mem_mb() >= 0 && pt_mem_mb() < 3000) { fprintf(stderr, "[optcheck] 内存低于 3000 MB，停止\n"); ok = false; }
         }
         snprintf(tag, sizeof tag, "run%u_post", arm);
-        if (ok && c->diag != 3 && c->diag != 10) ok = oc_eval(e, c, r, tr, nt, tag, "train", arm == 1 ? 1 : 2, f, rows) && oc_eval(e, c, r, ev, ne, tag, "eval", arm == 1 ? 1 : 2, f, rows);
+        if (ok && c->diag != 3 && c->diag != 10) ok = oc_eval(e, c, r, tr, nt, tag, "train", arm == 1 || c->diag == 11 ? 1 : 2, f, rows) && oc_eval(e, c, r, ev, ne, tag, "eval", arm == 1 || c->diag == 11 ? 1 : 2, f, rows);
         if (ok && contribution_ok && c->diag_save == arm) {
             double full_dev = 0;
             ok = pt_eval(e, c, r, d, 2, d->ns, &full_dev, 0, NULL, NULL, NULL) && full_dev > 0 && isfinite(full_dev);

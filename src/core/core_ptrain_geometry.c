@@ -244,6 +244,13 @@ bool pt_geometry_measure(const pt_cfg *c, pt_run *r, pt_geometry *g, unsigned ar
 
 bool pt_geometry_rescale(const pt_cfg *c, pt_run *r, pt_geometry *g, double norm) {
     if (!(norm > 0) || !(g->ref2 > 0)) return false;
+    if (c->diag == 11) {
+        /* 已在原1%容差内时保留原始位模式；减旧值再加回会引入额外舍入。
+         * 越界直接拒绝，不能靠重新缩放或反复试步长寻找好分数。 */
+        const double relative = fabs(norm / sqrt(g->ref2) - 1);
+        fprintf(stderr,"[geometry] retain_direct_update relative_radius_error=%.12g %s\n",relative,relative<=.01?"PASS":"FAIL");
+        return relative <= .01;
+    }
     const float scale = (float)(sqrt(g->ref2) / norm);
     if (!(scale >= .1f && scale <= 10.f)) return false;
     bool ok = true; const uint64_t nf = (uint64_t)c->rank * DS4_N_EMBD;
