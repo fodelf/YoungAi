@@ -197,5 +197,33 @@ bool pt_geometry_rescale(const pt_cfg *c, pt_run *r, pt_geometry *g, double norm
     return ok;
 }
 
+bool pt_geometry_project(const pt_cfg *c, pt_run *r, pt_geometry *g, double *gnorm) {
+    if (!pt_projected_gradient(c, r, gnorm)) return false;
+    bool ok = true; double linear = 0; const uint64_t ny = (uint64_t)g->rows * DS4_N_EMBD;
+    ds4_gpu_set_quality(true);
+    for (uint32_t l = c->layer_lo; ok && l <= c->layer_hi; l++) {
+        ds4_gpu_tensor *full[] = {r->st.ampA[l],r->st.ampB[l],r->mA[l],r->mB[l]}, *p[4] = {0};
+        for (unsigned k = 0; k < 4; k++) { p[k] = pt_rows(full[k], r->k2, c->rank, DS4_N_EMBD); if (!p[k]) ok = false; }
+        double ss = 0;
+        if (ok) ok = ds4_gpu_tensor_fill_f32(g->y, 0.f, ny) &&
+                     ds4_gpu_v41_amp_apply_tensor(g->y, g->x[l], p[2], p[1], g->tmp, g->rows, DS4_N_EMBD, c->rank) &&
+                     ds4_gpu_v41_amp_apply_tensor(g->y, g->x[l], p[0], p[3], g->tmp, g->rows, DS4_N_EMBD, c->rank) &&
+                     ds4_gpu_bwd_sumsq_tensor(g->y, ny, &ss);
+        linear += ss;
+        for (unsigned k = 0; k < 4; k++) geo_drop(&p[k]);
+    }
+    const float eta = linear > 0 ? (float)sqrt(g->ref2 / linear) : 0;
+    if (!(eta > 0 && eta <= 1)) ok = false;
+    for (uint32_t l = c->layer_lo; ok && l <= c->layer_hi; l++) {
+        ds4_gpu_tensor *full[] = {r->st.ampA[l],r->st.ampB[l],r->mA[l],r->mB[l]}, *p[4] = {0};
+        for (unsigned k = 0; k < 4; k++) { p[k] = pt_rows(full[k], r->k2, c->rank, DS4_N_EMBD); if (!p[k]) ok = false; }
+        if (ok) ok = ds4_gpu_bwd_axpy_tensor(p[0], p[2], -eta, (uint64_t)c->rank * DS4_N_EMBD) &&
+                     ds4_gpu_bwd_axpy_tensor(p[1], p[3], -eta, (uint64_t)c->rank * DS4_N_EMBD);
+        for (unsigned k = 0; k < 4; k++) geo_drop(&p[k]);
+    }
+    fprintf(stderr, "[projected] linear_norm=%.12g target_norm=%.12g eta=%.12g %s\n", sqrt(linear), sqrt(g->ref2), eta, ok ? "PASS" : "FAIL");
+    ds4_gpu_set_quality(false); return ok;
+}
+
 #endif
 typedef int ds4_core_ptrain_geometry_nonempty_tu;

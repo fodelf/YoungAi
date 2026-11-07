@@ -254,6 +254,8 @@ bool pt_geometry_equivalence(const pt_cfg *c, pt_run *r, pt_geometry *g, unsigne
 bool pt_geometry_before(const pt_cfg *c, pt_run *r, pt_geometry *g, uint32_t nrow, unsigned arm);
 bool pt_geometry_measure(const pt_cfg *c, pt_run *r, pt_geometry *g, unsigned arm, bool matched, double *norm);
 bool pt_geometry_rescale(const pt_cfg *c, pt_run *r, pt_geometry *g, double norm);
+bool pt_projected_gradient(const pt_cfg *c, pt_run *r, double *gnorm);
+bool pt_geometry_project(const pt_cfg *c, pt_run *r, pt_geometry *g, double *gnorm);
 bool pt_loss_mode(const pt_cfg *c, bool training);
 bool pt_loss_config(const pt_cfg *c);
 bool pt_loss_kl(const pt_cfg *c, pt_run *r, ds4_gpu_tensor *g, ds4_gpu_tensor *logits, uint32_t row, uint32_t m, float scale);

@@ -3,6 +3,7 @@
  * diag=4 重建一步后的状态，在训练doc6的L15/序列行471检查激活方向；不改冻结权重。
  * diag=5 核对实际 Adam 更新前后的同批目标，确认激活局部失配是否真的导致跨步过大。
  * diag=6：原写法重复两次，再测 Hadamard/倒数缩放；前向等价过闸才反传，单步且不存盘。
+ * diag=7：原 Adam 两臂，再做两臂 LoRA-Pro X=0 梯度单步，训练输入匹配有效更新幅度。
  * 每臂恢复同一份 GPU 权重快照并清空 Adam；只选每篇开头一个完整短段，
  * 因而不能把这里的结果说成长上下文成绩。独立留出只评分，不反传。
  * 所有矩阵计算复用生产 GPU 原语；退出时恢复快照，不保存 checkpoint。 */
@@ -240,9 +241,9 @@ bool pt_optcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
     }
     fprintf(stderr, "[optcheck] train_docs=%u eval_docs=%u steps=%u lrA=%.9g lrB=%.9g；每篇只取开头一段\n", nt, ne, c->max_steps, c->lr, c->lr_b > 0 ? c->lr_b : c->lr);
     fprintf(stderr, "[optcheck] 训练/评分固定 TF32；贡献测量 %s；恒等式阈值仍为 1%%\n", c->diag == 3 ? "TF32 与 FP32" : "FP32");
-    pt_geometry *geo = c->diag == 6 ? pt_geometry_new(c, r) : NULL;
+    pt_geometry *geo = c->diag >= 6 ? pt_geometry_new(c, r) : NULL;
     double original = 0, reference_norm = 0;
-    if (c->diag == 6 && !geo) ok = false;
+    if (c->diag >= 6 && !geo) ok = false;
     if (ok) ok = oc_score_check(e, c, r, tr[0].s);
     if (ok && c->diag != 3) ok = oc_eval(e, c, r, tr, nt, "base", "train", 0, f, rows) && oc_eval(e, c, r, ev, ne, "base", "eval", 0, f, rows);
     if (ok && geo) {
@@ -253,8 +254,8 @@ bool pt_optcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
         ok = oc_restore(c, r, a, b);
         if (ok && geo) {
             bool pass = false;
-            ok = pt_geometry_basis(c, r, geo, arm) && oc_frozen(c, r, a, b) && pt_geometry_equivalence(c, r, geo, arm) &&
-                 oc_basis_check(e, c, r, tr, nt, arm, original, &pass);
+            if (c->diag == 6) ok = pt_geometry_basis(c, r, geo, arm) && pt_geometry_equivalence(c, r, geo, arm);
+            if (ok) ok = oc_frozen(c, r, a, b) && oc_basis_check(e, c, r, tr, nt, arm, original, &pass);
             if (ok && !pass) { if (arm <= 2) ok = false; else continue; }
         }
         char tag[24]; snprintf(tag, sizeof tag, "run%u_pre", arm);
@@ -280,7 +281,7 @@ bool pt_optcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
                 free(id);
             }
             if (ok && geo) ok = pt_geometry_before(c, r, geo, tr[0].s->sn, arm);
-            if (ok) ok = pt_opt_step(c, r, step, &gn, &clipped);
+            if (ok) ok = c->diag == 7 && arm > 2 ? pt_geometry_project(c, r, geo, &gn) : pt_opt_step(c, r, step, &gn, &clipped);
             fprintf(stderr, "[optcheck] arm=%u step=%u loss=%.9f gnorm=%.9g clip=%d mem=%ld\n", arm, step, n ? loss / n : 0, gn, clipped, pt_mem_mb());
             if (ok && geo) {
                 double norm = 0, matched = 0;
