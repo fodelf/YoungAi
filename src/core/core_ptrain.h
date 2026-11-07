@@ -246,6 +246,7 @@ bool pt_opt_step(const pt_cfg *c, pt_run *r, uint32_t step, double *gnorm, int *
 /* 步 2(core_ptrain_onpolicy.c): qs[0..nq) = 本轮步 1 过的训练题号; 当前 ③ 存到 out/live 挂上去采样 → 教师打分 → 训, 步数接着 *step 往下记 */
 bool pt_onpolicy(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d, const uint32_t *qs, uint32_t nq, uint32_t ep, uint32_t *step, FILE *lf, double t0);
 bool pt_diag(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d);   /* diag=1: 逐位诊断, core_ptrain_diag.c(会把 ③ 的 A 置零, 跑完只能退出) */
+bool pt_shapecheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d); /* diag=12: 固定1022个目标，对齐2048前向；不更新、不保存权重。 */
 bool pt_optcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d); /* diag=2 重复短对照；3 再用 FP32 核验同一输出分解；只写指标。 */
 bool pt_actcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_sample *s, uint32_t layer, uint32_t row, unsigned arm); /* 固定权重，只扰动激活。 */
 bool pt_stability(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_sample *const *ss, uint32_t ns, uint32_t nt, ds4_gpu_tensor **a, ds4_gpu_tensor **b);
