@@ -1,5 +1,6 @@
 /* diag=2：重复短训固定 TF32；只用 FP32 量因子贡献，避免低精度分解误差掩盖读数。
  * diag=3 只做一步数值核验：固定默认 TF32 前向/反传，同一更新额外用 FP32 分解，不跑评分集。
+ * diag=4 重建一步后的状态，在训练doc6的L15/序列行471检查激活方向；不改冻结权重。
  * 每臂恢复同一份 GPU 权重快照并清空 Adam；只选每篇开头一个完整短段，
  * 因而不能把这里的结果说成长上下文成绩。独立留出只评分，不反传。
  * 所有矩阵计算复用生产 GPU 原语；退出时恢复快照，不保存 checkpoint。 */
@@ -165,6 +166,9 @@ bool pt_optcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
         q[*nq].s = s; q[*nq].index = i; (*nq)++;
     }
     if (nt < c->batch || ne < 4) { fprintf(stderr, "[optcheck] 独立短篇不足 train=%u eval=%u\n", nt, ne); return false; }
+    if (c->diag == 4 && (nt < 7 || tr[6].s->doc != 6 || c->max_steps != 1 || c->batch != 4)) {
+        fprintf(stderr, "[optcheck] 激活诊断固定原料doc6、batch4、max_steps=1；拒绝错位样本\n"); return false;
+    }
     for (uint32_t i = 0; i < nt; i++) for (uint32_t j = 0; j < ne; j++)
         if ((tr[i].s->fpkey && tr[i].s->fpkey == ev[j].s->fpkey) ||
             (tr[i].s->sn == ev[j].s->sn && !memcmp(tr[i].s->sids, ev[j].s->sids, (size_t)tr[i].s->sn * 4))) {
@@ -215,7 +219,7 @@ bool pt_optcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
             if (ok) ok = pt_opt_step(c, r, step, &gn, &clipped);
             fprintf(stderr, "[optcheck] arm=%u step=%u loss=%.9f gnorm=%.9g clip=%d mem=%ld\n", arm, step, n ? loss / n : 0, gn, clipped, pt_mem_mb());
             if (ok && step == 1) {
-                if (c->diag == 2) ds4_gpu_set_quality(true);
+                if (c->diag != 3) ds4_gpu_set_quality(true);
                 const int result = oc_contrib(c, r, a, b, tr[0].s->sn, arm, comp);
                 ds4_gpu_set_quality(false); /* 仅测量用 FP32，不能改变下一步训练或评分。 */
                 if (result < 0) ok = false;
@@ -230,6 +234,7 @@ bool pt_optcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
             }
             if (step == 1 && c->layer_lo < c->layer_hi)
                 for (uint32_t l = c->layer_lo; l <= c->layer_hi; l++) oc_free(&r->save.moe_in[l]);
+            if (ok && step == 1 && c->diag == 4) ok = pt_actcheck(e, c, r, tr[6].s, 15, 471, arm);
             if (pt_mem_mb() >= 0 && pt_mem_mb() < 3000) { fprintf(stderr, "[optcheck] 内存低于 3000 MB，停止\n"); ok = false; }
         }
         snprintf(tag, sizeof tag, "run%u_post", arm);

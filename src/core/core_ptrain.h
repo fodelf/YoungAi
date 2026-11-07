@@ -244,6 +244,7 @@ bool pt_opt_step(const pt_cfg *c, pt_run *r, uint32_t step, double *gnorm, int *
 bool pt_onpolicy(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d, const uint32_t *qs, uint32_t nq, uint32_t ep, uint32_t *step, FILE *lf, double t0);
 bool pt_diag(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d);   /* diag=1: 逐位诊断, core_ptrain_diag.c(会把 ③ 的 A 置零, 跑完只能退出) */
 bool pt_optcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d); /* diag=2 重复短对照；3 再用 FP32 核验同一输出分解；只写指标。 */
+bool pt_actcheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_sample *s, uint32_t layer, uint32_t row, unsigned arm); /* 固定权重，只扰动激活。 */
 
 /* core_ptrain_layer.c: 多层模式。alloc 分逐层缓冲与前向存档(层入口 hc/pre_mix/组号, engram 层另存门输入); bwd 从 r->ghc/r->gpre
  * (末层输出处的梯度)起, 第 hi 层到第 lo 层逐层"重算本层 → 倒推梯度", 放大器梯度累加进 gA/gB。训练段必须到末层(hi = 最后一层):
