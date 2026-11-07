@@ -96,6 +96,7 @@ __global__ static void bwd_scatter_add_kernel(float *dst, const float *src, cons
     float *dr = dst + (uint64_t)(p / (int32_t)K) * D;
     for (uint32_t d = threadIdx.x; d < D; d += blockDim.x) atomicAdd(dr + d, src[(uint64_t)r * D + d]);
 }
+#include "cuda_bwd_scatter_audit.inc.cu"
 /* g_w[pair] = <g_y[token], O[r]>(O = 专家未加权的 down 输出) */
 __global__ static void bwd_rowdot_kernel(float *gw, const float *gy, const float *O, const int32_t *pair, uint32_t K, uint32_t D) {
     __shared__ float sh[32];
@@ -251,7 +252,7 @@ int ds4_gpu_bwd_routed_moe_tensor(ds4_gpu_tensor *gx, ds4_gpu_tensor *gw, const 
                                : vqb_tdot(og, hg, blob, ver, 0u, MID, IN, act, aoff, acnt, nact, gr_all, OUT, 0, bad);   /* og ← G_X(gate 部分) */
         if (ok) ok = ver == 3u ? vqt_launch(og, hu, blob, 1u, MID, IN, nc, gr_all, OUT, 1, bad)
                                : vqb_tdot(og, hu, blob, ver, 1u, MID, IN, act, aoff, acnt, nact, gr_all, OUT, 1, bad);   /* og += G_X(up 部分) */
-        bwd_scatter_add_kernel<<<nv, 256, 0, g_cur_stream>>>((float *)gx->ptr, og, pair, K, IN);
+        if(ok) ok=bwd_scatter_dispatch((float *)gx->ptr,og,pair,list,K,IN,n_tok,nv,layer,cs);
         ok = ok && cuda_ok(cudaGetLastError(), "bwd vq moe");
     }
     int bad_h = 0;
