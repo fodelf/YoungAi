@@ -1,4 +1,4 @@
-/* diag=12：固定首篇原文的1022个教师目标，只改变前向行数。
+/* diag=12：固定首篇原文的1022个教师目标，只改变前向行数；diag=13导出1022行梯度作驻留/流式对拍。
  * out/ref_short.topk、out/ref_aligned.topk须来自同权重、同原文的冻结评分程序。
  * 概率复用评分出口：训练GPU top-K与评分CPU归一化的舍入不同，不能混着判前向。
  * 本入口没有优化器或存盘调用；对齐失败仍落盘诊断，但不做反传准入检查。 */
@@ -85,10 +85,33 @@ static bool shape_compare(const pt_cfg *c, const pt_sample *s, const char *a_nam
     return ok && !target;
 }
 
+static bool shape_gradient(const pt_cfg *c, const pt_run *r, FILE *report) {
+    char path[1200]; snprintf(path, sizeof path, "%s/gradient.bin", c->out);
+    FILE *f = fopen(path, "wb"); if (!f) return false;
+    const uint32_t hd[5] = {0x31445247u, c->layer_lo, c->layer_hi, c->rank, DS4_N_EMBD};
+    const uint64_t n = (uint64_t)c->rank * DS4_N_EMBD;
+    void *buf = xmalloc(n * 4); double total = 0;
+    bool ok = fwrite(hd, sizeof hd, 1, f) == 1;
+    for (uint32_t l = c->layer_lo; ok && l <= c->layer_hi; l++) {
+        ds4_gpu_tensor *ab[2] = {r->gA[l], r->gB[l]};
+        for (unsigned k = 0; ok && k < 2; k++) {
+            ds4_gpu_tensor *v = pt_rows(ab[k], r->k2, c->rank, DS4_N_EMBD); double ss = 0;
+            ok = v && ds4_gpu_bwd_sumsq_tensor(v, n, &ss) && shape_finite(ss) &&
+                 ds4_gpu_tensor_read(v, 0, buf, n * 4) && fwrite(buf, 4, n, f) == n;
+            if (v) ds4_gpu_tensor_free(v);
+            total += ss;
+        }
+    }
+    free(buf); if (fclose(f)) ok = false;
+    fprintf(report, "gradient\tsumsq=%.12g\tfinite_nonzero=%u\n", total, ok && total > 0);
+    return ok && total > 0;
+}
+
 bool pt_shapecheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
+    const uint32_t needed = c->diag == 13 ? SHAPE_TARGETS : SHAPE_ROWS;
     if (c->epochs || c->diag_save || c->max_steps || c->sample_n || !c->init[0] ||
-        r->st.cap_tok < SHAPE_ROWS || c->layer_lo != 0 || c->layer_hi != DS4_N_LAYER - 1u) {
-        fprintf(stderr, "[shape] 要epochs=0、禁止保存/采样、maxlen>=2048、全层固定init；配置不符停车\n"); return false;
+        r->st.cap_tok < needed || c->layer_lo != 0 || c->layer_hi != DS4_N_LAYER - 1u) {
+        fprintf(stderr, "[shape] 要epochs=0、禁止保存/采样、maxlen>=%u、全层固定init；配置不符停车\n", needed); return false;
     }
     const pt_sample *source = NULL;
     for (uint32_t i = 0; i < d->ns; i++) {
@@ -103,6 +126,17 @@ bool pt_shapecheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) 
     FILE *f = fopen(path, "w"); if (!f) return false;
     bool ok = shape_weights(c, r), control = false, aligned = false, repeat = false, post = false;
     if (ok) ok = shape_emit(e, c, r, &s, "short", f) && shape_compare(c, &s, "ref_short", "short", f, &control);
+    if (c->diag == 13) {
+        double loss = 0; uint32_t nt = 0;
+        r->grad_tokens = SHAPE_TARGETS;
+        ok = ok && control && pt_mem_mb() >= 6000 && pt_loss_mode(c, true) && pt_step_sample(e, c, r, &s, 1, &loss, &nt);
+        if (ok) ok = nt == SHAPE_TARGETS && shape_finite(loss) && shape_gradient(c, r, f);
+        if (ok) ok = shape_emit(e, c, r, &s, "post_bwd", f) && shape_compare(c, &s, "short", "post_bwd", f, &post);
+        const bool weights = shape_weights(c, r), pass = ok && post && weights;
+        fprintf(f, "verdict\t%s\tcontrol=%u\ttargets=%u\tobjective=%.12g\tpost=%u\tweights_equal=%u\tavailable_MiB=%ld\n",
+                pass ? "PASS" : "FAIL", control, nt, nt ? loss / nt : -1.0, post, weights, pt_mem_mb());
+        fclose(f); return pass;
+    }
     s.sn = SHAPE_ROWS;
     if (ok) ok = shape_emit(e, c, r, &s, "aligned", f) && shape_compare(c, &s, "ref_aligned", "aligned", f, &aligned);
     if (ok) ok = shape_emit(e, c, r, &s, "repeat", f) && shape_compare(c, &s, "aligned", "repeat", f, &repeat);

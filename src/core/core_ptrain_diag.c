@@ -74,7 +74,7 @@ static void pt_diag_col(FILE *f, ds4_engine *e, const char *name, const int32_t 
 }
 
 bool pt_diag(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
-    if (c->diag == 12) return pt_shapecheck(e, c, r, d);
+    if (c->diag == 12 || c->diag == 13) return pt_shapecheck(e, c, r, d);
     if (c->diag >= 2 && c->diag <= 11) return pt_optcheck(e, c, r, d);
     const uint32_t TK = c->topk;
     char path[1200]; snprintf(path, sizeof path, "%s/diag.txt", c->out);

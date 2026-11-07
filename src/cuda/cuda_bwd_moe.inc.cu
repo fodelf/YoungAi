@@ -140,7 +140,19 @@ int ds4_gpu_bwd_routed_moe_tensor(ds4_gpu_tensor *gx, ds4_gpu_tensor *gw, const 
     const uint32_t ver = ds4vq_blob_ver(bh);
     const uint8_t *blob = (const uint8_t *)cuda_model_range_cached_ptr(model_map, blob_offset, blob_bytes);
     if (!blob && (g_model_registered || g_model_device_owned)) blob = (const uint8_t *)cuda_model_range_ptr(model_map, blob_offset, blob_bytes, "bwd vq blob");
-    if (!blob) { fprintf(stderr, "ds4: [bwd] L%u 专家 blob 不在设备上(流式装载路的反向没接)\n", layer); return 0; }
+    /* 逐层反传刚重算过同层MoE，冷层原字节仍在前向的锁页暂存中。
+     * 只借用完全覆盖当前blob的那一段；不重新装层，避免覆盖截留激活或读到上一层。
+     * 重算与反传共用同一流，下一层重算前本层反传已提交，stage_fill也会同步再覆写。 */
+    if (!blob && g_v41_stage.valid && g_v41_stage.dev) {
+        const uintptr_t address = (uintptr_t)bh;
+        if (address >= g_v41_stage.reg && blob_bytes <= g_v41_stage.bytes &&
+            address - g_v41_stage.reg <= g_v41_stage.bytes - blob_bytes) {
+            blob = (const uint8_t *)g_v41_stage.dev + (address - g_v41_stage.reg);
+            static int said = 0;
+            if (!said++) fprintf(stderr, "ds4: [bwd] L%u 复用同层流式专家暂存，原址/长度已核对\n", layer);
+        }
+    }
+    if (!blob) { fprintf(stderr, "ds4: [bwd] L%u 专家 blob 不在设备缓存或同层流式暂存中\n", layer); return 0; }
     cudaStream_t cs = g_cur_stream ? g_cur_stream : cudaStreamPerThread;
     const uint64_t npair = (uint64_t)n_tok * K;
     int32_t *sel_h = (int32_t *)malloc(npair * 4), *list = (int32_t *)malloc(npair * 4);
