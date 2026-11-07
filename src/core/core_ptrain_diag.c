@@ -6,6 +6,7 @@
  * 只读不训: 不预热、不训练、不落 ③; 结果写 <out>/diag.txt, stderr 每题只打"教师与部署态榜首第一次分叉"那一位。
  * 出错会怎样: 不给 init= 时"挂 ③"那一列就是 A=0 的部署态, 两列逐位相同 —— 不是 bug, 是没挂东西。 */
 #include "core_ptrain.h"
+#include "core_ptrain_split.h"
 #ifndef DS4_NO_GPU
 
 #define PT_DIAG_SHOW 5u   /* 每份分布打前几名; top-K 核是逐轮取最大, 出来就是降序 */
@@ -74,6 +75,7 @@ static void pt_diag_col(FILE *f, ds4_engine *e, const char *name, const int32_t 
 }
 
 bool pt_diag(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
+    if (c->diag == 14) return pt_splitcheck(e, c, r, d);
     if (c->diag == 12 || c->diag == 13) return pt_shapecheck(e, c, r, d);
     if (c->diag >= 2 && c->diag <= 11) return pt_optcheck(e, c, r, d);
     const uint32_t TK = c->topk;

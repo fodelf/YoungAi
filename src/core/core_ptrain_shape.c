@@ -3,6 +3,7 @@
  * 概率复用评分出口：训练GPU top-K与评分CPU归一化的舍入不同，不能混着判前向。
  * 本入口没有优化器或存盘调用；对齐失败仍落盘诊断，但不做反传准入检查。 */
 #include "core_ptrain.h"
+#include "core_ptrain_split.h"
 #include "core_score_aux.h"
 #include "../common/ds4_etgd.h"
 #ifndef DS4_NO_GPU
@@ -15,7 +16,7 @@ static bool shape_finite(double value) {
     return (bits & UINT64_C(0x7ff0000000000000)) != UINT64_C(0x7ff0000000000000);
 }
 
-static bool shape_weights(const pt_cfg *c, const pt_run *r) {
+bool pt_diag_weights(const pt_cfg *c, const pt_run *r) {
     const size_t bytes = (size_t)c->rank * DS4_N_EMBD * 4;
     void *disk = xmalloc(bytes), *gpu = xmalloc(bytes);
     bool ok = true;
@@ -85,7 +86,7 @@ static bool shape_compare(const pt_cfg *c, const pt_sample *s, const char *a_nam
     return ok && !target;
 }
 
-static bool shape_gradient(const pt_cfg *c, const pt_run *r, FILE *report) {
+bool pt_diag_gradient(const pt_cfg *c, const pt_run *r, FILE *report) {
     char path[1200]; snprintf(path, sizeof path, "%s/gradient.bin", c->out);
     FILE *f = fopen(path, "wb"); if (!f) return false;
     const uint32_t hd[5] = {0x31445247u, c->layer_lo, c->layer_hi, c->rank, DS4_N_EMBD};
@@ -124,15 +125,15 @@ bool pt_shapecheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) 
     s.sids = d->docids[0]; s.m = SHAPE_TARGETS; s.sn = SHAPE_TARGETS;
     char path[1200]; snprintf(path, sizeof path, "%s/shape.tsv", c->out);
     FILE *f = fopen(path, "w"); if (!f) return false;
-    bool ok = shape_weights(c, r), control = false, aligned = false, repeat = false, post = false;
+    bool ok = pt_diag_weights(c, r), control = false, aligned = false, repeat = false, post = false;
     if (ok) ok = shape_emit(e, c, r, &s, "short", f) && shape_compare(c, &s, "ref_short", "short", f, &control);
     if (c->diag == 13) {
         double loss = 0; uint32_t nt = 0;
         r->grad_tokens = SHAPE_TARGETS;
         ok = ok && control && pt_mem_mb() >= 6000 && pt_loss_mode(c, true) && pt_step_sample(e, c, r, &s, 1, &loss, &nt);
-        if (ok) ok = nt == SHAPE_TARGETS && shape_finite(loss) && shape_gradient(c, r, f);
+        if (ok) ok = nt == SHAPE_TARGETS && shape_finite(loss) && pt_diag_gradient(c, r, f);
         if (ok) ok = shape_emit(e, c, r, &s, "post_bwd", f) && shape_compare(c, &s, "short", "post_bwd", f, &post);
-        const bool weights = shape_weights(c, r), pass = ok && post && weights;
+        const bool weights = pt_diag_weights(c, r), pass = ok && post && weights;
         fprintf(f, "verdict\t%s\tcontrol=%u\ttargets=%u\tobjective=%.12g\tpost=%u\tweights_equal=%u\tavailable_MiB=%ld\n",
                 pass ? "PASS" : "FAIL", control, nt, nt ? loss / nt : -1.0, post, weights, pt_mem_mb());
         fclose(f); return pass;
@@ -163,7 +164,7 @@ bool pt_shapecheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) 
                 nt, SHAPE_ROWS - SHAPE_TARGETS, tail_ss, nt ? loss / nt : -1.0, backward);
         if (ok) ok = shape_emit(e, c, r, &s, "post_bwd", f) && shape_compare(c, &s, "aligned", "post_bwd", f, &post);
     } else fprintf(f, "backward\tSKIP\tforward_gate_or_memory\tavailable_MiB=%ld\n", before);
-    const bool weights = shape_weights(c, r);
+    const bool weights = pt_diag_weights(c, r);
     const bool pass = ok && control && aligned && repeat && backward && post && weights;
     fprintf(f, "verdict\t%s\tcontrol=%u\taligned=%u\trepeat=%u\tbackward=%u\tpost=%u\tweights_equal=%u\tavailable_MiB=%ld\n",
             pass ? "PASS" : "FAIL", control, aligned, repeat, backward, post, weights, pt_mem_mb());

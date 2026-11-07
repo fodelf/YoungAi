@@ -7,6 +7,7 @@
  * 只有答案位(教师给了分布的那 m 行)有梯度: 末层之后没有注意力, 别的行对答案位没有影响。
  * 多层模式逐层重算并穿过注意力/MoE, 在 core_ptrain_layer.c, 本文件的出口段不变。 */
 #include "core_ptrain.h"
+#include "core_ptrain_split.h"
 #include "../common/ds4_gr_fnv.h"
 #include <sys/stat.h>
 #ifndef DS4_NO_GPU
@@ -133,7 +134,8 @@ bool pt_loss_rows(const pt_cfg *c, pt_run *r, ds4_gpu_tensor *logits, uint32_t r
               ds4_gpu_tensor_write(r->tp, 0, s->top_p + (size_t)off * TK, (uint64_t)m * TK * 4) &&
               ds4_gpu_tensor_write(r->trest, 0, s->top_rest + off, (uint64_t)m * 4) &&
               pt_loss_kl(c, r, *glog, logits, row, m, scale) &&
-              ds4_gpu_tensor_read(r->loss, 0, r->loss_h, (uint64_t)m * 4);
+              ds4_gpu_tensor_read(r->loss, 0, r->loss_h, (uint64_t)m * 4) &&
+              pt_split_mask(c, r, *glog, off, m);
     if (ok) { double l = 0; for (uint32_t k = 0; k < m; k++) l += r->loss_h[k]; *loss += l; *ntok += m; }
     if (ok && r->tail_on) for (uint32_t k = 0; k < m; k++) { r->tail_n++; r->tail_n1 += r->loss_h[k] > 1.f; r->tail_n2 += r->loss_h[k] > 2.f; }   /* 尾位计数(pt_run.tail_*) */
     r->dec_last = -1.0;
