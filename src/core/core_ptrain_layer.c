@@ -12,6 +12,7 @@
  *     轮到源层时(它自己也读自己的压缩行, 先加进去)经 RoPE 反向 → 压缩器 RMSNorm 反向 → 池化反向(ratio>1) → 两块投影的转置乘, 加进本层 g_xn。
  *   - engram 层: 存档是门之前的 hc, 重算时用存档的 key|value 先过门; 本层倒推完再过门的反向, 得到对门之前 hc 的梯度往下传。 */
 #include "core_ptrain.h"
+#include "../common/ds4_sha256.h"
 #ifndef DS4_NO_GPU
 
 #define PT_LB_LIST(b) &b->mixa, &b->posta, &b->comba, &b->prea, &b->xa, &b->xna, &b->qr, &b->kv, &b->o, &b->hcin, \
@@ -204,6 +205,23 @@ static bool pt_compress_bwd(ds4_engine *e, pt_run *r, uint32_t il, uint32_t r0, 
 double pt_tick(const pt_cfg *c) { if (c->prof) (void)ds4_gpu_synchronize(); return c->prof ? now_sec() : 0.0; }
 
 static double pt_row_absmax(const float *v, uint64_t n) { double m = 0; for (uint64_t i = 0; i < n; i++) if (fabs(v[i]) > m) m = fabs(v[i]); return m; }
+/* 范数打印会舍入；完整字节指纹才能判断反传边界是否已经分叉。
+ * 只在固定单题的diag13打开，不给普通训练增加同步或改变算子。 */
+static void pt_byte_hash(const pt_cfg *c, uint32_t il, const char *tag, const void *h, uint64_t bytes) {
+    if(c->diag!=13 || c->dbg_layer!=39 || il!=39) return;
+    uint8_t hash[32]; ds4_sha256(h,(size_t)bytes,hash);
+    fprintf(stderr,"[byte L%u] %s bytes=%llu sha256=",il,tag,(unsigned long long)bytes);
+    for(unsigned j=0;j<32;j++) fprintf(stderr,"%02x",hash[j]);
+    fputc('\n',stderr);
+}
+static bool pt_byte_tensor(const pt_cfg *c, uint32_t il, const char *tag, const ds4_gpu_tensor *t, uint64_t bytes) {
+    if(c->diag!=13 || c->dbg_layer!=39 || il!=39) return true;
+    void *h=xmalloc((size_t)bytes);
+    const bool ok=t && ds4_gpu_tensor_read(t,0,h,bytes);
+    if(ok) pt_byte_hash(c,il,tag,h,bytes);
+    else fprintf(stderr,"[byte L%u] %s READ_FAIL\n",il,tag);
+    free(h); return ok;
+}
 /* dbglayer 探针: 第一题那几行(合批 = 第 0 段, 单题 = 整段)的梯度范数 + 最大行(尖峰压在哪个 token 上), 同一层单题路 vs 合批并排看哪一步先分叉。
  * 10-02 用它追到 STE 尖峰: token 10 的入口梯度从 L20 起逐层放大, 到 L0 占整题 80%(fable5 同日条) */
 static void pt_dbg(const pt_cfg *c, const pt_run *r, uint32_t il, const char *tag, const ds4_gpu_tensor *t, uint64_t rowf) {
@@ -212,6 +230,7 @@ static void pt_dbg(const pt_cfg *c, const pt_run *r, uint32_t il, const char *ta
     float *h = xmalloc((size_t)n0 * rowf * 4);   /* 读回逐行范数: 尖峰压在哪一行(token)上, 是哪一步先冒出来的 */
     (void)ds4_gpu_synchronize();
     if (ds4_gpu_tensor_read(t, 0, h, (uint64_t)n0 * rowf * 4)) {
+        pt_byte_hash(c,il,tag,h,(uint64_t)n0*rowf*4);
         double s = 0, best = -1; uint32_t bi = 0;
         for (uint32_t q = 0; q < n0; q++) {
             double rs = 0;
@@ -267,9 +286,14 @@ static bool pt_layer_bwd(ds4_engine *e, const pt_cfg *c, pt_run *r, uint32_t il,
         char nm[64]; snprintf(nm, sizeof nm, "blk.%u.ffn_exps_vq.blob", il);
         const ds4_tensor *blob = model_find_tensor(m, nm);
         ds4_gpu_bwd_moe_vgrad(r->vg_slot[il] ? r->vg_dw : NULL, r->vg_slot[il], 0, E, FF, E);   /* V 步: 这一层要收按组梯度就开, 否则关(core_ptrain_vstep.c) */
-        ok = blob && ds4_gpu_bwd_routed_moe_tensor(b->g_xnf, b->g_rw, b->g_y, b->xnf, st->sel, st->rw, m->map, m->size, blob->abs_offset, blob->bytes,
-                                                   E, FF, E, DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, il, n) &&
-             ds4_gpu_bwd_router_tensor(b->g_glog, b->g_rw, st->sel, st->glog, n, DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE) &&
+        ok = pt_byte_tensor(c,il,"moe_sel",st->sel,(uint64_t)n*DS4_N_EXPERT_USED*4) &&
+             pt_byte_tensor(c,il,"moe_rw",st->rw,(uint64_t)n*DS4_N_EXPERT_USED*4) &&
+             pt_byte_tensor(c,il,"moe_glog",st->glog,(uint64_t)n*DS4_N_EXPERT*4) &&
+             blob && ds4_gpu_bwd_routed_moe_tensor(b->g_xnf, b->g_rw, b->g_y, b->xnf, st->sel, st->rw, m->map, m->size, blob->abs_offset, blob->bytes,
+                                                 E, FF, E, DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, il, n);
+        if(ok) ok=pt_byte_tensor(c,il,"moe_gx_before_router",b->g_xnf,(uint64_t)n*E*4) &&
+                  pt_byte_tensor(c,il,"moe_gw",b->g_rw,(uint64_t)n*DS4_N_EXPERT_USED*4);
+        if(ok) ok=ds4_gpu_bwd_router_tensor(b->g_glog, b->g_rw, st->sel, st->glog, n, DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE) &&
              PT_MT(b->g_xnf, l->ffn_gate_inp, E, DS4_N_EXPERT, b->g_glog, 1);
     }
     pt_dbg(c, r, il, "g_xnf routed+路由后", b->g_xnf, E);
