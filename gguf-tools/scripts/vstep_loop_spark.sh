@@ -9,13 +9,14 @@
 #        judge KLD ≤ 当前最好 且 Same ≥ 循环起点 − 0.3 pp ⇒ 接力成"当前最好"(vloop/current); 否则丢, 下轮仍从当前最好起。线上不自动挂(挂 = 用户一条命令)。
 # 用法(spark 仓库根): nohup bash gguf-tools/scripts/vstep_loop_spark.sh <轮数> [起点③=vloop/current 或 v17/ckpt_v04] [每族题数=10] [agent 每几轮=3] [模式 mix|think|pt] > /tmp/bugmd/vstep_loop.log 2>&1 &
 #   模式 pt(11-03 夜): 每轮不是 V 步而是低秩 ③(见 inner 的 pt 分支): 编程流 + 本轮新料蒸馏 1500 s, 从上一个接力的 ③ 续训, 与 v17 补丁拼一个目录量四把尺,
-#   门 = Same top 严格升 且 KLD 不比当前最好差过 0.0005; 状态多两个: pt_current(③ 本体) 与 LOOP_DONE(跑完的标记, Mac 侧等它挂上跑九项)。
+#   门 = 正确位数严格增加且KLD不超过当前最好+0.001；pt_current与current统一，LOOP_DONE表示循环完成。
 #   状态全在 gguf/go-onebit/evo/vloop/: current(当前最好 ckpt) / current.kld / current.same / base.same(循环起点 Same, 地板) / ledger.tsv(一轮一行) / rNNN/(料 + 日志)
 #   续跑: 再起一次就从 current 接着, 轮号接 ledger。停: kill 外层脚本(窗口里的训练由包装装回模型), 或 touch gguf/go-onebit/evo/vloop/STOP(本轮完就停)。
 # 判读: ledger.tsv 的 KLD / Same 列随轮单调不升是循环成立的样子; 鹈鹕抽查在 Mac 侧 tests/asst/pel_overnight_mac.sh <标签> <current 指的目录> 另跑, 不占循环。
 # 出错会怎样: 料失败(API 超时 / 行空)⇒ 这轮跳过记 ledger, 下轮重出题; 起点挂不上 ⇒ 停; 四把尺失败 ⇒ 这轮不接力。
 set -uo pipefail
 ROOT="$HOME/ds4-main"; cd "$ROOT" || exit 1
+source gguf-tools/scripts/vloop_gate.sh || exit 1
 S=gguf-tools/scripts/vstep_spark.sh; PY="$HOME/v41env/bin/python"; PD=gguf-tools/data/posttrain; KEY=$PD/deepseek_api.key; HF=hf/DeepSeek-V4.1-Flash-1017
 VL=gguf/go-onebit/evo/vloop; EVO=gguf/go-onebit/evo; CAP=gguf/go-onebit/restore/agent_capture; TH=gguf/go-onebit/evo/think_hold   # 思考留出(inner 也要用, 放顶上)
 VQP=gguf/v41/posttrain/vstep-v17/ckpt_v04   # pt 轮叠在这份索引补丁上量尺(现役 11-03; 两个机制各一个目录, 引擎 --posttrain 同目录两种都读)
@@ -26,9 +27,8 @@ BRIEF="每道题要能在 500 字以内(代码题 60 行以内)完整解答, 题
 M(){ local l; l="[vloop $(date '+%m-%d %H:%M:%S')] $*"; echo "$l"; echo "$l" >> "$VL/loop.log"; }
 num(){ grep -a "$2" "$1" | tail -1 | sed -E 's/.*= *([0-9.]+).*/\1/'; }
 scan_gap(){
-    # 映射失败时不能继续拿上轮配比出题，否则日志报错了、选料却仍按旧账走。
-    "$PY" gguf-tools/scripts/gap_scan.py scan "$@" 2>&1 | cut -c1-200 &&
-        "$PY" gguf-tools/scripts/gap_scan.py next 2>&1 | cut -c1-240 || { M "★缺口重算失败，停止循环★"; return 1; }
+    # 主判只允许选轮，不能把逐位错题反馈给下一轮造料。
+    M "累进模式：保留汇总成绩，停用评测驱动的选料配比"
 }
 
 if [ "${1:-}" = inner ]; then   # 停模型窗口里的一轮: prep → run → pick → judge → 循环门 → 接力
@@ -36,12 +36,12 @@ if [ "${1:-}" = inner ]; then   # 停模型窗口里的一轮: prep → run → 
     if [ "$KIND" = pt ]; then   # 低秩 ③ 轮(11-03 夜, 用户: 明早编程指标要好, Same top 往 90 慢慢推, 每轮 ≤ 1 小时):
         # 料 = 三条 FP 锚编程流(fitrows: 与判决份同域、教师是原件全 logits, V 步两小时的 +0.09 pp 就是它给的) + 本轮官方新短行 + 裸续写代码文档; 不放思考轨迹(pt01: 对编程 −0.15 pp, 真生成没兑现)。
         # 训 = ③ 叠裸 ② 向教师蒸馏 1500 s, 从上一个接力的 ③ 续训(pt_current); 留出 = 思考留出(只报数 + 训练器内"轮末不比第 0 步高"); 量 = ③ 与 v17 补丁拼一个目录(引擎同目录两种都读)的四把尺。
-        # 门: Same top > 当前最好 且 judge KLD ≤ 当前最好 + 0.001(不退的闸, 11-04 08:5x 用户定 Same 口径); 过 = current 指叠加目录 / pt_current 指 ③, 下轮从它续(pt_mode=cont); 不过 = 丢, 下轮仍从 pt_current。
+        # 接纳后current/pt_current都指向完整叠加目录；未接纳仍从当前最好续训。
         FR=$EVO/fitrows
         if [ ! -s "$FR/teacher.ptf" ]; then mkdir -p "$FR"; : > "$FR/rows.jsonl"; : > "$FR/teacher.ptf"
             for dm in code graphics restore; do "$PY" -c "import sys,json; print(json.dumps({'ids': [int(x) for x in open(sys.argv[1]).read().split()]}))" gguf/go-onebit/$dm/fit.ids >> "$FR/rows.jsonl"; cat "$EVO/vstep/fit_$dm.ptf" >> "$FR/teacher.ptf"; done
             M "编程流料目录 $FR: $(wc -l < "$FR/rows.jsonl") 条, 教师表 $(du -m "$FR/teacher.ptf" | cut -f1) MB"; fi
-        PCUR=$(cat "$VL/pt_current" 2>/dev/null); SCUR=$(cat "$VL/current.same")
+        PCUR=$(cat "$VL/current"); SCUR=$(cat "$VL/current.same")
         # 续训轮不再带三条固定 FP 流、只过 1 遍(11-03 夜实撞: vl002 从零 + 三流 一遍 ⇒ Same +0.43 留出平; vl004 / vl005 从 vl002 续 + 同三流再一遍 ⇒ 留出 +2.2% / +2.9% 两轮全丢,
         #   训练前 64 题损失一路掉 = 在背那三条流)。续训轮的料只有本轮官方新出的短行 + 裸续写代码(官方 top-20 教师, 每轮都是新的), 这才是能一直吃的。
         # 22:53 再撞: 续训只吃新料 1 遍(vl008) ⇒ 留出平但 Same 85.59 → 85.36 往回掉(新短行 5/6 不是代码, 把 FP 流学来的往回拉)。续训两条路都堵 ⇒
@@ -83,7 +83,10 @@ if [ "${1:-}" = inner ]; then   # 停模型窗口里的一轮: prep → run → 
         #   旧锚窗已背 15 遍, 砍到几条让 1500 s 能过完整一遍才是信号强度的真杠杆)
         # pt_mode 第 9 段 = ③ 的层段(缺省 0-39; 11-06 上午等体积换形: 秩 128 × L10-29 与 秩 64 × L0-39 字节一样, 加载器没文件的层不挂、逐层 K 可不同, core_v41_amp.c)
         read -r PM LR EP RANK MG MGAP NAM NFPO LAYS < <(cat "$VL/pt_mode" 2>/dev/null); LAYS="${LAYS:-0-39}"; [ -n "${PM:-}" ] || PM=scratch; RANK="${RANK:-64}"; MG="${MG:-0}"; MGAP="${MGAP:-1.0}"; NAM="${NAM:-8192}"
-        if [ "$PM" = cont ] && [ -n "$PCUR" ] && ls "$PCUR"/amp_L*.bin >/dev/null 2>&1; then LR="${LR:-5e-6}"; EP="${EP:-1}"; else PM=scratch; PCUR=""; LR="${LR:-2e-5}"; EP="${EP:-3}"; fi
+        if [ "$PM" != cont ] || [ "$RANK" != 64 ] || [ "$LAYS" != 0-39 ] || ! ls "$PCUR"/amp_L*.bin >/dev/null 2>&1; then
+            M "★累进轮必须从已接纳current续训、rank64、L0-39；拒绝静默从零或换形★"; exit 1
+        fi
+        LR="${LR:-5e-6}"; EP="${EP:-1}"
         DIRS="$FR2,$R/rows"; { [ "$PM" = cont ] && [ -s "$VL/pt_nofit" ]; } || DIRS="$FR,$DIRS"   # pt_nofit 只管续训轮; 从零轮必带三条 fit 流
         # 只按目录数取最近的锚会混入通用轮，并把 12k 位文件当成 8k 位(第 71 轮实撞)。
         # 完整序列按真实位数装入预算，不裁 token；裁过以后教师表的序列键会失配。
@@ -130,26 +133,22 @@ if [ "${1:-}" = inner ]; then   # 停模型窗口里的一轮: prep → run → 
         rm -f gguf/v41judge/stu_*"$(echo "$SD" | tr / _)"*.bin gguf/go-onebit/evo/entity/stu_"$TAG".bin
         K=$(num "/tmp/bugmd/vstep_judge_$TAG.log" "judge: Mean KLD"); SM=$(num "/tmp/bugmd/vstep_judge_$TAG.log" "judge: Same top"); SG=$(num "/tmp/bugmd/vstep_judge_$TAG.log" "judge: 分布还原率")
         WK=$(num "/tmp/bugmd/vstep_judge_$TAG.log" "wt2: Mean KLD"); WS=$(num "/tmp/bugmd/vstep_judge_$TAG.log" "wt2: Same top"); V=丢
-        # 门两条路(00:4x): ① Same 严格超当前最好且 KLD 不退过 0.0005; ② KLD 比当前最好低过 0.001 且 Same 不低于【历史最高 Same】− 0.15(净翻转 ±25 位 ≈ 0.16 pp 的 1σ, 10-21 定的"KLD 主裁 + Same 否决"口径;
-        #   减的是历史最高不是当前, 所以 ② 不会一轮轮把 Same 滑下去)。vl012 实撞: KLD 0.21773 → 0.21571 被 Same 85.52 < 85.59 一票否了, 那 0.07 在噪声里。
         SHI=$(cat "$VL/current.same_hi" 2>/dev/null); [ -n "$SHI" ] || SHI=$SCUR
-        # 08:5x 用户定基准 = vl020(Same 最高的那个), 第二条 KLD 路作废: 门 = Same 严格超当前最好 且 KLD 不比当前最好差过 0.001(只当不退的闸)。
-        #   噪声 1σ ≈ 0.16 pp, 严格超会把运气好的一轮当最好(赢家诅咒), 这是用户选 Same 口径的代价, 真分高下靠九项 / 生成探针。
-        # 09:5x vl023 实撞(从 vl020 续 lr 5e-6 一遍): Same 85.64 对 85.65 = 差 2 个位, KLD 0.21649 → 0.21525, Σmin 历史最高, 被"严格超"否了 ⇒ 下轮又从 vl020 重掷 = 接力叠不起来。
-        #   加平局决胜: Same 在当前最好 − 0.05 以内(≈ 8 个位, 远小于 1σ 25 位)算平, 平局看 KLD 低过 0.0005 才接力; 不是作废的那条 0.15 路(vl016 85.51 对 85.65 照样进不来)。
-        # 11:3x vl025 再撞(从 vl023 续: KLD 0.21525 → 0.21385, Σmin 又创最高, Same 85.57 对 85.64 差 11 个位)被 0.05 平局带否了 ⇒ "最好"与"链头"拆开:
-        #   最好(current, 用户的 Same 口径, 挂/报都看它)照上面的门; 链头(pt_current, 下轮从它续)只要求 KLD 比链头低过 0.0005 且 Same 不低于最好 − 0.15(1σ, 地板钉在最好上不随链滑),
-        #   训练才叠得起来; 链头的 KLD 记在 chain.kld。两者都过 = 接力; 只过链头 = 起点; 都不过 = 丢(下轮仍从链头)。
-        CHK=$(cat "$VL/chain.kld" 2>/dev/null); [ -n "$CHK" ] || CHK=$KCUR
-        # 链头地板 0.15 → 0.25(03:3x): r128 链 vl042 85.65 / vl043 85.73 两轮被 85.89 − 0.15 = 85.74 的地板差 0.01 卡住(85.89 本是运气位), 两轮都是我手工推的链头
-        if [ -n "$K" ] && [ -n "$SM" ] && awk "BEGIN{exit !($K <= $CHK - 0.0005 && $SM >= $SCUR - 0.25)}"; then V=起点; echo "$CK" > "$VL/pt_current"; echo "$K" > "$VL/chain.kld"; fi
-        if [ -n "$K" ] && [ -n "$SM" ] && awk "BEGIN{exit !(($SM > $SCUR && $K <= $KCUR + 0.001) || ($SM >= $SCUR - 0.05 && $K <= $KCUR - 0.0005))}"; then
-            V=接力; echo "$SD" > "$VL/current"; echo "$K" > "$VL/current.kld"; echo "$SM" > "$VL/current.same"; echo "$CK" > "$VL/pt_current"; echo "$K" > "$VL/chain.kld"
+        # 11-07 用户改为严格累进：KL改善不能购买Same退步，链头与已接纳版本统一。
+        BC=$(cat "$VL/current.correct" 2>/dev/null); BN=$(cat "$VL/current.total" 2>/dev/null)
+        RW=$(grep -a '逐位行 →' "/tmp/bugmd/judge_${TAG}_judge.log" | tail -1 | sed 's/.*→ //')
+        read -r NC NN NK < <(vloop_metrics "$RW" 15360)
+        [ "$BN" = 15360 ] && [ -n "$NC" ] || { M "★缺精确正确位数或主判不完整，拒绝接力★"; exit 1; }
+        if vloop_better "$BC" "$NC" "$BN" "$KCUR" "$NK"; then
+            SM=$(awk -v c="$NC" -v n="$NN" 'BEGIN{printf "%.9f",100*c/n}'); K=$NK
+            V=接力; echo "$SD" > "$VL/current"; echo "$K" > "$VL/current.kld"; echo "$SM" > "$VL/current.same"; echo "$SD" > "$VL/pt_current"; echo "$K" > "$VL/chain.kld"
+            echo "$NC" > "$VL/current.correct"; echo "$NN" > "$VL/current.total"
             awk "BEGIN{exit !($SM > $SHI)}" && echo "$SM" > "$VL/current.same_hi" || echo "$SHI" > "$VL/current.same_hi"
+        else
+            cat "$VL/current" > "$VL/pt_current"; cat "$VL/current.kld" > "$VL/chain.kld"
         fi
         M "$V: $SD judge $SG / $K / $SM(当前最好 $KCUR / $SCUR) wt2 $WK / $WS 思考留出 ${TK:-?}(第 0 步 ${H0:-?}) 决策位 ${DK:-?}"
         echo -e "$N\t$TAG\t$LAYER\t$KIND\t$SD\t$V\t${PCUR:--}\t${K:-?}\t${SM:-?}\t${SG:-?}\t${WK:-?}\t${WS:-?}\t-\t$(date '+%m-%d %H:%M')\t${TK:-}\t${DK:-}" >> "$VL/ledger.tsv"
-        # 缺口探索器(11-05 夜, gap_scan.py): 这轮的留出逐段 KL 按族拆 + 编程可修位, 落 gap/<tag>.tsv 与 gap/ledger.tsv, 再按缺口 × 响应度出下一轮的题数配比 gap/next.json
         scan_gap --tag "$TAG" || exit 1
         exit 0
     fi
@@ -209,45 +208,25 @@ gen(){   # 料 $1=轮号 $2=目录 $3=kind(qa|agent); 不要模型; 产物 $2/ro
         "$PY" gguf-tools/scripts/api_round.py leakcheck --q "$r/q.raw.jsonl" --out "$r/q.jsonl" --log "$VL/leak.jsonl" | tee -a "$r/q.log" | tail -1
     fi
     [ -s "$r/rows/ROWS_DONE" ] || { M "轮 $n ① 官方作答 $(grep -c . "$r/q.jsonl") 道 → 短行"; $S apirows "$r/q.jsonl" "$r/rows" > "$r/rows.log" 2>&1 || { tail -3 "$r/rows.log"; M "★轮 $n 短行失败★"; return 1; }; grep -a "短行:" "$r/rows.log" | tail -1; }
-    # 新编程流(第 2 轮起): 判决份的 30 种语言按轮轮转取 4 种, 官方各出 1 个源文件开头 → 泄题关 → 裸续写 ≤ 6144 位带 top-20(守门份换新, 见 vstep_spark.sh rawrows)
+    # 新编程流按预定语言表轮转，再过泄题检查；不读取主判语言分布。
     # ptthink 不出开头 / 不裸续写 / 不打新鲜编程锚(11-05 夜): 这 10 分钟换给思考轨迹料, 整轮才回到 1 小时内; 编程守门 = 11 条历轮锚窗 + 库存两条 FP 流 + 短行
     # $VL/pt_anchor 存在 ⇒ ptthink 也出开头 + 裸续写 + 新鲜编程锚(11-06 早: 60~64 轮没带新鲜锚, 编程 Same 85.9 → 85.5; 51~56 轮带着就守住 85.89 —— 守门的是新鲜锚不是 32 条旧锚窗)
     if { [ "$KINDMODE" != ptthink ] || [ -s "$VL/pt_anchor" ]; } && [ ! -s "$r/raw/ROWS_DONE" ]; then
-        mapfile -t LANGS < <(grep -v '^#' gguf/go-onebit/code/judge.ids.layout | awk 'NF == 3 {print $1}'); local nl=${#LANGS[@]} pick=() i
+        # 预定语言表不来自主判分布；逐位错误不能反送给出题器。
+        local LANGS=(python javascript typescript c cpp java go rust csharp php ruby swift kotlin scala dart lua perl r julia matlab fortran haskell ocaml elixir erlang clojure lisp shell sql html css json yaml markdown toml)
+        local nl=${#LANGS[@]} pick=() i
         # gen 模式(第 5 参 gen, 11-05 晚: 通用文本的矿): 开头换成 10 种通用文档体裁(vstep_spark.sh textgenres), 其余与 pt 轮一样 —— 新鲜 FP 锚就从编程文档变成通用文档, 主尺看 wt2, 编程 judge 只守带
         [ "$KINDMODE" != gen ] || { read -r -a pick < <($S textgenres); M "轮 $n 通用文档体裁 ${#pick[@]} 种 × 3 篇开头 → 裸续写通用流"; }
-        # 19:5x 对位选语言(用户: 不验九项, 自主推 Same 到 90): 按当前最好的判决份逐位行 + 教师 FP 全 logits, 数每种语言"教师 top-1 概率 ≥ 0.5 还不同"的位(可修的缺口;
-        #   vl035: 共 552 位 = 3.59 pp, ruby 34 / fortran 31 / shell 30 / rust 27 / perl 26 … 分布均匀, Same 最低的 markdown / scala 上限只 81~83 反而不是重点), 取最多的 10 种;
-        #   算不出(没行文件 / 没教师锚)退回按轮轮转。每轮 10 种 × 3 篇。
-        local CURJ; CURJ=$(cat "$VL/current" 2>/dev/null | tr / _); local RJ; RJ=$(ls -t gguf/v41judge/stu_code_judge_n15360*"${CURJ:-NONE}"*rows 2>/dev/null | head -1)
-        local TJ=gguf/v41judge/teacher_code_judge_n15360_$(basename "$HF").bin
-        if [ "$KINDMODE" != gen ] && [ -n "$RJ" ] && [ -s "$TJ" ]; then
-            mapfile -t pick < <("$PY" - "$RJ" "$TJ" gguf/go-onebit/code/judge.ids.layout <<'PY'
-import sys, numpy as np
-rows = np.loadtxt(sys.argv[1]); same = rows[:, 3].astype(bool); S = len(same); V = 129280
-m = np.memmap(sys.argv[2], dtype=np.float32, mode='r', offset=8, shape=(S, V)); p1 = np.zeros(S, np.float32)
-for a in range(0, S, 1024):
-    x = np.array(m[a:a + 1024], dtype=np.float32); x -= x.max(1, keepdims=True); e = np.exp(x); p1[a:a + 1024] = (e / e.sum(1, keepdims=True)).max(1)
-langs = [l.split() for l in open(sys.argv[3]) if not l.startswith('#')]
-sc = [((~same[int(s):int(s) + int(n)] & (p1[int(s):int(s) + int(n)] >= 0.5)).sum(), name) for name, s, n in (l for l in langs if len(l) == 3)]
-for c, name in sorted(sc, reverse=True)[:10]: print(name)
-PY
-)
-            M "轮 $n 对位选语言(当前最好 $CURJ 的可修缺口最多 10 种): ${pick[*]}"
-        fi
-        [ ${#pick[@]} -eq 10 ] || { pick=(); for i in 0 1 2 3 4 5 6 7 8 9; do pick+=("${LANGS[$(( (n * 10 + i) % nl ))]}"); done; M "轮 $n 对位选语言算不出, 退回轮转"; }   # 每轮 10 种语言 × 3 篇 = 30 个开头
-        M "轮 $n ① 官方出 4 个源文件开头(${pick[*]}) → 裸续写编程流"
+        [ ${#pick[@]} -gt 0 ] || { for i in 0 1 2 3 4 5 6 7 8 9; do pick+=("${LANGS[$(( (n * 10 + i) % nl ))]}"); done; }
+        M "轮 $n ① 官方出 ${#pick[@]} 种预定语言/体裁各3个开头(${pick[*]}) → 裸续写流"
         "$PY" gguf-tools/scripts/api_round.py seeds --key "$KEY" --langs "${pick[@]}" --n 3 --prefix "${tag}r" --out "$r/seeds.raw.jsonl" --ban "${ban[@]}" > "$r/seeds.log" 2>&1 || { tail -3 "$r/seeds.log"; M "★轮 $n 出开头失败★"; return 1; }
         "$PY" gguf-tools/scripts/api_round.py leakcheck --q "$r/seeds.raw.jsonl" --out "$r/seeds.jsonl" --log "$VL/leak.jsonl" | tee -a "$r/seeds.log" | tail -1
         # 裸续写流是锦上添花, 空了不废整轮(11-03 21:02 实撞: java/js/julia/lua 四篇续写全 < 1500 位 ⇒ 0 篇, 整轮 3 连同 45 条好短行一起跳过了); inner 看 raw/rows.jsonl 在不在决定用不用
         $S rawrows "$r/seeds.jsonl" "$r/raw" > "$r/raw.log" 2>&1 || { tail -2 "$r/raw.log"; M "★轮 $n 裸续写流空, 这轮不带它★"; rm -f "$r/raw/rows.jsonl"; }; grep -a "裸续写流:" "$r/raw.log" | tail -1
     fi
     if { [ "$kind" = think ] || [ "$KINDMODE" = ptthink ]; } && [ ! -s "$r/think/ROWS_DONE" ]; then
-        # 缺口探索器的配比(gap_scan.py next → gap/next.json {"quotas": {code: n, …}}): 有就按族给题数, 没有就 6 族各 NQ
+        # 固定各族题数，不能用主判或留出错误指导下一轮出题。
         QT=""
-        if [ -s "$EVO/gap/next.json" ]; then
-            QT=$("$PY" -c "import json,sys; d=json.load(open(sys.argv[1])); assert d.get('mapping') == 'doc-v2', '配比来自旧映射，请先重算'; print(','.join(f'{k}={v}' for k,v in d['quotas'].items()))" "$EVO/gap/next.json") || { M "★缺口配比未按真实题目重算，停止出题★"; return 1; }
-        fi
         M "轮 $n ① 官方开思考整条轨迹(${QT:-6 族 × $NQ 道}, ≤ 16384 位) → $r/think"
         $S thinkhold "$r/think" "$NQ" "${tag}t" "$QT" > "$r/think.log" 2>&1 || { tail -3 "$r/think.log"; M "★轮 $n 思考轨迹料失败★"; return 1; }; grep -a "思考留出:" "$r/think.log" | tail -1
     fi
@@ -273,13 +252,19 @@ if [ ! -s "$VL/current" ] || [ "$START" != "$(cat "$VL/current")" ]; then   # �
     bash gguf-tools/scripts/with_model_stopped_spark.sh bash -c "$S judge vl000 '$START' 2>&1 | tee /tmp/bugmd/vstep_judge_vl000.log | grep -aE 'judge:|wt2:|尾位'"
     K0=$(num /tmp/bugmd/vstep_judge_vl000.log "judge: Mean KLD"); S0=$(num /tmp/bugmd/vstep_judge_vl000.log "judge: Same top")
     [ -n "$K0" ] && [ -n "$S0" ] || { echo "★起点四把尺没量出来★"; exit 1; }
+    RW0=$(grep -a '逐位行 →' /tmp/bugmd/judge_vl000_judge.log | tail -1 | sed 's/.*→ //')
+    read -r C0 N0 K0 < <(vloop_metrics "$RW0" 15360)
+    [ -n "$C0" ] && [ "$N0" = 15360 ] || { echo "★起点缺完整主判，拒绝建立接力状态★"; exit 1; }
+    S0=$(awk -v c="$C0" -v n="$N0" 'BEGIN{printf "%.9f",100*c/n}')
     echo "$START" > "$VL/current"; echo "$K0" > "$VL/current.kld"; echo "$S0" > "$VL/current.same"; echo "$S0" > "$VL/base.same"
+    echo "$START" > "$VL/pt_current"; echo "$K0" > "$VL/chain.kld"
+    echo "$C0" > "$VL/current.correct"; echo "$N0" > "$VL/current.total"
     [ -s "$VL/ledger.tsv" ] || printf '轮\t标签\t层\t料\tckpt\t判\t起点\tKLD\tSame\tΣmin\twt2KLD\twt2Same\t累计组\t时间\n' > "$VL/ledger.tsv"
     echo -e "0\tvl000\t-\t起点\t$START\t当前最好\t-\t$K0\t$S0" >> "$VL/ledger.tsv"
 fi
 N0=$(( $(awk -F'\t' 'NR > 1 && $1 ~ /^[0-9]+$/ {n = $1} END {print n + 0}' "$VL/ledger.tsv") + 1 ))
 M "循环 $ROUNDS 轮, 从第 $N0 轮起, 当前最好 $(cat "$VL/current")(KLD $(cat "$VL/current.kld") Same $(cat "$VL/current.same"), 地板 Same $(cat "$VL/base.same") − 0.3); 每族 $NQ 道, 每 $AGENT_EVERY 轮一次 agent 轮"
-# ptthink(11-05 夜): 每轮低秩 ③(pt 分支)但料带本轮新开的思考轨迹, 题数按缺口探索器的配比(gap/next.json, gap_scan.py next)出 —— "每轮结束有数指方向"的循环
+# ptthink每轮带新思考轨迹，各族题数固定，评测只决定是否接纳。
 kind_of(){ if [ "$KINDMODE" = think ]; then echo think; elif [ "$KINDMODE" = pt ] || [ "$KINDMODE" = gen ] || [ "$KINDMODE" = ptthink ]; then echo pt; elif [ $(( $1 % AGENT_EVERY )) = 0 ]; then echo agent; else echo qa; fi; }
 rm -f "$VL/LOOP_DONE"
 R=$(printf '%s/r%03d' "$VL" "$N0"); [ -s "$R/GEN_DONE" ] || gen "$N0" "$R" "$(kind_of "$N0")" || { M "★第 $N0 轮料失败, 停★"; exit 1; }
