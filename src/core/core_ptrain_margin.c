@@ -51,15 +51,22 @@ static bool margin_predict(ds4_engine *e, const pt_cfg *c, pt_run *r,
 
 bool pt_margincheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
     if (c->epochs || c->diag_save || c->sample_n || c->max_steps || !c->init[0] ||
-        !c->token_mean || !c->nopack || c->maxlen!=1024 || c->rank!=64 ||
+        !c->token_mean || !c->nopack || (c->maxlen!=1024 && c->maxlen!=2048) || c->rank!=64 ||
         c->topk!=20 || c->layer_lo || c->layer_hi!=39 || c->margin!=.5f ||
         c->margin_p1!=.5f || c->margin_gap!=.3f) return false;
+    pt_sample aligned[MARGIN_DOCS];
     const pt_sample *samples[MARGIN_DOCS]={0};
     for (uint32_t i=0;i<d->ns;i++) {
         const pt_sample *s=&d->s[i];
         if (s->doc<MARGIN_DOCS && !samples[s->doc] && s->raw && !s->eval && s->src==0 &&
-            s->sn==MARGIN_N && s->m==MARGIN_N && !s->l0 && s->sa0==1 && s->top_id)
-            samples[s->doc]=s;
+            !s->l0 && s->sa0==1 && s->top_id) {
+            if(c->maxlen==1024 && s->sn==MARGIN_N && s->m==MARGIN_N) samples[s->doc]=s;
+            else if(c->maxlen==2048 && s->m>=MARGIN_N && d->docn[s->doc]>MARGIN_N) {
+                /* 与保护训练用同一真实前向形状；短文不填充，监督仍只取头1022位。 */
+                pt_sample *a=&aligned[s->doc]; *a=*s; a->sids=d->docids[s->doc]; a->m=MARGIN_N;
+                a->sn=d->docn[s->doc]-1<2048?d->docn[s->doc]-1:2048; samples[s->doc]=a;
+            }
+        }
     }
     for (unsigned j=0;j<MARGIN_DOCS;j++) if(!samples[j]) return false;
     char path[1200]; snprintf(path,sizeof path,"%s/margin.tsv",c->out);
@@ -78,7 +85,7 @@ bool pt_margincheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d)
                 rep,doc,j,v->teacher,v->first,v->second,v->competitor,v->p1,v->p2,v->target,
                 v->z_teacher,v->z_competitor,v->margin,eligible,eligible&&violation,violation);
         }
-        fflush(f); fprintf(stderr,"[margin] repeat=%u doc=%u ok=%u differing_rows=%u\n",rep,doc,ok,diff);
+        fflush(f); fprintf(stderr,"[margin] repeat=%u doc=%u rows=%u ok=%u differing_rows=%u\n",rep,doc,samples[doc]->sn,ok,diff);
     }
     const bool weights=pt_diag_weights(c,r); free(first);
     if(fclose(f)) ok=false;
