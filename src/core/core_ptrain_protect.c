@@ -89,7 +89,7 @@ static bool kp_tail_train(ds4_engine *e,const pt_cfg *c,pt_run *r,pt_sample *sam
                          ds4_gpu_tensor **mask,ds4_gpu_tensor *snap[DS4_MAX_LAYER][2],
                          int32_t base[KEEP_DOCS][KEEP_N],FILE *f,unsigned *updates) {
     bool ok=kp_restore(c,r,snap);double previous=0;
-    for(unsigned step=1;ok && step<=8;step++) {
+    for(unsigned step=1;ok && step<=c->max_steps;step++) {
         double pre=0,post=0,gn=0;int clipped=0;
         ok=kp_objective(e,c,r,samples,mask,true,1,&pre);
         const bool repeated=step==1 || pre==previous;
@@ -133,7 +133,7 @@ bool pt_protectcheck(ds4_engine *e,const pt_cfg *c,pt_run *r,const pt_data *d) {
     return false;
 #else
     const bool tail=c->diag==18;
-    if((c->diag!=16 && !tail) || c->maxlen!=2048 || c->max_steps!=(tail?8u:1u) || c->rank!=64 || c->layer_lo || c->layer_hi!=39 ||
+    if((c->diag!=16 && !tail) || c->maxlen!=2048 || (tail?(c->max_steps!=8 && c->max_steps!=16):c->max_steps!=1) || c->rank!=64 || c->layer_lo || c->layer_hi!=39 ||
        !c->token_mean || !c->nopack || c->sample_n || c->rankprob || c->margin!=.5f || c->margin_p1!=.5f || c->margin_gap!=.3f ||
        c->lr!=5e-6f || (c->lr_b && c->lr_b!=c->lr)) return false;
     pt_sample samples[KEEP_DOCS];bool found[KEEP_DOCS]={0};
