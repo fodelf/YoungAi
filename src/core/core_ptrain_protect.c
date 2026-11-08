@@ -21,6 +21,9 @@ enum { KEEP_DOCS=8, KEEP_N=1022, KEEP_TOTAL=8176 };
 #ifndef PT_TAIL_EXPECT_OBJECTIVE
 #define PT_TAIL_EXPECT_OBJECTIVE 0.
 #endif
+#ifndef PT_TAIL_DIRECTION
+#define PT_TAIL_DIRECTION 0
+#endif
 static ds4_gpu_tensor *protect_mask;
 const ds4_gpu_tensor *pt_protect_mask(void) { return protect_mask; }
 static void kp_free(ds4_gpu_tensor **p) { if(*p) ds4_gpu_tensor_free(*p); *p=NULL; }
@@ -128,10 +131,92 @@ static bool kp_retained(ds4_engine *e,const pt_cfg *c,pt_run *r,pt_sample *sampl
     if(ok && !*broken)memcpy(previous,next,sizeof next);
     return ok && fflush(audit)==0;
 }
+
+/* 只在GPU上量实际参数差；同L2不等于同逐坐标步长，所以两者都记录。 */
+static bool kp_update_stats(ds4_gpu_tensor **p,ds4_gpu_tensor **old,ds4_gpu_tensor **g,
+                            uint32_t n,double gn,double *norm,double *largest,double *alignment) {
+    bool ok=true;double ss=0,cross=0;float v=0;int32_t at=0;
+    ds4_gpu_tensor *d[2]={0},*tmp=v41_alloc((uint64_t)n*4,&ok),*idx=v41_alloc(4,&ok);
+    *largest=0;
+    for(unsigned k=0;ok && k<2;k++) {
+        d[k]=v41_alloc((uint64_t)n*4,&ok);double q=0;
+        if(ok)ok=ds4_gpu_tensor_copy(d[k],0,p[k],0,(uint64_t)n*4) && ds4_gpu_bwd_axpy_tensor(d[k],old[k],-1.f,n) &&
+            ds4_gpu_bwd_sumsq_tensor(d[k],n,&q);
+        ss+=q;
+        for(unsigned sign=0;ok && sign<2;sign++) {
+            ok=ds4_gpu_tensor_fill_f32(tmp,0.f,n) && ds4_gpu_bwd_axpy_tensor(tmp,d[k],sign?-1.f:1.f,n) &&
+                ds4_gpu_v41_argmax_tensor(idx,tmp,0,n) && ds4_gpu_tensor_read(idx,0,&at,4) && at>=0 && (uint32_t)at<n &&
+                ds4_gpu_tensor_read(tmp,(uint64_t)at*4,&v,4);
+            *largest=fmax(*largest,v);
+        }
+    }
+    *norm=sqrt(ss);ok=ok && isfinite(*norm) && *norm>0 && isfinite(gn) && gn>0;
+    for(unsigned k=0;ok && k<2;k++) {
+        double q=0;ok=ds4_gpu_tensor_fill_f32(tmp,0.f,n) && ds4_gpu_bwd_axpy_tensor(tmp,d[k],(float)(1 / *norm),n) &&
+            ds4_gpu_bwd_axpy_tensor(tmp,g[k],(float)(1/gn),n) && ds4_gpu_bwd_sumsq_tensor(tmp,n,&q);
+        cross+=q;
+    }
+    *alignment=(2-cross)/2;
+    kp_free(&d[0]);kp_free(&d[1]);kp_free(&tmp);kp_free(&idx);
+    return ok && isfinite(*largest) && isfinite(*alignment);
+}
+static bool kp_direction_fixture(void) {
+    const float before[4]={0},after[4]={3,-4,0,0},grad[4]={-3,4,0,0};
+    bool ok=true;ds4_gpu_tensor *p[2]={0},*old[2]={0},*g[2]={0};
+    for(unsigned k=0;ok && k<2;k++) {
+        p[k]=v41_alloc(16,&ok);old[k]=v41_alloc(16,&ok);g[k]=v41_alloc(16,&ok);
+        if(ok)ok=ds4_gpu_tensor_write(p[k],0,k?before:after,16) && ds4_gpu_tensor_write(old[k],0,before,16) &&
+            ds4_gpu_tensor_write(g[k],0,k?before:grad,16);
+    }
+    double norm=0,max=0,align=0;
+    if(ok)ok=kp_update_stats(p,old,g,4,5,&norm,&max,&align) && fabs(norm-5)<1e-6 && fabs(max-4)<1e-6 && fabs(align-1)<1e-6;
+    fprintf(stderr,"[direction] known_answer norm=%.12g max=%.12g alignment=%.12g %s\n",norm,max,align,ok?"PASS":"FAIL");
+    for(unsigned k=0;k<2;k++){kp_free(&p[k]);kp_free(&old[k]);kp_free(&g[k]);}
+    return ok;
+}
+static bool kp_direction_step(ds4_engine *e,const pt_cfg *c,pt_run *r,pt_sample *samples,ds4_gpu_tensor **mask,
+                              ds4_gpu_tensor *snap[DS4_MAX_LAYER][2],ds4_gpu_tensor **last,
+                              int32_t base[KEEP_DOCS][KEEP_N],FILE *audit,unsigned step,
+                              double *radius,double *gn,int *clipped,unsigned *updates) {
+    const uint32_t n=r->K*DS4_N_EMBD;bool ok=true;double gg=0;
+    ds4_gpu_tensor *g[2]={0},*p[]={r->st.ampA[c->layer_hi],r->st.ampB[c->layer_hi]};
+    ds4_gpu_tensor *live[]={r->gA[c->layer_hi],r->gB[c->layer_hi]};
+    for(unsigned k=0;ok && k<2;k++) {
+        if(r->k2) {
+            ds4_gpu_tensor *prefix=pt_rows(live[k],0,r->k2,DS4_N_EMBD);
+            ok=prefix && ds4_gpu_tensor_fill_f32(prefix,0.f,(uint64_t)r->k2*DS4_N_EMBD);kp_free(&prefix);
+        }
+        g[k]=v41_alloc((uint64_t)n*4,&ok);double q=0;
+        if(ok)ok=ds4_gpu_tensor_copy(g[k],0,live[k],0,(uint64_t)n*4) && ds4_gpu_bwd_sumsq_tensor(g[k],n,&q);
+        gg+=q;
+    }
+    *gn=sqrt(gg);*clipped=0;ok=ok && isfinite(*gn) && *gn>0 && *gn<c->clip;
+    if(ok && step==1) {
+        double adam_gn=0,post=0,max=0,align=0;int adam_clip=0;unsigned broken=0,hit=0;
+        int32_t control[KEEP_DOCS][KEEP_N];memcpy(control,base,sizeof control);
+        ok=kp_direction_fixture() && pt_opt_step(c,r,1,&adam_gn,&adam_clip);if(ok)(*updates)++;
+        if(ok)ok=kp_frozen(c,r,snap) && kp_update_stats(p,last,g,n,*gn,radius,&max,&align) &&
+            kp_objective(e,c,r,samples,mask,true,0,&post) && kp_retained(e,c,r,samples,control,&broken,&hit,audit,0);
+        fprintf(stderr,"[direction] adam_control norm=%.12g max=%.12g alignment=%.12g objective=%.12g same=%u broken=%u repeat=%u\n",
+                *radius,max,align,post,hit,broken,ok);
+        ok=ok && hit==7351 && broken==1 && fabs(post-.164124521423)<1e-10 && !adam_clip && fabs(adam_gn-*gn)<1e-10;
+        if(ok)ok=kp_restore(c,r,snap);
+    }
+    const double scale=*radius / *gn;
+    ok=ok && isfinite(scale) && scale>0;
+    for(unsigned k=0;ok && k<2;k++)ok=ds4_gpu_bwd_axpy_tensor(p[k],g[k],(float)-scale,n) && ds4_gpu_tensor_fill_f32(live[k],0.f,n);
+    if(ok)(*updates)++;
+    double actual=0,max=0,align=0;
+    if(ok)ok=kp_update_stats(p,last,g,n,*gn,&actual,&max,&align) && fabs(actual / *radius-1)<.001 && align>.999;
+    fprintf(stderr,"[direction] raw step=%u radius=%.12g actual=%.12g max=%.12g alignment=%.12g scale=%.12g matched=%u\n",
+            step,*radius,actual,max,align,scale,ok);
+    for(unsigned k=0;k<2;k++)kp_free(&g[k]);
+    return ok;
+}
 static bool kp_tail_train(ds4_engine *e,const pt_cfg *c,pt_run *r,pt_sample *samples,
                          ds4_gpu_tensor **mask,ds4_gpu_tensor *snap[DS4_MAX_LAYER][2],
                          int32_t base[KEEP_DOCS][KEEP_N],FILE *f,unsigned *updates) {
-    bool ok=kp_restore(c,r,snap);double previous=0;unsigned accepted=0;
+    bool ok=kp_restore(c,r,snap);double previous=0,radius=0;unsigned accepted=0;
     ds4_gpu_tensor *last[2]={0};const uint64_t bytes=(uint64_t)r->K*DS4_N_EMBD*4;
     FILE *audit=NULL;
     int32_t retained[KEEP_DOCS][KEEP_N];memcpy(retained,base,sizeof retained);
@@ -152,7 +237,8 @@ static bool kp_tail_train(ds4_engine *e,const pt_cfg *c,pt_run *r,pt_sample *sam
         ok=kp_objective(e,c,r,samples,mask,true,1,&pre);
         const bool repeated=step==1?(PT_TAIL_EXPECT_OBJECTIVE<=0 || fabs(pre-PT_TAIL_EXPECT_OBJECTIVE)<1e-6):pre==previous;
         ok=ok && repeated;
-        if(ok){ok=pt_opt_step(c,r,step,&gn,&clipped);if(ok)(*updates)++;}
+        if(ok && PT_TAIL_DIRECTION)ok=kp_direction_step(e,c,r,samples,mask,snap,last,base,audit,step,&radius,&gn,&clipped,updates);
+        else if(ok){ok=pt_opt_step(c,r,step,&gn,&clipped);if(ok)(*updates)++;}
         const bool frozen=ok && kp_frozen(c,r,snap);
         if(ok)ok=frozen && kp_objective(e,c,r,samples,mask,true,0,&post);
         ok=ok && isfinite(gn) && post<pre;
@@ -208,8 +294,8 @@ bool pt_protectcheck(ds4_engine *e,const pt_cfg *c,pt_run *r,const pt_data *d) {
     return false;
 #else
     const bool tail=c->diag==18;
-    if(tail && PT_TAIL_RETAIN && c->max_steps!=8)return false;
-    if((c->diag!=16 && !tail) || c->maxlen!=2048 || (tail?(c->max_steps!=8 && c->max_steps!=16):c->max_steps!=1) || c->rank!=64 || c->layer_lo || c->layer_hi!=39 ||
+    if(tail && PT_TAIL_RETAIN && c->max_steps!=(PT_TAIL_DIRECTION?4u:8u))return false;
+    if((c->diag!=16 && !tail) || c->maxlen!=2048 || (tail?(c->max_steps!=8 && c->max_steps!=16 && !(PT_TAIL_DIRECTION && c->max_steps==4)):c->max_steps!=1) || c->rank!=64 || c->layer_lo || c->layer_hi!=39 ||
        !c->token_mean || !c->nopack || c->sample_n || c->rankprob || c->margin!=.5f || c->margin_p1!=.5f || c->margin_gap!=.3f ||
        c->lr!=5e-6f || (c->lr_b && c->lr_b!=c->lr)) return false;
     pt_sample samples[KEEP_DOCS];bool found[KEEP_DOCS]={0};
