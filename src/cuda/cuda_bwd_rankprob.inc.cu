@@ -2,6 +2,7 @@
  * 教师仅有 top-K：学生榜首在表外时用末位概率作上界；无法证明严格排序则不加项。
  * 学生并列而 argmax 选到非教师词时取半梯度，与 torch.maximum 的折点约定一致。 */
 #include "ds4_gpu_rankprob.h"
+#include "cuda_bwd_keepmargin.inc.cu"
 
 __global__ static void rankprob_kernel(float *g, float *loss, const float *z, uint32_t row0,
     uint32_t V, const int32_t *tid, const float *tp, const float *w, uint32_t K, float scale, float lam) {
