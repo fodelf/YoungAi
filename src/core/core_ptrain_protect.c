@@ -5,6 +5,13 @@
 #include <sys/stat.h>
 #ifndef DS4_NO_GPU
 enum { KEEP_DOCS=8, KEEP_N=1022, KEEP_TOTAL=8176 };
+/* 独立实验构建声明父本计数，防止接力新父本时沿用旧轮次的准入值。 */
+#ifndef PT_TAIL_EXPECT_SAME
+#define PT_TAIL_EXPECT_SAME 7343
+#endif
+#ifndef PT_TAIL_EXPECT_LOW
+#define PT_TAIL_EXPECT_LOW 618
+#endif
 static ds4_gpu_tensor *protect_mask;
 const ds4_gpu_tensor *pt_protect_mask(void) { return protect_mask; }
 static void kp_free(ds4_gpu_tensor **p) { if(*p) ds4_gpu_tensor_free(*p); *p=NULL; }
@@ -171,7 +178,8 @@ bool pt_protectcheck(ds4_engine *e,const pt_cfg *c,pt_run *r,const pt_data *d) {
     fprintf(stderr,"[keep] frozen_base same=%u total=%u low_conf_correct=%u repeat=%u\n",total_keep,KEEP_TOTAL,low_keep,ok);
     const char *names[]={"control","candidate"};unsigned updates=0;
     if(tail) {
-        ok=ok && total_keep==7343 && low_keep==618 && kp_tail_train(e,c,r,samples,mask,snap,base,f,&updates);
+        fprintf(stderr,"[tail] expected_parent same=%u low_conf_correct=%u\n",(unsigned)PT_TAIL_EXPECT_SAME,(unsigned)PT_TAIL_EXPECT_LOW);
+        ok=ok && total_keep==PT_TAIL_EXPECT_SAME && low_keep==PT_TAIL_EXPECT_LOW && kp_tail_train(e,c,r,samples,mask,snap,base,f,&updates);
         goto finish;
     }
     for(unsigned arm=0;ok && arm<2;arm++) {
