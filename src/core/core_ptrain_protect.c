@@ -15,6 +15,9 @@ enum { KEEP_DOCS=8, KEEP_N=1022, KEEP_TOTAL=8176 };
 #ifndef PT_TAIL_RETAIN
 #define PT_TAIL_RETAIN 0
 #endif
+#ifndef PT_TAIL_ALLKEEP
+#define PT_TAIL_ALLKEEP 0
+#endif
 static ds4_gpu_tensor *protect_mask;
 const ds4_gpu_tensor *pt_protect_mask(void) { return protect_mask; }
 static void kp_free(ds4_gpu_tensor **p) { if(*p) ds4_gpu_tensor_free(*p); *p=NULL; }
@@ -32,15 +35,18 @@ static bool kp_fixture(void) {
         ds4_gpu_tensor_write(p[2],0,tp,sizeof tp) && ds4_gpu_tensor_write(p[3],0,rest,sizeof rest) &&
         ds4_gpu_tensor_write(p[4],0,keep,sizeof keep) && ds4_gpu_bwd_kl_margin(.5f,.5f,.3f) &&
         ds4_gpu_bwd_kl_topk_tensor(p[5],p[7],p[0],0,4,4,p[1],p[2],p[3],NULL,2,.25f) &&
-        ds4_gpu_bwd_kl_keepmargin_tensor(p[6],p[8],p[0],0,4,4,p[1],p[2],p[3],2,.25f,p[4],.5f,.5f,.3f) &&
+        ds4_gpu_bwd_kl_keepmargin_tensor(p[6],p[8],p[0],0,4,4,p[1],p[2],p[3],2,.25f,p[4],.5f,PT_TAIL_ALLKEEP?1.01f:.5f,.3f) &&
         ds4_gpu_tensor_read(p[5],0,a,sizeof a) && ds4_gpu_tensor_read(p[6],0,b,sizeof b) &&
         ds4_gpu_tensor_read(p[7],0,la,sizeof la) && ds4_gpu_tensor_read(p[8],0,lb,sizeof lb);
     double worst=0;
     for(unsigned i=0;ok && i<16;i++) {
-        const double expected=i==0?-.125:i==1?.125:0;
+        const double expected=(i==0 || (PT_TAIL_ALLKEEP && i==8))?-.125:(i==1 || (PT_TAIL_ALLKEEP && i==9))?.125:0;
         worst=fmax(worst,fabs((double)b[i]-a[i]-expected));
     }
-    for(unsigned i=0;ok && i<4;i++) worst=fmax(worst,fabs((double)lb[i]-la[i]-(i?0:.5*(log(.4/.35)-.1))));
+    for(unsigned i=0;ok && i<4;i++) {
+        const double expected=i==0?.5*(log(.4/.35)-.1):(PT_TAIL_ALLKEEP && i==2)?.1:0;
+        worst=fmax(worst,fabs((double)lb[i]-la[i]-expected));
+    }
     ok=ok && isfinite(worst) && worst<1e-6;
     fprintf(stderr,"[keep] known_answer max_error=%.12g %s\n",worst,ok?"PASS":"FAIL");
     for(unsigned i=0;i<9;i++) kp_free(&p[i]);
@@ -101,7 +107,7 @@ static unsigned kp_breaks(const int32_t *old,const int32_t *now,const int32_t *t
     return broken;
 }
 static bool kp_retained(ds4_engine *e,const pt_cfg *c,pt_run *r,pt_sample *samples,
-                        int32_t previous[KEEP_DOCS][KEEP_N],unsigned *broken,unsigned *hit) {
+                        int32_t previous[KEEP_DOCS][KEEP_N],unsigned *broken,unsigned *hit,FILE *audit,unsigned step) {
     int32_t next[KEEP_DOCS][KEEP_N],rep[KEEP_N],teacher[KEEP_N];bool ok=pt_loss_mode(c,false);
     *broken=0;*hit=0;
     for(unsigned doc=0;ok && doc<KEEP_DOCS;doc++) {
@@ -112,19 +118,24 @@ static bool kp_retained(ds4_engine *e,const pt_cfg *c,pt_run *r,pt_sample *sampl
             unsigned best=0;const size_t at=(size_t)j*c->topk;
             for(unsigned k=1;k<c->topk;k++)if(samples[doc].top_p[at+k]>samples[doc].top_p[at+best])best=k;
             teacher[j]=samples[doc].top_id[at+best];*hit+=next[doc][j]==teacher[j];
+            fprintf(audit,"%u\t%u\t%u\t%d\t%d\t%d\t%.9g\n",step,doc,j,teacher[j],previous[doc][j],next[doc][j],samples[doc].top_p[at+best]);
         }
         if(ok)*broken+=kp_breaks(previous[doc],next[doc],teacher,KEEP_N);
     }
     if(ok && !*broken)memcpy(previous,next,sizeof next);
-    return ok;
+    return ok && fflush(audit)==0;
 }
 static bool kp_tail_train(ds4_engine *e,const pt_cfg *c,pt_run *r,pt_sample *samples,
                          ds4_gpu_tensor **mask,ds4_gpu_tensor *snap[DS4_MAX_LAYER][2],
                          int32_t base[KEEP_DOCS][KEEP_N],FILE *f,unsigned *updates) {
     bool ok=kp_restore(c,r,snap);double previous=0;unsigned accepted=0;
     ds4_gpu_tensor *last[2]={0};const uint64_t bytes=(uint64_t)r->K*DS4_N_EMBD*4;
+    FILE *audit=NULL;
     int32_t retained[KEEP_DOCS][KEEP_N];memcpy(retained,base,sizeof retained);
     if(PT_TAIL_RETAIN) {
+        char path[1200];snprintf(path,sizeof path,"%s/retention.tsv",c->out);audit=fopen(path,"w");
+        ok=ok && audit!=NULL;
+        if(audit)fprintf(audit,"step\tdoc\tpos\tteacher\tprevious\ttrial\tp1\n");
         const int32_t t[]={1,2,3},old[]={1,0,3},swap[]={0,2,3},gain[]={1,2,3};
         ok=ok && kp_breaks(old,swap,t,3)==1 && kp_breaks(old,gain,t,3)==0;
         fprintf(stderr,"[retain] known_answer=%s\n",ok?"PASS":"FAIL");
@@ -146,7 +157,7 @@ static bool kp_tail_train(ds4_engine *e,const pt_cfg *c,pt_run *r,pt_sample *sam
                 step,pre,post,gn,clipped,repeated,frozen,ok);
         previous=post;
         if(ok && PT_TAIL_RETAIN) {
-            unsigned broken=0,hit=0;ok=kp_retained(e,c,r,samples,retained,&broken,&hit);
+            unsigned broken=0,hit=0;ok=kp_retained(e,c,r,samples,retained,&broken,&hit,audit,step);
             fprintf(stderr,"[retain] step=%u same=%u broken_previous=%u repeat=%u accepted=%u\n",step,hit,broken,ok,ok&&!broken);
             if(ok && broken) {
                 /* 首次违反保持条件就整步撤回并结束，不再使用该步的Adam状态续训。 */
@@ -159,6 +170,7 @@ static bool kp_tail_train(ds4_engine *e,const pt_cfg *c,pt_run *r,pt_sample *sam
         if(ok)accepted++;
     }
     for(unsigned k=0;k<2;k++)kp_free(&last[k]);
+    if(audit && fclose(audit)!=0)ok=false;
     unsigned hit=0,fixed=0,broken=0,baseline=0;int32_t ids[KEEP_N],rep[KEEP_N];
     if(ok)ok=pt_loss_mode(c,false);
     for(unsigned doc=0;ok && doc<KEEP_DOCS;doc++) {

@@ -3,6 +3,9 @@
 #include "ds4_gpu_rankprob.h"
 #include "ds4_gpu_keepmargin.h"
 #include "core_ptrain_split.h"
+#ifndef PT_TAIL_ALLKEEP
+#define PT_TAIL_ALLKEEP 0
+#endif
 #ifndef DS4_NO_GPU
 static float pt_rankprob_lambda;
 static bool pt_keep_training;
@@ -28,7 +31,8 @@ bool pt_loss_kl(const pt_cfg *c, pt_run *r, ds4_gpu_tensor *g, ds4_gpu_tensor *l
 #ifndef __APPLE__
     if((c->diag==16 || c->diag==18) && pt_keep_training && pt_protect_mask())
         return ds4_gpu_bwd_kl_keepmargin_tensor(g,r->loss,logits,row,m,DS4_N_VOCAB,r->tid,r->tp,r->trest,
-            c->topk,scale,pt_protect_mask(),c->margin,c->margin_p1,c->margin_gap);
+            c->topk,scale,pt_protect_mask(),c->margin,
+            c->diag==18 && PT_TAIL_ALLKEEP?1.01f:c->margin_p1,c->margin_gap);
     return ds4_gpu_bwd_kl_rankprob_tensor(g, r->loss, logits, row, m, DS4_N_VOCAB,
         r->tid, r->tp, r->trest, NULL, c->topk, scale, pt_rankprob_lambda);
 #else
