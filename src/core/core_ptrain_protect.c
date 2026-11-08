@@ -27,6 +27,9 @@ enum { KEEP_DOCS=8, KEEP_N=1022, KEEP_TOTAL=8176 };
 #ifndef PT_TAIL_RADIUS
 #define PT_TAIL_RADIUS 0.
 #endif
+#ifndef PT_TAIL_BACKTRACK
+#define PT_TAIL_BACKTRACK 0
+#endif
 static ds4_gpu_tensor *protect_mask;
 const ds4_gpu_tensor *pt_protect_mask(void) { return protect_mask; }
 static void kp_free(ds4_gpu_tensor **p) { if(*p) ds4_gpu_tensor_free(*p); *p=NULL; }
@@ -224,10 +227,70 @@ static bool kp_direction_step(ds4_engine *e,const pt_cfg *c,pt_run *r,pt_sample 
     for(unsigned k=0;k<2;k++)kp_free(&g[k]);
     return ok;
 }
+/* 只量训练切片B中已登记的脆弱位置；固定竞争词便于比较，最终仍检查全部位置。 */
+static bool kp_boundary_probe(ds4_engine *e,pt_run *r,const pt_sample *s,double *margin) {
+    pt_state_reset(&r->st);r->cont_s=NULL;r->st.ced_skip=0;r->st.head_last_only=0;
+    float a=0,b=0;const uint64_t row=(uint64_t)575*DS4_N_VOCAB;
+    const bool ok=v41_forward(e,&r->st,s->sids,s->sn) &&
+        ds4_gpu_tensor_read(r->st.logits,(row+769)*4,&a,4) && ds4_gpu_tensor_read(r->st.logits,(row+6946)*4,&b,4);
+    *margin=(double)a-b;return ok && isfinite(*margin);
+}
+
+/* 每次都从同一快照重新施加原梯度，避免权重插值误差；失败试算不能改保持集合。 */
+static int kp_backtrack(ds4_engine *e,const pt_cfg *c,pt_run *r,pt_sample *samples,ds4_gpu_tensor **mask,
+                        ds4_gpu_tensor *snap[DS4_MAX_LAYER][2],ds4_gpu_tensor **last,
+                        int32_t retained[KEEP_DOCS][KEEP_N],FILE *audit,unsigned step,double pre,
+                        double *post,double *radius,unsigned *trials,unsigned *updates) {
+    bool ok=true;const uint32_t n=r->K*DS4_N_EMBD;double gg=0;
+    ds4_gpu_tensor *g[2]={0},*p[]={r->st.ampA[c->layer_hi],r->st.ampB[c->layer_hi]};
+    ds4_gpu_tensor *live[]={r->gA[c->layer_hi],r->gB[c->layer_hi]};
+    for(unsigned k=0;ok && k<2;k++) {
+        if(r->k2) {
+            ds4_gpu_tensor *prefix=pt_rows(live[k],0,r->k2,DS4_N_EMBD);
+            ok=prefix && ds4_gpu_tensor_fill_f32(prefix,0.f,(uint64_t)r->k2*DS4_N_EMBD);kp_free(&prefix);
+        }
+        g[k]=v41_alloc((uint64_t)n*4,&ok);double q=0;
+        if(ok)ok=ds4_gpu_tensor_copy(g[k],0,live[k],0,(uint64_t)n*4) && ds4_gpu_bwd_sumsq_tensor(g[k],n,&q) &&
+            ds4_gpu_tensor_fill_f32(live[k],0.f,n);
+        gg+=q;
+    }
+    const double gn=sqrt(gg);double boundary=0;bool accepted=false;
+    ok=ok && isfinite(gn) && gn>0 && gn<c->clip && pre>0;
+    if(ok && step==1) {
+        *radius=PT_TAIL_RADIUS;
+        ok=kp_direction_fixture() && kp_boundary_probe(e,r,&samples[3],&boundary) &&
+            fabs(boundary-.000299453735)<1e-9 && fabs(gn-.0236464977571)<1e-10 && fabs(pre-.130914387941)<1e-10;
+        fprintf(stderr,"[backtrack] parent_boundary=%.12g gnorm=%.12g baseline_match=%u\n",boundary,gn,ok);
+    }
+    double trial_radius=*radius;
+    for(unsigned attempt=0;ok && attempt<4 && *trials<8;attempt++,trial_radius*=.5) {
+        for(unsigned k=0;ok && k<2;k++)ok=ds4_gpu_tensor_copy(p[k],0,last[k],0,(uint64_t)n*4) &&
+            ds4_gpu_bwd_axpy_tensor(p[k],g[k],(float)(-trial_radius/gn),n);
+        if(ok){(*updates)++;(*trials)++;}
+        double actual=0,max=0,align=0,trial_loss=0;
+        if(ok)ok=kp_frozen(c,r,snap) && kp_update_stats(p,last,g,n,gn,&actual,&max,&align) &&
+            fabs(actual/trial_radius-1)<.001 && align>.999 &&
+            kp_objective(e,c,r,samples,mask,true,0,&trial_loss) && kp_boundary_probe(e,r,&samples[3],&boundary);
+        int32_t next[KEEP_DOCS][KEEP_N];memcpy(next,retained,sizeof next);unsigned broken=0,hit=0;
+        if(ok)ok=kp_retained(e,c,r,samples,next,&broken,&hit,audit,*trials);
+        const bool replay=step!=1 || attempt!=0 ||
+            (fabs(trial_loss-.130811669869)<1e-10 && hit==7512 && broken==1);
+        ok=ok && replay;
+        const bool armijo=isfinite(trial_loss) && trial_loss<=pre-1e-4*trial_radius*gn;
+        accepted=ok && armijo && !broken;
+        fprintf(stderr,"[backtrack] step=%u attempt=%u trial=%u radius=%.12g actual=%.12g max=%.12g alignment=%.12g gnorm=%.12g before=%.12g after=%.12g boundary=%.12g same=%u broken=%u armijo=%u repeat=%u replay98_check=%d accepted=%u\n",
+                step,attempt+1,*trials,trial_radius,actual,max,align,gn,pre,trial_loss,boundary,hit,broken,armijo,ok,step==1&&attempt==0?(int)replay:-1,accepted);
+        if(accepted){memcpy(retained,next,sizeof next);*post=trial_loss;*radius=trial_radius;break;}
+        for(unsigned k=0;k<2;k++)if(!ds4_gpu_tensor_copy(p[k],0,last[k],0,(uint64_t)n*4))ok=false;
+        fprintf(stderr,"[backtrack] trial=%u restored_previous=%u\n",*trials,ok);
+    }
+    for(unsigned k=0;k<2;k++)kp_free(&g[k]);
+    return !ok?-1:accepted?1:0;
+}
 static bool kp_tail_train(ds4_engine *e,const pt_cfg *c,pt_run *r,pt_sample *samples,
                          ds4_gpu_tensor **mask,ds4_gpu_tensor *snap[DS4_MAX_LAYER][2],
                          int32_t base[KEEP_DOCS][KEEP_N],FILE *f,unsigned *updates) {
-    bool ok=kp_restore(c,r,snap);double previous=0,radius=0;unsigned accepted=0;
+    bool ok=kp_restore(c,r,snap);double previous=0,radius=0;unsigned accepted=0,trials=0;
     ds4_gpu_tensor *last[2]={0};const uint64_t bytes=(uint64_t)r->K*DS4_N_EMBD*4;
     FILE *audit=NULL;
     int32_t retained[KEEP_DOCS][KEEP_N];memcpy(retained,base,sizeof retained);
@@ -248,6 +311,14 @@ static bool kp_tail_train(ds4_engine *e,const pt_cfg *c,pt_run *r,pt_sample *sam
         ok=kp_objective(e,c,r,samples,mask,true,1,&pre);
         const bool repeated=step==1?(PT_TAIL_EXPECT_OBJECTIVE<=0 || fabs(pre-PT_TAIL_EXPECT_OBJECTIVE)<1e-6):pre==previous;
         ok=ok && repeated;
+        if(ok && PT_TAIL_BACKTRACK) {
+            const int result=kp_backtrack(e,c,r,samples,mask,snap,last,retained,audit,step,pre,&post,&radius,&trials,updates);
+            ok=result>=0;
+            if(result<=0){fprintf(stderr,"[backtrack] stopped_at=%u accepted_steps=%u trials=%u rollback=%u\n",step,accepted,trials,ok);break;}
+            previous=post;accepted++;
+            fprintf(stderr,"[tail] step=%u before=%.12g after=%.12g pre_repeat=%u frozen_L0_38=1 decreased=1 accepted=1\n",step,pre,post,repeated);
+            continue;
+        }
         if(ok && PT_TAIL_DIRECTION)ok=kp_direction_step(e,c,r,samples,mask,snap,last,base,audit,step,&radius,&gn,&clipped,updates);
         else if(ok){ok=pt_opt_step(c,r,step,&gn,&clipped);if(ok)(*updates)++;}
         const bool frozen=ok && kp_frozen(c,r,snap);
@@ -305,6 +376,7 @@ bool pt_protectcheck(ds4_engine *e,const pt_cfg *c,pt_run *r,const pt_data *d) {
     return false;
 #else
     const bool tail=c->diag==18;
+    if(PT_TAIL_BACKTRACK && (!tail || !PT_TAIL_RETAIN || !PT_TAIL_DIRECTION || PT_TAIL_RADIUS<=0))return false;
     if(tail && PT_TAIL_RETAIN && c->max_steps!=(PT_TAIL_DIRECTION?4u:8u))return false;
     if((c->diag!=16 && !tail) || c->maxlen!=2048 || (tail?(c->max_steps!=8 && c->max_steps!=16 && !(PT_TAIL_DIRECTION && c->max_steps==4)):c->max_steps!=1) || c->rank!=64 || c->layer_lo || c->layer_hi!=39 ||
        !c->token_mean || !c->nopack || c->sample_n || c->rankprob || c->margin!=.5f || c->margin_p1!=.5f || c->margin_gap!=.3f ||
