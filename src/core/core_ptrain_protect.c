@@ -18,6 +18,9 @@ enum { KEEP_DOCS=8, KEEP_N=1022, KEEP_TOTAL=8176 };
 #ifndef PT_TAIL_ALLKEEP
 #define PT_TAIL_ALLKEEP 0
 #endif
+#ifndef PT_TAIL_EXPECT_OBJECTIVE
+#define PT_TAIL_EXPECT_OBJECTIVE 0.
+#endif
 static ds4_gpu_tensor *protect_mask;
 const ds4_gpu_tensor *pt_protect_mask(void) { return protect_mask; }
 static void kp_free(ds4_gpu_tensor **p) { if(*p) ds4_gpu_tensor_free(*p); *p=NULL; }
@@ -147,7 +150,7 @@ static bool kp_tail_train(ds4_engine *e,const pt_cfg *c,pt_run *r,pt_sample *sam
             ok=ds4_gpu_tensor_copy(last[k],0,k?r->st.ampB[c->layer_hi]:r->st.ampA[c->layer_hi],0,bytes);
         if(!ok)break;
         ok=kp_objective(e,c,r,samples,mask,true,1,&pre);
-        const bool repeated=step==1 || pre==previous;
+        const bool repeated=step==1?(PT_TAIL_EXPECT_OBJECTIVE<=0 || fabs(pre-PT_TAIL_EXPECT_OBJECTIVE)<1e-6):pre==previous;
         ok=ok && repeated;
         if(ok){ok=pt_opt_step(c,r,step,&gn,&clipped);if(ok)(*updates)++;}
         const bool frozen=ok && kp_frozen(c,r,snap);
