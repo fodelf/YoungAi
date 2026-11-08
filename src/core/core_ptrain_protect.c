@@ -164,6 +164,7 @@ static bool kp_tail_train(ds4_engine *e,const pt_cfg *c,pt_run *r,pt_sample *sam
     for(unsigned doc=0;ok && doc<KEEP_DOCS;doc++) {
         double a=0,b=0;
         ok=kp_score(e,c,r,&samples[doc],ids,&a) && kp_score(e,c,r,&samples[doc],rep,&b) && !memcmp(ids,rep,sizeof ids) && a==b;
+        if(PT_TAIL_RETAIN)ok=ok && !memcmp(ids,retained[doc],sizeof ids);
         for(unsigned j=0;ok && j<KEEP_N;j++) {
             unsigned best=0;const size_t at=(size_t)j*c->topk;
             for(unsigned k=1;k<c->topk;k++)if(samples[doc].top_p[at+k]>samples[doc].top_p[at+best])best=k;
@@ -192,6 +193,7 @@ bool pt_protectcheck(ds4_engine *e,const pt_cfg *c,pt_run *r,const pt_data *d) {
     return false;
 #else
     const bool tail=c->diag==18;
+    if(tail && PT_TAIL_RETAIN && c->max_steps!=8)return false;
     if((c->diag!=16 && !tail) || c->maxlen!=2048 || (tail?(c->max_steps!=8 && c->max_steps!=16):c->max_steps!=1) || c->rank!=64 || c->layer_lo || c->layer_hi!=39 ||
        !c->token_mean || !c->nopack || c->sample_n || c->rankprob || c->margin!=.5f || c->margin_p1!=.5f || c->margin_gap!=.3f ||
        c->lr!=5e-6f || (c->lr_b && c->lr_b!=c->lr)) return false;
