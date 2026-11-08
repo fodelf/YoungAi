@@ -24,6 +24,9 @@ enum { KEEP_DOCS=8, KEEP_N=1022, KEEP_TOTAL=8176 };
 #ifndef PT_TAIL_DIRECTION
 #define PT_TAIL_DIRECTION 0
 #endif
+#ifndef PT_TAIL_RADIUS
+#define PT_TAIL_RADIUS 0.
+#endif
 static ds4_gpu_tensor *protect_mask;
 const ds4_gpu_tensor *pt_protect_mask(void) { return protect_mask; }
 static void kp_free(ds4_gpu_tensor **p) { if(*p) ds4_gpu_tensor_free(*p); *p=NULL; }
@@ -192,9 +195,17 @@ static bool kp_direction_step(ds4_engine *e,const pt_cfg *c,pt_run *r,pt_sample 
     }
     *gn=sqrt(gg);*clipped=0;ok=ok && isfinite(*gn) && *gn>0 && *gn<c->clip;
     if(ok && step==1) {
+        ok=kp_direction_fixture();
+        if(PT_TAIL_RADIUS>0) {
+            /* 接力已获准的总步长；不把旧父本专用的Adam控制组读数套到新父本。 */
+            *radius=PT_TAIL_RADIUS;
+            fprintf(stderr,"[direction] inherited_radius=%.12g adam_control_steps=0\n",*radius);
+        }
+    }
+    if(ok && step==1 && PT_TAIL_RADIUS<=0) {
         double adam_gn=0,post=0,max=0,align=0;int adam_clip=0;unsigned broken=0,hit=0;
         int32_t control[KEEP_DOCS][KEEP_N];memcpy(control,base,sizeof control);
-        ok=kp_direction_fixture() && pt_opt_step(c,r,1,&adam_gn,&adam_clip);if(ok)(*updates)++;
+        ok=pt_opt_step(c,r,1,&adam_gn,&adam_clip);if(ok)(*updates)++;
         if(ok)ok=kp_frozen(c,r,snap) && kp_update_stats(p,last,g,n,*gn,radius,&max,&align) &&
             kp_objective(e,c,r,samples,mask,true,0,&post) && kp_retained(e,c,r,samples,control,&broken,&hit,audit,0);
         fprintf(stderr,"[direction] adam_control norm=%.12g max=%.12g alignment=%.12g objective=%.12g same=%u broken=%u repeat=%u\n",
