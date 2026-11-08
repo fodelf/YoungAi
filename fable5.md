@@ -15588,3 +15588,5 @@ Same是与固定教师首选答案相同的位置数，越大越好；H是保护
 删除Spark上旧版DeepSeek-V4.1-Flash原始权重、旧量化目录、旧GGUF路径、旧上传分片和侧车，按明确路径清单执行；保留全部1017命名文件，包括混在旧上传目录中的1017侧车。根分区可用空间从3337216000增至854802231296字节，实际释放851465015296字节（约793GiB）。旧模型相关历史探针/训练目录中的部分软链接会失效，原历史记录未删除；当前96及1017依赖不受影响。
 
 删除前后均通过97的完整固定件/父本SHA清单和96默认文件SHA校验，1017底座stat不变，实际96服务idle、queued=0。清单、删除文件元信息、空间前后值、依赖校验及服务状态存Spark `gguf/go-onebit/evo/vloop/cleanup-v41-20261108/`。未清理训练轮次证据，不把历史记录中的旧模型路径改写成1017。
+
+随后按inode追到两个测试安装目录中旧GGUF的剩余硬链接，核对均为旧版同一文件（inode3147259）后删除：`/home/fodelf/yr-test2/gguf/hub/model/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf`、`/home/fodelf/yr-test/youngai-linux-aarch64-20261010/gguf/hub/model/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf`。清理后最终可用968355590144字节，较最初累计释放965018374144字节（898.74GiB），不是把多个硬链接重复计成多份释放量。补充清单为同证据目录delete-alias.paths、deleted-aliases.txt、space.final.txt。
