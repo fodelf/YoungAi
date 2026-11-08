@@ -153,6 +153,9 @@ bool pt_protectcheck(ds4_engine *e,const pt_cfg *c,pt_run *r,const pt_data *d) {
     for(unsigned l=c->layer_lo;ok && l<=c->layer_hi;l++) for(unsigned k=0;ok && k<2;k++) {
         snap[l][k]=v41_alloc(bytes,&ok);if(ok)ok=ds4_gpu_tensor_copy(snap[l][k],0,k?r->st.ampB[l]:r->st.ampA[l],0,bytes);
     }
+    /* 全层分配器靠重算取输入，不留末层闭式反传所需的 xn；混合入口必须显式存这一份。 */
+    if(ok && tail && !r->save.moe_in[c->layer_hi])
+        r->save.moe_in[c->layer_hi]=v41_alloc((uint64_t)c->maxlen*DS4_N_EMBD*4,&ok);
     unsigned total_keep=0,low_keep=0;
     for(unsigned doc=0;ok && doc<KEEP_DOCS;doc++) {
         double a=0,b=0;ok=kp_score(e,c,r,&samples[doc],base[doc],&a) && kp_score(e,c,r,&samples[doc],rep,&b) && !memcmp(base[doc],rep,sizeof rep) && a==b;
