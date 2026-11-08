@@ -26,7 +26,7 @@ bool pt_loss_mode(const pt_cfg *c, bool training) {
 bool pt_loss_kl(const pt_cfg *c, pt_run *r, ds4_gpu_tensor *g, ds4_gpu_tensor *logits,
                  uint32_t row, uint32_t m, float scale) {
 #ifndef __APPLE__
-    if(c->diag==16 && pt_keep_training && pt_protect_mask())
+    if((c->diag==16 || c->diag==18) && pt_keep_training && pt_protect_mask())
         return ds4_gpu_bwd_kl_keepmargin_tensor(g,r->loss,logits,row,m,DS4_N_VOCAB,r->tid,r->tp,r->trest,
             c->topk,scale,pt_protect_mask(),c->margin,c->margin_p1,c->margin_gap);
     return ds4_gpu_bwd_kl_rankprob_tensor(g, r->loss, logits, row, m, DS4_N_VOCAB,

@@ -1,5 +1,5 @@
-/* diag16：固定形状、单次Adam的保护项对照；diag17复用原1024完整留出口径。
- * 父本只决定掩码，标签仍是原FP教师。两臂都恢复47，只有预定candidate参与选轮。 */
+/* diag16：单步保护项对照；diag17：原1024完整留出；diag18：完整父本上的末层连续训练。
+ * 父本只决定掩码，标签仍是原FP教师；末层模式也完整加载/保存40层，避免漏掉其他层已有补丁。 */
 #include "core_ptrain_split.h"
 #include "ds4_gpu_keepmargin.h"
 #include <sys/stat.h>
@@ -48,10 +48,12 @@ static bool kp_restore(const pt_cfg *c,pt_run *r,ds4_gpu_tensor *snap[DS4_MAX_LA
     r->cont_s=NULL; r->grad_tokens=0; pt_state_reset(&r->st); return pt_diag_weights(c,r);
 }
 static bool kp_frozen(const pt_cfg *c,pt_run *r,ds4_gpu_tensor *snap[DS4_MAX_LAYER][2]) {
-    const size_t bytes=(size_t)r->k2*DS4_N_EMBD*4;
-    if(!bytes) return true;
-    void *a=xmalloc(bytes),*b=xmalloc(bytes); bool ok=true;
+    const size_t capacity=(size_t)(c->diag==18?r->K:r->k2)*DS4_N_EMBD*4;
+    if(!capacity) return true;
+    void *a=xmalloc(capacity),*b=xmalloc(capacity); bool ok=true;
     for(unsigned l=c->layer_lo;ok && l<=c->layer_hi;l++) {
+        const size_t bytes=(size_t)(c->diag==18 && l<c->layer_hi?r->K:r->k2)*DS4_N_EMBD*4;
+        if(!bytes)continue;
         ds4_gpu_tensor *p[]={r->st.ampA[l],r->st.ampB[l]};
         for(unsigned k=0;ok && k<2;k++) ok=ds4_gpu_tensor_read(p[k],0,a,bytes) && ds4_gpu_tensor_read(snap[l][k],0,b,bytes) && !memcmp(a,b,bytes);
     }
@@ -70,14 +72,54 @@ static bool kp_score(ds4_engine *e,const pt_cfg *c,pt_run *r,const pt_sample *s,
 }
 static bool kp_objective(ds4_engine *e,const pt_cfg *c,pt_run *r,pt_sample *s,ds4_gpu_tensor **mask,bool enabled,int grad,double *mean) {
     double sum=0;uint32_t nt=0; bool ok=pt_loss_mode(c,true);
+    pt_cfg step_cfg=*c;
+    /* 只改变反传入口；分配、父本加载和落盘仍使用完整40层配置。 */
+    if(c->diag==18)step_cfg.layer_lo=c->layer_hi;
     r->grad_tokens=KEEP_TOTAL;
     for(unsigned i=0;ok && i<KEEP_DOCS;i++) {
         protect_mask=enabled?mask[i]:NULL;r->cont_s=NULL;
-        ok=r->grad_tokens==KEEP_TOTAL && pt_step_sample(e,c,r,&s[i],grad,&sum,&nt);
+        ok=r->grad_tokens==KEEP_TOTAL && pt_step_sample(e,&step_cfg,r,&s[i],grad,&sum,&nt);
         fprintf(stderr,"[keep] %s grad=%d doc=%u rows=%u ok=%u\n",enabled?"candidate":"control",grad,i,s[i].sn,ok);
     }
     protect_mask=NULL;*mean=sum/KEEP_TOTAL;
     return ok && nt==KEEP_TOTAL && isfinite(*mean);
+}
+
+static bool kp_tail_train(ds4_engine *e,const pt_cfg *c,pt_run *r,pt_sample *samples,
+                         ds4_gpu_tensor **mask,ds4_gpu_tensor *snap[DS4_MAX_LAYER][2],
+                         int32_t base[KEEP_DOCS][KEEP_N],FILE *f,unsigned *updates) {
+    bool ok=kp_restore(c,r,snap);double previous=0;
+    for(unsigned step=1;ok && step<=8;step++) {
+        double pre=0,post=0,gn=0;int clipped=0;
+        ok=kp_objective(e,c,r,samples,mask,true,1,&pre);
+        const bool repeated=step==1 || pre==previous;
+        ok=ok && repeated;
+        if(ok){ok=pt_opt_step(c,r,step,&gn,&clipped);if(ok)(*updates)++;}
+        const bool frozen=ok && kp_frozen(c,r,snap);
+        if(ok)ok=frozen && kp_objective(e,c,r,samples,mask,true,0,&post);
+        ok=ok && isfinite(gn) && post<pre;
+        fprintf(stderr,"[tail] step=%u before=%.12g after=%.12g gnorm=%.12g clip=%d pre_repeat=%u frozen_L0_38=%u decreased=%u\n",
+                step,pre,post,gn,clipped,repeated,frozen,ok);
+        previous=post;
+    }
+    unsigned hit=0,fixed=0,broken=0,baseline=0;int32_t ids[KEEP_N],rep[KEEP_N];
+    if(ok)ok=pt_loss_mode(c,false);
+    for(unsigned doc=0;ok && doc<KEEP_DOCS;doc++) {
+        double a=0,b=0;
+        ok=kp_score(e,c,r,&samples[doc],ids,&a) && kp_score(e,c,r,&samples[doc],rep,&b) && !memcmp(ids,rep,sizeof ids) && a==b;
+        for(unsigned j=0;ok && j<KEEP_N;j++) {
+            unsigned best=0;const size_t at=(size_t)j*c->topk;
+            for(unsigned k=1;k<c->topk;k++)if(samples[doc].top_p[at+k]>samples[doc].top_p[at+best])best=k;
+            const int32_t t=samples[doc].top_id[at+best];const bool was=base[doc][j]==t,now=ids[j]==t;
+            baseline+=was;hit+=now;fixed+=!was&&now;broken+=was&&!now;
+            fprintf(f,"candidate\t%u\t%u\t%d\t%d\t%d\t%u\t%.9g\n",doc,j,t,ids[j],base[doc][j],was,samples[doc].top_p[at+best]);
+        }
+    }
+    ok=ok && hit>=baseline && kp_frozen(c,r,snap);
+    fprintf(stderr,"[tail] baseline=%u same=%u total=%u fixed=%u broken=%u post_repeat=%u\n",baseline,hit,KEEP_TOTAL,fixed,broken,ok);
+    char path[1200];snprintf(path,sizeof path,"%s/candidate",c->out);
+    if(ok)ok=mkdir(path,0755)==0 && pt_save_amp(c,r,path);
+    fflush(f);return ok;
 }
 
 bool pt_protectcheck(ds4_engine *e,const pt_cfg *c,pt_run *r,const pt_data *d) {
@@ -90,7 +132,8 @@ bool pt_protectcheck(ds4_engine *e,const pt_cfg *c,pt_run *r,const pt_data *d) {
 #ifdef __APPLE__
     return false;
 #else
-    if(c->diag!=16 || c->maxlen!=2048 || c->max_steps!=1 || c->rank!=64 || c->layer_lo || c->layer_hi!=39 ||
+    const bool tail=c->diag==18;
+    if((c->diag!=16 && !tail) || c->maxlen!=2048 || c->max_steps!=(tail?8u:1u) || c->rank!=64 || c->layer_lo || c->layer_hi!=39 ||
        !c->token_mean || !c->nopack || c->sample_n || c->rankprob || c->margin!=.5f || c->margin_p1!=.5f || c->margin_gap!=.3f ||
        c->lr!=5e-6f || (c->lr_b && c->lr_b!=c->lr)) return false;
     pt_sample samples[KEEP_DOCS];bool found[KEEP_DOCS]={0};
@@ -124,6 +167,10 @@ bool pt_protectcheck(ds4_engine *e,const pt_cfg *c,pt_run *r,const pt_data *d) {
     }
     fprintf(stderr,"[keep] frozen_base same=%u total=%u low_conf_correct=%u repeat=%u\n",total_keep,KEEP_TOTAL,low_keep,ok);
     const char *names[]={"control","candidate"};unsigned updates=0;
+    if(tail) {
+        ok=ok && total_keep==7343 && low_keep==618 && kp_tail_train(e,c,r,samples,mask,snap,base,f,&updates);
+        goto finish;
+    }
     for(unsigned arm=0;ok && arm<2;arm++) {
         double pre=0,post=0,gn=0;int clipped=0;
         ok=kp_restore(c,r,snap) && kp_objective(e,c,r,samples,mask,arm,1,&pre);
@@ -149,6 +196,7 @@ bool pt_protectcheck(ds4_engine *e,const pt_cfg *c,pt_run *r,const pt_data *d) {
         else if(arm==1) ok=false;
         fflush(f);
     }
+finish:
     protect_mask=NULL;bool restored=false;
     if(snap[c->layer_hi][1])restored=kp_restore(c,r,snap);
     fprintf(stderr,"[keep] restored_parent=%u optimizer_steps=%u success=%u\n",restored,updates,ok);

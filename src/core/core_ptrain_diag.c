@@ -75,7 +75,7 @@ static void pt_diag_col(FILE *f, ds4_engine *e, const char *name, const int32_t 
 }
 
 bool pt_diag(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data *d) {
-    if (c->diag == 16 || c->diag == 17) return pt_protectcheck(e,c,r,d);
+    if (c->diag == 16 || c->diag == 17 || c->diag == 18) return pt_protectcheck(e,c,r,d);
     if (c->diag == 15) return pt_margincheck(e, c, r, d);
     if (c->diag == 14) return pt_splitcheck(e, c, r, d);
     if (c->diag == 12 || c->diag == 13) return pt_shapecheck(e, c, r, d);
