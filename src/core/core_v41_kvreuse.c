@@ -51,10 +51,44 @@ typedef struct {
 enum { CK_PROMPT = 0, CK_END = 1, CK_SLOTS = 2 };
 static ckpt K[CK_SLOTS];
 
+/* ★检查点显存回收(2026-11-12)★: CK_PROMPT/CK_END 是进程级常驻的 KV 检查点, 不是请求态 —— 它们不随 ds4_v41_req_close / v41_state_free 释放。
+ * 这里给出真正的释放口: 显存缓冲(ckv/idk/win/cpk/cps/mainh/logits)全 free, CPU 的 tok/sig 也 free(只在 release_all 全丢时)。
+ * 为什么不能每次请求后都丢: 下一条请求可能就接它们, 丢早了白丢复用; 只在内存余量为 0、切插件、关引擎时丢。 */
+static void ckpt_free_gpu(ckpt *k) {
+    if (!k) return;
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        ds4_gpu_tensor_free(k->win[il]); k->win[il] = NULL;
+        ds4_gpu_tensor_free(k->ckv[il]); k->ckv[il] = NULL;
+        ds4_gpu_tensor_free(k->idk[il]); k->idk[il] = NULL;
+        ds4_gpu_tensor_free(k->cpk[il]); k->cpk[il] = NULL;
+        ds4_gpu_tensor_free(k->cps[il]); k->cps[il] = NULL;
+    }
+    ds4_gpu_tensor_free(k->mainh); k->mainh = NULL;
+    ds4_gpu_tensor_free(k->logits); k->logits = NULL;
+    k->valid = 0; k->bytes = 0;   /* tok/sig 留着: 切插件后 ds4_engine_v41_kv_stale_prompt 还要这串提示 id 来预热 */
+}
+static void ckpt_free_all(ckpt *k) {
+    ckpt_free_gpu(k);
+    free(k->tok); k->tok = NULL; k->tok_cap = 0;
+    free(k->sig); k->sig = NULL;
+    k->n = 0; k->bytes = 0;
+}
 /* 作废但留提示: 切换插件后服务端空闲时拿它用新插件重新预填一遍(server_plugins.c), 用户切完再发消息就接得上, 不用等整段预填
  * (7,240 token 的工具会话实测每次开关后首条 7.1 s)。只记一次: 取走就清, 预热被新请求打断也不再补(那条新请求自己会存新检查点)。 */
 static int g_stale;
-void v41_kvreuse_drop(void) { g_stale = K[CK_PROMPT].valid && K[CK_PROMPT].n > 0; K[CK_PROMPT].valid = 0; K[CK_END].valid = 0; }
+void v41_kvreuse_drop(void) {
+    g_stale = K[CK_PROMPT].valid && K[CK_PROMPT].n > 0;
+    ckpt_free_gpu(&K[CK_PROMPT]); ckpt_free_gpu(&K[CK_END]);   /* 作废检查点同时回收显存, 但 CK_PROMPT 的 tok/sig 留给 stale_prompt */
+}
+void v41_kvreuse_release_all(void) {
+    for (int s = 0; s < CK_SLOTS; s++) ckpt_free_all(&K[s]);   /* 引擎关: 显存 + CPU 检查点序列全丢 */
+    g_stale = 0;
+}
+void v41_kvreuse_trim(void) {
+    if (ds4_runtime_mem_headroom_bytes() != 0) return;   /* 余量还有就不主动丢: 复用优先 */
+    for (int s = 0; s < CK_SLOTS; s++) ckpt_free_all(&K[s]);
+    fprintf(stderr, "ds4: [v41] 运行余量为 0(低于 5000 MB 地板), 回收两个 KV 检查点槽 —— 下一条请求走冷预填\n");
+}
 int32_t *ds4_engine_v41_kv_stale_prompt(uint32_t *n) {
     *n = 0;
     if (!g_stale) return NULL;
@@ -105,8 +139,9 @@ static void ckpt_save(ckpt *k, const char *what, const ds4_v41_state *st, const 
                       const int32_t *tail, uint32_t nt, uint32_t logit_row) {
     k->valid = 0;
     const uint64_t need = ckpt_need(k, st), room = ds4_runtime_mem_headroom_bytes();
-    if (need > room) {
-        fprintf(stderr, "ds4: [v41] %s检查点要新分 %.0f MB, 内存余量只剩 %.0f MB, 这一份不存(下一条请求少这一段复用)\n",
+    if (room == 0 || need > room) {
+        ckpt_free_gpu(k);   /* 余量不够: 先回收旧检查点的显存, 这一份不存 —— 不把"不存"留成旧缓冲继续占内存 */
+        fprintf(stderr, "ds4: [v41] %s检查点要新分 %.0f MB, 内存余量只剩 %.0f MB, 这一份不存并回收旧缓冲(下一条请求少这一段复用)\n",
                 what, (double)need / 1048576.0, (double)room / 1048576.0);
         return;
     }

@@ -110,6 +110,9 @@ void append_tool_call_deltas_json(buf *b, const tool_calls *calls, const char *i
 bool http_response(int fd, bool enable_cors, int code, const char *type, const char *body);
 bool http_response_n(int fd, bool enable_cors, int code, const char *type, const char *body, size_t body_len);
 bool http_error(int fd, bool enable_cors, int code, const char *msg);
+/* 单 worker 内存准入(server_buf.c): 真实 /proc MemAvailable + 2 × 预填峰值字节 */
+long server_mem_available_mb(void);
+bool server_v41_mem_admit(server *s, job *j, char *err, size_t errn);
 bool request_exceeds_context(const request *r, int ctx_size);
 bool http_error_context_length_exceeded(int fd, bool enable_cors, const request *r, int n_prompt_tokens, int ctx_size);
 bool serve_chat_page(int fd, bool enable_cors, const char *path);
