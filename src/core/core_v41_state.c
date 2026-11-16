@@ -7,6 +7,7 @@
  * 预填仍用整状态(块 2048 行, 与单请求路一字不差); 预填完 v41_state_shrink 把稠密段的行释放、注意力侧缩到 1 行, 请求态
  * 只剩 KV + 几十 MB —— 三个 1M 请求态同时活着才装得下(单请求 3.1 GB 固定开销里, 2.2 GB 是这两份 2048 行的缓冲)。 */
 #include "core_internal.h"
+#include "core_v41_ckpt.h"   /* 磁盘离载模块的 clear(切插件时检查点/文件一起作废) */
 #ifndef DS4_NO_GPU
 
 ds4_gpu_tensor *v41_alloc(uint64_t bytes, bool *ok) {
@@ -112,6 +113,7 @@ int ds4_engine_v41_switch_plugins(const char *amp_dir, const char *pt_dir, char 
     free(own_amp); free(own_pt);
     own_amp = na; own_pt = np;
     v41_kvreuse_drop();   /* 检查点里的 KV 是带着老放大器算的 */
+    v41_ckpt_disk_clear();   /* 磁盘离载的检查点同样带老放大器算的: 文件/索引全删(2026-11-15) */
     return 0;
 }
 

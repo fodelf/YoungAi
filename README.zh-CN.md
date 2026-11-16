@@ -47,7 +47,8 @@
 ![YoungAi 工作台：助理在全网找最便宜的 DGX Spark](docs/img/studio-agent.png)
 
 背后的模型是 DeepSeek V4.1 Flash 的 1017 版（官方权重 510 GB），压到 113.6 GB，一台 128 GB 的机器就能跑：
-DGX Spark 或 Apple Silicon 的 Mac，1M 上下文。开源，MIT 协议；纯 C99，Spark 上用 CUDA，Mac 上用 Metal，
+DGX Spark 或 Apple Silicon 的 Mac，模型能力 1M 上下文、部署上限 300K token（engram 表与流离专家在盘上，
+每个 context parse 都是慢 SSD 读）。开源，MIT 协议；纯 C99，Spark 上用 CUDA，Mac 上用 Metal，
 一个 Makefile，不链任何第三方库。
 
 ## 模型
@@ -79,7 +80,9 @@ DGX Spark 或 Apple Silicon 的 Mac，1M 上下文。开源，MIT 协议；纯 C
 修正部分接着向官方 API 现写的源文件学。训练料和两把尺没有任何 16 个 token 长的重合片段，只有两行 Dockerfile 样板句例外。
 用法：把这个目录传给 `ds4-server --zchain`；索引补丁（`posttrain-restore-20261103`）叠在上面，用 `--posttrain` 传。
 
-上下文 1M token，满载 KV 缓存 0.89 GB。测法和完整结果表见[技术细节第五章](docs/TECHNICAL.zh-CN.md#五实测结果)，
+模型声明 1M token 上下文，部署上限 300K token（2026-11-13 用户令：每个 context parse 要读盘上 203 GB engram
+表与流离专家，1M 整段预填太慢）。每条请求的 KV 只按实际走到的位置长；模型满载 1M 的 KV 是 0.89 GB。
+测法和完整结果表见[技术细节第五章](docs/TECHNICAL.zh-CN.md#五实测结果)，
 后训练怎么做见[技术细节 4.3](docs/TECHNICAL.zh-CN.md#43-后训练文件)。
 
 ### 速度

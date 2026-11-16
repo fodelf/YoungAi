@@ -184,6 +184,8 @@ void usage(FILE *fp) {
         "      Enable disk KV checkpoints in DIR. The directory is created if needed.\n"
         "  --kv-disk-space-mb N\n"
         "      Disk budget for checkpoint files. Default when enabled: 4096\n"
+        "      V4.1 uses the same DIR/budget for prompt/decode-end KV checkpoints: when a different\n"
+        "      conversation/agent arrives the resident checkpoints are offloaded to disk (LRU budget).\n"
         "  --kv-cache-min-tokens N\n"
         "      Do not save or load checkpoints shorter than N tokens. Default: 512\n"
         "  --kv-cache-cold-max-tokens N\n"

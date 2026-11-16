@@ -34,6 +34,7 @@
 #include <string.h>
 
 #define TR_PATH 1024
+#define TR_V41_CKPT_DISK_MB 65536u   /* V4.1 检查点离载磁盘预算(2026-11-15): 64 GB; 服务起服时带 --kv-disk-space-mb; 同一份 LRU 管理 */
 #define TR_UPLOAD_MAX (512u * 1024u * 1024u)   /* 曾与 ds4-server 同为 64 MB; 云手机装 apk 走原始体, 淘宝闪购 85 MB(10-13)、微信 8.0.79 arm64 285 MB(10-14) ⇒ 512 MB(一次一个请求, 内存可控) */
 
 typedef struct {

@@ -706,6 +706,7 @@
     <div class="row1"><span class="dot" id="eng-dot"></span><span id="eng-title">连接中</span></div>
     <div class="sub" id="eng-sub">–</div>
     <button class="primary" id="btn-load" style="display:none" data-i18n="load_model">加载模型</button>
+    <button class="ghost" id="btn-restart" style="display:none" data-i18n="restart_model">重启模型</button>
   </div>
   <a class="setbtn" id="btn-set"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg><span data-i18n="set_btn">设置</span></a>
 </aside>
@@ -1129,12 +1130,12 @@ const I18N = {
     mo_totals: "自 {0}: {1} 条请求 · 读提示 {2} token{3}(复用 {4}) · 生成 {5} token{6}{7}", mo_tot_speed: " · {0} t/s", mo_tot_drafts: " · 草稿接受 {0}%",
     mo_cc: "磁盘 KV 缓存", mo_cc_budget: "占用预算", mo_cc_mem: "{0} / {1} GB", mo_cc_sum: "{0} / {1} 条请求复用了提示前缀", mo_cc_parked: "盘上检查点", mo_cc_pr: "存盘 / 装回", mo_cc_evicted: " · 逐出 {0}",
     hint_models: "本机模型与侧车, 一键加载; 从 Hugging Face 下载发布包", hint_train: "上下文蒸馏 + 答案 NLL, 写进独立的 ③ 文件", hint_data: "上传问答料、原文料或文档",
-    load_model: "加载模型", pt: "后训练", clear: "清空", send: "发送", stop: "停止", updated: "更新 {0}",
+    load_model: "加载模型", restart_model: "重启模型", pt: "后训练", clear: "清空", send: "发送", stop: "停止", updated: "更新 {0}",
     eng_unreachable: "连不上", eng_connecting: "连接中", eng_switching: "切换中", eng_switching_sub: "停模型 / 装模型, 稍等", eng_unloading_sub: "卸下当前模型, 稍等",
     eng_serving: "模型已加载", eng_port: "端口 {0}", eng_loading: "加载模型中", eng_loading_sub: "装完、冒烟过了就能聊",
     eng_train_gate: "训练中 · 选轮", eng_training: "训练中", eng_handover: "交接中", eng_train_sub: "训完自动加载模型",
     eng_lobby: "模型未加载", eng_lobby_sub: "可以直接开始训练", eng_avail: " · 可用 {0} GB",
-    fail: "失败: {0}", not_sent: "请求没发出去: {0}", load_started: "开始加载模型(约 1~2 分钟)",
+    fail: "失败: {0}", not_sent: "请求没发出去: {0}", load_started: "开始加载模型(约 1~2 分钟)", restart_started: "开始重启模型(约 1~2 分钟)", serve_failed: "模型没起来: 余量不足或旧服还没退(看模型页日志)",
     pick_data_first: "先选数据集, 或去语料页上传", train_started: "已开始训练", stop_confirm: "停止训练? 停下后模型会自动装回来。", stopped_toast: "已停止, 模型稍后自动加载",
     st_running: "进行中", st_done: "完成", st_nopick: "落盘·未选中", st_failed: "失败", st_stopped: "已停",
     ph_gate: "选轮 · 通用漂移", ph_pick: "落盘 / 选轮", ph_probe: "探针", ph_teacher: "教师表", ph_step0: "第 0 步评估", ph_train: "训练", ph_load: "装载",
@@ -1305,12 +1306,12 @@ const I18N = {
     mo_totals: "Since {0}: {1} requests · {2} prompt tokens read{3} ({4} reused) · {5} written{6}{7}", mo_tot_speed: " at {0} t/s", mo_tot_drafts: " · drafts accepted {0}%",
     mo_cc: "Disk KV cache", mo_cc_budget: "Budget used", mo_cc_mem: "{0} / {1} GB", mo_cc_sum: "{0} of {1} requests reused part of their prompt", mo_cc_parked: "Checkpoints on disk", mo_cc_pr: "Parked / restored", mo_cc_evicted: " · {0} evicted",
     hint_models: "Local models and sidecars, one-click load; download the release from Hugging Face", hint_train: "Context distillation + answer NLL, written to a separate ③ file", hint_data: "Upload Q&A data, raw text or documents",
-    load_model: "Load model", pt: "Post-train", clear: "Clear", send: "Send", stop: "Stop", updated: "Updated {0}",
+    load_model: "Load model", restart_model: "Restart model", pt: "Post-train", clear: "Clear", send: "Send", stop: "Stop", updated: "Updated {0}",
     eng_unreachable: "Unreachable", eng_connecting: "Connecting", eng_switching: "Switching", eng_switching_sub: "Stopping / loading the model, hold on", eng_unloading_sub: "Unloading the current model, hold on",
     eng_serving: "Model loaded", eng_port: "port {0}", eng_loading: "Loading model", eng_loading_sub: "Chat opens once it loads and passes the smoke test",
     eng_train_gate: "Training · picking epoch", eng_training: "Training", eng_handover: "Handing over", eng_train_sub: "Model reloads when training ends",
     eng_lobby: "No model loaded", eng_lobby_sub: "You can start training right away", eng_avail: " · {0} GB free",
-    fail: "Failed: {0}", not_sent: "Request not sent: {0}", load_started: "Loading model (about 1–2 min)",
+    fail: "Failed: {0}", not_sent: "Request not sent: {0}", load_started: "Loading model (about 1–2 min)", restart_started: "Restarting model (about 1–2 min)", serve_failed: "Model did not come up: low memory or old server still draining (see Model page log)",
     pick_data_first: "Pick a dataset first, or upload one on the Data page", train_started: "Training started", stop_confirm: "Stop training? The model reloads automatically afterwards.", stopped_toast: "Stopped; the model will reload shortly",
     st_running: "Running", st_done: "Done", st_nopick: "Saved · none picked", st_failed: "Failed", st_stopped: "Stopped",
     ph_gate: "Picking epoch · drift readout", ph_pick: "Saving / picking epoch", ph_probe: "Probes", ph_teacher: "Teacher cache", ph_step0: "Step-0 eval", ph_train: "Training", ph_load: "Loading",
@@ -1726,6 +1727,7 @@ function renderEngine() {
   if (curTab() === "more" && moreKey !== moreState()) renderMore();
   syncMonitor();   /* 模型起停跟着换: 监控页的读数 ↔ "没在服务" */
   $("btn-load").style.display = load && !switching ? "" : "none";
+  $("btn-restart").style.display = status && status.mode === "serving" && !switching ? "" : "none";
   $("btn-train").style.display = training() ? "none" : ""; $("btn-stop").style.display = training() ? "" : "none";
   $("btn-train").disabled = !!switching && !status;
   renderChatGate();
@@ -1737,6 +1739,9 @@ async function poll() {
     /* 1 = 等进训练, 2 = 等服务回来, 3 = 换模型: 老服务还在答话, 先等它退(状态离开 serving)再按 2 等新的回来 */
     if (switching === 3 && st.mode !== "serving") switching = 2;
     else if (switching && switching !== 3 && ((switching === 1 && st.mode === "training") || st.mode === "serving")) switching = 0;
+    /* 2026-11-16 实撞: 重启闸没起(停旧服后余量低) → 状态回 lobby、子进程没在 → switching=2 一直不清, 页面卡"重启中" 且
+       重启按钮不出现(只在 serving 时出). 这里给失败也收口并报一次; 成功后走上一行 serving→0. */
+    else if (switching === 2 && st.mode === "lobby" && !st.proc.server) { switching = 0; toast(t("serve_failed"), true); }
     if (!userPicked || !selected) { const r = runs.find(x => x.status === "running"); selected = (r || runs[0] || {}).name || null; }
     renderEngine(); renderRuns(); renderRunPick();
     text("updated", t("updated", new Date().toLocaleTimeString(locale())));
@@ -1757,6 +1762,7 @@ async function act(url, body, okMsg, sw) {
 }
 /* 还没选过模型(刚解压的发布包)就去模型页: 直接起服会去找脚本里的默认模型, 新机器上没有那个文件 */
 $("btn-load").onclick = $("btn-load2").onclick = () => mdata && mdata.pick ? act("/api/train/serve", {}, t("load_started"), 2) : (location.hash = "models");
+$("btn-restart").onclick = () => act("/api/train/serve?restart=1", {}, t("restart_started"), 2);   /* 2026-11-16: 同一套再起; 别的模型换装走模型页 load */
 $("btn-train").onclick = () => { if (!$("data").value) { toast(t("pick_data_first"), true); return; }
   const ex = [$("extra").value.trim(), $("evalf").value ? "eval=" + $("evalf").value : ""].filter(Boolean).join(",");
   act("/api/train/start", { data: $("data").value, epochs: $("epochs").value, layers: $("layers").value, lr: $("lr").value, extra: ex }, t("train_started"), 1)
@@ -3331,6 +3337,7 @@ document.querySelectorAll("#v-api .snip .copy").forEach(b => b.onclick = () => c
 
 /* ---------------- 模型 ----------------
    数据: GET /api/models/list(本机 GGUF + 同名前缀的侧车目录 + 正在用的 + 下载进度); POST /api/models/load|download|cancel。
+   同套重起(不换模型): POST /api/train/serve?restart=1, 先停正在跑的子进程再按同一套起; 侧车热切在聊天页切, 不重装底座。
    下载进度是后端看盘读的字节数, 速度/剩余时间这里拿相邻两次读数的差算(指数平滑, 不然每 2.5 s 一跳看着乱)。 */
 let mdata = null, dlPrev = null, dlSpeed = 0, egTouched = false;
 const GB = b => (b / 1e9).toFixed(1) + " GB";   /* 十进制 GB: 与 Finder / HF 页面显示的数一致 */
