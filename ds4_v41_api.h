@@ -129,6 +129,16 @@ int ds4_engine_v41_last_reused(void);
 /* 切换插件作废掉的那个检查点的提示 token(malloc 的, 调用方 free; 没有 / 带图片 = NULL, n=0)。服务端切完空闲时拿它用新插件重新预填
  * 一遍(ds4_engine_v41_generate_argmax n_predict=0 就只预填 + 存检查点), 用户切完再发消息直接接上。取一次就清。 */
 int32_t *ds4_engine_v41_kv_stale_prompt(uint32_t *n);
+/* 检查点磁盘离载(2026-11-15, core_v41_ckpt_disk.c): 服务端 --kv-disk-dir 开。dir=NULL/不开 = 旧行为。
+ * budget_mb 0 = 默认 4096; 文件按 tok 序列哈希 + LRU 预算管理。开/关是引擎级(进程内只有一份索引)。
+ * open 返回 0 成功; 失败写 err。offload = 换 agent/会话边界时把两槽整份写到磁盘、再放显存 —— 回到旧对话时
+ * 引擎自己从磁盘装进请求态(restore 优先 GPU 槽，槽没了就查磁盘)。 */
+int ds4_engine_v41_kv_disk_open(const char *dir, uint64_t budget_mb, char *err, size_t errn);
+void ds4_engine_v41_kv_disk_close(void);
+void ds4_engine_v41_kv_disk_clear(void);   /* 全清(切插件同款) */
+void ds4_engine_v41_kv_disk_conversation_set(const char *conv);   /* 请求/agent 会话号, CK store 尾 trailer 记 */
+int ds4_engine_v41_kv_disk_erase_conversation(const char *conv);  /* agent 关闭: 只删它归属的 CK, 别的 agent 留 */
+void ds4_engine_v41_kv_offload(void);
 /* 上一趟 generate 逐步的 logits 指纹(只有主机惩罚路记; 见 core_v41_sample.c), 返回步数; 服务端 --trace 时写进 trace 给精确门比 */
 int ds4_engine_v41_logit_sums(const double **out);
 

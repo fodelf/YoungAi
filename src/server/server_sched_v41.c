@@ -18,15 +18,7 @@ typedef struct {
     uint64_t order;            /* 到达序: 预填按它排队 */
 } v41_lane;
 
-/* Linux 的 MemAvailable(MB); 读不到 = -1 = 不拦(这条路只有 CUDA 引擎能到, Mac 上只是编译) */
-static long mem_available_mb(void) {
-    FILE *f = fopen("/proc/meminfo", "r");
-    if (!f) return -1;
-    char line[256]; long kb = -1;
-    while (fgets(line, sizeof line, f)) if (sscanf(line, "MemAvailable: %ld kB", &kb) == 1) break;
-    fclose(f);
-    return kb < 0 ? -1 : kb / 1024;
-}
+/* Linux MemAvailable(MB) 走 server_buf.c 的共享一份 server_mem_available_mb: 单 worker 与 --batch 同一口径。 */
 
 static void lane_finish(v41_lane *L, int rc) {
     if (L->r) ds4_v41_req_spec_stats(L->r, &L->g.spec_rounds, &L->g.spec_offered, &L->g.spec_accepted);   /* 监控的草稿账 */
@@ -55,7 +47,7 @@ static bool lane_admit(server *s, v41_lane *lanes, int cap, int *nl, uint64_t *o
 static bool sched_prefill(server *s, v41_lane *P, int *nl, int n_dec, double *t_chunk, double *t_dec) {
     v41_gen *g = &P->g; job *j = P->j;
     if (P->phase == 1) {
-        const long avail = mem_available_mb();
+        const long avail = server_mem_available_mb();
         const uint64_t peak_mb = (ds4_v41_req_prefill_bytes(g->prompt_tokens) + ds4_v41_images_bytes(j->req.images)) >> 20;
         if (avail >= 0 && (uint64_t)avail < 2u * peak_mb) {
             if (n_dec > 0) return false;   /* 等解码道退出腾内存 */

@@ -131,6 +131,7 @@ static bool kv_cache_store_live_prefix_text(server *s, const ds4_tokens *tokens,
                                             uint8_t cache_text_ext,
                                             const char *cache_text_key) {
     char err[160] = {0};
+    snprintf(s->kv.conv, sizeof s->kv.conv, "%s", s->conv);   /* cold/continued 也带当前 agent 归属, 不只 store_current */
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
     const int before = s->kv.len;
     const bool ok = ds4_kvstore_store_live_prefix_text(&s->kv, s->engine, s->session,
@@ -150,9 +151,39 @@ bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
                                            NULL, 0, NULL);
 }
 
+/* agent 关闭/服务关: 删本 DIR 里全部条目文件并清索引(不存当前会话).
+ * 为什么要删而不是只不存: "agent closed" 用户要求 (2026-11-16) 是离开就清盘上 KB;
+ * 只不存会留下旧前缀文件, 下次同 agent 再开仍从旧 KB 命中. 只删这个 kvstore 自己的, 不动别的目录. */
+void kv_cache_erase_all(server *s, const char *reason) {
+    if (!s || !s->kv.enabled) return;
+    const int n = ds4_kvstore_erase_all(&s->kv);
+    server_log(DS4_LOG_KVCACHE, "ds4-server: KV disk cache erased reason=%s files=%d dir=%s",
+               reason ? reason : "", n, s->kv.dir ? s->kv.dir : "");
+    ds4_session_invalidate(s->session);
+    mon_kv_event(s, "erased", 0, 0, kv_entries_bytes(&s->kv), 0);
+}
+
+/* agent 关闭但其它 agent 还在跑: 只删 conv 归属的 KB 文件, 服务继续.
+ * 与 erase_all 不同: 不是整目录, 别的会话前缀文件不动. V4.1 CK 盘同归属也删. */
+int server_cache_erase_conversation(server *s, const char *conv) {
+    if (!s || !conv || !conv[0]) return -1;
+    int n = 0;
+    if (s->kv.enabled) n += ds4_kvstore_erase_conversation(&s->kv, conv);
+#ifndef DS4_NO_GPU
+    const int ck = ds4_engine_v41_kv_disk_erase_conversation(conv);   /* ckptdisk 同 agent 的 v41ck 文件 */
+    if (ck >= 0) n += ck;   /* V41 CK 盘没开(-1) = 本模型没用 CK, 不能当失败 */
+#endif
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: KV disk cache erased conversation=%s files=%d (other agents kept)",
+               conv, n);
+    mon_kv_event(s, "erased-conv", 0, 0, kv_entries_bytes(&s->kv), 0);
+    return n;
+}
+
 void kv_cache_store_current(server *s, const char *reason) {
     const ds4_tokens *tokens = ds4_session_tokens(s->session);
     if (!tokens) return;
+    snprintf(s->kv.conv, sizeof s->kv.conv, "%s", s->conv);   /* 这一份盘上 KB 归属给这个 agent */
 
     char *visible_text = NULL;
     uint8_t visible_ext = 0;

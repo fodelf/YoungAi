@@ -157,6 +157,7 @@ int ds4_engine_v41_generate_argmax(ds4_engine *e, const int *prompt, int n_promp
     if (n_predict > room) n_predict = room;
     const uint32_t ck = g_ds4_v41_chunk > 0 ? (uint32_t)g_ds4_v41_chunk : DS4_V41_CHUNK;
     const uint32_t cap = ck < np ? ck : np;
+    v41_kvreuse_trim();   /* 内存余量为 0 先回收持久检查点槽; 否则下一条请求仍可复用 */
     ds4_v41_state st;
     if (!v41_state_alloc(&st, cap, ctx, DS4_MTP_MAX_BLOCK + 2u)) return 1;   /* 生成路: logits 只要解码/验证批那几行 + 预填末位 */
     st.head_last_only = 1;   /* 预填块只算末位 logits(core_v41.h) */

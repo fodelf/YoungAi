@@ -19,6 +19,7 @@
  * 10-14 实撞: 原来手写 10000, 云手机(≈2.5 GB)一起跑余量 9196 就把起得好好的模型杀了, 而白天它在 6.9 GB 上跑了一整天没事。 */
 #define TR_SERVE_FLOOR_MB (2 * TR_WD_KILL_MB)
 #define TR_UP_TRIES 120               /* 等 /v1/models 可达: 120 × 5 s = 10 分钟(冷启拷 106 GB 到页缓存约 1.5 分钟; 盘慢的机器给足) */
+#define TR_RESTART_RECOVER_TRIES 24   /* 2026-11-16 实撞: 停旧服后 GPU/CUDA 上下文回收不是瞬间, MemAvailable 2896 MB < 100000 闸, 重启没起; 等 24×5 s=120 s 给余量回升 */
 #define TR_SMOKE_PROMPT "{\"model\":\"deepseek-chat\",\"temperature\":0,\"max_tokens\":48,\"messages\":[{\"role\":\"user\",\"content\":\"用一句话解释什么是市盈率(PE), 并说明它偏高通常意味着什么。\"}]}"
 
 static struct { pthread_mutex_t mu; tr_model_phase phase; pid_t pid; int port; } g = { PTHREAD_MUTEX_INITIALIZER, TR_MODEL_IDLE, 0, 0 };
@@ -118,6 +119,15 @@ bool tr_model_start_sync(int model_port, FILE *log) {
     snprintf(ps, sizeof ps, "%d", model_port); snprintf(bud, sizeof bud, "%d", TR_SERVE_BUDGET_MB);
     argv[na++] = "--mem-budget-mb"; argv[na++] = bud; argv[na++] = "--host"; argv[na++] = "127.0.0.1"; argv[na++] = "--port"; argv[na++] = ps;
     argv[na++] = "--trace"; argv[na++] = trace;
+    /* V4.1 检查点离载(2026-11-15): 换 agent/会话时两个常驻 CK 槽写到这目录、显存回收; 预算 TR_V41_CKPT_DISK_MB(4096),
+     * 磁盘文件按 last_used LRU 删。V4 模型起服时这一目录也给会话磁盘 KV 用(同一个 --kv-disk-dir 语义)。 */
+    char ckp[TR_PATH + 64], cbud[16];
+    snprintf(ckp, sizeof ckp, "%s/gguf/v41/posttrain/ckptdisk", tr_root);
+    snprintf(cbud, sizeof cbud, "%u", TR_V41_CKPT_DISK_MB);
+    argv[na++] = "--kv-disk-dir"; argv[na++] = ckp;
+    argv[na++] = "--kv-disk-space-mb"; argv[na++] = cbud;
+    /* Yongai 支持(2026-11-16 用户令): 模型/agent 关掉(训练/换装/停服)时删盘上 KV, 不留旧前缀 KB. */
+    argv[na++] = "--kv-cache-shutdown-delete";
     char asr[TR_PATH + 300];
     if (asr_dir(asr, sizeof asr)) { argv[na++] = "--asr"; argv[na++] = asr; }   /* 语音识别模型(docs/assistant_asr.md): 有就带上, 页面据此出麦克风 */
     /* 视觉塔不用在这里带: 引擎自己按名字接模型旁边的 <底座>.vision.gguf(core_engine_open.c, 10-18); 第 3 行起用户写了 --vision-gguf 照样透传 */
@@ -164,7 +174,12 @@ void tr_model_stop_sync(FILE *log) {
     if (mine > 0) tr_child_kill(mine);
     if (n || mine > 0) {
         tr_logf(log, "停模型子进程(%d 个), 等它卸完映射", n);
-        if (!tr_prog_wait_gone("ds4-server", 10)) { tr_proc_kill("ds4-server", SIGKILL); tr_prog_wait_gone("ds4-server", 120); }
+        if (!tr_prog_wait_gone("ds4-server", 10)) {
+            /* 有请求还在收(11-16 13:57 实撞: 292k prompt 正在 prefill, SIGTERM 后 10 s 没退) → 强杀; 但 CUDA 上下文回收慢,
+             * 强杀后余量可能仍很低, start_thread 的重启等待才负责等它回升(见 TR_RESTART_RECOVER_TRIES)。 */
+            tr_logf(log, "10 s 还没收完(有请求在收), SIGKILL ds4-server");
+            tr_proc_kill("ds4-server", SIGKILL); tr_prog_wait_gone("ds4-server", 120);
+        }
         tr_logf(log, "模型子进程已退, MemAvailable %ld MB", tr_mem_avail_mb());
     }
     set_phase(TR_MODEL_IDLE);
@@ -175,7 +190,15 @@ static void *start_thread(void *arg) {
     start_arg *a = arg;
     char lp[TR_PATH + 96]; tr_ui_log_path("serve", lp, sizeof lp);
     FILE *log = fopen(lp, "w");
-    if (a->restart) tr_model_stop_sync(log);
+    if (a->restart) {
+        tr_model_stop_sync(log);
+        /* 2026-11-16 实撞: 停服后 MemAvailable 2896 MB(地板 100000), 直接起会"不起"; 强杀后 GPU/CUDA 上下文要过一会儿才回。
+         * 保持 STOPPING(=页面 loading), 等余量到闸再起; 等够 120 s 仍不够就照 start_sync 的闸失败并回 IDLE。 */
+        set_phase(TR_MODEL_STOPPING);
+        int waited = 0; long avail = tr_mem_avail_mb();
+        while (avail >= 0 && avail < TR_SERVE_MIN_AVAIL_MB && waited < TR_RESTART_RECOVER_TRIES) { sleep(5); waited++; avail = tr_mem_avail_mb(); }
+        tr_logf(log, "重启等余量: %ld MB(地板 %d), 等了 %d×5 s", avail, TR_SERVE_MIN_AVAIL_MB, waited);
+    }
     tr_model_start_sync(a->port, log);
     if (log) fclose(log);
     free(a);

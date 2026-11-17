@@ -80,6 +80,8 @@ void ds4_engine_close(ds4_engine *e) {
     ds4_threads_shutdown();
     model_close(&e->model);
 #ifndef DS4_NO_GPU
+    v41_kvreuse_release_all();   /* V4.1 检查点槽是进程级常驻: 关引擎时显存 + tok/sig 一并释放 */
+    ds4_engine_v41_kv_disk_close();   /* 检查点磁盘模块(2026-11-15): 关索引, 已落盘文件留着给下次开 */
     ds4_gpu_cleanup();
 #endif
     ds4_release_instance_lock();

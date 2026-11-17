@@ -184,6 +184,8 @@ void usage(FILE *fp) {
         "      Enable disk KV checkpoints in DIR. The directory is created if needed.\n"
         "  --kv-disk-space-mb N\n"
         "      Disk budget for checkpoint files. Default when enabled: 4096\n"
+        "      V4.1 uses the same DIR/budget for prompt/decode-end KV checkpoints: when a different\n"
+        "      conversation/agent arrives the resident checkpoints are offloaded to disk (LRU budget).\n"
         "  --kv-cache-min-tokens N\n"
         "      Do not save or load checkpoints shorter than N tokens. Default: 512\n"
         "  --kv-cache-cold-max-tokens N\n"
@@ -196,6 +198,9 @@ void usage(FILE *fp) {
         "      Align cold boundary saves down to this token multiple. 0 disables alignment. Default: 2048\n"
         "  --kv-cache-reject-different-quant\n"
         "      Refuse checkpoints written by the same model with a different routed-expert quantization.\n"
+        "  --kv-cache-shutdown-delete\n"
+        "      Clean shutdown erases this agent's disk KV cache files instead of saving the live conversation.\n"
+        "      Default keeps shutdown save for clients that resume later.\n"
         "  --disable-exact-dsml-tool-replay\n"
         "      Disable the tool-id -> exact sampled DSML map. Tool history falls back to canonical JSON rendering.\n"
         "  --tool-memory-max-ids N\n"
@@ -402,6 +407,8 @@ server_config parse_options(int argc, char **argv) {
             c.kv_cache.boundary_align_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-cache-reject-different-quant")) {
             c.kv_cache_reject_different_quant = true;
+        } else if (!strcmp(arg, "--kv-cache-shutdown-delete")) {
+            c.kv_cache_shutdown_delete = true;
         } else if (!strcmp(arg, "--disable-exact-dsml-tool-replay")) {
             c.disable_exact_dsml_tool_replay = true;
         } else if (!strcmp(arg, "--tool-memory-max-ids")) {

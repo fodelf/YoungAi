@@ -53,11 +53,17 @@ typedef enum {
 #define DS4_V41_MAX_ENGRAM 4
 #define DS4_MTP_MAX_TOWERS 4      /* DSpark 草稿塔数上限(官方 3); 真值读元数据 */
 #define DS4_MTP_MAX_EXPERTS 256   /* 每塔专家数上限(官方 128); 真值读元数据 */
+/* ★部署上下文上限 300K(2026-11-13 用户令)★: 模型元数据声明 V4.1 Flash = 1M, 但每个 context parsing 都要
+ * 从盘上慢 SSD 读(engram 表 + 流离的专家), 1M 提示的整段预填要数小时 ⇒ 最多 300Ki = 307200 位。
+ * 装载时把 g_ds4_v41.ctx 钳到它, 服务端 /v1/models 报的与每条请求的位置边界一律随之变小。 */
+#define DS4_V41_CONTEXT_TOK_MAX 307200u
 typedef struct {
     int      active;
     uint32_t ctx;                             /* 上下文 = GGUF deepseek4.context_length(转换器从 HF config 的 max_position_embeddings
-                                               * 写入, V4.1 Flash = 1048576)。引擎里没有第二个数(用户 2026-09-22 "不要任何写死的
-                                               * 上下文"): 生成/打分/取料的位置边界全从这里取, 缺键拒载不补默认。 */
+                                               * 写入, V4.1 Flash = 1048576), 装载时按 DS4_V41_CONTEXT_TOK_MAX(300K)钳。
+                                               * 引擎里没有第二个数(用户 2026-09-22 "不要任何写死的上下文" 是模型声明值;
+                                               * 2026-11-13 加部署上限 300K 因盘读太慢): 生成/打分/取料的位置边界全从这里取,
+                                               * 缺键拒载不补默认。 */
     uint8_t  is_kv_source[DS4_MAX_LAYER];     /* 本层自己压缩并持有压缩 KV 缓存 */
     int16_t  kv_source_of[DS4_MAX_LAYER];     /* 本层读哪层的压缩 KV(源层=自己; ratio 0 层 = -1) */
     uint8_t  is_index_source[DS4_MAX_LAYER];  /* 本层自己跑 indexer 产 topk */

@@ -118,6 +118,8 @@ void test_kv_cache_chat_anchor_ignores_multiturn_tail(void);
 void test_kv_cache_continued_uses_aligned_frontiers(void);
 void test_kv_cache_cold_store_suppresses_duplicate_continued_boundary(void);
 void test_kv_cache_file_size_must_fit_budget(void);
+void test_kv_cache_conv_trailer_roundtrip(void);
+void test_kv_cache_erase_conversation_keeps_others(void);
 void test_sha1_bytes_hex_matches_known_vector(void);
 void test_kv_stub_file(const char *dir, const char *sha, uint8_t reason, uint32_t tokens, uint32_t hits, uint64_t last_used, uint64_t payload_bytes);
 void test_kv_text_stub_file(const char *dir, const char *text, uint8_t reason, uint32_t tokens, uint64_t payload_bytes);

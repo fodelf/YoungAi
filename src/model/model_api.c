@@ -255,9 +255,11 @@ int tr_api(const tr_req *rq, ds4_buf *out, const char **ctype, int serving, int 
     if (!strcmp(rq->path, "/api/train/start")) return api_launch(rq, out, serving, port);
     if (!strcmp(rq->path, "/api/train/stop")) { if (serving) return reply(out, false, "要从主进程 ds4-train 的页面操作", 409); return reply(out, tr_job_stop(err, sizeof err), err, 409); }
     if (!strcmp(rq->path, "/api/train/upload")) return api_upload(rq, out);
-    if (!strcmp(rq->path, "/api/train/serve")) {   /* 大厅 → 起模型子进程(按 gguf/serve_pick.txt) */
-        if (serving) return reply(out, false, "服务已经在跑", 409);
-        return reply(out, tr_model_start(TR_MODEL_PORT(port), false, err, sizeof err), err, 409);
+    if (!strcmp(rq->path, "/api/train/serve")) {   /* 大厅 → 起模型子进程(按 gguf/serve_pick.txt); ?restart=1 = 先停正在跑的那份再按同一套起 */
+        if (serving) return reply(out, false, "要从主进程 ds4-train 的页面操作", 409);
+        char rs[8]; tr_query_get(rq->query, "restart", rs, sizeof rs);   /* 2026-11-16: 没有别的 restart 路由, 模型页/API 都用这一条 */
+        const bool restart = rs[0] && strcmp(rs, "0") != 0;
+        return reply(out, tr_model_start(TR_MODEL_PORT(port), restart, err, sizeof err), err, 409);
     }
     ds4_buf_puts(out, "{\"error\":\"没有这个路径\"}");
     return 404;

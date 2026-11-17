@@ -118,9 +118,11 @@ void test_kv_cache_file_size_must_fit_budget(void) {
     kv_disk_cache kc = {0};
     kc.budget_bytes = 1100;
 
-    TEST_ASSERT(kv_cache_file_size_fits(&kc, 100, 930, 0, NULL, NULL));
-    TEST_ASSERT(!kv_cache_file_size_fits(&kc, 100, 938, 0, NULL, NULL));
-    TEST_ASSERT(!kv_cache_file_size_fits(&kc, 100, 900, 40, NULL, NULL));
+    /* 文件字节 = 头52 + text100 + payload + trailer + 归属尾64; budget 1100.
+     * conv tail is part of every file, so the old 900 payload no longer fits. */
+    TEST_ASSERT(kv_cache_file_size_fits(&kc, 100, 870, 0, NULL, NULL));   /* 1086 + 1% ≤1100 */
+    TEST_ASSERT(!kv_cache_file_size_fits(&kc, 100, 900, 0, NULL, NULL));   /* 1116 + 1% >1100 */
+    TEST_ASSERT(!kv_cache_file_size_fits(&kc, 100, 870, 40, NULL, NULL));  /* +trailer40+conv64 = 1126 */
     TEST_ASSERT(!kv_cache_file_size_fits(&kc, UINT64_MAX, 1, 0, NULL, NULL));
 
     kc.budget_bytes = 0;

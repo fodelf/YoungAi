@@ -463,7 +463,16 @@ void v41_gen_end(v41_gen *g, int rc) {
 /* 单 worker 路(不带 --batch): 引擎整段跑(预填 → 逐 token, 带投机), token 从回调来 */
 void generate_job_v41(server *s, job *j) {
     v41_gen g;
-    v41_live_splice(s, j);   /* 提示以上一条生成的文本开头 ⇒ 沿用上一条的 id, 引擎的解码结束检查点才接得上 */
+    const bool cont = v41_live_splice(s, j);   /* true = 本条是上一条会话的续写 ⇒ 沿用上一条的 id, 引擎的解码结束检查点接得上 */
+    if (!cont) ds4_engine_v41_kv_offload();   /* 不同对话/agent 进来: 旧检查点对新提示没用 ⇒ 先整份离载到磁盘、放显存(2026-11-15) */
+    char err[256] = "";
+    if (!server_v41_mem_admit(s, j, err, sizeof err)) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: %s ctx=0..%d prefill admission refused: %s",
+                   j->req.kind == REQ_CHAT ? "chat" : "completion", j->req.prompt.len, err);
+        http_error(j->fd, s->enable_cors, 503, err);
+        mon_end(s, j->mon, "error", 0, -1, -1);
+        return;   /* 不进引擎: 不分配请求态, 也不碰 2500 MB 看门狗 */
+    }
     if (!v41_gen_begin(s, j, &g)) return;
     ds4_engine_set_decode_sampling(&g.sp);   /* 单 worker ⇒ 全局设置面按请求覆写即可 */
     server_log(DS4_LOG_PREFILL, "ds4-server: %s ctx=%s%s%s prompt start (V4.1 整段预填, decode_max=%d)",

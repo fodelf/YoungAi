@@ -73,7 +73,8 @@ in between. One run each, not hand-picked. What changed between the two drawings
 ![YoungAi Studio: the assistant hunting for the cheapest DGX Spark](docs/img/studio-agent-en.png)
 
 The model behind it is DeepSeek V4.1 Flash, the 1017 release (510 GB as published), shrunk to 113.6 GB and running on one
-128 GB machine, a DGX Spark or an Apple Silicon Mac, with a 1M-token context. Open source, MIT. Plain C99 + CUDA on the
+128 GB machine, a DGX Spark or an Apple Silicon Mac, with the model's 1M-token capacity deployed at a 300K-token ceiling
+(engram tables and routed experts stay on disk, so every context parse is a slow SSD read). Open source, MIT. Plain C99 + CUDA on the
 Spark, Metal on the Mac, one Makefile, no third-party libraries linked.
 
 ## The model
@@ -112,7 +113,9 @@ like ③ (105 MB). Its correction keeps learning from source files the official 
 16-token stretch with either ruler, apart from two lines of Dockerfile boilerplate. Pass the directory to
 `ds4-server --zchain`; the index patch (`posttrain-restore-20261103`) goes on top with `--posttrain`.
 
-Context is 1M tokens; the full KV cache is 0.89 GB. Method and full tables: [technical notes §5](docs/TECHNICAL.md#5-results);
+The model declares a 1M-token context; the deployed ceiling is 300K tokens (2026-11-13, because each context parse reads
+the 203 GB engram tables and offloaded experts from disk). Per-request KV grows only with positions actually used;
+the full 1M KV would be 0.89 GB. Method and full tables: [technical notes §5](docs/TECHNICAL.md#5-results);
 how the post-training file is made: [§4.3](docs/TECHNICAL.md#43-the-post-training-file).
 
 ### Speed

@@ -103,8 +103,18 @@ int main(int argc, char **argv) {
     if (v41) {
         cfg.ctx_size = ds4_engine_v41_ctx();
         if (cfg.kv_disk_dir) {
-            server_log(DS4_LOG_DEFAULT, "ds4-server: V4.1 没有会话 KV, 磁盘 KV 缓存(%s)不开", cfg.kv_disk_dir);
-            cfg.kv_disk_dir = NULL;
+            /* V4.1 没有会话 KV, 但检查点槽是进程级常驻显存(2026-11-15): --kv-disk-dir 给这一路的离载模块,
+             * 换 agent/会话时旧检查点写到该目录、显存回收; 预算 = --kv-disk-space-mb(0 = 默认 4096)。 */
+            char err[256];
+            if (ds4_engine_v41_kv_disk_open(cfg.kv_disk_dir, cfg.kv_disk_space_mb, err, sizeof err) != 0) {
+                server_log(DS4_LOG_DEFAULT, "ds4-server: V4.1 检查点磁盘离载打不开(%s): %s", cfg.kv_disk_dir, err);
+                ds4_engine_close(engine);
+                return 1;
+            }
+            server_log(DS4_LOG_DEFAULT, "ds4-server: V4.1 检查点磁盘离载开(%s, 预算 %llu MB%s), 换会话时旧 CK 写到磁盘",
+                       cfg.kv_disk_dir, (unsigned long long)cfg.kv_disk_space_mb,
+                       cfg.kv_disk_space_mb ? "" : "(默认 4096)");
+            cfg.kv_disk_dir = NULL;   /* 下面 V4 会话的磁盘 KV 路不重复开同一个目录 */
         }
         /* --batch N(≥2, 2026-09-30 batch.md): V4.1 并发调度器 —— N 条请求各自预填(一次一路)后合批解码, 权重每步只读一遍。
          * 不传 = 单 worker 一次一条(带投机)。 */
@@ -155,7 +165,7 @@ int main(int argc, char **argv) {
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
-    if (cfg.kv_disk_dir) {
+    if (cfg.kv_disk_dir && !v41) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
     }
@@ -276,7 +286,13 @@ int main(int argc, char **argv) {
     pthread_mutex_unlock(&s.mu);
 
     const ds4_tokens *tokens = s.session ? ds4_session_tokens(s.session) : NULL;
-    if (s.kv.enabled && tokens && tokens->len >= s.kv.opt.min_tokens) {
+    /* 2026-11-16 "delete KB cache when agent is closed": --kv-cache-shutdown-delete 让干净退出删本 agent(s.conv)
+     * 归属的 KB, 而不是存当前会话; 别的 agent 的留着. 默认仍是存(shutdown 触发器保留给要续的客户端). */
+    if (cfg.kv_cache_shutdown_delete && s.conv[0]) {
+        /* 用户 15:52 纠正: 只删本 agent(s.conv) 归属的 KB, 不是整个模型目录; 别的 agent 的留着.
+         * V4.1 CK 盘 trailer 同 conv; V4 会话 kvstore 条目 conv 同. 无 conv = 不知道是谁, 走默认存. */
+        server_cache_erase_conversation(&s, s.conv);
+    } else if (s.kv.enabled && tokens && tokens->len >= s.kv.opt.min_tokens) {
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: persisting current KV cache before shutdown tokens=%d",
                    tokens->len);

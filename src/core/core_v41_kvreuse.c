@@ -31,30 +31,75 @@
  * 作废: 侧车 / 后训练件热切(KV 是带着放大器算的)—— ds4_engine_v41_switch_plugins 调 v41_kvreuse_drop。
  * 出错会怎样: 拷贝失败 ⇒ 这一条照冷启动整段预填(结果与没有复用时相同), 日志打一行; 不会拿半份检查点去算。 */
 #include "core_internal.h"
+#include "core_v41_ckpt.h"   /* 磁盘离载模块(2026-11-15): CK_PROMPT/CK_END 换对话时写到磁盘 */
 
 int g_ds4_v41_kv_reuse = 1;
 void ds4_engine_v41_set_kv_reuse(int on) { g_ds4_v41_kv_reuse = on; }
 static int g_last_reused;
 int ds4_engine_v41_last_reused(void) { return g_last_reused; }
 
-typedef struct {
-    int valid;
-    uint32_t n;                 /* 检查点位置 = 到这里为止的 token 数 */
-    int32_t *tok; uint32_t tok_cap;
-    uint64_t *sig;              /* [n] 每位所属图片的指纹(0 = 文本): 图片 span 的 token 全是同一个占位 id, 不比图片字节就会把别的图的 KV 接上(2026-10-13) */
-    ds4_gpu_tensor *ckv[DS4_MAX_LAYER], *idk[DS4_MAX_LAYER], *win[DS4_MAX_LAYER], *cpk[DS4_MAX_LAYER], *cps[DS4_MAX_LAYER], *mainh;
-    ds4_gpu_tensor *logits;     /* 末位的 logits 一行 [V] f32: 等长复用时不预填, 第一个 token 从它采 */
-    uint32_t ng_src[DS4_MAX_LAYER], cpend[DS4_MAX_LAYER], win_from[DS4_MAX_LAYER];
-    int64_t mainh_end; uint32_t mainh_n;
-    uint64_t bytes;             /* 检查点占的显存(日志用) */
-} ckpt;
-enum { CK_PROMPT = 0, CK_END = 1, CK_SLOTS = 2 };
-static ckpt K[CK_SLOTS];
+static ckpt K[CK_SLOTS];   /* ckpt/CK_PROMPT/CK_END 在 core_v41_ckpt.h(磁盘模块共用同一份定义) */
 
+/* ★检查点显存回收(2026-11-12)★: CK_PROMPT/CK_END 是进程级常驻的 KV 检查点, 不是请求态 —— 它们不随 ds4_v41_req_close / v41_state_free 释放。
+ * 这里给出真正的释放口: 显存缓冲(ckv/idk/win/cpk/cps/mainh/logits)全 free, CPU 的 tok/sig 也 free(只在 release_all 全丢时)。
+ * 为什么不能每次请求后都丢: 下一条请求可能就接它们, 丢早了白丢复用; 只在内存余量为 0、切插件、关引擎时丢。 */
+static void ckpt_free_gpu(ckpt *k) {
+    if (!k) return;
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        ds4_gpu_tensor_free(k->win[il]); k->win[il] = NULL;
+        ds4_gpu_tensor_free(k->ckv[il]); k->ckv[il] = NULL;
+        ds4_gpu_tensor_free(k->idk[il]); k->idk[il] = NULL;
+        ds4_gpu_tensor_free(k->cpk[il]); k->cpk[il] = NULL;
+        ds4_gpu_tensor_free(k->cps[il]); k->cps[il] = NULL;
+    }
+    ds4_gpu_tensor_free(k->mainh); k->mainh = NULL;
+    ds4_gpu_tensor_free(k->logits); k->logits = NULL;
+    k->valid = 0; k->bytes = 0; k->mainh_bytes = 0;   /* tok/sig 留着: 切插件后 ds4_engine_v41_kv_stale_prompt 还要这串提示 id 来预热 */
+}
+static void ckpt_free_all(ckpt *k) {
+    ckpt_free_gpu(k);
+    free(k->tok); k->tok = NULL; k->tok_cap = 0;
+    free(k->sig); k->sig = NULL;
+    k->n = 0; k->bytes = 0;
+}
 /* 作废但留提示: 切换插件后服务端空闲时拿它用新插件重新预填一遍(server_plugins.c), 用户切完再发消息就接得上, 不用等整段预填
  * (7,240 token 的工具会话实测每次开关后首条 7.1 s)。只记一次: 取走就清, 预热被新请求打断也不再补(那条新请求自己会存新检查点)。 */
 static int g_stale;
-void v41_kvreuse_drop(void) { g_stale = K[CK_PROMPT].valid && K[CK_PROMPT].n > 0; K[CK_PROMPT].valid = 0; K[CK_END].valid = 0; }
+void v41_kvreuse_drop(void) {
+    g_stale = K[CK_PROMPT].valid && K[CK_PROMPT].n > 0;
+    ckpt_free_gpu(&K[CK_PROMPT]); ckpt_free_gpu(&K[CK_END]);   /* 作废检查点同时回收显存, 但 CK_PROMPT 的 tok/sig 留给 stale_prompt */
+}
+void v41_kvreuse_release_all(void) {
+    for (int s = 0; s < CK_SLOTS; s++) ckpt_free_all(&K[s]);   /* 引擎关: 显存 + CPU 检查点序列全丢 */
+    g_stale = 0;
+}
+/* ★换对话的离载(2026-11-15)★: 服务端发现本条提示不是上一条的续写(不同 agent/会话)时先调这里。
+ * 两份检查点整份写到磁盘模块，然后显存+CPU 全放掉 —— 回到旧对话时从磁盘装进请求态(core_v41_ckpt_disk.c)。
+ * 不开磁盘 = 与 release_all 同(旧检查点直接丢)。失败 = 照样放掉显存，下一条冷预填；不把半份留成占用。 */
+void v41_kvreuse_offload(void) {
+    if (!v41_ckpt_disk_enabled()) { v41_kvreuse_release_all(); return; }
+    char err[256];
+    for (int s = 0; s < CK_SLOTS; s++) {
+        if (!K[s].valid || !K[s].n) continue;
+        if (!v41_ckpt_disk_store(&K[s], (uint32_t)s, err, sizeof err))
+            fprintf(stderr, "ds4: [v41] %s检查点离载失败(%s), 显存照样回收\n", s == CK_END ? "解码结束的" : "提示末尾的", err);
+    }
+    for (int s = 0; s < CK_SLOTS; s++) ckpt_free_all(&K[s]);   /* 磁盘里已有 tok/sig ⇒ 主机两份也不再留 */
+    g_stale = 0;
+}
+int ds4_engine_v41_kv_disk_open(const char *dir, uint64_t budget_mb, char *err, size_t errn) {
+    return v41_ckpt_disk_open(dir, budget_mb, err, errn) ? 0 : 1;
+}
+void ds4_engine_v41_kv_disk_close(void) { v41_ckpt_disk_close(); }
+void ds4_engine_v41_kv_disk_clear(void) { v41_ckpt_disk_clear(); }
+void ds4_engine_v41_kv_disk_conversation_set(const char *conv) { v41_ckpt_disk_conversation_set(conv); }
+int ds4_engine_v41_kv_disk_erase_conversation(const char *conv) { return v41_ckpt_disk_erase_conversation(conv); }
+void ds4_engine_v41_kv_offload(void) { v41_kvreuse_offload(); }
+void v41_kvreuse_trim(void) {
+    if (ds4_runtime_mem_headroom_bytes() != 0) return;   /* 余量还有就不主动丢: 复用优先 */
+    for (int s = 0; s < CK_SLOTS; s++) ckpt_free_all(&K[s]);
+    fprintf(stderr, "ds4: [v41] 运行余量为 0(低于 5000 MB 地板), 回收两个 KV 检查点槽 —— 下一条请求走冷预填\n");
+}
 int32_t *ds4_engine_v41_kv_stale_prompt(uint32_t *n) {
     *n = 0;
     if (!g_stale) return NULL;
@@ -105,8 +150,11 @@ static void ckpt_save(ckpt *k, const char *what, const ds4_v41_state *st, const 
                       const int32_t *tail, uint32_t nt, uint32_t logit_row) {
     k->valid = 0;
     const uint64_t need = ckpt_need(k, st), room = ds4_runtime_mem_headroom_bytes();
+    /* need=0 ⇒ 现有缓冲都够大, 拷贝不新分显存 ⇒ room=0 也能存(否则余量0 时永远拒一份无需扩容的检查点,
+     * 下一条请求的复用就断)。只有真会新分时才按 room 拒。 */
     if (need > room) {
-        fprintf(stderr, "ds4: [v41] %s检查点要新分 %.0f MB, 内存余量只剩 %.0f MB, 这一份不存(下一条请求少这一段复用)\n",
+        ckpt_free_gpu(k);   /* 余量不够: 先回收旧检查点的显存, 这一份不存 —— 不把"不存"留成旧缓冲继续占内存 */
+        fprintf(stderr, "ds4: [v41] %s检查点要新分 %.0f MB, 内存余量只剩 %.0f MB, 这一份不存并回收旧缓冲(下一条请求少这一段复用)\n",
                 what, (double)need / 1048576.0, (double)room / 1048576.0);
         return;
     }
@@ -132,6 +180,7 @@ static void ckpt_save(ckpt *k, const char *what, const ds4_v41_state *st, const 
         total += mb;
     }
     k->mainh_end = st->mainh_end; k->mainh_n = st->mainh_n;
+    k->mainh_bytes = st->mainh ? ds4_gpu_tensor_bytes(st->mainh) : 0;   /* 磁盘只写有效份, 不是 ensure 后的 1.5 倍缓冲 */
     const uint64_t vb = (uint64_t)DS4_N_VOCAB * 4;
     if (ok) ok = ensure(&k->logits, vb) && st->logits && ds4_gpu_tensor_copy(k->logits, 0, st->logits, (uint64_t)logit_row * vb, vb);
     total += vb;
@@ -181,7 +230,17 @@ uint32_t v41_kvreuse_restore(ds4_v41_state *st, const int32_t *prompt, uint32_t 
         if (memcmp(c->tok, prompt, (size_t)c->n * 4) || !sig_match(c, sig, c->n)) continue;
         k = c;
     }
-    if (!k) return 0;
+    if (!k) {   /* 显存槽里没这份(刚换对话被离载了): 先查磁盘模块 —— 装进本请求态, 不再新分 GPU 检查点 */
+        char err[256];
+        const uint32_t n = v41_ckpt_disk_restore_state(st, prompt, np, sig, err, sizeof err);
+        if (n) {
+            g_last_reused = (int)n;
+            fprintf(stderr, "[v41] KV 复用 %u/%u token(磁盘检查点), 只预填后 %u\n", n, np, np - n);
+            return n;
+        }
+        if (err[0]) fprintf(stderr, "ds4: [v41] %s\n", err);
+        return 0;
+    }
     const uint64_t rowb = (uint64_t)DS4_N_HEAD_DIM * 4;
     bool ok = true;
     for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {

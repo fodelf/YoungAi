@@ -110,6 +110,9 @@ void append_tool_call_deltas_json(buf *b, const tool_calls *calls, const char *i
 bool http_response(int fd, bool enable_cors, int code, const char *type, const char *body);
 bool http_response_n(int fd, bool enable_cors, int code, const char *type, const char *body, size_t body_len);
 bool http_error(int fd, bool enable_cors, int code, const char *msg);
+/* 单 worker 内存准入(server_buf.c): 真实 /proc MemAvailable + 2 × 预填峰值字节 */
+long server_mem_available_mb(void);
+bool server_v41_mem_admit(server *s, job *j, char *err, size_t errn);
 bool request_exceeds_context(const request *r, int ctx_size);
 bool http_error_context_length_exceeded(int fd, bool enable_cors, const request *r, int n_prompt_tokens, int ctx_size);
 bool serve_chat_page(int fd, bool enable_cors, const char *path);
@@ -262,6 +265,8 @@ int kv_cache_chat_anchor_pos(const kv_disk_cache *kc, const ds4_tokens *prompt, 
 int kv_cache_continued_store_target(const kv_disk_cache *kc, int live_tokens);
 bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens, int store_len, const char *reason);
 void kv_cache_store_current(server *s, const char *reason);
+void kv_cache_erase_all(server *s, const char *reason);   /* 整目录删(旧路, 只有明确全清才用) */
+int server_cache_erase_conversation(server *s, const char *conv);   /* agent closed: 只删 conv 归属 KB, 别的 agent 保留 */
 void kv_cache_note_store(kv_disk_cache *kc, int tokens);
 int kv_cache_suppress_continued_store(kv_disk_cache *kc, int tokens);
 void kv_cache_restore_suppressed_continued(kv_disk_cache *kc, int old_tokens, int suppressed_tokens);
@@ -301,8 +306,9 @@ void think_loop_push(think_loop *d, int32_t tok);
 bool think_loop_hit(const think_loop *d, int *period, int *span);   /* true = 已成死环; period/span 可为 NULL */
 /* V4.1 服务生成路(server_generate_v41.c): 没有会话, token 从引擎回调来; generate_job 入口按模型分流 */
 void generate_job_v41(server *s, job *j);
-/* 上一条生成的序列接进下一条提示(server_v41_live.c): 生成前 splice(提示以上一条文本开头 ⇒ 沿用上一条的 id), 生成后 store */
-void v41_live_splice(server *s, job *j);   /* v41_live_store 在 v41_gen 定义之后声明 */
+/* 上一条生成的序列接进下一条提示(server_v41_live.c): 生成前 splice(提示以上一条文本开头 ⇒ 沿用上一条的 id), 生成后 store。
+ * 返回 true = 本条是上一条会话的续写; false = 不同对话/agent(或边界落 token 中间) ⇒ 服务端先离载旧检查点(2026-11-15)。 */
+bool v41_live_splice(server *s, job *j);   /* v41_live_store 在 v41_gen 定义之后声明 */
 /* 一条 V4.1 请求的生成期状态(2026-09-30 从 server_generate_v41.c 搬到头文件: 并发调度器 server_sched_v41.c 也要用)。
  * 三段: v41_gen_begin(校验/id/trace/采样面; 失败已回响应) → 引擎每出一个 token 调 v41_emit(文本累积/思考段/DSML/停止串/流式/挂断探测)
  * → v41_gen_end(收尾响应/trace/释放)。单请求路(generate_job_v41)与并发路走同一套, 客户端看到的字节一样。 */

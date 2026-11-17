@@ -366,6 +366,8 @@ void v41_kvreuse_save_end(const ds4_v41_state *st, const int32_t *prompt, uint32
                           const int32_t *fed, uint32_t nf, uint32_t logit_row);   /* fed = 真喂进 KV 的生成 token; logit_row = 末位 logits 所在行 */
 uint32_t v41_kvreuse_restore(ds4_v41_state *st, const int32_t *prompt, uint32_t np, const uint64_t *sig);
 void v41_kvreuse_drop(void);   /* 作废检查点但留着它的提示 token(ds4_engine_v41_kv_stale_prompt 取, 切换插件后预热用) */
+void v41_kvreuse_release_all(void);   /* 引擎关: 两个槽的显存 + tok/sig 全释放 */
+void v41_kvreuse_trim(void);          /* 余量为 0: 回收两个槽, 下一条请求冷预填 */
 #define DS4_V41_LOGIT_LOG 1024   /* 逐步 logits 指纹最多记几步(core_v41_sample.c) */
 void v41_logit_log_reset(void);
 extern int g_ds4_v41_lanes;   /* 合批缓存段按路分流(core_v41_multi.c); --no-lanes 关(A/B 用) */

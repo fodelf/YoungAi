@@ -14807,3 +14807,9 @@ PPL 2.8852 对 2.8827(比值 **1.001**), Σmin **0.9695**(中位 0.981), Mean KL
 - **九项对比图**: 用户要图里的 unsloth 对比也换成挂补丁的读数 ⇒ 要把 v17 挂到 spark 线上重跑 bench_chain_mac.sh(每项 90 分钟, 六项 spark + IFEval 判分 + Aider Mac Docker), 跑完 quant_compare.html 本项目行换数、render_arch.sh 出 png、README 顶部段落改数, 再提交 / 发 HF docs。核过 v17 的 agent 料 v002 全是 ani_task/vis_task(动画 / 视觉任务), 不含九项基准题, 排除清单不用加。**用户随即叫停: "别跑分了暂时不动"** ⇒ 没挂 v17、没发车, 线上仍纯 c5f2; README 顶部九项图仍是 11-01 c5f2 的读数(图注就是还原侧车, 与表的默认行一致)。
 - **用户"v17 现在是不是最好指标, 如果是应该设置为默认"**: 是 —— 编程判决尺 85.16 / 0.22382 / 0.8382 是所有量过版本里最好的(c5f2 85.07 / 0.22712 / 0.8340); wt2 81.64 对 c5f2 82.23 低 0.6 pp, 按 10-11 规矩只报数不否决。07:28 serve_pick 加 --posttrain gguf/v41/posttrain/vstep-v17/ckpt_v04 两行, with_model_stopped true 装回, 07:30 冒烟过, 子进程 cmdline 带 --posttrain ⇒ **现役 = c5f2 + v17 索引补丁**(serve_pick.txt 4 行; 退回 = 删那两行再装回, 备份 /tmp/bugmd/serve_pick.before_v17)。README ×2 的"Spark 上默认"挪到补丁那一行, 标题句改 85.2%。
 - **用户"把 README 里的技术细节迁到技术文档, 保持 README 简约"**: README ×2 四块缩成一两句 + 链接(九项样本量段 / 鹈鹕 10-27·10-30 两条 + 两趟之间尺读数 / "一致"定义 + KL 链 / 索引补丁段), 内容原样迁进 TECHNICAL ×2 §5.1 末尾(补丁段后加"11-03 起默认"一句 + README 表那一串 KL, 新小节 "任务基准(Unsloth 那一套)" 与 "鹈鹕测试")。README 341 → 328 行, 中文 273 → 263 行。
+
+## 11-13 · 用户"each context parsing is using slow ssd reading, make the context window size for maximum 300K"
+
+- **改**: `ds4_internal.h` 加 `DS4_V41_CONTEXT_TOK_MAX 307200u`(300Ki; 本仓 1M=1048576、384K=393216 同口径), `src/core/core_validate_v41.c` 装载时把模型元数据声明的 `deepseek4.context_length` 1048576 钳成部署上限 307200; 缺键仍拒载。理由: 每个 context parse 要并行 pread 盘上 203 GB engram 表(2 层 × 24 行/位)与流离专家, 1M 提示整段预填数小时; 300K 是部署上限。
+- **验**: `make cuda-spark` 成功, `make linecount` ok; `ds4_test --server`(104 项)/ `--engine-units` OK; 模型子进程重起后启动日志 "上下文 307200", /v1/models 两个 id 的 context_length=307200, /metrics max_context=307200。`make test` 除外部 Mongo 探针两条需认证外全绿(与本改动无关)。
+- **Pi 配置**: `~/.pi/ds4/settings.json` contextTokens 393216 → 307200(显式设定, `/reload` 生效)。README ×2 与 CLAUDE.md 的 "1M" 说法改成"模型能力 1M / 部署上限 300K"。

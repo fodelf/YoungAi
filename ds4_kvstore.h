@@ -9,6 +9,7 @@
 #include <stdio.h>
 
 #define DS4_KVSTORE_FIXED_HEADER 48u
+#define DS4_KVSTORE_CONV_TRAILER 64u   /* 文件末尾 agent 归属: 4B magic+version, 60B 会话号(零垫); 不计入 payload ABI */
 #define DS4_KVSTORE_DEFAULT_MB 4096
 #define DS4_KVSTORE_HIT_HALF_LIFE_SECONDS (6ull * 60ull * 60ull)
 
@@ -54,6 +55,7 @@ typedef struct {
     uint64_t payload_bytes;
     uint64_t text_bytes;
     uint64_t file_size;
+    char conv[64];   /* X-DS4-Conversation 归属(存时拷 kvstore 当前, 删按它) */
 } ds4_kvstore_entry;
 
 typedef struct {
@@ -75,6 +77,7 @@ typedef struct {
     int len;
     int cap;
     const char *log_name;
+    char conv[64];   /* 服务端最近请求的 agent 会话号, store 时拷进条目 */
     void *log_ud;
     void (*log)(void *ud, ds4_kvstore_log_type type, const char *msg);
 } ds4_kvstore;
@@ -118,7 +121,13 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
                       void *log_ud);
 void ds4_kvstore_close(ds4_kvstore *kc);
 void ds4_kvstore_clear(ds4_kvstore *kc);
+int ds4_kvstore_erase_all(ds4_kvstore *kc);   /* 删目录里全部条目文件并清索引, 返回删了几个 */
+int ds4_kvstore_erase_conversation(ds4_kvstore *kc, const char *conv);   /* 只删 conv 归属的条目 */
 void ds4_kvstore_entry_free(ds4_kvstore_entry *e);
+void ds4_kvstore_conv_trailer(uint8_t cv[DS4_KVSTORE_CONV_TRAILER], const char *conv);
+uint64_t ds4_kvstore_conv_write(FILE *fp, const char *conv);
+bool ds4_kvstore_conv_read(FILE *fp, uint64_t file_size, uint8_t cv[DS4_KVSTORE_CONV_TRAILER], char conv[64]);
+bool ds4_kvstore_conv_match(const uint8_t cv[DS4_KVSTORE_CONV_TRAILER], const char *conv);
 
 char *ds4_kvstore_render_tokens_text(ds4_engine *engine,
                                      const ds4_tokens *tokens,

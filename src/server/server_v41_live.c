@@ -47,13 +47,14 @@ void v41_live_store(server *s, const job *j, const v41_gen *g) {
     L->has_img = r->images != NULL;
 }
 
-/* 生成前调(v41_gen_begin 之前, 提示 id 还没进 trace/监控): 条件齐了就把 j->req.prompt 换成 上一条的 id + 边界后重新分词的 id */
-void v41_live_splice(server *s, job *j) {
+/* 生成前调(v41_gen_begin 之前, 提示 id 还没进 trace/监控): 条件齐了就把 j->req.prompt 换成 上一条的 id + 边界后重新分词的 id。
+ * 返回 true = 本条是上一条会话的续写; false = 不同对话/agent 或边界落进 token 中间 —— 服务端据此把旧检查点离载(2026-11-15)。 */
+bool v41_live_splice(server *s, job *j) {
     const v41_live_seq *L = &s->v41_live;
     request *r = &j->req;
-    if (!L->ids || L->n < 1 || !r->prompt_text || r->images || L->has_img) return;
+    if (!L->ids || L->n < 1 || !r->prompt_text || r->images || L->has_img) return false;
     const size_t pl = strlen(r->prompt_text);
-    if (pl < L->text_len || memcmp(r->prompt_text, L->text, L->text_len) != 0) return;
+    if (pl < L->text_len || memcmp(r->prompt_text, L->text, L->text_len) != 0) return false;
     size_t acc = 0; int b = -1;   /* b = 重新分词里第一个落在记下文本之外的 token 序号 */
     for (int i = 0; i <= r->prompt.len; i++) {
         if (acc == L->text_len) { b = i; break; }
@@ -63,7 +64,7 @@ void v41_live_splice(server *s, job *j) {
     }
     if (b < 0) {
         server_log(DS4_LOG_GENERATION, "ds4-server: V4.1 上一条序列(%d token, %zu 字节)是本条提示的前缀, 但重新分词的边界落在 token 中间, 不接, 整段冷分词", L->n, L->text_len);
-        return;
+        return false;
     }
     const int rest = r->prompt.len - b;
     int32_t *nv = xmalloc(((size_t)L->n + (size_t)rest) * sizeof(int32_t));
@@ -72,4 +73,5 @@ void v41_live_splice(server *s, job *j) {
     ds4_tokens_free(&r->prompt);
     r->prompt.v = nv; r->prompt.len = r->prompt.cap = L->n + rest;
     server_log(DS4_LOG_GENERATION, "ds4-server: V4.1 提示沿用上一条的 %d 个 token(重新分词是 %d 个)+ 新段 %d 个 = %d", L->n, b, rest, r->prompt.len);
+    return true;
 }

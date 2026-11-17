@@ -139,7 +139,7 @@ static void run_one(const char *sid, const char *text, const char *device, const
         if (!task) task = asst_task_of(sid, tid);   /* 上一轮刚调了 plan_propose: 这一轮起工具表就带 task_* 与 plan_step */
         const asst_tctx tc = { cur_caps, cur_apps, task ? tid : NULL, task && asst_plan_has(tid) };
         char *tools = asst_tools_json(&tc);
-        const bool good = asst_llm_chat(g_port, msgs, tools, &cb, &o);
+        const bool good = asst_llm_chat(g_port, sid, msgs, tools, &cb, &o);
         free(msgs); free(tools);
         ds4_buf m = {0};
         ds4_buf_puts(&m, "{\"role\":\"assistant\",\"content\":"); ds4_json_escape(&m, o.content.ptr ? o.content.ptr : "");

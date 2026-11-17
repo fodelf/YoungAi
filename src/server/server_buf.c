@@ -28,6 +28,29 @@ void die(const char *msg) {
     exit(1);
 }
 
+/* ★单 worker 内存准入(2026-11-12)★: 与 --batch 调度器同一规则 —— 开一条请求的预填要 MemAvailable ≥ 2 × 预填峰值字节。
+ * 单 worker 以前没有这条: 588715/406879 token 的提示直接把请求态与持久检查点推进 2500 MB 看门狗线。
+ * 不够就回 503 + 标准 error, 不进 ds4_engine_v41_generate_argmax 分配状态 —— 拒绝请求好过把服务杀掉。 */
+long server_mem_available_mb(void) {
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return -1;   /* 读不到 = 不拦(Mac 编译路没有 /proc) */
+    char line[256]; long kb = -1;
+    while (fgets(line, sizeof line, f)) if (sscanf(line, "MemAvailable: %ld kB", &kb) == 1) break;
+    fclose(f);
+    return kb < 0 ? -1 : kb / 1024;
+}
+bool server_v41_mem_admit(server *s, job *j, char *err, size_t errn) {
+    const long avail = server_mem_available_mb();
+    const uint64_t peak_mb = (ds4_v41_req_prefill_bytes(j->req.prompt.len) + ds4_v41_images_bytes(j->req.images)) >> 20;
+    if (avail >= 0 && (uint64_t)avail < 2u * peak_mb) {
+        snprintf(err, errn, "server memory insufficient: prefill peak %llu MB, MemAvailable %ld MB (admission = 2x peak)",
+                 (unsigned long long)peak_mb, avail);
+        return false;
+    }
+    (void)s;   /* 准入是纯内存判据, 不依赖 server 状态 */
+    return true;
+}
+
 char *xstrdup(const char *s) {
     size_t n = strlen(s);
     char *p = xmalloc(n + 1);
