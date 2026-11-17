@@ -286,7 +286,13 @@ int main(int argc, char **argv) {
     pthread_mutex_unlock(&s.mu);
 
     const ds4_tokens *tokens = s.session ? ds4_session_tokens(s.session) : NULL;
-    if (s.kv.enabled && tokens && tokens->len >= s.kv.opt.min_tokens) {
+    /* 2026-11-16 "delete KB cache when agent is closed": --kv-cache-shutdown-delete 让干净退出删本 agent(s.conv)
+     * 归属的 KB, 而不是存当前会话; 别的 agent 的留着. 默认仍是存(shutdown 触发器保留给要续的客户端). */
+    if (cfg.kv_cache_shutdown_delete && s.conv[0]) {
+        /* 用户 15:52 纠正: 只删本 agent(s.conv) 归属的 KB, 不是整个模型目录; 别的 agent 的留着.
+         * V4.1 CK 盘 trailer 同 conv; V4 会话 kvstore 条目 conv 同. 无 conv = 不知道是谁, 走默认存. */
+        server_cache_erase_conversation(&s, s.conv);
+    } else if (s.kv.enabled && tokens && tokens->len >= s.kv.opt.min_tokens) {
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: persisting current KV cache before shutdown tokens=%d",
                    tokens->len);

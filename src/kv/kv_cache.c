@@ -61,6 +61,10 @@ bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],
     ds4_kvstore_entry e = {0};
     uint32_t text_bytes = 0;
     bool ok = ds4_kvstore_read_header(fp, &e, &text_bytes);
+    if (ok) {
+        uint8_t cv[DS4_KVSTORE_CONV_TRAILER];
+        (void)ds4_kvstore_conv_read(fp, (uint64_t)st.st_size, cv, e.conv);   /* 文件尾归属, 旧文件无则空 */
+    }
     fclose(fp);
     if (!ok) return false;
     const uint64_t fixed = DS4_KVSTORE_FIXED_HEADER + 4ull;
@@ -386,9 +390,12 @@ static bool kv_cache_file_size_bytes(uint64_t text_bytes,
     const uint64_t fixed = DS4_KVSTORE_FIXED_HEADER + 4ull;
     if (UINT64_MAX - fixed < text_bytes ||
         UINT64_MAX - fixed - text_bytes < payload_bytes ||
-        UINT64_MAX - fixed - text_bytes - payload_bytes < trailer_bytes)
+        UINT64_MAX - trailer_bytes < DS4_KVSTORE_CONV_TRAILER ||
+        UINT64_MAX - fixed - text_bytes - payload_bytes < trailer_bytes +
+            DS4_KVSTORE_CONV_TRAILER)
         return false;
-    if (file_bytes) *file_bytes = fixed + text_bytes + payload_bytes + trailer_bytes;
+    if (file_bytes) *file_bytes = fixed + text_bytes + payload_bytes +
+                                  trailer_bytes + DS4_KVSTORE_CONV_TRAILER;
     return true;
 }
 

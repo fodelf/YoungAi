@@ -126,6 +126,8 @@ bool tr_model_start_sync(int model_port, FILE *log) {
     snprintf(cbud, sizeof cbud, "%u", TR_V41_CKPT_DISK_MB);
     argv[na++] = "--kv-disk-dir"; argv[na++] = ckp;
     argv[na++] = "--kv-disk-space-mb"; argv[na++] = cbud;
+    /* Yongai 支持(2026-11-16 用户令): 模型/agent 关掉(训练/换装/停服)时删盘上 KV, 不留旧前缀 KB. */
+    argv[na++] = "--kv-cache-shutdown-delete";
     char asr[TR_PATH + 300];
     if (asr_dir(asr, sizeof asr)) { argv[na++] = "--asr"; argv[na++] = asr; }   /* 语音识别模型(docs/assistant_asr.md): 有就带上, 页面据此出麦克风 */
     /* 视觉塔不用在这里带: 引擎自己按名字接模型旁边的 <底座>.vision.gguf(core_engine_open.c, 10-18); 第 3 行起用户写了 --vision-gguf 照样透传 */

@@ -39,7 +39,8 @@ static void kv_cache_rewrite_trailer(ds4_kvstore *kc, const char *path,
         ftruncate(fileno(fp), (off_t)end) == 0)
     {
         uint64_t ignored = 0;
-        ok = kv_trailer_write(hooks, fp, text, &ignored) && fflush(fp) == 0;
+        ok = kv_trailer_write(hooks, fp, text, &ignored) &&
+             ds4_kvstore_conv_write(fp, kc->conv) != 0 && fflush(fp) == 0;
         if (ok && ignored > 0) {
             uint8_t h[DS4_KVSTORE_FIXED_HEADER];
             uint64_t now = (uint64_t)time(NULL);
@@ -226,6 +227,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
               ds4_session_write_staged_payload(&staged, fp,
                                                save_err, sizeof(save_err)) == 0 &&
               kv_trailer_write(hooks, fp, text, &trailer_bytes) &&
+              ds4_kvstore_conv_write(fp, kc->conv) != 0 &&
               fflush(fp) == 0;
     int saved_errno = errno;
     if (fclose(fp) != 0) {
@@ -281,7 +283,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                 original_len - store_tokens.len,
                 reason,
                 text_override ? (cache_text_key ? cache_text_key : "visible-transcript") : "token-text",
-                (double)(DS4_KVSTORE_FIXED_HEADER + 4ull + text_len + payload_bytes + trailer_bytes) / (1024.0 * 1024.0),
+                (double)(DS4_KVSTORE_FIXED_HEADER + 4ull + text_len + payload_bytes + trailer_bytes + DS4_KVSTORE_CONV_TRAILER) / (1024.0 * 1024.0),
                 save_ms);
     }
     ds4_session_payload_file_free(&staged);

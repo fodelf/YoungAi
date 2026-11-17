@@ -54,6 +54,32 @@ bool http_accepts_text(const char *h, size_t n) {
     return false;
 }
 
+/* X-DS4-Conversation 头: Pi skill/agent 发会话号, 服务端把它当 KB 归属.
+ * 不读其它自定义头; 名字大小写无关; 值去前空格, 截到 cap-1. */
+static bool header_value(const char *h, size_t n, const char *name,
+                         char *out, size_t cap) {
+    const size_t nl = strlen(name);
+    out[0] = 0;
+    const char *p = h, *end = h + n;
+    while (p < end) {
+        const char *line = p;
+        while (p < end && *p != '\n') p++;
+        size_t len = (size_t)(p - line);
+        if (len && line[len - 1] == '\r') len--;
+        if (len >= nl && strncasecmp(line, name, nl) == 0 &&
+            len > nl && line[nl] == ':') {
+            const char *v = line + nl + 1;
+            while (v < line + len && isspace((unsigned char)*v)) v++;
+            size_t vl = (size_t)(line + len - v);
+            if (vl >= cap) vl = cap - 1;
+            memcpy(out, v, vl); out[vl] = 0;
+            return true;
+        }
+        if (p < end) p++;
+    }
+    return false;
+}
+
 static bool read_http_request(int fd, http_request *r) {
     buf b = {0};
     ssize_t hend = -1;
@@ -82,6 +108,7 @@ static bool read_http_request(int fd, http_request *r) {
     r->query[0] = '\0';
     if (q) { *q = '\0'; snprintf(r->query, sizeof r->query, "%s", q + 1); }
     r->accept_text = http_accepts_text(b.ptr, (size_t)hend);
+    (void)header_value(b.ptr, (size_t)hend, "X-DS4-Conversation", r->conv, sizeof r->conv);
 
     long clen = content_length(b.ptr, (size_t)hend);
     if (clen < 0 || (size_t)clen > max_body) goto fail;
@@ -291,12 +318,24 @@ void *client_main(void *arg) {
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/completions")) {
         ok = parse_completion_request(s->engine, hr.body, s->default_tokens,
                                       ctx_size, &req, err, sizeof(err));
+    } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/cache-delete")) {
+        /* 只删 X-DS4-Conversation 归属的那份: 一个 agent 关, 别的 agent 的 KB 留着.
+         * 不删整个模型目录 —— 用户 15:52 纠正. 头缺 = 400(不知道是谁的不能乱删). */
+        const char *who = hr.conv;
+        if (!who[0]) { http_error(fd, s->enable_cors, 400, "missing X-DS4-Conversation"); goto done; }
+        const int n = server_cache_erase_conversation(s, who);
+        ds4_buf o = {0}; ds4_buf_printf(&o, "{\"ok\":%s,\"deleted\":%d,\"conversation\":",
+                                  n >= 0 ? "true" : "false", n >= 0 ? n : 0);
+        ds4_json_escape(&o, who); ds4_buf_putc(&o, '}');   /* conv 是客户端头: 原文进 JSON 要转义 */
+        http_response_n(fd, s->enable_cors, 200, "application/json", o.ptr, o.len);
+        ds4_buf_free(&o); http_request_free(&hr); goto done;
     } else {
         http_error(fd, s->enable_cors, 404, "unknown endpoint");
         http_request_free(&hr);
         goto done;
     }
     if (ok) req.raw_body = xstrndup(hr.body, hr.body_len);
+    if (ok) snprintf(req.conv, sizeof req.conv, "%s", hr.conv);   /* 归属随 job 走; worker 开工时再落 s->kv/引擎, 不让并发解析写共享态 */
     char route_path[256];
     snprintf(route_path, sizeof route_path, "%s", hr.path);
     http_request_free(&hr);

@@ -324,3 +324,91 @@ void test_kv_cache_eviction_keeps_aligned_continued_frontiers(void) {
     free(continued_path);
     rmdir(dir);
 }
+
+static void kv_conv_stub_file(const char *dir, const char *text, const char *conv,
+                              uint64_t payload_bytes) {
+    char sha[41], name[44];
+    sha1_bytes_hex(text, strlen(text), sha);
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = path_join(dir, name);
+    FILE *fp = fopen(path, "wb");
+    TEST_ASSERT(fp != NULL);
+    if (!fp) { free(path); return; }
+    uint8_t h[DS4_KVSTORE_FIXED_HEADER];
+    ds4_kvstore_fill_header(h, 0, 2, DS4_KVSTORE_REASON_COLD, 0, 512, 0,
+                            32768, 100, 100, payload_bytes);
+    uint8_t text_len[4];
+    le_put32(text_len, (uint32_t)strlen(text));
+    TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
+    TEST_ASSERT(fwrite(text_len, 1, sizeof(text_len), fp) == sizeof(text_len));
+    TEST_ASSERT(fwrite(text, 1, strlen(text), fp) == strlen(text));
+    for (uint64_t i = 0; i < payload_bytes; i++) TEST_ASSERT(fputc(0, fp) != EOF);
+    TEST_ASSERT(ds4_kvstore_conv_write(fp, conv) == DS4_KVSTORE_CONV_TRAILER);
+    TEST_ASSERT(fclose(fp) == 0);
+    free(path);
+}
+
+void test_kv_cache_conv_trailer_roundtrip(void) {
+    char tmpl[] = "/tmp/ds4-kv-conv-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *text = "conv-owner transcript", *conv = "agent-alpha";
+    uint8_t cv_short[DS4_KVSTORE_CONV_TRAILER], cv_long[DS4_KVSTORE_CONV_TRAILER];
+    ds4_kvstore_conv_trailer(cv_short, "abc");
+    ds4_kvstore_conv_trailer(cv_long, "abcdef");
+    TEST_ASSERT(ds4_kvstore_conv_match(cv_short, "abc"));
+    TEST_ASSERT(!ds4_kvstore_conv_match(cv_short, "abcdef"));   /* 60B zero pad makes short names not prefixes */
+    TEST_ASSERT(!ds4_kvstore_conv_match(cv_long, "abc"));
+    kv_conv_stub_file(dir, text, conv, 16);
+
+    kv_disk_cache kc = {0};
+    TEST_ASSERT(ds4_kvstore_open(&kc, dir, 1, false,
+                                 ds4_kvstore_default_options(), "test", NULL, NULL));
+    TEST_ASSERT(kc.len == 1);
+    TEST_ASSERT(kc.len == 1 && strcmp(kc.entry[0].conv, conv) == 0);
+    ds4_kvstore_close(&kc);
+
+    char sha[41], name[44];
+    sha1_bytes_hex(text, strlen(text), sha);
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = path_join(dir, name);
+    unlink(path);
+    free(path);
+    rmdir(dir);
+}
+
+void test_kv_cache_erase_conversation_keeps_others(void) {
+    char tmpl[] = "/tmp/ds4-kv-conv-erase-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *a = "alpha transcript", *b = "beta transcript";
+    kv_conv_stub_file(dir, a, "agent-alpha", 16);
+    kv_conv_stub_file(dir, b, "agent-beta", 16);
+
+    kv_disk_cache kc = {0};
+    TEST_ASSERT(ds4_kvstore_open(&kc, dir, 1, false,
+                                 ds4_kvstore_default_options(), "test", NULL, NULL));
+    TEST_ASSERT(kc.len == 2);
+    TEST_ASSERT(ds4_kvstore_erase_conversation(&kc, "agent-alpha") == 1);
+    TEST_ASSERT(kc.len == 1);
+    TEST_ASSERT(kc.len == 1 && strcmp(kc.entry[0].conv, "agent-beta") == 0);
+
+    char sha_a[41], sha_b[41], name[44], *path_a, *path_b;
+    sha1_bytes_hex(a, strlen(a), sha_a);
+    sha1_bytes_hex(b, strlen(b), sha_b);
+    snprintf(name, sizeof(name), "%.40s.kv", sha_a);
+    path_a = path_join(dir, name);
+    TEST_ASSERT(access(path_a, F_OK) != 0);   /* alpha removed from disk */
+    snprintf(name, sizeof(name), "%.40s.kv", sha_b);
+    path_b = path_join(dir, name);
+    TEST_ASSERT(access(path_b, F_OK) == 0);   /* beta kept for the other agent */
+    ds4_kvstore_close(&kc);
+    unlink(path_b);
+    free(path_a);
+    free(path_b);
+    rmdir(dir);
+}

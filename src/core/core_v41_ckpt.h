@@ -42,6 +42,8 @@ uint32_t v41_ckpt_disk_restore_state(ds4_v41_state *st, const int32_t *prompt, u
 
 /* 切插件/引擎关: 磁盘检查点是带老放大器算的，全部作废。 */
 void v41_ckpt_disk_clear(void);
+void v41_ckpt_disk_conversation_set(const char *conv);   /* agent 会话号: store 时写进 64B 尾 trailer */
+int v41_ckpt_disk_erase_conversation(const char *conv);  /* 只删同 conv 的 CK 文件, 别的 agent 留 */
 
 #endif /* !DS4_NO_GPU */
 #endif /* DS4_CORE_V41_CKPT_H */

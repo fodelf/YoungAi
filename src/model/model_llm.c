@@ -103,14 +103,16 @@ bool asst_llm_strip_images(ds4_buf *body) {
 }
 
 /* 一次 POST: 返回 HTTP 状态(传输层失败 0, o->err 已填); 200 的 SSE 边收边喂回调 */
-static int llm_once(int port, const ds4_buf *body, const asst_llm_cb *cb, asst_llm_out *o) {
+static int llm_once(int port, const char *conv, const ds4_buf *body, const asst_llm_cb *cb, asst_llm_out *o) {
     const int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) { snprintf(o->err, sizeof o->err, "socket: %s", strerror(errno)); return 0; }
     struct sockaddr_in a; memset(&a, 0, sizeof a); a.sin_family = AF_INET; a.sin_port = htons((uint16_t)port); a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (connect(fd, (struct sockaddr *)&a, sizeof a)) { close(fd); snprintf(o->err, sizeof o->err, "model is not running (nothing on 127.0.0.1:%d; it may be training or not loaded)", port); return 0; }
     int one = 1; setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
     ds4_buf req = {0};
-    ds4_buf_printf(&req, "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", port, body->len);
+    ds4_buf_printf(&req, "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n", port);
+    if (conv && conv[0]) ds4_buf_printf(&req, "X-DS4-Conversation: %.63s\r\n", conv);   /* 会话归属: 服务端据此只删这个助理的 KB, 别的助理留着 */
+    ds4_buf_printf(&req, "Content-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", body->len);
     ds4_buf_append(&req, body->ptr, body->len);
     const bool sent = send_all(fd, req.ptr, req.len);
     ds4_buf_free(&req);
@@ -148,7 +150,7 @@ static int llm_once(int port, const ds4_buf *body, const asst_llm_cb *cb, asst_l
     return status;
 }
 
-bool asst_llm_chat(int port, const char *messages, const char *tools, const asst_llm_cb *cb, asst_llm_out *o) {
+bool asst_llm_chat(int port, const char *conv, const char *messages, const char *tools, const asst_llm_cb *cb, asst_llm_out *o) {
     memset(o, 0, sizeof *o);
     ds4_buf body = {0};
     /* ★助理默认开思考★(2026-10-12 用户定"Agent 默认开启"): 不思考模式下模型把过渡句当思考段, 收口位 24 次采样 8 次吐游离 </think>、1 次 EOS
@@ -159,10 +161,10 @@ bool asst_llm_chat(int port, const char *messages, const char *tools, const asst
                    ASST_MAX_TOKENS, messages);
     if (tools && tools[0]) ds4_buf_printf(&body, ",\"tools\":%s", tools);
     ds4_buf_putc(&body, '}');
-    int status = llm_once(port, &body, cb, o);
+    int status = llm_once(port, conv, &body, cb, o);
     if (status == 400 && !o->stopped && asst_llm_strip_images(&body)) {   /* 没视觉塔的模型拒带图请求: 去图重发一次(服务端在解析阶段就拒, 第一发不花推理) */
         asst_llm_out_free(o); memset(o, 0, sizeof *o);
-        status = llm_once(port, &body, cb, o);
+        status = llm_once(port, conv, &body, cb, o);
     }
     ds4_buf_free(&body);
     (void)status;

@@ -256,6 +256,7 @@ typedef struct {
     struct { unsigned char *data; size_t len; } *img;
     int n_img, cap_img;
     struct ds4_v41_images *images;
+    char conv[64];   /* X-DS4-Conversation 头(agent/session): 存盘 KB 文件归属, 删只删这一份 */
 } request;
 
 typedef struct {

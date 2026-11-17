@@ -282,7 +282,7 @@ struct server {
     live_tool_state anthropic_live;
     visible_live_state thinking_live;
     bool disable_exact_dsml_tool_replay;
-    bool enable_cors;
+    bool enable_cors; char conv[64];   /* 最近请求的 agent 会话号: 存/删 KB 按它归属 */
     pthread_mutex_t tool_mu;
     pthread_mutex_t mu;
     pthread_cond_t cv;
@@ -438,7 +438,7 @@ typedef struct {
 typedef struct {
     char method[8];
     char path[256];
-    char query[256];      /* '?' 后面的原文(不含 '?'); 没有就是空串。/metrics 看 requests=all / format=prometheus */
+    char query[256]; char conv[64];   /* '?' 后面的原文; conv = X-DS4-Conversation(agent/session 归属, Pi skill 发) */
     bool accept_text;     /* 请求头 Accept 带 text/plain 或 application/openmetrics-text: Prometheus 抓取 /metrics 的问法 */
     char *body;
     size_t body_len;
@@ -467,7 +467,7 @@ typedef struct {
     const char *kv_disk_dir;
     uint64_t kv_disk_space_mb;
     kv_cache_options kv_cache;
-    bool kv_cache_reject_different_quant;
+    bool kv_cache_reject_different_quant, kv_cache_shutdown_delete;
     bool disable_exact_dsml_tool_replay;
     int tool_memory_max_ids;
     bool enable_cors;

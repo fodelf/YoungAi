@@ -91,6 +91,9 @@ int ds4_engine_v41_kv_disk_open(const char *dir, uint64_t budget_mb, char *err, 
     return v41_ckpt_disk_open(dir, budget_mb, err, errn) ? 0 : 1;
 }
 void ds4_engine_v41_kv_disk_close(void) { v41_ckpt_disk_close(); }
+void ds4_engine_v41_kv_disk_clear(void) { v41_ckpt_disk_clear(); }
+void ds4_engine_v41_kv_disk_conversation_set(const char *conv) { v41_ckpt_disk_conversation_set(conv); }
+int ds4_engine_v41_kv_disk_erase_conversation(const char *conv) { return v41_ckpt_disk_erase_conversation(conv); }
 void ds4_engine_v41_kv_offload(void) { v41_kvreuse_offload(); }
 void v41_kvreuse_trim(void) {
     if (ds4_runtime_mem_headroom_bytes() != 0) return;   /* 余量还有就不主动丢: 复用优先 */
@@ -147,7 +150,9 @@ static void ckpt_save(ckpt *k, const char *what, const ds4_v41_state *st, const 
                       const int32_t *tail, uint32_t nt, uint32_t logit_row) {
     k->valid = 0;
     const uint64_t need = ckpt_need(k, st), room = ds4_runtime_mem_headroom_bytes();
-    if (room == 0 || need > room) {
+    /* need=0 ⇒ 现有缓冲都够大, 拷贝不新分显存 ⇒ room=0 也能存(否则余量0 时永远拒一份无需扩容的检查点,
+     * 下一条请求的复用就断)。只有真会新分时才按 room 拒。 */
+    if (need > room) {
         ckpt_free_gpu(k);   /* 余量不够: 先回收旧检查点的显存, 这一份不存 —— 不把"不存"留成旧缓冲继续占内存 */
         fprintf(stderr, "ds4: [v41] %s检查点要新分 %.0f MB, 内存余量只剩 %.0f MB, 这一份不存并回收旧缓冲(下一条请求少这一段复用)\n",
                 what, (double)need / 1048576.0, (double)room / 1048576.0);

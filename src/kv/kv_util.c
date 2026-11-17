@@ -333,7 +333,67 @@ void ds4_kvstore_clear(ds4_kvstore *kc) {
     kc->cap = 0;
 }
 
+/* 尾 trailer = agent 归属, 固定 64B: magic KCV + 版本 1 + 60B 会话号(后面零垫).
+ * 与 V4.1 CK 文件同款, 因为两种盘缓存都由同一个头字段 X-DS4-Conversation 归属. */
+void ds4_kvstore_conv_trailer(uint8_t cv[DS4_KVSTORE_CONV_TRAILER], const char *conv) {
+    memset(cv, 0, DS4_KVSTORE_CONV_TRAILER);
+    cv[0] = 'K'; cv[1] = 'C'; cv[2] = 'V'; cv[3] = 1;
+    size_t cl = strlen(conv ? conv : ""); if (cl > DS4_KVSTORE_CONV_TRAILER - 4u) cl = DS4_KVSTORE_CONV_TRAILER - 4u;
+    if (cl) memcpy(cv + 4, conv, cl);
+}
+uint64_t ds4_kvstore_conv_write(FILE *fp, const char *conv) {
+    uint8_t cv[DS4_KVSTORE_CONV_TRAILER];
+    ds4_kvstore_conv_trailer(cv, conv);
+    return fwrite(cv, 1, DS4_KVSTORE_CONV_TRAILER, fp) == DS4_KVSTORE_CONV_TRAILER ? DS4_KVSTORE_CONV_TRAILER : 0;
+}
+bool ds4_kvstore_conv_match(const uint8_t cv[DS4_KVSTORE_CONV_TRAILER], const char *conv) {
+    uint8_t exp[DS4_KVSTORE_CONV_TRAILER];
+    ds4_kvstore_conv_trailer(exp, conv);   /* 逐 64B 比: 60B 会话号 + 零垫 + 版本字节都相同才算 */
+    return memcmp(cv, exp, DS4_KVSTORE_CONV_TRAILER) == 0;
+}
+bool ds4_kvstore_conv_read(FILE *fp, uint64_t file_size, uint8_t cv[DS4_KVSTORE_CONV_TRAILER], char conv[64]) {
+    conv[0] = 0;
+    if (!fp || file_size < DS4_KVSTORE_CONV_TRAILER ||
+        fseeko(fp, (off_t)(file_size - DS4_KVSTORE_CONV_TRAILER), SEEK_SET) != 0 ||
+        fread(cv, 1, DS4_KVSTORE_CONV_TRAILER, fp) != DS4_KVSTORE_CONV_TRAILER)
+        return false;
+    if (cv[0] != 'K' || cv[1] != 'C' || cv[2] != 'V' || cv[3] != 1) return false;
+    size_t cl = 0;
+    while (cl < DS4_KVSTORE_CONV_TRAILER - 4u && cv[4 + cl]) cl++;
+    memcpy(conv, cv + 4, cl); conv[cl] = 0;
+    return true;
+}
+
+/* agent 关闭/服务关时不留盘上 KV: 删索引里的每个文件(不在 = 忽略), 再清索引.
+ * 返回删成功个数给日志/监控; 不碰其它目录, 只这个 kvstore 自己的条目. */
+int ds4_kvstore_erase_all(ds4_kvstore *kc) {
+    int n = 0;
+    for (int i = 0; i < kc->len; i++) {
+        if (kc->entry[i].path && unlink(kc->entry[i].path) == 0) n++;
+    }
+    ds4_kvstore_clear(kc);
+    return n;
+}
+
+/* 一个 agent 关闭: 只删它归属的条目文件, 别的 agent 的 KB 留着继续服务.
+ * conv 空 ⇒ 不删(不知道是谁的不能乱删). 删完索引里同归属条目也移除, 别留悬空 path. */
+int ds4_kvstore_erase_conversation(ds4_kvstore *kc, const char *conv) {
+    if (!kc || !conv || !conv[0]) return 0;
+    int n = 0;
+    for (int i = 0; i < kc->len; ) {
+        if (strcmp(kc->entry[i].conv, conv) == 0) {
+            if (kc->entry[i].path && unlink(kc->entry[i].path) == 0) n++;
+            ds4_kvstore_entry_free(&kc->entry[i]);
+            if (i != kc->len - 1) memmove(&kc->entry[i], &kc->entry[i + 1],
+                                          (size_t)(kc->len - i - 1) * sizeof kc->entry[0]);
+            kc->len--;
+        } else i++;
+    }
+    return n;
+}
+
 void kv_cache_push(ds4_kvstore *kc, ds4_kvstore_entry e) {
+    /* 不覆盖 e.conv: refresh 从盘 trailer 读归属; 旧文件无 trailer 留空, 不乱删别人的. */
     if (kc->len == kc->cap) {
         kc->cap = kc->cap ? kc->cap * 2 : 16;
         kc->entry = kv_xrealloc(kc->entry, (size_t)kc->cap * sizeof(kc->entry[0]));

@@ -135,6 +135,9 @@ int32_t *ds4_engine_v41_kv_stale_prompt(uint32_t *n);
  * 引擎自己从磁盘装进请求态(restore 优先 GPU 槽，槽没了就查磁盘)。 */
 int ds4_engine_v41_kv_disk_open(const char *dir, uint64_t budget_mb, char *err, size_t errn);
 void ds4_engine_v41_kv_disk_close(void);
+void ds4_engine_v41_kv_disk_clear(void);   /* 全清(切插件同款) */
+void ds4_engine_v41_kv_disk_conversation_set(const char *conv);   /* 请求/agent 会话号, CK store 尾 trailer 记 */
+int ds4_engine_v41_kv_disk_erase_conversation(const char *conv);  /* agent 关闭: 只删它归属的 CK, 别的 agent 留 */
 void ds4_engine_v41_kv_offload(void);
 /* 上一趟 generate 逐步的 logits 指纹(只有主机惩罚路记; 见 core_v41_sample.c), 返回步数; 服务端 --trace 时写进 trace 给精确门比 */
 int ds4_engine_v41_logit_sums(const double **out);

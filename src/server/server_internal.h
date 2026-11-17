@@ -265,6 +265,8 @@ int kv_cache_chat_anchor_pos(const kv_disk_cache *kc, const ds4_tokens *prompt, 
 int kv_cache_continued_store_target(const kv_disk_cache *kc, int live_tokens);
 bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens, int store_len, const char *reason);
 void kv_cache_store_current(server *s, const char *reason);
+void kv_cache_erase_all(server *s, const char *reason);   /* 整目录删(旧路, 只有明确全清才用) */
+int server_cache_erase_conversation(server *s, const char *conv);   /* agent closed: 只删 conv 归属 KB, 别的 agent 保留 */
 void kv_cache_note_store(kv_disk_cache *kc, int tokens);
 int kv_cache_suppress_continued_store(kv_disk_cache *kc, int tokens);
 void kv_cache_restore_suppressed_continued(kv_disk_cache *kc, int old_tokens, int suppressed_tokens);

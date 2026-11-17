@@ -26,6 +26,7 @@
 #define V41CKPT_META    (V41CKPT_META_PER * DS4_MAX_LAYER)
 #define V41CKPT_NAME_LEN 28u
 #define V41CKPT_STAGE   (8ull * 1024ull * 1024ull)
+#define V41CKPT_CONV    64u   /* agent 归属尾 trailer: 4B magic + 60B 会话号; 不影响 restore 的 tensor offset */
 #define V41CKPT_DEFAULT_MB 4096ull
 
 typedef struct {
@@ -39,6 +40,7 @@ typedef struct {
 } v41ckpt_disk_entry;
 
 static int g_on;
+static char g_conv[64];
 static char *g_dir;
 static uint64_t g_budget;
 static v41ckpt_disk_entry *g_entry;
@@ -159,7 +161,7 @@ static uint64_t file_bytes(const ckpt *k) {
         b += (uint64_t)k->ng_src[il] * DS4_V41_CKV_BYTES + (uint64_t)k->ng_src[il] * DS4_V41_IDXK_BYTES;
         if (k->cpk[il] && k->cps[il] && k->cpend[il]) b += (uint64_t)k->cpend[il] * rowb * 2u;
     }
-    b += k->mainh_bytes + (uint64_t)DS4_N_VOCAB * 4u;
+    b += k->mainh_bytes + (uint64_t)DS4_N_VOCAB * 4u + V41CKPT_CONV;
     return b;
 }
 
@@ -186,6 +188,19 @@ static bool write_meta(FILE *fp, const ckpt *k, uint32_t il, uint32_t ckv_b, uin
     return fwrite(m, 1, V41CKPT_META_PER, fp) == V41CKPT_META_PER;
 }
 
+/* 会话归属尾 trailer 填 64B: magic KCV + 版本 1 + 60B(截) + 零垫.
+ * 回读时整 64B 逐字节比, 不是只比字符串前缀 —— 短名"abc"能误配"abcdef"(2026-11-16 查出的 bug). */
+static void conv_trailer(uint8_t cv[V41CKPT_CONV], const char *conv) {
+    memset(cv, 0, V41CKPT_CONV);
+    cv[0] = 'K'; cv[1] = 'C'; cv[2] = 'V'; cv[3] = 1;
+    size_t cl = strlen(conv ? conv : ""); if (cl > V41CKPT_CONV - 4u) cl = V41CKPT_CONV - 4u;
+    if (cl) memcpy(cv + 4, conv, cl);
+}
+static bool conv_match(const uint8_t cv[V41CKPT_CONV], const char *conv) {
+    uint8_t exp[V41CKPT_CONV]; conv_trailer(exp, conv);   /* 60B 零垫 + 版本字节都必须同 */
+    return cv[3] == 1 && memcmp(cv, exp, V41CKPT_CONV) == 0;
+}
+
 static bool write_tensors(FILE *fp, const ckpt *k) {
     const uint64_t rowb = (uint64_t)DS4_N_HEAD_DIM * 4u, wb = win_bytes();
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
@@ -199,7 +214,10 @@ static bool write_tensors(FILE *fp, const ckpt *k) {
         }
     }
     if (!tensor_to_file(fp, k->mainh, k->mainh_bytes)) return false;
-    return tensor_to_file(fp, k->logits, (uint64_t)DS4_N_VOCAB * 4u);
+    if (!tensor_to_file(fp, k->logits, (uint64_t)DS4_N_VOCAB * 4u)) return false;
+    /* 尾 trailer 记 agent 会话号; 在最后一 tensor 后面, 不参与 restore tensor 读, 删按它归属. */
+    uint8_t cv[V41CKPT_CONV]; conv_trailer(cv, g_conv);
+    return fwrite(cv, 1, V41CKPT_CONV, fp) == V41CKPT_CONV;
 }
 
 /* 回读时先扫目录建索引; 只读头，不读 tok/sig/缓冲 —— 索引本身只有 path+hash+n+slot+bytes+last */
@@ -311,6 +329,31 @@ bool v41_ckpt_disk_enabled(void) { return g_on != 0; }
 void v41_ckpt_disk_clear(void) {
     for (int i = g_len - 1; i >= 0; i--) entry_remove(i, true);
     /* 目录和索引还活着: 切插件后新检查点照样能存新文件(旧文件已删) */
+}
+
+void v41_ckpt_disk_conversation_set(const char *conv) {
+    snprintf(g_conv, sizeof g_conv, "%s", conv ? conv : "");
+}
+
+/* 只删尾 trailer 里会话号等于 conv 的文件; 别的 agent 的 CK 留在 LRU 里继续能装.
+ * 扫的是索引(path+bytes), 读每个文件最后 64B; 无 magic(老文件/无 conv) 不删. */
+int v41_ckpt_disk_erase_conversation(const char *conv) {
+    if (!g_on || !conv || !conv[0]) return -1;
+    int n = 0;
+    for (int i = g_len - 1; i >= 0; i--) {
+        char *path = g_entry[i].path;
+        FILE *fp = path ? fopen(path, "rb") : NULL;
+        bool hit = false;
+        if (fp && g_entry[i].bytes >= V41CKPT_CONV &&
+            fseeko(fp, (off_t)(g_entry[i].bytes - V41CKPT_CONV), SEEK_SET) == 0) {
+            uint8_t cv[V41CKPT_CONV];
+            if (fread(cv, 1, V41CKPT_CONV, fp) == V41CKPT_CONV)
+                hit = conv_match(cv, conv);   /* 整 64B: 短名"abc"不再误配"abcdef" */
+        }
+        if (fp) fclose(fp);
+        if (hit) { entry_remove(i, true); n++; }
+    }
+    return n;
 }
 
 bool v41_ckpt_disk_store(const ckpt *k, uint32_t slot, char *err, size_t errn) {
