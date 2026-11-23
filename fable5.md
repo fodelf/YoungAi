@@ -15812,3 +15812,13 @@ Same是与固定教师首选词一致的位置数，不当成任务成功率；�
 **下一步指引：** 不再在`clean16.jsonl`（历史已反复训过的旧锚）上细调$\beta$。先离线盘点Spark现有8.8 GB `.ptf`库中**对47/96真正新鲜、且与主判/留出严格零重叠的高质量纯FP语料**，并结合更宽解码器层段（如L21–L39，仍冻结编码器L0–L20保全局KV零漂移）及`A`因子低有效秩塌缩诊断，再设计第106轮。
 
 **收尾与核账：** 源码提交`ca2d9f47`+`41b1bb86`（默认`PT_JSD_BETA=0.f`零行为变化），本地`make linecount`与`git diff --check`通过；Spark独立隔离构建`verify-vl105-dec10-jsd01/ds4`（复用104轮`ds4_cuda.o`），生产根目录源码/二进制/CUDA对象零改动。`initial.sha256`与`experiment.sha256`全项校验通过，基础GGUF stat零变化；内存全程最低可用6236 MiB；96服务已于21:54:50恢复（PID 1869514，`idle`、`queued=0`，`stray_ds4_pids=0`），`PHASE_COMPLETE` `2026-11-23T21:56:32+08:00`（`rc=0`、`service=PASS`、`elapsed_seconds=2552`、`deadline_compliant=true`，含attempt1重编与全套封账均在`22:14:00`完整截止前完成）。证据目录Spark `gguf/go-onebit/evo/vloop/verify-vl105-dec10-jsd01/`，起点`21:14:00`、计算截止`22:04:00`、完整截止`22:14:00`。
+
+### 11-23：106轮L39单层+459K零重叠纯FP训练跑完全部63步后在轮末评估阶段撞1800秒相限（rc=124，未落ckpt），不重置时钟，恢复96并封账
+
+**结论：106轮因`phase=train`的1800秒相限在63/63步完成后的轮末评估阶段超时退出（`rc=124`），未落`ckpt_e01`，未进入独立留出与主判，不接力、不重置本组时钟。最好及线上唯一父本仍是第96轮（`pt-vl096/candidate`，13206/15360，主判KL 0.207409441536，完整留出KL 0.0993900931066，距90%差618位）。** 96服务已于23:10:06恢复（PID 1937261，`idle`、`queued=0`）。（注：此前100–105轮未提分实验源码已于`436ceec0`全量回退，主分支相对99轮`5eae4a45`零实验源码残留；本轮严格遵守“未提分不提源码”，主分支零代码改动。）
+
+**开跑依据与实测过程：** 离线审计Spark全部50个`r*/fp/`纯FP 1017锚，剔除通用文本（`r057/r058`）与`pt_vl075`含judge重叠的`doc 0`，合并构造`fp459k.jsonl`+`fp459k.ptf`（52篇唯一文档、459,038纯FP token、95 MB，与`judge.ids`/`think_hold`/`eval.jsonl` 64-token窗口重叠均为0、零重复，审计见`data-audit.json`）。目标验证“仅训末层L39（下游零MoE路由翻路，消除89轮证实的L<39离散跳变）+ 459K零重叠纯FP 1-epoch（91–96轮的56×数据量，防止102轮小数据过拟合）+ 余弦退火`5e-6→2.5e-7` + 105轮验证零温度漂移的`JSD(β=0.10)`”。实测：GPU校验与52篇教师表100%匹配通过，**全部63/63步顺利完成（耗时1252秒=20.8分钟，梯度范数0.009–0.032全程零裁剪，最低可用内存6185 MiB）**，但因训练器内`eval_n=64`在第0步与第63步各耗时约5–6分钟，合计约31.8分钟超出`run.sh`中`phase=train`的1800秒上限约1–2分钟，在落盘`ckpt_e01`前被SIGTERM中止。
+
+**下一步指引（第107轮）：** 直接复用已通过零重叠审计的`fp459k.jsonl`+`fp459k.ptf`与隔离二进制，只把`train.cfg`内冗余的训练中`eval_n`从64降为1（独立1024完整留出仍由`eval_base`/`eval_candidate`全量把门，不放宽任何验收门），并将`run.sh`中`train`相限放宽至2100秒，可将训练段从31.8分钟压至约22分钟、整轮约36分钟内完整跑完含主判与复判。
+
+**收尾与核账：** 主分支零源码提交（隔离构建于Spark `verify-vl106-l39-fp459k-jsd01/ds4`）；`initial.sha256`、`experiment.sha256`、`base.before.stat == base.final.stat`核验通过；`pt-vl106/ckpt_e01`不存在；96服务已恢复（PID 1937261，`idle`、`queued=0`，`stray_ds4_pids=0`）；`PHASE_COMPLETE` `2026-11-23T23:11:35+08:00`（`rc=124`、`service=PASS`、`elapsed_seconds=2015`、`deadline_compliant=true`，封账于`23:14`完成，早于`23:38:00`完整截止24分钟）。证据目录Spark `gguf/go-onebit/evo/vloop/verify-vl106-l39-fp459k-jsd01/`，起点`22:38:00`、计算截止`23:28:00`、完整截止`23:38:00`。
