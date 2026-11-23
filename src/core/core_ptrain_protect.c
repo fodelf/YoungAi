@@ -320,11 +320,11 @@ static bool kp_tail_train(ds4_engine *e,const pt_cfg *c,pt_run *r,pt_sample *sam
         const int32_t t[]={1,2,3},old[]={1,0,3},swap[]={0,2,3},gain[]={1,2,3};
         ok=ok && kp_breaks(old,swap,t,3)==1 && kp_breaks(old,gain,t,3)==0;
         fprintf(stderr,"[retain] known_answer=%s\n",ok?"PASS":"FAIL");
-        for(unsigned k=0;ok && k<2;k++)last[k]=v41_alloc(bytes,&ok);
     }
+    if(PT_TAIL_RETAIN || PT_TAIL_DIRECTION)for(unsigned k=0;ok && k<2;k++)last[k]=v41_alloc(bytes,&ok);
     for(unsigned step=1;ok && step<=c->max_steps;step++) {
         double pre=0,post=0,gn=0;int clipped=0;
-        if(PT_TAIL_RETAIN)for(unsigned k=0;ok && k<2;k++)
+        if(PT_TAIL_RETAIN || PT_TAIL_DIRECTION)for(unsigned k=0;ok && k<2;k++)
             ok=ds4_gpu_tensor_copy(last[k],0,k?r->st.ampB[c->layer_hi]:r->st.ampA[c->layer_hi],0,bytes);
         if(!ok)break;
         ok=kp_objective(e,c,r,samples,mask,true,1,&pre);
