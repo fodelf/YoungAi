@@ -4,7 +4,16 @@
 #include "ds4_gpu_keepmargin.h"
 #include <sys/stat.h>
 #ifndef DS4_NO_GPU
-enum { KEEP_DOCS=8, KEEP_N=1022, KEEP_TOTAL=8176 };
+#ifndef PT_TAIL_DOCS
+#define PT_TAIL_DOCS 8
+#endif
+enum { KEEP_DOCS=PT_TAIL_DOCS, KEEP_N=1022, KEEP_TOTAL=KEEP_DOCS*KEEP_N };
+#ifndef PT_KEEP_FOCAL_LAM
+#define PT_KEEP_FOCAL_LAM 0.f
+#endif
+#ifndef PT_KEEP_FOCAL_GAP
+#define PT_KEEP_FOCAL_GAP 0.f
+#endif
 /* 独立实验构建声明父本计数，防止接力新父本时沿用旧轮次的准入值。 */
 #ifndef PT_TAIL_EXPECT_SAME
 #define PT_TAIL_EXPECT_SAME 7343
@@ -39,31 +48,34 @@ static void kp_free(ds4_gpu_tensor **p) { if(*p) ds4_gpu_tensor_free(*p); *p=NUL
 
 #ifndef __APPLE__
 static bool kp_fixture(void) {
-    const float z[]={.1f,0,-1,-1,.1f,0,-1,-1,.1f,0,-1,-1,.5f,0,-1,-1};
-    const int32_t id[]={0,1,0,1,0,1,0,1};
-    const float tp[]={.4f,.35f,.4f,.35f,.6f,.3f,.4f,.35f}, rest[]={.25f,.25f,.1f,.25f};
-    const unsigned char keep[]={1,0,1,1};
-    const size_t sizes[]={sizeof z,sizeof id,sizeof tp,sizeof rest,sizeof keep,sizeof z,sizeof z,16,16};
-    ds4_gpu_tensor *p[9]={0}; bool ok=true; float a[16],b[16],la[4],lb[4];
+    const float z[]={.1f,0,-1,-1,.1f,0,-1,-1,.1f,0,-1,-1,.5f,0,-1,-1,.01f,0,-1,-1};
+    const int32_t id[]={0,1,0,1,0,1,0,1,0,1};
+    const float tp[]={.4f,.35f,.4f,.35f,.6f,.3f,.4f,.35f,.6f,.3f}, rest[]={.25f,.25f,.1f,.25f,.1f};
+    const unsigned char keep[]={1,0,1,1,1};
+    const size_t sizes[]={sizeof z,sizeof id,sizeof tp,sizeof rest,sizeof keep,sizeof z,sizeof z,20,20};
+    ds4_gpu_tensor *p[9]={0}; bool ok=true; float a[20],b[20],la[5],lb[5];
     for(unsigned i=0;i<9;i++) p[i]=v41_alloc(sizes[i],&ok);
     if(ok) ok=ds4_gpu_tensor_write(p[0],0,z,sizeof z) && ds4_gpu_tensor_write(p[1],0,id,sizeof id) &&
         ds4_gpu_tensor_write(p[2],0,tp,sizeof tp) && ds4_gpu_tensor_write(p[3],0,rest,sizeof rest) &&
         ds4_gpu_tensor_write(p[4],0,keep,sizeof keep) && ds4_gpu_bwd_kl_margin(.5f,.5f,.3f) &&
-        ds4_gpu_bwd_kl_topk_tensor(p[5],p[7],p[0],0,4,4,p[1],p[2],p[3],NULL,2,.25f) &&
-        ds4_gpu_bwd_kl_keepmargin_tensor(p[6],p[8],p[0],0,4,4,p[1],p[2],p[3],2,.25f,p[4],.5f,PT_TAIL_ALLKEEP?1.01f:.5f,.3f) &&
+        ds4_gpu_bwd_kl_topk_tensor(p[5],p[7],p[0],0,5,4,p[1],p[2],p[3],NULL,2,.2f) &&
+        ds4_gpu_bwd_kl_keepmargin_tensor(p[6],p[8],p[0],0,5,4,p[1],p[2],p[3],2,.2f,p[4],.5f,PT_TAIL_ALLKEEP?1.01f:.5f,.3f) &&
         ds4_gpu_tensor_read(p[5],0,a,sizeof a) && ds4_gpu_tensor_read(p[6],0,b,sizeof b) &&
         ds4_gpu_tensor_read(p[7],0,la,sizeof la) && ds4_gpu_tensor_read(p[8],0,lb,sizeof lb);
+    const double fl=PT_TAIL_ALLKEEP && PT_KEEP_FOCAL_LAM>0 && PT_KEEP_FOCAL_GAP>.01?(double)PT_KEEP_FOCAL_LAM:0;
+    const double fg=fmin((double)PT_KEEP_FOCAL_GAP,.3);
+    const double g4=PT_TAIL_ALLKEEP?(.5+fl)*.2:0;
     double worst=0;
-    for(unsigned i=0;ok && i<16;i++) {
-        const double expected=(i==0 || (PT_TAIL_ALLKEEP && i==8))?-.125:(i==1 || (PT_TAIL_ALLKEEP && i==9))?.125:0;
+    for(unsigned i=0;ok && i<20;i++) {
+        const double expected=(i==0 || (PT_TAIL_ALLKEEP && i==8))?-.1:(i==1 || (PT_TAIL_ALLKEEP && i==9))?.1:i==16?-g4:i==17?g4:0;
         worst=fmax(worst,fabs((double)b[i]-a[i]-expected));
     }
-    for(unsigned i=0;ok && i<4;i++) {
-        const double expected=i==0?.5*(log(.4/.35)-.1):(PT_TAIL_ALLKEEP && i==2)?.1:0;
+    for(unsigned i=0;ok && i<5;i++) {
+        const double expected=i==0?.5*(log(.4/.35)-.1):(PT_TAIL_ALLKEEP && i==2)?.1:(PT_TAIL_ALLKEEP && i==4)?.5*.29+fl*(fg-.01):0;
         worst=fmax(worst,fabs((double)lb[i]-la[i]-expected));
     }
     ok=ok && isfinite(worst) && worst<1e-6;
-    fprintf(stderr,"[keep] known_answer max_error=%.12g %s\n",worst,ok?"PASS":"FAIL");
+    fprintf(stderr,"[keep] known_answer max_error=%.12g focal_lam=%.6g focal_gap=%.6g %s\n",worst,(double)PT_KEEP_FOCAL_LAM,(double)PT_KEEP_FOCAL_GAP,ok?"PASS":"FAIL");
     for(unsigned i=0;i<9;i++) kp_free(&p[i]);
     return ok;
 }
