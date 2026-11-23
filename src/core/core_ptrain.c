@@ -9,6 +9,7 @@
  * 轮数照配置训满(10-02 用户: "支持设置训练轮数, 然后选出最优就行了"), 挑哪一轮归脚本 kdpick 段(过 wt2 门的轮里留出损失最低者);
  * 每轮末另打一行"留出损失较上轮逐题配对降多少 ± 标准误"(见 pt_paired_gain), 只打不判 —— 末轮还在显著降 = 下次轮数可以给多些。 */
 #include "core_ptrain.h"
+#include "core_ptrain_split.h"
 #include <sys/stat.h>
 #ifndef DS4_NO_GPU
 
@@ -238,23 +239,24 @@ static bool pt_hccheck(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_data 
 /* 一个优化步: 全局范数裁剪(标准配方, 防单批炸步) + Adam(核里顺手把梯度清零) */
 bool pt_opt_step(const pt_cfg *c, pt_run *r, uint32_t step, double *gnorm, int *clipped) {
     double ss = 0;
+    const uint32_t lo = pt_train_lo(c);
     if (r->k2) {   /* ③ 叠在 ② 上(11-01): 前 k2 行是 ② 的低秩件, 冻结 —— 梯度清零(裁剪的范数也不算它); Adam 的 m/v 从零起、梯度恒零 ⇒ 这些行一步都不动 */
         static float *zero = NULL; static uint64_t zn = 0;
         const uint64_t n2 = (uint64_t)r->k2 * DS4_N_EMBD;
         if (zn < n2) { free(zero); zero = xmalloc_zeroed((size_t)n2, 4); zn = n2; }
-        for (uint32_t il = c->layer_lo; il <= c->layer_hi; il++)
+        for (uint32_t il = lo; il <= c->layer_hi; il++)
             if (!ds4_gpu_tensor_write(r->gA[il], 0, zero, n2 * 4) || !ds4_gpu_tensor_write(r->gB[il], 0, zero, n2 * 4)) return false;
     }
-    for (uint32_t il = c->layer_lo; il <= c->layer_hi; il++) {
+    for (uint32_t il = lo; il <= c->layer_hi; il++) {
         double a = 0, bb = 0;
         if (!ds4_gpu_bwd_sumsq_tensor(r->gA[il], (uint64_t)r->K * DS4_N_EMBD, &a) || !ds4_gpu_bwd_sumsq_tensor(r->gB[il], (uint64_t)r->K * DS4_N_EMBD, &bb)) return false;
         ss += a + bb;
     }
     const double gn = sqrt(ss);
-    const float gs = (c->clip > 0.f && gn > c->clip) ? (float)(c->clip / gn) : 1.0f;
-    for (uint32_t il = c->layer_lo; il <= c->layer_hi; il++)
-        if (!ds4_gpu_bwd_adam_tensor(r->st.ampA[il], r->gA[il], r->mA[il], r->vA[il], (uint64_t)r->K * DS4_N_EMBD, c->lr, 0.9f, 0.999f, 1e-8f, gs, step) ||
-            !ds4_gpu_bwd_adam_tensor(r->st.ampB[il], r->gB[il], r->mB[il], r->vB[il], (uint64_t)r->K * DS4_N_EMBD, c->lr_b > 0.f ? c->lr_b : c->lr, 0.9f, 0.999f, 1e-8f, gs, step)) return false;
+    const float gs = (c->clip > 0.f && gn > c->clip) ? (float)(c->clip / gn) : 1.0f, ls = pt_cosine_scale(step);
+    for (uint32_t il = lo; il <= c->layer_hi; il++)
+        if (!ds4_gpu_bwd_adam_tensor(r->st.ampA[il], r->gA[il], r->mA[il], r->vA[il], (uint64_t)r->K * DS4_N_EMBD, c->lr * ls, 0.9f, 0.999f, 1e-8f, gs, step) ||
+            !ds4_gpu_bwd_adam_tensor(r->st.ampB[il], r->gB[il], r->mB[il], r->vB[il], (uint64_t)r->K * DS4_N_EMBD, (c->lr_b > 0.f ? c->lr_b : c->lr) * ls, 0.9f, 0.999f, 1e-8f, gs, step)) return false;
     *gnorm = gn; *clipped = gs < 1.f;
     return true;
 }
@@ -379,6 +381,7 @@ int ds4_engine_ptrain(ds4_engine *e, const char *spec) {
     if (c.epoch_tok) fprintf(stderr, "; 每轮 token 预算 %u ⇒ 约 %.1f 轮过一遍, 轮末\"留出 KL 较上轮降\"比的是相邻切片\n", c.epoch_tok, (double)rows_all / (double)c.epoch_tok);
     uint32_t cur = ntr;   /* 打乱序的游标: 到头就重新打乱 */
     uint64_t qall = 0;    /* 开训以来过了多少题(算覆盖了几遍) */
+    if (!pt_cosine_init(c.epochs ? ((ntr + c.batch - 1u) / c.batch) * c.epochs : 0u)) goto out;
     t0 = now_sec();
     bool budget_hit = false;   /* budget_s 到了: 本轮按最后一批收, 轮末照常评估/落盘, 之后不开下一轮 */
     for (uint32_t ep = 1; ep <= c.epochs; ep++) {

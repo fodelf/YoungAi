@@ -14,5 +14,8 @@ bool pt_kp_frozen(const pt_cfg *, pt_run *, ds4_gpu_tensor *[DS4_MAX_LAYER][2]);
 bool pt_kp_objective(ds4_engine *, const pt_cfg *, pt_run *, pt_sample *, ds4_gpu_tensor **, bool, int, double *);
 bool pt_kp_direction_fixture(void);
 bool pt_trace_run(ds4_engine *, const pt_cfg *, pt_run *, pt_sample *, ds4_gpu_tensor **, ds4_gpu_tensor *[DS4_MAX_LAYER][2], double);
+uint32_t pt_train_lo(const pt_cfg *);
+bool pt_cosine_init(uint32_t);
+float pt_cosine_scale(uint32_t);
 #endif
 #endif
