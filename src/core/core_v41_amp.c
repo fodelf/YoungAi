@@ -11,6 +11,7 @@
  * fp4 文件不会报错(长度校验之外), 只会把码字当浮点位型解出一堆垃圾, 挂上去照跑, 出的是"一眼合理"的假账。
  * 解出来一律是 f32 上设备: 省的是磁盘与解码带宽, GEMM 仍走 f32(K≤512 的两发小 GEMM 不是瓶颈)。 */
 #include "core_internal.h"
+#include "core_v41_trace.h"
 #include "../common/ds4_quantfmt.h"
 #include "../common/ds4_float.h"
 #include "../common/ds4_gr_fnv.h"   /* 指纹算法: 引擎核对与解算器落盘共用一份 */

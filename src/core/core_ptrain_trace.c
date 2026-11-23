@@ -1,6 +1,7 @@
 /* core_ptrain_trace.c — 末层只读张量对照诊断(100轮): 定位单步缩步非单调跳变的精确阶段。
  * 只读合法训练位(切片B doc3, pos575, 教师769 vs 竞争6946), 不保存候选, 结束后完整恢复父本。 */
 #include "core_ptrain_split.h"
+#include "core_v41_trace.h"
 #ifndef DS4_NO_GPU
 
 v41_trace_tap *g_v41_trace_tap = NULL;

@@ -7,6 +7,7 @@
  * 末层后 hc_pre(pre_mix) → norm → head。bf16 舍入点跟官方 dtype 流走(见 ds4_gpu_v41.h 头注释)。
  * 出口(--score-ids/生成)在 core_v41_api.c。 */
 #include "core_internal.h"
+#include "core_v41_trace.h"
 #include "src/common/ds4_quantfmt.h"   /* DS4_GGT_*: 路由 gate 在盘上是 f32 还是 bf16, 按登记类型认 */
 #ifndef DS4_NO_GPU
 
