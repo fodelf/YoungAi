@@ -47,6 +47,14 @@ int ds4_gpu_bwd_kl_topk_tensor(ds4_gpu_tensor *glogits, ds4_gpu_tensor *loss, co
  * tau = 0 关(全 1, 老路逐位同)。为什么: 判决份 15360 位里 KLD>2 的 177 位四趟 V 步一位没动——均值目标下尾位梯度占 1% 被淹掉, 而长生成的决策全在尾位。
  * 只在 V 步的选码/审计趟开(core_ptrain_vstep.c vs_pass), 留出评估一律关 —— 报出来的留出仍是老口径。 */
 int ds4_gpu_bwd_kl_tail(float tau, float cap);
+/* 边际项(2026-11-05 ③ 链): lam > 0 时上面的核在"教师 top-1 概率 ≥ p1"的行上加 λ·max(0, δ − (z_t1 − max_{j≠t1} z_j)), δ = min(gap, 教师 log(p1/p2));
+ * 损失加进 loss[i](× w_i), 梯度只落 t1(−λ·scale·w_i) 与学生的最强对手 j*(+λ·scale·w_i)。lam = 0 关(老路逐位同)。
+ * 为什么: 45 轮 top-20 KL 蒸馏把 Σmin 从 0.838 推到 0.850, Same top 却停在 85.9 —— KL 动的是分布主体, 不同位里教师自信(p1 ≥ 0.5)的 552 位(3.6 pp)
+ * 两条链一位没动; 这一项直接对 argmax 施力, 只在教师自己拿得准的位上。只在反传趟开(core_ptrain_pack.c pt_run_list grad=1), 评估趟关 ⇒ 留出仍是老口径。 */
+int ds4_gpu_bwd_kl_margin(float lam, float p1, float gap);
+/* 广义 JSD(104 轮): beta ∈ (0,1) 时用 (1/(beta*(1-beta)))·JSD_beta(P, Q) 替代前向 KL，
+ * 局部二阶曲率与前向 KL 1:1 对齐，同时封顶低概率尾部梯度、重罚学生伪峰以保 Σmin 与 Same；beta=0 关(老路逐位同)。只在反传趟开。 */
+int ds4_gpu_bwd_kl_jsd(float beta);
 
 /* 教师 top-K: logits 第 row0..row0+m-1 行 → 概率最大的 K 个 (id, p) 与余量 1 − Σp(softmax 全词表)。
  * ★会改写 logits 这几行★(选中的位置置 −inf, 选 K 轮)—— 调用方读完才许调。tid[m][K] / tp[m][K] / trest[m]。 */
