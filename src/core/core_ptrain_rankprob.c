@@ -17,7 +17,7 @@ static bool pt_jsd_checked;
 #ifndef __APPLE__
 static bool jsd_fixture(float beta) {
     const uint32_t M = 3, V = 16, K = 3;
-    const float sc = 0.37f, eps = 1e-3f;
+    const float sc = 0.37f, eps = 3e-3f;
     float z[48] = {
         3.0f, 0.5f, -0.5f, -1.0f, -1.2f, -1.4f, -1.5f, -1.6f, -1.7f, -1.8f, -1.9f, -2.0f, -2.1f, -2.2f, -2.3f, -2.4f,
         4.0f, -3.5f, 0.1f, -0.8f, -1.0f, -1.2f, -1.4f, -1.6f, -1.8f, -2.0f, -2.2f, -2.4f, -2.6f, -2.8f, -3.0f, -3.2f,
@@ -37,11 +37,32 @@ static bool jsd_fixture(float beta) {
          ds4_gpu_tensor_read(p[4], 0, g, sizeof g) &&
          ds4_gpu_bwd_kl_topk_tensor(p[0], p[5], p[0], 0, M, V, p[1], p[2], p[3], NULL, K, sc) &&
          ds4_gpu_tensor_read(p[0], 0, gip, sizeof gip);
-    double max_fd = 0.0, max_sum = 0.0, max_ip = 0.0, max_fkl = 0.0;
+    double max_fd = 0.0, max_sum = 0.0, max_ip = 0.0, max_fkl = 0.0, max_ref = 0.0;
     for (unsigned i = 0; ok && i < M * V; i++) max_ip = fmax(max_ip, fabs((double)g[i] - gip[i]));
     for (unsigned r = 0; ok && r < M; r++) {
-        double s = 0.0; for (unsigned j = 0; j < V; j++) s += g[r * V + j];
+        double s = 0.0, mx = -1e30, qs = 0.0, rs = 0.0, ubar = 0.0;
+        for (unsigned j = 0; j < V; j++) { s += g[r * V + j]; if (z[r * V + j] > mx) mx = z[r * V + j]; }
         max_sum = fmax(max_sum, fabs(s));
+        double q[16];
+        for (unsigned j = 0; j < V; j++) qs += (q[j] = exp(z[r * V + j] - mx));
+        for (unsigned j = 0; j < V; j++) q[j] /= qs;
+        for (unsigned j = K; j < V; j++) rs += q[j];
+        const double b = (double)beta, om = 1.0 - b, mr = b * rest[r] + om * rs;
+        const double ur = rs > 1e-30 ? log(rs / mr) : 0.0;
+        for (unsigned k = 0; k < K; k++) {
+            const double qk = q[id[r * K + k]], mk = b * tp[r * K + k] + om * qk;
+            if (qk > 1e-30) ubar += qk * log(qk / mk);
+        }
+        ubar += rs * ur;
+        for (unsigned j = 0; j < V; j++) {
+            double uj = ur;
+            for (unsigned k = 0; k < K; k++) if ((unsigned)id[r * K + k] == j) {
+                const double mk = b * tp[r * K + k] + om * q[j];
+                uj = q[j] > 1e-30 ? log(q[j] / mk) : 0.0;
+            }
+            const double refg = (double)sc * q[j] * (uj - ubar) / b;
+            max_ref = fmax(max_ref, fabs((double)g[r * V + j] - refg));
+        }
     }
     for (unsigned j = 0; ok && j < V; j++) {
         float zp[48], zm[48]; memcpy(zp, z, sizeof z); memcpy(zm, z, sizeof z);
@@ -70,9 +91,9 @@ static bool jsd_fixture(float beta) {
         }
     }
     for (unsigned i = 0; i < 6; i++) if (p[i]) ds4_gpu_tensor_free(p[i]);
-    ok = ok && isfinite(max_fd) && max_fd < 2e-4 && max_sum < 1e-6 && max_ip == 0.0 && max_fkl < 1e-6;
-    fprintf(stderr, "[jsd] known_answer beta=%.6g max_fd_err=%.6g max_sum=%.6g inplace_err=%.6g fkl0_err=%.6g %s\n",
-            (double)beta, max_fd, max_sum, max_ip, max_fkl, ok ? "PASS" : "FAIL");
+    ok = ok && isfinite(max_fd) && max_ref < 2e-6 && max_fd < 2e-4 && max_sum < 1e-6 && max_ip == 0.0 && max_fkl < 1e-6;
+    fprintf(stderr, "[jsd] known_answer beta=%.6g max_ref_err=%.6g max_fd_err=%.6g max_sum=%.6g inplace_err=%.6g fkl0_err=%.6g %s\n",
+            (double)beta, max_ref, max_fd, max_sum, max_ip, max_fkl, ok ? "PASS" : "FAIL");
     return ok;
 }
 #endif
