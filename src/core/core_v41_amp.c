@@ -11,7 +11,6 @@
  * fp4 文件不会报错(长度校验之外), 只会把码字当浮点位型解出一堆垃圾, 挂上去照跑, 出的是"一眼合理"的假账。
  * 解出来一律是 f32 上设备: 省的是磁盘与解码带宽, GEMM 仍走 f32(K≤512 的两发小 GEMM 不是瓶颈)。 */
 #include "core_internal.h"
-#include "core_v41_trace.h"
 #include "../common/ds4_quantfmt.h"
 #include "../common/ds4_float.h"
 #include "../common/ds4_gr_fnv.h"   /* 指纹算法: 引擎核对与解算器落盘共用一份 */
@@ -441,27 +440,15 @@ void v41_amp_free(ds4_v41_state *st) {
 /* y[n][D](bf16 格点) += x[n][D]·(B·A) → 舍 bf16 */
 bool v41_amp_apply(ds4_v41_state *st, uint32_t il) {
     if (!st->ampA[il]) return true;
-    v41_trace_tap *tap = (!st->draft && g_v41_trace_tap && g_v41_trace_tap->layer == il) ? g_v41_trace_tap : NULL;
-    if (tap && tap->y_moe) v41_trace_capture_row(st->y, tap->row, DS4_N_EMBD, tap->y_moe, &tap->ok);
     if (st->ampS[il] && !st->draft) {   /* 带路由: 本层路由 st->sel/rw 此刻还是 v41_moe 刚算的 */
         if (!ds4_gpu_v41_amp_route_apply_tensor(st->y, st->xn, st->ampA[il], st->ampB[il], st->ampS[il], st->sel, st->rw, st->ampT, st->n,
                                                 DS4_N_EMBD, st->ampK[il], DS4_N_EXPERT_USED, DS4_N_EXPERT)) return false;
-        if (tap && tap->y_pre) v41_trace_capture_row(st->y, tap->row, DS4_N_EMBD, tap->y_pre, &tap->ok);
-        if (!tap || !tap->skip_amp_bf16) {
-            if (!ds4_gpu_v41_round_bf16_tensor(st->y, (uint64_t)st->n * DS4_N_EMBD)) return false;
-        }
-        if (tap && tap->y_post) v41_trace_capture_row(st->y, tap->row, DS4_N_EMBD, tap->y_post, &tap->ok);
-        return true;
+        return ds4_gpu_v41_round_bf16_tensor(st->y, (uint64_t)st->n * DS4_N_EMBD) != 0;
     }
     /* 草稿态(塔件)走小批两发小核(cuda_draft_attn.inc.cu): cuBLAS 小 n 一发 ~0.2 ms, 草稿一轮 8 发把接受率的收益吃光(10-07 dkspeed 分账); 主干照旧 */
     if (st->draft ? !ds4_gpu_draft_amp_apply_tensor(st->y, st->xn, st->ampA[il], st->ampB[il], st->ampT, st->n, DS4_N_EMBD, st->ampK[il])
                   : !ds4_gpu_v41_amp_apply_tensor(st->y, st->xn, st->ampA[il], st->ampB[il], st->ampT, st->n, DS4_N_EMBD, st->ampK[il])) return false;
-    if (tap && tap->y_pre) v41_trace_capture_row(st->y, tap->row, DS4_N_EMBD, tap->y_pre, &tap->ok);
-    if (!tap || !tap->skip_amp_bf16) {
-        if (!ds4_gpu_v41_round_bf16_tensor(st->y, (uint64_t)st->n * DS4_N_EMBD)) return false;
-    }
-    if (tap && tap->y_post) v41_trace_capture_row(st->y, tap->row, DS4_N_EMBD, tap->y_post, &tap->ok);
-    return true;
+    return ds4_gpu_v41_round_bf16_tensor(st->y, (uint64_t)st->n * DS4_N_EMBD) != 0;
 }
 #endif /* !DS4_NO_GPU */
 typedef int ds4_core_v41_amp_nonempty_tu;

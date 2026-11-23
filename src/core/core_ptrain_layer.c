@@ -12,7 +12,6 @@
  *     轮到源层时(它自己也读自己的压缩行, 先加进去)经 RoPE 反向 → 压缩器 RMSNorm 反向 → 池化反向(ratio>1) → 两块投影的转置乘, 加进本层 g_xn。
  *   - engram 层: 存档是门之前的 hc, 重算时用存档的 key|value 先过门; 本层倒推完再过门的反向, 得到对门之前 hc 的梯度往下传。 */
 #include "core_ptrain.h"
-#include "core_ptrain_split.h"
 #include "../common/ds4_sha256.h"
 #ifndef DS4_NO_GPU
 
@@ -322,7 +321,7 @@ static bool pt_layer_bwd(ds4_engine *e, const pt_cfg *c, pt_run *r, uint32_t il,
     pt_dbg(c, r, il, "注意力: g_o", b->g_o, (uint64_t)NH * HD); pt_dbg(c, r, il, "注意力: g_hcin hc_post 后", b->g_hcin, (uint64_t)HC * E);
     if (ok) {   /* 稀疏注意力反向按题(各题的窗口/压缩行/选组各自的; 压缩行梯度累加进 gcomp 里本题那几组) */
         const int16_t src = ratio ? g_ds4_v41.kv_source_of[il] : -1;
-        const bool wantc = src >= 0 && (uint32_t)src >= pt_train_lo(c) && b->gcomp[src];   /* 源层在训练段里才要对压缩行求导 */
+        const bool wantc = src >= 0 && (uint32_t)src >= c->layer_lo && b->gcomp[src];   /* 源层在训练段里才要对压缩行求导 */
         pt_seg sg[PT_PACK_MAX];
         const uint32_t nsg = pt_segs(r, il, n, sg);
         for (uint32_t i = 0; ok && i < nsg; i++) {
@@ -401,11 +400,10 @@ static void pt_poison_layer(pt_run *r, uint32_t il, uint32_t n) {
 }
 
 bool pt_layers_bwd(ds4_engine *e, const pt_cfg *c, pt_run *r, uint32_t n) {
-    const uint32_t lo = pt_train_lo(c);
-    for (uint32_t il = lo; il <= c->layer_hi; il++)   /* 压缩行梯度按题累加: 每题从 0 起 */
+    for (uint32_t il = c->layer_lo; il <= c->layer_hi; il++)   /* 压缩行梯度按题累加: 每题从 0 起 */
         if (r->lb.gcomp[il] && !ds4_gpu_tensor_fill_f32(r->lb.gcomp[il], 0.f, ds4_gpu_tensor_bytes(r->lb.gcomp[il]) / 4u)) return false;   /* 整块(按 ctxlen 的组数分) */
     int said = 0;
-    for (uint32_t il = c->layer_hi + 1u; il-- > lo; ) {
+    for (uint32_t il = c->layer_hi + 1u; il-- > c->layer_lo; ) {
         if (c->poison) pt_poison_layer(r, il, n);
         /* 层内 bf16 权重缓存: 本层重算解出的 q4_K 稠密矩阵留给本层反传的转置乘(省掉第二遍解码); 只在这一层的"重算 + 反传"里开 */
         (void)ds4_gpu_bwd_wcache(1);

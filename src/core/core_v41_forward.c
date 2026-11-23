@@ -7,7 +7,6 @@
  * 末层后 hc_pre(pre_mix) → norm → head。bf16 舍入点跟官方 dtype 流走(见 ds4_gpu_v41.h 头注释)。
  * 出口(--score-ids/生成)在 core_v41_api.c。 */
 #include "core_internal.h"
-#include "core_v41_trace.h"
 #include "src/common/ds4_quantfmt.h"   /* DS4_GGT_*: 路由 gate 在盘上是 f32 还是 bf16, 按登记类型认 */
 #ifndef DS4_NO_GPU
 
@@ -231,8 +230,6 @@ bool v41_layer(ds4_engine *e, ds4_v41_state *st, uint32_t il) {
     if (st->dump_prefix) { v41_dump_rows(st, st->xn, "x", il, E); v41_dump_rows(st, st->y, "y", il, E); }   /* 对拍夹具: MoE 入/出 */
     if (!ds4_gpu_v41_hc_post_tensor(st->hc2, st->y, st->hc, st->post, st->comb, E, DS4_N_HC, n)) return false;
     { ds4_gpu_tensor *t = st->hc; st->hc = st->hc2; st->hc2 = t; }   /* pre_mix ← ffn_pre 的交换已在 v41_hc_half 里做过 */
-    if (!st->draft && g_v41_trace_tap && g_v41_trace_tap->layer == il && g_v41_trace_tap->hc_post)
-        v41_trace_capture_row(st->hc, g_v41_trace_tap->row, DS4_N_HC * E, g_v41_trace_tap->hc_post, &g_v41_trace_tap->ok);
     return true;
 }
 
@@ -367,11 +364,7 @@ bool v41_forward_body(ds4_engine *e, ds4_v41_state *st) {
     if (st->stop_early) return true;   /* 位置照常推进(调用方做), 不出 logits */
     /* 出口: h = hc_pre(hc, pre_mix) → norm → head(f32 logits) */
     if (!ds4_gpu_v41_hc_pre_tensor(st->x, st->hc, st->pre_mix, E, DS4_N_HC, n)) return false;
-    if (!st->draft && g_v41_trace_tap && g_v41_trace_tap->hc_pre)
-        v41_trace_capture_row(st->x, g_v41_trace_tap->row, E, g_v41_trace_tap->hc_pre, &g_v41_trace_tap->ok);
     if (!ds4_gpu_v41_rms_norm_tensor(st->xn, st->x, e->model.map, e->model.size, e->weights.output_norm->abs_offset, E, n, DS4_RMS_EPS)) return false;
-    if (!st->draft && g_v41_trace_tap && g_v41_trace_tap->xn_out)
-        v41_trace_capture_row(st->xn, g_v41_trace_tap->row, E, g_v41_trace_tap->xn_out, &g_v41_trace_tap->ok);
     if (st->head_last_only && n > DS4_V41_GEMV_MAX_TOK) {
         /* ★生成路的预填块只算末位, 走解码同款 GEMV★(2026-09-29, 见 core_v41.h head_last_only): 整块走 GEMM 路 = 出口头 1.3 GB bf16 暂存 +
          * 2048 行 × 129280 列的白算, 而生成只读末位。★与整块 GEMM 路不逐字节同★: GEMM 路先把 q4_K 头权重舍成 bf16 再乘, GEMV 用 q4_K 原值
