@@ -8,4 +8,11 @@ const ds4_gpu_tensor *pt_protect_mask(void);
 bool pt_split_mask(const pt_cfg *, pt_run *, ds4_gpu_tensor *, uint32_t, uint32_t);
 bool pt_diag_weights(const pt_cfg *, const pt_run *);
 bool pt_diag_gradient(const pt_cfg *, const pt_run *, FILE *);
+#ifndef DS4_NO_GPU
+bool pt_kp_restore(const pt_cfg *, pt_run *, ds4_gpu_tensor *[DS4_MAX_LAYER][2]);
+bool pt_kp_frozen(const pt_cfg *, pt_run *, ds4_gpu_tensor *[DS4_MAX_LAYER][2]);
+bool pt_kp_objective(ds4_engine *, const pt_cfg *, pt_run *, pt_sample *, ds4_gpu_tensor **, bool, int, double *);
+bool pt_kp_direction_fixture(void);
+bool pt_trace_run(ds4_engine *, const pt_cfg *, pt_run *, pt_sample *, ds4_gpu_tensor **, ds4_gpu_tensor *[DS4_MAX_LAYER][2], double);
+#endif
 #endif

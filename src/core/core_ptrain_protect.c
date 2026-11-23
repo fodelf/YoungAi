@@ -30,6 +30,9 @@ enum { KEEP_DOCS=8, KEEP_N=1022, KEEP_TOTAL=8176 };
 #ifndef PT_TAIL_BACKTRACK
 #define PT_TAIL_BACKTRACK 0
 #endif
+#ifndef PT_TAIL_TRACE
+#define PT_TAIL_TRACE 0
+#endif
 static ds4_gpu_tensor *protect_mask;
 const ds4_gpu_tensor *pt_protect_mask(void) { return protect_mask; }
 static void kp_free(ds4_gpu_tensor **p) { if(*p) ds4_gpu_tensor_free(*p); *p=NULL; }
@@ -66,7 +69,7 @@ static bool kp_fixture(void) {
 }
 #endif
 
-static bool kp_restore(const pt_cfg *c,pt_run *r,ds4_gpu_tensor *snap[DS4_MAX_LAYER][2]) {
+bool pt_kp_restore(const pt_cfg *c,pt_run *r,ds4_gpu_tensor *snap[DS4_MAX_LAYER][2]) {
     const uint64_t bytes=(uint64_t)r->K*DS4_N_EMBD*4;
     for(unsigned l=c->layer_lo;l<=c->layer_hi;l++) {
         if(!ds4_gpu_tensor_copy(r->st.ampA[l],0,snap[l][0],0,bytes) || !ds4_gpu_tensor_copy(r->st.ampB[l],0,snap[l][1],0,bytes)) return false;
@@ -75,7 +78,7 @@ static bool kp_restore(const pt_cfg *c,pt_run *r,ds4_gpu_tensor *snap[DS4_MAX_LA
     }
     r->cont_s=NULL; r->grad_tokens=0; pt_state_reset(&r->st); return pt_diag_weights(c,r);
 }
-static bool kp_frozen(const pt_cfg *c,pt_run *r,ds4_gpu_tensor *snap[DS4_MAX_LAYER][2]) {
+bool pt_kp_frozen(const pt_cfg *c,pt_run *r,ds4_gpu_tensor *snap[DS4_MAX_LAYER][2]) {
     const size_t capacity=(size_t)(c->diag==18?r->K:r->k2)*DS4_N_EMBD*4;
     if(!capacity) return true;
     void *a=xmalloc(capacity),*b=xmalloc(capacity); bool ok=true;
@@ -87,6 +90,8 @@ static bool kp_frozen(const pt_cfg *c,pt_run *r,ds4_gpu_tensor *snap[DS4_MAX_LAY
     }
     free(a);free(b);return ok;
 }
+#define kp_restore pt_kp_restore
+#define kp_frozen pt_kp_frozen
 static bool kp_score(ds4_engine *e,const pt_cfg *c,pt_run *r,const pt_sample *s,int32_t *ids,double *loss) {
     pt_state_reset(&r->st);r->cont_s=NULL;r->grad_tokens=0;r->st.ced_skip=0;r->st.head_last_only=0;
     if(!v41_forward(e,&r->st,s->sids,s->sn)) return false;
@@ -98,7 +103,7 @@ static bool kp_score(ds4_engine *e,const pt_cfg *c,pt_run *r,const pt_sample *s,
     if(ok) ok=pt_loss_rows(c,r,r->st.logits,0,s,0,loss,&nt,&g) && nt==KEEP_N;
     kp_free(&g);return ok;
 }
-static bool kp_objective(ds4_engine *e,const pt_cfg *c,pt_run *r,pt_sample *s,ds4_gpu_tensor **mask,bool enabled,int grad,double *mean) {
+bool pt_kp_objective(ds4_engine *e,const pt_cfg *c,pt_run *r,pt_sample *s,ds4_gpu_tensor **mask,bool enabled,int grad,double *mean) {
     double sum=0;uint32_t nt=0; bool ok=pt_loss_mode(c,true);
     pt_cfg step_cfg=*c;
     /* 只改变反传入口；分配、父本加载和落盘仍使用完整40层配置。 */
@@ -112,6 +117,7 @@ static bool kp_objective(ds4_engine *e,const pt_cfg *c,pt_run *r,pt_sample *s,ds
     protect_mask=NULL;*mean=sum/KEEP_TOTAL;
     return ok && nt==KEEP_TOTAL && isfinite(*mean);
 }
+#define kp_objective pt_kp_objective
 
 /* 正确总数不降也可能发生互换；这里必须逐位判断，不能只比较总数。 */
 static unsigned kp_breaks(const int32_t *old,const int32_t *now,const int32_t *teacher,unsigned n) {
@@ -166,7 +172,7 @@ static bool kp_update_stats(ds4_gpu_tensor **p,ds4_gpu_tensor **old,ds4_gpu_tens
     kp_free(&d[0]);kp_free(&d[1]);kp_free(&tmp);kp_free(&idx);
     return ok && isfinite(*largest) && isfinite(*alignment);
 }
-static bool kp_direction_fixture(void) {
+bool pt_kp_direction_fixture(void) {
     const float before[4]={0},after[4]={3,-4,0,0},grad[4]={-3,4,0,0};
     bool ok=true;ds4_gpu_tensor *p[2]={0},*old[2]={0},*g[2]={0};
     for(unsigned k=0;ok && k<2;k++) {
@@ -180,6 +186,7 @@ static bool kp_direction_fixture(void) {
     for(unsigned k=0;k<2;k++){kp_free(&p[k]);kp_free(&old[k]);kp_free(&g[k]);}
     return ok;
 }
+#define kp_direction_fixture pt_kp_direction_fixture
 static bool kp_direction_step(ds4_engine *e,const pt_cfg *c,pt_run *r,pt_sample *samples,ds4_gpu_tensor **mask,
                               ds4_gpu_tensor *snap[DS4_MAX_LAYER][2],ds4_gpu_tensor **last,
                               int32_t base[KEEP_DOCS][KEEP_N],FILE *audit,unsigned step,
@@ -417,7 +424,12 @@ bool pt_protectcheck(ds4_engine *e,const pt_cfg *c,pt_run *r,const pt_data *d) {
     const char *names[]={"control","candidate"};unsigned updates=0;
     if(tail) {
         fprintf(stderr,"[tail] expected_parent same=%u low_conf_correct=%u\n",(unsigned)PT_TAIL_EXPECT_SAME,(unsigned)PT_TAIL_EXPECT_LOW);
+#if PT_TAIL_TRACE
+        (void)&kp_tail_train;
+        ok=ok && total_keep==PT_TAIL_EXPECT_SAME && low_keep==PT_TAIL_EXPECT_LOW && pt_trace_run(e,c,r,samples,mask,snap,PT_TAIL_RADIUS);
+#else
         ok=ok && total_keep==PT_TAIL_EXPECT_SAME && low_keep==PT_TAIL_EXPECT_LOW && kp_tail_train(e,c,r,samples,mask,snap,base,f,&updates);
+#endif
         goto finish;
     }
     for(unsigned arm=0;ok && arm<2;arm++) {

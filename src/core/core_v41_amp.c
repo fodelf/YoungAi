@@ -440,15 +440,27 @@ void v41_amp_free(ds4_v41_state *st) {
 /* y[n][D](bf16 格点) += x[n][D]·(B·A) → 舍 bf16 */
 bool v41_amp_apply(ds4_v41_state *st, uint32_t il) {
     if (!st->ampA[il]) return true;
+    v41_trace_tap *tap = (!st->draft && g_v41_trace_tap && g_v41_trace_tap->layer == il) ? g_v41_trace_tap : NULL;
+    if (tap && tap->y_moe) v41_trace_capture_row(st->y, tap->row, DS4_N_EMBD, tap->y_moe, &tap->ok);
     if (st->ampS[il] && !st->draft) {   /* 带路由: 本层路由 st->sel/rw 此刻还是 v41_moe 刚算的 */
         if (!ds4_gpu_v41_amp_route_apply_tensor(st->y, st->xn, st->ampA[il], st->ampB[il], st->ampS[il], st->sel, st->rw, st->ampT, st->n,
                                                 DS4_N_EMBD, st->ampK[il], DS4_N_EXPERT_USED, DS4_N_EXPERT)) return false;
-        return ds4_gpu_v41_round_bf16_tensor(st->y, (uint64_t)st->n * DS4_N_EMBD) != 0;
+        if (tap && tap->y_pre) v41_trace_capture_row(st->y, tap->row, DS4_N_EMBD, tap->y_pre, &tap->ok);
+        if (!tap || !tap->skip_amp_bf16) {
+            if (!ds4_gpu_v41_round_bf16_tensor(st->y, (uint64_t)st->n * DS4_N_EMBD)) return false;
+        }
+        if (tap && tap->y_post) v41_trace_capture_row(st->y, tap->row, DS4_N_EMBD, tap->y_post, &tap->ok);
+        return true;
     }
     /* 草稿态(塔件)走小批两发小核(cuda_draft_attn.inc.cu): cuBLAS 小 n 一发 ~0.2 ms, 草稿一轮 8 发把接受率的收益吃光(10-07 dkspeed 分账); 主干照旧 */
     if (st->draft ? !ds4_gpu_draft_amp_apply_tensor(st->y, st->xn, st->ampA[il], st->ampB[il], st->ampT, st->n, DS4_N_EMBD, st->ampK[il])
                   : !ds4_gpu_v41_amp_apply_tensor(st->y, st->xn, st->ampA[il], st->ampB[il], st->ampT, st->n, DS4_N_EMBD, st->ampK[il])) return false;
-    return ds4_gpu_v41_round_bf16_tensor(st->y, (uint64_t)st->n * DS4_N_EMBD) != 0;
+    if (tap && tap->y_pre) v41_trace_capture_row(st->y, tap->row, DS4_N_EMBD, tap->y_pre, &tap->ok);
+    if (!tap || !tap->skip_amp_bf16) {
+        if (!ds4_gpu_v41_round_bf16_tensor(st->y, (uint64_t)st->n * DS4_N_EMBD)) return false;
+    }
+    if (tap && tap->y_post) v41_trace_capture_row(st->y, tap->row, DS4_N_EMBD, tap->y_post, &tap->ok);
+    return true;
 }
 #endif /* !DS4_NO_GPU */
 typedef int ds4_core_v41_amp_nonempty_tu;

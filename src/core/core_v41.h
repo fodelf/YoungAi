@@ -449,6 +449,15 @@ float *v41_vision_run(ds4_engine *e, const float *patches, uint32_t n_vit_h, uin
 bool v41_engram(ds4_engine *e, ds4_v41_state *st, uint32_t il);      /* core_v41_engram.c: 就地改 st->hc(engram 层才调) */
 bool v41_engram_prefetch(ds4_engine *e, ds4_v41_state *st);          /* 前向开头: 所有 engram 层的行一次性后台并行 pread */
 void v41_engram_close(ds4_v41_state *st);
+/* 只读张量探针(默认 NULL, 零开销): 在指定层捕获补丁/BF16舍入前后及出口前张量。 */
+typedef struct {
+    uint32_t layer, row;
+    int skip_amp_bf16;
+    float *y_moe, *y_pre, *y_post, *hc_post, *hc_pre, *xn_out;
+    bool ok;
+} v41_trace_tap;
+extern v41_trace_tap *g_v41_trace_tap;
+void v41_trace_capture_row(const ds4_gpu_tensor *t, uint32_t row, uint32_t cols, float *dst, bool *ok);
 
 #endif /* !DS4_NO_GPU */
 #endif
