@@ -309,6 +309,8 @@ void generate_job_v41(server *s, job *j);
 /* 上一条生成的序列接进下一条提示(server_v41_live.c): 生成前 splice(提示以上一条文本开头 ⇒ 沿用上一条的 id), 生成后 store。
  * 返回 true = 本条是上一条会话的续写; false = 不同对话/agent(或边界落 token 中间) ⇒ 服务端先离载旧检查点(2026-11-15)。 */
 bool v41_live_splice(server *s, job *j);   /* v41_live_store 在 v41_gen 定义之后声明 */
+/* 本条与最新记下的序列是否同 X-DS4-Conversation: false ⇒ 换会话, generate_job_v41 才离载两槽(2026-11-23) */
+bool v41_live_same_conversation(server *s, const job *j);
 /* 一条 V4.1 请求的生成期状态(2026-09-30 从 server_generate_v41.c 搬到头文件: 并发调度器 server_sched_v41.c 也要用)。
  * 三段: v41_gen_begin(校验/id/trace/采样面; 失败已回响应) → 引擎每出一个 token 调 v41_emit(文本累积/思考段/DSML/停止串/流式/挂断探测)
  * → v41_gen_end(收尾响应/trace/释放)。单请求路(generate_job_v41)与并发路走同一套, 客户端看到的字节一样。 */
@@ -385,6 +387,8 @@ void primer_copy_init(primer_copy *cm, const char *src, size_t len, bool anchore
 int primer_copy_step(server *s, primer_copy *cm, const char *stopchars, int stop_tok, bool hard, bool *fell_back);
 int primer_divergence_token(server *s, int exclude_tok);
 void generate_job(server *s, job *j);
+/* worker 开工时落这条 job 的会话归属: s->conv/s->kv.conv/引擎 CK 盘 conv; 单请求与并发路都先调(2026-11-23) */
+void server_job_conv_bind(server *s, job *j);
 bool enqueue(server *s, job *j);
 void *worker_main(void *arg);
 void append_model_json_values(buf *b, const char *id, const char *name, int ctx, int default_tokens);

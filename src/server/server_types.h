@@ -110,7 +110,7 @@ typedef struct server server;
 
 /* V4.1 单 worker 路上一条生成的序列(server_v41_live.c, 2026-10-20): 渲染文本 + 引擎真吃/真吐的 token id(不含末尾 EOS)。
  * 下一条提示以这段文本开头就沿用这些 id —— 重新分词会在生成段里分叉(10-20 实撞第 12,229 位), 引擎的解码结束检查点才接得上。 */
-typedef struct { char *text; size_t text_len; int32_t *ids; int n; bool has_img; } v41_live_seq;
+typedef struct { char *text; size_t text_len; int32_t *ids; int n; bool has_img; char conv[64]; } v41_live_seq;
 
 typedef struct {
     char *id;

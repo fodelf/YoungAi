@@ -463,8 +463,11 @@ void v41_gen_end(v41_gen *g, int rc) {
 /* 单 worker 路(不带 --batch): 引擎整段跑(预填 → 逐 token, 带投机), token 从回调来 */
 void generate_job_v41(server *s, job *j) {
     v41_gen g;
+    const bool same = v41_live_same_conversation(s, j);   /* 同会话 = 最新记下的那份归同 conv */
     const bool cont = v41_live_splice(s, j);   /* true = 本条是上一条会话的续写 ⇒ 沿用上一条的 id, 引擎的解码结束检查点接得上 */
-    if (!cont) ds4_engine_v41_kv_offload();   /* 不同对话/agent 进来: 旧检查点对新提示没用 ⇒ 先整份离载到磁盘、放显存(2026-11-15) */
+    /* ★只换会话才离载★(2026-11-23): 旧检查点归旧 conv 写到盘、放显存, 回到旧 conv 可接; 同 conv 但边界/图片落不上
+     * ⇒ 两槽留着 —— 本条冷预填后覆盖同一会话的槽(CK_PROMPT/CK_END), 不许把同会话的当前份当废料丢掉. */
+    if (!cont && !same) ds4_engine_v41_kv_offload();
     char err[256] = "";
     if (!server_v41_mem_admit(s, j, err, sizeof err)) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: %s ctx=0..%d prefill admission refused: %s",

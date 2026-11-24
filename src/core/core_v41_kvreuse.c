@@ -37,6 +37,10 @@ int g_ds4_v41_kv_reuse = 1;
 void ds4_engine_v41_set_kv_reuse(int on) { g_ds4_v41_kv_reuse = on; }
 static int g_last_reused;
 int ds4_engine_v41_last_reused(void) { return g_last_reused; }
+/* 存检查点时的会话号(X-DS4-Conversation, 由 server_generate.c 的 job_conv_bind 落):
+ * 两槽自己记, restore 只接同会话 —— 以前两槽是进程级最近一份, 谁最后跑就谁占; 换 agent 后回来只能靠磁盘,
+ * 而磁盘候选只比 token 前缀不认人(2026-11-23)。 */
+static char g_v41_conv[64];
 
 static ckpt K[CK_SLOTS];   /* ckpt/CK_PROMPT/CK_END 在 core_v41_ckpt.h(磁盘模块共用同一份定义) */
 
@@ -92,7 +96,10 @@ int ds4_engine_v41_kv_disk_open(const char *dir, uint64_t budget_mb, char *err, 
 }
 void ds4_engine_v41_kv_disk_close(void) { v41_ckpt_disk_close(); }
 void ds4_engine_v41_kv_disk_clear(void) { v41_ckpt_disk_clear(); }
-void ds4_engine_v41_kv_disk_conversation_set(const char *conv) { v41_ckpt_disk_conversation_set(conv); }
+void ds4_engine_v41_kv_disk_conversation_set(const char *conv) {
+    snprintf(g_v41_conv, sizeof g_v41_conv, "%s", conv ? conv : "");
+    v41_ckpt_disk_conversation_set(conv);
+}
 int ds4_engine_v41_kv_disk_erase_conversation(const char *conv) { return v41_ckpt_disk_erase_conversation(conv); }
 void ds4_engine_v41_kv_offload(void) { v41_kvreuse_offload(); }
 void v41_kvreuse_trim(void) {
@@ -145,6 +152,37 @@ static uint64_t ckpt_need(const ckpt *k, const ds4_v41_state *st) {
     return need;
 }
 
+/* ★直存状态(2026-11-23)★: 余量不够新分一份 GPU 检查点, 或并发路不想占进程级两槽时, 组一份指向 st 现用
+ * 缓冲的临时 ckpt 走 v41_ckpt_disk_store 流式写盘 —— 主机只分 tok/sig 的 n×12 B 清单(1M ≈ 12 MB), 不 staging 整份。
+ * 成功 ⇒ 下一请求(同 conv)从磁盘装进请求态; 失败 ⇒ 调用方走旧路(冷或回收), 不留下半份。 */
+static bool ckpt_store_state(const ds4_v41_state *st, const int32_t *head, uint32_t nh, const uint64_t *hsig,
+                             const int32_t *tail, uint32_t nt, uint32_t slot, uint32_t logit_row,
+                             ds4_gpu_tensor *logits, const char *conv) {
+    if (!st || !head || (nh + nt) == 0 || !v41_ckpt_disk_enabled()) return false;
+    const uint32_t n = nh + nt;
+    int32_t *tok = xmalloc((size_t)n * 4); uint64_t *sig = xmalloc((size_t)n * 8);
+    memcpy(tok, head, (size_t)nh * 4); if (nt) memcpy(tok + nh, tail, (size_t)nt * 4);
+    if (hsig) memcpy(sig, hsig, (size_t)nh * 8); else memset(sig, 0, (size_t)nh * 8);
+    if (nt) memset(sig + nh, 0, (size_t)nt * 8);   /* 生成 token 无图 */
+    ckpt t; memset(&t, 0, sizeof t);
+    t.valid = 1; t.n = n; t.tok = tok; t.sig = sig; t.logit_row = logit_row;
+    snprintf(t.conv, sizeof t.conv, "%s", conv ? conv : "");
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        t.win[il] = st->win[il]; t.ng_src[il] = st->ng_src[il]; t.cpend[il] = st->cpend[il]; t.win_from[il] = st->win_from[il];
+        if (!st->comp_kv[il]) continue;
+        t.ckv[il] = st->comp_kv[il]; t.idk[il] = st->index_k[il];
+        if (st->cpre_kv[il] && st->cpend[il]) { t.cpk[il] = st->cpre_kv[il]; t.cps[il] = st->cpre_sc[il]; }
+    }
+    t.mainh = st->mainh; t.mainh_bytes = st->mainh ? ds4_gpu_tensor_bytes(st->mainh) : 0;
+    t.mainh_end = st->mainh_end; t.mainh_n = st->mainh_n;
+    t.logits = logits;   /* 单请求路 = st->logits; 并发路末位行在批态 B->logits, 由调用方给 */
+    char err[256];
+    const bool ok = v41_ckpt_disk_store(&t, slot, err, sizeof err);
+    if (!ok && err[0]) fprintf(stderr, "ds4: [v41] 直存检查点失败(%s), 这一条走原路", err);
+    free(tok); free(sig);
+    return ok;
+}
+
 /* st 此刻停在 head + tail 的末尾(tail 可空); logit_row = 末位 logits 在 st->logits 的哪一行 */
 static void ckpt_save(ckpt *k, const char *what, const ds4_v41_state *st, const int32_t *head, uint32_t nh, const uint64_t *hsig,
                       const int32_t *tail, uint32_t nt, uint32_t logit_row) {
@@ -153,9 +191,14 @@ static void ckpt_save(ckpt *k, const char *what, const ds4_v41_state *st, const 
     /* need=0 ⇒ 现有缓冲都够大, 拷贝不新分显存 ⇒ room=0 也能存(否则余量0 时永远拒一份无需扩容的检查点,
      * 下一条请求的复用就断)。只有真会新分时才按 room 拒。 */
     if (need > room) {
-        ckpt_free_gpu(k);   /* 余量不够: 先回收旧检查点的显存, 这一份不存 —— 不把"不存"留成旧缓冲继续占内存 */
-        fprintf(stderr, "ds4: [v41] %s检查点要新分 %.0f MB, 内存余量只剩 %.0f MB, 这一份不存并回收旧缓冲(下一条请求少这一段复用)\n",
-                what, (double)need / 1048576.0, (double)room / 1048576.0);
+        /* 低余量: 先试直存磁盘(不新分显存), 再回收旧缓冲 —— 以前一律丢, 下一请求必冷预填; 现在同 conv 可从盘接。
+         * 磁盘不开/写失败才走旧路, 不留半份。 */
+        const bool disk = ckpt_store_state(st, head, nh, hsig, tail, nt, (uint32_t)(k == &K[CK_END]), logit_row, st->logits, g_v41_conv);
+        ckpt_free_gpu(k);   /* 旧检查点的显存回收: 新份在盘里(成功)或不存(失败), 都不该占 */
+        fprintf(stderr, "ds4: [v41] %s检查点要新分 %.0f MB, 内存余量只剩 %.0f MB, %s并回收旧缓冲(下一条%s)\n",
+                what, (double)need / 1048576.0, (double)room / 1048576.0,
+                disk ? "直接写盘" : "这一份不存",
+                disk ? "同 conv 从磁盘接" : "请求少这一段复用, 走冷预填");
         return;
     }
     const uint64_t rowb = (uint64_t)DS4_N_HEAD_DIM * 4;
@@ -192,7 +235,8 @@ static void ckpt_save(ckpt *k, const char *what, const ds4_v41_state *st, const 
     if (nt) memcpy(k->tok + nh, tail, (size_t)nt * 4);
     if (hsig) memcpy(k->sig, hsig, (size_t)nh * 8); else memset(k->sig, 0, (size_t)nh * 8);
     if (nt) memset(k->sig + nh, 0, (size_t)nt * 8);   /* 生成的 token 没有图片 */
-    k->n = n; k->bytes = total; k->valid = 1;
+    k->n = n; k->bytes = total; k->valid = 1; k->logit_row = 0;   /* 存时已把 st 末位行拷到 k->logits 第 0 行(磁盘读也落第 0 行) */
+    snprintf(k->conv, sizeof k->conv, "%s", g_v41_conv);   /* 归属按存时, 不是离载时当下的新 conv */
 }
 
 /* 预填刚完(解码前)调: st 此刻正好停在提示末尾 */
@@ -200,8 +244,23 @@ void v41_kvreuse_save(const ds4_v41_state *st, const int32_t *prompt, uint32_t n
     if (!g_ds4_v41_kv_reuse) return;
     ckpt_save(&K[CK_PROMPT], "提示末尾的 KV ", st, prompt, np, sig, NULL, 0, st->last_logit_row);
 }
+/* ★并发路直接存提示末尾★(2026-11-23): --batch 的 N 条道各自预填完都会存, 进程级 CK_PROMPT 槽只能留一份 ——
+ * 后到的那条会盖掉同 conv 前一条, 跨请求复用就断. 所以并发路不占两槽, 按会话归属直接把 st 写到盘(CK_PROMPT).
+ * 成功 ⇒ 下一批同 conv 请求从盘接; 磁盘不开/预算装不下 ⇒ 返回 false, 调用方退回常规 v41_kvreuse_save(留进程级一份). */
+bool v41_kvreuse_save_direct(const ds4_v41_state *st, const int32_t *prompt, uint32_t np, const uint64_t *sig) {
+    if (!g_ds4_v41_kv_reuse || !st || !prompt || !np) return false;
+    return ckpt_store_state(st, prompt, np, sig, NULL, 0, CK_PROMPT, st->last_logit_row, st->logits, g_v41_conv);
+}
 
 /* 解码结束调: fed = 这一趟真喂进 KV 的生成 token(按喂入顺序, 不含没喂的末位/EOS); st 停在 prompt + fed 的末尾, 末位 logits 在 logit_row 行 */
+/* ★并发解码结束直存★(2026-11-23): 批态里 st.logits 收缩后已放, 末位 logits 在共享批态 B->logits 的 abs 行;
+ * 用这份外部行直存 CK_END(不先分 GPU 检查点, 也不占进程级槽). 同 conv 下一请求从盘接 prompt+fed. */
+bool v41_kvreuse_save_end_direct(const ds4_v41_state *st, const int32_t *prompt, uint32_t np, const uint64_t *sig,
+                                 const int32_t *fed, uint32_t nf, uint32_t logit_row, ds4_gpu_tensor *batch_logits) {
+    if (!g_ds4_v41_kv_reuse || !st || !prompt || !nf || !batch_logits || st->n_past != np + nf) return false;
+    return ckpt_store_state(st, prompt, np, sig, fed, nf, CK_END, logit_row, batch_logits, g_v41_conv);
+}
+
 void v41_kvreuse_save_end(const ds4_v41_state *st, const int32_t *prompt, uint32_t np, const uint64_t *sig,
                           const int32_t *fed, uint32_t nf, uint32_t logit_row) {
     if (!g_ds4_v41_kv_reuse || !nf) return;
@@ -227,6 +286,7 @@ uint32_t v41_kvreuse_restore(ds4_v41_state *st, const int32_t *prompt, uint32_t 
     for (int s = 0; s < CK_SLOTS; s++) {
         const ckpt *c = &K[s];
         if (!c->valid || c->n > np || c->n > st->ctx || (k && c->n <= k->n)) continue;
+        if (strcmp(c->conv, g_v41_conv) != 0) continue;   /* 别的会话留下的两槽不接(2026-11-23): 提示前缀相同也不接 */
         if (memcmp(c->tok, prompt, (size_t)c->n * 4) || !sig_match(c, sig, c->n)) continue;
         k = c;
     }

@@ -37,10 +37,12 @@ typedef struct {
     uint32_t flags;
     uint64_t bytes;
     uint64_t last_used;
+    uint8_t conv[V41CKPT_CONV];   /* 尾 trailer 的 64B 原文: restore 只认同会话(2026-11-23) */
 } v41ckpt_disk_entry;
 
 static int g_on;
 static char g_conv[64];
+static bool conv_match(const uint8_t cv[V41CKPT_CONV], const char *conv);   /* 定义在 conv_trailer 之后; trim_lru 先用 */
 static char *g_dir;
 static uint64_t g_budget;
 static v41ckpt_disk_entry *g_entry;
@@ -86,7 +88,8 @@ static char *path_join(const char *dir, const char *name) {
     return p;
 }
 
-static bool entry_push(char *path, const char *hash, uint32_t slot, uint32_t n, uint32_t flags, uint64_t bytes, uint64_t last_used) {
+static bool entry_push(char *path, const char *hash, uint32_t slot, uint32_t n, uint32_t flags, uint64_t bytes,
+                       uint64_t last_used, const uint8_t *conv) {
     if (g_len >= g_cap) {
         g_cap = g_cap ? g_cap * 2 : 8;
         g_entry = xrealloc(g_entry, (size_t)g_cap * sizeof *g_entry);   /* core xrealloc? */
@@ -94,6 +97,7 @@ static bool entry_push(char *path, const char *hash, uint32_t slot, uint32_t n, 
     v41ckpt_disk_entry *e = &g_entry[g_len++];
     e->path = path; memcpy(e->hash, hash, 17); e->slot = slot; e->n = n; e->flags = flags;
     e->bytes = bytes; e->last_used = last_used;
+    memcpy(e->conv, conv, V41CKPT_CONV);
     g_used += bytes;
     return true;
 }
@@ -109,12 +113,13 @@ static void entry_remove(int i, bool unlink_file) {
 }
 
 /* 预算不足: 删最久没用的文件，直到 已用+extra ≤ 预算; 只剩单文件也装不下 ⇒ 失败 */
-static bool trim_lru(uint64_t extra) {
+static bool trim_lru(uint64_t extra, const char *conv) {
     while (g_used + extra > g_budget && g_len > 0) {
         int victim = 0;
         for (int i = 1; i < g_len; i++) {
-            const uint64_t a = g_entry[i].last_used, b = g_entry[victim].last_used;
-            if (a < b || (a == b && g_entry[i].n < g_entry[victim].n)) victim = i;   /* LRU 同秒按短的先删(少丢长复用) */
+            const uint64_t a = g_entry[i].last_used, b = g_entry[victim].last_used, n_i = g_entry[i].n, n_v = g_entry[victim].n;
+            const int keep = conv_match(g_entry[i].conv, conv), keepv = conv_match(g_entry[victim].conv, conv);
+            if (keep < keepv || (keep == keepv && (a < b || (a == b && n_i < n_v)))) victim = i;   /* 本会话先保留: 预算满先删别人的; 同会话里 LRU 同秒按短的先删(少丢长复用) */
         }
         entry_remove(victim, true);
     }
@@ -126,16 +131,20 @@ static void stage_ensure(void) {
 }
 
 /* 张量 → 文件(流式): 8 MiB 块回读后立刻写，主机里最多只有一块 */
-static bool tensor_to_file(FILE *fp, ds4_gpu_tensor *t, uint64_t bytes) {
+/* 从 tensor 的 from_off 起写 bytes(低余量直存: st.logits 末位行不在第 0 行) */
+static bool tensor_to_file_from(FILE *fp, ds4_gpu_tensor *t, uint64_t from_off, uint64_t bytes) {
     if (!bytes) return true;
-    if (!t || bytes > ds4_gpu_tensor_bytes(t)) return false;
+    if (!t || from_off + bytes > ds4_gpu_tensor_bytes(t)) return false;
     stage_ensure();
     for (uint64_t off = 0; off < bytes; off += V41CKPT_STAGE) {
         const uint64_t n = bytes - off < V41CKPT_STAGE ? bytes - off : V41CKPT_STAGE;
-        if (!ds4_gpu_tensor_read(t, off, g_stage, n)) return false;
+        if (!ds4_gpu_tensor_read(t, from_off + off, g_stage, n)) return false;
         if (fwrite(g_stage, 1, (size_t)n, fp) != (size_t)n) return false;
     }
     return true;
+}
+static bool tensor_to_file(FILE *fp, ds4_gpu_tensor *t, uint64_t bytes) {
+    return tensor_to_file_from(fp, t, 0, bytes);
 }
 static bool file_to_tensor(FILE *fp, ds4_gpu_tensor *t, uint64_t bytes) {
     if (!bytes) return true;
@@ -200,8 +209,17 @@ static bool conv_match(const uint8_t cv[V41CKPT_CONV], const char *conv) {
     uint8_t exp[V41CKPT_CONV]; conv_trailer(exp, conv);   /* 60B 零垫 + 版本字节都必须同 */
     return cv[3] == 1 && memcmp(cv, exp, V41CKPT_CONV) == 0;
 }
+/* 文件末尾 64B → 会话归属; 无 trailer(旧文件/截断) ⇒ 零, 与任何 conv 都不配 */
+static bool read_conv_trailer(FILE *fp, uint64_t bytes, uint8_t cv[V41CKPT_CONV]) {
+    memset(cv, 0, V41CKPT_CONV);
+    if (!fp || bytes < V41CKPT_CONV || fseeko(fp, (off_t)(bytes - V41CKPT_CONV), SEEK_SET) != 0) return false;
+    if (fread(cv, 1, V41CKPT_CONV, fp) != V41CKPT_CONV || cv[0] != 'K' || cv[1] != 'C' || cv[2] != 'V' || cv[3] != 1) {
+        memset(cv, 0, V41CKPT_CONV); return false;
+    }
+    return true;
+}
 
-static bool write_tensors(FILE *fp, const ckpt *k) {
+static bool write_tensors(FILE *fp, const ckpt *k, uint32_t logit_row, const char *conv) {
     const uint64_t rowb = (uint64_t)DS4_N_HEAD_DIM * 4u, wb = win_bytes();
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         if (!tensor_to_file(fp, k->win[il], wb)) return false;
@@ -214,9 +232,9 @@ static bool write_tensors(FILE *fp, const ckpt *k) {
         }
     }
     if (!tensor_to_file(fp, k->mainh, k->mainh_bytes)) return false;
-    if (!tensor_to_file(fp, k->logits, (uint64_t)DS4_N_VOCAB * 4u)) return false;
-    /* 尾 trailer 记 agent 会话号; 在最后一 tensor 后面, 不参与 restore tensor 读, 删按它归属. */
-    uint8_t cv[V41CKPT_CONV]; conv_trailer(cv, g_conv);
+    if (!tensor_to_file_from(fp, k->logits, (uint64_t)logit_row * DS4_N_VOCAB * 4u, (uint64_t)DS4_N_VOCAB * 4u)) return false;
+    /* 尾 trailer 记存时的会话号(不是当下 g_conv: 换对话时旧 CK 必须仍归旧人); 在最后一 tensor 后面, 不参与 restore tensor 读, 删按它归属. */
+    uint8_t cv[V41CKPT_CONV]; conv_trailer(cv, conv);
     return fwrite(cv, 1, V41CKPT_CONV, fp) == V41CKPT_CONV;
 }
 
@@ -229,33 +247,23 @@ static bool scan_dir(void) {
         const char *name = de->d_name;
         if (strlen(name) != V41CKPT_NAME_LEN || strncmp(name, "v41ck_", 6) != 0 ||
             strcmp(name + 24, ".ckp") != 0) continue;
-        char hash[17];
-        for (int i = 0; i < 16; i++) {
-            char c = name[6 + i];
-            if (!isxdigit((unsigned char)c)) goto skip;
-            hash[i] = (char)tolower((unsigned char)c);
-        }
-        hash[16] = '\0';
-        const char *path = path_join(g_dir, name);
-        struct stat st;
+        char hash[17]; int hi = 0;
+        for (; hi < 16; hi++) { char c = name[6 + hi]; if (!isxdigit((unsigned char)c)) goto skip; hash[hi] = (char)tolower((unsigned char)c); }
+        hash[hi] = '\0';
+        const char *path = path_join(g_dir, name); struct stat st;
         if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) { free((void *)path); goto skip; }
-        FILE *fp = fopen(path, "rb");
-        if (!fp) { free((void *)path); goto skip; }
+        FILE *fp = fopen(path, "rb"); if (!fp) { free((void *)path); goto skip; }
         uint8_t h[V41CKPT_HDR];
-        bool ok = fread(h, 1, V41CKPT_HDR, fp) == V41CKPT_HDR && memcmp(h, V41CKPT_MAGIC, 8) == 0 &&
-                  get32(h + 8) == V41CKPT_VERSION;
-        uint32_t slot = 0, n = 0, flags = 0;
-        uint64_t last_used = 0;
+        bool ok = fread(h, 1, V41CKPT_HDR, fp) == V41CKPT_HDR && memcmp(h, V41CKPT_MAGIC, 8) == 0 && get32(h + 8) == V41CKPT_VERSION;
+        uint32_t slot = 0, n = 0, flags = 0; uint64_t last_used = 0; uint8_t cv[V41CKPT_CONV] = {0};
         if (ok) {
-            slot = get32(h + 12); n = get32(h + 16); flags = get32(h + 24);
-            last_used = get64(h + 40);
+            slot = get32(h + 12); n = get32(h + 16); flags = get32(h + 24); last_used = get64(h + 40);
             if (!last_used) last_used = get64(h + 32);
             ok = n > 0 && slot < 2 && (uint64_t)st.st_size >= V41CKPT_HDR + V41CKPT_META + (uint64_t)n * 12u;
+            if (ok) ok = read_conv_trailer(fp, (uint64_t)st.st_size, cv);   /* 无 trailer/截断 = 不知道是谁, 索引里 conv 全 0 */
         }
         fclose(fp);
-        if (!ok || entry_push((char *)path, hash, slot, n, flags, (uint64_t)st.st_size, last_used) == false) {
-            free((void *)path); goto skip;
-        }
+        if (!ok || !entry_push((char *)path, hash, slot, n, flags, (uint64_t)st.st_size, last_used, cv)) { free((void *)path); goto skip; }
         continue;
 skip:;
     }
@@ -308,7 +316,7 @@ bool v41_ckpt_disk_open(const char *dir, uint64_t budget_mb, char *err, size_t e
     { size_t dlen = strlen(dir) + 1; g_dir = xmalloc(dlen); memcpy(g_dir, dir, dlen); }
     if (!budget_mb) budget_mb = V41CKPT_DEFAULT_MB;
     g_budget = budget_mb * 1024ull * 1024ull;
-    if (!scan_dir() || !trim_lru(0)) {
+    if (!scan_dir() || !trim_lru(0, g_conv)) {   /* 开时 g_conv 可能空(还没请求): 只压预算, 不偏袒会话 */
         if (err && errn) snprintf(err, errn, "cannot scan/budget checkpoint dir %s", dir);
         v41_ckpt_disk_close();
         return false;
@@ -364,23 +372,13 @@ bool v41_ckpt_disk_store(const ckpt *k, uint32_t slot, char *err, size_t errn) {
         if (err && errn) snprintf(err, errn, "checkpoint %.0f MB > disk budget %.0f MB", (double)fb / 1048576.0, (double)g_budget / 1048576.0);
         return false;
     }
-    uint64_t h = v41ck_hash(k->tok, (size_t)k->n * 4u);
-    char hash[17]; hash_hex(h, hash);
-    char name[V41CKPT_NAME_LEN + 1];
-    snprintf(name, sizeof name, "v41ck_%s_%u.ckp", hash, slot);
-    char *path = path_join(g_dir, name);
-    /* 同键重存: 旧索引的字节不再算(文件马上被 wb 截断)，预算只按新文件算 */
+    char hash[17]; hash_hex(v41ck_hash(k->tok, (size_t)k->n * 4u), hash);
+    char name[V41CKPT_NAME_LEN + 1]; snprintf(name, sizeof name, "v41ck_%s_%u.ckp", hash, slot);
+    char *path = path_join(g_dir, name);   /* 同键重存: 旧索引的字节不再算(文件马上被 wb 截断), 预算只按新文件算 */
     for (int i = 0; i < g_len; i++) if (!strcmp(g_entry[i].path, path)) { entry_remove(i, false); break; }
-    if (!trim_lru(fb)) {
-        if (err && errn) snprintf(err, errn, "checkpoint disk budget full (need %.0f MB)", (double)fb / 1048576.0);
-        free(path);
-        return false;
-    }
+    if (!trim_lru(fb, k->conv)) { if (err && errn) snprintf(err, errn, "checkpoint disk budget full (need %.0f MB)", (double)fb / 1048576.0); free(path); return false; }
     FILE *fp = fopen(path, "wb");
-    if (!fp) {
-        if (err && errn) snprintf(err, errn, "cannot write checkpoint %s", path);
-        free(path); return false;
-    }
+    if (!fp) { if (err && errn) snprintf(err, errn, "cannot write checkpoint %s", path); free(path); return false; }
     uint32_t flags = 0;
     if (k->sig) for (uint32_t i = 0; i < k->n; i++) if (k->sig[i]) { flags = 1; break; }
     const uint64_t now = (uint64_t)time(NULL);
@@ -396,7 +394,7 @@ bool v41_ckpt_disk_store(const ckpt *k, uint32_t slot, char *err, size_t errn) {
     }
     if (ok) ok = fwrite(k->tok, 1, (size_t)k->n * 4u, fp) == (size_t)k->n * 4u &&
                   fwrite(k->sig, 1, (size_t)k->n * 8u, fp) == (size_t)k->n * 8u;
-    if (ok) ok = write_tensors(fp, k);
+    if (ok) ok = write_tensors(fp, k, k->logit_row, k->conv);
     if (ok) ok = fflush(fp) == 0;
     fclose(fp);
     if (!ok || !ds4_gpu_synchronize()) {
@@ -404,7 +402,8 @@ bool v41_ckpt_disk_store(const ckpt *k, uint32_t slot, char *err, size_t errn) {
         if (err && errn) snprintf(err, errn, "checkpoint write failed %s", path);
         free(path); return false;
     }
-    entry_push(path, hash, slot, k->n, flags, fb, now);
+    uint8_t cv[V41CKPT_CONV]; conv_trailer(cv, k->conv);   /* 索引按存时的会话归属 */
+    entry_push(path, hash, slot, k->n, flags, fb, now, cv);
     return true;
 }
 
@@ -415,6 +414,7 @@ static const v41ckpt_disk_entry *find_candidate(const int32_t *prompt, uint32_t 
     for (int i = 0; i < g_len; i++) {
         const v41ckpt_disk_entry *e = &g_entry[i];
         if (!e->n || e->n > np || (best && e->n <= best->n)) continue;
+        if (!conv_match(e->conv, g_conv)) continue;   /* 不是本会话的检查点: 不进候选(2026-11-23, 否则同提示前缀能把别的 agent 的 KV 接上) */
         uint64_t h = v41ck_hash(prompt, (size_t)e->n * 4u);
         char hex[17]; hash_hex(h, hex);
         if (strcmp(hex, e->hash) == 0) best = e;

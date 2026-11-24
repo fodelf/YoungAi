@@ -22,6 +22,9 @@ struct ds4_v41_req {
     const int32_t *prompt;
     uint32_t np, c0, cap;
     int32_t next;              /* 还没进模型的下一个 token: 预填完 = 首个生成 token; 每轮合批后 = 新 token */
+    uint32_t reused;           /* 开请求时从检查点接上的位置(0 = 整段冷预填; = np 一块都不填; 2026-11-23) */
+    struct ds4_v41_images *imgs;   /* 本请求的图片对象: 预填后不读, 但解码结束存 CK_END 要按它逐位记 sig */
+    int32_t *fed; uint32_t nfed, fedcap; uint32_t last_logit_abs;   /* 真喂进 KV 的 token + 末位 logits 在批态 B->logits 的行(2026-11-23) */
     int prefilled;
     /* 投机: 草稿器 + 调度账(与 generate_argmax 同一套); spec = 0 时每轮就是纯解码 1 行 */
     int spec;
@@ -73,6 +76,8 @@ static bool v41_req_setup(struct ds4_v41_req *r) {
     r->rng = r->sp.seed ? r->sp.seed : ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());   /* 与 CLI 同一条规则 */
     r->samp = (ds4_gpu_sample_params){ .temperature = r->sp.temperature, .top_p = r->sp.top_p, .min_p = r->sp.min_p,
                                        .top_k = r->sp.top_k, .seed = r->rng };
+    r->fedcap = (uint32_t)(r->n_predict > 0 ? r->n_predict : 0) + DS4_MTP_MAX_BLOCK + 2u;
+    r->fed = xmalloc((size_t)r->fedcap * sizeof *r->fed);   /* 与单请求路 fed 同容量: 每轮喂 1 + 接受的草稿 */
     /* 投机: 惩罚路不接(与 generate_argmax 同: 惩罚要按 token 史改 logits); 没三塔的 GGUF dr.ready=0 就是纯解码 */
     r->spec = (g_ds4_v41_dspark && !penal && v41_draft_alloc(r->e, &r->dr)) ? 1 : 0;
     if (r->spec && r->dev_sample) { r->dr.dev_sample = 1; r->dr.samp = r->samp; r->dr.samp.stream = 1u; }
@@ -127,23 +132,43 @@ void ds4_v41_req_close(struct ds4_v41_req *r) {
     if (r->spec) v41_draft_free(&r->dr);
     if (r->am) ds4_gpu_tensor_free(r->am);
     v41_state_free(&r->st);
-    free(r->rowbuf); free(r->hist.tok); free((void *)r->hist.brk);
+    free(r->rowbuf); free(r->hist.tok); free((void *)r->hist.brk); free(r->fed);
     free(r);
 }
 
 /* 图片(2026-10-13): 预填开始前挂上(调用方已用 ds4_v41_images_prepare 把提示展开, prompt 就是展开后的那份); 对象归调用方, 预填完就不再读 */
 int ds4_v41_req_set_images(struct ds4_v41_req *r, struct ds4_v41_images *imgs) {
     if (!r || r->prefilled || r->c0 || r->forked) return 0;
-    r->st.vimg = imgs;
+    r->st.vimg = imgs; r->imgs = imgs;   /* 存 CK_END 时按它记图片位 sig(预填后 st.vimg 清掉) */
     return 1;
+}
+
+/* ★开请求先接检查点★(2026-11-23): 并发路以前只有 open → 预填, 没有 restore/save, 跨请求前缀复用全断.
+ * 调用方(调度器)先 server_job_conv_bind(引擎的 CK 盘 conv), 挂图片, 再这里: 同 conv 且提示前缀相同的那份拷进
+ * 本请求态, 预填起点 = 接上的位置; 返回 0 = 冷预填. 图片指纹用 vimg->sig_of —— 不同图不许接. */
+uint32_t ds4_v41_req_restore(struct ds4_v41_req *r) {
+    if (!r || r->prefilled || r->c0 || r->forked) return 0;
+    const uint64_t *sig = r->st.vimg ? r->st.vimg->sig_of : NULL;
+    r->reused = v41_kvreuse_restore(&r->st, r->prompt, r->np, sig);
+    r->c0 = r->reused;
+    return r->reused;
 }
 
 int ds4_v41_req_prefill_step(struct ds4_v41_req *r) {
     if (!r) return -1;
     if (r->prefilled) return 1;
-    if (r->forked) { fprintf(stderr, "ds4: V4.1 分身没有自己的预填(原请求没预填完或已关)\n"); return -1; }
-    if (!v41_prefill_chunk(r->e, &r->st, r->prompt, r->np, &r->c0, r->cap)) return -1;
-    if (r->c0 < r->np) return 0;
+    if (r->forked) { fprintf(stderr, "ds4: V4.1 分身没有自己的预填(原请求没预填完或已关)"); return -1; }
+    if (r->c0 < r->np) {   /* 接上(= np)就不跑一块 0 token 的预填(v41_forward 拒 n==0) */
+        if (!v41_prefill_chunk(r->e, &r->st, r->prompt, r->np, &r->c0, r->cap)) return -1;
+        if (r->c0 < r->np) return 0;
+    }
+    /* 预填刚到提示末尾(或一块不填): 存提示末尾检查点给下一请求接(同提示整份接上的那份就是它, 不重存; 与单请求路同规则).
+     * 并发路用直接写盘: N 条道各自存, 进程级 CK_PROMPT 槽只能留一份会互相盖掉; 磁盘不开/装不下才退回槽. */
+    if (r->reused < r->np) {
+        const uint64_t *sig = r->st.vimg ? r->st.vimg->sig_of : NULL;
+        if (!v41_kvreuse_save_direct(&r->st, r->prompt, r->np, sig))
+            v41_kvreuse_save(&r->st, r->prompt, r->np, sig);
+    }
     r->st.vimg = NULL;   /* 图片只在预填里用; 之后的解码/分身克隆不再碰它 */
     /* 最后一块: 末位 logits → 首个 token(设备 argmax / 采样核 / 主机惩罚路), 然后收缩成解码态(投机的验证批要 1+块长 行) */
     if (!v41_next_token(&r->st, r->am, r->st.last_logit_row, r->rowbuf, &r->rng, &r->hist, &r->next)) return -1;
@@ -194,6 +219,9 @@ int ds4_v41_multi_step(struct ds4_v41_batch *b, struct ds4_v41_req **r, int n) {
         if (walked) r[i]->next = wants[i];
         else if (!v41_multi_pick(b, m[i], (uint32_t)i, r[i]->rowbuf, &r[i]->rng, &r[i]->hist, &r[i]->next)) return 1;
         r[i]->outq[0] = r[i]->next; r[i]->nout = 1;
+        /* 本步真喂进 KV 的就是 tok[i](旧的 next), 新 next 还没喂: 记进 fed 给解码结束检查点用 */
+        if (r[i]->nfed < r[i]->fedcap) r[i]->fed[r[i]->nfed++] = tok[i];
+        r[i]->last_logit_abs = (uint32_t)i;   /* 各路一行, 末位 logits 在批态第 i 行 */
     }
     return 0;
 }
@@ -262,9 +290,23 @@ int ds4_v41_multi_round(struct ds4_v41_batch *b, struct ds4_v41_req **r, int n) 
         for (uint32_t j = 0; j < a; j++) q->outq[q->nout++] = batch[i][j + 1u];   /* 白赚的那几位 */
         q->outq[q->nout++] = want[a];
         q->next = want[a];
+        /* 真喂进 KV: 本路旧的 next + 接受的 a 位草稿(拒绝的草稿验证后回滚, 不在末态 KV 里); 末位 logits 是 want[a] 的行 */
+        if (q->nfed + 1u + a <= q->fedcap) {
+            q->fed[q->nfed++] = batch[i][0];
+            for (uint32_t j = 0; j < a; j++) q->fed[q->nfed++] = batch[i][j + 1u];
+            q->last_logit_abs = off + a;
+        }
         off += rows[i];
     }
     return 0;
+}
+/* ★并发解码结束存 CK_END★(2026-11-23): 收尾前调, 成功 ⇒ 同 conv 下一请求从盘接 prompt+fed(不只提示末尾),
+ * 与单请求路 save_end 的语义同。批态共享 logits 的 abs 行由每轮记账; 收缩后 r->st.logits 已放, 所以用 b->rows.logits.
+ * 返回 1 = 存了; 0 = 没条件(没解码/位置账对不上/磁盘关/装不下). */
+int ds4_v41_batch_req_save_end(struct ds4_v41_batch *b, struct ds4_v41_req *r) {
+    if (!b || !r || !r->prefilled || !r->nfed || r->st.n_past != r->np + r->nfed || !b->rows.logits) return 0;
+    const uint64_t *sig = r->imgs ? r->imgs->sig_of : NULL;
+    return v41_kvreuse_save_end_direct(&r->st, r->prompt, r->np, sig, r->fed, r->nfed, r->last_logit_abs, b->rows.logits) ? 1 : 0;
 }
 void ds4_v41_req_spec_stats(const struct ds4_v41_req *r, int *rounds, int *offered, int *accepted) {
     if (rounds) *rounds = (int)r->rounds;

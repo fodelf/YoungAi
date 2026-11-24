@@ -35,6 +35,7 @@ void v41_live_store(server *s, const job *j, const v41_gen *g) {
         server_log(DS4_LOG_WARNING, "ds4-server: ★V4.1 吐出的 id 拼不回正文(id 文本 %zu 字节, 正文 %zu), 这条序列不记★", total, g->text.len);
         return;
     }
+    snprintf(L->conv, sizeof L->conv, "%s", r->conv);   /* 最新一份按会话归属(2026-11-23): 换 agent 的请求不接它 */
     const size_t pl = strlen(r->prompt_text);
     L->text = xmalloc(pl + g->text.len + 1);
     memcpy(L->text, r->prompt_text, pl);
@@ -53,6 +54,7 @@ bool v41_live_splice(server *s, job *j) {
     const v41_live_seq *L = &s->v41_live;
     request *r = &j->req;
     if (!L->ids || L->n < 1 || !r->prompt_text || r->images || L->has_img) return false;
+    if (strcmp(L->conv, r->conv) != 0) return false;   /* 不同会话/agent 的同文本也不接(2026-11-23): 旧检查点对它不是 KV */
     const size_t pl = strlen(r->prompt_text);
     if (pl < L->text_len || memcmp(r->prompt_text, L->text, L->text_len) != 0) return false;
     size_t acc = 0; int b = -1;   /* b = 重新分词里第一个落在记下文本之外的 token 序号 */
@@ -74,4 +76,11 @@ bool v41_live_splice(server *s, job *j) {
     r->prompt.v = nv; r->prompt.len = r->prompt.cap = L->n + rest;
     server_log(DS4_LOG_GENERATION, "ds4-server: V4.1 提示沿用上一条的 %d 个 token(重新分词是 %d 个)+ 新段 %d 个 = %d", L->n, b, rest, r->prompt.len);
     return true;
+}
+
+/* 本条与记下的最新一份是否同会话: false = 换 agent/会话, 服务端要把进程级两槽离载到盘(仍归旧 conv), 放显存;
+ * true 但 splice 失败(边界落 token 中/图片) = 同会话的不同分支, 两槽留着不离载, 冷预填后覆盖槽(2026-11-23)。 */
+bool v41_live_same_conversation(server *s, const job *j) {
+    const v41_live_seq *L = &s->v41_live;
+    return L->ids && L->n > 0 && strcmp(L->conv, j->req.conv) == 0;
 }

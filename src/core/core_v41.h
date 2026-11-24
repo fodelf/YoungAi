@@ -362,6 +362,11 @@ extern int g_ds4_v41_replay;  /* --decoder-replay(core_v41_api.c): 最后一块�
 /* 单请求路的 KV 前缀复用(core_v41_kvreuse.c): 预填完存槽 0、解码完存槽 1 / 新请求接上就从检查点位置起填(返回起点, 0 = 整段, = np 等长一块不填) / 热切插件时作废 */
 extern int g_ds4_v41_kv_reuse;
 void v41_kvreuse_save(const ds4_v41_state *st, const int32_t *prompt, uint32_t np, const uint64_t *sig);        /* sig = 每位的图片指纹(无图 NULL) */
+/* 并发路(同 conv 多道): 不占进程级 CK_PROMPT 槽, 直接按会话把提示末尾写到磁盘 —— 成功返回 true, 否则调用方退回常规 save */
+bool v41_kvreuse_save_direct(const ds4_v41_state *st, const int32_t *prompt, uint32_t np, const uint64_t *sig);
+/* 并发解码结束直存 CK_END: 末位 logits 在共享批态 batch_logits 的 logit_row 行(收缩后 st.logits 已放) */
+bool v41_kvreuse_save_end_direct(const ds4_v41_state *st, const int32_t *prompt, uint32_t np, const uint64_t *sig,
+                                 const int32_t *fed, uint32_t nf, uint32_t logit_row, ds4_gpu_tensor *batch_logits);
 void v41_kvreuse_save_end(const ds4_v41_state *st, const int32_t *prompt, uint32_t np, const uint64_t *sig,
                           const int32_t *fed, uint32_t nf, uint32_t logit_row);   /* fed = 真喂进 KV 的生成 token; logit_row = 末位 logits 所在行 */
 uint32_t v41_kvreuse_restore(ds4_v41_state *st, const int32_t *prompt, uint32_t np, const uint64_t *sig);

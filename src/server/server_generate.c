@@ -4,7 +4,8 @@
 
 /* worker 开工时按这条 job 自己的 conv 落归属, 不再用 parse 线程写共享 s->conv:
  * 并发解析把别人的 agent 号串进这里会让存盘 KB/CK 标错人, 删错别的 agent. */
-static void job_conv_bind(server *s, job *j) {
+/* 并发调度器(server_sched_v41.c)也调: 同一份绑定, 不让解析线程写共享态 */
+void server_job_conv_bind(server *s, job *j) {
     snprintf(s->conv, sizeof s->conv, "%s", j->req.conv);
     snprintf(s->kv.conv, sizeof s->kv.conv, "%s", s->conv);
 #ifndef DS4_NO_GPU
@@ -25,7 +26,7 @@ static void job_conv_bind(server *s, job *j) {
  * immediately continue to the real prompt.  The live graph therefore always
  * moves forward. */
 void generate_job(server *s, job *j) {
-    job_conv_bind(s, j);
+    server_job_conv_bind(s, j);
     /* DeepSeek V4.1(2026-09-19): 没有 ds4_session, 走 server_generate_v41.c 的回调式生成路; 下面的会话路一行不动。 */
     if (ds4_engine_is_v41(s->engine)) { generate_job_v41(s, j); return; }
 

@@ -17,10 +17,14 @@ typedef struct {
     int phase;                 /* 1 等预填(还没开请求态) / 2 预填中 / 3 解码中 */
     uint64_t order;            /* 到达序: 预填按它排队 */
 } v41_lane;
+static struct ds4_v41_batch *g_v41_sched_b;   /* 调度线程唯一的批态: lane_finish 用它存解码结束 CK_END */
 
 /* Linux MemAvailable(MB) 走 server_buf.c 的共享一份 server_mem_available_mb: 单 worker 与 --batch 同一口径。 */
 
 static void lane_finish(v41_lane *L, int rc) {
+    /* ★解码结束先存 CK_END★(2026-11-23): 与单请求路 save_end 同语义 —— 收尾前批态 logits 还在, r->fed/abs 行齐;
+     * 存完才 close. 预填失败/解码失败(rc≠0)不存: 那时 KV 里是什么都不知道. */
+    if (L->r && rc == 0 && L->phase == 3 && g_v41_sched_b) (void)ds4_v41_batch_req_save_end(g_v41_sched_b, L->r);
     if (L->r) ds4_v41_req_spec_stats(L->r, &L->g.spec_rounds, &L->g.spec_offered, &L->g.spec_accepted);   /* 监控的草稿账 */
     v41_gen_end(&L->g, rc);
     ds4_v41_req_close(L->r);
@@ -35,6 +39,7 @@ static bool lane_admit(server *s, v41_lane *lanes, int cap, int *nl, uint64_t *o
     if (!j) return false;
     if (j->sw) { *sw = j; return true; }
     if (j->asr) { server_asr_apply(s, j); job_finish(j); return true; }   /* 语音识别(server_asr.c): 不占道, 调度线程当场做完(GPU 在这条线程上串行) */
+    server_job_conv_bind(s, j);   /* ★并发路也落会话归属★(2026-11-23): 解析线程写共享 conv 会串错人; 开工线程按这条 job 绑 */
     v41_lane *L = NULL;
     for (int i = 0; i < cap && !L; i++) if (!lanes[i].j) L = &lanes[i];
     L->j = j;
@@ -59,6 +64,8 @@ static bool sched_prefill(server *s, v41_lane *P, int *nl, int n_dec, double *t_
         P->r = ds4_v41_req_open(s->engine, j->req.prompt.v, j->req.prompt.len, g->max_tokens, &g->sp);
         if (!P->r) { lane_finish(P, 1); (*nl)--; return true; }
         if (j->req.images) (void)ds4_v41_req_set_images(P->r, j->req.images);   /* 图片 span 的视觉嵌入, 预填前挂上 */
+        const uint32_t reused = ds4_v41_req_restore(P->r);   /* 同 conv 的提示末尾检查点/盘接上 ⇒ 预填只填后面那段(2026-11-23) */
+        if (reused) server_log(DS4_LOG_PREFILL, "ds4-server: V4.1 并发路接检查点 %u/%d token", reused, g->prompt_tokens);
         P->phase = 2;
         mon_prefill(s, j->mon, g->prompt_tokens, 0, g->max_tokens);   /* 监控: 这条道开始读提示(准入等待不算读) */
         server_log(DS4_LOG_PREFILL, "ds4-server: %s ctx=%s%s%s prompt start (V4.1 并发预填, decode_max=%d, 余量 %ld MB, 峰值 %llu MB, 同批解码 %d 路)",
@@ -84,6 +91,7 @@ void v41_sched_run(server *s) {
     /* 批态行数按解码小批核路上限(8)开, 不按道数: 投机的验证批每路 1+k 行, 行数只由引擎在 multi_round 里按 8 分配(装不下从 k 最大的路削) */
     struct ds4_v41_batch *b = ds4_v41_batch_open(s->engine, 8);
     if (!b) die("ds4-server: V4.1 批态分配失败(--batch)");
+    g_v41_sched_b = b;   /* lane_finish 的 CK_END 直接存要它 */
     v41_lane lanes[DS4_SERVER_BATCH_LANES];
     memset(lanes, 0, sizeof lanes);
     int nl = 0;
@@ -100,6 +108,7 @@ void v41_sched_run(server *s) {
             server_plugins_apply(s, sw); sw = NULL;
             b = ds4_v41_batch_open(s->engine, 8);
             if (!b) die("ds4-server: 切换插件后 V4.1 批态重开失败");
+            g_v41_sched_b = b;
             t_chunk = t_dec = 0;
             continue;
         }
@@ -134,4 +143,5 @@ void v41_sched_run(server *s) {
     }
     for (int i = 0; i < cap; i++) if (lanes[i].j) lane_finish(&lanes[i], lanes[i].phase == 3 ? 0 : 1);   /* 服务在停: 收尾按 shutdown 报 */
     ds4_v41_batch_close(b);
+    g_v41_sched_b = NULL;
 }

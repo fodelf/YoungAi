@@ -152,6 +152,7 @@ struct ds4_v41_batch;
 struct ds4_v41_batch *ds4_v41_batch_open(ds4_engine *e, int cap);   /* cap = 一步最多合几行(解码小批核路上限 8) */
 void ds4_v41_batch_close(struct ds4_v41_batch *b);
 struct ds4_v41_req *ds4_v41_req_open(ds4_engine *e, const int *prompt, int n_prompt, int n_predict, const ds4_decode_sampling *sp);
+uint32_t ds4_v41_req_restore(struct ds4_v41_req *r);   /* 开请求后、第一块预填前: 同 conv+前缀相同就从检查点/盘接, 返回预填起点(0 = 冷); 需先挂图片 */
 int ds4_v41_req_prefill_step(struct ds4_v41_req *r);   /* 跑一块预填: 1 = 预填完(首个 token 在 req_next), 0 = 还有块, -1 = 失败 */
 /* 共享预填(2026-10-09): 在 src 预填完之前挂一个同提示、自己采样面的分身; src 最后一块出完 logits 时分身按自己的采样面取首个 token,
  * 收缩后深拷 src 的 KV ⇒ 分身直接是预填完的请求态(不要再 prefill_step)。src 预填失败或先关, 分身停在没预填完(multi_step 会拒)。
@@ -166,6 +167,7 @@ int ds4_v41_multi_step(struct ds4_v41_batch *b, struct ds4_v41_req **r, int n); 
  * 没三塔 / 惩罚路 / 引擎投机关 = 退成纯解码一步(outq 1 个)。上下文不够放一个验证批的请求这一轮也只走 1 行。 */
 int ds4_v41_multi_round(struct ds4_v41_batch *b, struct ds4_v41_req **r, int n);
 int ds4_v41_req_take(struct ds4_v41_req *r, int *out, int max);   /* 取这一轮吐出的 token(最后一个 = 新 next), 取过即清; 返回个数 */
+int ds4_v41_batch_req_save_end(struct ds4_v41_batch *b, struct ds4_v41_req *r);   /* 收尾前存解码结束检查点(同 conv 下条接); 1 = 存了 */
 void ds4_v41_req_spec_stats(const struct ds4_v41_req *r, int *rounds, int *offered, int *accepted);   /* 投机轮数 / 出过的草稿位 / 接受的草稿位 */
 /* 单请求路(ds4_engine_v41_generate_argmax)上一趟的同一组投机账(服务监控页用); 每次 generate 进门清零, 没投机全 0 */
 void ds4_engine_v41_last_spec_stats(int *rounds, int *offered, int *accepted);

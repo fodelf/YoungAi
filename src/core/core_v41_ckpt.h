@@ -20,10 +20,12 @@ typedef struct {
     uint64_t *sig;              /* [n] 每位所属图片的指纹(0 = 文本): 图片 span 的 token 全是同一个占位 id, 不比图片字节就会把别的图的 KV 接上(2026-10-13) */
     ds4_gpu_tensor *ckv[DS4_MAX_LAYER], *idk[DS4_MAX_LAYER], *win[DS4_MAX_LAYER], *cpk[DS4_MAX_LAYER], *cps[DS4_MAX_LAYER], *mainh;
     ds4_gpu_tensor *logits;     /* 末位的 logits 一行 [V] f32: 等长复用时不预填, 第一个 token 从它采 */
+    uint32_t logit_row;         /* 直存低余量: 末位 logits 在 st.logits 的哪一行; 两槽常规存时拷到 k->logits 第 0 行(磁盘读也落第 0 行) */
     uint32_t ng_src[DS4_MAX_LAYER], cpend[DS4_MAX_LAYER], win_from[DS4_MAX_LAYER];
     int64_t mainh_end; uint32_t mainh_n;
     uint64_t mainh_bytes;       /* 检查点 main_hidden 有效字节(无 MTP = 0) */
     uint64_t bytes;             /* 检查点占的显存(日志用) */
+    char conv[64];              /* 存时的 X-DS4-Conversation: 两槽按会话归属, restore 必须同会话(2026-11-23) */
 } ckpt;
 enum { CK_PROMPT = 0, CK_END = 1, CK_SLOTS = 2 };
 
@@ -35,10 +37,15 @@ bool v41_ckpt_disk_enabled(void);
 /* 整份检查点写到磁盘(槽 0/1)。成功 ⇒ 文件按 tok 序列的 sha 落盘、last_used=now; 失败 ⇒ 不动 GPU。 */
 bool v41_ckpt_disk_store(const ckpt *k, uint32_t slot, char *err, size_t errn);
 
-/* 回旧对话: 找磁盘里 tok 前缀与本条提示相同、sig 逐位同、且不短于检查点的那份，装进请求态。
- * 返回 0 = 没接上/装不下(冷预填); 成功返回检查点位置(已把 KV/环/余行/mainh/logits/账/tok/sig 装进 st)。 */
+/* 回旧对话: 只认同 conv 且 tok 前缀与本条提示相同、sig 逐位同、且不短于检查点的那份，装进请求态。
+ * 返回 0 = 没接上/装不下/不是同一会话(冷预填); 成功返回检查点位置(已把 KV/环/余行/mainh/logits/账/tok/sig 装进 st)。 */
 uint32_t v41_ckpt_disk_restore_state(ds4_v41_state *st, const int32_t *prompt, uint32_t np,
                                      const uint64_t *sig, char *err, size_t errn);
+
+/* ★低余量/并发路直接状态存盘(2026-11-23)★: 不先新分一份 GPU 检查点 —— core_v41_kvreuse.c 组一份
+ * 指向 st 现用缓冲的临时 ckpt(valid=1, logit_row=st.last_logit_row), 走本文件的 store 流式写到磁盘:
+ * slot 0 = 提示末尾(仅 prompt), slot 1 = 解码结束(prompt + fed)。成功 ⇒ 文件 conv 尾 trailer = 存时的会话。 */
+
 
 /* 切插件/引擎关: 磁盘检查点是带老放大器算的，全部作废。 */
 void v41_ckpt_disk_clear(void);
