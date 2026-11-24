@@ -113,6 +113,9 @@ bool http_error(int fd, bool enable_cors, int code, const char *msg);
 /* 单 worker 内存准入(server_buf.c): 真实 /proc MemAvailable + 2 × 预填峰值字节 */
 long server_mem_available_mb(void);
 bool server_v41_mem_admit(server *s, job *j, char *err, size_t errn);
+/* 内存不够时落一张归属读数(server_buf.c): 主机 /proc/meminfo + 主机进程 VmHWM/VmRSS 前几名 +
+ * GPU compute-app 显存(NVML; GB10 统一内存的真占用不在 ps RSS 里)。只在准入失败那一次调用。 */
+void server_mem_diag(void);
 bool request_exceeds_context(const request *r, int ctx_size);
 bool http_error_context_length_exceeded(int fd, bool enable_cors, const request *r, int n_prompt_tokens, int ctx_size);
 bool serve_chat_page(int fd, bool enable_cors, const char *path);

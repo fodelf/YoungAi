@@ -93,4 +93,7 @@ void mon_hw_static_read(mon_hw_static *st);
 void mon_hw_sample(mon_hw_now *now, const mon_hw_static *st);
 void mon_hw_start(struct server_monitor *m);
 void mon_hw_stop(struct server_monitor *m);
+/* NVML compute-app 显存读数(Linux): 最多 cap 个, 返回条数; 无 NVML/Mac = 0。统一内存机器上
+ * GPU 占用就是整机内存的真值 —— 普通 ps RSS 看不到; 内存准入失败时诊断用。 */
+int mon_hw_compute_apps(unsigned *pids, unsigned long long *gpu_bytes, int cap);
 #endif /* DS4_SERVER_MONITOR_H */

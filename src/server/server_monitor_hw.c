@@ -67,12 +67,14 @@ static void mac_ram(double *used, double *total) {
 #include <dlfcn.h>
 typedef struct { unsigned gpu, memory; } nvml_util_t;
 typedef struct { unsigned long long total, free, used; } nvml_mem_t;
+typedef struct { unsigned pid; unsigned long long usedGpuMemory; unsigned gpuInstanceId, computeInstanceId; } nvml_proc_v2_t;
 static struct {
     void *lib, *dev; int tried, ok; unsigned count; char name[128];
     int (*util)(void *, nvml_util_t *); int (*mem)(void *, nvml_mem_t *);
     int (*temp)(void *, unsigned, unsigned *); int (*pcie_tp)(void *, unsigned, unsigned *);
     int (*power)(void *, unsigned *); int (*plimit)(void *, unsigned *);
     int (*pcie_gen)(void *, unsigned *); int (*pcie_gen_max)(void *, unsigned *); int (*pcie_width)(void *, unsigned *);
+    int (*procs)(void *, unsigned *, nvml_proc_v2_t *);
 } g_nvml;
 #define NVML_SYM(field, name) do { *(void **)(&g_nvml.field) = dlsym(g_nvml.lib, name); } while (0)
 
@@ -95,6 +97,9 @@ static int nvml_open(void) {
     NVML_SYM(power, "nvmlDeviceGetPowerUsage"); NVML_SYM(plimit, "nvmlDeviceGetEnforcedPowerLimit");
     NVML_SYM(pcie_gen, "nvmlDeviceGetCurrPcieLinkGeneration"); NVML_SYM(pcie_gen_max, "nvmlDeviceGetMaxPcieLinkGeneration");
     NVML_SYM(pcie_width, "nvmlDeviceGetCurrPcieLinkWidth");
+    /* compute-app 显存: GB10 统一内存的真占用不在 ps RSS; v3(进程 struct v2), 老驱动退回 v2 */
+    NVML_SYM(procs, "nvmlDeviceGetComputeRunningProcesses_v3");
+    if (!g_nvml.procs) *(void **)(&g_nvml.procs) = dlsym(g_nvml.lib, "nvmlDeviceGetComputeRunningProcesses_v2");
     g_nvml.ok = 1;
     return 1;
 }
@@ -294,6 +299,16 @@ static void *sampler_main(void *arg) {
         if (stop) break;
     }
     return NULL;
+}
+
+int mon_hw_compute_apps(unsigned *pids, unsigned long long *gpu_bytes, int cap) {
+    if (!pids || !gpu_bytes || cap <= 0 || !nvml_open() || !g_nvml.procs) return 0;
+    nvml_proc_v2_t p[64]; const int want = cap < 64 ? cap : 64;
+    unsigned count = (unsigned)want;
+    if (g_nvml.procs(g_nvml.dev, &count, p) != 0 || count > (unsigned)want) return 0;
+    int n = 0;
+    for (unsigned i = 0; i < count; i++) { pids[n] = p[i].pid; gpu_bytes[n] = p[i].usedGpuMemory; n++; }
+    return n;
 }
 
 void mon_hw_start(struct server_monitor *m) {

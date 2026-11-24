@@ -56,6 +56,7 @@ static bool sched_prefill(server *s, v41_lane *P, int *nl, int n_dec, double *t_
         const uint64_t peak_mb = (ds4_v41_req_prefill_bytes(g->prompt_tokens) + ds4_v41_images_bytes(j->req.images)) >> 20;
         if (avail >= 0 && (uint64_t)avail < 2u * peak_mb) {
             if (n_dec > 0) return false;   /* 等解码道退出腾内存 */
+            server_mem_diag();   /* 同上: 归属读数先落, 不只报公式 */
             server_log(DS4_LOG_DEFAULT, "ds4-server: %s ctx=%s 预填要 %llu MB 峰值(准入 2 倍), 余量只有 %ld MB, 装不下",
                        j->req.kind == REQ_CHAT ? "chat" : "completion", g->ctx_span, (unsigned long long)peak_mb, avail);
             lane_finish(P, 1); (*nl)--;   /* rc≠0 且没出过 token = 预填失败响应 */
