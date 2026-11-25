@@ -5,7 +5,7 @@
 #ifndef DS4_NO_GPU
 
 bool pt_frozen_vq_load(const pt_cfg *c) {
-    const char *ed = c->vq_init[0] ? c->vq_init : c->init;
+    const char *ed = c->init[0] ? c->init : c->vq_init;
     if (!c->vq_nl && ed[0] && v41_exit_load(ed, NULL) < 0) return false;
     if (c->vq_nl || !c->vq_init[0]) return true;
     if (!c->teacher_fp[0] || c->sample_n) {
