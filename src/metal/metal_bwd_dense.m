@@ -45,6 +45,7 @@ int ds4_gpu_bwd_grouped_matmul_t_tensor(ds4_gpu_tensor *gheads, const void *mode
 }
 /* 尾权(ds4_gpu_bwd.h): Metal 的 KL 核没接按行自加权 —— 开了就拒, 不许静默按全 1 跑(V 步只在 CUDA 上跑) */
 int ds4_gpu_bwd_kl_tail(float tau, float cap) { (void)cap; return tau > 0.f ? 0 : 1; }
+int ds4_gpu_bwd_kl_margin(float lam, float p1, float gap) { (void)p1; (void)gap; return lam > 0.f ? 0 : 1; }   /* 同上: Metal 的 KL 核没接边际项, 开了就拒 */
 int ds4_gpu_bwd_kl_topk_tensor(ds4_gpu_tensor *glogits, ds4_gpu_tensor *loss, const ds4_gpu_tensor *logits, uint32_t row0, uint32_t m, uint32_t n_vocab,
                                const ds4_gpu_tensor *tid, const ds4_gpu_tensor *tp, const ds4_gpu_tensor *trest, const ds4_gpu_tensor *w, uint32_t k, float scale) {
     if (!glogits || !loss || !logits || !tid || !tp || !trest || m == 0 || k == 0 || k > 128u || n_vocab > 4096u * 32u) return 0;

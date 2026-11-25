@@ -295,3 +295,16 @@ int ds4_gpu_v41_amp_apply_tensor(ds4_gpu_tensor *y, const ds4_gpu_tensor *x, con
     if (!v41_sgemm(x, D, 0, B, D, 1, T, K, n_tok, K, D, 1.0f, 0.0f, "v41 amp T=xB")) return 0;
     return v41_sgemm(T, K, 0, A, D, 0, y, D, n_tok, D, K, 1.0f, 1.0f, "v41 amp y+=TA");
 }
+int ds4_gpu_v41_exit_delta_h_tensor(ds4_gpu_tensor *dh, ds4_gpu_tensor *T, const ds4_gpu_tensor *x,
+                                    const ds4_gpu_tensor *dg, const ds4_gpu_tensor *A, const ds4_gpu_tensor *B,
+                                    uint32_t n_tok, uint32_t D, uint32_t K) {
+    if (!dh || !x || n_tok == 0 || D == 0) return 0;
+    const uint64_t tot = (uint64_t)n_tok * D;
+    if (ds4_gpu_tensor_bytes(dh) < tot * 4 || ds4_gpu_tensor_bytes(x) < tot * 4 || (dg && ds4_gpu_tensor_bytes(dg) < (uint64_t)D * 4)) return 0;
+    v41_n_args a = { n_tok, D, dg ? 1u : 0u, 0, 0, 0, 0, 0 };
+    const ds4_gpu_tensor *dg_bind = dg ? dg : x;
+    v41_bind b[] = { V41_A(a), V41_T(dh), V41_T(x), V41_T(dg_bind) };
+    if (!v41_launch_1d("kernel_v41_exit_diag", b, 4, tot)) return 0;
+    if (K > 0u) return ds4_gpu_v41_amp_apply_tensor(dh, x, A, B, T, n_tok, D, K);
+    return 1;
+}

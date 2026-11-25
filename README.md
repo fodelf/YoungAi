@@ -78,8 +78,8 @@ Spark, Metal on the Mac, one Makefile, no third-party libraries linked.
 
 ## The model
 
-A 113.6 GB base plus a 145 MB restore sidecar and a 13 MB index patch picks the same next token as the 510 GB original
-weights (Same top) **85.2%** of the time on code:
+A 113.6 GB base plus a 145 MB restore sidecar and a 490 MB post-training package picks the same next token as the 510 GB original
+weights (Same top) **86.0%** of the time on code:
 
 | | Size | Code | General English |
 |---|---:|---:|---:|
@@ -87,7 +87,8 @@ weights (Same top) **85.2%** of the time on code:
 | ① + ② code sidecar | + 41 MB | 82.0% | 79.7% |
 | ① + ② + ③ post-training | + 101 MB | 84.8% | 82.4% |
 | ① + restore sidecar | + 145 MB | 85.1% | **82.2%** |
-| **① + restore sidecar + index patch (default on the Spark)** | **+ 13 MB** | **85.2%** | 81.6% |
+| ① + restore sidecar + index patch | + 13 MB | 85.2% | 81.6% |
+| **① + restore sidecar + exit-restored post-training (default on the Spark)** | **+ 490 MB** | **86.0%** | 81.2% |
 
 "Same" means that on the same text, our model and the original rank the same token first; code is 15,360 held-out
 tokens across 30 languages, general English is WikiText-2. Mean KL per row, what the index patch is, and the full tables:
@@ -110,7 +111,7 @@ tokens across 30 languages, general English is WikiText-2. Mean KL per row, what
 **The restore sidecar** puts both pieces in one directory: gains and router biases like ② (40 MB), a rank-64 correction
 like ③ (105 MB). Its correction keeps learning from source files the official API writes fresh. No training text shares a
 16-token stretch with either ruler, apart from two lines of Dockerfile boilerplate. Pass the directory to
-`ds4-server --zchain`; the index patch (`posttrain-restore-20261103`) goes on top with `--posttrain`.
+`ds4-server --zchain`; the exit-restored post-training package (`posttrain-restore-20261125`) goes on top with `--posttrain`.
 
 Context is 1M tokens; the full KV cache is 0.89 GB. Method and full tables: [technical notes §5](docs/TECHNICAL.md#5-results);
 how the post-training file is made: [§4.3](docs/TECHNICAL.md#43-the-post-training-file).

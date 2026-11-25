@@ -349,6 +349,10 @@ int ds4_gpu_v41_engram_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *ra
  * 两发 cuBLAS Sgemm: T = x·B, y += T·A(f32 累加进 y; 调用方随后舍 bf16)。 */
 int ds4_gpu_v41_amp_apply_tensor(ds4_gpu_tensor *y, const ds4_gpu_tensor *x, const ds4_gpu_tensor *A, const ds4_gpu_tensor *B,
                                  ds4_gpu_tensor *T, uint32_t n_tok, uint32_t D, uint32_t K);
+/* 出口平滑补偿(core_v41_exit.c): dh[n][D] = (dg ? x ⊙ dg : 0) + (K > 0 ? (x·B)·A : 0), IEEE f32 累加。 */
+int ds4_gpu_v41_exit_delta_h_tensor(ds4_gpu_tensor *dh, ds4_gpu_tensor *T, const ds4_gpu_tensor *x,
+                                    const ds4_gpu_tensor *dg, const ds4_gpu_tensor *A, const ds4_gpu_tensor *B,
+                                    uint32_t n_tok, uint32_t D, uint32_t K);
 /* 带路由的放大器(10-29 段 B 试验件, src/cuda/cuda_amp_route.inc.cu): y += ((x·B) ⊙ u)·A, u[t][k] = 1 + Σ_j rw[t][j]·S[sel[t][j]][k];
  * S [NE][K] f32(每个专家一组秩系数), sel/rw = 本层路由 [n][NU](int32 / f32)。S = 0 与上面同一个函数。Metal 未实现(报错返回 0)。 */
 int ds4_gpu_v41_amp_route_apply_tensor(ds4_gpu_tensor *y, const ds4_gpu_tensor *x, const ds4_gpu_tensor *A, const ds4_gpu_tensor *B,

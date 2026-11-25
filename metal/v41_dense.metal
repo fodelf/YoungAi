@@ -461,3 +461,10 @@ kernel void kernel_v41_lowrank_y(constant v41_n_args &a [[buffer(0)]], device fl
     for (uint k = 0; k < K; k++) s += tr[k] * A[(ulong)k * D + d];
     y[(ulong)r * D + d] += s;
 }
+kernel void kernel_v41_exit_diag(constant v41_n_args &a [[buffer(0)]], device float *dh [[buffer(1)]],
+                                 device const float *x [[buffer(2)]], device const float *dg [[buffer(3)]],
+                                 uint i [[thread_position_in_grid]]) {
+    const ulong tot = (ulong)a.n0 * a.n1;
+    if ((ulong)i >= tot) return;
+    dh[i] = a.n2 ? (x[i] * dg[i % a.n1]) : 0.0f;
+}

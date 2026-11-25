@@ -11,6 +11,7 @@
  * fp4 文件不会报错(长度校验之外), 只会把码字当浮点位型解出一堆垃圾, 挂上去照跑, 出的是"一眼合理"的假账。
  * 解出来一律是 f32 上设备: 省的是磁盘与解码带宽, GEMM 仍走 f32(K≤512 的两发小 GEMM 不是瓶颈)。 */
 #include "core_internal.h"
+#include "core_v41_exit.h"
 #include "../common/ds4_quantfmt.h"
 #include "../common/ds4_float.h"
 #include "../common/ds4_gr_fnv.h"   /* 指纹算法: 引擎核对与解算器落盘共用一份 */
@@ -201,6 +202,7 @@ int v41_amp_adopt(ds4_v41_state *st, uint32_t lo, uint32_t hi) {
 
 /* 裸底座: 两张进程级表全卸 + 缓存丢掉。★gr 也要卸★: 以前只卸 rb, 从"挂 ②③"切到"不挂"时上一套的增益覆盖还留在设备上, 裸底座不裸 */
 void v41_plugins_clear_all(void) {
+    v41_exit_clear();
     (void)v41_rb_load(NULL);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) (void)ds4_gpu_v41_set_gr_override(il, NULL, 0, 0);
     v41_amp_cache_drop();
@@ -369,8 +371,10 @@ bool v41_amp_load(ds4_v41_state *st, const char *dir, const char *pt_dir) {
     }
     const int n_vq = v41_vqpatch_load(pt_dir);   /* V 步索引补丁(core_v41_vqpatch.c): 先还原上一组再装这一组; 挂不上就停 */
     if (n_vq < 0) { g_pc.valid = 1; v41_amp_cache_drop(); return false; }
-    /* 只有增益覆盖/路由偏置、没有低秩放大器也是合法的一种插件(权重侧反修与后训练的产物都长这样); 只有索引补丁的 ③ 同样合法 */
-    if (!n_arm && n_gr <= 0 && n_rb <= 0 && n_vq <= 0) {
+    const int n_ex = v41_exit_load(pt_dir, &mb);
+    if (n_ex < 0) { g_pc.valid = 1; v41_amp_cache_drop(); return false; }
+    /* 只有增益覆盖/路由偏置、没有低秩放大器也是合法的一种插件(权重侧反修与后训练的产物都长这样); 只有索引补丁/出口补偿的 ③ 同样合法 */
+    if (!n_arm && n_gr <= 0 && n_rb <= 0 && n_vq <= 0 && n_ex <= 0) {
         fprintf(stderr, "ds4: 目录里既没有 amp_Lnn.bin 也没有 gr_Lnn.bin / rb_Lnn.bin(反修 %s / 后训练 %s)\n",
                 dir && dir[0] ? dir : "(无)", pt_dir && pt_dir[0] ? pt_dir : "(无)");
         return false;

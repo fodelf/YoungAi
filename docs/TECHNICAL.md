@@ -677,13 +677,25 @@ the restore sidecar it sits on (85.07% / 0.227 / 82.2%):
 | Code judge slice, 15,360 | **85.16%** | 0.838 | 0.2238 | 184 / 629 (sidecar 177 / 634) |
 | WikiText-2, 512 | 81.64% | 0.780 | 0.572 | |
 
-It is what the Spark runs by default since Nov 3 (`serve_pick.txt` carries the `--posttrain` line): code KL −1.4%,
+It was what the Spark ran by default from Nov 3 (`serve_pick.txt` carries the `--posttrain` line): code KL −1.4%,
 general English −0.6 pp (3 of 512 tokens). We pick versions by the code ruler and only report general English, with
 80% as the floor it may not cross.
 
+**Exit-restored post-training package** (repository directory `posttrain-restore-20261125`, 490.1 MB, default on the Spark
+since Nov 25): pairs the 40-layer rank-64 MoE correction (104.9 MB) and the layers 10–29 index patch (12.6 MB) with an
+`FP4x32` residual of the factory `BF16` output head minus `q4_K` (`head_fp4.bin`, 351.6 MB, recovering 98.8% of `lm_head`
+quantization variance with zero downstream MoE routing churn) plus a calibrated `FP32` exit adapter (`exit_ctrl.bin`,
+21.0 MB, `alpha_head = 0.27`):
+
+| | Same top-1 | Σmin | Mean KL | PPL ratio |
+|---|---:|---:|---:|---:|
+| Code judge slice, 15,360 | **86.04%** | **0.850** | **0.2060** | 1.079 |
+| WikiText-2, 512 | 81.25% | **0.794** | **0.551** | **1.242** |
+
 **The ladder in the README table**, same two rulers (Same top-1 / mean KL): base 78.4% / 0.446 on code and 76.8% / 0.803
 on WikiText-2; + code sidecar 82.0% / 0.318 and 79.7% / 0.673; + post-training file 84.8% / 0.230 and 82.4% / 0.574;
-restore sidecar 85.1% / 0.227 and 82.2% / 0.590; restore sidecar + index patch 85.2% / 0.224 and 81.6% / 0.572. Against
+restore sidecar 85.1% / 0.227 and 82.2% / 0.590; restore sidecar + index patch 85.2% / 0.224 and 81.6% / 0.572;
+restore sidecar + exit-restored post-training 86.0% / 0.206 and 81.2% / 0.551. Against
 ② + ③ the restore sidecar is ahead on code Same top and level on code KL; on general English it is 0.2 pp lower (1 of 512
 tokens).
 

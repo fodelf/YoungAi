@@ -104,7 +104,7 @@ CORE_ENGINE_OBJS := $(CORE_ENGINE_SRCS:.c=.o)
 CORE_ENGINE_CPU_OBJS := $(CORE_ENGINE_SRCS:.c=_cpu.o)
 
 # src/common 共享格式库(纯主机 C, 无 GPU 引用 — 全部构建共用一个 .o)
-COMMON_FMT_OBJS := src/common/ds4_quantfmt.o src/common/ds4_json.o src/common/ds4_pretok.o
+COMMON_FMT_OBJS := src/common/ds4_quantfmt.o src/common/ds4_json.o src/common/ds4_pretok.o src/common/ds4_sha256.o
 # 模型模块(src/model/, 总纲 docs/modules.md): 模型子进程起停 + 模型清单/侧车 + 后训练作业与选轮 + /api/train|models 路由; ds4-server 与 ds4-train 共用。
 # 要在 ds4-server 的依赖行之前定义 —— 依赖列表在解析时就展开, 定义在后面 Linux 那条 $^ 就是空的(10-10 实撞)
 MODEL_OBJS := src/model/model_api.o src/model/model_train_runs.o src/model/model_proc.o src/model/model_catalog.o \

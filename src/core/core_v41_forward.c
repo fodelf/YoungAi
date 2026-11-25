@@ -7,6 +7,7 @@
  * 末层后 hc_pre(pre_mix) → norm → head。bf16 舍入点跟官方 dtype 流走(见 ds4_gpu_v41.h 头注释)。
  * 出口(--score-ids/生成)在 core_v41_api.c。 */
 #include "core_internal.h"
+#include "core_v41_exit.h"
 #include "src/common/ds4_quantfmt.h"   /* DS4_GGT_*: 路由 gate 在盘上是 f32 还是 bf16, 按登记类型认 */
 #ifndef DS4_NO_GPU
 
@@ -371,10 +372,12 @@ bool v41_forward_body(ds4_engine *e, ds4_v41_state *st) {
          * (与之后每一步解码同一条核路) —— 首个生成 token 的 logits 从"预填精度"变成"解码精度", 判据是文本/五指标, 不是 cmp。 */
         if (!ds4_gpu_tensor_copy(st->xlast, 0, st->xn, (uint64_t)(n - 1u) * E * 4, (uint64_t)E * 4)) return false;
         if (!v41_tproj(&e->model, st->logits, e->weights.output, E, DS4_N_VOCAB, st->xlast, 1, 0)) return false;
+        if (!st->draft && v41_exit_active() && !v41_exit_apply(&e->model, e->weights.output, st->logits, st->xlast, 1u)) return false;
         st->last_logit_row = 0;
     } else {
         if (n > st->logits_rows) { fprintf(stderr, "ds4: V4.1 出口要 %u 行 logits, 缓冲只开了 %u 行\n", n, st->logits_rows); return false; }
         if (!v41_tproj(&e->model, st->logits, e->weights.output, E, DS4_N_VOCAB, st->xn, n, 0)) return false;
+        if (!st->draft && v41_exit_active() && !v41_exit_apply(&e->model, e->weights.output, st->logits, st->xn, n)) return false;
         st->last_logit_row = n - 1u;
     }
     if (g_ds4_v41_prof) {   /* 逐层毫秒: 一眼看出哪层在吃时间(engram 层 L1/L14, 源层 L2/8/14/20, 候选层 L20) */

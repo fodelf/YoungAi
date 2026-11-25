@@ -8,6 +8,7 @@
  * 多层模式逐层重算并穿过注意力/MoE, 在 core_ptrain_layer.c, 本文件的出口段不变。 */
 #include "core_ptrain.h"
 #include "core_ptrain_split.h"
+#include "core_v41_exit.h"
 #include "../common/ds4_gr_fnv.h"
 #include <sys/stat.h>
 #ifndef DS4_NO_GPU
@@ -153,7 +154,7 @@ bool pt_loss_rows(const pt_cfg *c, pt_run *r, ds4_gpu_tensor *logits, uint32_t r
 bool pt_step_sample(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_sample *s, int grad, double *loss_sum, uint32_t *ntok) {
     ds4_v41_state *st = &r->st;
     const ds4_model *mdl = &e->model;
-    const uint32_t E = DS4_N_EMBD, HC = DS4_N_HC, V = DS4_N_VOCAB, K = r->K, cap = st->cap_tok;
+    const uint32_t E = DS4_N_EMBD, HC = DS4_N_HC, K = r->K, cap = st->cap_tok;
     if (!pt_runnable(r, s)) return true;   /* 教师没给表(续算块超长)/ 超出 ctxlen / 非 one-hot 的长题不进 */
     /* ★前缀形态(10-25, core_ptrain.h pt_cfg.ctxlen)★: sn > cap 的 one-hot 样本, 前 pfx 位只做普通预填(全部层都跑 —— 解码器层的窗口也要前缀键;
      * 不存档、不反传、出口只算末行), 最后 n 位存档 + 反传。pfx 对齐到最大压缩比(pt_pfx_align): 组界不跨前缀/尾窗。
@@ -207,7 +208,7 @@ bool pt_step_sample(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_sample *
         /* 多层: 出口梯度铺回整段(答案位以外的行为 0) → RMSNorm → hc_pre 得末层输出处的 g_hc / g_pre, 再逐层往下 */
         ds4_gpu_tensor *gv = pt_rows(r->gxn, r0, m, E);
         ok = gv && ds4_gpu_tensor_fill_f32(r->gxn, 0.f, (uint64_t)n * E) &&
-             ds4_gpu_bwd_matmul_t_tensor(gv, mdl->map, mdl->size, e->weights.output->type, e->weights.output->abs_offset, E, V, glog, m, 0) &&
+             v41_exit_bwd_proj(mdl, e->weights.output, gv, glog, m) &&
              ds4_gpu_bwd_rms_norm_tensor(r->gx, r->gxn, st->x, mdl->map, mdl->size, e->weights.output_norm->abs_offset, E, n, DS4_RMS_EPS, 0) &&
              ds4_gpu_tensor_fill_f32(r->ghc, 0.f, (uint64_t)n * HC * E) &&
              ds4_gpu_bwd_hc_pre_tensor(r->ghc, r->gpre, r->gx, st->hc, st->pre_mix, E, HC, n);
@@ -221,7 +222,7 @@ bool pt_step_sample(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_sample *
         ds4_gpu_tensor *pre = pt_rows(st->pre_mix, r0, m, HC), *post = pt_rows(st->post, r0, m, HC), *comb = pt_rows(st->comb, r0, m, (uint64_t)HC * HC);
         ds4_gpu_tensor *y = pt_rows(st->y, r0, m, E), *xin = pt_rows(r->save.moe_in[il], r0, m, E);
         ok = x && hc && hcm && pre && post && comb && y && xin &&
-             ds4_gpu_bwd_matmul_t_tensor(r->gxn, mdl->map, mdl->size, e->weights.output->type, e->weights.output->abs_offset, E, V, glog, m, 0) &&
+             v41_exit_bwd_proj(mdl, e->weights.output, r->gxn, glog, m) &&
              ds4_gpu_bwd_rms_norm_tensor(r->gx, r->gxn, x, mdl->map, mdl->size, e->weights.output_norm->abs_offset, E, m, DS4_RMS_EPS, 0) &&
              ds4_gpu_tensor_fill_f32(r->ghc, 0.f, (uint64_t)m * HC * E) &&
              ds4_gpu_bwd_hc_pre_tensor(r->ghc, r->gpre, r->gx, hc, pre, E, HC, m) &&

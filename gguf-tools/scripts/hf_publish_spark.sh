@@ -77,10 +77,10 @@ PT_ZD="$V41/DeepSeek-V4.1-Flash-1017-vq8sh14-q4k-mtpnative-grrb-code_fit_n15360-
 # 还原侧车(spark 默认挂的那份: ② 式增益 + ③ 式秩 64 修正一个目录, 修正之后按轮向官方 API 学, 见 restore_B_api_round_spark.sh)。
 # 不在 install.sh 的 sidecar_of 表里(--domain 选不到), 用户靠 install.sh "除分块外整仓下载"拿到, 传 ds4-server --zchain 用
 RS_NAME="DeepSeek-V4.1-Flash-1017-vq8sh14-q4k-mtpnative-grrb-restore_fit_n15360-engine"
-# 索引补丁 ③(11-03, V 步 core_ptrain_vstep.c 的产物, 叠在还原侧车上): 仓库目录名与本机源目录(选中的 ckpt)只在这两行; 换一版补丁只改这里 + README 的表。
+# 还原配对后训练包 ③(11-25, Round 126 pt-vl126/candidate: L0-39 秩 64 amp + L10-29 V 步索引补丁 + BF16 出口头 FP4x32 残差 head_fp4.bin + 平滑出口补偿 exit_ctrl.bin, 490.08 MB):
 # 用户用法写在 README: ds4-server --zchain <还原侧车> --posttrain <这个目录>; install.sh 的 --posttrain 仍是配编程侧车的那份 ③, 这份不进它
-VQ_NAME="posttrain-restore-20261103"
-VQ_SRC="$V41/posttrain/vstep-v17/ckpt_v04"
+VQ_NAME="posttrain-restore-20261125"
+VQ_SRC="$V41/posttrain/pt-vl126/candidate"
 pt_sidecar(){ sed -n "s/^ *$PT_DOMAIN) *echo \"\(DeepSeek-[^\"]*-engine\)\";;\$/\1/p" "$INSTALL"; }   # POSTTRAIN_DOMAIN 在仓库里的侧车目录名
 BASE_HF="$ROOT/hf/$(ins_var BASE_REPO | sed 's#.*/##')"   # 出厂权重目录 = BASE_REPO 斜杠后半截(LICENSE-DeepSeek 从这里拷)
 STAGE="$ROOT/gguf/hf_upload/${REPO#*/}"
@@ -443,33 +443,37 @@ case "$CMD" in
         || { tail -c 600 "$PLOG" | tr '\r' '\n' | grep -v '^\s*$' | tail -5; die "$RS_NAME 上传失败(完整输出 $PLOG; 重跑同一条就是续传)"; }
     remote_same "$RS_NAME" "$D" || die "传完远端与本机仍不逐字节同(远端多出旧文件? 看上一行)"
     LOG "RESTORE_DONE $(( $(date +%s) - t0 ))s https://huggingface.co/$REPO/tree/main/$RS_NAME";;
-  vqpatch)   # 索引补丁 ③: 见头注释。指纹(base.fnv)只对 ② 的 gr 层文件算 ⇒ 远端还原侧车的 gr_L*.bin 必须与本机逐字节同, 否则用户挂上两分钟后停车
+  vqpatch|ptrestore)   # 还原配对后训练包 ③: 指纹(base.fnv)只对 ② 的 gr 层文件算 ⇒ 远端还原侧车的 gr_L*.bin 必须与本机逐字节同, 否则用户挂上两分钟后停车
     need_login
     n=$(ls "$VQ_SRC"/vqpatch_L[0-9][0-9].bin 2>/dev/null | wc -l | tr -d ' ')
-    [ "$n" -gt 0 ] && [ -s "$VQ_SRC/base.fnv" ] || die "索引补丁源 $VQ_SRC 不齐(vqpatch_Lnn.bin $n 个, base.fnv $( [ -s "$VQ_SRC/base.fnv" ] && echo 有 || echo 缺))"
+    na=$(ls "$VQ_SRC"/amp_L[0-9][0-9].bin 2>/dev/null | wc -l | tr -d ' ')
+    [ "$n" -gt 0 ] && [ -s "$VQ_SRC/base.fnv" ] || die "后训练源 $VQ_SRC 不齐(vqpatch_Lnn.bin $n 个, base.fnv $( [ -s "$VQ_SRC/base.fnv" ] && echo 有 || echo 缺))"
     remote_same "$RS_NAME" "$V41/$RS_NAME" 'gr_L*.bin' || die "远端还原侧车的 gr 层文件与本机 $V41/$RS_NAME 不同: 补丁的指纹对不上, 先发对的还原侧车(restore)"
     D="$STAGE/$VQ_NAME"; rm -rf "$D"; mkdir -p "$D" && ln -f "$VQ_SRC"/vqpatch_L[0-9][0-9].bin "$VQ_SRC/base.fnv" "$D/" || die "摆 $D 失败"
+    [ "$na" -gt 0 ] && { ln -f "$VQ_SRC"/amp_L[0-9][0-9].bin "$D/" || die "摆 amp_L*.bin 失败"; }
+    for xf in head_fp4.bin exit_ctrl.bin; do [ -s "$VQ_SRC/$xf" ] && { ln -f "$VQ_SRC/$xf" "$D/" || die "摆 $xf 失败"; }; done
     if remote_same "$VQ_NAME" "$D"; then LOG "远端 $VQ_NAME 已与本机逐字节同, 跳过"; exit 0; fi
-    t0=$(date +%s); LOG "$VQ_NAME ($n 层补丁 + base.fnv, $(du -sb "$D" | cut -f1) B) ← $VQ_SRC"
+    t0=$(date +%s); LOG "$VQ_NAME (amp $na 层 + 补丁 $n 层 + 出口件, $(du -sb "$D" 2>/dev/null | cut -f1 || du -sk "$D" | cut -f1) B) ← $VQ_SRC"
     run_with_stall_guard "$STALL_S" "$PLOG" ${NOXET[@]+"${NOXET[@]}"} "$HF" upload "$REPO" "$D" "$VQ_NAME" --repo-type model \
-        --commit-message "Index patch for the restore sidecar: 787,503 expert weight groups in layers 10-29 re-pick their codeword (no weight values added); load with ds4-server --zchain <restore sidecar> --posttrain $VQ_NAME" \
+        --commit-message "Restore post-training package ($VQ_NAME, <500 MB): 40-layer rank-64 MoE correction + L10-29 index patch + BF16 lm_head FP4x32 residual & smooth exit control (86.04% Same top on code); load with ds4-server --zchain <restore sidecar> --posttrain $VQ_NAME" \
         || { tail -c 600 "$PLOG" | tr '\r' '\n' | grep -v '^\s*$' | tail -5; die "$VQ_NAME 上传失败(完整输出 $PLOG; 重跑同一条就是续传)"; }
     remote_same "$VQ_NAME" "$D" || die "传完远端与本机仍不逐字节同(看上一行)"
     LOG "VQPATCH_DONE $(( $(date +%s) - t0 ))s https://huggingface.co/$REPO/tree/main/$VQ_NAME";;
-  bin)   # 只发两个二进制: 见头注释。能挂索引补丁的二进制才发 —— 装载路的日志字串在二进制里(core_v41_vqpatch.c), 旧二进制没有
+  bin)   # 只发两个二进制: 见头注释。能挂索引补丁与出口残差的二进制才发 —— 装载路的日志字串在二进制里, 旧二进制没有
     need_login
     [ "$(uname -m)" = aarch64 ] || die "bin/ 是 spark(aarch64 CUDA)的二进制, 在 spark 上跑"
     for b in ds4 ds4-server; do
         [ -s "$ROOT/$b" ] || die "缺 $ROOT/$b"
         h=$("$ROOT/$b" --help 2>&1); case "$h" in *--engram-dir*) ;; *) die "$ROOT/$b 不认 --engram-dir, 先 make cuda-spark";; esac
         grep -q -a '反修·V步补丁' "$ROOT/$b" || die "$ROOT/$b 没有索引补丁装载路(core_v41_vqpatch.c), 先 make cuda-spark"
+        grep -q -a '\[pt124\] loaded' "$ROOT/$b" || die "$ROOT/$b 没有出口残差装载路(core_v41_exit.c), 先 make cuda-spark"
     done
     h=$("$ROOT/ds4-server" --help 2>&1); case "$h" in *--vision-gguf*) ;; *) die "$ROOT/ds4-server 不认 --vision-gguf, 先 make cuda-spark";; esac
     mkdir -p "$STAGE/bin" && cp -f "$ROOT/ds4" "$ROOT/ds4-server" "$STAGE/bin/" || die "摆 $STAGE/bin 失败"
     if remote_same bin "$STAGE/bin"; then LOG "远端 bin/ 已与本机逐字节同, 跳过"; exit 0; fi
     t0=$(date +%s); LOG "bin/ds4 + bin/ds4-server ($(du -sb "$STAGE/bin" | cut -f1) B)"
     run_with_stall_guard "$STALL_S" "$PLOG" ${NOXET[@]+"${NOXET[@]}"} "$HF" upload "$REPO" "$STAGE/bin" bin --repo-type model \
-        --commit-message "aarch64 CUDA binaries ds4 / ds4-server: load the index patch (--posttrain on a directory of vqpatch_Lnn.bin)" \
+        --commit-message "aarch64 CUDA binaries ds4 / ds4-server: support head_fp4.bin + exit_ctrl.bin + vqpatch_Lnn.bin in --posttrain ($VQ_NAME)" \
         || { tail -c 600 "$PLOG" | tr '\r' '\n' | grep -v '^\s*$' | tail -5; die "bin/ 上传失败(完整输出 $PLOG; 重跑同一条就是续传)"; }
     remote_same bin "$STAGE/bin" || die "传完远端与本机仍不逐字节同(看上一行)"
     LOG "BIN_DONE $(( $(date +%s) - t0 ))s https://huggingface.co/$REPO/tree/main/bin";;

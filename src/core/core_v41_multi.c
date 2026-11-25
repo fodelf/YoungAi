@@ -11,6 +11,7 @@
  * ⇒ 整步捕成 CUDA graph(core_v41_mgraph.c): 前向主体 v41_multi_body 直发与捕获共用, 捕获时各路按"设备位置"口径(st->graph=1), 各道的分支由图执行器并行跑。
  * 门 = 温 0 下每路输出与单请求路逐字节同(fable5 09-30)。 */
 #include "core_internal.h"
+#include "core_v41_exit.h"
 #ifndef DS4_NO_GPU
 
 int g_ds4_v41_lanes = 1;   /* 合批缓存段按路分流(默认开); --no-lanes 关掉只作 A/B(输出逐字节同, 只是发法) */
@@ -137,6 +138,7 @@ bool v41_multi_body(ds4_engine *e, ds4_v41_batch *b, ds4_v41_state **m, const ui
     if (ok && !ds4_gpu_v41_hc_pre_tensor(B->x, B->hc, B->pre_mix, E, HC, R)) ok = false;
     if (ok && !ds4_gpu_v41_rms_norm_tensor(B->xn, B->x, md->map, md->size, e->weights.output_norm->abs_offset, E, R, DS4_RMS_EPS)) ok = false;
     if (ok && !v41_tproj(md, B->logits, e->weights.output, E, DS4_N_VOCAB, B->xn, R, 0)) ok = false;
+    if (ok && v41_exit_active() && !v41_exit_apply(md, e->weights.output, B->logits, B->xn, R)) ok = false;
     B->last_logit_row = R - 1u;
     if (prof) {
         tp = mp_tick(&P.exit, tp);

@@ -12,6 +12,7 @@
  *   - 压缩器余行(cpre)与索引中间量从第 r0_i 行切, 压缩行 / 索引键从第 g0_i 组切(前面各题 n_j/ratio 之和) —— 都只写自己那段。
  * 出错会怎样: 视图一重叠, 后算的题盖掉先算的题的 KV, 不报错只出错的注意力 —— 门 = packcheck(同一批题单题路 vs 合批逐题对账)。 */
 #include "core_ptrain.h"
+#include "core_v41_exit.h"
 #ifndef DS4_NO_GPU
 
 static void pt_free_t(ds4_gpu_tensor **t) { if (*t) { ds4_gpu_tensor_free(*t); *t = NULL; } }
@@ -163,7 +164,8 @@ static bool pt_pack_forward(ds4_engine *e, pt_run *r) {
     }
     if (ok) ok = ds4_gpu_v41_hc_pre_tensor(B->x, B->hc, B->pre_mix, E, HC, R) &&
                  ds4_gpu_v41_rms_norm_tensor(B->xn, B->x, md->map, md->size, e->weights.output_norm->abs_offset, E, R, DS4_RMS_EPS) &&
-                 v41_tproj(md, B->logits, e->weights.output, E, DS4_N_VOCAB, B->xn, R, 0);
+                 v41_tproj(md, B->logits, e->weights.output, E, DS4_N_VOCAB, B->xn, R, 0) &&
+                 (!v41_exit_active() || v41_exit_apply(md, e->weights.output, B->logits, B->xn, R));
     if (ok && (ds4_gpu_end_commands() == 0 || ds4_gpu_synchronize() == 0)) ok = false;
     if (!ok) fprintf(stderr, "ds4: [ptrain] 合批前向失败(%u 题 %u 行)\n", pk->nb, R);
     return ok;
@@ -172,7 +174,7 @@ static bool pt_pack_forward(ds4_engine *e, pt_run *r) {
 bool pt_pack_step(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_sample *const *ss, uint32_t nb, int grad, double *loss_each, uint32_t *ntok_each) {
     pt_pack *pk = &r->pk; ds4_v41_state *B = &r->st;
     const ds4_model *mdl = &e->model;
-    const uint32_t E = DS4_N_EMBD, HC = DS4_N_HC, V = DS4_N_VOCAB;
+    const uint32_t E = DS4_N_EMBD, HC = DS4_N_HC;
     if (!pk->ready || !nb || nb > PT_PACK_MAX) return false;
     uint32_t R = 0, gacc[DS4_MAX_LAYER];
     memset(gacc, 0, sizeof gacc);
@@ -202,7 +204,7 @@ bool pt_pack_step(ds4_engine *e, const pt_cfg *c, pt_run *r, const pt_sample *co
         for (uint32_t i = 0; ok && i < nb; i++) {
             const uint32_t m = ss[i]->m - ss[i]->l0, row = pk->r0[i] + ss[i]->sa0 - 1u + ss[i]->l0;
             ds4_gpu_tensor *gv = pt_rows(r->gxn, row, m, E);
-            ok = gv && ds4_gpu_bwd_matmul_t_tensor(gv, mdl->map, mdl->size, e->weights.output->type, e->weights.output->abs_offset, E, V, glog[i], m, 0);
+            ok = gv && v41_exit_bwd_proj(mdl, e->weights.output, gv, glog[i], m);
             if (gv) ds4_gpu_tensor_free(gv);
         }
         if (ok) ok = ds4_gpu_bwd_rms_norm_tensor(r->gx, r->gxn, B->x, mdl->map, mdl->size, e->weights.output_norm->abs_offset, E, R, DS4_RMS_EPS, 0) &&

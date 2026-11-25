@@ -362,3 +362,34 @@ int ds4_gpu_v41_argmax_tensor(ds4_gpu_tensor *idx, const ds4_gpu_tensor *logits,
     v41_argmax_kernel<<<1, 1024, 0, g_cur_stream>>>((int32_t *)idx->ptr, (const float *)logits->ptr + (uint64_t)row * n_vocab, n_vocab);
     return cuda_ok(cudaGetLastError(), "v41 argmax");
 }
+
+__global__ static void v41_exit_diag_kernel(float *dh, const float *x, const float *dg, uint64_t tot, uint32_t D) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < tot) dh[i] = dg ? (x[i] * dg[(uint32_t)(i % D)]) : 0.0f;
+}
+int ds4_gpu_v41_exit_delta_h_tensor(ds4_gpu_tensor *dh, ds4_gpu_tensor *T, const ds4_gpu_tensor *x,
+                                    const ds4_gpu_tensor *dg, const ds4_gpu_tensor *A, const ds4_gpu_tensor *B,
+                                    uint32_t n_tok, uint32_t D, uint32_t K) {
+    if (!dh || !x || !g_cublas_ready || n_tok == 0 || D == 0) return 0;
+    const uint64_t tot = (uint64_t)n_tok * D;
+    if (dh->bytes < tot * 4 || x->bytes < tot * 4 || (dg && dg->bytes < (uint64_t)D * 4)) return 0;
+    v41_exit_diag_kernel<<<(unsigned)((tot + 255u) / 256u), 256, 0, g_cur_stream>>>(
+        (float *)dh->ptr, (const float *)x->ptr, dg ? (const float *)dg->ptr : NULL, tot, D);
+    if (!cuda_ok(cudaGetLastError(), "v41 exit diag")) return 0;
+    if (K > 0u) {
+        if (!A || !B || !T || T->bytes < (uint64_t)n_tok * K * 4) return 0;
+        const float a1 = 1.0f, b0 = 0.0f, b1 = 1.0f;
+        cublasMath_t saved = CUBLAS_DEFAULT_MATH;
+        (void)cublasSetStream(g_cublas, v41_cublas_stream());
+        (void)cublasGetMathMode(g_cublas, &saved);
+        (void)cublasSetMathMode(g_cublas, CUBLAS_DEFAULT_MATH);
+        cublasStatus_t st = cublasSgemm(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)K, (int)n_tok, (int)D, &a1,
+                                        (const float *)B->ptr, (int)D, (const float *)x->ptr, (int)D, &b0, (float *)T->ptr, (int)K);
+        if (st == CUBLAS_STATUS_SUCCESS)
+            st = cublasSgemm(g_cublas, CUBLAS_OP_N, CUBLAS_OP_N, (int)D, (int)n_tok, (int)K, &a1,
+                             (const float *)A->ptr, (int)D, (const float *)T->ptr, (int)K, &b1, (float *)dh->ptr, (int)D);
+        (void)cublasSetMathMode(g_cublas, saved);
+        if (!cublas_ok(st, "v41 exit dh+=TA")) return 0;
+    }
+    return 1;
+}
