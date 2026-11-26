@@ -16198,4 +16198,17 @@ Same是与固定教师首选词一致的位置数，不当成任务成功率；�
     - **通用英文 `WikiText-2 512`**：`418 / 512 = 81.64%`（较 `vl150` `81.45%` 再升 `+0.19 pp`），`Mean KLD = 0.55013`，`Σmin = 0.7948`，`PPL = 2.2365`（比值 `1.246`）。
     - **未见开发集与装载校验**：`heldout6_doc_1024` `4,082 → 4,085 (+3)`（`dh6k = -0.000029`）、`peld_00..03` `5,076 → 5,079 (+3)`、`vqh` `6,330 → 6,326 (-4)`、`TOT = 15,488 → 15,490 (+2)`、`think_val (13,127)` `0.102368 → 0.101760 (-0.000608)`；`DISK_RELOAD_CHECK peld0=1278/1278 kld=0.24603153/0.24603153 PASS`。
     - **Stage B 体积**：**`495,326,500 B`（`495.33 MB < 500,000,000 B`）**，保留 **`4,673,500 B`**（`228` 列 `FP16` 秩余量）供第155轮继续攻关。
-  - **合账与线上发布准备**：已封账 `GROUP_COMPLETE`、写入 `ledger.tsv`（第154行 `接力`）与 `notices.tsv`（`/api/rl/status` `rounds_len=154`、`verdict="relay"`、`running=false`），备份 `*.vl150` 后切换 Spark 线上 `ds4-server`（PID `2790925`）至 `pt-vl154/candidate` 并通过 OpenAI `/v1/chat/completions` HTTP 200 冒烟（`idle queued=0`），同步更新 `README*`、`docs/TECHNICAL*` 与 `hf_publish_spark.sh`。
+  - **合账与线上发布准备**：已封账 `GROUP_COMPLETE`、写入 `ledger.tsv`（第154行 `接力`）与 `notices.tsv`（`/api/rl/status` `rounds_len=154`、`verdict="relay"`、`running=false`），备份 `*.vl150` 后切换 Spark 线上 `ds4-server`（PID `2790925`）至 `pt-vl154/candidate` 并通过 OpenAI `/v1/chat/completions` HTTP 200 冒烟（`idle queued=0`），同步更新 `README*`、`docs/TECHNICAL*` 与 `hf_publish_spark.sh`（Git 提交 `7e3639de` 并推送，HuggingFace `VQPATCH_DONE 52s` `63/63 remote_same` + `DOCS_DONE`）。
+
+## 2026-11-27 凌晨 · 第155轮：30语言零重叠代码拟合与保边际护盾接力突破（13,233 / 15,360 = 86.1523%，Σmin 0.8505，497.62 MB）
+- **核心定位与工程修复**：
+  - **修复 Phase B `d_T` 越界缺陷**：查明第154轮 `p1_shd_f16` 录得 `kld=8.319` 系 `eval_disk_buf` 内 `d_T` 按 `R1` 分配导致当 `R2 > R1` 时写入越界覆盖相邻 `d_z`；本轮在 `pt155_{math,opt,save}.c` 统一按 `PT124_MAX_RANK = 1024` 分配 `d_T`，全部跨子空间候选恢复正常。
+  - **30 语言零 10-gram 重叠 `code/fit` + 干净 `vqhalf_a` + `6,430` 位双代码锚点**：在纯 C 构建覆盖全部 9 份评测集的 10-gram 哈希表，对边界补齐 ±11 token 切窗过滤 `code/fit.ids`（保留 `111/120` 窗 = `14,208` 位纯 30 语言代码）、`restore/fit.ids`（`119/120` 窗 = `15,232` 位）、`vqfin41/vqhalf_a.ids`（`60/64` 窗 = `7,680` 位）及 `sci/graphics/law/med`（`35,712` 位）构成 `72,832` 位零重叠拟合集；开发未见集扩为 `20,766` 位（`peld 6,144 + vqh 8,192 + cdev(heldout6_doc+heldout_probe) 6,430`），并对 `vqh` 设防退步惩罚。
+  - **算子求解与最优配置（`p0_pdr_f16`，`PHASE_COMPLETE rc=0 service=PASS elapsed=2229s`）**：在 `pt-vl154/candidate`（`R1=704, R2=576`）上联合纯 `keep_gap` 保边际护盾 `h1sh`（`+56` 秩）与 `RE75` 冷却 `d2re`（`+56` 秩，占 `R1=760, R2=632`, `exit_ctrl.bin = 28,528,704 B`, `flags = 85`）。
+- **全门实测突破（`pt-vl155/candidate`）**：
+  - **正式主判 `15,360` 位**：`13,230 → 13,233`（**`+3` 位净胜：`+8 / -5`，`86.1328% → 86.1523%`**，一位小数站上 **`86.2%`**，双遍复判 `cmp` 逐字节全同），**`Σmin = 0.8504 → 0.8505`**（精确 `0.85047988`，中位 `0.9182`，链内新高），`Mean KLD = 0.205928746549`（合门 `≤ 0.205940077539 + 0.001`），`PPL = 5.0407`（比值 `1.055`），`RMS Δp(top32) = 2.9513%`。
+  - **全量独立思考留出（`think_hold`）**：`0.0986897030081 → 0.0986736253329`（**再降 `-0.00001608`，再探历史新低**）。
+  - **通用英文 `WikiText-2 512`**：`418 / 512 = 81.64%`（`Σmin = 0.7948`, `Mean KLD = 0.55032`, `PPL = 2.2375` 比值 `1.247`）。
+  - **未见开发集与装载校验**：`cdev = 5,892 → 5,895 (+3)`、`vqh = 6,326 → 6,331 (+5)`、`TOT = 17,297 → 17,301 (+4)`、`kld = 0.251171 → 0.251074 (-0.000097)`、`think_val = 0.101760 → 0.101593 (-0.000166)`；`DISK_RELOAD_CHECK peld0=1277/1277 PASS`。
+  - **Stage B 体积**：**`497,620,260 B`（`497.62 MB < 500,000,000 B`）**，仍保留 **`2,379,740 B`**（`116` 列 `FP16` 秩）供第156轮收敛攻关。
+- **合账与线上切版**：已封账 `GROUP_COMPLETE`、写入 `ledger.tsv`（第155行 `接力`）与 `notices.tsv`（`/api/rl/status` `rounds_len=155`、`verdict="relay"`、`same=86.1523`、`smin=0.8505`），备份 `*.vl154` 后切换 Spark 线上 `ds4-server`（PID `2867472`）至 `pt-vl155/candidate` 并通过 OpenAI `/v1/chat/completions` HTTP 200 冒烟（`idle queued=0`），同步更新 `README*`、`docs/TECHNICAL*` 与 `hf_publish_spark.sh` 并提交推送至 `origin/restructure`。
