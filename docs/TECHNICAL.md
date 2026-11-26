@@ -681,15 +681,16 @@ It was what the Spark ran by default from Nov 3 (`serve_pick.txt` carries the `-
 general English −0.6 pp (3 of 512 tokens). We pick versions by the code ruler and only report general English, with
 80% as the floor it may not cross.
 
-**Exit-restored post-training package** (repository directory `posttrain-restore-20261125`, 490.1 MB, default on the Spark
-since Nov 25): pairs the 40-layer rank-64 MoE correction (104.9 MB) and the layers 10–29 index patch (12.6 MB) with an
+**Exit-restored post-training package** (repository directory `posttrain-restore-20261125`, 495.3 MB, default on the Spark
+since Nov 25, updated Nov 26): pairs the 40-layer rank-64 MoE correction (104.9 MB) and the layers 10–29 index patch (12.6 MB) with an
 `FP4x32` residual of the factory `BF16` output head minus `q4_K` (`head_fp4.bin`, 351.6 MB, recovering 98.8% of `lm_head`
-quantization variance with zero downstream MoE routing churn) plus a calibrated `FP32` exit adapter (`exit_ctrl.bin`,
-21.0 MB, `alpha_head = 0.27`):
+quantization variance with zero downstream MoE routing churn) plus a two-term superposed exit adapter (`exit_ctrl.bin`,
+26.2 MB: margin-preserving `FP32` low-rank control superposed with rank-512 `FP16` subspace-decoupled head restoration,
+`alpha_head = 0.278`, `alpha_perp = 0.287`):
 
 | | Same top-1 | Σmin | Mean KL | PPL ratio |
 |---|---:|---:|---:|---:|
-| Code judge slice, 15,360 | **86.04%** | **0.850** | **0.2060** | 1.079 |
+| Code judge slice, 15,360 | **86.04%** | **0.850** | **0.2059** | 1.055 |
 | WikiText-2, 512 | 81.25% | **0.794** | **0.551** | **1.242** |
 
 **The ladder in the README table**, same two rulers (Same top-1 / mean KL): base 78.4% / 0.446 on code and 76.8% / 0.803

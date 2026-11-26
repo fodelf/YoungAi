@@ -77,10 +77,10 @@ PT_ZD="$V41/DeepSeek-V4.1-Flash-1017-vq8sh14-q4k-mtpnative-grrb-code_fit_n15360-
 # 还原侧车(spark 默认挂的那份: ② 式增益 + ③ 式秩 64 修正一个目录, 修正之后按轮向官方 API 学, 见 restore_B_api_round_spark.sh)。
 # 不在 install.sh 的 sidecar_of 表里(--domain 选不到), 用户靠 install.sh "除分块外整仓下载"拿到, 传 ds4-server --zchain 用
 RS_NAME="DeepSeek-V4.1-Flash-1017-vq8sh14-q4k-mtpnative-grrb-restore_fit_n15360-engine"
-# 还原配对后训练包 ③(11-25, Round 126 pt-vl126/candidate: L0-39 秩 64 amp + L10-29 V 步索引补丁 + BF16 出口头 FP4x32 残差 head_fp4.bin + 平滑出口补偿 exit_ctrl.bin, 490.08 MB):
+# 还原配对后训练包 ③(11-26 升版, Round 144 pt-vl144/candidate: L0-39 秩 64 amp + L10-29 V 步索引补丁 + BF16 出口头 FP4x32 残差 head_fp4.bin + 双项叠加出口补偿 exit_ctrl.bin, 495.33 MB):
 # 用户用法写在 README: ds4-server --zchain <还原侧车> --posttrain <这个目录>; install.sh 的 --posttrain 仍是配编程侧车的那份 ③, 这份不进它
 VQ_NAME="posttrain-restore-20261125"
-VQ_SRC="$V41/posttrain/pt-vl126/candidate"
+VQ_SRC="$V41/posttrain/pt-vl144/candidate"
 pt_sidecar(){ sed -n "s/^ *$PT_DOMAIN) *echo \"\(DeepSeek-[^\"]*-engine\)\";;\$/\1/p" "$INSTALL"; }   # POSTTRAIN_DOMAIN 在仓库里的侧车目录名
 BASE_HF="$ROOT/hf/$(ins_var BASE_REPO | sed 's#.*/##')"   # 出厂权重目录 = BASE_REPO 斜杠后半截(LICENSE-DeepSeek 从这里拷)
 STAGE="$ROOT/gguf/hf_upload/${REPO#*/}"

@@ -78,7 +78,7 @@ Spark, Metal on the Mac, one Makefile, no third-party libraries linked.
 
 ## The model
 
-A 113.6 GB base plus a 145 MB restore sidecar and a 490 MB post-training package picks the same next token as the 510 GB original
+A 113.6 GB base plus a 145 MB restore sidecar and a 495 MB post-training package picks the same next token as the 510 GB original
 weights (Same top) **86.0%** of the time on code:
 
 | | Size | Code | General English |
@@ -88,7 +88,7 @@ weights (Same top) **86.0%** of the time on code:
 | ① + ② + ③ post-training | + 101 MB | 84.8% | 82.4% |
 | ① + restore sidecar | + 145 MB | 85.1% | **82.2%** |
 | ① + restore sidecar + index patch | + 13 MB | 85.2% | 81.6% |
-| **① + restore sidecar + exit-restored post-training (default on the Spark)** | **+ 490 MB** | **86.0%** | 81.2% |
+| **① + restore sidecar + exit-restored post-training (default on the Spark)** | **+ 495 MB** | **86.0%** | 81.2% |
 
 "Same" means that on the same text, our model and the original rank the same token first; code is 15,360 held-out
 tokens across 30 languages, general English is WikiText-2. Mean KL per row, what the index patch is, and the full tables:
