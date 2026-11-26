@@ -681,22 +681,22 @@ It was what the Spark ran by default from Nov 3 (`serve_pick.txt` carries the `-
 general English −0.6 pp (3 of 512 tokens). We pick versions by the code ruler and only report general English, with
 80% as the floor it may not cross.
 
-**Exit-restored post-training package** (repository directory `posttrain-restore-20261125`, 491.4 MB, default on the Spark
-since Nov 25, updated Nov 26): pairs the 40-layer rank-64 MoE correction (104.9 MB) and the layers 10–29 index patch (12.6 MB) with an
+**Exit-restored post-training package** (repository directory `posttrain-restore-20261125`, 495.3 MB, default on the Spark
+since Nov 25, updated Nov 27): pairs the 40-layer rank-64 MoE correction (104.9 MB) and the layers 10–29 index patch (12.6 MB) with an
 `FP4x32` residual of the factory `BF16` output head minus `q4_K` (`head_fp4.bin`, 351.6 MB, recovering 98.8% of `lm_head`
 quantization variance with zero downstream MoE routing churn) plus a think-guarded, two-term `FP16` superposed exit adapter
-(`exit_ctrl.bin`, 22.3 MB: margin-preserving control extended with rank-64 3-way sign-consensus `<think>`-guarded natural gradient `R1=576`,
-superposed with untruncated rank-512 subspace-decoupled head restoration `R2=512`, `alpha_head = 0.278`, `alpha_perp = 0.2885`):
+(`exit_ctrl.bin`, 26.2 MB: margin-preserving control extended with code-anchored `<think>`-guarded natural gradient `R1=704`,
+superposed with untruncated subspace-decoupled head restoration and forward-KL think cooling `R2=576`, `alpha_head = 0.278`, `alpha_perp = 0.2885`):
 
 | | Same top-1 | Σmin | Mean KL | PPL ratio |
 |---|---:|---:|---:|---:|
-| Code judge slice, 15,360 | **86.08%** | **0.850** | **0.2060** | 1.055 |
-| WikiText-2, 512 | 81.45% | **0.795** | **0.550** | **1.245** |
+| Code judge slice, 15,360 | **86.13%** | **0.850** | **0.2059** | 1.055 |
+| WikiText-2, 512 | 81.64% | **0.795** | **0.550** | **1.246** |
 
 **The ladder in the README table**, same two rulers (Same top-1 / mean KL): base 78.4% / 0.446 on code and 76.8% / 0.803
 on WikiText-2; + code sidecar 82.0% / 0.318 and 79.7% / 0.673; + post-training file 84.8% / 0.230 and 82.4% / 0.574;
 restore sidecar 85.1% / 0.227 and 82.2% / 0.590; restore sidecar + index patch 85.2% / 0.224 and 81.6% / 0.572;
-restore sidecar + exit-restored post-training 86.1% / 0.206 and 81.5% / 0.550. Against
+restore sidecar + exit-restored post-training 86.1% / 0.206 and 81.6% / 0.550. Against
 ② + ③ the restore sidecar is ahead on code Same top and level on code KL; on general English it is 0.2 pp lower (1 of 512
 tokens).
 
