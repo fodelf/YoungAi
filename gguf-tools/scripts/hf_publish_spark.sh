@@ -77,10 +77,10 @@ PT_ZD="$V41/DeepSeek-V4.1-Flash-1017-vq8sh14-q4k-mtpnative-grrb-code_fit_n15360-
 # 还原侧车(spark 默认挂的那份: ② 式增益 + ③ 式秩 64 修正一个目录, 修正之后按轮向官方 API 学, 见 restore_B_api_round_spark.sh)。
 # 不在 install.sh 的 sidecar_of 表里(--domain 选不到), 用户靠 install.sh "除分块外整仓下载"拿到, 传 ds4-server --zchain 用
 RS_NAME="DeepSeek-V4.1-Flash-1017-vq8sh14-q4k-mtpnative-grrb-restore_fit_n15360-engine"
-# 还原配对后训练包 ③(11-27 早升版, Round 159 pt-vl159/candidate: L0-39 秩 64 amp + L10-29 V 步索引补丁 + BF16 出口头 FP4x32 残差 head_fp4.bin + M1-SVD 无损降秩与 30 语言流式全上下文思考守卫 FP16 双项叠加出口补偿 exit_ctrl.bin, 495.49 MB):
+# 还原配对后训练包 ③(11-27 午升版, Round 161 pt-vl161/candidate: L0-39 秩 64 amp + L10-29 V 步索引补丁 + BF16 出口头 FP4x32 残差 head_fp4.bin + 全秩 5120x5120 M1 解算与对角吸收 dg+r224 Σx 特征分解及纯冷却 d2_re_clean(r32) 出口补偿 exit_ctrl.bin, 499.59 MB):
 # 用户用法写在 README: ds4-server --zchain <还原侧车> --posttrain <这个目录>; install.sh 的 --posttrain 仍是配编程侧车的那份 ③, 这份不进它
 VQ_NAME="posttrain-restore-20261125"
-VQ_SRC="$V41/posttrain/pt-vl159/candidate"
+VQ_SRC="$V41/posttrain/pt-vl161/candidate"
 pt_sidecar(){ sed -n "s/^ *$PT_DOMAIN) *echo \"\(DeepSeek-[^\"]*-engine\)\";;\$/\1/p" "$INSTALL"; }   # POSTTRAIN_DOMAIN 在仓库里的侧车目录名
 BASE_HF="$ROOT/hf/$(ins_var BASE_REPO | sed 's#.*/##')"   # 出厂权重目录 = BASE_REPO 斜杠后半截(LICENSE-DeepSeek 从这里拷)
 STAGE="$ROOT/gguf/hf_upload/${REPO#*/}"
@@ -455,7 +455,7 @@ case "$CMD" in
     if remote_same "$VQ_NAME" "$D"; then LOG "远端 $VQ_NAME 已与本机逐字节同, 跳过"; exit 0; fi
     t0=$(date +%s); LOG "$VQ_NAME (amp $na 层 + 补丁 $n 层 + 出口件, $(du -sb "$D" 2>/dev/null | cut -f1 || du -sk "$D" | cut -f1) B) ← $VQ_SRC"
     run_with_stall_guard "$STALL_S" "$PLOG" ${NOXET[@]+"${NOXET[@]}"} "$HF" upload "$REPO" "$D" "$VQ_NAME" --repo-type model \
-        --commit-message "Restore post-training package ($VQ_NAME, <500 MB): 40-layer rank-64 MoE correction + L10-29 index patch + BF16 lm_head FP4x32 residual & think-guarded FP16 exit control (86.17% Same top on code); load with ds4-server --zchain <restore sidecar> --posttrain $VQ_NAME" \
+        --commit-message "Restore post-training package ($VQ_NAME, <500 MB): 40-layer rank-64 MoE correction + L10-29 index patch + BF16 lm_head FP4x32 residual & think-guarded FP16 exit control (86.18% Same top on code); load with ds4-server --zchain <restore sidecar> --posttrain $VQ_NAME" \
         || { tail -c 600 "$PLOG" | tr '\r' '\n' | grep -v '^\s*$' | tail -5; die "$VQ_NAME 上传失败(完整输出 $PLOG; 重跑同一条就是续传)"; }
     remote_same "$VQ_NAME" "$D" || die "传完远端与本机仍不逐字节同(看上一行)"
     LOG "VQPATCH_DONE $(( $(date +%s) - t0 ))s https://huggingface.co/$REPO/tree/main/$VQ_NAME";;
