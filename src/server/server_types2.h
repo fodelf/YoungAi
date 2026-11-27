@@ -45,6 +45,10 @@ typedef struct {
     bool args_open;
     bool first_param;
     bool param_is_string;
+    bool pseudo_param;   /* 伪 XML 参数 <query>: 闭标签按参数名找 */
+    char param_name[64];
+    bool pseudo_invoke;   /* 伪 XML invoke <lightpanda_search">: 闭标签按工具名找 */
+    char invoke_name[64];
     char **ids;
     int ids_cap;
 } openai_tool_stream;
@@ -82,6 +86,11 @@ typedef struct {
     size_t pos;
     bool json_in_string;
     bool json_escaped;
+    bool in_invoke;     /* 已开 invoke(伪 XML 标签里: 块里的下一个标签是参数, 闭标签按工具名判) */
+    bool pseudo_param;  /* 当前值体是伪 XML 参数 <query>: 闭标签按参数名找 */
+    bool pseudo_invoke;
+    char invoke_name[64];
+    char param_name[64];
 } dsml_decode_tracker;
 
 typedef enum {
@@ -147,6 +156,10 @@ typedef struct {
     bool args_open;
     bool first_param;
     bool param_is_string;
+    bool pseudo_param;   /* 伪 XML 参数 <query>: 闭标签按参数名找 */
+    char param_name[64];
+    bool pseudo_invoke;   /* 伪 XML invoke <lightpanda_search">: 闭标签按工具名找 */
+    char invoke_name[64];
     char **ids;
     int ids_cap;
 } anthropic_tool_stream;

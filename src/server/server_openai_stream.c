@@ -200,12 +200,26 @@ static bool openai_tool_stream_fail(openai_tool_stream *ts) {
 static bool openai_tool_start_invoke(int fd, server *s, const request *r, const char *id,
                                      openai_tool_stream *ts,
                                      const char *raw, size_t raw_len) {
-    const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
-    if (!tag_end) return true;
-    char *tag = xstrndup(raw + ts->parse_pos, (size_t)(tag_end - (raw + ts->parse_pos) + 1));
-    char *name = dsml_attr(tag, "name");
-    free(tag);
-    if (!name) return openai_tool_stream_fail(ts);
+    char *name = NULL;
+    size_t tag_end_pos = 0;
+    if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->syn->invoke_start)) {
+        const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
+        if (!tag_end) return true;
+        char *tag = xstrndup(raw + ts->parse_pos, (size_t)(tag_end - (raw + ts->parse_pos) + 1));
+        name = dsml_attr(tag, "name");
+        free(tag);
+        if (!name) return openai_tool_stream_fail(ts);
+        tag_end_pos = (size_t)(tag_end - raw) + 1;
+    } else {
+        /* 伪 XML invoke 开标签: <lightpanda_search">(名字后一个多余 " 再 >), 与最终解析同一套标签规则 */
+        char pseudo_name[64]; size_t pseudo_end = 0;
+        if (!dsml_tag_open_at(raw, raw_len, ts->parse_pos, pseudo_name, sizeof pseudo_name, &pseudo_end))
+            return openai_tool_stream_fail(ts);
+        name = xstrdup(pseudo_name);
+        tag_end_pos = pseudo_end;   /* dsml_tag_open_at 的 end_out 是缓冲里的绝对下标, 不是相对长度 */
+        ts->pseudo_invoke = true;
+        snprintf(ts->invoke_name, sizeof ts->invoke_name, "%s", pseudo_name);
+    }
 
     const char *tool_id = openai_tool_stream_id(s, ts, ts->index);
     bool ok = sse_chat_tool_call_start_delta(fd, r, id, ts->index, tool_id, name) &&
@@ -216,7 +230,7 @@ static bool openai_tool_start_invoke(int fd, server *s, const request *r, const 
     ts->emitted_any = true;
     ts->args_open = true;
     ts->first_param = true;
-    ts->parse_pos = (size_t)(tag_end - raw) + 1;
+    ts->parse_pos = tag_end_pos;
     ts->state = DSML_TOOL_BETWEEN_PARAMS;
     return true;
 }
@@ -224,15 +238,31 @@ static bool openai_tool_start_invoke(int fd, server *s, const request *r, const 
 static bool openai_tool_start_param(int fd, const request *r, const char *id,
                                     openai_tool_stream *ts,
                                     const char *raw, size_t raw_len) {
-    const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
-    if (!tag_end) return true;
-    char *tag = xstrndup(raw + ts->parse_pos, (size_t)(tag_end - (raw + ts->parse_pos) + 1));
-    char *name = dsml_attr(tag, "name");
-    char *is_string = dsml_attr(tag, "string");
-    free(tag);
-    if (!name) {
-        free(is_string);
-        return openai_tool_stream_fail(ts);
+    char *name = NULL;
+    char *is_string = NULL;
+    size_t tag_end_pos = 0;
+    if (dsml_param_open_len(ts->syn, raw + ts->parse_pos)) {
+        const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
+        if (!tag_end) return true;
+        char *tag = xstrndup(raw + ts->parse_pos, (size_t)(tag_end - (raw + ts->parse_pos) + 1));
+        name = dsml_attr(tag, "name");
+        is_string = dsml_attr(tag, "string");
+        free(tag);
+        if (!name) {
+            free(is_string);
+            return openai_tool_stream_fail(ts);
+        }
+        tag_end_pos = (size_t)(tag_end - raw) + 1;
+    } else {
+        /* 伪 XML 参数开标签 <query>: 无 name/string 属性 -> 参数名就是标签名, string=true */
+        char pseudo_name[64]; size_t pseudo_end = 0;
+        if (!dsml_tag_open_at(raw, raw_len, ts->parse_pos, pseudo_name, sizeof pseudo_name, &pseudo_end))
+            return openai_tool_stream_fail(ts);
+        name = xstrdup(pseudo_name);
+        is_string = xstrdup("true");
+        tag_end_pos = pseudo_end;   /* dsml_tag_open_at 的 end_out 是缓冲里的绝对下标, 不是相对长度 */
+        ts->pseudo_param = true;
+        snprintf(ts->param_name, sizeof ts->param_name, "%s", pseudo_name);
     }
     bool string_value = !is_string || !strcmp(is_string, "true");   /* 缺 string 属性 = 字符串(与最终解析器一致) */
     bool ok = openai_tool_emit_param_prefix(fd, r, id, ts, name, string_value);
@@ -241,7 +271,7 @@ static bool openai_tool_start_param(int fd, const request *r, const char *id,
     if (!ok) return false;
 
     ts->param_is_string = string_value;
-    ts->parse_pos = (size_t)(tag_end - raw) + 1;
+    ts->parse_pos = tag_end_pos;
     ts->state = DSML_TOOL_PARAM_VALUE;
     return true;
 }
@@ -285,6 +315,16 @@ static bool openai_tool_stream_update(int fd, server *s, const request *r, const
                 if (ts->parse_pos == before_pos && ts->state == before_state) return true;
                 continue;
             }
+            /* 伪 XML invoke 开标签 <lightpanda_search">: 与最终解析同一套标签规则 */
+            if (dsml_tag_open_at(raw, raw_len, ts->parse_pos, ts->invoke_name, sizeof ts->invoke_name, NULL)) {
+                ts->pseudo_invoke = true;
+                size_t before_pos = ts->parse_pos;
+                dsml_tool_stream_state before_state = ts->state;
+                if (!openai_tool_start_invoke(fd, s, r, id, ts, raw, raw_len)) return false;
+                if (ts->parse_pos == before_pos && ts->state == before_state) return true;
+                continue;
+            }
+            if (dsml_tag_open_partial(raw, raw_len, ts->parse_pos)) return true;
             return openai_tool_stream_fail(ts);
         }
 
@@ -292,18 +332,36 @@ static bool openai_tool_stream_update(int fd, server *s, const request *r, const
             while (ts->parse_pos < raw_len && isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
             if (ts->parse_pos >= raw_len) return true;
             const size_t invoke_close = dsml_invoke_close_len(ts->syn, raw, raw_len, ts->parse_pos);   /* 与最终解析同一套标签规则(server_dsml_alias.c) */
-            if (invoke_close || dsml_calls_end_at(ts->syn, raw, raw_len, ts->parse_pos)) {   /* 块闭合直接到了 = 隐式 invoke 闭合, 游标不动 */
+            char pseudo_close[64]; size_t pseudo_close_len = 0;
+            const bool pseudo_invoke_close =
+                dsml_tag_close_at(raw, raw_len, ts->parse_pos, pseudo_close, sizeof pseudo_close, &pseudo_close_len) &&
+                ts->pseudo_invoke && !strcmp(pseudo_close, ts->invoke_name);
+            if (invoke_close || pseudo_invoke_close || dsml_calls_end_at(ts->syn, raw, raw_len, ts->parse_pos)) {   /* 块闭合直接到了 = 隐式 invoke 闭合, 游标不动 */
                 if (ts->args_open &&
                     !openai_tool_emit_args_fragment(fd, r, id, ts, "}", 1)) return false;
                 ts->args_open = false;
-                ts->parse_pos += invoke_close;
+                if (invoke_close) ts->parse_pos += invoke_close;   /* 相对长度 */
+                else if (pseudo_invoke_close) ts->parse_pos = pseudo_close_len;   /* dsml_tag_close_at 的 end_out 是绝对下标 */
+                /* 块闭合(隐式 invoke 闭合)不前进, 由外层 BETWEEN_INVOKES 收块 */
                 ts->index++;
+                ts->pseudo_invoke = false;
                 ts->state = DSML_TOOL_BETWEEN_INVOKES;
                 continue;
             }
             if (dsml_invoke_close_partial(ts->syn, raw, raw_len, ts->parse_pos) || dsml_param_open_partial(ts->syn, raw, raw_len, ts->parse_pos) ||
-                dsml_calls_end_partial(ts->syn, raw, raw_len, ts->parse_pos)) return true;
+                dsml_calls_end_partial(ts->syn, raw, raw_len, ts->parse_pos) ||
+                dsml_tag_close_partial(raw, raw_len, ts->parse_pos) ||
+                dsml_tag_open_partial(raw, raw_len, ts->parse_pos)) return true;
             if (dsml_param_open_full(ts->syn, raw, raw_len, ts->parse_pos)) {
+                size_t before_pos = ts->parse_pos;
+                dsml_tool_stream_state before_state = ts->state;
+                if (!openai_tool_start_param(fd, r, id, ts, raw, raw_len)) return false;
+                if (ts->parse_pos == before_pos && ts->state == before_state) return true;
+                continue;
+            }
+            /* 伪 XML 参数开标签 <query>: 参数名就是标签名, string=true(与最终解析同一套标签规则) */
+            if (dsml_tag_open_at(raw, raw_len, ts->parse_pos, ts->param_name, sizeof ts->param_name, NULL)) {
+                ts->pseudo_param = true;
                 size_t before_pos = ts->parse_pos;
                 dsml_tool_stream_state before_state = ts->state;
                 if (!openai_tool_start_param(fd, r, id, ts, raw, raw_len)) return false;
@@ -315,16 +373,23 @@ static bool openai_tool_stream_update(int fd, server *s, const request *r, const
 
         if (ts->state == DSML_TOOL_PARAM_VALUE) {
             size_t end_len = 0;
-            const char *end = dsml_param_close_find(ts->syn, raw + ts->parse_pos,
-                                                    raw_len - ts->parse_pos, &end_len);
+            const char *end = ts->pseudo_param ?
+                dsml_tag_close_find(raw + ts->parse_pos, raw_len - ts->parse_pos,
+                                    ts->param_name, &end_len) :
+                dsml_param_close_find(ts->syn, raw + ts->parse_pos,
+                                      raw_len - ts->parse_pos, &end_len);
             if (end) {
                 if (!openai_tool_finish_param(fd, r, id, ts, raw,
                                               (size_t)(end - raw), end_len)) return false;
+                ts->pseudo_param = false;
                 continue;
             }
-            size_t limit = tool_param_value_stream_safe_len(raw, ts->parse_pos,
-                                                            raw_len, ts->syn,
-                                                            ts->param_is_string);
+            size_t limit = ts->pseudo_param ?
+                dsml_pseudo_value_stream_safe_len(raw, ts->parse_pos, raw_len,
+                                                  ts->syn, ts->param_name, ts->param_is_string) :
+                tool_param_value_stream_safe_len(raw, ts->parse_pos,
+                                                 raw_len, ts->syn,
+                                                 ts->param_is_string);
             if (limit > ts->parse_pos) {
                 bool ok = ts->param_is_string ?
                     openai_tool_emit_string_value(fd, r, id, ts, raw + ts->parse_pos,

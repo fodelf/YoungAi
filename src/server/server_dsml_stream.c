@@ -146,6 +146,8 @@ dsml_decode_state dsml_decode_state_for_text(const char *raw, size_t raw_len) {
     if (!dsml_find_tool_start(raw, raw_len, &pos, &syn)) {
         return DSML_DECODE_OUTSIDE;
     }
+    bool in_invoke = false;
+    char invoke_name[64] = "", param_name[64] = "";
 
     for (;;) {
         while (pos < raw_len && isspace((unsigned char)raw[pos])) pos++;
@@ -156,13 +158,25 @@ dsml_decode_state dsml_decode_state_for_text(const char *raw, size_t raw_len) {
         }
         if (dsml_invoke_close_len(syn, raw, raw_len, pos)) {
             pos += dsml_invoke_close_len(syn, raw, raw_len, pos);
+            in_invoke = false;
             continue;
         }
         if (raw_full_lit(raw, raw_len, pos, syn->invoke_start)) {
             const char *tag_end = memchr(raw + pos, '>', raw_len - pos);
             if (!tag_end) return DSML_DECODE_STRUCTURAL;
             pos = (size_t)(tag_end - raw) + 1;
+            in_invoke = true;
             continue;
+        }
+        /* 伪 XML invoke 闭标签 </lightpanda_search>: 已开 invoke 时按工具名判 */
+        if (in_invoke) {
+            char got[64]; size_t got_len = 0;
+            if (dsml_tag_close_at(raw, raw_len, pos, got, sizeof got, &got_len) &&
+                !strcmp(got, invoke_name)) {
+                pos = got_len;   /* dsml_tag_close_at 的 end_out 是绝对下标 */
+                in_invoke = false;
+                continue;
+            }
         }
         if (dsml_param_open_full(syn, raw, raw_len, pos)) {
             size_t tag_start = pos;
@@ -194,6 +208,31 @@ dsml_decode_state dsml_decode_state_for_text(const char *raw, size_t raw_len) {
                 continue;
             }
             return json_state;
+        }
+        /* 伪 XML 标签: 第一枚(还没开 invoke)是 invoke, 后面的是参数; 参数一律 string=true */
+        char pseudo_name[64]; size_t pseudo_end = 0;
+        if (dsml_tag_open_at(raw, raw_len, pos, pseudo_name, sizeof pseudo_name, &pseudo_end)) {
+            if (!in_invoke) {
+                in_invoke = true;
+                snprintf(invoke_name, sizeof invoke_name, "%s", pseudo_name);
+                pos = pseudo_end;   /* dsml_tag_open_at 的 end_out 是绝对下标 */
+                continue;
+            }
+            snprintf(param_name, sizeof param_name, "%s", pseudo_name);
+            pos = pseudo_end;
+
+            size_t end_len = 0;
+            const char *end = dsml_tag_close_find(raw + pos, raw_len - pos, param_name, &end_len);
+            if (!end) {
+                size_t scan = raw_len > 64 ? raw_len - 64 : 0;
+                for (size_t i = raw_len; i > scan; i--) {
+                    if (raw[i - 1] == '<' && dsml_tag_close_partial(raw, raw_len, i - 1))
+                        return DSML_DECODE_STRUCTURAL;
+                }
+                return DSML_DECODE_STRING_BODY;
+            }
+            pos = (size_t)(end - raw) + end_len;
+            continue;
         }
 
         for (size_t i = 0; i < sizeof(dsml_syntaxes) / sizeof(dsml_syntaxes[0]); i++) {
@@ -258,16 +297,27 @@ void dsml_decode_tracker_update(dsml_decode_tracker *dt,
 
         if (dt->mode == DSML_TRACK_STRING_BODY) {
             while (dt->pos < raw_len) {
-                const size_t close = dsml_param_close_len(dt->syn, raw, raw_len, dt->pos);
-                if (close || dsml_calls_end_at(dt->syn, raw, raw_len, dt->pos)) {   /* 块闭合直接接值 = 隐式闭合, 不前进(server_dsml_alias.c) */
-                    dt->pos += close;
+                size_t close = dsml_param_close_len(dt->syn, raw, raw_len, dt->pos);
+                size_t close_len = 0;
+                if (dt->pseudo_param) {
+                    char got[64]; size_t got_len = 0;
+                    if (dsml_tag_close_at(raw, raw_len, dt->pos, got, sizeof got, &got_len) &&
+                        !strcmp(got, dt->param_name)) { close_len = got_len; }
+                    else if (dsml_tag_close_partial(raw, raw_len, dt->pos)) {
+                        dt->decode = DSML_DECODE_STRUCTURAL;
+                        return;
+                    }
+                } else if (dsml_param_close_partial(dt->syn, raw, raw_len, dt->pos, 2)) {
+                    dt->decode = DSML_DECODE_STRUCTURAL;
+                    return;
+                }
+                if (close || close_len || dsml_calls_end_at(dt->syn, raw, raw_len, dt->pos)) {   /* 块闭合直接接值 = 隐式闭合, 不前进(server_dsml_alias.c) */
+                    if (close) dt->pos += close;
+                    else if (close_len) dt->pos = close_len;   /* pseudo close_len 是 dsml_tag_close_at 的绝对下标 */
+                    dt->pseudo_param = false;
                     dt->mode = DSML_TRACK_STRUCTURAL;
                     dt->decode = DSML_DECODE_STRUCTURAL;
                     goto structural;
-                }
-                if (dsml_param_close_partial(dt->syn, raw, raw_len, dt->pos, 2)) {
-                    dt->decode = DSML_DECODE_STRUCTURAL;
-                    return;
                 }
                 dt->pos++;
             }
@@ -325,6 +375,7 @@ structural:
             }
             if (dsml_invoke_close_len(dt->syn, raw, raw_len, dt->pos)) {
                 dt->pos += dsml_invoke_close_len(dt->syn, raw, raw_len, dt->pos);
+                dt->in_invoke = false;
                 continue;
             }
             if (raw_full_lit(raw, raw_len, dt->pos, dt->syn->invoke_start)) {
@@ -334,7 +385,18 @@ structural:
                     return;
                 }
                 dt->pos = (size_t)(tag_end - raw) + 1;
+                dt->in_invoke = true;
                 continue;
+            }
+            /* 伪 XML invoke 闭标签 </lightpanda_search>: 已开 invoke 时按工具名判, 与最终解析同一套标签规则 */
+            if (dt->in_invoke) {
+                char got[64]; size_t got_len = 0;
+                if (dsml_tag_close_at(raw, raw_len, dt->pos, got, sizeof got, &got_len) &&
+                    !strcmp(got, dt->invoke_name)) {
+                    dt->pos = got_len;   /* dsml_tag_close_at 的 end_out 是绝对下标 */
+                    dt->in_invoke = false;
+                    continue;
+                }
             }
             if (dsml_param_open_full(dt->syn, raw, raw_len, dt->pos)) {
                 size_t tag_start = dt->pos;
@@ -357,6 +419,26 @@ structural:
                 }
                 break;
             }
+            /* 伪 XML 标签: 块里的第一枚(还没开 invoke)是 invoke, 后面的是参数名标签; 参数一律 string=true */
+            char pseudo_name[64]; size_t pseudo_end = 0;
+            if (dsml_tag_open_at(raw, raw_len, dt->pos, pseudo_name, sizeof pseudo_name, &pseudo_end)) {
+                if (!dt->in_invoke) {
+                    dt->in_invoke = true;
+                    snprintf(dt->invoke_name, sizeof dt->invoke_name, "%s", pseudo_name);
+                    dt->pos = pseudo_end;   /* dsml_tag_open_at 的 end_out 是绝对下标 */
+                    continue;
+                }
+                dt->pseudo_param = true;
+                snprintf(dt->param_name, sizeof dt->param_name, "%s", pseudo_name);
+                dt->pos = pseudo_end;
+                dt->mode = DSML_TRACK_STRING_BODY;
+                dt->decode = DSML_DECODE_STRING_BODY;
+                break;
+            }
+            if (dsml_tag_open_partial(raw, raw_len, dt->pos) || dsml_tag_close_partial(raw, raw_len, dt->pos)) {
+                dt->decode = DSML_DECODE_STRUCTURAL;
+                return;
+            }
 
             if (raw_partial_lit(raw, raw_len, dt->pos, dt->syn->tool_calls_end) ||
                 raw_partial_lit(raw, raw_len, dt->pos, dt->syn->invoke_start) ||
@@ -376,7 +458,7 @@ structural:
 
 /* 流式 string 值按块反转义: 块尾若停在一个转义序列的前半截, 先扣住不发, 否则客户端收到半截 "&l"。
  * 原样写法唯一的转义序列是 "&lt;" + 闭合标签剩余部分(dsml_value_unescape)。 */
-static size_t dsml_entity_stream_safe_len(const dsml_syntax *syn, const char *raw,
+size_t dsml_entity_stream_safe_len(const dsml_syntax *syn, const char *raw,
                                           size_t start, size_t limit) {
     static const char *ents[] = {"&amp;", "&lt;", "&gt;", "&quot;", "&apos;"};
     char sentinel[64];
@@ -397,6 +479,24 @@ static size_t dsml_entity_stream_safe_len(const dsml_syntax *syn, const char *ra
         break;
     }
     return limit;
+}
+
+size_t dsml_pseudo_value_stream_safe_len(const char *raw, size_t start,
+                                               size_t raw_len, const dsml_syntax *syn,
+                                               const char *name, bool is_string) {
+    (void)name;   /* 完整闭标签由 update 先经 dsml_tag_close_find 认出; 这里只看还没写完的任意 <... 标签 */
+    /* 伪 XML 参数的闭标签是 </名字>, 不是 syn->param_end: 值体尾巴停在 "</名字" 的前半截时扣住,
+     * 也不发一个还没写完的任意 <... 标签(下一块才能判是不是闭标签)。完整闭标签由 update 先经 dsml_tag_close_find 认出。 */
+    size_t limit = raw_len;
+    size_t scan = raw_len > start + 64 ? raw_len - 64 : start;
+    for (size_t i = raw_len; i > scan; i--) {
+        if (raw[i - 1] != '<') continue;
+        size_t marker = i - 1;
+        if (memchr(raw + marker, '>', raw_len - marker) == NULL) limit = marker;
+        break;
+    }
+    if (is_string) limit = dsml_entity_stream_safe_len(syn, raw, start, limit);
+    return utf8_stream_safe_len(raw, start, limit, false);
 }
 
 size_t tool_param_value_stream_safe_len(const char *raw, size_t start,

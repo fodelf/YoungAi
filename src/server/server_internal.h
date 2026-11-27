@@ -159,6 +159,13 @@ bool dsml_param_open_partial(const dsml_syntax *syn, const char *raw, size_t raw
 size_t dsml_param_close_len(const dsml_syntax *syn, const char *raw, size_t raw_len, size_t pos);
 bool dsml_param_close_partial(const dsml_syntax *syn, const char *raw, size_t raw_len, size_t pos, size_t min_len);
 const char *dsml_param_close_find(const dsml_syntax *syn, const char *s, size_t n, size_t *len_out);
+/* 伪 XML 标签(server_dsml_alias.c): 名字后直接 > 或一个多余 " 再 >(实撞 <lightpanda_search">),
+ * <oops/> 与 <oops name="..."> 不认 —— 那是写坏, 不是伪 DSML。 */
+bool dsml_tag_open_at(const char *raw, size_t raw_len, size_t pos, char *name, size_t name_cap, size_t *end_out);
+bool dsml_tag_close_at(const char *raw, size_t raw_len, size_t pos, char *name, size_t name_cap, size_t *end_out);
+const char *dsml_tag_close_find(const char *s, size_t n, const char *name, size_t *len_out);
+bool dsml_tag_open_partial(const char *raw, size_t raw_len, size_t pos);   /* 伪标签还没写完, 流式扣住等下一块 */
+bool dsml_tag_close_partial(const char *raw, size_t raw_len, size_t pos);
 /* 块闭合 </calls> 直接接在值后面 = 隐式关掉参数与 invoke(server_dsml_alias.c 隐式闭合那段); 三条路在值体/参数之间位都要认它 */
 bool dsml_calls_end_at(const dsml_syntax *syn, const char *raw, size_t raw_len, size_t pos);
 bool dsml_calls_end_partial(const dsml_syntax *syn, const char *raw, size_t raw_len, size_t pos);
@@ -171,6 +178,8 @@ bool dsml_decode_state_is_syntax(dsml_decode_state state);
 void dsml_decode_tracker_init(dsml_decode_tracker *dt);
 void dsml_decode_tracker_update(dsml_decode_tracker *dt, const char *raw, size_t raw_len);
 size_t tool_param_value_stream_safe_len(const char *raw, size_t start, size_t raw_len, const dsml_syntax *syn, bool is_string);
+size_t dsml_pseudo_value_stream_safe_len(const char *raw, size_t start, size_t raw_len, const dsml_syntax *syn, const char *name, bool is_string);
+size_t dsml_entity_stream_safe_len(const dsml_syntax *syn, const char *raw, size_t start, size_t limit);
 const dsml_syntax *dsml_render_syntax(void);
 char *dsml_value_unescape(const dsml_syntax *syn, const char *s);
 bool openai_sse_stream_update(int fd, server *s, const request *r, const char *id, openai_stream *st, const char *raw, size_t raw_len, bool final);

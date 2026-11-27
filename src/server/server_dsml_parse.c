@@ -325,14 +325,23 @@ bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
             split_reasoning_content(text, content_len, content_out, reasoning_out);
             return true;
         }
-        if (strncmp(p, invoke_start, strlen(invoke_start)) != 0) return false;
-        const char *tag_end = strchr(p, '>');
-        if (!tag_end) return false;
-        char *tag = xstrndup(p, (size_t)(tag_end - p + 1));
-        char *name = dsml_attr(tag, "name");
-        free(tag);
-        if (!name) return false;
-        p = tag_end + 1;
+        const char *tag_end = NULL;
+        char *name = NULL;
+        if (strncmp(p, invoke_start, strlen(invoke_start)) == 0) {
+            tag_end = strchr(p, '>');
+            if (!tag_end) return false;
+            char *tag = xstrndup(p, (size_t)(tag_end - p + 1));
+            name = dsml_attr(tag, "name");
+            free(tag);
+            if (!name) return false;
+            p = tag_end + 1;
+        } else {
+            /* 伪 XML invoke 开标签: <lightpanda_search">(名字后一个多余 " 再 >) */
+            char pseudo_name[64]; size_t pseudo_end = 0;
+            if (!dsml_tag_open_at(p, strlen(p), 0, pseudo_name, sizeof pseudo_name, &pseudo_end)) return false;
+            name = xstrdup(pseudo_name);
+            p += pseudo_end;
+        }
 
         buf args = {0};
         while (true) {
@@ -342,31 +351,51 @@ bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
                 p += close;
                 break;
             }
+            /* 伪 XML invoke 闭标签 </lightpanda_search> */
+            char pseudo_close[64]; size_t pseudo_close_len = 0;
+            if (dsml_tag_close_at(p, strlen(p), 0, pseudo_close, sizeof pseudo_close, &pseudo_close_len) &&
+                !strcmp(pseudo_close, name)) {
+                p += pseudo_close_len;
+                break;
+            }
             if (dsml_calls_end_at(syn, p, strlen(p), 0)) break;   /* 隐式 invoke 闭合: 块闭合直接到了, 游标不动, 外层收块 */
-            if (!dsml_param_open_len(syn, p)) {
-                free(name);
-                ds4_buf_free(&args);
-                return false;
+            char *param_name = NULL;
+            char *param_is_string = NULL;
+            bool pseudo_param = false;
+            if (dsml_param_open_len(syn, p)) {
+                tag_end = strchr(p, '>');
+                if (!tag_end) {
+                    free(name);
+                    ds4_buf_free(&args);
+                    return false;
+                }
+                char *tag = xstrndup(p, (size_t)(tag_end - p + 1));
+                param_name = dsml_attr(tag, "name");
+                param_is_string = dsml_attr(tag, "string");
+                free(tag);
+                if (!param_name) {
+                    free(name);
+                    free(param_name);
+                    free(param_is_string);
+                    ds4_buf_free(&args);
+                    return false;
+                }
+                p = tag_end + 1;
+            } else {
+                /* 伪 XML 参数开标签 <query>: 无 name/string 属性 -> 参数名就是标签名, string=true */
+                char pseudo_param_name[64]; size_t pseudo_end = 0;
+                if (!dsml_tag_open_at(p, strlen(p), 0, pseudo_param_name, sizeof pseudo_param_name, &pseudo_end)) {
+                    free(name);
+                    ds4_buf_free(&args);
+                    return false;
+                }
+                param_name = xstrdup(pseudo_param_name);
+                param_is_string = xstrdup("true");
+                pseudo_param = true;
+                p += pseudo_end;
             }
-            tag_end = strchr(p, '>');
-            if (!tag_end) {
-                free(name);
-                ds4_buf_free(&args);
-                return false;
-            }
-            tag = xstrndup(p, (size_t)(tag_end - p + 1));
-            char *param_name = dsml_attr(tag, "name");
-            char *param_is_string = dsml_attr(tag, "string");
-            free(tag);
-            if (!param_name) {
-                free(name);
-                free(param_name);
-                free(param_is_string);
-                ds4_buf_free(&args);
-                return false;
-            }
-            const char *value_start = tag_end + 1;
-            if (!param_is_string &&
+            const char *value_start = p;
+            if (!pseudo_param && !param_is_string &&
                 dsml_param_open_len(syn, skip_ascii_ws(value_start)))
             {
                 buf nested = {0};
@@ -388,7 +417,11 @@ bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
                 continue;
             }
             size_t end_len = 0;
-            const char *value_end = dsml_param_close_find(syn, value_start, strlen(value_start), &end_len);
+            const char *value_end;
+            if (pseudo_param)
+                value_end = dsml_tag_close_find(value_start, strlen(value_start), param_name, &end_len);
+            else
+                value_end = dsml_param_close_find(syn, value_start, strlen(value_start), &end_len);
             if (!value_end) {
                 free(name);
                 free(param_name);

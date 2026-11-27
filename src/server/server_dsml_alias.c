@@ -63,6 +63,72 @@ bool dsml_calls_end_at(const dsml_syntax *syn, const char *raw, size_t raw_len, 
 bool dsml_calls_end_partial(const dsml_syntax *syn, const char *raw, size_t raw_len, size_t pos) {
     return raw_partial_lit(raw, raw_len, pos, syn->tool_calls_end);
 }
+
+/* ★伪 XML 标签(2026-11-26 实撞)★: 模型在 DSML 块里不写 canonical invoke/parameter,
+ * 而是写工具名标签和参数名标签: <lightpanda_search">/<query>/</query>/</lightpanda_search>。
+ * 意图没有歧义(块起点是 DSML 的, 工具名标签在 invoke 位, 参数名标签在 parameter 位,
+ * 闭标签与开标签同名), 解析侧认下来; 模型输出一个字节不改, 精确重放表里存的仍是原字节。
+ * 只认"名字后直接 >"或"名字后一个多余 " 再 >"的形状(实撞 <lightpanda_search"> 就是后者);
+ * <oops/> 与 <oops name="..."> 这类带属性/自闭合的标签不认 —— 那是写坏, 不是伪 DSML。
+ * 三条路(最终解析 / 流式投影 / KV 语法跟踪)都经这里判标签, 规则若再分叉, 收尾一致性检查会报 error。 */
+static bool tag_name_ascii(const char *raw, size_t raw_len, size_t i, char *name, size_t cap) {
+    size_t n = 0;
+    while (i < raw_len && n + 1 < cap &&
+           (isalnum((unsigned char)raw[i]) || raw[i] == '_' || raw[i] == '-')) {
+        name[n++] = raw[i++];
+    }
+    if (n == 0) return false;
+    name[n] = 0;
+    return true;
+}
+
+bool dsml_tag_open_at(const char *raw, size_t raw_len, size_t pos,
+                      char *name, size_t name_cap, size_t *end_out) {
+    if (!raw || pos >= raw_len || raw[pos] != '<') return false;
+    if (pos + 1 < raw_len && raw[pos + 1] == '/') return false;
+    size_t i = pos + 1;
+    if (!tag_name_ascii(raw, raw_len, i, name, name_cap)) return false;
+    while (i < raw_len && (isalnum((unsigned char)raw[i]) || raw[i] == '_' || raw[i] == '-')) i++;
+    if (i < raw_len && raw[i] == '>') { if (end_out) *end_out = i + 1; return true; }
+    if (i + 1 < raw_len && raw[i] == '"' && raw[i + 1] == '>') { if (end_out) *end_out = i + 2; return true; }
+    return false;
+}
+
+bool dsml_tag_close_at(const char *raw, size_t raw_len, size_t pos,
+                       char *name, size_t name_cap, size_t *end_out) {
+    if (!raw || pos >= raw_len || raw[pos] != '<') return false;
+    if (pos + 1 >= raw_len || raw[pos + 1] != '/') return false;
+    size_t i = pos + 2;
+    if (!tag_name_ascii(raw, raw_len, i, name, name_cap)) return false;
+    while (i < raw_len && (isalnum((unsigned char)raw[i]) || raw[i] == '_' || raw[i] == '-')) i++;
+    if (i < raw_len && raw[i] == '>') { if (end_out) *end_out = i + 1; return true; }
+    return false;
+}
+
+/* 伪标签还没写完(缓冲从 pos 起到末尾是 <名字 或 <名字" 或 </名字 的前半截): 流式在这里扣住不发, 等下一块。
+ * 只在“没有 >”时成立: 一个完整但写坏的标签(<oops/>、带属性)由三条路各自判不认, 不归这里扣。 */
+bool dsml_tag_open_partial(const char *raw, size_t raw_len, size_t pos) {
+    if (!raw || pos >= raw_len || raw[pos] != '<' || raw[pos + 1] == '/') return false;
+    return memchr(raw + pos, '>', raw_len - pos) == NULL;
+}
+
+bool dsml_tag_close_partial(const char *raw, size_t raw_len, size_t pos) {
+    if (!raw || pos >= raw_len || raw[pos] != '<' || pos + 1 >= raw_len || raw[pos + 1] != '/') return false;
+    return memchr(raw + pos, '>', raw_len - pos) == NULL;
+}
+
+const char *dsml_tag_close_find(const char *s, size_t n, const char *name, size_t *len_out) {
+    if (!s || !name || !name[0]) return NULL;
+    for (size_t i = 0; i < n; i++) {
+        if (s[i] != '<') continue;
+        char got[64]; size_t end = 0;
+        if (dsml_tag_close_at(s, n, i, got, sizeof got, &end) && !strcmp(got, name)) {
+            if (len_out) *len_out = end - i;
+            return s + i;
+        }
+    }
+    return NULL;
+}
 static const char *dsml_implicit_close_find(const dsml_syntax *syn, const char *s, size_t n) {
     const char *c = find_lit_bounded(s, n, syn->tool_calls_end);
     if (!c) return NULL;

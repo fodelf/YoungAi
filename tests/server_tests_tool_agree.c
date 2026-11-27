@@ -35,6 +35,10 @@ static const agree_case CASES[] = {
     /* 10-11 的裸参数标签 + 10-16 的裸 invoke 闭标签一起出现 */
     { "bare param and invoke", S_CS "\n" S_IS " name=\"web_search\">\n<parameter name=\"query\" string=\"true\">DGX Spark</parameter>\n</invoke>\n" S_CE,
       WANT_CALLS, 1, "{\"query\":\"DGX Spark\"}" },
+    /* 11-26 原样形状: 模型在 DSML 块里写伪 XML 标签 <lightpanda_search">/<query>/</query>/</lightpanda_search>
+     * (invoke 名字标签, 名字后一个多余 " 再 >; 参数名标签无属性) —— 两边都认下 */
+    { "pseudo xml tags", "查一下这个。\n\n" S_CS "\n<lightpanda_search\">\n<query>best laptop price</query>\n</lightpanda_search>\n" S_CE,
+      WANT_CALLS, 1, "{\"query\":\"best laptop price\"}" },
     { "utf8 and json-special chars", S_CS "\n" S_IS " name=\"bash\">\n" S_PS " name=\"command\" string=\"true\">echo \"你好\" & ls\\n" S_PE "\n"
       S_PS " name=\"timeout\" string=\"false\">30" S_PE "\n" S_IE "\n" S_CE,
       WANT_CALLS, 1, "{\"command\":\"echo \\\"你好\\\" & ls\\\\n\",\"timeout\":30}" },

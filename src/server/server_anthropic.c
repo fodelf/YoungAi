@@ -368,13 +368,27 @@ bool anthropic_tool_stream_fail(anthropic_tool_stream *ts) {
 bool anthropic_tool_start_invoke(int fd, server *s, anthropic_stream *st,
                                         const char *raw, size_t raw_len) {
     anthropic_tool_stream *ts = &st->tool;
-    const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
-    if (!tag_end) return true;
-    char *tag = xstrndup(raw + ts->parse_pos,
-                         (size_t)(tag_end - (raw + ts->parse_pos) + 1));
-    char *name = dsml_attr(tag, "name");
-    free(tag);
-    if (!name) return anthropic_tool_stream_fail(ts);
+    char *name = NULL;
+    size_t tag_end_pos = 0;
+    if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->syn->invoke_start)) {
+        const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
+        if (!tag_end) return true;
+        char *tag = xstrndup(raw + ts->parse_pos,
+                             (size_t)(tag_end - (raw + ts->parse_pos) + 1));
+        name = dsml_attr(tag, "name");
+        free(tag);
+        if (!name) return anthropic_tool_stream_fail(ts);
+        tag_end_pos = (size_t)(tag_end - raw) + 1;
+    } else {
+        /* 伪 XML invoke 开标签: <lightpanda_search">(名字后一个多余 " 再 >), 与最终解析同一套标签规则 */
+        char pseudo_name[64]; size_t pseudo_end = 0;
+        if (!dsml_tag_open_at(raw, raw_len, ts->parse_pos, pseudo_name, sizeof pseudo_name, &pseudo_end))
+            return anthropic_tool_stream_fail(ts);
+        name = xstrdup(pseudo_name);
+        tag_end_pos = pseudo_end;   /* dsml_tag_open_at 的 end_out 是缓冲里的绝对下标, 不是相对长度 */
+        ts->pseudo_invoke = true;
+        snprintf(ts->invoke_name, sizeof ts->invoke_name, "%s", pseudo_name);
+    }
 
     /* This id is already visible to the client.  After final parsing,
      * apply_anthropic_stream_tool_ids() copies it into the parsed tool_call
@@ -389,7 +403,7 @@ bool anthropic_tool_start_invoke(int fd, server *s, anthropic_stream *st,
     ts->emitted_any = true;
     ts->args_open = true;
     ts->first_param = true;
-    ts->parse_pos = (size_t)(tag_end - raw) + 1;
+    ts->parse_pos = tag_end_pos;
     ts->state = DSML_TOOL_BETWEEN_PARAMS;
     return true;
 }
@@ -397,16 +411,32 @@ bool anthropic_tool_start_invoke(int fd, server *s, anthropic_stream *st,
 bool anthropic_tool_start_param(int fd, anthropic_stream *st,
                                        const char *raw, size_t raw_len) {
     anthropic_tool_stream *ts = &st->tool;
-    const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
-    if (!tag_end) return true;
-    char *tag = xstrndup(raw + ts->parse_pos,
-                         (size_t)(tag_end - (raw + ts->parse_pos) + 1));
-    char *name = dsml_attr(tag, "name");
-    char *is_string = dsml_attr(tag, "string");
-    free(tag);
-    if (!name) {
-        free(is_string);
-        return anthropic_tool_stream_fail(ts);
+    char *name = NULL;
+    char *is_string = NULL;
+    size_t tag_end_pos = 0;
+    if (dsml_param_open_len(ts->syn, raw + ts->parse_pos)) {
+        const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
+        if (!tag_end) return true;
+        char *tag = xstrndup(raw + ts->parse_pos,
+                             (size_t)(tag_end - (raw + ts->parse_pos) + 1));
+        name = dsml_attr(tag, "name");
+        is_string = dsml_attr(tag, "string");
+        free(tag);
+        if (!name) {
+            free(is_string);
+            return anthropic_tool_stream_fail(ts);
+        }
+        tag_end_pos = (size_t)(tag_end - raw) + 1;
+    } else {
+        /* 伪 XML 参数开标签 <query>: 无 name/string 属性 -> 参数名就是标签名, string=true */
+        char pseudo_name[64]; size_t pseudo_end = 0;
+        if (!dsml_tag_open_at(raw, raw_len, ts->parse_pos, pseudo_name, sizeof pseudo_name, &pseudo_end))
+            return anthropic_tool_stream_fail(ts);
+        name = xstrdup(pseudo_name);
+        is_string = xstrdup("true");
+        tag_end_pos = pseudo_end;   /* dsml_tag_open_at 的 end_out 是缓冲里的绝对下标, 不是相对长度 */
+        ts->pseudo_param = true;
+        snprintf(ts->param_name, sizeof ts->param_name, "%s", pseudo_name);
     }
     bool string_value = !is_string || !strcmp(is_string, "true");   /* 缺 string 属性 = 字符串(与最终解析器一致) */
     bool ok = anthropic_tool_emit_param_prefix(fd, st, name, string_value);
@@ -415,7 +445,7 @@ bool anthropic_tool_start_param(int fd, anthropic_stream *st,
     if (!ok) return false;
 
     ts->param_is_string = string_value;
-    ts->parse_pos = (size_t)(tag_end - raw) + 1;
+    ts->parse_pos = tag_end_pos;
     ts->state = DSML_TOOL_PARAM_VALUE;
     return true;
 }
